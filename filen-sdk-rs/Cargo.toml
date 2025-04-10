@@ -29,8 +29,3 @@ serde_path_to_error = "0.1.17"
 dotenv = "0.15.0"
 tokio = { version = "1.44.2", features = ["full"] }
 
-[profile.dev]
-opt-level = 3
-
-[profile.test]
-opt-level = 3
