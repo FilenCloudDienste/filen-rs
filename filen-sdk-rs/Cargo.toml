@@ -1,0 +1,36 @@
+[package]
+name = "filen-sdk-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = { version = "0.12.15", features = ["json"] }
+filen-types = { path = "../filen-types" }
+rand = "0.9.0"
+aes-gcm = { version = "0.10.3", features = ["std"] }
+generic-array = "1.2.0"
+thiserror = "2.0.12"
+base64 = "0.22.1"
+pbkdf2 = { version = "0.12.2", features = ["std", "sha2"] }
+sha2 = "0.10.8"
+rsa = "0.9.8"
+hkdf = { version = "0.12.4", features = ["std"] }
+hmac = { version = "0.12.1", features = ["std"] }
+uuid = "1.16.0"
+chrono = { version = "0.4.40", features = ["serde"] }
+digest = "0.10.7"
+serde = "1.0.219"
+serde_json = "1.0.140"
+faster-hex = { version = "0.10.0", features = ["serde"] }
+argon2 = { version = "0.5.3", features = ["std"] }
+serde_path_to_error = "0.1.17"
+
+[dev-dependencies]
+dotenv = "0.15.0"
+tokio = { version = "1.44.2", features = ["full"] }
+
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3
