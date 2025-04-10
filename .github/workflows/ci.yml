@@ -1,0 +1,30 @@
+name: Continuous Integration
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+jobs:
+  test:
+    strategy:
+      max-parallel: 1 # to stop the different oses from running at the same time
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+        version: [V2, V3]  # This remains to define which version of the secrets to use
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cargo-build-${{ runner.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run clippy
+        run: cargo clippy --all-features -- -D warnings
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --all-features
