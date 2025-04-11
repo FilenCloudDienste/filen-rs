@@ -10,6 +10,7 @@ use super::{error::ConversionError, shared::MetaCrypter};
 
 const INFO: &[u8] = b"hmac-sha256-key";
 
+#[derive(Clone)]
 pub(crate) struct HMACKey([u8; 32]);
 
 impl HMACKey {

@@ -132,7 +132,7 @@ impl MetaCrypter for MasterKey {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MasterKeys(pub Vec<MasterKey>);
 
 impl MasterKeys {

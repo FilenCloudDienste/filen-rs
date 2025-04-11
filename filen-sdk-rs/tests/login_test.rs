@@ -1,5 +1,5 @@
 use core::panic;
-use std::{env, sync::Arc};
+use std::env;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
@@ -11,11 +11,11 @@ use filen_sdk_rs::{
 use tokio::sync::OnceCell;
 
 struct Resources {
-	client: OnceCell<Arc<Client>>,
+	client: OnceCell<Client>,
 }
 
 struct TestResources {
-	client: Arc<Client>,
+	client: Client,
 	dir: Directory,
 }
 
@@ -40,21 +40,19 @@ impl Drop for TestResources {
 }
 
 impl Resources {
-	async fn client(&self) -> Arc<Client> {
+	async fn client(&self) -> &Client {
 		self.client
 			.get_or_init(|| async {
 				dotenv::dotenv().ok();
-				let client = login(
+				login(
 					env::var("TEST_EMAIL").unwrap(),
 					&env::var("TEST_PASSWORD").unwrap(),
 					&env::var("TEST_2FA_CODE").unwrap_or("XXXXXX".to_string()),
 				)
 				.await
-				.unwrap();
-				Arc::new(client)
+				.unwrap()
 			})
 			.await
-			.clone()
 	}
 
 	async fn get_resources(&self) -> TestResources {
@@ -62,7 +60,7 @@ impl Resources {
 			"rs-{}",
 			BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
 		);
-		let client = self.client().await;
+		let client = self.client().await.clone();
 		let test_dir = create_dir(&client, client.root(), name).await.unwrap();
 		TestResources {
 			client,

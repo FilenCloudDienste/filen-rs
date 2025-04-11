@@ -10,6 +10,7 @@ use crate::{
 
 use super::http::UnauthClient;
 
+#[derive(Clone)]
 pub(crate) struct AuthInfo {
 	dek: crate::crypto::v3::EncryptionKey,
 }

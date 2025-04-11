@@ -9,6 +9,7 @@ use sha1::Digest;
 
 use super::http::UnauthClient;
 
+#[derive(Clone)]
 pub(crate) struct AuthInfo {
 	master_keys: crate::crypto::v2::MasterKeys,
 }

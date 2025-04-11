@@ -17,6 +17,18 @@ pub struct AuthClient {
 	api_key: APIKey,
 }
 
+// not sure if this is the best way to do this
+// this is to work around the fact that in tests
+// this will be used across runtimes, which it doesn't like
+impl Clone for AuthClient {
+	fn clone(&self) -> Self {
+		Self {
+			client: reqwest::Client::new(),
+			api_key: self.api_key.clone(),
+		}
+	}
+}
+
 impl AuthClient {
 	pub fn new(api_key: APIKey) -> Self {
 		Self {

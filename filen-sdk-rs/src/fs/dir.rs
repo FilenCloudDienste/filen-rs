@@ -9,6 +9,7 @@ use crate::crypto::{error::ConversionError, shared::MetaCrypter};
 
 use super::{HasContents, HasMeta, HasParent, HasUUID};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectoryType<'a> {
 	Root(Cow<'a, RootDirectory>),
 	Directory(Cow<'a, Directory>),

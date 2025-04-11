@@ -14,7 +14,7 @@ pub mod http;
 pub mod v2;
 pub mod v3;
 
-#[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub(crate) enum AuthInfo {
 	V1,
 	V2(v2::AuthInfo),
@@ -65,6 +65,7 @@ impl MetaCrypter for AuthInfo {
 	}
 }
 
+#[derive(Clone)]
 pub struct Client {
 	email: String,
 
