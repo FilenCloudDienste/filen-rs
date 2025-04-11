@@ -5,6 +5,7 @@ use crate::{
 	crypto::{self, shared::MetaCrypter},
 	error::Error,
 };
+use sha1::Digest;
 
 use super::http::UnauthClient;
 
@@ -49,7 +50,7 @@ pub(super) async fn login(
 
 	let response = api::v3::login::post(
 		&client,
-		api::v3::login::Request {
+		&api::v3::login::Request {
 			email,
 			password: pwd,
 			two_factor_code,
@@ -72,4 +73,15 @@ pub(super) async fn login(
 		response.private_key,
 		response.public_key,
 	))
+}
+
+pub(super) fn hash_name(name: impl AsRef<[u8]>) -> String {
+	let mut outer_hasher = sha1::Sha1::new();
+	let mut inner_hasher = sha2::Sha512::new();
+	inner_hasher.update(name.as_ref());
+	let mut hashed_name = [0u8; 128];
+	// SAFETY: The length of hashed_named must be 2x the length of a Sha512 hash, which is 128 bytes
+	faster_hex::hex_encode(inner_hasher.finalize().as_slice(), &mut hashed_name).unwrap();
+	outer_hasher.update(hashed_name);
+	faster_hex::hex_string(outer_hasher.finalize().as_slice())
 }

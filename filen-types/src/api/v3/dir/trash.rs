@@ -10,3 +10,9 @@ impl From<Request> for reqwest::Body {
 		serde_json::to_string(&val).unwrap().into()
 	}
 }
+
+impl From<Request> for reqwest::blocking::Body {
+	fn from(val: Request) -> Self {
+		serde_json::to_string(&val).unwrap().into()
+	}
+}

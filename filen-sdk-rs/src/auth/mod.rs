@@ -1,4 +1,4 @@
-use filen_types::auth::AuthVersion;
+use filen_types::auth::{AuthVersion, FileEncryptionVersion, MetaEncryptionVersion};
 use http::{AuthClient, UnauthClient};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 
@@ -21,7 +21,7 @@ pub(crate) enum AuthInfo {
 	V3(v3::AuthInfo),
 }
 
-impl MetaCrypter for AuthInfo {
+impl MetaCrypter for &AuthInfo {
 	fn decrypt_meta_into(
 		&self,
 		meta: &filen_types::crypto::EncryptedString,
@@ -47,16 +47,22 @@ impl MetaCrypter for AuthInfo {
 	}
 }
 
-pub enum FileEncryptionVersion {
-	V1,
-	V2,
-	V3,
-}
+impl MetaCrypter for AuthInfo {
+	fn decrypt_meta_into(
+		&self,
+		meta: &filen_types::crypto::EncryptedString,
+		out: &mut String,
+	) -> Result<(), crypto::error::ConversionError> {
+		(&self).decrypt_meta_into(meta, out)
+	}
 
-pub enum MetaEncryptionVersion {
-	V1,
-	V2,
-	V3,
+	fn encrypt_meta_into(
+		&self,
+		meta: &str,
+		out: &mut filen_types::crypto::EncryptedString,
+	) -> Result<(), crypto::error::ConversionError> {
+		(&self).encrypt_meta_into(meta, out)
+	}
 }
 
 pub struct Client {
@@ -75,11 +81,51 @@ pub struct Client {
 	http_client: AuthClient,
 }
 
+impl Client {
+	pub fn client(&self) -> &AuthClient {
+		&self.http_client
+	}
+
+	pub fn crypter(&self) -> impl MetaCrypter {
+		&self.auth_info
+	}
+
+	pub fn hash_name(&self, name: &str) -> String {
+		match self.auth_info {
+			AuthInfo::V1 | AuthInfo::V2(_) => v2::hash_name(name),
+			AuthInfo::V3(_) => v3::hash_name(name, &self.hmac_key),
+		}
+	}
+
+	pub fn root(&self) -> &RootDirectory {
+		&self.root_dir
+	}
+}
+
+impl std::fmt::Debug for Client {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Client")
+			.field("email", &self.email)
+			.field("root_dir", &self.root_dir)
+			.field(
+				"auth_info",
+				&match self.auth_info {
+					AuthInfo::V1 => "V1",
+					AuthInfo::V2(_) => "V2",
+					AuthInfo::V3(_) => "V3",
+				},
+			)
+			.field("file_encryption_version", &self.file_encryption_version)
+			.field("meta_encryption_version", &self.meta_encryption_version)
+			.finish()
+	}
+}
+
 pub async fn login(email: String, pwd: &str, two_factor_code: &str) -> Result<Client, Error> {
 	let client = UnauthClient::default();
 
 	let info_response =
-		api::v3::auth::info::post(&client, api::v3::auth::info::Request { email: &email }).await?;
+		api::v3::auth::info::post(&client, &api::v3::auth::info::Request { email: &email }).await?;
 
 	println!("info_response: {:?}", info_response);
 

@@ -2,7 +2,11 @@ use std::str::FromStr;
 
 use filen_types::crypto::rsa::{EncodedPublicKey, EncryptedPrivateKey};
 
-use crate::{api, crypto::shared::MetaCrypter, error::Error};
+use crate::{
+	api,
+	crypto::{rsa::HMACKey, shared::MetaCrypter},
+	error::Error,
+};
 
 use super::http::UnauthClient;
 
@@ -47,7 +51,7 @@ pub(super) async fn login(
 
 	let response = api::v3::login::post(
 		&client,
-		api::v3::login::Request {
+		&api::v3::login::Request {
 			email,
 			password: pwd,
 			two_factor_code,
@@ -71,4 +75,8 @@ pub(super) async fn login(
 		response.private_key,
 		response.public_key,
 	))
+}
+
+pub(super) fn hash_name(name: impl AsRef<[u8]>, hmac_key: &HMACKey) -> String {
+	hmac_key.hash_to_string(name.as_ref())
 }

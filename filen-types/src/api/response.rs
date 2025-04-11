@@ -24,4 +24,15 @@ where
 			code: self.code,
 		})
 	}
+
+	pub fn check_status(self) -> Result<(), ResponseError> {
+		if self.status.is_some_and(|s| s) {
+			Ok(())
+		} else {
+			Err(ResponseError::ApiError {
+				message: self.message,
+				code: self.code,
+			})
+		}
+	}
 }

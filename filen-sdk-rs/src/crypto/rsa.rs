@@ -23,13 +23,13 @@ impl HMACKey {
 }
 
 impl HMACKey {
-	pub(crate) fn hash(&self, data: &[u8]) -> Output<Sha256> {
+	pub(crate) fn hash(&self, data: impl AsRef<[u8]>) -> Output<Sha256> {
 		let mut hmac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC key should be valid");
-		hmac.update(data);
+		hmac.update(data.as_ref());
 		hmac.finalize().into_bytes()
 	}
 
-	pub(crate) fn hash_to_string(&self, data: &[u8]) -> String {
+	pub(crate) fn hash_to_string(&self, data: impl AsRef<[u8]>) -> String {
 		faster_hex::hex_string(&self.hash(data))
 	}
 }

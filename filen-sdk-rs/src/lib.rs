@@ -5,7 +5,7 @@ pub mod auth;
 pub mod consts;
 pub(crate) mod crypto;
 pub mod error;
-pub(crate) mod fs;
+pub mod fs;
 pub mod prelude;
 
 pub use prelude::*;

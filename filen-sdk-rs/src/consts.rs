@@ -1,4 +1,4 @@
-use crate::auth::{FileEncryptionVersion, MetaEncryptionVersion};
+use filen_types::auth::{FileEncryptionVersion, MetaEncryptionVersion};
 
 pub const GATEWAY_URLS: [&str; 8] = [
 	"https://gateway.filen.io",

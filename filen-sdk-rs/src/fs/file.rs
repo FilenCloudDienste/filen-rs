@@ -1,12 +1,11 @@
 use std::{borrow::Cow, str::FromStr};
 
 use chrono::{DateTime, Utc};
+use filen_types::crypto::Sha512Hash;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::crypto::{self, shared::Sha512Hash};
-
-use super::{FSObject, Metadata, NonRootFSObject};
+use crate::crypto::{self};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FileKey {
@@ -62,7 +61,7 @@ impl crypto::shared::DataCrypter for FileKey {
 	}
 }
 
-pub(crate) struct File {
+pub struct File {
 	uuid: Uuid,
 	name: String,
 	parent: Uuid,
@@ -73,7 +72,7 @@ pub(crate) struct File {
 	modified: DateTime<Utc>,
 }
 
-pub(crate) struct RemoteFile {
+pub struct RemoteFile {
 	file: File,
 	size: u64,
 	favorited: bool,
@@ -83,47 +82,52 @@ pub(crate) struct RemoteFile {
 	hash: Sha512Hash,
 }
 
-impl FSObject for RemoteFile {
-	fn name(&self) -> &str {
-		&self.file.name
-	}
-
-	fn uuid(&self) -> &uuid::Uuid {
-		&self.file.uuid
-	}
-}
-
-impl NonRootFSObject for RemoteFile {
-	fn parent(&self) -> &uuid::Uuid {
-		&self.file.parent
-	}
-
-	fn get_meta(&self) -> impl super::Metadata<'_> {
-		FileMeta {
-			name: Cow::Borrowed(&self.file.name),
-			size: self.size,
-			mime: Cow::Borrowed(&self.file.mime),
-			key: Cow::Borrowed(&self.file.key),
-			last_modified: self.file.modified,
-			created: self.file.created,
-			hash: self.hash,
-		}
+impl RemoteFile {
+	pub fn from_encrypted(
+		file: filen_types::api::v3::dir::content::File,
+		decrypter: impl crypto::shared::MetaCrypter,
+	) -> Result<Self, crate::error::Error> {
+		let meta = FileMeta::from_encrypted(&file.metadata, decrypter)?;
+		Ok(Self {
+			file: File {
+				name: meta.name.into_owned(),
+				uuid: file.uuid,
+				parent: file.parent,
+				mime: meta.mime.into_owned(),
+				key: meta.key.into_owned(),
+				created: meta.created,
+				modified: meta.last_modified,
+			},
+			size: file.size,
+			favorited: file.favorited,
+			region: file.region,
+			bucket: file.bucket,
+			chunks: file.chunks,
+			hash: meta.hash,
+		})
 	}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FileMeta<'a> {
+struct FileMeta<'a> {
 	name: Cow<'a, str>,
 	size: u64,
 	mime: Cow<'a, str>,
 	key: Cow<'a, FileKey>,
+	#[serde(with = "chrono::serde::ts_milliseconds")]
 	last_modified: DateTime<Utc>,
+	#[serde(with = "chrono::serde::ts_milliseconds")]
 	created: DateTime<Utc>,
 	hash: Sha512Hash,
 }
 
-impl Metadata<'_> for FileMeta<'_> {
-	fn make_string(&self) -> String {
-		serde_json::to_string(self).unwrap()
+impl FileMeta<'_> {
+	fn from_encrypted(
+		meta: &filen_types::crypto::EncryptedString,
+		decrypter: impl crypto::shared::MetaCrypter,
+	) -> Result<Self, crate::error::Error> {
+		let decrypted = decrypter.decrypt_meta(meta)?;
+		let meta: FileMeta = serde_json::from_str(&decrypted)?;
+		Ok(meta)
 	}
 }

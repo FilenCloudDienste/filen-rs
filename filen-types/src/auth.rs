@@ -12,7 +12,7 @@ impl Display for APIKey {
 	}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum AuthVersion {
 	V1 = 1,
@@ -20,8 +20,18 @@ pub enum AuthVersion {
 	V3 = 3,
 }
 
-impl Debug for AuthVersion {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "AuthVersion({})", serde_json::to_string(self).unwrap())
-	}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum FileEncryptionVersion {
+	V1 = 1,
+	V2 = 2,
+	V3 = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum MetaEncryptionVersion {
+	V1 = 1,
+	V2 = 2,
+	V3 = 3,
 }

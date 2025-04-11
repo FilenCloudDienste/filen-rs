@@ -5,14 +5,14 @@ use crate::{auth::http::AuthorizedClient, consts::gateway_url};
 
 pub(crate) async fn post(
 	client: impl AuthorizedClient,
-	request: Request,
+	request: &Request,
 ) -> Result<(), ResponseError> {
 	client
-		.post_auth_request_json(gateway_url("v3/dir/trash"))
-		.body(request)
+		.post_auth_request(gateway_url("v3/dir/trash"))
+		.json(request)
 		.send()
 		.await?
 		.json::<FilenResponse<()>>()
 		.await?
-		.into_data()
+		.check_status()
 }

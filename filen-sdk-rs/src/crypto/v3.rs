@@ -29,13 +29,16 @@ const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4, Som
 #[derive(Clone)]
 pub struct EncryptionKey {
 	pub bytes: [u8; 32],
-	pub cipher: AesGcm<Aes256, NonceSize, TagSize>,
+	pub cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
 }
 
 impl EncryptionKey {
 	pub fn new(key: [u8; 32]) -> Self {
 		let cipher = AesGcm::new(&key.into());
-		Self { bytes: key, cipher }
+		Self {
+			bytes: key,
+			cipher: Box::new(cipher),
+		}
 	}
 }
 

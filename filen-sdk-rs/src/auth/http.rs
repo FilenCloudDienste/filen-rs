@@ -31,6 +31,10 @@ impl AuthClient {
 			api_key,
 		}
 	}
+
+	pub(crate) fn get_api_key(&self) -> &APIKey {
+		&self.api_key
+	}
 }
 
 impl UnauthorizedClient for &AuthClient {
@@ -55,11 +59,6 @@ pub trait UnauthorizedClient {
 	fn post_request(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
 		self.get_client().post(url)
 	}
-
-	fn post_request_json(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
-		self.post_request(url)
-			.header("Content-Type", "application/json")
-	}
 }
 
 pub trait AuthorizedClient: UnauthorizedClient {
@@ -67,16 +66,11 @@ pub trait AuthorizedClient: UnauthorizedClient {
 
 	fn get_auth_request(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
 		self.get_request(url)
-			.header("Authorization", format!("Bearer {}", self.get_api_key()))
+			.bearer_auth(self.get_api_key().0.as_str())
 	}
 
 	fn post_auth_request(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
 		self.post_request(url)
-			.header("Authorization", format!("Bearer {}", self.get_api_key()))
-	}
-
-	fn post_auth_request_json(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
-		self.post_auth_request(url)
-			.header("Content-Type", "application/json")
+			.bearer_auth(self.get_api_key().0.as_str())
 	}
 }

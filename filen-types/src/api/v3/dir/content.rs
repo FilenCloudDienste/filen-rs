@@ -62,9 +62,11 @@ pub struct File {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Directory {
 	pub uuid: uuid::Uuid,
-	pub metadata: EncryptedString,
+	#[serde(rename = "name")]
+	pub meta: EncryptedString,
 	pub parent: uuid::Uuid,
-	pub color: String,
+	pub color: Option<String>,
+	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 	#[serde(with = "serde_u64_bool")]
 	pub favorited: bool,

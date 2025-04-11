@@ -5,11 +5,11 @@ use crate::{auth::http::UnauthorizedClient, consts::gateway_url};
 
 pub(crate) async fn post(
 	client: impl UnauthorizedClient,
-	request: Request<'_>,
+	request: &Request<'_>,
 ) -> Result<Response, ResponseError> {
 	client
-		.post_request_json(gateway_url("v3/login"))
-		.body(request)
+		.post_request(gateway_url("v3/login"))
+		.json(request)
 		.send()
 		.await?
 		.json::<FilenResponse<Response>>()

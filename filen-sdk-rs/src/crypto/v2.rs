@@ -34,7 +34,7 @@ pub(crate) fn generate_bad_nonce() -> Nonce<NonceSize> {
 #[derive(Clone)]
 pub struct MasterKey {
 	pub key: String,
-	pub cipher: AesGcm<Aes256, NonceSize, TagSize>,
+	pub cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
 }
 
 impl std::fmt::Debug for MasterKey {
@@ -59,7 +59,7 @@ impl FromStr for MasterKey {
 		let cipher = AesGcm::new(&derived_key.into());
 		Ok(Self {
 			key: key.to_string(),
-			cipher,
+			cipher: Box::new(cipher),
 		})
 	}
 }
