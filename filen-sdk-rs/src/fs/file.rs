@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::crypto::{self};
 
+use super::HasMeta;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FileKey {
 	V2(crypto::v2::FileKey),
@@ -61,6 +63,7 @@ impl crypto::shared::DataCrypter for FileKey {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
 	uuid: Uuid,
 	name: String,
@@ -72,6 +75,8 @@ pub struct File {
 	modified: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+
 pub struct RemoteFile {
 	file: File,
 	size: u64,
@@ -80,6 +85,31 @@ pub struct RemoteFile {
 	bucket: String,
 	chunks: u64,
 	hash: Sha512Hash,
+}
+
+impl HasMeta for &RemoteFile {
+	fn name(&self) -> &str {
+		&self.file.name
+	}
+
+	fn meta(
+		&self,
+		crypter: impl crypto::shared::MetaCrypter,
+	) -> Result<filen_types::crypto::EncryptedString, crypto::error::ConversionError> {
+		// SAFETY if this fails, I want it to panic
+		// as this is a logic error
+		let string = serde_json::to_string(&FileMeta {
+			name: Cow::Borrowed(&self.file.name),
+			size: self.size,
+			mime: Cow::Borrowed(&self.file.mime),
+			key: Cow::Borrowed(&self.file.key),
+			created: self.file.created,
+			last_modified: self.file.modified,
+			hash: self.hash,
+		})
+		.unwrap();
+		crypter.encrypt_meta(&string)
+	}
 }
 
 impl RemoteFile {

@@ -9,6 +9,11 @@ use crate::crypto::{error::ConversionError, shared::MetaCrypter};
 
 use super::{HasContents, HasMeta, HasParent, HasUUID};
 
+pub enum DirectoryType<'a> {
+	Root(Cow<'a, RootDirectory>),
+	Directory(Cow<'a, Directory>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootDirectory {
 	uuid: Uuid,
@@ -19,21 +24,6 @@ impl RootDirectory {
 		Self { uuid }
 	}
 }
-
-impl HasUUID for &RootDirectory {
-	fn uuid(&self) -> uuid::Uuid {
-		self.uuid
-	}
-}
-
-impl HasUUID for RootDirectory {
-	fn uuid(&self) -> uuid::Uuid {
-		(&self).uuid()
-	}
-}
-
-impl HasContents for RootDirectory {}
-impl HasContents for &RootDirectory {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Directory {
@@ -75,6 +65,22 @@ impl Directory {
 }
 
 // should probably write a macro for this
+
+impl HasUUID for &RootDirectory {
+	fn uuid(&self) -> uuid::Uuid {
+		self.uuid
+	}
+}
+
+impl HasUUID for RootDirectory {
+	fn uuid(&self) -> uuid::Uuid {
+		(&self).uuid()
+	}
+}
+
+impl HasContents for RootDirectory {}
+impl HasContents for &RootDirectory {}
+
 impl HasUUID for Directory {
 	fn uuid(&self) -> uuid::Uuid {
 		self.uuid
@@ -87,6 +93,24 @@ impl HasUUID for &Directory {
 }
 impl HasContents for Directory {}
 impl HasContents for &Directory {}
+
+impl HasUUID for &DirectoryType<'_> {
+	fn uuid(&self) -> uuid::Uuid {
+		match self {
+			DirectoryType::Root(dir) => dir.uuid(),
+			DirectoryType::Directory(dir) => dir.uuid(),
+		}
+	}
+}
+
+impl HasUUID for DirectoryType<'_> {
+	fn uuid(&self) -> uuid::Uuid {
+		(&self).uuid()
+	}
+}
+
+impl HasContents for DirectoryType<'_> {}
+impl HasContents for &DirectoryType<'_> {}
 
 impl HasParent for Directory {
 	fn parent(&self) -> uuid::Uuid {

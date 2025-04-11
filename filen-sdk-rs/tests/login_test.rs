@@ -4,7 +4,7 @@ use std::{env, sync::Arc};
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{HasMeta, dir::Directory},
+	fs::{FSObjectType, HasMeta, dir::Directory},
 	prelude::*,
 };
 
@@ -99,4 +99,22 @@ async fn test_dir_actions() {
 	if !dirs.contains(&dir) {
 		panic!("Directory not found in root directory");
 	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_find_path() {
+	let resources = RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
+	let dir_b = create_dir(client, &dir_a, "b".to_string()).await.unwrap();
+	let dir_c = create_dir(client, &dir_b, "c".to_string()).await.unwrap();
+
+	assert_eq!(
+		find_item_at_path(client, format!("{}/a/b/c", test_dir.name()))
+			.await
+			.unwrap(),
+		FSObjectType::Dir(std::borrow::Cow::Borrowed(&dir_c))
+	);
 }

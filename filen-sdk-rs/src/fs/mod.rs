@@ -1,4 +1,6 @@
-use dir::Directory;
+use std::borrow::Cow;
+
+use dir::{Directory, DirectoryType};
 use file::RemoteFile;
 use filen_types::crypto::EncryptedString;
 
@@ -11,10 +13,11 @@ use crate::{
 pub mod dir;
 pub mod file;
 
-pub enum FSObject {
-	Dir(dir::Directory),
-	Root(dir::RootDirectory),
-	File(file::RemoteFile),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FSObjectType<'a> {
+	Dir(Cow<'a, dir::Directory>),
+	Root(Cow<'a, dir::RootDirectory>),
+	File(Cow<'a, file::RemoteFile>),
 }
 
 pub enum NonRootFSObject {
@@ -94,10 +97,37 @@ pub async fn trash_dir(client: &Client, dir: Directory) -> Result<(), crate::err
 	Ok(())
 }
 
-// pub fn find_item_at_path(
-// 	client: &Client,
-// 	path: impl AsRef<Path>,
-// ) -> Result<FSObject, crate::error::Error> {
-// 	for component in path.as_ref().canonicalize()?.components() {}
-// 	todo!();
-// }
+pub async fn find_item_at_path(
+	client: &Client,
+	path: impl AsRef<str>,
+) -> Result<FSObjectType, crate::error::Error> {
+	let mut curr_dir = DirectoryType::Root(Cow::Borrowed(client.root()));
+	let mut curr_path = String::with_capacity(path.as_ref().len());
+	let mut path_iter = path.as_ref().split('/');
+	while let Some(component) = path_iter.next() {
+		if component.is_empty() {
+			continue;
+		}
+		let (dirs, files) = list_dir(client, &curr_dir).await?;
+		if let Some(dir) = dirs.into_iter().find(|d| d.name() == component) {
+			curr_dir = DirectoryType::Directory(Cow::Owned(dir));
+			curr_path.push_str(component);
+			curr_path.push('/');
+			continue;
+		}
+
+		if let Some(file) = files.into_iter().find(|f| f.name() == component) {
+			if let Some(next) = path_iter.next() {
+				return Err(crate::error::Error::Custom(format!(
+					"Path {} is a file, but tried to access {}/{}",
+					curr_path, curr_path, next
+				)));
+			}
+			return Ok(FSObjectType::File(Cow::Owned(file)));
+		}
+	}
+	match curr_dir {
+		DirectoryType::Root(_) => Ok(FSObjectType::Root(Cow::Borrowed(client.root()))),
+		DirectoryType::Directory(dir) => Ok(FSObjectType::Dir(dir)),
+	}
+}
