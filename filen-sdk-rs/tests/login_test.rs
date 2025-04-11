@@ -116,3 +116,17 @@ async fn test_find_path() {
 		FSObjectType::Dir(std::borrow::Cow::Borrowed(&dir_c))
 	);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_find_create_dir() {
+	let resources = RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let path = format!("{}/a/b/c", test_dir.name());
+	let nested_dir = find_or_create_dir(client, &path).await.unwrap();
+
+	assert_eq!(
+		Into::<FSObjectType<'_>>::into(nested_dir),
+		find_item_at_path(client, &path).await.unwrap()
+	);
+}

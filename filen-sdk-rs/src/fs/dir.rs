@@ -12,7 +12,7 @@ use super::{HasContents, HasMeta, HasParent, HasUUID};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectoryType<'a> {
 	Root(Cow<'a, RootDirectory>),
-	Directory(Cow<'a, Directory>),
+	Dir(Cow<'a, Directory>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,7 +99,7 @@ impl HasUUID for &DirectoryType<'_> {
 	fn uuid(&self) -> uuid::Uuid {
 		match self {
 			DirectoryType::Root(dir) => dir.uuid(),
-			DirectoryType::Directory(dir) => dir.uuid(),
+			DirectoryType::Dir(dir) => dir.uuid(),
 		}
 	}
 }
