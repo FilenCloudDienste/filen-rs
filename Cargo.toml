@@ -2,8 +2,5 @@
 resolver = "2"
 members = ["filen-sdk-rs","filen-types"]
 
-[profile.dev]
-opt-level = 3
-
 [profile.test]
 opt-level = 3
