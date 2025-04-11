@@ -22,18 +22,36 @@ pub struct Response {
 	pub dirs: Vec<Directory>,
 }
 
-mod serde_u64_bool {
-	use serde::Deserialize;
+pub(crate) mod serde_u8_bool {
+	use serde::{Deserialize, de::Unexpected};
 
-	pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let value = u64::deserialize(deserializer)?;
-		Ok(value != 0)
+		match serde_json::Value::deserialize(deserializer) {
+			Ok(serde_json::Value::Bool(value)) => Ok(value),
+			Ok(serde_json::Value::Number(num)) => {
+				if let Some(value) = num.as_i64() {
+					Ok(value != 0)
+				} else if let Some(value) = num.as_u64() {
+					Ok(value != 0)
+				} else {
+					Err(serde::de::Error::invalid_value(
+						Unexpected::Other("not a boolean or number"),
+						&"boolean or number",
+					))
+				}
+			}
+			Ok(other) => Err(serde::de::Error::invalid_value(
+				Unexpected::Other(&format!("{:?}", other)),
+				&"boolean or number",
+			)),
+			Err(e) => Err(e),
+		}
 	}
 
-	pub(super) fn serialize<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
+	pub(crate) fn serialize<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,
 	{
@@ -55,7 +73,7 @@ pub struct File {
 	pub region: String,
 	pub parent: uuid::Uuid,
 	pub version: FileEncryptionVersion,
-	#[serde(with = "serde_u64_bool")]
+	#[serde(with = "serde_u8_bool")]
 	pub favorited: bool,
 }
 
@@ -68,10 +86,10 @@ pub struct Directory {
 	pub color: Option<String>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
-	#[serde(with = "serde_u64_bool")]
+	#[serde(with = "serde_u8_bool")]
 	pub favorited: bool,
-	#[serde(with = "serde_u64_bool")]
+	#[serde(with = "serde_u8_bool")]
 	pub is_sync: bool,
-	#[serde(with = "serde_u64_bool")]
+	#[serde(with = "serde_u8_bool")]
 	pub is_default: bool,
 }

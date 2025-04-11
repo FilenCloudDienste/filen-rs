@@ -130,3 +130,20 @@ async fn test_find_create_dir() {
 		find_item_at_path(client, &path).await.unwrap()
 	);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_list_dir_recursive() {
+	let resources = RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
+	let dir_b = create_dir(client, &dir_a, "b".to_string()).await.unwrap();
+	let dir_c = create_dir(client, &dir_b, "c".to_string()).await.unwrap();
+
+	let (dirs, _) = list_dir_recursive(client, test_dir).await.unwrap();
+
+	assert!(dirs.contains(&dir_a));
+	assert!(dirs.contains(&dir_b));
+	assert!(dirs.contains(&dir_c));
+}

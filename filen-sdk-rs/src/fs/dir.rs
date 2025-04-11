@@ -53,6 +53,25 @@ impl Directory {
 		})
 	}
 
+	pub fn try_from_encrypted(
+		dir: filen_types::api::v3::dir::download::Directory,
+		decrypter: impl MetaCrypter,
+	) -> Result<Option<Self>, crate::error::Error> {
+		let parent = match dir.parent {
+			None => return Ok(None),
+			Some(parent) => parent,
+		};
+		let meta = DirectoryMeta::from_encrypted(&dir.meta, decrypter)?;
+		Ok(Some(Self {
+			name: meta.name.into_owned(),
+			uuid: dir.uuid,
+			parent,
+			color: dir.color,
+			created: meta.created,
+			favorited: dir.favorited,
+		}))
+	}
+
 	pub fn new(name: String, parent: Uuid, created: DateTime<Utc>) -> Self {
 		Self {
 			uuid: Uuid::new_v4(),

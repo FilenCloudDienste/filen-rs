@@ -175,3 +175,35 @@ pub async fn find_or_create_dir(
 	}
 	Ok(curr_dir)
 }
+
+pub async fn list_dir_recursive(
+	client: &Client,
+	dir: &impl HasContents,
+) -> Result<(Vec<Directory>, Vec<RemoteFile>), crate::error::Error> {
+	let response = api::v3::dir::download::post(
+		client.client(),
+		&api::v3::dir::download::Request {
+			uuid: dir.uuid(),
+			skip_cache: false,
+		},
+	)
+	.await?;
+
+	let dirs = response
+		.dirs
+		.into_iter()
+		.map(|d| dir::Directory::try_from_encrypted(d, client.crypter()))
+		.filter_map(|d| match d {
+			Ok(Some(d)) => Some(Ok(d)),
+			Ok(None) => None,
+			Err(e) => Some(Err(e)),
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+
+	let files = response
+		.files
+		.into_iter()
+		.map(|f| file::RemoteFile::from_encrypted(f, client.crypter()))
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok((dirs, files))
+}
