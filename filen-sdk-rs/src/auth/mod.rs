@@ -127,8 +127,6 @@ pub async fn login(email: String, pwd: &str, two_factor_code: &str) -> Result<Cl
 	let info_response =
 		api::v3::auth::info::post(&client, &api::v3::auth::info::Request { email: &email }).await?;
 
-	println!("info_response: {:?}", info_response);
-
 	let (client, auth_info, private_key, public_key) = match info_response.auth_version {
 		AuthVersion::V1 => unimplemented!(),
 		AuthVersion::V2 => v2::login(&email, pwd, two_factor_code, &info_response, client).await?,
