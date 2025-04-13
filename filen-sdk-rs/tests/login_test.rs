@@ -181,3 +181,39 @@ async fn test_dir_move() {
 	move_dir(client, &mut dir_a, &dir_b).await.unwrap();
 	assert!(list_dir(client, &dir_b).await.unwrap().0.contains(&dir_a));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_dir_size() {
+	let resources = RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	assert_eq!(
+		get_dir_size(client, test_dir, false).await.unwrap(),
+		filen_types::api::v3::dir::size::Response {
+			size: 0,
+			files: 0,
+			dirs: 0
+		}
+	);
+
+	create_dir(client, test_dir, "a".to_string()).await.unwrap();
+	assert_eq!(
+		get_dir_size(client, test_dir, false).await.unwrap(),
+		filen_types::api::v3::dir::size::Response {
+			size: 0,
+			files: 0,
+			dirs: 1
+		}
+	);
+
+	create_dir(client, test_dir, "b".to_string()).await.unwrap();
+	assert_eq!(
+		get_dir_size(client, test_dir, false).await.unwrap(),
+		filen_types::api::v3::dir::size::Response {
+			size: 0,
+			files: 0,
+			dirs: 2
+		}
+	);
+}

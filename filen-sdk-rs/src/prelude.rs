@@ -3,6 +3,7 @@ pub use crate::fs::create_dir;
 pub use crate::fs::dir_exists;
 pub use crate::fs::find_item_at_path;
 pub use crate::fs::find_or_create_dir;
+pub use crate::fs::get_dir_size;
 pub use crate::fs::list_dir;
 pub use crate::fs::list_dir_recursive;
 pub use crate::fs::move_dir;

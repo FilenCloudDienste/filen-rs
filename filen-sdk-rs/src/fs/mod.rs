@@ -251,3 +251,21 @@ pub async fn move_dir(
 	dir.parent = new_parent.uuid();
 	Ok(())
 }
+
+pub async fn get_dir_size(
+	client: &Client,
+	dir: &impl HasContents,
+	trash: bool,
+) -> Result<api::v3::dir::size::Response, Error> {
+	let response = api::v3::dir::size::post(
+		client.client(),
+		&api::v3::dir::size::Request {
+			uuid: dir.uuid(),
+			sharer_id: None,
+			receiver_id: None,
+			trash,
+		},
+	)
+	.await?;
+	Ok(response)
+}
