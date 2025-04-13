@@ -30,7 +30,7 @@ impl RootDirectory {
 pub struct Directory {
 	pub(super) uuid: Uuid,
 	name: String,
-	parent: Uuid,
+	pub(super) parent: Uuid,
 
 	color: Option<String>, // todo use Color struct
 	created: Option<DateTime<Utc>>,

@@ -4,7 +4,7 @@ use std::env;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{FSObjectType, HasMeta, HasUUID, dir::Directory},
+	fs::{FSObjectType, HasMeta, HasUUID, dir::Directory, move_dir},
 	prelude::*,
 };
 
@@ -165,4 +165,19 @@ async fn test_dir_exists() {
 
 	trash_dir(client, dir_a).await.unwrap();
 	assert!(dir_exists(client, test_dir, "a").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_dir_move() {
+	let resources = RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let mut dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
+	let dir_b = create_dir(client, test_dir, "b".to_string()).await.unwrap();
+
+	assert!(list_dir(client, &dir_b).await.unwrap().0.is_empty());
+
+	move_dir(client, &mut dir_a, &dir_b).await.unwrap();
+	assert!(list_dir(client, &dir_b).await.unwrap().0.contains(&dir_a));
 }

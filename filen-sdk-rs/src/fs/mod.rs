@@ -232,3 +232,22 @@ pub async fn dir_exists(
 		}
 	})
 }
+
+// todo add overwriting
+// I want to add this in tandem with a locking mechanism so that I avoid race conditions
+pub async fn move_dir(
+	client: &Client,
+	dir: &mut Directory,
+	new_parent: &impl HasContents,
+) -> Result<(), Error> {
+	api::v3::dir::r#move::post(
+		client.client(),
+		&api::v3::dir::r#move::Request {
+			uuid: dir.uuid(),
+			to: new_parent.uuid(),
+		},
+	)
+	.await?;
+	dir.parent = new_parent.uuid();
+	Ok(())
+}
