@@ -208,3 +208,27 @@ pub async fn list_dir_recursive(
 		.collect::<Result<Vec<_>, _>>()?;
 	Ok((dirs, files))
 }
+
+pub async fn dir_exists(
+	client: &Client,
+	parent: impl HasContents,
+	name: impl AsRef<str>,
+) -> Result<Option<uuid::Uuid>, Error> {
+	let response = api::v3::dir::exists::post(
+		client.client(),
+		&api::v3::dir::exists::Request {
+			parent: parent.uuid(),
+			name_hashed: client.hash_name(name.as_ref()),
+		},
+	)
+	.await?;
+	Ok(match (response.exists, response.uuid) {
+		(true, Some(uuid)) => Some(uuid),
+		(false, _) => None,
+		(true, None) => {
+			return Err(Error::Custom(
+				"dir_exists returned true but no uuid".to_owned(),
+			));
+		}
+	})
+}

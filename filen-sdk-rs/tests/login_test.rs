@@ -4,7 +4,7 @@ use std::env;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{FSObjectType, HasMeta, dir::Directory},
+	fs::{FSObjectType, HasMeta, HasUUID, dir::Directory},
 	prelude::*,
 };
 
@@ -146,4 +146,23 @@ async fn test_list_dir_recursive() {
 	assert!(dirs.contains(&dir_a));
 	assert!(dirs.contains(&dir_b));
 	assert!(dirs.contains(&dir_c));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_dir_exists() {
+	let resources = RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	assert!(dir_exists(client, test_dir, "a").await.unwrap().is_none());
+
+	let dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
+
+	assert_eq!(
+		Some(dir_a.uuid()),
+		dir_exists(client, test_dir, "a").await.unwrap()
+	);
+
+	trash_dir(client, dir_a).await.unwrap();
+	assert!(dir_exists(client, test_dir, "a").await.unwrap().is_none());
 }
