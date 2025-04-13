@@ -22,44 +22,6 @@ pub struct Response {
 	pub dirs: Vec<Directory>,
 }
 
-pub(crate) mod serde_u8_bool {
-	use serde::{Deserialize, de::Unexpected};
-
-	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		match serde_json::Value::deserialize(deserializer) {
-			Ok(serde_json::Value::Bool(value)) => Ok(value),
-			Ok(serde_json::Value::Number(num)) => {
-				if let Some(value) = num.as_i64() {
-					Ok(value != 0)
-				} else if let Some(value) = num.as_u64() {
-					Ok(value != 0)
-				} else {
-					Err(serde::de::Error::invalid_value(
-						Unexpected::Other("not a boolean or number"),
-						&"boolean or number",
-					))
-				}
-			}
-			Ok(other) => Err(serde::de::Error::invalid_value(
-				Unexpected::Other(&format!("{:?}", other)),
-				&"boolean or number",
-			)),
-			Err(e) => Err(e),
-		}
-	}
-
-	pub(crate) fn serialize<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		let value = if *value { 1 } else { 0 };
-		serializer.serialize_u64(value)
-	}
-}
-
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct File {
 	pub uuid: uuid::Uuid,
@@ -73,7 +35,7 @@ pub struct File {
 	pub region: String,
 	pub parent: uuid::Uuid,
 	pub version: FileEncryptionVersion,
-	#[serde(with = "serde_u8_bool")]
+	#[serde(with = "crate::serde::boolean::number")]
 	pub favorited: bool,
 }
 
@@ -86,10 +48,10 @@ pub struct Directory {
 	pub color: Option<String>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
-	#[serde(with = "serde_u8_bool")]
+	#[serde(with = "crate::serde::boolean::number")]
 	pub favorited: bool,
-	#[serde(with = "serde_u8_bool")]
+	#[serde(with = "crate::serde::boolean::number")]
 	pub is_sync: bool,
-	#[serde(with = "serde_u8_bool")]
+	#[serde(with = "crate::serde::boolean::number")]
 	pub is_default: bool,
 }
