@@ -26,7 +26,7 @@ pub struct EncryptedMasterKeys(pub EncryptedString);
 pub struct EncryptedDEK(pub EncryptedString);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sha512Hash(#[serde(with = "faster_hex")] digest::Output<Sha512>);
+pub struct Sha512Hash(#[serde(with = "faster_hex::nopfx_ignorecase")] digest::Output<Sha512>);
 
 impl From<digest::Output<Sha512>> for Sha512Hash {
 	fn from(hash: digest::Output<Sha512>) -> Self {
@@ -47,7 +47,7 @@ impl From<Sha512Hash> for [u8; 64] {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sha256Hash(#[serde(with = "faster_hex")] digest::Output<sha2::Sha256>);
+pub struct Sha256Hash(#[serde(with = "faster_hex::nopfx_ignorecase")] digest::Output<sha2::Sha256>);
 impl From<digest::Output<sha2::Sha256>> for Sha256Hash {
 	fn from(hash: digest::Output<sha2::Sha256>) -> Self {
 		Self(hash)

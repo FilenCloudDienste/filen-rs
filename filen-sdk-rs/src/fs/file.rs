@@ -139,6 +139,7 @@ impl RemoteFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FileMeta<'a> {
 	name: Cow<'a, str>,
 	size: u64,
@@ -147,6 +148,7 @@ struct FileMeta<'a> {
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	last_modified: DateTime<Utc>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(rename = "creation")]
 	created: DateTime<Utc>,
 	hash: Sha512Hash,
 }
