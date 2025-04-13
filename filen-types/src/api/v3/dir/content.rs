@@ -8,12 +8,6 @@ pub struct Request {
 	pub uuid: uuid::Uuid,
 }
 
-impl From<Request> for reqwest::Body {
-	fn from(val: Request) -> Self {
-		serde_json::to_string(&val).unwrap().into()
-	}
-}
-
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Response {
 	#[serde(rename = "uploads")]

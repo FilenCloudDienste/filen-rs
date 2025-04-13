@@ -12,12 +12,6 @@ pub struct Request {
 	pub parent: uuid::Uuid,
 }
 
-impl From<Request> for reqwest::Body {
-	fn from(val: Request) -> Self {
-		serde_json::to_string(&val).unwrap().into()
-	}
-}
-
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Response {
 	pub uuid: uuid::Uuid,
