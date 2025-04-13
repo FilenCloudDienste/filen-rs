@@ -8,6 +8,7 @@ use crate::{
 	api,
 	auth::Client,
 	crypto::{error::ConversionError, shared::MetaCrypter},
+	error::Error,
 };
 
 pub mod dir;
@@ -52,7 +53,7 @@ pub trait HasMeta {
 pub async fn list_dir(
 	client: &Client,
 	dir: impl HasContents,
-) -> Result<(Vec<Directory>, Vec<RemoteFile>), crate::error::Error> {
+) -> Result<(Vec<Directory>, Vec<RemoteFile>), Error> {
 	let response = api::v3::dir::content::post(
 		client.client(),
 		&api::v3::dir::content::Request { uuid: dir.uuid() },
@@ -77,7 +78,7 @@ pub async fn create_dir(
 	client: &Client,
 	parent: impl HasContents,
 	name: impl Into<String>,
-) -> Result<dir::Directory, crate::error::Error> {
+) -> Result<dir::Directory, Error> {
 	let mut dir = dir::Directory::new(name.into(), parent.uuid(), chrono::Utc::now());
 
 	let response = api::v3::dir::create::post(
@@ -97,7 +98,7 @@ pub async fn create_dir(
 	Ok(dir)
 }
 
-pub async fn trash_dir(client: &Client, dir: Directory) -> Result<(), crate::error::Error> {
+pub async fn trash_dir(client: &Client, dir: Directory) -> Result<(), Error> {
 	api::v3::dir::trash::post(
 		client.client(),
 		&api::v3::dir::trash::Request { uuid: dir.uuid() },
@@ -109,7 +110,7 @@ pub async fn trash_dir(client: &Client, dir: Directory) -> Result<(), crate::err
 pub async fn find_item_at_path(
 	client: &Client,
 	path: impl AsRef<str>,
-) -> Result<FSObjectType, crate::error::Error> {
+) -> Result<FSObjectType, Error> {
 	let mut curr_dir = DirectoryType::Root(Cow::Borrowed(client.root()));
 	let mut curr_path = String::with_capacity(path.as_ref().len());
 	let mut path_iter = path.as_ref().split('/');
@@ -127,7 +128,7 @@ pub async fn find_item_at_path(
 
 		if let Some(file) = files.into_iter().find(|f| f.name() == component) {
 			if let Some(next) = path_iter.next() {
-				return Err(crate::error::Error::Custom(format!(
+				return Err(Error::Custom(format!(
 					"Path {} is a file, but tried to access {}/{}",
 					curr_path, curr_path, next
 				)));
@@ -144,7 +145,7 @@ pub async fn find_item_at_path(
 pub async fn find_or_create_dir(
 	client: &Client,
 	path: impl AsRef<str>,
-) -> Result<DirectoryType, crate::error::Error> {
+) -> Result<DirectoryType, Error> {
 	let mut curr_dir = DirectoryType::Root(Cow::Borrowed(client.root()));
 	let mut curr_path = String::with_capacity(path.as_ref().len());
 	for component in path.as_ref().split('/') {
@@ -160,7 +161,7 @@ pub async fn find_or_create_dir(
 		}
 
 		if files.iter().any(|f| f.name() == component) {
-			return Err(crate::error::Error::Custom(format!(
+			return Err(Error::Custom(format!(
 				"find_or_create_dir path {}/{} is a file when trying to create dir {}",
 				curr_path,
 				component,
@@ -179,7 +180,7 @@ pub async fn find_or_create_dir(
 pub async fn list_dir_recursive(
 	client: &Client,
 	dir: &impl HasContents,
-) -> Result<(Vec<Directory>, Vec<RemoteFile>), crate::error::Error> {
+) -> Result<(Vec<Directory>, Vec<RemoteFile>), Error> {
 	let response = api::v3::dir::download::post(
 		client.client(),
 		&api::v3::dir::download::Request {
