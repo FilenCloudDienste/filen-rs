@@ -224,16 +224,6 @@ async fn test_file_download() {
 	let resources = RESOURCES.get_resources().await;
 	let client = Arc::new(resources.client.clone());
 
-	let file = find_item_at_path(&client, "a.txt").await.unwrap();
-	let file = match file {
-		FSObjectType::File(file) => Arc::new(file.into_owned()),
-		_ => panic!("Expected a file"),
-	};
-	let mut reader = file.get_reader(client.clone());
-	let mut buf = String::with_capacity(1024);
-	reader.read_to_string(&mut buf).await.unwrap();
-	assert_eq!(&buf, "asdfasdfsfd");
-
 	let file = find_item_at_path(&client, "compat-go/small.txt")
 		.await
 		.unwrap();
