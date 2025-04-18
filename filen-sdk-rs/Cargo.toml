@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.12.15", features = ["json"] }
+reqwest = { version = "0.12.15", features = ["json", "stream"] }
 filen-types = { path = "../filen-types" }
 rand = "0.9.0"
 aes-gcm = { version = "0.10.3", features = ["std"] }
@@ -25,9 +25,9 @@ faster-hex = { version = "0.10.0", features = ["serde"] }
 argon2 = { version = "0.5.3", features = ["std"] }
 serde_path_to_error = "0.1.17"
 sha1 = "0.10.6"
+futures = "0.3.31"
 
 [dev-dependencies]
 dotenv = "0.15.0"
-futures = "0.3.31"
 tokio = { version = "1.44.2", features = ["full"] }
 

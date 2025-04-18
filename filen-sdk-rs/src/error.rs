@@ -12,4 +12,6 @@ pub enum Error {
 	SerdeJsonError(#[from] serde_json::Error),
 	#[error("`{0}`")]
 	Custom(String),
+	#[error("The returned chunk was too large expected `{expected}`, got `{actual}`")]
+	ChunkTooLarge { expected: usize, actual: usize },
 }

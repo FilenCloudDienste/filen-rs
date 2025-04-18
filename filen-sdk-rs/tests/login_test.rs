@@ -1,5 +1,5 @@
 use core::panic;
-use std::env;
+use std::{env, fmt::Write, sync::Arc};
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
@@ -8,6 +8,7 @@ use filen_sdk_rs::{
 	prelude::*,
 };
 
+use futures::AsyncReadExt;
 use tokio::sync::OnceCell;
 
 struct Resources {
@@ -216,4 +217,65 @@ async fn test_dir_size() {
 			dirs: 2
 		}
 	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_file_download() {
+	let resources = RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+
+	let file = find_item_at_path(&client, "a.txt").await.unwrap();
+	let file = match file {
+		FSObjectType::File(file) => Arc::new(file.into_owned()),
+		_ => panic!("Expected a file"),
+	};
+	let mut reader = file.get_reader(client.clone());
+	let mut buf = String::with_capacity(1024);
+	reader.read_to_string(&mut buf).await.unwrap();
+	assert_eq!(&buf, "asdfasdfsfd");
+
+	let file = find_item_at_path(&client, "compat-go/small.txt")
+		.await
+		.unwrap();
+	let file = match file {
+		FSObjectType::File(file) => Arc::new(file.into_owned()),
+		_ => panic!("Expected a file"),
+	};
+	let mut reader = file.get_reader(client.clone());
+	let mut buf = String::with_capacity(1024);
+	reader.read_to_string(&mut buf).await.unwrap();
+	assert_eq!(&buf, "Hello World from Go!");
+
+	let file = find_item_at_path(&client, "compat-go/big.txt")
+		.await
+		.unwrap();
+	let file = match file {
+		FSObjectType::File(file) => Arc::new(file.into_owned()),
+		_ => panic!("Expected a file"),
+	};
+	let mut reader = file.clone().get_reader(client.clone());
+	let mut buf = String::with_capacity(1024);
+	reader.read_to_string(&mut buf).await.unwrap();
+
+	assert_eq!(buf.len(), file.size() as usize);
+
+	let file = find_item_at_path(&client, "compat-go/large_sample-20mb.txt")
+		.await
+		.unwrap();
+	let file = match file {
+		FSObjectType::File(file) => Arc::new(file.into_owned()),
+		_ => panic!("Expected a file"),
+	};
+	let mut reader = file.get_reader(client.clone());
+	let mut buf = String::with_capacity(1024);
+	reader.read_to_string(&mut buf).await.unwrap();
+
+	let mut test_str = String::with_capacity(30_000_000);
+
+	for i in 0..2_700_000 {
+		test_str.write_str(i.to_string().as_str()).unwrap();
+		test_str.write_char('\n').unwrap();
+	}
+	assert_eq!(buf.len(), test_str.len());
+	assert_eq!(buf, test_str);
 }
