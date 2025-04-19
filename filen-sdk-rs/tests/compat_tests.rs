@@ -11,12 +11,20 @@ use filen_sdk_rs::{
 	},
 	prelude::*,
 };
+use filen_types::auth::FileEncryptionVersion;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use rand::TryRngCore;
 
 mod test_utils;
 
 fn get_compat_test_file(client: &Client, parent: impl HasContents) -> (FileBuilder, String) {
+	let file_key_str = match client.file_encryption_version() {
+		FileEncryptionVersion::V1 => "0123456789abcdefghijklmnopqrstuv",
+		FileEncryptionVersion::V2 => "0123456789abcdefghijklmnopqrstuv",
+		FileEncryptionVersion::V3 => {
+			&faster_hex::hex_string("0123456789abcdefghijklmnopqrstuv".as_bytes())
+		}
+	};
 	let file = FileBuilder::new("large_sample-20mb.txt", parent, client)
 		.created(DateTime::<Utc>::from_naive_utc_and_offset(
 			NaiveDateTime::new(
@@ -32,7 +40,7 @@ fn get_compat_test_file(client: &Client, parent: impl HasContents) -> (FileBuild
 			),
 			Utc,
 		))
-		.key(FileKey::from_str("0123456789abcdefghijklmnopqrstuv").unwrap());
+		.key(FileKey::from_str(file_key_str).unwrap());
 
 	let mut test_str = String::new();
 	for i in 0..2_700_000 {
