@@ -291,10 +291,7 @@ impl FileReader<'_> {
 			let chunk = Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA);
 			chunks.push(chunk);
 		}
-		if DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE < new.file.chunks()
-			|| DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE == new.file.chunks() // for when the file is perfectly chunk aligned
-				&& size % CHUNK_SIZE_U64 == 0
-		{
+		if DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE < new.file.chunks() || size % CHUNK_SIZE_U64 == 0 {
 			// if we have more chunks than threads, we need to add a full chunk for the last thread
 			let chunk = Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA);
 			chunks.push(chunk);
