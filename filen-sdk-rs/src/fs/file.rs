@@ -278,6 +278,10 @@ impl FileReader<'_> {
 		};
 
 		let num_threads: u64 = Ord::min(DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE, new.file.chunks());
+		if num_threads == 0 {
+			// if we have no threads, we can just return
+			return new;
+		}
 		// this should never exceed u32 as DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE should be relatively low
 		let num_threads: usize = num_threads.try_into().unwrap();
 
