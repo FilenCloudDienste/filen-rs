@@ -234,8 +234,9 @@ impl DataCrypter for FileKey {
 }
 
 impl CreateRandom for FileKey {
-	fn seeded_generate(rng: rand::prelude::ThreadRng) -> Self {
-		Self(super::v3::EncryptionKey::seeded_generate(rng))
+	fn seeded_generate(_rng: rand::prelude::ThreadRng) -> Self {
+		Self::from_str(&super::shared::generate_random_base64_values(32))
+			.expect("Failed to generate V2 key")
 	}
 }
 

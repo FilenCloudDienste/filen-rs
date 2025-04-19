@@ -1,5 +1,5 @@
 use filen_types::crypto::EncryptedString;
-use rand::rngs::ThreadRng;
+use rand::{Rng, rngs::ThreadRng};
 
 use super::error::ConversionError;
 
@@ -36,4 +36,20 @@ pub(crate) trait CreateRandom: Sized {
 	fn generate() -> Self {
 		Self::seeded_generate(rand::rng())
 	}
+}
+
+const BASE64_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+pub fn generate_random_base64_values(len: usize) -> String {
+	let mut rng = rand::rng();
+	let mut values = String::with_capacity(len);
+	for _ in 0..len {
+		values.push(
+			BASE64_ALPHABET
+				.chars()
+				.nth(rng.random_range(0..64))
+				.unwrap(), // SAFETY: The range is valid and the alphabet is 64 characters long.
+		);
+	}
+	values
 }
