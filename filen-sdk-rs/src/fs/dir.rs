@@ -82,6 +82,14 @@ impl Directory {
 			favorited: false,
 		}
 	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn uuid(&self) -> Uuid {
+		self.uuid
+	}
 }
 
 // should probably write a macro for this

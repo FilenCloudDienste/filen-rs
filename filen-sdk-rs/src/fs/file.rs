@@ -156,6 +156,12 @@ impl FileBuilder {
 		self
 	}
 
+	/// Should not be used outside of testing
+	pub fn uuid(mut self, uuid: Uuid) -> Self {
+		self.uuid = uuid;
+		self
+	}
+
 	pub fn build(self) -> File {
 		File {
 			uuid: self.uuid,
@@ -294,6 +300,10 @@ impl RemoteFile {
 
 	pub fn size(&self) -> u64 {
 		self.size
+	}
+
+	pub fn inner_file(&self) -> &File {
+		&self.file
 	}
 
 	pub fn into_reader(self, client: Arc<Client>) -> impl AsyncRead {
