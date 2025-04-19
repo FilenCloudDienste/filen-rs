@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use aes_gcm::{
-	AesGcm, KeyInit, Nonce,
+	AesGcm, Nonce,
 	aead::{Aead, AeadInPlace},
 	aes::Aes256,
 };
@@ -56,7 +56,7 @@ impl FromStr for MasterKey {
 		let mut derived_key = [0u8; 32];
 		pbkdf2::pbkdf2::<Hmac<Sha512>>(key.as_bytes(), key.as_bytes(), 1, &mut derived_key)?;
 
-		let cipher = AesGcm::new(&derived_key.into());
+		let cipher = <AesGcm<Aes256, NonceSize> as digest::KeyInit>::new(&derived_key.into());
 		Ok(Self {
 			key: key.to_string(),
 			cipher: Box::new(cipher),
