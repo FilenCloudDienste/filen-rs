@@ -52,7 +52,7 @@ pub trait HasMeta {
 
 pub async fn list_dir(
 	client: &Client,
-	dir: impl HasContents,
+	dir: &impl HasContents,
 ) -> Result<(Vec<Directory>, Vec<RemoteFile>), Error> {
 	let response = api::v3::dir::content::post(
 		client.client(),
@@ -76,7 +76,7 @@ pub async fn list_dir(
 
 pub async fn create_dir(
 	client: &Client,
-	parent: impl HasContents,
+	parent: &impl HasContents,
 	name: impl Into<String>,
 ) -> Result<dir::Directory, Error> {
 	let mut dir = dir::Directory::new(name.into(), parent.uuid(), chrono::Utc::now());
@@ -170,7 +170,7 @@ pub async fn find_or_create_dir(
 			)));
 		}
 
-		let new_dir = create_dir(client, curr_dir, component).await?;
+		let new_dir = create_dir(client, &curr_dir, component).await?;
 		curr_dir = DirectoryType::Dir(Cow::Owned(new_dir));
 		curr_path.push_str(component);
 		curr_path.push('/');
@@ -212,7 +212,7 @@ pub async fn list_dir_recursive(
 
 pub async fn dir_exists(
 	client: &Client,
-	parent: impl HasContents,
+	parent: &impl HasContents,
 	name: impl AsRef<str>,
 ) -> Result<Option<uuid::Uuid>, Error> {
 	let response = api::v3::dir::exists::post(
