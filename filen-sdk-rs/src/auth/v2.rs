@@ -2,7 +2,10 @@ use filen_types::crypto::rsa::{EncodedPublicKey, EncryptedPrivateKey};
 
 use crate::{
 	api,
-	crypto::{self, shared::MetaCrypter},
+	crypto::{
+		self,
+		shared::{CreateRandom, MetaCrypter},
+	},
 	error::Error,
 };
 use sha1::Digest;
@@ -85,4 +88,8 @@ pub(super) fn hash_name(name: impl AsRef<[u8]>) -> String {
 	faster_hex::hex_encode(inner_hasher.finalize().as_slice(), &mut hashed_name).unwrap();
 	outer_hasher.update(hashed_name);
 	faster_hex::hex_string(outer_hasher.finalize().as_slice())
+}
+
+pub(super) fn generate_file_key() -> crypto::v2::FileKey {
+	crypto::v2::FileKey::generate()
 }

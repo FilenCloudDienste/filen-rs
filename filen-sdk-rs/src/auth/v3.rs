@@ -4,7 +4,11 @@ use filen_types::crypto::rsa::{EncodedPublicKey, EncryptedPrivateKey};
 
 use crate::{
 	api,
-	crypto::{rsa::HMACKey, shared::MetaCrypter},
+	crypto::{
+		rsa::HMACKey,
+		shared::{CreateRandom, MetaCrypter},
+		v3::EncryptionKey,
+	},
 	error::Error,
 };
 
@@ -80,4 +84,8 @@ pub(super) async fn login(
 
 pub(super) fn hash_name(name: impl AsRef<[u8]>, hmac_key: &HMACKey) -> String {
 	hmac_key.hash_to_string(name.as_ref())
+}
+
+pub(super) fn generate_file_key() -> EncryptionKey {
+	EncryptionKey::generate()
 }

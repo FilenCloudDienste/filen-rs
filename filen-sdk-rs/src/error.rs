@@ -14,4 +14,6 @@ pub enum Error {
 	Custom(String),
 	#[error("The returned chunk was too large expected `{expected}`, got `{actual}`")]
 	ChunkTooLarge { expected: usize, actual: usize },
+	#[error("The struct was in an invalid state: `{0}`, expected: `{1}`")]
+	InvalidState(String, String),
 }

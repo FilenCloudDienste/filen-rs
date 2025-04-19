@@ -7,7 +7,7 @@ use crate::{
 	consts::{V2FILE_ENCRYPTION_VERSION, V2META_ENCRYPTION_VERSION},
 	crypto::{self, rsa::HMACKey, shared::MetaCrypter},
 	error::Error,
-	fs::dir::RootDirectory,
+	fs::{dir::RootDirectory, file::FileKey},
 };
 
 pub mod http;
@@ -100,6 +100,17 @@ impl Client {
 
 	pub fn root(&self) -> &RootDirectory {
 		&self.root_dir
+	}
+
+	pub fn file_encryption_version(&self) -> FileEncryptionVersion {
+		self.file_encryption_version
+	}
+
+	pub fn make_file_key(&self) -> FileKey {
+		match self.auth_info {
+			AuthInfo::V1 | AuthInfo::V2(_) => FileKey::V2(v2::generate_file_key()),
+			AuthInfo::V3(_) => FileKey::V3(v3::generate_file_key()),
+		}
 	}
 }
 

@@ -1,14 +1,15 @@
 use core::panic;
-use std::{env, fmt::Write, sync::Arc};
+use std::{env, sync::Arc};
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{FSObjectType, HasMeta, HasUUID, dir::Directory, move_dir},
+	fs::{FSObjectType, HasMeta, HasUUID, dir::Directory, file::FileBuilder, move_dir},
 	prelude::*,
 };
 
-use futures::AsyncReadExt;
+use futures::{AsyncReadExt, AsyncWriteExt};
+use rand::TryRngCore;
 use tokio::sync::OnceCell;
 
 struct Resources {
@@ -226,53 +227,50 @@ async fn test_dir_size() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test_file_download() {
+async fn test_file_action(name: &str, contents_len: usize) {
+	let mut contents = vec![0u8; contents_len];
+	rand::rng().try_fill_bytes(&mut contents).unwrap();
+
+	let contents = contents.as_ref();
 	let resources = RESOURCES.get_resources().await;
 	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
 
-	let file = find_item_at_path(&client, "compat-go/small.txt")
+	let file = FileBuilder::new(name, test_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer.write_all(contents).await.unwrap();
+	writer.close().await.unwrap();
+	let file = writer.into_remote_file().unwrap();
+
+	let found_file = match find_item_at_path(&client, format!("{}/{}", test_dir.name(), name))
 		.await
-		.unwrap();
-	let file = match file {
-		Some(FSObjectType::File(file)) => Arc::new(file.into_owned()),
+		.unwrap()
+	{
+		Some(FSObjectType::File(file)) => file.into_owned(),
 		_ => panic!("Expected a file"),
 	};
-	let mut reader = file.get_reader(client.clone());
-	let mut buf = String::with_capacity(1024);
-	reader.read_to_string(&mut buf).await.unwrap();
-	assert_eq!(&buf, "Hello World from Go!");
+	assert_eq!(
+		file, found_file,
+		"Downloaded file didn't match uploaded file for {}",
+		name
+	);
 
-	let file = find_item_at_path(&client, "compat-go/big.txt")
-		.await
-		.unwrap();
-	let file = match file {
-		Some(FSObjectType::File(file)) => Arc::new(file.into_owned()),
-		_ => panic!("Expected a file"),
-	};
-	let mut reader = file.clone().get_reader(client.clone());
-	let mut buf = String::with_capacity(1024);
-	reader.read_to_string(&mut buf).await.unwrap();
+	let mut reader = found_file.into_reader(client.clone());
+	let mut buf = Vec::with_capacity(contents.len());
+	reader.read_to_end(&mut buf).await.unwrap();
 
-	assert_eq!(buf.len(), file.size() as usize);
+	assert_eq!(buf.len(), contents.len(), "File size mismatch for {}", name);
+	assert_eq!(&buf, contents, "File contents mismatch for {}", name);
+}
 
-	let file = find_item_at_path(&client, "compat-go/large_sample-20mb.txt")
-		.await
-		.unwrap();
-	let file = match file {
-		Some(FSObjectType::File(file)) => Arc::new(file.into_owned()),
-		_ => panic!("Expected a file"),
-	};
-	let mut reader = file.get_reader(client.clone());
-	let mut buf = String::with_capacity(1024);
-	reader.read_to_string(&mut buf).await.unwrap();
-
-	let mut test_str = String::with_capacity(30_000_000);
-
-	for i in 0..2_700_000 {
-		test_str.write_str(i.to_string().as_str()).unwrap();
-		test_str.write_char('\n').unwrap();
-	}
-	assert_eq!(buf.len(), test_str.len());
-	assert_eq!(buf, test_str);
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_file_actions() {
+	test_file_action("small.txt", 10).await;
+	test_file_action("big_chunk_aligned_equal_to_threads.exe", 1024 * 1024 * 8).await;
+	test_file_action("big_chunk_aligned_less_than_threads.exe", 1024 * 1024 * 7).await;
+	test_file_action("big_chunk_aligned_more_than_threads.exe", 1024 * 1024 * 9).await;
+	test_file_action("big_not_chunk_aligned_over.exe", 1024 * 1024 * 8 + 1).await;
+	test_file_action("big_not_chunk_aligned_under.exe", 1024 * 1024 * 8 - 1).await;
+	test_file_action("empty.json", 0).await;
+	test_file_action("one_chunk", 1024 * 1024).await;
 }

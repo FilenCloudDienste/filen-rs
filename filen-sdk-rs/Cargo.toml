@@ -26,6 +26,7 @@ argon2 = { version = "0.5.3", features = ["std"] }
 serde_path_to_error = "0.1.17"
 sha1 = "0.10.6"
 futures = "0.3.31"
+mime_guess = "2.0.5"
 
 [dev-dependencies]
 dotenv = "0.15.0"
