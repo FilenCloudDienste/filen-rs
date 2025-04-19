@@ -110,7 +110,7 @@ pub async fn trash_dir(client: &Client, dir: Directory) -> Result<(), Error> {
 pub async fn find_item_at_path(
 	client: &Client,
 	path: impl AsRef<str>,
-) -> Result<FSObjectType, Error> {
+) -> Result<Option<FSObjectType>, Error> {
 	let mut curr_dir = DirectoryType::Root(Cow::Borrowed(client.root()));
 	let mut curr_path = String::with_capacity(path.as_ref().len());
 	let mut path_iter = path.as_ref().split('/');
@@ -133,12 +133,13 @@ pub async fn find_item_at_path(
 					curr_path, curr_path, next
 				)));
 			}
-			return Ok(FSObjectType::File(Cow::Owned(file)));
+			return Ok(Some(FSObjectType::File(Cow::Owned(file))));
 		}
+		return Ok(None);
 	}
 	match curr_dir {
-		DirectoryType::Root(_) => Ok(FSObjectType::Root(Cow::Borrowed(client.root()))),
-		DirectoryType::Dir(dir) => Ok(FSObjectType::Dir(dir)),
+		DirectoryType::Root(_) => Ok(Some(FSObjectType::Root(Cow::Borrowed(client.root())))),
+		DirectoryType::Dir(dir) => Ok(Some(FSObjectType::Dir(dir))),
 	}
 }
 

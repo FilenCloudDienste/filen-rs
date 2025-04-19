@@ -114,7 +114,14 @@ async fn test_find_path() {
 		find_item_at_path(client, format!("{}/a/b/c", test_dir.name()))
 			.await
 			.unwrap(),
-		FSObjectType::Dir(std::borrow::Cow::Borrowed(&dir_c))
+		Some(FSObjectType::Dir(std::borrow::Cow::Borrowed(&dir_c)))
+	);
+
+	assert_eq!(
+		find_item_at_path(client, format!("{}/a/bc", test_dir.name()))
+			.await
+			.unwrap(),
+		None
 	);
 }
 
@@ -127,7 +134,7 @@ async fn test_find_create_dir() {
 	let nested_dir = find_or_create_dir(client, &path).await.unwrap();
 
 	assert_eq!(
-		Into::<FSObjectType<'_>>::into(nested_dir),
+		Some(Into::<FSObjectType<'_>>::into(nested_dir)),
 		find_item_at_path(client, &path).await.unwrap()
 	);
 }
@@ -228,7 +235,7 @@ async fn test_file_download() {
 		.await
 		.unwrap();
 	let file = match file {
-		FSObjectType::File(file) => Arc::new(file.into_owned()),
+		Some(FSObjectType::File(file)) => Arc::new(file.into_owned()),
 		_ => panic!("Expected a file"),
 	};
 	let mut reader = file.get_reader(client.clone());
@@ -240,7 +247,7 @@ async fn test_file_download() {
 		.await
 		.unwrap();
 	let file = match file {
-		FSObjectType::File(file) => Arc::new(file.into_owned()),
+		Some(FSObjectType::File(file)) => Arc::new(file.into_owned()),
 		_ => panic!("Expected a file"),
 	};
 	let mut reader = file.clone().get_reader(client.clone());
@@ -253,7 +260,7 @@ async fn test_file_download() {
 		.await
 		.unwrap();
 	let file = match file {
-		FSObjectType::File(file) => Arc::new(file.into_owned()),
+		Some(FSObjectType::File(file)) => Arc::new(file.into_owned()),
 		_ => panic!("Expected a file"),
 	};
 	let mut reader = file.get_reader(client.clone());
