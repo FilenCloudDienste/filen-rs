@@ -2,6 +2,7 @@ pub use crate::auth::login;
 pub use crate::fs::create_dir;
 pub use crate::fs::dir_exists;
 pub use crate::fs::find_item_at_path;
+pub use crate::fs::find_item_in_dir;
 pub use crate::fs::find_or_create_dir;
 pub use crate::fs::get_dir_size;
 pub use crate::fs::list_dir;

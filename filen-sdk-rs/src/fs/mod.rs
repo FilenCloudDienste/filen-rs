@@ -107,6 +107,21 @@ pub async fn trash_dir(client: &Client, dir: Directory) -> Result<(), Error> {
 	Ok(())
 }
 
+pub async fn find_item_in_dir(
+	client: &Client,
+	dir: &impl HasContents,
+	name: impl AsRef<str>,
+) -> Result<Option<FSObjectType<'static>>, Error> {
+	let (dirs, files) = list_dir(client, dir).await?;
+	if let Some(dir) = dirs.into_iter().find(|d| d.name() == name.as_ref()) {
+		return Ok(Some(FSObjectType::Dir(Cow::Owned(dir))));
+	}
+	if let Some(file) = files.into_iter().find(|f| f.name() == name.as_ref()) {
+		return Ok(Some(FSObjectType::File(Cow::Owned(file))));
+	}
+	Ok(None)
+}
+
 pub async fn find_item_at_path(
 	client: &Client,
 	path: impl AsRef<str>,
@@ -118,22 +133,24 @@ pub async fn find_item_at_path(
 		if component.is_empty() {
 			continue;
 		}
-		let (dirs, files) = list_dir(client, &curr_dir).await?;
-		if let Some(dir) = dirs.into_iter().find(|d| d.name() == component) {
-			curr_dir = DirectoryType::Dir(Cow::Owned(dir));
-			curr_path.push_str(component);
-			curr_path.push('/');
-			continue;
-		}
-
-		if let Some(file) = files.into_iter().find(|f| f.name() == component) {
-			if let Some(next) = path_iter.next() {
-				return Err(Error::Custom(format!(
-					"Path {} is a file, but tried to access {}/{}",
-					curr_path, curr_path, next
-				)));
+		match find_item_in_dir(client, &curr_dir, component).await {
+			Ok(Some(FSObjectType::Dir(dir))) => {
+				curr_dir = DirectoryType::Dir(Cow::Owned(dir.into_owned()));
+				curr_path.push_str(component);
+				curr_path.push('/');
+				continue;
 			}
-			return Ok(Some(FSObjectType::File(Cow::Owned(file))));
+			Ok(Some(FSObjectType::File(file))) => {
+				if let Some(next) = path_iter.next() {
+					return Err(Error::Custom(format!(
+						"Path {} is a file, but tried to access {}/{}",
+						curr_path, curr_path, next
+					)));
+				}
+				return Ok(Some(FSObjectType::File(Cow::Owned(file.into_owned()))));
+			}
+			Err(e) => return Err(e),
+			_ => {}
 		}
 		return Ok(None);
 	}
