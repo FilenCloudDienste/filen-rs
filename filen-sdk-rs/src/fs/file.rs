@@ -72,6 +72,22 @@ impl<'de> Deserialize<'de> for FileKey {
 	}
 }
 
+impl FromStr for FileKey {
+	type Err = crypto::error::ConversionError;
+	fn from_str(key: &str) -> Result<Self, Self::Err> {
+		if key.len() == 32 {
+			Ok(FileKey::V2(crypto::v2::FileKey::from_str(key)?))
+		} else if key.len() == 64 {
+			Ok(FileKey::V3(crypto::v3::EncryptionKey::from_str(key)?))
+		} else {
+			Err(crypto::error::ConversionError::InvalidStringLength(
+				key.len(),
+				32,
+			))
+		}
+	}
+}
+
 impl crypto::shared::DataCrypter for FileKey {
 	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), crypto::error::ConversionError> {
 		match self {
