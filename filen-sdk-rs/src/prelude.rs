@@ -1,4 +1,5 @@
 pub use crate::auth::login;
+pub use crate::crypto::shared::generate_random_base64_values;
 pub use crate::fs::create_dir;
 pub use crate::fs::dir_exists;
 pub use crate::fs::find_item_at_path;
@@ -9,3 +10,4 @@ pub use crate::fs::list_dir;
 pub use crate::fs::list_dir_recursive;
 pub use crate::fs::move_dir;
 pub use crate::fs::trash_dir;
+pub use crate::search::find_item_matches_for_name;

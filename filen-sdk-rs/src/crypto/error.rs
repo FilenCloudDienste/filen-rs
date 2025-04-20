@@ -31,4 +31,6 @@ pub enum ConversionError {
 	FilenTypesError(#[from] filen_types::error::ConversionError),
 	#[error("Public and private RSA keys do not match")]
 	InvalidKeyPair,
+	#[error("Serde json Error: `{0}`")]
+	SerdeJsonError(#[from] serde_json::Error),
 }

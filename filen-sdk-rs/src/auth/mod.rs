@@ -77,7 +77,7 @@ pub struct Client {
 
 	public_key: RsaPublicKey,
 	private_key: RsaPrivateKey,
-	hmac_key: HMACKey,
+	pub(crate) hmac_key: HMACKey,
 
 	http_client: AuthClient,
 }

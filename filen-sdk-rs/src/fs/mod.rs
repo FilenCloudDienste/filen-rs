@@ -30,9 +30,34 @@ impl<'a> From<DirectoryType<'a>> for FSObjectType<'a> {
 	}
 }
 
-pub enum NonRootFSObject {
-	Dir(dir::Directory),
-	File(file::RemoteFile),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NonRootFSObject<'a> {
+	Dir(Cow<'a, dir::Directory>),
+	File(Cow<'a, file::RemoteFile>),
+}
+
+impl<'a> From<&'a RemoteFile> for NonRootFSObject<'a> {
+	fn from(file: &'a RemoteFile) -> Self {
+		NonRootFSObject::File(Cow::Borrowed(file))
+	}
+}
+
+impl From<RemoteFile> for NonRootFSObject<'_> {
+	fn from(file: RemoteFile) -> Self {
+		NonRootFSObject::File(Cow::Owned(file))
+	}
+}
+
+impl<'a> From<&'a Directory> for NonRootFSObject<'a> {
+	fn from(dir: &'a Directory) -> Self {
+		NonRootFSObject::Dir(Cow::Borrowed(dir))
+	}
+}
+
+impl From<Directory> for NonRootFSObject<'_> {
+	fn from(dir: Directory) -> Self {
+		NonRootFSObject::Dir(Cow::Owned(dir))
+	}
 }
 
 pub trait HasUUID {
@@ -95,6 +120,7 @@ pub async fn create_dir(
 		println!("UUID mismatch: {} != {}", dir.uuid(), response.uuid);
 		dir.uuid = response.uuid;
 	}
+	crate::search::update_search_hashes_for_item(client, &dir).await?;
 	Ok(dir)
 }
 

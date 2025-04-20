@@ -230,7 +230,7 @@ mod dir_meta_serde {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct DirectoryMeta<'a> {
+pub struct DirectoryMeta<'a> {
 	name: Cow<'a, str>,
 	#[serde(with = "dir_meta_serde")]
 	#[serde(rename = "creation")]
@@ -246,5 +246,15 @@ impl DirectoryMeta<'static> {
 		let decrypted = decrypter.decrypt_meta(encrypted)?;
 		let meta = serde_json::from_str(&decrypted)?;
 		Ok(meta)
+	}
+}
+
+impl DirectoryMeta<'_> {
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn created(&self) -> Option<DateTime<Utc>> {
+		self.created
 	}
 }

@@ -51,6 +51,35 @@ fn get_compat_test_file(client: &Client, parent: impl HasContents) -> (FileBuild
 	(file, test_str)
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
+struct NameSplitterFile {
+	name1: String,
+	split1: Vec<String>,
+	name2: String,
+	split2: Vec<String>,
+	name3: String,
+	split3: Vec<String>,
+}
+
+fn get_name_splitter_test_value() -> NameSplitterFile {
+	NameSplitterFile {
+		name1: "General_Invitation_-_the_ECSO_Award_Finals_2024.docx".to_string(),
+		split1: filen_sdk_rs::search::split_name(
+			"General_Invitation_-_the_ECSO_Award_Finals_2024.docx",
+			2,
+			16,
+		),
+		name2: "Screenshot 2023-05-16 201840.png".to_string(),
+		split2: filen_sdk_rs::search::split_name("Screenshot 2023-05-16 201840.png", 2, 16),
+		name3: "!service-invoice-657c56116e4f6947a80001cc.pdf".to_string(),
+		split3: filen_sdk_rs::search::split_name(
+			"!service-invoice-657c56116e4f6947a80001cc.pdf",
+			2,
+			16,
+		),
+	}
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn make_rs_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -92,6 +121,18 @@ async fn make_rs_compat_dir() {
 	let file = file.build();
 	let mut writer = file.into_writer(client.clone());
 	writer.write_all(test_str.as_bytes()).await.unwrap();
+	writer.close().await.unwrap();
+
+	let file = FileBuilder::new("nameSplitter.json", &compat_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer
+		.write_all(
+			serde_json::to_string(&get_name_splitter_test_value())
+				.unwrap()
+				.as_bytes(),
+		)
+		.await
+		.unwrap();
 	writer.close().await.unwrap();
 }
 
@@ -171,6 +212,27 @@ async fn run_compat_tests(client: Arc<Client>, compat_dir: Directory, language: 
 		}
 		_ => panic!("large_sample-20mb.txt not found in compat-go directory"),
 	}
+
+	match find_item_in_dir(&client, &compat_dir, "nameSplitter.json")
+		.await
+		.unwrap()
+	{
+		Some(FSObjectType::File(file)) => {
+			let mut reader = file.into_owned().into_reader(client.clone());
+			let mut buf = Vec::new();
+			reader.read_to_end(&mut buf).await.unwrap();
+			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
+			name_splitter.split1.sort_unstable();
+			name_splitter.split2.sort_unstable();
+			name_splitter.split3.sort_unstable();
+			assert_eq!(
+				name_splitter,
+				get_name_splitter_test_value(),
+				"nameSplitter.json contents mismatch"
+			);
+		}
+		_ => panic!("nameSplitter.json not found in compat-go directory"),
+	};
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

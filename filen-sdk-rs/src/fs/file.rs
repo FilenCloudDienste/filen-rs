@@ -728,7 +728,7 @@ struct FileWriterCompletingState<'a> {
 	client: Arc<Client>,
 }
 
-impl FileWriterCompletingState<'_> {
+impl<'a> FileWriterCompletingState<'a> {
 	fn poll_close(
 		&mut self,
 		cx: &mut std::task::Context<'_>,
@@ -743,12 +743,12 @@ impl FileWriterCompletingState<'_> {
 		}
 	}
 
-	fn into_complete_state(
+	fn into_finalizing_state(
 		self,
 		response: filen_types::api::v3::upload::empty::Response,
-	) -> FileWriterCompleteState {
-		FileWriterCompleteState {
-			file: RemoteFile {
+	) -> FileWriterFinalizingState<'a> {
+		FileWriterFinalizingState::new(
+			Arc::new(RemoteFile {
 				file: Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone()),
 				size: response.size,
 				favorited: false,
@@ -756,7 +756,63 @@ impl FileWriterCompletingState<'_> {
 				bucket: self.remote_file_info.bucket,
 				chunks: response.chunks,
 				hash: Some(self.hash),
-			},
+			}),
+			self.client,
+		)
+	}
+}
+
+struct FileWriterFinalizingState<'a> {
+	file: Arc<RemoteFile>,
+	futures: FuturesUnordered<futures::future::BoxFuture<'a, Result<(), Error>>>,
+	client: Arc<Client>,
+}
+
+impl FileWriterFinalizingState<'_> {
+	fn new(file: Arc<RemoteFile>, client: Arc<Client>) -> Self {
+		// we use futures unordered so that when we add shared link support that can be handled at the same time
+		let futures = FuturesUnordered::new();
+
+		let temp_client = client.clone();
+		let temp_file = file.clone();
+		futures.push(Box::pin(async move {
+			crate::search::update_search_hashes_for_item(&temp_client, temp_file.as_ref()).await?;
+			Ok(())
+		}) as futures::future::BoxFuture<'_, Result<(), Error>>);
+
+		Self {
+			file,
+			futures,
+			client,
+		}
+	}
+
+	fn poll_close(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		loop {
+			match self.futures.poll_next_unpin(cx) {
+				std::task::Poll::Ready(Some(Ok(()))) => {}
+				std::task::Poll::Ready(Some(Err(e))) => {
+					return std::task::Poll::Ready(Err(std::io::Error::new(
+						std::io::ErrorKind::Other,
+						e,
+					)));
+				}
+				std::task::Poll::Ready(None) => {
+					return std::task::Poll::Ready(Ok(()));
+				}
+				std::task::Poll::Pending => {
+					return std::task::Poll::Pending;
+				}
+			}
+		}
+	}
+
+	fn into_complete_state(self) -> FileWriterCompleteState {
+		FileWriterCompleteState {
+			file: Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone()),
 		}
 	}
 }
@@ -769,6 +825,7 @@ struct FileWriterCompleteState {
 enum FileWriterState<'a> {
 	Uploading(FileWriterUploadingState<'a>),
 	Completing(FileWriterCompletingState<'a>),
+	Finalizing(FileWriterFinalizingState<'a>),
 	Complete(FileWriterCompleteState),
 	Error(&'a str),
 }
@@ -821,7 +878,9 @@ impl AsyncWrite for FileWriter<'_> {
 	) -> std::task::Poll<std::io::Result<usize>> {
 		match &mut self.state {
 			FileWriterState::Uploading(uploading) => uploading.poll_write(cx, buf),
-			FileWriterState::Completing(_) | FileWriterState::Complete(_) => {
+			FileWriterState::Completing(_)
+			| FileWriterState::Finalizing(_)
+			| FileWriterState::Complete(_) => {
 				// we are in the completing state, we can't write anymore
 				std::task::Poll::Ready(Err(std::io::Error::new(
 					std::io::ErrorKind::Other,
@@ -876,18 +935,39 @@ impl AsyncWrite for FileWriter<'_> {
 			state => state,
 		};
 
+		let state = match state {
+			FileWriterState::Uploading(_) => {
+				unreachable!("Should be handled by the first part of this function")
+			}
+			FileWriterState::Completing(mut completing) => match completing.poll_close(cx) {
+				std::task::Poll::Ready(Ok(response)) => {
+					FileWriterState::Finalizing(completing.into_finalizing_state(response))
+				}
+				std::task::Poll::Ready(Err(e)) => {
+					return std::task::Poll::Ready(Err(std::io::Error::new(
+						std::io::ErrorKind::Other,
+						e,
+					)));
+				}
+				std::task::Poll::Pending => {
+					self.state = FileWriterState::Completing(completing);
+					return std::task::Poll::Pending;
+				}
+			},
+			state => state,
+		};
+
 		// now state cannot be uploading anymore, ideally this would be part of a match
 
 		match state {
-			FileWriterState::Completing(mut completing) => match completing.poll_close(cx) {
-				std::task::Poll::Ready(Ok(response)) => {
-					self.state =
-						FileWriterState::Complete(completing.into_complete_state(response));
+			FileWriterState::Finalizing(mut finalizing) => match finalizing.poll_close(cx) {
+				std::task::Poll::Ready(Ok(())) => {
+					self.state = FileWriterState::Complete(finalizing.into_complete_state());
 					std::task::Poll::Ready(Ok(()))
 				}
 				std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
 				std::task::Poll::Pending => {
-					self.state = FileWriterState::Completing(completing);
+					self.state = FileWriterState::Finalizing(finalizing);
 					std::task::Poll::Pending
 				}
 			},
@@ -898,7 +978,7 @@ impl AsyncWrite for FileWriter<'_> {
 			FileWriterState::Error(e) => {
 				std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
 			}
-			FileWriterState::Uploading(_) => {
+			FileWriterState::Uploading(_) | FileWriterState::Completing(_) => {
 				unreachable!("Should be handled by the first part of this function")
 			}
 		}

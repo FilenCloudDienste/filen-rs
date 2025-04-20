@@ -1,4 +1,9 @@
-use filen_sdk_rs::{fs::FSObjectType, prelude::*};
+use std::{borrow::Cow, sync::Arc};
+
+use filen_sdk_rs::{
+	fs::{FSObjectType, NonRootFSObject},
+	prelude::*,
+};
 
 mod test_utils;
 
@@ -146,4 +151,44 @@ async fn size() {
 			dirs: 2
 		}
 	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn dir_search() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let second_dir = create_dir(&client, test_dir, "second_dir").await.unwrap();
+
+	let dir_random_part_long = generate_random_base64_values(16);
+	let dir_random_part_short = generate_random_base64_values(2);
+
+	let dir_name = format!("{}{}", dir_random_part_long, dir_random_part_short);
+
+	let dir = create_dir(&client, &second_dir, dir_name).await.unwrap();
+
+	let found_items = find_item_matches_for_name(&client, dir_random_part_long)
+		.await
+		.unwrap();
+
+	assert_eq!(
+		found_items,
+		vec![(
+			NonRootFSObject::Dir(Cow::Owned(dir.clone())),
+			format!("/{}/{}", test_dir.name(), second_dir.name())
+		)]
+	);
+
+	let found_items = find_item_matches_for_name(&client, dir_random_part_short)
+		.await
+		.unwrap();
+
+	assert!(found_items.iter().any(|(item, _)| {
+		if let NonRootFSObject::Dir(found_dir) = item {
+			*found_dir.clone() == dir
+		} else {
+			false
+		}
+	}));
 }

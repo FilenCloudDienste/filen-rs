@@ -7,5 +7,6 @@ pub(crate) mod crypto;
 pub mod error;
 pub mod fs;
 pub mod prelude;
+pub mod search;
 
 pub use prelude::*;
