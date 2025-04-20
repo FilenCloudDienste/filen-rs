@@ -1,4 +1,8 @@
-use std::{borrow::Cow, cmp::min, collections::HashSet};
+use std::{
+	borrow::Cow,
+	cmp::min,
+	collections::{HashSet, VecDeque},
+};
 
 use filen_types::api::v3::search::{
 	add::{SearchAddItem, SearchAddItemType},
@@ -9,17 +13,36 @@ use crate::{
 	api,
 	auth::Client,
 	crypto::shared::MetaCrypter,
-	fs::{NonRootFSObject, dir::DirectoryMeta, file::RemoteFile},
+	fs::{HasMeta, HasUUID, NonRootFSObject, dir::DirectoryMeta, file::RemoteFile},
 };
 
-// wish we could return Vec<&str> instead of Vec<String>
-// but we need to to_lowercase the input which requires an allocation
-pub fn split_name(input: &str, min_len: usize, max_len: usize) -> Vec<String> {
+struct SplitName<'a> {
+	normalized_input: Cow<'a, str>,
+	results: VecDeque<&'a str>,
+}
+
+impl<'a> Iterator for SplitName<'a> {
+	type Item = &'a str;
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.results.is_empty() {
+			return None;
+		}
+		self.results.pop_front()
+	}
+}
+
+pub fn split_name(input: &str, min_len: usize, max_len: usize) -> Vec<Cow<'_, str>> {
 	if input.is_empty() {
 		return Vec::new();
 	}
 
-	let normalized_input = input.trim().to_lowercase();
+	// optimization so we only allocate if the input has uppercase letters
+	let normalized_input = if input.chars().any(|c| c.is_uppercase()) {
+		Cow::Owned(input.trim().to_lowercase())
+	} else {
+		Cow::Borrowed(input.trim())
+	};
+
 	let normalized_input_len = normalized_input.len();
 	let mut results = HashSet::new();
 	// let mut results = vec![normalized_input.into()];
@@ -28,14 +51,18 @@ pub fn split_name(input: &str, min_len: usize, max_len: usize) -> Vec<String> {
 	for start_index in 0..normalized_input_len {
 		for length in min_len..=max_len {
 			if start_index + length <= normalized_input_len {
-				results.insert(normalized_input[start_index..start_index + length].to_string());
+				let substring = match &normalized_input {
+					Cow::Borrowed(s) => Cow::Borrowed(&s[start_index..start_index + length]),
+					Cow::Owned(s) => Cow::Owned(s[start_index..start_index + length].to_string()),
+				};
+				results.insert(substring);
 			}
 		}
 	}
 
 	results.insert(normalized_input);
 
-	let mut results: Vec<String> = results.into_iter().collect();
+	let mut results: Vec<Cow<'_, str>> = results.into_iter().collect();
 
 	results.sort_unstable();
 	results.truncate(4096);
@@ -52,41 +79,33 @@ pub fn generate_search_hashes_for_name(
 }
 
 pub fn generate_search_items_for_item<'a>(
-	item: impl Into<NonRootFSObject<'a>>,
-	client: &Client,
+	item: &'a NonRootFSObject<'a>,
+	client: &'a Client,
 ) -> impl IntoIterator<Item = filen_types::api::v3::search::add::SearchAddItem> {
-	let item = item.into();
-	let (name, uuid, item_type) = match &item {
-		NonRootFSObject::File(file) => (file.name(), file.uuid(), SearchAddItemType::File),
-		NonRootFSObject::Dir(dir) => (dir.name(), dir.uuid(), SearchAddItemType::Directory),
+	let item_type = match item {
+		NonRootFSObject::File(_) => SearchAddItemType::File,
+		NonRootFSObject::Dir(_) => SearchAddItemType::Directory,
 	};
 
-	split_name(name, 2, 16)
+	let uuid = item.uuid();
+
+	generate_search_hashes_for_name(item.name(), client)
 		.into_iter()
-		.map(move |s| SearchAddItem {
+		.map(move |hash| SearchAddItem {
+			hash,
 			uuid,
-			hash: client.hmac_key.hash_to_string(s.as_bytes()),
 			r#type: item_type,
 		})
-}
-
-pub async fn update_search_hashes_for_items<'a>(
-	client: &'a Client,
-	items: impl IntoIterator<Item = impl Into<NonRootFSObject<'a>>>,
-) -> Result<api::v3::search::add::Response, filen_types::error::ResponseError> {
-	let items = items
-		.into_iter()
-		.flat_map(|item| generate_search_items_for_item(item, client))
-		.collect::<Vec<_>>();
-
-	api::v3::search::add::post(client.client(), &api::v3::search::add::Request { items }).await
 }
 
 pub async fn update_search_hashes_for_item<'a>(
 	client: &'a Client,
 	item: impl Into<NonRootFSObject<'a>>,
 ) -> Result<api::v3::search::add::Response, filen_types::error::ResponseError> {
-	update_search_hashes_for_items(client, std::iter::once(item)).await
+	let items = generate_search_items_for_item(&item.into(), client)
+		.into_iter()
+		.collect::<Vec<_>>();
+	api::v3::search::add::post(client.client(), &api::v3::search::add::Request { items }).await
 }
 
 pub async fn find_item_matches_for_name(

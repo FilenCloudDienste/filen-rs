@@ -1,5 +1,5 @@
 use core::panic;
-use std::{fmt::Write, str::FromStr, sync::Arc};
+use std::{borrow::Cow, fmt::Write, str::FromStr, sync::Arc};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_sdk_rs::{
@@ -52,16 +52,16 @@ fn get_compat_test_file(client: &Client, parent: impl HasContents) -> (FileBuild
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
-struct NameSplitterFile {
+struct NameSplitterFile<'a> {
 	name1: String,
-	split1: Vec<String>,
+	split1: Vec<Cow<'a, str>>,
 	name2: String,
-	split2: Vec<String>,
+	split2: Vec<Cow<'a, str>>,
 	name3: String,
-	split3: Vec<String>,
+	split3: Vec<Cow<'a, str>>,
 }
 
-fn get_name_splitter_test_value() -> NameSplitterFile {
+fn get_name_splitter_test_value() -> NameSplitterFile<'static> {
 	NameSplitterFile {
 		name1: "General_Invitation_-_the_ECSO_Award_Finals_2024.docx".to_string(),
 		split1: filen_sdk_rs::search::split_name(

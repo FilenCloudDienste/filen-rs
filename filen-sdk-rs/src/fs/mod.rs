@@ -60,6 +60,31 @@ impl From<Directory> for NonRootFSObject<'_> {
 	}
 }
 
+impl HasMeta for NonRootFSObject<'_> {
+	fn name(&self) -> &str {
+		match self {
+			NonRootFSObject::Dir(dir) => dir.name(),
+			NonRootFSObject::File(file) => file.name(),
+		}
+	}
+
+	fn meta(&self, crypter: impl MetaCrypter) -> Result<EncryptedString, ConversionError> {
+		match self {
+			NonRootFSObject::Dir(dir) => dir.meta(crypter),
+			NonRootFSObject::File(file) => file.meta(crypter),
+		}
+	}
+}
+
+impl HasUUID for NonRootFSObject<'_> {
+	fn uuid(&self) -> uuid::Uuid {
+		match self {
+			NonRootFSObject::Dir(dir) => dir.uuid(),
+			NonRootFSObject::File(file) => file.uuid(),
+		}
+	}
+}
+
 pub trait HasUUID {
 	fn uuid(&self) -> uuid::Uuid;
 }

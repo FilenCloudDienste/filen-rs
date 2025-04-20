@@ -228,7 +228,7 @@ pub struct RemoteFile {
 	hash: Option<Sha512Hash>,
 }
 
-impl HasMeta for &RemoteFile {
+impl HasMeta for RemoteFile {
 	fn name(&self) -> &str {
 		&self.file.name
 	}
