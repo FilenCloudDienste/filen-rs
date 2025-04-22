@@ -1,7 +1,11 @@
 use std::{borrow::Cow, sync::Arc};
 
+use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
-	fs::{FSObjectType, NonRootFSObject, file::FileBuilder},
+	fs::{
+		FSObjectType, NonRootFSObject,
+		file::{FileBuilder, update_file_metadata},
+	},
 	prelude::*,
 };
 use futures::{AsyncReadExt, AsyncWriteExt};
@@ -101,4 +105,225 @@ async fn file_search() {
 			false
 		}
 	}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_trash() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let file_name = "file.txt";
+	let file = FileBuilder::new(file_name, test_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer.write_all(b"Hello World from Rust!").await.unwrap();
+	writer.close().await.unwrap();
+	let file = writer.into_remote_file().unwrap();
+
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+
+	trash_file(&client, &file).await.unwrap();
+
+	assert!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap()
+			.is_none()
+	);
+
+	restore_file(&client, &file).await.unwrap();
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_delete_permanently() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let file_name = "file.txt";
+	let file = FileBuilder::new(file_name, test_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer.write_all(b"Hello World from Rust!").await.unwrap();
+	writer.close().await.unwrap();
+	let file = writer.into_remote_file().unwrap();
+
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+
+	delete_file_permanently(&client, file.clone())
+		.await
+		.unwrap();
+
+	assert!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap()
+			.is_none()
+	);
+
+	assert!(restore_file(&client, &file).await.is_err());
+
+	// Uncomment this when the API immediately permanently deletes the file
+	// let mut reader = file.into_reader(client.clone());
+	// let mut buf = Vec::new();
+	// assert!(reader.read_to_end(&mut buf).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_move() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let file_name = "file.txt";
+	let file = FileBuilder::new(file_name, test_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer.write_all(b"Hello World from Rust!").await.unwrap();
+	writer.close().await.unwrap();
+	let mut file = writer.into_remote_file().unwrap();
+
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+
+	let second_dir = create_dir(&client, test_dir, "second_dir").await.unwrap();
+	move_file(&client, &mut file, &second_dir).await.unwrap();
+
+	assert!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap()
+			.is_none(),
+	);
+
+	assert_eq!(
+		find_item_at_path(
+			&client,
+			format!("{}/{}/{}", test_dir.name(), second_dir.name(), file_name)
+		)
+		.await
+		.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_update_meta() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let file_name = "file.txt";
+	let file = FileBuilder::new(file_name, test_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer.write_all(b"Hello World from Rust!").await.unwrap();
+	writer.close().await.unwrap();
+	let mut file = writer.into_remote_file().unwrap();
+
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+
+	let mut meta = file.get_meta();
+	meta.set_name("new_name.json");
+
+	update_file_metadata(&client, &mut file, meta)
+		.await
+		.unwrap();
+
+	assert_eq!(file.name(), "new_name.json");
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file.name()))
+			.await
+			.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+
+	let mut meta = file.get_meta();
+	let created = Utc::now() - chrono::Duration::days(1);
+	let modified = Utc::now();
+	let new_mime = "application/json";
+	meta.set_mime(new_mime);
+	meta.set_last_modified(modified);
+	meta.set_created(created);
+
+	update_file_metadata(&client, &mut file, meta)
+		.await
+		.unwrap();
+	assert_eq!(file.mime(), new_mime);
+	assert_eq!(file.created(), created.round_subsecs(3));
+	assert_eq!(file.last_modified(), modified.round_subsecs(3));
+
+	let found_file = get_file(&client, file.uuid()).await.unwrap();
+	assert_eq!(found_file.mime(), new_mime);
+	assert_eq!(found_file.created(), created.round_subsecs(3));
+	assert_eq!(found_file.last_modified(), modified.round_subsecs(3));
+	assert_eq!(found_file, file);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_exists() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let file_name = "file.txt";
+
+	assert!(
+		exists_file(&client, file_name, test_dir)
+			.await
+			.unwrap()
+			.is_none()
+	);
+
+	let file = FileBuilder::new(file_name, test_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer.write_all(b"Hello World from Rust!").await.unwrap();
+	writer.close().await.unwrap();
+	let mut file = writer.into_remote_file().unwrap();
+
+	assert_eq!(
+		exists_file(&client, file.name(), test_dir).await.unwrap(),
+		Some(file.uuid())
+	);
+
+	let mut meta = file.get_meta();
+	let new_name = "new_name.json";
+	meta.set_name(new_name);
+	update_file_metadata(&client, &mut file, meta)
+		.await
+		.unwrap();
+
+	assert_eq!(
+		exists_file(&client, new_name, test_dir).await.unwrap(),
+		Some(file.uuid())
+	);
+
+	assert!(
+		exists_file(&client, file_name, test_dir)
+			.await
+			.unwrap()
+			.is_none(),
+	);
 }

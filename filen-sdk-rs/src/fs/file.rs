@@ -239,16 +239,7 @@ impl HasMeta for RemoteFile {
 	) -> Result<filen_types::crypto::EncryptedString, crypto::error::ConversionError> {
 		// SAFETY if this fails, I want it to panic
 		// as this is a logic error
-		let string = serde_json::to_string(&FileMeta {
-			name: Cow::Borrowed(&self.file.name),
-			size: self.size,
-			mime: Cow::Borrowed(&self.file.mime),
-			key: Cow::Borrowed(&self.file.key),
-			created: Some(self.file.created),
-			last_modified: self.file.modified,
-			hash: self.hash,
-		})
-		.unwrap();
+		let string = serde_json::to_string(&self.get_meta_borrowed()).unwrap();
 		crypter.encrypt_meta(&string)
 	}
 }
@@ -282,6 +273,18 @@ impl RemoteFile {
 		&self.file.name
 	}
 
+	pub fn mime(&self) -> &str {
+		&self.file.mime
+	}
+
+	pub fn created(&self) -> DateTime<Utc> {
+		self.file.created
+	}
+
+	pub fn last_modified(&self) -> DateTime<Utc> {
+		self.file.modified
+	}
+
 	pub fn region(&self) -> &str {
 		&self.region
 	}
@@ -313,11 +316,43 @@ impl RemoteFile {
 	pub fn get_reader(self: Arc<Self>, client: Arc<Client>) -> impl AsyncRead {
 		FileReader::new(self, client)
 	}
+
+	pub fn get_meta_borrowed(&self) -> FileMeta<'_> {
+		FileMeta {
+			name: Cow::Borrowed(&self.file.name),
+			size: self.size,
+			mime: Cow::Borrowed(&self.file.mime),
+			key: Cow::Borrowed(&self.file.key),
+			created: Some(self.file.created),
+			last_modified: self.file.modified,
+			hash: self.hash,
+		}
+	}
+
+	pub fn get_meta(&self) -> FileMeta<'static> {
+		FileMeta {
+			name: Cow::Owned(self.file.name.clone()),
+			size: self.size,
+			mime: Cow::Owned(self.file.mime.clone()),
+			key: Cow::Owned(self.file.key.clone()),
+			created: Some(self.file.created),
+			last_modified: self.file.modified,
+			hash: self.hash,
+		}
+	}
+
+	pub(crate) fn set_meta(&mut self, meta: FileMeta<'_>) {
+		self.file.name = meta.name.into_owned();
+		self.file.mime = meta.mime.into_owned();
+		self.file.key = meta.key.into_owned();
+		self.file.modified = meta.last_modified;
+		self.file.created = meta.created.unwrap_or_default();
+	}
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FileMeta<'a> {
+pub struct FileMeta<'a> {
 	name: Cow<'a, str>,
 	size: u64,
 	mime: Cow<'a, str>,
@@ -331,7 +366,7 @@ struct FileMeta<'a> {
 	hash: Option<Sha512Hash>,
 }
 
-impl FileMeta<'_> {
+impl<'a> FileMeta<'a> {
 	fn from_encrypted(
 		meta: &filen_types::crypto::EncryptedString,
 		decrypter: impl crypto::shared::MetaCrypter,
@@ -339,6 +374,50 @@ impl FileMeta<'_> {
 		let decrypted = decrypter.decrypt_meta(meta)?;
 		let meta: FileMeta = serde_json::from_str(&decrypted)?;
 		Ok(meta)
+	}
+
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) {
+		self.name = name.into();
+	}
+
+	pub fn mime(&self) -> &str {
+		&self.mime
+	}
+
+	pub fn set_mime(&mut self, mime: impl Into<Cow<'a, str>>) {
+		self.mime = mime.into();
+	}
+
+	pub fn last_modified(&self) -> DateTime<Utc> {
+		self.last_modified
+	}
+
+	pub fn set_last_modified(&mut self, last_modified: DateTime<Utc>) {
+		self.last_modified = last_modified.round_subsecs(3);
+	}
+
+	pub fn created(&self) -> Option<DateTime<Utc>> {
+		self.created
+	}
+
+	pub fn set_created(&mut self, created: DateTime<Utc>) {
+		self.created = Some(created.round_subsecs(3));
+	}
+
+	pub fn hash(&self) -> Option<Sha512Hash> {
+		self.hash
+	}
+
+	pub fn size(&self) -> u64 {
+		self.size
+	}
+
+	pub fn key(&self) -> &FileKey {
+		&self.key
 	}
 }
 
@@ -983,4 +1062,114 @@ impl AsyncWrite for FileWriter<'_> {
 			}
 		}
 	}
+}
+
+pub async fn trash_file(
+	client: &Client,
+	file: &RemoteFile,
+) -> Result<(), filen_types::error::ResponseError> {
+	api::v3::file::trash::post(
+		client.client(),
+		&api::v3::file::trash::Request { uuid: file.uuid() },
+	)
+	.await
+}
+
+pub async fn restore_file(
+	client: &Client,
+	file: &RemoteFile,
+) -> Result<(), filen_types::error::ResponseError> {
+	// should this maybe accept a uuid instead of a file?
+	api::v3::file::restore::post(
+		client.client(),
+		&api::v3::file::restore::Request { uuid: file.uuid() },
+	)
+	.await
+}
+
+pub async fn delete_file_permanently(
+	client: &Client,
+	file: RemoteFile,
+) -> Result<(), filen_types::error::ResponseError> {
+	api::v3::file::delete::permanent::post(
+		client.client(),
+		&api::v3::file::delete::permanent::Request { uuid: file.uuid() },
+	)
+	.await
+}
+
+pub async fn move_file(
+	client: &Client,
+	file: &mut RemoteFile,
+	new_parent: &impl HasContents,
+) -> Result<(), filen_types::error::ResponseError> {
+	api::v3::file::r#move::post(
+		client.client(),
+		&api::v3::file::r#move::Request {
+			uuid: file.uuid(),
+			new_parent: new_parent.uuid(),
+		},
+	)
+	.await?;
+	file.file.parent = new_parent.uuid();
+	Ok(())
+}
+
+pub async fn update_file_metadata(
+	client: &Client,
+	file: &mut RemoteFile,
+	new_meta: FileMeta<'_>,
+) -> Result<(), Error> {
+	api::v3::file::metadata::post(
+		client.client(),
+		&api::v3::file::metadata::Request {
+			uuid: file.uuid(),
+			name: client.crypter().encrypt_meta(&new_meta.name)?,
+			name_hashed: client.hash_name(&new_meta.name),
+			metadata: client
+				.crypter()
+				.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+		},
+	)
+	.await?;
+
+	file.set_meta(new_meta);
+	Ok(())
+}
+
+pub async fn get_file(client: &Client, uuid: Uuid) -> Result<RemoteFile, Error> {
+	let response = api::v3::file::post(client.client(), &api::v3::file::Request { uuid }).await?;
+
+	RemoteFile::from_encrypted(
+		filen_types::api::v3::dir::content::File {
+			uuid,
+			metadata: response.metadata,
+			rm: "".into(),
+			timestamp: response.timestamp,
+			chunks: response.size / CHUNK_SIZE_U64 + 1,
+			size: response.size,
+			bucket: response.bucket,
+			region: response.region,
+			parent: response.parent,
+			version: response.version,
+			favorited: false,
+		},
+		client.crypter(),
+	)
+}
+
+pub async fn exists_file(
+	client: &Client,
+	name: impl AsRef<str>,
+	parent: &impl HasContents,
+) -> Result<Option<Uuid>, filen_types::error::ResponseError> {
+	api::v3::file::exists::post(
+		client.client(),
+		&api::v3::file::exists::Request {
+			name_hashed: client.hash_name(name.as_ref()),
+			parent: parent.uuid(),
+		},
+	)
+	.await
+	.map(|r| r.0)
 }
