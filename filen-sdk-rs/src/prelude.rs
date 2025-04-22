@@ -18,3 +18,5 @@ pub use crate::fs::list_dir_recursive;
 pub use crate::fs::move_dir;
 pub use crate::fs::trash_dir;
 pub use crate::search::find_item_matches_for_name;
+pub use crate::sync::lock::acquire_lock;
+pub use crate::sync::lock::acquire_lock_with_default;

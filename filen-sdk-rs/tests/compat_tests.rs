@@ -94,6 +94,15 @@ async fn make_rs_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = Arc::new(resources.client.clone());
 
+	let _lock = acquire_lock(
+		client.clone(),
+		"test:rs",
+		std::time::Duration::from_secs(1),
+		600,
+	)
+	.await
+	.unwrap();
+
 	if let Some(FSObjectType::Dir(dir)) = find_item_at_path(&client, "compat-rs").await.unwrap() {
 		trash_dir(&client, dir.into_owned()).await.unwrap();
 	}
@@ -249,6 +258,15 @@ async fn check_go_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = Arc::new(resources.client.clone());
 
+	let _lock = acquire_lock(
+		client.clone(),
+		"test:go",
+		std::time::Duration::from_secs(1),
+		600,
+	)
+	.await
+	.unwrap();
+
 	let compat_dir = match find_item_at_path(&client, "compat-go").await.unwrap() {
 		Some(FSObjectType::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
@@ -261,6 +279,15 @@ async fn check_go_compat_dir() {
 async fn check_ts_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = Arc::new(resources.client.clone());
+
+	let _lock = acquire_lock(
+		client.clone(),
+		"test:ts",
+		std::time::Duration::from_secs(1),
+		600,
+	)
+	.await
+	.unwrap();
 
 	let compat_dir = match find_item_at_path(&client, "compat-ts").await.unwrap() {
 		Some(FSObjectType::Dir(dir)) => dir.into_owned(),

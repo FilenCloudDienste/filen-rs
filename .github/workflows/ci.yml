@@ -9,7 +9,6 @@ on:
 jobs:
   test:
     strategy:
-      max-parallel: 1 # to stop the different oses from running at the same time
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
         version: [V2, V3]  # This remains to define which version of the secrets to use

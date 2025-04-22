@@ -8,5 +8,6 @@ pub mod error;
 pub mod fs;
 pub mod prelude;
 pub mod search;
+pub mod sync;
 
 pub use prelude::*;
