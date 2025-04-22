@@ -116,7 +116,7 @@ pub async fn find_item_matches_for_name(
 	let response = api::v3::search::find::post(
 		client.client(),
 		&api::v3::search::find::Request {
-			hashes: vec![client.hmac_key.hash_to_string(name.as_bytes())],
+			hashes: vec![client.hmac_key.hash(name.as_bytes())],
 		},
 	)
 	.await?;

@@ -2,11 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString};
+use crate::{
+	auth::FileEncryptionVersion,
+	crypto::{EncryptedString, Sha256Hash},
+};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request {
-	pub hashes: Vec<String>,
+	pub hashes: Vec<Sha256Hash>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

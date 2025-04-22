@@ -1,6 +1,8 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
-use digest::Output;
-use filen_types::crypto::rsa::{EncodedPublicKey, EncryptedPrivateKey};
+use filen_types::crypto::{
+	Sha256Hash,
+	rsa::{EncodedPublicKey, EncryptedPrivateKey},
+};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey, traits::PrivateKeyParts};
@@ -24,14 +26,14 @@ impl HMACKey {
 }
 
 impl HMACKey {
-	pub(crate) fn hash(&self, data: impl AsRef<[u8]>) -> Output<Sha256> {
+	pub(crate) fn hash(&self, data: impl AsRef<[u8]>) -> Sha256Hash {
 		let mut hmac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC key should be valid");
 		hmac.update(data.as_ref());
-		hmac.finalize().into_bytes()
+		hmac.finalize().into_bytes().into()
 	}
 
 	pub(crate) fn hash_to_string(&self, data: impl AsRef<[u8]>) -> String {
-		faster_hex::hex_string(&self.hash(data))
+		faster_hex::hex_string(self.hash(data).as_ref())
 	}
 }
 

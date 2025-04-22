@@ -65,3 +65,9 @@ impl From<Sha256Hash> for [u8; 32] {
 		hash.0.into()
 	}
 }
+
+impl AsRef<[u8]> for Sha256Hash {
+	fn as_ref(&self) -> &[u8] {
+		&self.0
+	}
+}
