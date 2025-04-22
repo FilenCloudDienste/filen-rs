@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::Sha256Hash;
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request {
 	pub items: Vec<SearchAddItem>,
@@ -40,7 +42,7 @@ impl<'de> Deserialize<'de> for SearchAddItemType {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct SearchAddItem {
 	pub uuid: uuid::Uuid,
-	pub hash: String,
+	pub hash: Sha256Hash,
 	pub r#type: SearchAddItemType,
 }
 

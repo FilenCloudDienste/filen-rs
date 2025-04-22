@@ -1,5 +1,5 @@
 use core::panic;
-use std::{borrow::Cow, fmt::Write, str::FromStr, sync::Arc};
+use std::{fmt::Write, str::FromStr, sync::Arc};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_sdk_rs::{
@@ -52,31 +52,40 @@ fn get_compat_test_file(client: &Client, parent: impl HasContents) -> (FileBuild
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
-struct NameSplitterFile<'a> {
+struct NameSplitterFile {
 	name1: String,
-	split1: Vec<Cow<'a, str>>,
+	split1: Vec<String>,
 	name2: String,
-	split2: Vec<Cow<'a, str>>,
+	split2: Vec<String>,
 	name3: String,
-	split3: Vec<Cow<'a, str>>,
+	split3: Vec<String>,
 }
 
-fn get_name_splitter_test_value() -> NameSplitterFile<'static> {
+fn get_name_splitter_test_value() -> NameSplitterFile {
 	NameSplitterFile {
 		name1: "General_Invitation_-_the_ECSO_Award_Finals_2024.docx".to_string(),
 		split1: filen_sdk_rs::search::split_name(
 			"General_Invitation_-_the_ECSO_Award_Finals_2024.docx",
 			2,
 			16,
-		),
+		)
+		.iter()
+		.map(|s| s.to_string())
+		.collect(),
 		name2: "Screenshot 2023-05-16 201840.png".to_string(),
-		split2: filen_sdk_rs::search::split_name("Screenshot 2023-05-16 201840.png", 2, 16),
+		split2: filen_sdk_rs::search::split_name("Screenshot 2023-05-16 201840.png", 2, 16)
+			.iter()
+			.map(|s| s.to_string())
+			.collect(),
 		name3: "!service-invoice-657c56116e4f6947a80001cc.pdf".to_string(),
 		split3: filen_sdk_rs::search::split_name(
 			"!service-invoice-657c56116e4f6947a80001cc.pdf",
 			2,
 			16,
-		),
+		)
+		.iter()
+		.map(|s| s.to_string())
+		.collect(),
 	}
 }
 

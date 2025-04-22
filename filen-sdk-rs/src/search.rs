@@ -16,72 +16,93 @@ use crate::{
 	fs::{HasMeta, HasUUID, NonRootFSObject, dir::DirectoryMeta, file::RemoteFile},
 };
 
-struct SplitName<'a> {
+pub struct SplitName<'a> {
 	normalized_input: Cow<'a, str>,
-	results: VecDeque<&'a str>,
+	min_len: usize,
+	max_len: usize,
 }
 
-impl<'a> Iterator for SplitName<'a> {
-	type Item = &'a str;
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.results.is_empty() {
-			return None;
+fn trim_string_in_place(s: &mut String) {
+	let left_trim = s.chars().take_while(|&c| c.is_ascii_whitespace()).count();
+	let right_trim = s
+		.chars()
+		.rev()
+		.take_while(|&c| c.is_ascii_whitespace())
+		.count();
+
+	s.drain(..left_trim);
+	s.truncate(s.len() - right_trim - left_trim);
+}
+
+impl<'a> SplitName<'a> {
+	fn new(input: impl Into<Cow<'a, str>>, min_len: usize, max_len: usize) -> Self {
+		let normalized_input = match input.into() {
+			Cow::Borrowed(s) => {
+				if s.chars().any(|c| c.is_uppercase()) {
+					Cow::Owned(s.trim().to_lowercase())
+				} else {
+					Cow::Borrowed(s.trim())
+				}
+			}
+			Cow::Owned(mut s) => {
+				trim_string_in_place(&mut s);
+				Cow::Owned(s)
+			}
+		};
+
+		let max_len = min(max_len, normalized_input.len());
+		let min_len = min(min_len, max_len);
+
+		Self {
+			normalized_input,
+			min_len,
+			max_len,
 		}
-		self.results.pop_front()
-	}
-}
-
-pub fn split_name(input: &str, min_len: usize, max_len: usize) -> Vec<Cow<'_, str>> {
-	if input.is_empty() {
-		return Vec::new();
 	}
 
-	// optimization so we only allocate if the input has uppercase letters
-	let normalized_input = if input.chars().any(|c| c.is_uppercase()) {
-		Cow::Owned(input.trim().to_lowercase())
-	} else {
-		Cow::Borrowed(input.trim())
-	};
+	pub fn iter(&self) -> SplitNameIter<'_> {
+		let substring_count = (self.max_len - self.min_len + 1)
+			* ((self.normalized_input.len() + 1) - (self.max_len + self.min_len) / 2);
 
-	let normalized_input_len = normalized_input.len();
-	let mut results = HashSet::new();
-	// let mut results = vec![normalized_input.into()];
-	let max_len = min(max_len, normalized_input.len());
+		let mut slices = HashSet::with_capacity(substring_count + 1);
 
-	for start_index in 0..normalized_input_len {
-		for length in min_len..=max_len {
-			if start_index + length <= normalized_input_len {
-				let substring = match &normalized_input {
-					Cow::Borrowed(s) => Cow::Borrowed(&s[start_index..start_index + length]),
-					Cow::Owned(s) => Cow::Owned(s[start_index..start_index + length].to_string()),
-				};
-				results.insert(substring);
+		for start_index in 0..self.normalized_input.len() {
+			for length in self.min_len..=self.max_len {
+				if start_index + length <= self.normalized_input.len() {
+					let substring = &self.normalized_input[start_index..start_index + length];
+					slices.insert(substring);
+				}
 			}
 		}
+
+		slices.insert(&self.normalized_input);
+		let mut slices: VecDeque<&str> = slices.into_iter().collect();
+		slices.make_contiguous().sort_unstable();
+		slices.truncate(4096);
+
+		SplitNameIter { slices }
 	}
-
-	results.insert(normalized_input);
-
-	let mut results: Vec<Cow<'_, str>> = results.into_iter().collect();
-
-	results.sort_unstable();
-	results.truncate(4096);
-	results
 }
 
-pub fn generate_search_hashes_for_name(
-	name: &str,
-	client: &Client,
-) -> impl IntoIterator<Item = String> {
-	split_name(name, 2, 16)
-		.into_iter()
-		.map(|s| client.hmac_key.hash_to_string(s.as_bytes()))
+pub struct SplitNameIter<'a> {
+	slices: VecDeque<&'a str>,
+}
+
+impl<'a> Iterator for SplitNameIter<'a> {
+	type Item = &'a str;
+	fn next(&mut self) -> Option<Self::Item> {
+		self.slices.pop_front()
+	}
+}
+
+pub fn split_name(input: &str, min_len: usize, max_len: usize) -> SplitName {
+	SplitName::new(input, min_len, max_len)
 }
 
 pub fn generate_search_items_for_item<'a>(
 	item: &'a NonRootFSObject<'a>,
 	client: &'a Client,
-) -> impl IntoIterator<Item = filen_types::api::v3::search::add::SearchAddItem> {
+) -> Vec<SearchAddItem> {
 	let item_type = match item {
 		NonRootFSObject::File(_) => SearchAddItemType::File,
 		NonRootFSObject::Dir(_) => SearchAddItemType::Directory,
@@ -89,22 +110,21 @@ pub fn generate_search_items_for_item<'a>(
 
 	let uuid = item.uuid();
 
-	generate_search_hashes_for_name(item.name(), client)
-		.into_iter()
-		.map(move |hash| SearchAddItem {
-			hash,
+	split_name(item.name(), 2, 16)
+		.iter()
+		.map(move |s| SearchAddItem {
+			hash: client.hmac_key.hash(s.as_bytes()),
 			uuid,
 			r#type: item_type,
 		})
+		.collect()
 }
 
 pub async fn update_search_hashes_for_item<'a>(
 	client: &'a Client,
 	item: impl Into<NonRootFSObject<'a>>,
 ) -> Result<api::v3::search::add::Response, filen_types::error::ResponseError> {
-	let items = generate_search_items_for_item(&item.into(), client)
-		.into_iter()
-		.collect::<Vec<_>>();
+	let items = generate_search_items_for_item(&item.into(), client);
 	api::v3::search::add::post(client.client(), &api::v3::search::add::Request { items }).await
 }
 
@@ -194,4 +214,20 @@ pub async fn find_item_matches_for_name(
 			Ok((item, path))
 		})
 		.collect()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn split_name_iter() {
+		let minimal = "a";
+		let splitter = SplitName::new(minimal, 2, 16);
+		assert_eq!(vec!["a"], splitter.iter().collect::<Vec<_>>());
+
+		let normal = "abc";
+		let splitter = SplitName::new(normal, 2, 16);
+		assert_eq!(vec!["ab", "abc", "bc"], splitter.iter().collect::<Vec<_>>());
+	}
 }
