@@ -186,6 +186,8 @@ async fn file_delete_permanently() {
 
 	assert!(restore_file(&client, &file).await.is_err());
 
+	assert!(get_file(&client, file.uuid()).await.is_err());
+
 	// Uncomment this when the API immediately permanently deletes the file
 	// let mut reader = file.into_reader(client.clone());
 	// let mut buf = Vec::new();
