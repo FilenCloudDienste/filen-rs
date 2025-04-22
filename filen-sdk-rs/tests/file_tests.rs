@@ -127,6 +127,14 @@ async fn file_trash() {
 		Some(FSObjectType::File(Cow::Borrowed(&file)))
 	);
 
+	let _lock = acquire_lock(
+		client.clone(),
+		"test:rs:trash",
+		std::time::Duration::from_secs(1),
+		600,
+	)
+	.await
+	.unwrap();
 	trash_file(&client, &file).await.unwrap();
 
 	assert!(
@@ -326,4 +334,46 @@ async fn file_exists() {
 			.unwrap()
 			.is_none(),
 	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_trash_empty() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let file_name = "file.txt";
+	let file = FileBuilder::new(file_name, test_dir, &client).build();
+	let mut writer = file.into_writer(client.clone());
+	writer.write_all(b"Hello World from Rust!").await.unwrap();
+	writer.close().await.unwrap();
+	let file = writer.into_remote_file().unwrap();
+
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap(),
+		Some(FSObjectType::File(Cow::Borrowed(&file)))
+	);
+	let _lock = acquire_lock(
+		client.clone(),
+		"test:rs:trash",
+		std::time::Duration::from_secs(1),
+		600,
+	)
+	.await
+	.unwrap();
+	trash_file(&client, &file).await.unwrap();
+	assert!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), file_name))
+			.await
+			.unwrap()
+			.is_none()
+	);
+
+	assert_eq!(&get_file(&client, file.uuid()).await.unwrap(), &file);
+	empty_trash(&client).await.unwrap();
+	// emptying trash is asynchronous, so we need to wait a bit
+	tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+	assert!(get_file(&client, file.uuid()).await.is_err());
 }

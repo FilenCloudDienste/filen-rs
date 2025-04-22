@@ -338,3 +338,8 @@ pub async fn get_dir_size(
 	.await?;
 	Ok(response)
 }
+
+pub async fn empty_trash(client: &Client) -> Result<(), Error> {
+	api::v3::trash::empty::post(client.client()).await?;
+	Ok(())
+}

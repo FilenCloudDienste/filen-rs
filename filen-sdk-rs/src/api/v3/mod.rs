@@ -3,5 +3,6 @@ pub(crate) mod dir;
 pub(crate) mod file;
 pub(crate) mod login;
 pub(crate) mod search;
+pub(crate) mod trash;
 pub(crate) mod upload;
 pub(crate) mod user;
