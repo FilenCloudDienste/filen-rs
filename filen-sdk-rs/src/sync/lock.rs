@@ -35,11 +35,11 @@ impl Drop for ResourceLock {
 			{
 				Ok(response) => {
 					if !response.released {
-						eprintln!("Failed to release lock");
+						eprintln!("Failed to release lock {}", self.resource);
 					}
 				}
 				Err(e) => {
-					eprintln!("Failed to release lock: {}", e);
+					eprintln!("Failed to release lock {}: {}", self.resource, e);
 				}
 			}
 		})
