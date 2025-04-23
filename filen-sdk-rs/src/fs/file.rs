@@ -233,21 +233,15 @@ impl HasMeta for RemoteFile {
 		&self.file.name
 	}
 
-	fn meta(
-		&self,
-		crypter: impl crypto::shared::MetaCrypter,
-	) -> Result<filen_types::crypto::EncryptedString, crypto::error::ConversionError> {
-		// SAFETY if this fails, I want it to panic
-		// as this is a logic error
-		let string = serde_json::to_string(&self.get_meta_borrowed()).unwrap();
-		crypter.encrypt_meta(&string)
+	fn get_meta_string(&self) -> String {
+		serde_json::to_string(&self.get_meta_borrowed()).unwrap()
 	}
 }
 
 impl RemoteFile {
 	pub fn from_encrypted(
 		file: filen_types::api::v3::dir::content::File,
-		decrypter: impl crypto::shared::MetaCrypter,
+		decrypter: &impl crypto::shared::MetaCrypter,
 	) -> Result<Self, Error> {
 		let meta = FileMeta::from_encrypted(&file.metadata, decrypter)?;
 		Ok(Self {
@@ -369,7 +363,7 @@ pub struct FileMeta<'a> {
 impl<'a> FileMeta<'a> {
 	fn from_encrypted(
 		meta: &filen_types::crypto::EncryptedString,
-		decrypter: impl crypto::shared::MetaCrypter,
+		decrypter: &impl crypto::shared::MetaCrypter,
 	) -> Result<Self, Error> {
 		let decrypted = decrypter.decrypt_meta(meta)?;
 		let meta: FileMeta = serde_json::from_str(&decrypted)?;

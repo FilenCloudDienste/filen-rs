@@ -1,11 +1,12 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::crypto::{
 	Sha256Hash,
-	rsa::{EncodedPublicKey, EncryptedPrivateKey},
+	rsa::{EncodedPublicKey, EncryptedPrivateKey, RSAEncryptedString},
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey, traits::PrivateKeyParts};
+use rsa::{Oaep, RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey, traits::PrivateKeyParts};
+use sha1::Sha1;
 use sha2::Sha256;
 
 use super::{error::ConversionError, shared::MetaCrypter};
@@ -52,4 +53,20 @@ pub fn get_key_pair(
 
 	let hmac = HMACKey::new(&private_key);
 	Ok((private_key, public_key, hmac))
+}
+
+pub fn encrypt_with_public_key(
+	public_key: &RsaPublicKey,
+	data: impl AsRef<[u8]>,
+) -> Result<RSAEncryptedString, rsa::Error> {
+	let mut rng = old_rng::thread_rng();
+	// this is RSA_PKCS1_OAEP_PADDING according to
+	// https://github.com/RustCrypto/RSA/issues/435
+	let encrypted_data = public_key.encrypt(
+		&mut rng,
+		Oaep::new_with_mgf_hash::<Sha256, Sha1>(),
+		data.as_ref(),
+	)?;
+
+	Ok(RSAEncryptedString(BASE64_STANDARD.encode(encrypted_data)))
 }

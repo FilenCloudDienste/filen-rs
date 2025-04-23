@@ -19,3 +19,6 @@ impl TryFrom<&EncodedPublicKey> for RsaPublicKey {
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedPrivateKey(pub EncryptedString);
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct RSAEncryptedString(pub String);

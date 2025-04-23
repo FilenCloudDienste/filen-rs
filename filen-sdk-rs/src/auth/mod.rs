@@ -21,12 +21,12 @@ pub(crate) enum AuthInfo {
 	V3(v3::AuthInfo),
 }
 
-impl MetaCrypter for &AuthInfo {
+impl MetaCrypter for AuthInfo {
 	fn decrypt_meta_into(
 		&self,
 		meta: &filen_types::crypto::EncryptedString,
 		out: &mut String,
-	) -> Result<(), crate::crypto::error::ConversionError> {
+	) -> Result<(), crypto::error::ConversionError> {
 		match self {
 			AuthInfo::V1 => unimplemented!(),
 			AuthInfo::V2(info) => info.decrypt_meta_into(meta, out),
@@ -44,24 +44,6 @@ impl MetaCrypter for &AuthInfo {
 			AuthInfo::V2(info) => info.encrypt_meta_into(meta, out),
 			AuthInfo::V3(info) => info.encrypt_meta_into(meta, out),
 		}
-	}
-}
-
-impl MetaCrypter for AuthInfo {
-	fn decrypt_meta_into(
-		&self,
-		meta: &filen_types::crypto::EncryptedString,
-		out: &mut String,
-	) -> Result<(), crypto::error::ConversionError> {
-		(&self).decrypt_meta_into(meta, out)
-	}
-
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		out: &mut filen_types::crypto::EncryptedString,
-	) -> Result<(), crypto::error::ConversionError> {
-		(&self).encrypt_meta_into(meta, out)
 	}
 }
 
@@ -87,7 +69,7 @@ impl Client {
 		&self.http_client
 	}
 
-	pub fn crypter(&self) -> impl MetaCrypter {
+	pub fn crypter(&self) -> &impl MetaCrypter {
 		&self.auth_info
 	}
 

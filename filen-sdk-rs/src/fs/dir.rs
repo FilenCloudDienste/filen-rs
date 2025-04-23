@@ -5,7 +5,7 @@ use filen_types::crypto::EncryptedString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::crypto::{error::ConversionError, shared::MetaCrypter};
+use crate::crypto::shared::MetaCrypter;
 
 use super::{HasContents, HasMeta, HasParent, HasUUID};
 
@@ -40,7 +40,7 @@ pub struct Directory {
 impl Directory {
 	pub fn from_encrypted(
 		dir: filen_types::api::v3::dir::content::Directory,
-		decrypter: impl MetaCrypter,
+		decrypter: &impl MetaCrypter,
 	) -> Result<Self, crate::error::Error> {
 		let meta = DirectoryMeta::from_encrypted(&dir.meta, decrypter)?;
 		Ok(Self {
@@ -55,7 +55,7 @@ impl Directory {
 
 	pub fn try_from_encrypted(
 		dir: filen_types::api::v3::dir::download::Directory,
-		decrypter: impl MetaCrypter,
+		decrypter: &impl MetaCrypter,
 	) -> Result<Option<Self>, crate::error::Error> {
 		let parent = match dir.parent {
 			None => return Ok(None),
@@ -151,15 +151,14 @@ impl HasMeta for Directory {
 		&self.name
 	}
 
-	fn meta(&self, crypter: impl MetaCrypter) -> Result<EncryptedString, ConversionError> {
+	fn get_meta_string(&self) -> String {
 		// SAFETY if this fails, I want it to panic
 		// as this is a logic error
-		let string = serde_json::to_string(&DirectoryMeta {
+		serde_json::to_string(&DirectoryMeta {
 			name: Cow::Borrowed(&self.name),
 			created: self.created,
 		})
-		.unwrap();
-		crypter.encrypt_meta(&string)
+		.unwrap()
 	}
 }
 
@@ -241,7 +240,7 @@ pub struct DirectoryMeta<'a> {
 impl DirectoryMeta<'static> {
 	pub fn from_encrypted(
 		encrypted: &EncryptedString,
-		decrypter: impl MetaCrypter,
+		decrypter: &impl MetaCrypter,
 	) -> Result<Self, crate::error::Error> {
 		let decrypted = decrypter.decrypt_meta(encrypted)?;
 		let meta = serde_json::from_str(&decrypted)?;

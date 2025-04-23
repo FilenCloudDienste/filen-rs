@@ -2,7 +2,8 @@ use std::borrow::Cow;
 
 use dir::{Directory, DirectoryType};
 use file::RemoteFile;
-use filen_types::crypto::EncryptedString;
+use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
+use rsa::RsaPublicKey;
 
 use crate::{
 	api,
@@ -68,10 +69,10 @@ impl HasMeta for NonRootFSObject<'_> {
 		}
 	}
 
-	fn meta(&self, crypter: impl MetaCrypter) -> Result<EncryptedString, ConversionError> {
+	fn get_meta_string(&self) -> String {
 		match self {
-			NonRootFSObject::Dir(dir) => dir.meta(crypter),
-			NonRootFSObject::File(file) => file.meta(crypter),
+			NonRootFSObject::Dir(dir) => dir.get_meta_string(),
+			NonRootFSObject::File(file) => file.get_meta_string(),
 		}
 	}
 }
@@ -97,7 +98,20 @@ pub trait HasParent {
 
 pub trait HasMeta {
 	fn name(&self) -> &str;
-	fn meta(&self, crypter: impl MetaCrypter) -> Result<EncryptedString, ConversionError>;
+	fn get_meta_string(&self) -> String;
+	fn get_encrypted_meta(
+		&self,
+		crypter: &impl MetaCrypter,
+	) -> Result<EncryptedString, ConversionError> {
+		crypter.encrypt_meta(&self.get_meta_string())
+	}
+	fn get_rsa_encrypted_meta(
+		&self,
+		public_key: &RsaPublicKey,
+	) -> Result<RSAEncryptedString, rsa::Error> {
+		let meta = self.get_meta_string();
+		crate::crypto::rsa::encrypt_with_public_key(public_key, meta.as_bytes())
+	}
 }
 
 pub async fn list_dir(
@@ -137,7 +151,7 @@ pub async fn create_dir(
 			uuid: dir.uuid(),
 			parent: dir.parent(),
 			name_hashed: client.hash_name(dir.name()),
-			meta: dir.meta(client.crypter())?,
+			meta: dir.get_encrypted_meta(client.crypter())?,
 		},
 	)
 	.await?;
