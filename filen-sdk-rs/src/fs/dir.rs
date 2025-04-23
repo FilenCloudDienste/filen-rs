@@ -5,7 +5,7 @@ use filen_types::crypto::EncryptedString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::crypto::shared::MetaCrypter;
+use crate::{api, auth::Client, crypto::shared::MetaCrypter, error::Error};
 
 use super::{HasContents, HasMeta, HasParent, HasUUID};
 
@@ -53,6 +53,25 @@ impl Directory {
 		})
 	}
 
+	pub fn from_encrypted_generic(
+		uuid: Uuid,
+		parent: Uuid,
+		color: Option<String>,
+		favorited: bool,
+		meta: &EncryptedString,
+		decrypter: &impl MetaCrypter,
+	) -> Result<Self, crate::error::Error> {
+		let meta = DirectoryMeta::from_encrypted(meta, decrypter)?;
+		Ok(Self {
+			name: meta.name.into_owned(),
+			uuid,
+			parent,
+			color,
+			created: meta.created,
+			favorited,
+		})
+	}
+
 	pub fn try_from_encrypted(
 		dir: filen_types::api::v3::dir::download::Directory,
 		decrypter: &impl MetaCrypter,
@@ -89,6 +108,29 @@ impl Directory {
 
 	pub fn uuid(&self) -> Uuid {
 		self.uuid
+	}
+
+	pub fn created(&self) -> Option<DateTime<Utc>> {
+		self.created
+	}
+
+	pub fn get_meta_borrowed(&self) -> DirectoryMeta<'_> {
+		DirectoryMeta {
+			name: Cow::Borrowed(&self.name),
+			created: self.created,
+		}
+	}
+
+	pub fn get_meta(&self) -> DirectoryMeta<'static> {
+		DirectoryMeta {
+			name: Cow::Owned(self.name.clone()),
+			created: self.created,
+		}
+	}
+
+	pub fn set_meta(&mut self, meta: DirectoryMeta<'_>) {
+		self.name = meta.name.into_owned();
+		self.created = meta.created;
 	}
 }
 
@@ -248,7 +290,7 @@ impl DirectoryMeta<'static> {
 	}
 }
 
-impl DirectoryMeta<'_> {
+impl<'a> DirectoryMeta<'a> {
 	pub fn name(&self) -> &str {
 		&self.name
 	}
@@ -256,4 +298,46 @@ impl DirectoryMeta<'_> {
 	pub fn created(&self) -> Option<DateTime<Utc>> {
 		self.created
 	}
+
+	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) {
+		self.name = name.into();
+	}
+
+	pub fn set_created(&mut self, created: DateTime<Utc>) {
+		self.created = Some(created.round_subsecs(3));
+	}
+}
+
+pub async fn get_dir(client: &Client, uuid: Uuid) -> Result<Directory, Error> {
+	let response = api::v3::dir::post(client.client(), &api::v3::dir::Request { uuid }).await?;
+
+	Directory::from_encrypted_generic(
+		uuid,
+		response.parent,
+		response.color,
+		response.favorited,
+		&response.metadata,
+		client.crypter(),
+	)
+}
+
+pub async fn update_dir_metadata(
+	client: &Client,
+	dir: &mut Directory,
+	new_meta: DirectoryMeta<'_>,
+) -> Result<(), Error> {
+	api::v3::dir::metadata::post(
+		client.client(),
+		&api::v3::dir::metadata::Request {
+			uuid: dir.uuid(),
+			name_hashed: client.hash_name(&new_meta.name),
+			metadata: client
+				.crypter()
+				.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+		},
+	)
+	.await?;
+
+	dir.set_meta(new_meta);
+	Ok(())
 }

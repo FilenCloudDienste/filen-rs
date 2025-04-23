@@ -1,6 +1,8 @@
 pub use crate::auth::login;
 pub use crate::crypto::shared::generate_random_base64_values;
 pub use crate::fs::create_dir;
+pub use crate::fs::dir::get_dir;
+pub use crate::fs::dir::update_dir_metadata;
 pub use crate::fs::dir_exists;
 pub use crate::fs::empty_trash;
 pub use crate::fs::file::delete_file_permanently;

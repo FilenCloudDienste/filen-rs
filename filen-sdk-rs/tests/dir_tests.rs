@@ -1,5 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
+use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	fs::{FSObjectType, NonRootFSObject},
 	prelude::*,
@@ -191,4 +192,45 @@ async fn dir_search() {
 			false
 		}
 	}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn dir_update_meta() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = Arc::new(resources.client.clone());
+	let test_dir = &resources.dir;
+
+	let dir_name = "dir";
+	let mut dir = create_dir(&client, test_dir, dir_name).await.unwrap();
+
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), dir_name))
+			.await
+			.unwrap(),
+		Some(FSObjectType::Dir(Cow::Borrowed(&dir)))
+	);
+
+	let mut meta = dir.get_meta();
+	meta.set_name("new_name");
+
+	update_dir_metadata(&client, &mut dir, meta).await.unwrap();
+
+	assert_eq!(dir.name(), "new_name");
+	assert_eq!(
+		find_item_at_path(&client, format!("{}/{}", test_dir.name(), dir.name()))
+			.await
+			.unwrap(),
+		Some(FSObjectType::Dir(Cow::Borrowed(&dir)))
+	);
+
+	let mut meta = dir.get_meta();
+	let created = Utc::now() - chrono::Duration::days(1);
+	meta.set_created(created);
+
+	update_dir_metadata(&client, &mut dir, meta).await.unwrap();
+	assert_eq!(dir.created(), Some(created.round_subsecs(3)));
+
+	let found_dir = get_dir(&client, dir.uuid()).await.unwrap();
+	assert_eq!(found_dir.created(), Some(created.round_subsecs(3)));
+	assert_eq!(found_dir, dir);
 }
