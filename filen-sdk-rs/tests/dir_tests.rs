@@ -1,9 +1,9 @@
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
 
 use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
-	fs::{FSObjectType, NonRootFSObject},
-	prelude::*,
+	crypto::shared::generate_random_base64_values,
+	fs::{FSObjectType, HasUUID, NonRootFSObject},
 };
 
 mod test_utils;
@@ -14,14 +14,12 @@ async fn create_list_trash() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir = create_dir(client, test_dir, "test_dir".to_string())
-		.await
-		.unwrap();
+	let dir = client.create_dir(test_dir, "test_dir").await.unwrap();
 	assert_eq!(dir.name(), "test_dir");
 
-	let (dirs, _) = list_dir(client, test_dir).await.unwrap();
+	let (dirs, _) = client.list_dir(test_dir).await.unwrap();
 
-	trash_dir(client, dir.clone()).await.unwrap();
+	client.trash_dir(&dir).await.unwrap();
 
 	if !dirs.contains(&dir) {
 		panic!("Directory not found in root directory");
@@ -34,19 +32,21 @@ async fn find_at_path() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
-	let dir_b = create_dir(client, &dir_a, "b".to_string()).await.unwrap();
-	let dir_c = create_dir(client, &dir_b, "c".to_string()).await.unwrap();
+	let dir_a = client.create_dir(test_dir, "a").await.unwrap();
+	let dir_b = client.create_dir(&dir_a, "b").await.unwrap();
+	let dir_c = client.create_dir(&dir_b, "c").await.unwrap();
 
 	assert_eq!(
-		find_item_at_path(client, format!("{}/a/b/c", test_dir.name()))
+		client
+			.find_item_at_path(format!("{}/a/b/c", test_dir.name()))
 			.await
 			.unwrap(),
 		Some(FSObjectType::Dir(std::borrow::Cow::Borrowed(&dir_c)))
 	);
 
 	assert_eq!(
-		find_item_at_path(client, format!("{}/a/bc", test_dir.name()))
+		client
+			.find_item_at_path(format!("{}/a/bc", test_dir.name()))
 			.await
 			.unwrap(),
 		None
@@ -59,11 +59,11 @@ async fn find_or_create() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 	let path = format!("{}/a/b/c", test_dir.name());
-	let nested_dir = find_or_create_dir(client, &path).await.unwrap();
+	let nested_dir = client.find_or_create_dir(&path).await.unwrap();
 
 	assert_eq!(
 		Some(Into::<FSObjectType<'_>>::into(nested_dir)),
-		find_item_at_path(client, &path).await.unwrap()
+		client.find_item_at_path(&path).await.unwrap()
 	);
 }
 
@@ -73,11 +73,11 @@ async fn list_recursive() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
-	let dir_b = create_dir(client, &dir_a, "b".to_string()).await.unwrap();
-	let dir_c = create_dir(client, &dir_b, "c".to_string()).await.unwrap();
+	let dir_a = client.create_dir(test_dir, "a").await.unwrap();
+	let dir_b = client.create_dir(&dir_a, "b").await.unwrap();
+	let dir_c = client.create_dir(&dir_b, "c").await.unwrap();
 
-	let (dirs, _) = list_dir_recursive(client, test_dir).await.unwrap();
+	let (dirs, _) = client.list_dir_recursive(test_dir).await.unwrap();
 
 	assert!(dirs.contains(&dir_a));
 	assert!(dirs.contains(&dir_b));
@@ -90,17 +90,17 @@ async fn exists() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	assert!(dir_exists(client, test_dir, "a").await.unwrap().is_none());
+	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
 
-	let dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
+	let dir_a = client.create_dir(test_dir, "a").await.unwrap();
 
 	assert_eq!(
 		Some(dir_a.uuid()),
-		dir_exists(client, test_dir, "a").await.unwrap()
+		client.dir_exists(test_dir, "a").await.unwrap()
 	);
 
-	trash_dir(client, dir_a).await.unwrap();
-	assert!(dir_exists(client, test_dir, "a").await.unwrap().is_none());
+	client.trash_dir(&dir_a).await.unwrap();
+	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -109,13 +109,13 @@ async fn dir_move() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let mut dir_a = create_dir(client, test_dir, "a".to_string()).await.unwrap();
-	let dir_b = create_dir(client, test_dir, "b".to_string()).await.unwrap();
+	let mut dir_a = client.create_dir(test_dir, "a").await.unwrap();
+	let dir_b = client.create_dir(test_dir, "b").await.unwrap();
 
-	assert!(list_dir(client, &dir_b).await.unwrap().0.is_empty());
+	assert!(client.list_dir(&dir_b).await.unwrap().0.is_empty());
 
-	move_dir(client, &mut dir_a, &dir_b).await.unwrap();
-	assert!(list_dir(client, &dir_b).await.unwrap().0.contains(&dir_a));
+	client.move_dir(&mut dir_a, &dir_b).await.unwrap();
+	assert!(client.list_dir(&dir_b).await.unwrap().0.contains(&dir_a));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -125,7 +125,7 @@ async fn size() {
 	let test_dir = &resources.dir;
 
 	assert_eq!(
-		get_dir_size(client, test_dir, false).await.unwrap(),
+		client.get_dir_size(test_dir, false).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
 			size: 0,
 			files: 0,
@@ -133,9 +133,9 @@ async fn size() {
 		}
 	);
 
-	create_dir(client, test_dir, "a".to_string()).await.unwrap();
+	client.create_dir(test_dir, "a").await.unwrap();
 	assert_eq!(
-		get_dir_size(client, test_dir, false).await.unwrap(),
+		client.get_dir_size(test_dir, false).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
 			size: 0,
 			files: 0,
@@ -143,9 +143,9 @@ async fn size() {
 		}
 	);
 
-	create_dir(client, test_dir, "b".to_string()).await.unwrap();
+	client.create_dir(test_dir, "b").await.unwrap();
 	assert_eq!(
-		get_dir_size(client, test_dir, false).await.unwrap(),
+		client.get_dir_size(test_dir, false).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
 			size: 0,
 			files: 0,
@@ -157,19 +157,20 @@ async fn size() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn dir_search() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = Arc::new(resources.client.clone());
+	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let second_dir = create_dir(&client, test_dir, "second_dir").await.unwrap();
+	let second_dir = client.create_dir(test_dir, "second_dir").await.unwrap();
 
 	let dir_random_part_long = generate_random_base64_values(16);
 	let dir_random_part_short = generate_random_base64_values(2);
 
 	let dir_name = format!("{}{}", dir_random_part_long, dir_random_part_short);
 
-	let dir = create_dir(&client, &second_dir, dir_name).await.unwrap();
+	let dir = client.create_dir(&second_dir, dir_name).await.unwrap();
 
-	let found_items = find_item_matches_for_name(&client, dir_random_part_long)
+	let found_items = client
+		.find_item_matches_for_name(dir_random_part_long)
 		.await
 		.unwrap();
 
@@ -181,7 +182,8 @@ async fn dir_search() {
 		)]
 	);
 
-	let found_items = find_item_matches_for_name(&client, dir_random_part_short)
+	let found_items = client
+		.find_item_matches_for_name(dir_random_part_short)
 		.await
 		.unwrap();
 
@@ -197,14 +199,15 @@ async fn dir_search() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn dir_update_meta() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = Arc::new(resources.client.clone());
+	let client = &resources.client;
 	let test_dir = &resources.dir;
 
 	let dir_name = "dir";
-	let mut dir = create_dir(&client, test_dir, dir_name).await.unwrap();
+	let mut dir = client.create_dir(test_dir, dir_name).await.unwrap();
 
 	assert_eq!(
-		find_item_at_path(&client, format!("{}/{}", test_dir.name(), dir_name))
+		client
+			.find_item_at_path(format!("{}/{}", test_dir.name(), dir_name))
 			.await
 			.unwrap(),
 		Some(FSObjectType::Dir(Cow::Borrowed(&dir)))
@@ -213,11 +216,12 @@ async fn dir_update_meta() {
 	let mut meta = dir.get_meta();
 	meta.set_name("new_name");
 
-	update_dir_metadata(&client, &mut dir, meta).await.unwrap();
+	client.update_dir_metadata(&mut dir, meta).await.unwrap();
 
 	assert_eq!(dir.name(), "new_name");
 	assert_eq!(
-		find_item_at_path(&client, format!("{}/{}", test_dir.name(), dir.name()))
+		client
+			.find_item_at_path(format!("{}/{}", test_dir.name(), dir.name()))
 			.await
 			.unwrap(),
 		Some(FSObjectType::Dir(Cow::Borrowed(&dir)))
@@ -227,10 +231,10 @@ async fn dir_update_meta() {
 	let created = Utc::now() - chrono::Duration::days(1);
 	meta.set_created(created);
 
-	update_dir_metadata(&client, &mut dir, meta).await.unwrap();
+	client.update_dir_metadata(&mut dir, meta).await.unwrap();
 	assert_eq!(dir.created(), Some(created.round_subsecs(3)));
 
-	let found_dir = get_dir(&client, dir.uuid()).await.unwrap();
+	let found_dir = client.get_dir(dir.uuid()).await.unwrap();
 	assert_eq!(found_dir.created(), Some(created.round_subsecs(3)));
 	assert_eq!(found_dir, dir);
 }

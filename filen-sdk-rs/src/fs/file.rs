@@ -1,13 +1,15 @@
 use std::{
 	borrow::Cow,
-	fmt::{Debug, Display},
+	fmt::Debug,
 	io::{Cursor, Read, Write},
-	str::FromStr,
 	sync::{Arc, OnceLock},
 };
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_types::crypto::Sha512Hash;
+use filen_types::{
+	crypto::{EncryptedString, Sha512Hash},
+	error::ResponseError,
+};
 use futures::{
 	AsyncRead, AsyncWrite, FutureExt, StreamExt,
 	stream::{FuturesOrdered, FuturesUnordered},
@@ -25,91 +27,13 @@ use crate::{
 	},
 	crypto::{
 		self,
+		file::FileKey,
 		shared::{DataCrypter, MetaCrypter},
 	},
 	error::Error,
 };
 
-use super::{HasContents, HasMeta};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FileKey {
-	V2(crypto::v2::FileKey),
-	V3(crypto::v3::EncryptionKey),
-}
-
-impl Display for FileKey {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			FileKey::V2(key) => key.fmt(f),
-			FileKey::V3(key) => key.fmt(f),
-		}
-	}
-}
-
-impl Serialize for FileKey {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		match self {
-			FileKey::V2(key) => key.serialize(serializer),
-			FileKey::V3(key) => key.serialize(serializer),
-		}
-	}
-}
-
-impl<'de> Deserialize<'de> for FileKey {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		let key = String::deserialize(deserializer)?;
-		match key.len() {
-			32 => Ok(FileKey::V2(
-				crypto::v2::FileKey::from_str(&key).map_err(serde::de::Error::custom)?,
-			)),
-			64 => Ok(FileKey::V3(
-				crypto::v3::EncryptionKey::from_str(&key).map_err(serde::de::Error::custom)?,
-			)),
-			_ => Err(serde::de::Error::custom(format!(
-				"Invalid key length: {}",
-				key.len()
-			))),
-		}
-	}
-}
-
-impl FromStr for FileKey {
-	type Err = crypto::error::ConversionError;
-	fn from_str(key: &str) -> Result<Self, Self::Err> {
-		if key.len() == 32 {
-			Ok(FileKey::V2(crypto::v2::FileKey::from_str(key)?))
-		} else if key.len() == 64 {
-			Ok(FileKey::V3(crypto::v3::EncryptionKey::from_str(key)?))
-		} else {
-			Err(crypto::error::ConversionError::InvalidStringLength(
-				key.len(),
-				32,
-			))
-		}
-	}
-}
-
-impl crypto::shared::DataCrypter for FileKey {
-	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), crypto::error::ConversionError> {
-		match self {
-			FileKey::V2(key) => key.encrypt_data(data),
-			FileKey::V3(key) => key.encrypt_data(data),
-		}
-	}
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), crypto::error::ConversionError> {
-		match self {
-			FileKey::V2(key) => key.decrypt_data(data),
-			FileKey::V3(key) => key.decrypt_data(data),
-		}
-	}
-}
+use super::{HasContents, HasUUID, NonRootObject};
 
 pub struct FileBuilder {
 	uuid: Uuid,
@@ -124,7 +48,7 @@ pub struct FileBuilder {
 }
 
 impl FileBuilder {
-	pub fn new(name: impl Into<String>, parent: impl HasContents, client: &Client) -> Self {
+	fn new(name: impl Into<String>, parent: &impl HasContents, client: &Client) -> Self {
 		Self {
 			uuid: Uuid::new_v4(),
 			name: name.into(),
@@ -207,14 +131,6 @@ impl File {
 	pub fn key(&self) -> &FileKey {
 		&self.key
 	}
-
-	pub fn into_writer<'a>(self, client: Arc<Client>) -> FileWriter<'a> {
-		FileWriter::new(Arc::new(self), client)
-	}
-
-	pub fn get_writer<'a>(self: Arc<Self>, client: Arc<Client>) -> FileWriter<'a> {
-		FileWriter::new(self, client)
-	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,37 +144,55 @@ pub struct RemoteFile {
 	hash: Option<Sha512Hash>,
 }
 
-impl HasMeta for RemoteFile {
+impl NonRootObject for RemoteFile {
 	fn name(&self) -> &str {
 		&self.file.name
 	}
 
 	fn get_meta_string(&self) -> String {
-		serde_json::to_string(&self.get_meta_borrowed()).unwrap()
+		serde_json::to_string(&self.borrow_meta()).unwrap()
+	}
+
+	fn parent(&self) -> uuid::Uuid {
+		self.file.parent
+	}
+}
+
+impl HasUUID for RemoteFile {
+	fn uuid(&self) -> Uuid {
+		self.file.uuid
 	}
 }
 
 impl RemoteFile {
+	#[allow(clippy::too_many_arguments)]
 	pub fn from_encrypted(
-		file: filen_types::api::v3::dir::content::File,
+		uuid: Uuid,
+		parent: Uuid,
+		size: u64,
+		chunks: u64,
+		region: impl Into<String>,
+		bucket: impl Into<String>,
+		favorited: bool,
+		meta: &EncryptedString,
 		decrypter: &impl crypto::shared::MetaCrypter,
 	) -> Result<Self, Error> {
-		let meta = FileMeta::from_encrypted(&file.metadata, decrypter)?;
+		let meta = FileMeta::from_encrypted(meta, decrypter)?;
 		Ok(Self {
 			file: File {
 				name: meta.name.into_owned(),
-				uuid: file.uuid,
-				parent: file.parent,
+				uuid,
+				parent,
 				mime: meta.mime.into_owned(),
 				key: meta.key.into_owned(),
 				created: meta.created.unwrap_or_default(),
 				modified: meta.last_modified,
 			},
-			size: file.size,
-			favorited: file.favorited,
-			region: file.region,
-			bucket: file.bucket,
-			chunks: file.chunks,
+			size,
+			favorited,
+			region: region.into(),
+			bucket: bucket.into(),
+			chunks,
 			hash: meta.hash,
 		})
 	}
@@ -291,10 +225,6 @@ impl RemoteFile {
 		self.chunks
 	}
 
-	pub fn uuid(&self) -> Uuid {
-		self.file.uuid
-	}
-
 	pub fn size(&self) -> u64 {
 		self.size
 	}
@@ -303,15 +233,7 @@ impl RemoteFile {
 		&self.file
 	}
 
-	pub fn into_reader(self, client: Arc<Client>) -> impl AsyncRead {
-		FileReader::new(Arc::new(self), client)
-	}
-
-	pub fn get_reader(self: Arc<Self>, client: Arc<Client>) -> impl AsyncRead {
-		FileReader::new(self, client)
-	}
-
-	pub fn get_meta_borrowed(&self) -> FileMeta<'_> {
+	pub fn borrow_meta(&self) -> FileMeta<'_> {
 		FileMeta {
 			name: Cow::Borrowed(&self.file.name),
 			size: self.size,
@@ -362,7 +284,7 @@ pub struct FileMeta<'a> {
 
 impl<'a> FileMeta<'a> {
 	fn from_encrypted(
-		meta: &filen_types::crypto::EncryptedString,
+		meta: &EncryptedString,
 		decrypter: &impl crypto::shared::MetaCrypter,
 	) -> Result<Self, Error> {
 		let decrypted = decrypter.decrypt_meta(meta)?;
@@ -416,8 +338,8 @@ impl<'a> FileMeta<'a> {
 }
 
 struct FileReader<'a> {
-	file: Arc<RemoteFile>,
-	client: Arc<Client>,
+	file: &'a RemoteFile,
+	client: &'a Client,
 	index: u64,
 	limit: u64,
 	next_chunk_idx: u64,
@@ -425,8 +347,8 @@ struct FileReader<'a> {
 	futures: FuturesOrdered<futures::future::BoxFuture<'a, Result<Vec<u8>, Error>>>,
 }
 
-impl FileReader<'_> {
-	pub fn new(file: Arc<RemoteFile>, client: Arc<Client>) -> Self {
+impl<'a> FileReader<'a> {
+	fn new(file: &'a RemoteFile, client: &'a Client) -> Self {
 		let size = file.size; // adjustable in the future
 		let mut new = Self {
 			file,
@@ -479,10 +401,10 @@ impl FileReader<'_> {
 		}
 		let chunk_idx = self.next_chunk_idx;
 		self.next_chunk_idx += 1;
-		let client = self.client.clone();
-		let file = self.file.clone();
+		let client = self.client;
+		let file = self.file;
 		self.futures.push_back(Box::pin(async move {
-			api::download::download_file_chunk(client.client(), &file, chunk_idx, &mut out_data)
+			api::download::download_file_chunk(client.client(), file, chunk_idx, &mut out_data)
 				.await?;
 			file.file.key.decrypt_data(&mut out_data)?;
 			Ok(out_data)
@@ -585,7 +507,7 @@ struct FileWriterUploadingState<'a> {
 	remote_file_info: Arc<OnceLock<RemoteFileInfo>>,
 	upload_key: Arc<String>,
 	max_threads: usize,
-	client: Arc<Client>,
+	client: &'a Client,
 }
 
 impl<'a> FileWriterUploadingState<'a> {
@@ -675,10 +597,7 @@ impl<'a> FileWriterUploadingState<'a> {
 
 		let future: futures::future::BoxFuture<
 			'a,
-			Result<
-				filen_types::api::v3::upload::empty::Response,
-				filen_types::error::ResponseError,
-			>,
+			Result<filen_types::api::v3::upload::empty::Response, ResponseError>,
 		> = if self.written == 0 {
 			Box::pin(
 				async move { api::v3::upload::empty::post(client.client(), &empty_request).await },
@@ -794,11 +713,11 @@ struct FileWriterCompletingState<'a> {
 	file: Arc<File>,
 	future: futures::future::BoxFuture<
 		'a,
-		Result<filen_types::api::v3::upload::empty::Response, filen_types::error::ResponseError>,
+		Result<filen_types::api::v3::upload::empty::Response, ResponseError>,
 	>,
 	hash: Sha512Hash,
 	remote_file_info: RemoteFileInfo,
-	client: Arc<Client>,
+	client: &'a Client,
 }
 
 impl<'a> FileWriterCompletingState<'a> {
@@ -838,18 +757,20 @@ impl<'a> FileWriterCompletingState<'a> {
 struct FileWriterFinalizingState<'a> {
 	file: Arc<RemoteFile>,
 	futures: FuturesUnordered<futures::future::BoxFuture<'a, Result<(), Error>>>,
-	client: Arc<Client>,
+	client: &'a Client,
 }
 
-impl FileWriterFinalizingState<'_> {
-	fn new(file: Arc<RemoteFile>, client: Arc<Client>) -> Self {
+impl<'a> FileWriterFinalizingState<'a> {
+	fn new(file: Arc<RemoteFile>, client: &'a Client) -> Self {
 		// we use futures unordered so that when we add shared link support that can be handled at the same time
 		let futures = FuturesUnordered::new();
 
 		let temp_client = client.clone();
 		let temp_file = file.clone();
 		futures.push(Box::pin(async move {
-			crate::search::update_search_hashes_for_item(&temp_client, temp_file.as_ref()).await?;
+			temp_client
+				.update_search_hashes_for_item(temp_file.as_ref())
+				.await?;
 			Ok(())
 		}) as futures::future::BoxFuture<'_, Result<(), Error>>);
 
@@ -904,7 +825,7 @@ enum FileWriterState<'a> {
 }
 
 impl<'a> FileWriterState<'a> {
-	fn new(file: Arc<File>, client: Arc<Client>) -> Self {
+	fn new(file: Arc<File>, client: &'a Client) -> Self {
 		FileWriterState::Uploading(FileWriterUploadingState {
 			file,
 			futures: FuturesUnordered::new(),
@@ -928,8 +849,8 @@ pub struct FileWriter<'a> {
 	state: FileWriterState<'a>,
 }
 
-impl FileWriter<'_> {
-	pub fn new(file: Arc<File>, client: Arc<Client>) -> Self {
+impl<'a> FileWriter<'a> {
+	fn new(file: Arc<File>, client: &'a Client) -> Self {
 		Self {
 			state: FileWriterState::new(file, client),
 		}
@@ -1058,112 +979,115 @@ impl AsyncWrite for FileWriter<'_> {
 	}
 }
 
-pub async fn trash_file(
-	client: &Client,
-	file: &RemoteFile,
-) -> Result<(), filen_types::error::ResponseError> {
-	api::v3::file::trash::post(
-		client.client(),
-		&api::v3::file::trash::Request { uuid: file.uuid() },
-	)
-	.await
-}
+impl Client {
+	pub async fn trash_file(&self, file: &RemoteFile) -> Result<(), Error> {
+		Ok(api::v3::file::trash::post(
+			self.client(),
+			&api::v3::file::trash::Request { uuid: file.uuid() },
+		)
+		.await?)
+	}
 
-pub async fn restore_file(
-	client: &Client,
-	file: &RemoteFile,
-) -> Result<(), filen_types::error::ResponseError> {
-	// should this maybe accept a uuid instead of a file?
-	api::v3::file::restore::post(
-		client.client(),
-		&api::v3::file::restore::Request { uuid: file.uuid() },
-	)
-	.await
-}
+	pub async fn restore_file(&self, file: &RemoteFile) -> Result<(), Error> {
+		Ok(api::v3::file::restore::post(
+			self.client(),
+			&api::v3::file::restore::Request { uuid: file.uuid() },
+		)
+		.await?)
+	}
 
-pub async fn delete_file_permanently(
-	client: &Client,
-	file: RemoteFile,
-) -> Result<(), filen_types::error::ResponseError> {
-	api::v3::file::delete::permanent::post(
-		client.client(),
-		&api::v3::file::delete::permanent::Request { uuid: file.uuid() },
-	)
-	.await
-}
+	pub async fn delete_file_permanently(&self, file: RemoteFile) -> Result<(), Error> {
+		Ok(api::v3::file::delete::permanent::post(
+			self.client(),
+			&api::v3::file::delete::permanent::Request { uuid: file.uuid() },
+		)
+		.await?)
+	}
 
-pub async fn move_file(
-	client: &Client,
-	file: &mut RemoteFile,
-	new_parent: &impl HasContents,
-) -> Result<(), filen_types::error::ResponseError> {
-	api::v3::file::r#move::post(
-		client.client(),
-		&api::v3::file::r#move::Request {
-			uuid: file.uuid(),
-			new_parent: new_parent.uuid(),
-		},
-	)
-	.await?;
-	file.file.parent = new_parent.uuid();
-	Ok(())
-}
+	pub async fn move_file(
+		&self,
+		file: &mut RemoteFile,
+		new_parent: &impl HasContents,
+	) -> Result<(), Error> {
+		api::v3::file::r#move::post(
+			self.client(),
+			&api::v3::file::r#move::Request {
+				uuid: file.uuid(),
+				new_parent: new_parent.uuid(),
+			},
+		)
+		.await?;
+		file.file.parent = new_parent.uuid();
+		Ok(())
+	}
 
-pub async fn update_file_metadata(
-	client: &Client,
-	file: &mut RemoteFile,
-	new_meta: FileMeta<'_>,
-) -> Result<(), Error> {
-	api::v3::file::metadata::post(
-		client.client(),
-		&api::v3::file::metadata::Request {
-			uuid: file.uuid(),
-			name: client.crypter().encrypt_meta(&new_meta.name)?,
-			name_hashed: client.hash_name(&new_meta.name),
-			metadata: client
-				.crypter()
-				.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
-		},
-	)
-	.await?;
+	pub async fn update_file_metadata(
+		&self,
+		file: &mut RemoteFile,
+		new_meta: FileMeta<'_>,
+	) -> Result<(), Error> {
+		api::v3::file::metadata::post(
+			self.client(),
+			&api::v3::file::metadata::Request {
+				uuid: file.uuid(),
+				name: self.crypter().encrypt_meta(&new_meta.name)?,
+				name_hashed: self.hash_name(&new_meta.name),
+				metadata: self
+					.crypter()
+					.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+			},
+		)
+		.await?;
 
-	file.set_meta(new_meta);
-	Ok(())
-}
+		file.set_meta(new_meta);
+		Ok(())
+	}
 
-pub async fn get_file(client: &Client, uuid: Uuid) -> Result<RemoteFile, Error> {
-	let response = api::v3::file::post(client.client(), &api::v3::file::Request { uuid }).await?;
+	pub async fn get_file(&self, uuid: Uuid) -> Result<RemoteFile, Error> {
+		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
 
-	RemoteFile::from_encrypted(
-		filen_types::api::v3::dir::content::File {
+		RemoteFile::from_encrypted(
 			uuid,
-			metadata: response.metadata,
-			rm: "".into(),
-			timestamp: response.timestamp,
-			chunks: response.size / CHUNK_SIZE_U64 + 1,
-			size: response.size,
-			bucket: response.bucket,
-			region: response.region,
-			parent: response.parent,
-			version: response.version,
-			favorited: false,
-		},
-		client.crypter(),
-	)
-}
+			response.parent,
+			response.size,
+			response.size / CHUNK_SIZE_U64 + 1,
+			response.region,
+			response.bucket,
+			false,
+			&response.metadata,
+			self.crypter(),
+		)
+	}
 
-pub async fn exists_file(
-	client: &Client,
-	name: impl AsRef<str>,
-	parent: &impl HasContents,
-) -> Result<Option<Uuid>, filen_types::error::ResponseError> {
-	api::v3::file::exists::post(
-		client.client(),
-		&api::v3::file::exists::Request {
-			name_hashed: client.hash_name(name.as_ref()),
-			parent: parent.uuid(),
-		},
-	)
-	.await
-	.map(|r| r.0)
+	pub async fn file_exists(
+		&self,
+		name: impl AsRef<str>,
+		parent: &impl HasContents,
+	) -> Result<Option<Uuid>, Error> {
+		Ok(api::v3::file::exists::post(
+			self.client(),
+			&api::v3::file::exists::Request {
+				name_hashed: self.hash_name(name.as_ref()),
+				parent: parent.uuid(),
+			},
+		)
+		.await
+		.map(|r| r.0)?)
+	}
+
+	pub fn get_file_reader<'a>(&'a self, file: &'a RemoteFile) -> impl AsyncRead + 'a {
+		FileReader::new(file, self)
+	}
+
+	pub fn make_file_builder(
+		&self,
+		name: impl Into<String>,
+		parent: &impl HasContents,
+	) -> FileBuilder {
+		FileBuilder::new(name, parent, self)
+	}
+
+	pub fn get_file_writer(&self, file: impl Into<Arc<File>>) -> FileWriter<'_> {
+		FileWriter::new(file.into(), self)
+	}
 }

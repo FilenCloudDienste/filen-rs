@@ -1,4 +1,5 @@
 pub mod error;
+pub mod file;
 pub mod rsa;
 pub mod shared;
 pub mod v1;

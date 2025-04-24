@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+// todo improve error management
 #[derive(Debug, Error)]
 pub enum Error {
 	#[error("Request Error: `{0}`")]

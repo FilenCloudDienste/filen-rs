@@ -15,10 +15,10 @@ pub struct Request {
 pub struct Response(pub Option<Uuid>);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct RawResponse {
-	exists: bool,
+pub(crate) struct RawResponse {
+	pub(crate) exists: bool,
 	#[serde(with = "crate::serde::uuid::optional")]
-	uuid: Option<Uuid>,
+	pub(crate) uuid: Option<Uuid>,
 }
 
 impl Serialize for Response {

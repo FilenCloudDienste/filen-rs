@@ -1,15 +1,11 @@
 use core::panic;
-use std::{fmt::Write, str::FromStr, sync::Arc};
+use std::{fmt::Write, str::FromStr};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{
-		FSObjectType, HasContents,
-		dir::Directory,
-		file::{FileBuilder, FileKey},
-	},
-	prelude::*,
+	crypto::file::FileKey,
+	fs::{FSObjectType, HasContents, HasUUID, dir::Directory, file::FileBuilder},
 };
 use filen_types::auth::FileEncryptionVersion;
 use futures::{AsyncReadExt, AsyncWriteExt};
@@ -17,7 +13,7 @@ use rand::TryRngCore;
 
 mod test_utils;
 
-fn get_compat_test_file(client: &Client, parent: impl HasContents) -> (FileBuilder, String) {
+fn get_compat_test_file(client: &Client, parent: &impl HasContents) -> (FileBuilder, String) {
 	let file_key_str = match client.file_encryption_version() {
 		FileEncryptionVersion::V1 => "0123456789abcdefghijklmnopqrstuv",
 		FileEncryptionVersion::V2 => "0123456789abcdefghijklmnopqrstuv",
@@ -25,7 +21,8 @@ fn get_compat_test_file(client: &Client, parent: impl HasContents) -> (FileBuild
 			&faster_hex::hex_string("0123456789abcdefghijklmnopqrstuv".as_bytes())
 		}
 	};
-	let file = FileBuilder::new("large_sample-20mb.txt", parent, client)
+	let file = client
+		.make_file_builder("large_sample-20mb.txt", parent)
 		.created(DateTime::<Utc>::from_naive_utc_and_offset(
 			NaiveDateTime::new(
 				NaiveDate::from_ymd_opt(2025, 1, 11).unwrap(),
@@ -92,34 +89,28 @@ fn get_name_splitter_test_value() -> NameSplitterFile {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn make_rs_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = Arc::new(resources.client.clone());
+	let client = &resources.client;
 
-	let _lock = acquire_lock(
-		client.clone(),
-		"test:rs",
-		std::time::Duration::from_secs(1),
-		600,
-	)
-	.await
-	.unwrap();
-
-	if let Some(FSObjectType::Dir(dir)) = find_item_at_path(&client, "compat-rs").await.unwrap() {
-		trash_dir(&client, dir.into_owned()).await.unwrap();
-	}
-
-	let compat_dir = create_dir(&client, client.root(), "compat-rs")
+	let _lock = client
+		.acquire_lock("test:rs", std::time::Duration::from_secs(1), 600)
 		.await
 		.unwrap();
 
-	create_dir(&client, &compat_dir, "dir").await.unwrap();
+	if let Some(FSObjectType::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
+		client.trash_dir(&dir).await.unwrap();
+	}
 
-	let empty_file = FileBuilder::new("empty.txt", &compat_dir, &client).build();
-	let mut writer = empty_file.into_writer(client.clone());
+	let compat_dir = client.create_dir(client.root(), "compat-rs").await.unwrap();
+
+	client.create_dir(&compat_dir, "dir").await.unwrap();
+
+	let empty_file = client.make_file_builder("empty.txt", &compat_dir).build();
+	let mut writer = client.get_file_writer(empty_file);
 	writer.write_all(b"").await.unwrap();
 	writer.close().await.unwrap();
 
-	let small_file = FileBuilder::new("small.txt", &compat_dir, &client).build();
-	let mut writer = small_file.into_writer(client.clone());
+	let small_file = client.make_file_builder("small.txt", &compat_dir).build();
+	let mut writer = client.get_file_writer(small_file);
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	writer.into_remote_file().unwrap();
@@ -127,22 +118,24 @@ async fn make_rs_compat_dir() {
 	let mut big_random_bytes = vec![0u8; 1024 * 1024 * 4];
 	// fill with random bytes
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
-	let big_file = FileBuilder::new("big.txt", &compat_dir, &client).build();
-	let mut writer = big_file.into_writer(client.clone());
+	let big_file = client.make_file_builder("big.txt", &compat_dir).build();
+	let mut writer = client.get_file_writer(big_file);
 	writer
 		.write_all(faster_hex::hex_string(&big_random_bytes).as_bytes())
 		.await
 		.unwrap();
 	writer.close().await.unwrap();
 
-	let (file, test_str) = get_compat_test_file(&client, &compat_dir);
+	let (file, test_str) = get_compat_test_file(client, &compat_dir);
 	let file = file.build();
-	let mut writer = file.into_writer(client.clone());
+	let mut writer = client.get_file_writer(file);
 	writer.write_all(test_str.as_bytes()).await.unwrap();
 	writer.close().await.unwrap();
 
-	let file = FileBuilder::new("nameSplitter.json", &compat_dir, &client).build();
-	let mut writer = file.into_writer(client.clone());
+	let file = client
+		.make_file_builder("nameSplitter.json", &compat_dir)
+		.build();
+	let mut writer = client.get_file_writer(file);
 	writer
 		.write_all(
 			serde_json::to_string(&get_name_splitter_test_value())
@@ -154,29 +147,31 @@ async fn make_rs_compat_dir() {
 	writer.close().await.unwrap();
 }
 
-async fn run_compat_tests(client: Arc<Client>, compat_dir: Directory, language: &str) {
-	match find_item_in_dir(&client, &compat_dir, "dir").await.unwrap() {
+async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str) {
+	match client.find_item_in_dir(&compat_dir, "dir").await.unwrap() {
 		Some(FSObjectType::Dir(_)) => {}
 		_ => panic!("dir not found in compat-go directory"),
 	}
-	match find_item_in_dir(&client, &compat_dir, "empty.txt")
+	match client
+		.find_item_in_dir(&compat_dir, "empty.txt")
 		.await
 		.unwrap()
 	{
 		Some(FSObjectType::File(file)) => {
-			let mut reader = file.into_owned().into_reader(client.clone());
+			let mut reader = client.get_file_reader(&file);
 			let mut buf = Vec::new();
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(buf.len(), 0, "empty.txt should be empty");
 		}
 		_ => panic!("empty.txt not found in compat-go directory"),
 	}
-	match find_item_in_dir(&client, &compat_dir, "small.txt")
+	match client
+		.find_item_in_dir(&compat_dir, "small.txt")
 		.await
 		.unwrap()
 	{
 		Some(FSObjectType::File(file)) => {
-			let mut reader = file.into_owned().into_reader(client.clone());
+			let mut reader = client.get_file_reader(&file);
 			let mut buf = Vec::new();
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(
@@ -187,12 +182,13 @@ async fn run_compat_tests(client: Arc<Client>, compat_dir: Directory, language: 
 		}
 		_ => panic!("small.txt not found in compat-go directory"),
 	}
-	match find_item_in_dir(&client, &compat_dir, "big.txt")
+	match client
+		.find_item_in_dir(&compat_dir, "big.txt")
 		.await
 		.unwrap()
 	{
 		Some(FSObjectType::File(file)) => {
-			let mut reader = file.into_owned().into_reader(client.clone());
+			let mut reader = client.get_file_reader(&file);
 			let mut buf = Vec::with_capacity(1024 * 1024 * 4 * 2);
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(
@@ -204,9 +200,10 @@ async fn run_compat_tests(client: Arc<Client>, compat_dir: Directory, language: 
 		_ => panic!("big.txt not found in compat-go directory"),
 	}
 
-	let (compat_test_file, test_str) = get_compat_test_file(&client, &compat_dir);
+	let (compat_test_file, test_str) = get_compat_test_file(client, &compat_dir);
 
-	match find_item_in_dir(&client, &compat_dir, "large_sample-20mb.txt")
+	match client
+		.find_item_in_dir(&compat_dir, "large_sample-20mb.txt")
 		.await
 		.unwrap()
 	{
@@ -218,7 +215,7 @@ async fn run_compat_tests(client: Arc<Client>, compat_dir: Directory, language: 
 				"file inner_file mismatch"
 			);
 
-			let mut reader = file.into_owned().into_reader(client.clone());
+			let mut reader = client.get_file_reader(&file);
 			let mut buf = Vec::with_capacity(test_str.len());
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(test_str.len(), buf.len(), "file size mismatch");
@@ -231,12 +228,13 @@ async fn run_compat_tests(client: Arc<Client>, compat_dir: Directory, language: 
 		_ => panic!("large_sample-20mb.txt not found in compat-go directory"),
 	}
 
-	match find_item_in_dir(&client, &compat_dir, "nameSplitter.json")
+	match client
+		.find_item_in_dir(&compat_dir, "nameSplitter.json")
 		.await
 		.unwrap()
 	{
 		Some(FSObjectType::File(file)) => {
-			let mut reader = file.into_owned().into_reader(client.clone());
+			let mut reader = client.get_file_reader(&file);
 			let mut buf = Vec::new();
 			reader.read_to_end(&mut buf).await.unwrap();
 			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
@@ -256,18 +254,14 @@ async fn run_compat_tests(client: Arc<Client>, compat_dir: Directory, language: 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn check_go_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = Arc::new(resources.client.clone());
+	let client = &resources.client;
 
-	let _lock = acquire_lock(
-		client.clone(),
-		"test:go",
-		std::time::Duration::from_secs(1),
-		600,
-	)
-	.await
-	.unwrap();
+	let _lock = client
+		.acquire_lock("test:go", std::time::Duration::from_secs(1), 600)
+		.await
+		.unwrap();
 
-	let compat_dir = match find_item_at_path(&client, "compat-go").await.unwrap() {
+	let compat_dir = match client.find_item_at_path("compat-go").await.unwrap() {
 		Some(FSObjectType::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
 	};
@@ -278,18 +272,14 @@ async fn check_go_compat_dir() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn check_ts_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = Arc::new(resources.client.clone());
+	let client = &resources.client;
 
-	let _lock = acquire_lock(
-		client.clone(),
-		"test:ts",
-		std::time::Duration::from_secs(1),
-		600,
-	)
-	.await
-	.unwrap();
+	let _lock = client
+		.acquire_lock("test:ts", std::time::Duration::from_secs(1), 600)
+		.await
+		.unwrap();
 
-	let compat_dir = match find_item_at_path(&client, "compat-ts").await.unwrap() {
+	let compat_dir = match client.find_item_at_path("compat-ts").await.unwrap() {
 		Some(FSObjectType::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
 	};

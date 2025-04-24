@@ -5,9 +5,9 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use crate::{
 	api,
 	consts::{V2FILE_ENCRYPTION_VERSION, V2META_ENCRYPTION_VERSION},
-	crypto::{self, rsa::HMACKey, shared::MetaCrypter},
+	crypto::{self, file::FileKey, rsa::HMACKey, shared::MetaCrypter},
 	error::Error,
-	fs::{dir::RootDirectory, file::FileKey},
+	fs::dir::RootDirectory,
 };
 
 pub mod http;
@@ -94,6 +94,49 @@ impl Client {
 			AuthInfo::V3(_) => FileKey::V3(v3::generate_file_key()),
 		}
 	}
+
+	pub async fn login(email: String, pwd: &str, two_factor_code: &str) -> Result<Self, Error> {
+		let client = UnauthClient::default();
+
+		let info_response =
+			api::v3::auth::info::post(&client, &api::v3::auth::info::Request { email: &email })
+				.await?;
+
+		let (client, auth_info, private_key, public_key) = match info_response.auth_version {
+			AuthVersion::V1 => unimplemented!(),
+			AuthVersion::V2 => {
+				v2::login(&email, pwd, two_factor_code, &info_response, client).await?
+			}
+			AuthVersion::V3 => {
+				v3::login(&email, pwd, two_factor_code, &info_response, client).await?
+			}
+		};
+
+		let (private_key, public_key, hmac) =
+			crypto::rsa::get_key_pair(&public_key, &private_key, &auth_info)?;
+
+		let base_folder_uuid = api::v3::user::base_folder::get(&client).await?.uuid;
+		let root_dir = RootDirectory::new(base_folder_uuid);
+
+		let (file_encryption_version, meta_encryption_version) = match &info_response.auth_version {
+			AuthVersion::V1 | AuthVersion::V2 => {
+				(V2FILE_ENCRYPTION_VERSION, V2META_ENCRYPTION_VERSION)
+			}
+			AuthVersion::V3 => (FileEncryptionVersion::V3, MetaEncryptionVersion::V3),
+		};
+
+		Ok(Client {
+			email,
+			root_dir,
+			auth_info,
+			file_encryption_version,
+			meta_encryption_version,
+			public_key,
+			private_key,
+			hmac_key: hmac,
+			http_client: client,
+		})
+	}
 }
 
 impl std::fmt::Debug for Client {
@@ -113,40 +156,4 @@ impl std::fmt::Debug for Client {
 			.field("meta_encryption_version", &self.meta_encryption_version)
 			.finish()
 	}
-}
-
-pub async fn login(email: String, pwd: &str, two_factor_code: &str) -> Result<Client, Error> {
-	let client = UnauthClient::default();
-
-	let info_response =
-		api::v3::auth::info::post(&client, &api::v3::auth::info::Request { email: &email }).await?;
-
-	let (client, auth_info, private_key, public_key) = match info_response.auth_version {
-		AuthVersion::V1 => unimplemented!(),
-		AuthVersion::V2 => v2::login(&email, pwd, two_factor_code, &info_response, client).await?,
-		AuthVersion::V3 => v3::login(&email, pwd, two_factor_code, &info_response, client).await?,
-	};
-
-	let (private_key, public_key, hmac) =
-		crypto::rsa::get_key_pair(&public_key, &private_key, &auth_info)?;
-
-	let base_folder_uuid = api::v3::user::base_folder::get(&client).await?.uuid;
-	let root_dir = RootDirectory::new(base_folder_uuid);
-
-	let (file_encryption_version, meta_encryption_version) = match &info_response.auth_version {
-		AuthVersion::V1 | AuthVersion::V2 => (V2FILE_ENCRYPTION_VERSION, V2META_ENCRYPTION_VERSION),
-		AuthVersion::V3 => (FileEncryptionVersion::V3, MetaEncryptionVersion::V3),
-	};
-
-	Ok(Client {
-		email,
-		root_dir,
-		auth_info,
-		file_encryption_version,
-		meta_encryption_version,
-		public_key,
-		private_key,
-		hmac_key: hmac,
-		http_client: client,
-	})
 }

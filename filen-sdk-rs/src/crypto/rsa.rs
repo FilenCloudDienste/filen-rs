@@ -38,7 +38,7 @@ impl HMACKey {
 	}
 }
 
-pub fn get_key_pair(
+pub(crate) fn get_key_pair(
 	public_key: &EncodedPublicKey,
 	private_key: &EncryptedPrivateKey,
 	meta_crypter: &impl MetaCrypter,

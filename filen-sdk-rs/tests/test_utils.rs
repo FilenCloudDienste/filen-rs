@@ -1,7 +1,7 @@
 use std::env;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
-use filen_sdk_rs::{auth::Client, fs::dir::Directory, prelude::*};
+use filen_sdk_rs::{auth::Client, fs::dir::Directory};
 
 use tokio::sync::OnceCell;
 
@@ -26,7 +26,7 @@ impl Default for TestResources {
 impl Drop for TestResources {
 	fn drop(&mut self) {
 		futures::executor::block_on(async move {
-			match trash_dir(&self.client, self.dir.clone()).await {
+			match self.client.trash_dir(&self.dir).await {
 				Ok(_) => {}
 				Err(e) => eprintln!("Failed to clean up test directory: {}", e),
 			}
@@ -39,7 +39,7 @@ impl Resources {
 		self.client
 			.get_or_init(|| async {
 				dotenv::dotenv().ok();
-				login(
+				Client::login(
 					env::var("TEST_EMAIL").unwrap(),
 					&env::var("TEST_PASSWORD").unwrap(),
 					&env::var("TEST_2FA_CODE").unwrap_or("XXXXXX".to_string()),
@@ -56,7 +56,7 @@ impl Resources {
 			BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
 		);
 		let client = self.client().await.clone();
-		let test_dir = create_dir(&client, client.root(), name).await.unwrap();
+		let test_dir = client.create_dir(client.root(), name).await.unwrap();
 		TestResources {
 			client,
 			dir: test_dir,

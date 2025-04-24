@@ -7,9 +7,4 @@ pub struct Request {
 	pub parent: uuid::Uuid,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Response {
-	pub exists: bool,
-	#[serde(with = "crate::serde::uuid::optional")]
-	pub uuid: Option<uuid::Uuid>,
-}
+pub use crate::api::v3::file::exists::Response;
