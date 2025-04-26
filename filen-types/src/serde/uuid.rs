@@ -24,7 +24,7 @@ pub(crate) mod optional {
 }
 
 pub(crate) mod base {
-	use serde::Deserialize;
+	use serde::{Deserialize, Serialize};
 
 	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<uuid::Uuid>, D::Error>
 	where
@@ -42,7 +42,7 @@ pub(crate) mod base {
 		S: serde::Serializer,
 	{
 		match value {
-			Some(uuid) => uuid::serde::simple::serialize(uuid, serializer),
+			Some(uuid) => uuid.serialize(serializer),
 			None => serializer.serialize_str("base"),
 		}
 	}
