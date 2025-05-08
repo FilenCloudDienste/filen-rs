@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const ENDPOINT: &str = "v3/dir/size";
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
@@ -13,6 +15,7 @@ pub struct Request {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Response {
 	pub size: u64,
 	pub files: u64,

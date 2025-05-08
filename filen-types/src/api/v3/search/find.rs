@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -7,58 +9,62 @@ use crate::{
 	crypto::{EncryptedString, Sha256Hash},
 };
 
+pub const ENDPOINT: &str = "v3/search/find";
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub hashes: Vec<Sha256Hash>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Response<'a> {
+	pub items: Vec<SearchFindItem<'a>>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(tag = "type")]
-pub enum SearchFindItem {
+#[serde(rename_all = "camelCase")]
+pub enum SearchFindItem<'a> {
 	#[serde(rename = "directory")]
-	Dir(SearchFindDirectory),
+	Dir(SearchFindDirectory<'a>),
 	#[serde(rename = "file")]
-	File(SearchFindFile),
+	File(SearchFindFile<'a>),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchFindFile {
+pub struct SearchFindFile<'a> {
 	pub uuid: Uuid,
-	pub metadata: EncryptedString,
+	pub metadata: Cow<'a, EncryptedString>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
 	pub size: u64,
-	pub bucket: String,
-	pub region: String,
+	pub bucket: Cow<'a, str>,
+	pub region: Cow<'a, str>,
 	pub parent: Uuid,
 	pub version: FileEncryptionVersion,
 	pub favorited: bool,
 	pub trash: bool,
 	pub versioned: bool,
 	pub uuid_path: Vec<Uuid>,
-	pub metadata_path: Vec<EncryptedString>,
-	pub name_hashed: String,
+	pub metadata_path: Vec<Cow<'a, EncryptedString>>,
+	pub name_hashed: Cow<'a, str>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchFindDirectory {
+pub struct SearchFindDirectory<'a> {
 	pub uuid: Uuid,
-	pub metadata: EncryptedString,
+	pub metadata: Cow<'a, EncryptedString>,
 	pub parent: Uuid,
-	pub color: Option<String>,
+	pub color: Option<Cow<'a, str>>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
 	pub trash: bool,
 	pub uuid_path: Vec<Uuid>,
-	pub metadata_path: Vec<EncryptedString>,
-	pub name_hashed: String,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct Response {
-	pub items: Vec<SearchFindItem>,
+	pub metadata_path: Vec<Cow<'a, EncryptedString>>,
+	pub name_hashed: Cow<'a, str>,
 }

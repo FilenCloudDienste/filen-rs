@@ -1,3 +1,7 @@
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
+
 use crate::{
 	auth::{APIKey, AuthVersion},
 	crypto::{
@@ -6,30 +10,23 @@ use crate::{
 	},
 };
 
-use reqwest::Body;
-use serde::{Deserialize, Serialize};
+pub const ENDPOINT: &str = "v3/login";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub email: &'a str,
-	pub password: DerivedPassword,
-	pub two_factor_code: &'a str,
+	pub email: Cow<'a, str>,
+	pub password: Cow<'a, DerivedPassword>,
+	pub two_factor_code: Cow<'a, str>,
 	pub auth_version: AuthVersion,
-}
-
-impl From<Request<'_>> for Body {
-	fn from(val: Request) -> Self {
-		serde_json::to_string(&val).unwrap().into()
-	}
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Response {
-	pub api_key: APIKey,
-	pub master_keys: Option<EncryptedMasterKeys>,
-	pub public_key: EncodedPublicKey,
-	pub private_key: EncryptedPrivateKey,
-	pub dek: Option<EncryptedDEK>,
+pub struct Response<'a> {
+	pub api_key: Cow<'a, APIKey>,
+	pub master_keys: Option<Cow<'a, EncryptedMasterKeys>>,
+	pub public_key: Cow<'a, EncodedPublicKey>,
+	pub private_key: Cow<'a, EncryptedPrivateKey>,
+	pub dek: Option<Cow<'a, EncryptedDEK>>,
 }

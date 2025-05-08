@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use filen_types::auth::{AuthVersion, FileEncryptionVersion, MetaEncryptionVersion};
 use http::{AuthClient, UnauthClient};
 use rsa::{RsaPrivateKey, RsaPublicKey};
@@ -98,9 +100,13 @@ impl Client {
 	pub async fn login(email: String, pwd: &str, two_factor_code: &str) -> Result<Self, Error> {
 		let client = UnauthClient::default();
 
-		let info_response =
-			api::v3::auth::info::post(&client, &api::v3::auth::info::Request { email: &email })
-				.await?;
+		let info_response = api::v3::auth::info::post(
+			&client,
+			&api::v3::auth::info::Request {
+				email: Cow::Borrowed(&email),
+			},
+		)
+		.await?;
 
 		let (client, auth_info, private_key, public_key) = match info_response.auth_version {
 			AuthVersion::V1 => unimplemented!(),

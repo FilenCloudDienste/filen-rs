@@ -2,9 +2,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::Sha256Hash;
 
+pub const ENDPOINT: &str = "v3/search/add";
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request {
 	pub items: Vec<SearchAddItem>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Response {
+	added: u64,
+	skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,14 +49,9 @@ impl<'de> Deserialize<'de> for SearchAddItemType {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchAddItem {
 	pub uuid: uuid::Uuid,
 	pub hash: Sha256Hash,
 	pub r#type: SearchAddItemType,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct Response {
-	added: u64,
-	skipped: u64,
 }

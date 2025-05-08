@@ -1,18 +1,10 @@
-pub use filen_types::api::v3::dir::download::{Request, Response};
-use filen_types::{api::response::FilenResponse, error::ResponseError};
+pub use filen_types::api::v3::dir::download::{ENDPOINT, Request, Response};
 
-use crate::{auth::http::AuthorizedClient, consts::gateway_url};
+use crate::{api::post_auth_request, auth::http::AuthorizedClient, error::Error};
 
 pub(crate) async fn post(
 	client: impl AuthorizedClient,
 	request: &Request,
-) -> Result<Response, ResponseError> {
-	client
-		.post_auth_request(gateway_url("v3/dir/download"))
-		.json(request)
-		.send()
-		.await?
-		.json::<FilenResponse<Response>>()
-		.await?
-		.into_data()
+) -> Result<Response<'static>, Error> {
+	post_auth_request(client, request, ENDPOINT).await
 }

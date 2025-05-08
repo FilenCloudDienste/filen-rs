@@ -1,38 +1,42 @@
+use std::borrow::Cow;
+
 use serde::Deserialize;
 
 use crate::error::ResponseError;
 
 #[derive(Deserialize, Debug)]
 #[serde(bound = "T: Deserialize<'de>")]
-pub struct FilenResponse<T>
+pub struct FilenResponse<'a, T>
 where
 	T: std::fmt::Debug,
 {
 	pub status: Option<bool>,
-	pub message: Option<String>,
-	pub code: Option<String>,
+	pub message: Option<Cow<'a, str>>,
+	pub code: Option<Cow<'a, str>>,
 	data: Option<T>,
 }
 
-impl<T> FilenResponse<T>
+impl<T> FilenResponse<'_, T>
 where
 	T: std::fmt::Debug,
 {
 	pub fn into_data(self) -> Result<T, ResponseError> {
-		self.data.ok_or(ResponseError::ApiError {
-			message: self.message,
-			code: self.code,
-		})
+		match (self.status, self.data) {
+			(Some(true), Some(data)) => Ok(data),
+			_ => Err(ResponseError::ApiError {
+				message: self.message.map(|s| s.into_owned()),
+				code: self.code.map(|s| s.into_owned()),
+			}),
+		}
 	}
 
-	pub fn check_status(self) -> Result<(), ResponseError> {
-		if self.status.is_some_and(|s| s) {
-			Ok(())
-		} else {
-			Err(ResponseError::ApiError {
-				message: self.message,
-				code: self.code,
-			})
+	pub fn ignore_data(self) -> Result<(), ResponseError> {
+		match (self.status, self.data) {
+			(Some(true), _) => Ok(()),
+			_ => Err(ResponseError::ApiError {
+				message: self.message.map(|s| s.into_owned()),
+				code: self.code.map(|s| s.into_owned()),
+			}),
 		}
 	}
 }

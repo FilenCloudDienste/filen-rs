@@ -13,6 +13,7 @@ use crate::{
 	api,
 	auth::Client,
 	crypto::shared::MetaCrypter,
+	error::Error,
 	fs::{
 		HasUUID, NonRootFSObject, NonRootObject,
 		dir::{Directory, DirectoryMeta},
@@ -129,7 +130,7 @@ impl Client {
 	pub async fn update_search_hashes_for_item<'a>(
 		&self,
 		item: impl Into<NonRootFSObject<'a>>,
-	) -> Result<api::v3::search::add::Response, filen_types::error::ResponseError> {
+	) -> Result<api::v3::search::add::Response, Error> {
 		let items = self.generate_search_items_for_item(item);
 		api::v3::search::add::post(self.client(), &api::v3::search::add::Request { items }).await
 	}
@@ -155,7 +156,7 @@ impl Client {
 						NonRootFSObject::Dir(Cow::Owned(Directory::from_encrypted(
 							found_dir.uuid,
 							found_dir.parent,
-							found_dir.color,
+							found_dir.color.map(|s| s.into_owned()),
 							found_dir.favorited,
 							&found_dir.metadata,
 							self.crypter(),

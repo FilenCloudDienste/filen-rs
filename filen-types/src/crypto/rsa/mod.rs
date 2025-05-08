@@ -6,7 +6,7 @@ use crate::{crypto::EncodedString, error::ConversionError};
 use super::EncryptedString;
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncodedPublicKey(EncodedString);
+pub struct EncodedPublicKey(pub EncodedString);
 
 impl TryFrom<&EncodedPublicKey> for RsaPublicKey {
 	type Error = ConversionError;

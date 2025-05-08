@@ -1,18 +1,7 @@
-pub use filen_types::api::v3::file::delete::permanent::Request;
-use filen_types::{api::response::FilenResponse, error::ResponseError};
+pub use filen_types::api::v3::file::delete::permanent::{ENDPOINT, Request};
 
-use crate::{auth::http::AuthorizedClient, consts::gateway_url};
+use crate::{api::post_auth_request_empty, auth::http::AuthorizedClient, error::Error};
 
-pub(crate) async fn post(
-	client: impl AuthorizedClient,
-	request: &Request,
-) -> Result<(), ResponseError> {
-	client
-		.post_auth_request(gateway_url("v3/file/delete/permanent"))
-		.json(request)
-		.send()
-		.await?
-		.json::<FilenResponse<()>>()
-		.await?
-		.check_status()
+pub(crate) async fn post(client: impl AuthorizedClient, request: &Request) -> Result<(), Error> {
+	post_auth_request_empty(client, request, ENDPOINT).await
 }

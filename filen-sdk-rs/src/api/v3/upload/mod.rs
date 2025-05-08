@@ -1,4 +1,4 @@
-pub use filen_types::api::v3::upload::Response;
+pub use filen_types::api::v3::upload::{ENDPOINT, Response};
 use filen_types::{api::response::FilenResponse, error::ResponseError};
 use sha2::{Digest, Sha512};
 
@@ -13,11 +13,12 @@ pub(crate) async fn upload_file_chunk(
 	upload_key: &str,
 	chunk_idx: u64,
 	chunk: Vec<u8>,
-) -> Result<Response, ResponseError> {
+) -> Result<Response<'static>, ResponseError> {
 	let data_hash = Sha512::digest(&chunk);
 	let url = format!(
-		"{}/v3/upload?uuid={}&index={}&parent={}&uploadKey={}&hash={}",
+		"{}/{}?uuid={}&index={}&parent={}&uploadKey={}&hash={}",
 		random_ingest_url(),
+		ENDPOINT,
 		file.uuid(),
 		chunk_idx,
 		file.parent(),

@@ -1,16 +1,7 @@
-use filen_types::{
-	api::{response::FilenResponse, v3::user::base_folder::Response},
-	error::ResponseError,
-};
+use filen_types::api::v3::user::base_folder::{ENDPOINT, Response};
 
-use crate::{auth::http::AuthorizedClient, consts::gateway_url};
+use crate::{api::get_auth_request, auth::http::AuthorizedClient, error::Error};
 
-pub(crate) async fn get(client: impl AuthorizedClient) -> Result<Response, ResponseError> {
-	client
-		.get_auth_request(gateway_url("v3/user/baseFolder"))
-		.send()
-		.await?
-		.json::<FilenResponse<Response>>()
-		.await?
-		.into_data()
+pub(crate) async fn get(client: impl AuthorizedClient) -> Result<Response, Error> {
+	get_auth_request(client, ENDPOINT).await
 }

@@ -1,13 +1,7 @@
-use filen_types::{api::response::FilenResponse, error::ResponseError};
+use filen_types::api::v3::trash::empty::ENDPOINT;
 
-use crate::{auth::http::AuthorizedClient, consts::gateway_url};
+use crate::{api::post_auth_request_no_body_empty, auth::http::AuthorizedClient, error::Error};
 
-pub(crate) async fn post(client: impl AuthorizedClient) -> Result<(), ResponseError> {
-	client
-		.post_auth_request(gateway_url("v3/trash/empty"))
-		.send()
-		.await?
-		.json::<FilenResponse<()>>()
-		.await?
-		.check_status()
+pub(crate) async fn post(client: impl AuthorizedClient) -> Result<(), Error> {
+	post_auth_request_no_body_empty(client, ENDPOINT).await
 }

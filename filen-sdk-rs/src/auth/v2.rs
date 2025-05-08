@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use filen_types::crypto::rsa::{EncodedPublicKey, EncryptedPrivateKey};
 
 use crate::{
@@ -39,7 +41,7 @@ pub(super) async fn login(
 	email: &str,
 	pwd: &str,
 	two_factor_code: &str,
-	info: &api::v3::auth::info::Response,
+	info: &api::v3::auth::info::Response<'_>,
 	client: UnauthClient,
 ) -> Result<
 	(
@@ -50,32 +52,32 @@ pub(super) async fn login(
 	),
 	Error,
 > {
-	let (master_key, pwd) = crypto::v2::derive_password_and_mk(pwd, &info.salt)?;
+	let (master_key, pwd) = crypto::v2::derive_password_and_mk(pwd, info.salt.as_ref())?;
 
 	let response = api::v3::login::post(
 		&client,
 		&api::v3::login::Request {
-			email,
-			password: pwd,
-			two_factor_code,
+			email: Cow::Borrowed(email),
+			password: Cow::Borrowed(&pwd),
+			two_factor_code: Cow::Borrowed(two_factor_code),
 			auth_version: info.auth_version,
 		},
 	)
 	.await?;
 
-	let auth_client = super::AuthClient::new_from_client(response.api_key, client);
+	let auth_client = super::AuthClient::new_from_client(response.api_key.into_owned(), client);
 
 	let master_keys_str = response.master_keys.ok_or(Error::Custom(
 		"Missing master keys in login response".to_string(),
 	))?;
 
-	let master_keys = crypto::v2::MasterKeys::new(master_keys_str, master_key)?;
+	let master_keys = crypto::v2::MasterKeys::new(master_keys_str.into_owned(), master_key)?;
 
 	Ok((
 		auth_client,
 		super::AuthInfo::V2(AuthInfo { master_keys }),
-		response.private_key,
-		response.public_key,
+		response.private_key.into_owned(),
+		response.public_key.into_owned(),
 	))
 }
 

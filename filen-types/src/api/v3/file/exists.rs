@@ -4,6 +4,8 @@ use serde::{
 };
 use uuid::Uuid;
 
+pub const ENDPOINT: &str = "v3/file/exists";
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
@@ -15,6 +17,7 @@ pub struct Request {
 pub struct Response(pub Option<Uuid>);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RawResponse {
 	pub(crate) exists: bool,
 	#[serde(with = "crate::serde::uuid::optional")]

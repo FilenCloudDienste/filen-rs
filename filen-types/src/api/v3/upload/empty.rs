@@ -1,21 +1,26 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{auth::FileEncryptionVersion, crypto::EncryptedString};
 
+pub const ENDPOINT: &str = "v3/upload/empty";
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Request {
+pub struct Request<'a> {
 	pub uuid: uuid::Uuid,
-	pub name: EncryptedString,
-	pub name_hashed: String, // should this be a string or a stronger type?
-	pub size: EncryptedString,
+	pub name: Cow<'a, EncryptedString>,
+	pub name_hashed: Cow<'a, str>, // should this be a string or a stronger type?
+	pub size: Cow<'a, EncryptedString>,
 	pub parent: uuid::Uuid,
-	pub mime: EncryptedString,
-	pub metadata: EncryptedString,
+	pub mime: Cow<'a, EncryptedString>,
+	pub metadata: Cow<'a, EncryptedString>,
 	pub version: FileEncryptionVersion,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Response {
 	pub chunks: u64,
 	pub size: u64,

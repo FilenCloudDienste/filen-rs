@@ -6,12 +6,10 @@ use std::{
 };
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_types::{
-	crypto::{EncryptedString, Sha512Hash},
-	error::ResponseError,
-};
+use filen_types::crypto::{EncryptedString, Sha512Hash};
 use futures::{
 	AsyncRead, AsyncWrite, FutureExt, StreamExt,
+	future::BoxFuture,
 	stream::{FuturesOrdered, FuturesUnordered},
 };
 use serde::{Deserialize, Serialize};
@@ -533,8 +531,8 @@ impl<'a> FileWriterUploadingState<'a> {
 			.await?;
 			// don't care if this errors because that means another thread set it
 			let _ = remote_file_info.set(RemoteFileInfo {
-				region: result.region,
-				bucket: result.bucket,
+				region: result.region.into_owned(),
+				bucket: result.bucket.into_owned(),
 			});
 			Ok(())
 		}));
@@ -572,18 +570,17 @@ impl<'a> FileWriterUploadingState<'a> {
 
 		let empty_request = filen_types::api::v3::upload::empty::Request {
 			uuid: file.uuid,
-			name: self.client.crypter().encrypt_meta(&file.name)?,
-			name_hashed: self.client.hash_name(&file.name),
-			size: self
-				.client
-				.crypter()
-				.encrypt_meta(&self.written.to_string())?,
+			name: Cow::Owned(self.client.crypter().encrypt_meta(&file.name)?),
+			name_hashed: Cow::Owned(self.client.hash_name(&file.name)),
+			size: Cow::Owned(
+				self.client
+					.crypter()
+					.encrypt_meta(&self.written.to_string())?,
+			),
 			parent: file.parent,
-			mime: self.client.crypter().encrypt_meta(&self.file.mime)?,
-			metadata: self
-				.client
-				.crypter()
-				.encrypt_meta(&serde_json::to_string(&FileMeta {
+			mime: Cow::Owned(self.client.crypter().encrypt_meta(&self.file.mime)?),
+			metadata: Cow::Owned(self.client.crypter().encrypt_meta(&serde_json::to_string(
+				&FileMeta {
 					name: Cow::Borrowed(&file.name),
 					size: self.written,
 					mime: Cow::Borrowed(&file.mime),
@@ -591,32 +588,31 @@ impl<'a> FileWriterUploadingState<'a> {
 					created: Some(file.created),
 					last_modified: file.modified,
 					hash: Some(hash.into()),
-				})?)?,
+				},
+			)?)?),
 			version: self.client.file_encryption_version(),
 		};
 
-		let future: futures::future::BoxFuture<
-			'a,
-			Result<filen_types::api::v3::upload::empty::Response, ResponseError>,
-		> = if self.written == 0 {
-			Box::pin(
-				async move { api::v3::upload::empty::post(client.client(), &empty_request).await },
-			)
-		} else {
-			let upload_key = self.upload_key.clone();
-			Box::pin(async move {
-				api::v3::upload::done::post(
-					client.client(),
-					&api::v3::upload::done::Request {
-						empty_request,
-						chunks: self.next_chunk_idx,
-						rm: crypto::shared::generate_random_base64_values(32),
-						upload_key: Cow::Borrowed(&upload_key),
-					},
-				)
-				.await
-			})
-		};
+		let future: BoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>> =
+			if self.written == 0 {
+				Box::pin(async move {
+					api::v3::upload::empty::post(client.client(), &empty_request).await
+				})
+			} else {
+				let upload_key = self.upload_key.clone();
+				Box::pin(async move {
+					api::v3::upload::done::post(
+						client.client(),
+						&api::v3::upload::done::Request {
+							empty_request,
+							chunks: self.next_chunk_idx,
+							rm: Cow::Borrowed(&crypto::shared::generate_random_base64_values(32)),
+							upload_key: Cow::Borrowed(&upload_key),
+						},
+					)
+					.await
+				})
+			};
 
 		let remote_file_info = match Arc::try_unwrap(self.remote_file_info) {
 			Ok(lock) => lock.into_inner().unwrap_or_default(),
@@ -711,10 +707,7 @@ impl<'a> FileWriterUploadingState<'a> {
 
 struct FileWriterCompletingState<'a> {
 	file: Arc<File>,
-	future: futures::future::BoxFuture<
-		'a,
-		Result<filen_types::api::v3::upload::empty::Response, ResponseError>,
-	>,
+	future: BoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
 	hash: Sha512Hash,
 	remote_file_info: RemoteFileInfo,
 	client: &'a Client,
@@ -981,27 +974,27 @@ impl AsyncWrite for FileWriter<'_> {
 
 impl Client {
 	pub async fn trash_file(&self, file: &RemoteFile) -> Result<(), Error> {
-		Ok(api::v3::file::trash::post(
+		api::v3::file::trash::post(
 			self.client(),
 			&api::v3::file::trash::Request { uuid: file.uuid() },
 		)
-		.await?)
+		.await
 	}
 
 	pub async fn restore_file(&self, file: &RemoteFile) -> Result<(), Error> {
-		Ok(api::v3::file::restore::post(
+		api::v3::file::restore::post(
 			self.client(),
 			&api::v3::file::restore::Request { uuid: file.uuid() },
 		)
-		.await?)
+		.await
 	}
 
 	pub async fn delete_file_permanently(&self, file: RemoteFile) -> Result<(), Error> {
-		Ok(api::v3::file::delete::permanent::post(
+		api::v3::file::delete::permanent::post(
 			self.client(),
 			&api::v3::file::delete::permanent::Request { uuid: file.uuid() },
 		)
-		.await?)
+		.await
 	}
 
 	pub async fn move_file(
@@ -1030,11 +1023,13 @@ impl Client {
 			self.client(),
 			&api::v3::file::metadata::Request {
 				uuid: file.uuid(),
-				name: self.crypter().encrypt_meta(&new_meta.name)?,
-				name_hashed: self.hash_name(&new_meta.name),
-				metadata: self
-					.crypter()
-					.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+				name: Cow::Borrowed(&self.crypter().encrypt_meta(&new_meta.name)?),
+				name_hashed: Cow::Borrowed(&self.hash_name(&new_meta.name)),
+				metadata: Cow::Borrowed(
+					&self
+						.crypter()
+						.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+				),
 			},
 		)
 		.await?;
@@ -1064,7 +1059,7 @@ impl Client {
 		name: impl AsRef<str>,
 		parent: &impl HasContents,
 	) -> Result<Option<Uuid>, Error> {
-		Ok(api::v3::file::exists::post(
+		api::v3::file::exists::post(
 			self.client(),
 			&api::v3::file::exists::Request {
 				name_hashed: self.hash_name(name.as_ref()),
@@ -1072,7 +1067,7 @@ impl Client {
 			},
 		)
 		.await
-		.map(|r| r.0)?)
+		.map(|r| r.0)
 	}
 
 	pub fn get_file_reader<'a>(&'a self, file: &'a RemoteFile) -> impl AsyncRead + 'a {

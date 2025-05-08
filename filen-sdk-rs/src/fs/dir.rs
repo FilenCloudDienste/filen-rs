@@ -265,8 +265,8 @@ impl Client {
 			&api::v3::dir::create::Request {
 				uuid: dir.uuid(),
 				parent: dir.parent(),
-				name_hashed: self.hash_name(dir.name()),
-				meta: dir.get_encrypted_meta(self.crypter())?,
+				name_hashed: Cow::Borrowed(&self.hash_name(dir.name())),
+				meta: Cow::Borrowed(&dir.get_encrypted_meta(self.crypter())?),
 			},
 		)
 		.await?;
@@ -283,7 +283,7 @@ impl Client {
 		Directory::from_encrypted(
 			uuid,
 			response.parent,
-			response.color,
+			response.color.map(|s| s.into_owned()),
 			response.favorited,
 			&response.metadata,
 			self.crypter(),
@@ -295,15 +295,15 @@ impl Client {
 		parent: &impl HasContents,
 		name: impl AsRef<str>,
 	) -> Result<Option<uuid::Uuid>, Error> {
-		Ok(api::v3::dir::exists::post(
+		api::v3::dir::exists::post(
 			self.client(),
 			&api::v3::dir::exists::Request {
 				parent: parent.uuid(),
-				name_hashed: self.hash_name(name.as_ref()),
+				name_hashed: Cow::Borrowed(&self.hash_name(name.as_ref())),
 			},
 		)
 		.await
-		.map(|r| r.0)?)
+		.map(|r| r.0)
 	}
 
 	pub async fn list_dir(
@@ -323,7 +323,7 @@ impl Client {
 				Directory::from_encrypted(
 					d.uuid,
 					d.parent,
-					d.color,
+					d.color.map(|s| s.into_owned()),
 					d.favorited,
 					&d.meta,
 					self.crypter(),
@@ -375,7 +375,7 @@ impl Client {
 						None => return None,
 						Some(parent) => parent,
 					},
-					response_dir.color,
+					response_dir.color.map(|s| s.into_owned()),
 					response_dir.favorited,
 					&response_dir.meta,
 					self.crypter(),
@@ -387,10 +387,14 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
+				let decrypted_size = self.crypter().decrypt_meta(&f.size)?;
+				let decrypted_size = decrypted_size
+					.parse::<u64>()
+					.map_err(|_| Error::Custom("Failed to parse decrypted size".to_string()))?;
 				RemoteFile::from_encrypted(
 					f.uuid,
 					f.parent,
-					f.size,
+					decrypted_size,
 					f.chunks,
 					f.region,
 					f.bucket,
@@ -421,10 +425,12 @@ impl Client {
 			self.client(),
 			&api::v3::dir::metadata::Request {
 				uuid: dir.uuid(),
-				name_hashed: self.hash_name(&new_meta.name),
-				metadata: self
-					.crypter()
-					.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+				name_hashed: Cow::Borrowed(&self.hash_name(&new_meta.name)),
+				metadata: Cow::Borrowed(
+					&self
+						.crypter()
+						.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+				),
 			},
 		)
 		.await?;
@@ -507,7 +513,7 @@ impl Client {
 		dir: &impl HasContents,
 		trash: bool,
 	) -> Result<api::v3::dir::size::Response, Error> {
-		Ok(api::v3::dir::size::post(
+		api::v3::dir::size::post(
 			self.client(),
 			&api::v3::dir::size::Request {
 				uuid: dir.uuid(),
@@ -516,6 +522,6 @@ impl Client {
 				trash,
 			},
 		)
-		.await?)
+		.await
 	}
 }

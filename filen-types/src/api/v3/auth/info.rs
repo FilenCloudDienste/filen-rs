@@ -1,22 +1,20 @@
-use reqwest::Body;
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthVersion;
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct Request<'a> {
-	pub email: &'a str,
-}
+pub const ENDPOINT: &str = "v3/auth/info";
 
-impl From<Request<'_>> for Body {
-	fn from(val: Request) -> Self {
-		serde_json::to_string(&val).unwrap().into()
-	}
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Request<'a> {
+	pub email: Cow<'a, str>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Response {
+pub struct Response<'a> {
 	pub auth_version: AuthVersion,
-	pub salt: String, // this is not base64 or hex encoded, so probably bad practice, we should take a look at this
+	pub salt: Cow<'a, str>, // this is not base64 or hex encoded, so probably bad practice, we should take a look at this
 }
