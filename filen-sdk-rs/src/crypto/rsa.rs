@@ -70,3 +70,14 @@ pub fn encrypt_with_public_key(
 
 	Ok(RSAEncryptedString(BASE64_STANDARD.encode(encrypted_data)))
 }
+
+pub fn decrypt_with_private_key(
+	private_key: &RsaPrivateKey,
+	data: &RSAEncryptedString,
+) -> Result<Vec<u8>, ConversionError> {
+	let encrypted_data = BASE64_STANDARD.decode(&data.0)?;
+	let decrypted_data =
+		private_key.decrypt(Oaep::new_with_mgf_hash::<Sha256, Sha1>(), &encrypted_data)?;
+
+	Ok(decrypted_data)
+}

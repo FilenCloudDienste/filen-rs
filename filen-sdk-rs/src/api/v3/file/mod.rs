@@ -1,5 +1,6 @@
 pub(crate) mod delete;
 pub(crate) mod exists;
+pub(crate) mod link;
 pub(crate) mod metadata;
 pub(crate) mod r#move;
 pub(crate) mod restore;

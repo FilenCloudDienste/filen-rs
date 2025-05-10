@@ -4,10 +4,7 @@ use std::{
 	collections::{HashSet, VecDeque},
 };
 
-use filen_types::api::v3::search::{
-	add::{SearchAddItem, SearchAddItemType},
-	find::SearchFindItem,
-};
+use filen_types::api::v3::search::{add::SearchAddItem, find::SearchFindItem};
 
 use crate::{
 	api,
@@ -15,9 +12,9 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::Error,
 	fs::{
-		HasUUID, NonRootFSObject, NonRootObject,
+		HasName, HasType, HasUUID, NonRootFSObject,
 		dir::{Directory, DirectoryMeta},
-		file::RemoteFile,
+		file::{RemoteFile, meta::FileMeta},
 	},
 };
 
@@ -105,32 +102,27 @@ pub fn split_name(input: &str, min_len: usize, max_len: usize) -> SplitName {
 }
 
 impl Client {
-	pub fn generate_search_items_for_item<'a>(
-		&self,
-		item: impl Into<NonRootFSObject<'a>>,
-	) -> Vec<SearchAddItem> {
-		let item = item.into();
-		let item_type = match item {
-			NonRootFSObject::File(_) => SearchAddItemType::File,
-			NonRootFSObject::Dir(_) => SearchAddItemType::Directory,
-		};
-
-		let uuid = item.uuid();
-
+	pub fn generate_search_items_for_item<I>(&self, item: &I) -> Vec<SearchAddItem>
+	where
+		I: HasName + HasUUID + HasType,
+	{
 		split_name(item.name(), 2, 16)
 			.iter()
 			.map(move |s| SearchAddItem {
 				hash: self.hmac_key.hash(s.as_bytes()),
-				uuid,
-				r#type: item_type,
+				uuid: item.uuid(),
+				r#type: item.object_type().into(),
 			})
 			.collect()
 	}
 
-	pub async fn update_search_hashes_for_item<'a>(
+	pub async fn update_search_hashes_for_item<I>(
 		&self,
-		item: impl Into<NonRootFSObject<'a>>,
-	) -> Result<api::v3::search::add::Response, Error> {
+		item: &I,
+	) -> Result<api::v3::search::add::Response, Error>
+	where
+		I: HasName + HasUUID + HasType,
+	{
 		let items = self.generate_search_items_for_item(item);
 		api::v3::search::add::post(self.client(), &api::v3::search::add::Request { items }).await
 	}
@@ -163,20 +155,22 @@ impl Client {
 						)?)),
 						found_dir.metadata_path,
 					),
-					SearchFindItem::File(found_file) => (
-						NonRootFSObject::File(Cow::Owned(RemoteFile::from_encrypted(
-							found_file.uuid,
-							found_file.parent,
-							found_file.size,
-							found_file.chunks,
-							found_file.region,
-							found_file.bucket,
-							found_file.favorited,
-							&found_file.metadata,
-							self.crypter(),
-						)?)),
-						found_file.metadata_path,
-					),
+					SearchFindItem::File(found_file) => {
+						let meta = FileMeta::from_encrypted(&found_file.metadata, self.crypter())?;
+						(
+							NonRootFSObject::File(Cow::Owned(RemoteFile::from_meta(
+								found_file.uuid,
+								found_file.parent,
+								found_file.size,
+								found_file.chunks,
+								found_file.region,
+								found_file.bucket,
+								found_file.favorited,
+								meta,
+							))),
+							found_file.metadata_path,
+						)
+					}
 				};
 
 				let mut path = metadata_path

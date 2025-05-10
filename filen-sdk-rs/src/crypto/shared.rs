@@ -6,10 +6,10 @@ use super::error::ConversionError;
 pub trait MetaCrypter {
 	fn encrypt_meta_into(
 		&self,
-		meta: &str,
+		meta: impl AsRef<str>,
 		out: &mut EncryptedString,
 	) -> Result<(), ConversionError>;
-	fn encrypt_meta(&self, meta: &str) -> Result<EncryptedString, ConversionError> {
+	fn encrypt_meta(&self, meta: impl AsRef<str>) -> Result<EncryptedString, ConversionError> {
 		let mut out = EncryptedString(String::new());
 		self.encrypt_meta_into(meta, &mut out)?;
 		Ok(out)

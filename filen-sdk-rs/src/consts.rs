@@ -57,3 +57,5 @@ pub const DEFAULT_MAX_UPLOAD_THREADS_PER_FILE: usize = 8;
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1MiB
 pub const CHUNK_SIZE_U64: u64 = CHUNK_SIZE as u64;
 pub const FILE_CHUNK_SIZE_EXTRA: usize = 28; // auth tag (16) + nonce (12)
+
+pub const MAX_SMALL_PARALLEL_REQUESTS: usize = 64;

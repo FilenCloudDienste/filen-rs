@@ -33,4 +33,6 @@ pub enum ConversionError {
 	InvalidKeyPair,
 	#[error("Serde json Error: `{0}`")]
 	SerdeJsonError(#[from] serde_json::Error),
+	#[error("RSA Error: `{0}`")]
+	RSAError(#[from] rsa::errors::Error),
 }

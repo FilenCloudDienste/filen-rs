@@ -1,5 +1,6 @@
 pub mod delete;
 pub mod exists;
+pub mod link;
 pub mod metadata;
 pub mod r#move;
 pub mod restore;

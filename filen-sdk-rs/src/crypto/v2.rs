@@ -64,18 +64,19 @@ impl FromStr for MasterKey {
 	}
 }
 
-impl From<MasterKey> for String {
-	fn from(val: MasterKey) -> Self {
-		val.key
+impl AsRef<str> for MasterKey {
+	fn as_ref(&self) -> &str {
+		&self.key
 	}
 }
 
 impl MetaCrypter for MasterKey {
 	fn encrypt_meta_into(
 		&self,
-		meta: &str,
+		meta: impl AsRef<str>,
 		out: &mut EncryptedString,
 	) -> Result<(), ConversionError> {
+		let meta = meta.as_ref();
 		let nonce = generate_bad_nonce();
 		let out = &mut out.0;
 		out.clear();
@@ -132,6 +133,13 @@ impl MetaCrypter for MasterKey {
 	}
 }
 
+impl CreateRandom for MasterKey {
+	fn seeded_generate(_rng: rand::prelude::ThreadRng) -> Self {
+		Self::from_str(&super::shared::generate_random_base64_values(32))
+			.expect("Failed to generate Master Key key")
+	}
+}
+
 #[derive(Debug, Clone)]
 pub struct MasterKeys(pub Vec<MasterKey>);
 
@@ -156,7 +164,7 @@ impl MasterKeys {
 impl MetaCrypter for MasterKeys {
 	fn encrypt_meta_into(
 		&self,
-		meta: &str,
+		meta: impl AsRef<str>,
 		out: &mut EncryptedString,
 	) -> Result<(), ConversionError> {
 		self.0[0].encrypt_meta_into(meta, out)
@@ -240,12 +248,28 @@ impl CreateRandom for FileKey {
 	}
 }
 
+pub(crate) fn hash_to_buffer(name: &[u8]) -> [u8; 20] {
+	let mut outer_hasher = sha1::Sha1::new();
+	let mut inner_hasher = sha2::Sha512::new();
+	inner_hasher.update(name);
+	let mut hashed_name = [0u8; 128];
+	// SAFETY: The length of hashed_named must be 2x the length of a Sha512 hash, which is 128 bytes
+	faster_hex::hex_encode(inner_hasher.finalize().as_slice(), &mut hashed_name).unwrap();
+	outer_hasher.update(hashed_name);
+	outer_hasher.finalize().into()
+}
+
+pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], ConversionError> {
+	let mut derived_data = [0u8; 64];
+	pbkdf2::<Hmac<Sha512>>(password, salt, 200_000, &mut derived_data)?;
+	Ok(derived_data)
+}
+
 pub fn derive_password_and_mk(
 	password: impl AsRef<[u8]>,
 	salt: impl AsRef<[u8]>,
 ) -> Result<(MasterKey, DerivedPassword), ConversionError> {
-	let mut derived_data = [0u8; 64];
-	pbkdf2::<Hmac<Sha512>>(password.as_ref(), salt.as_ref(), 200_000, &mut derived_data)?;
+	let derived_data = derive_password(password.as_ref(), salt.as_ref())?;
 	let derived_str = faster_hex::hex_string(&derived_data);
 	let (master_key_str, derived_password_str) = derived_str.split_at(64);
 

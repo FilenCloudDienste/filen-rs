@@ -1,0 +1,255 @@
+use std::borrow::Cow;
+
+use chrono::{DateTime, SubsecRound, Utc};
+use filen_types::{crypto::EncryptedString, fs::ObjectType};
+use traits::{HasDirInfo, HasDirMeta, SetDirMeta};
+use uuid::Uuid;
+
+use crate::crypto::shared::MetaCrypter;
+
+use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
+
+pub mod client_impl;
+pub mod enums;
+pub mod meta;
+pub mod traits;
+
+pub use enums::*;
+pub use meta::DirectoryMeta;
+pub use traits::HasContents;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootDirectory {
+	uuid: Uuid,
+}
+
+impl RootDirectory {
+	pub(crate) fn new(uuid: Uuid) -> Self {
+		Self { uuid }
+	}
+}
+
+impl HasUUID for RootDirectory {
+	fn uuid(&self) -> uuid::Uuid {
+		self.uuid
+	}
+}
+impl HasContents for RootDirectory {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RootDirectoryWithMeta {
+	uuid: Uuid,
+	name: String,
+
+	color: Option<String>,
+	created: Option<DateTime<Utc>>,
+}
+
+impl RootDirectoryWithMeta {
+	pub fn from_meta(uuid: Uuid, color: Option<String>, meta: DirectoryMeta<'_>) -> Self {
+		Self {
+			uuid,
+			name: meta.name.into_owned(),
+			color,
+			created: meta.created,
+		}
+	}
+}
+
+impl HasUUID for RootDirectoryWithMeta {
+	fn uuid(&self) -> uuid::Uuid {
+		self.uuid
+	}
+}
+impl HasContents for RootDirectoryWithMeta {}
+
+impl HasType for RootDirectoryWithMeta {
+	fn object_type(&self) -> ObjectType {
+		ObjectType::Dir
+	}
+}
+
+impl HasName for RootDirectoryWithMeta {
+	fn name(&self) -> &str {
+		&self.name
+	}
+}
+
+impl HasDirMeta for RootDirectoryWithMeta {
+	fn borrow_meta(&self) -> DirectoryMeta<'_> {
+		DirectoryMeta {
+			name: Cow::Borrowed(&self.name),
+			created: self.created,
+		}
+	}
+
+	fn get_meta(&self) -> DirectoryMeta<'static> {
+		DirectoryMeta {
+			name: Cow::Owned(self.name.clone()),
+			created: self.created,
+		}
+	}
+}
+
+impl SetDirMeta for RootDirectoryWithMeta {
+	fn set_meta(&mut self, meta: DirectoryMeta<'_>) {
+		self.name = meta.name.into_owned();
+		self.created = meta.created;
+	}
+}
+
+impl HasMeta for RootDirectoryWithMeta {
+	fn get_meta_string(&self) -> String {
+		serde_json::to_string(&self.borrow_meta()).unwrap()
+	}
+}
+
+impl HasDirInfo for RootDirectoryWithMeta {
+	fn created(&self) -> Option<DateTime<Utc>> {
+		self.created
+	}
+}
+
+impl HasRemoteInfo for RootDirectoryWithMeta {
+	fn favorited(&self) -> bool {
+		false
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Directory {
+	uuid: Uuid,
+	name: String,
+	parent: Uuid,
+
+	color: Option<String>, // todo use Color struct
+	created: Option<DateTime<Utc>>,
+	favorited: bool,
+}
+
+impl Directory {
+	pub fn from_encrypted(
+		uuid: Uuid,
+		parent: Uuid,
+		color: Option<String>,
+		favorited: bool,
+		meta: &EncryptedString,
+		decrypter: &impl MetaCrypter,
+	) -> Result<Self, crate::error::Error> {
+		let meta = DirectoryMeta::from_encrypted(meta, decrypter)?;
+		Ok(Self {
+			name: meta.name.into_owned(),
+			uuid,
+			parent,
+			color,
+			created: meta.created,
+			favorited,
+		})
+	}
+
+	pub fn from_meta(
+		uuid: Uuid,
+		parent: Uuid,
+		color: Option<String>,
+		favorited: bool,
+		meta: DirectoryMeta<'_>,
+	) -> Self {
+		Self {
+			name: meta.name.into_owned(),
+			uuid,
+			parent,
+			color,
+			created: meta.created,
+			favorited,
+		}
+	}
+
+	pub fn new(name: String, parent: Uuid, created: DateTime<Utc>) -> Self {
+		Self {
+			uuid: Uuid::new_v4(),
+			name,
+			parent,
+			color: None,
+			created: Some(created.round_subsecs(3)),
+			favorited: false,
+		}
+	}
+
+	pub(crate) fn set_uuid(&mut self, uuid: Uuid) {
+		self.uuid = uuid;
+	}
+
+	pub(crate) fn set_parent(&mut self, parent: Uuid) {
+		self.parent = parent;
+	}
+
+	pub fn created(&self) -> Option<DateTime<Utc>> {
+		self.created
+	}
+}
+
+impl HasUUID for Directory {
+	fn uuid(&self) -> uuid::Uuid {
+		self.uuid
+	}
+}
+impl HasContents for Directory {}
+
+impl HasType for Directory {
+	fn object_type(&self) -> ObjectType {
+		ObjectType::Dir
+	}
+}
+
+impl HasName for Directory {
+	fn name(&self) -> &str {
+		&self.name
+	}
+}
+
+impl HasDirMeta for Directory {
+	fn borrow_meta(&self) -> DirectoryMeta<'_> {
+		DirectoryMeta {
+			name: Cow::Borrowed(&self.name),
+			created: self.created,
+		}
+	}
+
+	fn get_meta(&self) -> DirectoryMeta<'static> {
+		DirectoryMeta {
+			name: Cow::Owned(self.name.clone()),
+			created: self.created,
+		}
+	}
+}
+
+impl SetDirMeta for Directory {
+	fn set_meta(&mut self, meta: DirectoryMeta<'_>) {
+		self.name = meta.name.into_owned();
+		self.created = meta.created;
+	}
+}
+
+impl HasMeta for Directory {
+	fn get_meta_string(&self) -> String {
+		serde_json::to_string(&self.borrow_meta()).unwrap()
+	}
+}
+
+impl HasParent for Directory {
+	fn parent(&self) -> Uuid {
+		self.parent
+	}
+}
+
+impl HasDirInfo for Directory {
+	fn created(&self) -> Option<DateTime<Utc>> {
+		self.created
+	}
+}
+
+impl HasRemoteInfo for Directory {
+	fn favorited(&self) -> bool {
+		self.favorited
+	}
+}

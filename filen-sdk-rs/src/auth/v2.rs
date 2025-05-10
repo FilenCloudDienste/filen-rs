@@ -1,38 +1,44 @@
 use std::borrow::Cow;
 
-use filen_types::crypto::rsa::{EncodedPublicKey, EncryptedPrivateKey};
+use filen_types::crypto::{
+	EncryptedString,
+	rsa::{EncodedPublicKey, EncryptedPrivateKey},
+};
 
 use crate::{
 	api,
 	crypto::{
 		self,
+		error::ConversionError,
 		shared::{CreateRandom, MetaCrypter},
+		v2::{MasterKeys, hash_to_buffer},
 	},
 	error::Error,
 };
-use sha1::Digest;
 
 use super::http::UnauthClient;
 
+pub(crate) use crate::crypto::v2::MasterKey as MetaKey;
+
 #[derive(Clone)]
 pub(crate) struct AuthInfo {
-	master_keys: crate::crypto::v2::MasterKeys,
+	master_keys: MasterKeys,
 }
 
 impl MetaCrypter for AuthInfo {
 	fn encrypt_meta_into(
 		&self,
-		meta: &str,
-		out: &mut filen_types::crypto::EncryptedString,
-	) -> Result<(), crypto::error::ConversionError> {
+		meta: impl AsRef<str>,
+		out: &mut EncryptedString,
+	) -> Result<(), ConversionError> {
 		self.master_keys.encrypt_meta_into(meta, out)
 	}
 
 	fn decrypt_meta_into(
 		&self,
-		meta: &filen_types::crypto::EncryptedString,
+		meta: &EncryptedString,
 		out: &mut String,
-	) -> Result<(), crypto::error::ConversionError> {
+	) -> Result<(), ConversionError> {
 		self.master_keys.decrypt_meta_into(meta, out)
 	}
 }
@@ -81,15 +87,8 @@ pub(super) async fn login(
 	))
 }
 
-pub(super) fn hash_name(name: impl AsRef<[u8]>) -> String {
-	let mut outer_hasher = sha1::Sha1::new();
-	let mut inner_hasher = sha2::Sha512::new();
-	inner_hasher.update(name.as_ref());
-	let mut hashed_name = [0u8; 128];
-	// SAFETY: The length of hashed_named must be 2x the length of a Sha512 hash, which is 128 bytes
-	faster_hex::hex_encode(inner_hasher.finalize().as_slice(), &mut hashed_name).unwrap();
-	outer_hasher.update(hashed_name);
-	faster_hex::hex_string(outer_hasher.finalize().as_slice())
+pub(crate) fn hash_name(name: impl AsRef<[u8]>) -> String {
+	faster_hex::hex_string(&hash_to_buffer(name.as_ref()))
 }
 
 pub(super) fn generate_file_key() -> crypto::v2::FileKey {

@@ -7,6 +7,7 @@ use tokio::sync::OnceCell;
 
 pub struct Resources {
 	client: OnceCell<Client>,
+	account_prefix: &'static str,
 }
 
 pub struct TestResources {
@@ -40,11 +41,15 @@ impl Resources {
 			.get_or_init(|| async {
 				dotenv::dotenv().ok();
 				Client::login(
-					env::var("TEST_EMAIL").unwrap(),
-					&env::var("TEST_PASSWORD").unwrap(),
-					&env::var("TEST_2FA_CODE").unwrap_or("XXXXXX".to_string()),
+					env::var(format!("{}_EMAIL", self.account_prefix)).unwrap(),
+					&env::var(format!("{}_PASSWORD", self.account_prefix)).unwrap(),
+					&env::var(format!("{}_2FA_CODE", self.account_prefix))
+						.unwrap_or("XXXXXX".to_string()),
 				)
 				.await
+				.inspect_err(|_| {
+					println!("Failed to login: {}", self.account_prefix);
+				})
 				.unwrap()
 			})
 			.await
@@ -66,4 +71,10 @@ impl Resources {
 
 pub static RESOURCES: Resources = Resources {
 	client: OnceCell::const_new(),
+	account_prefix: "TEST",
+};
+
+pub static SHARE_RESOURCES: Resources = Resources {
+	client: OnceCell::const_new(),
+	account_prefix: "TEST_SHARE",
 };

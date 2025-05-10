@@ -1,10 +1,14 @@
 use std::{borrow::Cow, str::FromStr};
 
-use filen_types::crypto::rsa::{EncodedPublicKey, EncryptedPrivateKey};
+use filen_types::crypto::{
+	EncryptedString,
+	rsa::{EncodedPublicKey, EncryptedPrivateKey},
+};
 
 use crate::{
 	api,
 	crypto::{
+		error::ConversionError,
 		rsa::HMACKey,
 		shared::{CreateRandom, MetaCrypter},
 		v3::EncryptionKey,
@@ -13,26 +17,26 @@ use crate::{
 };
 
 use super::http::UnauthClient;
-
+pub(crate) use crate::crypto::v3::EncryptionKey as MetaKey;
 #[derive(Clone)]
 pub(crate) struct AuthInfo {
-	dek: crate::crypto::v3::EncryptionKey,
+	dek: MetaKey,
 }
 
 impl MetaCrypter for AuthInfo {
 	fn encrypt_meta_into(
 		&self,
-		meta: &str,
-		out: &mut filen_types::crypto::EncryptedString,
-	) -> Result<(), crate::crypto::error::ConversionError> {
+		meta: impl AsRef<str>,
+		out: &mut EncryptedString,
+	) -> Result<(), ConversionError> {
 		self.dek.encrypt_meta_into(meta, out)
 	}
 
 	fn decrypt_meta_into(
 		&self,
-		meta: &filen_types::crypto::EncryptedString,
+		meta: &EncryptedString,
 		out: &mut String,
-	) -> Result<(), crate::crypto::error::ConversionError> {
+	) -> Result<(), ConversionError> {
 		self.dek.decrypt_meta_into(meta, out)
 	}
 }

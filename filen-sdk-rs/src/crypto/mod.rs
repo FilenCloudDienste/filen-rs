@@ -1,3 +1,4 @@
+pub mod connect;
 pub mod error;
 pub mod file;
 pub mod rsa;

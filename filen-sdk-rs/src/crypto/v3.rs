@@ -21,7 +21,7 @@ const NONCE_SIZE: usize = 12;
 type TagSize = U16;
 const TAG_SIZE: usize = 16;
 
-const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4, Some(64)) {
+pub const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4, Some(64)) {
 	Ok(params) => params,
 	Err(_) => panic!("Failed to create Argon2 params"),
 };
@@ -99,9 +99,10 @@ impl Eq for EncryptionKey {}
 impl MetaCrypter for EncryptionKey {
 	fn encrypt_meta_into(
 		&self,
-		meta: &str,
+		meta: impl AsRef<str>,
 		out: &mut EncryptedString,
 	) -> Result<(), ConversionError> {
+		let meta = meta.as_ref();
 		let nonce: [u8; NONCE_SIZE] = rand::random();
 		let nonce = Nonce::from_slice(&nonce);
 		let out = &mut out.0;
@@ -203,6 +204,17 @@ impl CreateRandom for EncryptionKey {
 	}
 }
 
+pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], ConversionError> {
+	let argon2 = argon2::Argon2::new(
+		argon2::Algorithm::Argon2id,
+		argon2::Version::V0x13,
+		ARGON2_PARAMS,
+	);
+	let mut derived_data = [0u8; 64];
+	argon2.hash_password_into(password, salt, &mut derived_data)?;
+	Ok(derived_data)
+}
+
 pub fn derive_password_and_kek(
 	pwd: impl AsRef<[u8]>,
 	salt: impl AsRef<[u8]>,
@@ -210,14 +222,7 @@ pub fn derive_password_and_kek(
 	let mut decoded_salt = [0u8; 256];
 	faster_hex::hex_decode(salt.as_ref(), &mut decoded_salt)?;
 
-	let argon2 = argon2::Argon2::new(
-		argon2::Algorithm::Argon2id,
-		argon2::Version::V0x13,
-		ARGON2_PARAMS,
-	);
-
-	let mut derived_data = [0u8; 64];
-	argon2.hash_password_into(pwd.as_ref(), &decoded_salt, &mut derived_data)?;
+	let derived_data = derive_password(pwd.as_ref(), &decoded_salt)?;
 	let derived_str = faster_hex::hex_string(&derived_data);
 
 	let kek = EncryptionKey::from_str(&derived_str[0..64])?;

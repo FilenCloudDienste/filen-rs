@@ -1,14 +1,11 @@
 use futures::StreamExt;
 
 use crate::{
-	auth::http::AuthorizedClient,
-	consts::random_egest_url,
-	error::Error,
-	fs::{HasUUID, file::RemoteFile},
+	auth::http::AuthorizedClient, consts::random_egest_url, error::Error, fs::file::traits::File,
 };
 pub(crate) async fn download_file_chunk(
 	client: impl AuthorizedClient,
-	file: &RemoteFile,
+	file: &dyn File,
 	chunk_idx: u64,
 	out_chunk: &mut Vec<u8>,
 ) -> Result<(), Error> {

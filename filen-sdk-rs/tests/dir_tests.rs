@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	crypto::shared::generate_random_base64_values,
-	fs::{FSObjectType, HasUUID, NonRootFSObject},
+	fs::{FSObject, HasName, HasUUID, NonRootFSObject, dir::traits::HasDirMeta},
 };
 
 mod test_utils;
@@ -41,7 +41,7 @@ async fn find_at_path() {
 			.find_item_at_path(format!("{}/a/b/c", test_dir.name()))
 			.await
 			.unwrap(),
-		Some(FSObjectType::Dir(std::borrow::Cow::Borrowed(&dir_c)))
+		Some(FSObject::Dir(std::borrow::Cow::Borrowed(&dir_c)))
 	);
 
 	assert_eq!(
@@ -62,7 +62,7 @@ async fn find_or_create() {
 	let nested_dir = client.find_or_create_dir(&path).await.unwrap();
 
 	assert_eq!(
-		Some(Into::<FSObjectType<'_>>::into(nested_dir)),
+		Some(Into::<FSObject<'_>>::into(nested_dir)),
 		client.find_item_at_path(&path).await.unwrap()
 	);
 }
@@ -210,7 +210,7 @@ async fn dir_update_meta() {
 			.find_item_at_path(format!("{}/{}", test_dir.name(), dir_name))
 			.await
 			.unwrap(),
-		Some(FSObjectType::Dir(Cow::Borrowed(&dir)))
+		Some(FSObject::Dir(Cow::Borrowed(&dir)))
 	);
 
 	let mut meta = dir.get_meta();
@@ -224,7 +224,7 @@ async fn dir_update_meta() {
 			.find_item_at_path(format!("{}/{}", test_dir.name(), dir.name()))
 			.await
 			.unwrap(),
-		Some(FSObjectType::Dir(Cow::Borrowed(&dir)))
+		Some(FSObject::Dir(Cow::Borrowed(&dir)))
 	);
 
 	let mut meta = dir.get_meta();

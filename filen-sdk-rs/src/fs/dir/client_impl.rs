@@ -1,256 +1,21 @@
 use std::borrow::Cow;
 
-use chrono::{DateTime, SubsecRound, Utc};
-use filen_types::crypto::EncryptedString;
-use serde::{Deserialize, Serialize};
+use futures::TryFutureExt;
 use uuid::Uuid;
 
-use crate::{api, auth::Client, crypto::shared::MetaCrypter, error::Error};
+use crate::{
+	api,
+	auth::Client,
+	crypto::shared::MetaCrypter,
+	error::Error,
+	fs::{
+		HasMetaExt, HasName, HasParent, HasUUID,
+		enums::FSObject,
+		file::{RemoteFile, meta::FileMeta},
+	},
+};
 
-use super::{FSObjectType, HasContents, HasUUID, NonRootObject, file::RemoteFile};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RootDirectory {
-	uuid: Uuid,
-}
-
-impl RootDirectory {
-	pub(crate) fn new(uuid: Uuid) -> Self {
-		Self { uuid }
-	}
-}
-
-impl HasUUID for RootDirectory {
-	fn uuid(&self) -> uuid::Uuid {
-		self.uuid
-	}
-}
-impl HasContents for RootDirectory {}
-
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Directory {
-	uuid: Uuid,
-	name: String,
-	parent: Uuid,
-
-	color: Option<String>, // todo use Color struct
-	created: Option<DateTime<Utc>>,
-	favorited: bool,
-}
-
-impl Directory {
-	pub fn from_encrypted(
-		uuid: Uuid,
-		parent: Uuid,
-		color: Option<String>,
-		favorited: bool,
-		meta: &EncryptedString,
-		decrypter: &impl MetaCrypter,
-	) -> Result<Self, crate::error::Error> {
-		let meta = DirectoryMeta::from_encrypted(meta, decrypter)?;
-		Ok(Self {
-			name: meta.name.into_owned(),
-			uuid,
-			parent,
-			color,
-			created: meta.created,
-			favorited,
-		})
-	}
-
-	pub fn new(name: String, parent: Uuid, created: DateTime<Utc>) -> Self {
-		Self {
-			uuid: Uuid::new_v4(),
-			name,
-			parent,
-			color: None,
-			created: Some(created.round_subsecs(3)),
-			favorited: false,
-		}
-	}
-
-	pub fn name(&self) -> &str {
-		&self.name
-	}
-
-	pub(crate) fn set_uuid(&mut self, uuid: Uuid) {
-		self.uuid = uuid;
-	}
-
-	pub(crate) fn set_parent(&mut self, parent: Uuid) {
-		self.parent = parent;
-	}
-
-	pub fn created(&self) -> Option<DateTime<Utc>> {
-		self.created
-	}
-
-	pub fn borrow_meta(&self) -> DirectoryMeta<'_> {
-		DirectoryMeta {
-			name: Cow::Borrowed(&self.name),
-			created: self.created,
-		}
-	}
-
-	pub fn get_meta(&self) -> DirectoryMeta<'static> {
-		DirectoryMeta {
-			name: Cow::Owned(self.name.clone()),
-			created: self.created,
-		}
-	}
-
-	pub fn set_meta(&mut self, meta: DirectoryMeta<'_>) {
-		self.name = meta.name.into_owned();
-		self.created = meta.created;
-	}
-}
-
-impl HasUUID for Directory {
-	fn uuid(&self) -> uuid::Uuid {
-		self.uuid
-	}
-}
-impl HasContents for Directory {}
-
-impl NonRootObject for Directory {
-	fn name(&self) -> &str {
-		&self.name
-	}
-
-	fn get_meta_string(&self) -> String {
-		// SAFETY if this fails, I want it to panic
-		// as this is a logic error
-		serde_json::to_string(&DirectoryMeta {
-			name: Cow::Borrowed(&self.name),
-			created: self.created,
-		})
-		.unwrap()
-	}
-
-	fn parent(&self) -> uuid::Uuid {
-		self.parent
-	}
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DirectoryType<'a> {
-	Root(Cow<'a, RootDirectory>),
-	Dir(Cow<'a, Directory>),
-}
-
-impl HasUUID for DirectoryType<'_> {
-	fn uuid(&self) -> uuid::Uuid {
-		match self {
-			DirectoryType::Root(dir) => dir.uuid(),
-			DirectoryType::Dir(dir) => dir.uuid(),
-		}
-	}
-}
-impl HasContents for DirectoryType<'_> {}
-
-mod dir_meta_serde {
-	use chrono::{DateTime, Utc};
-	use serde::de::Visitor;
-
-	pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		struct OptionalDateTimeVisitor;
-		impl<'de> Visitor<'de> for OptionalDateTimeVisitor {
-			type Value = Option<DateTime<Utc>>;
-
-			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-				formatter.write_str("an optional timestamp in milliseconds")
-			}
-
-			fn visit_none<E>(self) -> Result<Self::Value, E>
-			where
-				E: serde::de::Error,
-			{
-				Ok(None)
-			}
-
-			fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-			where
-				D: serde::Deserializer<'de>,
-			{
-				deserializer.deserialize_i64(self)
-			}
-
-			fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-			where
-				E: serde::de::Error,
-			{
-				Ok(Some(
-					chrono::DateTime::<Utc>::from_timestamp_millis(v)
-						.ok_or_else(|| serde::de::Error::custom("Invalid timestamp"))?,
-				))
-			}
-
-			fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-			where
-				E: serde::de::Error,
-			{
-				self.visit_i64(v.try_into().map_err(|_| {
-					serde::de::Error::custom("Invalid timestamp: cannot convert u64 to i64")
-				})?)
-			}
-		}
-		deserializer.deserialize_option(OptionalDateTimeVisitor)
-	}
-
-	pub(super) fn serialize<S>(
-		value: &Option<DateTime<Utc>>,
-		serializer: S,
-	) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		match value {
-			Some(dt) => serializer.serialize_i64(dt.timestamp_millis()),
-			None => serializer.serialize_none(),
-		}
-	}
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DirectoryMeta<'a> {
-	name: Cow<'a, str>,
-	#[serde(with = "dir_meta_serde")]
-	#[serde(rename = "creation")]
-	#[serde(default)]
-	created: Option<DateTime<Utc>>,
-}
-
-impl DirectoryMeta<'static> {
-	pub fn from_encrypted(
-		encrypted: &EncryptedString,
-		decrypter: &impl MetaCrypter,
-	) -> Result<Self, crate::error::Error> {
-		let decrypted = decrypter.decrypt_meta(encrypted)?;
-		let meta = serde_json::from_str(&decrypted)?;
-		Ok(meta)
-	}
-}
-
-impl<'a> DirectoryMeta<'a> {
-	pub fn name(&self) -> &str {
-		&self.name
-	}
-
-	pub fn created(&self) -> Option<DateTime<Utc>> {
-		self.created
-	}
-
-	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) {
-		self.name = name.into();
-	}
-
-	pub fn set_created(&mut self, created: DateTime<Utc>) {
-		self.created = Some(created.round_subsecs(3));
-	}
-}
+use super::{Directory, DirectoryMeta, DirectoryType, HasContents, traits::SetDirMeta};
 
 impl Client {
 	pub async fn create_dir(
@@ -273,7 +38,11 @@ impl Client {
 		if dir.uuid() != response.uuid {
 			dir.set_uuid(response.uuid);
 		}
-		self.update_search_hashes_for_item(&dir).await?;
+		futures::try_join!(
+			self.update_search_hashes_for_item(&dir)
+				.map_err(Error::from),
+			self.update_item_with_maybe_connected_parent(&dir),
+		)?;
 		Ok(dir)
 	}
 
@@ -335,7 +104,8 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
-				RemoteFile::from_encrypted(
+				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter())?;
+				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,
 					f.size,
@@ -343,9 +113,8 @@ impl Client {
 					f.region,
 					f.bucket,
 					f.favorited,
-					&f.metadata,
-					self.crypter(),
-				)
+					meta,
+				))
 			})
 			.collect::<Result<Vec<_>, _>>()?;
 		Ok((dirs, files))
@@ -391,7 +160,8 @@ impl Client {
 				let decrypted_size = decrypted_size
 					.parse::<u64>()
 					.map_err(|_| Error::Custom("Failed to parse decrypted size".to_string()))?;
-				RemoteFile::from_encrypted(
+				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter())?;
+				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,
 					decrypted_size,
@@ -399,9 +169,8 @@ impl Client {
 					f.region,
 					f.bucket,
 					f.favorited,
-					&f.metadata,
-					self.crypter(),
-				)
+					meta,
+				))
 			})
 			.collect::<Result<Vec<_>, _>>()?;
 		Ok((dirs, files))
@@ -425,7 +194,7 @@ impl Client {
 			self.client(),
 			&api::v3::dir::metadata::Request {
 				uuid: dir.uuid(),
-				name_hashed: Cow::Borrowed(&self.hash_name(&new_meta.name)),
+				name_hashed: Cow::Borrowed(&self.hash_name(new_meta.name())),
 				metadata: Cow::Borrowed(
 					&self
 						.crypter()
@@ -443,13 +212,13 @@ impl Client {
 		&self,
 		dir: &impl HasContents,
 		name: impl AsRef<str>,
-	) -> Result<Option<FSObjectType<'static>>, Error> {
+	) -> Result<Option<FSObject<'static>>, Error> {
 		let (dirs, files) = self.list_dir(dir).await?;
 		if let Some(dir) = dirs.into_iter().find(|d| d.name() == name.as_ref()) {
-			return Ok(Some(FSObjectType::Dir(Cow::Owned(dir))));
+			return Ok(Some(FSObject::Dir(Cow::Owned(dir))));
 		}
 		if let Some(file) = files.into_iter().find(|f| f.name() == name.as_ref()) {
-			return Ok(Some(FSObjectType::File(Cow::Owned(file))));
+			return Ok(Some(FSObject::File(Cow::Owned(file))));
 		}
 		Ok(None)
 	}

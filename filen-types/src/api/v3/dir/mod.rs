@@ -2,6 +2,7 @@ pub mod content;
 pub mod create;
 pub mod download;
 pub mod exists;
+pub mod link;
 pub mod metadata;
 pub mod r#move;
 pub mod size;

@@ -5,7 +5,11 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_sdk_rs::{
 	auth::Client,
 	crypto::file::FileKey,
-	fs::{FSObjectType, HasContents, HasUUID, dir::Directory, file::FileBuilder},
+	fs::{
+		FSObject, HasUUID,
+		dir::{Directory, HasContents},
+		file::FileBuilder,
+	},
 };
 use filen_types::auth::FileEncryptionVersion;
 use futures::{AsyncReadExt, AsyncWriteExt};
@@ -96,7 +100,7 @@ async fn make_rs_compat_dir() {
 		.await
 		.unwrap();
 
-	if let Some(FSObjectType::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
+	if let Some(FSObject::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
 		client.trash_dir(&dir).await.unwrap();
 	}
 
@@ -149,7 +153,7 @@ async fn make_rs_compat_dir() {
 
 async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str) {
 	match client.find_item_in_dir(&compat_dir, "dir").await.unwrap() {
-		Some(FSObjectType::Dir(_)) => {}
+		Some(FSObject::Dir(_)) => {}
 		_ => panic!("dir not found in compat-go directory"),
 	}
 	match client
@@ -157,8 +161,8 @@ async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str
 		.await
 		.unwrap()
 	{
-		Some(FSObjectType::File(file)) => {
-			let mut reader = client.get_file_reader(&file);
+		Some(FSObject::File(file)) => {
+			let mut reader = client.get_file_reader(file.as_ref());
 			let mut buf = Vec::new();
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(buf.len(), 0, "empty.txt should be empty");
@@ -170,8 +174,8 @@ async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str
 		.await
 		.unwrap()
 	{
-		Some(FSObjectType::File(file)) => {
-			let mut reader = client.get_file_reader(&file);
+		Some(FSObject::File(file)) => {
+			let mut reader = client.get_file_reader(file.as_ref());
 			let mut buf = Vec::new();
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(
@@ -187,8 +191,8 @@ async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str
 		.await
 		.unwrap()
 	{
-		Some(FSObjectType::File(file)) => {
-			let mut reader = client.get_file_reader(&file);
+		Some(FSObject::File(file)) => {
+			let mut reader = client.get_file_reader(file.as_ref());
 			let mut buf = Vec::with_capacity(1024 * 1024 * 4 * 2);
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(
@@ -207,7 +211,7 @@ async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str
 		.await
 		.unwrap()
 	{
-		Some(FSObjectType::File(file)) => {
+		Some(FSObject::File(file)) => {
 			let compat_test_file = compat_test_file.uuid(file.uuid()).build();
 			assert_eq!(
 				*file.inner_file(),
@@ -215,7 +219,7 @@ async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str
 				"file inner_file mismatch"
 			);
 
-			let mut reader = client.get_file_reader(&file);
+			let mut reader = client.get_file_reader(file.as_ref());
 			let mut buf = Vec::with_capacity(test_str.len());
 			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(test_str.len(), buf.len(), "file size mismatch");
@@ -233,8 +237,8 @@ async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str
 		.await
 		.unwrap()
 	{
-		Some(FSObjectType::File(file)) => {
-			let mut reader = client.get_file_reader(&file);
+		Some(FSObject::File(file)) => {
+			let mut reader = client.get_file_reader(file.as_ref());
 			let mut buf = Vec::new();
 			reader.read_to_end(&mut buf).await.unwrap();
 			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
@@ -262,7 +266,7 @@ async fn check_go_compat_dir() {
 		.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-go").await.unwrap() {
-		Some(FSObjectType::Dir(dir)) => dir.into_owned(),
+		Some(FSObject::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
 	};
 
@@ -280,7 +284,7 @@ async fn check_ts_compat_dir() {
 		.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-ts").await.unwrap() {
-		Some(FSObjectType::Dir(dir)) => dir.into_owned(),
+		Some(FSObject::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
 	};
 
