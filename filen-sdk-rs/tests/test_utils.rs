@@ -1,7 +1,7 @@
 use std::env;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
-use filen_sdk_rs::{auth::Client, fs::dir::Directory};
+use filen_sdk_rs::{auth::Client, fs::dir::RemoteDirectory};
 
 use tokio::sync::OnceCell;
 
@@ -12,14 +12,14 @@ pub struct Resources {
 
 pub struct TestResources {
 	pub client: Client,
-	pub dir: Directory,
+	pub dir: RemoteDirectory,
 }
 
 impl Default for TestResources {
 	fn default() -> Self {
 		Self {
 			client: RESOURCES.client.get().unwrap().clone(),
-			dir: Directory::default(),
+			dir: RemoteDirectory::default(),
 		}
 	}
 }

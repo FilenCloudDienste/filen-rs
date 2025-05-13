@@ -117,7 +117,7 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Directory {
+pub struct RemoteDirectory {
 	uuid: Uuid,
 	name: String,
 	parent: Uuid,
@@ -127,7 +127,7 @@ pub struct Directory {
 	favorited: bool,
 }
 
-impl Directory {
+impl RemoteDirectory {
 	pub fn from_encrypted(
 		uuid: Uuid,
 		parent: Uuid,
@@ -188,26 +188,26 @@ impl Directory {
 	}
 }
 
-impl HasUUID for Directory {
+impl HasUUID for RemoteDirectory {
 	fn uuid(&self) -> uuid::Uuid {
 		self.uuid
 	}
 }
-impl HasContents for Directory {}
+impl HasContents for RemoteDirectory {}
 
-impl HasType for Directory {
+impl HasType for RemoteDirectory {
 	fn object_type(&self) -> ObjectType {
 		ObjectType::Dir
 	}
 }
 
-impl HasName for Directory {
+impl HasName for RemoteDirectory {
 	fn name(&self) -> &str {
 		&self.name
 	}
 }
 
-impl HasDirMeta for Directory {
+impl HasDirMeta for RemoteDirectory {
 	fn borrow_meta(&self) -> DirectoryMeta<'_> {
 		DirectoryMeta {
 			name: Cow::Borrowed(&self.name),
@@ -223,32 +223,32 @@ impl HasDirMeta for Directory {
 	}
 }
 
-impl SetDirMeta for Directory {
+impl SetDirMeta for RemoteDirectory {
 	fn set_meta(&mut self, meta: DirectoryMeta<'_>) {
 		self.name = meta.name.into_owned();
 		self.created = meta.created;
 	}
 }
 
-impl HasMeta for Directory {
+impl HasMeta for RemoteDirectory {
 	fn get_meta_string(&self) -> String {
 		serde_json::to_string(&self.borrow_meta()).unwrap()
 	}
 }
 
-impl HasParent for Directory {
+impl HasParent for RemoteDirectory {
 	fn parent(&self) -> Uuid {
 		self.parent
 	}
 }
 
-impl HasDirInfo for Directory {
+impl HasDirInfo for RemoteDirectory {
 	fn created(&self) -> Option<DateTime<Utc>> {
 		self.created
 	}
 }
 
-impl HasRemoteInfo for Directory {
+impl HasRemoteInfo for RemoteDirectory {
 	fn favorited(&self) -> bool {
 		self.favorited
 	}

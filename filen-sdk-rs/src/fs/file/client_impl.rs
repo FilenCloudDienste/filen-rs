@@ -83,6 +83,8 @@ impl Client {
 		.await?;
 
 		file.set_meta(new_meta);
+
+		self.update_maybe_connected_item(file).await?;
 		Ok(())
 	}
 

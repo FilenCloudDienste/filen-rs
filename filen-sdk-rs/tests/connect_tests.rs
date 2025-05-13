@@ -1,9 +1,11 @@
+use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	auth::Client,
 	connect::PasswordState,
 	fs::{
 		HasName, HasUUID,
-		file::traits::{HasFileInfo, HasRemoteFileInfo},
+		dir::traits::HasDirMeta,
+		file::traits::{HasFileInfo, HasFileMeta, HasRemoteFileInfo},
 	},
 	sync::lock::ResourceLock,
 };
@@ -19,7 +21,7 @@ async fn dir_public_link() {
 	let test_dir = &resources.dir;
 
 	let dir = client.create_dir(test_dir, "dir").await.unwrap();
-	let sub_dir = client.create_dir(&dir, "sub_dir").await.unwrap();
+	let mut sub_dir = client.create_dir(&dir, "sub_dir").await.unwrap();
 
 	let dir_file = client.make_file_builder("empty_dir.txt", &dir).build();
 	let mut writer = client.get_file_writer(dir_file);
@@ -78,12 +80,34 @@ async fn dir_public_link() {
 	let mut writer = client.get_file_writer(sub_sub_file);
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
-	let sub_sub_file = writer.into_remote_file().unwrap();
+	let mut sub_sub_file = writer.into_remote_file().unwrap();
+
 	let (sub_dirs, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
 	assert_eq!(sub_dirs.len(), 1);
 	assert!(sub_dirs.contains(&sub_sub_dir));
 	assert!(sub_files.contains(&sub_sub_file));
 	assert_eq!(sub_files.len(), 3);
+
+	let mut meta = sub_sub_file.get_meta();
+	meta.set_name("new_file_name.txt");
+	client
+		.update_file_metadata(&mut sub_sub_file, meta)
+		.await
+		.unwrap();
+
+	let (_, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
+	let found_file = sub_files.iter().find(|f| f.name() == "new_file_name.txt");
+	assert!(found_file.is_some());
+
+	let mut meta = sub_dir.get_meta();
+	meta.set_name("new_dir_name");
+	client
+		.update_dir_metadata(&mut sub_dir, meta)
+		.await
+		.unwrap();
+	let (dirs, _) = client.list_linked_dir(&dir, &link).await.unwrap();
+	assert_eq!(dirs.len(), 1);
+	assert_eq!(dirs[0].name(), "new_dir_name");
 
 	client.trash_dir(&sub_sub_dir).await.unwrap();
 	client.trash_file(&sub_sub_file).await.unwrap();
@@ -104,7 +128,7 @@ async fn file_public_link() {
 	let mut writer = client.get_file_writer(file);
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let mut file = writer.into_remote_file().unwrap();
 
 	let mut link = client.public_link_file(&file).await.unwrap();
 	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
@@ -139,6 +163,12 @@ async fn file_public_link() {
 
 	let found_linked_info = client.get_linked_file(&found_link).await.unwrap();
 	assert_eq!(found_linked_info, linked_info);
+
+	let mut meta = file.get_meta();
+	meta.set_name("new_file_name.txt");
+	client.update_file_metadata(&mut file, meta).await.unwrap();
+	let linked_info = client.get_linked_file(&link).await.unwrap();
+	assert_eq!(linked_info.name, "new_file_name.txt");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -278,13 +308,13 @@ async fn share_dir() {
 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
 	let share_client = &share_resources.client;
 
-	let dir = client.create_dir(test_dir, "dir").await.unwrap();
+	let mut dir = client.create_dir(test_dir, "dir").await.unwrap();
 	let sub_dir = client.create_dir(&dir, "sub_dir").await.unwrap();
 	let dir_file = client.make_file_builder("a.txt", &dir).build();
 	let mut writer = client.get_file_writer(dir_file);
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
-	let dir_file = writer.into_remote_file().unwrap();
+	let mut dir_file = writer.into_remote_file().unwrap();
 	let file = client.make_file_builder("a.txt", &sub_dir).build();
 	let mut writer = client.get_file_writer(file);
 	writer.close().await.unwrap();
@@ -335,6 +365,25 @@ async fn share_dir() {
 	out_reader.read_to_end(&mut buf).await.unwrap();
 	assert_eq!(buf, b"Hello, world!");
 	assert_eq!(shared_files_out[0].get_file(), &dir_file);
+
+	// change metadata
+	let mut meta = dir.get_meta();
+	meta.set_name("new_name");
+	client.update_dir_metadata(&mut dir, meta).await.unwrap();
+
+	let mut meta = dir_file.get_meta();
+	meta.set_name("new_file_name.txt");
+	client
+		.update_file_metadata(&mut dir_file, meta)
+		.await
+		.unwrap();
+	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
+	assert_eq!(shared_dirs_in.len(), 1);
+	assert_eq!(shared_dirs_in[0].get_dir().name(), "new_name");
+
+	let (_, shared_files_in) = share_client.list_in_shared_dir(&dir).await.unwrap();
+	assert_eq!(shared_files_in.len(), 1);
+	assert_eq!(shared_files_in[0].get_file().name(), "new_file_name.txt");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -352,7 +401,7 @@ async fn share_file() {
 	let mut writer = client.get_file_writer(file);
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let mut file = writer.into_remote_file().unwrap();
 
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
@@ -377,4 +426,19 @@ async fn share_file() {
 	let mut buf = Vec::new();
 	out_reader.read_to_end(&mut buf).await.unwrap();
 	assert_eq!(buf, b"Hello, world!");
+
+	let mut meta = file.get_meta();
+	meta.set_name("new_file_name.txt");
+	let new_created = Utc::now();
+	meta.set_created(new_created);
+	client.update_file_metadata(&mut file, meta).await.unwrap();
+
+	let (_, shared_files_in) = share_client.list_in_shared().await.unwrap();
+	assert_eq!(shared_files_in.len(), 1);
+	assert_eq!(shared_files_in[0].get_file().name(), "new_file_name.txt");
+	assert_eq!(
+		shared_files_in[0].get_file().created(),
+		new_created.round_subsecs(3),
+		"created date not updated"
+	);
 }

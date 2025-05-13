@@ -11,23 +11,26 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::Error,
 	fs::{
-		dir::{Directory, DirectoryMeta, DirectoryType, RootDirectoryWithMeta},
+		dir::{DirectoryMeta, DirectoryMetaType, RemoteDirectory, RootDirectoryWithMeta},
 		file::{RemoteRootFile, meta::FileMeta},
 	},
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareInfo {
 	pub email: String,
 	pub id: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SharingRole {
 	Sharer(ShareInfo),
 	Receiver(ShareInfo),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedDirectory {
-	dir: DirectoryType<'static>,
+	dir: DirectoryMetaType<'static>,
 	sharing_role: SharingRole,
 	write_access: bool,
 }
@@ -43,14 +46,14 @@ struct DirInfo {
 impl SharedDirectory {
 	fn inner_from_share(dir_info: DirInfo, sharing_role: SharingRole) -> Self {
 		let dir = match dir_info.parent {
-			Some(parent) => DirectoryType::Dir(Cow::Owned(Directory::from_meta(
+			Some(parent) => DirectoryMetaType::Dir(Cow::Owned(RemoteDirectory::from_meta(
 				dir_info.uuid,
 				parent,
 				dir_info.color,
 				false,
 				dir_info.metadata,
 			))),
-			None => DirectoryType::RootWithMeta(Cow::Owned(RootDirectoryWithMeta::from_meta(
+			None => DirectoryMetaType::Root(Cow::Owned(RootDirectoryWithMeta::from_meta(
 				dir_info.uuid,
 				dir_info.color,
 				dir_info.metadata,
@@ -105,7 +108,7 @@ impl SharedDirectory {
 		))
 	}
 
-	pub fn get_dir(&self) -> &DirectoryType<'_> {
+	pub fn get_dir(&self) -> &DirectoryMetaType<'_> {
 		&self.dir
 	}
 }

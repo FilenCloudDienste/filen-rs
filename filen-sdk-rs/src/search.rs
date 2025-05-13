@@ -13,7 +13,7 @@ use crate::{
 	error::Error,
 	fs::{
 		HasName, HasType, HasUUID, NonRootFSObject,
-		dir::{Directory, DirectoryMeta},
+		dir::{DirectoryMeta, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
 };
@@ -145,7 +145,7 @@ impl Client {
 			.map(|item| {
 				let (item, metadata_path) = match item {
 					SearchFindItem::Dir(found_dir) => (
-						NonRootFSObject::Dir(Cow::Owned(Directory::from_encrypted(
+						NonRootFSObject::Dir(Cow::Owned(RemoteDirectory::from_encrypted(
 							found_dir.uuid,
 							found_dir.parent,
 							found_dir.color.map(|s| s.into_owned()),

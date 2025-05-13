@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	crypto::file::FileKey,
 	fs::{
 		FSObject, HasUUID,
-		dir::{Directory, HasContents},
+		dir::{HasContents, RemoteDirectory},
 		file::FileBuilder,
 	},
 };
@@ -151,7 +151,7 @@ async fn make_rs_compat_dir() {
 	writer.close().await.unwrap();
 }
 
-async fn run_compat_tests(client: &Client, compat_dir: Directory, language: &str) {
+async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language: &str) {
 	match client.find_item_in_dir(&compat_dir, "dir").await.unwrap() {
 		Some(FSObject::Dir(_)) => {}
 		_ => panic!("dir not found in compat-go directory"),

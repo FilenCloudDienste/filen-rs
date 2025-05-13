@@ -5,13 +5,13 @@ use uuid::Uuid;
 
 use super::{
 	HasMeta, HasName, HasParent, HasType, HasUUID,
-	dir::{Directory, DirectoryType, RootDirectory, RootDirectoryWithMeta},
+	dir::{DirectoryType, RemoteDirectory, RootDirectory, RootDirectoryWithMeta},
 	file::{RemoteFile, RemoteRootFile},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FSObject<'a> {
-	Dir(Cow<'a, Directory>),
+	Dir(Cow<'a, RemoteDirectory>),
 	Root(Cow<'a, RootDirectory>),
 	RootWithMeta(Cow<'a, RootDirectoryWithMeta>),
 	File(Cow<'a, RemoteFile>),
@@ -30,7 +30,7 @@ impl<'a> From<DirectoryType<'a>> for FSObject<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NonRootFSObject<'a> {
-	Dir(Cow<'a, Directory>),
+	Dir(Cow<'a, RemoteDirectory>),
 	File(Cow<'a, RemoteFile>),
 }
 
@@ -46,14 +46,14 @@ impl From<RemoteFile> for NonRootFSObject<'_> {
 	}
 }
 
-impl<'a> From<&'a Directory> for NonRootFSObject<'a> {
-	fn from(dir: &'a Directory) -> Self {
+impl<'a> From<&'a RemoteDirectory> for NonRootFSObject<'a> {
+	fn from(dir: &'a RemoteDirectory) -> Self {
 		NonRootFSObject::Dir(Cow::Borrowed(dir))
 	}
 }
 
-impl From<Directory> for NonRootFSObject<'_> {
-	fn from(dir: Directory) -> Self {
+impl From<RemoteDirectory> for NonRootFSObject<'_> {
+	fn from(dir: RemoteDirectory) -> Self {
 		NonRootFSObject::Dir(Cow::Owned(dir))
 	}
 }
@@ -114,7 +114,7 @@ impl HasType for NonRootFSObject<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FSObject1 {
-	Dir(Directory),
+	Dir(RemoteDirectory),
 	Root(RootDirectory),
 	RootWithMeta(RootDirectoryWithMeta),
 	File(RemoteFile),

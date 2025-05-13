@@ -15,15 +15,15 @@ use crate::{
 	},
 };
 
-use super::{Directory, DirectoryMeta, DirectoryType, HasContents, traits::SetDirMeta};
+use super::{DirectoryMeta, DirectoryType, HasContents, RemoteDirectory, traits::SetDirMeta};
 
 impl Client {
 	pub async fn create_dir(
 		&self,
 		parent: &impl HasContents,
 		name: impl Into<String>,
-	) -> Result<Directory, Error> {
-		let mut dir = Directory::new(name.into(), parent.uuid(), chrono::Utc::now());
+	) -> Result<RemoteDirectory, Error> {
+		let mut dir = RemoteDirectory::new(name.into(), parent.uuid(), chrono::Utc::now());
 
 		let response = api::v3::dir::create::post(
 			self.client(),
@@ -46,10 +46,10 @@ impl Client {
 		Ok(dir)
 	}
 
-	pub async fn get_dir(&self, uuid: Uuid) -> Result<Directory, Error> {
+	pub async fn get_dir(&self, uuid: Uuid) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
-		Directory::from_encrypted(
+		RemoteDirectory::from_encrypted(
 			uuid,
 			response.parent,
 			response.color.map(|s| s.into_owned()),
@@ -78,7 +78,7 @@ impl Client {
 	pub async fn list_dir(
 		&self,
 		dir: &impl HasContents,
-	) -> Result<(Vec<Directory>, Vec<RemoteFile>), Error> {
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::content::post(
 			self.client(),
 			&api::v3::dir::content::Request { uuid: dir.uuid() },
@@ -89,7 +89,7 @@ impl Client {
 			.dirs
 			.into_iter()
 			.map(|d| {
-				Directory::from_encrypted(
+				RemoteDirectory::from_encrypted(
 					d.uuid,
 					d.parent,
 					d.color.map(|s| s.into_owned()),
@@ -123,7 +123,7 @@ impl Client {
 	pub async fn list_dir_recursive(
 		&self,
 		dir: &impl HasContents,
-	) -> Result<(Vec<Directory>, Vec<RemoteFile>), Error> {
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::download::post(
 			self.client(),
 			&api::v3::dir::download::Request {
@@ -137,7 +137,7 @@ impl Client {
 			.dirs
 			.into_iter()
 			.filter_map(|response_dir| {
-				Some(Directory::from_encrypted(
+				Some(RemoteDirectory::from_encrypted(
 					response_dir.uuid,
 					match response_dir.parent {
 						// the request returns the base dir for the request as one of its dirs, we filter it out here
@@ -176,7 +176,7 @@ impl Client {
 		Ok((dirs, files))
 	}
 
-	pub async fn trash_dir(&self, dir: &Directory) -> Result<(), Error> {
+	pub async fn trash_dir(&self, dir: &RemoteDirectory) -> Result<(), Error> {
 		api::v3::dir::trash::post(
 			self.client(),
 			&api::v3::dir::trash::Request { uuid: dir.uuid() },
@@ -187,7 +187,7 @@ impl Client {
 
 	pub async fn update_dir_metadata(
 		&self,
-		dir: &mut Directory,
+		dir: &mut RemoteDirectory,
 		new_meta: DirectoryMeta<'_>,
 	) -> Result<(), Error> {
 		api::v3::dir::metadata::post(
@@ -203,8 +203,9 @@ impl Client {
 			},
 		)
 		.await?;
-
 		dir.set_meta(new_meta);
+		self.update_maybe_connected_item(dir).await?;
+
 		Ok(())
 	}
 
@@ -262,7 +263,7 @@ impl Client {
 	// I want to add this in tandem with a locking mechanism so that I avoid race conditions
 	pub async fn move_dir(
 		&self,
-		dir: &mut Directory,
+		dir: &mut RemoteDirectory,
 		new_parent: &impl HasContents,
 	) -> Result<(), Error> {
 		api::v3::dir::r#move::post(

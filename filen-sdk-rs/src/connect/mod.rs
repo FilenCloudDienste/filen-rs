@@ -28,7 +28,7 @@ use crate::{
 	error::Error,
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
-		dir::{Directory, HasContents},
+		dir::{HasContents, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
 };
@@ -36,6 +36,7 @@ use crate::{
 pub mod contacts;
 pub mod fs;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
 	email: String,
 	public_key: RsaPublicKey,
@@ -249,7 +250,7 @@ impl MakePasswordSaltAndHash for DirPublicLink {
 impl Client {
 	async fn update_shared_item_meta<I>(&self, item: &I, user: &User) -> Result<(), Error>
 	where
-		I: HasMeta + HasUUID,
+		I: HasMeta + HasUUID + Debug,
 	{
 		api::v3::item::shared::rename::post(
 			self.client(),
@@ -290,7 +291,7 @@ impl Client {
 	where
 		I: HasMeta + HasUUID + Send + Sync + Debug,
 	{
-		let (shared, linked) = futures::try_join!(
+		let (linked, shared) = futures::try_join!(
 			async {
 				api::v3::item::linked::post(
 					self.client(),
@@ -306,8 +307,9 @@ impl Client {
 				.await
 			},
 		)?;
+
 		let futures = FuturesUnordered::new();
-		for link in shared.links {
+		for link in linked.links {
 			futures.push(Box::pin(async move {
 				let crypter = self.decrypt_meta_key(&link.link_key)?;
 				self.update_linked_item_meta(item, link.link_uuid, &crypter)
@@ -317,7 +319,7 @@ impl Client {
 					Box<dyn std::future::Future<Output = Result<(), Error>> + Send>,
 				>);
 		}
-		for user in linked.users {
+		for user in shared.users {
 			futures.push(Box::pin(async move {
 				let user = user.try_into()?;
 				self.update_shared_item_meta(item, &user).await
@@ -432,7 +434,7 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn public_link_dir(&self, dir: &Directory) -> Result<DirPublicLink, Error> {
+	pub async fn public_link_dir(&self, dir: &RemoteDirectory) -> Result<DirPublicLink, Error> {
 		let public_link = DirPublicLink::new(self.make_meta_key());
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
 		let link = ListedPublicLink {
@@ -521,7 +523,7 @@ impl Client {
 
 	pub async fn update_dir_link(
 		&self,
-		dir: &Directory,
+		dir: &RemoteDirectory,
 		link: &DirPublicLink,
 	) -> Result<(), Error> {
 		api::v3::dir::link::edit::post(
@@ -634,7 +636,7 @@ impl Client {
 
 	pub async fn get_dir_link_status(
 		&self,
-		dir: &Directory,
+		dir: &RemoteDirectory,
 	) -> Result<Option<DirPublicLink>, Error> {
 		let response = api::v3::dir::link::status::post(
 			self.client(),
@@ -674,7 +676,7 @@ impl Client {
 		&self,
 		dir: &dyn HasContents,
 		link: &DirPublicLink,
-	) -> Result<(Vec<Directory>, Vec<RemoteFile>), Error> {
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::link::content::post(
 			self.client(),
 			&api::v3::dir::link::content::Request {
@@ -689,7 +691,7 @@ impl Client {
 			.dirs
 			.into_iter()
 			.map(|d| {
-				Directory::from_encrypted(
+				RemoteDirectory::from_encrypted(
 					d.uuid,
 					d.parent,
 					d.color.map(|c| c.into_owned()),
@@ -745,7 +747,7 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn share_dir(&self, dir: &Directory, user: &User) -> Result<(), Error> {
+	pub async fn share_dir(&self, dir: &RemoteDirectory, user: &User) -> Result<(), Error> {
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
 		let futures = FuturesUnordered::new();
 
@@ -857,7 +859,8 @@ impl Client {
 		&self,
 		user: Option<&User>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_out_shared(None::<&Directory>, user).await
+		self.inner_list_out_shared(None::<&RemoteDirectory>, user)
+			.await
 	}
 
 	pub async fn list_out_shared_dir(
@@ -894,7 +897,7 @@ impl Client {
 	}
 
 	pub async fn list_in_shared(&self) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_in_shared(None::<&Directory>).await
+		self.inner_list_in_shared(None::<&RemoteDirectory>).await
 	}
 
 	pub async fn list_in_shared_dir(
