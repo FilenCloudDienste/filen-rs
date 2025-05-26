@@ -201,10 +201,7 @@ impl<'a> FileWriterUploadingState<'a> {
 					}
 				}
 				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::new(
-						std::io::ErrorKind::Other,
-						e.to_string(),
-					)));
+					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
 				}
 				std::task::Poll::Ready(None) => {
 					// all futures are done, return the number of bytes written
@@ -234,10 +231,7 @@ impl<'a> FileWriterUploadingState<'a> {
 			match self.futures.poll_next_unpin(cx) {
 				std::task::Poll::Ready(Some(Ok(()))) => {}
 				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::new(
-						std::io::ErrorKind::Other,
-						e.to_string(),
-					)));
+					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
 				}
 				std::task::Poll::Ready(None) => {
 					return std::task::Poll::Ready(Ok(()));
@@ -264,10 +258,9 @@ impl<'a> FileWriterCompletingState<'a> {
 		cx: &mut std::task::Context<'_>,
 	) -> std::task::Poll<std::io::Result<filen_types::api::v3::upload::empty::Response>> {
 		match self.future.poll_unpin(cx) {
-			std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::new(
-				std::io::ErrorKind::Other,
-				e.to_string(),
-			))),
+			std::task::Poll::Ready(Err(e)) => {
+				std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
+			}
 			std::task::Poll::Ready(Ok(response)) => std::task::Poll::Ready(Ok(response)),
 			std::task::Poll::Pending => std::task::Poll::Pending,
 		}
@@ -332,10 +325,7 @@ impl<'a> FileWriterFinalizingState<'a> {
 			match self.futures.poll_next_unpin(cx) {
 				std::task::Poll::Ready(Some(Ok(()))) => {}
 				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::new(
-						std::io::ErrorKind::Other,
-						e,
-					)));
+					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 				}
 				std::task::Poll::Ready(None) => {
 					return std::task::Poll::Ready(Ok(()));
@@ -419,14 +409,11 @@ impl AsyncWrite for FileWriter<'_> {
 			| FileWriterState::Finalizing(_)
 			| FileWriterState::Complete(_) => {
 				// we are in the completing state, we can't write anymore
-				std::task::Poll::Ready(Err(std::io::Error::new(
-					std::io::ErrorKind::Other,
+				std::task::Poll::Ready(Err(std::io::Error::other(
 					"Cannot write to a completed file",
 				)))
 			}
-			FileWriterState::Error(e) => {
-				std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, *e)))
-			}
+			FileWriterState::Error(e) => std::task::Poll::Ready(Err(std::io::Error::other(*e))),
 		}
 	}
 
@@ -451,17 +438,11 @@ impl AsyncWrite for FileWriter<'_> {
 					std::task::Poll::Ready(Ok(())) => match uploading.into_completing_state() {
 						Ok(completing) => FileWriterState::Completing(completing),
 						Err(e) => {
-							return std::task::Poll::Ready(Err(std::io::Error::new(
-								std::io::ErrorKind::Other,
-								e,
-							)));
+							return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 						}
 					},
 					std::task::Poll::Ready(Err(e)) => {
-						return std::task::Poll::Ready(Err(std::io::Error::new(
-							std::io::ErrorKind::Other,
-							e,
-						)));
+						return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 					}
 					std::task::Poll::Pending => {
 						self.state = FileWriterState::Uploading(uploading);
@@ -481,10 +462,7 @@ impl AsyncWrite for FileWriter<'_> {
 					FileWriterState::Finalizing(completing.into_finalizing_state(response))
 				}
 				std::task::Poll::Ready(Err(e)) => {
-					return std::task::Poll::Ready(Err(std::io::Error::new(
-						std::io::ErrorKind::Other,
-						e,
-					)));
+					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 				}
 				std::task::Poll::Pending => {
 					self.state = FileWriterState::Completing(completing);
@@ -512,9 +490,7 @@ impl AsyncWrite for FileWriter<'_> {
 				self.state = FileWriterState::Complete(complete);
 				std::task::Poll::Ready(Ok(()))
 			}
-			FileWriterState::Error(e) => {
-				std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-			}
+			FileWriterState::Error(e) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
 			FileWriterState::Uploading(_) | FileWriterState::Completing(_) => {
 				unreachable!("Should be handled by the first part of this function")
 			}

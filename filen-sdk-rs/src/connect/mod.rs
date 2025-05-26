@@ -94,7 +94,7 @@ trait MakePasswordSaltAndHash {
 	fn password(&self) -> &PasswordState;
 	fn salt(&self) -> &[u8];
 
-	fn get_password_hash(&self) -> Result<Cow<'_, Vec<u8>>, Error> {
+	fn get_password_hash(&self) -> Result<Cow<'_, [u8]>, Error> {
 		let password = match self.password() {
 			PasswordState::None => None,
 			PasswordState::Known(password) => Some(password.as_str()),

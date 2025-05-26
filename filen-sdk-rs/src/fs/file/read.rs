@@ -139,10 +139,7 @@ impl futures::io::AsyncRead for FileReader<'_> {
 					}
 				}
 				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::new(
-						std::io::ErrorKind::Other,
-						e,
-					)));
+					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 				}
 				std::task::Poll::Ready(None) => {
 					return std::task::Poll::Ready(Ok(read));
