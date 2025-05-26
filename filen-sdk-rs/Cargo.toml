@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.12.15", features = ["json", "stream"] }
+reqwest = { version = "0.12.15", features = ["json", "stream", "rustls-tls"], default-features = false}
+
 filen-types = { path = "../filen-types" }
 rand = "0.9.0"
 old_rng = {package = "rand", version="0.8.5"} # for compatibility with rsa 0.9.8
