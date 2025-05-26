@@ -13,8 +13,8 @@ use filen_sdk_rs::{
 };
 use filen_types::auth::FileEncryptionVersion;
 use futures::{AsyncReadExt, AsyncWriteExt};
-use rand::TryRngCore;
 
+use rand::TryRngCore;
 mod test_utils;
 
 fn get_compat_test_file(client: &Client, parent: &impl HasContents) -> (FileBuilder, String) {
@@ -104,9 +104,15 @@ async fn make_rs_compat_dir() {
 		client.trash_dir(&dir).await.unwrap();
 	}
 
-	let compat_dir = client.create_dir(client.root(), "compat-rs").await.unwrap();
+	let compat_dir = client
+		.create_dir(client.root(), "compat-rs".to_string())
+		.await
+		.unwrap();
 
-	client.create_dir(&compat_dir, "dir").await.unwrap();
+	client
+		.create_dir(&compat_dir, "dir".to_string())
+		.await
+		.unwrap();
 
 	let empty_file = client.make_file_builder("empty.txt", &compat_dir).build();
 	let mut writer = client.get_file_writer(empty_file);

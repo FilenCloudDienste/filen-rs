@@ -20,8 +20,14 @@ async fn dir_public_link() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir = client.create_dir(test_dir, "dir").await.unwrap();
-	let mut sub_dir = client.create_dir(&dir, "sub_dir").await.unwrap();
+	let dir = client
+		.create_dir(test_dir, "dir".to_string())
+		.await
+		.unwrap();
+	let mut sub_dir = client
+		.create_dir(&dir, "sub_dir".to_string())
+		.await
+		.unwrap();
 
 	let dir_file = client.make_file_builder("empty_dir.txt", &dir).build();
 	let mut writer = client.get_file_writer(dir_file);
@@ -73,7 +79,10 @@ async fn dir_public_link() {
 		"get_dir_link_status didn't match created link"
 	);
 
-	let sub_sub_dir = client.create_dir(&sub_dir, "sub_sub_dir").await.unwrap();
+	let sub_sub_dir = client
+		.create_dir(&sub_dir, "sub_sub_dir".to_string())
+		.await
+		.unwrap();
 	let sub_sub_file = client
 		.make_file_builder("sub_sub_file.txt", &sub_dir)
 		.build();
@@ -308,8 +317,14 @@ async fn share_dir() {
 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
 	let share_client = &share_resources.client;
 
-	let mut dir = client.create_dir(test_dir, "dir").await.unwrap();
-	let sub_dir = client.create_dir(&dir, "sub_dir").await.unwrap();
+	let mut dir = client
+		.create_dir(test_dir, "dir".to_string())
+		.await
+		.unwrap();
+	let sub_dir = client
+		.create_dir(&dir, "sub_dir".to_string())
+		.await
+		.unwrap();
 	let dir_file = client.make_file_builder("a.txt", &dir).build();
 	let mut writer = client.get_file_writer(dir_file);
 	writer.write_all(b"Hello, world!").await.unwrap();

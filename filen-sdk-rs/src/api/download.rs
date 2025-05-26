@@ -19,17 +19,13 @@ pub(crate) async fn download_file_chunk(
 		chunk_idx
 	);
 
-	let response = client
-		.get_auth_request(url)
-		.send()
-		.await
-		.map_err(Into::<filen_types::error::ResponseError>::into)?;
+	let response = client.get_auth_request(url).send().await?;
 
 	let mut bytes_stream = response.bytes_stream();
 	let mut i = 0;
 
 	while let Some(chunk) = bytes_stream.next().await {
-		let chunk = chunk.map_err(Into::<filen_types::error::ResponseError>::into)?;
+		let chunk = chunk?;
 		if chunk.len() + i > out_chunk.capacity() {
 			return Err(Error::ChunkTooLarge {
 				expected: out_chunk.capacity(),

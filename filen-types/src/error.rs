@@ -15,6 +15,4 @@ pub enum ResponseError {
 		message: Option<String>,
 		code: Option<String>,
 	},
-	#[error("Reqwest Error: `{0}`")]
-	ReqwestError(#[from] reqwest::Error),
 }

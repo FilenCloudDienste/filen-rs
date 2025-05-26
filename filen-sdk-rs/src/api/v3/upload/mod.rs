@@ -1,8 +1,10 @@
+use filen_types::api::response::FilenResponse;
 pub use filen_types::api::v3::upload::{ENDPOINT, Response};
-use filen_types::{api::response::FilenResponse, error::ResponseError};
 use sha2::{Digest, Sha512};
 
-use crate::{auth::http::AuthorizedClient, consts::random_ingest_url, fs::file::BaseFile};
+use crate::{
+	auth::http::AuthorizedClient, consts::random_ingest_url, error::Error, fs::file::BaseFile,
+};
 
 pub(crate) mod done;
 pub(crate) mod empty;
@@ -13,7 +15,7 @@ pub(crate) async fn upload_file_chunk(
 	upload_key: &str,
 	chunk_idx: u64,
 	chunk: Vec<u8>,
-) -> Result<Response<'static>, ResponseError> {
+) -> Result<Response<'static>, Error> {
 	let data_hash = Sha512::digest(&chunk);
 	let url = format!(
 		"{}/{}?uuid={}&index={}&parent={}&uploadKey={}&hash={}",
@@ -26,12 +28,12 @@ pub(crate) async fn upload_file_chunk(
 		faster_hex::hex_string(data_hash.as_slice()),
 	);
 
-	client
+	Ok(client
 		.post_auth_request(url)
 		.body(chunk)
 		.send()
 		.await?
 		.json::<FilenResponse<Response>>()
 		.await?
-		.into_data()
+		.into_data()?)
 }

@@ -20,10 +20,10 @@ use super::{DirectoryMeta, DirectoryType, HasContents, RemoteDirectory, traits::
 impl Client {
 	pub async fn create_dir(
 		&self,
-		parent: &impl HasContents,
-		name: impl Into<String>,
+		parent: &dyn HasContents,
+		name: String,
 	) -> Result<RemoteDirectory, Error> {
-		let mut dir = RemoteDirectory::new(name.into(), parent.uuid(), chrono::Utc::now());
+		let mut dir = RemoteDirectory::new(name, parent.uuid(), chrono::Utc::now());
 
 		let response = api::v3::dir::create::post(
 			self.client(),
@@ -61,8 +61,8 @@ impl Client {
 
 	pub async fn dir_exists(
 		&self,
-		parent: &impl HasContents,
-		name: impl AsRef<str>,
+		parent: &dyn HasContents,
+		name: &str,
 	) -> Result<Option<uuid::Uuid>, Error> {
 		api::v3::dir::exists::post(
 			self.client(),
@@ -77,7 +77,7 @@ impl Client {
 
 	pub async fn list_dir(
 		&self,
-		dir: &impl HasContents,
+		dir: &dyn HasContents,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::content::post(
 			self.client(),
@@ -122,7 +122,7 @@ impl Client {
 
 	pub async fn list_dir_recursive(
 		&self,
-		dir: &impl HasContents,
+		dir: &dyn HasContents,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::download::post(
 			self.client(),
@@ -211,26 +211,23 @@ impl Client {
 
 	pub async fn find_item_in_dir(
 		&self,
-		dir: &impl HasContents,
-		name: impl AsRef<str>,
+		dir: &dyn HasContents,
+		name: &str,
 	) -> Result<Option<FSObject<'static>>, Error> {
 		let (dirs, files) = self.list_dir(dir).await?;
-		if let Some(dir) = dirs.into_iter().find(|d| d.name() == name.as_ref()) {
+		if let Some(dir) = dirs.into_iter().find(|d| d.name() == name) {
 			return Ok(Some(FSObject::Dir(Cow::Owned(dir))));
 		}
-		if let Some(file) = files.into_iter().find(|f| f.name() == name.as_ref()) {
+		if let Some(file) = files.into_iter().find(|f| f.name() == name) {
 			return Ok(Some(FSObject::File(Cow::Owned(file))));
 		}
 		Ok(None)
 	}
 
-	pub async fn find_or_create_dir(
-		&self,
-		path: impl AsRef<str>,
-	) -> Result<DirectoryType<'_>, Error> {
+	pub async fn find_or_create_dir(&self, path: &str) -> Result<DirectoryType<'_>, Error> {
 		let mut curr_dir = DirectoryType::Root(Cow::Borrowed(self.root()));
-		let mut curr_path = String::with_capacity(path.as_ref().len());
-		for component in path.as_ref().split('/') {
+		let mut curr_path = String::with_capacity(path.len());
+		for component in path.split('/') {
 			if component.is_empty() {
 				continue;
 			}
@@ -245,13 +242,11 @@ impl Client {
 			if files.iter().any(|f| f.name() == component) {
 				return Err(Error::Custom(format!(
 					"find_or_create_dir path {}/{} is a file when trying to create dir {}",
-					curr_path,
-					component,
-					path.as_ref()
+					curr_path, component, path
 				)));
 			}
 
-			let new_dir = self.create_dir(&curr_dir, component).await?;
+			let new_dir = self.create_dir(&curr_dir, component.to_string()).await?;
 			curr_dir = DirectoryType::Dir(Cow::Owned(new_dir));
 			curr_path.push_str(component);
 			curr_path.push('/');
@@ -264,7 +259,7 @@ impl Client {
 	pub async fn move_dir(
 		&self,
 		dir: &mut RemoteDirectory,
-		new_parent: &impl HasContents,
+		new_parent: &dyn HasContents,
 	) -> Result<(), Error> {
 		api::v3::dir::r#move::post(
 			self.client(),
@@ -280,7 +275,7 @@ impl Client {
 
 	pub async fn get_dir_size(
 		&self,
-		dir: &impl HasContents,
+		dir: &dyn HasContents,
 		trash: bool,
 	) -> Result<api::v3::dir::size::Response, Error> {
 		api::v3::dir::size::post(

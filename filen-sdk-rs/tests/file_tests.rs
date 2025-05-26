@@ -71,7 +71,10 @@ async fn file_search() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let second_dir = client.create_dir(test_dir, "second_dir").await.unwrap();
+	let second_dir = client
+		.create_dir(test_dir, "second_dir".to_string())
+		.await
+		.unwrap();
 
 	let file_random_part_long = generate_random_base64_values(16);
 	let file_random_part_short = generate_random_base64_values(2);
@@ -217,7 +220,10 @@ async fn file_move() {
 		Some(FSObject::File(Cow::Borrowed(&file)))
 	);
 
-	let second_dir = client.create_dir(test_dir, "second_dir").await.unwrap();
+	let second_dir = client
+		.create_dir(test_dir, "second_dir".to_string())
+		.await
+		.unwrap();
 	client.move_file(&mut file, &second_dir).await.unwrap();
 
 	assert!(

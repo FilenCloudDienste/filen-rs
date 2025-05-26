@@ -14,7 +14,10 @@ async fn create_list_trash() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir = client.create_dir(test_dir, "test_dir").await.unwrap();
+	let dir = client
+		.create_dir(test_dir, "test_dir".to_string())
+		.await
+		.unwrap();
 	assert_eq!(dir.name(), "test_dir");
 
 	let (dirs, _) = client.list_dir(test_dir).await.unwrap();
@@ -32,9 +35,9 @@ async fn find_at_path() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = client.create_dir(test_dir, "a").await.unwrap();
-	let dir_b = client.create_dir(&dir_a, "b").await.unwrap();
-	let dir_c = client.create_dir(&dir_b, "c").await.unwrap();
+	let dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	let dir_b = client.create_dir(&dir_a, "b".to_string()).await.unwrap();
+	let dir_c = client.create_dir(&dir_b, "c".to_string()).await.unwrap();
 
 	assert_eq!(
 		client
@@ -73,9 +76,9 @@ async fn list_recursive() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = client.create_dir(test_dir, "a").await.unwrap();
-	let dir_b = client.create_dir(&dir_a, "b").await.unwrap();
-	let dir_c = client.create_dir(&dir_b, "c").await.unwrap();
+	let dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	let dir_b = client.create_dir(&dir_a, "b".to_string()).await.unwrap();
+	let dir_c = client.create_dir(&dir_b, "c".to_string()).await.unwrap();
 
 	let (dirs, _) = client.list_dir_recursive(test_dir).await.unwrap();
 
@@ -92,7 +95,7 @@ async fn exists() {
 
 	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
 
-	let dir_a = client.create_dir(test_dir, "a").await.unwrap();
+	let dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
 
 	assert_eq!(
 		Some(dir_a.uuid()),
@@ -109,8 +112,8 @@ async fn dir_move() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let mut dir_a = client.create_dir(test_dir, "a").await.unwrap();
-	let dir_b = client.create_dir(test_dir, "b").await.unwrap();
+	let mut dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	let dir_b = client.create_dir(test_dir, "b".to_string()).await.unwrap();
 
 	assert!(client.list_dir(&dir_b).await.unwrap().0.is_empty());
 
@@ -133,7 +136,7 @@ async fn size() {
 		}
 	);
 
-	client.create_dir(test_dir, "a").await.unwrap();
+	client.create_dir(test_dir, "a".to_string()).await.unwrap();
 	assert_eq!(
 		client.get_dir_size(test_dir, false).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
@@ -143,7 +146,7 @@ async fn size() {
 		}
 	);
 
-	client.create_dir(test_dir, "b").await.unwrap();
+	client.create_dir(test_dir, "b".to_string()).await.unwrap();
 	assert_eq!(
 		client.get_dir_size(test_dir, false).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
@@ -160,7 +163,10 @@ async fn dir_search() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let second_dir = client.create_dir(test_dir, "second_dir").await.unwrap();
+	let second_dir = client
+		.create_dir(test_dir, "second_dir".to_string())
+		.await
+		.unwrap();
 
 	let dir_random_part_long = generate_random_base64_values(16);
 	let dir_random_part_short = generate_random_base64_values(2);
@@ -203,7 +209,10 @@ async fn dir_update_meta() {
 	let test_dir = &resources.dir;
 
 	let dir_name = "dir";
-	let mut dir = client.create_dir(test_dir, dir_name).await.unwrap();
+	let mut dir = client
+		.create_dir(test_dir, dir_name.to_string())
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client
