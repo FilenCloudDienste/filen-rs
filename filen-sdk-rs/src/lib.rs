@@ -9,3 +9,4 @@ pub mod error;
 pub mod fs;
 pub mod search;
 pub mod sync;
+pub mod user;
