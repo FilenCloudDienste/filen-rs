@@ -47,8 +47,8 @@ impl Resources {
 						.unwrap_or("XXXXXX".to_string()),
 				)
 				.await
-				.inspect_err(|_| {
-					println!("Failed to login: {}", self.account_prefix);
+				.inspect_err(|e| {
+					println!("Failed to login: {}, error: {:?}", self.account_prefix, e);
 				})
 				.unwrap()
 			})
