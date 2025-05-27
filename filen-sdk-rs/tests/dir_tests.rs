@@ -5,6 +5,7 @@ use filen_sdk_rs::{
 	crypto::shared::generate_random_base64_values,
 	fs::{FSObject, HasName, HasUUID, NonRootFSObject, dir::traits::HasDirMeta},
 };
+use tokio::time;
 
 mod test_utils;
 
@@ -137,6 +138,7 @@ async fn size() {
 	);
 
 	client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	time::sleep(time::Duration::from_secs(100)).await; // ddos protection
 	assert_eq!(
 		client.get_dir_size(test_dir, false).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
@@ -147,6 +149,7 @@ async fn size() {
 	);
 
 	client.create_dir(test_dir, "b".to_string()).await.unwrap();
+	time::sleep(time::Duration::from_secs(100)).await; // ddos protection
 	assert_eq!(
 		client.get_dir_size(test_dir, false).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
