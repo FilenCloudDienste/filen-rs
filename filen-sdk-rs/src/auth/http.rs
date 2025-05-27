@@ -14,8 +14,15 @@ impl UnauthorizedClient for &UnauthClient {
 
 pub struct AuthClient {
 	client: reqwest::Client,
-	api_key: APIKey,
+	pub(crate) api_key: APIKey,
 }
+
+impl PartialEq for AuthClient {
+	fn eq(&self, other: &Self) -> bool {
+		self.api_key == other.api_key
+	}
+}
+impl Eq for AuthClient {}
 
 // not sure if this is the best way to do this
 // this is to work around the fact that in tests

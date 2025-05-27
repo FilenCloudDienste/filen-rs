@@ -140,24 +140,37 @@ impl CreateRandom for MasterKey {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterKeys(pub Vec<MasterKey>);
 
 impl MasterKeys {
 	pub fn new(encrypted: EncryptedMasterKeys, key: MasterKey) -> Result<Self, ConversionError> {
 		let key_str = key.decrypt_meta(&encrypted.0)?;
+		let mut keys = Self::from_decrypted_string(&key_str)?;
+		keys.0.retain(|v| *v != key);
+		keys.0.insert(0, key);
 
-		let mut key_vec = vec![key];
+		Ok(keys)
+	}
 
-		for s in key_str.split('|') {
-			match MasterKey::from_str(s) {
-				Ok(k) if k != key_vec[0] => key_vec.push(k),
-				Err(e) => return Err(e),
-				_ => {} // Skip the original key
-			}
+	pub fn from_decrypted_string(decrypted: &str) -> Result<Self, ConversionError> {
+		let keys = decrypted
+			.trim()
+			.split('|')
+			.map(MasterKey::from_str)
+			.collect::<Result<Vec<_>, ConversionError>>()?;
+		if keys.is_empty() {
+			return Err(ConversionError::InvalidStringLength(decrypted.len(), 1));
 		}
+		Ok(Self(keys))
+	}
 
-		Ok(Self(key_vec))
+	pub fn to_decrypted_string(&self) -> String {
+		self.0
+			.iter()
+			.map(|k| k.as_ref())
+			.collect::<Vec<_>>()
+			.join("|")
 	}
 }
 

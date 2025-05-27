@@ -30,6 +30,7 @@ sha1 = "0.10.6"
 futures = "0.3.31"
 mime_guess = "2.0.5"
 futures-timer = "3.0.3"
+anyhow = "1.0.98"
 
 [dev-dependencies]
 dotenv = "0.15.0"

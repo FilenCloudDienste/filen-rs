@@ -54,9 +54,9 @@ impl FromStr for EncryptionKey {
 	}
 }
 
-impl From<&EncryptionKey> for String {
-	fn from(val: &EncryptionKey) -> Self {
-		faster_hex::hex_string(&val.bytes)
+impl std::fmt::Display for EncryptionKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", faster_hex::hex_string(&self.bytes))
 	}
 }
 

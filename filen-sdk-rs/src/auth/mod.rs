@@ -1,11 +1,18 @@
-use std::{borrow::Cow, str::FromStr};
+use std::{
+	borrow::Cow,
+	fmt::{Debug, Display},
+	str::FromStr,
+};
 
+use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::{
-	auth::{AuthVersion, FileEncryptionVersion, MetaEncryptionVersion},
+	auth::{APIKey, AuthVersion, FileEncryptionVersion, MetaEncryptionVersion},
 	crypto::EncryptedMetaKey,
 };
 use http::{AuthClient, UnauthClient};
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::pkcs8::EncodePrivateKey;
+use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
+use uuid::Uuid;
 
 use crate::{
 	api,
@@ -16,9 +23,10 @@ use crate::{
 		file::FileKey,
 		rsa::HMACKey,
 		shared::{CreateRandom, MetaCrypter},
+		v2::MasterKeys,
 	},
 	error::Error,
-	fs::dir::RootDirectory,
+	fs::{HasUUID, dir::RootDirectory},
 };
 
 pub mod http;
@@ -55,11 +63,52 @@ impl MetaCrypter for MetaKey {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum AuthInfo {
 	V1,
 	V2(v2::AuthInfo),
 	V3(v3::AuthInfo),
+}
+
+impl Display for AuthInfo {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			AuthInfo::V1 => unimplemented!(),
+			AuthInfo::V2(info) => write!(f, "{}", info.master_keys.to_decrypted_string()),
+			AuthInfo::V3(info) => Display::fmt(&info.dek, f),
+		}
+	}
+}
+
+impl AuthInfo {
+	pub fn from_string_and_version(s: &str, version: u32) -> anyhow::Result<Self> {
+		match version {
+			1 => Ok(AuthInfo::V1),
+			2 => Ok(AuthInfo::V2(v2::AuthInfo {
+				master_keys: MasterKeys::from_decrypted_string(s)?,
+			})),
+			3 => Ok(AuthInfo::V3(v3::AuthInfo {
+				dek: v3::MetaKey::from_str(s)?,
+			})),
+			_ => unimplemented!("Unsupported auth version: {}", version),
+		}
+	}
+}
+
+impl FromStr for AuthInfo {
+	type Err = ConversionError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		if s.len() == 64 {
+			Ok(AuthInfo::V3(v3::AuthInfo {
+				dek: v3::MetaKey::from_str(s)?,
+			}))
+		} else {
+			Ok(AuthInfo::V2(v2::AuthInfo {
+				master_keys: MasterKeys::from_decrypted_string(s)?,
+			}))
+		}
+	}
 }
 
 impl MetaCrypter for AuthInfo {
@@ -88,7 +137,7 @@ impl MetaCrypter for AuthInfo {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Client {
 	email: String,
 
@@ -103,6 +152,15 @@ pub struct Client {
 	pub(crate) hmac_key: HMACKey,
 
 	http_client: AuthClient,
+}
+
+pub struct StringifiedClient {
+	pub email: String,
+	pub root_uuid: String,
+	pub auth_info: String,
+	pub private_key: String,
+	pub api_key: String,
+	pub auth_version: u32,
 }
 
 impl Client {
@@ -192,7 +250,7 @@ impl Client {
 	) -> Result<EncryptedMetaKey, ConversionError> {
 		Ok(EncryptedMetaKey(match key {
 			MetaKey::V2(key) => self.crypter().encrypt_meta(key.as_ref()),
-			MetaKey::V3(key) => self.crypter().encrypt_meta(Into::<String>::into(key)),
+			MetaKey::V3(key) => self.crypter().encrypt_meta(key.to_string()),
 		}?))
 	}
 
@@ -241,6 +299,55 @@ impl Client {
 			hmac_key: hmac,
 			http_client: client,
 		})
+	}
+
+	pub fn from_strings(
+		email: String,
+		root_uuid: &str,
+		auth_info: &str,
+		private_key: &str,
+		api_key: String,
+		version: u32,
+	) -> anyhow::Result<Self> {
+		let auth_info = AuthInfo::from_string_and_version(auth_info, version)?;
+		let file_encryption_version = match auth_info {
+			AuthInfo::V1 | AuthInfo::V2(_) => V2FILE_ENCRYPTION_VERSION,
+			AuthInfo::V3(_) => FileEncryptionVersion::V3,
+		};
+		let meta_encryption_version = match auth_info {
+			AuthInfo::V1 | AuthInfo::V2(_) => V2META_ENCRYPTION_VERSION,
+			AuthInfo::V3(_) => MetaEncryptionVersion::V3,
+		};
+
+		let private_key = RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(private_key)?)?;
+
+		Ok(Client {
+			email,
+			root_dir: RootDirectory::new(Uuid::from_str(root_uuid)?),
+			auth_info,
+			file_encryption_version,
+			meta_encryption_version,
+			public_key: RsaPublicKey::from(&private_key),
+			hmac_key: HMACKey::new(&private_key),
+			private_key,
+			http_client: AuthClient::new(APIKey(api_key)),
+		})
+	}
+
+	pub fn to_stringified(&self) -> StringifiedClient {
+		StringifiedClient {
+			email: self.email.clone(),
+			root_uuid: self.root_dir.uuid().to_string(),
+			auth_info: self.auth_info.to_string(),
+			private_key: BASE64_STANDARD
+				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
+			api_key: self.http_client.api_key.0.clone(),
+			auth_version: match self.auth_info {
+				AuthInfo::V1 => 1,
+				AuthInfo::V2(_) => 2,
+				AuthInfo::V3(_) => 3,
+			},
+		}
 	}
 }
 

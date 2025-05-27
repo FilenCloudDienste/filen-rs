@@ -20,9 +20,9 @@ use super::http::UnauthClient;
 
 pub(crate) use crate::crypto::v2::MasterKey as MetaKey;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AuthInfo {
-	master_keys: MasterKeys,
+	pub(crate) master_keys: MasterKeys,
 }
 
 impl MetaCrypter for AuthInfo {

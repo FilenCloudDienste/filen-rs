@@ -17,7 +17,7 @@ impl Display for FileKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			FileKey::V2(key) => key.fmt(f),
-			FileKey::V3(key) => key.fmt(f),
+			FileKey::V3(key) => Display::fmt(&key, f),
 		}
 	}
 }
