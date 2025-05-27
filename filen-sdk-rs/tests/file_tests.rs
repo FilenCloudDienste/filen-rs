@@ -11,8 +11,6 @@ use filen_sdk_rs::{
 use futures::{AsyncReadExt, AsyncWriteExt};
 use rand::TryRngCore;
 
-mod test_utils;
-
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let mut contents = vec![0u8; contents_len];
 	rand::rng().try_fill_bytes(&mut contents).unwrap();

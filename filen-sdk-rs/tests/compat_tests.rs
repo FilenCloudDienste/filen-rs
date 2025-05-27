@@ -15,7 +15,6 @@ use filen_types::auth::FileEncryptionVersion;
 use futures::{AsyncReadExt, AsyncWriteExt};
 
 use rand::TryRngCore;
-mod test_utils;
 
 fn get_compat_test_file(client: &Client, parent: &impl HasContents) -> (FileBuilder, String) {
 	let file_key_str = match client.file_encryption_version() {

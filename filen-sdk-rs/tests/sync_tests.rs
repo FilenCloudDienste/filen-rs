@@ -2,8 +2,6 @@ use std::time;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 
-mod test_utils;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_acquire_lock() {
 	let resources = test_utils::RESOURCES.get_resources().await;

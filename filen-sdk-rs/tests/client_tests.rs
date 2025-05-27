@@ -1,7 +1,5 @@
 use filen_sdk_rs::auth::Client;
 
-mod test_utils;
-
 // all tests must be multi_threaded, otherwise drop will deadlock for TestResources
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_login() {

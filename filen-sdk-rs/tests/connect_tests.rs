@@ -12,8 +12,6 @@ use filen_sdk_rs::{
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
 use futures::{AsyncReadExt, AsyncWriteExt};
 
-mod test_utils;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn dir_public_link() {
 	let resources = test_utils::RESOURCES.get_resources().await;

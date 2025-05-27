@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["filen-sdk-rs","filen-types"]
+members = ["filen-sdk-rs","filen-types", "test-utils"]
 
 [profile.test]
 opt-level = 3
