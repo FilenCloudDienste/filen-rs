@@ -383,6 +383,6 @@ async fn file_trash_empty() {
 	assert_eq!(&client.get_file(file.uuid()).await.unwrap(), &file);
 	client.empty_trash().await.unwrap();
 	// emptying trash is asynchronous, so we need to wait a bit
-	tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 	assert!(client.get_file(file.uuid()).await.is_err());
 }
