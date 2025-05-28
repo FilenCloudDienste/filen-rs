@@ -13,7 +13,8 @@ pub struct Response<'a> {
 	pub is_premium: bool,
 	pub max_storage: u64,
 	pub storage_used: u64,
+	#[serde(rename = "avatarURL")]
 	pub avatar_url: Cow<'a, str>,
-	#[serde(rename = "baseFolderUuid")]
+	#[serde(rename = "baseFolderUUID")]
 	pub root_dir_uuid: Cow<'a, str>,
 }
