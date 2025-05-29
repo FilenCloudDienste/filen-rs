@@ -18,6 +18,12 @@ pub trait HasUUID: Send + Sync {
 	fn uuid(&self) -> Uuid;
 }
 
+impl HasUUID for Uuid {
+	fn uuid(&self) -> Uuid {
+		*self
+	}
+}
+
 pub trait HasType {
 	fn object_type(&self) -> ObjectType;
 }

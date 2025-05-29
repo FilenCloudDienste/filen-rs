@@ -89,12 +89,12 @@ impl FileBuilder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootFile {
-	uuid: Uuid,
-	name: String,
-	mime: String,
-	key: FileKey,
-	created: DateTime<Utc>,
-	modified: DateTime<Utc>,
+	pub uuid: Uuid,
+	pub name: String,
+	pub mime: String,
+	pub key: FileKey,
+	pub created: DateTime<Utc>,
+	pub modified: DateTime<Utc>,
 }
 
 impl RootFile {
@@ -136,8 +136,8 @@ impl RootFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseFile {
-	root: RootFile,
-	parent: Uuid,
+	pub root: RootFile,
+	pub parent: Uuid,
 }
 
 impl BaseFile {
@@ -179,13 +179,13 @@ impl BaseFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
-	file: BaseFile,
-	size: u64,
-	favorited: bool,
-	region: String,
-	bucket: String,
-	chunks: u64,
-	hash: Option<Sha512Hash>,
+	pub file: BaseFile,
+	pub size: u64,
+	pub favorited: bool,
+	pub region: String,
+	pub bucket: String,
+	pub chunks: u64,
+	pub hash: Option<Sha512Hash>,
 }
 
 impl RemoteFile {

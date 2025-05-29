@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{crypto::EncryptedString, fs::ObjectType};
-use traits::{HasDirInfo, HasDirMeta, SetDirMeta};
+use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, SetDirMeta};
 use uuid::Uuid;
 
 use crate::crypto::shared::MetaCrypter;
@@ -24,7 +24,7 @@ pub struct RootDirectory {
 }
 
 impl RootDirectory {
-	pub(crate) fn new(uuid: Uuid) -> Self {
+	pub fn new(uuid: Uuid) -> Self {
 		Self { uuid }
 	}
 }
@@ -118,13 +118,13 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RemoteDirectory {
-	uuid: Uuid,
-	name: String,
-	parent: Uuid,
+	pub uuid: Uuid,
+	pub name: String,
+	pub parent: Uuid,
 
-	color: Option<String>, // todo use Color struct
-	created: Option<DateTime<Utc>>,
-	favorited: bool,
+	pub color: Option<String>, // todo use Color struct
+	pub created: Option<DateTime<Utc>>,
+	pub favorited: bool,
 }
 
 impl RemoteDirectory {
@@ -251,5 +251,11 @@ impl HasDirInfo for RemoteDirectory {
 impl HasRemoteInfo for RemoteDirectory {
 	fn favorited(&self) -> bool {
 		self.favorited
+	}
+}
+
+impl HasRemoteDirInfo for RemoteDirectory {
+	fn color(&self) -> Option<&str> {
+		self.color.as_deref()
 	}
 }
