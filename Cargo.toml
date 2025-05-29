@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["filen-sdk-rs","filen-types", "test-utils"]
+members = [ "filen-android-documents-provider", "filen-mobile-native-cache","filen-sdk-rs","filen-types", "filen-sdk-rs-macros", "test-utils", "uniffi-bindgen"]
 
 [profile.test]
 opt-level = 3

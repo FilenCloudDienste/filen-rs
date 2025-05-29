@@ -1,0 +1,38 @@
+[package]
+name = "filen-mobile-native-cache"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio", "filen-sdk-rs-macros/tokio"]
+
+[dependencies]
+anyhow = "1.0.98"
+filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs" }
+futures = "0.3.31"
+uniffi = { version = "0.29.2", features = [ "cli" ] }
+libsqlite3-sys = { version = "0.34", features = ["bundled"] }
+uuid = "1.17.0"
+chrono = { version = "0.4.41", features = ["serde"] }
+filen-sdk-rs-macros = { version = "0.1.0", path = "../filen-sdk-rs-macros" }
+env_logger = "0.11.8"
+rusqlite = { version = "0.36.0", features = ["bundled", "uuid"] }
+
+
+# Optional dependencies
+tokio = {version = "1.45.1", features = ["rt-multi-thread"], optional = true}
+log = "0.4.27"
+filen-types = { version = "0.1.0", path = "../filen-types" }
+[target.'cfg(target_os="android")'.dependencies]
+android_log = "0.1.3"
+
+[target.'cfg(not(target_os="android"))'.dependencies]
+env_logger = "0.11.8"
+
+[build-dependencies]
+uniffi = { version = "0.29.2", features = [ "build" ] }
+
+[dev-dependencies]
+tokio = { version = "1.45.1", features = ["full"] }
+test-utils = { path = "../test-utils" }

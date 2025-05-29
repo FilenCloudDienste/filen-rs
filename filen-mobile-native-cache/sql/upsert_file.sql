@@ -1,0 +1,35 @@
+INSERT INTO files (
+    id,
+    mime,
+    file_key,
+    created,
+    modified,
+    size,
+    chunks,
+    favorited,
+    region,
+    bucket,
+    hash
+) VALUES (
+    ?,
+    ?,
+    ?,
+    ?,
+    ?,
+    ?,
+    ?,
+    ?,
+    ?,
+    ?,
+    ?
+) ON CONFLICT (id) DO UPDATE SET
+mime = excluded.mime,
+file_key = excluded.file_key,
+created = excluded.created,
+modified = excluded.modified,
+size = excluded.size,
+chunks = excluded.chunks,
+favorited = excluded.favorited,
+region = excluded.region,
+bucket = excluded.bucket,
+hash = excluded.hash;
