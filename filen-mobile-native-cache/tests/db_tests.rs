@@ -74,7 +74,8 @@ pub async fn test_query_children() {
 	assert_eq!(resp.files.len(), 0);
 	assert_eq!(resp.parent.uuid, rss.dir.uuid().to_string());
 
-	rss.client
+	let dir = rss
+		.client
 		.create_dir(&rss.dir, "tmp".to_string())
 		.await
 		.unwrap();
@@ -98,4 +99,15 @@ pub async fn test_query_children() {
 	assert_eq!(resp.dirs[0].name, "tmp");
 	assert_eq!(resp.files[0].name, "file.txt");
 	assert_eq!(resp.files[0].size, file.size() as i64);
+
+	rss.client.trash_dir(&dir).await.unwrap();
+	db.update_dir_children(&client, &rss.dir.uuid().to_string())
+		.await
+		.unwrap();
+	let resp = db
+		.query_dir_children(&rss.dir.uuid().to_string())
+		.unwrap()
+		.unwrap();
+	assert_eq!(resp.dirs.len(), 0);
+	assert_eq!(resp.files.len(), 1);
 }

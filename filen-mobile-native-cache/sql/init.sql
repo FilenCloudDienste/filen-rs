@@ -3,6 +3,7 @@ CREATE TABLE items (
     uuid BLOB NOT NULL UNIQUE,
     parent BLOB NOT NULL,
     name TEXT NOT NULL,
+    is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
     type SMALLINT NOT NULL CHECK (type IN (0, 1, 2))
 );
 CREATE INDEX idx_items_uuid ON items (uuid);
@@ -14,6 +15,8 @@ CREATE TABLE roots (
     last_updated BIGINT NOT NULL DEFAULT 0,
     FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE
 );
+CREATE INDEX idx_stale_items ON items (parent)
+WHERE is_stale = TRUE;
 CREATE TABLE files (
     id BIGINT PRIMARY KEY NOT NULL,
     mime TEXT NOT NULL,
@@ -22,7 +25,7 @@ CREATE TABLE files (
     modified BIGINT NOT NULL,
     size BIGINT NOT NULL,
     chunks BIGINT NOT NULL,
-    favorited BOOLEAN NOT NULL CHECK (favorited IN (0, 1)),
+    favorited BOOLEAN NOT NULL CHECK (favorited IN (FALSE, TRUE)) DEFAULT FALSE,
     region TEXT NOT NULL,
     bucket TEXT NOT NULL,
     hash BLOB,
@@ -31,7 +34,7 @@ CREATE TABLE files (
 CREATE TABLE dirs (
     id BIGINT PRIMARY KEY NOT NULL,
     created BIGINT,
-    favorited BOOLEAN NOT NULL CHECK (favorited IN (0, 1)) DEFAULT 0,
+    favorited BOOLEAN NOT NULL CHECK (favorited IN (FALSE, TRUE)) DEFAULT FALSE,
     color TEXT,
     last_listed BIGINT NOT NULL DEFAULT 0,
     FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE

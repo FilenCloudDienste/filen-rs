@@ -227,14 +227,21 @@ pub(crate) fn select_dir_children(
 	Ok(Some((parent, dirs, files)))
 }
 
-pub fn upsert_items(
+pub fn update_children(
 	conn: &mut Connection,
+	parent_uuid: Uuid,
 	dirs: &[RemoteDirectory],
 	files: &[RemoteFile],
 ) -> Result<()> {
 	let tx = conn.transaction()?;
 	{
+		tx.execute(
+			include_str!("../../sql/mark_stale_with_parent.sql"),
+			[parent_uuid],
+		)?;
+
 		let mut stmt = tx.prepare(include_str!("../../sql/upsert_item.sql"))?;
+
 		let dir_ids = dirs
 			.iter()
 			.map(|dir| -> anyhow::Result<i64> {
@@ -248,6 +255,7 @@ pub fn upsert_items(
 			})
 			.collect::<Result<Vec<i64>>>()
 			.context("dir upsert_item")?;
+
 		let file_ids = files
 			.iter()
 			.map(|file| -> anyhow::Result<i64> {
@@ -300,6 +308,11 @@ pub fn upsert_items(
 				Ok(())
 			})
 			.context("upsert_file")?;
+
+		tx.execute(
+			include_str!("../../sql/delete_stale_with_parent.sql"),
+			[parent_uuid],
+		)?;
 	}
 	tx.commit()?;
 	Ok(())

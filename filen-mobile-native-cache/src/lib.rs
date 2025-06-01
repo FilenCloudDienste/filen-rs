@@ -113,7 +113,7 @@ impl FilenMobileDB {
 
 		let mut conn = self.conn();
 		sql::upsert_dir_last_listed(&mut conn, &parent).context("upsert_dir_last_listed")?;
-		sql::upsert_items(&mut conn, &dirs, &files).context("upsert_items")?;
+		sql::update_children(&mut conn, parent.uuid(), &dirs, &files).context("upsert_items")?;
 		Ok(())
 	}
 }
