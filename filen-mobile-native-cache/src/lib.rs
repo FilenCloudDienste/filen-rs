@@ -1,7 +1,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::Context;
-use ffi::{FfiDir, FfiFile, FfiRoot};
+use ffi::{FfiDir, FfiNonRootObject, FfiRoot};
 use filen_sdk_rs::fs::HasUUID;
 use futures::try_join;
 use rusqlite::Connection;
@@ -50,8 +50,7 @@ impl FilenMobileDB {
 
 #[derive(uniffi::Record)]
 pub struct QueryChildrenResponse {
-	pub files: Vec<FfiFile>,
-	pub dirs: Vec<FfiDir>,
+	pub objects: Vec<FfiNonRootObject>,
 	pub parent: FfiDir,
 }
 
@@ -78,17 +77,15 @@ impl FilenMobileDB {
 		Ok(())
 	}
 
-	pub fn query_dir_children(&self, dir_uuid: &str) -> Result<Option<QueryChildrenResponse>> {
+	pub fn query_dir_children(
+		&self,
+		dir_uuid: &str,
+		order_by: Option<String>,
+	) -> Result<Option<QueryChildrenResponse>> {
 		let dir_uuid = Uuid::parse_str(dir_uuid)?;
 		let conn = self.conn();
-		let maybe_info = sql::select_dir_children(&conn, dir_uuid)?;
-		Ok(
-			maybe_info.map(|(parent, dirs, files)| QueryChildrenResponse {
-				parent,
-				dirs,
-				files,
-			}),
-		)
+		let maybe_info = sql::select_dir_children(&conn, dir_uuid, order_by.as_deref())?;
+		Ok(maybe_info.map(|(parent, objects)| QueryChildrenResponse { parent, objects }))
 	}
 }
 

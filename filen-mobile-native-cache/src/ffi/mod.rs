@@ -46,6 +46,7 @@ pub enum FfiObject {
 	Root(FfiRoot),
 }
 
+#[derive(uniffi::Enum, PartialEq, Eq, Debug, Clone)]
 pub enum FfiNonRootObject {
 	File(FfiFile),
 	Dir(FfiDir),

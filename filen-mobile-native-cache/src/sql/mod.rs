@@ -13,7 +13,7 @@ use rusqlite::{
 };
 use uuid::Uuid;
 
-use crate::ffi::{FfiDir, FfiFile, FfiRoot};
+use crate::ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiRoot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
@@ -160,71 +160,105 @@ pub(crate) fn update_root(
 	Ok(())
 }
 
+fn convert_order_by(order_by: &str) -> &'static str {
+	if order_by.contains("display_name") {
+		if order_by.contains("ASC") {
+			return "ORDER BY items.name ASC";
+		} else if order_by.contains("DESC") {
+			return "ORDER BY items.name DESC";
+		}
+	} else if order_by.contains("last_modified") {
+		if order_by.contains("ASC") {
+			return "ORDER BY files.modified + 0 ASC";
+		} else if order_by.contains("DESC") {
+			return "ORDER BY files.modified + 0 DESC";
+		}
+	} else if order_by.contains("size") {
+		if order_by.contains("ASC") {
+			return "ORDER BY files.size + 0 ASC";
+		} else if order_by.contains("DESC") {
+			return "ORDER BY files.size + 0 DESC";
+		}
+	}
+	"ORDER BY items.name ASC"
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) fn select_dir_children(
 	conn: &Connection,
 	parent_uuid: Uuid,
-) -> Result<Option<(FfiDir, Vec<FfiDir>, Vec<FfiFile>)>> {
+	order_by: Option<&str>,
+) -> Result<Option<(FfiDir, Vec<FfiNonRootObject>)>> {
+	let order_by = match order_by {
+		Some(order_by) => convert_order_by(order_by),
+		_ => "ORDER BY items.name ASC",
+	};
+
 	let parent = get_dir_item(conn, parent_uuid).context("get_dir_item")?;
 	let parent = match parent {
 		Some(parent) => parent,
 		None => return Ok(None),
 	};
 
-	let mut stmt = conn
-		.prepare(include_str!("../../sql/select_dir_dir_children.sql"))
-		.context("select_dir_dir_children")?;
-	let dirs = stmt
+	let select_query = format!(
+		"{} {}",
+		include_str!("../../sql/select_dir_children.sql"),
+		order_by
+	);
+
+	let mut stmt = conn.prepare(&select_query).context("select_dir_children")?;
+
+	let objects = stmt
 		.query_and_then([parent_uuid], |row| {
 			let uuid: Uuid = row.get(0)?;
 			let name: String = row.get(1)?;
-			let created: Option<i64> = row.get(2)?;
-			let favorited: bool = row.get(3)?;
-			let color: Option<String> = row.get(4)?;
-			let last_listed: i64 = row.get(5)?;
-			Ok(FfiDir {
-				uuid: uuid.to_string(),
-				name,
-				parent: parent.uuid.clone(),
-				color,
-				created,
-				favorited,
-				last_listed,
-			})
+			let item_type: ItemType = row.get(2)?;
+
+			match item_type {
+				ItemType::Dir => {
+					let created: Option<i64> = row.get(3)?;
+					let favorited: bool = row.get(4)?;
+					let color: Option<String> = row.get(5)?;
+					let last_listed: i64 = row.get(6)?;
+					Ok(FfiNonRootObject::Dir(FfiDir {
+						uuid: uuid.to_string(),
+						name,
+						parent: parent.uuid.clone(),
+						color,
+						created,
+						favorited,
+						last_listed,
+					}))
+				}
+				ItemType::File => {
+					let mime: String = row.get(7)?;
+					let created: i64 = row.get(8)?;
+					let modified: i64 = row.get(9)?;
+					let size: i64 = row.get(10)?;
+					let chunks: i64 = row.get(11)?;
+					let favorited: bool = row.get(12)?;
+
+					Ok(FfiNonRootObject::File(FfiFile {
+						uuid: uuid.to_string(),
+						name,
+						parent: parent.uuid.clone(),
+						mime,
+						created,
+						modified,
+						size,
+						chunks,
+						favorited,
+					}))
+				}
+				ItemType::Root => {
+					unreachable!("Root items should not be returned in select_dir_children")
+				}
+			}
 		})?
 		.collect::<Result<Vec<_>>>()
-		.context("query select_dir_dir_children")?;
+		.context("query select_dir_children")?;
 
-	let mut stmt = conn
-		.prepare(include_str!("../../sql/select_dir_file_children.sql"))
-		.context("select_dir_file_children")?;
-	let files = stmt
-		.query_and_then([parent_uuid], |row| {
-			let uuid: Uuid = row.get(0)?;
-			let name: String = row.get(1)?;
-			let mime: String = row.get(2)?;
-			let created: i64 = row.get(3)?;
-			let modified: i64 = row.get(4)?;
-			let size: i64 = row.get(5)?;
-			let chunks: i64 = row.get(6)?;
-			let favorited: bool = row.get(7)?;
-
-			Ok(FfiFile {
-				uuid: uuid.to_string(),
-				name,
-				parent: parent.uuid.clone(),
-				mime,
-				created,
-				modified,
-				size,
-				chunks,
-				favorited,
-			})
-		})?
-		.collect::<Result<Vec<_>>>()
-		.context("query select_dir_file_children")?;
-
-	Ok(Some((parent, dirs, files)))
+	Ok(Some((parent, objects)))
 }
 
 pub fn update_children(

@@ -1,5 +1,5 @@
-use filen_mobile_native_cache::{CacheClient, FilenMobileDB};
-use filen_sdk_rs::fs::{HasUUID, file::traits::HasFileInfo};
+use filen_mobile_native_cache::{CacheClient, FilenMobileDB, ffi::FfiNonRootObject};
+use filen_sdk_rs::fs::HasUUID;
 use futures::AsyncWriteExt;
 use test_utils::TestResources;
 
@@ -57,7 +57,9 @@ pub async fn test_query_root() {
 pub async fn test_query_children() {
 	let (db, client, rss) = get_db_resources().await;
 
-	let resp = db.query_dir_children(&rss.dir.uuid().to_string()).unwrap();
+	let resp = db
+		.query_dir_children(&rss.dir.uuid().to_string(), None)
+		.unwrap();
 	// should be none because we haven't updated the children yet
 	assert!(resp.is_none());
 
@@ -66,12 +68,11 @@ pub async fn test_query_children() {
 		.unwrap();
 
 	let resp = db
-		.query_dir_children(&rss.dir.uuid().to_string())
+		.query_dir_children(&rss.dir.uuid().to_string(), None)
 		.unwrap()
 		.unwrap();
 	// should be empty because we haven't created any children yet
-	assert_eq!(resp.dirs.len(), 0);
-	assert_eq!(resp.files.len(), 0);
+	assert_eq!(resp.objects.len(), 0);
 	assert_eq!(resp.parent.uuid, rss.dir.uuid().to_string());
 
 	let dir = rss
@@ -90,24 +91,77 @@ pub async fn test_query_children() {
 		.await
 		.unwrap();
 	let resp = db
-		.query_dir_children(&rss.dir.uuid().to_string())
+		.query_dir_children(&rss.dir.uuid().to_string(), None)
 		.unwrap()
 		.unwrap();
-	assert_eq!(resp.dirs.len(), 1);
-	assert_eq!(resp.files.len(), 1);
+	assert_eq!(resp.objects.len(), 2);
 	assert_eq!(resp.parent.uuid, rss.dir.uuid().to_string());
-	assert_eq!(resp.dirs[0].name, "tmp");
-	assert_eq!(resp.files[0].name, "file.txt");
-	assert_eq!(resp.files[0].size, file.size() as i64);
+	println!("{:?}", resp.objects);
+	assert!(matches!(
+		&resp.objects[0],
+		FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()
+	));
+	assert!(matches!(
+		&resp.objects[1],
+		FfiNonRootObject::Dir(d) if d.uuid == dir.uuid().to_string()
+	));
+
+	let other_file = rss.client.make_file_builder("other.txt", &rss.dir).build();
+	let mut writer = rss.client.get_file_writer(other_file);
+	writer.close().await.unwrap();
+	let other_file = writer.into_remote_file().unwrap();
+	db.update_dir_children(&client, &rss.dir.uuid().to_string())
+		.await
+		.unwrap();
+
+	let resp = db
+		.query_dir_children(&rss.dir.uuid().to_string(), Some("size ASC".to_string()))
+		.unwrap()
+		.unwrap();
+	assert_eq!(resp.objects.len(), 3);
+	assert!(matches!(
+		&resp.objects[2],
+		FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()
+	));
+
+	let resp = db
+		.query_dir_children(&rss.dir.uuid().to_string(), Some("size DESC".to_string()))
+		.unwrap()
+		.unwrap();
+	assert_eq!(resp.objects.len(), 3);
+	assert!(matches!(
+		&resp.objects[0],
+		FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()
+	));
+
+	let resp = db
+		.query_dir_children(
+			&rss.dir.uuid().to_string(),
+			Some("display_name ASC".to_string()),
+		)
+		.unwrap()
+		.unwrap();
+	assert_eq!(resp.objects.len(), 3);
+	assert!(matches!(
+		&resp.objects[0],
+		FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()
+	));
+	assert!(matches!(
+		&resp.objects[1],
+		FfiNonRootObject::File(f) if f.uuid == other_file.uuid().to_string()
+	));
+	assert!(matches!(
+		&resp.objects[2],
+		FfiNonRootObject::Dir(d) if d.uuid == dir.uuid().to_string()
+	));
 
 	rss.client.trash_dir(&dir).await.unwrap();
 	db.update_dir_children(&client, &rss.dir.uuid().to_string())
 		.await
 		.unwrap();
 	let resp = db
-		.query_dir_children(&rss.dir.uuid().to_string())
+		.query_dir_children(&rss.dir.uuid().to_string(), None)
 		.unwrap()
 		.unwrap();
-	assert_eq!(resp.dirs.len(), 0);
-	assert_eq!(resp.files.len(), 1);
+	assert_eq!(resp.objects.len(), 2);
 }
