@@ -1,8 +1,11 @@
-use std::sync::{Mutex, MutexGuard};
+use std::{
+	str::FromStr,
+	sync::{Mutex, MutexGuard},
+};
 
 use anyhow::Context;
-use ffi::{FfiDir, FfiNonRootObject, FfiObject, FfiRoot};
-use filen_sdk_rs::fs::HasUUID;
+use ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiObject, FfiRoot};
+use filen_sdk_rs::fs::{HasUUID, file::traits::HasRemoteFileInfo};
 use futures::try_join;
 use rusqlite::Connection;
 use sql::update_root;
@@ -11,6 +14,7 @@ use uuid::Uuid;
 uniffi::setup_scaffolding!();
 
 pub mod ffi;
+pub mod io;
 pub mod sql;
 pub mod tokio;
 
@@ -58,7 +62,10 @@ pub struct QueryChildrenResponse {
 impl FilenMobileDB {
 	pub fn query_roots_info(&self, root_uuid_str: String) -> Result<Option<FfiRoot>> {
 		let conn = self.conn();
-		Ok(sql::select_root_item(&conn, root_uuid_str)?)
+		Ok(sql::select_ffi_root(
+			&conn,
+			Uuid::from_str(&root_uuid_str)?,
+		)?)
 	}
 
 	#[uniffi::constructor]
@@ -91,8 +98,14 @@ impl FilenMobileDB {
 	pub fn query_item(&self, uuid: &str) -> Result<Option<FfiObject>> {
 		let uuid = Uuid::parse_str(uuid)?;
 		let conn = self.conn();
-		Ok(sql::select_item(&conn, uuid)?)
+		Ok(sql::select_object(&conn, uuid)?)
 	}
+}
+
+#[derive(uniffi::Record)]
+pub struct DownloadResponse {
+	pub path: String,
+	pub file: FfiFile,
 }
 
 #[filen_sdk_rs_macros::create_uniffi_wrapper]
@@ -118,6 +131,49 @@ impl FilenMobileDB {
 		sql::upsert_dir_last_listed(&mut conn, &parent).context("upsert_dir_last_listed")?;
 		sql::update_children(&mut conn, parent.uuid(), &dirs, &files).context("upsert_items")?;
 		Ok(())
+	}
+
+	pub async fn download_file(&self, client: &CacheClient, file_uuid: &str) -> Result<String> {
+		let file_uuid = Uuid::parse_str(file_uuid)?;
+		let file = {
+			let conn = self.conn();
+			let file = sql::select_remote_file(&conn, file_uuid)?;
+			// check remote first?
+			file.ok_or_else(|| {
+				Error::Anyhow(anyhow::anyhow!("File with UUID {} not found", file_uuid))
+			})?
+		};
+		let path = io::download_file(&client.client, &file)
+			.await?
+			.into_os_string()
+			.into_string()
+			.map_err(|e| {
+				Error::Anyhow(anyhow::anyhow!("Failed to convert path to string: {:?}", e))
+			})?;
+		Ok(path)
+	}
+
+	pub async fn maybe_upload_file(&self, client: &CacheClient, file_uuid: &str) -> Result<bool> {
+		let file_uuid = Uuid::parse_str(file_uuid)?;
+		let file = {
+			let conn = self.conn();
+			sql::select_remote_file(&conn, file_uuid)?.ok_or_else(|| {
+				Error::Anyhow(anyhow::anyhow!("File with UUID {} not found", file_uuid))
+			})?
+		};
+
+		if let Some(hash) = file.hash() {
+			let local_hash = io::hash_local_file(&file).await?;
+			if local_hash == hash {
+				return Ok(false);
+			}
+		}
+
+		let file = io::upload_file(&client.client, file).await?;
+
+		let mut conn = self.conn();
+		sql::update_file(&mut conn, file_uuid, &file)?;
+		Ok(true)
 	}
 }
 

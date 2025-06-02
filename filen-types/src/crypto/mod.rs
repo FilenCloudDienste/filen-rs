@@ -56,6 +56,12 @@ impl From<Sha512Hash> for [u8; 64] {
 	}
 }
 
+impl From<[u8; 64]> for Sha512Hash {
+	fn from(hash: [u8; 64]) -> Self {
+		Self(digest::Output::<Sha512>::from(hash))
+	}
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sha256Hash(#[serde(with = "faster_hex::nopfx_ignorecase")] digest::Output<sha2::Sha256>);
 impl From<digest::Output<sha2::Sha256>> for Sha256Hash {

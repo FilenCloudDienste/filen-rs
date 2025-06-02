@@ -24,6 +24,8 @@ rusqlite = { version = "0.36.0", features = ["bundled", "uuid"] }
 tokio = {version = "1.45.1", features = ["rt-multi-thread"], optional = true}
 log = "0.4.27"
 filen-types = { version = "0.1.0", path = "../filen-types" }
+tokio-util = { version = "0.7.15", features = ["compat"] }
+sha2 = "0.10.9"
 [target.'cfg(target_os="android")'.dependencies]
 android_log = "0.1.3"
 

@@ -177,6 +177,12 @@ impl BaseFile {
 	}
 }
 
+impl From<RemoteFile> for BaseFile {
+	fn from(file: RemoteFile) -> Self {
+		file.file
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
 	pub file: BaseFile,
@@ -212,6 +218,46 @@ impl RemoteFile {
 	}
 	pub fn inner_file(&self) -> &BaseFile {
 		&self.file
+	}
+}
+
+pub struct FlatRemoteFile {
+	pub uuid: Uuid,
+	pub parent: Uuid,
+	pub name: String,
+	pub mime: String,
+	pub key: FileKey,
+	pub created: DateTime<Utc>,
+	pub modified: DateTime<Utc>,
+	pub size: u64,
+	pub chunks: u64,
+	pub favorited: bool,
+	pub region: String,
+	pub bucket: String,
+	pub hash: Option<Sha512Hash>,
+}
+
+impl From<FlatRemoteFile> for RemoteFile {
+	fn from(file: FlatRemoteFile) -> Self {
+		Self {
+			file: BaseFile {
+				root: RootFile {
+					uuid: file.uuid,
+					name: file.name,
+					mime: file.mime,
+					key: file.key,
+					created: file.created,
+					modified: file.modified,
+				},
+				parent: file.parent,
+			},
+			size: file.size,
+			favorited: file.favorited,
+			region: file.region,
+			bucket: file.bucket,
+			chunks: file.chunks,
+			hash: file.hash,
+		}
 	}
 }
 

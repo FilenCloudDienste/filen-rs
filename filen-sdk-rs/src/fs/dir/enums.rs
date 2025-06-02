@@ -33,6 +33,22 @@ impl HasType for DirectoryType<'_> {
 	}
 }
 
+impl From<RootDirectory> for DirectoryType<'static> {
+	fn from(dir: RootDirectory) -> Self {
+		DirectoryType::Root(Cow::Owned(dir))
+	}
+}
+impl From<RootDirectoryWithMeta> for DirectoryType<'static> {
+	fn from(dir: RootDirectoryWithMeta) -> Self {
+		DirectoryType::RootWithMeta(Cow::Owned(dir))
+	}
+}
+impl From<RemoteDirectory> for DirectoryType<'static> {
+	fn from(dir: RemoteDirectory) -> Self {
+		DirectoryType::Dir(Cow::Owned(dir))
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectoryMetaType<'a> {
 	Root(Cow<'a, RootDirectoryWithMeta>),
