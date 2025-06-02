@@ -13,7 +13,7 @@ use rusqlite::{
 };
 use uuid::Uuid;
 
-use crate::ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiRoot};
+use crate::ffi::{FfiDir, FfiNonRootObject, FfiObject, FfiRoot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
@@ -125,19 +125,7 @@ pub(crate) fn get_dir_item(conn: &Connection, dir_uuid: Uuid) -> Result<Option<F
 		.prepare("SELECT created, favorited, color, last_listed FROM dirs WHERE id = ? LIMIT 1;")?;
 	let dir = stmt
 		.query_one((id,), |row| {
-			let created: Option<i64> = row.get(0)?;
-			let favorited: bool = row.get(1)?;
-			let color: Option<String> = row.get(2)?;
-			let last_listed: i64 = row.get(3)?;
-			Ok(FfiDir {
-				uuid: dir_uuid.to_string(),
-				name,
-				parent: parent.to_string(),
-				color,
-				created,
-				favorited,
-				last_listed,
-			})
+			FfiDir::from_row(row, 0, dir_uuid.to_string(), parent.to_string(), name)
 		})
 		.context("select dir from dir_uuid")?;
 
@@ -209,53 +197,8 @@ pub(crate) fn select_dir_children(
 	let mut stmt = conn.prepare(&select_query).context("select_dir_children")?;
 
 	let objects = stmt
-		.query_and_then([parent_uuid], |row| {
-			let uuid: Uuid = row.get(0)?;
-			let name: String = row.get(1)?;
-			let item_type: ItemType = row.get(2)?;
-
-			match item_type {
-				ItemType::Dir => {
-					let created: Option<i64> = row.get(3)?;
-					let favorited: bool = row.get(4)?;
-					let color: Option<String> = row.get(5)?;
-					let last_listed: i64 = row.get(6)?;
-					Ok(FfiNonRootObject::Dir(FfiDir {
-						uuid: uuid.to_string(),
-						name,
-						parent: parent.uuid.clone(),
-						color,
-						created,
-						favorited,
-						last_listed,
-					}))
-				}
-				ItemType::File => {
-					let mime: String = row.get(7)?;
-					let created: i64 = row.get(8)?;
-					let modified: i64 = row.get(9)?;
-					let size: i64 = row.get(10)?;
-					let chunks: i64 = row.get(11)?;
-					let favorited: bool = row.get(12)?;
-
-					Ok(FfiNonRootObject::File(FfiFile {
-						uuid: uuid.to_string(),
-						name,
-						parent: parent.uuid.clone(),
-						mime,
-						created,
-						modified,
-						size,
-						chunks,
-						favorited,
-					}))
-				}
-				ItemType::Root => {
-					unreachable!("Root items should not be returned in select_dir_children")
-				}
-			}
-		})?
-		.collect::<Result<Vec<_>>>()
+		.query_and_then([parent_uuid], FfiNonRootObject::from_row)?
+		.collect::<rusqlite::Result<Vec<_>>>()
 		.context("query select_dir_children")?;
 
 	Ok(Some((parent, objects)))
@@ -385,4 +328,10 @@ pub fn upsert_dir_last_listed(conn: &mut Connection, dir: &RemoteDirectory) -> R
 	)?;
 	tx.commit()?;
 	Ok(())
+}
+
+pub fn select_item(conn: &Connection, uuid: Uuid) -> Result<Option<FfiObject>> {
+	let mut stmt = conn.prepare(include_str!("../../sql/select_item.sql"))?;
+	let maybe_item = stmt.query_one([uuid], FfiObject::from_row).optional()?;
+	Ok(maybe_item)
 }

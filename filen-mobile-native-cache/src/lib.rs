@@ -1,7 +1,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::Context;
-use ffi::{FfiDir, FfiNonRootObject, FfiRoot};
+use ffi::{FfiDir, FfiNonRootObject, FfiObject, FfiRoot};
 use filen_sdk_rs::fs::HasUUID;
 use futures::try_join;
 use rusqlite::Connection;
@@ -86,6 +86,12 @@ impl FilenMobileDB {
 		let conn = self.conn();
 		let maybe_info = sql::select_dir_children(&conn, dir_uuid, order_by.as_deref())?;
 		Ok(maybe_info.map(|(parent, objects)| QueryChildrenResponse { parent, objects }))
+	}
+
+	pub fn query_item(&self, uuid: &str) -> Result<Option<FfiObject>> {
+		let uuid = Uuid::parse_str(uuid)?;
+		let conn = self.conn();
+		Ok(sql::select_item(&conn, uuid)?)
 	}
 }
 

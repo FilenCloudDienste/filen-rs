@@ -3,8 +3,8 @@ CREATE TABLE items (
     uuid BLOB NOT NULL UNIQUE,
     parent BLOB NOT NULL,
     name TEXT NOT NULL,
-    is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
-    type SMALLINT NOT NULL CHECK (type IN (0, 1, 2))
+    type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
+    is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE
 );
 CREATE INDEX idx_items_uuid ON items (uuid);
 CREATE INDEX idx_items_parent ON items (parent);

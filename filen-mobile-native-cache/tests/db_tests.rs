@@ -1,4 +1,7 @@
-use filen_mobile_native_cache::{CacheClient, FilenMobileDB, ffi::FfiNonRootObject};
+use filen_mobile_native_cache::{
+	CacheClient, FilenMobileDB,
+	ffi::{FfiNonRootObject, FfiObject, FfiRoot},
+};
 use filen_sdk_rs::fs::HasUUID;
 use futures::AsyncWriteExt;
 use test_utils::TestResources;
@@ -164,4 +167,48 @@ pub async fn test_query_children() {
 		.unwrap()
 		.unwrap();
 	assert_eq!(resp.objects.len(), 2);
+}
+
+pub async fn test_query_item() {
+	let (db, client, rss) = get_db_resources().await;
+
+	let dir = rss
+		.client
+		.create_dir(&rss.dir, "tmp".to_string())
+		.await
+		.unwrap();
+
+	let file = rss.client.make_file_builder("file.txt", &rss.dir).build();
+	let mut file = rss.client.get_file_writer(file);
+	file.write_all(b"Hello, world!").await.unwrap();
+	file.close().await.unwrap();
+	let file = file.into_remote_file().unwrap();
+
+	assert_eq!(db.query_item(&file.uuid().to_string()).unwrap(), None);
+
+	db.update_dir_children(&client, &rss.dir.uuid().to_string())
+		.await
+		.unwrap();
+
+	assert_eq!(
+		db.query_item(&file.uuid().to_string()).unwrap(),
+		Some(FfiObject::File((&file).into()))
+	);
+
+	assert_eq!(
+		db.query_item(&dir.uuid().to_string()).unwrap(),
+		Some(FfiObject::Dir((&dir).into()))
+	);
+
+	assert_eq!(
+		db.query_item(&rss.client.root().uuid().to_string())
+			.unwrap(),
+		Some(FfiObject::Root(FfiRoot {
+			uuid: rss.client.root().uuid().to_string(),
+			max_storage: 0,
+			storage_used: 0,
+			last_updated: 0,
+			last_listed: 0,
+		}))
+	);
 }
