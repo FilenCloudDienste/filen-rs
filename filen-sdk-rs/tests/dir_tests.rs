@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	crypto::shared::generate_random_base64_values,
-	fs::{FSObject, HasName, HasUUID, NonRootFSObject, dir::traits::HasDirMeta},
+	fs::{
+		FSObject, HasName, HasUUID, NonRootFSObject, UnsharedFSObject,
+		dir::{UnsharedDirectoryType, traits::HasDirMeta},
+	},
 };
 use tokio::time;
 
@@ -53,6 +56,46 @@ async fn find_at_path() {
 			.unwrap(),
 		None
 	);
+
+	let items = client
+		.get_items_in_path(&format!("{}/a/b/c", test_dir.name()))
+		.await
+		.unwrap();
+
+	assert_eq!(items.0.len(), 4);
+	assert!(
+		items
+			.0
+			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_a)))
+	);
+	assert!(
+		items
+			.0
+			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_b)))
+	);
+	assert!(
+		!items
+			.0
+			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_c)))
+	);
+	assert_eq!(items.1, Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir_c))));
+
+	let items = client
+		.get_items_in_path_starting_at("b/c", UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_a)))
+		.await
+		.unwrap();
+	assert_eq!(items.0.len(), 2);
+	assert!(
+		items
+			.0
+			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_a)))
+	);
+	assert!(
+		items
+			.0
+			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_b)))
+	);
+	assert_eq!(items.1, Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir_c))));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

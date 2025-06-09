@@ -1,3 +1,4 @@
+use filen_types::fs::ObjectType;
 use thiserror::Error;
 
 // todo improve error management
@@ -21,6 +22,8 @@ pub enum Error {
 	ChunkTooLarge { expected: usize, actual: usize },
 	#[error("The struct was in an invalid state: `{0}`, expected: `{1}`")]
 	InvalidState(String, String),
+	#[error("Invalid type: `{0:?}`, expected: `{1:?}`")]
+	InvalidType(ObjectType, ObjectType),
 }
 
 pub trait ErrorExt<T, E> {

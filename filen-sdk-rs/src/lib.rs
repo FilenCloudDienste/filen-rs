@@ -10,3 +10,4 @@ pub mod fs;
 pub mod search;
 pub mod sync;
 pub mod user;
+pub mod util;
