@@ -9,9 +9,8 @@ INSERT INTO items (
     ?,
     ?
 )
-ON CONFLICT (uuid) DO UPDATE SET
-parent = excluded.parent,
-name = excluded.name,
+ON CONFLICT (name, parent, is_stale) DO UPDATE SET
+uuid = excluded.uuid,
 type = excluded.type,
 is_stale = FALSE
 RETURNING id;

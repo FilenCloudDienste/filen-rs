@@ -2,10 +2,8 @@ INSERT INTO dirs (
     id,
     created,
     favorited,
-    color,
-    last_listed
+    color
 ) VALUES (
-    ?,
     ?,
     ?,
     ?,
@@ -13,4 +11,5 @@ INSERT INTO dirs (
 ) ON CONFLICT (id) DO UPDATE SET
 created = excluded.created,
 favorited = excluded.favorited,
-color = excluded.color;
+color = excluded.color
+RETURNING last_listed;

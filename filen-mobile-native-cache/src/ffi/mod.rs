@@ -1,10 +1,7 @@
-use filen_sdk_rs::fs::{
-	HasName, HasParent, HasRemoteInfo, HasUUID,
-	dir::{RemoteDirectory, traits::HasRemoteDirInfo},
-	file::{RemoteFile, traits::HasFileInfo},
+use crate::{
+	DBDir, DBFile, DBObject,
+	sql::{DBDirObject, DBNonRootObject, DBRoot},
 };
-
-use crate::sql::ItemType;
 
 #[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
 pub struct FfiFile {
@@ -18,44 +15,20 @@ pub struct FfiFile {
 	pub created: i64,
 	pub modified: i64,
 	pub size: i64,
-	pub chunks: i64,
 	pub favorited: bool,
 }
 
-impl FfiFile {
-	pub(crate) fn from_row(
-		row: &rusqlite::Row,
-		starting_idx: usize,
-		uuid: String,
-		parent: String,
-		name: String,
-	) -> Result<Self, rusqlite::Error> {
-		Ok(FfiFile {
-			uuid,
-			parent,
-			name,
-			mime: row.get(starting_idx)?,
-			created: row.get(starting_idx + 1)?,
-			modified: row.get(starting_idx + 2)?,
-			size: row.get(starting_idx + 3)?,
-			chunks: row.get(starting_idx + 4)?,
-			favorited: row.get(starting_idx + 5)?,
-		})
-	}
-}
-
-impl From<&RemoteFile> for FfiFile {
-	fn from(file: &RemoteFile) -> Self {
+impl From<DBFile> for FfiFile {
+	fn from(file: DBFile) -> Self {
 		FfiFile {
-			uuid: file.uuid().to_string(),
-			parent: file.parent().to_string(),
-			name: file.name().to_string(),
-			mime: file.mime().to_string(),
-			created: file.created().timestamp_millis(),
-			modified: file.last_modified().timestamp_millis(),
-			size: file.size() as i64,
-			chunks: file.chunks() as i64,
-			favorited: file.favorited(),
+			uuid: file.uuid.to_string(),
+			parent: file.parent.to_string(),
+			name: file.name,
+			mime: file.mime,
+			created: file.created,
+			modified: file.modified,
+			size: file.size,
+			favorited: file.favorited,
 		}
 	}
 }
@@ -76,36 +49,33 @@ pub struct FfiDir {
 	pub last_listed: i64,
 }
 
-impl FfiDir {
-	pub(crate) fn from_row(
-		row: &rusqlite::Row,
-		starting_idx: usize,
-		uuid: String,
-		parent: String,
-		name: String,
-	) -> Result<Self, rusqlite::Error> {
-		Ok(FfiDir {
-			uuid,
-			parent,
-			name,
-			color: row.get(starting_idx)?,
-			created: row.get(starting_idx + 1)?,
-			favorited: row.get(starting_idx + 2)?,
-			last_listed: row.get(starting_idx + 3)?,
-		})
+impl From<DBDir> for FfiDir {
+	fn from(dir: DBDir) -> Self {
+		FfiDir {
+			uuid: dir.uuid.to_string(),
+			parent: dir.parent.to_string(),
+			name: dir.name,
+			color: dir.color,
+			created: dir.created,
+			favorited: dir.favorited,
+			last_listed: dir.last_listed,
+		}
 	}
 }
 
-impl From<&RemoteDirectory> for FfiDir {
-	fn from(dir: &RemoteDirectory) -> Self {
-		FfiDir {
-			uuid: dir.uuid().to_string(),
-			parent: dir.parent().to_string(),
-			name: dir.name().to_string(),
-			color: dir.color().map(|c| c.to_string()),
-			created: dir.created().map(|t| t.timestamp_millis()),
-			favorited: dir.favorited(),
-			last_listed: 0,
+impl From<DBDirObject> for FfiDir {
+	fn from(dir: DBDirObject) -> Self {
+		match dir {
+			DBDirObject::Dir(dir) => dir.into(),
+			DBDirObject::Root(root) => FfiDir {
+				uuid: root.uuid.to_string(),
+				parent: String::new(),
+				name: String::new(),
+				color: None,
+				created: None,
+				favorited: false,
+				last_listed: 0,
+			},
 		}
 	}
 }
@@ -119,19 +89,15 @@ pub struct FfiRoot {
 	pub last_listed: i64,
 }
 
-impl FfiRoot {
-	pub(crate) fn from_row(
-		row: &rusqlite::Row,
-		starting_idx: usize,
-		uuid: String,
-	) -> Result<Self, rusqlite::Error> {
-		Ok(FfiRoot {
-			uuid,
-			storage_used: row.get(starting_idx)?,
-			max_storage: row.get(starting_idx + 1)?,
-			last_updated: row.get(starting_idx + 2)?,
-			last_listed: row.get(starting_idx + 3)?,
-		})
+impl From<DBRoot> for FfiRoot {
+	fn from(root: DBRoot) -> Self {
+		FfiRoot {
+			uuid: root.uuid.to_string(),
+			storage_used: root.storage_used,
+			max_storage: root.max_storage,
+			last_updated: root.last_updated,
+			last_listed: root.last_listed,
+		}
 	}
 }
 
@@ -142,27 +108,12 @@ pub enum FfiObject {
 	Root(FfiRoot),
 }
 
-impl FfiObject {
-	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
-		let uuid: String = row.get(0)?;
-		let type_: ItemType = row.get(3)?;
-		match type_ {
-			ItemType::Dir => {
-				let parent: String = row.get(1)?;
-				let name: String = row.get(2)?;
-				let dir = FfiDir::from_row(row, 4, uuid, parent, name)?;
-				Ok(FfiObject::Dir(dir))
-			}
-			ItemType::File => {
-				let parent: String = row.get(1)?;
-				let name: String = row.get(2)?;
-				let file = FfiFile::from_row(row, 8, uuid, parent, name)?;
-				Ok(FfiObject::File(file))
-			}
-			ItemType::Root => {
-				let root = FfiRoot::from_row(row, 14, uuid)?;
-				Ok(FfiObject::Root(root))
-			}
+impl From<DBObject> for FfiObject {
+	fn from(obj: DBObject) -> Self {
+		match obj {
+			DBObject::File(file) => FfiObject::File(file.into()),
+			DBObject::Dir(dir) => FfiObject::Dir(dir.into()),
+			DBObject::Root(root) => FfiObject::Root(root.into()),
 		}
 	}
 }
@@ -173,24 +124,36 @@ pub enum FfiNonRootObject {
 	Dir(FfiDir),
 }
 
-impl FfiNonRootObject {
-	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
-		let uuid: String = row.get(0)?;
-		let type_: ItemType = row.get(3)?;
-		match type_ {
-			ItemType::Dir => {
-				let parent: String = row.get(1)?;
-				let name: String = row.get(2)?;
-				let dir = FfiDir::from_row(row, 4, uuid, parent, name)?;
-				Ok(FfiNonRootObject::Dir(dir))
-			}
-			ItemType::File => {
-				let parent: String = row.get(1)?;
-				let name: String = row.get(2)?;
-				let file = FfiFile::from_row(row, 8, uuid, parent, name)?;
-				Ok(FfiNonRootObject::File(file))
-			}
-			_ => Err(rusqlite::Error::InvalidQuery),
+impl From<DBNonRootObject> for FfiNonRootObject {
+	fn from(obj: DBNonRootObject) -> Self {
+		match obj {
+			DBNonRootObject::File(file) => FfiNonRootObject::File(file.into()),
+			DBNonRootObject::Dir(dir) => FfiNonRootObject::Dir(dir.into()),
 		}
 	}
 }
+
+#[derive(Clone)]
+pub struct PathWithRoot(pub String);
+
+impl From<String> for PathWithRoot {
+	fn from(path: String) -> Self {
+		PathWithRoot(path)
+	}
+}
+
+impl From<&str> for PathWithRoot {
+	fn from(path: &str) -> Self {
+		PathWithRoot(path.to_string())
+	}
+}
+
+impl std::fmt::Display for PathWithRoot {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
+
+uniffi::custom_type!(PathWithRoot, String, {
+	lower: |s| s.0,
+});

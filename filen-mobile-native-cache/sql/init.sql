@@ -1,11 +1,12 @@
 CREATE TABLE items (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     uuid BLOB NOT NULL UNIQUE,
-    parent BLOB NOT NULL,
+    parent BLOB,
     name TEXT NOT NULL,
     type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
     is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
-    UNIQUE (name, parent, is_stale)
+    UNIQUE (name, parent, is_stale),
+    FOREIGN KEY (parent) REFERENCES items (uuid) ON DELETE CASCADE
 );
 CREATE INDEX idx_items_uuid ON items (uuid);
 CREATE INDEX idx_items_parent ON items (parent);
@@ -40,3 +41,12 @@ CREATE TABLE dirs (
     last_listed BIGINT NOT NULL DEFAULT 0,
     FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE
 );
+
+CREATE TRIGGER cascade_on_update_uuid_delete_children
+AFTER UPDATE OF uuid ON items
+FOR EACH ROW
+WHEN old.uuid != new.uuid AND old.type != 2 -- Ensure it's not a file
+BEGIN
+DELETE FROM items
+WHERE parent = old.uuid;
+END;

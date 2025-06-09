@@ -165,6 +165,10 @@ impl BaseFile {
 		self.root.last_modified()
 	}
 
+	pub fn set_modified_now(&mut self) {
+		self.root.modified = Utc::now().round_subsecs(3);
+	}
+
 	fn from_meta(uuid: Uuid, parent: Uuid, meta: FileMeta<'_>) -> Self {
 		Self {
 			root: RootFile::from_meta(uuid, meta),
