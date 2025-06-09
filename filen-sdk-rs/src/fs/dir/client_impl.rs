@@ -13,6 +13,7 @@ use crate::{
 		enums::FSObject,
 		file::{RemoteFile, meta::FileMeta},
 	},
+	util::PathIteratorExt,
 };
 
 use super::{DirectoryMeta, DirectoryType, HasContents, RemoteDirectory, traits::SetDirMeta};
@@ -224,34 +225,35 @@ impl Client {
 		Ok(None)
 	}
 
-	pub async fn find_or_create_dir(&self, path: &str) -> Result<DirectoryType<'_>, Error> {
-		let mut curr_dir = DirectoryType::Root(Cow::Borrowed(self.root()));
-		let mut curr_path = String::with_capacity(path.len());
-		for component in path.split('/') {
-			if component.is_empty() {
-				continue;
-			}
+	pub async fn find_or_create_dir_starting_at<'a>(
+		&self,
+		dir: DirectoryType<'a>,
+		path: &str,
+	) -> Result<DirectoryType<'a>, Error> {
+		let mut curr_dir = dir;
+		for (component, remaining_path) in path.path_iter() {
 			let (dirs, files) = self.list_dir(&curr_dir).await?;
 			if let Some(dir) = dirs.into_iter().find(|d| d.name() == component) {
 				curr_dir = DirectoryType::Dir(Cow::Owned(dir));
-				curr_path.push_str(component);
-				curr_path.push('/');
 				continue;
 			}
 
 			if files.iter().any(|f| f.name() == component) {
 				return Err(Error::Custom(format!(
 					"find_or_create_dir path {}/{} is a file when trying to create dir {}",
-					curr_path, component, path
+					remaining_path, component, path
 				)));
 			}
 
 			let new_dir = self.create_dir(&curr_dir, component.to_string()).await?;
 			curr_dir = DirectoryType::Dir(Cow::Owned(new_dir));
-			curr_path.push_str(component);
-			curr_path.push('/');
 		}
 		Ok(curr_dir)
+	}
+
+	pub async fn find_or_create_dir(&self, path: &str) -> Result<DirectoryType<'_>, Error> {
+		self.find_or_create_dir_starting_at(DirectoryType::Root(Cow::Borrowed(self.root())), path)
+			.await
 	}
 
 	// todo add overwriting

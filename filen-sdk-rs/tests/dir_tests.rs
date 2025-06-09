@@ -107,8 +107,20 @@ async fn find_or_create() {
 	let nested_dir = client.find_or_create_dir(&path).await.unwrap();
 
 	assert_eq!(
-		Some(Into::<FSObject<'_>>::into(nested_dir)),
+		Some(Into::<FSObject<'_>>::into(nested_dir.clone())),
 		client.find_item_at_path(&path).await.unwrap()
+	);
+
+	let nested_dir = client
+		.find_or_create_dir_starting_at(nested_dir, "d/e")
+		.await
+		.unwrap();
+	assert_eq!(
+		Some(Into::<FSObject<'_>>::into(nested_dir.clone())),
+		client
+			.find_item_at_path(&format!("{}/d/e", path))
+			.await
+			.unwrap()
 	);
 }
 
