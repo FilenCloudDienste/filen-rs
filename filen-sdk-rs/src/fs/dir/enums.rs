@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use filen_types::fs::ObjectType;
 
-use crate::fs::{HasMeta, HasName, HasRemoteInfo, HasType, HasUUID};
+use crate::fs::{HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, UnsharedFSObject};
 
 use super::{
 	HasContents, RemoteDirectory, RootDirectory, RootDirectoryWithMeta,
@@ -46,6 +46,58 @@ impl From<RootDirectoryWithMeta> for DirectoryType<'static> {
 impl From<RemoteDirectory> for DirectoryType<'static> {
 	fn from(dir: RemoteDirectory) -> Self {
 		DirectoryType::Dir(Cow::Owned(dir))
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnsharedDirectoryType<'a> {
+	Root(Cow<'a, RootDirectory>),
+	Dir(Cow<'a, RemoteDirectory>),
+}
+
+impl<'a> From<UnsharedDirectoryType<'a>> for DirectoryType<'a> {
+	fn from(dir: UnsharedDirectoryType<'a>) -> Self {
+		match dir {
+			UnsharedDirectoryType::Root(dir) => DirectoryType::Root(dir),
+			UnsharedDirectoryType::Dir(dir) => DirectoryType::Dir(dir),
+		}
+	}
+}
+
+impl HasUUID for UnsharedDirectoryType<'_> {
+	fn uuid(&self) -> uuid::Uuid {
+		match self {
+			UnsharedDirectoryType::Root(dir) => dir.uuid(),
+			UnsharedDirectoryType::Dir(dir) => dir.uuid(),
+		}
+	}
+}
+impl HasContents for UnsharedDirectoryType<'_> {}
+
+impl HasType for UnsharedDirectoryType<'_> {
+	fn object_type(&self) -> ObjectType {
+		ObjectType::Dir
+	}
+}
+
+impl<'a> From<UnsharedDirectoryType<'a>> for UnsharedFSObject<'a> {
+	fn from(dir: UnsharedDirectoryType<'a>) -> Self {
+		match dir {
+			UnsharedDirectoryType::Root(dir) => UnsharedFSObject::Root(dir),
+			UnsharedDirectoryType::Dir(dir) => UnsharedFSObject::Dir(dir),
+		}
+	}
+}
+
+impl From<RemoteDirectory> for UnsharedDirectoryType<'static> {
+	fn from(dir: RemoteDirectory) -> Self {
+		UnsharedDirectoryType::Dir(Cow::Owned(dir))
+	}
+}
+
+impl From<RootDirectory> for UnsharedDirectoryType<'static> {
+	fn from(dir: RootDirectory) -> Self {
+		UnsharedDirectoryType::Root(Cow::Owned(dir))
 	}
 }
 

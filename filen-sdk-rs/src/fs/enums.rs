@@ -10,6 +10,35 @@ use super::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsharedFSObject<'a> {
+	Dir(Cow<'a, RemoteDirectory>),
+	Root(Cow<'a, RootDirectory>),
+	File(Cow<'a, RemoteFile>),
+}
+
+impl<'a> From<UnsharedFSObject<'a>> for FSObject<'a> {
+	fn from(item: UnsharedFSObject<'a>) -> Self {
+		match item {
+			UnsharedFSObject::Dir(dir) => FSObject::Dir(dir),
+			UnsharedFSObject::Root(dir) => FSObject::Root(dir),
+			UnsharedFSObject::File(file) => FSObject::File(file),
+		}
+	}
+}
+
+impl From<RemoteFile> for UnsharedFSObject<'static> {
+	fn from(file: RemoteFile) -> Self {
+		UnsharedFSObject::File(Cow::Owned(file))
+	}
+}
+
+impl From<RemoteDirectory> for UnsharedFSObject<'static> {
+	fn from(dir: RemoteDirectory) -> Self {
+		UnsharedFSObject::Dir(Cow::Owned(dir))
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FSObject<'a> {
 	Dir(Cow<'a, RemoteDirectory>),
 	Root(Cow<'a, RootDirectory>),
