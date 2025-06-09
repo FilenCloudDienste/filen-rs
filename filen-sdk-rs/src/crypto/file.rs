@@ -1,7 +1,4 @@
-use std::{
-	fmt::{Debug, Display},
-	str::FromStr,
-};
+use std::{borrow::Cow, fmt::Debug, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,11 +10,11 @@ pub enum FileKey {
 	V3(v3::EncryptionKey),
 }
 
-impl Display for FileKey {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl FileKey {
+	pub fn to_str(&self) -> Cow<'_, str> {
 		match self {
-			FileKey::V2(key) => key.fmt(f),
-			FileKey::V3(key) => Display::fmt(&key, f),
+			FileKey::V2(key) => Cow::Borrowed(key.as_ref()),
+			FileKey::V3(key) => Cow::Owned(key.to_string()),
 		}
 	}
 }
@@ -80,5 +77,21 @@ impl DataCrypter for FileKey {
 			FileKey::V2(key) => key.decrypt_data(data),
 			FileKey::V3(key) => key.decrypt_data(data),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn stringify_file_key() {
+		assert!(FileKey::from_str("ab").is_err());
+		let a64 = "a".repeat(64);
+		let a32 = "a".repeat(32);
+		let v2 = FileKey::from_str(&a32).unwrap();
+		assert_eq!(v2.to_str(), a32);
+		let v3 = FileKey::from_str(&a64).unwrap();
+		assert_eq!(v3.to_str(), a64);
 	}
 }
