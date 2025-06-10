@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use anyhow::Result;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
@@ -15,7 +14,7 @@ use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesOrdered};
 use rusqlite::Connection;
 
 use crate::{
-	DBDirTrait, FilenMobileDB, PathValues,
+	CacheError, DBDirTrait, FilenMobileDB, PathValues,
 	sql::{self, DBDir, DBDirObject, DBFile, DBObject, DBRoot},
 };
 
@@ -87,7 +86,7 @@ fn get_required_update_futures<'a, 'b>(
 	objects: Vec<(DBObject, &'b str)>,
 	all: bool,
 	client: &'a Client,
-) -> Result<FuturesOrdered<BoxFuture<'a, (LocalRemoteComparison<'a>, &'b str)>>>
+) -> Result<FuturesOrdered<BoxFuture<'a, (LocalRemoteComparison<'a>, &'b str)>>, CacheError>
 where
 	'b: 'a,
 {
@@ -120,7 +119,10 @@ where
 	Ok(futures)
 }
 
-fn update_dirs(conn: &mut Connection, dirs: Vec<UnsharedDirectoryType<'_>>) -> Result<DBDirObject> {
+fn update_dirs(
+	conn: &mut Connection,
+	dirs: Vec<UnsharedDirectoryType<'_>>,
+) -> Result<DBDirObject, CacheError> {
 	let mut last_dir_obj = None;
 	for dir in dirs {
 		match dir {
@@ -132,7 +134,7 @@ fn update_dirs(conn: &mut Connection, dirs: Vec<UnsharedDirectoryType<'_>>) -> R
 			}
 		}
 	}
-	last_dir_obj.ok_or_else(|| anyhow::anyhow!("No directories found in the provided list"))
+	last_dir_obj.ok_or_else(|| CacheError::remote("No directories found in the provided list"))
 }
 
 async fn update_items_in_path_starting_at<'a>(
@@ -140,7 +142,7 @@ async fn update_items_in_path_starting_at<'a>(
 	client: &Client,
 	path: &'a str,
 	parent: UnsharedDirectoryType<'_>,
-) -> Result<UpdateItemsInPath<'a>> {
+) -> Result<UpdateItemsInPath<'a>, CacheError> {
 	match client.get_items_in_path_starting_at(path, parent).await {
 		Ok((dirs, ObjectOrRemainingPath::Object(last_item))) => {
 			let conn = &mut db.conn();
@@ -193,7 +195,7 @@ pub(crate) async fn update_items_in_path<'a>(
 	db: &FilenMobileDB,
 	client: &Client,
 	path_values: &'a PathValues<'a>,
-) -> Result<UpdateItemsInPath<'a>> {
+) -> Result<UpdateItemsInPath<'a>, CacheError> {
 	let (objects, all) = sql::select_objects_in_path(&db.conn(), path_values)?;
 	let mut futures = get_required_update_futures(objects, all, client)?;
 
@@ -242,7 +244,10 @@ pub(crate) async fn update_items_in_path<'a>(
 	}
 	// SAFETY: We always have at least the root object
 	let last_valid_obj = last_valid_obj.ok_or_else(|| {
-		anyhow::anyhow!("No valid items found in path: {}", path_values.full_path)
+		CacheError::remote(format!(
+			"No valid items found in path: {}",
+			path_values.full_path
+		))
 	})?;
 	if !break_early {
 		// local cache matches remote, no need to update

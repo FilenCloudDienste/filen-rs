@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
@@ -17,7 +16,7 @@ use crate::{PathIteratorExt, PathValues};
 pub(crate) fn select_objects_in_path<'a>(
 	conn: &Connection,
 	path_values: &'a PathValues,
-) -> Result<(Vec<(DBObject, &'a str)>, bool)> {
+) -> Result<(Vec<(DBObject, &'a str)>, bool), rusqlite::Error> {
 	let path_iter = path_values.inner_path.path_iter();
 	let mut stmt = conn.prepare_cached(
 		"SELECT id, uuid, parent, name, type FROM items WHERE parent = ? AND name = ? LIMIT 1;",
@@ -37,8 +36,7 @@ pub(crate) fn select_objects_in_path<'a>(
 				(objects.last().unwrap().0.uuid(), component),
 				RawDBItem::from_row,
 			)
-			.optional()
-			.context("select item in path")?;
+			.optional()?;
 		match item {
 			Some(item) => {
 				objects.push((item.into_db_object(conn)?, remaining));
@@ -52,7 +50,7 @@ pub(crate) fn select_objects_in_path<'a>(
 pub(crate) fn select_object_at_path(
 	conn: &Connection,
 	path_values: &PathValues,
-) -> Result<Option<DBObject>> {
+) -> Result<Option<DBObject>, rusqlite::Error> {
 	match select_objects_in_path(conn, path_values)? {
 		(mut objects, true) => {
 			// SAFETY: We know that the last item in `objects` is always present because we start with the root item.
@@ -63,7 +61,7 @@ pub(crate) fn select_object_at_path(
 	}
 }
 
-pub(crate) fn insert_root(conn: &mut Connection, root: Uuid) -> Result<()> {
+pub(crate) fn insert_root(conn: &mut Connection, root: Uuid) -> Result<(), rusqlite::Error> {
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{
 		let mut stmt = tx.prepare_cached(
@@ -83,7 +81,7 @@ pub(crate) fn update_root(
 	conn: &Connection,
 	root_uuid: Uuid,
 	response: &filen_types::api::v3::user::info::Response<'_>,
-) -> Result<()> {
+) -> Result<(), rusqlite::Error> {
 	let id: i64 = conn.query_one("SELECT id FROM items WHERE uuid = ?;", [root_uuid], |row| {
 		row.get(0)
 	})?;

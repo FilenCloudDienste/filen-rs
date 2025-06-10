@@ -81,7 +81,7 @@ impl Display for AuthInfo {
 }
 
 impl AuthInfo {
-	pub fn from_string_and_version(s: &str, version: u32) -> anyhow::Result<Self> {
+	pub fn from_string_and_version(s: &str, version: u32) -> Result<Self, ConversionError> {
 		match version {
 			1 => Ok(AuthInfo::V1),
 			2 => Ok(AuthInfo::V2(v2::AuthInfo {
@@ -308,7 +308,7 @@ impl Client {
 		private_key: &str,
 		api_key: String,
 		version: u32,
-	) -> anyhow::Result<Self> {
+	) -> Result<Self, ConversionError> {
 		let auth_info = AuthInfo::from_string_and_version(auth_info, version)?;
 		let file_encryption_version = match auth_info {
 			AuthInfo::V1 | AuthInfo::V2(_) => V2FILE_ENCRYPTION_VERSION,

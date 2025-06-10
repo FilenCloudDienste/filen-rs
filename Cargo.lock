@@ -573,7 +573,6 @@ name = "filen-mobile-native-cache"
 version = "0.1.0"
 dependencies = [
  "android_log",
- "anyhow",
  "chrono",
  "env_logger",
  "faster-hex",
@@ -600,7 +599,6 @@ name = "filen-sdk-rs"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "argon2",
  "base64",
  "chrono",

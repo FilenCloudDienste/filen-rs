@@ -20,34 +20,15 @@ use crate::{
 
 uniffi::setup_scaffolding!();
 
+mod error;
 pub mod ffi;
 pub mod io;
 pub mod sql;
 pub(crate) mod sync;
 pub mod tokio;
+pub use error::CacheError;
 
-#[derive(uniffi::Error, Debug)]
-#[uniffi(flat_error)]
-pub enum Error {
-	Anyhow(anyhow::Error),
-}
-impl std::fmt::Display for Error {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Error::Anyhow(err) => err.fmt(f),
-		}
-	}
-}
-impl<T> From<T> for Error
-where
-	anyhow::Error: From<T>,
-{
-	fn from(err: T) -> Self {
-		Error::Anyhow(anyhow::Error::from(err))
-	}
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, CacheError>;
 
 #[derive(uniffi::Object)]
 pub struct FilenMobileDB {
@@ -152,9 +133,10 @@ impl FilenMobileDB {
 			match sync::update_items_in_path(self, &client.client, &path_values).await? {
 				UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
 				UpdateItemsInPath::Partial(_, _) => {
-					return Err(
-						anyhow::anyhow!("Path {} does not point to a directory", path).into(),
-					);
+					return Err(CacheError::remote(format!(
+						"Path {} does not point to a directory",
+						path_values.full_path
+					)));
 				}
 			};
 		let (dirs, files) = client.client.list_dir(&dir.uuid()).await?;
@@ -173,7 +155,7 @@ impl FilenMobileDB {
 		let file = match sync::update_items_in_path(self, &client.client, &path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => file,
 			UpdateItemsInPath::Partial(_, _) | UpdateItemsInPath::Complete(_) => {
-				return Err(Error::Anyhow(anyhow::anyhow!(
+				return Err(CacheError::remote(format!(
 					"Path {} does not point to a file",
 					path_values.full_path
 				)));
@@ -186,7 +168,7 @@ impl FilenMobileDB {
 			.into_os_string()
 			.into_string()
 			.map_err(|e| {
-				Error::Anyhow(anyhow::anyhow!("Failed to convert path to string: {:?}", e))
+				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
 			})?;
 		Ok(path)
 	}
@@ -209,22 +191,19 @@ impl FilenMobileDB {
 					file.parent
 				}
 				UpdateItemsInPath::Complete(_) => {
-					return Err(anyhow::anyhow!(
+					return Err(CacheError::remote(format!(
 						"Path {} does not point to a file",
 						path_values.full_path
-					)
-					.into());
+					)));
 				}
 				UpdateItemsInPath::Partial(remaining, parent) if remaining == path_values.name => {
 					parent.uuid()
 				}
 				UpdateItemsInPath::Partial(remaining, _) => {
-					return Err(anyhow::anyhow!(
+					return Err(CacheError::remote(format!(
 						"Path {} does not point to a file (remaining: {})",
-						path_values.full_path,
-						remaining
-					)
-					.into());
+						path_values.full_path, remaining
+					)));
 				}
 			};
 
@@ -247,15 +226,16 @@ impl FilenMobileDB {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
 			UpdateItemsInPath::Complete(DBObject::File(_)) => {
-				return Err(anyhow::anyhow!("Path {} points to a file", parent_path).into());
+				return Err(CacheError::remote(format!(
+					"Path {} points to a file",
+					parent_path
+				)));
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
-				return Err(anyhow::anyhow!(
+				return Err(CacheError::remote(format!(
 					"Path {} does not point to a directory (remaining: {})",
-					parent_path,
-					remaining
-				)
-				.into());
+					parent_path, remaining
+				)));
 			}
 		};
 		let file = client
@@ -265,9 +245,9 @@ impl FilenMobileDB {
 			.build();
 		let mut writer = client.client.get_file_writer(file);
 		writer.close().await?;
-		let file = writer.into_remote_file().ok_or_else(|| {
-			Error::Anyhow(anyhow::anyhow!("Failed to convert writer into remote file"))
-		})?;
+		let file = writer
+			.into_remote_file()
+			.ok_or_else(|| CacheError::conversion("Failed to convert writer into remote file"))?;
 		let mut conn = self.conn();
 		let file = DBFile::upsert_from_remote(&mut conn, file)?;
 		Ok(parent_path.join(&file.name))
@@ -284,15 +264,16 @@ impl FilenMobileDB {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
 			UpdateItemsInPath::Complete(DBObject::File(_)) => {
-				return Err(anyhow::anyhow!("Path {} points to a file", parent_path).into());
+				return Err(CacheError::remote(format!(
+					"Path {} points to a file",
+					parent_path
+				)));
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
-				return Err(anyhow::anyhow!(
+				return Err(CacheError::remote(format!(
 					"Path {} does not point to a directory (remaining: {})",
-					parent_path,
-					remaining
-				)
-				.into());
+					parent_path, remaining
+				)));
 			}
 		};
 
@@ -357,11 +338,11 @@ impl FfiPathWithRoot {
 
 		let (root_uuid_str, remaining) = iter
 			.next()
-			.ok_or_else(|| Error::Anyhow(anyhow::anyhow!("Path must start with a root UUID")))?;
+			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;
 
 		Ok(PathValues {
 			root_uuid: Uuid::parse_str(root_uuid_str)
-				.map_err(|e| Error::Anyhow(anyhow::anyhow!("Invalid root UUID: {}", e)))?,
+				.map_err(|e| CacheError::conversion(format!("Invalid root UUID: {}", e)))?,
 			full_path: self.0.as_str(),
 			inner_path: remaining,
 			name: iter.last().unwrap_or_default().0,

@@ -35,4 +35,6 @@ pub enum ConversionError {
 	SerdeJsonError(#[from] serde_json::Error),
 	#[error("RSA Error: `{0}`")]
 	RSAError(#[from] rsa::errors::Error),
+	#[error("Failed to parse UUID: `{0}`")]
+	UUIDError(#[from] uuid::Error),
 }

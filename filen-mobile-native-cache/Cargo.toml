@@ -8,7 +8,6 @@ default = ["tokio"]
 tokio = ["dep:tokio", "filen-sdk-rs-macros/tokio"]
 
 [dependencies]
-anyhow = "1.0.98"
 filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs" }
 futures = "0.3.31"
 uniffi = { version = "0.29.2", features = [ "cli" ] }
