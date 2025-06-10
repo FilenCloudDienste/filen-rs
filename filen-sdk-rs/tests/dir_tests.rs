@@ -5,6 +5,7 @@ use filen_sdk_rs::{
 	crypto::shared::generate_random_base64_values,
 	fs::{
 		FSObject, HasName, HasUUID, NonRootFSObject, UnsharedFSObject,
+		client_impl::ObjectOrRemainingPath,
 		dir::{UnsharedDirectoryType, traits::HasDirMeta},
 	},
 };
@@ -57,10 +58,9 @@ async fn find_at_path() {
 		None
 	);
 
-	let items = client
-		.get_items_in_path(&format!("{}/a/b/c", test_dir.name()))
-		.await
-		.unwrap();
+	let path = format!("{}/a/b/c", test_dir.name());
+
+	let items = client.get_items_in_path(&path).await.unwrap();
 
 	assert_eq!(items.0.len(), 4);
 	assert!(
@@ -78,7 +78,10 @@ async fn find_at_path() {
 			.0
 			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_c)))
 	);
-	assert_eq!(items.1, Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir_c))));
+	assert!(matches!(
+		items.1,
+		ObjectOrRemainingPath::Object(UnsharedFSObject::Dir(dir)) if *dir == dir_c
+	));
 
 	let items = client
 		.get_items_in_path_starting_at("b/c", UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_a)))
@@ -95,7 +98,26 @@ async fn find_at_path() {
 			.0
 			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_b)))
 	);
-	assert_eq!(items.1, Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir_c))));
+	assert!(matches!(
+		items.1,
+		ObjectOrRemainingPath::Object(UnsharedFSObject::Dir(dir)) if *dir == dir_c
+	));
+
+	let resp = client
+		.get_items_in_path_starting_at("c/d/e", UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_b)))
+		.await
+		.unwrap();
+	// Expecting None because "c/d/e" does not exist in the path
+	// and the last item in dirs be the directory "c"
+	match resp {
+		(mut dirs, ObjectOrRemainingPath::RemainingPath(path)) => match dirs.pop() {
+			Some(UnsharedDirectoryType::Dir(dir)) if *dir == dir_c => {
+				assert_eq!(path, "d/e");
+			}
+			other => panic!("Expected last directory to be 'c', but got: {:?}", other),
+		},
+		other => panic!("Expected dir_c, but got: {:?}", other),
+	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
