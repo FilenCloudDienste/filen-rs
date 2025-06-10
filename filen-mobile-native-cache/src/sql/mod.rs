@@ -7,7 +7,7 @@ pub use types::*;
 pub mod error;
 pub use error::SQLError;
 
-use crate::PathIteratorExt;
+use crate::{PathIteratorExt, PathValues};
 
 /// Selects object in a path starting from the root UUID.
 ///
@@ -16,18 +16,17 @@ use crate::PathIteratorExt;
 #[allow(clippy::type_complexity)]
 pub(crate) fn select_objects_in_path<'a>(
 	conn: &Connection,
-	root_uuid: Uuid,
-	path: &'a str,
+	path_values: &'a PathValues,
 ) -> Result<(Vec<(DBObject, &'a str)>, bool)> {
-	let path_iter = path.path_iter();
+	let path_iter = path_values.inner_path.path_iter();
 	let mut stmt = conn.prepare_cached(
 		"SELECT id, uuid, parent, name, type FROM items WHERE parent = ? AND name = ? LIMIT 1;",
 	)?;
 	let mut objects = Vec::new();
 
-	match RawDBItem::select(conn, root_uuid)? {
+	match RawDBItem::select(conn, path_values.root_uuid)? {
 		Some(item) => {
-			objects.push((item.into_db_object(conn)?, path));
+			objects.push((item.into_db_object(conn)?, path_values.inner_path));
 		}
 		None => return Ok((objects, false)),
 	}
@@ -52,10 +51,9 @@ pub(crate) fn select_objects_in_path<'a>(
 
 pub(crate) fn select_object_at_path(
 	conn: &Connection,
-	root_uuid: Uuid,
-	path: &str,
+	path_values: &PathValues,
 ) -> Result<Option<DBObject>> {
-	match select_objects_in_path(conn, root_uuid, path)? {
+	match select_objects_in_path(conn, path_values)? {
 		(mut objects, true) => {
 			// SAFETY: We know that the last item in `objects` is always present because we start with the root item.
 			let (obj, _) = objects.pop().unwrap();

@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	crypto::file::FileKey,
 	fs::{
-		HasName, HasParent, HasRemoteInfo, HasUUID,
+		HasName, HasParent, HasRemoteInfo, HasUUID, UnsharedFSObject,
 		dir::{RemoteDirectory, RootDirectory, traits::HasRemoteDirInfo},
 		file::{
 			FlatRemoteFile, RemoteFile,
@@ -761,6 +761,18 @@ impl DBObject {
 			DBObject::File(file) => file.uuid,
 			DBObject::Dir(dir) => dir.uuid,
 			DBObject::Root(root) => root.uuid,
+		}
+	}
+
+	pub(crate) fn upsert_from_remote(conn: &mut Connection, obj: UnsharedFSObject) -> Result<Self> {
+		match obj {
+			UnsharedFSObject::File(file) => {
+				Ok(DBFile::upsert_from_remote(conn, file.into_owned())?.into())
+			}
+			UnsharedFSObject::Dir(dir) => {
+				Ok(DBDir::upsert_from_remote(conn, dir.into_owned())?.into())
+			}
+			UnsharedFSObject::Root(root) => Ok(DBRoot::upsert_from_remote(conn, &root)?.into()),
 		}
 	}
 }

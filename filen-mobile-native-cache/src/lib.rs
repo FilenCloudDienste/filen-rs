@@ -5,11 +5,12 @@ use std::{
 
 use ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiObject, FfiRoot};
 use filen_sdk_rs::{fs::HasUUID, util::PathIteratorExt};
+use futures::AsyncWriteExt;
 use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::{
-	ffi::PathWithRoot,
+	ffi::FfiPathWithRoot,
 	sql::{
 		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBObject, DBRoot,
 		error::OptionalExtensionSQL,
@@ -65,16 +66,6 @@ pub struct QueryChildrenResponse {
 	pub parent: FfiDir,
 }
 
-fn get_root_and_path_from_path(path: &PathWithRoot) -> Result<(Uuid, &str)> {
-	let (root_uuid_str, path) = path
-		.0
-		.path_iter()
-		.next()
-		.ok_or_else(|| Error::Anyhow(anyhow::anyhow!("Path must start with a root UUID")))?;
-	let root_uuid = Uuid::parse_str(root_uuid_str)?;
-	Ok((root_uuid, path))
-}
-
 #[uniffi::export]
 impl FilenMobileDB {
 	pub fn query_roots_info(&self, root_uuid_str: String) -> Result<Option<FfiRoot>> {
@@ -111,12 +102,12 @@ impl FilenMobileDB {
 
 	pub fn query_dir_children(
 		&self,
-		path: &PathWithRoot,
+		path: &FfiPathWithRoot,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>> {
-		let (root, dir_path) = get_root_and_path_from_path(path)?;
+		let path_values = path.as_path_values()?;
 
-		let dir: DBDirObject = match sql::select_object_at_path(&self.conn(), root, dir_path)? {
+		let dir: DBDirObject = match sql::select_object_at_path(&self.conn(), &path_values)? {
 			Some(obj) => obj.try_into()?,
 			None => return Ok(None),
 		};
@@ -129,9 +120,9 @@ impl FilenMobileDB {
 		}))
 	}
 
-	pub fn query_item(&self, path: &PathWithRoot) -> Result<Option<FfiObject>> {
-		let (root, path) = get_root_and_path_from_path(path)?;
-		let obj = sql::select_object_at_path(&self.conn(), root, path)?;
+	pub fn query_item(&self, path: &FfiPathWithRoot) -> Result<Option<FfiObject>> {
+		let path_values = path.as_path_values()?;
+		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
 		Ok(obj.map(Into::into))
 	}
 }
@@ -154,23 +145,18 @@ impl FilenMobileDB {
 	pub async fn update_dir_children(
 		&self,
 		client: &CacheClient,
-		path: PathWithRoot,
+		path: FfiPathWithRoot,
 	) -> Result<()> {
-		let (root_uuid, dir_path) = get_root_and_path_from_path(&path)?;
-		if root_uuid != client.client.root().uuid() {
-			return Err(
-				anyhow::anyhow!("Root UUID in path does not match client's root UUID").into(),
-			);
-		}
-
-		let mut dir: DBDirObject = match sync::update_items_in_path(self, &client.client, dir_path)
-			.await?
-		{
-			UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
-			UpdateItemsInPath::Partial(_, _) => {
-				return Err(anyhow::anyhow!("Path {} does not point to a directory", path).into());
-			}
-		};
+		let path_values = path.as_path_values()?;
+		let mut dir: DBDirObject =
+			match sync::update_items_in_path(self, &client.client, &path_values).await? {
+				UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
+				UpdateItemsInPath::Partial(_, _) => {
+					return Err(
+						anyhow::anyhow!("Path {} does not point to a directory", path).into(),
+					);
+				}
+			};
 		let (dirs, files) = client.client.list_dir(&dir.uuid()).await?;
 		let mut conn = self.conn();
 		dir.update_children(&mut conn, dirs, files)?;
@@ -178,114 +164,143 @@ impl FilenMobileDB {
 		Ok(())
 	}
 
-	// pub async fn download_file(&self, client: &CacheClient, file_path: &str) -> Result<String> {
-	// 	let file = match sync::update_items_in_path(
-	// 		self,
-	// 		&client.client,
-	// 		client.client.root().uuid(),
-	// 		file_path,
-	// 	)
-	// 	.await?
-	// 	{
-	// 		UpdateItemsInPath::Complete(DBObject::File(file)) => file,
-	// 		UpdateItemsInPath::Partial(_, _) | UpdateItemsInPath::Complete(_) => {
-	// 			return Err(Error::Anyhow(anyhow::anyhow!(
-	// 				"Path {} does not point to a file",
-	// 				file_path
-	// 			)));
-	// 		}
-	// 	};
-	// 	let file = file.try_into()?;
+	pub async fn download_file(
+		&self,
+		client: &CacheClient,
+		file_path: FfiPathWithRoot,
+	) -> Result<String> {
+		let path_values = file_path.as_path_values()?;
+		let file = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+			UpdateItemsInPath::Complete(DBObject::File(file)) => file,
+			UpdateItemsInPath::Partial(_, _) | UpdateItemsInPath::Complete(_) => {
+				return Err(Error::Anyhow(anyhow::anyhow!(
+					"Path {} does not point to a file",
+					path_values.full_path
+				)));
+			}
+		};
+		let file = file.try_into()?;
 
-	// 	let path = io::download_file(&client.client, &file, file_path)
-	// 		.await?
-	// 		.into_os_string()
-	// 		.into_string()
-	// 		.map_err(|e| {
-	// 			Error::Anyhow(anyhow::anyhow!("Failed to convert path to string: {:?}", e))
-	// 		})?;
-	// 	Ok(path)
-	// }
+		let path = io::download_file(&client.client, &file, &file_path)
+			.await?
+			.into_os_string()
+			.into_string()
+			.map_err(|e| {
+				Error::Anyhow(anyhow::anyhow!("Failed to convert path to string: {:?}", e))
+			})?;
+		Ok(path)
+	}
 
-	// pub async fn maybe_upload_file(&self, client: &CacheClient, file_path: &str) -> Result<bool> {
-	// 	let found_object_or_parent = sync::update_or_create_items_in_path(
-	// 		self,
-	// 		&client.client,
-	// 		client.client.root().uuid(),
-	// 		file_path,
-	// 	)
-	// 	.await?;
-	// 	let mut file = match found_object_or_parent {
-	// 		ObjectOrParent::Object(dbobject) => match dbobject {
-	// 			DBObject::File(file) => file,
-	// 			_ => {
-	// 				return Err(std::io::Error::new(
-	// 					std::io::ErrorKind::IsADirectory,
-	// 					format!("No file found in path: {}", file_path),
-	// 				)
-	// 				.into());
-	// 			}
-	// 		},
-	// 		ObjectOrParent::Parent(_) => {
-	// 			return Err(std::io::Error::new(
-	// 				std::io::ErrorKind::NotFound,
-	// 				format!("No file found in path: {}", file_path),
-	// 			)
-	// 			.into());
-	// 		}
-	// 	};
+	pub async fn upload_file_if_changed(
+		&self,
+		client: &CacheClient,
+		path: FfiPathWithRoot,
+	) -> Result<bool> {
+		let path_values = path.as_path_values()?;
+		let parent_uuid =
+			match sync::update_items_in_path(self, &client.client, &path_values).await? {
+				UpdateItemsInPath::Complete(DBObject::File(file)) => {
+					if let Some(hash) = file.hash.map(Into::into) {
+						let local_hash = io::hash_local_file(&path)?;
+						if local_hash == hash {
+							return Ok(false);
+						}
+					}
+					file.parent
+				}
+				UpdateItemsInPath::Complete(_) => {
+					return Err(anyhow::anyhow!(
+						"Path {} does not point to a file",
+						path_values.full_path
+					)
+					.into());
+				}
+				UpdateItemsInPath::Partial(remaining, parent) if remaining == path_values.name => {
+					parent.uuid()
+				}
+				UpdateItemsInPath::Partial(remaining, _) => {
+					return Err(anyhow::anyhow!(
+						"Path {} does not point to a file (remaining: {})",
+						path_values.full_path,
+						remaining
+					)
+					.into());
+				}
+			};
 
-	// 	if let Some(hash) = file.hash.map(Into::into) {
-	// 		let local_hash = io::hash_local_file(file_path)?;
-	// 		if local_hash == hash {
-	// 			return Ok(false);
-	// 		}
-	// 	}
+		let remote_file = io::upload_file(&client.client, &path, parent_uuid).await?;
 
-	// 	let remote_file = io::upload_file(&client.client, file_path, file.item.parent).await?;
+		let mut conn = self.conn();
+		DBFile::upsert_from_remote(&mut conn, remote_file)?;
+		Ok(true)
+	}
 
-	// 	let mut conn = self.conn();
-	// 	file.update_from_remote(&mut conn, remote_file)?;
-	// 	Ok(true)
-	// }
+	pub async fn create_empty_file(
+		&self,
+		client: &CacheClient,
+		parent_path: FfiPathWithRoot,
+		name: String,
+		mime: String,
+	) -> Result<FfiPathWithRoot> {
+		let path_values = parent_path.as_path_values()?;
+		let parent = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
+			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
+			UpdateItemsInPath::Complete(DBObject::File(_)) => {
+				return Err(anyhow::anyhow!("Path {} points to a file", parent_path).into());
+			}
+			UpdateItemsInPath::Partial(remaining, _) => {
+				return Err(anyhow::anyhow!(
+					"Path {} does not point to a directory (remaining: {})",
+					parent_path,
+					remaining
+				)
+				.into());
+			}
+		};
+		let file = client
+			.client
+			.make_file_builder(name, &parent.uuid())
+			.mime(mime)
+			.build();
+		let mut writer = client.client.get_file_writer(file);
+		writer.close().await?;
+		let file = writer.into_remote_file().ok_or_else(|| {
+			Error::Anyhow(anyhow::anyhow!("Failed to convert writer into remote file"))
+		})?;
+		let mut conn = self.conn();
+		let file = DBFile::upsert_from_remote(&mut conn, file)?;
+		Ok(parent_path.join(&file.name))
+	}
 
-	// pub async fn create_empty_file(
-	// 	&self,
-	// 	client: &CacheClient,
-	// 	parent_uuid: &str,
-	// 	name: String,
-	// 	mime: String,
-	// ) -> Result<String> {
-	// 	let parent_uuid = Uuid::parse_str(parent_uuid)?;
-	// 	let file = client
-	// 		.client
-	// 		.make_file_builder(name, &parent_uuid)
-	// 		.mime(mime)
-	// 		.build();
-	// 	let mut writer = client.client.get_file_writer(file);
-	// 	writer.close().await?;
-	// 	let file = writer.into_remote_file().ok_or_else(|| {
-	// 		Error::Anyhow(anyhow::anyhow!("Failed to convert writer into remote file"))
-	// 	})?;
-	// 	let mut conn = self.conn();
-	// 	let uuid = file.uuid().to_string();
-	// 	DBFile::upsert_from_remote(&mut conn, file)?;
-	// 	Ok(uuid)
-	// }
+	pub async fn create_dir(
+		&self,
+		client: &CacheClient,
+		parent_path: FfiPathWithRoot,
+		name: String,
+	) -> Result<FfiPathWithRoot> {
+		let path_values = parent_path.as_path_values()?;
+		let parent = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
+			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
+			UpdateItemsInPath::Complete(DBObject::File(_)) => {
+				return Err(anyhow::anyhow!("Path {} points to a file", parent_path).into());
+			}
+			UpdateItemsInPath::Partial(remaining, _) => {
+				return Err(anyhow::anyhow!(
+					"Path {} does not point to a directory (remaining: {})",
+					parent_path,
+					remaining
+				)
+				.into());
+			}
+		};
 
-	// pub async fn create_dir(
-	// 	&self,
-	// 	client: &CacheClient,
-	// 	parent_uuid: &str,
-	// 	name: String,
-	// ) -> Result<String> {
-	// 	let parent_uuid = Uuid::parse_str(parent_uuid)?;
-	// 	let dir = client.client.create_dir(&parent_uuid, name).await?;
-	// 	let mut conn = self.conn();
-	// 	let uuid = dir.uuid().to_string();
-	// 	DBDir::upsert_from_remote(&mut conn, dir)?;
-	// 	Ok(uuid)
-	// }
+		let dir = client.client.create_dir(&parent.uuid(), name).await?;
+		let mut conn = self.conn();
+		let dir = DBDir::upsert_from_remote(&mut conn, dir)?;
+		Ok(parent_path.join(&dir.name))
+	}
 }
 
 #[derive(uniffi::Object)]
@@ -326,5 +341,30 @@ impl CacheClient {
 
 	pub fn root_uuid(&self) -> String {
 		self.client.root().uuid().to_string()
+	}
+}
+
+pub struct PathValues<'a> {
+	pub root_uuid: uuid::Uuid,
+	pub full_path: &'a str,
+	pub inner_path: &'a str,
+	pub name: &'a str,
+}
+
+impl FfiPathWithRoot {
+	pub fn as_path_values(&self) -> Result<PathValues> {
+		let mut iter = self.0.path_iter();
+
+		let (root_uuid_str, remaining) = iter
+			.next()
+			.ok_or_else(|| Error::Anyhow(anyhow::anyhow!("Path must start with a root UUID")))?;
+
+		Ok(PathValues {
+			root_uuid: Uuid::parse_str(root_uuid_str)
+				.map_err(|e| Error::Anyhow(anyhow::anyhow!("Invalid root UUID: {}", e)))?,
+			full_path: self.0.as_str(),
+			inner_path: remaining,
+			name: iter.last().unwrap_or_default().0,
+		})
 	}
 }

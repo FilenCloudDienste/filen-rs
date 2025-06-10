@@ -34,6 +34,8 @@ fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+
+use crate::ffi::FfiPathWithRoot;
 #[cfg(unix)]
 fn metadata_size(metadata: std::fs::Metadata) -> u64 {
 	metadata.size().max(BUFFER_SIZE)
@@ -61,8 +63,8 @@ fn get_tmp_path(uuid: &str) -> Result<std::path::PathBuf, io::Error> {
 	Ok(tmp_path)
 }
 
-fn get_file_path(path: &Path) -> Result<std::path::PathBuf, io::Error> {
-	let download_path = AsRef::<Path>::as_ref(FILES_DIR).join(path);
+pub fn get_file_path(path: &FfiPathWithRoot) -> Result<std::path::PathBuf, io::Error> {
+	let download_path = AsRef::<Path>::as_ref(FILES_DIR).join(&path.0);
 	// SAFETY: This unwrap is safe because FILES_DIR is a valid path
 	std::fs::create_dir_all(download_path.parent().unwrap())?;
 	Ok(download_path)
@@ -71,7 +73,7 @@ fn get_file_path(path: &Path) -> Result<std::path::PathBuf, io::Error> {
 pub async fn download_file(
 	client: &Client,
 	file: &RemoteFile,
-	path: &str,
+	path: &FfiPathWithRoot,
 ) -> Result<PathBuf, io::Error> {
 	let reader = client.get_file_reader(file).compat();
 	let uuid = file.uuid().to_string();
@@ -91,12 +93,13 @@ pub async fn download_file(
 	})
 	.await??;
 
-	let dst = get_file_path(path.as_ref())?;
+	let dst = get_file_path(path)?;
 	tokio::fs::rename(&src, &dst).await?;
 	Ok(dst)
 }
 
-pub fn hash_local_file(path: &str) -> Result<Sha512Hash, io::Error> {
+pub fn hash_local_file(path: &FfiPathWithRoot) -> Result<Sha512Hash, io::Error> {
+	let path = get_file_path(path)?;
 	let mut file = std::fs::File::open(path)?;
 	let file_size = file.metadata().map(metadata_size).unwrap_or(BUFFER_SIZE);
 	let mut buffer = vec![0; (file_size as usize).min(BUFFER_SIZE as usize)];
@@ -114,10 +117,10 @@ pub fn hash_local_file(path: &str) -> Result<Sha512Hash, io::Error> {
 
 pub async fn upload_file(
 	client: &Client,
-	path: &str,
+	path: &FfiPathWithRoot,
 	parent_uuid: Uuid,
 ) -> Result<RemoteFile, io::Error> {
-	let path = Path::new(path);
+	let path = get_file_path(path)?;
 	let file_name = path
 		.file_name()
 		.and_then(|s| s.to_str())

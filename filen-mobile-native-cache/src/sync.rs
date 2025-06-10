@@ -4,8 +4,9 @@ use anyhow::Result;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
-		HasUUID, UnsharedFSObject,
-		dir::{RemoteDirectory, UnsharedDirectoryType},
+		UnsharedFSObject,
+		client_impl::ObjectOrRemainingPath,
+		dir::{RemoteDirectory, RootDirectory, UnsharedDirectoryType},
 		file::RemoteFile,
 	},
 };
@@ -14,11 +15,12 @@ use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesOrdered};
 use rusqlite::Connection;
 
 use crate::{
-	FilenMobileDB,
+	DBDirTrait, FilenMobileDB, PathValues,
 	sql::{self, DBDir, DBDirObject, DBFile, DBObject, DBRoot},
 };
 
 #[allow(unused)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalRemoteComparison<'a> {
 	SameDir(DBDir, RemoteDirectory),
 	DifferentDir(DBDir, RemoteDirectory),
@@ -37,6 +39,13 @@ impl LocalRemoteComparison<'_> {
 			}
 			LocalRemoteComparison::SameFile(file, remote_file) => {
 				LocalRemoteComparison::Force(DBObject::File(file), remote_file.into())
+			}
+			LocalRemoteComparison::Root(root) => {
+				let remote_root = Cow::Owned(RootDirectory::new(root.uuid()));
+				LocalRemoteComparison::Force(
+					DBObject::Root(root),
+					UnsharedFSObject::Root(remote_root),
+				)
 			}
 			other => other,
 		}
@@ -111,31 +120,19 @@ where
 	Ok(futures)
 }
 
-fn update_dirs_and_item(
-	conn: &mut Connection,
-	mut dirs: Vec<UnsharedDirectoryType<'_>>,
-	last_item: Option<UnsharedFSObject<'_>>,
-) -> Result<DBObject> {
-	// SAFETY: We assume that the last item is always present,
-	// either from the last_item parameter or from the dirs vector.
-	let last_item = last_item.unwrap_or_else(|| dirs.pop().unwrap().into());
+fn update_dirs(conn: &mut Connection, dirs: Vec<UnsharedDirectoryType<'_>>) -> Result<DBDirObject> {
+	let mut last_dir_obj = None;
 	for dir in dirs {
 		match dir {
 			UnsharedDirectoryType::Root(root) => {
-				DBRoot::upsert_from_remote(conn, &root)?;
+				last_dir_obj = Some(DBRoot::upsert_from_remote(conn, &root)?.into());
 			}
 			UnsharedDirectoryType::Dir(dir) => {
-				DBDir::upsert_from_remote(conn, dir.into_owned())?;
+				last_dir_obj = Some(DBDir::upsert_from_remote(conn, dir.into_owned())?.into());
 			}
 		}
 	}
-	match last_item {
-		UnsharedFSObject::File(file) => {
-			Ok(DBFile::upsert_from_remote(conn, file.into_owned())?.into())
-		}
-		UnsharedFSObject::Dir(dir) => Ok(DBDir::upsert_from_remote(conn, dir.into_owned())?.into()),
-		UnsharedFSObject::Root(root) => Ok(DBRoot::upsert_from_remote(conn, &root)?.into()),
-	}
+	last_dir_obj.ok_or_else(|| anyhow::anyhow!("No directories found in the provided list"))
 }
 
 async fn update_items_in_path_starting_at<'a>(
@@ -145,17 +142,25 @@ async fn update_items_in_path_starting_at<'a>(
 	parent: UnsharedDirectoryType<'_>,
 ) -> Result<UpdateItemsInPath<'a>> {
 	match client.get_items_in_path_starting_at(path, parent).await {
-		Ok((dirs, last_item)) => {
-			let obj = update_dirs_and_item(&mut db.conn(), dirs, last_item)?;
+		Ok((dirs, ObjectOrRemainingPath::Object(last_item))) => {
+			let conn = &mut db.conn();
+			update_dirs(conn, dirs)?;
+			let obj = DBObject::upsert_from_remote(conn, last_item)?;
 			Ok(UpdateItemsInPath::Complete(obj))
+		}
+		Ok((dirs, ObjectOrRemainingPath::RemainingPath(path))) => {
+			let obj = update_dirs(&mut db.conn(), dirs)?;
+			Ok(UpdateItemsInPath::Partial(path, obj))
 		}
 		Err((
 			filen_sdk_rs::error::Error::InvalidType(ObjectType::File, ObjectType::Dir),
 			(dirs, last_item),
 			path_remaining,
 		)) => {
+			let conn = &mut db.conn();
+			update_dirs(conn, dirs)?;
 			// We got a file when we expected a directory, so we update the directories and the file
-			let dir_obj = match update_dirs_and_item(&mut db.conn(), dirs, last_item)? {
+			let dir_obj = match DBObject::upsert_from_remote(conn, last_item)? {
 				DBObject::File(_) => {
 					return Err(filen_sdk_rs::error::Error::InvalidType(
 						ObjectType::File,
@@ -166,11 +171,13 @@ async fn update_items_in_path_starting_at<'a>(
 				DBObject::Dir(dir) => dir.into(),
 				DBObject::Root(root) => root.into(),
 			};
-			// but return false to indicate that the path is invalid
+			// but return partial to indicate that the path is invalid
 			Ok(UpdateItemsInPath::Partial(path_remaining, dir_obj))
 		}
 		Err((e, (dirs, last_item), _)) => {
-			update_dirs_and_item(&mut db.conn(), dirs, last_item)?;
+			let conn = &mut db.conn();
+			update_dirs(conn, dirs)?;
+			DBObject::upsert_from_remote(conn, last_item)?;
 			Err(e.into())
 		}
 	}
@@ -185,13 +192,13 @@ pub(crate) enum UpdateItemsInPath<'a> {
 pub(crate) async fn update_items_in_path<'a>(
 	db: &FilenMobileDB,
 	client: &Client,
-	path: &'a str,
+	path_values: &'a PathValues<'a>,
 ) -> Result<UpdateItemsInPath<'a>> {
-	let (objects, all) = sql::select_objects_in_path(&db.conn(), client.root().uuid(), path)?;
+	let (objects, all) = sql::select_objects_in_path(&db.conn(), path_values)?;
 	let mut futures = get_required_update_futures(objects, all, client)?;
 
 	let mut last_valid_obj: Option<DBObject> = None;
-	let mut final_remaining_path: &str = path;
+	let mut final_remaining_path: &str = path_values.inner_path;
 
 	let mut break_early = false;
 
@@ -226,8 +233,6 @@ pub(crate) async fn update_items_in_path<'a>(
 			}
 			LocalRemoteComparison::Root(root) => {
 				last_valid_obj = Some(DBObject::Root(root));
-				break_early = true;
-				break;
 			}
 			LocalRemoteComparison::NotFound(_) => {
 				break_early = true;
@@ -236,8 +241,9 @@ pub(crate) async fn update_items_in_path<'a>(
 		}
 	}
 	// SAFETY: We always have at least the root object
-	let last_valid_obj =
-		last_valid_obj.ok_or_else(|| anyhow::anyhow!("No valid items found in path: {}", path))?;
+	let last_valid_obj = last_valid_obj.ok_or_else(|| {
+		anyhow::anyhow!("No valid items found in path: {}", path_values.full_path)
+	})?;
 	if !break_early {
 		// local cache matches remote, no need to update
 		return Ok(UpdateItemsInPath::Complete(last_valid_obj));
@@ -254,29 +260,3 @@ pub(crate) async fn update_items_in_path<'a>(
 	let resp = update_items_in_path_starting_at(db, client, final_remaining_path, last_dir).await?;
 	Ok(resp)
 }
-
-// pub(crate) enum ObjectOrParent {
-// 	Object(DBObject),
-// 	Parent(DBDirObject),
-// }
-
-// pub(crate) async fn update_or_create_items_in_path(
-// 	db: &FilenMobileDB,
-// 	client: &Client,
-// 	path: &str,
-// ) -> Result<ObjectOrParent> {
-// 	let (remaining_path, mut last_dir) = match update_items_in_path(db, client, path).await? {
-// 		UpdateItemsInPath::Complete(db_obj) => return Ok(ObjectOrParent::Object(db_obj)),
-// 		UpdateItemsInPath::Partial(path, dbdir_trait) => (path, dbdir_trait),
-// 	};
-// 	for component in remaining_path.split('/') {
-// 		if component.is_empty() {
-// 			continue; // Skip empty components
-// 		}
-// 		let new_dir = client
-// 			.create_dir(&last_dir.uuid(), component.to_string())
-// 			.await?;
-// 		last_dir = DBDir::upsert_from_remote(&mut db.conn(), new_dir)?.into();
-// 	}
-// 	Ok(ObjectOrParent::Parent(last_dir))
-// }

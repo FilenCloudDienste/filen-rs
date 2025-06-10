@@ -134,26 +134,38 @@ impl From<DBNonRootObject> for FfiNonRootObject {
 }
 
 #[derive(Clone)]
-pub struct PathWithRoot(pub String);
+pub struct FfiPathWithRoot(pub String);
 
-impl From<String> for PathWithRoot {
+impl FfiPathWithRoot {
+	pub fn join(&self, other: &str) -> Self {
+		let mut new = String::with_capacity(self.0.len() + other.len() + 1);
+		self.0.clone_into(&mut new);
+		if !new.ends_with('/') {
+			new.push('/');
+		}
+		new.push_str(other);
+		FfiPathWithRoot(new)
+	}
+}
+
+impl From<String> for FfiPathWithRoot {
 	fn from(path: String) -> Self {
-		PathWithRoot(path)
+		FfiPathWithRoot(path)
 	}
 }
 
-impl From<&str> for PathWithRoot {
+impl From<&str> for FfiPathWithRoot {
 	fn from(path: &str) -> Self {
-		PathWithRoot(path.to_string())
+		FfiPathWithRoot(path.to_string())
 	}
 }
 
-impl std::fmt::Display for PathWithRoot {
+impl std::fmt::Display for FfiPathWithRoot {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0)
 	}
 }
 
-uniffi::custom_type!(PathWithRoot, String, {
+uniffi::custom_type!(FfiPathWithRoot, String, {
 	lower: |s| s.0,
 });
