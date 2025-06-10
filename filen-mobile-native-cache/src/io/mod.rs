@@ -39,7 +39,7 @@ fn metadata_size(metadata: std::fs::Metadata) -> u64 {
 	metadata.size().max(BUFFER_SIZE)
 }
 #[cfg(unix)]
-fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
+fn get_file_times(_created: SystemTime, modified: SystemTime) -> FileTimes {
 	FileTimes::new().set_modified(modified)
 }
 
