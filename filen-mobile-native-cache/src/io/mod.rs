@@ -2,6 +2,7 @@ use std::{
 	fs::FileTimes,
 	io::{self, Read},
 	path::{Path, PathBuf},
+	time::SystemTime,
 };
 
 use chrono::{DateTime, Utc};
@@ -19,9 +20,8 @@ use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use std::os::windows::fs::FileTimesExt;
 #[cfg(windows)]
-use std::{os::windows::fs::MetadataExt, time::SystemTime};
+use std::os::windows::fs::{FileTimesExt, MetadataExt};
 #[cfg(windows)]
 fn metadata_size(metadata: std::fs::Metadata) -> u64 {
 	metadata.file_size().max(BUFFER_SIZE)
