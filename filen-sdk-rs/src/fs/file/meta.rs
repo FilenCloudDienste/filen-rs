@@ -10,7 +10,7 @@ use crate::{
 	error::Error,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMeta<'a> {
 	pub(super) name: Cow<'a, str>,

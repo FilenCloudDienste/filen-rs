@@ -18,6 +18,7 @@ use rusqlite::{
 	CachedStatement, Connection, OptionalExtension, Result, ToSql,
 	types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
 };
+use sha2::Digest;
 use uuid::Uuid;
 
 use super::SQLError;
@@ -179,7 +180,7 @@ impl From<RawDBItem> for InnerDBItem {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DBFile {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
@@ -195,6 +196,28 @@ pub struct DBFile {
 	pub(crate) region: String,
 	pub(crate) bucket: String,
 	pub(crate) hash: Option<[u8; 64]>,
+}
+
+impl std::fmt::Debug for DBFile {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let key_hash_str = faster_hex::hex_string(&sha2::Sha512::digest(self.file_key.as_bytes()));
+		f.debug_struct("DBFile")
+			.field("id", &self.id)
+			.field("uuid", &self.uuid)
+			.field("parent", &self.parent)
+			.field("name", &self.name)
+			.field("mime", &self.mime)
+			.field("file_key (hashed)", &key_hash_str)
+			.field("created", &self.created)
+			.field("modified", &self.modified)
+			.field("size", &self.size)
+			.field("chunks", &self.chunks)
+			.field("favorited", &self.favorited)
+			.field("region", &self.region)
+			.field("bucket", &self.bucket)
+			.field("hash", &self.hash.map(|h| faster_hex::hex_string(&h)))
+			.finish()
+	}
 }
 
 impl DBFile {

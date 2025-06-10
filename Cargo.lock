@@ -576,6 +576,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "env_logger",
+ "faster-hex",
  "filen-sdk-rs",
  "filen-sdk-rs-macros",
  "filen-types",

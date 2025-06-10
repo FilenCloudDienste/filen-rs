@@ -39,7 +39,11 @@ pub struct MasterKey {
 
 impl std::fmt::Debug for MasterKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", self.key)
+		let hash_key_str =
+			faster_hex::hex_string(sha2::Sha512::digest(self.key.as_bytes()).as_ref());
+		f.debug_struct("MasterKey")
+			.field("key (hashed)", &hash_key_str)
+			.finish()
 	}
 }
 

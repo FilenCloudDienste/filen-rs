@@ -10,6 +10,7 @@ use filen_types::crypto::{DerivedPassword, EncryptedString};
 use generic_array::typenum::{U12, U16};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use super::{
 	error::ConversionError,
@@ -82,8 +83,9 @@ impl<'de> Deserialize<'de> for EncryptionKey {
 
 impl Debug for EncryptionKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let key_hash_str = faster_hex::hex_string(&sha2::Sha512::digest(self.bytes));
 		f.debug_struct("EncryptionKey")
-			.field("bytes", &faster_hex::hex_string(&self.bytes))
+			.field("bytes (hashed)", &key_hash_str)
 			.finish()
 	}
 }
