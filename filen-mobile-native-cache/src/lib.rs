@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{
 	ffi::FfiPathWithRoot,
 	sql::{
-		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBObject, DBRoot,
+		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemExt, DBObject, DBRoot,
 		error::OptionalExtensionSQL,
 	},
 	sync::UpdateItemsInPath,
@@ -281,6 +281,39 @@ impl FilenMobileDB {
 		let mut conn = self.conn();
 		let dir = DBDir::upsert_from_remote(&mut conn, dir)?;
 		Ok(parent_path.join(&dir.name))
+	}
+
+	pub async fn trash_item(&self, client: &CacheClient, path: FfiPathWithRoot) -> Result<()> {
+		let path_values: PathValues<'_> = path.as_path_values()?;
+		let obj = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+			UpdateItemsInPath::Complete(dbobject) => dbobject,
+			UpdateItemsInPath::Partial(_, _) => {
+				return Err(CacheError::remote(format!(
+					"Path {} does not point to an item",
+					path_values.full_path
+				)));
+			}
+		};
+
+		match obj {
+			DBObject::Root(root) => {
+				return Err(CacheError::remote(format!(
+					"Cannot remove root directory: {}",
+					root.uuid()
+				)));
+			}
+			DBObject::Dir(dir) => {
+				let remote_dir = dir.clone().into();
+				client.client.trash_dir(&remote_dir).await?;
+				dir.delete(&self.conn())?;
+			}
+			DBObject::File(file) => {
+				let remote_file = file.clone().try_into()?;
+				client.client.trash_file(&remote_file).await?;
+				file.delete(&self.conn())?;
+			}
+		}
+		Ok(())
 	}
 }
 

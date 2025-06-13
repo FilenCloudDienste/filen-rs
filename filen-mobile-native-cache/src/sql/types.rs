@@ -387,6 +387,28 @@ impl DBFile {
 	}
 }
 
+impl DBItemTrait for DBFile {
+	fn id(&self) -> i64 {
+		self.id
+	}
+
+	fn uuid(&self) -> Uuid {
+		self.uuid
+	}
+
+	fn parent(&self) -> Option<Uuid> {
+		Some(self.parent)
+	}
+
+	fn name(&self) -> &str {
+		&self.name
+	}
+
+	fn item_type(&self) -> ItemType {
+		ItemType::File
+	}
+}
+
 impl TryFrom<DBFile> for RemoteFile {
 	type Error = <FileKey as FromStr>::Err;
 	fn try_from(value: DBFile) -> Result<Self, Self::Error> {
@@ -581,6 +603,28 @@ impl DBDirTrait for DBDir {
 	}
 }
 
+impl DBItemTrait for DBDir {
+	fn id(&self) -> i64 {
+		self.id
+	}
+
+	fn uuid(&self) -> Uuid {
+		self.uuid
+	}
+
+	fn parent(&self) -> Option<Uuid> {
+		Some(self.parent)
+	}
+
+	fn name(&self) -> &str {
+		&self.name
+	}
+
+	fn item_type(&self) -> ItemType {
+		ItemType::Dir
+	}
+}
+
 impl From<DBDir> for RemoteDirectory {
 	fn from(value: DBDir) -> Self {
 		RemoteDirectory {
@@ -722,6 +766,28 @@ impl DBDirTrait for DBRoot {
 	}
 }
 
+impl DBItemTrait for DBRoot {
+	fn id(&self) -> i64 {
+		self.id
+	}
+
+	fn uuid(&self) -> Uuid {
+		self.uuid
+	}
+
+	fn parent(&self) -> Option<Uuid> {
+		None
+	}
+
+	fn name(&self) -> &str {
+		""
+	}
+
+	fn item_type(&self) -> ItemType {
+		ItemType::Root
+	}
+}
+
 impl From<DBRoot> for RootDirectory {
 	fn from(value: DBRoot) -> Self {
 		RootDirectory::new(value.uuid)
@@ -853,22 +919,22 @@ impl DBDirTrait for DBDirObject {
 
 	fn id(&self) -> i64 {
 		match self {
-			DBDirObject::Dir(dir) => dir.id(),
-			DBDirObject::Root(root) => root.id(),
+			DBDirObject::Dir(dir) => DBDirTrait::id(dir),
+			DBDirObject::Root(root) => DBDirTrait::id(root),
 		}
 	}
 
 	fn uuid(&self) -> Uuid {
 		match self {
-			DBDirObject::Dir(dir) => dir.uuid(),
-			DBDirObject::Root(root) => root.uuid(),
+			DBDirObject::Dir(dir) => DBDirTrait::uuid(dir),
+			DBDirObject::Root(root) => DBDirTrait::uuid(root),
 		}
 	}
 
 	fn name(&self) -> &str {
 		match self {
-			DBDirObject::Dir(dir) => dir.name(),
-			DBDirObject::Root(root) => root.name(),
+			DBDirObject::Dir(dir) => DBDirTrait::name(dir),
+			DBDirObject::Root(root) => DBDirTrait::name(root),
 		}
 	}
 }
@@ -1008,6 +1074,42 @@ where
 		let mut stmt = conn.prepare(&select_query)?;
 		stmt.query_and_then([self.uuid()], DBNonRootObject::from_row)?
 			.collect::<SQLResult<Vec<_>>>()
+	}
+}
+
+pub(crate) trait DBItemTrait: Sync + Send {
+	fn id(&self) -> i64;
+	fn uuid(&self) -> Uuid;
+	fn parent(&self) -> Option<Uuid>;
+	fn name(&self) -> &str;
+	fn item_type(&self) -> ItemType;
+}
+
+pub(crate) trait DBItemExt: DBItemTrait {
+	fn delete(&self, conn: &Connection) -> Result<bool>;
+}
+
+impl<T> DBItemExt for T
+where
+	T: DBItemTrait + Sync + Send,
+{
+	fn delete(&self, conn: &Connection) -> Result<bool> {
+		debug!(
+			"Removing item: uuid = {}, name = {}",
+			self.uuid(),
+			self.name()
+		);
+		let mut stmt = conn.prepare_cached(include_str!("../../sql/delete_item.sql"))?;
+		let num_rows = stmt.execute([self.id()])?;
+		if num_rows == 0 {
+			debug!(
+				"No rows deleted for item: uuid = {}, name = {}",
+				self.uuid(),
+				self.name()
+			);
+			return Ok(false);
+		}
+		Ok(true)
 	}
 }
 

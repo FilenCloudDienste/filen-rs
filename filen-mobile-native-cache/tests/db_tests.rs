@@ -850,3 +850,390 @@ pub async fn test_create_empty_file_in_root() {
 		_ => panic!("Expected to find a file object in test directory"),
 	}
 }
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_file_success() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss
+		.client
+		.make_file_builder("trash_me.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer
+		.write_all(b"This file will be trashed")
+		.await
+		.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	// Update the database to include the file
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Verify file exists before trashing
+	let result = db.query_item(&file_path).unwrap();
+	assert!(result.is_some());
+
+	// Trash the file
+	db.trash_item(&client, file_path.clone()).await.unwrap();
+
+	// Verify file is removed from database
+	let result = db.query_item(&file_path).unwrap();
+	assert!(result.is_none());
+
+	// Verify file is no longer in parent directory listing
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+	let file_exists = children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()));
+	assert!(!file_exists);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_directory_success() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test directory
+	let dir = rss
+		.client
+		.create_dir(&rss.dir, "trash_this_dir".to_string())
+		.await
+		.unwrap();
+
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), dir.name()).into();
+
+	// Update the database to include the directory
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Verify directory exists before trashing
+	let result = db.query_item(&dir_path).unwrap();
+	assert!(result.is_some());
+
+	// Trash the directory
+	db.trash_item(&client, dir_path.clone()).await.unwrap();
+
+	// Verify directory is removed from database
+	let result = db.query_item(&dir_path).unwrap();
+	assert!(result.is_none());
+
+	// Verify directory is no longer in parent directory listing
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+	let dir_exists = children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == dir.uuid().to_string()));
+	assert!(!dir_exists);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_directory_with_contents() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a directory with nested content
+	let parent_dir = rss
+		.client
+		.create_dir(&rss.dir, "parent_to_trash".to_string())
+		.await
+		.unwrap();
+
+	// Add a subdirectory
+	let sub_dir = rss
+		.client
+		.create_dir(&parent_dir, "subdirectory".to_string())
+		.await
+		.unwrap();
+
+	// Add a file to the parent directory
+	let file_in_parent = rss
+		.client
+		.make_file_builder("file_in_parent.txt", &parent_dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file_in_parent);
+	file_writer.write_all(b"Content in parent").await.unwrap();
+	file_writer.close().await.unwrap();
+
+	// Add a file to the subdirectory
+	let file_in_sub = rss
+		.client
+		.make_file_builder("file_in_sub.txt", &sub_dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file_in_sub);
+	file_writer
+		.write_all(b"Content in subdirectory")
+		.await
+		.unwrap();
+	file_writer.close().await.unwrap();
+
+	// Update database with all the content
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_dir_path: FfiPathWithRoot = format!("{}/{}", base_path.0, parent_dir.name()).into();
+	let sub_dir_path: FfiPathWithRoot = format!("{}/{}", parent_dir_path.0, sub_dir.name()).into();
+
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, parent_dir_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, sub_dir_path.clone())
+		.await
+		.unwrap();
+
+	// Verify all content exists
+	assert!(db.query_item(&parent_dir_path).unwrap().is_some());
+	assert!(db.query_item(&sub_dir_path).unwrap().is_some());
+
+	// Trash the parent directory (should remove everything)
+	db.trash_item(&client, parent_dir_path.clone())
+		.await
+		.unwrap();
+
+	// Verify parent directory is gone
+	assert!(db.query_item(&parent_dir_path).unwrap().is_none());
+
+	// Verify subdirectory is also gone (cascading delete)
+	assert!(db.query_item(&sub_dir_path).unwrap().is_none());
+
+	// Verify parent directory is no longer in base directory listing
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+	let children = db.query_dir_children(&base_path, None).unwrap().unwrap();
+	let parent_exists = children.objects.iter().any(
+		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == parent_dir.uuid().to_string()),
+	);
+	assert!(!parent_exists);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_root_directory_error() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Attempt to trash the root directory
+	let root_path: FfiPathWithRoot = client.root_uuid().into();
+	let result = db.trash_item(&client, root_path).await;
+
+	// Should fail with appropriate error
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("Cannot remove root directory"));
+	assert!(error_message.contains(&rss.client.root().uuid().to_string()));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_nonexistent_file() {
+	let (db, client, rss) = get_db_resources().await;
+
+	let nonexistent_path: FfiPathWithRoot = format!(
+		"{}/{}/nonexistent_file.txt",
+		client.root_uuid(),
+		rss.dir.name()
+	)
+	.into();
+
+	// Should fail when trying to trash a non-existent file
+	let result = db.trash_item(&client, nonexistent_path).await;
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to an item"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_nonexistent_directory() {
+	let (db, client, rss) = get_db_resources().await;
+
+	let nonexistent_path: FfiPathWithRoot =
+		format!("{}/{}/nonexistent_dir", client.root_uuid(), rss.dir.name()).into();
+
+	// Should fail when trying to trash a non-existent directory
+	let result = db.trash_item(&client, nonexistent_path).await;
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to an item"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_invalid_path() {
+	let (db, client, _rss) = get_db_resources().await;
+
+	let invalid_path: FfiPathWithRoot = "not-a-uuid/invalid/path".into();
+	let result = db.trash_item(&client, invalid_path).await;
+
+	// Should fail with UUID parsing error
+	assert!(result.is_err());
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_partial_path() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a directory structure but don't update all levels
+	let level1 = rss
+		.client
+		.create_dir(&rss.dir, "level1".to_string())
+		.await
+		.unwrap();
+
+	rss.client
+		.create_dir(&level1, "level2".to_string())
+		.await
+		.unwrap();
+
+	// Only update the base directory, not the nested ones
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, base_path).await.unwrap();
+
+	// Try to trash level2 without having updated level1's children
+	let level2_path: FfiPathWithRoot =
+		format!("{}/{}/level1/level2", client.root_uuid(), rss.dir.name()).into();
+
+	db.trash_item(&client, level2_path).await.unwrap();
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_file_then_query_parent() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create multiple files in the same directory
+	let file1 = rss
+		.client
+		.make_file_builder("keep_me.txt", &rss.dir)
+		.build();
+	let mut file1_writer = rss.client.get_file_writer(file1);
+	file1_writer.write_all(b"Keep this file").await.unwrap();
+	file1_writer.close().await.unwrap();
+	let file1 = file1_writer.into_remote_file().unwrap();
+
+	let file2 = rss
+		.client
+		.make_file_builder("trash_me.txt", &rss.dir)
+		.build();
+	let mut file2_writer = rss.client.get_file_writer(file2);
+	file2_writer.write_all(b"Trash this file").await.unwrap();
+	file2_writer.close().await.unwrap();
+	let file2 = file2_writer.into_remote_file().unwrap();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let file2_path: FfiPathWithRoot = format!("{}/{}", parent_path.0, file2.name()).into();
+
+	// Update database
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Verify both files exist
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+	assert_eq!(children.objects.len(), 2);
+
+	// Trash one file
+	db.trash_item(&client, file2_path).await.unwrap();
+
+	// Update parent and verify only one file remains
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+	assert_eq!(children.objects.len(), 1);
+
+	// Verify it's the correct remaining file
+	assert!(matches!(
+		&children.objects[0],
+		FfiNonRootObject::File(f) if f.uuid == file1.uuid().to_string()
+	));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_empty_directory() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create an empty directory
+	let empty_dir = rss
+		.client
+		.create_dir(&rss.dir, "empty_dir".to_string())
+		.await
+		.unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		empty_dir.name()
+	)
+	.into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+
+	// Update database
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Verify directory exists and is empty
+	assert!(db.query_item(&dir_path).unwrap().is_some());
+	let empty_children = db.query_dir_children(&dir_path, None).unwrap().unwrap();
+	assert_eq!(empty_children.objects.len(), 0);
+
+	// Trash the empty directory
+	db.trash_item(&client, dir_path.clone()).await.unwrap();
+
+	// Verify it's gone
+	assert!(db.query_item(&dir_path).unwrap().is_none());
+
+	// Verify parent no longer contains it
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	let parent_children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+	let dir_exists = parent_children.objects.iter().any(
+		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == empty_dir.uuid().to_string()),
+	);
+	assert!(!dir_exists);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_trash_item_already_trashed_file() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create and trash a file using the SDK directly first
+	let file = rss
+		.client
+		.make_file_builder("already_trashed.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer
+		.write_all(b"This will be trashed twice")
+		.await
+		.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	// Trash it directly via SDK
+	rss.client.trash_file(&file).await.unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	// Now try to trash it via our method - should fail since it doesn't exist in our DB
+	let result = db.trash_item(&client, file_path).await;
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to an item"));
+}
