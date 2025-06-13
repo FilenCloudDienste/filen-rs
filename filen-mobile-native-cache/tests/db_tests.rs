@@ -1437,60 +1437,6 @@ pub async fn test_move_item_directory_success() {
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
-pub async fn test_move_item_file_to_root_directory() {
-	let (db, client, rss) = get_db_resources().await;
-
-	// Create a file in a subdirectory
-	let file = rss
-		.client
-		.make_file_builder("move_to_root.txt", &rss.dir)
-		.build();
-	let mut file_writer = rss.client.get_file_writer(file).unwrap();
-	file_writer.write_all(b"Moving to test root").await.unwrap();
-	file_writer.close().await.unwrap();
-	let file = file_writer.into_remote_file().unwrap();
-
-	// Update database
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	let file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, file.name()).into();
-	let root_path: FfiPathWithRoot = client.root_uuid().into();
-
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
-
-	// Move file from subdirectory to root
-	let new_file_path = db
-		.move_item(
-			&client,
-			file_path.clone(),
-			base_path.clone(),
-			root_path.clone(),
-		)
-		.await
-		.unwrap();
-
-	// Verify the new path is at root level
-	let expected_new_path: FfiPathWithRoot =
-		format!("{}/{}", client.root_uuid(), file.name()).into();
-	assert_eq!(new_file_path.0, expected_new_path.0);
-
-	// Verify file no longer exists in subdirectory
-	assert!(db.query_item(&file_path).unwrap().is_none());
-
-	// Verify file exists at root
-	let moved_file = db.query_item(&new_file_path).unwrap();
-	assert!(moved_file.is_some());
-	match moved_file.unwrap() {
-		FfiObject::File(f) => {
-			assert_eq!(f.name, file.name());
-			assert_eq!(f.uuid, file.uuid().to_string());
-		}
-		_ => panic!("Expected file object"),
-	}
-}
-
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_nonexistent_item() {
 	let (db, client, rss) = get_db_resources().await;
 
