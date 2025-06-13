@@ -50,8 +50,13 @@ impl<'a> FileMeta<'a> {
 		&self.name
 	}
 
-	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) {
-		self.name = name.into();
+	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) -> Result<(), Error> {
+		let name = name.into();
+		if name.is_empty() {
+			return Err(Error::InvalidName(name.into()));
+		}
+		self.name = name;
+		Ok(())
 	}
 
 	pub fn mime(&self) -> &str {

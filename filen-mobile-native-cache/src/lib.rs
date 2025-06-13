@@ -246,7 +246,7 @@ impl FilenMobileDB {
 			.make_file_builder(name, &parent.uuid())
 			.mime(mime)
 			.build();
-		let mut writer = client.client.get_file_writer(file);
+		let mut writer = client.client.get_file_writer(file)?;
 		writer.close().await?;
 		let file = writer
 			.into_remote_file()

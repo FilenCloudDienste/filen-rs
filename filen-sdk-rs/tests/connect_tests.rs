@@ -28,18 +28,18 @@ async fn dir_public_link() {
 		.unwrap();
 
 	let dir_file = client.make_file_builder("empty_dir.txt", &dir).build();
-	let mut writer = client.get_file_writer(dir_file);
+	let mut writer = client.get_file_writer(dir_file).unwrap();
 	writer.close().await.unwrap();
 	let dir_file = writer.into_remote_file().unwrap();
 
 	let file = client.make_file_builder("a.txt", &sub_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
 	let file = writer.into_remote_file().unwrap();
 
 	let empty_file = client.make_file_builder("empty.txt", &sub_dir).build();
-	let mut writer = client.get_file_writer(empty_file);
+	let mut writer = client.get_file_writer(empty_file).unwrap();
 	writer.close().await.unwrap();
 	let empty_file = writer.into_remote_file().unwrap();
 
@@ -84,7 +84,7 @@ async fn dir_public_link() {
 	let sub_sub_file = client
 		.make_file_builder("sub_sub_file.txt", &sub_dir)
 		.build();
-	let mut writer = client.get_file_writer(sub_sub_file);
+	let mut writer = client.get_file_writer(sub_sub_file).unwrap();
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
 	let mut sub_sub_file = writer.into_remote_file().unwrap();
@@ -96,7 +96,7 @@ async fn dir_public_link() {
 	assert_eq!(sub_files.len(), 3);
 
 	let mut meta = sub_sub_file.get_meta();
-	meta.set_name("new_file_name.txt");
+	meta.set_name("new_file_name.txt").unwrap();
 	client
 		.update_file_metadata(&mut sub_sub_file, meta)
 		.await
@@ -107,7 +107,7 @@ async fn dir_public_link() {
 	assert!(found_file.is_some());
 
 	let mut meta = sub_dir.get_meta();
-	meta.set_name("new_dir_name");
+	meta.set_name("new_dir_name").unwrap();
 	client
 		.update_dir_metadata(&mut sub_dir, meta)
 		.await
@@ -132,7 +132,7 @@ async fn file_public_link() {
 	let test_dir = &resources.dir;
 
 	let file = client.make_file_builder("a.txt", test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
 	let mut file = writer.into_remote_file().unwrap();
@@ -172,7 +172,7 @@ async fn file_public_link() {
 	assert_eq!(found_linked_info, linked_info);
 
 	let mut meta = file.get_meta();
-	meta.set_name("new_file_name.txt");
+	meta.set_name("new_file_name.txt").unwrap();
 	client.update_file_metadata(&mut file, meta).await.unwrap();
 	let linked_info = client.get_linked_file(&link).await.unwrap();
 	assert_eq!(linked_info.name, "new_file_name.txt");
@@ -324,12 +324,12 @@ async fn share_dir() {
 		.await
 		.unwrap();
 	let dir_file = client.make_file_builder("a.txt", &dir).build();
-	let mut writer = client.get_file_writer(dir_file);
+	let mut writer = client.get_file_writer(dir_file).unwrap();
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
 	let mut dir_file = writer.into_remote_file().unwrap();
 	let file = client.make_file_builder("a.txt", &sub_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.close().await.unwrap();
 
 	let _locks = set_up_contact(client, share_client).await;
@@ -381,11 +381,11 @@ async fn share_dir() {
 
 	// change metadata
 	let mut meta = dir.get_meta();
-	meta.set_name("new_name");
+	meta.set_name("new_name").unwrap();
 	client.update_dir_metadata(&mut dir, meta).await.unwrap();
 
 	let mut meta = dir_file.get_meta();
-	meta.set_name("new_file_name.txt");
+	meta.set_name("new_file_name.txt").unwrap();
 	client
 		.update_file_metadata(&mut dir_file, meta)
 		.await
@@ -411,7 +411,7 @@ async fn share_file() {
 	let _locks = set_up_contact(client, share_client).await;
 
 	let file = client.make_file_builder("a.txt", test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello, world!").await.unwrap();
 	writer.close().await.unwrap();
 	let mut file = writer.into_remote_file().unwrap();
@@ -441,7 +441,7 @@ async fn share_file() {
 	assert_eq!(buf, b"Hello, world!");
 
 	let mut meta = file.get_meta();
-	meta.set_name("new_file_name.txt");
+	meta.set_name("new_file_name.txt").unwrap();
 	let new_created = Utc::now();
 	meta.set_created(new_created);
 	client.update_file_metadata(&mut file, meta).await.unwrap();

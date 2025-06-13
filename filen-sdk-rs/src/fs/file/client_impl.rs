@@ -131,7 +131,16 @@ impl Client {
 		FileBuilder::new(name, parent, self)
 	}
 
-	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> FileWriter<'_> {
-		FileWriter::new(file.into(), self)
+	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> Result<FileWriter<'_>, Error> {
+		let file: Arc<BaseFile> = file.into();
+		if file.root.name.is_empty() {
+			let name = match Arc::try_unwrap(file).map(|f| f.root.name) {
+				Ok(name) => name,
+				Err(file) => file.name().to_string(),
+			};
+			Err(Error::InvalidName(name))
+		} else {
+			Ok(FileWriter::new(file, self))
+		}
 	}
 }

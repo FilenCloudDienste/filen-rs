@@ -5,7 +5,10 @@ use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{self, shared::MetaCrypter};
+use crate::{
+	crypto::{self, shared::MetaCrypter},
+	error::Error,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DirectoryMeta<'a> {
@@ -45,8 +48,13 @@ impl<'a> DirectoryMeta<'a> {
 		self.created
 	}
 
-	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) {
-		self.name = name.into();
+	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) -> Result<(), Error> {
+		let name = name.into();
+		if name.is_empty() {
+			return Err(Error::InvalidName(name.into()));
+		}
+		self.name = name;
+		Ok(())
 	}
 
 	pub fn set_created(&mut self, created: DateTime<Utc>) {

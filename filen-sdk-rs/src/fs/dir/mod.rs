@@ -5,7 +5,7 @@ use filen_types::{crypto::EncryptedString, fs::ObjectType};
 use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, SetDirMeta};
 use uuid::Uuid;
 
-use crate::crypto::shared::MetaCrypter;
+use crate::{crypto::shared::MetaCrypter, error::Error};
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
@@ -164,15 +164,18 @@ impl RemoteDirectory {
 		}
 	}
 
-	pub fn new(name: String, parent: Uuid, created: DateTime<Utc>) -> Self {
-		Self {
+	pub fn new(name: String, parent: Uuid, created: DateTime<Utc>) -> Result<Self, Error> {
+		if name.is_empty() {
+			return Err(Error::InvalidName(name));
+		}
+		Ok(Self {
 			uuid: Uuid::new_v4(),
 			name,
 			parent,
 			color: None,
 			created: Some(created.round_subsecs(3)),
 			favorited: false,
-		}
+		})
 	}
 
 	pub(crate) fn set_uuid(&mut self, uuid: Uuid) {

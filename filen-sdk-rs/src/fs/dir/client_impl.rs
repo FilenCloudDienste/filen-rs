@@ -24,7 +24,7 @@ impl Client {
 		parent: &dyn HasContents,
 		name: String,
 	) -> Result<RemoteDirectory, Error> {
-		let mut dir = RemoteDirectory::new(name, parent.uuid(), chrono::Utc::now());
+		let mut dir = RemoteDirectory::new(name, parent.uuid(), chrono::Utc::now())?;
 
 		let response = api::v3::dir::create::post(
 			self.client(),

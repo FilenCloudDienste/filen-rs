@@ -301,7 +301,7 @@ async fn dir_update_meta() {
 	);
 
 	let mut meta = dir.get_meta();
-	meta.set_name("new_name");
+	meta.set_name("new_name").unwrap();
 
 	client.update_dir_metadata(&mut dir, meta).await.unwrap();
 

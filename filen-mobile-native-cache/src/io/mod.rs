@@ -132,7 +132,9 @@ pub async fn upload_file(
 		.make_file_builder(file_name, &parent_uuid)
 		.created(meta.created()?.into())
 		.modified(metadata_modified(&meta));
-	let writer = client.get_file_writer(file.build());
+	let writer = client
+		.get_file_writer(file.build())
+		.map_err(|e| io::Error::new(io::ErrorKind::InvalidFilename, e))?;
 	let mut compat_writer = writer.compat_write();
 	let file_size = metadata_size(meta);
 

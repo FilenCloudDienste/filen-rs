@@ -21,7 +21,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let test_dir = &resources.dir;
 
 	let file = client.make_file_builder(name, test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(contents).await.unwrap();
 	writer.close().await.unwrap();
 	let file = writer.into_remote_file().unwrap();
@@ -80,7 +80,7 @@ async fn file_search() {
 	let file_name = format!("{}{}.txt", file_random_part_long, file_random_part_short);
 
 	let file = client.make_file_builder(&file_name, &second_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.close().await.unwrap();
 	let file = writer.into_remote_file().unwrap();
 
@@ -119,7 +119,7 @@ async fn file_trash() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	let file = writer.into_remote_file().unwrap();
@@ -164,7 +164,7 @@ async fn file_delete_permanently() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	let file = writer.into_remote_file().unwrap();
@@ -205,7 +205,7 @@ async fn file_move() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	let mut file = writer.into_remote_file().unwrap();
@@ -254,7 +254,7 @@ async fn file_update_meta() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	let mut file = writer.into_remote_file().unwrap();
@@ -268,7 +268,7 @@ async fn file_update_meta() {
 	);
 
 	let mut meta = file.get_meta();
-	meta.set_name("new_name.json");
+	meta.set_name("new_name.json").unwrap();
 
 	client.update_file_metadata(&mut file, meta).await.unwrap();
 
@@ -318,7 +318,7 @@ async fn file_exists() {
 	);
 
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	let mut file = writer.into_remote_file().unwrap();
@@ -330,7 +330,7 @@ async fn file_exists() {
 
 	let mut meta = file.get_meta();
 	let new_name = "new_name.json";
-	meta.set_name(new_name);
+	meta.set_name(new_name).unwrap();
 	client.update_file_metadata(&mut file, meta).await.unwrap();
 
 	assert_eq!(
@@ -355,7 +355,7 @@ async fn file_trash_empty() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	let file = writer.into_remote_file().unwrap();

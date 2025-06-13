@@ -120,7 +120,7 @@ pub async fn test_query_children_with_files_and_dirs() {
 		.client
 		.make_file_builder("test_file.txt", &rss.dir)
 		.build();
-	let mut file = rss.client.get_file_writer(file);
+	let mut file = rss.client.get_file_writer(file).unwrap();
 	file.write_all(b"Hello, world!").await.unwrap();
 	file.close().await.unwrap();
 	let file = file.into_remote_file().unwrap();
@@ -158,7 +158,7 @@ pub async fn test_query_children_sorting_by_size() {
 
 	// Create files with different sizes
 	let large_file = rss.client.make_file_builder("large.txt", &rss.dir).build();
-	let mut large_writer = rss.client.get_file_writer(large_file);
+	let mut large_writer = rss.client.get_file_writer(large_file).unwrap();
 	large_writer
 		.write_all(b"This is a much larger file with more content")
 		.await
@@ -167,12 +167,12 @@ pub async fn test_query_children_sorting_by_size() {
 	let large_file = large_writer.into_remote_file().unwrap();
 
 	let small_file = rss.client.make_file_builder("small.txt", &rss.dir).build();
-	let mut small_writer = rss.client.get_file_writer(small_file);
+	let mut small_writer = rss.client.get_file_writer(small_file).unwrap();
 	small_writer.write_all(b"small").await.unwrap();
 	small_writer.close().await.unwrap();
 
 	let empty_file = rss.client.make_file_builder("empty.txt", &rss.dir).build();
-	let mut empty_writer = rss.client.get_file_writer(empty_file);
+	let mut empty_writer = rss.client.get_file_writer(empty_file).unwrap();
 	empty_writer.close().await.unwrap();
 	let empty_file = empty_writer.into_remote_file().unwrap();
 
@@ -223,11 +223,11 @@ pub async fn test_query_children_sorting_by_name() {
 		.unwrap();
 
 	let alpha_file = rss.client.make_file_builder("alpha.txt", &rss.dir).build();
-	let mut alpha_writer = rss.client.get_file_writer(alpha_file);
+	let mut alpha_writer = rss.client.get_file_writer(alpha_file).unwrap();
 	alpha_writer.close().await.unwrap();
 
 	let beta_file = rss.client.make_file_builder("beta.txt", &rss.dir).build();
-	let mut beta_writer = rss.client.get_file_writer(beta_file);
+	let mut beta_writer = rss.client.get_file_writer(beta_file).unwrap();
 	beta_writer.close().await.unwrap();
 
 	db.update_dir_children(&client, test_dir_path.clone())
@@ -272,7 +272,7 @@ pub async fn test_query_children_after_deletion() {
 		.client
 		.make_file_builder("persistent.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
 
@@ -323,7 +323,7 @@ pub async fn test_query_item_file() {
 		.client
 		.make_file_builder("query_test.txt", &rss.dir)
 		.build();
-	let mut file = rss.client.get_file_writer(file);
+	let mut file = rss.client.get_file_writer(file).unwrap();
 	file.write_all(b"Test content").await.unwrap();
 	file.close().await.unwrap();
 	let file = file.into_remote_file().unwrap();
@@ -441,7 +441,7 @@ pub async fn test_query_item_deeply_nested() {
 		.client
 		.make_file_builder("deep_file.txt", &level2)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(deep_file);
+	let mut file_writer = rss.client.get_file_writer(deep_file).unwrap();
 	file_writer.write_all(b"Deep content").await.unwrap();
 	file_writer.close().await.unwrap();
 	let deep_file = file_writer.into_remote_file().unwrap();
@@ -496,7 +496,7 @@ pub async fn test_download_file() {
 		.client
 		.make_file_builder("test_download.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(test_content).await.unwrap();
 	file_writer.close().await.unwrap();
 	let remote_file = file_writer.into_remote_file().unwrap();
@@ -604,7 +604,7 @@ pub async fn test_upload_file_if_changed_unchanged_file() {
 		.client
 		.make_file_builder("hash_test.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(test_content).await.unwrap();
 	file_writer.close().await.unwrap();
 	let remote_file = file_writer.into_remote_file().unwrap();
@@ -645,7 +645,7 @@ pub async fn test_upload_file_if_changed_modified_file() {
 		.client
 		.make_file_builder("modify_test.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(original_content).await.unwrap();
 	file_writer.close().await.unwrap();
 
@@ -860,7 +860,7 @@ pub async fn test_trash_item_file_success() {
 		.client
 		.make_file_builder("trash_me.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer
 		.write_all(b"This file will be trashed")
 		.await
@@ -966,7 +966,7 @@ pub async fn test_trash_item_directory_with_contents() {
 		.client
 		.make_file_builder("file_in_parent.txt", &parent_dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file_in_parent);
+	let mut file_writer = rss.client.get_file_writer(file_in_parent).unwrap();
 	file_writer.write_all(b"Content in parent").await.unwrap();
 	file_writer.close().await.unwrap();
 
@@ -975,7 +975,7 @@ pub async fn test_trash_item_directory_with_contents() {
 		.client
 		.make_file_builder("file_in_sub.txt", &sub_dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file_in_sub);
+	let mut file_writer = rss.client.get_file_writer(file_in_sub).unwrap();
 	file_writer
 		.write_all(b"Content in subdirectory")
 		.await
@@ -1117,7 +1117,7 @@ pub async fn test_trash_item_file_then_query_parent() {
 		.client
 		.make_file_builder("keep_me.txt", &rss.dir)
 		.build();
-	let mut file1_writer = rss.client.get_file_writer(file1);
+	let mut file1_writer = rss.client.get_file_writer(file1).unwrap();
 	file1_writer.write_all(b"Keep this file").await.unwrap();
 	file1_writer.close().await.unwrap();
 	let file1 = file1_writer.into_remote_file().unwrap();
@@ -1126,7 +1126,7 @@ pub async fn test_trash_item_file_then_query_parent() {
 		.client
 		.make_file_builder("trash_me.txt", &rss.dir)
 		.build();
-	let mut file2_writer = rss.client.get_file_writer(file2);
+	let mut file2_writer = rss.client.get_file_writer(file2).unwrap();
 	file2_writer.write_all(b"Trash this file").await.unwrap();
 	file2_writer.close().await.unwrap();
 	let file2 = file2_writer.into_remote_file().unwrap();
@@ -1217,7 +1217,7 @@ pub async fn test_trash_item_already_trashed_file() {
 		.client
 		.make_file_builder("already_trashed.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer
 		.write_all(b"This will be trashed twice")
 		.await
@@ -1260,7 +1260,7 @@ pub async fn test_move_item_file_success() {
 		.client
 		.make_file_builder("move_me.txt", &source_dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(b"Content to move").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
@@ -1362,7 +1362,7 @@ pub async fn test_move_item_directory_success() {
 		.client
 		.make_file_builder("content.txt", &move_dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file_in_move_dir);
+	let mut file_writer = rss.client.get_file_writer(file_in_move_dir).unwrap();
 	file_writer
 		.write_all(b"Content in moved dir")
 		.await
@@ -1445,7 +1445,7 @@ pub async fn test_move_item_file_to_root_directory() {
 		.client
 		.make_file_builder("move_to_root.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(b"Moving to test root").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
@@ -1528,7 +1528,7 @@ pub async fn test_move_item_nonexistent_destination() {
 		.client
 		.make_file_builder("move_me.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(b"Content").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
@@ -1573,7 +1573,7 @@ pub async fn test_move_item_invalid_parent_path() {
 		.client
 		.make_file_builder("test_file.txt", &source_dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(b"Content").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
@@ -1608,7 +1608,7 @@ pub async fn test_move_item_destination_is_file() {
 		.client
 		.make_file_builder("move_me.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(move_file);
+	let mut file_writer = rss.client.get_file_writer(move_file).unwrap();
 	file_writer.write_all(b"Content to move").await.unwrap();
 	file_writer.close().await.unwrap();
 	let move_file = file_writer.into_remote_file().unwrap();
@@ -1618,7 +1618,7 @@ pub async fn test_move_item_destination_is_file() {
 		.client
 		.make_file_builder("dest_file.txt", &rss.dir)
 		.build();
-	let mut dest_writer = rss.client.get_file_writer(dest_file);
+	let mut dest_writer = rss.client.get_file_writer(dest_file).unwrap();
 	dest_writer
 		.write_all(b"This is not a directory")
 		.await
@@ -1680,7 +1680,7 @@ pub async fn test_move_item_same_directory() {
 		.client
 		.make_file_builder("stay_here.txt", &rss.dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(b"Content").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
@@ -1739,7 +1739,7 @@ pub async fn test_move_item_nested_directory_structure() {
 		.client
 		.make_file_builder("nested_file.txt", &level2)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(b"Nested content").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
@@ -1840,7 +1840,7 @@ pub async fn test_move_item_directory_with_contents() {
 		.client
 		.make_file_builder("file_in_source.txt", &source_dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file_in_source);
+	let mut file_writer = rss.client.get_file_writer(file_in_source).unwrap();
 	file_writer.write_all(b"Source content").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file_in_source = file_writer.into_remote_file().unwrap();
@@ -1849,7 +1849,7 @@ pub async fn test_move_item_directory_with_contents() {
 		.client
 		.make_file_builder("file_in_sub.txt", &sub_dir)
 		.build();
-	let mut sub_file_writer = rss.client.get_file_writer(file_in_sub);
+	let mut sub_file_writer = rss.client.get_file_writer(file_in_sub).unwrap();
 	sub_file_writer.write_all(b"Sub content").await.unwrap();
 	sub_file_writer.close().await.unwrap();
 
@@ -1992,7 +1992,7 @@ pub async fn test_move_item_partial_path_resolution() {
 		.client
 		.make_file_builder("deep_file.txt", &level2)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file);
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
 	file_writer.write_all(b"Deep content").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file = file_writer.into_remote_file().unwrap();
@@ -2043,7 +2043,7 @@ pub async fn test_move_item_name_collision_handling() {
 		.client
 		.make_file_builder("duplicate_name.txt", &source_dir)
 		.build();
-	let mut file_writer = rss.client.get_file_writer(file_to_move);
+	let mut file_writer = rss.client.get_file_writer(file_to_move).unwrap();
 	file_writer.write_all(b"Content to move").await.unwrap();
 	file_writer.close().await.unwrap();
 	let file_to_move = file_writer.into_remote_file().unwrap();
@@ -2059,7 +2059,7 @@ pub async fn test_move_item_name_collision_handling() {
 		.client
 		.make_file_builder("duplicate_name.txt", &dest_dir)
 		.build();
-	let mut existing_writer = rss.client.get_file_writer(existing_file);
+	let mut existing_writer = rss.client.get_file_writer(existing_file).unwrap();
 	existing_writer
 		.write_all(b"Existing content")
 		.await
@@ -2123,7 +2123,7 @@ pub async fn test_move_item_multiple_files_same_operation() {
 		.client
 		.make_file_builder("file1.txt", &source_dir)
 		.build();
-	let mut writer1 = rss.client.get_file_writer(file1);
+	let mut writer1 = rss.client.get_file_writer(file1).unwrap();
 	writer1.write_all(b"Content 1").await.unwrap();
 	writer1.close().await.unwrap();
 	let file1 = writer1.into_remote_file().unwrap();
@@ -2132,7 +2132,7 @@ pub async fn test_move_item_multiple_files_same_operation() {
 		.client
 		.make_file_builder("file2.txt", &source_dir)
 		.build();
-	let mut writer2 = rss.client.get_file_writer(file2);
+	let mut writer2 = rss.client.get_file_writer(file2).unwrap();
 	writer2.write_all(b"Content 2").await.unwrap();
 	writer2.close().await.unwrap();
 	let file2 = writer2.into_remote_file().unwrap();

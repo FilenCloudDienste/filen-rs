@@ -114,12 +114,12 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 
 	let empty_file = client.make_file_builder("empty.txt", &compat_dir).build();
-	let mut writer = client.get_file_writer(empty_file);
+	let mut writer = client.get_file_writer(empty_file).unwrap();
 	writer.write_all(b"").await.unwrap();
 	writer.close().await.unwrap();
 
 	let small_file = client.make_file_builder("small.txt", &compat_dir).build();
-	let mut writer = client.get_file_writer(small_file);
+	let mut writer = client.get_file_writer(small_file).unwrap();
 	writer.write_all(b"Hello World from Rust!").await.unwrap();
 	writer.close().await.unwrap();
 	writer.into_remote_file().unwrap();
@@ -128,7 +128,7 @@ async fn make_rs_compat_dir() {
 	// fill with random bytes
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
 	let big_file = client.make_file_builder("big.txt", &compat_dir).build();
-	let mut writer = client.get_file_writer(big_file);
+	let mut writer = client.get_file_writer(big_file).unwrap();
 	writer
 		.write_all(faster_hex::hex_string(&big_random_bytes).as_bytes())
 		.await
@@ -137,14 +137,14 @@ async fn make_rs_compat_dir() {
 
 	let (file, test_str) = get_compat_test_file(client, &compat_dir);
 	let file = file.build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer.write_all(test_str.as_bytes()).await.unwrap();
 	writer.close().await.unwrap();
 
 	let file = client
 		.make_file_builder("nameSplitter.json", &compat_dir)
 		.build();
-	let mut writer = client.get_file_writer(file);
+	let mut writer = client.get_file_writer(file).unwrap();
 	writer
 		.write_all(
 			serde_json::to_string(&get_name_splitter_test_value())

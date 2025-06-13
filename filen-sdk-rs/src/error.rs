@@ -24,6 +24,8 @@ pub enum Error {
 	InvalidState(String, String),
 	#[error("Invalid type: `{0:?}`, expected: `{1:?}`")]
 	InvalidType(ObjectType, ObjectType),
+	#[error("Invalid Name '{0}'")]
+	InvalidName(String),
 }
 
 pub trait ErrorExt<T, E> {
