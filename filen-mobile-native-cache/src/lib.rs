@@ -5,7 +5,11 @@ use std::{
 
 use ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiObject, FfiRoot};
 use filen_sdk_rs::{
-	fs::{HasName, HasParent, HasUUID},
+	fs::{
+		HasName, HasParent, HasUUID,
+		dir::{RemoteDirectory, traits::HasDirMeta},
+		file::{RemoteFile, traits::HasFileMeta},
+	},
 	util::PathIteratorExt,
 };
 use futures::AsyncWriteExt;
@@ -401,7 +405,7 @@ impl FilenMobileDB {
 				)?;
 			}
 			DBNonRootObject::File(dbfile) => {
-				let mut remote_file: filen_sdk_rs::fs::file::RemoteFile = dbfile.try_into()?;
+				let mut remote_file: RemoteFile = dbfile.try_into()?;
 				client
 					.client
 					.move_file(&mut remote_file, &new_parent_dir.uuid())
@@ -415,6 +419,64 @@ impl FilenMobileDB {
 			}
 		}
 		Ok(new_parent.join(item_pvs.name))
+	}
+
+	pub async fn rename_item(
+		&self,
+		client: &CacheClient,
+		item: FfiPathWithRoot,
+		new_name: String,
+	) -> Result<Option<FfiPathWithRoot>> {
+		let item_pvs: PathValues<'_> = item.as_path_values()?;
+		if item_pvs.name.is_empty() {
+			return Err(CacheError::remote(format!(
+				"Cannot rename item: {}",
+				item.0
+			)));
+		} else if item_pvs.name == new_name {
+			return Ok(None);
+		}
+		self.update_dir_children(client, item.parent()).await?;
+		let obj = match sql::select_object_at_path(&self.conn(), &item_pvs)? {
+			Some(obj) => DBNonRootObject::try_from(obj).map_err(|e| {
+				CacheError::remote(format!(
+					"Path {} does not point to a non-root item: {}",
+					item_pvs.full_path, e
+				))
+			})?,
+			None => {
+				return Err(CacheError::remote(format!(
+					"Path {} does not point to an item",
+					item_pvs.full_path
+				)));
+			}
+		};
+		let new_path = item.parent().join(&new_name);
+		match obj {
+			DBNonRootObject::Dir(dbdir) => {
+				let id = dbdir.id;
+				let mut remote_dir: RemoteDirectory = dbdir.into();
+				let mut meta = remote_dir.get_meta();
+				meta.set_name(&new_name)?;
+				client
+					.client
+					.update_dir_metadata(&mut remote_dir, meta)
+					.await?;
+				sql::rename_item(&mut self.conn(), id, &new_name, remote_dir.parent())?;
+			}
+			DBNonRootObject::File(dbfile) => {
+				let id = dbfile.id;
+				let mut remote_file: RemoteFile = dbfile.try_into()?;
+				let mut meta = remote_file.get_meta();
+				meta.set_name(&new_name)?;
+				client
+					.client
+					.update_file_metadata(&mut remote_file, meta)
+					.await?;
+				sql::rename_item(&mut self.conn(), id, &new_name, remote_file.parent())?;
+			}
+		}
+		Ok(Some(new_path))
 	}
 }
 
@@ -469,7 +531,6 @@ pub struct PathValues<'a> {
 impl FfiPathWithRoot {
 	pub fn as_path_values(&self) -> Result<PathValues> {
 		let mut iter = self.0.path_iter();
-
 		let (root_uuid_str, remaining) = iter
 			.next()
 			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;

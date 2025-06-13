@@ -939,6 +939,7 @@ impl DBDirTrait for DBDirObject {
 	}
 }
 
+#[derive(Debug)]
 pub enum DBNonRootObject {
 	Dir(DBDir),
 	File(DBFile),

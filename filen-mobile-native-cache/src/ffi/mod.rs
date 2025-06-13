@@ -146,6 +146,16 @@ impl FfiPathWithRoot {
 		new.push_str(other);
 		FfiPathWithRoot(new)
 	}
+
+	pub fn parent(&self) -> Self {
+		let mut new = self.0.clone();
+		if let Some(last_slash) = new.rfind('/') {
+			new.truncate(last_slash);
+		} else {
+			new.clear(); // If no slash found, return empty path
+		}
+		FfiPathWithRoot(new)
+	}
 }
 
 impl From<String> for FfiPathWithRoot {

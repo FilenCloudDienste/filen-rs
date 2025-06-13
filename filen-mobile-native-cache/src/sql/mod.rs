@@ -113,3 +113,20 @@ pub(crate) fn move_item(
 	tx.commit()?;
 	Ok(())
 }
+
+pub(crate) fn rename_item(
+	conn: &mut Connection,
+	id: i64,
+	new_name: &str,
+	parent: Uuid,
+) -> Result<(), rusqlite::Error> {
+	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
+	{
+		let mut stmt = tx.prepare_cached("DELETE FROM items WHERE name = ? AND parent = ?;")?;
+		stmt.execute((&new_name, parent))?;
+		let mut stmt = tx.prepare_cached("UPDATE items SET name = ? WHERE id = ?;")?;
+		stmt.execute((&new_name, id))?;
+	}
+	tx.commit()?;
+	Ok(())
+}

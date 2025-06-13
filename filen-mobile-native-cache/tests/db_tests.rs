@@ -2094,10 +2094,6 @@ pub async fn test_move_item_name_collision_handling() {
 
 	// The move operation should succeed - the SDK typically handles name conflicts
 	// by either overwriting or creating a new name variant
-	println!(
-		"New file path: {} old file path {}",
-		new_file_path.0, file_path.0
-	);
 	assert!(new_file_path.0.contains(&dest_path.0));
 
 	// Verify file no longer exists in source
@@ -2212,4 +2208,594 @@ pub async fn test_move_item_multiple_files_same_operation() {
 		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file2.uuid().to_string()));
 	assert!(has_file1);
 	assert!(has_file2);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_file_success() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss
+		.client
+		.make_file_builder("old_name.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Content to rename").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Rename the file
+	let new_name = "new_name.txt".to_string();
+	let new_file_path = db
+		.rename_item(&client, file_path.clone(), new_name.clone())
+		.await
+		.unwrap()
+		.unwrap();
+
+	// Verify the new path is correct
+	let expected_new_path: FfiPathWithRoot = format!("{}/{}", parent_path.0, new_name).into();
+	assert_eq!(new_file_path.0, expected_new_path.0);
+
+	// Verify old file path no longer exists
+	assert!(db.query_item(&file_path).unwrap().is_none());
+
+	// Verify file exists at new path with new name
+	let renamed_file = db.query_item(&new_file_path).unwrap();
+	assert!(renamed_file.is_some());
+	match renamed_file.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, new_name);
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+
+	// Verify parent directory listing reflects the rename
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+
+	let renamed_file_in_listing = children
+		.objects
+		.iter()
+		.find(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()));
+	assert!(renamed_file_in_listing.is_some());
+
+	if let Some(FfiNonRootObject::File(f)) = renamed_file_in_listing {
+		assert_eq!(f.name, new_name);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_directory_success() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test directory with some content
+	let dir = rss
+		.client
+		.create_dir(&rss.dir, "old_dir_name".to_string())
+		.await
+		.unwrap();
+
+	// Add a file to the directory to verify contents are preserved
+	let file_in_dir = rss.client.make_file_builder("content.txt", &dir).build();
+	let mut file_writer = rss.client.get_file_writer(file_in_dir).unwrap();
+	file_writer.write_all(b"Directory content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file_in_dir = file_writer.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), dir.name()).into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Rename the directory
+	let new_name = "new_dir_name".to_string();
+	let new_dir_path = db
+		.rename_item(&client, dir_path.clone(), new_name.clone())
+		.await
+		.unwrap()
+		.unwrap();
+
+	// Verify the new path is correct
+	let expected_new_path: FfiPathWithRoot = format!("{}/{}", parent_path.0, new_name).into();
+	assert_eq!(new_dir_path.0, expected_new_path.0);
+
+	// Verify old directory path no longer exists
+	assert!(db.query_item(&dir_path).unwrap().is_none());
+
+	// Verify directory exists at new path with new name
+	let renamed_dir = db.query_item(&new_dir_path).unwrap();
+	assert!(renamed_dir.is_some());
+	match renamed_dir.unwrap() {
+		FfiObject::Dir(d) => {
+			assert_eq!(d.name, new_name);
+			assert_eq!(d.uuid, dir.uuid().to_string());
+		}
+		_ => panic!("Expected directory object"),
+	}
+
+	// Verify parent directory listing reflects the rename
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+
+	let renamed_dir_in_listing = children
+		.objects
+		.iter()
+		.find(|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == dir.uuid().to_string()));
+	assert!(renamed_dir_in_listing.is_some());
+
+	if let Some(FfiNonRootObject::Dir(d)) = renamed_dir_in_listing {
+		assert_eq!(d.name, new_name);
+	}
+
+	// Verify directory contents are preserved
+	db.update_dir_children(&client, new_dir_path.clone())
+		.await
+		.unwrap();
+	let dir_contents = db.query_dir_children(&new_dir_path, None).unwrap().unwrap();
+	assert_eq!(dir_contents.objects.len(), 1);
+
+	let file_in_renamed_dir = dir_contents.objects.iter().find(
+		|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file_in_dir.uuid().to_string()),
+	);
+	assert!(file_in_renamed_dir.is_some());
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_file_extension_change() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a text file
+	let file = rss
+		.client
+		.make_file_builder("document.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Text content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Rename to change extension
+	let new_name = "document.md".to_string();
+	let new_file_path = db
+		.rename_item(&client, file_path.clone(), new_name.clone())
+		.await
+		.unwrap()
+		.unwrap();
+
+	// Verify rename worked
+	let renamed_file = db.query_item(&new_file_path).unwrap();
+	assert!(renamed_file.is_some());
+	match renamed_file.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, new_name);
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_same_name() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss
+		.client
+		.make_file_builder("same_name.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Rename to the same name
+	let same_name = file.name().to_string();
+	let new_file_path = db
+		.rename_item(&client, file_path.clone(), same_name.clone())
+		.await
+		.unwrap();
+
+	// Path should be the same
+	assert_eq!(new_file_path, None);
+
+	// File should still exist and be queryable
+	let file_result = db.query_item(&file_path).unwrap();
+	assert!(file_result.is_some());
+	match file_result.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, same_name);
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_nonexistent_file() {
+	let (db, client, rss) = get_db_resources().await;
+
+	let nonexistent_path: FfiPathWithRoot =
+		format!("{}/{}/nonexistent.txt", client.root_uuid(), rss.dir.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+
+	// Try to rename non-existent file
+	let result = db
+		.rename_item(&client, nonexistent_path, "new_name.txt".to_string())
+		.await;
+
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to an item"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_root_directory_error() {
+	let (db, client, _rss) = get_db_resources().await;
+
+	let root_path: FfiPathWithRoot = client.root_uuid().into();
+
+	// Try to rename root directory
+	let result = db
+		.rename_item(&client, root_path, "new_root_name".to_string())
+		.await;
+
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("Cannot rename item"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_invalid_path() {
+	let (db, client, _rss) = get_db_resources().await;
+
+	let invalid_path: FfiPathWithRoot = "not-a-uuid/invalid/path".into();
+
+	// Try to rename with invalid path
+	let result = db
+		.rename_item(&client, invalid_path, "new_name.txt".to_string())
+		.await;
+
+	assert!(result.is_err());
+	// Should fail with UUID parsing error
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_empty_name() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss
+		.client
+		.make_file_builder("test_file.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+
+	// Try to rename to empty string
+	let result = db.rename_item(&client, file_path, "".to_string()).await;
+
+	let err = result.unwrap_err();
+	assert!(err.to_string().contains("Invalid Name ''"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_special_characters() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss
+		.client
+		.make_file_builder("normal_name.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Test various special characters
+	let special_names = vec![
+		"file with spaces.txt",
+		"file-with-dashes.txt",
+		"file_with_underscores.txt",
+		"file.with.dots.txt",
+		"file(with)parentheses.txt",
+		"file[with]brackets.txt",
+		"файл.txt", // Unicode characters
+		"文件.txt", // Chinese characters
+	];
+
+	for special_name in special_names {
+		// Try to rename to special name
+		let result = db
+			.rename_item(&client, file_path.clone(), special_name.to_string())
+			.await;
+
+		if result.is_ok() {
+			let new_path = result.unwrap().unwrap();
+			let renamed_file = db.query_item(&new_path).unwrap();
+			assert!(renamed_file.is_some());
+
+			match renamed_file.unwrap() {
+				FfiObject::File(f) => {
+					assert_eq!(f.name, special_name);
+					assert_eq!(f.uuid, file.uuid().to_string());
+				}
+				_ => panic!("Expected file object"),
+			}
+
+			// Reset for next test by renaming back
+			let _ = db
+				.rename_item(&client, new_path, file.name().to_string())
+				.await;
+		} else {
+			// Document which special characters are rejected
+			panic!(
+				"Special name '{}' rejected: {}",
+				special_name,
+				result.unwrap_err()
+			);
+		}
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_name_collision() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create two files in the same directory
+	let file1 = rss.client.make_file_builder("file1.txt", &rss.dir).build();
+	let mut writer1 = rss.client.get_file_writer(file1).unwrap();
+	writer1.write_all(b"Content 1").await.unwrap();
+	writer1.close().await.unwrap();
+	let file1 = writer1.into_remote_file().unwrap();
+
+	let file2 = rss.client.make_file_builder("file2.txt", &rss.dir).build();
+	let mut writer2 = rss.client.get_file_writer(file2).unwrap();
+	writer2.write_all(b"Content 2").await.unwrap();
+	writer2.close().await.unwrap();
+	let file2 = writer2.into_remote_file().unwrap();
+
+	let file1_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file1.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Try to rename file1 to file2's name (collision)
+	let result = db
+		.rename_item(&client, file1_path, file2.name().to_string())
+		.await;
+
+	assert!(result.is_err());
+	assert!(
+		result
+			.unwrap_err()
+			.to_string()
+			.contains("File with the same name already exists at destination")
+	);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_nested_file() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create nested directory structure
+	let level1 = rss
+		.client
+		.create_dir(&rss.dir, "level1".to_string())
+		.await
+		.unwrap();
+
+	let level2 = rss
+		.client
+		.create_dir(&level1, "level2".to_string())
+		.await
+		.unwrap();
+
+	let nested_file = rss
+		.client
+		.make_file_builder("nested_file.txt", &level2)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(nested_file).unwrap();
+	file_writer.write_all(b"Nested content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let nested_file = file_writer.into_remote_file().unwrap();
+
+	// Set up paths
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let level1_path: FfiPathWithRoot = format!("{}/level1", base_path.0).into();
+	let level2_path: FfiPathWithRoot = format!("{}/level2", level1_path.0).into();
+	let file_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, nested_file.name()).into();
+
+	// Update all levels
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, level1_path).await.unwrap();
+	db.update_dir_children(&client, level2_path.clone())
+		.await
+		.unwrap();
+
+	// Rename the nested file
+	let new_name = "renamed_nested_file.txt".to_string();
+	let new_file_path = db
+		.rename_item(&client, file_path.clone(), new_name.clone())
+		.await
+		.unwrap()
+		.unwrap();
+
+	// Verify the new path is correct
+	let expected_new_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, new_name).into();
+	assert_eq!(new_file_path.0, expected_new_path.0);
+
+	// Verify old path no longer exists
+	assert!(db.query_item(&file_path).unwrap().is_none());
+
+	// Verify file exists at new path
+	let renamed_file = db.query_item(&new_file_path).unwrap();
+	assert!(renamed_file.is_some());
+	match renamed_file.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, new_name);
+			assert_eq!(f.uuid, nested_file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_long_name() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss.client.make_file_builder("short.txt", &rss.dir).build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+
+	// Try to rename to a very long name
+	let long_name = "a".repeat(255) + ".txt"; // 255 'a' characters plus extension
+	let result = db.rename_item(&client, file_path, long_name.clone()).await;
+
+	let new_path = result.unwrap().unwrap();
+	let renamed_file = db.query_item(&new_path).unwrap();
+	assert!(renamed_file.is_some());
+
+	match renamed_file.unwrap() {
+		FfiObject::File(f) => {
+			// Name might be truncated by the system
+			assert!(!f.name.is_empty());
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_rename_item_multiple_renames() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss
+		.client
+		.make_file_builder("original.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let mut current_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+
+	// Perform multiple renames in sequence
+	let names = vec!["first_rename.txt", "second_rename.txt", "final_name.txt"];
+
+	for name in names {
+		let new_path = db
+			.rename_item(&client, current_path.clone(), name.to_string())
+			.await
+			.unwrap()
+			.unwrap();
+
+		// Verify old path no longer exists
+		assert!(db.query_item(&current_path).unwrap().is_none());
+
+		// Verify new path exists
+		let renamed_file = db.query_item(&new_path).unwrap();
+		assert!(renamed_file.is_some());
+		match renamed_file.unwrap() {
+			FfiObject::File(f) => {
+				assert_eq!(f.name, name);
+				assert_eq!(f.uuid, file.uuid().to_string());
+			}
+			_ => panic!("Expected file object"),
+		}
+
+		// Update current path for next iteration
+		current_path = new_path;
+	}
+
+	// Verify final state in parent directory
+	db.update_dir_children(&client, parent_path.clone())
+		.await
+		.unwrap();
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+
+	let final_file = children
+		.objects
+		.iter()
+		.find(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()));
+	assert!(final_file.is_some());
+
+	if let Some(FfiNonRootObject::File(f)) = final_file {
+		assert_eq!(f.name, "final_name.txt");
+	}
 }
