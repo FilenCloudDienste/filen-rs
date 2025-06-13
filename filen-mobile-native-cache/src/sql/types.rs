@@ -966,6 +966,54 @@ impl DBNonRootObject {
 	}
 }
 
+impl DBItemTrait for DBNonRootObject {
+	fn id(&self) -> i64 {
+		match self {
+			DBNonRootObject::Dir(dir) => DBItemTrait::id(dir),
+			DBNonRootObject::File(file) => DBItemTrait::id(file),
+		}
+	}
+
+	fn uuid(&self) -> Uuid {
+		match self {
+			DBNonRootObject::Dir(dir) => DBItemTrait::uuid(dir),
+			DBNonRootObject::File(file) => DBItemTrait::uuid(file),
+		}
+	}
+
+	fn parent(&self) -> Option<Uuid> {
+		match self {
+			DBNonRootObject::Dir(dir) => Some(dir.parent),
+			DBNonRootObject::File(file) => Some(file.parent),
+		}
+	}
+
+	fn name(&self) -> &str {
+		match self {
+			DBNonRootObject::Dir(dir) => DBItemTrait::name(dir),
+			DBNonRootObject::File(file) => DBItemTrait::name(file),
+		}
+	}
+
+	fn item_type(&self) -> ItemType {
+		match self {
+			DBNonRootObject::Dir(_) => ItemType::Dir,
+			DBNonRootObject::File(_) => ItemType::File,
+		}
+	}
+}
+
+impl TryFrom<DBObject> for DBNonRootObject {
+	type Error = SQLError;
+	fn try_from(obj: DBObject) -> Result<Self, Self::Error> {
+		match obj {
+			DBObject::Dir(dir) => Ok(DBNonRootObject::Dir(dir)),
+			DBObject::File(file) => Ok(DBNonRootObject::File(file)),
+			DBObject::Root(_) => Err(SQLError::UnexpectedType(ItemType::Root, ItemType::Dir)),
+		}
+	}
+}
+
 pub(crate) trait DBDirTrait: Sync + Send {
 	fn id(&self) -> i64;
 	fn uuid(&self) -> Uuid;
@@ -1011,11 +1059,9 @@ where
 				tx.prepare_cached(include_str!("../../sql/mark_stale_with_parent.sql"))?;
 			stmt.execute([self.uuid()])?;
 
-			let mut upsert_item_conflict_uuid =
-				tx.prepare_cached(include_str!("../../sql/upsert_item_conflict_uuid.sql"))?;
-			let mut upsert_item_conflict_name_parent = tx.prepare_cached(include_str!(
-				"../../sql/upsert_item_conflict_name_parent.sql"
-			))?;
+			let mut upsert_item_conflict_uuid = tx.prepare_cached(UPSERT_ITEM_CONFLICT_UUID_SQL)?;
+			let mut upsert_item_conflict_name_parent =
+				tx.prepare_cached(UPSERT_ITEM_CONFLICT_NAME_PARENT_SQL)?;
 			let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
 
 			dirs.into_iter().try_for_each(|d| -> Result<()> {

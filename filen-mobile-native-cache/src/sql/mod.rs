@@ -92,3 +92,24 @@ pub(crate) fn update_root(
 	stmt.execute((response.storage_used, response.max_storage, now, id))?;
 	Ok(())
 }
+
+pub(crate) fn move_item(
+	conn: &mut Connection,
+	item_uuid: Uuid,
+	item_name: &str,
+	new_parent_uuid: Uuid,
+) -> Result<(), rusqlite::Error> {
+	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
+	{
+		// Delete potentially existing item with the same name in the new parent directory
+		let mut stmt = tx.prepare_cached(include_str!(
+			"../../sql/delete_item_by_name_parent_not_uuid.sql"
+		))?;
+		stmt.execute((item_name, new_parent_uuid, item_uuid))?;
+		let mut stmt =
+			tx.prepare_cached("UPDATE items SET parent = ?, name = ? WHERE uuid = ?;")?;
+		stmt.execute((new_parent_uuid, item_name, item_uuid))?;
+	}
+	tx.commit()?;
+	Ok(())
+}

@@ -1237,3 +1237,979 @@ pub async fn test_trash_item_already_trashed_file() {
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to an item"));
 }
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_file_success() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create source and destination directories
+	let source_dir = rss
+		.client
+		.create_dir(&rss.dir, "source_dir".to_string())
+		.await
+		.unwrap();
+
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "dest_dir".to_string())
+		.await
+		.unwrap();
+
+	// Create a file in the source directory
+	let file = rss
+		.client
+		.make_file_builder("move_me.txt", &source_dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer.write_all(b"Content to move").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	// Update database with all directories
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+
+	// Define paths for the move operation
+	let file_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file.name()).into();
+
+	// Move the file
+	let new_file_path = db
+		.move_item(
+			&client,
+			file_path.clone(),
+			source_path.clone(),
+			dest_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// Verify the new path is correct
+	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, file.name()).into();
+	assert_eq!(new_file_path.0, expected_new_path.0);
+
+	// Verify file no longer exists at old location
+	assert!(db.query_item(&file_path).unwrap().is_none());
+
+	// Verify file exists at new location
+	let moved_file = db.query_item(&new_file_path).unwrap();
+	assert!(moved_file.is_some());
+	match moved_file.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, file.name());
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+
+	// Verify source directory no longer contains the file
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	let source_children = db.query_dir_children(&source_path, None).unwrap().unwrap();
+	let file_in_source = source_children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()));
+	assert!(!file_in_source);
+
+	// Verify destination directory contains the file
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
+	let file_in_dest = dest_children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()));
+	assert!(file_in_dest);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_directory_success() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create source and destination directories
+	let source_dir = rss
+		.client
+		.create_dir(&rss.dir, "source_dir".to_string())
+		.await
+		.unwrap();
+
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "dest_dir".to_string())
+		.await
+		.unwrap();
+
+	// Create a directory to move
+	let move_dir = rss
+		.client
+		.create_dir(&source_dir, "dir_to_move".to_string())
+		.await
+		.unwrap();
+
+	// Add some content to the directory being moved
+	let file_in_move_dir = rss
+		.client
+		.make_file_builder("content.txt", &move_dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file_in_move_dir);
+	file_writer
+		.write_all(b"Content in moved dir")
+		.await
+		.unwrap();
+	file_writer.close().await.unwrap();
+
+	// Update database with all directories
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let move_dir_path: FfiPathWithRoot = format!("{}/{}", source_path.0, move_dir.name()).into();
+
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, move_dir_path.clone())
+		.await
+		.unwrap();
+
+	// Move the directory
+	let new_dir_path = db
+		.move_item(
+			&client,
+			move_dir_path.clone(),
+			source_path.clone(),
+			dest_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// Verify the new path is correct
+	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, move_dir.name()).into();
+	assert_eq!(new_dir_path.0, expected_new_path.0);
+
+	// Verify directory no longer exists at old location
+	assert!(db.query_item(&move_dir_path).unwrap().is_none());
+
+	// Verify directory exists at new location
+	let moved_dir = db.query_item(&new_dir_path).unwrap();
+	assert!(moved_dir.is_some());
+	match moved_dir.unwrap() {
+		FfiObject::Dir(d) => {
+			assert_eq!(d.name, move_dir.name());
+			assert_eq!(d.uuid, move_dir.uuid().to_string());
+		}
+		_ => panic!("Expected directory object"),
+	}
+
+	// Verify source directory no longer contains the moved directory
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	let source_children = db.query_dir_children(&source_path, None).unwrap().unwrap();
+	let dir_in_source = source_children.objects.iter().any(
+		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == move_dir.uuid().to_string()),
+	);
+	assert!(!dir_in_source);
+
+	// Verify destination directory contains the moved directory
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
+	let dir_in_dest = dest_children.objects.iter().any(
+		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == move_dir.uuid().to_string()),
+	);
+	assert!(dir_in_dest);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_file_to_root_directory() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a file in a subdirectory
+	let file = rss
+		.client
+		.make_file_builder("move_to_root.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer.write_all(b"Moving to test root").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	// Update database
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, file.name()).into();
+	let root_path: FfiPathWithRoot = client.root_uuid().into();
+
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+
+	// Move file from subdirectory to root
+	let new_file_path = db
+		.move_item(
+			&client,
+			file_path.clone(),
+			base_path.clone(),
+			root_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// Verify the new path is at root level
+	let expected_new_path: FfiPathWithRoot =
+		format!("{}/{}", client.root_uuid(), file.name()).into();
+	assert_eq!(new_file_path.0, expected_new_path.0);
+
+	// Verify file no longer exists in subdirectory
+	assert!(db.query_item(&file_path).unwrap().is_none());
+
+	// Verify file exists at root
+	let moved_file = db.query_item(&new_file_path).unwrap();
+	assert!(moved_file.is_some());
+	match moved_file.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, file.name());
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_nonexistent_item() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create destination directory
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "dest_dir".to_string())
+		.await
+		.unwrap();
+
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let nonexistent_file_path: FfiPathWithRoot = format!("{}/nonexistent.txt", base_path.0).into();
+
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+
+	// Try to move non-existent file
+	let result = db
+		.move_item(&client, nonexistent_file_path, base_path.clone(), dest_path)
+		.await;
+
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to an item"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_nonexistent_destination() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a file to move
+	let file = rss
+		.client
+		.make_file_builder("move_me.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, file.name()).into();
+	let nonexistent_dest: FfiPathWithRoot = format!("{}/nonexistent_dir", base_path.0).into();
+
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+
+	// Try to move to non-existent destination
+	let result = db
+		.move_item(&client, file_path, base_path.clone(), nonexistent_dest)
+		.await;
+
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to an item"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_invalid_parent_path() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create source and destination directories
+	let source_dir = rss
+		.client
+		.create_dir(&rss.dir, "source_dir".to_string())
+		.await
+		.unwrap();
+
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "dest_dir".to_string())
+		.await
+		.unwrap();
+
+	// Create a file in source directory
+	let file = rss
+		.client
+		.make_file_builder("test_file.txt", &source_dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let file_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file.name()).into();
+	let wrong_parent_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into(); // Wrong parent
+
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+
+	// Try to move with wrong parent path
+	let result = db
+		.move_item(&client, file_path, wrong_parent_path, dest_path)
+		.await;
+
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to the parent"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_destination_is_file() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a file to move
+	let move_file = rss
+		.client
+		.make_file_builder("move_me.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(move_file);
+	file_writer.write_all(b"Content to move").await.unwrap();
+	file_writer.close().await.unwrap();
+	let move_file = file_writer.into_remote_file().unwrap();
+
+	// Create a file that will be used as invalid destination
+	let dest_file = rss
+		.client
+		.make_file_builder("dest_file.txt", &rss.dir)
+		.build();
+	let mut dest_writer = rss.client.get_file_writer(dest_file);
+	dest_writer
+		.write_all(b"This is not a directory")
+		.await
+		.unwrap();
+	dest_writer.close().await.unwrap();
+	let dest_file = dest_writer.into_remote_file().unwrap();
+
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let move_file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, move_file.name()).into();
+	let dest_file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_file.name()).into();
+
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+
+	// Try to move to a file instead of directory
+	let result = db
+		.move_item(&client, move_file_path, base_path, dest_file_path)
+		.await;
+
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to a directory"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_root_directory_error() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create destination directory
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "dest_dir".to_string())
+		.await
+		.unwrap();
+
+	let root_path: FfiPathWithRoot = client.root_uuid().into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+
+	db.update_dir_children(&client, base_path).await.unwrap();
+
+	// Try to move root directory (should fail at conversion to DBNonRootObject)
+	let result = db
+		.move_item(&client, root_path.clone(), root_path.clone(), dest_path)
+		.await;
+
+	assert!(result.is_err());
+	let error_message = format!("{}", result.unwrap_err());
+	assert!(error_message.contains("does not point to a non-root item"));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_same_directory() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a file
+	let file = rss
+		.client
+		.make_file_builder("stay_here.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer.write_all(b"Content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, file.name()).into();
+
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+
+	// Move file to the same directory (should succeed)
+	let new_file_path = db
+		.move_item(
+			&client,
+			file_path.clone(),
+			base_path.clone(),
+			base_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// File should still be in the same location
+	assert_eq!(new_file_path.0, file_path.0);
+
+	// Verify file still exists
+	let moved_file = db.query_item(&new_file_path).unwrap();
+	assert!(moved_file.is_some());
+	match moved_file.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, file.name());
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_nested_directory_structure() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create nested structure: base/level1/level2/file.txt
+	let level1 = rss
+		.client
+		.create_dir(&rss.dir, "level1".to_string())
+		.await
+		.unwrap();
+
+	let level2 = rss
+		.client
+		.create_dir(&level1, "level2".to_string())
+		.await
+		.unwrap();
+
+	let file = rss
+		.client
+		.make_file_builder("nested_file.txt", &level2)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer.write_all(b"Nested content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	// Create destination directory at root level
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "destination".to_string())
+		.await
+		.unwrap();
+
+	// Set up paths
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let level1_path: FfiPathWithRoot = format!("{}/{}", base_path.0, level1.name()).into();
+	let level2_path: FfiPathWithRoot = format!("{}/{}", level1_path.0, level2.name()).into();
+	let file_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, file.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+
+	// Update all levels
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, level1_path).await.unwrap();
+	db.update_dir_children(&client, level2_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+
+	// Move file from deep nested location to destination
+	let new_file_path = db
+		.move_item(
+			&client,
+			file_path.clone(),
+			level2_path.clone(),
+			dest_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// Verify new path
+	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, file.name()).into();
+	assert_eq!(new_file_path.0, expected_new_path.0);
+
+	// Verify file no longer exists at original location
+	assert!(db.query_item(&file_path).unwrap().is_none());
+
+	// Verify file exists at new location
+	let moved_file = db.query_item(&new_file_path).unwrap();
+	assert!(moved_file.is_some());
+	match moved_file.unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(f.name, file.name());
+			assert_eq!(f.uuid, file.uuid().to_string());
+		}
+		_ => panic!("Expected file object"),
+	}
+
+	// Verify level2 directory is now empty
+	db.update_dir_children(&client, level2_path.clone())
+		.await
+		.unwrap();
+	let level2_children = db.query_dir_children(&level2_path, None).unwrap().unwrap();
+	assert_eq!(level2_children.objects.len(), 0);
+
+	// Verify destination directory contains the file
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
+	let file_in_dest = dest_children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file.uuid().to_string()));
+	assert!(file_in_dest);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_directory_with_contents() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create source directory with contents
+	let source_dir = rss
+		.client
+		.create_dir(&rss.dir, "source_with_contents".to_string())
+		.await
+		.unwrap();
+
+	// Create subdirectory and file in source
+	let sub_dir = rss
+		.client
+		.create_dir(&source_dir, "subdirectory".to_string())
+		.await
+		.unwrap();
+
+	let file_in_source = rss
+		.client
+		.make_file_builder("file_in_source.txt", &source_dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file_in_source);
+	file_writer.write_all(b"Source content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file_in_source = file_writer.into_remote_file().unwrap();
+
+	let file_in_sub = rss
+		.client
+		.make_file_builder("file_in_sub.txt", &sub_dir)
+		.build();
+	let mut sub_file_writer = rss.client.get_file_writer(file_in_sub);
+	sub_file_writer.write_all(b"Sub content").await.unwrap();
+	sub_file_writer.close().await.unwrap();
+
+	// Create destination directory
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "destination".to_string())
+		.await
+		.unwrap();
+
+	// Set up paths
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+
+	// Update database
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+
+	// Move the entire source directory to destination
+	let new_source_path = db
+		.move_item(
+			&client,
+			source_path.clone(),
+			base_path.clone(),
+			dest_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// Verify new path
+	let expected_new_path: FfiPathWithRoot =
+		format!("{}/{}", dest_path.0, source_dir.name()).into();
+	assert_eq!(new_source_path.0, expected_new_path.0);
+
+	// Verify old source directory is gone
+	assert!(db.query_item(&source_path).unwrap().is_none());
+
+	// Verify new source directory exists
+	let moved_dir = db.query_item(&new_source_path).unwrap();
+	assert!(moved_dir.is_some());
+	match moved_dir.unwrap() {
+		FfiObject::Dir(d) => {
+			assert_eq!(d.name, source_dir.name());
+			assert_eq!(d.uuid, source_dir.uuid().to_string());
+		}
+		_ => panic!("Expected directory object"),
+	}
+
+	// Verify base directory no longer contains old source
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+	let base_children = db.query_dir_children(&base_path, None).unwrap().unwrap();
+	let old_source_in_base = base_children.objects.iter().any(
+		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == source_dir.uuid().to_string()),
+	);
+	assert!(!old_source_in_base);
+
+	// Verify destination contains the moved directory
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
+	let source_in_dest = dest_children.objects.iter().any(
+		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == source_dir.uuid().to_string()),
+	);
+	assert!(source_in_dest);
+
+	// Verify contents are preserved (this tests that the move operation preserves the directory structure)
+	db.update_dir_children(&client, new_source_path.clone())
+		.await
+		.unwrap();
+	let moved_source_children = db
+		.query_dir_children(&new_source_path, None)
+		.unwrap()
+		.unwrap();
+	assert_eq!(moved_source_children.objects.len(), 2); // subdirectory + file
+
+	let has_sub_dir = moved_source_children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == sub_dir.uuid().to_string()));
+	let has_file = moved_source_children.objects.iter().any(
+		|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file_in_source.uuid().to_string()),
+	);
+	assert!(has_sub_dir);
+	assert!(has_file);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_invalid_uuid_in_path() {
+	let (db, client, rss) = get_db_resources().await;
+
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "dest_dir".to_string())
+		.await
+		.unwrap();
+
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let invalid_item_path: FfiPathWithRoot = "invalid-uuid/some/path".into();
+	let invalid_parent_path: FfiPathWithRoot = "invalid-uuid/parent".into();
+
+	// Try to move with invalid UUID in item path
+	let result = db
+		.move_item(&client, invalid_item_path, invalid_parent_path, dest_path)
+		.await;
+
+	assert!(result.is_err());
+	// Should fail with UUID parsing error
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_partial_path_resolution() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create nested structure but only update some levels
+	let level1 = rss
+		.client
+		.create_dir(&rss.dir, "level1".to_string())
+		.await
+		.unwrap();
+
+	let level2 = rss
+		.client
+		.create_dir(&level1, "level2".to_string())
+		.await
+		.unwrap();
+
+	let file = rss
+		.client
+		.make_file_builder("deep_file.txt", &level2)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file);
+	file_writer.write_all(b"Deep content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "destination".to_string())
+		.await
+		.unwrap();
+
+	// Only update base level, not the nested levels
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let level2_path: FfiPathWithRoot = format!("{}/level1/level2", base_path.0).into();
+	let file_path: FfiPathWithRoot = format!("{}/deep_file.txt", level2_path.0).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+
+	db.update_dir_children(&client, base_path.clone())
+		.await
+		.unwrap();
+
+	// Move should work with partial path resolution (sync::update_items_in_path should handle this)
+	let new_file_path = db
+		.move_item(&client, file_path.clone(), level2_path, dest_path.clone())
+		.await
+		.unwrap();
+
+	// Verify file was moved successfully
+	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, file.name()).into();
+	assert_eq!(new_file_path.0, expected_new_path.0);
+
+	// Verify file exists at new location
+	let moved_file = db.query_item(&new_file_path).unwrap();
+	assert!(moved_file.is_some());
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_name_collision_handling() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create source directory with a file
+	let source_dir = rss
+		.client
+		.create_dir(&rss.dir, "source".to_string())
+		.await
+		.unwrap();
+
+	let file_to_move = rss
+		.client
+		.make_file_builder("duplicate_name.txt", &source_dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file_to_move);
+	file_writer.write_all(b"Content to move").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file_to_move = file_writer.into_remote_file().unwrap();
+
+	// Create destination directory with a file of the same name
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "destination".to_string())
+		.await
+		.unwrap();
+
+	let existing_file = rss
+		.client
+		.make_file_builder("duplicate_name.txt", &dest_dir)
+		.build();
+	let mut existing_writer = rss.client.get_file_writer(existing_file);
+	existing_writer
+		.write_all(b"Existing content")
+		.await
+		.unwrap();
+	existing_writer.close().await.unwrap();
+
+	// Set up paths
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let file_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file_to_move.name()).into();
+
+	// Update database
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+
+	// Move should succeed (the SDK should handle name conflicts)
+	let new_file_path = db
+		.move_item(
+			&client,
+			file_path.clone(),
+			source_path.clone(),
+			dest_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// The move operation should succeed - the SDK typically handles name conflicts
+	// by either overwriting or creating a new name variant
+	println!(
+		"New file path: {} old file path {}",
+		new_file_path.0, file_path.0
+	);
+	assert!(new_file_path.0.contains(&dest_path.0));
+
+	// Verify file no longer exists in source
+	assert!(db.query_item(&file_path).unwrap().is_none());
+
+	// Verify some file exists at the new location (name might be modified by SDK)
+	let moved_file = db.query_item(&new_file_path).unwrap();
+	assert!(moved_file.is_some());
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_move_item_multiple_files_same_operation() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create source directory with multiple files
+	let source_dir = rss
+		.client
+		.create_dir(&rss.dir, "multi_source".to_string())
+		.await
+		.unwrap();
+
+	let file1 = rss
+		.client
+		.make_file_builder("file1.txt", &source_dir)
+		.build();
+	let mut writer1 = rss.client.get_file_writer(file1);
+	writer1.write_all(b"Content 1").await.unwrap();
+	writer1.close().await.unwrap();
+	let file1 = writer1.into_remote_file().unwrap();
+
+	let file2 = rss
+		.client
+		.make_file_builder("file2.txt", &source_dir)
+		.build();
+	let mut writer2 = rss.client.get_file_writer(file2);
+	writer2.write_all(b"Content 2").await.unwrap();
+	writer2.close().await.unwrap();
+	let file2 = writer2.into_remote_file().unwrap();
+
+	// Create destination directory
+	let dest_dir = rss
+		.client
+		.create_dir(&rss.dir, "multi_dest".to_string())
+		.await
+		.unwrap();
+
+	// Set up paths
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
+	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let file1_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file1.name()).into();
+	let file2_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file2.name()).into();
+
+	// Update database
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+
+	// Move both files
+	let new_file1_path = db
+		.move_item(
+			&client,
+			file1_path.clone(),
+			source_path.clone(),
+			dest_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	let new_file2_path = db
+		.move_item(
+			&client,
+			file2_path.clone(),
+			source_path.clone(),
+			dest_path.clone(),
+		)
+		.await
+		.unwrap();
+
+	// Verify both files were moved
+	assert!(db.query_item(&file1_path).unwrap().is_none());
+	assert!(db.query_item(&file2_path).unwrap().is_none());
+
+	assert!(db.query_item(&new_file1_path).unwrap().is_some());
+	assert!(db.query_item(&new_file2_path).unwrap().is_some());
+
+	// Verify source directory is now empty
+	db.update_dir_children(&client, source_path.clone())
+		.await
+		.unwrap();
+	let source_children = db.query_dir_children(&source_path, None).unwrap().unwrap();
+	assert_eq!(source_children.objects.len(), 0);
+
+	// Verify destination directory contains both files
+	db.update_dir_children(&client, dest_path.clone())
+		.await
+		.unwrap();
+	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
+	assert_eq!(dest_children.objects.len(), 2);
+
+	let has_file1 = dest_children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file1.uuid().to_string()));
+	let has_file2 = dest_children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == file2.uuid().to_string()));
+	assert!(has_file1);
+	assert!(has_file2);
+}

@@ -4,7 +4,10 @@ use std::{
 };
 
 use ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiObject, FfiRoot};
-use filen_sdk_rs::{fs::HasUUID, util::PathIteratorExt};
+use filen_sdk_rs::{
+	fs::{HasName, HasParent, HasUUID},
+	util::PathIteratorExt,
+};
 use futures::AsyncWriteExt;
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -12,8 +15,8 @@ use uuid::Uuid;
 use crate::{
 	ffi::FfiPathWithRoot,
 	sql::{
-		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemExt, DBObject, DBRoot,
-		error::OptionalExtensionSQL,
+		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemExt, DBItemTrait, DBNonRootObject,
+		DBObject, DBRoot, error::OptionalExtensionSQL,
 	},
 	sync::UpdateItemsInPath,
 };
@@ -299,7 +302,7 @@ impl FilenMobileDB {
 			DBObject::Root(root) => {
 				return Err(CacheError::remote(format!(
 					"Cannot remove root directory: {}",
-					root.uuid()
+					root.uuid
 				)));
 			}
 			DBObject::Dir(dir) => {
@@ -314,6 +317,104 @@ impl FilenMobileDB {
 			}
 		}
 		Ok(())
+	}
+
+	pub async fn move_item(
+		&self,
+		client: &CacheClient,
+		item: FfiPathWithRoot,
+		parent: FfiPathWithRoot,
+		new_parent: FfiPathWithRoot,
+	) -> Result<FfiPathWithRoot> {
+		let item_pvs: PathValues<'_> = item.as_path_values()?;
+		let parent_pvs: PathValues<'_> = parent.as_path_values()?;
+		let new_parent_pvs: PathValues<'_> = new_parent.as_path_values()?;
+
+		let (obj, new_parent_dir) = futures::try_join!(
+			async {
+				let obj = match sync::update_items_in_path(self, &client.client, &item_pvs).await? {
+					UpdateItemsInPath::Complete(obj) => {
+						DBNonRootObject::try_from(obj).map_err(|e| {
+							CacheError::remote(format!(
+								"Path {} does not point to a non-root item: {}",
+								item_pvs.full_path, e
+							))
+						})?
+					}
+					UpdateItemsInPath::Partial(_, _) => {
+						return Err(CacheError::remote(format!(
+							"Path {} does not point to an item",
+							item_pvs.full_path
+						)));
+					}
+				};
+				let parent = match sql::select_object_at_path(&self.conn(), &parent_pvs)?
+					.map(DBDirObject::try_from)
+				{
+					None | Some(Err(_)) => {
+						return Err(CacheError::remote(format!(
+							"Path {} does not point to a parent directory",
+							parent_pvs.full_path
+						)));
+					}
+					Some(Ok(obj)) => obj,
+				};
+				if Some(parent.uuid()) != obj.parent() {
+					return Err(CacheError::remote(format!(
+						"Path {} does not point to the parent of obj {} got {:?} (should be {})",
+						parent_pvs.full_path,
+						obj.uuid(),
+						obj.parent(),
+						parent.uuid()
+					)));
+				}
+				Ok(obj)
+			},
+			async {
+				match sync::update_items_in_path(self, &client.client, &new_parent_pvs).await? {
+					UpdateItemsInPath::Complete(obj) => DBDirObject::try_from(obj).map_err(|e| {
+						CacheError::remote(format!(
+							"Path {} does not point to a directory: {}",
+							new_parent_pvs.full_path, e
+						))
+					}),
+					UpdateItemsInPath::Partial(_, _) => Err(CacheError::remote(format!(
+						"Path {} does not point to an item",
+						item_pvs.full_path
+					))),
+				}
+			}
+		)?;
+
+		match obj {
+			DBNonRootObject::Dir(dbdir) => {
+				let mut remote_dir = dbdir.into();
+				client
+					.client
+					.move_dir(&mut remote_dir, &new_parent_dir.uuid())
+					.await?;
+				sql::move_item(
+					&mut self.conn(),
+					remote_dir.uuid(),
+					remote_dir.name(),
+					remote_dir.parent(),
+				)?;
+			}
+			DBNonRootObject::File(dbfile) => {
+				let mut remote_file: filen_sdk_rs::fs::file::RemoteFile = dbfile.try_into()?;
+				client
+					.client
+					.move_file(&mut remote_file, &new_parent_dir.uuid())
+					.await?;
+				sql::move_item(
+					&mut self.conn(),
+					remote_file.uuid(),
+					remote_file.name(),
+					remote_file.parent(),
+				)?;
+			}
+		}
+		Ok(new_parent.join(item_pvs.name))
 	}
 }
 

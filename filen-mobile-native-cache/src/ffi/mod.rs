@@ -133,7 +133,7 @@ impl From<DBNonRootObject> for FfiNonRootObject {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FfiPathWithRoot(pub String);
 
 impl FfiPathWithRoot {
