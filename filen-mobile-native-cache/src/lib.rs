@@ -12,7 +12,6 @@ use filen_sdk_rs::{
 	},
 	util::PathIteratorExt,
 };
-use futures::AsyncWriteExt;
 use rusqlite::Connection;
 use uuid::Uuid;
 
@@ -182,7 +181,7 @@ impl FilenMobileDB {
 		};
 		let file = file.try_into()?;
 
-		let path = io::download_file(&client.client, &file, &file_path)
+		let path = io::download_file(&client.client, &file, &path_values)
 			.await?
 			.into_os_string()
 			.into_string()
@@ -198,16 +197,16 @@ impl FilenMobileDB {
 		path: FfiPathWithRoot,
 	) -> Result<bool> {
 		let path_values = path.as_path_values()?;
-		let parent_uuid =
+		let (parent_uuid, mime) =
 			match sync::update_items_in_path(self, &client.client, &path_values).await? {
 				UpdateItemsInPath::Complete(DBObject::File(file)) => {
 					if let Some(hash) = file.hash.map(Into::into) {
-						let local_hash = io::hash_local_file(&path)?;
+						let local_hash = io::hash_local_file(&path_values).await?;
 						if local_hash == hash {
 							return Ok(false);
 						}
 					}
-					file.parent
+					(file.parent, Some(file.mime))
 				}
 				UpdateItemsInPath::Complete(_) => {
 					return Err(CacheError::remote(format!(
@@ -216,7 +215,7 @@ impl FilenMobileDB {
 					)));
 				}
 				UpdateItemsInPath::Partial(remaining, parent) if remaining == path_values.name => {
-					parent.uuid()
+					(parent.uuid(), None)
 				}
 				UpdateItemsInPath::Partial(remaining, _) => {
 					return Err(CacheError::remote(format!(
@@ -226,7 +225,7 @@ impl FilenMobileDB {
 				}
 			};
 
-		let remote_file = io::upload_file(&client.client, &path, parent_uuid).await?;
+		let remote_file = io::upload_file(&client.client, &path_values, parent_uuid, mime).await?;
 
 		let mut conn = self.conn();
 		DBFile::upsert_from_remote(&mut conn, remote_file)?;
@@ -240,8 +239,8 @@ impl FilenMobileDB {
 		name: String,
 		mime: String,
 	) -> Result<FfiPathWithRoot> {
-		let path_values = parent_path.as_path_values()?;
-		let parent = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+		let parent_pvs = parent_path.as_path_values()?;
+		let parent = match sync::update_items_in_path(self, &client.client, &parent_pvs).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
 			UpdateItemsInPath::Complete(DBObject::File(_)) => {
@@ -257,16 +256,9 @@ impl FilenMobileDB {
 				)));
 			}
 		};
-		let file = client
-			.client
-			.make_file_builder(name, &parent.uuid())
-			.mime(mime)
-			.build();
-		let mut writer = client.client.get_file_writer(file)?;
-		writer.close().await?;
-		let file = writer
-			.into_remote_file()
-			.ok_or_else(|| CacheError::conversion("Failed to convert writer into remote file"))?;
+		let path = parent_path.join(&name);
+		let pvs = path.as_path_values()?;
+		let file = io::create_file(&client.client, &pvs, parent.uuid(), mime).await?;
 		let mut conn = self.conn();
 		let file = DBFile::upsert_from_remote(&mut conn, file)?;
 		Ok(parent_path.join(&file.name))
@@ -296,7 +288,8 @@ impl FilenMobileDB {
 			}
 		};
 
-		let dir = client.client.create_dir(&parent.uuid(), name).await?;
+		let dir = io::create_dir(&client.client, &path_values, parent.uuid(), name).await?;
+
 		let mut conn = self.conn();
 		let dir = DBDir::upsert_from_remote(&mut conn, dir)?;
 		Ok(parent_path.join(&dir.name))

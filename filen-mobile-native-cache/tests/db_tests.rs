@@ -564,7 +564,9 @@ pub async fn test_upload_file_if_changed_new_file() {
 	let test_content = b"This is test content for upload.";
 	let upload_path: FfiPathWithRoot =
 		format!("{}/{}/test_upload.txt", client.root_uuid(), rss.dir.name()).into();
-	let io_path = io::get_file_path(&upload_path).unwrap();
+	let io_path = io::get_file_path(&upload_path.as_path_values().unwrap())
+		.await
+		.unwrap();
 	std::fs::write(&io_path, test_content).unwrap();
 
 	let upload_path: FfiPathWithRoot =
@@ -620,7 +622,9 @@ pub async fn test_upload_file_if_changed_unchanged_file() {
 		remote_file.name()
 	)
 	.into();
-	let io_path = io::get_file_path(&upload_path).unwrap();
+	let io_path = io::get_file_path(&upload_path.as_path_values().unwrap())
+		.await
+		.unwrap();
 
 	std::fs::write(&io_path, test_content).unwrap();
 
@@ -657,7 +661,9 @@ pub async fn test_upload_file_if_changed_modified_file() {
 	let modified_content = b"Modified content - completely different!";
 	let upload_path: FfiPathWithRoot =
 		format!("{}/{}/modify_test.txt", client.root_uuid(), rss.dir.name()).into();
-	let io_path = io::get_file_path(&upload_path).unwrap();
+	let io_path = io::get_file_path(&upload_path.as_path_values().unwrap())
+		.await
+		.unwrap();
 	std::fs::write(&io_path, modified_content).unwrap();
 
 	// Upload should return true (changed)
@@ -682,7 +688,9 @@ pub async fn test_upload_file_if_changed_invalid_parent() {
 	)
 	.into();
 
-	let io_path = io::get_file_path(&invalid_path).unwrap();
+	let io_path = io::get_file_path(&invalid_path.as_path_values().unwrap())
+		.await
+		.unwrap();
 
 	// Create a temporary local file
 	std::fs::write(&io_path, b"test").unwrap();

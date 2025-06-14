@@ -1,22 +1,24 @@
 use std::{
 	fs::FileTimes,
-	io::{self, Read},
+	io::{self},
 	path::{Path, PathBuf},
 	time::SystemTime,
 };
 
+use crate::PathValues;
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
 		HasUUID,
+		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo},
 	},
 };
 use filen_types::crypto::Sha512Hash;
 use futures::AsyncWriteExt;
 use sha2::Digest;
-use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use uuid::Uuid;
 
@@ -35,7 +37,6 @@ fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use crate::ffi::FfiPathWithRoot;
 #[cfg(unix)]
 fn metadata_size(metadata: std::fs::Metadata) -> u64 {
 	metadata.size().max(BUFFER_SIZE)
@@ -57,27 +58,27 @@ const TMP_DIR: &str = "native_cache/tmp";
 
 const BUFFER_SIZE: u64 = 64 * 1024; // 64 KiB
 
-fn get_tmp_path(uuid: &str) -> Result<std::path::PathBuf, io::Error> {
-	std::fs::create_dir_all(TMP_DIR)?;
+async fn get_tmp_path(uuid: &str) -> Result<std::path::PathBuf, io::Error> {
+	tokio::fs::create_dir_all(TMP_DIR).await?;
 	let tmp_path = AsRef::<Path>::as_ref(TMP_DIR).join(uuid);
 	Ok(tmp_path)
 }
 
-pub fn get_file_path(path: &FfiPathWithRoot) -> Result<std::path::PathBuf, io::Error> {
-	let download_path = AsRef::<Path>::as_ref(FILES_DIR).join(&path.0);
+pub async fn get_file_path(path: &PathValues<'_>) -> Result<std::path::PathBuf, io::Error> {
+	let download_path = AsRef::<Path>::as_ref(FILES_DIR).join(path.full_path);
 	// SAFETY: This unwrap is safe because FILES_DIR is a valid path
-	std::fs::create_dir_all(download_path.parent().unwrap())?;
+	tokio::fs::create_dir_all(download_path.parent().unwrap()).await?;
 	Ok(download_path)
 }
 
 pub async fn download_file(
 	client: &Client,
 	file: &RemoteFile,
-	path: &FfiPathWithRoot,
+	pvs: &PathValues<'_>,
 ) -> Result<PathBuf, io::Error> {
 	let reader = client.get_file_reader(file).compat();
 	let uuid = file.uuid().to_string();
-	let src: std::path::PathBuf = get_tmp_path(&uuid)?;
+	let src: std::path::PathBuf = get_tmp_path(&uuid).await?;
 	let mut buf_reader =
 		tokio::io::BufReader::with_capacity(BUFFER_SIZE.min(file.size) as usize, reader);
 	let mut os_file: tokio::fs::File = tokio::fs::File::create(&src).await?;
@@ -93,19 +94,23 @@ pub async fn download_file(
 	})
 	.await??;
 
-	let dst = get_file_path(path)?;
+	let dst = get_file_path(pvs).await?;
 	tokio::fs::rename(&src, &dst).await?;
 	Ok(dst)
 }
 
-pub fn hash_local_file(path: &FfiPathWithRoot) -> Result<Sha512Hash, io::Error> {
-	let path = get_file_path(path)?;
-	let mut file = std::fs::File::open(path)?;
-	let file_size = file.metadata().map(metadata_size).unwrap_or(BUFFER_SIZE);
+pub async fn hash_local_file(pvs: &PathValues<'_>) -> Result<Sha512Hash, io::Error> {
+	let path = get_file_path(pvs).await?;
+	let mut file = tokio::fs::File::open(path).await?;
+	let file_size = file
+		.metadata()
+		.await
+		.map(metadata_size)
+		.unwrap_or(BUFFER_SIZE);
 	let mut buffer = vec![0; (file_size as usize).min(BUFFER_SIZE as usize)];
 	let mut hasher = sha2::Sha512::new();
 	loop {
-		let bytes_read = file.read(&mut buffer)?;
+		let bytes_read = file.read(&mut buffer).await?;
 		if bytes_read == 0 {
 			break;
 		}
@@ -117,21 +122,20 @@ pub fn hash_local_file(path: &FfiPathWithRoot) -> Result<Sha512Hash, io::Error> 
 
 pub async fn upload_file(
 	client: &Client,
-	path: &FfiPathWithRoot,
+	pvs: &PathValues<'_>,
 	parent_uuid: Uuid,
+	mime: Option<String>,
 ) -> Result<RemoteFile, io::Error> {
-	let path = get_file_path(path)?;
-	let file_name = path
-		.file_name()
-		.and_then(|s| s.to_str())
-		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name"))?
-		.to_string();
+	let path = get_file_path(pvs).await?;
 	let os_file = tokio::fs::File::open(path).await?;
 	let meta = os_file.metadata().await?;
-	let file = client
-		.make_file_builder(file_name, &parent_uuid)
+	let mut file = client
+		.make_file_builder(pvs.name, &parent_uuid)
 		.created(meta.created()?.into())
 		.modified(metadata_modified(&meta));
+	if let Some(mime) = mime {
+		file = file.mime(mime);
+	}
 	let writer = client
 		.get_file_writer(file.build())
 		.map_err(|e| io::Error::new(io::ErrorKind::InvalidFilename, e))?;
@@ -153,35 +157,30 @@ pub async fn upload_file(
 	Ok(remote_file)
 }
 
-// pub(crate) async fn create_file(
-// 	db: &FilenMobileDB,
-// 	client: &Client,
-// 	file_path: &str,
-// 	parent_dir: &DBDirObject,
-// ) -> Result<DBFile, io::Error> {
-// 	let target_path = AsRef::<Path>::as_ref(&FILES_DIR).join(file_path);
-// 	let parent_path = target_path.parent().unwrap_or_else(|| Path::new(FILES_DIR));
-// 	std::fs::create_dir_all(parent_path)?;
+pub(crate) async fn create_file(
+	client: &Client,
+	pvs: &PathValues<'_>,
+	parent_uuid: Uuid,
+	mime: String,
+) -> Result<RemoteFile, io::Error> {
+	let target_path = get_file_path(pvs).await?;
+	let mut os_file = tokio::fs::File::create(target_path).await?;
+	os_file.flush().await?;
+	drop(os_file);
+	upload_file(client, pvs, parent_uuid, Some(mime)).await
+}
 
-// 	let file_name = target_path
-// 		.file_name()
-// 		.and_then(|s| s.to_str())
-// 		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name"))?
-// 		.to_string();
+pub(crate) async fn create_dir(
+	client: &Client,
+	pvs: &PathValues<'_>,
+	parent_uuid: Uuid,
+	name: String,
+) -> Result<RemoteDirectory, io::Error> {
+	let remote_dir = client
+		.create_dir(&parent_uuid, name)
+		.await
+		.map_err(|e| io::Error::other(format!("Failed to create directory: {}", e)))?;
 
-// 	std::fs::File::create(target_path)?;
-
-// 	let file = client
-// 		.make_file_builder(file_name, &parent_dir.uuid())
-// 		.build();
-
-// 	let mut writer = client.get_file_writer(file);
-// 	writer.close().await?;
-// 	let remote_file = writer
-// 		.into_remote_file()
-// 		.ok_or_else(|| io::Error::other("Failed to convert writer into remote file"))?;
-
-// 	let file = DBFile::upsert_from_remote(&mut db.conn(), remote_file).map_err(io::Error::other)?;
-
-// 	Ok(file)
-// }
+	tokio::fs::create_dir_all(get_file_path(pvs).await?).await?;
+	Ok(remote_dir)
+}
