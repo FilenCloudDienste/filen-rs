@@ -130,3 +130,38 @@ pub(crate) fn rename_item(
 	tx.commit()?;
 	Ok(())
 }
+
+fn get_all_descendant_paths_with_stmt(
+	uuid: Uuid,
+	current_path: &str,
+	stmt: &mut rusqlite::CachedStatement<'_>,
+	paths: &mut Vec<String>,
+) -> Result<(), rusqlite::Error> {
+	let items = stmt
+		.query_and_then([uuid], |f| -> Result<_, rusqlite::Error> {
+			let uuid = f.get::<_, Uuid>(0)?;
+			let name = f.get::<_, String>(1)?;
+			let item_type = f.get::<_, ItemType>(2)?;
+			Ok((uuid, name, item_type))
+		})?
+		.collect::<Result<Vec<_>, rusqlite::Error>>()?;
+	for (uuid, name, item_type) in items {
+		let current_path = format!("{}/{}", current_path, name);
+		if item_type == ItemType::Dir || item_type == ItemType::Root {
+			get_all_descendant_paths_with_stmt(uuid, &current_path, stmt, paths)?;
+		}
+		paths.push(current_path);
+	}
+	Ok(())
+}
+
+pub(crate) fn get_all_descendant_paths(
+	conn: &Connection,
+	uuid: Uuid,
+	current_path: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached("SELECT uuid, name, type FROM items WHERE parent = ?;")?;
+	let mut paths = Vec::new();
+	get_all_descendant_paths_with_stmt(uuid, current_path, &mut stmt, &mut paths)?;
+	Ok(paths)
+}

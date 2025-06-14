@@ -113,6 +113,18 @@ impl FilenMobileDB {
 		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
 		Ok(obj.map(Into::into))
 	}
+
+	pub fn get_all_descendant_paths(&self, path: &FfiPathWithRoot) -> Result<Vec<FfiPathWithRoot>> {
+		let path_values = path.as_path_values()?;
+		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
+		Ok(match obj {
+			Some(obj) => sql::get_all_descendant_paths(&self.conn(), obj.uuid(), &path.0)?
+				.into_iter()
+				.map(FfiPathWithRoot)
+				.collect(),
+			None => vec![],
+		})
+	}
 }
 
 #[derive(uniffi::Record)]

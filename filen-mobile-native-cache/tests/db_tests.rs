@@ -2745,3 +2745,1117 @@ pub async fn test_rename_item_multiple_renames() {
 		assert_eq!(f.name, "final_name.txt");
 	}
 }
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_empty_directory() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create an empty directory
+	let empty_dir = rss
+		.client
+		.create_dir(&rss.dir, "empty_dir".to_string())
+		.await
+		.unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		empty_dir.name()
+	)
+	.into();
+
+	// Update database to include the directory
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get descendant paths - should be empty
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 0);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_files_only() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a directory with multiple files
+	let test_dir = rss
+		.client
+		.create_dir(&rss.dir, "files_dir".to_string())
+		.await
+		.unwrap();
+
+	// Create several files
+	let file1 = rss.client.make_file_builder("file1.txt", &test_dir).build();
+	let mut writer1 = rss.client.get_file_writer(file1).unwrap();
+	writer1.write_all(b"Content 1").await.unwrap();
+	writer1.close().await.unwrap();
+	let file1 = writer1.into_remote_file().unwrap();
+
+	let file2 = rss.client.make_file_builder("file2.txt", &test_dir).build();
+	let mut writer2 = rss.client.get_file_writer(file2).unwrap();
+	writer2.write_all(b"Content 2").await.unwrap();
+	writer2.close().await.unwrap();
+	let file2 = writer2.into_remote_file().unwrap();
+
+	let file3 = rss.client.make_file_builder("file3.md", &test_dir).build();
+	let mut writer3 = rss.client.get_file_writer(file3).unwrap();
+	writer3.write_all(b"Markdown content").await.unwrap();
+	writer3.close().await.unwrap();
+	let file3 = writer3.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		test_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 3);
+
+	// Verify all file paths are present
+	let expected_paths = vec![
+		format!("{}/{}", dir_path.0, file1.name()),
+		format!("{}/{}", dir_path.0, file2.name()),
+		format!("{}/{}", dir_path.0, file3.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths",
+			expected_path
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_directories_only() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a directory with subdirectories
+	let test_dir = rss
+		.client
+		.create_dir(&rss.dir, "dirs_dir".to_string())
+		.await
+		.unwrap();
+
+	let subdir1 = rss
+		.client
+		.create_dir(&test_dir, "subdir1".to_string())
+		.await
+		.unwrap();
+
+	let subdir2 = rss
+		.client
+		.create_dir(&test_dir, "subdir2".to_string())
+		.await
+		.unwrap();
+
+	let subdir3 = rss
+		.client
+		.create_dir(&test_dir, "subdir3".to_string())
+		.await
+		.unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		test_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 3);
+
+	// Verify all directory paths are present
+	let expected_paths = vec![
+		format!("{}/{}", dir_path.0, subdir1.name()),
+		format!("{}/{}", dir_path.0, subdir2.name()),
+		format!("{}/{}", dir_path.0, subdir3.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths",
+			expected_path
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_mixed_content() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a directory with mixed files and subdirectories
+	let test_dir = rss
+		.client
+		.create_dir(&rss.dir, "mixed_dir".to_string())
+		.await
+		.unwrap();
+
+	// Create files
+	let file1 = rss
+		.client
+		.make_file_builder("readme.txt", &test_dir)
+		.build();
+	let mut writer1 = rss.client.get_file_writer(file1).unwrap();
+	writer1.write_all(b"Readme content").await.unwrap();
+	writer1.close().await.unwrap();
+	let file1 = writer1.into_remote_file().unwrap();
+
+	// Create subdirectory
+	let subdir = rss
+		.client
+		.create_dir(&test_dir, "subfolder".to_string())
+		.await
+		.unwrap();
+
+	// Create another file
+	let file2 = rss
+		.client
+		.make_file_builder("config.json", &test_dir)
+		.build();
+	let mut writer2 = rss.client.get_file_writer(file2).unwrap();
+	writer2.write_all(b"{}").await.unwrap();
+	writer2.close().await.unwrap();
+	let file2 = writer2.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		test_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 3);
+
+	// Verify all paths are present
+	let expected_paths = vec![
+		format!("{}/{}", dir_path.0, file1.name()),
+		format!("{}/{}", dir_path.0, subdir.name()),
+		format!("{}/{}", dir_path.0, file2.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths",
+			expected_path
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_nested_structure() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a deeply nested structure
+	let level1 = rss
+		.client
+		.create_dir(&rss.dir, "level1".to_string())
+		.await
+		.unwrap();
+
+	let level2 = rss
+		.client
+		.create_dir(&level1, "level2".to_string())
+		.await
+		.unwrap();
+
+	let level3 = rss
+		.client
+		.create_dir(&level2, "level3".to_string())
+		.await
+		.unwrap();
+
+	// Add files at different levels
+	let file_l1 = rss
+		.client
+		.make_file_builder("file_level1.txt", &level1)
+		.build();
+	let mut writer_l1 = rss.client.get_file_writer(file_l1).unwrap();
+	writer_l1.write_all(b"Level 1 content").await.unwrap();
+	writer_l1.close().await.unwrap();
+	let file_l1 = writer_l1.into_remote_file().unwrap();
+
+	let file_l2 = rss
+		.client
+		.make_file_builder("file_level2.txt", &level2)
+		.build();
+	let mut writer_l2 = rss.client.get_file_writer(file_l2).unwrap();
+	writer_l2.write_all(b"Level 2 content").await.unwrap();
+	writer_l2.close().await.unwrap();
+	let file_l2 = writer_l2.into_remote_file().unwrap();
+
+	let file_l3 = rss
+		.client
+		.make_file_builder("file_level3.txt", &level3)
+		.build();
+	let mut writer_l3 = rss.client.get_file_writer(file_l3).unwrap();
+	writer_l3.write_all(b"Level 3 content").await.unwrap();
+	writer_l3.close().await.unwrap();
+	let file_l3 = writer_l3.into_remote_file().unwrap();
+
+	// Set up paths
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let level1_path: FfiPathWithRoot = format!("{}/{}", base_path.0, level1.name()).into();
+	let level2_path: FfiPathWithRoot = format!("{}/{}", level1_path.0, level2.name()).into();
+	let level3_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, level3.name()).into();
+
+	// Update all levels in database
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, level1_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, level2_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, level3_path).await.unwrap();
+
+	// Get descendant paths from level1
+	let descendant_paths = db.get_all_descendant_paths(&level1_path).unwrap();
+
+	// Should include: level2 dir, file_l1, level3 dir, file_l2, file_l3
+	assert_eq!(descendant_paths.len(), 5);
+
+	// Verify all expected paths are present
+	let expected_paths = vec![
+		format!("{}/{}", level1_path.0, file_l1.name()), // Direct file in level1
+		format!("{}/{}", level1_path.0, level2.name()),  // level2 directory
+		format!("{}/{}/{}", level1_path.0, level2.name(), file_l2.name()), // File in level2
+		format!("{}/{}/{}", level1_path.0, level2.name(), level3.name()), // level3 directory
+		format!(
+			"{}/{}/{}/{}",
+			level1_path.0,
+			level2.name(),
+			level3.name(),
+			file_l3.name()
+		), // File in level3
+	];
+
+	for expected_path in &expected_paths {
+		let found = descendant_paths.iter().any(|p| &p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths.\nActual paths: {:#?}",
+			expected_path,
+			descendant_paths.iter().map(|p| &p.0).collect::<Vec<_>>()
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_complex_nested_structure() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a complex structure with multiple branches
+	let root_dir = rss
+		.client
+		.create_dir(&rss.dir, "complex_root".to_string())
+		.await
+		.unwrap();
+
+	// Branch 1: documents
+	let docs_dir = rss
+		.client
+		.create_dir(&root_dir, "documents".to_string())
+		.await
+		.unwrap();
+
+	let doc_file = rss.client.make_file_builder("readme.md", &docs_dir).build();
+	let mut doc_writer = rss.client.get_file_writer(doc_file).unwrap();
+	doc_writer.write_all(b"Documentation").await.unwrap();
+	doc_writer.close().await.unwrap();
+	let doc_file = doc_writer.into_remote_file().unwrap();
+
+	// Branch 2: images with subdirectories
+	let images_dir = rss
+		.client
+		.create_dir(&root_dir, "images".to_string())
+		.await
+		.unwrap();
+
+	let thumbnails_dir = rss
+		.client
+		.create_dir(&images_dir, "thumbnails".to_string())
+		.await
+		.unwrap();
+
+	let thumb_file = rss
+		.client
+		.make_file_builder("thumb1.jpg", &thumbnails_dir)
+		.build();
+	let mut thumb_writer = rss.client.get_file_writer(thumb_file).unwrap();
+	thumb_writer.write_all(b"thumbnail data").await.unwrap();
+	thumb_writer.close().await.unwrap();
+	let thumb_file = thumb_writer.into_remote_file().unwrap();
+
+	let full_image = rss
+		.client
+		.make_file_builder("photo.png", &images_dir)
+		.build();
+	let mut img_writer = rss.client.get_file_writer(full_image).unwrap();
+	img_writer.write_all(b"image data").await.unwrap();
+	img_writer.close().await.unwrap();
+	let full_image = img_writer.into_remote_file().unwrap();
+
+	// Branch 3: config file at root level
+	let config_file = rss
+		.client
+		.make_file_builder("config.json", &root_dir)
+		.build();
+	let mut config_writer = rss.client.get_file_writer(config_file).unwrap();
+	config_writer.write_all(b"{}").await.unwrap();
+	config_writer.close().await.unwrap();
+	let config_file = config_writer.into_remote_file().unwrap();
+
+	// Set up paths
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let root_path: FfiPathWithRoot = format!("{}/{}", base_path.0, root_dir.name()).into();
+	let docs_path: FfiPathWithRoot = format!("{}/{}", root_path.0, docs_dir.name()).into();
+	let images_path: FfiPathWithRoot = format!("{}/{}", root_path.0, images_dir.name()).into();
+	let thumbnails_path: FfiPathWithRoot =
+		format!("{}/{}", images_path.0, thumbnails_dir.name()).into();
+
+	// Update all directories in database
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, root_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, docs_path).await.unwrap();
+	db.update_dir_children(&client, images_path).await.unwrap();
+	db.update_dir_children(&client, thumbnails_path)
+		.await
+		.unwrap();
+
+	// Get all descendant paths from root
+	let descendant_paths = db.get_all_descendant_paths(&root_path).unwrap();
+
+	// Should include: config.json, documents/, readme.md, images/, photo.png, thumbnails/, thumb1.jpg
+	assert_eq!(descendant_paths.len(), 7);
+
+	// Build expected paths
+	let expected_paths = vec![
+		format!("{}/{}", root_path.0, config_file.name()),
+		format!("{}/{}", root_path.0, docs_dir.name()),
+		format!("{}/{}/{}", root_path.0, docs_dir.name(), doc_file.name()),
+		format!("{}/{}", root_path.0, images_dir.name()),
+		format!(
+			"{}/{}/{}",
+			root_path.0,
+			images_dir.name(),
+			full_image.name()
+		),
+		format!(
+			"{}/{}/{}",
+			root_path.0,
+			images_dir.name(),
+			thumbnails_dir.name()
+		),
+		format!(
+			"{}/{}/{}/{}",
+			root_path.0,
+			images_dir.name(),
+			thumbnails_dir.name(),
+			thumb_file.name()
+		),
+	];
+
+	for expected_path in &expected_paths {
+		let found = descendant_paths.iter().any(|p| &p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths.\nActual paths: {:#?}",
+			expected_path,
+			descendant_paths.iter().map(|p| &p.0).collect::<Vec<_>>()
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_nonexistent_path() {
+	let (db, client, rss) = get_db_resources().await;
+
+	let nonexistent_path: FfiPathWithRoot =
+		format!("{}/{}/nonexistent_dir", client.root_uuid(), rss.dir.name()).into();
+
+	// Get descendant paths for non-existent directory
+	let descendant_paths = db.get_all_descendant_paths(&nonexistent_path).unwrap();
+
+	// Should return empty vector for non-existent path
+	assert_eq!(descendant_paths.len(), 0);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_invalid_path() {
+	let (db, _client, _rss) = get_db_resources().await;
+
+	let invalid_path: FfiPathWithRoot = "not-a-uuid/invalid/path".into();
+
+	// Should fail with UUID parsing error
+	let result = db.get_all_descendant_paths(&invalid_path);
+	assert!(result.is_err());
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_file_path() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a file
+	let file = rss
+		.client
+		.make_file_builder("test_file.txt", &rss.dir)
+		.build();
+	let mut file_writer = rss.client.get_file_writer(file).unwrap();
+	file_writer.write_all(b"Test content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file = file_writer.into_remote_file().unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+
+	// Get descendant paths for a file (files have no descendants)
+	let descendant_paths = db.get_all_descendant_paths(&file_path).unwrap();
+
+	// Should return empty vector for file paths
+	assert_eq!(descendant_paths.len(), 0);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_root_directory() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create some content in the test root directory
+	let file_in_root = rss
+		.client
+		.make_file_builder("root_file.txt", &rss.dir)
+		.build();
+	let mut writer = rss.client.get_file_writer(file_in_root).unwrap();
+	writer.write_all(b"Root content").await.unwrap();
+	writer.close().await.unwrap();
+	let file_in_root = writer.into_remote_file().unwrap();
+
+	let subdir_in_root = rss
+		.client
+		.create_dir(&rss.dir, "root_subdir".to_string())
+		.await
+		.unwrap();
+
+	// Use the test directory as root (since we can't access the absolute root easily)
+	let root_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = client.root_uuid().into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, root_path.clone())
+		.await
+		.unwrap();
+
+	// Get descendant paths from our test "root"
+	let descendant_paths = db.get_all_descendant_paths(&root_path).unwrap();
+
+	// Should include both the file and directory
+	assert_eq!(descendant_paths.len(), 2);
+
+	println!("Descendant paths: {:?}", descendant_paths);
+
+	let expected_paths = vec![
+		format!("{}/{}", root_path.0, file_in_root.name()),
+		format!("{}/{}", root_path.0, subdir_in_root.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths",
+			expected_path
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_partial_database_state() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create nested structure but only update some levels in database
+	let level1 = rss
+		.client
+		.create_dir(&rss.dir, "level1".to_string())
+		.await
+		.unwrap();
+
+	let level2 = rss
+		.client
+		.create_dir(&level1, "level2".to_string())
+		.await
+		.unwrap();
+
+	let file_l2 = rss
+		.client
+		.make_file_builder("file_level2.txt", &level2)
+		.build();
+	let mut writer = rss.client.get_file_writer(file_l2).unwrap();
+	writer.write_all(b"Level 2 content").await.unwrap();
+	writer.close().await.unwrap();
+
+	// Only update the base and level1, not level2
+	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let level1_path: FfiPathWithRoot = format!("{}/{}", base_path.0, level1.name()).into();
+
+	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(&client, level1_path.clone())
+		.await
+		.unwrap();
+	// Note: NOT updating level2 contents
+
+	// Get descendant paths from level1
+	let descendant_paths = db.get_all_descendant_paths(&level1_path).unwrap();
+
+	// Should only include level2 directory, not its contents since they're not in database
+	assert_eq!(descendant_paths.len(), 1);
+
+	let expected_level2_path = format!("{}/{}", level1_path.0, level2.name());
+	assert_eq!(descendant_paths[0].0, expected_level2_path);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_special_characters_in_names() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create items with special characters in names
+	let special_dir = rss
+		.client
+		.create_dir(&rss.dir, "dir with spaces".to_string())
+		.await
+		.unwrap();
+
+	let special_file1 = rss
+		.client
+		.make_file_builder("file-with-dashes.txt", &special_dir)
+		.build();
+	let mut writer1 = rss.client.get_file_writer(special_file1).unwrap();
+	writer1.write_all(b"Content 1").await.unwrap();
+	writer1.close().await.unwrap();
+	let special_file1 = writer1.into_remote_file().unwrap();
+
+	let special_file2 = rss
+		.client
+		.make_file_builder("file_with_underscores.txt", &special_dir)
+		.build();
+	let mut writer2 = rss.client.get_file_writer(special_file2).unwrap();
+	writer2.write_all(b"Content 2").await.unwrap();
+	writer2.close().await.unwrap();
+	let special_file2 = writer2.into_remote_file().unwrap();
+
+	let unicode_file = rss
+		.client
+		.make_file_builder("файл.txt", &special_dir)
+		.build();
+	let mut unicode_writer = rss.client.get_file_writer(unicode_file).unwrap();
+	unicode_writer.write_all(b"Unicode content").await.unwrap();
+	unicode_writer.close().await.unwrap();
+	let unicode_file = unicode_writer.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		special_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 3);
+
+	// Verify all special-named files are present
+	let expected_paths = vec![
+		format!("{}/{}", dir_path.0, special_file1.name()),
+		format!("{}/{}", dir_path.0, special_file2.name()),
+		format!("{}/{}", dir_path.0, unicode_file.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths",
+			expected_path
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_path_ordering() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create structure to test path ordering
+	let test_dir = rss
+		.client
+		.create_dir(&rss.dir, "ordered_test".to_string())
+		.await
+		.unwrap();
+
+	// Create items in a specific order to see how paths are returned
+	let b_file = rss
+		.client
+		.make_file_builder("b_file.txt", &test_dir)
+		.build();
+	let mut b_writer = rss.client.get_file_writer(b_file).unwrap();
+	b_writer.write_all(b"B content").await.unwrap();
+	b_writer.close().await.unwrap();
+	let b_file = b_writer.into_remote_file().unwrap();
+
+	let a_dir = rss
+		.client
+		.create_dir(&test_dir, "a_directory".to_string())
+		.await
+		.unwrap();
+
+	let c_file = rss
+		.client
+		.make_file_builder("c_file.txt", &test_dir)
+		.build();
+	let mut c_writer = rss.client.get_file_writer(c_file).unwrap();
+	c_writer.write_all(b"C content").await.unwrap();
+	c_writer.close().await.unwrap();
+	let c_file = c_writer.into_remote_file().unwrap();
+
+	// Add file to subdirectory
+	let nested_file = rss.client.make_file_builder("nested.txt", &a_dir).build();
+	let mut nested_writer = rss.client.get_file_writer(nested_file).unwrap();
+	nested_writer.write_all(b"Nested content").await.unwrap();
+	nested_writer.close().await.unwrap();
+	let nested_file = nested_writer.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		test_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let a_dir_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, a_dir.name()).into();
+
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, a_dir_path).await.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 4);
+
+	// Verify all items are present (order may vary based on SQL query order)
+	let expected_paths = vec![
+		format!("{}/{}", dir_path.0, b_file.name()),
+		format!("{}/{}", dir_path.0, a_dir.name()),
+		format!("{}/{}", dir_path.0, c_file.name()),
+		format!("{}/{}/{}", dir_path.0, a_dir.name(), nested_file.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths",
+			expected_path
+		);
+	}
+
+	// Verify that all paths start with the correct base path
+	for path in &descendant_paths {
+		assert!(
+			path.0.starts_with(&dir_path.0),
+			"Path {} should start with base path {}",
+			path.0,
+			dir_path.0
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_large_directory() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create a directory with many files to test performance and correctness
+	let large_dir = rss
+		.client
+		.create_dir(&rss.dir, "large_directory".to_string())
+		.await
+		.unwrap();
+
+	let mut created_files = Vec::new();
+
+	// Create 20 files
+	for i in 0..20 {
+		let file = rss
+			.client
+			.make_file_builder(format!("file_{:02}.txt", i), &large_dir)
+			.build();
+		let mut writer = rss.client.get_file_writer(file).unwrap();
+		writer
+			.write_all(format!("Content {}", i).as_bytes())
+			.await
+			.unwrap();
+		writer.close().await.unwrap();
+		let file = writer.into_remote_file().unwrap();
+		created_files.push(file);
+	}
+
+	// Create a few subdirectories
+	let subdir1 = rss
+		.client
+		.create_dir(&large_dir, "subdir_01".to_string())
+		.await
+		.unwrap();
+
+	let subdir2 = rss
+		.client
+		.create_dir(&large_dir, "subdir_02".to_string())
+		.await
+		.unwrap();
+
+	// Add files to subdirectories
+	let nested_file1 = rss
+		.client
+		.make_file_builder("nested_1.txt", &subdir1)
+		.build();
+	let mut nested_writer1 = rss.client.get_file_writer(nested_file1).unwrap();
+	nested_writer1.write_all(b"Nested content 1").await.unwrap();
+	nested_writer1.close().await.unwrap();
+	let nested_file1 = nested_writer1.into_remote_file().unwrap();
+
+	let nested_file2 = rss
+		.client
+		.make_file_builder("nested_2.txt", &subdir2)
+		.build();
+	let mut nested_writer2 = rss.client.get_file_writer(nested_file2).unwrap();
+	nested_writer2.write_all(b"Nested content 2").await.unwrap();
+	nested_writer2.close().await.unwrap();
+	let nested_file2 = nested_writer2.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		large_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let subdir1_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, subdir1.name()).into();
+	let subdir2_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, subdir2.name()).into();
+
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, subdir1_path).await.unwrap();
+	db.update_dir_children(&client, subdir2_path).await.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+
+	// Should have: 20 files + 2 subdirs + 2 nested files = 24 total
+	assert_eq!(descendant_paths.len(), 24);
+
+	// Verify all created files are present
+	for file in &created_files {
+		let expected_path = format!("{}/{}", dir_path.0, file.name());
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(found, "Expected file path {} not found", expected_path);
+	}
+
+	// Verify subdirectories are present
+	let subdir1_expected = format!("{}/{}", dir_path.0, subdir1.name());
+	let subdir2_expected = format!("{}/{}", dir_path.0, subdir2.name());
+	assert!(descendant_paths.iter().any(|p| p.0 == subdir1_expected));
+	assert!(descendant_paths.iter().any(|p| p.0 == subdir2_expected));
+
+	// Verify nested files are present
+	let nested1_expected = format!("{}/{}/{}", dir_path.0, subdir1.name(), nested_file1.name());
+	let nested2_expected = format!("{}/{}/{}", dir_path.0, subdir2.name(), nested_file2.name());
+	assert!(descendant_paths.iter().any(|p| p.0 == nested1_expected));
+	assert!(descendant_paths.iter().any(|p| p.0 == nested2_expected));
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_empty_names() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Test edge case with empty or unusual names (if the SDK allows them)
+	let test_dir = rss
+		.client
+		.create_dir(&rss.dir, "edge_case_dir".to_string())
+		.await
+		.unwrap();
+
+	// Try to create files with edge case names
+	let normal_file = rss
+		.client
+		.make_file_builder("normal.txt", &test_dir)
+		.build();
+	let mut normal_writer = rss.client.get_file_writer(normal_file).unwrap();
+	normal_writer.write_all(b"Normal content").await.unwrap();
+	normal_writer.close().await.unwrap();
+	let normal_file = normal_writer.into_remote_file().unwrap();
+
+	// Test with just extension
+	let dot_file = rss.client.make_file_builder(".hidden", &test_dir).build();
+	let mut dot_writer = rss.client.get_file_writer(dot_file).unwrap();
+	dot_writer.write_all(b"Hidden file content").await.unwrap();
+	dot_writer.close().await.unwrap();
+	let dot_file = dot_writer.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		test_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 2);
+
+	// Verify both files are present
+	let expected_paths = vec![
+		format!("{}/{}", dir_path.0, normal_file.name()),
+		format!("{}/{}", dir_path.0, dot_file.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in descendant paths",
+			expected_path
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_concurrent_modifications() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create initial structure
+	let test_dir = rss
+		.client
+		.create_dir(&rss.dir, "concurrent_test".to_string())
+		.await
+		.unwrap();
+
+	let initial_file = rss
+		.client
+		.make_file_builder("initial.txt", &test_dir)
+		.build();
+	let mut initial_writer = rss.client.get_file_writer(initial_file).unwrap();
+	initial_writer.write_all(b"Initial content").await.unwrap();
+	initial_writer.close().await.unwrap();
+	let initial_file = initial_writer.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		test_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get initial descendant paths
+	let initial_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(initial_paths.len(), 1);
+
+	// Add more files after initial query
+	let additional_file = rss
+		.client
+		.make_file_builder("additional.txt", &test_dir)
+		.build();
+	let mut additional_writer = rss.client.get_file_writer(additional_file).unwrap();
+	additional_writer
+		.write_all(b"Additional content")
+		.await
+		.unwrap();
+	additional_writer.close().await.unwrap();
+	let additional_file = additional_writer.into_remote_file().unwrap();
+
+	// Update database again
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+
+	// Get updated descendant paths
+	let updated_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(updated_paths.len(), 2);
+
+	// Verify both files are present
+	let expected_paths = vec![
+		format!("{}/{}", dir_path.0, initial_file.name()),
+		format!("{}/{}", dir_path.0, additional_file.name()),
+	];
+
+	for expected_path in expected_paths {
+		let found = updated_paths.iter().any(|p| p.0 == expected_path);
+		assert!(
+			found,
+			"Expected path {} not found in updated descendant paths",
+			expected_path
+		);
+	}
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_get_all_descendant_paths_path_format_consistency() {
+	let (db, client, rss) = get_db_resources().await;
+
+	// Create nested structure to test path format consistency
+	let root_dir = rss
+		.client
+		.create_dir(&rss.dir, "path_test".to_string())
+		.await
+		.unwrap();
+
+	let sub_dir = rss
+		.client
+		.create_dir(&root_dir, "subdir".to_string())
+		.await
+		.unwrap();
+
+	let file_in_sub = rss.client.make_file_builder("file.txt", &sub_dir).build();
+	let mut file_writer = rss.client.get_file_writer(file_in_sub).unwrap();
+	file_writer.write_all(b"File content").await.unwrap();
+	file_writer.close().await.unwrap();
+	let file_in_sub = file_writer.into_remote_file().unwrap();
+
+	let dir_path: FfiPathWithRoot = format!(
+		"{}/{}/{}",
+		client.root_uuid(),
+		rss.dir.name(),
+		root_dir.name()
+	)
+	.into();
+
+	// Update database
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let sub_dir_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, sub_dir.name()).into();
+
+	db.update_dir_children(&client, parent_path).await.unwrap();
+	db.update_dir_children(&client, dir_path.clone())
+		.await
+		.unwrap();
+	db.update_dir_children(&client, sub_dir_path).await.unwrap();
+
+	// Get descendant paths
+	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
+	assert_eq!(descendant_paths.len(), 2);
+
+	// Verify path format consistency
+	for path in &descendant_paths {
+		// Paths should not have double slashes
+		assert!(
+			!path.0.contains("//"),
+			"Path should not contain double slashes: {}",
+			path.0
+		);
+
+		// Paths should start with the base path
+		assert!(
+			path.0.starts_with(&dir_path.0),
+			"Path {} should start with base path {}",
+			path.0,
+			dir_path.0
+		);
+
+		// Paths should not end with slash (unless it's just the root)
+		if path.0.len() > 1 {
+			assert!(
+				!path.0.ends_with('/'),
+				"Path should not end with slash: {}",
+				path.0
+			);
+		}
+	}
+
+	// Check specific expected paths
+	let expected_subdir = format!("{}/{}", dir_path.0, sub_dir.name());
+	let expected_file = format!("{}/{}/{}", dir_path.0, sub_dir.name(), file_in_sub.name());
+
+	assert!(
+		descendant_paths.iter().any(|p| p.0 == expected_subdir),
+		"Expected subdirectory path not found"
+	);
+	assert!(
+		descendant_paths.iter().any(|p| p.0 == expected_file),
+		"Expected file path not found"
+	);
+}
