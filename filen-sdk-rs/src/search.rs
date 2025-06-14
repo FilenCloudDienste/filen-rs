@@ -52,9 +52,6 @@ impl<'a> SplitName<'a> {
 			}
 		};
 
-		let max_len = min(max_len, normalized_input.len());
-		let min_len = min(min_len, max_len);
-
 		Self {
 			normalized_input,
 			min_len,
@@ -63,17 +60,35 @@ impl<'a> SplitName<'a> {
 	}
 
 	pub fn iter(&self) -> SplitNameIter<'_> {
-		let substring_count = (self.max_len - self.min_len + 1)
-			* ((self.normalized_input.len() + 1) - (self.max_len + self.min_len) / 2);
+		// Collect character boundaries (byte indices) for the string
+		let char_boundaries: Vec<usize> = self
+			.normalized_input
+			.char_indices()
+			.map(|(i, _)| i)
+			.chain(std::iter::once(self.normalized_input.len())) // Add the end boundary
+			.collect();
+
+		let char_count = char_boundaries.len() - 1; // Number of characters
+
+		let max_len = min(self.max_len, char_count);
+		let min_len = min(self.min_len, max_len);
+
+		let substring_count =
+			(max_len - min_len + 1) * ((char_count + 1) - (max_len + min_len) / 2);
 
 		let mut slices = HashSet::with_capacity(substring_count + 1);
 
-		for start_index in 0..self.normalized_input.len() {
-			for length in self.min_len..=self.max_len {
-				if start_index + length <= self.normalized_input.len() {
-					let substring = &self.normalized_input[start_index..start_index + length];
-					slices.insert(substring);
+		// Iterate over character positions, not byte positions
+		for start_char in 0..char_count {
+			for end_char in start_char + self.min_len..self.max_len {
+				if end_char > char_count {
+					break;
 				}
+				let start_byte = char_boundaries[start_char];
+				let end_byte = char_boundaries[end_char];
+
+				let substring = &self.normalized_input[start_byte..end_byte];
+				slices.insert(substring);
 			}
 		}
 
@@ -221,5 +236,41 @@ mod tests {
 		let normal = "abc";
 		let splitter = SplitName::new(normal, 2, 16);
 		assert_eq!(vec!["ab", "abc", "bc"], splitter.iter().collect::<Vec<_>>());
+
+		let normal = "файл.txt";
+		let splitter = SplitName::new(normal, 2, 16);
+		assert_eq!(
+			vec![
+				".t",
+				".tx",
+				".txt",
+				"tx",
+				"txt",
+				"xt",
+				"ай",
+				"айл",
+				"айл.",
+				"айл.t",
+				"айл.tx",
+				"айл.txt",
+				"йл",
+				"йл.",
+				"йл.t",
+				"йл.tx",
+				"йл.txt",
+				"л.",
+				"л.t",
+				"л.tx",
+				"л.txt",
+				"фа",
+				"фай",
+				"файл",
+				"файл.",
+				"файл.t",
+				"файл.tx",
+				"файл.txt"
+			],
+			splitter.iter().collect::<Vec<_>>()
+		);
 	}
 }
