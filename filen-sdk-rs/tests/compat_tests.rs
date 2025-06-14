@@ -59,6 +59,8 @@ struct NameSplitterFile {
 	split2: Vec<String>,
 	name3: String,
 	split3: Vec<String>,
+	name4: String,
+	split4: Vec<String>,
 }
 
 fn get_name_splitter_test_value() -> NameSplitterFile {
@@ -86,6 +88,11 @@ fn get_name_splitter_test_value() -> NameSplitterFile {
 		.iter()
 		.map(|s| s.to_string())
 		.collect(),
+		name4: "файл.txt".to_string(),
+		split4: filen_sdk_rs::search::split_name("файл.txt", 2, 16)
+			.iter()
+			.map(|s| s.to_string())
+			.collect(),
 	}
 }
 
@@ -250,6 +257,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 			name_splitter.split1.sort_unstable();
 			name_splitter.split2.sort_unstable();
 			name_splitter.split3.sort_unstable();
+			name_splitter.split4.sort_unstable();
 			assert_eq!(
 				name_splitter,
 				get_name_splitter_test_value(),
