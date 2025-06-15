@@ -10,7 +10,6 @@ use filen_sdk_rs::{
 	sync::lock::ResourceLock,
 };
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
-use futures::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn dir_public_link() {
@@ -28,20 +27,16 @@ async fn dir_public_link() {
 		.unwrap();
 
 	let dir_file = client.make_file_builder("empty_dir.txt", &dir).build();
-	let mut writer = client.get_file_writer(dir_file).unwrap();
-	writer.close().await.unwrap();
-	let dir_file = writer.into_remote_file().unwrap();
+	let dir_file = client.upload_file(dir_file.into(), b"").await.unwrap();
 
 	let file = client.make_file_builder("a.txt", &sub_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello, world!").await.unwrap();
-	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let file = client
+		.upload_file(file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 
 	let empty_file = client.make_file_builder("empty.txt", &sub_dir).build();
-	let mut writer = client.get_file_writer(empty_file).unwrap();
-	writer.close().await.unwrap();
-	let empty_file = writer.into_remote_file().unwrap();
+	let empty_file = client.upload_file(empty_file.into(), b"").await.unwrap();
 
 	let mut link = client.public_link_dir(&dir).await.unwrap();
 
@@ -84,10 +79,10 @@ async fn dir_public_link() {
 	let sub_sub_file = client
 		.make_file_builder("sub_sub_file.txt", &sub_dir)
 		.build();
-	let mut writer = client.get_file_writer(sub_sub_file).unwrap();
-	writer.write_all(b"Hello, world!").await.unwrap();
-	writer.close().await.unwrap();
-	let mut sub_sub_file = writer.into_remote_file().unwrap();
+	let mut sub_sub_file = client
+		.upload_file(sub_sub_file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 
 	let (sub_dirs, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
 	assert_eq!(sub_dirs.len(), 1);
@@ -132,10 +127,10 @@ async fn file_public_link() {
 	let test_dir = &resources.dir;
 
 	let file = client.make_file_builder("a.txt", test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello, world!").await.unwrap();
-	writer.close().await.unwrap();
-	let mut file = writer.into_remote_file().unwrap();
+	let mut file = client
+		.upload_file(file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 
 	let mut link = client.public_link_file(&file).await.unwrap();
 	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
@@ -324,13 +319,12 @@ async fn share_dir() {
 		.await
 		.unwrap();
 	let dir_file = client.make_file_builder("a.txt", &dir).build();
-	let mut writer = client.get_file_writer(dir_file).unwrap();
-	writer.write_all(b"Hello, world!").await.unwrap();
-	writer.close().await.unwrap();
-	let mut dir_file = writer.into_remote_file().unwrap();
+	let mut dir_file = client
+		.upload_file(dir_file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 	let file = client.make_file_builder("a.txt", &sub_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.close().await.unwrap();
+	client.upload_file(file.into(), b"").await.unwrap();
 
 	let _locks = set_up_contact(client, share_client).await;
 
@@ -368,15 +362,21 @@ async fn share_dir() {
 		shared_files_in[0].get_file()
 	);
 
-	let mut in_reader = share_client.get_file_reader(shared_files_in[0].get_file());
-	let mut buf = Vec::new();
-	in_reader.read_to_end(&mut buf).await.unwrap();
-	assert_eq!(buf, b"Hello, world!");
+	assert_eq!(
+		&share_client
+			.download_file(shared_files_in[0].get_file())
+			.await
+			.unwrap(),
+		b"Hello, world!"
+	);
 	assert_eq!(shared_files_in[0].get_file(), &dir_file);
-	let mut out_reader = client.get_file_reader(shared_files_out[0].get_file());
-	let mut buf = Vec::new();
-	out_reader.read_to_end(&mut buf).await.unwrap();
-	assert_eq!(buf, b"Hello, world!");
+	assert_eq!(
+		client
+			.download_file(shared_files_out[0].get_file())
+			.await
+			.unwrap(),
+		b"Hello, world!"
+	);
 	assert_eq!(shared_files_out[0].get_file(), &dir_file);
 
 	// change metadata
@@ -411,10 +411,10 @@ async fn share_file() {
 	let _locks = set_up_contact(client, share_client).await;
 
 	let file = client.make_file_builder("a.txt", test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello, world!").await.unwrap();
-	writer.close().await.unwrap();
-	let mut file = writer.into_remote_file().unwrap();
+	let mut file = client
+		.upload_file(file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
@@ -431,13 +431,9 @@ async fn share_file() {
 	assert_eq!(shared_files_in.len(), 1);
 	let shared_file = shared_files_in[0].get_file();
 	assert_eq!(shared_file, &file);
-	let mut in_reader = share_client.get_file_reader(shared_file);
-	let mut buf = Vec::new();
-	in_reader.read_to_end(&mut buf).await.unwrap();
+	let buf = share_client.download_file(shared_file).await.unwrap();
 	assert_eq!(buf, b"Hello, world!");
-	let mut out_reader = client.get_file_reader(shared_file);
-	let mut buf = Vec::new();
-	out_reader.read_to_end(&mut buf).await.unwrap();
+	let buf = client.download_file(shared_file).await.unwrap();
 	assert_eq!(buf, b"Hello, world!");
 
 	let mut meta = file.get_meta();

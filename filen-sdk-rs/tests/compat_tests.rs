@@ -12,7 +12,6 @@ use filen_sdk_rs::{
 	},
 };
 use filen_types::auth::FileEncryptionVersion;
-use futures::{AsyncReadExt, AsyncWriteExt};
 
 use rand::TryRngCore;
 
@@ -121,46 +120,45 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 
 	let empty_file = client.make_file_builder("empty.txt", &compat_dir).build();
-	let mut writer = client.get_file_writer(empty_file).unwrap();
-	writer.write_all(b"").await.unwrap();
-	writer.close().await.unwrap();
+	client.upload_file(empty_file.into(), b"").await.unwrap();
 
 	let small_file = client.make_file_builder("small.txt", &compat_dir).build();
-	let mut writer = client.get_file_writer(small_file).unwrap();
-	writer.write_all(b"Hello World from Rust!").await.unwrap();
-	writer.close().await.unwrap();
-	writer.into_remote_file().unwrap();
+	client
+		.upload_file(small_file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
 
 	let mut big_random_bytes = vec![0u8; 1024 * 1024 * 4];
 	// fill with random bytes
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
 	let big_file = client.make_file_builder("big.txt", &compat_dir).build();
-	let mut writer = client.get_file_writer(big_file).unwrap();
-	writer
-		.write_all(faster_hex::hex_string(&big_random_bytes).as_bytes())
+	client
+		.upload_file(
+			big_file.into(),
+			faster_hex::hex_string(&big_random_bytes).as_bytes(),
+		)
 		.await
 		.unwrap();
-	writer.close().await.unwrap();
 
 	let (file, test_str) = get_compat_test_file(client, &compat_dir);
 	let file = file.build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(test_str.as_bytes()).await.unwrap();
-	writer.close().await.unwrap();
+	client
+		.upload_file(file.into(), test_str.as_bytes())
+		.await
+		.unwrap();
 
 	let file = client
 		.make_file_builder("nameSplitter.json", &compat_dir)
 		.build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer
-		.write_all(
+	client
+		.upload_file(
+			file.into(),
 			serde_json::to_string(&get_name_splitter_test_value())
 				.unwrap()
 				.as_bytes(),
 		)
 		.await
 		.unwrap();
-	writer.close().await.unwrap();
 }
 
 async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language: &str) {
@@ -174,10 +172,11 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.unwrap()
 	{
 		Some(FSObject::File(file)) => {
-			let mut reader = client.get_file_reader(file.as_ref());
-			let mut buf = Vec::new();
-			reader.read_to_end(&mut buf).await.unwrap();
-			assert_eq!(buf.len(), 0, "empty.txt should be empty");
+			assert_eq!(
+				client.download_file(file.as_ref()).await.unwrap().len(),
+				0,
+				"empty.txt should be empty"
+			);
 		}
 		_ => panic!("empty.txt not found in compat-go directory"),
 	}
@@ -187,11 +186,8 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.unwrap()
 	{
 		Some(FSObject::File(file)) => {
-			let mut reader = client.get_file_reader(file.as_ref());
-			let mut buf = Vec::new();
-			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(
-				buf,
+				client.download_file(file.as_ref()).await.unwrap(),
 				format!("Hello World from {}!", language).as_bytes(),
 				"small.txt contents mismatch"
 			);
@@ -204,11 +200,8 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.unwrap()
 	{
 		Some(FSObject::File(file)) => {
-			let mut reader = client.get_file_reader(file.as_ref());
-			let mut buf = Vec::with_capacity(1024 * 1024 * 4 * 2);
-			reader.read_to_end(&mut buf).await.unwrap();
 			assert_eq!(
-				buf.len(),
+				client.download_file(file.as_ref()).await.unwrap().len(),
 				1024 * 1024 * 4 * 2,
 				"big.txt should be 8MiB of random bytes"
 			);
@@ -231,9 +224,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 				"file inner_file mismatch"
 			);
 
-			let mut reader = client.get_file_reader(file.as_ref());
-			let mut buf = Vec::with_capacity(test_str.len());
-			reader.read_to_end(&mut buf).await.unwrap();
+			let buf = client.download_file(file.as_ref()).await.unwrap();
 			assert_eq!(test_str.len(), buf.len(), "file size mismatch");
 			assert_eq!(
 				test_str,
@@ -250,9 +241,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.unwrap()
 	{
 		Some(FSObject::File(file)) => {
-			let mut reader = client.get_file_reader(file.as_ref());
-			let mut buf = Vec::new();
-			reader.read_to_end(&mut buf).await.unwrap();
+			let buf = client.download_file(file.as_ref()).await.unwrap();
 			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
 			name_splitter.split1.sort_unstable();
 			name_splitter.split2.sort_unstable();

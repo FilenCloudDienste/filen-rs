@@ -10,7 +10,6 @@ use filen_sdk_rs::{
 		file::traits::{HasFileInfo, HasFileMeta},
 	},
 };
-use futures::{AsyncReadExt, AsyncWriteExt};
 use rand::TryRngCore;
 
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
@@ -23,10 +22,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let test_dir = &resources.dir;
 
 	let file = client.make_file_builder(name, test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(contents).await.unwrap();
-	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let file = client.upload_file(file.into(), contents).await.unwrap();
 
 	let found_file = match client
 		.find_item_at_path(format!("{}/{}", test_dir.name(), name))
@@ -42,9 +38,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 		name
 	);
 
-	let mut reader = client.get_file_reader(&file);
-	let mut buf = Vec::with_capacity(contents.len());
-	reader.read_to_end(&mut buf).await.unwrap();
+	let buf = client.download_file(&file).await.unwrap();
 
 	assert_eq!(buf.len(), contents.len(), "File size mismatch for {}", name);
 	assert_eq!(&buf, contents, "File contents mismatch for {}", name);
@@ -82,9 +76,7 @@ async fn file_search() {
 	let file_name = format!("{}{}.txt", file_random_part_long, file_random_part_short);
 
 	let file = client.make_file_builder(&file_name, &second_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let file = client.upload_file(file.into(), &[]).await.unwrap();
 
 	let found_items = client
 		.find_item_matches_for_name(file_random_part_long)
@@ -121,10 +113,10 @@ async fn file_trash() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello World from Rust!").await.unwrap();
-	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let file = client
+		.upload_file(file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client
@@ -166,10 +158,10 @@ async fn file_delete_permanently() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello World from Rust!").await.unwrap();
-	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let file = client
+		.upload_file(file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client
@@ -207,10 +199,10 @@ async fn file_move() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello World from Rust!").await.unwrap();
-	writer.close().await.unwrap();
-	let mut file = writer.into_remote_file().unwrap();
+	let mut file = client
+		.upload_file(file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client
@@ -256,10 +248,10 @@ async fn file_update_meta() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello World from Rust!").await.unwrap();
-	writer.close().await.unwrap();
-	let mut file = writer.into_remote_file().unwrap();
+	let mut file = client
+		.upload_file(file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client
@@ -320,10 +312,10 @@ async fn file_exists() {
 	);
 
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello World from Rust!").await.unwrap();
-	writer.close().await.unwrap();
-	let mut file = writer.into_remote_file().unwrap();
+	let mut file = client
+		.upload_file(file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client.file_exists(file.name(), test_dir).await.unwrap(),
@@ -357,10 +349,10 @@ async fn file_trash_empty() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let mut writer = client.get_file_writer(file).unwrap();
-	writer.write_all(b"Hello World from Rust!").await.unwrap();
-	writer.close().await.unwrap();
-	let file = writer.into_remote_file().unwrap();
+	let file = client
+		.upload_file(file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client
