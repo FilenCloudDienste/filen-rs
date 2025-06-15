@@ -7,6 +7,7 @@ pub mod consts;
 pub mod crypto;
 pub mod error;
 pub mod fs;
+pub mod io;
 pub mod search;
 pub mod sync;
 pub mod user;

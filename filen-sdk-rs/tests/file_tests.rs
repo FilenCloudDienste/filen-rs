@@ -1,10 +1,12 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
+	auth::Client,
 	crypto::shared::generate_random_base64_values,
 	fs::{
 		FSObject, HasName, HasUUID, NonRootFSObject,
+		dir::RemoteDirectory,
 		file::traits::{HasFileInfo, HasFileMeta},
 	},
 };
@@ -385,4 +387,42 @@ async fn file_trash_empty() {
 	// emptying trash is asynchronous, so we need to wait a bit
 	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 	assert!(client.get_file(file.uuid()).await.is_err());
+}
+
+async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, contents_len: usize) {
+	let mut contents = vec![0u8; contents_len];
+	rand::rng().try_fill_bytes(&mut contents).unwrap();
+	let file_name = format!("file_{}.txt", contents_len);
+	let file = client.make_file_builder(file_name, test_dir).build();
+	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
+	client
+		.upload_file_from_reader(
+			file.into(),
+			&mut &contents[..],
+			Some(Arc::new(|bytes_read: u64| {
+				sender.send(bytes_read).unwrap();
+			})),
+		)
+		.await
+		.unwrap();
+	std::mem::drop(sender); // Close the sender to stop the loop
+	let mut total_bytes = 0;
+	while let Ok(bytes_read) = receiver.recv() {
+		total_bytes += bytes_read;
+	}
+	assert_eq!(total_bytes, contents.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn file_callbacks() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	test_callback_sums(client, test_dir, 10).await;
+	test_callback_sums(client, test_dir, 1024 * 1024).await;
+	test_callback_sums(client, test_dir, 1024 * 1024 * 8).await;
+	test_callback_sums(client, test_dir, 1024 * 1024 * 8 + 1).await;
+	test_callback_sums(client, test_dir, 1024 * 1024 * 8 - 1).await;
+	test_callback_sums(client, test_dir, 0).await;
 }

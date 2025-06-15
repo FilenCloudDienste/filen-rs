@@ -131,8 +131,11 @@ impl Client {
 		FileBuilder::new(name, parent, self)
 	}
 
-	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> Result<FileWriter<'_>, Error> {
-		let file: Arc<BaseFile> = file.into();
+	pub(crate) fn inner_get_file_writer<'a>(
+		&'a self,
+		file: Arc<BaseFile>,
+		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+	) -> Result<FileWriter<'a>, Error> {
 		if file.root.name.is_empty() {
 			let name = match Arc::try_unwrap(file).map(|f| f.root.name) {
 				Ok(name) => name,
@@ -140,7 +143,19 @@ impl Client {
 			};
 			Err(Error::InvalidName(name))
 		} else {
-			Ok(FileWriter::new(file, self))
+			Ok(FileWriter::new(file, self, callback))
 		}
+	}
+
+	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> Result<FileWriter<'_>, Error> {
+		self.inner_get_file_writer(file.into(), None)
+	}
+
+	pub fn get_file_writer_with_callback<'a>(
+		&'a self,
+		file: impl Into<Arc<BaseFile>>,
+		callback: Arc<dyn Fn(u64) + Send + Sync + 'a>,
+	) -> Result<FileWriter<'a>, Error> {
+		self.inner_get_file_writer(file.into(), Some(callback))
 	}
 }

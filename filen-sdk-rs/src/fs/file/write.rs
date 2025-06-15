@@ -38,6 +38,7 @@ impl Default for RemoteFileInfo {
 
 struct FileWriterUploadingState<'a> {
 	file: Arc<BaseFile>,
+	callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
 	futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>>,
 	curr_chunk: Option<Cursor<Vec<u8>>>,
 	next_chunk_idx: u64,
@@ -56,10 +57,12 @@ impl<'a> FileWriterUploadingState<'a> {
 		let client = self.client.clone();
 		let file = self.file.clone();
 		let upload_key = self.upload_key.clone();
+		let callback = self.callback.clone();
 		self.hasher.update(&out_data);
 		let remote_file_info = self.remote_file_info.clone();
 		self.futures.push(Box::pin(async move {
 			// encrypt the data
+			let len = out_data.len() as u64;
 			file.key().encrypt_data(&mut out_data)?;
 			// upload the data
 			let result = api::v3::upload::upload_file_chunk(
@@ -70,6 +73,9 @@ impl<'a> FileWriterUploadingState<'a> {
 				out_data,
 			)
 			.await?;
+			if let Some(callback) = callback {
+				callback(len);
+			}
 			// don't care if this errors because that means another thread set it
 			let _ = remote_file_info.set(RemoteFileInfo {
 				region: result.region.into_owned(),
@@ -358,9 +364,14 @@ enum FileWriterState<'a> {
 }
 
 impl<'a> FileWriterState<'a> {
-	fn new(file: Arc<BaseFile>, client: &'a Client) -> Self {
+	fn new(
+		file: Arc<BaseFile>,
+		client: &'a Client,
+		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+	) -> Self {
 		FileWriterState::Uploading(FileWriterUploadingState {
 			file,
+			callback,
 			futures: FuturesUnordered::new(),
 			curr_chunk: None,
 			next_chunk_idx: 0,
@@ -383,9 +394,13 @@ pub struct FileWriter<'a> {
 }
 
 impl<'a> FileWriter<'a> {
-	pub(crate) fn new(file: Arc<BaseFile>, client: &'a Client) -> Self {
+	pub(crate) fn new(
+		file: Arc<BaseFile>,
+		client: &'a Client,
+		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+	) -> Self {
 		Self {
-			state: FileWriterState::new(file, client),
+			state: FileWriterState::new(file, client, callback),
 		}
 	}
 
