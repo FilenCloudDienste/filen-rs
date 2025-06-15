@@ -3,6 +3,9 @@ name = "filen-mobile-native-cache"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
 [features]
 default = ["tokio"]
 tokio = ["dep:tokio", "filen-sdk-rs-macros/tokio"]

@@ -164,6 +164,16 @@ impl FilenMobileDB {
 		Ok(())
 	}
 
+	pub async fn update_and_query_dir_children(
+		&self,
+		client: &CacheClient,
+		path: FfiPathWithRoot,
+		order_by: Option<String>,
+	) -> Result<Option<QueryChildrenResponse>> {
+		self.update_dir_children(client, path.clone()).await?;
+		self.query_dir_children(&path, order_by)
+	}
+
 	pub async fn download_file(
 		&self,
 		client: &CacheClient,
