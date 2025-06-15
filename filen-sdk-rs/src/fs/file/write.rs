@@ -93,7 +93,7 @@ impl<'a> FileWriterUploadingState<'a> {
 		let written = cursor.write(&buf[..Ord::min(buf.len(), CHUNK_SIZE)])?;
 		// SAFETY: chunk should never be more than u32 in length
 		self.written += TryInto::<u64>::try_into(written).unwrap();
-		if (TryInto::<usize>::try_into(cursor.position()).unwrap()) < cursor.get_ref().len() {
+		if (TryInto::<usize>::try_into(cursor.position()).unwrap()) < CHUNK_SIZE {
 			// didn't write the whole chunk, put it back
 			self.curr_chunk = Some(cursor);
 		} else {
