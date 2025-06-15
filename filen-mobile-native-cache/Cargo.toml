@@ -6,9 +6,6 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
 
-[features]
-default = ["tokio"]
-tokio = ["dep:tokio", "filen-sdk-rs-macros/tokio"]
 
 [dependencies]
 filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs" }
@@ -17,13 +14,13 @@ uniffi = { version = "0.29.2", features = [ "cli" ] }
 libsqlite3-sys = { version = "0.34", features = ["bundled"] }
 uuid = "1.17.0"
 chrono = { version = "0.4.41", features = ["serde"] }
-filen-sdk-rs-macros = { version = "0.1.0", path = "../filen-sdk-rs-macros" }
+filen-sdk-rs-macros = { version = "0.1.0", path = "../filen-sdk-rs-macros", features = ["tokio"] }
 env_logger = "0.11.8"
 rusqlite = { version = "0.36.0", features = ["bundled", "uuid"] }
 
 
 # Optional dependencies
-tokio = {version = "1.45.1", features = ["rt-multi-thread"], optional = true}
+tokio = {version = "1.45.1", features = ["rt-multi-thread"]}
 log = "0.4.27"
 filen-types = { version = "0.1.0", path = "../filen-types" }
 tokio-util = { version = "0.7.15", features = ["compat"] }
