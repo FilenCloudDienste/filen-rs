@@ -20,7 +20,7 @@ rusqlite = { version = "0.36.0", features = ["bundled", "uuid"] }
 
 
 # Optional dependencies
-tokio = {version = "1.45.1", features = ["rt-multi-thread"]}
+tokio = {version = "1.45.1", features = ["rt-multi-thread", "macros"]}
 log = "0.4.27"
 filen-types = { version = "0.1.0", path = "../filen-types" }
 tokio-util = { version = "0.7.15", features = ["compat"] }
