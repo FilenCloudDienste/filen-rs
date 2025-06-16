@@ -7,7 +7,7 @@ pub enum ConversionError {
 	HexDecodeError(#[from] faster_hex::Error),
 	#[error("Invalid string length for conversion: `{0}` expected `{1}`")]
 	InvalidStringLength(usize, usize),
-	#[error("Failed to Encrypt data: `{0}`")]
+	#[error("AES GCM Error")]
 	AesGcmEncryptError(#[from] aes_gcm::aead::Error),
 	#[error("Invalid key length: `{0}`")]
 	AesGcmCipherInvalidLength(#[from] aes_gcm::aes::cipher::InvalidLength),
