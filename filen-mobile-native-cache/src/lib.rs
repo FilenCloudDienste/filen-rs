@@ -1,6 +1,7 @@
 use std::{
+	path::{Path, PathBuf},
 	str::FromStr,
-	sync::{Mutex, MutexGuard},
+	sync::{Arc, Mutex, MutexGuard},
 };
 
 use ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiObject, FfiRoot};
@@ -22,6 +23,7 @@ use crate::{
 		DBObject, DBRoot, error::OptionalExtensionSQL,
 	},
 	sync::UpdateItemsInPath,
+	traits::ProgressCallback,
 };
 
 uniffi::setup_scaffolding!();
@@ -33,17 +35,23 @@ pub mod sql;
 pub(crate) mod sync;
 pub mod tokio;
 pub use error::CacheError;
+pub mod traits;
 
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 #[derive(uniffi::Object)]
 pub struct FilenMobileDB {
 	conn: Mutex<Connection>,
+	files_dir: Mutex<PathBuf>,
 }
 
 impl FilenMobileDB {
 	pub fn conn(&self) -> MutexGuard<Connection> {
 		self.conn.lock().unwrap()
+	}
+
+	pub fn files(&self) -> PathBuf {
+		self.files_dir.lock().unwrap().clone()
 	}
 }
 
@@ -68,15 +76,17 @@ impl FilenMobileDB {
 		db.execute_batch(include_str!("../sql/init.sql"))?;
 		Ok(FilenMobileDB {
 			conn: Mutex::new(db),
+			files_dir: Mutex::new(PathBuf::from("")),
 		})
 	}
 
 	#[uniffi::constructor]
-	pub fn initialize_from_path(path: &str) -> Result<FilenMobileDB> {
-		let db = Connection::open(path)?;
+	pub fn initialize_from_files_dir(path: &str) -> Result<FilenMobileDB> {
+		let db = Connection::open(AsRef::<Path>::as_ref(path).join("native_cache/cache.db"))?;
 		db.execute_batch(include_str!("../sql/init.sql"))?;
 		Ok(FilenMobileDB {
 			conn: Mutex::new(db),
+			files_dir: Mutex::new(PathBuf::from(path)),
 		})
 	}
 
@@ -123,6 +133,19 @@ impl FilenMobileDB {
 				.collect(),
 			None => vec![],
 		})
+	}
+
+	pub fn set_files_dir(&self, files_dir: String) -> Result<()> {
+		let files_dir = PathBuf::from(files_dir);
+		if !files_dir.exists() {
+			return Err(CacheError::IO(
+				format!("Files directory does not exist: {}", files_dir.display()).into(),
+			));
+		}
+
+		let mut lock = self.files_dir.lock().unwrap_or_else(|e| e.into_inner());
+		*lock = files_dir;
+		Ok(())
 	}
 }
 
@@ -178,6 +201,7 @@ impl FilenMobileDB {
 		&self,
 		client: &CacheClient,
 		file_path: FfiPathWithRoot,
+		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<String> {
 		let path_values = file_path.as_path_values()?;
 		let file = match sync::update_items_in_path(self, &client.client, &path_values).await? {
@@ -189,15 +213,22 @@ impl FilenMobileDB {
 				)));
 			}
 		};
-		let file = file.try_into()?;
+		let file: RemoteFile = file.try_into()?;
 
-		let path = io::download_file(&client.client, &file, &path_values)
-			.await?
-			.into_os_string()
-			.into_string()
-			.map_err(|e| {
-				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
-			})?;
+		let files_path = self.files();
+		let path = io::download_file(
+			&client.client,
+			&file,
+			&path_values,
+			progress_callback,
+			&files_path,
+		)
+		.await?
+		.into_os_string()
+		.into_string()
+		.map_err(|e| {
+			CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
+		})?;
 		Ok(path)
 	}
 
@@ -205,13 +236,15 @@ impl FilenMobileDB {
 		&self,
 		client: &CacheClient,
 		path: FfiPathWithRoot,
+		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<bool> {
 		let path_values = path.as_path_values()?;
+		let files_path = self.files();
 		let (parent_uuid, mime) =
 			match sync::update_items_in_path(self, &client.client, &path_values).await? {
 				UpdateItemsInPath::Complete(DBObject::File(file)) => {
 					if let Some(hash) = file.hash.map(Into::into) {
-						let local_hash = io::hash_local_file(&path_values).await?;
+						let local_hash = io::hash_local_file(&path_values, &files_path).await?;
 						if local_hash == hash {
 							return Ok(false);
 						}
@@ -235,7 +268,15 @@ impl FilenMobileDB {
 				}
 			};
 
-		let remote_file = io::upload_file(&client.client, &path_values, parent_uuid, mime).await?;
+		let remote_file = io::upload_file(
+			&client.client,
+			&path_values,
+			parent_uuid,
+			mime,
+			Some(progress_callback),
+			&files_path,
+		)
+		.await?;
 
 		let mut conn = self.conn();
 		DBFile::upsert_from_remote(&mut conn, remote_file)?;
@@ -250,6 +291,7 @@ impl FilenMobileDB {
 		mime: String,
 	) -> Result<FfiPathWithRoot> {
 		let parent_pvs = parent_path.as_path_values()?;
+		let files_path = self.files();
 		let parent = match sync::update_items_in_path(self, &client.client, &parent_pvs).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
@@ -268,7 +310,7 @@ impl FilenMobileDB {
 		};
 		let path = parent_path.join(&name);
 		let pvs = path.as_path_values()?;
-		let file = io::create_file(&client.client, &pvs, parent.uuid(), mime).await?;
+		let file = io::create_file(&client.client, &pvs, parent.uuid(), mime, &files_path).await?;
 		let mut conn = self.conn();
 		let file = DBFile::upsert_from_remote(&mut conn, file)?;
 		Ok(parent_path.join(&file.name))
@@ -281,6 +323,7 @@ impl FilenMobileDB {
 		name: String,
 	) -> Result<FfiPathWithRoot> {
 		let path_values = parent_path.as_path_values()?;
+		let files_path = self.files();
 		let parent = match sync::update_items_in_path(self, &client.client, &path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
@@ -298,7 +341,14 @@ impl FilenMobileDB {
 			}
 		};
 
-		let dir = io::create_dir(&client.client, &path_values, parent.uuid(), name).await?;
+		let dir = io::create_dir(
+			&client.client,
+			&path_values,
+			parent.uuid(),
+			name,
+			&files_path,
+		)
+		.await?;
 
 		let mut conn = self.conn();
 		let dir = DBDir::upsert_from_remote(&mut conn, dir)?;

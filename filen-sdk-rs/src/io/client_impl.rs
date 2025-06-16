@@ -14,7 +14,7 @@ impl Client {
 		&'a self,
 		file: &'a dyn File,
 		writer: &mut T,
-		callback: &dyn Fn(u64),
+		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
 	) -> Result<(), crate::error::Error>
 	where
 		T: 'a + AsyncWrite + Unpin,
@@ -29,7 +29,9 @@ impl Client {
 			}
 			writer.write_all(&buffer[..bytes_read]).await?;
 			bytes_written += bytes_read as u64;
-			callback(bytes_written);
+			if let Some(callback) = &callback {
+				callback(bytes_written);
+			}
 		}
 		writer.flush().await?;
 		Ok(())
@@ -37,7 +39,7 @@ impl Client {
 
 	pub async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, crate::error::Error> {
 		let mut writer = Vec::with_capacity(file.size() as usize);
-		self.download_file_to_writer(file, &mut writer, &|_: u64| {})
+		self.download_file_to_writer(file, &mut writer, None)
 			.await?;
 		Ok(writer)
 	}
