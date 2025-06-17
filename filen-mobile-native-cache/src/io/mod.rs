@@ -140,7 +140,7 @@ pub async fn download_file(
 	client: &Client,
 	file: &RemoteFile,
 	pvs: &PathValues<'_>,
-	callback: Arc<dyn ProgressCallback + Send + Sync>,
+	callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
 	files_path: &Path,
 ) -> Result<PathBuf, io::Error> {
 	let reader = client.get_file_reader(file).compat();
@@ -150,15 +150,18 @@ pub async fn download_file(
 	let mut os_file = tokio::fs::File::create(&src).await?.compat_write();
 	let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
 	let file_size = file.size();
-	let task = tokio::task::spawn(async move { update_task(receiver, file_size, callback).await });
+	let callback = if let Some(callback) = callback {
+		tokio::task::spawn(async move {
+			update_task(receiver, file_size, callback).await;
+		});
+		Some(Arc::new(move |bytes_written: u64| {
+			let _ = sender.send(bytes_written);
+		}) as Arc<dyn Fn(u64) + Send + Sync>)
+	} else {
+		None
+	};
 	client
-		.download_file_to_writer(
-			file,
-			&mut os_file,
-			Some(Arc::new(move |bytes_written: u64| {
-				let _ = sender.send(bytes_written);
-			})),
-		)
+		.download_file_to_writer(file, &mut os_file, callback)
 		.await
 		.map_err(|e| io::Error::other(format!("Failed to download file: {}", e)))?;
 	let os_file = os_file.into_inner().into_std().await;
@@ -173,9 +176,6 @@ pub async fn download_file(
 
 	let dst = get_file_path(files_path, pvs).await?;
 	tokio::fs::rename(&src, &dst).await?;
-	// don't need to await for the task to finish, as it will run in the background
-	// this is for testing for now
-	let _ = task.await;
 	Ok(dst)
 }
 
@@ -223,27 +223,22 @@ pub async fn upload_file(
 		file = file.mime(mime);
 	}
 	let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
-	let reader_callback = if callback.is_some() {
+	let file_size = raw_meta_size(meta);
+	let reader_callback = if let Some(callback) = callback {
+		tokio::task::spawn(async move {
+			update_task(receiver, file_size, callback).await;
+		});
 		Some(Arc::new(move |bytes_written: u64| {
 			let _ = sender.send(bytes_written);
 		}) as Arc<dyn Fn(u64) + Send + Sync>)
 	} else {
 		None
 	};
-	let file_size = raw_meta_size(meta);
-	let task = tokio::task::spawn(async move {
-		if let Some(callback) = callback {
-			update_task(receiver, file_size, callback).await;
-		}
-	});
 
 	let remote_file = client
 		.upload_file_from_reader(file.build().into(), &mut os_file.compat(), reader_callback)
 		.await
 		.map_err(|e| io::Error::other(format!("Failed to upload file: {}", e)))?;
-	// don't need to await for the task to finish, as it will run in the background
-	// this is for testing for now
-	let _ = task.await;
 	Ok(remote_file)
 }
 

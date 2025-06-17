@@ -220,7 +220,7 @@ impl FilenMobileDB {
 			&client.client,
 			&file,
 			&path_values,
-			progress_callback,
+			Some(progress_callback),
 			&files_path,
 		)
 		.await?
