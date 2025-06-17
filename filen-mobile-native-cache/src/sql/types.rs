@@ -13,7 +13,7 @@ use filen_sdk_rs::{
 		},
 	},
 };
-use log::debug;
+use log::trace;
 use rusqlite::{
 	CachedStatement, Connection, OptionalExtension, Result, ToSql,
 	types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
@@ -77,7 +77,7 @@ fn upsert_item_with_stmts(
 	upsert_item_conflict_uuid: &mut CachedStatement<'_>,
 	upsert_item_conflict_name_parent: &mut CachedStatement<'_>,
 ) -> Result<i64> {
-	debug!(
+	trace!(
 		"Upserting item: uuid = {}, parent = {:?}, name = {}, type = {:?}",
 		uuid, parent, name, type_
 	);
@@ -93,7 +93,7 @@ fn upsert_item_with_stmts(
 			},
 			_,
 		)) => {
-			debug!("Conflict on UUID, trying to resolve by name and parent");
+			trace!("Conflict on UUID, trying to resolve by name and parent");
 			// might be a (parent, name, is_stale) conflict, so try to set the UUID and type
 			upsert_item_conflict_name_parent.query_one((uuid, parent, name, type_), |row| {
 				let id: i64 = row.get(0)?;
@@ -272,7 +272,7 @@ impl DBFile {
 		upsert_item_conflict_name_parent: &mut CachedStatement<'_>,
 		upsert_file: &mut CachedStatement<'_>,
 	) -> Result<Self> {
-		debug!("Upserting remote file: {:?}", remote_file);
+		trace!("Upserting remote file: {:?}", remote_file);
 		let id = upsert_item_with_stmts(
 			remote_file.uuid(),
 			Some(remote_file.parent()),
@@ -566,7 +566,7 @@ impl DBDir {
 		conn: &mut Connection,
 		remote_dir: RemoteDirectory,
 	) -> Result<Self> {
-		debug!("Upserting remote dir: {:?}", remote_dir);
+		trace!("Upserting remote dir: {:?}", remote_dir);
 		let tx = conn.transaction()?;
 		let new = {
 			let mut upsert_item_conflict_uuid = tx.prepare_cached(UPSERT_ITEM_CONFLICT_UUID_SQL)?;
@@ -713,7 +713,7 @@ impl DBRoot {
 		conn: &mut Connection,
 		remote_root: &RootDirectory,
 	) -> Result<Self> {
-		debug!("Upserting remote root: {:?}", remote_root);
+		trace!("Upserting remote root: {:?}", remote_root);
 		let tx = conn.transaction()?;
 		let id = upsert_item(
 			&tx,
@@ -1141,7 +1141,7 @@ where
 	T: DBItemTrait + Sync + Send,
 {
 	fn delete(&self, conn: &Connection) -> Result<bool> {
-		debug!(
+		trace!(
 			"Removing item: uuid = {}, name = {}",
 			self.uuid(),
 			self.name()
@@ -1149,7 +1149,7 @@ where
 		let mut stmt = conn.prepare_cached(include_str!("../../sql/delete_item.sql"))?;
 		let num_rows = stmt.execute([self.id()])?;
 		if num_rows == 0 {
-			debug!(
+			trace!(
 				"No rows deleted for item: uuid = {}, name = {}",
 				self.uuid(),
 				self.name()

@@ -17,7 +17,6 @@ use filen_sdk_rs::{
 	},
 };
 use filen_types::crypto::Sha512Hash;
-use log::debug;
 use sha2::Digest;
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt},
@@ -212,7 +211,6 @@ pub async fn upload_file(
 	files_path: &Path,
 ) -> Result<RemoteFile, io::Error> {
 	let path = get_file_path(files_path, pvs).await?;
-	debug!("Uploading file at {}", path.display());
 	let os_file = tokio::fs::File::open(path).await?;
 	let meta = os_file.metadata().await?;
 	let mut file = client
@@ -250,7 +248,6 @@ pub(crate) async fn create_file(
 	files_path: &Path,
 ) -> Result<RemoteFile, io::Error> {
 	let target_path = get_file_path(files_path, pvs).await?;
-	debug!("Creating file at {}", target_path.display());
 	let mut os_file = tokio::fs::File::create(target_path).await?;
 	os_file.flush().await?;
 	drop(os_file);

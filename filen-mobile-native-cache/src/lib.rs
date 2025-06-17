@@ -13,6 +13,7 @@ use filen_sdk_rs::{
 	},
 	util::PathIteratorExt,
 };
+use log::debug;
 use rusqlite::Connection;
 use uuid::Uuid;
 
@@ -158,6 +159,10 @@ pub struct DownloadResponse {
 #[filen_sdk_rs_macros::create_uniffi_wrapper]
 impl FilenMobileDB {
 	pub async fn update_roots_info(&self, client: &CacheClient) -> Result<()> {
+		debug!(
+			"Updating roots info for client: {}",
+			client.client.root().uuid()
+		);
 		let resp = client.client.get_user_info().await?;
 		let conn = self.conn();
 		sql::update_root(&conn, client.client.root().uuid(), &resp)?;
@@ -169,6 +174,7 @@ impl FilenMobileDB {
 		client: &CacheClient,
 		path: FfiPathWithRoot,
 	) -> Result<()> {
+		debug!("Updating directory children for path: {}", path.0);
 		let path_values = path.as_path_values()?;
 		let mut dir: DBDirObject =
 			match sync::update_items_in_path(self, &client.client, &path_values).await? {
@@ -193,6 +199,10 @@ impl FilenMobileDB {
 		path: FfiPathWithRoot,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>> {
+		debug!(
+			"Updating and querying directory children for path: {}",
+			path.0
+		);
 		self.update_dir_children(client, path.clone()).await?;
 		self.query_dir_children(&path, order_by)
 	}
@@ -203,6 +213,7 @@ impl FilenMobileDB {
 		file_path: FfiPathWithRoot,
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<String> {
+		debug!("Downloading file at path: {}", file_path.0);
 		let path_values = file_path.as_path_values()?;
 		let file = match sync::update_items_in_path(self, &client.client, &path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => file,
@@ -238,6 +249,7 @@ impl FilenMobileDB {
 		path: FfiPathWithRoot,
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<bool> {
+		debug!("Uploading file at path: {}", path.0);
 		let path_values = path.as_path_values()?;
 		let files_path = self.files();
 		let (parent_uuid, mime) =
@@ -290,6 +302,8 @@ impl FilenMobileDB {
 		name: String,
 		mime: String,
 	) -> Result<FfiPathWithRoot> {
+		let file_path = parent_path.join(&name);
+		debug!("Creating empty file at path: {}", file_path.0);
 		let parent_pvs = parent_path.as_path_values()?;
 		let files_path = self.files();
 		let parent = match sync::update_items_in_path(self, &client.client, &parent_pvs).await? {
@@ -312,8 +326,8 @@ impl FilenMobileDB {
 		let pvs = path.as_path_values()?;
 		let file = io::create_file(&client.client, &pvs, parent.uuid(), mime, &files_path).await?;
 		let mut conn = self.conn();
-		let file = DBFile::upsert_from_remote(&mut conn, file)?;
-		Ok(parent_path.join(&file.name))
+		DBFile::upsert_from_remote(&mut conn, file)?;
+		Ok(file_path)
 	}
 
 	pub async fn create_dir(
@@ -322,6 +336,8 @@ impl FilenMobileDB {
 		parent_path: FfiPathWithRoot,
 		name: String,
 	) -> Result<FfiPathWithRoot> {
+		let dir_path = parent_path.join(&name);
+		debug!("Creating directory at path: {}", dir_path.0);
 		let path_values = parent_path.as_path_values()?;
 		let files_path = self.files();
 		let parent = match sync::update_items_in_path(self, &client.client, &path_values).await? {
@@ -351,11 +367,12 @@ impl FilenMobileDB {
 		.await?;
 
 		let mut conn = self.conn();
-		let dir = DBDir::upsert_from_remote(&mut conn, dir)?;
-		Ok(parent_path.join(&dir.name))
+		DBDir::upsert_from_remote(&mut conn, dir)?;
+		Ok(dir_path)
 	}
 
 	pub async fn trash_item(&self, client: &CacheClient, path: FfiPathWithRoot) -> Result<()> {
+		debug!("Trashing item at path: {}", path.0);
 		let path_values: PathValues<'_> = path.as_path_values()?;
 		let obj = match sync::update_items_in_path(self, &client.client, &path_values).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject,
@@ -395,6 +412,10 @@ impl FilenMobileDB {
 		parent: FfiPathWithRoot,
 		new_parent: FfiPathWithRoot,
 	) -> Result<FfiPathWithRoot> {
+		debug!(
+			"Moving item {} from parent {} to new parent {}",
+			item.0, parent.0, new_parent.0
+		);
 		let item_pvs: PathValues<'_> = item.as_path_values()?;
 		let parent_pvs: PathValues<'_> = parent.as_path_values()?;
 		let new_parent_pvs: PathValues<'_> = new_parent.as_path_values()?;
@@ -492,6 +513,7 @@ impl FilenMobileDB {
 		item: FfiPathWithRoot,
 		new_name: String,
 	) -> Result<Option<FfiPathWithRoot>> {
+		debug!("Renaming item {} to {}", item.0, new_name);
 		let item_pvs: PathValues<'_> = item.as_path_values()?;
 		if item_pvs.name.is_empty() {
 			return Err(CacheError::remote(format!(
