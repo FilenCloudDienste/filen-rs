@@ -74,7 +74,7 @@ fn metadata_modified(metadata: &std::fs::Metadata) -> DateTime<Utc> {
 		.unwrap_or_else(|_| Utc::now())
 }
 
-pub(crate) const FILES_DIR: &str = "native_cache/downloads";
+pub const FILES_DIR: &str = "native_cache/downloads";
 const TMP_DIR: &str = "native_cache/tmp";
 
 const BUFFER_SIZE: u64 = 64 * 1024; // 64 KiB

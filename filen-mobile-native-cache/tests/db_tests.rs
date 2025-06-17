@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use filen_mobile_native_cache::{
 	CacheClient, FilenMobileDB,
 	ffi::{FfiNonRootObject, FfiObject, FfiPathWithRoot},
 	io,
+	traits::NoOpProgressCallback,
 };
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use test_log::test;
@@ -9,9 +12,12 @@ use test_utils::TestResources;
 
 async fn get_db_resources() -> (FilenMobileDB, CacheClient, TestResources) {
 	let path = std::env::temp_dir();
-	let sqlite_path = path.join("sqlite");
-	std::fs::create_dir_all(&sqlite_path).unwrap();
+	let files_path = path.join("test_files");
+	std::fs::create_dir_all(&files_path).unwrap();
 	let db = FilenMobileDB::initialize_in_memory().unwrap();
+
+	db.set_files_dir(files_path.to_string_lossy().to_string())
+		.unwrap();
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.to_stringified();
 	db.add_root(&client.root_uuid).unwrap();
@@ -516,7 +522,10 @@ pub async fn test_download_file() {
 	.into();
 
 	// Test downloading the file
-	let downloaded_path = db.download_file(&client, file_path.clone()).await.unwrap();
+	let downloaded_path = db
+		.download_file(&client, file_path.clone(), Arc::new(NoOpProgressCallback))
+		.await
+		.unwrap();
 
 	// Verify the file was downloaded and contains correct content
 	assert!(std::path::Path::new(&downloaded_path).exists());
@@ -539,7 +548,9 @@ pub async fn test_download_file_nonexistent() {
 	.into();
 
 	// Should fail when trying to download a non-existent file
-	let result = db.download_file(&client, nonexistent_path).await;
+	let result = db
+		.download_file(&client, nonexistent_path, Arc::new(NoOpProgressCallback))
+		.await;
 	assert!(result.is_err());
 }
 
@@ -557,7 +568,9 @@ pub async fn test_download_file_invalid_path() {
 		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), dir.name()).into();
 
 	// Should fail when trying to download a directory path as a file
-	let result = db.download_file(&client, dir_path).await;
+	let result = db
+		.download_file(&client, dir_path, Arc::new(NoOpProgressCallback))
+		.await;
 	assert!(result.is_err());
 }
 
@@ -570,7 +583,7 @@ pub async fn test_upload_file_if_changed_new_file() {
 	let test_content = b"This is test content for upload.";
 	let upload_path: FfiPathWithRoot =
 		format!("{}/{}/test_upload.txt", client.root_uuid(), rss.dir.name()).into();
-	let io_path = io::get_file_path(&upload_path.as_path_values().unwrap())
+	let io_path = io::get_file_path(&db.files(), &upload_path.as_path_values().unwrap())
 		.await
 		.unwrap();
 	std::fs::write(&io_path, test_content).unwrap();
@@ -580,7 +593,7 @@ pub async fn test_upload_file_if_changed_new_file() {
 
 	// Upload the file (should return true for new file)
 	let was_uploaded = db
-		.upload_file_if_changed(&client, upload_path.clone())
+		.upload_file_if_changed(&client, upload_path.clone(), Arc::new(NoOpProgressCallback))
 		.await
 		.unwrap();
 	assert!(was_uploaded);
@@ -629,7 +642,7 @@ pub async fn test_upload_file_if_changed_unchanged_file() {
 		remote_file.name()
 	)
 	.into();
-	let io_path = io::get_file_path(&upload_path.as_path_values().unwrap())
+	let io_path = io::get_file_path(&db.files(), &upload_path.as_path_values().unwrap())
 		.await
 		.unwrap();
 
@@ -637,7 +650,7 @@ pub async fn test_upload_file_if_changed_unchanged_file() {
 
 	// Upload should return false (unchanged)
 	let was_uploaded = db
-		.upload_file_if_changed(&client, upload_path)
+		.upload_file_if_changed(&client, upload_path, Arc::new(NoOpProgressCallback))
 		.await
 		.unwrap();
 	assert!(!was_uploaded);
@@ -669,14 +682,14 @@ pub async fn test_upload_file_if_changed_modified_file() {
 	let modified_content = b"Modified content - completely different!";
 	let upload_path: FfiPathWithRoot =
 		format!("{}/{}/modify_test.txt", client.root_uuid(), rss.dir.name()).into();
-	let io_path = io::get_file_path(&upload_path.as_path_values().unwrap())
+	let io_path = io::get_file_path(&db.files(), &upload_path.as_path_values().unwrap())
 		.await
 		.unwrap();
 	std::fs::write(&io_path, modified_content).unwrap();
 
 	// Upload should return true (changed)
 	let was_uploaded = db
-		.upload_file_if_changed(&client, upload_path)
+		.upload_file_if_changed(&client, upload_path, Arc::new(NoOpProgressCallback))
 		.await
 		.unwrap();
 	assert!(was_uploaded);
@@ -696,7 +709,7 @@ pub async fn test_upload_file_if_changed_invalid_parent() {
 	)
 	.into();
 
-	let io_path = io::get_file_path(&invalid_path.as_path_values().unwrap())
+	let io_path = io::get_file_path(&db.files(), &invalid_path.as_path_values().unwrap())
 		.await
 		.unwrap();
 
@@ -704,7 +717,9 @@ pub async fn test_upload_file_if_changed_invalid_parent() {
 	std::fs::write(&io_path, b"test").unwrap();
 
 	// Should fail with invalid parent path
-	let result = db.upload_file_if_changed(&client, invalid_path).await;
+	let result = db
+		.upload_file_if_changed(&client, invalid_path, Arc::new(NoOpProgressCallback))
+		.await;
 	assert!(result.is_err());
 
 	// Clean up
