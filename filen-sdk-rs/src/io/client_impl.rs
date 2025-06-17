@@ -21,16 +21,14 @@ impl Client {
 	{
 		let mut reader = self.get_file_reader(file);
 		let mut buffer = [0u8; IO_BUFFER_SIZE];
-		let mut bytes_written = 0;
 		loop {
 			let bytes_read = reader.read(&mut buffer).await?;
 			if bytes_read == 0 {
 				break;
 			}
 			writer.write_all(&buffer[..bytes_read]).await?;
-			bytes_written += bytes_read as u64;
 			if let Some(callback) = &callback {
-				callback(bytes_written);
+				callback(bytes_read as u64);
 			}
 		}
 		writer.flush().await?;
