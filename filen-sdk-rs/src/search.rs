@@ -80,7 +80,8 @@ impl<'a> SplitName<'a> {
 
 		// Iterate over character positions, not byte positions
 		for start_char in 0..char_count {
-			for end_char in start_char + self.min_len..self.max_len {
+			for slice_len in min_len..=max_len {
+				let end_char = slice_len + start_char;
 				if end_char > char_count {
 					break;
 				}
@@ -229,6 +230,13 @@ mod tests {
 
 	#[test]
 	fn split_name_iter() {
+		let input = "abc";
+		let splitter = SplitName::new(input, 1, 2);
+		assert_eq!(
+			vec!["a", "ab", "abc", "b", "bc", "c"],
+			splitter.iter().collect::<Vec<_>>()
+		);
+
 		let minimal = "a";
 		let splitter = SplitName::new(minimal, 2, 16);
 		assert_eq!(vec!["a"], splitter.iter().collect::<Vec<_>>());
