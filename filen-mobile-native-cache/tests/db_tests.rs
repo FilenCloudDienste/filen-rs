@@ -778,6 +778,8 @@ pub async fn test_progress_callback() {
 	assert_eq!(count, max);
 	assert_eq!(max, contents.len() as u64);
 
+	db.clear_local_cache(file_path.clone()).await.unwrap();
+
 	let progress_callback = Arc::new(SumProgressCallback::default());
 
 	let downloaded_path = db

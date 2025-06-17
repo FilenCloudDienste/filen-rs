@@ -575,6 +575,13 @@ impl FilenMobileDB {
 		}
 		Ok(Some(new_path))
 	}
+
+	pub async fn clear_local_cache(&self, item: FfiPathWithRoot) -> Result<()> {
+		let pvs = item.as_path_values()?;
+		let files_path = self.files();
+		io::delete_item(&files_path, &pvs).await?;
+		Ok(())
+	}
 }
 
 #[derive(uniffi::Object)]

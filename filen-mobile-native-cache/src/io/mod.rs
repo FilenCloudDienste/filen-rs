@@ -269,3 +269,16 @@ pub(crate) async fn create_dir(
 	tokio::fs::create_dir_all(get_file_path(files_path, pvs).await?).await?;
 	Ok(remote_dir)
 }
+
+pub(crate) async fn delete_item(files_path: &Path, pvs: &PathValues<'_>) -> Result<(), io::Error> {
+	let path = get_file_path(files_path, pvs).await?;
+	if !path.try_exists().unwrap_or_default() {
+		return Ok(());
+	}
+	if path.is_dir() {
+		let _ = tokio::fs::remove_dir_all(&path).await;
+	} else {
+		let _ = tokio::fs::remove_file(&path).await;
+	}
+	Ok(())
+}
