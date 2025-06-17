@@ -583,6 +583,7 @@ dependencies = [
  "libsqlite3-sys",
  "log 0.4.27",
  "once_cell",
+ "rand 0.9.1",
  "rusqlite",
  "sha2",
  "test-log",

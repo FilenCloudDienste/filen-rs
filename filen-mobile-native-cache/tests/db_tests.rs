@@ -4,11 +4,36 @@ use filen_mobile_native_cache::{
 	CacheClient, FilenMobileDB,
 	ffi::{FfiNonRootObject, FfiObject, FfiPathWithRoot},
 	io,
-	traits::NoOpProgressCallback,
+	traits::ProgressCallback,
 };
 use filen_sdk_rs::fs::{HasName, HasUUID};
+use rand::TryRngCore;
 use test_log::test;
 use test_utils::TestResources;
+
+pub struct NoOpProgressCallback;
+impl ProgressCallback for NoOpProgressCallback {
+	fn init(&self, _size: u64) {}
+	fn on_progress(&self, _bytes_processed: u64) {}
+}
+
+#[derive(Debug, Default)]
+pub struct SumProgressCallback {
+	pub max: std::sync::atomic::AtomicU64,
+	pub count: std::sync::atomic::AtomicU64,
+}
+
+impl ProgressCallback for SumProgressCallback {
+	fn init(&self, size: u64) {
+		self.max.store(size, std::sync::atomic::Ordering::Relaxed);
+		self.count.store(0, std::sync::atomic::Ordering::Relaxed);
+	}
+
+	fn on_progress(&self, bytes_processed: u64) {
+		self.count
+			.fetch_add(bytes_processed, std::sync::atomic::Ordering::Relaxed);
+	}
+}
 
 async fn get_db_resources() -> (FilenMobileDB, CacheClient, TestResources) {
 	let path = std::env::temp_dir();
@@ -724,6 +749,55 @@ pub async fn test_upload_file_if_changed_invalid_parent() {
 
 	// Clean up
 	std::fs::remove_file(&io_path).ok();
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_progress_callback() {
+	let (db, client, rss) = get_db_resources().await;
+	let mut contents = vec![0u8; 10 * 1024 * 1024];
+	rand::rng().try_fill_bytes(&mut contents).unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name(),).into();
+	let name = "test_progress.txt".to_string();
+	let file_path = db
+		.create_empty_file(&client, parent_path, name.clone(), "".into())
+		.await
+		.unwrap();
+	let files_path = db.files().join(filen_mobile_native_cache::io::FILES_DIR);
+	std::fs::write(files_path.join(&file_path.0), &contents).unwrap();
+
+	let upload_progress_callback = Arc::new(SumProgressCallback::default());
+	db.upload_file_if_changed(&client, file_path.clone(), upload_progress_callback.clone())
+		.await
+		.unwrap();
+	let count = upload_progress_callback
+		.count
+		.load(std::sync::atomic::Ordering::Relaxed);
+	let max = upload_progress_callback
+		.max
+		.load(std::sync::atomic::Ordering::Relaxed);
+	assert_eq!(count, max);
+	assert_eq!(max, contents.len() as u64);
+
+	let progress_callback = Arc::new(SumProgressCallback::default());
+
+	let downloaded_path = db
+		.download_file(&client, file_path.clone(), progress_callback.clone())
+		.await
+		.unwrap();
+
+	assert!(std::path::Path::new(&downloaded_path).exists());
+	let downloaded_content = std::fs::read(&downloaded_path).unwrap();
+	let count = progress_callback
+		.count
+		.load(std::sync::atomic::Ordering::Relaxed);
+	let max = progress_callback
+		.max
+		.load(std::sync::atomic::Ordering::Relaxed);
+	assert_eq!(count, max);
+	assert_eq!(max, contents.len() as u64);
+	assert_eq!(downloaded_content, contents);
+
+	std::fs::remove_file(&downloaded_path).ok();
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]

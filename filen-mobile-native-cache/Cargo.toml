@@ -41,3 +41,4 @@ uniffi = { version = "0.29.2", features = [ "build" ] }
 tokio = { version = "1.45.1", features = ["full"] }
 test-utils = { path = "../test-utils" }
 test-log = "0.2.17"
+rand = "0.9.1"

@@ -14,9 +14,3 @@ where
 
 	fn init(&self, _size: u64) {}
 }
-
-pub struct NoOpProgressCallback;
-impl ProgressCallback for NoOpProgressCallback {
-	fn init(&self, _size: u64) {}
-	fn on_progress(&self, _bytes_processed: u64) {}
-}
