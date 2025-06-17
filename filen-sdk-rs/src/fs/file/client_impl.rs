@@ -95,7 +95,7 @@ impl Client {
 			uuid,
 			response.parent,
 			response.size,
-			response.size / CHUNK_SIZE_U64 + 1,
+			response.size.div_ceil(CHUNK_SIZE_U64),
 			response.region,
 			response.bucket,
 			false,

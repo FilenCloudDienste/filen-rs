@@ -42,6 +42,9 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 
 	assert_eq!(buf.len(), contents.len(), "File size mismatch for {}", name);
 	assert_eq!(&buf, contents, "File contents mismatch for {}", name);
+
+	let got_file = client.get_file(file.uuid()).await.unwrap();
+	assert_eq!(file, got_file, "File metadata mismatch for {}", name);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
