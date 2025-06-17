@@ -548,7 +548,7 @@ pub async fn test_download_file() {
 
 	// Test downloading the file
 	let downloaded_path = db
-		.download_file(&client, file_path.clone(), Arc::new(NoOpProgressCallback))
+		.download_file_if_changed(&client, file_path.clone(), Arc::new(NoOpProgressCallback))
 		.await
 		.unwrap();
 
@@ -574,7 +574,7 @@ pub async fn test_download_file_nonexistent() {
 
 	// Should fail when trying to download a non-existent file
 	let result = db
-		.download_file(&client, nonexistent_path, Arc::new(NoOpProgressCallback))
+		.download_file_if_changed(&client, nonexistent_path, Arc::new(NoOpProgressCallback))
 		.await;
 	assert!(result.is_err());
 }
@@ -594,7 +594,7 @@ pub async fn test_download_file_invalid_path() {
 
 	// Should fail when trying to download a directory path as a file
 	let result = db
-		.download_file(&client, dir_path, Arc::new(NoOpProgressCallback))
+		.download_file_if_changed(&client, dir_path, Arc::new(NoOpProgressCallback))
 		.await;
 	assert!(result.is_err());
 }
@@ -781,7 +781,7 @@ pub async fn test_progress_callback() {
 	let progress_callback = Arc::new(SumProgressCallback::default());
 
 	let downloaded_path = db
-		.download_file(&client, file_path.clone(), progress_callback.clone())
+		.download_file_if_changed(&client, file_path.clone(), progress_callback.clone())
 		.await
 		.unwrap();
 

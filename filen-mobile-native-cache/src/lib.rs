@@ -207,13 +207,13 @@ impl FilenMobileDB {
 		self.query_dir_children(&path, order_by)
 	}
 
-	pub async fn download_file(
+	pub async fn download_file_if_changed(
 		&self,
 		client: &CacheClient,
 		file_path: FfiPathWithRoot,
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<String> {
-		debug!("Downloading file at path: {}", file_path.0);
+		debug!("Downloading file to path: {}", file_path.0);
 		let path_values = file_path.as_path_values()?;
 		let file = match sync::update_items_in_path(self, &client.client, &path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => file,
@@ -225,8 +225,18 @@ impl FilenMobileDB {
 			}
 		};
 		let file: RemoteFile = file.try_into()?;
-
 		let files_path = self.files();
+		let file_path = io::get_file_path(&files_path, &path_values).await?;
+		if file_path.exists() {
+			let local_hash = io::hash_local_file(&path_values, &files_path).await?;
+			if file.hash.is_some_and(|h| h == local_hash) {
+				debug!("File {} is already up-to-date", path_values.full_path);
+				return file_path.into_os_string().into_string().map_err(|e| {
+					CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
+				});
+			}
+		}
+
 		let path = io::download_file(
 			&client.client,
 			&file,
