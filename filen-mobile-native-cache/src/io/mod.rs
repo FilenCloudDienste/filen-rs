@@ -155,7 +155,7 @@ pub async fn download_file(
 		.download_file_to_writer(
 			file,
 			&mut os_file,
-			Some(Arc::new(|bytes_written: u64| {
+			Some(Arc::new(move |bytes_written: u64| {
 				let _ = sender.send(bytes_written);
 			})),
 		)
