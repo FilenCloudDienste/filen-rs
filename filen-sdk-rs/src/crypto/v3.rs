@@ -101,22 +101,19 @@ impl Eq for EncryptionKey {}
 impl MetaCrypter for EncryptionKey {
 	fn encrypt_meta_into(
 		&self,
-		meta: impl AsRef<str>,
-		out: &mut EncryptedString,
-	) -> Result<(), ConversionError> {
-		let meta = meta.as_ref();
+		meta: &str,
+		mut out: Vec<u8>,
+	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
 		let nonce: [u8; NONCE_SIZE] = rand::random();
 		let nonce = Nonce::from_slice(&nonce);
-		let out = &mut out.0;
+		out.clear();
 		let base64_len =
 			base64::encoded_len(meta.len() + TAG_SIZE, true).expect("meta len too long for base64");
 		out.reserve(3 + NONCE_SIZE * 2 + base64_len);
-		out.push_str("003");
-		{
-			// SAFETY: hex::encode_to_slice adds valid UTF8
-			let out = unsafe { out.as_mut_vec() };
-			out.resize(3 + NONCE_SIZE * 2, 0);
-			faster_hex::hex_encode(nonce.as_slice(), &mut out[3..])?;
+		out.extend_from_slice(b"003");
+		out.resize(out.len() + NONCE_SIZE * 2, 0);
+		if let Err(e) = faster_hex::hex_encode(nonce.as_slice(), &mut out[3..]) {
+			return Err((e.into(), out));
 		}
 
 		// not allocating here is very difficult, so we don't bother
@@ -124,50 +121,52 @@ impl MetaCrypter for EncryptionKey {
 		// but it would almost certainly require a reallocation
 		// because we would need to extend the buffer to fit the authentication tag
 		// before base64 encoding
-		let encrypted = self.cipher.encrypt(nonce, meta.as_bytes())?;
-		BASE64_STANDARD.encode_string(encrypted, out);
-		Ok(())
+		let encrypted = match self.cipher.encrypt(nonce, meta.as_bytes()) {
+			Ok(encrypted) => encrypted,
+			Err(e) => return Err((e.into(), out)),
+		};
+		let mut out_string =
+			String::from_utf8(out).map_err(|e| (e.utf8_error().into(), e.into_bytes()))?;
+		BASE64_STANDARD.encode_string(encrypted, &mut out_string);
+		Ok(EncryptedString(out_string))
 	}
 
 	fn decrypt_meta_into(
 		&self,
 		meta: &EncryptedString,
-		out: &mut String,
-	) -> Result<(), ConversionError> {
+		mut out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
 		let meta = &meta.0;
 		if meta.len() < NONCE_SIZE * 2 + 3 {
 			// hex encoded NONCE_SIZE + 3 for version tag
-			return Err(ConversionError::InvalidStringLength(
-				meta.len(),
-				NONCE_SIZE * 2 + 3,
+			return Err((
+				ConversionError::InvalidStringLength(meta.len(), NONCE_SIZE * 2 + 3),
+				out,
 			));
 		}
 		let tag = &meta[0..3];
 		if tag != "003" {
-			return Err(ConversionError::InvalidVersion(
-				tag.to_string(),
-				vec!["003".to_string()],
+			return Err((
+				ConversionError::InvalidVersion(tag.to_string(), vec!["003".to_string()]),
+				out,
 			));
 		}
 		let mut nonce = [0u8; NONCE_SIZE];
-		faster_hex::hex_decode(
+		if let Err(e) = faster_hex::hex_decode(
 			&meta.as_bytes()[3..3 + NONCE_SIZE * 2],
 			nonce.as_mut_slice(),
-		)?;
+		) {
+			return Err((e.into(), out));
+		}
 		let nonce = Nonce::from(nonce);
 		out.clear();
-		{
-			// SAFETY: we validate the utf8 status of the vec at the end of this block
-			let out = unsafe { out.as_mut_vec() };
-			BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE * 2 + 3..], out)?;
-
-			self.cipher.decrypt_in_place(&nonce, &[], out)?;
-			if let Err(e) = std::str::from_utf8(out) {
-				out.clear();
-				return Err(e.into());
-			}
+		if let Err(e) = BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE * 2 + 3..], &mut out) {
+			return Err((e.into(), out));
 		}
-		Ok(())
+		if let Err(e) = self.cipher.decrypt_in_place(&nonce, &[], &mut out) {
+			return Err((e.into(), out));
+		}
+		String::from_utf8(out).map_err(|e| (e.utf8_error().into(), e.into_bytes()))
 	}
 }
 

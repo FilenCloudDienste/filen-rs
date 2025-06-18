@@ -13,10 +13,10 @@ pub(crate) fn derive_password_for_link(
 					0 => "empty",
 					_ => password,
 				};
-				Ok(super::v2::hash_to_buffer(password.as_bytes()).to_vec())
+				Ok(super::v2::hash(password.as_bytes()).to_vec())
 			}
 		},
-		None => Ok(super::v2::hash_to_buffer("empty".as_bytes()).to_vec()),
+		None => Ok(super::v2::hash("empty".as_bytes()).to_vec()),
 	}
 }
 

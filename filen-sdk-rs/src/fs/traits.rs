@@ -55,7 +55,7 @@ where
 		&self,
 		crypter: &impl MetaCrypter,
 	) -> Result<EncryptedString, ConversionError> {
-		crypter.encrypt_meta(self.get_meta_string())
+		crypter.encrypt_meta(&self.get_meta_string())
 	}
 	fn get_rsa_encrypted_meta(
 		&self,

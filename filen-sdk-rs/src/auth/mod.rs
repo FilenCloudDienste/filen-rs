@@ -7,7 +7,7 @@ use std::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::{
 	auth::{APIKey, AuthVersion, FileEncryptionVersion, MetaEncryptionVersion},
-	crypto::EncryptedMetaKey,
+	crypto::{EncryptedMetaKey, EncryptedString},
 };
 use http::{AuthClient, UnauthClient};
 use rsa::pkcs8::EncodePrivateKey;
@@ -42,9 +42,9 @@ pub(crate) enum MetaKey {
 impl MetaCrypter for MetaKey {
 	fn decrypt_meta_into(
 		&self,
-		meta: &filen_types::crypto::EncryptedString,
-		out: &mut String,
-	) -> Result<(), crypto::error::ConversionError> {
+		meta: &EncryptedString,
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
 		match self {
 			MetaKey::V2(info) => info.decrypt_meta_into(meta, out),
 			MetaKey::V3(info) => info.decrypt_meta_into(meta, out),
@@ -53,9 +53,9 @@ impl MetaCrypter for MetaKey {
 
 	fn encrypt_meta_into(
 		&self,
-		meta: impl AsRef<str>,
-		out: &mut filen_types::crypto::EncryptedString,
-	) -> Result<(), crate::crypto::error::ConversionError> {
+		meta: &str,
+		out: Vec<u8>,
+	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
 		match self {
 			MetaKey::V2(info) => info.encrypt_meta_into(meta, out),
 			MetaKey::V3(info) => info.encrypt_meta_into(meta, out),
@@ -114,9 +114,9 @@ impl FromStr for AuthInfo {
 impl MetaCrypter for AuthInfo {
 	fn decrypt_meta_into(
 		&self,
-		meta: &filen_types::crypto::EncryptedString,
-		out: &mut String,
-	) -> Result<(), crypto::error::ConversionError> {
+		meta: &EncryptedString,
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
 		match self {
 			AuthInfo::V1 => unimplemented!(),
 			AuthInfo::V2(info) => info.decrypt_meta_into(meta, out),
@@ -126,9 +126,9 @@ impl MetaCrypter for AuthInfo {
 
 	fn encrypt_meta_into(
 		&self,
-		meta: impl AsRef<str>,
-		out: &mut filen_types::crypto::EncryptedString,
-	) -> Result<(), crate::crypto::error::ConversionError> {
+		meta: &str,
+		out: Vec<u8>,
+	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
 		match self {
 			AuthInfo::V1 => unimplemented!(),
 			AuthInfo::V2(info) => info.encrypt_meta_into(meta, out),
@@ -250,7 +250,7 @@ impl Client {
 	) -> Result<EncryptedMetaKey, ConversionError> {
 		Ok(EncryptedMetaKey(match key {
 			MetaKey::V2(key) => self.crypter().encrypt_meta(key.as_ref()),
-			MetaKey::V3(key) => self.crypter().encrypt_meta(key.to_string()),
+			MetaKey::V3(key) => self.crypter().encrypt_meta(&key.to_string()),
 		}?))
 	}
 

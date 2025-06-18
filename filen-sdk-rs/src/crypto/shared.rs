@@ -6,23 +6,19 @@ use super::error::ConversionError;
 pub trait MetaCrypter {
 	fn encrypt_meta_into(
 		&self,
-		meta: impl AsRef<str>,
-		out: &mut EncryptedString,
-	) -> Result<(), ConversionError>;
-	fn encrypt_meta(&self, meta: impl AsRef<str>) -> Result<EncryptedString, ConversionError> {
-		let mut out = EncryptedString(String::new());
-		self.encrypt_meta_into(meta, &mut out)?;
-		Ok(out)
+		meta: &str,
+		out: Vec<u8>,
+	) -> Result<EncryptedString, (ConversionError, Vec<u8>)>;
+	fn encrypt_meta(&self, meta: &str) -> Result<EncryptedString, ConversionError> {
+		self.encrypt_meta_into(meta, Vec::new()).map_err(|(e, _)| e)
 	}
 	fn decrypt_meta_into(
 		&self,
 		meta: &EncryptedString,
-		out: &mut String,
-	) -> Result<(), ConversionError>;
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)>;
 	fn decrypt_meta(&self, meta: &EncryptedString) -> Result<String, ConversionError> {
-		let mut out = String::new();
-		self.decrypt_meta_into(meta, &mut out)?;
-		Ok(out)
+		self.decrypt_meta_into(meta, Vec::new()).map_err(|(e, _)| e)
 	}
 }
 

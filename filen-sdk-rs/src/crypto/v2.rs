@@ -37,6 +37,31 @@ pub struct MasterKey {
 	pub cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
 }
 
+impl MasterKey {
+	fn decrypt_meta_into_v2(
+		&self,
+		meta: &EncryptedString,
+		mut out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
+		let meta = &meta.0;
+		let nonce = &meta[3..NONCE_SIZE + 3];
+		let nonce = Nonce::from_slice(nonce.as_bytes());
+		out.clear();
+		if let Err(e) = BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE + 3..], &mut out) {
+			return Err((e.into(), out));
+		}
+		if let Err(e) = self.cipher.decrypt_in_place(nonce, &[], &mut out) {
+			return Err((e.into(), out));
+		}
+
+		String::from_utf8(out).map_err(|e| {
+			let err = e.utf8_error();
+			let out = e.into_bytes();
+			(err.into(), out)
+		})
+	}
+}
+
 impl std::fmt::Debug for MasterKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let hash_key_str =
@@ -77,63 +102,58 @@ impl AsRef<str> for MasterKey {
 impl MetaCrypter for MasterKey {
 	fn encrypt_meta_into(
 		&self,
-		meta: impl AsRef<str>,
-		out: &mut EncryptedString,
-	) -> Result<(), ConversionError> {
-		let meta = meta.as_ref();
+		meta: &str,
+		mut out: Vec<u8>,
+	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
 		let nonce = generate_bad_nonce();
-		let out = &mut out.0;
 		out.clear();
 		let base64_len =
 			base64::encoded_len(meta.len() + TAG_SIZE, true).expect("meta len too long for base64");
 		out.reserve(3 + NONCE_SIZE + base64_len);
-		out.push_str("002");
-		out.push_str(std::str::from_utf8(&nonce)?); // can be changed to unsafe for max perf
+		out.extend_from_slice(b"002");
+		out.extend_from_slice(&nonce);
 
 		// not allocating here is very difficult, so we don't bother
 		// the problem is that if we owned the meta String, we could consume it,
 		// but it would almost certainly require a reallocation
 		// because we would need to extend the buffer to fit the authentication tag
 		// before base64 encoding
-		let encrypted = self.cipher.encrypt(&nonce, meta.as_bytes())?;
-		BASE64_STANDARD.encode_string(encrypted, out);
-		Ok(())
+
+		let encrypted = match self.cipher.encrypt(&nonce, meta.as_bytes()) {
+			Ok(encrypted) => encrypted,
+			Err(e) => {
+				return Err((e.into(), out));
+			}
+		};
+		let mut out_string = String::from_utf8(out).map_err(|e| {
+			let err = e.utf8_error();
+			let out = e.into_bytes();
+			(err.into(), out)
+		})?;
+		BASE64_STANDARD.encode_string(encrypted, &mut out_string);
+		Ok(EncryptedString(out_string))
 	}
 
 	fn decrypt_meta_into(
 		&self,
 		meta: &EncryptedString,
-		out: &mut String,
-	) -> Result<(), ConversionError> {
-		let meta = &meta.0;
-		if meta.len() < NONCE_SIZE + 3 {
-			return Err(ConversionError::InvalidStringLength(
-				meta.len(),
-				NONCE_SIZE + 3,
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
+		if meta.0.len() < NONCE_SIZE + 3 {
+			return Err((
+				ConversionError::InvalidStringLength(meta.0.len(), NONCE_SIZE + 3),
+				out,
 			));
 		}
-		let tag = &meta[0..3];
-		if tag != "002" {
-			return Err(ConversionError::InvalidVersion(
-				tag.to_string(),
-				vec!["002".to_string()],
-			));
-		}
-		let nonce = &meta[3..NONCE_SIZE + 3];
-		let nonce = Nonce::from_slice(nonce.as_bytes());
-		out.clear();
-		{
-			// SAFETY: we validate the utf8 status of the vec at the end of this block
-			let out = unsafe { out.as_mut_vec() };
-			BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE + 3..], out)?;
 
-			self.cipher.decrypt_in_place(nonce, &[], out)?;
-			if let Err(e) = std::str::from_utf8(out) {
-				out.clear();
-				return Err(e.into());
-			}
+		let tag = &meta.0[0..3];
+		if tag == "002" {
+			return self.decrypt_meta_into_v2(meta, out);
 		}
-		Ok(())
+		Err((
+			ConversionError::InvalidVersion(tag.to_string(), vec!["002".to_string()]),
+			out,
+		))
 	}
 }
 
@@ -181,26 +201,28 @@ impl MasterKeys {
 impl MetaCrypter for MasterKeys {
 	fn encrypt_meta_into(
 		&self,
-		meta: impl AsRef<str>,
-		out: &mut EncryptedString,
-	) -> Result<(), ConversionError> {
+		meta: &str,
+		out: Vec<u8>,
+	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
 		self.0[0].encrypt_meta_into(meta, out)
 	}
 
 	fn decrypt_meta_into(
 		&self,
 		meta: &EncryptedString,
-		out: &mut String,
-	) -> Result<(), ConversionError> {
+		mut out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
 		let mut errs = Vec::new();
 		for key in &self.0 {
 			match key.decrypt_meta_into(meta, out) {
-				Ok(()) => return Ok(()),
-				Err(err) => errs.push(err),
+				Ok(string) => return Ok(string),
+				Err((e, out_err)) => {
+					errs.push(e);
+					out = out_err;
+				}
 			}
 		}
-		out.clear();
-		Err(ConversionError::MultipleErrors(errs))
+		Err((ConversionError::MultipleErrors(errs), out))
 	}
 }
 
@@ -265,15 +287,13 @@ impl CreateRandom for FileKey {
 	}
 }
 
-pub(crate) fn hash_to_buffer(name: &[u8]) -> [u8; 20] {
-	let mut outer_hasher = sha1::Sha1::new();
-	let mut inner_hasher = sha2::Sha512::new();
-	inner_hasher.update(name);
-	let mut hashed_name = [0u8; 128];
+pub(crate) fn hash(name: &[u8]) -> [u8; 20] {
+	let mut temp = [0u8; 128];
 	// SAFETY: The length of hashed_named must be 2x the length of a Sha512 hash, which is 128 bytes
-	faster_hex::hex_encode(inner_hasher.finalize().as_slice(), &mut hashed_name).unwrap();
-	outer_hasher.update(hashed_name);
-	outer_hasher.finalize().into()
+	let sha2 = unsafe {
+		faster_hex::hex_encode(&sha2::Sha512::digest(name), &mut temp).unwrap_unchecked()
+	};
+	sha1::Sha1::digest(sha2).into()
 }
 
 pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], ConversionError> {

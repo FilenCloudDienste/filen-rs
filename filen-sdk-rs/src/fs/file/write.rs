@@ -122,7 +122,7 @@ impl<'a> FileWriterUploadingState<'a> {
 			size: Cow::Owned(
 				self.client
 					.crypter()
-					.encrypt_meta(self.written.to_string())?,
+					.encrypt_meta(&self.written.to_string())?,
 			),
 			parent: file.parent,
 			mime: Cow::Owned(

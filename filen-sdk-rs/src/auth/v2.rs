@@ -11,7 +11,7 @@ use crate::{
 		self,
 		error::ConversionError,
 		shared::{CreateRandom, MetaCrypter},
-		v2::{MasterKeys, hash_to_buffer},
+		v2::{MasterKeys, hash},
 	},
 	error::Error,
 };
@@ -28,17 +28,17 @@ pub(crate) struct AuthInfo {
 impl MetaCrypter for AuthInfo {
 	fn encrypt_meta_into(
 		&self,
-		meta: impl AsRef<str>,
-		out: &mut EncryptedString,
-	) -> Result<(), ConversionError> {
+		meta: &str,
+		out: Vec<u8>,
+	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
 		self.master_keys.encrypt_meta_into(meta, out)
 	}
 
 	fn decrypt_meta_into(
 		&self,
 		meta: &EncryptedString,
-		out: &mut String,
-	) -> Result<(), ConversionError> {
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
 		self.master_keys.decrypt_meta_into(meta, out)
 	}
 }
@@ -88,7 +88,7 @@ pub(super) async fn login(
 }
 
 pub(crate) fn hash_name(name: impl AsRef<[u8]>) -> String {
-	faster_hex::hex_string(&hash_to_buffer(name.as_ref()))
+	faster_hex::hex_string(&hash(name.as_ref()))
 }
 
 pub(super) fn generate_file_key() -> crypto::v2::FileKey {
