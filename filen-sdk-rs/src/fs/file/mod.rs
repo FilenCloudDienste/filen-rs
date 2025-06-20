@@ -1,14 +1,17 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_types::{crypto::Sha512Hash, fs::ObjectType};
+use filen_types::{
+	crypto::Sha512Hash,
+	fs::{ObjectType, ParentUuid},
+};
 use meta::FileMeta;
 use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, SetFileMeta};
 use uuid::Uuid;
 
-use crate::{auth::Client, crypto::file::FileKey};
+use crate::{auth::Client, crypto::file::FileKey, fs::dir::HasUUIDContents};
 
-use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID, dir::HasContents};
+use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
 pub mod client_impl;
 pub mod enums;
@@ -30,7 +33,11 @@ pub struct FileBuilder {
 }
 
 impl FileBuilder {
-	pub(crate) fn new(name: impl Into<String>, parent: &impl HasContents, client: &Client) -> Self {
+	pub(crate) fn new(
+		name: impl Into<String>,
+		parent: &impl HasUUIDContents,
+		client: &Client,
+	) -> Self {
 		Self {
 			uuid: Uuid::new_v4(),
 			name: name.into(),
@@ -185,15 +192,20 @@ impl BaseFile {
 	}
 }
 
-impl From<RemoteFile> for BaseFile {
-	fn from(file: RemoteFile) -> Self {
-		file.file
+impl TryFrom<RemoteFile> for BaseFile {
+	type Error = filen_types::error::ConversionError;
+	fn try_from(file: RemoteFile) -> Result<Self, Self::Error> {
+		Ok(Self {
+			root: file.file,
+			parent: file.parent.try_into()?,
+		})
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
-	pub file: BaseFile,
+	pub file: RootFile,
+	pub parent: ParentUuid,
 	pub size: u64,
 	pub favorited: bool,
 	pub region: String,
@@ -206,7 +218,7 @@ impl RemoteFile {
 	#[allow(clippy::too_many_arguments)]
 	pub fn from_meta(
 		uuid: Uuid,
-		parent: Uuid,
+		parent: ParentUuid,
 		size: u64,
 		chunks: u64,
 		region: impl Into<String>,
@@ -216,7 +228,8 @@ impl RemoteFile {
 	) -> Self {
 		Self {
 			hash: meta.hash,
-			file: BaseFile::from_meta(uuid, parent, meta),
+			parent,
+			file: RootFile::from_meta(uuid, meta),
 			size,
 			favorited,
 			region: region.into(),
@@ -224,14 +237,14 @@ impl RemoteFile {
 			chunks,
 		}
 	}
-	pub fn inner_file(&self) -> &BaseFile {
+	pub fn inner_file(&self) -> &RootFile {
 		&self.file
 	}
 }
 
 pub struct FlatRemoteFile {
 	pub uuid: Uuid,
-	pub parent: Uuid,
+	pub parent: ParentUuid,
 	pub name: String,
 	pub mime: String,
 	pub key: FileKey,
@@ -248,17 +261,15 @@ pub struct FlatRemoteFile {
 impl From<FlatRemoteFile> for RemoteFile {
 	fn from(file: FlatRemoteFile) -> Self {
 		Self {
-			file: BaseFile {
-				root: RootFile {
-					uuid: file.uuid,
-					name: file.name,
-					mime: file.mime,
-					key: file.key,
-					created: file.created,
-					modified: file.modified,
-				},
-				parent: file.parent,
+			file: RootFile {
+				uuid: file.uuid,
+				name: file.name,
+				mime: file.mime,
+				key: file.key,
+				created: file.created,
+				modified: file.modified,
 			},
+			parent: file.parent,
 			size: file.size,
 			favorited: file.favorited,
 			region: file.region,
@@ -276,8 +287,8 @@ impl HasUUID for RemoteFile {
 }
 
 impl HasParent for RemoteFile {
-	fn parent(&self) -> uuid::Uuid {
-		self.file.parent()
+	fn parent(&self) -> ParentUuid {
+		self.parent
 	}
 }
 
@@ -314,11 +325,11 @@ impl HasFileMeta for RemoteFile {
 
 impl SetFileMeta for RemoteFile {
 	fn set_meta(&mut self, meta: FileMeta<'_>) {
-		self.file.root.name = meta.name.into_owned();
-		self.file.root.mime = meta.mime.into_owned();
-		self.file.root.key = meta.key.into_owned();
-		self.file.root.modified = meta.last_modified;
-		self.file.root.created = meta.created.unwrap_or_default();
+		self.file.name = meta.name.into_owned();
+		self.file.mime = meta.mime.into_owned();
+		self.file.key = meta.key.into_owned();
+		self.file.modified = meta.last_modified;
+		self.file.created = meta.created.unwrap_or_default();
 	}
 }
 
@@ -384,7 +395,7 @@ impl HasRemoteFileInfo for RemoteFile {
 
 impl PartialEq<RemoteRootFile> for RemoteFile {
 	fn eq(&self, other: &RemoteRootFile) -> bool {
-		self.file.root == other.file
+		self.file == other.file
 			&& self.size == other.size
 			&& self.region == other.region
 			&& self.bucket == other.bucket
@@ -537,7 +548,7 @@ impl HasRemoteFileInfo for RemoteRootFile {
 
 impl PartialEq<RemoteFile> for RemoteRootFile {
 	fn eq(&self, other: &RemoteFile) -> bool {
-		self.file == other.file.root
+		self.file == other.file
 			&& self.size == other.size
 			&& self.region == other.region
 			&& self.bucket == other.bucket

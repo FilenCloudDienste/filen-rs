@@ -276,9 +276,12 @@ impl<'a> FileWriterCompletingState<'a> {
 		self,
 		response: filen_types::api::v3::upload::empty::Response,
 	) -> FileWriterFinalizingState<'a> {
+		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
+
 		FileWriterFinalizingState::new(
 			Arc::new(RemoteFile {
-				file: Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone()),
+				file: file.root,
+				parent: file.parent.into(),
 				size: response.size,
 				favorited: false,
 				region: self.remote_file_info.region,

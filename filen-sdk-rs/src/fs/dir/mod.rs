@@ -1,7 +1,10 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_types::{crypto::EncryptedString, fs::ObjectType};
+use filen_types::{
+	crypto::EncryptedString,
+	fs::{ObjectType, ParentUuid},
+};
 use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, SetDirMeta};
 use uuid::Uuid;
 
@@ -16,7 +19,7 @@ pub mod traits;
 
 pub use enums::*;
 pub use meta::DirectoryMeta;
-pub use traits::HasContents;
+pub use traits::{HasContents, HasUUIDContents};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootDirectory {
@@ -34,7 +37,11 @@ impl HasUUID for RootDirectory {
 		self.uuid
 	}
 }
-impl HasContents for RootDirectory {}
+impl HasContents for RootDirectory {
+	fn uuid_as_parent(&self) -> ParentUuid {
+		self.uuid.into()
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RootDirectoryWithMeta {
@@ -61,7 +68,11 @@ impl HasUUID for RootDirectoryWithMeta {
 		self.uuid
 	}
 }
-impl HasContents for RootDirectoryWithMeta {}
+impl HasContents for RootDirectoryWithMeta {
+	fn uuid_as_parent(&self) -> ParentUuid {
+		self.uuid.into()
+	}
+}
 
 impl HasType for RootDirectoryWithMeta {
 	fn object_type(&self) -> ObjectType {
@@ -120,7 +131,7 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 pub struct RemoteDirectory {
 	pub uuid: Uuid,
 	pub name: String,
-	pub parent: Uuid,
+	pub parent: ParentUuid,
 
 	pub color: Option<String>, // todo use Color struct
 	pub created: Option<DateTime<Utc>>,
@@ -130,7 +141,7 @@ pub struct RemoteDirectory {
 impl RemoteDirectory {
 	pub fn from_encrypted(
 		uuid: Uuid,
-		parent: Uuid,
+		parent: ParentUuid,
 		color: Option<String>,
 		favorited: bool,
 		meta: &EncryptedString,
@@ -149,7 +160,7 @@ impl RemoteDirectory {
 
 	pub fn from_meta(
 		uuid: Uuid,
-		parent: Uuid,
+		parent: ParentUuid,
 		color: Option<String>,
 		favorited: bool,
 		meta: DirectoryMeta<'_>,
@@ -164,7 +175,7 @@ impl RemoteDirectory {
 		}
 	}
 
-	pub fn new(name: String, parent: Uuid, created: DateTime<Utc>) -> Result<Self, Error> {
+	pub fn new(name: String, parent: ParentUuid, created: DateTime<Utc>) -> Result<Self, Error> {
 		if name.is_empty() {
 			return Err(Error::InvalidName(name));
 		}
@@ -182,7 +193,7 @@ impl RemoteDirectory {
 		self.uuid = uuid;
 	}
 
-	pub(crate) fn set_parent(&mut self, parent: Uuid) {
+	pub(crate) fn set_parent(&mut self, parent: ParentUuid) {
 		self.parent = parent;
 	}
 
@@ -196,7 +207,11 @@ impl HasUUID for RemoteDirectory {
 		self.uuid
 	}
 }
-impl HasContents for RemoteDirectory {}
+impl HasContents for RemoteDirectory {
+	fn uuid_as_parent(&self) -> ParentUuid {
+		self.uuid.into()
+	}
+}
 
 impl HasType for RemoteDirectory {
 	fn object_type(&self) -> ObjectType {
@@ -240,7 +255,7 @@ impl HasMeta for RemoteDirectory {
 }
 
 impl HasParent for RemoteDirectory {
-	fn parent(&self) -> Uuid {
+	fn parent(&self) -> ParentUuid {
 		self.parent
 	}
 }

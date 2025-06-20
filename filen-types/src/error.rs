@@ -6,6 +6,8 @@ pub enum ConversionError {
 	Base64DecodeError(#[from] base64::DecodeError),
 	#[error("Failed to convert EncodedPublicKey to RsaPublicKey: `{0}`")]
 	RsaPublicKeyError(#[from] rsa::pkcs8::spki::Error),
+	#[error("Failed to convert ParentUuid to Uuid: `{0}`")]
+	ParentUuidError(String),
 }
 
 #[derive(Debug, Error)]

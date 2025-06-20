@@ -9,7 +9,8 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::Error,
 	fs::{
-		HasMetaExt, HasName, HasParent, HasUUID,
+		HasMetaExt, HasName, HasUUID,
+		dir::HasUUIDContents,
 		enums::FSObject,
 		file::{RemoteFile, meta::FileMeta},
 	},
@@ -21,16 +22,16 @@ use super::{DirectoryMeta, DirectoryType, HasContents, RemoteDirectory, traits::
 impl Client {
 	pub async fn create_dir(
 		&self,
-		parent: &dyn HasContents,
+		parent: &dyn HasUUIDContents,
 		name: String,
 	) -> Result<RemoteDirectory, Error> {
-		let mut dir = RemoteDirectory::new(name, parent.uuid(), chrono::Utc::now())?;
+		let mut dir = RemoteDirectory::new(name, parent.uuid_as_parent(), chrono::Utc::now())?;
 
 		let response = api::v3::dir::create::post(
 			self.client(),
 			&api::v3::dir::create::Request {
 				uuid: dir.uuid(),
-				parent: dir.parent(),
+				parent: parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(dir.name())),
 				meta: Cow::Borrowed(&dir.get_encrypted_meta(self.crypter())?),
 			},
@@ -62,7 +63,7 @@ impl Client {
 
 	pub async fn dir_exists(
 		&self,
-		parent: &dyn HasContents,
+		parent: &dyn HasUUIDContents,
 		name: &str,
 	) -> Result<Option<uuid::Uuid>, Error> {
 		api::v3::dir::exists::post(
@@ -82,7 +83,9 @@ impl Client {
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::content::post(
 			self.client(),
-			&api::v3::dir::content::Request { uuid: dir.uuid() },
+			&api::v3::dir::content::Request {
+				uuid: dir.uuid_as_parent(),
+			},
 		)
 		.await?;
 
@@ -128,7 +131,7 @@ impl Client {
 		let response = api::v3::dir::download::post(
 			self.client(),
 			&api::v3::dir::download::Request {
-				uuid: dir.uuid(),
+				uuid: dir.uuid_as_parent(),
 				skip_cache: false,
 			},
 		)
@@ -261,7 +264,7 @@ impl Client {
 	pub async fn move_dir(
 		&self,
 		dir: &mut RemoteDirectory,
-		new_parent: &dyn HasContents,
+		new_parent: &dyn HasUUIDContents,
 	) -> Result<(), Error> {
 		api::v3::dir::r#move::post(
 			self.client(),
@@ -271,13 +274,13 @@ impl Client {
 			},
 		)
 		.await?;
-		dir.set_parent(new_parent.uuid());
+		dir.set_parent(new_parent.uuid().into());
 		Ok(())
 	}
 
 	pub async fn get_dir_size(
 		&self,
-		dir: &dyn HasContents,
+		dir: &dyn HasUUIDContents,
 		trash: bool,
 	) -> Result<api::v3::dir::size::Response, Error> {
 		api::v3::dir::size::post(

@@ -661,6 +661,7 @@ dependencies = [
  "digest",
  "faster-hex",
  "rsa",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_repr",

@@ -1,6 +1,6 @@
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::ObjectType,
+	fs::{ObjectType, ParentUuid},
 };
 use rsa::RsaPublicKey;
 use uuid::Uuid;
@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::crypto::{error::ConversionError, shared::MetaCrypter};
 
 pub trait HasParent {
-	fn parent(&self) -> Uuid;
+	fn parent(&self) -> ParentUuid;
 }
 
 pub trait HasRemoteInfo {

@@ -21,7 +21,7 @@ pub struct Request {
 	pub uuid: Uuid,
 }
 
-use crate::crypto::EncryptedString;
+use crate::{crypto::EncryptedString, fs::ParentUuid};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -30,7 +30,7 @@ pub struct Response<'a> {
 	#[serde(rename = "nameEncrypted")]
 	pub metadata: Cow<'a, EncryptedString>,
 	pub name_hashed: Cow<'a, str>,
-	pub parent: Uuid,
+	pub parent: ParentUuid,
 	pub trash: bool,
 	pub favorited: bool,
 	pub color: Option<Cow<'a, str>>,

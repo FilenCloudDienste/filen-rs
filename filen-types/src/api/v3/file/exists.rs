@@ -4,13 +4,15 @@ use serde::{
 };
 use uuid::Uuid;
 
+use crate::fs::ParentUuid;
+
 pub const ENDPOINT: &str = "v3/file/exists";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub name_hashed: String,
-	pub parent: Uuid,
+	pub parent: ParentUuid,
 }
 
 #[derive(Debug, Clone)]

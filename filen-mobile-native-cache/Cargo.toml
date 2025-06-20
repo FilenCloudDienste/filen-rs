@@ -17,12 +17,12 @@ chrono = { version = "0.4.41", features = ["serde"] }
 filen-sdk-rs-macros = { version = "0.1.0", path = "../filen-sdk-rs-macros", features = ["tokio"] }
 env_logger = "0.11.8"
 rusqlite = { version = "0.36.0", features = ["bundled", "uuid"] }
+filen-types = { path = "../filen-types" , features = ["rusqlite"]}
 
 
 # Optional dependencies
 tokio = {version = "1.45.1", features = ["rt-multi-thread", "macros"]}
 log = "0.4.27"
-filen-types = { version = "0.1.0", path = "../filen-types" }
 tokio-util = { version = "0.7.15", features = ["compat"] }
 sha2 = "0.10.9"
 once_cell = "1.21.3"

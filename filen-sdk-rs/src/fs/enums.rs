@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use filen_types::fs::ObjectType;
+use filen_types::fs::{ObjectType, ParentUuid};
 use uuid::Uuid;
 
 use super::{
@@ -97,7 +97,7 @@ impl<'a, 'b> From<&'b NonRootFSObject<'a>> for NonRootFSObject<'b> {
 }
 
 impl HasParent for NonRootFSObject<'_> {
-	fn parent(&self) -> Uuid {
+	fn parent(&self) -> ParentUuid {
 		match self {
 			NonRootFSObject::Dir(dir) => dir.parent(),
 			NonRootFSObject::File(file) => file.parent(),

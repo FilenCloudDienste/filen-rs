@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	crypto::file::FileKey,
 	fs::{
 		FSObject, HasUUID,
-		dir::{HasContents, RemoteDirectory},
+		dir::{HasUUIDContents, RemoteDirectory},
 		file::FileBuilder,
 	},
 };
@@ -15,7 +15,7 @@ use filen_types::auth::{AuthVersion, FileEncryptionVersion};
 
 use rand::TryRngCore;
 
-fn get_compat_test_file(client: &Client, parent: &impl HasContents) -> (FileBuilder, String) {
+fn get_compat_test_file(client: &Client, parent: &impl HasUUIDContents) -> (FileBuilder, String) {
 	let file_key_str = match client.file_encryption_version() {
 		FileEncryptionVersion::V1 => "0123456789abcdefghijklmnopqrstuv",
 		FileEncryptionVersion::V2 => "0123456789abcdefghijklmnopqrstuv",
@@ -248,7 +248,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 			let compat_test_file = compat_test_file.uuid(file.uuid()).build();
 			assert_eq!(
 				*file.inner_file(),
-				compat_test_file,
+				compat_test_file.root,
 				"file inner_file mismatch"
 			);
 

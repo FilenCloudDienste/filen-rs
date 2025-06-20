@@ -25,7 +25,15 @@ impl HasUUID for DirectoryType<'_> {
 		}
 	}
 }
-impl HasContents for DirectoryType<'_> {}
+impl HasContents for DirectoryType<'_> {
+	fn uuid_as_parent(&self) -> filen_types::fs::ParentUuid {
+		match self {
+			DirectoryType::Root(dir) => dir.uuid_as_parent(),
+			DirectoryType::Dir(dir) => dir.uuid_as_parent(),
+			DirectoryType::RootWithMeta(dir) => dir.uuid_as_parent(),
+		}
+	}
+}
 
 impl HasType for DirectoryType<'_> {
 	fn object_type(&self) -> ObjectType {
@@ -72,7 +80,14 @@ impl HasUUID for UnsharedDirectoryType<'_> {
 		}
 	}
 }
-impl HasContents for UnsharedDirectoryType<'_> {}
+impl HasContents for UnsharedDirectoryType<'_> {
+	fn uuid_as_parent(&self) -> filen_types::fs::ParentUuid {
+		match self {
+			UnsharedDirectoryType::Root(dir) => dir.uuid_as_parent(),
+			UnsharedDirectoryType::Dir(dir) => dir.uuid_as_parent(),
+		}
+	}
+}
 
 impl HasType for UnsharedDirectoryType<'_> {
 	fn object_type(&self) -> ObjectType {
@@ -116,7 +131,14 @@ impl HasUUID for DirectoryMetaType<'_> {
 	}
 }
 
-impl HasContents for DirectoryMetaType<'_> {}
+impl HasContents for DirectoryMetaType<'_> {
+	fn uuid_as_parent(&self) -> filen_types::fs::ParentUuid {
+		match self {
+			DirectoryMetaType::Root(dir) => dir.uuid_as_parent(),
+			DirectoryMetaType::Dir(dir) => dir.uuid_as_parent(),
+		}
+	}
+}
 
 impl HasType for DirectoryMetaType<'_> {
 	fn object_type(&self) -> ObjectType {

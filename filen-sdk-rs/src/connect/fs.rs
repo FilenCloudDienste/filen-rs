@@ -48,7 +48,7 @@ impl SharedDirectory {
 		let dir = match dir_info.parent {
 			Some(parent) => DirectoryMetaType::Dir(Cow::Owned(RemoteDirectory::from_meta(
 				dir_info.uuid,
-				parent,
+				parent.into(),
 				dir_info.color,
 				false,
 				dir_info.metadata,

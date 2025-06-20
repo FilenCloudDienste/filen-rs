@@ -2,15 +2,16 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString};
+use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::ParentUuid};
 
 pub const ENDPOINT: &str = "v3/dir/content";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: uuid::Uuid,
+	pub uuid: ParentUuid,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -25,7 +26,7 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
-	pub uuid: uuid::Uuid,
+	pub uuid: Uuid,
 	pub metadata: Cow<'a, EncryptedString>,
 	pub rm: Cow<'a, str>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
@@ -34,7 +35,7 @@ pub struct File<'a> {
 	pub size: u64,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
-	pub parent: uuid::Uuid,
+	pub parent: ParentUuid,
 	pub version: FileEncryptionVersion,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub favorited: bool,
@@ -43,10 +44,10 @@ pub struct File<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Directory<'a> {
-	pub uuid: uuid::Uuid,
+	pub uuid: Uuid,
 	#[serde(rename = "name")]
 	pub meta: Cow<'a, EncryptedString>,
-	pub parent: uuid::Uuid,
+	pub parent: ParentUuid,
 	pub color: Option<Cow<'a, str>>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,

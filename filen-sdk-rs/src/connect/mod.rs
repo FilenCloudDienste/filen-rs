@@ -28,7 +28,7 @@ use crate::{
 	error::Error,
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
-		dir::{HasContents, RemoteDirectory},
+		dir::{HasUUIDContents, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
 };
@@ -347,7 +347,7 @@ impl Client {
 		item: impl Into<NonRootFSObject<'_>>,
 	) -> Result<(), Error> {
 		let item = item.into();
-		let uuid = item.parent();
+		let uuid = item.parent().try_into()?;
 
 		let (linked, shared, items_to_process) = futures::try_join!(
 			async {
@@ -422,7 +422,7 @@ impl Client {
 			self.client(),
 			&api::v3::dir::link::add::Request {
 				uuid: item.uuid(),
-				parent: Some(item.parent()),
+				parent: Some(item.parent().try_into()?),
 				link_uuid: link.link_uuid,
 				r#type: item.object_type(),
 				metadata: Cow::Borrowed(&item.get_encrypted_meta(link_crypter)?),
@@ -674,7 +674,7 @@ impl Client {
 
 	pub async fn list_linked_dir(
 		&self,
-		dir: &dyn HasContents,
+		dir: &dyn HasUUIDContents,
 		link: &DirPublicLink,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::link::content::post(
@@ -693,7 +693,7 @@ impl Client {
 			.map(|d| {
 				RemoteDirectory::from_encrypted(
 					d.uuid,
-					d.parent,
+					d.parent.into(),
 					d.color.map(|c| c.into_owned()),
 					false,
 					&d.metadata,
@@ -708,7 +708,14 @@ impl Client {
 			.map(|f| {
 				let meta = FileMeta::from_encrypted(&f.metadata, link.crypter(), f.version)?;
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-					f.uuid, f.parent, f.size, f.chunks, f.region, f.bucket, false, meta,
+					f.uuid,
+					f.parent.into(),
+					f.size,
+					f.chunks,
+					f.region,
+					f.bucket,
+					false,
+					meta,
 				))
 			})
 			.collect::<Result<Vec<_>, Error>>()?;
@@ -734,7 +741,7 @@ impl Client {
 			self.client(),
 			&api::v3::item::share::Request {
 				uuid: item.uuid(),
-				parent: Some(item.parent()),
+				parent: Some(item.parent().try_into()?),
 				email: Cow::Borrowed(user.email()),
 				r#type: item.object_type(),
 				metadata: Cow::Owned(
@@ -829,7 +836,7 @@ impl Client {
 
 	async fn inner_list_out_shared(
 		&self,
-		dir: Option<&impl HasContents>,
+		dir: Option<&impl HasUUIDContents>,
 		user: Option<&User>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		let response = api::v3::shared::out::post(
@@ -865,7 +872,7 @@ impl Client {
 
 	pub async fn list_out_shared_dir(
 		&self,
-		dir: &impl HasContents,
+		dir: &impl HasUUIDContents,
 		user: &User,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		self.inner_list_out_shared(Some(dir), Some(user)).await
@@ -873,7 +880,7 @@ impl Client {
 
 	async fn inner_list_in_shared(
 		&self,
-		dir: Option<&impl HasContents>,
+		dir: Option<&impl HasUUIDContents>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		let response = api::v3::shared::r#in::post(
 			self.client(),
@@ -902,7 +909,7 @@ impl Client {
 
 	pub async fn list_in_shared_dir(
 		&self,
-		dir: &impl HasContents,
+		dir: &impl HasUUIDContents,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		self.inner_list_in_shared(Some(dir)).await
 	}

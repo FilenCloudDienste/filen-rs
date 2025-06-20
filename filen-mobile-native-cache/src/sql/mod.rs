@@ -1,3 +1,4 @@
+use filen_types::fs::ParentUuid;
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
@@ -97,7 +98,7 @@ pub(crate) fn move_item(
 	conn: &mut Connection,
 	item_uuid: Uuid,
 	item_name: &str,
-	new_parent_uuid: Uuid,
+	new_parent_uuid: ParentUuid,
 ) -> Result<(), rusqlite::Error> {
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{
@@ -118,7 +119,7 @@ pub(crate) fn rename_item(
 	conn: &mut Connection,
 	id: i64,
 	new_name: &str,
-	parent: Uuid,
+	parent: ParentUuid,
 ) -> Result<(), rusqlite::Error> {
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{

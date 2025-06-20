@@ -12,6 +12,8 @@ use filen_sdk_rs::{
 		},
 	},
 };
+use filen_types::fs::ParentUuid;
+use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use log::trace;
 use rusqlite::{
 	CachedStatement, Connection, OptionalExtension, Result, ToSql,
@@ -63,14 +65,14 @@ impl ToSql for ItemType {
 pub struct RawDBItem {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
-	pub(crate) parent: Option<Uuid>, // parent can be None for root items
+	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) name: String,
 	pub(crate) type_: ItemType,
 }
 
 fn upsert_item_with_stmts(
 	uuid: Uuid,
-	parent: Option<Uuid>,
+	parent: Option<ParentUuid>,
 	name: &str,
 	type_: ItemType,
 	upsert_item_conflict_uuid: &mut CachedStatement<'_>,
@@ -88,7 +90,7 @@ fn upsert_item_with_stmts(
 		Err(rusqlite::Error::SqliteFailure(
 			libsqlite3_sys::Error {
 				code: libsqlite3_sys::ErrorCode::ConstraintViolation,
-				..
+				extended_code: SQLITE_CONSTRAINT_UNIQUE,
 			},
 			_,
 		)) => {
@@ -107,7 +109,7 @@ fn upsert_item_with_stmts(
 fn upsert_item(
 	conn: &Connection,
 	uuid: Uuid,
-	parent: Option<Uuid>,
+	parent: Option<ParentUuid>,
 	name: &str,
 	type_: ItemType,
 ) -> Result<i64> {
@@ -153,7 +155,7 @@ impl RawDBItem {
 pub struct InnerDBItem {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
-	pub(crate) parent: Option<Uuid>, // parent can be None for root items
+	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) name: String,
 }
 
@@ -183,7 +185,7 @@ impl From<RawDBItem> for InnerDBItem {
 pub struct DBFile {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
-	pub(crate) parent: Uuid,
+	pub(crate) parent: ParentUuid,
 	pub(crate) name: String,
 	pub(crate) mime: String,
 	pub(crate) file_key: String,
@@ -309,8 +311,8 @@ impl DBFile {
 			chunks: remote_file.chunks() as i64,
 			favorited: remote_file.favorited(),
 			hash: remote_file.hash().map(|h| h.into()),
-			name: remote_file.file.root.name,
-			mime: remote_file.file.root.mime,
+			name: remote_file.file.name,
+			mime: remote_file.file.mime,
 			region: remote_file.region,
 			bucket: remote_file.bucket,
 			version: version as u8,
@@ -378,8 +380,8 @@ impl DBFile {
 		self.parent = file.parent();
 		self.favorited = file.favorited();
 		self.file_key = file_key.to_string();
-		self.name = file.file.root.name;
-		self.mime = file.file.root.mime;
+		self.name = file.file.name;
+		self.mime = file.file.mime;
 		self.created = created;
 		self.modified = modified;
 		self.size = size;
@@ -400,7 +402,7 @@ impl DBItemTrait for DBFile {
 		self.uuid
 	}
 
-	fn parent(&self) -> Option<Uuid> {
+	fn parent(&self) -> Option<ParentUuid> {
 		Some(self.parent)
 	}
 
@@ -450,8 +452,8 @@ impl From<RemoteFile> for DBFile {
 			favorited: value.favorited(),
 			hash: value.hash().map(Into::<[u8; 64]>::into),
 			version: value.key().version() as u8,
-			mime: value.file.root.mime,
-			name: value.file.root.name,
+			mime: value.file.mime,
+			name: value.file.name,
 			bucket: value.bucket,
 			region: value.region,
 		}
@@ -480,7 +482,7 @@ impl PartialEq<RemoteFile> for DBFile {
 pub struct DBDir {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
-	pub(crate) parent: Uuid,
+	pub(crate) parent: ParentUuid,
 	pub(crate) name: String,
 	pub(crate) created: Option<i64>,
 	pub(crate) favorited: bool,
@@ -617,7 +619,7 @@ impl DBItemTrait for DBDir {
 		self.uuid
 	}
 
-	fn parent(&self) -> Option<Uuid> {
+	fn parent(&self) -> Option<ParentUuid> {
 		Some(self.parent)
 	}
 
@@ -780,7 +782,7 @@ impl DBItemTrait for DBRoot {
 		self.uuid
 	}
 
-	fn parent(&self) -> Option<Uuid> {
+	fn parent(&self) -> Option<ParentUuid> {
 		None
 	}
 
@@ -987,7 +989,7 @@ impl DBItemTrait for DBNonRootObject {
 		}
 	}
 
-	fn parent(&self) -> Option<Uuid> {
+	fn parent(&self) -> Option<ParentUuid> {
 		match self {
 			DBNonRootObject::Dir(dir) => Some(dir.parent),
 			DBNonRootObject::File(file) => Some(file.parent),
@@ -1132,7 +1134,7 @@ where
 pub(crate) trait DBItemTrait: Sync + Send {
 	fn id(&self) -> i64;
 	fn uuid(&self) -> Uuid;
-	fn parent(&self) -> Option<Uuid>;
+	fn parent(&self) -> Option<ParentUuid>;
 	fn name(&self) -> &str;
 	fn item_type(&self) -> ItemType;
 }

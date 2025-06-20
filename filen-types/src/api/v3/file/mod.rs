@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString};
+use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::ParentUuid};
 
 pub const ENDPOINT: &str = "v3/file";
 
@@ -36,7 +36,7 @@ pub struct Response<'a> {
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 	pub size: u64,
-	pub parent: Uuid,
+	pub parent: ParentUuid,
 	pub versioned: bool,
 	pub trash: bool,
 	pub version: FileEncryptionVersion,

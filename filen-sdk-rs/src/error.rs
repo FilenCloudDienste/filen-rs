@@ -28,6 +28,12 @@ pub enum Error {
 	InvalidName(String),
 }
 
+impl From<filen_types::error::ConversionError> for Error {
+	fn from(e: filen_types::error::ConversionError) -> Self {
+		Error::ConversionError(e.into())
+	}
+}
+
 pub trait ErrorExt<T, E> {
 	fn context(self, context: &'static str) -> Result<T, Error>;
 }

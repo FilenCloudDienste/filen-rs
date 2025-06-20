@@ -297,7 +297,9 @@ impl FilenMobileCacheState {
 				self.io_upload_updated_file(
 					&file.uuid.to_string(),
 					path_values.name,
-					file.parent,
+					file.parent.try_into().map_err(|e| {
+						CacheError::conversion(format!("Failed to convert parent UUID: {}", e))
+					})?,
 					file.mime,
 					Some(progress_callback),
 				)
@@ -477,7 +479,7 @@ impl FilenMobileCacheState {
 					}
 					Some(Ok(obj)) => obj,
 				};
-				if Some(parent.uuid()) != obj.parent() {
+				if !obj.parent().is_some_and(|u| u == parent.uuid()) {
 					return Err(CacheError::remote(format!(
 						"Path {} does not point to the parent of obj {} got {:?} (should be {})",
 						parent_pvs.full_path,

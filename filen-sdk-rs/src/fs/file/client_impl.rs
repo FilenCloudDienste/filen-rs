@@ -9,7 +9,7 @@ use crate::{
 	consts::CHUNK_SIZE_U64,
 	crypto::shared::MetaCrypter,
 	error::Error,
-	fs::{HasUUID, dir::HasContents},
+	fs::{HasUUID, dir::HasUUIDContents},
 };
 
 use super::{
@@ -48,7 +48,7 @@ impl Client {
 	pub async fn move_file(
 		&self,
 		file: &mut RemoteFile,
-		new_parent: &impl HasContents,
+		new_parent: &impl HasUUIDContents,
 	) -> Result<(), Error> {
 		api::v3::file::r#move::post(
 			self.client(),
@@ -58,7 +58,7 @@ impl Client {
 			},
 		)
 		.await?;
-		file.file.parent = new_parent.uuid();
+		file.parent = new_parent.uuid().into();
 		Ok(())
 	}
 
@@ -106,13 +106,13 @@ impl Client {
 	pub async fn file_exists(
 		&self,
 		name: impl AsRef<str>,
-		parent: &impl HasContents,
+		parent: &impl HasUUIDContents,
 	) -> Result<Option<Uuid>, Error> {
 		api::v3::file::exists::post(
 			self.client(),
 			&api::v3::file::exists::Request {
 				name_hashed: self.hash_name(name.as_ref()),
-				parent: parent.uuid(),
+				parent: parent.uuid().into(),
 			},
 		)
 		.await
@@ -126,7 +126,7 @@ impl Client {
 	pub fn make_file_builder(
 		&self,
 		name: impl Into<String>,
-		parent: &impl HasContents,
+		parent: &impl HasUUIDContents,
 	) -> FileBuilder {
 		FileBuilder::new(name, parent, self)
 	}
