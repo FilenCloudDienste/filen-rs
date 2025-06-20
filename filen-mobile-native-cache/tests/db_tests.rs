@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use filen_mobile_native_cache::{
-	CacheClient, FilenMobileDB,
+	FilenMobileCacheState,
 	ffi::{FfiNonRootObject, FfiObject, FfiPathWithRoot},
-	io,
 	traits::ProgressCallback,
 };
 use filen_sdk_rs::fs::{HasName, HasUUID};
@@ -35,33 +34,30 @@ impl ProgressCallback for SumProgressCallback {
 	}
 }
 
-async fn get_db_resources() -> (FilenMobileDB, CacheClient, TestResources) {
+async fn get_db_resources() -> (FilenMobileCacheState, TestResources) {
 	let path = std::env::temp_dir();
 	let files_path = path.join("test_files");
 	std::fs::create_dir_all(&files_path).unwrap();
-	let db = FilenMobileDB::initialize_in_memory().unwrap();
-
-	db.set_files_dir(files_path.to_string_lossy().to_string())
-		.unwrap();
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.to_stringified();
-	db.add_root(&client.root_uuid).unwrap();
-	let client = CacheClient::from_strings(
+	let state = FilenMobileCacheState::from_strings_in_memory(
 		client.email,
 		&client.root_uuid,
 		&client.auth_info,
 		&client.private_key,
 		client.api_key,
 		client.auth_version,
+		files_path.to_string_lossy().as_ref(),
 	)
 	.unwrap();
-	(db, client, resources)
+	state.add_root(&client.root_uuid).unwrap();
+	(state, resources)
 }
 
 // Root query tests
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_root_initial_state() {
-	let (db, _, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let res = db
 		.query_roots_info(rss.client.root().uuid().to_string())
@@ -77,10 +73,10 @@ pub async fn test_query_root_initial_state() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_root_after_update() {
-	let (db, client, rss) = get_db_resources().await;
+	let (state, rss) = get_db_resources().await;
 
-	db.update_roots_info(&client).await.unwrap();
-	let root = db
+	state.update_roots_info().await.unwrap();
+	let root = state
 		.query_roots_info(rss.client.root().uuid().to_string())
 		.unwrap()
 		.unwrap();
@@ -88,13 +84,13 @@ pub async fn test_query_root_after_update() {
 	assert_ne!(root.max_storage, 0);
 	assert_ne!(root.storage_used, 0);
 	assert_ne!(root.last_updated, 0);
-	assert_eq!(root.uuid, client.root_uuid().to_string());
+	assert_eq!(root.uuid, state.root_uuid().to_string());
 	assert_eq!(root.last_listed, 0);
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_root_nonexistent() {
-	let (db, _client, _rss) = get_db_resources().await;
+	let (db, _rss) = get_db_resources().await;
 
 	let fake_uuid = uuid::Uuid::new_v4().to_string();
 	let result = db.query_roots_info(fake_uuid).unwrap();
@@ -103,7 +99,7 @@ pub async fn test_query_root_nonexistent() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_root_invalid_uuid() {
-	let (db, _client, _rss) = get_db_resources().await;
+	let (db, _rss) = get_db_resources().await;
 
 	let result = db.query_roots_info("invalid-uuid".to_string());
 	assert!(result.is_err());
@@ -112,18 +108,15 @@ pub async fn test_query_root_invalid_uuid() {
 // Directory children query tests
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_children_empty_directory() {
-	let (db, client, rss) = get_db_resources().await;
-	let test_dir_path: FfiPathWithRoot =
-		format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let (db, rss) = get_db_resources().await;
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Before update - should return None
 	let resp = db.query_dir_children(&test_dir_path, None).unwrap();
 	assert!(resp.is_none());
 
 	// After update - should return empty but valid response
-	db.update_dir_children(&client, test_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
 	let resp = db
 		.query_dir_children(&test_dir_path, None)
@@ -135,9 +128,8 @@ pub async fn test_query_children_empty_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_children_with_files_and_dirs() {
-	let (db, client, rss) = get_db_resources().await;
-	let test_dir_path: FfiPathWithRoot =
-		format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let (db, rss) = get_db_resources().await;
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Create test content
 	let dir = rss
@@ -157,9 +149,7 @@ pub async fn test_query_children_with_files_and_dirs() {
 		.unwrap();
 
 	// Update and verify
-	db.update_dir_children(&client, test_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 	let resp = db
 		.query_dir_children(&test_dir_path, None)
 		.unwrap()
@@ -183,9 +173,8 @@ pub async fn test_query_children_with_files_and_dirs() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_children_sorting_by_size() {
-	let (db, client, rss) = get_db_resources().await;
-	let test_dir_path: FfiPathWithRoot =
-		format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let (db, rss) = get_db_resources().await;
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Create files with different sizes
 	let large_file = rss.client.make_file_builder("large.txt", &rss.dir).build();
@@ -211,9 +200,7 @@ pub async fn test_query_children_sorting_by_size() {
 		.await
 		.unwrap();
 
-	db.update_dir_children(&client, test_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
 	// Test ascending size sort
 	let resp = db
@@ -247,9 +234,8 @@ pub async fn test_query_children_sorting_by_size() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_children_sorting_by_name() {
-	let (db, client, rss) = get_db_resources().await;
-	let test_dir_path: FfiPathWithRoot =
-		format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let (db, rss) = get_db_resources().await;
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Create items with specific names for alphabetical testing
 	rss.client
@@ -266,9 +252,7 @@ pub async fn test_query_children_sorting_by_name() {
 	let beta_file = rss.client.make_file_builder("beta.txt", &rss.dir).build();
 	rss.client.upload_file(beta_file.into(), b"").await.unwrap();
 
-	db.update_dir_children(&client, test_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
 	let resp = db
 		.query_dir_children(&test_dir_path, Some("display_name ASC".to_string()))
@@ -293,9 +277,8 @@ pub async fn test_query_children_sorting_by_name() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_children_after_deletion() {
-	let (db, client, rss) = get_db_resources().await;
-	let test_dir_path: FfiPathWithRoot =
-		format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let (db, rss) = get_db_resources().await;
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Create and then delete a directory
 	let dir = rss
@@ -311,9 +294,7 @@ pub async fn test_query_children_after_deletion() {
 	let file = rss.client.upload_file(file.into(), b"").await.unwrap();
 
 	// Update to get both items
-	db.update_dir_children(&client, test_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 	let resp = db
 		.query_dir_children(&test_dir_path, None)
 		.unwrap()
@@ -322,9 +303,7 @@ pub async fn test_query_children_after_deletion() {
 
 	// Delete the directory
 	rss.client.trash_dir(&dir).await.unwrap();
-	db.update_dir_children(&client, test_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
 	// Should now only have the file
 	let resp = db
@@ -340,9 +319,8 @@ pub async fn test_query_children_after_deletion() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_children_nonexistent_path() {
-	let (db, client, _rss) = get_db_resources().await;
-	let nonexistent_path: FfiPathWithRoot =
-		format!("{}/nonexistent_dir", client.root_uuid()).into();
+	let (db, _rss) = get_db_resources().await;
+	let nonexistent_path: FfiPathWithRoot = format!("{}/nonexistent_dir", db.root_uuid()).into();
 
 	let result = db.query_dir_children(&nonexistent_path, None).unwrap();
 	assert!(result.is_none());
@@ -351,7 +329,7 @@ pub async fn test_query_children_nonexistent_path() {
 // Item query tests
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_item_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let file = rss
 		.client
@@ -364,14 +342,14 @@ pub async fn test_query_item_file() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
-	let dir_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
+	let dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Before update - should return None
 	assert_eq!(db.query_item(&file_path).unwrap(), None);
 
 	// After update - should return the file
-	db.update_dir_children(&client, dir_path).await.unwrap();
+	db.update_dir_children(dir_path).await.unwrap();
 	let result = db.query_item(&file_path).unwrap();
 
 	match result {
@@ -385,7 +363,7 @@ pub async fn test_query_item_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_item_directory() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let dir = rss
 		.client
@@ -394,17 +372,14 @@ pub async fn test_query_item_directory() {
 		.unwrap();
 
 	let child_dir_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), dir.name()).into();
-	let parent_dir_path: FfiPathWithRoot =
-		format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), dir.name()).into();
+	let parent_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Before update - should return None
 	assert_eq!(db.query_item(&child_dir_path).unwrap(), None);
 
 	// After update - should return the directory
-	db.update_dir_children(&client, parent_dir_path)
-		.await
-		.unwrap();
+	db.update_dir_children(parent_dir_path).await.unwrap();
 	let result = db.query_item(&child_dir_path).unwrap();
 
 	match result {
@@ -418,7 +393,7 @@ pub async fn test_query_item_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_item_root() {
-	let (db, _, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let root_path: FfiPathWithRoot = rss.client.root().uuid().to_string().into();
 	let result = db.query_item(&root_path).unwrap();
@@ -437,10 +412,10 @@ pub async fn test_query_item_root() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_item_nonexistent() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let nonexistent_file_path: FfiPathWithRoot =
-		format!("{}/{}/nonexistent.txt", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/nonexistent.txt", db.root_uuid(), rss.dir.name()).into();
 
 	let result = db.query_item(&nonexistent_file_path).unwrap();
 	assert!(result.is_none());
@@ -448,7 +423,7 @@ pub async fn test_query_item_nonexistent() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_item_invalid_path() {
-	let (db, _client, _rss) = get_db_resources().await;
+	let (db, _rss) = get_db_resources().await;
 
 	let invalid_path: FfiPathWithRoot = "not-a-uuid/invalid/path".into();
 	let result = db.query_item(&invalid_path);
@@ -457,7 +432,7 @@ pub async fn test_query_item_invalid_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_query_item_deeply_nested() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create nested structure: rss.dir/level1/level2/deep_file.txt
 	let level1 = rss
@@ -483,18 +458,18 @@ pub async fn test_query_item_deeply_nested() {
 		.unwrap();
 
 	// Update each level
-	let dir_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let level1_path: FfiPathWithRoot = format!("{}/level1", dir_path.0).into();
 	let level2_path: FfiPathWithRoot = format!("{}/level2", level1_path.0).into();
 
-	db.update_dir_children(&client, dir_path).await.unwrap();
-	db.update_dir_children(&client, level1_path).await.unwrap();
-	db.update_dir_children(&client, level2_path).await.unwrap();
+	db.update_dir_children(dir_path).await.unwrap();
+	db.update_dir_children(level1_path).await.unwrap();
+	db.update_dir_children(level2_path).await.unwrap();
 
 	// Query the deep file
 	let deep_file_path: FfiPathWithRoot = format!(
 		"{}/{}/level1/level2/{}",
-		client.root_uuid(),
+		db.root_uuid(),
 		rss.dir.name(),
 		deep_file.name()
 	)
@@ -511,7 +486,7 @@ pub async fn test_query_item_deeply_nested() {
 
 	// Also test querying intermediate directories
 	let level1_query_path: FfiPathWithRoot =
-		format!("{}/{}/level1", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/level1", db.root_uuid(), rss.dir.name()).into();
 
 	let result = db.query_item(&level1_query_path).unwrap();
 	match result {
@@ -524,7 +499,7 @@ pub async fn test_query_item_deeply_nested() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_download_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file with some content inside rss.dir
 	let test_content = b"Hello, world! This is test content for download.";
@@ -540,7 +515,7 @@ pub async fn test_download_file() {
 
 	let file_path: FfiPathWithRoot = format!(
 		"{}/{}/{}",
-		client.root_uuid(),
+		db.root_uuid(),
 		rss.dir.name(),
 		remote_file.name()
 	)
@@ -548,7 +523,7 @@ pub async fn test_download_file() {
 
 	// Test downloading the file
 	let downloaded_path = db
-		.download_file_if_changed(&client, file_path.clone(), Arc::new(NoOpProgressCallback))
+		.download_file_if_changed(file_path.clone(), Arc::new(NoOpProgressCallback))
 		.await
 		.unwrap();
 
@@ -563,25 +538,21 @@ pub async fn test_download_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_download_file_nonexistent() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
-	let nonexistent_path: FfiPathWithRoot = format!(
-		"{}/{}/nonexistent_file.txt",
-		client.root_uuid(),
-		rss.dir.name()
-	)
-	.into();
+	let nonexistent_path: FfiPathWithRoot =
+		format!("{}/{}/nonexistent_file.txt", db.root_uuid(), rss.dir.name()).into();
 
 	// Should fail when trying to download a non-existent file
 	let result = db
-		.download_file_if_changed(&client, nonexistent_path, Arc::new(NoOpProgressCallback))
+		.download_file_if_changed(nonexistent_path, Arc::new(NoOpProgressCallback))
 		.await;
 	assert!(result.is_err());
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_download_file_invalid_path() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a directory first
 	let dir = rss
@@ -590,183 +561,30 @@ pub async fn test_download_file_invalid_path() {
 		.await
 		.unwrap();
 	let dir_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), dir.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), dir.name()).into();
 
 	// Should fail when trying to download a directory path as a file
 	let result = db
-		.download_file_if_changed(&client, dir_path, Arc::new(NoOpProgressCallback))
+		.download_file_if_changed(dir_path, Arc::new(NoOpProgressCallback))
 		.await;
 	assert!(result.is_err());
-}
-
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
-pub async fn test_upload_file_if_changed_new_file() {
-	let (db, client, rss) = get_db_resources().await;
-
-	// Create a temporary local file - the path parameter represents where the file should go in the cloud
-	// but the actual file should exist locally at the filename part of that path
-	let test_content = b"This is test content for upload.";
-	let upload_path: FfiPathWithRoot =
-		format!("{}/{}/test_upload.txt", client.root_uuid(), rss.dir.name()).into();
-	let io_path = io::get_file_path(&db.files(), &upload_path.as_path_values().unwrap())
-		.await
-		.unwrap();
-	std::fs::write(&io_path, test_content).unwrap();
-
-	let upload_path: FfiPathWithRoot =
-		format!("{}/{}/test_upload.txt", client.root_uuid(), rss.dir.name()).into();
-
-	// Upload the file (should return true for new file)
-	let was_uploaded = db
-		.upload_file_if_changed(&client, upload_path.clone(), Arc::new(NoOpProgressCallback))
-		.await
-		.unwrap();
-	assert!(was_uploaded);
-
-	// Verify the file exists in the database by checking the parent directory
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
-	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
-
-	let uploaded_file = children
-		.objects
-		.iter()
-		.find(|obj| matches!(obj, FfiNonRootObject::File(f) if f.name == "test_upload.txt"));
-	assert!(uploaded_file.is_some());
-
-	// Clean up
-	std::fs::remove_file(&io_path).ok();
-}
-
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
-pub async fn test_upload_file_if_changed_unchanged_file() {
-	let (db, client, rss) = get_db_resources().await;
-
-	// Create and upload a file first
-	let test_content = b"Unchanged content for hash test.";
-	let file = rss
-		.client
-		.make_file_builder("hash_test.txt", &rss.dir)
-		.build();
-	let remote_file = rss
-		.client
-		.upload_file(file.into(), test_content)
-		.await
-		.unwrap();
-
-	// Update the database with this file info
-	let dir_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, dir_path).await.unwrap();
-
-	let upload_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		remote_file.name()
-	)
-	.into();
-	let io_path = io::get_file_path(&db.files(), &upload_path.as_path_values().unwrap())
-		.await
-		.unwrap();
-
-	std::fs::write(&io_path, test_content).unwrap();
-
-	// Upload should return false (unchanged)
-	let was_uploaded = db
-		.upload_file_if_changed(&client, upload_path, Arc::new(NoOpProgressCallback))
-		.await
-		.unwrap();
-	assert!(!was_uploaded);
-
-	// Clean up
-	std::fs::remove_file(&io_path).ok();
-}
-
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
-pub async fn test_upload_file_if_changed_modified_file() {
-	let (db, client, rss) = get_db_resources().await;
-
-	// Create and upload a file first using the SDK directly
-	let original_content = b"Original content.";
-	let file = rss
-		.client
-		.make_file_builder("modify_test.txt", &rss.dir)
-		.build();
-	rss.client
-		.upload_file(file.into(), original_content)
-		.await
-		.unwrap();
-
-	// Update the database with this file info
-	let dir_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, dir_path).await.unwrap();
-
-	// Create a local file with different content
-	let modified_content = b"Modified content - completely different!";
-	let upload_path: FfiPathWithRoot =
-		format!("{}/{}/modify_test.txt", client.root_uuid(), rss.dir.name()).into();
-	let io_path = io::get_file_path(&db.files(), &upload_path.as_path_values().unwrap())
-		.await
-		.unwrap();
-	std::fs::write(&io_path, modified_content).unwrap();
-
-	// Upload should return true (changed)
-	let was_uploaded = db
-		.upload_file_if_changed(&client, upload_path, Arc::new(NoOpProgressCallback))
-		.await
-		.unwrap();
-	assert!(was_uploaded);
-
-	// Clean up
-	std::fs::remove_file(&io_path).ok();
-}
-
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
-pub async fn test_upload_file_if_changed_invalid_parent() {
-	let (db, client, rss) = get_db_resources().await;
-
-	let invalid_path: FfiPathWithRoot = format!(
-		"{}/{}/nonexistent_subdir/invalid_parent.txt",
-		client.root_uuid(),
-		rss.dir.name()
-	)
-	.into();
-
-	let io_path = io::get_file_path(&db.files(), &invalid_path.as_path_values().unwrap())
-		.await
-		.unwrap();
-
-	// Create a temporary local file
-	std::fs::write(&io_path, b"test").unwrap();
-
-	// Should fail with invalid parent path
-	let result = db
-		.upload_file_if_changed(&client, invalid_path, Arc::new(NoOpProgressCallback))
-		.await;
-	assert!(result.is_err());
-
-	// Clean up
-	std::fs::remove_file(&io_path).ok();
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_progress_callback() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 	let mut contents = vec![0u8; 10 * 1024 * 1024];
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name(),).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name(),).into();
 	let name = "test_progress.txt".to_string();
-	let file_path = db
-		.create_empty_file(&client, parent_path, name.clone(), "".into())
+	let create_resp = db
+		.create_empty_file(parent_path, name.clone(), "".into())
 		.await
 		.unwrap();
-	let files_path = db.files().join(filen_mobile_native_cache::io::FILES_DIR);
-	std::fs::write(files_path.join(&file_path.0), &contents).unwrap();
+	std::fs::write(create_resp.path, &contents).unwrap();
 
 	let upload_progress_callback = Arc::new(SumProgressCallback::default());
-	db.upload_file_if_changed(&client, file_path.clone(), upload_progress_callback.clone())
+	db.upload_file_if_changed(create_resp.id.clone(), upload_progress_callback.clone())
 		.await
 		.unwrap();
 	let count = upload_progress_callback
@@ -778,12 +596,12 @@ pub async fn test_progress_callback() {
 	assert_eq!(count, max);
 	assert_eq!(max, contents.len() as u64);
 
-	db.clear_local_cache(file_path.clone()).await.unwrap();
+	db.clear_local_cache(create_resp.id.clone()).await.unwrap();
 
 	let progress_callback = Arc::new(SumProgressCallback::default());
 
 	let downloaded_path = db
-		.download_file_if_changed(&client, file_path.clone(), progress_callback.clone())
+		.download_file_if_changed(create_resp.id.clone(), progress_callback.clone())
 		.await
 		.unwrap();
 
@@ -804,25 +622,20 @@ pub async fn test_progress_callback() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_create_empty_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let file_name = "empty_test.txt".to_string();
 	let mime_type = "text/plain".to_string();
 
 	// Create an empty file
-	let file_path = db
-		.create_empty_file(
-			&client,
-			parent_path.clone(),
-			file_name.clone(),
-			mime_type.clone(),
-		)
+	let create_resp = db
+		.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone())
 		.await
 		.unwrap();
 
 	// Verify the file exists in the database
-	let queried_file = db.query_item(&file_path).unwrap();
+	let queried_file = db.query_item(&create_resp.id).unwrap();
 
 	match queried_file {
 		Some(FfiObject::File(file)) => {
@@ -836,9 +649,9 @@ pub async fn test_create_empty_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_create_empty_file_different_mime_types() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	let test_cases = vec![
 		("test.json", "application/json"),
@@ -848,9 +661,8 @@ pub async fn test_create_empty_file_different_mime_types() {
 	];
 
 	for (filename, mime_type) in test_cases {
-		let file_path = db
+		let create_resp = db
 			.create_empty_file(
-				&client,
 				parent_path.clone(),
 				filename.to_string(),
 				mime_type.to_string(),
@@ -859,7 +671,7 @@ pub async fn test_create_empty_file_different_mime_types() {
 			.unwrap();
 
 		// Verify each file was created with correct MIME type
-		let queried_file = db.query_item(&file_path).unwrap();
+		let queried_file = db.query_item(&create_resp.id).unwrap();
 
 		match queried_file {
 			Some(FfiObject::File(file)) => {
@@ -874,49 +686,34 @@ pub async fn test_create_empty_file_different_mime_types() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_create_empty_file_duplicate_name() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let file_name = "duplicate.txt".to_string();
 	let mime_type = "text/plain".to_string();
 
 	// Create first file
-	db.create_empty_file(
-		&client,
-		parent_path.clone(),
-		file_name.clone(),
-		mime_type.clone(),
-	)
-	.await
-	.unwrap();
+	db.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone())
+		.await
+		.unwrap();
 
 	assert!(
-		db.create_empty_file(
-			&client,
-			parent_path.clone(),
-			file_name.clone(),
-			mime_type.clone(),
-		)
-		.await
-		.is_ok()
+		db.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone(),)
+			.await
+			.is_ok()
 	);
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_create_empty_file_invalid_parent() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
-	let invalid_parent_path: FfiPathWithRoot = format!(
-		"{}/{}/nonexistent_subdir",
-		client.root_uuid(),
-		rss.dir.name()
-	)
-	.into();
+	let invalid_parent_path: FfiPathWithRoot =
+		format!("{}/{}/nonexistent_subdir", db.root_uuid(), rss.dir.name()).into();
 
 	// Should fail with invalid parent path
 	let result = db
 		.create_empty_file(
-			&client,
 			invalid_parent_path,
 			"test.txt".to_string(),
 			"text/plain".to_string(),
@@ -928,26 +725,21 @@ pub async fn test_create_empty_file_invalid_parent() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_create_empty_file_in_root() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create file in the test directory (rss.dir), not the absolute root
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let file_name = "root_file.txt".to_string();
 	let mime_type = "text/plain".to_string();
 
 	// Create file in test directory
-	let file_path = db
-		.create_empty_file(
-			&client,
-			parent_path.clone(),
-			file_name.clone(),
-			mime_type.clone(),
-		)
+	let create_resp = db
+		.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone())
 		.await
 		.unwrap();
 
 	// Verify the file exists
-	let queried_file = db.query_item(&file_path).unwrap();
+	let queried_file = db.query_item(&create_resp.id).unwrap();
 
 	match queried_file {
 		Some(FfiObject::File(file)) => {
@@ -960,7 +752,7 @@ pub async fn test_create_empty_file_in_root() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_file_success() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file
 	let file = rss
@@ -974,29 +766,25 @@ pub async fn test_trash_item_file_success() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
 	// Update the database to include the file
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Verify file exists before trashing
 	let result = db.query_item(&file_path).unwrap();
 	assert!(result.is_some());
 
 	// Trash the file
-	db.trash_item(&client, file_path.clone()).await.unwrap();
+	db.trash_item(file_path.clone()).await.unwrap();
 
 	// Verify file is removed from database
 	let result = db.query_item(&file_path).unwrap();
 	assert!(result.is_none());
 
 	// Verify file is no longer in parent directory listing
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 	let file_exists = children
 		.objects
@@ -1007,7 +795,7 @@ pub async fn test_trash_item_file_success() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_directory_success() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test directory
 	let dir = rss
@@ -1017,29 +805,25 @@ pub async fn test_trash_item_directory_success() {
 		.unwrap();
 
 	let dir_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), dir.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), dir.name()).into();
 
 	// Update the database to include the directory
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Verify directory exists before trashing
 	let result = db.query_item(&dir_path).unwrap();
 	assert!(result.is_some());
 
 	// Trash the directory
-	db.trash_item(&client, dir_path.clone()).await.unwrap();
+	db.trash_item(dir_path.clone()).await.unwrap();
 
 	// Verify directory is removed from database
 	let result = db.query_item(&dir_path).unwrap();
 	assert!(result.is_none());
 
 	// Verify directory is no longer in parent directory listing
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 	let dir_exists = children
 		.objects
@@ -1050,7 +834,7 @@ pub async fn test_trash_item_directory_success() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_directory_with_contents() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a directory with nested content
 	let parent_dir = rss
@@ -1087,28 +871,22 @@ pub async fn test_trash_item_directory_with_contents() {
 		.unwrap();
 
 	// Update database with all the content
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let parent_dir_path: FfiPathWithRoot = format!("{}/{}", base_path.0, parent_dir.name()).into();
 	let sub_dir_path: FfiPathWithRoot = format!("{}/{}", parent_dir_path.0, sub_dir.name()).into();
 
-	db.update_dir_children(&client, base_path.clone())
+	db.update_dir_children(base_path.clone()).await.unwrap();
+	db.update_dir_children(parent_dir_path.clone())
 		.await
 		.unwrap();
-	db.update_dir_children(&client, parent_dir_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, sub_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(sub_dir_path.clone()).await.unwrap();
 
 	// Verify all content exists
 	assert!(db.query_item(&parent_dir_path).unwrap().is_some());
 	assert!(db.query_item(&sub_dir_path).unwrap().is_some());
 
 	// Trash the parent directory (should remove everything)
-	db.trash_item(&client, parent_dir_path.clone())
-		.await
-		.unwrap();
+	db.trash_item(parent_dir_path.clone()).await.unwrap();
 
 	// Verify parent directory is gone
 	assert!(db.query_item(&parent_dir_path).unwrap().is_none());
@@ -1117,9 +895,7 @@ pub async fn test_trash_item_directory_with_contents() {
 	assert!(db.query_item(&sub_dir_path).unwrap().is_none());
 
 	// Verify parent directory is no longer in base directory listing
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
 	let children = db.query_dir_children(&base_path, None).unwrap().unwrap();
 	let parent_exists = children.objects.iter().any(
 		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == parent_dir.uuid().to_string()),
@@ -1129,11 +905,11 @@ pub async fn test_trash_item_directory_with_contents() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_root_directory_error() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Attempt to trash the root directory
-	let root_path: FfiPathWithRoot = client.root_uuid().into();
-	let result = db.trash_item(&client, root_path).await;
+	let root_path: FfiPathWithRoot = db.root_uuid().into();
+	let result = db.trash_item(root_path).await;
 
 	// Should fail with appropriate error
 	assert!(result.is_err());
@@ -1144,17 +920,13 @@ pub async fn test_trash_item_root_directory_error() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_nonexistent_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
-	let nonexistent_path: FfiPathWithRoot = format!(
-		"{}/{}/nonexistent_file.txt",
-		client.root_uuid(),
-		rss.dir.name()
-	)
-	.into();
+	let nonexistent_path: FfiPathWithRoot =
+		format!("{}/{}/nonexistent_file.txt", db.root_uuid(), rss.dir.name()).into();
 
 	// Should fail when trying to trash a non-existent file
-	let result = db.trash_item(&client, nonexistent_path).await;
+	let result = db.trash_item(nonexistent_path).await;
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to an item"));
@@ -1162,13 +934,13 @@ pub async fn test_trash_item_nonexistent_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_nonexistent_directory() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let nonexistent_path: FfiPathWithRoot =
-		format!("{}/{}/nonexistent_dir", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/nonexistent_dir", db.root_uuid(), rss.dir.name()).into();
 
 	// Should fail when trying to trash a non-existent directory
-	let result = db.trash_item(&client, nonexistent_path).await;
+	let result = db.trash_item(nonexistent_path).await;
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to an item"));
@@ -1176,10 +948,10 @@ pub async fn test_trash_item_nonexistent_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_invalid_path() {
-	let (db, client, _rss) = get_db_resources().await;
+	let (db, _rss) = get_db_resources().await;
 
 	let invalid_path: FfiPathWithRoot = "not-a-uuid/invalid/path".into();
-	let result = db.trash_item(&client, invalid_path).await;
+	let result = db.trash_item(invalid_path).await;
 
 	// Should fail with UUID parsing error
 	assert!(result.is_err());
@@ -1187,7 +959,7 @@ pub async fn test_trash_item_invalid_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_partial_path() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a directory structure but don't update all levels
 	let level1 = rss
@@ -1202,19 +974,19 @@ pub async fn test_trash_item_partial_path() {
 		.unwrap();
 
 	// Only update the base directory, not the nested ones
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, base_path).await.unwrap();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(base_path).await.unwrap();
 
 	// Try to trash level2 without having updated level1's children
 	let level2_path: FfiPathWithRoot =
-		format!("{}/{}/level1/level2", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/level1/level2", db.root_uuid(), rss.dir.name()).into();
 
-	db.trash_item(&client, level2_path).await.unwrap();
+	db.trash_item(level2_path).await.unwrap();
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_file_then_query_parent() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create multiple files in the same directory
 	let file1 = rss
@@ -1237,25 +1009,21 @@ pub async fn test_trash_item_file_then_query_parent() {
 		.await
 		.unwrap();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let file2_path: FfiPathWithRoot = format!("{}/{}", parent_path.0, file2.name()).into();
 
 	// Update database
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Verify both files exist
 	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 	assert_eq!(children.objects.len(), 2);
 
 	// Trash one file
-	db.trash_item(&client, file2_path).await.unwrap();
+	db.trash_item(file2_path).await.unwrap();
 
 	// Update parent and verify only one file remains
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 	assert_eq!(children.objects.len(), 1);
 
@@ -1268,7 +1036,7 @@ pub async fn test_trash_item_file_then_query_parent() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_empty_directory() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create an empty directory
 	let empty_dir = rss
@@ -1277,20 +1045,13 @@ pub async fn test_trash_item_empty_directory() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		empty_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), empty_dir.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Update database
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Verify directory exists and is empty
 	assert!(db.query_item(&dir_path).unwrap().is_some());
@@ -1298,15 +1059,13 @@ pub async fn test_trash_item_empty_directory() {
 	assert_eq!(empty_children.objects.len(), 0);
 
 	// Trash the empty directory
-	db.trash_item(&client, dir_path.clone()).await.unwrap();
+	db.trash_item(dir_path.clone()).await.unwrap();
 
 	// Verify it's gone
 	assert!(db.query_item(&dir_path).unwrap().is_none());
 
 	// Verify parent no longer contains it
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 	let parent_children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 	let dir_exists = parent_children.objects.iter().any(
 		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == empty_dir.uuid().to_string()),
@@ -1316,7 +1075,7 @@ pub async fn test_trash_item_empty_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_trash_item_already_trashed_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create and trash a file using the SDK directly first
 	let file = rss
@@ -1333,10 +1092,10 @@ pub async fn test_trash_item_already_trashed_file() {
 	rss.client.trash_file(&file).await.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
 	// Now try to trash it via our method - should fail since it doesn't exist in our DB
-	let result = db.trash_item(&client, file_path).await;
+	let result = db.trash_item(file_path).await;
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to an item"));
@@ -1344,7 +1103,7 @@ pub async fn test_trash_item_already_trashed_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_file_success() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create source and destination directories
 	let source_dir = rss
@@ -1371,29 +1130,20 @@ pub async fn test_move_item_file_success() {
 		.unwrap();
 
 	// Update database with all directories
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 
 	// Define paths for the move operation
 	let file_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file.name()).into();
 
 	// Move the file
 	let new_file_path = db
-		.move_item(
-			&client,
-			file_path.clone(),
-			source_path.clone(),
-			dest_path.clone(),
-		)
+		.move_item(file_path.clone(), source_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
@@ -1416,9 +1166,7 @@ pub async fn test_move_item_file_success() {
 	}
 
 	// Verify source directory no longer contains the file
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
 	let source_children = db.query_dir_children(&source_path, None).unwrap().unwrap();
 	let file_in_source = source_children
 		.objects
@@ -1427,9 +1175,7 @@ pub async fn test_move_item_file_success() {
 	assert!(!file_in_source);
 
 	// Verify destination directory contains the file
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
 	let file_in_dest = dest_children
 		.objects
@@ -1440,7 +1186,7 @@ pub async fn test_move_item_file_success() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_directory_success() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create source and destination directories
 	let source_dir = rss
@@ -1473,26 +1219,19 @@ pub async fn test_move_item_directory_success() {
 		.unwrap();
 
 	// Update database with all directories
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 	let move_dir_path: FfiPathWithRoot = format!("{}/{}", source_path.0, move_dir.name()).into();
 
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, move_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
+	db.update_dir_children(move_dir_path.clone()).await.unwrap();
 
 	// Move the directory
 	let new_dir_path = db
 		.move_item(
-			&client,
 			move_dir_path.clone(),
 			source_path.clone(),
 			dest_path.clone(),
@@ -1519,9 +1258,7 @@ pub async fn test_move_item_directory_success() {
 	}
 
 	// Verify source directory no longer contains the moved directory
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
 	let source_children = db.query_dir_children(&source_path, None).unwrap().unwrap();
 	let dir_in_source = source_children.objects.iter().any(
 		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == move_dir.uuid().to_string()),
@@ -1529,9 +1266,7 @@ pub async fn test_move_item_directory_success() {
 	assert!(!dir_in_source);
 
 	// Verify destination directory contains the moved directory
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
 	let dir_in_dest = dest_children.objects.iter().any(
 		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == move_dir.uuid().to_string()),
@@ -1541,7 +1276,7 @@ pub async fn test_move_item_directory_success() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_nonexistent_item() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create destination directory
 	let dest_dir = rss
@@ -1550,17 +1285,15 @@ pub async fn test_move_item_nonexistent_item() {
 		.await
 		.unwrap();
 
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 	let nonexistent_file_path: FfiPathWithRoot = format!("{}/nonexistent.txt", base_path.0).into();
 
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Try to move non-existent file
 	let result = db
-		.move_item(&client, nonexistent_file_path, base_path.clone(), dest_path)
+		.move_item(nonexistent_file_path, base_path.clone(), dest_path)
 		.await;
 
 	assert!(result.is_err());
@@ -1570,7 +1303,7 @@ pub async fn test_move_item_nonexistent_item() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_nonexistent_destination() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a file to move
 	let file = rss
@@ -1583,17 +1316,15 @@ pub async fn test_move_item_nonexistent_destination() {
 		.await
 		.unwrap();
 
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, file.name()).into();
 	let nonexistent_dest: FfiPathWithRoot = format!("{}/nonexistent_dir", base_path.0).into();
 
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Try to move to non-existent destination
 	let result = db
-		.move_item(&client, file_path, base_path.clone(), nonexistent_dest)
+		.move_item(file_path, base_path.clone(), nonexistent_dest)
 		.await;
 
 	assert!(result.is_err());
@@ -1603,7 +1334,7 @@ pub async fn test_move_item_nonexistent_destination() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_invalid_parent_path() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create source and destination directories
 	let source_dir = rss
@@ -1629,21 +1360,17 @@ pub async fn test_move_item_invalid_parent_path() {
 		.await
 		.unwrap();
 
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 	let file_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file.name()).into();
 	let wrong_parent_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into(); // Wrong parent
 
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
 
 	// Try to move with wrong parent path
-	let result = db
-		.move_item(&client, file_path, wrong_parent_path, dest_path)
-		.await;
+	let result = db.move_item(file_path, wrong_parent_path, dest_path).await;
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
@@ -1652,7 +1379,7 @@ pub async fn test_move_item_invalid_parent_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_destination_is_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a file to move
 	let move_file = rss
@@ -1676,17 +1403,15 @@ pub async fn test_move_item_destination_is_file() {
 		.await
 		.unwrap();
 
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let move_file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, move_file.name()).into();
 	let dest_file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_file.name()).into();
 
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Try to move to a file instead of directory
 	let result = db
-		.move_item(&client, move_file_path, base_path, dest_file_path)
+		.move_item(move_file_path, base_path, dest_file_path)
 		.await;
 
 	assert!(result.is_err());
@@ -1696,7 +1421,7 @@ pub async fn test_move_item_destination_is_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_root_directory_error() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create destination directory
 	let dest_dir = rss
@@ -1705,15 +1430,15 @@ pub async fn test_move_item_root_directory_error() {
 		.await
 		.unwrap();
 
-	let root_path: FfiPathWithRoot = client.root_uuid().into();
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let root_path: FfiPathWithRoot = db.root_uuid().into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 
-	db.update_dir_children(&client, base_path).await.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
 
 	// Try to move root directory (should fail at conversion to DBNonRootObject)
 	let result = db
-		.move_item(&client, root_path.clone(), root_path.clone(), dest_path)
+		.move_item(root_path.clone(), root_path.clone(), dest_path)
 		.await;
 
 	assert!(result.is_err());
@@ -1723,7 +1448,7 @@ pub async fn test_move_item_root_directory_error() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_same_directory() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a file
 	let file = rss
@@ -1736,21 +1461,14 @@ pub async fn test_move_item_same_directory() {
 		.await
 		.unwrap();
 
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let file_path: FfiPathWithRoot = format!("{}/{}", base_path.0, file.name()).into();
 
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Move file to the same directory (should succeed)
 	let new_file_path = db
-		.move_item(
-			&client,
-			file_path.clone(),
-			base_path.clone(),
-			base_path.clone(),
-		)
+		.move_item(file_path.clone(), base_path.clone(), base_path.clone())
 		.await
 		.unwrap();
 
@@ -1771,7 +1489,7 @@ pub async fn test_move_item_same_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_nested_directory_structure() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create nested structure: base/level1/level2/file.txt
 	let level1 = rss
@@ -1804,32 +1522,21 @@ pub async fn test_move_item_nested_directory_structure() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let level1_path: FfiPathWithRoot = format!("{}/{}", base_path.0, level1.name()).into();
 	let level2_path: FfiPathWithRoot = format!("{}/{}", level1_path.0, level2.name()).into();
 	let file_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, file.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 
 	// Update all levels
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, level1_path).await.unwrap();
-	db.update_dir_children(&client, level2_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
+	db.update_dir_children(level1_path).await.unwrap();
+	db.update_dir_children(level2_path.clone()).await.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 
 	// Move file from deep nested location to destination
 	let new_file_path = db
-		.move_item(
-			&client,
-			file_path.clone(),
-			level2_path.clone(),
-			dest_path.clone(),
-		)
+		.move_item(file_path.clone(), level2_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
@@ -1852,16 +1559,12 @@ pub async fn test_move_item_nested_directory_structure() {
 	}
 
 	// Verify level2 directory is now empty
-	db.update_dir_children(&client, level2_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(level2_path.clone()).await.unwrap();
 	let level2_children = db.query_dir_children(&level2_path, None).unwrap().unwrap();
 	assert_eq!(level2_children.objects.len(), 0);
 
 	// Verify destination directory contains the file
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
 	let file_in_dest = dest_children
 		.objects
@@ -1872,7 +1575,7 @@ pub async fn test_move_item_nested_directory_structure() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_directory_with_contents() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create source directory with contents
 	let source_dir = rss
@@ -1915,29 +1618,18 @@ pub async fn test_move_item_directory_with_contents() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 
 	// Update database
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 
 	// Move the entire source directory to destination
 	let new_source_path = db
-		.move_item(
-			&client,
-			source_path.clone(),
-			base_path.clone(),
-			dest_path.clone(),
-		)
+		.move_item(source_path.clone(), base_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
@@ -1961,9 +1653,7 @@ pub async fn test_move_item_directory_with_contents() {
 	}
 
 	// Verify base directory no longer contains old source
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
 	let base_children = db.query_dir_children(&base_path, None).unwrap().unwrap();
 	let old_source_in_base = base_children.objects.iter().any(
 		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == source_dir.uuid().to_string()),
@@ -1971,9 +1661,7 @@ pub async fn test_move_item_directory_with_contents() {
 	assert!(!old_source_in_base);
 
 	// Verify destination contains the moved directory
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
 	let source_in_dest = dest_children.objects.iter().any(
 		|obj| matches!(obj, FfiNonRootObject::Dir(d) if d.uuid == source_dir.uuid().to_string()),
@@ -1981,7 +1669,7 @@ pub async fn test_move_item_directory_with_contents() {
 	assert!(source_in_dest);
 
 	// Verify contents are preserved (this tests that the move operation preserves the directory structure)
-	db.update_dir_children(&client, new_source_path.clone())
+	db.update_dir_children(new_source_path.clone())
 		.await
 		.unwrap();
 	let moved_source_children = db
@@ -2003,7 +1691,7 @@ pub async fn test_move_item_directory_with_contents() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_invalid_uuid_in_path() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let dest_dir = rss
 		.client
@@ -2011,14 +1699,14 @@ pub async fn test_move_item_invalid_uuid_in_path() {
 		.await
 		.unwrap();
 
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 	let invalid_item_path: FfiPathWithRoot = "invalid-uuid/some/path".into();
 	let invalid_parent_path: FfiPathWithRoot = "invalid-uuid/parent".into();
 
 	// Try to move with invalid UUID in item path
 	let result = db
-		.move_item(&client, invalid_item_path, invalid_parent_path, dest_path)
+		.move_item(invalid_item_path, invalid_parent_path, dest_path)
 		.await;
 
 	assert!(result.is_err());
@@ -2027,7 +1715,7 @@ pub async fn test_move_item_invalid_uuid_in_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_partial_path_resolution() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create nested structure but only update some levels
 	let level1 = rss
@@ -2059,18 +1747,16 @@ pub async fn test_move_item_partial_path_resolution() {
 		.unwrap();
 
 	// Only update base level, not the nested levels
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let level2_path: FfiPathWithRoot = format!("{}/level1/level2", base_path.0).into();
 	let file_path: FfiPathWithRoot = format!("{}/deep_file.txt", level2_path.0).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 
-	db.update_dir_children(&client, base_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Move should work with partial path resolution (sync::update_items_in_path should handle this)
 	let new_file_path = db
-		.move_item(&client, file_path.clone(), level2_path, dest_path.clone())
+		.move_item(file_path.clone(), level2_path, dest_path.clone())
 		.await
 		.unwrap();
 
@@ -2085,7 +1771,7 @@ pub async fn test_move_item_partial_path_resolution() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_name_collision_handling() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create source directory with a file
 	let source_dir = rss
@@ -2121,28 +1807,19 @@ pub async fn test_move_item_name_collision_handling() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 	let file_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file_to_move.name()).into();
 
 	// Update database
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 
 	// Move should succeed (the SDK should handle name conflicts)
 	let new_file_path = db
-		.move_item(
-			&client,
-			file_path.clone(),
-			source_path.clone(),
-			dest_path.clone(),
-		)
+		.move_item(file_path.clone(), source_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
@@ -2160,7 +1837,7 @@ pub async fn test_move_item_name_collision_handling() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_move_item_multiple_files_same_operation() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create source directory with multiple files
 	let source_dir = rss
@@ -2197,39 +1874,25 @@ pub async fn test_move_item_multiple_files_same_operation() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
 	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
 	let file1_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file1.name()).into();
 	let file2_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file2.name()).into();
 
 	// Update database
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 
 	// Move both files
 	let new_file1_path = db
-		.move_item(
-			&client,
-			file1_path.clone(),
-			source_path.clone(),
-			dest_path.clone(),
-		)
+		.move_item(file1_path.clone(), source_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	let new_file2_path = db
-		.move_item(
-			&client,
-			file2_path.clone(),
-			source_path.clone(),
-			dest_path.clone(),
-		)
+		.move_item(file2_path.clone(), source_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
@@ -2241,16 +1904,12 @@ pub async fn test_move_item_multiple_files_same_operation() {
 	assert!(db.query_item(&new_file2_path).unwrap().is_some());
 
 	// Verify source directory is now empty
-	db.update_dir_children(&client, source_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(source_path.clone()).await.unwrap();
 	let source_children = db.query_dir_children(&source_path, None).unwrap().unwrap();
 	assert_eq!(source_children.objects.len(), 0);
 
 	// Verify destination directory contains both files
-	db.update_dir_children(&client, dest_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(dest_path.clone()).await.unwrap();
 	let dest_children = db.query_dir_children(&dest_path, None).unwrap().unwrap();
 	assert_eq!(dest_children.objects.len(), 2);
 
@@ -2268,7 +1927,7 @@ pub async fn test_move_item_multiple_files_same_operation() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_file_success() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file
 	let file = rss
@@ -2282,18 +1941,16 @@ pub async fn test_rename_item_file_success() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Rename the file
 	let new_name = "new_name.txt".to_string();
 	let new_file_path = db
-		.rename_item(&client, file_path.clone(), new_name.clone())
+		.rename_item(file_path.clone(), new_name.clone())
 		.await
 		.unwrap()
 		.unwrap();
@@ -2317,9 +1974,7 @@ pub async fn test_rename_item_file_success() {
 	}
 
 	// Verify parent directory listing reflects the rename
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 
 	let renamed_file_in_listing = children
@@ -2335,7 +1990,7 @@ pub async fn test_rename_item_file_success() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_directory_success() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test directory with some content
 	let dir = rss
@@ -2353,21 +2008,17 @@ pub async fn test_rename_item_directory_success() {
 		.unwrap();
 
 	let dir_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), dir.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Rename the directory
 	let new_name = "new_dir_name".to_string();
 	let new_dir_path = db
-		.rename_item(&client, dir_path.clone(), new_name.clone())
+		.rename_item(dir_path.clone(), new_name.clone())
 		.await
 		.unwrap()
 		.unwrap();
@@ -2391,9 +2042,7 @@ pub async fn test_rename_item_directory_success() {
 	}
 
 	// Verify parent directory listing reflects the rename
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 
 	let renamed_dir_in_listing = children
@@ -2407,9 +2056,7 @@ pub async fn test_rename_item_directory_success() {
 	}
 
 	// Verify directory contents are preserved
-	db.update_dir_children(&client, new_dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(new_dir_path.clone()).await.unwrap();
 	let dir_contents = db.query_dir_children(&new_dir_path, None).unwrap().unwrap();
 	assert_eq!(dir_contents.objects.len(), 1);
 
@@ -2421,7 +2068,7 @@ pub async fn test_rename_item_directory_success() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_file_extension_change() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a text file
 	let file = rss
@@ -2435,17 +2082,15 @@ pub async fn test_rename_item_file_extension_change() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Rename to change extension
 	let new_name = "document.md".to_string();
 	let new_file_path = db
-		.rename_item(&client, file_path.clone(), new_name.clone())
+		.rename_item(file_path.clone(), new_name.clone())
 		.await
 		.unwrap()
 		.unwrap();
@@ -2464,7 +2109,7 @@ pub async fn test_rename_item_file_extension_change() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_same_name() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file
 	let file = rss
@@ -2478,17 +2123,15 @@ pub async fn test_rename_item_same_name() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Rename to the same name
 	let same_name = file.name().to_string();
 	let new_file_path = db
-		.rename_item(&client, file_path.clone(), same_name.clone())
+		.rename_item(file_path.clone(), same_name.clone())
 		.await
 		.unwrap();
 
@@ -2509,17 +2152,17 @@ pub async fn test_rename_item_same_name() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_nonexistent_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let nonexistent_path: FfiPathWithRoot =
-		format!("{}/{}/nonexistent.txt", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/nonexistent.txt", db.root_uuid(), rss.dir.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
 
 	// Try to rename non-existent file
 	let result = db
-		.rename_item(&client, nonexistent_path, "new_name.txt".to_string())
+		.rename_item(nonexistent_path, "new_name.txt".to_string())
 		.await;
 
 	assert!(result.is_err());
@@ -2529,14 +2172,12 @@ pub async fn test_rename_item_nonexistent_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_root_directory_error() {
-	let (db, client, _rss) = get_db_resources().await;
+	let (db, _rss) = get_db_resources().await;
 
-	let root_path: FfiPathWithRoot = client.root_uuid().into();
+	let root_path: FfiPathWithRoot = db.root_uuid().into();
 
 	// Try to rename root directory
-	let result = db
-		.rename_item(&client, root_path, "new_root_name".to_string())
-		.await;
+	let result = db.rename_item(root_path, "new_root_name".to_string()).await;
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
@@ -2545,13 +2186,13 @@ pub async fn test_rename_item_root_directory_error() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_invalid_path() {
-	let (db, client, _rss) = get_db_resources().await;
+	let (db, _rss) = get_db_resources().await;
 
 	let invalid_path: FfiPathWithRoot = "not-a-uuid/invalid/path".into();
 
 	// Try to rename with invalid path
 	let result = db
-		.rename_item(&client, invalid_path, "new_name.txt".to_string())
+		.rename_item(invalid_path, "new_name.txt".to_string())
 		.await;
 
 	assert!(result.is_err());
@@ -2560,7 +2201,7 @@ pub async fn test_rename_item_invalid_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_empty_name() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file
 	let file = rss
@@ -2574,13 +2215,13 @@ pub async fn test_rename_item_empty_name() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
 
 	// Try to rename to empty string
-	let result = db.rename_item(&client, file_path, "".to_string()).await;
+	let result = db.rename_item(file_path, "".to_string()).await;
 
 	let err = result.unwrap_err();
 	assert!(err.to_string().contains("Invalid Name ''"));
@@ -2588,7 +2229,7 @@ pub async fn test_rename_item_empty_name() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_special_characters() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file
 	let file = rss
@@ -2602,12 +2243,10 @@ pub async fn test_rename_item_special_characters() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Test various special characters
 	let special_names = vec![
@@ -2624,7 +2263,7 @@ pub async fn test_rename_item_special_characters() {
 	for special_name in special_names {
 		// Try to rename to special name
 		let result = db
-			.rename_item(&client, file_path.clone(), special_name.to_string())
+			.rename_item(file_path.clone(), special_name.to_string())
 			.await;
 
 		if result.is_ok() {
@@ -2641,9 +2280,7 @@ pub async fn test_rename_item_special_characters() {
 			}
 
 			// Reset for next test by renaming back
-			let _ = db
-				.rename_item(&client, new_path, file.name().to_string())
-				.await;
+			let _ = db.rename_item(new_path, file.name().to_string()).await;
 		} else {
 			// Document which special characters are rejected
 			panic!(
@@ -2657,7 +2294,7 @@ pub async fn test_rename_item_special_characters() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_name_collision() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create two files in the same directory
 	let file1 = rss.client.make_file_builder("file1.txt", &rss.dir).build();
@@ -2675,17 +2312,13 @@ pub async fn test_rename_item_name_collision() {
 		.unwrap();
 
 	let file1_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file1.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file1.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Try to rename file1 to file2's name (collision)
-	let result = db
-		.rename_item(&client, file1_path, file2.name().to_string())
-		.await;
+	let result = db.rename_item(file1_path, file2.name().to_string()).await;
 
 	assert!(result.is_err());
 	assert!(
@@ -2698,7 +2331,7 @@ pub async fn test_rename_item_name_collision() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_nested_file() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create nested directory structure
 	let level1 = rss
@@ -2724,22 +2357,20 @@ pub async fn test_rename_item_nested_file() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let level1_path: FfiPathWithRoot = format!("{}/level1", base_path.0).into();
 	let level2_path: FfiPathWithRoot = format!("{}/level2", level1_path.0).into();
 	let file_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, nested_file.name()).into();
 
 	// Update all levels
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, level1_path).await.unwrap();
-	db.update_dir_children(&client, level2_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(level1_path).await.unwrap();
+	db.update_dir_children(level2_path.clone()).await.unwrap();
 
 	// Rename the nested file
 	let new_name = "renamed_nested_file.txt".to_string();
 	let new_file_path = db
-		.rename_item(&client, file_path.clone(), new_name.clone())
+		.rename_item(file_path.clone(), new_name.clone())
 		.await
 		.unwrap()
 		.unwrap();
@@ -2765,7 +2396,7 @@ pub async fn test_rename_item_nested_file() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_long_name() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file
 	let file = rss.client.make_file_builder("short.txt", &rss.dir).build();
@@ -2776,14 +2407,14 @@ pub async fn test_rename_item_long_name() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
 
 	// Try to rename to a very long name
 	let long_name = "a".repeat(255) + ".txt"; // 255 'a' characters plus extension
-	let result = db.rename_item(&client, file_path, long_name.clone()).await;
+	let result = db.rename_item(file_path, long_name.clone()).await;
 
 	let new_path = result.unwrap().unwrap();
 	let renamed_file = db.query_item(&new_path).unwrap();
@@ -2801,7 +2432,7 @@ pub async fn test_rename_item_long_name() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_rename_item_multiple_renames() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a test file
 	let file = rss
@@ -2815,19 +2446,17 @@ pub async fn test_rename_item_multiple_renames() {
 		.unwrap();
 
 	let mut current_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Perform multiple renames in sequence
 	let names = vec!["first_rename.txt", "second_rename.txt", "final_name.txt"];
 
 	for name in names {
 		let new_path = db
-			.rename_item(&client, current_path.clone(), name.to_string())
+			.rename_item(current_path.clone(), name.to_string())
 			.await
 			.unwrap()
 			.unwrap();
@@ -2851,9 +2480,7 @@ pub async fn test_rename_item_multiple_renames() {
 	}
 
 	// Verify final state in parent directory
-	db.update_dir_children(&client, parent_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
 	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
 
 	let final_file = children
@@ -2869,7 +2496,7 @@ pub async fn test_rename_item_multiple_renames() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_empty_directory() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create an empty directory
 	let empty_dir = rss
@@ -2878,20 +2505,13 @@ pub async fn test_get_all_descendant_paths_empty_directory() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		empty_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), empty_dir.name()).into();
 
 	// Update database to include the directory
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get descendant paths - should be empty
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -2900,7 +2520,7 @@ pub async fn test_get_all_descendant_paths_empty_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_files_only() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a directory with multiple files
 	let test_dir = rss
@@ -2931,20 +2551,13 @@ pub async fn test_get_all_descendant_paths_files_only() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		test_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), test_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -2969,7 +2582,7 @@ pub async fn test_get_all_descendant_paths_files_only() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_directories_only() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a directory with subdirectories
 	let test_dir = rss
@@ -2996,20 +2609,13 @@ pub async fn test_get_all_descendant_paths_directories_only() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		test_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), test_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3034,7 +2640,7 @@ pub async fn test_get_all_descendant_paths_directories_only() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_mixed_content() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a directory with mixed files and subdirectories
 	let test_dir = rss
@@ -3068,20 +2674,13 @@ pub async fn test_get_all_descendant_paths_mixed_content() {
 		.build();
 	let file2 = rss.client.upload_file(file2.into(), b"{}").await.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		test_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), test_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3106,7 +2705,7 @@ pub async fn test_get_all_descendant_paths_mixed_content() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_nested_structure() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a deeply nested structure
 	let level1 = rss
@@ -3159,20 +2758,16 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let level1_path: FfiPathWithRoot = format!("{}/{}", base_path.0, level1.name()).into();
 	let level2_path: FfiPathWithRoot = format!("{}/{}", level1_path.0, level2.name()).into();
 	let level3_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, level3.name()).into();
 
 	// Update all levels in database
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, level1_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, level2_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, level3_path).await.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(level1_path.clone()).await.unwrap();
+	db.update_dir_children(level2_path.clone()).await.unwrap();
+	db.update_dir_children(level3_path).await.unwrap();
 
 	// Get descendant paths from level1
 	let descendant_paths = db.get_all_descendant_paths(&level1_path).unwrap();
@@ -3208,7 +2803,7 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_complex_nested_structure() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a complex structure with multiple branches
 	let root_dir = rss
@@ -3276,7 +2871,7 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let root_path: FfiPathWithRoot = format!("{}/{}", base_path.0, root_dir.name()).into();
 	let docs_path: FfiPathWithRoot = format!("{}/{}", root_path.0, docs_dir.name()).into();
 	let images_path: FfiPathWithRoot = format!("{}/{}", root_path.0, images_dir.name()).into();
@@ -3284,15 +2879,11 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 		format!("{}/{}", images_path.0, thumbnails_dir.name()).into();
 
 	// Update all directories in database
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, root_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, docs_path).await.unwrap();
-	db.update_dir_children(&client, images_path).await.unwrap();
-	db.update_dir_children(&client, thumbnails_path)
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(root_path.clone()).await.unwrap();
+	db.update_dir_children(docs_path).await.unwrap();
+	db.update_dir_children(images_path).await.unwrap();
+	db.update_dir_children(thumbnails_path).await.unwrap();
 
 	// Get all descendant paths from root
 	let descendant_paths = db.get_all_descendant_paths(&root_path).unwrap();
@@ -3340,10 +2931,10 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_nonexistent_path() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	let nonexistent_path: FfiPathWithRoot =
-		format!("{}/{}/nonexistent_dir", client.root_uuid(), rss.dir.name()).into();
+		format!("{}/{}/nonexistent_dir", db.root_uuid(), rss.dir.name()).into();
 
 	// Get descendant paths for non-existent directory
 	let descendant_paths = db.get_all_descendant_paths(&nonexistent_path).unwrap();
@@ -3354,7 +2945,7 @@ pub async fn test_get_all_descendant_paths_nonexistent_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_invalid_path() {
-	let (db, _client, _rss) = get_db_resources().await;
+	let (db, _rss) = get_db_resources().await;
 
 	let invalid_path: FfiPathWithRoot = "not-a-uuid/invalid/path".into();
 
@@ -3365,7 +2956,7 @@ pub async fn test_get_all_descendant_paths_invalid_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_file_path() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a file
 	let file = rss
@@ -3379,11 +2970,11 @@ pub async fn test_get_all_descendant_paths_file_path() {
 		.unwrap();
 
 	let file_path: FfiPathWithRoot =
-		format!("{}/{}/{}", client.root_uuid(), rss.dir.name(), file.name()).into();
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
 
 	// Get descendant paths for a file (files have no descendants)
 	let descendant_paths = db.get_all_descendant_paths(&file_path).unwrap();
@@ -3394,7 +2985,7 @@ pub async fn test_get_all_descendant_paths_file_path() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_root_directory() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create some content in the test root directory
 	let file_in_root = rss
@@ -3414,14 +3005,12 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 		.unwrap();
 
 	// Use the test directory as root (since we can't access the absolute root easily)
-	let root_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let root_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = client.root_uuid().into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, root_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = db.root_uuid().into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(root_path.clone()).await.unwrap();
 
 	// Get descendant paths from our test "root"
 	let descendant_paths = db.get_all_descendant_paths(&root_path).unwrap();
@@ -3448,7 +3037,7 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_partial_database_state() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create nested structure but only update some levels in database
 	let level1 = rss
@@ -3473,13 +3062,11 @@ pub async fn test_get_all_descendant_paths_partial_database_state() {
 		.unwrap();
 
 	// Only update the base and level1, not level2
-	let base_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let level1_path: FfiPathWithRoot = format!("{}/{}", base_path.0, level1.name()).into();
 
-	db.update_dir_children(&client, base_path).await.unwrap();
-	db.update_dir_children(&client, level1_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(base_path).await.unwrap();
+	db.update_dir_children(level1_path.clone()).await.unwrap();
 	// Note: NOT updating level2 contents
 
 	// Get descendant paths from level1
@@ -3494,7 +3081,7 @@ pub async fn test_get_all_descendant_paths_partial_database_state() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_special_characters_in_names() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create items with special characters in names
 	let special_dir = rss
@@ -3535,18 +3122,16 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 
 	let dir_path: FfiPathWithRoot = format!(
 		"{}/{}/{}",
-		client.root_uuid(),
+		db.root_uuid(),
 		rss.dir.name(),
 		special_dir.name()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3571,7 +3156,7 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_path_ordering() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create structure to test path ordering
 	let test_dir = rss
@@ -3615,23 +3200,16 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		test_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), test_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let a_dir_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, a_dir.name()).into();
 
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, a_dir_path).await.unwrap();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
+	db.update_dir_children(a_dir_path).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3667,7 +3245,7 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_large_directory() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create a directory with many files to test performance and correctness
 	let large_dir = rss
@@ -3726,25 +3304,18 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		large_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), large_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let subdir1_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, subdir1.name()).into();
 	let subdir2_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, subdir2.name()).into();
 
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, subdir1_path).await.unwrap();
-	db.update_dir_children(&client, subdir2_path).await.unwrap();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
+	db.update_dir_children(subdir1_path).await.unwrap();
+	db.update_dir_children(subdir2_path).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3774,7 +3345,7 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_empty_names() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Test edge case with empty or unusual names (if the SDK allows them)
 	let test_dir = rss
@@ -3802,20 +3373,13 @@ pub async fn test_get_all_descendant_paths_empty_names() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		test_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), test_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3839,7 +3403,7 @@ pub async fn test_get_all_descendant_paths_empty_names() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_concurrent_modifications() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create initial structure
 	let test_dir = rss
@@ -3858,20 +3422,13 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		test_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), test_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get initial descendant paths
 	let initial_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3889,9 +3446,7 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 		.unwrap();
 
 	// Update database again
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
 
 	// Get updated descendant paths
 	let updated_paths = db.get_all_descendant_paths(&dir_path).unwrap();
@@ -3915,7 +3470,7 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
 pub async fn test_get_all_descendant_paths_path_format_consistency() {
-	let (db, client, rss) = get_db_resources().await;
+	let (db, rss) = get_db_resources().await;
 
 	// Create nested structure to test path format consistency
 	let root_dir = rss
@@ -3937,23 +3492,16 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 		.await
 		.unwrap();
 
-	let dir_path: FfiPathWithRoot = format!(
-		"{}/{}/{}",
-		client.root_uuid(),
-		rss.dir.name(),
-		root_dir.name()
-	)
-	.into();
+	let dir_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), root_dir.name()).into();
 
 	// Update database
-	let parent_path: FfiPathWithRoot = format!("{}/{}", client.root_uuid(), rss.dir.name()).into();
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 	let sub_dir_path: FfiPathWithRoot = format!("{}/{}", dir_path.0, sub_dir.name()).into();
 
-	db.update_dir_children(&client, parent_path).await.unwrap();
-	db.update_dir_children(&client, dir_path.clone())
-		.await
-		.unwrap();
-	db.update_dir_children(&client, sub_dir_path).await.unwrap();
+	db.update_dir_children(parent_path).await.unwrap();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
+	db.update_dir_children(sub_dir_path).await.unwrap();
 
 	// Get descendant paths
 	let descendant_paths = db.get_all_descendant_paths(&dir_path).unwrap();

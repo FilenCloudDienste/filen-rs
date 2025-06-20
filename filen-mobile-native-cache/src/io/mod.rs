@@ -6,22 +6,15 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use crate::{PathValues, traits::ProgressCallback};
+use crate::{FilenMobileCacheState, traits::ProgressCallback};
 use chrono::{DateTime, Utc};
-use filen_sdk_rs::{
-	auth::Client,
-	fs::{
-		HasUUID,
-		dir::RemoteDirectory,
-		file::{RemoteFile, traits::HasFileInfo},
-	},
+use filen_sdk_rs::fs::{
+	HasUUID,
+	file::{FileBuilder, RemoteFile, traits::HasFileInfo},
 };
 use filen_types::crypto::Sha512Hash;
 use sha2::Digest;
-use tokio::{
-	io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt},
-	sync::mpsc::UnboundedReceiver,
-};
+use tokio::{io::AsyncReadExt, sync::mpsc::UnboundedReceiver};
 use tokio_util::compat::{
 	FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
 };
@@ -30,11 +23,11 @@ use uuid::Uuid;
 #[cfg(windows)]
 use std::os::windows::fs::{FileTimesExt, MetadataExt};
 #[cfg(windows)]
-fn metadata_size(metadata: std::fs::Metadata) -> u64 {
+fn metadata_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.file_size().max(BUFFER_SIZE)
 }
 #[cfg(windows)]
-fn raw_meta_size(metadata: std::fs::Metadata) -> u64 {
+fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.file_size()
 }
 #[cfg(windows)]
@@ -50,11 +43,11 @@ fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
 use std::os::unix::fs::MetadataExt;
 
 #[cfg(unix)]
-fn metadata_size(metadata: std::fs::Metadata) -> u64 {
+fn metadata_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.size().max(BUFFER_SIZE)
 }
 #[cfg(unix)]
-fn raw_meta_size(metadata: std::fs::Metadata) -> u64 {
+fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.size()
 }
 #[cfg(unix)]
@@ -73,26 +66,19 @@ fn metadata_modified(metadata: &std::fs::Metadata) -> DateTime<Utc> {
 		.unwrap_or_else(|_| Utc::now())
 }
 
-pub const FILES_DIR: &str = "native_cache/downloads";
-const TMP_DIR: &str = "native_cache/tmp";
+pub const CACHE_DIR: &str = "cache";
+const TMP_DIR: &str = "tmp";
 
 const BUFFER_SIZE: u64 = 64 * 1024; // 64 KiB
 const CALLBACK_INTERVAL: Duration = Duration::from_millis(200);
 
-async fn get_tmp_path(files_path: &Path, uuid: &str) -> Result<std::path::PathBuf, io::Error> {
-	let tmp_path = files_path.join(TMP_DIR);
-	tokio::fs::create_dir_all(&tmp_path).await?;
-	Ok(tmp_path.join(uuid))
-}
+pub(crate) fn init(files_path: &Path) -> Result<(PathBuf, PathBuf), io::Error> {
+	let cache_dir = files_path.join(CACHE_DIR);
+	std::fs::create_dir_all(&cache_dir)?;
 
-pub async fn get_file_path(
-	files_path: &Path,
-	path: &PathValues<'_>,
-) -> Result<std::path::PathBuf, io::Error> {
-	let download_path = files_path.join(FILES_DIR).join(path.full_path);
-	// SAFETY: This unwrap is safe because FILES_DIR is a valid path
-	tokio::fs::create_dir_all(download_path.parent().unwrap()).await?;
-	Ok(download_path)
+	let tmp_dir = files_path.join(TMP_DIR);
+	std::fs::create_dir_all(&tmp_dir)?;
+	Ok((cache_dir, tmp_dir))
 }
 
 async fn update_task(
@@ -135,150 +121,157 @@ async fn update_task(
 	}
 }
 
-pub async fn download_file(
-	client: &Client,
-	file: &RemoteFile,
-	pvs: &PathValues<'_>,
-	callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
-	files_path: &Path,
-) -> Result<PathBuf, io::Error> {
-	let reader = client.get_file_reader(file).compat();
-	let uuid = file.uuid().to_string();
-	let src: std::path::PathBuf = get_tmp_path(files_path, &uuid).await?;
-	tokio::io::BufReader::with_capacity(BUFFER_SIZE.min(file.size) as usize, reader);
-	let mut os_file = tokio::fs::File::create(&src).await?.compat_write();
-	let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
-	let file_size = file.size();
-	let callback = if let Some(callback) = callback {
-		tokio::task::spawn(async move {
-			update_task(receiver, file_size, callback).await;
-		});
-		Some(Arc::new(move |bytes_written: u64| {
-			let _ = sender.send(bytes_written);
-		}) as Arc<dyn Fn(u64) + Send + Sync>)
-	} else {
-		None
-	};
-	client
-		.download_file_to_writer(file, &mut os_file, callback)
-		.await
-		.map_err(|e| io::Error::other(format!("Failed to download file: {}", e)))?;
-	let os_file = os_file.into_inner().into_std().await;
-	let created = file.created().into();
-	let modified = file.last_modified().into();
-	tokio::task::spawn_blocking(move || {
-		os_file
-			.set_times(get_file_times(created, modified))
-			.map_err(io::Error::other)
-	})
-	.await??;
+impl FilenMobileCacheState {
+	pub async fn download_file_io(
+		&self,
+		file: &RemoteFile,
+		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+	) -> Result<PathBuf, io::Error> {
+		let reader = self.client.get_file_reader(file).compat();
+		let uuid = file.uuid().to_string();
+		let src = self.tmp_dir.join(&uuid);
+		tokio::io::BufReader::with_capacity(BUFFER_SIZE.min(file.size) as usize, reader);
+		let mut os_file = tokio::fs::File::create(&src).await?.compat_write();
+		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
+		let file_size = file.size();
+		let callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>> =
+			if let Some(callback) = callback {
+				tokio::task::spawn(async move {
+					update_task(receiver, file_size, callback).await;
+				});
+				Some(Arc::new(move |bytes_written: u64| {
+					let _ = sender.send(bytes_written);
+				}) as Arc<dyn Fn(u64) + Send + Sync>)
+			} else {
+				None
+			};
+		self.client
+			.download_file_to_writer(file, &mut os_file, callback)
+			.await
+			.map_err(|e| io::Error::other(format!("Failed to download file: {}", e)))?;
+		let os_file = os_file.into_inner().into_std().await;
+		let created = file.created().into();
+		let modified = file.last_modified().into();
+		tokio::task::spawn_blocking(move || {
+			os_file
+				.set_times(get_file_times(created, modified))
+				.map_err(io::Error::other)
+		})
+		.await??;
 
-	let dst = get_file_path(files_path, pvs).await?;
-	tokio::fs::rename(&src, &dst).await?;
-	Ok(dst)
-}
+		let dst = self.cache_dir.join(&uuid);
+		tokio::fs::rename(&src, &dst).await?;
+		Ok(dst)
+	}
 
-pub async fn hash_local_file(
-	pvs: &PathValues<'_>,
-	files_path: &Path,
-) -> Result<Sha512Hash, io::Error> {
-	let path = get_file_path(files_path, pvs).await?;
-	let mut file = tokio::fs::File::open(path).await?;
-	let file_size = file
-		.metadata()
-		.await
-		.map(metadata_size)
-		.unwrap_or(BUFFER_SIZE);
-	let mut buffer = vec![0; (file_size as usize).min(BUFFER_SIZE as usize)];
-	let mut hasher = sha2::Sha512::new();
-	loop {
-		let bytes_read = file.read(&mut buffer).await?;
-		if bytes_read == 0 {
-			break;
+	pub async fn hash_local_file(&self, uuid: &str) -> Result<Option<Sha512Hash>, io::Error> {
+		let path = self.cache_dir.join(uuid);
+		let mut os_file = match tokio::fs::File::open(path).await {
+			Ok(file) => file,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {
+				return Ok(None);
+			}
+			Err(e) => return Err(e),
+		};
+		let file_size = os_file
+			.metadata()
+			.await
+			.map(|m| metadata_size(&m))
+			.unwrap_or(BUFFER_SIZE);
+		let mut buffer = vec![0; (file_size as usize).min(BUFFER_SIZE as usize)];
+		let mut hasher = sha2::Sha512::new();
+		loop {
+			let bytes_read = os_file.read(&mut buffer).await?;
+			if bytes_read == 0 {
+				break;
+			}
+			hasher.update(&buffer[..bytes_read]);
 		}
-		hasher.update(&buffer[..bytes_read]);
+		let hash = hasher.finalize();
+		Ok(Some(hash.into()))
 	}
-	let hash = hasher.finalize();
-	Ok(hash.into())
-}
 
-pub async fn upload_file(
-	client: &Client,
-	pvs: &PathValues<'_>,
-	parent_uuid: Uuid,
-	mime: Option<String>,
-	callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
-	files_path: &Path,
-) -> Result<RemoteFile, io::Error> {
-	let path = get_file_path(files_path, pvs).await?;
-	let os_file = tokio::fs::File::open(path).await?;
-	let meta = os_file.metadata().await?;
-	let mut file = client
-		.make_file_builder(pvs.name, &parent_uuid)
-		.created(metadata_created(&meta).into())
-		.modified(metadata_modified(&meta));
-	if let Some(mime) = mime {
-		file = file.mime(mime);
+	async fn inner_upload_file(
+		&self,
+		file_builder: FileBuilder,
+		os_file: tokio::fs::File,
+		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+	) -> Result<(RemoteFile, tokio::fs::File), io::Error> {
+		let meta = os_file.metadata().await?;
+		let file = file_builder
+			.created(metadata_created(&meta).into())
+			.modified(metadata_modified(&meta))
+			.build();
+
+		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
+		let reader_callback = if let Some(callback) = callback {
+			tokio::task::spawn(async move {
+				update_task(receiver, raw_meta_size(&meta), callback).await;
+			});
+			Some(Arc::new(move |bytes_written: u64| {
+				let _ = sender.send(bytes_written);
+			}) as Arc<dyn Fn(u64) + Send + Sync>)
+		} else {
+			None
+		};
+
+		let mut os_file = os_file.compat();
+
+		let remote_file = self
+			.client
+			.upload_file_from_reader(file.into(), &mut os_file, reader_callback)
+			.await
+			.map_err(|e| io::Error::other(format!("Failed to upload file: {}", e)))?;
+
+		Ok((remote_file, os_file.into_inner()))
 	}
-	let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
-	let file_size = raw_meta_size(meta);
-	let reader_callback = if let Some(callback) = callback {
-		tokio::task::spawn(async move {
-			update_task(receiver, file_size, callback).await;
-		});
-		Some(Arc::new(move |bytes_written: u64| {
-			let _ = sender.send(bytes_written);
-		}) as Arc<dyn Fn(u64) + Send + Sync>)
-	} else {
-		None
-	};
 
-	let remote_file = client
-		.upload_file_from_reader(file.build().into(), &mut os_file.compat(), reader_callback)
-		.await
-		.map_err(|e| io::Error::other(format!("Failed to upload file: {}", e)))?;
-	Ok(remote_file)
-}
-
-pub(crate) async fn create_file(
-	client: &Client,
-	pvs: &PathValues<'_>,
-	parent_uuid: Uuid,
-	mime: String,
-	files_path: &Path,
-) -> Result<RemoteFile, io::Error> {
-	let target_path = get_file_path(files_path, pvs).await?;
-	let mut os_file = tokio::fs::File::create(target_path).await?;
-	os_file.flush().await?;
-	drop(os_file);
-	upload_file(client, pvs, parent_uuid, Some(mime), None, files_path).await
-}
-
-pub(crate) async fn create_dir(
-	client: &Client,
-	pvs: &PathValues<'_>,
-	parent_uuid: Uuid,
-	name: String,
-	files_path: &Path,
-) -> Result<RemoteDirectory, io::Error> {
-	let remote_dir = client
-		.create_dir(&parent_uuid, name)
-		.await
-		.map_err(|e| io::Error::other(format!("Failed to create directory: {}", e)))?;
-
-	tokio::fs::create_dir_all(get_file_path(files_path, pvs).await?).await?;
-	Ok(remote_dir)
-}
-
-pub(crate) async fn delete_item(files_path: &Path, pvs: &PathValues<'_>) -> Result<(), io::Error> {
-	let path = get_file_path(files_path, pvs).await?;
-	if !path.try_exists().unwrap_or_default() {
-		return Ok(());
+	pub(crate) async fn io_upload_updated_file(
+		&self,
+		old_uuid: &str,
+		name: &str,
+		parent_uuid: Uuid,
+		mime: String,
+		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+	) -> Result<RemoteFile, io::Error> {
+		let old_path = self.cache_dir.join(old_uuid);
+		let old_file = tokio::fs::File::open(&old_path).await?;
+		let file_builder = self.client.make_file_builder(name, &parent_uuid).mime(mime);
+		let (file, _) = self
+			.inner_upload_file(file_builder, old_file, callback)
+			.await?;
+		tokio::fs::rename(old_path, self.cache_dir.join(file.uuid().to_string())).await?;
+		Ok(file)
 	}
-	if path.is_dir() {
-		let _ = tokio::fs::remove_dir_all(&path).await;
-	} else {
-		let _ = tokio::fs::remove_file(&path).await;
+
+	pub(crate) async fn io_upload_new_file(
+		&self,
+		name: &str,
+		parent_uuid: Uuid,
+		mime: Option<String>,
+	) -> Result<(RemoteFile, PathBuf), io::Error> {
+		let mut file_builder = self.client.make_file_builder(name, &parent_uuid);
+		if let Some(mime) = mime {
+			file_builder = file_builder.mime(mime);
+		}
+		let uuid_str = file_builder.get_uuid().to_string();
+		let target_path = self.cache_dir.join(uuid_str);
+		let os_file = tokio::fs::OpenOptions::new()
+			.read(true)
+			.append(true) // only for create
+			.create(true)
+			.open(&target_path)
+			.await?;
+		let (file, _) = self.inner_upload_file(file_builder, os_file, None).await?;
+		Ok((file, target_path))
 	}
-	Ok(())
+
+	pub(crate) async fn io_delete_file(&self, file_uuid: &str) -> Result<(), io::Error> {
+		let path = self.cache_dir.join(file_uuid);
+		match tokio::fs::remove_file(&path).await {
+			Ok(_) => Ok(()),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+			Err(e) => Err(e),
+		}
+	}
 }

@@ -68,6 +68,10 @@ impl FileBuilder {
 		self
 	}
 
+	pub fn get_uuid(&self) -> Uuid {
+		self.uuid
+	}
+
 	pub fn build(self) -> BaseFile {
 		BaseFile {
 			root: RootFile {

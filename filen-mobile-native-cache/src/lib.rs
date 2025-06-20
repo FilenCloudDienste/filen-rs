@@ -41,18 +41,76 @@ pub mod traits;
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 #[derive(uniffi::Object)]
-pub struct FilenMobileDB {
+pub struct FilenMobileCacheState {
 	conn: Mutex<Connection>,
-	files_dir: Mutex<PathBuf>,
+	tmp_dir: PathBuf,
+	cache_dir: PathBuf,
+	client: filen_sdk_rs::auth::Client,
 }
 
-impl FilenMobileDB {
+#[uniffi::export]
+impl FilenMobileCacheState {
+	#[uniffi::constructor(name = "login")]
+	pub async fn login(
+		email: String,
+		password: &str,
+		two_factor_code: &str,
+		files_dir: &str,
+	) -> Result<Self> {
+		let db = Connection::open(AsRef::<Path>::as_ref(files_dir).join("native_cache.db"))?;
+		db.execute_batch(include_str!("../sql/init.sql"))?;
+		let (cache_dir, tmp_dir) = io::init(files_dir.as_ref())?;
+		let client = filen_sdk_rs::auth::Client::login(email, password, two_factor_code).await?;
+		Ok(Self {
+			client,
+			conn: Mutex::new(db),
+			cache_dir,
+			tmp_dir,
+		})
+	}
+
+	#[uniffi::constructor(name = "from_strings")]
+	pub fn from_strings_in_memory(
+		email: String,
+		root_uuid: &str,
+		auth_info: &str,
+		private_key: &str,
+		api_key: String,
+		version: u32,
+		files_dir: &str,
+	) -> Result<Self> {
+		let client = filen_sdk_rs::auth::Client::from_strings(
+			email,
+			root_uuid,
+			auth_info,
+			private_key,
+			api_key,
+			version,
+		)?;
+
+		let (cache_dir, tmp_dir) = io::init(files_dir.as_ref())?;
+		let db = Connection::open_in_memory()?;
+		db.execute_batch(include_str!("../sql/init.sql"))?;
+		Ok(FilenMobileCacheState {
+			client,
+			conn: Mutex::new(db),
+			cache_dir,
+			tmp_dir,
+		})
+	}
+
+	pub fn root_uuid(&self) -> String {
+		self.client.root().uuid().to_string()
+	}
+}
+
+impl FilenMobileCacheState {
 	pub fn conn(&self) -> MutexGuard<Connection> {
 		self.conn.lock().unwrap()
 	}
 
-	pub fn files(&self) -> PathBuf {
-		self.files_dir.lock().unwrap().clone()
+	pub fn cache_dir(&self) -> &Path {
+		&self.cache_dir
 	}
 }
 
@@ -63,32 +121,12 @@ pub struct QueryChildrenResponse {
 }
 
 #[uniffi::export]
-impl FilenMobileDB {
+impl FilenMobileCacheState {
 	pub fn query_roots_info(&self, root_uuid_str: String) -> Result<Option<FfiRoot>> {
 		let conn = self.conn();
 		Ok(DBRoot::select(&conn, Uuid::from_str(&root_uuid_str)?)
 			.optional()?
 			.map(Into::into))
-	}
-
-	#[uniffi::constructor]
-	pub fn initialize_in_memory() -> Result<FilenMobileDB> {
-		let db = Connection::open_in_memory()?;
-		db.execute_batch(include_str!("../sql/init.sql"))?;
-		Ok(FilenMobileDB {
-			conn: Mutex::new(db),
-			files_dir: Mutex::new(PathBuf::from("")),
-		})
-	}
-
-	#[uniffi::constructor]
-	pub fn initialize_from_files_dir(path: &str) -> Result<FilenMobileDB> {
-		let db = Connection::open(AsRef::<Path>::as_ref(path).join("native_cache/cache.db"))?;
-		db.execute_batch(include_str!("../sql/init.sql"))?;
-		Ok(FilenMobileDB {
-			conn: Mutex::new(db),
-			files_dir: Mutex::new(PathBuf::from(path)),
-		})
 	}
 
 	pub fn add_root(&self, root: &str) -> Result<()> {
@@ -135,19 +173,6 @@ impl FilenMobileDB {
 			None => vec![],
 		})
 	}
-
-	pub fn set_files_dir(&self, files_dir: String) -> Result<()> {
-		let files_dir = PathBuf::from(files_dir);
-		if !files_dir.exists() {
-			return Err(CacheError::IO(
-				format!("Files directory does not exist: {}", files_dir.display()).into(),
-			));
-		}
-
-		let mut lock = self.files_dir.lock().unwrap_or_else(|e| e.into_inner());
-		*lock = files_dir;
-		Ok(())
-	}
 }
 
 #[derive(uniffi::Record)]
@@ -157,36 +182,31 @@ pub struct DownloadResponse {
 }
 
 #[filen_sdk_rs_macros::create_uniffi_wrapper]
-impl FilenMobileDB {
-	pub async fn update_roots_info(&self, client: &CacheClient) -> Result<()> {
+impl FilenMobileCacheState {
+	pub async fn update_roots_info(&self) -> Result<()> {
 		debug!(
 			"Updating roots info for client: {}",
-			client.client.root().uuid()
+			self.client.root().uuid()
 		);
-		let resp = client.client.get_user_info().await?;
+		let resp = self.client.get_user_info().await?;
 		let conn = self.conn();
-		sql::update_root(&conn, client.client.root().uuid(), &resp)?;
+		sql::update_root(&conn, self.client.root().uuid(), &resp)?;
 		Ok(())
 	}
 
-	pub async fn update_dir_children(
-		&self,
-		client: &CacheClient,
-		path: FfiPathWithRoot,
-	) -> Result<()> {
+	pub async fn update_dir_children(&self, path: FfiPathWithRoot) -> Result<()> {
 		debug!("Updating directory children for path: {}", path.0);
 		let path_values = path.as_path_values()?;
-		let mut dir: DBDirObject =
-			match sync::update_items_in_path(self, &client.client, &path_values).await? {
-				UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
-				UpdateItemsInPath::Partial(_, _) => {
-					return Err(CacheError::remote(format!(
-						"Path {} does not point to a directory",
-						path_values.full_path
-					)));
-				}
-			};
-		let (dirs, files) = client.client.list_dir(&dir.uuid()).await?;
+		let mut dir: DBDirObject = match self.update_items_in_path(&path_values).await? {
+			UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
+			UpdateItemsInPath::Partial(_, _) => {
+				return Err(CacheError::remote(format!(
+					"Path {} does not point to a directory",
+					path_values.full_path
+				)));
+			}
+		};
+		let (dirs, files) = self.client.list_dir(&dir.uuid()).await?;
 		let mut conn = self.conn();
 		dir.update_children(&mut conn, dirs, files)?;
 		dir.update_dir_last_listed_now(&conn)?;
@@ -195,7 +215,6 @@ impl FilenMobileDB {
 
 	pub async fn update_and_query_dir_children(
 		&self,
-		client: &CacheClient,
 		path: FfiPathWithRoot,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>> {
@@ -203,19 +222,18 @@ impl FilenMobileDB {
 			"Updating and querying directory children for path: {}",
 			path.0
 		);
-		self.update_dir_children(client, path.clone()).await?;
+		self.update_dir_children(path.clone()).await?;
 		self.query_dir_children(&path, order_by)
 	}
 
 	pub async fn download_file_if_changed(
 		&self,
-		client: &CacheClient,
 		file_path: FfiPathWithRoot,
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<String> {
 		debug!("Downloading file to path: {}", file_path.0);
 		let path_values = file_path.as_path_values()?;
-		let file = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+		let file = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => file,
 			UpdateItemsInPath::Partial(_, _) | UpdateItemsInPath::Complete(_) => {
 				return Err(CacheError::remote(format!(
@@ -225,80 +243,84 @@ impl FilenMobileDB {
 			}
 		};
 		let file: RemoteFile = file.try_into()?;
-		let files_path = self.files();
-		let file_path = io::get_file_path(&files_path, &path_values).await?;
-		if file_path.exists() {
-			let local_hash = io::hash_local_file(&path_values, &files_path).await?;
-			if file.hash.is_some_and(|h| h == local_hash) {
-				debug!("File {} is already up-to-date", path_values.full_path);
-				return file_path.into_os_string().into_string().map_err(|e| {
-					CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
-				});
+		let uuid = file.uuid().to_string();
+		match self.hash_local_file(&uuid).await {
+			Ok(Some(hash)) => {
+				if file.hash.is_some_and(|h| h == hash) {
+					debug!("File {} is already up-to-date", path_values.full_path);
+					return self
+						.cache_dir
+						.join(uuid)
+						.into_os_string()
+						.into_string()
+						.map_err(|e| {
+							CacheError::conversion(format!(
+								"Failed to convert path to string: {:?}",
+								e
+							))
+						});
+				}
 			}
-		}
+			Ok(None) => {}
+			Err(e) => {
+				return Err(e.into());
+			}
+		};
 
-		let path = io::download_file(
-			&client.client,
-			&file,
-			&path_values,
-			Some(progress_callback),
-			&files_path,
-		)
-		.await?
-		.into_os_string()
-		.into_string()
-		.map_err(|e| {
-			CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
-		})?;
+		let path = self
+			.download_file_io(&file, Some(progress_callback))
+			.await?
+			.into_os_string()
+			.into_string()
+			.map_err(|e| {
+				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
+			})?;
 		Ok(path)
 	}
 
 	pub async fn upload_file_if_changed(
 		&self,
-		client: &CacheClient,
 		path: FfiPathWithRoot,
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<bool> {
 		debug!("Uploading file at path: {}", path.0);
 		let path_values = path.as_path_values()?;
-		let files_path = self.files();
-		let (parent_uuid, mime) =
-			match sync::update_items_in_path(self, &client.client, &path_values).await? {
-				UpdateItemsInPath::Complete(DBObject::File(file)) => {
-					if let Some(hash) = file.hash.map(Into::into) {
-						let local_hash = io::hash_local_file(&path_values, &files_path).await?;
-						if local_hash == hash {
-							return Ok(false);
-						}
+		let remote_file = match self.update_items_in_path(&path_values).await? {
+			UpdateItemsInPath::Complete(DBObject::File(file)) => {
+				if let Some(hash) = file.hash {
+					let local_hash = self.hash_local_file(&file.uuid.to_string()).await?;
+					if local_hash == Some(hash.into()) {
+						return Ok(false);
 					}
-					(file.parent, Some(file.mime))
 				}
-				UpdateItemsInPath::Complete(_) => {
-					return Err(CacheError::remote(format!(
-						"Path {} does not point to a file",
-						path_values.full_path
-					)));
-				}
-				UpdateItemsInPath::Partial(remaining, parent) if remaining == path_values.name => {
-					(parent.uuid(), None)
-				}
-				UpdateItemsInPath::Partial(remaining, _) => {
-					return Err(CacheError::remote(format!(
-						"Path {} does not point to a file (remaining: {})",
-						path_values.full_path, remaining
-					)));
-				}
-			};
 
-		let remote_file = io::upload_file(
-			&client.client,
-			&path_values,
-			parent_uuid,
-			mime,
-			Some(progress_callback),
-			&files_path,
-		)
-		.await?;
+				self.io_upload_updated_file(
+					&file.uuid.to_string(),
+					path_values.name,
+					file.parent,
+					file.mime,
+					Some(progress_callback),
+				)
+				.await?
+			}
+			UpdateItemsInPath::Complete(_) => {
+				return Err(CacheError::remote(format!(
+					"Path {} does not point to a file",
+					path_values.full_path
+				)));
+			}
+			UpdateItemsInPath::Partial(remaining, parent) if remaining == path_values.name => {
+				self.io_upload_new_file(path_values.name, parent.uuid(), None)
+					.await?
+					.0
+			}
+			UpdateItemsInPath::Partial(remaining, _) => {
+				return Err(CacheError::remote(format!(
+					"Path {} does not point to a file (remaining: {})",
+					path_values.full_path, remaining
+				)));
+			}
+		};
 
 		let mut conn = self.conn();
 		DBFile::upsert_from_remote(&mut conn, remote_file)?;
@@ -307,16 +329,14 @@ impl FilenMobileDB {
 
 	pub async fn create_empty_file(
 		&self,
-		client: &CacheClient,
 		parent_path: FfiPathWithRoot,
 		name: String,
 		mime: String,
-	) -> Result<FfiPathWithRoot> {
+	) -> Result<CreateFileResponse> {
 		let file_path = parent_path.join(&name);
 		debug!("Creating empty file at path: {}", file_path.0);
 		let parent_pvs = parent_path.as_path_values()?;
-		let files_path = self.files();
-		let parent = match sync::update_items_in_path(self, &client.client, &parent_pvs).await? {
+		let parent = match self.update_items_in_path(&parent_pvs).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
 			UpdateItemsInPath::Complete(DBObject::File(_)) => {
@@ -334,23 +354,28 @@ impl FilenMobileDB {
 		};
 		let path = parent_path.join(&name);
 		let pvs = path.as_path_values()?;
-		let file = io::create_file(&client.client, &pvs, parent.uuid(), mime, &files_path).await?;
+		let (file, os_path) = self
+			.io_upload_new_file(pvs.name, parent.uuid(), Some(mime))
+			.await?;
 		let mut conn = self.conn();
 		DBFile::upsert_from_remote(&mut conn, file)?;
-		Ok(file_path)
+		Ok(CreateFileResponse {
+			id: file_path,
+			path: os_path.into_os_string().into_string().map_err(|e| {
+				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
+			})?,
+		})
 	}
 
 	pub async fn create_dir(
 		&self,
-		client: &CacheClient,
 		parent_path: FfiPathWithRoot,
 		name: String,
 	) -> Result<FfiPathWithRoot> {
 		let dir_path = parent_path.join(&name);
 		debug!("Creating directory at path: {}", dir_path.0);
 		let path_values = parent_path.as_path_values()?;
-		let files_path = self.files();
-		let parent = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+		let parent = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
 			UpdateItemsInPath::Complete(DBObject::File(_)) => {
@@ -367,24 +392,17 @@ impl FilenMobileDB {
 			}
 		};
 
-		let dir = io::create_dir(
-			&client.client,
-			&path_values,
-			parent.uuid(),
-			name,
-			&files_path,
-		)
-		.await?;
+		let dir = self.client.create_dir(&parent.uuid(), name).await?;
 
 		let mut conn = self.conn();
 		DBDir::upsert_from_remote(&mut conn, dir)?;
 		Ok(dir_path)
 	}
 
-	pub async fn trash_item(&self, client: &CacheClient, path: FfiPathWithRoot) -> Result<()> {
+	pub async fn trash_item(&self, path: FfiPathWithRoot) -> Result<()> {
 		debug!("Trashing item at path: {}", path.0);
 		let path_values: PathValues<'_> = path.as_path_values()?;
-		let obj = match sync::update_items_in_path(self, &client.client, &path_values).await? {
+		let obj = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject,
 			UpdateItemsInPath::Partial(_, _) => {
 				return Err(CacheError::remote(format!(
@@ -403,12 +421,13 @@ impl FilenMobileDB {
 			}
 			DBObject::Dir(dir) => {
 				let remote_dir = dir.clone().into();
-				client.client.trash_dir(&remote_dir).await?;
+				self.client.trash_dir(&remote_dir).await?;
 				dir.delete(&self.conn())?;
 			}
 			DBObject::File(file) => {
 				let remote_file = file.clone().try_into()?;
-				client.client.trash_file(&remote_file).await?;
+				self.client.trash_file(&remote_file).await?;
+				self.io_delete_file(&remote_file.uuid().to_string()).await?;
 				file.delete(&self.conn())?;
 			}
 		}
@@ -417,7 +436,6 @@ impl FilenMobileDB {
 
 	pub async fn move_item(
 		&self,
-		client: &CacheClient,
 		item: FfiPathWithRoot,
 		parent: FfiPathWithRoot,
 		new_parent: FfiPathWithRoot,
@@ -432,7 +450,7 @@ impl FilenMobileDB {
 
 		let (obj, new_parent_dir) = futures::try_join!(
 			async {
-				let obj = match sync::update_items_in_path(self, &client.client, &item_pvs).await? {
+				let obj = match self.update_items_in_path(&item_pvs).await? {
 					UpdateItemsInPath::Complete(obj) => {
 						DBNonRootObject::try_from(obj).map_err(|e| {
 							CacheError::remote(format!(
@@ -471,7 +489,7 @@ impl FilenMobileDB {
 				Ok(obj)
 			},
 			async {
-				match sync::update_items_in_path(self, &client.client, &new_parent_pvs).await? {
+				match self.update_items_in_path(&new_parent_pvs).await? {
 					UpdateItemsInPath::Complete(obj) => DBDirObject::try_from(obj).map_err(|e| {
 						CacheError::remote(format!(
 							"Path {} does not point to a directory: {}",
@@ -489,8 +507,7 @@ impl FilenMobileDB {
 		match obj {
 			DBNonRootObject::Dir(dbdir) => {
 				let mut remote_dir = dbdir.into();
-				client
-					.client
+				self.client
 					.move_dir(&mut remote_dir, &new_parent_dir.uuid())
 					.await?;
 				sql::move_item(
@@ -502,8 +519,7 @@ impl FilenMobileDB {
 			}
 			DBNonRootObject::File(dbfile) => {
 				let mut remote_file: RemoteFile = dbfile.try_into()?;
-				client
-					.client
+				self.client
 					.move_file(&mut remote_file, &new_parent_dir.uuid())
 					.await?;
 				sql::move_item(
@@ -519,7 +535,6 @@ impl FilenMobileDB {
 
 	pub async fn rename_item(
 		&self,
-		client: &CacheClient,
 		item: FfiPathWithRoot,
 		new_name: String,
 	) -> Result<Option<FfiPathWithRoot>> {
@@ -533,7 +548,7 @@ impl FilenMobileDB {
 		} else if item_pvs.name == new_name {
 			return Ok(None);
 		}
-		self.update_dir_children(client, item.parent()).await?;
+		self.update_dir_children(item.parent()).await?;
 		let obj = match sql::select_object_at_path(&self.conn(), &item_pvs)? {
 			Some(obj) => DBNonRootObject::try_from(obj).map_err(|e| {
 				CacheError::remote(format!(
@@ -555,8 +570,7 @@ impl FilenMobileDB {
 				let mut remote_dir: RemoteDirectory = dbdir.into();
 				let mut meta = remote_dir.get_meta();
 				meta.set_name(&new_name)?;
-				client
-					.client
+				self.client
 					.update_dir_metadata(&mut remote_dir, meta)
 					.await?;
 				sql::rename_item(&mut self.conn(), id, &new_name, remote_dir.parent())?;
@@ -566,8 +580,7 @@ impl FilenMobileDB {
 				let mut remote_file: RemoteFile = dbfile.try_into()?;
 				let mut meta = remote_file.get_meta();
 				meta.set_name(&new_name)?;
-				client
-					.client
+				self.client
 					.update_file_metadata(&mut remote_file, meta)
 					.await?;
 				sql::rename_item(&mut self.conn(), id, &new_name, remote_file.parent())?;
@@ -578,51 +591,20 @@ impl FilenMobileDB {
 
 	pub async fn clear_local_cache(&self, item: FfiPathWithRoot) -> Result<()> {
 		let pvs = item.as_path_values()?;
-		let files_path = self.files();
-		io::delete_item(&files_path, &pvs).await?;
+		debug!("Clearing local cache for item: {}", pvs.full_path);
+		let file = match sql::select_object_at_path(&self.conn(), &pvs)? {
+			Some(DBObject::File(file)) => file,
+			_ => return Ok(()),
+		};
+		self.io_delete_file(&file.uuid.to_string()).await?;
 		Ok(())
 	}
 }
 
-#[derive(uniffi::Object)]
-pub struct CacheClient {
-	client: filen_sdk_rs::auth::Client,
-}
-
-#[uniffi::export]
-impl CacheClient {
-	#[uniffi::constructor(name = "login")]
-	pub async fn login(email: String, password: &str, two_factor_code: &str) -> Result<Self> {
-		Ok(
-			filen_sdk_rs::auth::Client::login(email, password, two_factor_code)
-				.await
-				.map(|client| Self { client })?,
-		)
-	}
-
-	#[uniffi::constructor(name = "from_strings")]
-	pub fn from_strings(
-		email: String,
-		root_uuid: &str,
-		auth_info: &str,
-		private_key: &str,
-		api_key: String,
-		version: u32,
-	) -> Result<Self> {
-		Ok(filen_sdk_rs::auth::Client::from_strings(
-			email,
-			root_uuid,
-			auth_info,
-			private_key,
-			api_key,
-			version,
-		)
-		.map(|client| Self { client })?)
-	}
-
-	pub fn root_uuid(&self) -> String {
-		self.client.root().uuid().to_string()
-	}
+#[derive(uniffi::Record)]
+pub struct CreateFileResponse {
+	pub path: String,
+	pub id: FfiPathWithRoot,
 }
 
 pub struct PathValues<'a> {
