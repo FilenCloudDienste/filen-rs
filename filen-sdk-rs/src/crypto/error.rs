@@ -1,3 +1,4 @@
+use cbc::cipher::block_padding::UnpadError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -37,4 +38,12 @@ pub enum ConversionError {
 	RSAError(#[from] rsa::errors::Error),
 	#[error("Failed to parse UUID: `{0}`")]
 	UUIDError(#[from] uuid::Error),
+	#[error("Unpad error")]
+	UnpadError(cbc::cipher::block_padding::UnpadError),
+}
+
+impl From<UnpadError> for ConversionError {
+	fn from(e: UnpadError) -> Self {
+		Self::UnpadError(e)
+	}
 }

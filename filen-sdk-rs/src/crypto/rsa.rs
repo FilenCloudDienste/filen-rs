@@ -1,4 +1,5 @@
 use base64::{Engine, prelude::BASE64_STANDARD};
+use digest::Digest;
 use filen_types::crypto::{
 	Sha256Hash,
 	rsa::{EncodedPublicKey, EncryptedPrivateKey, RSAEncryptedString},
@@ -15,6 +16,13 @@ const INFO: &[u8] = b"hmac-sha256-key";
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct HMACKey([u8; 32]);
+
+impl std::fmt::Debug for HMACKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let hmac_hash_str = faster_hex::hex_string(&sha2::Sha512::digest(self.0));
+		write!(f, "HMACKey({})", hmac_hash_str)
+	}
+}
 
 impl HMACKey {
 	pub(crate) fn new(key: &RsaPrivateKey) -> Self {

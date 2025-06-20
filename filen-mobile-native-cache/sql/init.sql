@@ -31,6 +31,7 @@ CREATE TABLE files (
     region TEXT NOT NULL,
     bucket TEXT NOT NULL,
     hash BLOB,
+    version SMALLINT NOT NULL CHECK (version IN (1, 2, 3)),
     FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE
 );
 CREATE TABLE dirs (

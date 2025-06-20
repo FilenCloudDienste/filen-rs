@@ -146,6 +146,11 @@ impl MetaCrypter for MasterKey {
 			));
 		}
 
+		let v1_tag = &meta.0[0..8];
+		if v1_tag == "U2FsdGVk" {
+			return self.decrypt_meta_into_v1(meta, out);
+		}
+
 		let tag = &meta.0[0..3];
 		if tag == "002" {
 			return self.decrypt_meta_into_v2(meta, out);

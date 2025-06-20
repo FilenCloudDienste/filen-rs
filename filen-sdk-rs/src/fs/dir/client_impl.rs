@@ -105,7 +105,7 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
-				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter())?;
+				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,
@@ -161,7 +161,7 @@ impl Client {
 				let decrypted_size = decrypted_size
 					.parse::<u64>()
 					.map_err(|_| Error::Custom("Failed to parse decrypted size".to_string()))?;
-				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter())?;
+				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,

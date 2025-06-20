@@ -17,7 +17,8 @@ SELECT
     files.favorited AS file_favorited,
     files.region,
     files.bucket,
-    files.hash
+    files.hash,
+    files.version
 FROM items
 LEFT JOIN dirs ON items.id = dirs.id
 LEFT JOIN files ON items.id = files.id

@@ -1,5 +1,5 @@
 use core::panic;
-use std::{fmt::Write, str::FromStr};
+use std::fmt::Write;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_sdk_rs::{
@@ -11,7 +11,7 @@ use filen_sdk_rs::{
 		file::FileBuilder,
 	},
 };
-use filen_types::auth::FileEncryptionVersion;
+use filen_types::auth::{AuthVersion, FileEncryptionVersion};
 
 use rand::TryRngCore;
 
@@ -39,7 +39,9 @@ fn get_compat_test_file(client: &Client, parent: &impl HasContents) -> (FileBuil
 			),
 			Utc,
 		))
-		.key(FileKey::from_str(file_key_str).unwrap());
+		.key(
+			FileKey::from_str_with_version(file_key_str, client.file_encryption_version()).unwrap(),
+		);
 
 	let mut test_str = String::new();
 	for i in 0..2_700_000 {
@@ -194,6 +196,32 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		}
 		_ => panic!("small.txt not found in compat-go directory"),
 	}
+
+	match client
+		.find_item_in_dir(&compat_dir, "nameSplitter.json")
+		.await
+		.unwrap()
+	{
+		Some(FSObject::File(file)) => {
+			let buf = client.download_file(file.as_ref()).await.unwrap();
+			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
+			name_splitter.split1.sort_unstable();
+			name_splitter.split2.sort_unstable();
+			name_splitter.split3.sort_unstable();
+			name_splitter.split4.sort_unstable();
+			assert_eq!(
+				name_splitter,
+				get_name_splitter_test_value(),
+				"nameSplitter.json contents mismatch"
+			);
+		}
+		_ => panic!("nameSplitter.json not found in compat-go directory"),
+	};
+
+	if client.auth_version() == AuthVersion::V1 {
+		// we weren't able to upload files larger than 1MiB to the V1 account
+		return;
+	}
 	match client
 		.find_item_in_dir(&compat_dir, "big.txt")
 		.await
@@ -234,27 +262,6 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		}
 		_ => panic!("large_sample-20mb.txt not found in compat-go directory"),
 	}
-
-	match client
-		.find_item_in_dir(&compat_dir, "nameSplitter.json")
-		.await
-		.unwrap()
-	{
-		Some(FSObject::File(file)) => {
-			let buf = client.download_file(file.as_ref()).await.unwrap();
-			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
-			name_splitter.split1.sort_unstable();
-			name_splitter.split2.sort_unstable();
-			name_splitter.split3.sort_unstable();
-			name_splitter.split4.sort_unstable();
-			assert_eq!(
-				name_splitter,
-				get_name_splitter_test_value(),
-				"nameSplitter.json contents mismatch"
-			);
-		}
-		_ => panic!("nameSplitter.json not found in compat-go directory"),
-	};
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

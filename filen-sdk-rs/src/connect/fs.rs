@@ -123,7 +123,8 @@ impl SharedFile {
 		shared_file: SharedFileIn<'_>,
 		private_key: &RsaPrivateKey,
 	) -> Result<Self, Error> {
-		let meta = FileMeta::from_rsa_encrypted(&shared_file.metadata, private_key)?;
+		let meta =
+			FileMeta::from_rsa_encrypted(&shared_file.metadata, private_key, shared_file.version)?;
 
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
@@ -149,7 +150,7 @@ impl SharedFile {
 		shared_file: SharedFileOut<'_>,
 		crypter: &impl MetaCrypter,
 	) -> Result<Self, Error> {
-		let meta = FileMeta::from_encrypted(&shared_file.metadata, crypter)?;
+		let meta = FileMeta::from_encrypted(&shared_file.metadata, crypter, shared_file.version)?;
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
 			shared_file.size,

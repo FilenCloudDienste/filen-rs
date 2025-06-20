@@ -172,7 +172,11 @@ impl Client {
 						found_dir.metadata_path,
 					),
 					SearchFindItem::File(found_file) => {
-						let meta = FileMeta::from_encrypted(&found_file.metadata, self.crypter())?;
+						let meta = FileMeta::from_encrypted(
+							&found_file.metadata,
+							self.crypter(),
+							found_file.version,
+						)?;
 						(
 							NonRootFSObject::File(Cow::Owned(RemoteFile::from_meta(
 								found_file.uuid,

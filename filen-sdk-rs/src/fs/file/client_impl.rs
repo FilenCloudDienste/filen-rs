@@ -90,7 +90,7 @@ impl Client {
 
 	pub async fn get_file(&self, uuid: Uuid) -> Result<RemoteFile, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
-		let meta = FileMeta::from_encrypted(&response.metadata, self.crypter())?;
+		let meta = FileMeta::from_encrypted(&response.metadata, self.crypter(), response.version)?;
 		Ok(RemoteFile::from_meta(
 			uuid,
 			response.parent,

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::crypto::EncryptedString;
+use crate::{auth::FileEncryptionVersion, crypto::EncryptedString};
 
 pub const ENDPOINT: &str = "v3/dir/link/content";
 
@@ -48,4 +48,5 @@ pub struct File<'a> {
 	pub chunks: u64,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
+	pub version: FileEncryptionVersion,
 }

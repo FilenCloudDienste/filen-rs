@@ -28,6 +28,17 @@ pub enum FileEncryptionVersion {
 	V3 = 3,
 }
 
+impl From<u8> for FileEncryptionVersion {
+	fn from(value: u8) -> Self {
+		match value {
+			1 => FileEncryptionVersion::V1,
+			2 => FileEncryptionVersion::V2,
+			3 => FileEncryptionVersion::V3,
+			o => panic!("Invalid FileEncryptionVersion value {}", o),
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum MetaEncryptionVersion {

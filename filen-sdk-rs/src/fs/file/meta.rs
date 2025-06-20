@@ -1,16 +1,67 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_types::crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString};
+use filen_types::{
+	auth::FileEncryptionVersion,
+	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},
+};
 use rsa::RsaPrivateKey;
-use serde::{Deserialize, Serialize};
+use serde::{
+	Deserialize, Serialize,
+	de::{DeserializeSeed, IntoDeserializer},
+};
 
 use crate::{
-	crypto::{self, file::FileKey, shared::MetaCrypter},
+	crypto::{
+		self,
+		file::{FileKey, FileKeySeed},
+		shared::MetaCrypter,
+	},
 	error::Error,
 };
 
-#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FileMetaSeed(pub(crate) FileEncryptionVersion);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFileMeta<'a> {
+	pub(super) name: String,
+	pub(super) size: u64,
+	pub(super) mime: String,
+	pub(super) key: &'a str,
+	#[serde(with = "chrono::serde::ts_milliseconds")]
+	// todo, there seems to be some issue with deserializing this in golang, take a look at this
+	pub(super) last_modified: DateTime<Utc>,
+	#[serde(with = "filen_types::serde::time::optional")]
+	#[serde(rename = "creation")]
+	#[serde(default)]
+	pub(super) created: Option<DateTime<Utc>>,
+	pub(super) hash: Option<Sha512Hash>,
+}
+
+impl<'de> DeserializeSeed<'de> for FileMetaSeed {
+	type Value = FileMeta<'static>;
+
+	fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let raw_meta = RawFileMeta::deserialize(deserializer)?;
+		let key = FileKeySeed(self.0).deserialize(raw_meta.key.into_deserializer())?;
+		let meta = FileMeta {
+			name: raw_meta.name.into(),
+			size: raw_meta.size,
+			mime: raw_meta.mime.into(),
+			key: Cow::Owned(key),
+			last_modified: raw_meta.last_modified,
+			created: raw_meta.created,
+			hash: raw_meta.hash,
+		};
+		Ok(meta)
+	}
+}
+
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMeta<'a> {
 	pub(super) name: Cow<'a, str>,
@@ -31,18 +82,22 @@ impl<'a> FileMeta<'a> {
 	pub(crate) fn from_encrypted(
 		meta: &EncryptedString,
 		decrypter: &impl MetaCrypter,
+		file_encryption_version: FileEncryptionVersion,
 	) -> Result<Self, Error> {
 		let decrypted = decrypter.decrypt_meta(meta)?;
-		let meta: FileMeta = serde_json::from_str(&decrypted)?;
+		let seed = FileMetaSeed(file_encryption_version);
+		let meta = seed.deserialize(&mut serde_json::Deserializer::from_str(&decrypted))?;
 		Ok(meta)
 	}
 
 	pub(crate) fn from_rsa_encrypted(
 		meta: &RSAEncryptedString,
 		private_key: &RsaPrivateKey,
+		file_encryption_version: FileEncryptionVersion,
 	) -> Result<Self, Error> {
 		let decrypted = crypto::rsa::decrypt_with_private_key(private_key, meta)?;
-		let meta = serde_json::from_slice(&decrypted)?;
+		let seed = FileMetaSeed(file_encryption_version);
+		let meta = seed.deserialize(&mut serde_json::Deserializer::from_slice(&decrypted))?;
 		Ok(meta)
 	}
 

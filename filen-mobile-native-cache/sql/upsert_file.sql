@@ -9,8 +9,10 @@ INSERT INTO files (
     favorited,
     region,
     bucket,
-    hash
+    hash,
+    version
 ) VALUES (
+    ?,
     ?,
     ?,
     ?,
@@ -32,4 +34,5 @@ chunks = excluded.chunks,
 favorited = excluded.favorited,
 region = excluded.region,
 bucket = excluded.bucket,
-hash = excluded.hash;
+hash = excluded.hash,
+version = excluded.version;

@@ -706,7 +706,7 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
-				let meta = FileMeta::from_encrypted(&f.metadata, link.crypter())?;
+				let meta = FileMeta::from_encrypted(&f.metadata, link.crypter(), f.version)?;
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid, f.parent, f.size, f.chunks, f.region, f.bucket, false, meta,
 				))

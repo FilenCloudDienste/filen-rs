@@ -48,7 +48,7 @@ impl Resources {
 				)
 				.await
 				.inspect_err(|e| {
-					println!("Failed to login: {}, error: {:?}", self.account_prefix, e);
+					println!("Failed to login: {}, error: {}", self.account_prefix, e);
 				})
 				.unwrap()
 			})

@@ -1,9 +1,8 @@
 #![allow(dead_code)]
-use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
-	crypto::file::FileKey,
+	crypto::{error::ConversionError, file::FileKey},
 	fs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID, UnsharedFSObject,
 		dir::{RemoteDirectory, RootDirectory, traits::HasRemoteDirInfo},
@@ -196,6 +195,7 @@ pub struct DBFile {
 	pub(crate) region: String,
 	pub(crate) bucket: String,
 	pub(crate) hash: Option<[u8; 64]>,
+	pub(crate) version: u8,
 }
 
 impl std::fmt::Debug for DBFile {
@@ -251,6 +251,7 @@ impl DBFile {
 			region: row.get(idx + 7)?,
 			bucket: row.get(idx + 8)?,
 			hash: row.get(idx + 9)?,
+			version: row.get(idx + 10)?,
 		})
 	}
 
@@ -282,6 +283,7 @@ impl DBFile {
 			upsert_item_conflict_name_parent,
 		)?;
 		let file_key = remote_file.key().to_str();
+		let version = remote_file.key().version();
 		upsert_file.execute((
 			id,
 			remote_file.mime(),
@@ -294,6 +296,7 @@ impl DBFile {
 			remote_file.region(),
 			remote_file.bucket(),
 			remote_file.hash().map(Into::<[u8; 64]>::into),
+			version as u8,
 		))?;
 		Ok(Self {
 			id,
@@ -310,6 +313,7 @@ impl DBFile {
 			mime: remote_file.file.root.mime,
 			region: remote_file.region,
 			bucket: remote_file.bucket,
+			version: version as u8,
 		})
 	}
 
@@ -410,7 +414,7 @@ impl DBItemTrait for DBFile {
 }
 
 impl TryFrom<DBFile> for RemoteFile {
-	type Error = <FileKey as FromStr>::Err;
+	type Error = ConversionError;
 	fn try_from(value: DBFile) -> Result<Self, Self::Error> {
 		Ok(FlatRemoteFile {
 			uuid: value.uuid,
@@ -422,7 +426,7 @@ impl TryFrom<DBFile> for RemoteFile {
 			size: value.size as u64,
 			chunks: value.chunks as u64,
 			favorited: value.favorited,
-			key: FileKey::from_str(&value.file_key)?,
+			key: FileKey::from_str_with_version(&value.file_key, value.version.into())?,
 			region: value.region,
 			bucket: value.bucket,
 			hash: value.hash.map(|h| h.into()),
@@ -445,6 +449,7 @@ impl From<RemoteFile> for DBFile {
 			chunks: value.chunks() as i64,
 			favorited: value.favorited(),
 			hash: value.hash().map(Into::<[u8; 64]>::into),
+			version: value.key().version() as u8,
 			mime: value.file.root.mime,
 			name: value.file.root.name,
 			bucket: value.bucket,
@@ -809,7 +814,7 @@ impl DBObject {
 			Ok(match item.type_ {
 				ItemType::Dir => Self::Dir(DBDir::from_inner_and_row(item.into(), row, 5)?),
 				ItemType::File => Self::File(DBFile::from_inner_and_row(item.into(), row, 9)?),
-				ItemType::Root => Self::Root(DBRoot::from_inner_and_row(item.into(), row, 19)?),
+				ItemType::Root => Self::Root(DBRoot::from_inner_and_row(item.into(), row, 20)?),
 			})
 		})
 	}

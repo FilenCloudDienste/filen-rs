@@ -12,6 +12,7 @@ SELECT
     files.favorited,
     files.region,
     files.bucket,
-    files.hash
+    files.hash,
+    files.version
 FROM items INNER JOIN files ON items.id = files.id
 WHERE items.uuid = ? LIMIT 1;

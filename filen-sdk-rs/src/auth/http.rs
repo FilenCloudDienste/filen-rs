@@ -1,3 +1,4 @@
+use digest::Digest;
 use filen_types::auth::APIKey;
 use reqwest::IntoUrl;
 
@@ -23,6 +24,16 @@ impl PartialEq for AuthClient {
 	}
 }
 impl Eq for AuthClient {}
+
+impl std::fmt::Debug for AuthClient {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let api_key_str =
+			faster_hex::hex_string(sha2::Sha512::digest(self.api_key.0.as_bytes()).as_ref());
+		f.debug_struct("AuthClient")
+			.field("api_key", &api_key_str)
+			.finish()
+	}
+}
 
 // not sure if this is the best way to do this
 // this is to work around the fact that in tests

@@ -18,7 +18,7 @@ use crate::{
 
 use super::http::UnauthClient;
 pub(crate) use crate::crypto::v3::EncryptionKey as MetaKey;
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthInfo {
 	pub(crate) dek: MetaKey,
 }

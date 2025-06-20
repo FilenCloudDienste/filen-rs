@@ -18,6 +18,7 @@ SELECT
     files.region,
     files.bucket,
     files.hash,
+    files.version,
     roots.storage_used,
     roots.max_storage,
     roots.last_updated,

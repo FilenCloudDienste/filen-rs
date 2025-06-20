@@ -8,6 +8,7 @@ SELECT
     favorited,
     region,
     bucket,
-    hash
+    hash,
+    version
 FROM files
 WHERE id = ? LIMIT 1;
