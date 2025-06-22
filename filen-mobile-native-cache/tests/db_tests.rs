@@ -12,7 +12,7 @@ use test_utils::TestResources;
 
 pub struct NoOpProgressCallback;
 impl ProgressCallback for NoOpProgressCallback {
-	fn init(&self, _size: u64) {}
+	fn set_total(&self, _size: u64) {}
 	fn on_progress(&self, _bytes_processed: u64) {}
 }
 
@@ -23,7 +23,7 @@ pub struct SumProgressCallback {
 }
 
 impl ProgressCallback for SumProgressCallback {
-	fn init(&self, size: u64) {
+	fn set_total(&self, size: u64) {
 		self.max.store(size, std::sync::atomic::Ordering::Relaxed);
 		self.count.store(0, std::sync::atomic::Ordering::Relaxed);
 	}

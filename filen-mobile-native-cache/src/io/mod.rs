@@ -86,7 +86,7 @@ async fn update_task(
 	file_size: u64,
 	callback: Arc<dyn ProgressCallback + Send + Sync>,
 ) {
-	callback.init(file_size);
+	callback.set_total(file_size);
 	let mut last_update = SystemTime::now();
 	let mut written_since_update = 0;
 	loop {

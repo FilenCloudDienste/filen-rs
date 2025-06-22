@@ -1,6 +1,6 @@
 #[uniffi::export(with_foreign)]
 pub trait ProgressCallback: Send + Sync {
-	fn init(&self, size: u64);
+	fn set_total(&self, size: u64);
 	fn on_progress(&self, bytes_processed: u64);
 }
 
@@ -12,5 +12,5 @@ where
 		self(bytes_processed);
 	}
 
-	fn init(&self, _size: u64) {}
+	fn set_total(&self, _size: u64) {}
 }
