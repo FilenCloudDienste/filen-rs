@@ -373,7 +373,7 @@ impl FilenMobileCacheState {
 		&self,
 		parent_path: FfiPathWithRoot,
 		name: String,
-	) -> Result<FfiPathWithRoot> {
+	) -> Result<CreateDirResponse> {
 		let dir_path = parent_path.join(&name);
 		debug!("Creating directory at path: {}", dir_path.0);
 		let path_values = parent_path.as_path_values()?;
@@ -397,8 +397,11 @@ impl FilenMobileCacheState {
 		let dir = self.client.create_dir(&parent.uuid(), name).await?;
 
 		let mut conn = self.conn();
-		DBDir::upsert_from_remote(&mut conn, dir)?;
-		Ok(dir_path)
+		let dir = DBDir::upsert_from_remote(&mut conn, dir)?;
+		Ok(CreateDirResponse {
+			object: dir.into(),
+			id: dir_path,
+		})
 	}
 
 	pub async fn trash_item(&self, path: FfiPathWithRoot) -> Result<()> {
@@ -606,6 +609,12 @@ impl FilenMobileCacheState {
 #[derive(uniffi::Record)]
 pub struct CreateFileResponse {
 	pub path: String,
+	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record)]
+pub struct CreateDirResponse {
+	pub object: FfiDir,
 	pub id: FfiPathWithRoot,
 }
 
