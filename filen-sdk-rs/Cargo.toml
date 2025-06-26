@@ -34,6 +34,8 @@ md2 = "0.10.2"
 md4 = "0.10.2"
 md-5 = "0.10.6"
 cbc = "0.1.2"
+image = {version = "0.25.6", default-features = false, features = ["png", "jpeg", "gif", "tiff", "webp", "qoi", "avif"] }
+
 
 [dev-dependencies]
 dotenv = "0.15.0"

@@ -29,13 +29,14 @@ use crate::{
 
 uniffi::setup_scaffolding!();
 
+pub mod env;
 mod error;
 pub mod ffi;
 pub mod io;
 pub mod sql;
 pub(crate) mod sync;
-pub mod tokio;
 pub use error::CacheError;
+pub mod thumbnail;
 pub mod traits;
 
 pub type Result<T> = std::result::Result<T, CacheError>;
@@ -45,6 +46,7 @@ pub struct FilenMobileCacheState {
 	conn: Mutex<Connection>,
 	tmp_dir: PathBuf,
 	cache_dir: PathBuf,
+	thumbnail_dir: PathBuf,
 	client: filen_sdk_rs::auth::Client,
 }
 
@@ -57,15 +59,17 @@ impl FilenMobileCacheState {
 		two_factor_code: &str,
 		files_dir: &str,
 	) -> Result<Self> {
+		env::init_logger();
 		let db = Connection::open(AsRef::<Path>::as_ref(files_dir).join("native_cache.db"))?;
 		db.execute_batch(include_str!("../sql/init.sql"))?;
-		let (cache_dir, tmp_dir) = io::init(files_dir.as_ref())?;
+		let (cache_dir, tmp_dir, thumbnail_dir) = io::init(files_dir.as_ref())?;
 		let client = filen_sdk_rs::auth::Client::login(email, password, two_factor_code).await?;
 		Ok(Self {
 			client,
 			conn: Mutex::new(db),
 			cache_dir,
 			tmp_dir,
+			thumbnail_dir,
 		})
 	}
 
@@ -79,6 +83,7 @@ impl FilenMobileCacheState {
 		version: u32,
 		files_dir: &str,
 	) -> Result<Self> {
+		env::init_logger();
 		let client = filen_sdk_rs::auth::Client::from_strings(
 			email,
 			root_uuid,
@@ -88,15 +93,18 @@ impl FilenMobileCacheState {
 			version,
 		)?;
 
-		let (cache_dir, tmp_dir) = io::init(files_dir.as_ref())?;
+		let (cache_dir, tmp_dir, thumbnail_dir) = io::init(files_dir.as_ref())?;
 		let db = Connection::open_in_memory()?;
 		db.execute_batch(include_str!("../sql/init.sql"))?;
-		Ok(FilenMobileCacheState {
+		let new = FilenMobileCacheState {
 			client,
 			conn: Mutex::new(db),
 			cache_dir,
 			tmp_dir,
-		})
+			thumbnail_dir,
+		};
+		new.add_root(root_uuid)?;
+		Ok(new)
 	}
 
 	pub fn root_uuid(&self) -> String {
@@ -114,7 +122,7 @@ impl FilenMobileCacheState {
 	}
 }
 
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Debug)]
 pub struct QueryChildrenResponse {
 	pub objects: Vec<FfiNonRootObject>,
 	pub parent: FfiDir,
@@ -157,9 +165,22 @@ impl FilenMobileCacheState {
 	}
 
 	pub fn query_item(&self, path: &FfiPathWithRoot) -> Result<Option<FfiObject>> {
+		debug!("Querying item at path: {}", path.0);
 		let path_values = path.as_path_values()?;
 		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
 		Ok(obj.map(Into::into))
+	}
+
+	pub fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiPathWithRoot>> {
+		debug!("Querying path for UUID: {}", uuid);
+		if uuid == self.root_uuid() {
+			return Ok(Some(uuid.into()));
+		}
+		let uuid = Uuid::parse_str(&uuid)?;
+		let conn = self.conn();
+		let path = sql::recursive_select_path_from_uuid(&conn, uuid)?;
+
+		Ok(path.map(|s| FfiPathWithRoot(format!("{}{}", self.client.root().uuid(), s))))
 	}
 
 	pub fn get_all_descendant_paths(&self, path: &FfiPathWithRoot) -> Result<Vec<FfiPathWithRoot>> {
@@ -226,7 +247,7 @@ impl FilenMobileCacheState {
 		self.query_dir_children(&path, order_by)
 	}
 
-	pub async fn download_file_if_changed(
+	pub async fn download_file_if_changed_by_path(
 		&self,
 		file_path: FfiPathWithRoot,
 		progress_callback: Arc<dyn ProgressCallback>,
@@ -242,40 +263,23 @@ impl FilenMobileCacheState {
 				)));
 			}
 		};
-		let file: RemoteFile = file.try_into()?;
-		let uuid = file.uuid().to_string();
-		match self.hash_local_file(&uuid).await {
-			Ok(Some(hash)) => {
-				if file.hash.is_some_and(|h| h == hash) {
-					debug!("File {} is already up-to-date", path_values.full_path);
-					return self
-						.cache_dir
-						.join(uuid)
-						.into_os_string()
-						.into_string()
-						.map_err(|e| {
-							CacheError::conversion(format!(
-								"Failed to convert path to string: {:?}",
-								e
-							))
-						});
-				}
-			}
-			Ok(None) => {}
-			Err(e) => {
-				return Err(e.into());
-			}
-		};
 
-		let path = self
-			.download_file_io(&file, Some(progress_callback))
-			.await?
-			.into_os_string()
-			.into_string()
-			.map_err(|e| {
-				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
-			})?;
-		Ok(path)
+		self.inner_download_file_if_changed(file, progress_callback)
+			.await
+	}
+
+	pub async fn download_file_if_changed_by_uuid(
+		&self,
+		uuid: String,
+		progress_callback: Arc<dyn ProgressCallback>,
+	) -> Result<String> {
+		debug!("Downloading file with UUID: {}", uuid);
+		let uuid = Uuid::parse_str(&uuid).unwrap();
+		let file = DBFile::select(&self.conn(), uuid)
+			.optional()?
+			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {}", uuid)))?;
+		self.inner_download_file_if_changed(file, progress_callback)
+			.await
 	}
 
 	pub async fn upload_file_if_changed(
@@ -603,6 +607,48 @@ impl FilenMobileCacheState {
 		};
 		self.io_delete_file(&file.uuid.to_string()).await?;
 		Ok(())
+	}
+}
+
+impl FilenMobileCacheState {
+	async fn inner_download_file_if_changed(
+		&self,
+		file: DBFile,
+		progress_callback: Arc<dyn ProgressCallback>,
+	) -> Result<String> {
+		let file: RemoteFile = file.try_into()?;
+		let uuid = file.uuid().to_string();
+		match self.hash_local_file(&uuid).await {
+			Ok(Some(hash)) => {
+				if file.hash.is_some_and(|h| h == hash) {
+					return self
+						.cache_dir
+						.join(uuid)
+						.into_os_string()
+						.into_string()
+						.map_err(|e| {
+							CacheError::conversion(format!(
+								"Failed to convert path to string: {:?}",
+								e
+							))
+						});
+				}
+			}
+			Ok(None) => {}
+			Err(e) => {
+				return Err(e.into());
+			}
+		};
+
+		let path = self
+			.download_file_io(&file, Some(progress_callback))
+			.await?
+			.into_os_string()
+			.into_string()
+			.map_err(|e| {
+				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
+			})?;
+		Ok(path)
 	}
 }
 

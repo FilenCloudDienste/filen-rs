@@ -50,7 +50,6 @@ async fn get_db_resources() -> (FilenMobileCacheState, TestResources) {
 		files_path.to_string_lossy().as_ref(),
 	)
 	.unwrap();
-	state.add_root(&client.root_uuid).unwrap();
 	(state, resources)
 }
 
@@ -523,7 +522,7 @@ pub async fn test_download_file() {
 
 	// Test downloading the file
 	let downloaded_path = db
-		.download_file_if_changed(file_path.clone(), Arc::new(NoOpProgressCallback))
+		.download_file_if_changed_by_path(file_path.clone(), Arc::new(NoOpProgressCallback))
 		.await
 		.unwrap();
 
@@ -545,7 +544,7 @@ pub async fn test_download_file_nonexistent() {
 
 	// Should fail when trying to download a non-existent file
 	let result = db
-		.download_file_if_changed(nonexistent_path, Arc::new(NoOpProgressCallback))
+		.download_file_if_changed_by_path(nonexistent_path, Arc::new(NoOpProgressCallback))
 		.await;
 	assert!(result.is_err());
 }
@@ -565,7 +564,7 @@ pub async fn test_download_file_invalid_path() {
 
 	// Should fail when trying to download a directory path as a file
 	let result = db
-		.download_file_if_changed(dir_path, Arc::new(NoOpProgressCallback))
+		.download_file_if_changed_by_path(dir_path, Arc::new(NoOpProgressCallback))
 		.await;
 	assert!(result.is_err());
 }
@@ -601,7 +600,7 @@ pub async fn test_progress_callback() {
 	let progress_callback = Arc::new(SumProgressCallback::default());
 
 	let downloaded_path = db
-		.download_file_if_changed(create_resp.id.clone(), progress_callback.clone())
+		.download_file_if_changed_by_path(create_resp.id.clone(), progress_callback.clone())
 		.await
 		.unwrap();
 
@@ -3545,5 +3544,43 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 	assert!(
 		descendant_paths.iter().any(|p| p.0 == expected_file),
 		"Expected file path not found"
+	);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+pub async fn test_query_path_for_uuid() {
+	let (db, rss) = get_db_resources().await;
+	let root_path: FfiPathWithRoot = db.root_uuid().to_string().into();
+	let parent_path = root_path.join(rss.dir.name());
+	let dir_path = parent_path.join("path_test");
+
+	let dir = rss
+		.client
+		.create_dir(&rss.dir, "path_test".to_string())
+		.await
+		.unwrap();
+
+	assert_eq!(
+		db.query_path_for_uuid(dir.uuid().to_string()).unwrap(),
+		None
+	);
+	db.update_dir_children(parent_path.clone()).await.unwrap();
+	assert_eq!(
+		db.query_path_for_uuid(dir.uuid().to_string())
+			.unwrap()
+			.unwrap(),
+		dir_path
+	);
+
+	assert_eq!(
+		db.query_path_for_uuid(rss.dir.uuid().to_string())
+			.unwrap()
+			.unwrap(),
+		parent_path
+	);
+
+	assert_eq!(
+		db.query_path_for_uuid(db.root_uuid()).unwrap().unwrap(),
+		root_path
 	);
 }

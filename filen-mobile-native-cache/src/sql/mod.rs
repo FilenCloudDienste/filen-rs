@@ -166,3 +166,13 @@ pub(crate) fn get_all_descendant_paths(
 	get_all_descendant_paths_with_stmt(uuid, current_path, &mut stmt, &mut paths)?;
 	Ok(paths)
 }
+
+pub(crate) fn recursive_select_path_from_uuid(
+	conn: &Connection,
+	uuid: Uuid,
+) -> Result<Option<String>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(include_str!(
+		"../../sql/recursive_select_path_from_uuid.sql"
+	))?;
+	stmt.query_row([uuid], |row| row.get(0)).optional()
+}

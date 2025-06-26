@@ -18,6 +18,7 @@ filen-sdk-rs-macros = { version = "0.1.0", path = "../filen-sdk-rs-macros", feat
 env_logger = "0.11.8"
 rusqlite = { version = "0.36.0", features = ["bundled", "uuid"] }
 filen-types = { path = "../filen-types" , features = ["rusqlite"]}
+image = {version = "0.25.6", default-features = false} # only need the error type here
 
 
 # Optional dependencies
@@ -28,9 +29,9 @@ sha2 = "0.10.9"
 once_cell = "1.21.3"
 thiserror = "2.0.12"
 faster-hex = "0.10.0"
+
 [target.'cfg(target_os="android")'.dependencies]
 android_log = "0.1.3"
-
 [target.'cfg(not(target_os="android"))'.dependencies]
 env_logger = "0.11.8"
 

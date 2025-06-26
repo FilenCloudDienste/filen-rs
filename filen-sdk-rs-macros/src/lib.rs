@@ -110,9 +110,10 @@ fn get_function_body(
 ) -> syn::Result<Block> {
 	syn::parse2(quote! {
 		{
+			println!("{} called", stringify!(#original_fn_name));
 			let time = chrono::Utc::now();
 
-			let ret = crate::tokio::get_runtime().spawn(async move {
+			let ret = crate::env::get_runtime().spawn(async move {
 				let time = chrono::Utc::now();
 				let ret = #fn_prefix #original_fn_name(#(#args),*).await;
 				log::info!(
@@ -174,12 +175,12 @@ where
 	new_item.set_ident(format_ident!("uniffi_{}", item.ident()));
 
 	let mut fn_prefix = T::default_prefix();
-
 	// Signature + calling args
 	let mut args: Vec<proc_macro2::TokenStream> = Vec::new();
 	for (og_param, new_param) in item.inputs().iter().zip(new_item.mut_inputs().iter_mut()) {
 		if let FnArg::Receiver(receiver) = og_param {
 			if receiver.reference.is_none() {
+				args.push(quote!(self));
 				continue;
 			}
 			fn_prefix = SelfPrefix::Method;

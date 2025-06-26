@@ -1,7 +1,7 @@
 CREATE TABLE items (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    uuid TEXT NOT NULL UNIQUE,
-    parent TEXT,
+    uuid BLOB NOT NULL UNIQUE,
+    parent BLOB,
     name TEXT NOT NULL,
     type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
     is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,

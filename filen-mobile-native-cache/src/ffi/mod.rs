@@ -16,6 +16,7 @@ pub struct FfiFile {
 	pub modified: i64,
 	pub size: i64,
 	pub favorited: bool,
+	pub hash: Option<Vec<u8>>,
 }
 
 impl From<DBFile> for FfiFile {
@@ -29,6 +30,7 @@ impl From<DBFile> for FfiFile {
 			modified: file.modified,
 			size: file.size,
 			favorited: file.favorited,
+			hash: file.hash.map(Vec::from),
 		}
 	}
 }

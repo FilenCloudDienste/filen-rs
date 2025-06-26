@@ -1,4 +1,5 @@
 use filen_types::fs::ObjectType;
+use image::ImageError;
 use thiserror::Error;
 
 // todo improve error management
@@ -26,6 +27,8 @@ pub enum Error {
 	InvalidType(ObjectType, ObjectType),
 	#[error("Invalid Name '{0}'")]
 	InvalidName(String),
+	#[error("Image error: '{0}'")]
+	ImageError(#[from] ImageError),
 }
 
 impl From<filen_types::error::ConversionError> for Error {

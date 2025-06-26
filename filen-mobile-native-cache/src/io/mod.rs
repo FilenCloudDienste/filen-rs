@@ -27,7 +27,7 @@ fn metadata_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.file_size().max(BUFFER_SIZE)
 }
 #[cfg(windows)]
-fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
+pub(crate) fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.file_size()
 }
 #[cfg(windows)]
@@ -47,7 +47,7 @@ fn metadata_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.size().max(BUFFER_SIZE)
 }
 #[cfg(unix)]
-fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
+pub(crate) fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
 	metadata.size()
 }
 #[cfg(unix)]
@@ -68,17 +68,23 @@ fn metadata_modified(metadata: &std::fs::Metadata) -> DateTime<Utc> {
 
 pub const CACHE_DIR: &str = "cache";
 const TMP_DIR: &str = "tmp";
+const THUMBNAIL_DIR: &str = "thumbnails";
 
 const BUFFER_SIZE: u64 = 64 * 1024; // 64 KiB
 const CALLBACK_INTERVAL: Duration = Duration::from_millis(200);
 
-pub(crate) fn init(files_path: &Path) -> Result<(PathBuf, PathBuf), io::Error> {
+pub(crate) fn init(files_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
 	let cache_dir = files_path.join(CACHE_DIR);
 	std::fs::create_dir_all(&cache_dir)?;
 
 	let tmp_dir = files_path.join(TMP_DIR);
 	std::fs::create_dir_all(&tmp_dir)?;
-	Ok((cache_dir, tmp_dir))
+
+	std::fs::create_dir_all(files_path.join("dir"))?;
+
+	let thumbnail_dir = files_path.join(THUMBNAIL_DIR);
+	std::fs::create_dir_all(&thumbnail_dir)?;
+	Ok((cache_dir, tmp_dir, thumbnail_dir))
 }
 
 async fn update_task(

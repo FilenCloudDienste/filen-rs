@@ -51,6 +51,7 @@ pub enum CacheError {
 	Conversion(ErrorContext),
 	IO(ErrorContext),
 	Remote(ErrorContext),
+	Image(ErrorContext),
 }
 
 impl CacheError {
@@ -71,6 +72,7 @@ impl std::fmt::Display for CacheError {
 			CacheError::Conversion(err) => err.fmt(f),
 			CacheError::IO(err) => err.fmt(f),
 			CacheError::Remote(err) => err.fmt(f),
+			CacheError::Image(err) => err.fmt(f),
 		}
 	}
 }
@@ -108,5 +110,11 @@ impl From<filen_sdk_rs::crypto::error::ConversionError> for CacheError {
 impl From<std::io::Error> for CacheError {
 	fn from(err: std::io::Error) -> Self {
 		CacheError::IO(err.into_error_context())
+	}
+}
+
+impl From<image::ImageError> for CacheError {
+	fn from(err: image::ImageError) -> Self {
+		CacheError::Image(err.into_error_context())
 	}
 }

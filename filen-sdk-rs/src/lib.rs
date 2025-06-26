@@ -10,5 +10,6 @@ pub mod fs;
 pub mod io;
 pub mod search;
 pub mod sync;
+pub mod thumbnail;
 pub mod user;
 pub mod util;
