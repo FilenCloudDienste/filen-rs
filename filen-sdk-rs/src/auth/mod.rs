@@ -147,6 +147,7 @@ pub struct Client {
 	pub(crate) drive_lock: Mutex<Option<Weak<ResourceLock>>>,
 	pub(crate) api_semaphore: tokio::sync::Semaphore,
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
+	pub open_file_semaphore: tokio::sync::Semaphore,
 }
 
 impl PartialEq for Client {
@@ -331,6 +332,7 @@ impl Client {
 			memory_semaphore: tokio::sync::Semaphore::new(
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
 			),
+			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
 		})
 	}
 
@@ -369,6 +371,7 @@ impl Client {
 			memory_semaphore: tokio::sync::Semaphore::new(
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
 			),
+			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
 		})
 	}
 

@@ -63,3 +63,4 @@ pub const FILE_CHUNK_SIZE_EXTRA_USIZE: usize = FILE_CHUNK_SIZE_EXTRA.get() as us
 pub(crate) const MAX_SMALL_PARALLEL_REQUESTS: usize = 64;
 pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
 	(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 4; // 4 full Chunks
+pub(crate) const MAX_OPEN_FILES: usize = 64;

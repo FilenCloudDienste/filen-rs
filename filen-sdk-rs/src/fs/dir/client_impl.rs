@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+#[cfg(feature = "tokio")]
+use std::path::Path;
 
 use futures::TryFutureExt;
 use uuid::Uuid;
@@ -14,6 +16,7 @@ use crate::{
 		enums::FSObject,
 		file::{RemoteFile, meta::FileMeta},
 	},
+	io::FilenMetaExt,
 	util::PathIteratorExt,
 };
 
@@ -297,5 +300,75 @@ impl Client {
 			},
 		)
 		.await
+	}
+}
+
+#[cfg(feature = "tokio")]
+impl Client {
+	pub async fn recursive_upload_dir(
+		&self,
+		dir: &Path,
+		parent: &dyn HasUUIDContents,
+	) -> Result<RemoteDirectory, Error> {
+		use futures::StreamExt;
+
+		let _lock = self.lock_drive().await?;
+		let dir_name = dir
+			.file_name()
+			.and_then(|s| s.to_str())
+			.ok_or_else(|| Error::Custom("Failed to get directory name".to_string()))?
+			.to_string();
+
+		let remote_dir = self.create_dir(parent, dir_name).await?;
+		let read_dir = tokio::fs::read_dir(dir).await?;
+		let stream = tokio_stream::wrappers::ReadDirStream::new(read_dir);
+
+		let stream = stream.then(|entry| async {
+			let entry = entry?;
+			let path = entry.path();
+			let meta = entry.metadata().await?;
+			if meta.is_dir() {
+				let name = entry.file_name().into_string().map_err(|_| {
+					Error::Custom("Failed to convert OsString to String".to_string())
+				})?;
+				let sub_dir = self.create_dir(&remote_dir, name).await?;
+				Box::pin(self.recursive_upload_dir(&path, &sub_dir)).await?;
+			} else if meta.is_file() {
+				use tokio_util::compat::TokioAsyncReadCompatExt;
+
+				let name = entry.file_name().into_string().map_err(|_| {
+					Error::Custom("Failed to convert OsString to String".to_string())
+				})?;
+				// stop from overloading client with too many open files
+				let _sem = self.open_file_semaphore.acquire().await.unwrap();
+				let os_file = tokio::fs::File::open(&path).await?;
+				let file = self
+					.make_file_builder(name, &remote_dir)
+					.modified(FilenMetaExt::modified(&meta).into())
+					.created(FilenMetaExt::created(&meta).into())
+					.build();
+
+				self.upload_file_from_reader(
+					file.into(),
+					&mut os_file.compat(),
+					None,
+					Some(meta.size()),
+				)
+				.await?;
+			} else {
+				return Err(Error::Custom("Unsupported file type".to_string()));
+			}
+			Ok::<_, Error>(())
+		});
+
+		{
+			tokio::pin!(stream);
+			while let Some(result) = stream.next().await {
+				use crate::error::ErrorExt;
+				result.context("recursive_upload_dir")?; // propagate any errors
+			}
+		}
+
+		Ok(remote_dir)
 	}
 }
