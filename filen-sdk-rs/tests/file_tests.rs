@@ -35,17 +35,16 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	};
 	assert_eq!(
 		file, found_file,
-		"Downloaded file didn't match uploaded file for {}",
-		name
+		"Downloaded file didn't match uploaded file for {name}"
 	);
 
 	let buf = client.download_file(&file).await.unwrap();
 
-	assert_eq!(buf.len(), contents.len(), "File size mismatch for {}", name);
-	assert_eq!(&buf, contents, "File contents mismatch for {}", name);
+	assert_eq!(buf.len(), contents.len(), "File size mismatch for {name}");
+	assert_eq!(&buf, contents, "File contents mismatch for {name}");
 
 	let got_file = client.get_file(file.uuid()).await.unwrap();
-	assert_eq!(file, got_file, "File metadata mismatch for {}", name);
+	assert_eq!(file, got_file, "File metadata mismatch for {name}");
 }
 
 #[shared_test_runtime]
@@ -77,7 +76,7 @@ async fn file_search() {
 	let file_random_part_long = generate_random_base64_values(16);
 	let file_random_part_short = generate_random_base64_values(2);
 
-	let file_name = format!("{}{}.txt", file_random_part_long, file_random_part_short);
+	let file_name = format!("{file_random_part_long}{file_random_part_short}.txt");
 
 	let file = client.make_file_builder(&file_name, &second_dir).build();
 	let file = client.upload_file(file.into(), &[]).await.unwrap();
@@ -388,7 +387,7 @@ async fn file_trash_empty() {
 async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, contents_len: usize) {
 	let mut contents = vec![0u8; contents_len];
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
-	let file_name = format!("file_{}.txt", contents_len);
+	let file_name = format!("file_{contents_len}.txt");
 	let file = client.make_file_builder(file_name, test_dir).build();
 	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
 	client

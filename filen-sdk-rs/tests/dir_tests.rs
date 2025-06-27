@@ -115,9 +115,9 @@ async fn find_at_path() {
 			Some(UnsharedDirectoryType::Dir(dir)) if *dir == dir_c => {
 				assert_eq!(path, "d/e");
 			}
-			other => panic!("Expected last directory to be 'c', but got: {:?}", other),
+			other => panic!("Expected last directory to be 'c', but got: {other:?}"),
 		},
-		other => panic!("Expected dir_c, but got: {:?}", other),
+		other => panic!("Expected dir_c, but got: {other:?}"),
 	}
 }
 
@@ -141,7 +141,7 @@ async fn find_or_create() {
 	assert_eq!(
 		Some(Into::<FSObject<'_>>::into(nested_dir.clone())),
 		client
-			.find_item_at_path(&format!("{}/d/e", path))
+			.find_item_at_path(&format!("{path}/d/e"))
 			.await
 			.unwrap()
 	);
@@ -250,7 +250,7 @@ async fn dir_search() {
 	let dir_random_part_long = generate_random_base64_values(16);
 	let dir_random_part_short = generate_random_base64_values(2);
 
-	let dir_name = format!("{}{}", dir_random_part_long, dir_random_part_short);
+	let dir_name = format!("{dir_random_part_long}{dir_random_part_short}");
 
 	let dir = client.create_dir(&second_dir, dir_name).await.unwrap();
 

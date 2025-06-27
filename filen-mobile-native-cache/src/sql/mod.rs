@@ -147,7 +147,7 @@ fn get_all_descendant_paths_with_stmt(
 		})?
 		.collect::<Result<Vec<_>, rusqlite::Error>>()?;
 	for (uuid, name, item_type) in items {
-		let current_path = format!("{}/{}", current_path, name);
+		let current_path = format!("{current_path}/{name}");
 		if item_type == ItemType::Dir || item_type == ItemType::Root {
 			get_all_descendant_paths_with_stmt(uuid, &current_path, stmt, paths)?;
 		}

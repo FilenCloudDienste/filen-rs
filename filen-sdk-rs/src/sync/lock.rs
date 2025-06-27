@@ -36,13 +36,13 @@ async fn actually_drop(client: &AuthClient, uuid: Uuid, resource: &str) {
 	.await
 	{
 		Ok(response) => {
-			debug!("Released lock {}: {}", resource, uuid);
+			debug!("Released lock {resource}: {uuid}");
 			if !response.released {
-				eprintln!("Failed to release lock {}", resource);
+				eprintln!("Failed to release lock {resource}");
 			}
 		}
 		Err(e) => {
-			eprintln!("Failed to release lock {}: {}", resource, e);
+			eprintln!("Failed to release lock {resource}: {e}");
 		}
 	}
 }
@@ -97,7 +97,7 @@ impl Client {
 			match self.try_acquire_lock(&resource, uuid).await {
 				Ok(false) => {}
 				Ok(true) => {
-					debug!("Acquired lock {}: {}", resource, uuid);
+					debug!("Acquired lock {resource}: {uuid}");
 					return Ok(ResourceLock {
 						uuid,
 						client: self.arc_client(),

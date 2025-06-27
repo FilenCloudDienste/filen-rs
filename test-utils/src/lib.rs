@@ -32,7 +32,7 @@ impl Drop for TestResources {
 		futures::executor::block_on(async move {
 			match self.client.trash_dir(&self.dir).await {
 				Ok(_) => {}
-				Err(e) => eprintln!("Failed to clean up test directory: {}", e),
+				Err(e) => eprintln!("Failed to clean up test directory: {e}"),
 			}
 		})
 	}

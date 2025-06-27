@@ -247,8 +247,7 @@ impl Client {
 
 			if files.iter().any(|f| f.name() == component) {
 				return Err(Error::Custom(format!(
-					"find_or_create_dir path {}/{} is a file when trying to create dir {}",
-					remaining_path, component, path
+					"find_or_create_dir path {remaining_path}/{component} is a file when trying to create dir {path}"
 				)));
 			}
 

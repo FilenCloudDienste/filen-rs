@@ -34,7 +34,7 @@ impl From<u8> for FileEncryptionVersion {
 			1 => FileEncryptionVersion::V1,
 			2 => FileEncryptionVersion::V2,
 			3 => FileEncryptionVersion::V3,
-			o => panic!("Invalid FileEncryptionVersion value {}", o),
+			o => panic!("Invalid FileEncryptionVersion value {o}"),
 		}
 	}
 }

@@ -35,7 +35,7 @@ where
 {
 	let response = request_builder.send().await.context(endpoint)?;
 	let text = response.text().await.context(endpoint)?;
-	println!("{} response: {}", endpoint, text);
+	println!("{endpoint} response: {text}");
 	let mut deserializer = serde_json::Deserializer::from_str(&text);
 	let response: FilenResponse<U> =
 		serde_path_to_error::deserialize(&mut deserializer).map_err(|e| {

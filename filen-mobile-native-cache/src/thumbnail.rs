@@ -24,7 +24,7 @@ impl FilenMobileCacheState {
 		let file_thumbnails_path = self.thumbnail_dir.join(&uuid_str);
 		tokio::fs::create_dir_all(&file_thumbnails_path).await?;
 		let thumbnail_path =
-			file_thumbnails_path.join(format!("{}x{}.webp", target_width, target_height));
+			file_thumbnails_path.join(format!("{target_width}x{target_height}.webp"));
 		println!("Thumbnail path: {}", thumbnail_path.display());
 		let thumbnail_file = tokio::fs::OpenOptions::new()
 			.append(true)

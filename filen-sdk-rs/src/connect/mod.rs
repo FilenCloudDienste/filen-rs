@@ -598,7 +598,7 @@ impl Client {
 		let size_str = self.crypter().decrypt_meta(&response.size)?;
 		let size = size_str
 			.parse::<u64>()
-			.map_err(|_| Error::Custom(format!("Failed to parse size: {}", size_str)))?;
+			.map_err(|_| Error::Custom(format!("Failed to parse size: {size_str}")))?;
 
 		let file_info = LinkedFileInfo {
 			uuid: response.uuid,

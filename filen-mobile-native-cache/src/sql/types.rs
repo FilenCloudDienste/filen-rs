@@ -78,10 +78,7 @@ fn upsert_item_with_stmts(
 	upsert_item_conflict_uuid: &mut CachedStatement<'_>,
 	upsert_item_conflict_name_parent: &mut CachedStatement<'_>,
 ) -> Result<i64> {
-	trace!(
-		"Upserting item: uuid = {}, parent = {:?}, name = {}, type = {:?}",
-		uuid, parent, name, type_
-	);
+	trace!("Upserting item: uuid = {uuid}, parent = {parent:?}, name = {name}, type = {type_:?}");
 	let id = match upsert_item_conflict_uuid.query_one((uuid, parent, name, type_), |row| {
 		let id: i64 = row.get(0)?;
 		Ok(id)
@@ -275,7 +272,7 @@ impl DBFile {
 		upsert_item_conflict_name_parent: &mut CachedStatement<'_>,
 		upsert_file: &mut CachedStatement<'_>,
 	) -> Result<Self> {
-		trace!("Upserting remote file: {:?}", remote_file);
+		trace!("Upserting remote file: {remote_file:?}");
 		let id = upsert_item_with_stmts(
 			remote_file.uuid(),
 			Some(remote_file.parent()),
@@ -424,7 +421,7 @@ impl TryFrom<DBFile> for RemoteFile {
 			name: value.name,
 			mime: value.mime,
 			created: DateTime::<Utc>::from_timestamp_millis(value.created).unwrap_or_default(),
-			modified: DateTime::<Utc>::from_timestamp_millis(value.created).unwrap_or_default(),
+			modified: DateTime::<Utc>::from_timestamp_millis(value.modified).unwrap_or_default(),
 			size: value.size as u64,
 			chunks: value.chunks as u64,
 			favorited: value.favorited,
@@ -573,7 +570,7 @@ impl DBDir {
 		conn: &mut Connection,
 		remote_dir: RemoteDirectory,
 	) -> Result<Self> {
-		trace!("Upserting remote dir: {:?}", remote_dir);
+		trace!("Upserting remote dir: {remote_dir:?}");
 		let tx = conn.transaction()?;
 		let new = {
 			let mut upsert_item_conflict_uuid = tx.prepare_cached(UPSERT_ITEM_CONFLICT_UUID_SQL)?;
@@ -720,7 +717,7 @@ impl DBRoot {
 		conn: &mut Connection,
 		remote_root: &RootDirectory,
 	) -> Result<Self> {
-		trace!("Upserting remote root: {:?}", remote_root);
+		trace!("Upserting remote root: {remote_root:?}");
 		let tx = conn.transaction()?;
 		let id = upsert_item(
 			&tx,

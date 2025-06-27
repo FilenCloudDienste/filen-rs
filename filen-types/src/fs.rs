@@ -66,7 +66,7 @@ impl TryFrom<ParentUuid> for Uuid {
 	fn try_from(value: ParentUuid) -> Result<Self, Self::Error> {
 		match value {
 			ParentUuid::Uuid(uuid) => Ok(uuid),
-			other => Err(ConversionError::ParentUuidError(format!("{:?}", other))),
+			other => Err(ConversionError::ParentUuidError(format!("{other:?}"))),
 		}
 	}
 }
@@ -74,7 +74,7 @@ impl TryFrom<ParentUuid> for Uuid {
 impl std::fmt::Display for ParentUuid {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			ParentUuid::Uuid(uuid) => write!(f, "{}", uuid),
+			ParentUuid::Uuid(uuid) => write!(f, "{uuid}"),
 			ParentUuid::Trash => write!(f, "trash"),
 			ParentUuid::Recents => write!(f, "recents"),
 			ParentUuid::Favorites => write!(f, "favorites"),

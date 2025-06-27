@@ -154,7 +154,7 @@ impl FilenMobileCacheState {
 		self.client
 			.download_file_to_writer(file, &mut os_file, callback)
 			.await
-			.map_err(|e| io::Error::other(format!("Failed to download file: {}", e)))?;
+			.map_err(|e| io::Error::other(format!("Failed to download file: {e}")))?;
 		let os_file = os_file.into_inner().into_std().await;
 		let created = file.created().into();
 		let modified = file.last_modified().into();
@@ -229,7 +229,7 @@ impl FilenMobileCacheState {
 			.client
 			.upload_file_from_reader(file.into(), &mut os_file, reader_callback, Some(file_size))
 			.await
-			.map_err(|e| io::Error::other(format!("Failed to upload file: {}", e)))?;
+			.map_err(|e| io::Error::other(format!("Failed to upload file: {e}")))?;
 
 		Ok((remote_file, os_file.into_inner()))
 	}

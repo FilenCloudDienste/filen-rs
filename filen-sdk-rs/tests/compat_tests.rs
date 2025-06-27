@@ -191,7 +191,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		Some(FSObject::File(file)) => {
 			assert_eq!(
 				client.download_file(file.as_ref()).await.unwrap(),
-				format!("Hello World from {}!", language).as_bytes(),
+				format!("Hello World from {language}!").as_bytes(),
 				"small.txt contents mismatch"
 			);
 		}

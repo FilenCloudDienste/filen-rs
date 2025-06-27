@@ -172,7 +172,7 @@ impl FilenMobileCacheState {
 	}
 
 	pub fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiPathWithRoot>> {
-		debug!("Querying path for UUID: {}", uuid);
+		debug!("Querying path for UUID: {uuid}");
 		if uuid == self.root_uuid() {
 			return Ok(Some(uuid.into()));
 		}
@@ -273,11 +273,11 @@ impl FilenMobileCacheState {
 		uuid: String,
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<String> {
-		debug!("Downloading file with UUID: {}", uuid);
+		debug!("Downloading file with UUID: {uuid}");
 		let uuid = Uuid::parse_str(&uuid).unwrap();
 		let file = DBFile::select(&self.conn(), uuid)
 			.optional()?
-			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {}", uuid)))?;
+			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {uuid}")))?;
 		self.inner_download_file_if_changed(file, progress_callback)
 			.await
 	}
@@ -302,7 +302,7 @@ impl FilenMobileCacheState {
 					&file.uuid.to_string(),
 					path_values.name,
 					file.parent.try_into().map_err(|e| {
-						CacheError::conversion(format!("Failed to convert parent UUID: {}", e))
+						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
 					})?,
 					file.mime,
 					Some(progress_callback),
@@ -347,14 +347,12 @@ impl FilenMobileCacheState {
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
 			UpdateItemsInPath::Complete(DBObject::File(_)) => {
 				return Err(CacheError::remote(format!(
-					"Path {} points to a file",
-					parent_path
+					"Path {parent_path} points to a file"
 				)));
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
 				return Err(CacheError::remote(format!(
-					"Path {} does not point to a directory (remaining: {})",
-					parent_path, remaining
+					"Path {parent_path} does not point to a directory (remaining: {remaining})"
 				)));
 			}
 		};
@@ -368,7 +366,7 @@ impl FilenMobileCacheState {
 		Ok(CreateFileResponse {
 			id: file_path,
 			path: os_path.into_os_string().into_string().map_err(|e| {
-				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
+				CacheError::conversion(format!("Failed to convert path to string: {e:?}"))
 			})?,
 		})
 	}
@@ -386,14 +384,12 @@ impl FilenMobileCacheState {
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
 			UpdateItemsInPath::Complete(DBObject::File(_)) => {
 				return Err(CacheError::remote(format!(
-					"Path {} points to a file",
-					parent_path
+					"Path {parent_path} points to a file"
 				)));
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
 				return Err(CacheError::remote(format!(
-					"Path {} does not point to a directory (remaining: {})",
-					parent_path, remaining
+					"Path {parent_path} does not point to a directory (remaining: {remaining})"
 				)));
 			}
 		};
@@ -646,7 +642,7 @@ impl FilenMobileCacheState {
 			.into_os_string()
 			.into_string()
 			.map_err(|e| {
-				CacheError::conversion(format!("Failed to convert path to string: {:?}", e))
+				CacheError::conversion(format!("Failed to convert path to string: {e:?}"))
 			})?;
 		Ok(path)
 	}
@@ -680,7 +676,7 @@ impl FfiPathWithRoot {
 
 		Ok(PathValues {
 			root_uuid: Uuid::parse_str(root_uuid_str)
-				.map_err(|e| CacheError::conversion(format!("Invalid root UUID: {}", e)))?,
+				.map_err(|e| CacheError::conversion(format!("Invalid root UUID: {e}")))?
 			full_path: self.0.as_str(),
 			inner_path: remaining,
 			name: iter.last().unwrap_or_default().0,

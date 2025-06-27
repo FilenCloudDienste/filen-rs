@@ -61,10 +61,7 @@ pub(crate) mod empty_notempty {
 		match value {
 			"notempty" => Ok(true),
 			"empty" => Ok(false),
-			_ => Err(serde::de::Error::custom(format!(
-				"Invalid value: {}",
-				value
-			))),
+			_ => Err(serde::de::Error::custom(format!("Invalid value: {value}"))),
 		}
 	}
 }
