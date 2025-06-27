@@ -760,6 +760,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "base64",
+ "bytes",
  "cbc",
  "chrono",
  "digest",
@@ -773,6 +774,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "image",
+ "log 0.4.27",
  "md-5",
  "md2",
  "md4",
@@ -2806,6 +2808,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "dotenv",
+ "env_logger",
  "filen-sdk-rs",
  "futures",
  "rand 0.9.1",

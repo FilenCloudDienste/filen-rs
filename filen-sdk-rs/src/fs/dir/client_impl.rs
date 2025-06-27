@@ -25,6 +25,7 @@ impl Client {
 		parent: &dyn HasUUIDContents,
 		name: String,
 	) -> Result<RemoteDirectory, Error> {
+		let _lock = self.lock_drive().await?;
 		let mut dir = RemoteDirectory::new(name, parent.uuid_as_parent(), chrono::Utc::now())?;
 
 		let response = api::v3::dir::create::post(
@@ -181,6 +182,7 @@ impl Client {
 	}
 
 	pub async fn trash_dir(&self, dir: &RemoteDirectory) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::dir::trash::post(
 			self.client(),
 			&api::v3::dir::trash::Request { uuid: dir.uuid() },
@@ -194,6 +196,7 @@ impl Client {
 		dir: &mut RemoteDirectory,
 		new_meta: DirectoryMeta<'_>,
 	) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::dir::metadata::post(
 			self.client(),
 			&api::v3::dir::metadata::Request {
@@ -233,6 +236,7 @@ impl Client {
 		dir: DirectoryType<'a>,
 		path: &str,
 	) -> Result<DirectoryType<'a>, Error> {
+		let _lock = self.lock_drive().await?;
 		let mut curr_dir = dir;
 		for (component, remaining_path) in path.path_iter() {
 			let (dirs, files) = self.list_dir(&curr_dir).await?;
@@ -266,6 +270,7 @@ impl Client {
 		dir: &mut RemoteDirectory,
 		new_parent: &dyn HasUUIDContents,
 	) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::dir::r#move::post(
 			self.client(),
 			&api::v3::dir::r#move::Request {

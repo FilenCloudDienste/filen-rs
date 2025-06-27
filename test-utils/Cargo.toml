@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 base64 = "0.22.1"
 dotenv = "0.15.0"
+env_logger = "0.11.8"
 filen-sdk-rs = { path = "../filen-sdk-rs" }
 futures = "0.3.31"
 rand = "0.9.1"

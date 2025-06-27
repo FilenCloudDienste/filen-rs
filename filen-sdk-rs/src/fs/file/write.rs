@@ -1,9 +1,11 @@
 use std::{
 	borrow::Cow,
-	io::{Cursor, Write},
+	io::Write,
+	num::NonZeroU32,
 	sync::{Arc, OnceLock},
 };
 
+use bytes::Bytes;
 use filen_types::crypto::Sha512Hash;
 use futures::{AsyncWrite, FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use sha2::Digest;
@@ -11,12 +13,14 @@ use sha2::Digest;
 use crate::{
 	api,
 	auth::Client,
-	consts::{CHUNK_SIZE, DEFAULT_MAX_UPLOAD_THREADS_PER_FILE, FILE_CHUNK_SIZE_EXTRA},
+	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::{
 		self,
 		shared::{DataCrypter, MetaCrypter},
 	},
 	error::Error,
+	fs::file::chunk::Chunk,
+	sync::lock::ResourceLock,
 };
 
 use super::{BaseFile, RemoteFile, meta::FileMeta};
@@ -39,22 +43,42 @@ impl Default for RemoteFileInfo {
 struct FileWriterUploadingState<'a> {
 	file: Arc<BaseFile>,
 	callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
-	futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>>,
-	curr_chunk: Option<Cursor<Vec<u8>>>,
+	futures: FuturesUnordered<BoxFuture<'a, Result<Chunk<'a>, Error>>>,
+	alloc_future: Option<BoxFuture<'a, Chunk<'a>>>,
+	// annoying that I have to split it up like this, but Cursor doesn't implement Write
+	// for impl AsMut<Vec<u8>> so we can't use Cursor<Chunk<'a>> directly
+	curr_chunk: Option<Chunk<'a>>,
+	allocated_chunks: Vec<Chunk<'a>>,
+	size: Option<u64>,
 	next_chunk_idx: u64,
 	written: u64,
 	hasher: sha2::Sha512,
 	remote_file_info: Arc<OnceLock<RemoteFileInfo>>,
 	upload_key: Arc<String>,
-	max_threads: usize,
 	client: &'a Client,
 }
 
 impl<'a> FileWriterUploadingState<'a> {
-	fn push_upload_next_chunk(&mut self, mut out_data: Vec<u8>) {
+	fn next_chunk_size(&self) -> Option<NonZeroU32> {
+		match self.size {
+			Some(0) => None,
+			None => Some(FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get())),
+			Some(size) if self.next_chunk_idx < size / CHUNK_SIZE_U64 => {
+				Some(FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()))
+			}
+			Some(size) => {
+				let remaining = size - (self.next_chunk_idx * u64::from(FILE_CHUNK_SIZE.get()))
+					+ u64::from(FILE_CHUNK_SIZE_EXTRA.get());
+				let size: u32 = remaining.try_into().unwrap();
+				Some(NonZeroU32::new(size).unwrap())
+			}
+		}
+	}
+
+	fn push_upload_next_chunk(&mut self, mut out_data: Chunk<'a>) {
 		let chunk_idx = self.next_chunk_idx;
 		self.next_chunk_idx += 1;
-		let client = self.client.clone();
+		let client = self.client;
 		let file = self.file.clone();
 		let upload_key = self.upload_key.clone();
 		let callback = self.callback.clone();
@@ -62,15 +86,23 @@ impl<'a> FileWriterUploadingState<'a> {
 		let remote_file_info = self.remote_file_info.clone();
 		self.futures.push(Box::pin(async move {
 			// encrypt the data
-			let len = out_data.len() as u64;
-			file.key().encrypt_data(&mut out_data)?;
+			let len = out_data.as_ref().len() as u64;
+			debug_assert!(
+				len <= CHUNK_SIZE_U64,
+				"Chunk size exceeded {CHUNK_SIZE_U64}: {len}"
+			);
+			file.key().encrypt_data(out_data.as_mut())?;
+
 			// upload the data
+			let (chunk_bytes, permit) = out_data.into_parts();
+
+			let chunk_bytes: Bytes = chunk_bytes.into();
 			let result = api::v3::upload::upload_file_chunk(
 				client.client(),
 				&file,
 				&upload_key,
 				chunk_idx,
-				out_data,
+				chunk_bytes.clone(),
 			)
 			.await?;
 			if let Some(callback) = callback {
@@ -81,40 +113,186 @@ impl<'a> FileWriterUploadingState<'a> {
 				region: result.region.into_owned(),
 				bucket: result.bucket.into_owned(),
 			});
-			Ok(())
+			let mut chunk_bytes: Vec<u8> = chunk_bytes.into();
+			chunk_bytes.clear();
+			Ok(Chunk::from_parts(chunk_bytes, permit))
 		}));
 	}
 
 	pub fn write_next_chunk(&mut self, buf: &[u8]) -> std::io::Result<usize> {
 		// take the chunk out of curr_chunk
-		let mut cursor = match self.curr_chunk.take() {
+		let mut chunk = match self.curr_chunk.take() {
 			Some(cursor) => cursor,
 			// this could be optimized, we currently allocated a full MiB for every chunk
 			// but we only need to allocate the size of the chunk
 			// the problem is that we don't know if there's another write_next_chunk coming
-			None => Cursor::new(Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA)),
+			None => {
+				if let Some(chunk) = self.allocated_chunks.pop() {
+					chunk
+				} else {
+					if let Some(size) = self.next_chunk_size()
+						&& self.alloc_future.is_none()
+					{
+						self.alloc_future =
+							Some(Box::pin(Chunk::acquire(size, self.client))
+								as BoxFuture<'a, Chunk<'a>>);
+					}
+					return Ok(0);
+				}
+			}
 		};
-		// todo double check if this write doesn't reallocate more memory
-		// maybe do this another way to guarantee that buf is only max CHUNK_SIZE at this point
-		let written = cursor.write(&buf[..Ord::min(buf.len(), CHUNK_SIZE)])?;
+		let written = chunk.write(&buf[..Ord::min(buf.len(), CHUNK_SIZE)])?;
 		// SAFETY: chunk should never be more than u32 in length
-		self.written += TryInto::<u64>::try_into(written).unwrap();
-		if (TryInto::<usize>::try_into(cursor.position()).unwrap()) < CHUNK_SIZE {
+		self.written += u64::try_from(written).unwrap();
+		if chunk.len() < CHUNK_SIZE {
 			// didn't write the whole chunk, put it back
-			self.curr_chunk = Some(cursor);
+			self.curr_chunk = Some(chunk);
 		} else {
 			// wrote the whole chunk, so we need to upload it
-			self.push_upload_next_chunk(cursor.into_inner());
+			self.push_upload_next_chunk(chunk);
 		}
 
 		Ok(written)
 	}
 
-	fn into_completing_state(self) -> Result<FileWriterCompletingState<'a>, Error> {
-		let file = self.file.clone();
-		let hash = self.hasher.finalize();
-		let client = self.client.clone();
+	fn into_waiting_for_drive_lock_state(
+		self,
+	) -> Result<FileWriterWaitingForDriveLockState<'a>, Error> {
+		let lock_future = self.client.lock_drive();
+		let hash = Sha512Hash::from(self.hasher.finalize());
 
+		let remote_file_info = match Arc::try_unwrap(self.remote_file_info) {
+			Ok(lock) => lock.into_inner().unwrap_or_default(),
+			Err(arc) => (*arc).get().cloned().unwrap_or_default(),
+		};
+
+		Ok(FileWriterWaitingForDriveLockState {
+			file: self.file,
+			lock_future: Box::pin(lock_future),
+			hash,
+			remote_file_info,
+			upload_key: self.upload_key,
+			written: self.written,
+			num_chunks: self.next_chunk_idx,
+			client: self.client,
+		})
+	}
+
+	fn poll_write(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		let mut written = self.write_next_chunk(buf)?;
+		if written >= buf.len() {
+			// we've filled the buffer
+			return std::task::Poll::Ready(Ok(written));
+		}
+
+		let mut should_pend = false;
+		while let Some(mut future) = self.alloc_future.take() {
+			if self.next_chunk_size().is_none() {
+				self.allocated_chunks.clear();
+				break;
+			}
+			match future.poll_unpin(cx) {
+				std::task::Poll::Ready(chunk) => {
+					self.allocated_chunks.push(chunk);
+					written += self.write_next_chunk(buf)?;
+					if written >= buf.len() {
+						// we've filled the buffer
+						return std::task::Poll::Ready(Ok(written));
+					}
+				}
+				std::task::Poll::Pending => {
+					// put the future back, we need to wait for it
+					self.alloc_future = Some(future);
+					should_pend = true;
+					break;
+				}
+			}
+		}
+
+		loop {
+			match self.futures.poll_next_unpin(cx) {
+				std::task::Poll::Ready(Some(Ok(chunk))) => {
+					if self.next_chunk_size().is_some() {
+						self.allocated_chunks.push(chunk);
+					} else {
+						self.allocated_chunks.clear();
+					}
+					if written < buf.len() {
+						written += self.write_next_chunk(&buf[written..])?;
+					}
+					if written >= buf.len() {
+						// we've filled the buffer
+						return std::task::Poll::Ready(Ok(written));
+					}
+				}
+				std::task::Poll::Ready(Some(Err(e))) => {
+					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
+				}
+				std::task::Poll::Ready(None) => {
+					// all futures are done, return the number of bytes written
+					if should_pend && written == 0 {
+						return std::task::Poll::Pending;
+					}
+					return std::task::Poll::Ready(Ok(written));
+				}
+				std::task::Poll::Pending => {
+					if written > 0 {
+						// we have written some data, return it
+						return std::task::Poll::Ready(Ok(written));
+					}
+					return std::task::Poll::Pending;
+				}
+			}
+		}
+	}
+
+	fn poll_close(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		if let Some(last_chunk) = self.curr_chunk.take() {
+			// we have a chunk to upload
+			self.push_upload_next_chunk(last_chunk);
+		}
+
+		loop {
+			match self.futures.poll_next_unpin(cx) {
+				std::task::Poll::Ready(Some(Ok(_))) => {}
+				std::task::Poll::Ready(Some(Err(e))) => {
+					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
+				}
+				std::task::Poll::Ready(None) => {
+					return std::task::Poll::Ready(Ok(()));
+				}
+				std::task::Poll::Pending => {
+					return std::task::Poll::Pending;
+				}
+			}
+		}
+	}
+}
+
+struct FileWriterWaitingForDriveLockState<'a> {
+	file: Arc<BaseFile>,
+	lock_future: BoxFuture<'a, Result<Arc<ResourceLock>, Error>>,
+	hash: Sha512Hash,
+	remote_file_info: RemoteFileInfo,
+	upload_key: Arc<String>,
+	written: u64,
+	num_chunks: u64,
+	client: &'a Client,
+}
+
+impl<'a> FileWriterWaitingForDriveLockState<'a> {
+	fn into_completing_state(
+		self,
+		drive_lock: Arc<ResourceLock>,
+	) -> Result<FileWriterCompletingState<'a>, Error> {
+		let file = self.file.clone();
 		let empty_request = filen_types::api::v3::upload::empty::Request {
 			uuid: file.uuid(),
 			name: Cow::Owned(self.client.crypter().encrypt_meta(file.name())?),
@@ -138,7 +316,7 @@ impl<'a> FileWriterUploadingState<'a> {
 					key: Cow::Borrowed(file.key()),
 					created: Some(file.created()),
 					last_modified: file.last_modified(),
-					hash: Some(hash.into()),
+					hash: Some(self.hash),
 				},
 			)?)?),
 			version: self.client.file_encryption_version(),
@@ -147,16 +325,16 @@ impl<'a> FileWriterUploadingState<'a> {
 		let future: BoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>> =
 			if self.written == 0 {
 				Box::pin(async move {
-					api::v3::upload::empty::post(client.client(), &empty_request).await
+					api::v3::upload::empty::post(self.client.client(), &empty_request).await
 				})
 			} else {
 				let upload_key = self.upload_key.clone();
 				Box::pin(async move {
 					api::v3::upload::done::post(
-						client.client(),
+						self.client.client(),
 						&api::v3::upload::done::Request {
 							empty_request,
-							chunks: self.next_chunk_idx,
+							chunks: self.num_chunks,
 							rm: Cow::Borrowed(&crypto::shared::generate_random_base64_values(32)),
 							upload_key: Cow::Borrowed(&upload_key),
 						},
@@ -165,93 +343,33 @@ impl<'a> FileWriterUploadingState<'a> {
 				})
 			};
 
-		let remote_file_info = match Arc::try_unwrap(self.remote_file_info) {
-			Ok(lock) => lock.into_inner().unwrap_or_default(),
-			Err(arc) => (*arc).get().cloned().unwrap_or_default(),
-		};
-
 		Ok(FileWriterCompletingState {
 			file: self.file.clone(),
 			future,
-			hash: hash.into(),
-			remote_file_info,
+			hash: self.hash,
+			remote_file_info: self.remote_file_info,
 			client: self.client,
+			drive_lock,
 		})
-	}
-
-	fn poll_write(
-		&mut self,
-		cx: &mut std::task::Context<'_>,
-		buf: &[u8],
-	) -> std::task::Poll<std::io::Result<usize>> {
-		let mut written = self.write_next_chunk(buf)?;
-		if written >= buf.len() {
-			// we've filled the buffer
-			return std::task::Poll::Ready(Ok(written));
-		}
-
-		while self.futures.len() < self.max_threads && written < buf.len() {
-			// we can push a new chunk
-			written += self.write_next_chunk(&buf[written..])?;
-		}
-
-		loop {
-			match self.futures.poll_next_unpin(cx) {
-				std::task::Poll::Ready(Some(Ok(()))) => {
-					if written < buf.len() {
-						written += self.write_next_chunk(&buf[written..])?;
-					}
-					if written >= buf.len() {
-						// we've filled the buffer
-						return std::task::Poll::Ready(Ok(written));
-					}
-				}
-				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
-				}
-				std::task::Poll::Ready(None) => {
-					// all futures are done, return the number of bytes written
-					return std::task::Poll::Ready(Ok(written));
-				}
-				std::task::Poll::Pending => {
-					if written > 0 {
-						// we have written some data, return it
-						return std::task::Poll::Ready(Ok(written));
-					}
-					return std::task::Poll::Pending;
-				}
-			}
-		}
 	}
 
 	fn poll_close(
 		&mut self,
 		cx: &mut std::task::Context<'_>,
-	) -> std::task::Poll<std::io::Result<()>> {
-		if let Some(last_chunk) = self.curr_chunk.take() {
-			// we have a chunk to upload
-			self.push_upload_next_chunk(last_chunk.into_inner());
-		}
-
-		loop {
-			match self.futures.poll_next_unpin(cx) {
-				std::task::Poll::Ready(Some(Ok(()))) => {}
-				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
-				}
-				std::task::Poll::Ready(None) => {
-					return std::task::Poll::Ready(Ok(()));
-				}
-				std::task::Poll::Pending => {
-					return std::task::Poll::Pending;
-				}
+	) -> std::task::Poll<std::io::Result<Arc<ResourceLock>>> {
+		match self.lock_future.poll_unpin(cx) {
+			std::task::Poll::Ready(Ok(drive_lock)) => std::task::Poll::Ready(Ok(drive_lock)),
+			std::task::Poll::Ready(Err(e)) => {
+				std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
 			}
+			std::task::Poll::Pending => std::task::Poll::Pending,
 		}
 	}
 }
 
 struct FileWriterCompletingState<'a> {
 	file: Arc<BaseFile>,
+	drive_lock: Arc<ResourceLock>,
 	future: BoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
 	hash: Sha512Hash,
 	remote_file_info: RemoteFileInfo,
@@ -277,55 +395,50 @@ impl<'a> FileWriterCompletingState<'a> {
 		response: filen_types::api::v3::upload::empty::Response,
 	) -> FileWriterFinalizingState<'a> {
 		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
-
-		FileWriterFinalizingState::new(
-			Arc::new(RemoteFile {
-				file: file.root,
-				parent: file.parent.into(),
-				size: response.size,
-				favorited: false,
-				region: self.remote_file_info.region,
-				bucket: self.remote_file_info.bucket,
-				chunks: response.chunks,
-				hash: Some(self.hash),
-			}),
-			self.client,
-		)
-	}
-}
-
-struct FileWriterFinalizingState<'a> {
-	file: Arc<RemoteFile>,
-	futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>>,
-	client: &'a Client,
-}
-
-impl<'a> FileWriterFinalizingState<'a> {
-	fn new(file: Arc<RemoteFile>, client: &'a Client) -> Self {
+		let file = Arc::new(RemoteFile {
+			file: file.root,
+			parent: file.parent.into(),
+			size: response.size,
+			favorited: false,
+			region: self.remote_file_info.region,
+			bucket: self.remote_file_info.bucket,
+			chunks: response.chunks,
+			hash: Some(self.hash),
+		});
 		let futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>> = FuturesUnordered::new();
 
 		let temp_file = file.clone();
 		futures.push(Box::pin(async move {
-			client
+			self.client
 				.update_item_with_maybe_connected_parent(temp_file.as_ref())
 				.await?;
 			Ok(())
 		}) as BoxFuture<'a, Result<(), Error>>);
 		let temp_file = file.clone();
 		futures.push(Box::pin(async move {
-			client
+			self.client
 				.update_search_hashes_for_item(temp_file.as_ref())
 				.await?;
 			Ok(())
 		}) as BoxFuture<'a, Result<(), Error>>);
 
-		Self {
+		FileWriterFinalizingState {
 			file,
+			client: self.client,
 			futures,
-			client,
+			drive_lock: self.drive_lock,
 		}
 	}
+}
 
+struct FileWriterFinalizingState<'a> {
+	drive_lock: Arc<ResourceLock>,
+	file: Arc<RemoteFile>,
+	futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>>,
+	client: &'a Client,
+}
+
+impl<'a> FileWriterFinalizingState<'a> {
 	fn poll_close(
 		&mut self,
 		cx: &mut std::task::Context<'_>,
@@ -360,6 +473,7 @@ struct FileWriterCompleteState {
 #[allow(clippy::large_enum_variant)]
 enum FileWriterState<'a> {
 	Uploading(FileWriterUploadingState<'a>),
+	WaitingForDriveLock(FileWriterWaitingForDriveLockState<'a>),
 	Completing(FileWriterCompletingState<'a>),
 	Finalizing(FileWriterFinalizingState<'a>),
 	Complete(FileWriterCompleteState),
@@ -371,6 +485,7 @@ impl<'a> FileWriterState<'a> {
 		file: Arc<BaseFile>,
 		client: &'a Client,
 		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		size: Option<u64>,
 	) -> Self {
 		FileWriterState::Uploading(FileWriterUploadingState {
 			file,
@@ -382,8 +497,10 @@ impl<'a> FileWriterState<'a> {
 			hasher: sha2::Sha512::new(),
 			remote_file_info: Arc::new(OnceLock::new()),
 			upload_key: Arc::new(crypto::shared::generate_random_base64_values(32)),
-			max_threads: DEFAULT_MAX_UPLOAD_THREADS_PER_FILE,
 			client,
+			alloc_future: None,
+			allocated_chunks: Vec::new(),
+			size,
 		})
 	}
 
@@ -401,9 +518,10 @@ impl<'a> FileWriter<'a> {
 		file: Arc<BaseFile>,
 		client: &'a Client,
 		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		size: Option<u64>,
 	) -> Self {
 		Self {
-			state: FileWriterState::new(file, client, callback),
+			state: FileWriterState::new(file, client, callback, size),
 		}
 	}
 
@@ -423,7 +541,8 @@ impl AsyncWrite for FileWriter<'_> {
 	) -> std::task::Poll<std::io::Result<usize>> {
 		match &mut self.state {
 			FileWriterState::Uploading(uploading) => uploading.poll_write(cx, buf),
-			FileWriterState::Completing(_)
+			FileWriterState::WaitingForDriveLock(_)
+			| FileWriterState::Completing(_)
 			| FileWriterState::Finalizing(_)
 			| FileWriterState::Complete(_) => {
 				// we are in the completing state, we can't write anymore
@@ -453,12 +572,14 @@ impl AsyncWrite for FileWriter<'_> {
 			FileWriterState::Uploading(mut uploading) => {
 				// we are in the uploading state, we need to poll the futures
 				match uploading.poll_close(cx) {
-					std::task::Poll::Ready(Ok(())) => match uploading.into_completing_state() {
-						Ok(completing) => FileWriterState::Completing(completing),
-						Err(e) => {
-							return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+					std::task::Poll::Ready(Ok(())) => {
+						match uploading.into_waiting_for_drive_lock_state() {
+							Ok(waiting) => FileWriterState::WaitingForDriveLock(waiting),
+							Err(e) => {
+								return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+							}
 						}
-					},
+					}
 					std::task::Poll::Ready(Err(e)) => {
 						return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 					}
@@ -469,6 +590,26 @@ impl AsyncWrite for FileWriter<'_> {
 				}
 			}
 			state => state,
+		};
+
+		let state = if let FileWriterState::WaitingForDriveLock(mut waiting) = state {
+			match waiting.poll_close(cx) {
+				std::task::Poll::Ready(Ok(drive_lock)) => {
+					match waiting.into_completing_state(drive_lock) {
+						Ok(completing) => FileWriterState::Completing(completing),
+						Err(e) => return std::task::Poll::Ready(Err(std::io::Error::other(e))),
+					}
+				}
+				std::task::Poll::Ready(Err(e)) => {
+					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+				}
+				std::task::Poll::Pending => {
+					self.state = FileWriterState::WaitingForDriveLock(waiting);
+					return std::task::Poll::Pending;
+				}
+			}
+		} else {
+			state
 		};
 
 		let state = match state {
@@ -509,7 +650,9 @@ impl AsyncWrite for FileWriter<'_> {
 				std::task::Poll::Ready(Ok(()))
 			}
 			FileWriterState::Error(e) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
-			FileWriterState::Uploading(_) | FileWriterState::Completing(_) => {
+			FileWriterState::Uploading(_)
+			| FileWriterState::Completing(_)
+			| FileWriterState::WaitingForDriveLock(_) => {
 				unreachable!("Should be handled by the first part of this function")
 			}
 		}

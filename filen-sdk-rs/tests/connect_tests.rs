@@ -263,7 +263,7 @@ async fn contact_interactions() {
 async fn set_up_contact<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
-) -> (ResourceLock<'a>, ResourceLock<'a>) {
+) -> (ResourceLock, ResourceLock) {
 	let lock1 = client
 		.acquire_lock_with_default("test:contact")
 		.await

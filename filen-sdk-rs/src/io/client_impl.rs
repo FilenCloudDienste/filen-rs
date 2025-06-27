@@ -47,11 +47,12 @@ impl Client {
 		base_file: Arc<BaseFile>,
 		reader: &mut T,
 		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		known_size: Option<u64>,
 	) -> Result<RemoteFile, crate::error::Error>
 	where
 		T: 'a + AsyncReadExt + Unpin,
 	{
-		let mut writer = self.inner_get_file_writer(base_file, callback)?;
+		let mut writer = self.inner_get_file_writer(base_file, callback, known_size)?;
 		let mut buffer = [0u8; IO_BUFFER_SIZE];
 		loop {
 			let bytes_read = reader.read(&mut buffer).await?;
@@ -71,6 +72,12 @@ impl Client {
 		data: &[u8],
 	) -> Result<RemoteFile, crate::error::Error> {
 		let mut reader = data;
-		self.upload_file_from_reader(file, &mut reader, None).await
+		self.upload_file_from_reader(
+			file,
+			&mut reader,
+			None,
+			Some(data.len().try_into().unwrap()),
+		)
+		.await
 	}
 }

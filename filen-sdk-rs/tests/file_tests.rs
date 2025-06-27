@@ -18,7 +18,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
 
 	let contents = contents.as_ref();
-	let resources = test_utils::RESOURCES.get_resources().await;
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
@@ -398,6 +398,7 @@ async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, content
 			Some(Arc::new(|bytes_read: u64| {
 				sender.send(bytes_read).unwrap();
 			})),
+			None,
 		)
 		.await
 		.unwrap();

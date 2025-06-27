@@ -77,9 +77,34 @@ impl AuthorizedClient for &AuthClient {
 	fn get_api_key(&self) -> &APIKey {
 		&self.api_key
 	}
+
+	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit> {
+		None
+	}
 }
 
-pub trait UnauthorizedClient {
+impl UnauthorizedClient for crate::auth::Client {
+	fn get_client(&self) -> &reqwest::Client {
+		&self.client().client
+	}
+}
+
+impl AuthorizedClient for crate::auth::Client {
+	fn get_api_key(&self) -> &APIKey {
+		self.client().get_api_key()
+	}
+
+	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit> {
+		Some(
+			self.api_semaphore
+				.acquire()
+				.await
+				.expect("Semaphore acquisition failed"),
+		)
+	}
+}
+
+pub(crate) trait UnauthorizedClient {
 	fn get_client(&self) -> &reqwest::Client;
 
 	fn get_request(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
@@ -91,7 +116,7 @@ pub trait UnauthorizedClient {
 	}
 }
 
-pub trait AuthorizedClient: UnauthorizedClient {
+pub(crate) trait AuthorizedClient: UnauthorizedClient {
 	fn get_api_key(&self) -> &APIKey;
 
 	fn get_auth_request(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
@@ -103,4 +128,6 @@ pub trait AuthorizedClient: UnauthorizedClient {
 		self.post_request(url)
 			.bearer_auth(self.get_api_key().0.as_str())
 	}
+
+	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit>;
 }

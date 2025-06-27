@@ -3,8 +3,13 @@ name = "filen-sdk-rs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+tokio = ["tokio/rt"]
+
 [dependencies]
 reqwest = { version = "0.12.15", features = ["json", "stream", "rustls-tls"], default-features = false}
+
 
 filen-types = { path = "../filen-types" }
 rand = "0.9.0"
@@ -35,6 +40,10 @@ md4 = "0.10.2"
 md-5 = "0.10.6"
 cbc = "0.1.2"
 image = {version = "0.25.6", default-features = false, features = ["png", "jpeg", "gif", "tiff", "webp", "qoi", "avif"] }
+tokio = { version = "1.44.2", default-features = false, features = ["sync"] }
+bytes = "1.10.1"
+log = "0.4.27"
+
 
 
 [dev-dependencies]

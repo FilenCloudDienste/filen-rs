@@ -22,6 +22,6 @@ async fn test_stringification() {
 			stringified.auth_version
 		)
 		.unwrap(),
-		*client
+		**client
 	)
 }

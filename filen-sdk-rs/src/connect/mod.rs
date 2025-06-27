@@ -15,7 +15,7 @@ use filen_types::{
 use fs::{SharedDirectory, SharedFile};
 use futures::{
 	future::BoxFuture,
-	stream::{self, FuturesUnordered, StreamExt},
+	stream::{FuturesUnordered, StreamExt},
 };
 use rsa::RsaPublicKey;
 use uuid::Uuid;
@@ -23,7 +23,6 @@ use uuid::Uuid;
 use crate::{
 	api,
 	auth::{Client, MetaKey},
-	consts::MAX_SMALL_PARALLEL_REQUESTS,
 	crypto::{error::ConversionError, shared::MetaCrypter},
 	error::Error,
 	fs::{
@@ -308,7 +307,7 @@ impl Client {
 			},
 		)?;
 
-		let futures = FuturesUnordered::new();
+		let mut futures = FuturesUnordered::new();
 		for link in linked.links {
 			futures.push(Box::pin(async move {
 				let crypter = self.decrypt_meta_key(&link.link_key)?;
@@ -329,11 +328,7 @@ impl Client {
 				>);
 		}
 
-		let mut stream = futures
-			.map(|v| async move { v }) // type coercion
-			.buffer_unordered(MAX_SMALL_PARALLEL_REQUESTS);
-
-		while let Some(result) = stream.next().await {
+		while let Some(result) = futures.next().await {
 			match result {
 				Ok(_) => continue,
 				Err(e) => return Err(e),
@@ -371,7 +366,7 @@ impl Client {
 			}
 		)?;
 
-		let futures = FuturesUnordered::new();
+		let mut futures = FuturesUnordered::new();
 
 		for link in linked.links {
 			let link = Arc::new(link);
@@ -396,11 +391,7 @@ impl Client {
 			}
 		}
 
-		let mut stream = futures
-			.map(|v| async move { v }) // type coercion
-			.buffer_unordered(MAX_SMALL_PARALLEL_REQUESTS);
-
-		while let Some(result) = stream.next().await {
+		while let Some(result) = futures.next().await {
 			match result {
 				Ok(_) => continue,
 				Err(e) => return Err(e),
@@ -442,59 +433,49 @@ impl Client {
 			link_key: Cow::Owned(self.encrypt_meta_key(&public_link.link_key)?),
 		};
 
+		let mut futures = FuturesUnordered::new();
+
 		// link main dir
-		let future = {
-			let link = &link;
-			let key = &public_link.link_key;
-			Box::pin(async move {
-				api::v3::dir::link::add::post(
-					self.client(),
-					&api::v3::dir::link::add::Request {
-						uuid: dir.uuid(),
-						parent: None,
-						link_uuid: public_link.link_uuid,
-						r#type: ObjectType::Dir,
-						metadata: Cow::Borrowed(&dir.get_encrypted_meta(key)?),
-						key: Cow::Borrowed(&link.link_key),
-						expiration: PublicLinkExpiration::Never,
-					},
-				)
-				.await
-			}) as Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send>>
-		};
+		let link = &link;
+		let key = &public_link.link_key;
+		futures.push(Box::pin(async move {
+			api::v3::dir::link::add::post(
+				self.client(),
+				&api::v3::dir::link::add::Request {
+					uuid: dir.uuid(),
+					parent: None,
+					link_uuid: public_link.link_uuid,
+					r#type: ObjectType::Dir,
+					metadata: Cow::Borrowed(&dir.get_encrypted_meta(key)?),
+					key: Cow::Borrowed(&link.link_key),
+					expiration: PublicLinkExpiration::Never,
+				},
+			)
+			.await
+		}) as BoxFuture<'_, Result<(), Error>>);
 
 		// link descendants
-		let mut stream = stream::iter(
-			std::iter::once(future).chain(
-				dirs.into_iter()
-					.map(|dir| {
-						let link = &link;
-						let key = &public_link.link_key;
-						Box::pin(
-							async move { self.add_item_to_directory_link(&dir, link, key).await },
-						)
-							as Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send>>
-					})
-					.chain(files.into_iter().map(|f| {
-						let link = &link;
-						let key = &public_link.link_key;
-						Box::pin(
-							async move { self.add_item_to_directory_link(&f, link, key).await },
-						)
-							as Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send>>
-					})),
-			),
-		)
-		.buffer_unordered(MAX_SMALL_PARALLEL_REQUESTS);
+		for dir in dirs {
+			let key = &public_link.link_key;
+			futures.push(Box::pin(
+				async move { self.add_item_to_directory_link(&dir, link, key).await },
+			) as BoxFuture<'_, Result<(), Error>>);
+		}
+		for file in files {
+			let key = &public_link.link_key;
+			futures.push(Box::pin(
+				async move { self.add_item_to_directory_link(&file, link, key).await },
+			) as BoxFuture<'_, Result<(), Error>>);
+		}
 
-		while let Some(result) = stream.next().await {
+		while let Some(result) = futures.next().await {
 			match result {
 				Ok(_) => continue,
 				Err(e) => return Err(e),
 			}
 		}
 
-		std::mem::drop(stream);
+		std::mem::drop(futures);
 		Ok(public_link)
 	}
 
@@ -756,7 +737,7 @@ impl Client {
 
 	pub async fn share_dir(&self, dir: &RemoteDirectory, user: &User) -> Result<(), Error> {
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
-		let futures = FuturesUnordered::new();
+		let mut futures = FuturesUnordered::new();
 
 		futures.push(Box::pin(async move {
 			api::v3::item::share::post(
@@ -788,11 +769,7 @@ impl Client {
 					as BoxFuture<'_, Result<(), Error>>,
 			);
 		}
-
-		let mut stream = futures
-			.map(|v| async move { v }) // type coercion
-			.buffer_unordered(MAX_SMALL_PARALLEL_REQUESTS);
-		while let Some(result) = stream.next().await {
+		while let Some(result) = futures.next().await {
 			match result {
 				Ok(_) => continue,
 				Err(e) => return Err(e),

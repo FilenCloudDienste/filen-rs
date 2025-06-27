@@ -209,10 +209,12 @@ impl FilenMobileCacheState {
 			.modified(metadata_modified(&meta))
 			.build();
 
+		let file_size = raw_meta_size(&meta);
+
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
 		let reader_callback = if let Some(callback) = callback {
 			tokio::task::spawn(async move {
-				update_task(receiver, raw_meta_size(&meta), callback).await;
+				update_task(receiver, file_size, callback).await;
 			});
 			Some(Arc::new(move |bytes_written: u64| {
 				let _ = sender.send(bytes_written);
@@ -225,7 +227,7 @@ impl FilenMobileCacheState {
 
 		let remote_file = self
 			.client
-			.upload_file_from_reader(file.into(), &mut os_file, reader_callback)
+			.upload_file_from_reader(file.into(), &mut os_file, reader_callback, Some(file_size))
 			.await
 			.map_err(|e| io::Error::other(format!("Failed to upload file: {}", e)))?;
 

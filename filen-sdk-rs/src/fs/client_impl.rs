@@ -51,6 +51,10 @@ impl Client {
 
 		let mut path_iter = path.path_iter().peekable();
 		let mut last_rest_of_path = path;
+		let _lock = match self.lock_drive().await {
+			Ok(lock) => lock,
+			Err(e) => return Err((e, (dirs, curr_dir.into()), path)),
+		};
 		while let Some((component, rest_of_path)) = path_iter.next() {
 			match self.find_item_in_dir(&curr_dir, component).await {
 				Ok(Some(FSObject::Dir(dir))) => {

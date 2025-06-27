@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use log::debug;
 
 use crate::{
 	auth::http::AuthorizedClient, consts::random_egest_url, error::Error, fs::file::traits::File,
@@ -19,6 +20,7 @@ pub(crate) async fn download_file_chunk(
 		chunk_idx
 	);
 
+	let _permit = client.get_semaphore_permit().await;
 	let response = client.get_auth_request(url).send().await?;
 
 	let mut bytes_stream = response.bytes_stream();
@@ -35,6 +37,12 @@ pub(crate) async fn download_file_chunk(
 		out_chunk.extend_from_slice(&chunk);
 		i += chunk.len();
 	}
+
+	debug!(
+		"Downloaded chunk {chunk_idx} of file {}, size: {}",
+		file.uuid(),
+		out_chunk.len()
+	);
 
 	Ok(())
 }

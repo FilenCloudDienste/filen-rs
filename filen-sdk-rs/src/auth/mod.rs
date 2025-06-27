@@ -2,6 +2,7 @@ use std::{
 	borrow::Cow,
 	fmt::{Debug, Display},
 	str::FromStr,
+	sync::{Arc, Weak},
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -13,6 +14,7 @@ use filen_types::{
 use http::{AuthClient, UnauthClient};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
@@ -28,6 +30,7 @@ use crate::{
 	},
 	error::Error,
 	fs::{HasUUID, dir::RootDirectory},
+	sync::lock::ResourceLock,
 };
 
 pub mod http;
@@ -125,7 +128,7 @@ impl MetaCrypter for AuthInfo {
 	}
 }
 
-#[derive(Clone, PartialEq, Eq)]
+// #[derive(Clone)]
 pub struct Client {
 	email: String,
 
@@ -139,8 +142,28 @@ pub struct Client {
 	private_key: RsaPrivateKey,
 	pub(crate) hmac_key: HMACKey,
 
-	http_client: AuthClient,
+	http_client: Arc<AuthClient>,
+
+	pub(crate) drive_lock: Mutex<Option<Weak<ResourceLock>>>,
+	pub(crate) api_semaphore: tokio::sync::Semaphore,
+	pub(crate) memory_semaphore: tokio::sync::Semaphore,
 }
+
+impl PartialEq for Client {
+	fn eq(&self, other: &Self) -> bool {
+		self.email == other.email
+			&& self.root_dir == other.root_dir
+			&& self.auth_info == other.auth_info
+			&& self.file_encryption_version == other.file_encryption_version
+			&& self.meta_encryption_version == other.meta_encryption_version
+			&& self.public_key == other.public_key
+			&& self.private_key == other.private_key
+			&& self.hmac_key == other.hmac_key
+			&& self.http_client.api_key == other.http_client.api_key
+	}
+}
+
+impl Eq for Client {}
 
 pub struct StringifiedClient {
 	pub email: String,
@@ -154,6 +177,10 @@ pub struct StringifiedClient {
 impl Client {
 	pub fn client(&self) -> &AuthClient {
 		&self.http_client
+	}
+
+	pub fn arc_client(&self) -> Arc<AuthClient> {
+		self.http_client.clone()
 	}
 
 	pub fn crypter(&self) -> &impl MetaCrypter {
@@ -298,7 +325,12 @@ impl Client {
 			public_key,
 			private_key,
 			hmac_key: hmac,
-			http_client: client,
+			http_client: Arc::new(client),
+			drive_lock: Mutex::new(None),
+			api_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
+			memory_semaphore: tokio::sync::Semaphore::new(
+				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
+			),
 		})
 	}
 
@@ -331,7 +363,12 @@ impl Client {
 			public_key: RsaPublicKey::from(&private_key),
 			hmac_key: HMACKey::new(&private_key),
 			private_key,
-			http_client: AuthClient::new(APIKey(api_key)),
+			http_client: Arc::new(AuthClient::new(APIKey(api_key))),
+			drive_lock: Mutex::new(None),
+			api_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
+			memory_semaphore: tokio::sync::Semaphore::new(
+				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
+			),
 		})
 	}
 

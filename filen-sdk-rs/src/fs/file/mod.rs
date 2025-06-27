@@ -13,6 +13,7 @@ use crate::{auth::Client, crypto::file::FileKey, fs::dir::HasUUIDContents};
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
+pub(crate) mod chunk;
 pub mod client_impl;
 pub mod enums;
 pub mod meta;

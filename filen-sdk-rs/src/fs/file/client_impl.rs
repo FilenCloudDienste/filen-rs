@@ -22,6 +22,7 @@ use super::{
 
 impl Client {
 	pub async fn trash_file(&self, file: &RemoteFile) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::file::trash::post(
 			self.client(),
 			&api::v3::file::trash::Request { uuid: file.uuid() },
@@ -30,6 +31,7 @@ impl Client {
 	}
 
 	pub async fn restore_file(&self, file: &RemoteFile) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::file::restore::post(
 			self.client(),
 			&api::v3::file::restore::Request { uuid: file.uuid() },
@@ -38,6 +40,7 @@ impl Client {
 	}
 
 	pub async fn delete_file_permanently(&self, file: RemoteFile) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::file::delete::permanent::post(
 			self.client(),
 			&api::v3::file::delete::permanent::Request { uuid: file.uuid() },
@@ -50,6 +53,7 @@ impl Client {
 		file: &mut RemoteFile,
 		new_parent: &impl HasUUIDContents,
 	) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::file::r#move::post(
 			self.client(),
 			&api::v3::file::r#move::Request {
@@ -67,6 +71,7 @@ impl Client {
 		file: &mut RemoteFile,
 		new_meta: FileMeta<'_>,
 	) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::file::metadata::post(
 			self.client(),
 			&api::v3::file::metadata::Request {
@@ -135,6 +140,7 @@ impl Client {
 		&'a self,
 		file: Arc<BaseFile>,
 		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		size: Option<u64>,
 	) -> Result<FileWriter<'a>, Error> {
 		if file.root.name.is_empty() {
 			let name = match Arc::try_unwrap(file).map(|f| f.root.name) {
@@ -143,12 +149,12 @@ impl Client {
 			};
 			Err(Error::InvalidName(name))
 		} else {
-			Ok(FileWriter::new(file, self, callback))
+			Ok(FileWriter::new(file, self, callback, size))
 		}
 	}
 
 	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> Result<FileWriter<'_>, Error> {
-		self.inner_get_file_writer(file.into(), None)
+		self.inner_get_file_writer(file.into(), None, None)
 	}
 
 	pub fn get_file_writer_with_callback<'a>(
@@ -156,6 +162,6 @@ impl Client {
 		file: impl Into<Arc<BaseFile>>,
 		callback: Arc<dyn Fn(u64) + Send + Sync + 'a>,
 	) -> Result<FileWriter<'a>, Error> {
-		self.inner_get_file_writer(file.into(), Some(callback))
+		self.inner_get_file_writer(file.into(), Some(callback), None)
 	}
 }

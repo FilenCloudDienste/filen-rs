@@ -95,6 +95,7 @@ where
 	T: serde::Serialize,
 	U: serde::de::DeserializeOwned + std::fmt::Debug,
 {
+	let _permit = client.get_semaphore_permit().await;
 	handle_request(
 		client
 			.post_auth_request(gateway_url(endpoint))
@@ -120,6 +121,7 @@ where
 		endpoint,
 		serde_json::to_string(request)?
 	);
+	let _permit = client.get_semaphore_permit().await;
 	handle_request_debug(
 		client
 			.post_auth_request(gateway_url(endpoint))
@@ -135,6 +137,7 @@ pub(crate) async fn post_auth_request_no_body_empty(
 	client: impl AuthorizedClient,
 	endpoint: &'static str,
 ) -> Result<(), Error> {
+	let _permit = client.get_semaphore_permit().await;
 	handle_request::<()>(client.post_auth_request(gateway_url(endpoint)), endpoint)
 		.await?
 		.ignore_data()
@@ -149,6 +152,7 @@ pub(crate) async fn post_auth_request_empty<T>(
 where
 	T: serde::Serialize,
 {
+	let _permit = client.get_semaphore_permit().await;
 	handle_request::<()>(
 		client
 			.post_auth_request(gateway_url(endpoint))
@@ -173,6 +177,7 @@ where
 		endpoint,
 		serde_json::to_string(request)?
 	);
+	let _permit = client.get_semaphore_permit().await;
 	handle_request_debug::<()>(
 		client
 			.post_auth_request(gateway_url(endpoint))
@@ -191,6 +196,7 @@ pub(crate) async fn get_auth_request<T>(
 where
 	T: serde::de::DeserializeOwned + std::fmt::Debug,
 {
+	let _permit = client.get_semaphore_permit().await;
 	handle_request(client.get_auth_request(gateway_url(endpoint)), endpoint)
 		.await?
 		.into_data()
@@ -204,6 +210,7 @@ pub(crate) async fn get_auth_request_debug<T>(
 where
 	T: serde::de::DeserializeOwned + std::fmt::Debug,
 {
+	let _permit = client.get_semaphore_permit().await;
 	handle_request_debug(client.get_auth_request(gateway_url(endpoint)), endpoint)
 		.await?
 		.into_data()

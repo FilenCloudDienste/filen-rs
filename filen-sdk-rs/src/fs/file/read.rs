@@ -1,18 +1,19 @@
-use std::io::{Cursor, Read};
+use std::{
+	io::{Cursor, Read},
+	num::NonZeroU32,
+};
 
 use futures::{StreamExt, future::BoxFuture, stream::FuturesOrdered};
 
 use crate::{
 	api,
 	auth::Client,
-	consts::{
-		CHUNK_SIZE, CHUNK_SIZE_U64, DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE, FILE_CHUNK_SIZE_EXTRA,
-	},
+	consts::{FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
 	error::Error,
 };
 
-use super::traits::File;
+use super::{chunk::Chunk, traits::File};
 
 pub(super) struct FileReader<'a> {
 	file: &'a dyn File,
@@ -20,8 +21,9 @@ pub(super) struct FileReader<'a> {
 	index: u64,
 	limit: u64,
 	next_chunk_idx: u64,
-	curr_chunk: Option<Cursor<Vec<u8>>>,
-	futures: FuturesOrdered<BoxFuture<'a, Result<Vec<u8>, Error>>>,
+	curr_chunk: Option<Cursor<Chunk<'a>>>,
+	futures: FuturesOrdered<BoxFuture<'a, Result<Chunk<'a>, Error>>>,
+	allocate_chunk_future: Option<BoxFuture<'a, Chunk<'a>>>,
 }
 
 impl<'a> FileReader<'a> {
@@ -35,44 +37,50 @@ impl<'a> FileReader<'a> {
 			curr_chunk: None,
 			futures: FuturesOrdered::new(),
 			next_chunk_idx: 0,
+			allocate_chunk_future: None,
 		};
 
-		let num_threads: u64 = Ord::min(DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE, new.file.chunks());
-		if num_threads == 0 {
-			// if we have no threads, we can just return
-			return new;
-		}
-		// this should never exceed u32 as DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE should be relatively low
-		let num_threads: usize = num_threads.try_into().unwrap();
-
-		// allocate memory
-		let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(num_threads);
-		for _ in 0..(num_threads - 1) {
-			let chunk = Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA);
-			chunks.push(chunk);
-		}
-		if DEFAULT_MAX_DOWNLOAD_THREADS_PER_FILE < new.file.chunks() || size % CHUNK_SIZE_U64 == 0 {
-			// if we have more chunks than threads, we need to add a full chunk for the last thread
-			let chunk = Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA);
-			chunks.push(chunk);
-		} else {
-			// if we have more threads than chunks, we add a smaller chunk for the last thread
-			let final_chunk_size: usize = (size % CHUNK_SIZE_U64).try_into().unwrap();
-			chunks.push(Vec::with_capacity(final_chunk_size + FILE_CHUNK_SIZE_EXTRA));
-		}
-
-		// prefetch chunks
-		for chunk in chunks.into_iter() {
+		// allocate memory and prefetch chunks
+		while let Some(chunk) = new.try_allocate_next_chunk() {
 			new.push_fetch_next_chunk(chunk);
 		}
+		new.allocate_chunk_future = new.allocate_next_chunk();
 
 		new
+	}
+
+	fn next_chunk_size(&self) -> Option<NonZeroU32> {
+		if self.file.chunks() == 0 {
+			return None;
+		}
+		if self.next_chunk_idx < self.file.chunks() - 1 {
+			Some(FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()))
+		} else if self.next_chunk_idx == self.file.chunks() - 1 {
+			let size: u64 = self.file.size()
+				- (self.next_chunk_idx * u64::from(FILE_CHUNK_SIZE.get()))
+				+ u64::from(FILE_CHUNK_SIZE_EXTRA.get());
+			let size: u32 = size.try_into().unwrap();
+			NonZeroU32::new(size)
+		} else {
+			None
+		}
+	}
+
+	fn try_allocate_next_chunk(&self) -> Option<Chunk<'a>> {
+		let chunk_size = self.next_chunk_size()?;
+
+		Chunk::try_acquire(chunk_size, self.client)
+	}
+
+	fn allocate_next_chunk(&self) -> Option<BoxFuture<'a, Chunk<'a>>> {
+		let chunk_size = self.next_chunk_size()?;
+		Some(Box::pin(Chunk::acquire(chunk_size, self.client)) as BoxFuture<'a, Chunk<'a>>)
 	}
 
 	/// Pushes the future to fetch the next chunk.
 	///
 	/// Requires that `out_data` have the necessary capacity to store the entire chunk returned from the server
-	fn push_fetch_next_chunk(&mut self, mut out_data: Vec<u8>) {
+	fn push_fetch_next_chunk(&mut self, mut out_data: Chunk<'a>) {
 		if self.file.chunks() <= self.next_chunk_idx {
 			return;
 		}
@@ -81,9 +89,9 @@ impl<'a> FileReader<'a> {
 		let client = self.client;
 		let file = self.file;
 		self.futures.push_back(Box::pin(async move {
-			api::download::download_file_chunk(client.client(), file, chunk_idx, &mut out_data)
+			api::download::download_file_chunk(client.client(), file, chunk_idx, out_data.as_mut())
 				.await?;
-			file.key().decrypt_data(&mut out_data)?;
+			file.key().decrypt_data(out_data.as_mut())?;
 			Ok(out_data)
 		}));
 	}
@@ -98,7 +106,8 @@ impl<'a> FileReader<'a> {
 		match self.curr_chunk.take() {
 			Some(mut cursor) => {
 				let read = cursor.read(buf)?;
-				if (TryInto::<usize>::try_into(cursor.position()).unwrap()) < cursor.get_ref().len()
+				if (TryInto::<usize>::try_into(cursor.position()).unwrap())
+					< cursor.get_ref().as_ref().len()
 				{
 					// didn't read the whole chunk, put it back and return
 					self.curr_chunk = Some(cursor);
@@ -119,7 +128,28 @@ impl futures::io::AsyncRead for FileReader<'_> {
 		cx: &mut std::task::Context<'_>,
 		buf: &mut [u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
-		// first see if we have a stored chunk
+		// first see if our allocation future is ready
+		let mut should_pend = false;
+		if let Some(mut fut) = self.allocate_chunk_future.take() {
+			match fut.as_mut().poll(cx) {
+				std::task::Poll::Ready(chunk) => {
+					// we have a new chunk, set it to curr_chunk
+					self.push_fetch_next_chunk(chunk);
+					self.allocate_chunk_future = self.allocate_next_chunk();
+				}
+				std::task::Poll::Pending => {
+					// allocation is still pending, we can't read anything yet
+					if self.next_chunk_size().is_some() {
+						// we have more chunks to allocate, so we put the future back
+						self.allocate_chunk_future = Some(fut);
+						should_pend = true;
+					}
+					// if we don't have more chunks to allocate, we can drop the future
+				}
+			}
+		}
+
+		// then see if we have a stored chunk
 		let mut read = self.read_next_chunk(buf)?;
 		if read >= buf.len() {
 			// we've filled the buffer
@@ -142,6 +172,11 @@ impl futures::io::AsyncRead for FileReader<'_> {
 					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 				}
 				std::task::Poll::Ready(None) => {
+					if should_pend && read == 0 {
+						// if we were waiting for allocation and we haven't read anything,
+						// we need to pend
+						return std::task::Poll::Pending;
+					}
 					return std::task::Poll::Ready(Ok(read));
 				}
 				std::task::Poll::Pending => {
