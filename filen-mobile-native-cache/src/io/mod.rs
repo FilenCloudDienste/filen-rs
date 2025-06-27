@@ -8,9 +8,12 @@ use std::{
 
 use crate::{FilenMobileCacheState, traits::ProgressCallback};
 use chrono::{DateTime, Utc};
-use filen_sdk_rs::fs::{
-	HasUUID,
-	file::{FileBuilder, RemoteFile, traits::HasFileInfo},
+use filen_sdk_rs::{
+	fs::{
+		HasUUID,
+		file::{FileBuilder, RemoteFile, traits::HasFileInfo},
+	},
+	io::FilenMetaExt,
 };
 use filen_types::crypto::Sha512Hash;
 use sha2::Digest;
@@ -21,49 +24,13 @@ use tokio_util::compat::{
 use uuid::Uuid;
 
 #[cfg(windows)]
-use std::os::windows::fs::{FileTimesExt, MetadataExt};
-#[cfg(windows)]
-fn metadata_size(metadata: &std::fs::Metadata) -> u64 {
-	metadata.file_size().max(BUFFER_SIZE)
-}
-#[cfg(windows)]
-pub(crate) fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
-	metadata.file_size()
-}
-#[cfg(windows)]
-fn metadata_created(metadata: &std::fs::Metadata) -> SystemTime {
-	metadata.created().unwrap_or_else(|_| SystemTime::now())
-}
-#[cfg(windows)]
 fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
 	FileTimes::new().set_created(created).set_modified(modified)
 }
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
-#[cfg(unix)]
-fn metadata_size(metadata: &std::fs::Metadata) -> u64 {
-	metadata.size().max(BUFFER_SIZE)
-}
-#[cfg(unix)]
-pub(crate) fn raw_meta_size(metadata: &std::fs::Metadata) -> u64 {
-	metadata.size()
-}
-#[cfg(unix)]
-fn metadata_created(metadata: &std::fs::Metadata) -> SystemTime {
-	metadata.modified().unwrap_or_else(|_| SystemTime::now())
-}
-#[cfg(unix)]
 fn get_file_times(_created: SystemTime, modified: SystemTime) -> FileTimes {
 	FileTimes::new().set_modified(modified)
-}
-
-fn metadata_modified(metadata: &std::fs::Metadata) -> DateTime<Utc> {
-	metadata
-		.modified()
-		.map(DateTime::<Utc>::from)
-		.unwrap_or_else(|_| Utc::now())
 }
 
 pub const CACHE_DIR: &str = "cache";
@@ -182,7 +149,7 @@ impl FilenMobileCacheState {
 		let file_size = os_file
 			.metadata()
 			.await
-			.map(|m| metadata_size(&m))
+			.map(|m| FilenMetaExt::size(&m).min(BUFFER_SIZE))
 			.unwrap_or(BUFFER_SIZE);
 		let mut buffer = vec![0; (file_size as usize).min(BUFFER_SIZE as usize)];
 		let mut hasher = sha2::Sha512::new();
@@ -205,11 +172,11 @@ impl FilenMobileCacheState {
 	) -> Result<(RemoteFile, tokio::fs::File), io::Error> {
 		let meta = os_file.metadata().await?;
 		let file = file_builder
-			.created(metadata_created(&meta).into())
-			.modified(metadata_modified(&meta))
+			.created(FilenMetaExt::created(&meta).into())
+			.modified(FilenMetaExt::modified(&meta).into())
 			.build();
 
-		let file_size = raw_meta_size(&meta);
+		let file_size = FilenMetaExt::size(&meta);
 
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
 		let reader_callback = if let Some(callback) = callback {

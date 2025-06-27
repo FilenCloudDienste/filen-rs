@@ -1,6 +1,9 @@
 use std::{path::PathBuf, sync::Arc};
 
-use filen_sdk_rs::fs::{HasUUID, file::RemoteFile};
+use filen_sdk_rs::{
+	fs::{HasUUID, file::RemoteFile},
+	io::FilenMetaExt,
+};
 use futures::{StreamExt, stream::FuturesUnordered};
 use image::ImageError;
 use log::debug;
@@ -8,7 +11,6 @@ use log::debug;
 use crate::{
 	CacheError, FilenMobileCacheState,
 	ffi::FfiPathWithRoot,
-	io::raw_meta_size,
 	sql::{self, DBObject},
 };
 
@@ -32,7 +34,7 @@ impl FilenMobileCacheState {
 			.open(&thumbnail_path)
 			.await?;
 		debug!("made thumbnail path: {}", thumbnail_path.display());
-		if raw_meta_size(&thumbnail_file.metadata().await?) != 0 {
+		if FilenMetaExt::size(&thumbnail_file.metadata().await?) != 0 {
 			return Ok(Some(thumbnail_path));
 		}
 		let image_file = match tokio::fs::File::open(&file_path).await {
