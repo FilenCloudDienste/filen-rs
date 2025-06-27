@@ -41,3 +41,4 @@ image = {version = "0.25.6", default-features = false, features = ["png", "jpeg"
 dotenv = "0.15.0"
 tokio = { version = "1.44.2", features = ["full"] }
 test-utils = {path = "../test-utils"}
+filen-sdk-rs-macros = { path = "../filen-sdk-rs-macros" }

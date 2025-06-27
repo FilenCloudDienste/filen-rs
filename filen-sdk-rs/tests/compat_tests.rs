@@ -11,6 +11,7 @@ use filen_sdk_rs::{
 		file::FileBuilder,
 	},
 };
+use filen_sdk_rs_macros::shared_test_runtime;
 use filen_types::auth::{AuthVersion, FileEncryptionVersion};
 
 use rand::TryRngCore;
@@ -97,7 +98,7 @@ fn get_name_splitter_test_value() -> NameSplitterFile {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn make_rs_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -264,7 +265,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn check_go_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -282,7 +283,7 @@ async fn check_go_compat_dir() {
 	run_compat_tests(client, compat_dir, "Go").await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn check_ts_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

@@ -285,3 +285,26 @@ pub fn create_uniffi_wrapper(_attr: TokenStream, item: TokenStream) -> TokenStre
 		.into(),
 	}
 }
+
+#[proc_macro_attribute]
+pub fn shared_test_runtime(_attr: TokenStream, input: TokenStream) -> TokenStream {
+	let input_fn = parse_macro_input!(input as ItemFn);
+
+	// Extract function components
+	let fn_vis = &input_fn.vis;
+	let fn_name = &input_fn.sig.ident;
+	let fn_generics = &input_fn.sig.generics;
+	let fn_inputs = &input_fn.sig.inputs;
+	let fn_output = &input_fn.sig.output;
+	let fn_block = &input_fn.block;
+
+	// Remove async from the signature and wrap the body
+	let result = quote! {
+		#[test]
+		#fn_vis fn #fn_name #fn_generics(#fn_inputs) #fn_output {
+			test_utils::rt().block_on(async #fn_block)
+		}
+	};
+
+	result.into()
+}

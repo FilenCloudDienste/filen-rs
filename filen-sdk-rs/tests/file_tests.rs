@@ -10,6 +10,7 @@ use filen_sdk_rs::{
 		file::traits::{HasFileInfo, HasFileMeta},
 	},
 };
+use filen_sdk_rs_macros::shared_test_runtime;
 use rand::TryRngCore;
 
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
@@ -47,7 +48,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	assert_eq!(file, got_file, "File metadata mismatch for {}", name);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_upload_download() {
 	assert_file_upload_download_equal("small.txt", 10).await;
 	assert_file_upload_download_equal("big_chunk_aligned_equal_to_threads.exe", 1024 * 1024 * 8)
@@ -62,7 +63,7 @@ async fn file_upload_download() {
 	assert_file_upload_download_equal("one_chunk", 1024 * 1024).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_search() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -108,7 +109,7 @@ async fn file_search() {
 	}));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_trash() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -153,7 +154,7 @@ async fn file_trash() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_delete_permanently() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -194,7 +195,7 @@ async fn file_delete_permanently() {
 	// assert!(reader.read_to_end(&mut buf).await.is_err());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_move() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -243,7 +244,7 @@ async fn file_move() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_update_meta() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -298,7 +299,7 @@ async fn file_update_meta() {
 	assert_eq!(found_file, file);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_exists() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -344,7 +345,7 @@ async fn file_exists() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_trash_empty() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -408,7 +409,7 @@ async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, content
 	assert_eq!(total_bytes, contents.len() as u64);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_callbacks() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

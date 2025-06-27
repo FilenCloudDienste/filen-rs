@@ -67,6 +67,16 @@ impl Resources {
 			dir: test_dir,
 		}
 	}
+
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+pub fn rt() -> &'static tokio::runtime::Runtime {
+	RUNTIME.get_or_init(|| {
+		tokio::runtime::Builder::new_multi_thread()
+			.enable_all()
+			.build()
+			.expect("Failed to create Tokio runtime")
+	})
 }
 
 pub static RESOURCES: Resources = Resources {

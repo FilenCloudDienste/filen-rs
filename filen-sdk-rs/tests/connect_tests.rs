@@ -9,9 +9,10 @@ use filen_sdk_rs::{
 	},
 	sync::lock::ResourceLock,
 };
+use filen_sdk_rs_macros::shared_test_runtime;
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn dir_public_link() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -120,7 +121,7 @@ async fn dir_public_link() {
 	assert!(!sub_files.contains(&sub_sub_file));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn file_public_link() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -173,7 +174,7 @@ async fn file_public_link() {
 	assert_eq!(linked_info.name, "new_file_name.txt");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn contact_interactions() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -301,7 +302,7 @@ async fn set_up_contact<'a>(
 	(lock1, lock2)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn share_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -399,7 +400,7 @@ async fn share_dir() {
 	assert_eq!(shared_files_in[0].get_file().name(), "new_file_name.txt");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn share_file() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

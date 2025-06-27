@@ -9,9 +9,10 @@ use filen_sdk_rs::{
 		dir::{UnsharedDirectoryType, traits::HasDirMeta},
 	},
 };
+use filen_sdk_rs_macros::shared_test_runtime;
 use tokio::time;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn create_list_trash() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -32,7 +33,7 @@ async fn create_list_trash() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn find_at_path() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -120,7 +121,7 @@ async fn find_at_path() {
 	}
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn find_or_create() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -146,7 +147,7 @@ async fn find_or_create() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn list_recursive() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -163,7 +164,7 @@ async fn list_recursive() {
 	assert!(dirs.contains(&dir_c));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn exists() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -182,7 +183,7 @@ async fn exists() {
 	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn dir_move() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -197,7 +198,7 @@ async fn dir_move() {
 	assert!(client.list_dir(&dir_b).await.unwrap().0.contains(&dir_a));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn size() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -235,7 +236,7 @@ async fn size() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn dir_search() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
@@ -280,7 +281,7 @@ async fn dir_search() {
 	}));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn dir_update_meta() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

@@ -765,6 +765,7 @@ dependencies = [
  "digest",
  "dotenv",
  "faster-hex",
+ "filen-sdk-rs-macros",
  "filen-types",
  "futures",
  "futures-timer",

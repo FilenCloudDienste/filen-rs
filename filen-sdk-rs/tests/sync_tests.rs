@@ -1,8 +1,9 @@
 use std::time;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+use filen_sdk_rs_macros::shared_test_runtime;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[shared_test_runtime]
 async fn test_acquire_lock() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
