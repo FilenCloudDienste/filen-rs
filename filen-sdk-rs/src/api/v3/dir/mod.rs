@@ -1,10 +1,12 @@
 pub(crate) mod content;
 pub(crate) mod create;
+pub(crate) mod delete;
 pub(crate) mod download;
 pub(crate) mod exists;
 pub(crate) mod link;
 pub(crate) mod metadata;
 pub(crate) mod r#move;
+pub(crate) mod restore;
 pub(crate) mod size;
 pub(crate) mod trash;
 

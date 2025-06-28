@@ -7,7 +7,7 @@ pub use types::*;
 pub mod error;
 pub use error::SQLError;
 
-use crate::{PathIteratorExt, PathValues};
+use crate::{MaybeTrashValues, PathIteratorExt, PathValues};
 
 /// Selects object in a path starting from the root UUID.
 ///
@@ -59,6 +59,18 @@ pub(crate) fn select_object_at_path(
 			Ok(Some(obj))
 		}
 		(_, false) => Ok(None),
+	}
+}
+
+pub(crate) fn select_maybe_trashed_object_at_path<'a>(
+	conn: &Connection,
+	path_values: &MaybeTrashValues<'a>,
+) -> Result<Option<DBObject>, rusqlite::Error> {
+	match path_values {
+		MaybeTrashValues::Trash(trash_values) => {
+			DBObject::select(conn, trash_values.uuid).optional()
+		}
+		MaybeTrashValues::Path(path_values) => select_object_at_path(conn, path_values),
 	}
 }
 

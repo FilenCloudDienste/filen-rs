@@ -4,6 +4,7 @@ use std::{
 	sync::{Arc, Mutex, MutexGuard},
 };
 
+use chrono::DateTime;
 use ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiObject, FfiRoot};
 use filen_sdk_rs::{
 	fs::{
@@ -13,6 +14,7 @@ use filen_sdk_rs::{
 	},
 	util::PathIteratorExt,
 };
+use filen_types::fs::ParentUuid;
 use log::debug;
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -150,6 +152,10 @@ impl FilenMobileCacheState {
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>> {
 		let path_values = path.as_path_values()?;
+		debug!(
+			"Querying directory children at path: {}",
+			path_values.full_path
+		);
 
 		let dir: DBDirObject = match sql::select_object_at_path(&self.conn(), &path_values)? {
 			Some(obj) => obj.try_into()?,
@@ -166,8 +172,8 @@ impl FilenMobileCacheState {
 
 	pub fn query_item(&self, path: &FfiPathWithRoot) -> Result<Option<FfiObject>> {
 		debug!("Querying item at path: {}", path.0);
-		let path_values = path.as_path_values()?;
-		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
+		let path_values = path.as_maybe_trash_values()?;
+		let obj = sql::select_maybe_trashed_object_at_path(&self.conn(), &path_values)?;
 		Ok(obj.map(Into::into))
 	}
 
@@ -254,6 +260,12 @@ impl FilenMobileCacheState {
 	) -> Result<String> {
 		debug!("Downloading file to path: {}", file_path.0);
 		let path_values = file_path.as_path_values()?;
+		let old_file = match sql::select_object_at_path(&self.conn(), &path_values)? {
+			Some(DBObject::File(file)) => Some(file),
+			Some(_) => None,
+			None => None,
+		};
+
 		let file = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => file,
 			UpdateItemsInPath::Partial(_, _) | UpdateItemsInPath::Complete(_) => {
@@ -264,7 +276,7 @@ impl FilenMobileCacheState {
 			}
 		};
 
-		self.inner_download_file_if_changed(file, progress_callback)
+		self.inner_download_file_if_changed(old_file, file, progress_callback)
 			.await
 	}
 
@@ -278,7 +290,8 @@ impl FilenMobileCacheState {
 		let file = DBFile::select(&self.conn(), uuid)
 			.optional()?
 			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {uuid}")))?;
-		self.inner_download_file_if_changed(file, progress_callback)
+		// unnecesssary clone but better than redownloading
+		self.inner_download_file_if_changed(Some(file.clone()), file, progress_callback)
 			.await
 	}
 
@@ -333,6 +346,74 @@ impl FilenMobileCacheState {
 		Ok(true)
 	}
 
+	pub async fn upload_new_file(
+		&self,
+		os_path: String,
+		parent_path: FfiPathWithRoot,
+		info: UploadFileInfo,
+		progress_callback: Arc<dyn ProgressCallback>,
+	) -> Result<FileWithPathResponse> {
+		let os_path = PathBuf::from(os_path);
+		let name = os_path
+			.file_name()
+			.ok_or_else(|| CacheError::remote("Invalid file name in path"))?;
+		let out_path = parent_path.join(name.to_str().unwrap());
+		debug!(
+			"Creating file at path: {}, importing from {}",
+			out_path.0,
+			os_path.display()
+		);
+		let parent_pvs = parent_path.as_path_values()?;
+		let parent = match self.update_items_in_path(&parent_pvs).await? {
+			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
+			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
+			UpdateItemsInPath::Complete(DBObject::File(_)) => {
+				return Err(CacheError::remote(format!(
+					"Path {parent_path} points to a file"
+				)));
+			}
+			UpdateItemsInPath::Partial(remaining, _) => {
+				return Err(CacheError::remote(format!(
+					"Path {parent_path} does not point to a directory (remaining: {remaining})"
+				)));
+			}
+		};
+
+		let mut file = self.client.make_file_builder(info.name, &parent.uuid());
+		if let Some(creation) = info.creation {
+			file = file.created(DateTime::from_timestamp_millis(creation).ok_or_else(|| {
+				CacheError::conversion(format!(
+					"Failed to convert creation timestamp {creation} to DateTime"
+				))
+			})?);
+		}
+		if let Some(modification) = info.modification {
+			file = file.modified(DateTime::from_timestamp_millis(modification).ok_or_else(
+				|| {
+					CacheError::conversion(format!(
+						"Failed to convert modification timestamp {modification} to DateTime"
+					))
+				},
+			)?);
+		}
+		if let Some(mime) = info.mime {
+			file = file.mime(mime);
+		}
+
+		let os_file = tokio::fs::File::open(&os_path).await?;
+
+		let remote_file = self
+			.io_upload_file(file.build(), os_file, Some(progress_callback))
+			.await?;
+
+		let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
+
+		Ok(FileWithPathResponse {
+			id: out_path,
+			file: file.into(),
+		})
+	}
+
 	pub async fn create_empty_file(
 		&self,
 		parent_path: FfiPathWithRoot,
@@ -362,9 +443,10 @@ impl FilenMobileCacheState {
 			.io_upload_new_file(pvs.name, parent.uuid(), Some(mime))
 			.await?;
 		let mut conn = self.conn();
-		DBFile::upsert_from_remote(&mut conn, file)?;
+		let file = DBFile::upsert_from_remote(&mut conn, file)?;
 		Ok(CreateFileResponse {
 			id: file_path,
+			file: file.into(),
 			path: os_path.into_os_string().into_string().map_err(|e| {
 				CacheError::conversion(format!("Failed to convert path to string: {e:?}"))
 			})?,
@@ -375,7 +457,8 @@ impl FilenMobileCacheState {
 		&self,
 		parent_path: FfiPathWithRoot,
 		name: String,
-	) -> Result<CreateDirResponse> {
+		created: Option<i64>,
+	) -> Result<DirWithPathResponse> {
 		let dir_path = parent_path.join(&name);
 		debug!("Creating directory at path: {}", dir_path.0);
 		let path_values = parent_path.as_path_values()?;
@@ -394,17 +477,32 @@ impl FilenMobileCacheState {
 			}
 		};
 
-		let dir = self.client.create_dir(&parent.uuid(), name).await?;
+		let dir = match created {
+			Some(time) => {
+				self.client
+					.create_dir_with_created(
+						&parent.uuid(),
+						name,
+						DateTime::from_timestamp_millis(time).ok_or_else(|| {
+							CacheError::conversion(format!(
+								"Failed to convert timestamp {time} to DateTime"
+							))
+						})?,
+					)
+					.await?
+			}
+			None => self.client.create_dir(&parent.uuid(), name).await?,
+		};
 
 		let mut conn = self.conn();
 		let dir = DBDir::upsert_from_remote(&mut conn, dir)?;
-		Ok(CreateDirResponse {
-			object: dir.into(),
+		Ok(DirWithPathResponse {
+			dir: dir.into(),
 			id: dir_path,
 		})
 	}
 
-	pub async fn trash_item(&self, path: FfiPathWithRoot) -> Result<()> {
+	pub async fn trash_item(&self, path: FfiPathWithRoot) -> Result<ObjectWithPathResponse> {
 		debug!("Trashing item at path: {}", path.0);
 		let path_values: PathValues<'_> = path.as_path_values()?;
 		let obj = match self.update_items_in_path(&path_values).await? {
@@ -417,7 +515,7 @@ impl FilenMobileCacheState {
 			}
 		};
 
-		match obj {
+		let obj = match obj {
 			DBObject::Root(root) => {
 				return Err(CacheError::remote(format!(
 					"Cannot remove root directory: {}",
@@ -427,30 +525,116 @@ impl FilenMobileCacheState {
 			DBObject::Dir(dir) => {
 				let remote_dir = dir.clone().into();
 				self.client.trash_dir(&remote_dir).await?;
-				dir.delete(&self.conn())?;
+				dir.trash(&self.conn())?;
+				DBObject::Dir(remote_dir.into())
 			}
 			DBObject::File(file) => {
 				let remote_file = file.clone().try_into()?;
 				self.client.trash_file(&remote_file).await?;
 				self.io_delete_file(&remote_file.uuid().to_string()).await?;
-				file.delete(&self.conn())?;
+				file.trash(&self.conn())?;
+				DBObject::File(remote_file.into())
+			}
+		};
+		Ok(ObjectWithPathResponse {
+			id: FfiPathWithRoot(format!("trash/{}", obj.uuid())),
+			object: obj.into(),
+		})
+	}
+
+	pub async fn restore_item(
+		&self,
+		uuid: &str,
+		to: Option<FfiPathWithRoot>,
+	) -> Result<ObjectWithPathResponse> {
+		debug!("Untrashing item with UUID: {uuid}");
+		let uuid = Uuid::parse_str(uuid)?;
+		let object = {
+			let conn = self.conn();
+			DBNonRootObject::select(&conn, uuid)?
+		};
+
+		// we do this first to make sure we have a valid restore target
+		let parent = match to {
+			Some(to_path) => {
+				let to_pvs: PathValues<'_> = to_path.as_path_values()?;
+				match self.update_items_in_path(&to_pvs).await? {
+					UpdateItemsInPath::Complete(DBObject::Dir(dir)) => {
+						Some((DBDirObject::Dir(dir), to_path))
+					}
+					UpdateItemsInPath::Complete(DBObject::Root(root)) => {
+						Some((DBDirObject::Root(root), to_path))
+					}
+					UpdateItemsInPath::Complete(DBObject::File(_)) => {
+						return Err(CacheError::remote(format!(
+							"Path {} points to a file",
+							to_pvs.full_path
+						)));
+					}
+					UpdateItemsInPath::Partial(_, _) => {
+						return Err(CacheError::remote(format!(
+							"Path {} does not point to a directory",
+							to_pvs.full_path
+						)));
+					}
+				}
+			}
+			None => None,
+		};
+
+		if !object.parent().is_some_and(|p| p == ParentUuid::Trash) {
+			return Err(CacheError::remote(format!(
+				"Object with UUID {uuid} is not in the trash"
+			)));
+		}
+
+		let object = match object {
+			DBNonRootObject::File(file) => {
+				let remote_file = file.try_into()?;
+				self.client.restore_file(&remote_file).await?;
+				let remote_file = self.client.get_file(remote_file.uuid()).await?;
+				let mut conn = self.conn();
+				let file = DBFile::upsert_from_remote(&mut conn, remote_file)?;
+				DBNonRootObject::File(file)
+			}
+			DBNonRootObject::Dir(dir) => {
+				let remote_dir: RemoteDirectory = dir.into();
+				self.client.restore_dir(&remote_dir).await?;
+				let remote_dir = self.client.get_dir(remote_dir.uuid()).await?;
+				let mut conn = self.conn();
+				let dir = DBDir::upsert_from_remote(&mut conn, remote_dir)?;
+				DBNonRootObject::Dir(dir)
+			}
+		};
+
+		if let Some((parent, parent_path)) = parent {
+			if object.certain_parent() != parent.uuid() {
+				let new_path = parent_path.join(object.name());
+				let item = self.inner_move_item(object, parent.uuid()).await?;
+				return Ok(ObjectWithPathResponse {
+					object: DBObject::from(item).into(),
+					id: new_path,
+				});
 			}
 		}
-		Ok(())
+
+		sql::recursive_select_path_from_uuid(&self.conn(), object.uuid())?
+			.ok_or_else(|| {
+				CacheError::remote(format!("Failed to get path for object with UUID {uuid}"))
+			})
+			.map(|s| ObjectWithPathResponse {
+				id: FfiPathWithRoot(format!("{}{}", self.client.root().uuid(), s)),
+				object: DBObject::from(object).into(),
+			})
 	}
 
 	pub async fn move_item(
 		&self,
 		item: FfiPathWithRoot,
-		parent: FfiPathWithRoot,
 		new_parent: FfiPathWithRoot,
-	) -> Result<FfiPathWithRoot> {
-		debug!(
-			"Moving item {} from parent {} to new parent {}",
-			item.0, parent.0, new_parent.0
-		);
+	) -> Result<ObjectWithPathResponse> {
+		debug!("Moving item {} to new parent {}", item.0, new_parent.0);
 		let item_pvs: PathValues<'_> = item.as_path_values()?;
-		let parent_pvs: PathValues<'_> = parent.as_path_values()?;
 		let new_parent_pvs: PathValues<'_> = new_parent.as_path_values()?;
 
 		let (obj, new_parent_dir) = futures::try_join!(
@@ -471,26 +655,6 @@ impl FilenMobileCacheState {
 						)));
 					}
 				};
-				let parent = match sql::select_object_at_path(&self.conn(), &parent_pvs)?
-					.map(DBDirObject::try_from)
-				{
-					None | Some(Err(_)) => {
-						return Err(CacheError::remote(format!(
-							"Path {} does not point to a parent directory",
-							parent_pvs.full_path
-						)));
-					}
-					Some(Ok(obj)) => obj,
-				};
-				if !obj.parent().is_some_and(|u| u == parent.uuid()) {
-					return Err(CacheError::remote(format!(
-						"Path {} does not point to the parent of obj {} got {:?} (should be {})",
-						parent_pvs.full_path,
-						obj.uuid(),
-						obj.parent(),
-						parent.uuid()
-					)));
-				}
 				Ok(obj)
 			},
 			async {
@@ -509,40 +673,18 @@ impl FilenMobileCacheState {
 			}
 		)?;
 
-		match obj {
-			DBNonRootObject::Dir(dbdir) => {
-				let mut remote_dir = dbdir.into();
-				self.client
-					.move_dir(&mut remote_dir, &new_parent_dir.uuid())
-					.await?;
-				sql::move_item(
-					&mut self.conn(),
-					remote_dir.uuid(),
-					remote_dir.name(),
-					remote_dir.parent(),
-				)?;
-			}
-			DBNonRootObject::File(dbfile) => {
-				let mut remote_file: RemoteFile = dbfile.try_into()?;
-				self.client
-					.move_file(&mut remote_file, &new_parent_dir.uuid())
-					.await?;
-				sql::move_item(
-					&mut self.conn(),
-					remote_file.uuid(),
-					remote_file.name(),
-					remote_file.parent(),
-				)?;
-			}
-		}
-		Ok(new_parent.join(item_pvs.name))
+		let obj = self.inner_move_item(obj, new_parent_dir.uuid()).await?;
+		Ok(ObjectWithPathResponse {
+			object: DBObject::from(obj).into(),
+			id: new_parent.join(item_pvs.name),
+		})
 	}
 
 	pub async fn rename_item(
 		&self,
 		item: FfiPathWithRoot,
 		new_name: String,
-	) -> Result<Option<FfiPathWithRoot>> {
+	) -> Result<Option<ObjectWithPathResponse>> {
 		debug!("Renaming item {} to {}", item.0, new_name);
 		let item_pvs: PathValues<'_> = item.as_path_values()?;
 		if item_pvs.name.is_empty() {
@@ -569,7 +711,7 @@ impl FilenMobileCacheState {
 			}
 		};
 		let new_path = item.parent().join(&new_name);
-		match obj {
+		let obj = match obj {
 			DBNonRootObject::Dir(dbdir) => {
 				let id = dbdir.id;
 				let mut remote_dir: RemoteDirectory = dbdir.into();
@@ -579,6 +721,7 @@ impl FilenMobileCacheState {
 					.update_dir_metadata(&mut remote_dir, meta)
 					.await?;
 				sql::rename_item(&mut self.conn(), id, &new_name, remote_dir.parent())?;
+				DBObject::Dir(remote_dir.into())
 			}
 			DBNonRootObject::File(dbfile) => {
 				let id = dbfile.id;
@@ -589,9 +732,13 @@ impl FilenMobileCacheState {
 					.update_file_metadata(&mut remote_file, meta)
 					.await?;
 				sql::rename_item(&mut self.conn(), id, &new_name, remote_file.parent())?;
+				DBObject::File(remote_file.into())
 			}
-		}
-		Ok(Some(new_path))
+		};
+		Ok(Some(ObjectWithPathResponse {
+			object: obj.into(),
+			id: new_path,
+		}))
 	}
 
 	pub async fn clear_local_cache(&self, item: FfiPathWithRoot) -> Result<()> {
@@ -609,14 +756,16 @@ impl FilenMobileCacheState {
 impl FilenMobileCacheState {
 	async fn inner_download_file_if_changed(
 		&self,
+		old_file: Option<DBFile>,
 		file: DBFile,
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<String> {
 		let file: RemoteFile = file.try_into()?;
 		let uuid = file.uuid().to_string();
-		match self.hash_local_file(&uuid).await {
-			Ok(Some(hash)) => {
-				if file.hash.is_some_and(|h| h == hash) {
+		match (file.hash, self.hash_local_file(&uuid).await) {
+			(Some(remote_hash), Ok(Some(local_hash))) => {
+				// Remote file has a hash and local file exists
+				if remote_hash == local_hash {
 					return self
 						.cache_dir
 						.join(uuid)
@@ -624,17 +773,35 @@ impl FilenMobileCacheState {
 						.into_string()
 						.map_err(|e| {
 							CacheError::conversion(format!(
-								"Failed to convert path to string: {:?}",
-								e
+								"Failed to convert path to string: {e:?}"
 							))
 						});
 				}
 			}
-			Ok(None) => {}
-			Err(e) => {
+			(None, Ok(Some(_))) => {
+				// Remote file does not have a hash but local file exists
+				if let Some(old_file) = old_file
+					&& old_file == file
+				{
+					return self
+						.cache_dir
+						.join(uuid)
+						.into_os_string()
+						.into_string()
+						.map_err(|e| {
+							CacheError::conversion(format!(
+								"Failed to convert path to string: {e:?}"
+							))
+						});
+				}
+			}
+			(_, Ok(None)) => {
+				// Local file does not exist
+			}
+			(_, Err(e)) => {
 				return Err(e.into());
 			}
-		};
+		}
 
 		let path = self
 			.download_file_io(&file, Some(progress_callback))
@@ -646,25 +813,94 @@ impl FilenMobileCacheState {
 			})?;
 		Ok(path)
 	}
+
+	async fn inner_move_item(
+		&self,
+		item: DBNonRootObject,
+		new_parent_uuid: Uuid,
+	) -> Result<DBNonRootObject> {
+		match item {
+			DBNonRootObject::Dir(dir) => {
+				let mut remote_dir: RemoteDirectory = dir.into();
+				self.client
+					.move_dir(&mut remote_dir, &new_parent_uuid)
+					.await?;
+				let mut conn = self.conn();
+				sql::move_item(
+					&mut conn,
+					remote_dir.uuid(),
+					remote_dir.name(),
+					new_parent_uuid.into(),
+				)?;
+				Ok(DBNonRootObject::Dir(remote_dir.into()))
+			}
+			DBNonRootObject::File(file) => {
+				let mut remote_file: RemoteFile = file.try_into()?;
+				self.client
+					.move_file(&mut remote_file, &new_parent_uuid)
+					.await?;
+				let mut conn = self.conn();
+				sql::move_item(
+					&mut conn,
+					remote_file.uuid(),
+					remote_file.name(),
+					new_parent_uuid.into(),
+				)?;
+				Ok(DBNonRootObject::File(remote_file.into()))
+			}
+		}
+	}
 }
 
 #[derive(uniffi::Record)]
 pub struct CreateFileResponse {
 	pub path: String,
+	pub file: FfiFile,
 	pub id: FfiPathWithRoot,
 }
 
-#[derive(uniffi::Record)]
-pub struct CreateDirResponse {
-	pub object: FfiDir,
+#[derive(uniffi::Record, Debug)]
+pub struct FileWithPathResponse {
+	pub file: FfiFile,
 	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct DirWithPathResponse {
+	pub dir: FfiDir,
+	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct ObjectWithPathResponse {
+	pub object: FfiObject,
+	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct UploadFileInfo {
+	pub name: String,
+	pub creation: Option<i64>,
+	pub modification: Option<i64>,
+	pub mime: Option<String>,
 }
 
 pub struct PathValues<'a> {
-	pub root_uuid: uuid::Uuid,
+	pub root_uuid: Uuid,
 	pub full_path: &'a str,
 	pub inner_path: &'a str,
 	pub name: &'a str,
+}
+
+pub struct TrashValues<'a> {
+	pub full_path: &'a str,
+	pub inner_path: &'a str,
+	pub uuid: Uuid,
+}
+
+pub enum MaybeTrashValues<'a> {
+	Trash(TrashValues<'a>),
+	Path(PathValues<'a>),
 }
 
 impl FfiPathWithRoot {
@@ -676,10 +912,26 @@ impl FfiPathWithRoot {
 
 		Ok(PathValues {
 			root_uuid: Uuid::parse_str(root_uuid_str)
-				.map_err(|e| CacheError::conversion(format!("Invalid root UUID: {e}")))?
+				.map_err(|e| CacheError::conversion(format!("Invalid root UUID: {e}")))?,
 			full_path: self.0.as_str(),
 			inner_path: remaining,
 			name: iter.last().unwrap_or_default().0,
 		})
+	}
+
+	pub fn as_maybe_trash_values(&self) -> Result<MaybeTrashValues> {
+		let mut iter = self.0.path_iter();
+		let (root_uuid_str, remaining) = iter
+			.next()
+			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;
+
+		match root_uuid_str {
+			"trash" => Ok(MaybeTrashValues::Trash(TrashValues {
+				full_path: self.0.as_str(),
+				inner_path: remaining,
+				uuid: Uuid::parse_str(iter.last().unwrap_or_default().0)?,
+			})),
+			_ => Ok(MaybeTrashValues::Path(self.as_path_values()?)),
+		}
 	}
 }

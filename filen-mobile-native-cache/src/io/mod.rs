@@ -7,11 +7,10 @@ use std::{
 };
 
 use crate::{FilenMobileCacheState, traits::ProgressCallback};
-use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	fs::{
 		HasUUID,
-		file::{FileBuilder, RemoteFile, traits::HasFileInfo},
+		file::{BaseFile, FileBuilder, RemoteFile, traits::HasFileInfo},
 	},
 	io::FilenMetaExt,
 };
@@ -164,6 +163,38 @@ impl FilenMobileCacheState {
 		Ok(Some(hash.into()))
 	}
 
+	pub(crate) async fn io_upload_file(
+		&self,
+		file: BaseFile,
+		os_file: tokio::fs::File,
+		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+	) -> Result<RemoteFile, io::Error> {
+		let meta = os_file.metadata().await?;
+		let file_size = FilenMetaExt::size(&meta);
+
+		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
+		let reader_callback = if let Some(callback) = callback {
+			tokio::task::spawn(async move {
+				update_task(receiver, file_size, callback).await;
+			});
+			Some(Arc::new(move |bytes_written: u64| {
+				let _ = sender.send(bytes_written);
+			}) as Arc<dyn Fn(u64) + Send + Sync>)
+		} else {
+			None
+		};
+
+		let mut os_file = os_file.compat();
+
+		let remote_file = self
+			.client
+			.upload_file_from_reader(file.into(), &mut os_file, reader_callback, Some(file_size))
+			.await
+			.map_err(|e| io::Error::other(format!("Failed to upload file: {e}")))?;
+
+		Ok(remote_file)
+	}
+
 	async fn inner_upload_file(
 		&self,
 		file_builder: FileBuilder,
@@ -172,8 +203,8 @@ impl FilenMobileCacheState {
 	) -> Result<(RemoteFile, tokio::fs::File), io::Error> {
 		let meta = os_file.metadata().await?;
 		let file = file_builder
-			.created(FilenMetaExt::created(&meta).into())
-			.modified(FilenMetaExt::modified(&meta).into())
+			.created(FilenMetaExt::created(&meta))
+			.modified(FilenMetaExt::modified(&meta))
 			.build();
 
 		let file_size = FilenMetaExt::size(&meta);
@@ -240,6 +271,16 @@ impl FilenMobileCacheState {
 		let (file, _) = self.inner_upload_file(file_builder, os_file, None).await?;
 		Ok((file, target_path))
 	}
+
+	// pub(crate) async fn io_upload_new_file_from_source(
+	// 	&self,
+	// 	name: &str,
+	// 	source: &Path,
+	// 	parent_uuid: Uuid,
+	// ) -> Result<(RemoteFile, PathBuf), io::Error> {
+	// 	// let mut file_builder = self.client.make_file_builder(name, parent);
+	// 	// let
+	// }
 
 	pub(crate) async fn io_delete_file(&self, file_uuid: &str) -> Result<(), io::Error> {
 		let path = self.cache_dir.join(file_uuid);

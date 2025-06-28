@@ -1,13 +1,16 @@
 CREATE TABLE items (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-    uuid BLOB NOT NULL UNIQUE,
-    parent BLOB,
+    uuid TEXT NOT NULL UNIQUE,
+    parent TEXT,
     name TEXT NOT NULL,
     type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
     is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
     UNIQUE (name, parent, is_stale),
     FOREIGN KEY (parent) REFERENCES items (uuid) ON DELETE CASCADE
 );
+INSERT
+INTO items (uuid, parent, name, type)
+VALUES ('trash', NULL, 'Trash', 1);
 CREATE INDEX idx_items_uuid ON items (uuid);
 CREATE INDEX idx_items_parent ON items (parent);
 CREATE TABLE roots (

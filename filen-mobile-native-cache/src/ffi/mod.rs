@@ -181,3 +181,27 @@ impl std::fmt::Display for FfiPathWithRoot {
 uniffi::custom_type!(FfiPathWithRoot, String, {
 	lower: |s| s.0,
 });
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FfiTrashPath(pub String);
+
+impl From<String> for FfiTrashPath {
+	fn from(path: String) -> Self {
+		FfiTrashPath(path)
+	}
+}
+impl std::fmt::Display for FfiTrashPath {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
+
+uniffi::custom_type!(FfiTrashPath, String, {
+	lower: |s| s.0,
+});
+
+impl FfiTrashPath {
+	pub fn uuid(&self) -> Option<&str> {
+		self.0.split('/').next_back()
+	}
+}

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 #[cfg(feature = "tokio")]
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
 use uuid::Uuid;
 
@@ -28,8 +29,18 @@ impl Client {
 		parent: &dyn HasUUIDContents,
 		name: String,
 	) -> Result<RemoteDirectory, Error> {
+		self.create_dir_with_created(parent, name, chrono::Utc::now())
+			.await
+	}
+
+	pub async fn create_dir_with_created(
+		&self,
+		parent: &dyn HasUUIDContents,
+		name: String,
+		created: DateTime<Utc>,
+	) -> Result<RemoteDirectory, Error> {
 		let _lock = self.lock_drive().await?;
-		let mut dir = RemoteDirectory::new(name, parent.uuid_as_parent(), chrono::Utc::now())?;
+		let mut dir = RemoteDirectory::new(name, parent.uuid_as_parent(), created)?;
 
 		let response = api::v3::dir::create::post(
 			self.client(),
@@ -194,6 +205,26 @@ impl Client {
 		Ok(())
 	}
 
+	pub async fn restore_dir(&self, dir: &RemoteDirectory) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
+		api::v3::dir::restore::post(
+			self.client(),
+			&api::v3::dir::restore::Request { uuid: dir.uuid() },
+		)
+		.await?;
+		Ok(())
+	}
+
+	pub async fn delete_dir_permanently(&self, dir: RemoteDirectory) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
+		api::v3::dir::delete::permanent::post(
+			self.client(),
+			&api::v3::dir::delete::permanent::Request { uuid: dir.uuid() },
+		)
+		.await?;
+		Ok(())
+	}
+
 	pub async fn update_dir_metadata(
 		&self,
 		dir: &mut RemoteDirectory,
@@ -308,58 +339,64 @@ impl Client {
 	pub async fn recursive_upload_dir(
 		&self,
 		dir: &Path,
+		name: String,
 		parent: &dyn HasUUIDContents,
+		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
 		use futures::StreamExt;
 
-		let _lock = self.lock_drive().await?;
-		let dir_name = dir
-			.file_name()
-			.and_then(|s| s.to_str())
-			.ok_or_else(|| Error::Custom("Failed to get directory name".to_string()))?
-			.to_string();
+		use crate::consts::MAX_SMALL_PARALLEL_REQUESTS;
 
-		let remote_dir = self.create_dir(parent, dir_name).await?;
+		let _lock = self.lock_drive().await?;
+
 		let read_dir = tokio::fs::read_dir(dir).await?;
+		let remote_dir = self.create_dir_with_created(parent, name, created).await?;
 		let stream = tokio_stream::wrappers::ReadDirStream::new(read_dir);
 
-		let stream = stream.then(|entry| async {
-			let entry = entry?;
-			let path = entry.path();
-			let meta = entry.metadata().await?;
-			if meta.is_dir() {
-				let name = entry.file_name().into_string().map_err(|_| {
-					Error::Custom("Failed to convert OsString to String".to_string())
-				})?;
-				let sub_dir = self.create_dir(&remote_dir, name).await?;
-				Box::pin(self.recursive_upload_dir(&path, &sub_dir)).await?;
-			} else if meta.is_file() {
-				use tokio_util::compat::TokioAsyncReadCompatExt;
+		let stream = stream
+			.map(|entry| async {
+				let entry = entry?;
+				let path = entry.path();
+				let meta = entry.metadata().await?;
+				if meta.is_dir() {
+					let name = entry.file_name().into_string().map_err(|_| {
+						Error::Custom("Failed to convert OsString to String".to_string())
+					})?;
+					Box::pin(self.recursive_upload_dir(
+						&path,
+						name,
+						&remote_dir,
+						FilenMetaExt::created(&meta),
+					))
+					.await?;
+				} else if meta.is_file() {
+					use tokio_util::compat::TokioAsyncReadCompatExt;
 
-				let name = entry.file_name().into_string().map_err(|_| {
-					Error::Custom("Failed to convert OsString to String".to_string())
-				})?;
-				// stop from overloading client with too many open files
-				let _sem = self.open_file_semaphore.acquire().await.unwrap();
-				let os_file = tokio::fs::File::open(&path).await?;
-				let file = self
-					.make_file_builder(name, &remote_dir)
-					.modified(FilenMetaExt::modified(&meta).into())
-					.created(FilenMetaExt::created(&meta).into())
-					.build();
+					let name = entry.file_name().into_string().map_err(|_| {
+						Error::Custom("Failed to convert OsString to String".to_string())
+					})?;
+					// stop from overloading client with too many open files
+					let _sem = self.open_file_semaphore.acquire().await.unwrap();
+					let os_file = tokio::fs::File::open(&path).await?;
+					let file = self
+						.make_file_builder(name, &remote_dir)
+						.modified(FilenMetaExt::modified(&meta))
+						.created(FilenMetaExt::created(&meta))
+						.build();
 
-				self.upload_file_from_reader(
-					file.into(),
-					&mut os_file.compat(),
-					None,
-					Some(meta.size()),
-				)
-				.await?;
-			} else {
-				return Err(Error::Custom("Unsupported file type".to_string()));
-			}
-			Ok::<_, Error>(())
-		});
+					self.upload_file_from_reader(
+						file.into(),
+						&mut os_file.compat(),
+						None,
+						Some(meta.size()),
+					)
+					.await?;
+				} else {
+					return Err(Error::Custom("Unsupported file type".to_string()));
+				}
+				Ok::<_, Error>(())
+			})
+			.buffer_unordered(MAX_SMALL_PARALLEL_REQUESTS);
 
 		{
 			tokio::pin!(stream);

@@ -90,13 +90,13 @@ impl FilenMobileCacheState {
 		requested_width: u32,
 		requested_height: u32,
 	) -> ThumbnailResult {
-		let pvs = match path.as_path_values() {
+		let pvs = match path.as_maybe_trash_values() {
 			Ok(pvs) => pvs,
 			Err(e) => return ThumbnailResult::Err(e),
 		};
 		let file = {
 			let conn: std::sync::MutexGuard<'_, rusqlite::Connection> = self.conn();
-			match sql::select_object_at_path(&conn, &pvs) {
+			match sql::select_maybe_trashed_object_at_path(&conn, &pvs) {
 				Ok(Some(DBObject::File(file))) => file,
 				Ok(Some(_)) => return ThumbnailResult::NoThumbnail,
 				Ok(None) => return ThumbnailResult::NotFound,

@@ -969,6 +969,13 @@ impl DBNonRootObject {
 			_ => return Err(SQLError::UnexpectedType(type_, ItemType::Dir)),
 		})
 	}
+
+	pub(crate) fn certain_parent(&self) -> ParentUuid {
+		match self {
+			DBNonRootObject::Dir(dir) => dir.parent,
+			DBNonRootObject::File(file) => file.parent,
+		}
+	}
 }
 
 impl DBItemTrait for DBNonRootObject {
@@ -1015,6 +1022,15 @@ impl TryFrom<DBObject> for DBNonRootObject {
 			DBObject::Dir(dir) => Ok(DBNonRootObject::Dir(dir)),
 			DBObject::File(file) => Ok(DBNonRootObject::File(file)),
 			DBObject::Root(_) => Err(SQLError::UnexpectedType(ItemType::Root, ItemType::Dir)),
+		}
+	}
+}
+
+impl From<DBNonRootObject> for DBObject {
+	fn from(obj: DBNonRootObject) -> Self {
+		match obj {
+			DBNonRootObject::Dir(dir) => DBObject::Dir(dir),
+			DBNonRootObject::File(file) => DBObject::File(file),
 		}
 	}
 }
@@ -1137,6 +1153,7 @@ pub(crate) trait DBItemTrait: Sync + Send {
 }
 
 pub(crate) trait DBItemExt: DBItemTrait {
+	fn trash(&self, conn: &Connection) -> Result<bool>;
 	fn delete(&self, conn: &Connection) -> Result<bool>;
 }
 
@@ -1144,6 +1161,25 @@ impl<T> DBItemExt for T
 where
 	T: DBItemTrait + Sync + Send,
 {
+	fn trash(&self, conn: &Connection) -> Result<bool> {
+		trace!(
+			"Trashing item: uuid = {}, name = {}",
+			self.uuid(),
+			self.name()
+		);
+		let mut stmt = conn.prepare_cached(include_str!("../../sql/trash_item.sql"))?;
+		let num_rows = stmt.execute([self.id()])?;
+		if num_rows == 0 {
+			trace!(
+				"No rows updated for item: uuid = {}, name = {}",
+				self.uuid(),
+				self.name()
+			);
+			return Ok(false);
+		}
+		Ok(true)
+	}
+
 	fn delete(&self, conn: &Connection) -> Result<bool> {
 		trace!(
 			"Removing item: uuid = {}, name = {}",
