@@ -6,6 +6,7 @@ use filen_mobile_native_cache::{
 	traits::ProgressCallback,
 };
 use filen_sdk_rs::fs::{HasName, HasUUID};
+use filen_sdk_rs_macros::shared_test_runtime;
 use rand::TryRngCore;
 use test_log::test;
 use test_utils::TestResources;
@@ -54,7 +55,7 @@ async fn get_db_resources() -> (FilenMobileCacheState, TestResources) {
 }
 
 // Root query tests
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_root_initial_state() {
 	let (db, rss) = get_db_resources().await;
 
@@ -70,7 +71,7 @@ pub async fn test_query_root_initial_state() {
 	assert_eq!(res.last_listed, 0);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_root_after_update() {
 	let (state, rss) = get_db_resources().await;
 
@@ -87,7 +88,7 @@ pub async fn test_query_root_after_update() {
 	assert_eq!(root.last_listed, 0);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_root_nonexistent() {
 	let (db, _rss) = get_db_resources().await;
 
@@ -96,7 +97,7 @@ pub async fn test_query_root_nonexistent() {
 	assert!(result.is_none());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_root_invalid_uuid() {
 	let (db, _rss) = get_db_resources().await;
 
@@ -105,7 +106,7 @@ pub async fn test_query_root_invalid_uuid() {
 }
 
 // Directory children query tests
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_children_empty_directory() {
 	let (db, rss) = get_db_resources().await;
 	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
@@ -125,7 +126,7 @@ pub async fn test_query_children_empty_directory() {
 	assert_eq!(resp.parent.uuid, rss.dir.uuid().to_string());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_children_with_files_and_dirs() {
 	let (db, rss) = get_db_resources().await;
 	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
@@ -170,7 +171,7 @@ pub async fn test_query_children_with_files_and_dirs() {
 	assert!(has_dir);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_children_sorting_by_size() {
 	let (db, rss) = get_db_resources().await;
 	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
@@ -231,7 +232,7 @@ pub async fn test_query_children_sorting_by_size() {
 	));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_children_sorting_by_name() {
 	let (db, rss) = get_db_resources().await;
 	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
@@ -274,7 +275,7 @@ pub async fn test_query_children_sorting_by_name() {
 	));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_children_after_deletion() {
 	let (db, rss) = get_db_resources().await;
 	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
@@ -316,7 +317,7 @@ pub async fn test_query_children_after_deletion() {
 	));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_children_nonexistent_path() {
 	let (db, _rss) = get_db_resources().await;
 	let nonexistent_path: FfiPathWithRoot = format!("{}/nonexistent_dir", db.root_uuid()).into();
@@ -326,7 +327,7 @@ pub async fn test_query_children_nonexistent_path() {
 }
 
 // Item query tests
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_item_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -360,7 +361,7 @@ pub async fn test_query_item_file() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_item_directory() {
 	let (db, rss) = get_db_resources().await;
 
@@ -390,7 +391,7 @@ pub async fn test_query_item_directory() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_item_root() {
 	let (db, rss) = get_db_resources().await;
 
@@ -409,7 +410,7 @@ pub async fn test_query_item_root() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_item_nonexistent() {
 	let (db, rss) = get_db_resources().await;
 
@@ -420,7 +421,7 @@ pub async fn test_query_item_nonexistent() {
 	assert!(result.is_none());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_item_invalid_path() {
 	let (db, _rss) = get_db_resources().await;
 
@@ -429,7 +430,7 @@ pub async fn test_query_item_invalid_path() {
 	assert!(result.is_err());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_item_deeply_nested() {
 	let (db, rss) = get_db_resources().await;
 
@@ -496,7 +497,7 @@ pub async fn test_query_item_deeply_nested() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_download_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -535,7 +536,7 @@ pub async fn test_download_file() {
 	std::fs::remove_file(&downloaded_path).ok();
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_download_file_nonexistent() {
 	let (db, rss) = get_db_resources().await;
 
@@ -549,7 +550,7 @@ pub async fn test_download_file_nonexistent() {
 	assert!(result.is_err());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_download_file_invalid_path() {
 	let (db, rss) = get_db_resources().await;
 
@@ -569,7 +570,7 @@ pub async fn test_download_file_invalid_path() {
 	assert!(result.is_err());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_progress_callback() {
 	let (db, rss) = get_db_resources().await;
 	let mut contents = vec![0u8; 10 * 1024 * 1024];
@@ -619,7 +620,7 @@ pub async fn test_progress_callback() {
 	std::fs::remove_file(&downloaded_path).ok();
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_create_empty_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -646,7 +647,7 @@ pub async fn test_create_empty_file() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_create_empty_file_different_mime_types() {
 	let (db, rss) = get_db_resources().await;
 
@@ -678,12 +679,12 @@ pub async fn test_create_empty_file_different_mime_types() {
 				assert_eq!(file.mime, mime_type);
 				assert_eq!(file.size, 0);
 			}
-			_ => panic!("Expected to find a file object for {}", filename),
+			_ => panic!("Expected to find a file object for {filename}"),
 		}
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_create_empty_file_duplicate_name() {
 	let (db, rss) = get_db_resources().await;
 
@@ -703,7 +704,7 @@ pub async fn test_create_empty_file_duplicate_name() {
 	);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_create_empty_file_invalid_parent() {
 	let (db, rss) = get_db_resources().await;
 
@@ -722,7 +723,7 @@ pub async fn test_create_empty_file_invalid_parent() {
 	assert!(result.is_err());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_create_empty_file_in_root() {
 	let (db, rss) = get_db_resources().await;
 
@@ -749,7 +750,7 @@ pub async fn test_create_empty_file_in_root() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_file_success() {
 	let (db, rss) = get_db_resources().await;
 
@@ -792,7 +793,7 @@ pub async fn test_trash_item_file_success() {
 	assert!(!file_exists);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_directory_success() {
 	let (db, rss) = get_db_resources().await;
 
@@ -831,7 +832,7 @@ pub async fn test_trash_item_directory_success() {
 	assert!(!dir_exists);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_directory_with_contents() {
 	let (db, rss) = get_db_resources().await;
 
@@ -902,7 +903,7 @@ pub async fn test_trash_item_directory_with_contents() {
 	assert!(!parent_exists);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_root_directory_error() {
 	let (db, rss) = get_db_resources().await;
 
@@ -917,7 +918,7 @@ pub async fn test_trash_item_root_directory_error() {
 	assert!(error_message.contains(&rss.client.root().uuid().to_string()));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_nonexistent_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -931,7 +932,7 @@ pub async fn test_trash_item_nonexistent_file() {
 	assert!(error_message.contains("does not point to an item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_nonexistent_directory() {
 	let (db, rss) = get_db_resources().await;
 
@@ -945,7 +946,7 @@ pub async fn test_trash_item_nonexistent_directory() {
 	assert!(error_message.contains("does not point to an item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_invalid_path() {
 	let (db, _rss) = get_db_resources().await;
 
@@ -956,7 +957,7 @@ pub async fn test_trash_item_invalid_path() {
 	assert!(result.is_err());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_partial_path() {
 	let (db, rss) = get_db_resources().await;
 
@@ -983,7 +984,7 @@ pub async fn test_trash_item_partial_path() {
 	db.trash_item(level2_path).await.unwrap();
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_file_then_query_parent() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1033,7 +1034,7 @@ pub async fn test_trash_item_file_then_query_parent() {
 	));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_empty_directory() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1072,7 +1073,7 @@ pub async fn test_trash_item_empty_directory() {
 	assert!(!dir_exists);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_trash_item_already_trashed_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1100,7 +1101,7 @@ pub async fn test_trash_item_already_trashed_file() {
 	assert!(error_message.contains("does not point to an item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_file_success() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1142,19 +1143,19 @@ pub async fn test_move_item_file_success() {
 
 	// Move the file
 	let new_file_path = db
-		.move_item(file_path.clone(), source_path.clone(), dest_path.clone())
+		.move_item(file_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	// Verify the new path is correct
 	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, file.name()).into();
-	assert_eq!(new_file_path.0, expected_new_path.0);
+	assert_eq!(new_file_path.id, expected_new_path);
 
 	// Verify file no longer exists at old location
 	assert!(db.query_item(&file_path).unwrap().is_none());
 
 	// Verify file exists at new location
-	let moved_file = db.query_item(&new_file_path).unwrap();
+	let moved_file = db.query_item(&new_file_path.id).unwrap();
 	assert!(moved_file.is_some());
 	match moved_file.unwrap() {
 		FfiObject::File(f) => {
@@ -1183,7 +1184,7 @@ pub async fn test_move_item_file_success() {
 	assert!(file_in_dest);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_directory_success() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1230,23 +1231,19 @@ pub async fn test_move_item_directory_success() {
 
 	// Move the directory
 	let new_dir_path = db
-		.move_item(
-			move_dir_path.clone(),
-			source_path.clone(),
-			dest_path.clone(),
-		)
+		.move_item(move_dir_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	// Verify the new path is correct
 	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, move_dir.name()).into();
-	assert_eq!(new_dir_path.0, expected_new_path.0);
+	assert_eq!(new_dir_path.id, expected_new_path);
 
 	// Verify directory no longer exists at old location
 	assert!(db.query_item(&move_dir_path).unwrap().is_none());
 
 	// Verify directory exists at new location
-	let moved_dir = db.query_item(&new_dir_path).unwrap();
+	let moved_dir = db.query_item(&new_dir_path.id).unwrap();
 	assert!(moved_dir.is_some());
 	match moved_dir.unwrap() {
 		FfiObject::Dir(d) => {
@@ -1273,7 +1270,7 @@ pub async fn test_move_item_directory_success() {
 	assert!(dir_in_dest);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_nonexistent_item() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1291,16 +1288,14 @@ pub async fn test_move_item_nonexistent_item() {
 	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Try to move non-existent file
-	let result = db
-		.move_item(nonexistent_file_path, base_path.clone(), dest_path)
-		.await;
+	let result = db.move_item(nonexistent_file_path, dest_path).await;
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to an item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_nonexistent_destination() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1322,61 +1317,14 @@ pub async fn test_move_item_nonexistent_destination() {
 	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Try to move to non-existent destination
-	let result = db
-		.move_item(file_path, base_path.clone(), nonexistent_dest)
-		.await;
+	let result = db.move_item(file_path, nonexistent_dest).await;
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to an item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
-pub async fn test_move_item_invalid_parent_path() {
-	let (db, rss) = get_db_resources().await;
-
-	// Create source and destination directories
-	let source_dir = rss
-		.client
-		.create_dir(&rss.dir, "source_dir".to_string())
-		.await
-		.unwrap();
-
-	let dest_dir = rss
-		.client
-		.create_dir(&rss.dir, "dest_dir".to_string())
-		.await
-		.unwrap();
-
-	// Create a file in source directory
-	let file = rss
-		.client
-		.make_file_builder("test_file.txt", &source_dir)
-		.build();
-	let file = rss
-		.client
-		.upload_file(file.into(), b"Content")
-		.await
-		.unwrap();
-
-	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
-	let source_path: FfiPathWithRoot = format!("{}/{}", base_path.0, source_dir.name()).into();
-	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
-	let file_path: FfiPathWithRoot = format!("{}/{}", source_path.0, file.name()).into();
-	let wrong_parent_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into(); // Wrong parent
-
-	db.update_dir_children(base_path).await.unwrap();
-	db.update_dir_children(source_path.clone()).await.unwrap();
-
-	// Try to move with wrong parent path
-	let result = db.move_item(file_path, wrong_parent_path, dest_path).await;
-
-	assert!(result.is_err());
-	let error_message = format!("{}", result.unwrap_err());
-	assert!(error_message.contains("does not point to the parent"));
-}
-
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_destination_is_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1409,16 +1357,14 @@ pub async fn test_move_item_destination_is_file() {
 	db.update_dir_children(base_path.clone()).await.unwrap();
 
 	// Try to move to a file instead of directory
-	let result = db
-		.move_item(move_file_path, base_path, dest_file_path)
-		.await;
+	let result = db.move_item(move_file_path, dest_file_path).await;
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to a directory"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_root_directory_error() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1436,16 +1382,14 @@ pub async fn test_move_item_root_directory_error() {
 	db.update_dir_children(base_path).await.unwrap();
 
 	// Try to move root directory (should fail at conversion to DBNonRootObject)
-	let result = db
-		.move_item(root_path.clone(), root_path.clone(), dest_path)
-		.await;
+	let result = db.move_item(root_path.clone(), dest_path).await;
 
 	assert!(result.is_err());
 	let error_message = format!("{}", result.unwrap_err());
 	assert!(error_message.contains("does not point to a non-root item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_same_directory() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1467,15 +1411,15 @@ pub async fn test_move_item_same_directory() {
 
 	// Move file to the same directory (should succeed)
 	let new_file_path = db
-		.move_item(file_path.clone(), base_path.clone(), base_path.clone())
+		.move_item(file_path.clone(), base_path.clone())
 		.await
 		.unwrap();
 
 	// File should still be in the same location
-	assert_eq!(new_file_path.0, file_path.0);
+	assert_eq!(new_file_path.id, file_path);
 
 	// Verify file still exists
-	let moved_file = db.query_item(&new_file_path).unwrap();
+	let moved_file = db.query_item(&new_file_path.id).unwrap();
 	assert!(moved_file.is_some());
 	match moved_file.unwrap() {
 		FfiObject::File(f) => {
@@ -1486,7 +1430,7 @@ pub async fn test_move_item_same_directory() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_nested_directory_structure() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1535,19 +1479,19 @@ pub async fn test_move_item_nested_directory_structure() {
 
 	// Move file from deep nested location to destination
 	let new_file_path = db
-		.move_item(file_path.clone(), level2_path.clone(), dest_path.clone())
+		.move_item(file_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	// Verify new path
 	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, file.name()).into();
-	assert_eq!(new_file_path.0, expected_new_path.0);
+	assert_eq!(new_file_path.id, expected_new_path);
 
 	// Verify file no longer exists at original location
 	assert!(db.query_item(&file_path).unwrap().is_none());
 
 	// Verify file exists at new location
-	let moved_file = db.query_item(&new_file_path).unwrap();
+	let moved_file = db.query_item(&new_file_path.id).unwrap();
 	assert!(moved_file.is_some());
 	match moved_file.unwrap() {
 		FfiObject::File(f) => {
@@ -1572,7 +1516,7 @@ pub async fn test_move_item_nested_directory_structure() {
 	assert!(file_in_dest);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_directory_with_contents() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1628,20 +1572,20 @@ pub async fn test_move_item_directory_with_contents() {
 
 	// Move the entire source directory to destination
 	let new_source_path = db
-		.move_item(source_path.clone(), base_path.clone(), dest_path.clone())
+		.move_item(source_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	// Verify new path
 	let expected_new_path: FfiPathWithRoot =
 		format!("{}/{}", dest_path.0, source_dir.name()).into();
-	assert_eq!(new_source_path.0, expected_new_path.0);
+	assert_eq!(new_source_path.id, expected_new_path);
 
 	// Verify old source directory is gone
 	assert!(db.query_item(&source_path).unwrap().is_none());
 
 	// Verify new source directory exists
-	let moved_dir = db.query_item(&new_source_path).unwrap();
+	let moved_dir = db.query_item(&new_source_path.id).unwrap();
 	assert!(moved_dir.is_some());
 	match moved_dir.unwrap() {
 		FfiObject::Dir(d) => {
@@ -1668,11 +1612,11 @@ pub async fn test_move_item_directory_with_contents() {
 	assert!(source_in_dest);
 
 	// Verify contents are preserved (this tests that the move operation preserves the directory structure)
-	db.update_dir_children(new_source_path.clone())
+	db.update_dir_children(new_source_path.id.clone())
 		.await
 		.unwrap();
 	let moved_source_children = db
-		.query_dir_children(&new_source_path, None)
+		.query_dir_children(&new_source_path.id, None)
 		.unwrap()
 		.unwrap();
 	assert_eq!(moved_source_children.objects.len(), 2); // subdirectory + file
@@ -1688,31 +1632,7 @@ pub async fn test_move_item_directory_with_contents() {
 	assert!(has_file);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
-pub async fn test_move_item_invalid_uuid_in_path() {
-	let (db, rss) = get_db_resources().await;
-
-	let dest_dir = rss
-		.client
-		.create_dir(&rss.dir, "dest_dir".to_string())
-		.await
-		.unwrap();
-
-	let base_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
-	let dest_path: FfiPathWithRoot = format!("{}/{}", base_path.0, dest_dir.name()).into();
-	let invalid_item_path: FfiPathWithRoot = "invalid-uuid/some/path".into();
-	let invalid_parent_path: FfiPathWithRoot = "invalid-uuid/parent".into();
-
-	// Try to move with invalid UUID in item path
-	let result = db
-		.move_item(invalid_item_path, invalid_parent_path, dest_path)
-		.await;
-
-	assert!(result.is_err());
-	// Should fail with UUID parsing error
-}
-
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_partial_path_resolution() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1755,20 +1675,20 @@ pub async fn test_move_item_partial_path_resolution() {
 
 	// Move should work with partial path resolution (sync::update_items_in_path should handle this)
 	let new_file_path = db
-		.move_item(file_path.clone(), level2_path, dest_path.clone())
+		.move_item(file_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	// Verify file was moved successfully
 	let expected_new_path: FfiPathWithRoot = format!("{}/{}", dest_path.0, file.name()).into();
-	assert_eq!(new_file_path.0, expected_new_path.0);
+	assert_eq!(new_file_path.id, expected_new_path);
 
 	// Verify file exists at new location
-	let moved_file = db.query_item(&new_file_path).unwrap();
+	let moved_file = db.query_item(&new_file_path.id).unwrap();
 	assert!(moved_file.is_some());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_name_collision_handling() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1818,23 +1738,23 @@ pub async fn test_move_item_name_collision_handling() {
 
 	// Move should succeed (the SDK should handle name conflicts)
 	let new_file_path = db
-		.move_item(file_path.clone(), source_path.clone(), dest_path.clone())
+		.move_item(file_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	// The move operation should succeed - the SDK typically handles name conflicts
 	// by either overwriting or creating a new name variant
-	assert!(new_file_path.0.contains(&dest_path.0));
+	assert!(new_file_path.id.0.contains(&dest_path.0));
 
 	// Verify file no longer exists in source
 	assert!(db.query_item(&file_path).unwrap().is_none());
 
 	// Verify some file exists at the new location (name might be modified by SDK)
-	let moved_file = db.query_item(&new_file_path).unwrap();
+	let moved_file = db.query_item(&new_file_path.id).unwrap();
 	assert!(moved_file.is_some());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_move_item_multiple_files_same_operation() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1886,12 +1806,12 @@ pub async fn test_move_item_multiple_files_same_operation() {
 
 	// Move both files
 	let new_file1_path = db
-		.move_item(file1_path.clone(), source_path.clone(), dest_path.clone())
+		.move_item(file1_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
 	let new_file2_path = db
-		.move_item(file2_path.clone(), source_path.clone(), dest_path.clone())
+		.move_item(file2_path.clone(), dest_path.clone())
 		.await
 		.unwrap();
 
@@ -1899,8 +1819,8 @@ pub async fn test_move_item_multiple_files_same_operation() {
 	assert!(db.query_item(&file1_path).unwrap().is_none());
 	assert!(db.query_item(&file2_path).unwrap().is_none());
 
-	assert!(db.query_item(&new_file1_path).unwrap().is_some());
-	assert!(db.query_item(&new_file2_path).unwrap().is_some());
+	assert!(db.query_item(&new_file1_path.id).unwrap().is_some());
+	assert!(db.query_item(&new_file2_path.id).unwrap().is_some());
 
 	// Verify source directory is now empty
 	db.update_dir_children(source_path.clone()).await.unwrap();
@@ -1924,7 +1844,7 @@ pub async fn test_move_item_multiple_files_same_operation() {
 	assert!(has_file2);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_file_success() {
 	let (db, rss) = get_db_resources().await;
 
@@ -1956,13 +1876,13 @@ pub async fn test_rename_item_file_success() {
 
 	// Verify the new path is correct
 	let expected_new_path: FfiPathWithRoot = format!("{}/{}", parent_path.0, new_name).into();
-	assert_eq!(new_file_path.0, expected_new_path.0);
+	assert_eq!(new_file_path.id.0, expected_new_path.0);
 
 	// Verify old file path no longer exists
 	assert!(db.query_item(&file_path).unwrap().is_none());
 
 	// Verify file exists at new path with new name
-	let renamed_file = db.query_item(&new_file_path).unwrap();
+	let renamed_file = db.query_item(&new_file_path.id).unwrap();
 	assert!(renamed_file.is_some());
 	match renamed_file.unwrap() {
 		FfiObject::File(f) => {
@@ -1987,7 +1907,7 @@ pub async fn test_rename_item_file_success() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_directory_success() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2024,13 +1944,13 @@ pub async fn test_rename_item_directory_success() {
 
 	// Verify the new path is correct
 	let expected_new_path: FfiPathWithRoot = format!("{}/{}", parent_path.0, new_name).into();
-	assert_eq!(new_dir_path.0, expected_new_path.0);
+	assert_eq!(new_dir_path.id.0, expected_new_path.0);
 
 	// Verify old directory path no longer exists
 	assert!(db.query_item(&dir_path).unwrap().is_none());
 
 	// Verify directory exists at new path with new name
-	let renamed_dir = db.query_item(&new_dir_path).unwrap();
+	let renamed_dir = db.query_item(&new_dir_path.id).unwrap();
 	assert!(renamed_dir.is_some());
 	match renamed_dir.unwrap() {
 		FfiObject::Dir(d) => {
@@ -2055,8 +1975,13 @@ pub async fn test_rename_item_directory_success() {
 	}
 
 	// Verify directory contents are preserved
-	db.update_dir_children(new_dir_path.clone()).await.unwrap();
-	let dir_contents = db.query_dir_children(&new_dir_path, None).unwrap().unwrap();
+	db.update_dir_children(new_dir_path.id.clone())
+		.await
+		.unwrap();
+	let dir_contents = db
+		.query_dir_children(&new_dir_path.id, None)
+		.unwrap()
+		.unwrap();
 	assert_eq!(dir_contents.objects.len(), 1);
 
 	let file_in_renamed_dir = dir_contents.objects.iter().find(
@@ -2065,7 +1990,7 @@ pub async fn test_rename_item_directory_success() {
 	assert!(file_in_renamed_dir.is_some());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_file_extension_change() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2095,7 +2020,7 @@ pub async fn test_rename_item_file_extension_change() {
 		.unwrap();
 
 	// Verify rename worked
-	let renamed_file = db.query_item(&new_file_path).unwrap();
+	let renamed_file = db.query_item(&new_file_path.id.clone()).unwrap();
 	assert!(renamed_file.is_some());
 	match renamed_file.unwrap() {
 		FfiObject::File(f) => {
@@ -2106,7 +2031,7 @@ pub async fn test_rename_item_file_extension_change() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_same_name() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2135,7 +2060,7 @@ pub async fn test_rename_item_same_name() {
 		.unwrap();
 
 	// Path should be the same
-	assert_eq!(new_file_path, None);
+	assert!(new_file_path.is_none());
 
 	// File should still exist and be queryable
 	let file_result = db.query_item(&file_path).unwrap();
@@ -2149,7 +2074,7 @@ pub async fn test_rename_item_same_name() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_nonexistent_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2169,7 +2094,7 @@ pub async fn test_rename_item_nonexistent_file() {
 	assert!(error_message.contains("does not point to an item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_root_directory_error() {
 	let (db, _rss) = get_db_resources().await;
 
@@ -2183,7 +2108,7 @@ pub async fn test_rename_item_root_directory_error() {
 	assert!(error_message.contains("Cannot rename item"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_invalid_path() {
 	let (db, _rss) = get_db_resources().await;
 
@@ -2198,7 +2123,7 @@ pub async fn test_rename_item_invalid_path() {
 	// Should fail with UUID parsing error
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_empty_name() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2226,7 +2151,7 @@ pub async fn test_rename_item_empty_name() {
 	assert!(err.to_string().contains("Invalid Name ''"));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_special_characters() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2267,7 +2192,7 @@ pub async fn test_rename_item_special_characters() {
 
 		if result.is_ok() {
 			let new_path = result.unwrap().unwrap();
-			let renamed_file = db.query_item(&new_path).unwrap();
+			let renamed_file = db.query_item(&new_path.id).unwrap();
 			assert!(renamed_file.is_some());
 
 			match renamed_file.unwrap() {
@@ -2279,7 +2204,7 @@ pub async fn test_rename_item_special_characters() {
 			}
 
 			// Reset for next test by renaming back
-			let _ = db.rename_item(new_path, file.name().to_string()).await;
+			let _ = db.rename_item(new_path.id, file.name().to_string()).await;
 		} else {
 			// Document which special characters are rejected
 			panic!(
@@ -2291,7 +2216,7 @@ pub async fn test_rename_item_special_characters() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_name_collision() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2328,7 +2253,7 @@ pub async fn test_rename_item_name_collision() {
 	);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_nested_file() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2376,13 +2301,13 @@ pub async fn test_rename_item_nested_file() {
 
 	// Verify the new path is correct
 	let expected_new_path: FfiPathWithRoot = format!("{}/{}", level2_path.0, new_name).into();
-	assert_eq!(new_file_path.0, expected_new_path.0);
+	assert_eq!(new_file_path.id.0, expected_new_path.0);
 
 	// Verify old path no longer exists
 	assert!(db.query_item(&file_path).unwrap().is_none());
 
 	// Verify file exists at new path
-	let renamed_file = db.query_item(&new_file_path).unwrap();
+	let renamed_file = db.query_item(&new_file_path.id).unwrap();
 	assert!(renamed_file.is_some());
 	match renamed_file.unwrap() {
 		FfiObject::File(f) => {
@@ -2393,7 +2318,7 @@ pub async fn test_rename_item_nested_file() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_long_name() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2416,7 +2341,7 @@ pub async fn test_rename_item_long_name() {
 	let result = db.rename_item(file_path, long_name.clone()).await;
 
 	let new_path = result.unwrap().unwrap();
-	let renamed_file = db.query_item(&new_path).unwrap();
+	let renamed_file = db.query_item(&new_path.id).unwrap();
 	assert!(renamed_file.is_some());
 
 	match renamed_file.unwrap() {
@@ -2429,7 +2354,7 @@ pub async fn test_rename_item_long_name() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_rename_item_multiple_renames() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2464,7 +2389,7 @@ pub async fn test_rename_item_multiple_renames() {
 		assert!(db.query_item(&current_path).unwrap().is_none());
 
 		// Verify new path exists
-		let renamed_file = db.query_item(&new_path).unwrap();
+		let renamed_file = db.query_item(&new_path.id).unwrap();
 		assert!(renamed_file.is_some());
 		match renamed_file.unwrap() {
 			FfiObject::File(f) => {
@@ -2475,7 +2400,7 @@ pub async fn test_rename_item_multiple_renames() {
 		}
 
 		// Update current path for next iteration
-		current_path = new_path;
+		current_path = new_path.id;
 	}
 
 	// Verify final state in parent directory
@@ -2493,7 +2418,7 @@ pub async fn test_rename_item_multiple_renames() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_empty_directory() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2517,7 +2442,7 @@ pub async fn test_get_all_descendant_paths_empty_directory() {
 	assert_eq!(descendant_paths.len(), 0);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_files_only() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2573,13 +2498,12 @@ pub async fn test_get_all_descendant_paths_files_only() {
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in descendant paths"
 		);
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_directories_only() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2631,13 +2555,12 @@ pub async fn test_get_all_descendant_paths_directories_only() {
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in descendant paths"
 		);
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_mixed_content() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2696,13 +2619,12 @@ pub async fn test_get_all_descendant_paths_mixed_content() {
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in descendant paths"
 		);
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_nested_structure() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2800,7 +2722,7 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2928,7 +2850,7 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_nonexistent_path() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2942,7 +2864,7 @@ pub async fn test_get_all_descendant_paths_nonexistent_path() {
 	assert_eq!(descendant_paths.len(), 0);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_invalid_path() {
 	let (db, _rss) = get_db_resources().await;
 
@@ -2953,7 +2875,7 @@ pub async fn test_get_all_descendant_paths_invalid_path() {
 	assert!(result.is_err());
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_file_path() {
 	let (db, rss) = get_db_resources().await;
 
@@ -2982,7 +2904,7 @@ pub async fn test_get_all_descendant_paths_file_path() {
 	assert_eq!(descendant_paths.len(), 0);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_root_directory() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3017,7 +2939,7 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 	// Should include both the file and directory
 	assert_eq!(descendant_paths.len(), 2);
 
-	println!("Descendant paths: {:?}", descendant_paths);
+	println!("Descendant paths: {descendant_paths:?}");
 
 	let expected_paths = vec![
 		format!("{}/{}", root_path.0, file_in_root.name()),
@@ -3028,13 +2950,12 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in descendant paths"
 		);
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_partial_database_state() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3078,7 +2999,7 @@ pub async fn test_get_all_descendant_paths_partial_database_state() {
 	assert_eq!(descendant_paths[0].0, expected_level2_path);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3147,13 +3068,12 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in descendant paths"
 		);
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_path_ordering() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3226,8 +3146,7 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in descendant paths"
 		);
 	}
 
@@ -3242,7 +3161,7 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_large_directory() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3259,11 +3178,11 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 	for i in 0..20 {
 		let file = rss
 			.client
-			.make_file_builder(format!("file_{:02}.txt", i), &large_dir)
+			.make_file_builder(format!("file_{i:02}.txt"), &large_dir)
 			.build();
 		let file = rss
 			.client
-			.upload_file(file.into(), format!("Content {}", i).as_bytes())
+			.upload_file(file.into(), format!("Content {i}").as_bytes())
 			.await
 			.unwrap();
 		created_files.push(file);
@@ -3326,7 +3245,7 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 	for file in &created_files {
 		let expected_path = format!("{}/{}", dir_path.0, file.name());
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
-		assert!(found, "Expected file path {} not found", expected_path);
+		assert!(found, "Expected file path {expected_path} not found");
 	}
 
 	// Verify subdirectories are present
@@ -3342,7 +3261,7 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 	assert!(descendant_paths.iter().any(|p| p.0 == nested2_expected));
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_empty_names() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3394,13 +3313,12 @@ pub async fn test_get_all_descendant_paths_empty_names() {
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in descendant paths"
 		);
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3461,13 +3379,12 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 		let found = updated_paths.iter().any(|p| p.0 == expected_path);
 		assert!(
 			found,
-			"Expected path {} not found in updated descendant paths",
-			expected_path
+			"Expected path {expected_path} not found in updated descendant paths"
 		);
 	}
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_get_all_descendant_paths_path_format_consistency() {
 	let (db, rss) = get_db_resources().await;
 
@@ -3547,7 +3464,7 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 	);
 }
 
-#[test(tokio::test(flavor = "multi_thread", worker_threads = 1))]
+#[shared_test_runtime]
 pub async fn test_query_path_for_uuid() {
 	let (db, rss) = get_db_resources().await;
 	let root_path: FfiPathWithRoot = db.root_uuid().to_string().into();
