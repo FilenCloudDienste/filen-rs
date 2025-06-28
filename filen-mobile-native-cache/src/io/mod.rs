@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 #[cfg(windows)]
 fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
+	use std::os::windows::fs::FileTimesExt;
+
 	FileTimes::new().set_created(created).set_modified(modified)
 }
 
