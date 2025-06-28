@@ -18,10 +18,10 @@ pub trait FilenMetaExt {
 // thanks Microsoft!
 fn nt_time_to_unix_time(nt_time: u64) -> DateTime<Utc> {
 	if nt_time == 0 {
-		return std::time::SystemTime::UNIX_EPOCH;
+		return std::time::SystemTime::UNIX_EPOCH.into();
 	}
 	let unix_seconds = nt_time / WINDOWS_TICKS_PER_SECOND - SEC_TO_UNIX_EPOCH;
-	std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(unix_seconds as u64)
+	(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(unix_seconds)).into()
 }
 
 impl FilenMetaExt for std::fs::Metadata {
@@ -34,8 +34,7 @@ impl FilenMetaExt for std::fs::Metadata {
 
 	fn modified(&self) -> DateTime<Utc> {
 		#[cfg(windows)]
-		return nt_time_to_unix_time(std::os::windows::fs::MetadataExt::last_write_time(self))
-			.into();
+		return nt_time_to_unix_time(std::os::windows::fs::MetadataExt::last_write_time(self));
 		#[cfg(unix)]
 		return (std::time::SystemTime::UNIX_EPOCH
 			+ Duration::from_secs(std::os::unix::fs::MetadataExt::mtime(self) as u64))
