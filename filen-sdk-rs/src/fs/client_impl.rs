@@ -6,7 +6,7 @@ use crate::{
 	api,
 	auth::Client,
 	error::Error,
-	fs::{UnsharedFSObject, dir::UnsharedDirectoryType},
+	fs::{HasType, HasUUID, SetRemoteInfo, UnsharedFSObject, dir::UnsharedDirectoryType},
 	util::PathIteratorExt,
 };
 
@@ -105,6 +105,23 @@ impl Client {
 
 	pub async fn empty_trash(&self) -> Result<(), Error> {
 		api::v3::trash::empty::post(self.client()).await?;
+		Ok(())
+	}
+
+	pub async fn set_favorite<T>(&self, object: &mut T, value: bool) -> Result<(), Error>
+	where
+		T: SetRemoteInfo + HasUUID + HasType,
+	{
+		let resp = api::v3::item::favorite::post(
+			self.client(),
+			&api::v3::item::favorite::Request {
+				uuid: object.uuid(),
+				r#type: object.object_type(),
+				value,
+			},
+		)
+		.await?;
+		object.set_favorited(resp.value);
 		Ok(())
 	}
 }

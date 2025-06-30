@@ -5,7 +5,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	crypto::shared::generate_random_base64_values,
 	fs::{
-		FSObject, HasName, HasUUID, NonRootFSObject,
+		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject,
 		dir::RemoteDirectory,
 		file::traits::{HasFileInfo, HasFileMeta},
 	},
@@ -421,4 +421,22 @@ async fn file_callbacks() {
 	test_callback_sums(client, test_dir, 1024 * 1024 * 8 + 1).await;
 	test_callback_sums(client, test_dir, 1024 * 1024 * 8 - 1).await;
 	test_callback_sums(client, test_dir, 0).await;
+}
+
+#[shared_test_runtime]
+async fn file_favorite() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client.make_file_builder("test", test_dir).build();
+	let mut file = client.upload_file(file.into(), b"").await.unwrap();
+
+	assert!(!file.favorited());
+
+	client.set_favorite(&mut file, true).await.unwrap();
+	assert!(file.favorited());
+
+	client.set_favorite(&mut file, false).await.unwrap();
+	assert!(!file.favorited());
 }

@@ -4,7 +4,7 @@ use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	crypto::shared::generate_random_base64_values,
 	fs::{
-		FSObject, HasName, HasUUID, NonRootFSObject, UnsharedFSObject,
+		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
 		client_impl::ObjectOrRemainingPath,
 		dir::{UnsharedDirectoryType, traits::HasDirMeta},
 	},
@@ -325,4 +325,24 @@ async fn dir_update_meta() {
 	let found_dir = client.get_dir(dir.uuid()).await.unwrap();
 	assert_eq!(found_dir.created(), Some(created.round_subsecs(3)));
 	assert_eq!(found_dir, dir);
+}
+
+#[shared_test_runtime]
+async fn dir_favorite() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let mut dir = client
+		.create_dir(test_dir, "test_dir".to_string())
+		.await
+		.unwrap();
+
+	assert!(!dir.favorited());
+
+	client.set_favorite(&mut dir, true).await.unwrap();
+	assert!(dir.favorited());
+
+	client.set_favorite(&mut dir, false).await.unwrap();
+	assert!(!dir.favorited());
 }

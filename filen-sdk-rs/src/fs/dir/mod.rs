@@ -8,7 +8,7 @@ use filen_types::{
 use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, SetDirMeta};
 use uuid::Uuid;
 
-use crate::{crypto::shared::MetaCrypter, error::Error};
+use crate::{crypto::shared::MetaCrypter, error::Error, fs::SetRemoteInfo};
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
@@ -269,6 +269,12 @@ impl HasDirInfo for RemoteDirectory {
 impl HasRemoteInfo for RemoteDirectory {
 	fn favorited(&self) -> bool {
 		self.favorited
+	}
+}
+
+impl SetRemoteInfo for RemoteDirectory {
+	fn set_favorited(&mut self, value: bool) {
+		self.favorited = value;
 	}
 }
 

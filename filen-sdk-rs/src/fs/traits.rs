@@ -14,6 +14,11 @@ pub trait HasParent {
 pub trait HasRemoteInfo {
 	fn favorited(&self) -> bool;
 }
+
+pub trait SetRemoteInfo {
+	fn set_favorited(&mut self, value: bool);
+}
+
 pub trait HasUUID: Send + Sync {
 	fn uuid(&self) -> Uuid;
 }

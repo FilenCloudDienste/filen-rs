@@ -9,7 +9,11 @@ use meta::FileMeta;
 use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, SetFileMeta};
 use uuid::Uuid;
 
-use crate::{auth::Client, crypto::file::FileKey, fs::dir::HasUUIDContents};
+use crate::{
+	auth::Client,
+	crypto::file::FileKey,
+	fs::{SetRemoteInfo, dir::HasUUIDContents},
+};
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
@@ -377,6 +381,12 @@ impl HasFileInfo for RemoteFile {
 impl HasRemoteInfo for RemoteFile {
 	fn favorited(&self) -> bool {
 		self.favorited
+	}
+}
+
+impl SetRemoteInfo for RemoteFile {
+	fn set_favorited(&mut self, value: bool) {
+		self.favorited = value;
 	}
 }
 
