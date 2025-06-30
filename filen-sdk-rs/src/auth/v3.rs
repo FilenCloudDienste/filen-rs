@@ -86,8 +86,8 @@ pub(super) async fn login(
 	))
 }
 
-pub(super) fn hash_name(name: impl AsRef<[u8]>, hmac_key: &HMACKey) -> String {
-	hmac_key.hash_to_string(name.as_ref())
+pub(super) fn hash_name(name: &str, hmac_key: &HMACKey) -> String {
+	hmac_key.hash_to_string(name.to_lowercase().as_bytes())
 }
 
 pub(super) fn generate_file_key() -> EncryptionKey {

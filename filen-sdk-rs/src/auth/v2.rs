@@ -87,8 +87,8 @@ pub(super) async fn login(
 	))
 }
 
-pub(crate) fn hash_name(name: impl AsRef<[u8]>) -> String {
-	faster_hex::hex_string(&hash(name.as_ref()))
+pub(crate) fn hash_name(name: &str) -> String {
+	faster_hex::hex_string(&hash(name.to_lowercase().as_bytes()))
 }
 
 pub(super) fn generate_file_key() -> crypto::v2::FileKey {
