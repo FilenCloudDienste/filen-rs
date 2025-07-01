@@ -80,7 +80,20 @@ pub(crate) fn insert_root(conn: &mut Connection, root: Uuid) -> Result<(), rusql
 		let mut stmt = tx.prepare_cached(
 			"INSERT INTO items (uuid, parent, name, type) VALUES (?, NULL, ?, ?) RETURNING id;",
 		)?;
-		let id: i64 = stmt.query_one((root, "", ItemType::Root as i8), |row| row.get(0))?;
+		let id: i64 = match stmt.query_one((root, "", ItemType::Root as i8), |row| row.get(0)) {
+			Ok(id) => id,
+			Err(rusqlite::Error::SqliteFailure(
+				libsqlite3_sys::Error {
+					code: libsqlite3_sys::ErrorCode::ConstraintViolation,
+					extended_code: SQLITE_CONSTRAINT_UNIQUE,
+				},
+				_,
+			)) => {
+				// root was already initialized
+				return Ok(());
+			}
+			Err(e) => return Err(e),
+		};
 		let mut stmt = tx.prepare_cached("INSERT INTO roots (id) VALUES (?);")?;
 		stmt.execute([id])?;
 		let mut stmt = tx.prepare_cached("INSERT INTO dirs (id) VALUES (?);")?;
