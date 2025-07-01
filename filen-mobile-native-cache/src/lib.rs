@@ -75,6 +75,43 @@ impl FilenMobileCacheState {
 		})
 	}
 
+	#[uniffi::constructor(name = "from_strings_in_file")]
+	pub fn from_strings_in_file(
+		email: String,
+		root_uuid: &str,
+		auth_info: &str,
+		private_key: &str,
+		api_key: String,
+		version: u32,
+		files_dir: &str,
+	) -> Result<Self> {
+		debug!("Creating FilenMobileCacheState from strings for email: {email}");
+
+		env::init_logger();
+		let client = filen_sdk_rs::auth::Client::from_strings(
+			email,
+			root_uuid,
+			auth_info,
+			private_key,
+			api_key,
+			version,
+		)?;
+
+		let (cache_dir, tmp_dir, thumbnail_dir) = io::init(files_dir.as_ref())?;
+		let db_path = AsRef::<Path>::as_ref(files_dir).join("native_cache.db");
+		let db = Connection::open(&db_path)?;
+		db.execute_batch(include_str!("../sql/init.sql"))?;
+		let new = FilenMobileCacheState {
+			client,
+			conn: Mutex::new(db),
+			cache_dir,
+			tmp_dir,
+			thumbnail_dir,
+		};
+		new.add_root(root_uuid)?;
+		Ok(new)
+	}
+
 	#[uniffi::constructor(name = "from_strings")]
 	pub fn from_strings_in_memory(
 		email: String,
