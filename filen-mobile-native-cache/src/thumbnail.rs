@@ -1,7 +1,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use filen_sdk_rs::{
-	fs::{HasUUID, file::RemoteFile},
+	fs::{
+		HasUUID,
+		file::{RemoteFile, traits::HasFileInfo},
+	},
 	io::FilenMetaExt,
 };
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -21,13 +24,19 @@ impl FilenMobileCacheState {
 		target_width: u32,
 		target_height: u32,
 	) -> Result<Option<PathBuf>, CacheError> {
+		if !file.mime().starts_with("image/") {
+			debug!(
+				"File is not an image, no thumbnail will be made: {}",
+				file.mime()
+			);
+			return Ok(None);
+		}
 		let uuid_str = file.uuid().to_string();
 		let file_path = self.cache_dir.join(&uuid_str);
 		let file_thumbnails_path = self.thumbnail_dir.join(&uuid_str);
 		tokio::fs::create_dir_all(&file_thumbnails_path).await?;
 		let thumbnail_path =
 			file_thumbnails_path.join(format!("{target_width}x{target_height}.webp"));
-		println!("Thumbnail path: {}", thumbnail_path.display());
 		let thumbnail_file = tokio::fs::OpenOptions::new()
 			.append(true)
 			.create(true)
