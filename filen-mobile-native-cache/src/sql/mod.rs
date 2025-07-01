@@ -140,6 +140,12 @@ pub(crate) fn move_item(
 	Ok(())
 }
 
+pub(crate) fn delete_item(conn: &Connection, item_uuid: UuidStr) -> Result<(), rusqlite::Error> {
+	let mut stmt = conn.prepare_cached("DELETE FROM items WHERE uuid = ?;")?;
+	stmt.execute([item_uuid])?;
+	Ok(())
+}
+
 pub(crate) fn rename_item(
 	conn: &mut Connection,
 	id: i64,

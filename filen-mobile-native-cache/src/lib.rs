@@ -805,6 +805,52 @@ impl FilenMobileCacheState {
 		self.io_delete_file(file.uuid.as_ref()).await?;
 		Ok(())
 	}
+
+	pub async fn delete_item(&self, item: FfiPathWithRoot) -> Result<()> {
+		debug!("Deleting object at path: {}", item.0);
+		let pvs = item.as_maybe_trash_values()?;
+		let obj = match pvs {
+			MaybeTrashValues::Trash(_) => {
+				sql::select_maybe_trashed_object_at_path(&self.conn(), &pvs)?
+			}
+			MaybeTrashValues::Path(path_values) => {
+				Some(match self.update_items_in_path(&path_values).await? {
+					UpdateItemsInPath::Complete(obj) => obj,
+					UpdateItemsInPath::Partial(_, _) => {
+						return Err(CacheError::remote(format!(
+							"Path {} does not point to an item",
+							item.0
+						)));
+					}
+				})
+			}
+		};
+		let Some(obj) = obj else {
+			return Ok(());
+		};
+
+		match obj {
+			DBObject::Root(_) => {
+				return Err(CacheError::remote("Cannot delete root directory"));
+			}
+			DBObject::Dir(dir) => {
+				let remote_dir: RemoteDirectory = dir.into();
+				let uuid = remote_dir.uuid();
+				self.client.delete_dir_permanently(remote_dir).await?;
+				sql::delete_item(&self.conn(), uuid)?;
+			}
+			DBObject::File(file) => {
+				let remote_file: RemoteFile = file.try_into()?;
+				let uuid = remote_file.uuid();
+				self.client.delete_file_permanently(remote_file).await?;
+				self.io_delete_file(uuid.as_ref()).await?;
+				sql::delete_item(&self.conn(), uuid)?;
+			}
+		}
+		debug!("Successfully deleted item at path: {}", item.0);
+		Ok(())
+	}
+
 	pub async fn set_favorite_rank(
 		&self,
 		item: FfiPathWithRoot,

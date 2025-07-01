@@ -5,7 +5,7 @@ use filen_mobile_native_cache::{
 	ffi::{FfiNonRootObject, FfiObject, FfiPathWithRoot},
 	traits::ProgressCallback,
 };
-use filen_sdk_rs::fs::{HasName, HasUUID};
+use filen_sdk_rs::fs::{HasName, HasUUID, file::traits::HasFileInfo};
 use filen_sdk_rs_macros::shared_test_runtime;
 use filen_types::fs::UuidStr;
 use rand::TryRngCore;
@@ -749,6 +749,80 @@ pub async fn test_create_empty_file_in_root() {
 		}
 		_ => panic!("Expected to find a file object in test directory"),
 	}
+}
+
+#[shared_test_runtime]
+pub async fn test_trash_item_file_restore() {
+	let (db, rss) = get_db_resources().await;
+
+	// Create a test file
+	let file = rss
+		.client
+		.make_file_builder("restore_me.txt", &rss.dir)
+		.build();
+	let file = rss
+		.client
+		.upload_file(file.into(), b"This file will be restored")
+		.await
+		.unwrap();
+
+	let file_path: FfiPathWithRoot =
+		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();
+
+	// Update the database to include the file
+	let parent_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	db.update_dir_children(parent_path.clone()).await.unwrap();
+
+	// Verify file exists before trashing
+	let db_obj = db.query_item(&file_path).unwrap().unwrap();
+
+	// Trash the file
+	db.trash_item(file_path.clone()).await.unwrap();
+
+	// Verify file is removed from database
+	let result = db.query_item(&file_path).unwrap();
+	assert!(result.is_none());
+
+	let trashed_db_obj = db
+		.query_item(&format!("trash/{}", file.uuid()).into())
+		.unwrap()
+		.unwrap();
+
+	match (db_obj, trashed_db_obj) {
+		(FfiObject::File(original_file), FfiObject::File(trashed_file)) => {
+			assert_eq!(original_file.uuid, trashed_file.uuid);
+			assert_eq!(original_file.name, trashed_file.name);
+			assert_eq!(original_file.size, trashed_file.size);
+			assert_eq!(trashed_file.parent, "trash");
+		}
+		(db_obj, trashed_db_obj) => panic!(
+			"Expected to find a file object in both original and trashed state {db_obj:?} {trashed_db_obj:?}"
+		),
+	}
+
+	// Restore the file
+	db.restore_item(file.uuid().as_ref(), None).await.unwrap();
+
+	// Verify the file is back in the database
+	let restored_result = db.query_item(&file_path).unwrap();
+	let restored_file = match restored_result.unwrap() {
+		FfiObject::File(restored_file) => {
+			assert_eq!(restored_file.uuid, file.uuid().to_string());
+			assert_eq!(restored_file.name, file.name());
+			assert_eq!(restored_file.size, file.size() as i64); // Size of "This file will be restored"
+			restored_file
+		}
+		_ => panic!("Expected to find a restored file object"),
+	};
+
+	// Verify the restored file is in the parent directory listing
+	db.update_dir_children(parent_path.clone()).await.unwrap();
+	let children = db.query_dir_children(&parent_path, None).unwrap().unwrap();
+	let file_exists = children
+		.objects
+		.iter()
+		.any(|obj| matches!(obj, FfiNonRootObject::File(f) if f.uuid == restored_file.uuid));
+	assert!(file_exists);
 }
 
 #[shared_test_runtime]
