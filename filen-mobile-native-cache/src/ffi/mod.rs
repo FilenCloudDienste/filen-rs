@@ -15,7 +15,7 @@ pub struct FfiFile {
 	pub created: i64,
 	pub modified: i64,
 	pub size: i64,
-	pub favorited: bool,
+	pub favorite_rank: i64,
 	pub hash: Option<Vec<u8>>,
 }
 
@@ -29,7 +29,7 @@ impl From<DBFile> for FfiFile {
 			created: file.created,
 			modified: file.modified,
 			size: file.size,
-			favorited: file.favorited,
+			favorite_rank: file.favorite_rank,
 			hash: file.hash.map(Vec::from),
 		}
 	}
@@ -45,7 +45,7 @@ pub struct FfiDir {
 	// dir
 	pub color: Option<String>,
 	pub created: Option<i64>,
-	pub favorited: bool,
+	pub favorite_rank: i64,
 
 	// cache info
 	pub last_listed: i64,
@@ -59,7 +59,7 @@ impl From<DBDir> for FfiDir {
 			name: dir.name,
 			color: dir.color,
 			created: dir.created,
-			favorited: dir.favorited,
+			favorite_rank: dir.favorite_rank,
 			last_listed: dir.last_listed,
 		}
 	}
@@ -75,7 +75,7 @@ impl From<DBDirObject> for FfiDir {
 				name: String::new(),
 				color: None,
 				created: None,
-				favorited: false,
+				favorite_rank: 0,
 				last_listed: 0,
 			},
 		}

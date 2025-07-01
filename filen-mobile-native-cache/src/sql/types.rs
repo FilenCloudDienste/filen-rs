@@ -190,7 +190,7 @@ pub struct DBFile {
 	pub(crate) modified: i64,
 	pub(crate) size: i64,
 	pub(crate) chunks: i64,
-	pub(crate) favorited: bool,
+	pub(crate) favorite_rank: i64,
 	pub(crate) region: String,
 	pub(crate) bucket: String,
 	pub(crate) hash: Option<[u8; 64]>,
@@ -211,7 +211,7 @@ impl std::fmt::Debug for DBFile {
 			.field("modified", &self.modified)
 			.field("size", &self.size)
 			.field("chunks", &self.chunks)
-			.field("favorited", &self.favorited)
+			.field("favorite_rank", &self.favorite_rank)
 			.field("region", &self.region)
 			.field("bucket", &self.bucket)
 			.field("hash", &self.hash.map(|h| faster_hex::hex_string(&h)))
@@ -246,7 +246,7 @@ impl DBFile {
 			modified: row.get(idx + 3)?,
 			size: row.get(idx + 4)?,
 			chunks: row.get(idx + 5)?,
-			favorited: row.get(idx + 6)?,
+			favorite_rank: row.get(idx + 6)?,
 			region: row.get(idx + 7)?,
 			bucket: row.get(idx + 8)?,
 			hash: row.get(idx + 9)?,
@@ -283,20 +283,23 @@ impl DBFile {
 		)?;
 		let file_key = remote_file.key().to_str();
 		let version = remote_file.key().version();
-		upsert_file.execute((
-			id,
-			remote_file.mime(),
-			&file_key,
-			remote_file.created().timestamp_millis(),
-			remote_file.last_modified().timestamp_millis(),
-			remote_file.size() as i64,
-			remote_file.chunks() as i64,
-			remote_file.favorited(),
-			remote_file.region(),
-			remote_file.bucket(),
-			remote_file.hash().map(Into::<[u8; 64]>::into),
-			version as u8,
-		))?;
+		let favorite_rank = upsert_file.query_one(
+			(
+				id,
+				remote_file.mime(),
+				&file_key,
+				remote_file.created().timestamp_millis(),
+				remote_file.last_modified().timestamp_millis(),
+				remote_file.size() as i64,
+				remote_file.chunks() as i64,
+				remote_file.favorited() as u8,
+				remote_file.region(),
+				remote_file.bucket(),
+				remote_file.hash().map(Into::<[u8; 64]>::into),
+				version as u8,
+			),
+			|r| r.get(0),
+		)?;
 		Ok(Self {
 			id,
 			uuid: remote_file.uuid(),
@@ -306,7 +309,7 @@ impl DBFile {
 			modified: remote_file.last_modified().timestamp_millis(),
 			size: remote_file.size() as i64,
 			chunks: remote_file.chunks() as i64,
-			favorited: remote_file.favorited(),
+			favorite_rank,
 			hash: remote_file.hash().map(|h| h.into()),
 			name: remote_file.file.name,
 			mime: remote_file.file.mime,
@@ -349,33 +352,36 @@ impl DBFile {
 		let size = file.size() as i64;
 		let chunks = file.chunks() as i64;
 		let hash = file.hash().map(Into::<[u8; 64]>::into);
-		{
+		let favorite_rank = {
 			let mut stmt = tx.prepare_cached(
 				"
 		UPDATE items SET uuid = ?, parent = ?, name = ? WHERE uuid = ? RETURNING id LIMIT 1;",
 			)?;
 			stmt.execute((file.uuid(), file.parent(), file.name(), self.uuid))?;
-			let mut stmt = tx.prepare_cached("UPDATE files SET mime = ?, file_key = ?, created = ?, modified = ?, size = ?, chunks = ?, favorited = ?, region = ?, bucket = ?, hash = ? WHERE id = ?")?;
+			let mut stmt = tx.prepare_cached(include_str!("../../sql/update_file.sql"))?;
 
-			stmt.execute((
-				file.mime(),
-				&file_key,
-				created,
-				modified,
-				size,
-				chunks,
-				file.favorited(),
-				file.region(),
-				file.bucket(),
-				hash,
-				self.id,
-			))?;
-		}
+			stmt.query_one(
+				(
+					file.mime(),
+					&file_key,
+					created,
+					modified,
+					size,
+					chunks,
+					file.favorited() as u8,
+					file.region(),
+					file.bucket(),
+					hash,
+					self.id,
+				),
+				|r| r.get(0),
+			)?
+		};
 
 		tx.commit()?;
 		self.uuid = file.uuid();
 		self.parent = file.parent();
-		self.favorited = file.favorited();
+		self.favorite_rank = favorite_rank;
 		self.file_key = file_key.to_string();
 		self.name = file.file.name;
 		self.mime = file.file.mime;
@@ -388,6 +394,18 @@ impl DBFile {
 		self.hash = hash;
 		Ok(())
 	}
+
+	pub(crate) fn update_favorite_rank(
+		&mut self,
+		conn: &Connection,
+		favorite_rank: i64,
+	) -> Result<()> {
+		let mut stmt =
+			conn.prepare_cached(include_str!("../../sql/update_file_favorite_rank.sql"))?;
+		stmt.execute((favorite_rank, self.id))?;
+		self.favorite_rank = favorite_rank;
+		Ok(())
+	}
 }
 
 impl DBItemTrait for DBFile {
@@ -395,7 +413,7 @@ impl DBItemTrait for DBFile {
 		self.id
 	}
 
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 
@@ -424,7 +442,7 @@ impl TryFrom<DBFile> for RemoteFile {
 			modified: DateTime::<Utc>::from_timestamp_millis(value.modified).unwrap_or_default(),
 			size: value.size as u64,
 			chunks: value.chunks as u64,
-			favorited: value.favorited,
+			favorited: value.favorite_rank > 0,
 			key: FileKey::from_str_with_version(&value.file_key, value.version.into())?,
 			region: value.region,
 			bucket: value.bucket,
@@ -446,7 +464,8 @@ impl From<RemoteFile> for DBFile {
 			modified: value.last_modified().timestamp_millis(),
 			size: value.size() as i64,
 			chunks: value.chunks() as i64,
-			favorited: value.favorited(),
+			// this might cause issues, but I'm going to go with it for now
+			favorite_rank: if value.favorited() { 1 } else { 0 },
 			hash: value.hash().map(Into::<[u8; 64]>::into),
 			version: value.key().version() as u8,
 			mime: value.file.mime,
@@ -467,7 +486,7 @@ impl PartialEq<RemoteFile> for DBFile {
 			&& self.modified == other.last_modified().timestamp_millis()
 			&& self.size as u64 == other.size()
 			&& self.chunks as u64 == other.chunks()
-			&& self.favorited == other.favorited()
+			&& (self.favorite_rank > 0) == other.favorited()
 			&& self.file_key == other.key().to_str()
 			&& self.region == other.region()
 			&& self.bucket == other.bucket()
@@ -478,11 +497,11 @@ impl PartialEq<RemoteFile> for DBFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DBDir {
 	pub(crate) id: i64,
-	pub(crate) uuid: Uuid,
+	pub(crate) uuid: UuidStr,
 	pub(crate) parent: ParentUuid,
 	pub(crate) name: String,
 	pub(crate) created: Option<i64>,
-	pub(crate) favorited: bool,
+	pub(crate) favorite_rank: i64,
 	pub(crate) color: Option<String>,
 	pub(crate) last_listed: i64,
 }
@@ -509,7 +528,7 @@ impl DBDir {
 			})?,
 			name: item.name,
 			created: row.get(idx)?,
-			favorited: row.get(idx + 1)?,
+			favorite_rank: row.get(idx + 1)?,
 			color: row.get(idx + 2)?,
 			last_listed: row.get(idx + 3)?,
 		})
@@ -542,23 +561,25 @@ impl DBDir {
 			upsert_item_conflict_uuid,
 			upsert_item_conflict_name_parent,
 		)?;
-		let last_listed = upsert_dir.query_one(
+		trace!("Upserting remote dir: {remote_dir:?}");
+		let (last_listed, favorite_rank) = upsert_dir.query_one(
 			(
 				id,
 				remote_dir.created().map(|t| t.timestamp_millis()),
-				remote_dir.favorited(),
+				remote_dir.favorited() as u8,
 				remote_dir.color().map(ToString::to_string),
 			),
 			|r| {
 				let last_listed: i64 = r.get(0)?;
-				Ok(last_listed)
+				let favorite_rank: i64 = r.get(1)?;
+				Ok((last_listed, favorite_rank))
 			},
 		)?;
 		Ok(Self {
 			id,
 			uuid: remote_dir.uuid(),
 			parent: remote_dir.parent(),
-			favorited: remote_dir.favorited(),
+			favorite_rank,
 			created: remote_dir.created().map(|t| t.timestamp_millis()),
 			name: remote_dir.name,
 			color: remote_dir.color,
@@ -586,6 +607,22 @@ impl DBDir {
 		};
 		tx.commit()?;
 		Ok(new)
+	}
+
+	pub(crate) fn update_favorite_rank(
+		&mut self,
+		conn: &Connection,
+		favorite_rank: i64,
+	) -> Result<()> {
+		trace!(
+			"Updating favorite rank for dir {} to {}",
+			self.uuid, favorite_rank
+		);
+		let mut stmt =
+			conn.prepare_cached(include_str!("../../sql/update_dir_favorite_rank.sql"))?;
+		stmt.execute((favorite_rank, self.id))?;
+		self.favorite_rank = favorite_rank;
+		Ok(())
 	}
 }
 
@@ -639,7 +676,7 @@ impl From<DBDir> for RemoteDirectory {
 			created: value
 				.created
 				.map(|t| DateTime::<Utc>::from_timestamp_millis(t).unwrap_or_default()),
-			favorited: value.favorited,
+			favorited: value.favorite_rank > 0,
 		}
 	}
 }
@@ -652,7 +689,8 @@ impl From<RemoteDirectory> for DBDir {
 			uuid: value.uuid(),
 			parent: value.parent(),
 			created: value.created().map(|t| t.timestamp_millis()),
-			favorited: value.favorited(),
+			// this might cause issues, but I'm going to go with it for now
+			favorite_rank: if value.favorited() { 1 } else { 0 },
 			last_listed: 0,
 			color: value.color,
 			name: value.name,
@@ -667,7 +705,7 @@ impl PartialEq<RemoteDirectory> for DBDir {
 			&& self.name == other.name()
 			&& self.color.as_deref() == other.color()
 			&& self.created == other.created().map(|t| t.timestamp_millis())
-			&& self.favorited == other.favorited()
+			&& (self.favorite_rank > 0) == other.favorited()
 	}
 }
 

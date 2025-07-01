@@ -751,6 +751,72 @@ impl FilenMobileCacheState {
 		self.io_delete_file(&file.uuid.to_string()).await?;
 		Ok(())
 	}
+	pub async fn set_favorite_rank(
+		&self,
+		item: FfiPathWithRoot,
+		favorite_rank: i64,
+	) -> Result<ObjectWithPathResponse> {
+		let pvs = item.as_maybe_trash_values()?;
+		debug!(
+			"Setting favorite rank for item: {}, rank: {}",
+			item.0, favorite_rank
+		);
+		let obj = match pvs {
+			MaybeTrashValues::Trash(_) => {
+				sql::select_maybe_trashed_object_at_path(&self.conn(), &pvs)?
+			}
+			MaybeTrashValues::Path(path_values) => {
+				Some(match self.update_items_in_path(&path_values).await? {
+					UpdateItemsInPath::Complete(obj) => obj,
+					UpdateItemsInPath::Partial(_, _) => {
+						return Err(CacheError::remote(format!(
+							"Path {} does not point to an item",
+							item.0
+						)));
+					}
+				})
+			}
+		}
+		.ok_or_else(|| CacheError::remote(format!("No item found at path: {}", item.0)))?;
+		let obj = match obj {
+			DBObject::File(mut dbfile) if favorite_rank != dbfile.favorite_rank => {
+				if (favorite_rank > 0) != (dbfile.favorite_rank > 0) {
+					// update server-side favorite status
+					let mut remote_file: RemoteFile = dbfile.try_into()?;
+					self.client
+						.set_favorite(&mut remote_file, favorite_rank > 0)
+						.await?;
+					dbfile = remote_file.into();
+				}
+				// update local favorite rank
+				dbfile.update_favorite_rank(&self.conn(), favorite_rank)?;
+				DBObject::File(dbfile)
+			}
+			DBObject::Dir(mut dbdir) if favorite_rank != dbdir.favorite_rank => {
+				if (favorite_rank > 0) != (dbdir.favorite_rank > 0) {
+					// update server-side favorite status
+					let mut remote_file: RemoteDirectory = dbdir.into();
+					self.client
+						.set_favorite(&mut remote_file, favorite_rank > 0)
+						.await?;
+					dbdir = remote_file.into();
+				}
+				// update local favorite rank
+				dbdir.update_favorite_rank(&self.conn(), favorite_rank)?;
+				DBObject::Dir(dbdir)
+			}
+			DBObject::Root(_) => {
+				return Err(CacheError::remote(
+					"Cannot set favorite rank for root directory",
+				));
+			}
+			obj => obj,
+		};
+		Ok(ObjectWithPathResponse {
+			object: obj.into(),
+			id: item,
+		})
+	}
 }
 
 impl FilenMobileCacheState {

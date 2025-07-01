@@ -1,6 +1,6 @@
 SELECT
     created,
-    favorited,
+    favorite_rank,
     color,
     last_listed
 FROM dirs

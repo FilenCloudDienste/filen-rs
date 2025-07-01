@@ -5,7 +5,7 @@ SELECT
     modified,
     size,
     chunks,
-    favorited,
+    favorite_rank,
     region,
     bucket,
     hash,

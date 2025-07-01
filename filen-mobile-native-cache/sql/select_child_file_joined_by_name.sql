@@ -9,7 +9,7 @@ SELECT
     files.modified,
     files.size,
     files.chunks,
-    files.favorited,
+    files.favorite_rank,
     files.region,
     files.bucket,
     files.hash,
