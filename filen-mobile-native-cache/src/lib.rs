@@ -391,10 +391,8 @@ impl FilenMobileCacheState {
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<FileWithPathResponse> {
 		let os_path = PathBuf::from(os_path);
-		let name = os_path
-			.file_name()
-			.ok_or_else(|| CacheError::remote("Invalid file name in path"))?;
-		let out_path = parent_path.join(name.to_str().unwrap());
+		let name = info.name;
+		let out_path = parent_path.join(&name);
 		debug!(
 			"Creating file at path: {}, importing from {}",
 			out_path.0,
@@ -416,7 +414,7 @@ impl FilenMobileCacheState {
 			}
 		};
 
-		let mut file = self.client.make_file_builder(info.name, &parent.uuid());
+		let mut file = self.client.make_file_builder(name, &parent.uuid());
 		if let Some(creation) = info.creation {
 			file = file.created(DateTime::from_timestamp_millis(creation).ok_or_else(|| {
 				CacheError::conversion(format!(
