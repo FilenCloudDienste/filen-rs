@@ -60,6 +60,7 @@ impl FilenMobileCacheState {
 		two_factor_code: &str,
 		files_dir: &str,
 	) -> Result<Self> {
+		debug!("Logging in with email: {email}");
 		env::init_logger();
 		let db = Connection::open(AsRef::<Path>::as_ref(files_dir).join("native_cache.db"))?;
 		db.execute_batch(include_str!("../sql/init.sql"))?;
@@ -121,6 +122,7 @@ impl FilenMobileCacheState {
 		version: u32,
 		files_dir: &str,
 	) -> Result<Self> {
+		debug!("Creating FilenMobileCacheState from strings for email: {email}");
 		env::init_logger();
 		let client = filen_sdk_rs::auth::Client::from_strings(
 			email,
@@ -169,6 +171,7 @@ pub struct QueryChildrenResponse {
 #[uniffi::export]
 impl FilenMobileCacheState {
 	pub fn query_roots_info(&self, root_uuid_str: String) -> Result<Option<FfiRoot>> {
+		debug!("Querying root info for UUID: {root_uuid_str}");
 		let conn = self.conn();
 		Ok(DBRoot::select(&conn, UuidStr::from_str(&root_uuid_str)?)
 			.optional()?
@@ -176,7 +179,7 @@ impl FilenMobileCacheState {
 	}
 
 	pub fn add_root(&self, root: &str) -> Result<()> {
-		let root_uuid = Uuid::parse_str(root)?;
+		debug!("Adding root with UUID: {root}");
 		let root_uuid = UuidStr::from_str(root)?;
 		let mut conn = self.conn();
 		sql::insert_root(&mut conn, root_uuid)?;
@@ -211,7 +214,6 @@ impl FilenMobileCacheState {
 		debug!("Querying item at path: {}", path.0);
 		let path_values = path.as_maybe_trash_values()?;
 		let obj = sql::select_maybe_trashed_object_at_path(&self.conn(), &path_values)?;
-		Ok(obj.map(Into::into))
 
 		let dir_obj = match obj {
 			Some(DBObject::Dir(dbdir)) => DBDirObject::Dir(dbdir),
@@ -245,6 +247,7 @@ impl FilenMobileCacheState {
 	}
 
 	pub fn get_all_descendant_paths(&self, path: &FfiPathWithRoot) -> Result<Vec<FfiPathWithRoot>> {
+		debug!("Getting all descendant paths for: {}", path.0);
 		let path_values = path.as_path_values()?;
 		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
 		Ok(match obj {

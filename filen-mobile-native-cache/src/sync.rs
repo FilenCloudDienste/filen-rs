@@ -11,6 +11,7 @@ use filen_sdk_rs::{
 };
 use filen_types::fs::ObjectType;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesOrdered};
+use log::debug;
 use rusqlite::Connection;
 
 use crate::{
@@ -150,7 +151,9 @@ impl FilenMobileCacheState {
 		{
 			Ok((dirs, ObjectOrRemainingPath::Object(last_item))) => {
 				let conn = &mut self.conn();
-				update_dirs(conn, dirs)?;
+				if !dirs.is_empty() {
+					update_dirs(conn, dirs)?;
+				}
 				let obj = DBObject::upsert_from_remote(conn, last_item)?;
 				Ok(UpdateItemsInPath::Complete(obj))
 			}
@@ -164,7 +167,9 @@ impl FilenMobileCacheState {
 				path_remaining,
 			)) => {
 				let conn = &mut self.conn();
-				update_dirs(conn, dirs)?;
+				if !dirs.is_empty() {
+					update_dirs(conn, dirs)?;
+				}
 				// We got a file when we expected a directory, so we update the directories and the file
 				let dir_obj = match DBObject::upsert_from_remote(conn, last_item)? {
 					DBObject::File(_) => {
@@ -182,7 +187,9 @@ impl FilenMobileCacheState {
 			}
 			Err((e, (dirs, last_item), _)) => {
 				let conn = &mut self.conn();
-				update_dirs(conn, dirs)?;
+				if !dirs.is_empty() {
+					update_dirs(conn, dirs)?;
+				}
 				DBObject::upsert_from_remote(conn, last_item)?;
 				Err(e.into())
 			}
@@ -193,6 +200,10 @@ impl FilenMobileCacheState {
 		&self,
 		path_values: &'a PathValues<'a>,
 	) -> Result<UpdateItemsInPath<'a>, CacheError> {
+		debug!(
+			"Updating items in path: {}, root: {}, name: {}",
+			path_values.full_path, path_values.root_uuid, path_values.name
+		);
 		let (objects, all) = sql::select_objects_in_path(&self.conn(), path_values)?;
 		let mut futures = get_required_update_futures(objects, all, &self.client)?;
 

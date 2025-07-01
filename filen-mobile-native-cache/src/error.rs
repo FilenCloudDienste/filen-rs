@@ -62,6 +62,44 @@ impl CacheError {
 	pub fn conversion(err: impl Into<Cow<'static, str>>) -> Self {
 		CacheError::Conversion(ErrorContext(err.into()))
 	}
+
+	pub fn io(err: impl Into<Cow<'static, str>>) -> Self {
+		CacheError::IO(ErrorContext(err.into()))
+	}
+
+	pub fn context(self, context: impl Into<Cow<'static, str>>) -> Self {
+		match self {
+			CacheError::SQL(err) => CacheError::SQL(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::SDK(err) => CacheError::SDK(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::Conversion(err) => CacheError::Conversion(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::IO(err) => CacheError::IO(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::Remote(err) => CacheError::Remote(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::Image(err) => CacheError::Image(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+		}
+	}
+}
+
+#[allow(unused)]
+pub(crate) trait CacheErrorContextExt<T> {
+	fn context(self, context: impl Into<Cow<'static, str>>) -> Result<T, CacheError>;
+}
+
+impl<T> CacheErrorContextExt<T> for Result<T, CacheError> {
+	fn context(self, context: impl Into<Cow<'static, str>>) -> Result<T, CacheError> {
+		self.map_err(|e| e.context(context))
+	}
 }
 
 impl std::fmt::Display for CacheError {
