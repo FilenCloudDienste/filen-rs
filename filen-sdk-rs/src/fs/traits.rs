@@ -1,9 +1,8 @@
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::{ObjectType, ParentUuid},
+	fs::{ObjectType, ParentUuid, UuidStr},
 };
 use rsa::RsaPublicKey;
-use uuid::Uuid;
 
 use crate::crypto::{error::ConversionError, shared::MetaCrypter};
 
@@ -20,11 +19,11 @@ pub trait SetRemoteInfo {
 }
 
 pub trait HasUUID: Send + Sync {
-	fn uuid(&self) -> Uuid;
+	fn uuid(&self) -> UuidStr;
 }
 
-impl HasUUID for Uuid {
-	fn uuid(&self) -> Uuid {
+impl HasUUID for UuidStr {
+	fn uuid(&self) -> UuidStr {
 		*self
 	}
 }

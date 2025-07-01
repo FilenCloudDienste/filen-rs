@@ -2,21 +2,20 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::crypto::EncryptedString;
+use crate::{crypto::EncryptedString, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/dir/link/info";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub parent: Uuid,
+	pub parent: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
 	pub has_password: bool,
 	#[serde(with = "crate::serde::hex::optional")]

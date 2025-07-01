@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
-use filen_types::fs::ParentUuid;
-use uuid::Uuid;
+use filen_types::fs::{ParentUuid, UuidStr};
 
 use crate::fs::traits::HasUUID;
 
@@ -10,7 +9,7 @@ pub trait HasContents: Send + Sync {
 	fn uuid_as_parent(&self) -> ParentUuid;
 }
 
-impl HasContents for Uuid {
+impl HasContents for UuidStr {
 	fn uuid_as_parent(&self) -> ParentUuid {
 		ParentUuid::from(*self)
 	}

@@ -14,10 +14,9 @@ use filen_sdk_rs::{
 	},
 	util::PathIteratorExt,
 };
-use filen_types::fs::ParentUuid;
+use filen_types::fs::{ParentUuid, UuidStr};
 use log::debug;
-use rusqlite::Connection;
-use uuid::Uuid;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::{
 	ffi::FfiPathWithRoot,
@@ -171,13 +170,14 @@ pub struct QueryChildrenResponse {
 impl FilenMobileCacheState {
 	pub fn query_roots_info(&self, root_uuid_str: String) -> Result<Option<FfiRoot>> {
 		let conn = self.conn();
-		Ok(DBRoot::select(&conn, Uuid::from_str(&root_uuid_str)?)
+		Ok(DBRoot::select(&conn, UuidStr::from_str(&root_uuid_str)?)
 			.optional()?
 			.map(Into::into))
 	}
 
 	pub fn add_root(&self, root: &str) -> Result<()> {
 		let root_uuid = Uuid::parse_str(root)?;
+		let root_uuid = UuidStr::from_str(root)?;
 		let mut conn = self.conn();
 		sql::insert_root(&mut conn, root_uuid)?;
 		Ok(())
@@ -219,7 +219,7 @@ impl FilenMobileCacheState {
 		if uuid == self.root_uuid() {
 			return Ok(Some(uuid.into()));
 		}
-		let uuid = Uuid::parse_str(&uuid)?;
+		let uuid = UuidStr::from_str(&uuid)?;
 		let conn = self.conn();
 		let path = sql::recursive_select_path_from_uuid(&conn, uuid)?;
 
@@ -323,7 +323,7 @@ impl FilenMobileCacheState {
 		progress_callback: Arc<dyn ProgressCallback>,
 	) -> Result<String> {
 		debug!("Downloading file with UUID: {uuid}");
-		let uuid = Uuid::parse_str(&uuid).unwrap();
+		let uuid = UuidStr::from_str(&uuid).unwrap();
 		let file = DBFile::select(&self.conn(), uuid)
 			.optional()?
 			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {uuid}")))?;
@@ -342,14 +342,14 @@ impl FilenMobileCacheState {
 		let remote_file = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => {
 				if let Some(hash) = file.hash {
-					let local_hash = self.hash_local_file(&file.uuid.to_string()).await?;
+					let local_hash = self.hash_local_file(file.uuid.as_ref()).await?;
 					if local_hash == Some(hash.into()) {
 						return Ok(false);
 					}
 				}
 
 				self.io_upload_updated_file(
-					&file.uuid.to_string(),
+					file.uuid.as_ref(),
 					path_values.name,
 					file.parent.try_into().map_err(|e| {
 						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
@@ -568,7 +568,7 @@ impl FilenMobileCacheState {
 			DBObject::File(file) => {
 				let remote_file = file.clone().try_into()?;
 				self.client.trash_file(&remote_file).await?;
-				self.io_delete_file(&remote_file.uuid().to_string()).await?;
+				self.io_delete_file(remote_file.uuid().as_ref()).await?;
 				file.trash(&self.conn())?;
 				DBObject::File(remote_file.into())
 			}
@@ -584,8 +584,9 @@ impl FilenMobileCacheState {
 		uuid: &str,
 		to: Option<FfiPathWithRoot>,
 	) -> Result<ObjectWithPathResponse> {
-		debug!("Untrashing item with UUID: {uuid}");
-		let uuid = Uuid::parse_str(uuid)?;
+		debug!("Untrashing item with UUID: {uuid} to parent: {to:?}");
+		let uuid = UuidStr::from_str(uuid)
+			.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?;
 		let object = {
 			let conn = self.conn();
 			DBNonRootObject::select(&conn, uuid)?
@@ -785,7 +786,7 @@ impl FilenMobileCacheState {
 			Some(DBObject::File(file)) => file,
 			_ => return Ok(()),
 		};
-		self.io_delete_file(&file.uuid.to_string()).await?;
+		self.io_delete_file(file.uuid.as_ref()).await?;
 		Ok(())
 	}
 	pub async fn set_favorite_rank(
@@ -920,7 +921,7 @@ impl FilenMobileCacheState {
 	async fn inner_move_item(
 		&self,
 		item: DBNonRootObject,
-		new_parent_uuid: Uuid,
+		new_parent_uuid: UuidStr,
 	) -> Result<DBNonRootObject> {
 		match item {
 			DBNonRootObject::Dir(dir) => {
@@ -988,19 +989,22 @@ pub struct UploadFileInfo {
 	pub mime: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct PathValues<'a> {
-	pub root_uuid: Uuid,
+	pub root_uuid: UuidStr,
 	pub full_path: &'a str,
 	pub inner_path: &'a str,
 	pub name: &'a str,
 }
 
+#[derive(Debug)]
 pub struct TrashValues<'a> {
 	pub full_path: &'a str,
 	pub inner_path: &'a str,
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 }
 
+#[derive(Debug)]
 pub enum MaybeTrashValues<'a> {
 	Trash(TrashValues<'a>),
 	Path(PathValues<'a>),
@@ -1014,8 +1018,9 @@ impl FfiPathWithRoot {
 			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;
 
 		Ok(PathValues {
-			root_uuid: Uuid::parse_str(root_uuid_str)
-				.map_err(|e| CacheError::conversion(format!("Invalid root UUID: {e}")))?,
+			root_uuid: UuidStr::from_str(root_uuid_str).map_err(|e| {
+				CacheError::conversion(format!("Invalid root UUID: {root_uuid_str} error: {e} "))
+			})?,
 			full_path: self.0.as_str(),
 			inner_path: remaining,
 			name: iter.last().unwrap_or_default().0,
@@ -1032,7 +1037,7 @@ impl FfiPathWithRoot {
 			"trash" => Ok(MaybeTrashValues::Trash(TrashValues {
 				full_path: self.0.as_str(),
 				inner_path: remaining,
-				uuid: Uuid::parse_str(iter.last().unwrap_or_default().0)?,
+				uuid: UuidStr::from_str(iter.last().unwrap_or_default().0)?,
 			})),
 			_ => Ok(MaybeTrashValues::Path(self.as_path_values()?)),
 		}

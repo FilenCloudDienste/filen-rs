@@ -2,9 +2,8 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::{auth::FileEncryptionVersion, crypto::rsa::RSAEncryptedString};
+use crate::{auth::FileEncryptionVersion, crypto::rsa::RSAEncryptedString, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/shared/in";
 
@@ -12,7 +11,7 @@ pub const ENDPOINT: &str = "v3/shared/in";
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	#[serde(with = "crate::serde::uuid::shared_in")]
-	pub uuid: Option<Uuid>,
+	pub uuid: Option<UuidStr>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -27,8 +26,8 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedFileIn<'a> {
-	pub uuid: Uuid,
-	pub parent: Option<Uuid>,
+	pub uuid: UuidStr,
+	pub parent: Option<UuidStr>,
 	pub metadata: Cow<'a, RSAEncryptedString>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
@@ -46,8 +45,8 @@ pub struct SharedFileIn<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedDirIn<'a> {
-	pub uuid: Uuid,
-	pub parent: Option<Uuid>,
+	pub uuid: UuidStr,
+	pub parent: Option<UuidStr>,
 	pub metadata: Cow<'a, RSAEncryptedString>,
 	pub sharer_email: Cow<'a, str>,
 	pub sharer_id: u64,

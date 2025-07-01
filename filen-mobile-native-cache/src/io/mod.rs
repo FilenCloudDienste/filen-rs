@@ -14,13 +14,12 @@ use filen_sdk_rs::{
 	},
 	io::FilenMetaExt,
 };
-use filen_types::crypto::Sha512Hash;
+use filen_types::{crypto::Sha512Hash, fs::UuidStr};
 use sha2::Digest;
 use tokio::{io::AsyncReadExt, sync::mpsc::UnboundedReceiver};
 use tokio_util::compat::{
 	FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
 };
-use uuid::Uuid;
 
 #[cfg(windows)]
 fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
@@ -238,7 +237,7 @@ impl FilenMobileCacheState {
 		&self,
 		old_uuid: &str,
 		name: &str,
-		parent_uuid: Uuid,
+		parent_uuid: UuidStr,
 		mime: String,
 		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
 	) -> Result<RemoteFile, io::Error> {
@@ -255,7 +254,7 @@ impl FilenMobileCacheState {
 	pub(crate) async fn io_upload_new_file(
 		&self,
 		name: &str,
-		parent_uuid: Uuid,
+		parent_uuid: UuidStr,
 		mime: Option<String>,
 	) -> Result<(RemoteFile, PathBuf), io::Error> {
 		let mut file_builder = self.client.make_file_builder(name, &parent_uuid);

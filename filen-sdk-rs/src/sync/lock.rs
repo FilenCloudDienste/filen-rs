@@ -1,9 +1,8 @@
 use std::{borrow::Cow, sync::Arc, time};
 
-use filen_types::api::v3::user::lock::LockType;
+use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
 use futures_timer::Delay;
 use log::debug;
-use uuid::Uuid;
 
 use crate::{
 	api,
@@ -13,7 +12,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLock {
-	uuid: Uuid,
+	uuid: UuidStr,
 	client: Arc<AuthClient>,
 	resource: String,
 }
@@ -24,7 +23,7 @@ impl ResourceLock {
 	}
 }
 
-async fn actually_drop(client: &AuthClient, uuid: Uuid, resource: &str) {
+async fn actually_drop(client: &AuthClient, uuid: UuidStr, resource: &str) {
 	match api::v3::user::lock::post(
 		client,
 		&api::v3::user::lock::Request {
@@ -72,7 +71,7 @@ impl Drop for ResourceLock {
 }
 
 impl Client {
-	async fn try_acquire_lock(&self, resource: &str, uuid: Uuid) -> Result<bool, Error> {
+	async fn try_acquire_lock(&self, resource: &str, uuid: UuidStr) -> Result<bool, Error> {
 		let response = api::v3::user::lock::post(
 			self.client(),
 			&api::v3::user::lock::Request {
@@ -92,7 +91,7 @@ impl Client {
 		attempts: usize,
 	) -> Result<ResourceLock, Error> {
 		let resource = resource.into();
-		let uuid = Uuid::new_v4();
+		let uuid = UuidStr::new_v4();
 		for attempt in 1..=attempts {
 			match self.try_acquire_lock(&resource, uuid).await {
 				Ok(false) => {}

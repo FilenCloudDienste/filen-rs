@@ -1,7 +1,11 @@
 macro_rules! parent_uuid_option_module {
 	($mod_name:ident, $none_value:expr) => {
 		pub mod $mod_name {
+			use std::str::FromStr;
+
 			use serde::{Deserialize, Serialize};
+
+			use crate::fs::UuidStr;
 
 			pub fn deserialize<'de, D>(
 				deserializer: D,
@@ -13,7 +17,7 @@ macro_rules! parent_uuid_option_module {
 				Ok(match value {
 					$none_value => None,
 					string => Some(
-						uuid::Uuid::parse_str(string)
+						UuidStr::from_str(string)
 							.map_err(serde::de::Error::custom)?
 							.into(),
 					),

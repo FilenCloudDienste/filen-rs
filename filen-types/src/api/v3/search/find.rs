@@ -2,11 +2,11 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, Sha256Hash},
+	fs::UuidStr,
 };
 
 pub const ENDPOINT: &str = "v3/search/find";
@@ -35,7 +35,7 @@ pub enum SearchFindItem<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchFindFile<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
@@ -43,12 +43,12 @@ pub struct SearchFindFile<'a> {
 	pub size: u64,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
-	pub parent: Uuid,
+	pub parent: UuidStr,
 	pub version: FileEncryptionVersion,
 	pub favorited: bool,
 	pub trash: bool,
 	pub versioned: bool,
-	pub uuid_path: Vec<Uuid>,
+	pub uuid_path: Vec<UuidStr>,
 	pub metadata_path: Vec<Cow<'a, EncryptedString>>,
 	pub name_hashed: Cow<'a, str>,
 }
@@ -56,15 +56,15 @@ pub struct SearchFindFile<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchFindDirectory<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
-	pub parent: Uuid,
+	pub parent: UuidStr,
 	pub color: Option<Cow<'a, str>>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
 	pub trash: bool,
-	pub uuid_path: Vec<Uuid>,
+	pub uuid_path: Vec<UuidStr>,
 	pub metadata_path: Vec<Cow<'a, EncryptedString>>,
 	pub name_hashed: Cow<'a, str>,
 }

@@ -3,10 +3,9 @@ use std::borrow::Cow;
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	crypto::EncryptedString,
-	fs::{ObjectType, ParentUuid},
+	fs::{ObjectType, ParentUuid, UuidStr},
 };
 use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, SetDirMeta};
-use uuid::Uuid;
 
 use crate::{crypto::shared::MetaCrypter, error::Error, fs::SetRemoteInfo};
 
@@ -23,17 +22,17 @@ pub use traits::{HasContents, HasUUIDContents};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootDirectory {
-	uuid: Uuid,
+	uuid: UuidStr,
 }
 
 impl RootDirectory {
-	pub fn new(uuid: Uuid) -> Self {
+	pub fn new(uuid: UuidStr) -> Self {
 		Self { uuid }
 	}
 }
 
 impl HasUUID for RootDirectory {
-	fn uuid(&self) -> uuid::Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 }
@@ -45,7 +44,7 @@ impl HasContents for RootDirectory {
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RootDirectoryWithMeta {
-	uuid: Uuid,
+	uuid: UuidStr,
 	name: String,
 
 	color: Option<String>,
@@ -53,7 +52,7 @@ pub struct RootDirectoryWithMeta {
 }
 
 impl RootDirectoryWithMeta {
-	pub fn from_meta(uuid: Uuid, color: Option<String>, meta: DirectoryMeta<'_>) -> Self {
+	pub fn from_meta(uuid: UuidStr, color: Option<String>, meta: DirectoryMeta<'_>) -> Self {
 		Self {
 			uuid,
 			name: meta.name.into_owned(),
@@ -64,7 +63,7 @@ impl RootDirectoryWithMeta {
 }
 
 impl HasUUID for RootDirectoryWithMeta {
-	fn uuid(&self) -> uuid::Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 }
@@ -129,7 +128,7 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RemoteDirectory {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub name: String,
 	pub parent: ParentUuid,
 
@@ -140,7 +139,7 @@ pub struct RemoteDirectory {
 
 impl RemoteDirectory {
 	pub fn from_encrypted(
-		uuid: Uuid,
+		uuid: UuidStr,
 		parent: ParentUuid,
 		color: Option<String>,
 		favorited: bool,
@@ -159,7 +158,7 @@ impl RemoteDirectory {
 	}
 
 	pub fn from_meta(
-		uuid: Uuid,
+		uuid: UuidStr,
 		parent: ParentUuid,
 		color: Option<String>,
 		favorited: bool,
@@ -180,7 +179,7 @@ impl RemoteDirectory {
 			return Err(Error::InvalidName(name));
 		}
 		Ok(Self {
-			uuid: Uuid::new_v4(),
+			uuid: UuidStr::new_v4(),
 			name,
 			parent,
 			color: None,
@@ -189,7 +188,7 @@ impl RemoteDirectory {
 		})
 	}
 
-	pub(crate) fn set_uuid(&mut self, uuid: Uuid) {
+	pub(crate) fn set_uuid(&mut self, uuid: UuidStr) {
 		self.uuid = uuid;
 	}
 
@@ -203,7 +202,7 @@ impl RemoteDirectory {
 }
 
 impl HasUUID for RemoteDirectory {
-	fn uuid(&self) -> uuid::Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 }

@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use crate::fs::UuidStr;
+
 pub const ENDPOINT: &str = "v3/dir/size";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: uuid::Uuid,
+	pub uuid: UuidStr,
 	#[serde(with = "crate::serde::option::default")]
 	pub sharer_id: Option<u64>,
 	#[serde(with = "crate::serde::option::default")]

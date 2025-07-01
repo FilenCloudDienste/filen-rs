@@ -2,19 +2,18 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString};
+use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/dir/link/content";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	#[serde(with = "faster_hex::nopfx_ignorecase")]
 	pub password: Cow<'a, [u8]>,
-	pub parent: Uuid,
+	pub parent: UuidStr,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -28,8 +27,8 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Directory<'a> {
-	pub uuid: Uuid,
-	pub parent: Uuid,
+	pub uuid: UuidStr,
+	pub parent: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
 	#[serde(with = "chrono::serde::ts_seconds")]
 	pub timestamp: DateTime<Utc>,
@@ -39,8 +38,8 @@ pub struct Directory<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
-	pub uuid: Uuid,
-	pub parent: Uuid,
+	pub uuid: UuidStr,
+	pub parent: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
 	#[serde(with = "chrono::serde::ts_seconds")]
 	pub timestamp: DateTime<Utc>,

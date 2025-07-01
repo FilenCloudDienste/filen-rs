@@ -10,7 +10,7 @@ use filen_types::{
 	},
 	auth::FileEncryptionVersion,
 	crypto::rsa::{EncodedPublicKey, RSAEncryptedString},
-	fs::ObjectType,
+	fs::{ObjectType, UuidStr},
 };
 use fs::{SharedDirectory, SharedFile};
 use futures::{
@@ -18,7 +18,6 @@ use futures::{
 	stream::{FuturesUnordered, StreamExt},
 };
 use rsa::RsaPublicKey;
-use uuid::Uuid;
 
 use crate::{
 	api,
@@ -44,7 +43,7 @@ pub struct User {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkedFileInfo {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub name: String,
 	pub mime: String,
 	pub hashed_password: Option<Vec<u8>>,
@@ -126,7 +125,7 @@ impl PasswordState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePublicLink {
-	link_uuid: Uuid,
+	link_uuid: UuidStr,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
@@ -136,7 +135,7 @@ pub struct FilePublicLink {
 impl FilePublicLink {
 	pub(crate) fn new() -> Self {
 		Self {
-			link_uuid: Uuid::new_v4(),
+			link_uuid: UuidStr::new_v4(),
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
 			downloadable: true,
@@ -144,7 +143,7 @@ impl FilePublicLink {
 		}
 	}
 
-	pub fn uuid(&self) -> Uuid {
+	pub fn uuid(&self) -> UuidStr {
 		self.link_uuid
 	}
 
@@ -180,7 +179,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirPublicLink {
-	link_uuid: Uuid,
+	link_uuid: UuidStr,
 	link_key: MetaKey,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
@@ -191,7 +190,7 @@ pub struct DirPublicLink {
 impl DirPublicLink {
 	pub(crate) fn new(link_key: MetaKey) -> Self {
 		Self {
-			link_uuid: Uuid::new_v4(),
+			link_uuid: UuidStr::new_v4(),
 			link_key,
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
@@ -200,7 +199,7 @@ impl DirPublicLink {
 		}
 	}
 
-	pub fn uuid(&self) -> Uuid {
+	pub fn uuid(&self) -> UuidStr {
 		self.link_uuid
 	}
 
@@ -269,7 +268,7 @@ impl Client {
 	async fn update_linked_item_meta<I>(
 		&self,
 		item: &I,
-		link_uuid: Uuid,
+		link_uuid: UuidStr,
 		crypter: &impl MetaCrypter,
 	) -> Result<(), Error>
 	where

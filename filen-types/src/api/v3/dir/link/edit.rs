@@ -1,16 +1,15 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::api::v3::dir::link::PublicLinkExpiration;
+use crate::{api::v3::dir::link::PublicLinkExpiration, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/dir/link/edit";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub expiration: PublicLinkExpiration,
 	#[serde(with = "crate::serde::boolean::empty_notempty")]
 	pub password: bool,

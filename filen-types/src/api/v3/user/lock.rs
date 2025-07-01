@@ -1,14 +1,15 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+
+use crate::fs::UuidStr;
 
 pub const ENDPOINT: &str = "v3/user/lock";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub r#type: LockType,
 	pub resource: Cow<'a, str>,
 }

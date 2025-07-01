@@ -10,12 +10,12 @@ use digest::Digest;
 use filen_types::{
 	auth::{APIKey, AuthVersion, FileEncryptionVersion, MetaEncryptionVersion},
 	crypto::{EncryptedMetaKey, EncryptedString},
+	fs::UuidStr,
 };
 use http::{AuthClient, UnauthClient};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 use crate::{
 	api,
@@ -358,7 +358,7 @@ impl Client {
 
 		Ok(Client {
 			email,
-			root_dir: RootDirectory::new(Uuid::from_str(root_uuid)?),
+			root_dir: RootDirectory::new(UuidStr::from_str(root_uuid)?),
 			auth_info,
 			file_encryption_version,
 			meta_encryption_version,

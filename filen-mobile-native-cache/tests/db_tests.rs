@@ -7,6 +7,7 @@ use filen_mobile_native_cache::{
 };
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs_macros::shared_test_runtime;
+use filen_types::fs::UuidStr;
 use rand::TryRngCore;
 use test_log::test;
 use test_utils::TestResources;
@@ -92,7 +93,7 @@ pub async fn test_query_root_after_update() {
 pub async fn test_query_root_nonexistent() {
 	let (db, _rss) = get_db_resources().await;
 
-	let fake_uuid = uuid::Uuid::new_v4().to_string();
+	let fake_uuid = UuidStr::new_v4().to_string();
 	let result = db.query_roots_info(fake_uuid).unwrap();
 	assert!(result.is_none());
 }

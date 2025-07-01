@@ -2,16 +2,15 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::api::v3::dir::link::PublicLinkExpiration;
+use crate::{api::v3::dir::link::PublicLinkExpiration, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/file/link/status";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 }
 
 #[derive(Debug, Clone)]
@@ -19,7 +18,7 @@ pub struct Response<'a>(pub Option<LinkStatus<'a>>);
 
 #[derive(Debug, Clone)]
 pub struct LinkStatus<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub expiration: DateTime<Utc>,
 	pub expiration_text: PublicLinkExpiration,
 	pub download_btn: bool,
@@ -30,7 +29,7 @@ pub struct LinkStatus<'a> {
 #[serde(rename_all = "camelCase")]
 struct RawResponse<'a> {
 	enabled: bool,
-	uuid: Option<Uuid>,
+	uuid: Option<UuidStr>,
 	#[serde(with = "crate::serde::time::optional")]
 	expiration: Option<DateTime<Utc>>,
 	expiration_text: Option<PublicLinkExpiration>,

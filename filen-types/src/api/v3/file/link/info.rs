@@ -2,15 +2,14 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString};
+use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/file/link/info";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	#[serde(with = "faster_hex::nopfx_ignorecase")]
 	pub password: Cow<'a, [u8]>,
 }
@@ -18,7 +17,7 @@ pub struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub name: Cow<'a, EncryptedString>,
 	pub mime: Cow<'a, EncryptedString>,
 	#[serde(with = "crate::serde::hex::optional")]

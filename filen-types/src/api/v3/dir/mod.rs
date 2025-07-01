@@ -13,22 +13,24 @@ pub mod trash;
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 pub const ENDPOINT: &str = "v3/dir";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 }
 
-use crate::{crypto::EncryptedString, fs::ParentUuid};
+use crate::{
+	crypto::EncryptedString,
+	fs::{ParentUuid, UuidStr},
+};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	#[serde(rename = "nameEncrypted")]
 	pub metadata: Cow<'a, EncryptedString>,
 	pub name_hashed: Cow<'a, str>,

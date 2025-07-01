@@ -3,8 +3,8 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use filen_types::fs::UuidStr;
 use futures::TryFutureExt;
-use uuid::Uuid;
 
 use crate::{
 	api,
@@ -63,7 +63,7 @@ impl Client {
 		Ok(dir)
 	}
 
-	pub async fn get_dir(&self, uuid: Uuid) -> Result<RemoteDirectory, Error> {
+	pub async fn get_dir(&self, uuid: UuidStr) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
 		RemoteDirectory::from_encrypted(
@@ -80,7 +80,7 @@ impl Client {
 		&self,
 		parent: &dyn HasUUIDContents,
 		name: &str,
-	) -> Result<Option<uuid::Uuid>, Error> {
+	) -> Result<Option<UuidStr>, Error> {
 		api::v3::dir::exists::post(
 			self.client(),
 			&api::v3::dir::exists::Request {

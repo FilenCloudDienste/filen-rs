@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+
+use crate::fs::UuidStr;
 
 pub const ENDPOINT: &str = "v3/contacts/requests/send";
 
@@ -14,5 +15,5 @@ pub struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 }

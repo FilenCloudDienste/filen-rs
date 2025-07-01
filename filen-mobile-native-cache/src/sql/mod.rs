@@ -1,6 +1,6 @@
-use filen_types::fs::ParentUuid;
+use filen_types::fs::{ParentUuid, UuidStr};
+use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use rusqlite::{Connection, OptionalExtension};
-use uuid::Uuid;
 
 pub mod types;
 pub use types::*;
@@ -74,7 +74,7 @@ pub(crate) fn select_maybe_trashed_object_at_path<'a>(
 	}
 }
 
-pub(crate) fn insert_root(conn: &mut Connection, root: Uuid) -> Result<(), rusqlite::Error> {
+pub(crate) fn insert_root(conn: &mut Connection, root: UuidStr) -> Result<(), rusqlite::Error> {
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{
 		let mut stmt = tx.prepare_cached(
@@ -105,7 +105,7 @@ pub(crate) fn insert_root(conn: &mut Connection, root: Uuid) -> Result<(), rusql
 
 pub(crate) fn update_root(
 	conn: &Connection,
-	root_uuid: Uuid,
+	root_uuid: UuidStr,
 	response: &filen_types::api::v3::user::info::Response<'_>,
 ) -> Result<(), rusqlite::Error> {
 	let id: i64 = conn.query_one("SELECT id FROM items WHERE uuid = ?;", [root_uuid], |row| {
@@ -121,7 +121,7 @@ pub(crate) fn update_root(
 
 pub(crate) fn move_item(
 	conn: &mut Connection,
-	item_uuid: Uuid,
+	item_uuid: UuidStr,
 	item_name: &str,
 	new_parent_uuid: ParentUuid,
 ) -> Result<(), rusqlite::Error> {
@@ -158,14 +158,14 @@ pub(crate) fn rename_item(
 }
 
 fn get_all_descendant_paths_with_stmt(
-	uuid: Uuid,
+	uuid: UuidStr,
 	current_path: &str,
 	stmt: &mut rusqlite::CachedStatement<'_>,
 	paths: &mut Vec<String>,
 ) -> Result<(), rusqlite::Error> {
 	let items = stmt
 		.query_and_then([uuid], |f| -> Result<_, rusqlite::Error> {
-			let uuid = f.get::<_, Uuid>(0)?;
+			let uuid = f.get::<_, UuidStr>(0)?;
 			let name = f.get::<_, String>(1)?;
 			let item_type = f.get::<_, ItemType>(2)?;
 			Ok((uuid, name, item_type))
@@ -183,7 +183,7 @@ fn get_all_descendant_paths_with_stmt(
 
 pub(crate) fn get_all_descendant_paths(
 	conn: &Connection,
-	uuid: Uuid,
+	uuid: UuidStr,
 	current_path: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached("SELECT uuid, name, type FROM items WHERE parent = ?;")?;
@@ -194,7 +194,7 @@ pub(crate) fn get_all_descendant_paths(
 
 pub(crate) fn recursive_select_path_from_uuid(
 	conn: &Connection,
-	uuid: Uuid,
+	uuid: UuidStr,
 ) -> Result<Option<String>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(include_str!(
 		"../../sql/recursive_select_path_from_uuid.sql"

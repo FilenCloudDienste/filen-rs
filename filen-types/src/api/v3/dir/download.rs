@@ -3,7 +3,11 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::ParentUuid};
+use crate::{
+	auth::FileEncryptionVersion,
+	crypto::EncryptedString,
+	fs::{ParentUuid, UuidStr},
+};
 
 pub const ENDPOINT: &str = "v3/dir/download";
 
@@ -25,7 +29,7 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Directory<'a> {
-	pub uuid: uuid::Uuid,
+	pub uuid: UuidStr,
 	#[serde(rename = "name")]
 	pub meta: Cow<'a, EncryptedString>,
 	#[serde(with = "crate::serde::parent_uuid::base")]
@@ -40,7 +44,7 @@ pub struct Directory<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
-	pub uuid: uuid::Uuid,
+	pub uuid: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,

@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
-use filen_types::fs::{ObjectType, ParentUuid};
-use uuid::Uuid;
+use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 
 use super::{
 	HasMeta, HasName, HasParent, HasType, HasUUID,
@@ -124,7 +123,7 @@ impl HasMeta for NonRootFSObject<'_> {
 }
 
 impl HasUUID for NonRootFSObject<'_> {
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		match self {
 			NonRootFSObject::Dir(dir) => dir.uuid(),
 			NonRootFSObject::File(file) => file.uuid(),

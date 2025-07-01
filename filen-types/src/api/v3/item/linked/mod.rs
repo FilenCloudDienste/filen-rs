@@ -1,9 +1,8 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::crypto::EncryptedMetaKey;
+use crate::{crypto::EncryptedMetaKey, fs::UuidStr};
 
 pub mod rename;
 
@@ -12,7 +11,7 @@ pub const ENDPOINT: &str = "v3/item/linked";
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -26,6 +25,6 @@ pub struct Response<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct ListedPublicLink<'a> {
 	#[serde(rename = "linkUUID")]
-	pub link_uuid: Uuid,
+	pub link_uuid: UuidStr,
 	pub link_key: Cow<'a, EncryptedMetaKey>,
 }

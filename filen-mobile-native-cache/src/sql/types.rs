@@ -12,7 +12,7 @@ use filen_sdk_rs::{
 		},
 	},
 };
-use filen_types::fs::ParentUuid;
+use filen_types::fs::{ParentUuid, UuidStr};
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use log::trace;
 use rusqlite::{
@@ -20,7 +20,6 @@ use rusqlite::{
 	types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
 };
 use sha2::Digest;
-use uuid::Uuid;
 
 use super::SQLError;
 
@@ -64,14 +63,14 @@ impl ToSql for ItemType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawDBItem {
 	pub(crate) id: i64,
-	pub(crate) uuid: Uuid,
+	pub(crate) uuid: UuidStr,
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) name: String,
 	pub(crate) type_: ItemType,
 }
 
 fn upsert_item_with_stmts(
-	uuid: Uuid,
+	uuid: UuidStr,
 	parent: Option<ParentUuid>,
 	name: &str,
 	type_: ItemType,
@@ -105,7 +104,7 @@ fn upsert_item_with_stmts(
 
 fn upsert_item(
 	conn: &Connection,
-	uuid: Uuid,
+	uuid: UuidStr,
 	parent: Option<ParentUuid>,
 	name: &str,
 	type_: ItemType,
@@ -134,7 +133,7 @@ impl RawDBItem {
 		})
 	}
 
-	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> Result<Option<Self>> {
+	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> Result<Option<Self>> {
 		let mut stmt = conn.prepare_cached(include_str!("../../sql/select_item.sql"))?;
 		stmt.query_one([uuid], Self::from_row).optional()
 	}
@@ -151,7 +150,7 @@ impl RawDBItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnerDBItem {
 	pub(crate) id: i64,
-	pub(crate) uuid: Uuid,
+	pub(crate) uuid: UuidStr,
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) name: String,
 }
@@ -181,7 +180,7 @@ impl From<RawDBItem> for InnerDBItem {
 #[derive(Clone, PartialEq, Eq)]
 pub struct DBFile {
 	pub(crate) id: i64,
-	pub(crate) uuid: Uuid,
+	pub(crate) uuid: UuidStr,
 	pub(crate) parent: ParentUuid,
 	pub(crate) name: String,
 	pub(crate) mime: String,
@@ -254,7 +253,7 @@ impl DBFile {
 		})
 	}
 
-	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
 		match DBObject::select(conn, uuid)? {
 			DBObject::File(file) => Ok(file),
 			obj => Err(SQLError::UnexpectedType(obj.item_type(), ItemType::File)),
@@ -540,7 +539,7 @@ impl DBDir {
 		Ok(res)
 	}
 
-	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
 		match DBObject::select(conn, uuid)? {
 			DBObject::Dir(dir) => Ok(dir),
 			obj => Err(SQLError::UnexpectedType(obj.item_type(), ItemType::Dir)),
@@ -631,7 +630,7 @@ impl DBDirTrait for DBDir {
 		self.id
 	}
 
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 
@@ -649,7 +648,7 @@ impl DBItemTrait for DBDir {
 		self.id
 	}
 
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 
@@ -712,7 +711,7 @@ impl PartialEq<RemoteDirectory> for DBDir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DBRoot {
 	pub(crate) id: i64,
-	pub(crate) uuid: Uuid,
+	pub(crate) uuid: UuidStr,
 	pub(crate) storage_used: i64,
 	pub(crate) max_storage: i64,
 	pub(crate) last_updated: i64,
@@ -744,7 +743,7 @@ impl DBRoot {
 		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))
 	}
 
-	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
 		match DBObject::select(conn, uuid)? {
 			DBObject::Root(root) => Ok(root),
 			obj => Err(SQLError::UnexpectedType(obj.item_type(), ItemType::Root)),
@@ -799,7 +798,7 @@ impl DBDirTrait for DBRoot {
 		self.id
 	}
 
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 
@@ -813,7 +812,7 @@ impl DBItemTrait for DBRoot {
 		self.id
 	}
 
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 
@@ -844,7 +843,7 @@ pub enum DBObject {
 }
 
 impl DBObject {
-	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> Result<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> Result<Self> {
 		let mut stmt = conn.prepare_cached(include_str!("../../sql/select_object.sql"))?;
 		stmt.query_one([uuid], |row| {
 			let item = RawDBItem::from_row(row)?;
@@ -864,7 +863,7 @@ impl DBObject {
 		}
 	}
 
-	pub(crate) fn uuid(&self) -> Uuid {
+	pub(crate) fn uuid(&self) -> UuidStr {
 		match self {
 			DBObject::File(file) => file.uuid,
 			DBObject::Dir(dir) => dir.uuid,
@@ -966,7 +965,7 @@ impl DBDirTrait for DBDirObject {
 		}
 	}
 
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		match self {
 			DBDirObject::Dir(dir) => DBDirTrait::uuid(dir),
 			DBDirObject::Root(root) => DBDirTrait::uuid(root),
@@ -988,7 +987,7 @@ pub enum DBNonRootObject {
 }
 
 impl DBNonRootObject {
-	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
 		Ok(match DBObject::select(conn, uuid)? {
 			DBObject::Dir(dir) => DBNonRootObject::Dir(dir),
 			DBObject::File(file) => DBNonRootObject::File(file),
@@ -1024,7 +1023,7 @@ impl DBItemTrait for DBNonRootObject {
 		}
 	}
 
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		match self {
 			DBNonRootObject::Dir(dir) => DBItemTrait::uuid(dir),
 			DBNonRootObject::File(file) => DBItemTrait::uuid(file),
@@ -1075,7 +1074,7 @@ impl From<DBNonRootObject> for DBObject {
 
 pub(crate) trait DBDirTrait: Sync + Send {
 	fn id(&self) -> i64;
-	fn uuid(&self) -> Uuid;
+	fn uuid(&self) -> UuidStr;
 	fn name(&self) -> &str;
 	fn set_last_listed(&mut self, value: i64);
 }
@@ -1184,7 +1183,7 @@ where
 
 pub(crate) trait DBItemTrait: Sync + Send {
 	fn id(&self) -> i64;
-	fn uuid(&self) -> Uuid;
+	fn uuid(&self) -> UuidStr;
 	fn parent(&self) -> Option<ParentUuid>;
 	fn name(&self) -> &str;
 	fn item_type(&self) -> ItemType;

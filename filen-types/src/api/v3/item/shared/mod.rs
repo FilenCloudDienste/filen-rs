@@ -1,9 +1,8 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use crate::crypto::rsa::EncodedPublicKey;
+use crate::{crypto::rsa::EncodedPublicKey, fs::UuidStr};
 
 pub mod rename;
 
@@ -12,7 +11,7 @@ pub const ENDPOINT: &str = "v3/item/shared";
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

@@ -1,8 +1,10 @@
-use filen_types::api::v3::contacts::{
-	Contact,
-	requests::{r#in::ContactRequestIn, out::ContactRequestOut},
+use filen_types::{
+	api::v3::contacts::{
+		Contact,
+		requests::{r#in::ContactRequestIn, out::ContactRequestOut},
+	},
+	fs::UuidStr,
 };
-use uuid::Uuid;
 
 use crate::{api, auth::Client, error::Error};
 
@@ -11,7 +13,7 @@ impl Client {
 		api::v3::contacts::get(self.client()).await.map(|r| r.0)
 	}
 
-	pub async fn send_contact_request(&self, email: &str) -> Result<Uuid, Error> {
+	pub async fn send_contact_request(&self, email: &str) -> Result<UuidStr, Error> {
 		Ok(api::v3::contacts::requests::send::post(
 			self.client(),
 			&api::v3::contacts::requests::send::Request {
@@ -22,7 +24,7 @@ impl Client {
 		.uuid)
 	}
 
-	pub async fn cancel_contact_request(&self, contact_uuid: Uuid) -> Result<(), Error> {
+	pub async fn cancel_contact_request(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		api::v3::contacts::requests::out::delete::post(
 			self.client(),
 			&api::v3::contacts::requests::out::delete::Request { uuid: contact_uuid },
@@ -30,7 +32,7 @@ impl Client {
 		.await
 	}
 
-	pub async fn accept_contact_request(&self, contact_uuid: Uuid) -> Result<Uuid, Error> {
+	pub async fn accept_contact_request(&self, contact_uuid: UuidStr) -> Result<UuidStr, Error> {
 		Ok(api::v3::contacts::requests::accept::post(
 			self.client(),
 			&api::v3::contacts::requests::accept::Request { uuid: contact_uuid },
@@ -39,7 +41,7 @@ impl Client {
 		.uuid)
 	}
 
-	pub async fn deny_contact_request(&self, contact_uuid: Uuid) -> Result<(), Error> {
+	pub async fn deny_contact_request(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		api::v3::contacts::requests::deny::post(
 			self.client(),
 			&api::v3::contacts::requests::deny::Request { uuid: contact_uuid },
@@ -47,7 +49,7 @@ impl Client {
 		.await
 	}
 
-	pub async fn delete_contact(&self, contact_uuid: Uuid) -> Result<(), Error> {
+	pub async fn delete_contact(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		api::v3::contacts::delete::post(
 			self.client(),
 			&api::v3::contacts::delete::Request { uuid: contact_uuid },

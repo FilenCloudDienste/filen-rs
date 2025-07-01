@@ -2,9 +2,8 @@ use serde::{
 	Deserialize, Deserializer, Serialize, Serializer,
 	de::{self},
 };
-use uuid::Uuid;
 
-use crate::fs::ParentUuid;
+use crate::fs::{ParentUuid, UuidStr};
 
 pub const ENDPOINT: &str = "v3/file/exists";
 
@@ -16,14 +15,14 @@ pub struct Request {
 }
 
 #[derive(Debug, Clone)]
-pub struct Response(pub Option<Uuid>);
+pub struct Response(pub Option<UuidStr>);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawResponse {
 	pub(crate) exists: bool,
 	#[serde(with = "crate::serde::uuid::optional")]
-	pub(crate) uuid: Option<Uuid>,
+	pub(crate) uuid: Option<UuidStr>,
 }
 
 impl Serialize for Response {

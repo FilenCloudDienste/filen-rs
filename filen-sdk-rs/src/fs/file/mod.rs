@@ -3,11 +3,10 @@ use std::borrow::Cow;
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	crypto::Sha512Hash,
-	fs::{ObjectType, ParentUuid},
+	fs::{ObjectType, ParentUuid, UuidStr},
 };
 use meta::FileMeta;
 use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, SetFileMeta};
-use uuid::Uuid;
 
 use crate::{
 	auth::Client,
@@ -26,11 +25,11 @@ pub mod traits;
 pub mod write;
 
 pub struct FileBuilder {
-	uuid: Uuid,
+	uuid: UuidStr,
 	key: FileKey,
 
 	name: String,
-	parent: Uuid,
+	parent: UuidStr,
 
 	mime: Option<String>,
 	created: Option<DateTime<Utc>>,
@@ -44,7 +43,7 @@ impl FileBuilder {
 		client: &Client,
 	) -> Self {
 		Self {
-			uuid: Uuid::new_v4(),
+			uuid: UuidStr::new_v4(),
 			name: name.into(),
 			parent: parent.uuid(),
 			key: client.make_file_key(),
@@ -75,12 +74,12 @@ impl FileBuilder {
 	}
 
 	/// Should not be used outside of testing
-	pub fn uuid(mut self, uuid: Uuid) -> Self {
+	pub fn uuid(mut self, uuid: UuidStr) -> Self {
 		self.uuid = uuid;
 		self
 	}
 
-	pub fn get_uuid(&self) -> Uuid {
+	pub fn get_uuid(&self) -> UuidStr {
 		self.uuid
 	}
 
@@ -105,7 +104,7 @@ impl FileBuilder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootFile {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub name: String,
 	pub mime: String,
 	pub key: FileKey,
@@ -114,7 +113,7 @@ pub struct RootFile {
 }
 
 impl RootFile {
-	fn from_meta(uuid: Uuid, meta: FileMeta<'_>) -> Self {
+	fn from_meta(uuid: UuidStr, meta: FileMeta<'_>) -> Self {
 		Self {
 			uuid,
 			name: meta.name.into_owned(),
@@ -125,7 +124,7 @@ impl RootFile {
 		}
 	}
 
-	pub fn uuid(&self) -> Uuid {
+	pub fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
 
@@ -153,11 +152,11 @@ impl RootFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseFile {
 	pub root: RootFile,
-	pub parent: Uuid,
+	pub parent: UuidStr,
 }
 
 impl BaseFile {
-	pub fn uuid(&self) -> Uuid {
+	pub fn uuid(&self) -> UuidStr {
 		self.root.uuid()
 	}
 
@@ -185,14 +184,14 @@ impl BaseFile {
 		self.root.modified = Utc::now().round_subsecs(3);
 	}
 
-	fn from_meta(uuid: Uuid, parent: Uuid, meta: FileMeta<'_>) -> Self {
+	fn from_meta(uuid: UuidStr, parent: UuidStr, meta: FileMeta<'_>) -> Self {
 		Self {
 			root: RootFile::from_meta(uuid, meta),
 			parent,
 		}
 	}
 
-	pub fn parent(&self) -> Uuid {
+	pub fn parent(&self) -> UuidStr {
 		self.parent
 	}
 }
@@ -222,7 +221,7 @@ pub struct RemoteFile {
 impl RemoteFile {
 	#[allow(clippy::too_many_arguments)]
 	pub fn from_meta(
-		uuid: Uuid,
+		uuid: UuidStr,
 		parent: ParentUuid,
 		size: u64,
 		chunks: u64,
@@ -248,7 +247,7 @@ impl RemoteFile {
 }
 
 pub struct FlatRemoteFile {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub parent: ParentUuid,
 	pub name: String,
 	pub mime: String,
@@ -286,7 +285,7 @@ impl From<FlatRemoteFile> for RemoteFile {
 }
 
 impl HasUUID for RemoteFile {
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.file.uuid()
 	}
 }
@@ -429,7 +428,7 @@ pub struct RemoteRootFile {
 
 impl RemoteRootFile {
 	pub fn from_meta(
-		uuid: Uuid,
+		uuid: UuidStr,
 		size: u64,
 		chunks: u64,
 		region: impl Into<String>,
@@ -451,7 +450,7 @@ impl RemoteRootFile {
 }
 
 impl HasUUID for RemoteRootFile {
-	fn uuid(&self) -> Uuid {
+	fn uuid(&self) -> UuidStr {
 		self.file.uuid
 	}
 }

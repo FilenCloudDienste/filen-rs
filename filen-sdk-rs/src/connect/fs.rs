@@ -1,11 +1,13 @@
 use std::borrow::Cow;
 
-use filen_types::api::v3::shared::{
-	r#in::{SharedDirIn, SharedFileIn},
-	out::{SharedDirOut, SharedFileOut},
+use filen_types::{
+	api::v3::shared::{
+		r#in::{SharedDirIn, SharedFileIn},
+		out::{SharedDirOut, SharedFileOut},
+	},
+	fs::UuidStr,
 };
 use rsa::RsaPrivateKey;
-use uuid::Uuid;
 
 use crate::{
 	crypto::shared::MetaCrypter,
@@ -36,8 +38,8 @@ pub struct SharedDirectory {
 }
 
 struct DirInfo {
-	uuid: Uuid,
-	parent: Option<Uuid>,
+	uuid: UuidStr,
+	parent: Option<UuidStr>,
 	color: Option<String>,
 	metadata: DirectoryMeta<'static>,
 	write_access: bool,

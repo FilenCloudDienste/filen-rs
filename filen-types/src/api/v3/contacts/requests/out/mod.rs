@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+
+use crate::fs::UuidStr;
 
 pub mod delete;
 
@@ -13,7 +14,7 @@ pub struct Response<'a>(pub Vec<ContactRequestOut<'a>>);
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactRequestOut<'a> {
-	pub uuid: Uuid,
+	pub uuid: UuidStr,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,
 	pub nick_name: Cow<'a, str>,

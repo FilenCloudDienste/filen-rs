@@ -15,9 +15,6 @@ serde_json = "1.0.140"
 serde_repr = "0.1.20"
 sha2 = "0.10.8"
 thiserror = "2.0.12"
-uuid = { version = "1.16.0", features = ["serde"] }
-
-[dev-dependencies]
 uuid = { version = "1.16.0", features = ["serde", "v4"] }
 
 [features]

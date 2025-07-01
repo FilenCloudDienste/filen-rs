@@ -1,7 +1,7 @@
 use std::{borrow::Cow, sync::Arc};
 
+use filen_types::fs::UuidStr;
 use futures::AsyncRead;
-use uuid::Uuid;
 
 use crate::{
 	api,
@@ -93,7 +93,7 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn get_file(&self, uuid: Uuid) -> Result<RemoteFile, Error> {
+	pub async fn get_file(&self, uuid: UuidStr) -> Result<RemoteFile, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
 		let meta = FileMeta::from_encrypted(&response.metadata, self.crypter(), response.version)?;
 		Ok(RemoteFile::from_meta(
@@ -112,7 +112,7 @@ impl Client {
 		&self,
 		name: impl AsRef<str>,
 		parent: &impl HasUUIDContents,
-	) -> Result<Option<Uuid>, Error> {
+	) -> Result<Option<UuidStr>, Error> {
 		api::v3::file::exists::post(
 			self.client(),
 			&api::v3::file::exists::Request {

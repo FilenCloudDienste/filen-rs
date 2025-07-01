@@ -23,7 +23,7 @@ sha2 = "0.10.8"
 rsa = "0.9.8"
 hkdf = { version = "0.12.4", features = ["std"] }
 hmac = { version = "0.12.1", features = ["std"] }
-uuid = { version = "1.16.0", features = ["serde", "v4"] }
+uuid = { version = "1.16.0", default-features = false}
 chrono = { version = "0.4.40", features = ["serde"] }
 digest = "0.10.7"
 serde = "1.0.219"

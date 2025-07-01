@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use filen_types::fs::ObjectType;
+use filen_types::fs::{ObjectType, UuidStr};
 
 use crate::{
 	crypto::file::FileKey,
@@ -29,7 +29,7 @@ impl From<RemoteRootFile> for RemoteFileType {
 }
 
 impl HasUUID for RemoteFileType {
-	fn uuid(&self) -> uuid::Uuid {
+	fn uuid(&self) -> UuidStr {
 		match self {
 			RemoteFileType::File(file) => file.uuid(),
 			RemoteFileType::SharedFile(file) => file.uuid(),
