@@ -9,7 +9,7 @@ INSERT INTO items (
     ?,
     ?
 )
-ON CONFLICT (name, parent, is_stale) DO UPDATE SET
+ON CONFLICT (name, parent, is_stale) WHERE parent != 'trash' DO UPDATE SET
 uuid = excluded.uuid,
 type = excluded.type,
 is_stale = FALSE
