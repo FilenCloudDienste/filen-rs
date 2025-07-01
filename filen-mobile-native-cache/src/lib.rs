@@ -212,6 +212,24 @@ impl FilenMobileCacheState {
 		let path_values = path.as_maybe_trash_values()?;
 		let obj = sql::select_maybe_trashed_object_at_path(&self.conn(), &path_values)?;
 		Ok(obj.map(Into::into))
+
+		let dir_obj = match obj {
+			Some(DBObject::Dir(dbdir)) => DBDirObject::Dir(dbdir),
+			Some(DBObject::Root(dbroot)) => DBDirObject::Root(dbroot),
+			other => return Ok(other.map(Into::into)),
+		};
+		// stop error for ios complaining that folder doesn't exist
+		match std::fs::create_dir_all(self.cache_dir.join(dir_obj.uuid().as_ref())) {
+			Ok(_) => {}
+			Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+			Err(e) => {
+				return Err(CacheError::io(format!(
+					"Failed to create directory for {}: {e}",
+					dir_obj.uuid()
+				)));
+			}
+		}
+		Ok(Some(FfiObject::from(DBObject::from(dir_obj))))
 	}
 
 	pub fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiPathWithRoot>> {
