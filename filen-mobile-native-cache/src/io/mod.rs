@@ -6,7 +6,11 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use crate::{FilenMobileCacheState, traits::ProgressCallback};
+use crate::{
+	FilenMobileCacheState,
+	sql::{DBItemTrait, ItemType},
+	traits::ProgressCallback,
+};
 use filen_sdk_rs::{
 	fs::{
 		HasUUID,
@@ -273,22 +277,15 @@ impl FilenMobileCacheState {
 		Ok((file, target_path))
 	}
 
-	// pub(crate) async fn io_upload_new_file_from_source(
-	// 	&self,
-	// 	name: &str,
-	// 	source: &Path,
-	// 	parent_uuid: Uuid,
-	// ) -> Result<(RemoteFile, PathBuf), io::Error> {
-	// 	// let mut file_builder = self.client.make_file_builder(name, parent);
-	// 	// let
-	// }
-
-	pub(crate) async fn io_delete_file(&self, file_uuid: &str) -> Result<(), io::Error> {
-		let path = self.cache_dir.join(file_uuid);
-		match tokio::fs::remove_file(&path).await {
-			Ok(_) => Ok(()),
-			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-			Err(e) => Err(e),
+	pub(crate) async fn io_delete_local(&self, object: &impl DBItemTrait) -> Result<(), io::Error> {
+		let path = self.cache_dir.join(object.uuid().as_ref());
+		if path.try_exists()? {
+			match object.item_type() {
+				ItemType::File => tokio::fs::remove_file(&path).await,
+				ItemType::Dir | ItemType::Root => tokio::fs::remove_dir(&path).await,
+			}
+		} else {
+			Ok(())
 		}
 	}
 }

@@ -912,6 +912,44 @@ impl PartialEq<DBObject> for RemoteDirectory {
 	}
 }
 
+impl DBItemTrait for DBObject {
+	fn id(&self) -> i64 {
+		match self {
+			DBObject::File(file) => file.id,
+			DBObject::Dir(dir) => dir.id,
+			DBObject::Root(root) => root.id,
+		}
+	}
+
+	fn uuid(&self) -> UuidStr {
+		match self {
+			DBObject::File(file) => file.uuid,
+			DBObject::Dir(dir) => dir.uuid,
+			DBObject::Root(root) => root.uuid,
+		}
+	}
+
+	fn parent(&self) -> Option<ParentUuid> {
+		match self {
+			DBObject::File(file) => Some(file.parent),
+			DBObject::Dir(dir) => Some(dir.parent),
+			DBObject::Root(_) => None,
+		}
+	}
+
+	fn name(&self) -> &str {
+		match self {
+			DBObject::File(file) => &file.name,
+			DBObject::Dir(dir) => &dir.name,
+			DBObject::Root(_) => "",
+		}
+	}
+
+	fn item_type(&self) -> ItemType {
+		self.item_type()
+	}
+}
+
 pub enum DBDirObject {
 	Dir(DBDir),
 	Root(DBRoot),

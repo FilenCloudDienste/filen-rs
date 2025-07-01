@@ -576,17 +576,20 @@ impl FilenMobileCacheState {
 				)));
 			}
 			DBObject::Dir(dir) => {
-				let remote_dir = dir.clone().into();
+				let remote_dir = dir.into();
 				self.client.trash_dir(&remote_dir).await?;
+				let dir: DBDir = remote_dir.into();
+				self.io_delete_local(&dir).await?;
 				dir.trash(&self.conn())?;
-				DBObject::Dir(remote_dir.into())
+				DBObject::Dir(dir)
 			}
 			DBObject::File(file) => {
-				let remote_file = file.clone().try_into()?;
+				let remote_file = file.try_into()?;
 				self.client.trash_file(&remote_file).await?;
-				self.io_delete_file(remote_file.uuid().as_ref()).await?;
+				let file: DBFile = remote_file.into();
+				self.io_delete_local(&file).await?;
 				file.trash(&self.conn())?;
-				DBObject::File(remote_file.into())
+				DBObject::File(file)
 			}
 		};
 		Ok(ObjectWithPathResponse {
@@ -798,11 +801,27 @@ impl FilenMobileCacheState {
 	pub async fn clear_local_cache(&self, item: FfiPathWithRoot) -> Result<()> {
 		let pvs = item.as_path_values()?;
 		debug!("Clearing local cache for item: {}", pvs.full_path);
-		let file = match sql::select_object_at_path(&self.conn(), &pvs)? {
-			Some(DBObject::File(file)) => file,
-			_ => return Ok(()),
+		let obj = match sql::select_object_at_path(&self.conn(), &pvs)? {
+			Some(obj) => obj,
+			None => return Ok(()),
 		};
-		self.io_delete_file(file.uuid.as_ref()).await?;
+		self.io_delete_local(&obj).await?;
+		Ok(())
+	}
+
+	pub async fn clear_local_cache_by_uuid(&self, uuid: &str) -> Result<()> {
+		debug!("Clearing local cache for item with uuid: {uuid}");
+		let obj = match DBObject::select(
+			&self.conn(),
+			UuidStr::from_str(uuid)
+				.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?,
+		)
+		.optional()?
+		{
+			Some(obj) => obj,
+			None => return Ok(()),
+		};
+		self.io_delete_local(&obj).await?;
 		Ok(())
 	}
 
@@ -834,16 +853,17 @@ impl FilenMobileCacheState {
 				return Err(CacheError::remote("Cannot delete root directory"));
 			}
 			DBObject::Dir(dir) => {
+				self.io_delete_local(&dir).await?;
 				let remote_dir: RemoteDirectory = dir.into();
 				let uuid = remote_dir.uuid();
 				self.client.delete_dir_permanently(remote_dir).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}
 			DBObject::File(file) => {
+				self.io_delete_local(&file).await?;
 				let remote_file: RemoteFile = file.try_into()?;
 				let uuid = remote_file.uuid();
 				self.client.delete_file_permanently(remote_file).await?;
-				self.io_delete_file(uuid.as_ref()).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}
 		}
