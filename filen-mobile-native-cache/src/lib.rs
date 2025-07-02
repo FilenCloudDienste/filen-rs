@@ -60,8 +60,8 @@ impl FilenMobileCacheState {
 		two_factor_code: &str,
 		files_dir: &str,
 	) -> Result<Self> {
-		debug!("Logging in with email: {email}");
 		env::init_logger();
+		debug!("Logging in with email: {email}");
 		let db = Connection::open(AsRef::<Path>::as_ref(files_dir).join("native_cache.db"))?;
 		db.execute_batch(include_str!("../sql/init.sql"))?;
 		let (cache_dir, tmp_dir, thumbnail_dir) = io::init(files_dir.as_ref())?;
@@ -85,9 +85,9 @@ impl FilenMobileCacheState {
 		version: u32,
 		files_dir: &str,
 	) -> Result<Self> {
+		env::init_logger();
 		debug!("Creating FilenMobileCacheState from strings for email: {email}");
 
-		env::init_logger();
 		let client = filen_sdk_rs::auth::Client::from_strings(
 			email,
 			root_uuid,
@@ -122,8 +122,8 @@ impl FilenMobileCacheState {
 		version: u32,
 		files_dir: &str,
 	) -> Result<Self> {
-		debug!("Creating FilenMobileCacheState from strings for email: {email}");
 		env::init_logger();
+		debug!("Creating FilenMobileCacheState from strings for email: {email}");
 		let client = filen_sdk_rs::auth::Client::from_strings(
 			email,
 			root_uuid,
