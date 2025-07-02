@@ -10,7 +10,7 @@ set -u
 
 # In release mode, we create a ZIP archive of the xcframework and update Package.swift with the computed checksum.
 # This is only needed when cutting a new release, not for local development.
-release=true
+release=false
 
 for arg in "$@"
 do
@@ -45,12 +45,12 @@ build_xcframework() {
   xcodebuild -create-xcframework \
     -library target/aarch64-apple-ios/release/lib$1.a -headers target/uniffi-xcframework-staging \
     -library target/aarch64-apple-ios-sim/release/lib$1.a -headers target/uniffi-xcframework-staging \
-    -output target/ios/lib$1-rs.xcframework
+    -output target/ios/lib$1.xcframework
 
   if $release; then
     echo "Building xcframework archive"
-    ditto -c -k --sequesterRsrc --keepParent target/ios/lib$1-rs.xcframework target/ios/lib$1-rs.xcframework.zip
-    checksum=$(swift package compute-checksum target/ios/lib$1-rs.xcframework.zip)
+    ditto -c -k --sequesterRsrc --keepParent target/ios/lib$1.xcframework target/ios/lib$1.xcframework.zip
+    checksum=$(swift package compute-checksum target/ios/lib$1.xcframework.zip)
     version=$(cargo metadata --format-version 1 | jq -r --arg pkg_name "$1" '.packages[] | select(.name==$pkg_name) .version')
     # sed -i "" -E "s/(let releaseTag = \")[^\"]+(\")/\1$version\2/g" ../Package.swift
     # sed -i "" -E "s/(let releaseChecksum = \")[^\"]+(\")/\1$checksum\2/g" ../Package.swift
@@ -64,4 +64,4 @@ cargo build -p $basename --lib --release --target aarch64-apple-ios-sim
 cargo build -p $basename --lib --release --target aarch64-apple-ios
 
 generate_ffi $lib_name
-build_xcframework $lib_name 
+build_xcframework $lib_name
