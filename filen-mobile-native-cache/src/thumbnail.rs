@@ -190,3 +190,16 @@ impl FilenMobileCacheState {
 		BulkThumbnailResponse { task: handle }
 	}
 }
+
+#[filen_sdk_rs_macros::create_uniffi_wrapper]
+impl FilenMobileCacheState {
+	pub async fn get_thumbnail(
+		&self,
+		item: FfiPathWithRoot,
+		requested_width: u32,
+		requested_height: u32,
+	) -> ThumbnailResult {
+		self.make_thumbnail_for_path(&item, requested_width, requested_height)
+			.await
+	}
+}
