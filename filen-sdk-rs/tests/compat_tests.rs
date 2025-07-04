@@ -131,6 +131,11 @@ async fn make_rs_compat_dir() {
 		.await
 		.unwrap();
 
+	if client.auth_version() == AuthVersion::V1 {
+		// we aren't able to upload files larger than 1MiB to the V1 account
+		return;
+	}
+
 	let mut big_random_bytes = vec![0u8; 1024 * 1024 * 4];
 	// fill with random bytes
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
