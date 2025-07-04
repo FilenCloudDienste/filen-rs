@@ -1252,7 +1252,7 @@ where
 			self.name()
 		);
 		let mut stmt = conn.prepare_cached(include_str!("../../sql/trash_item.sql"))?;
-		let num_rows = stmt.execute([self.id()])?;
+		let num_rows = stmt.execute([self.uuid()])?;
 		if num_rows == 0 {
 			trace!(
 				"No rows updated for item: uuid = {}, name = {}",
