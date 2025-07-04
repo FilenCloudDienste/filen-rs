@@ -30,7 +30,7 @@ impl Default for TestResources {
 impl Drop for TestResources {
 	fn drop(&mut self) {
 		futures::executor::block_on(async move {
-			match self.client.trash_dir(&self.dir).await {
+			match self.client.delete_dir_permanently(self.dir.clone()).await {
 				Ok(_) => {}
 				Err(e) => eprintln!("Failed to clean up test directory: {e}"),
 			}
