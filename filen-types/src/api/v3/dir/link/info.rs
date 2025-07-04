@@ -20,7 +20,7 @@ pub struct Response<'a> {
 	pub has_password: bool,
 	#[serde(with = "crate::serde::hex::optional")]
 	pub salt: Option<Cow<'a, [u8]>>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub download_btn: bool,
 }

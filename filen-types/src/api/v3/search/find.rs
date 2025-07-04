@@ -37,7 +37,7 @@ pub enum SearchFindItem<'a> {
 pub struct SearchFindFile<'a> {
 	pub uuid: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
 	pub size: u64,
@@ -60,7 +60,7 @@ pub struct SearchFindDirectory<'a> {
 	pub metadata: Cow<'a, EncryptedString>,
 	pub parent: UuidStr,
 	pub color: Option<Cow<'a, str>>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
 	pub trash: bool,

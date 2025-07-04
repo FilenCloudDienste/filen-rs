@@ -30,7 +30,7 @@ pub struct Response<'a> {
 	pub bucket: Cow<'a, str>,
 
 	pub version: FileEncryptionVersion,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub download_btn: bool,
 }

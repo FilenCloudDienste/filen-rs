@@ -29,8 +29,7 @@ struct RawFileMeta<'a> {
 	pub(super) size: u64,
 	pub(super) mime: String,
 	pub(super) key: &'a str,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
-	// todo, there seems to be some issue with deserializing this in golang, take a look at this
+	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
 	pub(super) last_modified: DateTime<Utc>,
 	#[serde(with = "filen_types::serde::time::optional")]
 	#[serde(rename = "creation")]
@@ -68,8 +67,7 @@ pub struct FileMeta<'a> {
 	pub(super) size: u64,
 	pub(super) mime: Cow<'a, str>,
 	pub(super) key: Cow<'a, FileKey>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
-	// todo, there seems to be some issue with deserializing this in golang, take a look at this
+	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
 	pub(super) last_modified: DateTime<Utc>,
 	#[serde(with = "filen_types::serde::time::optional")]
 	#[serde(rename = "creation")]

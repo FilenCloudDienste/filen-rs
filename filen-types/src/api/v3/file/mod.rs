@@ -36,7 +36,7 @@ pub struct Response<'a> {
 	pub size_encrypted: Cow<'a, EncryptedString>,
 	pub mime_encrypted: Cow<'a, EncryptedString>,
 	pub metadata: Cow<'a, EncryptedString>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub size: u64,
 	pub parent: ParentUuid,

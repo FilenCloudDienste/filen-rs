@@ -18,6 +18,6 @@ pub struct ContactRequestIn<'a> {
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,
 	pub nick_name: Cow<'a, str>,
-	// #[serde(with = "chrono::serde::ts_milliseconds")]
+	// #[serde(with = "crate::serde::time::seconds_or_millis")]
 	// pub timestamp: DateTime<Utc>,
 }

@@ -40,7 +40,7 @@ pub struct SharedFileOut<'a> {
 	pub receiver_id: u64,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub write_access: bool,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 }
 
@@ -55,7 +55,7 @@ pub struct SharedDirOut<'a> {
 	#[serde(with = "crate::serde::boolean::number")]
 	pub write_access: bool,
 	pub color: Option<Cow<'a, str>>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	#[serde(with = "crate::serde::boolean::number", rename = "is_sync")]
 	pub is_sync: bool,

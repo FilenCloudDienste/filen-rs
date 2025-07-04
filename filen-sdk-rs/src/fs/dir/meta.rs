@@ -13,7 +13,7 @@ use crate::{
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DirectoryMeta<'a> {
 	pub(super) name: Cow<'a, str>,
-	#[serde(with = "dir_meta_serde")]
+	#[serde(with = "filen_types::serde::time::optional")]
 	#[serde(rename = "creation")]
 	#[serde(default)]
 	pub(super) created: Option<DateTime<Utc>>,

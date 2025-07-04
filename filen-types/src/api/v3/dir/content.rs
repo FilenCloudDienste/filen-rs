@@ -32,7 +32,7 @@ pub struct File<'a> {
 	pub uuid: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
 	pub rm: Cow<'a, str>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
 	pub size: u64,
@@ -52,7 +52,7 @@ pub struct Directory<'a> {
 	pub meta: Cow<'a, EncryptedString>,
 	pub parent: ParentUuid,
 	pub color: Option<Cow<'a, str>>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub favorited: bool,
