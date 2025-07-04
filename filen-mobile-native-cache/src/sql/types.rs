@@ -988,6 +988,15 @@ impl From<DBRoot> for DBDirObject {
 	}
 }
 
+impl DBDirObject {
+	pub(crate) fn last_listed(&self) -> i64 {
+		match self {
+			DBDirObject::Dir(dir) => dir.last_listed,
+			DBDirObject::Root(root) => root.last_listed,
+		}
+	}
+}
+
 impl DBDirTrait for DBDirObject {
 	fn set_last_listed(&mut self, value: i64) {
 		match self {
@@ -1139,7 +1148,7 @@ where
 		let mut stmt: rusqlite::CachedStatement<'_> =
 			conn.prepare_cached(include_str!("../../sql/update_dir_last_listed.sql"))?;
 		let now = Utc::now().timestamp_millis();
-		stmt.execute((self.id(), now))?;
+		stmt.execute((now, self.id()))?;
 		self.set_last_listed(now);
 		Ok(())
 	}

@@ -76,7 +76,7 @@ impl From<DBDirObject> for FfiDir {
 				color: None,
 				created: None,
 				favorite_rank: 0,
-				last_listed: 0,
+				last_listed: root.last_listed,
 			},
 		}
 	}

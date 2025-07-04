@@ -3576,3 +3576,40 @@ pub async fn test_query_path_for_uuid() {
 		root_path
 	);
 }
+
+#[shared_test_runtime]
+pub async fn test_last_listed() {
+	let (db, rss) = get_db_resources().await;
+
+	// Create a directory and a file
+	let test_dir = rss
+		.client
+		.create_dir(&rss.dir, "test_last_listed".to_string())
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	let dir_path: FfiPathWithRoot = test_dir_path.join(test_dir.name());
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let dir = match db.query_item(&dir_path).unwrap().unwrap() {
+		FfiObject::Dir(dir) => dir,
+		_ => panic!("Expected a directory item"),
+	};
+
+	assert_eq!(dir.last_listed, 0);
+
+	let now = chrono::Utc::now().timestamp_millis();
+	db.update_dir_children(dir_path.clone()).await.unwrap();
+
+	let dir = match db.query_item(&dir_path).unwrap().unwrap() {
+		FfiObject::Dir(dir) => dir,
+		_ => panic!("Expected a directory item"),
+	};
+
+	let later = chrono::Utc::now().timestamp_millis();
+
+	assert!(now <= dir.last_listed);
+	assert!(dir.last_listed <= later);
+}
