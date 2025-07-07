@@ -113,6 +113,12 @@ impl SharedDirectory {
 	pub fn get_dir(&self) -> &DirectoryMetaType<'_> {
 		&self.dir
 	}
+
+	pub fn get_source_id(&self) -> u64 {
+		match &self.sharing_role {
+			SharingRole::Sharer(info) | SharingRole::Receiver(info) => info.id,
+		}
+	}
 }
 
 pub struct SharedFile {
@@ -175,5 +181,11 @@ impl SharedFile {
 
 	pub fn get_file(&self) -> &RemoteRootFile {
 		&self.file
+	}
+
+	pub fn get_source_id(&self) -> u64 {
+		match &self.sharing_role {
+			SharingRole::Sharer(info) | SharingRole::Receiver(info) => info.id,
+		}
 	}
 }

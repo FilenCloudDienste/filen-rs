@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{crypto::rsa::EncodedPublicKey, fs::UuidStr};
 
+pub mod r#in;
+pub mod out;
 pub mod rename;
 
 pub const ENDPOINT: &str = "v3/item/shared";

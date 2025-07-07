@@ -86,6 +86,10 @@ impl User {
 	pub fn public_encrypt(&self, data: &[u8]) -> Result<RSAEncryptedString, rsa::Error> {
 		crate::crypto::rsa::encrypt_with_public_key(&self.public_key, data)
 	}
+
+	pub fn id(&self) -> u64 {
+		self.id
+	}
 }
 
 trait MakePasswordSaltAndHash {
@@ -888,5 +892,27 @@ impl Client {
 		dir: &impl HasUUIDContents,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		self.inner_list_in_shared(Some(dir)).await
+	}
+
+	pub async fn remove_shared_link_in(&self, uuid: UuidStr) -> Result<(), Error> {
+		api::v3::item::shared::r#in::remove::post(
+			self.client(),
+			&api::v3::item::shared::r#in::remove::Request { uuid },
+		)
+		.await?;
+		Ok(())
+	}
+
+	pub async fn remove_shared_link_out(
+		&self,
+		uuid: UuidStr,
+		receiver_id: u64,
+	) -> Result<(), Error> {
+		api::v3::item::shared::out::remove::post(
+			self.client(),
+			&api::v3::item::shared::out::remove::Request { uuid, receiver_id },
+		)
+		.await?;
+		Ok(())
 	}
 }

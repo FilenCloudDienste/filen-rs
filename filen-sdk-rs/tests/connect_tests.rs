@@ -4,6 +4,7 @@ use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	auth::Client,
 	connect::PasswordState,
+	crypto::shared,
 	fs::{
 		HasName, HasUUID,
 		dir::traits::HasDirMeta,
@@ -12,7 +13,8 @@ use filen_sdk_rs::{
 	sync::lock::ResourceLock,
 };
 use filen_sdk_rs_macros::shared_test_runtime;
-use filen_types::api::v3::dir::link::PublicLinkExpiration;
+use filen_types::api::v3::{dir::link::PublicLinkExpiration, item::share};
+use futures::{StreamExt, stream::FuturesUnordered};
 
 #[shared_test_runtime]
 async fn dir_public_link() {
@@ -289,6 +291,38 @@ async fn set_up_contact<'a>(
 			for contact in client.list_incoming_contact_requests().await.unwrap() {
 				client.delete_contact(contact.uuid).await.unwrap();
 			}
+		},
+		async {
+			let (out_dirs, out_files) = client.list_out_shared(None).await.unwrap();
+			let mut out_futures = out_dirs
+				.into_iter()
+				.map(|d| (d.get_dir().uuid(), d.get_source_id()))
+				.chain(
+					out_files
+						.into_iter()
+						.map(|f| (f.get_file().uuid(), f.get_source_id())),
+				)
+				.map(|(uuid, source_id)| async move {
+					client
+						.remove_shared_link_out(uuid, source_id)
+						.await
+						.unwrap();
+				})
+				.collect::<FuturesUnordered<_>>();
+			while (out_futures.next().await).is_some() {}
+		},
+		async {
+			let (in_dirs, in_files) = client.list_in_shared().await.unwrap();
+
+			let mut in_futures = in_dirs
+				.into_iter()
+				.map(|d| (d.get_dir().uuid()))
+				.chain(in_files.into_iter().map(|f| (f.get_file().uuid())))
+				.map(|uuid| async move {
+					share_client.remove_shared_link_in(uuid).await.unwrap();
+				})
+				.collect::<FuturesUnordered<_>>();
+			while (in_futures.next().await).is_some() {}
 		}
 	);
 
@@ -453,4 +487,49 @@ async fn share_file() {
 		new_created.round_subsecs(3),
 		"created date not updated"
 	);
+}
+
+#[shared_test_runtime]
+async fn remove_link() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
+	let share_client = &share_resources.client;
+
+	let _locks = set_up_contact(client, share_client).await;
+
+	let out_dir = client
+		.create_dir(test_dir, "out".to_string())
+		.await
+		.unwrap();
+	let in_dir = client.create_dir(test_dir, "in".to_string()).await.unwrap();
+
+	let contacts = client.get_contacts().await.unwrap();
+	assert_eq!(contacts.len(), 1);
+	let contact = &contacts[0];
+	let share_user = client.make_user_from_contact(contact).await.unwrap();
+
+	client.share_dir(&out_dir, &share_user).await.unwrap();
+	client.share_dir(&in_dir, &share_user).await.unwrap();
+
+	let (shared_dirs_out, _) = client.list_out_shared(None).await.unwrap();
+	assert_eq!(shared_dirs_out.len(), 2);
+
+	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
+	assert_eq!(shared_dirs_in.len(), 2);
+	client
+		.remove_shared_link_out(out_dir.uuid(), share_user.id())
+		.await
+		.unwrap();
+	share_client
+		.remove_shared_link_in(in_dir.uuid())
+		.await
+		.unwrap();
+
+	let shared_dirs_out = client.list_out_shared(None).await.unwrap().0;
+	assert_eq!(shared_dirs_out.len(), 0);
+	let shared_dirs_in = share_client.list_in_shared().await.unwrap().0;
+	assert_eq!(shared_dirs_in.len(), 0);
 }
