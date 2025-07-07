@@ -708,10 +708,10 @@ impl FilenMobileCacheState {
 							))
 						})?
 					}
-					UpdateItemsInPath::Partial(_, _) => {
+					UpdateItemsInPath::Partial(remaining_path, _) => {
 						return Err(CacheError::remote(format!(
-							"Path {} does not point to an item",
-							item_pvs.full_path
+							"Path {} does not point to an item, remaining: {}",
+							item_pvs.full_path, remaining_path
 						)));
 					}
 				};
@@ -725,10 +725,12 @@ impl FilenMobileCacheState {
 							new_parent_pvs.full_path, e
 						))
 					}),
-					UpdateItemsInPath::Partial(_, _) => Err(CacheError::remote(format!(
-						"Path {} does not point to an item",
-						item_pvs.full_path
-					))),
+					UpdateItemsInPath::Partial(remaining_path, _) => {
+						Err(CacheError::remote(format!(
+							"Path {} does not point to an item, remaining: {}",
+							new_parent_pvs.full_path, remaining_path
+						)))
+					}
 				}
 			}
 		)?;
