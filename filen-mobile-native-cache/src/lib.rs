@@ -8,7 +8,7 @@ use chrono::DateTime;
 use ffi::{FfiDir, FfiFile, FfiNonRootObject, FfiObject, FfiRoot};
 use filen_sdk_rs::{
 	fs::{
-		HasName, HasParent, HasUUID,
+		HasUUID,
 		dir::{RemoteDirectory, traits::HasDirMeta},
 		file::{RemoteFile, traits::HasFileMeta},
 	},
@@ -21,8 +21,8 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::{
 	ffi::FfiPathWithRoot,
 	sql::{
-		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemExt, DBItemTrait, DBNonRootObject,
-		DBObject, DBRoot, error::OptionalExtensionSQL,
+		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemTrait, DBNonRootObject, DBObject,
+		DBRoot, ItemType, error::OptionalExtensionSQL,
 	},
 	sync::UpdateItemsInPath,
 	traits::ProgressCallback,
@@ -581,17 +581,17 @@ impl FilenMobileCacheState {
 			DBObject::Dir(dir) => {
 				let remote_dir = dir.into();
 				self.client.trash_dir(&remote_dir).await?;
-				let dir: DBDir = remote_dir.into();
-				self.io_delete_local(&dir).await?;
-				dir.trash(&self.conn())?;
+				self.io_delete_local(remote_dir.uuid(), ItemType::Dir)
+					.await?;
+				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
 				DBObject::Dir(dir)
 			}
 			DBObject::File(file) => {
 				let remote_file = file.try_into()?;
 				self.client.trash_file(&remote_file).await?;
-				let file: DBFile = remote_file.into();
-				self.io_delete_local(&file).await?;
-				file.trash(&self.conn())?;
+				self.io_delete_local(remote_file.uuid(), ItemType::File)
+					.await?;
+				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 				DBObject::File(file)
 			}
 		};
@@ -773,26 +773,24 @@ impl FilenMobileCacheState {
 		let new_path = item.parent().join(&new_name);
 		let obj = match obj {
 			DBNonRootObject::Dir(dbdir) => {
-				let id = dbdir.id;
 				let mut remote_dir: RemoteDirectory = dbdir.into();
 				let mut meta = remote_dir.get_meta();
 				meta.set_name(&new_name)?;
 				self.client
 					.update_dir_metadata(&mut remote_dir, meta)
 					.await?;
-				sql::rename_item(&mut self.conn(), id, &new_name, remote_dir.parent())?;
-				DBObject::Dir(remote_dir.into())
+				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
+				DBObject::Dir(dir)
 			}
 			DBNonRootObject::File(dbfile) => {
-				let id = dbfile.id;
 				let mut remote_file: RemoteFile = dbfile.try_into()?;
 				let mut meta = remote_file.get_meta();
 				meta.set_name(&new_name)?;
 				self.client
 					.update_file_metadata(&mut remote_file, meta)
 					.await?;
-				sql::rename_item(&mut self.conn(), id, &new_name, remote_file.parent())?;
-				DBObject::File(remote_file.into())
+				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
+				DBObject::File(file)
 			}
 		};
 		Ok(Some(ObjectWithPathResponse {
@@ -808,7 +806,7 @@ impl FilenMobileCacheState {
 			Some(obj) => obj,
 			None => return Ok(()),
 		};
-		self.io_delete_local(&obj).await?;
+		self.io_delete_local(obj.uuid(), obj.item_type()).await?;
 		Ok(())
 	}
 
@@ -824,7 +822,7 @@ impl FilenMobileCacheState {
 			Some(obj) => obj,
 			None => return Ok(()),
 		};
-		self.io_delete_local(&obj).await?;
+		self.io_delete_local(obj.uuid(), obj.item_type()).await?;
 		Ok(())
 	}
 
@@ -856,14 +854,14 @@ impl FilenMobileCacheState {
 				return Err(CacheError::remote("Cannot delete root directory"));
 			}
 			DBObject::Dir(dir) => {
-				self.io_delete_local(&dir).await?;
+				self.io_delete_local(dir.uuid, dir.item_type()).await?;
 				let remote_dir: RemoteDirectory = dir.into();
 				let uuid = remote_dir.uuid();
 				self.client.delete_dir_permanently(remote_dir).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}
 			DBObject::File(file) => {
-				self.io_delete_local(&file).await?;
+				self.io_delete_local(file.uuid, file.item_type()).await?;
 				let remote_file: RemoteFile = file.try_into()?;
 				let uuid = remote_file.uuid();
 				self.client.delete_file_permanently(remote_file).await?;
@@ -909,7 +907,7 @@ impl FilenMobileCacheState {
 					self.client
 						.set_favorite(&mut remote_file, favorite_rank > 0)
 						.await?;
-					dbfile = remote_file.into();
+					dbfile = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 				}
 				// update local favorite rank
 				dbfile.update_favorite_rank(&self.conn(), favorite_rank)?;
@@ -918,11 +916,11 @@ impl FilenMobileCacheState {
 			DBObject::Dir(mut dbdir) if favorite_rank != dbdir.favorite_rank => {
 				if (favorite_rank > 0) != (dbdir.favorite_rank > 0) {
 					// update server-side favorite status
-					let mut remote_file: RemoteDirectory = dbdir.into();
+					let mut remote_dir: RemoteDirectory = dbdir.into();
 					self.client
-						.set_favorite(&mut remote_file, favorite_rank > 0)
+						.set_favorite(&mut remote_dir, favorite_rank > 0)
 						.await?;
-					dbdir = remote_file.into();
+					dbdir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
 				}
 				// update local favorite rank
 				dbdir.update_favorite_rank(&self.conn(), favorite_rank)?;
@@ -1015,13 +1013,10 @@ impl FilenMobileCacheState {
 					.move_dir(&mut remote_dir, &new_parent_uuid)
 					.await?;
 				let mut conn = self.conn();
-				sql::move_item(
-					&mut conn,
-					remote_dir.uuid(),
-					remote_dir.name(),
-					new_parent_uuid.into(),
-				)?;
-				Ok(DBNonRootObject::Dir(remote_dir.into()))
+
+				Ok(DBNonRootObject::Dir(DBDir::upsert_from_remote(
+					&mut conn, remote_dir,
+				)?))
 			}
 			DBNonRootObject::File(file) => {
 				let mut remote_file: RemoteFile = file.try_into()?;
@@ -1029,13 +1024,10 @@ impl FilenMobileCacheState {
 					.move_file(&mut remote_file, &new_parent_uuid)
 					.await?;
 				let mut conn = self.conn();
-				sql::move_item(
+				Ok(DBNonRootObject::File(DBFile::upsert_from_remote(
 					&mut conn,
-					remote_file.uuid(),
-					remote_file.name(),
-					new_parent_uuid.into(),
-				)?;
-				Ok(DBNonRootObject::File(remote_file.into()))
+					remote_file,
+				)?))
 			}
 		}
 	}

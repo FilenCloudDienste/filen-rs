@@ -1,4 +1,4 @@
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::UuidStr;
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use rusqlite::{Connection, OptionalExtension};
 
@@ -119,47 +119,9 @@ pub(crate) fn update_root(
 	Ok(())
 }
 
-pub(crate) fn move_item(
-	conn: &mut Connection,
-	item_uuid: UuidStr,
-	item_name: &str,
-	new_parent_uuid: ParentUuid,
-) -> Result<(), rusqlite::Error> {
-	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
-	{
-		// Delete potentially existing item with the same name in the new parent directory
-		let mut stmt = tx.prepare_cached(include_str!(
-			"../../sql/delete_item_by_name_parent_not_uuid.sql"
-		))?;
-		stmt.execute((item_name, new_parent_uuid, item_uuid))?;
-		let mut stmt =
-			tx.prepare_cached("UPDATE items SET parent = ?, name = ? WHERE uuid = ?;")?;
-		stmt.execute((new_parent_uuid, item_name, item_uuid))?;
-	}
-	tx.commit()?;
-	Ok(())
-}
-
 pub(crate) fn delete_item(conn: &Connection, item_uuid: UuidStr) -> Result<(), rusqlite::Error> {
 	let mut stmt = conn.prepare_cached("DELETE FROM items WHERE uuid = ?;")?;
 	stmt.execute([item_uuid])?;
-	Ok(())
-}
-
-pub(crate) fn rename_item(
-	conn: &mut Connection,
-	id: i64,
-	new_name: &str,
-	parent: ParentUuid,
-) -> Result<(), rusqlite::Error> {
-	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
-	{
-		let mut stmt = tx.prepare_cached("DELETE FROM items WHERE name = ? AND parent = ?;")?;
-		stmt.execute((&new_name, parent))?;
-		let mut stmt = tx.prepare_cached("UPDATE items SET name = ? WHERE id = ?;")?;
-		stmt.execute((&new_name, id))?;
-	}
-	tx.commit()?;
 	Ok(())
 }
 

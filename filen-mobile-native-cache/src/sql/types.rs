@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	crypto::{error::ConversionError, file::FileKey},
@@ -219,10 +217,6 @@ impl std::fmt::Debug for DBFile {
 }
 
 impl DBFile {
-	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-		Self::from_inner_and_row(InnerDBItem::from_row(row)?, row, 4)
-	}
-
 	pub(crate) fn from_inner_and_row(
 		item: InnerDBItem,
 		row: &rusqlite::Row,
@@ -339,6 +333,7 @@ impl DBFile {
 		Ok(new)
 	}
 
+	#[allow(dead_code)]
 	pub(crate) fn update_from_remote(
 		&mut self,
 		conn: &mut Connection,
@@ -451,30 +446,6 @@ impl TryFrom<DBFile> for RemoteFile {
 	}
 }
 
-// for testing only
-impl From<RemoteFile> for DBFile {
-	fn from(value: RemoteFile) -> Self {
-		Self {
-			id: 0,
-			uuid: value.uuid(),
-			parent: value.parent(),
-			file_key: value.key().to_str().to_string(),
-			created: value.created().timestamp_millis(),
-			modified: value.last_modified().timestamp_millis(),
-			size: value.size() as i64,
-			chunks: value.chunks() as i64,
-			// this might cause issues, but I'm going to go with it for now
-			favorite_rank: if value.favorited() { 1 } else { 0 },
-			hash: value.hash().map(Into::<[u8; 64]>::into),
-			version: value.key().version() as u8,
-			mime: value.file.mime,
-			name: value.file.name,
-			bucket: value.bucket,
-			region: value.region,
-		}
-	}
-}
-
 impl PartialEq<RemoteFile> for DBFile {
 	fn eq(&self, other: &RemoteFile) -> bool {
 		self.uuid == other.uuid()
@@ -506,10 +477,6 @@ pub struct DBDir {
 }
 
 impl DBDir {
-	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-		Self::from_inner_and_row(InnerDBItem::from_row(row)?, row, 4)
-	}
-
 	pub(crate) fn from_inner_and_row(
 		item: InnerDBItem,
 		row: &rusqlite::Row,
@@ -539,6 +506,7 @@ impl DBDir {
 		Ok(res)
 	}
 
+	#[allow(dead_code)]
 	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
 		match DBObject::select(conn, uuid)? {
 			DBObject::Dir(dir) => Ok(dir),
@@ -680,23 +648,6 @@ impl From<DBDir> for RemoteDirectory {
 	}
 }
 
-// for testing only
-impl From<RemoteDirectory> for DBDir {
-	fn from(value: RemoteDirectory) -> Self {
-		Self {
-			id: 0,
-			uuid: value.uuid(),
-			parent: value.parent(),
-			created: value.created().map(|t| t.timestamp_millis()),
-			// this might cause issues, but I'm going to go with it for now
-			favorite_rank: if value.favorited() { 1 } else { 0 },
-			last_listed: 0,
-			color: value.color,
-			name: value.name,
-		}
-	}
-}
-
 impl PartialEq<RemoteDirectory> for DBDir {
 	fn eq(&self, other: &RemoteDirectory) -> bool {
 		self.uuid == other.uuid()
@@ -719,10 +670,6 @@ pub struct DBRoot {
 }
 
 impl DBRoot {
-	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-		Self::from_inner_and_row(InnerDBItem::from_row(row)?, row, 4)
-	}
-
 	pub(crate) fn from_inner_and_row(
 		inner: InnerDBItem,
 		row: &rusqlite::Row,
@@ -988,15 +935,6 @@ impl From<DBRoot> for DBDirObject {
 	}
 }
 
-impl DBDirObject {
-	pub(crate) fn last_listed(&self) -> i64 {
-		match self {
-			DBDirObject::Dir(dir) => dir.last_listed,
-			DBDirObject::Root(root) => root.last_listed,
-		}
-	}
-}
-
 impl DBDirTrait for DBDirObject {
 	fn set_last_listed(&mut self, value: i64) {
 		match self {
@@ -1119,6 +1057,7 @@ impl From<DBNonRootObject> for DBObject {
 	}
 }
 
+#[allow(dead_code)]
 pub(crate) trait DBDirTrait: Sync + Send {
 	fn id(&self) -> i64;
 	fn uuid(&self) -> UuidStr;
@@ -1132,7 +1071,6 @@ pub(crate) trait DBDirExt {
 	where
 		I: IntoIterator<Item = RemoteDirectory>,
 		I1: IntoIterator<Item = RemoteFile>;
-	fn find_child_file(&self, conn: &Connection, name: &str) -> Result<Option<DBFile>>;
 	fn select_children(
 		&self,
 		conn: &Connection,
@@ -1199,14 +1137,6 @@ where
 		Ok(())
 	}
 
-	fn find_child_file(&self, conn: &Connection, name: &str) -> Result<Option<DBFile>> {
-		let mut stmt = conn.prepare_cached(include_str!(
-			"../../sql/select_child_file_joined_by_name.sql"
-		))?;
-		stmt.query_one((self.uuid(), name), DBFile::from_row)
-			.optional()
-	}
-
 	fn select_children(
 		&self,
 		conn: &Connection,
@@ -1228,60 +1158,13 @@ where
 	}
 }
 
+#[allow(dead_code)]
 pub(crate) trait DBItemTrait: Sync + Send {
 	fn id(&self) -> i64;
 	fn uuid(&self) -> UuidStr;
 	fn parent(&self) -> Option<ParentUuid>;
 	fn name(&self) -> &str;
 	fn item_type(&self) -> ItemType;
-}
-
-pub(crate) trait DBItemExt: DBItemTrait {
-	fn trash(&self, conn: &Connection) -> Result<bool>;
-	fn delete(&self, conn: &Connection) -> Result<bool>;
-}
-
-impl<T> DBItemExt for T
-where
-	T: DBItemTrait + Sync + Send,
-{
-	fn trash(&self, conn: &Connection) -> Result<bool> {
-		trace!(
-			"Trashing item: uuid = {}, name = {}",
-			self.uuid(),
-			self.name()
-		);
-		let mut stmt = conn.prepare_cached(include_str!("../../sql/trash_item.sql"))?;
-		let num_rows = stmt.execute([self.uuid()])?;
-		if num_rows == 0 {
-			trace!(
-				"No rows updated for item: uuid = {}, name = {}",
-				self.uuid(),
-				self.name()
-			);
-			return Ok(false);
-		}
-		Ok(true)
-	}
-
-	fn delete(&self, conn: &Connection) -> Result<bool> {
-		trace!(
-			"Removing item: uuid = {}, name = {}",
-			self.uuid(),
-			self.name()
-		);
-		let mut stmt = conn.prepare_cached(include_str!("../../sql/delete_item.sql"))?;
-		let num_rows = stmt.execute([self.id()])?;
-		if num_rows == 0 {
-			trace!(
-				"No rows deleted for item: uuid = {}, name = {}",
-				self.uuid(),
-				self.name()
-			);
-			return Ok(false);
-		}
-		Ok(true)
-	}
 }
 
 fn convert_order_by(order_by: &str) -> &'static str {

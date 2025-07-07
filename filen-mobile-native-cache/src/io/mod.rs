@@ -6,11 +6,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use crate::{
-	FilenMobileCacheState,
-	sql::{DBItemTrait, ItemType},
-	traits::ProgressCallback,
-};
+use crate::{FilenMobileCacheState, sql::ItemType, traits::ProgressCallback};
 use filen_sdk_rs::{
 	fs::{
 		HasUUID,
@@ -277,10 +273,14 @@ impl FilenMobileCacheState {
 		Ok((file, target_path))
 	}
 
-	pub(crate) async fn io_delete_local(&self, object: &impl DBItemTrait) -> Result<(), io::Error> {
-		let path = self.cache_dir.join(object.uuid().as_ref());
+	pub(crate) async fn io_delete_local(
+		&self,
+		uuid: UuidStr,
+		item_type: ItemType,
+	) -> Result<(), io::Error> {
+		let path = self.cache_dir.join(uuid.as_ref());
 		if path.try_exists()? {
-			match object.item_type() {
+			match item_type {
 				ItemType::File => tokio::fs::remove_file(&path).await,
 				ItemType::Dir | ItemType::Root => tokio::fs::remove_dir(&path).await,
 			}
