@@ -26,11 +26,11 @@ async fn create_list_trash() {
 
 	let (dirs, _) = client.list_dir(test_dir).await.unwrap();
 
-	client.trash_dir(&mut dir).await.unwrap();
-
 	if !dirs.contains(&dir) {
 		panic!("Directory not found in root directory");
 	}
+
+	client.trash_dir(&mut dir).await.unwrap();
 }
 
 #[shared_test_runtime]
