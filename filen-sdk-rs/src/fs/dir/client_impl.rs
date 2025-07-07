@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use filen_types::fs::UuidStr;
+use filen_types::fs::{ParentUuid, UuidStr};
 use futures::TryFutureExt;
 
 use crate::{
@@ -195,13 +195,14 @@ impl Client {
 		Ok((dirs, files))
 	}
 
-	pub async fn trash_dir(&self, dir: &RemoteDirectory) -> Result<(), Error> {
+	pub async fn trash_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::trash::post(
 			self.client(),
 			&api::v3::dir::trash::Request { uuid: dir.uuid() },
 		)
 		.await?;
+		dir.parent = ParentUuid::Trash;
 		Ok(())
 	}
 

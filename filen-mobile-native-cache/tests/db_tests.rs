@@ -282,7 +282,7 @@ pub async fn test_query_children_after_deletion() {
 	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
 
 	// Create and then delete a directory
-	let dir = rss
+	let mut dir = rss
 		.client
 		.create_dir(&rss.dir, "temp_dir".to_string())
 		.await
@@ -303,7 +303,7 @@ pub async fn test_query_children_after_deletion() {
 	assert_eq!(resp.objects.len(), 2);
 
 	// Delete the directory
-	rss.client.trash_dir(&dir).await.unwrap();
+	rss.client.trash_dir(&mut dir).await.unwrap();
 	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
 	// Should now only have the file
@@ -1157,14 +1157,14 @@ pub async fn test_trash_item_already_trashed_file() {
 		.client
 		.make_file_builder("already_trashed.txt", &rss.dir)
 		.build();
-	let file = rss
+	let mut file = rss
 		.client
 		.upload_file(file.into(), b"This will be trashed twice")
 		.await
 		.unwrap();
 
 	// Trash it directly via SDK
-	rss.client.trash_file(&file).await.unwrap();
+	rss.client.trash_file(&mut file).await.unwrap();
 
 	let file_path: FfiPathWithRoot =
 		format!("{}/{}/{}", db.root_uuid(), rss.dir.name(), file.name()).into();

@@ -73,7 +73,7 @@ async fn dir_public_link() {
 		"get_dir_link_status didn't match created link"
 	);
 
-	let sub_sub_dir = client
+	let mut sub_sub_dir = client
 		.create_dir(&sub_dir, "sub_sub_dir".to_string())
 		.await
 		.unwrap();
@@ -112,8 +112,8 @@ async fn dir_public_link() {
 	assert_eq!(dirs.len(), 1);
 	assert_eq!(dirs[0].name(), "new_dir_name");
 
-	client.trash_dir(&sub_sub_dir).await.unwrap();
-	client.trash_file(&sub_sub_file).await.unwrap();
+	client.trash_dir(&mut sub_sub_dir).await.unwrap();
+	client.trash_file(&mut sub_sub_file).await.unwrap();
 
 	let (sub_dirs, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
 	assert_eq!(sub_dirs.len(), 0);

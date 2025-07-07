@@ -109,7 +109,7 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 
 	if let Some(FSObject::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
-		client.trash_dir(&dir).await.unwrap();
+		client.trash_dir(&mut dir.into_owned()).await.unwrap();
 	}
 
 	let compat_dir = client

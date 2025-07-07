@@ -579,16 +579,16 @@ impl FilenMobileCacheState {
 				)));
 			}
 			DBObject::Dir(dir) => {
-				let remote_dir = dir.into();
-				self.client.trash_dir(&remote_dir).await?;
+				let mut remote_dir = dir.into();
+				self.client.trash_dir(&mut remote_dir).await?;
 				self.io_delete_local(remote_dir.uuid(), ItemType::Dir)
 					.await?;
 				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
 				DBObject::Dir(dir)
 			}
 			DBObject::File(file) => {
-				let remote_file = file.try_into()?;
-				self.client.trash_file(&remote_file).await?;
+				let mut remote_file = file.try_into()?;
+				self.client.trash_file(&mut remote_file).await?;
 				self.io_delete_local(remote_file.uuid(), ItemType::File)
 					.await?;
 				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;

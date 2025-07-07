@@ -1,6 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
-use filen_types::fs::UuidStr;
+use filen_types::fs::{ParentUuid, UuidStr};
 use futures::AsyncRead;
 
 use crate::{
@@ -21,13 +21,15 @@ use super::{
 };
 
 impl Client {
-	pub async fn trash_file(&self, file: &RemoteFile) -> Result<(), Error> {
+	pub async fn trash_file(&self, file: &mut RemoteFile) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::trash::post(
 			self.client(),
 			&api::v3::file::trash::Request { uuid: file.uuid() },
 		)
-		.await
+		.await?;
+		file.parent = ParentUuid::Trash;
+		Ok(())
 	}
 
 	pub async fn restore_file(&self, file: &RemoteFile) -> Result<(), Error> {

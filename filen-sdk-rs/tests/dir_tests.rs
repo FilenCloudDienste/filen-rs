@@ -18,7 +18,7 @@ async fn create_list_trash() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir = client
+	let mut dir = client
 		.create_dir(test_dir, "test_dir".to_string())
 		.await
 		.unwrap();
@@ -26,7 +26,7 @@ async fn create_list_trash() {
 
 	let (dirs, _) = client.list_dir(test_dir).await.unwrap();
 
-	client.trash_dir(&dir).await.unwrap();
+	client.trash_dir(&mut dir).await.unwrap();
 
 	if !dirs.contains(&dir) {
 		panic!("Directory not found in root directory");
@@ -172,14 +172,14 @@ async fn exists() {
 
 	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
 
-	let dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	let mut dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
 
 	assert_eq!(
 		Some(dir_a.uuid()),
 		client.dir_exists(test_dir, "a").await.unwrap()
 	);
 
-	client.trash_dir(&dir_a).await.unwrap();
+	client.trash_dir(&mut dir_a).await.unwrap();
 	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
 }
 

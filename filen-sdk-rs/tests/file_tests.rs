@@ -116,7 +116,7 @@ async fn file_trash() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let file = client
+	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
 		.unwrap();
@@ -133,7 +133,7 @@ async fn file_trash() {
 		.acquire_lock("test:rs:trash", std::time::Duration::from_secs(1), 600)
 		.await
 		.unwrap();
-	client.trash_file(&file).await.unwrap();
+	client.trash_file(&mut file).await.unwrap();
 
 	assert!(
 		client
@@ -352,7 +352,7 @@ async fn file_trash_empty() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let file = client
+	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
 		.unwrap();
@@ -368,7 +368,7 @@ async fn file_trash_empty() {
 		.acquire_lock("test:rs:trash", std::time::Duration::from_secs(1), 600)
 		.await
 		.unwrap();
-	client.trash_file(&file).await.unwrap();
+	client.trash_file(&mut file).await.unwrap();
 	assert!(
 		client
 			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
