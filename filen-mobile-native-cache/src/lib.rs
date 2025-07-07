@@ -1,4 +1,5 @@
 use std::{
+	collections::HashMap,
 	path::{Path, PathBuf},
 	str::FromStr,
 	sync::{Arc, Mutex, MutexGuard},
@@ -22,7 +23,7 @@ use crate::{
 	ffi::FfiPathWithRoot,
 	sql::{
 		DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemTrait, DBNonRootObject, DBObject,
-		DBRoot, ItemType, error::OptionalExtensionSQL,
+		DBRoot, ItemType, error::OptionalExtensionSQL, json_object::JsonObject,
 	},
 	sync::UpdateItemsInPath,
 	traits::ProgressCallback,
@@ -257,6 +258,14 @@ impl FilenMobileCacheState {
 				.collect(),
 			None => vec![],
 		})
+	}
+
+	pub fn update_local_data(&self, uuid: &str, local_data: HashMap<String, String>) -> Result<()> {
+		debug!("Updating local data for UUID: {uuid}");
+		let uuid = UuidStr::from_str(uuid)?;
+		let mut conn = self.conn();
+		sql::update_local_data(&mut conn, uuid, Some(JsonObject::new(local_data)))?;
+		Ok(())
 	}
 }
 

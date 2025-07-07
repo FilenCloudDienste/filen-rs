@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS items (
     name TEXT NOT NULL,
     type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
     is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
+    local_data TEXT,
     FOREIGN KEY (parent) REFERENCES items (uuid) ON DELETE CASCADE
 );
 

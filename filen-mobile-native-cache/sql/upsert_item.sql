@@ -3,20 +3,31 @@ WITH local_source AS ( -- noqa: ST05
         COALESCE(
             moving.id,
             existing.id
-        ) AS id
+        ) AS id,
+        COALESCE(
+            ?4,
+            moving.local_data,
+            existing.local_data
+        ) AS local_data
     FROM (
     -- we select nothing here to make sure we always have a row
-        SELECT NULL AS id
+        SELECT
+            NULL AS id,
+            NULL AS local_data
     )
     -- The ambiguous cross join sqlfluff here is actually a bug
     -- this is a left join
     LEFT JOIN ( -- noqa: AM08
-        SELECT id
+        SELECT
+            id,
+            local_data
         FROM items
         WHERE uuid = ?1
     ) AS moving
     LEFT JOIN (
-        SELECT id
+        SELECT
+            id,
+            local_data
         FROM items
         WHERE parent = ?2 AND name = ?3
     ) AS existing
@@ -28,6 +39,7 @@ INSERT OR REPLACE INTO items (
     uuid,
     parent,
     name,
+    local_data,
     type
 )
 SELECT
@@ -35,6 +47,7 @@ SELECT
     ?1 AS uuid,
     ?2 AS parent,
     ?3 AS name,
-    ?4 AS type
+    local_source.local_data,
+    ?5 AS type
 FROM local_source
-RETURNING id;
+RETURNING id, local_data;

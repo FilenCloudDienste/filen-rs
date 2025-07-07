@@ -3,6 +3,7 @@ SELECT
     items.uuid,
     items.parent,
     items.name,
+    items.local_data,
     items.type,
     dirs.created AS dir_created,
     dirs.favorite_rank AS dir_favorite_rank,

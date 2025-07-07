@@ -2,6 +2,7 @@ SELECT
     items.id,
     items.uuid,
     items.parent,
+    items.local_data,
     items.name,
     files.mime,
     files.file_key,

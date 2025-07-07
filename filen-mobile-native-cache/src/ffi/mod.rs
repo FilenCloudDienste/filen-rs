@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{
 	DBDir, DBFile, DBObject,
 	sql::{DBDirObject, DBNonRootObject, DBRoot},
@@ -17,6 +19,8 @@ pub struct FfiFile {
 	pub size: i64,
 	pub favorite_rank: i64,
 	pub hash: Option<Vec<u8>>,
+
+	pub local_data: Option<HashMap<String, String>>,
 }
 
 impl From<DBFile> for FfiFile {
@@ -31,6 +35,7 @@ impl From<DBFile> for FfiFile {
 			size: file.size,
 			favorite_rank: file.favorite_rank,
 			hash: file.hash.map(Vec::from),
+			local_data: file.local_data.map(Into::into),
 		}
 	}
 }
@@ -49,6 +54,8 @@ pub struct FfiDir {
 
 	// cache info
 	pub last_listed: i64,
+
+	pub local_data: Option<HashMap<String, String>>,
 }
 
 impl From<DBDir> for FfiDir {
@@ -61,6 +68,7 @@ impl From<DBDir> for FfiDir {
 			created: dir.created,
 			favorite_rank: dir.favorite_rank,
 			last_listed: dir.last_listed,
+			local_data: dir.local_data.map(Into::into),
 		}
 	}
 }
@@ -77,6 +85,7 @@ impl From<DBDirObject> for FfiDir {
 				created: None,
 				favorite_rank: 0,
 				last_listed: root.last_listed,
+				local_data: None,
 			},
 		}
 	}

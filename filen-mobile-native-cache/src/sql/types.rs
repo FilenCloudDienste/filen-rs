@@ -18,6 +18,8 @@ use rusqlite::{
 };
 use sha2::Digest;
 
+use crate::sql::json_object::JsonObject;
+
 use super::SQLError;
 
 type SQLResult<T> = std::result::Result<T, SQLError>;
@@ -61,6 +63,7 @@ pub struct RawDBItem {
 	pub(crate) uuid: UuidStr,
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) name: String,
+	pub(crate) local_data: Option<JsonObject>, // local data is optional, used for storing additional metadata
 	pub(crate) type_: ItemType,
 }
 
@@ -68,12 +71,16 @@ fn upsert_item_with_stmts(
 	uuid: UuidStr,
 	parent: Option<ParentUuid>,
 	name: &str,
+	local_data: Option<JsonObject>,
 	type_: ItemType,
 	upsert_item_stmt: &mut CachedStatement<'_>,
-) -> Result<i64> {
+) -> Result<(i64, Option<JsonObject>)> {
 	trace!("Upserting item: uuid = {uuid}, parent = {parent:?}, name = {name}, type = {type_:?}");
-	let id = upsert_item_stmt.query_row((uuid, parent, name, type_), |row| row.get(0))?;
-	Ok(id)
+	let (id, local_data) = upsert_item_stmt
+		.query_row((uuid, parent, name, local_data, type_), |row| {
+			Ok((row.get(0)?, row.get(1)?))
+		})?;
+	Ok((id, local_data))
 }
 
 fn upsert_item(
@@ -81,10 +88,11 @@ fn upsert_item(
 	uuid: UuidStr,
 	parent: Option<ParentUuid>,
 	name: &str,
+	local_data: Option<JsonObject>,
 	type_: ItemType,
-) -> Result<i64> {
+) -> Result<(i64, Option<JsonObject>)> {
 	let mut upsert_item_stmt = conn.prepare_cached(UPSERT_ITEM_SQL)?;
-	upsert_item_with_stmts(uuid, parent, name, type_, &mut upsert_item_stmt)
+	upsert_item_with_stmts(uuid, parent, name, local_data, type_, &mut upsert_item_stmt)
 }
 
 impl RawDBItem {
@@ -94,7 +102,8 @@ impl RawDBItem {
 			uuid: row.get(1)?,
 			parent: row.get(2)?,
 			name: row.get(3)?,
-			type_: row.get(4)?,
+			local_data: row.get(4).unwrap(),
+			type_: row.get(5)?,
 		})
 	}
 
@@ -118,6 +127,7 @@ pub struct InnerDBItem {
 	pub(crate) uuid: UuidStr,
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) name: String,
+	pub(crate) local_data: Option<JsonObject>, // local data is optional, used for storing additional metadata
 }
 
 impl InnerDBItem {
@@ -127,6 +137,7 @@ impl InnerDBItem {
 			uuid: row.get(1)?,
 			parent: row.get(2)?,
 			name: row.get(3)?,
+			local_data: row.get(4).unwrap(),
 		})
 	}
 }
@@ -138,6 +149,7 @@ impl From<RawDBItem> for InnerDBItem {
 			uuid: raw.uuid,
 			parent: raw.parent,
 			name: raw.name,
+			local_data: raw.local_data,
 		}
 	}
 }
@@ -159,6 +171,7 @@ pub struct DBFile {
 	pub(crate) bucket: String,
 	pub(crate) hash: Option<[u8; 64]>,
 	pub(crate) version: u8,
+	pub(crate) local_data: Option<JsonObject>,
 }
 
 impl std::fmt::Debug for DBFile {
@@ -200,6 +213,7 @@ impl DBFile {
 				)
 			})?,
 			name: item.name,
+			local_data: item.local_data,
 			mime: row.get(idx)?,
 			file_key: row.get(idx + 1)?,
 			created: row.get(idx + 2)?,
@@ -232,10 +246,11 @@ impl DBFile {
 		upsert_file: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		trace!("Upserting remote file: {remote_file:?}");
-		let id = upsert_item_with_stmts(
+		let (id, local_data) = upsert_item_with_stmts(
 			remote_file.uuid(),
 			Some(remote_file.parent()),
 			remote_file.name(),
+			None,
 			ItemType::File,
 			upsert_item_stmt,
 		)?;
@@ -274,6 +289,7 @@ impl DBFile {
 			region: remote_file.region,
 			bucket: remote_file.bucket,
 			version: version as u8,
+			local_data,
 		})
 	}
 
@@ -432,6 +448,7 @@ pub struct DBDir {
 	pub(crate) favorite_rank: i64,
 	pub(crate) color: Option<String>,
 	pub(crate) last_listed: i64,
+	pub(crate) local_data: Option<JsonObject>,
 }
 
 impl DBDir {
@@ -451,6 +468,7 @@ impl DBDir {
 				)
 			})?,
 			name: item.name,
+			local_data: item.local_data,
 			created: row.get(idx)?,
 			favorite_rank: row.get(idx + 1)?,
 			color: row.get(idx + 2)?,
@@ -477,10 +495,11 @@ impl DBDir {
 		upsert_item_stmt: &mut CachedStatement<'_>,
 		upsert_dir: &mut CachedStatement<'_>,
 	) -> Result<Self> {
-		let id = upsert_item_with_stmts(
+		let (id, local_data) = upsert_item_with_stmts(
 			remote_dir.uuid(),
 			Some(remote_dir.parent()),
 			remote_dir.name(),
+			None,
 			ItemType::Dir,
 			upsert_item_stmt,
 		)?;
@@ -507,6 +526,7 @@ impl DBDir {
 			name: remote_dir.name,
 			color: remote_dir.color,
 			last_listed,
+			local_data,
 		})
 	}
 
@@ -652,11 +672,12 @@ impl DBRoot {
 	) -> Result<Self> {
 		trace!("Upserting remote root: {remote_root:?}");
 		let tx = conn.transaction()?;
-		let id = upsert_item(
+		let (id, _) = upsert_item(
 			&tx,
 			remote_root.uuid(),
 			None, // root has no parent
 			"",
+			None,
 			ItemType::Root,
 		)?;
 		let mut stmt = tx.prepare_cached(include_str!("../../sql/upsert_root_empty.sql"))?;
@@ -744,9 +765,9 @@ impl DBObject {
 		stmt.query_one([uuid], |row| {
 			let item = RawDBItem::from_row(row)?;
 			Ok(match item.type_ {
-				ItemType::Dir => Self::Dir(DBDir::from_inner_and_row(item.into(), row, 5)?),
-				ItemType::File => Self::File(DBFile::from_inner_and_row(item.into(), row, 9)?),
-				ItemType::Root => Self::Root(DBRoot::from_inner_and_row(item.into(), row, 20)?),
+				ItemType::Dir => Self::Dir(DBDir::from_inner_and_row(item.into(), row, 6)?),
+				ItemType::File => Self::File(DBFile::from_inner_and_row(item.into(), row, 10)?),
+				ItemType::Root => Self::Root(DBRoot::from_inner_and_row(item.into(), row, 21)?),
 			})
 		})
 	}
@@ -933,10 +954,10 @@ impl DBNonRootObject {
 
 	pub(crate) fn from_row(row: &rusqlite::Row) -> SQLResult<Self> {
 		let item = InnerDBItem::from_row(row)?;
-		let type_: ItemType = row.get(4)?;
+		let type_: ItemType = row.get(5)?;
 		Ok(match type_ {
-			ItemType::Dir => DBNonRootObject::Dir(DBDir::from_inner_and_row(item, row, 5)?),
-			ItemType::File => DBNonRootObject::File(DBFile::from_inner_and_row(item, row, 9)?),
+			ItemType::Dir => DBNonRootObject::Dir(DBDir::from_inner_and_row(item, row, 6)?),
+			ItemType::File => DBNonRootObject::File(DBFile::from_inner_and_row(item, row, 10)?),
 			_ => return Err(SQLError::UnexpectedType(type_, ItemType::Dir)),
 		})
 	}
@@ -1125,4 +1146,49 @@ fn convert_order_by(order_by: &str) -> &'static str {
 		}
 	}
 	"ORDER BY items.name ASC"
+}
+
+pub(crate) mod json_object {
+	use std::collections::HashMap;
+
+	use rusqlite::{
+		ToSql,
+		types::{FromSql, FromSqlError, ToSqlOutput, ValueRef},
+	};
+
+	#[derive(Debug, Clone, PartialEq, Eq)]
+	pub(crate) struct JsonObject(String);
+
+	impl JsonObject {
+		pub fn new(map: HashMap<String, String>) -> Self {
+			JsonObject(serde_json::to_string(&map).unwrap_or_default())
+		}
+
+		pub fn is_empty(&self) -> bool {
+			self.0 == "{}"
+		}
+	}
+
+	impl FromSql for JsonObject {
+		fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
+			match value {
+				ValueRef::Text(s) => Ok(JsonObject(
+					String::from_utf8(s.to_vec()).map_err(|e| FromSqlError::Other(e.into()))?,
+				)),
+				_ => Err(FromSqlError::InvalidType),
+			}
+		}
+	}
+
+	impl ToSql for JsonObject {
+		fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+			Ok(ToSqlOutput::Borrowed(ValueRef::Text(self.0.as_bytes())))
+		}
+	}
+
+	impl From<JsonObject> for HashMap<String, String> {
+		fn from(value: JsonObject) -> Self {
+			serde_json::from_str(&value.0).unwrap_or_default()
+		}
+	}
 }

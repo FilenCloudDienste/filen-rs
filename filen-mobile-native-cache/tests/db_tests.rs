@@ -3613,3 +3613,270 @@ pub async fn test_last_listed() {
 	assert!(now <= dir.last_listed);
 	assert!(dir.last_listed <= later);
 }
+
+#[shared_test_runtime]
+pub async fn test_update_local_data() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("file", &rss.dir)
+				.build()
+				.into(),
+			b"",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = test_dir_path.join(file.name());
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let mut ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item"),
+	};
+
+	let mut local_data = ffi_file.local_data.unwrap_or_default();
+	local_data.insert("k".to_string(), "v".to_string());
+	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+		.unwrap();
+	ffi_file.local_data = Some(local_data.clone());
+	let updated_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item"),
+	};
+	assert_eq!(updated_file, ffi_file);
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let updated_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item"),
+	};
+	assert_eq!(updated_file, ffi_file);
+}
+
+#[shared_test_runtime]
+pub async fn test_update_local_data_move() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("file", &rss.dir)
+				.build()
+				.into(),
+			b"",
+		)
+		.await
+		.unwrap();
+
+	let new_parent = rss
+		.client
+		.create_dir(&rss.dir, "new_parent".to_string())
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = test_dir_path.join(file.name());
+	let new_parent_path: FfiPathWithRoot = test_dir_path.join(new_parent.name());
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let mut ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item"),
+	};
+
+	let mut local_data = ffi_file.local_data.unwrap_or_default();
+	local_data.insert("k".to_string(), "v".to_string());
+	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+		.unwrap();
+	ffi_file.local_data = Some(local_data);
+
+	let resp = db.move_item(file_path, new_parent_path).await.unwrap();
+
+	let moved_file = match resp.object {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item after move"),
+	};
+	assert_eq!(moved_file.local_data, ffi_file.local_data);
+}
+
+#[shared_test_runtime]
+pub async fn test_update_local_data_remote_move() {
+	let (db, rss) = get_db_resources().await;
+
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("file", &rss.dir)
+				.build()
+				.into(),
+			b"",
+		)
+		.await
+		.unwrap();
+
+	let new_parent = rss
+		.client
+		.create_dir(&rss.dir, "new_parent".to_string())
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = test_dir_path.join(file.name());
+	let new_parent_path: FfiPathWithRoot = test_dir_path.join(new_parent.name());
+	let new_file_path: FfiPathWithRoot = new_parent_path.join(file.name());
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let mut ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item"),
+	};
+
+	let mut local_data = ffi_file.local_data.unwrap_or_default();
+	local_data.insert("k".to_string(), "v".to_string());
+	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+		.unwrap();
+	ffi_file.local_data = Some(local_data);
+
+	rss.client.move_file(&mut file, &new_parent).await.unwrap();
+
+	db.update_dir_children(new_parent_path.clone())
+		.await
+		.unwrap();
+	let moved_file = match db.query_item(&new_file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item after remote move"),
+	};
+
+	assert_eq!(moved_file.local_data, ffi_file.local_data);
+}
+
+#[shared_test_runtime]
+pub async fn test_update_local_data_remote_update() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("file", &rss.dir)
+				.build()
+				.into(),
+			b"",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = test_dir_path.join(file.name());
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item"),
+	};
+
+	let mut local_data = ffi_file.local_data.unwrap_or_default();
+	local_data.insert("k".to_string(), "v".to_string());
+	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+		.unwrap();
+
+	let _ = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder(file.name(), &rss.dir)
+				.build()
+				.into(),
+			b"1",
+		)
+		.await
+		.unwrap();
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let updated_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item after remote update"),
+	};
+	assert_eq!(updated_file.local_data, Some(local_data));
+}
+
+#[shared_test_runtime]
+pub async fn test_update_local_data_move_name_collision() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("file", &rss.dir)
+				.build()
+				.into(),
+			b"",
+		)
+		.await
+		.unwrap();
+
+	let new_parent = rss
+		.client
+		.create_dir(&rss.dir, "new_parent".to_string())
+		.await
+		.unwrap();
+
+	let _ = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("file", &new_parent)
+				.build()
+				.into(),
+			b"",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiPathWithRoot = format!("{}/{}", db.root_uuid(), rss.dir.name()).into();
+	let file_path: FfiPathWithRoot = test_dir_path.join(file.name());
+	let new_parent_path: FfiPathWithRoot = test_dir_path.join(new_parent.name());
+	let new_path: FfiPathWithRoot = new_parent_path.join(file.name());
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	db.update_dir_children(new_parent_path.clone())
+		.await
+		.unwrap();
+
+	let ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item"),
+	};
+
+	let mut local_data = ffi_file.local_data.unwrap_or_default();
+	local_data.insert("k".to_string(), "v".to_string());
+	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+		.unwrap();
+
+	let resp = db
+		.move_item(file_path.clone(), new_parent_path.clone())
+		.await
+		.unwrap();
+
+	let moved_file = match resp.object {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item after move"),
+	};
+
+	assert_eq!(moved_file.local_data, Some(local_data.clone()));
+
+	let moved_file = match db.query_item(&new_path).unwrap().unwrap() {
+		FfiObject::File(file) => file,
+		_ => panic!("Expected a file item after move"),
+	};
+	assert_eq!(moved_file.local_data, Some(local_data));
+}

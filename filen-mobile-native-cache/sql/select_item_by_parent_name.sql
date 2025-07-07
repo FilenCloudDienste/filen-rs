@@ -6,4 +6,5 @@ SELECT
     local_data,
     type
 FROM items
-WHERE uuid = ? LIMIT 1;
+WHERE parent = ? AND name = ?
+LIMIT 1;

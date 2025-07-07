@@ -7,7 +7,7 @@ pub use types::*;
 pub mod error;
 pub use error::SQLError;
 
-use crate::{MaybeTrashValues, PathIteratorExt, PathValues};
+use crate::{MaybeTrashValues, PathIteratorExt, PathValues, sql::json_object::JsonObject};
 
 /// Selects object in a path starting from the root UUID.
 ///
@@ -19,9 +19,7 @@ pub(crate) fn select_objects_in_path<'a>(
 	path_values: &'a PathValues,
 ) -> Result<(Vec<(DBObject, &'a str)>, bool), rusqlite::Error> {
 	let path_iter = path_values.inner_path.path_iter();
-	let mut stmt = conn.prepare_cached(
-		"SELECT id, uuid, parent, name, type FROM items WHERE parent = ? AND name = ? LIMIT 1;",
-	)?;
+	let mut stmt = conn.prepare_cached(include_str!("../../sql/select_item_by_parent_name.sql"))?;
 	let mut objects = Vec::new();
 
 	match RawDBItem::select(conn, path_values.root_uuid)? {
@@ -168,4 +166,17 @@ pub(crate) fn recursive_select_path_from_uuid(
 		"../../sql/recursive_select_path_from_uuid.sql"
 	))?;
 	stmt.query_row([uuid], |row| row.get(0)).optional()
+}
+
+pub(crate) fn update_local_data(
+	conn: &mut Connection,
+	uuid: UuidStr,
+	local_data: Option<JsonObject>,
+) -> Result<(), rusqlite::Error> {
+	let mut stmt = conn.prepare_cached("UPDATE items SET local_data = ? WHERE uuid = ?;")?;
+	let local_data = local_data
+		.map(|d| if d.is_empty() { None } else { Some(d) })
+		.unwrap_or(None);
+	stmt.execute((local_data, uuid))?;
+	Ok(())
 }

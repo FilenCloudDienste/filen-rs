@@ -3,6 +3,7 @@ SELECT
     items.uuid,
     items.parent,
     items.name,
+    items.local_data,
     files.mime,
     files.file_key,
     files.created,
