@@ -68,7 +68,12 @@ impl Client {
 
 		RemoteDirectory::from_encrypted(
 			uuid,
-			response.parent,
+			// v3 api returns the original parent as the parent if the file is in the trash
+			if response.trash {
+				ParentUuid::Trash
+			} else {
+				response.parent
+			},
 			response.color.map(|s| s.into_owned()),
 			response.favorited,
 			&response.metadata,

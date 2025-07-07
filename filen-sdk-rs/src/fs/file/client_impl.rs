@@ -100,7 +100,12 @@ impl Client {
 		let meta = FileMeta::from_encrypted(&response.metadata, self.crypter(), response.version)?;
 		Ok(RemoteFile::from_meta(
 			uuid,
-			response.parent,
+			// v3 api returns the original parent as the parent if the file is in the trash
+			if response.trash {
+				ParentUuid::Trash
+			} else {
+				response.parent
+			},
 			response.size,
 			response.size.div_ceil(CHUNK_SIZE_U64),
 			response.region,
