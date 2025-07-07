@@ -211,13 +211,18 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn restore_dir(&self, dir: &RemoteDirectory) -> Result<(), Error> {
+	pub async fn restore_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::restore::post(
 			self.client(),
 			&api::v3::dir::restore::Request { uuid: dir.uuid() },
 		)
 		.await?;
+
+		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
+		let resp =
+			api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid: dir.uuid() }).await?;
+		dir.parent = resp.parent;
 		Ok(())
 	}
 

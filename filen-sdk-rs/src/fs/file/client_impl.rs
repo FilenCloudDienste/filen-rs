@@ -32,13 +32,20 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn restore_file(&self, file: &RemoteFile) -> Result<(), Error> {
+	pub async fn restore_file(&self, file: &mut RemoteFile) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::restore::post(
 			self.client(),
 			&api::v3::file::restore::Request { uuid: file.uuid() },
 		)
-		.await
+		.await?;
+		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
+		let resp =
+			api::v3::file::post(self.client(), &api::v3::file::Request { uuid: file.uuid() })
+				.await?;
+
+		file.parent = resp.parent;
+		Ok(())
 	}
 
 	pub async fn delete_file_permanently(&self, file: RemoteFile) -> Result<(), Error> {

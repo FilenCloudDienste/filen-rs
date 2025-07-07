@@ -650,16 +650,16 @@ impl FilenMobileCacheState {
 
 		let object = match object {
 			DBNonRootObject::File(file) => {
-				let remote_file = file.try_into()?;
-				self.client.restore_file(&remote_file).await?;
+				let mut remote_file = file.try_into()?;
+				self.client.restore_file(&mut remote_file).await?;
 				let remote_file = self.client.get_file(remote_file.uuid()).await?;
 				let mut conn = self.conn();
 				let file = DBFile::upsert_from_remote(&mut conn, remote_file)?;
 				DBNonRootObject::File(file)
 			}
 			DBNonRootObject::Dir(dir) => {
-				let remote_dir: RemoteDirectory = dir.into();
-				self.client.restore_dir(&remote_dir).await?;
+				let mut remote_dir: RemoteDirectory = dir.into();
+				self.client.restore_dir(&mut remote_dir).await?;
 				let remote_dir = self.client.get_dir(remote_dir.uuid()).await?;
 				let mut conn = self.conn();
 				let dir = DBDir::upsert_from_remote(&mut conn, remote_dir)?;

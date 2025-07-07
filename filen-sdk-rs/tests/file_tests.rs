@@ -143,7 +143,7 @@ async fn file_trash() {
 			.is_none()
 	);
 
-	client.restore_file(&file).await.unwrap();
+	client.restore_file(&mut file).await.unwrap();
 	assert_eq!(
 		client
 			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
@@ -161,7 +161,7 @@ async fn file_delete_permanently() {
 
 	let file_name = "file.txt";
 	let file = client.make_file_builder(file_name, test_dir).build();
-	let file = client
+	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
 		.unwrap();
@@ -184,7 +184,7 @@ async fn file_delete_permanently() {
 			.is_none()
 	);
 
-	assert!(client.restore_file(&file).await.is_err());
+	assert!(client.restore_file(&mut file).await.is_err());
 
 	assert!(client.get_file(file.uuid()).await.is_err());
 
