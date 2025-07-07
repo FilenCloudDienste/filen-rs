@@ -11,7 +11,6 @@ use filen_sdk_rs::{
 	},
 };
 use filen_types::fs::{ParentUuid, UuidStr};
-use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use log::trace;
 use rusqlite::{
 	CachedStatement, Connection, OptionalExtension, Result, ToSql,
@@ -23,9 +22,7 @@ use super::SQLError;
 
 type SQLResult<T> = std::result::Result<T, SQLError>;
 
-const UPSERT_ITEM_CONFLICT_UUID_SQL: &str = include_str!("../../sql/upsert_item_conflict_uuid.sql");
-const UPSERT_ITEM_CONFLICT_NAME_PARENT_SQL: &str =
-	include_str!("../../sql/upsert_item_conflict_name_parent.sql");
+const UPSERT_ITEM_SQL: &str = include_str!("../../sql/upsert_item.sql");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
@@ -72,31 +69,10 @@ fn upsert_item_with_stmts(
 	parent: Option<ParentUuid>,
 	name: &str,
 	type_: ItemType,
-	upsert_item_conflict_uuid: &mut CachedStatement<'_>,
-	upsert_item_conflict_name_parent: &mut CachedStatement<'_>,
+	upsert_item_stmt: &mut CachedStatement<'_>,
 ) -> Result<i64> {
 	trace!("Upserting item: uuid = {uuid}, parent = {parent:?}, name = {name}, type = {type_:?}");
-	let id = match upsert_item_conflict_uuid.query_one((uuid, parent, name, type_), |row| {
-		let id: i64 = row.get(0)?;
-		Ok(id)
-	}) {
-		Ok(id) => id,
-		Err(rusqlite::Error::SqliteFailure(
-			libsqlite3_sys::Error {
-				code: libsqlite3_sys::ErrorCode::ConstraintViolation,
-				extended_code: SQLITE_CONSTRAINT_UNIQUE,
-			},
-			_,
-		)) => {
-			trace!("Conflict on UUID, trying to resolve by name and parent");
-			// might be a (parent, name, is_stale) conflict, so try to set the UUID and type
-			upsert_item_conflict_name_parent.query_one((uuid, parent, name, type_), |row| {
-				let id: i64 = row.get(0)?;
-				Ok(id)
-			})?
-		}
-		Err(e) => return Err(e),
-	};
+	let id = upsert_item_stmt.query_row((uuid, parent, name, type_), |row| row.get(0))?;
 	Ok(id)
 }
 
@@ -107,17 +83,8 @@ fn upsert_item(
 	name: &str,
 	type_: ItemType,
 ) -> Result<i64> {
-	let mut upsert_item_conflict_uuid = conn.prepare_cached(UPSERT_ITEM_CONFLICT_UUID_SQL)?;
-	let mut upsert_item_conflict_name_parent =
-		conn.prepare_cached(UPSERT_ITEM_CONFLICT_NAME_PARENT_SQL)?;
-	upsert_item_with_stmts(
-		uuid,
-		parent,
-		name,
-		type_,
-		&mut upsert_item_conflict_uuid,
-		&mut upsert_item_conflict_name_parent,
-	)
+	let mut upsert_item_stmt = conn.prepare_cached(UPSERT_ITEM_SQL)?;
+	upsert_item_with_stmts(uuid, parent, name, type_, &mut upsert_item_stmt)
 }
 
 impl RawDBItem {
@@ -261,8 +228,7 @@ impl DBFile {
 
 	pub(crate) fn upsert_from_remote_stmts(
 		remote_file: RemoteFile,
-		upsert_item_conflict_uuid: &mut CachedStatement<'_>,
-		upsert_item_conflict_name_parent: &mut CachedStatement<'_>,
+		upsert_item_stmt: &mut CachedStatement<'_>,
 		upsert_file: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		trace!("Upserting remote file: {remote_file:?}");
@@ -271,8 +237,7 @@ impl DBFile {
 			Some(remote_file.parent()),
 			remote_file.name(),
 			ItemType::File,
-			upsert_item_conflict_uuid,
-			upsert_item_conflict_name_parent,
+			upsert_item_stmt,
 		)?;
 		let file_key = remote_file.key().to_str();
 		let version = remote_file.key().version();
@@ -318,16 +283,9 @@ impl DBFile {
 	) -> Result<Self> {
 		let tx = conn.transaction()?;
 		let new = {
-			let mut upsert_item_conflict_uuid = tx.prepare_cached(UPSERT_ITEM_CONFLICT_UUID_SQL)?;
-			let mut upsert_item_conflict_name_parent =
-				tx.prepare_cached(UPSERT_ITEM_CONFLICT_NAME_PARENT_SQL)?;
+			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
 			let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
-			Self::upsert_from_remote_stmts(
-				remote_file,
-				&mut upsert_item_conflict_uuid,
-				&mut upsert_item_conflict_name_parent,
-				&mut upsert_file,
-			)?
+			Self::upsert_from_remote_stmts(remote_file, &mut upsert_item_stmt, &mut upsert_file)?
 		};
 		tx.commit()?;
 		Ok(new)
@@ -516,8 +474,7 @@ impl DBDir {
 
 	pub(crate) fn upsert_from_remote_stmts(
 		remote_dir: RemoteDirectory,
-		upsert_item_conflict_uuid: &mut CachedStatement<'_>,
-		upsert_item_conflict_name_parent: &mut CachedStatement<'_>,
+		upsert_item_stmt: &mut CachedStatement<'_>,
 		upsert_dir: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		let id = upsert_item_with_stmts(
@@ -525,8 +482,7 @@ impl DBDir {
 			Some(remote_dir.parent()),
 			remote_dir.name(),
 			ItemType::Dir,
-			upsert_item_conflict_uuid,
-			upsert_item_conflict_name_parent,
+			upsert_item_stmt,
 		)?;
 		trace!("Upserting remote dir: {remote_dir:?}");
 		let (last_listed, favorite_rank) = upsert_dir.query_one(
@@ -561,16 +517,9 @@ impl DBDir {
 		trace!("Upserting remote dir: {remote_dir:?}");
 		let tx = conn.transaction()?;
 		let new = {
-			let mut upsert_item_conflict_uuid = tx.prepare_cached(UPSERT_ITEM_CONFLICT_UUID_SQL)?;
-			let mut upsert_item_conflict_name_parent =
-				tx.prepare_cached(UPSERT_ITEM_CONFLICT_NAME_PARENT_SQL)?;
+			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
 			let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
-			Self::upsert_from_remote_stmts(
-				remote_dir,
-				&mut upsert_item_conflict_uuid,
-				&mut upsert_item_conflict_name_parent,
-				&mut upsert_dir,
-			)?
+			Self::upsert_from_remote_stmts(remote_dir, &mut upsert_item_stmt, &mut upsert_dir)?
 		};
 		tx.commit()?;
 		Ok(new)
@@ -1102,30 +1051,18 @@ where
 				tx.prepare_cached(include_str!("../../sql/mark_stale_with_parent.sql"))?;
 			stmt.execute([self.uuid()])?;
 
-			let mut upsert_item_conflict_uuid = tx.prepare_cached(UPSERT_ITEM_CONFLICT_UUID_SQL)?;
-			let mut upsert_item_conflict_name_parent =
-				tx.prepare_cached(UPSERT_ITEM_CONFLICT_NAME_PARENT_SQL)?;
+			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
 			let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
 
 			dirs.into_iter().try_for_each(|d| -> Result<()> {
-				DBDir::upsert_from_remote_stmts(
-					d,
-					&mut upsert_item_conflict_uuid,
-					&mut upsert_item_conflict_name_parent,
-					&mut upsert_dir,
-				)?;
+				DBDir::upsert_from_remote_stmts(d, &mut upsert_item_stmt, &mut upsert_dir)?;
 				Ok(())
 			})?;
 
 			let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
 
 			files.into_iter().try_for_each(|f| -> Result<()> {
-				DBFile::upsert_from_remote_stmts(
-					f,
-					&mut upsert_item_conflict_uuid,
-					&mut upsert_item_conflict_name_parent,
-					&mut upsert_file,
-				)?;
+				DBFile::upsert_from_remote_stmts(f, &mut upsert_item_stmt, &mut upsert_file)?;
 				Ok(())
 			})?;
 
