@@ -1,3 +1,4 @@
+use std::sync::Weak;
 use std::{borrow::Cow, sync::Arc, time};
 
 use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
@@ -70,6 +71,55 @@ impl Drop for ResourceLock {
 	}
 }
 
+#[cfg(feature = "tokio")]
+const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
+
+#[cfg(feature = "tokio")]
+fn keep_lock_alive(lock: Weak<ResourceLock>) {
+	use log::error;
+	use std::time::Instant;
+
+	let initial_update = Instant::now();
+	tokio::spawn(async move {
+		tokio::time::sleep(LOCK_REFRESH_INTERVAL - (Instant::now() - initial_update)).await;
+		loop {
+			if let Some(lock) = lock.upgrade() {
+				let good_response = match api::v3::user::lock::post(
+					lock.client.as_ref(),
+					&api::v3::user::lock::Request {
+						uuid: lock.uuid,
+						r#type: LockType::Refresh,
+						resource: Cow::Borrowed(&lock.resource),
+					},
+				)
+				.await
+				{
+					Ok(r) => r.refreshed,
+					Err(_) => false,
+				};
+
+				if !good_response {
+					error!("Failed to refresh lock: {}", lock.resource);
+					return;
+				} else {
+					debug!("Refreshed lock: {}", lock.resource);
+				}
+			} else {
+				return;
+			}
+			tokio::time::sleep(LOCK_REFRESH_INTERVAL).await;
+		}
+	});
+}
+
+#[cfg(not(feature = "tokio"))]
+fn keep_lock_alive(_lock: Weak<ResourceLock>) {
+	use log::warn;
+	warn!(
+		"Keep-alive for locks is not supported in non-tokio builds. The lock will not be refreshed automatically and will time out in 30 seconds."
+	);
+}
+
 impl Client {
 	async fn try_acquire_lock(&self, resource: &str, uuid: UuidStr) -> Result<bool, Error> {
 		let response = api::v3::user::lock::post(
@@ -89,7 +139,7 @@ impl Client {
 		resource: impl Into<String>,
 		sleep_time: time::Duration,
 		attempts: usize,
-	) -> Result<ResourceLock, Error> {
+	) -> Result<Arc<ResourceLock>, Error> {
 		let resource = resource.into();
 		let uuid = UuidStr::new_v4();
 		for attempt in 1..=attempts {
@@ -97,11 +147,14 @@ impl Client {
 				Ok(false) => {}
 				Ok(true) => {
 					debug!("Acquired lock {resource}: {uuid}");
-					return Ok(ResourceLock {
+					let lock = Arc::new(ResourceLock {
 						uuid,
 						client: self.arc_client(),
 						resource,
 					});
+					let weak_lock = Arc::downgrade(&lock);
+					keep_lock_alive(weak_lock);
+					return Ok(lock);
 				}
 				Err(e) => return Err(e),
 			}
@@ -117,7 +170,7 @@ impl Client {
 	pub async fn acquire_lock_with_default(
 		&self,
 		resource: impl Into<String>,
-	) -> Result<ResourceLock, Error> {
+	) -> Result<Arc<ResourceLock>, Error> {
 		self.acquire_lock(resource, time::Duration::from_secs(1), 86400)
 			.await
 	}

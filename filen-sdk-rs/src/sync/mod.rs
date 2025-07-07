@@ -13,7 +13,6 @@ impl Client {
 					Ok(lock)
 				} else {
 					let lock = self.acquire_lock_with_default("drive-write").await?;
-					let lock = Arc::new(lock);
 					let weak = Arc::downgrade(&lock);
 					guard.replace(weak);
 					Ok(lock)
@@ -21,7 +20,6 @@ impl Client {
 			}
 			None => {
 				let lock = self.acquire_lock_with_default("drive-write").await?;
-				let lock = Arc::new(lock);
 				let weak = Arc::downgrade(&lock);
 				guard.replace(weak);
 				Ok(lock)

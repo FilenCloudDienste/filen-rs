@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	auth::Client,
@@ -263,7 +265,7 @@ async fn contact_interactions() {
 async fn set_up_contact<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
-) -> (ResourceLock, ResourceLock) {
+) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
 	let lock1 = client
 		.acquire_lock_with_default("test:contact")
 		.await
