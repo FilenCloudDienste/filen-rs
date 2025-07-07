@@ -32,3 +32,4 @@ jobs:
           TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
           TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: trace
