@@ -4,7 +4,6 @@ use chrono::{SubsecRound, Utc};
 use filen_sdk_rs::{
 	auth::Client,
 	connect::PasswordState,
-	crypto::shared,
 	fs::{
 		HasName, HasUUID,
 		dir::traits::HasDirMeta,
@@ -13,7 +12,7 @@ use filen_sdk_rs::{
 	sync::lock::ResourceLock,
 };
 use filen_sdk_rs_macros::shared_test_runtime;
-use filen_types::api::v3::{dir::link::PublicLinkExpiration, item::share};
+use filen_types::api::v3::dir::link::PublicLinkExpiration;
 use futures::{StreamExt, stream::FuturesUnordered};
 
 #[shared_test_runtime]
@@ -335,6 +334,9 @@ async fn set_up_contact<'a>(
 		.accept_contact_request(request_uuid)
 		.await
 		.unwrap();
+
+	// removing in/out shared links is async so we wait
+	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 	(lock1, lock2)
 }
 
