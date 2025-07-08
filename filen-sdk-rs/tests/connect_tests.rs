@@ -263,14 +263,7 @@ async fn contact_interactions() {
 	assert_eq!(contacts.len(), 0);
 }
 
-async fn set_up_contact<'a>(
-	client: &'a Client,
-	share_client: &'a Client,
-) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
-	let lock1 = client
-		.acquire_lock_with_default("test:contact")
-		.await
-		.unwrap();
+async fn set_up_contact<'a>(client: &'a Client, share_client: &'a Client) -> Arc<ResourceLock> {
 	let lock2 = share_client
 		.acquire_lock_with_default("test:contact")
 		.await
@@ -337,7 +330,7 @@ async fn set_up_contact<'a>(
 
 	// removing in/out shared links is async so we wait
 	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-	(lock1, lock2)
+	lock2
 }
 
 #[shared_test_runtime]
@@ -365,7 +358,7 @@ async fn share_dir() {
 	let file = client.make_file_builder("a.txt", &sub_dir).build();
 	client.upload_file(file.into(), b"").await.unwrap();
 
-	let _locks = set_up_contact(client, share_client).await;
+	let _lock = set_up_contact(client, share_client).await;
 
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
@@ -447,7 +440,7 @@ async fn share_file() {
 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
 	let share_client = &share_resources.client;
 
-	let _locks = set_up_contact(client, share_client).await;
+	let _lock = set_up_contact(client, share_client).await;
 
 	let file = client.make_file_builder("a.txt", test_dir).build();
 	let mut file = client
@@ -500,7 +493,7 @@ async fn remove_link() {
 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
 	let share_client = &share_resources.client;
 
-	let _locks = set_up_contact(client, share_client).await;
+	let _lock = set_up_contact(client, share_client).await;
 
 	let out_dir = client
 		.create_dir(test_dir, "out".to_string())
@@ -529,6 +522,8 @@ async fn remove_link() {
 		.remove_shared_link_in(in_dir.uuid())
 		.await
 		.unwrap();
+
+	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
 	let shared_dirs_out = client.list_out_shared(None).await.unwrap().0;
 	assert_eq!(shared_dirs_out.len(), 0);
