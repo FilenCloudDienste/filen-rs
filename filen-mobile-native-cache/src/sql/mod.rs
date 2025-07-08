@@ -171,7 +171,7 @@ pub(crate) fn recursive_select_path_from_uuid(
 pub(crate) fn update_local_data(
 	conn: &mut Connection,
 	uuid: UuidStr,
-	local_data: Option<JsonObject>,
+	local_data: Option<&JsonObject>,
 ) -> Result<(), rusqlite::Error> {
 	let mut stmt = conn.prepare_cached("UPDATE items SET local_data = ? WHERE uuid = ?;")?;
 	let local_data = local_data

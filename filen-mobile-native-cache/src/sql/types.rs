@@ -968,6 +968,20 @@ impl DBNonRootObject {
 			DBNonRootObject::File(file) => file.parent,
 		}
 	}
+
+	pub(crate) fn local_data(&self) -> Option<&JsonObject> {
+		match self {
+			DBNonRootObject::Dir(dir) => dir.local_data.as_ref(),
+			DBNonRootObject::File(file) => file.local_data.as_ref(),
+		}
+	}
+
+	pub(crate) fn set_local_data(&mut self, local_data: Option<JsonObject>) {
+		match self {
+			DBNonRootObject::Dir(dir) => dir.local_data = local_data,
+			DBNonRootObject::File(file) => file.local_data = local_data,
+		}
+	}
 }
 
 impl DBItemTrait for DBNonRootObject {
@@ -1167,6 +1181,10 @@ pub(crate) mod json_object {
 		pub fn is_empty(&self) -> bool {
 			self.0 == "{}"
 		}
+
+		pub fn to_map(&self) -> HashMap<String, String> {
+			serde_json::from_str(&self.0).unwrap_or_default()
+		}
 	}
 
 	impl FromSql for JsonObject {
@@ -1183,12 +1201,6 @@ pub(crate) mod json_object {
 	impl ToSql for JsonObject {
 		fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
 			Ok(ToSqlOutput::Borrowed(ValueRef::Text(self.0.as_bytes())))
-		}
-	}
-
-	impl From<JsonObject> for HashMap<String, String> {
-		fn from(value: JsonObject) -> Self {
-			serde_json::from_str(&value.0).unwrap_or_default()
 		}
 	}
 }

@@ -261,11 +261,60 @@ impl FilenMobileCacheState {
 	}
 
 	pub fn update_local_data(&self, uuid: &str, local_data: HashMap<String, String>) -> Result<()> {
-		debug!("Updating local data for UUID: {uuid}");
+		debug!("Setting local data for UUID: {uuid} to {local_data:?}");
 		let uuid = UuidStr::from_str(uuid)?;
 		let mut conn = self.conn();
-		sql::update_local_data(&mut conn, uuid, Some(JsonObject::new(local_data)))?;
+		sql::update_local_data(&mut conn, uuid, Some(&JsonObject::new(local_data)))?;
 		Ok(())
+	}
+
+	pub fn insert_into_local_data_for_path(
+		&self,
+		path: FfiPathWithRoot,
+		key: String,
+		value: Option<String>,
+	) -> Result<FfiObject> {
+		debug!(
+			"Setting {key} to {value:?} for local data for path: {}",
+			path.0
+		);
+
+		let path_values = path.as_path_values()?;
+		let mut obj = match sql::select_object_at_path(&self.conn(), &path_values)? {
+			Some(DBObject::Dir(dir)) => DBNonRootObject::Dir(dir),
+			Some(DBObject::File(file)) => DBNonRootObject::File(file),
+			Some(DBObject::Root(_)) => {
+				return Err(CacheError::conversion(
+					"Cannot insert into local data for root",
+				));
+			}
+			None => {
+				return Err(CacheError::remote(format!(
+					"Path {} does not point to an item",
+					path_values.full_path
+				)));
+			}
+		};
+
+		let mut local_data = obj.local_data().map(|o| o.to_map()).unwrap_or_default();
+		match value {
+			Some(v) => local_data.insert(key, v),
+			None => local_data.remove(&key),
+		};
+		let local_data = JsonObject::new(local_data);
+
+		sql::update_local_data(
+			&mut self.conn(),
+			obj.uuid(),
+			if local_data.is_empty() {
+				None
+			} else {
+				Some(&local_data)
+			},
+		)?;
+		obj.set_local_data(Some(local_data));
+
+		Ok(FfiObject::from(DBObject::from(obj)))
 	}
 }
 

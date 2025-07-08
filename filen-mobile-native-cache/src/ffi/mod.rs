@@ -35,7 +35,7 @@ impl From<DBFile> for FfiFile {
 			size: file.size,
 			favorite_rank: file.favorite_rank,
 			hash: file.hash.map(Vec::from),
-			local_data: file.local_data.map(Into::into),
+			local_data: file.local_data.map(|o| o.to_map()),
 		}
 	}
 }
@@ -68,7 +68,7 @@ impl From<DBDir> for FfiDir {
 			created: dir.created,
 			favorite_rank: dir.favorite_rank,
 			last_listed: dir.last_listed,
-			local_data: dir.local_data.map(Into::into),
+			local_data: dir.local_data.map(|o| o.to_map()),
 		}
 	}
 }
