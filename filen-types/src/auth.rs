@@ -46,3 +46,22 @@ pub enum MetaEncryptionVersion {
 	V2 = 2,
 	V3 = 3,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilenSDKConfig {
+	pub email: String,
+	pub password: String,
+	pub two_factor_code: String,
+	pub master_keys: Vec<String>,
+	pub api_key: String,
+	pub public_key: String,
+	pub private_key: String,
+	pub auth_version: AuthVersion,
+	#[serde(rename = "baseFolderUUID")]
+	pub base_folder_uuid: String,
+	pub user_id: u64,
+	pub metadata_cache: bool,
+	pub tmp_path: String,
+	pub connect_to_socket: bool,
+}

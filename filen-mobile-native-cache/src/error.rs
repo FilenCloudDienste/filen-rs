@@ -15,6 +15,12 @@ impl std::fmt::Display for ErrorContext {
 	}
 }
 
+impl Default for ErrorContext {
+	fn default() -> Self {
+		ErrorContext(Cow::Borrowed(""))
+	}
+}
+
 trait IntoErrorContext {
 	fn into_error_context(self) -> ErrorContext;
 }
@@ -52,6 +58,8 @@ pub enum CacheError {
 	IO(ErrorContext),
 	Remote(ErrorContext),
 	Image(ErrorContext),
+	Unauthenticated(ErrorContext),
+	Disabled(ErrorContext),
 }
 
 impl CacheError {
@@ -87,6 +95,12 @@ impl CacheError {
 			CacheError::Image(err) => CacheError::Image(ErrorContext(
 				format!("{}: {}", context.into(), err.0).into(),
 			)),
+			CacheError::Unauthenticated(err) => CacheError::Unauthenticated(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::Disabled(err) => CacheError::Disabled(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
 		}
 	}
 }
@@ -111,6 +125,8 @@ impl std::fmt::Display for CacheError {
 			CacheError::IO(err) => err.fmt(f),
 			CacheError::Remote(err) => err.fmt(f),
 			CacheError::Image(err) => err.fmt(f),
+			CacheError::Unauthenticated(err) => err.fmt(f),
+			CacheError::Disabled(err) => err.fmt(f),
 		}
 	}
 }

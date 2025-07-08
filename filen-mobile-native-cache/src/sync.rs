@@ -15,8 +15,10 @@ use log::debug;
 use rusqlite::Connection;
 
 use crate::{
-	CacheError, DBDirTrait, FilenMobileCacheState, PathValues,
-	sql::{self, DBDir, DBDirObject, DBFile, DBObject, DBRoot},
+	CacheError,
+	auth::AuthCacheState,
+	ffi::PathValues,
+	sql::{self, DBDir, DBDirObject, DBFile, DBItemTrait, DBObject, DBRoot},
 };
 
 #[allow(unused)]
@@ -138,7 +140,7 @@ fn update_dirs(
 	last_dir_obj.ok_or_else(|| CacheError::remote("No directories found in the provided list"))
 }
 
-impl FilenMobileCacheState {
+impl AuthCacheState {
 	async fn update_items_in_path_starting_at<'a>(
 		&self,
 		path: &'a str,

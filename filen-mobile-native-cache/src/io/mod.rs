@@ -6,7 +6,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use crate::{FilenMobileCacheState, sql::ItemType, traits::ProgressCallback};
+use crate::{auth::AuthCacheState, sql::ItemType, traits::ProgressCallback};
 use filen_sdk_rs::{
 	fs::{
 		HasUUID,
@@ -94,7 +94,7 @@ async fn update_task(
 	}
 }
 
-impl FilenMobileCacheState {
+impl AuthCacheState {
 	pub async fn download_file_io(
 		&self,
 		file: &RemoteFile,

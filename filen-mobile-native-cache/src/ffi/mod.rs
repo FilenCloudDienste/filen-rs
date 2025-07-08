@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
+
+use filen_sdk_rs::util::PathIteratorExt;
+use filen_types::fs::UuidStr;
 
 use crate::{
-	DBDir, DBFile, DBObject,
-	sql::{DBDirObject, DBNonRootObject, DBRoot},
+	CacheError,
+	sql::{DBDir, DBDirObject, DBFile, DBNonRootObject, DBObject, DBRoot},
 };
 
 #[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
@@ -187,6 +190,61 @@ impl std::fmt::Display for FfiPathWithRoot {
 	}
 }
 
+#[derive(Debug)]
+pub struct PathValues<'a> {
+	pub root_uuid: UuidStr,
+	pub full_path: &'a str,
+	pub inner_path: &'a str,
+	pub name: &'a str,
+}
+
+#[derive(Debug)]
+pub struct TrashValues<'a> {
+	pub full_path: &'a str,
+	pub inner_path: &'a str,
+	pub uuid: UuidStr,
+}
+
+#[derive(Debug)]
+pub enum MaybeTrashValues<'a> {
+	Trash(TrashValues<'a>),
+	Path(PathValues<'a>),
+}
+
+impl FfiPathWithRoot {
+	pub fn as_path_values(&self) -> Result<PathValues, CacheError> {
+		let mut iter = self.0.path_iter();
+		let (root_uuid_str, remaining) = iter
+			.next()
+			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;
+
+		Ok(PathValues {
+			root_uuid: UuidStr::from_str(root_uuid_str).map_err(|e| {
+				CacheError::conversion(format!("Invalid root UUID: {root_uuid_str} error: {e} "))
+			})?,
+			full_path: self.0.as_str(),
+			inner_path: remaining,
+			name: iter.last().unwrap_or_default().0,
+		})
+	}
+
+	pub fn as_maybe_trash_values(&self) -> Result<MaybeTrashValues, CacheError> {
+		let mut iter = self.0.path_iter();
+		let (root_uuid_str, remaining) = iter
+			.next()
+			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;
+
+		match root_uuid_str {
+			"trash" => Ok(MaybeTrashValues::Trash(TrashValues {
+				full_path: self.0.as_str(),
+				inner_path: remaining,
+				uuid: UuidStr::from_str(iter.last().unwrap_or_default().0)?,
+			})),
+			_ => Ok(MaybeTrashValues::Path(self.as_path_values()?)),
+		}
+	}
+}
+
 uniffi::custom_type!(FfiPathWithRoot, String, {
 	lower: |s| s.0,
 });
@@ -213,4 +271,49 @@ impl FfiTrashPath {
 	pub fn uuid(&self) -> Option<&str> {
 		self.0.split('/').next_back()
 	}
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct QueryChildrenResponse {
+	pub objects: Vec<FfiNonRootObject>,
+	pub parent: FfiDir,
+}
+
+#[derive(uniffi::Record)]
+pub struct DownloadResponse {
+	pub path: String,
+	pub file: FfiFile,
+}
+
+#[derive(uniffi::Record)]
+pub struct CreateFileResponse {
+	pub path: String,
+	pub file: FfiFile,
+	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct FileWithPathResponse {
+	pub file: FfiFile,
+	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct DirWithPathResponse {
+	pub dir: FfiDir,
+	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct ObjectWithPathResponse {
+	pub object: FfiObject,
+	pub id: FfiPathWithRoot,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct UploadFileInfo {
+	pub name: String,
+	pub creation: Option<i64>,
+	pub modification: Option<i64>,
+	pub mime: Option<String>,
 }

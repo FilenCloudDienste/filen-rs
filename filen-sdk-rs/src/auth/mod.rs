@@ -8,7 +8,7 @@ use std::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use digest::Digest;
 use filen_types::{
-	auth::{APIKey, AuthVersion, FileEncryptionVersion, MetaEncryptionVersion},
+	auth::{APIKey, AuthVersion, FileEncryptionVersion, FilenSDKConfig, MetaEncryptionVersion},
 	crypto::{EncryptedMetaKey, EncryptedString},
 	fs::UuidStr,
 };
@@ -388,6 +388,35 @@ impl Client {
 				AuthInfo::V2(_) => 2,
 				AuthInfo::V3(_) => 3,
 			},
+		}
+	}
+
+	pub fn to_sdk_config(&self) -> FilenSDKConfig {
+		FilenSDKConfig {
+			email: self.email.clone(),
+			password: "".to_string(), // we should not be storing passwords in the client
+			two_factor_code: "".to_string(),
+			master_keys: match &self.auth_info {
+				AuthInfo::V1(info) | AuthInfo::V2(info) => info
+					.master_keys
+					.to_decrypted_string()
+					.split('|')
+					.fold(Vec::new(), |mut acc, key| {
+						acc.push(key.to_string());
+						acc
+					}),
+				AuthInfo::V3(info) => vec![info.dek.to_string()],
+			},
+			api_key: self.client().api_key.to_string(),
+			private_key: BASE64_STANDARD
+				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
+			public_key: BASE64_STANDARD.encode(self.public_key.to_pkcs1_der().unwrap().as_bytes()),
+			auth_version: self.auth_version(),
+			base_folder_uuid: self.root_dir.uuid().to_string(),
+			user_id: 0,
+			metadata_cache: false,
+			tmp_path: "".to_string(), // ?
+			connect_to_socket: false,
 		}
 	}
 }

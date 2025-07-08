@@ -10,14 +10,16 @@ use filen_sdk_rs::{
 use futures::{StreamExt, stream::FuturesUnordered};
 use image::ImageError;
 use log::debug;
+use tokio::sync::OwnedRwLockReadGuard;
 
 use crate::{
-	CacheError, FilenMobileCacheState,
+	CacheError,
+	auth::{AuthCacheState, CacheState, FilenMobileCacheState},
 	ffi::FfiPathWithRoot,
 	sql::{self, DBObject},
 };
 
-impl FilenMobileCacheState {
+impl AuthCacheState {
 	async fn get_or_make_thumbnail(
 		&self,
 		file: &RemoteFile,
@@ -162,19 +164,19 @@ impl BulkThumbnailResponse {
 	}
 }
 
-#[uniffi::export]
-impl FilenMobileCacheState {
-	pub fn get_thumbnails(
-		self: Arc<Self>,
+impl AuthCacheState {
+	pub(crate) fn get_thumbnails(
+		this: OwnedRwLockReadGuard<CacheState, Self>,
 		items: Vec<FfiPathWithRoot>,
 		requested_width: u32,
 		requested_height: u32,
 		callback: Arc<dyn ThumbnailCallback>,
 	) -> BulkThumbnailResponse {
+		let arc = Arc::new(this);
 		let handle = crate::env::get_runtime().spawn(async move {
 			let mut futures = FuturesUnordered::new();
 			for item in items {
-				let self_ref = self.clone();
+				let self_ref = arc.clone();
 				let callback_ref = callback.clone();
 				futures.push(async move {
 					let result = self_ref
@@ -191,15 +193,40 @@ impl FilenMobileCacheState {
 	}
 }
 
+#[uniffi::export]
+impl FilenMobileCacheState {
+	pub fn get_thumbnails(
+		self: Arc<Self>,
+		items: Vec<FfiPathWithRoot>,
+		requested_width: u32,
+		requested_height: u32,
+		callback: Arc<dyn ThumbnailCallback>,
+	) -> Result<BulkThumbnailResponse, CacheError> {
+		self.sync_execute_authed_owned(move |auth_state| {
+			Ok(AuthCacheState::get_thumbnails(
+				auth_state,
+				items,
+				requested_width,
+				requested_height,
+				callback,
+			))
+		})
+	}
+}
+
 #[filen_sdk_rs_macros::create_uniffi_wrapper]
 impl FilenMobileCacheState {
 	pub async fn get_thumbnail(
-		&self,
+		self: Arc<Self>,
 		item: FfiPathWithRoot,
 		requested_width: u32,
 		requested_height: u32,
-	) -> ThumbnailResult {
-		self.make_thumbnail_for_path(&item, requested_width, requested_height)
-			.await
+	) -> Result<ThumbnailResult, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			Ok(auth_state
+				.make_thumbnail_for_path(&item, requested_width, requested_height)
+				.await)
+		})
+		.await
 	}
 }

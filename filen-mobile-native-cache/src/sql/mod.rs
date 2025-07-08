@@ -1,3 +1,4 @@
+use filen_sdk_rs::util::PathIteratorExt;
 use filen_types::fs::UuidStr;
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use rusqlite::{Connection, OptionalExtension};
@@ -7,7 +8,10 @@ pub use types::*;
 pub mod error;
 pub use error::SQLError;
 
-use crate::{MaybeTrashValues, PathIteratorExt, PathValues, sql::json_object::JsonObject};
+use crate::{
+	ffi::{MaybeTrashValues, PathValues},
+	sql::json_object::JsonObject,
+};
 
 /// Selects object in a path starting from the root UUID.
 ///
