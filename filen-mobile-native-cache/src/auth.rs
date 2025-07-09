@@ -1,13 +1,14 @@
 use core::panic;
 use std::{
 	hint::unreachable_unchecked,
+	ops::Deref,
 	path::{Path, PathBuf},
 	sync::{Arc, Mutex, MutexGuard},
 	time::Instant,
 };
 
 use filen_types::auth::FilenSDKConfig;
-use log::{debug, info};
+use log::{debug, info, trace};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedRwLockReadGuard;
@@ -15,6 +16,7 @@ use tokio::sync::OwnedRwLockReadGuard;
 use crate::CacheError;
 
 const UNAUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const AUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,
@@ -31,7 +33,6 @@ enum UnauthReason {
 
 struct UnauthCacheState {
 	reason: UnauthReason,
-	last_update: Option<Instant>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -42,8 +43,9 @@ enum AuthStatus {
 
 pub(crate) struct CacheState {
 	status: AuthStatus,
-	auth_file: PathBuf,
+	auth_file: Arc<PathBuf>, // to allow async access without cloning
 	files_dir: PathBuf,
+	last_update: std::sync::RwLock<Option<Instant>>,
 }
 
 #[derive(uniffi::Object)]
@@ -60,11 +62,15 @@ pub struct AuthFile {
 }
 
 fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
+	debug!("Auth file content: {result:?}");
 	match result {
 		Ok(content) => {
 			let auth_file: serde_json::Result<AuthFile> = serde_json::from_str(&content);
 			match auth_file {
-				Ok(auth_file) => auth_file,
+				Ok(auth_file) => {
+					debug!("Parsed auth file: {auth_file:?}");
+					auth_file
+				}
 				Err(e) => {
 					log::error!("Failed to parse auth file, error: {e}");
 					AuthFile {
@@ -99,70 +105,83 @@ async fn async_get_auth_file(path: &Path) -> AuthFile {
 	parse_auth_file(tokio::fs::read_to_string(path).await)
 }
 
-fn match_state(state: &CacheState, now: Instant) -> bool {
-	match &state.status {
-		AuthStatus::Authenticated(_) => true,
-		AuthStatus::Unauthenticated(unauth_state) => {
-			if let Some(last_update) = unauth_state.last_update {
-				(last_update - now) < UNAUTH_UPDATE_INTERVAL
-			} else {
-				false
-			}
-		}
-	}
-}
-
-fn match_state_borrowed(
-	state: tokio::sync::RwLockReadGuard<'_, CacheState>,
-	now: Instant,
-) -> Option<tokio::sync::RwLockReadGuard<'_, CacheState>> {
-	match_state(&state, now).then_some(state)
-}
-
-fn match_state_owned(
-	state: tokio::sync::OwnedRwLockReadGuard<CacheState>,
-	now: Instant,
-) -> Option<tokio::sync::OwnedRwLockReadGuard<CacheState>> {
-	match_state(&state, now).then_some(state)
-}
-
 fn update_state(state: &mut CacheState, auth_file: AuthFile) {
 	if auth_file.provider_enabled {
 		match auth_file.sdk_config {
 			Some(config) => {
 				match AuthCacheState::from_sdk_config(config, &state.files_dir) {
-					Ok(auth_state) => state.status = AuthStatus::Authenticated(auth_state),
+					Ok(auth_state) => {
+						info!("Authenticated with Filen SDK");
+						state.status = AuthStatus::Authenticated(auth_state);
+					}
 					Err(e) => {
 						log::error!("Failed to create AuthCacheState: {e}");
 						state.status = AuthStatus::Unauthenticated(UnauthCacheState {
 							reason: UnauthReason::Unauthenticated,
-							last_update: Some(Instant::now()),
 						});
 					}
 				};
 			}
 			None => {
+				debug!("Auth file does not contain SDK config, setting to unauthenticated");
 				state.status = AuthStatus::Unauthenticated(UnauthCacheState {
 					reason: UnauthReason::Unauthenticated,
-					last_update: Some(Instant::now()),
 				});
 			}
 		}
 	} else {
+		debug!("Provider is disabled, setting to disabled");
 		state.status = AuthStatus::Unauthenticated(UnauthCacheState {
 			reason: UnauthReason::Disabled,
-			last_update: Some(Instant::now()),
 		});
 	}
+	let mut last_update = state.last_update.write().unwrap();
+	last_update.replace(Instant::now());
 }
 
 impl FilenMobileCacheState {
+	fn match_state<T>(&self, state: T, now: Instant) -> Option<T>
+	where
+		T: Deref<Target = CacheState>,
+	{
+		// read and immediately drop lock
+		match (&state.status, *state.last_update.read().unwrap()) {
+			(AuthStatus::Authenticated(_), last_update) => {
+				if let Some(last_update) = last_update
+					&& (last_update - now) < AUTH_UPDATE_INTERVAL
+				{
+				} else {
+					state.last_update.write().unwrap().replace(Instant::now());
+					let auth_file_path = state.auth_file.clone();
+					let state_arc = self.state.clone();
+
+					// run the update but do it async
+					crate::env::get_runtime().spawn(async move {
+						let auth_file = async_get_auth_file(&auth_file_path).await;
+						if !auth_file.provider_enabled || auth_file.sdk_config.is_none() {
+							update_state(&mut *state_arc.write().await, auth_file);
+						}
+					});
+				}
+			}
+			(AuthStatus::Unauthenticated(_), last_update) => {
+				if let Some(last_update) = last_update
+					&& (last_update - now) < UNAUTH_UPDATE_INTERVAL
+				{
+				} else {
+					return None;
+				}
+			}
+		}
+		Some(state)
+	}
+
 	async fn async_get_cache_state_borrowed(&self) -> tokio::sync::RwLockReadGuard<'_, CacheState> {
 		let state = self.state.read().await;
 		let now = Instant::now();
 
 		// If the state is valid and up to date, return it
-		if let Some(state) = match_state_borrowed(state, now) {
+		if let Some(state) = self.match_state(state, now) {
 			return state;
 		}
 
@@ -175,7 +194,7 @@ impl FilenMobileCacheState {
 			.expect("Coordinated read access should always succeed");
 
 		// check again after acquiring the coordinator lock
-		if let Some(state) = match_state_borrowed(state, now) {
+		if let Some(state) = self.match_state(state, now) {
 			return state;
 		}
 
@@ -196,7 +215,7 @@ impl FilenMobileCacheState {
 		let now = Instant::now();
 
 		// If the state is valid and up to date, return it
-		if let Some(state) = match_state_borrowed(state, now) {
+		if let Some(state) = self.match_state(state, now) {
 			return Some(state);
 		}
 
@@ -234,7 +253,7 @@ impl FilenMobileCacheState {
 		let now = Instant::now();
 
 		// If the state is valid and up to date, return it
-		if let Some(state) = match_state_owned(state, now) {
+		if let Some(state) = self.match_state(state, now) {
 			return state;
 		}
 
@@ -248,7 +267,7 @@ impl FilenMobileCacheState {
 			.expect("Coordinated read access should always succeed");
 
 		// check again after acquiring the coordinator lock
-		if let Some(state) = match_state_owned(state, now) {
+		if let Some(state) = self.match_state(state, now) {
 			return state;
 		}
 
@@ -269,7 +288,7 @@ impl FilenMobileCacheState {
 		let now = Instant::now();
 
 		// If the state is valid and up to date, return it
-		if let Some(state) = match_state_owned(state, now) {
+		if let Some(state) = self.match_state(state, now) {
 			return Some(state);
 		}
 
@@ -379,15 +398,16 @@ impl FilenMobileCacheState {
 		&self,
 		f: impl FnOnce(&AuthCacheState) -> Result<T, CacheError> + Send,
 	) -> Result<T, CacheError> {
+		trace!("sync_execute_authed");
 		let state = self.sync_get_cache_state_borrowed();
 		match &state.status {
 			AuthStatus::Authenticated(auth_state) => f(auth_state),
 			AuthStatus::Unauthenticated(unauth_state) => match unauth_state.reason {
 				UnauthReason::Disabled => {
-					Err(CacheError::Disabled("Disabled: execute_authed".into()))
+					Err(CacheError::Disabled("Disabled: sync_execute_authed".into()))
 				}
 				UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-					"Unauthenticated: execute_authed".into(),
+					"Unauthenticated: sync_execute_authed".into(),
 				)),
 			},
 		}
@@ -398,6 +418,7 @@ impl FilenMobileCacheState {
 		f: impl AsyncFnOnce(OwnedRwLockReadGuard<CacheState, AuthCacheState>) -> Result<T, CacheError>
 		+ Send,
 	) -> Result<T, CacheError> {
+		trace!("async_execute_authed_owned");
 		let state = self.async_get_cache_state_owned().await;
 		match &state.status {
 			AuthStatus::Authenticated(_) => {
@@ -409,11 +430,11 @@ impl FilenMobileCacheState {
 				f(new_guard).await
 			}
 			AuthStatus::Unauthenticated(unauth_state) => match unauth_state.reason {
-				UnauthReason::Disabled => {
-					Err(CacheError::Disabled("Disabled: execute_authed".into()))
-				}
+				UnauthReason::Disabled => Err(CacheError::Disabled(
+					"Disabled: async_execute_authed_owned".into(),
+				)),
 				UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-					"Unauthenticated: execute_authed".into(),
+					"Unauthenticated: async_execute_authed_owned".into(),
 				)),
 			},
 		}
@@ -425,6 +446,7 @@ impl FilenMobileCacheState {
 		+ Send
 		+ 'static,
 	) -> Result<T, CacheError> {
+		trace!("sync_execute_authed_owned");
 		let state = self.sync_get_cache_state_owned();
 		match &state.status {
 			AuthStatus::Authenticated(_) => {
@@ -436,11 +458,11 @@ impl FilenMobileCacheState {
 				f(new_guard)
 			}
 			AuthStatus::Unauthenticated(unauth_state) => match unauth_state.reason {
-				UnauthReason::Disabled => {
-					Err(CacheError::Disabled("Disabled: execute_authed".into()))
-				}
+				UnauthReason::Disabled => Err(CacheError::Disabled(
+					"Disabled: sync_execute_authed_owned".into(),
+				)),
 				UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-					"Unauthenticated: execute_authed".into(),
+					"Unauthenticated: sync_execute_authed_owned".into(),
 				)),
 			},
 		}
@@ -459,10 +481,10 @@ impl FilenMobileCacheState {
 			state: Arc::new(tokio::sync::RwLock::new(CacheState {
 				status: AuthStatus::Unauthenticated(UnauthCacheState {
 					reason: UnauthReason::Disabled,
-					last_update: None,
 				}),
-				auth_file: PathBuf::from(auth_file),
+				auth_file: Arc::new(PathBuf::from(auth_file)),
 				files_dir: PathBuf::from(files_dir),
+				last_update: std::sync::RwLock::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
 		}
@@ -490,8 +512,9 @@ impl FilenMobileCacheState {
 					version,
 					files_dir,
 				)?),
-				auth_file: PathBuf::from(files_dir).join("auth.json"),
+				auth_file: Arc::new(PathBuf::from(files_dir).join("auth.json")),
 				files_dir: PathBuf::from(files_dir),
+				last_update: std::sync::RwLock::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
 		})
