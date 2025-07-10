@@ -15,7 +15,7 @@ use tokio::sync::OwnedRwLockReadGuard;
 use crate::{
 	CacheError,
 	auth::{AuthCacheState, CacheState, FilenMobileCacheState},
-	ffi::FfiPathWithRoot,
+	ffi::FfiId,
 	sql::{self, DBObject},
 };
 
@@ -97,21 +97,21 @@ impl AuthCacheState {
 
 	async fn make_thumbnail_for_path(
 		&self,
-		path: &FfiPathWithRoot,
+		path: &FfiId,
 		requested_width: u32,
 		requested_height: u32,
 	) -> ThumbnailResult {
-		let pvs = match path.as_maybe_trash_values() {
+		let pvs = match path.as_parsed() {
 			Ok(pvs) => pvs,
 			Err(e) => return ThumbnailResult::Err(e),
 		};
 		let file = {
 			let conn: std::sync::MutexGuard<'_, rusqlite::Connection> = self.conn();
-			match sql::select_maybe_trashed_object_at_path(&conn, &pvs) {
+			match sql::select_object_at_parsed_id(&conn, &pvs) {
 				Ok(Some(DBObject::File(file))) => file,
 				Ok(Some(_)) => return ThumbnailResult::NoThumbnail,
 				Ok(None) => return ThumbnailResult::NotFound,
-				Err(e) => return ThumbnailResult::Err(e.into()),
+				Err(e) => return ThumbnailResult::Err(e),
 			}
 		};
 
@@ -146,7 +146,7 @@ impl From<CacheError> for ThumbnailResult {
 
 #[uniffi::export(with_foreign)]
 pub trait ThumbnailCallback: Send + Sync {
-	fn process(&self, id: FfiPathWithRoot, result: ThumbnailResult);
+	fn process(&self, id: FfiId, result: ThumbnailResult);
 	fn complete(&self);
 }
 
@@ -167,7 +167,7 @@ impl BulkThumbnailResponse {
 impl AuthCacheState {
 	pub(crate) fn get_thumbnails(
 		this: OwnedRwLockReadGuard<CacheState, Self>,
-		items: Vec<FfiPathWithRoot>,
+		items: Vec<FfiId>,
 		requested_width: u32,
 		requested_height: u32,
 		callback: Arc<dyn ThumbnailCallback>,
@@ -197,7 +197,7 @@ impl AuthCacheState {
 impl FilenMobileCacheState {
 	pub fn get_thumbnails(
 		self: Arc<Self>,
-		items: Vec<FfiPathWithRoot>,
+		items: Vec<FfiId>,
 		requested_width: u32,
 		requested_height: u32,
 		callback: Arc<dyn ThumbnailCallback>,
@@ -221,7 +221,7 @@ impl FilenMobileCacheState {
 	#[uniffi::method(name = "get_thumbnail")]
 	pub async fn get_thumbnail(
 		self: Arc<Self>,
-		item: FfiPathWithRoot,
+		item: FfiId,
 		requested_width: u32,
 		requested_height: u32,
 	) -> Result<ThumbnailResult, CacheError> {

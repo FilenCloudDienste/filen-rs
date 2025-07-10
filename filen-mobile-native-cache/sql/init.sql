@@ -1,3 +1,5 @@
+PRAGMA recursive_triggers = true;
+
 CREATE TABLE IF NOT EXISTS items (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     uuid TEXT NOT NULL UNIQUE,
@@ -6,7 +8,7 @@ CREATE TABLE IF NOT EXISTS items (
     type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
     is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
     local_data TEXT,
-    FOREIGN KEY (parent) REFERENCES items (uuid) ON DELETE CASCADE
+    is_recent BOOLEAN NOT NULL CHECK (is_recent IN (FALSE, TRUE)) DEFAULT FALSE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_name_parent_stale
@@ -18,6 +20,7 @@ VALUES ('trash', NULL, 'Trash', 1);
 
 CREATE INDEX IF NOT EXISTS idx_items_uuid ON items (uuid);
 CREATE INDEX IF NOT EXISTS idx_items_parent ON items (parent);
+CREATE INDEX IF NOT EXISTS idx_items_is_recent ON items (is_recent);
 
 CREATE TABLE IF NOT EXISTS roots (
     id BIGINT PRIMARY KEY NOT NULL,
@@ -59,6 +62,15 @@ CREATE TRIGGER IF NOT EXISTS cascade_on_update_uuid_delete_children
 AFTER UPDATE OF uuid ON items
 FOR EACH ROW
 WHEN old.uuid != new.uuid AND old.type != 2 -- Ensure it's not a file
+BEGIN
+DELETE FROM items
+WHERE parent = old.uuid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS cascade_on_delete_delete_children
+AFTER DELETE ON items
+FOR EACH ROW
+WHEN old.type != 2 -- Ensure it's not a file
 BEGIN
 DELETE FROM items
 WHERE parent = old.uuid;

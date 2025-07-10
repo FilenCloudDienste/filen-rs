@@ -1,13 +1,13 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Instant};
 
 use filen_sdk_rs::fs::HasUUID;
-use filen_types::fs::UuidStr;
+use filen_types::fs::{ParentUuid, UuidStr};
 use log::debug;
 
 use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
-	ffi::{FfiObject, FfiPathWithRoot, FfiRoot, QueryChildrenResponse},
+	ffi::{FfiId, FfiObject, FfiRoot, QueryChildrenResponse, QueryNonDirChildrenResponse},
 	sql::{
 		self, DBDirExt, DBDirObject, DBDirTrait, DBItemTrait, DBNonRootObject, DBObject, DBRoot,
 		error::OptionalExtensionSQL, json_object::JsonObject,
@@ -24,24 +24,35 @@ impl FilenMobileCacheState {
 
 	pub fn query_dir_children(
 		&self,
-		path: &FfiPathWithRoot,
+		path: &FfiId,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>, CacheError> {
 		self.sync_execute_authed(|auth_state| auth_state.query_dir_children(path, order_by))
 	}
 
-	pub fn query_item(&self, path: &FfiPathWithRoot) -> Result<Option<FfiObject>, CacheError> {
+	pub fn query_recents(
+		&self,
+		order_by: Option<String>,
+	) -> Result<QueryNonDirChildrenResponse, CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.query_recents(order_by))
+	}
+
+	pub fn query_trash(
+		&self,
+		order_by: Option<String>,
+	) -> Result<QueryNonDirChildrenResponse, CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.query_trash(order_by))
+	}
+
+	pub fn query_item(&self, path: &FfiId) -> Result<Option<FfiObject>, CacheError> {
 		self.sync_execute_authed(|auth_state| auth_state.query_item(path))
 	}
 
-	pub fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiPathWithRoot>, CacheError> {
+	pub fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiId>, CacheError> {
 		self.sync_execute_authed(|auth_state| auth_state.query_path_for_uuid(uuid))
 	}
 
-	pub fn get_all_descendant_paths(
-		&self,
-		path: &FfiPathWithRoot,
-	) -> Result<Vec<FfiPathWithRoot>, CacheError> {
+	pub fn get_all_descendant_paths(&self, path: &FfiId) -> Result<Vec<FfiId>, CacheError> {
 		self.sync_execute_authed(|auth_state| auth_state.get_all_descendant_paths(path))
 	}
 
@@ -55,7 +66,7 @@ impl FilenMobileCacheState {
 
 	pub fn insert_into_local_data_for_path(
 		&self,
-		path: FfiPathWithRoot,
+		path: FfiId,
 		key: String,
 		value: Option<String>,
 	) -> Result<FfiObject, CacheError> {
@@ -66,6 +77,11 @@ impl FilenMobileCacheState {
 
 	pub fn root_uuid(&self) -> Result<String, CacheError> {
 		self.sync_execute_authed(|auth_state| Ok(auth_state.root_uuid()))
+	}
+
+	pub async fn async_root_uuid(&self) -> Result<String, CacheError> {
+		self.async_execute_authed_owned(async |auth_state| Ok(auth_state.root_uuid()))
+			.await
 	}
 }
 
@@ -91,16 +107,13 @@ impl AuthCacheState {
 
 	pub(crate) fn query_dir_children(
 		&self,
-		path: &FfiPathWithRoot,
+		path: &FfiId,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>, CacheError> {
-		let path_values = path.as_path_values()?;
-		debug!(
-			"Querying directory children at path: {}",
-			path_values.full_path
-		);
+		let path_id = path.as_path()?;
+		debug!("Querying directory children at path: {}", path.0);
 
-		let dir: DBDirObject = match sql::select_object_at_path(&self.conn(), &path_values)? {
+		let dir: DBDirObject = match sql::select_object_at_path(&self.conn(), &path_id)? {
 			Some(obj) => obj.try_into()?,
 			None => return Ok(None),
 		};
@@ -113,13 +126,40 @@ impl AuthCacheState {
 		}))
 	}
 
-	pub(crate) fn query_item(
+	pub(crate) fn query_recents(
 		&self,
-		path: &FfiPathWithRoot,
-	) -> Result<Option<FfiObject>, CacheError> {
+		order_by: Option<String>,
+	) -> Result<QueryNonDirChildrenResponse, CacheError> {
+		debug!("Querying recents with order by: {order_by:?}");
+		let children = sql::select_recents(&self.conn(), order_by.as_deref())?;
+		let last_update = *self.last_recents_update.read().unwrap();
+		let now = Instant::now();
+		Ok(QueryNonDirChildrenResponse {
+			objects: children.into_iter().map(Into::into).collect(),
+			millis_since_updated: last_update
+				.map(|t| now.duration_since(t).as_millis().try_into().unwrap()),
+		})
+	}
+
+	pub(crate) fn query_trash(
+		&self,
+		order_by: Option<String>,
+	) -> Result<QueryNonDirChildrenResponse, CacheError> {
+		debug!("Querying trash with order by: {order_by:?}");
+		let children = sql::select_children(&self.conn(), order_by.as_deref(), ParentUuid::Trash)?;
+		let last_update = *self.last_trash_update.read().unwrap();
+		let now = Instant::now();
+		Ok(QueryNonDirChildrenResponse {
+			objects: children.into_iter().map(Into::into).collect(),
+			millis_since_updated: last_update
+				.map(|t| now.duration_since(t).as_millis().try_into().unwrap()),
+		})
+	}
+
+	pub(crate) fn query_item(&self, path: &FfiId) -> Result<Option<FfiObject>, CacheError> {
 		debug!("Querying item at path: {}", path.0);
-		let path_values = path.as_maybe_trash_values()?;
-		let obj = sql::select_maybe_trashed_object_at_path(&self.conn(), &path_values)?;
+		let path_values = path.as_parsed()?;
+		let obj = sql::select_object_at_parsed_id(&self.conn(), &path_values)?;
 
 		let dir_obj = match obj {
 			Some(DBObject::Dir(dbdir)) => DBDirObject::Dir(dbdir),
@@ -140,10 +180,7 @@ impl AuthCacheState {
 		Ok(Some(FfiObject::from(DBObject::from(dir_obj))))
 	}
 
-	pub(crate) fn query_path_for_uuid(
-		&self,
-		uuid: String,
-	) -> Result<Option<FfiPathWithRoot>, CacheError> {
+	pub(crate) fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiId>, CacheError> {
 		debug!("Querying path for UUID: {uuid}");
 		if uuid == self.client.root().uuid().as_ref() {
 			return Ok(Some(uuid.into()));
@@ -152,20 +189,17 @@ impl AuthCacheState {
 		let conn = self.conn();
 		let path = sql::recursive_select_path_from_uuid(&conn, uuid)?;
 
-		Ok(path.map(|s| FfiPathWithRoot(format!("{}{}", self.client.root().uuid(), s))))
+		Ok(path.map(|s| FfiId(format!("{}{}", self.client.root().uuid(), s))))
 	}
 
-	pub(crate) fn get_all_descendant_paths(
-		&self,
-		path: &FfiPathWithRoot,
-	) -> Result<Vec<FfiPathWithRoot>, CacheError> {
+	pub(crate) fn get_all_descendant_paths(&self, path: &FfiId) -> Result<Vec<FfiId>, CacheError> {
 		debug!("Getting all descendant paths for: {}", path.0);
-		let path_values = path.as_path_values()?;
+		let path_values = path.as_path()?;
 		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
 		Ok(match obj {
 			Some(obj) => sql::get_all_descendant_paths(&self.conn(), obj.uuid(), &path.0)?
 				.into_iter()
-				.map(FfiPathWithRoot)
+				.map(FfiId)
 				.collect(),
 			None => vec![],
 		})
@@ -185,7 +219,7 @@ impl AuthCacheState {
 
 	pub(crate) fn insert_into_local_data_for_path(
 		&self,
-		path: FfiPathWithRoot,
+		path: FfiId,
 		key: String,
 		value: Option<String>,
 	) -> Result<FfiObject, CacheError> {
@@ -194,7 +228,7 @@ impl AuthCacheState {
 			path.0
 		);
 
-		let path_values = path.as_path_values()?;
+		let path_values = path.as_path()?;
 		let mut obj = match sql::select_object_at_path(&self.conn(), &path_values)? {
 			Some(DBObject::Dir(dir)) => DBNonRootObject::Dir(dir),
 			Some(DBObject::File(file)) => DBNonRootObject::File(file),

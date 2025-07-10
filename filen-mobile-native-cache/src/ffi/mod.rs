@@ -148,9 +148,9 @@ impl From<DBNonRootObject> for FfiNonRootObject {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FfiPathWithRoot(pub String);
+pub struct FfiId(pub String);
 
-impl FfiPathWithRoot {
+impl FfiId {
 	pub fn join(&self, other: &str) -> Self {
 		let mut new = String::with_capacity(self.0.len() + other.len() + 1);
 		self.0.clone_into(&mut new);
@@ -158,7 +158,7 @@ impl FfiPathWithRoot {
 			new.push('/');
 		}
 		new.push_str(other);
-		FfiPathWithRoot(new)
+		FfiId(new)
 	}
 
 	pub fn parent(&self) -> Self {
@@ -168,84 +168,87 @@ impl FfiPathWithRoot {
 		} else {
 			new.clear(); // If no slash found, return empty path
 		}
-		FfiPathWithRoot(new)
+		FfiId(new)
 	}
 }
 
-impl From<String> for FfiPathWithRoot {
+impl From<String> for FfiId {
 	fn from(path: String) -> Self {
-		FfiPathWithRoot(path)
+		FfiId(path)
 	}
 }
 
-impl From<&str> for FfiPathWithRoot {
+impl From<&str> for FfiId {
 	fn from(path: &str) -> Self {
-		FfiPathWithRoot(path.to_string())
+		FfiId(path.to_string())
 	}
 }
 
-impl std::fmt::Display for FfiPathWithRoot {
+impl std::fmt::Display for FfiId {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0)
 	}
 }
 
 #[derive(Debug)]
-pub struct PathValues<'a> {
-	pub root_uuid: UuidStr,
+pub struct UuidFfiId<'a> {
 	pub full_path: &'a str,
+	pub uuid: Option<UuidStr>,
+}
+
+#[derive(Debug)]
+pub struct PathFfiId<'a> {
+	pub full_path: &'a str,
+	pub root_uuid: UuidStr,
 	pub inner_path: &'a str,
 	pub name: &'a str,
 }
 
 #[derive(Debug)]
-pub struct TrashValues<'a> {
-	pub full_path: &'a str,
-	pub inner_path: &'a str,
-	pub uuid: UuidStr,
+pub enum ParsedFfiId<'a> {
+	Trash(UuidFfiId<'a>),
+	Path(PathFfiId<'a>),
+	Recents(UuidFfiId<'a>),
 }
 
-#[derive(Debug)]
-pub enum MaybeTrashValues<'a> {
-	Trash(TrashValues<'a>),
-	Path(PathValues<'a>),
-}
-
-impl FfiPathWithRoot {
-	pub fn as_path_values(&self) -> Result<PathValues, CacheError> {
-		let mut iter = self.0.path_iter();
-		let (root_uuid_str, remaining) = iter
-			.next()
-			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;
-
-		Ok(PathValues {
-			root_uuid: UuidStr::from_str(root_uuid_str).map_err(|e| {
-				CacheError::conversion(format!("Invalid root UUID: {root_uuid_str} error: {e} "))
-			})?,
-			full_path: self.0.as_str(),
-			inner_path: remaining,
-			name: iter.last().unwrap_or_default().0,
-		})
+impl FfiId {
+	pub fn as_path(&self) -> Result<PathFfiId, CacheError> {
+		match self.as_parsed()? {
+			ParsedFfiId::Trash(_) | ParsedFfiId::Recents(_) => Err(CacheError::conversion(
+				format!("Expected PathFfiId, got: {}", self.0),
+			)),
+			ParsedFfiId::Path(path_ffi_id) => Ok(path_ffi_id),
+		}
 	}
 
-	pub fn as_maybe_trash_values(&self) -> Result<MaybeTrashValues, CacheError> {
+	pub(crate) fn as_parsed(&self) -> Result<ParsedFfiId, CacheError> {
 		let mut iter = self.0.path_iter();
-		let (root_uuid_str, remaining) = iter
+		let (root, remaining) = iter
 			.next()
-			.ok_or_else(|| CacheError::conversion("Path must start with a root UUID"))?;
+			.ok_or_else(|| CacheError::conversion("Path must not be empty"))?;
 
-		match root_uuid_str {
-			"trash" => Ok(MaybeTrashValues::Trash(TrashValues {
+		match root {
+			"trash" => Ok(ParsedFfiId::Trash(UuidFfiId {
 				full_path: self.0.as_str(),
-				inner_path: remaining,
-				uuid: UuidStr::from_str(iter.last().unwrap_or_default().0)?,
+				uuid: iter.last().map(|(s, _)| UuidStr::from_str(s)).transpose()?,
 			})),
-			_ => Ok(MaybeTrashValues::Path(self.as_path_values()?)),
+			"recents" => Ok(ParsedFfiId::Recents(UuidFfiId {
+				full_path: self.0.as_str(),
+				uuid: iter.last().map(|(s, _)| UuidStr::from_str(s)).transpose()?,
+			})),
+			_ => Ok(ParsedFfiId::Path(PathFfiId {
+				full_path: self.0.as_str(),
+				root_uuid: UuidStr::from_str(root).map_err(|e| {
+					CacheError::conversion(format!("Invalid root UUID: {root} error: {e} "))
+				})?,
+				inner_path: remaining,
+				name: iter.last().unwrap_or_default().0,
+			})),
 		}
 	}
 }
 
-uniffi::custom_type!(FfiPathWithRoot, String, {
+uniffi::custom_type!(FfiId, String, {
 	lower: |s| s.0,
 });
 
@@ -279,6 +282,12 @@ pub struct QueryChildrenResponse {
 	pub parent: FfiDir,
 }
 
+#[derive(uniffi::Record, Debug)]
+pub struct QueryNonDirChildrenResponse {
+	pub objects: Vec<FfiNonRootObject>,
+	pub millis_since_updated: Option<u64>,
+}
+
 #[derive(uniffi::Record)]
 pub struct DownloadResponse {
 	pub path: String,
@@ -289,25 +298,25 @@ pub struct DownloadResponse {
 pub struct CreateFileResponse {
 	pub path: String,
 	pub file: FfiFile,
-	pub id: FfiPathWithRoot,
+	pub id: FfiId,
 }
 
 #[derive(uniffi::Record, Debug)]
 pub struct FileWithPathResponse {
 	pub file: FfiFile,
-	pub id: FfiPathWithRoot,
+	pub id: FfiId,
 }
 
 #[derive(uniffi::Record, Debug)]
 pub struct DirWithPathResponse {
 	pub dir: FfiDir,
-	pub id: FfiPathWithRoot,
+	pub id: FfiId,
 }
 
 #[derive(uniffi::Record, Debug)]
 pub struct ObjectWithPathResponse {
 	pub object: FfiObject,
-	pub id: FfiPathWithRoot,
+	pub id: FfiId,
 }
 
 #[derive(uniffi::Record, Debug)]

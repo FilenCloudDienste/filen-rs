@@ -3,7 +3,7 @@ use std::{
 	hint::unreachable_unchecked,
 	ops::Deref,
 	path::{Path, PathBuf},
-	sync::{Arc, Mutex, MutexGuard},
+	sync::{Arc, Mutex, MutexGuard, RwLock},
 	time::Instant,
 };
 
@@ -24,6 +24,8 @@ pub struct AuthCacheState {
 	pub(crate) cache_dir: PathBuf,
 	pub(crate) thumbnail_dir: PathBuf,
 	pub(crate) client: filen_sdk_rs::auth::Client,
+	pub(crate) last_recents_update: RwLock<Option<Instant>>,
+	pub(crate) last_trash_update: RwLock<Option<Instant>>,
 }
 
 enum UnauthReason {
@@ -345,6 +347,8 @@ impl AuthCacheState {
 			cache_dir,
 			thumbnail_dir,
 			client,
+			last_recents_update: RwLock::new(None),
+			last_trash_update: RwLock::new(None),
 		};
 		new.add_root(&config.base_folder_uuid)?;
 		Ok(new)
@@ -378,6 +382,8 @@ impl AuthCacheState {
 			cache_dir,
 			tmp_dir,
 			thumbnail_dir,
+			last_recents_update: RwLock::new(None),
+			last_trash_update: RwLock::new(None),
 		};
 		new.add_root(root_uuid)?;
 		Ok(new)

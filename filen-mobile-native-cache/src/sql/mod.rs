@@ -1,6 +1,10 @@
-use filen_sdk_rs::util::PathIteratorExt;
-use filen_types::fs::UuidStr;
+use filen_sdk_rs::{
+	fs::{HasUUID, dir::RemoteDirectory, file::RemoteFile},
+	util::PathIteratorExt,
+};
+use filen_types::fs::{ParentUuid, UuidStr};
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
+use log::{debug, trace};
 use rusqlite::{Connection, OptionalExtension};
 
 pub mod types;
@@ -9,7 +13,8 @@ pub mod error;
 pub use error::SQLError;
 
 use crate::{
-	ffi::{MaybeTrashValues, PathValues},
+	CacheError,
+	ffi::{ParsedFfiId, PathFfiId},
 	sql::json_object::JsonObject,
 };
 
@@ -20,7 +25,7 @@ use crate::{
 #[allow(clippy::type_complexity)]
 pub(crate) fn select_objects_in_path<'a>(
 	conn: &Connection,
-	path_values: &'a PathValues,
+	path_values: &'a PathFfiId,
 ) -> Result<(Vec<(DBObject, &'a str)>, bool), rusqlite::Error> {
 	let path_iter = path_values.inner_path.path_iter();
 	let mut stmt = conn.prepare_cached(include_str!("../../sql/select_item_by_parent_name.sql"))?;
@@ -52,7 +57,7 @@ pub(crate) fn select_objects_in_path<'a>(
 
 pub(crate) fn select_object_at_path(
 	conn: &Connection,
-	path_values: &PathValues,
+	path_values: &PathFfiId,
 ) -> Result<Option<DBObject>, rusqlite::Error> {
 	match select_objects_in_path(conn, path_values)? {
 		(mut objects, true) => {
@@ -64,15 +69,21 @@ pub(crate) fn select_object_at_path(
 	}
 }
 
-pub(crate) fn select_maybe_trashed_object_at_path<'a>(
+pub(crate) fn select_object_at_parsed_id<'a>(
 	conn: &Connection,
-	path_values: &MaybeTrashValues<'a>,
-) -> Result<Option<DBObject>, rusqlite::Error> {
-	match path_values {
-		MaybeTrashValues::Trash(trash_values) => {
-			DBObject::select(conn, trash_values.uuid).optional()
-		}
-		MaybeTrashValues::Path(path_values) => select_object_at_path(conn, path_values),
+	parsed_id: &ParsedFfiId<'a>,
+) -> Result<Option<DBObject>, CacheError> {
+	match parsed_id {
+		ParsedFfiId::Trash(uuid_id) | ParsedFfiId::Recents(uuid_id) => Ok(DBObject::select(
+			conn,
+			uuid_id.uuid.ok_or_else(|| {
+				CacheError::DoesNotExist(
+					format!("cannot select object at path: {}", uuid_id.full_path).into(),
+				)
+			})?,
+		)
+		.optional()?),
+		ParsedFfiId::Path(path_values) => Ok(select_object_at_path(conn, path_values)?),
 	}
 }
 
@@ -183,4 +194,135 @@ pub(crate) fn update_local_data(
 		.unwrap_or(None);
 	stmt.execute((local_data, uuid))?;
 	Ok(())
+}
+
+pub(crate) fn update_recents(
+	conn: &mut Connection,
+	dirs: Vec<RemoteDirectory>,
+	files: Vec<RemoteFile>,
+) -> Result<(), rusqlite::Error> {
+	let tx = conn.transaction()?;
+	{
+		debug!("Clearing recents");
+		let mut stmt = tx.prepare_cached(include_str!("../../sql/clear_recents.sql"))?;
+		stmt.execute([])?;
+
+		let mut upsert_item_stmt = tx.prepare_cached(types::UPSERT_ITEM_SQL)?;
+		let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
+		let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
+		let mut update_recent =
+			tx.prepare_cached(include_str!("../../sql/update_item_set_recent.sql"))?;
+
+		for dir in dirs {
+			trace!("Updating recent directory: {}", dir.uuid());
+			let dir = DBDir::upsert_from_remote_stmts(dir, &mut upsert_item_stmt, &mut upsert_dir)?;
+			trace!("Updating recent directory: {}", dir.id);
+			update_recent.execute([dir.id])?;
+		}
+
+		for file in files {
+			trace!("Updating recent file: {}", file.uuid());
+			let file: DBFile =
+				DBFile::upsert_from_remote_stmts(file, &mut upsert_item_stmt, &mut upsert_file)?;
+			trace!("Updating recent file: {}", file.id);
+			update_recent.execute([file.id])?;
+		}
+	}
+	tx.commit()?;
+	Ok(())
+}
+
+pub(crate) fn update_items_with_parent<I, I1>(
+	conn: &mut Connection,
+	dirs: I,
+	files: I1,
+	parent: ParentUuid,
+) -> Result<(), rusqlite::Error>
+where
+	I: IntoIterator<Item = RemoteDirectory>,
+	I1: IntoIterator<Item = RemoteFile>,
+{
+	let tx = conn.transaction()?;
+	{
+		let mut stmt = tx.prepare_cached(include_str!("../../sql/mark_stale_with_parent.sql"))?;
+		stmt.execute([parent])?;
+
+		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
+		let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
+
+		for dir in dirs {
+			DBDir::upsert_from_remote_stmts(dir, &mut upsert_item_stmt, &mut upsert_dir)?;
+		}
+
+		let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
+
+		for file in files {
+			DBFile::upsert_from_remote_stmts(file, &mut upsert_item_stmt, &mut upsert_file)?;
+		}
+
+		let mut stmt = tx.prepare_cached(include_str!("../../sql/delete_stale_with_parent.sql"))?;
+		stmt.execute([parent])?;
+	}
+	tx.commit()?;
+	Ok(())
+}
+
+fn convert_order_by(order_by: &str) -> &'static str {
+	if order_by.contains("display_name") {
+		if order_by.contains("ASC") {
+			return "ORDER BY items.name ASC";
+		} else if order_by.contains("DESC") {
+			return "ORDER BY items.name DESC";
+		}
+	} else if order_by.contains("last_modified") {
+		if order_by.contains("ASC") {
+			return "ORDER BY files.modified + 0 ASC";
+		} else if order_by.contains("DESC") {
+			return "ORDER BY files.modified + 0 DESC";
+		}
+	} else if order_by.contains("size") {
+		if order_by.contains("ASC") {
+			return "ORDER BY files.size + 0 ASC";
+		} else if order_by.contains("DESC") {
+			return "ORDER BY files.size + 0 DESC";
+		}
+	}
+	"ORDER BY items.name ASC"
+}
+
+pub(crate) fn select_children(
+	conn: &Connection,
+	order_by: Option<&str>,
+	parent: ParentUuid,
+) -> SQLResult<Vec<DBNonRootObject>> {
+	let order_by = match order_by {
+		Some(order_by) => convert_order_by(order_by),
+		_ => "ORDER BY items.name ASC",
+	};
+
+	let mut stmt = conn.prepare(&format!(
+		"{} {}",
+		include_str!("../../sql/select_dir_children.sql"),
+		order_by
+	))?;
+	stmt.query_and_then([parent], DBNonRootObject::from_row)?
+		.collect::<SQLResult<Vec<_>>>()
+}
+
+pub(crate) fn select_recents(
+	conn: &Connection,
+	order_by: Option<&str>,
+) -> SQLResult<Vec<DBNonRootObject>> {
+	let order_by = match order_by {
+		Some(order_by) => convert_order_by(order_by),
+		_ => "ORDER BY items.name ASC",
+	};
+
+	let mut stmt = conn.prepare(&format!(
+		"{} {};",
+		include_str!("../../sql/select_recents.sql"),
+		order_by
+	))?;
+	stmt.query_and_then([], DBNonRootObject::from_row)?
+		.collect::<SQLResult<Vec<_>>>()
 }

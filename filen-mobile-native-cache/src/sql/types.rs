@@ -22,9 +22,9 @@ use crate::sql::json_object::JsonObject;
 
 use super::SQLError;
 
-type SQLResult<T> = std::result::Result<T, SQLError>;
+pub(crate) type SQLResult<T> = std::result::Result<T, SQLError>;
 
-const UPSERT_ITEM_SQL: &str = include_str!("../../sql/upsert_item.sql");
+pub(crate) const UPSERT_ITEM_SQL: &str = include_str!("../../sql/upsert_item.sql");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
@@ -254,6 +254,10 @@ impl DBFile {
 			ItemType::File,
 			upsert_item_stmt,
 		)?;
+		trace!(
+			"Upserted item with id: {id} for remote file: {}",
+			remote_file.uuid()
+		);
 		let file_key = remote_file.key().to_str();
 		let version = remote_file.key().version();
 		let favorite_rank = upsert_file.query_one(
@@ -1080,33 +1084,7 @@ where
 		I: IntoIterator<Item = RemoteDirectory>,
 		I1: IntoIterator<Item = RemoteFile>,
 	{
-		let tx = conn.transaction()?;
-		{
-			let mut stmt =
-				tx.prepare_cached(include_str!("../../sql/mark_stale_with_parent.sql"))?;
-			stmt.execute([self.uuid()])?;
-
-			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
-			let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
-
-			dirs.into_iter().try_for_each(|d| -> Result<()> {
-				DBDir::upsert_from_remote_stmts(d, &mut upsert_item_stmt, &mut upsert_dir)?;
-				Ok(())
-			})?;
-
-			let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
-
-			files.into_iter().try_for_each(|f| -> Result<()> {
-				DBFile::upsert_from_remote_stmts(f, &mut upsert_item_stmt, &mut upsert_file)?;
-				Ok(())
-			})?;
-
-			let mut stmt =
-				tx.prepare_cached(include_str!("../../sql/delete_stale_with_parent.sql"))?;
-			stmt.execute([self.uuid()])?;
-		}
-		tx.commit()?;
-		Ok(())
+		crate::sql::update_items_with_parent(conn, dirs, files, ParentUuid::Uuid(self.uuid()))
 	}
 
 	fn select_children(
@@ -1114,19 +1092,7 @@ where
 		conn: &Connection,
 		order_by: Option<&str>,
 	) -> SQLResult<Vec<DBNonRootObject>> {
-		let order_by = match order_by {
-			Some(order_by) => convert_order_by(order_by),
-			_ => "ORDER BY items.name ASC",
-		};
-
-		let select_query = format!(
-			"{} {}",
-			include_str!("../../sql/select_dir_children.sql"),
-			order_by
-		);
-		let mut stmt = conn.prepare(&select_query)?;
-		stmt.query_and_then([self.uuid()], DBNonRootObject::from_row)?
-			.collect::<SQLResult<Vec<_>>>()
+		crate::sql::select_children(conn, order_by, ParentUuid::Uuid(self.uuid()))
 	}
 }
 
@@ -1137,29 +1103,6 @@ pub(crate) trait DBItemTrait: Sync + Send {
 	fn parent(&self) -> Option<ParentUuid>;
 	fn name(&self) -> &str;
 	fn item_type(&self) -> ItemType;
-}
-
-fn convert_order_by(order_by: &str) -> &'static str {
-	if order_by.contains("display_name") {
-		if order_by.contains("ASC") {
-			return "ORDER BY items.name ASC";
-		} else if order_by.contains("DESC") {
-			return "ORDER BY items.name DESC";
-		}
-	} else if order_by.contains("last_modified") {
-		if order_by.contains("ASC") {
-			return "ORDER BY files.modified + 0 ASC";
-		} else if order_by.contains("DESC") {
-			return "ORDER BY files.modified + 0 DESC";
-		}
-	} else if order_by.contains("size") {
-		if order_by.contains("ASC") {
-			return "ORDER BY files.size + 0 ASC";
-		} else if order_by.contains("DESC") {
-			return "ORDER BY files.size + 0 DESC";
-		}
-	}
-	"ORDER BY items.name ASC"
 }
 
 pub(crate) mod json_object {

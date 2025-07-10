@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{path::PathBuf, str::FromStr, sync::Arc, time::Instant};
 
 use chrono::DateTime;
 use filen_sdk_rs::fs::{
@@ -14,9 +14,9 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
-		CreateFileResponse, DirWithPathResponse, FfiPathWithRoot, FileWithPathResponse,
-		MaybeTrashValues, ObjectWithPathResponse, PathValues, QueryChildrenResponse,
-		UploadFileInfo,
+		CreateFileResponse, DirWithPathResponse, FfiId, FileWithPathResponse,
+		ObjectWithPathResponse, ParsedFfiId, PathFfiId, QueryChildrenResponse,
+		QueryNonDirChildrenResponse, UploadFileInfo,
 	},
 	sql::{
 		self, DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemTrait, DBNonRootObject,
@@ -35,16 +35,26 @@ impl FilenMobileCacheState {
 			.await
 	}
 
-	pub async fn update_dir_children(&self, path: FfiPathWithRoot) -> Result<(), CacheError> {
+	pub async fn update_dir_children(&self, path: FfiId) -> Result<(), CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
-			auth_state.update_dir_children(path).await
+			auth_state.update_dir_children(&path).await
 		})
 		.await
 	}
 
+	pub async fn update_recents(&self) -> Result<(), CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| auth_state.update_recents().await)
+			.await
+	}
+
+	pub async fn update_trash(&self) -> Result<(), CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| auth_state.update_trash().await)
+			.await
+	}
+
 	pub async fn update_and_query_dir_children(
 		&self,
-		path: FfiPathWithRoot,
+		path: FfiId,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
@@ -55,10 +65,20 @@ impl FilenMobileCacheState {
 		.await
 	}
 
+	pub async fn update_and_query_recents(
+		&self,
+		order_by: Option<String>,
+	) -> Result<QueryNonDirChildrenResponse, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.update_and_query_recents(order_by).await
+		})
+		.await
+	}
+
 	pub async fn download_file_if_changed_by_path(
 		&self,
-		file_path: FfiPathWithRoot,
-		progress_callback: Arc<dyn ProgressCallback>,
+		file_path: FfiId,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state
@@ -71,7 +91,7 @@ impl FilenMobileCacheState {
 	pub async fn download_file_if_changed_by_uuid(
 		&self,
 		uuid: String,
-		progress_callback: Arc<dyn ProgressCallback>,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state
@@ -83,8 +103,8 @@ impl FilenMobileCacheState {
 
 	pub async fn upload_file_if_changed(
 		&self,
-		path: FfiPathWithRoot,
-		progress_callback: Arc<dyn ProgressCallback>,
+		path: FfiId,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<bool, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state
@@ -97,9 +117,9 @@ impl FilenMobileCacheState {
 	pub async fn upload_new_file(
 		&self,
 		os_path: String,
-		parent_path: FfiPathWithRoot,
+		parent_path: FfiId,
 		info: UploadFileInfo,
-		progress_callback: Arc<dyn ProgressCallback>,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<FileWithPathResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state
@@ -111,7 +131,7 @@ impl FilenMobileCacheState {
 
 	pub async fn create_empty_file(
 		&self,
-		parent_path: FfiPathWithRoot,
+		parent_path: FfiId,
 		name: String,
 		mime: String,
 	) -> Result<CreateFileResponse, CacheError> {
@@ -123,7 +143,7 @@ impl FilenMobileCacheState {
 
 	pub async fn create_dir(
 		&self,
-		parent_path: FfiPathWithRoot,
+		parent_path: FfiId,
 		name: String,
 		created: Option<i64>,
 	) -> Result<DirWithPathResponse, CacheError> {
@@ -133,10 +153,7 @@ impl FilenMobileCacheState {
 		.await
 	}
 
-	pub async fn trash_item(
-		&self,
-		path: FfiPathWithRoot,
-	) -> Result<ObjectWithPathResponse, CacheError> {
+	pub async fn trash_item(&self, path: FfiId) -> Result<ObjectWithPathResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| auth_state.trash_item(path).await)
 			.await
 	}
@@ -144,7 +161,7 @@ impl FilenMobileCacheState {
 	pub async fn restore_item(
 		&self,
 		uuid: &str,
-		to: Option<FfiPathWithRoot>,
+		to: Option<FfiId>,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.restore_item(uuid, to).await
@@ -154,8 +171,8 @@ impl FilenMobileCacheState {
 
 	pub async fn move_item(
 		&self,
-		item: FfiPathWithRoot,
-		new_parent: FfiPathWithRoot,
+		item: FfiId,
+		new_parent: FfiId,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.move_item(item, new_parent).await
@@ -165,7 +182,7 @@ impl FilenMobileCacheState {
 
 	pub async fn rename_item(
 		&self,
-		item: FfiPathWithRoot,
+		item: FfiId,
 		new_name: String,
 	) -> Result<Option<ObjectWithPathResponse>, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
@@ -174,7 +191,7 @@ impl FilenMobileCacheState {
 		.await
 	}
 
-	pub async fn clear_local_cache(&self, item: FfiPathWithRoot) -> Result<(), CacheError> {
+	pub async fn clear_local_cache(&self, item: FfiId) -> Result<(), CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.clear_local_cache(item).await
 		})
@@ -188,14 +205,14 @@ impl FilenMobileCacheState {
 		.await
 	}
 
-	pub async fn delete_item(&self, item: FfiPathWithRoot) -> Result<(), CacheError> {
+	pub async fn delete_item(&self, item: FfiId) -> Result<(), CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| auth_state.delete_item(item).await)
 			.await
 	}
 
 	pub async fn set_favorite_rank(
 		&self,
-		item: FfiPathWithRoot,
+		item: FfiId,
 		favorite_rank: i64,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
@@ -206,7 +223,7 @@ impl FilenMobileCacheState {
 }
 
 impl AuthCacheState {
-	pub async fn update_roots_info(&self) -> Result<(), CacheError> {
+	pub(crate) async fn update_roots_info(&self) -> Result<(), CacheError> {
 		debug!(
 			"Updating roots info for client: {}",
 			self.client.root().uuid()
@@ -217,45 +234,73 @@ impl AuthCacheState {
 		Ok(())
 	}
 
-	pub async fn update_dir_children(&self, path: FfiPathWithRoot) -> Result<(), CacheError> {
+	pub(crate) async fn update_dir_children(&self, path: &FfiId) -> Result<(), CacheError> {
 		debug!("Updating directory children for path: {}", path.0);
-		let path_values = path.as_path_values()?;
-		let mut dir: DBDirObject = match self.update_items_in_path(&path_values).await? {
+		let path_id = path.as_path()?;
+		let mut dir: DBDirObject = match self.update_items_in_path(&path_id).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
 			UpdateItemsInPath::Partial(_, _) => {
 				return Err(CacheError::remote(format!(
 					"Path {} does not point to a directory",
-					path_values.full_path
+					path_id.full_path
 				)));
 			}
 		};
-		let (dirs, files) = self.client.list_dir(&dir.uuid()).await?;
-		let mut conn = self.conn();
-		dir.update_children(&mut conn, dirs, files)?;
-		dir.update_dir_last_listed_now(&conn)?;
+		self.inner_update_dir(&mut dir).await?;
 		Ok(())
 	}
 
-	pub async fn update_and_query_dir_children(
+	pub(crate) async fn update_recents(&self) -> Result<(), CacheError> {
+		let (dirs, files) = self.client.list_dir(&ParentUuid::Recents).await?;
+		println!("Updating recents with {dirs:?} dirs and {files:?} files");
+		sql::update_recents(&mut self.conn(), dirs, files)?;
+		self.last_recents_update
+			.write()
+			.unwrap()
+			.replace(Instant::now());
+		Ok(())
+	}
+
+	pub(crate) async fn update_trash(&self) -> Result<(), CacheError> {
+		let (dirs, files) = self.client.list_dir(&ParentUuid::Trash).await?;
+		println!("Updating recents with {dirs:?} dirs and {files:?} files");
+		sql::update_items_with_parent(&mut self.conn(), dirs, files, ParentUuid::Trash)?;
+		self.last_trash_update
+			.write()
+			.unwrap()
+			.replace(Instant::now());
+		Ok(())
+	}
+
+	pub(crate) async fn update_and_query_dir_children(
 		&self,
-		path: FfiPathWithRoot,
+		path: FfiId,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>, CacheError> {
 		debug!(
 			"Updating and querying directory children for path: {}",
 			path.0
 		);
-		self.update_dir_children(path.clone()).await?;
+		self.update_dir_children(&path).await?;
 		self.query_dir_children(&path, order_by)
 	}
 
-	pub async fn download_file_if_changed_by_path(
+	pub(crate) async fn update_and_query_recents(
 		&self,
-		file_path: FfiPathWithRoot,
-		progress_callback: Arc<dyn ProgressCallback>,
+		order_by: Option<String>,
+	) -> Result<QueryNonDirChildrenResponse, CacheError> {
+		debug!("Updating and querying recents with order by: {order_by:?}");
+		self.update_recents().await?;
+		self.query_recents(order_by)
+	}
+
+	pub(crate) async fn download_file_if_changed_by_path(
+		&self,
+		file_path: FfiId,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		debug!("Downloading file to path: {}", file_path.0);
-		let path_values = file_path.as_path_values()?;
+		let path_values = file_path.as_path()?;
 		let old_file = match sql::select_object_at_path(&self.conn(), &path_values)? {
 			Some(DBObject::File(file)) => Some(file),
 			Some(_) => None,
@@ -276,10 +321,10 @@ impl AuthCacheState {
 			.await
 	}
 
-	pub async fn download_file_if_changed_by_uuid(
+	pub(crate) async fn download_file_if_changed_by_uuid(
 		&self,
 		uuid: String,
-		progress_callback: Arc<dyn ProgressCallback>,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		debug!("Downloading file with UUID: {uuid}");
 		let uuid = UuidStr::from_str(&uuid).unwrap();
@@ -291,13 +336,13 @@ impl AuthCacheState {
 			.await
 	}
 
-	pub async fn upload_file_if_changed(
+	pub(crate) async fn upload_file_if_changed(
 		&self,
-		path: FfiPathWithRoot,
-		progress_callback: Arc<dyn ProgressCallback>,
+		path: FfiId,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<bool, CacheError> {
 		debug!("Uploading file at path: {}", path.0);
-		let path_values = path.as_path_values()?;
+		let path_values = path.as_path()?;
 		let remote_file = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => {
 				if let Some(hash) = file.hash {
@@ -314,7 +359,7 @@ impl AuthCacheState {
 						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
 					})?,
 					file.mime,
-					Some(progress_callback),
+					progress_callback,
 				)
 				.await?
 			}
@@ -342,12 +387,12 @@ impl AuthCacheState {
 		Ok(true)
 	}
 
-	pub async fn upload_new_file(
+	pub(crate) async fn upload_new_file(
 		&self,
 		os_path: String,
-		parent_path: FfiPathWithRoot,
+		parent_path: FfiId,
 		info: UploadFileInfo,
-		progress_callback: Arc<dyn ProgressCallback>,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<FileWithPathResponse, CacheError> {
 		let os_path = PathBuf::from(os_path);
 		let name = info.name;
@@ -357,7 +402,7 @@ impl AuthCacheState {
 			out_path.0,
 			os_path.display()
 		);
-		let parent_pvs = parent_path.as_path_values()?;
+		let parent_pvs = parent_path.as_path()?;
 		let parent = match self.update_items_in_path(&parent_pvs).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
@@ -397,7 +442,7 @@ impl AuthCacheState {
 		let os_file = tokio::fs::File::open(&os_path).await?;
 
 		let remote_file = self
-			.io_upload_file(file.build(), os_file, Some(progress_callback))
+			.io_upload_file(file.build(), os_file, progress_callback)
 			.await?;
 
 		let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
@@ -408,15 +453,15 @@ impl AuthCacheState {
 		})
 	}
 
-	pub async fn create_empty_file(
+	pub(crate) async fn create_empty_file(
 		&self,
-		parent_path: FfiPathWithRoot,
+		parent_path: FfiId,
 		name: String,
 		mime: String,
 	) -> Result<CreateFileResponse, CacheError> {
 		let file_path = parent_path.join(&name);
 		debug!("Creating empty file at path: {}", file_path.0);
-		let parent_pvs = parent_path.as_path_values()?;
+		let parent_pvs = parent_path.as_path()?;
 		let parent = match self.update_items_in_path(&parent_pvs).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
@@ -432,7 +477,7 @@ impl AuthCacheState {
 			}
 		};
 		let path = parent_path.join(&name);
-		let pvs = path.as_path_values()?;
+		let pvs = path.as_path()?;
 		let (file, os_path) = self
 			.io_upload_new_file(pvs.name, parent.uuid(), Some(mime))
 			.await?;
@@ -447,15 +492,15 @@ impl AuthCacheState {
 		})
 	}
 
-	pub async fn create_dir(
+	pub(crate) async fn create_dir(
 		&self,
-		parent_path: FfiPathWithRoot,
+		parent_path: FfiId,
 		name: String,
 		created: Option<i64>,
 	) -> Result<DirWithPathResponse, CacheError> {
 		let dir_path = parent_path.join(&name);
 		debug!("Creating directory at path: {}", dir_path.0);
-		let path_values = parent_path.as_path_values()?;
+		let path_values = parent_path.as_path()?;
 		let parent = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::Dir(dir)) => DBDirObject::Dir(dir),
 			UpdateItemsInPath::Complete(DBObject::Root(root)) => DBDirObject::Root(root),
@@ -496,12 +541,12 @@ impl AuthCacheState {
 		})
 	}
 
-	pub async fn trash_item(
+	pub(crate) async fn trash_item(
 		&self,
-		path: FfiPathWithRoot,
+		path: FfiId,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Trashing item at path: {}", path.0);
-		let path_values: PathValues<'_> = path.as_path_values()?;
+		let path_values: PathFfiId<'_> = path.as_path()?;
 		let obj = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject,
 			UpdateItemsInPath::Partial(_, _) => {
@@ -537,15 +582,15 @@ impl AuthCacheState {
 			}
 		};
 		Ok(ObjectWithPathResponse {
-			id: FfiPathWithRoot(format!("trash/{}", obj.uuid())),
+			id: FfiId(format!("trash/{}", obj.uuid())),
 			object: obj.into(),
 		})
 	}
 
-	pub async fn restore_item(
+	pub(crate) async fn restore_item(
 		&self,
 		uuid: &str,
-		to: Option<FfiPathWithRoot>,
+		to: Option<FfiId>,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Untrashing item with UUID: {uuid} to parent: {to:?}");
 		let uuid = UuidStr::from_str(uuid)
@@ -558,7 +603,7 @@ impl AuthCacheState {
 		// we do this first to make sure we have a valid restore target
 		let parent = match to {
 			Some(to_path) => {
-				let to_pvs: PathValues<'_> = to_path.as_path_values()?;
+				let to_pvs: PathFfiId<'_> = to_path.as_path()?;
 				match self.update_items_in_path(&to_pvs).await? {
 					UpdateItemsInPath::Complete(DBObject::Dir(dir)) => {
 						Some((DBDirObject::Dir(dir), to_path))
@@ -624,19 +669,19 @@ impl AuthCacheState {
 				CacheError::remote(format!("Failed to get path for object with UUID {uuid}"))
 			})
 			.map(|s| ObjectWithPathResponse {
-				id: FfiPathWithRoot(format!("{}{}", self.client.root().uuid(), s)),
+				id: FfiId(format!("{}{}", self.client.root().uuid(), s)),
 				object: DBObject::from(object).into(),
 			})
 	}
 
-	pub async fn move_item(
+	pub(crate) async fn move_item(
 		&self,
-		item: FfiPathWithRoot,
-		new_parent: FfiPathWithRoot,
+		item: FfiId,
+		new_parent: FfiId,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Moving item {} to new parent {}", item.0, new_parent.0);
-		let item_pvs: PathValues<'_> = item.as_path_values()?;
-		let new_parent_pvs: PathValues<'_> = new_parent.as_path_values()?;
+		let item_pvs: PathFfiId<'_> = item.as_path()?;
+		let new_parent_pvs: PathFfiId<'_> = new_parent.as_path()?;
 
 		let (obj, new_parent_dir) = futures::try_join!(
 			async {
@@ -683,13 +728,13 @@ impl AuthCacheState {
 		})
 	}
 
-	pub async fn rename_item(
+	pub(crate) async fn rename_item(
 		&self,
-		item: FfiPathWithRoot,
+		item: FfiId,
 		new_name: String,
 	) -> Result<Option<ObjectWithPathResponse>, CacheError> {
 		debug!("Renaming item {} to {}", item.0, new_name);
-		let item_pvs: PathValues<'_> = item.as_path_values()?;
+		let item_pvs: PathFfiId<'_> = item.as_path()?;
 		if item_pvs.name.is_empty() {
 			return Err(CacheError::remote(format!(
 				"Cannot rename item: {}",
@@ -698,7 +743,7 @@ impl AuthCacheState {
 		} else if item_pvs.name == new_name {
 			return Ok(None);
 		}
-		self.update_dir_children(item.parent()).await?;
+		self.update_dir_children(&item.parent()).await?;
 		let obj = match sql::select_object_at_path(&self.conn(), &item_pvs)? {
 			Some(obj) => DBNonRootObject::try_from(obj).map_err(|e| {
 				CacheError::remote(format!(
@@ -742,8 +787,8 @@ impl AuthCacheState {
 		}))
 	}
 
-	pub async fn clear_local_cache(&self, item: FfiPathWithRoot) -> Result<(), CacheError> {
-		let pvs = item.as_path_values()?;
+	pub(crate) async fn clear_local_cache(&self, item: FfiId) -> Result<(), CacheError> {
+		let pvs = item.as_path()?;
 		debug!("Clearing local cache for item: {}", pvs.full_path);
 		let obj = match sql::select_object_at_path(&self.conn(), &pvs)? {
 			Some(obj) => obj,
@@ -753,7 +798,7 @@ impl AuthCacheState {
 		Ok(())
 	}
 
-	pub async fn clear_local_cache_by_uuid(&self, uuid: &str) -> Result<(), CacheError> {
+	pub(crate) async fn clear_local_cache_by_uuid(&self, uuid: &str) -> Result<(), CacheError> {
 		debug!("Clearing local cache for item with uuid: {uuid}");
 		let obj = match DBObject::select(
 			&self.conn(),
@@ -769,14 +814,20 @@ impl AuthCacheState {
 		Ok(())
 	}
 
-	pub async fn delete_item(&self, item: FfiPathWithRoot) -> Result<(), CacheError> {
+	pub(crate) async fn delete_item(&self, item: FfiId) -> Result<(), CacheError> {
 		debug!("Deleting object at path: {}", item.0);
-		let pvs = item.as_maybe_trash_values()?;
+		let pvs = item.as_parsed()?;
 		let obj = match pvs {
-			MaybeTrashValues::Trash(_) => {
-				sql::select_maybe_trashed_object_at_path(&self.conn(), &pvs)?
-			}
-			MaybeTrashValues::Path(path_values) => {
+			ParsedFfiId::Trash(uuid_id) | ParsedFfiId::Recents(uuid_id) => DBObject::select(
+				&self.conn(),
+				uuid_id.uuid.ok_or_else(|| {
+					CacheError::Unsupported(
+						format!("Cannot delete item at path: {}", item.0).into(),
+					)
+				})?,
+			)
+			.optional()?,
+			ParsedFfiId::Path(path_values) => {
 				Some(match self.update_items_in_path(&path_values).await? {
 					UpdateItemsInPath::Complete(obj) => obj,
 					UpdateItemsInPath::Partial(_, _) => {
@@ -815,21 +866,27 @@ impl AuthCacheState {
 		Ok(())
 	}
 
-	pub async fn set_favorite_rank(
+	pub(crate) async fn set_favorite_rank(
 		&self,
-		item: FfiPathWithRoot,
+		item: FfiId,
 		favorite_rank: i64,
 	) -> Result<ObjectWithPathResponse, CacheError> {
-		let pvs = item.as_maybe_trash_values()?;
+		let pvs = item.as_parsed()?;
 		debug!(
 			"Setting favorite rank for item: {}, rank: {}",
 			item.0, favorite_rank
 		);
 		let obj = match pvs {
-			MaybeTrashValues::Trash(_) => {
-				sql::select_maybe_trashed_object_at_path(&self.conn(), &pvs)?
-			}
-			MaybeTrashValues::Path(path_values) => {
+			ParsedFfiId::Trash(uuid_id) | ParsedFfiId::Recents(uuid_id) => DBObject::select(
+				&self.conn(),
+				uuid_id.uuid.ok_or_else(|| {
+					CacheError::Unsupported(
+						format!("Cannot set favorite rank for item at path: {}", item.0).into(),
+					)
+				})?,
+			)
+			.optional()?,
+			ParsedFfiId::Path(path_values) => {
 				Some(match self.update_items_in_path(&path_values).await? {
 					UpdateItemsInPath::Complete(obj) => obj,
 					UpdateItemsInPath::Partial(_, _) => {
@@ -886,7 +943,7 @@ impl AuthCacheState {
 		&self,
 		old_file: Option<DBFile>,
 		file: DBFile,
-		progress_callback: Arc<dyn ProgressCallback>,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		let file: RemoteFile = file.try_into()?;
 		let uuid = file.uuid().to_string();
@@ -932,7 +989,7 @@ impl AuthCacheState {
 		}
 
 		let path = self
-			.download_file_io(&file, Some(progress_callback))
+			.download_file_io(&file, progress_callback)
 			.await?
 			.into_os_string()
 			.into_string()
@@ -971,5 +1028,13 @@ impl AuthCacheState {
 				)?))
 			}
 		}
+	}
+
+	async fn inner_update_dir(&self, dir: &mut DBDirObject) -> Result<(), CacheError> {
+		let (dirs, files) = self.client.list_dir(&dir.uuid()).await?;
+		let mut conn = self.conn();
+		dir.update_dir_last_listed_now(&conn)?;
+		dir.update_children(&mut conn, dirs, files)?;
+		Ok(())
 	}
 }

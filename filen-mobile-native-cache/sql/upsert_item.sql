@@ -8,7 +8,8 @@ WITH local_source AS ( -- noqa: ST05
             ?4,
             moving.local_data,
             existing.local_data
-        ) AS local_data
+        ) AS local_data,
+        moving.is_recent AS is_recent
     FROM (
     -- we select nothing here to make sure we always have a row
         SELECT
@@ -20,7 +21,8 @@ WITH local_source AS ( -- noqa: ST05
     LEFT JOIN ( -- noqa: AM08
         SELECT
             id,
-            local_data
+            local_data,
+            is_recent
         FROM items
         WHERE uuid = ?1
     ) AS moving
@@ -40,7 +42,8 @@ INSERT OR REPLACE INTO items (
     parent,
     name,
     local_data,
-    type
+    type,
+    is_recent
 )
 SELECT
     local_source.id,
@@ -48,6 +51,7 @@ SELECT
     ?2 AS parent,
     ?3 AS name,
     local_source.local_data,
-    ?5 AS type
+    ?5 AS type,
+    local_source.is_recent
 FROM local_source
 RETURNING id, local_data;

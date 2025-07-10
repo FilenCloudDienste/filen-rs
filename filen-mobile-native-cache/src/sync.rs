@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use crate::{
 	CacheError,
 	auth::AuthCacheState,
-	ffi::PathValues,
+	ffi::PathFfiId,
 	sql::{self, DBDir, DBDirObject, DBFile, DBItemTrait, DBObject, DBRoot},
 };
 
@@ -200,7 +200,7 @@ impl AuthCacheState {
 
 	pub(crate) async fn update_items_in_path<'a>(
 		&self,
-		path_values: &'a PathValues<'a>,
+		path_values: &'a PathFfiId<'a>,
 	) -> Result<UpdateItemsInPath<'a>, CacheError> {
 		debug!(
 			"Updating items in path: {}, root: {}, name: {}",
