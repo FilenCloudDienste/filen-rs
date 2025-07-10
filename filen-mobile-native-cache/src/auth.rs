@@ -52,6 +52,9 @@ pub(crate) struct CacheState {
 pub struct FilenMobileCacheState {
 	state: Arc<tokio::sync::RwLock<CacheState>>,
 	state_write_coordinator: tokio::sync::Mutex<()>,
+	// allows spawning async tasks to check if the auth file has been updated
+	// to disable the provider, will always check if currently disabled
+	allow_auth_disable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -149,8 +152,8 @@ impl FilenMobileCacheState {
 		let last_update = *lock;
 		std::mem::drop(lock);
 
-		match (&state.status, last_update) {
-			(AuthStatus::Authenticated(_), last_update) => {
+		match (&state.status, last_update, self.allow_auth_disable) {
+			(AuthStatus::Authenticated(_), last_update, true) => {
 				if let Some(last_update) = last_update
 					&& (last_update - now) < AUTH_UPDATE_INTERVAL
 				{
@@ -168,7 +171,7 @@ impl FilenMobileCacheState {
 					});
 				}
 			}
-			(AuthStatus::Unauthenticated(_), last_update) => {
+			(AuthStatus::Unauthenticated(_), last_update, _) => {
 				if let Some(last_update) = last_update
 					&& (last_update - now) < UNAUTH_UPDATE_INTERVAL
 				{
@@ -176,6 +179,7 @@ impl FilenMobileCacheState {
 					return None;
 				}
 			}
+			_ => {}
 		}
 		Some(state)
 	}
@@ -491,10 +495,12 @@ impl FilenMobileCacheState {
 				last_update: std::sync::RwLock::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
+			allow_auth_disable: true,
 		}
 	}
+}
 
-	#[uniffi::constructor(name = "new_from_strings_in_memory")]
+impl FilenMobileCacheState {
 	pub fn from_strings_in_memory(
 		email: String,
 		root_uuid: &str,
@@ -521,6 +527,7 @@ impl FilenMobileCacheState {
 				last_update: std::sync::RwLock::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
+			allow_auth_disable: false,
 		})
 	}
 }
