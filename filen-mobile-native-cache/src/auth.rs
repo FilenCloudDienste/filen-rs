@@ -152,11 +152,11 @@ impl FilenMobileCacheState {
 
 		match (&state.status, last_update, self.allow_auth_disable) {
 			(AuthStatus::Authenticated(_), last_update, true) => {
-				if let Some(last_update) = last_update
-					&& (last_update - now) < AUTH_UPDATE_INTERVAL
-				{
-				} else {
-					state.last_update.write().unwrap().replace(Instant::now());
+				if last_update.is_none_or(|last_update| now - last_update > AUTH_UPDATE_INTERVAL) {
+					let mut last_update = state.last_update.write().unwrap();
+					*last_update = Some(Instant::now());
+					std::mem::drop(last_update);
+
 					let auth_file_path = state.auth_file.clone();
 					let state_arc = self.state.clone();
 
@@ -170,10 +170,8 @@ impl FilenMobileCacheState {
 				}
 			}
 			(AuthStatus::Unauthenticated(_), last_update, _) => {
-				if let Some(last_update) = last_update
-					&& (last_update - now) < UNAUTH_UPDATE_INTERVAL
+				if last_update.is_none_or(|last_update| now - last_update > UNAUTH_UPDATE_INTERVAL)
 				{
-				} else {
 					return None;
 				}
 			}
