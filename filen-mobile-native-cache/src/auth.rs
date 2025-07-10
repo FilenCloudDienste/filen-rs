@@ -145,7 +145,11 @@ impl FilenMobileCacheState {
 		T: Deref<Target = CacheState>,
 	{
 		// read and immediately drop lock
-		match (&state.status, *state.last_update.read().unwrap()) {
+		let lock = state.last_update.read().unwrap();
+		let last_update = *lock;
+		std::mem::drop(lock);
+
+		match (&state.status, last_update) {
 			(AuthStatus::Authenticated(_), last_update) => {
 				if let Some(last_update) = last_update
 					&& (last_update - now) < AUTH_UPDATE_INTERVAL
