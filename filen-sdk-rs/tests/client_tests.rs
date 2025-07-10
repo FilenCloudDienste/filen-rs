@@ -40,7 +40,7 @@ async fn cleanup_test_dirs() {
 		if dir.name().starts_with("rs-")
 			&& dir
 				.created()
-				.is_none_or(|c| c - now > chrono::Duration::days(1))
+				.is_none_or(|c| now - c > chrono::Duration::days(1))
 		{
 			futures.push(async { client.delete_dir_permanently(dir).await });
 		}
