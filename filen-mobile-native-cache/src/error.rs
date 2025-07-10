@@ -60,6 +60,9 @@ pub enum CacheError {
 	Image(ErrorContext),
 	Unauthenticated(ErrorContext),
 	Disabled(ErrorContext),
+	DoesNotExist(ErrorContext),
+	Unsupported(ErrorContext),
+	NotADirectory(ErrorContext),
 }
 
 impl CacheError {
@@ -101,6 +104,15 @@ impl CacheError {
 			CacheError::Disabled(err) => CacheError::Disabled(ErrorContext(
 				format!("{}: {}", context.into(), err.0).into(),
 			)),
+			CacheError::DoesNotExist(err) => CacheError::DoesNotExist(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::Unsupported(err) => CacheError::Unsupported(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
+			CacheError::NotADirectory(error_context) => CacheError::NotADirectory(ErrorContext(
+				format!("{}: {}", context.into(), error_context.0).into(),
+			)),
 		}
 	}
 }
@@ -127,6 +139,9 @@ impl std::fmt::Display for CacheError {
 			CacheError::Image(err) => err.fmt(f),
 			CacheError::Unauthenticated(err) => err.fmt(f),
 			CacheError::Disabled(err) => err.fmt(f),
+			CacheError::DoesNotExist(err) => err.fmt(f),
+			CacheError::Unsupported(err) => err.fmt(f),
+			CacheError::NotADirectory(err) => err.fmt(f),
 		}
 	}
 }
@@ -163,7 +178,11 @@ impl From<filen_sdk_rs::crypto::error::ConversionError> for CacheError {
 
 impl From<std::io::Error> for CacheError {
 	fn from(err: std::io::Error) -> Self {
-		CacheError::IO(err.into_error_context())
+		if err.kind() == std::io::ErrorKind::NotFound {
+			CacheError::DoesNotExist(err.into_error_context())
+		} else {
+			CacheError::IO(err.into_error_context())
+		}
 	}
 }
 
