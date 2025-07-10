@@ -65,15 +65,11 @@ pub struct AuthFile {
 }
 
 fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
-	debug!("Auth file content: {result:?}");
 	match result {
 		Ok(content) => {
 			let auth_file: serde_json::Result<AuthFile> = serde_json::from_str(&content);
 			match auth_file {
-				Ok(auth_file) => {
-					debug!("Parsed auth file: {auth_file:?}");
-					auth_file
-				}
+				Ok(auth_file) => auth_file,
 				Err(e) => {
 					log::error!("Failed to parse auth file, error: {e}");
 					AuthFile {

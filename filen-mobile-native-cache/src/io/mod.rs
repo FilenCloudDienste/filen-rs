@@ -98,7 +98,7 @@ impl AuthCacheState {
 	pub async fn download_file_io(
 		&self,
 		file: &RemoteFile,
-		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<PathBuf, io::Error> {
 		let reader = self.client.get_file_reader(file).compat();
 		let uuid = file.uuid().to_string();
@@ -168,7 +168,7 @@ impl AuthCacheState {
 		&self,
 		file: BaseFile,
 		os_file: tokio::fs::File,
-		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<RemoteFile, io::Error> {
 		let meta = os_file.metadata().await?;
 		let file_size = FilenMetaExt::size(&meta);
@@ -200,7 +200,7 @@ impl AuthCacheState {
 		&self,
 		file_builder: FileBuilder,
 		os_file: tokio::fs::File,
-		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<(RemoteFile, tokio::fs::File), io::Error> {
 		let meta = os_file.metadata().await?;
 		let file = file_builder
@@ -239,7 +239,7 @@ impl AuthCacheState {
 		name: &str,
 		parent_uuid: UuidStr,
 		mime: String,
-		callback: Option<Arc<dyn ProgressCallback + Send + Sync>>,
+		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<RemoteFile, io::Error> {
 		let old_path = self.cache_dir.join(old_uuid);
 		let old_file = tokio::fs::File::open(&old_path).await?;
