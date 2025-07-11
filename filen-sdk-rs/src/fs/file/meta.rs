@@ -24,11 +24,11 @@ pub(crate) struct FileMetaSeed(pub(crate) FileEncryptionVersion);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawFileMeta<'a> {
+struct RawFileMeta {
 	pub(super) name: String,
 	pub(super) size: u64,
 	pub(super) mime: String,
-	pub(super) key: &'a str,
+	pub(super) key: String,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
 	pub(super) last_modified: DateTime<Utc>,
 	#[serde(with = "filen_types::serde::time::optional")]
