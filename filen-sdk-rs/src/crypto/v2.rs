@@ -270,8 +270,8 @@ impl<'de> Deserialize<'de> for FileKey {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let key = String::deserialize(deserializer)?;
-		FileKey::from_str(&key).map_err(serde::de::Error::custom)
+		let key = <&str>::deserialize(deserializer)?;
+		FileKey::from_str(key).map_err(serde::de::Error::custom)
 	}
 }
 
