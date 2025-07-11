@@ -17,8 +17,9 @@ pub(crate) fn init_logger() {
 	println!("Initializing logger");
 	INIT_LOGGER.get_or_init(|| {
 		println!("Initializing env_logger");
-		let _ = env_logger::try_init();
-		// env_logger::init();
+		let _ =
+			env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+				.try_init();
 	});
 }
 
