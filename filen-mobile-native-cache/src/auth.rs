@@ -7,7 +7,7 @@ use std::{
 	time::Instant,
 };
 
-use filen_types::auth::FilenSDKConfig;
+use filen_types::{auth::FilenSDKConfig, crypto::Sha256Hash};
 use log::{debug, info, trace};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,69 @@ pub struct FilenMobileCacheState {
 	// allows spawning async tasks to check if the auth file has been updated
 	// to disable the provider, will always check if currently disabled
 	allow_auth_disable: bool,
+}
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SavedDBState {
+	pub(crate) db_hash: Sha256Hash,
+}
+
+fn init_db(db_path: &Path, state_file_path: &Path) -> Result<Connection, CacheError> {
+	match std::fs::remove_file(db_path) {
+		Ok(()) => {
+			log::info!("Removed old database file: {}", db_path.display());
+		}
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			log::info!(
+				"Database file not found, creating new one: {}",
+				db_path.display()
+			);
+		}
+		Err(e) => {
+			log::error!("Failed to remove old database file: {e}");
+			return Err(e.into());
+		}
+	}
+	let db = Connection::open(db_path)?;
+	db.execute_batch(sql::statements::INIT)?;
+	let contents = serde_json::to_string(&SavedDBState {
+		db_hash: *sql::statements::DB_INIT_HASH,
+	})
+	.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
+	std::fs::write(state_file_path, contents)?;
+	Ok(db)
+}
+
+fn db_from_files_dir(files_dir: &Path) -> Result<Connection, CacheError> {
+	let db_path = files_dir.join("native_cache.db");
+	let state_file_path = files_dir.join("db_state.json");
+	let state_file = match std::fs::read_to_string(&state_file_path) {
+		Ok(contents) => contents,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+			return init_db(&db_path, &state_file_path);
+		}
+		Err(e) => {
+			log::error!("Failed to read db_state.json, error: {e}");
+			return Err(e.into());
+		}
+	};
+
+	let saved_state: SavedDBState = serde_json::from_str(&state_file)
+		.map_err(|e| CacheError::conversion(format!("Failed to parse db_state.json: {e}")))?;
+	if saved_state.db_hash != *sql::statements::DB_INIT_HASH {
+		log::info!(
+			"Database hash mismatch, reinitializing database. Expected: {:?}, Found: {:?}",
+			*sql::statements::DB_INIT_HASH,
+			saved_state.db_hash
+		);
+		init_db(&db_path, &state_file_path)
+	} else {
+		log::info!(
+			"Database hash matches, using existing database: {}",
+			db_path.display()
+		);
+		Connection::open(db_path).map_err(Into::into)
+	}
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -335,8 +398,8 @@ impl AuthCacheState {
 			config.auth_version as u32,
 		)?;
 
-		let db = Connection::open(files_dir.join("native_cache.db"))?;
-		db.execute_batch(include_str!("../sql/init.sql"))?;
+		let db = db_from_files_dir(files_dir)?;
+
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir)?;
 
 		let new = Self {
