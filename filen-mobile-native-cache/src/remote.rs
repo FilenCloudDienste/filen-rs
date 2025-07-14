@@ -140,7 +140,7 @@ impl FilenMobileCacheState {
 		&self,
 		parent_path: FfiId,
 		name: String,
-		mime: String,
+		mime: Option<String>,
 	) -> Result<CreateFileResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.create_empty_file(parent_path, name, mime).await
@@ -470,7 +470,7 @@ impl AuthCacheState {
 		&self,
 		parent_path: FfiId,
 		name: String,
-		mime: String,
+		mime: Option<String>,
 	) -> Result<CreateFileResponse, CacheError> {
 		let file_path = parent_path.join(&name);
 		debug!("Creating empty file at path: {}", file_path.0);
@@ -492,7 +492,7 @@ impl AuthCacheState {
 		let path = parent_path.join(&name);
 		let pvs = path.as_path()?;
 		let (file, os_path) = self
-			.io_upload_new_file(pvs.name, parent.uuid(), Some(mime))
+			.io_upload_new_file(pvs.name, parent.uuid(), mime)
 			.await?;
 		let mut conn = self.conn();
 		let file = DBFile::upsert_from_remote(&mut conn, file)?;

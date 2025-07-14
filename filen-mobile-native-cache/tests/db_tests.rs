@@ -601,7 +601,7 @@ pub async fn test_progress_callback() {
 	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name(),).into();
 	let name = "test_progress.txt".to_string();
 	let create_resp = db
-		.create_empty_file(parent_path, name.clone(), "".into())
+		.create_empty_file(parent_path, name.clone(), None)
 		.await
 		.unwrap();
 	std::fs::write(create_resp.path, &contents).unwrap();
@@ -656,7 +656,11 @@ pub async fn test_create_empty_file() {
 
 	// Create an empty file
 	let create_resp = db
-		.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone())
+		.create_empty_file(
+			parent_path.clone(),
+			file_name.clone(),
+			Some(mime_type.clone()),
+		)
 		.await
 		.unwrap();
 
@@ -691,7 +695,7 @@ pub async fn test_create_empty_file_different_mime_types() {
 			.create_empty_file(
 				parent_path.clone(),
 				filename.to_string(),
-				mime_type.to_string(),
+				Some(mime_type.to_string()),
 			)
 			.await
 			.unwrap();
@@ -719,14 +723,22 @@ pub async fn test_create_empty_file_duplicate_name() {
 	let mime_type = "text/plain".to_string();
 
 	// Create first file
-	db.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone())
-		.await
-		.unwrap();
+	db.create_empty_file(
+		parent_path.clone(),
+		file_name.clone(),
+		Some(mime_type.clone()),
+	)
+	.await
+	.unwrap();
 
 	assert!(
-		db.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone(),)
-			.await
-			.is_ok()
+		db.create_empty_file(
+			parent_path.clone(),
+			file_name.clone(),
+			Some(mime_type.clone()),
+		)
+		.await
+		.is_ok()
 	);
 }
 
@@ -746,7 +758,7 @@ pub async fn test_create_empty_file_invalid_parent() {
 		.create_empty_file(
 			invalid_parent_path,
 			"test.txt".to_string(),
-			"text/plain".to_string(),
+			Some("text/plain".to_string()),
 		)
 		.await;
 
@@ -764,7 +776,11 @@ pub async fn test_create_empty_file_in_root() {
 
 	// Create file in test directory
 	let create_resp = db
-		.create_empty_file(parent_path.clone(), file_name.clone(), mime_type.clone())
+		.create_empty_file(
+			parent_path.clone(),
+			file_name.clone(),
+			Some(mime_type.clone()),
+		)
 		.await
 		.unwrap();
 
