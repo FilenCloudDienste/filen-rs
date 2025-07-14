@@ -738,6 +738,7 @@ dependencies = [
  "filen-types",
  "futures",
  "image",
+ "lazy_static",
  "libsqlite3-sys",
  "log 0.4.27",
  "once_cell",

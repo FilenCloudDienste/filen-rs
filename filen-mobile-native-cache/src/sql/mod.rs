@@ -11,6 +11,8 @@ pub mod types;
 pub use types::*;
 pub mod error;
 pub use error::SQLError;
+pub(crate) mod statements;
+use statements::*;
 
 use crate::{
 	CacheError,
@@ -28,7 +30,7 @@ pub(crate) fn select_objects_in_path<'a>(
 	path_values: &'a PathFfiId,
 ) -> Result<(Vec<(DBObject, &'a str)>, bool), rusqlite::Error> {
 	let path_iter = path_values.inner_path.path_iter();
-	let mut stmt = conn.prepare_cached(include_str!("../../sql/select_item_by_parent_name.sql"))?;
+	let mut stmt = conn.prepare_cached(SELECT_ITEM_BY_PARENT_NAME)?;
 	let mut objects = Vec::new();
 
 	match RawDBItem::select(conn, path_values.root_uuid)? {
@@ -90,9 +92,7 @@ pub(crate) fn select_object_at_parsed_id<'a>(
 pub(crate) fn insert_root(conn: &mut Connection, root: UuidStr) -> Result<(), rusqlite::Error> {
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{
-		let mut stmt = tx.prepare_cached(
-			"INSERT INTO items (uuid, parent, name, type) VALUES (?, NULL, ?, ?) RETURNING id;",
-		)?;
+		let mut stmt = tx.prepare_cached(INSERT_ROOT_INTO_ITEMS)?;
 		let id: i64 = match stmt.query_one((root, "", ItemType::Root as i8), |row| row.get(0)) {
 			Ok(id) => id,
 			Err(rusqlite::Error::SqliteFailure(
@@ -107,9 +107,9 @@ pub(crate) fn insert_root(conn: &mut Connection, root: UuidStr) -> Result<(), ru
 			}
 			Err(e) => return Err(e),
 		};
-		let mut stmt = tx.prepare_cached("INSERT INTO roots (id) VALUES (?);")?;
+		let mut stmt = tx.prepare_cached(INSERT_ROOT_INTO_ROOTS)?;
 		stmt.execute([id])?;
-		let mut stmt = tx.prepare_cached("INSERT INTO dirs (id) VALUES (?);")?;
+		let mut stmt = tx.prepare_cached(INSERT_ROOT_INTO_DIRS)?;
 		stmt.execute([id])?;
 	}
 	tx.commit()?;
@@ -121,19 +121,15 @@ pub(crate) fn update_root(
 	root_uuid: UuidStr,
 	response: &filen_types::api::v3::user::info::Response<'_>,
 ) -> Result<(), rusqlite::Error> {
-	let id: i64 = conn.query_one("SELECT id FROM items WHERE uuid = ?;", [root_uuid], |row| {
-		row.get(0)
-	})?;
-	let mut stmt = conn.prepare(
-		"UPDATE roots SET storage_used = ?, max_storage = ?, last_updated = ? WHERE id = ?;",
-	)?;
+	let id: i64 = conn.query_one(SELECT_ID_BY_UUID, [root_uuid], |row| row.get(0))?;
+	let mut stmt = conn.prepare(UPDATE_ROOT)?;
 	let now = chrono::Utc::now().timestamp_millis();
 	stmt.execute((response.storage_used, response.max_storage, now, id))?;
 	Ok(())
 }
 
 pub(crate) fn delete_item(conn: &Connection, item_uuid: UuidStr) -> Result<(), rusqlite::Error> {
-	let mut stmt = conn.prepare_cached("DELETE FROM items WHERE uuid = ?;")?;
+	let mut stmt = conn.prepare_cached(DELETE_BY_UUID)?;
 	stmt.execute([item_uuid])?;
 	Ok(())
 }
@@ -167,7 +163,7 @@ pub(crate) fn get_all_descendant_paths(
 	uuid: UuidStr,
 	current_path: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
-	let mut stmt = conn.prepare_cached("SELECT uuid, name, type FROM items WHERE parent = ?;")?;
+	let mut stmt = conn.prepare_cached(SELECT_UUID_NAME_TYPE_BY_PARENT)?;
 	let mut paths = Vec::new();
 	get_all_descendant_paths_with_stmt(uuid, current_path, &mut stmt, &mut paths)?;
 	Ok(paths)
@@ -177,9 +173,7 @@ pub(crate) fn recursive_select_path_from_uuid(
 	conn: &Connection,
 	uuid: UuidStr,
 ) -> Result<Option<String>, rusqlite::Error> {
-	let mut stmt = conn.prepare_cached(include_str!(
-		"../../sql/recursive_select_path_from_uuid.sql"
-	))?;
+	let mut stmt = conn.prepare_cached(RECURSIVE_SELECT_PATH_FROM_UUID)?;
 	stmt.query_row([uuid], |row| row.get(0)).optional()
 }
 
@@ -188,7 +182,7 @@ pub(crate) fn update_local_data(
 	uuid: UuidStr,
 	local_data: Option<&JsonObject>,
 ) -> Result<(), rusqlite::Error> {
-	let mut stmt = conn.prepare_cached("UPDATE items SET local_data = ? WHERE uuid = ?;")?;
+	let mut stmt = conn.prepare_cached(UPDATE_LOCAL_DATA_BY_UUID)?;
 	let local_data = local_data
 		.map(|d| if d.is_empty() { None } else { Some(d) })
 		.unwrap_or(None);
@@ -204,14 +198,13 @@ pub(crate) fn update_recents(
 	let tx = conn.transaction()?;
 	{
 		debug!("Clearing recents");
-		let mut stmt = tx.prepare_cached(include_str!("../../sql/clear_recents.sql"))?;
+		let mut stmt = tx.prepare_cached(CLEAR_RECENTS)?;
 		stmt.execute([])?;
 
-		let mut upsert_item_stmt = tx.prepare_cached(types::UPSERT_ITEM_SQL)?;
-		let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
-		let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
-		let mut update_recent =
-			tx.prepare_cached(include_str!("../../sql/update_item_set_recent.sql"))?;
+		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
+		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
+		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
+		let mut update_recent = tx.prepare_cached(UPDATE_ITEM_SET_RECENT)?;
 
 		for dir in dirs {
 			trace!("Updating recent directory: {}", dir.uuid());
@@ -242,20 +235,17 @@ where
 	let tx = conn.transaction()?;
 	let items = {
 		// This should remove any orphaned items that were previously around because they were searched for
-		let mut clear_search =
-			tx.prepare_cached(include_str!("../../sql/clear_orphaned_search_items.sql"))?;
+		let mut clear_search = tx.prepare_cached(CLEAR_ORPHANED_SEARCH_ITEMS)?;
 		clear_search.execute([])?;
 
 		// This should removed the search path from all items that were previously searched for
-		let mut clear_search =
-			tx.prepare_cached(include_str!("../../sql/clear_search_from_items.sql"))?;
+		let mut clear_search = tx.prepare_cached(CLEAR_SEARCH_FROM_ITEMS)?;
 		clear_search.execute([])?;
 
-		let mut upsert_item_stmt = tx.prepare_cached(types::UPSERT_ITEM_SQL)?;
-		let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
-		let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
-		let mut update_search_path =
-			tx.prepare_cached(include_str!("../../sql/update_search_path.sql"))?;
+		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
+		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
+		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
+		let mut update_search_path = tx.prepare_cached(UPDATE_SEARCH_PATH)?;
 
 		items
 			.into_iter()
@@ -297,50 +287,27 @@ where
 {
 	let tx = conn.transaction()?;
 	{
-		let mut stmt = tx.prepare_cached(include_str!("../../sql/mark_stale_with_parent.sql"))?;
+		let mut stmt = tx.prepare_cached(MARK_STALE_WITH_PARENT)?;
 		stmt.execute([parent])?;
 
-		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
-		let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
+		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
+		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
 
 		for dir in dirs {
 			DBDir::upsert_from_remote_stmts(dir, &mut upsert_item_stmt, &mut upsert_dir)?;
 		}
 
-		let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
+		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
 
 		for file in files {
 			DBFile::upsert_from_remote_stmts(file, &mut upsert_item_stmt, &mut upsert_file)?;
 		}
 
-		let mut stmt = tx.prepare_cached(include_str!("../../sql/delete_stale_with_parent.sql"))?;
+		let mut stmt = tx.prepare_cached(DELETE_STALE_WITH_PARENT)?;
 		stmt.execute([parent])?;
 	}
 	tx.commit()?;
 	Ok(())
-}
-
-fn convert_order_by(order_by: &str) -> &'static str {
-	if order_by.contains("display_name") {
-		if order_by.contains("ASC") {
-			return "ORDER BY items.name ASC";
-		} else if order_by.contains("DESC") {
-			return "ORDER BY items.name DESC";
-		}
-	} else if order_by.contains("last_modified") {
-		if order_by.contains("ASC") {
-			return "ORDER BY files.modified + 0 ASC";
-		} else if order_by.contains("DESC") {
-			return "ORDER BY files.modified + 0 DESC";
-		}
-	} else if order_by.contains("size") {
-		if order_by.contains("ASC") {
-			return "ORDER BY files.size + 0 ASC";
-		} else if order_by.contains("DESC") {
-			return "ORDER BY files.size + 0 DESC";
-		}
-	}
-	"ORDER BY items.name ASC"
 }
 
 pub(crate) fn select_children(
@@ -348,16 +315,7 @@ pub(crate) fn select_children(
 	order_by: Option<&str>,
 	parent: ParentUuid,
 ) -> SQLResult<Vec<DBNonRootObject>> {
-	let order_by = match order_by {
-		Some(order_by) => convert_order_by(order_by),
-		_ => "ORDER BY items.name ASC",
-	};
-
-	let mut stmt = conn.prepare(&format!(
-		"{} {}",
-		include_str!("../../sql/select_dir_children.sql"),
-		order_by
-	))?;
+	let mut stmt = conn.prepare(&select_dir_children(order_by))?;
 	stmt.query_and_then([parent], DBNonRootObject::from_row)?
 		.collect::<SQLResult<Vec<_>>>()
 }
@@ -366,16 +324,7 @@ pub(crate) fn select_recents(
 	conn: &Connection,
 	order_by: Option<&str>,
 ) -> SQLResult<Vec<DBNonRootObject>> {
-	let order_by = match order_by {
-		Some(order_by) => convert_order_by(order_by),
-		_ => "ORDER BY items.name ASC",
-	};
-
-	let mut stmt = conn.prepare(&format!(
-		"{} {};",
-		include_str!("../../sql/select_recents.sql"),
-		order_by
-	))?;
+	let mut stmt = conn.prepare(&statements::select_recents(order_by))?;
 	stmt.query_and_then([], DBNonRootObject::from_row)?
 		.collect::<SQLResult<Vec<_>>>()
 }
@@ -385,7 +334,7 @@ pub(crate) fn select_search(
 	args: &SearchQueryArgs,
 	root: UuidStr,
 ) -> SQLResult<Vec<(DBNonRootObject, String)>> {
-	let mut stmt = conn.prepare_cached(include_str!("../../sql/select_search.sql"))?;
+	let mut stmt = conn.prepare_cached(SELECT_SEARCH)?;
 
 	let mime_json_array_string = if args.mime_types.is_empty() {
 		None

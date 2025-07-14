@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedRwLockReadGuard;
 
-use crate::CacheError;
+use crate::{CacheError, sql};
 
 const UNAUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const AUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -373,7 +373,8 @@ impl AuthCacheState {
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir.as_ref())?;
 		let db = Connection::open_in_memory()?;
-		db.execute_batch(include_str!("../sql/init.sql"))?;
+		db.execute_batch(sql::statements::INIT)?;
+
 		let new = Self {
 			client,
 			conn: Mutex::new(db),

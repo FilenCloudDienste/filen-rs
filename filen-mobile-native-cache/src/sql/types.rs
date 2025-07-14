@@ -21,10 +21,9 @@ use sha2::Digest;
 use crate::{ffi::ItemType, sql::json_object::JsonObject};
 
 use super::SQLError;
+use super::statements::*;
 
 pub(crate) type SQLResult<T> = std::result::Result<T, SQLError>;
-
-pub(crate) const UPSERT_ITEM_SQL: &str = include_str!("../../sql/upsert_item.sql");
 
 impl FromSql for ItemType {
 	fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
@@ -83,7 +82,7 @@ fn upsert_item(
 	local_data: Option<JsonObject>,
 	type_: ItemType,
 ) -> Result<(i64, Option<JsonObject>)> {
-	let mut upsert_item_stmt = conn.prepare_cached(UPSERT_ITEM_SQL)?;
+	let mut upsert_item_stmt = conn.prepare_cached(UPSERT_ITEM)?;
 	upsert_item_with_stmts(uuid, parent, name, local_data, type_, &mut upsert_item_stmt)
 }
 
@@ -100,7 +99,7 @@ impl RawDBItem {
 	}
 
 	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> Result<Option<Self>> {
-		let mut stmt = conn.prepare_cached(include_str!("../../sql/select_item.sql"))?;
+		let mut stmt = conn.prepare_cached(SELECT_ITEM_BY_UUID)?;
 		stmt.query_one([uuid], Self::from_row).optional()
 	}
 
@@ -228,7 +227,7 @@ impl DBFile {
 	}
 
 	pub(crate) fn from_item(item: InnerDBItem, conn: &Connection) -> Result<Self> {
-		let mut stmt = conn.prepare_cached(include_str!("../../sql/select_file.sql"))?;
+		let mut stmt = conn.prepare_cached(SELECT_FILE)?;
 		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))
 	}
 
@@ -295,68 +294,12 @@ impl DBFile {
 	) -> Result<Self> {
 		let tx = conn.transaction()?;
 		let new = {
-			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
-			let mut upsert_file = tx.prepare_cached(include_str!("../../sql/upsert_file.sql"))?;
+			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
+			let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
 			Self::upsert_from_remote_stmts(remote_file, &mut upsert_item_stmt, &mut upsert_file)?
 		};
 		tx.commit()?;
 		Ok(new)
-	}
-
-	#[allow(dead_code)]
-	pub(crate) fn update_from_remote(
-		&mut self,
-		conn: &mut Connection,
-		file: RemoteFile,
-	) -> Result<()> {
-		let tx = conn.transaction()?;
-		let file_key = file.key().to_str();
-		let created = file.created().timestamp_millis();
-		let modified = file.last_modified().timestamp_millis();
-		let size = file.size() as i64;
-		let chunks = file.chunks() as i64;
-		let hash = file.hash().map(Into::<[u8; 64]>::into);
-		let favorite_rank = {
-			let mut stmt = tx.prepare_cached(
-				"
-		UPDATE items SET uuid = ?, parent = ?, name = ? WHERE uuid = ? RETURNING id LIMIT 1;",
-			)?;
-			stmt.execute((file.uuid(), file.parent(), file.name(), self.uuid))?;
-			let mut stmt = tx.prepare_cached(include_str!("../../sql/update_file.sql"))?;
-
-			stmt.query_one(
-				(
-					file.mime(),
-					&file_key,
-					created,
-					modified,
-					size,
-					chunks,
-					file.favorited() as u8,
-					file.region(),
-					file.bucket(),
-					hash,
-					self.id,
-				),
-				|r| r.get(0),
-			)?
-		};
-
-		tx.commit()?;
-		self.uuid = file.uuid();
-		self.parent = file.parent();
-		self.favorite_rank = favorite_rank;
-		self.file_key = file_key.to_string();
-		self.name = file.file.name;
-		self.mime = file.file.mime;
-		self.created = created;
-		self.modified = modified;
-		self.size = size;
-		self.chunks = chunks;
-		self.region = file.region;
-		self.bucket = file.bucket;
-		self.hash = hash;
-		Ok(())
 	}
 
 	pub(crate) fn update_favorite_rank(
@@ -364,8 +307,7 @@ impl DBFile {
 		conn: &Connection,
 		favorite_rank: i64,
 	) -> Result<()> {
-		let mut stmt =
-			conn.prepare_cached(include_str!("../../sql/update_file_favorite_rank.sql"))?;
+		let mut stmt = conn.prepare_cached(UPDATE_FILE_FAVORITE_RANK)?;
 		stmt.execute((favorite_rank, self.id))?;
 		self.favorite_rank = favorite_rank;
 		Ok(())
@@ -473,7 +415,7 @@ impl DBDir {
 	}
 
 	pub(crate) fn from_item(item: InnerDBItem, conn: &Connection) -> Result<Self> {
-		let mut stmt = conn.prepare_cached(include_str!("../../sql/select_dir.sql"))?;
+		let mut stmt = conn.prepare_cached(SELECT_DIR)?;
 		let res = stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))?;
 		Ok(res)
 	}
@@ -533,8 +475,8 @@ impl DBDir {
 		trace!("Upserting remote dir: {remote_dir:?}");
 		let tx = conn.transaction()?;
 		let new = {
-			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM_SQL)?;
-			let mut upsert_dir = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
+			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
+			let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
 			Self::upsert_from_remote_stmts(remote_dir, &mut upsert_item_stmt, &mut upsert_dir)?
 		};
 		tx.commit()?;
@@ -550,8 +492,7 @@ impl DBDir {
 			"Updating favorite rank for dir {} to {}",
 			self.uuid, favorite_rank
 		);
-		let mut stmt =
-			conn.prepare_cached(include_str!("../../sql/update_dir_favorite_rank.sql"))?;
+		let mut stmt = conn.prepare_cached(UPDATE_DIR_FAVORITE_RANK)?;
 		stmt.execute((favorite_rank, self.id))?;
 		self.favorite_rank = favorite_rank;
 		Ok(())
@@ -651,7 +592,7 @@ impl DBRoot {
 	}
 
 	pub(crate) fn from_item(item: InnerDBItem, conn: &Connection) -> Result<Self> {
-		let mut stmt = conn.prepare_cached(include_str!("../../sql/select_root.sql"))?;
+		let mut stmt = conn.prepare_cached(SELECT_ROOT)?;
 		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))
 	}
 
@@ -676,7 +617,7 @@ impl DBRoot {
 			None,
 			ItemType::Root,
 		)?;
-		let mut stmt = tx.prepare_cached(include_str!("../../sql/upsert_root_empty.sql"))?;
+		let mut stmt = tx.prepare_cached(UPSERT_ROOT_EMPTY)?;
 		let (storage_used, max_storage, last_updated) = stmt.query_one([id], |f| {
 			let storage_used: i64 = f.get(0)?;
 			let max_storage: i64 = f.get(1)?;
@@ -684,7 +625,7 @@ impl DBRoot {
 			Ok((storage_used, max_storage, last_updated))
 		})?;
 		std::mem::drop(stmt);
-		let mut stmt = tx.prepare_cached(include_str!("../../sql/upsert_dir.sql"))?;
+		let mut stmt = tx.prepare_cached(UPSERT_DIR)?;
 		let last_listed = stmt.query_one((id, 0, false, Option::<String>::None), |r| {
 			let last_listed: i64 = r.get(0)?;
 			Ok(last_listed)
@@ -757,7 +698,7 @@ pub enum DBObject {
 
 impl DBObject {
 	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> Result<Self> {
-		let mut stmt = conn.prepare_cached(include_str!("../../sql/select_object.sql"))?;
+		let mut stmt = conn.prepare_cached(SELECT_OBJECT_BY_UUID)?;
 		stmt.query_one([uuid], |row| {
 			let item = RawDBItem::from_row(row)?;
 			Ok(match item.type_ {
@@ -1064,7 +1005,7 @@ where
 {
 	fn update_dir_last_listed_now(&mut self, conn: &Connection) -> Result<()> {
 		let mut stmt: rusqlite::CachedStatement<'_> =
-			conn.prepare_cached(include_str!("../../sql/update_dir_last_listed.sql"))?;
+			conn.prepare_cached(UPDATE_DIR_LAST_LISTED)?;
 		let now = Utc::now().timestamp_millis();
 		stmt.execute((now, self.id()))?;
 		self.set_last_listed(now);
