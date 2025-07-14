@@ -18,21 +18,13 @@ use rusqlite::{
 };
 use sha2::Digest;
 
-use crate::sql::json_object::JsonObject;
+use crate::{ffi::ItemType, sql::json_object::JsonObject};
 
 use super::SQLError;
 
 pub(crate) type SQLResult<T> = std::result::Result<T, SQLError>;
 
 pub(crate) const UPSERT_ITEM_SQL: &str = include_str!("../../sql/upsert_item.sql");
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i8)]
-pub enum ItemType {
-	Root,
-	Dir,
-	File,
-}
 
 impl FromSql for ItemType {
 	fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {

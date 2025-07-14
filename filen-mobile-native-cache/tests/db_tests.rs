@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use filen_mobile_native_cache::{
 	auth::{AuthFile, FilenMobileCacheState},
-	ffi::{FfiId, FfiNonRootObject, FfiObject},
+	ffi::{FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs},
 	traits::ProgressCallback,
 };
 use filen_sdk_rs::fs::{HasName, HasUUID, file::traits::HasFileInfo};
@@ -4187,4 +4187,188 @@ pub async fn test_recents() {
 			_ => false,
 		}
 	}))
+}
+
+#[shared_test_runtime]
+pub async fn test_search() {
+	let (db, rss) = get_db_resources().await;
+
+	// this is to make an orphaned file which should be cleaned up later
+	let dir = rss
+		.client
+		.create_dir(&rss.dir, "a".to_string())
+		.await
+		.unwrap();
+	let dir = rss.client.create_dir(&dir, "b".to_string()).await.unwrap();
+	let remote_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("searChable", &dir)
+				.mime("image/other".to_string())
+				.build()
+				.into(),
+			b"Search content",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let remote_file_path: FfiId = format!("{}/a/b/{}", test_dir_path.0, remote_file.name()).into();
+
+	let file = db
+		.create_empty_file(
+			test_dir_path,
+			"other_searchablE".to_string(),
+			Some("text/plain".to_string()),
+		)
+		.await
+		.unwrap();
+
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: Some("seArchable".to_string()),
+			exclude_media_on_device: false,
+			mime_types: Vec::new(),
+			file_size_min: None,
+			last_modified_min: None,
+			item_type: None,
+		})
+		.unwrap();
+
+	assert_eq!(resp.len(), 1, "Expected 1 search result");
+	assert!(
+		match &resp[0].object {
+			FfiNonRootObject::File(f) => f.uuid == file.file.uuid,
+			_ => false,
+		},
+		"Expected the first search result to be the uploaded file",
+	);
+
+	assert_eq!(
+		resp[0].path, file.id.0,
+		"Expected search result path to match the file path"
+	);
+
+	db.update_search("searchAble").await.unwrap();
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: Some("sEarchable".to_string()),
+			exclude_media_on_device: false,
+			mime_types: Vec::new(),
+			file_size_min: None,
+			last_modified_min: None,
+			item_type: None,
+		})
+		.unwrap();
+	assert_eq!(resp.len(), 2, "Expected 2 search results after update");
+	assert!(
+		resp.iter().any(|e| {
+			match (&e.object, &e.path) {
+				(FfiNonRootObject::File(f), path) => {
+					f.uuid == remote_file.uuid().as_ref() && *path == remote_file_path.0
+				}
+				_ => false,
+			}
+		}),
+		"Expected search results to include the remote file"
+	);
+	assert!(
+		resp.iter().any(|e| {
+			match (&e.object, &e.path) {
+				(FfiNonRootObject::File(f), path) => f.uuid == file.file.uuid && *path == file.id.0,
+				_ => false,
+			}
+		}),
+		"Expected search results to include the local file"
+	);
+
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: Some("searchable".to_string()),
+			exclude_media_on_device: false,
+			mime_types: Vec::new(),
+			file_size_min: Some(1),
+			last_modified_min: None,
+			item_type: None,
+		})
+		.unwrap();
+
+	assert_eq!(resp.len(), 1);
+
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: Some("searchable".to_string()),
+			exclude_media_on_device: false,
+			mime_types: vec![
+				"image/*".to_string(),
+				"asf".to_string(),
+				"video/*".to_string(),
+			],
+			file_size_min: Some(1),
+			last_modified_min: None,
+			item_type: Some(ItemType::File),
+		})
+		.unwrap();
+
+	assert_eq!(resp.len(), 1);
+
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: Some("searchable".to_string()),
+			exclude_media_on_device: false,
+			mime_types: vec!["image/*".to_string()],
+			file_size_min: Some(1),
+			last_modified_min: None,
+			item_type: Some(ItemType::Dir),
+		})
+		.unwrap();
+
+	assert_eq!(resp.len(), 0);
+
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: Some("searchable".to_string()),
+			exclude_media_on_device: false,
+			mime_types: vec!["asf".to_string(), "video/*".to_string()],
+			file_size_min: Some(1),
+			last_modified_min: None,
+			item_type: Some(ItemType::File),
+		})
+		.unwrap();
+
+	assert_eq!(resp.len(), 0);
+
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: None,
+			exclude_media_on_device: false,
+			mime_types: Vec::new(),
+			file_size_min: None,
+			last_modified_min: None,
+			item_type: Some(ItemType::File),
+		})
+		.unwrap();
+
+	assert_eq!(resp.len(), 2);
+
+	// Test orphaned search results cleanup
+	// This should remove the orphaned file at a/b/searchable
+	db.update_search("asdf").await.unwrap();
+
+	let resp = db
+		.query_search(SearchQueryArgs {
+			name: Some("searchable".to_string()),
+			exclude_media_on_device: false,
+			mime_types: Vec::new(),
+			file_size_min: None,
+			last_modified_min: None,
+			item_type: None,
+		})
+		.unwrap();
+	assert_eq!(
+		resp.len(),
+		1,
+		"Expected no orphaned search results after update"
+	);
 }

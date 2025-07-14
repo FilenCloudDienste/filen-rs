@@ -326,3 +326,27 @@ pub struct UploadFileInfo {
 	pub modification: Option<i64>,
 	pub mime: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[repr(i8)]
+pub enum ItemType {
+	Root,
+	Dir,
+	File,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct SearchQueryArgs {
+	pub name: Option<String>,
+	pub item_type: Option<ItemType>,
+	pub exclude_media_on_device: bool, // currently ignored
+	pub mime_types: Vec<String>,
+	pub file_size_min: Option<u64>,
+	pub last_modified_min: Option<u64>,
+}
+
+#[derive(uniffi::Record, Debug)]
+pub struct SearchQueryResponseEntry {
+	pub object: FfiNonRootObject,
+	pub path: String,
+}

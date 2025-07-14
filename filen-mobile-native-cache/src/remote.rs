@@ -14,13 +14,13 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
-		CreateFileResponse, DirWithPathResponse, FfiId, FileWithPathResponse,
+		CreateFileResponse, DirWithPathResponse, FfiId, FileWithPathResponse, ItemType,
 		ObjectWithPathResponse, ParsedFfiId, PathFfiId, QueryChildrenResponse,
 		QueryNonDirChildrenResponse, UploadFileInfo,
 	},
 	sql::{
 		self, DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemTrait, DBNonRootObject,
-		DBObject, ItemType, error::OptionalExtensionSQL,
+		DBObject, error::OptionalExtensionSQL,
 	},
 	sync::UpdateItemsInPath,
 	traits::ProgressCallback,
@@ -71,6 +71,13 @@ impl FilenMobileCacheState {
 	) -> Result<QueryNonDirChildrenResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.update_and_query_recents(order_by).await
+		})
+		.await
+	}
+
+	pub async fn update_search(&self, name: &str) -> Result<(), CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.update_search(name).await
 		})
 		.await
 	}
@@ -269,6 +276,12 @@ impl AuthCacheState {
 			.write()
 			.unwrap()
 			.replace(Instant::now());
+		Ok(())
+	}
+
+	pub(crate) async fn update_search(&self, name: &str) -> Result<(), CacheError> {
+		let results = self.client.find_item_matches_for_name(name).await?;
+		sql::update_search_items(&mut self.conn(), results)?;
 		Ok(())
 	}
 

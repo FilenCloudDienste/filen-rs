@@ -1,19 +1,15 @@
-use super::ItemType;
+use crate::ffi::ItemType;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SQLError {
 	#[error("SQLite error: {0}")]
-	SQLiteError(rusqlite::Error),
+	SQLiteError(#[from] rusqlite::Error),
+	#[error("SQLLite FromSqlError: {0}")]
+	FromSqlError(#[from] rusqlite::types::FromSqlError),
 	#[error("Unexpected type: expected: {0:?}, got: {1:?}")]
 	UnexpectedType(ItemType, ItemType),
 	#[error("Unexpected None value for item: {0:?}, field: {1}")]
 	UnexpectedNone(ItemType, &'static str),
-}
-
-impl From<rusqlite::Error> for SQLError {
-	fn from(err: rusqlite::Error) -> Self {
-		SQLError::SQLiteError(err)
-	}
 }
 
 pub trait OptionalExtensionSQL<T> {

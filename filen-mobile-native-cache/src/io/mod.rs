@@ -6,7 +6,7 @@ use std::{
 	time::{Duration, SystemTime},
 };
 
-use crate::{auth::AuthCacheState, sql::ItemType, traits::ProgressCallback};
+use crate::{auth::AuthCacheState, ffi::ItemType, traits::ProgressCallback};
 use filen_sdk_rs::{
 	fs::{
 		HasUUID,
