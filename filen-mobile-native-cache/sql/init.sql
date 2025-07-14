@@ -1,4 +1,6 @@
 PRAGMA recursive_triggers = true;
+PRAGMA journal_mode = WAL;
+PRAGMA temp_store = MEMORY;
 
 CREATE TABLE IF NOT EXISTS items (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
