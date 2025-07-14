@@ -730,6 +730,7 @@ name = "filen-mobile-native-cache"
 version = "0.1.0"
 dependencies = [
  "android_log",
+ "base64",
  "chrono",
  "env_logger",
  "faster-hex",

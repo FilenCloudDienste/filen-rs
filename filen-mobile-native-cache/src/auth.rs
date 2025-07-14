@@ -15,7 +15,7 @@ use tokio::sync::OwnedRwLockReadGuard;
 
 use crate::{CacheError, sql};
 
-const UNAUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const UNAUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const AUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct AuthCacheState {

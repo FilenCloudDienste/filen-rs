@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_mobile_native_cache::{
 	auth::{AuthFile, FilenMobileCacheState},
 	ffi::{FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs},
@@ -4209,6 +4210,12 @@ pub async fn test_recents() {
 pub async fn test_search() {
 	let (db, rss) = get_db_resources().await;
 
+	let name = BASE64_URL_SAFE_NO_PAD
+		.encode(rand::random::<[u8; 10]>())
+		.to_string();
+
+	let lower_name = name.to_lowercase();
+
 	// this is to make an orphaned file which should be cleaned up later
 	let dir = rss
 		.client
@@ -4220,7 +4227,7 @@ pub async fn test_search() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("searChable", &dir)
+				.make_file_builder(name.clone(), &dir)
 				.mime("image/other".to_string())
 				.build()
 				.into(),
@@ -4235,7 +4242,7 @@ pub async fn test_search() {
 	let file = db
 		.create_empty_file(
 			test_dir_path,
-			"other_searchablE".to_string(),
+			format!("other {}", &lower_name),
 			Some("text/plain".to_string()),
 		)
 		.await
@@ -4243,7 +4250,7 @@ pub async fn test_search() {
 
 	let resp = db
 		.query_search(SearchQueryArgs {
-			name: Some("seArchable".to_string()),
+			name: Some(name.clone()),
 			exclude_media_on_device: false,
 			mime_types: Vec::new(),
 			file_size_min: None,
@@ -4266,10 +4273,10 @@ pub async fn test_search() {
 		"Expected search result path to match the file path"
 	);
 
-	db.update_search("searchAble").await.unwrap();
+	db.update_search(&name).await.unwrap();
 	let resp = db
 		.query_search(SearchQueryArgs {
-			name: Some("sEarchable".to_string()),
+			name: Some(name.clone()),
 			exclude_media_on_device: false,
 			mime_types: Vec::new(),
 			file_size_min: None,
@@ -4301,7 +4308,7 @@ pub async fn test_search() {
 
 	let resp = db
 		.query_search(SearchQueryArgs {
-			name: Some("searchable".to_string()),
+			name: Some(name.clone()),
 			exclude_media_on_device: false,
 			mime_types: Vec::new(),
 			file_size_min: Some(1),
@@ -4314,7 +4321,7 @@ pub async fn test_search() {
 
 	let resp = db
 		.query_search(SearchQueryArgs {
-			name: Some("searchable".to_string()),
+			name: Some(name.clone()),
 			exclude_media_on_device: false,
 			mime_types: vec![
 				"image/*".to_string(),
@@ -4331,7 +4338,7 @@ pub async fn test_search() {
 
 	let resp = db
 		.query_search(SearchQueryArgs {
-			name: Some("searchable".to_string()),
+			name: Some(name.clone()),
 			exclude_media_on_device: false,
 			mime_types: vec!["image/*".to_string()],
 			file_size_min: Some(1),
@@ -4344,7 +4351,7 @@ pub async fn test_search() {
 
 	let resp = db
 		.query_search(SearchQueryArgs {
-			name: Some("searchable".to_string()),
+			name: Some(name.clone()),
 			exclude_media_on_device: false,
 			mime_types: vec!["asf".to_string(), "video/*".to_string()],
 			file_size_min: Some(1),
@@ -4374,7 +4381,7 @@ pub async fn test_search() {
 
 	let resp = db
 		.query_search(SearchQueryArgs {
-			name: Some("searchable".to_string()),
+			name: Some(name.clone()),
 			exclude_media_on_device: false,
 			mime_types: Vec::new(),
 			file_size_min: None,
