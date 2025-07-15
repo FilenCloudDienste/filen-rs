@@ -18,6 +18,8 @@ use crate::{CacheError, sql};
 const UNAUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const AUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+pub const DB_FILE_NAME: &str = "native_cache.db";
+
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,
 	pub(crate) tmp_dir: PathBuf,
@@ -38,21 +40,24 @@ struct UnauthCacheState {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum AuthStatus {
+// we never actually need to read UnauthCacheState
+// we only need to know if we are authenticated
+#[allow(private_interfaces)]
+pub(crate) enum AuthStatus {
 	Authenticated(AuthCacheState),
 	Unauthenticated(UnauthCacheState),
 }
 
 pub(crate) struct CacheState {
-	status: AuthStatus,
+	pub(crate) status: AuthStatus,
 	auth_file: Arc<PathBuf>, // to allow async access without cloning
-	files_dir: PathBuf,
+	pub(crate) files_dir: PathBuf,
 	last_update: std::sync::RwLock<Option<Instant>>,
 }
 
 #[derive(uniffi::Object)]
 pub struct FilenMobileCacheState {
-	state: Arc<tokio::sync::RwLock<CacheState>>,
+	pub(crate) state: Arc<tokio::sync::RwLock<CacheState>>,
 	state_write_coordinator: tokio::sync::Mutex<()>,
 	// allows spawning async tasks to check if the auth file has been updated
 	// to disable the provider, will always check if currently disabled
@@ -91,7 +96,7 @@ fn init_db(db_path: &Path, state_file_path: &Path) -> Result<Connection, CacheEr
 }
 
 fn db_from_files_dir(files_dir: &Path) -> Result<Connection, CacheError> {
-	let db_path = files_dir.join("native_cache.db");
+	let db_path = files_dir.join(DB_FILE_NAME);
 	let state_file_path = files_dir.join("db_state.json");
 	let state_file = match std::fs::read_to_string(&state_file_path) {
 		Ok(contents) => contents,
@@ -370,7 +375,9 @@ impl FilenMobileCacheState {
 		Some(write_state.downgrade())
 	}
 
-	fn sync_get_cache_state_owned(&self) -> tokio::sync::OwnedRwLockReadGuard<CacheState> {
+	pub(crate) fn sync_get_cache_state_owned(
+		&self,
+	) -> tokio::sync::OwnedRwLockReadGuard<CacheState> {
 		if let Some(state) = self.sync_get_cache_state_owned_inner() {
 			return state;
 		}
@@ -474,14 +481,17 @@ impl FilenMobileCacheState {
 		let state = self.sync_get_cache_state_borrowed();
 		match &state.status {
 			AuthStatus::Authenticated(auth_state) => f(auth_state),
-			AuthStatus::Unauthenticated(unauth_state) => match unauth_state.reason {
-				UnauthReason::Disabled => {
-					Err(CacheError::Disabled("Disabled: sync_execute_authed".into()))
+			AuthStatus::Unauthenticated(unauth_state) => {
+				self.sync_launch_cleanup_task();
+				match unauth_state.reason {
+					UnauthReason::Disabled => {
+						Err(CacheError::Disabled("Disabled: sync_execute_authed".into()))
+					}
+					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
+						"Unauthenticated: sync_execute_authed".into(),
+					)),
 				}
-				UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-					"Unauthenticated: sync_execute_authed".into(),
-				)),
-			},
+			}
 		}
 	}
 
@@ -501,14 +511,17 @@ impl FilenMobileCacheState {
 				});
 				f(new_guard).await
 			}
-			AuthStatus::Unauthenticated(unauth_state) => match unauth_state.reason {
-				UnauthReason::Disabled => Err(CacheError::Disabled(
-					"Disabled: async_execute_authed_owned".into(),
-				)),
-				UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-					"Unauthenticated: async_execute_authed_owned".into(),
-				)),
-			},
+			AuthStatus::Unauthenticated(unauth_state) => {
+				self.async_launch_cleanup_task().await;
+				match unauth_state.reason {
+					UnauthReason::Disabled => Err(CacheError::Disabled(
+						"Disabled: async_execute_authed_owned".into(),
+					)),
+					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
+						"Unauthenticated: async_execute_authed_owned".into(),
+					)),
+				}
+			}
 		}
 	}
 
@@ -529,14 +542,17 @@ impl FilenMobileCacheState {
 				});
 				f(new_guard)
 			}
-			AuthStatus::Unauthenticated(unauth_state) => match unauth_state.reason {
-				UnauthReason::Disabled => Err(CacheError::Disabled(
-					"Disabled: sync_execute_authed_owned".into(),
-				)),
-				UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
-					"Unauthenticated: sync_execute_authed_owned".into(),
-				)),
-			},
+			AuthStatus::Unauthenticated(unauth_state) => {
+				self.sync_launch_cleanup_task();
+				match unauth_state.reason {
+					UnauthReason::Disabled => Err(CacheError::Disabled(
+						"Disabled: sync_execute_authed_owned".into(),
+					)),
+					UnauthReason::Unauthenticated => Err(CacheError::Unauthenticated(
+						"Unauthenticated: sync_execute_authed_owned".into(),
+					)),
+				}
+			}
 		}
 	}
 }
@@ -549,7 +565,7 @@ impl FilenMobileCacheState {
 		debug!(
 			"Initializing FilenMobileCacheState with files_dir: {files_dir} and auth_dir: {auth_file}"
 		);
-		Self {
+		let new = Self {
 			state: Arc::new(tokio::sync::RwLock::new(CacheState {
 				status: AuthStatus::Unauthenticated(UnauthCacheState {
 					reason: UnauthReason::Disabled,
@@ -560,7 +576,9 @@ impl FilenMobileCacheState {
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
 			allow_auth_disable: true,
-		}
+		};
+		new.sync_launch_cleanup_task();
+		new
 	}
 }
 

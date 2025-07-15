@@ -131,6 +131,8 @@ mod uuid {
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
 
 	impl UuidStr {
+		pub const LENGTH: usize = Hyphenated::LENGTH;
+
 		pub fn new_v4() -> Self {
 			Uuid::new_v4().into()
 		}

@@ -24,6 +24,8 @@ pub(crate) const MARK_STALE_WITH_PARENT: &str =
 	include_str!("../../sql/mark_stale_with_parent.sql");
 pub(crate) const DELETE_STALE_WITH_PARENT: &str =
 	include_str!("../../sql/delete_stale_with_parent.sql");
+pub(crate) const SELECT_POS_NOT_IN_UUIDS: &str =
+	include_str!("../../sql/select_pos_not_in_uuids.sql");
 
 // Item/Recents
 pub(crate) const UPDATE_ITEM_SET_RECENT: &str =

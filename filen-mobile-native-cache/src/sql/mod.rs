@@ -385,3 +385,29 @@ pub(crate) fn select_search(
 	)?
 	.collect::<SQLResult<Vec<_>>>()
 }
+
+/// Accepts an iterator over UUIDs
+/// and returns a vector of positions (usize)
+/// which correspond to the indices of the passed UUIDs
+/// which are not in the database.
+pub(crate) fn select_positions_not_in_uuids<I>(conn: &Connection, uuids: I) -> SQLResult<Vec<usize>>
+where
+	I: ExactSizeIterator<Item = UuidStr>,
+{
+	let mut stmt = conn.prepare_cached(SELECT_POS_NOT_IN_UUIDS)?;
+	let mut uuids_json_string = String::with_capacity(
+		uuids.len() * (UuidStr::LENGTH + 3) + if uuids.len() == 0 { 2 } else { 1 },
+	); // 3 for the surrounding quotes and comma, 2 for the brackets - 1 for the last comma
+	uuids_json_string.push('[');
+	for (i, uuid) in uuids.enumerate() {
+		if i > 0 {
+			uuids_json_string.push(',');
+		}
+		uuids_json_string.push('"');
+		uuids_json_string.push_str(uuid.as_ref());
+		uuids_json_string.push('"');
+	}
+	uuids_json_string.push(']');
+	stmt.query_and_then([uuids_json_string], |row| Ok(row.get(0)?))?
+		.collect::<SQLResult<Vec<_>>>()
+}

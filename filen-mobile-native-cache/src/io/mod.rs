@@ -2,11 +2,17 @@ use std::{
 	fs::FileTimes,
 	io::{self},
 	path::{Path, PathBuf},
+	str::FromStr,
 	sync::Arc,
 	time::{Duration, SystemTime},
 };
 
-use crate::{auth::AuthCacheState, ffi::ItemType, traits::ProgressCallback};
+use crate::{
+	auth::{AuthCacheState, AuthStatus, CacheState, DB_FILE_NAME, FilenMobileCacheState},
+	ffi::ItemType,
+	sql,
+	traits::ProgressCallback,
+};
 use filen_sdk_rs::{
 	fs::{
 		HasUUID,
@@ -15,8 +21,10 @@ use filen_sdk_rs::{
 	io::FilenMetaExt,
 };
 use filen_types::{crypto::Sha512Hash, fs::UuidStr};
+use futures::{StreamExt, stream::FuturesUnordered};
+use log::{debug, error, info, trace};
 use sha2::Digest;
-use tokio::{io::AsyncReadExt, sync::mpsc::UnboundedReceiver};
+use tokio::{fs::DirEntry, io::AsyncReadExt, sync::mpsc::UnboundedReceiver};
 use tokio_util::compat::{
 	FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
 };
@@ -40,16 +48,17 @@ const THUMBNAIL_DIR: &str = "thumbnails";
 const BUFFER_SIZE: u64 = 64 * 1024; // 64 KiB
 const CALLBACK_INTERVAL: Duration = Duration::from_millis(200);
 
-pub(crate) fn init(files_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+fn get_paths(files_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
 	let cache_dir = files_path.join(CACHE_DIR);
-	std::fs::create_dir_all(&cache_dir)?;
-
 	let tmp_dir = files_path.join(TMP_DIR);
-	std::fs::create_dir_all(&tmp_dir)?;
-
-	std::fs::create_dir_all(files_path.join("dir"))?;
-
 	let thumbnail_dir = files_path.join(THUMBNAIL_DIR);
+	(cache_dir, tmp_dir, thumbnail_dir)
+}
+
+pub(crate) fn init(files_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+	let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(files_path);
+	std::fs::create_dir_all(&cache_dir)?;
+	std::fs::create_dir_all(&tmp_dir)?;
 	std::fs::create_dir_all(&thumbnail_dir)?;
 	Ok((cache_dir, tmp_dir, thumbnail_dir))
 }
@@ -287,5 +296,150 @@ impl AuthCacheState {
 		} else {
 			Ok(())
 		}
+	}
+}
+
+async fn remove_dir_all_if_exists(path: &Path) {
+	match tokio::fs::remove_dir_all(path).await {
+		Ok(_) => {}
+		Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+		Err(e) => {
+			error!("Failed to remove directory {}: {}", path.display(), e);
+		}
+	}
+}
+
+async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
+	let Ok(mut dir) = tokio::fs::read_dir(dir_path).await else {
+		log::warn!(
+			"Tried to clean up directory {}, but it does not exist.",
+			dir_path.display()
+		);
+		return;
+	};
+
+	let mut uuids: Vec<(UuidStr, DirEntry)> = Vec::new();
+
+	loop {
+		match dir.next_entry().await {
+			Ok(Some(entry)) => {
+				if let Ok(uuid) = UuidStr::from_str(&entry.file_name().to_string_lossy()) {
+					uuids.push((uuid, entry));
+				}
+			}
+			Ok(None) => break,
+			Err(e) => {
+				error!("Failed to read directory {}: {}", dir_path.display(), e);
+				return;
+			}
+		}
+	}
+
+	let Ok(removed_uuid_positions) =
+		sql::select_positions_not_in_uuids(&auth_state.conn(), uuids.iter().map(|(uuid, _)| *uuid))
+	else {
+		error!(
+			"Failed to select positions not in uuids for directory {}",
+			dir_path.display()
+		);
+		return;
+	};
+
+	let mut futures = FuturesUnordered::new();
+
+	for i in removed_uuid_positions {
+		let entry = &uuids[i].1;
+		futures.push(async move {
+			let path = entry.path();
+			match entry.metadata().await {
+				Ok(meta) if meta.is_file() => match tokio::fs::remove_file(&path).await {
+					Ok(_) => {
+						trace!("Removed file: {}", path.display());
+					}
+					Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+					Err(e) => {
+						error!("Failed to remove file {}: {}", path.display(), e);
+					}
+				},
+				Ok(_) => match tokio::fs::remove_dir_all(&path).await {
+					Ok(_) => {
+						trace!("Removed directory: {}", path.display());
+					}
+					Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+					Err(e) => {
+						error!("Failed to remove directory {}: {}", path.display(), e);
+					}
+				},
+				Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+				Err(e) => {
+					error!("Failed to get metadata for {}: {}", path.display(), e);
+				}
+			}
+		});
+	}
+
+	while (futures.next().await).is_some() {}
+}
+
+impl CacheState {
+	pub(crate) async fn cleanup_cache(&self) {
+		debug!("Cleaning up cache at {}", self.files_dir.display());
+		match self.status {
+			AuthStatus::Authenticated(ref auth_state) => {
+				debug!("Authenticated, cleaning up old files in cache directories");
+				futures::join!(
+					cleanup_uuid_dir(auth_state, &auth_state.cache_dir),
+					cleanup_uuid_dir(auth_state, &auth_state.tmp_dir),
+					cleanup_uuid_dir(auth_state, &auth_state.thumbnail_dir)
+				);
+			}
+			_ => {
+				debug!("Not authenticated, removing all cache directories and database file");
+				let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(&self.files_dir);
+				let db_file = self.files_dir.join(DB_FILE_NAME);
+				futures::join!(
+					remove_dir_all_if_exists(&cache_dir),
+					remove_dir_all_if_exists(&tmp_dir),
+					remove_dir_all_if_exists(&thumbnail_dir),
+					async {
+						// we can delete the db here because we are not authenticated
+						// so we know there is no database connection open
+						match tokio::fs::remove_file(&db_file).await {
+							Ok(_) => info!("Removed database file: {}", db_file.display()),
+							Err(e) if e.kind() == io::ErrorKind::NotFound => {
+								info!(
+									"Database file not found, nothing to remove: {}",
+									db_file.display()
+								);
+							}
+							Err(e) => {
+								error!(
+									"Failed to remove database file {}: {}",
+									db_file.display(),
+									e
+								);
+							}
+						}
+					}
+				);
+			}
+		};
+	}
+}
+
+impl FilenMobileCacheState {
+	pub(crate) async fn async_launch_cleanup_task(&self) {
+		trace!("Launching cleanup task asynchronously");
+		let cache = self.async_get_cache_state_owned().await;
+		crate::env::get_runtime().spawn(async move {
+			cache.cleanup_cache().await;
+		});
+	}
+	pub(crate) fn sync_launch_cleanup_task(&self) {
+		trace!("Launching cleanup task synchronously");
+		let cache = self.sync_get_cache_state_owned();
+		crate::env::get_runtime().spawn(async move {
+			cache.cleanup_cache().await;
+		});
 	}
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_mobile_native_cache::{
-	auth::{AuthFile, FilenMobileCacheState},
+	auth::{AuthFile, DB_FILE_NAME, FilenMobileCacheState},
 	ffi::{FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs},
 	traits::ProgressCallback,
 };
@@ -4086,7 +4086,7 @@ pub async fn test_init_from_file() {
 	let auth_file = tmp_dir.join("auth.json").to_string_lossy().into_owned();
 	tokio::fs::write(&auth_file, json_config).await.unwrap();
 	let files_path = tmp_dir.join("files").to_string_lossy().into_owned();
-	tokio::fs::remove_file(&format!("{files_path}/native_cache.db"))
+	tokio::fs::remove_file(&format!("{files_path}/{DB_FILE_NAME}"))
 		.await
 		.ok();
 	tokio::fs::create_dir_all(&files_path).await.unwrap();
