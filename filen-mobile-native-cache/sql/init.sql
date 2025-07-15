@@ -2,7 +2,7 @@ PRAGMA recursive_triggers = TRUE;
 PRAGMA journal_mode = WAL;
 PRAGMA temp_store = MEMORY;
 
-CREATE TABLE IF NOT EXISTS items (
+CREATE TABLE items (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
 	uuid TEXT NOT NULL UNIQUE,
 	parent TEXT,
@@ -21,21 +21,19 @@ CREATE TABLE IF NOT EXISTS items (
 	parent_path TEXT
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_name_parent_stale
+CREATE UNIQUE INDEX idx_unique_name_parent_stale
 ON items (name, parent, is_stale)
 WHERE parent != 'trash';
 
-INSERT OR IGNORE INTO items (uuid, parent, name, type)
+INSERT INTO items (uuid, parent, name, type)
 VALUES ('trash', NULL, 'Trash', 1);
 
-CREATE INDEX IF NOT EXISTS idx_items_uuid ON items (uuid);
-CREATE INDEX IF NOT EXISTS idx_items_parent ON items (parent);
-CREATE INDEX IF NOT EXISTS idx_items_is_recent ON items (is_recent);
-CREATE INDEX IF NOT EXISTS idx_items_has_search ON items (
-	parent_path IS NOT NULL
-);
+CREATE INDEX idx_items_uuid ON items (uuid);
+CREATE INDEX idx_items_parent ON items (parent);
+CREATE INDEX idx_items_is_recent ON items (is_recent);
+CREATE INDEX idx_items_has_search ON items (parent_path IS NOT NULL);
 
-CREATE TABLE IF NOT EXISTS roots (
+CREATE TABLE roots (
 	id BIGINT PRIMARY KEY NOT NULL,
 	storage_used BIGINT NOT NULL DEFAULT 0,
 	max_storage BIGINT NOT NULL DEFAULT 0,
@@ -43,10 +41,10 @@ CREATE TABLE IF NOT EXISTS roots (
 	FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_stale_items ON items (parent)
+CREATE INDEX idx_stale_items ON items (parent)
 WHERE is_stale = TRUE;
 
-CREATE TABLE IF NOT EXISTS files (
+CREATE TABLE files (
 	id BIGINT PRIMARY KEY NOT NULL,
 	mime TEXT NOT NULL,
 	file_key TEXT NOT NULL,
@@ -62,7 +60,7 @@ CREATE TABLE IF NOT EXISTS files (
 	FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS dirs (
+CREATE TABLE dirs (
 	id BIGINT PRIMARY KEY NOT NULL,
 	created BIGINT,
 	favorite_rank INTEGER NOT NULL DEFAULT 0, -- IOS uses this for sorting
@@ -71,7 +69,7 @@ CREATE TABLE IF NOT EXISTS dirs (
 	FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE
 );
 
-CREATE TRIGGER IF NOT EXISTS cascade_on_update_uuid_delete_children
+CREATE TRIGGER cascade_on_update_uuid_delete_children
 AFTER UPDATE OF uuid ON items
 FOR EACH ROW
 WHEN old.uuid != new.uuid AND old.type != 2 -- Ensure it's not a file
@@ -80,7 +78,7 @@ DELETE FROM items
 WHERE parent = old.uuid AND parent_path IS NULL;
 END;
 
-CREATE TRIGGER IF NOT EXISTS cascade_on_delete_delete_children
+CREATE TRIGGER cascade_on_delete_delete_children
 AFTER DELETE ON items
 FOR EACH ROW
 WHEN old.type != 2 -- Ensure it's not a file
