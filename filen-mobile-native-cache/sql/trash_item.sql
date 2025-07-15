@@ -1,3 +1,3 @@
 UPDATE items SET
-    parent = 'trash'
+	parent = 'trash'
 WHERE uuid = ?;

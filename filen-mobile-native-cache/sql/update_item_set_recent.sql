@@ -1,1 +1,2 @@
-UPDATE items SET is_recent = TRUE WHERE id = ?;
+UPDATE items SET is_recent = TRUE
+WHERE id = ?;

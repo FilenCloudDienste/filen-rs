@@ -1,0 +1,9 @@
+[sqlfluff]
+dialect = sqlite
+
+[sqlfluff:indentation]
+indent_unit = tab
+tab_space_size = 4
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = upper
