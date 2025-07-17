@@ -118,6 +118,12 @@ fn db_from_files_dir(files_dir: &Path) -> Result<Connection, CacheError> {
 			saved_state.db_hash
 		);
 		init_db(&db_path, &state_file_path)
+	} else if !db_path.exists() {
+		log::info!(
+			"Database file does not exist, creating new one: {}",
+			db_path.display()
+		);
+		init_db(&db_path, &state_file_path)
 	} else {
 		log::info!(
 			"Database hash matches, using existing database: {}",
