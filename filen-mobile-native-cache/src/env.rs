@@ -12,7 +12,17 @@ pub(crate) fn init_logger() {
 	});
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "ios")]
+pub(crate) fn init_logger() {
+	INIT_LOGGER.get_or_init(|| {
+		let _ = oslog::OsLogger::new("io.filen.app.FilenFileProvider")
+			.level_filter(log::LevelFilter::Debug)
+			.init()
+			.unwrap();
+	});
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) fn init_logger() {
 	println!("Initializing logger");
 	INIT_LOGGER.get_or_init(|| {
