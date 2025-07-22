@@ -22,11 +22,11 @@ jobs:
         with:
           prefix-key: cargo-build-${{ runner.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Setup Cpp
-        uses: aminya/setup-cpp@v1
-        with:
-          compiler: llvm
-          cmake: true
+      - name: Install C++ Build Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
       - name: Run rustfmt
