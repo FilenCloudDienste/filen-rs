@@ -7,7 +7,9 @@ use cmake::Config;
 
 fn main() {
 	println!("cargo:rerun-if-changed=wrapper.h");
-	println!("cargo:rustc-link-lib=c++");
+	if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
+		println!("cargo:rustc-link-lib=c++");
+	}
 
 	let libde265_path = build_libde265();
 	let libheif_path = build_libheif(&libde265_path);
