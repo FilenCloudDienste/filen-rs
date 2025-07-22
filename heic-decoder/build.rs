@@ -95,7 +95,12 @@ fn build_libde265() -> PathBuf {
 	let dst = config.build();
 	println!("cargo:rerun-if-changed=deps/libde265");
 	println!("cargo:rustc-link-search=native={}/lib", dst.display());
-	println!("cargo:rustc-link-lib=static=de265");
+
+	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+		println!("cargo:rustc-link-lib=static=libde265");
+	} else {
+		println!("cargo:rustc-link-lib=static=de265");
+	}
 
 	dst
 }
@@ -107,7 +112,12 @@ fn build_libheif(libde265_path: &Path) -> PathBuf {
 	config_cmake_for_libcxx(&mut config);
 
 	config.define("LIBDE265_INCLUDE_DIR", libde265_path.join("include"));
-	config.define("LIBDE265_LIBRARY", libde265_path.join("lib/libde265.a"));
+
+	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+		config.define("LIBDE265_LIBRARY", libde265_path.join("lib/libde265.lib"));
+	} else {
+		config.define("LIBDE265_LIBRARY", libde265_path.join("lib/libde265.a"));
+	}
 
 	config.define("WITH_LIBDE265", "ON");
 
