@@ -69,10 +69,22 @@ fn config_cmake_for_macos(config: &mut Config) {
 	config.define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
 }
 
+fn config_cmake_for_libcxx(config: &mut Config) {
+	// Force CMake to use libc++ instead of libstdc++
+	config.define("CMAKE_CXX_FLAGS", "-stdlib=libc++");
+	config.define("CMAKE_EXE_LINKER_FLAGS", "-stdlib=libc++");
+	config.define("CMAKE_SHARED_LINKER_FLAGS", "-stdlib=libc++");
+
+	// Ensure we're using clang++ for consistency
+	config.define("CMAKE_CXX_COMPILER", "clang++");
+	config.define("CMAKE_C_COMPILER", "clang");
+}
+
 fn build_libde265() -> PathBuf {
 	let mut config = Config::new("deps/libde265");
 	config_cmake_for_android(&mut config);
 	config_cmake_for_macos(&mut config);
+	config_cmake_for_libcxx(&mut config);
 
 	// ideally I'd also want to disable DEC265 here, but there's no way to do that with cmake
 	config.define("ENABLE_SDL", "OFF");
@@ -92,6 +104,7 @@ fn build_libheif(libde265_path: &Path) -> PathBuf {
 	let mut config = Config::new("deps/libheif");
 	config_cmake_for_android(&mut config);
 	config_cmake_for_macos(&mut config);
+	config_cmake_for_libcxx(&mut config);
 
 	config.define("LIBDE265_INCLUDE_DIR", libde265_path.join("include"));
 	config.define("LIBDE265_LIBRARY", libde265_path.join("lib/libde265.a"));
