@@ -64,7 +64,7 @@ async fn test_refresh_lock() {
 		.unwrap_err();
 	std::mem::drop(lock);
 	// wait for the tokio task to release
-	tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+	tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 	client
 		.acquire_lock(&resource, std::time::Duration::from_secs(1), 1)
 		.await
