@@ -304,36 +304,36 @@ impl std::fmt::Display for HeifError {
 }
 impl std::error::Error for HeifError {}
 
-#[cfg(test)]
-mod tests {
-	use super::*;
+// #[cfg(test)]
+// mod tests {
+// 	use super::*;
 
-	const TEST_HEIC_FILE: &str = "/path/to/your/test.heic"; // Update this path to a valid HEIC file for testing
-	const TEST_OUTPUT_DIR: &str = "/path/to/output/"; // Update this path to a valid output directory
+// 	const TEST_HEIC_FILE: &str = "/Users/end/Documents/tmp/image1.heic"; // Update this path to a valid HEIC file for testing
+// 	const TEST_OUTPUT_DIR: &str = "/Users/end/Documents/tmp/"; // Update this path to a valid output directory
 
-	// very basic tests for now
+// 	// very basic tests for now
 
-	#[test]
-	fn test_reader() {
-		let heic_file = std::fs::File::open(TEST_HEIC_FILE).unwrap();
-		let file_size = heic_file.metadata().unwrap().len();
-		let image = try_get_rgba_image_from_reader(heic_file, file_size).unwrap();
-		let mut file = std::fs::File::create(format!("{TEST_OUTPUT_DIR}/from_reader.png")).unwrap();
-		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
-	}
+// 	#[test]
+// 	fn test_reader() {
+// 		let heic_file = std::fs::File::open(TEST_HEIC_FILE).unwrap();
+// 		let file_size = heic_file.metadata().unwrap().len();
+// 		let image = try_get_rgba_image_from_reader(heic_file, file_size).unwrap();
+// 		let mut file = std::fs::File::create(format!("{TEST_OUTPUT_DIR}/from_reader.png")).unwrap();
+// 		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
+// 	}
 
-	#[test]
-	fn test_file() {
-		let image = try_get_rgba_image_from_file(TEST_HEIC_FILE).unwrap();
-		let mut file = std::fs::File::create(format!("{TEST_OUTPUT_DIR}/from_file.png")).unwrap();
-		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
-	}
+// 	#[test]
+// 	fn test_file() {
+// 		let image = try_get_rgba_image_from_file(TEST_HEIC_FILE).unwrap();
+// 		let mut file = std::fs::File::create(format!("{TEST_OUTPUT_DIR}/from_file.png")).unwrap();
+// 		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
+// 	}
 
-	#[test]
-	fn test_slice() {
-		let heic_data = std::fs::read(TEST_HEIC_FILE).unwrap();
-		let image = try_get_rgba_image_from_slice(&heic_data).unwrap();
-		let mut file = std::fs::File::create(format!("{TEST_OUTPUT_DIR}/from_slice.png")).unwrap();
-		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
-	}
-}
+// 	#[test]
+// 	fn test_slice() {
+// 		let heic_data = std::fs::read(TEST_HEIC_FILE).unwrap();
+// 		let image = try_get_rgba_image_from_slice(&heic_data).unwrap();
+// 		let mut file = std::fs::File::create(format!("{TEST_OUTPUT_DIR}/from_slice.png")).unwrap();
+// 		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
+// 	}
+// }
