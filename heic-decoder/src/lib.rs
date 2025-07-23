@@ -16,6 +16,10 @@ struct HeicContext<'a> {
 	_lifetime: PhantomData<&'a [u8]>,
 }
 
+// Safety: This is a read only error type pointing to a string literal, so it is safe to send across threads.
+unsafe impl Send for heif_error {}
+unsafe impl Sync for heif_error {}
+
 impl HeicContext<'_> {
 	fn from_slice(data: &[u8]) -> Result<Self, HeifError> {
 		let context = unsafe { heif_context_alloc() };
@@ -302,6 +306,7 @@ impl std::fmt::Display for HeifError {
 		)
 	}
 }
+
 impl std::error::Error for HeifError {}
 
 // #[cfg(test)]

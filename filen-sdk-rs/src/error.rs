@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum Error {
 	#[error("Request Error: `{0}`")]
 	RequestError(#[from] filen_types::error::ResponseError),
-	#[error("Reqwest Error: `{0}`")]
+	#[error("Reqwest Error: `{0:?}`")]
 	ReqwestError(#[from] reqwest::Error),
 	#[error("`{0}` context: `{1}`")]
 	ErrorWithContext(Box<Error>, &'static str),
@@ -29,6 +29,9 @@ pub enum Error {
 	InvalidName(String),
 	#[error("Image error: '{0}'")]
 	ImageError(#[from] ImageError),
+	#[cfg(feature = "heic")]
+	#[error("HEIC decoding error: `{0}`")]
+	HeifError(#[from] heic_decoder::HeifError),
 }
 
 impl From<filen_types::error::ConversionError> for Error {

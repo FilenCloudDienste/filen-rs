@@ -71,6 +71,28 @@ fn config_cmake_for_macos(config: &mut Config) {
 	config.define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
 }
 
+fn config_cmake_for_ios(config: &mut Config) {
+	println!("cargo:warning=checking if Building for iOS");
+	if env::var("CARGO_CFG_TARGET_OS")
+		.ok()
+		.is_none_or(|os| os != "ios")
+	{
+		println!("cargo:warning=Not building for iOS, skipping iOS configuration");
+		return;
+	}
+
+	let deployment_target = env::var("DEPLOYMENT_TARGET").unwrap_or_else(|_| "12.0".to_string());
+	config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
+
+	println!("cargo:warning=Building for iOS, deployment target: {deployment_target}");
+
+	if env::var("TARGET").unwrap().contains("ios-sim") {
+		config.define("CMAKE_OSX_SYSROOT", "iphonesimulator");
+	} else {
+		config.define("CMAKE_OSX_SYSROOT", "iphoneos");
+	}
+}
+
 fn config_cmake_for_libcxx(config: &mut Config) {
 	// Force CMake to use libc++ instead of libstdc++
 	config.define("CMAKE_CXX_FLAGS", "-stdlib=libc++");
@@ -87,6 +109,7 @@ fn build_libde265() -> PathBuf {
 	config_cmake_for_android(&mut config);
 	config_cmake_for_macos(&mut config);
 	config_cmake_for_libcxx(&mut config);
+	config_cmake_for_ios(&mut config);
 
 	// ideally I'd also want to disable DEC265 here, but there's no way to do that with cmake
 	config.define("ENABLE_SDL", "OFF");
@@ -112,6 +135,7 @@ fn build_libheif(libde265_path: &Path) -> PathBuf {
 	config_cmake_for_android(&mut config);
 	config_cmake_for_macos(&mut config);
 	config_cmake_for_libcxx(&mut config);
+	config_cmake_for_ios(&mut config);
 
 	config.define("LIBDE265_INCLUDE_DIR", libde265_path.join("include"));
 
