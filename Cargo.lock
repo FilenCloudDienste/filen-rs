@@ -838,6 +838,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "generic-array 1.2.0",
+ "heic-decoder",
  "hkdf",
  "hmac",
  "image",

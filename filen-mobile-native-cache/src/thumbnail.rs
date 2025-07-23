@@ -70,24 +70,30 @@ impl AuthCacheState {
 			}
 		};
 
-		let (file, mut thumbnail_file) =
+		let (os_file, mut thumbnail_file) =
 			futures::join!(image_file.into_std(), thumbnail_file.into_std());
 
-		if let Err(e) = tokio::task::spawn_blocking(move || -> Result<(), ImageError> {
-			let image_reader = std::io::BufReader::new(file);
-			filen_sdk_rs::thumbnail::make_thumbnail(
-				image_reader,
-				target_width,
-				target_height,
-				&mut thumbnail_file,
-			)?;
-			Ok(())
-		})
-		.await
-		.unwrap()
+		let mime = file.mime().to_string();
+		let size = file.size();
+
+		if let Err(e) =
+			tokio::task::spawn_blocking(move || -> Result<(), filen_sdk_rs::error::Error> {
+				let image_reader = std::io::BufReader::new(os_file);
+				filen_sdk_rs::thumbnail::make_thumbnail(
+					&mime,
+					size,
+					image_reader,
+					target_width,
+					target_height,
+					&mut thumbnail_file,
+				)?;
+				Ok(())
+			})
+			.await
+			.unwrap()
 		{
 			tokio::fs::remove_file(&thumbnail_path).await?;
-			if let ImageError::Unsupported(_) = e {
+			if let filen_sdk_rs::error::Error::ImageError(ImageError::Unsupported(_)) = e {
 				Ok(None)
 			} else {
 				Err(CacheError::from(e))

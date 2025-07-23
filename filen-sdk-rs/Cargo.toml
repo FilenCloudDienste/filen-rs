@@ -7,12 +7,14 @@ edition = "2024"
 default = []
 tokio = ["tokio/rt", "tokio-stream", "tokio-util"]
 malformed = []
+heic = ["dep:heic-decoder"]
 
 [dependencies]
 reqwest = { version = "0.12.15", features = ["json", "stream", "rustls-tls"], default-features = false}
 
 
 filen-types = { path = "../filen-types" }
+heic-decoder = { path = "../heic-decoder", optional = true}
 rand = "0.9.0"
 old_rng = {package = "rand", version="0.8.5"} # for compatibility with rsa 0.9.8
 aes-gcm = { version = "0.10.3", features = ["std"] }
