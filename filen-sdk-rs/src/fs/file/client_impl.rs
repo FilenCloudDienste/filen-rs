@@ -21,7 +21,6 @@ use crate::{
 
 use super::{
 	BaseFile, FileBuilder, RemoteFile,
-	meta::DecryptedFileMeta,
 	read::FileReader,
 	traits::{File, UpdateFileMeta},
 	write::FileWriter,
@@ -117,11 +116,7 @@ impl Client {
 
 	pub async fn get_file(&self, uuid: UuidStr) -> Result<RemoteFile, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
-		let meta = DecryptedFileMeta::from_encrypted(
-			&response.metadata,
-			self.crypter(),
-			response.version,
-		)?;
+		let meta = FileMeta::from_encrypted(response.metadata, self.crypter(), response.version);
 		Ok(RemoteFile::from_meta(
 			uuid,
 			// v3 api returns the original parent as the parent if the file is in the trash

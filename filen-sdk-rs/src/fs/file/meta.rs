@@ -194,32 +194,6 @@ pub struct DecryptedFileMeta<'a> {
 }
 
 impl<'a> DecryptedFileMeta<'a> {
-	pub(crate) fn from_encrypted(
-		meta: &EncryptedString,
-		decrypter: &impl MetaCrypter,
-		file_encryption_version: FileEncryptionVersion,
-	) -> Result<Self, Error> {
-		let decrypted = decrypter.decrypt_meta(meta)?;
-		let seed = FileMetaSeed(file_encryption_version);
-		let meta = seed
-			.deserialize(&mut serde_json::Deserializer::from_str(&decrypted))?
-			.into_owned();
-		Ok(meta)
-	}
-
-	pub(crate) fn from_rsa_encrypted(
-		meta: &RSAEncryptedString,
-		private_key: &RsaPrivateKey,
-		file_encryption_version: FileEncryptionVersion,
-	) -> Result<Self, Error> {
-		let decrypted = crypto::rsa::decrypt_with_private_key(private_key, meta)?;
-		let seed = FileMetaSeed(file_encryption_version);
-		let meta = seed
-			.deserialize(&mut serde_json::Deserializer::from_slice(&decrypted))?
-			.into_owned();
-		Ok(meta)
-	}
-
 	pub fn into_owned(self) -> DecryptedFileMeta<'static> {
 		DecryptedFileMeta {
 			name: Cow::Owned(self.name.into_owned()),

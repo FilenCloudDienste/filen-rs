@@ -19,7 +19,7 @@ use crate::{
 			traits::HasDirMeta,
 		},
 		enums::FSObject,
-		file::{RemoteFile, meta::DecryptedFileMeta},
+		file::{RemoteFile, meta::FileMeta},
 	},
 	io::FilenMetaExt,
 	util::PathIteratorExt,
@@ -137,8 +137,7 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
-				let meta =
-					DecryptedFileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
+				let meta = FileMeta::from_encrypted(f.metadata, self.crypter(), f.version);
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,
@@ -194,8 +193,7 @@ impl Client {
 				let decrypted_size = decrypted_size
 					.parse::<u64>()
 					.map_err(|_| Error::Custom("Failed to parse decrypted size".to_string()))?;
-				let meta =
-					DecryptedFileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
+				let meta = FileMeta::from_encrypted(f.metadata, self.crypter(), f.version);
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,

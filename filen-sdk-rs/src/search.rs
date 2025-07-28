@@ -14,7 +14,7 @@ use crate::{
 	fs::{
 		HasName, HasType, HasUUID, NonRootFSObject,
 		dir::{DecryptedDirectoryMeta, RemoteDirectory},
-		file::{RemoteFile, meta::DecryptedFileMeta},
+		file::{RemoteFile, meta::FileMeta},
 	},
 };
 
@@ -174,11 +174,11 @@ impl Client {
 						found_dir.metadata_path,
 					),
 					SearchFindItem::File(found_file) => {
-						let meta = DecryptedFileMeta::from_encrypted(
-							&found_file.metadata,
+						let meta = FileMeta::from_encrypted(
+							found_file.metadata,
 							self.crypter(),
 							found_file.version,
-						)?;
+						);
 						(
 							NonRootFSObject::File(Cow::Owned(RemoteFile::from_meta(
 								found_file.uuid,

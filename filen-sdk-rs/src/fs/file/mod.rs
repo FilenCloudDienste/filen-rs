@@ -237,11 +237,11 @@ impl RemoteFile {
 		region: impl Into<String>,
 		bucket: impl Into<String>,
 		favorited: bool,
-		meta: DecryptedFileMeta<'static>,
+		meta: FileMeta<'static>,
 	) -> Self {
 		Self {
 			uuid,
-			meta: FileMeta::Decoded(meta),
+			meta,
 			parent,
 			size,
 			favorited,
@@ -250,9 +250,6 @@ impl RemoteFile {
 			chunks,
 		}
 	}
-	// pub fn inner_file(&self) -> &RootFile {
-	// 	&self.file
-	// }
 }
 
 pub struct FlatRemoteFile {
@@ -418,11 +415,11 @@ impl RemoteRootFile {
 		chunks: u64,
 		region: impl Into<String>,
 		bucket: impl Into<String>,
-		meta: DecryptedFileMeta<'static>,
+		meta: FileMeta<'static>,
 	) -> Self {
 		Self {
 			uuid,
-			meta: FileMeta::Decoded(meta),
+			meta,
 			size,
 			region: region.into(),
 			bucket: bucket.into(),

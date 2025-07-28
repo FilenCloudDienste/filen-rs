@@ -27,7 +27,7 @@ use crate::{
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
 		dir::{HasUUIDContents, RemoteDirectory},
-		file::{RemoteFile, meta::DecryptedFileMeta},
+		file::{RemoteFile, meta::FileMeta},
 	},
 };
 
@@ -701,8 +701,7 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
-				let meta =
-					DecryptedFileMeta::from_encrypted(&f.metadata, link.crypter(), f.version)?;
+				let meta = FileMeta::from_encrypted(f.metadata, link.crypter(), f.version);
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent.into(),

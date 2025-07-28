@@ -155,24 +155,6 @@ pub struct DecryptedDirectoryMeta<'a> {
 }
 
 impl<'a> DecryptedDirectoryMeta<'a> {
-	pub fn from_encrypted(
-		encrypted: &EncryptedString,
-		decrypter: &impl MetaCrypter,
-	) -> Result<Self, crate::error::Error> {
-		let decrypted = decrypter.decrypt_meta(encrypted)?;
-		let meta = serde_json::from_str(&decrypted)?;
-		Ok(meta)
-	}
-
-	pub fn from_rsa_encrypted(
-		encrypted: &RSAEncryptedString,
-		decrypter: &RsaPrivateKey,
-	) -> Result<Self, crate::error::Error> {
-		let decrypted = crypto::rsa::decrypt_with_private_key(decrypter, encrypted)?;
-		let meta = serde_json::from_slice(decrypted.as_ref())?;
-		Ok(meta)
-	}
-
 	pub fn name(&self) -> &str {
 		&self.name
 	}
