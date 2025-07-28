@@ -6,8 +6,11 @@ use filen_sdk_rs::{
 	connect::PasswordState,
 	fs::{
 		HasName, HasUUID,
-		dir::traits::HasDirMeta,
-		file::traits::{HasFileInfo, HasFileMeta, HasRemoteFileInfo},
+		dir::meta::DirectoryMetaChanges,
+		file::{
+			meta::FileMetaChanges,
+			traits::{HasFileInfo, HasRemoteFileInfo},
+		},
 	},
 	sync::lock::ResourceLock,
 };
@@ -94,26 +97,34 @@ async fn dir_public_link() {
 	assert!(sub_files.contains(&sub_sub_file));
 	assert_eq!(sub_files.len(), 3);
 
-	let mut meta = sub_sub_file.get_meta();
-	meta.set_name("new_file_name.txt").unwrap();
 	client
-		.update_file_metadata(&mut sub_sub_file, meta)
+		.update_file_metadata(
+			&mut sub_sub_file,
+			FileMetaChanges::default()
+				.name("new_file_name.txt".to_string())
+				.unwrap(),
+		)
 		.await
 		.unwrap();
 
 	let (_, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
-	let found_file = sub_files.iter().find(|f| f.name() == "new_file_name.txt");
+	let found_file = sub_files
+		.iter()
+		.find(|f| f.name().is_some_and(|n| n == "new_file_name.txt"));
 	assert!(found_file.is_some());
 
-	let mut meta = sub_dir.get_meta();
-	meta.set_name("new_dir_name").unwrap();
 	client
-		.update_dir_metadata(&mut sub_dir, meta)
+		.update_dir_metadata(
+			&mut sub_dir,
+			DirectoryMetaChanges::default()
+				.name("new_dir_name".to_string())
+				.unwrap(),
+		)
 		.await
 		.unwrap();
 	let (dirs, _) = client.list_linked_dir(&dir, &link).await.unwrap();
 	assert_eq!(dirs.len(), 1);
-	assert_eq!(dirs[0].name(), "new_dir_name");
+	assert_eq!(dirs[0].name(), Some("new_dir_name"));
 
 	client.trash_dir(&mut sub_sub_dir).await.unwrap();
 	client.trash_file(&mut sub_sub_file).await.unwrap();
@@ -156,8 +167,8 @@ async fn file_public_link() {
 
 	let linked_info = client.get_linked_file(&link).await.unwrap();
 	assert_eq!(linked_info.uuid, file.uuid());
-	assert_eq!(linked_info.name, file.name());
-	assert_eq!(linked_info.mime, file.mime());
+	assert_eq!(linked_info.name, file.name().unwrap());
+	assert_eq!(linked_info.mime, file.mime().unwrap());
 	assert_eq!(
 		&PasswordState::Hashed(linked_info.hashed_password.clone().unwrap()),
 		found_link.password()
@@ -170,9 +181,15 @@ async fn file_public_link() {
 	let found_linked_info = client.get_linked_file(&found_link).await.unwrap();
 	assert_eq!(found_linked_info, linked_info);
 
-	let mut meta = file.get_meta();
-	meta.set_name("new_file_name.txt").unwrap();
-	client.update_file_metadata(&mut file, meta).await.unwrap();
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name("new_file_name.txt".to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
 	let linked_info = client.get_linked_file(&link).await.unwrap();
 	assert_eq!(linked_info.name, "new_file_name.txt");
 }
@@ -412,23 +429,35 @@ async fn share_dir() {
 	assert_eq!(shared_files_out[0].get_file(), &dir_file);
 
 	// change metadata
-	let mut meta = dir.get_meta();
-	meta.set_name("new_name").unwrap();
-	client.update_dir_metadata(&mut dir, meta).await.unwrap();
-
-	let mut meta = dir_file.get_meta();
-	meta.set_name("new_file_name.txt").unwrap();
 	client
-		.update_file_metadata(&mut dir_file, meta)
+		.update_dir_metadata(
+			&mut dir,
+			DirectoryMetaChanges::default()
+				.name("new_name".to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	client
+		.update_file_metadata(
+			&mut dir_file,
+			FileMetaChanges::default()
+				.name("new_file_name.txt".to_string())
+				.unwrap(),
+		)
 		.await
 		.unwrap();
 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
 	assert_eq!(shared_dirs_in.len(), 1);
-	assert_eq!(shared_dirs_in[0].get_dir().name(), "new_name");
+	assert_eq!(shared_dirs_in[0].get_dir().name().unwrap(), "new_name");
 
 	let (_, shared_files_in) = share_client.list_in_shared_dir(&dir).await.unwrap();
 	assert_eq!(shared_files_in.len(), 1);
-	assert_eq!(shared_files_in[0].get_file().name(), "new_file_name.txt");
+	assert_eq!(
+		shared_files_in[0].get_file().name().unwrap(),
+		"new_file_name.txt"
+	);
 }
 
 #[shared_test_runtime]
@@ -468,17 +497,24 @@ async fn share_file() {
 	let buf = client.download_file(shared_file).await.unwrap();
 	assert_eq!(buf, b"Hello, world!");
 
-	let mut meta = file.get_meta();
-	meta.set_name("new_file_name.txt").unwrap();
 	let new_created = Utc::now();
-	meta.set_created(new_created);
-	client.update_file_metadata(&mut file, meta).await.unwrap();
+	let changes = FileMetaChanges::default()
+		.name("new_file_name.txt".to_string())
+		.unwrap()
+		.created(Some(new_created));
+	client
+		.update_file_metadata(&mut file, changes)
+		.await
+		.unwrap();
 
 	let (_, shared_files_in) = share_client.list_in_shared().await.unwrap();
 	assert_eq!(shared_files_in.len(), 1);
-	assert_eq!(shared_files_in[0].get_file().name(), "new_file_name.txt");
 	assert_eq!(
-		shared_files_in[0].get_file().created(),
+		shared_files_in[0].get_file().name().unwrap(),
+		"new_file_name.txt"
+	);
+	assert_eq!(
+		shared_files_in[0].get_file().created().unwrap(),
 		new_created.round_subsecs(3),
 		"created date not updated"
 	);

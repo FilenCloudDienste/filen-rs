@@ -29,6 +29,8 @@ pub enum Error {
 	InvalidName(String),
 	#[error("Image error: '{0}'")]
 	ImageError(#[from] ImageError),
+	#[error("Tried to use metadata for an item that failed to decrypt metadata")]
+	MetadataWasNotDecrypted,
 }
 
 impl From<filen_types::error::ConversionError> for Error {

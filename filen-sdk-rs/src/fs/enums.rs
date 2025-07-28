@@ -105,7 +105,7 @@ impl HasParent for NonRootFSObject<'_> {
 }
 
 impl HasName for NonRootFSObject<'_> {
-	fn name(&self) -> &str {
+	fn name(&self) -> Option<&str> {
 		match self {
 			NonRootFSObject::Dir(dir) => dir.name(),
 			NonRootFSObject::File(file) => file.name(),
@@ -114,7 +114,7 @@ impl HasName for NonRootFSObject<'_> {
 }
 
 impl HasMeta for NonRootFSObject<'_> {
-	fn get_meta_string(&self) -> String {
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
 		match self {
 			NonRootFSObject::Dir(dir) => dir.get_meta_string(),
 			NonRootFSObject::File(file) => file.get_meta_string(),

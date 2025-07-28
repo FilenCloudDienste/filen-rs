@@ -5,9 +5,16 @@ use filen_types::{
 	crypto::EncryptedString,
 	fs::{ObjectType, ParentUuid, UuidStr},
 };
-use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, SetDirMeta};
+use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, UpdateDirMeta};
 
-use crate::{crypto::shared::MetaCrypter, error::Error, fs::SetRemoteInfo};
+use crate::{
+	crypto::shared::MetaCrypter,
+	error::Error,
+	fs::{
+		SetRemoteInfo,
+		dir::meta::{DirectoryMeta, DirectoryMetaChanges},
+	},
+};
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
@@ -17,7 +24,7 @@ pub mod meta;
 pub mod traits;
 
 pub use enums::*;
-pub use meta::DirectoryMeta;
+pub use meta::DecryptedDirectoryMeta;
 pub use traits::{HasContents, HasUUIDContents};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,23 +49,18 @@ impl HasContents for RootDirectory {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootDirectoryWithMeta {
 	uuid: UuidStr,
-	name: String,
 
 	color: Option<String>,
-	created: Option<DateTime<Utc>>,
+
+	meta: DirectoryMeta<'static>,
 }
 
 impl RootDirectoryWithMeta {
-	pub fn from_meta(uuid: UuidStr, color: Option<String>, meta: DirectoryMeta<'_>) -> Self {
-		Self {
-			uuid,
-			name: meta.name.into_owned(),
-			color,
-			created: meta.created,
-		}
+	pub fn from_meta(uuid: UuidStr, color: Option<String>, meta: DirectoryMeta<'static>) -> Self {
+		Self { uuid, color, meta }
 	}
 }
 
@@ -80,43 +82,32 @@ impl HasType for RootDirectoryWithMeta {
 }
 
 impl HasName for RootDirectoryWithMeta {
-	fn name(&self) -> &str {
-		&self.name
+	fn name(&self) -> Option<&str> {
+		self.meta.name()
 	}
 }
 
 impl HasDirMeta for RootDirectoryWithMeta {
-	fn borrow_meta(&self) -> DirectoryMeta<'_> {
-		DirectoryMeta {
-			name: Cow::Borrowed(&self.name),
-			created: self.created,
-		}
-	}
-
-	fn get_meta(&self) -> DirectoryMeta<'static> {
-		DirectoryMeta {
-			name: Cow::Owned(self.name.clone()),
-			created: self.created,
-		}
+	fn get_meta(&self) -> &DirectoryMeta<'_> {
+		&self.meta
 	}
 }
 
-impl SetDirMeta for RootDirectoryWithMeta {
-	fn set_meta(&mut self, meta: DirectoryMeta<'_>) {
-		self.name = meta.name.into_owned();
-		self.created = meta.created;
+impl UpdateDirMeta for RootDirectoryWithMeta {
+	fn update_meta(&mut self, meta: DirectoryMetaChanges) -> Result<(), Error> {
+		self.meta.apply_changes(meta)
 	}
 }
 
 impl HasMeta for RootDirectoryWithMeta {
-	fn get_meta_string(&self) -> String {
-		serde_json::to_string(&self.borrow_meta()).unwrap()
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
+		self.meta.try_to_string()
 	}
 }
 
 impl HasDirInfo for RootDirectoryWithMeta {
 	fn created(&self) -> Option<DateTime<Utc>> {
-		self.created
+		self.meta.created()
 	}
 }
 
@@ -126,15 +117,15 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteDirectory {
-	pub uuid: UuidStr,
-	pub name: String,
-	pub parent: ParentUuid,
+	uuid: UuidStr,
+	parent: ParentUuid,
 
-	pub color: Option<String>, // todo use Color struct
-	pub created: Option<DateTime<Utc>>,
-	pub favorited: bool,
+	color: Option<String>, // todo use Color struct
+	favorited: bool,
+
+	meta: DirectoryMeta<'static>,
 }
 
 impl RemoteDirectory {
@@ -143,18 +134,17 @@ impl RemoteDirectory {
 		parent: ParentUuid,
 		color: Option<String>,
 		favorited: bool,
-		meta: &EncryptedString,
+		meta: Cow<'_, EncryptedString>,
 		decrypter: &impl MetaCrypter,
-	) -> Result<Self, crate::error::Error> {
-		let meta = DirectoryMeta::from_encrypted(meta, decrypter)?;
-		Ok(Self {
-			name: meta.name.into_owned(),
+	) -> Self {
+		let meta = DirectoryMeta::from_encrypted(meta, decrypter);
+		Self {
 			uuid,
 			parent,
 			color,
-			created: meta.created,
 			favorited,
-		})
+			meta,
+		}
 	}
 
 	pub fn from_meta(
@@ -162,15 +152,14 @@ impl RemoteDirectory {
 		parent: ParentUuid,
 		color: Option<String>,
 		favorited: bool,
-		meta: DirectoryMeta<'_>,
+		meta: DirectoryMeta<'static>,
 	) -> Self {
 		Self {
-			name: meta.name.into_owned(),
 			uuid,
 			parent,
 			color,
-			created: meta.created,
 			favorited,
+			meta,
 		}
 	}
 
@@ -180,11 +169,13 @@ impl RemoteDirectory {
 		}
 		Ok(Self {
 			uuid: UuidStr::new_v4(),
-			name,
 			parent,
 			color: None,
-			created: Some(created.round_subsecs(3)),
 			favorited: false,
+			meta: DirectoryMeta::Decoded(DecryptedDirectoryMeta {
+				name: Cow::Owned(name),
+				created: Some(created.round_subsecs(3)),
+			}),
 		})
 	}
 
@@ -197,7 +188,7 @@ impl RemoteDirectory {
 	}
 
 	pub fn created(&self) -> Option<DateTime<Utc>> {
-		self.created
+		self.meta.created()
 	}
 }
 
@@ -219,37 +210,26 @@ impl HasType for RemoteDirectory {
 }
 
 impl HasName for RemoteDirectory {
-	fn name(&self) -> &str {
-		&self.name
+	fn name(&self) -> Option<&str> {
+		self.meta.name()
 	}
 }
 
 impl HasDirMeta for RemoteDirectory {
-	fn borrow_meta(&self) -> DirectoryMeta<'_> {
-		DirectoryMeta {
-			name: Cow::Borrowed(&self.name),
-			created: self.created,
-		}
-	}
-
-	fn get_meta(&self) -> DirectoryMeta<'static> {
-		DirectoryMeta {
-			name: Cow::Owned(self.name.clone()),
-			created: self.created,
-		}
+	fn get_meta(&self) -> &DirectoryMeta {
+		&self.meta
 	}
 }
 
-impl SetDirMeta for RemoteDirectory {
-	fn set_meta(&mut self, meta: DirectoryMeta<'_>) {
-		self.name = meta.name.into_owned();
-		self.created = meta.created;
+impl UpdateDirMeta for RemoteDirectory {
+	fn update_meta(&mut self, changes: DirectoryMetaChanges) -> Result<(), Error> {
+		self.meta.apply_changes(changes)
 	}
 }
 
 impl HasMeta for RemoteDirectory {
-	fn get_meta_string(&self) -> String {
-		serde_json::to_string(&self.borrow_meta()).unwrap()
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
+		self.meta.try_to_string()
 	}
 }
 
@@ -261,7 +241,7 @@ impl HasParent for RemoteDirectory {
 
 impl HasDirInfo for RemoteDirectory {
 	fn created(&self) -> Option<DateTime<Utc>> {
-		self.created
+		self.meta.created()
 	}
 }
 

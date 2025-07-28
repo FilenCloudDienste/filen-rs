@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use filen_types::fs::{ObjectType, UuidStr};
 
@@ -38,7 +40,7 @@ impl HasUUID for RemoteFileType {
 }
 
 impl HasName for RemoteFileType {
-	fn name(&self) -> &str {
+	fn name(&self) -> Option<&str> {
 		match self {
 			RemoteFileType::File(file) => file.name(),
 			RemoteFileType::SharedFile(file) => file.name(),
@@ -47,7 +49,7 @@ impl HasName for RemoteFileType {
 }
 
 impl HasMeta for RemoteFileType {
-	fn get_meta_string(&self) -> String {
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
 		match self {
 			RemoteFileType::File(file) => file.get_meta_string(),
 			RemoteFileType::SharedFile(file) => file.get_meta_string(),
@@ -62,21 +64,21 @@ impl HasType for RemoteFileType {
 }
 
 impl HasFileInfo for RemoteFileType {
-	fn mime(&self) -> &str {
+	fn mime(&self) -> Option<&str> {
 		match self {
 			RemoteFileType::File(file) => file.mime(),
 			RemoteFileType::SharedFile(file) => file.mime(),
 		}
 	}
 
-	fn created(&self) -> DateTime<Utc> {
+	fn created(&self) -> Option<DateTime<Utc>> {
 		match self {
 			RemoteFileType::File(file) => file.created(),
 			RemoteFileType::SharedFile(file) => file.created(),
 		}
 	}
 
-	fn last_modified(&self) -> DateTime<Utc> {
+	fn last_modified(&self) -> Option<DateTime<Utc>> {
 		match self {
 			RemoteFileType::File(file) => file.last_modified(),
 			RemoteFileType::SharedFile(file) => file.last_modified(),
@@ -97,7 +99,7 @@ impl HasFileInfo for RemoteFileType {
 		}
 	}
 
-	fn key(&self) -> &FileKey {
+	fn key(&self) -> Option<&FileKey> {
 		match self {
 			RemoteFileType::File(file) => file.key(),
 			RemoteFileType::SharedFile(file) => file.key(),

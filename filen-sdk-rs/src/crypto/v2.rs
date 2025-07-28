@@ -23,12 +23,30 @@ type TagSize = U16;
 const TAG_SIZE: usize = 16;
 
 const NONCE_VALUES: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-pub(crate) fn generate_bad_nonce() -> Nonce<NonceSize> {
-	let mut nonce: [u8; 12] = rand::random();
-	nonce
-		.iter_mut()
-		.for_each(|b| *b = NONCE_VALUES[*b as usize % NONCE_VALUES.len()]);
-	nonce.into()
+
+struct BadNonce([u8; NONCE_SIZE]);
+
+impl BadNonce {
+	fn new() -> Self {
+		let mut nonce = [0u8; NONCE_SIZE];
+		for i in 0..NONCE_SIZE {
+			nonce[i] = NONCE_VALUES[i % NONCE_VALUES.len()];
+		}
+		Self(nonce)
+	}
+}
+
+impl From<BadNonce> for Nonce<NonceSize> {
+	fn from(val: BadNonce) -> Self {
+		val.0.into()
+	}
+}
+
+impl AsRef<str> for BadNonce {
+	fn as_ref(&self) -> &str {
+		// SAFETY: The nonce is generated from a fixed set of valid chars
+		unsafe { std::str::from_utf8_unchecked(&self.0) }
+	}
 }
 
 #[derive(Clone)]
@@ -100,18 +118,14 @@ impl AsRef<str> for MasterKey {
 }
 
 impl MetaCrypter for MasterKey {
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		mut out: Vec<u8>,
-	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
-		let nonce = generate_bad_nonce();
+	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString {
+		let nonce = BadNonce::new();
 		out.clear();
 		let base64_len =
 			base64::encoded_len(meta.len() + TAG_SIZE, true).expect("meta len too long for base64");
 		out.reserve(3 + NONCE_SIZE + base64_len);
-		out.extend_from_slice(b"002");
-		out.extend_from_slice(&nonce);
+		out.push_str("002");
+		out.push_str(nonce.as_ref());
 
 		// not allocating here is very difficult, so we don't bother
 		// the problem is that if we owned the meta String, we could consume it,
@@ -119,19 +133,12 @@ impl MetaCrypter for MasterKey {
 		// because we would need to extend the buffer to fit the authentication tag
 		// before base64 encoding
 
-		let encrypted = match self.cipher.encrypt(&nonce, meta.as_bytes()) {
-			Ok(encrypted) => encrypted,
-			Err(e) => {
-				return Err((e.into(), out));
-			}
-		};
-		let mut out_string = String::from_utf8(out).map_err(|e| {
-			let err = e.utf8_error();
-			let out = e.into_bytes();
-			(err.into(), out)
-		})?;
-		BASE64_STANDARD.encode_string(encrypted, &mut out_string);
-		Ok(EncryptedString(out_string))
+		// SAFETY: This cannot fail unless we encrypt more than 64GiB of metadata at a time, which we will never do
+		// we also don't have AAD
+		let encrypted = self.cipher.encrypt(&nonce.into(), meta.as_bytes()).unwrap();
+
+		BASE64_STANDARD.encode_string(encrypted, &mut out);
+		EncryptedString(out)
 	}
 
 	fn decrypt_meta_into(
@@ -204,11 +211,7 @@ impl MasterKeys {
 }
 
 impl MetaCrypter for MasterKeys {
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		out: Vec<u8>,
-	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString {
 		self.0[0].encrypt_meta_into(meta, out)
 	}
 

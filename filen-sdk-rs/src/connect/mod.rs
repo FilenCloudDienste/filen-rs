@@ -27,7 +27,7 @@ use crate::{
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
 		dir::{HasUUIDContents, RemoteDirectory},
-		file::{RemoteFile, meta::FileMeta},
+		file::{RemoteFile, meta::DecryptedFileMeta},
 	},
 };
 
@@ -262,7 +262,7 @@ impl Client {
 				metadata: Cow::Borrowed(
 					&item
 						.get_rsa_encrypted_meta(&user.public_key)
-						.map_err(|e| Error::Custom(e.to_string()))?,
+						.ok_or(Error::MetadataWasNotDecrypted)?,
 				),
 			},
 		)
@@ -283,7 +283,11 @@ impl Client {
 			&api::v3::item::linked::rename::Request {
 				uuid: item.uuid(),
 				link_uuid,
-				metadata: Cow::Borrowed(&item.get_encrypted_meta(crypter)?),
+				metadata: Cow::Borrowed(
+					&item
+						.get_encrypted_meta(crypter)
+						.ok_or(Error::MetadataWasNotDecrypted)?,
+				),
 			},
 		)
 		.await
@@ -419,7 +423,11 @@ impl Client {
 				parent: Some(item.parent().try_into()?),
 				link_uuid: link.link_uuid,
 				r#type: item.object_type(),
-				metadata: Cow::Borrowed(&item.get_encrypted_meta(link_crypter)?),
+				metadata: Cow::Borrowed(
+					&item
+						.get_encrypted_meta(link_crypter)
+						.ok_or(Error::MetadataWasNotDecrypted)?,
+				),
 				key: Cow::Borrowed(&link.link_key),
 				expiration: PublicLinkExpiration::Never,
 			},
@@ -433,7 +441,7 @@ impl Client {
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
-			link_key: Cow::Owned(self.encrypt_meta_key(&public_link.link_key)?),
+			link_key: Cow::Owned(self.encrypt_meta_key(&public_link.link_key)),
 		};
 
 		let mut futures = FuturesUnordered::new();
@@ -449,7 +457,10 @@ impl Client {
 					parent: None,
 					link_uuid: public_link.link_uuid,
 					r#type: ObjectType::Dir,
-					metadata: Cow::Borrowed(&dir.get_encrypted_meta(key)?),
+					metadata: Cow::Borrowed(
+						&dir.get_encrypted_meta(key)
+							.ok_or(Error::MetadataWasNotDecrypted)?,
+					),
 					key: Cow::Borrowed(&link.link_key),
 					expiration: PublicLinkExpiration::Never,
 				},
@@ -680,17 +691,18 @@ impl Client {
 					d.parent.into(),
 					d.color.map(|c| c.into_owned()),
 					false,
-					&d.metadata,
+					d.metadata,
 					link.crypter(),
 				)
 			})
-			.collect::<Result<Vec<_>, _>>()?;
+			.collect::<Vec<_>>();
 
 		let files: Vec<RemoteFile> = response
 			.files
 			.into_iter()
 			.map(|f| {
-				let meta = FileMeta::from_encrypted(&f.metadata, link.crypter(), f.version)?;
+				let meta =
+					DecryptedFileMeta::from_encrypted(&f.metadata, link.crypter(), f.version)?;
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent.into(),
@@ -730,7 +742,7 @@ impl Client {
 				r#type: item.object_type(),
 				metadata: Cow::Owned(
 					item.get_rsa_encrypted_meta(&user.public_key)
-						.map_err(|e| Error::Custom(e.to_string()))?,
+						.ok_or(Error::MetadataWasNotDecrypted)?,
 				),
 			},
 		)
@@ -752,7 +764,7 @@ impl Client {
 					r#type: ObjectType::Dir,
 					metadata: Cow::Owned(
 						dir.get_rsa_encrypted_meta(&user.public_key)
-							.map_err(|e| Error::Custom(e.to_string()))?,
+							.ok_or(Error::MetadataWasNotDecrypted)?,
 					),
 				},
 			)
@@ -792,7 +804,7 @@ impl Client {
 				metadata: Cow::Borrowed(
 					&file
 						.get_rsa_encrypted_meta(&user.public_key)
-						.map_err(|e| Error::Custom(e.to_string()))?,
+						.ok_or(Error::MetadataWasNotDecrypted)?,
 				),
 			},
 		)

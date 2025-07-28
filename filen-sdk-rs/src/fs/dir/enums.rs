@@ -2,7 +2,9 @@ use std::borrow::Cow;
 
 use filen_types::fs::{ObjectType, UuidStr};
 
-use crate::fs::{HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, UnsharedFSObject};
+use crate::fs::{
+	HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, UnsharedFSObject, dir::meta::DirectoryMeta,
+};
 
 use super::{
 	HasContents, RemoteDirectory, RootDirectory, RootDirectoryWithMeta,
@@ -147,7 +149,7 @@ impl HasType for DirectoryMetaType<'_> {
 }
 
 impl HasName for DirectoryMetaType<'_> {
-	fn name(&self) -> &str {
+	fn name(&self) -> Option<&str> {
 		match self {
 			DirectoryMetaType::Root(dir) => dir.name(),
 			DirectoryMetaType::Dir(dir) => dir.name(),
@@ -174,7 +176,7 @@ impl HasRemoteInfo for DirectoryMetaType<'_> {
 }
 
 impl HasMeta for DirectoryMetaType<'_> {
-	fn get_meta_string(&self) -> String {
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
 		match self {
 			DirectoryMetaType::Root(dir) => dir.get_meta_string(),
 			DirectoryMetaType::Dir(dir) => dir.get_meta_string(),
@@ -183,14 +185,7 @@ impl HasMeta for DirectoryMetaType<'_> {
 }
 
 impl HasDirMeta for DirectoryMetaType<'_> {
-	fn borrow_meta(&self) -> super::DirectoryMeta<'_> {
-		match self {
-			DirectoryMetaType::Root(dir) => dir.borrow_meta(),
-			DirectoryMetaType::Dir(dir) => dir.borrow_meta(),
-		}
-	}
-
-	fn get_meta(&self) -> super::DirectoryMeta<'static> {
+	fn get_meta(&self) -> &DirectoryMeta {
 		match self {
 			DirectoryMetaType::Root(dir) => dir.get_meta(),
 			DirectoryMetaType::Dir(dir) => dir.get_meta(),

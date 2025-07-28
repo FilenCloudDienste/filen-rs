@@ -13,15 +13,19 @@ use crate::{
 	error::Error,
 	fs::{
 		HasMetaExt, HasName, HasUUID,
-		dir::HasUUIDContents,
+		dir::{
+			HasUUIDContents,
+			meta::{DirectoryMeta, DirectoryMetaChanges},
+			traits::HasDirMeta,
+		},
 		enums::FSObject,
-		file::{RemoteFile, meta::FileMeta},
+		file::{RemoteFile, meta::DecryptedFileMeta},
 	},
 	io::FilenMetaExt,
 	util::PathIteratorExt,
 };
 
-use super::{DirectoryMeta, DirectoryType, HasContents, RemoteDirectory, traits::SetDirMeta};
+use super::{DirectoryType, HasContents, RemoteDirectory, traits::UpdateDirMeta};
 
 impl Client {
 	pub async fn create_dir(
@@ -47,8 +51,13 @@ impl Client {
 			&api::v3::dir::create::Request {
 				uuid: dir.uuid(),
 				parent: parent.uuid(),
-				name_hashed: Cow::Borrowed(&self.hash_name(dir.name())),
-				meta: Cow::Borrowed(&dir.get_encrypted_meta(self.crypter())?),
+				name_hashed: Cow::Borrowed(
+					&self.hash_name(dir.name().ok_or(Error::MetadataWasNotDecrypted)?),
+				),
+				meta: Cow::Borrowed(
+					&dir.get_encrypted_meta(self.crypter())
+						.ok_or(Error::MetadataWasNotDecrypted)?,
+				),
 			},
 		)
 		.await?;
@@ -66,7 +75,7 @@ impl Client {
 	pub async fn get_dir(&self, uuid: UuidStr) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
-		RemoteDirectory::from_encrypted(
+		Ok(RemoteDirectory::from_encrypted(
 			uuid,
 			// v3 api returns the original parent as the parent if the file is in the trash
 			if response.trash {
@@ -76,9 +85,9 @@ impl Client {
 			},
 			response.color.map(|s| s.into_owned()),
 			response.favorited,
-			&response.metadata,
+			response.metadata,
 			self.crypter(),
-		)
+		))
 	}
 
 	pub async fn dir_exists(
@@ -118,17 +127,18 @@ impl Client {
 					d.parent,
 					d.color.map(|s| s.into_owned()),
 					d.favorited,
-					&d.meta,
+					d.meta,
 					self.crypter(),
 				)
 			})
-			.collect::<Result<Vec<_>, _>>()?;
+			.collect::<Vec<_>>();
 
 		let files = response
 			.files
 			.into_iter()
 			.map(|f| {
-				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
+				let meta =
+					DecryptedFileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,
@@ -170,11 +180,11 @@ impl Client {
 					},
 					response_dir.color.map(|s| s.into_owned()),
 					response_dir.favorited,
-					&response_dir.meta,
+					response_dir.meta,
 					self.crypter(),
 				))
 			})
-			.collect::<Result<Vec<_>, _>>()?;
+			.collect::<Vec<_>>();
 
 		let files = response
 			.files
@@ -184,7 +194,8 @@ impl Client {
 				let decrypted_size = decrypted_size
 					.parse::<u64>()
 					.map_err(|_| Error::Custom("Failed to parse decrypted size".to_string()))?;
-				let meta = FileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
+				let meta =
+					DecryptedFileMeta::from_encrypted(&f.metadata, self.crypter(), f.version)?;
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,
@@ -239,23 +250,30 @@ impl Client {
 	pub async fn update_dir_metadata(
 		&self,
 		dir: &mut RemoteDirectory,
-		new_meta: DirectoryMeta<'_>,
+		changes: DirectoryMetaChanges,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
+		let new_borrowed_meta = dir.get_meta();
+		let temp_meta = new_borrowed_meta.borrow_with_changes(&changes)?;
+		let DirectoryMeta::Decoded(temp_meta) = temp_meta else {
+			return Err(Error::MetadataWasNotDecrypted);
+		};
+
 		api::v3::dir::metadata::post(
 			self.client(),
 			&api::v3::dir::metadata::Request {
 				uuid: dir.uuid(),
-				name_hashed: Cow::Borrowed(&self.hash_name(new_meta.name())),
+				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
 				metadata: Cow::Borrowed(
 					&self
 						.crypter()
-						.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+						.encrypt_meta(&serde_json::to_string(&temp_meta)?),
 				),
 			},
 		)
 		.await?;
-		dir.set_meta(new_meta);
+
+		dir.update_meta(changes)?;
 		self.update_maybe_connected_item(dir).await?;
 
 		Ok(())
@@ -267,10 +285,16 @@ impl Client {
 		name: &str,
 	) -> Result<Option<FSObject<'static>>, Error> {
 		let (dirs, files) = self.list_dir(dir).await?;
-		if let Some(dir) = dirs.into_iter().find(|d| d.name() == name) {
+		if let Some(dir) = dirs
+			.into_iter()
+			.find(|d| d.name().is_some_and(|n| n == name))
+		{
 			return Ok(Some(FSObject::Dir(Cow::Owned(dir))));
 		}
-		if let Some(file) = files.into_iter().find(|f| f.name() == name) {
+		if let Some(file) = files
+			.into_iter()
+			.find(|f| f.name().is_some_and(|n| n == name))
+		{
 			return Ok(Some(FSObject::File(Cow::Owned(file))));
 		}
 		Ok(None)
@@ -285,12 +309,18 @@ impl Client {
 		let mut curr_dir = dir;
 		for (component, remaining_path) in path.path_iter() {
 			let (dirs, files) = self.list_dir(&curr_dir).await?;
-			if let Some(dir) = dirs.into_iter().find(|d| d.name() == component) {
+			if let Some(dir) = dirs
+				.into_iter()
+				.find(|d| d.name().is_some_and(|n| n == component))
+			{
 				curr_dir = DirectoryType::Dir(Cow::Owned(dir));
 				continue;
 			}
 
-			if files.iter().any(|f| f.name() == component) {
+			if files
+				.iter()
+				.any(|f| f.name().is_some_and(|n| n == component))
+			{
 				return Err(Error::Custom(format!(
 					"find_or_create_dir path {remaining_path}/{component} is a file when trying to create dir {path}"
 				)));

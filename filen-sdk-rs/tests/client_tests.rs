@@ -37,7 +37,7 @@ async fn cleanup_test_dirs() {
 	let mut futures = FuturesUnordered::new();
 	let now = chrono::Utc::now();
 	for dir in dirs {
-		if dir.name().starts_with("rs-")
+		if dir.name().is_some_and(|n| n.starts_with("rs-"))
 			&& dir
 				.created()
 				.is_none_or(|c| now - c > chrono::Duration::days(1))

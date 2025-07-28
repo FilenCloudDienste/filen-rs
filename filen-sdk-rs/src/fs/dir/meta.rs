@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
 use rsa::RsaPrivateKey;
@@ -10,8 +11,142 @@ use crate::{
 	error::Error,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DirectoryMeta<'a> {
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum DirectoryMeta<'a> {
+	Decoded(DecryptedDirectoryMeta<'a>),
+	DecryptedRaw(Vec<u8>),
+	DecryptedUTF8(String),
+	Encrypted(EncryptedString),
+	RSAEncrypted(RSAEncryptedString),
+}
+
+impl DirectoryMeta<'static> {
+	pub(crate) fn from_encrypted(
+		encrypted: Cow<'_, EncryptedString>,
+		decrypter: &impl MetaCrypter,
+	) -> Self {
+		let Ok(decrypted) = decrypter.decrypt_meta(&encrypted) else {
+			return Self::Encrypted(encrypted.into_owned());
+		};
+		let Ok(meta) = serde_json::from_str(&decrypted) else {
+			return Self::DecryptedUTF8(decrypted);
+		};
+		Self::Decoded(meta)
+	}
+
+	pub(crate) fn from_rsa_encrypted(
+		encrypted: Cow<'_, RSAEncryptedString>,
+		decrypter: &RsaPrivateKey,
+	) -> Self {
+		let Ok(decrypted) = crypto::rsa::decrypt_with_private_key(decrypter, &encrypted) else {
+			return Self::RSAEncrypted(encrypted.into_owned());
+		};
+		let Ok(meta) = serde_json::from_slice(decrypted.as_ref()) else {
+			match String::from_utf8(decrypted) {
+				Ok(decrypted) => return Self::DecryptedUTF8(decrypted),
+				Err(err) => return Self::DecryptedRaw(err.into_bytes()),
+			}
+		};
+		Self::Decoded(meta)
+	}
+}
+
+impl<'a> DirectoryMeta<'a> {
+	pub(crate) fn encrypt(&self, encrypter: &impl MetaCrypter) -> Option<EncryptedString> {
+		match self {
+			Self::Decoded(meta) => {
+				let json = serde_json::to_string(meta).expect("Failed to serialize directory meta");
+
+				Some(encrypter.encrypt_meta(&json))
+			}
+			Self::DecryptedRaw(raw) => Some(encrypter.encrypt_meta(&BASE64_STANDARD.encode(raw))),
+			Self::DecryptedUTF8(utf8) => Some(encrypter.encrypt_meta(utf8)),
+			other => {
+				log::warn!("Cannot convert {other:?} to encrypted meta");
+				None
+			}
+		}
+	}
+
+	pub fn try_to_string(&self) -> Option<Cow<'_, str>> {
+		match self {
+			// SAFETY: serializing a DecryptedDirectoryMeta always succeeds
+			// - filen_types::serde::time::optional::serialize cannot fail
+			// - serializing a String cannot fail
+			// - serde_json::to_string always suceeds if we have string keys and serialization cannot fail
+			Self::Decoded(meta) => Some(
+				serde_json::to_string(meta)
+					.expect("Failed to serialize directory meta (should be impossible)")
+					.into(),
+			),
+			Self::DecryptedUTF8(utf8) => Some(Cow::Borrowed(utf8)),
+			Self::DecryptedRaw(_) | Self::Encrypted(_) | Self::RSAEncrypted(_) => None,
+		}
+	}
+
+	pub fn name(&self) -> Option<&str> {
+		match self {
+			Self::Decoded(meta) => Some(meta.name()),
+			Self::DecryptedRaw(_)
+			| Self::DecryptedUTF8(_)
+			| Self::Encrypted(_)
+			| Self::RSAEncrypted(_) => None,
+		}
+	}
+
+	pub fn created(&self) -> Option<DateTime<Utc>> {
+		match self {
+			Self::Decoded(meta) => meta.created(),
+			Self::DecryptedRaw(_)
+			| Self::DecryptedUTF8(_)
+			| Self::Encrypted(_)
+			| Self::RSAEncrypted(_) => None,
+		}
+	}
+
+	pub(crate) fn apply_changes(&mut self, changes: DirectoryMetaChanges) -> Result<(), Error> {
+		match self {
+			Self::Decoded(meta) => meta.apply_changes(changes),
+			Self::DecryptedRaw(_)
+			| Self::DecryptedUTF8(_)
+			| Self::Encrypted(_)
+			| Self::RSAEncrypted(_) => {
+				// if all the metadata is being applied, we can convert to Decoded
+				*self = Self::Decoded(DecryptedDirectoryMeta {
+					name: changes
+						.name
+						.map(Cow::Owned)
+						.ok_or(Error::MetadataWasNotDecrypted)?,
+					created: changes.created.ok_or(Error::MetadataWasNotDecrypted)?,
+				})
+			}
+		}
+		Ok(())
+	}
+
+	pub(crate) fn borrow_with_changes(
+		&'a self,
+		changes: &'a DirectoryMetaChanges,
+	) -> Result<Self, Error> {
+		Ok(match self {
+			Self::Decoded(meta) => Self::Decoded(meta.borrowed_with_changes(changes)),
+			Self::DecryptedRaw(_)
+			| Self::DecryptedUTF8(_)
+			| Self::Encrypted(_)
+			| Self::RSAEncrypted(_) => Self::Decoded(DecryptedDirectoryMeta {
+				name: changes
+					.name
+					.as_deref()
+					.map(Cow::Borrowed)
+					.ok_or(Error::MetadataWasNotDecrypted)?,
+				created: changes.created.ok_or(Error::MetadataWasNotDecrypted)?,
+			}),
+		})
+	}
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct DecryptedDirectoryMeta<'a> {
 	pub(super) name: Cow<'a, str>,
 	#[serde(with = "filen_types::serde::time::optional")]
 	#[serde(rename = "creation")]
@@ -19,7 +154,7 @@ pub struct DirectoryMeta<'a> {
 	pub(super) created: Option<DateTime<Utc>>,
 }
 
-impl DirectoryMeta<'static> {
+impl<'a> DecryptedDirectoryMeta<'a> {
 	pub fn from_encrypted(
 		encrypted: &EncryptedString,
 		decrypter: &impl MetaCrypter,
@@ -37,9 +172,7 @@ impl DirectoryMeta<'static> {
 		let meta = serde_json::from_slice(decrypted.as_ref())?;
 		Ok(meta)
 	}
-}
 
-impl<'a> DirectoryMeta<'a> {
 	pub fn name(&self) -> &str {
 		&self.name
 	}
@@ -48,82 +181,44 @@ impl<'a> DirectoryMeta<'a> {
 		self.created
 	}
 
-	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) -> Result<(), Error> {
-		let name = name.into();
-		if name.is_empty() {
-			return Err(Error::InvalidName(name.into()));
+	fn apply_changes(&mut self, changes: DirectoryMetaChanges) {
+		if let Some(name) = changes.name {
+			// don't need to check for empty name here,
+			// because it was already checked in DirectoryMetaChanger::set_name
+			self.name = Cow::Owned(name);
 		}
-		self.name = name;
-		Ok(())
+		if let Some(created) = changes.created {
+			self.created = created;
+		}
 	}
 
-	pub fn set_created(&mut self, created: DateTime<Utc>) {
-		self.created = Some(created.round_subsecs(3));
+	pub fn borrowed_with_changes(&'a self, changes: &'a DirectoryMetaChanges) -> Self {
+		Self {
+			name: Cow::Borrowed(changes.name.as_deref().unwrap_or(&self.name)),
+			created: changes.created.unwrap_or(self.created),
+		}
 	}
 }
 
-mod dir_meta_serde {
-	use chrono::{DateTime, Utc};
-	use serde::de::Visitor;
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct DirectoryMetaChanges {
+	name: Option<String>,
+	// double option because we need to distinguish between
+	// "not set" and "set to None"
+	created: Option<Option<DateTime<Utc>>>,
+}
 
-	pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		struct OptionalDateTimeVisitor;
-		impl<'de> Visitor<'de> for OptionalDateTimeVisitor {
-			type Value = Option<DateTime<Utc>>;
-
-			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-				formatter.write_str("an optional timestamp in milliseconds")
-			}
-
-			fn visit_none<E>(self) -> Result<Self::Value, E>
-			where
-				E: serde::de::Error,
-			{
-				Ok(None)
-			}
-
-			fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-			where
-				D: serde::Deserializer<'de>,
-			{
-				deserializer.deserialize_i64(self)
-			}
-
-			fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-			where
-				E: serde::de::Error,
-			{
-				Ok(Some(
-					chrono::DateTime::<Utc>::from_timestamp_millis(v)
-						.ok_or_else(|| serde::de::Error::custom("Invalid timestamp"))?,
-				))
-			}
-
-			fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-			where
-				E: serde::de::Error,
-			{
-				self.visit_i64(v.try_into().map_err(|_| {
-					serde::de::Error::custom("Invalid timestamp: cannot convert u64 to i64")
-				})?)
-			}
+impl DirectoryMetaChanges {
+	pub fn name(mut self, name: String) -> Result<Self, Error> {
+		if name.is_empty() {
+			return Err(Error::InvalidName(name));
 		}
-		deserializer.deserialize_option(OptionalDateTimeVisitor)
+		self.name = Some(name);
+		Ok(self)
 	}
 
-	pub(super) fn serialize<S>(
-		value: &Option<DateTime<Utc>>,
-		serializer: S,
-	) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		match value {
-			Some(dt) => serializer.serialize_i64(dt.timestamp_millis()),
-			None => serializer.serialize_none(),
-		}
+	pub fn created(mut self, created: Option<DateTime<Utc>>) -> Self {
+		self.created = Some(created.map(|t| t.round_subsecs(3)));
+		self
 	}
 }

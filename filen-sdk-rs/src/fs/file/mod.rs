@@ -5,13 +5,18 @@ use filen_types::{
 	crypto::Sha512Hash,
 	fs::{ObjectType, ParentUuid, UuidStr},
 };
-use meta::FileMeta;
-use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, SetFileMeta};
+use meta::DecryptedFileMeta;
+use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, UpdateFileMeta};
 
 use crate::{
 	auth::Client,
 	crypto::file::FileKey,
-	fs::{SetRemoteInfo, dir::HasUUIDContents},
+	error::Error,
+	fs::{
+		SetRemoteInfo,
+		dir::HasUUIDContents,
+		file::meta::{FileMeta, FileMetaChanges},
+	},
 };
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
@@ -87,11 +92,7 @@ impl FileBuilder {
 		BaseFile {
 			root: RootFile {
 				uuid: self.uuid,
-				mime: self.mime.unwrap_or_else(|| {
-					mime_guess::from_ext(self.name.rsplit('.').next().unwrap_or_else(|| &self.name))
-						.first_or_octet_stream()
-						.to_string()
-				}),
+				mime: make_mime(&self.name, self.mime),
 				name: self.name,
 				key: self.key,
 				created: self.created.unwrap_or_else(Utc::now).round_subsecs(3),
@@ -113,17 +114,6 @@ pub struct RootFile {
 }
 
 impl RootFile {
-	fn from_meta(uuid: UuidStr, meta: FileMeta<'_>) -> Self {
-		Self {
-			uuid,
-			name: meta.name.into_owned(),
-			mime: meta.mime.into_owned(),
-			key: meta.key.into_owned(),
-			created: meta.created.unwrap_or_default(),
-			modified: meta.last_modified,
-		}
-	}
-
 	pub fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
@@ -184,23 +174,29 @@ impl BaseFile {
 		self.root.modified = Utc::now().round_subsecs(3);
 	}
 
-	fn from_meta(uuid: UuidStr, parent: UuidStr, meta: FileMeta<'_>) -> Self {
-		Self {
-			root: RootFile::from_meta(uuid, meta),
-			parent,
-		}
-	}
-
 	pub fn parent(&self) -> UuidStr {
 		self.parent
 	}
 }
 
 impl TryFrom<RemoteFile> for BaseFile {
-	type Error = filen_types::error::ConversionError;
+	type Error = crate::error::Error;
 	fn try_from(file: RemoteFile) -> Result<Self, Self::Error> {
+		let meta = match file.meta {
+			FileMeta::Decoded(decrypted_file_meta) => decrypted_file_meta,
+			_ => {
+				return Err(crate::error::Error::MetadataWasNotDecrypted);
+			}
+		};
 		Ok(Self {
-			root: file.file,
+			root: RootFile {
+				uuid: file.uuid,
+				name: meta.name.into_owned(),
+				mime: meta.mime.into_owned(),
+				key: meta.key.into_owned(),
+				created: meta.created.unwrap_or_default(),
+				modified: meta.last_modified,
+			},
 			parent: file.parent.try_into()?,
 		})
 	}
@@ -208,14 +204,27 @@ impl TryFrom<RemoteFile> for BaseFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
-	pub file: RootFile,
-	pub parent: ParentUuid,
-	pub size: u64,
-	pub favorited: bool,
-	pub region: String,
-	pub bucket: String,
-	pub chunks: u64,
-	pub hash: Option<Sha512Hash>,
+	uuid: UuidStr,
+	meta: FileMeta<'static>,
+
+	parent: ParentUuid,
+	size: u64,
+	favorited: bool,
+	region: String,
+	bucket: String,
+	chunks: u64,
+}
+
+impl PartialEq<BaseFile> for RemoteFile {
+	fn eq(&self, other: &BaseFile) -> bool {
+		self.uuid == other.uuid()
+			&& self.parent == other.parent
+			&& self.name() == Some(other.name())
+			&& self.mime() == Some(other.mime())
+			&& self.key() == Some(other.key())
+			&& self.created() == Some(other.created())
+			&& self.last_modified() == Some(other.last_modified())
+	}
 }
 
 impl RemoteFile {
@@ -228,12 +237,12 @@ impl RemoteFile {
 		region: impl Into<String>,
 		bucket: impl Into<String>,
 		favorited: bool,
-		meta: FileMeta<'_>,
+		meta: DecryptedFileMeta<'static>,
 	) -> Self {
 		Self {
-			hash: meta.hash,
+			uuid,
+			meta: FileMeta::Decoded(meta),
 			parent,
-			file: RootFile::from_meta(uuid, meta),
 			size,
 			favorited,
 			region: region.into(),
@@ -241,9 +250,9 @@ impl RemoteFile {
 			chunks,
 		}
 	}
-	pub fn inner_file(&self) -> &RootFile {
-		&self.file
-	}
+	// pub fn inner_file(&self) -> &RootFile {
+	// 	&self.file
+	// }
 }
 
 pub struct FlatRemoteFile {
@@ -265,28 +274,29 @@ pub struct FlatRemoteFile {
 impl From<FlatRemoteFile> for RemoteFile {
 	fn from(file: FlatRemoteFile) -> Self {
 		Self {
-			file: RootFile {
-				uuid: file.uuid,
-				name: file.name,
-				mime: file.mime,
-				key: file.key,
-				created: file.created,
-				modified: file.modified,
-			},
+			uuid: file.uuid,
 			parent: file.parent,
 			size: file.size,
 			favorited: file.favorited,
 			region: file.region,
 			bucket: file.bucket,
 			chunks: file.chunks,
-			hash: file.hash,
+			meta: FileMeta::Decoded(DecryptedFileMeta {
+				size: file.size,
+				name: Cow::Owned(file.name),
+				mime: Cow::Owned(file.mime),
+				key: Cow::Owned(file.key),
+				created: Some(file.created.round_subsecs(3)),
+				last_modified: file.modified.round_subsecs(3),
+				hash: file.hash,
+			}),
 		}
 	}
 }
 
 impl HasUUID for RemoteFile {
 	fn uuid(&self) -> UuidStr {
-		self.file.uuid()
+		self.uuid
 	}
 }
 
@@ -297,51 +307,26 @@ impl HasParent for RemoteFile {
 }
 
 impl HasName for RemoteFile {
-	fn name(&self) -> &str {
-		self.file.name()
+	fn name(&self) -> Option<&str> {
+		self.meta.name()
 	}
 }
 
 impl HasFileMeta for RemoteFile {
-	fn borrow_meta(&self) -> FileMeta<'_> {
-		FileMeta {
-			name: Cow::Borrowed(self.name()),
-			size: self.size,
-			mime: Cow::Borrowed(self.mime()),
-			key: Cow::Borrowed(self.key()),
-			created: Some(self.created()),
-			last_modified: self.last_modified(),
-			hash: self.hash,
-		}
-	}
-	fn get_meta(&self) -> FileMeta<'static> {
-		FileMeta {
-			name: Cow::Owned(self.name().to_owned()),
-			size: self.size,
-			mime: Cow::Owned(self.mime().to_owned()),
-			key: Cow::Owned(self.key().clone()),
-			created: Some(self.created()),
-			last_modified: self.last_modified(),
-			hash: self.hash,
-		}
+	fn get_meta(&self) -> &FileMeta<'_> {
+		&self.meta
 	}
 }
 
-impl SetFileMeta for RemoteFile {
-	fn set_meta(&mut self, meta: FileMeta<'_>) {
-		self.file.name = meta.name.into_owned();
-		self.file.mime = meta.mime.into_owned();
-		self.file.key = meta.key.into_owned();
-		self.file.modified = meta.last_modified;
-		self.file.created = meta.created.unwrap_or_default();
+impl UpdateFileMeta for RemoteFile {
+	fn update_meta(&mut self, changes: FileMetaChanges) -> Result<(), Error> {
+		self.meta.apply_changes(changes)
 	}
 }
 
 impl HasMeta for RemoteFile {
-	fn get_meta_string(&self) -> String {
-		// If this fails, I want it to panic
-		// as this is a logic error
-		serde_json::to_string(&self.borrow_meta()).unwrap()
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
+		self.meta.try_to_string()
 	}
 }
 
@@ -352,16 +337,16 @@ impl HasType for RemoteFile {
 }
 
 impl HasFileInfo for RemoteFile {
-	fn mime(&self) -> &str {
-		self.file.mime()
+	fn mime(&self) -> Option<&str> {
+		self.meta.mime()
 	}
 
-	fn created(&self) -> DateTime<Utc> {
-		self.file.created()
+	fn created(&self) -> Option<DateTime<Utc>> {
+		self.meta.created()
 	}
 
-	fn last_modified(&self) -> DateTime<Utc> {
-		self.file.last_modified()
+	fn last_modified(&self) -> Option<DateTime<Utc>> {
+		self.meta.last_modified()
 	}
 
 	fn size(&self) -> u64 {
@@ -372,8 +357,8 @@ impl HasFileInfo for RemoteFile {
 		self.chunks
 	}
 
-	fn key(&self) -> &FileKey {
-		self.file.key()
+	fn key(&self) -> Option<&FileKey> {
+		self.meta.key()
 	}
 }
 
@@ -399,18 +384,18 @@ impl HasRemoteFileInfo for RemoteFile {
 	}
 
 	fn hash(&self) -> Option<Sha512Hash> {
-		self.hash
+		self.meta.hash()
 	}
 }
 
 impl PartialEq<RemoteRootFile> for RemoteFile {
 	fn eq(&self, other: &RemoteRootFile) -> bool {
-		self.file == other.file
+		self.meta == other.meta
+			&& self.uuid == other.uuid
 			&& self.size == other.size
 			&& self.region == other.region
 			&& self.bucket == other.bucket
 			&& self.chunks == other.chunks
-			&& self.hash == other.hash
 	}
 }
 
@@ -418,12 +403,12 @@ impl File for RemoteFile {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRootFile {
-	file: RootFile,
+	uuid: UuidStr,
 	size: u64,
 	region: String,
 	bucket: String,
 	chunks: u64,
-	hash: Option<Sha512Hash>,
+	meta: FileMeta<'static>,
 }
 
 impl RemoteRootFile {
@@ -433,74 +418,48 @@ impl RemoteRootFile {
 		chunks: u64,
 		region: impl Into<String>,
 		bucket: impl Into<String>,
-		meta: FileMeta<'_>,
+		meta: DecryptedFileMeta<'static>,
 	) -> Self {
 		Self {
-			hash: meta.hash,
-			file: RootFile::from_meta(uuid, meta),
+			uuid,
+			meta: FileMeta::Decoded(meta),
 			size,
 			region: region.into(),
 			bucket: bucket.into(),
 			chunks,
 		}
 	}
-	pub fn inner_file(&self) -> &RootFile {
-		&self.file
-	}
 }
 
 impl HasUUID for RemoteRootFile {
 	fn uuid(&self) -> UuidStr {
-		self.file.uuid
+		self.uuid
 	}
 }
 
 impl HasName for RemoteRootFile {
-	fn name(&self) -> &str {
-		self.file.name()
+	fn name(&self) -> Option<&str> {
+		self.meta.name()
 	}
 }
 
 impl HasFileMeta for RemoteRootFile {
-	fn borrow_meta(&self) -> FileMeta<'_> {
-		FileMeta {
-			name: Cow::Borrowed(self.name()),
-			size: self.size,
-			mime: Cow::Borrowed(self.mime()),
-			key: Cow::Borrowed(self.key()),
-			created: Some(self.created()),
-			last_modified: self.last_modified(),
-			hash: self.hash,
-		}
-	}
-	fn get_meta(&self) -> FileMeta<'static> {
-		FileMeta {
-			name: Cow::Owned(self.name().to_owned()),
-			size: self.size,
-			mime: Cow::Owned(self.mime().to_owned()),
-			key: Cow::Owned(self.key().clone()),
-			created: Some(self.created()),
-			last_modified: self.last_modified(),
-			hash: self.hash,
-		}
+	fn get_meta(&self) -> &FileMeta<'_> {
+		&self.meta
 	}
 }
 
-impl SetFileMeta for RemoteRootFile {
-	fn set_meta(&mut self, meta: FileMeta<'_>) {
-		self.file.name = meta.name.into_owned();
-		self.file.mime = meta.mime.into_owned();
-		self.file.key = meta.key.into_owned();
-		self.file.modified = meta.last_modified;
-		self.file.created = meta.created.unwrap_or_default();
+impl UpdateFileMeta for RemoteRootFile {
+	fn update_meta(&mut self, changes: FileMetaChanges) -> Result<(), Error> {
+		self.meta.apply_changes(changes)
 	}
 }
 
 impl HasMeta for RemoteRootFile {
-	fn get_meta_string(&self) -> String {
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
 		// If this fails, I want it to panic
 		// as this is a logic error
-		serde_json::to_string(&self.borrow_meta()).unwrap()
+		self.meta.try_to_string()
 	}
 }
 
@@ -511,16 +470,16 @@ impl HasType for RemoteRootFile {
 }
 
 impl HasFileInfo for RemoteRootFile {
-	fn mime(&self) -> &str {
-		self.file.mime()
+	fn mime(&self) -> Option<&str> {
+		self.meta.mime()
 	}
 
-	fn created(&self) -> DateTime<Utc> {
-		self.file.created()
+	fn created(&self) -> Option<DateTime<Utc>> {
+		self.meta.created()
 	}
 
-	fn last_modified(&self) -> DateTime<Utc> {
-		self.file.last_modified()
+	fn last_modified(&self) -> Option<DateTime<Utc>> {
+		self.meta.last_modified()
 	}
 
 	fn size(&self) -> u64 {
@@ -531,8 +490,8 @@ impl HasFileInfo for RemoteRootFile {
 		self.chunks
 	}
 
-	fn key(&self) -> &FileKey {
-		self.file.key()
+	fn key(&self) -> Option<&FileKey> {
+		self.meta.key()
 	}
 }
 
@@ -552,19 +511,27 @@ impl HasRemoteFileInfo for RemoteRootFile {
 	}
 
 	fn hash(&self) -> Option<Sha512Hash> {
-		self.hash
+		self.meta.hash()
 	}
 }
 
 impl PartialEq<RemoteFile> for RemoteRootFile {
 	fn eq(&self, other: &RemoteFile) -> bool {
-		self.file == other.file
+		self.meta == other.meta
+			&& self.uuid == other.uuid
 			&& self.size == other.size
 			&& self.region == other.region
 			&& self.bucket == other.bucket
 			&& self.chunks == other.chunks
-			&& self.hash == other.hash
 	}
 }
 
 impl File for RemoteRootFile {}
+
+pub(crate) fn make_mime(name: &str, mime: Option<String>) -> String {
+	mime.unwrap_or(
+		mime_guess::from_path(name)
+			.first_or_octet_stream()
+			.to_string(),
+	)
+}

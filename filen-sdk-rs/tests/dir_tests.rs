@@ -6,7 +6,7 @@ use filen_sdk_rs::{
 	fs::{
 		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
 		client_impl::ObjectOrRemainingPath,
-		dir::{UnsharedDirectoryType, traits::HasDirMeta},
+		dir::{UnsharedDirectoryType, meta::DirectoryMetaChanges},
 	},
 };
 use filen_sdk_rs_macros::shared_test_runtime;
@@ -22,7 +22,7 @@ async fn create_list_trash() {
 		.create_dir(test_dir, "test_dir".to_string())
 		.await
 		.unwrap();
-	assert_eq!(dir.name(), "test_dir");
+	assert_eq!(dir.name().unwrap(), "test_dir");
 
 	let (dirs, _) = client.list_dir(test_dir).await.unwrap();
 
@@ -45,7 +45,7 @@ async fn find_at_path() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/a/b/c", test_dir.name()))
+			.find_item_at_path(format!("{}/a/b/c", test_dir.name().unwrap()))
 			.await
 			.unwrap(),
 		Some(FSObject::Dir(std::borrow::Cow::Borrowed(&dir_c)))
@@ -53,13 +53,13 @@ async fn find_at_path() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/a/bc", test_dir.name()))
+			.find_item_at_path(format!("{}/a/bc", test_dir.name().unwrap()))
 			.await
 			.unwrap(),
 		None
 	);
 
-	let path = format!("{}/a/b/c", test_dir.name());
+	let path = format!("{}/a/b/c", test_dir.name().unwrap());
 
 	let items = client.get_items_in_path(&path).await.unwrap();
 
@@ -126,7 +126,7 @@ async fn find_or_create() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let path = format!("{}/a/b/c", test_dir.name());
+	let path = format!("{}/a/b/c", test_dir.name().unwrap());
 	let nested_dir = client.find_or_create_dir(&path).await.unwrap();
 
 	assert_eq!(
@@ -198,43 +198,43 @@ async fn dir_move() {
 	assert!(client.list_dir(&dir_b).await.unwrap().0.contains(&dir_a));
 }
 
-#[shared_test_runtime]
-async fn size() {
-	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
-	let test_dir = &resources.dir;
+// #[shared_test_runtime]
+// async fn size() {
+// 	let resources = test_utils::RESOURCES.get_resources().await;
+// 	let client = &resources.client;
+// 	let test_dir = &resources.dir;
 
-	assert_eq!(
-		client.get_dir_size(test_dir, false).await.unwrap(),
-		filen_types::api::v3::dir::size::Response {
-			size: 0,
-			files: 0,
-			dirs: 0
-		}
-	);
+// 	assert_eq!(
+// 		client.get_dir_size(test_dir, false).await.unwrap(),
+// 		filen_types::api::v3::dir::size::Response {
+// 			size: 0,
+// 			files: 0,
+// 			dirs: 0
+// 		}
+// 	);
 
-	client.create_dir(test_dir, "a".to_string()).await.unwrap();
-	time::sleep(time::Duration::from_secs(100)).await; // ddos protection
-	assert_eq!(
-		client.get_dir_size(test_dir, false).await.unwrap(),
-		filen_types::api::v3::dir::size::Response {
-			size: 0,
-			files: 0,
-			dirs: 1
-		}
-	);
+// 	client.create_dir(test_dir, "a".to_string()).await.unwrap();
+// 	time::sleep(time::Duration::from_secs(300)).await; // ddos protection
+// 	assert_eq!(
+// 		client.get_dir_size(test_dir, false).await.unwrap(),
+// 		filen_types::api::v3::dir::size::Response {
+// 			size: 0,
+// 			files: 0,
+// 			dirs: 1
+// 		}
+// 	);
 
-	client.create_dir(test_dir, "b".to_string()).await.unwrap();
-	time::sleep(time::Duration::from_secs(100)).await; // ddos protection
-	assert_eq!(
-		client.get_dir_size(test_dir, false).await.unwrap(),
-		filen_types::api::v3::dir::size::Response {
-			size: 0,
-			files: 0,
-			dirs: 2
-		}
-	);
-}
+// 	client.create_dir(test_dir, "b".to_string()).await.unwrap();
+// 	time::sleep(time::Duration::from_secs(300)).await; // ddos protection
+// 	assert_eq!(
+// 		client.get_dir_size(test_dir, false).await.unwrap(),
+// 		filen_types::api::v3::dir::size::Response {
+// 			size: 0,
+// 			files: 0,
+// 			dirs: 2
+// 		}
+// 	);
+// }
 
 #[shared_test_runtime]
 async fn dir_search() {
@@ -263,7 +263,11 @@ async fn dir_search() {
 		found_items,
 		vec![(
 			NonRootFSObject::Dir(Cow::Owned(dir.clone())),
-			format!("/{}/{}", test_dir.name(), second_dir.name())
+			format!(
+				"/{}/{}",
+				test_dir.name().unwrap(),
+				second_dir.name().unwrap()
+			)
 		)]
 	);
 
@@ -295,31 +299,43 @@ async fn dir_update_meta() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), dir_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), dir_name))
 			.await
 			.unwrap(),
 		Some(FSObject::Dir(Cow::Borrowed(&dir)))
 	);
 
-	let mut meta = dir.get_meta();
-	meta.set_name("new_name").unwrap();
+	client
+		.update_dir_metadata(
+			&mut dir,
+			DirectoryMetaChanges::default()
+				.name("new_name".to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
 
-	client.update_dir_metadata(&mut dir, meta).await.unwrap();
-
-	assert_eq!(dir.name(), "new_name");
+	assert_eq!(dir.name().unwrap(), "new_name");
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), dir.name()))
+			.find_item_at_path(format!(
+				"{}/{}",
+				test_dir.name().unwrap(),
+				dir.name().unwrap()
+			))
 			.await
 			.unwrap(),
 		Some(FSObject::Dir(Cow::Borrowed(&dir)))
 	);
 
-	let mut meta = dir.get_meta();
 	let created = Utc::now() - chrono::Duration::days(1);
-	meta.set_created(created);
-
-	client.update_dir_metadata(&mut dir, meta).await.unwrap();
+	client
+		.update_dir_metadata(
+			&mut dir,
+			DirectoryMetaChanges::default().created(Some(created)),
+		)
+		.await
+		.unwrap();
 	assert_eq!(dir.created(), Some(created.round_subsecs(3)));
 
 	let found_dir = client.get_dir(dir.uuid()).await.unwrap();

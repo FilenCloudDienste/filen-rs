@@ -4,13 +4,9 @@ use rand::{Rng, rngs::ThreadRng};
 use super::error::ConversionError;
 
 pub trait MetaCrypter {
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		out: Vec<u8>,
-	) -> Result<EncryptedString, (ConversionError, Vec<u8>)>;
-	fn encrypt_meta(&self, meta: &str) -> Result<EncryptedString, ConversionError> {
-		self.encrypt_meta_into(meta, Vec::new()).map_err(|(e, _)| e)
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString;
+	fn encrypt_meta(&self, meta: &str) -> EncryptedString {
+		self.encrypt_meta_into(meta, String::new())
 	}
 	fn decrypt_meta_into(
 		&self,

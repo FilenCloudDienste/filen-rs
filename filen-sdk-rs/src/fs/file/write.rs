@@ -23,7 +23,7 @@ use crate::{
 	sync::lock::ResourceLock,
 };
 
-use super::{BaseFile, RemoteFile, meta::FileMeta};
+use super::{BaseFile, RemoteFile, meta::DecryptedFileMeta};
 
 #[derive(Debug, Clone)]
 struct RemoteFileInfo {
@@ -295,21 +295,21 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		let file = self.file.clone();
 		let empty_request = filen_types::api::v3::upload::empty::Request {
 			uuid: file.uuid(),
-			name: Cow::Owned(self.client.crypter().encrypt_meta(file.name())?),
+			name: Cow::Owned(self.client.crypter().encrypt_meta(file.name())),
 			name_hashed: Cow::Owned(self.client.hash_name(file.name())),
 			size: Cow::Owned(
 				self.client
 					.crypter()
-					.encrypt_meta(&self.written.to_string())?,
+					.encrypt_meta(&self.written.to_string()),
 			),
 			parent: file.parent,
 			mime: Cow::Owned(
 				self.client
 					.crypter()
-					.encrypt_meta(self.file.as_ref().mime())?,
+					.encrypt_meta(self.file.as_ref().mime()),
 			),
 			metadata: Cow::Owned(self.client.crypter().encrypt_meta(&serde_json::to_string(
-				&FileMeta {
+				&DecryptedFileMeta {
 					name: Cow::Borrowed(file.name()),
 					size: self.written,
 					mime: Cow::Borrowed(file.mime()),
@@ -318,7 +318,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 					last_modified: file.last_modified(),
 					hash: Some(self.hash),
 				},
-			)?)?),
+			)?)),
 			version: self.client.file_encryption_version(),
 		};
 
@@ -396,14 +396,22 @@ impl<'a> FileWriterCompletingState<'a> {
 	) -> FileWriterFinalizingState<'a> {
 		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
 		let file = Arc::new(RemoteFile {
-			file: file.root,
 			parent: file.parent.into(),
 			size: response.size,
 			favorited: false,
 			region: self.remote_file_info.region,
 			bucket: self.remote_file_info.bucket,
 			chunks: response.chunks,
-			hash: Some(self.hash),
+			uuid: file.root.uuid,
+			meta: super::meta::FileMeta::Decoded(DecryptedFileMeta {
+				name: Cow::Owned(file.root.name),
+				size: response.size,
+				mime: Cow::Owned(file.root.mime),
+				key: Cow::Owned(file.root.key),
+				last_modified: file.root.modified,
+				created: Some(file.root.created),
+				hash: Some(self.hash),
+			}),
 		});
 		let futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>> = FuturesUnordered::new();
 

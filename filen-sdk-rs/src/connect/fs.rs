@@ -13,8 +13,11 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::Error,
 	fs::{
-		dir::{DirectoryMeta, DirectoryMetaType, RemoteDirectory, RootDirectoryWithMeta},
-		file::{RemoteRootFile, meta::FileMeta},
+		dir::{
+			DecryptedDirectoryMeta, DirectoryMetaType, RemoteDirectory, RootDirectoryWithMeta,
+			meta::DirectoryMeta,
+		},
+		file::{RemoteRootFile, meta::DecryptedFileMeta},
 	},
 };
 
@@ -41,7 +44,7 @@ struct DirInfo {
 	uuid: UuidStr,
 	parent: Option<UuidStr>,
 	color: Option<String>,
-	metadata: DirectoryMeta<'static>,
+	metadata: DecryptedDirectoryMeta<'static>,
 	write_access: bool,
 }
 
@@ -53,12 +56,12 @@ impl SharedDirectory {
 				parent.into(),
 				dir_info.color,
 				false,
-				dir_info.metadata,
+				DirectoryMeta::Decoded(dir_info.metadata),
 			))),
 			None => DirectoryMetaType::Root(Cow::Owned(RootDirectoryWithMeta::from_meta(
 				dir_info.uuid,
 				dir_info.color,
-				dir_info.metadata,
+				DirectoryMeta::Decoded(dir_info.metadata),
 			))),
 		};
 
@@ -83,7 +86,10 @@ impl SharedDirectory {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
 				color: shared_dir.color.map(|s| s.into_owned()),
-				metadata: DirectoryMeta::from_rsa_encrypted(&shared_dir.metadata, private_key)?,
+				metadata: DecryptedDirectoryMeta::from_rsa_encrypted(
+					&shared_dir.metadata,
+					private_key,
+				)?,
 				write_access: shared_dir.write_access,
 			},
 			sharing_role,
@@ -103,7 +109,7 @@ impl SharedDirectory {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
 				color: shared_dir.color.map(|s| s.into_owned()),
-				metadata: DirectoryMeta::from_encrypted(&shared_dir.metadata, crypter)?,
+				metadata: DecryptedDirectoryMeta::from_encrypted(&shared_dir.metadata, crypter)?,
 				write_access: shared_dir.write_access,
 			},
 			sharing_role,
@@ -131,8 +137,11 @@ impl SharedFile {
 		shared_file: SharedFileIn<'_>,
 		private_key: &RsaPrivateKey,
 	) -> Result<Self, Error> {
-		let meta =
-			FileMeta::from_rsa_encrypted(&shared_file.metadata, private_key, shared_file.version)?;
+		let meta = DecryptedFileMeta::from_rsa_encrypted(
+			&shared_file.metadata,
+			private_key,
+			shared_file.version,
+		)?;
 
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
@@ -158,7 +167,8 @@ impl SharedFile {
 		shared_file: SharedFileOut<'_>,
 		crypter: &impl MetaCrypter,
 	) -> Result<Self, Error> {
-		let meta = FileMeta::from_encrypted(&shared_file.metadata, crypter, shared_file.version)?;
+		let meta =
+			DecryptedFileMeta::from_encrypted(&shared_file.metadata, crypter, shared_file.version)?;
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
 			shared_file.size,

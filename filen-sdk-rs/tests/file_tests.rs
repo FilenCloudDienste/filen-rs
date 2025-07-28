@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	fs::{
 		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject,
 		dir::RemoteDirectory,
-		file::traits::{HasFileInfo, HasFileMeta},
+		file::{meta::FileMetaChanges, traits::HasFileInfo},
 	},
 };
 use filen_sdk_rs_macros::shared_test_runtime;
@@ -26,7 +26,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let file = client.upload_file(file.into(), contents).await.unwrap();
 
 	let found_file = match client
-		.find_item_at_path(format!("{}/{}", test_dir.name(), name))
+		.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), name))
 		.await
 		.unwrap()
 	{
@@ -90,7 +90,11 @@ async fn file_search() {
 		found_items,
 		vec![(
 			NonRootFSObject::File(Cow::Owned(file.clone())),
-			format!("/{}/{}", test_dir.name(), second_dir.name())
+			format!(
+				"/{}/{}",
+				test_dir.name().unwrap(),
+				second_dir.name().unwrap()
+			)
 		)]
 	);
 
@@ -123,7 +127,7 @@ async fn file_trash() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -137,7 +141,7 @@ async fn file_trash() {
 
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none()
@@ -146,7 +150,7 @@ async fn file_trash() {
 	client.restore_file(&mut file).await.unwrap();
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -168,7 +172,7 @@ async fn file_delete_permanently() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -178,7 +182,7 @@ async fn file_delete_permanently() {
 
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none()
@@ -209,7 +213,7 @@ async fn file_move() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -223,7 +227,7 @@ async fn file_move() {
 
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none(),
@@ -233,8 +237,8 @@ async fn file_move() {
 		client
 			.find_item_at_path(format!(
 				"{}/{}/{}",
-				test_dir.name(),
-				second_dir.name(),
+				test_dir.name().unwrap(),
+				second_dir.name().unwrap(),
 				file_name
 			))
 			.await
@@ -258,43 +262,60 @@ async fn file_update_meta() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
 	);
 
-	let mut meta = file.get_meta();
-	meta.set_name("new_name.json").unwrap();
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name("new_name.json".to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
 
-	client.update_file_metadata(&mut file, meta).await.unwrap();
-
-	assert_eq!(file.name(), "new_name.json");
+	assert_eq!(file.name().unwrap(), "new_name.json");
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file.name()))
+			.find_item_at_path(format!(
+				"{}/{}",
+				test_dir.name().unwrap(),
+				file.name().unwrap()
+			))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
 	);
 
-	let mut meta = file.get_meta();
 	let created = Utc::now() - chrono::Duration::days(1);
 	let modified = Utc::now();
 	let new_mime = "application/json";
-	meta.set_mime(new_mime);
-	meta.set_last_modified(modified);
-	meta.set_created(created);
 
-	client.update_file_metadata(&mut file, meta).await.unwrap();
-	assert_eq!(file.mime(), new_mime);
-	assert_eq!(file.created(), created.round_subsecs(3));
-	assert_eq!(file.last_modified(), modified.round_subsecs(3));
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.mime(new_mime.to_string())
+				.last_modified(modified)
+				.created(Some(created)),
+		)
+		.await
+		.unwrap();
+	assert_eq!(file.mime().unwrap(), new_mime);
+	assert_eq!(file.created().unwrap(), created.round_subsecs(3));
+	assert_eq!(file.last_modified().unwrap(), modified.round_subsecs(3));
 
 	let found_file = client.get_file(file.uuid()).await.unwrap();
-	assert_eq!(found_file.mime(), new_mime);
-	assert_eq!(found_file.created(), created.round_subsecs(3));
-	assert_eq!(found_file.last_modified(), modified.round_subsecs(3));
+	assert_eq!(found_file.mime().unwrap(), new_mime);
+	assert_eq!(found_file.created().unwrap(), created.round_subsecs(3));
+	assert_eq!(
+		found_file.last_modified().unwrap(),
+		modified.round_subsecs(3)
+	);
 	assert_eq!(found_file, file);
 }
 
@@ -321,14 +342,23 @@ async fn file_exists() {
 		.unwrap();
 
 	assert_eq!(
-		client.file_exists(file.name(), test_dir).await.unwrap(),
+		client
+			.file_exists(file.name().unwrap(), test_dir)
+			.await
+			.unwrap(),
 		Some(file.uuid())
 	);
 
-	let mut meta = file.get_meta();
 	let new_name = "new_name.json";
-	meta.set_name(new_name).unwrap();
-	client.update_file_metadata(&mut file, meta).await.unwrap();
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name(new_name.to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client.file_exists(new_name, test_dir).await.unwrap(),
@@ -359,7 +389,7 @@ async fn file_trash_empty() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -371,7 +401,7 @@ async fn file_trash_empty() {
 	client.trash_file(&mut file).await.unwrap();
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name(), file_name))
+			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none()

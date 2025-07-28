@@ -99,21 +99,22 @@ impl PartialEq for EncryptionKey {
 impl Eq for EncryptionKey {}
 
 impl MetaCrypter for EncryptionKey {
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		mut out: Vec<u8>,
-	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
+	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString {
 		let nonce: [u8; NONCE_SIZE] = rand::random();
 		let nonce = Nonce::from_slice(&nonce);
 		out.clear();
 		let base64_len =
 			base64::encoded_len(meta.len() + TAG_SIZE, true).expect("meta len too long for base64");
 		out.reserve(3 + NONCE_SIZE * 2 + base64_len);
-		out.extend_from_slice(b"003");
-		out.resize(out.len() + NONCE_SIZE * 2, 0);
-		if let Err(e) = faster_hex::hex_encode(nonce.as_slice(), &mut out[3..]) {
-			return Err((e.into(), out));
+		out.push_str("003");
+		// SAFETY: the nonce is NONCE_SIZE bytes long, and we reserve NONCE_SIZE * 2 bytes for the hex representation
+		// and the hex representation is always valid UTF-8.
+		// ideally faster_hex would provide a way to write directly into a String,
+		unsafe {
+			let out = out.as_mut_vec();
+			let out_len = out.len();
+			out.resize(out_len + nonce.len() * 2, 0);
+			faster_hex::hex_encode(nonce.as_slice(), &mut out[out_len..]).unwrap_unchecked();
 		}
 
 		// not allocating here is very difficult, so we don't bother
@@ -121,14 +122,12 @@ impl MetaCrypter for EncryptionKey {
 		// but it would almost certainly require a reallocation
 		// because we would need to extend the buffer to fit the authentication tag
 		// before base64 encoding
-		let encrypted = match self.cipher.encrypt(nonce, meta.as_bytes()) {
-			Ok(encrypted) => encrypted,
-			Err(e) => return Err((e.into(), out)),
-		};
-		let mut out_string =
-			String::from_utf8(out).map_err(|e| (e.utf8_error().into(), e.into_bytes()))?;
-		BASE64_STANDARD.encode_string(encrypted, &mut out_string);
-		Ok(EncryptedString(out_string))
+
+		// SAFETY: This cannot fail unless we encrypt more than 64GiB of metadata at a time
+		// which we will never do we also don't have AAD which could cause issues
+		let encrypted = self.cipher.encrypt(nonce, meta.as_bytes()).unwrap();
+		BASE64_STANDARD.encode_string(encrypted, &mut out);
+		EncryptedString(out)
 	}
 
 	fn decrypt_meta_into(

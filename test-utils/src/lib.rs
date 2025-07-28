@@ -18,15 +18,6 @@ pub struct TestResources {
 	pub dir: RemoteDirectory,
 }
 
-impl Default for TestResources {
-	fn default() -> Self {
-		Self {
-			client: RESOURCES.client.get().unwrap().clone(),
-			dir: RemoteDirectory::default(),
-		}
-	}
-}
-
 impl Drop for TestResources {
 	fn drop(&mut self) {
 		futures::executor::block_on(async move {

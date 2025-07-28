@@ -4,10 +4,12 @@ use filen_types::crypto::Sha512Hash;
 use crate::{
 	consts::CHUNK_SIZE_U64,
 	crypto::file::FileKey,
-	fs::{HasMeta, HasName, HasRemoteInfo, HasUUID},
+	error::Error,
+	fs::{
+		HasMeta, HasName, HasRemoteInfo, HasUUID,
+		file::meta::{FileMeta, FileMetaChanges},
+	},
 };
-
-use super::meta::FileMeta;
 
 pub trait HasRemoteFileInfo: HasRemoteInfo + HasFileInfo {
 	fn region(&self) -> &str;
@@ -16,23 +18,22 @@ pub trait HasRemoteFileInfo: HasRemoteInfo + HasFileInfo {
 }
 
 pub trait HasFileInfo {
-	fn mime(&self) -> &str;
-	fn created(&self) -> DateTime<Utc>;
-	fn last_modified(&self) -> DateTime<Utc>;
+	fn mime(&self) -> Option<&str>;
+	fn created(&self) -> Option<DateTime<Utc>>;
+	fn last_modified(&self) -> Option<DateTime<Utc>>;
 	fn size(&self) -> u64;
 	fn chunks(&self) -> u64 {
 		self.size() / CHUNK_SIZE_U64
 	}
-	fn key(&self) -> &FileKey;
+	fn key(&self) -> Option<&FileKey>;
 }
 
 pub trait HasFileMeta {
-	fn borrow_meta(&self) -> FileMeta<'_>;
-	fn get_meta(&self) -> FileMeta<'static>;
+	fn get_meta(&self) -> &FileMeta<'_>;
 }
 
-pub(crate) trait SetFileMeta {
-	fn set_meta(&mut self, meta: FileMeta<'_>);
+pub(crate) trait UpdateFileMeta {
+	fn update_meta(&mut self, changes: FileMetaChanges) -> Result<(), Error>;
 }
 
 pub trait File:

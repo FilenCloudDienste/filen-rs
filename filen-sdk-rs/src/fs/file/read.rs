@@ -91,7 +91,9 @@ impl<'a> FileReader<'a> {
 		self.futures.push_back(Box::pin(async move {
 			api::download::download_file_chunk(client.client(), file, chunk_idx, out_data.as_mut())
 				.await?;
-			file.key().decrypt_data(out_data.as_mut())?;
+			file.key()
+				.ok_or(Error::MetadataWasNotDecrypted)?
+				.decrypt_data(out_data.as_mut())?;
 			Ok(out_data)
 		}));
 	}

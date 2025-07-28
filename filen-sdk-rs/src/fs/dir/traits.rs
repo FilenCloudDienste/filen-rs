@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
 use filen_types::fs::{ParentUuid, UuidStr};
 
-use crate::fs::traits::HasUUID;
-
-use super::DirectoryMeta;
+use crate::{
+	error::Error,
+	fs::{
+		dir::meta::{DirectoryMeta, DirectoryMetaChanges},
+		traits::HasUUID,
+	},
+};
 
 pub trait HasContents: Send + Sync {
 	fn uuid_as_parent(&self) -> ParentUuid;
@@ -34,10 +38,9 @@ pub trait HasDirInfo {
 }
 
 pub trait HasDirMeta {
-	fn borrow_meta(&self) -> DirectoryMeta<'_>;
-	fn get_meta(&self) -> DirectoryMeta<'static>;
+	fn get_meta(&self) -> &DirectoryMeta;
 }
 
-pub(crate) trait SetDirMeta {
-	fn set_meta(&mut self, meta: DirectoryMeta<'_>);
+pub(crate) trait UpdateDirMeta {
+	fn update_meta(&mut self, meta: DirectoryMetaChanges) -> Result<(), Error>;
 }

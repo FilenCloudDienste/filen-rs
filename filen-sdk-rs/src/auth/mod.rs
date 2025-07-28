@@ -57,11 +57,7 @@ impl MetaCrypter for MetaKey {
 		}
 	}
 
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		out: Vec<u8>,
-	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString {
 		match self {
 			MetaKey::V1(info) | MetaKey::V2(info) => info.encrypt_meta_into(meta, out),
 			MetaKey::V3(info) => info.encrypt_meta_into(meta, out),
@@ -116,11 +112,7 @@ impl MetaCrypter for AuthInfo {
 		}
 	}
 
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		out: Vec<u8>,
-	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString {
 		match self {
 			AuthInfo::V1(info) | AuthInfo::V2(info) => info.encrypt_meta_into(meta, out),
 			AuthInfo::V3(info) => info.encrypt_meta_into(meta, out),
@@ -269,17 +261,14 @@ impl Client {
 		self.get_meta_key_from_str(&decrypted_str)
 	}
 
-	pub(crate) fn encrypt_meta_key(
-		&self,
-		key: &MetaKey,
-	) -> Result<EncryptedMetaKey, ConversionError> {
-		Ok(EncryptedMetaKey(match key {
+	pub(crate) fn encrypt_meta_key(&self, key: &MetaKey) -> EncryptedMetaKey {
+		EncryptedMetaKey(match key {
 			MetaKey::V1(_) => {
 				unimplemented!("V1 encryption is not supported in this version of the SDK")
 			}
 			MetaKey::V2(key) => self.crypter().encrypt_meta(key.as_ref()),
 			MetaKey::V3(key) => self.crypter().encrypt_meta(&key.to_string()),
-		}?))
+		})
 	}
 
 	pub async fn login(email: String, pwd: &str, two_factor_code: &str) -> Result<Self, Error> {

@@ -26,11 +26,7 @@ pub(crate) struct AuthInfo {
 }
 
 impl MetaCrypter for AuthInfo {
-	fn encrypt_meta_into(
-		&self,
-		meta: &str,
-		out: Vec<u8>,
-	) -> Result<EncryptedString, (ConversionError, Vec<u8>)> {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString {
 		self.master_keys.encrypt_meta_into(meta, out)
 	}
 

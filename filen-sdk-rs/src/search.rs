@@ -13,8 +13,8 @@ use crate::{
 	error::Error,
 	fs::{
 		HasName, HasType, HasUUID, NonRootFSObject,
-		dir::{DirectoryMeta, RemoteDirectory},
-		file::{RemoteFile, meta::FileMeta},
+		dir::{DecryptedDirectoryMeta, RemoteDirectory},
+		file::{RemoteFile, meta::DecryptedFileMeta},
 	},
 };
 
@@ -118,18 +118,20 @@ pub fn split_name(input: &str, min_len: usize, max_len: usize) -> SplitName {
 }
 
 impl Client {
-	pub fn generate_search_items_for_item<I>(&self, item: &I) -> Vec<SearchAddItem>
+	pub fn generate_search_items_for_item<I>(&self, item: &I) -> Result<Vec<SearchAddItem>, Error>
 	where
 		I: HasName + HasUUID + HasType,
 	{
-		split_name(item.name(), 2, 16)
-			.iter()
-			.map(move |s| SearchAddItem {
-				hash: self.hmac_key.hash(s.as_bytes()),
-				uuid: item.uuid(),
-				r#type: item.object_type().into(),
-			})
-			.collect()
+		Ok(
+			split_name(item.name().ok_or(Error::MetadataWasNotDecrypted)?, 2, 16)
+				.iter()
+				.map(move |s| SearchAddItem {
+					hash: self.hmac_key.hash(s.as_bytes()),
+					uuid: item.uuid(),
+					r#type: item.object_type().into(),
+				})
+				.collect(),
+		)
 	}
 
 	pub async fn update_search_hashes_for_item<I>(
@@ -139,7 +141,7 @@ impl Client {
 	where
 		I: HasName + HasUUID + HasType,
 	{
-		let items = self.generate_search_items_for_item(item);
+		let items = self.generate_search_items_for_item(item)?;
 		api::v3::search::add::post(self.client(), &api::v3::search::add::Request { items }).await
 	}
 
@@ -166,13 +168,13 @@ impl Client {
 							found_dir.parent.into(),
 							found_dir.color.map(|s| s.into_owned()),
 							found_dir.favorited,
-							&found_dir.metadata,
+							found_dir.metadata,
 							self.crypter(),
-						)?)),
+						))),
 						found_dir.metadata_path,
 					),
 					SearchFindItem::File(found_file) => {
-						let meta = FileMeta::from_encrypted(
+						let meta = DecryptedFileMeta::from_encrypted(
 							&found_file.metadata,
 							self.crypter(),
 							found_file.version,
@@ -204,10 +206,12 @@ impl Client {
 									return Some(Err(e));
 								}
 							};
-							Some(match serde_json::from_str::<DirectoryMeta>(&decrypted) {
-								Ok(meta) => Ok(meta),
-								Err(e) => Err(e.into()),
-							})
+							Some(
+								match serde_json::from_str::<DecryptedDirectoryMeta>(&decrypted) {
+									Ok(meta) => Ok(meta),
+									Err(e) => Err(e.into()),
+								},
+							)
 						}
 					})
 					.try_fold("/".to_string(), |mut acc, meta| match meta {

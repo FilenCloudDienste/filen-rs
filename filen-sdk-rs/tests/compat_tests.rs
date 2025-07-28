@@ -252,11 +252,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 	{
 		Some(FSObject::File(file)) => {
 			let compat_test_file = compat_test_file.uuid(file.uuid()).build();
-			assert_eq!(
-				*file.inner_file(),
-				compat_test_file.root,
-				"file inner_file mismatch"
-			);
+			assert_eq!(*file, compat_test_file, "file inner_file mismatch");
 
 			let buf = client.download_file(file.as_ref()).await.unwrap();
 			assert_eq!(test_str.len(), buf.len(), "file size mismatch");

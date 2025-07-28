@@ -9,14 +9,21 @@ use crate::{
 	consts::CHUNK_SIZE_U64,
 	crypto::shared::MetaCrypter,
 	error::Error,
-	fs::{HasUUID, dir::HasUUIDContents},
+	fs::{
+		HasUUID,
+		dir::HasUUIDContents,
+		file::{
+			meta::{FileMeta, FileMetaChanges},
+			traits::HasFileMeta,
+		},
+	},
 };
 
 use super::{
 	BaseFile, FileBuilder, RemoteFile,
-	meta::FileMeta,
+	meta::DecryptedFileMeta,
 	read::FileReader,
-	traits::{File, SetFileMeta},
+	traits::{File, UpdateFileMeta},
 	write::FileWriter,
 };
 
@@ -78,25 +85,31 @@ impl Client {
 	pub async fn update_file_metadata(
 		&self,
 		file: &mut RemoteFile,
-		new_meta: FileMeta<'_>,
+		changes: FileMetaChanges,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
+
+		let temp_meta = file.get_meta().borrow_with_changes(&changes)?;
+		let FileMeta::Decoded(temp_meta) = temp_meta else {
+			return Err(Error::MetadataWasNotDecrypted);
+		};
+
 		api::v3::file::metadata::post(
 			self.client(),
 			&api::v3::file::metadata::Request {
 				uuid: file.uuid(),
-				name: Cow::Borrowed(&self.crypter().encrypt_meta(&new_meta.name)?),
-				name_hashed: Cow::Borrowed(&self.hash_name(&new_meta.name)),
+				name: Cow::Borrowed(&self.crypter().encrypt_meta(temp_meta.name())),
+				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
 				metadata: Cow::Borrowed(
 					&self
 						.crypter()
-						.encrypt_meta(&serde_json::to_string(&new_meta)?)?,
+						.encrypt_meta(&serde_json::to_string(&temp_meta)?),
 				),
 			},
 		)
 		.await?;
 
-		file.set_meta(new_meta);
+		file.update_meta(changes)?;
 
 		self.update_maybe_connected_item(file).await?;
 		Ok(())
@@ -104,7 +117,11 @@ impl Client {
 
 	pub async fn get_file(&self, uuid: UuidStr) -> Result<RemoteFile, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
-		let meta = FileMeta::from_encrypted(&response.metadata, self.crypter(), response.version)?;
+		let meta = DecryptedFileMeta::from_encrypted(
+			&response.metadata,
+			self.crypter(),
+			response.version,
+		)?;
 		Ok(RemoteFile::from_meta(
 			uuid,
 			// v3 api returns the original parent as the parent if the file is in the trash
