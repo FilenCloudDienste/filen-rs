@@ -470,3 +470,31 @@ async fn file_favorite() {
 	client.set_favorite(&mut file, false).await.unwrap();
 	assert!(!file.favorited());
 }
+
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn file_malformed_meta() {
+	use filen_sdk_rs::fs::file::{meta::FileMeta, traits::HasFileMeta};
+
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let uuid = client
+		.create_malformed_file(
+			test_dir,
+			"malformed_meta",
+			"malformed_meta",
+			"asdfsadfasfd",
+			"asdfsaf",
+		)
+		.await
+		.unwrap();
+
+	let file = client.get_file(uuid).await.unwrap();
+	assert!(matches!(file.get_meta(), FileMeta::Encrypted(_)));
+
+	let files = client.list_dir(test_dir).await.unwrap().1;
+	assert!(files.iter().any(|f| f.uuid() == uuid));
+	assert_eq!(files.len(), 1);
+}

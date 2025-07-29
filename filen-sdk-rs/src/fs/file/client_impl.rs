@@ -190,4 +190,33 @@ impl Client {
 	) -> Result<FileWriter<'a>, Error> {
 		self.inner_get_file_writer(file.into(), Some(callback), None)
 	}
+
+	#[cfg(feature = "malformed")]
+	pub async fn create_malformed_file(
+		&self,
+		parent: &impl HasUUIDContents,
+		name: impl Into<String>,
+		meta: impl Into<String>,
+		mime: impl Into<String>,
+		size: impl Into<String>,
+	) -> Result<UuidStr, Error> {
+		use filen_types::crypto::EncryptedString;
+		let uuid = UuidStr::new_v4();
+		let name = name.into();
+		api::v3::upload::empty::post(
+			self.client(),
+			&api::v3::upload::empty::Request {
+				name_hashed: Cow::Owned(self.hash_name(&name)),
+				uuid,
+				parent: parent.uuid(),
+				metadata: Cow::Owned(EncryptedString(meta.into())),
+				name: Cow::Owned(EncryptedString(name)),
+				size: Cow::Owned(EncryptedString(size.into())),
+				mime: Cow::Owned(EncryptedString(mime.into())),
+				version: filen_types::auth::FileEncryptionVersion::V2,
+			},
+		)
+		.await?;
+		Ok(uuid)
+	}
 }

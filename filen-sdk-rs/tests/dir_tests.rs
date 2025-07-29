@@ -362,3 +362,28 @@ async fn dir_favorite() {
 	client.set_favorite(&mut dir, false).await.unwrap();
 	assert!(!dir.favorited());
 }
+
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn dir_malformed_meta() {
+	use filen_sdk_rs::fs::dir::{meta::DirectoryMeta, traits::HasDirMeta};
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let uuid = client
+		.create_malformed_dir(
+			test_dir,
+			"malformed".to_string(),
+			"malformed meta".to_string(),
+		)
+		.await
+		.unwrap();
+
+	let dirs = client.list_dir(test_dir).await.unwrap().0;
+	assert!(dirs.iter().any(|d| d.uuid() == uuid));
+	assert!(matches!(dirs[0].get_meta(), DirectoryMeta::Encrypted(_)));
+
+	let dir = client.get_dir(uuid).await.unwrap();
+	assert!(matches!(dir.get_meta(), DirectoryMeta::Encrypted(_)));
+}

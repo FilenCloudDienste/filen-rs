@@ -72,6 +72,30 @@ impl Client {
 		Ok(dir)
 	}
 
+	#[cfg(feature = "malformed")]
+	pub async fn create_malformed_dir(
+		&self,
+		parent: &dyn HasUUIDContents,
+		name: &str,
+		contents: impl Into<String>,
+	) -> Result<UuidStr, Error> {
+		use filen_types::crypto::EncryptedString;
+		let _lock = self.lock_drive().await?;
+
+		let uuid = UuidStr::new_v4();
+		let response = api::v3::dir::create::post(
+			self.client(),
+			&api::v3::dir::create::Request {
+				uuid,
+				parent: parent.uuid(),
+				name_hashed: Cow::Borrowed(&self.hash_name(name)),
+				meta: Cow::Borrowed(&EncryptedString(contents.into())),
+			},
+		)
+		.await?;
+		Ok(response.uuid)
+	}
+
 	pub async fn get_dir(&self, uuid: UuidStr) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
