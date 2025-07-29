@@ -167,8 +167,8 @@ async fn file_public_link() {
 
 	let linked_info = client.get_linked_file(&link).await.unwrap();
 	assert_eq!(linked_info.uuid, file.uuid());
-	assert_eq!(linked_info.name, file.name().unwrap());
-	assert_eq!(linked_info.mime, file.mime().unwrap());
+	assert_eq!(linked_info.name.as_deref(), file.name());
+	assert_eq!(linked_info.mime.as_deref(), file.mime());
 	assert_eq!(
 		&PasswordState::Hashed(linked_info.hashed_password.clone().unwrap()),
 		found_link.password()
@@ -191,7 +191,7 @@ async fn file_public_link() {
 		.await
 		.unwrap();
 	let linked_info = client.get_linked_file(&link).await.unwrap();
-	assert_eq!(linked_info.name, "new_file_name.txt");
+	assert_eq!(linked_info.name.unwrap(), "new_file_name.txt");
 }
 
 #[shared_test_runtime]

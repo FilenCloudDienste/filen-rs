@@ -44,8 +44,8 @@ pub struct User {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkedFileInfo {
 	pub uuid: UuidStr,
-	pub name: String,
-	pub mime: String,
+	pub name: Option<String>,
+	pub mime: Option<String>,
 	pub hashed_password: Option<Vec<u8>>,
 	pub chunks: u64,
 	pub size: u64,
@@ -184,7 +184,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirPublicLink {
 	link_uuid: UuidStr,
-	link_key: MetaKey,
+	link_key: Option<MetaKey>,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	enable_download: bool,
@@ -195,7 +195,7 @@ impl DirPublicLink {
 	pub(crate) fn new(link_key: MetaKey) -> Self {
 		Self {
 			link_uuid: UuidStr::new_v4(),
-			link_key,
+			link_key: Some(link_key),
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
 			enable_download: true,
@@ -234,8 +234,8 @@ impl DirPublicLink {
 		self.enable_download = enable_download;
 	}
 
-	pub(crate) fn crypter(&self) -> &impl MetaCrypter {
-		&self.link_key
+	pub(crate) fn crypter(&self) -> Option<&impl MetaCrypter> {
+		self.link_key.as_ref()
 	}
 }
 
@@ -317,7 +317,9 @@ impl Client {
 		let mut futures = FuturesUnordered::new();
 		for link in linked.links {
 			futures.push(Box::pin(async move {
-				let crypter = self.decrypt_meta_key(&link.link_key)?;
+				let crypter = self
+					.decrypt_meta_key(&link.link_key)
+					.map_err(|_| Error::MetadataWasNotDecrypted)?;
 				self.update_linked_item_meta(item, link.link_uuid, &crypter)
 					.await
 			})
@@ -377,7 +379,10 @@ impl Client {
 
 		for link in linked.links {
 			let link = Arc::new(link);
-			let crypter = Arc::new(self.decrypt_meta_key(&link.link_key)?);
+			let crypter = Arc::new(
+				self.decrypt_meta_key(&link.link_key)
+					.map_err(|_| Error::MetadataWasNotDecrypted)?,
+			);
 			for item in &items_to_process {
 				let link = link.clone();
 				let crypter = crypter.clone();
@@ -441,14 +446,22 @@ impl Client {
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
-			link_key: Cow::Owned(self.encrypt_meta_key(&public_link.link_key)),
+			link_key: Cow::Owned(
+				self.encrypt_meta_key(
+					public_link
+						.link_key
+						.as_ref()
+						.ok_or(Error::MetadataWasNotDecrypted)?,
+				),
+			),
 		};
 
 		let mut futures = FuturesUnordered::new();
 
 		// link main dir
 		let link = &link;
-		let key = &public_link.link_key;
+		let key = public_link.link_key.as_ref();
+		let key = key.ok_or(Error::MetadataWasNotDecrypted)?;
 		futures.push(Box::pin(async move {
 			api::v3::dir::link::add::post(
 				self.client(),
@@ -470,13 +483,11 @@ impl Client {
 
 		// link descendants
 		for dir in dirs {
-			let key = &public_link.link_key;
 			futures.push(Box::pin(
 				async move { self.add_item_to_directory_link(&dir, link, key).await },
 			) as BoxFuture<'_, Result<(), Error>>);
 		}
 		for file in files {
-			let key = &public_link.link_key;
 			futures.push(Box::pin(
 				async move { self.add_item_to_directory_link(&file, link, key).await },
 			) as BoxFuture<'_, Result<(), Error>>);
@@ -616,8 +627,8 @@ impl Client {
 
 		let file_info = LinkedFileInfo {
 			uuid: response.uuid,
-			name: self.crypter().decrypt_meta(&response.name)?,
-			mime: self.crypter().decrypt_meta(&response.mime)?,
+			name: self.crypter().decrypt_meta(&response.name).ok(),
+			mime: self.crypter().decrypt_meta(&response.mime).ok(),
 			hashed_password: response.password.map(|v| v.into_owned()),
 			chunks: response.chunks,
 			size,
@@ -659,7 +670,7 @@ impl Client {
 		};
 		Ok(Some(DirPublicLink {
 			link_uuid: link_status.uuid,
-			link_key: self.decrypt_meta_key(&link_status.key)?,
+			link_key: self.decrypt_meta_key(&link_status.key).ok(),
 			password,
 			expiration: link_status.expiration_text,
 			enable_download: link_status.download_btn,
@@ -682,6 +693,8 @@ impl Client {
 		)
 		.await?;
 
+		let crypter = link.crypter().ok_or(Error::MetadataWasNotDecrypted)?;
+
 		let dirs = response
 			.dirs
 			.into_iter()
@@ -692,7 +705,7 @@ impl Client {
 					d.color.map(|c| c.into_owned()),
 					false,
 					d.metadata,
-					link.crypter(),
+					crypter,
 				)
 			})
 			.collect::<Vec<_>>();
@@ -701,7 +714,7 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
-				let meta = FileMeta::from_encrypted(f.metadata, link.crypter(), f.version);
+				let meta = FileMeta::from_encrypted(f.metadata, crypter, f.version);
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent.into(),
