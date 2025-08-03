@@ -1,5 +1,9 @@
 use filen_sdk_rs::{
-	fs::{HasUUID, NonRootFSObject, dir::RemoteDirectory, file::RemoteFile},
+	fs::{
+		HasUUID, NonRootFSObject,
+		dir::{RemoteDirectory, meta::DirectoryMeta},
+		file::{RemoteFile, meta::FileMeta},
+	},
 	util::PathIteratorExt,
 };
 use filen_types::fs::{ParentUuid, UuidStr};
@@ -504,5 +508,55 @@ impl FromSql for MetaState {
 impl ToSql for MetaState {
 	fn to_sql(&self) -> Result<rusqlite::types::ToSqlOutput<'_>, rusqlite::Error> {
 		Ok(rusqlite::types::ToSqlOutput::from(*self as u8))
+	}
+}
+
+enum RawMeta<'a> {
+	Decoded,
+	Decrypted(&'a [u8]),
+	Encrypted(&'a str),
+	RSAEncrypted(&'a str),
+}
+
+fn raw_meta_and_state_from_dir_meta<'a>(dir_meta: &'a DirectoryMeta) -> (MetaState, RawMeta<'a>) {
+	match dir_meta {
+		DirectoryMeta::Decoded(_) => (MetaState::Decoded, RawMeta::Decoded),
+		DirectoryMeta::DecryptedRaw(cow) => (MetaState::Decrypted, RawMeta::Decrypted(cow)),
+		DirectoryMeta::DecryptedUTF8(cow) => {
+			(MetaState::Decrypted, RawMeta::Decrypted(cow.as_bytes()))
+		}
+		DirectoryMeta::Encrypted(cow) => (MetaState::Encrypted, RawMeta::Encrypted(&cow.0)),
+		DirectoryMeta::RSAEncrypted(cow) => {
+			(MetaState::RSAEncrypted, RawMeta::RSAEncrypted(&cow.0))
+		}
+	}
+}
+
+fn raw_meta_and_state_from_file_meta<'a>(dir_meta: &'a FileMeta) -> (MetaState, RawMeta<'a>) {
+	match dir_meta {
+		FileMeta::Decoded(_) => (MetaState::Decoded, RawMeta::Decoded),
+		FileMeta::DecryptedRaw(cow) => (MetaState::Decrypted, RawMeta::Decrypted(cow)),
+		FileMeta::DecryptedUTF8(cow) => (MetaState::Decrypted, RawMeta::Decrypted(cow.as_bytes())),
+		FileMeta::Encrypted(cow) => (MetaState::Encrypted, RawMeta::Encrypted(&cow.0)),
+		FileMeta::RSAEncrypted(cow) => (MetaState::RSAEncrypted, RawMeta::RSAEncrypted(&cow.0)),
+	}
+}
+
+impl ToSql for RawMeta<'_> {
+	fn to_sql(&self) -> Result<rusqlite::types::ToSqlOutput<'_>, rusqlite::Error> {
+		match self {
+			RawMeta::Decoded => Ok(rusqlite::types::ToSqlOutput::Owned(
+				rusqlite::types::Value::Null,
+			)),
+			RawMeta::Decrypted(bytes) => Ok(rusqlite::types::ToSqlOutput::Borrowed(
+				ValueRef::Blob(bytes),
+			)),
+			RawMeta::Encrypted(s) => Ok(rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(
+				s.as_bytes(),
+			))),
+			RawMeta::RSAEncrypted(s) => Ok(rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(
+				s.as_bytes(),
+			))),
+		}
 	}
 }

@@ -23,6 +23,7 @@ use crate::{
 		MetaState, SQLError,
 		item::{self, DBItemTrait, InnerDBItem},
 		object::{DBNonRootObject, DBObject, JsonObject},
+		raw_meta_and_state_from_dir_meta,
 		statements::*,
 	},
 };
@@ -177,13 +178,8 @@ impl DBDir {
 		trace!("Upserting remote dir: {remote_dir:?}");
 
 		let meta = remote_dir.get_meta();
-		let (meta_state, meta) = match meta {
-			DirectoryMeta::Decoded(_) => (MetaState::Decoded, None),
-			DirectoryMeta::DecryptedRaw(cow) => (MetaState::Decrypted, Some(cow.as_ref())),
-			DirectoryMeta::DecryptedUTF8(cow) => (MetaState::Decrypted, Some(cow.as_bytes())),
-			DirectoryMeta::Encrypted(cow) => (MetaState::Encrypted, Some(cow.0.as_bytes())),
-			DirectoryMeta::RSAEncrypted(cow) => (MetaState::RSAEncrypted, Some(cow.0.as_bytes())),
-		};
+
+		let (meta_state, meta) = raw_meta_and_state_from_dir_meta(meta);
 
 		let (last_listed, favorite_rank) = upsert_dir.query_one(
 			(

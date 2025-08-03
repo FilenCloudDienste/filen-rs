@@ -27,6 +27,7 @@ use crate::{
 		MetaState, SQLError,
 		item::{self, DBItemTrait, InnerDBItem},
 		object::{DBObject, JsonObject},
+		raw_meta_and_state_from_file_meta,
 		statements::*,
 	},
 };
@@ -243,13 +244,7 @@ impl DBFile {
 			remote_file.uuid()
 		);
 		let meta = remote_file.get_meta();
-		let (meta_state, meta) = match meta {
-			FileMeta::Decoded(_) => (MetaState::Decoded, None),
-			FileMeta::DecryptedRaw(cow) => (MetaState::Decrypted, Some(cow.as_ref())),
-			FileMeta::DecryptedUTF8(cow) => (MetaState::Decrypted, Some(cow.as_bytes())),
-			FileMeta::Encrypted(cow) => (MetaState::Encrypted, Some(cow.0.as_bytes())),
-			FileMeta::RSAEncrypted(cow) => (MetaState::RSAEncrypted, Some(cow.0.as_bytes())),
-		};
+		let (meta_state, meta) = raw_meta_and_state_from_file_meta(meta);
 
 		let favorite_rank = upsert_file.query_one(
 			(

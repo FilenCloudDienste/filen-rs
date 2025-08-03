@@ -4513,3 +4513,53 @@ pub async fn test_search() {
 		"Expected no orphaned search results after update"
 	);
 }
+
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+pub async fn test_malformed() {
+	let (db, rss) = get_db_resources().await;
+
+	let test_dir_id: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+
+	// Create a directory with a malformed name
+	let dir = rss
+		.client
+		.create_malformed_dir(&rss.dir, "asdfs", "dsfsdf")
+		.await
+		.unwrap();
+
+	db.update_dir_children(test_dir_id.clone()).await.unwrap();
+	let resp = db.query_dir_children(&test_dir_id, None).unwrap().unwrap();
+	assert_eq!(resp.objects.len(), 1);
+	let FfiNonRootObject::Dir(malformed_dir) = &resp.objects[0] else {
+		panic!("Expected a directory object");
+	};
+	assert!(malformed_dir.meta.is_none());
+	assert_eq!(malformed_dir.uuid, dir.uuid().as_ref());
+
+	let file = rss
+		.client
+		.create_malformed_file(&rss.dir, "asdfsa", "asdfsa", "asdf", "asdf")
+		.await
+		.unwrap();
+
+	db.update_dir_children(test_dir_id.clone()).await.unwrap();
+	let resp = db.query_dir_children(&test_dir_id, None).unwrap().unwrap();
+	println!("Resp: {:?}", resp);
+	assert_eq!(resp.objects.len(), 2);
+	let malformed_file = resp
+		.objects
+		.into_iter()
+		.filter_map(|obj| {
+			if let FfiNonRootObject::File(f) = obj {
+				Some(f)
+			} else {
+				None
+			}
+		})
+		.find(|f| f.uuid == file.uuid().as_ref())
+		.unwrap();
+	assert!(malformed_file.meta.is_none());
+	assert_eq!(malformed_file.uuid, file.uuid().as_ref());
+}
