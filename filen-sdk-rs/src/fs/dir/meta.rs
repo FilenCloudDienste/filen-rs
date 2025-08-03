@@ -147,11 +147,11 @@ impl<'a> DirectoryMeta<'a> {
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct DecryptedDirectoryMeta<'a> {
-	pub(super) name: Cow<'a, str>,
+	pub name: Cow<'a, str>,
 	#[serde(with = "filen_types::serde::time::optional")]
 	#[serde(rename = "creation")]
 	#[serde(default)]
-	pub(super) created: Option<DateTime<Utc>>,
+	pub created: Option<DateTime<Utc>>,
 }
 
 impl<'a> DecryptedDirectoryMeta<'a> {

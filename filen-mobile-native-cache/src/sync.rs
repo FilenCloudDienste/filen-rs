@@ -18,7 +18,7 @@ use crate::{
 	CacheError,
 	auth::AuthCacheState,
 	ffi::PathFfiId,
-	sql::{self, DBDir, DBDirObject, DBFile, DBItemTrait, DBObject, DBRoot},
+	sql::{self, DBDirObject, DBItemTrait, DBRoot, dir::DBDir, file::DBFile, object::DBObject},
 };
 
 #[allow(unused)]
@@ -203,8 +203,8 @@ impl AuthCacheState {
 		path_values: &'a PathFfiId<'a>,
 	) -> Result<UpdateItemsInPath<'a>, CacheError> {
 		debug!(
-			"Updating items in path: {}, root: {}, name: {}",
-			path_values.full_path, path_values.root_uuid, path_values.name
+			"Updating items in path: {}, root: {}, name or uuid: {}",
+			path_values.full_path, path_values.root_uuid, path_values.name_or_uuid
 		);
 		let (objects, all) = sql::select_objects_in_path(&self.conn(), path_values)?;
 		let mut futures = get_required_update_futures(objects, all, &self.client)?;

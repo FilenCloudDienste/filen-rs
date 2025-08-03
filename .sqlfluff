@@ -1,5 +1,6 @@
 [sqlfluff]
 dialect = sqlite
+exclude_rules = ST06
 
 [sqlfluff:indentation]
 indent_unit = tab

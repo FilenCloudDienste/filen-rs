@@ -180,17 +180,17 @@ impl<'a> FileMeta<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptedFileMeta<'a> {
-	pub(super) name: Cow<'a, str>,
-	pub(super) size: u64,
-	pub(super) mime: Cow<'a, str>,
-	pub(super) key: Cow<'a, FileKey>,
+	pub name: Cow<'a, str>,
+	pub size: u64,
+	pub mime: Cow<'a, str>,
+	pub key: Cow<'a, FileKey>,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
-	pub(super) last_modified: DateTime<Utc>,
+	pub last_modified: DateTime<Utc>,
 	#[serde(with = "filen_types::serde::time::optional")]
 	#[serde(rename = "creation")]
 	#[serde(default)]
-	pub(super) created: Option<DateTime<Utc>>,
-	pub(super) hash: Option<Sha512Hash>,
+	pub created: Option<DateTime<Utc>>,
+	pub hash: Option<Sha512Hash>,
 }
 
 impl<'a> DecryptedFileMeta<'a> {

@@ -16,7 +16,7 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, CacheState, FilenMobileCacheState},
 	ffi::FfiId,
-	sql::{self, DBObject},
+	sql::{self, object::DBObject},
 };
 
 impl AuthCacheState {
@@ -26,11 +26,13 @@ impl AuthCacheState {
 		target_width: u32,
 		target_height: u32,
 	) -> Result<Option<PathBuf>, CacheError> {
-		if !file.mime().starts_with("image/") {
-			debug!(
-				"File is not an image, no thumbnail will be made: {}",
-				file.mime()
-			);
+		let Some(mime) = file.mime() else {
+			debug!("File has no mime type, no thumbnail will be made");
+			return Ok(None);
+		};
+
+		if !mime.starts_with("image/") {
+			debug!("File is not an image, no thumbnail will be made: {mime}");
 			return Ok(None);
 		}
 		let uuid_str = file.uuid().to_string();

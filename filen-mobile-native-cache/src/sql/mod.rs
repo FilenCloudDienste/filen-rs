@@ -5,20 +5,37 @@ use filen_sdk_rs::{
 use filen_types::fs::{ParentUuid, UuidStr};
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use log::{debug, trace};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{
+	Connection, OptionalExtension, ToSql,
+	types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
+};
 
-pub mod types;
-pub use types::*;
 pub mod error;
 pub use error::SQLError;
+pub mod dir;
+pub mod file;
+pub mod item;
+pub mod object;
 pub(crate) mod statements;
 use statements::*;
 
 use crate::{
 	CacheError,
 	ffi::{ItemType, ParsedFfiId, PathFfiId, SearchQueryArgs},
-	sql::json_object::JsonObject,
+	sql::{
+		dir::DBDir,
+		file::DBFile,
+		item::RawDBItem,
+		object::{DBNonRootObject, DBObject, JsonObject},
+	},
 };
+
+pub(crate) use dir::*;
+pub(crate) use file::*;
+pub(crate) use item::*;
+pub(crate) use object::*;
+
+pub(crate) type SQLResult<T> = std::result::Result<T, SQLError>;
 
 /// Selects object in a path starting from the root UUID.
 ///
@@ -93,7 +110,7 @@ pub(crate) fn insert_root(conn: &mut Connection, root: UuidStr) -> Result<(), ru
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{
 		let mut stmt = tx.prepare_cached(INSERT_ROOT_INTO_ITEMS)?;
-		let id: i64 = match stmt.query_one((root, "", ItemType::Root as i8), |row| row.get(0)) {
+		let id: i64 = match stmt.query_one((root, ItemType::Root as i8), |row| row.get(0)) {
 			Ok(id) => id,
 			Err(rusqlite::Error::SqliteFailure(
 				libsqlite3_sys::Error {
@@ -143,13 +160,13 @@ fn get_all_descendant_paths_with_stmt(
 	let items = stmt
 		.query_and_then([uuid], |f| -> Result<_, rusqlite::Error> {
 			let uuid = f.get::<_, UuidStr>(0)?;
-			let name = f.get::<_, String>(1)?;
-			let item_type = f.get::<_, ItemType>(2)?;
-			Ok((uuid, name, item_type))
+			let item_type = f.get::<_, ItemType>(1)?;
+			let name_or_uuid = f.get::<_, String>(2)?;
+			Ok((uuid, name_or_uuid, item_type))
 		})?
 		.collect::<Result<Vec<_>, rusqlite::Error>>()?;
-	for (uuid, name, item_type) in items {
-		let current_path = format!("{current_path}/{name}");
+	for (uuid, name_or_uuid, item_type) in items {
+		let current_path = format!("{current_path}/{name_or_uuid}");
 		if item_type == ItemType::Dir || item_type == ItemType::Root {
 			get_all_descendant_paths_with_stmt(uuid, &current_path, stmt, paths)?;
 		}
@@ -163,7 +180,7 @@ pub(crate) fn get_all_descendant_paths(
 	uuid: UuidStr,
 	current_path: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
-	let mut stmt = conn.prepare_cached(SELECT_UUID_NAME_TYPE_BY_PARENT)?;
+	let mut stmt = conn.prepare_cached(SELECT_UUID_TYPE_NAME_BY_PARENT)?;
 	let mut paths = Vec::new();
 	get_all_descendant_paths_with_stmt(uuid, current_path, &mut stmt, &mut paths)?;
 	Ok(paths)
@@ -203,20 +220,35 @@ pub(crate) fn update_recents(
 
 		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
 		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
+		let mut upset_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
+		let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
 		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
 		let mut update_recent = tx.prepare_cached(UPDATE_ITEM_SET_RECENT)?;
+		let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
+		let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
 
 		for dir in dirs {
 			trace!("Updating recent directory: {}", dir.uuid());
-			let dir = DBDir::upsert_from_remote_stmts(dir, &mut upsert_item_stmt, &mut upsert_dir)?;
+			let dir = DBDir::upsert_from_remote_stmts(
+				dir,
+				&mut upsert_item_stmt,
+				&mut upsert_dir,
+				&mut upset_dir_meta,
+				&mut delete_dir_meta,
+			)?;
 			trace!("Updating recent directory: {}", dir.id);
 			update_recent.execute([dir.id])?;
 		}
 
 		for file in files {
 			trace!("Updating recent file: {}", file.uuid());
-			let file: DBFile =
-				DBFile::upsert_from_remote_stmts(file, &mut upsert_item_stmt, &mut upsert_file)?;
+			let file: DBFile = DBFile::upsert_from_remote_stmts(
+				file,
+				&mut upsert_item_stmt,
+				&mut upsert_file,
+				&mut upsert_file_meta,
+				&mut delete_file_meta,
+			)?;
 			trace!("Updating recent file: {}", file.id);
 			update_recent.execute([file.id])?;
 		}
@@ -244,8 +276,12 @@ where
 
 		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
 		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
+		let mut upsert_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
+		let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
 		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
 		let mut update_search_path = tx.prepare_cached(UPDATE_SEARCH_PATH)?;
+		let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
+		let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
 
 		items
 			.into_iter()
@@ -255,6 +291,8 @@ where
 						cow.into_owned(),
 						&mut upsert_item_stmt,
 						&mut upsert_dir,
+						&mut upsert_dir_meta,
+						&mut delete_dir_meta,
 					)?;
 					update_search_path.execute((path, dir.id))?;
 					Ok(DBNonRootObject::Dir(dir))
@@ -264,6 +302,8 @@ where
 						cow.into_owned(),
 						&mut upsert_item_stmt,
 						&mut upsert_file,
+						&mut upsert_file_meta,
+						&mut delete_file_meta,
 					)?;
 					update_search_path.execute((path, file.id))?;
 					Ok(DBNonRootObject::File(file))
@@ -292,15 +332,31 @@ where
 
 		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
 		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
+		let mut upsert_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
+		let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
 
 		for dir in dirs {
-			DBDir::upsert_from_remote_stmts(dir, &mut upsert_item_stmt, &mut upsert_dir)?;
+			DBDir::upsert_from_remote_stmts(
+				dir,
+				&mut upsert_item_stmt,
+				&mut upsert_dir,
+				&mut upsert_dir_meta,
+				&mut delete_dir_meta,
+			)?;
 		}
 
 		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
+		let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
+		let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
 
 		for file in files {
-			DBFile::upsert_from_remote_stmts(file, &mut upsert_item_stmt, &mut upsert_file)?;
+			DBFile::upsert_from_remote_stmts(
+				file,
+				&mut upsert_item_stmt,
+				&mut upsert_file,
+				&mut upsert_file_meta,
+				&mut delete_file_meta,
+			)?;
 		}
 
 		let mut stmt = tx.prepare_cached(DELETE_STALE_WITH_PARENT)?;
@@ -379,7 +435,16 @@ pub(crate) fn select_search(
 		|r| {
 			Ok((
 				DBNonRootObject::from_row(r)?,
-				format!("{}{}", root.as_ref(), r.get_ref(21)?.as_str()?),
+				format!(
+					"{}{}",
+					root.as_ref(),
+					r.get_ref(
+						ITEM_COLUMN_COUNT_NO_EXTRA
+							+ FILES_COLUMN_COUNT + FILES_META_COLUMN_COUNT
+							+ DIRS_COLUMN_COUNT + DIRS_META_COLUMN_COUNT
+					)?
+					.as_str()?
+				),
 			))
 		},
 	)?
@@ -410,4 +475,34 @@ where
 	uuids_json_string.push(']');
 	stmt.query_and_then([uuids_json_string], |row| Ok(row.get(0)?))?
 		.collect::<SQLResult<Vec<_>>>()
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetaState {
+	Decoded,
+	Decrypted,
+	Encrypted,
+	RSAEncrypted,
+}
+
+impl FromSql for MetaState {
+	fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+		match value {
+			ValueRef::Integer(i) => match i {
+				0 => Ok(Self::Decoded),
+				1 => Ok(Self::Decrypted),
+				2 => Ok(Self::Encrypted),
+				3 => Ok(Self::RSAEncrypted),
+				_ => Err(FromSqlError::OutOfRange(i)),
+			},
+			_ => Err(FromSqlError::InvalidType),
+		}
+	}
+}
+
+impl ToSql for MetaState {
+	fn to_sql(&self) -> Result<rusqlite::types::ToSqlOutput<'_>, rusqlite::Error> {
+		Ok(rusqlite::types::ToSqlOutput::from(*self as u8))
+	}
 }

@@ -63,6 +63,7 @@ pub enum CacheError {
 	DoesNotExist(ErrorContext),
 	Unsupported(ErrorContext),
 	NotADirectory(ErrorContext),
+	FailedToDecrypt(ErrorContext),
 }
 
 impl CacheError {
@@ -113,6 +114,9 @@ impl CacheError {
 			CacheError::NotADirectory(error_context) => CacheError::NotADirectory(ErrorContext(
 				format!("{}: {}", context.into(), error_context.0).into(),
 			)),
+			CacheError::FailedToDecrypt(err) => CacheError::FailedToDecrypt(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
 		}
 	}
 }
@@ -142,6 +146,7 @@ impl std::fmt::Display for CacheError {
 			CacheError::DoesNotExist(err) => err.fmt(f),
 			CacheError::Unsupported(err) => err.fmt(f),
 			CacheError::NotADirectory(err) => err.fmt(f),
+			CacheError::FailedToDecrypt(err) => err.fmt(f),
 		}
 	}
 }

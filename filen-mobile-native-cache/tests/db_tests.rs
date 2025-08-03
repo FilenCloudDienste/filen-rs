@@ -112,7 +112,8 @@ pub async fn test_query_root_invalid_uuid() {
 #[shared_test_runtime]
 pub async fn test_query_children_empty_directory() {
 	let (db, rss) = get_db_resources().await;
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Before update - should return None
 	let resp = db.query_dir_children(&test_dir_path, None).unwrap();
@@ -132,7 +133,8 @@ pub async fn test_query_children_empty_directory() {
 #[shared_test_runtime]
 pub async fn test_query_children_with_files_and_dirs() {
 	let (db, rss) = get_db_resources().await;
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Create test content
 	let dir = rss
@@ -177,7 +179,8 @@ pub async fn test_query_children_with_files_and_dirs() {
 #[shared_test_runtime]
 pub async fn test_query_children_sorting_by_size() {
 	let (db, rss) = get_db_resources().await;
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Create files with different sizes
 	let large_file = rss.client.make_file_builder("large.txt", &rss.dir).build();
@@ -238,7 +241,8 @@ pub async fn test_query_children_sorting_by_size() {
 #[shared_test_runtime]
 pub async fn test_query_children_sorting_by_name() {
 	let (db, rss) = get_db_resources().await;
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Create items with specific names for alphabetical testing
 	rss.client
@@ -266,22 +270,23 @@ pub async fn test_query_children_sorting_by_name() {
 	// Verify alphabetical order
 	assert!(matches!(
 		&resp.objects[0],
-		FfiNonRootObject::File(f) if f.name == "alpha.txt"
+		FfiNonRootObject::File(f) if f.meta.clone().unwrap().name == "alpha.txt"
 	));
 	assert!(matches!(
 		&resp.objects[1],
-		FfiNonRootObject::File(f) if f.name == "beta.txt"
+		FfiNonRootObject::File(f) if f.meta.clone().unwrap().name == "beta.txt"
 	));
 	assert!(matches!(
 		&resp.objects[2],
-		FfiNonRootObject::Dir(d) if d.name == "zebra_dir"
+		FfiNonRootObject::Dir(d) if d.meta.clone().unwrap().name == "zebra_dir"
 	));
 }
 
 #[shared_test_runtime]
 pub async fn test_query_children_after_deletion() {
 	let (db, rss) = get_db_resources().await;
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Create and then delete a directory
 	let mut dir = rss
@@ -347,11 +352,11 @@ pub async fn test_query_item_file() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
-	let dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Before update - should return None
 	assert_eq!(db.query_item(&file_path).unwrap(), None);
@@ -363,7 +368,7 @@ pub async fn test_query_item_file() {
 	match result {
 		Some(FfiObject::File(retrieved_file)) => {
 			assert_eq!(retrieved_file.uuid, file.uuid().to_string());
-			assert_eq!(retrieved_file.name, file.name());
+			assert_eq!(retrieved_file.meta.unwrap().name, file.name().unwrap());
 		}
 		_ => panic!("Expected to find a file object"),
 	}
@@ -382,11 +387,12 @@ pub async fn test_query_item_directory() {
 	let child_dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		dir.name()
+		rss.dir.name().unwrap(),
+		dir.name().unwrap()
 	)
 	.into();
-	let parent_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Before update - should return None
 	assert_eq!(db.query_item(&child_dir_path).unwrap(), None);
@@ -398,7 +404,7 @@ pub async fn test_query_item_directory() {
 	match result {
 		Some(FfiObject::Dir(retrieved_dir)) => {
 			assert_eq!(retrieved_dir.uuid, dir.uuid().to_string());
-			assert_eq!(retrieved_dir.name, dir.name());
+			assert_eq!(retrieved_dir.meta.unwrap().name, dir.name().unwrap());
 		}
 		_ => panic!("Expected to find a directory object"),
 	}
@@ -430,7 +436,7 @@ pub async fn test_query_item_nonexistent() {
 	let nonexistent_file_path: FfiId = format!(
 		"{}/{}/nonexistent.txt",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
@@ -475,7 +481,7 @@ pub async fn test_query_item_deeply_nested() {
 		.unwrap();
 
 	// Update each level
-	let dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	let level1_path: FfiId = format!("{}/level1", dir_path.0).into();
 	let level2_path: FfiId = format!("{}/level2", level1_path.0).into();
 
@@ -487,8 +493,8 @@ pub async fn test_query_item_deeply_nested() {
 	let deep_file_path: FfiId = format!(
 		"{}/{}/level1/level2/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		deep_file.name()
+		rss.dir.name().unwrap(),
+		deep_file.name().unwrap()
 	)
 	.into();
 
@@ -496,14 +502,18 @@ pub async fn test_query_item_deeply_nested() {
 	match result {
 		Some(FfiObject::File(retrieved_file)) => {
 			assert_eq!(retrieved_file.uuid, deep_file.uuid().to_string());
-			assert_eq!(retrieved_file.name, deep_file.name());
+			assert_eq!(retrieved_file.meta.unwrap().name, deep_file.name().unwrap());
 		}
 		_ => panic!("Expected to find the deeply nested file"),
 	}
 
 	// Also test querying intermediate directories
-	let level1_query_path: FfiId =
-		format!("{}/{}/level1", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let level1_query_path: FfiId = format!(
+		"{}/{}/level1",
+		db.root_uuid().unwrap(),
+		rss.dir.name().unwrap()
+	)
+	.into();
 
 	let result = db.query_item(&level1_query_path).unwrap();
 	match result {
@@ -533,8 +543,8 @@ pub async fn test_download_file() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		remote_file.name()
+		rss.dir.name().unwrap(),
+		remote_file.name().unwrap()
 	)
 	.into();
 
@@ -560,7 +570,7 @@ pub async fn test_download_file_nonexistent() {
 	let nonexistent_path: FfiId = format!(
 		"{}/{}/nonexistent_file.txt",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
@@ -584,8 +594,8 @@ pub async fn test_download_file_invalid_path() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		dir.name()
+		rss.dir.name().unwrap(),
+		dir.name().unwrap()
 	)
 	.into();
 
@@ -599,7 +609,8 @@ pub async fn test_progress_callback() {
 	let (db, rss) = get_db_resources().await;
 	let mut contents = vec![0u8; 10 * 1024 * 1024];
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name(),).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap(),).into();
 	let name = "test_progress.txt".to_string();
 	let create_resp = db
 		.create_empty_file(parent_path, name.clone(), None)
@@ -651,7 +662,8 @@ pub async fn test_progress_callback() {
 pub async fn test_create_empty_file() {
 	let (db, rss) = get_db_resources().await;
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	let file_name = "empty_test.txt".to_string();
 	let mime_type = "text/plain".to_string();
 
@@ -670,8 +682,9 @@ pub async fn test_create_empty_file() {
 
 	match queried_file {
 		Some(FfiObject::File(file)) => {
-			assert_eq!(file.name, file_name);
-			assert_eq!(file.mime, mime_type);
+			let meta = file.meta.unwrap();
+			assert_eq!(meta.name, file_name);
+			assert_eq!(meta.mime, mime_type);
 			assert_eq!(file.size, 0); // Should be empty
 		}
 		_ => panic!("Expected to find a file object"),
@@ -682,7 +695,8 @@ pub async fn test_create_empty_file() {
 pub async fn test_create_empty_file_different_mime_types() {
 	let (db, rss) = get_db_resources().await;
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	let test_cases = vec![
 		("test.json", "application/json"),
@@ -706,8 +720,9 @@ pub async fn test_create_empty_file_different_mime_types() {
 
 		match queried_file {
 			Some(FfiObject::File(file)) => {
-				assert_eq!(file.name, filename);
-				assert_eq!(file.mime, mime_type);
+				let meta = file.meta.unwrap();
+				assert_eq!(meta.name, filename);
+				assert_eq!(meta.mime, mime_type);
 				assert_eq!(file.size, 0);
 			}
 			_ => panic!("Expected to find a file object for {filename}"),
@@ -719,7 +734,8 @@ pub async fn test_create_empty_file_different_mime_types() {
 pub async fn test_create_empty_file_duplicate_name() {
 	let (db, rss) = get_db_resources().await;
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	let file_name = "duplicate.txt".to_string();
 	let mime_type = "text/plain".to_string();
 
@@ -750,7 +766,7 @@ pub async fn test_create_empty_file_invalid_parent() {
 	let invalid_parent_path: FfiId = format!(
 		"{}/{}/nonexistent_subdir",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
@@ -771,7 +787,8 @@ pub async fn test_create_empty_file_in_root() {
 	let (db, rss) = get_db_resources().await;
 
 	// Create file in the test directory (rss.dir), not the absolute root
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	let file_name = "root_file.txt".to_string();
 	let mime_type = "text/plain".to_string();
 
@@ -790,8 +807,9 @@ pub async fn test_create_empty_file_in_root() {
 
 	match queried_file {
 		Some(FfiObject::File(file)) => {
-			assert_eq!(file.name, file_name);
-			assert_eq!(file.mime, mime_type);
+			let meta = file.meta.unwrap();
+			assert_eq!(meta.name, file_name);
+			assert_eq!(meta.mime, mime_type);
 		}
 		_ => panic!("Expected to find a file object in test directory"),
 	}
@@ -815,13 +833,14 @@ pub async fn test_trash_item_file_restore() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
 	// Update the database to include the file
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Verify file exists before trashing
@@ -842,7 +861,10 @@ pub async fn test_trash_item_file_restore() {
 	match (db_obj, trashed_db_obj) {
 		(FfiObject::File(original_file), FfiObject::File(trashed_file)) => {
 			assert_eq!(original_file.uuid, trashed_file.uuid);
-			assert_eq!(original_file.name, trashed_file.name);
+			assert_eq!(
+				original_file.meta.unwrap().name,
+				trashed_file.meta.unwrap().name
+			);
 			assert_eq!(original_file.size, trashed_file.size);
 			assert_eq!(trashed_file.parent, "trash");
 		}
@@ -859,7 +881,10 @@ pub async fn test_trash_item_file_restore() {
 	let restored_file = match restored_result.unwrap() {
 		FfiObject::File(restored_file) => {
 			assert_eq!(restored_file.uuid, file.uuid().to_string());
-			assert_eq!(restored_file.name, file.name());
+			assert_eq!(
+				restored_file.meta.clone().unwrap().name,
+				file.name().unwrap()
+			);
 			assert_eq!(restored_file.size, file.size() as i64); // Size of "This file will be restored"
 			restored_file
 		}
@@ -894,13 +919,14 @@ pub async fn test_trash_item_file_success() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
 	// Update the database to include the file
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Verify file exists before trashing
@@ -938,13 +964,14 @@ pub async fn test_trash_item_directory_success() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		dir.name()
+		rss.dir.name().unwrap(),
+		dir.name().unwrap()
 	)
 	.into();
 
 	// Update the database to include the directory
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Verify directory exists before trashing
@@ -1007,9 +1034,10 @@ pub async fn test_trash_item_directory_with_contents() {
 		.unwrap();
 
 	// Update database with all the content
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let parent_dir_path: FfiId = format!("{}/{}", base_path.0, parent_dir.name()).into();
-	let sub_dir_path: FfiId = format!("{}/{}", parent_dir_path.0, sub_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let parent_dir_path: FfiId = format!("{}/{}", base_path.0, parent_dir.name().unwrap()).into();
+	let sub_dir_path: FfiId = format!("{}/{}", parent_dir_path.0, sub_dir.name().unwrap()).into();
 
 	db.update_dir_children(base_path.clone()).await.unwrap();
 	db.update_dir_children(parent_dir_path.clone())
@@ -1061,7 +1089,7 @@ pub async fn test_trash_item_nonexistent_file() {
 	let nonexistent_path: FfiId = format!(
 		"{}/{}/nonexistent_file.txt",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
@@ -1079,7 +1107,7 @@ pub async fn test_trash_item_nonexistent_directory() {
 	let nonexistent_path: FfiId = format!(
 		"{}/{}/nonexistent_dir",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
@@ -1118,14 +1146,15 @@ pub async fn test_trash_item_partial_path() {
 		.unwrap();
 
 	// Only update the base directory, not the nested ones
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(base_path).await.unwrap();
 
 	// Try to trash level2 without having updated level1's children
 	let level2_path: FfiId = format!(
 		"{}/{}/level1/level2",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
@@ -1157,8 +1186,9 @@ pub async fn test_trash_item_file_then_query_parent() {
 		.await
 		.unwrap();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file2_path: FfiId = format!("{}/{}", parent_path.0, file2.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file2_path: FfiId = format!("{}/{}", parent_path.0, file2.name().unwrap()).into();
 
 	// Update database
 	db.update_dir_children(parent_path.clone()).await.unwrap();
@@ -1196,12 +1226,13 @@ pub async fn test_trash_item_empty_directory() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		empty_dir.name()
+		rss.dir.name().unwrap(),
+		empty_dir.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Update database
 	db.update_dir_children(parent_path.clone()).await.unwrap();
@@ -1247,8 +1278,8 @@ pub async fn test_trash_item_already_trashed_file() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
@@ -1288,16 +1319,17 @@ pub async fn test_move_item_file_success() {
 		.unwrap();
 
 	// Update database with all directories
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
 
 	db.update_dir_children(base_path).await.unwrap();
 	db.update_dir_children(source_path.clone()).await.unwrap();
 	db.update_dir_children(dest_path.clone()).await.unwrap();
 
 	// Define paths for the move operation
-	let file_path: FfiId = format!("{}/{}", source_path.0, file.name()).into();
+	let file_path: FfiId = format!("{}/{}", source_path.0, file.name().unwrap()).into();
 
 	// Move the file
 	let new_file_path = db
@@ -1306,7 +1338,7 @@ pub async fn test_move_item_file_success() {
 		.unwrap();
 
 	// Verify the new path is correct
-	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, file.name()).into();
+	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, file.name().unwrap()).into();
 	assert_eq!(new_file_path.id, expected_new_path);
 
 	// Verify file no longer exists at old location
@@ -1317,7 +1349,7 @@ pub async fn test_move_item_file_success() {
 	assert!(moved_file.is_some());
 	match moved_file.unwrap() {
 		FfiObject::File(f) => {
-			assert_eq!(f.name, file.name());
+			assert_eq!(f.meta.unwrap().name, file.name().unwrap());
 			assert_eq!(f.uuid, file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -1377,10 +1409,11 @@ pub async fn test_move_item_directory_success() {
 		.unwrap();
 
 	// Update database with all directories
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
-	let move_dir_path: FfiId = format!("{}/{}", source_path.0, move_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
+	let move_dir_path: FfiId = format!("{}/{}", source_path.0, move_dir.name().unwrap()).into();
 
 	db.update_dir_children(base_path).await.unwrap();
 	db.update_dir_children(source_path.clone()).await.unwrap();
@@ -1394,7 +1427,7 @@ pub async fn test_move_item_directory_success() {
 		.unwrap();
 
 	// Verify the new path is correct
-	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, move_dir.name()).into();
+	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, move_dir.name().unwrap()).into();
 	assert_eq!(new_dir_path.id, expected_new_path);
 
 	// Verify directory no longer exists at old location
@@ -1405,7 +1438,7 @@ pub async fn test_move_item_directory_success() {
 	assert!(moved_dir.is_some());
 	match moved_dir.unwrap() {
 		FfiObject::Dir(d) => {
-			assert_eq!(d.name, move_dir.name());
+			assert_eq!(d.meta.unwrap().name, move_dir.name().unwrap());
 			assert_eq!(d.uuid, move_dir.uuid().to_string());
 		}
 		_ => panic!("Expected directory object"),
@@ -1439,8 +1472,9 @@ pub async fn test_move_item_nonexistent_item() {
 		.await
 		.unwrap();
 
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
 	let nonexistent_file_path: FfiId = format!("{}/nonexistent.txt", base_path.0).into();
 
 	db.update_dir_children(base_path.clone()).await.unwrap();
@@ -1468,8 +1502,9 @@ pub async fn test_move_item_nonexistent_destination() {
 		.await
 		.unwrap();
 
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file_path: FfiId = format!("{}/{}", base_path.0, file.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = format!("{}/{}", base_path.0, file.name().unwrap()).into();
 	let nonexistent_dest: FfiId = format!("{}/nonexistent_dir", base_path.0).into();
 
 	db.update_dir_children(base_path.clone()).await.unwrap();
@@ -1508,9 +1543,10 @@ pub async fn test_move_item_destination_is_file() {
 		.await
 		.unwrap();
 
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let move_file_path: FfiId = format!("{}/{}", base_path.0, move_file.name()).into();
-	let dest_file_path: FfiId = format!("{}/{}", base_path.0, dest_file.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let move_file_path: FfiId = format!("{}/{}", base_path.0, move_file.name().unwrap()).into();
+	let dest_file_path: FfiId = format!("{}/{}", base_path.0, dest_file.name().unwrap()).into();
 
 	db.update_dir_children(base_path.clone()).await.unwrap();
 
@@ -1534,8 +1570,9 @@ pub async fn test_move_item_root_directory_error() {
 		.unwrap();
 
 	let root_path: FfiId = db.root_uuid().unwrap().into();
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
 
 	db.update_dir_children(base_path).await.unwrap();
 
@@ -1562,8 +1599,9 @@ pub async fn test_move_item_same_directory() {
 		.await
 		.unwrap();
 
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file_path: FfiId = format!("{}/{}", base_path.0, file.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = format!("{}/{}", base_path.0, file.name().unwrap()).into();
 
 	db.update_dir_children(base_path.clone()).await.unwrap();
 
@@ -1581,7 +1619,7 @@ pub async fn test_move_item_same_directory() {
 	assert!(moved_file.is_some());
 	match moved_file.unwrap() {
 		FfiObject::File(f) => {
-			assert_eq!(f.name, file.name());
+			assert_eq!(f.meta.unwrap().name, file.name().unwrap());
 			assert_eq!(f.uuid, file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -1623,11 +1661,12 @@ pub async fn test_move_item_nested_directory_structure() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let level1_path: FfiId = format!("{}/{}", base_path.0, level1.name()).into();
-	let level2_path: FfiId = format!("{}/{}", level1_path.0, level2.name()).into();
-	let file_path: FfiId = format!("{}/{}", level2_path.0, file.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let level1_path: FfiId = format!("{}/{}", base_path.0, level1.name().unwrap()).into();
+	let level2_path: FfiId = format!("{}/{}", level1_path.0, level2.name().unwrap()).into();
+	let file_path: FfiId = format!("{}/{}", level2_path.0, file.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
 
 	// Update all levels
 	db.update_dir_children(base_path.clone()).await.unwrap();
@@ -1642,7 +1681,7 @@ pub async fn test_move_item_nested_directory_structure() {
 		.unwrap();
 
 	// Verify new path
-	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, file.name()).into();
+	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, file.name().unwrap()).into();
 	assert_eq!(new_file_path.id, expected_new_path);
 
 	// Verify file no longer exists at original location
@@ -1653,7 +1692,7 @@ pub async fn test_move_item_nested_directory_structure() {
 	assert!(moved_file.is_some());
 	match moved_file.unwrap() {
 		FfiObject::File(f) => {
-			assert_eq!(f.name, file.name());
+			assert_eq!(f.meta.unwrap().name, file.name().unwrap());
 			assert_eq!(f.uuid, file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -1719,9 +1758,10 @@ pub async fn test_move_item_directory_with_contents() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
 
 	// Update database
 	db.update_dir_children(base_path.clone()).await.unwrap();
@@ -1735,7 +1775,7 @@ pub async fn test_move_item_directory_with_contents() {
 		.unwrap();
 
 	// Verify new path
-	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, source_dir.name()).into();
+	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, source_dir.name().unwrap()).into();
 	assert_eq!(new_source_path.id, expected_new_path);
 
 	// Verify old source directory is gone
@@ -1746,7 +1786,7 @@ pub async fn test_move_item_directory_with_contents() {
 	assert!(moved_dir.is_some());
 	match moved_dir.unwrap() {
 		FfiObject::Dir(d) => {
-			assert_eq!(d.name, source_dir.name());
+			assert_eq!(d.meta.unwrap().name, source_dir.name().unwrap());
 			assert_eq!(d.uuid, source_dir.uuid().to_string());
 		}
 		_ => panic!("Expected directory object"),
@@ -1823,10 +1863,11 @@ pub async fn test_move_item_partial_path_resolution() {
 		.unwrap();
 
 	// Only update base level, not the nested levels
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	let level2_path: FfiId = format!("{}/level1/level2", base_path.0).into();
 	let file_path: FfiId = format!("{}/deep_file.txt", level2_path.0).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
 
 	db.update_dir_children(base_path.clone()).await.unwrap();
 
@@ -1837,7 +1878,7 @@ pub async fn test_move_item_partial_path_resolution() {
 		.unwrap();
 
 	// Verify file was moved successfully
-	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, file.name()).into();
+	let expected_new_path: FfiId = format!("{}/{}", dest_path.0, file.name().unwrap()).into();
 	assert_eq!(new_file_path.id, expected_new_path);
 
 	// Verify file exists at new location
@@ -1883,10 +1924,11 @@ pub async fn test_move_item_name_collision_handling() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
-	let file_path: FfiId = format!("{}/{}", source_path.0, file_to_move.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
+	let file_path: FfiId = format!("{}/{}", source_path.0, file_to_move.name().unwrap()).into();
 
 	// Update database
 	db.update_dir_children(base_path).await.unwrap();
@@ -1950,11 +1992,12 @@ pub async fn test_move_item_multiple_files_same_operation() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name()).into();
-	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name()).into();
-	let file1_path: FfiId = format!("{}/{}", source_path.0, file1.name()).into();
-	let file2_path: FfiId = format!("{}/{}", source_path.0, file2.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let source_path: FfiId = format!("{}/{}", base_path.0, source_dir.name().unwrap()).into();
+	let dest_path: FfiId = format!("{}/{}", base_path.0, dest_dir.name().unwrap()).into();
+	let file1_path: FfiId = format!("{}/{}", source_path.0, file1.name().unwrap()).into();
+	let file2_path: FfiId = format!("{}/{}", source_path.0, file2.name().unwrap()).into();
 
 	// Update database
 	db.update_dir_children(base_path).await.unwrap();
@@ -2019,13 +2062,14 @@ pub async fn test_rename_item_file_success() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Rename the file
@@ -2048,7 +2092,7 @@ pub async fn test_rename_item_file_success() {
 	assert!(renamed_file.is_some());
 	match renamed_file.unwrap() {
 		FfiObject::File(f) => {
-			assert_eq!(f.name, new_name);
+			assert_eq!(f.meta.unwrap().name, new_name);
 			assert_eq!(f.uuid, file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -2065,7 +2109,7 @@ pub async fn test_rename_item_file_success() {
 	assert!(renamed_file_in_listing.is_some());
 
 	if let Some(FfiNonRootObject::File(f)) = renamed_file_in_listing {
-		assert_eq!(f.name, new_name);
+		assert_eq!(f.meta.clone().unwrap().name, new_name);
 	}
 }
 
@@ -2091,13 +2135,14 @@ pub async fn test_rename_item_directory_success() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		dir.name()
+		rss.dir.name().unwrap(),
+		dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -2121,7 +2166,7 @@ pub async fn test_rename_item_directory_success() {
 	assert!(renamed_dir.is_some());
 	match renamed_dir.unwrap() {
 		FfiObject::Dir(d) => {
-			assert_eq!(d.name, new_name);
+			assert_eq!(d.meta.unwrap().name, new_name);
 			assert_eq!(d.uuid, dir.uuid().to_string());
 		}
 		_ => panic!("Expected directory object"),
@@ -2138,7 +2183,7 @@ pub async fn test_rename_item_directory_success() {
 	assert!(renamed_dir_in_listing.is_some());
 
 	if let Some(FfiNonRootObject::Dir(d)) = renamed_dir_in_listing {
-		assert_eq!(d.name, new_name);
+		assert_eq!(d.meta.clone().unwrap().name, new_name);
 	}
 
 	// Verify directory contents are preserved
@@ -2175,12 +2220,13 @@ pub async fn test_rename_item_file_extension_change() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Rename to change extension
@@ -2196,7 +2242,7 @@ pub async fn test_rename_item_file_extension_change() {
 	assert!(renamed_file.is_some());
 	match renamed_file.unwrap() {
 		FfiObject::File(f) => {
-			assert_eq!(f.name, new_name);
+			assert_eq!(f.meta.unwrap().name, new_name);
 			assert_eq!(f.uuid, file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -2221,16 +2267,17 @@ pub async fn test_rename_item_same_name() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Rename to the same name
-	let same_name = file.name().to_string();
+	let same_name = file.name().unwrap().to_string();
 	let new_file_path = db
 		.rename_item(file_path.clone(), same_name.clone())
 		.await
@@ -2244,7 +2291,7 @@ pub async fn test_rename_item_same_name() {
 	assert!(file_result.is_some());
 	match file_result.unwrap() {
 		FfiObject::File(f) => {
-			assert_eq!(f.name, same_name);
+			assert_eq!(f.meta.unwrap().name, same_name);
 			assert_eq!(f.uuid, file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -2258,11 +2305,12 @@ pub async fn test_rename_item_nonexistent_file() {
 	let nonexistent_path: FfiId = format!(
 		"{}/{}/nonexistent.txt",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 
 	// Try to rename non-existent file
@@ -2322,12 +2370,13 @@ pub async fn test_rename_item_empty_name() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 
 	// Try to rename to empty string
@@ -2355,12 +2404,13 @@ pub async fn test_rename_item_special_characters() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Test various special characters
@@ -2388,14 +2438,16 @@ pub async fn test_rename_item_special_characters() {
 
 			match renamed_file.unwrap() {
 				FfiObject::File(f) => {
-					assert_eq!(f.name, special_name);
+					assert_eq!(f.meta.unwrap().name, special_name);
 					assert_eq!(f.uuid, file.uuid().to_string());
 				}
 				_ => panic!("Expected file object"),
 			}
 
 			// Reset for next test by renaming back
-			let _ = db.rename_item(new_path.id, file.name().to_string()).await;
+			let _ = db
+				.rename_item(new_path.id, file.name().unwrap().to_string())
+				.await;
 		} else {
 			// Document which special characters are rejected
 			panic!(
@@ -2429,16 +2481,19 @@ pub async fn test_rename_item_name_collision() {
 	let file1_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file1.name()
+		rss.dir.name().unwrap(),
+		file1.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Try to rename file1 to file2's name (collision)
-	let result = db.rename_item(file1_path, file2.name().to_string()).await;
+	let result = db
+		.rename_item(file1_path, file2.name().unwrap().to_string())
+		.await;
 
 	assert!(result.is_err());
 	assert!(
@@ -2477,10 +2532,11 @@ pub async fn test_rename_item_nested_file() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	let level1_path: FfiId = format!("{}/level1", base_path.0).into();
 	let level2_path: FfiId = format!("{}/level2", level1_path.0).into();
-	let file_path: FfiId = format!("{}/{}", level2_path.0, nested_file.name()).into();
+	let file_path: FfiId = format!("{}/{}", level2_path.0, nested_file.name().unwrap()).into();
 
 	// Update all levels
 	db.update_dir_children(base_path).await.unwrap();
@@ -2507,7 +2563,7 @@ pub async fn test_rename_item_nested_file() {
 	assert!(renamed_file.is_some());
 	match renamed_file.unwrap() {
 		FfiObject::File(f) => {
-			assert_eq!(f.name, new_name);
+			assert_eq!(f.meta.unwrap().name, new_name);
 			assert_eq!(f.uuid, nested_file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -2529,12 +2585,13 @@ pub async fn test_rename_item_long_name() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 
 	// Try to rename to a very long name
@@ -2548,7 +2605,7 @@ pub async fn test_rename_item_long_name() {
 	match renamed_file.unwrap() {
 		FfiObject::File(f) => {
 			// Name might be truncated by the system
-			assert!(!f.name.is_empty());
+			assert!(!f.meta.unwrap().name.is_empty());
 			assert_eq!(f.uuid, file.uuid().to_string());
 		}
 		_ => panic!("Expected file object"),
@@ -2573,12 +2630,13 @@ pub async fn test_rename_item_multiple_renames() {
 	let mut current_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path.clone()).await.unwrap();
 
 	// Perform multiple renames in sequence
@@ -2599,7 +2657,7 @@ pub async fn test_rename_item_multiple_renames() {
 		assert!(renamed_file.is_some());
 		match renamed_file.unwrap() {
 			FfiObject::File(f) => {
-				assert_eq!(f.name, name);
+				assert_eq!(f.meta.unwrap().name, name);
 				assert_eq!(f.uuid, file.uuid().to_string());
 			}
 			_ => panic!("Expected file object"),
@@ -2620,7 +2678,7 @@ pub async fn test_rename_item_multiple_renames() {
 	assert!(final_file.is_some());
 
 	if let Some(FfiNonRootObject::File(f)) = final_file {
-		assert_eq!(f.name, "final_name.txt");
+		assert_eq!(f.meta.clone().unwrap().name, "final_name.txt");
 	}
 }
 
@@ -2638,13 +2696,14 @@ pub async fn test_get_all_descendant_paths_empty_directory() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		empty_dir.name()
+		rss.dir.name().unwrap(),
+		empty_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database to include the directory
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -2689,13 +2748,14 @@ pub async fn test_get_all_descendant_paths_files_only() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		test_dir.name()
+		rss.dir.name().unwrap(),
+		test_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -2705,9 +2765,9 @@ pub async fn test_get_all_descendant_paths_files_only() {
 
 	// Verify all file paths are present
 	let expected_paths = vec![
-		format!("{}/{}", dir_path.0, file1.name()),
-		format!("{}/{}", dir_path.0, file2.name()),
-		format!("{}/{}", dir_path.0, file3.name()),
+		format!("{}/{}", dir_path.0, file1.name().unwrap()),
+		format!("{}/{}", dir_path.0, file2.name().unwrap()),
+		format!("{}/{}", dir_path.0, file3.name().unwrap()),
 	];
 
 	for expected_path in expected_paths {
@@ -2751,13 +2811,14 @@ pub async fn test_get_all_descendant_paths_directories_only() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		test_dir.name()
+		rss.dir.name().unwrap(),
+		test_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -2767,9 +2828,9 @@ pub async fn test_get_all_descendant_paths_directories_only() {
 
 	// Verify all directory paths are present
 	let expected_paths = vec![
-		format!("{}/{}", dir_path.0, subdir1.name()),
-		format!("{}/{}", dir_path.0, subdir2.name()),
-		format!("{}/{}", dir_path.0, subdir3.name()),
+		format!("{}/{}", dir_path.0, subdir1.name().unwrap()),
+		format!("{}/{}", dir_path.0, subdir2.name().unwrap()),
+		format!("{}/{}", dir_path.0, subdir3.name().unwrap()),
 	];
 
 	for expected_path in expected_paths {
@@ -2820,13 +2881,14 @@ pub async fn test_get_all_descendant_paths_mixed_content() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		test_dir.name()
+		rss.dir.name().unwrap(),
+		test_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -2836,9 +2898,9 @@ pub async fn test_get_all_descendant_paths_mixed_content() {
 
 	// Verify all paths are present
 	let expected_paths = vec![
-		format!("{}/{}", dir_path.0, file1.name()),
-		format!("{}/{}", dir_path.0, subdir.name()),
-		format!("{}/{}", dir_path.0, file2.name()),
+		format!("{}/{}", dir_path.0, file1.name().unwrap()),
+		format!("{}/{}", dir_path.0, subdir.name().unwrap()),
+		format!("{}/{}", dir_path.0, file2.name().unwrap()),
 	];
 
 	for expected_path in expected_paths {
@@ -2905,10 +2967,11 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let level1_path: FfiId = format!("{}/{}", base_path.0, level1.name()).into();
-	let level2_path: FfiId = format!("{}/{}", level1_path.0, level2.name()).into();
-	let level3_path: FfiId = format!("{}/{}", level2_path.0, level3.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let level1_path: FfiId = format!("{}/{}", base_path.0, level1.name().unwrap()).into();
+	let level2_path: FfiId = format!("{}/{}", level1_path.0, level2.name().unwrap()).into();
+	let level3_path: FfiId = format!("{}/{}", level2_path.0, level3.name().unwrap()).into();
 
 	// Update all levels in database
 	db.update_dir_children(base_path).await.unwrap();
@@ -2924,16 +2987,26 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 
 	// Verify all expected paths are present
 	let expected_paths = vec![
-		format!("{}/{}", level1_path.0, file_l1.name()), // Direct file in level1
-		format!("{}/{}", level1_path.0, level2.name()),  // level2 directory
-		format!("{}/{}/{}", level1_path.0, level2.name(), file_l2.name()), // File in level2
-		format!("{}/{}/{}", level1_path.0, level2.name(), level3.name()), // level3 directory
+		format!("{}/{}", level1_path.0, file_l1.name().unwrap()), // Direct file in level1
+		format!("{}/{}", level1_path.0, level2.name().unwrap()),  // level2 directory
+		format!(
+			"{}/{}/{}",
+			level1_path.0,
+			level2.name().unwrap(),
+			file_l2.name().unwrap()
+		), // File in level2
+		format!(
+			"{}/{}/{}",
+			level1_path.0,
+			level2.name().unwrap(),
+			level3.name().unwrap()
+		), // level3 directory
 		format!(
 			"{}/{}/{}/{}",
 			level1_path.0,
-			level2.name(),
-			level3.name(),
-			file_l3.name()
+			level2.name().unwrap(),
+			level3.name().unwrap(),
+			file_l3.name().unwrap()
 		), // File in level3
 	];
 
@@ -3018,11 +3091,13 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 		.unwrap();
 
 	// Set up paths
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let root_path: FfiId = format!("{}/{}", base_path.0, root_dir.name()).into();
-	let docs_path: FfiId = format!("{}/{}", root_path.0, docs_dir.name()).into();
-	let images_path: FfiId = format!("{}/{}", root_path.0, images_dir.name()).into();
-	let thumbnails_path: FfiId = format!("{}/{}", images_path.0, thumbnails_dir.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let root_path: FfiId = format!("{}/{}", base_path.0, root_dir.name().unwrap()).into();
+	let docs_path: FfiId = format!("{}/{}", root_path.0, docs_dir.name().unwrap()).into();
+	let images_path: FfiId = format!("{}/{}", root_path.0, images_dir.name().unwrap()).into();
+	let thumbnails_path: FfiId =
+		format!("{}/{}", images_path.0, thumbnails_dir.name().unwrap()).into();
 
 	// Update all directories in database
 	db.update_dir_children(base_path).await.unwrap();
@@ -3039,28 +3114,33 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 
 	// Build expected paths
 	let expected_paths = vec![
-		format!("{}/{}", root_path.0, config_file.name()),
-		format!("{}/{}", root_path.0, docs_dir.name()),
-		format!("{}/{}/{}", root_path.0, docs_dir.name(), doc_file.name()),
-		format!("{}/{}", root_path.0, images_dir.name()),
+		format!("{}/{}", root_path.0, config_file.name().unwrap()),
+		format!("{}/{}", root_path.0, docs_dir.name().unwrap()),
 		format!(
 			"{}/{}/{}",
 			root_path.0,
-			images_dir.name(),
-			full_image.name()
+			docs_dir.name().unwrap(),
+			doc_file.name().unwrap()
+		),
+		format!("{}/{}", root_path.0, images_dir.name().unwrap()),
+		format!(
+			"{}/{}/{}",
+			root_path.0,
+			images_dir.name().unwrap(),
+			full_image.name().unwrap()
 		),
 		format!(
 			"{}/{}/{}",
 			root_path.0,
-			images_dir.name(),
-			thumbnails_dir.name()
+			images_dir.name().unwrap(),
+			thumbnails_dir.name().unwrap()
 		),
 		format!(
 			"{}/{}/{}/{}",
 			root_path.0,
-			images_dir.name(),
-			thumbnails_dir.name(),
-			thumb_file.name()
+			images_dir.name().unwrap(),
+			thumbnails_dir.name().unwrap(),
+			thumb_file.name().unwrap()
 		),
 	];
 
@@ -3082,7 +3162,7 @@ pub async fn test_get_all_descendant_paths_nonexistent_path() {
 	let nonexistent_path: FfiId = format!(
 		"{}/{}/nonexistent_dir",
 		db.root_uuid().unwrap(),
-		rss.dir.name()
+		rss.dir.name().unwrap()
 	)
 	.into();
 
@@ -3122,13 +3202,14 @@ pub async fn test_get_all_descendant_paths_file_path() {
 	let file_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		file.name()
+		rss.dir.name().unwrap(),
+		file.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 
 	// Get descendant paths for a file (files have no descendants)
@@ -3160,7 +3241,8 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 		.unwrap();
 
 	// Use the test directory as root (since we can't access the absolute root easily)
-	let root_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let root_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// Update database
 	let parent_path: FfiId = db.root_uuid().unwrap().into();
@@ -3176,8 +3258,8 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 	println!("Descendant paths: {descendant_paths:?}");
 
 	let expected_paths = vec![
-		format!("{}/{}", root_path.0, file_in_root.name()),
-		format!("{}/{}", root_path.0, subdir_in_root.name()),
+		format!("{}/{}", root_path.0, file_in_root.name().unwrap()),
+		format!("{}/{}", root_path.0, subdir_in_root.name().unwrap()),
 	];
 
 	for expected_path in expected_paths {
@@ -3216,8 +3298,9 @@ pub async fn test_get_all_descendant_paths_partial_database_state() {
 		.unwrap();
 
 	// Only update the base and level1, not level2
-	let base_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let level1_path: FfiId = format!("{}/{}", base_path.0, level1.name()).into();
+	let base_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let level1_path: FfiId = format!("{}/{}", base_path.0, level1.name().unwrap()).into();
 
 	db.update_dir_children(base_path).await.unwrap();
 	db.update_dir_children(level1_path.clone()).await.unwrap();
@@ -3229,7 +3312,7 @@ pub async fn test_get_all_descendant_paths_partial_database_state() {
 	// Should only include level2 directory, not its contents since they're not in database
 	assert_eq!(descendant_paths.len(), 1);
 
-	let expected_level2_path = format!("{}/{}", level1_path.0, level2.name());
+	let expected_level2_path = format!("{}/{}", level1_path.0, level2.name().unwrap());
 	assert_eq!(descendant_paths[0].0, expected_level2_path);
 }
 
@@ -3277,13 +3360,14 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		special_dir.name()
+		rss.dir.name().unwrap(),
+		special_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -3293,9 +3377,9 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 
 	// Verify all special-named files are present
 	let expected_paths = vec![
-		format!("{}/{}", dir_path.0, special_file1.name()),
-		format!("{}/{}", dir_path.0, special_file2.name()),
-		format!("{}/{}", dir_path.0, unicode_file.name()),
+		format!("{}/{}", dir_path.0, special_file1.name().unwrap()),
+		format!("{}/{}", dir_path.0, special_file2.name().unwrap()),
+		format!("{}/{}", dir_path.0, unicode_file.name().unwrap()),
 	];
 
 	for expected_path in expected_paths {
@@ -3356,14 +3440,15 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		test_dir.name()
+		rss.dir.name().unwrap(),
+		test_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let a_dir_path: FfiId = format!("{}/{}", dir_path.0, a_dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let a_dir_path: FfiId = format!("{}/{}", dir_path.0, a_dir.name().unwrap()).into();
 
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
@@ -3375,10 +3460,15 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 
 	// Verify all items are present (order may vary based on SQL query order)
 	let expected_paths = vec![
-		format!("{}/{}", dir_path.0, b_file.name()),
-		format!("{}/{}", dir_path.0, a_dir.name()),
-		format!("{}/{}", dir_path.0, c_file.name()),
-		format!("{}/{}/{}", dir_path.0, a_dir.name(), nested_file.name()),
+		format!("{}/{}", dir_path.0, b_file.name().unwrap()),
+		format!("{}/{}", dir_path.0, a_dir.name().unwrap()),
+		format!("{}/{}", dir_path.0, c_file.name().unwrap()),
+		format!(
+			"{}/{}/{}",
+			dir_path.0,
+			a_dir.name().unwrap(),
+			nested_file.name().unwrap()
+		),
 	];
 
 	for expected_path in expected_paths {
@@ -3464,15 +3554,16 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		large_dir.name()
+		rss.dir.name().unwrap(),
+		large_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let subdir1_path: FfiId = format!("{}/{}", dir_path.0, subdir1.name()).into();
-	let subdir2_path: FfiId = format!("{}/{}", dir_path.0, subdir2.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let subdir1_path: FfiId = format!("{}/{}", dir_path.0, subdir1.name().unwrap()).into();
+	let subdir2_path: FfiId = format!("{}/{}", dir_path.0, subdir2.name().unwrap()).into();
 
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
@@ -3487,20 +3578,30 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 
 	// Verify all created files are present
 	for file in &created_files {
-		let expected_path = format!("{}/{}", dir_path.0, file.name());
+		let expected_path = format!("{}/{}", dir_path.0, file.name().unwrap());
 		let found = descendant_paths.iter().any(|p| p.0 == expected_path);
 		assert!(found, "Expected file path {expected_path} not found");
 	}
 
 	// Verify subdirectories are present
-	let subdir1_expected = format!("{}/{}", dir_path.0, subdir1.name());
-	let subdir2_expected = format!("{}/{}", dir_path.0, subdir2.name());
+	let subdir1_expected = format!("{}/{}", dir_path.0, subdir1.name().unwrap());
+	let subdir2_expected = format!("{}/{}", dir_path.0, subdir2.name().unwrap());
 	assert!(descendant_paths.iter().any(|p| p.0 == subdir1_expected));
 	assert!(descendant_paths.iter().any(|p| p.0 == subdir2_expected));
 
 	// Verify nested files are present
-	let nested1_expected = format!("{}/{}/{}", dir_path.0, subdir1.name(), nested_file1.name());
-	let nested2_expected = format!("{}/{}/{}", dir_path.0, subdir2.name(), nested_file2.name());
+	let nested1_expected = format!(
+		"{}/{}/{}",
+		dir_path.0,
+		subdir1.name().unwrap(),
+		nested_file1.name().unwrap()
+	);
+	let nested2_expected = format!(
+		"{}/{}/{}",
+		dir_path.0,
+		subdir2.name().unwrap(),
+		nested_file2.name().unwrap()
+	);
 	assert!(descendant_paths.iter().any(|p| p.0 == nested1_expected));
 	assert!(descendant_paths.iter().any(|p| p.0 == nested2_expected));
 }
@@ -3538,13 +3639,14 @@ pub async fn test_get_all_descendant_paths_empty_names() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		test_dir.name()
+		rss.dir.name().unwrap(),
+		test_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -3554,8 +3656,8 @@ pub async fn test_get_all_descendant_paths_empty_names() {
 
 	// Verify both files are present
 	let expected_paths = vec![
-		format!("{}/{}", dir_path.0, normal_file.name()),
-		format!("{}/{}", dir_path.0, dot_file.name()),
+		format!("{}/{}", dir_path.0, normal_file.name().unwrap()),
+		format!("{}/{}", dir_path.0, dot_file.name().unwrap()),
 	];
 
 	for expected_path in expected_paths {
@@ -3591,13 +3693,14 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		test_dir.name()
+		rss.dir.name().unwrap(),
+		test_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
 
@@ -3625,8 +3728,8 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 
 	// Verify both files are present
 	let expected_paths = vec![
-		format!("{}/{}", dir_path.0, initial_file.name()),
-		format!("{}/{}", dir_path.0, additional_file.name()),
+		format!("{}/{}", dir_path.0, initial_file.name().unwrap()),
+		format!("{}/{}", dir_path.0, additional_file.name().unwrap()),
 	];
 
 	for expected_path in expected_paths {
@@ -3665,14 +3768,15 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 	let dir_path: FfiId = format!(
 		"{}/{}/{}",
 		db.root_uuid().unwrap(),
-		rss.dir.name(),
-		root_dir.name()
+		rss.dir.name().unwrap(),
+		root_dir.name().unwrap()
 	)
 	.into();
 
 	// Update database
-	let parent_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let sub_dir_path: FfiId = format!("{}/{}", dir_path.0, sub_dir.name()).into();
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let sub_dir_path: FfiId = format!("{}/{}", dir_path.0, sub_dir.name().unwrap()).into();
 
 	db.update_dir_children(parent_path).await.unwrap();
 	db.update_dir_children(dir_path.clone()).await.unwrap();
@@ -3710,8 +3814,13 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 	}
 
 	// Check specific expected paths
-	let expected_subdir = format!("{}/{}", dir_path.0, sub_dir.name());
-	let expected_file = format!("{}/{}/{}", dir_path.0, sub_dir.name(), file_in_sub.name());
+	let expected_subdir = format!("{}/{}", dir_path.0, sub_dir.name().unwrap());
+	let expected_file = format!(
+		"{}/{}/{}",
+		dir_path.0,
+		sub_dir.name().unwrap(),
+		file_in_sub.name().unwrap()
+	);
 
 	assert!(
 		descendant_paths.iter().any(|p| p.0 == expected_subdir),
@@ -3727,7 +3836,7 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 pub async fn test_query_path_for_uuid() {
 	let (db, rss) = get_db_resources().await;
 	let root_path: FfiId = db.root_uuid().unwrap().to_string().into();
-	let parent_path = root_path.join(rss.dir.name());
+	let parent_path = root_path.join(rss.dir.name().unwrap());
 	let dir_path = parent_path.join("path_test");
 
 	let dir = rss
@@ -3774,8 +3883,9 @@ pub async fn test_last_listed() {
 		.await
 		.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let dir_path: FfiId = test_dir_path.join(test_dir.name());
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let dir_path: FfiId = test_dir_path.join(test_dir.name().unwrap());
 
 	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
@@ -3816,8 +3926,9 @@ pub async fn test_update_local_data() {
 		.await
 		.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file_path: FfiId = test_dir_path.join(file.name());
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join(file.name().unwrap());
 
 	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 	let mut ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
@@ -3866,9 +3977,10 @@ pub async fn test_update_local_data_move() {
 		.await
 		.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file_path: FfiId = test_dir_path.join(file.name());
-	let new_parent_path: FfiId = test_dir_path.join(new_parent.name());
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join(file.name().unwrap());
+	let new_parent_path: FfiId = test_dir_path.join(new_parent.name().unwrap());
 
 	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 	let mut ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
@@ -3913,10 +4025,11 @@ pub async fn test_update_local_data_remote_move() {
 		.await
 		.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file_path: FfiId = test_dir_path.join(file.name());
-	let new_parent_path: FfiId = test_dir_path.join(new_parent.name());
-	let new_file_path: FfiId = new_parent_path.join(file.name());
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join(file.name().unwrap());
+	let new_parent_path: FfiId = test_dir_path.join(new_parent.name().unwrap());
+	let new_file_path: FfiId = new_parent_path.join(file.name().unwrap());
 
 	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 	let mut ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
@@ -3959,8 +4072,9 @@ pub async fn test_update_local_data_remote_update() {
 		.await
 		.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file_path: FfiId = test_dir_path.join(file.name());
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join(file.name().unwrap());
 
 	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 
@@ -3978,7 +4092,7 @@ pub async fn test_update_local_data_remote_update() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder(file.name(), &rss.dir)
+				.make_file_builder(file.name().unwrap(), &rss.dir)
 				.build()
 				.into(),
 			b"1",
@@ -4028,10 +4142,11 @@ pub async fn test_update_local_data_move_name_collision() {
 		.await
 		.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let file_path: FfiId = test_dir_path.join(file.name());
-	let new_parent_path: FfiId = test_dir_path.join(new_parent.name());
-	let new_path: FfiId = new_parent_path.join(file.name());
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join(file.name().unwrap());
+	let new_parent_path: FfiId = test_dir_path.join(new_parent.name().unwrap());
+	let new_path: FfiId = new_parent_path.join(file.name().unwrap());
 
 	db.update_dir_children(test_dir_path.clone()).await.unwrap();
 	db.update_dir_children(new_parent_path.clone())
@@ -4091,7 +4206,8 @@ pub async fn test_init_from_file() {
 		.ok();
 	tokio::fs::create_dir_all(&files_path).await.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// sync
 	let new = FilenMobileCacheState::new(files_path.clone(), auth_file.clone());
@@ -4236,8 +4352,10 @@ pub async fn test_search() {
 		.await
 		.unwrap();
 
-	let test_dir_path: FfiId = format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name()).into();
-	let remote_file_path: FfiId = format!("{}/a/b/{}", test_dir_path.0, remote_file.name()).into();
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let remote_file_path: FfiId =
+		format!("{}/a/b/{}", test_dir_path.0, remote_file.name().unwrap()).into();
 
 	let file = db
 		.create_empty_file(

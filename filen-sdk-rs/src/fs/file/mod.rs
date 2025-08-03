@@ -204,15 +204,15 @@ impl TryFrom<RemoteFile> for BaseFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
-	uuid: UuidStr,
-	meta: FileMeta<'static>,
+	pub uuid: UuidStr,
+	pub meta: FileMeta<'static>,
 
-	parent: ParentUuid,
-	size: u64,
-	favorited: bool,
-	region: String,
-	bucket: String,
-	chunks: u64,
+	pub parent: ParentUuid,
+	pub size: u64,
+	pub favorited: bool,
+	pub region: String,
+	pub bucket: String,
+	pub chunks: u64,
 }
 
 impl PartialEq<BaseFile> for RemoteFile {

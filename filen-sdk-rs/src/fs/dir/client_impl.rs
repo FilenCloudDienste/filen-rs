@@ -27,6 +27,11 @@ use crate::{
 
 use super::{DirectoryType, HasContents, RemoteDirectory, traits::UpdateDirMeta};
 
+enum ObjectMatch<T> {
+	Name(T),
+	Uuid(T),
+}
+
 impl Client {
 	pub async fn create_dir(
 		&self,
@@ -301,25 +306,68 @@ impl Client {
 		Ok(())
 	}
 
+	fn inner_find_item_in_dirs(
+		&self,
+		dirs: Vec<RemoteDirectory>,
+		name_or_uuid: &str,
+	) -> Option<ObjectMatch<RemoteDirectory>> {
+		let mut uuid_match = None;
+
+		for dir in dirs {
+			if dir.name().is_some_and(|n| n == name_or_uuid) {
+				return Some(ObjectMatch::Name(dir));
+			} else if dir.uuid().as_ref() == name_or_uuid {
+				uuid_match = Some(ObjectMatch::Uuid(dir));
+			}
+		}
+		uuid_match
+	}
+
+	fn inner_find_item_in_files(
+		&self,
+		files: Vec<RemoteFile>,
+		name_or_uuid: &str,
+	) -> Option<ObjectMatch<RemoteFile>> {
+		let mut uuid_match = None;
+
+		for file in files {
+			if file.name().is_some_and(|n| n == name_or_uuid) {
+				return Some(ObjectMatch::Name(file));
+			} else if file.uuid().as_ref() == name_or_uuid {
+				uuid_match = Some(ObjectMatch::Uuid(file));
+			}
+		}
+		uuid_match
+	}
+
+	fn inner_find_item_in_dirs_and_files(
+		&self,
+		dirs: Vec<RemoteDirectory>,
+		files: Vec<RemoteFile>,
+		name_or_uuid: &str,
+	) -> Option<FSObject<'static>> {
+		let uuid_match = match self.inner_find_item_in_dirs(dirs, name_or_uuid) {
+			Some(ObjectMatch::Name(dir)) => return Some(FSObject::Dir(Cow::Owned(dir))),
+			Some(ObjectMatch::Uuid(dir)) => Some(dir),
+			None => None,
+		};
+		match self.inner_find_item_in_files(files, name_or_uuid) {
+			Some(ObjectMatch::Name(file)) => Some(FSObject::File(Cow::Owned(file))),
+			Some(ObjectMatch::Uuid(file)) => Some(FSObject::File(Cow::Owned(file))),
+			None => uuid_match.map(|dir| FSObject::Dir(Cow::Owned(dir))),
+		}
+	}
+
+	/// Finds an item in the directory by name or UUID.
+	/// Returns the match by name if one exists, otherwise returns the match by UUID.
+	/// If no match is found, returns None.
 	pub async fn find_item_in_dir(
 		&self,
 		dir: &dyn HasContents,
-		name: &str,
+		name_or_uuid: &str,
 	) -> Result<Option<FSObject<'static>>, Error> {
 		let (dirs, files) = self.list_dir(dir).await?;
-		if let Some(dir) = dirs
-			.into_iter()
-			.find(|d| d.name().is_some_and(|n| n == name))
-		{
-			return Ok(Some(FSObject::Dir(Cow::Owned(dir))));
-		}
-		if let Some(file) = files
-			.into_iter()
-			.find(|f| f.name().is_some_and(|n| n == name))
-		{
-			return Ok(Some(FSObject::File(Cow::Owned(file))));
-		}
-		Ok(None)
+		Ok(self.inner_find_item_in_dirs_and_files(dirs, files, name_or_uuid))
 	}
 
 	pub async fn find_or_create_dir_starting_at<'a>(
@@ -331,21 +379,28 @@ impl Client {
 		let mut curr_dir = dir;
 		for (component, remaining_path) in path.path_iter() {
 			let (dirs, files) = self.list_dir(&curr_dir).await?;
-			if let Some(dir) = dirs
-				.into_iter()
-				.find(|d| d.name().is_some_and(|n| n == component))
-			{
+
+			let dir_uuid_match = match self.inner_find_item_in_dirs(dirs, component) {
+				Some(ObjectMatch::Name(dir)) => {
+					curr_dir = DirectoryType::Dir(Cow::Owned(dir));
+					continue;
+				}
+				Some(ObjectMatch::Uuid(obj)) => Some(obj),
+				None => None,
+			};
+
+			match self.inner_find_item_in_files(files, component) {
+				Some(ObjectMatch::Name(_)) | Some(ObjectMatch::Uuid(_)) => {
+					return Err(Error::Custom(format!(
+						"find_or_create_dir path {remaining_path}/{component} is a file when trying to create dir {path}"
+					)));
+				}
+				None => {}
+			};
+
+			if let Some(dir) = dir_uuid_match {
 				curr_dir = DirectoryType::Dir(Cow::Owned(dir));
 				continue;
-			}
-
-			if files
-				.iter()
-				.any(|f| f.name().is_some_and(|n| n == component))
-			{
-				return Err(Error::Custom(format!(
-					"find_or_create_dir path {remaining_path}/{component} is a file when trying to create dir {path}"
-				)));
 			}
 
 			let new_dir = self.create_dir(&curr_dir, component.to_string()).await?;

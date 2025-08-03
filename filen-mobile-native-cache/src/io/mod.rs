@@ -30,15 +30,25 @@ use tokio_util::compat::{
 };
 
 #[cfg(windows)]
-fn get_file_times(created: SystemTime, modified: SystemTime) -> FileTimes {
+fn get_file_times(created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
 	use std::os::windows::fs::FileTimesExt;
-
-	FileTimes::new().set_created(created).set_modified(modified)
+	let mut times = FileTimes::new();
+	if let Some(created) = created {
+		times = times.set_created(created);
+	}
+	if let Some(modified) = modified {
+		times = times.set_modified(modified);
+	}
+	times
 }
 
 #[cfg(unix)]
-fn get_file_times(_created: SystemTime, modified: SystemTime) -> FileTimes {
-	FileTimes::new().set_modified(modified)
+fn get_file_times(_created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
+	let mut times = FileTimes::new();
+	if let Some(modified) = modified {
+		times = times.set_modified(modified);
+	}
+	times
 }
 
 pub const CACHE_DIR: &str = "cache";
@@ -132,8 +142,8 @@ impl AuthCacheState {
 			.await
 			.map_err(|e| io::Error::other(format!("Failed to download file: {e}")))?;
 		let os_file = os_file.into_inner().into_std().await;
-		let created = file.created().into();
-		let modified = file.last_modified().into();
+		let created = file.created().map(Into::into);
+		let modified = file.last_modified().map(Into::into);
 		tokio::task::spawn_blocking(move || {
 			os_file
 				.set_times(get_file_times(created, modified))

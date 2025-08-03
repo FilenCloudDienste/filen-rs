@@ -3,8 +3,8 @@ use std::{path::PathBuf, str::FromStr, sync::Arc, time::Instant};
 use chrono::DateTime;
 use filen_sdk_rs::fs::{
 	HasUUID,
-	dir::{RemoteDirectory, traits::HasDirMeta},
-	file::{RemoteFile, traits::HasFileMeta},
+	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
+	file::{RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 };
 use filen_types::fs::{ParentUuid, UuidStr};
 use log::debug;
@@ -19,8 +19,11 @@ use crate::{
 		QueryNonDirChildrenResponse, UploadFileInfo,
 	},
 	sql::{
-		self, DBDir, DBDirExt, DBDirObject, DBDirTrait, DBFile, DBItemTrait, DBNonRootObject,
-		DBObject, error::OptionalExtensionSQL,
+		self, DBDirExt, DBDirObject, DBDirTrait, DBFileMeta, DBItemTrait,
+		dir::DBDir,
+		error::OptionalExtensionSQL,
+		file::DBFile,
+		object::{DBNonRootObject, DBObject},
 	},
 	sync::UpdateItemsInPath,
 	traits::ProgressCallback,
@@ -358,7 +361,13 @@ impl AuthCacheState {
 		let path_values = path.as_path()?;
 		let remote_file = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => {
-				if let Some(hash) = file.hash {
+				let DBFileMeta::Decoded(meta) = file.meta else {
+					return Err(CacheError::remote(format!(
+						"Path {} does not point to a file with decoded metadata",
+						path_values.full_path
+					)));
+				};
+				if let Some(hash) = meta.hash {
 					let local_hash = self.hash_local_file(file.uuid.as_ref()).await?;
 					if local_hash == Some(hash.into()) {
 						return Ok(false);
@@ -367,11 +376,11 @@ impl AuthCacheState {
 
 				self.io_upload_updated_file(
 					file.uuid.as_ref(),
-					path_values.name,
+					&meta.name,
 					file.parent.try_into().map_err(|e| {
 						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
 					})?,
-					file.mime,
+					meta.mime,
 					progress_callback,
 				)
 				.await?
@@ -382,8 +391,10 @@ impl AuthCacheState {
 					path_values.full_path
 				)));
 			}
-			UpdateItemsInPath::Partial(remaining, parent) if remaining == path_values.name => {
-				self.io_upload_new_file(path_values.name, parent.uuid(), None)
+			UpdateItemsInPath::Partial(remaining, parent)
+				if remaining == path_values.name_or_uuid =>
+			{
+				self.io_upload_new_file(path_values.name_or_uuid, parent.uuid(), None)
 					.await?
 					.0
 			}
@@ -492,7 +503,7 @@ impl AuthCacheState {
 		let path = parent_path.join(&name);
 		let pvs = path.as_path()?;
 		let (file, os_path) = self
-			.io_upload_new_file(pvs.name, parent.uuid(), mime)
+			.io_upload_new_file(pvs.name_or_uuid, parent.uuid(), mime)
 			.await?;
 		let mut conn = self.conn();
 		let file = DBFile::upsert_from_remote(&mut conn, file)?;
@@ -668,7 +679,7 @@ impl AuthCacheState {
 
 		if let Some((parent, parent_path)) = parent {
 			if object.certain_parent() != parent.uuid() {
-				let new_path = parent_path.join(object.name());
+				let new_path = parent_path.join(object.uuid().as_ref());
 				let item = self.inner_move_item(object, parent.uuid()).await?;
 				return Ok(ObjectWithPathResponse {
 					object: DBObject::from(item).into(),
@@ -737,7 +748,7 @@ impl AuthCacheState {
 		let obj = self.inner_move_item(obj, new_parent_dir.uuid()).await?;
 		Ok(ObjectWithPathResponse {
 			object: DBObject::from(obj).into(),
-			id: new_parent.join(item_pvs.name),
+			id: new_parent.join(item_pvs.name_or_uuid),
 		})
 	}
 
@@ -748,12 +759,12 @@ impl AuthCacheState {
 	) -> Result<Option<ObjectWithPathResponse>, CacheError> {
 		debug!("Renaming item {} to {}", item.0, new_name);
 		let item_pvs: PathFfiId<'_> = item.as_path()?;
-		if item_pvs.name.is_empty() {
+		if item_pvs.name_or_uuid.is_empty() {
 			return Err(CacheError::remote(format!(
 				"Cannot rename item: {}",
 				item.0
 			)));
-		} else if item_pvs.name == new_name {
+		} else if item_pvs.name_or_uuid == new_name {
 			return Ok(None);
 		}
 		self.update_dir_children(&item.parent()).await?;
@@ -775,20 +786,18 @@ impl AuthCacheState {
 		let obj = match obj {
 			DBNonRootObject::Dir(dbdir) => {
 				let mut remote_dir: RemoteDirectory = dbdir.into();
-				let mut meta = remote_dir.get_meta();
-				meta.set_name(&new_name)?;
+				let changes = DirectoryMetaChanges::default().name(new_name)?;
 				self.client
-					.update_dir_metadata(&mut remote_dir, meta)
+					.update_dir_metadata(&mut remote_dir, changes)
 					.await?;
 				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
 				DBObject::Dir(dir)
 			}
 			DBNonRootObject::File(dbfile) => {
 				let mut remote_file: RemoteFile = dbfile.try_into()?;
-				let mut meta = remote_file.get_meta();
-				meta.set_name(&new_name)?;
+				let changes = FileMetaChanges::default().name(new_name)?;
 				self.client
-					.update_file_metadata(&mut remote_file, meta)
+					.update_file_metadata(&mut remote_file, changes)
 					.await?;
 				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 				DBObject::File(file)
@@ -960,7 +969,7 @@ impl AuthCacheState {
 	) -> Result<String, CacheError> {
 		let file: RemoteFile = file.try_into()?;
 		let uuid = file.uuid().to_string();
-		match (file.hash, self.hash_local_file(&uuid).await) {
+		match (file.hash(), self.hash_local_file(&uuid).await) {
 			(Some(remote_hash), Ok(Some(local_hash))) => {
 				// Remote file has a hash and local file exists
 				if remote_hash == local_hash {

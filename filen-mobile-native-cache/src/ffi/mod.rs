@@ -5,23 +5,33 @@ use filen_types::fs::UuidStr;
 
 use crate::{
 	CacheError,
-	sql::{DBDir, DBDirObject, DBFile, DBNonRootObject, DBObject, DBRoot},
+	sql::{
+		DBDirMeta, DBDirObject, DBFileMeta, DBRoot,
+		dir::DBDir,
+		file::DBFile,
+		object::{DBNonRootObject, DBObject},
+	},
 };
+
+#[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
+pub struct FfiFileMeta {
+	pub name: String,
+	pub mime: String,
+	pub created: i64,
+	pub modified: i64,
+	pub hash: Option<Vec<u8>>,
+}
 
 #[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
 pub struct FfiFile {
 	// item
 	pub uuid: String,
 	pub parent: String,
-	pub name: String,
 
 	// file
-	pub mime: String,
-	pub created: i64,
-	pub modified: i64,
+	pub meta: Option<FfiFileMeta>,
 	pub size: i64,
 	pub favorite_rank: i64,
-	pub hash: Option<Vec<u8>>,
 
 	pub local_data: Option<HashMap<String, String>>,
 }
@@ -31,16 +41,27 @@ impl From<DBFile> for FfiFile {
 		FfiFile {
 			uuid: file.uuid.to_string(),
 			parent: file.parent.to_string(),
-			name: file.name,
-			mime: file.mime,
-			created: file.created,
-			modified: file.modified,
 			size: file.size,
 			favorite_rank: file.favorite_rank,
-			hash: file.hash.map(Vec::from),
 			local_data: file.local_data.map(|o| o.to_map()),
+			meta: match file.meta {
+				DBFileMeta::Decoded(meta) => Some(FfiFileMeta {
+					name: meta.name.to_string(),
+					mime: meta.mime.to_string(),
+					created: meta.created.unwrap_or_default(),
+					modified: meta.modified,
+					hash: meta.hash.map(|h| h.to_vec()),
+				}),
+				_ => None,
+			},
 		}
 	}
+}
+
+#[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
+pub struct FfiDirMeta {
+	pub name: String,
+	pub created: Option<i64>,
 }
 
 #[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
@@ -48,11 +69,10 @@ pub struct FfiDir {
 	// item
 	pub uuid: String,
 	pub parent: String,
-	pub name: String,
 
 	// dir
+	pub meta: Option<FfiDirMeta>,
 	pub color: Option<String>,
-	pub created: Option<i64>,
 	pub favorite_rank: i64,
 
 	// cache info
@@ -66,12 +86,18 @@ impl From<DBDir> for FfiDir {
 		FfiDir {
 			uuid: dir.uuid.to_string(),
 			parent: dir.parent.to_string(),
-			name: dir.name,
 			color: dir.color,
-			created: dir.created,
 			favorite_rank: dir.favorite_rank,
 			last_listed: dir.last_listed,
 			local_data: dir.local_data.map(|o| o.to_map()),
+			meta: if let DBDirMeta::Decoded(meta) = dir.meta {
+				Some(FfiDirMeta {
+					name: meta.name,
+					created: meta.created,
+				})
+			} else {
+				None
+			},
 		}
 	}
 }
@@ -83,12 +109,11 @@ impl From<DBDirObject> for FfiDir {
 			DBDirObject::Root(root) => FfiDir {
 				uuid: root.uuid.to_string(),
 				parent: String::new(),
-				name: String::new(),
 				color: None,
-				created: None,
 				favorite_rank: 0,
 				last_listed: root.last_listed,
 				local_data: None,
+				meta: None,
 			},
 		}
 	}
@@ -201,7 +226,7 @@ pub struct PathFfiId<'a> {
 	pub full_path: &'a str,
 	pub root_uuid: UuidStr,
 	pub inner_path: &'a str,
-	pub name: &'a str,
+	pub name_or_uuid: &'a str,
 }
 
 #[derive(Debug)]
@@ -242,7 +267,7 @@ impl FfiId {
 					CacheError::conversion(format!("Invalid root UUID: {root} error: {e} "))
 				})?,
 				inner_path: remaining,
-				name: iter.last().unwrap_or_default().0,
+				name_or_uuid: iter.last().unwrap_or_default().0,
 			})),
 		}
 	}

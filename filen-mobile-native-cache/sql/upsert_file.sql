@@ -1,21 +1,13 @@
 INSERT INTO files (
 	id,
-	mime,
-	file_key,
-	created,
-	modified,
 	size,
 	chunks,
 	favorite_rank,
 	region,
 	bucket,
-	hash,
-	version
+	metadata_state,
+	raw_metadata
 ) VALUES (
-	?,
-	?,
-	?,
-	?,
 	?,
 	?,
 	?,
@@ -25,10 +17,6 @@ INSERT INTO files (
 	?,
 	?
 ) ON CONFLICT (id) DO UPDATE SET
-mime = excluded.mime,
-file_key = excluded.file_key,
-created = excluded.created,
-modified = excluded.modified,
 size = excluded.size,
 chunks = excluded.chunks,
 -- we use the remote favorite IF favorite is being unset
@@ -42,6 +30,6 @@ favorite_rank
 END,
 region = excluded.region,
 bucket = excluded.bucket,
-hash = excluded.hash,
-version = excluded.version
+metadata_state = excluded.metadata_state,
+raw_metadata = excluded.raw_metadata
 RETURNING favorite_rank;

@@ -9,10 +9,14 @@ WITH moving AS (
 
 existing AS (
 	SELECT
-		id,
-		local_data
+		items.id,
+		items.local_data
 	FROM items
-	WHERE parent = ?2 AND name = ?3
+	LEFT JOIN files_meta ON items.id = files_meta.id
+	LEFT JOIN dirs_meta ON items.id = dirs_meta.id
+	WHERE
+		items.parent = ?2
+		AND (?3 IS NULL OR files_meta.name = ?3 OR dirs_meta.name = ?3)
 ),
 
 local_source AS ( -- noqa: ST05
@@ -44,7 +48,6 @@ INSERT OR REPLACE INTO items (
 	id,
 	uuid,
 	parent,
-	name,
 	local_data,
 	type,
 	is_recent
@@ -53,7 +56,6 @@ SELECT
 	local_source.id,
 	?1 AS uuid,
 	?2 AS parent,
-	?3 AS name,
 	local_source.local_data,
 	?5 AS type,
 	local_source.is_recent

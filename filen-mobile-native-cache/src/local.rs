@@ -12,8 +12,10 @@ use crate::{
 		QueryNonDirChildrenResponse, SearchQueryArgs, SearchQueryResponseEntry,
 	},
 	sql::{
-		self, DBDirExt, DBDirObject, DBDirTrait, DBItemTrait, DBNonRootObject, DBObject, DBRoot,
-		error::OptionalExtensionSQL, json_object::JsonObject,
+		self, DBDirExt, DBDirObject, DBDirTrait, DBItemTrait, DBRoot,
+		error::OptionalExtensionSQL,
+		json_object::JsonObject,
+		object::{DBNonRootObject, DBObject},
 	},
 };
 
@@ -194,7 +196,7 @@ impl AuthCacheState {
 		let conn = self.conn();
 		let path = sql::recursive_select_path_from_uuid(&conn, uuid)?;
 
-		Ok(path.map(|s| FfiId(format!("{}{}", self.client.root().uuid(), s))))
+		Ok(path.map(Into::into))
 	}
 
 	pub(crate) fn get_all_descendant_paths(&self, path: &FfiId) -> Result<Vec<FfiId>, CacheError> {

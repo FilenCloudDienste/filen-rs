@@ -198,43 +198,43 @@ async fn dir_move() {
 	assert!(client.list_dir(&dir_b).await.unwrap().0.contains(&dir_a));
 }
 
-// #[shared_test_runtime]
-// async fn size() {
-// 	let resources = test_utils::RESOURCES.get_resources().await;
-// 	let client = &resources.client;
-// 	let test_dir = &resources.dir;
+#[shared_test_runtime]
+async fn size() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
 
-// 	assert_eq!(
-// 		client.get_dir_size(test_dir, false).await.unwrap(),
-// 		filen_types::api::v3::dir::size::Response {
-// 			size: 0,
-// 			files: 0,
-// 			dirs: 0
-// 		}
-// 	);
+	assert_eq!(
+		client.get_dir_size(test_dir, false).await.unwrap(),
+		filen_types::api::v3::dir::size::Response {
+			size: 0,
+			files: 0,
+			dirs: 0
+		}
+	);
 
-// 	client.create_dir(test_dir, "a".to_string()).await.unwrap();
-// 	time::sleep(time::Duration::from_secs(300)).await; // ddos protection
-// 	assert_eq!(
-// 		client.get_dir_size(test_dir, false).await.unwrap(),
-// 		filen_types::api::v3::dir::size::Response {
-// 			size: 0,
-// 			files: 0,
-// 			dirs: 1
-// 		}
-// 	);
+	client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	time::sleep(time::Duration::from_secs(300)).await; // ddos protection
+	assert_eq!(
+		client.get_dir_size(test_dir, false).await.unwrap(),
+		filen_types::api::v3::dir::size::Response {
+			size: 0,
+			files: 0,
+			dirs: 1
+		}
+	);
 
-// 	client.create_dir(test_dir, "b".to_string()).await.unwrap();
-// 	time::sleep(time::Duration::from_secs(300)).await; // ddos protection
-// 	assert_eq!(
-// 		client.get_dir_size(test_dir, false).await.unwrap(),
-// 		filen_types::api::v3::dir::size::Response {
-// 			size: 0,
-// 			files: 0,
-// 			dirs: 2
-// 		}
-// 	);
-// }
+	client.create_dir(test_dir, "b".to_string()).await.unwrap();
+	time::sleep(time::Duration::from_secs(300)).await; // ddos protection
+	assert_eq!(
+		client.get_dir_size(test_dir, false).await.unwrap(),
+		filen_types::api::v3::dir::size::Response {
+			size: 0,
+			files: 0,
+			dirs: 2
+		}
+	);
+}
 
 #[shared_test_runtime]
 async fn dir_search() {
@@ -372,11 +372,7 @@ async fn dir_malformed_meta() {
 	let test_dir = &resources.dir;
 
 	let uuid = client
-		.create_malformed_dir(
-			test_dir,
-			"malformed".to_string(),
-			"malformed meta".to_string(),
-		)
+		.create_malformed_dir(test_dir, "malformed", "malformed meta".to_string())
 		.await
 		.unwrap();
 

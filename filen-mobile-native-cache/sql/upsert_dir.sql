@@ -1,15 +1,16 @@
 INSERT INTO dirs (
 	id,
-	created,
 	favorite_rank,
-	color
+	color,
+	metadata_state,
+	raw_metadata
 ) VALUES (
+	?,
 	?,
 	?,
 	?,
 	?
 ) ON CONFLICT (id) DO UPDATE SET
-created = excluded.created,
 -- we use the remote favorite IF favorite is being unset
 -- OR if the local favorite wasn't set
 favorite_rank
@@ -19,5 +20,7 @@ favorite_rank
 		THEN excluded.favorite_rank
 	ELSE dirs.favorite_rank
 END,
-color = excluded.color
+color = excluded.color,
+metadata_state = excluded.metadata_state,
+raw_metadata = excluded.raw_metadata
 RETURNING last_listed, favorite_rank;

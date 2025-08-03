@@ -119,13 +119,13 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteDirectory {
-	uuid: UuidStr,
-	parent: ParentUuid,
+	pub uuid: UuidStr,
+	pub parent: ParentUuid,
 
-	color: Option<String>, // todo use Color struct
-	favorited: bool,
+	pub color: Option<String>, // todo use Color struct
+	pub favorited: bool,
 
-	meta: DirectoryMeta<'static>,
+	pub meta: DirectoryMeta<'static>,
 }
 
 impl RemoteDirectory {
