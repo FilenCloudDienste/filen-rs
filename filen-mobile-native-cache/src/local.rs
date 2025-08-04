@@ -3,6 +3,7 @@ use std::{collections::HashMap, str::FromStr, time::Instant};
 use filen_sdk_rs::fs::HasUUID;
 use filen_types::fs::{ParentUuid, UuidStr};
 use log::debug;
+use rusqlite::OptionalExtension;
 
 use crate::{
 	CacheError,
@@ -51,6 +52,10 @@ impl FilenMobileCacheState {
 
 	pub fn query_item(&self, path: &FfiId) -> Result<Option<FfiObject>, CacheError> {
 		self.sync_execute_authed(|auth_state| auth_state.query_item(path))
+	}
+
+	pub fn query_item_by_uuid(&self, uuid: &str) -> Result<Option<FfiObject>, CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.query_item_by_uuid(uuid))
 	}
 
 	pub fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiId>, CacheError> {
@@ -185,6 +190,14 @@ impl AuthCacheState {
 			}
 		}
 		Ok(Some(FfiObject::from(DBObject::from(dir_obj))))
+	}
+
+	pub(crate) fn query_item_by_uuid(&self, uuid: &str) -> Result<Option<FfiObject>, CacheError> {
+		debug!("Querying item by UUID: {uuid}");
+		let uuid = UuidStr::from_str(uuid)?;
+		Ok(DBObject::select(&self.conn(), uuid)
+			.optional()?
+			.map(Into::into))
 	}
 
 	pub(crate) fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiId>, CacheError> {
