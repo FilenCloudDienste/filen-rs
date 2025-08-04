@@ -6,7 +6,7 @@ pub enum SQLError {
 	SQLiteError(#[from] rusqlite::Error),
 	#[error("SQLLite FromSqlError: {0}")]
 	FromSqlError(#[from] rusqlite::types::FromSqlError),
-	#[error("Unexpected type: expected: {0:?}, got: {1:?}")]
+	#[error("Unexpected type: expected: {1:?}, got: {0:?}")]
 	UnexpectedType(ItemType, ItemType),
 	#[error("Unexpected None value for item: {0:?}, field: {1}")]
 	UnexpectedNone(ItemType, &'static str),
