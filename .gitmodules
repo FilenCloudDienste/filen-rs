@@ -1,6 +1,6 @@
-[submodule "heic-decoder/deps/libheif"]
-	path = heic-decoder/deps/libheif
+[submodule "heif-decoder/deps/libheif"]
+	path = heif-decoder/deps/libheif
 	url = https://github.com/strukturag/libheif.git
-[submodule "heic-decoder/deps/libde265"]
-	path = heic-decoder/deps/libde265
+[submodule "heif-decoder/deps/libde265"]
+	path = heif-decoder/deps/libde265
 	url = https://github.com/strukturag/libde265.git

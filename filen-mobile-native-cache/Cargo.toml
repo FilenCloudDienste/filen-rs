@@ -9,10 +9,10 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [features]
 default = []
 malformed = ["filen-sdk-rs/malformed"]
-
+heif-decoder = ["filen-sdk-rs/heif-decoder"]
 
 [dependencies]
-filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs", features = ["tokio", "malformed", "heic"] }
+filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs", features = ["tokio", "malformed"] }
 futures = "0.3.31"
 uniffi = { version = "0.29.2", features = [ "cli" ] }
 libsqlite3-sys = { version = "0.34", features = ["bundled"] }

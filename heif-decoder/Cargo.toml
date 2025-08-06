@@ -1,5 +1,5 @@
 [package]
-name = "heic-decoder"
+name = "heif-decoder"
 version = "0.1.0"
 edition = "2024"
 links = "de265"

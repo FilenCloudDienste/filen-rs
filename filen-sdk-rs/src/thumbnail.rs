@@ -16,16 +16,17 @@ where
 	R: BufRead + Seek,
 	W: Write,
 {
-	let should_use_heic = cfg!(feature = "heic") && (mime == Some("image/heic") || mime == Some("image/heif"));
+	let should_use_heic = cfg!(feature = "heif-decoder")
+		&& (mime == Some("image/heic") || mime == Some("image/heif"));
 	let img = if should_use_heic {
-		#[cfg(feature = "heic")]
+		#[cfg(feature = "heif-decoder")]
 		{
-			DynamicImage::ImageRgba8(heic_decoder::try_get_rgba_image_from_reader(
+			DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_reader(
 				image_reader,
 				_image_file_size,
 			)?)
 		}
-		#[cfg(not(feature = "heic"))]
+		#[cfg(not(feature = "heif-decoder"))]
 		{
 			// heic check above will prevent this from being called
 			unsafe { std::hint::unreachable_unchecked() }

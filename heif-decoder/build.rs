@@ -7,7 +7,10 @@ use cmake::Config;
 
 fn main() {
 	println!("cargo:rerun-if-changed=wrapper.h");
-	if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
+	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "android" {
+		// if we don't bundle libc++ this causes problems on android
+		println!("cargo:rustc-link-lib=static:-bundle=c++");
+	} else if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
 		println!("cargo:rustc-link-lib=c++");
 	}
 
@@ -72,19 +75,15 @@ fn config_cmake_for_macos(config: &mut Config) {
 }
 
 fn config_cmake_for_ios(config: &mut Config) {
-	println!("cargo:warning=checking if Building for iOS");
 	if env::var("CARGO_CFG_TARGET_OS")
 		.ok()
 		.is_none_or(|os| os != "ios")
 	{
-		println!("cargo:warning=Not building for iOS, skipping iOS configuration");
 		return;
 	}
 
 	let deployment_target = env::var("DEPLOYMENT_TARGET").unwrap_or_else(|_| "12.0".to_string());
 	config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
-
-	println!("cargo:warning=Building for iOS, deployment target: {deployment_target}");
 
 	if env::var("TARGET").unwrap().contains("ios-sim") {
 		config.define("CMAKE_OSX_SYSROOT", "iphonesimulator");

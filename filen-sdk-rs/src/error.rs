@@ -31,9 +31,9 @@ pub enum Error {
 	ImageError(#[from] ImageError),
 	#[error("Tried to use metadata for an item that failed to decrypt metadata")]
 	MetadataWasNotDecrypted,
-	#[cfg(feature = "heic")]
+	#[cfg(feature = "heif-decoder")]
 	#[error("HEIC decoding error: `{0}`")]
-	HeifError(#[from] heic_decoder::HeifError),
+	HeifError(#[from] heif_decoder::HeifError),
 }
 
 impl From<filen_types::error::ConversionError> for Error {
