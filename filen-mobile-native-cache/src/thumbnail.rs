@@ -73,14 +73,14 @@ impl AuthCacheState {
 		let (os_file, mut thumbnail_file) =
 			futures::join!(image_file.into_std(), thumbnail_file.into_std());
 
-		let mime = file.mime().to_string();
+		let mime = file.mime().map(|m| m.to_string());
 		let size = file.size();
 
 		if let Err(e) =
 			tokio::task::spawn_blocking(move || -> Result<(), filen_sdk_rs::error::Error> {
 				let image_reader = std::io::BufReader::new(os_file);
 				filen_sdk_rs::thumbnail::make_thumbnail(
-					&mime,
+					mime.as_deref(),
 					size,
 					image_reader,
 					target_width,

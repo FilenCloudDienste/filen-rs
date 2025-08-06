@@ -5,7 +5,7 @@ use image::{DynamicImage, ImageReader, codecs::webp::WebPEncoder, imageops::Filt
 use crate::error::Error;
 
 pub fn make_thumbnail<R, W>(
-	mime: &str,
+	mime: Option<&str>,
 	_image_file_size: u64,
 	image_reader: R,
 	target_width: u32,
@@ -16,7 +16,7 @@ where
 	R: BufRead + Seek,
 	W: Write,
 {
-	let should_use_heic = cfg!(feature = "heic") && (mime == "image/heic" || mime == "image/heif");
+	let should_use_heic = cfg!(feature = "heic") && (mime == Some("image/heic") || mime == Some("image/heif"));
 	let img = if should_use_heic {
 		#[cfg(feature = "heic")]
 		{
