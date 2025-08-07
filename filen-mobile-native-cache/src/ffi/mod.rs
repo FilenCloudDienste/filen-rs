@@ -237,7 +237,7 @@ pub enum ParsedFfiId<'a> {
 }
 
 impl FfiId {
-	pub fn as_path(&self) -> Result<PathFfiId, CacheError> {
+	pub fn as_path(&self) -> Result<PathFfiId<'_>, CacheError> {
 		match self.as_parsed()? {
 			ParsedFfiId::Trash(_) | ParsedFfiId::Recents(_) => Err(CacheError::conversion(
 				format!("Expected PathFfiId, got: {}", self.0),
@@ -246,7 +246,7 @@ impl FfiId {
 		}
 	}
 
-	pub(crate) fn as_parsed(&self) -> Result<ParsedFfiId, CacheError> {
+	pub(crate) fn as_parsed(&self) -> Result<ParsedFfiId<'_>, CacheError> {
 		let mut iter = self.0.path_iter();
 		let (root, remaining) = iter
 			.next()

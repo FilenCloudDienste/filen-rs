@@ -216,7 +216,7 @@ impl HasName for RemoteDirectory {
 }
 
 impl HasDirMeta for RemoteDirectory {
-	fn get_meta(&self) -> &DirectoryMeta {
+	fn get_meta(&self) -> &DirectoryMeta<'_> {
 		&self.meta
 	}
 }

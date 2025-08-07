@@ -677,15 +677,15 @@ impl AuthCacheState {
 			}
 		};
 
-		if let Some((parent, parent_path)) = parent {
-			if object.certain_parent() != parent.uuid() {
-				let new_path = parent_path.join(object.uuid().as_ref());
-				let item = self.inner_move_item(object, parent.uuid()).await?;
-				return Ok(ObjectWithPathResponse {
-					object: DBObject::from(item).into(),
-					id: new_path,
-				});
-			}
+		if let Some((parent, parent_path)) = parent
+			&& object.certain_parent() != parent.uuid()
+		{
+			let new_path = parent_path.join(object.uuid().as_ref());
+			let item = self.inner_move_item(object, parent.uuid()).await?;
+			return Ok(ObjectWithPathResponse {
+				object: DBObject::from(item).into(),
+				id: new_path,
+			});
 		}
 
 		sql::recursive_select_path_from_uuid(&self.conn(), object.uuid())?

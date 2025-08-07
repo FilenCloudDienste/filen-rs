@@ -38,7 +38,7 @@ pub trait HasDirInfo {
 }
 
 pub trait HasDirMeta {
-	fn get_meta(&self) -> &DirectoryMeta;
+	fn get_meta(&self) -> &DirectoryMeta<'_>;
 }
 
 pub(crate) trait UpdateDirMeta {

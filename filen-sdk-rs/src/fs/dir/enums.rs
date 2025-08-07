@@ -185,7 +185,7 @@ impl HasMeta for DirectoryMetaType<'_> {
 }
 
 impl HasDirMeta for DirectoryMetaType<'_> {
-	fn get_meta(&self) -> &DirectoryMeta {
+	fn get_meta(&self) -> &DirectoryMeta<'_> {
 		match self {
 			DirectoryMetaType::Root(dir) => dir.get_meta(),
 			DirectoryMetaType::Dir(dir) => dir.get_meta(),

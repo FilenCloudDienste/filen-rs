@@ -37,11 +37,11 @@ impl<'a> Iterator for PathIterator<'a> {
 }
 
 pub trait PathIteratorExt {
-	fn path_iter(&self) -> PathIterator;
+	fn path_iter(&self) -> PathIterator<'_>;
 }
 
 impl PathIteratorExt for str {
-	fn path_iter(&self) -> PathIterator {
+	fn path_iter(&self) -> PathIterator<'_> {
 		PathIterator::new(self)
 	}
 }

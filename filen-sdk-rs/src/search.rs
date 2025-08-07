@@ -113,7 +113,7 @@ impl<'a> Iterator for SplitNameIter<'a> {
 	}
 }
 
-pub fn split_name(input: &str, min_len: usize, max_len: usize) -> SplitName {
+pub fn split_name(input: &str, min_len: usize, max_len: usize) -> SplitName<'_> {
 	SplitName::new(input, min_len, max_len)
 }
 

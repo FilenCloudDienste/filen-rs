@@ -54,7 +54,10 @@ impl LocalRemoteComparison<'_> {
 	}
 }
 
-async fn check_local_item_matches_remote(obj: DBObject, client: &Client) -> LocalRemoteComparison {
+async fn check_local_item_matches_remote(
+	obj: DBObject,
+	client: &Client,
+) -> LocalRemoteComparison<'_> {
 	match obj {
 		DBObject::Dir(dir) => match client.get_dir(dir.uuid).await {
 			Ok(remote_dir) => {

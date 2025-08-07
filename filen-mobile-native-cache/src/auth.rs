@@ -464,7 +464,7 @@ impl AuthCacheState {
 		Ok(new)
 	}
 
-	pub(crate) fn conn(&self) -> MutexGuard<Connection> {
+	pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
 		match self.conn.lock() {
 			Ok(conn) => conn,
 			// continue if poisoned

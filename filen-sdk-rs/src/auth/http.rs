@@ -78,7 +78,7 @@ impl AuthorizedClient for &AuthClient {
 		&self.api_key
 	}
 
-	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit> {
+	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
 		None
 	}
 }
@@ -94,7 +94,7 @@ impl AuthorizedClient for crate::auth::Client {
 		self.client().get_api_key()
 	}
 
-	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit> {
+	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
 		Some(
 			self.api_semaphore
 				.acquire()
@@ -129,5 +129,5 @@ pub(crate) trait AuthorizedClient: UnauthorizedClient {
 			.bearer_auth(self.get_api_key().0.as_str())
 	}
 
-	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit>;
+	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>>;
 }

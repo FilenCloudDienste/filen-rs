@@ -9,7 +9,7 @@ use filen_types::{
 use crate::{api, auth::Client, error::Error};
 
 impl Client {
-	pub async fn get_contacts(&self) -> Result<Vec<Contact>, Error> {
+	pub async fn get_contacts(&self) -> Result<Vec<Contact<'_>>, Error> {
 		api::v3::contacts::get(self.client()).await.map(|r| r.0)
 	}
 
@@ -57,13 +57,15 @@ impl Client {
 		.await
 	}
 
-	pub async fn list_incoming_contact_requests(&self) -> Result<Vec<ContactRequestIn>, Error> {
+	pub async fn list_incoming_contact_requests(&self) -> Result<Vec<ContactRequestIn<'_>>, Error> {
 		api::v3::contacts::requests::r#in::get(self.client())
 			.await
 			.map(|r| r.0)
 	}
 
-	pub async fn list_outgoing_contact_requests(&self) -> Result<Vec<ContactRequestOut>, Error> {
+	pub async fn list_outgoing_contact_requests(
+		&self,
+	) -> Result<Vec<ContactRequestOut<'_>>, Error> {
 		api::v3::contacts::requests::out::get(self.client())
 			.await
 			.map(|r| r.0)

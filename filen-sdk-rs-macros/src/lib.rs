@@ -189,17 +189,16 @@ where
 			let arg_name = &new_pat_type.pat;
 			if let Type::Reference(ref type_ref) = *pat_type.ty {
 				let inner_type = &type_ref.elem;
-				if let Type::Path(type_path) = inner_type.as_ref() {
-					if type_path
+				if let Type::Path(type_path) = inner_type.as_ref()
+					&& type_path
 						.path
 						.segments
 						.first()
 						.is_some_and(|s| s.ident == "str")
-					{
-						*new_pat_type.ty = syn::parse_quote!(String);
-						args.push(quote!(#arg_name.as_ref()));
-						continue;
-					}
+				{
+					*new_pat_type.ty = syn::parse_quote!(String);
+					args.push(quote!(#arg_name.as_ref()));
+					continue;
 				}
 				*new_pat_type.ty = syn::parse_quote!(std::sync::Arc<#inner_type>);
 				args.push(quote!(#arg_name.as_ref()));
