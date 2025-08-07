@@ -140,6 +140,9 @@ fn build_libheif(libde265_path: &Path) -> PathBuf {
 
 	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
 		config.define("LIBDE265_LIBRARY", libde265_path.join("lib/libde265.lib"));
+
+		config.define("CMAKE_C_FLAGS", "/DLIBDE265_STATIC_BUILD");
+		config.define("CMAKE_CXX_FLAGS", "/DLIBDE265_STATIC_BUILD");
 	} else {
 		config.define("LIBDE265_LIBRARY", libde265_path.join("lib/libde265.a"));
 	}
