@@ -5,7 +5,7 @@ edition = "2024"
 links = "de265"
 
 [dependencies]
-image = {version = "0.25.6", default-features = false}
+image = { version = "0.25.6", default-features = false }
 
 [build-dependencies]
 bindgen = "0.72.0"
@@ -13,4 +13,3 @@ cmake = "0.1.54"
 
 [dev-dependencies]
 image = { version = "0.25.6", default-features = false, features = ["png"] }
-

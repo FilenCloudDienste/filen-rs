@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = [ "filen-mobile-native-cache","filen-sdk-rs","filen-types", "filen-sdk-rs-macros", "heif-decoder", "test-utils", "uniffi-bindgen", "uniffi-bindgen-swift"]
+members = [
+	"filen-mobile-native-cache",
+	"filen-sdk-rs",
+	"filen-types",
+	"filen-sdk-rs-macros",
+	"heif-decoder",
+	"test-utils",
+	"uniffi-bindgen",
+	"uniffi-bindgen-swift",
+]
 
 [profile.test]
 opt-level = 3

@@ -12,21 +12,26 @@ malformed = ["filen-sdk-rs/malformed"]
 heif-decoder = ["filen-sdk-rs/heif-decoder"]
 
 [dependencies]
-filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs", features = ["tokio", "malformed"] }
+filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs", features = [
+	"tokio",
+	"malformed",
+] }
 futures = "0.3.31"
-uniffi = { version = "0.29.2", features = [ "cli" ] }
+uniffi = { version = "0.29.2", features = ["cli"] }
 libsqlite3-sys = { version = "0.34", features = ["bundled"] }
 uuid = { version = "1.17.0", default-features = false }
 chrono = { version = "0.4.41", features = ["serde"] }
-filen-sdk-rs-macros = { version = "0.1.0", path = "../filen-sdk-rs-macros", features = ["tokio"] }
+filen-sdk-rs-macros = { version = "0.1.0", path = "../filen-sdk-rs-macros", features = [
+	"tokio",
+] }
 env_logger = "0.11.8"
 rusqlite = { version = "0.36.0", features = ["bundled"] }
-filen-types = { path = "../filen-types" , features = ["rusqlite"]}
-image = {version = "0.25.6", default-features = false} # only need the error type here
+filen-types = { path = "../filen-types", features = ["rusqlite"] }
+image = { version = "0.25.6", default-features = false } # only need the error type here
 
 
 # Optional dependencies
-tokio = {version = "1.45.1", features = ["rt-multi-thread", "macros", "fs"]}
+tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "fs"] }
 log = "0.4.27"
 tokio-util = { version = "0.7.15", features = ["compat"] }
 sha2 = "0.10.9"
@@ -45,7 +50,7 @@ android_log = "0.1.3"
 env_logger = "0.11.8"
 
 [build-dependencies]
-uniffi = { version = "0.29.2", features = [ "build" ] }
+uniffi = { version = "0.29.2", features = ["build"] }
 
 [dev-dependencies]
 tokio = { version = "1.45.1", features = ["full"] }
