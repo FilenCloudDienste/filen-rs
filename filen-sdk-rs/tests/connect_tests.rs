@@ -559,7 +559,7 @@ async fn remove_link() {
 		.await
 		.unwrap();
 
-	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+	tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
 	let shared_dirs_out = client.list_out_shared(None).await.unwrap().0;
 	assert_eq!(shared_dirs_out.len(), 0);
