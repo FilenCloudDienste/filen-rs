@@ -94,9 +94,9 @@ fn convert_order_by(order_by: Option<&str>) -> &'static str {
 			}
 		} else if order_by.contains("last_modified") {
 			if order_by.contains("ASC") {
-				return "ORDER BY files.modified + 0 ASC";
+				return "ORDER BY files_meta.modified + 0 ASC";
 			} else if order_by.contains("DESC") {
-				return "ORDER BY files.modified + 0 DESC";
+				return "ORDER BY files_meta.modified + 0 DESC";
 			}
 		} else if order_by.contains("size") {
 			if order_by.contains("ASC") {
