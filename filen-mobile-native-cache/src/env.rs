@@ -22,6 +22,16 @@ pub(crate) fn init_logger() {
 	});
 }
 
+#[cfg(target_os = "android")]
+static VM: OnceLock<jni::JavaVM> = OnceLock::new();
+
+#[cfg(target_os = "android")]
+#[unsafe(export_name = "Java_io_filen_app_FilenDocumentsProvider_initJavaVM")]
+pub extern "system" fn java_init(env: jni::JNIEnv, _class: jni::objects::JClass) {
+	let vm = env.get_java_vm().unwrap();
+	_ = VM.set(vm);
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) fn init_logger() {
 	println!("Initializing logger");
@@ -43,7 +53,20 @@ fn build_tokio_runtime() -> Runtime {
 		.expect("Failed to create Tokio runtime")
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(target_os = "android")]
+fn build_tokio_runtime() -> Runtime {
+	Builder::new_multi_thread()
+		.enable_all()
+		.thread_stack_size(1024 * 1024 * 2)
+		.on_thread_start(|| {
+			let vm = VM.get().expect("init java vm");
+			vm.attach_current_thread_permanently().unwrap();
+		})
+		.build()
+		.expect("Failed to create Tokio runtime")
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn build_tokio_runtime() -> Runtime {
 	Builder::new_multi_thread()
 		.enable_all()
