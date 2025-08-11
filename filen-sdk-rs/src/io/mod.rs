@@ -1,11 +1,15 @@
 use std::time::Duration;
 
+#[cfg(unix)]
+use chrono::SubsecRound;
 use chrono::{DateTime, Utc};
 
 pub mod client_impl;
 
-const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
-const SEC_TO_UNIX_EPOCH: u64 = 11_644_473_600; // 11644473600 seconds from 1601-01-01 to 1970-01-01
+#[cfg(windows)]
+const WINDOWS_TICKS_PER_MILLI: u64 = 10_000;
+#[cfg(windows)]
+const MILLIS_TO_UNIX_EPOCH: u64 = 11_644_473_600_000; // 11644473600000 milliseconds from 1601-01-01 to 1970-01-01
 
 pub trait FilenMetaExt {
 	/// Returns the size of the file in bytes.
@@ -20,8 +24,8 @@ fn nt_time_to_unix_time(nt_time: u64) -> DateTime<Utc> {
 	if nt_time == 0 {
 		return std::time::SystemTime::UNIX_EPOCH.into();
 	}
-	let unix_seconds = nt_time / WINDOWS_TICKS_PER_SECOND - SEC_TO_UNIX_EPOCH;
-	(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(unix_seconds)).into()
+	let unix_millis = nt_time / WINDOWS_TICKS_PER_MILLI - MILLIS_TO_UNIX_EPOCH;
+	(std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(unix_millis)).into()
 }
 
 impl FilenMetaExt for std::fs::Metadata {
@@ -36,9 +40,11 @@ impl FilenMetaExt for std::fs::Metadata {
 		#[cfg(windows)]
 		return nt_time_to_unix_time(std::os::windows::fs::MetadataExt::last_write_time(self));
 		#[cfg(unix)]
-		return (std::time::SystemTime::UNIX_EPOCH
-			+ Duration::from_secs(std::os::unix::fs::MetadataExt::mtime(self) as u64))
-		.into();
+		return DateTime::<Utc>::from(
+			std::time::SystemTime::UNIX_EPOCH
+				+ Duration::from_nanos(std::os::unix::fs::MetadataExt::mtime_nsec(self) as u64),
+		)
+		.round_subsecs(3);
 	}
 
 	fn created(&self) -> DateTime<Utc> {
