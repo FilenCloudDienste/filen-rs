@@ -280,7 +280,14 @@ async fn contact_interactions() {
 	assert_eq!(contacts.len(), 0);
 }
 
-async fn set_up_contact<'a>(client: &'a Client, share_client: &'a Client) -> Arc<ResourceLock> {
+async fn set_up_contact<'a>(
+	client: &'a Client,
+	share_client: &'a Client,
+) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
+	let lock1 = client
+		.acquire_lock_with_default("test:contact")
+		.await
+		.unwrap();
 	let lock2 = share_client
 		.acquire_lock_with_default("test:contact")
 		.await
@@ -347,7 +354,7 @@ async fn set_up_contact<'a>(client: &'a Client, share_client: &'a Client) -> Arc
 
 	// removing in/out shared links is async so we wait
 	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-	lock2
+	(lock1, lock2)
 }
 
 #[shared_test_runtime]
