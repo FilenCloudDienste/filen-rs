@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
 	println!("Welcome to Filen CLI!");
 
 	let cli = Cli::parse();
-	let client = authenticate(&cli).await?;
+	let client = authenticate(cli.email, cli.password.as_deref()).await?;
 
 	let mut working_path = RemotePath::new("");
 
