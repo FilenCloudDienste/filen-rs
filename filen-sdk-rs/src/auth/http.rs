@@ -40,17 +40,17 @@ impl std::fmt::Debug for AuthClient {
 // this will be used across runtimes, which it doesn't like
 impl Clone for AuthClient {
 	fn clone(&self) -> Self {
-		Self {
-			client: reqwest::Client::new(),
-			api_key: self.api_key.clone(),
-		}
+		Self::new(self.api_key.clone())
 	}
 }
 
 impl AuthClient {
 	pub fn new(api_key: APIKey) -> Self {
+		let builder = reqwest::Client::builder().use_rustls_tls();
+		#[cfg(feature = "tokio")]
+		let builder = builder.timeout(std::time::Duration::from_secs(30));
 		Self {
-			client: reqwest::Client::default(),
+			client: builder.build().expect("Failed to create reqwest client"),
 			api_key,
 		}
 	}

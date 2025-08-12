@@ -39,4 +39,15 @@ where
 			}),
 		}
 	}
+
+	pub fn as_error(&self) -> Option<ResponseError> {
+		if let Some(false) = self.status {
+			Some(ResponseError::ApiError {
+				message: self.message.as_ref().map(|s| s.to_string()),
+				code: self.code.as_ref().map(|s| s.to_string()),
+			})
+		} else {
+			None
+		}
+	}
 }
