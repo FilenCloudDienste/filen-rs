@@ -4,7 +4,7 @@ members = [
 	"filen-mobile-native-cache",
 	"filen-sdk-rs",
 	"filen-types",
-	"filen-sdk-rs-macros",
+	"filen-macros",
 	"heif-decoder",
 	"test-utils",
 	"uniffi-bindgen",

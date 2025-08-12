@@ -804,6 +804,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "filen-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "filen-mobile-native-cache"
 version = "0.1.0"
 dependencies = [
@@ -812,8 +821,8 @@ dependencies = [
  "chrono",
  "env_logger",
  "faster-hex",
+ "filen-macros",
  "filen-sdk-rs",
- "filen-sdk-rs-macros",
  "filen-types",
  "futures",
  "image",
@@ -850,7 +859,7 @@ dependencies = [
  "digest",
  "dotenv",
  "faster-hex",
- "filen-sdk-rs-macros",
+ "filen-macros",
  "filen-types",
  "futures",
  "futures-timer",
@@ -880,15 +889,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "uuid",
-]
-
-[[package]]
-name = "filen-sdk-rs-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

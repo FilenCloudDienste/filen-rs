@@ -69,4 +69,4 @@ log = "0.4.27"
 dotenv = "0.15.0"
 tokio = { version = "1.47.1", features = ["full"] }
 test-utils = { path = "../test-utils" }
-filen-sdk-rs-macros = { path = "../filen-sdk-rs-macros" }
+filen-macros = { path = "../filen-macros" }

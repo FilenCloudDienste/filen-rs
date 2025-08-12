@@ -1,5 +1,5 @@
+use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{auth::Client, fs::HasName};
-use filen_sdk_rs_macros::shared_test_runtime;
 use futures::{StreamExt, stream::FuturesUnordered};
 
 // all tests must be multi_threaded, otherwise drop will deadlock for TestResources

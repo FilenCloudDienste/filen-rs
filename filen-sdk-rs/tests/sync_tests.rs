@@ -3,7 +3,7 @@ use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 #[cfg(not(feature = "tokio"))]
 // in the tokio runtime, the lock might not be released immediately
 // because we spawn a task to release it
-#[filen_sdk_rs_macros::shared_test_runtime]
+#[filen_macros::shared_test_runtime]
 async fn test_acquire_lock() {
 	use std::time;
 
@@ -38,7 +38,7 @@ async fn test_acquire_lock() {
 }
 
 #[cfg(feature = "tokio")]
-#[filen_sdk_rs_macros::shared_test_runtime]
+#[filen_macros::shared_test_runtime]
 async fn test_refresh_lock() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

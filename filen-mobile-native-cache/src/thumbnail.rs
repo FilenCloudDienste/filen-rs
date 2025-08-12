@@ -222,7 +222,7 @@ impl FilenMobileCacheState {
 	}
 }
 
-#[filen_sdk_rs_macros::create_uniffi_wrapper]
+#[filen_macros::create_uniffi_wrapper]
 impl FilenMobileCacheState {
 	// not sure why this is necessary for this specific function,
 	// but otherwise it seems like the macro wasn't adding this

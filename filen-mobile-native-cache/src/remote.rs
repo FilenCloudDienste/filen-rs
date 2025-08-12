@@ -31,7 +31,7 @@ use crate::{
 
 // yes this should be done with macros
 // no I didn't have time
-#[filen_sdk_rs_macros::create_uniffi_wrapper]
+#[filen_macros::create_uniffi_wrapper]
 impl FilenMobileCacheState {
 	pub async fn update_roots_info(&self) -> Result<(), CacheError> {
 		self.async_execute_authed_owned(async |auth_state| auth_state.update_roots_info().await)
