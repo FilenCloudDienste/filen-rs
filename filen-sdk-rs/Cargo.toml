@@ -10,7 +10,7 @@ malformed = []
 heif-decoder = ["dep:heif-decoder"]
 
 [dependencies]
-reqwest = { version = "0.12.15", features = [
+reqwest = { version = "0.12.22", features = [
 	"json",
 	"stream",
 	"rustls-tls",
@@ -18,22 +18,22 @@ reqwest = { version = "0.12.15", features = [
 
 filen-types = { path = "../filen-types" }
 heif-decoder = { path = "../heif-decoder", optional = true }
-rand = "0.9.0"
+rand = "0.9.2"
 old_rng = { package = "rand", version = "0.8.5" } # for compatibility with rsa 0.9.8
 aes-gcm = { version = "0.10.3", features = ["std"] }
 generic-array = "1.2.0"
-thiserror = "2.0.12"
+thiserror = "2.0.14"
 base64 = "0.22.1"
 pbkdf2 = { version = "0.12.2", features = ["std", "sha2"] }
-sha2 = "0.10.8"
+sha2 = "0.10.9"
 rsa = "0.9.8"
 hkdf = { version = "0.12.4", features = ["std"] }
 hmac = { version = "0.12.1", features = ["std"] }
-uuid = { version = "1.16.0", default-features = false }
-chrono = { version = "0.4.40", features = ["serde"] }
+uuid = { version = "1.18.0", default-features = false }
+chrono = { version = "0.4.41", features = ["serde"] }
 digest = "0.10.7"
 serde = "1.0.219"
-serde_json = "1.0.140"
+serde_json = "1.0.142"
 faster-hex = { version = "0.10.0", features = ["serde"] }
 argon2 = { version = "0.5.3", features = ["std"] }
 serde_path_to_error = "0.1.17"
@@ -54,11 +54,11 @@ image = { version = "0.25.6", default-features = false, features = [
 	"qoi",
 	"avif",
 ] }
-tokio = { version = "1.44.2", default-features = false, features = ["sync"] }
+tokio = { version = "1.47.1", default-features = false, features = ["sync"] }
 tokio-stream = { version = "0.1.17", default-features = false, features = [
 	"fs",
 ], optional = true }
-tokio-util = { version = "0.7.15", default-features = false, features = [
+tokio-util = { version = "0.7.16", default-features = false, features = [
 	"compat",
 ], optional = true }
 bytes = "1.10.1"
@@ -67,6 +67,6 @@ log = "0.4.27"
 
 [dev-dependencies]
 dotenv = "0.15.0"
-tokio = { version = "1.44.2", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full"] }
 test-utils = { path = "../test-utils" }
 filen-sdk-rs-macros = { path = "../filen-sdk-rs-macros" }
