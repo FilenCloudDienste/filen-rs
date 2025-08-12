@@ -15,6 +15,7 @@ use filen_types::{
 use http::{AuthClient, UnauthClient};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -158,6 +159,7 @@ impl PartialEq for Client {
 
 impl Eq for Client {}
 
+#[derive(Serialize, Deserialize)]
 pub struct StringifiedClient {
 	pub email: String,
 	pub root_uuid: String,
