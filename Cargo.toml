@@ -9,6 +9,7 @@ members = [
 	"test-utils",
 	"uniffi-bindgen",
 	"uniffi-bindgen-swift",
+	"filen-cli",
 ]
 
 [profile.test]
