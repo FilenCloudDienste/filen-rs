@@ -47,11 +47,18 @@ jobs:
         with:
           key: cargo-build-ci-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: nttld/setup-ndk@v1
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
         with:
-          ndk-version: r28c
-          add-to-path: true
-          local-cache: true
+          java-version: 17
+          distribution: temurin
+      - name: Setup Android SDK
+        uses: amyu/setup-android@v4
+        with:
+          sdk-version: 36
+          build-tools-version: 35.0.0
+          cmake-version: 3.10.2.4988404
+          ndk-version: 27.0.12077973
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: cargo-ndk
