@@ -61,7 +61,8 @@ jobs:
           ndk-version: 27.0.12077973
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
-          tool: cargo-ndk
+          # Can't use the latest version until https://github.com/bbqsrc/cargo-ndk/issues/181 is fixed
+          tool: cargo-ndk@3.5.4
       - name: Run clippy Android
         run: cargo ndk --target aarch64-linux-android clippy --all-features -- -D warnings
       - name: Run clippy
