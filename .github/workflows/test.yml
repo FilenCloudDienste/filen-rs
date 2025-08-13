@@ -28,6 +28,7 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
         version: [V1, V2, V3] # This remains to define which version of the secrets to use
     runs-on: ${{ matrix.os }}
+    name: Test on ${{ matrix.os }} with version ${{ matrix.version }}
     steps:
       - uses: actions/checkout@v4
         with:

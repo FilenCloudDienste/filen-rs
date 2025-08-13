@@ -7,12 +7,13 @@ on:
     branches:
       - main
 jobs:
-  test:
+  ci:
     strategy:
       matrix:
         # We still need to run CI on all OSes
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    name: CI on ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,8 +32,9 @@ jobs:
           sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
-  test-macos:
+  ci-macos:
     runs-on: macos-latest
+    name: CI on macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
