@@ -38,6 +38,9 @@ fn config_cmake_for_android(config: &mut Config) {
 	}
 
 	let Ok(sysroot_path) = env::var("CARGO_NDK_SYSROOT_PATH") else {
+		println!(
+			"cargo:warning=CARGO_NDK_SYSROOT_PATH is not set, skipping Android NDK configuration"
+		);
 		return;
 	};
 
@@ -56,10 +59,16 @@ fn config_cmake_for_android(config: &mut Config) {
 			config.define("CMAKE_TOOLCHAIN_FILE", toolchain_file);
 			config.define("ANDROID_NDK", ndk_root);
 		}
+	} else {
+		println!(
+			"cargo:warning=Could not determine NDK root path, skipping Android NDK configuration"
+		);
 	}
 
 	if let Ok(android_target) = env::var("CARGO_NDK_ANDROID_TARGET") {
 		config.define("ANDROID_ABI", android_target);
+	} else {
+		println!("cargo:warning=CARGO_NDK_ANDROID_TARGET is not set, using default Android ABI");
 	}
 }
 
