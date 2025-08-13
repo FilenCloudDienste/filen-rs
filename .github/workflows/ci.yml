@@ -23,7 +23,8 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cargo-build-ci-${{ matrix.os }}
+          prefix-key: ''
+          shared-key: cargo-build-ci-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
         if: runner.os == 'Linux'
@@ -45,7 +46,8 @@ jobs:
           targets: aarch64-apple-ios,aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cargo-build-ci-macos
+          prefix-key: ''
+          shared-key: cargo-build-ci-macos-latest
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Setup JDK 17
         uses: actions/setup-java@v4
