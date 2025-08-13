@@ -10,7 +10,7 @@ use crate::{
 	api,
 	auth::Client,
 	crypto::shared::MetaCrypter,
-	error::Error,
+	error::{Error, MetadataWasNotDecryptedError},
 	fs::{
 		HasName, HasType, HasUUID, NonRootFSObject,
 		dir::{DecryptedDirectoryMeta, RemoteDirectory},
@@ -123,7 +123,7 @@ impl Client {
 		I: HasName + HasUUID + HasType,
 	{
 		Ok(
-			split_name(item.name().ok_or(Error::MetadataWasNotDecrypted)?, 2, 16)
+			split_name(item.name().ok_or(MetadataWasNotDecryptedError)?, 2, 16)
 				.iter()
 				.map(move |s| SearchAddItem {
 					hash: self.hmac_key.hash(s.as_bytes()),

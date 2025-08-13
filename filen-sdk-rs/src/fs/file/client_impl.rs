@@ -8,7 +8,7 @@ use crate::{
 	auth::Client,
 	consts::CHUNK_SIZE_U64,
 	crypto::shared::MetaCrypter,
-	error::Error,
+	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 	fs::{
 		HasUUID,
 		dir::HasUUIDContents,
@@ -90,7 +90,7 @@ impl Client {
 
 		let temp_meta = file.get_meta().borrow_with_changes(&changes)?;
 		let FileMeta::Decoded(temp_meta) = temp_meta else {
-			return Err(Error::MetadataWasNotDecrypted);
+			return Err(MetadataWasNotDecryptedError.into());
 		};
 
 		api::v3::file::metadata::post(
@@ -173,7 +173,7 @@ impl Client {
 				Ok(name) => name,
 				Err(file) => file.name().to_string(),
 			};
-			Err(Error::InvalidName(name))
+			Err(InvalidNameError(name).into())
 		} else {
 			Ok(FileWriter::new(file, self, callback, size))
 		}

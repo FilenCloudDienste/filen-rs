@@ -5,9 +5,10 @@ use filen_types::api::response::FilenResponse;
 use reqwest::RequestBuilder;
 
 use crate::{
+	ErrorKind,
 	auth::http::{AuthorizedClient, UnauthorizedClient},
 	consts::gateway_url,
-	error::{Error, ErrorExt},
+	error::{Error, ErrorExt, ResultExt},
 };
 
 pub(crate) mod download;
@@ -45,19 +46,19 @@ where
 			Ok(resp) => resp,
 			Err(e) if e.is_timeout() => {
 				log::warn!("Request to {endpoint} timed out");
-				last_error = Some(Error::ErrorWithContext(Box::new(e.into()), endpoint));
+				last_error = Some(e.with_context(endpoint));
 				continue;
 			}
 			// wish I could use a if let guard here
 			Err(e) if e.status().is_some() => {
 				let status = e.status().expect("status should be present");
 				log::warn!("Request to {endpoint} failed with status {status}",);
-				last_error = Some(Error::ErrorWithContext(Box::new(e.into()), endpoint));
+				last_error = Some(e.with_context(endpoint));
 				continue;
 			}
 			Err(e) => {
 				log::error!("Request to {endpoint} failed: {}", e);
-				return Err(Error::ErrorWithContext(Box::new(e.into()), endpoint));
+				return Err(e.with_context(endpoint));
 			}
 		};
 
@@ -65,13 +66,13 @@ where
 			Ok(body) => body,
 			Err(e) => {
 				log::error!("Failed to parse response from {endpoint}: {}", e);
-				return Err(Error::ErrorWithContext(Box::new(e.into()), endpoint));
+				return Err(e.with_context(endpoint));
 			}
 		};
 
 		if let Some(e) = body.as_error() {
 			log::warn!("Request to {endpoint} failed: {}", e);
-			last_error = Some(Error::ErrorWithContext(Box::new(e.into()), endpoint));
+			last_error = Some(e.with_context(endpoint));
 			continue;
 		}
 		return Ok(body);
@@ -93,7 +94,10 @@ where
 	let response: FilenResponse<U> =
 		serde_path_to_error::deserialize(&mut deserializer).map_err(|e| {
 			let error_string = e.to_string();
-			Error::ErrorWithContext(Box::new(Error::Custom(error_string)), endpoint)
+			Error::custom(
+				ErrorKind::Response,
+				format!("Failed to deserialize response from {endpoint}: {error_string}"),
+			)
 		})?;
 	Ok(response)
 }

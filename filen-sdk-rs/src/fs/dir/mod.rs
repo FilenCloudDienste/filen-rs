@@ -9,7 +9,7 @@ use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, UpdateDirMeta};
 
 use crate::{
 	crypto::shared::MetaCrypter,
-	error::Error,
+	error::{Error, InvalidNameError},
 	fs::{
 		SetRemoteInfo,
 		dir::meta::{DirectoryMeta, DirectoryMetaChanges},
@@ -165,7 +165,7 @@ impl RemoteDirectory {
 
 	pub fn new(name: String, parent: ParentUuid, created: DateTime<Utc>) -> Result<Self, Error> {
 		if name.is_empty() {
-			return Err(Error::InvalidName(name));
+			return Err(InvalidNameError(name).into());
 		}
 		Ok(Self {
 			uuid: UuidStr::new_v4(),

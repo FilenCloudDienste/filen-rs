@@ -10,7 +10,7 @@ use crate::{
 	auth::Client,
 	consts::{FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
-	error::Error,
+	error::{Error, MetadataWasNotDecryptedError},
 };
 
 use super::{chunk::Chunk, traits::File};
@@ -92,7 +92,7 @@ impl<'a> FileReader<'a> {
 			api::download::download_file_chunk(client.client(), file, chunk_idx, out_data.as_mut())
 				.await?;
 			file.key()
-				.ok_or(Error::MetadataWasNotDecrypted)?
+				.ok_or(MetadataWasNotDecryptedError)?
 				.decrypt_data(out_data.as_mut())?;
 			Ok(out_data)
 		}));

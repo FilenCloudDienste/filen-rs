@@ -17,7 +17,7 @@ use crate::{
 		file::{FileKey, FileKeySeed},
 		shared::MetaCrypter,
 	},
-	error::Error,
+	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 	fs::file::make_mime,
 };
 
@@ -152,7 +152,7 @@ impl<'a> FileMeta<'a> {
 			Self::DecryptedRaw(_)
 			| Self::DecryptedUTF8(_)
 			| Self::Encrypted(_)
-			| Self::RSAEncrypted(_) => Err(Error::MetadataWasNotDecrypted),
+			| Self::RSAEncrypted(_) => Err(MetadataWasNotDecryptedError.into()),
 		}
 	}
 
@@ -165,7 +165,7 @@ impl<'a> FileMeta<'a> {
 			Self::DecryptedRaw(_)
 			| Self::DecryptedUTF8(_)
 			| Self::Encrypted(_)
-			| Self::RSAEncrypted(_) => Err(Error::MetadataWasNotDecrypted),
+			| Self::RSAEncrypted(_) => Err(MetadataWasNotDecryptedError.into()),
 		}
 	}
 
@@ -242,7 +242,7 @@ impl<'a> DecryptedFileMeta<'a> {
 	pub fn set_name(&mut self, name: impl Into<Cow<'a, str>>) -> Result<(), Error> {
 		let name = name.into();
 		if name.is_empty() {
-			return Err(Error::InvalidName(name.into()));
+			return Err(InvalidNameError(name.into_owned()).into());
 		}
 		self.name = name;
 		Ok(())
@@ -296,7 +296,7 @@ pub struct FileMetaChanges {
 impl FileMetaChanges {
 	pub fn name(mut self, name: String) -> Result<Self, Error> {
 		if name.is_empty() {
-			return Err(Error::InvalidName(name));
+			return Err(InvalidNameError(name).into());
 		}
 		if self.mime.is_none() {
 			self.mime = Some(make_mime(&name, None));

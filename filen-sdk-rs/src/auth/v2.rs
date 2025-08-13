@@ -6,14 +6,13 @@ use filen_types::crypto::{
 };
 
 use crate::{
-	api,
+	Error, ErrorKind, api,
 	crypto::{
 		self,
 		error::ConversionError,
 		shared::{CreateRandom, MetaCrypter},
 		v2::{MasterKeys, hash},
 	},
-	error::Error,
 };
 
 use super::http::UnauthClient;
@@ -69,8 +68,9 @@ pub(super) async fn login(
 
 	let auth_client = super::AuthClient::new_from_client(response.api_key.into_owned(), client);
 
-	let master_keys_str = response.master_keys.ok_or(Error::Custom(
-		"Missing master keys in login response".to_string(),
+	let master_keys_str = response.master_keys.ok_or(Error::custom(
+		ErrorKind::Response,
+		"Missing master keys in login response",
 	))?;
 
 	let master_keys = crypto::v2::MasterKeys::new(master_keys_str.into_owned(), master_key)?;

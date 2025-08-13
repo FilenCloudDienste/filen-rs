@@ -11,7 +11,7 @@ use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, UpdateFileMeta};
 use crate::{
 	auth::Client,
 	crypto::file::FileKey,
-	error::Error,
+	error::{Error, MetadataWasNotDecryptedError},
 	fs::{
 		SetRemoteInfo,
 		dir::HasUUIDContents,
@@ -185,7 +185,7 @@ impl TryFrom<RemoteFile> for BaseFile {
 		let meta = match file.meta {
 			FileMeta::Decoded(decrypted_file_meta) => decrypted_file_meta,
 			_ => {
-				return Err(crate::error::Error::MetadataWasNotDecrypted);
+				return Err(MetadataWasNotDecryptedError.into());
 			}
 		};
 		Ok(Self {

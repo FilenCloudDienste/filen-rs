@@ -23,7 +23,7 @@ use crate::{
 	api,
 	auth::{Client, MetaKey},
 	crypto::{error::ConversionError, shared::MetaCrypter},
-	error::Error,
+	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
 		dir::{HasUUIDContents, RemoteDirectory},
@@ -262,7 +262,7 @@ impl Client {
 				metadata: Cow::Borrowed(
 					&item
 						.get_rsa_encrypted_meta(&user.public_key)
-						.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
 				),
 			},
 		)
@@ -286,7 +286,7 @@ impl Client {
 				metadata: Cow::Borrowed(
 					&item
 						.get_encrypted_meta(crypter)
-						.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
 				),
 			},
 		)
@@ -319,7 +319,7 @@ impl Client {
 			futures.push(Box::pin(async move {
 				let crypter = self
 					.decrypt_meta_key(&link.link_key)
-					.map_err(|_| Error::MetadataWasNotDecrypted)?;
+					.map_err(|_| MetadataWasNotDecryptedError)?;
 				self.update_linked_item_meta(item, link.link_uuid, &crypter)
 					.await
 			})
@@ -381,7 +381,7 @@ impl Client {
 			let link = Arc::new(link);
 			let crypter = Arc::new(
 				self.decrypt_meta_key(&link.link_key)
-					.map_err(|_| Error::MetadataWasNotDecrypted)?,
+					.map_err(|_| MetadataWasNotDecryptedError)?,
 			);
 			for item in &items_to_process {
 				let link = link.clone();
@@ -431,7 +431,7 @@ impl Client {
 				metadata: Cow::Borrowed(
 					&item
 						.get_encrypted_meta(link_crypter)
-						.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
 				),
 				key: Cow::Borrowed(&link.link_key),
 				expiration: PublicLinkExpiration::Never,
@@ -451,7 +451,7 @@ impl Client {
 					public_link
 						.link_key
 						.as_ref()
-						.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
 				),
 			),
 		};
@@ -461,7 +461,7 @@ impl Client {
 		// link main dir
 		let link = &link;
 		let key = public_link.link_key.as_ref();
-		let key = key.ok_or(Error::MetadataWasNotDecrypted)?;
+		let key = key.ok_or(MetadataWasNotDecryptedError)?;
 		futures.push(Box::pin(async move {
 			api::v3::dir::link::add::post(
 				self.client(),
@@ -472,7 +472,7 @@ impl Client {
 					r#type: ObjectType::Dir,
 					metadata: Cow::Borrowed(
 						&dir.get_encrypted_meta(key)
-							.ok_or(Error::MetadataWasNotDecrypted)?,
+							.ok_or(MetadataWasNotDecryptedError)?,
 					),
 					key: Cow::Borrowed(&link.link_key),
 					expiration: PublicLinkExpiration::Never,
@@ -621,9 +621,12 @@ impl Client {
 		.await?;
 
 		let size_str = self.crypter().decrypt_meta(&response.size)?;
-		let size = size_str
-			.parse::<u64>()
-			.map_err(|_| Error::Custom(format!("Failed to parse size: {size_str}")))?;
+		let size = size_str.parse::<u64>().map_err(|_| {
+			Error::custom(
+				ErrorKind::Conversion,
+				format!("Failed to parse size: {size_str}"),
+			)
+		})?;
 
 		let file_info = LinkedFileInfo {
 			uuid: response.uuid,
@@ -693,7 +696,7 @@ impl Client {
 		)
 		.await?;
 
-		let crypter = link.crypter().ok_or(Error::MetadataWasNotDecrypted)?;
+		let crypter = link.crypter().ok_or(MetadataWasNotDecryptedError)?;
 
 		let dirs = response
 			.dirs
@@ -754,7 +757,7 @@ impl Client {
 				r#type: item.object_type(),
 				metadata: Cow::Owned(
 					item.get_rsa_encrypted_meta(&user.public_key)
-						.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
 				),
 			},
 		)
@@ -776,7 +779,7 @@ impl Client {
 					r#type: ObjectType::Dir,
 					metadata: Cow::Owned(
 						dir.get_rsa_encrypted_meta(&user.public_key)
-							.ok_or(Error::MetadataWasNotDecrypted)?,
+							.ok_or(MetadataWasNotDecryptedError)?,
 					),
 				},
 			)
@@ -816,7 +819,7 @@ impl Client {
 				metadata: Cow::Borrowed(
 					&file
 						.get_rsa_encrypted_meta(&user.public_key)
-						.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
 				),
 			},
 		)

@@ -13,3 +13,5 @@ pub mod sync;
 pub mod thumbnail;
 pub mod user;
 pub mod util;
+
+pub use error::{Error, ErrorKind};

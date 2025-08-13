@@ -5,6 +5,7 @@ use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
 use futures_timer::Delay;
 use log::debug;
 
+use crate::error::RetryFailedError;
 use crate::{
 	api,
 	auth::{Client, http::AuthClient},
@@ -162,9 +163,7 @@ impl Client {
 				Delay::new(sleep_time).await;
 			}
 		}
-		Err(Error::Custom(format!(
-			"Failed to acquire lock after {attempts} attempts"
-		)))
+		Err(RetryFailedError(attempts).into())
 	}
 
 	pub async fn acquire_lock_with_default(

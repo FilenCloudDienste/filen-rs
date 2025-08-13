@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	fs::{
 		UnsharedFSObject,
@@ -166,11 +167,9 @@ impl AuthCacheState {
 				let obj = update_dirs(&mut self.conn(), dirs)?;
 				Ok(UpdateItemsInPath::Partial(path, obj))
 			}
-			Err((
-				filen_sdk_rs::error::Error::InvalidType(ObjectType::File, ObjectType::Dir),
-				(dirs, last_item),
-				path_remaining,
-			)) => {
+			Err((error, (dirs, last_item), path_remaining))
+				if error.kind() == ErrorKind::InvalidType =>
+			{
 				let conn = &mut self.conn();
 				if !dirs.is_empty() {
 					update_dirs(conn, dirs)?;
@@ -178,9 +177,11 @@ impl AuthCacheState {
 				// We got a file when we expected a directory, so we update the directories and the file
 				let dir_obj = match DBObject::upsert_from_remote(conn, last_item)? {
 					DBObject::File(_) => {
-						return Err(filen_sdk_rs::error::Error::InvalidType(
-							ObjectType::File,
-							ObjectType::Dir,
+						return Err(filen_sdk_rs::Error::from(
+							filen_sdk_rs::error::InvalidTypeError {
+								expected: ObjectType::File,
+								actual: ObjectType::Dir,
+							},
 						)
 						.into());
 					}
@@ -270,11 +271,13 @@ impl AuthCacheState {
 			DBObject::Dir(dir) => UnsharedDirectoryType::Dir(Cow::Owned(dir.into())),
 			DBObject::Root(root) => UnsharedDirectoryType::Root(Cow::Owned(root.into())),
 			DBObject::File(_) => {
-				return Err(filen_sdk_rs::error::Error::InvalidType(
-					ObjectType::File,
-					ObjectType::Dir,
-				)
-				.into());
+				return Err(
+					filen_sdk_rs::Error::from(filen_sdk_rs::error::InvalidTypeError {
+						actual: ObjectType::File,
+						expected: ObjectType::Dir,
+					})
+					.into(),
+				);
 			}
 		};
 		let resp = self

@@ -6,7 +6,7 @@ use filen_types::crypto::{
 };
 
 use crate::{
-	api,
+	ErrorKind, api,
 	crypto::{
 		error::ConversionError,
 		rsa::HMACKey,
@@ -67,9 +67,10 @@ pub(super) async fn login(
 
 	let auth_client = super::AuthClient::new_from_client(response.api_key.into_owned(), client);
 
-	let dek_str = response
-		.dek
-		.ok_or(Error::Custom("Missing dek in login response".to_string()))?;
+	let dek_str = response.dek.ok_or(Error::custom(
+		ErrorKind::Response,
+		"Missing dek in login response",
+	))?;
 
 	let dek_str = kek.decrypt_meta(&dek_str.0)?;
 	let dek = EncryptionKey::from_str(&dek_str)?;

@@ -5,7 +5,7 @@ use filen_types::fs::ObjectType;
 use crate::{
 	api,
 	auth::Client,
-	error::Error,
+	error::{Error, InvalidTypeError},
 	fs::{HasType, HasUUID, SetRemoteInfo, UnsharedFSObject, dir::UnsharedDirectoryType},
 	util::PathIteratorExt,
 };
@@ -71,7 +71,11 @@ impl Client {
 					dirs.push(curr_dir);
 					if path_iter.peek().is_some() {
 						return Err((
-							Error::InvalidType(ObjectType::File, ObjectType::Dir),
+							InvalidTypeError {
+								actual: ObjectType::File,
+								expected: ObjectType::Dir,
+							}
+							.into(),
 							(dirs, file),
 							rest_of_path,
 						));

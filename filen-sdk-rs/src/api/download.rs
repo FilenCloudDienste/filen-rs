@@ -2,7 +2,10 @@ use futures::StreamExt;
 use log::debug;
 
 use crate::{
-	auth::http::AuthorizedClient, consts::random_egest_url, error::Error, fs::file::traits::File,
+	auth::http::AuthorizedClient,
+	consts::random_egest_url,
+	error::{ChunkTooLargeError, Error},
+	fs::file::traits::File,
 };
 pub(crate) async fn download_file_chunk(
 	client: impl AuthorizedClient,
@@ -29,10 +32,11 @@ pub(crate) async fn download_file_chunk(
 	while let Some(chunk) = bytes_stream.next().await {
 		let chunk = chunk?;
 		if chunk.len() + i > out_chunk.capacity() {
-			return Err(Error::ChunkTooLarge {
+			return Err(ChunkTooLargeError {
 				expected: out_chunk.capacity(),
 				actual: chunk.len() + i,
-			});
+			}
+			.into());
 		}
 		out_chunk.extend_from_slice(&chunk);
 		i += chunk.len();

@@ -93,10 +93,10 @@ impl AuthCacheState {
 			.unwrap()
 		{
 			tokio::fs::remove_file(&thumbnail_path).await?;
-			if let filen_sdk_rs::error::Error::ImageError(ImageError::Unsupported(_)) = e {
-				Ok(None)
-			} else {
-				Err(CacheError::from(e))
+			match e.downcast::<ImageError>() {
+				Ok(ImageError::Unsupported(_)) => Ok(None),
+				Ok(e) => Err(CacheError::from(e)),
+				Err(e) => Err(CacheError::from(e)),
 			}
 		} else {
 			Ok(Some(thumbnail_path))

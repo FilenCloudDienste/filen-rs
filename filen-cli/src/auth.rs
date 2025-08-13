@@ -1,6 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
-use filen_sdk_rs::auth::{Client, StringifiedClient};
+use filen_sdk_rs::{
+	ErrorKind,
+	auth::{Client, StringifiedClient},
+};
+use filen_types::error::ResponseError;
 
 use crate::{prompt, prompt_confirm, util::LongKeyringEntry};
 
@@ -21,44 +25,29 @@ async fn login_and_optionally_prompt_two_factor_code(
 	email: String,
 	password: &str,
 ) -> Result<Client> {
-	// todo: go over this paragraph again
-	match Client::login(email.clone(), password, "XXXXXX").await {
-		Ok(client) => Ok(client),
-		Err(filen_sdk_rs::error::Error::ErrorWithContext(boxed_error, _))
-			if matches!(
-				*boxed_error,
-				filen_sdk_rs::error::Error::RequestError(
-					filen_types::error::ResponseError::ApiError { .. }
-				)
-			) =>
-		{
-			let code = if let filen_sdk_rs::error::Error::RequestError(
-				filen_types::error::ResponseError::ApiError { code, .. },
-			) = *boxed_error
-			{
-				code
-			} else {
-				None
-			};
-			if code.as_deref() == Some("enter_2fa") {
-				let two_factor_code = prompt("Two-factor authentication code: ")?;
-				let client = Client::login(email, password, two_factor_code.trim())
-					.await
-					.context("Failed to log in (with 2fa code)")?;
-				Ok(client)
-			} else {
-				Err(anyhow::anyhow!(
-					"Failed to log in (code {})",
-					code.as_deref().unwrap_or("")
-				))
+	let unhandled_err = match Client::login(email.clone(), password, "XXXXXX").await {
+		Ok(client) => return Ok(client),
+		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
+			Ok(ResponseError::ApiError { code, .. }) => {
+				if code.as_deref() == Some("enter_2fa") {
+					let two_factor_code = prompt("Two-factor authentication code: ")?;
+					let client = Client::login(email, password, two_factor_code.trim())
+						.await
+						.context("Failed to log in (with 2fa code)")?;
+					return Ok(client);
+				} else {
+					return Err(anyhow::anyhow!(
+						"Failed to log in (code {})",
+						code.as_deref().unwrap_or("")
+					));
+				}
 			}
-		}
-		Err(e) => {
-			// Debug: print the actual error to see its structure
-			eprintln!("Login error: {:?}", e);
-			Err(anyhow::Error::new(e).context("Failed to log in"))
-		}
-	}
+			Err(e) => anyhow!(e),
+		},
+		Err(e) => anyhow!(e),
+	};
+	eprintln!("Login error: {:?}", unhandled_err);
+	Err(unhandled_err.context("Failed to log in"))
 }
 
 /// Authenticate using credentials provided in the CLI arguments.

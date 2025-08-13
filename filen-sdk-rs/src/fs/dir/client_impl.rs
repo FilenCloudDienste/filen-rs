@@ -3,14 +3,15 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
 
+use crate::error::ErrorKind;
 use crate::{
 	api,
 	auth::Client,
 	crypto::shared::MetaCrypter,
-	error::Error,
+	error::{Error, ErrorExt, InvalidTypeError, MetadataWasNotDecryptedError},
 	fs::{
 		HasMetaExt, HasName, HasUUID,
 		dir::{
@@ -57,11 +58,11 @@ impl Client {
 				uuid: dir.uuid(),
 				parent: parent.uuid(),
 				name_hashed: Cow::Borrowed(
-					&self.hash_name(dir.name().ok_or(Error::MetadataWasNotDecrypted)?),
+					&self.hash_name(dir.name().ok_or(MetadataWasNotDecryptedError)?),
 				),
 				meta: Cow::Borrowed(
 					&dir.get_encrypted_meta(self.crypter())
-						.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
 				),
 			},
 		)
@@ -219,9 +220,12 @@ impl Client {
 			.into_iter()
 			.map(|f| {
 				let decrypted_size = self.crypter().decrypt_meta(&f.size)?;
-				let decrypted_size = decrypted_size
-					.parse::<u64>()
-					.map_err(|_| Error::Custom("Failed to parse decrypted size".to_string()))?;
+				let decrypted_size = decrypted_size.parse::<u64>().map_err(|_| {
+					Error::custom(
+						ErrorKind::Conversion,
+						format!("Failed to parse decrypted size: {}", decrypted_size),
+					)
+				})?;
 				let meta = FileMeta::from_encrypted(f.metadata, self.crypter(), f.version);
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
@@ -283,7 +287,7 @@ impl Client {
 		let new_borrowed_meta = dir.get_meta();
 		let temp_meta = new_borrowed_meta.borrow_with_changes(&changes)?;
 		let DirectoryMeta::Decoded(temp_meta) = temp_meta else {
-			return Err(Error::MetadataWasNotDecrypted);
+			return Err(MetadataWasNotDecryptedError.into());
 		};
 
 		api::v3::dir::metadata::post(
@@ -391,7 +395,10 @@ impl Client {
 
 			match self.inner_find_item_in_files(files, component) {
 				Some(ObjectMatch::Name(_)) | Some(ObjectMatch::Uuid(_)) => {
-					return Err(Error::Custom(format!(
+					return Err(InvalidTypeError {
+						actual: ObjectType::File,
+						expected: ObjectType::Dir,
+					}.with_context(format!(
 						"find_or_create_dir path {remaining_path}/{component} is a file when trying to create dir {path}"
 					)));
 				}
@@ -478,7 +485,10 @@ impl Client {
 				let meta = entry.metadata().await?;
 				if meta.is_dir() {
 					let name = entry.file_name().into_string().map_err(|_| {
-						Error::Custom("Failed to convert OsString to String".to_string())
+						Error::custom(
+							ErrorKind::Conversion,
+							"Failed to convert OsString to String",
+						)
 					})?;
 					Box::pin(self.recursive_upload_dir(
 						&path,
@@ -491,7 +501,10 @@ impl Client {
 					use tokio_util::compat::TokioAsyncReadCompatExt;
 
 					let name = entry.file_name().into_string().map_err(|_| {
-						Error::Custom("Failed to convert OsString to String".to_string())
+						Error::custom(
+							ErrorKind::Conversion,
+							"Failed to convert OsString to String",
+						)
 					})?;
 					// stop from overloading client with too many open files
 					let _sem = self.open_file_semaphore.acquire().await.unwrap();
@@ -510,7 +523,10 @@ impl Client {
 					)
 					.await?;
 				} else {
-					return Err(Error::Custom("Unsupported file type".to_string()));
+					return Err(Error::custom(
+						ErrorKind::IO,
+						format!("Unsupported file type for path: {}", path.display()),
+					));
 				}
 				Ok::<_, Error>(())
 			})
@@ -519,7 +535,7 @@ impl Client {
 		{
 			tokio::pin!(stream);
 			while let Some(result) = stream.next().await {
-				use crate::error::ErrorExt;
+				use crate::error::ResultExt;
 				result.context("recursive_upload_dir")?; // propagate any errors
 			}
 		}

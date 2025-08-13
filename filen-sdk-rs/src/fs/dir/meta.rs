@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	crypto::{self, shared::MetaCrypter},
-	error::Error,
+	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 };
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -116,8 +116,8 @@ impl<'a> DirectoryMeta<'a> {
 					name: changes
 						.name
 						.map(Cow::Owned)
-						.ok_or(Error::MetadataWasNotDecrypted)?,
-					created: changes.created.ok_or(Error::MetadataWasNotDecrypted)?,
+						.ok_or(MetadataWasNotDecryptedError)?,
+					created: changes.created.ok_or(MetadataWasNotDecryptedError)?,
 				})
 			}
 		}
@@ -138,8 +138,8 @@ impl<'a> DirectoryMeta<'a> {
 					.name
 					.as_deref()
 					.map(Cow::Borrowed)
-					.ok_or(Error::MetadataWasNotDecrypted)?,
-				created: changes.created.ok_or(Error::MetadataWasNotDecrypted)?,
+					.ok_or(MetadataWasNotDecryptedError)?,
+				created: changes.created.ok_or(MetadataWasNotDecryptedError)?,
 			}),
 		})
 	}
@@ -193,7 +193,7 @@ pub struct DirectoryMetaChanges {
 impl DirectoryMetaChanges {
 	pub fn name(mut self, name: String) -> Result<Self, Error> {
 		if name.is_empty() {
-			return Err(Error::InvalidName(name));
+			return Err(InvalidNameError(name).into());
 		}
 		self.name = Some(name);
 		Ok(self)
