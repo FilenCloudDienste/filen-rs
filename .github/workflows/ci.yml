@@ -23,7 +23,7 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: cargo-build-ci-${{ matrix.os }}
+          key: cargo-build-ci-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
         if: runner.os == 'Linux'
@@ -45,7 +45,7 @@ jobs:
           targets: aarch64-apple-ios,aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: cargo-build-ci-macos
+          key: cargo-build-ci-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: nttld/setup-ndk@v1
         with:
