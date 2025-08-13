@@ -55,11 +55,11 @@ jobs:
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: cargo-ndk
+      - name: Run clippy Android
+        run: cargo ndk --target aarch64-linux-android clippy --all-features -- -D warnings
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
       - name: Run clippy iOS
         run: cargo clippy --target aarch64-apple-ios --all-features -- -D warnings
-      - name: Run clippy Android
-        run: cargo ndk clippy --target aarch64-linux-android --all-features -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
