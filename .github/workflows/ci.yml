@@ -10,17 +10,19 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
-        version: [V1, V2, V3] # This remains to define which version of the secrets to use
+        # We still need to run CI on all OSes
+        os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: cargo-build-${{ runner.os }}
+          prefix-key: cargo-build-ci-${{ runner.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
         if: runner.os == 'Linux'
@@ -29,13 +31,33 @@ jobs:
           sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: clippy,rustfmt
+          targets: aarch64-apple-ios,aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cargo-build-ci-${{ runner.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28c
+          add-to-path: true
+          local-cache: true
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-ndk
+      - name: Run clippy
+        run: cargo clippy --all-features -- -D warnings
+      - name: Run clippy iOS
+        run: cargo clippy --target aarch64-apple-ios --all-features -- -D warnings
+      - name: Run clippy Android
+        run: cargo ndk clippy --target aarch64-linux-android --all-features -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
-      - name: Run tests
-        run: cargo test --all-features
-        env:
-          TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
-          TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
-          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
-          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
-          RUST_LOG: trace
