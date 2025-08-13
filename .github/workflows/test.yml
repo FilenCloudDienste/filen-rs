@@ -1,4 +1,4 @@
-name: Comprehensive Tests
+name: Tests
 on:
   # Run at 3 AM every day
   schedule:
@@ -16,43 +16,13 @@ on:
     branches: [main]
 
 jobs:
-  check-trigger:
-    runs-on: ubuntu-latest
-    outputs:
-      should-run: ${{ steps.check.outputs.triggered }}
-    steps:
-      - name: Check if comprehensive tests should run
-        id: check
-        run: |
-          # Always run for scheduled runs and manual dispatch
-          if [[ "${{ github.event_name }}" == "schedule" ]] || \
-             [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "triggered=true" >> $GITHUB_OUTPUT
-            echo "Running comprehensive tests (scheduled or manual trigger)"
-            exit 0
-          fi
-
-          # Check commit message for [test] trigger
-          if [[ "${{ github.event.head_commit.message }}" == *"[test]"* ]]; then
-            echo "triggered=true" >> $GITHUB_OUTPUT
-            echo "Running comprehensive tests (commit message trigger)"
-            exit 0
-          fi
-
-          # Check PR title and body for [test] trigger
-          if [[ "${{ github.event.pull_request.title }}" == *"[test]"* ]] || \
-             [[ "${{ github.event.pull_request.body }}" == *"[test]"* ]]; then
-            echo "triggered=true" >> $GITHUB_OUTPUT
-            echo "Running comprehensive tests (PR trigger)"
-            exit 0
-          fi
-
-          echo "triggered=false" >> $GITHUB_OUTPUT
-          echo "Skipping comprehensive tests (no trigger found)"
-
   test:
-    needs: check-trigger
-    if: needs.check-trigger.outputs.should-run == 'true'
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[test]') ||
+      contains(github.event.pull_request.title, '[test]') ||
+      contains(github.event.pull_request.body, '[test]')
     strategy:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
