@@ -65,7 +65,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: cargo-build-test-${{ runner.os }}
+          prefix-key: cargo-build-test-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
         if: runner.os == 'Linux'
