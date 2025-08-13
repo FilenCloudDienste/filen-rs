@@ -15,7 +15,7 @@ pub(crate) fn init_logger() {
 #[cfg(target_os = "ios")]
 pub(crate) fn init_logger() {
 	INIT_LOGGER.get_or_init(|| {
-		let _ = oslog::OsLogger::new("io.filen.app.FilenFileProvider")
+		oslog::OsLogger::new("io.filen.app.FilenFileProvider")
 			.level_filter(log::LevelFilter::Debug)
 			.init()
 			.unwrap();
