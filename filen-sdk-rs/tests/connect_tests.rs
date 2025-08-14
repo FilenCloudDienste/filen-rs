@@ -332,8 +332,8 @@ async fn set_up_contact<'a>(
 
 			let mut in_futures = in_dirs
 				.into_iter()
-				.map(|d| (d.get_dir().uuid()))
-				.chain(in_files.into_iter().map(|f| (f.get_file().uuid())))
+				.map(|d| d.get_dir().uuid())
+				.chain(in_files.into_iter().map(|f| f.get_file().uuid()))
 				.map(|uuid| async move {
 					share_client.remove_shared_link_in(uuid).await.unwrap();
 				})
