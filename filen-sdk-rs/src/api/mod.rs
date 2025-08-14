@@ -1,7 +1,7 @@
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, cmp::min, time::Duration};
 
 use bytes::Bytes;
-use filen_types::api::response::FilenResponse;
+use filen_types::{api::response::FilenResponse, error::ResponseError};
 use reqwest::RequestBuilder;
 
 use crate::{
@@ -14,7 +14,8 @@ use crate::{
 pub(crate) mod download;
 pub(crate) mod v3;
 
-pub(crate) const NUM_RETRIES: u64 = 7;
+pub(crate) const DEFAULT_NUM_RETRIES: usize = 7;
+pub(crate) const DEFAULT_MAX_RETRY_TIME: Duration = Duration::from_secs(30);
 
 fn fibonacci_iter() -> impl Iterator<Item = u64> {
 	std::iter::successors(Some((0_u64, Some(1))), |&(a, b)| {
@@ -25,14 +26,13 @@ fn fibonacci_iter() -> impl Iterator<Item = u64> {
 
 /// Represents an error that occured during the `response_handler` closure in [`retry_wrap`].
 ///
-/// The `Retry` variant may still be returned if the number of retries is > [`NUM_RETRIES`].
+/// The `Retry` variant may still be returned if the number of retries is > [`DEFAULT_NUM_RETRIES`].
 pub(crate) enum RetryError {
 	Retry(Error),
 	NoRetry(Error),
 }
 
 /// Retries a request with exponential backoff using the Fibonacci sequence for delays.
-/// This request is retried up to [`NUM_RETRIES`] times.
 ///
 /// `body_bytes` are the bytes to be sent in the request.
 ///
@@ -44,18 +44,22 @@ pub(crate) enum RetryError {
 /// - `Ok(data)` if the request was successful,
 /// - `Err(RetryError::Retry(error))` if the request should be retried
 /// - `Err(RetryError::NoRetry(error))` if the request failed and should not be retried.
+///
+/// `attempts` specifies the number of attempts to retry the request.
 pub(crate) async fn retry_wrap<T>(
 	body_bytes: Bytes,
 	request_builder_fn: impl Fn() -> RequestBuilder,
 	endpoint: impl Into<Cow<'static, str>>,
 	mut response_handler: impl AsyncFnMut(reqwest::Response) -> Result<T, RetryError>,
+	attempts: usize,
+	max_retry_time: Duration,
 ) -> Result<T, Error> {
 	let endpoint = endpoint.into();
 	let mut last_error: Option<Error> = None;
-	for (i, delay) in (0..=NUM_RETRIES).zip(fibonacci_iter()) {
+	for (i, delay) in (0..=attempts).zip(fibonacci_iter()) {
 		if i > 0 {
-			futures_timer::Delay::new(Duration::from_secs(delay)).await;
-			log::warn!("Retrying: {endpoint} ({i}/{NUM_RETRIES})");
+			futures_timer::Delay::new(min(max_retry_time, Duration::from_secs(delay))).await;
+			log::warn!("Retrying: {endpoint} ({i}/{attempts})");
 		}
 
 		// cloning the body bytes is necessary because the request builder consumes it
@@ -94,33 +98,51 @@ pub(crate) async fn retry_wrap<T>(
 			}
 		}
 	}
-	log::error!("Request to {endpoint} failed after {NUM_RETRIES} retries",);
+	log::error!("Request to {endpoint} failed after {attempts} retries",);
 	Err(last_error.expect("retries must be more than 0"))
 }
 
-async fn handle_request<U>(
+pub(crate) async fn handle_request<U>(
 	body_bytes: Bytes,
 	request_builder_fn: impl Fn() -> RequestBuilder,
 	endpoint: &'static str,
+	attempts: usize,
+	max_retry_time: Duration,
 ) -> Result<FilenResponse<'static, U>, Error>
 where
 	U: serde::de::DeserializeOwned,
 {
-	retry_wrap(body_bytes, request_builder_fn, endpoint, async |resp| {
-		let body = match resp.json::<FilenResponse<U>>().await {
-			Ok(body) => body,
-			Err(e) => {
-				log::error!("Failed to parse response from {endpoint}: {e}");
-				return Err(RetryError::NoRetry(e.with_context(endpoint)));
-			}
-		};
+	retry_wrap(
+		body_bytes,
+		request_builder_fn,
+		endpoint,
+		async |resp| {
+			let body = match resp.json::<FilenResponse<U>>().await {
+				Ok(body) => body,
+				Err(e) => {
+					log::error!("Failed to parse response from {endpoint}: {e}");
+					return Err(RetryError::NoRetry(e.with_context(endpoint)));
+				}
+			};
 
-		if let Some(e) = body.as_error() {
-			log::warn!("Request to {endpoint} failed: {}", e);
-			return Err(RetryError::Retry(e.with_context(endpoint)));
-		}
-		Ok(body)
-	})
+			if let Some(ResponseError::ApiError { message, code }) = body.as_error() {
+				log::warn!("Request to {endpoint} failed. message: {message:?}, code: {code:?}");
+				if let Some("internal_error") = code.as_deref() {
+					log::warn!("Internal error, retrying: {message:?}");
+					return Err(RetryError::Retry(
+						ResponseError::ApiError { message, code }.with_context(endpoint),
+					));
+				} else {
+					return Err(RetryError::NoRetry(
+						ResponseError::ApiError { message, code }.with_context(endpoint),
+					));
+				}
+			}
+			Ok(body)
+		},
+		attempts,
+		max_retry_time,
+	)
 	.await
 }
 
@@ -164,6 +186,8 @@ where
 			)
 		},
 		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
 	)
 	.await?
 	.into_data()
@@ -212,6 +236,8 @@ where
 			)
 		},
 		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
 	)
 	.await?
 	.into_data()
@@ -253,6 +279,8 @@ pub(crate) async fn post_auth_request_no_body_empty(
 		Bytes::new(),
 		|| client.post_auth_request(gateway_url(endpoint)),
 		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
 	)
 	.await?
 	.ignore_data()
@@ -277,6 +305,8 @@ where
 			)
 		},
 		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
 	)
 	.await?
 	.ignore_data()
@@ -320,6 +350,8 @@ where
 		Bytes::new(),
 		|| client.get_auth_request(gateway_url(endpoint)),
 		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
 	)
 	.await?
 	.into_data()

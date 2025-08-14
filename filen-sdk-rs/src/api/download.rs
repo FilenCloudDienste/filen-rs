@@ -3,7 +3,7 @@ use futures::StreamExt;
 use log::debug;
 
 use crate::{
-	api::{RetryError, retry_wrap},
+	api::{DEFAULT_MAX_RETRY_TIME, DEFAULT_NUM_RETRIES, RetryError, retry_wrap},
 	auth::http::AuthorizedClient,
 	consts::random_egest_url,
 	error::{ChunkTooLargeError, Error},
@@ -56,6 +56,8 @@ pub(crate) async fn download_file_chunk(
 			);
 			Ok(())
 		},
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
 	)
 	.await
 }

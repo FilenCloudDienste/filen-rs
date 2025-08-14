@@ -5,7 +5,10 @@ use log::debug;
 use sha2::{Digest, Sha512};
 
 use crate::{
-	api::retry_wrap, auth::http::AuthorizedClient, consts::random_ingest_url, error::Error,
+	api::{DEFAULT_MAX_RETRY_TIME, DEFAULT_NUM_RETRIES, retry_wrap},
+	auth::http::AuthorizedClient,
+	consts::random_ingest_url,
+	error::Error,
 	fs::file::BaseFile,
 };
 
@@ -50,6 +53,8 @@ pub(crate) async fn upload_file_chunk(
 				.map(|resp| resp.into_data())
 				.map_err(|e| crate::api::RetryError::NoRetry(e.into()))
 		},
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
 	)
 	.await?
 	.map_err(Into::into)
