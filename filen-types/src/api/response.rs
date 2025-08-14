@@ -4,22 +4,30 @@ use serde::Deserialize;
 
 use crate::error::ResponseError;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 #[serde(bound = "T: Deserialize<'de>")]
-pub struct FilenResponse<'a, T>
-where
-	T: std::fmt::Debug,
-{
+pub struct FilenResponse<'a, T> {
 	pub status: Option<bool>,
 	pub message: Option<Cow<'a, str>>,
 	pub code: Option<Cow<'a, str>>,
 	data: Option<T>,
 }
 
-impl<T> FilenResponse<'_, T>
+impl<T> std::fmt::Debug for FilenResponse<'_, T>
 where
 	T: std::fmt::Debug,
 {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("FilenResponse")
+			.field("status", &self.status)
+			.field("message", &self.message)
+			.field("code", &self.code)
+			.field("data", &self.data)
+			.finish()
+	}
+}
+
+impl<T> FilenResponse<'_, T> {
 	pub fn into_data(self) -> Result<T, ResponseError> {
 		match (self.status, self.data) {
 			(Some(true), Some(data)) => Ok(data),
