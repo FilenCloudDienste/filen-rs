@@ -5,7 +5,8 @@ use log::debug;
 use sha2::{Digest, Sha512};
 
 use crate::{
-	auth::http::AuthorizedClient, consts::random_ingest_url, error::Error, fs::file::BaseFile,
+	api::retry_wrap, auth::http::AuthorizedClient, consts::random_ingest_url, error::Error,
+	fs::file::BaseFile,
 };
 
 pub(crate) mod done;
@@ -38,12 +39,18 @@ pub(crate) async fn upload_file_chunk(
 
 	let _permit = client.get_semaphore_permit().await;
 
-	Ok(client
-		.post_auth_request(url)
-		.body(chunk)
-		.send()
-		.await?
-		.json::<FilenResponse<Response>>()
-		.await?
-		.into_data()?)
+	retry_wrap(
+		chunk,
+		|| client.post_auth_request(&url),
+		url.clone(),
+		async |response| {
+			response
+				.json::<FilenResponse<Response>>()
+				.await
+				.map(|resp| resp.into_data())
+				.map_err(|e| crate::api::RetryError::NoRetry(e.into()))
+		},
+	)
+	.await?
+	.map_err(Into::into)
 }

@@ -1,0 +1,6 @@
+[toolchain]
+# we use nightly because of the `higher-ranked-assumptions` feature (https://github.com/rust-lang/rust/pull/143545)
+#
+# At time of writing this was causing issues with "implementation of `std::marker::Send` is not general enough"
+# errors with the reworked `filen_sdk_rs::api::handle_request` function.
+channel = "nightly-2025-08-14"

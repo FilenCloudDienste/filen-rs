@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 use bytes::Bytes;
 use filen_types::api::response::FilenResponse;
@@ -14,7 +14,7 @@ use crate::{
 pub(crate) mod download;
 pub(crate) mod v3;
 
-const NUM_RETRIES: u64 = 7;
+pub(crate) const NUM_RETRIES: u64 = 7;
 
 fn fibonacci_iter() -> impl Iterator<Item = u64> {
 	std::iter::successors(Some((0_u64, Some(1))), |&(a, b)| {
@@ -23,19 +23,39 @@ fn fibonacci_iter() -> impl Iterator<Item = u64> {
 	.map(|(a, _)| a)
 }
 
-async fn handle_request<U>(
+/// Represents an error that occured during the `response_handler` closure in [`retry_wrap`].
+///
+/// The `Retry` variant may still be returned if the number of retries is > [`NUM_RETRIES`].
+pub(crate) enum RetryError {
+	Retry(Error),
+	NoRetry(Error),
+}
+
+/// Retries a request with exponential backoff using the Fibonacci sequence for delays.
+/// This request is retried up to [`NUM_RETRIES`] times.
+///
+/// `body_bytes` are the bytes to be sent in the request.
+///
+/// `request_builder_fn` returns the request builder for the request to be sent.
+///
+/// `endpoint` is used for logging and error handling.
+///
+/// `response_handler` is passed the response body and returns a result with the error being [`RetryError`].
+/// - `Ok(data)` if the request was successful,
+/// - `Err(RetryError::Retry(error))` if the request should be retried
+/// - `Err(RetryError::NoRetry(error))` if the request failed and should not be retried.
+pub(crate) async fn retry_wrap<T>(
 	body_bytes: Bytes,
 	request_builder_fn: impl Fn() -> RequestBuilder,
-	endpoint: &'static str,
-) -> Result<FilenResponse<'static, U>, Error>
-where
-	U: serde::de::DeserializeOwned + std::fmt::Debug,
-{
+	endpoint: impl Into<Cow<'static, str>>,
+	mut response_handler: impl AsyncFnMut(reqwest::Response) -> Result<T, RetryError>,
+) -> Result<T, Error> {
+	let endpoint = endpoint.into();
 	let mut last_error: Option<Error> = None;
 	for (i, delay) in (0..=NUM_RETRIES).zip(fibonacci_iter()) {
 		if i > 0 {
 			futures_timer::Delay::new(Duration::from_secs(delay)).await;
-			log::warn!("Retrying: {endpoint} ({}/{NUM_RETRIES})", i);
+			log::warn!("Retrying: {endpoint} ({i}/{NUM_RETRIES})");
 		}
 
 		// cloning the body bytes is necessary because the request builder consumes it
@@ -46,38 +66,62 @@ where
 			Ok(resp) => resp,
 			Err(e) if e.is_timeout() => {
 				log::warn!("Request to {endpoint} timed out");
-				last_error = Some(e.with_context(endpoint));
+				last_error = Some(e.with_context(endpoint.clone()));
 				continue;
 			}
 			// wish I could use a if let guard here
 			Err(e) if e.status().is_some() => {
 				let status = e.status().expect("status should be present");
-				log::warn!("Request to {endpoint} failed with status {status}",);
-				last_error = Some(e.with_context(endpoint));
+				log::warn!("Request to {endpoint} failed with status {status}");
+				last_error = Some(e.with_context(endpoint.clone()));
 				continue;
 			}
 			Err(e) => {
-				log::error!("Request to {endpoint} failed: {}", e);
+				log::error!("Request to {endpoint} failed: {e}");
 				return Err(e.with_context(endpoint));
 			}
 		};
 
+		match response_handler(resp).await {
+			Ok(data) => return Ok(data),
+			Err(RetryError::Retry(e)) => {
+				log::warn!("Request to {endpoint} failed, retrying: {e}");
+				last_error = Some(e.with_context(endpoint.clone()));
+			}
+			Err(RetryError::NoRetry(e)) => {
+				log::error!("Request to {endpoint} failed, not retrying: {e}");
+				return Err(e.with_context(endpoint));
+			}
+		}
+	}
+	log::error!("Request to {endpoint} failed after {NUM_RETRIES} retries",);
+	Err(last_error.expect("retries must be more than 0"))
+}
+
+async fn handle_request<U>(
+	body_bytes: Bytes,
+	request_builder_fn: impl Fn() -> RequestBuilder,
+	endpoint: &'static str,
+) -> Result<FilenResponse<'static, U>, Error>
+where
+	U: serde::de::DeserializeOwned,
+{
+	retry_wrap(body_bytes, request_builder_fn, endpoint, async |resp| {
 		let body = match resp.json::<FilenResponse<U>>().await {
 			Ok(body) => body,
 			Err(e) => {
-				log::error!("Failed to parse response from {endpoint}: {}", e);
-				return Err(e.with_context(endpoint));
+				log::error!("Failed to parse response from {endpoint}: {e}");
+				return Err(RetryError::NoRetry(e.with_context(endpoint)));
 			}
 		};
 
 		if let Some(e) = body.as_error() {
 			log::warn!("Request to {endpoint} failed: {}", e);
-			last_error = Some(e.with_context(endpoint));
-			continue;
+			return Err(RetryError::Retry(e.with_context(endpoint)));
 		}
-		return Ok(body);
-	}
-	Err(last_error.expect("retries must be more than 0"))
+		Ok(body)
+	})
+	.await
 }
 
 async fn handle_request_debug<U>(

@@ -1,7 +1,9 @@
+use bytes::Bytes;
 use futures::StreamExt;
 use log::debug;
 
 use crate::{
+	api::{RetryError, retry_wrap},
 	auth::http::AuthorizedClient,
 	consts::random_egest_url,
 	error::{ChunkTooLargeError, Error},
@@ -13,7 +15,6 @@ pub(crate) async fn download_file_chunk(
 	chunk_idx: u64,
 	out_chunk: &mut Vec<u8>,
 ) -> Result<(), Error> {
-	out_chunk.clear();
 	let url = format!(
 		"{}/{}/{}/{}/{}",
 		random_egest_url(),
@@ -24,29 +25,37 @@ pub(crate) async fn download_file_chunk(
 	);
 
 	let _permit = client.get_semaphore_permit().await;
-	let response = client.get_auth_request(url).send().await?;
 
-	let mut bytes_stream = response.bytes_stream();
-	let mut i = 0;
+	retry_wrap(
+		Bytes::new(),
+		|| client.get_auth_request(&url),
+		url.clone(),
+		async |response| {
+			out_chunk.clear();
+			let mut bytes_stream = response.bytes_stream();
+			let mut i = 0;
 
-	while let Some(chunk) = bytes_stream.next().await {
-		let chunk = chunk?;
-		if chunk.len() + i > out_chunk.capacity() {
-			return Err(ChunkTooLargeError {
-				expected: out_chunk.capacity(),
-				actual: chunk.len() + i,
+			while let Some(chunk) = bytes_stream.next().await {
+				let chunk = chunk.map_err(|e| RetryError::Retry(e.into()))?;
+				if chunk.len() + i > out_chunk.capacity() {
+					return Err(RetryError::NoRetry(
+						ChunkTooLargeError {
+							expected: out_chunk.capacity(),
+							actual: chunk.len() + i,
+						}
+						.into(),
+					));
+				}
+				out_chunk.extend_from_slice(&chunk);
+				i += chunk.len();
 			}
-			.into());
-		}
-		out_chunk.extend_from_slice(&chunk);
-		i += chunk.len();
-	}
-
-	debug!(
-		"Downloaded chunk {chunk_idx} of file {}, size: {}",
-		file.uuid(),
-		out_chunk.len()
-	);
-
-	Ok(())
+			debug!(
+				"Downloaded chunk {chunk_idx} of file {}, size: {}",
+				file.uuid(),
+				out_chunk.len()
+			);
+			Ok(())
+		},
+	)
+	.await
 }
