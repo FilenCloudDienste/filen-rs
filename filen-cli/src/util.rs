@@ -55,7 +55,7 @@ impl LongKeyringEntry {
 		}
 	}
 
-	pub fn read(&self) -> Result<String> {
+	pub fn read(&self) -> Result<Option<String>> {
 		let mut result = String::new();
 		let mut i = 0;
 		loop {
@@ -70,7 +70,7 @@ impl LongKeyringEntry {
 			}
 			i += 1;
 		}
-		Ok(result)
+		if i > 0 { Ok(Some(result)) } else { Ok(None) }
 	}
 
 	pub fn write(&self, str: &str) -> Result<()> {
@@ -89,19 +89,25 @@ impl LongKeyringEntry {
 		Ok(())
 	}
 
-	pub fn delete(&self) -> Result<()> {
+	/// Returns true if the entry was deleted, false if it didn't exist.
+	pub fn delete(&self) -> Result<bool> {
 		let mut i = 0;
 		loop {
 			let entry = keyring::Entry::new(KEYRING_SERVICE_NAME, &format!("{}_{}", self.name, i))
 				.context("Failed to create keyring entry for deletion")?;
 			match entry.delete_credential() {
 				Ok(_) => {}
-				Err(keyring::Error::NoEntry) => break,
+				Err(keyring::Error::NoEntry) => {
+					if i == 0 {
+						return Ok(false);
+					}
+					break;
+				}
 				Err(e) => anyhow::bail!("Failed to delete keyring entry: {}", e),
 			}
 			i += 1;
 		}
-		Ok(())
+		Ok(true)
 	}
 }
 

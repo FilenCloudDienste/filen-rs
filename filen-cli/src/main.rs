@@ -3,7 +3,6 @@ use clap::Parser;
 use std::io::Write;
 
 use crate::{
-	auth::authenticate,
 	commands::{Commands, execute_command},
 	util::RemotePath,
 };
@@ -31,12 +30,12 @@ async fn main() -> Result<()> {
 	println!("Welcome to Filen CLI!");
 
 	let cli = Cli::parse();
-	let client = authenticate(cli.email, cli.password.as_deref()).await?;
+	let mut client = auth::LazyClient::new(cli.email, cli.password);
 
 	let mut working_path = RemotePath::new("");
 
 	if let Some(command) = cli.command {
-		execute_command(&client, &working_path, &command).await?;
+		execute_command(&mut client, &working_path, &command).await?;
 	} else {
 		loop {
 			let line = prompt(&format!("{} >", working_path))?;
@@ -56,7 +55,7 @@ async fn main() -> Result<()> {
 			if cli.command.is_none() {
 				continue;
 			}
-			match execute_command(&client, &working_path, &cli.command.unwrap()).await {
+			match execute_command(&mut client, &working_path, &cli.command.unwrap()).await {
 				Ok(result) => {
 					if result.exit {
 						break;
@@ -98,7 +97,7 @@ fn prompt(msg: &str) -> Result<String> {
 
 fn prompt_confirm(msg: &str, default: bool) -> Result<bool> {
 	let y_n_str = if default { "Y/n" } else { "y/N" };
-	let response = prompt(&format!("{} [{}]: ", msg, y_n_str))?;
+	let response = prompt(&format!("{} [{}] ", msg, y_n_str))?;
 	if response.trim().is_empty() {
 		return Ok(default);
 	}

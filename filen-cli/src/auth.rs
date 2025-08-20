@@ -8,6 +8,46 @@ use filen_types::error::ResponseError;
 
 use crate::{prompt, prompt_confirm, util::LongKeyringEntry};
 
+/// A lazily authenticated client.
+/// Since some commands (e. g. logout) don't need the user to be authenticated, we only authenticate when necessary.
+pub enum LazyClient {
+	Unauthenticated {
+		email_arg: Option<String>,
+		password_arg: Option<String>,
+	},
+	Authenticated {
+		client: Box<Client>,
+	},
+}
+
+impl LazyClient {
+	pub fn new(email_arg: Option<String>, password_arg: Option<String>) -> Self {
+		Self::Unauthenticated {
+			email_arg,
+			password_arg,
+		}
+	}
+
+	pub async fn get(&mut self) -> Result<&Client> {
+		match self {
+			Self::Authenticated { client } => Ok(client),
+			Self::Unauthenticated {
+				email_arg,
+				password_arg,
+			} => {
+				let client = authenticate(email_arg.to_owned(), password_arg.as_deref()).await?;
+				*self = Self::Authenticated {
+					client: Box::new(client),
+				};
+				let Self::Authenticated { client } = self else {
+					unreachable!();
+				};
+				Ok(client)
+			}
+		}
+	}
+}
+
 /// Authenticate by one of the available authentication methods.
 pub async fn authenticate(email_arg: Option<String>, password_arg: Option<&str>) -> Result<Client> {
 	if let Ok(client) = authenticate_from_cli_args(email_arg, password_arg).await {
@@ -78,9 +118,12 @@ async fn authenticate_from_keyring() -> Result<Client> {
 	let sdk_config = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 		.read()
 		.context("Failed to read SDK config from keyring")?;
+	let Some(sdk_config) = sdk_config else {
+		anyhow::bail!("No SDK config found in keyring");
+	};
 	let sdk_config = base64.decode(sdk_config)?;
 	let Ok(sdk_config) = serde_json::from_slice::<StringifiedClient>(&sdk_config) else {
-		eprintln!("Invalid SDK config in keyring!"); // todo: ?
+		eprintln!("Invalid SDK config in keyring! Try to `logout`.");
 		return Err(anyhow::anyhow!("Failed to parse SDK config from keyring"));
 	};
 	let client = Client::from_strings(
@@ -117,10 +160,10 @@ async fn authenticate_from_prompt() -> Result<Client> {
 	Ok(client)
 }
 
-/// Deletes credentials from the keyring.
-pub fn delete_credentials() -> Result<()> {
-	LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
+/// Deletes credentials from the keyring. Returns true if successful.
+pub fn delete_credentials() -> Result<bool> {
+	let deleted = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 		.delete()
 		.context("Failed to delete SDK config from keyring")?;
-	Ok(())
+	Ok(deleted)
 }
