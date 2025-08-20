@@ -75,3 +75,26 @@ jobs:
         run: cargo clippy --target aarch64-apple-ios --all-features -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
+  ci-wasm:
+    runs-on: ubuntu-latest
+    name: CI on wasm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-14
+          components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ''
+          shared-key: cargo-build-ci-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+        working-directory: ./filen-wasm
+      - name: Run rustfmt in filen-wasm
+        run: cargo fmt -- --check
+        working-directory: ./filen-wasm

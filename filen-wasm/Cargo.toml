@@ -1,0 +1,33 @@
+# You must change these to your own details.
+[package]
+name = "filen-wasm"
+description = "My super awesome Rust, WebAssembly, and Webpack project!"
+version = "0.1.0"
+authors = ["You <you@example.com>"]
+categories = ["wasm"]
+readme = "README.md"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = {version = "0.2.100", features = ["enable-interning"]}
+filen-sdk-rs = { path = "../filen-sdk-rs" }
+wasm-bindgen-futures = "0.4.50"
+console_error_panic_hook = "0.1.5"
+wasm-logger = "0.2.0"
+filen-types = { version = "0.1.0", path = "../filen-types" }
+tsify = { version = "0.5.5", default-features = false, features = ["js", "wasm-bindgen"] }
+serde = "1.0.219"
+chrono = { version = "0.4.41", default-features = false, features = ["wasmbind", "serde"] }
+wasm-bindgen-derive = "0.3.0"
+wasm-streams = "0.4.2"
+log = "0.4.27"
+serde-wasm-bindgen = "0.6.5"
+web-sys = { version = "0.3.22", default-features = false}
+
+[profile.release]
+opt-level = 's'
+codegen-units = 1
+lto = true

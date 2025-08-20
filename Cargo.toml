@@ -9,7 +9,13 @@ members = [
 	"test-utils",
 	"uniffi-bindgen",
 	"uniffi-bindgen-swift",
-	"filen-cli",
+	"filen-cli"
+]
+# wasm needs to be built separately because otherwise rust-analyzer
+# will try to build it for the same target as the rest of the workspace
+# which doesn't work
+exclude = [
+	"filen-wasm"
 ]
 
 [profile.test]

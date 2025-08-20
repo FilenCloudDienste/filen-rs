@@ -53,3 +53,44 @@ jobs:
           TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
           RUST_LOG: trace
+  test-wasm:
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[test]') ||
+      contains(github.event.pull_request.title, '[test]') ||
+      contains(github.event.pull_request.body, '[test]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-14
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ''
+          shared-key: cargo-build-test-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wasm-pack
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Package WASM bundle
+        run: |
+          wasm-pack build
+        working-directory: ./filen-wasm
+      - name: Run TS tests
+        run: |
+          cd filen-wasm/ts-tests
+          npm install
+          npm run test
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+
