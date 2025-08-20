@@ -40,7 +40,6 @@ serde_path_to_error = "0.1.17"
 sha1 = "0.10.6"
 futures = "0.3.31"
 mime_guess = "2.0.5"
-futures-timer = "3.0.3"
 md2 = "0.10.2"
 md4 = "0.10.2"
 md-5 = "0.10.6"
@@ -63,6 +62,19 @@ tokio-util = { version = "0.7.16", default-features = false, features = [
 ], optional = true }
 bytes = "1.10.1"
 log = "0.4.27"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_v3 = { package = "getrandom", version = "0.3", features = [
+	"wasm_js",
+] }
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1.18.0", default-features = false, features = [
+	"rng-getrandom",
+] }
+wasm-bindgen-futures = "0.4.50"
+wasm-bindgen = "0.2.100"
+wasmtimer = "0.4.2"
+tsify = { version = "0.5.5", default-features = false, features = ["wasm-bindgen"] }
 
 
 [dev-dependencies]

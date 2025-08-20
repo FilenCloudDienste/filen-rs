@@ -58,7 +58,10 @@ pub(crate) async fn retry_wrap<T>(
 	let mut last_error: Option<Error> = None;
 	for (i, delay) in (0..=attempts).zip(fibonacci_iter()) {
 		if i > 0 {
-			futures_timer::Delay::new(min(max_retry_time, Duration::from_secs(delay))).await;
+			#[cfg(not(target_arch = "wasm32"))]
+			tokio::time::sleep(min(max_retry_time, Duration::from_secs(delay))).await;
+			#[cfg(target_arch = "wasm32")]
+			wasmtimer::tokio::sleep(min(max_retry_time, Duration::from_secs(delay))).await;
 			log::warn!("Retrying: {endpoint} ({i}/{attempts})");
 		}
 

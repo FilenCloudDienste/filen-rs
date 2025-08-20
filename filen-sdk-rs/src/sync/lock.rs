@@ -69,7 +69,17 @@ fn drop(lock: &mut ResourceLock) {
 	tokio::spawn(async move { actually_drop(&client, uuid, &resource).await });
 }
 
-#[cfg(not(feature = "tokio"))]
+#[cfg(target_arch = "wasm32")]
+fn drop(lock: &mut ResourceLock) {
+	let client = lock.client.clone();
+	let uuid = lock.uuid;
+	let resource = lock.resource.clone();
+	wasm_bindgen_futures::spawn_local(async move {
+		actually_drop(&client, uuid, &resource).await;
+	});
+}
+
+#[cfg(not(any(feature = "tokio", target_arch = "wasm32")))]
 fn drop(lock: &mut ResourceLock) {
 	futures::executor::block_on(async move {
 		actually_drop(&lock.client, lock.uuid, &lock.resource).await

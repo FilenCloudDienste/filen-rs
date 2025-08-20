@@ -17,6 +17,7 @@ use crate::{
 			traits::HasFileMeta,
 		},
 	},
+	util::MaybeSendCallback,
 };
 
 use super::{
@@ -165,7 +166,7 @@ impl Client {
 	pub(crate) fn inner_get_file_writer<'a>(
 		&'a self,
 		file: Arc<BaseFile>,
-		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
 	) -> Result<FileWriter<'a>, Error> {
 		if file.root.name.is_empty() {
@@ -186,7 +187,7 @@ impl Client {
 	pub fn get_file_writer_with_callback<'a>(
 		&'a self,
 		file: impl Into<Arc<BaseFile>>,
-		callback: Arc<dyn Fn(u64) + Send + Sync + 'a>,
+		callback: MaybeSendCallback<'a, u64>,
 	) -> Result<FileWriter<'a>, Error> {
 		self.inner_get_file_writer(file.into(), Some(callback), None)
 	}

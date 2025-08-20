@@ -10,6 +10,7 @@ use filen_sdk_rs::{
 		dir::RemoteDirectory,
 		file::{meta::FileMetaChanges, traits::HasFileInfo},
 	},
+	util::MaybeSendCallback,
 };
 use rand::TryRngCore;
 
@@ -426,7 +427,7 @@ async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, content
 			&mut &contents[..],
 			Some(Arc::new(|bytes_read: u64| {
 				sender.send(bytes_read).unwrap();
-			})),
+			}) as MaybeSendCallback<u64>),
 			None,
 		)
 		.await

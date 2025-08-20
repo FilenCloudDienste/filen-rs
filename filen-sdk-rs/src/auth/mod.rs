@@ -159,7 +159,10 @@ impl PartialEq for Client {
 
 impl Eq for Client {}
 
+#[cfg_attr(target_arch = "wasm32", derive(tsify::Tsify))]
+#[cfg_attr(target_arch = "wasm32", tsify(from_wasm_abi, into_wasm_abi))]
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StringifiedClient {
 	pub email: String,
 	pub root_uuid: String,

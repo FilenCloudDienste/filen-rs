@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Debug, pin::Pin, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -13,10 +13,7 @@ use filen_types::{
 	fs::{ObjectType, UuidStr},
 };
 use fs::{SharedDirectory, SharedFile};
-use futures::{
-	future::BoxFuture,
-	stream::{FuturesUnordered, StreamExt},
-};
+use futures::stream::{FuturesUnordered, StreamExt};
 use rsa::RsaPublicKey;
 
 use crate::{
@@ -29,6 +26,7 @@ use crate::{
 		dir::{HasUUIDContents, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
+	util::MaybeSendBoxFuture,
 };
 
 pub mod contacts;
@@ -322,19 +320,13 @@ impl Client {
 					.map_err(|_| MetadataWasNotDecryptedError)?;
 				self.update_linked_item_meta(item, link.link_uuid, &crypter)
 					.await
-			})
-				as Pin<
-					Box<dyn std::future::Future<Output = Result<(), Error>> + Send>,
-				>);
+			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 		for user in shared.users {
 			futures.push(Box::pin(async move {
 				let user = user.try_into()?;
 				self.update_shared_item_meta(item, &user).await
-			})
-				as Pin<
-					Box<dyn std::future::Future<Output = Result<(), Error>> + Send>,
-				>);
+			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 
 		while let Some(result) = futures.next().await {
@@ -389,7 +381,7 @@ impl Client {
 				futures.push(Box::pin(async move {
 					self.add_item_to_directory_link(item, link.as_ref(), crypter.as_ref())
 						.await
-				}) as BoxFuture<'_, Result<(), Error>>);
+				}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 			}
 		}
 
@@ -399,7 +391,7 @@ impl Client {
 				let user = user.clone();
 				futures.push(Box::pin(
 					async move { self.inner_share_item(item, user.as_ref()).await },
-				) as BoxFuture<'_, Result<(), Error>>);
+				) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 			}
 		}
 
@@ -479,18 +471,18 @@ impl Client {
 				},
 			)
 			.await
-		}) as BoxFuture<'_, Result<(), Error>>);
+		}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 
 		// link descendants
 		for dir in dirs {
 			futures.push(Box::pin(
 				async move { self.add_item_to_directory_link(&dir, link, key).await },
-			) as BoxFuture<'_, Result<(), Error>>);
+			) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 		for file in files {
 			futures.push(Box::pin(
 				async move { self.add_item_to_directory_link(&file, link, key).await },
-			) as BoxFuture<'_, Result<(), Error>>);
+			) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 
 		while let Some(result) = futures.next().await {
@@ -784,19 +776,19 @@ impl Client {
 				},
 			)
 			.await
-		}) as BoxFuture<'_, Result<(), Error>>);
+		}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 
 		for dir in dirs {
 			futures.push(
 				Box::pin(async move { self.inner_share_item(&dir, user).await })
-					as BoxFuture<'_, Result<(), Error>>,
+					as MaybeSendBoxFuture<'_, Result<(), Error>>,
 			);
 		}
 
 		for file in files {
 			futures.push(
 				Box::pin(async move { self.inner_share_item(&file, user).await })
-					as BoxFuture<'_, Result<(), Error>>,
+					as MaybeSendBoxFuture<'_, Result<(), Error>>,
 			);
 		}
 		while let Some(result) = futures.next().await {

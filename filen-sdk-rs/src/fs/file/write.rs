@@ -7,7 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use filen_types::crypto::Sha512Hash;
-use futures::{AsyncWrite, FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{AsyncWrite, FutureExt, StreamExt, stream::FuturesUnordered};
 use sha2::Digest;
 
 use crate::{
@@ -21,6 +21,7 @@ use crate::{
 	error::Error,
 	fs::file::chunk::Chunk,
 	sync::lock::ResourceLock,
+	util::{MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 use super::{BaseFile, RemoteFile, meta::DecryptedFileMeta};
@@ -42,9 +43,9 @@ impl Default for RemoteFileInfo {
 
 struct FileWriterUploadingState<'a> {
 	file: Arc<BaseFile>,
-	callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
-	futures: FuturesUnordered<BoxFuture<'a, Result<Chunk<'a>, Error>>>,
-	alloc_future: Option<BoxFuture<'a, Chunk<'a>>>,
+	callback: Option<MaybeSendCallback<'a, u64>>,
+	futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<Chunk<'a>, Error>>>,
+	alloc_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
 	// annoying that I have to split it up like this, but Cursor doesn't implement Write
 	// for impl AsMut<Vec<u8>> so we can't use Cursor<Chunk<'a>> directly
 	curr_chunk: Option<Chunk<'a>>,
@@ -133,9 +134,8 @@ impl<'a> FileWriterUploadingState<'a> {
 					if let Some(size) = self.next_chunk_size()
 						&& self.alloc_future.is_none()
 					{
-						self.alloc_future =
-							Some(Box::pin(Chunk::acquire(size, self.client))
-								as BoxFuture<'a, Chunk<'a>>);
+						self.alloc_future = Some(Box::pin(Chunk::acquire(size, self.client))
+							as MaybeSendBoxFuture<'a, Chunk<'a>>);
 					}
 					return Ok(0);
 				}
@@ -278,7 +278,7 @@ impl<'a> FileWriterUploadingState<'a> {
 
 struct FileWriterWaitingForDriveLockState<'a> {
 	file: Arc<BaseFile>,
-	lock_future: BoxFuture<'a, Result<Arc<ResourceLock>, Error>>,
+	lock_future: MaybeSendBoxFuture<'a, Result<Arc<ResourceLock>, Error>>,
 	hash: Sha512Hash,
 	remote_file_info: RemoteFileInfo,
 	upload_key: Arc<String>,
@@ -322,26 +322,28 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 			version: self.client.file_encryption_version(),
 		};
 
-		let future: BoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>> =
-			if self.written == 0 {
-				Box::pin(async move {
-					api::v3::upload::empty::post(self.client.client(), &empty_request).await
-				})
-			} else {
-				let upload_key = self.upload_key.clone();
-				Box::pin(async move {
-					api::v3::upload::done::post(
-						self.client.client(),
-						&api::v3::upload::done::Request {
-							empty_request,
-							chunks: self.num_chunks,
-							rm: Cow::Borrowed(&crypto::shared::generate_random_base64_values(32)),
-							upload_key: Cow::Borrowed(&upload_key),
-						},
-					)
-					.await
-				})
-			};
+		let future: MaybeSendBoxFuture<
+			'a,
+			Result<filen_types::api::v3::upload::empty::Response, Error>,
+		> = if self.written == 0 {
+			Box::pin(async move {
+				api::v3::upload::empty::post(self.client.client(), &empty_request).await
+			})
+		} else {
+			let upload_key = self.upload_key.clone();
+			Box::pin(async move {
+				api::v3::upload::done::post(
+					self.client.client(),
+					&api::v3::upload::done::Request {
+						empty_request,
+						chunks: self.num_chunks,
+						rm: Cow::Borrowed(&crypto::shared::generate_random_base64_values(32)),
+						upload_key: Cow::Borrowed(&upload_key),
+					},
+				)
+				.await
+			})
+		};
 
 		Ok(FileWriterCompletingState {
 			file: self.file.clone(),
@@ -370,7 +372,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 struct FileWriterCompletingState<'a> {
 	file: Arc<BaseFile>,
 	drive_lock: Arc<ResourceLock>,
-	future: BoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
+	future: MaybeSendBoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
 	hash: Sha512Hash,
 	remote_file_info: RemoteFileInfo,
 	client: &'a Client,
@@ -413,7 +415,8 @@ impl<'a> FileWriterCompletingState<'a> {
 				hash: Some(self.hash),
 			}),
 		});
-		let futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>> = FuturesUnordered::new();
+		let futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<(), Error>>> =
+			FuturesUnordered::new();
 
 		let temp_file = file.clone();
 		futures.push(Box::pin(async move {
@@ -421,14 +424,14 @@ impl<'a> FileWriterCompletingState<'a> {
 				.update_item_with_maybe_connected_parent(temp_file.as_ref())
 				.await?;
 			Ok(())
-		}) as BoxFuture<'a, Result<(), Error>>);
+		}) as MaybeSendBoxFuture<'a, Result<(), Error>>);
 		let temp_file = file.clone();
 		futures.push(Box::pin(async move {
 			self.client
 				.update_search_hashes_for_item(temp_file.as_ref())
 				.await?;
 			Ok(())
-		}) as BoxFuture<'a, Result<(), Error>>);
+		}) as MaybeSendBoxFuture<'a, Result<(), Error>>);
 
 		FileWriterFinalizingState {
 			file,
@@ -442,7 +445,7 @@ impl<'a> FileWriterCompletingState<'a> {
 struct FileWriterFinalizingState<'a> {
 	drive_lock: Arc<ResourceLock>,
 	file: Arc<RemoteFile>,
-	futures: FuturesUnordered<BoxFuture<'a, Result<(), Error>>>,
+	futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<(), Error>>>,
 	client: &'a Client,
 }
 
@@ -492,7 +495,7 @@ impl<'a> FileWriterState<'a> {
 	fn new(
 		file: Arc<BaseFile>,
 		client: &'a Client,
-		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
 	) -> Self {
 		FileWriterState::Uploading(FileWriterUploadingState {
@@ -525,7 +528,7 @@ impl<'a> FileWriter<'a> {
 	pub(crate) fn new(
 		file: Arc<BaseFile>,
 		client: &'a Client,
-		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
 	) -> Self {
 		Self {

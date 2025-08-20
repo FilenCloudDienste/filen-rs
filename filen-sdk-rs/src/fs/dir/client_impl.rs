@@ -22,7 +22,6 @@ use crate::{
 		},
 		file::{RemoteFile, meta::FileMeta},
 	},
-	io::FilenMetaExt,
 	util::PathIteratorExt,
 };
 
@@ -470,7 +469,7 @@ impl Client {
 	) -> Result<RemoteDirectory, Error> {
 		use futures::StreamExt;
 
-		use crate::consts::MAX_SMALL_PARALLEL_REQUESTS;
+		use crate::{consts::MAX_SMALL_PARALLEL_REQUESTS, io::FilenMetaExt};
 
 		let _lock = self.lock_drive().await?;
 

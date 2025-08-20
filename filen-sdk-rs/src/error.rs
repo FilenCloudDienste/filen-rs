@@ -204,3 +204,10 @@ impl_from!(
 	MetadataWasNotDecryptedError,
 	ErrorKind::MetadataWasNotDecrypted
 );
+
+#[cfg(target_arch = "wasm32")]
+impl From<Error> for wasm_bindgen::JsValue {
+	fn from(e: Error) -> Self {
+		wasm_bindgen::JsValue::from_str(&format!("Error of kind {:?}: {}", e.kind, e))
+	}
+}

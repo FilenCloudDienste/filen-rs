@@ -46,6 +46,21 @@ impl PathIteratorExt for str {
 	}
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub type MaybeSendBoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
+#[cfg(target_arch = "wasm32")]
+pub type MaybeSendBoxFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub type MaybeSendCallback<'a, T> = std::sync::Arc<dyn Fn(T) + Send + Sync + 'a>;
+#[cfg(target_arch = "wasm32")]
+pub type MaybeSendCallback<'a, T> = std::rc::Rc<dyn Fn(T) + 'a>;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub type MaybeArc<T> = std::sync::Arc<T>;
+#[cfg(target_arch = "wasm32")]
+pub type MaybeArc<T> = std::rc::Rc<T>;
+
 #[cfg(test)]
 mod tests {
 	use super::*;

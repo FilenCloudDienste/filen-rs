@@ -3,7 +3,7 @@ use std::{
 	num::NonZeroU32,
 };
 
-use futures::{StreamExt, future::BoxFuture, stream::FuturesOrdered};
+use futures::{StreamExt, stream::FuturesOrdered};
 
 use crate::{
 	api,
@@ -11,6 +11,7 @@ use crate::{
 	consts::{FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
 	error::{Error, MetadataWasNotDecryptedError},
+	util::MaybeSendBoxFuture,
 };
 
 use super::{chunk::Chunk, traits::File};
@@ -22,8 +23,8 @@ pub(super) struct FileReader<'a> {
 	limit: u64,
 	next_chunk_idx: u64,
 	curr_chunk: Option<Cursor<Chunk<'a>>>,
-	futures: FuturesOrdered<BoxFuture<'a, Result<Chunk<'a>, Error>>>,
-	allocate_chunk_future: Option<BoxFuture<'a, Chunk<'a>>>,
+	futures: FuturesOrdered<MaybeSendBoxFuture<'a, Result<Chunk<'a>, Error>>>,
+	allocate_chunk_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
 }
 
 impl<'a> FileReader<'a> {
@@ -72,9 +73,9 @@ impl<'a> FileReader<'a> {
 		Chunk::try_acquire(chunk_size, self.client)
 	}
 
-	fn allocate_next_chunk(&self) -> Option<BoxFuture<'a, Chunk<'a>>> {
+	fn allocate_next_chunk(&self) -> Option<MaybeSendBoxFuture<'a, Chunk<'a>>> {
 		let chunk_size = self.next_chunk_size()?;
-		Some(Box::pin(Chunk::acquire(chunk_size, self.client)) as BoxFuture<'a, Chunk<'a>>)
+		Some(Box::pin(Chunk::acquire(chunk_size, self.client)) as MaybeSendBoxFuture<'a, Chunk<'a>>)
 	}
 
 	/// Pushes the future to fetch the next chunk.

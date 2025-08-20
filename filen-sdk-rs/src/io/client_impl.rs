@@ -5,6 +5,7 @@ use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
 	auth::Client,
 	fs::file::{BaseFile, RemoteFile, traits::File},
+	util::MaybeSendCallback,
 };
 
 const IO_BUFFER_SIZE: usize = 1024 * 64; // 64 KiB
@@ -14,7 +15,7 @@ impl Client {
 		&'a self,
 		file: &'a dyn File,
 		writer: &mut T,
-		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		callback: Option<MaybeSendCallback<'a, u64>>,
 	) -> Result<(), crate::error::Error>
 	where
 		T: 'a + AsyncWrite + Unpin,
@@ -46,7 +47,7 @@ impl Client {
 		&'a self,
 		base_file: Arc<BaseFile>,
 		reader: &mut T,
-		callback: Option<Arc<dyn Fn(u64) + Send + Sync + 'a>>,
+		callback: Option<MaybeSendCallback<'a, u64>>,
 		known_size: Option<u64>,
 	) -> Result<RemoteFile, crate::error::Error>
 	where
