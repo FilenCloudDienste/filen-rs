@@ -72,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ''
-          shared-key: cargo-build-test-wasm
+          shared-key: cargo-build-release-wasm
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
@@ -93,4 +93,3 @@ jobs:
         env:
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
           TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
-
