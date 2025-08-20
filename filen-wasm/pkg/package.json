@@ -1,0 +1,40 @@
+{
+  "name": "@filen/sdk-rs",
+  "version": "0.1.0",
+  "description": "Filen WASM SDK using filen-sdk-rs",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "author": "Filen",
+  "collaborators": [
+    "Enduriel <endur1el@protonmail.com>"
+  ],
+  "files": [
+    "browser"
+  ],
+  "main": "browser/sdk-rs.js",
+  "types": "browser/sdk-rs.d.ts",
+  "sideEffects": [
+    "./browser/sdk-rs.js"
+  ],
+  "license": "AGPLv3",
+  "keywords": [
+    "filen"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FilenCloudDienste/filen-rs"
+  },
+  "engines": {
+    "node": ">=23"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.3",
+    "vite": "^7.1.2",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.5.0",
+    "vitest": "^3.2.4",
+    "dotenv": "^17.2.1"
+  }
+}

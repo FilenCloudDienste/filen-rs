@@ -83,11 +83,11 @@ jobs:
           node-version: '24.x'
       - name: Package WASM bundle
         run: |
-          wasm-pack build
+          sh wasm-pack.sh
         working-directory: ./filen-wasm
       - name: Run TS tests
         run: |
-          cd filen-wasm/ts-tests
+          cd filen-wasm/pkg
           npm install
           npm run test
         env:

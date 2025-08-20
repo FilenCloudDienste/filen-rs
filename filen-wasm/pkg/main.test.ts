@@ -1,4 +1,4 @@
-import { Dir, login, FilenState, from_serialized } from "@filen/sdk-rs"
+import { Dir, login, FilenState, from_serialized } from "./browser/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import "dotenv/config"
 
