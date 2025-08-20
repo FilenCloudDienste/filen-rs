@@ -7,6 +7,7 @@ use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
 
 use crate::error::ErrorKind;
+use crate::fs::NonRootFSObject;
 use crate::{
 	api,
 	auth::Client,
@@ -19,7 +20,6 @@ use crate::{
 			meta::{DirectoryMeta, DirectoryMetaChanges},
 			traits::HasDirMeta,
 		},
-		enums::FSObject,
 		file::{RemoteFile, meta::FileMeta},
 	},
 	io::FilenMetaExt,
@@ -349,16 +349,16 @@ impl Client {
 		dirs: Vec<RemoteDirectory>,
 		files: Vec<RemoteFile>,
 		name_or_uuid: &str,
-	) -> Option<FSObject<'static>> {
+	) -> Option<NonRootFSObject<'static>> {
 		let uuid_match = match self.inner_find_item_in_dirs(dirs, name_or_uuid) {
-			Some(ObjectMatch::Name(dir)) => return Some(FSObject::Dir(Cow::Owned(dir))),
+			Some(ObjectMatch::Name(dir)) => return Some(NonRootFSObject::Dir(Cow::Owned(dir))),
 			Some(ObjectMatch::Uuid(dir)) => Some(dir),
 			None => None,
 		};
 		match self.inner_find_item_in_files(files, name_or_uuid) {
-			Some(ObjectMatch::Name(file)) => Some(FSObject::File(Cow::Owned(file))),
-			Some(ObjectMatch::Uuid(file)) => Some(FSObject::File(Cow::Owned(file))),
-			None => uuid_match.map(|dir| FSObject::Dir(Cow::Owned(dir))),
+			Some(ObjectMatch::Name(file)) => Some(NonRootFSObject::File(Cow::Owned(file))),
+			Some(ObjectMatch::Uuid(file)) => Some(NonRootFSObject::File(Cow::Owned(file))),
+			None => uuid_match.map(|dir| NonRootFSObject::Dir(Cow::Owned(dir))),
 		}
 	}
 
@@ -369,7 +369,7 @@ impl Client {
 		&self,
 		dir: &dyn HasContents,
 		name_or_uuid: &str,
-	) -> Result<Option<FSObject<'static>>, Error> {
+	) -> Result<Option<NonRootFSObject<'static>>, Error> {
 		let (dirs, files) = self.list_dir(dir).await?;
 		Ok(self.inner_find_item_in_dirs_and_files(dirs, files, name_or_uuid))
 	}

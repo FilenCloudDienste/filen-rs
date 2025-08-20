@@ -6,7 +6,10 @@ use crate::{
 	api,
 	auth::Client,
 	error::{Error, InvalidTypeError},
-	fs::{HasType, HasUUID, SetRemoteInfo, UnsharedFSObject, dir::UnsharedDirectoryType},
+	fs::{
+		HasType, HasUUID, NonRootFSObject, SetRemoteInfo, UnsharedFSObject,
+		dir::UnsharedDirectoryType,
+	},
 	util::PathIteratorExt,
 };
 
@@ -57,7 +60,7 @@ impl Client {
 		};
 		while let Some((component, rest_of_path)) = path_iter.next() {
 			match self.find_item_in_dir(&curr_dir, component).await {
-				Ok(Some(FSObject::Dir(dir))) => {
+				Ok(Some(NonRootFSObject::Dir(dir))) => {
 					let old_dir = std::mem::replace(&mut curr_dir, UnsharedDirectoryType::Dir(dir));
 					dirs.push(old_dir);
 					if path_iter.peek().is_none() {
@@ -66,7 +69,7 @@ impl Client {
 					last_rest_of_path = rest_of_path;
 					continue;
 				}
-				Ok(Some(FSObject::File(file))) => {
+				Ok(Some(NonRootFSObject::File(file))) => {
 					let file = UnsharedFSObject::File(file);
 					dirs.push(curr_dir);
 					if path_iter.peek().is_some() {
@@ -90,7 +93,6 @@ impl Client {
 					));
 				}
 				Err(e) => return Err((e, (dirs, curr_dir.into()), rest_of_path)),
-				Ok(Some(o)) => unreachable!("Unexpected fs_object {:?} in path search", o),
 			}
 		}
 		Ok((dirs, ObjectOrRemainingPath::Object(curr_dir.into())))

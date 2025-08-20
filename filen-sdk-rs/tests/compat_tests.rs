@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	crypto::file::FileKey,
 	fs::{
-		FSObject, HasUUID,
+		FSObject, HasUUID, NonRootFSObject,
 		dir::{HasUUIDContents, RemoteDirectory},
 		file::FileBuilder,
 	},
@@ -171,7 +171,7 @@ async fn make_rs_compat_dir() {
 
 async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language: &str) {
 	match client.find_item_in_dir(&compat_dir, "dir").await.unwrap() {
-		Some(FSObject::Dir(_)) => {}
+		Some(NonRootFSObject::Dir(_)) => {}
 		_ => panic!("dir not found in compat-go directory"),
 	}
 	match client
@@ -179,7 +179,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.await
 		.unwrap()
 	{
-		Some(FSObject::File(file)) => {
+		Some(NonRootFSObject::File(file)) => {
 			assert_eq!(
 				client.download_file(file.as_ref()).await.unwrap().len(),
 				0,
@@ -193,7 +193,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.await
 		.unwrap()
 	{
-		Some(FSObject::File(file)) => {
+		Some(NonRootFSObject::File(file)) => {
 			assert_eq!(
 				client.download_file(file.as_ref()).await.unwrap(),
 				format!("Hello World from {language}!").as_bytes(),
@@ -208,7 +208,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.await
 		.unwrap()
 	{
-		Some(FSObject::File(file)) => {
+		Some(NonRootFSObject::File(file)) => {
 			let buf = client.download_file(file.as_ref()).await.unwrap();
 			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
 			name_splitter.split1.sort_unstable();
@@ -233,7 +233,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.await
 		.unwrap()
 	{
-		Some(FSObject::File(file)) => {
+		Some(NonRootFSObject::File(file)) => {
 			assert_eq!(
 				client.download_file(file.as_ref()).await.unwrap().len(),
 				1024 * 1024 * 4 * 2,
@@ -250,7 +250,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.await
 		.unwrap()
 	{
-		Some(FSObject::File(file)) => {
+		Some(NonRootFSObject::File(file)) => {
 			let compat_test_file = compat_test_file.uuid(file.uuid()).build();
 			assert_eq!(*file, compat_test_file, "file inner_file mismatch");
 
