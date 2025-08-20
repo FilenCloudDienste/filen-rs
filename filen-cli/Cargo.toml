@@ -2,6 +2,7 @@
 name = "filen-cli"
 version = "0.1.0"
 edition = "2024"
+metadata.workspaces = { independent = true }
 
 [dependencies]
 anyhow = "1.0.98"
