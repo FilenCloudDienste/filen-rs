@@ -17,7 +17,7 @@ filen-sdk-rs = { path = "../filen-sdk-rs" }
 wasm-bindgen-futures = "0.4.50"
 console_error_panic_hook = "0.1.5"
 wasm-logger = "0.2.0"
-filen-types = { version = "0.1.0", path = "../filen-types" }
+filen-types = { path = "../filen-types" }
 tsify = { version = "0.5.5", default-features = false, features = ["js", "wasm-bindgen"] }
 serde = "1.0.219"
 chrono = { version = "0.4.41", default-features = false, features = ["wasmbind", "serde"] }

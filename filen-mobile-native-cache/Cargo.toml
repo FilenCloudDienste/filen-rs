@@ -13,7 +13,7 @@ malformed = ["filen-sdk-rs/malformed"]
 heif-decoder = ["filen-sdk-rs/heif-decoder"]
 
 [dependencies]
-filen-sdk-rs = { version = "0.1.0", path = "../filen-sdk-rs", features = [
+filen-sdk-rs = { path = "../filen-sdk-rs", features = [
 	"tokio",
 	"malformed",
 ] }
@@ -22,7 +22,7 @@ uniffi = { version = "0.29.4", features = ["cli"] }
 libsqlite3-sys = { version = "0.35", features = ["bundled"] }
 uuid = { version = "1.18.0", default-features = false }
 chrono = { version = "0.4.41", features = ["serde"] }
-filen-macros = { version = "0.1.0", path = "../filen-macros", features = [
+filen-macros = { path = "../filen-macros", features = [
 	"tokio",
 ] }
 env_logger = "0.11.8"
