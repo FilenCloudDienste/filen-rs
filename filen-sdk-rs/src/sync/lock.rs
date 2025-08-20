@@ -6,10 +6,11 @@ use filen_types::api::response::FilenResponse;
 use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
 use log::debug;
 
+use crate::ErrorKind;
 use crate::api::{RetryError, retry_wrap};
 use crate::auth::http::AuthorizedClient;
 use crate::consts::gateway_url;
-use crate::error::{ErrorExt, RetryFailedError};
+use crate::error::ErrorExt;
 use crate::{
 	api,
 	auth::{Client, http::AuthClient},
@@ -150,6 +151,7 @@ impl Client {
 			resource: Cow::Borrowed(&resource),
 		})?);
 		let endpoint = api::v3::user::lock::ENDPOINT;
+		debug!("Acquiring lock on resource: {resource} with uuid: {uuid}");
 		retry_wrap(
 			bytes,
 			|| {
@@ -184,7 +186,10 @@ impl Client {
 						resource: resource.clone(),
 					}))
 				} else {
-					Err(RetryError::Retry(RetryFailedError(attempts).into()))
+					Err(RetryError::Retry(Error::custom(
+						ErrorKind::Server,
+						"Failed to acquire lock",
+					)))
 				}
 			},
 			attempts,
