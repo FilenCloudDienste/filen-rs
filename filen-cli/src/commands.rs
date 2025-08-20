@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
-use filen_sdk_rs::fs::HasName as _;
+use filen_sdk_rs::fs::{HasName as _, HasUUID};
 
 use crate::{CommandResult, auth::LazyClient, util::RemotePath};
 
@@ -32,10 +32,28 @@ pub async fn execute_command(
 				..Default::default()
 			})
 		}
-		Commands::Ls { directory: _ } => {
+		Commands::Ls { directory } => {
+			let directory_str = directory
+				.as_ref()
+				.map(|d| working_path.navigate(d))
+				.unwrap_or(working_path.clone())
+				.0;
 			let client = client.get().await?;
+			let Some(directory) = client
+				.find_item_at_path(directory_str.clone())
+				.await
+				.context("Failed to find ls parent directory")?
+			else {
+				anyhow::bail!("No such directory: {}", directory_str);
+			};
+			let directory = match directory {
+				filen_sdk_rs::fs::FSObject::Dir(dir) => dir.uuid,
+				filen_sdk_rs::fs::FSObject::Root(root) => root.uuid(),
+				filen_sdk_rs::fs::FSObject::RootWithMeta(root) => root.uuid(),
+				_ => anyhow::bail!("Not a directory: {}", directory_str),
+			};
 			let items = client
-				.list_dir(client.root())
+				.list_dir(&directory)
 				.await
 				.expect("Failed to list root directory");
 			let mut directories = items
