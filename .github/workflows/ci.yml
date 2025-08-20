@@ -18,8 +18,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@nightly-2025-08-14
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2025-08-14
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
@@ -40,8 +41,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@nightly-2025-08-14
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2025-08-14
           components: clippy,rustfmt
           targets: aarch64-apple-ios,aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
