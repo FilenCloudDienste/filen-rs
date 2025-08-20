@@ -56,6 +56,12 @@ impl From<Sha512Hash> for [u8; 64] {
 	}
 }
 
+impl AsRef<[u8]> for Sha512Hash {
+	fn as_ref(&self) -> &[u8] {
+		&self.0
+	}
+}
+
 impl From<[u8; 64]> for Sha512Hash {
 	fn from(hash: [u8; 64]) -> Self {
 		Self(digest::Output::<Sha512>::from(hash))
