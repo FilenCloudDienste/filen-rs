@@ -173,6 +173,17 @@ pub struct StringifiedClient {
 }
 
 impl Client {
+	pub fn from_stringified(stringified: StringifiedClient) -> Result<Self, ConversionError> {
+		Client::from_strings(
+			stringified.email,
+			&stringified.root_uuid,
+			&stringified.auth_info,
+			&stringified.private_key,
+			stringified.api_key,
+			stringified.auth_version,
+		)
+	}
+
 	pub fn client(&self) -> &AuthClient {
 		&self.http_client
 	}
