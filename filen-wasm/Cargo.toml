@@ -1,7 +1,7 @@
 # You must change these to your own details.
 [package]
 name = "filen-wasm"
-version = "0.2.1"
+version = "0.2.4"
 categories = ["wasm"]
 edition = "2024"
 
