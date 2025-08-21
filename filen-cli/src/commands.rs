@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use filen_sdk_rs::fs::{HasName as _, HasUUID};
+use filen_sdk_rs::fs::{FSObject, HasName as _, HasUUID, file::traits::File};
 
-use crate::{CommandResult, auth::LazyClient, util::RemotePath};
+use crate::{CommandResult, auth::LazyClient, prompt_confirm, util::RemotePath};
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
@@ -13,6 +13,8 @@ pub enum Commands {
 		/// Directory to list files in, defaults to the current working directory.
 		directory: Option<String>,
 	},
+	/// Print the contents of a file
+	Cat { file: String },
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -47,9 +49,9 @@ pub async fn execute_command(
 				anyhow::bail!("No such directory: {}", directory_str);
 			};
 			let directory = match directory {
-				filen_sdk_rs::fs::FSObject::Dir(dir) => dir.uuid,
-				filen_sdk_rs::fs::FSObject::Root(root) => root.uuid(),
-				filen_sdk_rs::fs::FSObject::RootWithMeta(root) => root.uuid(),
+				FSObject::Dir(dir) => dir.uuid,
+				FSObject::Root(root) => root.uuid(),
+				FSObject::RootWithMeta(root) => root.uuid(),
 				_ => anyhow::bail!("Not a directory: {}", directory_str),
 			};
 			let items = client
@@ -69,6 +71,30 @@ pub async fn execute_command(
 				.collect::<Vec<&str>>();
 			files.sort();
 			println!("{}", [directories, files].concat().join("  "));
+			None
+		}
+		Commands::Cat { file } => {
+			let file_str = working_path.navigate(file).0;
+			let client = client.get().await?;
+			let Some(file) = client
+				.find_item_at_path(file_str.clone())
+				.await
+				.context("Failed to find cat file")?
+			else {
+				return Err(anyhow::anyhow!("No such file: {}", file_str));
+			};
+			let file: Box<dyn File> = match file {
+				FSObject::File(file) => Box::new(file.into_owned()),
+				FSObject::SharedFile(file) => Box::new(file.into_owned()),
+				_ => return Err(anyhow::anyhow!("Not a file: {}", file_str)),
+			};
+			if file.size() < 1024
+				|| prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
+			{
+				let content = client.download_file(file.as_ref()).await?;
+				let content = String::from_utf8_lossy(&content);
+				println!("{}", content);
+			}
 			None
 		}
 		Commands::Logout => {
