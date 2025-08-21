@@ -18,8 +18,6 @@ pub struct FilenState {
 	client: filen_sdk_rs::auth::Client,
 }
 
-impl FilenState {}
-
 #[wasm_bindgen]
 pub async fn login(
 	email: String,
@@ -80,14 +78,14 @@ mod dir {
 			self.client.root().clone().into()
 		}
 
-		#[wasm_bindgen(unchecked_return_type = "[DirEnum[], File[]]", js_name = "listDir")]
+		#[wasm_bindgen(unchecked_return_type = "[Dir[], File[]]", js_name = "listDir")]
 		pub async fn list_dir(&self, dir: DirEnum) -> Result<JsValue, JsValue> {
 			let (dirs, files) = self
 				.client
 				.list_dir(&UnsharedDirectoryType::from(dir))
 				.await?;
 			Ok(tuple_to_jsvalue!(
-				dirs.into_iter().map(DirEnum::from).collect::<Vec<_>>(),
+				dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
 				files.into_iter().map(File::from).collect::<Vec<_>>()
 			))
 		}

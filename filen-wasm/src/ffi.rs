@@ -618,6 +618,14 @@ impl<'de> Deserialize<'de> for Dir {
 	}
 }
 
+impl wasm_bindgen::__rt::VectorIntoJsValue for Dir {
+	fn vector_into_jsvalue(
+		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+	) -> wasm_bindgen::JsValue {
+		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+	}
+}
+
 impl From<RemoteDirectory> for Dir {
 	fn from(dir: RemoteDirectory) -> Self {
 		Dir {
@@ -653,21 +661,13 @@ impl Dir {
 	}
 }
 
-#[derive(Tsify, Serialize, Deserialize)]
-#[tsify(into_wasm_abi, from_wasm_abi)]
+#[derive(Tsify, Deserialize)]
+#[tsify(from_wasm_abi)]
 #[serde(untagged)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum DirEnum {
 	Dir(Dir),
 	Root(Root),
-}
-
-impl wasm_bindgen::__rt::VectorIntoJsValue for DirEnum {
-	fn vector_into_jsvalue(
-		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-	) -> wasm_bindgen::JsValue {
-		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-	}
 }
 
 impl From<RemoteDirectory> for DirEnum {
