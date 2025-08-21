@@ -791,7 +791,7 @@ pub struct DownloadFileStreamParams {
 mod tests {
 	use std::str::FromStr;
 
-	use wasm_bindgen_test::{console_log, wasm_bindgen_test};
+	use wasm_bindgen_test::wasm_bindgen_test;
 
 	use super::*;
 
@@ -867,7 +867,6 @@ mod tests {
 		let js_value = JsValue::from(non_root_object.clone());
 
 		let js_value2 = js_value.clone();
-		console_log!("JS Value: {:?}", js_value);
 		let deserializer = serde_wasm_bindgen::Deserializer::from(js_value);
 		let deserialized_object: Dir = serde_path_to_error::deserialize(deserializer).unwrap();
 		assert_eq!(deserialized_object, dir);
