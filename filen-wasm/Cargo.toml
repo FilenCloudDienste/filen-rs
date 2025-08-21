@@ -28,3 +28,7 @@ web-sys = { version = "0.3.22", default-features = false}
 opt-level = 's'
 codegen-units = 1
 lto = true
+
+[dev-dependencies]
+serde_path_to_error = "0.1.17"
+wasm-bindgen-test = "0.3.50"

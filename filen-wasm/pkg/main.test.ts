@@ -1,4 +1,4 @@
-import { Dir, login, FilenState, from_serialized } from "./browser/sdk-rs.js"
+import { login, FilenState, from_serialized, type Dir } from "./browser/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import "dotenv/config"
 
@@ -17,13 +17,18 @@ beforeAll(async () => {
 
 	const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
 	if (maybeDir) {
-		if (maybeDir instanceof Dir) {
+		if (maybeDir.type === "dir") {
 			await state.deleteDirPermanently(maybeDir)
 		} else {
 			throw new Error("Expected testDir to be a Dir, but it was a File")
 		}
 	}
 	testDir = await state.createDir(state.root(), "wasm-test-dir")
+})
+
+test("login", async () => {
+	expect(state).toBeDefined()
+	expect(state.root().uuid).toBeDefined()
 })
 
 test("serialization", async () => {
@@ -37,10 +42,6 @@ test("list root directory", async () => {
 	const root = state.root()
 	expect(root).toBeDefined()
 	expect(root.uuid).toBeDefined()
-	expect(root.meta).toBeUndefined()
-	expect(root.favorited).toBe(false)
-	expect(root.color).toBeUndefined()
-	expect(root.parent).toBeUndefined()
 	const resp = await state.listDir(root)
 	expect(resp).toBeDefined()
 	expect(resp.length).toBe(2)
@@ -49,43 +50,42 @@ test("list root directory", async () => {
 })
 
 test("Directory", async () => {
-	const before = new Date()
+	const before = new Date().getTime()
 	const dir = await state.createDir(testDir, "test-dir")
-	const after = new Date()
+	const after = new Date().getTime()
 	expect(dir).toBeDefined()
 	expect(dir.uuid).toBeDefined()
 	expect(dir.parent).toBe(testDir.uuid)
 	expect(dir.meta?.name).toBe("test-dir")
-	expect(dir.meta?.created?.getTime()).toBeGreaterThanOrEqual(before.getTime())
-	expect(dir.meta?.created?.getTime()).toBeLessThanOrEqual(after.getTime())
+	expect(dir.meta?.created).toBeGreaterThanOrEqual(before)
+	expect(dir.meta?.created).toBeLessThanOrEqual(after)
 	await state.trashDir(dir)
 	expect(dir.parent).toBe("trash")
 	await state.deleteDirPermanently(dir)
-	expect((dir as any).__wbg_ptr).toBe(0)
 })
 
 test("File", async () => {
-	const created = new Date(214000)
-	const before = new Date()
-	const file = await state.uploadFile(testDir, Buffer.from("test-file.txt"), {
+	const created = BigInt(new Date().getTime())
+	const before = BigInt(new Date().getTime())
+	const file = await state.uploadFile(Buffer.from("test-file.txt"), {
+		parent: testDir,
 		name: "test-file.txt",
 		created: created
 	})
-	const after = new Date()
+	const after = new Date().getTime()
 	expect(file).toBeDefined()
 	expect(file.uuid).toBeDefined()
 	expect(file.parent).toBe(testDir.uuid)
 	expect(file.meta?.name).toBe("test-file.txt")
 	expect(file.meta?.created).toStrictEqual(created)
-	expect(file.meta?.modified?.getTime()).toBeGreaterThanOrEqual(before.getTime())
-	expect(file.meta?.modified?.getTime()).toBeLessThanOrEqual(after.getTime())
+	expect(file.meta?.modified).toBeGreaterThanOrEqual(before)
+	expect(file.meta?.modified).toBeLessThanOrEqual(after)
 	expect(file.size).toBe(BigInt("test-file.txt".length))
 	const data = await state.downloadFile(file)
 	expect(new TextDecoder().decode(data)).toBe("test-file.txt")
 	await state.trashFile(file)
 	expect(file.parent).toBe("trash")
 	await state.deleteFilePermanently(file)
-	expect((file as any).__wbg_ptr).toBe(0)
 })
 
 test("File Streams", async () => {
@@ -96,7 +96,8 @@ test("File Streams", async () => {
 	const blob = new Blob(["test file data"])
 
 	let progress = 0n
-	const remoteFile = await state.uploadFileStream(testDir, {
+	const remoteFile = await state.uploadFileStream({
+		parent: testDir,
 		name: "stream-file.txt",
 		reader: blob.stream(),
 		progress: (bytes: bigint) => {
@@ -125,7 +126,8 @@ test("File Streams", async () => {
 		}
 	})
 	let downloadProgress = 0n
-	await state.downloadFileToWriter(remoteFile, {
+	await state.downloadFileToWriter({
+		file: remoteFile,
 		writer: webStream,
 		progress: bytes => {
 			downloadProgress = bytes
@@ -141,5 +143,5 @@ test("File Streams", async () => {
 })
 
 afterAll(async () => {
-	await state.deleteDirPermanently(testDir)
+	await state?.deleteDirPermanently(testDir)
 })
