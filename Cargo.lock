@@ -1180,6 +1180,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.14",
  "uuid",
+ "wasm-bindgen",
 ]
 
 [[package]]

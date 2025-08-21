@@ -249,6 +249,19 @@ mod uuid {
 			}
 		}
 	}
+
+	#[cfg(target_arch = "wasm32")]
+	mod wasm {
+		use wasm_bindgen::JsValue;
+
+		use super::*;
+
+		impl From<UuidStr> for JsValue {
+			fn from(uuid: UuidStr) -> Self {
+				JsValue::from(uuid.as_ref())
+			}
+		}
+	}
 }
 
 #[cfg(feature = "rusqlite")]
@@ -288,6 +301,19 @@ mod sqlite {
 				}
 				_ => Err(FromSqlError::InvalidType),
 			}
+		}
+	}
+}
+
+#[cfg(target_arch = "wasm32")]
+mod wasm {
+	use wasm_bindgen::JsValue;
+
+	use super::*;
+
+	impl From<ParentUuid> for JsValue {
+		fn from(parent: ParentUuid) -> Self {
+			JsValue::from(parent.as_ref())
 		}
 	}
 }
