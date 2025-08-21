@@ -72,15 +72,21 @@ impl TryFrom<ParentUuid> for UuidStr {
 	}
 }
 
+impl AsRef<str> for ParentUuid {
+	fn as_ref(&self) -> &str {
+		match self {
+			ParentUuid::Uuid(uuid) => uuid.as_ref(),
+			ParentUuid::Trash => "trash",
+			ParentUuid::Recents => "recents",
+			ParentUuid::Favorites => "favorites",
+			ParentUuid::Links => "links",
+		}
+	}
+}
+
 impl std::fmt::Display for ParentUuid {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			ParentUuid::Uuid(uuid) => write!(f, "{uuid}"),
-			ParentUuid::Trash => write!(f, "trash"),
-			ParentUuid::Recents => write!(f, "recents"),
-			ParentUuid::Favorites => write!(f, "favorites"),
-			ParentUuid::Links => write!(f, "links"),
-		}
+		f.write_str(self.as_ref())
 	}
 }
 
@@ -107,7 +113,7 @@ impl Serialize for ParentUuid {
 	where
 		S: serde::Serializer,
 	{
-		serializer.serialize_str(&self.to_string())
+		serializer.serialize_str(self.as_ref())
 	}
 }
 
@@ -260,10 +266,7 @@ mod sqlite {
 
 	impl ToSql for ParentUuid {
 		fn to_sql(&self) -> Result<ToSqlOutput<'_>, Error> {
-			match self {
-				ParentUuid::Uuid(uuid) => uuid.to_sql(),
-				_ => Ok(ToSqlOutput::Owned(self.to_string().into())),
-			}
+			Ok(ToSqlOutput::Borrowed(self.as_ref().into()))
 		}
 	}
 
@@ -299,7 +302,7 @@ mod tests {
 		let parent_uuid = ParentUuid::Uuid(uuid);
 		assert_eq!(parent_uuid.to_string(), uuid.to_string());
 		assert_eq!(
-			ParentUuid::from_str(&parent_uuid.to_string()).unwrap(),
+			ParentUuid::from_str(parent_uuid.as_ref()).unwrap(),
 			parent_uuid
 		);
 	}
