@@ -14,37 +14,57 @@ use crate::{
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum DirectoryMeta<'a> {
 	Decoded(DecryptedDirectoryMeta<'a>),
-	DecryptedRaw(Vec<u8>),
-	DecryptedUTF8(String),
-	Encrypted(EncryptedString),
-	RSAEncrypted(RSAEncryptedString),
+	DecryptedRaw(Cow<'a, [u8]>),
+	DecryptedUTF8(Cow<'a, str>),
+	Encrypted(Cow<'a, EncryptedString>),
+	RSAEncrypted(Cow<'a, RSAEncryptedString>),
 }
 
-impl DirectoryMeta<'static> {
+impl DirectoryMeta<'_> {
+	pub fn into_owned(self) -> DirectoryMeta<'static> {
+		match self {
+			DirectoryMeta::Decoded(meta) => DirectoryMeta::Decoded(meta.into_owned()),
+			DirectoryMeta::DecryptedRaw(raw) => {
+				DirectoryMeta::DecryptedRaw(Cow::Owned(raw.into_owned()))
+			}
+			DirectoryMeta::DecryptedUTF8(utf8) => {
+				DirectoryMeta::DecryptedUTF8(Cow::Owned(utf8.into_owned()))
+			}
+			DirectoryMeta::Encrypted(encrypted) => {
+				DirectoryMeta::Encrypted(Cow::Owned(encrypted.into_owned()))
+			}
+			DirectoryMeta::RSAEncrypted(encrypted) => {
+				DirectoryMeta::RSAEncrypted(Cow::Owned(encrypted.into_owned()))
+			}
+		}
+	}
+}
+
+impl<'a> DirectoryMeta<'a> {
 	pub(crate) fn from_encrypted(
-		encrypted: Cow<'_, EncryptedString>,
+		encrypted: Cow<'a, EncryptedString>,
 		decrypter: &impl MetaCrypter,
 	) -> Self {
 		let Ok(decrypted) = decrypter.decrypt_meta(&encrypted) else {
-			return Self::Encrypted(encrypted.into_owned());
+			return Self::Encrypted(encrypted);
 		};
 		let Ok(meta) = serde_json::from_str(&decrypted) else {
-			return Self::DecryptedUTF8(decrypted);
+			return Self::DecryptedUTF8(Cow::Owned(decrypted));
 		};
 		Self::Decoded(meta)
 	}
 
 	pub(crate) fn from_rsa_encrypted(
-		encrypted: Cow<'_, RSAEncryptedString>,
+		encrypted: Cow<'a, RSAEncryptedString>,
 		decrypter: &RsaPrivateKey,
 	) -> Self {
 		let Ok(decrypted) = crypto::rsa::decrypt_with_private_key(decrypter, &encrypted) else {
-			return Self::RSAEncrypted(encrypted.into_owned());
+			return Self::RSAEncrypted(encrypted);
 		};
 		let Ok(meta) = serde_json::from_slice(decrypted.as_ref()) else {
 			match String::from_utf8(decrypted) {
-				Ok(decrypted) => return Self::DecryptedUTF8(decrypted),
-				Err(err) => return Self::DecryptedRaw(err.into_bytes()),
+				Ok(decrypted) => return Self::DecryptedUTF8(Cow::Owned(decrypted)),
+				Err(err) => return Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
 			}
 		};
 		Self::Decoded(meta)
@@ -178,6 +198,15 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 		Self {
 			name: Cow::Borrowed(changes.name.as_deref().unwrap_or(&self.name)),
 			created: changes.created.unwrap_or(self.created),
+		}
+	}
+}
+
+impl DecryptedDirectoryMeta<'_> {
+	pub fn into_owned(self) -> DecryptedDirectoryMeta<'static> {
+		DecryptedDirectoryMeta {
+			name: Cow::Owned(self.name.into_owned()),
+			created: self.created,
 		}
 	}
 }

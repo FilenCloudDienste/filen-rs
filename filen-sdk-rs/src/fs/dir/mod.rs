@@ -28,6 +28,7 @@ pub use meta::DecryptedDirectoryMeta;
 pub use traits::{HasContents, HasUUIDContents};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+
 pub struct RootDirectory {
 	uuid: UuidStr,
 }
@@ -137,7 +138,7 @@ impl RemoteDirectory {
 		meta: Cow<'_, EncryptedString>,
 		decrypter: &impl MetaCrypter,
 	) -> Self {
-		let meta = DirectoryMeta::from_encrypted(meta, decrypter);
+		let meta = DirectoryMeta::from_encrypted(meta, decrypter).into_owned();
 		Self {
 			uuid,
 			parent,

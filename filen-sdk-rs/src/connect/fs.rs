@@ -83,7 +83,8 @@ impl SharedDirectory {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
 				color: shared_dir.color.map(|s| s.into_owned()),
-				metadata: DirectoryMeta::from_rsa_encrypted(shared_dir.metadata, private_key),
+				metadata: DirectoryMeta::from_rsa_encrypted(shared_dir.metadata, private_key)
+					.into_owned(),
 				write_access: shared_dir.write_access,
 			},
 			sharing_role,
@@ -103,7 +104,7 @@ impl SharedDirectory {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
 				color: shared_dir.color.map(|s| s.into_owned()),
-				metadata: DirectoryMeta::from_encrypted(shared_dir.metadata, crypter),
+				metadata: DirectoryMeta::from_encrypted(shared_dir.metadata, crypter).into_owned(),
 				write_access: shared_dir.write_access,
 			},
 			sharing_role,

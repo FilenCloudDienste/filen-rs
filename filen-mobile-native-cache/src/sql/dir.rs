@@ -85,10 +85,12 @@ impl From<DirectoryMeta<'_>> for DBDirMeta {
 	fn from(meta: DirectoryMeta<'_>) -> Self {
 		match meta {
 			DirectoryMeta::Decoded(decoded) => Self::Decoded(DBDecryptedDirMeta::from(decoded)),
-			DirectoryMeta::DecryptedRaw(raw) => Self::DecryptedRaw(raw),
-			DirectoryMeta::DecryptedUTF8(utf8) => Self::DecryptedUTF8(utf8),
-			DirectoryMeta::Encrypted(encrypted) => Self::Encrypted(encrypted),
-			DirectoryMeta::RSAEncrypted(rsa_encrypted) => Self::RSAEncrypted(rsa_encrypted),
+			DirectoryMeta::DecryptedRaw(raw) => Self::DecryptedRaw(raw.into_owned()),
+			DirectoryMeta::DecryptedUTF8(utf8) => Self::DecryptedUTF8(utf8.into_owned()),
+			DirectoryMeta::Encrypted(encrypted) => Self::Encrypted(encrypted.into_owned()),
+			DirectoryMeta::RSAEncrypted(rsa_encrypted) => {
+				Self::RSAEncrypted(rsa_encrypted.into_owned())
+			}
 		}
 	}
 }
@@ -102,10 +104,12 @@ impl From<DBDirMeta> for DirectoryMeta<'static> {
 					.created
 					.map(|ts| DateTime::<Utc>::from_timestamp_millis(ts).unwrap_or_default()),
 			}),
-			DBDirMeta::DecryptedRaw(raw) => DirectoryMeta::DecryptedRaw(raw),
-			DBDirMeta::DecryptedUTF8(utf8) => DirectoryMeta::DecryptedUTF8(utf8),
-			DBDirMeta::Encrypted(encrypted) => DirectoryMeta::Encrypted(encrypted),
-			DBDirMeta::RSAEncrypted(rsa_encrypted) => DirectoryMeta::RSAEncrypted(rsa_encrypted),
+			DBDirMeta::DecryptedRaw(raw) => DirectoryMeta::DecryptedRaw(Cow::Owned(raw)),
+			DBDirMeta::DecryptedUTF8(utf8) => DirectoryMeta::DecryptedUTF8(Cow::Owned(utf8)),
+			DBDirMeta::Encrypted(encrypted) => DirectoryMeta::Encrypted(Cow::Owned(encrypted)),
+			DBDirMeta::RSAEncrypted(rsa_encrypted) => {
+				DirectoryMeta::RSAEncrypted(Cow::Owned(rsa_encrypted))
+			}
 		}
 	}
 }
