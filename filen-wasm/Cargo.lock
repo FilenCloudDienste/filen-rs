@@ -542,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "filen-wasm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
