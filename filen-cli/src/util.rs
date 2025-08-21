@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fmt::Display;
 
 /// Represents a path to a remote file or directory.
@@ -67,7 +67,7 @@ impl LongKeyringEntry {
 					result.push_str(&chunk);
 				}
 				Err(keyring::Error::NoEntry) => break,
-				Err(e) => anyhow::bail!("Failed to read keyring entry: {}", e),
+				Err(e) => return Err(anyhow!("Failed to read keyring entry: {}", e)),
 			}
 			i += 1;
 		}
@@ -104,7 +104,7 @@ impl LongKeyringEntry {
 					}
 					break;
 				}
-				Err(e) => anyhow::bail!("Failed to delete keyring entry: {}", e),
+				Err(e) => return Err(anyhow!("Failed to delete keyring entry: {}", e)),
 			}
 			i += 1;
 		}

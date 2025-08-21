@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use filen_sdk_rs::fs::{FSObject, HasName as _, HasUUID, file::traits::File};
 
@@ -46,13 +46,13 @@ pub async fn execute_command(
 				.await
 				.context("Failed to find ls parent directory")?
 			else {
-				anyhow::bail!("No such directory: {}", directory_str);
+				return Err(anyhow!("No such directory: {}", directory_str));
 			};
 			let directory = match directory {
 				FSObject::Dir(dir) => dir.uuid,
 				FSObject::Root(root) => root.uuid(),
 				FSObject::RootWithMeta(root) => root.uuid(),
-				_ => anyhow::bail!("Not a directory: {}", directory_str),
+				_ => return Err(anyhow!("Not a directory: {}", directory_str)),
 			};
 			let items = client
 				.list_dir(&directory)

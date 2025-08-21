@@ -119,12 +119,12 @@ async fn authenticate_from_keyring() -> Result<Client> {
 		.read()
 		.context("Failed to read SDK config from keyring")?;
 	let Some(sdk_config) = sdk_config else {
-		anyhow::bail!("No SDK config found in keyring");
+		return Err(anyhow!("No SDK config found in keyring"));
 	};
 	let sdk_config = base64.decode(sdk_config)?;
 	let Ok(sdk_config) = serde_json::from_slice::<StringifiedClient>(&sdk_config) else {
 		eprintln!("Invalid SDK config in keyring! Try to `logout`.");
-		return Err(anyhow::anyhow!("Failed to parse SDK config from keyring"));
+		return Err(anyhow!("Failed to parse SDK config from keyring"));
 	};
 	let client = Client::from_strings(
 		sdk_config.email,
