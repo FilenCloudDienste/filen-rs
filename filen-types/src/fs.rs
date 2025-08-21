@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -122,13 +122,13 @@ impl<'de> Deserialize<'de> for ParentUuid {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let s = <&str>::deserialize(deserializer)?;
-		ParentUuid::from_str(s).map_err(serde::de::Error::custom)
+		let s = Cow::<'de, str>::deserialize(deserializer)?;
+		ParentUuid::from_str(&s).map_err(serde::de::Error::custom)
 	}
 }
 
 mod uuid {
-	use std::str::FromStr;
+	use std::{borrow::Cow, str::FromStr};
 
 	use serde::{Deserialize, Serialize};
 	use uuid::{Uuid, fmt::Hyphenated};
@@ -203,8 +203,8 @@ mod uuid {
 		where
 			D: serde::Deserializer<'de>,
 		{
-			let s = <&str>::deserialize(deserializer)?;
-			UuidStr::from_str(s).map_err(serde::de::Error::custom)
+			let s = Cow::<'de, str>::deserialize(deserializer)?;
+			UuidStr::from_str(&s).map_err(serde::de::Error::custom)
 		}
 	}
 
