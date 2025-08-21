@@ -5,7 +5,7 @@ use filen_sdk_rs::fs::{FSObject, HasName as _, HasUUID, file::traits::File};
 use crate::{CommandResult, auth::LazyClient, prompt_confirm, util::RemotePath};
 
 #[derive(Debug, Subcommand)]
-pub enum Commands {
+pub(crate) enum Commands {
 	/// Change the working directory (in REPL)
 	Cd { directory: String },
 	/// List files in a directory
@@ -21,7 +21,7 @@ pub enum Commands {
 	Exit,
 }
 
-pub async fn execute_command(
+pub(crate) async fn execute_command(
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	command: &Commands,

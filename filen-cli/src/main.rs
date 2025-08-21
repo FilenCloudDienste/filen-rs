@@ -12,7 +12,7 @@ mod commands;
 mod util;
 
 #[derive(Debug, Parser)]
-pub struct Cli {
+pub(crate) struct Cli {
 	/// Filen account email (requires --password)
 	#[arg(short, long)]
 	email: Option<String>,
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 
 /// Information returned by a command execution.
 #[derive(Default)]
-pub struct CommandResult {
+pub(crate) struct CommandResult {
 	/// Change the REPL's working path.
 	working_path: Option<RemotePath>,
 	/// Exit the REPL.

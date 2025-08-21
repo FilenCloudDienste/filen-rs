@@ -3,10 +3,10 @@ use std::fmt::Display;
 
 /// Represents a path to a remote file or directory.
 #[derive(Clone)]
-pub struct RemotePath(pub String);
+pub(crate) struct RemotePath(pub(crate) String);
 
 impl RemotePath {
-	pub fn new(path: &str) -> Self {
+	pub(crate) fn new(path: &str) -> Self {
 		RemotePath(String::from("/") + path.trim_start_matches("/"))
 		//TODO check for correct syntax?
 	}
@@ -14,7 +14,7 @@ impl RemotePath {
 	/// Navigate to a new path.
 	/// If the path starts with '/', it replaces the current path, otherwise it interprets it as a relative path.
 	/// Supports ".." and ".". Paths will always start with "/".
-	pub fn navigate(&self, navigation: &str) -> Self {
+	pub(crate) fn navigate(&self, navigation: &str) -> Self {
 		if navigation.starts_with("/") {
 			RemotePath::new(navigation)
 		} else {
@@ -45,18 +45,18 @@ const KEYRING_SERVICE_NAME: &str = "filen-cli-rs";
 
 /// Provides an interface for reading and writing keyring entries that exceed the character limit.
 /// It splits the entry up into multiple entries with a numerical suffix.
-pub struct LongKeyringEntry {
-	pub name: String,
+pub(crate) struct LongKeyringEntry {
+	pub(crate) name: String,
 }
 
 impl LongKeyringEntry {
-	pub fn new(name: &str) -> Self {
+	pub(crate) fn new(name: &str) -> Self {
 		LongKeyringEntry {
 			name: name.to_string(),
 		}
 	}
 
-	pub fn read(&self) -> Result<Option<String>> {
+	pub(crate) fn read(&self) -> Result<Option<String>> {
 		let mut result = String::new();
 		let mut i = 0;
 		loop {
@@ -74,7 +74,7 @@ impl LongKeyringEntry {
 		if i > 0 { Ok(Some(result)) } else { Ok(None) }
 	}
 
-	pub fn write(&self, str: &str) -> Result<()> {
+	pub(crate) fn write(&self, str: &str) -> Result<()> {
 		let chunks = str
 			.as_bytes()
 			.chunks(1000) // todo: larger limit possible?
@@ -91,7 +91,7 @@ impl LongKeyringEntry {
 	}
 
 	/// Returns true if the entry was deleted, false if it didn't exist.
-	pub fn delete(&self) -> Result<bool> {
+	pub(crate) fn delete(&self) -> Result<bool> {
 		let mut i = 0;
 		loop {
 			let entry = keyring::Entry::new(KEYRING_SERVICE_NAME, &format!("{}_{}", self.name, i))

@@ -10,7 +10,7 @@ use crate::{prompt, prompt_confirm, util::LongKeyringEntry};
 
 /// A lazily authenticated client.
 /// Since some commands (e. g. logout) don't need the user to be authenticated, we only authenticate when necessary.
-pub enum LazyClient {
+pub(crate) enum LazyClient {
 	Unauthenticated {
 		email_arg: Option<String>,
 		password_arg: Option<String>,
@@ -21,14 +21,14 @@ pub enum LazyClient {
 }
 
 impl LazyClient {
-	pub fn new(email_arg: Option<String>, password_arg: Option<String>) -> Self {
+	pub(crate) fn new(email_arg: Option<String>, password_arg: Option<String>) -> Self {
 		Self::Unauthenticated {
 			email_arg,
 			password_arg,
 		}
 	}
 
-	pub async fn get(&mut self) -> Result<&Client> {
+	pub(crate) async fn get(&mut self) -> Result<&Client> {
 		match self {
 			Self::Authenticated { client } => Ok(client),
 			Self::Unauthenticated {
@@ -49,7 +49,10 @@ impl LazyClient {
 }
 
 /// Authenticate by one of the available authentication methods.
-pub async fn authenticate(email_arg: Option<String>, password_arg: Option<&str>) -> Result<Client> {
+pub(crate) async fn authenticate(
+	email_arg: Option<String>,
+	password_arg: Option<&str>,
+) -> Result<Client> {
 	if let Ok(client) = authenticate_from_cli_args(email_arg, password_arg).await {
 		Ok(client)
 	} else if let Ok(client) = authenticate_from_environment_variables().await {
@@ -161,7 +164,7 @@ async fn authenticate_from_prompt() -> Result<Client> {
 }
 
 /// Deletes credentials from the keyring. Returns true if successful.
-pub fn delete_credentials() -> Result<bool> {
+pub(crate) fn delete_credentials() -> Result<bool> {
 	let deleted = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 		.delete()
 		.context("Failed to delete SDK config from keyring")?;
