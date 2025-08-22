@@ -5,7 +5,7 @@ use filen_types::fs::{ObjectType, UuidStr};
 
 use crate::{
 	crypto::file::FileKey,
-	fs::{HasMeta, HasName, HasRemoteInfo, HasType, HasUUID},
+	fs::{HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, file::traits::File},
 };
 
 use super::{
@@ -138,3 +138,5 @@ impl HasRemoteFileInfo for RemoteFileType {
 		}
 	}
 }
+
+impl File for RemoteFileType {}
