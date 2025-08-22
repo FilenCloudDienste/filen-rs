@@ -96,7 +96,7 @@ impl<'a, 'b> From<&'b NonRootFSObject<'a>> for NonRootFSObject<'b> {
 }
 
 impl HasParent for NonRootFSObject<'_> {
-	fn parent(&self) -> ParentUuid {
+	fn parent(&self) -> &ParentUuid {
 		match self {
 			NonRootFSObject::Dir(dir) => dir.parent(),
 			NonRootFSObject::File(file) => file.parent(),

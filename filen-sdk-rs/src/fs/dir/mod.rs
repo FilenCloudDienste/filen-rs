@@ -235,8 +235,8 @@ impl HasMeta for RemoteDirectory {
 }
 
 impl HasParent for RemoteDirectory {
-	fn parent(&self) -> ParentUuid {
-		self.parent
+	fn parent(&self) -> &ParentUuid {
+		&self.parent
 	}
 }
 

@@ -298,8 +298,8 @@ impl HasUUID for RemoteFile {
 }
 
 impl HasParent for RemoteFile {
-	fn parent(&self) -> ParentUuid {
-		self.parent
+	fn parent(&self) -> &ParentUuid {
+		&self.parent
 	}
 }
 

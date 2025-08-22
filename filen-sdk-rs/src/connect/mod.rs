@@ -343,7 +343,7 @@ impl Client {
 		item: impl Into<NonRootFSObject<'_>>,
 	) -> Result<(), Error> {
 		let item = item.into();
-		let uuid = item.parent().try_into()?;
+		let uuid = (*item.parent()).try_into()?;
 
 		let (linked, shared, items_to_process) = futures::try_join!(
 			async {
@@ -417,7 +417,7 @@ impl Client {
 			self.client(),
 			&api::v3::dir::link::add::Request {
 				uuid: *item.uuid(),
-				parent: Some(item.parent().try_into()?),
+				parent: Some((*item.parent()).try_into()?),
 				link_uuid: link.link_uuid,
 				r#type: item.object_type(),
 				metadata: Cow::Borrowed(
@@ -744,7 +744,7 @@ impl Client {
 			self.client(),
 			&api::v3::item::share::Request {
 				uuid: *item.uuid(),
-				parent: Some(item.parent().try_into()?),
+				parent: Some((*item.parent()).try_into()?),
 				email: Cow::Borrowed(user.email()),
 				r#type: item.object_type(),
 				metadata: Cow::Owned(

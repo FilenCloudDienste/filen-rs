@@ -9,7 +9,7 @@ use rsa::RsaPublicKey;
 use crate::crypto::shared::MetaCrypter;
 
 pub trait HasParent {
-	fn parent(&self) -> ParentUuid;
+	fn parent(&self) -> &ParentUuid;
 }
 
 pub trait HasRemoteInfo {

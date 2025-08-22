@@ -233,7 +233,7 @@ impl DBFile {
 		trace!("Upserting remote file: {remote_file:?}");
 		let (id, local_data) = item::upsert_item_with_stmts(
 			*remote_file.uuid(),
-			Some(remote_file.parent()),
+			Some(*remote_file.parent()),
 			remote_file.name(),
 			None,
 			ItemType::File,
@@ -399,7 +399,7 @@ impl TryFrom<DBFile> for RemoteFile {
 impl PartialEq<RemoteFile> for DBFile {
 	fn eq(&self, other: &RemoteFile) -> bool {
 		self.uuid == *other.uuid()
-			&& self.parent == other.parent()
+			&& self.parent == *other.parent()
 			&& self.size as u64 == other.size()
 			&& self.chunks as u64 == other.chunks()
 			&& (self.favorite_rank > 0) == other.favorited()

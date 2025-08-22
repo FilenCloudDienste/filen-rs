@@ -173,7 +173,7 @@ impl DBDir {
 	) -> Result<Self> {
 		let (id, local_data) = item::upsert_item_with_stmts(
 			*remote_dir.uuid(),
-			Some(remote_dir.parent()),
+			Some(*remote_dir.parent()),
 			remote_dir.name(),
 			None,
 			ItemType::Dir,
@@ -333,7 +333,7 @@ impl From<DBDir> for RemoteDirectory {
 impl PartialEq<RemoteDirectory> for DBDir {
 	fn eq(&self, other: &RemoteDirectory) -> bool {
 		self.uuid == *other.uuid()
-			&& self.parent == other.parent()
+			&& self.parent == *other.parent()
 			&& DBItemTrait::name(self) == other.name()
 			&& self.color.as_deref() == other.color()
 			&& self.created() == other.created().map(|t| t.timestamp_millis())
