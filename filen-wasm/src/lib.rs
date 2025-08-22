@@ -9,7 +9,10 @@ pub use ffi::*;
 #[wasm_bindgen(start)]
 pub fn main_js() -> Result<(), JsValue> {
 	console_error_panic_hook::set_once();
-	wasm_logger::init(wasm_logger::Config::default());
+	#[cfg(debug_assertions)]
+	wasm_logger::init(wasm_logger::Config::new(log::Level::Debug));
+	#[cfg(not(debug_assertions))]
+	wasm_logger::init(wasm_logger::Config::new(log::Level::Info));
 	Ok(())
 }
 
