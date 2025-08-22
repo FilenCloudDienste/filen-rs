@@ -22,7 +22,7 @@ pub struct FilenState {
 pub async fn login(
 	email: String,
 	password: &str,
-	two_factor_code: Option<String>,
+	#[wasm_bindgen(js_name = "twoFactorCode")] two_factor_code: Option<String>,
 ) -> Result<FilenState, JsValue> {
 	let client = filen_sdk_rs::auth::Client::login(
 		email,
@@ -33,7 +33,7 @@ pub async fn login(
 	Ok(FilenState { client })
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen(js_name = "fromSerialized")]
 pub fn from_serialized(serialized: StringifiedClient) -> Result<FilenState, JsValue> {
 	let client = filen_sdk_rs::auth::Client::from_stringified(serialized).map_err(Error::from)?;
 	Ok(FilenState { client })
@@ -130,14 +130,11 @@ mod dir {
 			Ok(())
 		}
 
-		#[wasm_bindgen(
-			js_name = "findItemInDir",
-			// unchecked_return_type = "DirEnum & { type: 'directory' } | File & { type: 'file' } | undefined"
-		)]
+		#[wasm_bindgen(js_name = "findItemInDir")]
 		pub async fn find_item_in_dir(
 			&self,
 			dir: DirEnum,
-			name_or_uuid: &str,
+			#[wasm_bindgen(js_name = "nameOrUuid")] name_or_uuid: &str,
 		) -> Result<Option<NonRootObject>, JsValue> {
 			let item = self
 				.client
