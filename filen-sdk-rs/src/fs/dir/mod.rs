@@ -40,8 +40,8 @@ impl RootDirectory {
 }
 
 impl HasUUID for RootDirectory {
-	fn uuid(&self) -> UuidStr {
-		self.uuid
+	fn uuid(&self) -> &UuidStr {
+		&self.uuid
 	}
 }
 impl HasContents for RootDirectory {
@@ -66,8 +66,8 @@ impl RootDirectoryWithMeta {
 }
 
 impl HasUUID for RootDirectoryWithMeta {
-	fn uuid(&self) -> UuidStr {
-		self.uuid
+	fn uuid(&self) -> &UuidStr {
+		&self.uuid
 	}
 }
 impl HasContents for RootDirectoryWithMeta {
@@ -194,8 +194,8 @@ impl RemoteDirectory {
 }
 
 impl HasUUID for RemoteDirectory {
-	fn uuid(&self) -> UuidStr {
-		self.uuid
+	fn uuid(&self) -> &UuidStr {
+		&self.uuid
 	}
 }
 impl HasContents for RemoteDirectory {

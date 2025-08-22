@@ -21,12 +21,12 @@ pub trait SetRemoteInfo {
 }
 
 pub trait HasUUID: Send + Sync {
-	fn uuid(&self) -> UuidStr;
+	fn uuid(&self) -> &UuidStr;
 }
 
 impl HasUUID for UuidStr {
-	fn uuid(&self) -> UuidStr {
-		*self
+	fn uuid(&self) -> &UuidStr {
+		self
 	}
 }
 

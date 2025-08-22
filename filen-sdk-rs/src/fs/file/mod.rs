@@ -50,7 +50,7 @@ impl FileBuilder {
 		Self {
 			uuid: UuidStr::new_v4(),
 			name: name.into(),
-			parent: parent.uuid(),
+			parent: *parent.uuid(),
 			key: client.make_file_key(),
 			mime: None,
 			created: None,
@@ -292,8 +292,8 @@ impl From<FlatRemoteFile> for RemoteFile {
 }
 
 impl HasUUID for RemoteFile {
-	fn uuid(&self) -> UuidStr {
-		self.uuid
+	fn uuid(&self) -> &UuidStr {
+		&self.uuid
 	}
 }
 
@@ -429,8 +429,8 @@ impl RemoteRootFile {
 }
 
 impl HasUUID for RemoteRootFile {
-	fn uuid(&self) -> UuidStr {
-		self.uuid
+	fn uuid(&self) -> &UuidStr {
+		&self.uuid
 	}
 }
 

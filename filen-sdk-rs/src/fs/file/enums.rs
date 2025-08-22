@@ -31,7 +31,7 @@ impl From<RemoteRootFile> for RemoteFileType {
 }
 
 impl HasUUID for RemoteFileType {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> &UuidStr {
 		match self {
 			RemoteFileType::File(file) => file.uuid(),
 			RemoteFileType::SharedFile(file) => file.uuid(),

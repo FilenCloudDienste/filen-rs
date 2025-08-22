@@ -19,7 +19,7 @@ pub enum DirectoryType<'a> {
 }
 
 impl HasUUID for DirectoryType<'_> {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> &UuidStr {
 		match self {
 			DirectoryType::Root(dir) => dir.uuid(),
 			DirectoryType::Dir(dir) => dir.uuid(),
@@ -75,7 +75,7 @@ impl<'a> From<UnsharedDirectoryType<'a>> for DirectoryType<'a> {
 }
 
 impl HasUUID for UnsharedDirectoryType<'_> {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> &UuidStr {
 		match self {
 			UnsharedDirectoryType::Root(dir) => dir.uuid(),
 			UnsharedDirectoryType::Dir(dir) => dir.uuid(),
@@ -125,7 +125,7 @@ pub enum DirectoryMetaType<'a> {
 }
 
 impl HasUUID for DirectoryMetaType<'_> {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> &UuidStr {
 		match self {
 			DirectoryMetaType::Root(dir) => dir.uuid(),
 			DirectoryMetaType::Dir(dir) => dir.uuid(),

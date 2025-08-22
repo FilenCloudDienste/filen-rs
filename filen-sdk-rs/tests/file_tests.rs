@@ -44,7 +44,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	assert_eq!(buf.len(), contents.len(), "File size mismatch for {name}");
 	assert_eq!(&buf, contents, "File contents mismatch for {name}");
 
-	let got_file = client.get_file(file.uuid()).await.unwrap();
+	let got_file = client.get_file(*file.uuid()).await.unwrap();
 	assert_eq!(file, got_file, "File metadata mismatch for {name}");
 }
 
@@ -191,7 +191,7 @@ async fn file_delete_permanently() {
 
 	assert!(client.restore_file(&mut file).await.is_err());
 
-	assert!(client.get_file(file.uuid()).await.is_err());
+	assert!(client.get_file(*file.uuid()).await.is_err());
 
 	// Uncomment this when the API immediately permanently deletes the file
 	// let mut reader = file.into_reader(client.clone());
@@ -310,7 +310,7 @@ async fn file_update_meta() {
 	assert_eq!(file.created().unwrap(), created.round_subsecs(3));
 	assert_eq!(file.last_modified().unwrap(), modified.round_subsecs(3));
 
-	let found_file = client.get_file(file.uuid()).await.unwrap();
+	let found_file = client.get_file(*file.uuid()).await.unwrap();
 	assert_eq!(found_file.mime().unwrap(), new_mime);
 	assert_eq!(found_file.created().unwrap(), created.round_subsecs(3));
 	assert_eq!(
@@ -347,7 +347,7 @@ async fn file_exists() {
 			.file_exists(file.name().unwrap(), test_dir)
 			.await
 			.unwrap(),
-		Some(file.uuid())
+		Some(*file.uuid())
 	);
 
 	let new_name = "new_name.json";
@@ -363,7 +363,7 @@ async fn file_exists() {
 
 	assert_eq!(
 		client.file_exists(new_name, test_dir).await.unwrap(),
-		Some(file.uuid())
+		Some(*file.uuid())
 	);
 
 	assert!(
@@ -408,11 +408,11 @@ async fn file_trash_empty() {
 			.is_none()
 	);
 
-	assert_eq!(&client.get_file(file.uuid()).await.unwrap(), &file);
+	assert_eq!(&client.get_file(*file.uuid()).await.unwrap(), &file);
 	client.empty_trash().await.unwrap();
 	// emptying trash is asynchronous, so we need to wait a bit
 	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-	assert!(client.get_file(file.uuid()).await.is_err());
+	assert!(client.get_file(*file.uuid()).await.is_err());
 }
 
 async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, contents_len: usize) {

@@ -127,7 +127,7 @@ impl Client {
 				.iter()
 				.map(move |s| SearchAddItem {
 					hash: self.hmac_key.hash(s.as_bytes()),
-					uuid: item.uuid(),
+					uuid: *item.uuid(),
 					r#type: item.object_type().into(),
 				})
 				.collect(),

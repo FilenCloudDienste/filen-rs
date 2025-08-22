@@ -54,8 +54,8 @@ impl Client {
 		let response = api::v3::dir::create::post(
 			self.client(),
 			&api::v3::dir::create::Request {
-				uuid: dir.uuid(),
-				parent: parent.uuid(),
+				uuid: *dir.uuid(),
+				parent: *parent.uuid(),
 				name_hashed: Cow::Borrowed(
 					&self.hash_name(dir.name().ok_or(MetadataWasNotDecryptedError)?),
 				),
@@ -66,7 +66,7 @@ impl Client {
 			},
 		)
 		.await?;
-		if dir.uuid() != response.uuid {
+		if *dir.uuid() != response.uuid {
 			dir.set_uuid(response.uuid);
 		}
 		futures::try_join!(
@@ -92,7 +92,7 @@ impl Client {
 			self.client(),
 			&api::v3::dir::create::Request {
 				uuid,
-				parent: parent.uuid(),
+				parent: *parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(name)),
 				meta: Cow::Borrowed(&EncryptedString(contents.into())),
 			},
@@ -127,7 +127,7 @@ impl Client {
 		api::v3::dir::exists::post(
 			self.client(),
 			&api::v3::dir::exists::Request {
-				parent: parent.uuid(),
+				parent: *parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(name.as_ref())),
 			},
 		)
@@ -245,7 +245,7 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::trash::post(
 			self.client(),
-			&api::v3::dir::trash::Request { uuid: dir.uuid() },
+			&api::v3::dir::trash::Request { uuid: *dir.uuid() },
 		)
 		.await?;
 		dir.parent = ParentUuid::Trash;
@@ -256,13 +256,13 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::restore::post(
 			self.client(),
-			&api::v3::dir::restore::Request { uuid: dir.uuid() },
+			&api::v3::dir::restore::Request { uuid: *dir.uuid() },
 		)
 		.await?;
 
 		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
 		let resp =
-			api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid: dir.uuid() }).await?;
+			api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid: *dir.uuid() }).await?;
 		dir.parent = resp.parent;
 		Ok(())
 	}
@@ -271,7 +271,7 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::delete::permanent::post(
 			self.client(),
-			&api::v3::dir::delete::permanent::Request { uuid: dir.uuid() },
+			&api::v3::dir::delete::permanent::Request { uuid: *dir.uuid() },
 		)
 		.await?;
 		Ok(())
@@ -292,7 +292,7 @@ impl Client {
 		api::v3::dir::metadata::post(
 			self.client(),
 			&api::v3::dir::metadata::Request {
-				uuid: dir.uuid(),
+				uuid: *dir.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
 				metadata: Cow::Borrowed(
 					&self
@@ -431,12 +431,12 @@ impl Client {
 		api::v3::dir::r#move::post(
 			self.client(),
 			&api::v3::dir::r#move::Request {
-				uuid: dir.uuid(),
-				to: new_parent.uuid(),
+				uuid: *dir.uuid(),
+				to: *new_parent.uuid(),
 			},
 		)
 		.await?;
-		dir.set_parent(new_parent.uuid().into());
+		dir.set_parent((*new_parent.uuid()).into());
 		Ok(())
 	}
 
@@ -448,7 +448,7 @@ impl Client {
 		api::v3::dir::size::post(
 			self.client(),
 			&api::v3::dir::size::Request {
-				uuid: dir.uuid(),
+				uuid: *dir.uuid(),
 				sharer_id: None,
 				receiver_id: None,
 				trash,

@@ -172,7 +172,7 @@ impl DBDir {
 		delete_dir_meta: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		let (id, local_data) = item::upsert_item_with_stmts(
-			remote_dir.uuid(),
+			*remote_dir.uuid(),
 			Some(remote_dir.parent()),
 			remote_dir.name(),
 			None,
@@ -332,7 +332,7 @@ impl From<DBDir> for RemoteDirectory {
 
 impl PartialEq<RemoteDirectory> for DBDir {
 	fn eq(&self, other: &RemoteDirectory) -> bool {
-		self.uuid == other.uuid()
+		self.uuid == *other.uuid()
 			&& self.parent == other.parent()
 			&& DBItemTrait::name(self) == other.name()
 			&& self.color.as_deref() == other.color()
@@ -387,7 +387,7 @@ impl DBRoot {
 		let tx = conn.transaction()?;
 		let (id, _) = item::upsert_item(
 			&tx,
-			remote_root.uuid(),
+			*remote_root.uuid(),
 			None, // root has no parent
 			None, // root has no name
 			None,
@@ -419,7 +419,7 @@ impl DBRoot {
 		trace!("Upserted remote root with id: {id}");
 		Ok(Self {
 			id,
-			uuid: remote_root.uuid(),
+			uuid: *remote_root.uuid(),
 			storage_used,
 			max_storage,
 			last_updated,

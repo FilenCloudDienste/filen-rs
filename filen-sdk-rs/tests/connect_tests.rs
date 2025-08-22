@@ -166,7 +166,7 @@ async fn file_public_link() {
 	assert_eq!(&link, &cloned_found_link);
 
 	let linked_info = client.get_linked_file(&link).await.unwrap();
-	assert_eq!(linked_info.uuid, file.uuid());
+	assert_eq!(linked_info.uuid, *file.uuid());
 	assert_eq!(linked_info.name.as_deref(), file.name());
 	assert_eq!(linked_info.mime.as_deref(), file.mime());
 	assert_eq!(
@@ -312,11 +312,11 @@ async fn set_up_contact<'a>(
 			let (out_dirs, out_files) = client.list_out_shared(None).await.unwrap();
 			let mut out_futures = out_dirs
 				.into_iter()
-				.map(|d| (d.get_dir().uuid(), d.get_source_id()))
+				.map(|d| (*d.get_dir().uuid(), d.get_source_id()))
 				.chain(
 					out_files
 						.into_iter()
-						.map(|f| (f.get_file().uuid(), f.get_source_id())),
+						.map(|f| (*f.get_file().uuid(), f.get_source_id())),
 				)
 				.map(|(uuid, source_id)| async move {
 					client
@@ -332,8 +332,8 @@ async fn set_up_contact<'a>(
 
 			let mut in_futures = in_dirs
 				.into_iter()
-				.map(|d| d.get_dir().uuid())
-				.chain(in_files.into_iter().map(|f| f.get_file().uuid()))
+				.map(|d| *d.get_dir().uuid())
+				.chain(in_files.into_iter().map(|f| *f.get_file().uuid()))
 				.map(|uuid| async move {
 					share_client.remove_shared_link_in(uuid).await.unwrap();
 				})
@@ -558,11 +558,11 @@ async fn remove_link() {
 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
 	assert_eq!(shared_dirs_in.len(), 2);
 	client
-		.remove_shared_link_out(out_dir.uuid(), share_user.id())
+		.remove_shared_link_out(*out_dir.uuid(), share_user.id())
 		.await
 		.unwrap();
 	share_client
-		.remove_shared_link_in(in_dir.uuid())
+		.remove_shared_link_in(*in_dir.uuid())
 		.await
 		.unwrap();
 

@@ -50,8 +50,8 @@ pub(crate) async fn execute_command(
 			};
 			let directory = match directory {
 				FSObject::Dir(dir) => dir.uuid,
-				FSObject::Root(root) => root.uuid(),
-				FSObject::RootWithMeta(root) => root.uuid(),
+				FSObject::Root(root) => *root.uuid(),
+				FSObject::RootWithMeta(root) => *root.uuid(),
 				_ => return Err(anyhow!("Not a directory: {}", directory_str)),
 			};
 			let items = client

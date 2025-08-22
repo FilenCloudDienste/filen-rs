@@ -176,7 +176,7 @@ async fn exists() {
 
 	assert_eq!(
 		Some(dir_a.uuid()),
-		client.dir_exists(test_dir, "a").await.unwrap()
+		client.dir_exists(test_dir, "a").await.unwrap().as_ref()
 	);
 
 	client.trash_dir(&mut dir_a).await.unwrap();
@@ -338,7 +338,7 @@ async fn dir_update_meta() {
 		.unwrap();
 	assert_eq!(dir.created(), Some(created.round_subsecs(3)));
 
-	let found_dir = client.get_dir(dir.uuid()).await.unwrap();
+	let found_dir = client.get_dir(*dir.uuid()).await.unwrap();
 	assert_eq!(found_dir.created(), Some(created.round_subsecs(3)));
 	assert_eq!(found_dir, dir);
 }

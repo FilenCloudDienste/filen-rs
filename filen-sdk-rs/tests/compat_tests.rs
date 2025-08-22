@@ -251,7 +251,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 		.unwrap()
 	{
 		Some(NonRootFSObject::File(file)) => {
-			let compat_test_file = compat_test_file.uuid(file.uuid()).build();
+			let compat_test_file = compat_test_file.uuid(*file.uuid()).build();
 			assert_eq!(*file, compat_test_file, "file inner_file mismatch");
 
 			let buf = client.download_file(file.as_ref()).await.unwrap();

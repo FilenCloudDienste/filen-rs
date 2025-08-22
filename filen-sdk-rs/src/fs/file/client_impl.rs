@@ -32,7 +32,7 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::trash::post(
 			self.client(),
-			&api::v3::file::trash::Request { uuid: file.uuid() },
+			&api::v3::file::trash::Request { uuid: *file.uuid() },
 		)
 		.await?;
 		file.parent = ParentUuid::Trash;
@@ -43,13 +43,15 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::restore::post(
 			self.client(),
-			&api::v3::file::restore::Request { uuid: file.uuid() },
+			&api::v3::file::restore::Request { uuid: *file.uuid() },
 		)
 		.await?;
 		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
-		let resp =
-			api::v3::file::post(self.client(), &api::v3::file::Request { uuid: file.uuid() })
-				.await?;
+		let resp = api::v3::file::post(
+			self.client(),
+			&api::v3::file::Request { uuid: *file.uuid() },
+		)
+		.await?;
 
 		file.parent = resp.parent;
 		Ok(())
@@ -59,7 +61,7 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::delete::permanent::post(
 			self.client(),
-			&api::v3::file::delete::permanent::Request { uuid: file.uuid() },
+			&api::v3::file::delete::permanent::Request { uuid: *file.uuid() },
 		)
 		.await
 	}
@@ -73,12 +75,12 @@ impl Client {
 		api::v3::file::r#move::post(
 			self.client(),
 			&api::v3::file::r#move::Request {
-				uuid: file.uuid(),
-				new_parent: new_parent.uuid(),
+				uuid: *file.uuid(),
+				new_parent: *new_parent.uuid(),
 			},
 		)
 		.await?;
-		file.parent = new_parent.uuid().into();
+		file.parent = (*new_parent.uuid()).into();
 		Ok(())
 	}
 
@@ -97,7 +99,7 @@ impl Client {
 		api::v3::file::metadata::post(
 			self.client(),
 			&api::v3::file::metadata::Request {
-				uuid: file.uuid(),
+				uuid: *file.uuid(),
 				name: Cow::Borrowed(&self.crypter().encrypt_meta(temp_meta.name())),
 				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
 				metadata: Cow::Borrowed(
@@ -144,7 +146,7 @@ impl Client {
 			self.client(),
 			&api::v3::file::exists::Request {
 				name_hashed: self.hash_name(name.as_ref()),
-				parent: parent.uuid().into(),
+				parent: (*parent.uuid()).into(),
 			},
 		)
 		.await
@@ -209,7 +211,7 @@ impl Client {
 			&api::v3::upload::empty::Request {
 				name_hashed: Cow::Owned(self.hash_name(&name)),
 				uuid,
-				parent: parent.uuid(),
+				parent: *parent.uuid(),
 				metadata: Cow::Owned(EncryptedString(meta.into())),
 				name: Cow::Owned(EncryptedString(name)),
 				size: Cow::Owned(EncryptedString(size.into())),

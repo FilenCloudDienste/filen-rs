@@ -240,7 +240,7 @@ impl AuthCacheState {
 		);
 		let resp = self.client.get_user_info().await?;
 		let conn = self.conn();
-		sql::update_root(&conn, self.client.root().uuid(), &resp)?;
+		sql::update_root(&conn, *self.client.root().uuid(), &resp)?;
 		Ok(())
 	}
 
@@ -591,7 +591,7 @@ impl AuthCacheState {
 			DBObject::Dir(dir) => {
 				let mut remote_dir = dir.into();
 				self.client.trash_dir(&mut remote_dir).await?;
-				self.io_delete_local(remote_dir.uuid(), ItemType::Dir)
+				self.io_delete_local(*remote_dir.uuid(), ItemType::Dir)
 					.await?;
 				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
 				DBObject::Dir(dir)
@@ -599,7 +599,7 @@ impl AuthCacheState {
 			DBObject::File(file) => {
 				let mut remote_file = file.try_into()?;
 				self.client.trash_file(&mut remote_file).await?;
-				self.io_delete_local(remote_file.uuid(), ItemType::File)
+				self.io_delete_local(*remote_file.uuid(), ItemType::File)
 					.await?;
 				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 				DBObject::File(file)
@@ -662,7 +662,7 @@ impl AuthCacheState {
 			DBNonRootObject::File(file) => {
 				let mut remote_file = file.try_into()?;
 				self.client.restore_file(&mut remote_file).await?;
-				let remote_file = self.client.get_file(remote_file.uuid()).await?;
+				let remote_file = self.client.get_file(*remote_file.uuid()).await?;
 				let mut conn = self.conn();
 				let file = DBFile::upsert_from_remote(&mut conn, remote_file)?;
 				DBNonRootObject::File(file)
@@ -670,7 +670,7 @@ impl AuthCacheState {
 			DBNonRootObject::Dir(dir) => {
 				let mut remote_dir: RemoteDirectory = dir.into();
 				self.client.restore_dir(&mut remote_dir).await?;
-				let remote_dir = self.client.get_dir(remote_dir.uuid()).await?;
+				let remote_dir = self.client.get_dir(*remote_dir.uuid()).await?;
 				let mut conn = self.conn();
 				let dir = DBDir::upsert_from_remote(&mut conn, remote_dir)?;
 				DBNonRootObject::Dir(dir)
@@ -872,14 +872,14 @@ impl AuthCacheState {
 			DBObject::Dir(dir) => {
 				self.io_delete_local(dir.uuid, dir.item_type()).await?;
 				let remote_dir: RemoteDirectory = dir.into();
-				let uuid = remote_dir.uuid();
+				let uuid = *remote_dir.uuid();
 				self.client.delete_dir_permanently(remote_dir).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}
 			DBObject::File(file) => {
 				self.io_delete_local(file.uuid, file.item_type()).await?;
 				let remote_file: RemoteFile = file.try_into()?;
-				let uuid = remote_file.uuid();
+				let uuid = *remote_file.uuid();
 				self.client.delete_file_permanently(remote_file).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}

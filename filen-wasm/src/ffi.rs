@@ -518,7 +518,7 @@ pub struct Root {
 
 impl From<RootDirectory> for Root {
 	fn from(dir: RootDirectory) -> Self {
-		Root { uuid: dir.uuid() }
+		Root { uuid: *dir.uuid() }
 	}
 }
 

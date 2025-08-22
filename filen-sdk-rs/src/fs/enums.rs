@@ -123,7 +123,7 @@ impl HasMeta for NonRootFSObject<'_> {
 }
 
 impl HasUUID for NonRootFSObject<'_> {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> &UuidStr {
 		match self {
 			NonRootFSObject::Dir(dir) => dir.uuid(),
 			NonRootFSObject::File(file) => file.uuid(),

@@ -255,7 +255,7 @@ impl Client {
 		api::v3::item::shared::rename::post(
 			self.client(),
 			&api::v3::item::shared::rename::Request {
-				uuid: item.uuid(),
+				uuid: *item.uuid(),
 				receiver_id: user.id,
 				metadata: Cow::Borrowed(
 					&item
@@ -279,7 +279,7 @@ impl Client {
 		api::v3::item::linked::rename::post(
 			self.client(),
 			&api::v3::item::linked::rename::Request {
-				uuid: item.uuid(),
+				uuid: *item.uuid(),
 				link_uuid,
 				metadata: Cow::Borrowed(
 					&item
@@ -299,14 +299,14 @@ impl Client {
 			async {
 				api::v3::item::linked::post(
 					self.client(),
-					&api::v3::item::linked::Request { uuid: item.uuid() },
+					&api::v3::item::linked::Request { uuid: *item.uuid() },
 				)
 				.await
 			},
 			async {
 				api::v3::item::shared::post(
 					self.client(),
-					&api::v3::item::shared::Request { uuid: item.uuid() },
+					&api::v3::item::shared::Request { uuid: *item.uuid() },
 				)
 				.await
 			},
@@ -416,7 +416,7 @@ impl Client {
 		api::v3::dir::link::add::post(
 			self.client(),
 			&api::v3::dir::link::add::Request {
-				uuid: item.uuid(),
+				uuid: *item.uuid(),
 				parent: Some(item.parent().try_into()?),
 				link_uuid: link.link_uuid,
 				r#type: item.object_type(),
@@ -458,7 +458,7 @@ impl Client {
 			api::v3::dir::link::add::post(
 				self.client(),
 				&api::v3::dir::link::add::Request {
-					uuid: dir.uuid(),
+					uuid: *dir.uuid(),
 					parent: None,
 					link_uuid: public_link.link_uuid,
 					r#type: ObjectType::Dir,
@@ -503,7 +503,7 @@ impl Client {
 			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: file_link.link_uuid,
-				file_uuid: file.uuid(),
+				file_uuid: *file.uuid(),
 				expiration: PublicLinkExpiration::Never,
 				password: false,
 				// why does this just hash_name empty? Who knows,
@@ -527,7 +527,7 @@ impl Client {
 		api::v3::dir::link::edit::post(
 			self.client(),
 			&api::v3::dir::link::edit::Request {
-				uuid: dir.uuid(),
+				uuid: *dir.uuid(),
 				expiration: link.expiration,
 				password: link.password().is_known(),
 				password_hashed: Cow::Borrowed(&link.get_password_hash()?),
@@ -549,7 +549,7 @@ impl Client {
 			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: link.link_uuid,
-				file_uuid: file.uuid(),
+				file_uuid: *file.uuid(),
 				expiration: link.expiration,
 				password: link.password().is_known(),
 				password_hashed: Cow::Borrowed(&link.get_password_hash()?),
@@ -568,7 +568,7 @@ impl Client {
 	) -> Result<Option<FilePublicLink>, Error> {
 		let response = api::v3::file::link::status::post(
 			self.client(),
-			&api::v3::file::link::status::Request { uuid: file.uuid() },
+			&api::v3::file::link::status::Request { uuid: *file.uuid() },
 		)
 		.await?;
 
@@ -641,7 +641,7 @@ impl Client {
 	) -> Result<Option<DirPublicLink>, Error> {
 		let response = api::v3::dir::link::status::post(
 			self.client(),
-			&api::v3::dir::link::status::Request { uuid: dir.uuid() },
+			&api::v3::dir::link::status::Request { uuid: *dir.uuid() },
 		)
 		.await?;
 
@@ -683,7 +683,7 @@ impl Client {
 			&api::v3::dir::link::content::Request {
 				uuid: link.link_uuid,
 				password: Cow::Borrowed(&link.get_password_hash()?),
-				parent: dir.uuid(),
+				parent: *dir.uuid(),
 			},
 		)
 		.await?;
@@ -743,7 +743,7 @@ impl Client {
 		api::v3::item::share::post(
 			self.client(),
 			&api::v3::item::share::Request {
-				uuid: item.uuid(),
+				uuid: *item.uuid(),
 				parent: Some(item.parent().try_into()?),
 				email: Cow::Borrowed(user.email()),
 				r#type: item.object_type(),
@@ -765,7 +765,7 @@ impl Client {
 			api::v3::item::share::post(
 				self.client(),
 				&api::v3::item::share::Request {
-					uuid: dir.uuid(),
+					uuid: *dir.uuid(),
 					parent: None,
 					email: Cow::Borrowed(user.email()),
 					r#type: ObjectType::Dir,
@@ -804,7 +804,7 @@ impl Client {
 		api::v3::item::share::post(
 			self.client(),
 			&api::v3::item::share::Request {
-				uuid: file.uuid(),
+				uuid: *file.uuid(),
 				parent: None,
 				email: Cow::Borrowed(user.email()),
 				r#type: ObjectType::File,
@@ -841,7 +841,7 @@ impl Client {
 		let response = api::v3::shared::out::post(
 			self.client(),
 			&api::v3::shared::out::Request {
-				uuid: dir.map(|d| d.uuid()),
+				uuid: dir.map(|d| *d.uuid()),
 				receiver_id: user.map(|u| u.id),
 			},
 		)
@@ -884,7 +884,7 @@ impl Client {
 		let response = api::v3::shared::r#in::post(
 			self.client(),
 			&api::v3::shared::r#in::Request {
-				uuid: dir.map(|d| d.uuid()),
+				uuid: dir.map(|d| *d.uuid()),
 			},
 		)
 		.await?;

@@ -121,7 +121,7 @@ impl Client {
 		let resp = api::v3::item::favorite::post(
 			self.client(),
 			&api::v3::item::favorite::Request {
-				uuid: object.uuid(),
+				uuid: *object.uuid(),
 				r#type: object.object_type(),
 				value,
 			},

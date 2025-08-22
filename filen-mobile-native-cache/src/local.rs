@@ -295,7 +295,7 @@ impl AuthCacheState {
 		args: SearchQueryArgs,
 	) -> Result<Vec<SearchQueryResponseEntry>, CacheError> {
 		Ok(
-			sql::select_search(&self.conn(), &args, self.client.root().uuid())?
+			sql::select_search(&self.conn(), &args, *self.client.root().uuid())?
 				.into_iter()
 				.map(|(o, path)| SearchQueryResponseEntry {
 					object: FfiNonRootObject::from(o),
