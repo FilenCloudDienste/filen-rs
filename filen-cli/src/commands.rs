@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use filen_sdk_rs::fs::{
-	FSObject, HasName as _,
+	FSObject, HasName as _, HasUUID as _,
 	dir::DirectoryType,
 	file::{enums::RemoteFileType, traits::HasFileInfo as _},
 };
@@ -125,13 +125,13 @@ async fn list_directory(
 	let mut directories = items
 		.0
 		.iter()
-		.map(|f| f.name().unwrap_or("CANNOT_DECRYPT_NAME")) // todo
+		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()))
 		.collect::<Vec<&str>>();
 	directories.sort();
 	let mut files = items
 		.1
 		.iter()
-		.map(|f| f.name().unwrap_or("CANNOT_DECRYPT_NAME")) // todo
+		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()))
 		.collect::<Vec<&str>>();
 	files.sort();
 	println!("{}", [directories, files].concat().join("  "));
