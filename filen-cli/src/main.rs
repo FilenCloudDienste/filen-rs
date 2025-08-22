@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 	let mut working_path = RemotePath::new("");
 
 	if let Some(command) = cli.command {
-		execute_command(&mut client, &working_path, &command).await?;
+		execute_command(&mut client, &working_path, command).await?;
 	} else {
 		loop {
 			let line = prompt(&format!("{} >", working_path))?;
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
 			if cli.command.is_none() {
 				continue;
 			}
-			match execute_command(&mut client, &working_path, &cli.command.unwrap()).await {
+			match execute_command(&mut client, &working_path, cli.command.unwrap()).await {
 				Ok(result) => {
 					if result.exit {
 						break;
