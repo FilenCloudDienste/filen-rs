@@ -1,8 +1,8 @@
+use serde::{Deserialize, Deserializer, Serializer, de::IntoDeserializer};
+use std::borrow::Cow;
+
 pub(crate) mod optional {
-	use std::borrow::Cow;
-
-	use serde::{Deserialize, Deserializer, Serializer, de::IntoDeserializer};
-
+	use super::*;
 	pub(crate) fn serialize<S>(
 		value: &Option<Cow<'_, [u8]>>,
 		serializer: S,
@@ -30,5 +30,33 @@ pub(crate) mod optional {
 			}
 			None => Ok(None),
 		}
+	}
+}
+
+pub(crate) mod const_size {
+	use super::*;
+
+	pub(crate) fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		faster_hex::nopfx_ignorecase::serialize(value, serializer)
+	}
+
+	pub(crate) fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let cow = Cow::<str>::deserialize(deserializer)?;
+		let mut bytes = [0u8; N];
+		if cow.len() != N * 2 {
+			return Err(serde::de::Error::custom(format!(
+				"Invalid length for [u8; {}]: {}",
+				N,
+				cow.len()
+			)));
+		}
+		faster_hex::hex_decode(cow.as_bytes(), &mut bytes).map_err(serde::de::Error::custom)?;
+		Ok(bytes)
 	}
 }

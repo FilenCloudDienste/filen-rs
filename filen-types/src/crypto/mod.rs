@@ -31,7 +31,8 @@ pub struct EncryptedDEK(pub EncryptedString);
 pub struct EncryptedMetaKey(pub EncryptedString);
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sha512Hash(#[serde(with = "faster_hex::nopfx_ignorecase")] digest::Output<Sha512>);
+pub struct Sha512Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 64]);
+
 impl std::fmt::Debug for Sha512Hash {
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
 		write!(f, "Sha512Hash({})", faster_hex::hex_string(&self.0))
@@ -40,19 +41,19 @@ impl std::fmt::Debug for Sha512Hash {
 
 impl From<digest::Output<Sha512>> for Sha512Hash {
 	fn from(hash: digest::Output<Sha512>) -> Self {
-		Self(hash)
+		Self(hash.into())
 	}
 }
 
 impl From<Sha512Hash> for digest::Output<Sha512> {
 	fn from(hash: Sha512Hash) -> Self {
-		hash.0
+		hash.0.into()
 	}
 }
 
 impl From<Sha512Hash> for [u8; 64] {
 	fn from(hash: Sha512Hash) -> Self {
-		hash.0.into()
+		hash.0
 	}
 }
 
@@ -64,15 +65,16 @@ impl AsRef<[u8]> for Sha512Hash {
 
 impl From<[u8; 64]> for Sha512Hash {
 	fn from(hash: [u8; 64]) -> Self {
-		Self(digest::Output::<Sha512>::from(hash))
+		Self(hash)
 	}
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Sha256Hash(#[serde(with = "faster_hex::nopfx_ignorecase")] digest::Output<sha2::Sha256>);
+pub struct Sha256Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 32]);
+
 impl From<digest::Output<sha2::Sha256>> for Sha256Hash {
 	fn from(hash: digest::Output<sha2::Sha256>) -> Self {
-		Self(hash)
+		Self(hash.into())
 	}
 }
 
@@ -84,13 +86,13 @@ impl std::fmt::Debug for Sha256Hash {
 
 impl From<Sha256Hash> for digest::Output<sha2::Sha256> {
 	fn from(hash: Sha256Hash) -> Self {
-		hash.0
+		hash.0.into()
 	}
 }
 
 impl From<Sha256Hash> for [u8; 32] {
 	fn from(hash: Sha256Hash) -> Self {
-		hash.0.into()
+		hash.0
 	}
 }
 
