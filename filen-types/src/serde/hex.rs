@@ -11,7 +11,7 @@ pub(crate) mod optional {
 		S: Serializer,
 	{
 		match value {
-			Some(v) => serializer.serialize_bytes(v),
+			Some(value) => faster_hex::nopfx_lowercase::serialize(value, serializer),
 			None => serializer.serialize_none(),
 		}
 	}
