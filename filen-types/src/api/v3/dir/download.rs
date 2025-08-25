@@ -50,6 +50,7 @@ pub struct File<'a> {
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
 	pub size: Cow<'a, EncryptedString>,
+	pub chunks_size: u64,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
 	pub parent: ParentUuid,

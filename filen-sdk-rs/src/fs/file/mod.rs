@@ -234,13 +234,17 @@ impl RemoteFile {
 	pub fn from_meta(
 		uuid: UuidStr,
 		parent: ParentUuid,
-		size: u64,
+		fallback_size: u64,
 		chunks: u64,
 		region: impl Into<String>,
 		bucket: impl Into<String>,
 		favorited: bool,
 		meta: FileMeta<'static>,
 	) -> Self {
+		let size = match &meta {
+			FileMeta::Decoded(decrypted) => decrypted.size,
+			_ => fallback_size,
+		};
 		Self {
 			uuid,
 			meta,

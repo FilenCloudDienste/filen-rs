@@ -218,18 +218,11 @@ impl Client {
 			.files
 			.into_iter()
 			.map(|f| {
-				let decrypted_size = self.crypter().decrypt_meta(&f.size)?;
-				let decrypted_size = decrypted_size.parse::<u64>().map_err(|_| {
-					Error::custom(
-						ErrorKind::Conversion,
-						format!("Failed to parse decrypted size: {}", decrypted_size),
-					)
-				})?;
 				let meta = FileMeta::from_encrypted(f.metadata, self.crypter(), f.version);
 				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 					f.uuid,
 					f.parent,
-					decrypted_size,
+					f.chunks_size,
 					f.chunks,
 					f.region,
 					f.bucket,
