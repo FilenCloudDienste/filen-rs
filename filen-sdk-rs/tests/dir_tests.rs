@@ -377,7 +377,7 @@ async fn dir_malformed_meta() {
 		.unwrap();
 
 	let dirs = client.list_dir(test_dir).await.unwrap().0;
-	assert!(dirs.iter().any(|d| d.uuid() == uuid));
+	assert!(dirs.iter().any(|d| *d.uuid() == uuid));
 	assert!(matches!(dirs[0].get_meta(), DirectoryMeta::Encrypted(_)));
 
 	let dir = client.get_dir(uuid).await.unwrap();

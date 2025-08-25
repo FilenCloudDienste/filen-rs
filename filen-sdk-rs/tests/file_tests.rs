@@ -496,6 +496,6 @@ async fn file_malformed_meta() {
 	assert!(matches!(file.get_meta(), FileMeta::Encrypted(_)));
 
 	let files = client.list_dir(test_dir).await.unwrap().1;
-	assert!(files.iter().any(|f| f.uuid() == uuid));
+	assert!(files.iter().any(|f| *f.uuid() == uuid));
 	assert_eq!(files.len(), 1);
 }
