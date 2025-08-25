@@ -32,7 +32,7 @@ impl Client {
 				callback(bytes_read as u64);
 			}
 		}
-		writer.flush().await?;
+		writer.close().await?;
 		Ok(())
 	}
 
