@@ -1,8 +1,0 @@
-[build]
-rustflags = [
-    "-C",
-    "target-feature=-nontrapping-fptoint",
-    "--cfg",
-    "getrandom_backend=\"wasm_js\"",
-]
-target = "wasm32-unknown-unknown"

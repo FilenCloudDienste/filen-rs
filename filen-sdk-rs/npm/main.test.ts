@@ -1,8 +1,8 @@
-import { login, FilenState, from_serialized, type Dir } from "./browser/sdk-rs.js"
+import { login, Client, fromStringified, type Dir } from "./browser/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import "dotenv/config"
 
-let state: FilenState
+let state: Client
 let testDir: Dir
 beforeAll(async () => {
 	const email = process.env.TEST_EMAIL
@@ -32,9 +32,9 @@ test("login", async () => {
 })
 
 test("serialization", async () => {
-	const serializedState = state.serialize()
+	const serializedState = state.toStringified()
 	expect(serializedState.rootUuid).toEqual(state.root().uuid)
-	const newState = from_serialized(serializedState)
+	const newState = fromStringified(serializedState)
 	expect(newState.root().uuid).toEqual(state.root().uuid)
 })
 
@@ -51,7 +51,7 @@ test("list root directory", async () => {
 
 test("Directory", async () => {
 	const before = new Date().getTime()
-	const dir = await state.createDir(testDir, "test-dir")
+	let dir = await state.createDir(testDir, "test-dir")
 	const after = new Date().getTime()
 	expect(dir).toBeDefined()
 	expect(dir.uuid).toBeDefined()
@@ -59,7 +59,7 @@ test("Directory", async () => {
 	expect(dir.meta?.name).toBe("test-dir")
 	expect(dir.meta?.created).toBeGreaterThanOrEqual(before)
 	expect(dir.meta?.created).toBeLessThanOrEqual(after)
-	await state.trashDir(dir)
+	dir = await state.trashDir(dir)
 	expect(dir.parent).toBe("trash")
 	await state.deleteDirPermanently(dir)
 })
@@ -67,7 +67,7 @@ test("Directory", async () => {
 test("File", async () => {
 	const created = BigInt(new Date().getTime())
 	const before = BigInt(new Date().getTime())
-	const file = await state.uploadFile(Buffer.from("test-file.txt"), {
+	let file = await state.uploadFile(Buffer.from("test-file.txt"), {
 		parent: testDir,
 		name: "test-file.txt",
 		created: created
@@ -83,7 +83,7 @@ test("File", async () => {
 	expect(file.size).toBe(BigInt("test-file.txt".length))
 	const data = await state.downloadFile(file)
 	expect(new TextDecoder().decode(data)).toBe("test-file.txt")
-	await state.trashFile(file)
+	file = await state.trashFile(file)
 	expect(file.parent).toBe("trash")
 	await state.deleteFilePermanently(file)
 })
@@ -96,7 +96,7 @@ test("File Streams", async () => {
 	const blob = new Blob(["test file data"])
 
 	let progress = 0n
-	const remoteFile = await state.uploadFileStream({
+	const remoteFile = await state.uploadFileFromReader({
 		parent: testDir,
 		name: "stream-file.txt",
 		reader: blob.stream(),

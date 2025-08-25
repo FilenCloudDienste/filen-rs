@@ -27,6 +27,10 @@ pub enum FileEncryptionVersion {
 	V2 = 2,
 	V3 = 3,
 }
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const TS_FILE_ENCRYPTION_VERSION: &'static str =
+	r#"export type FileEncryptionVersion = 1 | 2 | 3;"#;
 
 impl From<u8> for FileEncryptionVersion {
 	fn from(value: u8) -> Self {

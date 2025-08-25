@@ -1,2 +1,10 @@
 [build]
 rustflags = ["-Zhigher-ranked-assumptions"]
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C",
+    "target-feature=-nontrapping-fptoint",
+    "--cfg",
+    "getrandom_backend=\"wasm_js\"",
+]

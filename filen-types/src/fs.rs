@@ -39,6 +39,10 @@ pub enum ParentUuid {
 	Favorites,
 	Links,
 }
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const TS_PARENT_UUID: &'static str =
+	r#"export type ParentUuid = UuidStr | "trash" | "recents" | "favorites" | "links";"#;
 
 impl Default for ParentUuid {
 	fn default() -> Self {
@@ -135,6 +139,10 @@ mod uuid {
 
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+	const TS_PARENT_UUID: &'static str = r#"export type UuidStr = string;"#;
 
 	impl UuidStr {
 		pub const LENGTH: usize = Hyphenated::LENGTH;
@@ -262,6 +270,20 @@ mod uuid {
 			}
 		}
 	}
+
+	#[cfg(feature = "node")]
+	mod node {
+		use super::UuidStr;
+		use napi::bindgen_prelude::ToNapiValue;
+		impl ToNapiValue for UuidStr {
+			unsafe fn to_napi_value(
+				env: napi::sys::napi_env,
+				val: Self,
+			) -> napi::Result<napi::sys::napi_value> {
+				unsafe { ToNapiValue::to_napi_value(env, val.as_ref()) }
+			}
+		}
+	}
 }
 
 #[cfg(feature = "rusqlite")]
@@ -314,6 +336,20 @@ mod wasm {
 	impl From<ParentUuid> for JsValue {
 		fn from(parent: ParentUuid) -> Self {
 			JsValue::from(parent.as_ref())
+		}
+	}
+}
+
+#[cfg(feature = "node")]
+mod node {
+	use super::ParentUuid;
+	use napi::bindgen_prelude::ToNapiValue;
+	impl ToNapiValue for ParentUuid {
+		unsafe fn to_napi_value(
+			env: napi::sys::napi_env,
+			val: Self,
+		) -> napi::Result<napi::sys::napi_value> {
+			unsafe { ToNapiValue::to_napi_value(env, val.as_ref()) }
 		}
 	}
 }

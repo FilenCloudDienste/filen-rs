@@ -122,6 +122,11 @@ impl MetaCrypter for AuthInfo {
 }
 
 // #[derive(Clone)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen
+)]
+#[cfg_attr(feature = "node", napi_derive::napi)]
 pub struct Client {
 	email: String,
 
@@ -140,6 +145,8 @@ pub struct Client {
 	pub(crate) drive_lock: Mutex<Option<Weak<ResourceLock>>>,
 	pub(crate) api_semaphore: tokio::sync::Semaphore,
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
+	#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen(skip))]
+	#[cfg_attr(feature = "node", napi_derive::napi(skip))]
 	pub open_file_semaphore: tokio::sync::Semaphore,
 }
 
@@ -159,8 +166,15 @@ impl PartialEq for Client {
 
 impl Eq for Client {}
 
-#[cfg_attr(target_arch = "wasm32", derive(tsify::Tsify))]
-#[cfg_attr(target_arch = "wasm32", tsify(from_wasm_abi, into_wasm_abi))]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	derive(tsify::Tsify)
+)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	tsify(from_wasm_abi, into_wasm_abi)
+)]
+#[cfg_attr(feature = "node", napi_derive::napi(object))]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StringifiedClient {
@@ -380,22 +394,6 @@ impl Client {
 		})
 	}
 
-	pub fn to_stringified(&self) -> StringifiedClient {
-		StringifiedClient {
-			email: self.email.clone(),
-			root_uuid: self.root_dir.uuid().to_string(),
-			auth_info: self.auth_info.to_string(),
-			private_key: BASE64_STANDARD
-				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
-			api_key: self.http_client.api_key.0.clone(),
-			auth_version: match self.auth_info {
-				AuthInfo::V1(_) => 1,
-				AuthInfo::V2(_) => 2,
-				AuthInfo::V3(_) => 3,
-			},
-		}
-	}
-
 	pub fn to_sdk_config(&self) -> FilenSDKConfig {
 		FilenSDKConfig {
 			email: self.email.clone(),
@@ -422,6 +420,32 @@ impl Client {
 			metadata_cache: false,
 			tmp_path: "".to_string(), // ?
 			connect_to_socket: false,
+		}
+	}
+}
+
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen
+)]
+impl Client {
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "toStringified")
+	)]
+	pub fn to_stringified(&self) -> StringifiedClient {
+		StringifiedClient {
+			email: self.email.clone(),
+			root_uuid: self.root_dir.uuid().to_string(),
+			auth_info: self.auth_info.to_string(),
+			private_key: BASE64_STANDARD
+				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
+			api_key: self.http_client.api_key.0.clone(),
+			auth_version: match self.auth_info {
+				AuthInfo::V1(_) => 1,
+				AuthInfo::V2(_) => 2,
+				AuthInfo::V3(_) => 3,
+			},
 		}
 	}
 }

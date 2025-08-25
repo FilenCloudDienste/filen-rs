@@ -16,6 +16,11 @@ serde_repr = "0.1.20"
 sha2 = "0.10.9"
 thiserror = "2.0.14"
 uuid = { version = "1.18.0", features = ["serde", "v4"] }
+napi = { version = "3.2.4", default-features = false, optional = true }
+napi-derive = { version = "3.2.4", default-features = false, optional = true }
+tsify = { version = "0.5.5", default-features = false, features = [
+    "js"
+] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2.100"
@@ -23,4 +28,5 @@ wasm-bindgen = "0.2.100"
 [features]
 default = []
 rusqlite = ["dep:rusqlite"]
+node = ["dep:napi", "dep:napi-derive"]
 
