@@ -36,6 +36,7 @@ struct RawFileMeta<'a> {
 	#[serde(rename = "creation")]
 	#[serde(default)]
 	pub(super) created: Option<DateTime<Utc>>,
+	#[serde(with = "empty_hash_is_none")]
 	pub(super) hash: Option<Sha512Hash>,
 }
 
@@ -318,5 +319,37 @@ impl FileMetaChanges {
 	pub fn created(mut self, created: Option<DateTime<Utc>>) -> Self {
 		self.created = Some(created.map(|t| t.round_subsecs(3)));
 		self
+	}
+}
+
+pub(super) mod empty_hash_is_none {
+	use std::borrow::Cow;
+
+	use filen_types::crypto::Sha512Hash;
+	use serde::{Deserialize, Serialize, Serializer, de::IntoDeserializer};
+
+	pub(crate) fn serialize<S>(value: &Option<Sha512Hash>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		if let Some(value) = value {
+			Sha512Hash::serialize(value, serializer)
+		} else {
+			serializer.serialize_none()
+		}
+	}
+
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Sha512Hash>, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let option = Option::<Cow<str>>::deserialize(deserializer)?;
+		match option {
+			Some(cow) if !cow.is_empty() => {
+				let hash = Sha512Hash::deserialize(cow.into_deserializer())?;
+				Ok(Some(hash))
+			}
+			_ => Ok(None),
+		}
 	}
 }
