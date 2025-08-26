@@ -31,6 +31,7 @@ pub struct EncryptedDEK(pub EncryptedString);
 pub struct EncryptedMetaKey(pub EncryptedString);
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Sha512Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 64]);
 
 impl std::fmt::Debug for Sha512Hash {
@@ -70,6 +71,7 @@ impl From<[u8; 64]> for Sha512Hash {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Sha256Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 32]);
 
 impl From<digest::Output<sha2::Sha256>> for Sha256Hash {
