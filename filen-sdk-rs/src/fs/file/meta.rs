@@ -37,6 +37,7 @@ struct RawFileMeta<'a> {
 	#[serde(default)]
 	pub(super) created: Option<DateTime<Utc>>,
 	#[serde(with = "empty_hash_is_none")]
+	#[serde(default)]
 	pub(super) hash: Option<Sha512Hash>,
 }
 
