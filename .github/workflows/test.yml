@@ -15,6 +15,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: 'test'
+  cancel-in-progress: true
+
 jobs:
   test:
     if: |
