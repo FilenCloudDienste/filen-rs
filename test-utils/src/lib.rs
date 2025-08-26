@@ -20,12 +20,24 @@ pub struct TestResources {
 
 impl Drop for TestResources {
 	fn drop(&mut self) {
-		futures::executor::block_on(async move {
-			match self.client.delete_dir_permanently(self.dir.clone()).await {
-				Ok(_) => {}
-				Err(e) => eprintln!("Failed to clean up test directory: {e}"),
+		match tokio::runtime::Handle::try_current() {
+			Ok(handle) => {
+				handle.spawn(Self::cleanup(self.client.clone(), self.dir.clone()));
 			}
-		})
+			Err(_) => {
+				let rt = rt();
+				rt.block_on(Self::cleanup(self.client.clone(), self.dir.clone()));
+			}
+		}
+	}
+}
+
+impl TestResources {
+	async fn cleanup(client: Arc<Client>, dir: RemoteDirectory) {
+		match client.delete_dir_permanently(dir).await {
+			Ok(_) => {}
+			Err(e) => eprintln!("Failed to clean up test directory: {e}"),
+		}
 	}
 }
 
