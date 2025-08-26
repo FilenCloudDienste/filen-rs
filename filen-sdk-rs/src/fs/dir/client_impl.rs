@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
 
+#[cfg(feature = "tokio")]
 use crate::error::ErrorKind;
 use crate::fs::NonRootFSObject;
 use crate::{

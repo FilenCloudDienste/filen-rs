@@ -91,7 +91,7 @@ impl Client {
 		&self,
 		params: crate::js::UploadFileStreamParams,
 	) -> Result<File, JsValue> {
-		let builder = params.file_params.into_file_builder(&self);
+		let builder = params.file_params.into_file_builder(self);
 		let mut reader = wasm_streams::ReadableStream::from_raw(params.reader)
 			.try_into_async_read()
 			.map_err(|(e, _)| e)?;
