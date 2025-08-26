@@ -56,6 +56,10 @@ test("list root directory", async () => {
 test("Directory", async () => {
 	const before = new Date().getTime()
 	let dir = await state.createDir(testDir, "test-dir")
+	const [dirs, files] = await state.listDir(dir)
+	expect(dirs.length).toBe(0)
+	expect(files.length).toBe(0)
+
 	const after = new Date().getTime()
 	expect(dir).toBeDefined()
 	expect(dir.uuid).toBeDefined()
