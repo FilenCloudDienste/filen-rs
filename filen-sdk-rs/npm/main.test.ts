@@ -150,7 +150,7 @@ test("File Streams", async () => {
 	expect([...downloadedBytes]).toEqual([...expectedBytes])
 })
 
-test.only("Zip Download", async () => {
+test("Zip Download", async () => {
 	const dirA = await state.createDir(testDir, "a")
 	const dirB = await state.createDir(dirA, "b")
 	await state.createDir(testDir, "c")
