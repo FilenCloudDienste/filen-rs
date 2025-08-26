@@ -8,7 +8,7 @@ use crate::{
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use crate::js::File;
+use crate::js::{File, Item};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use tsify::Tsify;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -115,5 +115,36 @@ pub struct DownloadFileStreamParams {
 		serde(with = "serde_wasm_bindgen::preserve")
 	)]
 	#[serde(default)]
+	pub progress: js_sys::Function,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Deserialize)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	tsify(from_wasm_abi)
+)]
+pub struct DownloadFileToZipParams {
+	pub items: Vec<Item>,
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "WritableStream<Uint8Array>")
+	)]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		serde(with = "serde_wasm_bindgen::preserve")
+	)]
+	pub writer: web_sys::WritableStream,
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "(bytes: bigint) => void")
+	)]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		serde(with = "serde_wasm_bindgen::preserve")
+	)]
+	#[serde(default)]
+	// ignored for now, as the zip writer doesn't currently support progress updates
 	pub progress: js_sys::Function,
 }

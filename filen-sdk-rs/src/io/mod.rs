@@ -9,9 +9,7 @@ use chrono::{DateTime, Utc};
 
 pub mod client_impl;
 
-#[cfg(windows)]
 const WINDOWS_TICKS_PER_MILLI: u64 = 10_000;
-#[cfg(windows)]
 const MILLIS_TO_UNIX_EPOCH: u64 = 11_644_473_600_000; // 11644473600000 milliseconds from 1601-01-01 to 1970-01-01
 
 pub trait FilenMetaExt {
@@ -29,6 +27,12 @@ fn nt_time_to_unix_time(nt_time: u64) -> DateTime<Utc> {
 	}
 	let unix_millis = nt_time / WINDOWS_TICKS_PER_MILLI - MILLIS_TO_UNIX_EPOCH;
 	(std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(unix_millis)).into()
+}
+
+// only public for tests
+pub fn unix_time_to_nt_time(dt: DateTime<Utc>) -> u64 {
+	let duration_since_epoch = dt.timestamp_millis() as u64 + MILLIS_TO_UNIX_EPOCH;
+	duration_since_epoch * WINDOWS_TICKS_PER_MILLI
 }
 
 impl FilenMetaExt for std::fs::Metadata {

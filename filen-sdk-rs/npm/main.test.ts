@@ -1,6 +1,10 @@
-import { login, Client, fromStringified, type Dir } from "./browser/sdk-rs.js"
+import { login, Client, fromStringified, type Dir, type File } from "./browser/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
+import { tmpdir } from "os"
+import { createReadStream, createWriteStream, openAsBlob } from "fs"
 import "dotenv/config"
+import Stream from "stream"
+import { BlobWriter, fs, ZipReader, type Entry } from "@zip.js/zip.js"
 
 let state: Client
 let testDir: Dir
@@ -142,6 +146,93 @@ test("File Streams", async () => {
 	expect([...downloadedBytes]).toEqual([...expectedBytes])
 })
 
+test.only("Zip Download", async () => {
+	const dirA = await state.createDir(testDir, "a")
+	const dirB = await state.createDir(dirA, "b")
+	await state.createDir(testDir, "c")
+
+	const file = await state.uploadFile(new TextEncoder().encode("root file content"), {
+		parent: testDir,
+		name: "file.txt"
+	})
+	const file1 = await state.uploadFile(new TextEncoder().encode("file 1 content"), {
+		parent: dirA,
+		name: "file1.txt"
+	})
+	const file2 = await state.uploadFile(new TextEncoder().encode("file 2 content"), {
+		parent: dirB,
+		name: "file2.txt"
+	})
+	const file3 = await state.uploadFile(new TextEncoder().encode("file 3 content"), {
+		parent: dirB,
+		name: "file3.txt"
+	})
+
+	const writeStream = createWriteStream(`${tmpdir()}/test-zip-download.zip`)
+	const webStream = Stream.Writable.toWeb(writeStream)
+	await state.downloadItemsToZip({
+		items: [file, dirA],
+		writer: webStream
+	})
+	writeStream.end()
+
+	const zipBlob = await openAsBlob(`${tmpdir()}/test-zip-download.zip`)
+
+	const zipReader = new ZipReader(zipBlob.stream())
+
+	const entries = await zipReader.getEntries()
+	const map = new Map<string, Entry>()
+	for (const entry of entries) {
+		map.set(entry.filename, entry)
+	}
+
+	const compareFileToEntry = async (entry: Entry, expected: Uint8Array, expectedFile: File) => {
+		// zip.js has bad precision for dates, so we compare in seconds
+		expect(BigInt(entry.creationDate!.getTime())).toEqual(expectedFile.meta?.created)
+		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(expectedFile.meta?.modified) / 1000))
+		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
+		const object = createMemoryWritableStream()
+		await entry.getData!(object.stream)
+		expect(object.getBuffer()).toEqual(expected)
+	}
+
+	await compareFileToEntry(map.get("file.txt")!, new TextEncoder().encode("root file content"), file)
+	await compareFileToEntry(map.get("a/file1.txt")!, new TextEncoder().encode("file 1 content"), file1)
+	await compareFileToEntry(map.get("a/b/file2.txt")!, new TextEncoder().encode("file 2 content"), file2)
+	await compareFileToEntry(map.get("a/b/file3.txt")!, new TextEncoder().encode("file 3 content"), file3)
+})
+
 afterAll(async () => {
 	await state?.deleteDirPermanently(testDir)
 })
+
+export function createMemoryWritableStream(): {
+	stream: WritableStream<Uint8Array>
+	getBuffer: () => Uint8Array
+} {
+	const chunks: Uint8Array[] = []
+
+	const stream = new WritableStream<Uint8Array>({
+		write(chunk) {
+			chunks.push(chunk)
+		}
+	})
+
+	const getBuffer = () => {
+		const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+		const result = new Uint8Array(totalLength)
+		let offset = 0
+
+		for (const chunk of chunks) {
+			result.set(chunk, offset)
+			offset += chunk.length
+		}
+
+		return result
+	}
+
+	return {
+		stream,
+		getBuffer
+	}
+}

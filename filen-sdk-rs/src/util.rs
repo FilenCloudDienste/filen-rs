@@ -52,6 +52,16 @@ pub type MaybeSendBoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 pub type MaybeSendBoxFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSendSync: Send + Sync {}
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSendSync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> MaybeSendSync for T {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSendSync for T {}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub type MaybeSendCallback<'a, T> = std::sync::Arc<dyn Fn(T) + Send + Sync + 'a>;
 #[cfg(target_arch = "wasm32")]
 pub type MaybeSendCallback<'a, T> = std::rc::Rc<dyn Fn(T) + 'a>;
