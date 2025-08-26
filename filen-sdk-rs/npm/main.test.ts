@@ -1,10 +1,10 @@
 import { login, Client, fromStringified, type Dir, type File } from "./browser/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import { tmpdir } from "os"
-import { createReadStream, createWriteStream, openAsBlob } from "fs"
+import { createWriteStream, openAsBlob } from "fs"
 import "dotenv/config"
 import Stream from "stream"
-import { BlobWriter, fs, ZipReader, type Entry } from "@zip.js/zip.js"
+import { ZipReader, type Entry } from "@zip.js/zip.js"
 
 let state: Client
 let testDir: Dir
