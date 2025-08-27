@@ -4,7 +4,7 @@ use std::{
 	io::{BufReader, Read, Seek},
 };
 
-use chrono::{DateTime, Local, SubsecRound, Utc};
+use chrono::{SubsecRound, Utc};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	crypto::shared::generate_random_base64_values,
