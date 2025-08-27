@@ -425,7 +425,6 @@ async fn download_to_zip() {
 		.unwrap();
 
 	let tmp = std::env::temp_dir();
-	println!("Using temp dir: {:?}", tmp);
 	let mut options = tokio::fs::OpenOptions::new();
 	options.create(true).write(true).read(true).truncate(true);
 	let zip_file = options
@@ -515,8 +514,4 @@ async fn download_to_zip() {
 		b"file 3 content",
 		&file_3,
 	);
-	let file_data = archive.by_name("file.txt").unwrap();
-
-	let data = file_data.extra_data_fields().collect::<Vec<_>>();
-	info!("Extra data fields: {data:?}");
 }
