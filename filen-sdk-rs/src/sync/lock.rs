@@ -95,7 +95,7 @@ impl Drop for ResourceLock {
 	}
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), feature = "tokio"))]
 const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
 
 #[cfg(feature = "tokio")]
@@ -136,7 +136,44 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 	});
 }
 
-#[cfg(not(feature = "tokio"))]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn keep_lock_alive(lock: Weak<ResourceLock>) {
+	use wasmtimer::std::Instant;
+
+	let initial_update = Instant::now();
+	wasm_bindgen_futures::spawn_local(async move {
+		wasmtimer::tokio::sleep(LOCK_REFRESH_INTERVAL - (Instant::now() - initial_update)).await;
+		loop {
+			if let Some(lock) = lock.upgrade() {
+				let good_response = match api::v3::user::lock::post(
+					lock.client.as_ref(),
+					&api::v3::user::lock::Request {
+						uuid: lock.uuid,
+						r#type: LockType::Refresh,
+						resource: Cow::Borrowed(&lock.resource),
+					},
+				)
+				.await
+				{
+					Ok(r) => r.refreshed,
+					Err(_) => false,
+				};
+
+				if !good_response {
+					log::error!("Failed to refresh lock: {}", lock.resource);
+					return;
+				} else {
+					debug!("Refreshed lock: {}", lock.resource);
+				}
+			} else {
+				return;
+			}
+			wasmtimer::tokio::sleep(LOCK_REFRESH_INTERVAL).await;
+		}
+	});
+}
+
+#[cfg(not(any(all(target_arch = "wasm32", target_os = "unknown"), feature = "tokio")))]
 fn keep_lock_alive(_lock: Weak<ResourceLock>) {
 	use log::warn;
 	warn!(
