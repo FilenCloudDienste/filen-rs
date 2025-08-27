@@ -17,7 +17,7 @@ existing AS (
 	WHERE
 		items.parent = ?2
 		AND (
-			(?3 IS NULL AND (files_meta.name IS NOT NULL OR dirs_meta.name IS NOT NULL))
+			(?3 IS NULL AND items.uuid = ?1)
 			OR (files_meta.name = ?3 OR dirs_meta.name = ?3)
 		)
 ),
