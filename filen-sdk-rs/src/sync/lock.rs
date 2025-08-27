@@ -190,11 +190,13 @@ impl Client {
 					.map_err(|e| RetryError::NoRetry(e.with_context(endpoint)))?;
 
 				if resp.acquired {
-					Ok(Arc::new(ResourceLock {
+					let lock = Arc::new(ResourceLock {
 						uuid,
 						client: self.arc_client(),
 						resource: resource.clone(),
-					}))
+					});
+					keep_lock_alive(Arc::downgrade(&lock));
+					Ok(lock)
 				} else {
 					Err(RetryError::Retry(Error::custom(
 						ErrorKind::Server,
