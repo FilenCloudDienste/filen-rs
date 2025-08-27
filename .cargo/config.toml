@@ -8,3 +8,14 @@ rustflags = [
     "--cfg",
     "getrandom_backend=\"wasm_js\"",
 ]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Zhigher-ranked-assumptions", "-C", "link-arg=/STACK:2097152"]
+
+# 64 bit Mingw
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-Zhigher-ranked-assumptions",
+    "-C",
+    "link-arg=-Wl,--stack,2097152",
+]
