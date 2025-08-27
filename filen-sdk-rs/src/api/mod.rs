@@ -17,11 +17,16 @@ pub(crate) mod v3;
 pub(crate) const DEFAULT_NUM_RETRIES: usize = 7;
 pub(crate) const DEFAULT_MAX_RETRY_TIME: Duration = Duration::from_secs(30);
 
-fn fibonacci_iter() -> impl Iterator<Item = u64> {
-	std::iter::successors(Some((0_u64, Some(1))), |&(a, b)| {
-		Some((b?, a.checked_add(b?)))
-	})
-	.map(|(a, _)| a)
+fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
+	std::iter::successors(
+		Some((
+			max_retry_time,
+			Duration::from_secs(0),
+			Duration::from_millis(250),
+		)),
+		|&(max, a, b)| Some((max, b, min(max, a + b))),
+	)
+	.map(|(_, a, _)| a)
 }
 
 /// Represents an error that occured during the `response_handler` closure in [`retry_wrap`].
@@ -56,13 +61,16 @@ pub(crate) async fn retry_wrap<T>(
 ) -> Result<T, Error> {
 	let endpoint = endpoint.into();
 	let mut last_error: Option<Error> = None;
-	for (i, delay) in (0..=attempts).zip(fibonacci_iter()) {
+	for (i, delay) in (0..attempts).zip(fibonacci_iter(max_retry_time)) {
 		if i > 0 {
 			#[cfg(not(target_arch = "wasm32"))]
-			tokio::time::sleep(min(max_retry_time, Duration::from_secs(delay))).await;
+			tokio::time::sleep(delay).await;
 			#[cfg(target_arch = "wasm32")]
-			wasmtimer::tokio::sleep(min(max_retry_time, Duration::from_secs(delay))).await;
-			log::warn!("Retrying: {endpoint} ({i}/{attempts})");
+			wasmtimer::tokio::sleep(delay).await;
+			log::warn!(
+				"Retrying: {endpoint} ({i}/{attempts}) after {}ms)",
+				delay.as_millis()
+			);
 		}
 
 		// cloning the body bytes is necessary because the request builder consumes it
