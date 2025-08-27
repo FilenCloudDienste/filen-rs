@@ -8,7 +8,7 @@ metadata.workspaces = { independent = true }
 anyhow = "1.0.98"
 clap = { version = "4.5.43", features = ["derive"] }
 env_logger = "0.11.8"
-filen-sdk-rs = { path = "../filen-sdk-rs" }
+filen-sdk-rs = { path = "../filen-sdk-rs", features = ["tokio"] }
 filen-types = { path = "../filen-types" }
 log = "0.4.27"
 shlex = "1.3.0"
