@@ -28,7 +28,7 @@ beforeAll(async () => {
 		}
 	}
 	testDir = await state.createDir(state.root(), "wasm-test-dir")
-})
+}, 30000)
 
 test("login", async () => {
 	expect(state).toBeDefined()
