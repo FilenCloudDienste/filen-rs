@@ -92,6 +92,22 @@ pub(crate) async fn retry_wrap<T>(
 				continue;
 			}
 			Err(e) => {
+				#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+				use std::error::Error as StdError;
+				#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+				if let Some(source) = e.source()
+					&& let Some(e) = source.downcast_ref::<hyper_util::client::legacy::Error>()
+					&& e.is_connect()
+				{
+					// dns error
+					log::warn!("Request to {endpoint} failed to connect: {e}");
+					last_error = Some(
+						Error::custom(ErrorKind::Reqwest, e.to_string())
+							.with_context(endpoint.clone()),
+					);
+					continue;
+				}
+
 				log::error!("Request to {endpoint} failed: {e}");
 				return Err(e.with_context(endpoint));
 			}

@@ -81,6 +81,9 @@ async_zip = { git = "https://github.com/Enduriel/rs-async-zip.git", rev = "6ad27
 	"chrono",
 ] }
 
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+hyper-util = { version = "0.1.16", features = ["client-legacy"] }
+
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom_v3 = { package = "getrandom", version = "0.3", features = [
 	"wasm_js",

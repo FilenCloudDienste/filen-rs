@@ -1223,6 +1223,7 @@ dependencies = [
  "heif-decoder",
  "hkdf",
  "hmac",
+ "hyper-util",
  "image",
  "log 0.4.27",
  "md-5",
