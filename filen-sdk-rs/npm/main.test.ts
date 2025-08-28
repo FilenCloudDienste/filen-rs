@@ -246,7 +246,9 @@ test("Zip Download", async () => {
 })
 
 afterAll(async () => {
-	await state?.deleteDirPermanently(testDir)
+	if (state && testDir) {
+		await state?.deleteDirPermanently(testDir)
+	}
 })
 
 export function createMemoryWritableStream(): {
