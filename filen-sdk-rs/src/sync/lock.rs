@@ -251,7 +251,7 @@ impl Client {
 		&self,
 		resource: impl Into<String>,
 	) -> Result<Arc<ResourceLock>, Error> {
-		self.acquire_lock(resource, time::Duration::from_secs(10), 8640)
+		self.acquire_lock(resource, time::Duration::from_secs(30), 8640)
 			.await
 	}
 }
