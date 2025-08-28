@@ -150,6 +150,45 @@ test("File Streams", async () => {
 	expect([...downloadedBytes]).toEqual([...expectedBytes])
 })
 
+test("abort", async () => {
+	const abortController = new AbortController()
+	const fileAPromise = state.uploadFile(Buffer.from("file a"), {
+		name: "abort a.txt",
+		parent: testDir,
+		abortSignal: abortController.signal
+	})
+
+	const fileBPromise = state.uploadFile(Buffer.from("file b"), {
+		name: "abort b.txt",
+		parent: testDir
+	})
+
+	const abortControllerDelayed = new AbortController()
+
+	const fileCPromise = state.uploadFile(Buffer.from("file c"), {
+		name: "abort c.txt",
+		parent: testDir,
+		abortSignal: abortControllerDelayed.signal
+	})
+	setTimeout(() => {
+		abortControllerDelayed.abort()
+	}, 20)
+
+	abortController.abort()
+
+	await expect(fileAPromise).rejects.toThrowError("Operation was cancelled")
+	await expect(fileCPromise).rejects.toThrowError("Operation was cancelled")
+
+	const fileB = await fileBPromise
+	const [, files] = await state.listDir(testDir)
+
+	expect(files).toContainEqual(fileB)
+	for (const file of files) {
+		expect(file.meta?.name).not.toBe("abort a.txt")
+		expect(file.meta?.name).not.toBe("abort c.txt")
+	}
+})
+
 test("Zip Download", async () => {
 	const dirA = await state.createDir(testDir, "a")
 	const dirB = await state.createDir(dirA, "b")

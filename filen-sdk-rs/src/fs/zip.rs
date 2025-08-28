@@ -360,13 +360,22 @@ mod js_impl {
 			let writer = wasm_streams::WritableStream::from_raw(params.writer)
 				.try_into_async_write()
 				.map_err(|(e, _)| e)?;
+			let abort_fut = params.abort_signal.into_future()?;
 			let items = params
 				.items
 				.into_iter()
 				.map(TryInto::try_into)
 				.collect::<Result<Vec<_>, ConversionError>>()
 				.map_err(Error::from)?;
-			let _ = self.download_items_to_zip(&items, writer).await?;
+			let _ = tokio::select! {
+				biased;
+				err = abort_fut => {
+					return Err(JsValue::from(Error::from(err)))
+				},
+				writer = async {
+					self.download_items_to_zip(&items, writer).await
+				} => writer
+			}?;
 			Ok(())
 		}
 	}

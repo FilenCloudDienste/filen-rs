@@ -119,6 +119,8 @@ impl Write for Chunk<'_> {
 
 impl Drop for Chunk<'_> {
 	fn drop(&mut self) {
+		// note, this not getting printed doesn't mean the permits aren't released
+		// they might have been dropped after being moved out with into_parts
 		debug!(
 			"Releasing chunk with {} permits",
 			self.permits.num_permits()

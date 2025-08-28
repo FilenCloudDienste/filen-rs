@@ -24,8 +24,19 @@ impl Client {
 		data: &[u8],
 		params: UploadFileParams,
 	) -> Result<File, Error> {
-		let builder = params.into_file_builder(self);
-		let file = self.upload_file(Arc::new(builder.build()), data).await?;
+		let (builder, abort_signal) = params.into_file_builder(self);
+
+		let abort_fut = abort_signal.into_future()?;
+		let file = tokio::select! {
+			biased;
+			err = abort_fut => {
+				return Err(Error::from(err))
+			},
+			file = async {
+				self.upload_file(Arc::new(builder.build()), data).await
+			} => file,
+		}?;
+
 		Ok(file.into())
 	}
 
@@ -76,12 +87,21 @@ impl Client {
 			}) as crate::util::MaybeSendCallback<u64>)
 		};
 
-		self.download_file_to_writer(
-			&RemoteFile::try_from(params.file).map_err(Error::from)?,
-			&mut writer,
-			progress_callback,
-		)
-		.await?;
+		let abort_fut = params.abort_signal.into_future()?;
+		tokio::select! {
+			biased;
+			err = abort_fut => {
+				return Err(JsValue::from(Error::from(err)))
+			},
+			res = async {
+				self.download_file_to_writer(
+					&RemoteFile::try_from(params.file).map_err(Error::from)?,
+					&mut writer,
+					progress_callback,
+				)
+				.await
+			} => res
+		}?;
 		Ok(())
 	}
 
@@ -91,7 +111,7 @@ impl Client {
 		&self,
 		params: crate::js::UploadFileStreamParams,
 	) -> Result<File, JsValue> {
-		let builder = params.file_params.into_file_builder(self);
+		let (builder, abort_signal) = params.file_params.into_file_builder(self);
 		let mut reader = wasm_streams::ReadableStream::from_raw(params.reader)
 			.try_into_async_read()
 			.map_err(|(e, _)| e)?;
@@ -104,14 +124,21 @@ impl Client {
 			}) as crate::util::MaybeSendCallback<u64>)
 		};
 
-		let file = self
-			.upload_file_from_reader(
-				Arc::new(builder.build()),
-				&mut reader,
-				progress_callback,
-				params.known_size,
-			)
-			.await?;
+		let abort_fut = abort_signal.into_future()?;
+		let file = tokio::select! {
+			biased;
+			err = abort_fut => {
+				return Err(JsValue::from(Error::from(err)))
+			},
+			file = async {
+				self.upload_file_from_reader(
+					Arc::new(builder.build()),
+					&mut reader,
+					progress_callback,
+					params.known_size,
+				).await
+			} => file,
+		}?;
 		Ok(file.into())
 	}
 }

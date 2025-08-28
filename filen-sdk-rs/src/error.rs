@@ -61,6 +61,9 @@ pub enum ErrorKind {
 	ImageError,
 	/// Tried to use metadata for an item that failed to decrypt metadata
 	MetadataWasNotDecrypted,
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	/// Operation was cancelled
+	Cancelled,
 	#[cfg(feature = "heif-decoder")]
 	/// passthrough heif-decoder crate error
 	HeifError,
@@ -204,6 +207,13 @@ impl_from!(
 	MetadataWasNotDecryptedError,
 	ErrorKind::MetadataWasNotDecrypted
 );
+
+#[derive(Debug, Error)]
+#[error("Operation was cancelled")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) struct AbortedError;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl_from!(AbortedError, ErrorKind::Cancelled);
 
 #[cfg(target_arch = "wasm32")]
 impl From<Error> for wasm_bindgen::JsValue {

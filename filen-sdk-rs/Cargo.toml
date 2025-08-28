@@ -57,7 +57,10 @@ image = { version = "0.25.6", default-features = false, features = [
 	"qoi",
 	"avif",
 ] }
-tokio = { version = "1.47.1", default-features = false, features = ["sync"] }
+tokio = { version = "1.47.1", default-features = false, features = [
+	"sync",
+	"macros",
+] }
 tokio-stream = { version = "0.1.17", default-features = false, features = [
 	"fs",
 ], optional = true }
