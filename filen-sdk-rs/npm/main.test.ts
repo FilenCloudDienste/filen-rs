@@ -117,7 +117,7 @@ test("File Streams", async () => {
 	expect(progress).toBe(BigInt(data.length))
 
 	let buffer = new ArrayBuffer(0)
-	const webStream = new WritableStream({
+	let webStream = new WritableStream({
 		write(chunk) {
 			const bytes = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk)
 
@@ -148,6 +148,34 @@ test("File Streams", async () => {
 	const downloadedBytes = new Uint8Array(buffer)
 	const expectedBytes = new TextEncoder().encode(data)
 	expect([...downloadedBytes]).toEqual([...expectedBytes])
+
+	buffer = new ArrayBuffer(0)
+	webStream = new WritableStream({
+		write(chunk) {
+			const bytes = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk)
+
+			// Create new buffer with combined size
+			const newBuffer = new ArrayBuffer(buffer.byteLength + bytes.length)
+			const newView = new Uint8Array(newBuffer)
+
+			// Copy existing data
+			newView.set(new Uint8Array(buffer))
+			// Append new data
+			newView.set(bytes, buffer.byteLength)
+
+			buffer = newBuffer
+		}
+	})
+	await state.downloadFileToWriter({
+		file: remoteFile,
+		writer: webStream,
+		progress: bytes => {
+			downloadProgress = bytes
+		},
+		start: BigInt(5),
+		end: BigInt(9)
+	})
+	expect([...new Uint8Array(buffer)]).toEqual([...new TextEncoder().encode("file")])
 })
 
 test("abort", async () => {

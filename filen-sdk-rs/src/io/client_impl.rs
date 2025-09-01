@@ -20,7 +20,22 @@ impl Client {
 	where
 		T: 'a + AsyncWrite + Unpin,
 	{
-		let mut reader = self.get_file_reader(file);
+		self.download_file_to_writer_for_range(file, writer, callback, 0, file.size())
+			.await
+	}
+
+	pub async fn download_file_to_writer_for_range<'a, T>(
+		&'a self,
+		file: &'a dyn File,
+		writer: &mut T,
+		callback: Option<MaybeSendCallback<'a, u64>>,
+		start: u64,
+		end: u64,
+	) -> Result<(), crate::error::Error>
+	where
+		T: 'a + AsyncWrite + Unpin,
+	{
+		let mut reader = self.get_file_reader_for_range(file, start, end);
 		let mut buffer = [0u8; IO_BUFFER_SIZE];
 		loop {
 			let bytes_read = reader.read(&mut buffer).await?;

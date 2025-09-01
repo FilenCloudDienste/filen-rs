@@ -12,6 +12,7 @@ use filen_sdk_rs::{
 	},
 	util::MaybeSendCallback,
 };
+use futures::AsyncReadExt;
 use rand::TryRngCore;
 
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
@@ -470,6 +471,50 @@ async fn file_favorite() {
 
 	client.set_favorite(&mut file, false).await.unwrap();
 	assert!(!file.favorited());
+}
+
+#[shared_test_runtime]
+async fn file_read_range() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client.make_file_builder("test", test_dir).build();
+	let file = client
+		.upload_file(file.into(), b"Hello, Filen!")
+		.await
+		.unwrap();
+
+	let mut reader = client.get_file_reader_for_range(&file, 6, 1000000);
+	let mut buf = Vec::new();
+	reader.read_to_end(&mut buf).await.unwrap();
+	assert_eq!(str::from_utf8(&buf).unwrap(), " Filen!");
+	buf.clear();
+	let mut reader = client.get_file_reader_for_range(&file, 0, 5);
+	reader.read_to_end(&mut buf).await.unwrap();
+	assert_eq!(str::from_utf8(&buf).unwrap(), "Hello");
+
+	let file = client.make_file_builder("test2", test_dir).build();
+
+	let border_contents = b"Hello, Filen";
+	let mut big_contents = vec![0u8; 1024 * 1024 * 3 + border_contents.len() / 2];
+	big_contents
+		[1024 * 1024 * 2 - border_contents.len() / 2..1024 * 1024 * 2 + border_contents.len() / 2]
+		.copy_from_slice(&border_contents[..]);
+
+	let file = client
+		.upload_file(file.into(), &big_contents)
+		.await
+		.unwrap();
+
+	let mut reader = client.get_file_reader_for_range(
+		&file,
+		(1024 * 1024 * 2 - border_contents.len() / 2) as u64,
+		(1024 * 1024 * 2 + border_contents.len() / 2) as u64,
+	);
+	buf.clear();
+	reader.read_to_end(&mut buf).await.unwrap();
+	assert_eq!(str::from_utf8(&buf).unwrap(), "Hello, Filen");
 }
 
 #[cfg(feature = "malformed")]

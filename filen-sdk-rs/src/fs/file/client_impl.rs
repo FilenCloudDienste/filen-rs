@@ -157,6 +157,15 @@ impl Client {
 		FileReader::new(file, self)
 	}
 
+	pub fn get_file_reader_for_range<'a>(
+		&'a self,
+		file: &'a dyn File,
+		start: u64,
+		end: u64,
+	) -> impl AsyncRead + 'a {
+		FileReader::new_for_range(file, self, start, end)
+	}
+
 	pub fn make_file_builder(
 		&self,
 		name: impl Into<String>,
