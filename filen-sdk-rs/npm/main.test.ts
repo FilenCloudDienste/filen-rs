@@ -111,7 +111,7 @@ test("File Streams", async () => {
 		progress: (bytes: bigint) => {
 			progress = bytes
 		},
-		known_size: BigInt(data.length)
+		knownSize: BigInt(data.length)
 	})
 
 	expect(progress).toBe(BigInt(data.length))
@@ -215,7 +215,10 @@ test("Zip Download", async () => {
 	const webStream = Stream.Writable.toWeb(writeStream)
 	await state.downloadItemsToZip({
 		items: [file, dirA],
-		writer: webStream
+		writer: webStream,
+		progress: (_bytesWritten, _totalBytes, _itemsProcessed, _totalItems) => {
+			//
+		}
 	})
 	writeStream.end()
 

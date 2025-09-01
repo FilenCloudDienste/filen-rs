@@ -3,14 +3,20 @@ use std::{borrow::Cow, pin::Pin};
 use chrono::{DateTime, Utc};
 use futures::future;
 use serde::Deserialize;
-use wasm_bindgen::{JsCast, JsValue, prelude::Closure};
-use web_sys::{AbortSignal as WasmAbortSignal, js_sys::JsString};
+use wasm_bindgen::{
+	JsCast, JsValue,
+	prelude::{Closure, wasm_bindgen},
+};
+use web_sys::{
+	AbortSignal as WasmAbortSignal,
+	js_sys::{BigInt, Function, JsString},
+};
 
 use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	error::AbortedError,
-	fs::{dir::UnsharedDirectoryType, file::FileBuilder},
+	fs::{dir::UnsharedDirectoryType, file::FileBuilder, zip::ZipProgressCallback},
 	js::DirEnum,
 };
 
@@ -130,6 +136,7 @@ impl UploadFileParams {
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[derive(Deserialize, Tsify)]
 #[tsify(from_wasm_abi, large_number_types_as_bigints)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadFileStreamParams {
 	#[serde(flatten)]
 	pub file_params: UploadFileParams,
@@ -158,6 +165,7 @@ pub struct UploadFileStreamParams {
 	all(target_arch = "wasm32", target_os = "unknown"),
 	tsify(from_wasm_abi, large_number_types_as_bigints)
 )]
+#[serde(rename_all = "camelCase")]
 pub struct DownloadFileStreamParams {
 	pub file: File,
 	#[cfg_attr(
@@ -183,6 +191,52 @@ pub struct DownloadFileStreamParams {
 	pub abort_signal: AbortSignal,
 }
 
+#[wasm_bindgen]
+unsafe extern "C" {
+	#[wasm_bindgen(extends = Function, is_type_of = JsValue::is_function, typescript_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void")]
+	pub type ZipProgressCallbackJS;
+	#[wasm_bindgen(method, catch, js_name = call)]
+	pub unsafe fn call4(
+		this: &ZipProgressCallbackJS,
+		context: &JsValue,
+		arg1: &JsValue,
+		arg2: &JsValue,
+		arg3: &JsValue,
+		arg4: &JsValue,
+	) -> Result<JsValue, JsValue>;
+}
+
+impl Default for ZipProgressCallbackJS {
+	fn default() -> Self {
+		JsValue::undefined().unchecked_into()
+	}
+}
+
+impl ZipProgressCallbackJS {
+	pub(crate) fn into_rust_callback(self) -> Option<impl ZipProgressCallback> {
+		if self.is_undefined() {
+			None
+		} else {
+			Some(
+				move |bytes_written: u64,
+				      files_dirs_written: u64,
+				      bytes_total: u64,
+				      files_dirs_total: u64| {
+					let _ = unsafe {
+						self.call4(
+							&JsValue::NULL,
+							&BigInt::from(bytes_written).into(),
+							&BigInt::from(files_dirs_written).into(),
+							&BigInt::from(bytes_total).into(),
+							&BigInt::from(files_dirs_total).into(),
+						)
+					};
+				},
+			)
+		}
+	}
+}
+
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[derive(Deserialize)]
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
@@ -190,6 +244,7 @@ pub struct DownloadFileStreamParams {
 	all(target_arch = "wasm32", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
+#[serde(rename_all = "camelCase")]
 pub struct DownloadFileToZipParams {
 	pub items: Vec<Item>,
 	#[cfg_attr(
@@ -203,15 +258,13 @@ pub struct DownloadFileToZipParams {
 	pub writer: web_sys::WritableStream,
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
-		tsify(type = "(bytes: bigint) => void")
-	)]
-	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
 		serde(with = "serde_wasm_bindgen::preserve")
 	)]
+	#[tsify(
+		type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void"
+	)]
 	#[serde(default)]
-	// ignored for now, as the zip writer doesn't currently support progress updates
-	pub progress: js_sys::Function,
+	pub progress: ZipProgressCallbackJS,
 	#[serde(default)]
 	pub abort_signal: AbortSignal,
 }
