@@ -15,7 +15,6 @@ use filen_sdk_rs::{
 		file::{RemoteFile, traits::HasFileInfo},
 	},
 };
-use log::info;
 use tokio::time;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use zip::{ExtraField, read::ZipFile};
@@ -439,6 +438,7 @@ async fn download_to_zip() {
 				UnsharedFSObject::Dir(Cow::Borrowed(&dir_a)),
 			],
 			zip_file,
+			None::<&fn(u64, u64, u64, u64)>,
 		)
 		.await
 		.unwrap();

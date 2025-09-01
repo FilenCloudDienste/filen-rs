@@ -6,30 +6,30 @@ use std::{
 use cmake::Config;
 
 fn main() {
-	println!("cargo:rerun-if-changed=wrapper.h");
-	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "android" {
-		// if we don't bundle libc++ this causes problems on android
-		println!("cargo:rustc-link-lib=static:-bundle=c++");
-	} else if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
-		println!("cargo:rustc-link-lib=c++");
-	}
+	// println!("cargo:rerun-if-changed=wrapper.h");
+	// if env::var("CARGO_CFG_TARGET_OS").unwrap() == "android" {
+	// 	// if we don't bundle libc++ this causes problems on android
+	// 	println!("cargo:rustc-link-lib=static:-bundle=c++");
+	// } else if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
+	// 	println!("cargo:rustc-link-lib=c++");
+	// }
 
-	let libde265_path = build_libde265();
-	let libheif_path = build_libheif(&libde265_path);
+	// let libde265_path = build_libde265();
+	// let libheif_path = build_libheif(&libde265_path);
 
-	let include_path = libheif_path.join("include");
+	// let include_path = libheif_path.join("include");
 
-	let bindings = bindgen::Builder::default()
-		.header("wrapper.h")
-		.clang_arg(format!("-I{}", include_path.display()))
-		.parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-		.generate()
-		.expect("Unable to generate bindings");
+	// let bindings = bindgen::Builder::default()
+	// 	.header("wrapper.h")
+	// 	.clang_arg(format!("-I{}", include_path.display()))
+	// 	.parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+	// 	.generate()
+	// 	.expect("Unable to generate bindings");
 
-	let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-	bindings
-		.write_to_file(out_path.join("bindings.rs"))
-		.expect("Couldn't write bindings!");
+	// let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+	// bindings
+	// 	.write_to_file(out_path.join("bindings.rs"))
+	// 	.expect("Couldn't write bindings!");
 }
 
 fn config_cmake_for_android(config: &mut Config) {

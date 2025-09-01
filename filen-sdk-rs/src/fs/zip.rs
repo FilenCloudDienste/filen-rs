@@ -1,6 +1,9 @@
 use async_zip::spec::header::{ExtraField, UnknownExtraField};
 
-use crate::fs::file::{RemoteFile, traits::HasFileInfo};
+use crate::{
+	fs::file::{RemoteFile, traits::HasFileInfo},
+	util::MaybeSendSync,
+};
 
 struct ZipExtendedTime {
 	modification: Option<u32>,
@@ -124,8 +127,35 @@ fn add_dir_times(
 	])
 }
 
+#[derive(Clone)]
+struct ZipState {
+	bytes_written: u64,
+	total_bytes: u64,
+	items_processed: u64,
+	total_items: u64,
+}
+
+impl ZipState {
+	fn new(total_bytes: u64, total_items: u64) -> Self {
+		Self {
+			bytes_written: 0,
+			total_bytes,
+			items_processed: 0,
+			total_items,
+		}
+	}
+}
+
+pub trait ZipProgressCallback: Fn(u64, u64, u64, u64) + MaybeSendSync {}
+
+impl<T> ZipProgressCallback for T where T: Fn(u64, u64, u64, u64) + MaybeSendSync {}
+
 mod client_impl {
-	use std::{borrow::Cow, cmp::min, sync::Arc};
+	use std::{
+		borrow::Cow,
+		cmp::min,
+		sync::{Arc, Mutex as StdMutex},
+	};
 
 	use async_zip::{ZipEntryBuilder, base::write::ZipFileWriter};
 	use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
@@ -139,7 +169,7 @@ mod client_impl {
 			HasName, HasUUID, UnsharedFSObject,
 			dir::UnsharedDirectoryType,
 			file::{RemoteFile, traits::HasFileInfo},
-			zip::{add_dir_times, add_file_times},
+			zip::{ZipProgressCallback, ZipState, add_dir_times, add_file_times},
 		},
 		util::{MaybeSendBoxFuture, MaybeSendSync},
 	};
@@ -150,6 +180,8 @@ mod client_impl {
 			&self,
 			file: &RemoteFile,
 			zip: Arc<Mutex<ZipFileWriter<impl AsyncWrite + Unpin>>>,
+			state: Arc<StdMutex<ZipState>>,
+			progress_callback: Option<&impl ZipProgressCallback>,
 			parent_path: &str,
 		) -> Result<(), Error> {
 			let file_name = match file.name() {
@@ -183,11 +215,6 @@ mod client_impl {
 			let read = reader.read(&mut initial_buffer).await?;
 
 			let mut zip = zip.lock().await;
-			println!(
-				"Adding file to zip: {}, contents: ",
-				entry.filename().as_str().unwrap(),
-				// String::from_utf8_lossy(initial_buffer[..read].as_ref())
-			);
 			let mut writer = zip.write_entry_stream(entry).await.map_err(|e| {
 				Error::custom(
 					crate::ErrorKind::IO,
@@ -205,6 +232,23 @@ mod client_impl {
 				.close()
 				.await
 				.map_err(|e| Error::custom(crate::ErrorKind::IO, e.to_string()))?;
+			std::mem::drop(zip);
+			let state_clone = {
+				let mut state = state.lock().unwrap();
+				state.bytes_written += file.size();
+				state.items_processed += 1;
+				state.clone()
+			};
+
+			if let Some(callback) = progress_callback {
+				callback(
+					state_clone.bytes_written,
+					state_clone.total_bytes,
+					state_clone.items_processed,
+					state_clone.total_items,
+				);
+			}
+
 			Ok(())
 		}
 
@@ -214,13 +258,17 @@ mod client_impl {
 			&'a self,
 			dir: UnsharedDirectoryType<'a>,
 			zip: Arc<Mutex<ZipFileWriter<T>>>,
+			state: Arc<StdMutex<ZipState>>,
+			progress_callback: Option<&'a impl ZipProgressCallback>,
 			parent_path: &'a str,
 		) -> MaybeSendBoxFuture<'a, Result<(), Error>>
 		where
 			T: AsyncWrite + Unpin + MaybeSendSync + 'a,
 		{
-			Box::pin(async move { self.download_dir_to_zip(&dir, zip, parent_path).await })
-				as MaybeSendBoxFuture<Result<(), Error>>
+			Box::pin(async move {
+				self.download_dir_to_zip(&dir, zip, state, progress_callback, parent_path)
+					.await
+			}) as MaybeSendBoxFuture<Result<(), Error>>
 		}
 
 		/// Parent path is assumed to not have a trailing slash
@@ -228,6 +276,8 @@ mod client_impl {
 			&self,
 			dir: &UnsharedDirectoryType<'_>,
 			zip: Arc<Mutex<ZipFileWriter<T>>>,
+			state: Arc<StdMutex<ZipState>>,
+			progress_callback: Option<&impl ZipProgressCallback>,
 			parent_path: &str,
 		) -> Result<(), Error>
 		where
@@ -246,27 +296,33 @@ mod client_impl {
 			};
 
 			let (dirs, files) = self.list_dir(dir).await?;
+			{
+				let mut state = state.lock().unwrap();
+				state.total_items +=
+					u64::try_from(dirs.len() + files.len()).expect("dir listing to fit in u64");
+				state.total_bytes += files.iter().map(|f| f.size()).sum::<u64>();
+			}
 			let mut futures: FuturesUnordered<MaybeSendBoxFuture<Result<(), Error>>> = dirs
 				.into_iter()
 				.map(|d| {
 					let zip = zip.clone();
+					let state = state.clone();
 					let dir_path = &dir_path;
 					self.download_dir_to_zip_wrapper(
 						UnsharedDirectoryType::Dir(Cow::Owned(d)),
 						zip,
+						state,
+						progress_callback,
 						dir_path,
 					)
 				})
 				.chain(files.into_iter().map(|f| {
 					let zip = zip.clone();
+					let state = state.clone();
 					let dir_path = &dir_path;
 					Box::pin(async move {
-						println!(
-							"Downloading file to zip: {}: {:?}",
-							f.name().unwrap_or("unnamed file"),
-							f
-						);
-						self.download_file_to_zip(&f, zip, dir_path).await
+						self.download_file_to_zip(&f, zip, state, progress_callback, dir_path)
+							.await
 					}) as MaybeSendBoxFuture<Result<(), Error>>
 				}))
 				.collect();
@@ -288,6 +344,20 @@ mod client_impl {
 				zip.write_entry_whole(entry, &[]).await.unwrap();
 			}
 
+			let state_clone = {
+				let mut state = state.lock().unwrap();
+				state.items_processed += 1;
+				state.clone()
+			};
+
+			if let Some(callback) = progress_callback {
+				callback(
+					state_clone.bytes_written,
+					state_clone.total_bytes,
+					state_clone.items_processed,
+					state_clone.total_items,
+				);
+			}
 			Ok(())
 		}
 
@@ -295,22 +365,45 @@ mod client_impl {
 			&self,
 			items: &[UnsharedFSObject<'_>],
 			writer: T,
+			progress_callback: Option<&impl ZipProgressCallback>,
 		) -> Result<T, Error>
 		where
 			T: AsyncWrite + MaybeSendSync + Unpin,
 		{
 			let writer = ZipFileWriter::new(writer);
 			let zip = Arc::new(Mutex::new(writer));
+			let state = Arc::new(StdMutex::new(ZipState::new(
+				items
+					.iter()
+					.filter_map(|i| {
+						if let UnsharedFSObject::File(file) = i {
+							Some(file.size())
+						} else {
+							None
+						}
+					})
+					.sum(),
+				items.len().try_into().expect("items to fit in u64"),
+			)));
 
 			let root_path = "";
 			let mut futures: FuturesUnordered<MaybeSendBoxFuture<Result<(), Error>>> = items
 				.iter()
 				.map(|i| {
 					let zip = zip.clone();
+					let state = state.clone();
 					Box::pin(async move {
 						let dir = match i {
 							UnsharedFSObject::File(f) => {
-								return self.download_file_to_zip(f, zip, root_path).await;
+								return self
+									.download_file_to_zip(
+										f,
+										zip,
+										state,
+										progress_callback,
+										root_path,
+									)
+									.await;
 							}
 							UnsharedFSObject::Dir(cow) => {
 								UnsharedDirectoryType::Dir(Cow::Borrowed(cow))
@@ -319,7 +412,8 @@ mod client_impl {
 								UnsharedDirectoryType::Root(Cow::Borrowed(cow))
 							}
 						};
-						self.download_dir_to_zip(&dir, zip, root_path).await
+						self.download_dir_to_zip(&dir, zip, state, progress_callback, root_path)
+							.await
 					}) as MaybeSendBoxFuture<Result<(), Error>>
 				})
 				.collect();
@@ -367,13 +461,16 @@ mod js_impl {
 				.map(TryInto::try_into)
 				.collect::<Result<Vec<_>, ConversionError>>()
 				.map_err(Error::from)?;
+
+			let progress_callback = params.progress.into_rust_callback();
+
 			let _ = tokio::select! {
 				biased;
 				err = abort_fut => {
 					return Err(JsValue::from(Error::from(err)))
 				},
 				writer = async {
-					self.download_items_to_zip(&items, writer).await
+					self.download_items_to_zip(&items, writer, progress_callback.as_ref()).await
 				} => writer
 			}?;
 			Ok(())
