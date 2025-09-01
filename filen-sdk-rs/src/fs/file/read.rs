@@ -8,7 +8,7 @@ use futures::{StreamExt, stream::FuturesOrdered};
 use crate::{
 	api,
 	auth::Client,
-	consts::{FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
+	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
 	error::{Error, MetadataWasNotDecryptedError},
 	util::MaybeSendBoxFuture,
@@ -23,21 +23,32 @@ pub(super) struct FileReader<'a> {
 	limit: u64,
 	next_chunk_idx: u64,
 	curr_chunk: Option<Cursor<Chunk<'a>>>,
-	futures: FuturesOrdered<MaybeSendBoxFuture<'a, Result<Chunk<'a>, Error>>>,
+	futures: FuturesOrdered<MaybeSendBoxFuture<'a, Result<Cursor<Chunk<'a>>, Error>>>,
 	allocate_chunk_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
 }
 
 impl<'a> FileReader<'a> {
 	pub(crate) fn new(file: &'a dyn File, client: &'a Client) -> Self {
-		let size = file.size(); // adjustable in the future
+		Self::new_for_range(file, client, 0, file.size())
+	}
+
+	pub(crate) fn new_for_range(
+		file: &'a dyn File,
+		client: &'a Client,
+		start: u64,
+		end: u64,
+	) -> Self {
+		let size = file.size();
+		let limit = end.min(size);
+		let index = start.min(limit);
 		let mut new = Self {
 			file,
 			client,
-			index: 0,
-			limit: size,
+			index,
+			limit,
 			curr_chunk: None,
 			futures: FuturesOrdered::new(),
-			next_chunk_idx: 0,
+			next_chunk_idx: index / CHUNK_SIZE_U64,
 			allocate_chunk_future: None,
 		};
 
@@ -87,6 +98,9 @@ impl<'a> FileReader<'a> {
 		}
 		let chunk_idx = self.next_chunk_idx;
 		self.next_chunk_idx += 1;
+
+		let first_chunk = self.index / CHUNK_SIZE_U64 == chunk_idx;
+		let index = self.index;
 		let client = self.client;
 		let file = self.file;
 		self.futures.push_back(Box::pin(async move {
@@ -95,7 +109,14 @@ impl<'a> FileReader<'a> {
 			file.key()
 				.ok_or(MetadataWasNotDecryptedError)?
 				.decrypt_data(out_data.as_mut())?;
-			Ok(out_data)
+
+			Ok(if first_chunk {
+				let mut cursor = Cursor::new(out_data);
+				cursor.set_position(index % CHUNK_SIZE_U64);
+				cursor
+			} else {
+				Cursor::new(out_data)
+			})
 		}));
 	}
 
@@ -108,9 +129,14 @@ impl<'a> FileReader<'a> {
 		// take the chunk out of curr_chunk
 		match self.curr_chunk.take() {
 			Some(mut cursor) => {
-				let read = cursor.read(buf)?;
-				if (TryInto::<usize>::try_into(cursor.position()).unwrap())
-					< cursor.get_ref().as_ref().len()
+				let max_read = match usize::try_from(self.limit - self.index) {
+					Ok(v) => v.min(buf.len()),
+					Err(_) => buf.len(),
+				};
+				let read = cursor.read(&mut buf[..max_read])?;
+				self.index += u64::try_from(read).unwrap();
+				if (cursor.position()) < u64::try_from(cursor.get_ref().as_ref().len()).unwrap()
+					&& self.index < self.limit
 				{
 					// didn't read the whole chunk, put it back and return
 					self.curr_chunk = Some(cursor);
@@ -162,9 +188,9 @@ impl futures::io::AsyncRead for FileReader<'_> {
 		loop {
 			// loop through futures
 			match self.futures.poll_next_unpin(cx) {
-				std::task::Poll::Ready(Some(Ok(data))) => {
+				std::task::Poll::Ready(Some(Ok(cursor))) => {
 					// we have a new chunk, make a cursor and read from it
-					self.curr_chunk = Some(Cursor::new(data));
+					self.curr_chunk = Some(cursor);
 					read += self.read_next_chunk(&mut buf[read..])?;
 					if read >= buf.len() {
 						// we've filled the buffer

@@ -189,6 +189,10 @@ pub struct DownloadFileStreamParams {
 	pub progress: js_sys::Function,
 	#[serde(default)]
 	pub abort_signal: AbortSignal,
+	#[serde(default)]
+	pub start: Option<u64>,
+	#[serde(default)]
+	pub end: Option<u64>,
 }
 
 #[wasm_bindgen]

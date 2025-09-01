@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
 	Error,
 	auth::Client,
-	fs::file::RemoteFile,
+	fs::file::{HasFileInfo, RemoteFile},
 	js::{File, UploadFileParams},
 };
 #[cfg(feature = "node")]
@@ -94,10 +94,13 @@ impl Client {
 				return Err(JsValue::from(Error::from(err)))
 			},
 			res = async {
-				self.download_file_to_writer(
-					&RemoteFile::try_from(params.file).map_err(Error::from)?,
+				let file = RemoteFile::try_from(params.file).map_err(Error::from)?;
+				self.download_file_to_writer_for_range(
+					&file,
 					&mut writer,
 					progress_callback,
+					params.start.unwrap_or(0),
+					params.end.unwrap_or(file.size()),
 				)
 				.await
 			} => res
