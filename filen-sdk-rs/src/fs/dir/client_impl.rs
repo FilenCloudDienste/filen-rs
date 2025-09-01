@@ -8,7 +8,7 @@ use futures::TryFutureExt;
 
 #[cfg(feature = "tokio")]
 use crate::error::ErrorKind;
-use crate::fs::NonRootFSObject;
+use crate::fs::{HasParent, NonRootFSObject};
 use crate::{
 	api,
 	auth::Client,
@@ -434,18 +434,17 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn get_dir_size(
-		&self,
-		dir: &dyn HasUUIDContents,
-		trash: bool,
-	) -> Result<api::v3::dir::size::Response, Error> {
+	pub async fn get_dir_size<T>(&self, dir: &T) -> Result<api::v3::dir::size::Response, Error>
+	where
+		T: HasUUIDContents + HasParent,
+	{
 		api::v3::dir::size::post(
 			self.client(),
 			&api::v3::dir::size::Request {
 				uuid: *dir.uuid(),
 				sharer_id: None,
 				receiver_id: None,
-				trash,
+				trash: *dir.parent() == ParentUuid::Trash,
 			},
 		)
 		.await
