@@ -34,3 +34,12 @@ impl From<NonRootFSObject<'_>> for NonRootObject {
 		}
 	}
 }
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Serialize, Tsify)]
+#[tsify(into_wasm_abi, large_number_types_as_bigints)]
+pub struct DirSizeResponse {
+	pub size: u64,
+	pub files: u64,
+	pub dirs: u64,
+}

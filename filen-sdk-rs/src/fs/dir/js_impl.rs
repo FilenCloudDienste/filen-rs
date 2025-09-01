@@ -4,6 +4,9 @@ use crate::{
 	fs::dir::UnsharedDirectoryType,
 	js::{Dir, DirEnum, File, NonRootObject, Root},
 };
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::{fs::dir::HasContents, js::DirSizeResponse};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[cfg(feature = "node")]
 use napi_derive::napi;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -46,12 +49,55 @@ impl Client {
 	}
 
 	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	async fn list_dir_inner_wasm(&self, parent: &impl HasContents) -> Result<JsValue, Error> {
+		let (dirs, files) = self.list_dir(parent).await?;
+		Ok(tuple_to_jsvalue!(
+			dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+			files.into_iter().map(File::from).collect::<Vec<_>>()
+		))
+	}
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
 		wasm_bindgen(unchecked_return_type = "[Dir[], File[]]", js_name = "listDir")
 	)]
 	pub async fn list_dir_js(&self, dir: DirEnum) -> Result<JsValue, Error> {
-		let (dirs, files) = self.list_dir(&UnsharedDirectoryType::from(dir)).await?;
+		self.list_dir_inner_wasm(&UnsharedDirectoryType::from(dir))
+			.await
+	}
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		wasm_bindgen(unchecked_return_type = "[Dir[], File[]]", js_name = "listRecents")
+	)]
+	pub async fn list_recents_js(&self) -> Result<JsValue, Error> {
+		use filen_types::fs::ParentUuid;
+
+		self.list_dir_inner_wasm(&ParentUuid::Recents).await
+	}
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		wasm_bindgen(unchecked_return_type = "[Dir[], File[]]", js_name = "listFavorites")
+	)]
+	pub async fn list_favorites_js(&self) -> Result<JsValue, Error> {
+		use filen_types::fs::ParentUuid;
+
+		self.list_dir_inner_wasm(&ParentUuid::Favorites).await
+	}
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[wasm_bindgen(
+		unchecked_return_type = "[Dir[], File[]]",
+		js_name = "listDirRecursive"
+	)]
+	pub async fn list_dir_recursive_js(&self, dir: DirEnum) -> Result<JsValue, Error> {
+		let (dirs, files) = self
+			.list_dir_recursive(&UnsharedDirectoryType::from(dir))
+			.await?;
 		Ok(tuple_to_jsvalue!(
 			dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
 			files.into_iter().map(File::from).collect::<Vec<_>>()
@@ -129,5 +175,18 @@ impl Client {
 			.find_item_in_dir(&UnsharedDirectoryType::from(dir), &name_or_uuid)
 			.await?;
 		Ok(item.map(Into::into))
+	}
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[wasm_bindgen(js_name = "getDirSize")]
+	pub async fn get_dir_size_js(&self, dir: Dir) -> Result<DirSizeResponse, Error> {
+		use crate::fs::dir::RemoteDirectory;
+
+		let resp = self.get_dir_size(&RemoteDirectory::from(dir)).await?;
+		Ok(DirSizeResponse {
+			size: resp.size,
+			files: resp.files,
+			dirs: resp.dirs,
+		})
 	}
 }
