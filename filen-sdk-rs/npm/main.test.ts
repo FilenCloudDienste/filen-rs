@@ -1,4 +1,4 @@
-import { login, Client, fromStringified, type Dir, type File } from "./browser/sdk-rs.js"
+import { login, Client, fromStringified, type Dir, type File } from "./bundler/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import { tmpdir } from "os"
 import { createWriteStream, openAsBlob } from "fs"
