@@ -172,7 +172,7 @@ impl Eq for Client {}
 )]
 #[cfg_attr(
 	all(target_arch = "wasm32", target_os = "unknown"),
-	tsify(from_wasm_abi, into_wasm_abi)
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
 #[cfg_attr(feature = "node", napi_derive::napi(object))]
 #[derive(Serialize, Deserialize)]
@@ -184,17 +184,35 @@ pub struct StringifiedClient {
 	pub private_key: String,
 	pub api_key: String,
 	pub auth_version: u32,
+	#[serde(default)]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
+	pub max_parallel_requests: Option<usize>,
+	#[serde(default)]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
+	pub max_io_memory_usage: Option<usize>,
 }
 
 impl Client {
 	pub fn from_stringified(stringified: StringifiedClient) -> Result<Self, ConversionError> {
-		Client::from_strings(
+		Client::from_strings_with_limits(
 			stringified.email,
 			&stringified.root_uuid,
 			&stringified.auth_info,
 			&stringified.private_key,
 			stringified.api_key,
 			stringified.auth_version,
+			stringified
+				.max_parallel_requests
+				.unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
+			stringified
+				.max_io_memory_usage
+				.unwrap_or(crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET),
 		)
 	}
 
@@ -363,6 +381,28 @@ impl Client {
 		api_key: String,
 		version: u32,
 	) -> Result<Self, ConversionError> {
+		Client::from_strings_with_limits(
+			email,
+			root_uuid,
+			auth_info,
+			private_key,
+			api_key,
+			version,
+			crate::consts::MAX_SMALL_PARALLEL_REQUESTS,
+			crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
+		)
+	}
+
+	fn from_strings_with_limits(
+		email: String,
+		root_uuid: &str,
+		auth_info: &str,
+		private_key: &str,
+		api_key: String,
+		version: u32,
+		max_parallel_requests: usize,
+		max_io_memory_usage: usize,
+	) -> Result<Self, ConversionError> {
 		let auth_info = AuthInfo::from_string_and_version(auth_info, version)?;
 		let file_encryption_version = match auth_info {
 			AuthInfo::V1(_) | AuthInfo::V2(_) => V2FILE_ENCRYPTION_VERSION,
@@ -386,10 +426,8 @@ impl Client {
 			private_key,
 			http_client: Arc::new(AuthClient::new(APIKey(api_key))),
 			drive_lock: Mutex::new(None),
-			api_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
-			memory_semaphore: tokio::sync::Semaphore::new(
-				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
-			),
+			api_semaphore: tokio::sync::Semaphore::new(max_parallel_requests),
+			memory_semaphore: tokio::sync::Semaphore::new(max_io_memory_usage),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
 		})
 	}
@@ -446,6 +484,8 @@ impl Client {
 				AuthInfo::V2(_) => 2,
 				AuthInfo::V3(_) => 3,
 			},
+			max_parallel_requests: None,
+			max_io_memory_usage: None,
 		}
 	}
 }
