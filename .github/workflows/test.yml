@@ -86,8 +86,9 @@ jobs:
         with:
           node-version: '24.x'
       - name: Package WASM bundle
-        run: |
-          sh wasm-pack.sh
+        run:
+          | # we use the bundler target because vitest doesn't seem to be able to work with the web target (see https://github.com/vitest-dev/vitest/discussions/4283)
+          sh wasm-pack-bundler.sh
         working-directory: ./filen-sdk-rs
       - name: Run TS tests
         run: |
