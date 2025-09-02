@@ -271,7 +271,8 @@ mod serde_impls {
 		where
 			S: serde::Serializer,
 		{
-			let mut state = serializer.serialize_struct("Dir", 5)?;
+			let num_fields = 4 + if self.color.is_some() { 1 } else { 0 };
+			let mut state = serializer.serialize_struct("Dir", num_fields)?;
 			state.serialize_field("uuid", &self.uuid)?;
 			state.serialize_field("parent", &self.parent)?;
 			if let Some(color) = &self.color {

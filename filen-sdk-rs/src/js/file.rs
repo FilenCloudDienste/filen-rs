@@ -250,7 +250,7 @@ mod serde_impls {
 		where
 			S: serde::Serializer,
 		{
-			let mut state = serializer.serialize_struct("File", 5)?;
+			let mut state = serializer.serialize_struct("File", 8)?;
 			state.serialize_field("uuid", &self.uuid)?;
 			state.serialize_field("parent", &self.parent)?;
 
