@@ -12,6 +12,7 @@ pub mod io;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod js;
 pub mod search;
+pub(crate) mod serde;
 pub mod sync;
 pub mod thumbnail;
 pub mod user;

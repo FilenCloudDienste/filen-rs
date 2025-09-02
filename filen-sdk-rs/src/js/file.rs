@@ -9,9 +9,11 @@ use filen_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+	connect::fs::SharingRole,
 	crypto::{error::ConversionError, file::FileKey},
 	fs::file::{
-		RemoteFile,
+		RemoteFile, RemoteRootFile,
+		enums::RemoteFileType,
 		meta::{DecryptedFileMeta as SDKDecryptedFileMeta, FileMeta as SDKFileMeta},
 	},
 	js::{AsEncodedOrDecoded, EncodedOrDecoded},
@@ -140,7 +142,15 @@ impl TryFrom<FileMeta> for SDKFileMeta<'static> {
 	}
 }
 
-impl<'a> AsEncodedOrDecoded<'a, FileMetaEncoded<'a>, &'a DecryptedFileMeta> for FileMeta {
+impl<'a>
+	AsEncodedOrDecoded<
+		'a,
+		FileMetaEncoded<'a>,
+		&'a DecryptedFileMeta,
+		FileMetaEncoded<'static>,
+		DecryptedFileMeta,
+	> for FileMeta
+{
 	fn as_encoded_or_decoded(
 		&'a self,
 	) -> EncodedOrDecoded<FileMetaEncoded<'a>, &'a DecryptedFileMeta> {
@@ -158,6 +168,19 @@ impl<'a> AsEncodedOrDecoded<'a, FileMetaEncoded<'a>, &'a DecryptedFileMeta> for 
 			FileMeta::RSAEncrypted(data) => {
 				EncodedOrDecoded::Encoded(FileMetaEncoded::RSAEncrypted(Cow::Borrowed(data)))
 			}
+		}
+	}
+
+	fn from_decoded(decoded: DecryptedFileMeta) -> Self {
+		FileMeta::Decoded(decoded)
+	}
+
+	fn from_encoded(encoded: FileMetaEncoded<'static>) -> Self {
+		match encoded {
+			FileMetaEncoded::DecryptedRaw(data) => FileMeta::DecryptedRaw(data.into_owned()),
+			FileMetaEncoded::DecryptedUTF8(data) => FileMeta::DecryptedUTF8(data.into_owned()),
+			FileMetaEncoded::Encrypted(data) => FileMeta::Encrypted(data.into_owned()),
+			FileMetaEncoded::RSAEncrypted(data) => FileMeta::RSAEncrypted(data.into_owned()),
 		}
 	}
 }
@@ -239,6 +262,98 @@ impl TryFrom<File> for RemoteFile {
 	}
 }
 
+#[derive(Tsify)]
+#[tsify(from_wasm_abi, into_wasm_abi)]
+pub struct RootFile {
+	pub uuid: UuidStr,
+	pub size: u64,
+	pub chunks: u64,
+	pub region: String,
+	pub bucket: String,
+	#[tsify(optional, type = "DecryptedDirMeta")]
+	pub meta: FileMeta,
+}
+
+impl TryFrom<RootFile> for RemoteRootFile {
+	type Error = ConversionError;
+	fn try_from(file: RootFile) -> Result<Self, Self::Error> {
+		Ok(RemoteRootFile {
+			uuid: file.uuid,
+			size: file.size,
+			chunks: file.chunks,
+			region: file.region,
+			bucket: file.bucket,
+			meta: file.meta.try_into()?,
+		})
+	}
+}
+
+impl From<RemoteRootFile> for RootFile {
+	fn from(file: RemoteRootFile) -> Self {
+		RootFile {
+			uuid: file.uuid,
+			size: file.size,
+			chunks: file.chunks,
+			region: file.region,
+			bucket: file.bucket,
+			meta: file.meta.into(),
+		}
+	}
+}
+
+#[derive(Tsify, Serialize, Deserialize)]
+#[tsify(from_wasm_abi, into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedFile {
+	pub file: RootFile,
+	pub sharing_role: SharingRole,
+}
+
+impl TryFrom<SharedFile> for crate::connect::fs::SharedFile {
+	type Error = <RemoteRootFile as TryFrom<RootFile>>::Error;
+	fn try_from(shared: SharedFile) -> Result<Self, Self::Error> {
+		Ok(Self {
+			file: shared.file.try_into()?,
+			sharing_role: shared.sharing_role,
+		})
+	}
+}
+
+impl From<crate::connect::fs::SharedFile> for SharedFile {
+	fn from(shared: crate::connect::fs::SharedFile) -> Self {
+		Self {
+			file: shared.file.into(),
+			sharing_role: shared.sharing_role,
+		}
+	}
+}
+
+impl wasm_bindgen::__rt::VectorIntoJsValue for SharedFile {
+	fn vector_into_jsvalue(
+		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+	) -> wasm_bindgen::JsValue {
+		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+	}
+}
+
+#[derive(Tsify, Serialize, Deserialize)]
+#[tsify(from_wasm_abi, into_wasm_abi)]
+#[serde(untagged)]
+pub enum FileEnum {
+	File(File),
+	RootFile(RootFile),
+}
+
+impl TryFrom<FileEnum> for RemoteFileType<'static> {
+	type Error = ConversionError;
+	fn try_from(file: FileEnum) -> Result<Self, Self::Error> {
+		Ok(match file {
+			FileEnum::File(file) => RemoteFileType::File(Cow::Owned(file.try_into()?)),
+			FileEnum::RootFile(file) => RemoteFileType::SharedFile(Cow::Owned(file.try_into()?)),
+		})
+	}
+}
+
 mod serde_impls {
 	use serde::ser::SerializeStruct;
 
@@ -261,24 +376,11 @@ mod serde_impls {
 			state.serialize_field("bucket", &self.bucket)?;
 			state.serialize_field("chunks", &self.chunks)?;
 
-			let encoded_meta = match &self.meta {
-				FileMeta::Decoded(meta) => {
-					state.serialize_field("meta", &meta)?;
-					None
+			match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Decoded(meta) => state.serialize_field("meta", &meta)?,
+				EncodedOrDecoded::Encoded(encoded) => {
+					state.serialize_field(HIDDEN_META_KEY, &encoded)?
 				}
-				FileMeta::DecryptedRaw(meta) => {
-					Some(FileMetaEncoded::DecryptedRaw(Cow::Borrowed(meta)))
-				}
-				FileMeta::DecryptedUTF8(meta) => {
-					Some(FileMetaEncoded::DecryptedUTF8(Cow::Borrowed(meta)))
-				}
-				FileMeta::Encrypted(meta) => Some(FileMetaEncoded::Encrypted(Cow::Borrowed(meta))),
-				FileMeta::RSAEncrypted(meta) => {
-					Some(FileMetaEncoded::RSAEncrypted(Cow::Borrowed(meta)))
-				}
-			};
-			if let Some(encoded_meta) = encoded_meta {
-				state.serialize_field(HIDDEN_META_KEY, &encoded_meta)?;
 			}
 			state.end()
 		}
@@ -308,38 +410,83 @@ mod serde_impls {
 		{
 			let intermediate = FileIntermediate::deserialize(deserializer)?;
 
-			// Handle meta field priority: decoded meta takes precedence over hidden meta
-			let final_meta = if let Some(decoded_meta) = intermediate.meta {
-				FileMeta::Decoded(decoded_meta)
-			} else if let Some(encoded_meta) = intermediate.hidden_meta {
-				match encoded_meta {
-					FileMetaEncoded::DecryptedRaw(data) => {
-						FileMeta::DecryptedRaw(data.into_owned())
-					}
-					FileMetaEncoded::DecryptedUTF8(data) => {
-						FileMeta::DecryptedUTF8(data.into_owned())
-					}
-					FileMetaEncoded::Encrypted(data) => FileMeta::Encrypted(data.into_owned()),
-					FileMetaEncoded::RSAEncrypted(data) => {
-						FileMeta::RSAEncrypted(data.into_owned())
-					}
-				}
-			} else {
-				// this doesn't need to be an allocation
-				return Err(serde::de::Error::custom(format!(
-					"either 'meta' or '{HIDDEN_META_KEY}' field is required"
-				)));
-			};
-
 			Ok(File {
 				uuid: intermediate.uuid,
-				meta: final_meta,
+				meta: FileMeta::from_encoded_or_decoded(
+					intermediate.hidden_meta,
+					intermediate.meta,
+				)
+				.ok_or_else(|| {
+					serde::de::Error::custom(format!(
+						"either 'meta' or '{HIDDEN_META_KEY}' field is required"
+					))
+				})?,
 				parent: intermediate.parent,
 				size: intermediate.size,
 				favorited: intermediate.favorited,
 				region: intermediate.region,
 				bucket: intermediate.bucket,
 				chunks: intermediate.chunks,
+			})
+		}
+	}
+
+	impl Serialize for RootFile {
+		fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+		where
+			S: serde::Serializer,
+		{
+			let mut state = serializer.serialize_struct("RootFile", 6)?;
+			state.serialize_field("uuid", &self.uuid)?;
+			state.serialize_field("size", &self.size)?;
+			state.serialize_field("chunks", &self.chunks)?;
+			state.serialize_field("region", &self.region)?;
+			state.serialize_field("bucket", &self.bucket)?;
+			match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Decoded(meta) => state.serialize_field("meta", &meta)?,
+				EncodedOrDecoded::Encoded(encoded) => {
+					state.serialize_field(HIDDEN_META_KEY, &encoded)?
+				}
+			}
+			state.end()
+		}
+	}
+
+	#[derive(Deserialize)]
+	struct RootFileIntermediate<'a> {
+		uuid: UuidStr,
+		size: u64,
+		chunks: u64,
+		region: String,
+		bucket: String,
+		meta: Option<DecryptedFileMeta>,
+		// HIDDEN_META_KEY
+		#[serde(rename = "__hiddenMeta")]
+		hidden_meta: Option<FileMetaEncoded<'a>>,
+	}
+
+	impl<'de> Deserialize<'de> for RootFile {
+		fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+		where
+			D: serde::Deserializer<'de>,
+		{
+			let intermediate = RootFileIntermediate::deserialize(deserializer)?;
+
+			Ok(RootFile {
+				uuid: intermediate.uuid,
+				size: intermediate.size,
+				chunks: intermediate.chunks,
+				region: intermediate.region,
+				bucket: intermediate.bucket,
+				meta: FileMeta::from_encoded_or_decoded(
+					intermediate.hidden_meta,
+					intermediate.meta,
+				)
+				.ok_or_else(|| {
+					serde::de::Error::custom(format!(
+						"either 'meta' or '{HIDDEN_META_KEY}' field is required"
+					))
+				})?,
 			})
 		}
 	}

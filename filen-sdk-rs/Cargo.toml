@@ -80,6 +80,7 @@ napi-derive = { version = "3.0.0", default-features = false, optional = true }
 async_zip = { git = "https://github.com/Enduriel/rs-async-zip.git", rev = "6ad27fd1010b35de2a96143884c1bce95e939e5e", default-features = false, features = [
 	"chrono",
 ] }
+serde_bytes = "0.11.17"
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 hyper-util = { version = "0.1.16", features = ["client-legacy"] }

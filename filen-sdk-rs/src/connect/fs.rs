@@ -8,6 +8,7 @@ use filen_types::{
 	fs::UuidStr,
 };
 use rsa::RsaPrivateKey;
+use serde::{Deserialize, Serialize};
 
 use crate::{
 	crypto::shared::MetaCrypter,
@@ -18,13 +19,15 @@ use crate::{
 	},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareInfo {
 	pub email: String,
 	pub id: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role")]
+#[serde(rename_all = "camelCase")]
 pub enum SharingRole {
 	Sharer(ShareInfo),
 	Receiver(ShareInfo),
@@ -32,9 +35,9 @@ pub enum SharingRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedDirectory {
-	dir: DirectoryMetaType<'static>,
-	sharing_role: SharingRole,
-	write_access: bool,
+	pub(crate) dir: DirectoryMetaType<'static>,
+	pub(crate) sharing_role: SharingRole,
+	pub(crate) write_access: bool,
 }
 
 struct DirInfo {
@@ -123,8 +126,8 @@ impl SharedDirectory {
 }
 
 pub struct SharedFile {
-	file: RemoteRootFile,
-	sharing_role: SharingRole,
+	pub(crate) file: RemoteRootFile,
+	pub(crate) sharing_role: SharingRole,
 }
 
 impl SharedFile {

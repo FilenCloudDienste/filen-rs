@@ -8,6 +8,10 @@ pub mod remove;
 pub mod status;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	derive(tsify::Tsify)
+)]
 pub enum PublicLinkExpiration {
 	#[serde(rename = "never")]
 	Never,

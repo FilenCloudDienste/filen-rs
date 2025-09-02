@@ -1,11 +1,14 @@
 use crate::{
 	Error,
 	auth::Client,
-	fs::dir::UnsharedDirectoryType,
+	fs::dir::{DirectoryType, UnsharedDirectoryType},
 	js::{Dir, DirEnum, File, NonRootObject, Root},
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use crate::{fs::dir::HasContents, js::DirSizeResponse};
+use crate::{
+	fs::dir::HasContents,
+	js::{AnyDirEnum, DirSizeResponse},
+};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[cfg(feature = "node")]
 use napi_derive::napi;
@@ -13,6 +16,7 @@ use napi_derive::napi;
 use wasm_bindgen::prelude::*;
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[macro_export]
 macro_rules! tuple_to_jsvalue {
 	// Handle direct tuple literals
 	($($element:expr),+ $(,)?) => {{
@@ -139,9 +143,8 @@ impl Client {
 		wasm_bindgen(js_name = "dirExists")
 	)]
 	#[cfg_attr(feature = "node", napi(js_name = "dirExists"))]
-	pub async fn dir_exists_js(&self, parent: DirEnum, name: String) -> Result<(), Error> {
-		self.dir_exists(&UnsharedDirectoryType::from(parent), &name)
-			.await?;
+	pub async fn dir_exists_js(&self, parent: AnyDirEnum, name: String) -> Result<(), Error> {
+		self.dir_exists(&DirectoryType::from(parent), &name).await?;
 		Ok(())
 	}
 
@@ -155,11 +158,11 @@ impl Client {
 	)]
 	pub async fn find_item_in_dir_js(
 		&self,
-		dir: DirEnum,
+		dir: AnyDirEnum,
 		#[wasm_bindgen(js_name = "nameOrUuid")] name_or_uuid: String,
 	) -> Result<Option<NonRootObject>, Error> {
 		let item = self
-			.find_item_in_dir(&UnsharedDirectoryType::from(dir), &name_or_uuid)
+			.find_item_in_dir(&DirectoryType::from(dir), &name_or_uuid)
 			.await?;
 		Ok(item.map(Into::into))
 	}
@@ -168,11 +171,11 @@ impl Client {
 	#[cfg_attr(feature = "node", napi(js_name = "findItemInDir"))]
 	pub async fn find_item_in_dir_js(
 		&self,
-		dir: DirEnum,
+		dir: AnyDirEnum,
 		name_or_uuid: String,
 	) -> Result<Option<NonRootObject>, Error> {
 		let item = self
-			.find_item_in_dir(&UnsharedDirectoryType::from(dir), &name_or_uuid)
+			.find_item_in_dir(&DirectoryType::from(dir), &name_or_uuid)
 			.await?;
 		Ok(item.map(Into::into))
 	}

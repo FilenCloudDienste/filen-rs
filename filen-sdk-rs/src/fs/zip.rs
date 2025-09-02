@@ -1,9 +1,6 @@
 use async_zip::spec::header::{ExtraField, UnknownExtraField};
 
-use crate::{
-	fs::file::{RemoteFile, traits::HasFileInfo},
-	util::MaybeSendSync,
-};
+use crate::{fs::file::traits::File, util::MaybeSendSync};
 
 struct ZipExtendedTime {
 	modification: Option<u32>,
@@ -77,7 +74,7 @@ impl From<ZipNTFSTime> for UnknownExtraField {
 }
 
 fn add_file_times(
-	file: &RemoteFile,
+	file: &impl File,
 	builder: async_zip::ZipEntryBuilder,
 ) -> async_zip::ZipEntryBuilder {
 	let (modified, created) = (file.last_modified(), file.created());
@@ -166,9 +163,9 @@ mod client_impl {
 		Error,
 		auth::Client,
 		fs::{
-			HasName, HasUUID, UnsharedFSObject,
-			dir::UnsharedDirectoryType,
-			file::{RemoteFile, traits::HasFileInfo},
+			FSObject, FsObjectIntoTypes, HasName, HasUUID,
+			dir::DirectoryType,
+			file::traits::{File, HasFileInfo},
 			zip::{ZipProgressCallback, ZipState, add_dir_times, add_file_times},
 		},
 		util::{MaybeSendBoxFuture, MaybeSendSync},
@@ -178,7 +175,7 @@ mod client_impl {
 		/// Parent path is assumed to not have a trailing slash
 		async fn download_file_to_zip(
 			&self,
-			file: &RemoteFile,
+			file: &impl File,
 			zip: Arc<Mutex<ZipFileWriter<impl AsyncWrite + Unpin>>>,
 			state: Arc<StdMutex<ZipState>>,
 			progress_callback: Option<&impl ZipProgressCallback>,
@@ -256,7 +253,7 @@ mod client_impl {
 		/// I'm honestly not sure why this is necessary as a separate function.
 		fn download_dir_to_zip_wrapper<'a, T>(
 			&'a self,
-			dir: UnsharedDirectoryType<'a>,
+			dir: DirectoryType<'a>,
 			zip: Arc<Mutex<ZipFileWriter<T>>>,
 			state: Arc<StdMutex<ZipState>>,
 			progress_callback: Option<&'a impl ZipProgressCallback>,
@@ -274,7 +271,7 @@ mod client_impl {
 		/// Parent path is assumed to not have a trailing slash
 		async fn download_dir_to_zip<T>(
 			&self,
-			dir: &UnsharedDirectoryType<'_>,
+			dir: &DirectoryType<'_>,
 			zip: Arc<Mutex<ZipFileWriter<T>>>,
 			state: Arc<StdMutex<ZipState>>,
 			progress_callback: Option<&impl ZipProgressCallback>,
@@ -284,11 +281,13 @@ mod client_impl {
 			T: AsyncWrite + Unpin + MaybeSendSync,
 		{
 			let dir_path = match dir {
-				UnsharedDirectoryType::Root(_) => Cow::Borrowed(parent_path),
-				UnsharedDirectoryType::Dir(dir) if parent_path.is_empty() => {
+				DirectoryType::Root(_) | DirectoryType::RootWithMeta(_) => {
+					Cow::Borrowed(parent_path)
+				}
+				DirectoryType::Dir(dir) if parent_path.is_empty() => {
 					Cow::Borrowed(dir.name().unwrap_or_else(|| dir.uuid().as_ref()))
 				}
-				UnsharedDirectoryType::Dir(dir) => Cow::Owned(format!(
+				DirectoryType::Dir(dir) => Cow::Owned(format!(
 					"{}/{}",
 					parent_path,
 					dir.name().unwrap_or_else(|| dir.uuid().as_ref())
@@ -309,7 +308,7 @@ mod client_impl {
 					let state = state.clone();
 					let dir_path = &dir_path;
 					self.download_dir_to_zip_wrapper(
-						UnsharedDirectoryType::Dir(Cow::Owned(d)),
+						DirectoryType::Dir(Cow::Owned(d)),
 						zip,
 						state,
 						progress_callback,
@@ -331,7 +330,7 @@ mod client_impl {
 			}
 			std::mem::drop(futures);
 
-			if let UnsharedDirectoryType::Dir(dir) = dir {
+			if let DirectoryType::Dir(dir) = dir {
 				// this is apparently how you add a directory in async-zip
 				// (you add an an empty entry with a trailing slash)
 				// todo initially allocate enough memory for this
@@ -363,7 +362,7 @@ mod client_impl {
 
 		pub async fn download_items_to_zip<T>(
 			&self,
-			items: &[UnsharedFSObject<'_>],
+			items: &[FSObject<'_>],
 			writer: T,
 			progress_callback: Option<&impl ZipProgressCallback>,
 		) -> Result<T, Error>
@@ -375,12 +374,10 @@ mod client_impl {
 			let state = Arc::new(StdMutex::new(ZipState::new(
 				items
 					.iter()
-					.filter_map(|i| {
-						if let UnsharedFSObject::File(file) = i {
-							Some(file.size())
-						} else {
-							None
-						}
+					.filter_map(|i| match i {
+						FSObject::File(f) => Some(f.size()),
+						FSObject::SharedFile(f) => Some(f.size()),
+						_ => None,
 					})
 					.sum(),
 				items.len().try_into().expect("items to fit in u64"),
@@ -393,11 +390,11 @@ mod client_impl {
 					let zip = zip.clone();
 					let state = state.clone();
 					Box::pin(async move {
-						let dir = match i {
-							UnsharedFSObject::File(f) => {
+						let dir = match FsObjectIntoTypes::from(FSObject::from(i)) {
+							FsObjectIntoTypes::File(file) => {
 								return self
 									.download_file_to_zip(
-										f,
+										&file,
 										zip,
 										state,
 										progress_callback,
@@ -405,12 +402,7 @@ mod client_impl {
 									)
 									.await;
 							}
-							UnsharedFSObject::Dir(cow) => {
-								UnsharedDirectoryType::Dir(Cow::Borrowed(cow))
-							}
-							UnsharedFSObject::Root(cow) => {
-								UnsharedDirectoryType::Root(Cow::Borrowed(cow))
-							}
+							FsObjectIntoTypes::Dir(dir) => dir,
 						};
 						self.download_dir_to_zip(&dir, zip, state, progress_callback, root_path)
 							.await

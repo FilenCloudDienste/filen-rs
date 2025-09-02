@@ -39,7 +39,7 @@ pub mod v1;
 pub mod v2;
 pub mod v3;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MetaKey {
 	V1(v2::MetaKey),
 	V2(v2::MetaKey),
@@ -184,8 +184,16 @@ pub struct StringifiedClient {
 	pub private_key: String,
 	pub api_key: String,
 	pub auth_version: u32,
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "number")
+	)]
 	#[serde(default)]
 	pub max_parallel_requests: Option<u32>,
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "number")
+	)]
 	#[serde(default)]
 	pub max_io_memory_usage: Option<u32>,
 }

@@ -8,11 +8,13 @@ use filen_types::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+	connect::fs::SharingRole,
 	fs::{
 		HasUUID,
 		dir::{
-			DecryptedDirectoryMeta as SDKDecryptedDirMeta, RemoteDirectory, RootDirectory,
-			UnsharedDirectoryType, meta::DirectoryMeta,
+			DecryptedDirectoryMeta as SDKDecryptedDirMeta, DirectoryMetaType, DirectoryType,
+			RemoteDirectory, RootDirectory, RootDirectoryWithMeta, UnsharedDirectoryType,
+			meta::DirectoryMeta,
 		},
 	},
 	js::{AsEncodedOrDecoded, EncodedOrDecoded},
@@ -237,7 +239,15 @@ impl From<DirEnum> for UnsharedDirectoryType<'static> {
 	}
 }
 
-impl<'a> AsEncodedOrDecoded<'a, DirMetaEncoded<'a>, &'a DecryptedDirMeta> for DirMeta {
+impl<'a>
+	AsEncodedOrDecoded<
+		'a,
+		DirMetaEncoded<'a>,
+		&'a DecryptedDirMeta,
+		DirMetaEncoded<'static>,
+		DecryptedDirMeta,
+	> for DirMeta
+{
 	fn as_encoded_or_decoded(
 		&'a self,
 	) -> EncodedOrDecoded<DirMetaEncoded<'a>, &'a DecryptedDirMeta> {
@@ -255,6 +265,127 @@ impl<'a> AsEncodedOrDecoded<'a, DirMetaEncoded<'a>, &'a DecryptedDirMeta> for Di
 			DirMeta::RSAEncrypted(data) => {
 				EncodedOrDecoded::Encoded(DirMetaEncoded::RSAEncrypted(Cow::Borrowed(data)))
 			}
+		}
+	}
+
+	fn from_encoded(encoded: DirMetaEncoded<'static>) -> Self {
+		match encoded {
+			DirMetaEncoded::DecryptedRaw(data) => DirMeta::DecryptedRaw(data.into_owned()),
+			DirMetaEncoded::DecryptedUTF8(data) => DirMeta::DecryptedUTF8(data.into_owned()),
+			DirMetaEncoded::Encrypted(data) => DirMeta::Encrypted(data.into_owned()),
+			DirMetaEncoded::RSAEncrypted(data) => DirMeta::RSAEncrypted(data.into_owned()),
+		}
+	}
+
+	fn from_decoded(decoded: DecryptedDirMeta) -> Self {
+		DirMeta::Decoded(decoded)
+	}
+}
+
+#[derive(Clone, PartialEq, Eq, Tsify)]
+#[tsify(from_wasm_abi, into_wasm_abi)]
+pub struct RootWithMeta {
+	pub uuid: UuidStr,
+	#[tsify(optional)]
+	pub color: Option<String>,
+	#[tsify(optional, type = "DecryptedDirMeta")]
+	pub meta: DirMeta,
+}
+
+impl From<RootWithMeta> for RootDirectoryWithMeta {
+	fn from(dir: RootWithMeta) -> Self {
+		RootDirectoryWithMeta::from_meta(dir.uuid, dir.color, dir.meta.into())
+	}
+}
+
+impl From<RootDirectoryWithMeta> for RootWithMeta {
+	fn from(dir: RootDirectoryWithMeta) -> Self {
+		RootWithMeta {
+			uuid: *dir.uuid(),
+			color: dir.color,
+			meta: dir.meta.into(),
+		}
+	}
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(untagged)]
+pub enum DirWithMetaEnum {
+	Dir(Dir),
+	Root(RootWithMeta),
+}
+
+impl From<DirWithMetaEnum> for DirectoryMetaType<'static> {
+	fn from(value: DirWithMetaEnum) -> Self {
+		match value {
+			DirWithMetaEnum::Dir(dir) => DirectoryMetaType::Dir(Cow::Owned(dir.into())),
+			DirWithMetaEnum::Root(root) => DirectoryMetaType::Root(Cow::Owned(root.into())),
+		}
+	}
+}
+
+impl From<DirectoryMetaType<'_>> for DirWithMetaEnum {
+	fn from(value: DirectoryMetaType<'_>) -> Self {
+		match value {
+			DirectoryMetaType::Dir(dir) => DirWithMetaEnum::Dir(dir.into_owned().into()),
+			DirectoryMetaType::Root(dir) => DirWithMetaEnum::Root(dir.into_owned().into()),
+		}
+	}
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[tsify(from_wasm_abi, into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedDir {
+	pub dir: DirWithMetaEnum,
+	pub sharing_role: SharingRole,
+	pub write_access: bool,
+}
+
+impl From<SharedDir> for crate::connect::fs::SharedDirectory {
+	fn from(shared: SharedDir) -> Self {
+		Self {
+			dir: shared.dir.into(),
+			sharing_role: shared.sharing_role,
+			write_access: shared.write_access,
+		}
+	}
+}
+
+impl From<crate::connect::fs::SharedDirectory> for SharedDir {
+	fn from(shared: crate::connect::fs::SharedDirectory) -> Self {
+		Self {
+			dir: shared.dir.into(),
+			sharing_role: shared.sharing_role,
+			write_access: shared.write_access,
+		}
+	}
+}
+
+impl wasm_bindgen::__rt::VectorIntoJsValue for SharedDir {
+	fn vector_into_jsvalue(
+		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+	) -> wasm_bindgen::JsValue {
+		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+	}
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[tsify(into_wasm_abi, from_wasm_abi)]
+#[serde(untagged)]
+pub enum AnyDirEnum {
+	Dir(Dir),
+	RootWithMeta(RootWithMeta),
+	Root(Root),
+}
+
+impl From<AnyDirEnum> for DirectoryType<'static> {
+	fn from(value: AnyDirEnum) -> Self {
+		match value {
+			AnyDirEnum::Dir(dir) => DirectoryType::Dir(Cow::Owned(dir.into())),
+			AnyDirEnum::RootWithMeta(root) => DirectoryType::RootWithMeta(Cow::Owned(root.into())),
+			AnyDirEnum::Root(root) => DirectoryType::Root(Cow::Owned(root.into())),
 		}
 	}
 }
@@ -279,24 +410,11 @@ mod serde_impls {
 				state.serialize_field("color", color)?;
 			}
 			state.serialize_field("favorited", &self.favorited)?;
-			let encoded_meta = match &self.meta {
-				DirMeta::Decoded(meta) => {
-					state.serialize_field("meta", &meta)?;
-					None
+			match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Encoded(encoded) => {
+					state.serialize_field(HIDDEN_META_KEY, &encoded)?
 				}
-				DirMeta::DecryptedRaw(meta) => {
-					Some(DirMetaEncoded::DecryptedRaw(Cow::Borrowed(meta)))
-				}
-				DirMeta::DecryptedUTF8(meta) => {
-					Some(DirMetaEncoded::DecryptedUTF8(Cow::Borrowed(meta)))
-				}
-				DirMeta::Encrypted(meta) => Some(DirMetaEncoded::Encrypted(Cow::Borrowed(meta))),
-				DirMeta::RSAEncrypted(meta) => {
-					Some(DirMetaEncoded::RSAEncrypted(Cow::Borrowed(meta)))
-				}
-			};
-			if let Some(encoded_meta) = encoded_meta {
-				state.serialize_field(HIDDEN_META_KEY, &encoded_meta)?;
+				EncodedOrDecoded::Decoded(decoded) => state.serialize_field("meta", decoded)?,
 			}
 			state.end()
 		}
@@ -321,31 +439,68 @@ mod serde_impls {
 		{
 			let intermediate = DirIntermediate::deserialize(deserializer)?;
 
-			// Handle meta field priority: decoded meta takes precedence over hidden meta
-			let final_meta = if let Some(decoded_meta) = intermediate.meta {
-				DirMeta::Decoded(decoded_meta)
-			} else if let Some(encoded_meta) = intermediate.hidden_meta {
-				match encoded_meta {
-					DirMetaEncoded::DecryptedRaw(data) => DirMeta::DecryptedRaw(data.into_owned()),
-					DirMetaEncoded::DecryptedUTF8(data) => {
-						DirMeta::DecryptedUTF8(data.into_owned())
-					}
-					DirMetaEncoded::Encrypted(data) => DirMeta::Encrypted(data.into_owned()),
-					DirMetaEncoded::RSAEncrypted(data) => DirMeta::RSAEncrypted(data.into_owned()),
-				}
-			} else {
-				// this doesn't need to be an allocation
-				return Err(serde::de::Error::custom(format!(
-					"either 'meta' or '{HIDDEN_META_KEY}' field is required"
-				)));
-			};
-
 			Ok(Dir {
 				uuid: intermediate.uuid,
 				parent: intermediate.parent,
 				color: intermediate.color,
 				favorited: intermediate.favorited,
-				meta: final_meta,
+				meta: DirMeta::from_encoded_or_decoded(intermediate.hidden_meta, intermediate.meta)
+					.ok_or_else(|| {
+						serde::de::Error::custom(format!(
+							"either 'meta' or '{HIDDEN_META_KEY}' field is required"
+						))
+					})?,
+			})
+		}
+	}
+
+	impl Serialize for RootWithMeta {
+		fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+		where
+			S: serde::Serializer,
+		{
+			let num_fields = 2 + if self.color.is_some() { 1 } else { 0 };
+			let mut state = serializer.serialize_struct("RootDirWithMeta", num_fields)?;
+			state.serialize_field("uuid", &self.uuid)?;
+			if let Some(color) = &self.color {
+				state.serialize_field("color", color)?;
+			}
+			match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Encoded(encoded) => {
+					state.serialize_field(HIDDEN_META_KEY, &encoded)?
+				}
+				EncodedOrDecoded::Decoded(decoded) => state.serialize_field("meta", decoded)?,
+			}
+			state.end()
+		}
+	}
+
+	#[derive(Deserialize)]
+	struct RootWithMetaIntermediate<'a> {
+		uuid: UuidStr,
+		color: Option<String>,
+		meta: Option<DecryptedDirMeta>,
+		// HIDDEN_META_KEY
+		#[serde(rename = "__hiddenMeta")]
+		hidden_meta: Option<DirMetaEncoded<'a>>,
+	}
+
+	impl<'de> Deserialize<'de> for RootWithMeta {
+		fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+		where
+			D: serde::Deserializer<'de>,
+		{
+			let intermediate = RootWithMetaIntermediate::deserialize(deserializer)?;
+
+			Ok(RootWithMeta {
+				uuid: intermediate.uuid,
+				color: intermediate.color,
+				meta: DirMeta::from_encoded_or_decoded(intermediate.hidden_meta, intermediate.meta)
+					.ok_or_else(|| {
+						serde::de::Error::custom(format!(
+							"either 'meta' or '{HIDDEN_META_KEY}' field is required"
+						))
+					})?,
 			})
 		}
 	}

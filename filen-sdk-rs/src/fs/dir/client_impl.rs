@@ -34,6 +34,7 @@ enum ObjectMatch<T> {
 }
 
 impl Client {
+	// todo, do not allow using shared dirs here
 	pub async fn create_dir(
 		&self,
 		parent: &dyn HasUUIDContents,

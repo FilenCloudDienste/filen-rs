@@ -7,27 +7,54 @@ import Stream from "stream"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
 
 let state: Client
+let shareClient: Client
 let testDir: Dir
-beforeAll(async () => {
-	const email = process.env.TEST_EMAIL
-	if (!email) {
-		throw new Error("TEST_EMAIL environment variable is not set")
-	}
-	const password = process.env.TEST_PASSWORD
-	if (!password) {
-		throw new Error("TEST_PASSWORD environment variable is not set")
-	}
-	state = await login(email, password)
+// let _shareTestDir: Dir
 
-	const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
-	if (maybeDir) {
-		if (maybeDir.type === "dir") {
-			await state.deleteDirPermanently(maybeDir)
-		} else {
-			throw new Error("Expected testDir to be a Dir, but it was a File")
-		}
-	}
-	testDir = await state.createDir(state.root(), "wasm-test-dir")
+beforeAll(async () => {
+	await Promise.all([
+		(async () => {
+			const email = process.env.TEST_EMAIL
+			if (!email) {
+				throw new Error("TEST_EMAIL environment variable is not set")
+			}
+			const password = process.env.TEST_PASSWORD
+			if (!password) {
+				throw new Error("TEST_PASSWORD environment variable is not set")
+			}
+			state = await login(email, password)
+
+			const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
+			if (maybeDir) {
+				if (maybeDir.type === "dir") {
+					await state.deleteDirPermanently(maybeDir)
+				} else {
+					throw new Error("Expected testDir to be a Dir, but it was a File")
+				}
+			}
+			testDir = await state.createDir(state.root(), "wasm-test-dir")
+		})(),
+		(async () => {
+			const email = process.env.TEST_SHARE_EMAIL
+			if (!email) {
+				throw new Error("TEST_SHARE_EMAIL environment variable is not set")
+			}
+			const password = process.env.TEST_SHARE_PASSWORD
+			if (!password) {
+				throw new Error("TEST_SHARE_PASSWORD environment variable is not set")
+			}
+			shareClient = await login(email, password)
+			// const maybeDir = await shareClient.findItemInDir(shareClient.root(), "wasm-test-dir")
+			// if (maybeDir) {
+			// 	if (maybeDir.type === "dir") {
+			// 		_shareTestDir = maybeDir
+			// 	} else {
+			// 		throw new Error("Expected shareDir to be a Dir, but it was a File")
+			// 	}
+			// }
+			// testDir = await shareClient.createDir(shareClient.root(), "wasm-test-dir")
+		})()
+	])
 }, 30000)
 
 test("login", async () => {
@@ -274,6 +301,50 @@ test("Zip Download", async () => {
 	await compareFileToEntry(map.get("a/file1.txt")!, new TextEncoder().encode("file 1 content"), file1)
 	await compareFileToEntry(map.get("a/b/file2.txt")!, new TextEncoder().encode("file 2 content"), file2)
 	await compareFileToEntry(map.get("a/b/file3.txt")!, new TextEncoder().encode("file 3 content"), file3)
+})
+
+test("sharing", async () => {
+	const dir = await state.createDir(testDir, "share-test-dir")
+	const file = await state.uploadFile(new TextEncoder().encode("shared file content"), {
+		parent: dir,
+		name: "shared-file.txt"
+	})
+
+	const contacts = await state.getContacts()
+	let contact
+	for (const c of contacts) {
+		if (c.email === process.env.TEST_SHARE_EMAIL) {
+			contact = c
+			break
+		}
+	}
+	if (!contact) {
+		const reqUuid = await state.sendContactRequest(process.env.TEST_SHARE_EMAIL!)
+		const reqs = await shareClient.listIncomingContactRequests()
+		const req = reqs.find(r => r.uuid === reqUuid)
+		if (!req) {
+			throw new Error("Contact request not found")
+		}
+		await shareClient.acceptContactRequest(req.uuid)
+		contact = (await state.getContacts()).find(c => c.email === process.env.TEST_SHARE_EMAIL!)!
+	}
+	expect(contact).toBeDefined()
+	const user = await state.makeUserFromContact(contact)
+	await state.shareDir(dir, user)
+	const shared = await state.listOutShared(null, user)
+	console.log("shared", shared)
+	const sharedDir = shared[0].find(d => d.dir.uuid === dir.uuid)
+	expect(sharedDir).toBeDefined()
+	expect(sharedDir.dir.uuid).toEqual(dir.uuid)
+
+	await shareClient.listInShared()
+	const sharedDirs = await shareClient.listInShared()
+	const sharedDirIn = sharedDirs[0].find(d => d.dir.uuid === dir.uuid)
+	expect(sharedDirIn).toBeDefined()
+	const [, files] = await shareClient.listInShared(sharedDirIn.dir)
+	expect(files.find(f => f.file.uuid === file.uuid)).toBeDefined()
+
+	await state.deleteContact(contact.uuid)
 })
 
 afterAll(async () => {

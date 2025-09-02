@@ -136,13 +136,36 @@ mod uuid {
 
 	use serde::{Deserialize, Serialize};
 	use uuid::{Uuid, fmt::Hyphenated};
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	use wasm_bindgen::{
+		convert::{FromWasmAbi, RefFromWasmAbi},
+		describe::WasmDescribe,
+		prelude::wasm_bindgen,
+	};
 
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
 
 	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-	#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+	#[wasm_bindgen(typescript_custom_section)]
 	const TS_PARENT_UUID: &'static str = r#"export type UuidStr = string;"#;
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	impl WasmDescribe for UuidStr {
+		fn describe() {
+			<str as WasmDescribe>::describe();
+		}
+	}
+
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	impl FromWasmAbi for UuidStr {
+		type Abi = <str as RefFromWasmAbi>::Abi;
+
+		unsafe fn from_abi(abi: Self::Abi) -> Self {
+			let s = unsafe { <str>::ref_from_abi(abi) };
+			UuidStr::from_str(&s).expect("Invalid UUID string passed from JS")
+		}
+	}
 
 	impl UuidStr {
 		pub const LENGTH: usize = Hyphenated::LENGTH;

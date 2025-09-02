@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::{
 	Error,
 	auth::Client,
-	fs::file::{HasFileInfo, RemoteFile},
-	js::{File, UploadFileParams},
+	fs::file::{HasFileInfo, enums::RemoteFileType},
+	js::{File, FileEnum, UploadFileParams},
 };
 #[cfg(feature = "node")]
 use napi_derive::napi;
@@ -45,8 +45,8 @@ impl Client {
 		wasm_bindgen(js_name = "downloadFile")
 	)]
 	#[cfg_attr(feature = "node", napi(js_name = "downloadFile"))]
-	pub async fn download_file_js(&self, file: File) -> Result<Vec<u8>, Error> {
-		self.download_file(&RemoteFile::try_from(file)?).await
+	pub async fn download_file_js(&self, file: FileEnum) -> Result<Vec<u8>, Error> {
+		self.download_file(&RemoteFileType::try_from(file)?).await
 	}
 
 	#[cfg_attr(
@@ -75,6 +75,8 @@ impl Client {
 		&self,
 		params: crate::js::DownloadFileStreamParams,
 	) -> Result<(), JsValue> {
+		use crate::fs::file::enums::RemoteFileType;
+
 		let mut writer = wasm_streams::WritableStream::from_raw(params.writer)
 			.try_into_async_write()
 			.map_err(|(e, _)| e)?;
@@ -94,7 +96,7 @@ impl Client {
 				return Err(JsValue::from(Error::from(err)))
 			},
 			res = async {
-				let file = RemoteFile::try_from(params.file).map_err(Error::from)?;
+				let file = RemoteFileType::try_from(params.file).map_err(Error::from)?;
 				self.download_file_to_writer_for_range(
 					&file,
 					&mut writer,

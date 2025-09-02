@@ -57,7 +57,9 @@ impl Client {
 		.await
 	}
 
-	pub async fn list_incoming_contact_requests(&self) -> Result<Vec<ContactRequestIn<'_>>, Error> {
+	pub async fn list_incoming_contact_requests(
+		&self,
+	) -> Result<Vec<ContactRequestIn<'static>>, Error> {
 		api::v3::contacts::requests::r#in::get(self.client())
 			.await
 			.map(|r| r.0)
@@ -65,7 +67,7 @@ impl Client {
 
 	pub async fn list_outgoing_contact_requests(
 		&self,
-	) -> Result<Vec<ContactRequestOut<'_>>, Error> {
+	) -> Result<Vec<ContactRequestOut<'static>>, Error> {
 		api::v3::contacts::requests::out::get(self.client())
 			.await
 			.map(|r| r.0)

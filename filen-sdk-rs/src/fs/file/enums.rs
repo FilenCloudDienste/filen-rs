@@ -13,24 +13,24 @@ use super::{
 	traits::{HasFileInfo, HasRemoteFileInfo},
 };
 
-pub enum RemoteFileType {
-	File(RemoteFile),
-	SharedFile(RemoteRootFile),
+pub enum RemoteFileType<'a> {
+	File(Cow<'a, RemoteFile>),
+	SharedFile(Cow<'a, RemoteRootFile>),
 }
 
-impl From<RemoteFile> for RemoteFileType {
+impl From<RemoteFile> for RemoteFileType<'static> {
 	fn from(file: RemoteFile) -> Self {
-		RemoteFileType::File(file)
+		RemoteFileType::File(Cow::Owned(file))
 	}
 }
 
-impl From<RemoteRootFile> for RemoteFileType {
+impl From<RemoteRootFile> for RemoteFileType<'static> {
 	fn from(file: RemoteRootFile) -> Self {
-		RemoteFileType::SharedFile(file)
+		RemoteFileType::SharedFile(Cow::Owned(file))
 	}
 }
 
-impl HasUUID for RemoteFileType {
+impl HasUUID for RemoteFileType<'_> {
 	fn uuid(&self) -> &UuidStr {
 		match self {
 			RemoteFileType::File(file) => file.uuid(),
@@ -39,7 +39,7 @@ impl HasUUID for RemoteFileType {
 	}
 }
 
-impl HasName for RemoteFileType {
+impl HasName for RemoteFileType<'_> {
 	fn name(&self) -> Option<&str> {
 		match self {
 			RemoteFileType::File(file) => file.name(),
@@ -48,7 +48,7 @@ impl HasName for RemoteFileType {
 	}
 }
 
-impl HasMeta for RemoteFileType {
+impl HasMeta for RemoteFileType<'_> {
 	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
 		match self {
 			RemoteFileType::File(file) => file.get_meta_string(),
@@ -57,13 +57,13 @@ impl HasMeta for RemoteFileType {
 	}
 }
 
-impl HasType for RemoteFileType {
+impl HasType for RemoteFileType<'_> {
 	fn object_type(&self) -> ObjectType {
 		ObjectType::File
 	}
 }
 
-impl HasFileInfo for RemoteFileType {
+impl HasFileInfo for RemoteFileType<'_> {
 	fn mime(&self) -> Option<&str> {
 		match self {
 			RemoteFileType::File(file) => file.mime(),
@@ -107,7 +107,7 @@ impl HasFileInfo for RemoteFileType {
 	}
 }
 
-impl HasRemoteInfo for RemoteFileType {
+impl HasRemoteInfo for RemoteFileType<'_> {
 	fn favorited(&self) -> bool {
 		match self {
 			RemoteFileType::File(file) => file.favorited(),
@@ -116,7 +116,7 @@ impl HasRemoteInfo for RemoteFileType {
 	}
 }
 
-impl HasRemoteFileInfo for RemoteFileType {
+impl HasRemoteFileInfo for RemoteFileType<'_> {
 	fn region(&self) -> &str {
 		match self {
 			RemoteFileType::File(file) => file.region(),
@@ -139,4 +139,4 @@ impl HasRemoteFileInfo for RemoteFileType {
 	}
 }
 
-impl File for RemoteFileType {}
+impl File for RemoteFileType<'_> {}

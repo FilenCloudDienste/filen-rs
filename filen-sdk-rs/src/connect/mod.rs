@@ -15,6 +15,7 @@ use filen_types::{
 use fs::{SharedDirectory, SharedFile};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rsa::RsaPublicKey;
+use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
@@ -31,10 +32,26 @@ use crate::{
 
 pub mod contacts;
 pub mod fs;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub mod js_impls;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	derive(tsify::Tsify)
+)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
+)]
+#[serde(rename_all = "camelCase")]
 pub struct User {
 	email: String,
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "Uint8Array")
+	)]
+	#[serde(with = "crate::serde::rsa_public_key_pkcs1")]
 	public_key: RsaPublicKey,
 	id: u64,
 }
@@ -108,11 +125,19 @@ trait MakePasswordSaltAndHash {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum PasswordState {
-	None,
 	Known(String),
+	#[serde(with = "serde_bytes")]
 	Hashed(Vec<u8>),
+	None,
+}
+
+impl Default for PasswordState {
+	fn default() -> Self {
+		Self::None
+	}
 }
 
 impl PasswordState {
@@ -123,14 +148,37 @@ impl PasswordState {
 			PasswordState::Known(_) => true,
 		}
 	}
+
+	fn is_none(&self) -> bool {
+		matches!(self, PasswordState::None)
+	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	derive(tsify::Tsify)
+)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	tsify(into_wasm_abi, from_wasm_abi)
+)]
+#[serde(rename_all = "camelCase")]
 pub struct FilePublicLink {
 	link_uuid: UuidStr,
+	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "string | Uint8Array")
+	)]
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
+	#[serde(with = "serde_bytes")]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "Uint8Array")
+	)]
 	salt: Vec<u8>,
 }
 
@@ -179,13 +227,33 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	derive(tsify::Tsify)
+)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	tsify(into_wasm_abi, from_wasm_abi)
+)]
+#[serde(rename_all = "camelCase")]
 pub struct DirPublicLink {
 	link_uuid: UuidStr,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	link_key: Option<MetaKey>,
+	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "string | Uint8Array")
+	)]
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	enable_download: bool,
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		tsify(type = "Uint8Array")
+	)]
+	#[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
 	salt: Option<Vec<u8>>,
 }
 
@@ -833,7 +901,7 @@ impl Client {
 		)?)
 	}
 
-	async fn inner_list_out_shared(
+	pub(crate) async fn inner_list_out_shared(
 		&self,
 		dir: Option<&impl HasUUIDContents>,
 		user: Option<&User>,
@@ -877,7 +945,7 @@ impl Client {
 		self.inner_list_out_shared(Some(dir), Some(user)).await
 	}
 
-	async fn inner_list_in_shared(
+	pub(crate) async fn inner_list_in_shared(
 		&self,
 		dir: Option<&impl HasUUIDContents>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {

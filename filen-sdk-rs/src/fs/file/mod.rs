@@ -407,12 +407,12 @@ impl File for RemoteFile {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRootFile {
-	uuid: UuidStr,
-	size: u64,
-	region: String,
-	bucket: String,
-	chunks: u64,
-	meta: FileMeta<'static>,
+	pub(crate) uuid: UuidStr,
+	pub(crate) size: u64,
+	pub(crate) region: String,
+	pub(crate) bucket: String,
+	pub(crate) chunks: u64,
+	pub(crate) meta: FileMeta<'static>,
 }
 
 impl RemoteRootFile {

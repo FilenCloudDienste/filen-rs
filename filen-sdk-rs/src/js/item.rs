@@ -5,8 +5,8 @@ use serde::Deserialize;
 use tsify::Tsify;
 
 use crate::{
-	fs::{UnsharedFSObject, file::RemoteFile},
-	js::{Dir, File, Root},
+	fs::{FSObject, file::RemoteFile},
+	js::{Dir, File, Root, RootFile, RootWithMeta},
 };
 
 #[derive(Deserialize)]
@@ -19,17 +19,21 @@ use crate::{
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum Item {
 	File(File),
+	RootFile(RootFile),
 	Dir(Dir),
+	RootWithMeta(RootWithMeta),
 	Root(Root),
 }
 
-impl TryFrom<Item> for UnsharedFSObject<'static> {
+impl TryFrom<Item> for FSObject<'static> {
 	type Error = <RemoteFile as TryFrom<File>>::Error;
 	fn try_from(value: Item) -> Result<Self, Self::Error> {
 		Ok(match value {
-			Item::Dir(dir) => UnsharedFSObject::Dir(Cow::Owned(dir.into())),
-			Item::Root(root) => UnsharedFSObject::Root(Cow::Owned(root.into())),
-			Item::File(file) => UnsharedFSObject::File(Cow::Owned(file.try_into()?)),
+			Item::Dir(dir) => Self::Dir(Cow::Owned(dir.into())),
+			Item::Root(root) => Self::Root(Cow::Owned(root.into())),
+			Item::File(file) => Self::File(Cow::Owned(file.try_into()?)),
+			Item::RootFile(root_file) => Self::SharedFile(Cow::Owned(root_file.try_into()?)),
+			Item::RootWithMeta(dir) => Self::RootWithMeta(Cow::Owned(dir.into())),
 		})
 	}
 }

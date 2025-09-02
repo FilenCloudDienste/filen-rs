@@ -159,8 +159,8 @@ async fn print_file(
 		return Err(anyhow::anyhow!("No such file: {}", file));
 	};
 	let file = match file {
-		FSObject::File(file) => RemoteFileType::File(file.into_owned()),
-		FSObject::SharedFile(file) => RemoteFileType::SharedFile(file.into_owned()),
+		FSObject::File(file) => RemoteFileType::File(file),
+		FSObject::SharedFile(file) => RemoteFileType::SharedFile(file),
 		_ => return Err(anyhow::anyhow!("Not a file: {}", file_str)),
 	};
 	if file.size() < 1024

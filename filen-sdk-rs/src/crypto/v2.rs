@@ -55,6 +55,25 @@ pub struct MasterKey {
 	pub cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
 }
 
+impl Serialize for MasterKey {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		serializer.serialize_str(&self.key)
+	}
+}
+
+impl<'de> Deserialize<'de> for MasterKey {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let key = String::deserialize(deserializer)?;
+		MasterKey::try_from(key).map_err(serde::de::Error::custom)
+	}
+}
+
 impl MasterKey {
 	fn decrypt_meta_into_v2(
 		&self,
@@ -97,17 +116,24 @@ impl PartialEq for MasterKey {
 }
 impl Eq for MasterKey {}
 
-impl FromStr for MasterKey {
-	type Err = ConversionError;
-	fn from_str(key: &str) -> Result<Self, ConversionError> {
+impl TryFrom<String> for MasterKey {
+	type Error = ConversionError;
+	fn try_from(key: String) -> Result<Self, Self::Error> {
 		let mut derived_key = [0u8; 32];
 		pbkdf2::pbkdf2::<Hmac<Sha512>>(key.as_bytes(), key.as_bytes(), 1, &mut derived_key)?;
 
 		let cipher = <AesGcm<Aes256, NonceSize> as digest::KeyInit>::new(&derived_key.into());
 		Ok(Self {
-			key: key.to_string(),
+			key,
 			cipher: Box::new(cipher),
 		})
+	}
+}
+
+impl FromStr for MasterKey {
+	type Err = <MasterKey as TryFrom<String>>::Error;
+	fn from_str(key: &str) -> Result<Self, Self::Err> {
+		Self::try_from(key.to_string())
 	}
 }
 

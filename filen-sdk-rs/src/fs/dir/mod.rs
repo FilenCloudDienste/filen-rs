@@ -55,11 +55,11 @@ impl HasContents for RootDirectory {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootDirectoryWithMeta {
-	uuid: UuidStr,
+	pub(crate) uuid: UuidStr,
 
-	color: Option<String>,
+	pub(crate) color: Option<String>,
 
-	meta: DirectoryMeta<'static>,
+	pub(crate) meta: DirectoryMeta<'static>,
 }
 
 impl RootDirectoryWithMeta {

@@ -21,7 +21,7 @@ use crate::{
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use crate::js::{File, Item};
+use crate::js::{FileEnum, Item};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use tsify::Tsify;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -103,6 +103,7 @@ pub struct UploadFileParams {
 	#[serde(with = "filen_types::serde::time::optional", default)]
 	pub modified: Option<DateTime<Utc>>,
 	#[serde(default)]
+	#[tsify(type = "string")]
 	pub mime: Option<String>,
 	#[serde(default)]
 	pub abort_signal: AbortSignal,
@@ -167,7 +168,7 @@ pub struct UploadFileStreamParams {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadFileStreamParams {
-	pub file: File,
+	pub file: FileEnum,
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
 		tsify(type = "WritableStream<Uint8Array>")
@@ -190,8 +191,10 @@ pub struct DownloadFileStreamParams {
 	#[serde(default)]
 	pub abort_signal: AbortSignal,
 	#[serde(default)]
+	#[tsify(type = "bigint")]
 	pub start: Option<u64>,
 	#[serde(default)]
+	#[tsify(type = "bigint")]
 	pub end: Option<u64>,
 }
 
