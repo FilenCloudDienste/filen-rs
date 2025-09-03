@@ -328,7 +328,7 @@ async fn set_up_contact<'a>(
 			while (out_futures.next().await).is_some() {}
 		},
 		async {
-			let (in_dirs, in_files) = client.list_in_shared().await.unwrap();
+			let (in_dirs, in_files) = share_client.list_in_shared().await.unwrap();
 
 			let mut in_futures = in_dirs
 				.into_iter()
