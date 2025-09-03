@@ -212,7 +212,7 @@ async fn size() {
 	let test_dir = &resources.dir;
 
 	assert_eq!(
-		client.get_dir_size(test_dir, false).await.unwrap(),
+		client.get_dir_size(test_dir).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
 			size: 0,
 			files: 0,
@@ -223,7 +223,7 @@ async fn size() {
 	client.create_dir(test_dir, "a".to_string()).await.unwrap();
 	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
 	assert_eq!(
-		client.get_dir_size(test_dir, false).await.unwrap(),
+		client.get_dir_size(test_dir).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
 			size: 0,
 			files: 0,
@@ -234,7 +234,7 @@ async fn size() {
 	client.create_dir(test_dir, "b".to_string()).await.unwrap();
 	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
 	assert_eq!(
-		client.get_dir_size(test_dir, false).await.unwrap(),
+		client.get_dir_size(test_dir).await.unwrap(),
 		filen_types::api::v3::dir::size::Response {
 			size: 0,
 			files: 0,
@@ -434,8 +434,8 @@ async fn download_to_zip() {
 	let zip_file = client
 		.download_items_to_zip(
 			&[
-				UnsharedFSObject::File(Cow::Borrowed(&file)),
-				UnsharedFSObject::Dir(Cow::Borrowed(&dir_a)),
+				FSObject::File(Cow::Borrowed(&file)),
+				FSObject::Dir(Cow::Borrowed(&dir_a)),
 			],
 			zip_file,
 			None::<&fn(u64, u64, u64, u64)>,
