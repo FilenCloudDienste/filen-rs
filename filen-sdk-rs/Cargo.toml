@@ -44,7 +44,9 @@ argon2 = { version = "0.5.3", features = ["std"] }
 serde_path_to_error = "0.1.17"
 sha1 = "0.10.6"
 futures = "0.3.31"
-mime_guess = "2.0.5"
+# custom version here because the base crate doesn't support image/qoi
+# until https://github.com/abonander/mime_guess/pull/101 is merged and released
+mime_guess = { git = "https://github.com/Enduriel/mime_guess", rev = "a65301ae52c812be31a2d1203f006a880c7206b3" }
 md2 = "0.10.2"
 md4 = "0.10.2"
 md-5 = "0.10.6"
