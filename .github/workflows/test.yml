@@ -49,8 +49,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
+      - name: Install dependencies for avif-decoder (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y libdav1d-dev pkg-config
+      - name: Install dependencies for avif-decoder (windows)
+        if: runner.os == 'Windows'
+        run: |
+          git clone https://github.com/Microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat
+          choco install pkgconfiglite
+          vcpkg install dav1d:x64-windows
+          echo "PKG_CONFIG_PATH=$env:C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
+      - name: Install dependencies for avif-decoder (macos)
+        if: runner.os == 'macOS'
+        run: |
+          brew install dav1d pkg-config
       - name: Run tests
-        run: cargo test -F tokio,malformed,heif-decoder
+        run: cargo test -F tokio,malformed,heif-decoder,avif-decoder
         env:
           TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
           TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
