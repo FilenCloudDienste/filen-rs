@@ -11,6 +11,7 @@ default = []
 tokio = ["tokio/rt", "tokio-stream", "tokio-util"]
 malformed = []
 heif-decoder = ["dep:heif-decoder"]
+avif-decoder = ["image/avif-native"]
 node = ["dep:napi", "dep:napi-derive", "filen-types/node"]
 
 [dependencies]
@@ -55,7 +56,6 @@ image = { version = "0.25.6", default-features = false, features = [
 	"tiff",
 	"webp",
 	"qoi",
-	"avif",
 ] }
 tokio = { version = "1.47.1", default-features = false, features = [
 	"sync",
