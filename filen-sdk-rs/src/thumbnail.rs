@@ -25,10 +25,6 @@ const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
 	"image/x-qoi",
 ];
 
-#[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
-	wasm_bindgen::prelude::wasm_bindgen(js_name = "isSupportedThumbnailMime")
-)]
 pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
 	SUPPORTED_THUMBNAIL_MIME_TYPES.contains(&mime)
 }

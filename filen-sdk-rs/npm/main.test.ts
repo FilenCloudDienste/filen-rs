@@ -1,4 +1,4 @@
-import { login, Client, fromStringified, type Dir, type File, isSupportedThumbnailMime } from "./bundler/sdk-rs.js"
+import { login, Client, fromStringified, type Dir, type File } from "./bundler/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import { tmpdir } from "os"
 import { createWriteStream, openAsBlob } from "fs"
@@ -370,7 +370,7 @@ test.only("thumbnail", async () => {
 				name: `${img}.${ext}`
 			})
 
-			if (!isSupportedThumbnailMime(file.meta?.mime || "")) {
+			if (!file.canMakeThumbnail) {
 				console.warn(`Skipping thumbnail test for unsupported mime type: ${file.meta?.mime}`)
 				return
 			}

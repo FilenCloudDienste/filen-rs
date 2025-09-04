@@ -17,6 +17,7 @@ use crate::{
 		meta::{DecryptedFileMeta as SDKDecryptedFileMeta, FileMeta as SDKFileMeta},
 	},
 	js::{AsEncodedOrDecoded, EncodedOrDecoded},
+	thumbnail::is_supported_thumbnail_mime,
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -192,6 +193,7 @@ impl<'a>
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
 )]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[serde(rename_all = "camelCase")]
 pub struct File {
 	pub uuid: UuidStr,
 	#[cfg_attr(
@@ -215,6 +217,9 @@ pub struct File {
 		tsify(type = "bigint")
 	)]
 	pub chunks: u64,
+	// JS only field, indicates if the file can have a thumbnail generated
+	// this is here to avoid having to call into WASM to check mime types
+	pub can_make_thumbnail: bool,
 }
 
 #[cfg(feature = "node")]
@@ -233,9 +238,15 @@ impl wasm_bindgen::__rt::VectorIntoJsValue for File {
 
 impl From<RemoteFile> for File {
 	fn from(file: RemoteFile) -> Self {
+		let meta = file.meta.into();
 		File {
+			can_make_thumbnail: if let FileMeta::Decoded(meta) = &meta {
+				is_supported_thumbnail_mime(&meta.mime)
+			} else {
+				false
+			},
 			uuid: file.uuid,
-			meta: file.meta.into(),
+			meta,
 			parent: file.parent,
 			size: file.size,
 			favorited: file.favorited,
@@ -264,6 +275,7 @@ impl TryFrom<File> for RemoteFile {
 
 #[derive(Tsify)]
 #[tsify(from_wasm_abi, into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
 pub struct RootFile {
 	pub uuid: UuidStr,
 	pub size: u64,
@@ -272,6 +284,9 @@ pub struct RootFile {
 	pub bucket: String,
 	#[tsify(optional, type = "DecryptedDirMeta")]
 	pub meta: FileMeta,
+	// JS only field, indicates if the file can have a thumbnail generated
+	// this is here to avoid having to call into WASM to check mime types
+	pub can_make_thumbnail: bool,
 }
 
 impl TryFrom<RootFile> for RemoteRootFile {
@@ -290,13 +305,19 @@ impl TryFrom<RootFile> for RemoteRootFile {
 
 impl From<RemoteRootFile> for RootFile {
 	fn from(file: RemoteRootFile) -> Self {
+		let meta = file.meta.into();
 		RootFile {
+			can_make_thumbnail: if let FileMeta::Decoded(meta) = &meta {
+				is_supported_thumbnail_mime(&meta.mime)
+			} else {
+				false
+			},
 			uuid: file.uuid,
 			size: file.size,
 			chunks: file.chunks,
 			region: file.region,
 			bucket: file.bucket,
-			meta: file.meta.into(),
+			meta,
 		}
 	}
 }
@@ -375,6 +396,7 @@ mod serde_impls {
 			state.serialize_field("region", &self.region)?;
 			state.serialize_field("bucket", &self.bucket)?;
 			state.serialize_field("chunks", &self.chunks)?;
+			state.serialize_field("canMakeThumbnail", &self.can_make_thumbnail)?;
 
 			match self.meta.as_encoded_or_decoded() {
 				EncodedOrDecoded::Decoded(meta) => state.serialize_field("meta", &meta)?,
@@ -427,6 +449,7 @@ mod serde_impls {
 				region: intermediate.region,
 				bucket: intermediate.bucket,
 				chunks: intermediate.chunks,
+				can_make_thumbnail: false,
 			})
 		}
 	}
@@ -442,6 +465,7 @@ mod serde_impls {
 			state.serialize_field("chunks", &self.chunks)?;
 			state.serialize_field("region", &self.region)?;
 			state.serialize_field("bucket", &self.bucket)?;
+			state.serialize_field("canMakeThumbnail", &self.can_make_thumbnail)?;
 			match self.meta.as_encoded_or_decoded() {
 				EncodedOrDecoded::Decoded(meta) => state.serialize_field("meta", &meta)?,
 				EncodedOrDecoded::Encoded(encoded) => {
@@ -487,6 +511,7 @@ mod serde_impls {
 						"either 'meta' or '{HIDDEN_META_KEY}' field is required"
 					))
 				})?,
+				can_make_thumbnail: false,
 			})
 		}
 	}
