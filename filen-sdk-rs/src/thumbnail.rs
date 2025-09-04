@@ -2,7 +2,131 @@ use std::io::{BufRead, Seek, Write};
 
 use image::{DynamicImage, ImageReader, codecs::webp::WebPEncoder, imageops::FilterType};
 
-use crate::error::Error;
+use crate::{
+	ErrorKind,
+	auth::Client,
+	error::{Error, MetadataWasNotDecryptedError},
+	fs::file::{RemoteFile, traits::HasFileInfo},
+};
+
+const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
+	#[cfg(feature = "avif-decoder")]
+	"image/avif",
+	#[cfg(feature = "heif-decoder")]
+	"image/heic",
+	#[cfg(feature = "heif-decoder")]
+	"image/heif",
+	"image/jpeg",
+	"image/gif",
+	"image/png",
+	"image/tiff",
+	"image/webp",
+	"image/qoi",
+	"image/x-qoi",
+];
+
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "isSupportedThumbnailMime")
+)]
+pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
+	SUPPORTED_THUMBNAIL_MIME_TYPES.contains(&mime)
+}
+
+impl Client {
+	pub async fn make_thumbnail_in_memory(
+		&self,
+		file: &RemoteFile,
+		max_width: u32,
+		max_height: u32,
+	) -> Result<DynamicImage, Error> {
+		let mime = file.mime().ok_or(MetadataWasNotDecryptedError)?;
+		if !is_supported_thumbnail_mime(mime) {
+			return Err(Error::custom(
+				ErrorKind::ImageError,
+				format!("unsupported thumbnail mime type: {mime}"),
+			));
+		}
+		let image_data = self.download_file(file).await?;
+
+		let image = if mime == "image/heic" || mime == "image/heif" {
+			#[cfg(feature = "heif-decoder")]
+			{
+				DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_slice(&image_data)?)
+			}
+			#[cfg(not(feature = "heif-decoder"))]
+			{
+				unreachable!(
+					"heif/heic support not enabled, should be handled by is_supported_thumbnail_mime"
+				)
+			}
+		} else {
+			image::load_from_memory(&image_data)?
+		};
+
+		Ok(image.resize(max_width, max_height, FilterType::CatmullRom))
+	}
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod js_impls {
+	use serde::{Deserialize, Serialize};
+	use serde_bytes::ByteBuf;
+	use tsify::Tsify;
+	use wasm_bindgen::prelude::wasm_bindgen;
+
+	use crate::{Error, auth::Client, fs::file::RemoteFile, js::File};
+
+	#[derive(Deserialize, Tsify)]
+	#[serde(rename_all = "camelCase")]
+	#[tsify(from_wasm_abi)]
+	pub struct MakeThumbnailInMemoryParams {
+		pub file: File,
+		pub max_width: u32,
+		pub max_height: u32,
+	}
+
+	#[derive(Serialize, Tsify)]
+	#[serde(rename_all = "camelCase")]
+	#[tsify(into_wasm_abi)]
+	pub struct MakeThumbnailInMemoryResult {
+		pub image_data: ByteBuf,
+		pub width: u32,
+		pub height: u32,
+	}
+
+	#[wasm_bindgen]
+	impl Client {
+		#[wasm_bindgen(js_name = "makeThumbnailInMemory")]
+		pub async fn make_thumbnail_in_memory_js(
+			&self,
+			params: MakeThumbnailInMemoryParams,
+		) -> Result<Option<MakeThumbnailInMemoryResult>, Error> {
+			let image = match self
+				.make_thumbnail_in_memory(
+					&RemoteFile::try_from(params.file)?,
+					params.max_width,
+					params.max_height,
+				)
+				.await
+			{
+				Ok(image) => image,
+				Err(e) => {
+					log::warn!("failed to create thumbnail: {}", e);
+					return Ok(None);
+				}
+			};
+			let width = image.width();
+			let height = image.height();
+
+			Ok(Some(MakeThumbnailInMemoryResult {
+				image_data: ByteBuf::from(image.into_rgba8().into_vec()),
+				width,
+				height,
+			}))
+		}
+	}
+}
 
 pub fn make_thumbnail<R, W>(
 	mime: Option<&str>,

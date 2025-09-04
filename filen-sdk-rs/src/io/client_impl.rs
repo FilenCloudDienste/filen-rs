@@ -51,6 +51,10 @@ impl Client {
 		Ok(())
 	}
 
+	// this could be optimized to avoid allocations by downloading directly to the writer
+	// would need to allocate a buffer of file.size() + FILE_CHUNK_SIZE_EXTRA
+	// and download to it sequentially, decrypting in place
+	// and finally shrinking the buffer to file.size()
 	pub async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, crate::error::Error> {
 		let mut writer = Vec::with_capacity(file.size() as usize);
 		self.download_file_to_writer(file, &mut writer, None)

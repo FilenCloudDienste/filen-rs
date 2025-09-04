@@ -1,10 +1,11 @@
-import { login, Client, fromStringified, type Dir, type File } from "./bundler/sdk-rs.js"
+import { login, Client, fromStringified, type Dir, type File, isSupportedThumbnailMime } from "./bundler/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import { tmpdir } from "os"
 import { createWriteStream, openAsBlob } from "fs"
 import "dotenv/config"
 import Stream from "stream"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
+import sharp from "sharp"
 
 let state: Client
 let shareClient: Client
@@ -345,6 +346,68 @@ test("sharing", async () => {
 	expect(files.find(f => f.file.uuid === file.uuid)).toBeDefined()
 
 	await state.deleteContact(contact.uuid)
+})
+
+test.only("thumbnail", async () => {
+	const imgs = [
+		["parrot", "avif"],
+		["parrot", "heif"],
+		["parrot", "gif"],
+		["parrot", "jpg"],
+		["parrot", "png"],
+		["parrot", "qoi"],
+		["parrot", "tiff"],
+		["parrot", "webp"]
+	]
+
+	const completed: string[] = []
+
+	await Promise.all(
+		imgs.map(async ([img, ext]) => {
+			const parrotImage = await openAsBlob(`test_imgs/${img}.${ext}`)
+			const file = await state.uploadFile(await parrotImage.bytes(), {
+				parent: testDir,
+				name: `${img}.${ext}`
+			})
+
+			if (!isSupportedThumbnailMime(file.meta?.mime || "")) {
+				console.warn(`Skipping thumbnail test for unsupported mime type: ${file.meta?.mime}`)
+				return
+			}
+
+			const thumb = await state.makeThumbnailInMemory({
+				file: file,
+				maxHeight: 100,
+				maxWidth: 100
+			})
+
+			expect(thumb).toBeDefined()
+			expect(thumb?.height).toBeLessThanOrEqual(100)
+			expect(thumb?.width).toBeLessThanOrEqual(100)
+			await expect(
+				sharp(thumb!.imageData, {
+					raw: {
+						width: thumb!.width,
+						height: thumb!.height,
+						channels: 4
+					}
+				})
+					.png()
+					.toArray()
+			).resolves.toBeDefined()
+			completed.push(ext)
+		})
+	)
+
+	// avif and heic do not currently work
+	expect(completed).not.toContainEqual("avif")
+	expect(completed).toContainEqual("gif")
+	expect(completed).not.toContainEqual("heif")
+	expect(completed).toContainEqual("jpg")
+	expect(completed).toContainEqual("png")
+	expect(completed).toContainEqual("tiff")
+	expect(completed).toContainEqual("qoi")
+	expect(completed).toContainEqual("webp")
 })
 
 afterAll(async () => {
