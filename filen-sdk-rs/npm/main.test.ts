@@ -348,7 +348,7 @@ test("sharing", async () => {
 	await state.deleteContact(contact.uuid)
 })
 
-test.only("thumbnail", async () => {
+test("thumbnail", async () => {
 	const imgs = [
 		["parrot", "avif"],
 		["parrot", "heif"],
