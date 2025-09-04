@@ -9,24 +9,25 @@ use crate::{
 	fs::file::{RemoteFile, traits::HasFileInfo},
 };
 
+// MUST BE SORTED ALPHABETICALLY
 const SUPPORTED_THUMBNAIL_MIME_TYPES: &[&str] = &[
 	#[cfg(feature = "avif-decoder")]
 	"image/avif",
+	"image/gif",
 	#[cfg(feature = "heif-decoder")]
 	"image/heic",
 	#[cfg(feature = "heif-decoder")]
 	"image/heif",
 	"image/jpeg",
-	"image/gif",
 	"image/png",
+	"image/qoi",
 	"image/tiff",
 	"image/webp",
-	"image/qoi",
 	"image/x-qoi",
 ];
 
 pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
-	SUPPORTED_THUMBNAIL_MIME_TYPES.contains(&mime)
+	SUPPORTED_THUMBNAIL_MIME_TYPES.binary_search(&mime).is_ok()
 }
 
 impl Client {
