@@ -57,7 +57,7 @@ jobs:
           C:\vcpkg\bootstrap-vcpkg.bat
           choco install pkgconfiglite
           vcpkg install dav1d:x64-windows
-          echo "PKG_CONFIG_PATH=$env:C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
 
