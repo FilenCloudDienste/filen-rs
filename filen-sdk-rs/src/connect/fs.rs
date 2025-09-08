@@ -20,12 +20,20 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	derive(tsify::Tsify)
+)]
 pub struct ShareInfo {
 	pub email: String,
 	pub id: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	derive(tsify::Tsify)
+)]
 #[serde(tag = "role")]
 #[serde(rename_all = "camelCase")]
 pub enum SharingRole {
