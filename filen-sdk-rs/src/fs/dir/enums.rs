@@ -2,8 +2,12 @@ use std::borrow::Cow;
 
 use filen_types::fs::{ObjectType, UuidStr};
 
-use crate::fs::{
-	HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, UnsharedFSObject, dir::meta::DirectoryMeta,
+use crate::{
+	connect::fs::SharedDirectory,
+	fs::{
+		HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, UnsharedFSObject,
+		dir::meta::DirectoryMeta,
+	},
 };
 
 use super::{
@@ -56,6 +60,47 @@ impl From<RootDirectoryWithMeta> for DirectoryType<'static> {
 impl From<RemoteDirectory> for DirectoryType<'static> {
 	fn from(dir: RemoteDirectory) -> Self {
 		DirectoryType::Dir(Cow::Owned(dir))
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectoryTypeWithShareInfo<'a> {
+	Root(Cow<'a, RootDirectory>),
+	SharedDir(Cow<'a, SharedDirectory>),
+	Dir(Cow<'a, RemoteDirectory>),
+}
+
+impl<'a> From<&'a RootDirectory> for DirectoryTypeWithShareInfo<'a> {
+	fn from(dir: &'a RootDirectory) -> Self {
+		DirectoryTypeWithShareInfo::Root(Cow::Borrowed(dir))
+	}
+}
+
+impl<'a> From<&'a SharedDirectory> for DirectoryTypeWithShareInfo<'a> {
+	fn from(dir: &'a SharedDirectory) -> Self {
+		DirectoryTypeWithShareInfo::SharedDir(Cow::Borrowed(dir))
+	}
+}
+
+impl<'a> From<&'a RemoteDirectory> for DirectoryTypeWithShareInfo<'a> {
+	fn from(dir: &'a RemoteDirectory) -> Self {
+		DirectoryTypeWithShareInfo::Dir(Cow::Borrowed(dir))
+	}
+}
+
+impl<'a> From<&'a DirectoryTypeWithShareInfo<'_>> for DirectoryTypeWithShareInfo<'a> {
+	fn from(dir: &'a DirectoryTypeWithShareInfo<'_>) -> Self {
+		match dir {
+			DirectoryTypeWithShareInfo::Root(dir) => {
+				DirectoryTypeWithShareInfo::Root(Cow::Borrowed(dir))
+			}
+			DirectoryTypeWithShareInfo::SharedDir(dir) => {
+				DirectoryTypeWithShareInfo::SharedDir(Cow::Borrowed(dir))
+			}
+			DirectoryTypeWithShareInfo::Dir(dir) => {
+				DirectoryTypeWithShareInfo::Dir(Cow::Borrowed(dir))
+			}
+		}
 	}
 }
 

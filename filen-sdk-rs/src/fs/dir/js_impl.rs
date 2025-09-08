@@ -7,7 +7,7 @@ use crate::{
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
 	fs::dir::HasContents,
-	js::{AnyDirEnum, DirSizeResponse},
+	js::{AnyDirEnum, AnyDirEnumWithShareInfo, DirSizeResponse},
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[cfg(feature = "node")]
@@ -182,10 +182,15 @@ impl Client {
 
 	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	#[wasm_bindgen(js_name = "getDirSize")]
-	pub async fn get_dir_size_js(&self, dir: Dir) -> Result<DirSizeResponse, Error> {
-		use crate::fs::dir::RemoteDirectory;
+	pub async fn get_dir_size_js(
+		&self,
+		dir: AnyDirEnumWithShareInfo,
+	) -> Result<DirSizeResponse, Error> {
+		use crate::fs::dir::DirectoryTypeWithShareInfo;
 
-		let resp = self.get_dir_size(&RemoteDirectory::from(dir)).await?;
+		let resp = self
+			.get_dir_size(&DirectoryTypeWithShareInfo::from(dir))
+			.await?;
 		Ok(DirSizeResponse {
 			size: resp.size,
 			files: resp.files,

@@ -6,8 +6,10 @@ use chrono::{DateTime, Utc};
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
 
+use crate::connect::fs::{ShareInfo, SharingRole};
 #[cfg(feature = "tokio")]
 use crate::error::ErrorKind;
+use crate::fs::dir::DirectoryTypeWithShareInfo;
 use crate::fs::{HasParent, NonRootFSObject};
 use crate::{
 	api,
@@ -435,20 +437,42 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn get_dir_size<T>(&self, dir: &T) -> Result<api::v3::dir::size::Response, Error>
+	pub async fn get_dir_size<'a, T>(
+		&self,
+		dir: &'a T,
+	) -> Result<api::v3::dir::size::Response, Error>
 	where
-		T: HasUUIDContents + HasParent,
+		&'a T: Into<DirectoryTypeWithShareInfo<'a>>,
 	{
-		api::v3::dir::size::post(
-			self.client(),
-			&api::v3::dir::size::Request {
-				uuid: *dir.uuid(),
+		let request = match dir.into() {
+			DirectoryTypeWithShareInfo::Root(r) => api::v3::dir::size::Request {
+				uuid: *r.uuid(),
 				sharer_id: None,
 				receiver_id: None,
-				trash: *dir.parent() == ParentUuid::Trash,
+				trash: false,
 			},
-		)
-		.await
+			DirectoryTypeWithShareInfo::Dir(d) => api::v3::dir::size::Request {
+				uuid: *d.uuid(),
+				sharer_id: None,
+				receiver_id: None,
+				trash: *d.parent() == ParentUuid::Trash,
+			},
+			DirectoryTypeWithShareInfo::SharedDir(d) => api::v3::dir::size::Request {
+				uuid: *d.dir.uuid(),
+				sharer_id: if let SharingRole::Sharer(ShareInfo { id, .. }) = d.sharing_role {
+					Some(id)
+				} else {
+					None
+				},
+				receiver_id: if let SharingRole::Receiver(ShareInfo { id, .. }) = d.sharing_role {
+					Some(id)
+				} else {
+					None
+				},
+				trash: false,
+			},
+		};
+		api::v3::dir::size::post(self.client(), &request).await
 	}
 }
 

@@ -13,8 +13,8 @@ use crate::{
 		HasUUID,
 		dir::{
 			DecryptedDirectoryMeta as SDKDecryptedDirMeta, DirectoryMetaType, DirectoryType,
-			RemoteDirectory, RootDirectory, RootDirectoryWithMeta, UnsharedDirectoryType,
-			meta::DirectoryMeta,
+			DirectoryTypeWithShareInfo, RemoteDirectory, RootDirectory, RootDirectoryWithMeta,
+			UnsharedDirectoryType, meta::DirectoryMeta,
 		},
 	},
 	js::{AsEncodedOrDecoded, EncodedOrDecoded},
@@ -386,6 +386,31 @@ impl From<AnyDirEnum> for DirectoryType<'static> {
 			AnyDirEnum::Dir(dir) => DirectoryType::Dir(Cow::Owned(dir.into())),
 			AnyDirEnum::RootWithMeta(root) => DirectoryType::RootWithMeta(Cow::Owned(root.into())),
 			AnyDirEnum::Root(root) => DirectoryType::Root(Cow::Owned(root.into())),
+		}
+	}
+}
+
+#[derive(Deserialize, Tsify)]
+#[tsify(from_wasm_abi)]
+#[serde(untagged)]
+pub enum AnyDirEnumWithShareInfo {
+	Dir(Dir),
+	SharedDir(SharedDir),
+	Root(Root),
+}
+
+impl From<AnyDirEnumWithShareInfo> for DirectoryTypeWithShareInfo<'static> {
+	fn from(value: AnyDirEnumWithShareInfo) -> Self {
+		match value {
+			AnyDirEnumWithShareInfo::Dir(dir) => {
+				DirectoryTypeWithShareInfo::Dir(Cow::Owned(dir.into()))
+			}
+			AnyDirEnumWithShareInfo::SharedDir(shared) => {
+				DirectoryTypeWithShareInfo::SharedDir(Cow::Owned(shared.into()))
+			}
+			AnyDirEnumWithShareInfo::Root(root) => {
+				DirectoryTypeWithShareInfo::Root(Cow::Owned(root.into()))
+			}
 		}
 	}
 }
