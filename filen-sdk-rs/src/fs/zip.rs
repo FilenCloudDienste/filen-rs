@@ -446,7 +446,7 @@ mod js_impl {
 			let writer = wasm_streams::WritableStream::from_raw(params.writer)
 				.try_into_async_write()
 				.map_err(|(e, _)| e)?;
-			let abort_fut = params.abort_signal.into_future()?;
+
 			let items = params
 				.items
 				.into_iter()
@@ -456,15 +456,14 @@ mod js_impl {
 
 			let progress_callback = params.progress.into_rust_callback();
 
-			let _ = tokio::select! {
-				biased;
-				err = abort_fut => {
-					return Err(JsValue::from(Error::from(err)))
-				},
-				writer = async {
-					self.download_items_to_zip(&items, writer, progress_callback.as_ref()).await
-				} => writer
-			}?;
+			let _ = params
+				.managed_future
+				.into_js_managed_future(self.download_items_to_zip(
+					&items,
+					writer,
+					progress_callback.as_ref(),
+				))?
+				.await?;
 			Ok(())
 		}
 	}

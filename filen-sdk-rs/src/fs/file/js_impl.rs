@@ -23,19 +23,13 @@ impl Client {
 		&self,
 		data: &[u8],
 		params: UploadFileParams,
-	) -> Result<File, Error> {
-		let (builder, abort_signal) = params.into_file_builder(self);
+	) -> Result<File, JsValue> {
+		let builder = params.file_builder_params.into_file_builder(self);
 
-		let abort_fut = abort_signal.into_future()?;
-		let file = tokio::select! {
-			biased;
-			err = abort_fut => {
-				return Err(Error::from(err))
-			},
-			file = async {
-				self.upload_file(Arc::new(builder.build()), data).await
-			} => file,
-		}?;
+		let file = params
+			.managed_future
+			.into_js_managed_future(self.upload_file(Arc::new(builder.build()), data))?
+			.await?;
 
 		Ok(file.into())
 	}
@@ -75,8 +69,6 @@ impl Client {
 		&self,
 		params: crate::js::DownloadFileStreamParams,
 	) -> Result<(), JsValue> {
-		use crate::fs::file::enums::RemoteFileType;
-
 		let mut writer = wasm_streams::WritableStream::from_raw(params.writer)
 			.try_into_async_write()
 			.map_err(|(e, _)| e)?;
@@ -88,25 +80,17 @@ impl Client {
 				let _ = params.progress.call1(&JsValue::UNDEFINED, &bytes.into());
 			}) as crate::util::MaybeSendCallback<u64>)
 		};
-
-		let abort_fut = params.abort_signal.into_future()?;
-		tokio::select! {
-			biased;
-			err = abort_fut => {
-				return Err(JsValue::from(Error::from(err)))
-			},
-			res = async {
-				let file = RemoteFileType::try_from(params.file).map_err(Error::from)?;
-				self.download_file_to_writer_for_range(
-					&file,
-					&mut writer,
-					progress_callback,
-					params.start.unwrap_or(0),
-					params.end.unwrap_or(file.size()),
-				)
-				.await
-			} => res
-		}?;
+		let file = RemoteFileType::try_from(params.file).map_err(Error::from)?;
+		params
+			.managed_future
+			.into_js_managed_future(self.download_file_to_writer_for_range(
+				&file,
+				&mut writer,
+				progress_callback,
+				params.start.unwrap_or(0),
+				params.end.unwrap_or(file.size()),
+			))?
+			.await?;
 		Ok(())
 	}
 
@@ -116,7 +100,10 @@ impl Client {
 		&self,
 		params: crate::js::UploadFileStreamParams,
 	) -> Result<File, JsValue> {
-		let (builder, abort_signal) = params.file_params.into_file_builder(self);
+		let builder = params
+			.file_params
+			.file_builder_params
+			.into_file_builder(self);
 		let mut reader = wasm_streams::ReadableStream::from_raw(params.reader)
 			.try_into_async_read()
 			.map_err(|(e, _)| e)?;
@@ -129,21 +116,16 @@ impl Client {
 			}) as crate::util::MaybeSendCallback<u64>)
 		};
 
-		let abort_fut = abort_signal.into_future()?;
-		let file = tokio::select! {
-			biased;
-			err = abort_fut => {
-				return Err(JsValue::from(Error::from(err)))
-			},
-			file = async {
-				self.upload_file_from_reader(
-					Arc::new(builder.build()),
-					&mut reader,
-					progress_callback,
-					params.known_size,
-				).await
-			} => file,
-		}?;
+		let file = params
+			.file_params
+			.managed_future
+			.into_js_managed_future(self.upload_file_from_reader(
+				Arc::new(builder.build()),
+				&mut reader,
+				progress_callback,
+				params.known_size,
+			))?
+			.await?;
 		Ok(file.into())
 	}
 }

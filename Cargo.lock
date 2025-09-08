@@ -1221,6 +1221,7 @@ dependencies = [
  "napi",
  "napi-derive",
  "pbkdf2",
+ "pin-project-lite",
  "rand 0.8.5",
  "rand 0.9.2",
  "reqwest",

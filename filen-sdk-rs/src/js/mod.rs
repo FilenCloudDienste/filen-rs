@@ -1,12 +1,14 @@
 mod dir;
 mod file;
 mod item;
+mod managed_futures;
 mod params;
 mod returned_types;
 
 pub use dir::*;
 pub use file::*;
 pub use item::*;
+pub use managed_futures::*;
 pub use params::*;
 pub use returned_types::*;
 use shared::*;

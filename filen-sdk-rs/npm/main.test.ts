@@ -1,4 +1,4 @@
-import { login, Client, fromStringified, type Dir, type File } from "./bundler/sdk-rs.js"
+import { login, Client, fromStringified, type Dir, type File, PauseSignal } from "./bundler/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import { tmpdir } from "os"
 import { createWriteStream, openAsBlob } from "fs"
@@ -211,7 +211,9 @@ test("abort", async () => {
 	const fileAPromise = state.uploadFile(Buffer.from("file a"), {
 		name: "abort a.txt",
 		parent: testDir,
-		abortSignal: abortController.signal
+		managedFuture: {
+			abortSignal: abortController.signal
+		}
 	})
 
 	const fileBPromise = state.uploadFile(Buffer.from("file b"), {
@@ -224,7 +226,9 @@ test("abort", async () => {
 	const fileCPromise = state.uploadFile(Buffer.from("file c"), {
 		name: "abort c.txt",
 		parent: testDir,
-		abortSignal: abortControllerDelayed.signal
+		managedFuture: {
+			abortSignal: abortControllerDelayed.signal
+		}
 	})
 	setTimeout(() => {
 		abortControllerDelayed.abort()
@@ -243,6 +247,73 @@ test("abort", async () => {
 		expect(file.meta?.name).not.toBe("abort a.txt")
 		expect(file.meta?.name).not.toBe("abort c.txt")
 	}
+})
+
+test("pause", async () => {
+	const pauseSignal = new PauseSignal()
+	let fileAPromiseResolved = false
+	const fileAPromise = state.uploadFile(Buffer.from("file a"), {
+		name: "pause a.txt",
+		parent: testDir,
+		managedFuture: {
+			pauseSignal: pauseSignal
+		}
+	})
+	fileAPromise.then(() => {
+		fileAPromiseResolved = true
+	})
+	console.log("Pausing")
+	pauseSignal.pause()
+	console.log("Paused", pauseSignal.isPaused())
+
+	let fileBPromiseResolved = false
+	const fileBPromise = state.uploadFile(Buffer.from("file b"), {
+		name: "pause b.txt",
+		parent: testDir,
+		managedFuture: {
+			pauseSignal: pauseSignal
+		}
+	})
+	fileBPromise.then(() => {
+		fileBPromiseResolved = true
+	})
+
+	const fileCPromise = state.uploadFile(Buffer.from("file c"), {
+		name: "pause c.txt",
+		parent: testDir
+	})
+
+	let fileDPromiseResolved = false
+	const fileDPromise = state.uploadFile(Buffer.from("file d"), {
+		name: "pause d.txt",
+		parent: testDir
+	})
+	fileDPromise.then(() => {
+		fileDPromiseResolved = true
+	})
+
+	console.log("awaiting first file (c)")
+	const fileC = await fileCPromise
+	console.log("file c done")
+	expect(fileC).toBeDefined()
+	expect(fileC.meta?.name).toBe("pause c.txt")
+	await new Promise(resolve => setTimeout(resolve, 2000))
+	expect(fileAPromiseResolved).toBe(false)
+	expect(fileBPromiseResolved).toBe(false)
+	expect(fileDPromiseResolved).toBe(true)
+	pauseSignal.resume()
+	console.log("resumed, awaiting a and b")
+	const fileA = await fileAPromise
+	console.log("file a done")
+	expect(fileA).toBeDefined()
+	expect(fileA.meta?.name).toBe("pause a.txt")
+	console.log("awaiting b")
+	await new Promise(resolve => setTimeout(resolve, 2000))
+	console.log("checking b")
+	expect(fileBPromiseResolved).toBe(true)
+	const fileB = await fileBPromise
+	expect(fileB).toBeDefined()
+	expect(fileB.meta?.name).toBe("pause b.txt")
 })
 
 test("Zip Download", async () => {

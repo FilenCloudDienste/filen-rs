@@ -1,23 +1,12 @@
-use std::{borrow::Cow, pin::Pin};
-
 use chrono::{DateTime, Utc};
-use futures::future;
 use serde::Deserialize;
-use wasm_bindgen::{
-	JsCast, JsValue,
-	prelude::{Closure, wasm_bindgen},
-};
-use web_sys::{
-	AbortSignal as WasmAbortSignal,
-	js_sys::{BigInt, Function, JsString},
-};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
+use web_sys::js_sys::{BigInt, Function};
 
 use crate::{
-	Error, ErrorKind,
 	auth::Client,
-	error::AbortedError,
 	fs::{dir::UnsharedDirectoryType, file::FileBuilder, zip::ZipProgressCallback},
-	js::DirEnum,
+	js::{DirEnum, ManagedFuture},
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -27,67 +16,8 @@ use tsify::Tsify;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_sys::js_sys::{self};
 
-#[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
-	derive(Tsify, Debug)
-)]
-#[derive(Deserialize, Default)]
-#[serde(transparent)]
-pub struct AbortSignal(
-	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
-		tsify(type = "AbortSignal")
-	)]
-	#[serde(with = "serde_wasm_bindgen::preserve")]
-	pub JsValue,
-);
-
-impl AbortSignal {
-	pub(crate) fn into_future(self) -> Result<Pin<Box<dyn Future<Output = AbortedError>>>, Error> {
-		let signal: Option<WasmAbortSignal> = if self.0.is_undefined() {
-			None
-		} else {
-			Some(self.0.dyn_into().map_err(|e| {
-				let ty = JsValue::dyn_ref::<JsString>(&e.js_typeof())
-					.map(|s| Cow::Owned(String::from(s)))
-					.unwrap_or(Cow::Borrowed("unknown"));
-				Error::custom(
-					ErrorKind::Conversion,
-					format!("expected AbortSignal, got {}", ty),
-				)
-			})?)
-		};
-		Ok(match signal {
-			None => Box::pin(future::pending()),
-			Some(abort_signal) => {
-				let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
-				let closure = Closure::once(move || {
-					let _ = sender.send(());
-				});
-				abort_signal.set_onabort(Some(closure.as_ref().unchecked_ref()));
-				Box::pin(async move {
-					if abort_signal.aborted() {
-						log::debug!("AbortSignal already aborted, returning AbortedError");
-						return AbortedError;
-					}
-					let _closure = closure; // keep the closure alive
-					let _ = receiver.await;
-					log::debug!("AbortSignal aborted, returning AbortedError");
-					AbortedError
-				})
-			}
-		})
-	}
-}
-
-#[derive(Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
-#[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
-	tsify(from_wasm_abi)
-)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadFileParams {
+#[derive(Deserialize, Tsify)]
+pub struct FileBuilderParams {
 	pub parent: DirEnum,
 	pub name: String,
 	#[cfg_attr(
@@ -105,15 +35,29 @@ pub struct UploadFileParams {
 	#[serde(default)]
 	#[tsify(type = "string")]
 	pub mime: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	tsify(from_wasm_abi)
+)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadFileParams {
+	#[serde(flatten)]
+	pub file_builder_params: FileBuilderParams,
+	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
+	// #[serde(flatten)]
 	#[serde(default)]
-	pub abort_signal: AbortSignal,
+	pub managed_future: ManagedFuture,
 }
 
 #[cfg(feature = "node")]
 super::napi_from_json_impl!(UploadFileParams);
 
-impl UploadFileParams {
-	pub(crate) fn into_file_builder(self, client: &Client) -> (FileBuilder, AbortSignal) {
+impl FileBuilderParams {
+	pub(crate) fn into_file_builder(self, client: &Client) -> FileBuilder {
 		let mut file_builder =
 			client.make_file_builder(self.name, &UnsharedDirectoryType::from(self.parent));
 		if let Some(mime) = self.mime {
@@ -129,7 +73,7 @@ impl UploadFileParams {
 			}
 			(None, None) => {}
 		};
-		(file_builder, self.abort_signal)
+		file_builder
 	}
 }
 
@@ -149,15 +93,6 @@ pub struct UploadFileStreamParams {
 	#[serde(with = "serde_wasm_bindgen::preserve")]
 	pub progress: js_sys::Function,
 }
-
-// #[derive(Deserialize)]
-// pub struct UploadFileStreamParams<'a> {
-// 	#[serde(flatten)]
-// 	pub file_params: UploadFileParams,
-// 	pub reader: web_sys::ReadableStream,
-// 	pub known_size: Option<u64>,
-// 	pub progress: Arc<ThreadsafeFunction<u64, ()>>,
-// }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[derive(Deserialize)]
@@ -189,13 +124,15 @@ pub struct DownloadFileStreamParams {
 	#[serde(default)]
 	pub progress: js_sys::Function,
 	#[serde(default)]
-	pub abort_signal: AbortSignal,
-	#[serde(default)]
 	#[tsify(type = "bigint")]
 	pub start: Option<u64>,
 	#[serde(default)]
 	#[tsify(type = "bigint")]
 	pub end: Option<u64>,
+	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
+	// #[serde(flatten)]
+	#[serde(default)]
+	pub managed_future: ManagedFuture,
 }
 
 #[wasm_bindgen]
@@ -272,6 +209,8 @@ pub struct DownloadFileToZipParams {
 	)]
 	#[serde(default)]
 	pub progress: ZipProgressCallbackJS,
+	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
+	// #[serde(flatten)]
 	#[serde(default)]
-	pub abort_signal: AbortSignal,
+	pub managed_future: ManagedFuture,
 }
