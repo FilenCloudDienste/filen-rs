@@ -539,6 +539,11 @@ test("meta updates", async () => {
 		name: "meta-dir-renamed"
 	})
 	expect(updatedDir.meta?.name).toBe("meta-dir-renamed")
+
+	updatedFile = (await state.setFavorite(updatedFile, true)) as File
+	updatedDir = (await state.setFavorite(updatedDir, true)) as Dir
+	expect(updatedFile.favorited).toBe(true)
+	expect(updatedDir.favorited).toBe(true)
 })
 
 afterAll(async () => {

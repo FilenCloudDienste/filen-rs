@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
@@ -5,8 +7,13 @@ use web_sys::js_sys::{BigInt, Function};
 
 use crate::{
 	auth::Client,
-	fs::{dir::UnsharedDirectoryType, file::FileBuilder, zip::ZipProgressCallback},
-	js::{DirEnum, ManagedFuture},
+	fs::{
+		NonRootFSObject,
+		dir::UnsharedDirectoryType,
+		file::{FileBuilder, RemoteFile},
+		zip::ZipProgressCallback,
+	},
+	js::{Dir, DirEnum, File, ManagedFuture},
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -15,6 +22,28 @@ use crate::js::{FileEnum, Item};
 use tsify::Tsify;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_sys::js_sys::{self};
+
+#[derive(Deserialize)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	tsify(from_wasm_abi)
+)]
+#[serde(untagged)]
+pub enum NonRootItem {
+	File(File),
+	Dir(Dir),
+}
+
+impl TryFrom<NonRootItem> for NonRootFSObject<'static> {
+	type Error = <RemoteFile as TryFrom<File>>::Error;
+	fn try_from(value: NonRootItem) -> Result<Self, Self::Error> {
+		Ok(match value {
+			NonRootItem::Dir(dir) => Self::Dir(Cow::Owned(dir.into())),
+			NonRootItem::File(file) => Self::File(Cow::Owned(file.try_into()?)),
+		})
+	}
+}
 
 #[derive(Deserialize, Tsify)]
 pub struct FileBuilderParams {
