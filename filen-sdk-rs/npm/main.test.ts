@@ -45,15 +45,6 @@ beforeAll(async () => {
 				throw new Error("TEST_SHARE_PASSWORD environment variable is not set")
 			}
 			shareClient = await login(email, password)
-			// const maybeDir = await shareClient.findItemInDir(shareClient.root(), "wasm-test-dir")
-			// if (maybeDir) {
-			// 	if (maybeDir.type === "dir") {
-			// 		_shareTestDir = maybeDir
-			// 	} else {
-			// 		throw new Error("Expected shareDir to be a Dir, but it was a File")
-			// 	}
-			// }
-			// testDir = await shareClient.createDir(shareClient.root(), "wasm-test-dir")
 		})()
 	])
 }, 30000)
@@ -404,7 +395,6 @@ test("sharing", async () => {
 	const user = await state.makeUserFromContact(contact)
 	await state.shareDir(dir, user)
 	const shared = await state.listOutShared(null, user)
-	console.log("shared", shared)
 	const sharedDir = shared[0].find(d => d.dir.uuid === dir.uuid)
 	expect(sharedDir).toBeDefined()
 	expect(sharedDir.dir.uuid).toEqual(dir.uuid)
