@@ -453,19 +453,13 @@ test("thumbnail", async () => {
 			})
 
 			expect(thumb).toBeDefined()
-			expect(thumb?.height).toBeLessThanOrEqual(100)
-			expect(thumb?.width).toBeLessThanOrEqual(100)
-			await expect(
-				sharp(thumb!.imageData, {
-					raw: {
-						width: thumb!.width,
-						height: thumb!.height,
-						channels: 4
-					}
-				})
-					.png()
-					.toArray()
-			).resolves.toBeDefined()
+
+			const metaPromise = sharp(thumb!.webpData).metadata()
+			await expect(metaPromise).resolves.toBeDefined()
+			const meta = await metaPromise
+			expect(meta.width).toBeLessThanOrEqual(100)
+			expect(meta.height).toBeLessThanOrEqual(100)
+			expect(meta.format).toBe("webp")
 			completed.push(ext)
 		})
 	)

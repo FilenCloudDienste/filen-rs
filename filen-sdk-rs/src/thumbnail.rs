@@ -67,6 +67,7 @@ impl Client {
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod js_impls {
+	use image::codecs::webp::WebPEncoder;
 	use serde::{Deserialize, Serialize};
 	use serde_bytes::ByteBuf;
 	use tsify::Tsify;
@@ -87,9 +88,7 @@ mod js_impls {
 	#[serde(rename_all = "camelCase")]
 	#[tsify(into_wasm_abi)]
 	pub struct MakeThumbnailInMemoryResult {
-		pub image_data: ByteBuf,
-		pub width: u32,
-		pub height: u32,
+		pub webp_data: ByteBuf,
 	}
 
 	#[wasm_bindgen]
@@ -113,13 +112,12 @@ mod js_impls {
 					return Ok(None);
 				}
 			};
-			let width = image.width();
-			let height = image.height();
+			// really wish I knew the exact size beforehand so we could preallocate
+			let mut image_data = Vec::new();
+			image.write_with_encoder(WebPEncoder::new_lossless(&mut image_data))?;
 
 			Ok(Some(MakeThumbnailInMemoryResult {
-				image_data: ByteBuf::from(image.into_rgba8().into_vec()),
-				width,
-				height,
+				webp_data: ByteBuf::from(image_data),
 			}))
 		}
 	}
