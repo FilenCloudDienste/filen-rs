@@ -292,6 +292,7 @@ async fn set_up_contact_no_add<'a>(
 		.acquire_lock_with_default("test:contact")
 		.await
 		.unwrap();
+
 	let _ = futures::join!(
 		async {
 			for contact in client.get_contacts().await.unwrap() {
@@ -300,12 +301,12 @@ async fn set_up_contact_no_add<'a>(
 		},
 		async {
 			for contact in client.list_outgoing_contact_requests().await.unwrap() {
-				client.delete_contact(contact.uuid).await.unwrap();
+				client.cancel_contact_request(contact.uuid).await.unwrap();
 			}
 		},
 		async {
 			for contact in client.list_incoming_contact_requests().await.unwrap() {
-				client.delete_contact(contact.uuid).await.unwrap();
+				client.deny_contact_request(contact.uuid).await.unwrap();
 			}
 		},
 		async {
