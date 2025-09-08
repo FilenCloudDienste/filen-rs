@@ -65,6 +65,35 @@ impl<'a> From<&'a Contact> for filen_types::api::v3::contacts::Contact<'a> {
 #[derive(Serialize, Deserialize, Tsify)]
 #[tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)]
 #[serde(rename_all = "camelCase")]
+pub struct BlockedContact {
+	pub uuid: UuidStr,
+	pub user_id: u64,
+	pub email: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[tsify(type = "string")]
+	pub avatar: Option<String>,
+	pub nick_name: String,
+	#[tsify(type = "bigint")]
+	#[serde(with = "chrono::serde::ts_milliseconds")]
+	pub timestamp: DateTime<Utc>,
+}
+
+impl From<filen_types::api::v3::contacts::blocked::BlockedContact<'_>> for BlockedContact {
+	fn from(c: filen_types::api::v3::contacts::blocked::BlockedContact<'_>) -> Self {
+		Self {
+			uuid: c.uuid,
+			user_id: c.user_id,
+			email: c.email.into_owned(),
+			avatar: c.avatar.map(|a| a.into_owned()),
+			nick_name: c.nick_name.into_owned(),
+			timestamp: c.timestamp,
+		}
+	}
+}
+
+#[derive(Serialize, Deserialize, Tsify)]
+#[tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)]
+#[serde(rename_all = "camelCase")]
 pub struct ContactRequestIn {
 	pub uuid: UuidStr,
 	pub user_id: u64,
@@ -267,6 +296,29 @@ impl Client {
 			.map(ContactRequestOut::from)
 			.collect::<Vec<_>>();
 		Ok(serde_wasm_bindgen::to_value(&requests)?)
+	}
+
+	#[wasm_bindgen(
+		js_name = "getBlockedContacts",
+		unchecked_return_type = "BlockedContact[]"
+	)]
+	pub async fn get_blocked_contacts_js(&self) -> Result<JsValue, JsValue> {
+		let contacts = self.get_blocked_contacts().await?;
+		let contacts = contacts
+			.into_iter()
+			.map(BlockedContact::from)
+			.collect::<Vec<_>>();
+		Ok(serde_wasm_bindgen::to_value(&contacts)?)
+	}
+
+	#[wasm_bindgen(js_name = "blockContact")]
+	pub async fn block_contact_js(&self, email: &str) -> Result<UuidStr, Error> {
+		self.block_contact(email).await
+	}
+
+	#[wasm_bindgen(js_name = "unblockContact")]
+	pub async fn unblock_contact_js(&self, contact_uuid: UuidStr) -> Result<(), Error> {
+		self.unblock_contact(contact_uuid).await
 	}
 
 	// Sharing

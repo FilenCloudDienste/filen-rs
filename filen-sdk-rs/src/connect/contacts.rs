@@ -1,6 +1,7 @@
 use filen_types::{
 	api::v3::contacts::{
 		Contact,
+		blocked::BlockedContact,
 		requests::{r#in::ContactRequestIn, out::ContactRequestOut},
 	},
 	fs::UuidStr,
@@ -71,5 +72,30 @@ impl Client {
 		api::v3::contacts::requests::out::get(self.client())
 			.await
 			.map(|r| r.0)
+	}
+
+	pub async fn get_blocked_contacts(&self) -> Result<Vec<BlockedContact<'static>>, Error> {
+		api::v3::contacts::blocked::get(self.client())
+			.await
+			.map(|r| r.0)
+	}
+
+	pub async fn block_contact(&self, email: &str) -> Result<UuidStr, Error> {
+		Ok(api::v3::contacts::blocked::add::post(
+			self.client(),
+			&api::v3::contacts::blocked::add::Request {
+				email: email.to_string(),
+			},
+		)
+		.await?
+		.uuid)
+	}
+
+	pub async fn unblock_contact(&self, contact_uuid: UuidStr) -> Result<(), Error> {
+		api::v3::contacts::blocked::delete::post(
+			self.client(),
+			&api::v3::contacts::blocked::delete::Request { uuid: contact_uuid },
+		)
+		.await
 	}
 }

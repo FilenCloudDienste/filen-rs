@@ -47,7 +47,7 @@ beforeAll(async () => {
 			shareClient = await login(email, password)
 		})()
 	])
-}, 30000)
+}, 120000)
 
 test("login", async () => {
 	expect(state).toBeDefined()
@@ -407,6 +407,47 @@ test("sharing", async () => {
 	expect(files.find(f => f.file.uuid === file.uuid)).toBeDefined()
 
 	await state.deleteContact(contact.uuid)
+})
+
+test("block", async () => {
+	const contacts = await state.getContacts()
+	let contact
+	for (const c of contacts) {
+		if (c.email === process.env.TEST_SHARE_EMAIL) {
+			contact = c
+			break
+		}
+	}
+	if (contact) {
+		await state.deleteContact(contact.uuid)
+		const requests = await state.listOutgoingContactRequests()
+		for (const req of requests) {
+			console.log("Cancelling existing contact request")
+			await state.cancelContactRequest(req.uuid)
+		}
+	}
+	await state.sendContactRequest(process.env.TEST_SHARE_EMAIL!)
+	const requests = await shareClient.listIncomingContactRequests()
+	const req = requests.find(r => r.email === process.env.TEST_EMAIL)
+	if (!req) {
+		throw new Error("Contact request not found")
+	}
+
+	await shareClient.blockContact(req.email)
+	const blocked = await shareClient.getBlockedContacts()
+	expect(blocked.length).toBe(1)
+	expect(blocked[0].email).toBe(process.env.TEST_EMAIL)
+
+	const requestsAfter = await shareClient.listIncomingContactRequests()
+	expect(requestsAfter.length).toBe(0)
+
+	await shareClient.unblockContact(blocked[0].uuid)
+	const blockedAfter = await shareClient.getBlockedContacts()
+	expect(blockedAfter.length).toBe(0)
+
+	const requestsFinal = await shareClient.listIncomingContactRequests()
+	expect(requestsFinal.length).toBe(1)
+	expect(requestsFinal[0].email).toBe(process.env.TEST_EMAIL)
 })
 
 test("thumbnail", async () => {

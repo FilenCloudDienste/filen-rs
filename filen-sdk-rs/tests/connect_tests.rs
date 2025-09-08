@@ -280,7 +280,7 @@ async fn contact_interactions() {
 	assert_eq!(contacts.len(), 0);
 }
 
-async fn set_up_contact<'a>(
+async fn set_up_contact_no_add<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
 ) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
@@ -339,8 +339,37 @@ async fn set_up_contact<'a>(
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (in_futures.next().await).is_some() {}
+		},
+		async {
+			let blocked_contacts = client.get_blocked_contacts().await.unwrap();
+			let mut futures = blocked_contacts
+				.into_iter()
+				.map(|c| async move {
+					client.unblock_contact(c.uuid).await.unwrap();
+				})
+				.collect::<FuturesUnordered<_>>();
+			while (futures.next().await).is_some() {}
+		},
+		async {
+			let blocked_contacts = share_client.get_blocked_contacts().await.unwrap();
+			let mut futures = blocked_contacts
+				.into_iter()
+				.map(|c| async move {
+					share_client.unblock_contact(c.uuid).await.unwrap();
+				})
+				.collect::<FuturesUnordered<_>>();
+			while (futures.next().await).is_some() {}
 		}
 	);
+	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+	(lock1, lock2)
+}
+
+async fn set_up_contact<'a>(
+	client: &'a Client,
+	share_client: &'a Client,
+) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
+	let (lock1, lock2) = set_up_contact_no_add(client, share_client).await;
 
 	let request_uuid = client
 		.send_contact_request(share_client.email())
@@ -572,4 +601,59 @@ async fn remove_link() {
 	assert_eq!(shared_dirs_out.len(), 0);
 	let shared_dirs_in = share_client.list_in_shared().await.unwrap().0;
 	assert_eq!(shared_dirs_in.len(), 0);
+}
+
+#[shared_test_runtime]
+async fn block() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+
+	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
+	let share_client = &share_resources.client;
+
+	let _lock = set_up_contact_no_add(client, share_client).await;
+
+	client
+		.send_contact_request(share_client.email())
+		.await
+		.unwrap();
+	let requests = share_client.list_incoming_contact_requests().await.unwrap();
+	assert_eq!(requests.len(), 1);
+	assert_eq!(requests[0].email, client.email());
+
+	share_client
+		.block_contact(&requests[0].email)
+		.await
+		.unwrap();
+	let requests = share_client.list_incoming_contact_requests().await.unwrap();
+	assert_eq!(requests.len(), 0);
+
+	let blocked = share_client.get_blocked_contacts().await.unwrap();
+	assert_eq!(blocked.len(), 1);
+	assert_eq!(blocked[0].email, client.email());
+
+	let err = client
+		.send_contact_request(share_client.email())
+		.await
+		.unwrap_err();
+	assert!(err.to_string().contains("Contact blocked"));
+
+	let requests = share_client.list_incoming_contact_requests().await.unwrap();
+	assert_eq!(requests.len(), 0);
+
+	share_client.unblock_contact(blocked[0].uuid).await.unwrap();
+	let requests = share_client.list_incoming_contact_requests().await.unwrap();
+	assert_eq!(requests.len(), 1);
+	assert_eq!(requests[0].email, client.email());
+
+	let blocked = share_client.get_blocked_contacts().await.unwrap();
+	assert_eq!(blocked.len(), 0);
+
+	share_client
+		.accept_contact_request(requests[0].uuid)
+		.await
+		.unwrap();
+	let contacts = share_client.get_contacts().await.unwrap();
+	assert_eq!(contacts.len(), 1);
+	assert_eq!(contacts[0].email, client.email());
 }
