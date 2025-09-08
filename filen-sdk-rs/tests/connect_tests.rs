@@ -382,8 +382,6 @@ async fn set_up_contact<'a>(
 		.await
 		.unwrap();
 
-	// removing in/out shared links is async so we wait
-	tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 	(lock1, lock2)
 }
 
