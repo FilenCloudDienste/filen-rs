@@ -193,13 +193,13 @@ mod tests {
 			}),
 		};
 
-		let non_root_object = NonRootObject::File(file.clone());
+		let non_root_object = NonRootItemTagged::File(file.clone());
 		let js_value = JsValue::from(non_root_object.clone());
 		let deserializer = serde_wasm_bindgen::Deserializer::from(js_value);
 		let deserialized_object: File = serde_path_to_error::deserialize(deserializer).unwrap();
 		assert_eq!(deserialized_object, file);
 
-		let non_root_object = NonRootObject::Dir(dir.clone());
+		let non_root_object = NonRootItemTagged::Dir(dir.clone());
 		let js_value = JsValue::from(non_root_object.clone());
 
 		let js_value2 = js_value.clone();

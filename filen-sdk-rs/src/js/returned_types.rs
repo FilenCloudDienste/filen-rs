@@ -16,7 +16,7 @@ use tsify::Tsify;
 )]
 #[serde(tag = "type")]
 #[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
-pub enum NonRootObject {
+pub enum NonRootItemTagged {
 	#[serde(rename = "dir")]
 	Dir(Dir),
 	#[serde(rename = "file")]
@@ -26,11 +26,11 @@ pub enum NonRootObject {
 #[cfg(feature = "node")]
 super::napi_to_json_impl!(NonRootObject);
 
-impl From<NonRootFSObject<'_>> for NonRootObject {
+impl From<NonRootFSObject<'_>> for NonRootItemTagged {
 	fn from(obj: NonRootFSObject<'_>) -> Self {
 		match obj {
-			NonRootFSObject::Dir(dir) => NonRootObject::Dir(dir.into_owned().into()),
-			NonRootFSObject::File(file) => NonRootObject::File(file.into_owned().into()),
+			NonRootFSObject::Dir(dir) => NonRootItemTagged::Dir(dir.into_owned().into()),
+			NonRootFSObject::File(file) => NonRootItemTagged::File(file.into_owned().into()),
 		}
 	}
 }

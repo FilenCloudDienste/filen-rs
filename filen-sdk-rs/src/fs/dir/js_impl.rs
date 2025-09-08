@@ -2,7 +2,7 @@ use crate::{
 	Error,
 	auth::Client,
 	fs::dir::{DirectoryType, UnsharedDirectoryType, meta::DirectoryMetaChanges},
-	js::{Dir, DirEnum, File, NonRootObject, Root},
+	js::{Dir, DirEnum, File, NonRootItemTagged, Root},
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
@@ -160,7 +160,7 @@ impl Client {
 		&self,
 		dir: AnyDirEnum,
 		#[wasm_bindgen(js_name = "nameOrUuid")] name_or_uuid: String,
-	) -> Result<Option<NonRootObject>, Error> {
+	) -> Result<Option<NonRootItemTagged>, Error> {
 		let item = self
 			.find_item_in_dir(&DirectoryType::from(dir), &name_or_uuid)
 			.await?;
@@ -173,7 +173,7 @@ impl Client {
 		&self,
 		dir: AnyDirEnum,
 		name_or_uuid: String,
-	) -> Result<Option<NonRootObject>, Error> {
+	) -> Result<Option<NonRootItemTagged>, Error> {
 		let item = self
 			.find_item_in_dir(&DirectoryType::from(dir), &name_or_uuid)
 			.await?;
