@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
 	Error,
 	auth::Client,
-	fs::file::{HasFileInfo, enums::RemoteFileType},
+	fs::file::{HasFileInfo, enums::RemoteFileType, meta::FileMetaChanges},
 	js::{File, FileEnum, UploadFileParams},
 };
 #[cfg(feature = "node")]
@@ -126,6 +126,17 @@ impl Client {
 				params.known_size,
 			))?
 			.await?;
+		Ok(file.into())
+	}
+
+	#[wasm_bindgen(js_name = "updateFileMetadata")]
+	pub async fn update_file_metadata_js(
+		&self,
+		file: File,
+		changes: FileMetaChanges,
+	) -> Result<File, Error> {
+		let mut file = file.try_into()?;
+		self.update_file_metadata(&mut file, changes).await?;
 		Ok(file.into())
 	}
 }

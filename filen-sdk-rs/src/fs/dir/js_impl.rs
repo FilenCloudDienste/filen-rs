@@ -1,7 +1,7 @@
 use crate::{
 	Error,
 	auth::Client,
-	fs::dir::{DirectoryType, UnsharedDirectoryType},
+	fs::dir::{DirectoryType, UnsharedDirectoryType, meta::DirectoryMetaChanges},
 	js::{Dir, DirEnum, File, NonRootObject, Root},
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -196,5 +196,16 @@ impl Client {
 			files: resp.files,
 			dirs: resp.dirs,
 		})
+	}
+
+	#[wasm_bindgen(js_name = "updateDirMetadata")]
+	pub async fn update_dir_metadata_js(
+		&self,
+		dir: Dir,
+		changes: DirectoryMetaChanges,
+	) -> Result<Dir, Error> {
+		let mut dir = dir.into();
+		self.update_dir_metadata(&mut dir, changes).await?;
+		Ok(dir.into())
 	}
 }

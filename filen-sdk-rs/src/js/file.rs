@@ -375,6 +375,15 @@ impl TryFrom<FileEnum> for RemoteFileType<'static> {
 	}
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Default, Tsify, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMetaChanges {
+	name: Option<String>,
+	mime: Option<String>,
+	last_modified: Option<DateTime<Utc>>,
+	created: Option<Option<DateTime<Utc>>>,
+}
+
 mod serde_impls {
 	use serde::ser::SerializeStruct;
 

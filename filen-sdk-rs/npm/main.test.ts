@@ -506,6 +506,41 @@ test("thumbnail", async () => {
 	expect(completed).toContainEqual("webp")
 })
 
+test("meta updates", async () => {
+	const file = await state.uploadFile(new TextEncoder().encode("meta file content"), {
+		parent: testDir,
+		name: "meta-file.txt"
+	})
+
+	expect(file.meta?.name).toBe("meta-file.txt")
+	expect(file.meta?.created).toBeDefined()
+	expect(file.meta?.modified).toBeDefined()
+
+	let updatedFile = await state.updateFileMetadata(file, {
+		created: null
+	})
+	expect(updatedFile.meta?.created).toBeUndefined()
+
+	updatedFile = await state.updateFileMetadata(file, {
+		name: "meta-file-renamed.txt"
+	})
+	expect(updatedFile.meta?.name).toBe("meta-file-renamed.txt")
+
+	const dir = await state.createDir(testDir, "meta-dir")
+	expect(dir.meta?.name).toBe("meta-dir")
+	expect(dir.meta?.created).toBeDefined()
+
+	let updatedDir = await state.updateDirMetadata(dir, {
+		created: null
+	})
+	expect(updatedDir.meta?.created).toBeUndefined()
+
+	updatedDir = await state.updateDirMetadata(dir, {
+		name: "meta-dir-renamed"
+	})
+	expect(updatedDir.meta?.name).toBe("meta-dir-renamed")
+})
+
 afterAll(async () => {
 	if (state && testDir) {
 		await state?.deleteDirPermanently(testDir)
