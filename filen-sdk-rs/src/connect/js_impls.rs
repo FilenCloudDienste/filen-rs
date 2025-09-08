@@ -27,7 +27,9 @@ pub struct Contact {
 	pub avatar: Option<String>,
 	pub nick_name: String,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[tsify(type = "bigint")]
 	pub last_active: DateTime<Utc>,
+	#[tsify(type = "bigint")]
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 }
