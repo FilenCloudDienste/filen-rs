@@ -179,6 +179,7 @@ mod tests {
 			region: "us-west-1".to_string(),
 			bucket: "test-bucket".to_string(),
 			chunks: 1,
+			can_make_thumbnail: false,
 		};
 
 		let dir = Dir {
