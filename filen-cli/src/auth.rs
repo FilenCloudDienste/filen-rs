@@ -6,7 +6,7 @@ use filen_sdk_rs::{
 };
 use filen_types::error::ResponseError;
 
-use crate::{prompt, prompt_confirm, util::LongKeyringEntry};
+use crate::{ui::UI, util::LongKeyringEntry};
 
 /// A lazily authenticated client.
 /// Since some commands (e. g. logout) don't need the user to be authenticated, we only authenticate when necessary.
@@ -28,14 +28,16 @@ impl LazyClient {
 		}
 	}
 
-	pub(crate) async fn get(&mut self) -> Result<&Client> {
+	pub(crate) async fn get(&mut self, ui: &mut UI) -> Result<&Client> {
 		match self {
 			Self::Authenticated { client } => Ok(client),
 			Self::Unauthenticated {
 				email_arg,
 				password_arg,
 			} => {
-				let client = authenticate(email_arg.to_owned(), password_arg.as_deref()).await?;
+				let client =
+					authenticate(ui, email_arg.to_owned(), password_arg.as_deref()).await?;
+				ui.set_user(Some(client.email()));
 				*self = Self::Authenticated {
 					client: Box::new(client),
 				};
@@ -50,21 +52,23 @@ impl LazyClient {
 
 /// Authenticate by one of the available authentication methods.
 pub(crate) async fn authenticate(
+	ui: &mut UI,
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
 ) -> Result<Client> {
-	if let Ok(client) = authenticate_from_cli_args(email_arg, password_arg).await {
+	if let Ok(client) = authenticate_from_cli_args(ui, email_arg, password_arg).await {
 		Ok(client)
-	} else if let Ok(client) = authenticate_from_environment_variables().await {
+	} else if let Ok(client) = authenticate_from_environment_variables(ui).await {
 		Ok(client)
 	} else if let Ok(client) = authenticate_from_keyring().await {
 		Ok(client)
 	} else {
-		authenticate_from_prompt().await
+		authenticate_from_prompt(ui).await
 	}
 }
 
 async fn login_and_optionally_prompt_two_factor_code(
+	ui: &mut UI,
 	email: String,
 	password: &str,
 ) -> Result<Client> {
@@ -73,7 +77,7 @@ async fn login_and_optionally_prompt_two_factor_code(
 		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
 			Ok(ResponseError::ApiError { code, .. }) => {
 				if code.as_deref() == Some("enter_2fa") {
-					let two_factor_code = prompt("Two-factor authentication code: ")?;
+					let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
 					let client = Client::login(email, password, two_factor_code.trim())
 						.await
 						.context("Failed to log in (with 2fa code)")?;
@@ -95,22 +99,23 @@ async fn login_and_optionally_prompt_two_factor_code(
 
 /// Authenticate using credentials provided in the CLI arguments.
 async fn authenticate_from_cli_args(
+	ui: &mut UI,
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
 ) -> Result<Client> {
 	let email = email_arg.context("Email is required")?;
 	let password = password_arg.context("Password is required")?;
-	let client = login_and_optionally_prompt_two_factor_code(email, password).await?;
+	let client = login_and_optionally_prompt_two_factor_code(ui, email, password).await?;
 	Ok(client)
 }
 
 /// Authenticate from credentials provided via environment variables.
-async fn authenticate_from_environment_variables() -> Result<Client> {
+async fn authenticate_from_environment_variables(ui: &mut UI) -> Result<Client> {
 	let email = std::env::var("FILEN_CLI_EMAIL")
 		.context("FILEN_CLI_EMAIL environment variable is required")?;
 	let password = std::env::var("FILEN_CLI_PASSWORD")
 		.context("FILEN_CLI_PASSWORD environment variable is required")?;
-	let client = login_and_optionally_prompt_two_factor_code(email, &password).await?;
+	let client = login_and_optionally_prompt_two_factor_code(ui, email, &password).await?;
 	Ok(client)
 }
 
@@ -142,15 +147,15 @@ async fn authenticate_from_keyring() -> Result<Client> {
 }
 
 /// Authenticate using credentials provided interactively.
-async fn authenticate_from_prompt() -> Result<Client> {
-	let email = prompt("Email: ")?;
-	let password = prompt("Password: ")?;
+async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
+	let email = ui.prompt("Email: ")?;
+	let password = ui.prompt_password("Password: ")?;
 	let client =
-		login_and_optionally_prompt_two_factor_code(email.trim().to_string(), password.trim())
+		login_and_optionally_prompt_two_factor_code(ui, email.trim().to_string(), password.trim())
 			.await?;
 
 	// optionally, save credentials
-	if prompt_confirm("Keep me logged in?", true)? {
+	if ui.prompt_confirm("Keep me logged in?", true)? {
 		let sdk_config = client.to_stringified();
 		let sdk_config = serde_json::to_string(&sdk_config).unwrap();
 		let sdk_config = base64.encode(sdk_config);

@@ -6,7 +6,7 @@ use filen_sdk_rs::fs::{
 	file::{enums::RemoteFileType, traits::HasFileInfo as _},
 };
 
-use crate::{CommandResult, auth::LazyClient, prompt_confirm, util::RemotePath};
+use crate::{CommandResult, auth::LazyClient, ui::UI, util::RemotePath};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
@@ -38,6 +38,7 @@ pub(crate) enum Commands {
 }
 
 pub(crate) async fn execute_command(
+	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	command: Commands,
@@ -51,15 +52,16 @@ pub(crate) async fn execute_command(
 			})
 		}
 		Commands::Ls { directory } => {
-			list_directory(client, working_path, directory).await?;
+			list_directory(ui, client, working_path, directory).await?;
 			None
 		}
 		Commands::Cat { file } => {
-			print_file(client, working_path, &file, PrintFileLines::Full).await?;
+			print_file(ui, client, working_path, &file, PrintFileLines::Full).await?;
 			None
 		}
 		Commands::Head { file, lines } => {
 			print_file(
+				ui,
 				client,
 				working_path,
 				&file,
@@ -70,6 +72,7 @@ pub(crate) async fn execute_command(
 		}
 		Commands::Tail { file, lines } => {
 			print_file(
+				ui,
 				client,
 				working_path,
 				&file,
@@ -99,12 +102,13 @@ pub(crate) async fn execute_command(
 }
 
 async fn list_directory(
+	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	directory: Option<String>,
 ) -> Result<()> {
 	let directory_str = working_path.navigate(directory.as_deref().unwrap_or("")).0;
-	let client = client.get().await?;
+	let client = client.get(ui).await?;
 	let Some(directory) = client
 		.find_item_at_path(&directory_str)
 		.await
@@ -144,13 +148,14 @@ enum PrintFileLines {
 	Tail(usize),
 }
 async fn print_file(
+	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	file: &str,
 	lines: PrintFileLines,
 ) -> Result<()> {
 	let file_str = working_path.navigate(file).0;
-	let client = client.get().await?;
+	let client = client.get(ui).await?;
 	let Some(file) = client
 		.find_item_at_path(file)
 		.await
@@ -164,7 +169,7 @@ async fn print_file(
 		_ => return Err(anyhow::anyhow!("Not a file: {}", file_str)),
 	};
 	if file.size() < 1024
-		|| prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
+		|| ui.prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
 	{
 		let content = client.download_file(&file).await?;
 		let content = String::from_utf8_lossy(&content);
