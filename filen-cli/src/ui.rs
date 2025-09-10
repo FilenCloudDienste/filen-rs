@@ -13,6 +13,8 @@ impl UI {
 		UI {
 			theme: dialoguer::theme::ColorfulTheme {
 				prompt_prefix: style("›".to_string()).cyan().bold(),
+				prompt_suffix: style("›".to_string()).dim().bold(),
+				success_prefix: style("›".to_string()).dim().bold(),
 				..Default::default()
 			},
 			repl_input_theme: Self::repl_input_theme_for_user(None),
@@ -20,6 +22,7 @@ impl UI {
 		}
 	}
 
+	// todo: is this necessary anymore?
 	pub(crate) fn set_user(&mut self, user: Option<&str>) {
 		self.repl_input_theme = Self::repl_input_theme_for_user(user);
 	}
@@ -39,13 +42,10 @@ impl UI {
 		}
 	}
 
-	pub(crate) fn println(&self, msg: &str) {
-		println!("{}", msg);
-		// todo: use ui.println() everywhere?
-	}
-
+	/// Print a colorful banner at the top of the application (contains app name and version)
 	pub(crate) fn print_banner(&self) {
 		let banner_text = "Filen CLI v0.0.0";
+		// todo: print actual version
 		let width: usize = termsize::get().map(|size| size.cols).unwrap_or(10).into();
 		let banner = "=".repeat((width - banner_text.len() - 2) / 2)
 			+ " " + banner_text
@@ -58,6 +58,37 @@ impl UI {
 		println!("{}", banner);
 	}
 
+	pub(crate) fn println(&self, msg: &str) {
+		println!("{}", msg);
+		// todo: use ui.println() everywhere?
+	}
+	pub(crate) fn eprintln(&self, msg: &str) {
+		eprintln!("{}", msg);
+	}
+
+	// print with formatting
+
+	/// Print a message with a success icon
+	pub(crate) fn print_success(&self, msg: &str) {
+		self.println(&format!("{} {}", style("✔").green(), msg));
+	}
+
+	/// Print a message with a failure icon
+	pub(crate) fn print_failure(&self, msg: &str) {
+		self.eprintln(&format!("{} {}", style("✘").red(), style(msg).dim()));
+	}
+
+	/// Print a table of key-value pairs
+	pub(crate) fn print_key_value_table(&self, table: &[(&str, &str)]) {
+		let key_width = table.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+		for (key, value) in table {
+			self.println(&format!("{:>key_width$} {}", style(key).dim(), value));
+		}
+	}
+
+	// prompt
+
+	/// Prompt the user for input in the REPL (contains some special formatting)
 	pub(crate) fn prompt_repl(&mut self, path: &str) -> Result<String> {
 		let input = dialoguer::Input::with_theme(&self.repl_input_theme)
 			.history_with(&mut self.history)
@@ -67,6 +98,7 @@ impl UI {
 		Ok(input)
 	}
 
+	/// Prompt the user for text input
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
 		let input = dialoguer::Input::with_theme(&self.theme)
 			.history_with(&mut self.history)
@@ -76,6 +108,7 @@ impl UI {
 		Ok(input)
 	}
 
+	/// Prompt the user for a password (no echo)
 	pub(crate) fn prompt_password(&mut self, msg: &str) -> Result<String> {
 		let password = dialoguer::Password::with_theme(&self.theme)
 			.with_prompt(msg.trim())
@@ -84,6 +117,7 @@ impl UI {
 		Ok(password)
 	}
 
+	/// Prompt the user for a yes/no input
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
 		let result = dialoguer::Confirm::with_theme(&self.theme)
 			.with_prompt(msg.trim())

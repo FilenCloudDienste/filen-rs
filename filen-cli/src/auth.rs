@@ -148,7 +148,7 @@ async fn authenticate_from_keyring() -> Result<Client> {
 
 /// Authenticate using credentials provided interactively.
 async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
-	let email = ui.prompt("Email: ")?;
+	let email = ui.prompt("Email:")?;
 	let password = ui.prompt_password("Password: ")?;
 	let client =
 		login_and_optionally_prompt_two_factor_code(ui, email.trim().to_string(), password.trim())
@@ -162,7 +162,7 @@ async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 		LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 			.write(&sdk_config)
 			.context("Failed to write SDK config to keyring")?;
-		println!("Saved credentials.");
+		ui.print_success("Saved credentials");
 	}
 
 	Ok(client)

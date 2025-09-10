@@ -20,3 +20,4 @@ base64 = "0.22.1"
 dialoguer = { version = "0.12.0", features = ["history", "password"] }
 tiny-gradient = "0.1.0"
 termsize = "0.1.9"
+humansize = "2.1.3"

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use filen_sdk_rs::fs::{
 	FSObject, HasName as _, HasUUID as _,
-	dir::DirectoryType,
+	dir::{DirectoryType, traits::HasDirMeta},
 	file::{enums::RemoteFileType, traits::HasFileInfo as _},
 };
 
@@ -30,6 +30,37 @@ pub(crate) enum Commands {
 		file: String,
 		/// Number of lines to print (default: 10)
 		lines: Option<usize>,
+	},
+	/// Show information about a file or directory
+	Stat {
+		/// File or directory to show information about
+		file_or_directory: String,
+	},
+	/// Show information about the file system
+	Statfs,
+	/// Create a new directory
+	Mkdir {
+		/// Directory to create
+		directory: String,
+	},
+	/// Remove a file or directory
+	Rm {
+		/// File or directory to remove
+		file_or_directory: String,
+	},
+	/// Move a file or directory
+	Mv {
+		/// Source file or directory
+		source: String,
+		/// Destination file or directory
+		destination: String,
+	},
+	/// Copy a file or directory
+	Cp {
+		/// Source file or directory
+		source: String,
+		/// Destination file or directory
+		destination: String,
 	},
 	/// Delete saved credentials and exit
 	Logout,
@@ -81,12 +112,29 @@ pub(crate) async fn execute_command(
 			.await?;
 			None
 		}
+		Commands::Stat { file_or_directory } => {
+			print_file_or_directory_info(ui, client, working_path, &file_or_directory).await?;
+			None
+		}
+		Commands::Statfs => todo!(),
+		Commands::Mkdir { directory: _ } => todo!(),
+		Commands::Rm {
+			file_or_directory: _,
+		} => todo!(),
+		Commands::Mv {
+			source: _,
+			destination: _,
+		} => todo!(),
+		Commands::Cp {
+			source: _,
+			destination: _,
+		} => todo!(),
 		Commands::Logout => {
 			let deleted = crate::auth::delete_credentials()?;
 			if deleted {
-				println!("Credentials deleted.");
+				ui.print_success("Credentials deleted");
 			} else {
-				println!("No credentials found.");
+				ui.print_failure("No credentials found");
 			}
 			Some(CommandResult {
 				exit: true,
@@ -151,17 +199,17 @@ async fn print_file(
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
-	file: &str,
+	file_str: &str,
 	lines: PrintFileLines,
 ) -> Result<()> {
-	let file_str = working_path.navigate(file).0;
+	let file_str = working_path.navigate(file_str).0;
 	let client = client.get(ui).await?;
 	let Some(file) = client
-		.find_item_at_path(file)
+		.find_item_at_path(file_str.clone())
 		.await
 		.context("Failed to find cat file")?
 	else {
-		return Err(anyhow::anyhow!("No such file: {}", file));
+		return Err(anyhow::anyhow!("No such file: {}", file_str));
 	};
 	let file = match file {
 		FSObject::File(file) => RemoteFileType::File(file),
@@ -184,6 +232,89 @@ async fn print_file(
 				.join("\n"),
 		};
 		println!("{}", content);
+	}
+	Ok(())
+}
+
+async fn print_file_or_directory_info(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	file_or_directory_str: &str,
+) -> Result<()> {
+	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
+	let client = client.get(ui).await?;
+	let Some(item) = client
+		.find_item_at_path(file_or_directory_str.clone())
+		.await
+		.context("Failed to find item")?
+	else {
+		return Err(anyhow::anyhow!(
+			"No such file or directory: {}",
+			file_or_directory_str
+		));
+	};
+	match item {
+		// todo: better date formatting?
+		FSObject::File(file) => {
+			ui.print_key_value_table(&[
+				("Name", file.name().unwrap_or_else(|| file.uuid().as_ref())),
+				("Type", "File"),
+				(
+					"Size",
+					&humansize::format_size(file.size(), humansize::BINARY),
+				),
+				(
+					"Modified",
+					&file
+						.last_modified()
+						.map(|d| d.to_string())
+						.unwrap_or("-".to_string()),
+				),
+				(
+					"Created",
+					&file
+						.created()
+						.map(|d| d.to_string())
+						.unwrap_or("-".to_string()),
+				),
+			]);
+		}
+		FSObject::Dir(dir) => {
+			ui.print_key_value_table(&[
+				("Name", dir.name().unwrap_or_else(|| dir.uuid().as_ref())),
+				("Type", "Directory"),
+				(
+					"Created",
+					&dir.created()
+						.map(|d| d.to_string())
+						.unwrap_or("-".to_string()),
+				),
+				// todo: aggregate directory size, file count, ...?
+			]);
+		}
+		FSObject::Root(_) => {
+			ui.print_key_value_table(&[
+				("Type", "Root"),
+				// todo: print root info
+			]);
+		}
+		FSObject::RootWithMeta(root) => {
+			let dir = root.get_meta();
+			ui.print_key_value_table(&[
+				("Name", dir.name().unwrap_or("(root)")),
+				("Type", "Root"),
+				(
+					"Created",
+					&dir.created()
+						.map(|d| d.to_string())
+						.unwrap_or("-".to_string()),
+				),
+			]);
+		}
+		FSObject::SharedFile(_) => {
+			ui.print_failure("Cannot show information for shared file");
+		}
 	}
 	Ok(())
 }
