@@ -300,13 +300,21 @@ async fn set_up_contact_no_add<'a>(
 			}
 		},
 		async {
+			for contact in share_client.get_contacts().await.unwrap() {
+				share_client.delete_contact(contact.uuid).await.unwrap();
+			}
+		},
+		async {
 			for contact in client.list_outgoing_contact_requests().await.unwrap() {
 				client.cancel_contact_request(contact.uuid).await.unwrap();
 			}
 		},
 		async {
-			for contact in client.list_incoming_contact_requests().await.unwrap() {
-				client.deny_contact_request(contact.uuid).await.unwrap();
+			for contact in share_client.list_incoming_contact_requests().await.unwrap() {
+				share_client
+					.deny_contact_request(contact.uuid)
+					.await
+					.unwrap();
 			}
 		},
 		async {
