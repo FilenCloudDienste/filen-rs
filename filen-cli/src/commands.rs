@@ -6,7 +6,12 @@ use filen_sdk_rs::fs::{
 	file::{enums::RemoteFileType, traits::HasFileInfo as _},
 };
 
-use crate::{CommandResult, auth::LazyClient, ui::UI, util::RemotePath};
+use crate::{
+	CommandResult,
+	auth::LazyClient,
+	ui::{self, UI},
+	util::RemotePath,
+};
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
@@ -285,7 +290,6 @@ async fn print_file_or_directory_info(
 		));
 	};
 	match item {
-		// todo: better date formatting?
 		FSObject::File(file) => {
 			ui.print_key_value_table(&[
 				("Name", file.name().unwrap_or_else(|| file.uuid().as_ref())),
@@ -298,14 +302,14 @@ async fn print_file_or_directory_info(
 					"Modified",
 					&file
 						.last_modified()
-						.map(|d| d.to_string())
+						.map(|d| ui::format_date(&d))
 						.unwrap_or("-".to_string()),
 				),
 				(
 					"Created",
 					&file
 						.created()
-						.map(|d| d.to_string())
+						.map(|d| ui::format_date(&d))
 						.unwrap_or("-".to_string()),
 				),
 				("UUID", file.uuid().as_ref()),
@@ -318,7 +322,7 @@ async fn print_file_or_directory_info(
 				(
 					"Created",
 					&dir.created()
-						.map(|d| d.to_string())
+						.map(|d| ui::format_date(&d))
 						.unwrap_or("-".to_string()),
 				),
 				("UUID", dir.uuid().as_ref()),
@@ -326,11 +330,14 @@ async fn print_file_or_directory_info(
 			]);
 		}
 		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+			let user_info = client
+				.get_user_info()
+				.await
+				.context("Failed to get user info")?;
 			ui.print_key_value_table(&[
-				("Type", "Root Directory"),
-				("Used", "..."),
-				("Total", "..."),
-				// todo: print root information (statfs), missing endpoint /v3/user/account in filen-sdk-rs
+				("Type", "Drive"),
+				("Used", &ui::format_size(user_info.storage_used)),
+				("Total", &ui::format_size(user_info.max_storage)),
 			]);
 		}
 		FSObject::SharedFile(_) => {
@@ -402,10 +409,10 @@ async fn delete_file_or_directory(
 		return Ok(());
 	}
 	match item {
-		FSObject::File(file) => {
+		FSObject::File(mut file) => {
 			if permanent {
 				client
-					.delete_file_permanently(file.into_owned()) // todo: is this correct?
+					.delete_file_permanently(file.into_owned())
 					.await
 					.context("Failed to permanently delete file")?;
 				ui.print_success(&format!(
@@ -414,16 +421,16 @@ async fn delete_file_or_directory(
 				));
 			} else {
 				client
-					.trash_file(&mut file.into_owned()) // todo: is this correct?
+					.trash_file(file.to_mut())
 					.await
 					.context("Failed to trash file")?;
 				ui.print_success(&format!("Trashed file: {}", file_or_directory_str));
 			}
 		}
-		FSObject::Dir(dir) => {
+		FSObject::Dir(mut dir) => {
 			if permanent {
 				client
-					.delete_dir_permanently(dir.into_owned()) // todo: is this correct?
+					.delete_dir_permanently(dir.into_owned())
 					.await
 					.context("Failed to permanently delete directory")?;
 				ui.print_success(&format!(
@@ -432,7 +439,7 @@ async fn delete_file_or_directory(
 				));
 			} else {
 				client
-					.trash_dir(&mut dir.into_owned()) // todo: is this correct?
+					.trash_dir(dir.to_mut())
 					.await
 					.context("Failed to trash directory")?;
 				ui.print_success(&format!("Trashed directory: {}", file_or_directory_str));

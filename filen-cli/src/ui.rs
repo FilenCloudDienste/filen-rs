@@ -128,3 +128,11 @@ impl UI {
 		Ok(result)
 	}
 }
+
+pub(crate) fn format_date(date: &chrono::DateTime<chrono::Utc>) -> String {
+	date.format("%Y-%m-%d %H:%M:%S (UTC)").to_string()
+}
+
+pub(crate) fn format_size(size: u64) -> String {
+	humansize::format_size(size, humansize::BINARY)
+}
