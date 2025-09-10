@@ -546,7 +546,7 @@ test("meta updates", async () => {
 	expect(updatedDir.favorited).toBe(true)
 })
 
-test.only("color", async () => {
+test("color", async () => {
 	let dir = await state.createDir(testDir, "color-dir")
 	expect(dir.color).toBe("default")
 
@@ -573,6 +573,18 @@ test.only("color", async () => {
 	dir = await state.setDirColor(dir, "#123456")
 	expect(dir.color).toBe("#123456")
 	expect(dir).toEqual(await state.getDir(dir.uuid))
+})
+
+test("search", async () => {
+	const dir = await state.createDir(testDir, "search-dir-124asdfas;dlkfj")
+	const file = await state.uploadFile(new TextEncoder().encode("search file content"), {
+		parent: dir,
+		name: "search-file-124asdfas;dlkfj.txt"
+	})
+
+	const results = await state.findItemMatchesForName("124asdfas;dlkfj")
+	expect(results.find(i => i.item.uuid === dir.uuid)).toBeDefined()
+	expect(results.find(i => i.item.uuid === file.uuid)).toBeDefined()
 })
 
 afterAll(async () => {

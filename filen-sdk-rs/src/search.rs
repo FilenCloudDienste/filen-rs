@@ -232,6 +232,48 @@ impl Client {
 	}
 }
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod js_impl {
+	use serde::Serialize;
+	use tsify::Tsify;
+	use wasm_bindgen::prelude::wasm_bindgen;
+
+	use crate::{auth::Client, js::NonRootItemTagged};
+
+	#[derive(Serialize, Tsify)]
+	#[tsify(into_wasm_abi)]
+	pub struct ItemMatch {
+		pub item: NonRootItemTagged,
+		pub path: String,
+	}
+
+	impl wasm_bindgen::__rt::VectorIntoJsValue for ItemMatch {
+		fn vector_into_jsvalue(
+			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+		) -> wasm_bindgen::JsValue {
+			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+		}
+	}
+
+	#[wasm_bindgen]
+	impl Client {
+		#[wasm_bindgen(js_name = "findItemMatchesForName")]
+		pub async fn find_item_matches_for_name_js(
+			&self,
+			name: String,
+		) -> Result<Vec<ItemMatch>, crate::error::Error> {
+			let matches = self.find_item_matches_for_name(&name).await?;
+			Ok(matches
+				.into_iter()
+				.map(|(item, path)| ItemMatch {
+					item: item.into(),
+					path,
+				})
+				.collect())
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
