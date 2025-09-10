@@ -6,6 +6,7 @@ use crate::{
 	fs::file::{HasFileInfo, enums::RemoteFileType, meta::FileMetaChanges},
 	js::{File, FileEnum, UploadFileParams},
 };
+use filen_types::fs::UuidStr;
 #[cfg(feature = "node")]
 use napi_derive::napi;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -14,6 +15,11 @@ use wasm_bindgen::prelude::*;
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
 #[cfg_attr(feature = "node", napi)]
 impl Client {
+	#[wasm_bindgen(js_name = "getFile")]
+	pub async fn get_file_js(&self, uuid: UuidStr) -> Result<File, Error> {
+		Ok(self.get_file(uuid).await?.into())
+	}
+
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
 		wasm_bindgen(js_name = "uploadFile")

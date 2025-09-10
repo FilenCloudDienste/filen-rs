@@ -9,6 +9,7 @@ use crate::{
 	fs::dir::HasContents,
 	js::{AnyDirEnum, AnyDirEnumWithShareInfo, DirSizeResponse},
 };
+use filen_types::fs::UuidStr;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[cfg(feature = "node")]
 use napi_derive::napi;
@@ -40,6 +41,12 @@ impl Client {
 	pub fn root_js(&self) -> Root {
 		self.root().clone().into()
 	}
+
+	#[wasm_bindgen(js_name = "getDir")]
+	pub async fn get_dir_js(&self, uuid: UuidStr) -> Result<Dir, Error> {
+		Ok(self.get_dir(uuid).await?.into())
+	}
+
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
 		wasm_bindgen(js_name = "createDir")
