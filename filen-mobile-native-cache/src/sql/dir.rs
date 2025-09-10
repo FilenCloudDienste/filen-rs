@@ -11,6 +11,7 @@ use filen_sdk_rs::fs::{
 	file::RemoteFile,
 };
 use filen_types::{
+	api::v3::dir::color::DirColor,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ParentUuid, UuidStr},
 };
@@ -120,7 +121,7 @@ pub struct DBDir {
 	pub(crate) uuid: UuidStr,
 	pub(crate) parent: ParentUuid,
 	pub(crate) favorite_rank: i64,
-	pub(crate) color: Option<String>,
+	pub(crate) color: DirColor<'static>,
 	pub(crate) last_listed: i64,
 	pub(crate) local_data: Option<JsonObject>,
 	pub(crate) meta: DBDirMeta,
@@ -335,7 +336,7 @@ impl PartialEq<RemoteDirectory> for DBDir {
 		self.uuid == *other.uuid()
 			&& self.parent == *other.parent()
 			&& DBItemTrait::name(self) == other.name()
-			&& self.color.as_deref() == other.color()
+			&& self.color == other.color()
 			&& self.created() == other.created().map(|t| t.timestamp_millis())
 			&& (self.favorite_rank > 0) == other.favorited()
 	}

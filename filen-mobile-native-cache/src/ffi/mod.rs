@@ -86,7 +86,7 @@ impl From<DBDir> for FfiDir {
 		FfiDir {
 			uuid: dir.uuid.to_string(),
 			parent: dir.parent.to_string(),
-			color: dir.color,
+			color: dir.color.into(),
 			favorite_rank: dir.favorite_rank,
 			last_listed: dir.last_listed,
 			local_data: dir.local_data.map(|o| o.to_map()),

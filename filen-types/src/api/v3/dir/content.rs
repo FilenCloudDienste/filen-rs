@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+	api::v3::dir::color::DirColor,
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
 	fs::{ParentUuid, UuidStr},
@@ -51,7 +52,7 @@ pub struct Directory<'a> {
 	#[serde(rename = "name")]
 	pub meta: Cow<'a, EncryptedString>,
 	pub parent: ParentUuid,
-	pub color: Option<Cow<'a, str>>,
+	pub color: DirColor<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	#[serde(with = "crate::serde::boolean::number")]

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
+	api::v3::dir::color::DirColor,
 	crypto::EncryptedString,
 	fs::{ObjectType, ParentUuid, UuidStr},
 };
@@ -57,13 +58,17 @@ impl HasContents for RootDirectory {
 pub struct RootDirectoryWithMeta {
 	pub(crate) uuid: UuidStr,
 
-	pub(crate) color: Option<String>,
+	pub(crate) color: DirColor<'static>,
 
 	pub(crate) meta: DirectoryMeta<'static>,
 }
 
 impl RootDirectoryWithMeta {
-	pub fn from_meta(uuid: UuidStr, color: Option<String>, meta: DirectoryMeta<'static>) -> Self {
+	pub fn from_meta(
+		uuid: UuidStr,
+		color: DirColor<'static>,
+		meta: DirectoryMeta<'static>,
+	) -> Self {
 		Self { uuid, color, meta }
 	}
 }
@@ -126,7 +131,7 @@ pub struct RemoteDirectory {
 	pub uuid: UuidStr,
 	pub parent: ParentUuid,
 
-	pub color: Option<String>, // todo use Color struct
+	pub color: DirColor<'static>, // todo use Color struct
 	pub favorited: bool,
 
 	pub meta: DirectoryMeta<'static>,
@@ -136,7 +141,7 @@ impl RemoteDirectory {
 	pub fn from_encrypted(
 		uuid: UuidStr,
 		parent: ParentUuid,
-		color: Option<String>,
+		color: DirColor<'static>,
 		favorited: bool,
 		meta: Cow<'_, EncryptedString>,
 		decrypter: &impl MetaCrypter,
@@ -154,7 +159,7 @@ impl RemoteDirectory {
 	pub fn from_meta(
 		uuid: UuidStr,
 		parent: ParentUuid,
-		color: Option<String>,
+		color: DirColor<'static>,
 		favorited: bool,
 		meta: DirectoryMeta<'static>,
 	) -> Self {
@@ -174,7 +179,7 @@ impl RemoteDirectory {
 		Ok(Self {
 			uuid: UuidStr::new_v4(),
 			parent,
-			color: None,
+			color: DirColor::Default,
 			favorited: false,
 			meta: DirectoryMeta::Decoded(DecryptedDirectoryMeta {
 				name: Cow::Owned(name),
@@ -262,7 +267,7 @@ impl SetRemoteInfo for RemoteDirectory {
 }
 
 impl HasRemoteDirInfo for RemoteDirectory {
-	fn color(&self) -> Option<&str> {
-		self.color.as_deref()
+	fn color(&self) -> DirColor<'_> {
+		self.color.borrow_clone()
 	}
 }

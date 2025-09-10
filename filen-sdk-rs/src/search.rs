@@ -166,7 +166,7 @@ impl Client {
 						NonRootFSObject::Dir(Cow::Owned(RemoteDirectory::from_encrypted(
 							found_dir.uuid,
 							found_dir.parent.into(),
-							found_dir.color.map(|s| s.into_owned()),
+							found_dir.color,
 							found_dir.favorited,
 							found_dir.metadata,
 							self.crypter(),

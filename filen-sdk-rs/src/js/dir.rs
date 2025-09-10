@@ -138,6 +138,56 @@ super::napi_to_json_impl!(Root);
 #[cfg(feature = "node")]
 super::napi_from_json_impl!(Root);
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DirColor {
+	Default,
+	Blue,
+	Green,
+	Purple,
+	Red,
+	Gray,
+	#[serde(untagged)]
+	Custom(String),
+}
+
+// tsify does not support untagged variants yet: https://github.com/madonoharu/tsify/issues/52
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const TS_DIR_COLOR: &'static str =
+	r#"export type DirColor = "default" | "blue" | "green" | "purple" | "red" | "gray" | string;"#;
+
+impl From<filen_types::api::v3::dir::color::DirColor<'_>> for DirColor {
+	fn from(color: filen_types::api::v3::dir::color::DirColor) -> Self {
+		match color {
+			filen_types::api::v3::dir::color::DirColor::Default => DirColor::Default,
+			filen_types::api::v3::dir::color::DirColor::Blue => DirColor::Blue,
+			filen_types::api::v3::dir::color::DirColor::Green => DirColor::Green,
+			filen_types::api::v3::dir::color::DirColor::Purple => DirColor::Purple,
+			filen_types::api::v3::dir::color::DirColor::Red => DirColor::Red,
+			filen_types::api::v3::dir::color::DirColor::Gray => DirColor::Gray,
+			filen_types::api::v3::dir::color::DirColor::Custom(c) => {
+				DirColor::Custom(c.into_owned())
+			}
+		}
+	}
+}
+
+impl From<DirColor> for filen_types::api::v3::dir::color::DirColor<'static> {
+	fn from(color: DirColor) -> Self {
+		match color {
+			DirColor::Default => filen_types::api::v3::dir::color::DirColor::Default,
+			DirColor::Blue => filen_types::api::v3::dir::color::DirColor::Blue,
+			DirColor::Green => filen_types::api::v3::dir::color::DirColor::Green,
+			DirColor::Purple => filen_types::api::v3::dir::color::DirColor::Purple,
+			DirColor::Red => filen_types::api::v3::dir::color::DirColor::Red,
+			DirColor::Gray => filen_types::api::v3::dir::color::DirColor::Gray,
+			DirColor::Custom(c) => {
+				filen_types::api::v3::dir::color::DirColor::Custom(Cow::Owned(c))
+			}
+		}
+	}
+}
+
 #[derive(Clone)]
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
@@ -148,8 +198,7 @@ super::napi_from_json_impl!(Root);
 pub struct Dir {
 	pub uuid: UuidStr,
 	pub parent: ParentUuid,
-	#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), tsify(optional))]
-	pub color: Option<String>,
+	pub color: DirColor,
 	pub favorited: bool,
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
@@ -177,7 +226,7 @@ impl From<RemoteDirectory> for Dir {
 		Dir {
 			uuid: dir.uuid,
 			parent: dir.parent,
-			color: dir.color,
+			color: dir.color.into(),
 			favorited: dir.favorited,
 			meta: dir.meta.into(),
 		}
@@ -189,7 +238,7 @@ impl From<Dir> for RemoteDirectory {
 		RemoteDirectory::from_meta(
 			dir.uuid,
 			dir.parent,
-			dir.color,
+			dir.color.into(),
 			dir.favorited,
 			dir.meta.into(),
 		)
@@ -286,15 +335,14 @@ impl<'a>
 #[tsify(from_wasm_abi, into_wasm_abi)]
 pub struct RootWithMeta {
 	pub uuid: UuidStr,
-	#[tsify(optional)]
-	pub color: Option<String>,
+	pub color: DirColor,
 	#[tsify(optional, type = "DecryptedDirMeta")]
 	pub meta: DirMeta,
 }
 
 impl From<RootWithMeta> for RootDirectoryWithMeta {
 	fn from(dir: RootWithMeta) -> Self {
-		RootDirectoryWithMeta::from_meta(dir.uuid, dir.color, dir.meta.into())
+		RootDirectoryWithMeta::from_meta(dir.uuid, dir.color.into(), dir.meta.into())
 	}
 }
 
@@ -302,7 +350,7 @@ impl From<RootDirectoryWithMeta> for RootWithMeta {
 	fn from(dir: RootDirectoryWithMeta) -> Self {
 		RootWithMeta {
 			uuid: *dir.uuid(),
-			color: dir.color,
+			color: dir.color.into(),
 			meta: dir.meta.into(),
 		}
 	}
@@ -427,13 +475,11 @@ mod serde_impls {
 		where
 			S: serde::Serializer,
 		{
-			let num_fields = 4 + if self.color.is_some() { 1 } else { 0 };
+			let num_fields = 5;
 			let mut state = serializer.serialize_struct("Dir", num_fields)?;
 			state.serialize_field("uuid", &self.uuid)?;
 			state.serialize_field("parent", &self.parent)?;
-			if let Some(color) = &self.color {
-				state.serialize_field("color", color)?;
-			}
+			state.serialize_field("color", &self.color)?;
 			state.serialize_field("favorited", &self.favorited)?;
 			match self.meta.as_encoded_or_decoded() {
 				EncodedOrDecoded::Encoded(encoded) => {
@@ -449,7 +495,7 @@ mod serde_impls {
 	struct DirIntermediate {
 		uuid: UuidStr,
 		parent: ParentUuid,
-		color: Option<String>,
+		color: DirColor,
 		favorited: bool,
 		meta: Option<DecryptedDirMeta>,
 		// HIDDEN_META_KEY
@@ -484,12 +530,10 @@ mod serde_impls {
 		where
 			S: serde::Serializer,
 		{
-			let num_fields = 2 + if self.color.is_some() { 1 } else { 0 };
+			let num_fields = 3;
 			let mut state = serializer.serialize_struct("RootDirWithMeta", num_fields)?;
 			state.serialize_field("uuid", &self.uuid)?;
-			if let Some(color) = &self.color {
-				state.serialize_field("color", color)?;
-			}
+			state.serialize_field("color", &self.color)?;
 			match self.meta.as_encoded_or_decoded() {
 				EncodedOrDecoded::Encoded(encoded) => {
 					state.serialize_field(HIDDEN_META_KEY, &encoded)?
@@ -503,7 +547,7 @@ mod serde_impls {
 	#[derive(Deserialize)]
 	struct RootWithMetaIntermediate<'a> {
 		uuid: UuidStr,
-		color: Option<String>,
+		color: DirColor,
 		meta: Option<DecryptedDirMeta>,
 		// HIDDEN_META_KEY
 		#[serde(rename = "__hiddenMeta")]

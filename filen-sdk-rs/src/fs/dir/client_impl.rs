@@ -116,7 +116,7 @@ impl Client {
 			} else {
 				response.parent
 			},
-			response.color.map(|s| s.into_owned()),
+			response.color,
 			response.favorited,
 			response.metadata,
 			self.crypter(),
@@ -158,7 +158,7 @@ impl Client {
 				RemoteDirectory::from_encrypted(
 					d.uuid,
 					d.parent,
-					d.color.map(|s| s.into_owned()),
+					d.color,
 					d.favorited,
 					d.meta,
 					self.crypter(),
@@ -210,7 +210,7 @@ impl Client {
 						None => return None,
 						Some(parent) => parent,
 					},
-					response_dir.color.map(|s| s.into_owned()),
+					response_dir.color,
 					response_dir.favorited,
 					response_dir.meta,
 					self.crypter(),

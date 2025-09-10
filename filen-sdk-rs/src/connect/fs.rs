@@ -1,9 +1,12 @@
 use std::borrow::Cow;
 
 use filen_types::{
-	api::v3::shared::{
-		r#in::{SharedDirIn, SharedFileIn},
-		out::{SharedDirOut, SharedFileOut},
+	api::v3::{
+		dir::color::DirColor,
+		shared::{
+			r#in::{SharedDirIn, SharedFileIn},
+			out::{SharedDirOut, SharedFileOut},
+		},
 	},
 	fs::UuidStr,
 };
@@ -51,7 +54,7 @@ pub struct SharedDirectory {
 struct DirInfo {
 	uuid: UuidStr,
 	parent: Option<UuidStr>,
-	color: Option<String>,
+	color: DirColor<'static>,
 	metadata: DirectoryMeta<'static>,
 	write_access: bool,
 }
@@ -93,7 +96,7 @@ impl SharedDirectory {
 			DirInfo {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
-				color: shared_dir.color.map(|s| s.into_owned()),
+				color: shared_dir.color.into_owned(),
 				metadata: DirectoryMeta::from_rsa_encrypted(shared_dir.metadata, private_key)
 					.into_owned(),
 				write_access: shared_dir.write_access,
@@ -114,7 +117,7 @@ impl SharedDirectory {
 			DirInfo {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
-				color: shared_dir.color.map(|s| s.into_owned()),
+				color: shared_dir.color.into_owned(),
 				metadata: DirectoryMeta::from_encrypted(shared_dir.metadata, crypter).into_owned(),
 				write_access: shared_dir.write_access,
 			},

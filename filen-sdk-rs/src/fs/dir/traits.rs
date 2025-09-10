@@ -1,5 +1,8 @@
 use chrono::{DateTime, Utc};
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::{
+	api::v3::dir::color::DirColor,
+	fs::{ParentUuid, UuidStr},
+};
 
 use crate::{
 	error::Error,
@@ -30,7 +33,7 @@ pub trait HasUUIDContents: HasContents + HasUUID {}
 impl<T: HasContents + HasUUID> HasUUIDContents for T {}
 
 pub trait HasRemoteDirInfo {
-	fn color(&self) -> Option<&str>;
+	fn color(&self) -> DirColor<'_>;
 }
 
 pub trait HasDirInfo {

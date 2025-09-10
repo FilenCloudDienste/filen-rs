@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::UuidStr};
+use crate::{
+	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
+	fs::UuidStr,
+};
 
 pub const ENDPOINT: &str = "v3/dir/link/content";
 
@@ -32,7 +35,7 @@ pub struct Directory<'a> {
 	pub metadata: Cow<'a, EncryptedString>,
 	#[serde(with = "chrono::serde::ts_seconds")]
 	pub timestamp: DateTime<Utc>,
-	pub color: Option<Cow<'a, str>>,
+	pub color: DirColor<'a>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

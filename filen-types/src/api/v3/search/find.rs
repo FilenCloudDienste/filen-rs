@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+	api::v3::dir::color::DirColor,
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, Sha256Hash},
 	fs::UuidStr,
@@ -59,7 +60,7 @@ pub struct SearchFindDirectory<'a> {
 	pub uuid: UuidStr,
 	pub metadata: Cow<'a, EncryptedString>,
 	pub parent: UuidStr,
-	pub color: Option<Cow<'a, str>>,
+	pub color: DirColor<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,

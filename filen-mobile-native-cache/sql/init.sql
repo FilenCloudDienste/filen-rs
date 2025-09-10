@@ -71,6 +71,7 @@ CREATE TABLE files_meta (
 CREATE TABLE dirs (
 	id BIGINT PRIMARY KEY NOT NULL,
 	favorite_rank INTEGER NOT NULL DEFAULT 0, -- IOS uses this for sorting
+	-- DirColor type
 	color TEXT,
 	-- 0 = decoded, 1 = decrypted(raw or utf8), 2 = encrypted, 3 = rsa encrypted
 	metadata_state SMALLINT NOT NULL CHECK (

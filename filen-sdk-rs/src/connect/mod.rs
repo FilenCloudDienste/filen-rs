@@ -765,7 +765,7 @@ impl Client {
 				RemoteDirectory::from_encrypted(
 					d.uuid,
 					d.parent.into(),
-					d.color.map(|c| c.into_owned()),
+					d.color,
 					false,
 					d.metadata,
 					crypter,

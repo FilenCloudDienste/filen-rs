@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::UuidStr};
+use crate::{
+	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
+	fs::UuidStr,
+};
 
 pub const ENDPOINT: &str = "v3/shared/out";
 
@@ -54,7 +57,7 @@ pub struct SharedDirOut<'a> {
 	pub receiver_id: u64,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub write_access: bool,
-	pub color: Option<Cow<'a, str>>,
+	pub color: DirColor<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	#[serde(with = "crate::serde::boolean::number", rename = "is_sync")]

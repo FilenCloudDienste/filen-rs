@@ -1,3 +1,4 @@
+pub mod color;
 pub mod content;
 pub mod create;
 pub mod delete;
@@ -23,6 +24,7 @@ pub struct Request {
 }
 
 use crate::{
+	api::v3::dir::color::DirColor,
 	crypto::EncryptedString,
 	fs::{ParentUuid, UuidStr},
 };
@@ -37,5 +39,5 @@ pub struct Response<'a> {
 	pub parent: ParentUuid,
 	pub trash: bool,
 	pub favorited: bool,
-	pub color: Option<Cow<'a, str>>,
+	pub color: DirColor<'a>,
 }

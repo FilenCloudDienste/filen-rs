@@ -1,3 +1,4 @@
+pub(crate) mod color;
 pub(crate) mod content;
 pub(crate) mod create;
 pub(crate) mod delete;
