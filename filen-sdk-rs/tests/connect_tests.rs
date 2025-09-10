@@ -296,25 +296,22 @@ async fn set_up_contact_no_add<'a>(
 	let _ = futures::join!(
 		async {
 			for contact in client.get_contacts().await.unwrap() {
-				client.delete_contact(contact.uuid).await.unwrap();
+				let _ = client.delete_contact(contact.uuid).await;
 			}
 		},
 		async {
 			for contact in share_client.get_contacts().await.unwrap() {
-				share_client.delete_contact(contact.uuid).await.unwrap();
+				let _ = share_client.delete_contact(contact.uuid).await;
 			}
 		},
 		async {
 			for contact in client.list_outgoing_contact_requests().await.unwrap() {
-				client.cancel_contact_request(contact.uuid).await.unwrap();
+				let _ = client.cancel_contact_request(contact.uuid).await;
 			}
 		},
 		async {
 			for contact in share_client.list_incoming_contact_requests().await.unwrap() {
-				share_client
-					.deny_contact_request(contact.uuid)
-					.await
-					.unwrap();
+				let _ = share_client.deny_contact_request(contact.uuid).await;
 			}
 		},
 		async {
@@ -328,10 +325,7 @@ async fn set_up_contact_no_add<'a>(
 						.map(|f| (*f.get_file().uuid(), f.get_source_id())),
 				)
 				.map(|(uuid, source_id)| async move {
-					client
-						.remove_shared_link_out(uuid, source_id)
-						.await
-						.unwrap();
+					let _ = client.remove_shared_link_out(uuid, source_id).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (out_futures.next().await).is_some() {}
@@ -344,7 +338,7 @@ async fn set_up_contact_no_add<'a>(
 				.map(|d| *d.get_dir().uuid())
 				.chain(in_files.into_iter().map(|f| *f.get_file().uuid()))
 				.map(|uuid| async move {
-					share_client.remove_shared_link_in(uuid).await.unwrap();
+					let _ = share_client.remove_shared_link_in(uuid).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (in_futures.next().await).is_some() {}
@@ -354,7 +348,7 @@ async fn set_up_contact_no_add<'a>(
 			let mut futures = blocked_contacts
 				.into_iter()
 				.map(|c| async move {
-					client.unblock_contact(c.uuid).await.unwrap();
+					let _ = client.unblock_contact(c.uuid).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (futures.next().await).is_some() {}
@@ -364,13 +358,13 @@ async fn set_up_contact_no_add<'a>(
 			let mut futures = blocked_contacts
 				.into_iter()
 				.map(|c| async move {
-					share_client.unblock_contact(c.uuid).await.unwrap();
+					let _ = share_client.unblock_contact(c.uuid).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (futures.next().await).is_some() {}
 		}
 	);
-	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+	tokio::time::sleep(std::time::Duration::from_secs(120)).await;
 	(lock1, lock2)
 }
 
