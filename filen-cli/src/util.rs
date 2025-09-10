@@ -33,6 +33,17 @@ impl RemotePath {
 			RemotePath::new(&new_path)
 		}
 	}
+
+	/// Returns the base name (last segment) of the path.
+	/// If the path is root ("/"), returns None.
+	pub(crate) fn basename(&self) -> Option<&str> {
+		let basename = self.0.rsplit_once('/').map(|(_, name)| name).unwrap(); // always starts with "/"
+		if !basename.is_empty() {
+			Some(basename)
+		} else {
+			None
+		}
+	}
 }
 
 impl Display for RemotePath {
@@ -125,5 +136,6 @@ mod tests {
 		assert_eq!(path.navigate("./file.txt").0, "/root/dir/file.txt");
 		assert_eq!(path.navigate("./../notthedir/.././adir").0, "/root/adir"); // complex
 		assert_eq!(path.navigate("../../..").0, "/"); // root has no parent
+		assert_eq!(path.basename(), Some("dir"));
 	}
 }

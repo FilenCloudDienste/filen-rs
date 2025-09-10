@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use filen_sdk_rs::fs::{
 	FSObject, HasName as _, HasUUID as _,
-	dir::{DirectoryType, traits::HasDirMeta},
+	dir::DirectoryType,
 	file::{enums::RemoteFileType, traits::HasFileInfo as _},
 };
 
@@ -31,13 +31,11 @@ pub(crate) enum Commands {
 		/// Number of lines to print (default: 10)
 		lines: Option<usize>,
 	},
-	/// Show information about a file or directory
+	/// Show information about a file, a directory or the Filen drive
 	Stat {
-		/// File or directory to show information about
+		/// File or directory to show information about ("/" for the Filen drive)
 		file_or_directory: String,
 	},
-	/// Show information about the file system
-	Statfs,
 	/// Create a new directory
 	Mkdir {
 		/// Directory to create
@@ -47,19 +45,22 @@ pub(crate) enum Commands {
 	Rm {
 		/// File or directory to remove
 		file_or_directory: String,
+		/// Permanently delete the file or directory (default: move to trash)
+		#[arg(short, long)]
+		permanent: bool,
 	},
 	/// Move a file or directory
 	Mv {
 		/// Source file or directory
 		source: String,
-		/// Destination file or directory
+		/// Destination parent directory
 		destination: String,
 	},
 	/// Copy a file or directory
 	Cp {
 		/// Source file or directory
 		source: String,
-		/// Destination file or directory
+		/// Destination parent directory
 		destination: String,
 	},
 	/// Delete saved credentials and exit
@@ -116,19 +117,48 @@ pub(crate) async fn execute_command(
 			print_file_or_directory_info(ui, client, working_path, &file_or_directory).await?;
 			None
 		}
-		Commands::Statfs => todo!(),
-		Commands::Mkdir { directory: _ } => todo!(),
+		Commands::Mkdir { directory } => {
+			create_directory(ui, client, working_path, &directory).await?;
+			None
+		}
 		Commands::Rm {
-			file_or_directory: _,
-		} => todo!(),
+			file_or_directory,
+			permanent,
+		} => {
+			delete_file_or_directory(ui, client, working_path, &file_or_directory, permanent)
+				.await?;
+			None
+		}
 		Commands::Mv {
-			source: _,
-			destination: _,
-		} => todo!(),
+			source,
+			destination,
+		} => {
+			move_or_copy_file_or_directory(
+				ui,
+				client,
+				working_path,
+				MoveOrCopy::Move,
+				&source,
+				&destination,
+			)
+			.await?;
+			None
+		}
 		Commands::Cp {
-			source: _,
-			destination: _,
-		} => todo!(),
+			source,
+			destination,
+		} => {
+			move_or_copy_file_or_directory(
+				ui,
+				client,
+				working_path,
+				MoveOrCopy::Copy,
+				&source,
+				&destination,
+			)
+			.await?;
+			None
+		}
 		Commands::Logout => {
 			let deleted = crate::auth::delete_credentials()?;
 			if deleted {
@@ -186,7 +216,7 @@ async fn list_directory(
 		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()))
 		.collect::<Vec<&str>>();
 	files.sort();
-	println!("{}", [directories, files].concat().join("  "));
+	println!("{}", [directories, files].concat().join("  ")); // todo: better output formatting of ls command
 	Ok(())
 }
 
@@ -209,12 +239,12 @@ async fn print_file(
 		.await
 		.context("Failed to find cat file")?
 	else {
-		return Err(anyhow::anyhow!("No such file: {}", file_str));
+		return Err(anyhow!("No such file: {}", file_str));
 	};
 	let file = match file {
 		FSObject::File(file) => RemoteFileType::File(file),
 		FSObject::SharedFile(file) => RemoteFileType::SharedFile(file),
-		_ => return Err(anyhow::anyhow!("Not a file: {}", file_str)),
+		_ => return Err(anyhow!("Not a file: {}", file_str)),
 	};
 	if file.size() < 1024
 		|| ui.prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
@@ -249,7 +279,7 @@ async fn print_file_or_directory_info(
 		.await
 		.context("Failed to find item")?
 	else {
-		return Err(anyhow::anyhow!(
+		return Err(anyhow!(
 			"No such file or directory: {}",
 			file_or_directory_str
 		));
@@ -278,6 +308,7 @@ async fn print_file_or_directory_info(
 						.map(|d| d.to_string())
 						.unwrap_or("-".to_string()),
 				),
+				("UUID", file.uuid().as_ref()),
 			]);
 		}
 		FSObject::Dir(dir) => {
@@ -290,31 +321,218 @@ async fn print_file_or_directory_info(
 						.map(|d| d.to_string())
 						.unwrap_or("-".to_string()),
 				),
+				("UUID", dir.uuid().as_ref()),
 				// todo: aggregate directory size, file count, ...?
 			]);
 		}
-		FSObject::Root(_) => {
+		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
 			ui.print_key_value_table(&[
-				("Type", "Root"),
-				// todo: print root info
-			]);
-		}
-		FSObject::RootWithMeta(root) => {
-			let dir = root.get_meta();
-			ui.print_key_value_table(&[
-				("Name", dir.name().unwrap_or("(root)")),
-				("Type", "Root"),
-				(
-					"Created",
-					&dir.created()
-						.map(|d| d.to_string())
-						.unwrap_or("-".to_string()),
-				),
+				("Type", "Root Directory"),
+				("Used", "..."),
+				("Total", "..."),
+				// todo: print root information (statfs), missing endpoint /v3/user/account in filen-sdk-rs
 			]);
 		}
 		FSObject::SharedFile(_) => {
 			ui.print_failure("Cannot show information for shared file");
 		}
 	}
+	Ok(())
+}
+
+async fn create_directory(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	directory_str: &str,
+) -> Result<()> {
+	let directory_str = working_path.navigate(directory_str);
+	let parent_str = directory_str.navigate("..");
+	let client = client.get(ui).await?;
+	if parent_str.0 == directory_str.0 {
+		return Err(anyhow!("Cannot create root directory"));
+	}
+	let Some(parent) = client
+		.find_item_at_path(parent_str.0.clone())
+		.await
+		.context("Failed to find parent directory")?
+	else {
+		return Err(anyhow!("No such parent directory: {}", parent_str));
+	};
+	let parent = match parent {
+		FSObject::Dir(dir) => DirectoryType::Dir(dir),
+		FSObject::Root(root) => DirectoryType::Root(root),
+		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
+		_ => return Err(anyhow!("Not a directory: {}", parent_str)),
+	};
+	client
+		.create_dir(&parent, directory_str.basename().unwrap().to_string())
+		.await
+		.context("Failed to create directory")?;
+	ui.print_success(&format!("Directory created: {}", directory_str));
+	Ok(())
+	// todo: recursive flag
+}
+
+async fn delete_file_or_directory(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	file_or_directory_str: &str,
+	permanent: bool,
+) -> Result<()> {
+	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
+	let client = client.get(ui).await?;
+	let Some(item) = client
+		.find_item_at_path(file_or_directory_str.clone())
+		.await
+		.context("Failed to find file or directory")?
+	else {
+		return Err(anyhow!(
+			"No such file or directory: {}",
+			file_or_directory_str
+		));
+	};
+	if permanent
+		&& !ui.prompt_confirm(
+			&format!("Permanently delete {}?", file_or_directory_str),
+			false,
+		)? {
+		// todo: make formatting of ui.prompt and ui.print_success more consistent
+		return Ok(());
+	}
+	match item {
+		FSObject::File(file) => {
+			if permanent {
+				client
+					.delete_file_permanently(file.into_owned()) // todo: is this correct?
+					.await
+					.context("Failed to permanently delete file")?;
+				ui.print_success(&format!(
+					"Permanently deleted file: {}",
+					file_or_directory_str
+				));
+			} else {
+				client
+					.trash_file(&mut file.into_owned()) // todo: is this correct?
+					.await
+					.context("Failed to trash file")?;
+				ui.print_success(&format!("Trashed file: {}", file_or_directory_str));
+			}
+		}
+		FSObject::Dir(dir) => {
+			if permanent {
+				client
+					.delete_dir_permanently(dir.into_owned()) // todo: is this correct?
+					.await
+					.context("Failed to permanently delete directory")?;
+				ui.print_success(&format!(
+					"Permanently deleted directory: {}",
+					file_or_directory_str
+				));
+			} else {
+				client
+					.trash_dir(&mut dir.into_owned()) // todo: is this correct?
+					.await
+					.context("Failed to trash directory")?;
+				ui.print_success(&format!("Trashed directory: {}", file_or_directory_str));
+			}
+		}
+		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+			return Err(anyhow!("Cannot delete root directory"));
+		}
+		FSObject::SharedFile(_) => {
+			return Err(anyhow!("Cannot delete shared file"));
+		}
+	} // todo: simplify this match statement?
+	Ok(())
+}
+
+enum MoveOrCopy {
+	Move,
+	Copy,
+}
+async fn move_or_copy_file_or_directory(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	action: MoveOrCopy,
+	source_str: &str,
+	destination_str: &str,
+) -> Result<()> {
+	let source_str = working_path.navigate(source_str);
+	let destination_str = working_path.navigate(destination_str);
+	let client = client.get(ui).await?;
+	let Some(source_file_or_directory) = client
+		.find_item_at_path(source_str.0.clone())
+		.await
+		.context("Failed to find source file or directory")?
+	else {
+		return Err(anyhow!(
+			"No such source file or directory: {}",
+			source_str.0
+		));
+	};
+	let Some(destination_dir) = client
+		.find_item_at_path(destination_str.0.clone())
+		.await
+		.context("Failed to find destination directory")?
+	else {
+		return Err(anyhow!(
+			"No such destination directory: {}",
+			destination_str.0
+		));
+	};
+	let destination_dir = match destination_dir {
+		FSObject::Dir(dir) => DirectoryType::Dir(dir),
+		FSObject::Root(root) => DirectoryType::Root(root),
+		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
+		_ => return Err(anyhow!("Not a directory: {}", destination_str.0)),
+	};
+	match action {
+		MoveOrCopy::Move => match source_file_or_directory {
+			FSObject::File(file) => {
+				client
+					.move_file(&mut file.into_owned(), &destination_dir)
+					.await
+					.context("Failed to move file or directory")?;
+			}
+			FSObject::Dir(dir) => {
+				client
+					.move_dir(&mut dir.into_owned(), &destination_dir)
+					.await
+					.context("Failed to move directory")?;
+			}
+			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+				return Err(anyhow!("Cannot move root directory"));
+			}
+			FSObject::SharedFile(_) => {
+				return Err(anyhow!("Cannot move shared file"));
+			}
+		},
+		MoveOrCopy::Copy => match source_file_or_directory {
+			FSObject::File(_) => {
+				todo!("Implement file copy"); // filen-sdk-rs does not support file copy yet
+			}
+			FSObject::Dir(_) => {
+				todo!("Implement directory copy"); // filen-sdk-rs does not support directory copy yet
+			}
+			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+				return Err(anyhow!("Cannot copy root directory"));
+			}
+			FSObject::SharedFile(_) => {
+				return Err(anyhow!("Cannot copy shared file"));
+			}
+		},
+	}
+	ui.print_success(&format!(
+		"{} {} into {}",
+		match action {
+			MoveOrCopy::Move => "Moved",
+			MoveOrCopy::Copy => "Copied",
+		},
+		source_str.0,
+		destination_str.0
+	));
 	Ok(())
 }
