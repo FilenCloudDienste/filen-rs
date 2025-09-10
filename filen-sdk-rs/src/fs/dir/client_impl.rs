@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
+use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
 
@@ -473,6 +474,24 @@ impl Client {
 			},
 		};
 		api::v3::dir::size::post(self.client(), &request).await
+	}
+
+	pub async fn set_dir_color(
+		&self,
+		dir: &mut RemoteDirectory,
+		color: DirColor<'_>,
+	) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
+		api::v3::dir::color::post(
+			self.client(),
+			&api::v3::dir::color::Request {
+				uuid: *dir.uuid(),
+				color: color.borrow_clone(),
+			},
+		)
+		.await?;
+		dir.color = color.into_owned();
+		Ok(())
 	}
 }
 

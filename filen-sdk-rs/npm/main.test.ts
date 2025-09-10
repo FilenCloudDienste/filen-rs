@@ -546,6 +546,35 @@ test("meta updates", async () => {
 	expect(updatedDir.favorited).toBe(true)
 })
 
+test.only("color", async () => {
+	let dir = await state.createDir(testDir, "color-dir")
+	expect(dir.color).toBe("default")
+
+	dir = await state.setDirColor(dir, "blue")
+	expect(dir.color).toBe("blue")
+	expect(dir).toEqual(await state.getDir(dir.uuid))
+
+	dir = await state.setDirColor(dir, "green")
+	expect(dir.color).toBe("green")
+	expect(dir).toEqual(await state.getDir(dir.uuid))
+
+	dir = await state.setDirColor(dir, "purple")
+	expect(dir.color).toBe("purple")
+	expect(dir).toEqual(await state.getDir(dir.uuid))
+
+	dir = await state.setDirColor(dir, "red")
+	expect(dir.color).toBe("red")
+	expect(dir).toEqual(await state.getDir(dir.uuid))
+
+	dir = await state.setDirColor(dir, "gray")
+	expect(dir.color).toBe("gray")
+	expect(dir).toEqual(await state.getDir(dir.uuid))
+
+	dir = await state.setDirColor(dir, "#123456")
+	expect(dir.color).toBe("#123456")
+	expect(dir).toEqual(await state.getDir(dir.uuid))
+})
+
 afterAll(async () => {
 	if (state && testDir) {
 		await state?.deleteDirPermanently(testDir)

@@ -2,7 +2,7 @@ use crate::{
 	Error,
 	auth::Client,
 	fs::dir::{DirectoryType, UnsharedDirectoryType, meta::DirectoryMetaChanges},
-	js::{Dir, DirEnum, File, NonRootItemTagged, Root},
+	js::{Dir, DirColor, DirEnum, File, NonRootItemTagged, Root},
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
@@ -213,6 +213,18 @@ impl Client {
 	) -> Result<Dir, Error> {
 		let mut dir = dir.into();
 		self.update_dir_metadata(&mut dir, changes).await?;
+		Ok(dir.into())
+	}
+
+	#[wasm_bindgen(js_name = "setDirColor")]
+	pub async fn set_dir_color_js(
+		&self,
+		dir: Dir,
+		#[wasm_bindgen(unchecked_param_type = "DirColor")] color: JsValue,
+	) -> Result<Dir, JsValue> {
+		let mut dir = dir.into();
+		let color: DirColor = serde_wasm_bindgen::from_value(color)?;
+		self.set_dir_color(&mut dir, color.into()).await?;
 		Ok(dir.into())
 	}
 }
