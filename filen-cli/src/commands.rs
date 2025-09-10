@@ -68,6 +68,16 @@ pub(crate) enum Commands {
 		/// Destination parent directory
 		destination: String,
 	},
+	/// Favorite a file or directory
+	Favorite {
+		/// File or directory to favorite
+		file_or_directory: String,
+	},
+	/// Unfavorite a file or directory
+	Unfavorite {
+		/// File or directory to unfavorite
+		file_or_directory: String,
+	},
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -164,6 +174,16 @@ pub(crate) async fn execute_command(
 			.await?;
 			None
 		}
+		Commands::Favorite { file_or_directory } => {
+			set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, true)
+				.await?;
+			None
+		}
+		Commands::Unfavorite { file_or_directory } => {
+			set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, false)
+				.await?;
+			None
+		}
 		Commands::Logout => {
 			let deleted = crate::auth::delete_credentials()?;
 			if deleted {
@@ -223,6 +243,7 @@ async fn list_directory(
 	files.sort();
 	println!("{}", [directories, files].concat().join("  ")); // todo: better output formatting of ls command
 	Ok(())
+	// todo: ls -l flag
 }
 
 enum PrintFileLines {
@@ -541,5 +562,57 @@ async fn move_or_copy_file_or_directory(
 		source_str.0,
 		destination_str.0
 	));
+	Ok(())
+}
+
+async fn set_file_or_directory_favorite(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	file_or_directory_str: &str,
+	favorite: bool,
+) -> Result<()> {
+	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
+	let client = client.get(ui).await?;
+	let Some(file_or_directory) = client
+		.find_item_at_path(file_or_directory_str.clone())
+		.await
+		.context("Failed to find file or directory")?
+	else {
+		return Err(anyhow!(
+			"No such file or directory: {}",
+			file_or_directory_str
+		));
+	};
+	match file_or_directory {
+		FSObject::File(mut file) => {
+			client
+				.set_favorite(file.to_mut(), favorite)
+				.await
+				.context("Failed to set file favorite status")?;
+			ui.print_success(&format!(
+				"{} file: {}",
+				if favorite { "Favorited" } else { "Unfavorited" },
+				file_or_directory_str
+			));
+		}
+		FSObject::Dir(mut dir) => {
+			client
+				.set_favorite(dir.to_mut(), favorite)
+				.await
+				.context("Failed to set directory favorite status")?;
+			ui.print_success(&format!(
+				"{} directory: {}",
+				if favorite { "Favorited" } else { "Unfavorited" },
+				file_or_directory_str
+			));
+		}
+		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+			return Err(anyhow!("Cannot change favorite status of root directory"));
+		}
+		FSObject::SharedFile(_) => {
+			return Err(anyhow!("Cannot change favorite status of shared file"));
+		}
+	}
 	Ok(())
 }
