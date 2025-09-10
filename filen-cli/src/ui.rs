@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use dialoguer::console::style;
 use tiny_gradient::{GradientStr, RGB};
 
+const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub(crate) struct UI {
 	theme: dialoguer::theme::ColorfulTheme,
 	repl_input_theme: dialoguer::theme::ColorfulTheme,
@@ -44,17 +46,17 @@ impl UI {
 
 	/// Print a colorful banner at the top of the application (contains app name and version)
 	pub(crate) fn print_banner(&self) {
-		let banner_text = "Filen CLI v0.0.0";
-		// todo: print actual version
+		let banner_text = format!("Filen CLI v{}", FILEN_CLI_VERSION);
 		let width: usize = termsize::get().map(|size| size.cols).unwrap_or(10).into();
 		let banner = "=".repeat((width - banner_text.len() - 2) / 2)
-			+ " " + banner_text
+			+ " " + &banner_text
 			+ " " + &"=".repeat((width - banner_text.len() - 2) / 2);
 		let filen_blue = RGB::new(0x1d, 0x57, 0xb9);
 		let filen_violet = RGB::new(0x99, 0x66, 0xCC);
 		let filen_green = RGB::new(0x50, 0xC8, 0x78);
 		let banner = banner.gradient([filen_blue, filen_violet, filen_green]);
-		// todo: make banner bold
+		// the string outputted by tiny_gradient has many "0m" sequences that reset formatting, so we're applying the bold formatting manually
+		let banner = banner.to_string().replace("0m", "1m");
 		println!("{}", banner);
 	}
 
