@@ -1,9 +1,12 @@
 pub(crate) mod auth;
+pub(crate) mod chat;
 pub(crate) mod contacts;
 pub(crate) mod dir;
 pub(crate) mod file;
+pub(crate) mod health;
 pub(crate) mod item;
 pub(crate) mod login;
+pub(crate) mod notes;
 pub(crate) mod search;
 pub(crate) mod shared;
 pub(crate) mod trash;

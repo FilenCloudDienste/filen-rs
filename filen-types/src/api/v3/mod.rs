@@ -1,9 +1,12 @@
 pub mod auth;
+pub mod chat;
 pub mod contacts;
 pub mod dir;
 pub mod file;
+pub mod health;
 pub mod item;
 pub mod login;
+pub mod notes;
 pub mod search;
 pub mod shared;
 pub mod trash;

@@ -9,6 +9,7 @@ pub mod error;
 pub mod fs;
 pub mod io;
 // #[cfg(any(feature = "node", all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod chats;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod js;
 pub mod search;
