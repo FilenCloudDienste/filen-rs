@@ -17,6 +17,9 @@ use crate::{
 	error::Error,
 };
 
+pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
+pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
+
 /// Represents a lock on a resource, which can be acquired using the [`Client::acquire_lock`] method.
 /// The lock is released when the [`ResourceLock`] is dropped.
 ///
@@ -251,7 +254,7 @@ impl Client {
 		&self,
 		resource: impl Into<String>,
 	) -> Result<Arc<ResourceLock>, Error> {
-		self.acquire_lock(resource, time::Duration::from_secs(30), 8640)
+		self.acquire_lock(resource, MAX_SLEEP_TIME_DEFAULT, ATTEMPTS_DEFAULT)
 			.await
 	}
 }
