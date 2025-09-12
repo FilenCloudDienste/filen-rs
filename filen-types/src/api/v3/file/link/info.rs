@@ -18,12 +18,12 @@ pub struct Request<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
 	pub uuid: UuidStr,
-	pub name: Cow<'a, EncryptedString>,
-	pub mime: Cow<'a, EncryptedString>,
+	pub name: EncryptedString<'a>,
+	pub mime: EncryptedString<'a>,
 	#[serde(with = "crate::serde::hex::optional")]
 	pub password: Option<Cow<'a, [u8]>>,
 
-	pub size: Cow<'a, EncryptedString>,
+	pub size: EncryptedString<'a>,
 	pub chunks: u64,
 
 	pub region: Cow<'a, str>,

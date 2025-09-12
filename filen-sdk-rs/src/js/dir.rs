@@ -79,8 +79,8 @@ pub enum DirMeta {
 enum DirMetaEncoded<'a> {
 	DecryptedRaw(Cow<'a, [u8]>),
 	DecryptedUTF8(Cow<'a, str>),
-	Encrypted(Cow<'a, EncryptedString>),
-	RSAEncrypted(Cow<'a, RSAEncryptedString>),
+	Encrypted(EncryptedString<'a>),
+	RSAEncrypted(RSAEncryptedString<'a>),
 }
 
 impl From<DirectoryMeta<'_>> for DirMeta {

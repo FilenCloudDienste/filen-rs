@@ -379,7 +379,7 @@ async fn dir_malformed_meta() {
 	let test_dir = &resources.dir;
 
 	let uuid = client
-		.create_malformed_dir(test_dir, "malformed", "malformed meta".to_string())
+		.create_malformed_dir(test_dir, "malformed", "malformed meta")
 		.await
 		.unwrap();
 

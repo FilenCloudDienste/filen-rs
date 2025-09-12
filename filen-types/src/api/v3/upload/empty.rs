@@ -10,12 +10,12 @@ pub const ENDPOINT: &str = "v3/upload/empty";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub uuid: UuidStr,
-	pub name: Cow<'a, EncryptedString>,
+	pub name: EncryptedString<'a>,
 	pub name_hashed: Cow<'a, str>, // should this be a string or a stronger type?
-	pub size: Cow<'a, EncryptedString>,
+	pub size: EncryptedString<'a>,
 	pub parent: UuidStr,
-	pub mime: Cow<'a, EncryptedString>,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub mime: EncryptedString<'a>,
+	pub metadata: EncryptedString<'a>,
 	pub version: FileEncryptionVersion,
 }
 

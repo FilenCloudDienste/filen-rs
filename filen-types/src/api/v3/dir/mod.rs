@@ -34,7 +34,7 @@ use crate::{
 pub struct Response<'a> {
 	pub uuid: UuidStr,
 	#[serde(rename = "nameEncrypted")]
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	pub name_hashed: Cow<'a, str>,
 	pub parent: ParentUuid,
 	pub trash: bool,

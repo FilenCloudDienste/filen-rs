@@ -100,13 +100,11 @@ impl Client {
 			self.client(),
 			&api::v3::file::metadata::Request {
 				uuid: *file.uuid(),
-				name: Cow::Borrowed(&self.crypter().encrypt_meta(temp_meta.name())),
-				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
-				metadata: Cow::Borrowed(
-					&self
-						.crypter()
-						.encrypt_meta(&serde_json::to_string(&temp_meta)?),
-				),
+				name: self.crypter().encrypt_meta(temp_meta.name()),
+				name_hashed: Cow::Owned(self.hash_name(temp_meta.name())),
+				metadata: self
+					.crypter()
+					.encrypt_meta(&serde_json::to_string(&temp_meta)?),
 			},
 		)
 		.await?;
@@ -207,24 +205,23 @@ impl Client {
 	pub async fn create_malformed_file(
 		&self,
 		parent: &impl HasUUIDContents,
-		name: impl Into<String>,
-		meta: impl Into<String>,
-		mime: impl Into<String>,
-		size: impl Into<String>,
+		name: &str,
+		meta: &str,
+		mime: &str,
+		size: &str,
 	) -> Result<UuidStr, Error> {
 		use filen_types::crypto::EncryptedString;
 		let uuid = UuidStr::new_v4();
-		let name = name.into();
 		api::v3::upload::empty::post(
 			self.client(),
 			&api::v3::upload::empty::Request {
-				name_hashed: Cow::Owned(self.hash_name(&name)),
+				name_hashed: Cow::Owned(self.hash_name(name)),
 				uuid,
 				parent: *parent.uuid(),
-				metadata: Cow::Owned(EncryptedString(meta.into())),
-				name: Cow::Owned(EncryptedString(name)),
-				size: Cow::Owned(EncryptedString(size.into())),
-				mime: Cow::Owned(EncryptedString(mime.into())),
+				metadata: EncryptedString(Cow::Borrowed(meta)),
+				name: EncryptedString(Cow::Borrowed(name)),
+				size: EncryptedString(Cow::Borrowed(size)),
+				mime: EncryptedString(Cow::Borrowed(mime)),
 				version: filen_types::auth::FileEncryptionVersion::V2,
 			},
 		)

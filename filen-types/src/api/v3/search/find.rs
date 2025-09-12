@@ -37,7 +37,7 @@ pub enum SearchFindItem<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct SearchFindFile<'a> {
 	pub uuid: UuidStr,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
@@ -50,7 +50,7 @@ pub struct SearchFindFile<'a> {
 	pub trash: bool,
 	pub versioned: bool,
 	pub uuid_path: Vec<UuidStr>,
-	pub metadata_path: Vec<Cow<'a, EncryptedString>>,
+	pub metadata_path: Vec<EncryptedString<'a>>,
 	pub name_hashed: Cow<'a, str>,
 }
 
@@ -58,7 +58,7 @@ pub struct SearchFindFile<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct SearchFindDirectory<'a> {
 	pub uuid: UuidStr,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	pub parent: UuidStr,
 	pub color: DirColor<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -66,6 +66,6 @@ pub struct SearchFindDirectory<'a> {
 	pub favorited: bool,
 	pub trash: bool,
 	pub uuid_path: Vec<UuidStr>,
-	pub metadata_path: Vec<Cow<'a, EncryptedString>>,
+	pub metadata_path: Vec<EncryptedString<'a>>,
 	pub name_hashed: Cow<'a, str>,
 }

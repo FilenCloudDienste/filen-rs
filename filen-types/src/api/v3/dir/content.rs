@@ -31,7 +31,7 @@ pub struct Response<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
 	pub uuid: UuidStr,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	pub rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
@@ -50,7 +50,7 @@ pub struct File<'a> {
 pub struct Directory<'a> {
 	pub uuid: UuidStr,
 	#[serde(rename = "name")]
-	pub meta: Cow<'a, EncryptedString>,
+	pub meta: EncryptedString<'a>,
 	pub parent: ParentUuid,
 	pub color: DirColor<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]

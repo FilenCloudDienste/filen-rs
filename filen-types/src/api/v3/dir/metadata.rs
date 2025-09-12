@@ -12,5 +12,5 @@ pub struct Request<'a> {
 	pub uuid: UuidStr,
 	pub name_hashed: Cow<'a, str>,
 	#[serde(rename = "name")]
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 }

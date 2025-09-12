@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use base64::{Engine, prelude::BASE64_STANDARD};
 use digest::Digest;
 use filen_types::crypto::{
@@ -66,7 +68,7 @@ pub(crate) fn get_key_pair(
 pub fn encrypt_with_public_key(
 	public_key: &RsaPublicKey,
 	data: impl AsRef<[u8]>,
-) -> Result<RSAEncryptedString, rsa::Error> {
+) -> Result<RSAEncryptedString<'static>, rsa::Error> {
 	let mut rng = old_rng::thread_rng();
 	// this is RSA_PKCS1_OAEP_PADDING according to
 	// https://github.com/RustCrypto/RSA/issues/435
@@ -76,14 +78,16 @@ pub fn encrypt_with_public_key(
 		data.as_ref(),
 	)?;
 
-	Ok(RSAEncryptedString(BASE64_STANDARD.encode(encrypted_data)))
+	Ok(RSAEncryptedString(Cow::Owned(
+		BASE64_STANDARD.encode(encrypted_data),
+	)))
 }
 
 pub fn decrypt_with_private_key(
 	private_key: &RsaPrivateKey,
 	data: &RSAEncryptedString,
 ) -> Result<Vec<u8>, ConversionError> {
-	let encrypted_data = BASE64_STANDARD.decode(&data.0)?;
+	let encrypted_data = BASE64_STANDARD.decode(data.0.as_ref())?;
 	let decrypted_data =
 		private_key.decrypt(Oaep::new_with_mgf_hash::<Sha256, Sha1>(), &encrypted_data)?;
 

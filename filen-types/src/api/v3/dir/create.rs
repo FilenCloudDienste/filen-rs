@@ -11,7 +11,7 @@ pub const ENDPOINT: &str = "v3/dir/create";
 pub struct Request<'a> {
 	pub uuid: UuidStr,
 	#[serde(rename = "name")]
-	pub meta: Cow<'a, EncryptedString>,
+	pub meta: EncryptedString<'a>,
 	pub name_hashed: Cow<'a, str>,
 	pub parent: UuidStr,
 }

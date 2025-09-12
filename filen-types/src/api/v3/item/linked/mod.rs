@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::EncryptedMetaKey, fs::UuidStr};
@@ -26,5 +24,5 @@ pub struct Response<'a> {
 pub struct ListedPublicLink<'a> {
 	#[serde(rename = "linkUUID")]
 	pub link_uuid: UuidStr,
-	pub link_key: Cow<'a, EncryptedMetaKey>,
+	pub link_key: EncryptedMetaKey<'a>,
 }

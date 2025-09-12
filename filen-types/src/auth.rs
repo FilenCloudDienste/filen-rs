@@ -1,12 +1,18 @@
-use std::fmt::{Debug, Display};
+use std::{
+	borrow::Cow,
+	fmt::{Debug, Display},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct APIKey(pub String);
+use crate::impl_cow_helpers_for_newtype;
 
-impl Display for APIKey {
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct APIKey<'a>(pub Cow<'a, str>);
+impl_cow_helpers_for_newtype!(APIKey);
+
+impl Display for APIKey<'_> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.0)
 	}

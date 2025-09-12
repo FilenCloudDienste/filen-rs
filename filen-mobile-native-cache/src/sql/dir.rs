@@ -14,6 +14,7 @@ use filen_types::{
 	api::v3::dir::color::DirColor,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ParentUuid, UuidStr},
+	traits::CowHelpers,
 };
 use log::trace;
 use rusqlite::{CachedStatement, Connection, Result};
@@ -60,8 +61,8 @@ pub(crate) enum DBDirMeta {
 	Decoded(DBDecryptedDirMeta),
 	DecryptedRaw(Vec<u8>),
 	DecryptedUTF8(String),
-	Encrypted(EncryptedString),
-	RSAEncrypted(RSAEncryptedString),
+	Encrypted(EncryptedString<'static>),
+	RSAEncrypted(RSAEncryptedString<'static>),
 }
 
 impl DBDirMeta {
@@ -88,9 +89,9 @@ impl From<DirectoryMeta<'_>> for DBDirMeta {
 			DirectoryMeta::Decoded(decoded) => Self::Decoded(DBDecryptedDirMeta::from(decoded)),
 			DirectoryMeta::DecryptedRaw(raw) => Self::DecryptedRaw(raw.into_owned()),
 			DirectoryMeta::DecryptedUTF8(utf8) => Self::DecryptedUTF8(utf8.into_owned()),
-			DirectoryMeta::Encrypted(encrypted) => Self::Encrypted(encrypted.into_owned()),
+			DirectoryMeta::Encrypted(encrypted) => Self::Encrypted(encrypted.into_owned_cow()),
 			DirectoryMeta::RSAEncrypted(rsa_encrypted) => {
-				Self::RSAEncrypted(rsa_encrypted.into_owned())
+				Self::RSAEncrypted(rsa_encrypted.into_owned_cow())
 			}
 		}
 	}
@@ -107,10 +108,8 @@ impl From<DBDirMeta> for DirectoryMeta<'static> {
 			}),
 			DBDirMeta::DecryptedRaw(raw) => DirectoryMeta::DecryptedRaw(Cow::Owned(raw)),
 			DBDirMeta::DecryptedUTF8(utf8) => DirectoryMeta::DecryptedUTF8(Cow::Owned(utf8)),
-			DBDirMeta::Encrypted(encrypted) => DirectoryMeta::Encrypted(Cow::Owned(encrypted)),
-			DBDirMeta::RSAEncrypted(rsa_encrypted) => {
-				DirectoryMeta::RSAEncrypted(Cow::Owned(rsa_encrypted))
-			}
+			DBDirMeta::Encrypted(encrypted) => DirectoryMeta::Encrypted(encrypted),
+			DBDirMeta::RSAEncrypted(rsa_encrypted) => DirectoryMeta::RSAEncrypted(rsa_encrypted),
 		}
 	}
 }

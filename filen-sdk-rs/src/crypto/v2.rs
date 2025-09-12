@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 use aes_gcm::{
 	AesGcm, Nonce,
@@ -144,7 +144,7 @@ impl AsRef<str> for MasterKey {
 }
 
 impl MetaCrypter for MasterKey {
-	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString {
+	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
 		let nonce = BadNonce::new();
 		out.clear();
 		let base64_len =
@@ -164,7 +164,7 @@ impl MetaCrypter for MasterKey {
 		let encrypted = self.cipher.encrypt(&nonce.into(), meta.as_bytes()).unwrap();
 
 		BASE64_STANDARD.encode_string(encrypted, &mut out);
-		EncryptedString(out)
+		EncryptedString(Cow::Owned(out))
 	}
 
 	fn decrypt_meta_into(
@@ -237,7 +237,7 @@ impl MasterKeys {
 }
 
 impl MetaCrypter for MasterKeys {
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
 		self.0[0].encrypt_meta_into(meta, out)
 	}
 
@@ -339,7 +339,7 @@ pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], 
 pub fn derive_password_and_mk(
 	password: impl AsRef<[u8]>,
 	salt: impl AsRef<[u8]>,
-) -> Result<(MasterKey, DerivedPassword), ConversionError> {
+) -> Result<(MasterKey, DerivedPassword<'static>), ConversionError> {
 	let derived_data = derive_password(password.as_ref(), salt.as_ref())?;
 	let derived_str = faster_hex::hex_string(&derived_data);
 	let (master_key_str, derived_password_str) = derived_str.split_at(64);
@@ -348,7 +348,7 @@ pub fn derive_password_and_mk(
 
 	let mut hasher = Sha512::new();
 	hasher.update(derived_password_str);
-	let derived_password = DerivedPassword(faster_hex::hex_string(&hasher.finalize()));
+	let derived_password = DerivedPassword(Cow::Owned(faster_hex::hex_string(&hasher.finalize())));
 
 	Ok((master_key, derived_password))
 }

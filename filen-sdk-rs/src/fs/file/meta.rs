@@ -4,6 +4,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},
+	traits::CowHelpers,
 };
 use rsa::RsaPrivateKey;
 use serde::{
@@ -68,8 +69,8 @@ pub enum FileMeta<'a> {
 	Decoded(DecryptedFileMeta<'a>),
 	DecryptedRaw(Cow<'a, [u8]>),
 	DecryptedUTF8(Cow<'a, str>),
-	Encrypted(Cow<'a, EncryptedString>),
-	RSAEncrypted(Cow<'a, RSAEncryptedString>),
+	Encrypted(EncryptedString<'a>),
+	RSAEncrypted(RSAEncryptedString<'a>),
 }
 
 macro_rules! get_value_from_decrypted {
@@ -102,12 +103,12 @@ macro_rules! get_value_from_decrypted_optional {
 
 impl FileMeta<'static> {
 	pub fn from_encrypted(
-		meta: Cow<'_, EncryptedString>,
+		meta: EncryptedString<'_>,
 		decrypter: &impl MetaCrypter,
 		file_encryption_version: FileEncryptionVersion,
 	) -> Self {
 		let Ok(decrypted) = decrypter.decrypt_meta(&meta) else {
-			return Self::Encrypted(Cow::Owned(meta.into_owned()));
+			return Self::Encrypted(meta.into_owned_cow());
 		};
 		let seed = FileMetaSeed(file_encryption_version);
 		let Ok(meta) = seed.deserialize(&mut serde_json::Deserializer::from_str(&decrypted)) else {
@@ -117,12 +118,12 @@ impl FileMeta<'static> {
 	}
 
 	pub fn from_rsa_encrypted(
-		meta: Cow<'_, RSAEncryptedString>,
+		meta: RSAEncryptedString<'_>,
 		private_key: &RsaPrivateKey,
 		file_encryption_version: FileEncryptionVersion,
 	) -> Self {
 		let Ok(decrypted) = crypto::rsa::decrypt_with_private_key(private_key, &meta) else {
-			return Self::RSAEncrypted(Cow::Owned(meta.into_owned()));
+			return Self::RSAEncrypted(meta.into_owned_cow());
 		};
 		let seed = FileMetaSeed(file_encryption_version);
 		let Ok(meta) = seed.deserialize(&mut serde_json::Deserializer::from_slice(&decrypted))

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::str::FromStr;
 
 use aes_gcm::aes::{self};
@@ -67,7 +68,7 @@ impl MasterKey {
 		mut out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		out.clear();
-		if let Err(e) = BASE64_STANDARD.decode_vec(&meta.0, &mut out) {
+		if let Err(e) = BASE64_STANDARD.decode_vec(meta.0.as_ref(), &mut out) {
 			return Err((e.into(), out));
 		}
 		if out.len() < 16 {
@@ -164,7 +165,7 @@ impl DataCrypter for FileKey {
 	}
 }
 
-fn hash_password(password: &[u8]) -> DerivedPassword {
+fn hash_password(password: &[u8]) -> DerivedPassword<'static> {
 	let mut out = vec![0u8; 256];
 
 	// SAFETY: The output buffer is guaranteed to be large enough for all hashes
@@ -187,12 +188,12 @@ fn hash_password(password: &[u8]) -> DerivedPassword {
 		String::from_utf8_unchecked(out)
 	};
 
-	DerivedPassword(pass)
+	DerivedPassword(Cow::Owned(pass))
 }
 
 pub fn derive_password_and_mk(
 	password: &[u8],
-) -> Result<(MasterKey, DerivedPassword), ConversionError> {
+) -> Result<(MasterKey, DerivedPassword<'static>), ConversionError> {
 	let master_key_str = faster_hex::hex_string(&super::v2::hash(password));
 
 	Ok((

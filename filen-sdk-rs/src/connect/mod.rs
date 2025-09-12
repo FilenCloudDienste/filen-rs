@@ -11,6 +11,7 @@ use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::rsa::{EncodedPublicKey, RSAEncryptedString},
 	fs::{ObjectType, UuidStr},
+	traits::CowHelpers,
 };
 use fs::{SharedDirectory, SharedFile};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -75,7 +76,7 @@ impl TryFrom<SharedUser<'_>> for User {
 	fn try_from(shared_user: SharedUser) -> Result<Self, Self::Error> {
 		Ok(Self {
 			email: shared_user.email.into_owned(),
-			public_key: RsaPublicKey::try_from(shared_user.public_key.as_ref())?,
+			public_key: RsaPublicKey::try_from(&shared_user.public_key.as_borrowed_cow())?,
 			id: shared_user.id,
 		})
 	}
@@ -98,7 +99,7 @@ impl User {
 		&self.email
 	}
 
-	pub fn public_encrypt(&self, data: &[u8]) -> Result<RSAEncryptedString, rsa::Error> {
+	pub fn public_encrypt(&self, data: &[u8]) -> Result<RSAEncryptedString<'static>, rsa::Error> {
 		crate::crypto::rsa::encrypt_with_public_key(&self.public_key, data)
 	}
 
@@ -325,11 +326,9 @@ impl Client {
 			&api::v3::item::shared::rename::Request {
 				uuid: *item.uuid(),
 				receiver_id: user.id,
-				metadata: Cow::Borrowed(
-					&item
-						.get_rsa_encrypted_meta(&user.public_key)
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
+				metadata: item
+					.get_rsa_encrypted_meta(&user.public_key)
+					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await
@@ -349,11 +348,9 @@ impl Client {
 			&api::v3::item::linked::rename::Request {
 				uuid: *item.uuid(),
 				link_uuid,
-				metadata: Cow::Borrowed(
-					&item
-						.get_encrypted_meta(crypter)
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
+				metadata: item
+					.get_encrypted_meta(crypter)
+					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await
@@ -488,12 +485,10 @@ impl Client {
 				parent: Some((*item.parent()).try_into()?),
 				link_uuid: link.link_uuid,
 				r#type: item.object_type(),
-				metadata: Cow::Borrowed(
-					&item
-						.get_encrypted_meta(link_crypter)
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
-				key: Cow::Borrowed(&link.link_key),
+				metadata: item
+					.get_encrypted_meta(link_crypter)
+					.ok_or(MetadataWasNotDecryptedError)?,
+				key: link.link_key.as_borrowed_cow(),
 				expiration: PublicLinkExpiration::Never,
 			},
 		)
@@ -506,13 +501,11 @@ impl Client {
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
-			link_key: Cow::Owned(
-				self.encrypt_meta_key(
-					public_link
-						.link_key
-						.as_ref()
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
+			link_key: self.encrypt_meta_key(
+				public_link
+					.link_key
+					.as_ref()
+					.ok_or(MetadataWasNotDecryptedError)?,
 			),
 		};
 
@@ -530,11 +523,10 @@ impl Client {
 					parent: None,
 					link_uuid: public_link.link_uuid,
 					r#type: ObjectType::Dir,
-					metadata: Cow::Borrowed(
-						&dir.get_encrypted_meta(key)
-							.ok_or(MetadataWasNotDecryptedError)?,
-					),
-					key: Cow::Borrowed(&link.link_key),
+					metadata: dir
+						.get_encrypted_meta(key)
+						.ok_or(MetadataWasNotDecryptedError)?,
+					key: link.link_key.as_borrowed_cow(),
 					expiration: PublicLinkExpiration::Never,
 				},
 			)
@@ -815,10 +807,9 @@ impl Client {
 				parent: Some((*item.parent()).try_into()?),
 				email: Cow::Borrowed(user.email()),
 				r#type: item.object_type(),
-				metadata: Cow::Owned(
-					item.get_rsa_encrypted_meta(&user.public_key)
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
+				metadata: item
+					.get_rsa_encrypted_meta(&user.public_key)
+					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await?;
@@ -837,10 +828,9 @@ impl Client {
 					parent: None,
 					email: Cow::Borrowed(user.email()),
 					r#type: ObjectType::Dir,
-					metadata: Cow::Owned(
-						dir.get_rsa_encrypted_meta(&user.public_key)
-							.ok_or(MetadataWasNotDecryptedError)?,
-					),
+					metadata: dir
+						.get_rsa_encrypted_meta(&user.public_key)
+						.ok_or(MetadataWasNotDecryptedError)?,
 				},
 			)
 			.await
@@ -876,11 +866,9 @@ impl Client {
 				parent: None,
 				email: Cow::Borrowed(user.email()),
 				r#type: ObjectType::File,
-				metadata: Cow::Borrowed(
-					&file
-						.get_rsa_encrypted_meta(&user.public_key)
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
+				metadata: file
+					.get_rsa_encrypted_meta(&user.public_key)
+					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await

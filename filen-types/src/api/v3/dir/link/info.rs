@@ -16,7 +16,7 @@ pub struct Request {
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
 	pub parent: UuidStr,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	pub has_password: bool,
 	#[serde(with = "crate::serde::hex::optional")]
 	pub salt: Option<Cow<'a, [u8]>>,

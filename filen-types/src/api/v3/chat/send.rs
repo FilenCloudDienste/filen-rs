@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::EncryptedString, fs::UuidStr};
@@ -11,6 +9,6 @@ pub const ENDPOINT: &str = "/v3/chat/send";
 pub struct Request<'a> {
 	conversation: UuidStr,
 	uuid: UuidStr,
-	message: Cow<'a, EncryptedString>,
+	message: EncryptedString<'a>,
 	reply_to: Option<UuidStr>,
 }

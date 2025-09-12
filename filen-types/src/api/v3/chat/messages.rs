@@ -28,7 +28,7 @@ pub struct ChatMessage<'a> {
 	pub sender_email: Cow<'a, str>,
 	pub sender_avatar: Option<Cow<'a, str>>,
 	pub sender_nick_name: Cow<'a, str>,
-	pub message: Cow<'a, EncryptedString>,
+	pub message: EncryptedString<'a>,
 	pub reply_to: Option<ChatMessageReplyInfo<'a>>,
 	pub embed_disabled: bool,
 	pub edited: bool,

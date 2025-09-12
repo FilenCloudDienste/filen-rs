@@ -24,7 +24,7 @@ pub struct Response<'a>(pub Option<LinkStatus<'a>>);
 #[derive(Debug, Clone)]
 pub struct LinkStatus<'a> {
 	pub uuid: UuidStr,
-	pub key: Cow<'a, EncryptedMetaKey>,
+	pub key: EncryptedMetaKey<'a>,
 	pub expiration: DateTime<Utc>,
 	pub expiration_text: PublicLinkExpiration,
 	pub download_btn: bool,
@@ -36,7 +36,7 @@ pub struct LinkStatus<'a> {
 struct RawResponse<'a> {
 	exists: bool,
 	uuid: Option<UuidStr>,
-	key: Option<Cow<'a, EncryptedMetaKey>>,
+	key: Option<EncryptedMetaKey<'a>>,
 	#[serde(with = "crate::serde::time::optional")]
 	expiration: Option<DateTime<Utc>>,
 	expiration_text: Option<PublicLinkExpiration>,

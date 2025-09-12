@@ -32,7 +32,7 @@ pub struct Response<'a> {
 pub struct Directory<'a> {
 	pub uuid: UuidStr,
 	#[serde(rename = "name")]
-	pub meta: Cow<'a, EncryptedString>,
+	pub meta: EncryptedString<'a>,
 	#[serde(with = "crate::serde::parent_uuid::base")]
 	pub parent: Option<ParentUuid>,
 	pub color: DirColor<'a>,
@@ -46,11 +46,11 @@ pub struct Directory<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
 	pub uuid: UuidStr,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
-	pub size: Cow<'a, EncryptedString>,
+	pub size: EncryptedString<'a>,
 	pub chunks_size: u64,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,

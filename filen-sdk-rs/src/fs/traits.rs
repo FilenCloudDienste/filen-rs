@@ -43,19 +43,25 @@ pub trait HasMeta {
 }
 
 pub trait HasMetaExt {
-	fn get_encrypted_meta(&self, crypter: &impl MetaCrypter) -> Option<EncryptedString>;
-	fn get_rsa_encrypted_meta(&self, public_key: &RsaPublicKey) -> Option<RSAEncryptedString>;
+	fn get_encrypted_meta(&self, crypter: &impl MetaCrypter) -> Option<EncryptedString<'static>>;
+	fn get_rsa_encrypted_meta(
+		&self,
+		public_key: &RsaPublicKey,
+	) -> Option<RSAEncryptedString<'static>>;
 }
 
 impl<T> HasMetaExt for T
 where
 	T: HasMeta + ?Sized,
 {
-	fn get_encrypted_meta(&self, crypter: &impl MetaCrypter) -> Option<EncryptedString> {
+	fn get_encrypted_meta(&self, crypter: &impl MetaCrypter) -> Option<EncryptedString<'static>> {
 		Some(crypter.encrypt_meta(&self.get_meta_string()?))
 	}
 
-	fn get_rsa_encrypted_meta(&self, public_key: &RsaPublicKey) -> Option<RSAEncryptedString> {
+	fn get_rsa_encrypted_meta(
+		&self,
+		public_key: &RsaPublicKey,
+	) -> Option<RSAEncryptedString<'static>> {
 		let meta = self.get_meta_string()?;
 		match crate::crypto::rsa::encrypt_with_public_key(public_key, meta.as_bytes()) {
 			Ok(encrypted) => Some(encrypted),

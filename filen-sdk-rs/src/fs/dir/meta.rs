@@ -16,8 +16,8 @@ pub enum DirectoryMeta<'a> {
 	Decoded(DecryptedDirectoryMeta<'a>),
 	DecryptedRaw(Cow<'a, [u8]>),
 	DecryptedUTF8(Cow<'a, str>),
-	Encrypted(Cow<'a, EncryptedString>),
-	RSAEncrypted(Cow<'a, RSAEncryptedString>),
+	Encrypted(EncryptedString<'a>),
+	RSAEncrypted(RSAEncryptedString<'a>),
 }
 
 impl DirectoryMeta<'_> {
@@ -31,18 +31,18 @@ impl DirectoryMeta<'_> {
 				DirectoryMeta::DecryptedUTF8(Cow::Owned(utf8.into_owned()))
 			}
 			DirectoryMeta::Encrypted(encrypted) => {
-				DirectoryMeta::Encrypted(Cow::Owned(encrypted.into_owned()))
+				DirectoryMeta::Encrypted(EncryptedString(Cow::Owned(encrypted.0.into_owned())))
 			}
-			DirectoryMeta::RSAEncrypted(encrypted) => {
-				DirectoryMeta::RSAEncrypted(Cow::Owned(encrypted.into_owned()))
-			}
+			DirectoryMeta::RSAEncrypted(encrypted) => DirectoryMeta::RSAEncrypted(
+				RSAEncryptedString(Cow::Owned(encrypted.0.into_owned())),
+			),
 		}
 	}
 }
 
 impl<'a> DirectoryMeta<'a> {
 	pub(crate) fn from_encrypted(
-		encrypted: Cow<'a, EncryptedString>,
+		encrypted: EncryptedString<'a>,
 		decrypter: &impl MetaCrypter,
 	) -> Self {
 		let Ok(decrypted) = decrypter.decrypt_meta(&encrypted) else {
@@ -55,7 +55,7 @@ impl<'a> DirectoryMeta<'a> {
 	}
 
 	pub(crate) fn from_rsa_encrypted(
-		encrypted: Cow<'a, RSAEncryptedString>,
+		encrypted: RSAEncryptedString<'a>,
 		decrypter: &RsaPrivateKey,
 	) -> Self {
 		let Ok(decrypted) = crypto::rsa::decrypt_with_private_key(decrypter, &encrypted) else {
@@ -72,7 +72,7 @@ impl<'a> DirectoryMeta<'a> {
 }
 
 impl<'a> DirectoryMeta<'a> {
-	pub(crate) fn encrypt(&self, encrypter: &impl MetaCrypter) -> Option<EncryptedString> {
+	pub(crate) fn encrypt(&self, encrypter: &impl MetaCrypter) -> Option<EncryptedString<'static>> {
 		match self {
 			Self::Decoded(meta) => {
 				let json = serde_json::to_string(meta).expect("Failed to serialize directory meta");

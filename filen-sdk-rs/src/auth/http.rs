@@ -15,7 +15,7 @@ impl UnauthorizedClient for &UnauthClient {
 
 pub struct AuthClient {
 	client: reqwest::Client,
-	pub(crate) api_key: APIKey,
+	pub(crate) api_key: APIKey<'static>,
 }
 
 impl PartialEq for AuthClient {
@@ -45,7 +45,7 @@ impl Clone for AuthClient {
 }
 
 impl AuthClient {
-	pub fn new(api_key: APIKey) -> Self {
+	pub fn new(api_key: APIKey<'static>) -> Self {
 		let builder = reqwest::Client::builder();
 		#[cfg(not(target_arch = "wasm32"))]
 		let builder = builder.use_rustls_tls();
@@ -57,14 +57,14 @@ impl AuthClient {
 		}
 	}
 
-	pub fn new_from_client(api_key: APIKey, client: UnauthClient) -> Self {
+	pub fn new_from_client(api_key: APIKey<'static>, client: UnauthClient) -> Self {
 		Self {
 			client: client.client,
 			api_key,
 		}
 	}
 
-	pub(crate) fn get_api_key(&self) -> &APIKey {
+	pub(crate) fn get_api_key(&self) -> &APIKey<'_> {
 		&self.api_key
 	}
 }
@@ -76,7 +76,7 @@ impl UnauthorizedClient for &AuthClient {
 }
 
 impl AuthorizedClient for &AuthClient {
-	fn get_api_key(&self) -> &APIKey {
+	fn get_api_key(&self) -> &APIKey<'_> {
 		&self.api_key
 	}
 
@@ -92,7 +92,7 @@ impl UnauthorizedClient for crate::auth::Client {
 }
 
 impl AuthorizedClient for crate::auth::Client {
-	fn get_api_key(&self) -> &APIKey {
+	fn get_api_key(&self) -> &APIKey<'_> {
 		self.client().get_api_key()
 	}
 
@@ -119,16 +119,14 @@ pub(crate) trait UnauthorizedClient {
 }
 
 pub(crate) trait AuthorizedClient: UnauthorizedClient {
-	fn get_api_key(&self) -> &APIKey;
+	fn get_api_key(&self) -> &APIKey<'_>;
 
 	fn get_auth_request(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
-		self.get_request(url)
-			.bearer_auth(self.get_api_key().0.as_str())
+		self.get_request(url).bearer_auth(&self.get_api_key().0)
 	}
 
 	fn post_auth_request(&self, url: impl IntoUrl) -> reqwest::RequestBuilder {
-		self.post_request(url)
-			.bearer_auth(self.get_api_key().0.as_str())
+		self.post_request(url).bearer_auth(&self.get_api_key().0)
 	}
 
 	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>>;

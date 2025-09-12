@@ -10,7 +10,7 @@ pub const ENDPOINT: &str = "v3/file/metadata";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub uuid: UuidStr,
-	pub name: Cow<'a, EncryptedString>,
+	pub name: EncryptedString<'a>,
 	pub name_hashed: Cow<'a, str>,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 }

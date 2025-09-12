@@ -295,20 +295,18 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		let file = self.file.clone();
 		let empty_request = filen_types::api::v3::upload::empty::Request {
 			uuid: file.uuid(),
-			name: Cow::Owned(self.client.crypter().encrypt_meta(file.name())),
+			name: self.client.crypter().encrypt_meta(file.name()),
 			name_hashed: Cow::Owned(self.client.hash_name(file.name())),
-			size: Cow::Owned(
-				self.client
-					.crypter()
-					.encrypt_meta(&self.written.to_string()),
-			),
+			size: self
+				.client
+				.crypter()
+				.encrypt_meta(&self.written.to_string()),
 			parent: file.parent,
-			mime: Cow::Owned(
-				self.client
-					.crypter()
-					.encrypt_meta(self.file.as_ref().mime()),
-			),
-			metadata: Cow::Owned(self.client.crypter().encrypt_meta(&serde_json::to_string(
+			mime: self
+				.client
+				.crypter()
+				.encrypt_meta(self.file.as_ref().mime()),
+			metadata: self.client.crypter().encrypt_meta(&serde_json::to_string(
 				&DecryptedFileMeta {
 					name: Cow::Borrowed(file.name()),
 					size: self.written,
@@ -318,7 +316,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 					last_modified: file.last_modified(),
 					hash: Some(self.hash),
 				},
-			)?)),
+			)?),
 			version: self.client.file_encryption_version(),
 		};
 

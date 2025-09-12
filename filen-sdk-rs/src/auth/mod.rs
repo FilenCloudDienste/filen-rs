@@ -58,7 +58,7 @@ impl MetaCrypter for MetaKey {
 		}
 	}
 
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
 		match self {
 			MetaKey::V1(info) | MetaKey::V2(info) => info.encrypt_meta_into(meta, out),
 			MetaKey::V3(info) => info.encrypt_meta_into(meta, out),
@@ -113,7 +113,7 @@ impl MetaCrypter for AuthInfo {
 		}
 	}
 
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
 		match self {
 			AuthInfo::V1(info) | AuthInfo::V2(info) => info.encrypt_meta_into(meta, out),
 			AuthInfo::V3(info) => info.encrypt_meta_into(meta, out),
@@ -311,7 +311,7 @@ impl Client {
 		self.get_meta_key_from_str(&decrypted_str)
 	}
 
-	pub(crate) fn encrypt_meta_key(&self, key: &MetaKey) -> EncryptedMetaKey {
+	pub(crate) fn encrypt_meta_key(&self, key: &MetaKey) -> EncryptedMetaKey<'static> {
 		EncryptedMetaKey(match key {
 			MetaKey::V1(_) => {
 				unimplemented!("V1 encryption is not supported in this version of the SDK")
@@ -427,7 +427,7 @@ impl Client {
 			public_key: RsaPublicKey::from(&private_key),
 			hmac_key: HMACKey::new(&private_key),
 			private_key,
-			http_client: Arc::new(AuthClient::new(APIKey(api_key))),
+			http_client: Arc::new(AuthClient::new(APIKey(Cow::Owned(api_key)))),
 			drive_lock: Mutex::new(None),
 			api_semaphore: tokio::sync::Semaphore::new(max_parallel_requests),
 			memory_semaphore: tokio::sync::Semaphore::new(max_io_memory_usage),
@@ -481,7 +481,7 @@ impl Client {
 			auth_info: self.auth_info.to_string(),
 			private_key: BASE64_STANDARD
 				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
-			api_key: self.http_client.api_key.0.clone(),
+			api_key: self.http_client.api_key.0.to_string(),
 			auth_version: match self.auth_info {
 				AuthInfo::V1(_) => 1,
 				AuthInfo::V2(_) => 2,

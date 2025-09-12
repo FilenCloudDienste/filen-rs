@@ -31,7 +31,7 @@ pub struct Response<'a> {
 pub struct SharedFileIn<'a> {
 	pub uuid: UuidStr,
 	pub parent: Option<UuidStr>,
-	pub metadata: Cow<'a, RSAEncryptedString>,
+	pub metadata: RSAEncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
 	pub chunks: u64,
@@ -50,7 +50,7 @@ pub struct SharedFileIn<'a> {
 pub struct SharedDirIn<'a> {
 	pub uuid: UuidStr,
 	pub parent: Option<UuidStr>,
-	pub metadata: Cow<'a, RSAEncryptedString>,
+	pub metadata: RSAEncryptedString<'a>,
 	pub sharer_email: Cow<'a, str>,
 	pub sharer_id: u64,
 	#[serde(with = "crate::serde::boolean::number")]

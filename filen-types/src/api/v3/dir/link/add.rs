@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -18,7 +16,7 @@ pub struct Request<'a> {
 	#[serde(rename = "linkUUID")]
 	pub link_uuid: UuidStr,
 	pub r#type: ObjectType,
-	pub metadata: Cow<'a, EncryptedString>,
-	pub key: Cow<'a, EncryptedMetaKey>,
+	pub metadata: EncryptedString<'a>,
+	pub key: EncryptedMetaKey<'a>,
 	pub expiration: super::PublicLinkExpiration,
 }

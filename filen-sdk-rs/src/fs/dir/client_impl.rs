@@ -64,10 +64,9 @@ impl Client {
 				name_hashed: Cow::Borrowed(
 					&self.hash_name(dir.name().ok_or(MetadataWasNotDecryptedError)?),
 				),
-				meta: Cow::Borrowed(
-					&dir.get_encrypted_meta(self.crypter())
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
+				meta: dir
+					.get_encrypted_meta(self.crypter())
+					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await?;
@@ -87,7 +86,7 @@ impl Client {
 		&self,
 		parent: &dyn HasUUIDContents,
 		name: &str,
-		contents: impl Into<String>,
+		contents: &str,
 	) -> Result<UuidStr, Error> {
 		use filen_types::crypto::EncryptedString;
 		let _lock = self.lock_drive().await?;
@@ -99,7 +98,7 @@ impl Client {
 				uuid,
 				parent: *parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(name)),
-				meta: Cow::Borrowed(&EncryptedString(contents.into())),
+				meta: EncryptedString(Cow::Borrowed(contents)),
 			},
 		)
 		.await?;
@@ -292,11 +291,9 @@ impl Client {
 			&api::v3::dir::metadata::Request {
 				uuid: *dir.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
-				metadata: Cow::Borrowed(
-					&self
-						.crypter()
-						.encrypt_meta(&serde_json::to_string(&temp_meta)?),
-				),
+				metadata: self
+					.crypter()
+					.encrypt_meta(&serde_json::to_string(&temp_meta)?),
 			},
 		)
 		.await?;

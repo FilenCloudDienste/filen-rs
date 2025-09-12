@@ -16,6 +16,7 @@ use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ParentUuid, UuidStr},
+	traits::CowHelpers,
 };
 use log::trace;
 use rusqlite::{CachedStatement, Connection, Result};
@@ -106,8 +107,8 @@ pub(crate) enum DBFileMeta {
 	Decoded(DBDecryptedFileMeta),
 	DecryptedRaw(Vec<u8>),
 	DecryptedUTF8(String),
-	Encrypted(EncryptedString),
-	RSAEncrypted(RSAEncryptedString),
+	Encrypted(EncryptedString<'static>),
+	RSAEncrypted(RSAEncryptedString<'static>),
 }
 
 impl DBFileMeta {
@@ -134,8 +135,8 @@ impl PartialEq<FileMeta<'_>> for DBFileMeta {
 			(Self::Decoded(meta), FileMeta::Decoded(other_meta)) => meta == other_meta,
 			(Self::DecryptedRaw(data), FileMeta::DecryptedRaw(other_data)) => *data == **other_data,
 			(Self::DecryptedUTF8(data), FileMeta::DecryptedUTF8(other_data)) => data == other_data,
-			(Self::Encrypted(data), FileMeta::Encrypted(other_data)) => *data == **other_data,
-			(Self::RSAEncrypted(data), FileMeta::RSAEncrypted(other_data)) => *data == **other_data,
+			(Self::Encrypted(data), FileMeta::Encrypted(other_data)) => *data == *other_data,
+			(Self::RSAEncrypted(data), FileMeta::RSAEncrypted(other_data)) => *data == *other_data,
 			_ => false,
 		}
 	}
@@ -149,8 +150,10 @@ impl From<FileMeta<'_>> for DBFileMeta {
 			}
 			FileMeta::DecryptedRaw(raw) => Self::DecryptedRaw(raw.into_owned()),
 			FileMeta::DecryptedUTF8(utf8) => Self::DecryptedUTF8(utf8.into_owned()),
-			FileMeta::Encrypted(encrypted) => Self::Encrypted(encrypted.into_owned()),
-			FileMeta::RSAEncrypted(rsa_encrypted) => Self::RSAEncrypted(rsa_encrypted.into_owned()),
+			FileMeta::Encrypted(encrypted) => Self::Encrypted(encrypted.into_owned_cow()),
+			FileMeta::RSAEncrypted(rsa_encrypted) => {
+				Self::RSAEncrypted(rsa_encrypted.into_owned_cow())
+			}
 		}
 	}
 }
@@ -387,10 +390,8 @@ impl TryFrom<DBFile> for RemoteFile {
 				}),
 				DBFileMeta::DecryptedRaw(raw) => FileMeta::DecryptedRaw(Cow::Owned(raw)),
 				DBFileMeta::DecryptedUTF8(utf8) => FileMeta::DecryptedUTF8(Cow::Owned(utf8)),
-				DBFileMeta::Encrypted(encrypted) => FileMeta::Encrypted(Cow::Owned(encrypted)),
-				DBFileMeta::RSAEncrypted(rsa_encrypted) => {
-					FileMeta::RSAEncrypted(Cow::Owned(rsa_encrypted))
-				}
+				DBFileMeta::Encrypted(encrypted) => FileMeta::Encrypted(encrypted),
+				DBFileMeta::RSAEncrypted(rsa_encrypted) => FileMeta::RSAEncrypted(rsa_encrypted),
 			},
 		})
 	}

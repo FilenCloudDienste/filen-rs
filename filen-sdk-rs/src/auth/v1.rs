@@ -14,8 +14,8 @@ pub(super) async fn login(
 	(
 		super::AuthClient,
 		super::AuthInfo,
-		EncryptedPrivateKey,
-		EncodedPublicKey,
+		EncryptedPrivateKey<'static>,
+		EncodedPublicKey<'static>,
 	),
 	Error,
 > {
@@ -25,26 +25,26 @@ pub(super) async fn login(
 		&client,
 		&api::v3::login::Request {
 			email: Cow::Borrowed(email),
-			password: Cow::Borrowed(&pwd),
+			password: pwd,
 			two_factor_code: Cow::Borrowed(two_factor_code),
 			auth_version: info.auth_version,
 		},
 	)
 	.await?;
 
-	let auth_client = super::AuthClient::new_from_client(response.api_key.into_owned(), client);
+	let auth_client = super::AuthClient::new_from_client(response.api_key, client);
 
 	let master_keys_str = response.master_keys.ok_or(Error::custom(
 		ErrorKind::Response,
 		"Missing master keys in login response",
 	))?;
 
-	let master_keys = crypto::v2::MasterKeys::new(master_keys_str.into_owned(), master_key)?;
+	let master_keys = crypto::v2::MasterKeys::new(master_keys_str, master_key)?;
 
 	Ok((
 		auth_client,
 		super::AuthInfo::V1(super::v2::AuthInfo { master_keys }),
-		response.private_key.into_owned(),
-		response.public_key.into_owned(),
+		response.private_key,
+		response.public_key,
 	))
 }

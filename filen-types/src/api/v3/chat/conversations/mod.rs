@@ -24,13 +24,13 @@ pub struct Response<'a>(pub Vec<ChatConversation<'a>>);
 pub struct ChatConversation<'a> {
 	pub uuid: UuidStr,
 	pub last_message_sender: u64,
-	pub last_message: Option<Cow<'a, EncryptedString>>,
+	pub last_message: Option<EncryptedString<'a>>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub last_message_timestamp: DateTime<Utc>,
 	pub last_message_uuid: Option<UuidStr>,
 	pub owner_id: u64,
-	pub owner_metadata: Option<Cow<'a, EncryptedString>>,
-	pub name: Option<Cow<'a, EncryptedString>>,
+	pub owner_metadata: Option<EncryptedString<'a>>,
+	pub name: Option<EncryptedString<'a>>,
 	pub participants: Vec<ChatConversationParticipant<'a>>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub created_timestamp: DateTime<Utc>,
@@ -41,8 +41,8 @@ pub struct ChatConversationParticipant<'a> {
 	pub user_id: u64,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,
-	pub nick_name: Cow<'a, EncryptedString>,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub nick_name: EncryptedString<'a>,
+	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub permissions_add: bool,
 	#[serde(with = "chrono::serde::ts_milliseconds")]

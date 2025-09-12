@@ -11,5 +11,5 @@ pub const ENDPOINT: &str = "v3/notes/create";
 pub struct Request<'a> {
 	pub uuid: UuidStr,
 	pub title: Cow<'a, str>,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 }

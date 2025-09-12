@@ -1,4 +1,4 @@
-use std::{fmt::Debug, str::FromStr};
+use std::{borrow::Cow, fmt::Debug, str::FromStr};
 
 use aes_gcm::{
 	AesGcm, KeyInit, Nonce,
@@ -99,7 +99,7 @@ impl PartialEq for EncryptionKey {
 impl Eq for EncryptionKey {}
 
 impl MetaCrypter for EncryptionKey {
-	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString {
+	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
 		let nonce: [u8; NONCE_SIZE] = rand::random();
 		let nonce = Nonce::from_slice(&nonce);
 		out.clear();
@@ -127,7 +127,7 @@ impl MetaCrypter for EncryptionKey {
 		// which we will never do we also don't have AAD which could cause issues
 		let encrypted = self.cipher.encrypt(nonce, meta.as_bytes()).unwrap();
 		BASE64_STANDARD.encode_string(encrypted, &mut out);
-		EncryptedString(out)
+		EncryptedString(Cow::Owned(out))
 	}
 
 	fn decrypt_meta_into(
@@ -218,7 +218,7 @@ pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], 
 pub fn derive_password_and_kek(
 	pwd: impl AsRef<[u8]>,
 	salt: impl AsRef<[u8]>,
-) -> Result<(EncryptionKey, DerivedPassword), ConversionError> {
+) -> Result<(EncryptionKey, DerivedPassword<'static>), ConversionError> {
 	let mut decoded_salt = [0u8; 256];
 	faster_hex::hex_decode(salt.as_ref(), &mut decoded_salt)?;
 
@@ -226,7 +226,7 @@ pub fn derive_password_and_kek(
 	let derived_str = faster_hex::hex_string(&derived_data);
 
 	let kek = EncryptionKey::from_str(&derived_str[0..64])?;
-	let password = DerivedPassword(derived_str[64..128].to_owned());
+	let password = DerivedPassword(Cow::Owned(derived_str[64..128].to_string()));
 
 	Ok((kek, password))
 }

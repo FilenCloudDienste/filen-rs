@@ -16,5 +16,5 @@ pub struct Request<'a> {
 	pub parent: Option<UuidStr>,
 	pub email: Cow<'a, str>,
 	pub r#type: ObjectType,
-	pub metadata: Cow<'a, RSAEncryptedString>,
+	pub metadata: RSAEncryptedString<'a>,
 }

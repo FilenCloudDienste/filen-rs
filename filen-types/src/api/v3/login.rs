@@ -16,7 +16,7 @@ pub const ENDPOINT: &str = "v3/login";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub email: Cow<'a, str>,
-	pub password: Cow<'a, DerivedPassword>,
+	pub password: DerivedPassword<'a>,
 	pub two_factor_code: Cow<'a, str>,
 	pub auth_version: AuthVersion,
 }
@@ -24,9 +24,9 @@ pub struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub api_key: Cow<'a, APIKey>,
-	pub master_keys: Option<Cow<'a, EncryptedMasterKeys>>,
-	pub public_key: Cow<'a, EncodedPublicKey>,
-	pub private_key: Cow<'a, EncryptedPrivateKey>,
-	pub dek: Option<Cow<'a, EncryptedDEK>>,
+	pub api_key: APIKey<'a>,
+	pub master_keys: Option<EncryptedMasterKeys<'a>>,
+	pub public_key: EncodedPublicKey<'a>,
+	pub private_key: EncryptedPrivateKey<'a>,
+	pub dek: Option<EncryptedDEK<'a>>,
 }

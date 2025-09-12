@@ -13,5 +13,5 @@ pub struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub public_key: Cow<'a, EncodedPublicKey>,
+	pub public_key: EncodedPublicKey<'a>,
 }

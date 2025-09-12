@@ -32,7 +32,7 @@ pub struct Response<'a> {
 pub struct Directory<'a> {
 	pub uuid: UuidStr,
 	pub parent: UuidStr,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	#[serde(with = "chrono::serde::ts_seconds")]
 	pub timestamp: DateTime<Utc>,
 	pub color: DirColor<'a>,
@@ -43,7 +43,7 @@ pub struct Directory<'a> {
 pub struct File<'a> {
 	pub uuid: UuidStr,
 	pub parent: UuidStr,
-	pub metadata: Cow<'a, EncryptedString>,
+	pub metadata: EncryptedString<'a>,
 	#[serde(with = "chrono::serde::ts_seconds")]
 	pub timestamp: DateTime<Utc>,
 	pub size: u64,

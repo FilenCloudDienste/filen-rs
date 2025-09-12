@@ -28,5 +28,5 @@ pub struct Response<'a> {
 pub struct SharedUser<'a> {
 	pub id: u64,
 	pub email: Cow<'a, str>,
-	pub public_key: Cow<'a, EncodedPublicKey>,
+	pub public_key: EncodedPublicKey<'a>,
 }

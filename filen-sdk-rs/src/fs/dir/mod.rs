@@ -143,7 +143,7 @@ impl RemoteDirectory {
 		parent: ParentUuid,
 		color: DirColor<'static>,
 		favorited: bool,
-		meta: Cow<'_, EncryptedString>,
+		meta: EncryptedString<'_>,
 		decrypter: &impl MetaCrypter,
 	) -> Self {
 		let meta = DirectoryMeta::from_encrypted(meta, decrypter).into_owned();

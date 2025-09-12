@@ -1,34 +1,48 @@
 pub mod rsa;
-use std::fmt::Formatter;
+use std::{borrow::Cow, fmt::Formatter};
 
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct DerivedPassword(pub String);
+use crate::impl_cow_helpers_for_newtype;
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncodedString(pub String);
+#[serde(transparent)]
+pub struct DerivedPassword<'a>(pub Cow<'a, str>);
+impl_cow_helpers_for_newtype!(DerivedPassword);
 
-impl TryFrom<&EncodedString> for Vec<u8> {
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct EncodedString<'a>(pub Cow<'a, str>);
+impl_cow_helpers_for_newtype!(EncodedString);
+
+impl TryFrom<&EncodedString<'_>> for Vec<u8> {
 	type Error = base64::DecodeError;
 	fn try_from(value: &EncodedString) -> Result<Self, Self::Error> {
-		BASE64_STANDARD.decode(&value.0)
+		BASE64_STANDARD.decode(value.0.as_ref())
 	}
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedString(pub String);
+#[serde(transparent)]
+pub struct EncryptedString<'a>(pub Cow<'a, str>);
+impl_cow_helpers_for_newtype!(EncryptedString);
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedMasterKeys(pub EncryptedString);
+#[serde(transparent)]
+pub struct EncryptedMasterKeys<'a>(pub EncryptedString<'a>);
+impl_cow_helpers_for_newtype!(EncryptedMasterKeys);
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedDEK(pub EncryptedString);
+#[serde(transparent)]
+pub struct EncryptedDEK<'a>(pub EncryptedString<'a>);
+impl_cow_helpers_for_newtype!(EncryptedDEK);
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub struct EncryptedMetaKey(pub EncryptedString);
+#[serde(transparent)]
+pub struct EncryptedMetaKey<'a>(pub EncryptedString<'a>);
+impl_cow_helpers_for_newtype!(EncryptedMetaKey);
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
