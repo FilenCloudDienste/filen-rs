@@ -336,11 +336,11 @@ pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], 
 	Ok(derived_data)
 }
 
-pub fn derive_password_and_mk(
-	password: impl AsRef<[u8]>,
-	salt: impl AsRef<[u8]>,
+pub(crate) fn derive_password_and_mk(
+	password: &[u8],
+	salt: &[u8],
 ) -> Result<(MasterKey, DerivedPassword<'static>), ConversionError> {
-	let derived_data = derive_password(password.as_ref(), salt.as_ref())?;
+	let derived_data = derive_password(password, salt)?;
 	let derived_str = faster_hex::hex_string(&derived_data);
 	let (master_key_str, derived_password_str) = derived_str.split_at(64);
 

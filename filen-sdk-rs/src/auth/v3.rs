@@ -52,7 +52,8 @@ pub(super) async fn login(
 	),
 	Error,
 > {
-	let (kek, pwd) = crate::crypto::v3::derive_password_and_kek(pwd, info.salt.as_ref())?;
+	let (kek, pwd) =
+		crate::crypto::v3::derive_password_and_kek(pwd.as_bytes(), info.salt.as_bytes())?;
 
 	let response = api::v3::login::post(
 		&client,

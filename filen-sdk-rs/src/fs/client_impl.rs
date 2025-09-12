@@ -30,9 +30,8 @@ pub type GetItemsResponseError<'a> = (Vec<UnsharedDirectoryType<'a>>, UnsharedFS
 impl Client {
 	pub async fn find_item_at_path<'a>(
 		&'a self,
-		path: impl AsRef<str>,
+		path: &str,
 	) -> Result<Option<FSObject<'a>>, Error> {
-		let path: &str = path.as_ref();
 		let (_, item): (_, ObjectOrRemainingPath<'a, '_>) =
 			self.get_items_in_path(path).await.map_err(|(e, _, _)| e)?;
 		match item {

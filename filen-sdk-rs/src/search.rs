@@ -147,9 +147,9 @@ impl Client {
 
 	pub async fn find_item_matches_for_name(
 		&self,
-		name: impl AsRef<str>,
+		name: &str,
 	) -> Result<Vec<(NonRootFSObject<'static>, String)>, crate::error::Error> {
-		let name = name.as_ref().trim().to_lowercase();
+		let name = name.trim().to_lowercase();
 		let response = api::v3::search::find::post(
 			self.client(),
 			&api::v3::search::find::Request {

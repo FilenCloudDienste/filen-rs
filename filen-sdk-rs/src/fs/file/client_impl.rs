@@ -137,13 +137,13 @@ impl Client {
 
 	pub async fn file_exists(
 		&self,
-		name: impl AsRef<str>,
+		name: &str,
 		parent: &impl HasUUIDContents,
 	) -> Result<Option<UuidStr>, Error> {
 		api::v3::file::exists::post(
 			self.client(),
 			&api::v3::file::exists::Request {
-				name_hashed: self.hash_name(name.as_ref()),
+				name_hashed: self.hash_name(name),
 				parent: (*parent.uuid()).into(),
 			},
 		)

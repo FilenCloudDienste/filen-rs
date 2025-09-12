@@ -53,7 +53,8 @@ pub(super) async fn login(
 	),
 	Error,
 > {
-	let (master_key, pwd) = crypto::v2::derive_password_and_mk(pwd, info.salt.as_ref())?;
+	let (master_key, pwd) =
+		crypto::v2::derive_password_and_mk(pwd.as_bytes(), info.salt.as_bytes())?;
 
 	let response = api::v3::login::post(
 		&client,

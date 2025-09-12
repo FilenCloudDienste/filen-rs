@@ -261,7 +261,7 @@ async fn print_file(
 	let file_str = working_path.navigate(file_str).0;
 	let client = client.get(ui).await?;
 	let Some(file) = client
-		.find_item_at_path(file_str.clone())
+		.find_item_at_path(&file_str)
 		.await
 		.context("Failed to find cat file")?
 	else {
@@ -301,7 +301,7 @@ async fn print_file_or_directory_info(
 	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
 	let client = client.get(ui).await?;
 	let Some(item) = client
-		.find_item_at_path(file_or_directory_str.clone())
+		.find_item_at_path(&file_or_directory_str)
 		.await
 		.context("Failed to find item")?
 	else {
@@ -381,7 +381,7 @@ async fn create_directory(
 		return Err(anyhow!("Cannot create root directory"));
 	}
 	let Some(parent) = client
-		.find_item_at_path(parent_str.0.clone())
+		.find_item_at_path(&parent_str.0)
 		.await
 		.context("Failed to find parent directory")?
 	else {
@@ -412,7 +412,7 @@ async fn delete_file_or_directory(
 	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
 	let client = client.get(ui).await?;
 	let Some(item) = client
-		.find_item_at_path(file_or_directory_str.clone())
+		.find_item_at_path(&file_or_directory_str)
 		.await
 		.context("Failed to find file or directory")?
 	else {
@@ -492,7 +492,7 @@ async fn move_or_copy_file_or_directory(
 	let destination_str = working_path.navigate(destination_str);
 	let client = client.get(ui).await?;
 	let Some(source_file_or_directory) = client
-		.find_item_at_path(source_str.0.clone())
+		.find_item_at_path(&source_str.0)
 		.await
 		.context("Failed to find source file or directory")?
 	else {
@@ -502,7 +502,7 @@ async fn move_or_copy_file_or_directory(
 		));
 	};
 	let Some(destination_dir) = client
-		.find_item_at_path(destination_str.0.clone())
+		.find_item_at_path(&destination_str.0)
 		.await
 		.context("Failed to find destination directory")?
 	else {
@@ -575,7 +575,7 @@ async fn set_file_or_directory_favorite(
 	let file_or_directory_str = working_path.navigate(file_or_directory_str).0;
 	let client = client.get(ui).await?;
 	let Some(file_or_directory) = client
-		.find_item_at_path(file_or_directory_str.clone())
+		.find_item_at_path(&file_or_directory_str)
 		.await
 		.context("Failed to find file or directory")?
 	else {

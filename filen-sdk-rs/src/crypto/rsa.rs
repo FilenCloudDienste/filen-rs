@@ -37,13 +37,13 @@ impl HMACKey {
 }
 
 impl HMACKey {
-	pub(crate) fn hash(&self, data: impl AsRef<[u8]>) -> Sha256Hash {
+	pub(crate) fn hash(&self, data: &[u8]) -> Sha256Hash {
 		let mut hmac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC key should be valid");
-		hmac.update(data.as_ref());
+		hmac.update(data);
 		hmac.finalize().into_bytes().into()
 	}
 
-	pub(crate) fn hash_to_string(&self, data: impl AsRef<[u8]>) -> String {
+	pub(crate) fn hash_to_string(&self, data: &[u8]) -> String {
 		faster_hex::hex_string(self.hash(data).as_ref())
 	}
 }
@@ -65,9 +65,9 @@ pub(crate) fn get_key_pair(
 	Ok((private_key, public_key, hmac))
 }
 
-pub fn encrypt_with_public_key(
+pub(crate) fn encrypt_with_public_key(
 	public_key: &RsaPublicKey,
-	data: impl AsRef<[u8]>,
+	data: &[u8],
 ) -> Result<RSAEncryptedString<'static>, rsa::Error> {
 	let mut rng = old_rng::thread_rng();
 	// this is RSA_PKCS1_OAEP_PADDING according to

@@ -28,7 +28,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let file = client.upload_file(file.into(), contents).await.unwrap();
 
 	let found_file = match client
-		.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), name))
+		.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), name))
 		.await
 		.unwrap()
 	{
@@ -84,7 +84,7 @@ async fn file_search() {
 	let file = client.upload_file(file.into(), &[]).await.unwrap();
 
 	let found_items = client
-		.find_item_matches_for_name(file_random_part_long)
+		.find_item_matches_for_name(&file_random_part_long)
 		.await
 		.unwrap();
 
@@ -101,7 +101,7 @@ async fn file_search() {
 	);
 
 	let found_items = client
-		.find_item_matches_for_name(file_random_part_short)
+		.find_item_matches_for_name(&file_random_part_short)
 		.await
 		.unwrap();
 
@@ -129,7 +129,7 @@ async fn file_trash() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -143,7 +143,7 @@ async fn file_trash() {
 
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none()
@@ -152,7 +152,7 @@ async fn file_trash() {
 	client.restore_file(&mut file).await.unwrap();
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -174,7 +174,7 @@ async fn file_delete_permanently() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -184,7 +184,7 @@ async fn file_delete_permanently() {
 
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none()
@@ -215,7 +215,7 @@ async fn file_move() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -229,7 +229,7 @@ async fn file_move() {
 
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none(),
@@ -237,7 +237,7 @@ async fn file_move() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!(
+			.find_item_at_path(&format!(
 				"{}/{}/{}",
 				test_dir.name().unwrap(),
 				second_dir.name().unwrap(),
@@ -264,7 +264,7 @@ async fn file_update_meta() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -283,7 +283,7 @@ async fn file_update_meta() {
 	assert_eq!(file.name().unwrap(), "new_name.json");
 	assert_eq!(
 		client
-			.find_item_at_path(format!(
+			.find_item_at_path(&format!(
 				"{}/{}",
 				test_dir.name().unwrap(),
 				file.name().unwrap()
@@ -391,7 +391,7 @@ async fn file_trash_empty() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
 		Some(FSObject::File(Cow::Borrowed(&file)))
@@ -403,7 +403,7 @@ async fn file_trash_empty() {
 	client.trash_file(&mut file).await.unwrap();
 	assert!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), file_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap()
 			.is_none()

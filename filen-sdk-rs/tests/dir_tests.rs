@@ -52,7 +52,7 @@ async fn find_at_path() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/a/b/c", test_dir.name().unwrap()))
+			.find_item_at_path(&format!("{}/a/b/c", test_dir.name().unwrap()))
 			.await
 			.unwrap(),
 		Some(FSObject::Dir(std::borrow::Cow::Borrowed(&dir_c)))
@@ -60,7 +60,7 @@ async fn find_at_path() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/a/bc", test_dir.name().unwrap()))
+			.find_item_at_path(&format!("{}/a/bc", test_dir.name().unwrap()))
 			.await
 			.unwrap(),
 		None
@@ -262,7 +262,7 @@ async fn dir_search() {
 	let dir = client.create_dir(&second_dir, dir_name).await.unwrap();
 
 	let found_items = client
-		.find_item_matches_for_name(dir_random_part_long)
+		.find_item_matches_for_name(&dir_random_part_long)
 		.await
 		.unwrap();
 
@@ -279,7 +279,7 @@ async fn dir_search() {
 	);
 
 	let found_items = client
-		.find_item_matches_for_name(dir_random_part_short)
+		.find_item_matches_for_name(&dir_random_part_short)
 		.await
 		.unwrap();
 
@@ -306,7 +306,7 @@ async fn dir_update_meta() {
 
 	assert_eq!(
 		client
-			.find_item_at_path(format!("{}/{}", test_dir.name().unwrap(), dir_name))
+			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), dir_name))
 			.await
 			.unwrap(),
 		Some(FSObject::Dir(Cow::Borrowed(&dir)))
@@ -325,7 +325,7 @@ async fn dir_update_meta() {
 	assert_eq!(dir.name().unwrap(), "new_name");
 	assert_eq!(
 		client
-			.find_item_at_path(format!(
+			.find_item_at_path(&format!(
 				"{}/{}",
 				test_dir.name().unwrap(),
 				dir.name().unwrap()

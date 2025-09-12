@@ -215,14 +215,14 @@ pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], 
 	Ok(derived_data)
 }
 
-pub fn derive_password_and_kek(
-	pwd: impl AsRef<[u8]>,
-	salt: impl AsRef<[u8]>,
+pub(crate) fn derive_password_and_kek(
+	pwd: &[u8],
+	salt: &[u8],
 ) -> Result<(EncryptionKey, DerivedPassword<'static>), ConversionError> {
 	let mut decoded_salt = [0u8; 256];
-	faster_hex::hex_decode(salt.as_ref(), &mut decoded_salt)?;
+	faster_hex::hex_decode(salt, &mut decoded_salt)?;
 
-	let derived_data = derive_password(pwd.as_ref(), &decoded_salt)?;
+	let derived_data = derive_password(pwd, &decoded_salt)?;
 	let derived_str = faster_hex::hex_string(&derived_data);
 
 	let kek = EncryptionKey::from_str(&derived_str[0..64])?;
