@@ -13,18 +13,7 @@ async fn test_stringification() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let stringified = client.to_stringified();
-	assert_eq!(
-		Client::from_strings(
-			stringified.email,
-			&stringified.root_uuid,
-			&stringified.auth_info,
-			&stringified.private_key,
-			stringified.api_key,
-			stringified.auth_version
-		)
-		.unwrap(),
-		**client
-	)
+	assert_eq!(Client::from_stringified(stringified).unwrap(), **client)
 }
 
 #[shared_test_runtime]

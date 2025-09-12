@@ -44,13 +44,8 @@ async fn get_db_resources() -> (FilenMobileCacheState, TestResources) {
 	std::fs::create_dir_all(&files_path).unwrap();
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.to_stringified();
-	let state = FilenMobileCacheState::from_strings_in_memory(
-		client.email,
-		&client.root_uuid,
-		&client.auth_info,
-		&client.private_key,
-		client.api_key,
-		client.auth_version,
+	let state = FilenMobileCacheState::from_stringified_in_memory(
+		client,
 		files_path.to_string_lossy().as_ref(),
 	)
 	.unwrap();

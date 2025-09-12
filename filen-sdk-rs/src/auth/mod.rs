@@ -85,7 +85,7 @@ impl Display for AuthInfo {
 }
 
 impl AuthInfo {
-	pub fn from_string_and_version(s: &str, version: u32) -> Result<Self, ConversionError> {
+	pub fn from_string_and_version(s: &str, version: u8) -> Result<Self, ConversionError> {
 		match version {
 			1 => Ok(AuthInfo::V1(v2::AuthInfo {
 				master_keys: MasterKeys::from_decrypted_string(s)?,
@@ -129,6 +129,7 @@ impl MetaCrypter for AuthInfo {
 #[cfg_attr(feature = "node", napi_derive::napi)]
 pub struct Client {
 	email: String,
+	user_id: u64,
 
 	root_dir: RootDirectory,
 
@@ -179,11 +180,12 @@ impl Eq for Client {}
 #[serde(rename_all = "camelCase")]
 pub struct StringifiedClient {
 	pub email: String,
+	pub user_id: u64,
 	pub root_uuid: String,
 	pub auth_info: String,
 	pub private_key: String,
 	pub api_key: String,
-	pub auth_version: u32,
+	pub auth_version: u8,
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
 		tsify(type = "number")
@@ -198,24 +200,68 @@ pub struct StringifiedClient {
 	pub max_io_memory_usage: Option<u32>,
 }
 
+impl From<FilenSDKConfig> for StringifiedClient {
+	fn from(value: FilenSDKConfig) -> Self {
+		StringifiedClient {
+			email: value.email,
+			user_id: value.user_id,
+			root_uuid: value.base_folder_uuid,
+			auth_info: value.master_keys.join("|"),
+			private_key: value.private_key,
+			api_key: value.api_key,
+			auth_version: value.auth_version as u8,
+			max_parallel_requests: None,
+			max_io_memory_usage: None,
+		}
+	}
+}
+
 impl Client {
 	pub fn from_stringified(stringified: StringifiedClient) -> Result<Self, ConversionError> {
-		Client::from_strings_with_limits(
-			stringified.email,
-			&stringified.root_uuid,
-			&stringified.auth_info,
-			&stringified.private_key,
-			stringified.api_key,
-			stringified.auth_version,
-			stringified
-				.max_parallel_requests
-				.map(|v| v as usize)
-				.unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
-			stringified
-				.max_io_memory_usage
-				.map(|v| v as usize)
-				.unwrap_or(crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET),
-		)
+		let auth_info =
+			AuthInfo::from_string_and_version(&stringified.auth_info, stringified.auth_version)?;
+		let file_encryption_version = match auth_info {
+			AuthInfo::V1(_) | AuthInfo::V2(_) => V2FILE_ENCRYPTION_VERSION,
+			AuthInfo::V3(_) => FileEncryptionVersion::V3,
+		};
+		let meta_encryption_version = match auth_info {
+			AuthInfo::V1(_) | AuthInfo::V2(_) => V2META_ENCRYPTION_VERSION,
+			AuthInfo::V3(_) => MetaEncryptionVersion::V3,
+		};
+
+		let private_key =
+			RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(stringified.private_key)?)?;
+
+		Ok(Client {
+			email: stringified.email,
+			user_id: stringified.user_id,
+			root_dir: RootDirectory::new(UuidStr::from_str(&stringified.root_uuid)?),
+			auth_info,
+			file_encryption_version,
+			meta_encryption_version,
+			public_key: RsaPublicKey::from(&private_key),
+			hmac_key: HMACKey::new(&private_key),
+			private_key,
+			http_client: Arc::new(AuthClient::new(APIKey(Cow::Owned(stringified.api_key)))),
+			drive_lock: Mutex::new(None),
+			api_semaphore: tokio::sync::Semaphore::new(
+				stringified
+					.max_parallel_requests
+					.map(|v| {
+						usize::try_from(v).unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS)
+					})
+					.unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
+			),
+			memory_semaphore: tokio::sync::Semaphore::new(
+				stringified
+					.max_io_memory_usage
+					.map(|v| {
+						usize::try_from(v).unwrap_or(crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET)
+					})
+					.unwrap_or(crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET),
+			),
+			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
+		})
 	}
 
 	pub fn client(&self) -> &AuthClient {
@@ -356,8 +402,11 @@ impl Client {
 			AuthVersion::V3 => (FileEncryptionVersion::V3, MetaEncryptionVersion::V3),
 		};
 
+		let user_info = api::v3::user::info::get(&client).await?;
+
 		Ok(Client {
 			email,
+			user_id: user_info.id,
 			root_dir,
 			auth_info,
 			file_encryption_version,
@@ -371,66 +420,6 @@ impl Client {
 			memory_semaphore: tokio::sync::Semaphore::new(
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
 			),
-			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
-		})
-	}
-
-	pub fn from_strings(
-		email: String,
-		root_uuid: &str,
-		auth_info: &str,
-		private_key: &str,
-		api_key: String,
-		version: u32,
-	) -> Result<Self, ConversionError> {
-		Client::from_strings_with_limits(
-			email,
-			root_uuid,
-			auth_info,
-			private_key,
-			api_key,
-			version,
-			crate::consts::MAX_SMALL_PARALLEL_REQUESTS,
-			crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
-		)
-	}
-
-	#[allow(clippy::too_many_arguments)]
-	fn from_strings_with_limits(
-		email: String,
-		root_uuid: &str,
-		auth_info: &str,
-		private_key: &str,
-		api_key: String,
-		version: u32,
-		max_parallel_requests: usize,
-		max_io_memory_usage: usize,
-	) -> Result<Self, ConversionError> {
-		let auth_info = AuthInfo::from_string_and_version(auth_info, version)?;
-		let file_encryption_version = match auth_info {
-			AuthInfo::V1(_) | AuthInfo::V2(_) => V2FILE_ENCRYPTION_VERSION,
-			AuthInfo::V3(_) => FileEncryptionVersion::V3,
-		};
-		let meta_encryption_version = match auth_info {
-			AuthInfo::V1(_) | AuthInfo::V2(_) => V2META_ENCRYPTION_VERSION,
-			AuthInfo::V3(_) => MetaEncryptionVersion::V3,
-		};
-
-		let private_key = RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(private_key)?)?;
-
-		Ok(Client {
-			email,
-			root_dir: RootDirectory::new(UuidStr::from_str(root_uuid)?),
-			auth_info,
-			file_encryption_version,
-			meta_encryption_version,
-			public_key: RsaPublicKey::from(&private_key),
-			hmac_key: HMACKey::new(&private_key),
-			private_key,
-			http_client: Arc::new(AuthClient::new(APIKey(Cow::Owned(api_key)))),
-			drive_lock: Mutex::new(None),
-			api_semaphore: tokio::sync::Semaphore::new(max_parallel_requests),
-			memory_semaphore: tokio::sync::Semaphore::new(max_io_memory_usage),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
 		})
 	}
@@ -477,6 +466,7 @@ impl Client {
 	pub fn to_stringified(&self) -> StringifiedClient {
 		StringifiedClient {
 			email: self.email.clone(),
+			user_id: self.user_id,
 			root_uuid: self.root_dir.uuid().to_string(),
 			auth_info: self.auth_info.to_string(),
 			private_key: BASE64_STANDARD

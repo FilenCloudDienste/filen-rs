@@ -134,15 +134,8 @@ async fn authenticate_from_keyring() -> Result<Client> {
 		eprintln!("Invalid SDK config in keyring! Try to `logout`.");
 		return Err(anyhow!("Failed to parse SDK config from keyring"));
 	};
-	let client = Client::from_strings(
-		sdk_config.email,
-		&sdk_config.root_uuid,
-		&sdk_config.auth_info,
-		&sdk_config.private_key,
-		sdk_config.api_key,
-		sdk_config.auth_version,
-	)
-	.context("Failed to create client from SDK config")?;
+	let client =
+		Client::from_stringified(sdk_config).context("Failed to create client from SDK config")?;
 	Ok(client)
 }
 

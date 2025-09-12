@@ -7,6 +7,7 @@ use std::{
 	time::Instant,
 };
 
+use filen_sdk_rs::{auth::StringifiedClient, fs::HasUUID};
 use filen_types::{auth::FilenSDKConfig, crypto::Sha256Hash};
 use log::{debug, info, trace};
 use rusqlite::Connection;
@@ -402,14 +403,7 @@ impl FilenMobileCacheState {
 
 impl AuthCacheState {
 	fn from_sdk_config(config: FilenSDKConfig, files_dir: &Path) -> Result<Self, CacheError> {
-		let client = filen_sdk_rs::auth::Client::from_strings(
-			config.email,
-			&config.base_folder_uuid,
-			&config.master_keys.join("|"), // hope this works
-			&config.private_key,
-			config.api_key,
-			config.auth_version as u32,
-		)?;
+		let client = filen_sdk_rs::auth::Client::from_stringified(config.into())?;
 
 		let db = db_from_files_dir(files_dir)?;
 
@@ -424,28 +418,19 @@ impl AuthCacheState {
 			last_recents_update: RwLock::new(None),
 			last_trash_update: RwLock::new(None),
 		};
-		new.add_root(&config.base_folder_uuid)?;
+		new.add_root(new.client.root().uuid().as_ref())?;
 		Ok(new)
 	}
 
-	fn from_strings_in_memory(
-		email: String,
-		root_uuid: &str,
-		auth_info: &str,
-		private_key: &str,
-		api_key: String,
-		version: u32,
+	fn from_stringified_in_memory(
+		client: StringifiedClient,
 		files_dir: &str,
 	) -> Result<Self, CacheError> {
-		debug!("Creating FilenMobileCacheState from strings for email: {email}");
-		let client = filen_sdk_rs::auth::Client::from_strings(
-			email,
-			root_uuid,
-			auth_info,
-			private_key,
-			api_key,
-			version,
-		)?;
+		debug!(
+			"Creating FilenMobileCacheState from strings for email: {}",
+			client.email
+		);
+		let client = filen_sdk_rs::auth::Client::from_stringified(client)?;
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir.as_ref())?;
 		let db = Connection::open_in_memory()?;
@@ -460,7 +445,7 @@ impl AuthCacheState {
 			last_recents_update: RwLock::new(None),
 			last_trash_update: RwLock::new(None),
 		};
-		new.add_root(root_uuid)?;
+		new.add_root(new.client.root().uuid().as_ref())?;
 		Ok(new)
 	}
 
@@ -589,26 +574,15 @@ impl FilenMobileCacheState {
 }
 
 impl FilenMobileCacheState {
-	pub fn from_strings_in_memory(
-		email: String,
-		root_uuid: &str,
-		auth_info: &str,
-		private_key: &str,
-		api_key: String,
-		version: u32,
+	pub fn from_stringified_in_memory(
+		client: StringifiedClient,
 		files_dir: &str,
 	) -> Result<Self, CacheError> {
 		crate::env::init_logger();
 		Ok(Self {
 			state: Arc::new(tokio::sync::RwLock::new(CacheState {
-				status: AuthStatus::Authenticated(AuthCacheState::from_strings_in_memory(
-					email,
-					root_uuid,
-					auth_info,
-					private_key,
-					api_key,
-					version,
-					files_dir,
+				status: AuthStatus::Authenticated(AuthCacheState::from_stringified_in_memory(
+					client, files_dir,
 				)?),
 				auth_file: Arc::new(PathBuf::from(files_dir).join("auth.json")),
 				files_dir: PathBuf::from(files_dir),
