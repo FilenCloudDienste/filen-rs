@@ -126,7 +126,6 @@ impl MetaCrypter for AuthInfo {
 	all(target_arch = "wasm32", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen
 )]
-#[cfg_attr(feature = "node", napi_derive::napi)]
 pub struct Client {
 	email: String,
 	user_id: u64,
@@ -147,7 +146,6 @@ pub struct Client {
 	pub(crate) api_semaphore: tokio::sync::Semaphore,
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
 	#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen(skip))]
-	#[cfg_attr(feature = "node", napi_derive::napi(skip))]
 	pub open_file_semaphore: tokio::sync::Semaphore,
 }
 
@@ -175,7 +173,6 @@ impl Eq for Client {}
 	all(target_arch = "wasm32", target_os = "unknown"),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
-#[cfg_attr(feature = "node", napi_derive::napi(object))]
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StringifiedClient {

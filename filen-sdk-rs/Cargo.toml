@@ -12,7 +12,7 @@ tokio = ["tokio/rt", "tokio-stream", "tokio-util"]
 malformed = []
 heif-decoder = ["dep:heif-decoder"]
 avif-decoder = ["image/avif-native"]
-node = ["dep:napi", "dep:napi-derive", "filen-types/node"]
+# node = ["dep:napi", "dep:napi-derive", "filen-types/node"]
 
 [dependencies]
 reqwest = { version = "0.12.22", features = [

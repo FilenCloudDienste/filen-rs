@@ -221,27 +221,3 @@ impl From<Error> for wasm_bindgen::JsValue {
 		wasm_bindgen::JsValue::from_str(&format!("Error of kind {:?}: {}", e.kind, e))
 	}
 }
-
-#[cfg(feature = "node")]
-mod napi_impls {
-	use super::*;
-	use napi::JsError;
-
-	impl From<Error> for JsError {
-		fn from(e: Error) -> Self {
-			JsError::from(napi::Error::new(
-				napi::Status::GenericFailure,
-				e.to_string(),
-			))
-		}
-	}
-
-	impl From<Error> for napi::Error {
-		fn from(e: Error) -> Self {
-			napi::Error::new(
-				napi::Status::GenericFailure,
-				format!("Error of kind {:?}: {}", e.kind, e),
-			)
-		}
-	}
-}
