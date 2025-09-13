@@ -124,7 +124,7 @@ jobs:
           shared-key: cargo-build-ci-wasm
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
         working-directory: ./filen-sdk-rs
       - name: Run rustfmt in filen-wasm
         run: cargo fmt -- --check
