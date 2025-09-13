@@ -24,7 +24,7 @@ mod pausable {
 		}
 	}
 
-	#[derive(Debug)]
+	#[derive(Debug, Default)]
 	struct Controller {
 		paused: bool,
 		wakers: Vec<Waker>,
@@ -44,7 +44,7 @@ mod pausable {
 			F: Future,
 		{
 			let pausable = Pausable {
-				fut: fut,
+				fut,
 				signal: if self.0.is_undefined() {
 					None
 				} else {
@@ -56,7 +56,7 @@ mod pausable {
 	}
 
 	thread_local! {
-		static WBG_PTR: OnceCell<JsValue> = OnceCell::new();
+		static WBG_PTR: OnceCell<JsValue> = const { OnceCell::new() };
 	}
 
 	impl PauseSignalRust {
@@ -79,13 +79,13 @@ mod pausable {
 			} else {
 				let rc_ref =
 					unsafe { <Self as wasm_bindgen::convert::RefFromWasmAbi>::ref_from_abi(ptr) };
-				Ok((&*rc_ref).clone())
+				Ok((*rc_ref).clone())
 			}
 		}
 	}
 
 	// Might not work with tuple struct
-	#[derive(Debug, Clone)]
+	#[derive(Debug, Clone, Default)]
 	#[wasm_bindgen(js_name = "PauseSignal")]
 	pub struct PauseSignalRust(Rc<RefCell<Controller>>);
 
@@ -103,10 +103,7 @@ mod pausable {
 	impl PauseSignalRust {
 		#[wasm_bindgen(constructor)]
 		pub fn new() -> Self {
-			Self(Rc::new(RefCell::new(Controller {
-				paused: false,
-				wakers: Vec::new(),
-			})))
+			Self::default()
 		}
 
 		#[wasm_bindgen(js_name = "isPaused")]

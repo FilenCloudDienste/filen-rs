@@ -32,7 +32,6 @@ impl Client {
 mod js_impl {
 	use std::sync::Arc;
 
-	use filen_types::fs::UuidStr;
 	use serde::Deserialize;
 	use tsify::Tsify;
 	use wasm_bindgen::prelude::wasm_bindgen;
