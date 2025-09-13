@@ -62,9 +62,6 @@ impl From<DecryptedDirMeta> for SDKDecryptedDirMeta<'static> {
 	}
 }
 
-#[cfg(feature = "node")]
-super::napi_to_json_impl!(&DecryptedDirMeta);
-
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(Debug))]
 pub enum DirMeta {
@@ -107,9 +104,6 @@ impl From<DirMeta> for DirectoryMeta<'static> {
 	}
 }
 
-#[cfg(feature = "node")]
-super::napi_to_json_impl!(DirMetaEncoded<'_>);
-
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
@@ -132,11 +126,6 @@ impl From<Root> for RootDirectory {
 		RootDirectory::new(root.uuid)
 	}
 }
-
-#[cfg(feature = "node")]
-super::napi_to_json_impl!(Root);
-#[cfg(feature = "node")]
-super::napi_from_json_impl!(Root);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -207,11 +196,6 @@ pub struct Dir {
 	pub meta: DirMeta,
 }
 
-#[cfg(feature = "node")]
-super::napi_to_json_impl!(Dir);
-#[cfg(feature = "node")]
-super::napi_from_json_impl!(Dir);
-
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 impl wasm_bindgen::__rt::VectorIntoJsValue for Dir {
 	fn vector_into_jsvalue(
@@ -257,9 +241,6 @@ pub enum DirEnum {
 	Dir(Dir),
 	Root(Root),
 }
-
-#[cfg(feature = "node")]
-super::napi_from_json_impl!(DirEnum);
 
 impl From<RemoteDirectory> for DirEnum {
 	fn from(dir: RemoteDirectory) -> Self {

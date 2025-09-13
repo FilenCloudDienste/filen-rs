@@ -13,42 +13,6 @@ pub use params::*;
 pub use returned_types::*;
 use shared::*;
 
-#[cfg(feature = "node")]
-macro_rules! napi_from_json_impl {
-	($type:ty) => {
-		impl napi::bindgen_prelude::FromNapiValue for $type {
-			unsafe fn from_napi_value(
-				env: napi::sys::napi_env,
-				val: napi::sys::napi_value,
-			) -> napi::Result<Self> {
-				let value = unsafe { serde_json::Value::from_napi_value(env, val)? };
-				serde_json::from_value(value)
-					.map_err(|e| napi::Error::from_reason(format!("Deserialization error: {}", e)))
-			}
-		}
-	};
-}
-#[cfg(feature = "node")]
-use napi_from_json_impl;
-
-#[cfg(feature = "node")]
-macro_rules! napi_to_json_impl {
-	($type:ty) => {
-		impl napi::bindgen_prelude::ToNapiValue for $type {
-			unsafe fn to_napi_value(
-				env: napi::sys::napi_env,
-				val: Self,
-			) -> napi::Result<napi::sys::napi_value> {
-				let value = serde_json::to_value(&val)
-					.map_err(|e| napi::Error::from_reason(format!("Serialization error: {}", e)))?;
-				unsafe { serde_json::Value::to_napi_value(env, value) }
-			}
-		}
-	};
-}
-#[cfg(feature = "node")]
-use napi_to_json_impl;
-
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
 

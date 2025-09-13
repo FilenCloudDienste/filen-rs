@@ -82,9 +82,6 @@ pub struct UploadFileParams {
 	pub managed_future: ManagedFuture,
 }
 
-#[cfg(feature = "node")]
-super::napi_from_json_impl!(UploadFileParams);
-
 impl FileBuilderParams {
 	pub(crate) fn into_file_builder(self, client: &Client) -> FileBuilder {
 		let mut file_builder =

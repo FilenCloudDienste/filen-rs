@@ -64,8 +64,6 @@ pub struct DecryptedFileMeta {
 	pub key: String,
 	pub version: FileEncryptionVersion,
 }
-#[cfg(feature = "node")]
-super::napi_to_json_impl!(&DecryptedFileMeta);
 
 impl From<SDKDecryptedFileMeta<'_>> for DecryptedFileMeta {
 	fn from(meta: SDKDecryptedFileMeta) -> Self {
@@ -114,9 +112,6 @@ enum FileMetaEncoded<'a> {
 	Encrypted(EncryptedString<'a>),
 	RSAEncrypted(RSAEncryptedString<'a>),
 }
-
-#[cfg(feature = "node")]
-super::napi_to_json_impl!(FileMetaEncoded<'_>);
 
 impl From<SDKFileMeta<'_>> for FileMeta {
 	fn from(meta: SDKFileMeta) -> Self {
@@ -221,11 +216,6 @@ pub struct File {
 	// this is here to avoid having to call into WASM to check mime types
 	pub can_make_thumbnail: bool,
 }
-
-#[cfg(feature = "node")]
-super::napi_to_json_impl!(File);
-#[cfg(feature = "node")]
-super::napi_from_json_impl!(File);
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 impl wasm_bindgen::__rt::VectorIntoJsValue for File {

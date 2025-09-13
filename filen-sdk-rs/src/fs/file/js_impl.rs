@@ -7,24 +7,16 @@ use crate::{
 	js::{File, FileEnum, UploadFileParams},
 };
 use filen_types::fs::UuidStr;
-#[cfg(feature = "node")]
-use napi_derive::napi;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
 
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
-#[cfg_attr(feature = "node", napi)]
+#[wasm_bindgen]
 impl Client {
 	#[wasm_bindgen(js_name = "getFile")]
 	pub async fn get_file_js(&self, uuid: UuidStr) -> Result<File, Error> {
 		Ok(self.get_file(uuid).await?.into())
 	}
 
-	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
-		wasm_bindgen(js_name = "uploadFile")
-	)]
-	#[cfg_attr(feature = "node", napi(js_name = "uploadFile"))]
+	#[wasm_bindgen(js_name = "uploadFile")]
 	pub async fn upload_file_js(
 		&self,
 		data: &[u8],
@@ -40,36 +32,23 @@ impl Client {
 		Ok(file.into())
 	}
 
-	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
-		wasm_bindgen(js_name = "downloadFile")
-	)]
-	#[cfg_attr(feature = "node", napi(js_name = "downloadFile"))]
+	#[wasm_bindgen(js_name = "downloadFile")]
 	pub async fn download_file_js(&self, file: FileEnum) -> Result<Vec<u8>, Error> {
 		self.download_file(&RemoteFileType::try_from(file)?).await
 	}
 
-	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
-		wasm_bindgen(js_name = "trashFile")
-	)]
-	#[cfg_attr(feature = "node", napi(js_name = "trashFile"))]
+	#[wasm_bindgen(js_name = "trashFile")]
 	pub async fn trash_file_js(&self, file: File) -> Result<File, Error> {
 		let mut file = file.try_into()?;
 		self.trash_file(&mut file).await?;
 		Ok(file.into())
 	}
 
-	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
-		wasm_bindgen(js_name = "deleteFilePermanently")
-	)]
-	#[cfg_attr(feature = "node", napi(js_name = "deleteFilePermanently"))]
+	#[wasm_bindgen(js_name = "deleteFilePermanently")]
 	pub async fn delete_file_permanently_js(&self, file: File) -> Result<(), Error> {
 		self.delete_file_permanently(file.try_into()?).await
 	}
 
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	#[wasm_bindgen(js_name = "downloadFileToWriter")]
 	pub async fn download_file_to_writer_js(
 		&self,
@@ -100,7 +79,6 @@ impl Client {
 		Ok(())
 	}
 
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	#[wasm_bindgen(js_name = "uploadFileFromReader")]
 	pub async fn upload_file_from_reader_js(
 		&self,

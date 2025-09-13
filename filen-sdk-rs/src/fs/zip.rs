@@ -429,16 +429,11 @@ mod client_impl {
 mod js_impl {
 	use crate::{Error, auth::Client, crypto::error::ConversionError, js::DownloadFileToZipParams};
 
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	use wasm_bindgen::prelude::*;
 
-	#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen)]
-	#[cfg_attr(feature = "node", napi)]
+	#[wasm_bindgen]
 	impl Client {
-		#[cfg_attr(
-			all(target_arch = "wasm32", target_os = "unknown"),
-			wasm_bindgen(js_name = "downloadItemsToZip")
-		)]
+		#[wasm_bindgen(js_name = "downloadItemsToZip")]
 		pub async fn download_items_to_zip_js(
 			&self,
 			params: DownloadFileToZipParams,
