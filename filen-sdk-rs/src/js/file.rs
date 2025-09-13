@@ -101,8 +101,8 @@ pub enum FileMeta {
 	Decoded(DecryptedFileMeta),
 	DecryptedUTF8(String),
 	DecryptedRaw(Vec<u8>),
-	Encrypted(EncryptedString),
-	RSAEncrypted(RSAEncryptedString),
+	Encrypted(String),
+	RSAEncrypted(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,8 +119,8 @@ impl From<SDKFileMeta<'_>> for FileMeta {
 			SDKFileMeta::Decoded(meta) => FileMeta::Decoded(meta.into()),
 			SDKFileMeta::DecryptedUTF8(meta) => FileMeta::DecryptedUTF8(meta.into_owned()),
 			SDKFileMeta::DecryptedRaw(meta) => FileMeta::DecryptedRaw(meta.into_owned()),
-			SDKFileMeta::Encrypted(meta) => FileMeta::Encrypted(meta.into_owned()),
-			SDKFileMeta::RSAEncrypted(meta) => FileMeta::RSAEncrypted(meta.into_owned()),
+			SDKFileMeta::Encrypted(meta) => FileMeta::Encrypted(meta.0.into_owned()),
+			SDKFileMeta::RSAEncrypted(meta) => FileMeta::RSAEncrypted(meta.0.into_owned()),
 		}
 	}
 }
@@ -132,8 +132,10 @@ impl TryFrom<FileMeta> for SDKFileMeta<'static> {
 			FileMeta::Decoded(meta) => SDKFileMeta::Decoded(meta.try_into()?),
 			FileMeta::DecryptedUTF8(meta) => SDKFileMeta::DecryptedUTF8(Cow::Owned(meta)),
 			FileMeta::DecryptedRaw(meta) => SDKFileMeta::DecryptedRaw(Cow::Owned(meta)),
-			FileMeta::Encrypted(meta) => SDKFileMeta::Encrypted(Cow::Owned(meta)),
-			FileMeta::RSAEncrypted(meta) => SDKFileMeta::RSAEncrypted(Cow::Owned(meta)),
+			FileMeta::Encrypted(meta) => SDKFileMeta::Encrypted(EncryptedString(Cow::Owned(meta))),
+			FileMeta::RSAEncrypted(meta) => {
+				SDKFileMeta::RSAEncrypted(RSAEncryptedString(Cow::Owned(meta)))
+			}
 		})
 	}
 }
@@ -158,12 +160,12 @@ impl<'a>
 			FileMeta::DecryptedUTF8(data) => {
 				EncodedOrDecoded::Encoded(FileMetaEncoded::DecryptedUTF8(Cow::Borrowed(data)))
 			}
-			FileMeta::Encrypted(data) => {
-				EncodedOrDecoded::Encoded(FileMetaEncoded::Encrypted(Cow::Borrowed(data)))
-			}
-			FileMeta::RSAEncrypted(data) => {
-				EncodedOrDecoded::Encoded(FileMetaEncoded::RSAEncrypted(Cow::Borrowed(data)))
-			}
+			FileMeta::Encrypted(data) => EncodedOrDecoded::Encoded(FileMetaEncoded::Encrypted(
+				EncryptedString(Cow::Borrowed(data)),
+			)),
+			FileMeta::RSAEncrypted(data) => EncodedOrDecoded::Encoded(
+				FileMetaEncoded::RSAEncrypted(RSAEncryptedString(Cow::Borrowed(data))),
+			),
 		}
 	}
 
@@ -175,8 +177,8 @@ impl<'a>
 		match encoded {
 			FileMetaEncoded::DecryptedRaw(data) => FileMeta::DecryptedRaw(data.into_owned()),
 			FileMetaEncoded::DecryptedUTF8(data) => FileMeta::DecryptedUTF8(data.into_owned()),
-			FileMetaEncoded::Encrypted(data) => FileMeta::Encrypted(data.into_owned()),
-			FileMetaEncoded::RSAEncrypted(data) => FileMeta::RSAEncrypted(data.into_owned()),
+			FileMetaEncoded::Encrypted(data) => FileMeta::Encrypted(data.0.into_owned()),
+			FileMetaEncoded::RSAEncrypted(data) => FileMeta::RSAEncrypted(data.0.into_owned()),
 		}
 	}
 }

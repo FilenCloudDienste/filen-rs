@@ -68,8 +68,8 @@ pub enum DirMeta {
 	Decoded(DecryptedDirMeta),
 	DecryptedRaw(Vec<u8>),
 	DecryptedUTF8(String),
-	Encrypted(EncryptedString),
-	RSAEncrypted(RSAEncryptedString),
+	Encrypted(String),
+	RSAEncrypted(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -86,8 +86,8 @@ impl From<DirectoryMeta<'_>> for DirMeta {
 			DirectoryMeta::Decoded(meta) => DirMeta::Decoded(meta.into()),
 			DirectoryMeta::DecryptedRaw(meta) => DirMeta::DecryptedRaw(meta.into_owned()),
 			DirectoryMeta::DecryptedUTF8(meta) => DirMeta::DecryptedUTF8(meta.into_owned()),
-			DirectoryMeta::Encrypted(meta) => DirMeta::Encrypted(meta.into_owned()),
-			DirectoryMeta::RSAEncrypted(meta) => DirMeta::RSAEncrypted(meta.into_owned()),
+			DirectoryMeta::Encrypted(meta) => DirMeta::Encrypted(meta.0.into_owned()),
+			DirectoryMeta::RSAEncrypted(meta) => DirMeta::RSAEncrypted(meta.0.into_owned()),
 		}
 	}
 }
@@ -98,8 +98,10 @@ impl From<DirMeta> for DirectoryMeta<'static> {
 			DirMeta::Decoded(meta) => DirectoryMeta::Decoded(meta.into()),
 			DirMeta::DecryptedRaw(meta) => DirectoryMeta::DecryptedRaw(Cow::Owned(meta)),
 			DirMeta::DecryptedUTF8(meta) => DirectoryMeta::DecryptedUTF8(Cow::Owned(meta)),
-			DirMeta::Encrypted(meta) => DirectoryMeta::Encrypted(Cow::Owned(meta)),
-			DirMeta::RSAEncrypted(meta) => DirectoryMeta::RSAEncrypted(Cow::Owned(meta)),
+			DirMeta::Encrypted(meta) => DirectoryMeta::Encrypted(EncryptedString(Cow::Owned(meta))),
+			DirMeta::RSAEncrypted(meta) => {
+				DirectoryMeta::RSAEncrypted(RSAEncryptedString(Cow::Owned(meta)))
+			}
 		}
 	}
 }
@@ -289,12 +291,12 @@ impl<'a>
 			DirMeta::DecryptedUTF8(data) => {
 				EncodedOrDecoded::Encoded(DirMetaEncoded::DecryptedUTF8(Cow::Borrowed(data)))
 			}
-			DirMeta::Encrypted(data) => {
-				EncodedOrDecoded::Encoded(DirMetaEncoded::Encrypted(Cow::Borrowed(data)))
-			}
-			DirMeta::RSAEncrypted(data) => {
-				EncodedOrDecoded::Encoded(DirMetaEncoded::RSAEncrypted(Cow::Borrowed(data)))
-			}
+			DirMeta::Encrypted(data) => EncodedOrDecoded::Encoded(DirMetaEncoded::Encrypted(
+				EncryptedString(Cow::Borrowed(data)),
+			)),
+			DirMeta::RSAEncrypted(data) => EncodedOrDecoded::Encoded(DirMetaEncoded::RSAEncrypted(
+				RSAEncryptedString(Cow::Borrowed(data)),
+			)),
 		}
 	}
 
@@ -302,8 +304,8 @@ impl<'a>
 		match encoded {
 			DirMetaEncoded::DecryptedRaw(data) => DirMeta::DecryptedRaw(data.into_owned()),
 			DirMetaEncoded::DecryptedUTF8(data) => DirMeta::DecryptedUTF8(data.into_owned()),
-			DirMetaEncoded::Encrypted(data) => DirMeta::Encrypted(data.into_owned()),
-			DirMetaEncoded::RSAEncrypted(data) => DirMeta::RSAEncrypted(data.into_owned()),
+			DirMetaEncoded::Encrypted(data) => DirMeta::Encrypted(data.0.into_owned()),
+			DirMetaEncoded::RSAEncrypted(data) => DirMeta::RSAEncrypted(data.0.into_owned()),
 		}
 	}
 
