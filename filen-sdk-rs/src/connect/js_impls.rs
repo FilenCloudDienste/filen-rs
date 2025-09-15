@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::UuidStr;
+use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 use tsify::Tsify;
 use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
@@ -9,7 +10,7 @@ use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 use crate::{
 	Error,
 	auth::Client,
-	connect::{DirPublicLink, FilePublicLink, User},
+	connect::{DirPublicLink, FilePublicLink},
 	fs::dir::DirectoryMetaType,
 	js::{Dir, DirWithMetaEnum, File, SharedDir, SharedFile},
 	tuple_to_jsvalue,
@@ -32,6 +33,9 @@ pub struct Contact {
 	#[tsify(type = "bigint")]
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
+	#[tsify(type = "string")]
+	#[serde(with = "filen_types::serde::rsa::public_key_der")]
+	pub public_key: RsaPublicKey,
 }
 
 impl From<filen_types::api::v3::contacts::Contact<'_>> for Contact {
@@ -44,20 +48,22 @@ impl From<filen_types::api::v3::contacts::Contact<'_>> for Contact {
 			nick_name: c.nick_name.into_owned(),
 			last_active: c.last_active,
 			timestamp: c.timestamp,
+			public_key: c.public_key,
 		}
 	}
 }
 
-impl<'a> From<&'a Contact> for filen_types::api::v3::contacts::Contact<'a> {
-	fn from(c: &'a Contact) -> Self {
+impl From<Contact> for filen_types::api::v3::contacts::Contact<'static> {
+	fn from(c: Contact) -> Self {
 		Self {
 			uuid: c.uuid,
 			user_id: c.user_id,
-			email: Cow::Borrowed(&c.email),
-			avatar: c.avatar.as_deref().map(Cow::Borrowed),
-			nick_name: Cow::Borrowed(&c.nick_name),
+			email: Cow::Owned(c.email),
+			avatar: c.avatar.map(Cow::Owned),
+			nick_name: Cow::Owned(c.nick_name),
 			last_active: c.last_active,
 			timestamp: c.timestamp,
+			public_key: c.public_key,
 		}
 	}
 }
@@ -323,19 +329,14 @@ impl Client {
 
 	// Sharing
 
-	#[wasm_bindgen(js_name = "makeUserFromContact")]
-	pub async fn make_user_from_contact_js(&self, contact: Contact) -> Result<User, Error> {
-		self.make_user_from_contact(&(&contact).into()).await
-	}
-
 	#[wasm_bindgen(js_name = "shareDir")]
-	pub async fn share_dir_js(&self, dir: Dir, user: User) -> Result<(), Error> {
-		self.share_dir(&dir.into(), &user).await
+	pub async fn share_dir_js(&self, dir: Dir, contact: Contact) -> Result<(), Error> {
+		self.share_dir(&dir.into(), &contact.into()).await
 	}
 
 	#[wasm_bindgen(js_name = "shareFile")]
-	pub async fn share_file_js(&self, file: File, user: User) -> Result<(), Error> {
-		self.share_file(&file.try_into()?, &user).await
+	pub async fn share_file_js(&self, file: File, contact: Contact) -> Result<(), Error> {
+		self.share_file(&file.try_into()?, &contact.into()).await
 	}
 
 	#[wasm_bindgen(
@@ -345,10 +346,13 @@ impl Client {
 	pub async fn list_out_shared_js(
 		&self,
 		dir: Option<DirWithMetaEnum>,
-		user: Option<User>,
+		contact: Option<Contact>,
 	) -> Result<JsValue, Error> {
 		let (dirs, files) = self
-			.inner_list_out_shared(dir.map(DirectoryMetaType::from).as_ref(), user.as_ref())
+			.inner_list_out_shared(
+				dir.map(DirectoryMetaType::from).as_ref(),
+				contact.map(Into::into).as_ref(),
+			)
 			.await?;
 		Ok(tuple_to_jsvalue!(
 			dirs.into_iter().map(SharedDir::from).collect::<Vec<_>>(),

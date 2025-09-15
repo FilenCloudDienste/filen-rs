@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 
+use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::rsa::EncodedPublicKey, fs::UuidStr};
+use crate::{api::v3::contacts::Contact, fs::UuidStr, traits::CowHelpers};
 
 pub mod r#in;
 pub mod out;
@@ -28,5 +29,16 @@ pub struct Response<'a> {
 pub struct SharedUser<'a> {
 	pub id: u64,
 	pub email: Cow<'a, str>,
-	pub public_key: EncodedPublicKey<'a>,
+	#[serde(with = "crate::serde::rsa::public_key_der")]
+	pub public_key: RsaPublicKey,
+}
+
+impl<'a> From<&'a Contact<'a>> for SharedUser<'a> {
+	fn from(contact: &'a Contact<'a>) -> Self {
+		Self {
+			id: contact.user_id,
+			email: contact.email.as_borrowed_cow(),
+			public_key: contact.public_key.clone(),
+		}
+	}
 }

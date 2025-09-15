@@ -1,13 +1,11 @@
 use std::borrow::Cow;
 
+use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::{
 	auth::{APIKey, AuthVersion},
-	crypto::{
-		DerivedPassword, EncryptedDEK, EncryptedMasterKeys,
-		rsa::{EncodedPublicKey, EncryptedPrivateKey},
-	},
+	crypto::{DerivedPassword, EncryptedDEK, EncryptedMasterKeys, rsa::EncryptedPrivateKey},
 };
 
 pub const ENDPOINT: &str = "v3/login";
@@ -26,7 +24,8 @@ pub struct Request<'a> {
 pub struct Response<'a> {
 	pub api_key: APIKey<'a>,
 	pub master_keys: Option<EncryptedMasterKeys<'a>>,
-	pub public_key: EncodedPublicKey<'a>,
+	#[serde(with = "crate::serde::rsa::public_key_der")]
+	pub public_key: RsaPublicKey,
 	pub private_key: EncryptedPrivateKey<'a>,
 	pub dek: Option<EncryptedDEK<'a>>,
 }

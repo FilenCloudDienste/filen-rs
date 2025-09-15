@@ -416,9 +416,9 @@ async fn share_dir() {
 
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
-	assert_eq!(contacts[0].email, share_client.email());
-	let share_user = client.make_user_from_contact(&contacts[0]).await.unwrap();
-	client.share_dir(&dir, &share_user).await.unwrap();
+	let contact = &contacts[0];
+	assert_eq!(contact.email, share_client.email());
+	client.share_dir(&dir, contact).await.unwrap();
 
 	let (shared_dirs_out, _) = client.list_out_shared(None).await.unwrap();
 	assert_eq!(shared_dirs_out.len(), 1);
@@ -434,7 +434,7 @@ async fn share_dir() {
 	assert_eq!(shared_dirs_in[0].get_dir(), shared_dirs_out[0].get_dir());
 
 	let (shared_dirs_out, shared_files_out) =
-		client.list_out_shared_dir(&dir, &share_user).await.unwrap();
+		client.list_out_shared_dir(&dir, contact).await.unwrap();
 	let (shared_dirs_in, shared_files_in) = share_client.list_in_shared_dir(&dir).await.unwrap();
 
 	assert_eq!(shared_dirs_out.len(), 1);
@@ -517,9 +517,8 @@ async fn share_file() {
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
 	let contact = &contacts[0];
-	let share_user = client.make_user_from_contact(contact).await.unwrap();
 
-	client.share_file(&file, &share_user).await.unwrap();
+	client.share_file(&file, contact).await.unwrap();
 
 	let (_, shared_files_out) = client.list_out_shared(None).await.unwrap();
 	assert_eq!(shared_files_out.len(), 1);
@@ -577,10 +576,8 @@ async fn remove_link() {
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
 	let contact = &contacts[0];
-	let share_user = client.make_user_from_contact(contact).await.unwrap();
 
-	client.share_dir(&out_dir, &share_user).await.unwrap();
-	client.share_dir(&in_dir, &share_user).await.unwrap();
+	client.share_dir(&out_dir, contact).await.unwrap();
 
 	let (shared_dirs_out, _) = client.list_out_shared(None).await.unwrap();
 	assert_eq!(shared_dirs_out.len(), 2);
@@ -588,7 +585,7 @@ async fn remove_link() {
 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
 	assert_eq!(shared_dirs_in.len(), 2);
 	client
-		.remove_shared_link_out(*out_dir.uuid(), share_user.id())
+		.remove_shared_link_out(*out_dir.uuid(), contact.user_id)
 		.await
 		.unwrap();
 	share_client

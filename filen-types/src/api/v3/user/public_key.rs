@@ -1,8 +1,7 @@
 use std::borrow::Cow;
 
+use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
-
-use crate::crypto::rsa::EncodedPublicKey;
 
 pub const ENDPOINT: &str = "v3/user/publicKey";
 
@@ -12,6 +11,7 @@ pub struct Request<'a> {
 }
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Response<'a> {
-	pub public_key: EncodedPublicKey<'a>,
+pub struct Response {
+	#[serde(with = "crate::serde::rsa::public_key_der")]
+	pub public_key: RsaPublicKey,
 }

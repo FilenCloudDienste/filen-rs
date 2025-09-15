@@ -4,7 +4,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use digest::Digest;
 use filen_types::crypto::{
 	Sha256Hash,
-	rsa::{EncodedPublicKey, EncryptedPrivateKey, RSAEncryptedString},
+	rsa::{EncryptedPrivateKey, RSAEncryptedString},
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -49,13 +49,12 @@ impl HMACKey {
 }
 
 pub(crate) fn get_key_pair(
-	public_key: &EncodedPublicKey,
+	public_key: RsaPublicKey,
 	private_key: &EncryptedPrivateKey,
 	meta_crypter: &impl MetaCrypter,
 ) -> Result<(RsaPrivateKey, RsaPublicKey, HMACKey), ConversionError> {
 	let private_key_str = meta_crypter.decrypt_meta(&private_key.0)?;
 	let private_key = RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(&private_key_str)?)?;
-	let public_key = RsaPublicKey::try_from(public_key)?;
 
 	if *private_key.as_ref() != public_key {
 		return Err(ConversionError::InvalidKeyPair);

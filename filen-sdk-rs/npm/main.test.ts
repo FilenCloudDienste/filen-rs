@@ -392,9 +392,8 @@ test("sharing", async () => {
 		contact = (await state.getContacts()).find(c => c.email === process.env.TEST_SHARE_EMAIL!)!
 	}
 	expect(contact).toBeDefined()
-	const user = await state.makeUserFromContact(contact)
-	await state.shareDir(dir, user)
-	const shared = await state.listOutShared(null, user)
+	await state.shareDir(dir, contact)
+	const shared = await state.listOutShared(null, contact)
 	const sharedDir = shared[0].find(d => d.dir.uuid === dir.uuid)
 	expect(sharedDir).toBeDefined()
 	expect(sharedDir.dir.uuid).toEqual(dir.uuid)

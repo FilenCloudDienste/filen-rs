@@ -1,9 +1,7 @@
 use std::{borrow::Cow, str::FromStr};
 
-use filen_types::crypto::{
-	EncryptedString,
-	rsa::{EncodedPublicKey, EncryptedPrivateKey},
-};
+use filen_types::crypto::{EncryptedString, rsa::EncryptedPrivateKey};
+use rsa::RsaPublicKey;
 
 use crate::{
 	ErrorKind, api,
@@ -48,7 +46,7 @@ pub(super) async fn login(
 		super::AuthClient,
 		super::AuthInfo,
 		EncryptedPrivateKey<'static>,
-		EncodedPublicKey<'static>,
+		RsaPublicKey,
 	),
 	Error,
 > {

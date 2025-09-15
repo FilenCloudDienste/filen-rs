@@ -1298,6 +1298,7 @@ dependencies = [
  "rsa",
  "rusqlite",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serde_repr",
  "sha2",

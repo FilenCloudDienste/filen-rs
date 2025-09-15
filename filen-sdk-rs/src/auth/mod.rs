@@ -128,7 +128,7 @@ impl MetaCrypter for AuthInfo {
 )]
 pub struct Client {
 	email: String,
-	user_id: u64,
+	pub(crate) user_id: u64,
 
 	root_dir: RootDirectory,
 
@@ -388,7 +388,7 @@ impl Client {
 		};
 
 		let (private_key, public_key, hmac) =
-			crypto::rsa::get_key_pair(&public_key, &private_key, &auth_info)?;
+			crypto::rsa::get_key_pair(public_key, &private_key, &auth_info)?;
 		let base_folder_uuid = api::v3::user::base_folder::get(&client).await?.uuid;
 		let root_dir = RootDirectory::new(base_folder_uuid);
 

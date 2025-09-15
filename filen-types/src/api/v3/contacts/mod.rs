@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
+use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::fs::UuidStr;
@@ -26,4 +27,6 @@ pub struct Contact<'a> {
 	pub last_active: DateTime<Utc>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::rsa::public_key_der")]
+	pub public_key: RsaPublicKey,
 }

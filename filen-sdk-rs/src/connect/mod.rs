@@ -9,19 +9,17 @@ use filen_types::{
 		item::{linked::ListedPublicLink, shared::SharedUser},
 	},
 	auth::FileEncryptionVersion,
-	crypto::rsa::{EncodedPublicKey, RSAEncryptedString},
 	fs::{ObjectType, UuidStr},
 	traits::CowHelpers,
 };
 use fs::{SharedDirectory, SharedFile};
 use futures::stream::{FuturesUnordered, StreamExt};
-use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
 	auth::{Client, MetaKey},
-	crypto::{error::ConversionError, shared::MetaCrypter},
+	crypto::shared::MetaCrypter,
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
@@ -36,27 +34,6 @@ pub mod fs;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod js_impls;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
-	derive(tsify::Tsify)
-)]
-#[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
-	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
-)]
-#[serde(rename_all = "camelCase")]
-pub struct User {
-	email: String,
-	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
-		tsify(type = "Uint8Array")
-	)]
-	#[serde(with = "crate::serde::rsa_public_key_pkcs1")]
-	public_key: RsaPublicKey,
-	id: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkedFileInfo {
 	pub uuid: UuidStr,
@@ -69,43 +46,6 @@ pub struct LinkedFileInfo {
 	pub bucket: String,
 	pub timestamp: DateTime<Utc>,
 	pub version: FileEncryptionVersion,
-}
-
-impl TryFrom<SharedUser<'_>> for User {
-	type Error = ConversionError;
-	fn try_from(shared_user: SharedUser) -> Result<Self, Self::Error> {
-		Ok(Self {
-			email: shared_user.email.into_owned(),
-			public_key: RsaPublicKey::try_from(&shared_user.public_key.as_borrowed_cow())?,
-			id: shared_user.id,
-		})
-	}
-}
-
-impl User {
-	pub fn new(
-		email: String,
-		public_key: &EncodedPublicKey,
-		id: u64,
-	) -> Result<Self, ConversionError> {
-		Ok(Self {
-			email,
-			public_key: RsaPublicKey::try_from(public_key)?,
-			id,
-		})
-	}
-
-	pub fn email(&self) -> &str {
-		&self.email
-	}
-
-	pub fn public_encrypt(&self, data: &[u8]) -> Result<RSAEncryptedString<'static>, rsa::Error> {
-		crate::crypto::rsa::encrypt_with_public_key(&self.public_key, data)
-	}
-
-	pub fn id(&self) -> u64 {
-		self.id
-	}
 }
 
 trait MakePasswordSaltAndHash {
@@ -317,7 +257,7 @@ impl MakePasswordSaltAndHash for DirPublicLink {
 }
 
 impl Client {
-	async fn update_shared_item_meta<I>(&self, item: &I, user: &User) -> Result<(), Error>
+	async fn update_shared_item_meta<I>(&self, item: &I, user: &SharedUser<'_>) -> Result<(), Error>
 	where
 		I: HasMeta + HasUUID + Debug,
 	{
@@ -388,10 +328,10 @@ impl Client {
 			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 		for user in shared.users {
-			futures.push(Box::pin(async move {
-				let user = user.try_into()?;
-				self.update_shared_item_meta(item, &user).await
-			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+			futures.push(
+				Box::pin(async move { self.update_shared_item_meta(item, &user).await })
+					as MaybeSendBoxFuture<'_, Result<(), Error>>,
+			);
 		}
 
 		while let Some(result) = futures.next().await {
@@ -451,7 +391,7 @@ impl Client {
 		}
 
 		for user in shared.users {
-			let user: Arc<User> = Arc::new(user.try_into()?);
+			let user = Arc::new(user);
 			for item in &items_to_process {
 				let user = user.clone();
 				futures.push(Box::pin(
@@ -798,7 +738,7 @@ impl Client {
 		Ok(())
 	}
 
-	async fn inner_share_item<I>(&self, item: &I, user: &User) -> Result<(), Error>
+	async fn inner_share_item<I>(&self, item: &I, user: &SharedUser<'_>) -> Result<(), Error>
 	where
 		I: HasParent + HasMeta + HasUUID + HasType,
 	{
@@ -807,7 +747,7 @@ impl Client {
 			&api::v3::item::share::Request {
 				uuid: *item.uuid(),
 				parent: Some((*item.parent()).try_into()?),
-				email: Cow::Borrowed(user.email()),
+				email: user.email.as_borrowed_cow(),
 				r#type: item.object_type(),
 				metadata: item
 					.get_rsa_encrypted_meta(&user.public_key)
@@ -818,8 +758,16 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn share_dir(&self, dir: &RemoteDirectory, user: &User) -> Result<(), Error> {
+	pub async fn share_dir(
+		&self,
+		dir: &RemoteDirectory,
+		client: &Contact<'_>,
+	) -> Result<(), Error> {
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
+
+		let shared_user = client.into();
+		let shared_user = &shared_user;
+
 		let mut futures = FuturesUnordered::new();
 
 		futures.push(Box::pin(async move {
@@ -828,10 +776,10 @@ impl Client {
 				&api::v3::item::share::Request {
 					uuid: *dir.uuid(),
 					parent: None,
-					email: Cow::Borrowed(user.email()),
+					email: client.email.as_borrowed_cow(),
 					r#type: ObjectType::Dir,
 					metadata: dir
-						.get_rsa_encrypted_meta(&user.public_key)
+						.get_rsa_encrypted_meta(&client.public_key)
 						.ok_or(MetadataWasNotDecryptedError)?,
 				},
 			)
@@ -840,14 +788,14 @@ impl Client {
 
 		for dir in dirs {
 			futures.push(
-				Box::pin(async move { self.inner_share_item(&dir, user).await })
+				Box::pin(async move { self.inner_share_item(&dir, shared_user).await })
 					as MaybeSendBoxFuture<'_, Result<(), Error>>,
 			);
 		}
 
 		for file in files {
 			futures.push(
-				Box::pin(async move { self.inner_share_item(&file, user).await })
+				Box::pin(async move { self.inner_share_item(&file, shared_user).await })
 					as MaybeSendBoxFuture<'_, Result<(), Error>>,
 			);
 		}
@@ -857,50 +805,36 @@ impl Client {
 				Err(e) => return Err(e),
 			}
 		}
+		std::mem::drop(futures);
 		Ok(())
 	}
 
-	pub async fn share_file(&self, file: &RemoteFile, user: &User) -> Result<(), Error> {
+	pub async fn share_file(&self, file: &RemoteFile, contact: &Contact<'_>) -> Result<(), Error> {
 		api::v3::item::share::post(
 			self.client(),
 			&api::v3::item::share::Request {
 				uuid: *file.uuid(),
 				parent: None,
-				email: Cow::Borrowed(user.email()),
+				email: contact.email.as_borrowed_cow(),
 				r#type: ObjectType::File,
 				metadata: file
-					.get_rsa_encrypted_meta(&user.public_key)
+					.get_rsa_encrypted_meta(&contact.public_key)
 					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await
 	}
 
-	pub async fn make_user_from_contact(&self, contact: &Contact<'_>) -> Result<User, Error> {
-		let response = api::v3::user::public_key::post(
-			self.client(),
-			&api::v3::user::public_key::Request {
-				email: Cow::Borrowed(&*contact.email),
-			},
-		)
-		.await?;
-		Ok(User::new(
-			contact.email.to_string(),
-			&response.public_key,
-			contact.user_id,
-		)?)
-	}
-
 	pub(crate) async fn inner_list_out_shared(
 		&self,
 		dir: Option<&impl HasUUIDContents>,
-		user: Option<&User>,
+		contact: Option<&Contact<'_>>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		let response = api::v3::shared::out::post(
 			self.client(),
 			&api::v3::shared::out::Request {
 				uuid: dir.map(|d| *d.uuid()),
-				receiver_id: user.map(|u| u.id),
+				receiver_id: contact.map(|u| u.user_id),
 			},
 		)
 		.await?;
@@ -921,18 +855,18 @@ impl Client {
 
 	pub async fn list_out_shared(
 		&self,
-		user: Option<&User>,
+		contact: Option<&Contact<'_>>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_out_shared(None::<&RemoteDirectory>, user)
+		self.inner_list_out_shared(None::<&RemoteDirectory>, contact)
 			.await
 	}
 
 	pub async fn list_out_shared_dir(
 		&self,
 		dir: &impl HasUUIDContents,
-		user: &User,
+		contact: &Contact<'_>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_out_shared(Some(dir), Some(user)).await
+		self.inner_list_out_shared(Some(dir), Some(contact)).await
 	}
 
 	pub(crate) async fn inner_list_in_shared(
