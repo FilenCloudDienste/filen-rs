@@ -168,6 +168,7 @@ pub struct DBFile {
 	pub(crate) favorite_rank: i64,
 	pub(crate) region: String,
 	pub(crate) bucket: String,
+	pub(crate) timestamp: i64,
 	pub(crate) local_data: Option<JsonObject>,
 	pub(crate) meta: DBFileMeta,
 }
@@ -210,7 +211,8 @@ impl DBFile {
 			favorite_rank: row.get(idx + 2)?,
 			region: row.get(idx + 3)?,
 			bucket: row.get(idx + 4)?,
-			meta: DBFileMeta::from_row(row, idx + 5).unwrap(),
+			timestamp: row.get(idx + 5)?,
+			meta: DBFileMeta::from_row(row, idx + 6).unwrap(),
 		})
 	}
 
@@ -257,6 +259,7 @@ impl DBFile {
 				remote_file.favorited() as u8,
 				remote_file.region(),
 				remote_file.bucket(),
+				remote_file.timestamp.timestamp_millis(),
 				meta_state,
 				meta,
 			),
@@ -287,6 +290,7 @@ impl DBFile {
 			favorite_rank,
 			region: remote_file.region,
 			bucket: remote_file.bucket,
+			timestamp: remote_file.timestamp.timestamp_millis(),
 			local_data,
 			meta: remote_file.meta.into(),
 		})
@@ -371,6 +375,7 @@ impl TryFrom<DBFile> for RemoteFile {
 			favorited: value.favorite_rank > 0,
 			region: value.region,
 			bucket: value.bucket,
+			timestamp: DateTime::<Utc>::from_timestamp_millis(value.timestamp).unwrap_or_default(),
 			meta: match value.meta {
 				DBFileMeta::Decoded(decrypted_meta) => FileMeta::Decoded(DecryptedFileMeta {
 					name: Cow::Owned(decrypted_meta.name),

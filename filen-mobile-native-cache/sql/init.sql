@@ -43,6 +43,7 @@ CREATE TABLE files (
 	favorite_rank INTEGER NOT NULL DEFAULT 0, -- IOS uses this for sorting
 	region TEXT NOT NULL,
 	bucket TEXT NOT NULL,
+	timestamp BIGINT NOT NULL,
 	-- 0 = decoded, 1 = decrypted(raw or utf8), 2 = encrypted, 3 = rsa encrypted
 	metadata_state SMALLINT NOT NULL CHECK (
 		metadata_state IN (0, 1, 2, 3)
@@ -73,6 +74,7 @@ CREATE TABLE dirs (
 	favorite_rank INTEGER NOT NULL DEFAULT 0, -- IOS uses this for sorting
 	-- DirColor type
 	color TEXT,
+	timestamp BIGINT NOT NULL,
 	-- 0 = decoded, 1 = decrypted(raw or utf8), 2 = encrypted, 3 = rsa encrypted
 	metadata_state SMALLINT NOT NULL CHECK (
 		metadata_state IN (0, 1, 2, 3)
@@ -95,7 +97,9 @@ CREATE TABLE dirs_meta (
 );
 
 INSERT INTO items (uuid, parent, type) VALUES ('trash', NULL, 1);
-INSERT INTO dirs (id, metadata_state) VALUES (last_insert_rowid(), 0);
+INSERT INTO dirs (id, timestamp, metadata_state) VALUES (
+	last_insert_rowid(), 0, 0
+);
 INSERT INTO dirs_meta (id, name) VALUES (last_insert_rowid(), 'Trash');
 
 CREATE TRIGGER cascade_on_update_uuid_delete_children

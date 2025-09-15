@@ -396,13 +396,14 @@ impl<'a> FileWriterCompletingState<'a> {
 	) -> FileWriterFinalizingState<'a> {
 		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
 		let file = Arc::new(RemoteFile {
+			uuid: file.root.uuid,
 			parent: file.parent.into(),
 			size: response.size,
 			favorited: false,
 			region: self.remote_file_info.region,
 			bucket: self.remote_file_info.bucket,
+			timestamp: response.timestamp,
 			chunks: response.chunks,
-			uuid: file.root.uuid,
 			meta: super::meta::FileMeta::Decoded(DecryptedFileMeta {
 				name: Cow::Owned(file.root.name),
 				size: response.size,

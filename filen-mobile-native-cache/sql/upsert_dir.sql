@@ -2,9 +2,11 @@ INSERT INTO dirs (
 	id,
 	favorite_rank,
 	color,
+	timestamp,
 	metadata_state,
 	raw_metadata
 ) VALUES (
+	?,
 	?,
 	?,
 	?,
@@ -21,6 +23,7 @@ favorite_rank
 	ELSE dirs.favorite_rank
 END,
 color = excluded.color,
+timestamp = excluded.timestamp,
 metadata_state = excluded.metadata_state,
 raw_metadata = excluded.raw_metadata
 RETURNING last_listed, favorite_rank;

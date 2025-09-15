@@ -214,6 +214,7 @@ pub struct RemoteFile {
 	pub favorited: bool,
 	pub region: String,
 	pub bucket: String,
+	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
 }
 
@@ -238,6 +239,7 @@ impl RemoteFile {
 		chunks: u64,
 		region: impl Into<String>,
 		bucket: impl Into<String>,
+		timestamp: DateTime<Utc>,
 		favorited: bool,
 		meta: FileMeta<'static>,
 	) -> Self {
@@ -253,6 +255,7 @@ impl RemoteFile {
 			favorited,
 			region: region.into(),
 			bucket: bucket.into(),
+			timestamp,
 			chunks,
 		}
 	}
@@ -271,6 +274,7 @@ pub struct FlatRemoteFile {
 	pub favorited: bool,
 	pub region: String,
 	pub bucket: String,
+	pub timestamp: DateTime<Utc>,
 	pub hash: Option<Sha512Hash>,
 }
 
@@ -283,6 +287,7 @@ impl From<FlatRemoteFile> for RemoteFile {
 			favorited: file.favorited,
 			region: file.region,
 			bucket: file.bucket,
+			timestamp: file.timestamp,
 			chunks: file.chunks,
 			meta: FileMeta::Decoded(DecryptedFileMeta {
 				size: file.size,
@@ -411,6 +416,7 @@ pub struct RemoteRootFile {
 	pub(crate) region: String,
 	pub(crate) bucket: String,
 	pub(crate) chunks: u64,
+	pub(crate) timestamp: DateTime<Utc>,
 	pub(crate) meta: FileMeta<'static>,
 }
 
@@ -421,6 +427,7 @@ impl RemoteRootFile {
 		chunks: u64,
 		region: impl Into<String>,
 		bucket: impl Into<String>,
+		timestamp: DateTime<Utc>,
 		meta: FileMeta<'static>,
 	) -> Self {
 		Self {
@@ -429,6 +436,7 @@ impl RemoteRootFile {
 			size,
 			region: region.into(),
 			bucket: bucket.into(),
+			timestamp,
 			chunks,
 		}
 	}

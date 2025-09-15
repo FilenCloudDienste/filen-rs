@@ -13,6 +13,7 @@ pub mod trash;
 
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const ENDPOINT: &str = "v3/dir";
@@ -40,4 +41,6 @@ pub struct Response<'a> {
 	pub trash: bool,
 	pub favorited: bool,
 	pub color: DirColor<'a>,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub timestamp: DateTime<Utc>,
 }

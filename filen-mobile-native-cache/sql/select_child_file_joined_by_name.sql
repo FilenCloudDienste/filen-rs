@@ -8,6 +8,7 @@ SELECT
 	files.favorite_rank,
 	files.region,
 	files.bucket,
+	files.timestamp,
 	files.metadata_state,
 	files.raw_metadata,
 	files_meta.name,

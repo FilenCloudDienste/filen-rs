@@ -18,7 +18,7 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::{Error, ErrorExt, InvalidTypeError, MetadataWasNotDecryptedError},
 	fs::{
-		HasMetaExt, HasName, HasUUID,
+		HasName, HasUUID,
 		dir::{
 			HasUUIDContents,
 			meta::{DirectoryMeta, DirectoryMetaChanges},
@@ -54,25 +54,30 @@ impl Client {
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
 		let _lock = self.lock_drive().await?;
-		let mut dir = RemoteDirectory::new(name, parent.uuid_as_parent(), created)?;
+		let (mut uuid, meta) = RemoteDirectory::make_parts(name, created)?;
 
 		let response = api::v3::dir::create::post(
 			self.client(),
 			&api::v3::dir::create::Request {
-				uuid: *dir.uuid(),
+				uuid,
 				parent: *parent.uuid(),
-				name_hashed: Cow::Borrowed(
-					&self.hash_name(dir.name().ok_or(MetadataWasNotDecryptedError)?),
-				),
-				meta: dir
-					.get_encrypted_meta(self.crypter())
-					.ok_or(MetadataWasNotDecryptedError)?,
+				name_hashed: Cow::Borrowed(&self.hash_name(&meta.name)),
+				meta: self.crypter().encrypt_meta(&meta.to_json_string()),
 			},
 		)
 		.await?;
-		if *dir.uuid() != response.uuid {
-			dir.set_uuid(response.uuid);
+
+		if uuid != response.uuid {
+			uuid = response.uuid;
 		}
+
+		let dir: RemoteDirectory = RemoteDirectory::new_from_parts(
+			uuid,
+			meta,
+			parent.uuid_as_parent(),
+			response.timestamp,
+		);
+
 		futures::try_join!(
 			self.update_search_hashes_for_item(&dir)
 				.map_err(Error::from),
@@ -118,6 +123,7 @@ impl Client {
 			},
 			response.color,
 			response.favorited,
+			response.timestamp,
 			response.metadata,
 			self.crypter(),
 		))
@@ -160,6 +166,7 @@ impl Client {
 					d.parent,
 					d.color,
 					d.favorited,
+					d.timestamp,
 					d.meta,
 					self.crypter(),
 				)
@@ -178,6 +185,7 @@ impl Client {
 					f.chunks,
 					f.region,
 					f.bucket,
+					f.timestamp,
 					f.favorited,
 					meta,
 				))
@@ -212,6 +220,7 @@ impl Client {
 					},
 					response_dir.color,
 					response_dir.favorited,
+					response_dir.timestamp,
 					response_dir.meta,
 					self.crypter(),
 				))
@@ -230,6 +239,7 @@ impl Client {
 					f.chunks,
 					f.region,
 					f.bucket,
+					f.timestamp,
 					f.favorited,
 					meta,
 				))

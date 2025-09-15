@@ -1,6 +1,7 @@
 SELECT
 	dirs.favorite_rank,
 	dirs.color,
+	dirs.timestamp,
 	dirs.last_listed,
 	dirs.metadata_state,
 	dirs.raw_metadata,

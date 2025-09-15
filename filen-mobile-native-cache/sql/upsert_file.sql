@@ -5,9 +5,11 @@ INSERT INTO files (
 	favorite_rank,
 	region,
 	bucket,
+	timestamp,
 	metadata_state,
 	raw_metadata
 ) VALUES (
+	?,
 	?,
 	?,
 	?,
@@ -30,6 +32,7 @@ favorite_rank
 END,
 region = excluded.region,
 bucket = excluded.bucket,
+timestamp = excluded.timestamp,
 metadata_state = excluded.metadata_state,
 raw_metadata = excluded.raw_metadata
 RETURNING favorite_rank;

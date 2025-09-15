@@ -130,6 +130,7 @@ impl Client {
 			response.size.div_ceil(CHUNK_SIZE_U64),
 			response.region,
 			response.bucket,
+			response.timestamp,
 			false,
 			meta,
 		))

@@ -59,6 +59,7 @@ pub struct RootDirectoryWithMeta {
 	pub(crate) uuid: UuidStr,
 
 	pub(crate) color: DirColor<'static>,
+	pub(crate) timestamp: DateTime<Utc>,
 
 	pub(crate) meta: DirectoryMeta<'static>,
 }
@@ -67,9 +68,15 @@ impl RootDirectoryWithMeta {
 	pub fn from_meta(
 		uuid: UuidStr,
 		color: DirColor<'static>,
+		timestamp: DateTime<Utc>,
 		meta: DirectoryMeta<'static>,
 	) -> Self {
-		Self { uuid, color, meta }
+		Self {
+			uuid,
+			color,
+			timestamp,
+			meta,
+		}
 	}
 }
 
@@ -131,8 +138,9 @@ pub struct RemoteDirectory {
 	pub uuid: UuidStr,
 	pub parent: ParentUuid,
 
-	pub color: DirColor<'static>, // todo use Color struct
+	pub color: DirColor<'static>,
 	pub favorited: bool,
+	pub timestamp: DateTime<Utc>,
 
 	pub meta: DirectoryMeta<'static>,
 }
@@ -143,6 +151,7 @@ impl RemoteDirectory {
 		parent: ParentUuid,
 		color: DirColor<'static>,
 		favorited: bool,
+		timestamp: DateTime<Utc>,
 		meta: EncryptedString<'_>,
 		decrypter: &impl MetaCrypter,
 	) -> Self {
@@ -152,6 +161,7 @@ impl RemoteDirectory {
 			parent,
 			color,
 			favorited,
+			timestamp,
 			meta,
 		}
 	}
@@ -161,6 +171,7 @@ impl RemoteDirectory {
 		parent: ParentUuid,
 		color: DirColor<'static>,
 		favorited: bool,
+		timestamp: DateTime<Utc>,
 		meta: DirectoryMeta<'static>,
 	) -> Self {
 		Self {
@@ -168,24 +179,41 @@ impl RemoteDirectory {
 			parent,
 			color,
 			favorited,
+			timestamp,
 			meta,
 		}
 	}
 
-	pub fn new(name: String, parent: ParentUuid, created: DateTime<Utc>) -> Result<Self, Error> {
+	pub fn make_parts(
+		name: String,
+		created: DateTime<Utc>,
+	) -> Result<(UuidStr, DecryptedDirectoryMeta<'static>), Error> {
 		if name.is_empty() {
 			return Err(InvalidNameError(name).into());
 		}
-		Ok(Self {
-			uuid: UuidStr::new_v4(),
+		Ok((
+			UuidStr::new_v4(),
+			DecryptedDirectoryMeta {
+				name: Cow::Owned(name),
+				created: Some(created.round_subsecs(3)),
+			},
+		))
+	}
+
+	pub fn new_from_parts(
+		uuid: UuidStr,
+		meta: DecryptedDirectoryMeta<'static>,
+		parent: ParentUuid,
+		timestamp: DateTime<Utc>,
+	) -> Self {
+		Self {
+			uuid,
 			parent,
 			color: DirColor::Default,
 			favorited: false,
-			meta: DirectoryMeta::Decoded(DecryptedDirectoryMeta {
-				name: Cow::Owned(name),
-				created: Some(created.round_subsecs(3)),
-			}),
-		})
+			timestamp,
+			meta: DirectoryMeta::Decoded(meta),
+		}
 	}
 
 	pub(crate) fn set_uuid(&mut self, uuid: UuidStr) {

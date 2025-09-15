@@ -72,7 +72,7 @@ pub enum DirMeta {
 	RSAEncrypted(String),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum DirMetaEncoded<'a> {
 	DecryptedRaw(Cow<'a, [u8]>),
 	DecryptedUTF8(Cow<'a, str>),
@@ -179,17 +179,15 @@ impl From<DirColor> for filen_types::api::v3::dir::color::DirColor<'static> {
 	}
 }
 
-#[derive(Clone)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
-#[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
-	tsify(into_wasm_abi, from_wasm_abi)
-)]
+#[derive(Clone, Tsify)]
+#[tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct Dir {
 	pub uuid: UuidStr,
 	pub parent: ParentUuid,
 	pub color: DirColor,
+	#[tsify(type = "bigint")]
+	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
@@ -214,6 +212,7 @@ impl From<RemoteDirectory> for Dir {
 			parent: dir.parent,
 			color: dir.color.into(),
 			favorited: dir.favorited,
+			timestamp: dir.timestamp,
 			meta: dir.meta.into(),
 		}
 	}
@@ -226,6 +225,7 @@ impl From<Dir> for RemoteDirectory {
 			dir.parent,
 			dir.color.into(),
 			dir.favorited,
+			dir.timestamp,
 			dir.meta.into(),
 		)
 	}
@@ -315,17 +315,19 @@ impl<'a>
 }
 
 #[derive(Clone, PartialEq, Eq, Tsify)]
-#[tsify(from_wasm_abi, into_wasm_abi)]
+#[tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)]
 pub struct RootWithMeta {
 	pub uuid: UuidStr,
 	pub color: DirColor,
+	#[tsify(type = "bigint")]
+	pub timestamp: DateTime<Utc>,
 	#[tsify(optional, type = "DecryptedDirMeta")]
 	pub meta: DirMeta,
 }
 
 impl From<RootWithMeta> for RootDirectoryWithMeta {
 	fn from(dir: RootWithMeta) -> Self {
-		RootDirectoryWithMeta::from_meta(dir.uuid, dir.color.into(), dir.meta.into())
+		RootDirectoryWithMeta::from_meta(dir.uuid, dir.color.into(), dir.timestamp, dir.meta.into())
 	}
 }
 
@@ -334,6 +336,7 @@ impl From<RootDirectoryWithMeta> for RootWithMeta {
 		RootWithMeta {
 			uuid: *dir.uuid(),
 			color: dir.color.into(),
+			timestamp: dir.timestamp,
 			meta: dir.meta.into(),
 		}
 	}
@@ -366,7 +369,7 @@ impl From<DirectoryMetaType<'_>> for DirWithMetaEnum {
 }
 
 #[derive(Serialize, Deserialize, Tsify)]
-#[tsify(from_wasm_abi, into_wasm_abi)]
+#[tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedDir {
 	pub dir: DirWithMetaEnum,
@@ -447,43 +450,45 @@ impl From<AnyDirEnumWithShareInfo> for DirectoryTypeWithShareInfo<'static> {
 }
 
 mod serde_impls {
-	use serde::ser::SerializeStruct;
-
 	use crate::js::HIDDEN_META_KEY;
 
 	use super::*;
+
+	#[derive(Serialize, Deserialize, Clone)]
+	#[serde(rename_all = "camelCase")]
+	struct DirIntermediate<'a> {
+		uuid: UuidStr,
+		parent: ParentUuid,
+		color: Cow<'a, DirColor>,
+		favorited: bool,
+		#[serde(with = "chrono::serde::ts_milliseconds")]
+		timestamp: DateTime<Utc>,
+		meta: Option<Cow<'a, DecryptedDirMeta>>,
+		// HIDDEN_META_KEY
+		#[serde(rename = "__hiddenMeta")]
+		hidden_meta: Option<Cow<'a, DirMetaEncoded<'a>>>,
+	}
 
 	impl Serialize for Dir {
 		fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 		where
 			S: serde::Serializer,
 		{
-			let num_fields = 5;
-			let mut state = serializer.serialize_struct("Dir", num_fields)?;
-			state.serialize_field("uuid", &self.uuid)?;
-			state.serialize_field("parent", &self.parent)?;
-			state.serialize_field("color", &self.color)?;
-			state.serialize_field("favorited", &self.favorited)?;
-			match self.meta.as_encoded_or_decoded() {
-				EncodedOrDecoded::Encoded(encoded) => {
-					state.serialize_field(HIDDEN_META_KEY, &encoded)?
-				}
-				EncodedOrDecoded::Decoded(decoded) => state.serialize_field("meta", decoded)?,
+			let (meta, hidden_meta) = match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Decoded(meta) => (Some(meta), None),
+				EncodedOrDecoded::Encoded(decoded) => (None, Some(decoded)),
+			};
+			DirIntermediate {
+				uuid: self.uuid,
+				parent: self.parent,
+				color: Cow::Borrowed(&self.color),
+				favorited: self.favorited,
+				timestamp: self.timestamp,
+				meta: meta.map(Cow::Borrowed),
+				hidden_meta: hidden_meta.as_ref().map(Cow::Borrowed),
 			}
-			state.end()
+			.serialize(serializer)
 		}
-	}
-
-	#[derive(Deserialize)]
-	struct DirIntermediate {
-		uuid: UuidStr,
-		parent: ParentUuid,
-		color: DirColor,
-		favorited: bool,
-		meta: Option<DecryptedDirMeta>,
-		// HIDDEN_META_KEY
-		#[serde(rename = "__hiddenMeta")]
-		hidden_meta: Option<DirMetaEncoded<'static>>,
 	}
 
 	impl<'de> Deserialize<'de> for Dir {
@@ -496,16 +501,33 @@ mod serde_impls {
 			Ok(Dir {
 				uuid: intermediate.uuid,
 				parent: intermediate.parent,
-				color: intermediate.color,
+				color: intermediate.color.into_owned(),
+				timestamp: intermediate.timestamp,
 				favorited: intermediate.favorited,
-				meta: DirMeta::from_encoded_or_decoded(intermediate.hidden_meta, intermediate.meta)
-					.ok_or_else(|| {
-						serde::de::Error::custom(format!(
-							"either 'meta' or '{HIDDEN_META_KEY}' field is required"
-						))
-					})?,
+				meta: DirMeta::from_encoded_or_decoded(
+					intermediate.hidden_meta.map(Cow::into_owned),
+					intermediate.meta.map(Cow::into_owned),
+				)
+				.ok_or_else(|| {
+					serde::de::Error::custom(format!(
+						"either 'meta' or '{HIDDEN_META_KEY}' field is required"
+					))
+				})?,
 			})
 		}
+	}
+
+	#[derive(Serialize, Deserialize)]
+	#[serde(rename_all = "camelCase")]
+	struct RootWithMetaIntermediate<'a> {
+		uuid: UuidStr,
+		color: Cow<'a, DirColor>,
+		#[serde(with = "chrono::serde::ts_milliseconds")]
+		timestamp: DateTime<Utc>,
+		meta: Option<Cow<'a, DecryptedDirMeta>>,
+		// HIDDEN_META_KEY
+		#[serde(rename = "__hiddenMeta")]
+		hidden_meta: Option<Cow<'a, DirMetaEncoded<'a>>>,
 	}
 
 	impl Serialize for RootWithMeta {
@@ -513,28 +535,19 @@ mod serde_impls {
 		where
 			S: serde::Serializer,
 		{
-			let num_fields = 3;
-			let mut state = serializer.serialize_struct("RootDirWithMeta", num_fields)?;
-			state.serialize_field("uuid", &self.uuid)?;
-			state.serialize_field("color", &self.color)?;
-			match self.meta.as_encoded_or_decoded() {
-				EncodedOrDecoded::Encoded(encoded) => {
-					state.serialize_field(HIDDEN_META_KEY, &encoded)?
-				}
-				EncodedOrDecoded::Decoded(decoded) => state.serialize_field("meta", decoded)?,
+			let (meta, hidden_meta) = match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Decoded(meta) => (Some(meta), None),
+				EncodedOrDecoded::Encoded(decoded) => (None, Some(decoded)),
+			};
+			RootWithMetaIntermediate {
+				uuid: self.uuid,
+				color: Cow::Borrowed(&self.color),
+				timestamp: self.timestamp,
+				meta: meta.map(Cow::Borrowed),
+				hidden_meta: hidden_meta.as_ref().map(Cow::Borrowed),
 			}
-			state.end()
+			.serialize(serializer)
 		}
-	}
-
-	#[derive(Deserialize)]
-	struct RootWithMetaIntermediate<'a> {
-		uuid: UuidStr,
-		color: DirColor,
-		meta: Option<DecryptedDirMeta>,
-		// HIDDEN_META_KEY
-		#[serde(rename = "__hiddenMeta")]
-		hidden_meta: Option<DirMetaEncoded<'a>>,
 	}
 
 	impl<'de> Deserialize<'de> for RootWithMeta {
@@ -546,13 +559,17 @@ mod serde_impls {
 
 			Ok(RootWithMeta {
 				uuid: intermediate.uuid,
-				color: intermediate.color,
-				meta: DirMeta::from_encoded_or_decoded(intermediate.hidden_meta, intermediate.meta)
-					.ok_or_else(|| {
-						serde::de::Error::custom(format!(
-							"either 'meta' or '{HIDDEN_META_KEY}' field is required"
-						))
-					})?,
+				color: intermediate.color.into_owned(),
+				timestamp: intermediate.timestamp,
+				meta: DirMeta::from_encoded_or_decoded(
+					intermediate.hidden_meta.map(Cow::into_owned),
+					intermediate.meta.map(Cow::into_owned),
+				)
+				.ok_or_else(|| {
+					serde::de::Error::custom(format!(
+						"either 'meta' or '{HIDDEN_META_KEY}' field is required"
+					))
+				})?,
 			})
 		}
 	}

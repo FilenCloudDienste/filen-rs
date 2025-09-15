@@ -111,6 +111,7 @@ mod tests {
 			uuid: UuidStr::default(),
 			parent: ParentUuid::default(),
 			color: Some("blue".to_string()),
+			timestamp: Utc::now(),
 			favorited: true,
 			meta: DirMeta::Decoded(DecryptedDirMeta {
 				name: "Test Directory".to_string(),
@@ -142,6 +143,7 @@ mod tests {
 			favorited: false,
 			region: "us-west-1".to_string(),
 			bucket: "test-bucket".to_string(),
+			timestamp: Utc::now(),
 			chunks: 1,
 			can_make_thumbnail: false,
 		};
@@ -150,6 +152,7 @@ mod tests {
 			uuid: UuidStr::from_str("413c5087-cef2-468a-a7b0-3e4f597fffd3").unwrap(),
 			parent: ParentUuid::from_str("32514e81-2753-4741-aac9-7da2400900c3").unwrap(),
 			color: None,
+			timestamp: Utc::from_timestamp_millis(1755781567998).unwrap(),
 			favorited: false,
 			meta: DirMeta::Decoded(DecryptedDirMeta {
 				name: "wasm-test-dir".to_string(),
@@ -182,6 +185,7 @@ mod tests {
 			uuid: UuidStr::default(),
 			parent: ParentUuid::default(),
 			color: Some("blue".to_string()),
+			timestamp: Utc::now(),
 			favorited: true,
 			meta: DirMeta::Decoded(DecryptedDirMeta {
 				name: "Test Directory".to_string(),

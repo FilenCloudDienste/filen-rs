@@ -75,7 +75,7 @@ pub(crate) const INSERT_ROOT_INTO_ITEMS: &str =
 	"INSERT INTO items (uuid, parent, type) VALUES (?, NULL, ?) RETURNING id;";
 pub(crate) const INSERT_ROOT_INTO_ROOTS: &str = "INSERT INTO roots (id) VALUES (?);";
 pub(crate) const INSERT_ROOT_INTO_DIRS: &str =
-	"INSERT INTO dirs (id, metadata_state, raw_metadata) VALUES (?, 1, '');";
+	"INSERT INTO dirs (id, metadata_state, timestamp, raw_metadata) VALUES (?, 1, 0, '');";
 pub(crate) const UPDATE_ROOT: &str =
 	"UPDATE roots SET storage_used = ?, max_storage = ?, last_updated = ? WHERE id = ?;";
 
@@ -113,7 +113,7 @@ fn convert_order_by(order_by: Option<&str>) -> &'static str {
 /// Does not include is_stale, is_recent and parent_path
 pub(crate) const ITEM_COLUMN_COUNT_NO_EXTRA: usize = 5;
 // does not include the `id` column for the below
-pub(crate) const DIRS_COLUMN_COUNT: usize = 5;
+pub(crate) const DIRS_COLUMN_COUNT: usize = 6;
 pub(crate) const DIRS_META_COLUMN_COUNT: usize = 2;
-pub(crate) const FILES_COLUMN_COUNT: usize = 7;
+pub(crate) const FILES_COLUMN_COUNT: usize = 8;
 pub(crate) const FILES_META_COLUMN_COUNT: usize = 7;

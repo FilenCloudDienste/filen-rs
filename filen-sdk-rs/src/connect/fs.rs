@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use filen_types::{
 	api::v3::{
 		dir::color::DirColor,
@@ -55,6 +56,7 @@ struct DirInfo {
 	uuid: UuidStr,
 	parent: Option<UuidStr>,
 	color: DirColor<'static>,
+	timestamp: DateTime<Utc>,
 	metadata: DirectoryMeta<'static>,
 	write_access: bool,
 }
@@ -67,11 +69,13 @@ impl SharedDirectory {
 				parent.into(),
 				dir_info.color,
 				false,
+				dir_info.timestamp,
 				dir_info.metadata,
 			))),
 			None => DirectoryMetaType::Root(Cow::Owned(RootDirectoryWithMeta::from_meta(
 				dir_info.uuid,
 				dir_info.color,
+				dir_info.timestamp,
 				dir_info.metadata,
 			))),
 		};
@@ -99,6 +103,7 @@ impl SharedDirectory {
 				color: shared_dir.color.into_owned(),
 				metadata: DirectoryMeta::from_rsa_encrypted(shared_dir.metadata, private_key)
 					.into_owned(),
+				timestamp: shared_dir.timestamp,
 				write_access: shared_dir.write_access,
 			},
 			sharing_role,
@@ -119,6 +124,7 @@ impl SharedDirectory {
 				parent: shared_dir.parent,
 				color: shared_dir.color.into_owned(),
 				metadata: DirectoryMeta::from_encrypted(shared_dir.metadata, crypter).into_owned(),
+				timestamp: shared_dir.timestamp,
 				write_access: shared_dir.write_access,
 			},
 			sharing_role,
@@ -155,6 +161,7 @@ impl SharedFile {
 			shared_file.chunks,
 			shared_file.region.into_owned(),
 			shared_file.bucket.into_owned(),
+			shared_file.timestamp,
 			meta,
 		);
 
@@ -180,6 +187,7 @@ impl SharedFile {
 			shared_file.chunks,
 			shared_file.region.into_owned(),
 			shared_file.bucket.into_owned(),
+			shared_file.timestamp,
 			meta,
 		);
 

@@ -2,7 +2,10 @@ use std::borrow::Cow;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
+use filen_types::{
+	crypto::{EncryptedString, rsa::RSAEncryptedString},
+	traits::CowHelpers,
+};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +26,7 @@ pub enum DirectoryMeta<'a> {
 impl DirectoryMeta<'_> {
 	pub fn into_owned(self) -> DirectoryMeta<'static> {
 		match self {
-			DirectoryMeta::Decoded(meta) => DirectoryMeta::Decoded(meta.into_owned()),
+			DirectoryMeta::Decoded(meta) => DirectoryMeta::Decoded(meta.into_owned_cow()),
 			DirectoryMeta::DecryptedRaw(raw) => {
 				DirectoryMeta::DecryptedRaw(Cow::Owned(raw.into_owned()))
 			}
@@ -88,17 +91,13 @@ impl<'a> DirectoryMeta<'a> {
 		}
 	}
 
-	pub fn try_to_string(&self) -> Option<Cow<'_, str>> {
+	pub fn try_to_string(&'a self) -> Option<Cow<'a, str>> {
 		match self {
 			// SAFETY: serializing a DecryptedDirectoryMeta always succeeds
 			// - filen_types::serde::time::optional::serialize cannot fail
 			// - serializing a String cannot fail
 			// - serde_json::to_string always suceeds if we have string keys and serialization cannot fail
-			Self::Decoded(meta) => Some(
-				serde_json::to_string(meta)
-					.expect("Failed to serialize directory meta (should be impossible)")
-					.into(),
-			),
+			Self::Decoded(meta) => Some(Cow::Owned(meta.to_json_string())),
 			Self::DecryptedUTF8(utf8) => Some(Cow::Borrowed(utf8)),
 			Self::DecryptedRaw(_) | Self::Encrypted(_) | Self::RSAEncrypted(_) => None,
 		}
@@ -200,10 +199,36 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 			created: changes.created.unwrap_or(self.created),
 		}
 	}
+
+	pub(crate) fn to_json_string(&self) -> String {
+		// SAFETY: serializing a DecryptedDirectoryMeta always succeeds
+		// - filen_types::serde::time::optional::serialize cannot fail
+		// - serializing a String cannot fail
+		// - serde_json::to_string always suceeds if we have string keys and serialization cannot fail
+		serde_json::to_string(self)
+			.expect("Failed to serialize directory meta (should be impossible)")
+	}
 }
 
-impl DecryptedDirectoryMeta<'_> {
-	pub fn into_owned(self) -> DecryptedDirectoryMeta<'static> {
+impl CowHelpers for DecryptedDirectoryMeta<'_> {
+	type CowBorrowed<'borrow>
+		= DecryptedDirectoryMeta<'borrow>
+	where
+		Self: 'borrow;
+
+	type CowStatic = DecryptedDirectoryMeta<'static>;
+
+	fn as_borrowed_cow<'borrow>(&'borrow self) -> Self::CowBorrowed<'borrow>
+	where
+		Self: 'borrow,
+	{
+		DecryptedDirectoryMeta {
+			name: Cow::Borrowed(&self.name),
+			created: self.created,
+		}
+	}
+
+	fn into_owned_cow(self) -> Self::CowStatic {
 		DecryptedDirectoryMeta {
 			name: Cow::Owned(self.name.into_owned()),
 			created: self.created,

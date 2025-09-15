@@ -124,6 +124,7 @@ pub struct DBDir {
 	pub(crate) last_listed: i64,
 	pub(crate) local_data: Option<JsonObject>,
 	pub(crate) meta: DBDirMeta,
+	pub(crate) timestamp: i64,
 }
 
 impl DBDir {
@@ -145,8 +146,9 @@ impl DBDir {
 			local_data: item.local_data,
 			favorite_rank: row.get(idx)?,
 			color: row.get(idx + 1)?,
-			last_listed: row.get(idx + 2)?,
-			meta: DBDirMeta::from_row(row, idx + 3)?,
+			timestamp: row.get(idx + 2)?,
+			last_listed: row.get(idx + 3)?,
+			meta: DBDirMeta::from_row(row, idx + 4)?,
 		})
 	}
 
@@ -185,11 +187,14 @@ impl DBDir {
 
 		let (meta_state, meta) = raw_meta_and_state_from_dir_meta(meta);
 
+		let timestamp = remote_dir.timestamp.timestamp_millis();
+
 		let (last_listed, favorite_rank) = upsert_dir.query_one(
 			(
 				id,
 				remote_dir.favorited() as u8,
 				remote_dir.color(),
+				timestamp,
 				meta_state,
 				meta,
 			),
@@ -218,6 +223,7 @@ impl DBDir {
 			parent: remote_dir.parent,
 			favorite_rank,
 			color: remote_dir.color,
+			timestamp,
 			last_listed,
 			local_data,
 			meta: DBDirMeta::from(remote_dir.meta),
@@ -324,6 +330,7 @@ impl From<DBDir> for RemoteDirectory {
 			uuid: value.uuid,
 			parent: value.parent,
 			color: value.color,
+			timestamp: DateTime::<Utc>::from_timestamp_millis(value.timestamp).unwrap_or_default(),
 			favorited: value.favorite_rank > 0,
 			meta: DirectoryMeta::from(value.meta),
 		}
@@ -392,30 +399,25 @@ impl DBRoot {
 			None, // root has no name
 			None,
 			ItemType::Root,
-		)
-		.unwrap();
-		let mut stmt = tx.prepare_cached(UPSERT_ROOT_EMPTY).unwrap();
-		let (storage_used, max_storage, last_updated) = stmt
-			.query_one([id], |f| {
-				let storage_used: i64 = f.get(0)?;
-				let max_storage: i64 = f.get(1)?;
-				let last_updated: i64 = f.get(2)?;
-				Ok((storage_used, max_storage, last_updated))
-			})
-			.unwrap();
+		)?;
+		let mut stmt = tx.prepare_cached(UPSERT_ROOT_EMPTY)?;
+		let (storage_used, max_storage, last_updated) = stmt.query_one([id], |f| {
+			let storage_used: i64 = f.get(0)?;
+			let max_storage: i64 = f.get(1)?;
+			let last_updated: i64 = f.get(2)?;
+			Ok((storage_used, max_storage, last_updated))
+		})?;
 		std::mem::drop(stmt);
-		let mut stmt = tx.prepare_cached(UPSERT_DIR).unwrap();
-		let last_listed = stmt
-			.query_one(
-				(id, 0, Option::<String>::None, MetaState::Decrypted, ""),
-				|r| {
-					let last_listed: i64 = r.get(0)?;
-					Ok(last_listed)
-				},
-			)
-			.unwrap();
+		let mut stmt = tx.prepare_cached(UPSERT_DIR)?;
+		let last_listed = stmt.query_one(
+			(id, 0, Option::<String>::None, 0, MetaState::Decrypted, ""),
+			|r| {
+				let last_listed: i64 = r.get(0)?;
+				Ok(last_listed)
+			},
+		)?;
 		std::mem::drop(stmt);
-		tx.commit().unwrap();
+		tx.commit()?;
 		trace!("Upserted remote root with id: {id}");
 		Ok(Self {
 			id,

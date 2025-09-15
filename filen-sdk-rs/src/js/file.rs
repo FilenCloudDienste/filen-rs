@@ -105,7 +105,7 @@ pub enum FileMeta {
 	RSAEncrypted(String),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum FileMetaEncoded<'a> {
 	DecryptedRaw(Cow<'a, [u8]>),
 	DecryptedUTF8(Cow<'a, str>),
@@ -183,12 +183,8 @@ impl<'a>
 	}
 }
 
-#[derive(Clone)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
-#[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
-)]
+#[derive(Clone, Tsify)]
+#[tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 #[serde(rename_all = "camelCase")]
 pub struct File {
@@ -209,6 +205,8 @@ pub struct File {
 
 	pub region: String,
 	pub bucket: String,
+	#[tsify(type = "bigint")]
+	pub timestamp: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_arch = "wasm32", target_os = "unknown"),
 		tsify(type = "bigint")
@@ -244,6 +242,7 @@ impl From<RemoteFile> for File {
 			favorited: file.favorited,
 			region: file.region,
 			bucket: file.bucket,
+			timestamp: file.timestamp,
 			chunks: file.chunks,
 		}
 	}
@@ -260,13 +259,14 @@ impl TryFrom<File> for RemoteFile {
 			favorited: file.favorited,
 			region: file.region,
 			bucket: file.bucket,
+			timestamp: file.timestamp,
 			chunks: file.chunks,
 		})
 	}
 }
 
 #[derive(Tsify)]
-#[tsify(from_wasm_abi, into_wasm_abi)]
+#[tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)]
 #[serde(rename_all = "camelCase")]
 pub struct RootFile {
 	pub uuid: UuidStr,
@@ -274,6 +274,8 @@ pub struct RootFile {
 	pub chunks: u64,
 	pub region: String,
 	pub bucket: String,
+	#[tsify(type = "bigint")]
+	pub timestamp: DateTime<Utc>,
 	#[tsify(optional, type = "DecryptedDirMeta")]
 	pub meta: FileMeta,
 	// JS only field, indicates if the file can have a thumbnail generated
@@ -290,6 +292,7 @@ impl TryFrom<RootFile> for RemoteRootFile {
 			chunks: file.chunks,
 			region: file.region,
 			bucket: file.bucket,
+			timestamp: file.timestamp,
 			meta: file.meta.try_into()?,
 		})
 	}
@@ -309,13 +312,14 @@ impl From<RemoteRootFile> for RootFile {
 			chunks: file.chunks,
 			region: file.region,
 			bucket: file.bucket,
+			timestamp: file.timestamp,
 			meta,
 		}
 	}
 }
 
 #[derive(Tsify, Serialize, Deserialize)]
-#[tsify(from_wasm_abi, into_wasm_abi)]
+#[tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedFile {
 	pub file: RootFile,
@@ -377,53 +381,57 @@ pub struct FileMetaChanges {
 }
 
 mod serde_impls {
-	use serde::ser::SerializeStruct;
-
 	use crate::js::HIDDEN_META_KEY;
 
 	use super::*;
-	impl Serialize for File {
-		fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-		where
-			S: serde::Serializer,
-		{
-			let mut state = serializer.serialize_struct("File", 8)?;
-			state.serialize_field("uuid", &self.uuid)?;
-			state.serialize_field("parent", &self.parent)?;
 
-			state.serialize_field("size", &self.size)?;
-			state.serialize_field("favorited", &self.favorited)?;
-
-			state.serialize_field("region", &self.region)?;
-			state.serialize_field("bucket", &self.bucket)?;
-			state.serialize_field("chunks", &self.chunks)?;
-			state.serialize_field("canMakeThumbnail", &self.can_make_thumbnail)?;
-
-			match self.meta.as_encoded_or_decoded() {
-				EncodedOrDecoded::Decoded(meta) => state.serialize_field("meta", &meta)?,
-				EncodedOrDecoded::Encoded(encoded) => {
-					state.serialize_field(HIDDEN_META_KEY, &encoded)?
-				}
-			}
-			state.end()
-		}
-	}
-	#[derive(Deserialize)]
-	struct FileIntermediate {
+	#[derive(Serialize, Deserialize)]
+	#[serde(rename_all = "camelCase")]
+	struct FileIntermediate<'a> {
 		uuid: UuidStr,
 		parent: ParentUuid,
 
 		size: u64,
 		favorited: bool,
 
-		region: String,
-		bucket: String,
+		region: Cow<'a, str>,
+		bucket: Cow<'a, str>,
+		#[serde(with = "chrono::serde::ts_milliseconds")]
+		timestamp: DateTime<Utc>,
 		chunks: u64,
 
-		meta: Option<DecryptedFileMeta>,
+		meta: Option<Cow<'a, DecryptedFileMeta>>,
 		// HIDDEN_META_KEY
 		#[serde(rename = "__hiddenMeta")]
-		hidden_meta: Option<FileMetaEncoded<'static>>,
+		hidden_meta: Option<Cow<'a, FileMetaEncoded<'a>>>,
+
+		can_make_thumbnail: bool,
+	}
+
+	impl Serialize for File {
+		fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+		where
+			S: serde::Serializer,
+		{
+			let (meta, hidden_meta) = match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Decoded(meta) => (Some(meta), None),
+				EncodedOrDecoded::Encoded(encoded) => (None, Some(encoded)),
+			};
+			FileIntermediate {
+				uuid: self.uuid,
+				parent: self.parent,
+				size: self.size,
+				favorited: self.favorited,
+				region: Cow::Borrowed(&self.region),
+				bucket: Cow::Borrowed(&self.bucket),
+				timestamp: self.timestamp,
+				chunks: self.chunks,
+				meta: meta.map(Cow::Borrowed),
+				hidden_meta: hidden_meta.as_ref().map(Cow::Borrowed),
+				can_make_thumbnail: self.can_make_thumbnail,
+			}
+			.serialize(serializer)
+		}
 	}
 
 	impl<'de> Deserialize<'de> for File {
@@ -436,8 +444,8 @@ mod serde_impls {
 			Ok(File {
 				uuid: intermediate.uuid,
 				meta: FileMeta::from_encoded_or_decoded(
-					intermediate.hidden_meta,
-					intermediate.meta,
+					intermediate.hidden_meta.map(Cow::into_owned),
+					intermediate.meta.map(Cow::into_owned),
 				)
 				.ok_or_else(|| {
 					serde::de::Error::custom(format!(
@@ -447,12 +455,31 @@ mod serde_impls {
 				parent: intermediate.parent,
 				size: intermediate.size,
 				favorited: intermediate.favorited,
-				region: intermediate.region,
-				bucket: intermediate.bucket,
+				region: intermediate.region.into_owned(),
+				bucket: intermediate.bucket.into_owned(),
+				timestamp: intermediate.timestamp,
 				chunks: intermediate.chunks,
-				can_make_thumbnail: false,
+				can_make_thumbnail: intermediate.can_make_thumbnail,
 			})
 		}
+	}
+
+	#[derive(Serialize, Deserialize)]
+	#[serde(rename_all = "camelCase")]
+	struct RootFileIntermediate<'a> {
+		uuid: UuidStr,
+		size: u64,
+		chunks: u64,
+		region: Cow<'a, str>,
+		bucket: Cow<'a, str>,
+		#[serde(with = "chrono::serde::ts_milliseconds")]
+		timestamp: DateTime<Utc>,
+		meta: Option<Cow<'a, DecryptedFileMeta>>,
+		// HIDDEN_META_KEY
+		#[serde(rename = "__hiddenMeta")]
+		hidden_meta: Option<Cow<'a, FileMetaEncoded<'a>>>,
+
+		can_make_thumbnail: bool,
 	}
 
 	impl Serialize for RootFile {
@@ -460,34 +487,23 @@ mod serde_impls {
 		where
 			S: serde::Serializer,
 		{
-			let mut state = serializer.serialize_struct("RootFile", 6)?;
-			state.serialize_field("uuid", &self.uuid)?;
-			state.serialize_field("size", &self.size)?;
-			state.serialize_field("chunks", &self.chunks)?;
-			state.serialize_field("region", &self.region)?;
-			state.serialize_field("bucket", &self.bucket)?;
-			state.serialize_field("canMakeThumbnail", &self.can_make_thumbnail)?;
-			match self.meta.as_encoded_or_decoded() {
-				EncodedOrDecoded::Decoded(meta) => state.serialize_field("meta", &meta)?,
-				EncodedOrDecoded::Encoded(encoded) => {
-					state.serialize_field(HIDDEN_META_KEY, &encoded)?
-				}
+			let (meta, hidden_meta) = match self.meta.as_encoded_or_decoded() {
+				EncodedOrDecoded::Decoded(meta) => (Some(meta), None),
+				EncodedOrDecoded::Encoded(encoded) => (None, Some(encoded)),
+			};
+			RootFileIntermediate {
+				uuid: self.uuid,
+				size: self.size,
+				chunks: self.chunks,
+				region: Cow::Borrowed(&self.region),
+				bucket: Cow::Borrowed(&self.bucket),
+				timestamp: self.timestamp,
+				meta: meta.map(Cow::Borrowed),
+				hidden_meta: hidden_meta.as_ref().map(Cow::Borrowed),
+				can_make_thumbnail: self.can_make_thumbnail,
 			}
-			state.end()
+			.serialize(serializer)
 		}
-	}
-
-	#[derive(Deserialize)]
-	struct RootFileIntermediate<'a> {
-		uuid: UuidStr,
-		size: u64,
-		chunks: u64,
-		region: String,
-		bucket: String,
-		meta: Option<DecryptedFileMeta>,
-		// HIDDEN_META_KEY
-		#[serde(rename = "__hiddenMeta")]
-		hidden_meta: Option<FileMetaEncoded<'a>>,
 	}
 
 	impl<'de> Deserialize<'de> for RootFile {
@@ -501,18 +517,19 @@ mod serde_impls {
 				uuid: intermediate.uuid,
 				size: intermediate.size,
 				chunks: intermediate.chunks,
-				region: intermediate.region,
-				bucket: intermediate.bucket,
+				region: intermediate.region.into_owned(),
+				bucket: intermediate.bucket.into_owned(),
+				timestamp: intermediate.timestamp,
 				meta: FileMeta::from_encoded_or_decoded(
-					intermediate.hidden_meta,
-					intermediate.meta,
+					intermediate.hidden_meta.map(Cow::into_owned),
+					intermediate.meta.map(Cow::into_owned),
 				)
 				.ok_or_else(|| {
 					serde::de::Error::custom(format!(
 						"either 'meta' or '{HIDDEN_META_KEY}' field is required"
 					))
 				})?,
-				can_make_thumbnail: false,
+				can_make_thumbnail: intermediate.can_make_thumbnail,
 			})
 		}
 	}

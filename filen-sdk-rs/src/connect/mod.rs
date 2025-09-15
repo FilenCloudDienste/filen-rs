@@ -759,6 +759,7 @@ impl Client {
 					d.parent.into(),
 					d.color,
 					false,
+					d.timestamp,
 					d.metadata,
 					crypter,
 				)
@@ -777,6 +778,7 @@ impl Client {
 					f.chunks,
 					f.region,
 					f.bucket,
+					f.timestamp,
 					false,
 					meta,
 				))

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::EncryptedString, fs::UuidStr};
@@ -20,4 +21,6 @@ pub struct Request<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct Response {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub timestamp: DateTime<Utc>,
 }

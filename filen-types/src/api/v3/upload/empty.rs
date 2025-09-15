@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::UuidStr};
@@ -24,4 +25,6 @@ pub struct Request<'a> {
 pub struct Response {
 	pub chunks: u64,
 	pub size: u64,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub timestamp: DateTime<Utc>,
 }
