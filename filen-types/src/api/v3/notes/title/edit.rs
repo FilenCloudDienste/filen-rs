@@ -1,8 +1,6 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::{crypto::EncryptedString, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/notes/title/edit";
 
@@ -10,5 +8,5 @@ pub const ENDPOINT: &str = "v3/notes/title/edit";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub uuid: UuidStr,
-	pub title: Cow<'a, str>,
+	pub title: EncryptedString<'a>,
 }

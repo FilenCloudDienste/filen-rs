@@ -1,8 +1,6 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
-use crate::{api::v3::notes::NoteType, fs::UuidStr};
+use crate::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/notes/content/edit";
 
@@ -10,7 +8,8 @@ pub const ENDPOINT: &str = "v3/notes/content/edit";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub uuid: UuidStr,
-	pub preview: Cow<'a, str>,
-	pub content: Cow<'a, str>,
-	pub r#type: NoteType,
+	pub preview: EncryptedString<'a>,
+	pub content: EncryptedString<'a>,
+	#[serde(rename = "type")]
+	pub note_type: NoteType,
 }

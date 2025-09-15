@@ -1,9 +1,7 @@
-use std::borrow::Cow;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{api::v3::notes::NoteType, fs::UuidStr};
+use crate::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
 
 pub mod restore;
 
@@ -23,9 +21,10 @@ pub struct Response<'a>(pub Vec<NoteHistory<'a>>);
 #[serde(rename_all = "camelCase")]
 pub struct NoteHistory<'a> {
 	pub id: u64,
-	pub preview: Cow<'a, str>,
-	pub content: Cow<'a, str>,
+	pub preview: EncryptedString<'a>,
+	pub content: EncryptedString<'a>,
 	pub edited_timestamp: DateTime<Utc>,
 	pub editor_id: u64,
-	pub r#type: NoteType,
+	#[serde(rename = "type")]
+	pub note_type: NoteType,
 }

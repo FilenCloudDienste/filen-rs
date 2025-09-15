@@ -2,16 +2,16 @@
 
 pub(crate) mod api;
 pub mod auth;
+pub mod chats;
 pub mod connect;
 pub mod consts;
 pub mod crypto;
 pub mod error;
 pub mod fs;
 pub mod io;
-// #[cfg(any(feature = "node", all(target_arch = "wasm32", target_os = "unknown")))]
-pub mod chats;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod js;
+pub mod notes;
 pub mod search;
 pub(crate) mod serde;
 pub mod sync;

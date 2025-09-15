@@ -45,7 +45,7 @@ pub enum ErrorKind {
 	Response,
 	/// A request being retried and failing after a certain number of attempts
 	RetryFailed,
-	/// Error during conversion, e.g. decryption or parsing
+	/// Error during conversion, e.g. decryption, encryption or parsing
 	Conversion,
 	/// Error during IO operations
 	IO,
@@ -100,6 +100,18 @@ impl Error {
 			kind,
 			inner: None,
 			context: Some(message.into()),
+		}
+	}
+
+	pub fn custom_with_source(
+		kind: ErrorKind,
+		source: impl std::error::Error + Send + Sync + 'static,
+		context: Option<impl Into<Cow<'static, str>>>,
+	) -> Self {
+		Self {
+			kind,
+			inner: Some(Box::new(source)),
+			context: context.map(Into::into),
 		}
 	}
 

@@ -13,3 +13,11 @@ pub(crate) mod title;
 pub(crate) mod trash;
 pub(crate) mod r#type;
 pub(crate) mod untag;
+
+pub use filen_types::api::v3::notes::{ENDPOINT, Response};
+
+use crate::{api::get_auth_request, auth::http::AuthorizedClient, error::Error};
+
+pub(crate) async fn get(client: impl AuthorizedClient) -> Result<Response<'static>, Error> {
+	get_auth_request(client, ENDPOINT).await
+}
