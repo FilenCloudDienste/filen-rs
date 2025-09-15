@@ -240,7 +240,7 @@ impl Client {
 				} else {
 					Err(RetryError::Retry(Error::custom(
 						ErrorKind::Server,
-						"Failed to acquire lock",
+						format!("Failed to acquire lock: {}", resp.resource),
 					)))
 				}
 			},
