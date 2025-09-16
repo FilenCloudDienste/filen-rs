@@ -578,6 +578,7 @@ async fn remove_link() {
 	let contact = &contacts[0];
 
 	client.share_dir(&out_dir, contact).await.unwrap();
+	client.share_dir(&in_dir, contact).await.unwrap();
 
 	let (shared_dirs_out, _) = client.list_out_shared(None).await.unwrap();
 	assert_eq!(shared_dirs_out.len(), 2);
