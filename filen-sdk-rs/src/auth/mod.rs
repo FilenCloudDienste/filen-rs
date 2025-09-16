@@ -16,7 +16,6 @@ use http::{AuthClient, UnauthClient};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use crate::{
 	api,
@@ -142,7 +141,9 @@ pub struct Client {
 
 	http_client: Arc<AuthClient>,
 
-	pub(crate) drive_lock: Mutex<Option<Weak<ResourceLock>>>,
+	pub(crate) drive_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
+	pub(crate) notes_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
+
 	pub(crate) api_semaphore: tokio::sync::Semaphore,
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
 	#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen(skip))]
@@ -240,7 +241,8 @@ impl Client {
 			hmac_key: HMACKey::new(&private_key),
 			private_key,
 			http_client: Arc::new(AuthClient::new(APIKey(Cow::Owned(stringified.api_key)))),
-			drive_lock: Mutex::new(None),
+			drive_lock: tokio::sync::RwLock::new(None),
+			notes_lock: tokio::sync::RwLock::new(None),
 			api_semaphore: tokio::sync::Semaphore::new(
 				stringified
 					.max_parallel_requests
@@ -412,7 +414,8 @@ impl Client {
 			private_key,
 			hmac_key: hmac,
 			http_client: Arc::new(client),
-			drive_lock: Mutex::new(None),
+			drive_lock: tokio::sync::RwLock::new(None),
+			notes_lock: tokio::sync::RwLock::new(None),
 			api_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
 			memory_semaphore: tokio::sync::Semaphore::new(
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,

@@ -1,30 +1,40 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use crate::{auth::Client, error::Error};
+use crate::{auth::Client, error::Error, sync::lock::ResourceLock};
 
 pub mod lock;
 
 impl Client {
-	pub async fn lock_drive(&self) -> Result<Arc<lock::ResourceLock>, Error> {
-		let mut guard = self.drive_lock.lock().await;
-		match guard.as_ref() {
-			Some(lock) => {
-				if let Some(lock) = lock.upgrade() {
-					Ok(lock)
-				} else {
-					let lock = self.acquire_lock_with_default("drive-write").await?;
-					let weak = Arc::downgrade(&lock);
-					guard.replace(weak);
-					Ok(lock)
-				}
-			}
-			None => {
-				let lock = self.acquire_lock_with_default("drive-write").await?;
-				let weak = Arc::downgrade(&lock);
-				guard.replace(weak);
-				Ok(lock)
-			}
+	async fn lock_resource(
+		&self,
+		lock: &tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
+		name: &str,
+	) -> Result<Arc<ResourceLock>, Error> {
+		let read_lock = lock.read().await;
+		if let Some(weak) = read_lock.as_ref()
+			&& let Some(arc) = weak.upgrade()
+		{
+			return Ok(arc);
 		}
+		std::mem::drop(read_lock);
+		let mut write_lock = lock.write().await;
+		if let Some(weak) = write_lock.as_ref()
+			&& let Some(arc) = weak.upgrade()
+		{
+			return Ok(arc);
+		}
+		let lock = self.acquire_lock_with_default(name).await?;
+		let weak = Arc::downgrade(&lock);
+		write_lock.replace(weak);
+		Ok(lock)
+	}
+
+	pub async fn lock_drive(&self) -> Result<Arc<lock::ResourceLock>, Error> {
+		self.lock_resource(&self.drive_lock, "drive-write").await
+	}
+
+	pub async fn lock_notes(&self) -> Result<Arc<lock::ResourceLock>, Error> {
+		self.lock_resource(&self.notes_lock, "notes-write").await
 	}
 }
 
