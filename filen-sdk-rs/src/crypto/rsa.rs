@@ -9,8 +9,7 @@ use filen_types::crypto::{
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey, traits::PrivateKeyParts};
-use sha1::Sha1;
-use sha2::Sha256;
+use sha2::{Sha256, Sha512};
 
 use super::{error::ConversionError, shared::MetaCrypter};
 
@@ -69,13 +68,7 @@ pub(crate) fn encrypt_with_public_key(
 	data: &[u8],
 ) -> Result<RSAEncryptedString<'static>, rsa::Error> {
 	let mut rng = old_rng::thread_rng();
-	// this is RSA_PKCS1_OAEP_PADDING according to
-	// https://github.com/RustCrypto/RSA/issues/435
-	let encrypted_data = public_key.encrypt(
-		&mut rng,
-		Oaep::new_with_mgf_hash::<Sha256, Sha1>(),
-		data.as_ref(),
-	)?;
+	let encrypted_data = public_key.encrypt(&mut rng, Oaep::new::<Sha512>(), data.as_ref())?;
 
 	Ok(RSAEncryptedString(Cow::Owned(
 		BASE64_STANDARD.encode(encrypted_data),
@@ -87,8 +80,7 @@ pub fn decrypt_with_private_key(
 	data: &RSAEncryptedString,
 ) -> Result<Vec<u8>, ConversionError> {
 	let encrypted_data = BASE64_STANDARD.decode(data.0.as_ref())?;
-	let decrypted_data =
-		private_key.decrypt(Oaep::new_with_mgf_hash::<Sha256, Sha1>(), &encrypted_data)?;
+	let decrypted_data = private_key.decrypt(Oaep::new::<Sha512>(), &encrypted_data)?;
 
 	Ok(decrypted_data)
 }
