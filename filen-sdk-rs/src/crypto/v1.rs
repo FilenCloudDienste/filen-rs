@@ -15,6 +15,7 @@ use sha2::{Sha256, Sha384, Sha512};
 
 use crate::crypto::error::ConversionError;
 use crate::crypto::shared::DataCrypter;
+use crate::crypto::v2::V2Key;
 
 use super::v2::{MasterKey, MasterKeys};
 
@@ -61,31 +62,55 @@ fn decrypt(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
 	Ok(())
 }
 
-impl MasterKey {
-	pub fn decrypt_meta_into_v1(
-		&self,
-		meta: &EncryptedString,
-		mut out: Vec<u8>,
-	) -> Result<String, (ConversionError, Vec<u8>)> {
-		out.clear();
-		if let Err(e) = BASE64_STANDARD.decode_vec(meta.0.as_ref(), &mut out) {
-			return Err((e.into(), out));
-		}
-		if out.len() < 16 {
-			return Err((ConversionError::InvalidStringLength(out.len(), 16), out));
-		}
-
-		if let Err(e) = decrypt(self.key.as_bytes(), &mut out) {
-			return Err((e, out));
-		}
-
-		let out = String::from_utf8(out).map_err(|e| {
-			let err = e.utf8_error();
-			let out = e.into_bytes();
-			(err.into(), out)
-		})?;
-		Ok(out)
+fn decrypt_meta(
+	key: &[u8],
+	meta: &EncryptedString,
+	mut out: Vec<u8>,
+) -> Result<String, (ConversionError, Vec<u8>)> {
+	out.clear();
+	if let Err(e) = BASE64_STANDARD.decode_vec(meta.0.as_ref(), &mut out) {
+		return Err((e.into(), out));
 	}
+	if out.len() < 16 {
+		return Err((ConversionError::InvalidStringLength(out.len(), 16), out));
+	}
+
+	if let Err(e) = decrypt(key, &mut out) {
+		return Err((e, out));
+	}
+
+	let out = String::from_utf8(out).map_err(|e| {
+		let err = e.utf8_error();
+		let out = e.into_bytes();
+		(err.into(), out)
+	})?;
+	Ok(out)
+}
+
+fn decrypt_data(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	let first_16 = &data[..16.min(data.len())];
+	let as_str = String::from_utf8_lossy(first_16);
+	let as_b64 = BASE64_STANDARD.encode(first_16);
+
+	let needs_convert = !as_str.starts_with("Salted_") && !as_b64.starts_with("Salted_");
+	let is_normal_cbc =
+		!needs_convert && !as_str.starts_with("U2FsdGVk") && !as_b64.starts_with("U2FsdGVk");
+
+	if needs_convert && !is_normal_cbc {
+		*data = BASE64_STANDARD.decode(std::str::from_utf8(data)?)?
+	}
+
+	if !is_normal_cbc {
+		decrypt(key, data)?;
+	} else {
+		let cipher = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, &key[..IV_LEN])?;
+		data.copy_within(16.., 0);
+		data.truncate(data.len() - 16);
+		cipher.decrypt_padded_mut::<Pkcs7>(data)?;
+		let padding_len = data.last().copied().unwrap_or(0) as usize;
+		data.truncate(data.len() - padding_len);
+	}
+	Ok(())
 }
 
 impl MasterKeys {
@@ -96,7 +121,7 @@ impl MasterKeys {
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		let mut errs = Vec::new();
 		for key in &self.0 {
-			match key.decrypt_meta_into_v1(meta, out) {
+			match key.0.decrypt_meta_into_v1(meta, out) {
 				Ok(string) => return Ok(string),
 				Err((e, out_err)) => {
 					errs.push(e);
@@ -105,6 +130,20 @@ impl MasterKeys {
 			}
 		}
 		Err((ConversionError::MultipleErrors(errs), out))
+	}
+}
+
+impl V2Key {
+	pub(crate) fn decrypt_meta_into_v1(
+		&self,
+		meta: &EncryptedString,
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
+		decrypt_meta(self.as_ref().as_bytes(), meta, out)
+	}
+
+	pub(crate) fn decrypt_data_v1(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+		decrypt_data(self.as_ref().as_bytes(), data)
 	}
 }
 
@@ -138,30 +177,7 @@ impl DataCrypter for FileKey {
 	}
 
 	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		let first_16 = &data[..16.min(data.len())];
-		let as_str = String::from_utf8_lossy(first_16);
-		let as_b64 = BASE64_STANDARD.encode(first_16);
-
-		let needs_convert = !as_str.starts_with("Salted_") && !as_b64.starts_with("Salted_");
-		let is_normal_cbc =
-			!needs_convert && !as_str.starts_with("U2FsdGVk") && !as_b64.starts_with("U2FsdGVk");
-
-		if needs_convert && !is_normal_cbc {
-			*data = BASE64_STANDARD.decode(std::str::from_utf8(data)?)?
-		}
-
-		if !is_normal_cbc {
-			decrypt(&self.key, data)?;
-		} else {
-			let cipher =
-				cbc::Decryptor::<aes::Aes256>::new_from_slices(&self.key, &self.key[..IV_LEN])?;
-			data.copy_within(16.., 0);
-			data.truncate(data.len() - 16);
-			cipher.decrypt_padded_mut::<Pkcs7>(data)?;
-			let padding_len = data.last().copied().unwrap_or(0) as usize;
-			data.truncate(data.len() - padding_len);
-		}
-		Ok(())
+		decrypt_data(&self.key, data)
 	}
 }
 

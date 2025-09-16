@@ -1,3 +1,5 @@
+use aes_gcm::{AesGcm, Nonce, aead::AeadInPlace, aes::Aes256};
+use digest::consts::{U12, U16};
 use filen_types::crypto::EncryptedString;
 use rand::{Rng, rngs::ThreadRng};
 
@@ -44,4 +46,42 @@ pub fn generate_random_base64_values(len: usize) -> String {
 		);
 	}
 	values
+}
+
+pub(crate) type NonceSize = U12;
+pub(crate) const NONCE_SIZE: usize = 12;
+pub(crate) type TagSize = U16;
+pub(crate) const TAG_SIZE: usize = 16;
+
+pub(crate) fn encrypt_data(
+	cipher: &AesGcm<Aes256, NonceSize, TagSize>,
+	data: &mut Vec<u8>,
+) -> Result<(), ConversionError> {
+	let nonce: [u8; NONCE_SIZE] = rand::random();
+	let nonce = Nonce::from_slice(&nonce);
+	data.reserve_exact(NONCE_SIZE + TAG_SIZE);
+	cipher.encrypt_in_place(nonce, &[], data)?;
+	let original_len = data.len();
+	data.extend_from_within(original_len - NONCE_SIZE..);
+	data.copy_within(0..original_len - NONCE_SIZE, NONCE_SIZE);
+	data[0..NONCE_SIZE].copy_from_slice(nonce.as_slice());
+	Ok(())
+}
+
+pub(crate) fn decrypt_data(
+	cipher: &AesGcm<Aes256, NonceSize, TagSize>,
+	data: &mut Vec<u8>,
+) -> Result<(), ConversionError> {
+	if data.len() < NONCE_SIZE + TAG_SIZE {
+		return Err(ConversionError::InvalidStringLength(
+			data.len(),
+			NONCE_SIZE + TAG_SIZE,
+		));
+	}
+	let nonce: [u8; NONCE_SIZE] = data[0..NONCE_SIZE].try_into()?;
+	let nonce = Nonce::from_slice(&nonce);
+	data.copy_within(NONCE_SIZE.., 0);
+	data.truncate(data.len() - NONCE_SIZE);
+	cipher.decrypt_in_place(nonce, &[], data)?;
+	Ok(())
 }

@@ -43,7 +43,11 @@ fn get_compat_test_file(client: &Client, parent: &impl HasUUIDContents) -> (File
 			Utc,
 		))
 		.key(
-			FileKey::from_str_with_version(file_key_str, client.file_encryption_version()).unwrap(),
+			FileKey::from_string_with_version(
+				file_key_str.to_string(),
+				client.file_encryption_version(),
+			)
+			.unwrap(),
 		);
 
 	let mut test_str = String::new();

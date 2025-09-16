@@ -7,20 +7,16 @@ use aes_gcm::{
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString};
-use generic_array::typenum::{U12, U16};
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+
+use crate::crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize};
 
 use super::{
 	error::ConversionError,
 	shared::{CreateRandom, DataCrypter, MetaCrypter},
 };
-
-type NonceSize = U12;
-const NONCE_SIZE: usize = 12;
-type TagSize = U16;
-const TAG_SIZE: usize = 16;
 
 const NONCE_VALUES: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
@@ -50,31 +46,25 @@ impl AsRef<str> for BadNonce {
 }
 
 #[derive(Clone)]
-pub struct MasterKey {
-	pub key: String,
-	pub cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
+pub struct V2Key {
+	key: String,
+	cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
 }
 
-impl Serialize for MasterKey {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		serializer.serialize_str(&self.key)
+impl PartialEq for V2Key {
+	fn eq(&self, other: &Self) -> bool {
+		self.key == other.key
+	}
+}
+impl Eq for V2Key {}
+
+impl AsRef<str> for V2Key {
+	fn as_ref(&self) -> &str {
+		&self.key
 	}
 }
 
-impl<'de> Deserialize<'de> for MasterKey {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		let key = String::deserialize(deserializer)?;
-		MasterKey::try_from(key).map_err(serde::de::Error::custom)
-	}
-}
-
-impl MasterKey {
+impl V2Key {
 	fn decrypt_meta_into_v2(
 		&self,
 		meta: &EncryptedString,
@@ -99,51 +89,7 @@ impl MasterKey {
 	}
 }
 
-impl std::fmt::Debug for MasterKey {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let hash_key_str =
-			faster_hex::hex_string(sha2::Sha512::digest(self.key.as_bytes()).as_ref());
-		f.debug_struct("MasterKey")
-			.field("key (hashed)", &hash_key_str)
-			.finish()
-	}
-}
-
-impl PartialEq for MasterKey {
-	fn eq(&self, other: &Self) -> bool {
-		self.key == other.key
-	}
-}
-impl Eq for MasterKey {}
-
-impl TryFrom<String> for MasterKey {
-	type Error = ConversionError;
-	fn try_from(key: String) -> Result<Self, Self::Error> {
-		let mut derived_key = [0u8; 32];
-		pbkdf2::pbkdf2::<Hmac<Sha512>>(key.as_bytes(), key.as_bytes(), 1, &mut derived_key)?;
-
-		let cipher = <AesGcm<Aes256, NonceSize> as digest::KeyInit>::new(&derived_key.into());
-		Ok(Self {
-			key,
-			cipher: Box::new(cipher),
-		})
-	}
-}
-
-impl FromStr for MasterKey {
-	type Err = <MasterKey as TryFrom<String>>::Error;
-	fn from_str(key: &str) -> Result<Self, Self::Err> {
-		Self::try_from(key.to_string())
-	}
-}
-
-impl AsRef<str> for MasterKey {
-	fn as_ref(&self) -> &str {
-		&self.key
-	}
-}
-
-impl MetaCrypter for MasterKey {
+impl MetaCrypter for V2Key {
 	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
 		let nonce = BadNonce::new();
 		out.clear();
@@ -169,7 +115,7 @@ impl MetaCrypter for MasterKey {
 
 	fn decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		if meta.0.len() < NONCE_SIZE + 3 {
@@ -195,9 +141,78 @@ impl MetaCrypter for MasterKey {
 	}
 }
 
+impl DataCrypter for V2Key {
+	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+		super::shared::encrypt_data(&self.cipher, data)
+	}
+
+	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+		super::shared::decrypt_data(&self.cipher, data)
+	}
+}
+
+impl std::fmt::Debug for V2Key {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let hash_key_str =
+			faster_hex::hex_string(sha2::Sha512::digest(self.key.as_bytes()).as_ref());
+		f.debug_struct("V2Key")
+			.field("key (hashed)", &hash_key_str)
+			.finish()
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MasterKey(pub(crate) V2Key);
+
+impl Serialize for MasterKey {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		serializer.serialize_str(&self.0.key)
+	}
+}
+
+impl<'de> Deserialize<'de> for MasterKey {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let key = String::deserialize(deserializer)?;
+		MasterKey::try_from(key).map_err(serde::de::Error::custom)
+	}
+}
+
+impl FromStr for MasterKey {
+	type Err = <MasterKey as TryFrom<String>>::Error;
+	fn from_str(key: &str) -> Result<Self, Self::Err> {
+		Self::try_from(key.to_string())
+	}
+}
+
+impl AsRef<str> for MasterKey {
+	fn as_ref(&self) -> &str {
+		self.0.as_ref()
+	}
+}
+
+impl MetaCrypter for MasterKey {
+	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
+		self.0.encrypt_meta_into(meta, out)
+	}
+
+	fn decrypt_meta_into(
+		&self,
+		meta: &EncryptedString,
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
+		self.0.decrypt_meta_into(meta, out)
+	}
+}
+
 impl CreateRandom for MasterKey {
 	fn seeded_generate(_rng: rand::prelude::ThreadRng) -> Self {
-		Self::from_str(&super::shared::generate_random_base64_values(32))
+		Self::try_from(super::shared::generate_random_base64_values(32))
 			.expect("Failed to generate Master Key key")
 	}
 }
@@ -260,28 +275,40 @@ impl MetaCrypter for MasterKeys {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileKey(super::v3::EncryptionKey);
+impl TryFrom<String> for MasterKey {
+	type Error = ConversionError;
+	fn try_from(key: String) -> Result<Self, Self::Error> {
+		let mut derived_key = [0u8; 32];
+		pbkdf2::pbkdf2::<Hmac<Sha512>>(key.as_bytes(), key.as_bytes(), 1, &mut derived_key)?;
 
-impl FromStr for FileKey {
-	type Err = ConversionError;
-	fn from_str(key: &str) -> Result<Self, ConversionError> {
+		let cipher = <AesGcm<Aes256, NonceSize> as digest::KeyInit>::new(&derived_key.into());
+		Ok(Self(V2Key {
+			key,
+			cipher: Box::new(cipher),
+		}))
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileKey(pub(crate) V2Key);
+
+impl TryFrom<String> for FileKey {
+	type Error = ConversionError;
+	fn try_from(key: String) -> Result<Self, Self::Error> {
 		if key.len() != 32 {
 			return Err(ConversionError::InvalidStringLength(key.len(), 32));
 		}
-		let mut bytes = [0u8; 32];
-		bytes.copy_from_slice(key.as_bytes());
-		let key = super::v3::EncryptionKey::new(bytes);
-		Ok(Self(key))
+		let cipher = <AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(key.as_bytes().into());
+		Ok(Self(V2Key {
+			key,
+			cipher: Box::new(cipher),
+		}))
 	}
 }
 
 impl AsRef<str> for FileKey {
 	fn as_ref(&self) -> &str {
-		unsafe {
-			// SAFETY: The key is guaranteed to be 32 bytes, built from a utf8 string so it can be safely converted to a str.
-			std::str::from_utf8_unchecked(&self.0.bytes)
-		}
+		self.0.as_ref()
 	}
 }
 
@@ -299,8 +326,8 @@ impl<'de> Deserialize<'de> for FileKey {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let key = <&str>::deserialize(deserializer)?;
-		FileKey::from_str(key).map_err(serde::de::Error::custom)
+		let key = String::deserialize(deserializer)?;
+		FileKey::try_from(key).map_err(serde::de::Error::custom)
 	}
 }
 
@@ -316,11 +343,10 @@ impl DataCrypter for FileKey {
 
 impl CreateRandom for FileKey {
 	fn seeded_generate(_rng: rand::prelude::ThreadRng) -> Self {
-		Self::from_str(&super::shared::generate_random_base64_values(32))
+		Self::try_from(super::shared::generate_random_base64_values(32))
 			.expect("Failed to generate V2 key")
 	}
 }
-
 pub(crate) fn hash(name: &[u8]) -> [u8; 20] {
 	let mut temp = [0u8; 128];
 	// SAFETY: The length of hashed_named must be 2x the length of a Sha512 hash, which is 128 bytes

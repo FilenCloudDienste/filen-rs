@@ -62,7 +62,7 @@ impl<'de> DeserializeSeed<'de> for FileKeySeed {
 				Ok(FileKey::V1(v1_key))
 			}
 			FileEncryptionVersion::V2 => {
-				let v2_key = v2::FileKey::from_str(&key).map_err(serde::de::Error::custom)?;
+				let v2_key = v2::FileKey::try_from(key).map_err(serde::de::Error::custom)?;
 				Ok(FileKey::V2(v2_key))
 			}
 			FileEncryptionVersion::V3 => {
@@ -74,14 +74,14 @@ impl<'de> DeserializeSeed<'de> for FileKeySeed {
 }
 
 impl FileKey {
-	pub fn from_str_with_version(
-		key: &str,
+	pub fn from_string_with_version(
+		key: String,
 		version: FileEncryptionVersion,
 	) -> Result<Self, ConversionError> {
 		match version {
-			FileEncryptionVersion::V1 => v1::FileKey::from_str(key).map(FileKey::V1),
-			FileEncryptionVersion::V2 => v2::FileKey::from_str(key).map(FileKey::V2),
-			FileEncryptionVersion::V3 => v3::EncryptionKey::from_str(key).map(FileKey::V3),
+			FileEncryptionVersion::V1 => v1::FileKey::from_str(&key).map(FileKey::V1),
+			FileEncryptionVersion::V2 => v2::FileKey::try_from(key).map(FileKey::V2),
+			FileEncryptionVersion::V3 => v3::EncryptionKey::from_str(&key).map(FileKey::V3),
 		}
 	}
 }
@@ -109,12 +109,12 @@ mod tests {
 
 	#[test]
 	fn stringify_file_key() {
-		assert!(FileKey::from_str_with_version("ab", FileEncryptionVersion::V2).is_err());
+		assert!(FileKey::from_string_with_version("ab".into(), FileEncryptionVersion::V2).is_err());
 		let a64 = "a".repeat(64);
 		let a32 = "a".repeat(32);
-		let v2 = FileKey::from_str_with_version(&a32, FileEncryptionVersion::V2).unwrap();
+		let v2 = FileKey::from_string_with_version(a32.clone(), FileEncryptionVersion::V2).unwrap();
 		assert_eq!(v2.to_str(), a32);
-		let v3 = FileKey::from_str_with_version(&a64, FileEncryptionVersion::V3).unwrap();
+		let v3 = FileKey::from_string_with_version(a64.clone(), FileEncryptionVersion::V3).unwrap();
 		assert_eq!(v3.to_str(), a64);
 	}
 }

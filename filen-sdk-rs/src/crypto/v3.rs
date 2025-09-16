@@ -7,20 +7,16 @@ use aes_gcm::{
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::crypto::{DerivedPassword, EncryptedString};
-use generic_array::typenum::{U12, U16};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+
+use crate::crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize};
 
 use super::{
 	error::ConversionError,
 	shared::{CreateRandom, DataCrypter, MetaCrypter},
 };
-
-type NonceSize = U12;
-const NONCE_SIZE: usize = 12;
-type TagSize = U16;
-const TAG_SIZE: usize = 16;
 
 pub const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4, Some(64)) {
 	Ok(params) => params,
@@ -171,30 +167,11 @@ impl MetaCrypter for EncryptionKey {
 
 impl DataCrypter for EncryptionKey {
 	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		let nonce: [u8; NONCE_SIZE] = rand::random();
-		let nonce = Nonce::from_slice(&nonce);
-		data.reserve_exact(NONCE_SIZE + TAG_SIZE);
-		self.cipher.encrypt_in_place(nonce, &[], data)?;
-		let original_len = data.len();
-		data.extend_from_within(original_len - NONCE_SIZE..);
-		data.copy_within(0..original_len - NONCE_SIZE, NONCE_SIZE);
-		data[0..NONCE_SIZE].copy_from_slice(nonce.as_slice());
-		Ok(())
+		super::shared::encrypt_data(&self.cipher, data)
 	}
 
 	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		if data.len() < NONCE_SIZE + TAG_SIZE {
-			return Err(ConversionError::InvalidStringLength(
-				data.len(),
-				NONCE_SIZE + TAG_SIZE,
-			));
-		}
-		let nonce: [u8; NONCE_SIZE] = data[0..NONCE_SIZE].try_into()?;
-		let nonce = Nonce::from_slice(&nonce);
-		data.copy_within(NONCE_SIZE.., 0);
-		data.truncate(data.len() - NONCE_SIZE);
-		self.cipher.decrypt_in_place(nonce, &[], data)?;
-		Ok(())
+		super::shared::decrypt_data(&self.cipher, data)
 	}
 }
 
