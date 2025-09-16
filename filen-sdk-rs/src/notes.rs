@@ -1,4 +1,4 @@
-use std::{borrow::Cow, str::FromStr};
+use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -15,14 +15,15 @@ use crate::{
 	Error, ErrorKind, api,
 	auth::Client,
 	crypto::{
+		notes::NoteKey,
 		shared::{CreateRandom, MetaCrypter},
-		v3::EncryptionKey,
 	},
 	error::MetadataWasNotDecryptedError,
 };
 
 const EMPTY_CHECKLIST_NOTE: &str = r#"<ul data-checked="false"><li><br></li></ul>"#;
 
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct NoteTag {
 	pub uuid: UuidStr,
 	// none if decryption fails
@@ -69,6 +70,14 @@ impl NoteTag {
 	}
 }
 
+struct NoteParticipantParts {
+	pub user_id: u64,
+	pub email: String,
+	pub avatar: Option<String>,
+	pub nick_name: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct NoteParticipant {
 	pub user_id: u64,
 	pub is_owner: bool,
@@ -79,6 +88,7 @@ pub struct NoteParticipant {
 	pub added_timestamp: DateTime<Utc>,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Note {
 	uuid: UuidStr,
 	owner_id: u64,
@@ -88,7 +98,7 @@ pub struct Note {
 	tags: Vec<NoteTag>,
 	note_type: NoteType,
 	// none if decryption fails
-	encryption_key: Option<EncryptionKey>,
+	encryption_key: Option<NoteKey>,
 	// none if decryption fails
 	title: Option<String>,
 	// none if decryption fails
@@ -98,6 +108,24 @@ pub struct Note {
 	created_timestamp: DateTime<Utc>,
 	edited_timestamp: DateTime<Utc>,
 	participants: Vec<NoteParticipant>,
+}
+
+impl Note {
+	pub fn uuid(&self) -> &UuidStr {
+		&self.uuid
+	}
+
+	pub fn favorited(&self) -> bool {
+		self.favorite
+	}
+
+	pub fn pinned(&self) -> bool {
+		self.pinned
+	}
+
+	pub fn note_type(&self) -> NoteType {
+		self.note_type
+	}
 }
 
 #[derive(Clone)]
@@ -113,7 +141,7 @@ pub struct NoteHistory {
 impl NoteHistory {
 	fn decrypt_with_key(
 		note_history: &filen_types::api::v3::notes::history::NoteHistory<'_>,
-		note_key: &EncryptionKey,
+		note_key: &NoteKey,
 		outer_tmp_vec: &mut Vec<u8>,
 	) -> Self {
 		let tmp_vec = std::mem::take(outer_tmp_vec);
@@ -127,7 +155,7 @@ impl NoteHistory {
 					}
 				},
 				Err((e, s_vec)) => {
-					log::error!("Failed to decrypt note preview: {e}");
+					log::error!("Failed to decrypt note history preview: {e}");
 					(None, s_vec)
 				}
 			};
@@ -161,8 +189,8 @@ impl NoteHistory {
 }
 
 #[derive(Deserialize, Serialize)]
-struct NoteKey<'a> {
-	key: Cow<'a, EncryptionKey>,
+struct NoteKeyStruct<'a> {
+	key: Cow<'a, NoteKey>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -186,10 +214,17 @@ struct NoteContent<'a> {
 }
 
 impl Client {
+	pub async fn is_shared(
+		&self,
+		uuid: UuidStr,
+	) -> Result<api::v3::item::shared::Response<'static>, Error> {
+		api::v3::item::shared::post(self.client(), &api::v3::item::shared::Request { uuid }).await
+	}
+
 	fn decrypt_note_key(
 		&self,
 		note: &filen_types::api::v3::notes::Note<'_>,
-	) -> Result<EncryptionKey, Error> {
+	) -> Result<NoteKey, Error> {
 		let participant = note
 			.participants
 			.iter()
@@ -198,13 +233,16 @@ impl Client {
 				Error::custom(ErrorKind::Response, "User is not a participant in the note")
 			})?;
 
-		let key = crate::crypto::rsa::decrypt_with_private_key(
-			self.private_key(),
-			&participant.metadata,
-		)?;
+		let key =
+			crate::crypto::rsa::decrypt_with_private_key(self.private_key(), &participant.metadata)
+				.map_err(|e| {
+					log::error!("Failed to decrypt note key for note {}: {e}", note.uuid);
+					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note key"))
+				})?;
 		let key_str = str::from_utf8(&key)
 			.map_err(|_| Error::custom(ErrorKind::Response, "Failed to parse note key as UTF-8"))?;
-		Ok(EncryptionKey::from_str(key_str)?)
+		let key_struct: NoteKeyStruct = serde_json::from_str(key_str)?;
+		Ok(key_struct.key.into_owned())
 	}
 
 	fn decrypt_note(
@@ -230,17 +268,21 @@ impl Client {
 				}
 			};
 
-			let (preview, tmp_vec) = match key.decrypt_meta_into(&note.preview, tmp_vec) {
-				Ok(s) => match serde_json::from_str::<NotePreview>(&s) {
-					Ok(np) => (Some(np.preview.into_owned()), s.into_bytes()),
-					Err(e) => {
-						log::error!("Failed to parse note preview JSON: {e}");
-						(None, s.into_bytes())
+			let (preview, tmp_vec) = if note.preview.0.is_empty() {
+				(Some(String::new()), tmp_vec)
+			} else {
+				match key.decrypt_meta_into(&note.preview, tmp_vec) {
+					Ok(s) => match serde_json::from_str::<NotePreview>(&s) {
+						Ok(np) => (Some(np.preview.into_owned()), s.into_bytes()),
+						Err(e) => {
+							log::error!("Failed to parse note preview JSON: {e}");
+							(None, s.into_bytes())
+						}
+					},
+					Err((e, s_vec)) => {
+						log::error!("Failed to decrypt note preview: {e}");
+						(None, s_vec)
 					}
-				},
-				Err((e, s_vec)) => {
-					log::error!("Failed to decrypt note preview: {e}");
-					(None, s_vec)
 				}
 			};
 
@@ -309,10 +351,11 @@ impl Client {
 		contact_uuid: ContactUuid,
 		write: bool,
 		public_key: &RsaPublicKey,
+		note_participant_parts: NoteParticipantParts,
 	) -> Result<(), Error> {
 		let data = crate::crypto::rsa::encrypt_with_public_key(
 			public_key,
-			serde_json::to_string(&NoteKey {
+			serde_json::to_string(&NoteKeyStruct {
 				key: Cow::Borrowed(
 					note.encryption_key
 						.as_ref()
@@ -325,7 +368,7 @@ impl Client {
 			Error::custom_with_source(ErrorKind::Conversion, e, Some("add participant"))
 		})?;
 
-		crate::api::v3::notes::participants::add::post(
+		let response = crate::api::v3::notes::participants::add::post(
 			self.client(),
 			&crate::api::v3::notes::participants::add::Request {
 				uuid: note.uuid,
@@ -335,6 +378,16 @@ impl Client {
 			},
 		)
 		.await?;
+
+		note.participants.push(NoteParticipant {
+			user_id: note_participant_parts.user_id,
+			is_owner: note_participant_parts.user_id == note.owner_id,
+			email: note_participant_parts.email,
+			avatar: note_participant_parts.avatar,
+			nick_name: note_participant_parts.nick_name,
+			permissions_write: write,
+			added_timestamp: response.timestamp,
+		});
 
 		Ok(())
 	}
@@ -350,6 +403,12 @@ impl Client {
 			ContactUuid::Uuid(contact.uuid),
 			write,
 			&contact.public_key,
+			NoteParticipantParts {
+				user_id: contact.user_id,
+				email: contact.email.clone().into_owned(),
+				avatar: contact.avatar.clone().map(|a| a.into_owned()),
+				nick_name: contact.nick_name.clone().into_owned(),
+			},
 		)
 		.await
 	}
@@ -396,8 +455,8 @@ impl Client {
 	pub async fn create_note(&self, title: Option<String>) -> Result<Note, Error> {
 		let uuid = UuidStr::new_v4();
 		let title = title.unwrap_or_else(|| Utc::now().format("%a %b %d %Y %X").to_string());
-		let key = EncryptionKey::generate();
-		let key_struct = NoteKey {
+		let key = NoteKey::generate();
+		let key_struct = NoteKeyStruct {
 			key: Cow::Borrowed(&key),
 		};
 		let title_struct = NoteTitle {
@@ -408,6 +467,8 @@ impl Client {
 			.crypter()
 			.encrypt_meta(&serde_json::to_string(&key_struct)?);
 		let title_string = key.encrypt_meta(&serde_json::to_string(&title_struct)?);
+
+		let _lock = self.lock_notes().await?;
 
 		let response = api::v3::notes::create::post(
 			self.client(),
@@ -428,7 +489,7 @@ impl Client {
 			note_type: NoteType::Text,
 			encryption_key: Some(key),
 			title: Some(title),
-			preview: None,
+			preview: Some(String::new()),
 			trash: false,
 			archive: false,
 			created_timestamp: response.created_timestamp,
@@ -436,8 +497,20 @@ impl Client {
 			participants: vec![],
 		};
 
-		self.inner_add_note_participant(&mut new, ContactUuid::Owner, true, self.public_key())
-			.await?;
+		self.inner_add_note_participant(
+			&mut new,
+			ContactUuid::Owner,
+			true,
+			self.public_key(),
+			NoteParticipantParts {
+				user_id: self.user_id,
+				email: self.email().to_string(),
+				// todo, remove these when participants/add returns them
+				avatar: None,
+				nick_name: String::new(),
+			},
+		)
+		.await?;
 
 		Ok(new)
 	}
@@ -508,6 +581,7 @@ impl Client {
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)?;
 
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::content::edit::post(
 			self.client(),
 			&api::v3::notes::content::edit::Request {
@@ -545,6 +619,7 @@ impl Client {
 				.expect("Failed to serialize note title (should never happen)"),
 			);
 
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::title::edit::post(
 			self.client(),
 			&api::v3::notes::title::edit::Request {
@@ -558,6 +633,7 @@ impl Client {
 	}
 
 	pub async fn delete_note(&self, note: Note) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::delete::post(
 			self.client(),
 			&api::v3::notes::delete::Request { uuid: note.uuid },
@@ -566,6 +642,7 @@ impl Client {
 	}
 
 	pub async fn archive_note(&self, note: &mut Note) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::archive::post(
 			self.client(),
 			&api::v3::notes::archive::Request { uuid: note.uuid },
@@ -576,6 +653,7 @@ impl Client {
 	}
 
 	pub async fn trash_note(&self, note: &mut Note) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::trash::post(
 			self.client(),
 			&api::v3::notes::trash::Request { uuid: note.uuid },
@@ -586,6 +664,7 @@ impl Client {
 	}
 
 	pub async fn set_note_favorited(&self, note: &mut Note, favorite: bool) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::favorite::post(
 			self.client(),
 			&api::v3::notes::favorite::Request {
@@ -599,6 +678,7 @@ impl Client {
 	}
 
 	pub async fn set_note_pinned(&self, note: &mut Note, pinned: bool) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::pinned::post(
 			self.client(),
 			&api::v3::notes::pinned::Request {
@@ -613,6 +693,7 @@ impl Client {
 
 	/// Restore a note from the archive or trash.
 	pub async fn restore_note(&self, note: &mut Note) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::restore::post(
 			self.client(),
 			&api::v3::notes::restore::Request { uuid: note.uuid },
@@ -624,6 +705,7 @@ impl Client {
 	}
 
 	pub async fn duplicate_note(&self, note: &mut Note) -> Result<Note, Error> {
+		let _lock = self.lock_notes().await?;
 		let content = self.get_note_content(note).await?;
 
 		let mut new = self.create_note(note.title.clone()).await?;
@@ -665,6 +747,7 @@ impl Client {
 		note: &mut Note,
 		history: NoteHistory,
 	) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::history::restore::post(
 			self.client(),
 			&api::v3::notes::history::restore::Request {
@@ -684,6 +767,7 @@ impl Client {
 	}
 
 	pub async fn add_tag_to_note(&self, note: &mut Note, tag: NoteTag) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::tag::post(
 			self.client(),
 			&api::v3::notes::tag::Request {
@@ -702,6 +786,7 @@ impl Client {
 	}
 
 	pub async fn remove_tag_from_note(&self, note: &mut Note, tag: &NoteTag) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::untag::post(
 			self.client(),
 			&api::v3::notes::untag::Request {
@@ -744,6 +829,7 @@ impl Client {
 			.crypter()
 			.encrypt_meta(&serde_json::to_string(&name_struct)?);
 
+		let _lock = self.lock_notes().await?;
 		let response = api::v3::notes::tags::create::post(
 			self.client(),
 			&api::v3::notes::tags::create::Request { name: name_string },
@@ -766,6 +852,7 @@ impl Client {
 				name: Cow::Borrowed(&new_name),
 			})?);
 
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::tags::rename::post(
 			self.client(),
 			&api::v3::notes::tags::rename::Request {
@@ -783,6 +870,7 @@ impl Client {
 		tag: &mut NoteTag,
 		favorite: bool,
 	) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::tags::favorite::post(
 			self.client(),
 			&api::v3::notes::tags::favorite::Request {
@@ -796,6 +884,7 @@ impl Client {
 	}
 
 	pub async fn delete_note_tag(&self, tag: NoteTag) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		api::v3::notes::tags::delete::post(
 			self.client(),
 			&api::v3::notes::tags::delete::Request { uuid: tag.uuid },

@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::rsa::RSAEncryptedString, fs::UuidStr};
@@ -14,6 +15,13 @@ pub struct Request<'a> {
 	pub contact_uuid: ContactUuid,
 	pub metadata: RSAEncryptedString<'a>,
 	pub permissions_write: bool,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Response {
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
