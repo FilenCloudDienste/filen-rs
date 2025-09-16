@@ -69,6 +69,7 @@ pub struct Note<'a> {
 	pub favorite: bool,
 	pub pinned: bool,
 	pub tags: Vec<NoteTag<'a>>,
+	#[serde(rename = "type")]
 	pub note_type: NoteType,
 	pub metadata: EncryptedString<'a>,
 	pub title: EncryptedString<'a>,
