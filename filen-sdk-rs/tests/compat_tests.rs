@@ -1,16 +1,18 @@
 use core::panic;
-use std::fmt::Write;
+use std::{fmt::Write, sync::Arc};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
+	connect::fs::SharedDirectory,
 	crypto::file::FileKey,
 	fs::{
-		FSObject, HasUUID, NonRootFSObject,
+		FSObject, HasName, HasUUID, NonRootFSObject,
 		dir::{HasUUIDContents, RemoteDirectory},
 		file::FileBuilder,
 	},
+	sync::lock::ResourceLock,
 };
 use filen_types::auth::{AuthVersion, FileEncryptionVersion};
 
@@ -98,6 +100,47 @@ fn get_name_splitter_test_value() -> NameSplitterFile {
 	}
 }
 
+async fn get_contact(
+	client: &Client,
+) -> (
+	filen_types::api::v3::contacts::Contact<'static>,
+	Arc<ResourceLock>,
+	Arc<ResourceLock>,
+) {
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let lock1 = client
+		.acquire_lock_with_default("test:contact")
+		.await
+		.unwrap();
+	let lock2 = share_client
+		.acquire_lock_with_default("test:contact")
+		.await
+		.unwrap();
+
+	let contacts = client.get_contacts().await.unwrap();
+	for contact in contacts {
+		if contact.email == share_client.email() {
+			return (contact, lock1, lock2);
+		}
+	}
+	let contact_uuid = client
+		.send_contact_request(share_client.email())
+		.await
+		.unwrap();
+	share_client
+		.accept_contact_request(contact_uuid)
+		.await
+		.unwrap();
+
+	let contacts = client.get_contacts().await.unwrap();
+	for contact in contacts {
+		if contact.email == share_client.email() {
+			return (contact, lock1, lock2);
+		}
+	}
+	panic!("Contact not found after sending request");
+}
+
 #[shared_test_runtime]
 async fn make_rs_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -124,6 +167,9 @@ async fn make_rs_compat_dir() {
 
 	let empty_file = client.make_file_builder("empty.txt", &compat_dir).build();
 	client.upload_file(empty_file.into(), b"").await.unwrap();
+
+	let (contact, _lock1, _lock2) = get_contact(client).await;
+	client.share_dir(&compat_dir, &contact).await.unwrap();
 
 	let small_file = client.make_file_builder("small.txt", &compat_dir).build();
 	client
@@ -169,10 +215,92 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 }
 
-async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language: &str) {
+async fn prep_shared_compat_tests(client: &Client, language: &str, shortened: &str) {
+	let share_client = &test_utils::SHARE_RESOURCES.client().await;
+
+	let _lock1 = client
+		.acquire_lock_with_default("test:contact")
+		.await
+		.unwrap();
+	let _lock2 = share_client
+		.acquire_lock_with_default("test:contact")
+		.await
+		.unwrap();
+
+	let share_dirs = share_client
+		.list_in_shared()
+		.await
+		.unwrap()
+		.0
+		.into_iter()
+		.filter(|d| d.get_dir().name() == Some(&format!("compat-{shortened}")))
+		.collect::<Vec<_>>();
+
+	assert_eq!(
+		share_dirs.len(),
+		3,
+		"Expected 3 compat-{shortened} shares (one for each auth version)"
+	);
+
+	for dir in share_dirs {
+		run_shared_compat_tests(share_client, dir, language).await;
+	}
+}
+
+async fn run_shared_compat_tests(
+	share_client: &Client,
+	compat_dir: SharedDirectory,
+	language: &str,
+) {
+	let (dirs, files) = share_client
+		.list_in_shared_dir(compat_dir.get_dir())
+		.await
+		.unwrap();
+	assert!(dirs.iter().any(|d| d.get_dir().name() == Some("dir")));
+
+	let Some(empty_file) = files
+		.iter()
+		.find(|f| f.get_file().name() == Some("empty.txt"))
+	else {
+		panic!("empty.txt not found in shared compat dir for {language}");
+	};
+
+	assert_eq!(
+		share_client
+			.download_file(empty_file.get_file())
+			.await
+			.unwrap()
+			.len(),
+		0,
+		"empty.txt should be empty"
+	);
+
+	let Some(small_file) = files
+		.iter()
+		.find(|f| f.get_file().name() == Some("small.txt"))
+	else {
+		panic!("small.txt not found in shared compat dir for {language}");
+	};
+
+	assert_eq!(
+		share_client
+			.download_file(small_file.get_file())
+			.await
+			.unwrap(),
+		format!("Hello World from {language}!").as_bytes(),
+		"small.txt contents mismatch"
+	);
+}
+
+async fn run_compat_tests(
+	client: &Client,
+	compat_dir: RemoteDirectory,
+	language: &str,
+	shortened: &str,
+) {
 	match client.find_item_in_dir(&compat_dir, "dir").await.unwrap() {
 		Some(NonRootFSObject::Dir(_)) => {}
-		_ => panic!("dir not found in compat-go directory"),
+		_ => panic!("dir not found in compat-{shortened} directory"),
 	}
 	match client
 		.find_item_in_dir(&compat_dir, "empty.txt")
@@ -186,7 +314,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 				"empty.txt should be empty"
 			);
 		}
-		_ => panic!("empty.txt not found in compat-go directory"),
+		_ => panic!("empty.txt not found in compat-{shortened} directory"),
 	}
 	match client
 		.find_item_in_dir(&compat_dir, "small.txt")
@@ -200,7 +328,7 @@ async fn run_compat_tests(client: &Client, compat_dir: RemoteDirectory, language
 				"small.txt contents mismatch"
 			);
 		}
-		_ => panic!("small.txt not found in compat-go directory"),
+		_ => panic!("small.txt not found in compat-{shortened} directory"),
 	}
 
 	match client
@@ -271,17 +399,15 @@ async fn check_go_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 
-	let _lock = client
-		.acquire_lock("test:go", std::time::Duration::from_secs(1), 600)
-		.await
-		.unwrap();
+	let _lock = client.acquire_lock_with_default("test:go").await.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-go").await.unwrap() {
 		Some(FSObject::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
 	};
 
-	run_compat_tests(client, compat_dir, "Go").await;
+	run_compat_tests(client, compat_dir, "Go", "go").await;
+	prep_shared_compat_tests(client, "Go", "go").await;
 }
 
 #[shared_test_runtime]
@@ -289,15 +415,14 @@ async fn check_ts_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 
-	let _lock = client
-		.acquire_lock("test:ts", std::time::Duration::from_secs(1), 600)
-		.await
-		.unwrap();
+	let _lock = client.acquire_lock_with_default("test:ts").await.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-ts").await.unwrap() {
 		Some(FSObject::Dir(dir)) => dir.into_owned(),
-		_ => panic!("compat-go directory not found"),
+		_ => panic!("compat-ts directory not found"),
 	};
 
-	run_compat_tests(client, compat_dir, "TypeScript").await;
+	run_compat_tests(client, compat_dir, "TypeScript", "ts").await;
+	// todo uncomment when TS compat dirs are shared
+	// prep_shared_compat_tests(client, "TypeScript", "ts").await;
 }

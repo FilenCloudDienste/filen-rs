@@ -142,6 +142,7 @@ impl SharedDirectory {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedFile {
 	pub(crate) file: RemoteRootFile,
 	pub(crate) sharing_role: SharingRole,

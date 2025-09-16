@@ -283,7 +283,7 @@ async fn contact_interactions() {
 async fn set_up_contact_no_add<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
-) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
+) -> (Arc<ResourceLock>, Arc<ResourceLock>, usize, usize) {
 	let lock1 = client
 		.acquire_lock_with_default("test:contact")
 		.await
@@ -292,6 +292,9 @@ async fn set_up_contact_no_add<'a>(
 		.acquire_lock_with_default("test:contact")
 		.await
 		.unwrap();
+
+	let mut num_shared_out = 0;
+	let mut num_shared_in = 0;
 
 	let _ = futures::join!(
 		async {
@@ -318,7 +321,14 @@ async fn set_up_contact_no_add<'a>(
 			let (out_dirs, out_files) = client.list_out_shared(None).await.unwrap();
 			let mut out_futures = out_dirs
 				.into_iter()
-				.map(|d| (*d.get_dir().uuid(), d.get_source_id()))
+				.filter_map(|d| {
+					if d.get_dir().name().unwrap().starts_with("compat-") {
+						num_shared_out += 1;
+						None
+					} else {
+						Some((*d.get_dir().uuid(), d.get_source_id()))
+					}
+				})
 				.chain(
 					out_files
 						.into_iter()
@@ -335,7 +345,14 @@ async fn set_up_contact_no_add<'a>(
 
 			let mut in_futures = in_dirs
 				.into_iter()
-				.map(|d| *d.get_dir().uuid())
+				.filter_map(|d| {
+					if d.get_dir().name().unwrap().starts_with("compat-") {
+						num_shared_in += 1;
+						None
+					} else {
+						Some(*d.get_dir().uuid())
+					}
+				})
 				.chain(in_files.into_iter().map(|f| *f.get_file().uuid()))
 				.map(|uuid| async move {
 					let _ = share_client.remove_shared_link_in(uuid).await;
@@ -365,14 +382,15 @@ async fn set_up_contact_no_add<'a>(
 		}
 	);
 	tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-	(lock1, lock2)
+	(lock1, lock2, num_shared_out, num_shared_in)
 }
 
 async fn set_up_contact<'a>(
 	client: &'a Client,
 	share_client: &'a Client,
-) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
-	let (lock1, lock2) = set_up_contact_no_add(client, share_client).await;
+) -> (Arc<ResourceLock>, Arc<ResourceLock>, usize, usize) {
+	let (lock1, lock2, num_shared_out, num_shared_in) =
+		set_up_contact_no_add(client, share_client).await;
 
 	let request_uuid = client
 		.send_contact_request(share_client.email())
@@ -384,7 +402,7 @@ async fn set_up_contact<'a>(
 		.await
 		.unwrap();
 
-	(lock1, lock2)
+	(lock1, lock2, num_shared_out, num_shared_in)
 }
 
 #[shared_test_runtime]
@@ -412,7 +430,8 @@ async fn share_dir() {
 	let file = client.make_file_builder("a.txt", &sub_dir).build();
 	client.upload_file(file.into(), b"").await.unwrap();
 
-	let _lock = set_up_contact(client, share_client).await;
+	let (_lock1, _lock2, num_shared_out, num_shared_in) =
+		set_up_contact(client, share_client).await;
 
 	let contacts = client.get_contacts().await.unwrap();
 	assert_eq!(contacts.len(), 1);
@@ -421,7 +440,7 @@ async fn share_dir() {
 	client.share_dir(&dir, contact).await.unwrap();
 
 	let (shared_dirs_out, _) = client.list_out_shared(None).await.unwrap();
-	assert_eq!(shared_dirs_out.len(), 1);
+	assert_eq!(shared_dirs_out.len(), num_shared_out + 1);
 	assert!(
 		shared_dirs_out
 			.iter()
@@ -429,9 +448,19 @@ async fn share_dir() {
 	);
 
 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
-	assert_eq!(shared_dirs_in.len(), 1);
+	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
 
-	assert_eq!(shared_dirs_in[0].get_dir(), shared_dirs_out[0].get_dir());
+	let shared_dir_in = shared_dirs_in
+		.iter()
+		.find(|d| d.get_dir().uuid() == dir.uuid())
+		.unwrap();
+
+	let shared_dir_out = shared_dirs_out
+		.iter()
+		.find(|d| d.get_dir().uuid() == dir.uuid())
+		.unwrap();
+
+	assert_eq!(shared_dir_in.get_dir(), shared_dir_out.get_dir());
 
 	let (shared_dirs_out, shared_files_out) =
 		client.list_out_shared_dir(&dir, contact).await.unwrap();
@@ -442,7 +471,7 @@ async fn share_dir() {
 	assert_eq!(shared_files_out.len(), 1);
 	assert_eq!(shared_files_in.len(), 1);
 
-	assert_eq!(shared_dirs_out[0].get_dir(), shared_dirs_in[0].get_dir());
+	assert_eq!(shared_dirs_in[0].get_dir(), shared_dirs_out[0].get_dir());
 	assert_eq!(
 		shared_files_out[0].get_file(),
 		shared_files_in[0].get_file()
@@ -486,8 +515,14 @@ async fn share_dir() {
 		.await
 		.unwrap();
 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
-	assert_eq!(shared_dirs_in.len(), 1);
-	assert_eq!(shared_dirs_in[0].get_dir().name().unwrap(), "new_name");
+	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
+
+	let shared_dir_in = shared_dirs_in
+		.iter()
+		.find(|d| d.get_dir().uuid() == dir.uuid())
+		.unwrap();
+
+	assert_eq!(shared_dir_in.get_dir().name().unwrap(), "new_name");
 
 	let (_, shared_files_in) = share_client.list_in_shared_dir(&dir).await.unwrap();
 	assert_eq!(shared_files_in.len(), 1);
@@ -506,7 +541,7 @@ async fn share_file() {
 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
 	let share_client = &share_resources.client;
 
-	let _lock = set_up_contact(client, share_client).await;
+	let _locks = set_up_contact(client, share_client).await;
 
 	let file = client.make_file_builder("a.txt", test_dir).build();
 	let mut file = client
@@ -565,7 +600,8 @@ async fn remove_link() {
 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
 	let share_client = &share_resources.client;
 
-	let _lock = set_up_contact(client, share_client).await;
+	let (_lock1, _lock2, num_shared_out, num_shared_in) =
+		set_up_contact(client, share_client).await;
 
 	let out_dir = client
 		.create_dir(test_dir, "out".to_string())
@@ -581,10 +617,10 @@ async fn remove_link() {
 	client.share_dir(&in_dir, contact).await.unwrap();
 
 	let (shared_dirs_out, _) = client.list_out_shared(None).await.unwrap();
-	assert_eq!(shared_dirs_out.len(), 2);
+	assert_eq!(shared_dirs_out.len(), num_shared_out + 2);
 
 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
-	assert_eq!(shared_dirs_in.len(), 2);
+	assert_eq!(shared_dirs_in.len(), num_shared_in + 2);
 	client
 		.remove_shared_link_out(*out_dir.uuid(), contact.user_id)
 		.await
@@ -597,9 +633,9 @@ async fn remove_link() {
 	tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 
 	let shared_dirs_out = client.list_out_shared(None).await.unwrap().0;
-	assert_eq!(shared_dirs_out.len(), 0);
+	assert_eq!(shared_dirs_out.len(), num_shared_out);
 	let shared_dirs_in = share_client.list_in_shared().await.unwrap().0;
-	assert_eq!(shared_dirs_in.len(), 0);
+	assert_eq!(shared_dirs_in.len(), num_shared_in);
 }
 
 #[shared_test_runtime]
