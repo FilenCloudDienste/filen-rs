@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{crypto::EncryptedString, fs::UuidStr};
 
-pub const ENDPOINT: &str = "/v3/chat/messages";
+pub const ENDPOINT: &str = "v3/chat/messages";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{crypto::EncryptedString, fs::UuidStr};
 
-pub const ENDPOINT: &str = "/v3/chat/conversations";
+pub const ENDPOINT: &str = "v3/chat/conversations";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(transparent)]

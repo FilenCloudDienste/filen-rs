@@ -82,7 +82,7 @@ pub struct Note<'a> {
 	pub participants: Vec<NoteParticipant<'a>>,
 }
 
-pub const ENDPOINT: &str = "/v3/notes";
+pub const ENDPOINT: &str = "v3/notes";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(transparent)]
