@@ -371,6 +371,7 @@ impl Client {
 	/// If no match is found, returns None.
 	pub async fn find_item_in_dir(
 		&self,
+		// TODO, disallow shared dirs here
 		dir: &dyn HasContents,
 		name_or_uuid: &str,
 	) -> Result<Option<NonRootFSObject<'static>>, Error> {

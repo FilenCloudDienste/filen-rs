@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
@@ -12,4 +13,11 @@ pub struct Request<'a> {
 	pub content: EncryptedString<'a>,
 	#[serde(rename = "type")]
 	pub note_type: NoteType,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Response {
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub timestamp: DateTime<Utc>,
 }

@@ -16,7 +16,5 @@ pub struct Request<'a> {
 pub struct Response {
 	pub uuid: UuidStr,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
-	pub edited_timestamp: DateTime<Utc>,
-	#[serde(with = "crate::serde::time::seconds_or_millis")]
-	pub created_timestamp: DateTime<Utc>,
+	pub timestamp: DateTime<Utc>,
 }

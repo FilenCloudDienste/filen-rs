@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -18,8 +16,9 @@ pub struct Request {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub preview: Cow<'a, str>,
+	pub preview: EncryptedString<'a>,
 	pub content: EncryptedString<'a>,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub edited_timestamp: DateTime<Utc>,
 	pub editor_id: u64,
 	#[serde(rename = "type")]

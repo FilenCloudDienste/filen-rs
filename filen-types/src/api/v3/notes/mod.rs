@@ -65,6 +65,7 @@ pub struct NoteParticipant<'a> {
 pub struct Note<'a> {
 	pub uuid: UuidStr,
 	pub owner_id: u64,
+	pub editor_id: u64,
 	pub is_owner: bool,
 	pub favorite: bool,
 	pub pinned: bool,

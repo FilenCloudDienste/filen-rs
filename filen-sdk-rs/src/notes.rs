@@ -9,7 +9,6 @@ use filen_types::{
 	fs::UuidStr,
 };
 use rsa::RsaPublicKey;
-use serde::{Deserialize, Serialize};
 
 use crate::{
 	Error, ErrorKind, api,
@@ -21,44 +20,25 @@ use crate::{
 	error::MetadataWasNotDecryptedError,
 };
 
-const EMPTY_CHECKLIST_NOTE: &str = r#"<ul data-checked="false"><li><br></li></ul>"#;
+use crypto::*;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct NoteTag {
-	pub uuid: UuidStr,
+	uuid: UuidStr,
 	// none if decryption fails
-	pub name: Option<String>,
-	pub favorite: bool,
-	pub edited_timestamp: DateTime<Utc>,
-	pub created_timestamp: DateTime<Utc>,
+	name: Option<String>,
+	favorite: bool,
+	edited_timestamp: DateTime<Utc>,
+	created_timestamp: DateTime<Utc>,
 }
 
 impl NoteTag {
 	fn decrypt_with_key(
 		tag: &filen_types::api::v3::notes::NoteTag<'_>,
-		note_key: Option<&impl MetaCrypter>,
+		crypter: &impl MetaCrypter,
 		outer_tmp_vec: &mut Vec<u8>,
 	) -> Self {
-		let name = if let Some(key) = note_key {
-			let tmp_vec = std::mem::take(outer_tmp_vec);
-			let (name, tmp_vec) = match key.decrypt_meta_into(&tag.name, tmp_vec) {
-				Ok(s) => match serde_json::from_str::<NoteTagName>(&s) {
-					Ok(ntm) => (Some(ntm.name.into_owned()), s.into_bytes()),
-					Err(e) => {
-						log::error!("Failed to parse note tag name JSON: {e}");
-						(None, s.into_bytes())
-					}
-				},
-				Err((e, s_vec)) => {
-					log::error!("Failed to decrypt note tag name: {e}");
-					(None, s_vec)
-				}
-			};
-			*outer_tmp_vec = tmp_vec;
-			name
-		} else {
-			None
-		};
+		let name = NoteTagName::try_decrypt(crypter, &tag.name, outer_tmp_vec).ok();
 
 		Self {
 			uuid: tag.uuid,
@@ -68,31 +48,45 @@ impl NoteTag {
 			created_timestamp: tag.created_timestamp,
 		}
 	}
+
+	pub fn name(&self) -> Option<&str> {
+		self.name.as_deref()
+	}
+
+	pub fn favorited(&self) -> bool {
+		self.favorite
+	}
+
+	pub fn created(&self) -> DateTime<Utc> {
+		self.created_timestamp
+	}
+
+	pub fn edited(&self) -> DateTime<Utc> {
+		self.edited_timestamp
+	}
 }
 
 struct NoteParticipantParts {
-	pub user_id: u64,
-	pub email: String,
-	pub avatar: Option<String>,
-	pub nick_name: String,
+	user_id: u64,
+	email: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct NoteParticipant {
-	pub user_id: u64,
-	pub is_owner: bool,
-	pub email: String,
-	pub avatar: Option<String>,
-	pub nick_name: String,
-	pub permissions_write: bool,
-	pub added_timestamp: DateTime<Utc>,
+	user_id: u64,
+	is_owner: bool,
+	email: String,
+	avatar: Option<String>,
+	nick_name: String,
+	permissions_write: bool,
+	added_timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Note {
 	uuid: UuidStr,
 	owner_id: u64,
-	// last_edited_by: u64,
+	last_editor_id: u64,
 	favorite: bool,
 	pinned: bool,
 	tags: Vec<NoteTag>,
@@ -126,9 +120,29 @@ impl Note {
 	pub fn note_type(&self) -> NoteType {
 		self.note_type
 	}
+
+	pub fn trashed(&self) -> bool {
+		self.trash
+	}
+
+	pub fn archived(&self) -> bool {
+		self.archive
+	}
+
+	pub fn title(&self) -> Option<&str> {
+		self.title.as_deref()
+	}
+
+	pub fn preview(&self) -> Option<&str> {
+		self.preview.as_deref()
+	}
+
+	pub fn tags(&self) -> &[NoteTag] {
+		&self.tags
+	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NoteHistory {
 	id: u64,
 	preview: Option<String>,
@@ -139,48 +153,29 @@ pub struct NoteHistory {
 }
 
 impl NoteHistory {
+	pub fn preview(&self) -> Option<&str> {
+		self.preview.as_deref()
+	}
+
+	pub fn content(&self) -> Option<&str> {
+		self.content.as_deref()
+	}
+
+	pub fn note_type(&self) -> NoteType {
+		self.note_type
+	}
+}
+
+impl NoteHistory {
 	fn decrypt_with_key(
 		note_history: &filen_types::api::v3::notes::history::NoteHistory<'_>,
 		note_key: &NoteKey,
 		outer_tmp_vec: &mut Vec<u8>,
 	) -> Self {
-		let tmp_vec = std::mem::take(outer_tmp_vec);
-		let (decrypted_preview, tmp_vec) =
-			match note_key.decrypt_meta_into(&note_history.preview, tmp_vec) {
-				Ok(s) => match serde_json::from_str::<NotePreview>(&s) {
-					Ok(np) => (Some(np.preview.into_owned()), s.into_bytes()),
-					Err(e) => {
-						log::error!("Failed to parse note preview JSON: {e}");
-						(None, s.into_bytes())
-					}
-				},
-				Err((e, s_vec)) => {
-					log::error!("Failed to decrypt note history preview: {e}");
-					(None, s_vec)
-				}
-			};
-
-		let (decrypted_content, tmp_vec) =
-			match note_key.decrypt_meta_into(&note_history.content, tmp_vec) {
-				Ok(s) => match serde_json::from_str::<NoteContent>(&s) {
-					Ok(nc) => (Some(nc.content.into_owned()), s.into_bytes()),
-					Err(e) => {
-						log::error!("Failed to parse note content JSON: {e}");
-						(None, s.into_bytes())
-					}
-				},
-				Err((e, s_vec)) => {
-					log::error!("Failed to decrypt note content: {e}");
-					(None, s_vec)
-				}
-			};
-
-		*outer_tmp_vec = tmp_vec;
-
 		Self {
 			id: note_history.id,
-			preview: decrypted_preview,
-			content: decrypted_content,
+			preview: NotePreview::try_decrypt(note_key, &note_history.preview, outer_tmp_vec).ok(),
+			content: NoteContent::try_decrypt(note_key, &note_history.content, outer_tmp_vec).ok(),
 			edited_timestamp: note_history.edited_timestamp,
 			editor_id: note_history.editor_id,
 			note_type: note_history.note_type,
@@ -188,29 +183,216 @@ impl NoteHistory {
 	}
 }
 
-#[derive(Deserialize, Serialize)]
-struct NoteKeyStruct<'a> {
-	key: Cow<'a, NoteKey>,
-}
+mod crypto {
+	use std::borrow::Cow;
 
-#[derive(Deserialize, Serialize)]
-struct NoteTitle<'a> {
-	title: Cow<'a, str>,
-}
+	use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
+	use rsa::{RsaPrivateKey, RsaPublicKey};
+	use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize)]
-struct NotePreview<'a> {
-	preview: Cow<'a, str>,
-}
+	use crate::{
+		Error, ErrorKind,
+		crypto::{notes::NoteKey, shared::MetaCrypter},
+	};
 
-#[derive(Deserialize, Serialize)]
-struct NoteTagName<'a> {
-	name: Cow<'a, str>,
-}
+	#[derive(Deserialize, Serialize)]
+	pub(super) struct NoteKeyStruct<'a> {
+		key: Cow<'a, NoteKey>,
+	}
 
-#[derive(Deserialize, Serialize)]
-struct NoteContent<'a> {
-	content: Cow<'a, str>,
+	impl NoteKeyStruct<'_> {
+		pub(super) fn try_decrypt_rsa(
+			rsa_key: &RsaPrivateKey,
+			encrypted_key: &RSAEncryptedString<'_>,
+		) -> Result<NoteKey, Error> {
+			let key = crate::crypto::rsa::decrypt_with_private_key(rsa_key, encrypted_key)
+				.map_err(|e| {
+					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note key"))
+				})?;
+			let key_str = str::from_utf8(&key).map_err(|_| {
+				Error::custom(ErrorKind::Response, "Failed to parse note key as UTF-8")
+			})?;
+			let key_struct: NoteKeyStruct = serde_json::from_str(key_str)?;
+			Ok(key_struct.key.into_owned())
+		}
+
+		pub(super) fn try_encrypt_rsa(
+			rsa_key: &RsaPublicKey,
+			note_key: &NoteKey,
+		) -> Result<RSAEncryptedString<'static>, Error> {
+			let key_struct = NoteKeyStruct {
+				key: Cow::Borrowed(note_key),
+			};
+			let key_string = serde_json::to_string(&key_struct)?;
+			let encrypted_key =
+				crate::crypto::rsa::encrypt_with_public_key(rsa_key, key_string.as_bytes())
+					.map_err(|e| {
+						Error::custom_with_source(
+							ErrorKind::Conversion,
+							e,
+							Some("encrypt note key"),
+						)
+					})?;
+			Ok(encrypted_key)
+		}
+
+		pub(super) fn encrypt_symmetric(
+			crypter: &impl MetaCrypter,
+			note_key: &NoteKey,
+		) -> EncryptedString<'static> {
+			let key_struct = NoteKeyStruct {
+				key: Cow::Borrowed(note_key),
+			};
+			let key_string =
+				serde_json::to_string(&key_struct).expect("Failed to serialize note key");
+			crypter.encrypt_meta(&key_string)
+		}
+	}
+
+	#[derive(Deserialize, Serialize)]
+	pub(super) struct NoteTitle<'a> {
+		title: Cow<'a, str>,
+	}
+
+	impl NoteTitle<'_> {
+		pub(super) fn try_decrypt(
+			note_key: &NoteKey,
+			encrypted_title: &EncryptedString<'_>,
+			outer_tmp_vec: &mut Vec<u8>,
+		) -> Result<String, Error> {
+			let tmp_vec = std::mem::take(outer_tmp_vec);
+			let decrypted_title = note_key
+				.decrypt_meta_into(encrypted_title, tmp_vec)
+				.map_err(|(e, tmp_vec)| {
+					*outer_tmp_vec = tmp_vec;
+					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note title"))
+				})?;
+			let title_struct: NoteTitle = serde_json::from_str(&decrypted_title)?;
+			*outer_tmp_vec = decrypted_title.into_bytes();
+			Ok(title_struct.title.into_owned())
+		}
+
+		pub(super) fn encrypt(note_key: &NoteKey, title: &str) -> EncryptedString<'static> {
+			let title_struct = NoteTitle {
+				title: Cow::Borrowed(title),
+			};
+			let title_string =
+				serde_json::to_string(&title_struct).expect("Failed to serialize note title");
+			note_key.encrypt_meta(&title_string)
+		}
+	}
+
+	#[derive(Deserialize, Serialize)]
+	pub(super) struct NotePreview<'a> {
+		preview: Cow<'a, str>,
+	}
+
+	impl NotePreview<'_> {
+		pub(super) fn try_decrypt(
+			note_key: &NoteKey,
+			encrypted_preview: &EncryptedString<'_>,
+			outer_tmp_vec: &mut Vec<u8>,
+		) -> Result<String, Error> {
+			if encrypted_preview.0.is_empty() {
+				return Ok(String::new());
+			}
+
+			let tmp_vec = std::mem::take(outer_tmp_vec);
+			let decrypted_preview = note_key
+				.decrypt_meta_into(encrypted_preview, tmp_vec)
+				.map_err(|(e, tmp_vec)| {
+					*outer_tmp_vec = tmp_vec;
+					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note preview"))
+				})?;
+			let preview_struct: NotePreview = serde_json::from_str(&decrypted_preview)?;
+			*outer_tmp_vec = decrypted_preview.into_bytes();
+			Ok(preview_struct.preview.into_owned())
+		}
+
+		pub(super) fn encrypt(note_key: &NoteKey, preview: &str) -> EncryptedString<'static> {
+			let preview_struct = NotePreview {
+				preview: Cow::Borrowed(preview),
+			};
+			let preview_string =
+				serde_json::to_string(&preview_struct).expect("Failed to serialize note preview");
+			note_key.encrypt_meta(&preview_string)
+		}
+	}
+
+	#[derive(Deserialize, Serialize)]
+	pub(super) struct NoteTagName<'a> {
+		name: Cow<'a, str>,
+	}
+
+	impl NoteTagName<'_> {
+		pub(super) fn try_decrypt(
+			crypter: &impl MetaCrypter,
+			encrypted_name: &EncryptedString<'_>,
+			outer_tmp_vec: &mut Vec<u8>,
+		) -> Result<String, Error> {
+			let tmp_vec = std::mem::take(outer_tmp_vec);
+			let decrypted_name =
+				crypter
+					.decrypt_meta_into(encrypted_name, tmp_vec)
+					.map_err(|(e, tmp_vec)| {
+						*outer_tmp_vec = tmp_vec;
+						Error::custom_with_source(
+							ErrorKind::Response,
+							e,
+							Some("decrypt note tag name"),
+						)
+					})?;
+			let name_struct: NoteTagName = serde_json::from_str(&decrypted_name)?;
+			*outer_tmp_vec = decrypted_name.into_bytes();
+			Ok(name_struct.name.into_owned())
+		}
+
+		pub(super) fn encrypt(crypter: &impl MetaCrypter, name: &str) -> EncryptedString<'static> {
+			let name_struct = NoteTagName {
+				name: Cow::Borrowed(name),
+			};
+			let name_string =
+				serde_json::to_string(&name_struct).expect("Failed to serialize note tag name");
+			crypter.encrypt_meta(&name_string)
+		}
+	}
+
+	#[derive(Deserialize, Serialize)]
+	pub(super) struct NoteContent<'a> {
+		content: Cow<'a, str>,
+	}
+
+	impl NoteContent<'_> {
+		pub(super) fn try_decrypt(
+			note_key: &NoteKey,
+			encrypted_content: &EncryptedString<'_>,
+			outer_tmp_vec: &mut Vec<u8>,
+		) -> Result<String, Error> {
+			if encrypted_content.0.is_empty() {
+				return Ok(String::new());
+			}
+
+			let tmp_vec = std::mem::take(outer_tmp_vec);
+			let decrypted_content = note_key
+				.decrypt_meta_into(encrypted_content, tmp_vec)
+				.map_err(|(e, tmp_vec)| {
+					*outer_tmp_vec = tmp_vec;
+					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note content"))
+				})?;
+			let content_struct: NoteContent = serde_json::from_str(&decrypted_content)?;
+			*outer_tmp_vec = decrypted_content.into_bytes();
+			Ok(content_struct.content.into_owned())
+		}
+
+		pub(super) fn encrypt(note_key: &NoteKey, content: &str) -> EncryptedString<'static> {
+			let content_struct = NoteContent {
+				content: Cow::Borrowed(content),
+			};
+			let content_string =
+				serde_json::to_string(&content_struct).expect("Failed to serialize note content");
+			note_key.encrypt_meta(&content_string)
+		}
+	}
 }
 
 impl Client {
@@ -233,16 +415,7 @@ impl Client {
 				Error::custom(ErrorKind::Response, "User is not a participant in the note")
 			})?;
 
-		let key =
-			crate::crypto::rsa::decrypt_with_private_key(self.private_key(), &participant.metadata)
-				.map_err(|e| {
-					log::error!("Failed to decrypt note key for note {}: {e}", note.uuid);
-					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note key"))
-				})?;
-		let key_str = str::from_utf8(&key)
-			.map_err(|_| Error::custom(ErrorKind::Response, "Failed to parse note key as UTF-8"))?;
-		let key_struct: NoteKeyStruct = serde_json::from_str(key_str)?;
-		Ok(key_struct.key.into_owned())
+		NoteKeyStruct::try_decrypt_rsa(self.private_key(), &participant.metadata)
 	}
 
 	fn decrypt_note(
@@ -250,41 +423,12 @@ impl Client {
 		note: filen_types::api::v3::notes::Note<'_>,
 		outer_tmp_vec: &mut Vec<u8>,
 	) -> Note {
-		let tmp_vec = std::mem::take(outer_tmp_vec);
+		let mut tmp_vec = std::mem::take(outer_tmp_vec);
 		let key = self.decrypt_note_key(&note).ok();
 
 		let (title, preview, mut tmp_vec) = if let Some(key) = &key {
-			let (title, tmp_vec) = match key.decrypt_meta_into(&note.title, tmp_vec) {
-				Ok(s) => match serde_json::from_str::<NoteTitle>(&s) {
-					Ok(nt) => (Some(nt.title.into_owned()), s.into_bytes()),
-					Err(e) => {
-						log::error!("Failed to parse note title JSON: {e}");
-						(None, s.into_bytes())
-					}
-				},
-				Err((e, s_vec)) => {
-					log::error!("Failed to decrypt note title: {e}");
-					(None, s_vec)
-				}
-			};
-
-			let (preview, tmp_vec) = if note.preview.0.is_empty() {
-				(Some(String::new()), tmp_vec)
-			} else {
-				match key.decrypt_meta_into(&note.preview, tmp_vec) {
-					Ok(s) => match serde_json::from_str::<NotePreview>(&s) {
-						Ok(np) => (Some(np.preview.into_owned()), s.into_bytes()),
-						Err(e) => {
-							log::error!("Failed to parse note preview JSON: {e}");
-							(None, s.into_bytes())
-						}
-					},
-					Err((e, s_vec)) => {
-						log::error!("Failed to decrypt note preview: {e}");
-						(None, s_vec)
-					}
-				}
-			};
+			let title = NoteTitle::try_decrypt(key, &note.title, &mut tmp_vec).ok();
+			let preview = NotePreview::try_decrypt(key, &note.preview, &mut tmp_vec).ok();
 
 			(title, preview, tmp_vec)
 		} else {
@@ -293,7 +437,7 @@ impl Client {
 		let tags = note
 			.tags
 			.into_iter()
-			.map(|tag| NoteTag::decrypt_with_key(&tag, key.as_ref(), &mut tmp_vec))
+			.map(|tag| NoteTag::decrypt_with_key(&tag, self.crypter(), &mut tmp_vec))
 			.collect::<Vec<_>>();
 
 		let participants = note
@@ -315,6 +459,7 @@ impl Client {
 		Note {
 			uuid: note.uuid,
 			owner_id: note.owner_id,
+			last_editor_id: note.editor_id,
 			favorite: note.favorite,
 			pinned: note.pinned,
 			tags,
@@ -330,7 +475,7 @@ impl Client {
 		}
 	}
 
-	pub async fn list_all_notes(&self) -> Result<Vec<Note>, Error> {
+	pub async fn list_notes(&self) -> Result<Vec<Note>, Error> {
 		let notes = crate::api::v3::notes::get(self.client()).await?;
 		// opportunity for par_iter here if we ever start using rayon
 		let mut outer_tmp_vec = Vec::new();
@@ -353,16 +498,11 @@ impl Client {
 		public_key: &RsaPublicKey,
 		note_participant_parts: NoteParticipantParts,
 	) -> Result<(), Error> {
-		let data = crate::crypto::rsa::encrypt_with_public_key(
+		let data = NoteKeyStruct::try_encrypt_rsa(
 			public_key,
-			serde_json::to_string(&NoteKeyStruct {
-				key: Cow::Borrowed(
-					note.encryption_key
-						.as_ref()
-						.ok_or(MetadataWasNotDecryptedError)?,
-				),
-			})?
-			.as_bytes(),
+			note.encryption_key
+				.as_ref()
+				.ok_or(MetadataWasNotDecryptedError)?,
 		)
 		.map_err(|e| {
 			Error::custom_with_source(ErrorKind::Conversion, e, Some("add participant"))
@@ -383,8 +523,8 @@ impl Client {
 			user_id: note_participant_parts.user_id,
 			is_owner: note_participant_parts.user_id == note.owner_id,
 			email: note_participant_parts.email,
-			avatar: note_participant_parts.avatar,
-			nick_name: note_participant_parts.nick_name,
+			avatar: response.avatar.map(Cow::into_owned),
+			nick_name: response.nick_name.into_owned(),
 			permissions_write: write,
 			added_timestamp: response.timestamp,
 		});
@@ -406,8 +546,6 @@ impl Client {
 			NoteParticipantParts {
 				user_id: contact.user_id,
 				email: contact.email.clone().into_owned(),
-				avatar: contact.avatar.clone().map(|a| a.into_owned()),
-				nick_name: contact.nick_name.clone().into_owned(),
 			},
 		)
 		.await
@@ -447,7 +585,7 @@ impl Client {
 
 	pub async fn get_note(&self, uuid: UuidStr) -> Result<Option<Note>, Error> {
 		// I hate this
-		self.list_all_notes()
+		self.list_notes()
 			.await
 			.map(|notes| notes.into_iter().find(|n| n.uuid == uuid))
 	}
@@ -456,17 +594,9 @@ impl Client {
 		let uuid = UuidStr::new_v4();
 		let title = title.unwrap_or_else(|| Utc::now().format("%a %b %d %Y %X").to_string());
 		let key = NoteKey::generate();
-		let key_struct = NoteKeyStruct {
-			key: Cow::Borrowed(&key),
-		};
-		let title_struct = NoteTitle {
-			title: Cow::Borrowed(&title),
-		};
 
-		let key_string = self
-			.crypter()
-			.encrypt_meta(&serde_json::to_string(&key_struct)?);
-		let title_string = key.encrypt_meta(&serde_json::to_string(&title_struct)?);
+		let key_string = NoteKeyStruct::encrypt_symmetric(self.crypter(), &key);
+		let title_string = NoteTitle::encrypt(&key, &title);
 
 		let _lock = self.lock_notes().await?;
 
@@ -483,6 +613,7 @@ impl Client {
 		let mut new = Note {
 			uuid,
 			owner_id: self.user_id,
+			last_editor_id: self.user_id,
 			favorite: false,
 			pinned: false,
 			tags: vec![],
@@ -505,9 +636,6 @@ impl Client {
 			NoteParticipantParts {
 				user_id: self.user_id,
 				email: self.email().to_string(),
-				// todo, remove these when participants/add returns them
-				avatar: None,
-				nick_name: String::new(),
 			},
 		)
 		.await?;
@@ -524,39 +652,68 @@ impl Client {
 
 		note.note_type = response.note_type;
 		note.edited_timestamp = response.edited_timestamp;
-		note.preview = Some(response.preview.into_owned());
+
+		let mut tmp_vec = Vec::new();
+
+		note.preview = NotePreview::try_decrypt(
+			note.encryption_key
+				.as_ref()
+				.ok_or(MetadataWasNotDecryptedError)?,
+			&response.preview,
+			&mut tmp_vec,
+		)
+		.ok();
 
 		if response.content.0.is_empty() {
-			match note.note_type {
-				NoteType::Checklist => Ok(Some(EMPTY_CHECKLIST_NOTE.to_string())),
-				_ => Ok(Some(String::new())),
-			}
+			Ok(Some(String::new()))
 		} else {
 			let Some(key) = note.encryption_key.as_ref() else {
 				return Ok(None);
 			};
 
-			let Ok(decrypted_content) = key.decrypt_meta(&response.content) else {
-				log::error!("Failed to decrypt note content: No encryption key available");
-				return Ok(None);
-			};
-
-			let content = match NoteContent::deserialize(&mut serde_json::Deserializer::from_str(
-				&decrypted_content,
-			)) {
-				Ok(content) => content.content.into_owned(),
-				Err(e) => {
-					log::error!("Failed to parse note content JSON: {e}");
-					return Ok(None);
-				}
-			};
-
-			if content.is_empty() && note.note_type == NoteType::Checklist {
-				Ok(Some(EMPTY_CHECKLIST_NOTE.to_string()))
-			} else {
-				Ok(Some(content))
-			}
+			Ok(NoteContent::try_decrypt(key, &response.content, &mut tmp_vec).ok())
 		}
+	}
+
+	pub async fn set_note_type(
+		&self,
+		note: &mut Note,
+		new_type: NoteType,
+		known_content: Option<&str>,
+	) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
+		let content = if let Some(content) = known_content {
+			Cow::Borrowed(content)
+		} else {
+			Cow::Owned(
+				self.get_note_content(note)
+					.await?
+					.ok_or(MetadataWasNotDecryptedError)?,
+			)
+		};
+		let note_key = note
+			.encryption_key
+			.as_ref()
+			.ok_or(MetadataWasNotDecryptedError)?;
+
+		let resp = api::v3::notes::r#type::change::post(
+			self.client(),
+			&api::v3::notes::r#type::change::Request {
+				uuid: note.uuid,
+				preview: NotePreview::encrypt(
+					note_key,
+					note.preview.as_ref().ok_or(MetadataWasNotDecryptedError)?,
+				),
+				content: NoteContent::encrypt(note_key, &content),
+				note_type: new_type,
+			},
+		)
+		.await?;
+
+		note.note_type = new_type;
+		note.edited_timestamp = resp.edited_timestamp;
+		note.last_editor_id = resp.editor_id;
+		Ok(())
 	}
 
 	pub async fn set_note_content(
@@ -565,59 +722,36 @@ impl Client {
 		new_content: &str,
 		new_preview: String,
 	) -> Result<(), Error> {
-		self.set_note_content_and_type(note, new_content, new_preview, note.note_type)
-			.await
-	}
-
-	pub async fn set_note_content_and_type(
-		&self,
-		note: &mut Note,
-		new_content: &str,
-		new_preview: String,
-		new_note_type: NoteType,
-	) -> Result<(), Error> {
 		let note_key = note
 			.encryption_key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)?;
 
+		let content = NoteContent::encrypt(note_key, new_content);
+		let preview = NotePreview::encrypt(note_key, &new_preview);
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::content::edit::post(
+		let response = api::v3::notes::content::edit::post(
 			self.client(),
 			&api::v3::notes::content::edit::Request {
 				uuid: note.uuid,
-				content: note_key.encrypt_meta(
-					&serde_json::to_string(&NoteContent {
-						content: Cow::Borrowed(new_content),
-					})
-					.expect("Failed to serialize note content (should never happen)"),
-				),
-				preview: note_key.encrypt_meta(
-					&serde_json::to_string(&NotePreview {
-						preview: Cow::Borrowed(&new_preview),
-					})
-					.expect("Failed to serialize note preview (should never happen)"),
-				),
-				note_type: new_note_type,
+				content,
+				preview,
+				note_type: note.note_type,
 			},
 		)
 		.await?;
-		note.note_type = new_note_type;
 		note.preview = Some(new_preview);
+		note.edited_timestamp = response.timestamp;
 		Ok(())
 	}
 
-	pub async fn set_note_title(&self, note: &mut Note, new_title: &str) -> Result<(), Error> {
-		let title = note
-			.encryption_key
-			.as_ref()
-			.ok_or(MetadataWasNotDecryptedError)?
-			.encrypt_meta(
-				&serde_json::to_string(&NoteTitle {
-					title: Cow::Borrowed(new_title),
-				})
-				.expect("Failed to serialize note title (should never happen)"),
-			);
+	pub async fn set_note_title(&self, note: &mut Note, new_title: String) -> Result<(), Error> {
+		let title = NoteTitle::encrypt(
+			note.encryption_key
+				.as_ref()
+				.ok_or(MetadataWasNotDecryptedError)?,
+			&new_title,
+		);
 
 		let _lock = self.lock_notes().await?;
 		api::v3::notes::title::edit::post(
@@ -628,7 +762,7 @@ impl Client {
 			},
 		)
 		.await?;
-		note.title = Some(new_title.to_string());
+		note.title = Some(new_title);
 		Ok(())
 	}
 
@@ -649,6 +783,7 @@ impl Client {
 		)
 		.await?;
 		note.archive = true;
+		note.trash = false;
 		Ok(())
 	}
 
@@ -660,6 +795,7 @@ impl Client {
 		)
 		.await?;
 		note.trash = true;
+		note.archive = false;
 		Ok(())
 	}
 
@@ -709,16 +845,19 @@ impl Client {
 		let content = self.get_note_content(note).await?;
 
 		let mut new = self.create_note(note.title.clone()).await?;
-		self.set_note_content_and_type(
+		self.set_note_content(
 			&mut new,
 			content.as_deref().unwrap_or(""),
 			note.preview.clone().unwrap_or_default(),
-			note.note_type,
 		)
 		.await?;
+
+		self.set_note_type(&mut new, note.note_type, content.as_deref())
+			.await?;
 		Ok(new)
 	}
 
+	/// Get the edit history of a note, sorted by edited timestamp (oldest first).
 	pub async fn get_note_history(&self, note: &Note) -> Result<Vec<NoteHistory>, Error> {
 		let note_key = note
 			.encryption_key
@@ -733,11 +872,13 @@ impl Client {
 
 		let mut outer_tmp_vec = Vec::new();
 
-		let histories = histories
+		let mut histories = histories
 			.0
 			.into_iter()
 			.map(|h| NoteHistory::decrypt_with_key(&h, note_key, &mut outer_tmp_vec))
 			.collect::<Vec<_>>();
+
+		histories.sort_by_key(|h| h.edited_timestamp);
 
 		Ok(histories)
 	}
@@ -760,8 +901,7 @@ impl Client {
 		note.edited_timestamp = history.edited_timestamp;
 		note.note_type = history.note_type;
 		note.preview = history.preview;
-		// todo when editor_id is added
-		// note.editor_id = history.editor_id;
+		note.last_editor_id = history.editor_id;
 
 		Ok(())
 	}
@@ -800,19 +940,19 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn list_all_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
+	pub async fn list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
 		let response = api::v3::notes::tags::post(self.client()).await?;
 		let mut outer_tmp_vec = Vec::new();
 		Ok(response
 			.0
 			.into_iter()
-			.map(|tag| NoteTag::decrypt_with_key(&tag, Some(self.crypter()), &mut outer_tmp_vec))
+			.map(|tag| NoteTag::decrypt_with_key(&tag, self.crypter(), &mut outer_tmp_vec))
 			.collect::<Vec<_>>())
 	}
 
 	pub async fn create_note_tag(&self, name: String) -> Result<NoteTag, Error> {
 		// is this necessary?
-		if let Some(existing) = self.list_all_note_tags().await?.into_iter().find(|t| {
+		if let Some(existing) = self.list_note_tags().await?.into_iter().find(|t| {
 			if let Some(t_name) = &t.name {
 				*t_name == name
 			} else {
@@ -822,17 +962,14 @@ impl Client {
 			return Ok(existing);
 		}
 
-		let name_struct = NoteTagName {
-			name: Cow::Borrowed(&name),
-		};
-		let name_string = self
-			.crypter()
-			.encrypt_meta(&serde_json::to_string(&name_struct)?);
+		let encrypted_name = NoteTagName::encrypt(self.crypter(), &name);
 
 		let _lock = self.lock_notes().await?;
 		let response = api::v3::notes::tags::create::post(
 			self.client(),
-			&api::v3::notes::tags::create::Request { name: name_string },
+			&api::v3::notes::tags::create::Request {
+				name: encrypted_name,
+			},
 		)
 		.await?;
 
@@ -840,24 +977,20 @@ impl Client {
 			uuid: response.uuid,
 			name: Some(name),
 			favorite: false,
-			edited_timestamp: response.edited_timestamp,
-			created_timestamp: response.created_timestamp,
+			edited_timestamp: response.timestamp,
+			created_timestamp: response.timestamp,
 		})
 	}
 
 	pub async fn rename_note_tag(&self, tag: &mut NoteTag, new_name: String) -> Result<(), Error> {
-		let name_string = self
-			.crypter()
-			.encrypt_meta(&serde_json::to_string(&NoteTagName {
-				name: Cow::Borrowed(&new_name),
-			})?);
+		let encrypted_name = NoteTagName::encrypt(self.crypter(), &new_name);
 
 		let _lock = self.lock_notes().await?;
 		api::v3::notes::tags::rename::post(
 			self.client(),
 			&api::v3::notes::tags::rename::Request {
 				uuid: tag.uuid,
-				name: name_string,
+				name: encrypted_name,
 			},
 		)
 		.await?;

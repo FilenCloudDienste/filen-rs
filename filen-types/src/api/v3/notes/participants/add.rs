@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,9 +19,11 @@ pub struct Request<'a> {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Response {
+pub struct Response<'a> {
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	pub avatar: Option<Cow<'a, str>>,
+	pub nick_name: Cow<'a, str>,
 }
 
 #[derive(Debug, Clone)]
