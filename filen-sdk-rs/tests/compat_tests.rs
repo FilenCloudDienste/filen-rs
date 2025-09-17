@@ -150,10 +150,7 @@ async fn make_rs_compat_dir() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 
-	let _lock = client
-		.acquire_lock("test:rs", std::time::Duration::from_secs(1), 600)
-		.await
-		.unwrap();
+	let _lock = client.acquire_lock_with_default("test:rs").await.unwrap();
 
 	if let Some(FSObject::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
 		client.trash_dir(&mut dir.into_owned()).await.unwrap();
