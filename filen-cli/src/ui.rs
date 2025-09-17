@@ -81,6 +81,11 @@ impl UI {
 		self.eprint(&format!("{} {}", style("✘").red(), msg));
 	}
 
+	/// Print an error with a failure icon
+	pub(crate) fn print_err(&self, err: &anyhow::Error) {
+		self.print_failure(&format!("{}", err));
+	}
+
 	pub(crate) fn print_muted(&self, msg: &str) {
 		self.print(&style(msg).dim().to_string());
 	}

@@ -43,7 +43,13 @@ async fn main() -> Result<()> {
 	} else {
 		ui.print_banner();
 		loop {
-			let _ = client.get(&mut ui).await;
+			match client.get(&mut ui).await {
+				Ok(_) => {}
+				Err(e) => {
+					ui.print_err(&e);
+					break;
+				}
+			}
 			// authenticate, so the username is shown in the prompt.
 			// this essentially defeats the purpose of LazyClient, so maybe scrapping it would be better?
 			// it does make a difference so non-authenticated commands (e.g. logout) can still be run ..

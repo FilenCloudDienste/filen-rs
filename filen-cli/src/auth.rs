@@ -71,14 +71,13 @@ pub(crate) async fn authenticate(
 	password_arg: Option<&str>,
 	auth_config_path_arg: Option<&str>,
 ) -> Result<Client> {
-	// todo: differentiate better betweeen failure and abscence of credentials
-	if let Ok(client) = authenticate_from_cli_args(ui, email_arg, password_arg).await {
+	if let Some(client) = authenticate_from_cli_args(ui, email_arg, password_arg).await? {
 		Ok(client)
-	} else if let Ok(client) = authenticate_from_auth_config(auth_config_path_arg) {
+	} else if let Some(client) = authenticate_from_auth_config(auth_config_path_arg)? {
 		Ok(client)
-	} else if let Ok(client) = authenticate_from_environment_variables(ui).await {
+	} else if let Some(client) = authenticate_from_environment_variables(ui).await? {
 		Ok(client)
-	} else if let Ok(client) = authenticate_from_keyring().await {
+	} else if let Some(client) = authenticate_from_keyring().await? {
 		Ok(client)
 	} else {
 		authenticate_from_prompt(ui).await
@@ -120,41 +119,49 @@ async fn authenticate_from_cli_args(
 	ui: &mut UI,
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
-) -> Result<Client> {
+) -> Result<Option<Client>> {
+	if email_arg.is_none() && password_arg.is_none() {
+		return Ok(None);
+	}
 	let email = email_arg.context("Email is required")?;
 	let password = password_arg.context("Password is required")?;
 	let client = login_and_optionally_prompt_two_factor_code(ui, email, password).await?;
-	Ok(client)
+	Ok(Some(client))
 }
 
 /// Authenticate using SDK config stored in a file ("auth config").
-fn authenticate_from_auth_config(path_arg: Option<&str>) -> Result<Client> {
-	let path = path_arg.context("A path to the auth config file is required")?;
+fn authenticate_from_auth_config(path_arg: Option<&str>) -> Result<Option<Client>> {
+	let Some(path) = path_arg else {
+		return Ok(None);
+	};
 	let sdk_config = std::fs::read_to_string(path).context("Failed to read auth config file")?;
-	deserialize_auth_config(&sdk_config)
+	Ok(Some(deserialize_auth_config(&sdk_config)?))
 }
 
 /// Authenticate from credentials provided via environment variables.
-async fn authenticate_from_environment_variables(ui: &mut UI) -> Result<Client> {
-	let email = std::env::var("FILEN_CLI_EMAIL")
-		.context("FILEN_CLI_EMAIL environment variable is required")?;
-	let password = std::env::var("FILEN_CLI_PASSWORD")
-		.context("FILEN_CLI_PASSWORD environment variable is required")?;
+async fn authenticate_from_environment_variables(ui: &mut UI) -> Result<Option<Client>> {
+	let email_var = std::env::var("FILEN_CLI_EMAIL").ok();
+	let password_var = std::env::var("FILEN_CLI_PASSWORD").ok();
+	if email_var.is_none() && password_var.is_none() {
+		return Ok(None);
+	}
+	let email = email_var.context("FILEN_CLI_EMAIL is required")?;
+	let password = password_var.context("FILEN_CLI_PASSWORD is required")?;
 	let client = login_and_optionally_prompt_two_factor_code(ui, email, &password).await?;
-	Ok(client)
+	Ok(Some(client))
 }
 
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
 
 /// Authenticate using SDK config stored in the keyring.
-async fn authenticate_from_keyring() -> Result<Client> {
+async fn authenticate_from_keyring() -> Result<Option<Client>> {
 	let sdk_config = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 		.read()
 		.context("Failed to read SDK config from keyring")?;
 	let Some(sdk_config) = sdk_config else {
-		return Err(anyhow!("No SDK config found in keyring"));
+		return Ok(None);
 	};
-	deserialize_auth_config(&sdk_config)
+	Ok(Some(deserialize_auth_config(&sdk_config)?))
 }
 
 /// Authenticate using credentials provided interactively.
