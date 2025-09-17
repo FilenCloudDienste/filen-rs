@@ -108,6 +108,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ansi-width"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "219e3ce6f2611d83b51ec2098a12702112c29e57203a6b0a0929b2cddb486608"
+dependencies = [
+ "unicode-width 0.1.14",
+]
+
+[[package]]
 name = "anstream"
 version = "0.6.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -745,7 +754,7 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
- "unicode-width",
+ "unicode-width 0.2.1",
  "windows-sys 0.61.0",
 ]
 
@@ -1161,6 +1170,7 @@ dependencies = [
 name = "filen-cli"
 version = "0.2.0"
 dependencies = [
+ "ansi-width",
  "anyhow",
  "base64",
  "chrono",
@@ -1178,6 +1188,7 @@ dependencies = [
  "termsize",
  "tiny-gradient",
  "tokio",
+ "unicode-width 0.2.1",
 ]
 
 [[package]]
@@ -4021,6 +4032,12 @@ name = "unicode-segmentation"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
+use dialoguer::console::style;
 use filen_sdk_rs::fs::{
 	FSObject, HasName as _, HasUUID as _,
 	dir::DirectoryType,
@@ -238,10 +239,24 @@ async fn list_directory(
 	let mut files = items
 		.1
 		.iter()
-		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()))
-		.collect::<Vec<&str>>();
+		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()).to_string())
+		.collect::<Vec<String>>();
 	files.sort();
-	println!("{}", [directories, files].concat().join("  ")); // todo: better output formatting of ls command
+	// print directory names in blue
+	let directories = directories
+		.iter()
+		.map(|s| style(s).blue().to_string())
+		.collect::<Vec<String>>();
+	let all_items = directories
+		.iter()
+		.chain(files.iter())
+		.map(|s| s.as_ref())
+		.collect::<Vec<&str>>();
+	if all_items.is_empty() {
+		ui.print_muted("Directory is empty");
+		return Ok(());
+	}
+	ui.print_grid(&all_items);
 	Ok(())
 	// todo: ls -l flag
 }

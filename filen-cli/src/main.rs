@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
 					working_path = result.working_path.unwrap_or(working_path);
 				}
 				Err(e) => {
-					eprintln!("Error: {}", e);
+					ui.print_failure(&format!("{}", e));
 				}
 			}
 		}

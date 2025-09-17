@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use dialoguer::console::style;
 use tiny_gradient::{GradientStr, RGB};
+use unicode_width::UnicodeWidthStr;
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -60,11 +61,11 @@ impl UI {
 		println!("{}", banner);
 	}
 
-	pub(crate) fn println(&self, msg: &str) {
+	pub(crate) fn print(&self, msg: &str) {
 		println!("{}", msg);
 		// todo: use ui.println() everywhere?
 	}
-	pub(crate) fn eprintln(&self, msg: &str) {
+	pub(crate) fn eprint(&self, msg: &str) {
 		eprintln!("{}", msg);
 	}
 
@@ -72,19 +73,71 @@ impl UI {
 
 	/// Print a message with a success icon
 	pub(crate) fn print_success(&self, msg: &str) {
-		self.println(&format!("{} {}", style("✔").green(), msg));
+		self.print(&format!("{} {}", style("✔").green(), msg));
 	}
 
 	/// Print a message with a failure icon
 	pub(crate) fn print_failure(&self, msg: &str) {
-		self.eprintln(&format!("{} {}", style("✘").red(), style(msg).dim()));
+		self.eprint(&format!("{} {}", style("✘").red(), msg));
+	}
+
+	pub(crate) fn print_muted(&self, msg: &str) {
+		self.print(&style(msg).dim().to_string());
 	}
 
 	/// Print a table of key-value pairs
 	pub(crate) fn print_key_value_table(&self, table: &[(&str, &str)]) {
 		let key_width = table.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
 		for (key, value) in table {
-			self.println(&format!("{:>key_width$} {}", style(key).dim(), value));
+			self.print(&format!("{:>key_width$} {}", style(key).dim(), value));
+		}
+	}
+
+	/// Print a grid of strings (like an ls command's output)
+	pub(crate) fn print_grid(&self, items: &[&str]) {
+		if items.is_empty() {
+			self.print("");
+			return;
+		}
+		let terminal_width = termsize::get().map(|size| size.cols).unwrap_or(10) as usize;
+		let min_text_width = items.iter().map(|item| item.width()).max().unwrap_or(0);
+		if min_text_width > terminal_width {
+			// it won't fit, so just print one per line
+			self.print(&items.join("\n"));
+			return;
+		}
+		// try different column heights
+		for column_height in 1.. {
+			let columns = items.chunks(column_height).collect::<Vec<_>>();
+			let num_columns = columns.len();
+			let column_widths = columns
+				.clone()
+				.iter()
+				.map(|column| {
+					column
+						.iter()
+						.map(|item| ansi_width::ansi_width(item))
+						.max()
+						.unwrap()
+				})
+				.collect::<Vec<_>>();
+			let spacing_width = (num_columns - 1) * 2;
+			// check if it fits
+			let total_text_width = column_widths.iter().sum::<usize>();
+			if total_text_width + spacing_width <= terminal_width {
+				for row in 0..column_height {
+					let items = (0..columns.len())
+						.map(|i| {
+							let cell = columns[i].get(row).unwrap_or(&"");
+							let padding =
+								" ".repeat(column_widths[i] - ansi_width::ansi_width(cell));
+							format!("{}{}", cell, padding)
+						})
+						.collect::<Vec<_>>();
+					self.print(&items.join("  "));
+				}
+				break;
+			}
 		}
 	}
 
