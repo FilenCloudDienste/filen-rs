@@ -330,12 +330,16 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		} else {
 			let upload_key = self.upload_key.clone();
 			Box::pin(async move {
+				let rm = Cow::Owned(crypto::shared::generate_random_base64_values(
+					32,
+					&mut rand::rng(),
+				));
 				api::v3::upload::done::post(
 					self.client.client(),
 					&api::v3::upload::done::Request {
 						empty_request,
 						chunks: self.num_chunks,
-						rm: Cow::Borrowed(&crypto::shared::generate_random_base64_values(32)),
+						rm,
 						upload_key: Cow::Borrowed(&upload_key),
 					},
 				)
@@ -506,7 +510,10 @@ impl<'a> FileWriterState<'a> {
 			written: 0,
 			hasher: sha2::Sha512::new(),
 			remote_file_info: Arc::new(OnceLock::new()),
-			upload_key: Arc::new(crypto::shared::generate_random_base64_values(32)),
+			upload_key: Arc::new(crypto::shared::generate_random_base64_values(
+				32,
+				&mut rand::rng(),
+			)),
 			client,
 			alloc_future: None,
 			allocated_chunks: Vec::new(),

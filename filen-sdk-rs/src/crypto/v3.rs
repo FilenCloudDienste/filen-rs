@@ -176,7 +176,7 @@ impl DataCrypter for EncryptionKey {
 }
 
 impl CreateRandom for EncryptionKey {
-	fn seeded_generate(mut rng: rand::prelude::ThreadRng) -> Self {
+	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
 		Self::new(rng.random())
 	}
 }

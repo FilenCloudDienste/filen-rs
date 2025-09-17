@@ -89,7 +89,7 @@ impl DataCrypter for NoteKey {
 }
 
 impl CreateRandom for NoteKey {
-	fn seeded_generate(rng: rand::prelude::ThreadRng) -> Self {
+	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
 		Self::V2(MasterKey::seeded_generate(rng).0)
 	}
 }

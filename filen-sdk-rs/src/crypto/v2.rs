@@ -8,6 +8,7 @@ use aes_gcm::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString};
 use pbkdf2::{hmac::Hmac, pbkdf2};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
@@ -22,11 +23,11 @@ const NONCE_VALUES: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX
 
 struct BadNonce([u8; NONCE_SIZE]);
 
-impl BadNonce {
-	fn new() -> Self {
+impl CreateRandom for BadNonce {
+	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
 		let mut nonce = [0u8; NONCE_SIZE];
-		for i in 0..NONCE_SIZE {
-			nonce[i] = NONCE_VALUES[i % NONCE_VALUES.len()];
+		for byte in nonce.iter_mut() {
+			*byte = NONCE_VALUES[rng.random_range(0..NONCE_VALUES.len())];
 		}
 		Self(nonce)
 	}
@@ -91,7 +92,7 @@ impl V2Key {
 
 impl MetaCrypter for V2Key {
 	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
-		let nonce = BadNonce::new();
+		let nonce = BadNonce::generate();
 		out.clear();
 		let base64_len =
 			base64::encoded_len(meta.len() + TAG_SIZE, true).expect("meta len too long for base64");
@@ -211,8 +212,8 @@ impl MetaCrypter for MasterKey {
 }
 
 impl CreateRandom for MasterKey {
-	fn seeded_generate(_rng: rand::prelude::ThreadRng) -> Self {
-		Self::try_from(super::shared::generate_random_base64_values(32))
+	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
+		Self::try_from(super::shared::generate_random_base64_values(32, rng))
 			.expect("Failed to generate Master Key key")
 	}
 }
@@ -342,8 +343,8 @@ impl DataCrypter for FileKey {
 }
 
 impl CreateRandom for FileKey {
-	fn seeded_generate(_rng: rand::prelude::ThreadRng) -> Self {
-		Self::try_from(super::shared::generate_random_base64_values(32))
+	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
+		Self::try_from(super::shared::generate_random_base64_values(32, rng))
 			.expect("Failed to generate V2 key")
 	}
 }

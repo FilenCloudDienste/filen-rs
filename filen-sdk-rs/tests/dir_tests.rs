@@ -254,8 +254,9 @@ async fn dir_search() {
 		.await
 		.unwrap();
 
-	let dir_random_part_long = generate_random_base64_values(16);
-	let dir_random_part_short = generate_random_base64_values(2);
+	let rng = &mut rand::rng();
+	let dir_random_part_long = generate_random_base64_values(16, rng);
+	let dir_random_part_short = generate_random_base64_values(2, rng);
 
 	let dir_name = format!("{dir_random_part_long}{dir_random_part_short}");
 

@@ -75,8 +75,9 @@ async fn file_search() {
 		.await
 		.unwrap();
 
-	let file_random_part_long = generate_random_base64_values(16);
-	let file_random_part_short = generate_random_base64_values(2);
+	let rng = &mut rand::rng();
+	let file_random_part_long = generate_random_base64_values(16, rng);
+	let file_random_part_short = generate_random_base64_values(2, rng);
 
 	let file_name = format!("{file_random_part_long}{file_random_part_short}.txt");
 

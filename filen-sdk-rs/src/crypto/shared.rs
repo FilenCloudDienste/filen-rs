@@ -26,16 +26,15 @@ pub(crate) trait DataCrypter {
 }
 
 pub(crate) trait CreateRandom: Sized {
-	fn seeded_generate(rng: ThreadRng) -> Self;
+	fn seeded_generate(rng: &mut ThreadRng) -> Self;
 	fn generate() -> Self {
-		Self::seeded_generate(rand::rng())
+		Self::seeded_generate(&mut rand::rng())
 	}
 }
 
 const BASE64_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-pub fn generate_random_base64_values(len: usize) -> String {
-	let mut rng = rand::rng();
+pub fn generate_random_base64_values(len: usize, rng: &mut rand::prelude::ThreadRng) -> String {
 	let mut values = String::with_capacity(len);
 	for _ in 0..len {
 		values.push(
