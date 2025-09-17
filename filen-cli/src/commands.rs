@@ -9,7 +9,7 @@ use filen_sdk_rs::fs::{
 
 use crate::{
 	CommandResult,
-	auth::LazyClient,
+	auth::{LazyClient, export_auth_config},
 	ui::{self, UI},
 	util::RemotePath,
 };
@@ -83,6 +83,8 @@ pub(crate) enum Commands {
 	ListTrash,
 	/// Permanently delete all trashed items
 	EmptyTrash,
+	/// Export an auth config (to be used with --auth-config-path option)
+	ExportAuthConfig,
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -195,6 +197,18 @@ pub(crate) async fn execute_command(
 		}
 		Commands::EmptyTrash => {
 			empty_trash(ui, client).await?;
+			None
+		}
+		Commands::ExportAuthConfig => {
+			let client = client.get(ui).await?;
+			let export_path = std::env::current_dir()
+				.context("Failed to get current directory")?
+				.join("filen-cli-auth-config");
+			export_auth_config(client, &export_path)?;
+			ui.print_success(&format!(
+				"Exported auth config to {}",
+				export_path.display()
+			));
 			None
 		}
 		Commands::Logout => {

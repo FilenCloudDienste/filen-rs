@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
 use filen_sdk_rs::{
@@ -14,6 +16,7 @@ pub(crate) enum LazyClient {
 	Unauthenticated {
 		email_arg: Option<String>,
 		password_arg: Option<String>,
+		auth_config_path_arg: Option<String>,
 	},
 	Authenticated {
 		client: Box<Client>,
@@ -21,10 +24,15 @@ pub(crate) enum LazyClient {
 }
 
 impl LazyClient {
-	pub(crate) fn new(email_arg: Option<String>, password_arg: Option<String>) -> Self {
+	pub(crate) fn new(
+		email_arg: Option<String>,
+		password_arg: Option<String>,
+		auth_config_path_arg: Option<String>,
+	) -> Self {
 		Self::Unauthenticated {
 			email_arg,
 			password_arg,
+			auth_config_path_arg,
 		}
 	}
 
@@ -34,9 +42,15 @@ impl LazyClient {
 			Self::Unauthenticated {
 				email_arg,
 				password_arg,
+				auth_config_path_arg,
 			} => {
-				let client =
-					authenticate(ui, email_arg.to_owned(), password_arg.as_deref()).await?;
+				let client = authenticate(
+					ui,
+					email_arg.to_owned(),
+					password_arg.as_deref(),
+					auth_config_path_arg.as_deref(),
+				)
+				.await?;
 				ui.set_user(Some(client.email()));
 				*self = Self::Authenticated {
 					client: Box::new(client),
@@ -55,8 +69,12 @@ pub(crate) async fn authenticate(
 	ui: &mut UI,
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
+	auth_config_path_arg: Option<&str>,
 ) -> Result<Client> {
+	// todo: differentiate better betweeen failure and abscence of credentials
 	if let Ok(client) = authenticate_from_cli_args(ui, email_arg, password_arg).await {
+		Ok(client)
+	} else if let Ok(client) = authenticate_from_auth_config(auth_config_path_arg) {
 		Ok(client)
 	} else if let Ok(client) = authenticate_from_environment_variables(ui).await {
 		Ok(client)
@@ -109,6 +127,13 @@ async fn authenticate_from_cli_args(
 	Ok(client)
 }
 
+/// Authenticate using SDK config stored in a file ("auth config").
+fn authenticate_from_auth_config(path_arg: Option<&str>) -> Result<Client> {
+	let path = path_arg.context("A path to the auth config file is required")?;
+	let sdk_config = std::fs::read_to_string(path).context("Failed to read auth config file")?;
+	deserialize_auth_config(&sdk_config)
+}
+
 /// Authenticate from credentials provided via environment variables.
 async fn authenticate_from_environment_variables(ui: &mut UI) -> Result<Client> {
 	let email = std::env::var("FILEN_CLI_EMAIL")
@@ -129,14 +154,7 @@ async fn authenticate_from_keyring() -> Result<Client> {
 	let Some(sdk_config) = sdk_config else {
 		return Err(anyhow!("No SDK config found in keyring"));
 	};
-	let sdk_config = base64.decode(sdk_config)?;
-	let Ok(sdk_config) = serde_json::from_slice::<StringifiedClient>(&sdk_config) else {
-		eprintln!("Invalid SDK config in keyring! Try to `logout`.");
-		return Err(anyhow!("Failed to parse SDK config from keyring"));
-	};
-	let client =
-		Client::from_stringified(sdk_config).context("Failed to create client from SDK config")?;
-	Ok(client)
+	deserialize_auth_config(&sdk_config)
 }
 
 /// Authenticate using credentials provided interactively.
@@ -149,9 +167,7 @@ async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 
 	// optionally, save credentials
 	if ui.prompt_confirm("Keep me logged in?", true)? {
-		let sdk_config = client.to_stringified();
-		let sdk_config = serde_json::to_string(&sdk_config).unwrap();
-		let sdk_config = base64.encode(sdk_config);
+		let sdk_config = serialize_auth_config(&client)?;
 		LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 			.write(&sdk_config)
 			.context("Failed to write SDK config to keyring")?;
@@ -161,10 +177,35 @@ async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 	Ok(client)
 }
 
+pub(crate) fn export_auth_config(client: &Client, path: &PathBuf) -> Result<()> {
+	let sdk_config = serialize_auth_config(client)?;
+	std::fs::write(path, sdk_config).context(format!(
+		"Failed to write auth config to file {}",
+		path.display()
+	))?;
+	Ok(())
+}
+
 /// Deletes credentials from the keyring. Returns true if successful.
 pub(crate) fn delete_credentials() -> Result<bool> {
 	let deleted = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 		.delete()
 		.context("Failed to delete SDK config from keyring")?;
 	Ok(deleted)
+}
+
+fn serialize_auth_config(client: &Client) -> Result<String> {
+	let sdk_config = client.to_stringified();
+	let sdk_config = serde_json::to_string(&sdk_config).unwrap();
+	let sdk_config = base64.encode(sdk_config);
+	Ok(sdk_config)
+}
+
+fn deserialize_auth_config(sdk_config: &str) -> Result<Client> {
+	let sdk_config = base64.decode(sdk_config)?;
+	let sdk_config = serde_json::from_slice::<StringifiedClient>(&sdk_config)
+		.context("Failed to parse auth config (it may be corrupt)")?;
+	let client =
+		Client::from_stringified(sdk_config).context("Failed to create client from SDK config")?;
+	Ok(client)
 }

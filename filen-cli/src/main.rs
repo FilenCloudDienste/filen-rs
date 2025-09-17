@@ -21,6 +21,10 @@ pub(crate) struct Cli {
 	#[arg(short, long)]
 	password: Option<String>,
 
+	/// Path to auth config file
+	#[arg(long)]
+	auth_config_path: Option<String>,
+
 	#[command(subcommand)]
 	command: Option<Commands>,
 }
@@ -30,7 +34,7 @@ async fn main() -> Result<()> {
 	let mut ui = ui::UI::new();
 
 	let cli = Cli::parse();
-	let mut client = auth::LazyClient::new(cli.email, cli.password);
+	let mut client = auth::LazyClient::new(cli.email, cli.password, cli.auth_config_path);
 
 	let mut working_path = RemotePath::new("");
 
