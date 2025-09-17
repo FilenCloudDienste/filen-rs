@@ -79,6 +79,10 @@ pub(crate) enum Commands {
 		/// File or directory to unfavorite
 		file_or_directory: String,
 	},
+	/// List trashed items with option to restore or permanently delete them
+	ListTrash,
+	/// Permanently delete all trashed items
+	EmptyTrash,
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -183,6 +187,14 @@ pub(crate) async fn execute_command(
 		Commands::Unfavorite { file_or_directory } => {
 			set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, false)
 				.await?;
+			None
+		}
+		Commands::ListTrash => {
+			list_trash(ui).await?;
+			None
+		}
+		Commands::EmptyTrash => {
+			empty_trash(ui, client).await?;
 			None
 		}
 		Commands::Logout => {
@@ -629,5 +641,18 @@ async fn set_file_or_directory_favorite(
 			return Err(anyhow!("Cannot change favorite status of shared file"));
 		}
 	}
+	Ok(())
+}
+
+async fn list_trash(ui: &mut UI) -> Result<()> {
+	//todo: how can I get the trash dir?
+	ui.print_muted("Not implemented yet");
+	Ok(())
+}
+
+async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
+	let client = client.get(ui).await?;
+	client.empty_trash().await?;
+	ui.print_success("Emptied trash");
 	Ok(())
 }
