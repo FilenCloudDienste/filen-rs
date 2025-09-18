@@ -293,9 +293,6 @@ async fn set_up_contact_no_add<'a>(
 		.await
 		.unwrap();
 
-	let mut num_shared_out = 0;
-	let mut num_shared_in = 0;
-
 	let _ = futures::join!(
 		async {
 			for contact in client.get_contacts().await.unwrap() {
@@ -323,7 +320,6 @@ async fn set_up_contact_no_add<'a>(
 				.into_iter()
 				.filter_map(|d| {
 					if d.get_dir().name().unwrap().starts_with("compat-") {
-						num_shared_out += 1;
 						None
 					} else {
 						Some((*d.get_dir().uuid(), d.get_source_id()))
@@ -347,7 +343,6 @@ async fn set_up_contact_no_add<'a>(
 				.into_iter()
 				.filter_map(|d| {
 					if d.get_dir().name().unwrap().starts_with("compat-") {
-						num_shared_in += 1;
 						None
 					} else {
 						Some(*d.get_dir().uuid())
@@ -382,7 +377,9 @@ async fn set_up_contact_no_add<'a>(
 		}
 	);
 	tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-	(lock1, lock2, num_shared_out, num_shared_in)
+	let (out_dirs, _) = client.list_out_shared(None).await.unwrap();
+	let (in_dirs, _) = share_client.list_in_shared().await.unwrap();
+	(lock1, lock2, out_dirs.len(), in_dirs.len())
 }
 
 async fn set_up_contact<'a>(
