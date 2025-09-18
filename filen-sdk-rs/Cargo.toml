@@ -43,9 +43,8 @@ argon2 = { version = "0.5.3", features = ["std"] }
 serde_path_to_error = "0.1.17"
 sha1 = "0.10.6"
 futures = "0.3.31"
-# custom version here because the base crate doesn't support image/qoi
-# until https://github.com/abonander/mime_guess/pull/101 is merged and released
-mime_guess = { git = "https://github.com/Enduriel/mime_guess", rev = "a65301ae52c812be31a2d1203f006a880c7206b3" }
+# Waiting until https://github.com/abonander/mime_guess/pull/101 is in a released version
+mime_guess = { git = "https://github.com/abonander/mime_guess", rev = "90f3d09696f7c08dcac94ca2bb2a279383bb20ce" }
 md2 = "0.10.2"
 md4 = "0.10.2"
 md-5 = "0.10.6"
