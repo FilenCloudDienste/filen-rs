@@ -14,7 +14,7 @@ use crate::{
 	Error, ErrorKind, api,
 	auth::Client,
 	crypto::{
-		notes::{NoteKey, NoteOrChatCarrierCryptoExt},
+		notes_and_chats::{NoteOrChatCarrierCryptoExt, NoteOrChatKey, NoteOrChatKeyStruct},
 		shared::{CreateRandom, MetaCrypter},
 	},
 	error::MetadataWasNotDecryptedError,
@@ -92,7 +92,7 @@ pub struct Note {
 	tags: Vec<NoteTag>,
 	note_type: NoteType,
 	// none if decryption fails
-	encryption_key: Option<NoteKey>,
+	encryption_key: Option<NoteOrChatKey>,
 	// none if decryption fails
 	title: Option<String>,
 	// none if decryption fails
@@ -169,7 +169,7 @@ impl NoteHistory {
 impl NoteHistory {
 	fn decrypt_with_key(
 		note_history: &filen_types::api::v3::notes::history::NoteHistory<'_>,
-		note_key: &NoteKey,
+		note_key: &NoteOrChatKey,
 		outer_tmp_vec: &mut Vec<u8>,
 	) -> Self {
 		Self {
@@ -186,71 +186,11 @@ impl NoteHistory {
 mod crypto {
 	use std::borrow::Cow;
 
-	use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
-	use rsa::{RsaPrivateKey, RsaPublicKey};
 	use serde::{Deserialize, Serialize};
 
-	use crate::{
-		Error, ErrorKind,
-		crypto::{
-			notes::{NoteKey, NoteOrChatCarrierCrypto, impl_note_or_chat_carrier_crypto},
-			shared::MetaCrypter,
-		},
+	use crate::crypto::notes_and_chats::{
+		NoteOrChatCarrierCrypto, impl_note_or_chat_carrier_crypto,
 	};
-
-	#[derive(Deserialize, Serialize)]
-	pub(super) struct NoteKeyStruct<'a> {
-		key: Cow<'a, NoteKey>,
-	}
-
-	impl NoteKeyStruct<'_> {
-		pub(super) fn try_decrypt_rsa(
-			rsa_key: &RsaPrivateKey,
-			encrypted_key: &RSAEncryptedString<'_>,
-		) -> Result<NoteKey, Error> {
-			let key = crate::crypto::rsa::decrypt_with_private_key(rsa_key, encrypted_key)
-				.map_err(|e| {
-					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note key"))
-				})?;
-			let key_str = str::from_utf8(&key).map_err(|_| {
-				Error::custom(ErrorKind::Response, "Failed to parse note key as UTF-8")
-			})?;
-			let key_struct: NoteKeyStruct = serde_json::from_str(key_str)?;
-			Ok(key_struct.key.into_owned())
-		}
-
-		pub(super) fn try_encrypt_rsa(
-			rsa_key: &RsaPublicKey,
-			note_key: &NoteKey,
-		) -> Result<RSAEncryptedString<'static>, Error> {
-			let key_struct = NoteKeyStruct {
-				key: Cow::Borrowed(note_key),
-			};
-			let key_string = serde_json::to_string(&key_struct)?;
-			let encrypted_key =
-				crate::crypto::rsa::encrypt_with_public_key(rsa_key, key_string.as_bytes())
-					.map_err(|e| {
-						Error::custom_with_source(
-							ErrorKind::Conversion,
-							e,
-							Some("encrypt note key"),
-						)
-					})?;
-			Ok(encrypted_key)
-		}
-
-		pub(super) fn encrypt_symmetric(
-			crypter: &impl MetaCrypter,
-			note_key: &NoteKey,
-		) -> EncryptedString<'static> {
-			let key_struct = NoteKeyStruct {
-				key: Cow::Borrowed(note_key),
-			};
-			let key_string =
-				serde_json::to_string(&key_struct).expect("Failed to serialize note key");
-			crypter.encrypt_meta(&key_string)
-		}
-	}
 
 	#[derive(Deserialize, Serialize)]
 	pub(super) struct NoteTitle<'a> {
@@ -292,7 +232,7 @@ impl Client {
 	fn decrypt_note_key(
 		&self,
 		note: &filen_types::api::v3::notes::Note<'_>,
-	) -> Result<NoteKey, Error> {
+	) -> Result<NoteOrChatKey, Error> {
 		let participant = note
 			.participants
 			.iter()
@@ -301,7 +241,7 @@ impl Client {
 				Error::custom(ErrorKind::Response, "User is not a participant in the note")
 			})?;
 
-		NoteKeyStruct::try_decrypt_rsa(self.private_key(), &participant.metadata)
+		NoteOrChatKeyStruct::try_decrypt_rsa(self.private_key(), &participant.metadata)
 	}
 
 	fn decrypt_note(
@@ -384,7 +324,7 @@ impl Client {
 		public_key: &RsaPublicKey,
 		note_participant_parts: NoteParticipantParts,
 	) -> Result<(), Error> {
-		let data = NoteKeyStruct::try_encrypt_rsa(
+		let data = NoteOrChatKeyStruct::try_encrypt_rsa(
 			public_key,
 			note.encryption_key
 				.as_ref()
@@ -479,9 +419,9 @@ impl Client {
 	pub async fn create_note(&self, title: Option<String>) -> Result<Note, Error> {
 		let uuid = UuidStr::new_v4();
 		let title = title.unwrap_or_else(|| Utc::now().format("%a %b %d %Y %X").to_string());
-		let key = NoteKey::generate();
+		let key = NoteOrChatKey::generate();
 
-		let key_string = NoteKeyStruct::encrypt_symmetric(self.crypter(), &key);
+		let key_string = NoteOrChatKeyStruct::encrypt_symmetric(self.crypter(), &key);
 		let title_string = NoteTitle::encrypt(&key, &title);
 
 		let _lock = self.lock_notes().await?;

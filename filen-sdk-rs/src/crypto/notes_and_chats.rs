@@ -1,6 +1,7 @@
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
-use filen_types::crypto::EncryptedString;
+use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -13,36 +14,36 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NoteKey {
+pub enum NoteOrChatKey {
 	V2(V2Key),
 	V3(EncryptionKey),
 }
 
-impl Serialize for NoteKey {
+impl Serialize for NoteOrChatKey {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,
 	{
 		match self {
-			NoteKey::V2(key) => key.as_ref().serialize(serializer),
-			NoteKey::V3(key) => key.serialize(serializer),
+			NoteOrChatKey::V2(key) => key.as_ref().serialize(serializer),
+			NoteOrChatKey::V3(key) => key.serialize(serializer),
 		}
 	}
 }
 
-impl<'de> Deserialize<'de> for NoteKey {
+impl<'de> Deserialize<'de> for NoteOrChatKey {
 	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
 		let key = String::deserialize(deserializer)?;
 		match key.len() {
-			32 => Ok(NoteKey::V2(
+			32 => Ok(NoteOrChatKey::V2(
 				MasterKey::try_from(key)
 					.map_err(serde::de::Error::custom)?
 					.0,
 			)),
-			64 => Ok(NoteKey::V3(
+			64 => Ok(NoteOrChatKey::V3(
 				EncryptionKey::from_str(&key).map_err(serde::de::Error::custom)?,
 			)),
 			len => Err(serde::de::Error::custom(format!(
@@ -52,15 +53,15 @@ impl<'de> Deserialize<'de> for NoteKey {
 	}
 }
 
-impl MetaCrypter for NoteKey {
+impl MetaCrypter for NoteOrChatKey {
 	fn encrypt_meta_into(
 		&self,
 		meta: &str,
 		out: String,
 	) -> filen_types::crypto::EncryptedString<'static> {
 		match self {
-			NoteKey::V2(key) => key.encrypt_meta_into(meta, out),
-			NoteKey::V3(key) => key.encrypt_meta_into(meta, out),
+			NoteOrChatKey::V2(key) => key.encrypt_meta_into(meta, out),
+			NoteOrChatKey::V3(key) => key.encrypt_meta_into(meta, out),
 		}
 	}
 
@@ -70,29 +71,29 @@ impl MetaCrypter for NoteKey {
 		out: Vec<u8>,
 	) -> Result<String, (super::error::ConversionError, Vec<u8>)> {
 		match self {
-			NoteKey::V2(key) => key.decrypt_meta_into(meta, out),
-			NoteKey::V3(key) => key.decrypt_meta_into(meta, out),
+			NoteOrChatKey::V2(key) => key.decrypt_meta_into(meta, out),
+			NoteOrChatKey::V3(key) => key.decrypt_meta_into(meta, out),
 		}
 	}
 }
 
-impl DataCrypter for NoteKey {
+impl DataCrypter for NoteOrChatKey {
 	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), super::error::ConversionError> {
 		match self {
-			NoteKey::V2(key) => key.encrypt_data(data),
-			NoteKey::V3(key) => key.encrypt_data(data),
+			NoteOrChatKey::V2(key) => key.encrypt_data(data),
+			NoteOrChatKey::V3(key) => key.encrypt_data(data),
 		}
 	}
 
 	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), super::error::ConversionError> {
 		match self {
-			NoteKey::V2(key) => key.decrypt_data(data),
-			NoteKey::V3(key) => key.decrypt_data(data),
+			NoteOrChatKey::V2(key) => key.decrypt_data(data),
+			NoteOrChatKey::V3(key) => key.decrypt_data(data),
 		}
 	}
 }
 
-impl CreateRandom for NoteKey {
+impl CreateRandom for NoteOrChatKey {
 	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
 		Self::V2(MasterKey::seeded_generate(rng).0)
 	}
@@ -164,3 +165,50 @@ macro_rules! impl_note_or_chat_carrier_crypto {
 }
 
 pub(crate) use impl_note_or_chat_carrier_crypto;
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct NoteOrChatKeyStruct<'a> {
+	key: Cow<'a, NoteOrChatKey>,
+}
+
+impl NoteOrChatKeyStruct<'_> {
+	pub(crate) fn try_decrypt_rsa(
+		rsa_key: &RsaPrivateKey,
+		encrypted_key: &RSAEncryptedString<'_>,
+	) -> Result<NoteOrChatKey, Error> {
+		let key =
+			crate::crypto::rsa::decrypt_with_private_key(rsa_key, encrypted_key).map_err(|e| {
+				Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note key"))
+			})?;
+		let key_str = str::from_utf8(&key)
+			.map_err(|_| Error::custom(ErrorKind::Response, "Failed to parse note key as UTF-8"))?;
+		let key_struct: NoteOrChatKeyStruct = serde_json::from_str(key_str)?;
+		Ok(key_struct.key.into_owned())
+	}
+
+	pub(crate) fn try_encrypt_rsa(
+		rsa_key: &RsaPublicKey,
+		note_key: &NoteOrChatKey,
+	) -> Result<RSAEncryptedString<'static>, Error> {
+		let key_struct = NoteOrChatKeyStruct {
+			key: Cow::Borrowed(note_key),
+		};
+		let key_string = serde_json::to_string(&key_struct)?;
+		let encrypted_key =
+			crate::crypto::rsa::encrypt_with_public_key(rsa_key, key_string.as_bytes()).map_err(
+				|e| Error::custom_with_source(ErrorKind::Conversion, e, Some("encrypt note key")),
+			)?;
+		Ok(encrypted_key)
+	}
+
+	pub(crate) fn encrypt_symmetric(
+		crypter: &impl MetaCrypter,
+		note_key: &NoteOrChatKey,
+	) -> EncryptedString<'static> {
+		let key_struct = NoteOrChatKeyStruct {
+			key: Cow::Borrowed(note_key),
+		};
+		let key_string = serde_json::to_string(&key_struct).expect("Failed to serialize note key");
+		crypter.encrypt_meta(&key_string)
+	}
+}

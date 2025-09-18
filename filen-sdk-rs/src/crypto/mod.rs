@@ -1,7 +1,7 @@
 pub mod connect;
 pub mod error;
 pub mod file;
-pub mod notes;
+pub mod notes_and_chats;
 pub mod rsa;
 pub mod shared;
 pub mod v1;
