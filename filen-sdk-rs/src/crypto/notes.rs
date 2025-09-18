@@ -1,11 +1,15 @@
 use std::str::FromStr;
 
+use filen_types::crypto::EncryptedString;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{
-	shared::{CreateRandom, DataCrypter, MetaCrypter},
-	v2::{MasterKey, V2Key},
-	v3::EncryptionKey,
+use crate::{
+	Error, ErrorKind,
+	crypto::{
+		shared::{CreateRandom, DataCrypter, MetaCrypter},
+		v2::{MasterKey, V2Key},
+		v3::EncryptionKey,
+	},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,3 +97,70 @@ impl CreateRandom for NoteKey {
 		Self::V2(MasterKey::seeded_generate(rng).0)
 	}
 }
+
+pub(crate) trait NoteOrChatCarrierCrypto<T>
+where
+	T: ToOwned + ?Sized,
+{
+	type WithLifetime<'de>: Serialize + Deserialize<'de>;
+	const NAME: &'static str;
+	fn into_inner<'a>(item: Self::WithLifetime<'a>) -> T::Owned;
+	fn from_inner<'a>(s: &'a T) -> Self::WithLifetime<'a>;
+}
+
+pub(crate) trait NoteOrChatCarrierCryptoExt<T>: NoteOrChatCarrierCrypto<T>
+where
+	T: ToOwned + ?Sized,
+{
+	fn try_decrypt(
+		crypter: &impl MetaCrypter,
+		encrypted: &EncryptedString<'_>,
+		outer_tmp_vec: &mut Vec<u8>,
+	) -> Result<T::Owned, Error> {
+		let tmp_vec = std::mem::take(outer_tmp_vec);
+		let decrypted = crypter
+			.decrypt_meta_into(encrypted, tmp_vec)
+			.map_err(|(e, tmp_vec)| {
+				*outer_tmp_vec = tmp_vec;
+				Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note title"))
+			})?;
+
+		let carrier: Self::WithLifetime<'_> = serde_json::from_str(&decrypted)?;
+		let out_string = Self::into_inner(carrier);
+		*outer_tmp_vec = decrypted.into_bytes();
+		Ok(out_string)
+	}
+
+	fn encrypt(crypter: &impl MetaCrypter, inner: &T) -> EncryptedString<'static> {
+		let struct_ = Self::from_inner(inner);
+		let struct_string =
+			serde_json::to_string(&struct_).expect("Failed to serialize note title");
+		crypter.encrypt_meta(&struct_string)
+	}
+}
+
+impl<T: NoteOrChatCarrierCrypto<U>, U> NoteOrChatCarrierCryptoExt<U> for T where U: ToOwned + ?Sized {}
+
+macro_rules! impl_note_or_chat_carrier_crypto {
+	($struct_name:ident, $field_name:ident, $debug_name:literal, $inner_type_name:ident) => {
+		impl NoteOrChatCarrierCrypto<$inner_type_name> for $struct_name<'_> {
+			type WithLifetime<'a> = $struct_name<'a>;
+
+			const NAME: &'static str = $debug_name;
+
+			fn into_inner<'a>(
+				item: Self::WithLifetime<'a>,
+			) -> <$inner_type_name as ToOwned>::Owned {
+				item.$field_name.into_owned()
+			}
+
+			fn from_inner(s: &$inner_type_name) -> Self::WithLifetime<'_> {
+				$struct_name {
+					$field_name: Cow::Borrowed(s),
+				}
+			}
+		}
+	};
+}
+
+pub(crate) use impl_note_or_chat_carrier_crypto;

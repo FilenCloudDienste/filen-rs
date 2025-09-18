@@ -14,7 +14,7 @@ use crate::{
 	Error, ErrorKind, api,
 	auth::Client,
 	crypto::{
-		notes::NoteKey,
+		notes::{NoteKey, NoteOrChatCarrierCryptoExt},
 		shared::{CreateRandom, MetaCrypter},
 	},
 	error::MetadataWasNotDecryptedError,
@@ -192,7 +192,10 @@ mod crypto {
 
 	use crate::{
 		Error, ErrorKind,
-		crypto::{notes::NoteKey, shared::MetaCrypter},
+		crypto::{
+			notes::{NoteKey, NoteOrChatCarrierCrypto, impl_note_or_chat_carrier_crypto},
+			shared::MetaCrypter,
+		},
 	};
 
 	#[derive(Deserialize, Serialize)]
@@ -251,148 +254,31 @@ mod crypto {
 
 	#[derive(Deserialize, Serialize)]
 	pub(super) struct NoteTitle<'a> {
+		#[serde(borrow)]
 		title: Cow<'a, str>,
 	}
-
-	impl NoteTitle<'_> {
-		pub(super) fn try_decrypt(
-			note_key: &NoteKey,
-			encrypted_title: &EncryptedString<'_>,
-			outer_tmp_vec: &mut Vec<u8>,
-		) -> Result<String, Error> {
-			let tmp_vec = std::mem::take(outer_tmp_vec);
-			let decrypted_title = note_key
-				.decrypt_meta_into(encrypted_title, tmp_vec)
-				.map_err(|(e, tmp_vec)| {
-					*outer_tmp_vec = tmp_vec;
-					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note title"))
-				})?;
-			let title_struct: NoteTitle = serde_json::from_str(&decrypted_title)?;
-			*outer_tmp_vec = decrypted_title.into_bytes();
-			Ok(title_struct.title.into_owned())
-		}
-
-		pub(super) fn encrypt(note_key: &NoteKey, title: &str) -> EncryptedString<'static> {
-			let title_struct = NoteTitle {
-				title: Cow::Borrowed(title),
-			};
-			let title_string =
-				serde_json::to_string(&title_struct).expect("Failed to serialize note title");
-			note_key.encrypt_meta(&title_string)
-		}
-	}
+	impl_note_or_chat_carrier_crypto!(NoteTitle, title, "note title", str);
 
 	#[derive(Deserialize, Serialize)]
 	pub(super) struct NotePreview<'a> {
+		#[serde(borrow)]
 		preview: Cow<'a, str>,
 	}
-
-	impl NotePreview<'_> {
-		pub(super) fn try_decrypt(
-			note_key: &NoteKey,
-			encrypted_preview: &EncryptedString<'_>,
-			outer_tmp_vec: &mut Vec<u8>,
-		) -> Result<String, Error> {
-			if encrypted_preview.0.is_empty() {
-				return Ok(String::new());
-			}
-
-			let tmp_vec = std::mem::take(outer_tmp_vec);
-			let decrypted_preview = note_key
-				.decrypt_meta_into(encrypted_preview, tmp_vec)
-				.map_err(|(e, tmp_vec)| {
-					*outer_tmp_vec = tmp_vec;
-					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note preview"))
-				})?;
-			let preview_struct: NotePreview = serde_json::from_str(&decrypted_preview)?;
-			*outer_tmp_vec = decrypted_preview.into_bytes();
-			Ok(preview_struct.preview.into_owned())
-		}
-
-		pub(super) fn encrypt(note_key: &NoteKey, preview: &str) -> EncryptedString<'static> {
-			let preview_struct = NotePreview {
-				preview: Cow::Borrowed(preview),
-			};
-			let preview_string =
-				serde_json::to_string(&preview_struct).expect("Failed to serialize note preview");
-			note_key.encrypt_meta(&preview_string)
-		}
-	}
+	impl_note_or_chat_carrier_crypto!(NotePreview, preview, "note preview", str);
 
 	#[derive(Deserialize, Serialize)]
 	pub(super) struct NoteTagName<'a> {
+		#[serde(borrow)]
 		name: Cow<'a, str>,
 	}
-
-	impl NoteTagName<'_> {
-		pub(super) fn try_decrypt(
-			crypter: &impl MetaCrypter,
-			encrypted_name: &EncryptedString<'_>,
-			outer_tmp_vec: &mut Vec<u8>,
-		) -> Result<String, Error> {
-			let tmp_vec = std::mem::take(outer_tmp_vec);
-			let decrypted_name =
-				crypter
-					.decrypt_meta_into(encrypted_name, tmp_vec)
-					.map_err(|(e, tmp_vec)| {
-						*outer_tmp_vec = tmp_vec;
-						Error::custom_with_source(
-							ErrorKind::Response,
-							e,
-							Some("decrypt note tag name"),
-						)
-					})?;
-			let name_struct: NoteTagName = serde_json::from_str(&decrypted_name)?;
-			*outer_tmp_vec = decrypted_name.into_bytes();
-			Ok(name_struct.name.into_owned())
-		}
-
-		pub(super) fn encrypt(crypter: &impl MetaCrypter, name: &str) -> EncryptedString<'static> {
-			let name_struct = NoteTagName {
-				name: Cow::Borrowed(name),
-			};
-			let name_string =
-				serde_json::to_string(&name_struct).expect("Failed to serialize note tag name");
-			crypter.encrypt_meta(&name_string)
-		}
-	}
+	impl_note_or_chat_carrier_crypto!(NoteTagName, name, "note tag name", str);
 
 	#[derive(Deserialize, Serialize)]
 	pub(super) struct NoteContent<'a> {
+		#[serde(borrow)]
 		content: Cow<'a, str>,
 	}
-
-	impl NoteContent<'_> {
-		pub(super) fn try_decrypt(
-			note_key: &NoteKey,
-			encrypted_content: &EncryptedString<'_>,
-			outer_tmp_vec: &mut Vec<u8>,
-		) -> Result<String, Error> {
-			if encrypted_content.0.is_empty() {
-				return Ok(String::new());
-			}
-
-			let tmp_vec = std::mem::take(outer_tmp_vec);
-			let decrypted_content = note_key
-				.decrypt_meta_into(encrypted_content, tmp_vec)
-				.map_err(|(e, tmp_vec)| {
-					*outer_tmp_vec = tmp_vec;
-					Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note content"))
-				})?;
-			let content_struct: NoteContent = serde_json::from_str(&decrypted_content)?;
-			*outer_tmp_vec = decrypted_content.into_bytes();
-			Ok(content_struct.content.into_owned())
-		}
-
-		pub(super) fn encrypt(note_key: &NoteKey, content: &str) -> EncryptedString<'static> {
-			let content_struct = NoteContent {
-				content: Cow::Borrowed(content),
-			};
-			let content_string =
-				serde_json::to_string(&content_struct).expect("Failed to serialize note content");
-			note_key.encrypt_meta(&content_string)
-		}
-	}
+	impl_note_or_chat_carrier_crypto!(NoteContent, content, "note content", str);
 }
 
 impl Client {
