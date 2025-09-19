@@ -143,6 +143,7 @@ pub struct Client {
 
 	pub(crate) drive_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 	pub(crate) notes_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
+	pub(crate) chats_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 
 	pub(crate) api_semaphore: tokio::sync::Semaphore,
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
@@ -243,6 +244,7 @@ impl Client {
 			http_client: Arc::new(AuthClient::new(APIKey(Cow::Owned(stringified.api_key)))),
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
+			chats_lock: tokio::sync::RwLock::new(None),
 			api_semaphore: tokio::sync::Semaphore::new(
 				stringified
 					.max_parallel_requests
@@ -416,6 +418,7 @@ impl Client {
 			http_client: Arc::new(client),
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
+			chats_lock: tokio::sync::RwLock::new(None),
 			api_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
 			memory_semaphore: tokio::sync::Semaphore::new(
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,

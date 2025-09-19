@@ -23,13 +23,9 @@ pub struct Response<'a>(pub Vec<ChatMessage<'a>>);
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage<'a> {
 	pub conversation: UuidStr,
-	pub uuid: UuidStr,
-	pub sender_id: u64,
-	pub sender_email: Cow<'a, str>,
-	pub sender_avatar: Option<Cow<'a, str>>,
-	pub sender_nick_name: Cow<'a, str>,
-	pub message: EncryptedString<'a>,
-	pub reply_to: Option<ChatMessageReplyInfo<'a>>,
+	#[serde(flatten)]
+	pub inner: ChatMessagePartial<'a>,
+	pub reply_to: Option<ChatMessagePartial<'a>>,
 	pub embed_disabled: bool,
 	pub edited: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -40,11 +36,11 @@ pub struct ChatMessage<'a> {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct ChatMessageReplyInfo<'a> {
+pub struct ChatMessagePartial<'a> {
 	pub uuid: UuidStr,
 	pub sender_id: u64,
 	pub sender_email: Cow<'a, str>,
-	pub sender_avatar: Cow<'a, str>,
+	pub sender_avatar: Option<Cow<'a, str>>,
 	pub sender_nick_name: Cow<'a, str>,
-	pub message: Cow<'a, str>,
+	pub message: EncryptedString<'a>,
 }

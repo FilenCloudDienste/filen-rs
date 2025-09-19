@@ -1,7 +1,7 @@
-pub use filen_types::api::v3::chat::messages::{ENDPOINT, Request};
+pub use filen_types::api::v3::chat::unread::{ENDPOINT, Response};
 
-use crate::{api::post_auth_request_empty, auth::http::AuthorizedClient, error::Error};
+use crate::{api::get_auth_request, auth::http::AuthorizedClient, error::Error};
 
-pub(crate) async fn post(client: impl AuthorizedClient, request: &Request) -> Result<(), Error> {
-	post_auth_request_empty(client, request, ENDPOINT).await
+pub(crate) async fn get(client: impl AuthorizedClient) -> Result<Response, Error> {
+	get_auth_request(client, ENDPOINT).await
 }

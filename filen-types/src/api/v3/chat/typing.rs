@@ -7,8 +7,9 @@ pub const ENDPOINT: &str = "v3/chat/typing";
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	conversation: UuidStr,
-	r#type: ChatTypingType,
+	pub conversation: UuidStr,
+	#[serde(rename = "type")]
+	pub signal_type: ChatTypingType,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

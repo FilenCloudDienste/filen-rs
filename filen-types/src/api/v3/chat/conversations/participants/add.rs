@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::EncryptedString, fs::UuidStr};
+use crate::{crypto::rsa::RSAEncryptedString, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/chat/conversations/participants/add";
 
@@ -9,5 +9,5 @@ pub const ENDPOINT: &str = "v3/chat/conversations/participants/add";
 pub struct Request<'a> {
 	pub uuid: UuidStr,
 	pub contact_uuid: UuidStr,
-	pub metadata: EncryptedString<'a>,
+	pub metadata: RSAEncryptedString<'a>,
 }

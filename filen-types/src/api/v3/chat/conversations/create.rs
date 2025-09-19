@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::EncryptedString, fs::UuidStr};
+use crate::{
+	crypto::{EncryptedString, rsa::RSAEncryptedString},
+	fs::UuidStr,
+};
 
 pub const ENDPOINT: &str = "v3/chat/conversations/create";
 
@@ -8,6 +11,6 @@ pub const ENDPOINT: &str = "v3/chat/conversations/create";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub uuid: UuidStr,
-	pub metadata: EncryptedString<'a>,
+	pub metadata: RSAEncryptedString<'a>,
 	pub owner_metadata: EncryptedString<'a>,
 }

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::fs::UuidStr;
@@ -14,5 +15,6 @@ pub struct Request {
 #[serde(rename_all = "camelCase")]
 pub struct ChatLastFocusValues {
 	uuid: UuidStr,
-	last_focus: u64,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	last_focus: DateTime<Utc>,
 }

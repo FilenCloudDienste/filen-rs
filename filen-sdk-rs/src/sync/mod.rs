@@ -36,6 +36,10 @@ impl Client {
 	pub async fn lock_notes(&self) -> Result<Arc<lock::ResourceLock>, Error> {
 		self.lock_resource(&self.notes_lock, "notes-write").await
 	}
+
+	pub async fn lock_chats(&self) -> Result<Arc<lock::ResourceLock>, Error> {
+		self.lock_resource(&self.chats_lock, "chats-write").await
+	}
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

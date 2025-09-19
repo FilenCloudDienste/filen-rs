@@ -6,4 +6,4 @@ pub const ENDPOINT: &str = "v3/chat/lastFocus";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Response(Vec<ChatLastFocusValues>);
+pub struct Response(pub Vec<ChatLastFocusValues>);
