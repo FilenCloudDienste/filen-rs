@@ -366,7 +366,7 @@ async fn note_tag_manipulation() {
 		client.delete_note_tag(tag).await.unwrap();
 	}
 
-	let tag1 = client.create_note_tag("Tag1".to_string()).await.unwrap();
+	let mut tag1 = client.create_note_tag("Tag1".to_string()).await.unwrap();
 	let tag2 = client.create_note_tag("Tag2".to_string()).await.unwrap();
 	let tag3 = client.create_note_tag("Tag3".to_string()).await.unwrap();
 
@@ -376,37 +376,35 @@ async fn note_tag_manipulation() {
 	assert!(tags.contains(&tag2));
 	assert!(tags.contains(&tag3));
 
-	// tests below are waiting for API updates to return timestamp changes
+	client
+		.rename_note_tag(&mut tag1, "New Tag1".to_string())
+		.await
+		.unwrap();
 
-	// client
-	// 	.rename_note_tag(&mut tag1, "New Tag1".to_string())
-	// 	.await
-	// 	.unwrap();
+	assert_eq!(tag1.name(), Some("New Tag1"));
 
-	// assert_eq!(tag1.name(), Some("New Tag1"));
+	let tags = client.list_note_tags().await.unwrap();
+	println!("{tags:?}");
+	println!("tag1: {tag1:?}");
+	assert!(tags.contains(&tag1));
 
-	// let tags = client.list_note_tags().await.unwrap();
-	// println!("{tags:?}");
-	// println!("tag1: {tag1:?}");
-	// assert!(tags.contains(&tag1));
+	client
+		.set_note_tag_favorited(&mut tag1, true)
+		.await
+		.unwrap();
+	assert!(tag1.favorited());
+	let tags = client.list_note_tags().await.unwrap();
+	println!("{tags:?}");
+	println!("tag1: {tag1:?}");
+	assert!(tags.contains(&tag1));
 
-	// client
-	// 	.set_note_tag_favorited(&mut tag1, true)
-	// 	.await
-	// 	.unwrap();
-	// assert!(tag1.favorited());
-	// let tags = client.list_note_tags().await.unwrap();
-	// println!("{tags:?}");
-	// println!("tag1: {tag1:?}");
-	// assert!(tags.contains(&tag1));
-
-	// client
-	// 	.set_note_tag_favorited(&mut tag1, false)
-	// 	.await
-	// 	.unwrap();
-	// assert!(!tag1.favorited());
-	// let tags = client.list_note_tags().await.unwrap();
-	// assert!(tags.contains(&tag1));
+	client
+		.set_note_tag_favorited(&mut tag1, false)
+		.await
+		.unwrap();
+	assert!(!tag1.favorited());
+	let tags = client.list_note_tags().await.unwrap();
+	assert!(tags.contains(&tag1));
 
 	client.delete_note_tag(tag2).await.unwrap();
 	let tags = client.list_note_tags().await.unwrap();

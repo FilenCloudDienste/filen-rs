@@ -188,9 +188,7 @@ mod crypto {
 
 	use serde::{Deserialize, Serialize};
 
-	use crate::crypto::notes_and_chats::{
-		NoteOrChatCarrierCrypto, impl_note_or_chat_carrier_crypto,
-	};
+	use crate::crypto::notes_and_chats::impl_note_or_chat_carrier_crypto;
 
 	#[derive(Deserialize, Serialize)]
 	pub(super) struct NoteTitle<'a> {
@@ -812,7 +810,7 @@ impl Client {
 		let encrypted_name = NoteTagName::encrypt(self.crypter(), &new_name);
 
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::tags::rename::post(
+		let resp = api::v3::notes::tags::rename::post(
 			self.client(),
 			&api::v3::notes::tags::rename::Request {
 				uuid: tag.uuid,
@@ -821,6 +819,7 @@ impl Client {
 		)
 		.await?;
 		tag.name = Some(new_name);
+		tag.edited_timestamp = resp.edited_timestamp;
 		Ok(())
 	}
 
@@ -830,7 +829,7 @@ impl Client {
 		favorite: bool,
 	) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::tags::favorite::post(
+		let resp = api::v3::notes::tags::favorite::post(
 			self.client(),
 			&api::v3::notes::tags::favorite::Request {
 				uuid: tag.uuid,
@@ -839,6 +838,7 @@ impl Client {
 		)
 		.await?;
 		tag.favorite = favorite;
+		tag.edited_timestamp = resp.edited_timestamp;
 		Ok(())
 	}
 
