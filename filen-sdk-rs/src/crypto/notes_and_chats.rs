@@ -102,6 +102,7 @@ impl CreateRandom for NoteOrChatKey {
 pub(crate) trait NoteOrChatCarrierCrypto<T>
 where
 	T: ToOwned + ?Sized,
+	T::Owned: Default,
 {
 	type WithLifetime<'de>: Serialize + Deserialize<'de>;
 	const NAME: &'static str;
@@ -112,12 +113,17 @@ where
 pub(crate) trait NoteOrChatCarrierCryptoExt<T>: NoteOrChatCarrierCrypto<T>
 where
 	T: ToOwned + ?Sized,
+	T::Owned: Default,
 {
 	fn try_decrypt(
 		crypter: &impl MetaCrypter,
 		encrypted: &EncryptedString<'_>,
 		outer_tmp_vec: &mut Vec<u8>,
 	) -> Result<T::Owned, Error> {
+		if encrypted.0.is_empty() {
+			return Ok(T::Owned::default());
+		}
+
 		let tmp_vec = std::mem::take(outer_tmp_vec);
 		let decrypted = crypter
 			.decrypt_meta_into(encrypted, tmp_vec)
@@ -140,11 +146,18 @@ where
 	}
 }
 
-impl<T: NoteOrChatCarrierCrypto<U>, U> NoteOrChatCarrierCryptoExt<U> for T where U: ToOwned + ?Sized {}
+impl<T: NoteOrChatCarrierCrypto<U>, U> NoteOrChatCarrierCryptoExt<U> for T
+where
+	U: ToOwned + ?Sized,
+	U::Owned: Default,
+{
+}
 
 macro_rules! impl_note_or_chat_carrier_crypto {
 	($struct_name:ident, $field_name:ident, $debug_name:literal, $inner_type_name:ident) => {
-		impl NoteOrChatCarrierCrypto<$inner_type_name> for $struct_name<'_> {
+		impl crate::crypto::notes_and_chats::NoteOrChatCarrierCrypto<$inner_type_name>
+			for $struct_name<'_>
+		{
 			type WithLifetime<'a> = $struct_name<'a>;
 
 			const NAME: &'static str = $debug_name;
