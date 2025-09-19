@@ -40,9 +40,9 @@ pub struct NoteTag<'a> {
 	pub uuid: UuidStr,
 	pub name: EncryptedString<'a>,
 	pub favorite: bool,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub edited_timestamp: DateTime<Utc>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub created_timestamp: DateTime<Utc>,
 }
 
@@ -56,7 +56,7 @@ pub struct NoteParticipant<'a> {
 	pub nick_name: Cow<'a, str>,
 	pub metadata: RSAEncryptedString<'a>,
 	pub permissions_write: bool,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub added_timestamp: DateTime<Utc>,
 }
 
@@ -77,9 +77,9 @@ pub struct Note<'a> {
 	pub preview: EncryptedString<'a>,
 	pub trash: bool,
 	pub archive: bool,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub created_timestamp: DateTime<Utc>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub edited_timestamp: DateTime<Utc>,
 	pub participants: Vec<NoteParticipant<'a>>,
 }

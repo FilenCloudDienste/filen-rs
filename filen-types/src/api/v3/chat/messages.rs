@@ -11,7 +11,7 @@ pub const ENDPOINT: &str = "v3/chat/messages";
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub conversation: UuidStr,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 }
 
@@ -32,8 +32,10 @@ pub struct ChatMessage<'a> {
 	pub reply_to: Option<ChatMessageReplyInfo<'a>>,
 	pub embed_disabled: bool,
 	pub edited: bool,
-	pub edited_timestamp: u64,
-	pub sent_timestamp: u64,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub edited_timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub sent_timestamp: DateTime<Utc>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
