@@ -12,6 +12,7 @@ mod ui;
 mod util;
 
 #[derive(Debug, Parser)]
+#[clap(name = "Filen CLI", version)]
 pub(crate) struct Cli {
 	/// Filen account email (requires --password)
 	#[arg(short, long)]
