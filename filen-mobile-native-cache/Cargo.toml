@@ -1,7 +1,10 @@
 [package]
 name = "filen-mobile-native-cache"
 version = "0.2.0"
+authors = ["FilenCloudDienste"]
 edition = "2024"
+repository = "https://github.com/FilenCloudDienste/filen-rs"
+license = "AGPL-3.0"
 metadata.workspaces = { independent = true }
 
 [lib]
