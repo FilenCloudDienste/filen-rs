@@ -441,3 +441,103 @@ async fn note_tagging() {
 	// let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
 	// assert_eq!(note, fetched);
 }
+
+#[shared_test_runtime]
+async fn note_sharing() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+
+	let _lock1 = client
+		.acquire_lock_with_default("test:contact")
+		.await
+		.unwrap();
+	let _lock2 = share_client
+		.acquire_lock_with_default("test:contact")
+		.await
+		.unwrap();
+	let _lock = client
+		.acquire_lock_with_default("test:notes")
+		.await
+		.unwrap();
+
+	if let Ok(uuid) = client.send_contact_request(share_client.email()).await {
+		let _ = share_client.accept_contact_request(uuid).await;
+	}
+
+	let contact = client
+		.get_contacts()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|c| c.email == share_client.email())
+		.unwrap();
+
+	let mut note = client.create_note(None).await.unwrap();
+	let content = "Content to be shared.";
+	let preview = "new preview.";
+	client
+		.set_note_content(&mut note, content, preview.to_string())
+		.await
+		.unwrap();
+
+	client
+		.add_note_participant(&mut note, &contact, false)
+		.await
+		.unwrap();
+
+	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
+	assert_eq!(note, fetched);
+	let fetched_content = client.get_note_content(&mut note).await.unwrap();
+	let shared_fetched_content = share_client.get_note_content(&mut note).await.unwrap();
+	assert_eq!(fetched_content, Some(content.to_string()));
+	assert_eq!(shared_fetched_content, Some(content.to_string()));
+
+	let content2 = "This is the updated content of the shared note.";
+	let preview2 = "updated preview";
+
+	share_client
+		.set_note_content(&mut note, content2, preview2.to_string())
+		.await
+		.unwrap_err();
+
+	client
+		.remove_note_participant(&mut note, &contact)
+		.await
+		.unwrap();
+	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
+	assert_eq!(note, fetched);
+
+	client
+		.add_note_participant(&mut note, &contact, true)
+		.await
+		.unwrap();
+	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
+	assert_eq!(note, fetched);
+
+	share_client
+		.set_note_content(&mut note, content2, preview2.to_string())
+		.await
+		.unwrap();
+	let fetched_content = client.get_note_content(&mut note).await.unwrap();
+	let shared_fetched_content = share_client.get_note_content(&mut note).await.unwrap();
+	assert_eq!(fetched_content, Some(content2.to_string()));
+	assert_eq!(shared_fetched_content, Some(content2.to_string()));
+	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
+	assert_eq!(note, fetched);
+
+	client
+		.set_note_participant_permission(&mut note, &contact, false)
+		.await
+		.unwrap();
+	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
+	assert_eq!(note, fetched);
+
+	share_client
+		.set_note_content(&mut note, content, preview.to_string())
+		.await
+		.unwrap_err();
+	let fetched_content = client.get_note_content(&mut note).await.unwrap();
+	let shared_fetched_content = share_client.get_note_content(&mut note).await.unwrap();
+	assert_eq!(fetched_content, Some(content2.to_string()));
+	assert_eq!(shared_fetched_content, Some(content2.to_string()));
+}

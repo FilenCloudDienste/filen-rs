@@ -264,7 +264,7 @@ impl Client {
 			.map(|tag| NoteTag::decrypt_with_key(&tag, self.crypter(), &mut tmp_vec))
 			.collect::<Vec<_>>();
 
-		let participants = note
+		let mut participants = note
 			.participants
 			.into_iter()
 			.map(|p| NoteParticipant {
@@ -277,6 +277,8 @@ impl Client {
 				added_timestamp: p.added_timestamp,
 			})
 			.collect::<Vec<_>>();
+
+		participants.sort_by_key(|p| p.added_timestamp);
 
 		*outer_tmp_vec = tmp_vec;
 
@@ -377,7 +379,7 @@ impl Client {
 
 	pub async fn remove_note_participant(
 		&self,
-		note: &Note,
+		note: &mut Note,
 		contact: &Contact<'_>,
 	) -> Result<(), Error> {
 		crate::api::v3::notes::participants::remove::post(
@@ -387,12 +389,15 @@ impl Client {
 				user_id: contact.user_id,
 			},
 		)
-		.await
+		.await?;
+
+		note.participants.retain(|p| p.user_id != contact.user_id);
+		Ok(())
 	}
 
 	pub async fn set_note_participant_permission(
 		&self,
-		note: &Note,
+		note: &mut Note,
 		contact: &Contact<'_>,
 		write: bool,
 	) -> Result<(), Error> {
@@ -404,7 +409,17 @@ impl Client {
 				permissions_write: write,
 			},
 		)
-		.await
+		.await?;
+
+		if let Some(participant) = note
+			.participants
+			.iter_mut()
+			.find(|p| p.user_id == contact.user_id)
+		{
+			participant.permissions_write = write;
+		}
+
+		Ok(())
 	}
 
 	pub async fn get_note(&self, uuid: UuidStr) -> Result<Option<Note>, Error> {
@@ -566,6 +581,7 @@ impl Client {
 		.await?;
 		note.preview = Some(new_preview);
 		note.edited_timestamp = response.timestamp;
+		note.last_editor_id = self.user_id;
 		Ok(())
 	}
 
