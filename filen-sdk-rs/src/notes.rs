@@ -23,12 +23,32 @@ use crate::{
 use crypto::*;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
+)]
 pub struct NoteTag {
 	uuid: UuidStr,
 	// none if decryption fails
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	name: Option<String>,
 	favorite: bool,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	edited_timestamp: DateTime<Utc>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	created_timestamp: DateTime<Utc>,
 }
 
@@ -72,17 +92,37 @@ struct NoteParticipantParts {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
+)]
 pub struct NoteParticipant {
 	user_id: u64,
 	is_owner: bool,
 	email: String,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	avatar: Option<String>,
 	nick_name: String,
 	permissions_write: bool,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	added_timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
+)]
 pub struct Note {
 	uuid: UuidStr,
 	owner_id: u64,
@@ -92,14 +132,39 @@ pub struct Note {
 	tags: Vec<NoteTag>,
 	note_type: NoteType,
 	// none if decryption fails
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	encryption_key: Option<NoteOrChatKey>,
 	// none if decryption fails
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	title: Option<String>,
 	// none if decryption fails
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	preview: Option<String>,
 	trash: bool,
 	archive: bool,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	created_timestamp: DateTime<Utc>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	edited_timestamp: DateTime<Utc>,
 	participants: Vec<NoteParticipant>,
 }
@@ -143,10 +208,30 @@ impl Note {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
+)]
 pub struct NoteHistory {
 	id: u64,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	preview: Option<String>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	content: Option<String>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	edited_timestamp: DateTime<Utc>,
 	editor_id: u64,
 	note_type: NoteType,
@@ -867,5 +952,268 @@ impl Client {
 			&api::v3::notes::tags::delete::Request { uuid: tag.uuid },
 		)
 		.await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub mod js_impls {
+	use filen_types::{api::v3::notes::NoteType, fs::UuidStr};
+	use serde::Serialize;
+	use tsify::Tsify;
+	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+
+	use crate::{
+		Error, auth::Client, connect::js_impls::Contact, fs::dir::js_impl::tuple_to_jsvalue,
+	};
+
+	use super::{Note, NoteHistory, NoteTag};
+
+	impl wasm_bindgen::__rt::VectorIntoJsValue for NoteTag {
+		fn vector_into_jsvalue(
+			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+		) -> wasm_bindgen::JsValue {
+			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+		}
+	}
+
+	impl wasm_bindgen::__rt::VectorIntoJsValue for Note {
+		fn vector_into_jsvalue(
+			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+		) -> wasm_bindgen::JsValue {
+			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+		}
+	}
+
+	impl wasm_bindgen::__rt::VectorIntoJsValue for NoteHistory {
+		fn vector_into_jsvalue(
+			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+		) -> wasm_bindgen::JsValue {
+			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+		}
+	}
+
+	#[derive(Serialize, Tsify)]
+	#[tsify(into_wasm_abi)]
+	pub struct DuplicateNoteResponse {
+		pub original: Note,
+		pub duplicated: Note,
+	}
+
+	#[wasm_bindgen]
+	impl Client {
+		#[wasm_bindgen(js_name = "listNotes")]
+		pub async fn js_list_notes(&self) -> Result<Vec<Note>, Error> {
+			self.list_notes().await
+		}
+
+		#[wasm_bindgen(js_name = "addNoteParticipant")]
+		pub async fn js_add_note_participant(
+			&self,
+			mut note: Note,
+			contact: Contact,
+			write: bool,
+		) -> Result<Note, Error> {
+			self.add_note_participant(&mut note, &contact.into(), write)
+				.await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "removeNoteParticipant")]
+		pub async fn js_remove_note_participant(
+			&self,
+			mut note: Note,
+			contact: Contact,
+		) -> Result<Note, Error> {
+			self.remove_note_participant(&mut note, &contact.into())
+				.await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "setNoteParticipantPermission")]
+		pub async fn js_set_note_participant_permission(
+			&self,
+			mut note: Note,
+			contact: Contact,
+			write: bool,
+		) -> Result<Note, Error> {
+			self.set_note_participant_permission(&mut note, &contact.into(), write)
+				.await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "getNote")]
+		pub async fn js_get_note(&self, note_uuid: UuidStr) -> Result<Option<Note>, Error> {
+			self.get_note(note_uuid).await
+		}
+
+		#[wasm_bindgen(js_name = "createNote")]
+		pub async fn js_create_note(&self, title: Option<String>) -> Result<Note, Error> {
+			self.create_note(title).await
+		}
+
+		#[wasm_bindgen(js_name = "getNoteContent")]
+		pub async fn js_get_note_content(&self, mut note: Note) -> Result<Option<String>, Error> {
+			self.get_note_content(&mut note).await
+		}
+
+		#[wasm_bindgen(js_name = "setNoteType")]
+		pub async fn js_set_note_type(
+			&self,
+			mut note: Note,
+			note_type: NoteType,
+			known_content: Option<String>,
+		) -> Result<Note, Error> {
+			self.set_note_type(&mut note, note_type, known_content.as_deref())
+				.await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "setNoteContent")]
+		pub async fn js_set_note_content(
+			&self,
+			mut note: Note,
+			new_content: String,
+			new_preview: String,
+		) -> Result<Note, Error> {
+			self.set_note_content(&mut note, &new_content, new_preview)
+				.await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "setNoteTitle")]
+		pub async fn js_set_note_title(
+			&self,
+			mut note: Note,
+			new_title: String,
+		) -> Result<Note, Error> {
+			self.set_note_title(&mut note, new_title).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "deleteNote")]
+		pub async fn js_delete_note(&self, note: Note) -> Result<(), Error> {
+			self.delete_note(note).await
+		}
+
+		#[wasm_bindgen(js_name = "archiveNote")]
+		pub async fn js_archive_note(&self, mut note: Note) -> Result<Note, Error> {
+			self.archive_note(&mut note).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "trashNote")]
+		pub async fn js_trash_note(&self, mut note: Note) -> Result<Note, Error> {
+			self.trash_note(&mut note).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "setNoteFavorited")]
+		pub async fn js_set_note_favorited(
+			&self,
+			mut note: Note,
+			favorite: bool,
+		) -> Result<Note, Error> {
+			self.set_note_favorited(&mut note, favorite).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "setNotePinned")]
+		pub async fn js_set_note_pinned(
+			&self,
+			mut note: Note,
+			pinned: bool,
+		) -> Result<Note, Error> {
+			self.set_note_pinned(&mut note, pinned).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "restoreNote")]
+		pub async fn js_restore_note(&self, mut note: Note) -> Result<Note, Error> {
+			self.restore_note(&mut note).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "duplicateNote")]
+		pub async fn js_duplicate_note(
+			&self,
+			mut note: Note,
+		) -> Result<DuplicateNoteResponse, Error> {
+			let new = self.duplicate_note(&mut note).await?;
+
+			Ok(DuplicateNoteResponse {
+				original: note,
+				duplicated: new,
+			})
+		}
+
+		#[wasm_bindgen(js_name = "getNoteHistory")]
+		pub async fn js_get_note_history(&self, note: Note) -> Result<Vec<NoteHistory>, Error> {
+			self.get_note_history(&note).await
+		}
+
+		#[wasm_bindgen(js_name = "restoreNoteFromHistory")]
+		pub async fn js_restore_note_from_history(
+			&self,
+			mut note: Note,
+			history: NoteHistory,
+		) -> Result<Note, Error> {
+			self.restore_note_from_history(&mut note, history).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "listNoteTags")]
+		pub async fn js_list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
+			self.list_note_tags().await
+		}
+
+		#[wasm_bindgen(unchecked_return_type = "[Note, NoteTag]", js_name = "addTagToNote")]
+		pub async fn js_add_tag_to_note(
+			&self,
+			mut note: Note,
+			mut tag: NoteTag,
+		) -> Result<JsValue, Error> {
+			self.add_tag_to_note(&mut note, &mut tag).await?;
+			Ok(tuple_to_jsvalue!(note, tag))
+		}
+
+		#[wasm_bindgen(js_name = "removeTagFromNote")]
+		pub async fn js_remove_tag_from_note(
+			&self,
+			mut note: Note,
+			tag: NoteTag,
+		) -> Result<Note, Error> {
+			self.remove_tag_from_note(&mut note, &tag).await?;
+			Ok(note)
+		}
+
+		#[wasm_bindgen(js_name = "createNoteTag")]
+		pub async fn js_create_note_tag(&self, name: String) -> Result<NoteTag, Error> {
+			self.create_note_tag(name).await
+		}
+
+		#[wasm_bindgen(js_name = "renameNoteTag")]
+		pub async fn js_rename_note_tag(
+			&self,
+			mut tag: NoteTag,
+			new_name: String,
+		) -> Result<NoteTag, Error> {
+			self.rename_note_tag(&mut tag, new_name).await?;
+			Ok(tag)
+		}
+
+		#[wasm_bindgen(js_name = "setNoteTagFavorited")]
+		pub async fn js_set_note_tag_favorited(
+			&self,
+			mut tag: NoteTag,
+			favorite: bool,
+		) -> Result<NoteTag, Error> {
+			self.set_note_tag_favorited(&mut tag, favorite).await?;
+			Ok(tag)
+		}
+
+		#[wasm_bindgen(js_name = "deleteNoteTag")]
+		pub async fn js_delete_note_tag(&self, tag: NoteTag) -> Result<(), Error> {
+			self.delete_note_tag(tag).await
+		}
 	}
 }

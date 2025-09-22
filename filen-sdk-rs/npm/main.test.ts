@@ -574,6 +574,36 @@ test("color", async () => {
 	expect(dir).toEqual(await state.getDir(dir.uuid))
 })
 
+test("notes", async () => {
+	let note = await state.createNote()
+	expect(note).toBeDefined()
+	expect(note.uuid).toBeDefined()
+	const fetchedNote = await state.getNote(note.uuid)
+	expect(fetchedNote).toEqual(note)
+
+	note = await state.setNoteContent(note, "This is the note content", "This is the preview")
+	expect(note.preview).toBe("This is the preview")
+	const content = await state.getNoteContent(note)
+	expect(content).toBe("This is the note content")
+
+	let tag = await state.createNoteTag("Test Tag")
+	const [note1, tag1] = await state.addTagToNote(note, tag)
+	note = note1
+	tag = tag1
+	expect(note.tags).toBeDefined()
+	expect(note.tags!.length).toBe(1)
+	expect(note.tags![0].uuid).toBe(tag.uuid)
+	const tags = await state.listNoteTags()
+	expect(tags.find(t => t.uuid === tag.uuid)).toBeDefined()
+
+	const history = await state.getNoteHistory(note)
+	expect(history.length).toBe(2)
+	expect(history[0].preview).toBe("")
+	expect(history[0].content).toBe("")
+	expect(history[1].preview).toBe("This is the preview")
+	expect(history[1].content).toBe("This is the note content")
+})
+
 test("search", async () => {
 	const dir = await state.createDir(testDir, "search-dir-124asdfas;dlkfj")
 	const file = await state.uploadFile(new TextEncoder().encode("search file content"), {

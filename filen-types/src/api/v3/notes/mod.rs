@@ -26,6 +26,11 @@ pub mod untag;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi)
+)]
 pub enum NoteType {
 	Text,
 	Md,
