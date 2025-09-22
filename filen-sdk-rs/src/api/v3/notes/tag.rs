@@ -1,7 +1,10 @@
-pub use filen_types::api::v3::notes::tag::{ENDPOINT, Request};
+pub use filen_types::api::v3::notes::tag::{ENDPOINT, Request, Response};
 
-use crate::{api::post_auth_request_empty, auth::http::AuthorizedClient, error::Error};
+use crate::{api::post_auth_request, auth::http::AuthorizedClient, error::Error};
 
-pub(crate) async fn post(client: impl AuthorizedClient, request: &Request) -> Result<(), Error> {
-	post_auth_request_empty(client, request, ENDPOINT).await
+pub(crate) async fn post(
+	client: impl AuthorizedClient,
+	request: &Request,
+) -> Result<Response, Error> {
+	post_auth_request(client, request, ENDPOINT).await
 }

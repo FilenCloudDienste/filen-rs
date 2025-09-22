@@ -746,9 +746,9 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn add_tag_to_note(&self, note: &mut Note, tag: NoteTag) -> Result<(), Error> {
+	pub async fn add_tag_to_note(&self, note: &mut Note, tag: &mut NoteTag) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::tag::post(
+		let resp = api::v3::notes::tag::post(
 			self.client(),
 			&api::v3::notes::tag::Request {
 				uuid: note.uuid,
@@ -757,9 +757,11 @@ impl Client {
 		)
 		.await?;
 
+		tag.edited_timestamp = resp.edited_timestamp;
+
 		// avoid duplicates
 		if !note.tags.iter().any(|t| t.uuid == tag.uuid) {
-			note.tags.push(tag);
+			note.tags.push(tag.clone());
 		}
 
 		Ok(())

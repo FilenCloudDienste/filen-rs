@@ -384,8 +384,6 @@ async fn note_tag_manipulation() {
 	assert_eq!(tag1.name(), Some("New Tag1"));
 
 	let tags = client.list_note_tags().await.unwrap();
-	println!("{tags:?}");
-	println!("tag1: {tag1:?}");
 	assert!(tags.contains(&tag1));
 
 	client
@@ -394,8 +392,6 @@ async fn note_tag_manipulation() {
 		.unwrap();
 	assert!(tag1.favorited());
 	let tags = client.list_note_tags().await.unwrap();
-	println!("{tags:?}");
-	println!("tag1: {tag1:?}");
 	assert!(tags.contains(&tag1));
 
 	client
@@ -421,25 +417,20 @@ async fn note_tagging() {
 		.await
 		.unwrap();
 
-	let tag = client.create_note_tag("Tag13".to_string()).await.unwrap();
+	let mut tag = client.create_note_tag("Tag13".to_string()).await.unwrap();
 	let mut note = client.create_note(None).await.unwrap();
 	assert!(note.tags().is_empty());
-	client
-		.add_tag_to_note(&mut note, tag.clone())
-		.await
-		.unwrap();
+	client.add_tag_to_note(&mut note, &mut tag).await.unwrap();
 	assert!(note.tags().contains(&tag));
 	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
-	println!("fetched: {fetched:?}");
 	let tags = client.list_note_tags().await.unwrap();
-	println!("tags: {tags:?}");
 	assert!(fetched.tags().iter().any(|t| t.name() == tag.name()));
 
-	// // assert!(note.tags().iter().any(|t| t.name() == tag.name()));
-	// assert!(note.tags().contains(&tag));
+	// waiting for v3/notes/tag to return timestamp for note
+	assert!(note.tags().contains(&tag));
 
-	// let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
-	// assert_eq!(note, fetched);
+	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
+	assert_eq!(note, fetched);
 }
 
 #[shared_test_runtime]
