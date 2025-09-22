@@ -1,6 +1,6 @@
 {
   "name": "@filen/sdk-rs",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "description": "Filen WASM SDK using filen-sdk-rs",
   "type": "module",
   "scripts": {
