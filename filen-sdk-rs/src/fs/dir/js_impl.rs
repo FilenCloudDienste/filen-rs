@@ -11,7 +11,6 @@ use crate::{
 use filen_types::fs::UuidStr;
 use wasm_bindgen::prelude::*;
 
-#[macro_export]
 macro_rules! tuple_to_jsvalue {
 	// Handle direct tuple literals
 	($($element:expr),+ $(,)?) => {{
@@ -23,6 +22,8 @@ macro_rules! tuple_to_jsvalue {
 		JsValue::from(array)
 	}};
 }
+
+pub(crate) use tuple_to_jsvalue;
 
 #[wasm_bindgen]
 impl Client {

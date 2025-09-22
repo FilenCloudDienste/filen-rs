@@ -11,9 +11,8 @@ use crate::{
 	Error,
 	auth::Client,
 	connect::{DirPublicLink, FilePublicLink},
-	fs::dir::DirectoryMetaType,
+	fs::dir::{DirectoryMetaType, js_impl::tuple_to_jsvalue},
 	js::{Dir, DirWithMetaEnum, File, SharedDir, SharedFile},
-	tuple_to_jsvalue,
 };
 
 #[derive(Serialize, Deserialize, Tsify)]
