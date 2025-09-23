@@ -526,11 +526,11 @@ impl Client {
 
 	pub async fn send_chat_message<'a>(
 		&self,
-		chats: &'a mut Chat,
+		chat: &'a mut Chat,
 		message: String,
 		reply_to: Option<ChatMessagePartial>,
 	) -> Result<&'a ChatMessage, Error> {
-		let key = chats
+		let key = chat
 			.key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
@@ -542,7 +542,7 @@ impl Client {
 		let resp = api::v3::chat::send::post(
 			self.client(),
 			&api::v3::chat::send::Request {
-				conversation: chats.uuid,
+				conversation: chat.uuid,
 				uuid,
 				message: encrypted_message,
 				reply_to: reply_to.as_ref().map(|r| r.uuid),
@@ -550,8 +550,8 @@ impl Client {
 		)
 		.await?;
 
-		chats.last_message = Some(ChatMessage {
-			chat: chats.uuid,
+		chat.last_message = Some(ChatMessage {
+			chat: chat.uuid,
 			inner: ChatMessagePartial {
 				uuid,
 				sender_id: self.user_id,
@@ -568,7 +568,7 @@ impl Client {
 			sent_timestamp: resp.timestamp,
 		});
 
-		Ok(chats.last_message.as_ref().expect("we just set it above"))
+		Ok(chat.last_message.as_ref().expect("we just set it above"))
 	}
 
 	// this API is a bit annoying because ideally we'd want to allow the consumer to pass in a mutable reference to
