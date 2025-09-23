@@ -40,7 +40,7 @@ pub mod seconds_or_millis {
 	use chrono::{DateTime, Utc};
 	use serde::{Deserialize, Deserializer, Serializer};
 
-	pub fn from_seconds_or_millis(value: i64) -> Option<DateTime<Utc>> {
+	pub(crate) fn from_seconds_or_millis(value: i64) -> Option<DateTime<Utc>> {
 		let now = Utc::now().timestamp_millis();
 		DateTime::<Utc>::from_timestamp_millis(
 			if (now - value).abs() < (now - value * 1000).abs() {
