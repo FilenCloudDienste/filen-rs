@@ -25,14 +25,35 @@ use crate::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
 pub struct ChatParticipant {
 	user_id: u64,
 	email: String,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	avatar: Option<String>,
 	nick_name: String,
 	permissions_add: bool,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	added: DateTime<Utc>,
 	appear_offline: bool,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	last_active: DateTime<Utc>,
 }
 
@@ -43,15 +64,47 @@ impl ChatParticipant {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
 pub struct Chat {
 	uuid: UuidStr,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none")
+	)]
 	last_message: Option<ChatMessage>,
 	owner_id: u64,
+	// none if decryption fails
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	key: Option<NoteOrChatKey>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
+	// none if decryption fails
 	name: Option<String>,
 	participants: Vec<ChatParticipant>,
 	muted: bool,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	created: DateTime<Utc>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "filen_types::serde::time::optional"),
+		tsify(type = "bigint")
+	)]
 	last_focus: Option<DateTime<Utc>>,
 }
 
@@ -82,12 +135,29 @@ impl Chat {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
 pub struct ChatMessagePartial {
 	uuid: UuidStr,
 	sender_id: u64,
 	sender_email: String,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	sender_avatar: Option<String>,
 	sender_nick_name: String,
+	// none if decryption fails
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none"),
+		tsify(type = "string")
+	)]
 	message: Option<String>,
 }
 
@@ -111,13 +181,34 @@ impl ChatMessagePartial {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
 pub struct ChatMessage {
 	chat: UuidStr,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
 	inner: ChatMessagePartial,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(default, skip_serializing_if = "Option::is_none",)
+	)]
 	reply_to: Option<ChatMessagePartial>,
 	embed_disabled: bool,
 	edited: bool,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	edited_timestamp: DateTime<Utc>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	sent_timestamp: DateTime<Utc>,
 }
 
@@ -703,5 +794,201 @@ impl Client {
 		chat.muted = mute;
 
 		Ok(())
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub mod js_impls {
+	use chrono::TimeZone;
+	use filen_types::{api::v3::chat::typing::ChatTypingType, fs::UuidStr};
+	use wasm_bindgen::prelude::wasm_bindgen;
+
+	use crate::{Error, auth::Client, connect::js_impls::Contact};
+
+	use super::{Chat, ChatMessage, ChatMessagePartial};
+
+	impl wasm_bindgen::__rt::VectorIntoJsValue for Chat {
+		fn vector_into_jsvalue(
+			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+		) -> wasm_bindgen::JsValue {
+			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+		}
+	}
+
+	impl wasm_bindgen::__rt::VectorIntoJsValue for ChatMessage {
+		fn vector_into_jsvalue(
+			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
+		) -> wasm_bindgen::JsValue {
+			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
+		}
+	}
+
+	#[wasm_bindgen]
+	impl Client {
+		#[wasm_bindgen(js_name = "listMessages")]
+		pub async fn js_list_messages(&self, chat: Chat) -> Result<Vec<ChatMessage>, Error> {
+			self.list_messages(&chat).await
+		}
+
+		#[wasm_bindgen(js_name = "listMessagesBefore")]
+		pub async fn js_list_messages_before(
+			&self,
+			chat: Chat,
+			// todo make sure this is bigint in ts
+			before: i64,
+		) -> Result<Vec<ChatMessage>, Error> {
+			self.list_messages_before(
+				&chat,
+				chrono::Utc
+					.timestamp_millis_opt(before)
+					.latest()
+					.expect("valid timestamp"),
+			)
+			.await
+		}
+
+		#[wasm_bindgen(js_name = "listChats")]
+		pub async fn js_list_chats(&self) -> Result<Vec<Chat>, Error> {
+			self.list_chats().await
+		}
+
+		#[wasm_bindgen(js_name = "getChat")]
+		pub async fn js_get_chat(&self, uuid: UuidStr) -> Result<Option<Chat>, Error> {
+			self.get_chat(uuid).await
+		}
+
+		#[wasm_bindgen(js_name = "createChat")]
+		pub async fn js_create_chat(&self, contacts: Vec<Contact>) -> Result<Chat, Error> {
+			self.create_chat(&contacts.into_iter().map(|c| c.into()).collect::<Vec<_>>())
+				.await
+		}
+
+		#[wasm_bindgen(js_name = "renameChat")]
+		pub async fn js_rename_chat(
+			&self,
+			mut chat: Chat,
+			new_name: String,
+		) -> Result<Chat, Error> {
+			self.rename_chat(&mut chat, new_name).await?;
+			Ok(chat)
+		}
+
+		#[wasm_bindgen(js_name = "deleteChat")]
+		pub async fn js_delete_chat(&self, chat: Chat) -> Result<(), Error> {
+			self.delete_chat(chat).await
+		}
+
+		#[wasm_bindgen(js_name = "sendChatMessage")]
+		pub async fn js_send_chat_message(
+			&self,
+			mut chat: Chat,
+			message: String,
+			reply_to: Option<ChatMessagePartial>,
+		) -> Result<Chat, Error> {
+			self.send_chat_message(&mut chat, message, reply_to).await?;
+			Ok(chat)
+		}
+
+		#[wasm_bindgen(js_name = "editMessage")]
+		pub async fn js_edit_message(
+			&self,
+			chat: Chat,
+			mut message: ChatMessage,
+			new_message: String,
+		) -> Result<ChatMessage, Error> {
+			self.edit_message(&chat, &mut message, new_message).await?;
+			Ok(message)
+		}
+
+		#[wasm_bindgen(js_name = "deleteMessage")]
+		pub async fn js_delete_message(
+			&self,
+			mut chat: Chat,
+			message: ChatMessage,
+		) -> Result<Chat, Error> {
+			self.delete_message(&mut chat, &message).await?;
+			Ok(chat)
+		}
+
+		#[wasm_bindgen(js_name = "disableMessageEmbed")]
+		pub async fn js_disable_message_embed(
+			&self,
+			mut message: ChatMessage,
+		) -> Result<ChatMessage, Error> {
+			self.disable_message_embed(&mut message).await?;
+			Ok(message)
+		}
+
+		#[wasm_bindgen(js_name = "sendTypingSignal")]
+		pub async fn js_send_typing_signal(
+			&self,
+			chat: Chat,
+			signal_type: ChatTypingType,
+		) -> Result<(), Error> {
+			self.send_typing_signal(&chat, signal_type).await
+		}
+
+		#[wasm_bindgen(js_name = "addChatParticipant")]
+		pub async fn js_add_chat_participant(
+			&self,
+			mut chat: Chat,
+			contact: Contact,
+		) -> Result<Chat, Error> {
+			self.add_chat_participant(&mut chat, &contact.into())
+				.await?;
+			Ok(chat)
+		}
+
+		#[wasm_bindgen(js_name = "removeChatParticipant")]
+		pub async fn js_remove_chat_participant(
+			&self,
+			mut chat: Chat,
+			contact: Contact,
+		) -> Result<Chat, Error> {
+			self.remove_chat_participant(&mut chat, &contact.into())
+				.await?;
+			Ok(chat)
+		}
+
+		#[wasm_bindgen(js_name = "markChatRead")]
+		pub async fn js_mark_chat_read(&self, chat: Chat) -> Result<(), Error> {
+			self.mark_chat_read(&chat).await
+		}
+
+		#[wasm_bindgen(js_name = "getChatUnreadCount")]
+		pub async fn js_get_chat_unread_count(&self, chat: Chat) -> Result<u64, Error> {
+			self.get_chat_unread_count(&chat).await
+		}
+
+		#[wasm_bindgen(js_name = "getAllChatsUnreadCount")]
+		pub async fn js_get_all_chats_unread_count(&self) -> Result<u64, Error> {
+			self.get_all_chats_unread_count().await
+		}
+
+		#[wasm_bindgen(js_name = "updateChatOnlineStatus")]
+		pub async fn js_update_chat_online_status(&self, mut chat: Chat) -> Result<Chat, Error> {
+			self.update_chat_online_status(&mut chat).await?;
+			Ok(chat)
+		}
+
+		#[wasm_bindgen(js_name = "leaveChat")]
+		pub async fn js_leave_chat(&self, chat: Chat) -> Result<(), Error> {
+			self.leave_chat(&chat).await
+		}
+
+		#[wasm_bindgen(js_name = "updateLastChatFocusTimesNow")]
+		pub async fn js_update_last_chat_focus_times_now(
+			&self,
+			mut chats: Vec<Chat>,
+		) -> Result<Vec<Chat>, Error> {
+			self.update_last_chat_focus_times_now(&mut chats).await?;
+			Ok(chats)
+		}
+
+		#[wasm_bindgen(js_name = "muteChat")]
+		pub async fn js_mute_chat(&self, mut chat: Chat, mute: bool) -> Result<Chat, Error> {
+			self.mute_chat(&mut chat, mute).await?;
+			Ok(chat)
+		}
 	}
 }
