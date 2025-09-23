@@ -376,7 +376,7 @@ async fn set_up_contact_no_add<'a>(
 			while (futures.next().await).is_some() {}
 		}
 	);
-	tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+	tokio::time::sleep(std::time::Duration::from_secs(300)).await;
 	let (out_dirs, _) = client.list_out_shared(None).await.unwrap();
 	let (in_dirs, _) = share_client.list_in_shared().await.unwrap();
 	(lock1, lock2, out_dirs.len(), in_dirs.len())
