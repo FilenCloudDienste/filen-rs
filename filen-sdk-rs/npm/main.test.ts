@@ -604,6 +604,18 @@ test("notes", async () => {
 	expect(history[1].content).toBe("This is the note content")
 })
 
+test("chats", async () => {
+	let chat = await state.createChat([])
+	expect(chat).toBeDefined()
+	chat = await state.renameChat(chat, "Test Chat")
+	expect(chat.name).toBe("Test Chat")
+
+	chat = await state.sendChatMessage(chat, "This is a test message")
+	expect(chat.lastMessage?.inner.message).toEqual("This is a test message")
+	const fetchedChat = await state.getChat(chat.uuid)
+	expect(fetchedChat).toEqual(chat)
+})
+
 test("search", async () => {
 	const dir = await state.createDir(testDir, "search-dir-124asdfas;dlkfj")
 	const file = await state.uploadFile(new TextEncoder().encode("search file content"), {
