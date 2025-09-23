@@ -189,7 +189,8 @@ impl ChatMessagePartial {
 )]
 pub struct ChatMessage {
 	chat: UuidStr,
-	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
+	// want to use flatten here but can't until https://github.com/madonoharu/tsify/issues/69 is resolved
+	// #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
 	inner: ChatMessagePartial,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
