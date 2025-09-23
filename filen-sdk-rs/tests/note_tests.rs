@@ -423,7 +423,6 @@ async fn note_tagging() {
 	client.add_tag_to_note(&mut note, &mut tag).await.unwrap();
 	assert!(note.tags().contains(&tag));
 	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
-	let tags = client.list_note_tags().await.unwrap();
 	assert!(fetched.tags().iter().any(|t| t.name() == tag.name()));
 
 	// waiting for v3/notes/tag to return timestamp for note

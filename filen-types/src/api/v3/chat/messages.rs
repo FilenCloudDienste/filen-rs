@@ -25,6 +25,7 @@ pub struct ChatMessage<'a> {
 	pub conversation: UuidStr,
 	#[serde(flatten)]
 	pub inner: ChatMessagePartial<'a>,
+	#[serde(deserialize_with = "crate::serde::option::result_to_option::deserialize")]
 	pub reply_to: Option<ChatMessagePartial<'a>>,
 	pub embed_disabled: bool,
 	pub edited: bool,

@@ -1,10 +1,12 @@
-pub use filen_types::api::v3::chat::conversations::participants::add::{ENDPOINT, Request};
+pub use filen_types::api::v3::chat::conversations::participants::add::{
+	ENDPOINT, Request, Response,
+};
 
-use crate::{api::post_auth_request_empty, auth::http::AuthorizedClient, error::Error};
+use crate::{api::post_auth_request, auth::http::AuthorizedClient, error::Error};
 
 pub(crate) async fn post(
 	client: impl AuthorizedClient,
 	request: &Request<'_>,
-) -> Result<(), Error> {
-	post_auth_request_empty(client, request, ENDPOINT).await
+) -> Result<Response, Error> {
+	post_auth_request(client, request, ENDPOINT).await
 }

@@ -3,7 +3,7 @@ use std::{
 	sync::{Arc, Mutex},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	api::v3::{
 		chat::{last_focus_update::ChatLastFocusValues, typing::ChatTypingType},
@@ -36,8 +36,14 @@ pub struct ChatParticipant {
 	last_active: DateTime<Utc>,
 }
 
+impl ChatParticipant {
+	pub fn email(&self) -> &str {
+		&self.email
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChatConversation {
+pub struct Chat {
 	uuid: UuidStr,
 	last_message: Option<ChatMessage>,
 	owner_id: u64,
@@ -46,6 +52,33 @@ pub struct ChatConversation {
 	participants: Vec<ChatParticipant>,
 	muted: bool,
 	created: DateTime<Utc>,
+	last_focus: Option<DateTime<Utc>>,
+}
+
+impl Chat {
+	pub fn uuid(&self) -> UuidStr {
+		self.uuid
+	}
+
+	pub fn name(&self) -> Option<&str> {
+		self.name.as_deref()
+	}
+
+	pub fn participants(&self) -> &[ChatParticipant] {
+		&self.participants
+	}
+
+	pub fn last_message(&self) -> Option<&ChatMessage> {
+		self.last_message.as_ref()
+	}
+
+	pub fn last_focus(&self) -> Option<DateTime<Utc>> {
+		self.last_focus
+	}
+
+	pub fn muted(&self) -> bool {
+		self.muted
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +112,7 @@ impl ChatMessagePartial {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatMessage {
-	conversation: UuidStr,
+	chat: UuidStr,
 	inner: ChatMessagePartial,
 	reply_to: Option<ChatMessagePartial>,
 	embed_disabled: bool,
@@ -95,7 +128,7 @@ impl ChatMessage {
 		tmp_vec: &mut Vec<u8>,
 	) -> Self {
 		Self {
-			conversation: encrypted.conversation,
+			chat: encrypted.conversation,
 			inner: ChatMessagePartial::decrypt(encrypted.inner, private_key, tmp_vec),
 			reply_to: encrypted
 				.reply_to
@@ -105,6 +138,18 @@ impl ChatMessage {
 			edited_timestamp: encrypted.edited_timestamp,
 			sent_timestamp: encrypted.sent_timestamp,
 		}
+	}
+
+	pub fn message(&self) -> Option<&str> {
+		self.inner.message.as_deref()
+	}
+
+	pub fn into_inner(self) -> ChatMessagePartial {
+		self.inner
+	}
+
+	pub fn embed_disabled(&self) -> bool {
+		self.embed_disabled
 	}
 }
 
@@ -146,15 +191,20 @@ impl Client {
 		NoteOrChatKeyStruct::try_decrypt_rsa(self.private_key(), &participant.metadata)
 	}
 
-	async fn list_messages(
+	pub async fn list_messages(&self, chat: &Chat) -> Result<Vec<ChatMessage>, Error> {
+		self.list_messages_before(chat, chrono::Utc::now() + chrono::Duration::days(1))
+			.await
+	}
+
+	pub async fn list_messages_before(
 		&self,
-		conversation: &ChatConversation,
+		chat: &Chat,
 		before: DateTime<Utc>,
 	) -> Result<Vec<ChatMessage>, Error> {
 		let resp = api::v3::chat::messages::post(
 			self.client(),
 			&api::v3::chat::messages::Request {
-				conversation: conversation.uuid,
+				conversation: chat.uuid,
 				timestamp: before,
 			},
 		)
@@ -165,17 +215,17 @@ impl Client {
 		let messages = resp
 			.0
 			.into_iter()
-			.map(|message| ChatMessage::decrypt(message, conversation.key.as_ref(), tmp_vec))
+			.map(|message| ChatMessage::decrypt(message, chat.key.as_ref(), tmp_vec))
 			.collect::<Vec<_>>();
 
 		Ok(messages)
 	}
 
-	fn decrypt_chat_conversation(
+	fn decrypt_chat(
 		&self,
 		encrypted: filen_types::api::v3::chat::conversations::ChatConversation<'_>,
 		outer_tmp_vec: &mut Vec<u8>,
-	) -> ChatConversation {
+	) -> Chat {
 		let mut tmp_vec = std::mem::take(outer_tmp_vec);
 
 		let key = self.decrypt_chat_key(&encrypted).ok();
@@ -193,7 +243,7 @@ impl Client {
 			(chat_name, last_message)
 		});
 
-		let participants = encrypted
+		let mut participants = encrypted
 			.participants
 			.into_iter()
 			.map(|p| ChatParticipant {
@@ -203,13 +253,20 @@ impl Client {
 				nick_name: p.nick_name.into_owned(),
 				permissions_add: p.permissions_add,
 				added: p.added_timestamp,
-				// adjust if the backend returns online status
-				appear_offline: true,
-				last_active: DateTime::<Utc>::default(),
+				appear_offline: p.appear_offline,
+				// this is so that our own last_active is always 0
+				// this is because otherwise it is impossible to test
+				last_active: if p.user_id == self.user_id {
+					DateTime::<Utc>::default()
+				} else {
+					p.last_active
+				},
 			})
 			.collect::<Vec<_>>();
 
-		ChatConversation {
+		participants.sort_by_key(|p| p.added);
+
+		Chat {
 			uuid: encrypted.uuid,
 			last_message,
 			owner_id: encrypted.owner_id,
@@ -218,18 +275,24 @@ impl Client {
 			participants,
 			muted: encrypted.muted,
 			created: encrypted.created_timestamp,
+			last_focus: encrypted.last_focus,
 		}
 	}
 
-	pub async fn list_conversations(&self) -> Result<Vec<ChatConversation>, Error> {
+	pub async fn list_chats(&self) -> Result<Vec<Chat>, Error> {
 		let resp = api::v3::chat::conversations::get(self.client()).await?;
 
 		let tmp_vec = &mut Vec::new();
 		Ok(resp
 			.0
 			.into_iter()
-			.map(|chat| self.decrypt_chat_conversation(chat, tmp_vec))
+			.map(|chat| self.decrypt_chat(chat, tmp_vec))
 			.collect::<Vec<_>>())
+	}
+
+	pub async fn get_chat(&self, uuid: UuidStr) -> Result<Option<Chat>, Error> {
+		let chats = self.list_chats().await?;
+		Ok(chats.into_iter().find(|c| c.uuid == uuid))
 	}
 
 	async fn inner_add_chat_participant(
@@ -240,7 +303,7 @@ impl Client {
 	) -> Result<ChatParticipant, Error> {
 		let metadata = NoteOrChatKeyStruct::try_encrypt_rsa(&contact.public_key, key)?;
 		let _lock = self.lock_chats().await?;
-		api::v3::chat::conversations::participants::add::post(
+		let resp = api::v3::chat::conversations::participants::add::post(
 			self.client(),
 			&api::v3::chat::conversations::participants::add::Request {
 				uuid: chat_uuid,
@@ -255,18 +318,14 @@ impl Client {
 			email: contact.email.to_string(),
 			avatar: contact.avatar.as_ref().map(|a| a.clone().into_owned()),
 			nick_name: contact.nick_name.clone().into_owned(),
-			permissions_add: false,
-			// temporary
-			added: chrono::Utc::now(),
-			appear_offline: true,
-			last_active: contact.last_active,
+			permissions_add: true,
+			added: resp.timestamp,
+			appear_offline: resp.appear_offline,
+			last_active: resp.last_active,
 		})
 	}
 
-	pub async fn create_conversation(
-		&self,
-		contacts: &[Contact<'_>],
-	) -> Result<ChatConversation, Error> {
+	pub async fn create_chat(&self, contacts: &[Contact<'_>]) -> Result<Chat, Error> {
 		let uuid = UuidStr::new_v4();
 		let key = NoteOrChatKey::generate();
 
@@ -274,7 +333,7 @@ impl Client {
 		let key_asymm_string = NoteOrChatKeyStruct::try_encrypt_rsa(self.public_key(), &key)?;
 		let _lock = self.lock_chats().await?;
 
-		api::v3::chat::conversations::create::post(
+		let resp = api::v3::chat::conversations::create::post(
 			self.client(),
 			&api::v3::chat::conversations::create::Request {
 				uuid,
@@ -284,46 +343,27 @@ impl Client {
 		)
 		.await?;
 
-		let mut new = ChatConversation {
-			uuid,
-			last_message: None,
-			owner_id: self.user_id,
-			key: Some(key),
-			name: None,
-			// will be replaced later
-			participants: Vec::new(),
-			muted: false,
-			created: chrono::Utc::now(),
-		};
-		let key = new
-			.key
-			.as_ref()
-			.expect("we just created the chat, so the key must be Some");
-
 		let mut participants = Vec::with_capacity(contacts.len() + 1);
 		participants.push(ChatParticipant {
 			user_id: self.user_id,
 			email: self.email().to_string(),
-			// temporary, remove when /v3/chat/conversations/create returns this
-			avatar: Some(self.get_user_info().await?.avatar_url.into_owned()),
+			avatar: None,
 			nick_name: String::new(), // todo: get real nick name
 			permissions_add: true,
-			// todo: get real added time
-			added: chrono::Utc::now(),
+			added: resp.timestamp,
 			appear_offline: false,
-			last_active: chrono::Utc::now(),
+			last_active: DateTime::<Utc>::default(),
 		});
 
-		let participants = Arc::new(Mutex::new(Vec::with_capacity(contacts.len())));
+		let participants = Arc::new(Mutex::new(participants));
 
 		let mut participant_futures = contacts
 			.iter()
 			.map(|contact| {
 				let participants = participants.clone();
+				let key = &key;
 				async move {
-					let participant = self
-						.inner_add_chat_participant(key, new.uuid, contact)
-						.await?;
+					let participant = self.inner_add_chat_participant(key, uuid, contact).await?;
 					participants
 						.lock()
 						.unwrap_or_else(|e| e.into_inner())
@@ -347,39 +387,43 @@ impl Client {
 			Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
 		};
 
-		new.participants = participants;
-
-		Ok(new)
+		Ok(Chat {
+			uuid: resp.uuid,
+			last_message: None,
+			owner_id: self.user_id,
+			key: Some(key),
+			name: None,
+			participants,
+			muted: false,
+			created: resp.timestamp,
+			last_focus: None,
+		})
 	}
 
-	pub async fn rename_conversation(
-		&self,
-		conversation: &mut ChatConversation,
-		new_name: String,
-	) -> Result<(), Error> {
-		let key = conversation
+	pub async fn rename_chat(&self, chat: &mut Chat, new_name: String) -> Result<(), Error> {
+		let key = chat
 			.key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
-			.context("rename_conversation")?;
+			.context("rename_chat")?;
 		let encrypted_name = crypto::ChatName::encrypt(key, &new_name);
 		let _lock = self.lock_chats().await?;
 
 		api::v3::chat::conversations::name::edit::post(
 			self.client(),
 			&api::v3::chat::conversations::name::edit::Request {
-				uuid: conversation.uuid,
+				uuid: chat.uuid,
 				name: encrypted_name,
 			},
 		)
 		.await?;
 
-		conversation.name = Some(new_name);
+		chat.name = Some(new_name);
 
 		Ok(())
 	}
 
-	pub async fn delete_conversation(&self, chat: ChatConversation) -> Result<(), Error> {
+	pub async fn delete_chat(&self, chat: Chat) -> Result<(), Error> {
 		let _lock = self.lock_chats().await?;
 
 		api::v3::chat::conversations::delete::post(
@@ -391,11 +435,11 @@ impl Client {
 
 	pub async fn send_chat_message<'a>(
 		&self,
-		conversation: &'a mut ChatConversation,
+		chats: &'a mut Chat,
 		message: String,
 		reply_to: Option<ChatMessagePartial>,
 	) -> Result<&'a ChatMessage, Error> {
-		let key = conversation
+		let key = chats
 			.key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
@@ -404,10 +448,10 @@ impl Client {
 
 		let encrypted_message = crypto::ChatMessage::encrypt(key, &message);
 
-		api::v3::chat::send::post(
+		let resp = api::v3::chat::send::post(
 			self.client(),
 			&api::v3::chat::send::Request {
-				conversation: conversation.uuid,
+				conversation: chats.uuid,
 				uuid,
 				message: encrypted_message,
 				reply_to: reply_to.as_ref().map(|r| r.uuid),
@@ -415,8 +459,8 @@ impl Client {
 		)
 		.await?;
 
-		conversation.last_message = Some(ChatMessage {
-			conversation: conversation.uuid,
+		chats.last_message = Some(ChatMessage {
+			chat: chats.uuid,
 			inner: ChatMessagePartial {
 				uuid,
 				sender_id: self.user_id,
@@ -429,15 +473,11 @@ impl Client {
 			reply_to,
 			embed_disabled: false,
 			edited: false,
-			// todo get real timestamps
 			edited_timestamp: DateTime::<Utc>::default(),
-			sent_timestamp: DateTime::<Utc>::default(),
+			sent_timestamp: resp.timestamp,
 		});
 
-		Ok(conversation
-			.last_message
-			.as_ref()
-			.expect("we just set it above"))
+		Ok(chats.last_message.as_ref().expect("we just set it above"))
 	}
 
 	// this API is a bit annoying because ideally we'd want to allow the consumer to pass in a mutable reference to
@@ -446,11 +486,11 @@ impl Client {
 	// and we don't want to expose that part of the struct publicly
 	pub async fn edit_message(
 		&self,
-		conversation: &ChatConversation,
+		chat: &Chat,
 		message: &mut ChatMessage,
 		new_message: String,
 	) -> Result<(), Error> {
-		let key = conversation
+		let key = chat
 			.key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
@@ -458,10 +498,10 @@ impl Client {
 
 		let encrypted_message = crypto::ChatMessage::encrypt(key, &new_message);
 
-		api::v3::chat::edit::post(
+		let resp = api::v3::chat::edit::post(
 			self.client(),
 			&api::v3::chat::edit::Request {
-				conversation: message.conversation,
+				conversation: message.chat,
 				uuid: message.inner.uuid,
 				message: encrypted_message,
 			},
@@ -470,15 +510,14 @@ impl Client {
 
 		message.inner.message = Some(new_message);
 		message.edited = true;
-		// todo get real edited timestamp
-		message.edited_timestamp = chrono::Utc::now();
+		message.edited_timestamp = resp.timestamp;
 
 		Ok(())
 	}
 
 	pub async fn delete_message(
 		&self,
-		conversation: &mut ChatConversation,
+		chat: &mut Chat,
 		message: &ChatMessage,
 	) -> Result<(), Error> {
 		let _lock = self.lock_chats().await?;
@@ -492,12 +531,12 @@ impl Client {
 		.await?;
 
 		// is there a last message
-		if let Some(last_message) = &conversation.last_message
+		if let Some(last_message) = &chat.last_message
 			// is it the same message
 			&& last_message.inner.uuid == message.inner.uuid
 		{
-			let messages = self.list_messages(conversation, chrono::Utc::now()).await?;
-			conversation.last_message = messages.into_iter().next();
+			let messages = self.list_messages(chat).await?;
+			chat.last_message = messages.into_iter().next();
 		}
 
 		Ok(())
@@ -518,13 +557,13 @@ impl Client {
 
 	pub async fn send_typing_signal(
 		&self,
-		conversation: &ChatConversation,
+		chat: &Chat,
 		signal_type: ChatTypingType,
 	) -> Result<(), Error> {
 		api::v3::chat::typing::post(
 			self.client(),
 			&api::v3::chat::typing::Request {
-				conversation: conversation.uuid,
+				conversation: chat.uuid,
 				signal_type,
 			},
 		)
@@ -533,7 +572,7 @@ impl Client {
 
 	pub async fn add_chat_participant(
 		&self,
-		chat: &mut ChatConversation,
+		chat: &mut Chat,
 		contact: &Contact<'_>,
 	) -> Result<(), Error> {
 		let key = chat
@@ -553,7 +592,7 @@ impl Client {
 
 	pub async fn remove_chat_participant(
 		&self,
-		chat: &ChatConversation,
+		chat: &mut Chat,
 		contact: &Contact<'_>,
 	) -> Result<(), Error> {
 		let _lock = self.lock_chats().await?;
@@ -565,10 +604,13 @@ impl Client {
 				user_id: contact.user_id,
 			},
 		)
-		.await
+		.await?;
+
+		chat.participants.retain(|p| p.user_id != contact.user_id);
+		Ok(())
 	}
 
-	pub async fn mark_conversation_read(&self, chat: &ChatConversation) -> Result<(), Error> {
+	pub async fn mark_chat_read(&self, chat: &Chat) -> Result<(), Error> {
 		api::v3::chat::conversations::read::post(
 			self.client(),
 			&api::v3::chat::conversations::read::Request { uuid: chat.uuid },
@@ -576,10 +618,7 @@ impl Client {
 		.await
 	}
 
-	pub async fn get_conversation_unread_count(
-		&self,
-		chat: &ChatConversation,
-	) -> Result<u64, Error> {
+	pub async fn get_chat_unread_count(&self, chat: &Chat) -> Result<u64, Error> {
 		Ok(api::v3::chat::conversations::unread::post(
 			self.client(),
 			&api::v3::chat::conversations::unread::Request { uuid: chat.uuid },
@@ -588,22 +627,24 @@ impl Client {
 		.unread)
 	}
 
-	pub async fn get_all_conversations_unread_count(&self) -> Result<u64, Error> {
+	pub async fn get_all_chats_unread_count(&self) -> Result<u64, Error> {
 		Ok(api::v3::chat::unread::get(self.client()).await?.unread)
 	}
 
-	pub async fn update_conversation_online_status(
-		&self,
-		conversation: &mut ChatConversation,
-	) -> Result<(), Error> {
+	pub async fn update_chat_online_status(&self, chat: &mut Chat) -> Result<(), Error> {
 		let resp = api::v3::chat::conversations::online::post(
 			self.client(),
 			&api::v3::chat::conversations::online::Request {
-				conversation: conversation.uuid,
+				conversation: chat.uuid,
 			},
 		)
 		.await?;
-		conversation.participants.iter_mut().for_each(|p| {
+		chat.participants.iter_mut().for_each(|p| {
+			if p.user_id == self.user_id {
+				// our own status is always 0
+				p.last_active = DateTime::<Utc>::default();
+				return;
+			}
 			let status = resp.0.iter().find(|s| s.user_id == p.user_id);
 
 			p.last_active = status.map_or(p.last_active, |s| s.last_active);
@@ -613,7 +654,7 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn leave_conversation(&self, chat: &ChatConversation) -> Result<(), Error> {
+	pub async fn leave_chat(&self, chat: &Chat) -> Result<(), Error> {
 		if self.user_id == chat.owner_id {
 			return Err(
 				Error::custom(ErrorKind::Server, "Owner cannot leave the chat")
@@ -629,26 +670,37 @@ impl Client {
 		.await
 	}
 
-	pub async fn get_last_chat_focus_times(&self) -> Result<Vec<ChatLastFocusValues>, Error> {
-		Ok(api::v3::chat::last_focus::get(self.client()).await?.0)
+	pub async fn update_last_chat_focus_times_now(&self, chats: &mut [Chat]) -> Result<(), Error> {
+		let now = Utc::now().round_subsecs(3);
+		api::v3::chat::last_focus_update::post(
+			self.client(),
+			&api::v3::chat::last_focus_update::Request {
+				conversations: chats
+					.iter()
+					.map(|c| ChatLastFocusValues {
+						uuid: c.uuid,
+						last_focus: now,
+					})
+					.collect(),
+			},
+		)
+		.await?;
+		chats.iter_mut().for_each(|c| c.last_focus = Some(now));
+		Ok(())
 	}
 
-	pub async fn mute_chat(
-		&self,
-		conversation: &mut ChatConversation,
-		mute: bool,
-	) -> Result<(), Error> {
+	pub async fn mute_chat(&self, chat: &mut Chat, mute: bool) -> Result<(), Error> {
 		let _lock = self.lock_chats().await?;
 		api::v3::chat::mute::post(
 			self.client(),
 			&api::v3::chat::mute::Request {
-				uuid: conversation.uuid,
+				uuid: chat.uuid,
 				mute,
 			},
 		)
 		.await?;
 
-		conversation.muted = mute;
+		chat.muted = mute;
 
 		Ok(())
 	}

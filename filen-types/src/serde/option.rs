@@ -17,3 +17,15 @@ pub(crate) mod default {
 		Option::<T>::deserialize(deserializer)
 	}
 }
+
+pub(crate) mod result_to_option {
+	use serde::Deserialize;
+
+	pub(crate) fn deserialize<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(
+		deserializer: D,
+	) -> Result<Option<T>, D::Error> {
+		let value = serde_json::Value::deserialize(deserializer)?;
+		let deserialized: Result<T, _> = serde_json::from_value(value);
+		Ok(deserialized.ok())
+	}
+}

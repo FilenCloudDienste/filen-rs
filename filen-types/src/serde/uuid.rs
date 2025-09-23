@@ -25,6 +25,19 @@ pub(crate) mod optional {
 			None => serializer.serialize_none(),
 		}
 	}
+
+	pub(crate) fn serialize_as_str<S>(
+		value: &Option<UuidStr>,
+		serializer: S,
+	) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		match value {
+			Some(uuid) => uuid.serialize(serializer),
+			None => "".serialize(serializer),
+		}
+	}
 }
 
 macro_rules! uuid_option_module {
