@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "filen-sdk-rs"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "aes-gcm",
  "argon2",
