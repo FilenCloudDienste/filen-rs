@@ -110,6 +110,9 @@ fn config_cmake_for_libcxx(config: &mut Config) {
 	// Ensure we're using clang++ for consistency
 	config.define("CMAKE_CXX_COMPILER", "clang++");
 	config.define("CMAKE_C_COMPILER", "clang");
+
+	// This was causing issues on the windows runner and we don't care about documentation
+	config.define("CMAKE_DISABLE_FIND_PACKAGE_Doxygen", "TRUE");
 }
 
 fn build_libde265() -> PathBuf {
