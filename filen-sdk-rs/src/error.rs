@@ -18,7 +18,26 @@ macro_rules! impl_from {
 	};
 }
 
-impl_from!(filen_types::error::ResponseError, ErrorKind::Server);
+impl From<filen_types::error::ResponseError> for Error {
+	fn from(e: filen_types::error::ResponseError) -> Self {
+		let kind = {
+			let filen_types::error::ResponseError::ApiError { code, .. } = &e;
+			// this is the code returned by the server when the API key is invalid
+			if code.as_deref() == Some("api_key_not_found") {
+				ErrorKind::Unauthenticated
+			} else {
+				ErrorKind::Server
+			}
+		};
+
+		Error {
+			kind,
+			inner: Some(Box::new(e)),
+			context: None,
+		}
+	}
+}
+
 impl_from!(reqwest::Error, ErrorKind::Reqwest);
 impl_from!(crate::crypto::error::ConversionError, ErrorKind::Conversion);
 impl From<filen_types::error::ConversionError> for Error {
@@ -35,9 +54,16 @@ impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
 /// Enum for all the error kinds that can occur in the SDK.
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi)
+)]
 pub enum ErrorKind {
 	/// Returned by the server
 	Server,
+	/// The server replied with an error indicating the client is not authenticated
+	Unauthenticated,
 	/// Passthrough reqwest crate error
 	Reqwest,
 	/// The response was unexpected, either failed serde_json conversion
@@ -71,18 +97,37 @@ pub enum ErrorKind {
 
 /// Custom error type for the SDK
 #[derive(Debug)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "FilenSDKError")
+)]
 pub struct Error {
 	kind: ErrorKind,
 	inner: Option<Box<dyn std::error::Error + Send + Sync>>,
 	context: Option<Cow<'static, str>>,
 }
 
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "FilenSDKError")
+)]
 impl Error {
-	/// Returns the ErrorKind of the error
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(getter)
+	)]
 	pub fn kind(&self) -> ErrorKind {
 		self.kind
 	}
 
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "toString")]
+	pub fn js_to_string(&self) -> String {
+		format!("{}", self)
+	}
+}
+
+impl Error {
 	/// Adds context to the error, which can be used to provide more information about the error
 	pub fn with_context(mut self, context: impl Into<Cow<'static, str>>) -> Self {
 		match self.context {
@@ -226,10 +271,3 @@ impl_from!(
 pub(crate) struct AbortedError;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 impl_from!(AbortedError, ErrorKind::Cancelled);
-
-#[cfg(target_arch = "wasm32")]
-impl From<Error> for wasm_bindgen::JsValue {
-	fn from(e: Error) -> Self {
-		wasm_bindgen::JsValue::from_str(&format!("Error of kind {:?}: {}", e.kind, e))
-	}
-}

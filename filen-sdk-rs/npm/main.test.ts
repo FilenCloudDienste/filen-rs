@@ -1,4 +1,4 @@
-import { login, Client, fromStringified, type Dir, type File, PauseSignal } from "./bundler/sdk-rs.js"
+import { login, Client, fromStringified, type Dir, type File, PauseSignal, FilenSDKError } from "./bundler/sdk-rs.js"
 import { expect, beforeAll, test, afterAll } from "vitest"
 import { tmpdir } from "os"
 import { createWriteStream, openAsBlob } from "fs"
@@ -626,6 +626,19 @@ test("search", async () => {
 	const results = await state.findItemMatchesForName("124asdfas;dlkfj")
 	expect(results.find(i => i.item.uuid === dir.uuid)).toBeDefined()
 	expect(results.find(i => i.item.uuid === file.uuid)).toBeDefined()
+})
+
+test("authError", async () => {
+	const badStringified = state.toStringified()
+	badStringified.apiKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	const badState = fromStringified(badStringified)
+	try {
+		await badState.listDir(badState.root())
+	} catch (e) {
+		expect(e).toBeInstanceOf(FilenSDKError)
+		expect((e as FilenSDKError).kind).toEqual("Unauthenticated")
+		expect((e as FilenSDKError).toString()).toContain("v3/dir/content")
+	}
 })
 
 afterAll(async () => {
