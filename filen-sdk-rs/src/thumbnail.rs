@@ -1,6 +1,8 @@
 use std::io::{BufRead, Seek, Write};
 
-use image::{DynamicImage, ImageReader, codecs::webp::WebPEncoder, imageops::FilterType};
+use image::{
+	DynamicImage, ImageDecoder, ImageReader, codecs::webp::WebPEncoder, imageops::FilterType,
+};
 
 use crate::{
 	ErrorKind,
@@ -58,7 +60,13 @@ impl Client {
 				)
 			}
 		} else {
-			image::load_from_memory(&image_data)?
+			let reader =
+				image::ImageReader::new(std::io::Cursor::new(&image_data)).with_guessed_format()?;
+			let mut decoder = reader.into_decoder()?;
+			let orientation = decoder.orientation()?;
+			let mut image = DynamicImage::from_decoder(decoder)?;
+			image.apply_orientation(orientation);
+			image
 		};
 
 		Ok(image.resize(max_width, max_height, FilterType::CatmullRom))
@@ -152,8 +160,11 @@ where
 		}
 	} else {
 		let reader = ImageReader::new(image_reader).with_guessed_format()?;
-		let img: DynamicImage = reader.decode()?;
-		img
+		let mut decoder = reader.into_decoder()?;
+		let orientation = decoder.orientation()?;
+		let mut image = DynamicImage::from_decoder(decoder)?;
+		image.apply_orientation(orientation);
+		image
 	};
 	let created_width = target_width.min(img.width());
 	let created_height = target_height.min(img.height());
