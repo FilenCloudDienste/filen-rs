@@ -808,22 +808,6 @@ pub mod js_impls {
 
 	use super::{Chat, ChatMessage, ChatMessagePartial};
 
-	impl wasm_bindgen::__rt::VectorIntoJsValue for Chat {
-		fn vector_into_jsvalue(
-			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-		) -> wasm_bindgen::JsValue {
-			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-		}
-	}
-
-	impl wasm_bindgen::__rt::VectorIntoJsValue for ChatMessage {
-		fn vector_into_jsvalue(
-			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-		) -> wasm_bindgen::JsValue {
-			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-		}
-	}
-
 	#[wasm_bindgen]
 	impl Client {
 		#[wasm_bindgen(js_name = "listMessages")]

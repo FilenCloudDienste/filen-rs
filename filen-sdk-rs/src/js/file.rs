@@ -217,15 +217,6 @@ pub struct File {
 	pub can_make_thumbnail: bool,
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-impl wasm_bindgen::__rt::VectorIntoJsValue for File {
-	fn vector_into_jsvalue(
-		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-	) -> wasm_bindgen::JsValue {
-		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-	}
-}
-
 impl From<RemoteFile> for File {
 	fn from(file: RemoteFile) -> Self {
 		let meta = file.meta.into();
@@ -342,14 +333,6 @@ impl From<crate::connect::fs::SharedFile> for SharedFile {
 			file: shared.file.into(),
 			sharing_role: shared.sharing_role,
 		}
-	}
-}
-
-impl wasm_bindgen::__rt::VectorIntoJsValue for SharedFile {
-	fn vector_into_jsvalue(
-		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-	) -> wasm_bindgen::JsValue {
-		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
 	}
 }
 

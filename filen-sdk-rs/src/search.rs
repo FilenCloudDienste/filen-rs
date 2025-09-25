@@ -249,14 +249,6 @@ mod js_impl {
 		pub path: String,
 	}
 
-	impl wasm_bindgen::__rt::VectorIntoJsValue for ItemMatch {
-		fn vector_into_jsvalue(
-			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-		) -> wasm_bindgen::JsValue {
-			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-		}
-	}
-
 	#[wasm_bindgen]
 	impl Client {
 		#[wasm_bindgen(js_name = "findItemMatchesForName")]

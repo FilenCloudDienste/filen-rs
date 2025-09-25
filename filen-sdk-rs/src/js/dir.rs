@@ -196,15 +196,6 @@ pub struct Dir {
 	pub meta: DirMeta,
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-impl wasm_bindgen::__rt::VectorIntoJsValue for Dir {
-	fn vector_into_jsvalue(
-		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-	) -> wasm_bindgen::JsValue {
-		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-	}
-}
-
 impl From<RemoteDirectory> for Dir {
 	fn from(dir: RemoteDirectory) -> Self {
 		Dir {
@@ -394,14 +385,6 @@ impl From<crate::connect::fs::SharedDirectory> for SharedDir {
 			sharing_role: shared.sharing_role,
 			write_access: shared.write_access,
 		}
-	}
-}
-
-impl wasm_bindgen::__rt::VectorIntoJsValue for SharedDir {
-	fn vector_into_jsvalue(
-		vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-	) -> wasm_bindgen::JsValue {
-		wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
 	}
 }
 

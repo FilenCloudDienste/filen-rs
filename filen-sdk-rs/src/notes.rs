@@ -972,30 +972,6 @@ pub mod js_impls {
 
 	use super::{Note, NoteHistory, NoteTag};
 
-	impl wasm_bindgen::__rt::VectorIntoJsValue for NoteTag {
-		fn vector_into_jsvalue(
-			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-		) -> wasm_bindgen::JsValue {
-			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-		}
-	}
-
-	impl wasm_bindgen::__rt::VectorIntoJsValue for Note {
-		fn vector_into_jsvalue(
-			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-		) -> wasm_bindgen::JsValue {
-			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-		}
-	}
-
-	impl wasm_bindgen::__rt::VectorIntoJsValue for NoteHistory {
-		fn vector_into_jsvalue(
-			vector: wasm_bindgen::__rt::std::boxed::Box<[Self]>,
-		) -> wasm_bindgen::JsValue {
-			wasm_bindgen::__rt::js_value_vector_into_jsvalue(vector)
-		}
-	}
-
 	#[derive(Serialize, Tsify)]
 	#[tsify(into_wasm_abi)]
 	pub struct DuplicateNoteResponse {
