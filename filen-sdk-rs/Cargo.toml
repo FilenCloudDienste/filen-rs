@@ -1,6 +1,6 @@
 [package]
 name = "filen-sdk-rs"
-version = "0.3.17"
+version = "0.3.18"
 authors = ["FilenCloudDienste"]
 edition = "2024"
 repository = "https://github.com/FilenCloudDienste/filen-rs"
