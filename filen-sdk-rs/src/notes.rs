@@ -483,18 +483,18 @@ impl Client {
 	pub async fn remove_note_participant(
 		&self,
 		note: &mut Note,
-		contact: &Contact<'_>,
+		participant_id: u64,
 	) -> Result<(), Error> {
 		crate::api::v3::notes::participants::remove::post(
 			self.client(),
 			&crate::api::v3::notes::participants::remove::Request {
 				uuid: note.uuid,
-				user_id: contact.user_id,
+				user_id: participant_id,
 			},
 		)
 		.await?;
 
-		note.participants.retain(|p| p.user_id != contact.user_id);
+		note.participants.retain(|p| p.user_id != participant_id);
 		Ok(())
 	}
 
@@ -1011,9 +1011,9 @@ pub mod js_impls {
 		pub async fn js_remove_note_participant(
 			&self,
 			mut note: Note,
-			contact: Contact,
+			participant_id: u64,
 		) -> Result<Note, Error> {
-			self.remove_note_participant(&mut note, &contact.into())
+			self.remove_note_participant(&mut note, participant_id)
 				.await?;
 			Ok(note)
 		}
