@@ -184,13 +184,13 @@ impl ChatMessagePartial {
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
+	// hashmap_as_object is needed here as a workaround to https://github.com/madonoharu/tsify/issues/69
+	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints, hashmap_as_object),
 	serde(rename_all = "camelCase")
 )]
 pub struct ChatMessage {
 	chat: UuidStr,
-	// want to use flatten here but can't until https://github.com/madonoharu/tsify/issues/69 is resolved
-	// #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
 	inner: ChatMessagePartial,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),

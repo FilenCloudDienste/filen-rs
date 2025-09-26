@@ -611,7 +611,7 @@ test("chats", async () => {
 	expect(chat.name).toBe("Test Chat")
 
 	chat = await state.sendChatMessage(chat, "This is a test message")
-	expect(chat.lastMessage?.inner.message).toEqual("This is a test message")
+	expect(chat.lastMessage?.message).toEqual("This is a test message")
 	const fetchedChat = await state.getChat(chat.uuid)
 	expect(fetchedChat).toEqual(chat)
 })
