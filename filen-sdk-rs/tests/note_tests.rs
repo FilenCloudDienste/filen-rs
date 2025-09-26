@@ -515,8 +515,16 @@ async fn note_sharing() {
 	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
 	assert_eq!(note, fetched);
 
+	let note_uuid = *note.uuid();
+
+	let participant = note
+		.participants_mut()
+		.iter_mut()
+		.find(|p| p.user_id() == contact.user_id)
+		.unwrap();
+
 	client
-		.set_note_participant_permission(&mut note, &contact, false)
+		.set_note_participant_permission(note_uuid, participant, false)
 		.await
 		.unwrap();
 	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();

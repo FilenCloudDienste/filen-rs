@@ -119,6 +119,12 @@ pub struct NoteParticipant {
 	added_timestamp: DateTime<Utc>,
 }
 
+impl NoteParticipant {
+	pub fn user_id(&self) -> u64 {
+		self.user_id
+	}
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -207,6 +213,14 @@ impl Note {
 
 	pub fn tags(&self) -> &[NoteTag] {
 		&self.tags
+	}
+
+	pub fn participants(&self) -> &[NoteParticipant] {
+		&self.participants
+	}
+
+	pub fn participants_mut(&mut self) -> &mut [NoteParticipant] {
+		&mut self.participants
 	}
 }
 
@@ -486,27 +500,21 @@ impl Client {
 
 	pub async fn set_note_participant_permission(
 		&self,
-		note: &mut Note,
-		contact: &Contact<'_>,
+		note_uuid: UuidStr,
+		participant: &mut NoteParticipant,
 		write: bool,
 	) -> Result<(), Error> {
 		crate::api::v3::notes::participants::permissions::post(
 			self.client(),
 			&crate::api::v3::notes::participants::permissions::Request {
-				uuid: note.uuid,
-				user_id: contact.user_id,
+				uuid: note_uuid,
+				user_id: participant.user_id,
 				permissions_write: write,
 			},
 		)
 		.await?;
 
-		if let Some(participant) = note
-			.participants
-			.iter_mut()
-			.find(|p| p.user_id == contact.user_id)
-		{
-			participant.permissions_write = write;
-		}
+		participant.permissions_write = write;
 
 		Ok(())
 	}
@@ -968,6 +976,7 @@ pub mod js_impls {
 
 	use crate::{
 		Error, auth::Client, connect::js_impls::Contact, fs::dir::js_impl::tuple_to_jsvalue,
+		notes::NoteParticipant,
 	};
 
 	use super::{Note, NoteHistory, NoteTag};
@@ -1012,13 +1021,13 @@ pub mod js_impls {
 		#[wasm_bindgen(js_name = "setNoteParticipantPermission")]
 		pub async fn js_set_note_participant_permission(
 			&self,
-			mut note: Note,
-			contact: Contact,
+			#[wasm_bindgen(js_name = "noteUuid")] note_uuid: UuidStr,
+			mut participant: NoteParticipant,
 			write: bool,
-		) -> Result<Note, Error> {
-			self.set_note_participant_permission(&mut note, &contact.into(), write)
+		) -> Result<NoteParticipant, Error> {
+			self.set_note_participant_permission(note_uuid, &mut participant, write)
 				.await?;
-			Ok(note)
+			Ok(participant)
 		}
 
 		#[wasm_bindgen(js_name = "getNote")]
