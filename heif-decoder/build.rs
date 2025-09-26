@@ -44,6 +44,9 @@ fn config_cmake_for_android(config: &mut Config) {
 		return;
 	};
 
+	// Android 16KiB page size force
+	config.define("ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES", "ON");
+
 	// /toolchains/llvm/prebuilt/darwin-x86_64/sysroot/
 	let ndk_root = PathBuf::from(&sysroot_path)
 		.parent() // remove /sysroot
