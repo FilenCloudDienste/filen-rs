@@ -491,7 +491,7 @@ async fn note_sharing() {
 		.unwrap_err();
 
 	client
-		.remove_note_participant(&mut note, &contact)
+		.remove_note_participant(&mut note, contact.user_id)
 		.await
 		.unwrap();
 	let fetched = client.get_note(*note.uuid()).await.unwrap().unwrap();
