@@ -12,7 +12,7 @@ pub struct Request {
 	pub signal_type: ChatTypingType,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),

@@ -33,6 +33,9 @@ use crate::{
 	sync::lock::ResourceLock,
 };
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::sockets::{SocketConfig, SocketConnectionState};
+
 pub mod http;
 pub mod v1;
 pub mod v2;
@@ -149,6 +152,9 @@ pub struct Client {
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
 	#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen(skip))]
 	pub open_file_semaphore: tokio::sync::Semaphore,
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	pub(crate) socket_connection: SocketConnectionState,
 }
 
 impl PartialEq for Client {
@@ -231,6 +237,8 @@ impl Client {
 		let private_key =
 			RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(stringified.private_key)?)?;
 
+		let http_client = Arc::new(AuthClient::new(APIKey(Cow::Owned(stringified.api_key))));
+
 		Ok(Client {
 			email: stringified.email,
 			user_id: stringified.user_id,
@@ -241,7 +249,7 @@ impl Client {
 			public_key: RsaPublicKey::from(&private_key),
 			hmac_key: HMACKey::new(&private_key),
 			private_key,
-			http_client: Arc::new(AuthClient::new(APIKey(Cow::Owned(stringified.api_key)))),
+			http_client: http_client.clone(),
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
@@ -262,6 +270,8 @@ impl Client {
 					.unwrap_or(crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET),
 			),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			socket_connection: SocketConnectionState::new(http_client, SocketConfig::default()),
 		})
 	}
 
@@ -405,6 +415,8 @@ impl Client {
 
 		let user_info = api::v3::user::info::get(&client).await?;
 
+		let http_client = Arc::new(client);
+
 		Ok(Client {
 			email,
 			user_id: user_info.id,
@@ -415,7 +427,7 @@ impl Client {
 			public_key,
 			private_key,
 			hmac_key: hmac,
-			http_client: Arc::new(client),
+			http_client: http_client.clone(),
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
@@ -424,6 +436,8 @@ impl Client {
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
 			),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			socket_connection: SocketConnectionState::new(http_client, SocketConfig::default()),
 		})
 	}
 

@@ -51,7 +51,7 @@ pub struct NoteTag<'a> {
 	pub created_timestamp: DateTime<Utc>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteParticipant<'a> {
 	pub user_id: u64,

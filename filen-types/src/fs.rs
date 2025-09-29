@@ -6,7 +6,13 @@ use crate::error::ConversionError;
 
 pub use uuid::UuidStr;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(large_number_types_as_bigints)
+)]
 pub enum ObjectType {
 	#[serde(rename = "file")]
 	File,

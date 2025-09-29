@@ -88,6 +88,11 @@ serde_bytes = "0.11.17"
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 hyper-util = { version = "0.1.16", features = ["client-legacy"] }
 heif-decoder = { path = "../heif-decoder", optional = true }
+tokio-tungstenite = { version = "0.28.0", features = [
+	"rustls",
+	"rustls-tls-native-roots",
+] }
+tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom_v3 = { package = "getrandom", version = "0.3", features = [
@@ -105,7 +110,9 @@ tsify = { version = "0.5.5", default-features = false, features = [
 	"js",
 ] }
 serde-wasm-bindgen = "0.6.5"
-web-sys = { version = "0.3.22", default-features = false }
+web-sys = { version = "0.3.22", default-features = false, features = [
+	"WebSocket",
+] }
 wasm-logger = "0.2.0"
 console_error_panic_hook = "0.1.5"
 wasm-streams = "0.4.2"

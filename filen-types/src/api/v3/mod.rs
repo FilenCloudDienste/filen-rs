@@ -9,6 +9,7 @@ pub mod login;
 pub mod notes;
 pub mod search;
 pub mod shared;
+pub mod socket;
 pub mod trash;
 pub mod upload;
 pub mod user;
