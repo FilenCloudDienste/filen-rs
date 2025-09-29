@@ -19,7 +19,7 @@ pub struct Request {
 #[serde(transparent)]
 pub struct Response<'a>(pub Vec<ChatMessage<'a>>);
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage<'a> {
 	pub conversation: UuidStr,
@@ -35,7 +35,7 @@ pub struct ChatMessage<'a> {
 	pub sent_timestamp: DateTime<Utc>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessagePartial<'a> {
 	pub uuid: UuidStr,

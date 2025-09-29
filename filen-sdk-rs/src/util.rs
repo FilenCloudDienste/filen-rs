@@ -71,6 +71,11 @@ pub type MaybeArc<T> = std::sync::Arc<T>;
 #[cfg(target_arch = "wasm32")]
 pub type MaybeArc<T> = std::rc::Rc<T>;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub type MaybeArcWeak<T> = std::sync::Weak<T>;
+#[cfg(target_arch = "wasm32")]
+pub type MaybeArcWeak<T> = std::rc::Weak<T>;
+
 #[cfg(test)]
 mod tests {
 	use super::*;

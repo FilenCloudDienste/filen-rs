@@ -9,6 +9,7 @@ use filen_types::{
 		chat::{last_focus_update::ChatLastFocusValues, typing::ChatTypingType},
 		contacts::Contact,
 	},
+	crypto::EncryptedString,
 	fs::UuidStr,
 	traits::CowHelpers,
 };
@@ -136,6 +137,56 @@ impl Chat {
 
 	pub fn muted(&self) -> bool {
 		self.muted
+	}
+
+	pub fn update_name_from_encrypted(
+		&mut self,
+		encrypted: &EncryptedString<'_>,
+	) -> Result<(), Error> {
+		let key = self
+			.key
+			.as_ref()
+			.ok_or(MetadataWasNotDecryptedError)
+			.context("update_name_from_encrypted")?;
+		self.name = Some(crypto::ChatName::try_decrypt(
+			key,
+			encrypted,
+			&mut Vec::new(),
+		)?);
+		Ok(())
+	}
+
+	pub fn update_chat_message_from_encrypted(
+		&self,
+		message: &mut ChatMessage,
+		encrypted: &EncryptedString<'_>,
+		edited_timestamp: DateTime<Utc>,
+	) -> Result<(), Error> {
+		let key = self
+			.key
+			.as_ref()
+			.ok_or(MetadataWasNotDecryptedError)
+			.context("update_chat_message_from_encrypted")?;
+		message.inner.message = Some(crypto::ChatMessage::try_decrypt(
+			key,
+			encrypted,
+			&mut Vec::new(),
+		)?);
+		message.edited_timestamp = edited_timestamp.round_subsecs(3);
+		message.edited = true;
+		Ok(())
+	}
+
+	pub fn decrypt_chat_message(
+		&self,
+		encrypted: filen_types::api::v3::chat::messages::ChatMessage<'static>,
+	) -> Result<ChatMessage, Error> {
+		let key = self
+			.key
+			.as_ref()
+			.ok_or(MetadataWasNotDecryptedError)
+			.context("decrypt_chat_message")?;
+		Ok(ChatMessage::decrypt(encrypted, Some(key), &mut Vec::new()))
 	}
 }
 

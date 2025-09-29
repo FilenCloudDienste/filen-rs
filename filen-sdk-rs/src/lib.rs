@@ -14,6 +14,8 @@ pub mod js;
 pub mod notes;
 pub mod search;
 pub(crate) mod serde;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub mod sockets;
 pub mod sync;
 pub mod thumbnail;
 pub mod user;
