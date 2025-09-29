@@ -227,9 +227,18 @@ test("abort", async () => {
 
 	abortController.abort()
 
-	await expect(fileAPromise).rejects.toThrowError("Operation was cancelled")
-	await expect(fileCPromise).rejects.toThrowError("Operation was cancelled")
-
+	try {
+		await fileAPromise
+	} catch (e) {
+		expect(e).toBeInstanceOf(FilenSDKError)
+		expect((e as FilenSDKError).kind).toBe("Cancelled")
+	}
+	try {
+		await fileCPromise
+	} catch (e) {
+		expect(e).toBeInstanceOf(FilenSDKError)
+		expect((e as FilenSDKError).kind).toBe("Cancelled")
+	}
 	const fileB = await fileBPromise
 	const [, files] = await state.listDir(testDir)
 
