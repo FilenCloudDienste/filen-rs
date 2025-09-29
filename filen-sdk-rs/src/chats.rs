@@ -67,7 +67,12 @@ impl ChatParticipant {
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
+	tsify(
+		into_wasm_abi,
+		from_wasm_abi,
+		large_number_types_as_bigints,
+		hashmap_as_object
+	),
 	serde(rename_all = "camelCase")
 )]
 pub struct Chat {
