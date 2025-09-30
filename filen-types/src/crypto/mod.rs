@@ -29,6 +29,40 @@ impl TryFrom<&EncodedString<'_>> for Vec<u8> {
 pub struct EncryptedString<'a>(pub Cow<'a, str>);
 impl_cow_helpers_for_newtype!(EncryptedString);
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl<'a> wasm_bindgen::convert::IntoWasmAbi for EncryptedString<'a> {
+	type Abi = <&'a str as wasm_bindgen::convert::IntoWasmAbi>::Abi;
+	#[inline]
+	fn into_abi(self) -> Self::Abi {
+		(&self.0).into_abi()
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl wasm_bindgen::describe::WasmDescribe for EncryptedString<'_> {
+	fn describe() {
+		<&str as wasm_bindgen::describe::WasmDescribe>::describe()
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
+	type Abi = <String as wasm_bindgen::convert::FromWasmAbi>::Abi;
+	#[inline]
+	unsafe fn from_abi(abi: Self::Abi) -> Self {
+		Self(Cow::Owned(unsafe {
+			<String as wasm_bindgen::convert::FromWasmAbi>::from_abi(abi)
+		}))
+	}
+}
+
+// claude said to do this to define the type in TS
+// without allowing it to be constructed in TS
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const TS_ENCRYPTED_STRING: &'static str = r#"declare const encryptedStringBrand: unique symbol;
+export type EncryptedString = string & {readonly [encryptedStringBrand]: "UserId"}"#;
+
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct EncryptedMasterKeys<'a>(pub EncryptedString<'a>);

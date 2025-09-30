@@ -20,7 +20,7 @@ use crate::{
 	auth::Client,
 	crypto::{
 		notes_and_chats::{NoteOrChatCarrierCryptoExt, NoteOrChatKey, NoteOrChatKeyStruct},
-		shared::CreateRandom,
+		shared::{CreateRandom, MetaCrypter},
 	},
 	error::{MetadataWasNotDecryptedError, ResultExt},
 };
@@ -177,16 +177,13 @@ impl Chat {
 		Ok(())
 	}
 
-	pub fn decrypt_chat_message(
-		&self,
-		encrypted: filen_types::api::v3::chat::messages::ChatMessage<'static>,
-	) -> Result<ChatMessage, Error> {
+	pub fn decrypt_string(&self, encrypted: EncryptedString<'_>) -> Result<String, Error> {
 		let key = self
 			.key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
 			.context("decrypt_chat_message")?;
-		Ok(ChatMessage::decrypt(encrypted, Some(key), &mut Vec::new()))
+		key.decrypt_meta(&encrypted).context("decrypt_chat_message")
 	}
 }
 
@@ -219,7 +216,7 @@ pub struct ChatMessagePartial {
 
 impl ChatMessagePartial {
 	fn decrypt(
-		encrypted: filen_types::api::v3::chat::messages::ChatMessagePartial<'_>,
+		encrypted: filen_types::api::v3::chat::messages::ChatMessagePartialEncrypted<'_>,
 		chat_key: Option<&NoteOrChatKey>,
 		tmp_vec: &mut Vec<u8>,
 	) -> Self {
@@ -271,12 +268,12 @@ pub struct ChatMessage {
 
 impl ChatMessage {
 	fn decrypt(
-		encrypted: filen_types::api::v3::chat::messages::ChatMessage<'_>,
+		encrypted: filen_types::api::v3::chat::messages::ChatMessageEncrypted<'_>,
 		private_key: Option<&NoteOrChatKey>,
 		tmp_vec: &mut Vec<u8>,
 	) -> Self {
 		Self {
-			chat: encrypted.conversation,
+			chat: encrypted.chat,
 			inner: ChatMessagePartial::decrypt(encrypted.inner, private_key, tmp_vec),
 			reply_to: encrypted
 				.reply_to
@@ -857,12 +854,26 @@ impl Client {
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub mod js_impls {
 	use chrono::TimeZone;
-	use filen_types::{api::v3::chat::typing::ChatTypingType, fs::UuidStr};
+	use filen_types::{
+		api::v3::chat::typing::ChatTypingType, crypto::EncryptedString, fs::UuidStr,
+	};
 	use wasm_bindgen::prelude::wasm_bindgen;
 
 	use crate::{Error, auth::Client, connect::js_impls::Contact};
 
 	use super::{Chat, ChatMessage, ChatMessagePartial};
+
+	#[wasm_bindgen(js_name = "decryptMetaWithChatKey")]
+	/// Decrypts chat metadata (like chat name or message content) using the provided chat key.
+	/// Meant to be used in socket event handlers where this cannot currently be done automatically.
+	///
+	/// Should not be used outside of that context.
+	pub fn decrypt_meta_with_chat_key(
+		chat: &Chat,
+		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: EncryptedString,
+	) -> Result<String, Error> {
+		chat.decrypt_string(encrypted)
+	}
 
 	#[wasm_bindgen]
 	impl Client {

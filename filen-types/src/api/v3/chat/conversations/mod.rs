@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	api::v3::chat::messages::ChatMessage,
+	api::v3::chat::messages::ChatMessageEncrypted,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::UuidStr,
 };
@@ -28,7 +28,7 @@ pub struct Response<'a>(pub Vec<ChatConversation<'a>>);
 #[serde(rename_all = "camelCase")]
 pub struct ChatConversation<'a> {
 	pub uuid: UuidStr,
-	pub last_message_full: Option<ChatMessage<'a>>,
+	pub last_message_full: Option<ChatMessageEncrypted<'a>>,
 	pub owner_id: u64,
 	pub owner_metadata: Option<EncryptedString<'a>>,
 	pub name: Option<EncryptedString<'a>>,
