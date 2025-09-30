@@ -111,9 +111,12 @@ jobs:
           sh wasm-pack-bundler.sh
         working-directory: ./filen-sdk-rs
       - name: Run TS tests
+        # using --expose-gc to allow checking behavior of code with GC
+        # currently used because the sockets are cleaned up when the handles are dropped,
+        # but dropping is non-deterministic and relies on GC
         run: |
           npm install
-          npm run test
+          npm run test --node-options=--expose-gc
         working-directory: ./filen-sdk-rs/npm
         env:
           TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}

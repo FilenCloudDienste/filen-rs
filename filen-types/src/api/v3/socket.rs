@@ -4,7 +4,10 @@ use std::borrow::Cow;
 
 use crate::{
 	api::v3::{
-		chat::{messages::ChatMessage, typing::ChatTypingType},
+		chat::{
+			messages::{ChatMessageEncrypted, ChatMessagePartialEncrypted},
+			typing::ChatTypingType,
+		},
 		dir::color::DirColor,
 		notes::{NoteParticipant, NoteType},
 	},
@@ -16,13 +19,13 @@ use crate::{
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
-	Connect,
-	Disconnect,
-	Ping,
-	Pong,
-	Message,
-	Upgrade,
-	Noop,
+	Connect = b'0',
+	Disconnect = b'1',
+	Ping = b'2',
+	Pong = b'3',
+	Message = b'4',
+	Upgrade = b'5',
+	Noop = b'6',
 }
 
 impl TryFrom<u8> for PacketType {
@@ -30,13 +33,13 @@ impl TryFrom<u8> for PacketType {
 
 	fn try_from(value: u8) -> Result<Self, u8> {
 		match value {
-			0 => Ok(PacketType::Connect),
-			1 => Ok(PacketType::Disconnect),
-			2 => Ok(PacketType::Ping),
-			3 => Ok(PacketType::Pong),
-			4 => Ok(PacketType::Message),
-			5 => Ok(PacketType::Upgrade),
-			6 => Ok(PacketType::Noop),
+			b'0' => Ok(PacketType::Connect),
+			b'1' => Ok(PacketType::Disconnect),
+			b'2' => Ok(PacketType::Ping),
+			b'3' => Ok(PacketType::Pong),
+			b'4' => Ok(PacketType::Message),
+			b'5' => Ok(PacketType::Upgrade),
+			b'6' => Ok(PacketType::Noop),
 			other => Err(other),
 		}
 	}
@@ -45,13 +48,13 @@ impl TryFrom<u8> for PacketType {
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageType {
-	Connect,
-	Disconnect,
-	Event,
-	Ack,
-	Error,
-	BinaryEvent,
-	BinaryAck,
+	Connect = b'0',
+	Disconnect = b'1',
+	Event = b'2',
+	Ack = b'3',
+	Error = b'4',
+	BinaryEvent = b'5',
+	BinaryAck = b'6',
 }
 
 impl TryFrom<u8> for MessageType {
@@ -59,13 +62,13 @@ impl TryFrom<u8> for MessageType {
 
 	fn try_from(value: u8) -> Result<Self, u8> {
 		match value {
-			0 => Ok(MessageType::Connect),
-			1 => Ok(MessageType::Disconnect),
-			2 => Ok(MessageType::Event),
-			3 => Ok(MessageType::Ack),
-			4 => Ok(MessageType::Error),
-			5 => Ok(MessageType::BinaryEvent),
-			6 => Ok(MessageType::BinaryAck),
+			b'0' => Ok(MessageType::Connect),
+			b'1' => Ok(MessageType::Disconnect),
+			b'2' => Ok(MessageType::Event),
+			b'3' => Ok(MessageType::Ack),
+			b'4' => Ok(MessageType::Error),
+			b'5' => Ok(MessageType::BinaryEvent),
+			b'6' => Ok(MessageType::BinaryAck),
 			other => Err(other),
 		}
 	}
@@ -85,9 +88,10 @@ pub struct HandShake<'a> {
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
+	tsify(into_wasm_abi, large_number_types_as_bigints, hashmap_as_object)
 )]
 pub enum SocketEvent<'a> {
+	AuthSuccess,
 	#[serde(borrow)]
 	NewEvent(NewEvent<'a>),
 	#[serde(borrow)]
@@ -148,11 +152,17 @@ pub enum SocketEvent<'a> {
 	#[serde(borrow)]
 	ChatConversationParticipantNew(ChatConversationParticipantNew<'a>),
 	FileDeletedPermanent(FileDeletedPermanent),
+	#[serde(borrow)]
+	FolderMetadataChanged(FolderMetadataChanged<'a>),
+	FolderDeletedPermanent(FolderDeletedPermanent),
+	#[serde(borrow)]
+	FileMetadataChanged(FileMetadataChanged<'a>),
 }
 
 impl SocketEvent<'_> {
 	pub fn event_type(&self) -> &'static str {
 		match self {
+			SocketEvent::AuthSuccess => "authSuccess",
 			SocketEvent::NewEvent(_) => "newEvent",
 			SocketEvent::FileRename(_) => "fileRename",
 			SocketEvent::FileArchiveRestored(_) => "fileArchiveRestored",
@@ -191,25 +201,11 @@ impl SocketEvent<'_> {
 			SocketEvent::ItemFavorite(_) => "itemFavorite",
 			SocketEvent::ChatConversationParticipantNew(_) => "chatConversationParticipantNew",
 			SocketEvent::FileDeletedPermanent(_) => "fileDeletedPermanent",
+			SocketEvent::FolderMetadataChanged(_) => "folderMetadataChanged",
+			SocketEvent::FolderDeletedPermanent(_) => "folderDeletedPermanent",
+			SocketEvent::FileMetadataChanged(_) => "fileMetadataChanged",
 		}
 	}
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(large_number_types_as_bigints)
-)]
-pub struct NewEventInfo<'a> {
-	#[serde(borrow)]
-	pub ip: Cow<'a, str>,
-	#[serde(borrow)]
-	pub metadata: Cow<'a, str>,
-	#[serde(borrow)]
-	pub user_agent: Cow<'a, str>,
-	pub uuid: UuidStr,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -231,7 +227,7 @@ pub struct NewEvent<'a> {
 	)]
 	pub timestamp: DateTime<Utc>,
 	#[serde(borrow)]
-	pub info: NewEventInfo<'a>,
+	pub info: Cow<'a, str>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -274,7 +270,7 @@ pub struct FileArchiveRestored<'a> {
 	#[serde(borrow)]
 	pub region: Cow<'a, str>,
 	pub version: FileEncryptionVersion,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub favorited: bool,
 }
 
@@ -304,7 +300,7 @@ pub struct FileNew<'a> {
 	#[serde(borrow)]
 	pub region: Cow<'a, str>,
 	pub version: FileEncryptionVersion,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub favorited: bool,
 }
 
@@ -334,7 +330,7 @@ pub struct FileRestore<'a> {
 	#[serde(borrow)]
 	pub region: Cow<'a, str>,
 	pub version: FileEncryptionVersion,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub favorited: bool,
 }
 
@@ -364,7 +360,7 @@ pub struct FileMove<'a> {
 	#[serde(borrow)]
 	pub region: Cow<'a, str>,
 	pub version: FileEncryptionVersion,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub favorited: bool,
 }
 
@@ -433,7 +429,7 @@ pub struct FolderMove<'a> {
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub favorited: bool,
 }
 
@@ -455,7 +451,7 @@ pub struct FolderSubCreated<'a> {
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub favorited: bool,
 }
 
@@ -477,7 +473,7 @@ pub struct FolderRestore<'a> {
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub favorited: bool,
 }
 
@@ -499,12 +495,37 @@ pub struct FolderColorChanged<'a> {
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify),
-	tsify(large_number_types_as_bigints)
+	tsify(large_number_types_as_bigints, hashmap_as_object)
 )]
 pub struct ChatMessageNew<'a> {
-	pub conversation: UuidStr,
+	#[serde(rename = "conversation")]
+	pub chat: UuidStr,
 	#[serde(flatten, borrow)]
-	pub message: ChatMessage<'a>,
+	pub inner: ChatMessagePartialEncrypted<'a>,
+	#[serde(
+		borrow,
+		deserialize_with = "crate::serde::option::result_to_option::deserialize",
+		skip_serializing_if = "Option::is_none"
+	)]
+	// #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), tsify(optional))]
+	pub reply_to: Option<ChatMessagePartialEncrypted<'a>>,
+	pub embed_disabled: bool,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub sent_timestamp: DateTime<Utc>,
+}
+
+impl<'a> From<ChatMessageNew<'a>> for ChatMessageEncrypted<'a> {
+	fn from(value: ChatMessageNew<'a>) -> Self {
+		Self {
+			chat: value.chat,
+			inner: value.inner,
+			reply_to: value.reply_to,
+			embed_disabled: value.embed_disabled,
+			edited: false,
+			edited_timestamp: DateTime::<Utc>::default(),
+			sent_timestamp: value.sent_timestamp,
+		}
+	}
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -515,7 +536,8 @@ pub struct ChatMessageNew<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct ChatTyping<'a> {
-	pub conversation: UuidStr,
+	#[serde(rename = "conversation")]
+	pub chat: UuidStr,
 	#[serde(borrow)]
 	pub sender_avatar: Option<Cow<'a, str>>,
 	#[serde(borrow)]
@@ -660,7 +682,7 @@ pub struct NoteParticipantRemoved {
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify),
-	tsify(large_number_types_as_bigints)
+	tsify(large_number_types_as_bigints, hashmap_as_object)
 )]
 pub struct NoteParticipantNew<'a> {
 	pub note: UuidStr,
@@ -721,7 +743,8 @@ pub struct ChatConversationDeleted {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct ChatMessageEdited<'a> {
-	pub conversation: UuidStr,
+	#[serde(rename = "conversation")]
+	pub chat: UuidStr,
 	pub uuid: UuidStr,
 	#[serde(borrow)]
 	pub message: EncryptedString<'a>,
@@ -781,7 +804,7 @@ pub struct ItemFavorite<'a> {
 	pub uuid: UuidStr,
 	#[serde(rename = "type")]
 	pub item_type: ObjectType,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub value: bool,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
@@ -795,7 +818,8 @@ pub struct ItemFavorite<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct ChatConversationParticipantNew<'a> {
-	pub conversation: UuidStr,
+	#[serde(rename = "conversation")]
+	pub chat: UuidStr,
 	pub user_id: u64,
 	#[serde(borrow)]
 	pub email: Cow<'a, str>,
@@ -822,5 +846,46 @@ pub struct ChatConversationParticipantNew<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct FileDeletedPermanent {
+	pub uuid: UuidStr,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(large_number_types_as_bigints)
+)]
+pub struct FolderMetadataChanged<'a> {
+	pub uuid: UuidStr,
+	#[serde(borrow)]
+	pub name: EncryptedString<'a>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(large_number_types_as_bigints)
+)]
+pub struct FileMetadataChanged<'a> {
+	pub uuid: UuidStr,
+	#[serde(borrow)]
+	pub name: EncryptedString<'a>,
+	#[serde(borrow)]
+	pub metadata: EncryptedString<'a>,
+	#[serde(borrow)]
+	pub old_metadata: EncryptedString<'a>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(large_number_types_as_bigints)
+)]
+pub struct FolderDeletedPermanent {
 	pub uuid: UuidStr,
 }

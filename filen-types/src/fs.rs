@@ -154,7 +154,8 @@ mod uuid {
 
 	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	#[wasm_bindgen(typescript_custom_section)]
-	const TS_PARENT_UUID: &'static str = r#"export type UuidStr = string;"#;
+	const TS_PARENT_UUID: &'static str =
+		r#"export type UuidStr = `${string}-${string}-${string}-${string}`;"#;
 
 	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 	impl WasmDescribe for UuidStr {

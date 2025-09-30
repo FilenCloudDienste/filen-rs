@@ -17,16 +17,17 @@ pub struct Request {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(transparent)]
-pub struct Response<'a>(pub Vec<ChatMessage<'a>>);
+pub struct Response<'a>(pub Vec<ChatMessageEncrypted<'a>>);
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ChatMessage<'a> {
-	pub conversation: UuidStr,
+pub struct ChatMessageEncrypted<'a> {
+	#[serde(rename = "conversation")]
+	pub chat: UuidStr,
 	#[serde(flatten)]
-	pub inner: ChatMessagePartial<'a>,
+	pub inner: ChatMessagePartialEncrypted<'a>,
 	#[serde(deserialize_with = "crate::serde::option::result_to_option::deserialize")]
-	pub reply_to: Option<ChatMessagePartial<'a>>,
+	pub reply_to: Option<ChatMessagePartialEncrypted<'a>>,
 	pub embed_disabled: bool,
 	pub edited: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -37,7 +38,12 @@ pub struct ChatMessage<'a> {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ChatMessagePartial<'a> {
+#[cfg_attr(
+	target_family = "wasm",
+	derive(tsify::Tsify),
+	tsify(large_number_types_as_bigints)
+)]
+pub struct ChatMessagePartialEncrypted<'a> {
 	pub uuid: UuidStr,
 	pub sender_id: u64,
 	pub sender_email: Cow<'a, str>,

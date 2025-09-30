@@ -6,6 +6,7 @@ use filen_types::{
 		contacts::Contact,
 		notes::{NoteType, participants::add::ContactUuid},
 	},
+	crypto::EncryptedString,
 	fs::UuidStr,
 };
 use rsa::RsaPublicKey;
@@ -17,7 +18,7 @@ use crate::{
 		notes_and_chats::{NoteOrChatCarrierCryptoExt, NoteOrChatKey, NoteOrChatKeyStruct},
 		shared::{CreateRandom, MetaCrypter},
 	},
-	error::MetadataWasNotDecryptedError,
+	error::{MetadataWasNotDecryptedError, ResultExt},
 };
 
 use crypto::*;
@@ -221,6 +222,14 @@ impl Note {
 
 	pub fn participants_mut(&mut self) -> &mut [NoteParticipant] {
 		&mut self.participants
+	}
+
+	pub fn decrypt_string(&self, meta: &EncryptedString) -> Result<String, Error> {
+		let key = self
+			.encryption_key
+			.as_ref()
+			.ok_or(MetadataWasNotDecryptedError)?;
+		key.decrypt_meta(meta).context("decrypt_meta_with_note_key")
 	}
 }
 
@@ -969,7 +978,7 @@ impl Client {
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub mod js_impls {
-	use filen_types::{api::v3::notes::NoteType, fs::UuidStr};
+	use filen_types::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
 	use serde::Serialize;
 	use tsify::Tsify;
 	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
@@ -986,6 +995,18 @@ pub mod js_impls {
 	pub struct DuplicateNoteResponse {
 		pub original: Note,
 		pub duplicated: Note,
+	}
+
+	/// Decrypts note data using the provided chat key.
+	/// Meant to be used in socket event handlers where this cannot currently be done automatically.
+	///
+	/// Should not be used outside of that context.
+	#[wasm_bindgen(js_name = "decrypMetaWithNoteKey")]
+	pub fn decrypt_meta_with_note_key(
+		note: Note,
+		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: EncryptedString,
+	) -> Result<String, Error> {
+		note.decrypt_string(&encrypted)
 	}
 
 	#[wasm_bindgen]

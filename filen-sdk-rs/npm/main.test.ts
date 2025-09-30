@@ -1,5 +1,16 @@
-import { login, Client, fromStringified, type Dir, type File, PauseSignal, FilenSDKError } from "./bundler/sdk-rs.js"
-import { expect, beforeAll, test, afterAll } from "vitest"
+import {
+	login,
+	Client,
+	fromStringified,
+	type Dir,
+	type File,
+	PauseSignal,
+	FilenSDKError,
+	EventListenerHandle,
+	type SocketEvent,
+	decryptMetaWithChatKey
+} from "./bundler/sdk-rs.js"
+import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 import { tmpdir } from "os"
 import { createWriteStream, openAsBlob } from "fs"
 import "dotenv/config"
@@ -10,7 +21,24 @@ import sharp from "sharp"
 let state: Client
 let shareClient: Client
 let testDir: Dir
+const allEvents: SocketEvent[] = []
+const listenerHandles: EventListenerHandle[] = []
 // let _shareTestDir: Dir
+const listenerErrors: Error[] = []
+
+function assertNoMaps(value: unknown): boolean {
+	if (value instanceof Map) {
+		return false
+	}
+	if (value && typeof value === "object") {
+		for (const key in value as object) {
+			if (!assertNoMaps((value as Record<string, unknown>)[key])) {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 beforeAll(async () => {
 	await Promise.all([
@@ -24,6 +52,19 @@ beforeAll(async () => {
 				throw new Error("TEST_PASSWORD environment variable is not set")
 			}
 			state = await login(email, password)
+
+			listenerHandles.push(
+				await state.addSocketListener(null, event => {
+					if (!assertNoMaps(event)) {
+						listenerErrors.push(new Error("Socket event contained a Map", { cause: event }))
+					}
+					allEvents.push(event)
+				})
+			)
+
+			// sleep for 10s to allow socket to connect
+			// this will not be necessary in future
+			await new Promise(resolve => setTimeout(resolve, 10000))
 
 			const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
 			if (maybeDir) {
@@ -48,6 +89,15 @@ beforeAll(async () => {
 		})()
 	])
 }, 120000)
+
+afterEach(() => {
+	if (listenerErrors.length > 0) {
+		const errors = [...listenerErrors]
+		listenerErrors.length = 0
+		console.error("Socket listener errors detected:", errors[0].cause)
+		throw errors
+	}
+})
 
 test("login", async () => {
 	expect(state).toBeDefined()
@@ -613,7 +663,7 @@ test("notes", async () => {
 	expect(history[1].content).toBe("This is the note content")
 })
 
-test("chats", async () => {
+test.only("chats", async () => {
 	let chat = await state.createChat([])
 	expect(chat).toBeDefined()
 	chat = await state.renameChat(chat, "Test Chat")
@@ -623,6 +673,32 @@ test("chats", async () => {
 	expect(chat.lastMessage?.message).toEqual("This is a test message")
 	const fetchedChat = await state.getChat(chat.uuid)
 	expect(fetchedChat).toEqual(chat)
+
+	// sleep for 5s
+	await new Promise(resolve => setTimeout(resolve, 5000))
+	const chatEvent = allEvents.find(e => e.type === "chatMessageNew" && e.data.conversation === chat.uuid)
+
+	expect(chatEvent).toBeDefined()
+
+	if (chatEvent?.type !== "chatMessageNew") {
+		throw new Error("Expected chatMessageNew event")
+	}
+
+	const { conversation, ...rest } = chatEvent.data
+
+	const receivedChatMessage = {
+		...rest,
+		replyTo: rest.replyTo && {
+			...rest.replyTo,
+			message: JSON.parse(decryptMetaWithChatKey(chat, rest.replyTo.message)).message
+		},
+		message: JSON.parse(decryptMetaWithChatKey(chat, rest.message)).message,
+		chat: conversation,
+		edited: false,
+		editedTimestamp: 0n
+	}
+
+	expect(receivedChatMessage).toEqual(fetchedChat?.lastMessage)
 })
 
 test("search", async () => {
@@ -648,6 +724,21 @@ test("authError", async () => {
 		expect((e as FilenSDKError).kind).toEqual("Unauthenticated")
 		expect((e as FilenSDKError).toString()).toContain("v3/dir/content")
 	}
+})
+
+test("sockets", async () => {
+	expect(state.isSocketConnected()).toBe(true)
+	if (global.gc) {
+		listenerHandles.length = 0
+		global.gc()
+	} else {
+		console.warn("No GC hook! Start your test runner with --expose-gc")
+		for (const handle of listenerHandles) {
+			handle.free()
+		}
+	}
+	await new Promise(resolve => setTimeout(resolve, 5000))
+	expect(state.isSocketConnected()).toBe(false)
 })
 
 afterAll(async () => {

@@ -1,16 +1,24 @@
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use std::pin::Pin;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::{borrow::Cow, collections::HashSet, mem::ManuallyDrop, sync::Arc, time::Duration};
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use serde::Deserialize;
+use std::{
+	borrow::Cow,
+	collections::HashSet,
+	fmt::Write,
+	mem::ManuallyDrop,
+	rc::Rc,
+	sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+	time::Duration,
+};
 
-use filen_types::api::v3::socket::SocketEvent;
+use filen_types::{
+	api::v3::socket::{MessageType, PacketType, SocketEvent},
+	crypto::EncryptedString,
+};
 
 use crate::{
 	Error,
 	auth::{Client, http::AuthClient},
+	crypto::shared::MetaCrypter,
+	error::ResultExt,
 	util::{MaybeArc, MaybeArcWeak},
 };
 
@@ -19,15 +27,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub type EventListenerCallback = Box<dyn Fn(&SocketEvent<'_>) + 'static>;
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub type EventListenerCallback = Box<
-	dyn for<'a> Fn(&'a SocketEvent<'a>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
-		+ Send
-		+ Sync
-		+ 'static,
->;
 #[derive(Clone)]
 pub(crate) struct SocketConnectionState(MaybeArc<RwLock<SocketConnectionStateEnum>>);
 
@@ -48,8 +48,6 @@ fn uninitialize(state: &mut SocketConnectionStateEnum) {
 		}
 	};
 
-	init.ws_handle.close();
-
 	*state = SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
 		client: init.client,
 		ws_url: init.socket_url,
@@ -65,6 +63,225 @@ enum AddListenerReturn<'a> {
 		RwLockWriteGuard<'a, SocketConnectionStateEnum>,
 		EventListener,
 	),
+}
+
+struct EventAndOptionalData<'a, T> {
+	event: &'a str,
+	data: Option<&'a T>,
+}
+
+impl<T> serde::Serialize for EventAndOptionalData<'_, T>
+where
+	T: serde::Serialize,
+{
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		use serde::ser::SerializeSeq;
+		let mut seq = serializer.serialize_seq(Some(1 + self.data.is_some() as usize))?;
+		seq.serialize_element(&self.event)?;
+		if let Some(data) = &self.data {
+			seq.serialize_element(data)?;
+		}
+		seq.end()
+	}
+}
+
+fn send_event(
+	ws: &WebSocketHandle,
+	event: &str,
+	data: Option<&impl serde::Serialize>,
+) -> Result<(), Error> {
+	let payload = EventAndOptionalData { event, data };
+	let mut packet = Vec::new();
+	packet.push(PacketType::Message as u8);
+	packet.push(MessageType::Event as u8);
+	serde_json::to_writer(&mut packet, &payload)
+		.expect("string message serialization should not fail");
+
+	// SAFETY: we just serialized valid UTF-8
+	// and both PacketType and MessageType are valid ASCII
+	// so the resulting byte array is valid UTF-8
+	let packet = unsafe { std::str::from_utf8_unchecked(&packet) };
+	ws.send_and_log_error(packet);
+	Ok(())
+}
+
+fn handle_handshake(ws: &WebSocketHandle, msg: &str) -> Result<(), Error> {
+	use filen_types::api::v3::socket::{HandShake, MessageType, PacketType};
+
+	let handshake: HandShake = serde_json::from_str(msg).map_err(|e| {
+		Error::custom(
+			crate::ErrorKind::Server,
+			format!("Failed to parse handshake message: {}", e),
+		)
+	})?;
+	// don't care if the send fails, the connection will be closed soon if it does
+	let _ = ws
+		.interval_change_sender
+		.send(Duration::from_millis(handshake.ping_interval));
+	let raw_payload = [PacketType::Message as u8, MessageType::Event as u8];
+	ws.send_and_log_error(str::from_utf8(&raw_payload).unwrap());
+	Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthMessage<'a> {
+	api_key: Cow<'a, str>,
+}
+
+fn handle_message(msg: &str, connection: &InitSocketConnection) -> Result<(), Error> {
+	let message_type = msg.bytes().next().ok_or_else(|| {
+		Error::custom(
+			crate::ErrorKind::Server,
+			"Empty message received over WebSocket",
+		)
+	})?;
+	match MessageType::try_from(message_type) {
+		Err(e) => {
+			log::error!("Invalid message type: {}", e);
+			return Ok(());
+		}
+		Ok(MessageType::Event) => {
+			// continue
+		}
+		Ok(_) => {
+			// ignore other message types for now
+			return Ok(());
+		}
+	}
+
+	let json_value: serde_json::Value = serde_json::from_str(&msg[1..]).map_err(|e| {
+		Error::custom(
+			crate::ErrorKind::Server,
+			format!("Failed to parse WebSocket message: {}", e),
+		)
+	})?;
+
+	if let serde_json::Value::Array(arr) = json_value
+		&& let mut arr_iter = arr.into_iter()
+		&& let Some(event_name) = arr_iter.next()
+	{
+		let event_name = event_name.as_str().ok_or_else(|| {
+			Error::custom(
+				crate::ErrorKind::Server,
+				"Invalid event name in WebSocket message",
+			)
+		})?;
+		match event_name {
+			"authFailed" => {
+				log::error!("WebSocket authentication failed");
+				// todo handle this state
+			}
+			"authed" => {
+				let Some(data) = arr_iter.next() else {
+					return Err(Error::custom(
+						crate::ErrorKind::Server,
+						"Invalid authed event data in WebSocket message",
+					));
+				};
+				if data.as_bool() == Some(false) {
+					send_event(
+						&connection.ws_handle,
+						"auth",
+						Some(&AuthMessage {
+							api_key: Cow::Borrowed(&connection.client.api_key.0),
+						}),
+					)?;
+				}
+			}
+			other => {
+				let event_name = normalize_event_name(other);
+				let data = arr_iter.next();
+				let mut serialized_value = serde_json::Map::with_capacity(2);
+				serialized_value.insert(
+					"type".to_string(),
+					serde_json::Value::String(event_name.into_owned()),
+				);
+				if let Some(data) = data {
+					serialized_value.insert("data".to_string(), data);
+				}
+				let serialized_value = serde_json::Value::Object(serialized_value);
+				let event = SocketEvent::deserialize(&serialized_value).map_err(|e| {
+					Error::custom(
+						crate::ErrorKind::Server,
+						format!("Failed to parse WebSocket event: {}", e),
+					)
+				})?;
+				connection.listener_manager.handle_event(&event);
+			}
+		}
+	}
+
+	Ok(())
+}
+
+fn normalize_event_name(name: &str) -> Cow<'_, str> {
+	let dashes = name
+		.bytes()
+		.enumerate()
+		.rev()
+		.filter_map(|(i, c)| if c == b'-' { Some(i) } else { None });
+	let mut cow = Cow::Borrowed(name);
+	for i in dashes {
+		let mut_string = cow.to_mut();
+
+		mut_string.remove(i);
+		// SAFETY: we potentially convert a single byte ASCII lowercase character to uppercase
+		// which is still valid UTF-8 and we are not changing the length of the string
+		let mut_vec = unsafe { mut_string.as_mut_vec() };
+		if let Some(c) = mut_vec.get(i)
+			&& c.is_ascii_lowercase()
+		{
+			mut_vec[i] = c.to_ascii_uppercase();
+		}
+	}
+	cow
+}
+
+fn start_ping_task(
+	ws: &MaybeArc<WebSocketHandle>,
+	mut interval: Duration,
+	mut interval_change_receiver: tokio::sync::mpsc::UnboundedReceiver<Duration>,
+) {
+	let ws = MaybeArc::downgrade(ws);
+	let mut last_update = wasmtimer::std::Instant::now();
+	wasm_bindgen_futures::spawn_local(async move {
+		let mut timestamp_string = String::new();
+		let ping_packet = [PacketType::Ping as u8];
+		loop {
+			tokio::select! {
+				biased;
+				Some(new_interval) = interval_change_receiver.recv() => {
+					interval = new_interval;
+				}
+				_ = wasmtimer::tokio::sleep(interval.saturating_sub(last_update.elapsed())) => {
+					if let Some(ws) = ws.upgrade() {
+						ws.send(str::from_utf8(&ping_packet).unwrap())
+							.unwrap_or_else(|e| {
+								log::error!("Failed to send ping over WebSocket: {:?}", e);
+							});
+						timestamp_string.clear();
+						write!(
+							&mut timestamp_string,
+							"{}",
+							chrono::Utc::now().timestamp_millis()
+						)
+						.expect("writing integer to string should not fail");
+						send_event(&ws, "authed", Some(&timestamp_string)).unwrap_or_else(|e| {
+							log::error!("Failed to send authed over WebSocket: {:?}", e);
+						});
+						last_update = wasmtimer::std::Instant::now();
+					} else {
+						// automatic cleanup when the WebSocket is dropped
+						break;
+					}
+				}
+			}
+		}
+	});
 }
 
 impl SocketConnectionState {
@@ -97,24 +314,12 @@ impl SocketConnectionState {
 		}
 	}
 
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	fn get_write_guard(&self) -> RwLockWriteGuard<'_, SocketConnectionStateEnum> {
 		self.0.write().unwrap_or_else(|e| e.into_inner())
 	}
 
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	async fn get_write_guard(&self) -> RwLockWriteGuard<'_, SocketConnectionStateEnum> {
-		self.0.write().await
-	}
-
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	fn get_read_guard(&self) -> RwLockReadGuard<'_, SocketConnectionStateEnum> {
 		self.0.read().unwrap_or_else(|e| e.into_inner())
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	async fn get_read_guard(&self) -> RwLockReadGuard<'_, SocketConnectionStateEnum> {
-		self.0.read().await
 	}
 
 	async fn add_listener(
@@ -123,16 +328,7 @@ impl SocketConnectionState {
 		callback: EventListenerCallback,
 	) -> Result<EventListenerHandle, Error> {
 		let (mut write_guard, listener) = match self.inner_add_listener(
-			{
-				#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-				{
-					self.get_write_guard()
-				}
-				#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-				{
-					self.get_write_guard().await
-				}
-			},
+			self.get_write_guard(),
 			EventListener {
 				event_types,
 				callback,
@@ -160,157 +356,66 @@ impl SocketConnectionState {
 
 		// initialize WebSocket connection
 		let ws_handle = {
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				use wasm_bindgen::JsCast;
+			use wasm_bindgen::JsCast;
+			use web_sys::MessageEvent;
 
-				let ws = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
-					Error::custom(
-						crate::ErrorKind::Server,
-						format!("Failed to create WebSocket connection: {:?}", e),
-					)
-				})?;
+			let ws = web_sys::WebSocket::new(&websocket_url).map_err(|e| {
+				Error::custom(
+					crate::ErrorKind::Server,
+					format!("Failed to create WebSocket connection: {:?}", e),
+				)
+			})?;
 
-				let closure_state = self.clone();
-				let closure =
-					wasm_bindgen::closure::Closure::<dyn Fn(String)>::new(move |msg: String| {
-						log::info!("WebSocket message: {:?}", msg);
-						let read_guard = closure_state.get_read_guard();
-						if let SocketConnectionStateEnum::Initialized(conn) = &*read_guard {
-							conn.listener_manager.handle_message(&msg)
+			let closure_state = self.clone();
+			let closure = wasm_bindgen::closure::Closure::<dyn Fn(MessageEvent)>::new(
+				move |msg: MessageEvent| {
+					let msg = msg.data();
+					use filen_types::api::v3::socket::PacketType;
+					let Some(msg) = msg.as_string() else {
+						log::error!("Invalid message type");
+						return;
+					};
+
+					let Some(packet_type) = msg.bytes().next() else {
+						log::error!("Invalid packet type: {}", msg);
+						return;
+					};
+					match PacketType::try_from(packet_type) {
+						Err(e) => {
+							log::error!("Invalid packet type: {}", e);
 						}
-					})
-					.into_js_value();
+						Ok(PacketType::Connect) => {
+							let read_guard = closure_state.get_read_guard();
+							if let SocketConnectionStateEnum::Initialized(conn) = &*read_guard {
+								handle_handshake(&conn.ws_handle, &msg[1..]).unwrap_or_else(|e| {
+									log::error!("Failed to handle handshake: {}", e);
+								});
+							}
+						}
+						Ok(PacketType::Message) => {
+							let read_guard = closure_state.get_read_guard();
+							if let SocketConnectionStateEnum::Initialized(conn) = &*read_guard {
+								handle_message(&msg[1..], conn).unwrap_or_else(|e| {
+									log::error!("Failed to handle message: {}", e);
+								});
+							}
+						}
+						Ok(_) => {}
+					}
+				},
+			)
+			.into_js_value();
 
-				ws.set_onmessage(Some(closure.unchecked_ref()));
-				WebSocketHandle { wasm: ws }
-			}
-			// #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			// {
-			// 	use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-			// 	log::info!("Connecting to WebSocket: {}", websocket_url);
+			ws.set_onmessage(Some(closure.unchecked_ref()));
+			let (interval_change_sender, interval_change_receiver) =
+				tokio::sync::mpsc::unbounded_channel();
+			let ref_counted = Rc::new(WebSocketHandle {
+				wasm: ws,
+				interval_change_sender,
+			});
 
-			// 	let (mut socket, _) = tokio_tungstenite::connect_async(
-			// 		websocket_url.into_client_request().map_err(|e| {
-			// 			Error::custom(
-			// 				crate::ErrorKind::Server,
-			// 				format!("Failed to create WebSocket request: {}", e),
-			// 			)
-			// 		})?,
-			// 	)
-			// 	.await
-			// 	.map_err(|e| {
-			// 		Error::custom(
-			// 			crate::ErrorKind::Server,
-			// 			format!("Failed to connect to WebSocket: {}", e),
-			// 		)
-			// 	})?;
-			// 	let closure_state = self.clone();
-
-			// 	let (close_sender, mut close_recv) = tokio::sync::oneshot::channel::<()>();
-			// 	let (message_sender, mut msg_recv) =
-			// 		tokio::sync::mpsc::unbounded_channel::<String>();
-
-			// 	let handle = tokio::spawn(async move {
-			// 		use filen_types::api::v3::socket::PacketType;
-			// 		use futures::{SinkExt, StreamExt};
-			// 		let msg = socket.next().await.unwrap().unwrap();
-			// 		let msg = msg.into_data();
-			// 		let Ok(packet_type) = PacketType::try_from(msg[0]) else {
-			// 			log::error!("Invalid packet type: {}", msg[0]);
-			// 			return false;
-			// 		};
-
-			// 		match packet_type {
-			// 			PacketType::Connect => {
-			// 				use filen_types::api::v3::socket::{HandShake, MessageType};
-
-			// 				log::info!("WebSocket connected");
-			// 				let Ok(handshake) = serde_json::from_slice::<HandShake>(&msg[1..])
-			// 				else {
-			// 					log::error!("Invalid message type: {}", msg[1]);
-			// 					return false;
-			// 				};
-			// 				match socket
-			// 					.send(tungstenite::Message::Text(
-			// 						format!(
-			// 							"{}{}",
-			// 							PacketType::Message as u8,
-			// 							MessageType::Connect as u8
-			// 						)
-			// 						.into(),
-			// 					))
-			// 					.await
-			// 				{
-			// 					Ok(_) => {}
-			// 					Err(e) => {
-			// 						log::error!("Failed to send WebSocket message: {}", e);
-			// 						return false;
-			// 					}
-			// 				}
-			// 			}
-			// 			other => {
-			// 				log::error!("Expected Connect packet, got: {:?}", other);
-			// 				return false;
-			// 			}
-			// 		}
-
-			// 		loop {
-			// 			tokio::select! {
-			// 				biased;
-			// 				_ = &mut close_recv => {
-			// 					if let Err(e) = socket.close(None).await {
-			// 						log::error!("Error when trying to close websocket: {}", e);
-			// 						return false;
-			// 					} else {
-			// 						log::info!("WebSocket receive loop terminated by sender");
-			// 						return true;
-			// 					}
-			// 				}
-			// 				msg_to_send = msg_recv.recv() => {
-			// 					if let Some(msg) = msg_to_send {
-			// 						if let Err(e) = socket.send(tungstenite::Message::Text(msg.into())).await {
-			// 							log::error!("Failed to send WebSocket message: {}", e);
-			// 							return false;
-			// 						}
-			// 					} else {
-			// 						log::info!("WebSocket send channel closed");
-			// 						return true;
-			// 					}
-			// 				}
-			// 				msg = socket.next() => {
-			// 					match msg {
-			// 					Some(Ok(tungstenite::Message::Text(txt))) => {
-			// 						log::info!("WebSocket message: {:?}", txt);
-			// 						let read_guard = closure_state.get_read_guard().await;
-			// 						if let SocketConnectionStateEnum::Initialized(conn) = &*read_guard {
-			// 							conn.listener_manager.handle_message(&txt).await;
-			// 						}
-			// 					}
-			// 					Some(Ok(tungstenite::Message::Close(_))) => {
-			// 						log::info!("WebSocket closed");
-			// 						return true;
-			// 					}
-			// 					Some(Ok(_)) => {}
-			// 					Some(Err(e)) => {
-			// 						log::error!("WebSocket error: {}", e);
-			// 						return false;
-			// 					}
-			// 					None => {
-			// 						log::info!("WebSocket stream ended");
-			// 						return true;
-			// 					}
-			// 				}
-			// 				}
-			// 			}
-			// 		}
-			// 	});
-			// 	WebSocketHandle {
-			// 		handle,
-			// 		close_sender,
-			// 		message_sender,
-			// 	}
-			// }
+			start_ping_task(&ref_counted, uninit.ping_interval, interval_change_receiver);
+			ref_counted
 		};
 
 		let mut tmp_state = SocketConnectionStateEnum::Tmp;
@@ -340,28 +445,12 @@ impl SocketConnectionState {
 
 	// Only called when there is a listener being dropped and therefore a cleanup is needed
 	fn cleanup(&mut self) {
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		{
-			let mut write_guard = self.get_write_guard();
-			if let SocketConnectionStateEnum::Initialized(conn) = &mut *write_guard {
-				conn.listener_manager.cleanup();
-				if conn.listener_manager.listeners.is_empty() {
-					uninitialize(&mut write_guard);
-				}
+		let mut write_guard = self.get_write_guard();
+		if let SocketConnectionStateEnum::Initialized(conn) = &mut *write_guard {
+			conn.listener_manager.cleanup();
+			if conn.listener_manager.listeners.is_empty() {
+				uninitialize(&mut write_guard);
 			}
-		}
-		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		{
-			let state = self.clone();
-			tokio::spawn(async move {
-				let mut write_guard = state.get_write_guard().await;
-				if let SocketConnectionStateEnum::Initialized(conn) = &mut *write_guard {
-					conn.listener_manager.cleanup();
-					if conn.listener_manager.listeners.is_empty() {
-						uninitialize(&mut write_guard);
-					}
-				}
-			});
 		}
 	}
 }
@@ -381,66 +470,44 @@ struct InitSocketConnection {
 	max_reconnect_delay: Duration,
 	ping_interval: Duration,
 
-	ws_handle: WebSocketHandle,
+	ws_handle: MaybeArc<WebSocketHandle>,
 	listener_manager: ListenerManager,
 }
 
 struct WebSocketHandle {
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	interval_change_sender: tokio::sync::mpsc::UnboundedSender<Duration>,
 	wasm: web_sys::WebSocket,
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	handle: tokio::task::JoinHandle<bool>,
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	close_sender: tokio::sync::oneshot::Sender<()>,
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	message_sender: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl Drop for WebSocketHandle {
+	fn drop(&mut self) {
+		let _ = self.wasm.close();
+	}
 }
 
 impl WebSocketHandle {
-	fn close(&self) {
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		{
-			let _ = self.wasm.close();
+	fn send_and_log_error(&self, msg: &str) {
+		if let Err(e) = self.send(msg) {
+			log::error!("Failed to send WebSocket message: {}", e);
 		}
-		// #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		// {
-		// 	// closing with tokio is handled automatically when the Handle is dropped
-		// }
 	}
 
-	fn send(&self, _msg: &str) -> Result<(), Error> {
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		{
-			self.wasm.send_with_str(_msg).map_err(|e| {
-				Error::custom(
-					crate::ErrorKind::Server,
-					format!("Failed to send WebSocket message: {:?}", e),
-				)
-			})
-		}
-		// #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		// {
-		// 	unimplemented!(
-		// 		"Sending messages over WebSocket is not implemented yet for non-wasm targets"
-		// 	);
-		// }
+	fn send(&self, msg: &str) -> Result<(), Error> {
+		self.wasm.send_with_str(msg).map_err(|e| {
+			Error::custom(
+				crate::ErrorKind::Server,
+				format!("Failed to send WebSocket message: {:?}", e),
+			)
+		})
 	}
 }
-
-// fn f() {
-// 	fn g<T: Send>() {}
-// 	g::<Client>();
-// }
 
 struct EventListener {
 	event_types: Option<HashSet<String>>,
 	callback: EventListenerCallback,
 }
 
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen::prelude::wasm_bindgen
-)]
+#[wasm_bindgen::prelude::wasm_bindgen]
 pub struct EventListenerHandle {
 	// we use ManuallyDrop here so that we can drop the Arc before we call cleanup on state
 	my_listener: ManuallyDrop<MaybeArc<EventListener>>,
@@ -474,7 +541,19 @@ impl ListenerManager {
 		}
 	}
 
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	fn handle_event(&self, event: &SocketEvent<'_>) {
+		for weak_ref in self.listeners.iter() {
+			if let Some(listener) = weak_ref.upgrade()
+				&& listener
+					.event_types
+					.as_ref()
+					.is_none_or(|set| set.contains(event.event_type()))
+			{
+				(listener.callback)(event);
+			}
+		}
+	}
+
 	fn handle_message(&self, msg: &str) {
 		let event: SocketEvent<'_> = match serde_json::from_str(msg) {
 			Ok(event) => event,
@@ -484,49 +563,7 @@ impl ListenerManager {
 			}
 		};
 
-		for weak_ref in self.listeners.iter() {
-			if let Some(listener) = weak_ref.upgrade()
-				&& listener
-					.event_types
-					.as_ref()
-					.is_none_or(|set| set.contains(event.event_type()))
-			{
-				(listener.callback)(&event);
-			}
-		}
-	}
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	async fn handle_message(&self, msg: &str) {
-		let event: SocketEvent<'_> = match serde_json::from_str(msg) {
-			Ok(event) => event,
-			Err(e) => {
-				log::error!("Failed to parse WebSocket message: {}", e);
-				return;
-			}
-		};
-
-		use futures::{StreamExt, stream::FuturesUnordered};
-
-		let mut futures: FuturesUnordered<_> = self
-			.listeners
-			.iter()
-			.filter_map(|weak_ref| {
-				if let Some(listener) = weak_ref.upgrade() {
-					if listener
-						.event_types
-						.as_ref()
-						.is_none_or(|set| set.contains(event.event_type()))
-					{
-						Some((listener.callback)(&event))
-					} else {
-						None
-					}
-				} else {
-					None
-				}
-			})
-			.collect();
-		while let Some(()) = futures.next().await {}
+		self.handle_event(&event);
 	}
 
 	fn cleanup(&mut self) {
@@ -577,11 +614,24 @@ impl Client {
 			.add_listener(event_types, callback)
 			.await
 	}
+
+	pub fn is_socket_connected(&self) -> bool {
+		let read_guard = self.socket_connection.get_read_guard();
+		matches!(*read_guard, SocketConnectionStateEnum::Initialized(_))
+	}
+
+	// we need to expose this for v3 because most of the returned events are encrypted
+	// and we need to decrypt them, and we do not have enough information to do that purely in the rust sdk
+	pub fn decrypt_meta(&self, encrypted: &EncryptedString) -> Result<String, Error> {
+		self.crypter()
+			.decrypt_meta(encrypted)
+			.context("public decrypt_meta")
+	}
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod js_impl {
-	use filen_types::api::v3::socket::SocketEvent;
+	use filen_types::{api::v3::socket::SocketEvent, crypto::EncryptedString};
 	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 	use web_sys::js_sys;
 
@@ -593,17 +643,55 @@ mod js_impl {
 		pub async fn js_add_socket_listener(
 			&self,
 			event_types: Option<Vec<String>>,
+			#[wasm_bindgen(unchecked_param_type = "(event: SocketEvent) => void")]
 			listener: js_sys::Function,
 		) -> Result<EventListenerHandle, Error> {
 			let callback = Box::new(move |event: &SocketEvent<'_>| {
+				let serializer = serde_wasm_bindgen::Serializer::new()
+					.serialize_maps_as_objects(true)
+					.serialize_large_number_types_as_bigints(true);
+
 				let _ = listener.call1(
 					&JsValue::UNDEFINED,
-					&serde_wasm_bindgen::to_value(event)
+					&serde::Serialize::serialize(&event, &serializer)
 						.expect("failed to serialize event to JsValue (should be impossible)"),
 				);
 			});
 			self.add_socket_listener(event_types.map(|v| v.into_iter().collect()), callback)
 				.await
 		}
+
+		#[wasm_bindgen(js_name = "isSocketConnected")]
+		pub fn js_is_socket_connected(&self) -> bool {
+			self.is_socket_connected()
+		}
+
+		#[wasm_bindgen(js_name = "decryptMeta")]
+		pub fn js_decrypt_meta(
+			&self,
+			#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: EncryptedString,
+		) -> Result<String, Error> {
+			self.decrypt_meta(&encrypted)
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn camelify_name_from_kebab() {
+		assert_eq!(normalize_event_name("file-rename"), "fileRename");
+		assert_eq!(
+			normalize_event_name("file-archive-restored"),
+			"fileArchiveRestored"
+		);
+		assert_eq!(normalize_event_name("auth-success"), "authSuccess");
+		assert_eq!(normalize_event_name("simpleevent"), "simpleevent");
+		assert_eq!(normalize_event_name("simpleEvent"), "simpleEvent");
+		assert_eq!(normalize_event_name("-----"), "");
+		assert_eq!(normalize_event_name("-----a"), "A");
+		assert_eq!(normalize_event_name("-----aaa"), "Aaa");
 	}
 }
