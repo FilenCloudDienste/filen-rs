@@ -642,7 +642,9 @@ mod js_impl {
 		#[wasm_bindgen(js_name = "addSocketListener")]
 		pub async fn js_add_socket_listener(
 			&self,
-			event_types: Option<Vec<String>>,
+			#[wasm_bindgen(unchecked_param_type = "SocketEventType[] | null")] event_types: Option<
+				Vec<String>,
+			>,
 			#[wasm_bindgen(unchecked_param_type = "(event: SocketEvent) => void")]
 			listener: js_sys::Function,
 		) -> Result<EventListenerHandle, Error> {
