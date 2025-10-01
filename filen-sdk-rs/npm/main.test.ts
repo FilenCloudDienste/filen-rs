@@ -663,7 +663,7 @@ test("notes", async () => {
 	expect(history[1].content).toBe("This is the note content")
 })
 
-test.only("chats", async () => {
+test("chats", async () => {
 	let chat = await state.createChat([])
 	expect(chat).toBeDefined()
 	chat = await state.renameChat(chat, "Test Chat")
