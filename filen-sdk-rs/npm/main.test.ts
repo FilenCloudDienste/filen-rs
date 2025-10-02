@@ -62,10 +62,6 @@ beforeAll(async () => {
 				})
 			)
 
-			// sleep for 10s to allow socket to connect
-			// this will not be necessary in future
-			await new Promise(resolve => setTimeout(resolve, 10000))
-
 			const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
 			if (maybeDir) {
 				if (maybeDir.type === "dir") {
@@ -719,10 +715,28 @@ test("authError", async () => {
 	const badState = fromStringified(badStringified)
 	try {
 		await badState.listDir(badState.root())
+		expect.fail("Expected error to be thrown")
 	} catch (e) {
 		expect(e).toBeInstanceOf(FilenSDKError)
 		expect((e as FilenSDKError).kind).toEqual("Unauthenticated")
 		expect((e as FilenSDKError).toString()).toContain("v3/dir/content")
+	}
+
+	let gotAuthFailedEvent = false
+	try {
+		await badState.addSocketListener(["authFailed"], event => {
+			if (event.type === "authFailed") {
+				gotAuthFailedEvent = true
+			} else {
+				throw new Error("Expected authFailed event")
+			}
+		})
+		expect.fail("Expected error to be thrown")
+	} catch (e) {
+		expect(e).toBeInstanceOf(FilenSDKError)
+		expect((e as FilenSDKError).kind).toEqual("Unauthenticated")
+		expect((e as FilenSDKError).toString()).toContain("WebSocket")
+		expect(gotAuthFailedEvent).toBe(true)
 	}
 })
 

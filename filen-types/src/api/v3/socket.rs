@@ -91,7 +91,12 @@ pub struct HandShake<'a> {
 	tsify(into_wasm_abi, large_number_types_as_bigints, hashmap_as_object)
 )]
 pub enum SocketEvent<'a> {
+	/// Sent after successful authentication, including on reconnect
 	AuthSuccess,
+	/// Sent after failed authentication, including on reconnect, after which the socket is closed and all listeners removed
+	AuthFailed,
+	/// Sent when the socket has unexpectedly closed and begins attempting to reconnect
+	Reconnecting,
 	#[serde(borrow)]
 	NewEvent(NewEvent<'a>),
 	#[serde(borrow)]
@@ -163,6 +168,8 @@ impl SocketEvent<'_> {
 	pub fn event_type(&self) -> &'static str {
 		match self {
 			SocketEvent::AuthSuccess => "authSuccess",
+			SocketEvent::AuthFailed => "authFailed",
+			SocketEvent::Reconnecting => "reconnecting",
 			SocketEvent::NewEvent(_) => "newEvent",
 			SocketEvent::FileRename(_) => "fileRename",
 			SocketEvent::FileArchiveRestored(_) => "fileArchiveRestored",
