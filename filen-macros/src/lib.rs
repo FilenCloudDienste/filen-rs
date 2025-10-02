@@ -6,6 +6,8 @@ use syn::spanned::Spanned;
 use syn::token::Comma;
 use syn::{Attribute, Block, FnArg, Ident, ItemFn, Type, parse_macro_input};
 
+mod anchored_ref;
+
 #[derive(PartialEq, Eq)]
 enum SelfPrefix {
 	None,
@@ -306,4 +308,14 @@ pub fn shared_test_runtime(_attr: TokenStream, input: TokenStream) -> TokenStrea
 	};
 
 	result.into()
+}
+
+/// Derive macro for TransmuteLifetime trait
+///
+/// Generates different implementations based on whether the struct has lifetime parameters:
+/// - For types with lifetimes: implements for 'static version with transmute
+/// - For types without lifetimes: implements identity operations
+#[proc_macro_derive(AnchorableRef)]
+pub fn derive_transmute_lifetime(input: TokenStream) -> TokenStream {
+	anchored_ref::derive_transmute_lifetime(input)
 }
