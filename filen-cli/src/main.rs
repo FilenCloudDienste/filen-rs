@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use log::error;
 
 use crate::{
 	commands::{Commands, execute_command},
@@ -32,6 +33,8 @@ pub(crate) struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	env_logger::init();
+
 	let mut ui = ui::UI::new();
 
 	let cli = Cli::parse();
@@ -40,7 +43,10 @@ async fn main() -> Result<()> {
 	let mut working_path = RemotePath::new("");
 
 	if let Some(command) = cli.command {
-		execute_command(&mut ui, &mut client, &working_path, command).await?;
+		if let Err(e) = execute_command(&mut ui, &mut client, &working_path, command).await {
+			error!("{}", e);
+			ui.print_failure(&format!("An error occurred: {}. If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues", e));
+		}
 	} else {
 		ui.print_banner();
 		loop {
@@ -82,7 +88,8 @@ async fn main() -> Result<()> {
 					working_path = result.working_path.unwrap_or(working_path);
 				}
 				Err(e) => {
-					ui.print_failure(&format!("{}", e));
+					error!("{}", e);
+					ui.print_failure(&format!("An error occurred: {}. If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues", e));
 				}
 			}
 		}
