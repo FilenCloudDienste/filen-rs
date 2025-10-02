@@ -1,11 +1,15 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Subcommand;
 use dialoguer::console::style;
-use filen_sdk_rs::fs::{
-	FSObject, HasName as _, HasUUID as _,
-	dir::DirectoryType,
-	file::{enums::RemoteFileType, traits::HasFileInfo as _},
+use filen_sdk_rs::{
+	auth::Client,
+	fs::{
+		FSObject, HasName as _, HasUUID,
+		dir::{DirectoryType, HasContents},
+		file::{enums::RemoteFileType, traits::HasFileInfo as _},
+	},
 };
+use filen_types::fs::ParentUuid;
 
 use crate::{
 	CommandResult,
@@ -192,7 +196,7 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::ListTrash => {
-			list_trash(ui).await?;
+			list_trash(ui, client).await?;
 			None
 		}
 		Commands::EmptyTrash => {
@@ -242,7 +246,7 @@ async fn list_directory(
 	let Some(directory) = client
 		.find_item_at_path(&directory_str)
 		.await
-		.context("Failed to find ls parent directory")?
+		.context("Failed to find parent directory")?
 	else {
 		return Err(anyhow!("No such directory: {}", directory_str));
 	};
@@ -252,10 +256,20 @@ async fn list_directory(
 		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
 		_ => return Err(anyhow!("Not a directory: {}", directory_str)),
 	};
+	list_directory_by_uuid(ui, client, directory.uuid()).await
+	// todo: ls -l flag
+}
+
+async fn list_directory_by_uuid(
+	ui: &mut UI,
+	client: &Client,
+	directory: &dyn HasContents,
+) -> Result<()> {
+	dbg!(directory.uuid_as_parent());
 	let items = client
-		.list_dir(&directory)
+		.list_dir(directory)
 		.await
-		.context("Failed to list root directory")?;
+		.context("Failed to list directory")?;
 	let mut directories = items
 		.0
 		.iter()
@@ -284,7 +298,6 @@ async fn list_directory(
 	}
 	ui.print_grid(&all_items);
 	Ok(())
-	// todo: ls -l flag
 }
 
 enum PrintFileLines {
@@ -658,10 +671,10 @@ async fn set_file_or_directory_favorite(
 	Ok(())
 }
 
-async fn list_trash(ui: &mut UI) -> Result<()> {
-	//todo: how can I get the trash dir?
-	ui.print_muted("Not implemented yet");
-	Ok(())
+async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
+	let client = client.get(ui).await?;
+	list_directory_by_uuid(ui, client, &ParentUuid::Trash).await
+	// todo: this doesn't work, but it should, so maybe it is an underlying error? -> implement better logging first and then fix it
 }
 
 async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
