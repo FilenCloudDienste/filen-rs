@@ -674,7 +674,7 @@ async fn set_file_or_directory_favorite(
 async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
 	list_directory_by_uuid(ui, client, &ParentUuid::Trash).await
-	// todo: this doesn't work, but it should, so maybe it is an underlying error? -> implement better logging first and then fix it
+	// todo: this should work, maybe it is an underlying issue?
 }
 
 async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
