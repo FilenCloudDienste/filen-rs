@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use dialoguer::console::style;
 use filen_sdk_rs::{
@@ -248,13 +248,13 @@ async fn list_directory(
 		.await
 		.context("Failed to find parent directory")?
 	else {
-		return Err(anyhow!("No such directory: {}", directory_str));
+		return UI::failure(&format!("No such directory: {}", directory_str));
 	};
 	let directory = match directory {
 		FSObject::Dir(dir) => DirectoryType::Dir(dir),
 		FSObject::Root(root) => DirectoryType::Root(root),
 		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
-		_ => return Err(anyhow!("Not a directory: {}", directory_str)),
+		_ => return UI::failure(&format!("Not a directory: {}", directory_str)),
 	};
 	list_directory_by_uuid(ui, client, directory.uuid()).await
 	// todo: ls -l flag
@@ -319,12 +319,12 @@ async fn print_file(
 		.await
 		.context("Failed to find cat file")?
 	else {
-		return Err(anyhow!("No such file: {}", file_str));
+		return UI::failure(&format!("No such file: {}", file_str));
 	};
 	let file = match file {
 		FSObject::File(file) => RemoteFileType::File(file),
 		FSObject::SharedFile(file) => RemoteFileType::SharedFile(file),
-		_ => return Err(anyhow!("Not a file: {}", file_str)),
+		_ => return UI::failure(&format!("Not a file: {}", file_str)),
 	};
 	if file.size() < 1024
 		|| ui.prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
@@ -359,7 +359,7 @@ async fn print_file_or_directory_info(
 		.await
 		.context("Failed to find item")?
 	else {
-		return Err(anyhow!(
+		return UI::failure(&format!(
 			"No such file or directory: {}",
 			file_or_directory_str
 		));
@@ -416,7 +416,7 @@ async fn print_file_or_directory_info(
 			]);
 		}
 		FSObject::SharedFile(_) => {
-			ui.print_failure("Cannot show information for shared file");
+			return UI::failure("Cannot show information for shared file");
 		}
 	}
 	Ok(())
@@ -432,20 +432,20 @@ async fn create_directory(
 	let parent_str = directory_str.navigate("..");
 	let client = client.get(ui).await?;
 	if parent_str.0 == directory_str.0 {
-		return Err(anyhow!("Cannot create root directory"));
+		return UI::failure("Cannot create root directory");
 	}
 	let Some(parent) = client
 		.find_item_at_path(&parent_str.0)
 		.await
 		.context("Failed to find parent directory")?
 	else {
-		return Err(anyhow!("No such parent directory: {}", parent_str));
+		return UI::failure(&format!("No such parent directory: {}", parent_str));
 	};
 	let parent = match parent {
 		FSObject::Dir(dir) => DirectoryType::Dir(dir),
 		FSObject::Root(root) => DirectoryType::Root(root),
 		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
-		_ => return Err(anyhow!("Not a directory: {}", parent_str)),
+		_ => return UI::failure(&format!("Not a directory: {}", parent_str)),
 	};
 	client
 		.create_dir(&parent, directory_str.basename().unwrap().to_string())
@@ -470,7 +470,7 @@ async fn delete_file_or_directory(
 		.await
 		.context("Failed to find file or directory")?
 	else {
-		return Err(anyhow!(
+		return UI::failure(&format!(
 			"No such file or directory: {}",
 			file_or_directory_str
 		));
@@ -521,10 +521,10 @@ async fn delete_file_or_directory(
 			}
 		}
 		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-			return Err(anyhow!("Cannot delete root directory"));
+			return UI::failure("Cannot delete root directory");
 		}
 		FSObject::SharedFile(_) => {
-			return Err(anyhow!("Cannot delete shared file"));
+			return UI::failure("Cannot delete shared file");
 		}
 	} // todo: simplify this match statement?
 	Ok(())
@@ -550,7 +550,7 @@ async fn move_or_copy_file_or_directory(
 		.await
 		.context("Failed to find source file or directory")?
 	else {
-		return Err(anyhow!(
+		return UI::failure(&format!(
 			"No such source file or directory: {}",
 			source_str.0
 		));
@@ -560,7 +560,7 @@ async fn move_or_copy_file_or_directory(
 		.await
 		.context("Failed to find destination directory")?
 	else {
-		return Err(anyhow!(
+		return UI::failure(&format!(
 			"No such destination directory: {}",
 			destination_str.0
 		));
@@ -569,7 +569,7 @@ async fn move_or_copy_file_or_directory(
 		FSObject::Dir(dir) => DirectoryType::Dir(dir),
 		FSObject::Root(root) => DirectoryType::Root(root),
 		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
-		_ => return Err(anyhow!("Not a directory: {}", destination_str.0)),
+		_ => return UI::failure(&format!("Not a directory: {}", destination_str.0)),
 	};
 	match action {
 		MoveOrCopy::Move => match source_file_or_directory {
@@ -586,10 +586,10 @@ async fn move_or_copy_file_or_directory(
 					.context("Failed to move directory")?;
 			}
 			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-				return Err(anyhow!("Cannot move root directory"));
+				return UI::failure("Cannot move root directory");
 			}
 			FSObject::SharedFile(_) => {
-				return Err(anyhow!("Cannot move shared file"));
+				return UI::failure("Cannot move shared file");
 			}
 		},
 		MoveOrCopy::Copy => match source_file_or_directory {
@@ -600,10 +600,10 @@ async fn move_or_copy_file_or_directory(
 				todo!("Implement directory copy"); // filen-sdk-rs does not support directory copy yet
 			}
 			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-				return Err(anyhow!("Cannot copy root directory"));
+				return UI::failure("Cannot copy root directory");
 			}
 			FSObject::SharedFile(_) => {
-				return Err(anyhow!("Cannot copy shared file"));
+				return UI::failure("Cannot copy shared file");
 			}
 		},
 	}
@@ -633,7 +633,7 @@ async fn set_file_or_directory_favorite(
 		.await
 		.context("Failed to find file or directory")?
 	else {
-		return Err(anyhow!(
+		return UI::failure(&format!(
 			"No such file or directory: {}",
 			file_or_directory_str
 		));
@@ -662,10 +662,10 @@ async fn set_file_or_directory_favorite(
 			));
 		}
 		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-			return Err(anyhow!("Cannot change favorite status of root directory"));
+			return UI::failure("Cannot change favorite status of root directory");
 		}
 		FSObject::SharedFile(_) => {
-			return Err(anyhow!("Cannot change favorite status of shared file"));
+			return UI::failure("Cannot change favorite status of shared file");
 		}
 	}
 	Ok(())

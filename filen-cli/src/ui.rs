@@ -119,6 +119,25 @@ impl UI {
 		self.eprint(&format!("{} {}", style("✘").red(), msg));
 	}
 
+	/// Return an error with a user-friendly error message
+	pub(crate) fn failure(msg: &str) -> Result<()> {
+		Err(anyhow::anyhow!("{} {}", style("✘").red(), msg))
+	}
+
+	/// Print an error or failure message
+	/// User-friendly failures created with `UI::failure` will be printed as-is,
+	/// other errors will be printed with a generic message and a link to report bugs.
+	pub(crate) fn print_failure_or_error(&self, err: &anyhow::Error) {
+		let err_msg = format!("{}", err);
+		let is_failure = err_msg.starts_with(&format!("{}", style("✘").red()));
+		if is_failure {
+			self.eprint(&err_msg);
+		} else {
+			self.print_failure(&format!("An unexpected error occurred: {}", err));
+			self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
+		}
+	}
+
 	/// Print an error with a failure icon
 	pub(crate) fn print_err(&self, err: &anyhow::Error) {
 		self.print_failure(&format!("{}", err));
