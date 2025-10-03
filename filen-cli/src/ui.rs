@@ -42,14 +42,16 @@ impl log::Log for CustomLogger {
 }
 
 pub(crate) struct UI {
+	quiet: bool,
 	theme: dialoguer::theme::ColorfulTheme,
 	repl_input_theme: dialoguer::theme::ColorfulTheme,
 	history: dialoguer::BasicHistory,
 }
 
 impl UI {
-	pub(crate) fn new() -> Self {
+	pub(crate) fn new(quiet: bool) -> Self {
 		UI {
+			quiet,
 			theme: dialoguer::theme::ColorfulTheme {
 				prompt_prefix: style("›".to_string()).cyan().bold(),
 				prompt_suffix: style("›".to_string()).dim().bold(),
@@ -102,6 +104,9 @@ impl UI {
 		// todo: use ui.println() everywhere?
 		info!("[PRINT] {}", msg);
 	}
+	pub(crate) fn print_hidden(&self, msg: &str) {
+		info!("[PRINT] {}", msg);
+	}
 	pub(crate) fn eprint(&self, msg: &str) {
 		eprintln!("{}", msg);
 		error!("[PRINT] {}", msg);
@@ -111,7 +116,11 @@ impl UI {
 
 	/// Print a message with a success icon
 	pub(crate) fn print_success(&self, msg: &str) {
-		self.print(&format!("{} {}", style("✔").green(), msg));
+		if !self.quiet {
+			self.print(&format!("{} {}", style("✔").green(), msg));
+		} else {
+			self.print_hidden(&format!("{} {}", style("✔").green(), msg));
+		}
 	}
 
 	/// Print a message with a failure icon

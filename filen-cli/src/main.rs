@@ -2,7 +2,6 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use clap_verbosity_flag::{OffLevel, Verbosity};
 use ftail::Ftail;
 use log::{LevelFilter, info};
 
@@ -20,8 +19,13 @@ mod util;
 #[derive(Debug, Parser)]
 #[clap(name = "Filen CLI", version)]
 pub(crate) struct Cli {
-	#[command(flatten)]
-	verbose: Verbosity<OffLevel>, // todo: remove default help text for these options (--quiet cannot even be used)
+	/// Increase verbosity (-v, -vv, -vvv)
+	#[arg(short, long, action = clap::ArgAction::Count)]
+	verbose: u8,
+
+	/// Hide progress bars and other non-essential output (overrides -v)
+	#[arg(short, long)]
+	quiet: bool,
 
 	/// Config directory
 	#[arg(long)]
@@ -71,10 +75,15 @@ async fn main() -> Result<()> {
 	};
 
 	fs::create_dir_all(config_dir.join("logs")).context("Failed to create logs dir")?;
-	let logging_level = match cli.verbose.log_level_filter() {
-		LevelFilter::Off => LevelFilter::Off,
-		filter => filter.increment_severity().increment_severity(),
-		// default logging level is off, -v = info, -vv = debug, -vvv = trace (error and warn are skipped)
+	let logging_level = if cli.quiet {
+		LevelFilter::Off
+	} else {
+		match cli.verbose {
+			0 => LevelFilter::Off,
+			1 => LevelFilter::Info,
+			2 => LevelFilter::Debug,
+			_ => LevelFilter::Trace,
+		}
 	};
 	Ftail::new()
 		.custom(
@@ -93,7 +102,7 @@ async fn main() -> Result<()> {
 		.context("Failed to initialize logger")?;
 	info!("Logging level: {}", logging_level);
 
-	let mut ui = ui::UI::new();
+	let mut ui = ui::UI::new(cli.quiet);
 
 	let mut client = auth::LazyClient::new(cli.email, cli.password, cli.auth_config_path);
 
