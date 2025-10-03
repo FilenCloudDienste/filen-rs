@@ -1,9 +1,45 @@
 use anyhow::{Context, Result};
 use dialoguer::console::style;
+use log::{error, info};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub(crate) struct CustomLogger {
+	pub(crate) config: ftail::Config,
+}
+
+impl log::Log for CustomLogger {
+	fn enabled(&self, metadata: &log::Metadata) -> bool {
+		metadata.level() <= self.config.level_filter
+	}
+
+	fn log(&self, record: &log::Record) {
+		if !self.enabled(record.metadata()) {
+			return;
+		}
+		let now = chrono::Local::now().format(&self.config.datetime_format);
+		let formatted_timestamp = style(format!("[{}]", now)).dim();
+		let formatted_level = match record.level() {
+			log::Level::Error => style("[ERROR]").red(),
+			log::Level::Warn => style("[WARN] ").yellow(),
+			log::Level::Info => style("[INFO] ").green(),
+			log::Level::Debug => style("[DEBUG]").blue(),
+			log::Level::Trace => style("[TRACE]").dim(),
+		};
+		let formatted_target = style(format!("({})", record.target())).dim();
+		println!(
+			"{} {} {} {}",
+			formatted_timestamp,
+			formatted_level,
+			formatted_target,
+			record.args()
+		);
+	}
+
+	fn flush(&self) {}
+}
 
 pub(crate) struct UI {
 	theme: dialoguer::theme::ColorfulTheme,
@@ -64,9 +100,11 @@ impl UI {
 	pub(crate) fn print(&self, msg: &str) {
 		println!("{}", msg);
 		// todo: use ui.println() everywhere?
+		info!("[PRINT] {}", msg);
 	}
 	pub(crate) fn eprint(&self, msg: &str) {
 		eprintln!("{}", msg);
+		error!("[PRINT] {}", msg);
 	}
 
 	// print with formatting
