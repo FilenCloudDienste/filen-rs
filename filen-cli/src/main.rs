@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use clap_verbosity_flag::{OffLevel, Verbosity};
 use ftail::Ftail;
-use log::{LevelFilter, error, info};
+use log::{LevelFilter, info};
 
 use crate::{
 	commands::{Commands, execute_command},
@@ -101,8 +101,7 @@ async fn main() -> Result<()> {
 
 	if let Some(command) = cli.command {
 		if let Err(e) = execute_command(&mut ui, &mut client, &working_path, command).await {
-			error!("{}", e);
-			ui.print_failure(&format!("An error occurred: {}. If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues", e));
+			ui.print_failure_or_error(&e);
 		}
 	} else {
 		ui.print_banner();
@@ -145,11 +144,7 @@ async fn main() -> Result<()> {
 					working_path = result.working_path.unwrap_or(working_path);
 				}
 				Err(e) => {
-					error!("{}", e);
-					ui.print_failure(&format!("An error occurred: {}. If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues", e));
-					// todo: better error handling, e. g. "no such directory bla" should not be formatted with bug report link
-					// there should be a user-facing error type or something that's stil an error
-					// we can't only print the error via ui.print_failure() because we want non-zero exit codes
+					ui.print_failure_or_error(&e);
 				}
 			}
 		}
