@@ -27,3 +27,6 @@ humansize = "2.1.3"
 chrono = { version = "0.4.41", features = ["serde"] }
 unicode-width = "0.2.1"
 ansi-width = "0.1.0"
+ftail = "0.3.1"
+dirs = "6.0.0"
+clap-verbosity-flag = "3.0.4"

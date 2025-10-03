@@ -1,9 +1,14 @@
+use std::{fs, path::PathBuf};
+
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::error;
+use clap_verbosity_flag::{OffLevel, Verbosity};
+use ftail::Ftail;
+use log::{LevelFilter, error, info};
 
 use crate::{
 	commands::{Commands, execute_command},
+	ui::CustomLogger,
 	util::RemotePath,
 };
 
@@ -15,6 +20,13 @@ mod util;
 #[derive(Debug, Parser)]
 #[clap(name = "Filen CLI", version)]
 pub(crate) struct Cli {
+	#[command(flatten)]
+	verbose: Verbosity<OffLevel>, // todo: remove default help text for these options (--quiet cannot even be used)
+
+	/// Config directory
+	#[arg(long)]
+	config_dir: Option<PathBuf>,
+
 	/// Filen account email (requires --password)
 	#[arg(short, long)]
 	email: Option<String>,
@@ -33,11 +45,56 @@ pub(crate) struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	env_logger::init();
+	let is_dev = cfg!(debug_assertions);
+
+	let cli = Cli::parse();
+	// todo: add colors and styling to clap help texts
+
+	// determine config dir
+	let config_dir = match cli.config_dir {
+		Some(dir) => {
+			if !dir.exists() {
+				return Err(anyhow::anyhow!("Config dir does not exist"));
+			}
+			dir
+		}
+		None => {
+			let dir = dirs::config_dir()
+				.ok_or(anyhow::anyhow!("Failed to get config dir"))?
+				.join(match is_dev {
+					true => "filen-cli-dev",
+					false => "filen-cli",
+				});
+			fs::create_dir_all(&dir).context("Failed to create config dir")?;
+			dir
+		}
+	};
+
+	fs::create_dir_all(config_dir.join("logs")).context("Failed to create logs dir")?;
+	let logging_level = match cli.verbose.log_level_filter() {
+		LevelFilter::Off => LevelFilter::Off,
+		filter => filter.increment_severity().increment_severity(),
+		// default logging level is off, -v = info, -vv = debug, -vvv = trace (error and warn are skipped)
+	};
+	Ftail::new()
+		.custom(
+			|config| Box::new(CustomLogger { config }) as Box<dyn log::Log + Send + Sync>,
+			logging_level,
+		)
+		.single_file(
+			&config_dir.join("logs").join("latest.log"),
+			false,
+			LevelFilter::Debug,
+		)
+		.daily_file(&config_dir.join("logs"), LevelFilter::Debug)
+		.max_file_size(10 * 1024 * 1024) // 10 MB
+		.retention_days(3)
+		.init()
+		.context("Failed to initialize logger")?;
+	info!("Logging level: {}", logging_level);
 
 	let mut ui = ui::UI::new();
 
-	let cli = Cli::parse();
 	let mut client = auth::LazyClient::new(cli.email, cli.password, cli.auth_config_path);
 
 	let mut working_path = RemotePath::new("");
@@ -90,6 +147,9 @@ async fn main() -> Result<()> {
 				Err(e) => {
 					error!("{}", e);
 					ui.print_failure(&format!("An error occurred: {}. If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues", e));
+					// todo: better error handling, e. g. "no such directory bla" should not be formatted with bug report link
+					// there should be a user-facing error type or something that's stil an error
+					// we can't only print the error via ui.print_failure() because we want non-zero exit codes
 				}
 			}
 		}
