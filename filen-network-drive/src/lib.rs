@@ -67,14 +67,7 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 			.context("Failed to create Rclone binary directory")?;
 		fs::write(&rclone_binary_path, &bytes).await?;
 
-		// make binary executable
-		#[cfg(unix)]
-		{
-			let mut perms = std::fs::metadata(&rclone_binary_path)?.permissions();
-			perms.set_mode(0o755);
-			std::fs::set_permissions(&rclone_binary_path, perms)?;
-		}
-		// todo: test if binaries are actually made executable on unix
+		// todo: on unix, make binaries executable
 	}
 
 	debug!("Using Rclone binary at {}", rclone_binary_path.display());
