@@ -205,11 +205,11 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::ExportAuthConfig => {
-			let client = client.get(ui).await?;
+			let (client, password) = client.get_with_password(ui).await?;
 			let export_path = std::env::current_dir()
 				.context("Failed to get current directory")?
 				.join("filen-cli-auth-config");
-			export_auth_config(client, &export_path)?;
+			export_auth_config(client, password, &export_path)?;
 			ui.print_success(&format!(
 				"Exported auth config to {}",
 				export_path.display()
