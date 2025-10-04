@@ -29,13 +29,13 @@ impl log::Log for CustomLogger {
 			log::Level::Trace => style("[TRACE]").dim(),
 		};
 		let formatted_target = style(format!("({})", record.target())).dim();
-		println!(
-			"{} {} {} {}",
-			formatted_timestamp,
-			formatted_level,
-			formatted_target,
-			record.args()
-		);
+		let msg = record.args().to_string();
+		if !msg.starts_with("[PRINT]") {
+			println!(
+				"{} {} {} {}",
+				formatted_timestamp, formatted_level, formatted_target, msg
+			);
+		}
 	}
 
 	fn flush(&self) {}

@@ -12,7 +12,7 @@ use filen_sdk_rs::{
 use filen_types::fs::ParentUuid;
 
 use crate::{
-	CommandResult,
+	CliConfig, CommandResult,
 	auth::{LazyClient, export_auth_config},
 	ui::{self, UI},
 	util::RemotePath,
@@ -96,6 +96,7 @@ pub(crate) enum Commands {
 }
 
 pub(crate) async fn execute_command(
+	config: &CliConfig,
 	ui: &mut UI,
 	client: &mut LazyClient,
 	working_path: &RemotePath,
