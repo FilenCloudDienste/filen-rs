@@ -89,6 +89,8 @@ pub(crate) enum Commands {
 	EmptyTrash,
 	/// Export an auth config (to be used with --auth-config-path option)
 	ExportAuthConfig,
+	/// Mount Filen as a network drive
+	Mount { mount_point: Option<String> },
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -214,6 +216,23 @@ pub(crate) async fn execute_command(
 				"Exported auth config to {}",
 				export_path.display()
 			));
+			None
+		}
+		Commands::Mount { mount_point } => {
+			let (client, password) = client.get_with_password(ui).await?;
+			let mut process = filen_network_drive::mount_network_drive(
+				client,
+				password,
+				&config.config_dir,
+				mount_point.as_deref(),
+			)
+			.await
+			.context("Failed to mount network drive")?;
+			ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)"); // todo
+			process
+				.wait()
+				.await
+				.context("Failed to wait for mount process")?;
 			None
 		}
 		Commands::Logout => {
