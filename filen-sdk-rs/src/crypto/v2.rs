@@ -8,7 +8,7 @@ use aes_gcm::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString};
 use pbkdf2::{hmac::Hmac, pbkdf2};
-use rand::Rng;
+use rand::distr::Distribution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
@@ -26,8 +26,10 @@ struct BadNonce([u8; NONCE_SIZE]);
 impl CreateRandom for BadNonce {
 	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
 		let mut nonce = [0u8; NONCE_SIZE];
+		let sampler =
+			rand::distr::Uniform::new(0, NONCE_VALUES.len()).expect("Uniform should be valid");
 		for byte in nonce.iter_mut() {
-			*byte = NONCE_VALUES[rng.random_range(0..NONCE_VALUES.len())];
+			*byte = NONCE_VALUES[sampler.sample(rng)];
 		}
 		Self(nonce)
 	}
