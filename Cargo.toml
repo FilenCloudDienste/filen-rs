@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+	"anchored-ref",
 	"filen-mobile-native-cache",
 	"filen-sdk-rs",
 	"filen-types",

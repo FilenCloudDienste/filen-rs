@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "nightly", feature(closure_lifetime_binder))]
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 use std::mem::MaybeUninit;
@@ -30,6 +31,25 @@ pub struct AnchoredRef<T, U> {
 	// we need a very specific drop order: `borrowed` _before_ `owned`.
 	owned: ManuallyDrop<T>,
 	borrowed: ManuallyDrop<U>,
+}
+
+pub trait MapFnHelper<'a, U, U1>
+where
+	U: TransmuteLifetime,
+	U1: TransmuteLifetime,
+{
+	fn call(self, u: U::Borrowed<'a>) -> U1::Borrowed<'a>;
+}
+
+impl<'a, U, U1, F> MapFnHelper<'a, U, U1> for F
+where
+	U: TransmuteLifetime,
+	U1: TransmuteLifetime,
+	F: FnOnce(U::Borrowed<'a>) -> U1::Borrowed<'a>,
+{
+	fn call(self, u: U::Borrowed<'a>) -> U1::Borrowed<'a> {
+		self(u)
+	}
 }
 
 impl<T, U: TransmuteLifetime + 'static> AnchoredRef<T, U> {
@@ -108,19 +128,21 @@ impl<T, U: TransmuteLifetime + 'static> AnchoredRef<T, U> {
 		f(TransmuteLifetime::transmute_from_static(borrowed))
 	}
 
-	// Consumes self and maps the borrowed part to another type, returning a new CombinedStruct
-	// The owned part is unchanged
+	/// Consumes self and maps the borrowed part to another type, returning a new CombinedStruct
+	/// The owned part is unchanged
+	///
+	/// Unfortunately, without the rust nightly feature `closure_lifetime_binder`
+	/// there is no way for a closure to correctly Map from U<'a> to a U1<'a>
+	/// so in stable rust it is generally required to pass a function instead of a closure here.
 	pub fn map<F, U1>(self, f: F) -> AnchoredRef<T, U1>
 	where
 		U1: TransmuteLifetime,
-		// the &'a () is required because there are situations where U::Borrowed could be owned (eg String)
-		// and in that case the compiler isn't able to bind U1::Borrowed to a lifetime
-		F: for<'a> FnOnce(U::Borrowed<'a>, &'a ()) -> U1::Borrowed<'a>,
+		F: for<'a> MapFnHelper<'a, U, U1>,
 	{
 		// Safety: we are deconstructing the tuple and assigning both T and U so they are dropped in the right order
 		let (owned, borrowed) = unsafe { self.into_parts() };
 
-		let mapped = f(TransmuteLifetime::transmute_from_static(borrowed), &());
+		let mapped = f.call(TransmuteLifetime::transmute_from_static(borrowed));
 		let static_mapped = unsafe { U1::transmute_to_static(mapped) };
 		AnchoredRef {
 			owned: ManuallyDrop::new(owned),

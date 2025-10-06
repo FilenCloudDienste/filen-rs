@@ -74,6 +74,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "anchored-ref"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "filen-macros",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "android_liblog-sys"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -4,6 +4,9 @@ use bytes::Bytes;
 
 use super::*;
 
+#[cfg(feature = "nightly")]
+mod nightly_test;
+
 pub fn create_combined_with_serde<T>(data: Bytes) -> AnchoredRef<Bytes, T>
 where
 	T: TransmuteLifetime + 'static,
@@ -128,6 +131,13 @@ fn test_with_mystruct() {
 	});
 }
 
+fn map_struct<'a>(parts: MyStruct<'a>) -> AnotherStruct<'a> {
+	AnotherStruct {
+		name: parts.k,
+		value: parts.k1,
+	}
+}
+
 #[test]
 fn test_with_mystruct1() {
 	let data = Bytes::from(r#"{"k": "\n", "k1": "asdf"}"#);
@@ -137,10 +147,7 @@ fn test_with_mystruct1() {
 
 	println!("Combined: {:?}", combined);
 
-	let combined = combined.map::<_, AnotherStruct>(|parts, _| AnotherStruct {
-		name: parts.k,
-		value: parts.k1,
-	});
+	let combined = combined.map::<_, AnotherStruct>(map_struct);
 
 	combined.with_ref(|deserialized| {
 		println!("Deserialized: {:?}", deserialized);
