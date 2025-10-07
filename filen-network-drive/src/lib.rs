@@ -15,13 +15,11 @@ use log::{debug, info};
 /// Downloads Rclone binary if necessary, writes config file, and starts the `rclone mount` process.
 pub async fn mount_network_drive(
 	client: &Client,
-	password: &str,
 	config_dir: &Path,
 	mount_point: Option<&str>,
 ) -> Result<Child> {
 	let rclone_binary_path = ensure_rclone_binary(config_dir).await?;
-	let rclone_config_path =
-		write_rclone_config(&rclone_binary_path, client, password, config_dir).await?;
+	let rclone_config_path = write_rclone_config(&rclone_binary_path, client, config_dir).await?;
 	start_rclone_mount_process(
 		&rclone_binary_path,
 		&rclone_config_path,
@@ -77,17 +75,24 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 async fn write_rclone_config(
 	rclone_binary_path: &Path,
 	client: &Client,
-	password: &str,
 	config_dir: &Path,
 ) -> Result<PathBuf> {
 	let rclone_config_dir = config_dir.join("network-drive-rlone");
 	let rclone_config_path = rclone_config_dir.join("rclone.conf");
 
+	let client_sdk_config = client.to_sdk_config();
 	let rclone_config_content = format!(
-		"[filen]\ntype = filen\nemail = {}\npassword = {}\napi_key = {}",
+		// using "internal" fields to avoid needing the plaintext password here
+		// ref: https://github.com/FilenCloudDienste/filen-rclone/blob/784979078ecd573af0d9809d2c5a07bafaad2c41/backend/filen/filen.go#L136
+		"[filen]\ntype = filen\npassword = {}\nemail = {}\nmaster_keys = {}\napi_key = {}\npublic_key = {}\nprivate_key = {}\nauth_version = {}\nbase_folder_uuid = {}\n",
+		obscure_password_for_rclone(rclone_binary_path, "INTERNAL").await?,
 		client.email(),
-		obscure_password_for_rclone(rclone_binary_path, password).await?,
-		obscure_password_for_rclone(rclone_binary_path, &client.to_stringified().api_key).await?
+		client_sdk_config.master_keys.join("|"),
+		obscure_password_for_rclone(rclone_binary_path, &client_sdk_config.api_key).await?,
+		client_sdk_config.public_key,
+		client_sdk_config.private_key,
+		client_sdk_config.auth_version as u8,
+		client_sdk_config.base_folder_uuid
 	);
 
 	fs::create_dir_all(&rclone_config_dir)
