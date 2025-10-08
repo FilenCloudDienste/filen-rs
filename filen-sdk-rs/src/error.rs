@@ -125,6 +125,12 @@ impl Error {
 	pub fn js_to_string(&self) -> String {
 		format!("{}", self)
 	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(getter, js_name = "message")]
+	pub fn js_message(&self) -> String {
+		format!("{}", self)
+	}
 }
 
 impl Error {
