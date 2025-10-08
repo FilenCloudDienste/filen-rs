@@ -6,7 +6,8 @@ use std::{
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
-use digest::Digest;
+use chrono::{DateTime, Utc};
+use digest::{Digest, FixedOutput, KeyInit, Update};
 use filen_types::{
 	auth::{APIKey, AuthVersion, FileEncryptionVersion, FilenSDKConfig, MetaEncryptionVersion},
 	crypto::{EncryptedMetaKey, EncryptedString},
@@ -147,6 +148,7 @@ pub struct Client {
 	pub(crate) drive_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 	pub(crate) notes_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 	pub(crate) chats_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
+	pub(crate) auth_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 
 	pub(crate) api_semaphore: tokio::sync::Semaphore,
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
@@ -253,6 +255,7 @@ impl Client {
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
+			auth_lock: tokio::sync::RwLock::new(None),
 			api_semaphore: tokio::sync::Semaphore::new(
 				stringified
 					.max_parallel_requests
@@ -431,6 +434,7 @@ impl Client {
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
+			auth_lock: tokio::sync::RwLock::new(None),
 			api_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
 			memory_semaphore: tokio::sync::Semaphore::new(
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
@@ -468,6 +472,102 @@ impl Client {
 			tmp_path: "".to_string(), // ?
 			connect_to_socket: false,
 		}
+	}
+
+	pub async fn generate_2fa_secret(&self) -> Result<TwoFASecret, Error> {
+		let resp = api::v3::user::settings::get(self.client()).await?;
+
+		Ok(TwoFASecret::new(
+			resp.two_factor_key.into_owned(),
+			&resp.email,
+		))
+	}
+
+	/// Enables 2FA for the account. Returns the recovery key which must be stored safely.
+	pub async fn enable_2fa(&self, current_2fa_code: &str) -> Result<String, Error> {
+		let _lock = self.lock_auth().await?;
+		let resp = api::v3::user::two_fa::enable::post(
+			self.client(),
+			&api::v3::user::two_fa::enable::Request {
+				code: Cow::Borrowed(current_2fa_code),
+			},
+		)
+		.await?;
+
+		Ok(resp.recovery_key.into_owned())
+	}
+
+	pub async fn disable_2fa(&self, current_2fa_code: &str) -> Result<(), Error> {
+		let _lock = self.lock_auth().await?;
+		api::v3::user::two_fa::disable::post(
+			self.client(),
+			&api::v3::user::two_fa::disable::Request {
+				code: Cow::Borrowed(current_2fa_code),
+			},
+		)
+		.await?;
+		Ok(())
+	}
+}
+
+pub struct TwoFASecret {
+	secret: String,
+	url: String,
+}
+
+impl TwoFASecret {
+	pub fn new(secret: String, email: &str) -> Self {
+		Self {
+			url: format!(
+				"otpauth://totp/Filen:{}?secret={}&issuer=Filen&digits=6&period=30",
+				urlencoding::encode(email),
+				secret
+			),
+			secret,
+		}
+	}
+}
+
+impl TwoFASecret {
+	pub fn secret(&self) -> &str {
+		&self.secret
+	}
+
+	pub fn url(&self) -> &str {
+		&self.url
+	}
+
+	pub fn make_totp_code(&self, for_time: DateTime<Utc>) -> Result<u32, Error> {
+		let decoded_secret =
+			base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &self.secret).ok_or_else(
+				|| {
+					Error::custom(
+						crate::ErrorKind::Conversion,
+						"Failed to decode 2FA secret from base32",
+					)
+				},
+			)?;
+
+		let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(&decoded_secret).map_err(|_| {
+			Error::custom(
+				crate::ErrorKind::Conversion,
+				format!(
+					"Failed to create HMAC instance for TOTP generation (invalid key length: {})",
+					decoded_secret.len()
+				),
+			)
+		})?;
+
+		let counter = for_time.timestamp() / 30;
+		mac.update(&counter.to_be_bytes());
+		let hash = mac.finalize_fixed();
+		let offset = (hash[hash.len() - 1] & 0x0f) as usize;
+		let code = ((hash[offset] & 0x7f) as u32) << 24
+			| (hash[offset + 1] as u32) << 16
+			| (hash[offset + 2] as u32) << 8
+			| (hash[offset + 3] as u32);
+
+		Ok(code % 1_000_000)
 	}
 }
 

@@ -37,3 +37,28 @@ async fn cleanup_test_dirs() {
 
 	while futures.next().await.is_some() {}
 }
+
+#[shared_test_runtime]
+async fn test_2fa() {
+	let client = test_utils::RESOURCES.client().await;
+
+	let _lock = client.lock_auth().await.unwrap();
+
+	let secret = client.generate_2fa_secret().await.unwrap();
+
+	let recovery_key = client
+		.enable_2fa(
+			&secret
+				.make_totp_code(chrono::Utc::now())
+				.unwrap()
+				.to_string(),
+		)
+		.await
+		.unwrap();
+	// we print this in case we have to recover the account
+	println!("Recovery key: {recovery_key:?}");
+
+	// we use the recovery key here rather than the 2fa code
+	// to make sure the test doesn't fail due to a race condition
+	client.disable_2fa(&recovery_key).await.unwrap();
+}
