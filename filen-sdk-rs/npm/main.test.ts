@@ -753,6 +753,12 @@ test("sockets", async () => {
 	}
 	await new Promise(resolve => setTimeout(resolve, 5000))
 	expect(state.isSocketConnected()).toBe(false)
+	{
+		/* eslint-disable @typescript-eslint/no-unused-vars */
+		using handle = await state.addSocketListener(null, () => {})
+		expect(state.isSocketConnected()).toBe(true)
+	}
+	expect(state.isSocketConnected()).toBe(false)
 })
 
 afterAll(async () => {

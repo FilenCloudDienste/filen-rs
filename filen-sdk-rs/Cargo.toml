@@ -105,7 +105,7 @@ uuid = { version = "1.18.0", default-features = false, features = [
 	"rng-getrandom",
 ] }
 wasm-bindgen-futures = "0.4.50"
-wasm-bindgen = "0.2.100"
+wasm-bindgen = "0.2.104"
 wasmtimer = "0.4.2"
 tsify = { version = "0.5.5", default-features = false, features = [
 	"wasm-bindgen",
