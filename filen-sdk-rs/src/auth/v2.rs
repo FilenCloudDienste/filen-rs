@@ -4,7 +4,7 @@ use filen_types::crypto::{EncryptedString, rsa::EncryptedPrivateKey};
 use rsa::RsaPublicKey;
 
 use crate::{
-	Error, ErrorKind, api,
+	Error, api,
 	crypto::{
 		self,
 		error::ConversionError,
@@ -46,8 +46,8 @@ pub(super) async fn login(
 	(
 		super::AuthClient,
 		super::AuthInfo,
-		EncryptedPrivateKey<'static>,
-		RsaPublicKey,
+		Option<EncryptedPrivateKey<'static>>,
+		Option<RsaPublicKey>,
 	),
 	Error,
 > {
@@ -67,18 +67,27 @@ pub(super) async fn login(
 
 	let auth_client = super::AuthClient::new_from_client(response.api_key, client);
 
-	let master_keys_str = response.master_keys.ok_or(Error::custom(
-		ErrorKind::Response,
-		"Missing master keys in login response",
-	))?;
-
-	let master_keys = crypto::v2::MasterKeys::new(master_keys_str, master_key)?;
+	let master_keys = if let Some(master_keys_str) = response.master_keys {
+		crypto::v2::MasterKeys::new(master_keys_str, master_key)?
+		// no master key set, set one up
+	} else {
+		let master_keys = MasterKeys::new_from_key(master_key);
+		let encrypted = master_keys.to_encrypted();
+		api::v3::user::master_keys::post(
+			&auth_client,
+			&api::v3::user::master_keys::Request {
+				master_keys: encrypted,
+			},
+		)
+		.await?;
+		master_keys
+	};
 
 	Ok((
 		auth_client,
 		super::AuthInfo::V2(AuthInfo { master_keys }),
 		response.private_key,
-		response.public_key,
+		response.public_key.map(|k| k.0.into_owned()),
 	))
 }
 

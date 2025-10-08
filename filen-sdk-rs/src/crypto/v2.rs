@@ -233,6 +233,10 @@ impl MasterKeys {
 		Ok(keys)
 	}
 
+	pub fn new_from_key(key: MasterKey) -> Self {
+		Self(vec![key])
+	}
+
 	pub fn from_decrypted_string(decrypted: &str) -> Result<Self, ConversionError> {
 		let keys = decrypted
 			.trim()
@@ -251,6 +255,11 @@ impl MasterKeys {
 			.map(|k| k.as_ref())
 			.collect::<Vec<_>>()
 			.join("|")
+	}
+
+	pub fn to_encrypted(&self) -> EncryptedMasterKeys<'static> {
+		let decrypted = self.to_decrypted_string();
+		EncryptedMasterKeys(self.0[0].encrypt_meta(&decrypted))
 	}
 }
 

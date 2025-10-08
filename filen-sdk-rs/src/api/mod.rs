@@ -244,6 +244,51 @@ where
 	.context(endpoint)
 }
 
+pub(crate) async fn post_request_empty<T>(
+	client: impl UnauthorizedClient,
+	request: &T,
+	endpoint: &'static str,
+) -> Result<(), Error>
+where
+	T: serde::Serialize,
+{
+	handle_request::<()>(
+		Bytes::from_owner(serde_json::to_vec(request).context(endpoint)?),
+		|| client.post_request(gateway_url(endpoint)).json(request),
+		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
+	)
+	.await?
+	.ignore_data()
+	.context(endpoint)
+}
+
+pub(crate) async fn post_request_empty_debug<T>(
+	client: impl UnauthorizedClient,
+	request: &T,
+	endpoint: &'static str,
+) -> Result<(), Error>
+where
+	T: serde::Serialize,
+{
+	println!(
+		"{} request: {:?}",
+		endpoint,
+		serde_json::to_string(request)?
+	);
+	handle_request::<()>(
+		Bytes::from_owner(serde_json::to_vec(request).context(endpoint)?),
+		|| client.post_request(gateway_url(endpoint)).json(request),
+		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
+	)
+	.await?
+	.ignore_data()
+	.context(endpoint)
+}
+
 pub(crate) async fn post_auth_request<T, U>(
 	client: impl AuthorizedClient,
 	request: &T,

@@ -37,7 +37,7 @@ pub(super) async fn login(
 
 	let master_keys_str = response.master_keys.ok_or(Error::custom(
 		ErrorKind::Response,
-		"Missing master keys in login response",
+		"Missing master keys in v1 login response",
 	))?;
 
 	let master_keys = crypto::v2::MasterKeys::new(master_keys_str, master_key)?;
@@ -45,7 +45,17 @@ pub(super) async fn login(
 	Ok((
 		auth_client,
 		super::AuthInfo::V1(super::v2::AuthInfo { master_keys }),
-		response.private_key,
-		response.public_key,
+		response.private_key.ok_or(Error::custom(
+			ErrorKind::Response,
+			"Missing private key in v1 login response",
+		))?,
+		response
+			.public_key
+			.ok_or(Error::custom(
+				ErrorKind::Response,
+				"Missing public key in v1 login response",
+			))?
+			.0
+			.into_owned(),
 	))
 }

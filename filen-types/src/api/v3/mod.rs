@@ -7,6 +7,7 @@ pub mod health;
 pub mod item;
 pub mod login;
 pub mod notes;
+pub mod register;
 pub mod search;
 pub mod shared;
 pub mod socket;

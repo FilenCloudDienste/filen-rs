@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use filen_types::auth::{FileEncryptionVersion, MetaEncryptionVersion};
+use filen_types::auth::{AuthVersion, FileEncryptionVersion, MetaEncryptionVersion};
 
 pub const GATEWAY_URLS: [&str; 8] = [
 	"https://gateway.filen.io",
@@ -53,6 +53,7 @@ pub fn random_ingest_url() -> &'static str {
 
 pub const V2FILE_ENCRYPTION_VERSION: FileEncryptionVersion = FileEncryptionVersion::V2;
 pub const V2META_ENCRYPTION_VERSION: MetaEncryptionVersion = MetaEncryptionVersion::V2;
+pub const NEW_ACCOUNT_AUTH_VERSION: AuthVersion = AuthVersion::V2;
 
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1MiB
 pub const CHUNK_SIZE_U64: u64 = CHUNK_SIZE as u64;
@@ -68,3 +69,5 @@ pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
 pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
 	(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 2; // 4 full Chunks
 pub(crate) const MAX_OPEN_FILES: usize = 64;
+
+pub const RSA_KEY_SIZE: usize = 4096;

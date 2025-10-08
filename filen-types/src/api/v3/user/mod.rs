@@ -1,6 +1,9 @@
 pub mod base_folder;
+pub mod delete;
 pub mod info;
+pub mod key_pair;
 pub mod lock;
+pub mod master_keys;
 pub mod public_key;
 pub mod settings;
 pub mod two_fa;

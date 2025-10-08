@@ -7,6 +7,7 @@ pub(crate) mod health;
 pub(crate) mod item;
 pub(crate) mod login;
 pub(crate) mod notes;
+pub(crate) mod register;
 pub(crate) mod search;
 pub(crate) mod shared;
 pub(crate) mod trash;

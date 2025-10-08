@@ -755,7 +755,7 @@ test("sockets", async () => {
 	expect(state.isSocketConnected()).toBe(false)
 	{
 		/* eslint-disable @typescript-eslint/no-unused-vars */
-		using handle = await state.addSocketListener(null, () => {})
+		using _ = await state.addSocketListener(null, () => {})
 		expect(state.isSocketConnected()).toBe(true)
 	}
 	expect(state.isSocketConnected()).toBe(false)

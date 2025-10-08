@@ -45,8 +45,8 @@ pub(super) async fn login(
 	(
 		super::AuthClient,
 		super::AuthInfo,
-		EncryptedPrivateKey<'static>,
-		RsaPublicKey,
+		Option<EncryptedPrivateKey<'static>>,
+		Option<RsaPublicKey>,
 	),
 	Error,
 > {
@@ -78,7 +78,7 @@ pub(super) async fn login(
 		auth_client,
 		super::AuthInfo::V3(AuthInfo { dek }),
 		response.private_key,
-		response.public_key,
+		response.public_key.map(|k| k.0.into_owned()),
 	))
 }
 

@@ -12,6 +12,8 @@ use filen_types::{
 	auth::{APIKey, AuthVersion, FileEncryptionVersion, FilenSDKConfig, MetaEncryptionVersion},
 	crypto::{EncryptedMetaKey, EncryptedString},
 	fs::UuidStr,
+	serde::rsa::RsaDerPublicKey,
+	traits::CowHelpers,
 };
 use http::{AuthClient, UnauthClient};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
@@ -20,14 +22,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
-	consts::{V2FILE_ENCRYPTION_VERSION, V2META_ENCRYPTION_VERSION},
+	consts::{
+		NEW_ACCOUNT_AUTH_VERSION, RSA_KEY_SIZE, V2FILE_ENCRYPTION_VERSION,
+		V2META_ENCRYPTION_VERSION,
+	},
 	crypto::{
 		self,
 		error::ConversionError,
 		file::FileKey,
 		rsa::HMACKey,
 		shared::{CreateRandom, MetaCrypter},
-		v2::MasterKeys,
+		v2::{MasterKey, MasterKeys},
+		v3::EncryptionKey,
 	},
 	error::Error,
 	fs::{HasUUID, dir::RootDirectory},
@@ -100,6 +106,14 @@ impl AuthInfo {
 				dek: v3::MetaKey::from_str(s)?,
 			})),
 			_ => unimplemented!("Unsupported auth version: {}", version),
+		}
+	}
+
+	pub fn version(&self) -> AuthVersion {
+		match self {
+			AuthInfo::V1(_) => AuthVersion::V1,
+			AuthInfo::V2(_) => AuthVersion::V2,
+			AuthInfo::V3(_) => AuthVersion::V3,
 		}
 	}
 }
@@ -396,11 +410,42 @@ impl Client {
 			AuthVersion::V1 => {
 				v1::login(&email, pwd, two_factor_code, &info_response, client).await?
 			}
-			AuthVersion::V2 => {
-				v2::login(&email, pwd, two_factor_code, &info_response, client).await?
-			}
-			AuthVersion::V3 => {
-				v3::login(&email, pwd, two_factor_code, &info_response, client).await?
+			AuthVersion::V2 | AuthVersion::V3 => {
+				let (client, auth_info, private_key, public_key) = match info_response.auth_version
+				{
+					AuthVersion::V2 => {
+						v2::login(&email, pwd, two_factor_code, &info_response, client).await?
+					}
+					AuthVersion::V3 => {
+						v3::login(&email, pwd, two_factor_code, &info_response, client).await?
+					}
+					_ => unreachable!(),
+				};
+
+				match (public_key, private_key) {
+					(Some(public_key), Some(private_key)) => {
+						(client, auth_info, private_key, public_key)
+					}
+					_ => {
+						let new_private_key =
+							rsa::RsaPrivateKey::new(&mut old_rng::thread_rng(), RSA_KEY_SIZE)
+								.expect("Failed to generate RSA key pair");
+
+						let new_public_key = new_private_key.to_public_key();
+						let encrypted_private_key =
+							crypto::rsa::encrypt_private_key(&new_private_key, &auth_info)?;
+
+						api::v3::user::key_pair::set::post(
+							&client,
+							&api::v3::user::key_pair::set::Request {
+								public_key: RsaDerPublicKey(Cow::Borrowed(&new_public_key)),
+								private_key: encrypted_private_key.as_borrowed_cow(),
+							},
+						)
+						.await?;
+						(client, auth_info, encrypted_private_key, new_public_key)
+					}
+				}
 			}
 		};
 
@@ -508,6 +553,17 @@ impl Client {
 		.await?;
 		Ok(())
 	}
+
+	pub async fn delete_account(self, two_factor_code: &str) -> Result<(), (Error, Self)> {
+		api::v3::user::delete::post(
+			self.client(),
+			&api::v3::user::delete::Request {
+				two_factor_key: Cow::Borrowed(two_factor_code),
+			},
+		)
+		.await
+		.map_err(|e| (e, self))
+	}
 }
 
 pub struct TwoFASecret {
@@ -597,6 +653,74 @@ impl Client {
 			max_parallel_requests: None,
 			max_io_memory_usage: None,
 		}
+	}
+}
+
+enum RegisteredAuthInfo {
+	V2(MasterKey),
+	V3(EncryptionKey), // kek
+}
+
+impl RegisteredAuthInfo {
+	fn version(&self) -> AuthVersion {
+		match self {
+			RegisteredAuthInfo::V2(_) => AuthVersion::V2,
+			RegisteredAuthInfo::V3(_) => AuthVersion::V3,
+		}
+	}
+}
+
+pub struct RegisteredInfo {
+	email: String,
+	salt: String,
+	auth_info: RegisteredAuthInfo,
+}
+
+impl RegisteredInfo {
+	pub async fn register(
+		email: String,
+		password: &str,
+		ref_id: Option<&str>,
+		aff_id: Option<&str>,
+	) -> Result<Self, Error> {
+		let client = UnauthClient::default();
+
+		let (derived_pwd, salt, auth_info) = match NEW_ACCOUNT_AUTH_VERSION {
+			AuthVersion::V1 => unreachable!("V1 is not supported for new accounts"),
+			AuthVersion::V2 => {
+				let salt: [u8; 128] = rand::random();
+				let salt = faster_hex::hex_string(&salt);
+				let (mk, pwd) =
+					crypto::v2::derive_password_and_mk(password.as_bytes(), salt.as_bytes())?;
+				(pwd, salt, RegisteredAuthInfo::V2(mk))
+			}
+			AuthVersion::V3 => {
+				let salt: [u8; 256] = rand::random();
+				let salt = faster_hex::hex_string(&salt);
+				let (kek, pwd) =
+					crypto::v3::derive_password_and_kek(password.as_bytes(), salt.as_bytes())?;
+				(pwd, salt, RegisteredAuthInfo::V3(kek))
+			}
+		};
+
+		api::v3::register::post(
+			&client,
+			&api::v3::register::Request {
+				email: Cow::Borrowed(&email),
+				salt: Cow::Borrowed(&salt),
+				auth_version: auth_info.version(),
+				password: derived_pwd.as_borrowed_cow(),
+				ref_id: ref_id.map(Cow::Borrowed),
+				aff_id: aff_id.map(Cow::Borrowed),
+			},
+		)
+		.await?;
+
+		Ok(RegisteredInfo {
+			email,
+			salt,
+			auth_info,
+		})
 	}
 }
 

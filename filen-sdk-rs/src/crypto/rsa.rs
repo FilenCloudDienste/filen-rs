@@ -8,7 +8,11 @@ use filen_types::crypto::{
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rsa::{Oaep, RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey, traits::PrivateKeyParts};
+use rsa::{
+	Oaep, RsaPrivateKey, RsaPublicKey,
+	pkcs8::{DecodePrivateKey, EncodePrivateKey},
+	traits::PrivateKeyParts,
+};
 use sha2::{Sha256, Sha512};
 
 use super::{error::ConversionError, shared::MetaCrypter};
@@ -61,6 +65,16 @@ pub(crate) fn get_key_pair(
 
 	let hmac = HMACKey::new(&private_key);
 	Ok((private_key, public_key, hmac))
+}
+
+pub(crate) fn encrypt_private_key(
+	private_key: &RsaPrivateKey,
+	meta_crypter: &impl MetaCrypter,
+) -> Result<EncryptedPrivateKey<'static>, ConversionError> {
+	let der = private_key.to_pkcs8_der()?;
+	let der_base64 = BASE64_STANDARD.encode(der.as_bytes());
+	let encrypted = meta_crypter.encrypt_meta(&der_base64);
+	Ok(EncryptedPrivateKey(encrypted))
 }
 
 pub(crate) fn encrypt_with_public_key(

@@ -131,3 +131,6 @@ tokio-util = { version = "0.7.16", default-features = false, features = [
 test-utils = { path = "../test-utils" }
 filen-macros = { path = "../filen-macros" }
 zip = { version = "5.1.1", default-features = false }
+imap = "3.0.0-alpha.15"
+regex = "1.11.3"
+chromiumoxide = "0.7.0"
