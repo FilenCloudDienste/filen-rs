@@ -72,6 +72,8 @@ jobs:
           TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
           TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          IMAP_EMAIL_USER: ${{ secrets['IMAP_EMAIL_USER'] }}
+          IMAP_EMAIL_PASSWORD: ${{ secrets['IMAP_EMAIL_PASSWORD'] }}
           RUST_LOG: trace
   test-wasm:
     if: |
