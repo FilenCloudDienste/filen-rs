@@ -18,7 +18,10 @@ use filen_types::{
 
 use crate::{
 	Error,
-	auth::{Client, http::AuthClient},
+	auth::{
+		Client,
+		http::{AuthClient, AuthorizedClient},
+	},
 	crypto::shared::MetaCrypter,
 	error::ResultExt,
 	util::{MaybeArc, MaybeArcWeak},
@@ -232,19 +235,20 @@ fn handle_unauthed_message(
 	match parse_message(msg) {
 		Ok(Some((event_name, data))) => match event_name.as_str() {
 			"authed" => {
-				if data.as_ref().and_then(|d| d.as_bool()) == Some(false)
-					&& let Err(e) = send_event(
-						&connection.ws_handle,
-						"auth",
-						Some(&AuthMessage {
-							api_key: Cow::Borrowed(&connection.config.client.api_key.0),
-						}),
-					) {
-					log::error!("Failed to send auth event: {}", e);
-					return Err((
-						SocketConnectionStateEnum::Initializing(connection, broadcaster),
-						e,
-					));
+				if data.as_ref().and_then(|d| d.as_bool()) == Some(false) {
+					let client = &*connection.config.client;
+					let api_key = client.get_api_key();
+					let msg = Some(&AuthMessage {
+						api_key: Cow::Borrowed(&api_key.0),
+					});
+					if let Err(e) = send_event(&connection.ws_handle, "auth", msg) {
+						std::mem::drop(api_key);
+						log::error!("Failed to send auth event: {}", e);
+						return Err((
+							SocketConnectionStateEnum::Initializing(connection, broadcaster),
+							e,
+						));
+					}
 				}
 				Ok(SocketConnectionStateEnum::Initializing(
 					connection,
@@ -310,13 +314,13 @@ fn handle_authed_message(msg: &str, connection: &InitSocketConnection) -> Result
 		match event_name.as_str() {
 			"authed" => {
 				if data.as_ref().and_then(|d| d.as_bool()) == Some(false) {
-					send_event(
-						&connection.ws_handle,
-						"auth",
-						Some(&AuthMessage {
-							api_key: Cow::Borrowed(&connection.config.client.api_key.0),
-						}),
-					)?;
+					let client = &*connection.config.client;
+					let api_key = client.get_api_key();
+					let msg = Some(&AuthMessage {
+						api_key: Cow::Borrowed(&api_key.0),
+					});
+
+					send_event(&connection.ws_handle, "auth", msg)?;
 				}
 			}
 			other => {

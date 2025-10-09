@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
@@ -44,11 +44,14 @@ impl DirectoryMeta<'_> {
 }
 
 impl<'a> DirectoryMeta<'a> {
-	pub(crate) fn from_encrypted(
+	pub(crate) fn from_encrypted<MC>(
 		encrypted: EncryptedString<'a>,
-		decrypter: &impl MetaCrypter,
-	) -> Self {
-		let Ok(decrypted) = decrypter.decrypt_meta(&encrypted) else {
+		decrypter: impl Deref<Target = MC>,
+	) -> Self
+	where
+		MC: MetaCrypter,
+	{
+		let Ok(decrypted) = decrypter.deref().decrypt_meta(&encrypted) else {
 			return Self::Encrypted(encrypted);
 		};
 		let Ok(meta) = serde_json::from_str(&decrypted) else {
@@ -75,15 +78,23 @@ impl<'a> DirectoryMeta<'a> {
 }
 
 impl<'a> DirectoryMeta<'a> {
-	pub(crate) fn encrypt(&self, encrypter: &impl MetaCrypter) -> Option<EncryptedString<'static>> {
+	pub(crate) fn encrypt<MC>(
+		&self,
+		encrypter: impl Deref<Target = MC>,
+	) -> Option<EncryptedString<'static>>
+	where
+		MC: MetaCrypter,
+	{
 		match self {
 			Self::Decoded(meta) => {
 				let json = serde_json::to_string(meta).expect("Failed to serialize directory meta");
 
-				Some(encrypter.encrypt_meta(&json))
+				Some(encrypter.deref().encrypt_meta(&json))
 			}
-			Self::DecryptedRaw(raw) => Some(encrypter.encrypt_meta(&BASE64_STANDARD.encode(raw))),
-			Self::DecryptedUTF8(utf8) => Some(encrypter.encrypt_meta(utf8)),
+			Self::DecryptedRaw(raw) => {
+				Some(encrypter.deref().encrypt_meta(&BASE64_STANDARD.encode(raw)))
+			}
+			Self::DecryptedUTF8(utf8) => Some(encrypter.deref().encrypt_meta(utf8)),
 			other => {
 				log::warn!("Cannot convert {other:?} to encrypted meta");
 				None

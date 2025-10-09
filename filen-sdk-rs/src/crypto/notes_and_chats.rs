@@ -1,4 +1,4 @@
-use std::{borrow::Cow, str::FromStr};
+use std::{borrow::Cow, ops::Deref, str::FromStr};
 
 use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
 use rsa::{RsaPrivateKey, RsaPublicKey};
@@ -115,17 +115,21 @@ where
 	T: ToOwned + ?Sized,
 	T::Owned: Default,
 {
-	fn try_decrypt(
-		crypter: &impl MetaCrypter,
+	fn try_decrypt<MC>(
+		crypter: impl Deref<Target = MC>,
 		encrypted: &EncryptedString<'_>,
 		outer_tmp_vec: &mut Vec<u8>,
-	) -> Result<T::Owned, Error> {
+	) -> Result<T::Owned, Error>
+	where
+		MC: MetaCrypter,
+	{
 		if encrypted.0.is_empty() {
 			return Ok(T::Owned::default());
 		}
 
 		let tmp_vec = std::mem::take(outer_tmp_vec);
 		let decrypted = crypter
+			.deref()
 			.decrypt_meta_into(encrypted, tmp_vec)
 			.map_err(|(e, tmp_vec)| {
 				*outer_tmp_vec = tmp_vec;
@@ -138,11 +142,14 @@ where
 		Ok(out_string)
 	}
 
-	fn encrypt(crypter: &impl MetaCrypter, inner: &T) -> EncryptedString<'static> {
+	fn encrypt<MC>(crypter: impl Deref<Target = MC>, inner: &T) -> EncryptedString<'static>
+	where
+		MC: MetaCrypter,
+	{
 		let struct_ = Self::from_inner(inner);
 		let struct_string =
 			serde_json::to_string(&struct_).expect("Failed to serialize note title");
-		crypter.encrypt_meta(&struct_string)
+		crypter.deref().encrypt_meta(&struct_string)
 	}
 }
 
@@ -214,14 +221,17 @@ impl NoteOrChatKeyStruct<'_> {
 		Ok(encrypted_key)
 	}
 
-	pub(crate) fn encrypt_symmetric(
-		crypter: &impl MetaCrypter,
+	pub(crate) fn encrypt_symmetric<MC>(
+		crypter: impl Deref<Target = MC>,
 		note_key: &NoteOrChatKey,
-	) -> EncryptedString<'static> {
+	) -> EncryptedString<'static>
+	where
+		MC: MetaCrypter,
+	{
 		let key_struct = NoteOrChatKeyStruct {
 			key: Cow::Borrowed(note_key),
 		};
 		let key_string = serde_json::to_string(&key_struct).expect("Failed to serialize note key");
-		crypter.encrypt_meta(&key_string)
+		crypter.deref().encrypt_meta(&key_string)
 	}
 }

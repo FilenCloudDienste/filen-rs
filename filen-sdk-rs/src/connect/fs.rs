@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -110,10 +110,13 @@ impl SharedDirectory {
 		))
 	}
 
-	pub fn from_shared_out(
+	pub fn from_shared_out<MC>(
 		shared_dir: SharedDirOut<'_>,
-		crypter: &impl MetaCrypter,
-	) -> Result<Self, Error> {
+		crypter: impl Deref<Target = MC>,
+	) -> Result<Self, Error>
+	where
+		MC: MetaCrypter,
+	{
 		let sharing_role = SharingRole::Receiver(ShareInfo {
 			email: shared_dir.receiver_email.into_owned(),
 			id: shared_dir.receiver_id,
@@ -177,10 +180,13 @@ impl SharedFile {
 		})
 	}
 
-	pub fn from_shared_out(
+	pub fn from_shared_out<MC>(
 		shared_file: SharedFileOut<'_>,
-		crypter: &impl MetaCrypter,
-	) -> Result<Self, Error> {
+		crypter: impl Deref<Target = MC>,
+	) -> Result<Self, Error>
+	where
+		MC: MetaCrypter,
+	{
 		let meta = FileMeta::from_encrypted(shared_file.metadata, crypter, shared_file.version);
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,

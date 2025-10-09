@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
+	auth::http::AuthorizedClient,
 	consts::{
 		NEW_ACCOUNT_AUTH_VERSION, RSA_KEY_SIZE, V2FILE_ENCRYPTION_VERSION,
 		V2META_ENCRYPTION_VERSION,
@@ -38,6 +39,7 @@ use crate::{
 	error::Error,
 	fs::{HasUUID, dir::RootDirectory},
 	sync::lock::ResourceLock,
+	util::MaybeArc,
 };
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -149,7 +151,7 @@ pub struct Client {
 
 	root_dir: RootDirectory,
 
-	auth_info: AuthInfo,
+	auth_info: std::sync::RwLock<MaybeArc<AuthInfo>>,
 	file_encryption_version: FileEncryptionVersion,
 	meta_encryption_version: MetaEncryptionVersion,
 
@@ -177,13 +179,14 @@ impl PartialEq for Client {
 	fn eq(&self, other: &Self) -> bool {
 		self.email == other.email
 			&& self.root_dir == other.root_dir
-			&& self.auth_info == other.auth_info
+			&& *self.auth_info.read().unwrap_or_else(|e| e.into_inner())
+				== *other.auth_info.read().unwrap_or_else(|e| e.into_inner())
 			&& self.file_encryption_version == other.file_encryption_version
 			&& self.meta_encryption_version == other.meta_encryption_version
 			&& self.public_key == other.public_key
 			&& self.private_key == other.private_key
 			&& self.hmac_key == other.hmac_key
-			&& self.http_client.api_key == other.http_client.api_key
+			&& *self.get_api_key() == *other.get_api_key()
 	}
 }
 
@@ -259,7 +262,7 @@ impl Client {
 			email: stringified.email,
 			user_id: stringified.user_id,
 			root_dir: RootDirectory::new(UuidStr::from_str(&stringified.root_uuid)?),
-			auth_info,
+			auth_info: std::sync::RwLock::new(MaybeArc::new(auth_info)),
 			file_encryption_version,
 			meta_encryption_version,
 			public_key: RsaPublicKey::from(&private_key),
@@ -300,8 +303,11 @@ impl Client {
 		self.http_client.clone()
 	}
 
-	pub fn crypter(&self) -> &impl MetaCrypter {
-		&self.auth_info
+	pub fn crypter(&self) -> MaybeArc<impl MetaCrypter> {
+		self.auth_info
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.clone()
 	}
 
 	pub fn private_key(&self) -> &RsaPrivateKey {
@@ -313,7 +319,12 @@ impl Client {
 	}
 
 	pub fn hash_name(&self, name: &str) -> String {
-		match self.auth_info {
+		match self
+			.auth_info
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+		{
 			AuthInfo::V1(_) | AuthInfo::V2(_) => v2::hash_name(name),
 			AuthInfo::V3(_) => v3::hash_name(name, &self.hmac_key),
 		}
@@ -336,7 +347,12 @@ impl Client {
 	}
 
 	pub fn auth_version(&self) -> AuthVersion {
-		match self.auth_info {
+		match self
+			.auth_info
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+		{
 			AuthInfo::V1(_) => AuthVersion::V1,
 			AuthInfo::V2(_) => AuthVersion::V2,
 			AuthInfo::V3(_) => AuthVersion::V3,
@@ -344,14 +360,24 @@ impl Client {
 	}
 
 	pub fn make_file_key(&self) -> FileKey {
-		match self.auth_info {
+		match self
+			.auth_info
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+		{
 			AuthInfo::V1(_) | AuthInfo::V2(_) => FileKey::V2(v2::generate_file_key()),
 			AuthInfo::V3(_) => FileKey::V3(v3::generate_file_key()),
 		}
 	}
 
 	pub(crate) fn make_meta_key(&self) -> MetaKey {
-		match self.auth_info {
+		match self
+			.auth_info
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+		{
 			AuthInfo::V1(_) | AuthInfo::V2(_) => MetaKey::V2(v2::MetaKey::generate()),
 			AuthInfo::V3(_) => MetaKey::V3(v3::MetaKey::generate()),
 		}
@@ -469,7 +495,7 @@ impl Client {
 			email,
 			user_id: user_info.id,
 			root_dir,
-			auth_info,
+			auth_info: std::sync::RwLock::new(MaybeArc::new(auth_info)),
 			file_encryption_version,
 			meta_encryption_version,
 			public_key,
@@ -495,7 +521,12 @@ impl Client {
 			email: self.email.clone(),
 			password: "".to_string(), // we should not be storing passwords in the client
 			two_factor_code: "".to_string(),
-			master_keys: match &self.auth_info {
+			master_keys: match self
+				.auth_info
+				.read()
+				.unwrap_or_else(|e| e.into_inner())
+				.as_ref()
+			{
 				AuthInfo::V1(info) | AuthInfo::V2(info) => info
 					.master_keys
 					.to_decrypted_string()
@@ -506,7 +537,7 @@ impl Client {
 					}),
 				AuthInfo::V3(info) => vec![info.dek.to_string()],
 			},
-			api_key: self.client().api_key.to_string(),
+			api_key: self.client().get_api_key().to_string(),
 			private_key: BASE64_STANDARD
 				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
 			public_key: BASE64_STANDARD.encode(self.public_key.to_pkcs1_der().unwrap().as_bytes()),
@@ -563,6 +594,86 @@ impl Client {
 		)
 		.await
 		.map_err(|e| (e, self))
+	}
+
+	pub async fn change_password(
+		&self,
+		current_password: &str,
+		new_password: &str,
+	) -> Result<(), Error> {
+		let _lock = self.lock_auth().await?;
+		let auth_info_resp = api::v3::auth::info::post(
+			self.client(),
+			&api::v3::auth::info::Request {
+				email: Cow::Borrowed(&self.email),
+			},
+		)
+		.await?;
+
+		let auth_info = (**self.auth_info.read().unwrap_or_else(|e| e.into_inner())).clone();
+		let mut master_keys = match auth_info {
+			AuthInfo::V1(info) => info.master_keys,
+			AuthInfo::V2(info) => info.master_keys,
+			AuthInfo::V3(_) => {
+				return Err(Error::custom(
+					crate::ErrorKind::InvalidState,
+					"Changing password is not supported for V3 accounts",
+				));
+			}
+		};
+		let new_salt: [u8; 256] = rand::random();
+		let new_salt = faster_hex::hex_string(&new_salt);
+
+		let current_derived = match auth_info_resp.auth_version {
+			AuthVersion::V1 => crypto::v1::derive_password_and_mk(current_password.as_bytes())?.1,
+			AuthVersion::V2 => {
+				crypto::v2::derive_password_and_mk(
+					current_password.as_bytes(),
+					auth_info_resp.salt.as_bytes(),
+				)?
+				.1
+			}
+			AuthVersion::V3 => unreachable!("we checked for v3 above"),
+		};
+
+		let (new_master_key, new_derive) =
+			crypto::v2::derive_password_and_mk(new_password.as_bytes(), new_salt.as_bytes())?;
+
+		master_keys.0.insert(0, new_master_key);
+		let private_key_encrypted =
+			crypto::rsa::encrypt_private_key(&self.private_key, &master_keys)?;
+
+		let encrypted = master_keys.to_encrypted();
+
+		let resp = api::v3::user::settings::password::change::post(
+			self.client(),
+			&api::v3::user::settings::password::change::Request {
+				current_password: current_derived,
+				password: new_derive,
+				auth_version: AuthVersion::V2,
+				salt: Cow::Borrowed(&new_salt),
+				master_keys: encrypted,
+			},
+		)
+		.await?;
+
+		self.update_api_key(resp.new_api_key);
+
+		api::v3::user::key_pair::update::post(
+			self.client(),
+			&api::v3::user::key_pair::update::Request {
+				public_key: RsaDerPublicKey(Cow::Borrowed(&self.public_key)),
+				private_key: private_key_encrypted,
+			},
+		)
+		.await?;
+
+		let mut write_lock = self.auth_info.write().unwrap_or_else(|e| e.into_inner());
+		*write_lock = MaybeArc::new(AuthInfo::V2(v2::AuthInfo { master_keys }));
+		self.auth_info.clear_poison();
+		std::mem::drop(write_lock);
+
+		Ok(())
 	}
 }
 
@@ -637,15 +748,16 @@ impl Client {
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "toStringified")
 	)]
 	pub fn to_stringified(&self) -> StringifiedClient {
+		let auth_info = self.auth_info.read().unwrap_or_else(|e| e.into_inner());
 		StringifiedClient {
 			email: self.email.clone(),
 			user_id: self.user_id,
 			root_uuid: self.root_dir.uuid().to_string(),
-			auth_info: self.auth_info.to_string(),
+			auth_info: auth_info.to_string(),
 			private_key: BASE64_STANDARD
 				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
-			api_key: self.http_client.api_key.0.to_string(),
-			auth_version: match self.auth_info {
+			api_key: self.get_api_key().to_string(),
+			auth_version: match **auth_info {
 				AuthInfo::V1(_) => 1,
 				AuthInfo::V2(_) => 2,
 				AuthInfo::V3(_) => 3,
@@ -674,6 +786,7 @@ pub struct RegisteredInfo {
 	email: String,
 	salt: String,
 	auth_info: RegisteredAuthInfo,
+	api_key: APIKey<'static>,
 }
 
 impl RegisteredInfo {
@@ -703,7 +816,7 @@ impl RegisteredInfo {
 			}
 		};
 
-		api::v3::register::post(
+		let resp = api::v3::register::post(
 			&client,
 			&api::v3::register::Request {
 				email: Cow::Borrowed(&email),
@@ -720,6 +833,7 @@ impl RegisteredInfo {
 			email,
 			salt,
 			auth_info,
+			api_key: resp.api_key,
 		})
 	}
 }

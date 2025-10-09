@@ -233,7 +233,56 @@ fn register() {
 			.await
 			.unwrap();
 		client.list_dir(client.root()).await.unwrap();
-		client.delete_account("XXXXXX").await.unwrap();
+		let first_file = client.make_file_builder("first.txt", client.root()).build();
+
+		let first_file = client
+			.upload_file(first_file.into(), b"Hello, world!")
+			.await
+			.unwrap();
+
+		let new_password: [u8; 64] = rand::random();
+		let new_password = BASE64_STANDARD_NO_PAD.encode(new_password);
+
+		client
+			.change_password(&password, &new_password)
+			.await
+			.unwrap();
+
+		let second_file = client.make_file_builder("second", client.root()).build();
+		let second_file = client
+			.upload_file(second_file.into(), b"Hello, world!")
+			.await
+			.unwrap();
+
+		let relogin_client = Client::login(email.clone(), &new_password, "XXXXXX")
+			.await
+			.unwrap();
+
+		let third_file = relogin_client
+			.make_file_builder("third", client.root())
+			.build();
+
+		let third_file = relogin_client
+			.upload_file(third_file.into(), b"Hello, world!")
+			.await
+			.unwrap();
+
+		let (_, files) = relogin_client
+			.list_dir(relogin_client.root())
+			.await
+			.unwrap();
+
+		assert_eq!(files.len(), 3);
+		assert!(files.contains(&first_file));
+		assert!(files.contains(&second_file));
+		assert!(files.contains(&third_file));
+
+		for file in files {
+			let contents = relogin_client.download_file(&file).await.unwrap();
+			assert_eq!(contents, b"Hello, world!");
+		}
+
+		relogin_client.delete_account("XXXXXX").await.unwrap();
 	});
 
 	let body = await_email(

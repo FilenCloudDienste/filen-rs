@@ -4,24 +4,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	auth::{APIKey, AuthVersion},
-	crypto::DerivedPassword,
+	crypto::{DerivedPassword, EncryptedMasterKeys},
 };
 
-pub const ENDPOINT: &str = "v3/register";
+pub const ENDPOINT: &str = "v3/user/settings/password/change";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub email: Cow<'a, str>,
 	pub password: DerivedPassword<'a>,
-	pub salt: Cow<'a, str>, // this is not base64 or hex encoded, so probably bad practice, we should take a look at this
+	pub current_password: DerivedPassword<'a>,
 	pub auth_version: AuthVersion,
-	pub ref_id: Option<Cow<'a, str>>,
-	pub aff_id: Option<Cow<'a, str>>,
+	pub salt: Cow<'a, str>,
+	pub master_keys: EncryptedMasterKeys<'a>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub api_key: APIKey<'a>,
+	#[serde(rename = "newAPIKey")]
+	pub new_api_key: APIKey<'a>,
 }

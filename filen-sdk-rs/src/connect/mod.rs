@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, ops::Deref, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -274,14 +274,15 @@ impl Client {
 		.await
 	}
 
-	async fn update_linked_item_meta<I>(
+	async fn update_linked_item_meta<I, MC>(
 		&self,
 		item: &I,
 		link_uuid: UuidStr,
-		crypter: &impl MetaCrypter,
+		crypter: impl Deref<Target = MC>,
 	) -> Result<(), Error>
 	where
 		I: HasMeta + HasUUID,
+		MC: MetaCrypter,
 	{
 		api::v3::item::linked::rename::post(
 			self.client(),
@@ -409,14 +410,15 @@ impl Client {
 		Ok(())
 	}
 
-	pub(crate) async fn add_item_to_directory_link<I>(
+	pub(crate) async fn add_item_to_directory_link<I, MC>(
 		&self,
 		item: &I,
 		link: &ListedPublicLink<'_>,
-		link_crypter: &impl MetaCrypter,
+		link_crypter: impl Deref<Target = MC>,
 	) -> Result<(), Error>
 	where
 		I: HasParent + HasMeta + HasUUID + HasType + ?Sized,
+		MC: MetaCrypter,
 	{
 		api::v3::dir::link::add::post(
 			self.client(),

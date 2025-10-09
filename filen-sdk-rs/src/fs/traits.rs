@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
@@ -43,7 +43,12 @@ pub trait HasMeta {
 }
 
 pub trait HasMetaExt {
-	fn get_encrypted_meta(&self, crypter: &impl MetaCrypter) -> Option<EncryptedString<'static>>;
+	fn get_encrypted_meta<MC>(
+		&self,
+		crypter: impl Deref<Target = MC>,
+	) -> Option<EncryptedString<'static>>
+	where
+		MC: MetaCrypter;
 	fn get_rsa_encrypted_meta(
 		&self,
 		public_key: &RsaPublicKey,
@@ -54,8 +59,14 @@ impl<T> HasMetaExt for T
 where
 	T: HasMeta + ?Sized,
 {
-	fn get_encrypted_meta(&self, crypter: &impl MetaCrypter) -> Option<EncryptedString<'static>> {
-		Some(crypter.encrypt_meta(&self.get_meta_string()?))
+	fn get_encrypted_meta<MC>(
+		&self,
+		crypter: impl Deref<Target = MC>,
+	) -> Option<EncryptedString<'static>>
+	where
+		MC: MetaCrypter,
+	{
+		Some(crypter.deref().encrypt_meta(&self.get_meta_string()?))
 	}
 
 	fn get_rsa_encrypted_meta(

@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
@@ -146,15 +146,18 @@ pub struct RemoteDirectory {
 }
 
 impl RemoteDirectory {
-	pub fn from_encrypted(
+	pub fn from_encrypted<MC>(
 		uuid: UuidStr,
 		parent: ParentUuid,
 		color: DirColor<'static>,
 		favorited: bool,
 		timestamp: DateTime<Utc>,
 		meta: EncryptedString<'_>,
-		decrypter: &impl MetaCrypter,
-	) -> Self {
+		decrypter: impl Deref<Target = MC>,
+	) -> Self
+	where
+		MC: MetaCrypter,
+	{
 		let meta = DirectoryMeta::from_encrypted(meta, decrypter).into_owned();
 		Self {
 			uuid,

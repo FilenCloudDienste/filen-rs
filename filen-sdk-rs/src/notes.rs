@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Deref};
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -55,11 +55,14 @@ pub struct NoteTag {
 }
 
 impl NoteTag {
-	fn decrypt_with_key(
+	fn decrypt_with_key<MC>(
 		tag: &filen_types::api::v3::notes::NoteTag<'_>,
-		crypter: &impl MetaCrypter,
+		crypter: impl Deref<Target = MC>,
 		outer_tmp_vec: &mut Vec<u8>,
-	) -> Self {
+	) -> Self
+	where
+		MC: MetaCrypter,
+	{
 		let name = NoteTagName::try_decrypt(crypter, &tag.name, outer_tmp_vec).ok();
 
 		Self {
