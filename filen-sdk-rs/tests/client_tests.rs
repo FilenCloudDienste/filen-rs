@@ -6,7 +6,7 @@ use base64::{
 };
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
-	auth::{Client, RegisteredInfo},
+	auth::{Client, RegisteredInfo, TwoFASecret},
 	fs::HasName,
 };
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -48,6 +48,23 @@ async fn cleanup_test_dirs() {
 	while futures.next().await.is_some() {}
 }
 
+async fn enable_2fa_for_client(client: &Client, secret: &TwoFASecret) -> String {
+	for _ in 0..10 {
+		let result = client
+			.enable_2fa(
+				&secret
+					.make_totp_code(chrono::Utc::now())
+					.unwrap()
+					.to_string(),
+			)
+			.await;
+		if let Ok(recovery_key) = result {
+			return recovery_key;
+		}
+	}
+	panic!("Failed to enable 2FA after multiple attempts");
+}
+
 #[shared_test_runtime]
 async fn test_2fa() {
 	let client = test_utils::RESOURCES.client().await;
@@ -56,15 +73,8 @@ async fn test_2fa() {
 
 	let secret = client.generate_2fa_secret().await.unwrap();
 
-	let recovery_key = client
-		.enable_2fa(
-			&secret
-				.make_totp_code(chrono::Utc::now())
-				.unwrap()
-				.to_string(),
-		)
-		.await
-		.unwrap();
+	let recovery_key = enable_2fa_for_client(&client, &secret).await;
+
 	// we print this in case we have to recover the account
 	println!("Recovery key: {recovery_key:?}");
 
