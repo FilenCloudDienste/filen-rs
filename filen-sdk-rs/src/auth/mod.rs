@@ -543,7 +543,7 @@ impl Client {
 			public_key: BASE64_STANDARD.encode(self.public_key.to_pkcs1_der().unwrap().as_bytes()),
 			auth_version: self.auth_version(),
 			base_folder_uuid: self.root_dir.uuid().to_string(),
-			user_id: 0,
+			user_id: self.user_id,
 			metadata_cache: false,
 			tmp_path: "".to_string(), // ?
 			connect_to_socket: false,
