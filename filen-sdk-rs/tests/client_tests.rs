@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use core::panic;
+use std::collections::{HashMap, HashSet};
 
 use base64::{
 	Engine,
@@ -11,6 +12,7 @@ use filen_sdk_rs::{
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use regex::Regex;
+use scraper::{Html, Selector};
 
 // all tests must be multi_threaded, otherwise drop will deadlock for TestResources
 #[shared_test_runtime]
@@ -285,27 +287,54 @@ fn delete_account(client: Client, register_data: &mut RegisterTest) {
 	let (delete_link, _) = match_regex_in_email_body(&body, &delete_regex);
 
 	test_utils::rt().block_on(async {
-		let (mut browser, mut handler) = chromiumoxide::Browser::launch(
-			chromiumoxide::BrowserConfig::builder().build().unwrap(),
-		)
-		.await
-		.unwrap();
+		let client = reqwest::Client::builder()
+			.cookie_store(true)
+			.build()
+			.unwrap();
 
-		let handle = tokio::spawn(async move {
-			while let Some(event) = handler.next().await {
-				if event.is_err() {
-					break;
-				}
+		let response = client.get(&delete_link).send().await.unwrap();
+		let html_content = response.text().await.unwrap();
+
+		let document = Html::parse_document(&html_content);
+
+		let form_selector = Selector::parse(r#"form[method="POST"]"#).unwrap();
+		let input_selector = Selector::parse("input[type='hidden']").unwrap();
+
+		let form = document
+			.select(&form_selector)
+			.find(|f| {
+				let button_sel = Selector::parse("button").unwrap();
+				f.select(&button_sel)
+					.any(|b| b.text().any(|t| t.contains("Delete my account")))
+			})
+			.expect("Delete account form not found");
+
+		let mut form_data: HashMap<String, String> = HashMap::new();
+
+		for input in form.select(&input_selector) {
+			if let Some(name) = input.value().attr("name") {
+				let value = input.value().attr("value").unwrap_or("");
+				form_data.insert(name.to_string(), value.to_string());
 			}
-		});
+		}
 
-		let page = browser.new_page(delete_link).await.unwrap();
+		let mut multipart_form = reqwest::multipart::Form::new();
 
-		let element = page.find_element(r#"button[type="submit"]"#).await.unwrap();
-		element.click().await.unwrap();
+		for input in form.select(&input_selector) {
+			if let Some(name) = input.value().attr("name") {
+				let value = input.value().attr("value").unwrap_or("");
+				multipart_form = multipart_form.text(name.to_string(), value.to_string());
+			}
+		}
 
-		browser.close().await.unwrap();
-		handle.await.unwrap();
+		let response = client
+			.post(&delete_link)
+			.multipart(multipart_form)
+			.send()
+			.await
+			.unwrap();
+
+		assert!(response.status().is_success() || response.status().is_redirection());
 	})
 }
 

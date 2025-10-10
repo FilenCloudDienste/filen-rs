@@ -133,5 +133,9 @@ test-utils = { path = "../test-utils" }
 filen-macros = { path = "../filen-macros" }
 zip = { version = "5.1.1", default-features = false }
 imap = "3.0.0-alpha.15"
-chromiumoxide = "0.7.0"
 mail-parser = "0.11.1"
+reqwest = { version = "0.12.22", features = [
+	"cookies",
+	"multipart",
+], default-features = false }
+scraper = "0.24.0"
