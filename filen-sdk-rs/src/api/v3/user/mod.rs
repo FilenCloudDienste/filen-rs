@@ -1,9 +1,11 @@
 pub(crate) mod base_folder;
 pub(crate) mod delete;
+pub(crate) mod did_export_master_keys;
 pub(crate) mod info;
 pub(crate) mod key_pair;
 pub(crate) mod lock;
 pub(crate) mod master_keys;
+pub(crate) mod password;
 pub(crate) mod public_key;
 pub(crate) mod settings;
 pub(crate) mod two_fa;

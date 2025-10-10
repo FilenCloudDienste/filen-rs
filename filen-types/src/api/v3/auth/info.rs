@@ -15,6 +15,9 @@ pub struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
+	pub email: Cow<'a, str>,
 	pub auth_version: AuthVersion,
 	pub salt: Cow<'a, str>, // this is not base64 or hex encoded, so probably bad practice, we should take a look at this
+	#[serde(rename = "id")]
+	pub user_id: u64,
 }

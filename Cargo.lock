@@ -1526,6 +1526,7 @@ dependencies = [
  "image",
  "imap",
  "log 0.4.28",
+ "mail-parser",
  "md-5",
  "md2",
  "md4",
@@ -1916,6 +1917,17 @@ name = "hashbrown"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
+
+[[package]]
+name = "hashify"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "149e3ea90eb5a26ad354cfe3cb7f7401b9329032d0235f2687d03a35f30e5d4c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
 
 [[package]]
 name = "hashlink"
@@ -2559,6 +2571,16 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "mail-parser"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcf4390741c4e6fa330bdeccdfb580815dbb462952de91838b723357985119a3"
+dependencies = [
+ "encoding_rs",
+ "hashify",
+]
 
 [[package]]
 name = "matchers"

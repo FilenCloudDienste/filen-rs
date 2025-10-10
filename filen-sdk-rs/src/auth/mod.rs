@@ -140,6 +140,88 @@ impl MetaCrypter for AuthInfo {
 	}
 }
 
+impl AuthInfo {
+	pub fn convert_into_exportable(&self, user_id: u64) -> Result<String, Error> {
+		let exported_keys_string = match self {
+			AuthInfo::V1(info) | AuthInfo::V2(info) => {
+				let mut iter = info.master_keys.0.iter().map(|k| {
+					format!(
+						"_VALID_FILEN_MASTERKEY_{}@{}_VALID_FILEN_MASTERKEY_",
+						k.as_ref(),
+						user_id
+					)
+				});
+				let first = iter.next().ok_or_else(|| {
+					Error::custom(
+						crate::ErrorKind::InvalidState,
+						"Account has no master keys to export",
+					)
+				})?;
+				iter.fold(first, |acc, x| format!("{}|{}", acc, x))
+			}
+			AuthInfo::V3(_) => panic!("Exporting V3 accounts is not supported"),
+		};
+		let encoded = BASE64_STANDARD.encode(exported_keys_string);
+		Ok(encoded)
+	}
+}
+
+fn master_keys_from_exportable(recovery_key: &str, user_id: u64) -> Result<Vec<MasterKey>, Error> {
+	let decoded = BASE64_STANDARD.decode(recovery_key).map_err(|_| {
+		Error::custom(
+			crate::ErrorKind::BadRecoveryKey,
+			"Failed to decode recovery key from base64",
+		)
+	})?;
+	let decoded = String::from_utf8(decoded).map_err(|_| {
+		Error::custom(
+			crate::ErrorKind::BadRecoveryKey,
+			"Failed to decode recovery key from UTF-8",
+		)
+	})?;
+	let regex =
+		regex::Regex::new(r"_VALID_FILEN_MASTERKEY_([A-Fa-f0-9]{64})@(\d+)_VALID_FILEN_MASTERKEY_")
+			.expect("Failed to compile recovery key regex");
+
+	let mut caps = regex.captures_iter(&decoded).peekable();
+	if caps.peek().is_none() {
+		return Err(Error::custom(
+			crate::ErrorKind::BadRecoveryKey,
+			"Recovery key did not contain any valid master keys",
+		));
+	}
+	caps.map(|cap| {
+		let key = cap
+			.get(1)
+			.expect("Failed to get master key from recovery key (should be impossible)");
+
+		let cap_user_id = cap
+			.get(2)
+			.expect("Failed to get user ID from recovery key (should be impossible)")
+			.as_str()
+			.parse::<u64>()
+			.map_err(|_| {
+				Error::custom(
+					crate::ErrorKind::BadRecoveryKey,
+					"Failed to parse user ID from recovery key",
+				)
+			})?;
+		if user_id != cap_user_id {
+			return Err(Error::custom(
+				crate::ErrorKind::BadRecoveryKey,
+				"User ID in recovery key does not match the account's user ID",
+			));
+		}
+		MasterKey::from_str(key.as_str()).map_err(|_| {
+			Error::custom(
+				crate::ErrorKind::BadRecoveryKey,
+				"Failed to parse master key from recovery key",
+			)
+		})
+	})
+	.collect::<Result<Vec<MasterKey>, Error>>()
+}
+
 // #[derive(Clone)]
 #[cfg_attr(
 	all(target_arch = "wasm32", target_os = "unknown"),
@@ -675,6 +757,68 @@ impl Client {
 
 		Ok(())
 	}
+
+	pub async fn export_master_keys(&self) -> Result<String, Error> {
+		let exportable = self
+			.auth_info
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+			.convert_into_exportable(self.user_id)?;
+		api::v3::user::did_export_master_keys::post(self.client())
+			.await
+			.map(|_| exportable)
+	}
+
+	pub async fn complete_password_reset(
+		token: &str,
+		email: String,
+		new_password: &str,
+		recovery_key: Option<&str>,
+	) -> Result<Self, Error> {
+		let client = UnauthClient::default();
+
+		let auth_info_resp = api::v3::auth::info::post(
+			&client,
+			&api::v3::auth::info::Request {
+				email: Cow::Borrowed(&email),
+			},
+		)
+		.await?;
+
+		let salt: [u8; 256] = rand::random();
+		let salt = faster_hex::hex_string(&salt);
+		let (mk, password) =
+			crypto::v2::derive_password_and_mk(new_password.as_bytes(), salt.as_bytes())?;
+
+		let mut master_keys = MasterKeys::new_from_key(mk);
+
+		if let Some(recovery_key) = recovery_key {
+			let old_keys_vec = master_keys_from_exportable(recovery_key, auth_info_resp.user_id)?;
+			master_keys.0.extend(old_keys_vec.into_iter());
+		}
+
+		let encrypted = master_keys.to_encrypted();
+
+		api::v3::user::password::forgot::reset::post(
+			&client,
+			&api::v3::user::password::forgot::reset::Request {
+				token: Cow::Borrowed(token),
+				password,
+				auth_version: AuthVersion::V2,
+				salt: Cow::Borrowed(&salt),
+				has_recovery_keys: recovery_key.is_some(),
+				new_master_keys: encrypted,
+			},
+		)
+		.await?;
+
+		// I could try and log in here without using a login call
+		// but it's annoying with the state management
+		// we can do it properly with v4
+
+		Client::login(email, new_password, "XXXXXX").await
+	}
 }
 
 pub struct TwoFASecret {
@@ -838,6 +982,17 @@ impl RegisteredInfo {
 	}
 }
 
+pub async fn start_password_reset(email: &str) -> Result<(), Error> {
+	let client = UnauthClient::default();
+	api::v3::user::password::forgot::post(
+		&client,
+		&api::v3::user::password::forgot::Request {
+			email: Cow::Borrowed(email),
+		},
+	)
+	.await
+}
+
 impl std::fmt::Debug for Client {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("Client")
@@ -861,5 +1016,37 @@ impl std::fmt::Debug for Client {
 			.field("hmac_key", &self.hmac_key)
 			.field("http_client", &self.http_client)
 			.finish()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn auth_info_convert_into_exportable() {
+		let auth_info = AuthInfo::V2(v2::AuthInfo {
+			master_keys: MasterKeys(vec![
+				MasterKey::from_str(
+					"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+				)
+				.unwrap(),
+				MasterKey::from_str(
+					"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+				)
+				.unwrap(),
+			]),
+		});
+		let exported = auth_info.convert_into_exportable(123456).unwrap();
+		assert_eq!(
+			exported,
+			"X1ZBTElEX0ZJTEVOX01BU1RFUktFWV8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmQDEyMzQ1Nl9WQUxJRF9GSUxFTl9NQVNURVJLRVlffF9WQUxJRF9GSUxFTl9NQVNURVJLRVlfZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTBmZWRjYmE5ODc2NTQzMjEwZmVkY2JhOTg3NjU0MzIxMEAxMjM0NTZfVkFMSURfRklMRU5fTUFTVEVSS0VZXw=="
+		);
+		let expected_master_keys = match auth_info {
+			AuthInfo::V2(info) => info.master_keys.0,
+			_ => unreachable!(),
+		};
+		let master_keys_vec = master_keys_from_exportable(&exported, 123456).unwrap();
+		assert_eq!(master_keys_vec, expected_master_keys);
 	}
 }

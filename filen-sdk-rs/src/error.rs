@@ -93,6 +93,8 @@ pub enum ErrorKind {
 	#[cfg(feature = "heif-decoder")]
 	/// passthrough heif-decoder crate error
 	HeifError,
+	/// there was an issue with the provided recovery key
+	BadRecoveryKey,
 }
 
 /// Custom error type for the SDK

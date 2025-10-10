@@ -1,9 +1,11 @@
 pub mod base_folder;
 pub mod delete;
+pub mod did_export_master_keys;
 pub mod info;
 pub mod key_pair;
 pub mod lock;
 pub mod master_keys;
+pub mod password;
 pub mod public_key;
 pub mod settings;
 pub mod two_fa;

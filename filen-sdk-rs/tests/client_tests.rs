@@ -75,9 +75,6 @@ async fn test_2fa() {
 
 	let recovery_key = enable_2fa_for_client(&client, &secret).await;
 
-	// we print this in case we have to recover the account
-	println!("Recovery key: {recovery_key:?}");
-
 	// we use the recovery key here rather than the 2fa code
 	// to make sure the test doesn't fail due to a race condition
 	client.disable_2fa(&recovery_key).await.unwrap();
@@ -123,8 +120,6 @@ impl Drop for MsgsResponse<'_> {
 		if self.ids.is_empty() {
 			return;
 		}
-
-		println!("Deleting {} emails", self.ids.len());
 
 		if let Err(e) = self.session.session.uid_store(
 			self.ids
@@ -191,9 +186,32 @@ fn await_email(
 	panic!("No email received");
 }
 
-// this isn't async so we can block_on in drops
-#[test]
-fn register() {
+fn match_regex_in_email_body(body: &str, regex: &Regex) -> (String, Vec<String>) {
+	let message = mail_parser::MessageParser::default().parse(body).unwrap();
+
+	for i in 0..message.text_body_count() {
+		let body = message.body_text(i).unwrap();
+		if let Some(captures) = regex.captures(&body) {
+			let mut captures_iter = captures.iter();
+			let overall = captures_iter.next().unwrap().unwrap().as_str().to_string();
+
+			let groups = captures_iter
+				.filter_map(|c| c.map(|m| m.as_str().to_string()))
+				.collect();
+
+			return (overall, groups);
+		}
+	}
+	panic!("No link found in email body");
+}
+
+struct RegisterTest {
+	imap: ImapSession,
+	password: String,
+	email: String,
+}
+
+fn init_register_test() -> RegisterTest {
 	let _ = dotenv::dotenv();
 	let password: [u8; 64] = rand::random();
 	let password = BASE64_STANDARD_NO_PAD.encode(password);
@@ -205,33 +223,144 @@ fn register() {
 		BASE64_URL_SAFE_NO_PAD.encode(suffix)
 	);
 
+	let imap = imap_login(&email_username);
+	RegisterTest {
+		imap,
+		password,
+		email,
+	}
+}
+
+fn activate_account(register_data: &mut RegisterTest) -> Client {
 	test_utils::rt().block_on(async {
-		RegisteredInfo::register(email.clone(), &password, None, None)
-			.await
-			.unwrap();
+		RegisteredInfo::register(
+			register_data.email.clone(),
+			&register_data.password,
+			None,
+			None,
+		)
+		.await
+		.unwrap();
 	});
 
-	let mut imap_session = imap_login(&email_username);
 	let body = await_email(
-		&mut imap_session,
-		&email,
+		&mut register_data.imap,
+		&register_data.email,
 		"Account activation",
 		20,
 		std::time::Duration::from_secs(30),
 	);
 
-	let activate_regex = Regex::new("https://filen.io/activate/\\w+").unwrap();
+	let activate_regex = Regex::new(r"https:\/\/filen\.io\/activate\/\w+").unwrap();
 
-	let activate_link = activate_regex
-		.find(&body)
-		.expect("No activation link found")
-		.as_str();
-
+	let (activate_link, _) = match_regex_in_email_body(&body, &activate_regex);
 	test_utils::rt().block_on(async {
 		reqwest::get(activate_link).await.unwrap();
-		let client = Client::login(email.clone(), &password, "XXXXXX")
+		let client = Client::login(
+			register_data.email.clone(),
+			&register_data.password,
+			"XXXXXX",
+		)
+		.await
+		.unwrap();
+		client.list_dir(client.root()).await.unwrap();
+		client
+	})
+}
+
+fn delete_account(client: Client, register_data: &mut RegisterTest) {
+	test_utils::rt().block_on(async {
+		client.delete_account("XXXXXX").await.unwrap();
+	});
+
+	let body = await_email(
+		&mut register_data.imap,
+		&register_data.email,
+		"Confirm account deletion",
+		20,
+		std::time::Duration::from_secs(30),
+	);
+
+	let delete_regex = Regex::new(r"https:\/\/filen\.io\/delete-account\/(\w+)").unwrap();
+	let (delete_link, _) = match_regex_in_email_body(&body, &delete_regex);
+
+	test_utils::rt().block_on(async {
+		let (mut browser, mut handler) = chromiumoxide::Browser::launch(
+			chromiumoxide::BrowserConfig::builder().build().unwrap(),
+		)
+		.await
+		.unwrap();
+
+		let handle = tokio::spawn(async move {
+			while let Some(event) = handler.next().await {
+				if event.is_err() {
+					break;
+				}
+			}
+		});
+
+		let page = browser.new_page(delete_link).await.unwrap();
+
+		let element = page.find_element(r#"button[type="submit"]"#).await.unwrap();
+		element.click().await.unwrap();
+
+		browser.close().await.unwrap();
+		handle.await.unwrap();
+	})
+}
+
+#[test]
+fn register_and_reset_password_no_export() {
+	let mut register_data = init_register_test();
+
+	activate_account(&mut register_data);
+
+	test_utils::rt().block_on(async {
+		filen_sdk_rs::auth::start_password_reset(&register_data.email)
 			.await
 			.unwrap();
+	});
+
+	let reset_password_body = await_email(
+		&mut register_data.imap,
+		&register_data.email,
+		"Password reset",
+		20,
+		std::time::Duration::from_secs(30),
+	);
+
+	let reset_regex = Regex::new(r"https:\/\/filen\.io\/forgot-password\/([\w-]+)").unwrap();
+	let (_, reset_token_match_vec) = match_regex_in_email_body(&reset_password_body, &reset_regex);
+	let reset_token = &reset_token_match_vec[0];
+
+	let new_password: [u8; 64] = rand::random();
+	let new_password = BASE64_STANDARD_NO_PAD.encode(new_password);
+	let client = test_utils::rt().block_on(async {
+		let client = Client::complete_password_reset(
+			reset_token,
+			register_data.email.clone(),
+			&new_password,
+			None,
+		)
+		.await
+		.unwrap();
+		client.list_dir(client.root()).await.unwrap();
+		Client::login(register_data.email.clone(), &new_password, "XXXXXX")
+			.await
+			.unwrap();
+		client
+	});
+
+	delete_account(client, &mut register_data);
+}
+
+// this isn't async so we can block_on in drops
+#[test]
+fn register_change_and_reset_password_with_export() {
+	let mut register_data = init_register_test();
+	let client = activate_account(&mut register_data);
+
+	let (recovery_key, files) = test_utils::rt().block_on(async {
 		client.list_dir(client.root()).await.unwrap();
 		let first_file = client.make_file_builder("first.txt", client.root()).build();
 
@@ -244,7 +373,7 @@ fn register() {
 		let new_password = BASE64_STANDARD_NO_PAD.encode(new_password);
 
 		client
-			.change_password(&password, &new_password)
+			.change_password(&register_data.password, &new_password)
 			.await
 			.unwrap();
 
@@ -254,7 +383,7 @@ fn register() {
 			.await
 			.unwrap();
 
-		let relogin_client = Client::login(email.clone(), &new_password, "XXXXXX")
+		let relogin_client = Client::login(register_data.email.clone(), &new_password, "XXXXXX")
 			.await
 			.unwrap();
 
@@ -282,45 +411,51 @@ fn register() {
 			assert_eq!(contents, b"Hello, world!");
 		}
 
-		relogin_client.delete_account("XXXXXX").await.unwrap();
+		let exported_keys_string = relogin_client
+			.export_master_keys()
+			.await
+			.unwrap_or_else(|e| panic!("Failed to export master keys: {}", e));
+
+		filen_sdk_rs::auth::start_password_reset(&register_data.email)
+			.await
+			.unwrap();
+		(exported_keys_string, (first_file, second_file, third_file))
 	});
 
-	let body = await_email(
-		&mut imap_session,
-		&email,
-		"Confirm account deletion",
+	let reset_password_body = await_email(
+		&mut register_data.imap,
+		&register_data.email,
+		"Password reset",
 		20,
 		std::time::Duration::from_secs(30),
 	);
 
-	let activate_regex = Regex::new("https://filen.io/delete-account/(\\w+)").unwrap();
-	let delete_match = activate_regex.captures(&body).unwrap();
-	let delete_link = delete_match.get(0).unwrap().as_str();
+	let reset_regex = Regex::new(r"https:\/\/filen\.io\/forgot-password\/([\w-]+)").unwrap();
+	let (_, reset_token_match_vec) = match_regex_in_email_body(&reset_password_body, &reset_regex);
+	let reset_token = &reset_token_match_vec[0];
 
-	// we print this in case we have to force delete the account
-	println!("Deletion link: {}", delete_link);
-
-	test_utils::rt().block_on(async {
-		let (mut browser, mut handler) = chromiumoxide::Browser::launch(
-			chromiumoxide::BrowserConfig::builder().build().unwrap(),
+	let new_password: [u8; 64] = rand::random();
+	let new_password = BASE64_STANDARD_NO_PAD.encode(new_password);
+	let client = test_utils::rt().block_on(async {
+		let client = Client::complete_password_reset(
+			reset_token,
+			register_data.email.clone(),
+			&new_password,
+			Some(&recovery_key),
 		)
 		.await
 		.unwrap();
 
-		let handle = tokio::spawn(async move {
-			while let Some(event) = handler.next().await {
-				if event.is_err() {
-					break;
-				}
-			}
-		});
+		let (first_file, second_file, third_file) = files;
 
-		let page = browser.new_page(delete_link).await.unwrap();
+		let (_, files) = client.list_dir(client.root()).await.unwrap();
 
-		let element = page.find_element(r#"button[type="submit"]"#).await.unwrap();
-		element.click().await.unwrap();
-
-		browser.close().await.unwrap();
-		handle.await.unwrap();
+		assert_eq!(files.len(), 3);
+		assert!(files.contains(&first_file));
+		assert!(files.contains(&second_file));
+		assert!(files.contains(&third_file));
+		client
 	});
+
+	delete_account(client, &mut register_data);
 }
