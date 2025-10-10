@@ -9,14 +9,8 @@ use tokio::fs;
 const TEST_DIR: &str = "filen-rs-filen-network-drive-tests";
 
 #[shared_test_runtime]
+#[ignore = "would fial in CI, there are still some manual setup steps required"]
 async fn start_rclone_mount() {
-	if env::var("filen-rs-filen-network-drive-run-test").unwrap_or_default() != "1" {
-		println!(
-			"This test is not yet suitable for CI, as it will fail. (Missing #[ignore] attribute in combination with #[shared_test_runtime])"
-		);
-		return;
-	}
-
 	let client = test_utils::RESOURCES.client().await;
 	let config_dir = dirs::config_dir().unwrap().join(TEST_DIR);
 
