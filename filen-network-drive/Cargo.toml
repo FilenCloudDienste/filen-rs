@@ -10,8 +10,14 @@ metadata.workspaces = { independent = true }
 [dependencies]
 anyhow = "1.0.98"
 filen-sdk-rs = { path = "../filen-sdk-rs", features = ["tokio"] }
+# todo: make sure filen-network-drive does not depend on filen-sdk-rs
 log = "0.4.27"
 port_check = "0.3.0"
 reqwest = { version = "0.12.22", features = [ "rustls-tls" ], default-features = false }
 sysinfo = "0.37.2"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process"] }
+
+[dev-dependencies]
+test-utils = { path = "../test-utils" }
+filen-macros = { path = "../filen-macros" }
+dirs = "6.0.0"

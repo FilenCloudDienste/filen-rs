@@ -220,18 +220,26 @@ pub(crate) async fn execute_command(
 		}
 		Commands::Mount { mount_point } => {
 			let client = client.get(ui).await?;
-			let mut process = filen_network_drive::mount_network_drive(
+			let mut network_drive = filen_network_drive::mount_network_drive(
 				client,
 				&config.config_dir,
 				mount_point.as_deref(),
+				false,
 			)
 			.await
 			.context("Failed to mount network drive")?;
-			ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)"); // todo
-			process
+			ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)"); // todo: change message, it might not be successful yet
+			let code = network_drive
+				.process
 				.wait()
 				.await
 				.context("Failed to wait for mount process")?;
+			if !code.success() {
+				return Err(anyhow::anyhow!(match code.code() {
+					Some(c) => format!("Mount process exited with code: {}", c),
+					None => "Mount process exited with unknown code".to_string(),
+				}));
+			}
 			None
 		}
 		Commands::Logout => {
