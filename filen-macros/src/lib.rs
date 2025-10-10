@@ -298,10 +298,12 @@ pub fn shared_test_runtime(_attr: TokenStream, input: TokenStream) -> TokenStrea
 	let fn_inputs = &input_fn.sig.inputs;
 	let fn_output = &input_fn.sig.output;
 	let fn_block = &input_fn.block;
+	let fn_attrs = &input_fn.attrs;
 
 	// Remove async from the signature and wrap the body
 	let result = quote! {
 		#[test]
+		#(#fn_attrs)*
 		#fn_vis fn #fn_name #fn_generics(#fn_inputs) #fn_output {
 			test_utils::rt().block_on(async #fn_block)
 		}
