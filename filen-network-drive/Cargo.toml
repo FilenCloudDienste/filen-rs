@@ -11,5 +11,7 @@ metadata.workspaces = { independent = true }
 anyhow = "1.0.98"
 filen-sdk-rs = { path = "../filen-sdk-rs", features = ["tokio"] }
 log = "0.4.27"
+port_check = "0.3.0"
 reqwest = { version = "0.12.22", features = [ "rustls-tls" ], default-features = false }
+sysinfo = "0.37.2"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process"] }
