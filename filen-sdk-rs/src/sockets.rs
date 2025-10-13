@@ -8,6 +8,7 @@ use std::{
 	sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 	time::Duration,
 };
+use tokio::sync::oneshot;
 use wasm_bindgen::JsCast;
 use web_sys::CloseEvent;
 
@@ -529,8 +530,19 @@ fn make_on_message_closure(
 
 fn make_on_close_closure(
 	connection: SocketConnectionState,
+	handled_close_receiver: oneshot::Receiver<()>,
 ) -> wasm_bindgen::prelude::Closure<dyn Fn(CloseEvent)> {
+	// needed to make the closure Fn instead of FnMut which is required for the Closure trait bound
+	let handled_close_channel = std::sync::Mutex::new(handled_close_receiver);
 	wasm_bindgen::prelude::Closure::<dyn Fn(CloseEvent)>::new(move |e: CloseEvent| {
+		match handled_close_channel.lock().unwrap().try_recv() {
+			Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
+				// connection was closed due to a graceful state transition, do not attempt to reconnect
+				// it is annoying that this is the best way I have of handling this
+				return;
+			}
+			Err(oneshot::error::TryRecvError::Empty) => {}
+		}
 		let mut write_guard = connection.get_write_guard();
 		write_guard.with_owned(|state| {
 			let (init, broadcaster) = match state {
@@ -618,8 +630,10 @@ fn setup_websocket(
 			.unchecked_ref(),
 	));
 
+	let (handled_close_sender, handled_close_receiver) = oneshot::channel();
+
 	ws.set_onclose(Some(
-		make_on_close_closure(state.clone())
+		make_on_close_closure(state.clone(), handled_close_receiver)
 			.into_js_value()
 			.unchecked_ref(),
 	));
@@ -628,6 +642,7 @@ fn setup_websocket(
 
 	let ws_handle = Rc::new(WebSocketHandle {
 		wasm: ws,
+		handled_close_sender,
 		interval_change_sender,
 	});
 
@@ -826,7 +841,9 @@ impl SocketConnectionState {
 					)
 				}
 			}
-			other => ((), other),
+			SocketConnectionStateEnum::Uninintialized(uninit) => {
+				((), SocketConnectionStateEnum::Uninintialized(uninit))
+			}
 		})
 	}
 }
@@ -852,6 +869,7 @@ struct InitSocketConnection {
 
 struct WebSocketHandle {
 	interval_change_sender: tokio::sync::mpsc::UnboundedSender<Duration>,
+	handled_close_sender: oneshot::Sender<()>,
 	wasm: web_sys::WebSocket,
 }
 
