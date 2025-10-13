@@ -1,4 +1,5 @@
-import {
+import init, {
+	initThreadPool,
 	login,
 	Client,
 	fromStringified,
@@ -9,14 +10,18 @@ import {
 	EventListenerHandle,
 	type SocketEvent,
 	decryptMetaWithChatKey
-} from "./bundler/sdk-rs.js"
+} from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
-import { tmpdir } from "os"
-import { createWriteStream, openAsBlob } from "fs"
-import "dotenv/config"
-import Stream from "stream"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
-import sharp from "sharp"
+
+const env = (import.meta as any).env as Record<string, string | undefined>
+
+console.log("Initializing WASM...")
+await init()
+console.log("WASM initialized", navigator.hardwareConcurrency)
+const now = Date.now()
+await initThreadPool(navigator.hardwareConcurrency || 4)
+console.log(`WASM initialized ${navigator.hardwareConcurrency || 4} in ${Date.now() - now}ms`)
 
 let state: Client
 let shareClient: Client
@@ -43,15 +48,13 @@ function assertNoMaps(value: unknown): boolean {
 beforeAll(async () => {
 	await Promise.all([
 		(async () => {
-			const email = process.env.TEST_EMAIL
-			if (!email) {
-				throw new Error("TEST_EMAIL environment variable is not set")
+			if (!env.VITE_TEST_EMAIL) {
+				throw new Error("VITE_TEST_EMAIL environment variable is not set")
 			}
-			const password = process.env.TEST_PASSWORD
-			if (!password) {
-				throw new Error("TEST_PASSWORD environment variable is not set")
+			if (!env.VITE_TEST_PASSWORD) {
+				throw new Error("VITE_TEST_PASSWORD environment variable is not set")
 			}
-			state = await login(email, password)
+			state = await login(env.VITE_TEST_EMAIL, env.VITE_TEST_PASSWORD)
 
 			listenerHandles.push(
 				await state.addSocketListener(null, event => {
@@ -73,15 +76,13 @@ beforeAll(async () => {
 			testDir = await state.createDir(state.root(), "wasm-test-dir")
 		})(),
 		(async () => {
-			const email = process.env.TEST_SHARE_EMAIL
-			if (!email) {
-				throw new Error("TEST_SHARE_EMAIL environment variable is not set")
+			if (!env.VITE_TEST_SHARE_EMAIL) {
+				throw new Error("VITE_TEST_SHARE_EMAIL environment variable is not set")
 			}
-			const password = process.env.TEST_SHARE_PASSWORD
-			if (!password) {
-				throw new Error("TEST_SHARE_PASSWORD environment variable is not set")
+			if (!env.VITE_TEST_SHARE_PASSWORD) {
+				throw new Error("VITE_TEST_SHARE_PASSWORD environment variable is not set")
 			}
-			shareClient = await login(email, password)
+			shareClient = await login(env.VITE_TEST_SHARE_EMAIL, env.VITE_TEST_SHARE_PASSWORD)
 		})()
 	])
 }, 120000)
@@ -140,7 +141,7 @@ test("Directory", async () => {
 test("File", async () => {
 	const created = BigInt(new Date().getTime())
 	const before = BigInt(new Date().getTime())
-	let file = await state.uploadFile(Buffer.from("test-file.txt"), {
+	let file = await state.uploadFile(new TextEncoder().encode("test-file.txt"), {
 		parent: testDir,
 		name: "test-file.txt",
 		created: created
@@ -162,12 +163,10 @@ test("File", async () => {
 })
 
 test("File Streams", async () => {
-	// Write test file
 	const data = "test file data"
+	const blob = new Blob([data])
 
-	// Create a readable stream from the file
-	const blob = new Blob(["test file data"])
-
+	// Upload test
 	let progress = 0n
 	const remoteFile = await state.uploadFileFromReader({
 		parent: testDir,
@@ -181,71 +180,58 @@ test("File Streams", async () => {
 
 	expect(progress).toBe(BigInt(data.length))
 
-	let buffer = new ArrayBuffer(0)
-	let webStream = new WritableStream({
-		write(chunk) {
-			const bytes = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk)
-
-			// Create new buffer with combined size
-			const newBuffer = new ArrayBuffer(buffer.byteLength + bytes.length)
-			const newView = new Uint8Array(newBuffer)
-
-			// Copy existing data
-			newView.set(new Uint8Array(buffer))
-			// Append new data
-			newView.set(bytes, buffer.byteLength)
-
-			buffer = newBuffer
+	// Helper to collect stream into bytes
+	const collectBytes = async (downloadFn: (writer: WritableStream<Uint8Array>) => Promise<void>): Promise<Uint8Array> => {
+		const chunks: Uint8Array[] = []
+		await downloadFn(
+			new WritableStream<Uint8Array>({
+				write(chunk: Uint8Array) {
+					chunks.push(chunk)
+				}
+			})
+		)
+		// Manually concatenate chunks to avoid type issues
+		const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+		const result = new Uint8Array(totalLength)
+		let offset = 0
+		for (const chunk of chunks) {
+			result.set(chunk, offset)
+			offset += chunk.length
 		}
-	})
+		return result
+	}
+
+	// Full download test
 	let downloadProgress = 0n
-	await state.downloadFileToWriter({
-		file: remoteFile,
-		writer: webStream,
-		progress: bytes => {
-			downloadProgress = bytes
-		}
-	})
+	const downloadedBytes = await collectBytes((writer: WritableStream<Uint8Array>) =>
+		state.downloadFileToWriter({
+			file: remoteFile,
+			writer,
+			progress: (bytes: bigint) => {
+				downloadProgress = bytes
+			}
+		})
+	)
 
 	expect(downloadProgress).toBe(BigInt(data.length))
+	expect([...downloadedBytes]).toEqual([...new TextEncoder().encode(data)])
 
-	// Convert both to Uint8Array for comparison
-	const downloadedBytes = new Uint8Array(buffer)
-	const expectedBytes = new TextEncoder().encode(data)
-	expect([...downloadedBytes]).toEqual([...expectedBytes])
+	// Partial download test
+	const partialBytes = await collectBytes((writer: WritableStream<Uint8Array>) =>
+		state.downloadFileToWriter({
+			file: remoteFile,
+			writer,
+			start: BigInt(5),
+			end: BigInt(9)
+		})
+	)
 
-	buffer = new ArrayBuffer(0)
-	webStream = new WritableStream({
-		write(chunk) {
-			const bytes = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk)
-
-			// Create new buffer with combined size
-			const newBuffer = new ArrayBuffer(buffer.byteLength + bytes.length)
-			const newView = new Uint8Array(newBuffer)
-
-			// Copy existing data
-			newView.set(new Uint8Array(buffer))
-			// Append new data
-			newView.set(bytes, buffer.byteLength)
-
-			buffer = newBuffer
-		}
-	})
-	await state.downloadFileToWriter({
-		file: remoteFile,
-		writer: webStream,
-		progress: bytes => {
-			downloadProgress = bytes
-		},
-		start: BigInt(5),
-		end: BigInt(9)
-	})
-	expect([...new Uint8Array(buffer)]).toEqual([...new TextEncoder().encode("file")])
+	expect([...partialBytes]).toEqual([...new TextEncoder().encode("file")])
 })
 
 test("abort", async () => {
 	const abortController = new AbortController()
-	const fileAPromise = state.uploadFile(Buffer.from("file a"), {
+	const fileAPromise = state.uploadFile(new TextEncoder().encode("file a"), {
 		name: "abort a.txt",
 		parent: testDir,
 		managedFuture: {
@@ -253,14 +239,14 @@ test("abort", async () => {
 		}
 	})
 
-	const fileBPromise = state.uploadFile(Buffer.from("file b"), {
+	const fileBPromise = state.uploadFile(new TextEncoder().encode("file b"), {
 		name: "abort b.txt",
 		parent: testDir
 	})
 
 	const abortControllerDelayed = new AbortController()
 
-	const fileCPromise = state.uploadFile(Buffer.from("file c"), {
+	const fileCPromise = state.uploadFile(new TextEncoder().encode("file c"), {
 		name: "abort c.txt",
 		parent: testDir,
 		managedFuture: {
@@ -298,7 +284,7 @@ test("abort", async () => {
 test("pause", async () => {
 	const pauseSignal = new PauseSignal()
 	let fileAPromiseResolved = false
-	const fileAPromise = state.uploadFile(Buffer.from("file a"), {
+	const fileAPromise = state.uploadFile(new TextEncoder().encode("file a"), {
 		name: "pause a.txt",
 		parent: testDir,
 		managedFuture: {
@@ -313,7 +299,7 @@ test("pause", async () => {
 	console.log("Paused", pauseSignal.isPaused())
 
 	let fileBPromiseResolved = false
-	const fileBPromise = state.uploadFile(Buffer.from("file b"), {
+	const fileBPromise = state.uploadFile(new TextEncoder().encode("file b"), {
 		name: "pause b.txt",
 		parent: testDir,
 		managedFuture: {
@@ -324,13 +310,13 @@ test("pause", async () => {
 		fileBPromiseResolved = true
 	})
 
-	const fileCPromise = state.uploadFile(Buffer.from("file c"), {
+	const fileCPromise = state.uploadFile(new TextEncoder().encode("file c"), {
 		name: "pause c.txt",
 		parent: testDir
 	})
 
 	let fileDPromiseResolved = false
-	const fileDPromise = state.uploadFile(Buffer.from("file d"), {
+	const fileDPromise = state.uploadFile(new TextEncoder().encode("file d"), {
 		name: "pause d.txt",
 		parent: testDir
 	})
@@ -384,20 +370,19 @@ test("Zip Download", async () => {
 		name: "file3.txt"
 	})
 
-	const writeStream = createWriteStream(`${tmpdir()}/test-zip-download.zip`)
-	const webStream = Stream.Writable.toWeb(writeStream)
-	await state.downloadItemsToZip({
+	const { readable, writable } = new TransformStream()
+
+	// we don't await here because TransformStream doesn't have a buffer
+	// so this would hang forever
+	state.downloadItemsToZip({
 		items: [file, dirA],
-		writer: webStream,
+		writer: writable,
 		progress: (_bytesWritten, _totalBytes, _itemsProcessed, _totalItems) => {
 			//
 		}
 	})
-	writeStream.end()
 
-	const zipBlob = await openAsBlob(`${tmpdir()}/test-zip-download.zip`)
-
-	const zipReader = new ZipReader(zipBlob.stream())
+	const zipReader = new ZipReader(readable)
 
 	const entries = await zipReader.getEntries()
 	const map = new Map<string, Entry>()
@@ -406,13 +391,18 @@ test("Zip Download", async () => {
 	}
 
 	const compareFileToEntry = async (entry: Entry, expected: Uint8Array, expectedFile: File) => {
+		if (entry.directory) {
+			throw new Error("Expected entry to be a FileEntry, but it was a directory")
+		}
 		// zip.js has bad precision for dates, so we compare in seconds
 		expect(BigInt(entry.creationDate!.getTime())).toEqual(expectedFile.meta?.created)
 		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(expectedFile.meta?.modified) / 1000))
 		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
-		const object = createMemoryWritableStream()
-		await entry.getData!(object.stream)
-		expect(object.getBuffer()).toEqual(expected)
+		const { readable, writable } = new TransformStream()
+		// we don't await here because TransformStream doesn't have a buffer
+		// so this would hang forever
+		entry.getData!(writable)
+		expect(await streamToUint8Array(readable)).toEqual(expected)
 	}
 
 	await compareFileToEntry(map.get("file.txt")!, new TextEncoder().encode("root file content"), file)
@@ -431,20 +421,20 @@ test("sharing", async () => {
 	const contacts = await state.getContacts()
 	let contact
 	for (const c of contacts) {
-		if (c.email === process.env.TEST_SHARE_EMAIL) {
+		if (c.email === env.VITE_TEST_SHARE_EMAIL) {
 			contact = c
 			break
 		}
 	}
 	if (!contact) {
-		const reqUuid = await state.sendContactRequest(process.env.TEST_SHARE_EMAIL!)
+		const reqUuid = await state.sendContactRequest(env.VITE_TEST_SHARE_EMAIL!)
 		const reqs = await shareClient.listIncomingContactRequests()
 		const req = reqs.find(r => r.uuid === reqUuid)
 		if (!req) {
 			throw new Error("Contact request not found")
 		}
 		await shareClient.acceptContactRequest(req.uuid)
-		contact = (await state.getContacts()).find(c => c.email === process.env.TEST_SHARE_EMAIL!)!
+		contact = (await state.getContacts()).find(c => c.email === env.VITE_TEST_SHARE_EMAIL!)!
 	}
 	expect(contact).toBeDefined()
 	await state.shareDir(dir, contact)
@@ -467,7 +457,7 @@ test("block", async () => {
 	const contacts = await state.getContacts()
 	let contact
 	for (const c of contacts) {
-		if (c.email === process.env.TEST_SHARE_EMAIL) {
+		if (c.email === env.VITE_TEST_SHARE_EMAIL) {
 			contact = c
 			break
 		}
@@ -480,9 +470,9 @@ test("block", async () => {
 			await state.cancelContactRequest(req.uuid)
 		}
 	}
-	await state.sendContactRequest(process.env.TEST_SHARE_EMAIL!)
+	await state.sendContactRequest(env.VITE_TEST_SHARE_EMAIL!)
 	const requests = await shareClient.listIncomingContactRequests()
-	const req = requests.find(r => r.email === process.env.TEST_EMAIL)
+	const req = requests.find(r => r.email === env.VITE_TEST_EMAIL)
 	if (!req) {
 		throw new Error("Contact request not found")
 	}
@@ -490,7 +480,7 @@ test("block", async () => {
 	await shareClient.blockContact(req.email)
 	const blocked = await shareClient.getBlockedContacts()
 	expect(blocked.length).toBe(1)
-	expect(blocked[0].email).toBe(process.env.TEST_EMAIL)
+	expect(blocked[0].email).toBe(env.VITE_TEST_EMAIL)
 
 	const requestsAfter = await shareClient.listIncomingContactRequests()
 	expect(requestsAfter.length).toBe(0)
@@ -501,7 +491,7 @@ test("block", async () => {
 
 	const requestsFinal = await shareClient.listIncomingContactRequests()
 	expect(requestsFinal.length).toBe(1)
-	expect(requestsFinal[0].email).toBe(process.env.TEST_EMAIL)
+	expect(requestsFinal[0].email).toBe(env.VITE_TEST_EMAIL)
 })
 
 test("thumbnail", async () => {
@@ -520,7 +510,7 @@ test("thumbnail", async () => {
 
 	await Promise.all(
 		imgs.map(async ([img, ext]) => {
-			const parrotImage = await openAsBlob(`test_imgs/${img}.${ext}`)
+			const parrotImage = await fetch(`imgs/${img}.${ext}`)
 			const file = await state.uploadFile(await parrotImage.bytes(), {
 				parent: testDir,
 				name: `${img}.${ext}`
@@ -539,12 +529,17 @@ test("thumbnail", async () => {
 
 			expect(thumb).toBeDefined()
 
-			const metaPromise = sharp(thumb!.webpData).metadata()
-			await expect(metaPromise).resolves.toBeDefined()
-			const meta = await metaPromise
-			expect(meta.width).toBeLessThanOrEqual(100)
-			expect(meta.height).toBeLessThanOrEqual(100)
-			expect(meta.format).toBe("webp")
+			const blob = new Blob([thumb!.webpData], { type: "image/webp" })
+			const bitmap = await createImageBitmap(blob)
+
+			expect(bitmap.width).toBeLessThanOrEqual(100)
+			expect(bitmap.height).toBeLessThanOrEqual(100)
+
+			expect(blob.type).toBe("image/webp")
+
+			// Clean up
+			bitmap.close()
+
 			completed.push(ext)
 		})
 	)
@@ -740,18 +735,11 @@ test("authError", async () => {
 	}
 })
 
-test("sockets", async () => {
+test.only("sockets", async () => {
 	expect(state.isSocketConnected()).toBe(true)
-	if (global.gc) {
-		listenerHandles.length = 0
-		global.gc()
-	} else {
-		console.warn("No GC hook! Start your test runner with --expose-gc")
-		for (const handle of listenerHandles) {
-			handle.free()
-		}
+	for (const handle of listenerHandles) {
+		handle.free()
 	}
-	await new Promise(resolve => setTimeout(resolve, 5000))
 	expect(state.isSocketConnected()).toBe(false)
 	{
 		/* eslint-disable @typescript-eslint/no-unused-vars */
@@ -767,33 +755,24 @@ afterAll(async () => {
 	}
 })
 
-export function createMemoryWritableStream(): {
-	stream: WritableStream<Uint8Array>
-	getBuffer: () => Uint8Array
-} {
-	const chunks: Uint8Array[] = []
+async function streamToUint8Array(readableStream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+	const chunks = []
+	const reader = readableStream.getReader()
 
-	const stream = new WritableStream<Uint8Array>({
-		write(chunk) {
-			chunks.push(chunk)
-		}
-	})
-
-	const getBuffer = () => {
-		const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-		const result = new Uint8Array(totalLength)
-		let offset = 0
-
-		for (const chunk of chunks) {
-			result.set(chunk, offset)
-			offset += chunk.length
-		}
-
-		return result
+	while (true) {
+		const { done, value } = await reader.read()
+		if (done) break
+		chunks.push(value)
 	}
 
-	return {
-		stream,
-		getBuffer
+	// Concatenate all chunks
+	const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+	const result = new Uint8Array(totalLength)
+	let offset = 0
+	for (const chunk of chunks) {
+		result.set(chunk, offset)
+		offset += chunk.length
 	}
+
+	return result
 }

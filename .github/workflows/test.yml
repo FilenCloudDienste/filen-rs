@@ -110,18 +110,19 @@ jobs:
       - name: Package WASM bundle
         run:
           | # we use the bundler target because vitest doesn't seem to be able to work with the web target (see https://github.com/vitest-dev/vitest/discussions/4283)
-          sh wasm-pack-bundler.sh
+          sh wasm-pack.sh
         working-directory: ./filen-sdk-rs
       - name: Run TS tests
-        # using --expose-gc to allow checking behavior of code with GC
-        # currently used because the sockets are cleaned up when the handles are dropped,
-        # but dropping is non-deterministic and relies on GC
+        # we're waiting on https://github.com/RReverser/wasm-bindgen-rayon/issues/32
+        # for webkit/safari support
         run: |
           npm install
-          npm run test --node-options=--expose-gc
-        working-directory: ./filen-sdk-rs/npm
+          npx playwright install --with-deps
+          npx vitest run --browser=chromium
+          npx vitest run --browser=firefox
+        working-directory: ./filen-sdk-rs/web
         env:
-          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
-          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
-          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
-          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          VITE_TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          VITE_TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          VITE_TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          VITE_TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}

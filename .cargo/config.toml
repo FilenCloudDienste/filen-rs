@@ -4,7 +4,7 @@ rustflags = ["-Zhigher-ranked-assumptions"]
 [target.wasm32-unknown-unknown]
 rustflags = [
     "-C",
-    "target-feature=-nontrapping-fptoint",
+    "target-feature=-nontrapping-fptoint,+atomics,+bulk-memory",
     "--cfg",
     "getrandom_backend=\"wasm_js\"",
 ]

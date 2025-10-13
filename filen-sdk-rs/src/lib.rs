@@ -12,6 +12,7 @@ pub mod io;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod js;
 pub mod notes;
+pub mod runtime;
 pub mod search;
 pub(crate) mod serde;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]

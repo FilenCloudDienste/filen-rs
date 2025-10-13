@@ -11,12 +11,16 @@
     "Enduriel <endur1el@protonmail.com>"
   ],
   "files": [
-    "browser"
+    "sdk-rs.js",
+    "sdk-rs.d.ts",
+    "sdk-rs_bg.wasm",
+    "sdk-rs_bg.wasm.d.ts",
+    "snippets"
   ],
-  "main": "browser/sdk-rs.js",
-  "types": "browser/sdk-rs.d.ts",
+  "main": "sdk-rs.js",
+  "types": "sdk-rs.d.ts",
   "sideEffects": [
-    "./browser/sdk-rs.js"
+    "/sdk-rs.js"
   ],
   "license": "AGPLv3",
   "keywords": [
@@ -30,9 +34,9 @@
     "node": ">=23"
   },
   "devDependencies": {
+    "@vitest/browser": "^3.2.4",
     "@zip.js/zip.js": "^2.7.72",
-    "dotenv": "^17.2.1",
-    "sharp": "^0.34.3",
+    "playwright": "^1.56.0",
     "typescript": "~5.8.3",
     "vite": "^7.1.2",
     "vite-plugin-top-level-await": "^1.6.0",
