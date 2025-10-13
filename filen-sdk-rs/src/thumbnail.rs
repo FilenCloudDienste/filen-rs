@@ -96,6 +96,10 @@ mod js_impls {
 	#[serde(rename_all = "camelCase")]
 	#[tsify(into_wasm_abi)]
 	pub struct MakeThumbnailInMemoryResult {
+		// this is correct, ts requires the specifity
+		// because of https://github.com/microsoft/typescript/issues/62546
+		// not sure who to upstream this to, tsify, js_sys, or wasm-bindgen
+		#[tsify(type = "Uint8Array<ArrayBuffer>")]
 		pub webp_data: ByteBuf,
 	}
 
