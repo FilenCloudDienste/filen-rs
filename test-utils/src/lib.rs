@@ -47,8 +47,18 @@ impl Resources {
 			.get_or_init(|| async {
 				dotenv::dotenv().ok();
 				let client = Client::login(
-					env::var(format!("{}_EMAIL", self.account_prefix)).unwrap(),
-					&env::var(format!("{}_PASSWORD", self.account_prefix)).unwrap(),
+					env::var(format!("{}_EMAIL", self.account_prefix)).unwrap_or_else(|_| {
+						panic!(
+							"Failed to get Filen testing account email from environment variable {}_EMAIL",
+							self.account_prefix
+						)
+					}),
+					&env::var(format!("{}_PASSWORD", self.account_prefix)).unwrap_or_else(|_| {
+						panic!(
+							"Failed to get Filen testing account password from environment variable {}_PASSWORD",
+							self.account_prefix
+						)
+					}),
 					&env::var(format!("{}_2FA_CODE", self.account_prefix))
 						.unwrap_or("XXXXXX".to_string()),
 				)
