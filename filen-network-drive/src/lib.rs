@@ -49,13 +49,30 @@ pub async fn mount_network_drive(
 /// Returns the path to the rclone binary, downloading it if necessary
 async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 	// determine download url
-	let rclone_binary_download_url = match std::env::consts::OS {
-		"windows" => {
-			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.12/rclone-v1.70.0-filen.12-windows-arm64.exe"
-		}
-		// todo: add other platforms/archictures, use proper download location (GitHub or CDN?); check checksums?
-		os => {
-			return Err(anyhow::anyhow!("No Rclone binary for target: {}", os));
+	let platform_str = match std::env::consts::OS {
+		"windows" => Some("windows"),
+		"linux" => Some("linux"),
+		"macos" => Some("macos"),
+		_ => None,
+	};
+	let arch_str = match std::env::consts::ARCH {
+		"x86_64" => Some("amd64"),
+		"aarch64" => Some("arm64"),
+		_ => None,
+	};
+	let rclone_binary_download_url = match (platform_str, arch_str) {
+		(Some(platform), Some(arch)) => format!(
+			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.12/rclone-v1.70.0-filen.12-{}-{}{}",
+			platform,
+			arch,
+			if platform == "windows" { ".exe" } else { "" }
+		),
+		_ => {
+			return Err(anyhow::anyhow!(
+				"Unsupported platform/architecture: {} {}",
+				std::env::consts::OS,
+				std::env::consts::ARCH
+			));
 		}
 	};
 
