@@ -22,16 +22,16 @@ pub(crate) struct AuthInfo {
 }
 
 impl MetaCrypter for AuthInfo {
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
-		self.dek.encrypt_meta_into(meta, out)
+	fn blocking_encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
+		self.dek.blocking_encrypt_meta_into(meta, out)
 	}
 
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
-		self.dek.decrypt_meta_into(meta, out)
+		self.dek.blocking_decrypt_meta_into(meta, out)
 	}
 }
 
@@ -71,7 +71,7 @@ pub(super) async fn login(
 		"Missing dek in login response",
 	))?;
 
-	let dek_str = kek.decrypt_meta(&dek_str.0)?;
+	let dek_str = kek.decrypt_meta(&dek_str.0).await?;
 	let dek = EncryptionKey::from_str(&dek_str)?;
 
 	Ok((

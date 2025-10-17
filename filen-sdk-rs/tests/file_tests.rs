@@ -16,8 +16,11 @@ use futures::AsyncReadExt;
 use rand::TryRngCore;
 
 async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
+	log::debug!("Asserting file upload/download for {name} of size {contents_len}");
 	let mut contents = vec![0u8; contents_len];
+	log::debug!("Generating random contents for {name}");
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
+	log::debug!("Generated random contents for {name}");
 
 	let contents = contents.as_ref();
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
@@ -25,6 +28,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let test_dir = &resources.dir;
 
 	let file = client.make_file_builder(name, test_dir).build();
+	log::debug!("Uploading file {name} of size {contents_len}");
 	let file = client.upload_file(file.into(), contents).await.unwrap();
 
 	let found_file = match client
@@ -39,19 +43,27 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 		file, found_file,
 		"Downloaded file didn't match uploaded file for {name}"
 	);
-
+	log::info!("Uploaded file {name} of size {}", contents.len());
 	let buf = client.download_file(&file).await.unwrap();
+	log::info!("Downloaded file {name} of size {}", buf.len());
 
 	assert_eq!(buf.len(), contents.len(), "File size mismatch for {name}");
 	assert_eq!(&buf, contents, "File contents mismatch for {name}");
 
+	log::info!("Getting file {name} by UUID");
 	let got_file = client.get_file(*file.uuid()).await.unwrap();
+	log::info!("Got file {name} by UUID");
 	assert_eq!(file, got_file, "File metadata mismatch for {name}");
 }
 
 #[shared_test_runtime]
 async fn file_upload_download() {
+	log::info!(
+		"Starting file_upload_download test, num_threads: {}",
+		rayon::current_num_threads()
+	);
 	assert_file_upload_download_equal("small.txt", 10).await;
+	log::info!("Uploaded and downloaded small.txt");
 	assert_file_upload_download_equal("big_chunk_aligned_equal_to_threads.exe", 1024 * 1024 * 8)
 		.await;
 	assert_file_upload_download_equal("big_chunk_aligned_less_than_threads.exe", 1024 * 1024 * 7)

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref};
+use std::borrow::Cow;
 
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
@@ -6,7 +6,7 @@ use filen_types::{
 };
 use rsa::RsaPublicKey;
 
-use crate::crypto::shared::MetaCrypter;
+use crate::{crypto::shared::MetaCrypter, runtime::do_cpu_intensive};
 
 pub trait HasParent {
 	fn parent(&self) -> &ParentUuid;
@@ -42,39 +42,49 @@ pub trait HasMeta {
 	fn get_meta_string(&self) -> Option<Cow<'_, str>>;
 }
 
-pub trait HasMetaExt {
-	fn get_encrypted_meta<MC>(
+pub trait HasMetaExt: Send + Sync {
+	fn blocking_get_encrypted_meta(
 		&self,
-		crypter: impl Deref<Target = MC>,
-	) -> Option<EncryptedString<'static>>
-	where
-		MC: MetaCrypter;
-	fn get_rsa_encrypted_meta(
+		crypter: &impl MetaCrypter,
+	) -> Option<EncryptedString<'static>>;
+
+	fn get_encrypted_meta<'a>(
+		&'a self,
+		crypter: &'a impl MetaCrypter,
+	) -> impl Future<Output = Option<EncryptedString<'static>>> + Send + 'a {
+		do_cpu_intensive(|| self.blocking_get_encrypted_meta(crypter))
+	}
+
+	fn blocking_get_rsa_encrypted_meta(
 		&self,
 		public_key: &RsaPublicKey,
 	) -> Option<RSAEncryptedString<'static>>;
+
+	fn get_rsa_encrypted_meta<'a>(
+		&'a self,
+		public_key: &'a RsaPublicKey,
+	) -> impl Future<Output = Option<RSAEncryptedString<'static>>> + Send + 'a {
+		do_cpu_intensive(|| self.blocking_get_rsa_encrypted_meta(public_key))
+	}
 }
 
 impl<T> HasMetaExt for T
 where
-	T: HasMeta + ?Sized,
+	T: HasMeta + ?Sized + Send + Sync,
 {
-	fn get_encrypted_meta<MC>(
+	fn blocking_get_encrypted_meta(
 		&self,
-		crypter: impl Deref<Target = MC>,
-	) -> Option<EncryptedString<'static>>
-	where
-		MC: MetaCrypter,
-	{
-		Some(crypter.deref().encrypt_meta(&self.get_meta_string()?))
+		crypter: &impl MetaCrypter,
+	) -> Option<EncryptedString<'static>> {
+		Some(crypter.blocking_encrypt_meta(&self.get_meta_string()?))
 	}
 
-	fn get_rsa_encrypted_meta(
+	fn blocking_get_rsa_encrypted_meta(
 		&self,
 		public_key: &RsaPublicKey,
 	) -> Option<RSAEncryptedString<'static>> {
 		let meta = self.get_meta_string()?;
-		match crate::crypto::rsa::encrypt_with_public_key(public_key, meta.as_bytes()) {
+		match crate::crypto::rsa::blocking_encrypt_with_public_key(public_key, meta.as_bytes()) {
 			Ok(encrypted) => Some(encrypted),
 			Err(_) => {
 				log::error!(

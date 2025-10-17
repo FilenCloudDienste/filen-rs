@@ -14,6 +14,7 @@ use filen_types::{
 	traits::CowHelpers,
 };
 use futures::{StreamExt, stream::FuturesUnordered};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
 	Error, ErrorKind, api,
@@ -23,6 +24,7 @@ use crate::{
 		shared::{CreateRandom, MetaCrypter},
 	},
 	error::{MetadataWasNotDecryptedError, ResultExt},
+	runtime::{blocking_join, do_cpu_intensive},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,7 +141,7 @@ impl Chat {
 		self.muted
 	}
 
-	pub fn update_name_from_encrypted(
+	pub async fn update_name_from_encrypted(
 		&mut self,
 		encrypted: &EncryptedString<'_>,
 	) -> Result<(), Error> {
@@ -148,15 +150,13 @@ impl Chat {
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
 			.context("update_name_from_encrypted")?;
-		self.name = Some(crypto::ChatName::try_decrypt(
-			key,
-			encrypted,
-			&mut Vec::new(),
-		)?);
+		self.name = Some(
+			do_cpu_intensive(|| crypto::ChatName::blocking_try_decrypt(key, encrypted)).await?,
+		);
 		Ok(())
 	}
 
-	pub fn update_chat_message_from_encrypted(
+	pub async fn update_chat_message_from_encrypted(
 		&self,
 		message: &mut ChatMessage,
 		encrypted: &EncryptedString<'_>,
@@ -167,23 +167,23 @@ impl Chat {
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
 			.context("update_chat_message_from_encrypted")?;
-		message.inner.message = Some(crypto::ChatMessage::try_decrypt(
-			key,
-			encrypted,
-			&mut Vec::new(),
-		)?);
+		message.inner.message = Some(
+			do_cpu_intensive(|| crypto::ChatMessage::blocking_try_decrypt(key, encrypted)).await?,
+		);
 		message.edited_timestamp = edited_timestamp.round_subsecs(3);
 		message.edited = true;
 		Ok(())
 	}
 
-	pub fn decrypt_string(&self, encrypted: EncryptedString<'_>) -> Result<String, Error> {
+	pub async fn decrypt_string(&self, encrypted: &EncryptedString<'_>) -> Result<String, Error> {
 		let key = self
 			.key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
 			.context("decrypt_chat_message")?;
-		key.decrypt_meta(&encrypted).context("decrypt_chat_message")
+		key.decrypt_meta(encrypted)
+			.await
+			.context("decrypt_chat_message")
 	}
 }
 
@@ -215,10 +215,9 @@ pub struct ChatMessagePartial {
 }
 
 impl ChatMessagePartial {
-	fn decrypt(
+	fn blocking_decrypt(
 		encrypted: filen_types::api::v3::chat::messages::ChatMessagePartialEncrypted<'_>,
 		chat_key: Option<&NoteOrChatKey>,
-		tmp_vec: &mut Vec<u8>,
 	) -> Self {
 		Self {
 			uuid: encrypted.uuid,
@@ -226,9 +225,12 @@ impl ChatMessagePartial {
 			sender_email: encrypted.sender_email.into_owned(),
 			sender_avatar: encrypted.sender_avatar.map(Cow::into_owned),
 			sender_nick_name: encrypted.sender_nick_name.into_owned(),
-			message: chat_key.and_then(|chat_key| {
-				crypto::ChatMessage::try_decrypt(chat_key, &encrypted.message, tmp_vec).ok()
-			}),
+			message: match chat_key {
+				None => None,
+				Some(chat_key) => {
+					crypto::ChatMessage::blocking_try_decrypt(chat_key, &encrypted.message).ok()
+				}
+			},
 		}
 	}
 }
@@ -267,17 +269,23 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-	fn decrypt(
+	fn blocking_decrypt(
 		encrypted: filen_types::api::v3::chat::messages::ChatMessageEncrypted<'_>,
 		private_key: Option<&NoteOrChatKey>,
-		tmp_vec: &mut Vec<u8>,
 	) -> Self {
+		let (inner, reply_to) = blocking_join!(
+			|| { ChatMessagePartial::blocking_decrypt(encrypted.inner, private_key) },
+			|| {
+				encrypted
+					.reply_to
+					.map(|r| ChatMessagePartial::blocking_decrypt(r, private_key))
+			}
+		);
+
 		Self {
 			chat: encrypted.chat,
-			inner: ChatMessagePartial::decrypt(encrypted.inner, private_key, tmp_vec),
-			reply_to: encrypted
-				.reply_to
-				.map(|r| ChatMessagePartial::decrypt(r, private_key, tmp_vec)),
+			inner,
+			reply_to,
 			embed_disabled: encrypted.embed_disabled,
 			edited: encrypted.edited,
 			edited_timestamp: encrypted.edited_timestamp,
@@ -321,7 +329,7 @@ mod crypto {
 }
 
 impl Client {
-	fn decrypt_chat_key(
+	fn blocking_decrypt_chat_key(
 		&self,
 		chat: &filen_types::api::v3::chat::conversations::ChatConversation<'_>,
 	) -> Result<NoteOrChatKey, Error> {
@@ -333,7 +341,7 @@ impl Client {
 				Error::custom(ErrorKind::Response, "User is not a participant in the chat")
 			})?;
 
-		NoteOrChatKeyStruct::try_decrypt_rsa(self.private_key(), &participant.metadata)
+		NoteOrChatKeyStruct::blocking_try_decrypt_rsa(self.private_key(), &participant.metadata)
 	}
 
 	pub async fn list_messages(&self, chat: &Chat) -> Result<Vec<ChatMessage>, Error> {
@@ -355,61 +363,68 @@ impl Client {
 		)
 		.await?;
 
-		let tmp_vec = &mut Vec::new();
-
-		let messages = resp
-			.0
-			.into_iter()
-			.map(|message| ChatMessage::decrypt(message, chat.key.as_ref(), tmp_vec))
-			.collect::<Vec<_>>();
+		let messages = do_cpu_intensive(|| {
+			resp.0
+				.into_par_iter()
+				.map(|message| ChatMessage::blocking_decrypt(message, chat.key.as_ref()))
+				.collect::<Vec<_>>()
+		})
+		.await;
 
 		Ok(messages)
 	}
 
-	fn decrypt_chat(
+	fn blocking_decrypt_chat(
 		&self,
 		encrypted: filen_types::api::v3::chat::conversations::ChatConversation<'_>,
-		outer_tmp_vec: &mut Vec<u8>,
 	) -> Chat {
-		let mut tmp_vec = std::mem::take(outer_tmp_vec);
+		let key = self.blocking_decrypt_chat_key(&encrypted).ok();
 
-		let key = self.decrypt_chat_key(&encrypted).ok();
+		let participants_closure = || {
+			let mut participants = encrypted
+				.participants
+				.into_iter()
+				.map(|p| ChatParticipant {
+					user_id: p.user_id,
+					email: p.email.into_owned(),
+					avatar: p.avatar.map(Cow::into_owned),
+					nick_name: p.nick_name.into_owned(),
+					permissions_add: p.permissions_add,
+					added: p.added_timestamp,
+					appear_offline: p.appear_offline,
+					// this is so that our own last_active is always 0
+					// this is because otherwise it is impossible to test
+					last_active: if p.user_id == self.user_id {
+						DateTime::<Utc>::default()
+					} else {
+						p.last_active
+					},
+				})
+				.collect::<Vec<_>>();
 
-		let (name, last_message) = key.as_ref().map_or((None, None), |k| {
-			let chat_name = encrypted
-				.name
-				.as_ref()
-				.and_then(|name| crypto::ChatName::try_decrypt(k, name, &mut tmp_vec).ok());
-			let last_message = encrypted
-				.last_message_full
-				.as_ref()
-				.map(|msg| ChatMessage::decrypt(msg.clone(), Some(k), &mut tmp_vec));
+			participants.sort_by_key(|p| p.added);
+			participants
+		};
 
-			(chat_name, last_message)
-		});
-
-		let mut participants = encrypted
-			.participants
-			.into_iter()
-			.map(|p| ChatParticipant {
-				user_id: p.user_id,
-				email: p.email.into_owned(),
-				avatar: p.avatar.map(Cow::into_owned),
-				nick_name: p.nick_name.into_owned(),
-				permissions_add: p.permissions_add,
-				added: p.added_timestamp,
-				appear_offline: p.appear_offline,
-				// this is so that our own last_active is always 0
-				// this is because otherwise it is impossible to test
-				last_active: if p.user_id == self.user_id {
-					DateTime::<Utc>::default()
-				} else {
-					p.last_active
-				},
-			})
-			.collect::<Vec<_>>();
-
-		participants.sort_by_key(|p| p.added);
+		let (name, last_message, participants) = match key.as_ref() {
+			Some(k) => {
+				blocking_join!(
+					|| {
+						encrypted
+							.name
+							.as_ref()
+							.and_then(|name| crypto::ChatName::blocking_try_decrypt(k, name).ok())
+					},
+					|| {
+						encrypted
+							.last_message_full
+							.map(|msg| ChatMessage::blocking_decrypt(msg, Some(k)))
+					},
+					participants_closure
+				)
+			}
+			None => (None, None, participants_closure()),
+		};
 
 		Chat {
 			uuid: encrypted.uuid,
@@ -427,12 +442,13 @@ impl Client {
 	pub async fn list_chats(&self) -> Result<Vec<Chat>, Error> {
 		let resp = api::v3::chat::conversations::get(self.client()).await?;
 
-		let tmp_vec = &mut Vec::new();
-		Ok(resp
-			.0
-			.into_iter()
-			.map(|chat| self.decrypt_chat(chat, tmp_vec))
-			.collect::<Vec<_>>())
+		Ok(do_cpu_intensive(|| {
+			resp.0
+				.into_par_iter()
+				.map(|chat| self.blocking_decrypt_chat(chat))
+				.collect::<Vec<_>>()
+		})
+		.await)
 	}
 
 	pub async fn get_chat(&self, uuid: UuidStr) -> Result<Option<Chat>, Error> {
@@ -446,14 +462,19 @@ impl Client {
 		chat_uuid: UuidStr,
 		contact: &Contact<'_>,
 	) -> Result<ChatParticipant, Error> {
-		let metadata = NoteOrChatKeyStruct::try_encrypt_rsa(&contact.public_key, key)?;
-		let _lock = self.lock_chats().await?;
+		let (metadata, _lock) = futures::join!(
+			do_cpu_intensive(|| NoteOrChatKeyStruct::blocking_try_encrypt_rsa(
+				&contact.public_key,
+				key
+			)),
+			self.lock_chats()
+		);
 		let resp = api::v3::chat::conversations::participants::add::post(
 			self.client(),
 			&api::v3::chat::conversations::participants::add::Request {
 				uuid: chat_uuid,
 				contact_uuid: contact.uuid,
-				metadata,
+				metadata: metadata?,
 			},
 		)
 		.await?;
@@ -474,15 +495,22 @@ impl Client {
 		let uuid = UuidStr::new_v4();
 		let key = NoteOrChatKey::generate();
 
-		let key_string = NoteOrChatKeyStruct::encrypt_symmetric(self.crypter(), &key);
-		let key_asymm_string = NoteOrChatKeyStruct::try_encrypt_rsa(self.public_key(), &key)?;
-		let _lock = self.lock_chats().await?;
+		let crypter = self.crypter();
+
+		let (key_string, key_asymm_string, _lock) = futures::join!(
+			do_cpu_intensive(|| NoteOrChatKeyStruct::blocking_encrypt_symmetric(&*crypter, &key)),
+			do_cpu_intensive(|| NoteOrChatKeyStruct::blocking_try_encrypt_rsa(
+				self.public_key(),
+				&key
+			)),
+			self.lock_chats()
+		);
 
 		let resp = api::v3::chat::conversations::create::post(
 			self.client(),
 			&api::v3::chat::conversations::create::Request {
 				uuid,
-				metadata: key_asymm_string.as_borrowed_cow(),
+				metadata: key_asymm_string?.as_borrowed_cow(),
 				owner_metadata: key_string.as_borrowed_cow(),
 			},
 		)
@@ -551,8 +579,12 @@ impl Client {
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
 			.context("rename_chat")?;
-		let encrypted_name = crypto::ChatName::encrypt(key, &new_name);
-		let _lock = self.lock_chats().await?;
+
+		let (encrypted_name, _lock) = futures::join!(
+			do_cpu_intensive(|| crypto::ChatName::blocking_encrypt(key, &new_name)),
+			self.lock_chats()
+		);
+		let _lock = _lock?;
 
 		api::v3::chat::conversations::name::edit::post(
 			self.client(),
@@ -591,7 +623,8 @@ impl Client {
 			.context("send_chat_message")?;
 		let uuid = UuidStr::new_v4();
 
-		let encrypted_message = crypto::ChatMessage::encrypt(key, &message);
+		let encrypted_message =
+			do_cpu_intensive(|| crypto::ChatMessage::blocking_encrypt(key, &message)).await;
 
 		let resp = api::v3::chat::send::post(
 			self.client(),
@@ -641,7 +674,8 @@ impl Client {
 			.ok_or(MetadataWasNotDecryptedError)
 			.context("edit_message")?;
 
-		let encrypted_message = crypto::ChatMessage::encrypt(key, &new_message);
+		let encrypted_message =
+			do_cpu_intensive(|| crypto::ChatMessage::blocking_encrypt(key, &new_message)).await;
 
 		let resp = api::v3::chat::edit::post(
 			self.client(),
@@ -853,6 +887,8 @@ impl Client {
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub mod js_impls {
+	use std::borrow::Cow;
+
 	use chrono::TimeZone;
 	use filen_types::{
 		api::v3::chat::typing::ChatTypingType, crypto::EncryptedString, fs::UuidStr,
@@ -868,11 +904,12 @@ pub mod js_impls {
 	/// Meant to be used in socket event handlers where this cannot currently be done automatically.
 	///
 	/// Should not be used outside of that context.
-	pub fn decrypt_meta_with_chat_key(
-		chat: &Chat,
-		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: EncryptedString,
+	pub async fn decrypt_meta_with_chat_key(
+		chat: Chat,
+		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: &str,
 	) -> Result<String, Error> {
-		chat.decrypt_string(encrypted)
+		chat.decrypt_string(&EncryptedString(Cow::Borrowed(encrypted)))
+			.await
 	}
 
 	#[wasm_bindgen]

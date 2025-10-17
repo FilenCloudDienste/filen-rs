@@ -9,6 +9,7 @@ use crate::{
 	auth::Client,
 	error::{Error, MetadataWasNotDecryptedError},
 	fs::file::{RemoteFile, traits::HasFileInfo},
+	runtime,
 };
 
 // MUST BE SORTED ALPHABETICALLY
@@ -48,28 +49,33 @@ impl Client {
 		}
 		let image_data = self.download_file(file).await?;
 
-		let image = if mime == "image/heic" || mime == "image/heif" {
-			#[cfg(feature = "heif-decoder")]
-			{
-				DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_slice(&image_data)?)
-			}
-			#[cfg(not(feature = "heif-decoder"))]
-			{
-				unreachable!(
-					"heif/heic support not enabled, should be handled by is_supported_thumbnail_mime"
-				)
-			}
-		} else {
-			let reader =
-				image::ImageReader::new(std::io::Cursor::new(&image_data)).with_guessed_format()?;
-			let mut decoder = reader.into_decoder()?;
-			let orientation = decoder.orientation()?;
-			let mut image = DynamicImage::from_decoder(decoder)?;
-			image.apply_orientation(orientation);
-			image
-		};
+		runtime::do_cpu_intensive(|| {
+			let image = if mime == "image/heic" || mime == "image/heif" {
+				#[cfg(feature = "heif-decoder")]
+				{
+					DynamicImage::ImageRgba8(heif_decoder::try_get_rgba_image_from_slice(
+						&image_data,
+					)?)
+				}
+				#[cfg(not(feature = "heif-decoder"))]
+				{
+					unreachable!(
+						"heif/heic support not enabled, should be handled by is_supported_thumbnail_mime"
+					)
+				}
+			} else {
+				let reader = image::ImageReader::new(std::io::Cursor::new(&image_data))
+					.with_guessed_format()?;
+				let mut decoder = reader.into_decoder()?;
+				let orientation = decoder.orientation()?;
+				let mut image = DynamicImage::from_decoder(decoder)?;
+				image.apply_orientation(orientation);
+				image
+			};
 
-		Ok(image.resize(max_width, max_height, FilterType::CatmullRom))
+			Ok(image.resize(max_width, max_height, FilterType::CatmullRom))
+		})
+		.await
 	}
 }
 
@@ -81,7 +87,13 @@ mod js_impls {
 	use tsify::Tsify;
 	use wasm_bindgen::prelude::wasm_bindgen;
 
-	use crate::{Error, auth::Client, fs::file::RemoteFile, js::File};
+	use crate::{
+		Error,
+		auth::Client,
+		fs::file::RemoteFile,
+		js::File,
+		runtime::{self},
+	};
 
 	#[derive(Deserialize, Tsify)]
 	#[serde(rename_all = "camelCase")]
@@ -124,13 +136,15 @@ mod js_impls {
 					return Ok(None);
 				}
 			};
-			// really wish I knew the exact size beforehand so we could preallocate
-			let mut image_data = Vec::new();
-			image.write_with_encoder(WebPEncoder::new_lossless(&mut image_data))?;
-
-			Ok(Some(MakeThumbnailInMemoryResult {
-				webp_data: ByteBuf::from(image_data),
-			}))
+			runtime::do_cpu_intensive(|| -> Result<Option<MakeThumbnailInMemoryResult>, Error> {
+				// really wish I knew the exact size beforehand so we could preallocate
+				let mut image_data = Vec::new();
+				image.write_with_encoder(WebPEncoder::new_lossless(&mut image_data))?;
+				Ok(Some(MakeThumbnailInMemoryResult {
+					webp_data: ByteBuf::from(image_data),
+				}))
+			})
+			.await
 		}
 	}
 }

@@ -44,6 +44,56 @@ where
 	}
 }
 
+impl<'a, T> CowHelpers for Vec<T>
+where
+	T: CowHelpers + 'a,
+{
+	type CowBorrowed<'borrow>
+		= Vec<T::CowBorrowed<'borrow>>
+	where
+		Self: 'borrow;
+
+	type CowStatic = Vec<T::CowStatic>;
+
+	#[inline]
+	fn as_borrowed_cow<'borrow>(&'borrow self) -> Self::CowBorrowed<'borrow>
+	where
+		Self: 'borrow,
+	{
+		self.iter().map(|item| item.as_borrowed_cow()).collect()
+	}
+
+	#[inline]
+	fn into_owned_cow(self) -> Self::CowStatic {
+		self.into_iter().map(|item| item.into_owned_cow()).collect()
+	}
+}
+
+impl<'a, T> CowHelpers for Option<T>
+where
+	T: CowHelpers + 'a,
+{
+	type CowBorrowed<'borrow>
+		= Option<T::CowBorrowed<'borrow>>
+	where
+		Self: 'borrow;
+
+	type CowStatic = Option<T::CowStatic>;
+
+	#[inline]
+	fn as_borrowed_cow<'borrow>(&'borrow self) -> Self::CowBorrowed<'borrow>
+	where
+		Self: 'borrow,
+	{
+		self.as_ref().map(|item| item.as_borrowed_cow())
+	}
+
+	#[inline]
+	fn into_owned_cow(self) -> Self::CowStatic {
+		self.map(|item| item.into_owned_cow())
+	}
+}
+
 #[macro_export]
 macro_rules! impl_cow_helpers_for_newtype {
 	($newtype:ident) => {

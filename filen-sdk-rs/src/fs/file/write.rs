@@ -20,6 +20,7 @@ use crate::{
 	},
 	error::Error,
 	fs::file::chunk::Chunk,
+	runtime::do_cpu_intensive,
 	sync::lock::ResourceLock,
 	util::{MaybeSendBoxFuture, MaybeSendCallback},
 };
@@ -92,7 +93,7 @@ impl<'a> FileWriterUploadingState<'a> {
 				len <= CHUNK_SIZE_U64,
 				"Chunk size exceeded {CHUNK_SIZE_U64}: {len}"
 			);
-			file.key().encrypt_data(out_data.as_mut())?;
+			file.key().blocking_encrypt_data(out_data.as_mut())?;
 
 			// upload the data
 			let (chunk_bytes, permit) = out_data.into_parts();
@@ -105,7 +106,14 @@ impl<'a> FileWriterUploadingState<'a> {
 				chunk_idx,
 				chunk_bytes.clone(),
 			)
-			.await?;
+			.await
+			.map_err(|e| {
+				log::error!(
+					"releasing chunk due to upload error: {e}, permit_size: {}",
+					permit.num_permits()
+				);
+				e
+			})?;
 			if let Some(callback) = callback {
 				callback(len);
 			}
@@ -288,44 +296,105 @@ struct FileWriterWaitingForDriveLockState<'a> {
 }
 
 impl<'a> FileWriterWaitingForDriveLockState<'a> {
+	// fn into_completing_state(
+	// 	self,
+	// 	drive_lock: Arc<ResourceLock>,
+	// ) -> Result<FileWriterCompletingState<'a>, Error> {
+	// 	let file = self.file.clone();
+	// 	let crypter = self.client.crypter();
+	// 	let empty_request = filen_types::api::v3::upload::empty::Request {
+	// 		uuid: file.uuid(),
+	// 		name: crypter.blocking_encrypt_meta(file.name()),
+	// 		name_hashed: Cow::Owned(self.client.hash_name(file.name())),
+	// 		size: crypter.blocking_encrypt_meta(&self.written.to_string()),
+	// 		parent: file.parent,
+	// 		mime: crypter.blocking_encrypt_meta(self.file.as_ref().mime()),
+	// 		metadata: crypter.blocking_encrypt_meta(&serde_json::to_string(&DecryptedFileMeta {
+	// 			name: Cow::Borrowed(file.name()),
+	// 			size: self.written,
+	// 			mime: Cow::Borrowed(file.mime()),
+	// 			key: Cow::Borrowed(file.key()),
+	// 			created: Some(file.created()),
+	// 			last_modified: file.last_modified(),
+	// 			hash: Some(self.hash),
+	// 		})?),
+	// 		version: self.client.file_encryption_version(),
+	// 	};
+
+	// 	let future: MaybeSendBoxFuture<
+	// 		'a,
+	// 		Result<filen_types::api::v3::upload::empty::Response, Error>,
+	// 	> = if self.written == 0 {
+	// 		Box::pin(async move {
+	// 			api::v3::upload::empty::post(self.client.client(), &empty_request).await
+	// 		})
+	// 	} else {
+	// 		let upload_key = self.upload_key.clone();
+	// 		Box::pin(async move {
+	// 			let rm = Cow::Owned(crypto::shared::generate_random_base64_values(
+	// 				32,
+	// 				&mut rand::rng(),
+	// 			));
+	// 			api::v3::upload::done::post(
+	// 				self.client.client(),
+	// 				&api::v3::upload::done::Request {
+	// 					empty_request,
+	// 					chunks: self.num_chunks,
+	// 					rm,
+	// 					upload_key: Cow::Borrowed(&upload_key),
+	// 				},
+	// 			)
+	// 			.await
+	// 		})
+	// 	};
+
+	// 	Ok(FileWriterCompletingState {
+	// 		file: self.file.clone(),
+	// 		future,
+	// 		hash: self.hash,
+	// 		remote_file_info: self.remote_file_info,
+	// 		client: self.client,
+	// 		drive_lock,
+	// 	})
+	// }
+
 	fn into_completing_state(
 		self,
 		drive_lock: Arc<ResourceLock>,
 	) -> Result<FileWriterCompletingState<'a>, Error> {
 		let file = self.file.clone();
-		let empty_request = filen_types::api::v3::upload::empty::Request {
-			uuid: file.uuid(),
-			name: self.client.crypter().encrypt_meta(file.name()),
-			name_hashed: Cow::Owned(self.client.hash_name(file.name())),
-			size: self
-				.client
-				.crypter()
-				.encrypt_meta(&self.written.to_string()),
-			parent: file.parent,
-			mime: self
-				.client
-				.crypter()
-				.encrypt_meta(self.file.as_ref().mime()),
-			metadata: self.client.crypter().encrypt_meta(&serde_json::to_string(
-				&DecryptedFileMeta {
-					name: Cow::Borrowed(file.name()),
-					size: self.written,
-					mime: Cow::Borrowed(file.mime()),
-					key: Cow::Borrowed(file.key()),
-					created: Some(file.created()),
-					last_modified: file.last_modified(),
-					hash: Some(self.hash),
-				},
-			)?),
-			version: self.client.file_encryption_version(),
-		};
+		let crypter = self.client.crypter();
+
+		let empty_request_future = do_cpu_intensive(move || {
+			Ok::<_, Error>(filen_types::api::v3::upload::empty::Request {
+				uuid: file.uuid(),
+				name: crypter.blocking_encrypt_meta(file.name()),
+				name_hashed: Cow::Owned(self.client.hash_name(file.name())),
+				size: crypter.blocking_encrypt_meta(&self.written.to_string()),
+				parent: file.parent,
+				mime: crypter.blocking_encrypt_meta(file.as_ref().mime()),
+				metadata: crypter.blocking_encrypt_meta(&serde_json::to_string(
+					&DecryptedFileMeta {
+						name: Cow::Borrowed(file.name()),
+						size: self.written,
+						mime: Cow::Borrowed(file.mime()),
+						key: Cow::Borrowed(file.key()),
+						created: Some(file.created()),
+						last_modified: file.last_modified(),
+						hash: Some(self.hash),
+					},
+				)?),
+				version: self.client.file_encryption_version(),
+			})
+		});
 
 		let future: MaybeSendBoxFuture<
 			'a,
 			Result<filen_types::api::v3::upload::empty::Response, Error>,
 		> = if self.written == 0 {
 			Box::pin(async move {
-				api::v3::upload::empty::post(self.client.client(), &empty_request).await
+				api::v3::upload::empty::post(self.client.client(), &empty_request_future.await?)
+					.await
 			})
 		} else {
 			let upload_key = self.upload_key.clone();
@@ -337,7 +406,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 				api::v3::upload::done::post(
 					self.client.client(),
 					&api::v3::upload::done::Request {
-						empty_request,
+						empty_request: empty_request_future.await?,
 						chunks: self.num_chunks,
 						rm,
 						upload_key: Cow::Borrowed(&upload_key),
@@ -348,7 +417,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		};
 
 		Ok(FileWriterCompletingState {
-			file: self.file.clone(),
+			file: self.file,
 			future,
 			hash: self.hash,
 			remote_file_info: self.remote_file_info,
@@ -556,6 +625,7 @@ impl AsyncWrite for FileWriter<'_> {
 		cx: &mut std::task::Context<'_>,
 		buf: &[u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
+		log::info!("FileWriter poll_write called with {} bytes", buf.len());
 		match &mut self.state {
 			FileWriterState::Uploading(uploading) => uploading.poll_write(cx, buf),
 			FileWriterState::WaitingForDriveLock(_)

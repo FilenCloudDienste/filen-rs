@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref};
+use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -87,7 +87,7 @@ impl SharedDirectory {
 		}
 	}
 
-	pub fn from_shared_in(
+	pub fn blocking_from_shared_in(
 		shared_dir: SharedDirIn<'_>,
 		private_key: &RsaPrivateKey,
 	) -> Result<Self, Error> {
@@ -101,8 +101,11 @@ impl SharedDirectory {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
 				color: shared_dir.color.into_owned(),
-				metadata: DirectoryMeta::from_rsa_encrypted(shared_dir.metadata, private_key)
-					.into_owned(),
+				metadata: DirectoryMeta::blocking_from_rsa_encrypted(
+					shared_dir.metadata,
+					private_key,
+				)
+				.into_owned(),
 				timestamp: shared_dir.timestamp,
 				write_access: shared_dir.write_access,
 			},
@@ -110,13 +113,10 @@ impl SharedDirectory {
 		))
 	}
 
-	pub fn from_shared_out<MC>(
+	pub fn blocking_from_shared_out(
 		shared_dir: SharedDirOut<'_>,
-		crypter: impl Deref<Target = MC>,
-	) -> Result<Self, Error>
-	where
-		MC: MetaCrypter,
-	{
+		crypter: &impl MetaCrypter,
+	) -> Result<Self, Error> {
 		let sharing_role = SharingRole::Receiver(ShareInfo {
 			email: shared_dir.receiver_email.into_owned(),
 			id: shared_dir.receiver_id,
@@ -126,7 +126,8 @@ impl SharedDirectory {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
 				color: shared_dir.color.into_owned(),
-				metadata: DirectoryMeta::from_encrypted(shared_dir.metadata, crypter).into_owned(),
+				metadata: DirectoryMeta::blocking_from_encrypted(shared_dir.metadata, crypter)
+					.into_owned(),
 				timestamp: shared_dir.timestamp,
 				write_access: shared_dir.write_access,
 			},
@@ -152,12 +153,15 @@ pub struct SharedFile {
 }
 
 impl SharedFile {
-	pub fn from_shared_in(
+	pub fn blocking_from_shared_in(
 		shared_file: SharedFileIn<'_>,
 		private_key: &RsaPrivateKey,
 	) -> Result<Self, Error> {
-		let meta =
-			FileMeta::from_rsa_encrypted(shared_file.metadata, private_key, shared_file.version);
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			shared_file.metadata,
+			private_key,
+			shared_file.version,
+		);
 
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
@@ -180,14 +184,12 @@ impl SharedFile {
 		})
 	}
 
-	pub fn from_shared_out<MC>(
+	pub fn blocking_from_shared_out(
 		shared_file: SharedFileOut<'_>,
-		crypter: impl Deref<Target = MC>,
-	) -> Result<Self, Error>
-	where
-		MC: MetaCrypter,
-	{
-		let meta = FileMeta::from_encrypted(shared_file.metadata, crypter, shared_file.version);
+		crypter: &impl MetaCrypter,
+	) -> Result<Self, Error> {
+		let meta =
+			FileMeta::blocking_from_encrypted(shared_file.metadata, crypter, shared_file.version);
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
 			shared_file.size,

@@ -90,6 +90,11 @@ mod shared {
 mod tests {
 	use std::str::FromStr;
 
+	use chrono::{DateTime, Utc};
+	use filen_types::{
+		auth::FileEncryptionVersion,
+		fs::{ParentUuid, UuidStr},
+	};
 	use wasm_bindgen_test::wasm_bindgen_test;
 
 	use super::*;
@@ -110,7 +115,7 @@ mod tests {
 		let dir = Dir {
 			uuid: UuidStr::default(),
 			parent: ParentUuid::default(),
-			color: Some("blue".to_string()),
+			color: DirColor::Blue,
 			timestamp: Utc::now(),
 			favorited: true,
 			meta: DirMeta::Decoded(DecryptedDirMeta {
@@ -151,8 +156,8 @@ mod tests {
 		let dir = Dir {
 			uuid: UuidStr::from_str("413c5087-cef2-468a-a7b0-3e4f597fffd3").unwrap(),
 			parent: ParentUuid::from_str("32514e81-2753-4741-aac9-7da2400900c3").unwrap(),
-			color: None,
-			timestamp: Utc::from_timestamp_millis(1755781567998).unwrap(),
+			color: DirColor::Default,
+			timestamp: DateTime::from_timestamp_millis(1755781567998).unwrap(),
 			favorited: false,
 			meta: DirMeta::Decoded(DecryptedDirMeta {
 				name: "wasm-test-dir".to_string(),
@@ -184,7 +189,7 @@ mod tests {
 		let mut dir = Dir {
 			uuid: UuidStr::default(),
 			parent: ParentUuid::default(),
-			color: Some("blue".to_string()),
+			color: DirColor::Blue,
 			timestamp: Utc::now(),
 			favorited: true,
 			meta: DirMeta::Decoded(DecryptedDirMeta {
@@ -209,7 +214,7 @@ mod tests {
 		let deserialized_dir: Dir = serde_path_to_error::deserialize(deserializer).unwrap();
 		assert_eq!(deserialized_dir, dir);
 
-		dir.meta = DirMeta::Encrypted(EncryptedString("encrypted_data".to_string()));
+		dir.meta = DirMeta::Encrypted("encrypted_data".to_string());
 		let js_value = JsValue::from(dir.clone());
 		let deserializer = serde_wasm_bindgen::Deserializer::from(js_value);
 		let deserialized_dir: Dir = serde_path_to_error::deserialize(deserializer).unwrap();

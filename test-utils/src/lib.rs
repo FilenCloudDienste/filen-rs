@@ -1,10 +1,17 @@
+// #![feature(async_drop)]
+
 use std::{
 	env,
+	// future::AsyncDrop,
 	sync::{Arc, OnceLock},
 };
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
-use filen_sdk_rs::{auth::Client, fs::dir::RemoteDirectory, sync::lock::ResourceLock};
+use filen_sdk_rs::{
+	auth::Client,
+	fs::{HasName, dir::RemoteDirectory},
+	sync::lock::ResourceLock,
+};
 
 use tokio::sync::OnceCell;
 
@@ -32,8 +39,15 @@ impl Drop for TestResources {
 	}
 }
 
+// impl AsyncDrop for TestResources {
+// 	async fn drop(self: std::pin::Pin<&mut Self>) {
+// 		Self::cleanup(self.client.clone(), self.dir.clone()).await;
+// 	}
+// }
+
 impl TestResources {
 	async fn cleanup(client: Arc<Client>, dir: RemoteDirectory) {
+		println!("Cleaning up test directory: {:?}", dir.name());
 		match client.delete_dir_permanently(dir).await {
 			Ok(_) => {}
 			Err(e) => eprintln!("Failed to clean up test directory: {e}"),

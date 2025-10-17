@@ -40,7 +40,7 @@ pub(super) async fn login(
 		"Missing master keys in v1 login response",
 	))?;
 
-	let master_keys = crypto::v2::MasterKeys::new(master_keys_str, master_key)?;
+	let master_keys = crypto::v2::MasterKeys::new(master_keys_str, master_key).await?;
 
 	Ok((
 		auth_client,

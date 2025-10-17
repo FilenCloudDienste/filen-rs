@@ -104,11 +104,13 @@ impl<'a> FileReader<'a> {
 		let client = self.client;
 		let file = self.file;
 		self.futures.push_back(Box::pin(async move {
+			log::debug!("Fetching chunk {chunk_idx} for file {}", file.uuid());
 			api::download::download_file_chunk(client.client(), file, chunk_idx, out_data.as_mut())
 				.await?;
 			file.key()
 				.ok_or(MetadataWasNotDecryptedError)?
-				.decrypt_data(out_data.as_mut())?;
+				.decrypt_data(out_data.as_mut())
+				.await?;
 
 			Ok(if first_chunk {
 				let mut cursor = Cursor::new(out_data);
@@ -157,16 +159,20 @@ impl futures::io::AsyncRead for FileReader<'_> {
 		cx: &mut std::task::Context<'_>,
 		buf: &mut [u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
+		log::debug!("FileReader poll_read {} bytes", buf.len());
 		// first see if our allocation future is ready
 		let mut should_pend = false;
 		if let Some(mut fut) = self.allocate_chunk_future.take() {
+			log::debug!("FileReader polling allocate_chunk_future");
 			match fut.as_mut().poll(cx) {
 				std::task::Poll::Ready(chunk) => {
+					log::debug!("FileReader allocate_chunk_future ready");
 					// we have a new chunk, set it to curr_chunk
 					self.push_fetch_next_chunk(chunk);
 					self.allocate_chunk_future = self.allocate_next_chunk();
 				}
 				std::task::Poll::Pending => {
+					log::debug!("FileReader allocate_chunk_future pending");
 					// allocation is still pending, we can't read anything yet
 					if self.next_chunk_size().is_some() {
 						// we have more chunks to allocate, so we put the future back
@@ -206,6 +212,7 @@ impl futures::io::AsyncRead for FileReader<'_> {
 						// we need to pend
 						return std::task::Poll::Pending;
 					}
+					log::info!("FileReader reached EOF {read} bytes read");
 					return std::task::Poll::Ready(Ok(read));
 				}
 				std::task::Poll::Pending => {

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref};
+use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
@@ -102,15 +102,12 @@ macro_rules! get_value_from_decrypted_optional {
 }
 
 impl FileMeta<'static> {
-	pub fn from_encrypted<MC>(
+	pub fn blocking_from_encrypted(
 		meta: EncryptedString<'_>,
-		decrypter: impl Deref<Target = MC>,
+		decrypter: &impl MetaCrypter,
 		file_encryption_version: FileEncryptionVersion,
-	) -> Self
-	where
-		MC: MetaCrypter,
-	{
-		let Ok(decrypted) = decrypter.deref().decrypt_meta(&meta) else {
+	) -> Self {
+		let Ok(decrypted) = decrypter.blocking_decrypt_meta(&meta) else {
 			return Self::Encrypted(meta.into_owned_cow());
 		};
 		let seed = FileMetaSeed(file_encryption_version);
@@ -120,12 +117,13 @@ impl FileMeta<'static> {
 		Self::Decoded(meta.into_owned())
 	}
 
-	pub fn from_rsa_encrypted(
+	pub fn blocking_from_rsa_encrypted(
 		meta: RSAEncryptedString<'_>,
 		private_key: &RsaPrivateKey,
 		file_encryption_version: FileEncryptionVersion,
 	) -> Self {
-		let Ok(decrypted) = crypto::rsa::decrypt_with_private_key(private_key, &meta) else {
+		let Ok(decrypted) = crypto::rsa::blocking_decrypt_with_private_key(private_key, &meta)
+		else {
 			return Self::RSAEncrypted(meta.into_owned_cow());
 		};
 		let seed = FileMetaSeed(file_encryption_version);

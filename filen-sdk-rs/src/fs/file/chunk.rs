@@ -50,6 +50,14 @@ impl<'a> Chunk<'a> {
 	}
 
 	pub async fn acquire(chunk_size: NonZeroU32, client: &'a Client) -> Chunk<'a> {
+		log::debug!(
+			"acquire: Waiting to acquire chunk with {} permits",
+			chunk_size
+		);
+		log::debug!(
+			"Current available permits: {}",
+			client.memory_semaphore.available_permits()
+		);
 		let permits = client
 			.memory_semaphore
 			.acquire_many(chunk_size.get())

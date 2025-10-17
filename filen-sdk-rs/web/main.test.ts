@@ -9,7 +9,8 @@ import init, {
 	FilenSDKError,
 	EventListenerHandle,
 	type SocketEvent,
-	decryptMetaWithChatKey
+	decryptMetaWithChatKey,
+	test_async_drop
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
@@ -20,8 +21,9 @@ console.log("Initializing WASM...")
 await init()
 console.log("WASM initialized", navigator.hardwareConcurrency)
 const now = Date.now()
-await initThreadPool(navigator.hardwareConcurrency || 4)
-console.log(`WASM initialized ${navigator.hardwareConcurrency || 4} in ${Date.now() - now}ms`)
+const threads = Math.max((navigator.hardwareConcurrency || 5) - 1, 1)
+await initThreadPool(threads)
+console.log(`WASM initialized ${threads} in ${Date.now() - now}ms`)
 
 let state: Client
 let shareClient: Client
@@ -54,7 +56,9 @@ beforeAll(async () => {
 			if (!env.VITE_TEST_PASSWORD) {
 				throw new Error("VITE_TEST_PASSWORD environment variable is not set")
 			}
+			console.log("Logging in for tests...")
 			state = await login(env.VITE_TEST_EMAIL, env.VITE_TEST_PASSWORD)
+			console.log("Logged in for tests")
 
 			listenerHandles.push(
 				await state.addSocketListener(null, event => {
@@ -64,7 +68,7 @@ beforeAll(async () => {
 					allEvents.push(event)
 				})
 			)
-
+			console.log("Socket listener added")
 			const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
 			if (maybeDir) {
 				if (maybeDir.type === "dir") {
@@ -82,7 +86,9 @@ beforeAll(async () => {
 			if (!env.VITE_TEST_SHARE_PASSWORD) {
 				throw new Error("VITE_TEST_SHARE_PASSWORD environment variable is not set")
 			}
+			console.log("Logging in for shares...")
 			shareClient = await login(env.VITE_TEST_SHARE_EMAIL, env.VITE_TEST_SHARE_PASSWORD)
+			console.log("Logged in for shares")
 		})()
 	])
 }, 120000)
@@ -681,9 +687,9 @@ test("chats", async () => {
 		...rest,
 		replyTo: rest.replyTo && {
 			...rest.replyTo,
-			message: JSON.parse(decryptMetaWithChatKey(chat, rest.replyTo.message)).message
+			message: JSON.parse(await decryptMetaWithChatKey(chat, rest.replyTo.message)).message
 		},
-		message: JSON.parse(decryptMetaWithChatKey(chat, rest.message)).message,
+		message: JSON.parse(await decryptMetaWithChatKey(chat, rest.message)).message,
 		chat: conversation,
 		edited: false,
 		editedTimestamp: 0n
@@ -735,7 +741,7 @@ test("authError", async () => {
 	}
 })
 
-test.only("sockets", async () => {
+test("sockets", async () => {
 	expect(state.isSocketConnected()).toBe(true)
 	for (const handle of listenerHandles) {
 		handle.free()

@@ -87,18 +87,19 @@ impl FileKey {
 }
 
 impl DataCrypter for FileKey {
-	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		match self {
-			FileKey::V1(key) => key.encrypt_data(data),
-			FileKey::V2(key) => key.encrypt_data(data),
-			FileKey::V3(key) => key.encrypt_data(data),
+			FileKey::V1(key) => key.blocking_encrypt_data(data),
+			FileKey::V2(key) => key.blocking_encrypt_data(data),
+			FileKey::V3(key) => key.blocking_encrypt_data(data),
 		}
 	}
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+
+	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		match self {
-			FileKey::V1(key) => key.decrypt_data(data),
-			FileKey::V2(key) => key.decrypt_data(data),
-			FileKey::V3(key) => key.decrypt_data(data),
+			FileKey::V1(key) => key.blocking_decrypt_data(data),
+			FileKey::V2(key) => key.blocking_decrypt_data(data),
+			FileKey::V3(key) => key.blocking_decrypt_data(data),
 		}
 	}
 }

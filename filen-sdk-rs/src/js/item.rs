@@ -16,7 +16,6 @@ use crate::{
 	tsify(from_wasm_abi)
 )]
 #[serde(untagged)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub enum Item {
 	File(File),
 	RootFile(RootFile),

@@ -39,7 +39,6 @@ use crate::{
 	error::Error,
 	fs::{HasUUID, dir::RootDirectory},
 	sync::lock::ResourceLock,
-	util::MaybeArc,
 };
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -58,21 +57,21 @@ pub(crate) enum MetaKey {
 }
 
 impl MetaCrypter for MetaKey {
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		match self {
-			MetaKey::V1(info) | MetaKey::V2(info) => info.decrypt_meta_into(meta, out),
-			MetaKey::V3(info) => info.decrypt_meta_into(meta, out),
+			MetaKey::V1(info) | MetaKey::V2(info) => info.blocking_decrypt_meta_into(meta, out),
+			MetaKey::V3(info) => info.blocking_decrypt_meta_into(meta, out),
 		}
 	}
 
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
+	fn blocking_encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
 		match self {
-			MetaKey::V1(info) | MetaKey::V2(info) => info.encrypt_meta_into(meta, out),
-			MetaKey::V3(info) => info.encrypt_meta_into(meta, out),
+			MetaKey::V1(info) | MetaKey::V2(info) => info.blocking_encrypt_meta_into(meta, out),
+			MetaKey::V3(info) => info.blocking_encrypt_meta_into(meta, out),
 		}
 	}
 }
@@ -121,21 +120,21 @@ impl AuthInfo {
 }
 
 impl MetaCrypter for AuthInfo {
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		match self {
-			AuthInfo::V1(info) | AuthInfo::V2(info) => info.decrypt_meta_into(meta, out),
-			AuthInfo::V3(info) => info.decrypt_meta_into(meta, out),
+			AuthInfo::V1(info) | AuthInfo::V2(info) => info.blocking_decrypt_meta_into(meta, out),
+			AuthInfo::V3(info) => info.blocking_decrypt_meta_into(meta, out),
 		}
 	}
 
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
+	fn blocking_encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
 		match self {
-			AuthInfo::V1(info) | AuthInfo::V2(info) => info.encrypt_meta_into(meta, out),
-			AuthInfo::V3(info) => info.encrypt_meta_into(meta, out),
+			AuthInfo::V1(info) | AuthInfo::V2(info) => info.blocking_encrypt_meta_into(meta, out),
+			AuthInfo::V3(info) => info.blocking_encrypt_meta_into(meta, out),
 		}
 	}
 }
@@ -233,7 +232,7 @@ pub struct Client {
 
 	root_dir: RootDirectory,
 
-	auth_info: std::sync::RwLock<MaybeArc<AuthInfo>>,
+	auth_info: std::sync::RwLock<Arc<AuthInfo>>,
 	file_encryption_version: FileEncryptionVersion,
 	meta_encryption_version: MetaEncryptionVersion,
 
@@ -344,7 +343,7 @@ impl Client {
 			email: stringified.email,
 			user_id: stringified.user_id,
 			root_dir: RootDirectory::new(UuidStr::from_str(&stringified.root_uuid)?),
-			auth_info: std::sync::RwLock::new(MaybeArc::new(auth_info)),
+			auth_info: std::sync::RwLock::new(Arc::new(auth_info)),
 			file_encryption_version,
 			meta_encryption_version,
 			public_key: RsaPublicKey::from(&private_key),
@@ -385,7 +384,7 @@ impl Client {
 		self.http_client.clone()
 	}
 
-	pub fn crypter(&self) -> MaybeArc<impl MetaCrypter> {
+	pub fn crypter(&self) -> Arc<impl MetaCrypter> {
 		self.auth_info
 			.read()
 			.unwrap_or_else(|e| e.into_inner())
@@ -485,21 +484,21 @@ impl Client {
 		}
 	}
 
-	pub(crate) fn decrypt_meta_key(
+	pub(crate) async fn decrypt_meta_key(
 		&self,
-		key_str: &EncryptedMetaKey,
+		key_str: &EncryptedMetaKey<'_>,
 	) -> Result<MetaKey, ConversionError> {
-		let decrypted_str = self.crypter().decrypt_meta(&key_str.0)?;
+		let decrypted_str = self.crypter().decrypt_meta(&key_str.0).await?;
 		self.get_meta_key_from_str(&decrypted_str)
 	}
 
-	pub(crate) fn encrypt_meta_key(&self, key: &MetaKey) -> EncryptedMetaKey<'static> {
+	pub(crate) async fn encrypt_meta_key(&self, key: &MetaKey) -> EncryptedMetaKey<'static> {
 		EncryptedMetaKey(match key {
 			MetaKey::V1(_) => {
 				unimplemented!("V1 encryption is not supported in this version of the SDK")
 			}
-			MetaKey::V2(key) => self.crypter().encrypt_meta(key.as_ref()),
-			MetaKey::V3(key) => self.crypter().encrypt_meta(&key.to_string()),
+			MetaKey::V2(key) => self.crypter().encrypt_meta(key.as_ref()).await,
+			MetaKey::V3(key) => self.crypter().encrypt_meta(&key.to_string()).await,
 		})
 	}
 
@@ -541,7 +540,7 @@ impl Client {
 
 						let new_public_key = new_private_key.to_public_key();
 						let encrypted_private_key =
-							crypto::rsa::encrypt_private_key(&new_private_key, &auth_info)?;
+							crypto::rsa::encrypt_private_key(&new_private_key, &auth_info).await?;
 
 						api::v3::user::key_pair::set::post(
 							&client,
@@ -558,7 +557,7 @@ impl Client {
 		};
 
 		let (private_key, public_key, hmac) =
-			crypto::rsa::get_key_pair(public_key, &private_key, &auth_info)?;
+			crypto::rsa::get_key_pair(public_key, &private_key, &auth_info).await?;
 		let base_folder_uuid = api::v3::user::base_folder::get(&client).await?.uuid;
 		let root_dir = RootDirectory::new(base_folder_uuid);
 
@@ -577,7 +576,7 @@ impl Client {
 			email,
 			user_id: user_info.id,
 			root_dir,
-			auth_info: std::sync::RwLock::new(MaybeArc::new(auth_info)),
+			auth_info: std::sync::RwLock::new(Arc::new(auth_info)),
 			file_encryption_version,
 			meta_encryption_version,
 			public_key,
@@ -723,9 +722,9 @@ impl Client {
 
 		master_keys.0.insert(0, new_master_key);
 		let private_key_encrypted =
-			crypto::rsa::encrypt_private_key(&self.private_key, &master_keys)?;
+			crypto::rsa::encrypt_private_key(&self.private_key, &master_keys).await?;
 
-		let encrypted = master_keys.to_encrypted();
+		let encrypted = master_keys.to_encrypted().await;
 
 		let resp = api::v3::user::settings::password::change::post(
 			self.client(),
@@ -751,7 +750,7 @@ impl Client {
 		.await?;
 
 		let mut write_lock = self.auth_info.write().unwrap_or_else(|e| e.into_inner());
-		*write_lock = MaybeArc::new(AuthInfo::V2(v2::AuthInfo { master_keys }));
+		*write_lock = Arc::new(AuthInfo::V2(v2::AuthInfo { master_keys }));
 		self.auth_info.clear_poison();
 		std::mem::drop(write_lock);
 
@@ -798,7 +797,7 @@ impl Client {
 			master_keys.0.extend(old_keys_vec.into_iter());
 		}
 
-		let encrypted = master_keys.to_encrypted();
+		let encrypted = master_keys.to_encrypted().await;
 
 		api::v3::user::password::forgot::reset::post(
 			&client,

@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#![allow(incomplete_features)]
+// #![feature(async_drop)]
 
 pub(crate) mod api;
 pub mod auth;

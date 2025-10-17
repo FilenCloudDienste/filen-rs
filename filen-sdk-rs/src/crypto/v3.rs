@@ -95,7 +95,7 @@ impl PartialEq for EncryptionKey {
 impl Eq for EncryptionKey {}
 
 impl MetaCrypter for EncryptionKey {
-	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
+	fn blocking_encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
 		let nonce: [u8; NONCE_SIZE] = rand::random();
 		let nonce = Nonce::from_slice(&nonce);
 		out.clear();
@@ -126,9 +126,9 @@ impl MetaCrypter for EncryptionKey {
 		EncryptedString(Cow::Owned(out))
 	}
 
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		mut out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		let meta = &meta.0;
@@ -166,11 +166,11 @@ impl MetaCrypter for EncryptionKey {
 }
 
 impl DataCrypter for EncryptionKey {
-	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		super::shared::encrypt_data(&self.cipher, data)
 	}
 
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		super::shared::decrypt_data(&self.cipher, data)
 	}
 }
