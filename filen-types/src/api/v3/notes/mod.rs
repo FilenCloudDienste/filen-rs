@@ -1,11 +1,13 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
+use filen_macros::CowHelpers;
 use serde::{Deserialize, Serialize};
 
 use crate::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::UuidStr,
+	traits::CowHelpers,
 };
 
 pub mod archive;
@@ -51,7 +53,7 @@ pub struct NoteTag<'a> {
 	pub created_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteParticipant<'a> {
 	pub user_id: u64,

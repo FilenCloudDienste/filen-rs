@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use filen_macros::CowHelpers;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -14,6 +15,7 @@ use crate::{
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
 	fs::{ObjectType, UuidStr},
+	traits::CowHelpers,
 };
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +76,7 @@ impl TryFrom<u8> for MessageType {
 	}
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct HandShake<'a> {
 	pub sid: Cow<'a, str>,
@@ -83,7 +85,7 @@ pub struct HandShake<'a> {
 	pub ping_timeout: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(tag = "type", content = "data", rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -219,7 +221,7 @@ impl SocketEvent<'_> {
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_SOCKET_EVENT_TYPE: &str = r#"export type SocketEventType = SocketEvent["type"]"#;
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -241,7 +243,7 @@ pub struct NewEvent<'a> {
 	pub info: Cow<'a, str>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -254,7 +256,7 @@ pub struct FileRename<'a> {
 	pub metadata: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -285,7 +287,7 @@ pub struct FileArchiveRestored<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -315,7 +317,7 @@ pub struct FileNew<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -345,7 +347,7 @@ pub struct FileRestore<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -375,7 +377,7 @@ pub struct FileMove<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -386,7 +388,7 @@ pub struct FileTrash {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -397,7 +399,7 @@ pub struct FileArchived {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -410,7 +412,7 @@ pub struct FolderRename<'a> {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -422,7 +424,7 @@ pub struct FolderTrash {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -444,7 +446,7 @@ pub struct FolderMove<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -466,7 +468,7 @@ pub struct FolderSubCreated<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -488,7 +490,7 @@ pub struct FolderRestore<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -501,7 +503,7 @@ pub struct FolderColorChanged<'a> {
 	pub color: DirColor<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -539,7 +541,7 @@ impl<'a> From<ChatMessageNew<'a>> for ChatMessageEncrypted<'a> {
 	}
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -566,7 +568,7 @@ pub struct ChatTyping<'a> {
 	pub typing_type: ChatTypingType,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -585,7 +587,7 @@ pub struct ChatConversationsNew<'a> {
 	pub added_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -596,7 +598,7 @@ pub struct ChatMessageDelete {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -617,7 +619,7 @@ pub struct NoteContentEdited<'a> {
 	pub edited_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -628,7 +630,7 @@ pub struct NoteArchived {
 	pub note: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -639,7 +641,7 @@ pub struct NoteDeleted {
 	pub note: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -652,7 +654,7 @@ pub struct NoteTitleEdited<'a> {
 	pub title: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -665,7 +667,7 @@ pub struct NoteParticipantPermissions {
 	pub permissions_write: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -676,7 +678,7 @@ pub struct NoteRestored {
 	pub note: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -688,7 +690,7 @@ pub struct NoteParticipantRemoved {
 	pub user_id: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -701,7 +703,7 @@ pub struct NoteParticipantNew<'a> {
 	pub participant: NoteParticipant<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -712,7 +714,7 @@ pub struct NoteNew {
 	pub note: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -723,7 +725,7 @@ pub struct ChatMessageEmbedDisabled {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -735,7 +737,7 @@ pub struct ChatConversationParticipantLeft {
 	pub user_id: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -746,7 +748,7 @@ pub struct ChatConversationDeleted {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -767,7 +769,7 @@ pub struct ChatMessageEdited<'a> {
 	pub edited_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -780,7 +782,7 @@ pub struct ChatConversationNameEdited<'a> {
 	pub name: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -804,7 +806,7 @@ pub struct ContactRequestReceived<'a> {
 	pub sent_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -821,7 +823,7 @@ pub struct ItemFavorite<'a> {
 	pub metadata: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -849,7 +851,7 @@ pub struct ChatConversationParticipantNew<'a> {
 	pub added_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -860,7 +862,7 @@ pub struct FileDeletedPermanent {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -873,7 +875,7 @@ pub struct FolderMetadataChanged<'a> {
 	pub name: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -890,7 +892,7 @@ pub struct FileMetadataChanged<'a> {
 	pub old_metadata: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),

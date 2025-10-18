@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 
+use filen_macros::CowHelpers;
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::{fs::UuidStr, traits::CowHelpers};
 
 pub const ENDPOINT: &str = "v3/dir/color";
 
@@ -12,7 +13,7 @@ pub struct Request<'a> {
 	pub color: DirColor<'a>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub enum DirColor<'a> {
 	#[default]
