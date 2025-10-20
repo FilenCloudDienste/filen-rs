@@ -137,6 +137,7 @@ impl UI {
 	/// User-friendly failures created with `UI::failure` will be printed as-is,
 	/// other errors will be printed with a generic message and a link to report bugs.
 	pub(crate) fn print_failure_or_error(&self, err: &anyhow::Error) {
+		error!("{:#}", err);
 		let err_msg = format!("{}", err);
 		let is_failure = err_msg.starts_with(&format!("{}", style("✘").red()));
 		if is_failure {
