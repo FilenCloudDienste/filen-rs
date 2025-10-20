@@ -291,7 +291,7 @@ impl JsClient {
 					.unwrap_or(max_cache_size),
 				max_cache_size,
 			);
-			let mut buffer = Vec::with_capacity(cache_size);
+			let mut buffer = vec![0u8; cache_size];
 			loop {
 				match reader.read(&mut buffer).await {
 					Ok(0) => break, // EOF
