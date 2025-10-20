@@ -9,10 +9,11 @@ use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 use crate::{
 	Error,
-	auth::Client,
+	auth::JsClient,
 	connect::{DirPublicLink, FilePublicLink},
 	fs::dir::{DirectoryMetaType, js_impl::tuple_to_jsvalue},
 	js::{Dir, DirWithMetaEnum, File, SharedDir, SharedFile},
+	runtime::{self, do_on_commander},
 };
 
 #[derive(Serialize, Deserialize, Tsify)]
@@ -175,28 +176,42 @@ impl<'a> From<&'a ContactRequestOut>
 	}
 }
 
-#[wasm_bindgen]
-impl Client {
+#[wasm_bindgen(js_class = "Client")]
+impl JsClient {
 	// Public Links
 
 	#[wasm_bindgen(js_name = "publicLinkDir")]
 	pub async fn public_link_dir_js(&self, dir: Dir) -> Result<DirPublicLink, Error> {
-		self.public_link_dir(&dir.into()).await
+		let this = self.inner();
+		runtime::do_on_commander(move || async move { this.public_link_dir(&dir.into()).await })
+			.await
 	}
 
 	#[wasm_bindgen(js_name = "publicLinkFile")]
 	pub async fn public_link_file_js(&self, file: File) -> Result<FilePublicLink, Error> {
-		self.public_link_file(&file.try_into()?).await
+		let this = self.inner();
+		runtime::do_on_commander(
+			move || async move { this.public_link_file(&file.try_into()?).await },
+		)
+		.await
 	}
 
 	#[wasm_bindgen(js_name = "updateDirLink")]
 	pub async fn update_dir_link_js(&self, dir: Dir, link: DirPublicLink) -> Result<(), Error> {
-		self.update_dir_link(&dir.into(), &link).await
+		let this = self.inner();
+		runtime::do_on_commander(
+			move || async move { this.update_dir_link(&dir.into(), &link).await },
+		)
+		.await
 	}
 
 	#[wasm_bindgen(js_name = "updateFileLink")]
 	pub async fn update_file_link_js(&self, file: File, link: FilePublicLink) -> Result<(), Error> {
-		self.update_file_link(&file.try_into()?, &link).await
+		let this = self.inner();
+		runtime::do_on_commander(move || async move {
+			this.update_file_link(&file.try_into()?, &link).await
+		})
+		.await
 	}
 
 	#[wasm_bindgen(js_name = "getFileLinkStatus")]
@@ -204,7 +219,11 @@ impl Client {
 		&self,
 		file: File,
 	) -> Result<Option<FilePublicLink>, Error> {
-		self.get_file_link_status(&file.try_into()?).await
+		let this = self.inner();
+		runtime::do_on_commander(move || async move {
+			this.get_file_link_status(&file.try_into()?).await
+		})
+		.await
 	}
 
 	// This is annoying because I can't map this to either of the basic file types
@@ -220,7 +239,9 @@ impl Client {
 
 	#[wasm_bindgen(js_name = "getDirLinkStatus")]
 	pub async fn get_dir_link_status_js(&self, dir: Dir) -> Result<Option<DirPublicLink>, Error> {
-		self.get_dir_link_status(&dir.into()).await
+		let this = self.inner();
+		runtime::do_on_commander(move || async move { this.get_dir_link_status(&dir.into()).await })
+			.await
 	}
 
 	#[wasm_bindgen(js_name = "listLinkedDir", unchecked_return_type = "[Dir[], File[]]")]
@@ -229,52 +250,72 @@ impl Client {
 		dir: DirWithMetaEnum,
 		link: DirPublicLink,
 	) -> Result<JsValue, Error> {
-		let (dirs, files) = self
-			.list_linked_dir(&DirectoryMetaType::from(dir), &link)
-			.await?;
-		Ok(tuple_to_jsvalue!(
-			dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
-			files.into_iter().map(File::from).collect::<Vec<_>>()
-		))
+		let this = self.inner();
+		let (dirs, files) = runtime::do_on_commander(move || async move {
+			this.list_linked_dir(&DirectoryMetaType::from(dir), &link)
+				.await
+				.map(|(dirs, files)| {
+					(
+						dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+						files.into_iter().map(File::from).collect::<Vec<_>>(),
+					)
+				})
+		})
+		.await?;
+
+		Ok(tuple_to_jsvalue!(dirs, files))
 	}
 
 	#[wasm_bindgen(js_name = "removeDirLink")]
 	pub async fn remove_dir_link_js(&self, link: DirPublicLink) -> Result<(), Error> {
-		self.remove_dir_link(link).await
+		let this = self.inner();
+		runtime::do_on_commander(move || async move { this.remove_dir_link(link).await }).await
 	}
 
 	// Contacts
 
 	#[wasm_bindgen(js_name = "getContacts", unchecked_return_type = "Contact[]")]
 	pub async fn get_contacts_js(&self) -> Result<JsValue, JsValue> {
-		let contacts = self.get_contacts().await?;
-		let contacts = contacts.into_iter().map(Contact::from).collect::<Vec<_>>();
+		let this = self.inner();
+		let contacts = runtime::do_on_commander(move || async move {
+			this.get_contacts()
+				.await
+				.map(|contacts| contacts.into_iter().map(Contact::from).collect::<Vec<_>>())
+		})
+		.await?;
 		Ok(serde_wasm_bindgen::to_value(&contacts)?)
 	}
 
 	#[wasm_bindgen(js_name = "sendContactRequest")]
-	pub async fn send_contact_request_js(&self, email: &str) -> Result<UuidStr, Error> {
-		self.send_contact_request(email).await
+	pub async fn send_contact_request_js(&self, email: String) -> Result<UuidStr, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.send_contact_request(&email).await }).await
 	}
 
 	#[wasm_bindgen(js_name = "cancelContactRequest")]
 	pub async fn cancel_contact_request_js(&self, contact_uuid: UuidStr) -> Result<(), Error> {
-		self.cancel_contact_request(contact_uuid).await
+		let this = self.inner();
+		do_on_commander(move || async move { this.cancel_contact_request(contact_uuid).await })
+			.await
 	}
 
 	#[wasm_bindgen(js_name = "acceptContactRequest")]
 	pub async fn accept_contact_request_js(&self, contact_uuid: UuidStr) -> Result<UuidStr, Error> {
-		self.accept_contact_request(contact_uuid).await
+		let this = self.inner();
+		do_on_commander(move || async move { this.accept_contact_request(contact_uuid).await })
+			.await
 	}
 
 	#[wasm_bindgen(js_name = "denyContactRequest")]
 	pub async fn deny_contact_request_js(&self, contact_uuid: UuidStr) -> Result<(), Error> {
-		self.deny_contact_request(contact_uuid).await
+		let this = self.inner();
+		do_on_commander(move || async move { this.deny_contact_request(contact_uuid).await }).await
 	}
 
 	#[wasm_bindgen(js_name = "deleteContact")]
 	pub async fn delete_contact_js(&self, contact_uuid: UuidStr) -> Result<(), Error> {
-		self.delete_contact(contact_uuid).await
+		let this = self.inner();
+		do_on_commander(move || async move { this.delete_contact(contact_uuid).await }).await
 	}
 
 	#[wasm_bindgen(
@@ -282,11 +323,16 @@ impl Client {
 		unchecked_return_type = "ContactRequestIn[]"
 	)]
 	pub async fn list_incoming_contact_requests_js(&self) -> Result<JsValue, JsValue> {
-		let requests = self.list_incoming_contact_requests().await?;
-		let requests = requests
-			.into_iter()
-			.map(ContactRequestIn::from)
-			.collect::<Vec<_>>();
+		let this = self.inner();
+		let requests = do_on_commander(move || async move {
+			this.list_incoming_contact_requests().await.map(|requests| {
+				requests
+					.into_iter()
+					.map(ContactRequestIn::from)
+					.collect::<Vec<_>>()
+			})
+		})
+		.await?;
 		Ok(serde_wasm_bindgen::to_value(&requests)?)
 	}
 
@@ -295,11 +341,16 @@ impl Client {
 		unchecked_return_type = "ContactRequestOut[]"
 	)]
 	pub async fn list_outgoing_contact_requests_js(&self) -> Result<JsValue, JsValue> {
-		let requests = self.list_outgoing_contact_requests().await?;
-		let requests = requests
-			.into_iter()
-			.map(ContactRequestOut::from)
-			.collect::<Vec<_>>();
+		let this = self.inner();
+		let requests = do_on_commander(move || async move {
+			this.list_outgoing_contact_requests().await.map(|requests| {
+				requests
+					.into_iter()
+					.map(ContactRequestOut::from)
+					.collect::<Vec<_>>()
+			})
+		})
+		.await?;
 		Ok(serde_wasm_bindgen::to_value(&requests)?)
 	}
 
@@ -308,34 +359,47 @@ impl Client {
 		unchecked_return_type = "BlockedContact[]"
 	)]
 	pub async fn get_blocked_contacts_js(&self) -> Result<JsValue, JsValue> {
-		let contacts = self.get_blocked_contacts().await?;
-		let contacts = contacts
-			.into_iter()
-			.map(BlockedContact::from)
-			.collect::<Vec<_>>();
+		let this = self.inner();
+		let contacts = do_on_commander(move || async move {
+			this.get_blocked_contacts().await.map(|contacts| {
+				contacts
+					.into_iter()
+					.map(BlockedContact::from)
+					.collect::<Vec<_>>()
+			})
+		})
+		.await?;
 		Ok(serde_wasm_bindgen::to_value(&contacts)?)
 	}
 
 	#[wasm_bindgen(js_name = "blockContact")]
-	pub async fn block_contact_js(&self, email: &str) -> Result<UuidStr, Error> {
-		self.block_contact(email).await
+	pub async fn block_contact_js(&self, email: String) -> Result<UuidStr, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.block_contact(&email).await }).await
 	}
 
 	#[wasm_bindgen(js_name = "unblockContact")]
 	pub async fn unblock_contact_js(&self, contact_uuid: UuidStr) -> Result<(), Error> {
-		self.unblock_contact(contact_uuid).await
+		let this = self.inner();
+		do_on_commander(move || async move { this.unblock_contact(contact_uuid).await }).await
 	}
 
 	// Sharing
 
 	#[wasm_bindgen(js_name = "shareDir")]
 	pub async fn share_dir_js(&self, dir: Dir, contact: Contact) -> Result<(), Error> {
-		self.share_dir(&dir.into(), &contact.into()).await
+		let this = self.inner();
+		do_on_commander(move || async move { this.share_dir(&dir.into(), &contact.into()).await })
+			.await
 	}
 
 	#[wasm_bindgen(js_name = "shareFile")]
 	pub async fn share_file_js(&self, file: File, contact: Contact) -> Result<(), Error> {
-		self.share_file(&file.try_into()?, &contact.into()).await
+		let this = self.inner();
+		do_on_commander(
+			move || async move { this.share_file(&file.try_into()?, &contact.into()).await },
+		)
+		.await
 	}
 
 	#[wasm_bindgen(
@@ -347,16 +411,22 @@ impl Client {
 		dir: Option<DirWithMetaEnum>,
 		contact: Option<Contact>,
 	) -> Result<JsValue, Error> {
-		let (dirs, files) = self
-			.inner_list_out_shared(
+		let this = self.inner();
+		let (dirs, files) = runtime::do_on_commander(move || async move {
+			this.inner_list_out_shared(
 				dir.map(DirectoryMetaType::from).as_ref(),
 				contact.map(Into::into).as_ref(),
 			)
-			.await?;
-		Ok(tuple_to_jsvalue!(
-			dirs.into_iter().map(SharedDir::from).collect::<Vec<_>>(),
-			files.into_iter().map(SharedFile::from).collect::<Vec<_>>()
-		))
+			.await
+			.map(|(dirs, files)| {
+				(
+					dirs.into_iter().map(SharedDir::from).collect::<Vec<_>>(),
+					files.into_iter().map(SharedFile::from).collect::<Vec<_>>(),
+				)
+			})
+		})
+		.await?;
+		Ok(tuple_to_jsvalue!(dirs, files))
 	}
 
 	#[wasm_bindgen(
@@ -364,18 +434,25 @@ impl Client {
 		unchecked_return_type = "[SharedDirectory[], SharedFile[]]"
 	)]
 	pub async fn list_in_shared_js(&self, dir: Option<DirWithMetaEnum>) -> Result<JsValue, Error> {
-		let (dirs, files) = self
-			.inner_list_in_shared(dir.map(DirectoryMetaType::from).as_ref())
-			.await?;
-		Ok(tuple_to_jsvalue!(
-			dirs.into_iter().map(SharedDir::from).collect::<Vec<_>>(),
-			files.into_iter().map(SharedFile::from).collect::<Vec<_>>()
-		))
+		let this = self.inner();
+		let (dirs, files) = runtime::do_on_commander(move || async move {
+			this.inner_list_in_shared(dir.map(DirectoryMetaType::from).as_ref())
+				.await
+				.map(|(dirs, files)| {
+					(
+						dirs.into_iter().map(SharedDir::from).collect::<Vec<_>>(),
+						files.into_iter().map(SharedFile::from).collect::<Vec<_>>(),
+					)
+				})
+		})
+		.await?;
+		Ok(tuple_to_jsvalue!(dirs, files))
 	}
 
 	#[wasm_bindgen(js_name = "removeSharedLinkIn")]
 	pub async fn remove_shared_link_in_js(&self, link_uuid: UuidStr) -> Result<(), Error> {
-		self.remove_shared_link_in(link_uuid).await
+		let this = self.inner();
+		do_on_commander(move || async move { this.remove_shared_link_in(link_uuid).await }).await
 	}
 
 	#[wasm_bindgen(js_name = "removeSharedLinkOut")]
@@ -384,6 +461,10 @@ impl Client {
 		link_uuid: UuidStr,
 		#[wasm_bindgen(unchecked_param_type = "bigint")] receiver_id: u64,
 	) -> Result<(), Error> {
-		self.remove_shared_link_out(link_uuid, receiver_id).await
+		let this = self.inner();
+		do_on_commander(
+			move || async move { this.remove_shared_link_out(link_uuid, receiver_id).await },
+		)
+		.await
 	}
 }

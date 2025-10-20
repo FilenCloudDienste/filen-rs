@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref};
+use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -9,6 +9,7 @@ use filen_types::{
 	crypto::EncryptedString,
 	fs::UuidStr,
 };
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rsa::RsaPublicKey;
 
 use crate::{
@@ -19,6 +20,7 @@ use crate::{
 		shared::{CreateRandom, MetaCrypter},
 	},
 	error::{MetadataWasNotDecryptedError, ResultExt},
+	runtime::{blocking_join, do_cpu_intensive},
 };
 
 use crypto::*;
@@ -55,15 +57,11 @@ pub struct NoteTag {
 }
 
 impl NoteTag {
-	fn decrypt_with_key<MC>(
+	fn blocking_decrypt_with_key(
 		tag: &filen_types::api::v3::notes::NoteTag<'_>,
-		crypter: impl Deref<Target = MC>,
-		outer_tmp_vec: &mut Vec<u8>,
-	) -> Self
-	where
-		MC: MetaCrypter,
-	{
-		let name = NoteTagName::try_decrypt(crypter, &tag.name, outer_tmp_vec).ok();
+		crypter: &impl MetaCrypter,
+	) -> Self {
+		let name = NoteTagName::blocking_try_decrypt(crypter, &tag.name).ok();
 
 		Self {
 			uuid: tag.uuid,
@@ -227,12 +225,14 @@ impl Note {
 		&mut self.participants
 	}
 
-	pub fn decrypt_string(&self, meta: &EncryptedString) -> Result<String, Error> {
+	pub async fn decrypt_string(&self, meta: &EncryptedString<'_>) -> Result<String, Error> {
 		let key = self
 			.encryption_key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)?;
-		key.decrypt_meta(meta).context("decrypt_meta_with_note_key")
+		key.decrypt_meta(meta)
+			.await
+			.context("decrypt_meta_with_note_key")
 	}
 }
 
@@ -282,15 +282,18 @@ impl NoteHistory {
 }
 
 impl NoteHistory {
-	fn decrypt_with_key(
+	fn blocking_decrypt_with_key(
 		note_history: &filen_types::api::v3::notes::history::NoteHistory<'_>,
 		note_key: &NoteOrChatKey,
-		outer_tmp_vec: &mut Vec<u8>,
 	) -> Self {
+		let (preview, content) = blocking_join!(
+			|| NotePreview::blocking_try_decrypt(note_key, &note_history.preview),
+			|| NoteContent::blocking_try_decrypt(note_key, &note_history.content)
+		);
 		Self {
 			id: note_history.id,
-			preview: NotePreview::try_decrypt(note_key, &note_history.preview, outer_tmp_vec).ok(),
-			content: NoteContent::try_decrypt(note_key, &note_history.content, outer_tmp_vec).ok(),
+			preview: preview.ok(),
+			content: content.ok(),
 			edited_timestamp: note_history.edited_timestamp,
 			editor_id: note_history.editor_id,
 			note_type: note_history.note_type,
@@ -342,7 +345,7 @@ impl Client {
 		api::v3::item::shared::post(self.client(), &api::v3::item::shared::Request { uuid }).await
 	}
 
-	fn decrypt_note_key(
+	fn blocking_decrypt_note_key(
 		&self,
 		note: &filen_types::api::v3::notes::Note<'_>,
 	) -> Result<NoteOrChatKey, Error> {
@@ -354,48 +357,53 @@ impl Client {
 				Error::custom(ErrorKind::Response, "User is not a participant in the note")
 			})?;
 
-		NoteOrChatKeyStruct::try_decrypt_rsa(self.private_key(), &participant.metadata)
+		NoteOrChatKeyStruct::blocking_try_decrypt_rsa(self.private_key(), &participant.metadata)
 	}
 
-	fn decrypt_note(
+	fn blocking_decrypt_note(
 		&self,
+		crypter: &impl MetaCrypter,
 		note: filen_types::api::v3::notes::Note<'_>,
-		outer_tmp_vec: &mut Vec<u8>,
 	) -> Note {
-		let mut tmp_vec = std::mem::take(outer_tmp_vec);
-		let key = self.decrypt_note_key(&note).ok();
+		let key = self.blocking_decrypt_note_key(&note).ok();
 
-		let (title, preview, mut tmp_vec) = if let Some(key) = &key {
-			let title = NoteTitle::try_decrypt(key, &note.title, &mut tmp_vec).ok();
-			let preview = NotePreview::try_decrypt(key, &note.preview, &mut tmp_vec).ok();
-
-			(title, preview, tmp_vec)
-		} else {
-			(None, None, tmp_vec)
+		let tags_closure = || {
+			note.tags
+				.par_iter()
+				.map(|tag| NoteTag::blocking_decrypt_with_key(tag, crypter))
+				.collect::<Vec<_>>()
 		};
-		let tags = note
-			.tags
-			.into_iter()
-			.map(|tag| NoteTag::decrypt_with_key(&tag, self.crypter(), &mut tmp_vec))
-			.collect::<Vec<_>>();
 
-		let mut participants = note
-			.participants
-			.into_iter()
-			.map(|p| NoteParticipant {
-				user_id: p.user_id,
-				is_owner: p.is_owner,
-				email: p.email.into_owned(),
-				avatar: p.avatar.map(|a| a.into_owned()),
-				nick_name: p.nick_name.into_owned(),
-				permissions_write: p.permissions_write,
-				added_timestamp: p.added_timestamp,
-			})
-			.collect::<Vec<_>>();
+		let participants_closure = || {
+			let mut participants = note
+				.participants
+				.into_iter()
+				.map(|p| NoteParticipant {
+					user_id: p.user_id,
+					is_owner: p.is_owner,
+					email: p.email.into_owned(),
+					avatar: p.avatar.map(|a| a.into_owned()),
+					nick_name: p.nick_name.into_owned(),
+					permissions_write: p.permissions_write,
+					added_timestamp: p.added_timestamp,
+				})
+				.collect::<Vec<_>>();
 
-		participants.sort_by_key(|p| p.added_timestamp);
+			participants.sort_by_key(|p| p.added_timestamp);
+			participants
+		};
 
-		*outer_tmp_vec = tmp_vec;
+		let (title, preview, tags, participants) = if let Some(key) = &key {
+			blocking_join!(
+				|| { NoteTitle::blocking_try_decrypt(key, &note.title).ok() },
+				|| { NotePreview::blocking_try_decrypt(key, &note.preview).ok() },
+				tags_closure,
+				participants_closure
+			)
+		} else {
+			let (tags, participants) = blocking_join!(tags_closure, participants_closure);
+			(None, None, tags, participants)
+		};
 
 		Note {
 			uuid: note.uuid,
@@ -418,16 +426,18 @@ impl Client {
 
 	pub async fn list_notes(&self) -> Result<Vec<Note>, Error> {
 		let notes = crate::api::v3::notes::get(self.client()).await?;
-		// opportunity for par_iter here if we ever start using rayon
-		let mut outer_tmp_vec = Vec::new();
-		let notes = notes
-			.0
-			.into_iter()
-			.map(|note| {
-				// TS sdk filters participants to make sure the user is included
-				self.decrypt_note(note, &mut outer_tmp_vec)
-			})
-			.collect::<Vec<_>>();
+
+		let crypter = self.crypter();
+
+		let notes = do_cpu_intensive(|| {
+			notes
+				.0
+				.into_par_iter()
+				.map(|note| self.blocking_decrypt_note(&*crypter, note))
+				.collect::<Vec<_>>()
+		})
+		.await;
+
 		Ok(notes)
 	}
 
@@ -439,12 +449,15 @@ impl Client {
 		public_key: &RsaPublicKey,
 		note_participant_parts: NoteParticipantParts,
 	) -> Result<(), Error> {
-		let data = NoteOrChatKeyStruct::try_encrypt_rsa(
-			public_key,
-			note.encryption_key
-				.as_ref()
-				.ok_or(MetadataWasNotDecryptedError)?,
-		)
+		let data = do_cpu_intensive(|| {
+			NoteOrChatKeyStruct::blocking_try_encrypt_rsa(
+				public_key,
+				note.encryption_key
+					.as_ref()
+					.ok_or(MetadataWasNotDecryptedError)?,
+			)
+		})
+		.await
 		.map_err(|e| {
 			Error::custom_with_source(ErrorKind::Conversion, e, Some("add participant"))
 		})?;
@@ -543,10 +556,17 @@ impl Client {
 		let title = title.unwrap_or_else(|| Utc::now().format("%a %b %d %Y %X").to_string());
 		let key = NoteOrChatKey::generate();
 
-		let key_string = NoteOrChatKeyStruct::encrypt_symmetric(self.crypter(), &key);
-		let title_string = NoteTitle::encrypt(&key, &title);
+		let crypter = self.crypter();
 
-		let _lock = self.lock_notes().await?;
+		let ((key_string, title_string), _lock) = futures::join!(
+			do_cpu_intensive(|| {
+				blocking_join!(
+					|| NoteOrChatKeyStruct::blocking_encrypt_symmetric(&*crypter, &key),
+					|| NoteTitle::blocking_encrypt(&key, &title)
+				)
+			}),
+			self.lock_notes()
+		);
 
 		let response = api::v3::notes::create::post(
 			self.client(),
@@ -601,26 +621,27 @@ impl Client {
 		note.note_type = response.note_type;
 		note.edited_timestamp = response.edited_timestamp;
 
-		let mut tmp_vec = Vec::new();
+		let key = note
+			.encryption_key
+			.as_ref()
+			.ok_or(MetadataWasNotDecryptedError)?;
 
-		note.preview = NotePreview::try_decrypt(
-			note.encryption_key
-				.as_ref()
-				.ok_or(MetadataWasNotDecryptedError)?,
-			&response.preview,
-			&mut tmp_vec,
-		)
-		.ok();
+		let (preview, content) = do_cpu_intensive(|| {
+			blocking_join!(
+				|| NotePreview::blocking_try_decrypt(key, &response.preview),
+				|| {
+					if response.content.0.is_empty() {
+						Some(String::new())
+					} else {
+						NoteContent::blocking_try_decrypt(key, &response.content).ok()
+					}
+				}
+			)
+		})
+		.await;
 
-		if response.content.0.is_empty() {
-			Ok(Some(String::new()))
-		} else {
-			let Some(key) = note.encryption_key.as_ref() else {
-				return Ok(None);
-			};
-
-			Ok(NoteContent::try_decrypt(key, &response.content, &mut tmp_vec).ok())
-		}
+		note.preview = preview.ok();
+		Ok(content)
 	}
 
 	pub async fn set_note_type(
@@ -630,29 +651,35 @@ impl Client {
 		known_content: Option<&str>,
 	) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
+
 		let content = if let Some(content) = known_content {
 			Cow::Borrowed(content)
 		} else {
-			Cow::Owned(
-				self.get_note_content(note)
-					.await?
-					.ok_or(MetadataWasNotDecryptedError)?,
-			)
+			self.get_note_content(note)
+				.await?
+				.ok_or(MetadataWasNotDecryptedError)
+				.map(Cow::Owned)?
 		};
+
 		let note_key = note
 			.encryption_key
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)?;
+		let preview = note.preview.as_ref().ok_or(MetadataWasNotDecryptedError)?;
+
+		let (preview, content) = do_cpu_intensive(|| {
+			blocking_join!(|| NotePreview::blocking_encrypt(note_key, preview,), || {
+				NoteContent::blocking_encrypt(note_key, &content)
+			})
+		})
+		.await;
 
 		let resp = api::v3::notes::r#type::change::post(
 			self.client(),
 			&api::v3::notes::r#type::change::Request {
 				uuid: note.uuid,
-				preview: NotePreview::encrypt(
-					note_key,
-					note.preview.as_ref().ok_or(MetadataWasNotDecryptedError)?,
-				),
-				content: NoteContent::encrypt(note_key, &content),
+				preview,
+				content,
 				note_type: new_type,
 			},
 		)
@@ -675,9 +702,16 @@ impl Client {
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)?;
 
-		let content = NoteContent::encrypt(note_key, new_content);
-		let preview = NotePreview::encrypt(note_key, &new_preview);
-		let _lock = self.lock_notes().await?;
+		let ((content, preview), _lock) = futures::join!(
+			do_cpu_intensive(|| {
+				blocking_join!(
+					|| NoteContent::blocking_encrypt(note_key, new_content),
+					|| NotePreview::blocking_encrypt(note_key, &new_preview)
+				)
+			}),
+			self.lock_notes()
+		);
+
 		let response = api::v3::notes::content::edit::post(
 			self.client(),
 			&api::v3::notes::content::edit::Request {
@@ -695,14 +729,16 @@ impl Client {
 	}
 
 	pub async fn set_note_title(&self, note: &mut Note, new_title: String) -> Result<(), Error> {
-		let title = NoteTitle::encrypt(
-			note.encryption_key
-				.as_ref()
-				.ok_or(MetadataWasNotDecryptedError)?,
-			&new_title,
+		let key = note
+			.encryption_key
+			.as_ref()
+			.ok_or(MetadataWasNotDecryptedError)?;
+
+		let (title, _lock) = futures::join!(
+			do_cpu_intensive(|| NoteTitle::blocking_encrypt(key, &new_title,)),
+			self.lock_notes()
 		);
 
-		let _lock = self.lock_notes().await?;
 		api::v3::notes::title::edit::post(
 			self.client(),
 			&api::v3::notes::title::edit::Request {
@@ -819,15 +855,16 @@ impl Client {
 		)
 		.await?;
 
-		let mut outer_tmp_vec = Vec::new();
-
-		let mut histories = histories
-			.0
-			.into_iter()
-			.map(|h| NoteHistory::decrypt_with_key(&h, note_key, &mut outer_tmp_vec))
-			.collect::<Vec<_>>();
-
-		histories.sort_by_key(|h| h.edited_timestamp);
+		let histories = do_cpu_intensive(|| {
+			let mut histories = histories
+				.0
+				.par_iter()
+				.map(|h| NoteHistory::blocking_decrypt_with_key(h, note_key))
+				.collect::<Vec<_>>();
+			histories.sort_by_key(|h| h.edited_timestamp);
+			histories
+		})
+		.await;
 
 		Ok(histories)
 	}
@@ -893,12 +930,18 @@ impl Client {
 
 	pub async fn list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
 		let response = api::v3::notes::tags::post(self.client()).await?;
-		let mut outer_tmp_vec = Vec::new();
-		Ok(response
-			.0
-			.into_iter()
-			.map(|tag| NoteTag::decrypt_with_key(&tag, self.crypter(), &mut outer_tmp_vec))
-			.collect::<Vec<_>>())
+		let crypter = self.crypter();
+
+		let tags = do_cpu_intensive(|| {
+			response
+				.0
+				.par_iter()
+				.map(|tag| NoteTag::blocking_decrypt_with_key(tag, &*crypter))
+				.collect::<Vec<_>>()
+		})
+		.await;
+
+		Ok(tags)
 	}
 
 	pub async fn create_note_tag(&self, name: String) -> Result<NoteTag, Error> {
@@ -913,9 +956,13 @@ impl Client {
 			return Ok(existing);
 		}
 
-		let encrypted_name = NoteTagName::encrypt(self.crypter(), &name);
+		let crypter = self.crypter();
 
-		let _lock = self.lock_notes().await?;
+		let (encrypted_name, _lock) = futures::join!(
+			do_cpu_intensive(|| NoteTagName::blocking_encrypt(&*crypter, &name)),
+			self.lock_notes()
+		);
+
 		let response = api::v3::notes::tags::create::post(
 			self.client(),
 			&api::v3::notes::tags::create::Request {
@@ -934,9 +981,12 @@ impl Client {
 	}
 
 	pub async fn rename_note_tag(&self, tag: &mut NoteTag, new_name: String) -> Result<(), Error> {
-		let encrypted_name = NoteTagName::encrypt(self.crypter(), &new_name);
+		let crypter = self.crypter();
+		let (encrypted_name, _lock) = futures::join!(
+			do_cpu_intensive(|| NoteTagName::blocking_encrypt(&*crypter, &new_name)),
+			self.lock_notes()
+		);
 
-		let _lock = self.lock_notes().await?;
 		let resp = api::v3::notes::tags::rename::post(
 			self.client(),
 			&api::v3::notes::tags::rename::Request {
@@ -981,14 +1031,16 @@ impl Client {
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub mod js_impls {
+	use std::borrow::Cow;
+
 	use filen_types::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
 	use serde::Serialize;
 	use tsify::Tsify;
 	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 	use crate::{
-		Error, auth::Client, connect::js_impls::Contact, fs::dir::js_impl::tuple_to_jsvalue,
-		notes::NoteParticipant,
+		Error, auth::JsClient, connect::js_impls::Contact, fs::dir::js_impl::tuple_to_jsvalue,
+		notes::NoteParticipant, runtime::do_on_commander,
 	};
 
 	use super::{Note, NoteHistory, NoteTag};
@@ -1005,18 +1057,23 @@ pub mod js_impls {
 	///
 	/// Should not be used outside of that context.
 	#[wasm_bindgen(js_name = "decrypMetaWithNoteKey")]
-	pub fn decrypt_meta_with_note_key(
+	pub async fn decrypt_meta_with_note_key(
 		note: Note,
-		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: EncryptedString,
+		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: String,
 	) -> Result<String, Error> {
-		note.decrypt_string(&encrypted)
+		do_on_commander(move || async move {
+			note.decrypt_string(&EncryptedString(Cow::Owned(encrypted)))
+				.await
+		})
+		.await
 	}
 
-	#[wasm_bindgen]
-	impl Client {
+	#[wasm_bindgen(js_class = "Client")]
+	impl JsClient {
 		#[wasm_bindgen(js_name = "listNotes")]
 		pub async fn js_list_notes(&self) -> Result<Vec<Note>, Error> {
-			self.list_notes().await
+			let this = self.inner();
+			do_on_commander(move || async move { this.list_notes().await }).await
 		}
 
 		#[wasm_bindgen(js_name = "addNoteParticipant")]
@@ -1026,9 +1083,13 @@ pub mod js_impls {
 			contact: Contact,
 			write: bool,
 		) -> Result<Note, Error> {
-			self.add_note_participant(&mut note, &contact.into(), write)
-				.await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.add_note_participant(&mut note, &contact.into(), write)
+					.await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "removeNoteParticipant")]
@@ -1037,9 +1098,13 @@ pub mod js_impls {
 			mut note: Note,
 			participant_id: u64,
 		) -> Result<Note, Error> {
-			self.remove_note_participant(&mut note, participant_id)
-				.await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.remove_note_participant(&mut note, participant_id)
+					.await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "setNoteParticipantPermission")]
@@ -1049,24 +1114,31 @@ pub mod js_impls {
 			mut participant: NoteParticipant,
 			write: bool,
 		) -> Result<NoteParticipant, Error> {
-			self.set_note_participant_permission(note_uuid, &mut participant, write)
-				.await?;
-			Ok(participant)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_note_participant_permission(note_uuid, &mut participant, write)
+					.await?;
+				Ok(participant)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "getNote")]
 		pub async fn js_get_note(&self, note_uuid: UuidStr) -> Result<Option<Note>, Error> {
-			self.get_note(note_uuid).await
+			let this = self.inner();
+			do_on_commander(move || async move { this.get_note(note_uuid).await }).await
 		}
 
 		#[wasm_bindgen(js_name = "createNote")]
 		pub async fn js_create_note(&self, title: Option<String>) -> Result<Note, Error> {
-			self.create_note(title).await
+			let this = self.inner();
+			do_on_commander(move || async move { this.create_note(title).await }).await
 		}
 
 		#[wasm_bindgen(js_name = "getNoteContent")]
 		pub async fn js_get_note_content(&self, mut note: Note) -> Result<Option<String>, Error> {
-			self.get_note_content(&mut note).await
+			let this = self.inner();
+			do_on_commander(move || async move { this.get_note_content(&mut note).await }).await
 		}
 
 		#[wasm_bindgen(js_name = "setNoteType")]
@@ -1076,9 +1148,13 @@ pub mod js_impls {
 			note_type: NoteType,
 			known_content: Option<String>,
 		) -> Result<Note, Error> {
-			self.set_note_type(&mut note, note_type, known_content.as_deref())
-				.await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_note_type(&mut note, note_type, known_content.as_deref())
+					.await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "setNoteContent")]
@@ -1088,9 +1164,13 @@ pub mod js_impls {
 			new_content: String,
 			new_preview: String,
 		) -> Result<Note, Error> {
-			self.set_note_content(&mut note, &new_content, new_preview)
-				.await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_note_content(&mut note, &new_content, new_preview)
+					.await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "setNoteTitle")]
@@ -1099,25 +1179,38 @@ pub mod js_impls {
 			mut note: Note,
 			new_title: String,
 		) -> Result<Note, Error> {
-			self.set_note_title(&mut note, new_title).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_note_title(&mut note, new_title).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "deleteNote")]
 		pub async fn js_delete_note(&self, note: Note) -> Result<(), Error> {
-			self.delete_note(note).await
+			let this = self.inner();
+			do_on_commander(move || async move { this.delete_note(note).await }).await
 		}
 
 		#[wasm_bindgen(js_name = "archiveNote")]
 		pub async fn js_archive_note(&self, mut note: Note) -> Result<Note, Error> {
-			self.archive_note(&mut note).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.archive_note(&mut note).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "trashNote")]
 		pub async fn js_trash_note(&self, mut note: Note) -> Result<Note, Error> {
-			self.trash_note(&mut note).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.trash_note(&mut note).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "setNoteFavorited")]
@@ -1126,8 +1219,12 @@ pub mod js_impls {
 			mut note: Note,
 			favorite: bool,
 		) -> Result<Note, Error> {
-			self.set_note_favorited(&mut note, favorite).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_note_favorited(&mut note, favorite).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "setNotePinned")]
@@ -1136,14 +1233,22 @@ pub mod js_impls {
 			mut note: Note,
 			pinned: bool,
 		) -> Result<Note, Error> {
-			self.set_note_pinned(&mut note, pinned).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_note_pinned(&mut note, pinned).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "restoreNote")]
 		pub async fn js_restore_note(&self, mut note: Note) -> Result<Note, Error> {
-			self.restore_note(&mut note).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.restore_note(&mut note).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "duplicateNote")]
@@ -1151,17 +1256,22 @@ pub mod js_impls {
 			&self,
 			mut note: Note,
 		) -> Result<DuplicateNoteResponse, Error> {
-			let new = self.duplicate_note(&mut note).await?;
+			let this = self.inner();
+			do_on_commander(move || async move {
+				let new = this.duplicate_note(&mut note).await?;
 
-			Ok(DuplicateNoteResponse {
-				original: note,
-				duplicated: new,
+				Ok(DuplicateNoteResponse {
+					original: note,
+					duplicated: new,
+				})
 			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "getNoteHistory")]
 		pub async fn js_get_note_history(&self, note: Note) -> Result<Vec<NoteHistory>, Error> {
-			self.get_note_history(&note).await
+			let this = self.inner();
+			do_on_commander(move || async move { this.get_note_history(&note).await }).await
 		}
 
 		#[wasm_bindgen(js_name = "restoreNoteFromHistory")]
@@ -1170,13 +1280,18 @@ pub mod js_impls {
 			mut note: Note,
 			history: NoteHistory,
 		) -> Result<Note, Error> {
-			self.restore_note_from_history(&mut note, history).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.restore_note_from_history(&mut note, history).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "listNoteTags")]
 		pub async fn js_list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
-			self.list_note_tags().await
+			let this = self.inner();
+			do_on_commander(move || async move { this.list_note_tags().await }).await
 		}
 
 		#[wasm_bindgen(unchecked_return_type = "[Note, NoteTag]", js_name = "addTagToNote")]
@@ -1185,7 +1300,12 @@ pub mod js_impls {
 			mut note: Note,
 			mut tag: NoteTag,
 		) -> Result<JsValue, Error> {
-			self.add_tag_to_note(&mut note, &mut tag).await?;
+			let this = self.inner();
+			let (note, tag) = do_on_commander(move || async move {
+				this.add_tag_to_note(&mut note, &mut tag).await?;
+				Ok::<_, Error>((note, tag))
+			})
+			.await?;
 			Ok(tuple_to_jsvalue!(note, tag))
 		}
 
@@ -1195,13 +1315,18 @@ pub mod js_impls {
 			mut note: Note,
 			tag: NoteTag,
 		) -> Result<Note, Error> {
-			self.remove_tag_from_note(&mut note, &tag).await?;
-			Ok(note)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.remove_tag_from_note(&mut note, &tag).await?;
+				Ok(note)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "createNoteTag")]
 		pub async fn js_create_note_tag(&self, name: String) -> Result<NoteTag, Error> {
-			self.create_note_tag(name).await
+			let this = self.inner();
+			do_on_commander(move || async move { this.create_note_tag(name).await }).await
 		}
 
 		#[wasm_bindgen(js_name = "renameNoteTag")]
@@ -1210,8 +1335,12 @@ pub mod js_impls {
 			mut tag: NoteTag,
 			new_name: String,
 		) -> Result<NoteTag, Error> {
-			self.rename_note_tag(&mut tag, new_name).await?;
-			Ok(tag)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.rename_note_tag(&mut tag, new_name).await?;
+				Ok(tag)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "setNoteTagFavorited")]
@@ -1220,13 +1349,18 @@ pub mod js_impls {
 			mut tag: NoteTag,
 			favorite: bool,
 		) -> Result<NoteTag, Error> {
-			self.set_note_tag_favorited(&mut tag, favorite).await?;
-			Ok(tag)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.set_note_tag_favorited(&mut tag, favorite).await?;
+				Ok(tag)
+			})
+			.await
 		}
 
 		#[wasm_bindgen(js_name = "deleteNoteTag")]
 		pub async fn js_delete_note_tag(&self, tag: NoteTag) -> Result<(), Error> {
-			self.delete_note_tag(tag).await
+			let this = self.inner();
+			do_on_commander(move || async move { this.delete_note_tag(tag).await }).await
 		}
 	}
 }

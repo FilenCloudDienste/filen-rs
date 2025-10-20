@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Debug, ops::Deref, sync::Arc};
+use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -14,6 +14,7 @@ use filen_types::{
 };
 use fs::{SharedDirectory, SharedFile};
 use futures::stream::{FuturesUnordered, StreamExt};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -26,6 +27,7 @@ use crate::{
 		dir::{HasUUIDContents, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
+	runtime::{blocking_join, do_cpu_intensive},
 	util::MaybeSendBoxFuture,
 };
 
@@ -268,21 +270,21 @@ impl Client {
 				receiver_id: user.id,
 				metadata: item
 					.get_rsa_encrypted_meta(&user.public_key)
+					.await
 					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await
 	}
 
-	async fn update_linked_item_meta<I, MC>(
+	async fn update_linked_item_meta<I>(
 		&self,
 		item: &I,
 		link_uuid: UuidStr,
-		crypter: impl Deref<Target = MC>,
+		crypter: &impl MetaCrypter,
 	) -> Result<(), Error>
 	where
 		I: HasMeta + HasUUID,
-		MC: MetaCrypter,
 	{
 		api::v3::item::linked::rename::post(
 			self.client(),
@@ -291,6 +293,7 @@ impl Client {
 				link_uuid,
 				metadata: item
 					.get_encrypted_meta(crypter)
+					.await
 					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
@@ -323,6 +326,7 @@ impl Client {
 			futures.push(Box::pin(async move {
 				let crypter = self
 					.decrypt_meta_key(&link.link_key)
+					.await
 					.map_err(|_| MetadataWasNotDecryptedError)?;
 				self.update_linked_item_meta(item, link.link_uuid, &crypter)
 					.await
@@ -379,6 +383,7 @@ impl Client {
 			let link = Arc::new(link);
 			let crypter = Arc::new(
 				self.decrypt_meta_key(&link.link_key)
+					.await
 					.map_err(|_| MetadataWasNotDecryptedError)?,
 			);
 			for item in &items_to_process {
@@ -410,15 +415,14 @@ impl Client {
 		Ok(())
 	}
 
-	pub(crate) async fn add_item_to_directory_link<I, MC>(
+	pub(crate) async fn add_item_to_directory_link<I>(
 		&self,
 		item: &I,
 		link: &ListedPublicLink<'_>,
-		link_crypter: impl Deref<Target = MC>,
+		link_crypter: &impl MetaCrypter,
 	) -> Result<(), Error>
 	where
 		I: HasParent + HasMeta + HasUUID + HasType + ?Sized,
-		MC: MetaCrypter,
 	{
 		api::v3::dir::link::add::post(
 			self.client(),
@@ -429,6 +433,7 @@ impl Client {
 				r#type: item.object_type(),
 				metadata: item
 					.get_encrypted_meta(link_crypter)
+					.await
 					.ok_or(MetadataWasNotDecryptedError)?,
 				key: link.link_key.as_borrowed_cow(),
 				expiration: PublicLinkExpiration::Never,
@@ -443,12 +448,14 @@ impl Client {
 		let (dirs, files) = self.list_dir_recursive(dir).await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
-			link_key: self.encrypt_meta_key(
-				public_link
-					.link_key
-					.as_ref()
-					.ok_or(MetadataWasNotDecryptedError)?,
-			),
+			link_key: self
+				.encrypt_meta_key(
+					public_link
+						.link_key
+						.as_ref()
+						.ok_or(MetadataWasNotDecryptedError)?,
+				)
+				.await,
 		};
 
 		let mut futures = FuturesUnordered::new();
@@ -467,6 +474,7 @@ impl Client {
 					r#type: ObjectType::Dir,
 					metadata: dir
 						.get_encrypted_meta(key)
+						.await
 						.ok_or(MetadataWasNotDecryptedError)?,
 					key: link.link_key.as_borrowed_cow(),
 					expiration: PublicLinkExpiration::Never,
@@ -614,18 +622,26 @@ impl Client {
 		)
 		.await?;
 
-		let size_str = self.crypter().decrypt_meta(&response.size)?;
-		let size = size_str.parse::<u64>().map_err(|_| {
+		let crypter = self.crypter();
+
+		let (decrypted_size, decrypted_name, decrypted_mime) = futures::join!(
+			crypter.decrypt_meta(&response.size),
+			crypter.decrypt_meta(&response.name),
+			crypter.decrypt_meta(&response.mime),
+		);
+
+		let decrypted_size = decrypted_size?;
+		let size = decrypted_size.parse::<u64>().map_err(|_| {
 			Error::custom(
 				ErrorKind::Conversion,
-				format!("Failed to parse size: {size_str}"),
+				format!("Failed to parse size: {decrypted_size}"),
 			)
 		})?;
 
 		let file_info = LinkedFileInfo {
 			uuid: response.uuid,
-			name: self.crypter().decrypt_meta(&response.name).ok(),
-			mime: self.crypter().decrypt_meta(&response.mime).ok(),
+			name: decrypted_name.ok(),
+			mime: decrypted_mime.ok(),
 			hashed_password: response.password.map(|v| v.into_owned()),
 			chunks: response.chunks,
 			size,
@@ -654,20 +670,27 @@ impl Client {
 			Some(link_status) => link_status,
 		};
 
-		let info_response = api::v3::dir::link::info::post(
-			self.client(),
-			&api::v3::dir::link::info::Request {
-				uuid: link_status.uuid,
+		let (info_response, decrypted_link_key) = futures::join!(
+			async {
+				api::v3::dir::link::info::post(
+					self.client(),
+					&api::v3::dir::link::info::Request {
+						uuid: link_status.uuid,
+					},
+				)
+				.await
 			},
-		)
-		.await?;
+			self.decrypt_meta_key(&link_status.key)
+		);
+
+		let info_response = info_response?;
 		let password = match link_status.password {
 			Some(password) => PasswordState::Hashed(password.into_owned()),
 			None => PasswordState::None,
 		};
 		Ok(Some(DirPublicLink {
 			link_uuid: link_status.uuid,
-			link_key: self.decrypt_meta_key(&link_status.key).ok(),
+			link_key: decrypted_link_key.ok(),
 			password,
 			expiration: link_status.expiration_text,
 			enable_download: link_status.download_btn,
@@ -692,41 +715,47 @@ impl Client {
 
 		let crypter = link.crypter().ok_or(MetadataWasNotDecryptedError)?;
 
-		let dirs = response
-			.dirs
-			.into_iter()
-			.map(|d| {
-				RemoteDirectory::from_encrypted(
-					d.uuid,
-					d.parent.into(),
-					d.color,
-					false,
-					d.timestamp,
-					d.metadata,
-					crypter,
-				)
-			})
-			.collect::<Vec<_>>();
+		do_cpu_intensive(|| {
+			let (dirs, files) = blocking_join!(
+				|| response
+					.dirs
+					.into_par_iter()
+					.map(|d| {
+						RemoteDirectory::blocking_from_encrypted(
+							d.uuid,
+							d.parent.into(),
+							d.color,
+							false,
+							d.timestamp,
+							d.metadata,
+							crypter,
+						)
+					})
+					.collect::<Vec<_>>(),
+				|| response
+					.files
+					.into_par_iter()
+					.map(|f| {
+						let meta =
+							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
+						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+							f.uuid,
+							f.parent.into(),
+							f.size,
+							f.chunks,
+							f.region,
+							f.bucket,
+							f.timestamp,
+							false,
+							meta,
+						))
+					})
+					.collect::<Result<Vec<_>, Error>>()
+			);
 
-		let files: Vec<RemoteFile> = response
-			.files
-			.into_iter()
-			.map(|f| {
-				let meta = FileMeta::from_encrypted(f.metadata, crypter, f.version);
-				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-					f.uuid,
-					f.parent.into(),
-					f.size,
-					f.chunks,
-					f.region,
-					f.bucket,
-					f.timestamp,
-					false,
-					meta,
-				))
-			})
-			.collect::<Result<Vec<_>, Error>>()?;
-		Ok((dirs, files))
+			Ok((dirs, files?))
+		})
+		.await
 	}
 
 	pub async fn remove_dir_link(&self, link: DirPublicLink) -> Result<(), Error> {
@@ -753,6 +782,7 @@ impl Client {
 				r#type: item.object_type(),
 				metadata: item
 					.get_rsa_encrypted_meta(&user.public_key)
+					.await
 					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
@@ -782,6 +812,7 @@ impl Client {
 					r#type: ObjectType::Dir,
 					metadata: dir
 						.get_rsa_encrypted_meta(&client.public_key)
+						.await
 						.ok_or(MetadataWasNotDecryptedError)?,
 				},
 			)
@@ -821,6 +852,7 @@ impl Client {
 				r#type: ObjectType::File,
 				metadata: file
 					.get_rsa_encrypted_meta(&contact.public_key)
+					.await
 					.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
@@ -841,18 +873,28 @@ impl Client {
 		)
 		.await?;
 
-		let dirs = response
-			.dirs
-			.into_iter()
-			.map(|d| SharedDirectory::from_shared_out(d, self.crypter()))
-			.collect::<Result<Vec<_>, _>>()?;
+		let crypter = self.crypter();
 
-		let files = response
-			.files
-			.into_iter()
-			.map(|f| SharedFile::from_shared_out(f, self.crypter()))
-			.collect::<Result<Vec<_>, _>>()?;
-		Ok((dirs, files))
+		do_cpu_intensive(|| {
+			let (dirs, files) = blocking_join!(
+				|| {
+					response
+						.dirs
+						.into_par_iter()
+						.map(|d| SharedDirectory::blocking_from_shared_out(d, &*crypter))
+						.collect::<Result<Vec<_>, _>>()
+				},
+				|| {
+					response
+						.files
+						.into_par_iter()
+						.map(|f| SharedFile::blocking_from_shared_out(f, &*crypter))
+						.collect::<Result<Vec<_>, _>>()
+				}
+			);
+			Ok((dirs?, files?))
+		})
+		.await
 	}
 
 	pub async fn list_out_shared(
@@ -882,18 +924,29 @@ impl Client {
 			},
 		)
 		.await?;
-		let dirs = response
-			.dirs
-			.into_iter()
-			.map(|d| SharedDirectory::from_shared_in(d, self.private_key()))
-			.collect::<Result<Vec<_>, _>>()?;
 
-		let files = response
-			.files
-			.into_iter()
-			.map(|f| SharedFile::from_shared_in(f, self.private_key()))
-			.collect::<Result<Vec<_>, _>>()?;
-		Ok((dirs, files))
+		let priv_key = self.private_key();
+
+		do_cpu_intensive(|| {
+			let (dirs, files) = blocking_join!(
+				|| {
+					response
+						.dirs
+						.into_par_iter()
+						.map(|d| SharedDirectory::blocking_from_shared_in(d, priv_key))
+						.collect::<Result<Vec<_>, _>>()
+				},
+				|| {
+					response
+						.files
+						.into_par_iter()
+						.map(|f| SharedFile::blocking_from_shared_in(f, priv_key))
+						.collect::<Result<Vec<_>, _>>()
+				}
+			);
+			Ok((dirs?, files?))
+		})
+		.await
 	}
 
 	pub async fn list_in_shared(&self) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {

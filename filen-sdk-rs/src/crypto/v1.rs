@@ -172,11 +172,11 @@ impl FromStr for FileKey {
 }
 
 impl DataCrypter for FileKey {
-	fn encrypt_data(&self, _data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	fn blocking_encrypt_data(&self, _data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		unimplemented!("Data encryption for V1 is not supported");
 	}
 
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		decrypt_data(&self.key, data)
 	}
 }

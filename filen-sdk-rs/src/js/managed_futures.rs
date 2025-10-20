@@ -16,6 +16,8 @@ mod pausable {
 	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 	use web_sys::js_sys;
 
+	use crate::{Error, ErrorKind};
+
 	pin_project! {
 		pub(super) struct Pausable<F> where F: Future {
 			#[pin]
@@ -39,7 +41,7 @@ mod pausable {
 	pub struct PauseSignal(#[serde(with = "serde_wasm_bindgen::preserve")] JsValue);
 
 	impl PauseSignal {
-		pub(super) fn into_pausable<F>(self, fut: F) -> Result<Pausable<F>, JsValue>
+		pub(super) fn into_pausable<F>(self, fut: F) -> Result<Pausable<F>, Error>
 		where
 			F: Future,
 		{
@@ -48,7 +50,12 @@ mod pausable {
 				signal: if self.0.is_undefined() {
 					None
 				} else {
-					Some(PauseSignalRust::clone_from_js_value(self.0)?)
+					Some(PauseSignalRust::clone_from_js_value(self.0).map_err(|e| {
+						Error::custom(
+							ErrorKind::Conversion,
+							format!("got error when converting to PauseSignal: {:?}", e),
+						)
+					})?)
 				},
 			};
 			Ok(pausable)
@@ -238,7 +245,7 @@ mod managed {
 	use pin_project_lite::pin_project;
 	use serde::Deserialize;
 	use tsify::Tsify;
-	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+	use wasm_bindgen::prelude::wasm_bindgen;
 
 	use crate::{Error, error::AbortedError};
 
@@ -257,7 +264,7 @@ mod managed {
 		pub(crate) fn into_js_managed_future<F>(
 			self,
 			fut: F,
-		) -> Result<JSManagedFuture<F, impl Future<Output = AbortedError>>, JsValue>
+		) -> Result<JSManagedFuture<F, impl Future<Output = AbortedError>>, Error>
 		where
 			F: std::future::Future,
 		{

@@ -23,16 +23,16 @@ pub(crate) struct AuthInfo {
 }
 
 impl MetaCrypter for AuthInfo {
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
-		self.master_keys.encrypt_meta_into(meta, out)
+	fn blocking_encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
+		self.master_keys.blocking_encrypt_meta_into(meta, out)
 	}
 
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
-		self.master_keys.decrypt_meta_into(meta, out)
+		self.master_keys.blocking_decrypt_meta_into(meta, out)
 	}
 }
 
@@ -68,11 +68,11 @@ pub(super) async fn login(
 	let auth_client = super::AuthClient::new_from_client(response.api_key, client);
 
 	let master_keys = if let Some(master_keys_str) = response.master_keys {
-		crypto::v2::MasterKeys::new(master_keys_str, master_key)?
+		crypto::v2::MasterKeys::new(master_keys_str, master_key).await?
 		// no master key set, set one up
 	} else {
 		let master_keys = MasterKeys::new_from_key(master_key);
-		let encrypted = master_keys.to_encrypted();
+		let encrypted = master_keys.to_encrypted().await;
 		api::v3::user::master_keys::post(
 			&auth_client,
 			&api::v3::user::master_keys::Request {

@@ -5,6 +5,7 @@ use std::{
 };
 
 use filen_types::api::v3::search::{add::SearchAddItem, find::SearchFindItem};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::{
 	api,
@@ -16,6 +17,7 @@ use crate::{
 		dir::{DecryptedDirectoryMeta, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
+	runtime::do_cpu_intensive,
 };
 
 pub struct SplitName<'a> {
@@ -157,80 +159,87 @@ impl Client {
 			},
 		)
 		.await?;
-		response
-			.items
-			.into_iter()
-			.map(|item| {
-				let (item, metadata_path) = match item {
-					SearchFindItem::Dir(found_dir) => (
-						NonRootFSObject::Dir(Cow::Owned(RemoteDirectory::from_encrypted(
-							found_dir.uuid,
-							found_dir.parent.into(),
-							found_dir.color,
-							found_dir.favorited,
-							found_dir.timestamp,
-							found_dir.metadata,
-							self.crypter(),
-						))),
-						found_dir.metadata_path,
-					),
-					SearchFindItem::File(found_file) => {
-						let meta = FileMeta::from_encrypted(
-							found_file.metadata,
-							self.crypter(),
-							found_file.version,
-						);
-						(
-							NonRootFSObject::File(Cow::Owned(RemoteFile::from_meta(
-								found_file.uuid,
-								found_file.parent.into(),
-								found_file.size,
-								found_file.chunks,
-								found_file.region,
-								found_file.bucket,
-								found_file.timestamp,
-								found_file.favorited,
-								meta,
-							))),
-							found_file.metadata_path,
-						)
-					}
-				};
-
-				let mut path = metadata_path
-					.into_iter()
-					.filter_map(|meta| match meta.0.as_ref() {
-						"default" => None,
-						_ => {
-							let decrypted = match self.crypter().decrypt_meta(&meta) {
-								Ok(decrypted) => decrypted,
-								Err(e) => {
-									return Some(Err(e));
-								}
-							};
-							Some(
-								match serde_json::from_str::<DecryptedDirectoryMeta>(&decrypted) {
-									Ok(meta) => Ok(meta),
-									Err(e) => Err(e.into()),
-								},
+		let crypter = self.crypter();
+		do_cpu_intensive(|| {
+			response
+				.items
+				.into_par_iter()
+				.map(|item| {
+					let (item, metadata_path) = match item {
+						SearchFindItem::Dir(found_dir) => (
+							NonRootFSObject::Dir(Cow::Owned(
+								RemoteDirectory::blocking_from_encrypted(
+									found_dir.uuid,
+									found_dir.parent.into(),
+									found_dir.color,
+									found_dir.favorited,
+									found_dir.timestamp,
+									found_dir.metadata,
+									&*crypter,
+								),
+							)),
+							found_dir.metadata_path,
+						),
+						SearchFindItem::File(found_file) => {
+							let meta = FileMeta::blocking_from_encrypted(
+								found_file.metadata,
+								&*crypter,
+								found_file.version,
+							);
+							(
+								NonRootFSObject::File(Cow::Owned(RemoteFile::from_meta(
+									found_file.uuid,
+									found_file.parent.into(),
+									found_file.size,
+									found_file.chunks,
+									found_file.region,
+									found_file.bucket,
+									found_file.timestamp,
+									found_file.favorited,
+									meta,
+								))),
+								found_file.metadata_path,
 							)
 						}
-					})
-					.try_fold("/".to_string(), |mut acc, meta| match meta {
-						Ok(meta) => {
-							acc.push_str(meta.name());
-							acc.push('/');
-							Ok(acc)
-						}
-						Err(e) => Err(e),
-					})?;
-				if path.len() > 1 {
-					path.pop(); // remove final /
-				}
+					};
 
-				Ok((item, path))
-			})
-			.collect()
+					let mut path = metadata_path
+						.into_iter()
+						.filter_map(|meta| match meta.0.as_ref() {
+							"default" => None,
+							_ => {
+								let decrypted = match crypter.blocking_decrypt_meta(&meta) {
+									Ok(decrypted) => decrypted,
+									Err(e) => {
+										return Some(Err(e));
+									}
+								};
+								Some(
+									match serde_json::from_str::<DecryptedDirectoryMeta>(&decrypted)
+									{
+										Ok(meta) => Ok(meta),
+										Err(e) => Err(e.into()),
+									},
+								)
+							}
+						})
+						.try_fold("/".to_string(), |mut acc, meta| match meta {
+							Ok(meta) => {
+								acc.push_str(meta.name());
+								acc.push('/');
+								Ok(acc)
+							}
+							Err(e) => Err(e),
+						})?;
+					if path.len() > 1 {
+						path.pop(); // remove final /
+					}
+
+					Ok((item, path))
+				})
+				.collect()
+		})
+		.await
 	}
 }
 
@@ -240,7 +249,7 @@ mod js_impl {
 	use tsify::Tsify;
 	use wasm_bindgen::prelude::wasm_bindgen;
 
-	use crate::{auth::Client, js::NonRootItemTagged};
+	use crate::{auth::JsClient, js::NonRootItemTagged, runtime::do_on_commander};
 
 	#[derive(Serialize, Tsify)]
 	#[tsify(into_wasm_abi)]
@@ -249,21 +258,25 @@ mod js_impl {
 		pub path: String,
 	}
 
-	#[wasm_bindgen]
-	impl Client {
+	#[wasm_bindgen(js_class = "Client")]
+	impl JsClient {
 		#[wasm_bindgen(js_name = "findItemMatchesForName")]
 		pub async fn find_item_matches_for_name_js(
 			&self,
 			name: String,
 		) -> Result<Vec<ItemMatch>, crate::error::Error> {
-			let matches = self.find_item_matches_for_name(&name).await?;
-			Ok(matches
-				.into_iter()
-				.map(|(item, path)| ItemMatch {
-					item: item.into(),
-					path,
-				})
-				.collect())
+			let this = self.inner();
+			do_on_commander(move || async move {
+				let matches = this.find_item_matches_for_name(&name).await?;
+				Ok(matches
+					.into_iter()
+					.map(|(item, path)| ItemMatch {
+						item: item.into(),
+						path,
+					})
+					.collect())
+			})
+			.await
 		}
 	}
 }

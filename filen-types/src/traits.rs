@@ -44,9 +44,9 @@ where
 	}
 }
 
-impl<'a, T> CowHelpers for Vec<T>
+impl<T> CowHelpers for Vec<T>
 where
-	T: CowHelpers + 'a,
+	T: CowHelpers,
 {
 	type CowBorrowed<'borrow>
 		= Vec<T::CowBorrowed<'borrow>>
@@ -69,9 +69,9 @@ where
 	}
 }
 
-impl<'a, T> CowHelpers for Option<T>
+impl<T> CowHelpers for Option<T>
 where
-	T: CowHelpers + 'a,
+	T: CowHelpers,
 {
 	type CowBorrowed<'borrow>
 		= Option<T::CowBorrowed<'borrow>>

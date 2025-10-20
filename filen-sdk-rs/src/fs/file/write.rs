@@ -20,6 +20,7 @@ use crate::{
 	},
 	error::Error,
 	fs::file::chunk::Chunk,
+	runtime::{blocking_join, do_cpu_intensive},
 	sync::lock::ResourceLock,
 	util::{MaybeSendBoxFuture, MaybeSendCallback},
 };
@@ -92,7 +93,7 @@ impl<'a> FileWriterUploadingState<'a> {
 				len <= CHUNK_SIZE_U64,
 				"Chunk size exceeded {CHUNK_SIZE_U64}: {len}"
 			);
-			file.key().encrypt_data(out_data.as_mut())?;
+			file.key().blocking_encrypt_data(out_data.as_mut())?;
 
 			// upload the data
 			let (chunk_bytes, permit) = out_data.into_parts();
@@ -293,39 +294,45 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		drive_lock: Arc<ResourceLock>,
 	) -> Result<FileWriterCompletingState<'a>, Error> {
 		let file = self.file.clone();
-		let empty_request = filen_types::api::v3::upload::empty::Request {
-			uuid: file.uuid(),
-			name: self.client.crypter().encrypt_meta(file.name()),
-			name_hashed: Cow::Owned(self.client.hash_name(file.name())),
-			size: self
-				.client
-				.crypter()
-				.encrypt_meta(&self.written.to_string()),
-			parent: file.parent,
-			mime: self
-				.client
-				.crypter()
-				.encrypt_meta(self.file.as_ref().mime()),
-			metadata: self.client.crypter().encrypt_meta(&serde_json::to_string(
-				&DecryptedFileMeta {
-					name: Cow::Borrowed(file.name()),
-					size: self.written,
-					mime: Cow::Borrowed(file.mime()),
-					key: Cow::Borrowed(file.key()),
-					created: Some(file.created()),
-					last_modified: file.last_modified(),
-					hash: Some(self.hash),
-				},
-			)?),
-			version: self.client.file_encryption_version(),
-		};
+		let crypter = self.client.crypter();
+
+		let empty_request_future = do_cpu_intensive(move || {
+			let (name, size, mime, metadata) = blocking_join!(
+				|| crypter.blocking_encrypt_meta(file.name()),
+				|| crypter.blocking_encrypt_meta(&self.written.to_string()),
+				|| crypter.blocking_encrypt_meta(file.as_ref().mime()),
+				|| Ok::<_, Error>(crypter.blocking_encrypt_meta(&serde_json::to_string(
+					&DecryptedFileMeta {
+						name: Cow::Borrowed(file.name()),
+						size: self.written,
+						mime: Cow::Borrowed(file.mime()),
+						key: Cow::Borrowed(file.key()),
+						created: Some(file.created()),
+						last_modified: file.last_modified(),
+						hash: Some(self.hash),
+					},
+				)?))
+			);
+
+			Ok::<_, Error>(filen_types::api::v3::upload::empty::Request {
+				uuid: file.uuid(),
+				name,
+				name_hashed: Cow::Owned(self.client.hash_name(file.name())),
+				size,
+				parent: file.parent,
+				mime,
+				metadata: metadata?,
+				version: self.client.file_encryption_version(),
+			})
+		});
 
 		let future: MaybeSendBoxFuture<
 			'a,
 			Result<filen_types::api::v3::upload::empty::Response, Error>,
 		> = if self.written == 0 {
 			Box::pin(async move {
-				api::v3::upload::empty::post(self.client.client(), &empty_request).await
+				api::v3::upload::empty::post(self.client.client(), &empty_request_future.await?)
+					.await
 			})
 		} else {
 			let upload_key = self.upload_key.clone();
@@ -337,7 +344,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 				api::v3::upload::done::post(
 					self.client.client(),
 					&api::v3::upload::done::Request {
-						empty_request,
+						empty_request: empty_request_future.await?,
 						chunks: self.num_chunks,
 						rm,
 						upload_key: Cow::Borrowed(&upload_key),
@@ -348,7 +355,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		};
 
 		Ok(FileWriterCompletingState {
-			file: self.file.clone(),
+			file: self.file,
 			future,
 			hash: self.hash,
 			remote_file_info: self.remote_file_info,

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref};
+use std::borrow::Cow;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use digest::Digest;
@@ -14,6 +14,8 @@ use rsa::{
 	traits::PrivateKeyParts,
 };
 use sha2::{Sha256, Sha512};
+
+use crate::runtime;
 
 use super::{error::ConversionError, shared::MetaCrypter};
 
@@ -51,15 +53,12 @@ impl HMACKey {
 	}
 }
 
-pub(crate) fn get_key_pair<MC>(
+pub(crate) async fn get_key_pair(
 	public_key: RsaPublicKey,
-	private_key: &EncryptedPrivateKey,
-	meta_crypter: impl Deref<Target = MC>,
-) -> Result<(RsaPrivateKey, RsaPublicKey, HMACKey), ConversionError>
-where
-	MC: MetaCrypter,
-{
-	let private_key_str = meta_crypter.deref().decrypt_meta(&private_key.0)?;
+	private_key: &EncryptedPrivateKey<'_>,
+	meta_crypter: &impl MetaCrypter,
+) -> Result<(RsaPrivateKey, RsaPublicKey, HMACKey), ConversionError> {
+	let private_key_str = meta_crypter.decrypt_meta(&private_key.0).await?;
 	let private_key = RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(&private_key_str)?)?;
 
 	if *private_key.as_ref() != public_key {
@@ -70,20 +69,24 @@ where
 	Ok((private_key, public_key, hmac))
 }
 
-pub(crate) fn encrypt_private_key<MC>(
+pub(crate) async fn encrypt_private_key(
 	private_key: &RsaPrivateKey,
-	meta_crypter: impl Deref<Target = MC>,
-) -> Result<EncryptedPrivateKey<'static>, ConversionError>
-where
-	MC: MetaCrypter,
-{
+	meta_crypter: &impl MetaCrypter,
+) -> Result<EncryptedPrivateKey<'static>, ConversionError> {
 	let der = private_key.to_pkcs8_der()?;
 	let der_base64 = BASE64_STANDARD.encode(der.as_bytes());
-	let encrypted = meta_crypter.deref().encrypt_meta(&der_base64);
+	let encrypted = meta_crypter.encrypt_meta(&der_base64).await;
 	Ok(EncryptedPrivateKey(encrypted))
 }
 
-pub(crate) fn encrypt_with_public_key(
+pub(crate) fn encrypt_with_public_key<'a>(
+	public_key: &'a RsaPublicKey,
+	data: &'a [u8],
+) -> impl Future<Output = Result<RSAEncryptedString<'static>, rsa::Error>> + Send + 'a {
+	runtime::do_cpu_intensive(|| blocking_encrypt_with_public_key(public_key, data))
+}
+
+pub(crate) fn blocking_encrypt_with_public_key(
 	public_key: &RsaPublicKey,
 	data: &[u8],
 ) -> Result<RSAEncryptedString<'static>, rsa::Error> {
@@ -95,12 +98,18 @@ pub(crate) fn encrypt_with_public_key(
 	)))
 }
 
-pub fn decrypt_with_private_key(
+pub fn blocking_decrypt_with_private_key(
 	private_key: &RsaPrivateKey,
-	data: &RSAEncryptedString,
+	data: &RSAEncryptedString<'_>,
 ) -> Result<Vec<u8>, ConversionError> {
 	let encrypted_data = BASE64_STANDARD.decode(data.0.as_ref())?;
 	let decrypted_data = private_key.decrypt(Oaep::new::<Sha512>(), &encrypted_data)?;
-
 	Ok(decrypted_data)
+}
+
+pub fn decrypt_with_private_key<'a>(
+	private_key: &'a RsaPrivateKey,
+	data: &'a RSAEncryptedString<'a>,
+) -> impl Future<Output = Result<Vec<u8>, ConversionError>> + Send + 'a {
+	runtime::do_cpu_intensive(|| blocking_decrypt_with_private_key(private_key, data))
 }

@@ -3,26 +3,75 @@ use digest::consts::{U12, U16};
 use filen_types::crypto::EncryptedString;
 use rand::{Rng, rngs::ThreadRng};
 
+use crate::runtime;
+
 use super::error::ConversionError;
 
-pub trait MetaCrypter {
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static>;
-	fn encrypt_meta(&self, meta: &str) -> EncryptedString<'static> {
-		self.encrypt_meta_into(meta, String::new())
+pub trait MetaCrypter: Send + Sync {
+	fn blocking_encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static>;
+	fn blocking_encrypt_meta(&self, meta: &str) -> EncryptedString<'static> {
+		self.blocking_encrypt_meta_into(meta, String::new())
 	}
-	fn decrypt_meta_into(
+
+	fn encrypt_meta_into<'a>(
+		&'a self,
+		meta: &'a str,
+		out: String,
+	) -> impl Future<Output = EncryptedString<'static>> + Send + 'a {
+		runtime::do_cpu_intensive(move || self.blocking_encrypt_meta_into(meta, out))
+	}
+
+	fn encrypt_meta<'a>(
+		&'a self,
+		meta: &'a str,
+	) -> impl Future<Output = EncryptedString<'static>> + Send + 'a {
+		runtime::do_cpu_intensive(move || self.blocking_encrypt_meta(meta))
+	}
+
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString<'_>,
+		meta: &EncryptedString,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)>;
-	fn decrypt_meta(&self, meta: &EncryptedString<'_>) -> Result<String, ConversionError> {
-		self.decrypt_meta_into(meta, Vec::new()).map_err(|(e, _)| e)
+
+	fn blocking_decrypt_meta(&self, meta: &EncryptedString) -> Result<String, ConversionError> {
+		self.blocking_decrypt_meta_into(meta, Vec::new())
+			.map_err(|(e, _)| e)
+	}
+
+	fn decrypt_meta_into<'a>(
+		&'a self,
+		meta: &'a EncryptedString<'a>,
+		out: Vec<u8>,
+	) -> impl Future<Output = Result<String, (ConversionError, Vec<u8>)>> + Send + 'a {
+		runtime::do_cpu_intensive(|| self.blocking_decrypt_meta_into(meta, out))
+	}
+
+	fn decrypt_meta<'a>(
+		&'a self,
+		meta: &'a EncryptedString<'a>,
+	) -> impl Future<Output = Result<String, ConversionError>> + Send + 'a {
+		runtime::do_cpu_intensive(|| self.blocking_decrypt_meta(meta))
 	}
 }
 
-pub(crate) trait DataCrypter {
-	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
+pub(crate) trait DataCrypter: Send + Sync {
+	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
+	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
+
+	fn encrypt_data<'a>(
+		&'a self,
+		data: &'a mut Vec<u8>,
+	) -> impl Future<Output = Result<(), ConversionError>> + Send + 'a {
+		runtime::do_cpu_intensive(|| self.blocking_encrypt_data(data))
+	}
+
+	fn decrypt_data<'a>(
+		&'a self,
+		data: &'a mut Vec<u8>,
+	) -> impl Future<Output = Result<(), ConversionError>> + Send + 'a {
+		runtime::do_cpu_intensive(|| self.blocking_decrypt_data(data))
+	}
 }
 
 pub(crate) trait CreateRandom: Sized {

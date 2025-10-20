@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref, str::FromStr};
+use std::{borrow::Cow, str::FromStr};
 
 use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
 use rsa::{RsaPrivateKey, RsaPublicKey};
@@ -54,41 +54,47 @@ impl<'de> Deserialize<'de> for NoteOrChatKey {
 }
 
 impl MetaCrypter for NoteOrChatKey {
-	fn encrypt_meta_into(
+	fn blocking_encrypt_meta_into(
 		&self,
 		meta: &str,
 		out: String,
 	) -> filen_types::crypto::EncryptedString<'static> {
 		match self {
-			NoteOrChatKey::V2(key) => key.encrypt_meta_into(meta, out),
-			NoteOrChatKey::V3(key) => key.encrypt_meta_into(meta, out),
+			NoteOrChatKey::V2(key) => key.blocking_encrypt_meta_into(meta, out),
+			NoteOrChatKey::V3(key) => key.blocking_encrypt_meta_into(meta, out),
 		}
 	}
 
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
 		meta: &filen_types::crypto::EncryptedString<'_>,
 		out: Vec<u8>,
 	) -> Result<String, (super::error::ConversionError, Vec<u8>)> {
 		match self {
-			NoteOrChatKey::V2(key) => key.decrypt_meta_into(meta, out),
-			NoteOrChatKey::V3(key) => key.decrypt_meta_into(meta, out),
+			NoteOrChatKey::V2(key) => key.blocking_decrypt_meta_into(meta, out),
+			NoteOrChatKey::V3(key) => key.blocking_decrypt_meta_into(meta, out),
 		}
 	}
 }
 
 impl DataCrypter for NoteOrChatKey {
-	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), super::error::ConversionError> {
+	fn blocking_encrypt_data(
+		&self,
+		data: &mut Vec<u8>,
+	) -> Result<(), super::error::ConversionError> {
 		match self {
-			NoteOrChatKey::V2(key) => key.encrypt_data(data),
-			NoteOrChatKey::V3(key) => key.encrypt_data(data),
+			NoteOrChatKey::V2(key) => key.blocking_encrypt_data(data),
+			NoteOrChatKey::V3(key) => key.blocking_encrypt_data(data),
 		}
 	}
 
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), super::error::ConversionError> {
+	fn blocking_decrypt_data(
+		&self,
+		data: &mut Vec<u8>,
+	) -> Result<(), super::error::ConversionError> {
 		match self {
-			NoteOrChatKey::V2(key) => key.decrypt_data(data),
-			NoteOrChatKey::V3(key) => key.decrypt_data(data),
+			NoteOrChatKey::V2(key) => key.blocking_decrypt_data(data),
+			NoteOrChatKey::V3(key) => key.blocking_decrypt_data(data),
 		}
 	}
 }
@@ -115,41 +121,28 @@ where
 	T: ToOwned + ?Sized,
 	T::Owned: Default,
 {
-	fn try_decrypt<MC>(
-		crypter: impl Deref<Target = MC>,
+	fn blocking_try_decrypt(
+		crypter: &impl MetaCrypter,
 		encrypted: &EncryptedString<'_>,
-		outer_tmp_vec: &mut Vec<u8>,
-	) -> Result<T::Owned, Error>
-	where
-		MC: MetaCrypter,
-	{
+	) -> Result<T::Owned, Error> {
 		if encrypted.0.is_empty() {
 			return Ok(T::Owned::default());
 		}
 
-		let tmp_vec = std::mem::take(outer_tmp_vec);
-		let decrypted = crypter
-			.deref()
-			.decrypt_meta_into(encrypted, tmp_vec)
-			.map_err(|(e, tmp_vec)| {
-				*outer_tmp_vec = tmp_vec;
-				Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note title"))
-			})?;
+		let decrypted = crypter.blocking_decrypt_meta(encrypted).map_err(|e| {
+			Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note title"))
+		})?;
 
 		let carrier: Self::WithLifetime<'_> = serde_json::from_str(&decrypted)?;
 		let out_string = Self::into_inner(carrier);
-		*outer_tmp_vec = decrypted.into_bytes();
 		Ok(out_string)
 	}
 
-	fn encrypt<MC>(crypter: impl Deref<Target = MC>, inner: &T) -> EncryptedString<'static>
-	where
-		MC: MetaCrypter,
-	{
+	fn blocking_encrypt(crypter: &impl MetaCrypter, inner: &T) -> EncryptedString<'static> {
 		let struct_ = Self::from_inner(inner);
 		let struct_string =
 			serde_json::to_string(&struct_).expect("Failed to serialize note title");
-		crypter.deref().encrypt_meta(&struct_string)
+		crypter.blocking_encrypt_meta(&struct_string)
 	}
 }
 
@@ -192,12 +185,12 @@ pub(crate) struct NoteOrChatKeyStruct<'a> {
 }
 
 impl NoteOrChatKeyStruct<'_> {
-	pub(crate) fn try_decrypt_rsa(
+	pub(crate) fn blocking_try_decrypt_rsa(
 		rsa_key: &RsaPrivateKey,
 		encrypted_key: &RSAEncryptedString<'_>,
 	) -> Result<NoteOrChatKey, Error> {
-		let key =
-			crate::crypto::rsa::decrypt_with_private_key(rsa_key, encrypted_key).map_err(|e| {
+		let key = crate::crypto::rsa::blocking_decrypt_with_private_key(rsa_key, encrypted_key)
+			.map_err(|e| {
 				Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note key"))
 			})?;
 		let key_str = str::from_utf8(&key)
@@ -206,7 +199,7 @@ impl NoteOrChatKeyStruct<'_> {
 		Ok(key_struct.key.into_owned())
 	}
 
-	pub(crate) fn try_encrypt_rsa(
+	pub(crate) fn blocking_try_encrypt_rsa(
 		rsa_key: &RsaPublicKey,
 		note_key: &NoteOrChatKey,
 	) -> Result<RSAEncryptedString<'static>, Error> {
@@ -215,23 +208,21 @@ impl NoteOrChatKeyStruct<'_> {
 		};
 		let key_string = serde_json::to_string(&key_struct)?;
 		let encrypted_key =
-			crate::crypto::rsa::encrypt_with_public_key(rsa_key, key_string.as_bytes()).map_err(
-				|e| Error::custom_with_source(ErrorKind::Conversion, e, Some("encrypt note key")),
-			)?;
+			crate::crypto::rsa::blocking_encrypt_with_public_key(rsa_key, key_string.as_bytes())
+				.map_err(|e| {
+					Error::custom_with_source(ErrorKind::Conversion, e, Some("encrypt note key"))
+				})?;
 		Ok(encrypted_key)
 	}
 
-	pub(crate) fn encrypt_symmetric<MC>(
-		crypter: impl Deref<Target = MC>,
+	pub(crate) fn blocking_encrypt_symmetric(
+		crypter: &impl MetaCrypter,
 		note_key: &NoteOrChatKey,
-	) -> EncryptedString<'static>
-	where
-		MC: MetaCrypter,
-	{
+	) -> EncryptedString<'static> {
 		let key_struct = NoteOrChatKeyStruct {
 			key: Cow::Borrowed(note_key),
 		};
 		let key_string = serde_json::to_string(&key_struct).expect("Failed to serialize note key");
-		crypter.deref().encrypt_meta(&key_string)
+		crypter.blocking_encrypt_meta(&key_string)
 	}
 }

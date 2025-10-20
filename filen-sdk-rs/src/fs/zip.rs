@@ -1,6 +1,6 @@
 use async_zip::spec::header::{ExtraField, UnknownExtraField};
 
-use crate::{fs::file::traits::File, util::MaybeSendSync};
+use crate::fs::file::traits::File;
 
 struct ZipExtendedTime {
 	modification: Option<u32>,
@@ -143,9 +143,9 @@ impl ZipState {
 	}
 }
 
-pub trait ZipProgressCallback: Fn(u64, u64, u64, u64) + MaybeSendSync {}
+pub trait ZipProgressCallback: Fn(u64, u64, u64, u64) + Send + Sync {}
 
-impl<T> ZipProgressCallback for T where T: Fn(u64, u64, u64, u64) + MaybeSendSync {}
+impl<T> ZipProgressCallback for T where T: Fn(u64, u64, u64, u64) + Send + Sync {}
 
 mod client_impl {
 	use std::{
@@ -427,20 +427,66 @@ mod client_impl {
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod js_impl {
-	use crate::{Error, auth::Client, crypto::error::ConversionError, js::DownloadFileToZipParams};
+	use crate::{
+		Error, ErrorKind,
+		auth::JsClient,
+		crypto::error::ConversionError,
+		fs::file::js_impl::StreamWriter,
+		js::DownloadFileToZipParams,
+		runtime::{self, do_on_commander},
+	};
 
+	use futures::AsyncWriteExt;
 	use wasm_bindgen::prelude::*;
 
-	#[wasm_bindgen]
-	impl Client {
+	fn spawn_write_future(
+		mut data_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+		mut writer: wasm_streams::writable::IntoAsyncWrite<'static>,
+		result_sender: tokio::sync::oneshot::Sender<Result<(), Error>>,
+	) {
+		runtime::spawn_local(async move {
+			while let Some(data) = data_receiver.recv().await {
+				if let Err(e) = writer.write(&data).await {
+					let _ = result_sender.send(Err(Error::custom(
+						ErrorKind::IO,
+						format!("error writing to stream: {:?}", e),
+					)));
+					return;
+				}
+			}
+
+			if let Err(e) = writer.close().await {
+				let _ = result_sender.send(Err(Error::custom(
+					ErrorKind::IO,
+					format!("error closing stream: {:?}", e),
+				)));
+				return;
+			}
+			let _ = result_sender.send(Ok(()));
+		});
+	}
+
+	#[wasm_bindgen(js_class = "Client")]
+	impl JsClient {
 		#[wasm_bindgen(js_name = "downloadItemsToZip")]
 		pub async fn download_items_to_zip_js(
 			&self,
 			params: DownloadFileToZipParams,
-		) -> Result<(), JsValue> {
+		) -> Result<(), Error> {
+			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
 			let writer = wasm_streams::WritableStream::from_raw(params.writer)
 				.try_into_async_write()
-				.map_err(|(e, _)| e)?;
+				.map_err(|(e, _)| {
+					Error::custom(
+						ErrorKind::Conversion,
+						format!("failed to convert WritableStream to AsyncWrite: {:?}", e),
+					)
+				})?;
+
+			let (result_sender, result_receiver) =
+				tokio::sync::oneshot::channel::<Result<(), Error>>();
+
+			spawn_write_future(data_receiver, writer, result_sender);
 
 			let items = params
 				.items
@@ -451,15 +497,23 @@ mod js_impl {
 
 			let progress_callback = params.progress.into_rust_callback();
 
-			let _ = params
+			let this = self.inner();
+
+			params
 				.managed_future
-				.into_js_managed_future(self.download_items_to_zip(
-					&items,
-					writer,
-					progress_callback.as_ref(),
-				))?
-				.await?;
-			Ok(())
+				.into_js_managed_future(do_on_commander(move || async move {
+					let writer = StreamWriter::new(data_sender);
+
+					this.download_items_to_zip(&items, writer, progress_callback.as_ref())
+						.await?;
+					result_receiver.await.unwrap_or_else(|e| {
+						Err(Error::custom(
+							ErrorKind::IO,
+							format!("zip download result_sender dropped: {}", e),
+						))
+					})
+				}))?
+				.await
 		}
 	}
 }

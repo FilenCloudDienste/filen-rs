@@ -18,10 +18,11 @@ const env = (import.meta as any).env as Record<string, string | undefined>
 
 console.log("Initializing WASM...")
 await init()
-console.log("WASM initialized", navigator.hardwareConcurrency)
+const threads = Math.max((navigator.hardwareConcurrency || 5) - 1, 1)
+console.log(`WASM initialized ${threads} threads`)
 const now = Date.now()
-await initThreadPool(navigator.hardwareConcurrency || 4)
-console.log(`WASM initialized ${navigator.hardwareConcurrency || 4} in ${Date.now() - now}ms`)
+await initThreadPool(threads)
+console.log(`WASM initialized ${threads} in ${Date.now() - now}ms`)
 
 let state: Client
 let shareClient: Client
@@ -102,7 +103,7 @@ test("login", async () => {
 })
 
 test("serialization", async () => {
-	const serializedState = state.toStringified()
+	const serializedState = await state.toStringified()
 	expect(serializedState.rootUuid).toEqual(state.root().uuid)
 	const newState = fromStringified(serializedState)
 	expect(newState.root().uuid).toEqual(state.root().uuid)
@@ -681,9 +682,9 @@ test("chats", async () => {
 		...rest,
 		replyTo: rest.replyTo && {
 			...rest.replyTo,
-			message: JSON.parse(decryptMetaWithChatKey(chat, rest.replyTo.message)).message
+			message: JSON.parse(await decryptMetaWithChatKey(chat, rest.replyTo.message)).message
 		},
-		message: JSON.parse(decryptMetaWithChatKey(chat, rest.message)).message,
+		message: JSON.parse(await decryptMetaWithChatKey(chat, rest.message)).message,
 		chat: conversation,
 		edited: false,
 		editedTimestamp: 0n
@@ -705,7 +706,7 @@ test("search", async () => {
 })
 
 test("authError", async () => {
-	const badStringified = state.toStringified()
+	const badStringified = await state.toStringified()
 	badStringified.apiKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	const badState = fromStringified(badStringified)
 	try {
@@ -735,18 +736,18 @@ test("authError", async () => {
 	}
 })
 
-test.only("sockets", async () => {
-	expect(state.isSocketConnected()).toBe(true)
+test("sockets", async () => {
+	expect(await state.isSocketConnected()).toBe(true)
 	for (const handle of listenerHandles) {
 		handle.free()
 	}
-	expect(state.isSocketConnected()).toBe(false)
+	expect(await state.isSocketConnected()).toBe(false)
 	{
 		/* eslint-disable @typescript-eslint/no-unused-vars */
 		using _ = await state.addSocketListener(null, () => {})
-		expect(state.isSocketConnected()).toBe(true)
+		expect(await state.isSocketConnected()).toBe(true)
 	}
-	expect(state.isSocketConnected()).toBe(false)
+	expect(await state.isSocketConnected()).toBe(false)
 })
 
 afterAll(async () => {

@@ -6,12 +6,14 @@ use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::connect::fs::{ShareInfo, SharingRole};
 #[cfg(feature = "tokio")]
 use crate::error::ErrorKind;
 use crate::fs::dir::DirectoryTypeWithShareInfo;
 use crate::fs::{HasParent, NonRootFSObject};
+use crate::runtime::{blocking_join, do_cpu_intensive};
 use crate::{
 	api,
 	auth::Client,
@@ -62,7 +64,7 @@ impl Client {
 				uuid,
 				parent: *parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(&meta.name)),
-				meta: self.crypter().encrypt_meta(&meta.to_json_string()),
+				meta: self.crypter().encrypt_meta(&meta.to_json_string()).await,
 			},
 		)
 		.await?;
@@ -113,20 +115,23 @@ impl Client {
 	pub async fn get_dir(&self, uuid: UuidStr) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
-		Ok(RemoteDirectory::from_encrypted(
-			uuid,
-			// v3 api returns the original parent as the parent if the file is in the trash
-			if response.trash {
-				ParentUuid::Trash
-			} else {
-				response.parent
-			},
-			response.color,
-			response.favorited,
-			response.timestamp,
-			response.metadata,
-			self.crypter(),
-		))
+		Ok(do_cpu_intensive(|| {
+			RemoteDirectory::blocking_from_encrypted(
+				uuid,
+				// v3 api returns the original parent as the parent if the file is in the trash
+				if response.trash {
+					ParentUuid::Trash
+				} else {
+					response.parent
+				},
+				response.color,
+				response.favorited,
+				response.timestamp,
+				response.metadata,
+				&*self.crypter(),
+			)
+		})
+		.await)
 	}
 
 	pub async fn dir_exists(
@@ -157,41 +162,49 @@ impl Client {
 		)
 		.await?;
 
-		let dirs = response
-			.dirs
-			.into_iter()
-			.map(|d| {
-				RemoteDirectory::from_encrypted(
-					d.uuid,
-					d.parent,
-					d.color,
-					d.favorited,
-					d.timestamp,
-					d.meta,
-					self.crypter(),
-				)
-			})
-			.collect::<Vec<_>>();
+		let crypter = self.crypter();
 
-		let files = response
-			.files
-			.into_iter()
-			.map(|f| {
-				let meta = FileMeta::from_encrypted(f.metadata, self.crypter(), f.version);
-				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-					f.uuid,
-					f.parent,
-					f.size,
-					f.chunks,
-					f.region,
-					f.bucket,
-					f.timestamp,
-					f.favorited,
-					meta,
-				))
-			})
-			.collect::<Result<Vec<_>, _>>()?;
-		Ok((dirs, files))
+		do_cpu_intensive(|| {
+			let (dirs, files) = blocking_join!(
+				|| response
+					.dirs
+					.into_par_iter()
+					.map(|d| {
+						RemoteDirectory::blocking_from_encrypted(
+							d.uuid,
+							d.parent,
+							d.color,
+							d.favorited,
+							d.timestamp,
+							d.meta,
+							&*crypter,
+						)
+					})
+					.collect::<Vec<_>>(),
+				|| response
+					.files
+					.into_par_iter()
+					.map(|f| {
+						let meta =
+							FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
+						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+							f.uuid,
+							f.parent,
+							f.size,
+							f.chunks,
+							f.region,
+							f.bucket,
+							f.timestamp,
+							f.favorited,
+							meta,
+						))
+					})
+					.collect::<Result<Vec<_>, _>>()
+			);
+
+			Ok((dirs, files?))
+		})
+		.await
 	}
 
 	pub async fn list_dir_recursive(
@@ -207,45 +220,52 @@ impl Client {
 		)
 		.await?;
 
-		let dirs = response
-			.dirs
-			.into_iter()
-			.filter_map(|response_dir| {
-				Some(RemoteDirectory::from_encrypted(
-					response_dir.uuid,
-					match response_dir.parent {
-						// the request returns the base dir for the request as one of its dirs, we filter it out here
-						None => return None,
-						Some(parent) => parent,
-					},
-					response_dir.color,
-					response_dir.favorited,
-					response_dir.timestamp,
-					response_dir.meta,
-					self.crypter(),
-				))
-			})
-			.collect::<Vec<_>>();
+		let crypter = self.crypter();
 
-		let files = response
-			.files
-			.into_iter()
-			.map(|f| {
-				let meta = FileMeta::from_encrypted(f.metadata, self.crypter(), f.version);
-				Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-					f.uuid,
-					f.parent,
-					f.chunks_size,
-					f.chunks,
-					f.region,
-					f.bucket,
-					f.timestamp,
-					f.favorited,
-					meta,
-				))
-			})
-			.collect::<Result<Vec<_>, _>>()?;
-		Ok((dirs, files))
+		do_cpu_intensive(|| {
+			let (dirs, files) = blocking_join!(
+				|| response
+					.dirs
+					.into_par_iter()
+					.filter_map(|response_dir| {
+						Some(RemoteDirectory::blocking_from_encrypted(
+							response_dir.uuid,
+							match response_dir.parent {
+								// the request returns the base dir for the request as one of its dirs, we filter it out here
+								None => return None,
+								Some(parent) => parent,
+							},
+							response_dir.color,
+							response_dir.favorited,
+							response_dir.timestamp,
+							response_dir.meta,
+							&*crypter,
+						))
+					})
+					.collect::<Vec<_>>(),
+				|| response
+					.files
+					.into_par_iter()
+					.map(|f| {
+						let meta =
+							FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
+						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+							f.uuid,
+							f.parent,
+							f.chunks_size,
+							f.chunks,
+							f.region,
+							f.bucket,
+							f.timestamp,
+							f.favorited,
+							meta,
+						))
+					})
+					.collect::<Result<Vec<_>, _>>()
+			);
+			Ok((dirs, files?))
+		})
+		.await
 	}
 
 	pub async fn trash_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {
@@ -289,21 +309,28 @@ impl Client {
 		dir: &mut RemoteDirectory,
 		changes: DirectoryMetaChanges,
 	) -> Result<(), Error> {
-		let _lock = self.lock_drive().await?;
 		let new_borrowed_meta = dir.get_meta();
 		let temp_meta = new_borrowed_meta.borrow_with_changes(&changes)?;
 		let DirectoryMeta::Decoded(temp_meta) = temp_meta else {
 			return Err(MetadataWasNotDecryptedError.into());
 		};
 
+		let (_lock, encrypted_meta) = futures::join!(
+			self.lock_drive(),
+			do_cpu_intensive(|| {
+				Ok::<_, Error>(
+					self.crypter()
+						.blocking_encrypt_meta(&serde_json::to_string(&temp_meta)?),
+				)
+			})
+		);
+
 		api::v3::dir::metadata::post(
 			self.client(),
 			&api::v3::dir::metadata::Request {
 				uuid: *dir.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
-				metadata: self
-					.crypter()
-					.encrypt_meta(&serde_json::to_string(&temp_meta)?),
+				metadata: encrypted_meta?,
 			},
 		)
 		.await?;

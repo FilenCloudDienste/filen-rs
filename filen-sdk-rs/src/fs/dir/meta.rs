@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Deref};
+use std::borrow::Cow;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
@@ -44,14 +44,11 @@ impl DirectoryMeta<'_> {
 }
 
 impl<'a> DirectoryMeta<'a> {
-	pub(crate) fn from_encrypted<MC>(
+	pub(crate) fn blocking_from_encrypted(
 		encrypted: EncryptedString<'a>,
-		decrypter: impl Deref<Target = MC>,
-	) -> Self
-	where
-		MC: MetaCrypter,
-	{
-		let Ok(decrypted) = decrypter.deref().decrypt_meta(&encrypted) else {
+		decrypter: &impl MetaCrypter,
+	) -> Self {
+		let Ok(decrypted) = decrypter.blocking_decrypt_meta(&encrypted) else {
 			return Self::Encrypted(encrypted);
 		};
 		let Ok(meta) = serde_json::from_str(&decrypted) else {
@@ -60,11 +57,12 @@ impl<'a> DirectoryMeta<'a> {
 		Self::Decoded(meta)
 	}
 
-	pub(crate) fn from_rsa_encrypted(
+	pub(crate) fn blocking_from_rsa_encrypted(
 		encrypted: RSAEncryptedString<'a>,
 		decrypter: &RsaPrivateKey,
 	) -> Self {
-		let Ok(decrypted) = crypto::rsa::decrypt_with_private_key(decrypter, &encrypted) else {
+		let Ok(decrypted) = crypto::rsa::blocking_decrypt_with_private_key(decrypter, &encrypted)
+		else {
 			return Self::RSAEncrypted(encrypted);
 		};
 		let Ok(meta) = serde_json::from_slice(decrypted.as_ref()) else {
@@ -78,23 +76,20 @@ impl<'a> DirectoryMeta<'a> {
 }
 
 impl<'a> DirectoryMeta<'a> {
-	pub(crate) fn encrypt<MC>(
+	pub(crate) fn blocking_encrypt(
 		&self,
-		encrypter: impl Deref<Target = MC>,
-	) -> Option<EncryptedString<'static>>
-	where
-		MC: MetaCrypter,
-	{
+		encrypter: &impl MetaCrypter,
+	) -> Option<EncryptedString<'static>> {
 		match self {
 			Self::Decoded(meta) => {
 				let json = serde_json::to_string(meta).expect("Failed to serialize directory meta");
 
-				Some(encrypter.deref().encrypt_meta(&json))
+				Some(encrypter.blocking_encrypt_meta(&json))
 			}
 			Self::DecryptedRaw(raw) => {
-				Some(encrypter.deref().encrypt_meta(&BASE64_STANDARD.encode(raw)))
+				Some(encrypter.blocking_encrypt_meta(&BASE64_STANDARD.encode(raw)))
 			}
-			Self::DecryptedUTF8(utf8) => Some(encrypter.deref().encrypt_meta(utf8)),
+			Self::DecryptedUTF8(utf8) => Some(encrypter.blocking_encrypt_meta(utf8)),
 			other => {
 				log::warn!("Cannot convert {other:?} to encrypted meta");
 				None

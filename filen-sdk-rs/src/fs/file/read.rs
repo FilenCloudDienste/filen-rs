@@ -108,7 +108,8 @@ impl<'a> FileReader<'a> {
 				.await?;
 			file.key()
 				.ok_or(MetadataWasNotDecryptedError)?
-				.decrypt_data(out_data.as_mut())?;
+				.decrypt_data(out_data.as_mut())
+				.await?;
 
 			Ok(if first_chunk {
 				let mut cursor = Cursor::new(out_data);

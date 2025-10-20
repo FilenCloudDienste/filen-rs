@@ -23,3 +23,6 @@ codegen-units = 1
 [profile.web-release]
 inherits = "release"
 opt-level = "s"
+
+[patch.crates-io]
+rayon = { git = "https://github.com/Enduriel/rayon.git", rev = "cc48c198e609ff69a205e26db71b890b6b633746" }

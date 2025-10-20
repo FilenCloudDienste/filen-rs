@@ -93,7 +93,7 @@ impl V2Key {
 }
 
 impl MetaCrypter for V2Key {
-	fn encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
+	fn blocking_encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
 		let nonce = BadNonce::generate();
 		out.clear();
 		let base64_len =
@@ -116,7 +116,7 @@ impl MetaCrypter for V2Key {
 		EncryptedString(Cow::Owned(out))
 	}
 
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
 		meta: &EncryptedString<'_>,
 		out: Vec<u8>,
@@ -145,11 +145,11 @@ impl MetaCrypter for V2Key {
 }
 
 impl DataCrypter for V2Key {
-	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		super::shared::encrypt_data(&self.cipher, data)
 	}
 
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		super::shared::decrypt_data(&self.cipher, data)
 	}
 }
@@ -200,16 +200,16 @@ impl AsRef<str> for MasterKey {
 }
 
 impl MetaCrypter for MasterKey {
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
-		self.0.encrypt_meta_into(meta, out)
+	fn blocking_encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
+		self.0.blocking_encrypt_meta_into(meta, out)
 	}
 
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
-		self.0.decrypt_meta_into(meta, out)
+		self.0.blocking_decrypt_meta_into(meta, out)
 	}
 }
 
@@ -224,8 +224,11 @@ impl CreateRandom for MasterKey {
 pub struct MasterKeys(pub Vec<MasterKey>);
 
 impl MasterKeys {
-	pub fn new(encrypted: EncryptedMasterKeys, key: MasterKey) -> Result<Self, ConversionError> {
-		let key_str = key.decrypt_meta(&encrypted.0)?;
+	pub async fn new(
+		encrypted: EncryptedMasterKeys<'_>,
+		key: MasterKey,
+	) -> Result<Self, ConversionError> {
+		let key_str = key.decrypt_meta(&encrypted.0).await?;
 		let mut keys = Self::from_decrypted_string(&key_str)?;
 		keys.0.retain(|v| *v != key);
 		keys.0.insert(0, key);
@@ -257,25 +260,25 @@ impl MasterKeys {
 			.join("|")
 	}
 
-	pub fn to_encrypted(&self) -> EncryptedMasterKeys<'static> {
+	pub async fn to_encrypted(&self) -> EncryptedMasterKeys<'static> {
 		let decrypted = self.to_decrypted_string();
-		EncryptedMasterKeys(self.0[0].encrypt_meta(&decrypted))
+		EncryptedMasterKeys(self.0[0].encrypt_meta(&decrypted).await)
 	}
 }
 
 impl MetaCrypter for MasterKeys {
-	fn encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
-		self.0[0].encrypt_meta_into(meta, out)
+	fn blocking_encrypt_meta_into(&self, meta: &str, out: String) -> EncryptedString<'static> {
+		self.0[0].blocking_encrypt_meta_into(meta, out)
 	}
 
-	fn decrypt_meta_into(
+	fn blocking_decrypt_meta_into(
 		&self,
-		meta: &EncryptedString,
+		meta: &EncryptedString<'_>,
 		mut out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		let mut errs = Vec::new();
 		for key in &self.0 {
-			match key.decrypt_meta_into(meta, out) {
+			match key.blocking_decrypt_meta_into(meta, out) {
 				Ok(string) => return Ok(string),
 				Err((e, out_err)) => {
 					errs.push(e);
@@ -344,12 +347,12 @@ impl<'de> Deserialize<'de> for FileKey {
 }
 
 impl DataCrypter for FileKey {
-	fn encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		self.0.encrypt_data(data)
+	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+		self.0.blocking_encrypt_data(data)
 	}
 
-	fn decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		self.0.decrypt_data(data)
+	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
+		self.0.blocking_decrypt_data(data)
 	}
 }
 

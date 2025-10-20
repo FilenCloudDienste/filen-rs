@@ -56,7 +56,8 @@ mod js_impl {
 
 	use crate::{
 		Error,
-		auth::Client,
+		auth::JsClient,
+		runtime::do_on_commander,
 		sync::lock::{self},
 	};
 
@@ -90,10 +91,11 @@ mod js_impl {
 	}
 
 	#[wasm_bindgen]
-	impl Client {
+	impl JsClient {
 		#[wasm_bindgen(js_name = "lockDrive")]
 		pub async fn lock_drive_js(&self) -> Result<ResourceLock, Error> {
-			self.lock_drive().await.map(ResourceLock)
+			let this = self.inner();
+			do_on_commander(move || async move { this.lock_drive().await.map(ResourceLock) }).await
 		}
 
 		#[wasm_bindgen(js_name = "acquireLock")]
@@ -101,19 +103,23 @@ mod js_impl {
 			&self,
 			params: AcquireLockParams,
 		) -> Result<ResourceLock, Error> {
-			self.acquire_lock(
-				params.resource,
-				params
-					.max_sleep_time
-					.map(|t| std::time::Duration::from_secs(t.into()))
-					.unwrap_or(lock::MAX_SLEEP_TIME_DEFAULT),
-				params
-					.attempts
-					.map(|a| usize::try_from(a).unwrap_or(usize::MAX))
-					.unwrap_or(lock::ATTEMPTS_DEFAULT),
-			)
+			let this = self.inner();
+			do_on_commander(move || async move {
+				this.acquire_lock(
+					params.resource,
+					params
+						.max_sleep_time
+						.map(|t| std::time::Duration::from_secs(t.into()))
+						.unwrap_or(lock::MAX_SLEEP_TIME_DEFAULT),
+					params
+						.attempts
+						.map(|a| usize::try_from(a).unwrap_or(usize::MAX))
+						.unwrap_or(lock::ATTEMPTS_DEFAULT),
+				)
+				.await
+				.map(ResourceLock)
+			})
 			.await
-			.map(ResourceLock)
 		}
 	}
 }

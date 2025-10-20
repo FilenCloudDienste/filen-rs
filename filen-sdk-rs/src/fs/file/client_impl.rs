@@ -17,6 +17,7 @@ use crate::{
 			traits::HasFileMeta,
 		},
 	},
+	runtime::{self, blocking_join, do_cpu_intensive},
 	util::MaybeSendCallback,
 };
 
@@ -96,15 +97,23 @@ impl Client {
 			return Err(MetadataWasNotDecryptedError.into());
 		};
 
+		let crypter = self.crypter();
+
+		let (name, metadata) = do_cpu_intensive(|| {
+			blocking_join!(|| crypter.blocking_encrypt_meta(&temp_meta.name), || {
+				let meta_json = serde_json::to_string(&temp_meta)?;
+				Ok::<_, Error>(crypter.blocking_encrypt_meta(&meta_json))
+			})
+		})
+		.await;
+
 		api::v3::file::metadata::post(
 			self.client(),
 			&api::v3::file::metadata::Request {
 				uuid: *file.uuid(),
-				name: self.crypter().encrypt_meta(temp_meta.name()),
+				name,
 				name_hashed: Cow::Owned(self.hash_name(temp_meta.name())),
-				metadata: self
-					.crypter()
-					.encrypt_meta(&serde_json::to_string(&temp_meta)?),
+				metadata: metadata?,
 			},
 		)
 		.await?;
@@ -117,7 +126,10 @@ impl Client {
 
 	pub async fn get_file(&self, uuid: UuidStr) -> Result<RemoteFile, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
-		let meta = FileMeta::from_encrypted(response.metadata, self.crypter(), response.version);
+		let meta = runtime::do_cpu_intensive(|| {
+			FileMeta::blocking_from_encrypted(response.metadata, &*self.crypter(), response.version)
+		})
+		.await;
 		Ok(RemoteFile::from_meta(
 			uuid,
 			// v3 api returns the original parent as the parent if the file is in the trash

@@ -14,6 +14,7 @@ use crate::{
 		zip::ZipProgressCallback,
 	},
 	js::{Dir, DirEnum, File, ManagedFuture},
+	runtime,
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -187,11 +188,12 @@ impl ZipProgressCallbackJS {
 		if self.is_undefined() {
 			None
 		} else {
-			Some(
-				move |bytes_written: u64,
-				      files_dirs_written: u64,
-				      bytes_total: u64,
-				      files_dirs_total: u64| {
+			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+			runtime::spawn_local(async move {
+				while let Some((bytes_written, files_dirs_written, bytes_total, files_dirs_total)) =
+					receiver.recv().await
+				{
 					let _ = unsafe {
 						self.call4(
 							&JsValue::NULL,
@@ -201,6 +203,19 @@ impl ZipProgressCallbackJS {
 							&BigInt::from(files_dirs_total).into(),
 						)
 					};
+				}
+			});
+			Some(
+				move |bytes_written: u64,
+				      files_dirs_written: u64,
+				      bytes_total: u64,
+				      files_dirs_total: u64| {
+					let _ = sender.send((
+						bytes_written,
+						files_dirs_written,
+						bytes_total,
+						files_dirs_total,
+					));
 				},
 			)
 		}
