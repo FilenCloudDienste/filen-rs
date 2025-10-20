@@ -320,8 +320,7 @@ where
 	}
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{
-		#[allow(clippy::let_underscore_future)]
-		let _ = f;
+		std::mem::drop(f);
 		panic!("spawn_local is only currently supported on wasm targets");
 	}
 }
