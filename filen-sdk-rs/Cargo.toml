@@ -127,6 +127,9 @@ console_error_panic_hook = "0.1.5"
 wasm-streams = "0.4.2"
 pin-project-lite = "0.2.16"
 wasm-bindgen-rayon = "1.3.0"
+# we don't need this directly, but wasmtimer uses it and doesn't enable the nightly feature
+# which meant that wasm_atomic was not being used
+parking_lot = { version = "0.12", features = ["nightly"] }
 
 [target.'cfg(not(all(target_family="wasm", target_os= "unknown")))'.dev-dependencies]
 dotenv = "0.15.0"
