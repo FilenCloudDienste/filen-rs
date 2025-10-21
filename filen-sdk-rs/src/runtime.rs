@@ -49,6 +49,30 @@ mod async_scoped_task {
 		}
 	}
 
+	/// Spawns a closure on the rayon threadpool without requiring 'static lifetime.
+	///
+	/// # Safety
+	/// The caller must guarantee that the closure does not outlive any references it captures.
+	unsafe fn spawn_unchecked<F>(f: F)
+	where
+		F: FnOnce() + Send,
+	{
+		let f = Box::into_raw(Box::new(f));
+		struct SendPtr(*mut ());
+
+		unsafe impl Send for SendPtr {}
+		let ptr = SendPtr(f as *mut ());
+
+		rayon::spawn(move || {
+			let ptr = ptr;
+			// SAFETY: we are doing this to bypass the 'static requirement of rayon::spawn
+			// this function is unsafe because the caller must guarantee that the closure
+			// does not outlive any references it captures
+			let f = unsafe { Box::from_raw(ptr.0 as *mut F) };
+			f();
+		});
+	}
+
 	/// Runs a CPU intensive intensive function on the rayon threadpool, returning a future that resolves to the result.
 	///
 	/// # Important
@@ -83,7 +107,7 @@ mod async_scoped_task {
 		};
 
 		unsafe {
-			rayon::spawn_unchecked(move || {
+			spawn_unchecked(move || {
 				let res = f();
 				let _ = async_sender.send(res);
 			});
