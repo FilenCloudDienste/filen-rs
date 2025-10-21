@@ -259,7 +259,7 @@ fn try_handle_event(
 }
 
 fn handle_unauthed_message(
-	ws: &WebSocket,
+	ws: &std::rc::Weak<WebSocket>,
 	msg: &str,
 	connection: InitSocketConnection,
 	broadcaster: tokio::sync::broadcast::Sender<bool>,
@@ -273,7 +273,20 @@ fn handle_unauthed_message(
 					let msg = Some(&AuthMessage {
 						api_key: Cow::Borrowed(&api_key.0),
 					});
-					if let Err(e) = send_event(ws, "auth", msg) {
+					let Some(ws) = ws.upgrade() else {
+						std::mem::drop(api_key);
+						log::error!("WebSocket was closed before authentication could be sent");
+						return Err((
+							SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
+								config: connection.config,
+							}),
+							Error::custom(
+								crate::ErrorKind::Server,
+								"WebSocket was closed before authentication could be sent",
+							),
+						));
+					};
+					if let Err(e) = send_event(&ws, "auth", msg) {
 						std::mem::drop(api_key);
 						log::error!("Failed to send auth event: {}", e);
 						return Err((
@@ -290,9 +303,8 @@ fn handle_unauthed_message(
 			other => match other {
 				"authFailed" => {
 					log::error!("WebSocket authentication failed");
-					let _ = broadcaster.send(false);
 					// first notify listeners, then drop them
-					match try_handle_event(other, data, &connection.listener_manager) {
+					let res = match try_handle_event(other, data, &connection.listener_manager) {
 						Ok(()) => Ok(SocketConnectionStateEnum::Uninintialized(
 							UninitSocketConnection {
 								config: connection.config,
@@ -304,7 +316,9 @@ fn handle_unauthed_message(
 							}),
 							e,
 						)),
-					}
+					};
+					let _ = broadcaster.send(false);
+					res
 				}
 				"authSuccess" => {
 					let _ = broadcaster.send(true);
@@ -342,7 +356,7 @@ fn handle_unauthed_message(
 }
 
 fn handle_authed_message(
-	ws: &WebSocket,
+	ws: &std::rc::Weak<WebSocket>,
 	msg: &str,
 	connection: &InitSocketConnection,
 ) -> Result<(), Error> {
@@ -356,7 +370,9 @@ fn handle_authed_message(
 						api_key: Cow::Borrowed(&api_key.0),
 					});
 
-					send_event(ws, "auth", msg)?;
+					if let Some(ws) = ws.upgrade() {
+						send_event(&ws, "auth", msg)?;
+					}
 				}
 			}
 			other => {
@@ -391,7 +407,7 @@ fn normalize_event_name(name: &str) -> Cow<'_, str> {
 }
 
 fn start_ping_task(
-	ws: Rc<WebSocket>,
+	ws: std::rc::Weak<WebSocket>,
 	mut interval: Duration,
 	mut interval_change_receiver: tokio::sync::mpsc::UnboundedReceiver<Duration>,
 ) {
@@ -407,6 +423,11 @@ fn start_ping_task(
 					interval = new_interval;
 				}
 				_ = wasmtimer::tokio::sleep(interval.saturating_sub(last_update.elapsed())) => {
+					let Some(ws) = ws.upgrade() else {
+						// automatic cleanup when the WebSocket is dropped
+						return;
+					};
+
 					if send_str(&ws, ping_packet).is_err() {
 						return;
 					}
@@ -500,7 +521,7 @@ fn start_reconnect_task(
 }
 
 fn make_on_message_closure(
-	ws: Rc<WebSocket>,
+	ws: std::rc::Weak<WebSocket>,
 	interval_change_sender: tokio::sync::mpsc::UnboundedSender<Duration>,
 	connection: Weak<Mutex<SocketConnectionStateCarrier>>,
 ) -> wasm_bindgen::prelude::Closure<dyn Fn(web_sys::MessageEvent)> {
@@ -531,11 +552,12 @@ fn make_on_message_closure(
 						let interval_change_sender = interval_change_sender
 							.lock()
 							.unwrap_or_else(|e| e.into_inner());
-						handle_handshake(&ws, &interval_change_sender, &msg[1..]).unwrap_or_else(
-							|e| {
-								log::error!("Failed to handle handshake: {}", e);
-							},
-						);
+						if let Some(ws) = ws.upgrade() {
+							handle_handshake(&ws, &interval_change_sender, &msg[1..])
+								.unwrap_or_else(|e| {
+									log::error!("Failed to handle handshake: {}", e);
+								});
+						}
 					}
 				}
 				Ok(PacketType::Message) => {
@@ -678,7 +700,7 @@ fn setup_websocket_thread(
 	let ws = Rc::new(ws);
 
 	ws.set_onmessage(Some(
-		make_on_message_closure(Rc::clone(&ws), interval_change_sender, state.clone())
+		make_on_message_closure(Rc::downgrade(&ws), interval_change_sender, state.clone())
 			.into_js_value()
 			.unchecked_ref(),
 	));
@@ -690,7 +712,7 @@ fn setup_websocket_thread(
 	));
 
 	start_ping_task(
-		Rc::clone(&ws),
+		Rc::downgrade(&ws),
 		config.ping_interval,
 		interval_change_receiver,
 	);
