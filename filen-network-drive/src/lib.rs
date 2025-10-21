@@ -1,5 +1,9 @@
 use port_check::free_local_ipv4_port;
-use std::path::{Path, PathBuf};
+use regex::Regex;
+use std::{
+	borrow::Cow,
+	path::{Path, PathBuf},
+};
 use sysinfo::Disks;
 use tokio::{
 	fs,
@@ -27,15 +31,12 @@ pub async fn mount_network_drive(
 ) -> Result<MountedNetworkDrive> {
 	let rclone_binary_path = ensure_rclone_binary(config_dir).await?;
 	let rclone_config_path = write_rclone_config(&rclone_binary_path, client, config_dir).await?;
-	let mount_point = mount_point.unwrap_or(match std::env::consts::FAMILY {
-		"windows" => "X:\\",
-		_ => "/tmp/filen",
-	});
+	let mount_point = resolve_mount_point(mount_point).await?;
 	let process = start_rclone_mount_process(
 		&config_dir.join("network-drive-rclone/cache"),
 		&rclone_binary_path,
 		&rclone_config_path,
-		mount_point,
+		&mount_point,
 		read_only,
 		None,
 	)
@@ -43,6 +44,34 @@ pub async fn mount_network_drive(
 	Ok(MountedNetworkDrive {
 		mount_point: mount_point.to_string(),
 		process,
+	})
+}
+
+async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> {
+	Ok(match std::env::consts::FAMILY {
+		"windows" => match mount_point {
+			None => Cow::Borrowed("X:\\"),
+			Some(mount_point) => {
+				let drive_letter = Regex::new(r"^([A-Z])\:?\\?$")
+					.unwrap()
+					.captures(mount_point);
+				let Some(drive_letter) = drive_letter else {
+					return Err(anyhow::anyhow!(
+						"Invalid Windows mount point (not a drive letter): {}",
+						mount_point
+					));
+				};
+				let drive_letter = drive_letter.get(1).unwrap().as_str().to_uppercase();
+				Cow::Owned(format!("{}:\\", drive_letter))
+			}
+		},
+		_ => {
+			let mount_point = mount_point.unwrap_or("/tmp/filen");
+			fs::create_dir_all(mount_point)
+				.await
+				.context("Failed to create mount point directory")?;
+			Cow::Borrowed(mount_point)
+		}
 	})
 }
 
@@ -101,7 +130,18 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 			.context("Failed to create Rclone binary directory")?;
 		fs::write(&rclone_binary_path, &bytes).await?;
 
-		// todo: on unix, make binaries executable
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			let mut perms = fs::metadata(&rclone_binary_path)
+				.await
+				.context("Failed to get Rclone binary metadata")?
+				.permissions();
+			perms.set_mode(0o755);
+			fs::set_permissions(&rclone_binary_path, perms)
+				.await
+				.context("Failed to set Rclone binary permissions")?;
+		}
 	}
 
 	debug!("Using Rclone binary at {}", rclone_binary_path.display());
@@ -304,4 +344,36 @@ fn get_available_disk_space(path: &Path) -> Result<u64> {
 				path.display()
 			)
 		})
+}
+
+#[cfg(windows)]
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn test_resolve_mount_point() {
+		assert_eq!(
+			resolve_mount_point(Some("F:\\"))
+				.await
+				.unwrap()
+				.into_owned(),
+			"F:\\"
+		);
+		assert_eq!(
+			resolve_mount_point(Some("Z:")).await.unwrap().into_owned(),
+			"Z:\\"
+		);
+		assert_eq!(
+			resolve_mount_point(Some("Y")).await.unwrap().into_owned(),
+			"Y:\\"
+		);
+		assert_eq!(
+			resolve_mount_point(None).await.unwrap().into_owned(),
+			"X:\\"
+		);
+		assert!(resolve_mount_point(Some("a")).await.is_err());
+		assert!(resolve_mount_point(Some("AB")).await.is_err());
+		assert!(resolve_mount_point(Some("/path")).await.is_err());
+	}
 }

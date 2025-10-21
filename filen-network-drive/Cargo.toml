@@ -13,6 +13,7 @@ filen-sdk-rs = { path = "../filen-sdk-rs" }
 # todo: make sure filen-network-drive does not depend on filen-sdk-rs
 log = "0.4.27"
 port_check = "0.3.0"
+regex = "1.12.2"
 reqwest = { version = "0.12.22", features = [
 	"rustls-tls",
 ], default-features = false }
