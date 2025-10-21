@@ -431,7 +431,7 @@ mod js_impl {
 		Error, ErrorKind,
 		auth::JsClient,
 		crypto::error::ConversionError,
-		fs::file::js_impl::StreamWriter,
+		fs::file::js_impl::{MAX_BUFFER_SIZE_BEFORE_FLUSH, StreamWriter},
 		js::DownloadFileToZipParams,
 		runtime::{self, do_on_commander},
 	};
@@ -445,14 +445,32 @@ mod js_impl {
 		result_sender: tokio::sync::oneshot::Sender<Result<(), Error>>,
 	) {
 		runtime::spawn_local(async move {
+			let mut local_cache = Vec::with_capacity(1024);
+
 			while let Some(data) = data_receiver.recv().await {
-				if let Err(e) = writer.write(&data).await {
+				local_cache.extend_from_slice(&data);
+
+				if local_cache.len() < MAX_BUFFER_SIZE_BEFORE_FLUSH {
+					continue;
+				}
+				if let Err(e) = writer.write(&local_cache).await {
 					let _ = result_sender.send(Err(Error::custom(
 						ErrorKind::IO,
 						format!("error writing to stream: {:?}", e),
 					)));
 					return;
 				}
+				local_cache.clear();
+			}
+
+			if !local_cache.is_empty()
+				&& let Err(e) = writer.write(&local_cache).await
+			{
+				let _ = result_sender.send(Err(Error::custom(
+					ErrorKind::IO,
+					format!("error writing to stream: {:?}", e),
+				)));
+				return;
 			}
 
 			if let Err(e) = writer.close().await {
