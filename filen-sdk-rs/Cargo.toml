@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-tokio = ["tokio/rt", "tokio-stream", "tokio-util"]
+tokio = ["tokio/rt", "tokio-stream/fs", "tokio-util"]
 malformed = []
 heif-decoder = ["dep:heif-decoder"]
 avif-decoder = ["image/avif-native"]
@@ -65,8 +65,8 @@ tokio = { version = "1.47.1", default-features = false, features = [
 	"macros",
 ] }
 tokio-stream = { version = "0.1.17", default-features = false, features = [
-	"fs",
-], optional = true }
+	"sync",
+] }
 tokio-util = { version = "0.7.16", default-features = false, features = [
 	"compat",
 ], optional = true }

@@ -433,7 +433,7 @@ mod js_impl {
 		crypto::error::ConversionError,
 		fs::file::js_impl::{MAX_BUFFER_SIZE_BEFORE_FLUSH, StreamWriter},
 		js::DownloadFileToZipParams,
-		runtime::{self, do_on_commander},
+		runtime::{self},
 	};
 
 	use futures::AsyncWriteExt;
@@ -519,7 +519,7 @@ mod js_impl {
 
 			params
 				.managed_future
-				.into_js_managed_future(do_on_commander(move || async move {
+				.into_js_managed_commander_future(move || async move {
 					let writer = StreamWriter::new(data_sender);
 
 					this.download_items_to_zip(&items, writer, progress_callback.as_ref())
@@ -530,7 +530,7 @@ mod js_impl {
 							format!("zip download result_sender dropped: {}", e),
 						))
 					})
-				}))?
+				})?
 				.await
 		}
 	}

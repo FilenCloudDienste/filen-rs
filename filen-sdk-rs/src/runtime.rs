@@ -155,9 +155,11 @@ mod worker_handle {
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod commander_thread {
-	use std::{pin::Pin, sync::OnceLock};
+	use std::{mem::ManuallyDrop, pin::Pin, sync::OnceLock};
 
-	use futures::stream::FuturesUnordered;
+	use futures::{Stream, stream::FuturesUnordered};
+
+	use pin_project_lite::pin_project;
 	use tokio::sync::mpsc::UnboundedSender;
 	use wasm_bindgen::UnwrapThrowExt;
 
@@ -219,39 +221,263 @@ mod commander_thread {
 			sender
 		})
 	}
+
+	pin_project! {
+		pub(crate) struct CommanderFutHandle<T> {
+			paused: bool,
+			pause_signal: tokio::sync::watch::Sender<bool>,
+			cancel_signal: ManuallyDrop<tokio::sync::oneshot::Sender<()>>,
+			#[pin]
+			result_receiver: tokio::sync::oneshot::Receiver<T>,
+		}
+
+		impl<T> PinnedDrop for CommanderFutHandle<T> {
+			fn drop(mut this: Pin<&mut Self>) {
+				// SAFETY: this is the only place we take the cancel signal out of the ManuallyDrop
+				// drop is only ever called once, so this is safe
+				let cancel_signal = unsafe { ManuallyDrop::take(&mut this.cancel_signal) };
+				// don't care if it errors, just means the task was already completed/dropped
+				let _ = cancel_signal.send(());
+			}
+		}
+	}
+
+	impl<T> CommanderFutHandle<T> {
+		pub(crate) fn pause(&mut self) {
+			if !self.paused {
+				// don't care if it errors, just means the task was already completed/dropped
+				let _ = self.pause_signal.send(true);
+				self.paused = true;
+			}
+		}
+
+		pub(crate) fn resume(&mut self) {
+			if self.paused {
+				// don't care if it errors, just means the task was already completed/dropped
+				let _ = self.pause_signal.send(false);
+				self.paused = false;
+			}
+		}
+
+		pub(crate) fn is_paused(&self) -> bool {
+			self.paused
+		}
+	}
+
+	impl<T> Future for CommanderFutHandle<T> {
+		type Output = T;
+
+		fn poll(
+			self: Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<Self::Output> {
+			let this = self.project();
+			this.result_receiver
+				.poll(cx)
+				.map(|res| res.expect_throw("CommanderFuture panicked"))
+		}
+	}
+
+	pin_project! {
+		struct CommanderFut<F, T>
+		where
+			F: Future<Output = T>,
+		{
+			#[pin]
+			inner: F,
+			#[pin]
+			pause_stream: Option<tokio_stream::wrappers::WatchStream<bool>>,
+			#[pin]
+			cancel_signal: tokio::sync::oneshot::Receiver<()>,
+			result_sender: Option<tokio::sync::oneshot::Sender<T>>,
+			paused: bool,
+		}
+	}
+
+	struct CommanderFutBuilder<F, Fut, T>
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: Future<Output = T> + 'static,
+		T: Send + 'static,
+	{
+		future_builder: F,
+		pause_stream: tokio_stream::wrappers::WatchStream<bool>,
+		cancel_signal: tokio::sync::oneshot::Receiver<()>,
+		result_sender: tokio::sync::oneshot::Sender<T>,
+	}
+
+	impl<F, Fut, T> CommanderFutBuilder<F, Fut, T>
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: Future<Output = T> + 'static,
+		T: Send + 'static,
+	{
+		fn build(self) -> CommanderFut<Fut, T> {
+			CommanderFut {
+				inner: (self.future_builder)(),
+				pause_stream: Some(self.pause_stream),
+				cancel_signal: self.cancel_signal,
+				result_sender: Some(self.result_sender),
+				paused: false,
+			}
+		}
+	}
+
+	impl<F, T> Future for CommanderFut<F, T>
+	where
+		F: Future<Output = T>,
+	{
+		type Output = bool;
+
+		fn poll(
+			self: Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<Self::Output> {
+			let mut this = self.project();
+
+			// check for cancellation
+			match this.cancel_signal.poll(cx) {
+				std::task::Poll::Ready(_) => {
+					return std::task::Poll::Ready(false);
+				}
+				std::task::Poll::Pending => {}
+			}
+
+			// check for pause
+			if let Some(mut pause_stream) = this.pause_stream.as_mut().as_pin_mut() {
+				loop {
+					match pause_stream.as_mut().poll_next(cx) {
+						std::task::Poll::Ready(Some(paused)) => {
+							*this.paused = paused;
+						}
+						std::task::Poll::Ready(None) => {
+							// pause signal closed, treat as unpaused
+							this.pause_stream.set(None);
+							*this.paused = false;
+							break;
+						}
+						std::task::Poll::Pending => {
+							break;
+						}
+					}
+				}
+			}
+
+			if *this.paused {
+				std::task::Poll::Pending
+			} else {
+				match this.inner.as_mut().poll(cx) {
+					std::task::Poll::Ready(v) => {
+						if let Some(sender) = this.result_sender.take() {
+							let _ = sender.send(v);
+						}
+						std::task::Poll::Ready(true)
+					}
+					std::task::Poll::Pending => std::task::Poll::Pending,
+				}
+			}
+		}
+	}
+
+	fn make_future_builder_with_handle<F, Fut>(
+		pause_signal: Option<(
+			tokio::sync::watch::Sender<bool>,
+			tokio::sync::watch::Receiver<bool>,
+		)>,
+		fut_builder: F,
+	) -> (
+		CommanderFutBuilder<F, Fut, Fut::Output>,
+		CommanderFutHandle<Fut::Output>,
+	)
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: Future + 'static,
+		Fut::Output: Send + 'static,
+	{
+		let (pause_signal_tx, pause_signal_rx) =
+			pause_signal.unwrap_or_else(|| tokio::sync::watch::channel(false));
+		let (cancel_signal_tx, cancel_signal_rx) = tokio::sync::oneshot::channel();
+		let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+
+		let fut_builder = CommanderFutBuilder {
+			future_builder: fut_builder,
+			pause_stream: tokio_stream::wrappers::WatchStream::new(pause_signal_rx),
+			cancel_signal: cancel_signal_rx,
+			result_sender,
+		};
+
+		let handle = CommanderFutHandle {
+			paused: false,
+			pause_signal: pause_signal_tx,
+			cancel_signal: ManuallyDrop::new(cancel_signal_tx),
+			result_receiver,
+		};
+
+		(fut_builder, handle)
+	}
+
+	fn inner_do_on_commander<F, Fut>(
+		pause_signal: Option<(
+			tokio::sync::watch::Sender<bool>,
+			tokio::sync::watch::Receiver<bool>,
+		)>,
+		f: F,
+	) -> CommanderFutHandle<Fut::Output>
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: Future + 'static,
+		Fut::Output: Send + 'static,
+	{
+		let sender = get_or_init_commander_sender();
+
+		let (fut_builder, handle) = make_future_builder_with_handle(pause_signal, f);
+
+		sender
+			.send(Box::new(move || {
+				Box::pin(async move {
+					fut_builder.build().await;
+				}) as Pin<Box<dyn Future<Output = ()> + 'static>>
+			}))
+			.expect_throw("Failed to send task to commander worker");
+
+		handle
+	}
+
 	/// Runs an async function on a dedicated 'commander' worker thread, returning the result.
 	///
 	/// meant to be used for wasm so that we can use do_cpu_intensive on this thread.
 	/// This is because wasm doesn't allow blocking the main thread
 	/// which we might need to do to prevent UB if a do_cpu_intensive future is dropped before completion.
-	pub(crate) async fn do_on_commander<F, Fut, R>(f: F) -> R
+	pub(crate) fn do_on_commander<F, Fut>(f: F) -> CommanderFutHandle<Fut::Output>
 	where
 		F: FnOnce() -> Fut + Send + 'static,
-		Fut: Future<Output = R> + 'static,
-		R: Send + 'static,
+		Fut: Future + 'static,
+		Fut::Output: Send + 'static,
 	{
-		let sender = get_or_init_commander_sender();
+		inner_do_on_commander(None, f)
+	}
 
-		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<R>();
-
-		sender
-			.send(Box::new(move || {
-				Box::pin(async move {
-					let res = f().await;
-					let _ = result_sender.send(res);
-				}) as Pin<Box<dyn Future<Output = ()> + 'static>>
-			}))
-			.expect_throw("Failed to send task to commander worker");
-
-		result_receiver
-			.await
-			.expect_throw("Worker thread dropped task result")
+	pub(crate) fn do_with_pause_channel_on_commander<F, Fut>(
+		channel: (
+			tokio::sync::watch::Sender<bool>,
+			tokio::sync::watch::Receiver<bool>,
+		),
+		f: F,
+	) -> CommanderFutHandle<Fut::Output>
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: Future + 'static,
+		Fut::Output: Send + 'static,
+	{
+		inner_do_on_commander(Some(channel), f)
 	}
 
 	impl JsClient {}
 }
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub(crate) use commander_thread::do_on_commander;
+pub(crate) use commander_thread::{
+	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
+};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod wasm_threading {

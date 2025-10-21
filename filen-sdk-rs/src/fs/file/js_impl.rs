@@ -250,10 +250,10 @@ impl JsClient {
 
 		let file = params
 			.managed_future
-			.into_js_managed_future(do_on_commander(move || async move {
+			.into_js_managed_commander_future(move || async move {
 				let builder = params.file_builder_params.into_file_builder(&this);
 				this.upload_file(Arc::new(builder.build()), &data).await
-			}))?
+			})?
 			.await?;
 
 		Ok(file.into())
@@ -319,7 +319,7 @@ impl JsClient {
 		let this = self.inner();
 		params
 			.managed_future
-			.into_js_managed_future(do_on_commander(move || async move {
+			.into_js_managed_commander_future(move || async move {
 				let mut writer = StreamWriter::new(data_sender);
 
 				let file = RemoteFileType::try_from(params.file)?;
@@ -337,7 +337,7 @@ impl JsClient {
 						"download task cancelled",
 					))
 				})
-			}))?
+			})?
 			.await
 	}
 
@@ -408,7 +408,7 @@ impl JsClient {
 		let file = params
 			.file_params
 			.managed_future
-			.into_js_managed_future(do_on_commander(move || async move {
+			.into_js_managed_commander_future(move || async move {
 				let mut reader = StreamReader {
 					receiver: data_receiver,
 					current_chunk: None,
@@ -433,7 +433,7 @@ impl JsClient {
 					))
 				})?;
 				Ok(file)
-			}))?
+			})?
 			.await?;
 
 		Ok(file.into())

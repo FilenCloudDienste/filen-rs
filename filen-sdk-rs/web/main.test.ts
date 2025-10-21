@@ -330,7 +330,7 @@ test("pause", async () => {
 	console.log("file c done")
 	expect(fileC).toBeDefined()
 	expect(fileC.meta?.name).toBe("pause c.txt")
-	await new Promise(resolve => setTimeout(resolve, 2000))
+	await new Promise(resolve => setTimeout(resolve, 5000))
 	expect(fileAPromiseResolved).toBe(false)
 	expect(fileBPromiseResolved).toBe(false)
 	expect(fileDPromiseResolved).toBe(true)
@@ -341,7 +341,7 @@ test("pause", async () => {
 	expect(fileA).toBeDefined()
 	expect(fileA.meta?.name).toBe("pause a.txt")
 	console.log("awaiting b")
-	await new Promise(resolve => setTimeout(resolve, 2000))
+	await new Promise(resolve => setTimeout(resolve, 5000))
 	console.log("checking b")
 	expect(fileBPromiseResolved).toBe(true)
 	const fileB = await fileBPromise

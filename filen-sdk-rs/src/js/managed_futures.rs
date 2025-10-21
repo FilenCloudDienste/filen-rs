@@ -4,19 +4,17 @@ pub use pausable::{PauseSignal, PauseSignalRust};
 mod pausable {
 	// Heavily inspired by
 	// https://github.com/xuxiaocheng0201/pausable_future
-	use std::{
-		cell::{OnceCell, RefCell},
-		future::Future,
-		rc::Rc,
-		task::{Poll, Waker},
-	};
+	use std::{cell::OnceCell, future::Future, task::Waker};
 
 	use pin_project_lite::pin_project;
 	use serde::Deserialize;
-	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+	use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 	use web_sys::js_sys;
 
-	use crate::{Error, ErrorKind};
+	use crate::{
+		Error, ErrorKind,
+		runtime::{self, CommanderFutHandle},
+	};
 
 	pin_project! {
 		pub(super) struct Pausable<F> where F: Future {
@@ -41,24 +39,47 @@ mod pausable {
 	pub struct PauseSignal(#[serde(with = "serde_wasm_bindgen::preserve")] JsValue);
 
 	impl PauseSignal {
-		pub(super) fn into_pausable<F>(self, fut: F) -> Result<Pausable<F>, Error>
+		pub(super) fn into_pausable_on_commander<F, Fut>(
+			self,
+			fut_builder: F,
+		) -> Result<CommanderFutHandle<Fut::Output>, Error>
 		where
-			F: Future,
+			F: FnOnce() -> Fut + Send + 'static,
+			Fut: Future + 'static,
+			Fut::Output: Send + 'static,
 		{
-			let pausable = Pausable {
-				fut,
-				signal: if self.0.is_undefined() {
-					None
-				} else {
-					Some(PauseSignalRust::clone_from_js_value(self.0).map_err(|e| {
+			if self.0.is_undefined() {
+				Ok(runtime::do_on_commander(fut_builder))
+			} else {
+				let pause_signal =
+					PauseSignalRust::get_ref_from_js_value(&self.0).map_err(|e| {
+						let ty = JsValue::dyn_ref::<js_sys::JsString>(&e.js_typeof())
+							.map(|s| format!("{}", s))
+							.unwrap_or_else(|| "unknown".to_string());
 						Error::custom(
 							ErrorKind::Conversion,
-							format!("got error when converting to PauseSignal: {:?}", e),
+							format!("expected PauseSignal, got {}", ty),
 						)
-					})?)
-				},
-			};
-			Ok(pausable)
+					})?;
+				Ok(runtime::do_with_pause_channel_on_commander(
+					(pause_signal.sender.clone(), pause_signal.receiver.clone()),
+					fut_builder,
+				))
+			}
+		}
+	}
+
+	#[wasm_bindgen(js_name = "PauseSignal")]
+	#[derive(Clone)]
+	pub struct PauseSignalRust {
+		sender: tokio::sync::watch::Sender<bool>,
+		receiver: tokio::sync::watch::Receiver<bool>,
+	}
+
+	impl Default for PauseSignalRust {
+		fn default() -> Self {
+			let (sender, receiver) = tokio::sync::watch::channel(false);
+			Self { sender, receiver }
 		}
 	}
 
@@ -67,42 +88,22 @@ mod pausable {
 	}
 
 	impl PauseSignalRust {
-		// This is made by using cargo expand on the #[wasm_bindgen] for PauseSignalRust
-		// and then combining the wasm_bindgen::convert::TryFromJsValue for PauseSignalRust
-		// and impl wasm_bindgen::convert::RefFromWasmAbi for PauseSignalRust
-		// the default TryFromJsValue implementation calls into JS to delete the value JS side
-		// this version clones the inner value instead
-		fn clone_from_js_value(
-			value: wasm_bindgen::JsValue,
-		) -> wasm_bindgen::__rt::core::result::Result<Self, JsValue> {
+		fn get_ref_from_js_value(
+			value: &wasm_bindgen::JsValue,
+		) -> Result<wasm_bindgen::__rt::RcRef<Self>, JsValue> {
 			let ptr = {
 				WBG_PTR.with(|v| {
-					js_sys::Reflect::get(&value, v.get_or_init(|| JsValue::from_str("__wbg_ptr")))
+					js_sys::Reflect::get(value, v.get_or_init(|| JsValue::from_str("__wbg_ptr")))
 				})
 			}?;
 			let ptr = ptr.as_f64().unwrap() as u32;
 			if ptr == 0 {
-				wasm_bindgen::__rt::core::result::Result::Err(value)
+				Err(value.clone())
 			} else {
 				let rc_ref =
 					unsafe { <Self as wasm_bindgen::convert::RefFromWasmAbi>::ref_from_abi(ptr) };
-				Ok((*rc_ref).clone())
+				Ok(rc_ref)
 			}
-		}
-	}
-
-	// Might not work with tuple struct
-	#[derive(Debug, Clone, Default)]
-	#[wasm_bindgen(js_name = "PauseSignal")]
-	pub struct PauseSignalRust(Rc<RefCell<Controller>>);
-
-	impl PauseSignalRust {
-		fn inner(&self) -> std::cell::Ref<'_, Controller> {
-			self.0.borrow()
-		}
-
-		fn inner_mut(&self) -> std::cell::RefMut<'_, Controller> {
-			self.0.borrow_mut()
 		}
 	}
 
@@ -115,48 +116,17 @@ mod pausable {
 
 		#[wasm_bindgen(js_name = "isPaused")]
 		pub fn is_paused(&self) -> bool {
-			self.inner().paused
+			*self.receiver.borrow()
 		}
 
 		#[wasm_bindgen]
 		pub fn pause(&self) {
-			let mut inner = self.inner_mut();
-			inner.paused = true;
+			let _ = self.sender.send(true);
 		}
 
 		#[wasm_bindgen]
 		pub fn resume(&self) {
-			let mut inner = self.inner_mut();
-			inner.paused = false;
-			for waker in inner.wakers.drain(..) {
-				waker.wake();
-			}
-		}
-	}
-
-	impl<F> Future for Pausable<F>
-	where
-		F: Future,
-	{
-		type Output = F::Output;
-
-		fn poll(
-			self: std::pin::Pin<&mut Self>,
-			cx: &mut std::task::Context<'_>,
-		) -> std::task::Poll<Self::Output> {
-			let this = self.project();
-			if let Some(signal) = this.signal {
-				let mut controller = signal.inner_mut();
-				if !controller.paused {
-					std::mem::drop(controller);
-					this.fut.poll(cx)
-				} else {
-					controller.wakers.push(cx.waker().clone());
-					Poll::Pending
-				}
-			} else {
-				this.fut.poll(cx)
-			}
+			let _ = self.sender.send(false);
 		}
 	}
 }
@@ -247,7 +217,7 @@ mod managed {
 	use tsify::Tsify;
 	use wasm_bindgen::prelude::wasm_bindgen;
 
-	use crate::{Error, error::AbortedError};
+	use crate::{Error, error::AbortedError, runtime::CommanderFutHandle};
 
 	use super::{abortable::*, pausable::*};
 
@@ -261,17 +231,22 @@ mod managed {
 	}
 
 	impl ManagedFuture {
-		pub(crate) fn into_js_managed_future<F>(
+		pub(crate) fn into_js_managed_commander_future<F, Fut>(
 			self,
-			fut: F,
-		) -> Result<JSManagedFuture<F, impl Future<Output = AbortedError>>, Error>
+			f: F,
+		) -> Result<
+			JSManagedFuture<CommanderFutHandle<Fut::Output>, impl Future<Output = AbortedError>>,
+			Error,
+		>
 		where
-			F: std::future::Future,
+			F: FnOnce() -> Fut + Send + 'static,
+			Fut: Future + 'static,
+			Fut::Output: Send + 'static,
 		{
 			let abort_fut = self.abort_signal.into_future()?;
-			let pausable = self.pause_signal.into_pausable(fut)?;
+			let pausable = self.pause_signal.into_pausable_on_commander(f)?;
 			Ok(JSManagedFuture {
-				main_fut: pausable,
+				main_fut: Some(pausable),
 				abort_fut,
 			})
 		}
@@ -284,7 +259,7 @@ mod managed {
 			F1: std::future::Future<Output = AbortedError>,
 		{
 			#[pin]
-			main_fut: Pausable<F>,
+			main_fut: Option<CommanderFutHandle<F::Output>>,
 			#[pin]
 			abort_fut: AbortSignalFuture<F1>,
 		}
@@ -301,12 +276,26 @@ mod managed {
 			self: std::pin::Pin<&mut Self>,
 			cx: &mut std::task::Context<'_>,
 		) -> std::task::Poll<Self::Output> {
-			let this = self.project();
+			let mut this = self.project();
 			if let Poll::Ready(aborted) = this.abort_fut.poll(cx) {
+				// drop the main future, which cancels it on the commander thread
+				this.main_fut.take();
 				Poll::Ready(Err(Error::from(aborted)))
+			} else if let Some(main_fut) = this.main_fut.as_mut().as_pin_mut() {
+				if let Poll::Ready(res) = main_fut.poll(cx) {
+					this.main_fut.take();
+					Poll::Ready(res)
+				} else {
+					Poll::Pending
+				}
 			} else {
-				this.main_fut.poll(cx)
+				Poll::Pending
 			}
 		}
+	}
+
+	struct NewManagedFuture {
+		abort_signal: AbortSignal,
+		pause_signal: PauseSignal,
 	}
 }
