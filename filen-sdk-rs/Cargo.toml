@@ -15,7 +15,6 @@ tokio = ["tokio/rt", "tokio-stream/fs", "tokio-util"]
 malformed = []
 heif-decoder = ["dep:heif-decoder"]
 avif-decoder = ["image/avif-native"]
-# node = ["dep:napi", "dep:napi-derive", "filen-types/node"]
 
 [dependencies]
 reqwest = { version = "0.12.22", features = [
@@ -72,14 +71,6 @@ tokio-util = { version = "0.7.16", default-features = false, features = [
 ], optional = true }
 bytes = "1.10.1"
 log = "0.4.27"
-napi = { version = "3.0.0", default-features = false, features = [
-	"napi10",
-	"async",
-	"latin1",
-	"chrono_date",
-	"serde-json",
-], optional = true }
-napi-derive = { version = "3.0.0", default-features = false, optional = true }
 async_zip = { git = "https://github.com/Enduriel/rs-async-zip.git", rev = "6ad27fd1010b35de2a96143884c1bce95e939e5e", default-features = false, features = [
 	"chrono",
 ] }

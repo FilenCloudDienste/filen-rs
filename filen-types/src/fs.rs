@@ -300,20 +300,6 @@ mod uuid {
 			}
 		}
 	}
-
-	#[cfg(feature = "node")]
-	mod node {
-		use super::UuidStr;
-		use napi::bindgen_prelude::ToNapiValue;
-		impl ToNapiValue for UuidStr {
-			unsafe fn to_napi_value(
-				env: napi::sys::napi_env,
-				val: Self,
-			) -> napi::Result<napi::sys::napi_value> {
-				unsafe { ToNapiValue::to_napi_value(env, val.as_ref()) }
-			}
-		}
-	}
 }
 
 #[cfg(feature = "rusqlite")]
@@ -366,20 +352,6 @@ mod wasm {
 	impl From<ParentUuid> for JsValue {
 		fn from(parent: ParentUuid) -> Self {
 			JsValue::from(parent.as_ref())
-		}
-	}
-}
-
-#[cfg(feature = "node")]
-mod node {
-	use super::ParentUuid;
-	use napi::bindgen_prelude::ToNapiValue;
-	impl ToNapiValue for ParentUuid {
-		unsafe fn to_napi_value(
-			env: napi::sys::napi_env,
-			val: Self,
-		) -> napi::Result<napi::sys::napi_value> {
-			unsafe { ToNapiValue::to_napi_value(env, val.as_ref()) }
 		}
 	}
 }
