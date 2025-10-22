@@ -18,7 +18,8 @@ export default defineConfig({
 			provider: "playwright",
 
 			instances: [
-				{ browser: "chromium" }
+				{ browser: "chromium" },
+				{ browser: "firefox" }
 				// running the tests in parallel causes issues becaues they share the account
 				// so we do it manually in the CI
 				// but we have to specify a browser here or vitest complains
