@@ -3,14 +3,14 @@ pub(crate) mod optional {
 
 	use serde::{Deserialize, Serialize};
 
-	use crate::fs::UuidStr;
+	use crate::{fs::UuidStr, serde::cow::CowStrWrapper};
 
 	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<UuidStr>, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let value = Option::<&str>::deserialize(deserializer)?;
-		Ok(match value {
+		let value = Option::<CowStrWrapper>::deserialize(deserializer)?.map(|v| v.0);
+		Ok(match value.as_deref() {
 			Some("") | None => None,
 			Some(string) => Some(UuidStr::from_str(string).map_err(serde::de::Error::custom)?),
 		})
@@ -45,7 +45,7 @@ macro_rules! uuid_option_module {
 		pub mod $mod_name {
 			use std::str::FromStr;
 
-			use serde::{Deserialize, Serialize};
+			use serde::Serialize;
 
 			use crate::fs::UuidStr;
 
@@ -53,8 +53,8 @@ macro_rules! uuid_option_module {
 			where
 				D: serde::Deserializer<'de>,
 			{
-				let value = <&str>::deserialize(deserializer)?;
-				Ok(match value {
+				let value = crate::serde::cow::deserialize(deserializer)?;
+				Ok(match value.as_ref() {
 					$none_value => None,
 					string => Some(UuidStr::from_str(string).map_err(serde::de::Error::custom)?),
 				})

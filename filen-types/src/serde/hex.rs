@@ -2,6 +2,8 @@ use serde::{Deserialize, Deserializer, Serializer, de::IntoDeserializer};
 use std::borrow::Cow;
 
 pub(crate) mod optional {
+	use crate::serde::cow::CowStrWrapper;
+
 	use super::*;
 	pub(crate) fn serialize<S>(
 		value: &Option<Cow<'_, [u8]>>,
@@ -22,10 +24,10 @@ pub(crate) mod optional {
 	where
 		D: Deserializer<'de>,
 	{
-		let value = <Option<&str>>::deserialize(deserializer)?;
+		let value = <Option<CowStrWrapper>>::deserialize(deserializer)?;
 		match value {
 			Some(v) => {
-				let bytes = faster_hex::nopfx_ignorecase::deserialize(v.into_deserializer())?;
+				let bytes = faster_hex::nopfx_ignorecase::deserialize(v.0.into_deserializer())?;
 				Ok(Some(Cow::Owned(bytes)))
 			}
 			None => Ok(None),

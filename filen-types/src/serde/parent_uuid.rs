@@ -3,7 +3,7 @@ macro_rules! parent_uuid_option_module {
 		pub mod $mod_name {
 			use std::str::FromStr;
 
-			use serde::{Deserialize, Serialize};
+			use serde::Serialize;
 
 			use crate::fs::UuidStr;
 
@@ -13,8 +13,8 @@ macro_rules! parent_uuid_option_module {
 			where
 				D: serde::Deserializer<'de>,
 			{
-				let value = <&str>::deserialize(deserializer)?;
-				Ok(match value {
+				let value = crate::serde::cow::deserialize(deserializer)?;
+				Ok(match value.as_ref() {
 					$none_value => None,
 					string => Some(
 						UuidStr::from_str(string)

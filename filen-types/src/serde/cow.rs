@@ -1,12 +1,35 @@
 use std::{borrow::Cow, fmt};
 
-use serde::de::{Error, Unexpected, Visitor};
+use serde::{
+	Serialize,
+	de::{Error, Unexpected, Visitor},
+};
 
-pub(crate) fn serialize<S>(value: Cow<'_, str>, serializer: S) -> Result<S::Ok, S::Error>
+pub(crate) struct CowStrWrapper<'a>(pub(crate) Cow<'a, str>);
+impl Serialize for CowStrWrapper<'_> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		serialize(&self.0, serializer)
+	}
+}
+
+impl<'de> serde::Deserialize<'de> for CowStrWrapper<'de> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let cow = deserialize(deserializer)?;
+		Ok(CowStrWrapper(cow))
+	}
+}
+
+pub(crate) fn serialize<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
 where
 	S: serde::Serializer,
 {
-	serializer.serialize_str(&value)
+	serializer.serialize_str(value)
 }
 
 pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Cow<'de, str>, D::Error>

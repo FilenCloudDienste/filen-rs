@@ -40,7 +40,7 @@ pub(crate) mod number {
 }
 
 pub(crate) mod empty_notempty {
-	use serde::{Deserialize, Deserializer, Serializer};
+	use serde::{Deserializer, Serializer};
 
 	pub(crate) fn serialize<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
 	where
@@ -57,8 +57,8 @@ pub(crate) mod empty_notempty {
 	where
 		D: Deserializer<'de>,
 	{
-		let value = <&str>::deserialize(deserializer)?;
-		match value {
+		let value = crate::serde::cow::deserialize(deserializer)?;
+		match value.as_ref() {
 			"notempty" => Ok(true),
 			"empty" => Ok(false),
 			_ => Err(serde::de::Error::custom(format!("Invalid value: {value}"))),

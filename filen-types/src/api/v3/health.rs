@@ -17,7 +17,7 @@ impl Serialize for OK {
 	where
 		S: serde::Serializer,
 	{
-		crate::serde::cow::serialize(Cow::Borrowed(OK_STR), serializer)
+		crate::serde::cow::serialize(&Cow::Borrowed(OK_STR), serializer)
 	}
 }
 
