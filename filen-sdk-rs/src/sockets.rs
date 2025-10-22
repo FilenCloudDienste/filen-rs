@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::{
 	borrow::Cow,
+	cell::Cell,
 	collections::HashSet,
 	fmt::Write,
 	mem::ManuallyDrop,
@@ -406,6 +407,11 @@ fn normalize_event_name(name: &str) -> Cow<'_, str> {
 	cow
 }
 
+const PING_MESSAGE: &str = match str::from_utf8(&[PacketType::Ping as u8]) {
+	Ok(s) => s,
+	Err(_) => panic!("Failed to create ping message string"),
+};
+
 fn start_ping_task(
 	ws: std::rc::Weak<WebSocket>,
 	mut interval: Duration,
@@ -414,8 +420,6 @@ fn start_ping_task(
 	let mut last_update = wasmtimer::std::Instant::now();
 	runtime::spawn_local(async move {
 		let mut timestamp_string = String::new();
-		let ping_packet = [PacketType::Ping as u8];
-		let ping_packet = str::from_utf8(&ping_packet).unwrap();
 		loop {
 			tokio::select! {
 				biased;
@@ -428,7 +432,8 @@ fn start_ping_task(
 						return;
 					};
 
-					if send_str(&ws, ping_packet).is_err() {
+					if send_str(&ws, PING_MESSAGE).is_err() {
+						log::warn!("Failed to send ping message, stopping ping task");
 						return;
 					}
 					timestamp_string.clear();
@@ -659,6 +664,25 @@ fn make_on_close_closure(
 	})
 }
 
+fn make_on_open_closure(
+	ws: std::rc::Weak<WebSocket>,
+	ping_interval: Duration,
+	interval_change_receiver: tokio::sync::mpsc::UnboundedReceiver<Duration>,
+) -> wasm_bindgen::prelude::Closure<dyn Fn(web_sys::Event)> {
+	// workaround for Closure needing Fn instead of FnMut/FnOnce
+	let fn_once = Cell::new(Some(move || {
+		start_ping_task(ws, ping_interval, interval_change_receiver)
+	}));
+
+	wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::Event)>::new(move |_e: web_sys::Event| {
+		if let Some(f) = fn_once.take() {
+			f();
+		} else {
+			log::error!("WebSocket onopen called multiple times");
+		}
+	})
+}
+
 enum SocketUninitOrReconnecting {
 	Reconnecting(UninitSocketConnection, ListenerManager),
 	Uninit(UninitSocketConnection),
@@ -711,11 +735,16 @@ fn setup_websocket_thread(
 			.unchecked_ref(),
 	));
 
-	start_ping_task(
-		Rc::downgrade(&ws),
-		config.ping_interval,
-		interval_change_receiver,
-	);
+	ws.set_onopen(Some(
+		make_on_open_closure(
+			Rc::downgrade(&ws),
+			config.ping_interval,
+			interval_change_receiver,
+		)
+		.into_js_value()
+		.unchecked_ref(),
+	));
+
 	spawn_close_task(receivers.close_receiver, ws);
 
 	Ok((listener_manager, config))
