@@ -46,34 +46,34 @@ impl PathIteratorExt for str {
 	}
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub type MaybeSendBoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub type MaybeSendBoxFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub trait MaybeSendSync: Send + Sync {}
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub trait MaybeSendSync {}
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl<T: Send + Sync> MaybeSendSync for T {}
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 impl<T> MaybeSendSync for T {}
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub type MaybeSendCallback<'a, T> = std::sync::Arc<dyn Fn(T) + Send + Sync + 'a>;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub type MaybeSendCallback<'a, T> = std::rc::Rc<dyn Fn(T) + 'a>;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub type MaybeArc<T> = std::sync::Arc<T>;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub type MaybeArc<T> = std::rc::Rc<T>;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub type MaybeArcWeak<T> = std::sync::Weak<T>;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub type MaybeArcWeak<T> = std::rc::Weak<T>;
 
 #[cfg(test)]

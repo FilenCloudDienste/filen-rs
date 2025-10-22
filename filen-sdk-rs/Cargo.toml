@@ -89,7 +89,7 @@ base32 = "0.5.1"
 regex = "1.11.3"
 rayon = "1.11.0"
 
-[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 hyper-util = { version = "0.1.16", features = ["client-legacy"] }
 heif-decoder = { path = "../heif-decoder", optional = true }
 tokio-tungstenite = { version = "0.28.0", features = [
@@ -98,7 +98,7 @@ tokio-tungstenite = { version = "0.28.0", features = [
 ] }
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 
-[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 getrandom_v3 = { package = "getrandom", version = "0.3", features = [
 	"wasm_js",
 ] }

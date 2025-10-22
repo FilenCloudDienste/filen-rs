@@ -45,7 +45,7 @@ pub enum ParentUuid {
 	Favorites,
 	Links,
 }
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_PARENT_UUID: &'static str =
 	r#"export type ParentUuid = UuidStr | "trash" | "recents" | "favorites" | "links";"#;
@@ -142,7 +142,7 @@ mod uuid {
 
 	use serde::{Deserialize, Serialize};
 	use uuid::{Uuid, fmt::Hyphenated};
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	use wasm_bindgen::{
 		convert::{FromWasmAbi, RefFromWasmAbi},
 		describe::WasmDescribe,
@@ -152,19 +152,19 @@ mod uuid {
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
 
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen(typescript_custom_section)]
 	const TS_PARENT_UUID: &'static str =
 		r#"export type UuidStr = `${string}-${string}-${string}-${string}`;"#;
 
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	impl WasmDescribe for UuidStr {
 		fn describe() {
 			<str as WasmDescribe>::describe();
 		}
 	}
 
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	impl FromWasmAbi for UuidStr {
 		type Abi = <str as RefFromWasmAbi>::Abi;
 
@@ -288,7 +288,7 @@ mod uuid {
 		}
 	}
 
-	#[cfg(target_arch = "wasm32")]
+	#[cfg(target_family = "wasm")]
 	mod wasm {
 		use wasm_bindgen::JsValue;
 
@@ -357,7 +357,7 @@ mod sqlite {
 	}
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 mod wasm {
 	use wasm_bindgen::JsValue;
 

@@ -273,11 +273,11 @@ impl PartialEq for Client {
 impl Eq for Client {}
 
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
 #[derive(Serialize, Deserialize)]
@@ -291,13 +291,13 @@ pub struct StringifiedClient {
 	pub api_key: String,
 	pub auth_version: u8,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "number")
 	)]
 	#[serde(default)]
 	pub max_parallel_requests: Option<u32>,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "number")
 	)]
 	#[serde(default)]

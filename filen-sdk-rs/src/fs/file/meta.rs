@@ -292,34 +292,34 @@ impl<'a> DecryptedFileMeta<'a> {
 #[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
 pub struct FileMetaChanges {
 	#[serde(default)]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
 	name: Option<String>,
 	#[serde(default)]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
 	mime: Option<String>,
 	#[serde(default, with = "filen_types::serde::time::optional")]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	last_modified: Option<DateTime<Utc>>,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint | null")
 	)]
 	#[serde(

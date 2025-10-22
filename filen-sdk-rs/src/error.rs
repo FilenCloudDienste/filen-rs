@@ -87,7 +87,7 @@ pub enum ErrorKind {
 	ImageError,
 	/// Tried to use metadata for an item that failed to decrypt metadata
 	MetadataWasNotDecrypted,
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	/// Operation was cancelled
 	Cancelled,
 	#[cfg(feature = "heif-decoder")]
@@ -275,7 +275,7 @@ impl_from!(
 
 #[derive(Debug, Error)]
 #[error("Operation was cancelled")]
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) struct AbortedError;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl_from!(AbortedError, ErrorKind::Cancelled);

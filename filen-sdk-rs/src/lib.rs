@@ -9,7 +9,7 @@ pub mod crypto;
 pub mod error;
 pub mod fs;
 pub mod io;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown")))]
 pub mod js;
 pub mod notes;
 pub mod runtime;

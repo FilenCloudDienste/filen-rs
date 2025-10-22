@@ -245,24 +245,24 @@ impl CowHelpers for DecryptedDirectoryMeta<'_> {
 #[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
 pub struct DirectoryMetaChanges {
 	#[serde(default)]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
 	name: Option<String>,
 	// double option because we need to distinguish between
 	// "not set" and "set to None"
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint | null")
 	)]
 	#[serde(

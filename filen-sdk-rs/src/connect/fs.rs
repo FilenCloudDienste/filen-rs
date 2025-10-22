@@ -25,7 +25,7 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
 pub struct ShareInfo {
@@ -35,7 +35,7 @@ pub struct ShareInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
 #[serde(tag = "role")]

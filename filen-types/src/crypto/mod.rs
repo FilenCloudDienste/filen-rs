@@ -58,7 +58,7 @@ impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
 
 // claude said to do this to define the type in TS
 // without allowing it to be constructed in TS
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_ENCRYPTED_STRING: &'static str = r#"export type EncryptedString = unknown"#;
 

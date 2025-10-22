@@ -57,7 +57,7 @@ impl Clone for AuthClient {
 impl AuthClient {
 	pub fn new(api_key: APIKey<'static>) -> Self {
 		let builder = reqwest::Client::builder();
-		#[cfg(not(target_arch = "wasm32"))]
+		#[cfg(not(target_family = "wasm"))]
 		let builder = builder.use_rustls_tls();
 		#[cfg(feature = "tokio")]
 		let builder = builder.timeout(std::time::Duration::from_secs(30));

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use serde::Deserialize;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 
 use crate::{
@@ -10,9 +10,9 @@ use crate::{
 };
 
 #[derive(Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
 #[serde(untagged)]

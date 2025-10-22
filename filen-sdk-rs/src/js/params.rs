@@ -17,17 +17,17 @@ use crate::{
 	runtime,
 };
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::js::{FileEnum, Item};
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use web_sys::js_sys::{self};
 
 #[derive(Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
 #[serde(untagged)]
@@ -51,13 +51,13 @@ pub struct FileBuilderParams {
 	pub parent: DirEnum,
 	pub name: String,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "filen_types::serde::time::optional", default)]
 	pub created: Option<DateTime<Utc>>,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "filen_types::serde::time::optional", default)]
@@ -68,9 +68,9 @@ pub struct FileBuilderParams {
 }
 
 #[derive(Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
 #[serde(rename_all = "camelCase")]
@@ -105,7 +105,7 @@ impl FileBuilderParams {
 }
 
 // not sure how the streams are handled in napi, so just excluding these from napi for now
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[derive(Deserialize, Tsify)]
 #[tsify(from_wasm_abi, large_number_types_as_bigints)]
 #[serde(rename_all = "camelCase")]
@@ -121,31 +121,31 @@ pub struct UploadFileStreamParams {
 	pub progress: js_sys::Function,
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[derive(Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi, large_number_types_as_bigints)
 )]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadFileStreamParams {
 	pub file: FileEnum,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "WritableStream<Uint8Array>")
 	)]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		serde(with = "serde_wasm_bindgen::preserve")
 	)]
 	pub writer: web_sys::WritableStream,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "(bytes: bigint) => void")
 	)]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		serde(with = "serde_wasm_bindgen::preserve")
 	)]
 	#[serde(default)]
@@ -222,27 +222,27 @@ impl ZipProgressCallbackJS {
 	}
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[derive(Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadFileToZipParams {
 	pub items: Vec<Item>,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "WritableStream<Uint8Array>")
 	)]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		serde(with = "serde_wasm_bindgen::preserve")
 	)]
 	pub writer: web_sys::WritableStream,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		serde(with = "serde_wasm_bindgen::preserve")
 	)]
 	#[tsify(

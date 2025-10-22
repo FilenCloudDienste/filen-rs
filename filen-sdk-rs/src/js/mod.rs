@@ -13,10 +13,10 @@ pub use params::*;
 pub use returned_types::*;
 use shared::*;
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::{
 	Error,
 	auth::{Client, JsClient, StringifiedClient},
@@ -24,7 +24,7 @@ use crate::{
 
 const HIDDEN_META_KEY: &str = "__hiddenMeta";
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen(start)]
 pub fn main_js() -> Result<(), JsValue> {
 	console_error_panic_hook::set_once();
@@ -35,7 +35,7 @@ pub fn main_js() -> Result<(), JsValue> {
 	Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen]
 pub async fn login(
 	email: String,
@@ -52,7 +52,7 @@ pub async fn login(
 	))
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen(js_name = "fromStringified")]
 pub fn from_stringified(serialized: StringifiedClient) -> Result<JsClient, JsValue> {
 	Ok(JsClient::new(
@@ -90,7 +90,7 @@ mod shared {
 	}
 }
 
-#[cfg(all(test, target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(test, target_family = "wasm", target_os = "unknown"))]
 mod tests {
 	use std::str::FromStr;
 

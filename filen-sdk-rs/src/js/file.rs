@@ -20,13 +20,13 @@ use crate::{
 	thumbnail::is_supported_thumbnail_mime,
 };
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(large_number_types_as_bigints)
 )]
 #[cfg_attr(test, derive(Debug))]
@@ -34,7 +34,7 @@ pub struct DecryptedFileMeta {
 	pub name: String,
 	pub mime: String,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(
@@ -44,20 +44,20 @@ pub struct DecryptedFileMeta {
 	)]
 	pub created: Option<DateTime<Utc>>,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub modified: DateTime<Utc>,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "Uint8Array")
 	)]
 	#[serde(skip_serializing_if = "Option::is_none", default)]
 	pub hash: Option<Sha512Hash>,
 
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	pub size: u64,
@@ -190,14 +190,14 @@ impl<'a>
 pub struct File {
 	pub uuid: UuidStr,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(optional, type = "DecryptedFileMeta")
 	)]
 	pub meta: FileMeta,
 
 	pub parent: ParentUuid,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	pub size: u64,
@@ -208,7 +208,7 @@ pub struct File {
 	#[tsify(type = "bigint")]
 	pub timestamp: DateTime<Utc>,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	pub chunks: u64,

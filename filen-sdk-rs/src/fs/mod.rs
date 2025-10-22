@@ -2,7 +2,7 @@ pub mod client_impl;
 pub mod dir;
 pub mod enums;
 pub mod file;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub mod js_impl;
 pub mod traits;
 pub mod zip;

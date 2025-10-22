@@ -63,9 +63,9 @@ pub(crate) async fn retry_wrap<T>(
 	let mut last_error: Option<Error> = None;
 	for (i, delay) in (0..attempts).zip(fibonacci_iter(max_retry_time)) {
 		if i > 0 {
-			#[cfg(not(target_arch = "wasm32"))]
+			#[cfg(not(target_family = "wasm"))]
 			tokio::time::sleep(delay).await;
-			#[cfg(target_arch = "wasm32")]
+			#[cfg(target_family = "wasm")]
 			wasmtimer::tokio::sleep(delay).await;
 			log::warn!(
 				"Retrying: {endpoint} ({i}/{attempts}) after {}ms)",
@@ -92,9 +92,9 @@ pub(crate) async fn retry_wrap<T>(
 				continue;
 			}
 			Err(e) => {
-				#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+				#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 				use std::error::Error as StdError;
-				#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+				#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 				if let Some(source) = e.source()
 					&& let Some(e) = source.downcast_ref::<hyper_util::client::legacy::Error>()
 					&& e.is_connect()

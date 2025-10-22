@@ -33,7 +33,7 @@ use crate::{
 
 pub mod contacts;
 pub mod fs;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub mod js_impls;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,11 +99,11 @@ impl PasswordState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
 #[serde(rename_all = "camelCase")]
@@ -111,7 +111,7 @@ pub struct FilePublicLink {
 	link_uuid: UuidStr,
 	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string | Uint8Array")
 	)]
 	password: PasswordState,
@@ -119,7 +119,7 @@ pub struct FilePublicLink {
 	downloadable: bool,
 	#[serde(with = "serde_bytes")]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "Uint8Array")
 	)]
 	salt: Vec<u8>,
@@ -172,11 +172,11 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
 #[serde(rename_all = "camelCase")]
@@ -186,14 +186,14 @@ pub struct DirPublicLink {
 	link_key: Option<MetaKey>,
 	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string | Uint8Array")
 	)]
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	enable_download: bool,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "Uint8Array")
 	)]
 	#[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]

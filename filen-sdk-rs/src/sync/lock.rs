@@ -72,7 +72,7 @@ fn drop(lock: &mut ResourceLock) {
 	tokio::spawn(async move { actually_drop(&client, uuid, &resource).await });
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn drop(lock: &mut ResourceLock) {
 	let client = lock.client.clone();
 	let uuid = lock.uuid;
@@ -82,7 +82,7 @@ fn drop(lock: &mut ResourceLock) {
 	});
 }
 
-#[cfg(not(any(feature = "tokio", target_arch = "wasm32")))]
+#[cfg(not(any(feature = "tokio", target_family = "wasm")))]
 fn drop(lock: &mut ResourceLock) {
 	futures::executor::block_on(async move {
 		actually_drop(&lock.client, lock.uuid, &lock.resource).await
@@ -98,7 +98,7 @@ impl Drop for ResourceLock {
 	}
 }
 
-#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), feature = "tokio"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "tokio"))]
 const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
 
 #[cfg(feature = "tokio")]
@@ -139,7 +139,7 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 	});
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn keep_lock_alive(lock: Weak<ResourceLock>) {
 	use wasmtimer::std::Instant;
 
@@ -176,7 +176,7 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 	});
 }
 
-#[cfg(not(any(all(target_arch = "wasm32", target_os = "unknown"), feature = "tokio")))]
+#[cfg(not(any(all(target_family = "wasm", target_os = "unknown"), feature = "tokio")))]
 fn keep_lock_alive(_lock: Weak<ResourceLock>) {
 	use log::warn;
 	warn!(

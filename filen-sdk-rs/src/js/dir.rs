@@ -20,20 +20,20 @@ use crate::{
 	js::{AsEncodedOrDecoded, EncodedOrDecoded},
 };
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(large_number_types_as_bigints)
 )]
 #[cfg_attr(test, derive(Debug))]
 pub struct DecryptedDirMeta {
 	pub name: String,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(
@@ -107,9 +107,9 @@ impl From<DirMeta> for DirectoryMeta<'static> {
 }
 
 #[derive(Serialize, Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq, Clone))]
@@ -190,7 +190,7 @@ pub struct Dir {
 	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
 	#[cfg_attr(
-		all(target_arch = "wasm32", target_os = "unknown"),
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(optional, type = "DecryptedDirMeta")
 	)]
 	pub meta: DirMeta,
@@ -223,9 +223,9 @@ impl From<Dir> for RemoteDirectory {
 }
 
 #[derive(Deserialize)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
-	all(target_arch = "wasm32", target_os = "unknown"),
+	all(target_family = "wasm", target_os = "unknown"),
 	tsify(from_wasm_abi)
 )]
 #[serde(untagged)]

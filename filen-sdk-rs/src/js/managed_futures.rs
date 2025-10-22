@@ -32,7 +32,7 @@ mod pausable {
 
 	#[derive(Deserialize, Default)]
 	#[serde(transparent)]
-	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	// unfortunately we have to call this PauseSignal, instead of PauseSignalJS,
 	// because Tsify does not support renaming the struct
 	// and we need to export the Rust PauseSignal struct as PauseSignal in JS

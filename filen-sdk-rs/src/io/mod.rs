@@ -1,6 +1,6 @@
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 use core::panic;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -41,7 +41,7 @@ impl FilenMetaExt for std::fs::Metadata {
 		return std::os::windows::fs::MetadataExt::file_size(self);
 		#[cfg(unix)]
 		return std::os::unix::fs::MetadataExt::size(self);
-		#[cfg(target_arch = "wasm32")]
+		#[cfg(target_family = "wasm")]
 		panic!("Cannot get file size on wasm32");
 	}
 
@@ -54,7 +54,7 @@ impl FilenMetaExt for std::fs::Metadata {
 				+ Duration::from_nanos(std::os::unix::fs::MetadataExt::mtime_nsec(self) as u64),
 		)
 		.round_subsecs(3);
-		#[cfg(target_arch = "wasm32")]
+		#[cfg(target_family = "wasm")]
 		panic!("Cannot get file modified time on wasm32");
 	}
 
@@ -63,7 +63,7 @@ impl FilenMetaExt for std::fs::Metadata {
 		return nt_time_to_unix_time(std::os::windows::fs::MetadataExt::creation_time(self));
 		#[cfg(unix)]
 		return FilenMetaExt::modified(self);
-		#[cfg(target_arch = "wasm32")]
+		#[cfg(target_family = "wasm")]
 		panic!("Cannot get file created time on wasm32");
 	}
 }
