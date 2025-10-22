@@ -74,7 +74,7 @@ jobs:
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
           IMAP_EMAIL_USER: ${{ secrets['IMAP_EMAIL_USER'] }}
           IMAP_EMAIL_PASSWORD: ${{ secrets['IMAP_EMAIL_PASSWORD'] }}
-          RUST_LOG: trace
+          RUST_LOG: debug
   test-wasm:
     if: |
       github.event_name == 'schedule' ||
