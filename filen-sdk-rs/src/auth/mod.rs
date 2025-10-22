@@ -45,9 +45,14 @@ use crate::{
 use crate::sockets::{SocketConfig, SocketConnectionState};
 
 pub mod http;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub mod js_impls;
 pub mod v1;
 pub mod v2;
 pub mod v3;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub use js_impls::JsClient;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum MetaKey {
@@ -219,29 +224,6 @@ fn master_keys_from_exportable(recovery_key: &str, user_id: u64) -> Result<Vec<M
 		})
 	})
 	.collect::<Result<Vec<MasterKey>, Error>>()
-}
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[wasm_bindgen::prelude::wasm_bindgen(js_name = "Client")]
-pub struct JsClient {
-	client: Arc<Client>,
-}
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-impl JsClient {
-	pub(crate) fn new(client: Client) -> Self {
-		Self {
-			client: Arc::new(client),
-		}
-	}
-
-	pub(crate) fn inner(&self) -> Arc<Client> {
-		self.client.clone()
-	}
-
-	pub(crate) fn inner_ref(&self) -> &Client {
-		&self.client
-	}
 }
 
 pub struct Client {
@@ -683,15 +665,15 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn delete_account(self, two_factor_code: &str) -> Result<(), (Error, Self)> {
+	pub async fn delete_account(&self, two_factor_code: &str) -> Result<(), Error> {
 		api::v3::user::delete::post(
 			self.client(),
 			&api::v3::user::delete::Request {
 				two_factor_key: Cow::Borrowed(two_factor_code),
 			},
 		)
-		.await
-		.map_err(|e| (e, self))
+		.await?;
+		Ok(())
 	}
 
 	pub async fn change_password(
@@ -837,6 +819,11 @@ impl Client {
 	}
 }
 
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Serialize, tsify::Tsify),
+	tsify(into_wasm_abi)
+)]
 pub struct TwoFASecret {
 	secret: String,
 	url: String,
@@ -917,16 +904,6 @@ impl Client {
 			max_parallel_requests: None,
 			max_io_memory_usage: None,
 		}
-	}
-}
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
-impl JsClient {
-	#[wasm_bindgen(js_name = "toStringified")]
-	pub async fn to_stringified(&self) -> StringifiedClient {
-		let this = self.inner();
-		crate::runtime::do_on_commander(move || async move { this.to_stringified() }).await
 	}
 }
 
