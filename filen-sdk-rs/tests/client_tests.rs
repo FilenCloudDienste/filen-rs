@@ -60,8 +60,12 @@ async fn enable_2fa_for_client(client: &Client, secret: &TwoFASecret) -> String 
 					.to_string(),
 			)
 			.await;
-		if let Ok(recovery_key) = result {
-			return recovery_key;
+		match result {
+			Err(e) => {
+				log::warn!("Failed to enable 2FA: {}, retrying...", e);
+				continue;
+			}
+			Ok(recovery_key) => return recovery_key,
 		}
 	}
 	panic!("Failed to enable 2FA after multiple attempts");
