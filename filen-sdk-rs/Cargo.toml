@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-tokio = ["tokio/rt", "tokio-stream/fs", "tokio-util"]
+tokio = ["tokio/rt-multi-thread", "tokio-stream/fs", "tokio-util"]
 malformed = []
 heif-decoder = ["dep:heif-decoder"]
 avif-decoder = ["image/avif-native"]
