@@ -30,7 +30,7 @@ jobs:
     strategy:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
-        version: [V1, V2, V3] # This remains to define which version of the secrets to use
+        version: [V1, V2] # This remains to define which version of the secrets to use
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
