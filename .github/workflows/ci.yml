@@ -34,6 +34,8 @@ jobs:
           sudo apt-get install -y libdav1d-dev pkg-config
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
 
   ci-windows:
     runs-on: windows-latest
@@ -103,8 +105,6 @@ jobs:
         run: cargo clippy --all-features -- -D warnings
       - name: Run clippy iOS
         run: cargo clippy --target aarch64-apple-ios -F tokio,malformed,heif-decoder -- -D warnings
-      - name: Run rustfmt
-        run: cargo fmt --all -- --check
 
   ci-wasm:
     runs-on: ubuntu-latest
