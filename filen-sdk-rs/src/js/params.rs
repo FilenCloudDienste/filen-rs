@@ -1,9 +1,6 @@
 use std::borrow::Cow;
 
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
-use web_sys::js_sys::{BigInt, Function};
 
 use crate::{
 	auth::Client,
@@ -11,23 +8,25 @@ use crate::{
 		NonRootFSObject,
 		dir::UnsharedDirectoryType,
 		file::{FileBuilder, RemoteFile},
-		zip::ZipProgressCallback,
 	},
-	js::{Dir, DirEnum, File, ManagedFuture},
-	runtime,
+	js::{DateTime, Dir, DirEnum, File},
 };
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::{fs::zip::ZipProgressCallback, js::ManagedFuture, runtime};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::js::{FileEnum, Item};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use web_sys::js_sys::{self};
+use wasm_bindgen::prelude::*;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use web_sys::js_sys::{self, BigInt, Function};
 
 #[derive(Deserialize)]
-#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
 	tsify(from_wasm_abi)
 )]
 #[serde(untagged)]
@@ -46,7 +45,8 @@ impl TryFrom<NonRootItem> for NonRootFSObject<'static> {
 	}
 }
 
-#[derive(Deserialize, Tsify)]
+#[derive(Deserialize)]
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 pub struct FileBuilderParams {
 	pub parent: DirEnum,
 	pub name: String,
@@ -55,15 +55,18 @@ pub struct FileBuilderParams {
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "filen_types::serde::time::optional", default)]
-	pub created: Option<DateTime<Utc>>,
+	pub created: Option<DateTime>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "filen_types::serde::time::optional", default)]
-	pub modified: Option<DateTime<Utc>>,
+	pub modified: Option<DateTime>,
 	#[serde(default)]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub mime: Option<String>,
 }
 
@@ -80,6 +83,7 @@ pub struct UploadFileParams {
 	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
 	// #[serde(flatten)]
 	#[serde(default)]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	pub managed_future: ManagedFuture,
 }
 
@@ -104,7 +108,6 @@ impl FileBuilderParams {
 	}
 }
 
-// not sure how the streams are handled in napi, so just excluding these from napi for now
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[derive(Deserialize, Tsify)]
 #[tsify(from_wasm_abi, large_number_types_as_bigints)]
@@ -122,33 +125,16 @@ pub struct UploadFileStreamParams {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[derive(Deserialize)]
-#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	tsify(from_wasm_abi, large_number_types_as_bigints)
-)]
+#[derive(Deserialize, Tsify)]
+#[tsify(from_wasm_abi, large_number_types_as_bigints)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadFileStreamParams {
 	pub file: FileEnum,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "WritableStream<Uint8Array>")
-	)]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		serde(with = "serde_wasm_bindgen::preserve")
-	)]
+	#[tsify(type = "WritableStream<Uint8Array>")]
+	#[serde(with = "serde_wasm_bindgen::preserve")]
 	pub writer: web_sys::WritableStream,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "(bytes: bigint) => void")
-	)]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		serde(with = "serde_wasm_bindgen::preserve")
-	)]
-	#[serde(default)]
+	#[tsify(type = "(bytes: bigint) => void")]
+	#[serde(default, with = "serde_wasm_bindgen::preserve")]
 	pub progress: js_sys::Function,
 	#[serde(default)]
 	#[tsify(type = "bigint")]
@@ -163,6 +149,7 @@ pub struct DownloadFileStreamParams {
 }
 
 #[wasm_bindgen]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 unsafe extern "C" {
 	#[wasm_bindgen(extends = Function, is_type_of = JsValue::is_function, typescript_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void")]
 	pub type ZipProgressCallbackJS;
@@ -177,12 +164,14 @@ unsafe extern "C" {
 	) -> Result<JsValue, JsValue>;
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl Default for ZipProgressCallbackJS {
 	fn default() -> Self {
 		JsValue::undefined().unchecked_into()
 	}
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl ZipProgressCallbackJS {
 	pub(crate) fn into_rust_callback(self) -> Option<impl ZipProgressCallback> {
 		if self.is_undefined() {
@@ -223,32 +212,18 @@ impl ZipProgressCallbackJS {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[derive(Deserialize)]
-#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	tsify(from_wasm_abi)
-)]
+#[derive(Deserialize, Tsify)]
+#[tsify(from_wasm_abi)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadFileToZipParams {
 	pub items: Vec<Item>,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "WritableStream<Uint8Array>")
-	)]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		serde(with = "serde_wasm_bindgen::preserve")
-	)]
+	#[tsify(type = "WritableStream<Uint8Array>")]
+	#[serde(with = "serde_wasm_bindgen::preserve")]
 	pub writer: web_sys::WritableStream,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		serde(with = "serde_wasm_bindgen::preserve")
-	)]
+	#[serde(default, with = "serde_wasm_bindgen::preserve")]
 	#[tsify(
 		type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void"
 	)]
-	#[serde(default)]
 	pub progress: ZipProgressCallbackJS,
 	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
 	// #[serde(flatten)]

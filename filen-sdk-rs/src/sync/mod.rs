@@ -83,10 +83,16 @@ mod js_impl {
 	pub struct AcquireLockParams {
 		resource: String,
 		#[serde(default)]
-		#[tsify(type = "number")]
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			tsify(type = "number")
+		)]
 		max_sleep_time: Option<u32>,
 		#[serde(default)]
-		#[tsify(type = "number")]
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			tsify(type = "number")
+		)]
 		attempts: Option<u32>,
 	}
 

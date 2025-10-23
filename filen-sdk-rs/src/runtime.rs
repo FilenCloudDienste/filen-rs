@@ -491,7 +491,10 @@ mod wasm_threading {
 	#[serde(rename_all = "camelCase")]
 	pub struct WorkerInitEvent {
 		#[serde(with = "serde_wasm_bindgen::preserve")]
-		#[tsify(type = "WebAssembly.Memory")]
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			tsify(type = "WebAssembly.Memory")
+		)]
 		memory: JsValue,
 		closure_ptr: usize,
 	}

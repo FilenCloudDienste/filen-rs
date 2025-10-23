@@ -1,6 +1,7 @@
 mod dir;
 mod file;
 mod item;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod managed_futures;
 mod params;
 mod returned_types;
@@ -8,6 +9,7 @@ mod returned_types;
 pub use dir::*;
 pub use file::*;
 pub use item::*;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use managed_futures::*;
 pub use params::*;
 pub use returned_types::*;
@@ -90,6 +92,7 @@ mod shared {
 	}
 }
 
+type DateTime = chrono::DateTime<chrono::Utc>;
 #[cfg(all(test, target_family = "wasm", target_os = "unknown"))]
 mod tests {
 	use std::str::FromStr;

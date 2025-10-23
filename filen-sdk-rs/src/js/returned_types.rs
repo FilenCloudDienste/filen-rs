@@ -5,10 +5,15 @@ use crate::{
 	js::{Dir, File},
 };
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 
-#[derive(Serialize, Tsify)]
-#[tsify(into_wasm_abi)]
+#[derive(Serialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(into_wasm_abi)
+)]
 #[serde(tag = "type")]
 #[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub enum NonRootItemTagged {
@@ -27,8 +32,12 @@ impl From<NonRootFSObject<'_>> for NonRootItemTagged {
 	}
 }
 
-#[derive(Serialize, Tsify)]
-#[tsify(into_wasm_abi, large_number_types_as_bigints)]
+#[derive(Serialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints)
+)]
 pub struct DirSizeResponse {
 	pub size: u64,
 	pub files: u64,

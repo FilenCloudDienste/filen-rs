@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use chrono::{DateTime, Utc};
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},
@@ -16,7 +15,7 @@ use crate::{
 		enums::RemoteFileType,
 		meta::{DecryptedFileMeta as SDKDecryptedFileMeta, FileMeta as SDKFileMeta},
 	},
-	js::{AsEncodedOrDecoded, EncodedOrDecoded},
+	js::{AsEncodedOrDecoded, DateTime, EncodedOrDecoded},
 	thumbnail::is_supported_thumbnail_mime,
 };
 
@@ -24,9 +23,9 @@ use crate::{
 use tsify::Tsify;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
 	tsify(large_number_types_as_bigints)
 )]
 #[cfg_attr(test, derive(Debug))]
@@ -42,13 +41,13 @@ pub struct DecryptedFileMeta {
 		skip_serializing_if = "Option::is_none",
 		default
 	)]
-	pub created: Option<DateTime<Utc>>,
+	pub created: Option<DateTime>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "chrono::serde::ts_milliseconds")]
-	pub modified: DateTime<Utc>,
+	pub modified: DateTime,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "Uint8Array")
@@ -183,10 +182,13 @@ impl<'a>
 	}
 }
 
-#[derive(Clone, Tsify)]
-#[tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)]
+#[derive(Clone)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
+)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-#[serde(rename_all = "camelCase")]
 pub struct File {
 	pub uuid: UuidStr,
 	#[cfg_attr(
@@ -205,8 +207,11 @@ pub struct File {
 
 	pub region: String,
 	pub bucket: String,
-	#[tsify(type = "bigint")]
-	pub timestamp: DateTime<Utc>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
+	pub timestamp: DateTime,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
@@ -256,18 +261,26 @@ impl TryFrom<File> for RemoteFile {
 	}
 }
 
-#[derive(Tsify)]
-#[tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)]
-#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
+)]
 pub struct RootFile {
 	pub uuid: UuidStr,
 	pub size: u64,
 	pub chunks: u64,
 	pub region: String,
 	pub bucket: String,
-	#[tsify(type = "bigint")]
-	pub timestamp: DateTime<Utc>,
-	#[tsify(optional, type = "DecryptedDirMeta")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
+	pub timestamp: DateTime,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(optional, type = "DecryptedDirMeta")
+	)]
 	pub meta: FileMeta,
 	// JS only field, indicates if the file can have a thumbnail generated
 	// this is here to avoid having to call into WASM to check mime types
@@ -309,8 +322,12 @@ impl From<RemoteRootFile> for RootFile {
 	}
 }
 
-#[derive(Tsify, Serialize, Deserialize)]
-#[tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)]
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
+)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedFile {
 	pub file: RootFile,
@@ -336,8 +353,12 @@ impl From<crate::connect::fs::SharedFile> for SharedFile {
 	}
 }
 
-#[derive(Tsify, Serialize, Deserialize)]
-#[tsify(from_wasm_abi, into_wasm_abi)]
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
+)]
 #[serde(untagged)]
 pub enum FileEnum {
 	File(File),
@@ -371,7 +392,7 @@ mod serde_impls {
 		region: Cow<'a, str>,
 		bucket: Cow<'a, str>,
 		#[serde(with = "chrono::serde::ts_milliseconds")]
-		timestamp: DateTime<Utc>,
+		timestamp: DateTime,
 		chunks: u64,
 
 		meta: Option<Cow<'a, DecryptedFileMeta>>,
@@ -447,7 +468,7 @@ mod serde_impls {
 		region: Cow<'a, str>,
 		bucket: Cow<'a, str>,
 		#[serde(with = "chrono::serde::ts_milliseconds")]
-		timestamp: DateTime<Utc>,
+		timestamp: DateTime,
 		meta: Option<Cow<'a, DecryptedFileMeta>>,
 		// HIDDEN_META_KEY
 		#[serde(rename = "__hiddenMeta")]

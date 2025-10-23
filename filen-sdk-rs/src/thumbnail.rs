@@ -111,7 +111,10 @@ mod js_impls {
 		// this is correct, ts requires the specifity
 		// because of https://github.com/microsoft/typescript/issues/62546
 		// not sure who to upstream this to, tsify, js_sys, or wasm-bindgen
-		#[tsify(type = "Uint8Array<ArrayBuffer>")]
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			tsify(type = "Uint8Array<ArrayBuffer>")
+		)]
 		pub webp_data: ByteBuf,
 	}
 

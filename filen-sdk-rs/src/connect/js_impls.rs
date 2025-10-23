@@ -24,16 +24,28 @@ pub struct Contact {
 	pub user_id: u64,
 	pub email: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub avatar: Option<String>,
 	pub nick_name: String,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
-	#[tsify(type = "bigint")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
 	pub last_active: DateTime<Utc>,
-	#[tsify(type = "bigint")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	#[serde(with = "filen_types::serde::rsa::public_key_der")]
 	pub public_key: RsaPublicKey,
 }
@@ -76,10 +88,16 @@ pub struct BlockedContact {
 	pub user_id: u64,
 	pub email: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub avatar: Option<String>,
 	pub nick_name: String,
-	#[tsify(type = "bigint")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 }
@@ -105,7 +123,10 @@ pub struct ContactRequestIn {
 	pub user_id: u64,
 	pub email: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub avatar: Option<String>,
 	pub nick_name: String,
 }
@@ -145,7 +166,10 @@ pub struct ContactRequestOut {
 	pub uuid: UuidStr,
 	pub email: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub avatar: Option<String>,
 	pub nick_name: String,
 }

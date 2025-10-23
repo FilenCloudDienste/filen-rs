@@ -110,7 +110,10 @@ pub struct CompletePasswordResetParams {
 	pub email: String,
 	pub new_password: String,
 	#[serde(default)]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub recover_key: Option<String>,
 }
 
@@ -138,10 +141,16 @@ pub struct RegisterParams {
 	pub email: String,
 	pub password: String,
 	#[serde(default)]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub ref_id: Option<String>,
 	#[serde(default)]
-	#[tsify(type = "string")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
 	pub aff_id: Option<String>,
 }
 
