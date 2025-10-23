@@ -100,10 +100,7 @@ impl PasswordState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify)
-)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
 #[serde(rename_all = "camelCase")]
@@ -173,10 +170,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify)
-)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
 #[serde(rename_all = "camelCase")]

@@ -274,10 +274,7 @@ impl Eq for Client {}
 
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify)
-)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
 #[derive(Serialize, Deserialize)]

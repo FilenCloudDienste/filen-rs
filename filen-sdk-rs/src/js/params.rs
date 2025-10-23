@@ -71,9 +71,9 @@ pub struct FileBuilderParams {
 }
 
 #[derive(Deserialize)]
-#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
 	tsify(from_wasm_abi)
 )]
 #[serde(rename_all = "camelCase")]

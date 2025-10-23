@@ -246,10 +246,7 @@ impl CowHelpers for DecryptedDirectoryMeta<'_> {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify)
-)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
 	tsify(from_wasm_abi)
 )]
 pub struct DirectoryMetaChanges {
