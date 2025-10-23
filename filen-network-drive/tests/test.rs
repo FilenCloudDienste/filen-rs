@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 
 use filen_macros::shared_test_runtime;
 use filen_network_drive::mount_network_drive;

@@ -10,7 +10,7 @@ on:
       - dev
 jobs:
   ci-linux:
-    # also runs TOML linting and rustfmt
+    # also runs clippy on tests, does TOML linting and runs rustfmt
     runs-on: ubuntu-latest
     name: CI on ubuntu-latest
     steps:
@@ -35,6 +35,8 @@ jobs:
           sudo apt-get install -y libdav1d-dev pkg-config
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
+      - name: Run clippy on tests
+        run: cargo clippy --tests -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
       - name: Install TOML linter
