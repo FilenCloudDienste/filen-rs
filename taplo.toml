@@ -1,0 +1,4 @@
+[formatting]
+indent_string = "	"
+allowed_blank_lines = 1
+align_comments = false

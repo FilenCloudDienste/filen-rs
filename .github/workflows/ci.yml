@@ -10,6 +10,7 @@ on:
       - dev
 jobs:
   ci-linux:
+    # also runs TOML linting and rustfmt
     runs-on: ubuntu-latest
     name: CI on ubuntu-latest
     steps:
@@ -36,6 +37,14 @@ jobs:
         run: cargo clippy --all-features -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
+      - name: Install TOML linter
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: taplo-cli@0.10.0
+      - name: Run TOML linter and formatter
+        run: |
+          taplo lint
+          taplo fmt --check
 
   ci-windows:
     runs-on: windows-latest
@@ -64,6 +73,7 @@ jobs:
         run: cargo clippy --all-features -- -D warnings
 
   ci-macos:
+    # also runs iOS and Android clippy
     runs-on: macos-latest
     name: CI on macos-latest
     steps:

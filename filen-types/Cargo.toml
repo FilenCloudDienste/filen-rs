@@ -12,16 +12,16 @@ chrono = { version = "0.4.41", features = ["serde"] }
 digest = "0.10.7"
 faster-hex = { version = "0.10.0", features = ["serde"] }
 rsa = "0.9.8" # update to 0.10 when it is released, as it patches a side-channel timing based attack
-rusqlite = { version = "0.37.0", optional = true, default-features = false, features = ["uuid"] }
+rusqlite = { version = "0.37.0", optional = true, default-features = false, features = [
+	"uuid",
+] }
 serde = { version = "1.0.219", features = ["serde_derive"] }
 serde_json = "1.0.142"
 serde_repr = "0.1.20"
 sha2 = "0.10.9"
 thiserror = "2.0.14"
 uuid = { version = "1.18.0", features = ["serde", "v4"] }
-tsify = { version = "0.5.5", default-features = false, features = [
-    "js"
-] }
+tsify = { version = "0.5.5", default-features = false, features = ["js"] }
 serde_bytes = "0.11.17"
 filen-macros = { path = "../filen-macros" }
 

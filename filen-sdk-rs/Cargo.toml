@@ -25,7 +25,7 @@ reqwest = { version = "0.12.22", features = [
 
 filen-types = { path = "../filen-types" }
 rand = "0.9.2"
-old_rng = { package = "rand", version = "0.8.5" }           # for compatibility with rsa 0.9.8
+old_rng = { package = "rand", version = "0.8.5" } # for compatibility with rsa 0.9.8
 aes-gcm = { version = "0.10.3", features = ["std"] }
 generic-array = "1.2.0"
 thiserror = "2.0.14"
