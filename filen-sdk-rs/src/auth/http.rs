@@ -57,10 +57,11 @@ impl Clone for AuthClient {
 impl AuthClient {
 	pub fn new(api_key: APIKey<'static>) -> Self {
 		let builder = reqwest::Client::builder();
-		#[cfg(not(target_family = "wasm"))]
-		let builder = builder.use_rustls_tls();
-		#[cfg(feature = "tokio")]
-		let builder = builder.timeout(std::time::Duration::from_secs(30));
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		let builder = {
+			let builder = builder.use_rustls_tls();
+			builder.timeout(std::time::Duration::from_secs(30))
+		};
 		Self {
 			client: builder.build().expect("Failed to create reqwest client"),
 			api_key: std::sync::RwLock::new(api_key),

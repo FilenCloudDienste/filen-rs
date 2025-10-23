@@ -64,7 +64,7 @@ async fn actually_drop(client: &AuthClient, uuid: UuidStr, resource: &str) {
 	}
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn drop(lock: &mut ResourceLock) {
 	let client = lock.client.clone();
 	let uuid = lock.uuid;
@@ -72,20 +72,13 @@ fn drop(lock: &mut ResourceLock) {
 	tokio::spawn(async move { actually_drop(&client, uuid, &resource).await });
 }
 
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn drop(lock: &mut ResourceLock) {
 	let client = lock.client.clone();
 	let uuid = lock.uuid;
 	let resource = lock.resource.clone();
 	wasm_bindgen_futures::spawn_local(async move {
 		actually_drop(&client, uuid, &resource).await;
-	});
-}
-
-#[cfg(not(any(feature = "tokio", target_family = "wasm")))]
-fn drop(lock: &mut ResourceLock) {
-	futures::executor::block_on(async move {
-		actually_drop(&lock.client, lock.uuid, &lock.resource).await
 	});
 }
 
@@ -98,10 +91,9 @@ impl Drop for ResourceLock {
 	}
 }
 
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "tokio"))]
 const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
 
-#[cfg(feature = "tokio")]
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn keep_lock_alive(lock: Weak<ResourceLock>) {
 	use log::error;
 	use std::time::Instant;
@@ -174,14 +166,6 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 			wasmtimer::tokio::sleep(LOCK_REFRESH_INTERVAL).await;
 		}
 	});
-}
-
-#[cfg(not(any(all(target_family = "wasm", target_os = "unknown"), feature = "tokio")))]
-fn keep_lock_alive(_lock: Weak<ResourceLock>) {
-	use log::warn;
-	warn!(
-		"Keep-alive for locks is not supported in non-tokio builds. The lock will not be refreshed automatically and will time out in 30 seconds."
-	);
 }
 
 impl Client {

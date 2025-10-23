@@ -11,7 +11,6 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-tokio = ["tokio/rt-multi-thread", "tokio-stream/fs", "tokio-util"]
 malformed = []
 heif-decoder = ["dep:heif-decoder"]
 avif-decoder = ["image/avif-native"]
@@ -80,6 +79,7 @@ base32 = "0.5.1"
 regex = "1.11.3"
 rayon = "1.11.0"
 
+# native (not wasm) only dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 hyper-util = { version = "0.1.16", features = ["client-legacy"] }
 heif-decoder = { path = "../heif-decoder", optional = true }
@@ -88,7 +88,21 @@ tokio-tungstenite = { version = "0.28.0", features = [
 	"rustls-tls-native-roots",
 ] }
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+tokio = { version = "1.47.1", default-features = false, features = [
+	"sync",
+	"macros",
+	"fs",
+	"rt-multi-thread",
+] }
+tokio-util = { version = "0.7.16", default-features = false, features = [
+	"compat",
+] }
+tokio-stream = { version = "0.1.17", default-features = false, features = [
+	"sync",
+	"fs",
+] }
 
+# wasm only dependencies
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 getrandom_v3 = { package = "getrandom", version = "0.3", features = [
 	"wasm_js",
@@ -122,6 +136,8 @@ wasm-bindgen-rayon = "1.3.0"
 # which meant that wasm_atomic was not being used
 parking_lot = { version = "0.12", features = ["nightly"] }
 
+# dev-dependencies
+# native (not wasm) only dev-dependencies
 [target.'cfg(not(all(target_family="wasm", target_os= "unknown")))'.dev-dependencies]
 dotenv = "0.15.0"
 tokio = { version = "1.47.1", features = ["full"] }
@@ -141,5 +157,6 @@ reqwest = { version = "0.12.22", features = [
 ], default-features = false }
 scraper = "0.24.0"
 
+# wasm only dev-dependencies
 [target.'cfg(all(target_family="wasm", target_os= "unknown"))'.dev-dependencies]
 wasm-bindgen-test = "0.3.54"

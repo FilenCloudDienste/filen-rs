@@ -107,7 +107,6 @@ impl ItemFnLike for syn::ImplItemFn {
 	}
 }
 
-#[cfg(feature = "tokio")]
 fn get_function_body(
 	fn_prefix: proc_macro2::TokenStream,
 	original_fn_name: &Ident,
@@ -115,50 +114,9 @@ fn get_function_body(
 ) -> syn::Result<Block> {
 	syn::parse2(quote! {
 		{
-			println!("{} called", stringify!(#original_fn_name));
-			let time = chrono::Utc::now();
-
-			let ret = crate::env::get_runtime().spawn(async move {
-				let time = chrono::Utc::now();
-				let ret = #fn_prefix #original_fn_name(#(#args),*).await;
-				log::info!(
-				"{} inner time: {}ms",
-				stringify!(#original_fn_name),
-					(chrono::Utc::now() - time).num_milliseconds()
-				);
-				ret
-			}).await.unwrap();
-
-			log::info!(
-				"{} full time: {}ms",
-				stringify!(#original_fn_name),
-				(chrono::Utc::now() - time).num_milliseconds()
-			);
-
-			ret
-		}
-	})
-}
-
-#[cfg(not(feature = "tokio"))]
-fn get_function_body(
-	fn_prefix: proc_macro2::TokenStream,
-	original_fn_name: &Ident,
-	args: &[proc_macro2::TokenStream],
-) -> syn::Result<Block> {
-	syn::parse2(quote! {
-		{
-			let time = chrono::Utc::now();
-
-			let ret = #fn_prefix #original_fn_name(#(#args),*).await;
-
-			log::info!(
-				"{} call time: {}ms",
-				stringify!(#original_fn_name),
-				(chrono::Utc::now() - time).num_milliseconds()
-			);
-
-			ret
+			crate::env::get_runtime().spawn(async move {
+				#fn_prefix #original_fn_name(#(#args),*).await
+			}).await.unwrap()
 		}
 	})
 }

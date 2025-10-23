@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-#[cfg(feature = "tokio")]
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -8,26 +8,24 @@ use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::connect::fs::{ShareInfo, SharingRole};
-#[cfg(feature = "tokio")]
-use crate::error::ErrorKind;
-use crate::fs::dir::DirectoryTypeWithShareInfo;
-use crate::fs::{HasParent, NonRootFSObject};
-use crate::runtime::{blocking_join, do_cpu_intensive};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use crate::ErrorKind;
 use crate::{
 	api,
 	auth::Client,
+	connect::fs::{ShareInfo, SharingRole},
 	crypto::shared::MetaCrypter,
 	error::{Error, ErrorExt, InvalidTypeError, MetadataWasNotDecryptedError},
 	fs::{
-		HasName, HasUUID,
+		HasName, HasParent, HasUUID, NonRootFSObject,
 		dir::{
-			HasUUIDContents,
+			DirectoryTypeWithShareInfo, HasUUIDContents,
 			meta::{DirectoryMeta, DirectoryMetaChanges},
 			traits::HasDirMeta,
 		},
 		file::{RemoteFile, meta::FileMeta},
 	},
+	runtime::{blocking_join, do_cpu_intensive},
 	util::PathIteratorExt,
 };
 
@@ -530,7 +528,7 @@ impl Client {
 	}
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 impl Client {
 	pub async fn recursive_upload_dir(
 		&self,
