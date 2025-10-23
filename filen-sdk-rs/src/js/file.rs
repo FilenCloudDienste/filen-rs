@@ -186,7 +186,8 @@ impl<'a>
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
-	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
 )]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct File {
@@ -264,7 +265,8 @@ impl TryFrom<File> for RemoteFile {
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
-	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
 )]
 pub struct RootFile {
 	pub uuid: UuidStr,
