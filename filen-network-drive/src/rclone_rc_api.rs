@@ -12,7 +12,7 @@ pub(crate) struct CoreStatsResponseTransfer {
 	/// in bytes
 	pub(crate) size: i64,
 	/// in bytes per second
-	pub(crate) speed: i64,
+	pub(crate) speed: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -458,7 +458,7 @@ pub struct NetworkDriveStats {
 pub struct NetworkDriveTransfer {
 	pub name: String,
 	pub size: i64,
-	pub speed: i64,
+	pub speed: f64,
 }
 
 impl MountedNetworkDrive {
