@@ -1,5 +1,7 @@
+use hex_literal::hex;
 use port_check::free_local_ipv4_port;
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},
@@ -138,6 +140,36 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 		fs::create_dir_all(rclone_binary_dir)
 			.await
 			.context("Failed to create Rclone binary directory")?;
+
+		// verify checksum
+		let downloaded_checksum = Sha256::digest(&bytes);
+		let expected_checksum = match (std::env::consts::OS, std::env::consts::ARCH) {
+			("windows", "x86_64") => {
+				hex!("98abf27aaef7709b828a70444a86dbecf3785339b7cc0fe2bd4109456178bb7f")
+			}
+			("windows", "aarch64") => {
+				hex!("7cc58e796ccdbca7fe8c61fb2e452c79c8b6d7f7f805500dc5f4c484a7c34489")
+			}
+			("linux", "x86_64") => {
+				hex!("b955ffcca0705ac9ce807b238650bdcc22a109f4c3474e77c4a163fa208a6214")
+			}
+			("linux", "aarch64") => {
+				hex!("106ba687b5662eaad2120f3241e36c185743e4755f30069c49393c479a2c9b8f")
+			}
+			("macos", "x86_64") => {
+				hex!("9143b88e35b105a3b4c04073fcad5008d80c65fce8a997afa2316428fd783d51")
+			}
+			("macos", "aarch64") => {
+				hex!("67aa11b8112f293b93d02aec97cc4bb7463ebc1c775b3c31a7d9017146d2d844")
+			}
+			_ => unreachable!(),
+		};
+		if downloaded_checksum.as_slice() != expected_checksum {
+			return Err(anyhow::anyhow!(
+				"Downloaded Rclone binary's checksum doesn't match!"
+			));
+		}
+
 		fs::write(&rclone_binary_path, &bytes).await?;
 
 		#[cfg(unix)]
@@ -152,8 +184,6 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 				.await
 				.context("Failed to set Rclone binary permissions")?;
 		}
-
-		// todo: verify downloaded file checksum
 	}
 
 	debug!("Using Rclone binary at {}", rclone_binary_path.display());

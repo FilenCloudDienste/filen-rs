@@ -10,6 +10,7 @@ metadata.workspaces = { independent = true }
 [dependencies]
 anyhow = "1.0.98"
 filen-sdk-rs = { path = "../filen-sdk-rs" }
+hex-literal = "1.1.0"
 # todo: make sure filen-network-drive does not depend on filen-sdk-rs
 log = "0.4.27"
 port_check = "0.3.0"
@@ -19,6 +20,7 @@ reqwest = { version = "0.12.22", features = [
 ], default-features = false }
 serde = "1.0.228"
 serde_json = "1.0.145"
+sha2 = "0.10.9"
 sysinfo = "0.37.2"
 tokio = { version = "1.47.1", features = [
 	"rt-multi-thread",
