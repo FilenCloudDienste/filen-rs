@@ -3,6 +3,7 @@ use regex::Regex;
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},
+	process::ExitStatus,
 };
 use sysinfo::Disks;
 use tokio::{
@@ -12,13 +13,18 @@ use tokio::{
 
 use anyhow::{Context, Result};
 use filen_sdk_rs::auth::Client;
-use log::{debug, info};
+use log::{debug, info, trace};
+
+use crate::rclone_rc_api::{RcloneApiClient, VfsListResponse};
+
+mod rclone_rc_api;
 
 pub struct MountedNetworkDrive {
 	/// The path where the network drive is mounted
 	pub mount_point: String,
 	/// The `rclone mount` child process. Will be killed on drop.
 	pub process: Child,
+	api_client: RcloneApiClient,
 }
 
 /// Mount Filen as a network drive using Rclone.
@@ -32,11 +38,14 @@ pub async fn mount_network_drive(
 	let rclone_binary_path = ensure_rclone_binary(config_dir).await?;
 	let rclone_config_path = write_rclone_config(&rclone_binary_path, client, config_dir).await?;
 	let mount_point = resolve_mount_point(mount_point).await?;
+	let rc_port =
+		free_local_ipv4_port().ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
 	let process = start_rclone_mount_process(
 		&config_dir.join("network-drive-rclone/cache"),
 		&rclone_binary_path,
 		&rclone_config_path,
 		&mount_point,
+		&rc_port,
 		read_only,
 		None,
 	)
@@ -44,6 +53,7 @@ pub async fn mount_network_drive(
 	Ok(MountedNetworkDrive {
 		mount_point: mount_point.to_string(),
 		process,
+		api_client: RcloneApiClient::new(rc_port),
 	})
 }
 
@@ -91,7 +101,7 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 	};
 	let rclone_binary_download_url = match (platform_str, arch_str) {
 		(Some(platform), Some(arch)) => format!(
-			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.12/rclone-v1.70.0-filen.12-{}-{}{}",
+			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.13/rclone-v1.70.0-filen.13-{}-{}{}",
 			platform,
 			arch,
 			if platform == "windows" { ".exe" } else { "" }
@@ -142,6 +152,8 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 				.await
 				.context("Failed to set Rclone binary permissions")?;
 		}
+
+		// todo: verify downloaded file checksum
 	}
 
 	debug!("Using Rclone binary at {}", rclone_binary_path.display());
@@ -206,27 +218,24 @@ async fn start_rclone_mount_process(
 	rclone_binary_path: &Path,
 	rclone_config_path: &Path,
 	mount_point: &str,
+	rc_port: &u16,
 	read_only: bool,
 	log_file_path: Option<&Path>,
 ) -> Result<Child> {
 	// calculate cache size from available disk space
 	let available_disk_space = get_available_disk_space(cache_path)?;
-	let os_disk_buffer = 5 * 1024 * 1024 * 1024; // 5 GiB
-	let available_cache_size = (available_disk_space as i64) - os_disk_buffer;
-	let cache_size = match available_cache_size {
-		s if s > 0 => available_cache_size / 1024 / 1024 / 1024, // in GiB
-		_ => 5,
+	let os_disk_buffer: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+	let cache_size = match available_disk_space.checked_sub(os_disk_buffer) {
+		Some(size) => size,
+		None => available_disk_space,
 	};
-
-	let rclone_port =
-		free_local_ipv4_port().ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
 
 	// stringify args
 	let cache_path = cache_path
 		.to_str()
 		.ok_or(anyhow::anyhow!("Failed to format cache path"))?;
 	let cache_size_formatted = format!("{}Gi", cache_size);
-	let rc_addr_formatted = format!("127.0.0.1:{}", rclone_port);
+	let rc_addr_formatted = format!("127.0.0.1:{}", rc_port);
 
 	// construct args
 	let mut args = vec![
@@ -344,6 +353,104 @@ fn get_available_disk_space(path: &Path) -> Result<u64> {
 				path.display()
 			)
 		})
+}
+
+#[derive(PartialEq)]
+pub enum NetworkDriveStatus {
+	/// The network drive is not accessible, e.g. during startup.
+	Unavailable,
+	/// The network drive is active and accessible.
+	Active,
+	/// The underlying rclone process has exited.
+	Exited { status_code: ExitStatus },
+}
+
+impl MountedNetworkDrive {
+	pub async fn is_active(&mut self) -> NetworkDriveStatus {
+		if let Ok(Some(status_code)) = self.process.try_wait() {
+			return NetworkDriveStatus::Exited { status_code };
+		}
+		if let Ok(exists) = fs::try_exists(self.mount_point.clone()).await
+			&& !exists
+		{
+			trace!("Mount point is inaccessible");
+			return NetworkDriveStatus::Unavailable;
+		}
+		if !self
+			.api_client
+			.vfs_list()
+			.await
+			.unwrap_or(VfsListResponse { vfses: vec![] })
+			.vfses
+			.contains(&String::from("filen:"))
+		{
+			trace!("Rclone VFS is not active");
+			return NetworkDriveStatus::Unavailable;
+		}
+		NetworkDriveStatus::Active
+	}
+
+	pub async fn wait_until_active(&mut self) -> Result<()> {
+		let mut i = 0;
+		loop {
+			match self.is_active().await {
+				NetworkDriveStatus::Active => return Ok(()),
+				NetworkDriveStatus::Exited { status_code } => {
+					return Err(anyhow::anyhow!(
+						"Rclone mount process has exited with status code: {}",
+						status_code
+					));
+				}
+				_ => {
+					if i >= 300 {
+						return Err(anyhow::anyhow!(
+							"Timed out waiting for network drive to become active"
+						));
+					}
+					i += 1;
+					tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+					// todo: better backoff strategy?
+				}
+			}
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkDriveStats {
+	pub uploads_in_progress: i32,
+	pub uploads_queued: i32,
+	pub errored_files: i32,
+	pub transfers: Vec<NetworkDriveTransfer>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkDriveTransfer {
+	pub name: String,
+	pub size: i64,
+	pub speed: i64,
+}
+
+impl MountedNetworkDrive {
+	pub async fn get_stats(&self) -> Result<NetworkDriveStats> {
+		let core_stats = self.api_client.core_stats().await?;
+		let vfs_stats = self.api_client.vfs_stats().await?;
+		Ok(NetworkDriveStats {
+			uploads_in_progress: vfs_stats.disk_cache.uploads_in_progress,
+			uploads_queued: vfs_stats.disk_cache.uploads_queued,
+			errored_files: vfs_stats.disk_cache.errored_files,
+			transfers: core_stats
+				.transferring
+				.unwrap_or_default()
+				.into_iter()
+				.map(|t| NetworkDriveTransfer {
+					name: t.name,
+					size: t.size,
+					speed: t.speed,
+				})
+				.collect(),
+		})
+	}
 }
 
 #[cfg(windows)]

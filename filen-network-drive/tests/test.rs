@@ -15,12 +15,18 @@ async fn start_rclone_mount() {
 	let config_dir = dirs::config_dir().unwrap().join(TEST_DIR);
 
 	// mount network drive (is killed on drop)
-	let network_drive = mount_network_drive(&client, &config_dir, None, false)
+	let mut network_drive = mount_network_drive(&client, &config_dir, None, false)
 		.await
 		.unwrap();
 	info!("Network drive mounted at: {}", network_drive.mount_point);
 
 	let created_dir_path = format!("{}/created_dir", TEST_DIR);
+
+	network_drive.wait_until_active().await.unwrap();
+
+	// get stats
+	let stats = network_drive.get_stats().await.unwrap();
+	debug!("Stats: {:?}", stats);
 
 	// create remote test root dir if it doesn't exist
 	if client.find_item_at_path(TEST_DIR).await.unwrap().is_none() {
@@ -68,4 +74,6 @@ async fn start_rclone_mount() {
 		}
 		_ => panic!("Created item is not a directory"),
 	}
+
+	// todo: upload file, check stats
 }

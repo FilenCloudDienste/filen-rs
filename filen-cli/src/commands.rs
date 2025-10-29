@@ -228,7 +228,11 @@ pub(crate) async fn execute_command(
 			)
 			.await
 			.context("Failed to mount network drive")?;
-			ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)"); // todo: change message, it might not be successful yet
+			network_drive
+				.wait_until_active()
+				.await
+				.context("Failed to mount network drive")?;
+			ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)");
 			let code = network_drive
 				.process
 				.wait()
