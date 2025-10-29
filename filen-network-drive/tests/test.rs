@@ -22,11 +22,13 @@ async fn start_rclone_mount() {
 
 	let created_dir_path = format!("{}/created_dir", TEST_DIR);
 
-	// create remote test root dir
-	client
-		.create_dir(client.root(), TEST_DIR.to_string())
-		.await
-		.unwrap();
+	// create remote test root dir if it doesn't exist
+	if client.find_item_at_path(TEST_DIR).await.unwrap().is_none() {
+		client
+			.create_dir(client.root(), TEST_DIR.to_string())
+			.await
+			.unwrap();
+	};
 
 	// check that dir doesn't exist before creation
 	if client
