@@ -5,11 +5,12 @@ use sha2::{Digest, Sha256};
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},
-	process::ExitStatus,
+	process::{ExitStatus, Stdio},
 };
 use sysinfo::Disks;
 use tokio::{
 	fs,
+	io::{AsyncBufReadExt, BufReader},
 	process::{Child, Command},
 };
 
@@ -360,14 +361,30 @@ async fn start_rclone_mount_process(
 		"Starting Rclone mount process with args: {}",
 		args.join(" ")
 	);
-	let process = Command::new(rclone_binary_path)
+	let mut process = Command::new(rclone_binary_path)
 		.args(args)
-		/* .stdout(Stdio::null())
-		.stderr(Stdio::null()) */
-		// todo: redirect stdout so it can be logged nicer or not at all
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
 		.kill_on_drop(true)
 		.spawn()
 		.context("Failed to start Rclone mount process")?;
+
+	// log stdout and stderr
+	let process_stdout = process.stdout.take().unwrap();
+	tokio::spawn(async move {
+		let mut reader = BufReader::new(process_stdout).lines();
+		while let Ok(Some(line)) = reader.next_line().await {
+			info!("[rclone stdout] {}", line);
+		}
+	});
+	let process_stderr = process.stderr.take().unwrap();
+	tokio::spawn(async move {
+		let mut reader = BufReader::new(process_stderr).lines();
+		while let Ok(Some(line)) = reader.next_line().await {
+			info!("[rclone stderr] {}", line);
+		}
+	});
+
 	Ok(process)
 }
 
