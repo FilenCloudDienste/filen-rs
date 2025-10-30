@@ -75,7 +75,19 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 					));
 				};
 				let drive_letter = drive_letter.get(1).unwrap().as_str().to_uppercase();
-				Cow::Owned(format!("{}:\\", drive_letter))
+				let drive_path = format!("{}:\\", drive_letter);
+				if get_available_drive_letters()
+					.await
+					.context("Failed to get available drive letters")?
+					.contains(&drive_path)
+				{
+					return Ok(Cow::Owned(drive_path));
+				} else {
+					return Err(anyhow::anyhow!(
+						"Drive letter {} is not available",
+						drive_letter
+					));
+				}
 			}
 		},
 		_ => {
@@ -86,6 +98,19 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 			Cow::Borrowed(mount_point)
 		}
 	})
+}
+
+/// Lists available drive letters, e.g. `C:\` (Windows)
+#[cfg(windows)]
+pub async fn get_available_drive_letters() -> Result<Vec<String>> {
+	let mut available_letters = Vec::new();
+	for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars() {
+		let drive_path = format!("{}:\\", letter);
+		if !fs::try_exists(&drive_path).await? {
+			available_letters.push(drive_path);
+		}
+	}
+	Ok(available_letters)
 }
 
 /// Returns the path to the rclone binary, downloading it if necessary

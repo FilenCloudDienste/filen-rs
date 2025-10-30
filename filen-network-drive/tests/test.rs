@@ -15,6 +15,18 @@ async fn start_rclone_mount() {
 	let client = test_utils::RESOURCES.client().await;
 	let config_dir = dirs::config_dir().unwrap().join(TEST_DIR);
 
+	#[cfg(windows)]
+	{
+		// try to mount on invalid drive letter
+		assert!(
+			mount_network_drive(&client, &config_dir, Some("C:\\"), false)
+				.await
+				.is_err(),
+			"Mounting on used drive letter should fail"
+		);
+		info!("Tested mounting on used drive letter fails as expected");
+	}
+
 	// mount network drive (is killed on drop)
 	let mut network_drive = mount_network_drive(&client, &config_dir, None, false)
 		.await
