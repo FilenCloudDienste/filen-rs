@@ -6,9 +6,9 @@ use thiserror::Error;
 
 macro_rules! impl_from {
 	($error_type:ty, $kind:expr) => {
-		impl From<$error_type> for Error {
+		impl From<$error_type> for FilenSDKError {
 			fn from(e: $error_type) -> Self {
-				Error {
+				FilenSDKError {
 					kind: $kind,
 					inner: Some(Box::new(e)),
 					context: None,
@@ -101,19 +101,25 @@ pub enum ErrorKind {
 #[derive(Debug)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen::prelude::wasm_bindgen(js_name = "FilenSDKError")
+	wasm_bindgen::prelude::wasm_bindgen
 )]
-pub struct Error {
+pub struct FilenSDKError {
 	kind: ErrorKind,
 	inner: Option<Box<dyn std::error::Error + Send + Sync>>,
 	context: Option<Cow<'static, str>>,
 }
 
+// The error type is called FilenSDKError internally, but we expose it as Error
+// this is because TS doesn't allow Error as a type name,
+// and this was causing issues with uniffi
+// https://github.com/jhugman/uniffi-bindgen-react-native/issues/321
+pub type Error = FilenSDKError;
+
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen::prelude::wasm_bindgen(js_class = "FilenSDKError")
+	wasm_bindgen::prelude::wasm_bindgen
 )]
-impl Error {
+impl FilenSDKError {
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(getter)
@@ -135,7 +141,7 @@ impl Error {
 	}
 }
 
-impl Error {
+impl FilenSDKError {
 	/// Adds context to the error, which can be used to provide more information about the error
 	pub fn with_context(mut self, context: impl Into<Cow<'static, str>>) -> Self {
 		match self.context {
