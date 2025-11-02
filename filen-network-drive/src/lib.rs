@@ -112,6 +112,10 @@ pub async fn get_available_drive_letters() -> Result<Vec<String>> {
 	}
 	Ok(available_letters)
 }
+#[cfg(not(windows))]
+pub async fn get_available_drive_letters() -> Result<Vec<String>> {
+	panic!("get_available_drive_letters is only supported on Windows");
+}
 
 /// Returns the path to the rclone binary, downloading it if necessary
 async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
