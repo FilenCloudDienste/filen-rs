@@ -1,6 +1,5 @@
 use hex_literal::hex;
 use port_check::free_local_ipv4_port;
-use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::{
 	borrow::Cow,
@@ -61,11 +60,12 @@ pub async fn mount_network_drive(
 }
 
 async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> {
-	Ok(match std::env::consts::FAMILY {
-		"windows" => match mount_point {
-			None => Cow::Borrowed("X:\\"),
+	#[cfg(windows)]
+	{
+		match mount_point {
+			None => Ok(Cow::Borrowed("X:\\")),
 			Some(mount_point) => {
-				let drive_letter = Regex::new(r"^([A-Z])\:?\\?$")
+				let drive_letter = regex::Regex::new(r"^([A-Z])\:?\\?$")
 					.unwrap()
 					.captures(mount_point);
 				let Some(drive_letter) = drive_letter else {
@@ -81,23 +81,24 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 					.context("Failed to get available drive letters")?
 					.contains(&drive_path)
 				{
-					return Ok(Cow::Owned(drive_path));
+					Ok(Cow::Owned(drive_path))
 				} else {
-					return Err(anyhow::anyhow!(
+					Err(anyhow::anyhow!(
 						"Drive letter {} is not available",
 						drive_letter
-					));
+					))
 				}
 			}
-		},
-		_ => {
-			let mount_point = mount_point.unwrap_or("/tmp/filen");
-			fs::create_dir_all(mount_point)
-				.await
-				.context("Failed to create mount point directory")?;
-			Cow::Borrowed(mount_point)
 		}
-	})
+	}
+	#[cfg(not(windows))]
+	{
+		let mount_point = mount_point.unwrap_or("/tmp/filen");
+		fs::create_dir_all(mount_point)
+			.await
+			.context("Failed to create mount point directory")?;
+		Ok(Cow::Borrowed(mount_point))
+	}
 }
 
 /// Lists available drive letters, e.g. `C:\` (Windows)
@@ -111,10 +112,6 @@ pub async fn get_available_drive_letters() -> Result<Vec<String>> {
 		}
 	}
 	Ok(available_letters)
-}
-#[cfg(not(windows))]
-pub async fn get_available_drive_letters() -> Result<Vec<String>> {
-	panic!("get_available_drive_letters is only supported on Windows");
 }
 
 /// Returns the path to the rclone binary, downloading it if necessary
