@@ -1,6 +1,7 @@
 use std::{
 	fs::FileTimes,
 	io::{self},
+	os::unix::fs::MetadataExt,
 	path::{Path, PathBuf},
 	str::FromStr,
 	sync::Arc,
@@ -8,7 +9,10 @@ use std::{
 };
 
 use crate::{
-	auth::{AuthCacheState, AuthStatus, CacheState, DB_FILE_NAME, FilenMobileCacheState},
+	auth::{
+		AUTH_CLEANUP_INTERVAL, AuthCacheState, AuthStatus, CacheState, DB_FILE_NAME,
+		FilenMobileCacheState, update_saved_db_state_cache_cleanup_time,
+	},
 	sql,
 	traits::ProgressCallback,
 };
@@ -459,17 +463,220 @@ async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
 	while (futures.next().await).is_some() {}
 }
 
-impl CacheState {
+async fn process_subdir(
+	subdir_entry: tokio::fs::DirEntry,
+) -> std::io::Result<Option<(PathBuf, i64, u64)>> {
+	// we match on file_type because it's generally free
+	let file_type = match subdir_entry.file_type().await {
+		Ok(ft) => ft,
+		Err(e) => return Err(e),
+	};
+	let path = subdir_entry.path();
+	// if the subfolder is a file or symlink, remove it and return an error
+	if file_type.is_file() || file_type.is_symlink() {
+		tokio::fs::remove_file(&path).await?;
+		return Err(io::Error::new(
+			io::ErrorKind::NotADirectory,
+			format!("Expected directory but found file: {}", path.display()),
+		));
+	}
+
+	// then we read the contents of the subfolder
+	let mut contents = tokio::fs::read_dir(&path).await?;
+	let Some(file_entry) = contents.next_entry().await? else {
+		tokio::fs::remove_dir_all(path).await?;
+		return Ok(None);
+	};
+	// we match on file_type first because it's generally free
+	let file_type = file_entry.file_type().await?;
+	if file_type.is_file() {
+		// make sure there is only one file
+		if contents.next_entry().await?.is_some() {
+			log::warn!(
+				"Multiple files found in cache subdirectory {}, removing all",
+				path.display()
+			);
+			tokio::fs::remove_dir_all(path).await?;
+			Ok(None)
+		} else {
+			let meta = file_entry.metadata().await?;
+			Ok(Some((
+				path,
+				//
+				meta.atime(),
+				FilenMetaExt::size(&meta),
+			)))
+		}
+	} else {
+		// if it's not a file, we remove the directory
+		tokio::fs::remove_dir_all(path).await?;
+		Ok(None)
+	}
+}
+
+async fn count_cache_files(dir: &Path) -> std::io::Result<Vec<(PathBuf, i64, u64)>> {
+	let stream = tokio_stream::wrappers::ReadDirStream::new(tokio::fs::read_dir(dir).await?);
+
+	let results = stream
+		.map(|entry| async move { process_subdir(entry?).await })
+		.buffer_unordered(128)
+		// don't care about Ok(None), means we fixed the issue by removing invalid files
+		// we also don't care about NotFound errors, they mean the file was already removed
+		.filter_map(|res: Result<Option<_>, std::io::Error>| async {
+			if let Err(e) = &res
+				&& e.kind() == io::ErrorKind::NotFound
+			{
+				None
+			} else {
+				res.transpose()
+			}
+		})
+		.collect::<Vec<_>>()
+		.await;
+
+	// we first want to make sure we try to cleanup as many files as possible
+	// and only then return an error if there was one
+	results.into_iter().collect()
+}
+
+async fn count_thumbnail_files(thumbnail_dir: &Path) -> std::io::Result<Vec<(PathBuf, i64, u64)>> {
+	let stream =
+		tokio_stream::wrappers::ReadDirStream::new(tokio::fs::read_dir(thumbnail_dir).await?);
+
+	let results = stream
+		.map(|entry| async move {
+			let entry = entry?;
+			let path = entry.path();
+			let file_type = entry.file_type().await?;
+
+			if file_type.is_file() {
+				let meta = entry.metadata().await?;
+				let modified = meta.atime();
+				let size = FilenMetaExt::size(&meta);
+				Ok(Some((path, modified, size)))
+			} else if file_type.is_dir() {
+				// if it's not a file, we remove the directory
+				tokio::fs::remove_dir_all(path).await?;
+				Ok(None)
+			} else {
+				tokio::fs::remove_file(path).await?;
+				Ok(None)
+			}
+		})
+		.buffer_unordered(128)
+		// don't care about Ok(None), means we fixed the issue by removing invalid files
+		// we also don't care about NotFound errors, they mean the file was already removed
+		.filter_map(|res: Result<Option<_>, std::io::Error>| async {
+			if let Err(e) = &res
+				&& e.kind() == io::ErrorKind::NotFound
+			{
+				None
+			} else {
+				res.transpose()
+			}
+		})
+		.collect::<Vec<_>>()
+		.await;
+	// we first want to make sure we try to cleanup as many files as possible
+	// and only then return an error if there was one
+	results.into_iter().collect()
+}
+
+const MIN_CACHED_FILES: usize = 5;
+
+async fn remove_old_files<F>(dir: &Path, size_budget: u64, func: F) -> std::io::Result<u64>
+where
+	F: AsyncFnOnce(&Path) -> std::io::Result<Vec<(PathBuf, i64, u64)>>,
+{
+	let mut current_files = func(dir).await?;
+
+	current_files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+
+	let mut total_size: u64 = current_files.iter().map(|(_, _, size)| *size).sum();
+
+	let mut file_count = current_files.len();
+
+	for (path, _, size) in current_files {
+		if total_size < size_budget || file_count < MIN_CACHED_FILES {
+			break;
+		}
+		// remove dir all because we store files in per-file directories
+		tokio::fs::remove_dir_all(&path).await?;
+		total_size = total_size.saturating_sub(size);
+		file_count -= 1;
+	}
+
+	Ok(total_size)
+}
+
+async fn remove_old_cache_files(cache_dir: &Path, size_budget: u64) {
+	if let Err(e) = remove_old_files(cache_dir, size_budget, count_cache_files).await {
+		error!(
+			"Failed to remove old cache files in {}: {}",
+			cache_dir.display(),
+			e
+		);
+	}
+}
+
+async fn remove_old_thumbnails(thumbnail_dir: &Path, size_budget: u64) {
+	if let Err(e) = remove_old_files(thumbnail_dir, size_budget, count_thumbnail_files).await {
+		error!(
+			"Failed to remove old thumbnail files in {}: {}",
+			thumbnail_dir.display(),
+			e
+		);
+	}
+}
+
+impl AuthCacheState {
+	pub(crate) async fn should_cleanup(&self) -> bool {
+		self.last_cleanup
+			.read()
+			.await
+			.is_none_or(|t| t + AUTH_CLEANUP_INTERVAL <= chrono::Utc::now())
+	}
+
 	pub(crate) async fn cleanup_cache(&self) {
+		if !self.should_cleanup().await {
+			return;
+		}
+
+		let res = self.last_cleanup_sem.try_acquire();
+		let _perm = match res {
+			Ok(perm) => perm,
+			Err(_) => {
+				// another cleanup is already running
+				return;
+			}
+		};
+
+		futures::join!(
+			cleanup_uuid_dir(self, &self.cache_dir),
+			cleanup_uuid_dir(self, &self.tmp_dir),
+			remove_old_cache_files(&self.cache_dir, self.cache_file_budget,),
+			remove_old_thumbnails(&self.thumbnail_dir, self.thumbnail_file_budget,),
+			cleanup_uuid_dir(self, &self.thumbnail_dir)
+		);
+
+		let mut lock = self.last_cleanup.write().await;
+		let now = chrono::Utc::now();
+		*lock = Some(now);
+		if let Err(e) =
+			update_saved_db_state_cache_cleanup_time(self.cache_state_file.as_ref(), now).await
+		{
+			log::error!("Failed to update cache cleanup time in saved db state: {e}");
+		}
+	}
+}
+
+impl CacheState {
+	pub(crate) async fn cleanup_cache_if_necessary(&self) {
 		debug!("Cleaning up cache at {}", self.files_dir.display());
 		match self.status {
 			AuthStatus::Authenticated(ref auth_state) => {
 				debug!("Authenticated, cleaning up old files in cache directories");
-				futures::join!(
-					cleanup_uuid_dir(auth_state, &auth_state.cache_dir),
-					cleanup_uuid_dir(auth_state, &auth_state.tmp_dir),
-					cleanup_uuid_dir(auth_state, &auth_state.thumbnail_dir)
-				);
+				auth_state.cleanup_cache().await;
 			}
 			_ => {
 				debug!("Not authenticated, removing all cache directories and database file");
@@ -510,14 +717,14 @@ impl FilenMobileCacheState {
 		trace!("Launching cleanup task asynchronously");
 		let cache = self.async_get_cache_state_owned().await;
 		crate::env::get_runtime().spawn(async move {
-			cache.cleanup_cache().await;
+			cache.cleanup_cache_if_necessary().await;
 		});
 	}
 	pub(crate) fn sync_launch_cleanup_task(&self) {
 		trace!("Launching cleanup task synchronously");
 		let cache = self.sync_get_cache_state_owned();
 		crate::env::get_runtime().spawn(async move {
-			cache.cleanup_cache().await;
+			cache.cleanup_cache_if_necessary().await;
 		});
 	}
 }

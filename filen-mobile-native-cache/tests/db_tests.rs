@@ -4184,6 +4184,8 @@ pub async fn test_init_from_file() {
 	let json_config = serde_json::to_string(&AuthFile {
 		sdk_config: Some(config),
 		provider_enabled: true,
+		max_thumbnail_files_budget: Some(1024 * 1024 * 6),
+		max_cache_files_budget: Some(1024 * 1024 * 10),
 	})
 	.unwrap();
 

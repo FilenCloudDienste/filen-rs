@@ -7,17 +7,26 @@ use std::{
 	time::Instant,
 };
 
+use chrono::{DateTime, Utc};
 use filen_sdk_rs::{auth::StringifiedClient, fs::HasUUID};
 use filen_types::{auth::FilenSDKConfig, crypto::Sha256Hash};
 use log::{debug, info, trace};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tokio::sync::OwnedRwLockReadGuard;
+use tokio::{
+	io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+	sync::OwnedRwLockReadGuard,
+};
 
 use crate::{CacheError, sql};
 
 const UNAUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const AUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub(crate) const AUTH_CLEANUP_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::minutes(10); // 10 minutes
+
+const DEFAULT_MAX_THUMBNAIL_FILES_BUDGET: u64 = 256 * 1024 * 1024; // 256 MiB
+const DEFAULT_MAX_CACHE_FILES_BUDGET: u64 = 768 * 1024 * 1024; // 768 MiB
 
 pub const DB_FILE_NAME: &str = "native_cache.db";
 
@@ -26,12 +35,17 @@ const CACHE_VERSION: u64 = 1;
 
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,
+	pub(crate) cache_state_file: PathBuf,
 	pub(crate) tmp_dir: PathBuf,
 	pub(crate) cache_dir: PathBuf,
 	pub(crate) thumbnail_dir: PathBuf,
 	pub(crate) client: filen_sdk_rs::auth::Client,
 	pub(crate) last_recents_update: RwLock<Option<Instant>>,
 	pub(crate) last_trash_update: RwLock<Option<Instant>>,
+	pub(crate) thumbnail_file_budget: u64,
+	pub(crate) cache_file_budget: u64,
+	pub(crate) last_cleanup: tokio::sync::RwLock<Option<DateTime<Utc>>>,
+	pub(crate) last_cleanup_sem: tokio::sync::Semaphore,
 }
 
 enum UnauthReason {
@@ -73,9 +87,46 @@ pub(crate) struct SavedDBState {
 	pub(crate) db_hash: Sha256Hash,
 	#[serde(default)]
 	pub(crate) version: Option<u64>,
+	#[serde(default)]
+	pub(crate) last_cache_cleanup: Option<DateTime<Utc>>,
 }
 
-fn init_db(db_path: &Path, state_file_path: &Path) -> Result<Connection, CacheError> {
+impl Default for SavedDBState {
+	fn default() -> Self {
+		SavedDBState {
+			db_hash: *sql::statements::DB_INIT_HASH,
+			version: Some(CACHE_VERSION),
+			last_cache_cleanup: None,
+		}
+	}
+}
+
+pub(crate) async fn update_saved_db_state_cache_cleanup_time(
+	state_file_path: &Path,
+	timestamp: DateTime<Utc>,
+) -> Result<(), CacheError> {
+	let mut file = tokio::fs::OpenOptions::new()
+		.create(true)
+		.truncate(false)
+		.read(true)
+		.write(true)
+		.open(state_file_path)
+		.await?;
+	let mut contents = String::new();
+	file.read_to_string(&mut contents).await?;
+	let mut saved_state = serde_json::from_str::<SavedDBState>(&contents).unwrap_or_default();
+	saved_state.last_cache_cleanup = Some(timestamp);
+	contents.clear();
+	// SAFETY: serde_json::to_writer always writes valid UTF-8
+	serde_json::to_writer(unsafe { contents.as_mut_vec() }, &saved_state)
+		.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
+	file.set_len(0).await?;
+	file.seek(std::io::SeekFrom::Start(0)).await?;
+	file.write_all(contents.as_bytes()).await?;
+	Ok(())
+}
+
+fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheError> {
 	match std::fs::remove_file(db_path) {
 		Ok(()) => {
 			log::info!("Removed old database file: {}", db_path.display());
@@ -93,22 +144,21 @@ fn init_db(db_path: &Path, state_file_path: &Path) -> Result<Connection, CacheEr
 	}
 	let db = Connection::open(db_path)?;
 	db.execute_batch(sql::statements::INIT)?;
-	let contents = serde_json::to_string(&SavedDBState {
-		db_hash: *sql::statements::DB_INIT_HASH,
-		version: Some(CACHE_VERSION),
-	})
-	.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
-	std::fs::write(state_file_path, contents)?;
+	let contents = serde_json::to_string(&SavedDBState::default())
+		.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
+	std::fs::write(cache_state_file, contents)?;
 	Ok(db)
 }
 
-fn db_from_files_dir(files_dir: &Path) -> Result<(Connection, Option<SavedDBState>), CacheError> {
+fn db_from_files_dir(
+	files_dir: &Path,
+	cache_state_file: &Path,
+) -> Result<(Connection, Option<SavedDBState>), CacheError> {
 	let db_path = files_dir.join(DB_FILE_NAME);
-	let state_file_path = files_dir.join("db_state.json");
-	let state_file = match std::fs::read_to_string(&state_file_path) {
+	let state_file = match std::fs::read_to_string(cache_state_file) {
 		Ok(contents) => contents,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-			return Ok((init_db(&db_path, &state_file_path)?, None));
+			return Ok((init_db(&db_path, cache_state_file)?, None));
 		}
 		Err(e) => {
 			log::error!("Failed to read db_state.json, error: {e}");
@@ -116,21 +166,41 @@ fn db_from_files_dir(files_dir: &Path) -> Result<(Connection, Option<SavedDBStat
 		}
 	};
 
-	let saved_state: SavedDBState = serde_json::from_str(&state_file)
-		.map_err(|e| CacheError::conversion(format!("Failed to parse db_state.json: {e}")))?;
+	let parsed_saved_state = match serde_json::from_str::<SavedDBState>(&state_file) {
+		Ok(state) => Some(state),
+		Err(e) => {
+			log::error!("Failed to parse db_state.json, error: {e}");
+			None
+		}
+	};
+
+	let Some(saved_state) = parsed_saved_state else {
+		log::info!(
+			"Failed to parse saved DB state, reinitializing database: {}",
+			db_path.display()
+		);
+		return Ok((init_db(&db_path, cache_state_file)?, None));
+	};
+
 	if saved_state.db_hash != *sql::statements::DB_INIT_HASH {
 		log::info!(
 			"Database hash mismatch, reinitializing database. Expected: {:?}, Found: {:?}",
 			*sql::statements::DB_INIT_HASH,
 			saved_state.db_hash
 		);
-		Ok((init_db(&db_path, &state_file_path)?, Some(saved_state)))
+		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
 	} else if !db_path.exists() {
 		log::info!(
 			"Database file does not exist, creating new one: {}",
 			db_path.display()
 		);
-		Ok((init_db(&db_path, &state_file_path)?, Some(saved_state)))
+		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
+	} else if saved_state.version.is_none_or(|v| v < CACHE_VERSION) {
+		log::info!(
+			"Database version is outdated or missing, reinitializing database: {}",
+			db_path.display()
+		);
+		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
 	} else {
 		log::info!(
 			"Database hash matches, using existing database: {}",
@@ -140,11 +210,15 @@ fn db_from_files_dir(files_dir: &Path) -> Result<(Connection, Option<SavedDBStat
 	}
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthFile {
 	pub provider_enabled: bool,
 	pub sdk_config: Option<FilenSDKConfig>,
+	#[serde(default)]
+	pub max_thumbnail_files_budget: Option<u64>,
+	#[serde(default)]
+	pub max_cache_files_budget: Option<u64>,
 }
 
 fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
@@ -155,26 +229,17 @@ fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
 				Ok(auth_file) => auth_file,
 				Err(e) => {
 					log::error!("Failed to parse auth file, error: {e}");
-					AuthFile {
-						provider_enabled: false,
-						sdk_config: None,
-					}
+					AuthFile::default()
 				}
 			}
 		}
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 			info!("Auth file not found");
-			AuthFile {
-				provider_enabled: false,
-				sdk_config: None,
-			}
+			AuthFile::default()
 		}
 		Err(e) => {
 			log::error!("Failed to read auth file, error: {e}");
-			AuthFile {
-				provider_enabled: false,
-				sdk_config: None,
-			}
+			AuthFile::default()
 		}
 	}
 }
@@ -191,7 +256,16 @@ fn update_state(state: &mut CacheState, auth_file: AuthFile) {
 	if auth_file.provider_enabled {
 		match auth_file.sdk_config {
 			Some(config) => {
-				match AuthCacheState::from_sdk_config(config, &state.files_dir) {
+				match AuthCacheState::from_sdk_config(
+					config,
+					&state.files_dir,
+					auth_file
+						.max_thumbnail_files_budget
+						.unwrap_or(DEFAULT_MAX_THUMBNAIL_FILES_BUDGET),
+					auth_file
+						.max_cache_files_budget
+						.unwrap_or(DEFAULT_MAX_CACHE_FILES_BUDGET),
+				) {
 					Ok(auth_state) => {
 						info!("Authenticated with Filen SDK");
 						state.status = AuthStatus::Authenticated(auth_state);
@@ -408,12 +482,19 @@ impl FilenMobileCacheState {
 }
 
 impl AuthCacheState {
-	fn from_sdk_config(config: FilenSDKConfig, files_dir: &Path) -> Result<Self, CacheError> {
+	fn from_sdk_config(
+		config: FilenSDKConfig,
+		files_dir: &Path,
+		max_thumbnail_files_budget: u64,
+		max_cache_files_budget: u64,
+	) -> Result<Self, CacheError> {
 		let client = filen_sdk_rs::auth::Client::from_stringified(config.into())?;
 
-		let (db, state) = db_from_files_dir(files_dir)?;
+		let cache_state_file = files_dir.join("db_state.json");
 
-		if state.is_none_or(|state| state.version.is_none()) {
+		let (db, state) = db_from_files_dir(files_dir, &cache_state_file)?;
+
+		if state.as_ref().is_none_or(|state| state.version.is_none()) {
 			log::info!(
 				"Database version is missing, removing cache directory to ensure compatibility"
 			);
@@ -430,12 +511,19 @@ impl AuthCacheState {
 
 		let new = Self {
 			conn: Mutex::new(db),
+			cache_state_file,
 			tmp_dir,
 			cache_dir,
 			thumbnail_dir,
 			client,
 			last_recents_update: RwLock::new(None),
 			last_trash_update: RwLock::new(None),
+			thumbnail_file_budget: max_thumbnail_files_budget,
+			cache_file_budget: max_cache_files_budget,
+			last_cleanup: tokio::sync::RwLock::new(
+				state.as_ref().and_then(|s| s.last_cache_cleanup),
+			),
+			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 		};
 		new.add_root(new.client.root().uuid().as_ref())?;
 		Ok(new)
@@ -451,6 +539,8 @@ impl AuthCacheState {
 		);
 		let client = filen_sdk_rs::auth::Client::from_stringified(client)?;
 
+		let cache_state_file = std::convert::AsRef::<Path>::as_ref(files_dir).join("db_state.json");
+
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir.as_ref())?;
 		let db = Connection::open_in_memory()?;
 		db.execute_batch(sql::statements::INIT)?;
@@ -458,11 +548,16 @@ impl AuthCacheState {
 		let new = Self {
 			client,
 			conn: Mutex::new(db),
+			cache_state_file,
 			cache_dir,
 			tmp_dir,
 			thumbnail_dir,
 			last_recents_update: RwLock::new(None),
 			last_trash_update: RwLock::new(None),
+			thumbnail_file_budget: DEFAULT_MAX_THUMBNAIL_FILES_BUDGET,
+			cache_file_budget: DEFAULT_MAX_CACHE_FILES_BUDGET,
+			last_cleanup: tokio::sync::RwLock::new(None),
+			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 		};
 		new.add_root(new.client.root().uuid().as_ref())?;
 		Ok(new)
@@ -519,7 +614,13 @@ impl FilenMobileCacheState {
 					// SAFETY: We just checked that the status is Authenticated, so this is safe
 					AuthStatus::Unauthenticated(_) => unsafe { unreachable_unchecked() },
 				});
-				f(new_guard).await
+				// we check for cleanup separately so we don't spawn an unnecessary task and try to reacquire the lock for no reason
+				let should_cleanup = new_guard.should_cleanup().await;
+				let res = f(new_guard).await;
+				if should_cleanup {
+					self.async_launch_cleanup_task().await;
+				}
+				res
 			}
 			AuthStatus::Unauthenticated(unauth_state) => {
 				self.async_launch_cleanup_task().await;
