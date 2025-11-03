@@ -9,13 +9,12 @@ use std::{
 
 use crate::{
 	auth::{AuthCacheState, AuthStatus, CacheState, DB_FILE_NAME, FilenMobileCacheState},
-	ffi::ItemType,
 	sql,
 	traits::ProgressCallback,
 };
 use filen_sdk_rs::{
 	fs::{
-		HasUUID,
+		HasName, HasUUID,
 		file::{BaseFile, FileBuilder, RemoteFile, traits::HasFileInfo},
 	},
 	io::FilenMetaExt,
@@ -58,7 +57,7 @@ const THUMBNAIL_DIR: &str = "thumbnails";
 const BUFFER_SIZE: u64 = 64 * 1024; // 64 KiB
 const CALLBACK_INTERVAL: Duration = Duration::from_millis(200);
 
-fn get_paths(files_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
+pub(crate) fn get_paths(files_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
 	let cache_dir = files_path.join(CACHE_DIR);
 	let tmp_dir = files_path.join(TMP_DIR);
 	let thumbnail_dir = files_path.join(THUMBNAIL_DIR);
@@ -114,14 +113,48 @@ async fn update_task(
 }
 
 impl AuthCacheState {
+	// we use the uuid as the folder and the actual name of the file because otherwise we run into a bug in IOS
+	// where files get shared as a full UUID
+
+	pub(crate) fn get_cached_file_path_from_name(&self, uuid: &str, name: Option<&str>) -> PathBuf {
+		self.cache_dir
+			.join(format!("{}/{}", uuid, name.unwrap_or(uuid)))
+	}
+
+	pub(crate) fn get_cached_file_path(&self, file: &RemoteFile) -> PathBuf {
+		self.get_cached_file_path_from_name(file.uuid().as_ref(), file.name())
+	}
+
+	pub(crate) async fn try_get_local_file_with_uuid(
+		&self,
+		uuid: &UuidStr,
+	) -> Result<Option<PathBuf>, io::Error> {
+		let dir_path = self.cache_dir.join(uuid.as_ref());
+		match tokio::fs::read_dir(&dir_path).await {
+			Ok(mut entries) => {
+				if let Ok(Some(entry)) = entries.next_entry().await {
+					if let Ok(Some(_)) = entries.next_entry().await {
+						return Err(io::Error::other(format!(
+							"Multiple files found for UUID {} in cache",
+							uuid.as_ref()
+						)));
+					}
+					return Ok(Some(entry.path()));
+				}
+				Ok(None)
+			}
+			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+			Err(e) => Err(e),
+		}
+	}
+
 	pub async fn download_file_io(
 		&self,
 		file: &RemoteFile,
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<PathBuf, io::Error> {
 		let reader = self.client.get_file_reader(file).compat();
-		let uuid = file.uuid().to_string();
-		let src = self.tmp_dir.join(&uuid);
+		let src = self.tmp_dir.join(file.uuid().as_ref());
 		tokio::io::BufReader::with_capacity(BUFFER_SIZE.min(file.size) as usize, reader);
 		let mut os_file = tokio::fs::File::create(&src).await?.compat_write();
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
@@ -151,13 +184,22 @@ impl AuthCacheState {
 		})
 		.await??;
 
-		let dst = self.cache_dir.join(&uuid);
+		let dst = self.get_cached_file_path(file);
+		let parent = dst
+			.parent()
+			.expect("cached file path parent should always exist");
+		tokio::fs::create_dir_all(parent).await?;
 		tokio::fs::rename(&src, &dst).await?;
 		Ok(dst)
 	}
 
-	pub async fn hash_local_file(&self, uuid: &str) -> Result<Option<Sha512Hash>, io::Error> {
-		let path = self.cache_dir.join(uuid);
+	pub async fn hash_local_file(
+		&self,
+		file_uuid: &UuidStr,
+	) -> Result<Option<Sha512Hash>, io::Error> {
+		let Some(path) = self.try_get_local_file_with_uuid(file_uuid).await? else {
+			return Ok(None);
+		};
 		let mut os_file = match tokio::fs::File::open(path).await {
 			Ok(file) => file,
 			Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -260,13 +302,27 @@ impl AuthCacheState {
 		mime: String,
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<RemoteFile, io::Error> {
-		let old_path = self.cache_dir.join(old_uuid);
+		let old_path = self.get_cached_file_path_from_name(old_uuid, Some(name));
 		let old_file = tokio::fs::File::open(&old_path).await?;
 		let file_builder = self.client.make_file_builder(name, &parent_uuid).mime(mime);
 		let (file, _) = self
 			.inner_upload_file(file_builder, old_file, callback)
 			.await?;
-		tokio::fs::rename(old_path, self.cache_dir.join(file.uuid().to_string())).await?;
+		let new_path = self.get_cached_file_path(&file);
+		let parent = new_path
+			.parent()
+			.expect("cached file path parent should always exist");
+		tokio::fs::create_dir_all(parent).await?;
+		tokio::fs::rename(&old_path, new_path).await?;
+		if let Some(parent) = old_path.parent()
+			&& let Err(e) = tokio::fs::remove_dir(parent).await
+		{
+			log::warn!(
+				"Failed to remove old parent directory {}: {}",
+				parent.display(),
+				e
+			)
+		};
 		Ok(file)
 	}
 
@@ -280,8 +336,12 @@ impl AuthCacheState {
 		if let Some(mime) = mime {
 			file_builder = file_builder.mime(mime);
 		}
-		let uuid_str = file_builder.get_uuid().to_string();
-		let target_path = self.cache_dir.join(uuid_str);
+		let target_path =
+			self.get_cached_file_path_from_name(file_builder.get_uuid().as_ref(), Some(name));
+		let parent_path = target_path
+			.parent()
+			.expect("cached file path should always have a parent");
+		tokio::fs::create_dir_all(parent_path).await?;
 		let os_file = tokio::fs::OpenOptions::new()
 			.read(true)
 			.append(true) // only for create
@@ -292,20 +352,28 @@ impl AuthCacheState {
 		Ok((file, target_path))
 	}
 
-	pub(crate) async fn io_delete_local(
-		&self,
-		uuid: UuidStr,
-		item_type: ItemType,
-	) -> Result<(), io::Error> {
+	pub(crate) async fn io_delete_local(&self, uuid: &UuidStr) -> Result<(), io::Error> {
 		let path = self.cache_dir.join(uuid.as_ref());
-		if path.try_exists()? {
-			match item_type {
-				ItemType::File => tokio::fs::remove_file(&path).await,
-				ItemType::Dir | ItemType::Root => tokio::fs::remove_dir(&path).await,
+		if let Err(e) = match tokio::fs::metadata(&path).await {
+			Ok(meta) => {
+				if meta.is_dir() {
+					tokio::fs::remove_dir_all(&path).await
+				} else if meta.is_file() || meta.is_symlink() {
+					tokio::fs::remove_file(&path).await
+				} else {
+					log::warn!(
+						"Path {} is neither file nor directory, cannot delete",
+						path.display()
+					);
+					Ok(())
+				}
 			}
-		} else {
-			Ok(())
+			Err(e) => Err(e),
+		} && e.kind() != io::ErrorKind::NotFound
+		{
+			return Err(e);
 		}
+		Ok(())
 	}
 }
 

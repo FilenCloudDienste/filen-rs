@@ -21,6 +21,9 @@ const AUTH_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 
 pub const DB_FILE_NAME: &str = "native_cache.db";
 
+// 1 - initial version, changed how files as stored in cache from flat to per-file directories
+const CACHE_VERSION: u64 = 1;
+
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,
 	pub(crate) tmp_dir: PathBuf,
@@ -68,6 +71,8 @@ pub struct FilenMobileCacheState {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SavedDBState {
 	pub(crate) db_hash: Sha256Hash,
+	#[serde(default)]
+	pub(crate) version: Option<u64>,
 }
 
 fn init_db(db_path: &Path, state_file_path: &Path) -> Result<Connection, CacheError> {
@@ -90,19 +95,20 @@ fn init_db(db_path: &Path, state_file_path: &Path) -> Result<Connection, CacheEr
 	db.execute_batch(sql::statements::INIT)?;
 	let contents = serde_json::to_string(&SavedDBState {
 		db_hash: *sql::statements::DB_INIT_HASH,
+		version: Some(CACHE_VERSION),
 	})
 	.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
 	std::fs::write(state_file_path, contents)?;
 	Ok(db)
 }
 
-fn db_from_files_dir(files_dir: &Path) -> Result<Connection, CacheError> {
+fn db_from_files_dir(files_dir: &Path) -> Result<(Connection, Option<SavedDBState>), CacheError> {
 	let db_path = files_dir.join(DB_FILE_NAME);
 	let state_file_path = files_dir.join("db_state.json");
 	let state_file = match std::fs::read_to_string(&state_file_path) {
 		Ok(contents) => contents,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-			return init_db(&db_path, &state_file_path);
+			return Ok((init_db(&db_path, &state_file_path)?, None));
 		}
 		Err(e) => {
 			log::error!("Failed to read db_state.json, error: {e}");
@@ -118,19 +124,19 @@ fn db_from_files_dir(files_dir: &Path) -> Result<Connection, CacheError> {
 			*sql::statements::DB_INIT_HASH,
 			saved_state.db_hash
 		);
-		init_db(&db_path, &state_file_path)
+		Ok((init_db(&db_path, &state_file_path)?, Some(saved_state)))
 	} else if !db_path.exists() {
 		log::info!(
 			"Database file does not exist, creating new one: {}",
 			db_path.display()
 		);
-		init_db(&db_path, &state_file_path)
+		Ok((init_db(&db_path, &state_file_path)?, Some(saved_state)))
 	} else {
 		log::info!(
 			"Database hash matches, using existing database: {}",
 			db_path.display()
 		);
-		Connection::open(db_path).map_err(Into::into)
+		Ok((Connection::open(db_path)?, Some(saved_state)))
 	}
 }
 
@@ -405,7 +411,20 @@ impl AuthCacheState {
 	fn from_sdk_config(config: FilenSDKConfig, files_dir: &Path) -> Result<Self, CacheError> {
 		let client = filen_sdk_rs::auth::Client::from_stringified(config.into())?;
 
-		let db = db_from_files_dir(files_dir)?;
+		let (db, state) = db_from_files_dir(files_dir)?;
+
+		if state.is_none_or(|state| state.version.is_none()) {
+			log::info!(
+				"Database version is missing, removing cache directory to ensure compatibility"
+			);
+			let (cache_dir, _, _) = crate::io::get_paths(files_dir);
+			if let Err(e) = std::fs::remove_dir_all(cache_dir)
+				&& e.kind() != std::io::ErrorKind::NotFound
+			{
+				log::error!("Failed to remove cache directory during DB version upgrade: {e}");
+				return Err(e.into());
+			}
+		}
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir)?;
 

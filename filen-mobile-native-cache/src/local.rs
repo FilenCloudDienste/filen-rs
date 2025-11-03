@@ -13,7 +13,7 @@ use crate::{
 		QueryNonDirChildrenResponse, SearchQueryArgs, SearchQueryResponseEntry,
 	},
 	sql::{
-		self, DBDirExt, DBDirObject, DBDirTrait, DBItemTrait, DBRoot,
+		self, DBDirExt, DBDirObject, DBItemTrait, DBRoot,
 		error::OptionalExtensionSQL,
 		json_object::JsonObject,
 		object::{DBNonRootObject, DBObject},
@@ -179,10 +179,17 @@ impl AuthCacheState {
 			other => return Ok(other.map(Into::into)),
 		};
 		// stop error for ios complaining that folder doesn't exist
-		match std::fs::create_dir_all(self.cache_dir.join(dir_obj.uuid().as_ref())) {
-			Ok(_) => {}
-			Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-			Err(e) => {
+		#[cfg(target_os = "ios")]
+		{
+			use crate::sql::DBDirTrait;
+			let name = match &dir_obj {
+				DBDirObject::Dir(dbdir) => sql::dir::DBDirTrait::name(dbdir),
+				DBDirObject::Root(_) => Some("root"),
+			};
+			let path = self.get_cached_file_path_from_name(dir_obj.uuid().as_ref(), name);
+			if let Err(e) = std::fs::create_dir_all(path)
+				&& e.kind() != std::io::ErrorKind::AlreadyExists
+			{
 				return Err(CacheError::io(format!(
 					"Failed to create directory for {}: {e}",
 					dir_obj.uuid()

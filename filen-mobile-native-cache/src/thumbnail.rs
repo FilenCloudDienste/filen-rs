@@ -35,7 +35,7 @@ impl AuthCacheState {
 			debug!("File is not an image, no thumbnail will be made: {mime}");
 			return Ok(None);
 		}
-		let file_path = self.cache_dir.join(file.uuid().as_ref());
+		let file_path = self.get_cached_file_path(file);
 		let file_thumbnails_path = self.thumbnail_dir.join(file.uuid().as_ref());
 		tokio::fs::create_dir_all(&file_thumbnails_path).await?;
 		let thumbnail_path =

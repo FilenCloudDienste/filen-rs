@@ -14,7 +14,7 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
-		CreateFileResponse, DirWithPathResponse, FfiId, FileWithPathResponse, ItemType,
+		CreateFileResponse, DirWithPathResponse, FfiId, FileWithPathResponse,
 		ObjectWithPathResponse, ParsedFfiId, PathFfiId, QueryChildrenResponse,
 		QueryNonDirChildrenResponse, UploadFileInfo,
 	},
@@ -368,7 +368,7 @@ impl AuthCacheState {
 					)));
 				};
 				if let Some(hash) = meta.hash {
-					let local_hash = self.hash_local_file(file.uuid.as_ref()).await?;
+					let local_hash = self.hash_local_file(&file.uuid).await?;
 					if local_hash == Some(hash.into()) {
 						return Ok(false);
 					}
@@ -591,16 +591,14 @@ impl AuthCacheState {
 			DBObject::Dir(dir) => {
 				let mut remote_dir = dir.into();
 				self.client.trash_dir(&mut remote_dir).await?;
-				self.io_delete_local(*remote_dir.uuid(), ItemType::Dir)
-					.await?;
+				self.io_delete_local(remote_dir.uuid()).await?;
 				let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
 				DBObject::Dir(dir)
 			}
 			DBObject::File(file) => {
 				let mut remote_file = file.try_into()?;
 				self.client.trash_file(&mut remote_file).await?;
-				self.io_delete_local(*remote_file.uuid(), ItemType::File)
-					.await?;
+				self.io_delete_local(remote_file.uuid()).await?;
 				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 				DBObject::File(file)
 			}
@@ -816,7 +814,7 @@ impl AuthCacheState {
 			Some(obj) => obj,
 			None => return Ok(()),
 		};
-		self.io_delete_local(obj.uuid(), obj.item_type()).await?;
+		self.io_delete_local(&obj.uuid()).await?;
 		Ok(())
 	}
 
@@ -832,7 +830,7 @@ impl AuthCacheState {
 			Some(obj) => obj,
 			None => return Ok(()),
 		};
-		self.io_delete_local(obj.uuid(), obj.item_type()).await?;
+		self.io_delete_local(&obj.uuid()).await?;
 		Ok(())
 	}
 
@@ -870,14 +868,14 @@ impl AuthCacheState {
 				return Err(CacheError::remote("Cannot delete root directory"));
 			}
 			DBObject::Dir(dir) => {
-				self.io_delete_local(dir.uuid, dir.item_type()).await?;
+				self.io_delete_local(&dir.uuid).await?;
 				let remote_dir: RemoteDirectory = dir.into();
 				let uuid = *remote_dir.uuid();
 				self.client.delete_dir_permanently(remote_dir).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}
 			DBObject::File(file) => {
-				self.io_delete_local(file.uuid, file.item_type()).await?;
+				self.io_delete_local(&file.uuid).await?;
 				let remote_file: RemoteFile = file.try_into()?;
 				let uuid = *remote_file.uuid();
 				self.client.delete_file_permanently(remote_file).await?;
@@ -968,14 +966,13 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		let file: RemoteFile = file.try_into()?;
-		let uuid = file.uuid().to_string();
-		match (file.hash(), self.hash_local_file(&uuid).await) {
+		match (file.hash(), self.hash_local_file(file.uuid()).await) {
 			(Some(remote_hash), Ok(Some(local_hash))) => {
 				// Remote file has a hash and local file exists
 				if remote_hash == local_hash {
 					return self
 						.cache_dir
-						.join(uuid)
+						.join(file.uuid().as_ref())
 						.into_os_string()
 						.into_string()
 						.map_err(|e| {
@@ -992,7 +989,7 @@ impl AuthCacheState {
 				{
 					return self
 						.cache_dir
-						.join(uuid)
+						.join(file.uuid().as_ref())
 						.into_os_string()
 						.into_string()
 						.map_err(|e| {
