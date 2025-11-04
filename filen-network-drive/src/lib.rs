@@ -130,7 +130,7 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 	};
 	let rclone_binary_download_url = match (platform_str, arch_str) {
 		(Some(platform), Some(arch)) => format!(
-			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.13/rclone-v1.70.0-filen.13-{}-{}{}",
+			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.14/rclone-v1.70.0-filen.14-{}-{}{}",
 			platform,
 			arch,
 			if platform == "windows" { ".exe" } else { "" }
@@ -172,22 +172,22 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 		let downloaded_checksum = Sha256::digest(&bytes);
 		let expected_checksum = match (std::env::consts::OS, std::env::consts::ARCH) {
 			("windows", "x86_64") => {
-				hex!("98abf27aaef7709b828a70444a86dbecf3785339b7cc0fe2bd4109456178bb7f")
+				hex!("c855395339115d314b920c574610f559df03d2baaea096866b4532a59b5b7235")
 			}
 			("windows", "aarch64") => {
-				hex!("7cc58e796ccdbca7fe8c61fb2e452c79c8b6d7f7f805500dc5f4c484a7c34489")
+				hex!("ab24619f110ef14f30d4e8e77fcca8e17f5dbe7e413f907a0cf76b46fe3ffaf4")
 			}
 			("linux", "x86_64") => {
-				hex!("b955ffcca0705ac9ce807b238650bdcc22a109f4c3474e77c4a163fa208a6214")
+				hex!("265f641844a2aa17c202f3cf6c06bc98dcd9b6c3b3fa228c5c454a203105de07")
 			}
 			("linux", "aarch64") => {
-				hex!("106ba687b5662eaad2120f3241e36c185743e4755f30069c49393c479a2c9b8f")
+				hex!("f70689b939c19bb6c81784f9003f09329b97d96be4ab2c70d1f2dc6e8fd417e5")
 			}
 			("macos", "x86_64") => {
-				hex!("9143b88e35b105a3b4c04073fcad5008d80c65fce8a997afa2316428fd783d51")
+				hex!("1210e92b8adc172356a9bd79216d6a4fe22875b957326292ac2da56f2af6b207")
 			}
 			("macos", "aarch64") => {
-				hex!("67aa11b8112f293b93d02aec97cc4bb7463ebc1c775b3c31a7d9017146d2d844")
+				hex!("cabaee158814afad05ebbe7f8469608e0ea3c4a1979063d52ff0289aaafdf89b")
 			}
 			_ => unreachable!(),
 		};
