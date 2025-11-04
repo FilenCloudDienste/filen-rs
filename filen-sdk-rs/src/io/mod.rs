@@ -17,6 +17,15 @@ pub trait FilenMetaExt {
 	fn size(&self) -> u64;
 	fn modified(&self) -> DateTime<Utc>;
 	fn created(&self) -> DateTime<Utc>;
+	fn accessed(&self) -> DateTime<Utc>;
+	fn accessed_or_modified(&self) -> DateTime<Utc> {
+		let accessed = self.accessed();
+		if accessed.timestamp_millis() == 0 {
+			self.modified()
+		} else {
+			accessed
+		}
+	}
 }
 
 #[cfg(windows)]
@@ -51,6 +60,7 @@ impl FilenMetaExt for std::fs::Metadata {
 		#[cfg(unix)]
 		return DateTime::<Utc>::from(
 			std::time::SystemTime::UNIX_EPOCH
+				+ Duration::from_secs(std::os::unix::fs::MetadataExt::mtime(self) as u64)
 				+ Duration::from_nanos(std::os::unix::fs::MetadataExt::mtime_nsec(self) as u64),
 		)
 		.round_subsecs(3);
@@ -65,5 +75,19 @@ impl FilenMetaExt for std::fs::Metadata {
 		return FilenMetaExt::modified(self);
 		#[cfg(target_family = "wasm")]
 		panic!("Cannot get file created time on wasm32");
+	}
+
+	fn accessed(&self) -> DateTime<Utc> {
+		#[cfg(windows)]
+		return nt_time_to_unix_time(std::os::windows::fs::MetadataExt::last_access_time(self));
+		#[cfg(unix)]
+		return DateTime::<Utc>::from(
+			std::time::SystemTime::UNIX_EPOCH
+				+ Duration::from_secs(std::os::unix::fs::MetadataExt::atime(self) as u64)
+				+ Duration::from_nanos(std::os::unix::fs::MetadataExt::atime_nsec(self) as u64),
+		)
+		.round_subsecs(3);
+		#[cfg(target_family = "wasm")]
+		panic!("Cannot get file accessed time on wasm32");
 	}
 }
