@@ -591,7 +591,10 @@ where
 {
 	let mut current_files = func(dir).await?;
 
-	current_files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+	current_files.sort_unstable_by(|a, b| match a.1.cmp(&b.1) {
+		std::cmp::Ordering::Equal => b.2.cmp(&a.2), // larger files first if same modified time
+		other => other,
+	});
 
 	let mut total_size: u64 = current_files.iter().map(|(_, _, size)| *size).sum();
 
