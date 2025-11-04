@@ -9,14 +9,14 @@ on:
 
   # Run on push if commit message contains [test]
   push:
-    branches: [main]
+    branches: ["**"]
 
   # Run on PR if title or description contains [test]
   pull_request:
-    branches: [main]
+    branches: ["**"]
 
 concurrency:
-  group: 'test'
+  group: test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
