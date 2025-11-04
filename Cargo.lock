@@ -1527,6 +1527,7 @@ dependencies = [
  "sysinfo",
  "test-utils",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

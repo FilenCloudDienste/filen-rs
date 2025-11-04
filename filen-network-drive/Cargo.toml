@@ -32,3 +32,4 @@ tokio = { version = "1.47.1", features = [
 test-utils = { path = "../test-utils" }
 filen-macros = { path = "../filen-macros" }
 dirs = "6.0.0"
+uuid = "1.18.1"
