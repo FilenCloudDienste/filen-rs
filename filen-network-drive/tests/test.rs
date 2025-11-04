@@ -14,7 +14,7 @@ async fn start_rclone_mount() {
 	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
 
 	let client = test_utils::RESOURCES.client().await;
-	let config_dir = dirs::config_dir().unwrap().join(&test_root_dir);
+	let config_dir = dirs::config_dir().unwrap().join(TEST_ROOT_DIR_PREFIX);
 
 	#[cfg(windows)]
 	{
