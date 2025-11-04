@@ -10,7 +10,6 @@ const TEST_DIR: &str = "filen-rs-filen-network-drive-tests";
 const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tests.";
 
 #[shared_test_runtime]
-#[ignore = "would fial in CI, there are still some manual setup steps required"]
 async fn start_rclone_mount() {
 	let client = test_utils::RESOURCES.client().await;
 	let config_dir = dirs::config_dir().unwrap().join(TEST_DIR);
