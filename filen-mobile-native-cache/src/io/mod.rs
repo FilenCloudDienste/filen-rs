@@ -1,7 +1,6 @@
 use std::{
 	fs::FileTimes,
 	io::{self},
-	os::unix::fs::MetadataExt,
 	path::{Path, PathBuf},
 	str::FromStr,
 	sync::Arc,
@@ -16,6 +15,7 @@ use crate::{
 	sql,
 	traits::ProgressCallback,
 };
+use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
@@ -465,7 +465,7 @@ async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
 
 async fn process_subdir(
 	subdir_entry: tokio::fs::DirEntry,
-) -> std::io::Result<Option<(PathBuf, i64, u64)>> {
+) -> std::io::Result<Option<(PathBuf, DateTime<Utc>, u64)>> {
 	// we match on file_type because it's generally free
 	let file_type = match subdir_entry.file_type().await {
 		Ok(ft) => ft,
@@ -502,8 +502,7 @@ async fn process_subdir(
 			let meta = file_entry.metadata().await?;
 			Ok(Some((
 				path,
-				//
-				meta.atime(),
+				FilenMetaExt::accessed_or_modified(&meta),
 				FilenMetaExt::size(&meta),
 			)))
 		}
@@ -514,7 +513,7 @@ async fn process_subdir(
 	}
 }
 
-async fn count_cache_files(dir: &Path) -> std::io::Result<Vec<(PathBuf, i64, u64)>> {
+async fn count_cache_files(dir: &Path) -> std::io::Result<Vec<(PathBuf, DateTime<Utc>, u64)>> {
 	let stream = tokio_stream::wrappers::ReadDirStream::new(tokio::fs::read_dir(dir).await?);
 
 	let results = stream
@@ -539,7 +538,9 @@ async fn count_cache_files(dir: &Path) -> std::io::Result<Vec<(PathBuf, i64, u64
 	results.into_iter().collect()
 }
 
-async fn count_thumbnail_files(thumbnail_dir: &Path) -> std::io::Result<Vec<(PathBuf, i64, u64)>> {
+async fn count_thumbnail_files(
+	thumbnail_dir: &Path,
+) -> std::io::Result<Vec<(PathBuf, DateTime<Utc>, u64)>> {
 	let stream =
 		tokio_stream::wrappers::ReadDirStream::new(tokio::fs::read_dir(thumbnail_dir).await?);
 
@@ -551,7 +552,7 @@ async fn count_thumbnail_files(thumbnail_dir: &Path) -> std::io::Result<Vec<(Pat
 
 			if file_type.is_file() {
 				let meta = entry.metadata().await?;
-				let modified = meta.atime();
+				let modified = FilenMetaExt::accessed_or_modified(&meta);
 				let size = FilenMetaExt::size(&meta);
 				Ok(Some((path, modified, size)))
 			} else if file_type.is_dir() {
@@ -586,7 +587,7 @@ const MIN_CACHED_FILES: usize = 5;
 
 async fn remove_old_files<F>(dir: &Path, size_budget: u64, func: F) -> std::io::Result<u64>
 where
-	F: AsyncFnOnce(&Path) -> std::io::Result<Vec<(PathBuf, i64, u64)>>,
+	F: AsyncFnOnce(&Path) -> std::io::Result<Vec<(PathBuf, DateTime<Utc>, u64)>>,
 {
 	let mut current_files = func(dir).await?;
 
