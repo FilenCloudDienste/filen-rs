@@ -6,13 +6,15 @@ use filen_sdk_rs::fs::FSObject;
 use log::{debug, info, trace};
 use tokio::fs;
 
-const TEST_DIR: &str = "filen-rs-filen-network-drive-tests";
+const TEST_ROOT_DIR_PREFIX: &str = "filen-rs-filen-network-drive-tests";
 const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tests.";
 
 #[shared_test_runtime]
 async fn start_rclone_mount() {
+	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
+
 	let client = test_utils::RESOURCES.client().await;
-	let config_dir = dirs::config_dir().unwrap().join(TEST_DIR);
+	let config_dir = dirs::config_dir().unwrap().join(&test_root_dir);
 
 	#[cfg(windows)]
 	{
@@ -32,7 +34,7 @@ async fn start_rclone_mount() {
 		.unwrap();
 	info!("Network drive mounted at: {}", network_drive.mount_point);
 
-	let created_dir_path = format!("{}/created_dir", TEST_DIR);
+	let created_dir_path = format!("{}/created_dir", test_root_dir);
 
 	network_drive.wait_until_active().await.unwrap();
 
@@ -41,11 +43,25 @@ async fn start_rclone_mount() {
 	debug!("Stats: {:?}", stats);
 
 	// create remote test root dir if it doesn't exist
-	if client.find_item_at_path(TEST_DIR).await.unwrap().is_none() {
+	if client
+		.find_item_at_path(&test_root_dir)
+		.await
+		.unwrap()
+		.is_none()
+	{
 		client
-			.create_dir(client.root(), TEST_DIR.to_string())
+			.create_dir(client.root(), test_root_dir.clone())
 			.await
 			.unwrap();
+	};
+	let remote_test_root = {
+		match client.find_item_at_path(&test_root_dir).await.unwrap() {
+			Some(item) => match item {
+				FSObject::Dir(dir) => dir,
+				_ => panic!("Remote root dir is not a directory"),
+			},
+			None => panic!("Failed to find remote root dir"),
+		}
 	};
 
 	// check that dir doesn't exist before creation
@@ -89,7 +105,7 @@ async fn start_rclone_mount() {
 
 	// todo: upload file, check stats
 
-	let uploaded_file_path = format!("{}/uploaded_file.txt", TEST_DIR);
+	let uploaded_file_path = format!("{}/uploaded_file.txt", test_root_dir);
 
 	// check that file doesn't exist before upload
 	if client
@@ -164,4 +180,13 @@ async fn start_rclone_mount() {
 		}
 		_ => panic!("Uploaded item is not a file"),
 	}
+
+	drop(network_drive.process);
+	info!("Network drive unmounted");
+
+	// cleanup test root dir
+	client
+		.delete_dir_permanently(remote_test_root.into_owned())
+		.await
+		.unwrap();
 }
