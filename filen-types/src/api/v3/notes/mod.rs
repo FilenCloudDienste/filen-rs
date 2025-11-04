@@ -33,6 +33,7 @@ pub mod untag;
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum NoteType {
 	Text,
 	Md,

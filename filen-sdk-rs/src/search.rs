@@ -243,25 +243,35 @@ impl Client {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 mod js_impl {
 	use serde::Serialize;
-	use tsify::Tsify;
-	use wasm_bindgen::prelude::wasm_bindgen;
 
 	use crate::{auth::JsClient, js::NonRootItemTagged, runtime::do_on_commander};
 
-	#[derive(Serialize, Tsify)]
-	#[tsify(into_wasm_abi)]
+	#[derive(Serialize)]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		derive(tsify::Tsify),
+		tsify(into_wasm_abi)
+	)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 	pub struct ItemMatch {
 		pub item: NonRootItemTagged,
 		pub path: String,
 	}
 
-	#[wasm_bindgen(js_class = "Client")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl JsClient {
-		#[wasm_bindgen(js_name = "findItemMatchesForName")]
-		pub async fn find_item_matches_for_name_js(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "findItemMatchesForName")
+		)]
+		pub async fn find_item_matches_for_name(
 			&self,
 			name: String,
 		) -> Result<Vec<ItemMatch>, crate::error::Error> {

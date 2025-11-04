@@ -28,6 +28,7 @@ pub enum AuthVersion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum FileEncryptionVersion {
 	V1 = 1,
 	V2 = 2,

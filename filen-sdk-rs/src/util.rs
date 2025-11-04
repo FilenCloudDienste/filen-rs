@@ -62,6 +62,16 @@ impl<T: Send + Sync> MaybeSendSync for T {}
 impl<T> MaybeSendSync for T {}
 
 #[cfg(not(target_family = "wasm"))]
+pub trait MaybeSend: Send {}
+#[cfg(target_family = "wasm")]
+pub trait MaybeSend {}
+
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send> MaybeSend for T {}
+#[cfg(target_family = "wasm")]
+impl<T> MaybeSend for T {}
+
+#[cfg(not(target_family = "wasm"))]
 pub type MaybeSendCallback<'a, T> = std::sync::Arc<dyn Fn(T) + Send + Sync + 'a>;
 #[cfg(target_family = "wasm")]
 pub type MaybeSendCallback<'a, T> = std::rc::Rc<dyn Fn(T) + 'a>;
@@ -75,6 +85,71 @@ pub type MaybeArc<T> = std::rc::Rc<T>;
 pub type MaybeArcWeak<T> = std::sync::Weak<T>;
 #[cfg(target_family = "wasm")]
 pub type MaybeArcWeak<T> = std::rc::Weak<T>;
+
+pub(crate) trait WasmResultExt<T> {
+	fn unwrap_or_throw(self) -> T;
+	fn expect_or_throw(self, msg: &str) -> T;
+}
+
+impl<T, E: std::fmt::Debug> WasmResultExt<T> for Result<T, E> {
+	fn unwrap_or_throw(self) -> T {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			use wasm_bindgen::UnwrapThrowExt;
+			self.unwrap_throw()
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			self.unwrap()
+		}
+	}
+	fn expect_or_throw(self, msg: &str) -> T {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			use wasm_bindgen::UnwrapThrowExt;
+			self.expect_throw(msg)
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			self.expect(msg)
+		}
+	}
+}
+
+impl<T> WasmResultExt<T> for Option<T> {
+	fn unwrap_or_throw(self) -> T {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			use wasm_bindgen::UnwrapThrowExt;
+			self.unwrap_throw()
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			self.unwrap()
+		}
+	}
+	fn expect_or_throw(self, msg: &str) -> T {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			use wasm_bindgen::UnwrapThrowExt;
+			self.expect_throw(msg)
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			self.expect(msg)
+		}
+	}
+}
+
+type DateTime = chrono::DateTime<chrono::Utc>;
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(DateTime, i64, {
+	remote,
+	lower: |dt: &DateTime| dt.timestamp_millis(),
+	try_lift: |millis: i64| {
+		chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis).ok_or_else(|| uniffi::deps::anyhow::anyhow!("invalid timestamp millis: {}", millis))
+	},
+});
 
 #[cfg(test)]
 mod tests {

@@ -1162,7 +1162,7 @@ mod js_impl {
 	use std::borrow::Cow;
 
 	use filen_types::{api::v3::socket::SocketEvent, crypto::EncryptedString, traits::CowHelpers};
-	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+	use wasm_bindgen::JsValue;
 	use web_sys::js_sys;
 
 	use crate::{
@@ -1172,10 +1172,16 @@ mod js_impl {
 		sockets::EventListenerHandle,
 	};
 
-	#[wasm_bindgen(js_class = "Client")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+	)]
 	impl JsClient {
-		#[wasm_bindgen(js_name = "addSocketListener")]
-		pub async fn js_add_socket_listener(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "addSocketListener")
+		)]
+		pub async fn add_socket_listener(
 			&self,
 			#[wasm_bindgen(unchecked_param_type = "SocketEventType[] | null")] event_types: Option<
 				Vec<String>,
@@ -1213,14 +1219,20 @@ mod js_impl {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "isSocketConnected")]
-		pub async fn js_is_socket_connected(&self) -> bool {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "isSocketConnected")
+		)]
+		pub async fn is_socket_connected(&self) -> bool {
 			let this = self.inner();
 			do_on_commander(move || async move { this.is_socket_connected().await }).await
 		}
 
-		#[wasm_bindgen(js_name = "decryptMeta")]
-		pub async fn js_decrypt_meta(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "decryptMeta")
+		)]
+		pub async fn decrypt_meta(
 			&self,
 			#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: String,
 		) -> Result<String, Error> {

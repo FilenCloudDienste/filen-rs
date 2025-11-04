@@ -12,6 +12,7 @@ pub mod status;
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PublicLinkExpiration {
 	#[serde(rename = "never")]
 	Never,

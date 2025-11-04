@@ -34,6 +34,7 @@ use crate::{
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatParticipant {
 	user_id: u64,
 	email: String,
@@ -78,6 +79,7 @@ impl ChatParticipant {
 	),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Chat {
 	uuid: UuidStr,
 	#[cfg_attr(
@@ -194,6 +196,7 @@ impl Chat {
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatMessagePartial {
 	uuid: UuidStr,
 	sender_id: u64,
@@ -243,6 +246,7 @@ impl ChatMessagePartial {
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints, hashmap_as_object),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatMessage {
 	chat: UuidStr,
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
@@ -885,43 +889,66 @@ impl Client {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js_impls {
-	use std::borrow::Cow;
-
 	use chrono::TimeZone;
 	use filen_types::{
 		api::v3::chat::typing::ChatTypingType, crypto::EncryptedString, fs::UuidStr,
 	};
-	use wasm_bindgen::{UnwrapThrowExt, prelude::wasm_bindgen};
 
-	use crate::{Error, auth::JsClient, connect::js_impls::Contact, runtime::do_on_commander};
+	use crate::{
+		Error, auth::JsClient, connect::js_impls::Contact, runtime::do_on_commander,
+		util::WasmResultExt,
+	};
 
 	use super::{Chat, ChatMessage, ChatMessagePartial};
 
-	#[wasm_bindgen(js_name = "decryptMetaWithChatKey")]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "decryptMetaWithChatKey")]
 	/// Decrypts chat metadata (like chat name or message content) using the provided chat key.
 	/// Meant to be used in socket event handlers where this cannot currently be done automatically.
 	///
 	/// Should not be used outside of that context.
 	pub async fn decrypt_meta_with_chat_key(
 		chat: Chat,
-		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: &str,
+		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: String,
 	) -> Result<String, Error> {
-		chat.decrypt_string(&EncryptedString(Cow::Borrowed(encrypted)))
-			.await
+		do_on_commander(|| async move {
+			chat.decrypt_string(&EncryptedString(std::borrow::Cow::Owned(encrypted)))
+				.await
+		})
+		.await
 	}
 
-	#[wasm_bindgen(js_class = "Client")]
+	#[cfg(feature = "uniffi")]
+	#[uniffi::export]
+	pub async fn decrypt_meta_with_chat_key(
+		chat: Chat,
+		encrypted: EncryptedString<'static>,
+	) -> Result<String, Error> {
+		do_on_commander(|| async move { chat.decrypt_string(&encrypted).await }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl JsClient {
-		#[wasm_bindgen(js_name = "listMessages")]
-		pub async fn js_list_messages(&self, chat: Chat) -> Result<Vec<ChatMessage>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "listMessages")
+		)]
+		pub async fn list_messages(&self, chat: Chat) -> Result<Vec<ChatMessage>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.list_messages(&chat).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "listMessagesBefore")]
-		pub async fn js_list_messages_before(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "listMessagesBefore")
+		)]
+		pub async fn list_messages_before(
 			&self,
 			chat: Chat,
 			// todo make sure this is bigint in ts
@@ -934,27 +961,36 @@ pub mod js_impls {
 					chrono::Utc
 						.timestamp_millis_opt(before)
 						.latest()
-						.expect_throw("valid timestamp"),
+						.expect_or_throw("valid timestamp"),
 				)
 				.await
 			})
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "listChats")]
-		pub async fn js_list_chats(&self) -> Result<Vec<Chat>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "listChats")
+		)]
+		pub async fn list_chats(&self) -> Result<Vec<Chat>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.list_chats().await }).await
 		}
 
-		#[wasm_bindgen(js_name = "getChat")]
-		pub async fn js_get_chat(&self, uuid: UuidStr) -> Result<Option<Chat>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "getChat")
+		)]
+		pub async fn get_chat(&self, uuid: UuidStr) -> Result<Option<Chat>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.get_chat(uuid).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "createChat")]
-		pub async fn js_create_chat(&self, contacts: Vec<Contact>) -> Result<Chat, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "createChat")
+		)]
+		pub async fn create_chat(&self, contacts: Vec<Contact>) -> Result<Chat, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.create_chat(&contacts.into_iter().map(|c| c.into()).collect::<Vec<_>>())
@@ -963,28 +999,34 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "renameChat")]
-		pub async fn js_rename_chat(
-			&self,
-			mut chat: Chat,
-			new_name: String,
-		) -> Result<Chat, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "renameChat")
+		)]
+		pub async fn rename_chat(&self, chat: Chat, new_name: String) -> Result<Chat, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
+				let mut chat = chat;
 				this.rename_chat(&mut chat, new_name).await?;
 				Ok(chat)
 			})
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "deleteChat")]
-		pub async fn js_delete_chat(&self, chat: Chat) -> Result<(), Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteChat")
+		)]
+		pub async fn delete_chat(&self, chat: Chat) -> Result<(), Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.delete_chat(chat).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "sendChatMessage")]
-		pub async fn js_send_chat_message(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "sendChatMessage")
+		)]
+		pub async fn send_chat_message(
 			&self,
 			mut chat: Chat,
 			message: String,
@@ -998,8 +1040,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "editMessage")]
-		pub async fn js_edit_message(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "editMessage")
+		)]
+		pub async fn edit_message(
 			&self,
 			chat: Chat,
 			mut message: ChatMessage,
@@ -1013,8 +1058,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "deleteMessage")]
-		pub async fn js_delete_message(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteMessage")
+		)]
+		pub async fn delete_message(
 			&self,
 			mut chat: Chat,
 			message: ChatMessage,
@@ -1027,8 +1075,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "disableMessageEmbed")]
-		pub async fn js_disable_message_embed(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "disableMessageEmbed")
+		)]
+		pub async fn disable_message_embed(
 			&self,
 			mut message: ChatMessage,
 		) -> Result<ChatMessage, Error> {
@@ -1040,8 +1091,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "sendTypingSignal")]
-		pub async fn js_send_typing_signal(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "sendTypingSignal")
+		)]
+		pub async fn send_typing_signal(
 			&self,
 			chat: Chat,
 			signal_type: ChatTypingType,
@@ -1053,8 +1107,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "addChatParticipant")]
-		pub async fn js_add_chat_participant(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "addChatParticipant")
+		)]
+		pub async fn add_chat_participant(
 			&self,
 			mut chat: Chat,
 			contact: Contact,
@@ -1068,8 +1125,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "removeChatParticipant")]
-		pub async fn js_remove_chat_participant(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "removeChatParticipant")
+		)]
+		pub async fn remove_chat_participant(
 			&self,
 			mut chat: Chat,
 			contact: Contact,
@@ -1083,26 +1143,38 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "markChatRead")]
-		pub async fn js_mark_chat_read(&self, chat: Chat) -> Result<(), Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "markChatRead")
+		)]
+		pub async fn mark_chat_read(&self, chat: Chat) -> Result<(), Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.mark_chat_read(&chat).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "getChatUnreadCount")]
-		pub async fn js_get_chat_unread_count(&self, chat: Chat) -> Result<u64, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "getChatUnreadCount")
+		)]
+		pub async fn get_chat_unread_count(&self, chat: Chat) -> Result<u64, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.get_chat_unread_count(&chat).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "getAllChatsUnreadCount")]
-		pub async fn js_get_all_chats_unread_count(&self) -> Result<u64, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "getAllChatsUnreadCount")
+		)]
+		pub async fn get_all_chats_unread_count(&self) -> Result<u64, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.get_all_chats_unread_count().await }).await
 		}
 
-		#[wasm_bindgen(js_name = "updateChatOnlineStatus")]
-		pub async fn js_update_chat_online_status(&self, mut chat: Chat) -> Result<Chat, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "updateChatOnlineStatus")
+		)]
+		pub async fn update_chat_online_status(&self, mut chat: Chat) -> Result<Chat, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.update_chat_online_status(&mut chat).await?;
@@ -1111,14 +1183,20 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "leaveChat")]
-		pub async fn js_leave_chat(&self, chat: Chat) -> Result<(), Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "leaveChat")
+		)]
+		pub async fn leave_chat(&self, chat: Chat) -> Result<(), Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.leave_chat(&chat).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "updateLastChatFocusTimesNow")]
-		pub async fn js_update_last_chat_focus_times_now(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "updateLastChatFocusTimesNow")
+		)]
+		pub async fn update_last_chat_focus_times_now(
 			&self,
 			mut chats: Vec<Chat>,
 		) -> Result<Vec<Chat>, Error> {
@@ -1130,8 +1208,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "muteChat")]
-		pub async fn js_mute_chat(&self, mut chat: Chat, mute: bool) -> Result<Chat, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "muteChat")
+		)]
+		pub async fn mute_chat(&self, mut chat: Chat, mute: bool) -> Result<Chat, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.mute_chat(&mut chat, mute).await?;

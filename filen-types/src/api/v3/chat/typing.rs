@@ -19,6 +19,7 @@ pub struct Request {
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ChatTypingType {
 	Up,
 	Down,

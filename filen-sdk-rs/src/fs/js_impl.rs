@@ -1,5 +1,3 @@
-use wasm_bindgen::prelude::wasm_bindgen;
-
 use crate::{
 	Error,
 	auth::JsClient,
@@ -8,10 +6,17 @@ use crate::{
 	runtime::do_on_commander,
 };
 
-#[wasm_bindgen(js_class = "Client")]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsClient {
-	#[wasm_bindgen(js_name = "setFavorite")]
-	pub async fn set_favorite_js(
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "setFavorite")
+	)]
+	pub async fn set_favorite(
 		&self,
 		item: NonRootItem,
 		favorited: bool,

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ParentUuid, UuidStr},
@@ -16,7 +17,7 @@ use crate::{
 			UnsharedDirectoryType, meta::DirectoryMeta,
 		},
 	},
-	js::{AsEncodedOrDecoded, DateTime, EncodedOrDecoded},
+	js::{AsEncodedOrDecoded, EncodedOrDecoded},
 };
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -28,6 +29,7 @@ use tsify::Tsify;
 	derive(Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[cfg_attr(test, derive(Debug))]
 pub struct DecryptedDirMeta {
 	pub name: String,
@@ -40,7 +42,7 @@ pub struct DecryptedDirMeta {
 		skip_serializing_if = "Option::is_none",
 		default
 	)]
-	pub created: Option<DateTime>,
+	pub created: Option<DateTime<Utc>>,
 }
 
 impl From<SDKDecryptedDirMeta<'_>> for DecryptedDirMeta {
@@ -63,6 +65,7 @@ impl From<DecryptedDirMeta> for SDKDecryptedDirMeta<'static> {
 
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(Debug))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DirMeta {
 	Decoded(DecryptedDirMeta),
 	DecryptedRaw(Vec<u8>),
@@ -112,6 +115,7 @@ impl From<DirMeta> for DirectoryMeta<'static> {
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq, Clone))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Root {
 	pub uuid: UuidStr,
 }
@@ -130,6 +134,7 @@ impl From<Root> for RootDirectory {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DirColor {
 	Default,
 	Blue,
@@ -139,6 +144,37 @@ pub enum DirColor {
 	Gray,
 	#[serde(untagged)]
 	Custom(String),
+}
+
+impl From<String> for DirColor {
+	fn from(s: String) -> Self {
+		match s.as_str() {
+			"default" => DirColor::Default,
+			"blue" => DirColor::Blue,
+			"green" => DirColor::Green,
+			"purple" => DirColor::Purple,
+			"red" => DirColor::Red,
+			"gray" => DirColor::Gray,
+			_ => DirColor::Custom(s),
+		}
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl wasm_bindgen::describe::WasmDescribe for DirColor {
+	fn describe() {
+		<String as wasm_bindgen::describe::WasmDescribe>::describe();
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl wasm_bindgen::convert::FromWasmAbi for DirColor {
+	type Abi = <String as wasm_bindgen::convert::FromWasmAbi>::Abi;
+
+	unsafe fn from_abi(abi: Self::Abi) -> Self {
+		let s = unsafe { <String as wasm_bindgen::convert::FromWasmAbi>::from_abi(abi) };
+		DirColor::from(s)
+	}
 }
 
 // tsify does not support untagged variants yet: https://github.com/madonoharu/tsify/issues/52
@@ -186,6 +222,7 @@ impl From<DirColor> for filen_types::api::v3::dir::color::DirColor<'static> {
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
 )]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Dir {
 	pub uuid: UuidStr,
 	pub parent: ParentUuid,
@@ -194,7 +231,7 @@ pub struct Dir {
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
-	pub timestamp: DateTime,
+	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -237,6 +274,7 @@ impl From<Dir> for RemoteDirectory {
 )]
 #[serde(untagged)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DirEnum {
 	Dir(Dir),
 	Root(Root),
@@ -318,6 +356,7 @@ impl<'a>
 	derive(Tsify),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RootWithMeta {
 	pub uuid: UuidStr,
 	pub color: DirColor,
@@ -325,7 +364,7 @@ pub struct RootWithMeta {
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
-	pub timestamp: DateTime,
+	pub timestamp: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(optional, type = "DecryptedDirMeta")
@@ -356,6 +395,7 @@ impl From<RootDirectoryWithMeta> for RootWithMeta {
 	derive(Tsify),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(untagged)]
 pub enum DirWithMetaEnum {
 	Dir(Dir),
@@ -387,6 +427,7 @@ impl From<DirectoryMetaType<'_>> for DirWithMetaEnum {
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct SharedDir {
 	pub dir: DirWithMetaEnum,
 	pub sharing_role: SharingRole,
@@ -419,6 +460,7 @@ impl From<crate::connect::fs::SharedDirectory> for SharedDir {
 	derive(Tsify),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(untagged)]
 pub enum AnyDirEnum {
 	Dir(Dir),
@@ -442,6 +484,7 @@ impl From<AnyDirEnum> for DirectoryType<'static> {
 	derive(Tsify),
 	tsify(from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(untagged)]
 pub enum AnyDirEnumWithShareInfo {
 	Dir(Dir),
@@ -478,7 +521,7 @@ mod serde_impls {
 		color: Cow<'a, DirColor>,
 		favorited: bool,
 		#[serde(with = "chrono::serde::ts_milliseconds")]
-		timestamp: DateTime,
+		timestamp: DateTime<Utc>,
 		meta: Option<Cow<'a, DecryptedDirMeta>>,
 		// HIDDEN_META_KEY
 		#[serde(rename = "__hiddenMeta")]
@@ -539,7 +582,7 @@ mod serde_impls {
 		uuid: UuidStr,
 		color: Cow<'a, DirColor>,
 		#[serde(with = "chrono::serde::ts_milliseconds")]
-		timestamp: DateTime,
+		timestamp: DateTime<Utc>,
 		meta: Option<Cow<'a, DecryptedDirMeta>>,
 		// HIDDEN_META_KEY
 		#[serde(rename = "__hiddenMeta")]

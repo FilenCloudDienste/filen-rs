@@ -29,6 +29,16 @@ impl TryFrom<&EncodedString<'_>> for Vec<u8> {
 pub struct EncryptedString<'a>(pub Cow<'a, str>);
 impl_cow_helpers_for_newtype!(EncryptedString);
 
+pub type EncryptedStringStatic = EncryptedString<'static>;
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(
+	EncryptedStringStatic,
+	String, {
+		lower: |v: &EncryptedStringStatic| v.0.to_string(),
+		try_lift: |v: String| Ok(EncryptedString(Cow::Owned(v)))
+	}
+);
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl<'a> wasm_bindgen::convert::IntoWasmAbi for EncryptedString<'a> {
 	type Abi = <&'a str as wasm_bindgen::convert::IntoWasmAbi>::Abi;
@@ -80,6 +90,18 @@ impl_cow_helpers_for_newtype!(EncryptedMetaKey);
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Sha512Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 64]);
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(
+	Sha512Hash,
+	Vec<u8>, {
+	lower: |v: &Sha512Hash| v.0.to_vec(),
+	try_lift: |v: Vec<u8>| {
+		let slice: [u8; 64] = v.as_slice().try_into().map_err(|_| {
+			uniffi::deps::anyhow::anyhow!("expected 64 bytes for Sha512Hash, got {}", v.len())
+		})?;
+		Ok(Sha512Hash(slice))
+	}}
+);
 
 impl std::fmt::Debug for Sha512Hash {
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {

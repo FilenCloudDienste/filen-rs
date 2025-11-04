@@ -173,9 +173,11 @@ impl<'a> DirectoryMeta<'a> {
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct DecryptedDirectoryMeta<'a> {
 	pub name: Cow<'a, str>,
-	#[serde(with = "filen_types::serde::time::optional")]
-	#[serde(rename = "creation")]
-	#[serde(default)]
+	#[serde(
+		with = "filen_types::serde::time::optional",
+		rename = "creation",
+		default
+	)]
 	pub created: Option<DateTime<Utc>>,
 }
 
@@ -249,12 +251,14 @@ impl CowHelpers for DecryptedDirectoryMeta<'_> {
 	derive(tsify::Tsify),
 	tsify(from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DirectoryMetaChanges {
 	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	name: Option<String>,
 	// double option because we need to distinguish between
 	// "not set" and "set to None"
@@ -266,6 +270,7 @@ pub struct DirectoryMetaChanges {
 		default,
 		deserialize_with = "crate::serde::deserialize_double_option_timestamp"
 	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	created: Option<Option<DateTime<Utc>>>,
 }
 

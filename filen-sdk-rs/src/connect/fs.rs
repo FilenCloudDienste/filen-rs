@@ -28,6 +28,7 @@ use crate::{
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ShareInfo {
 	pub email: String,
 	pub id: u64,
@@ -38,8 +39,8 @@ pub struct ShareInfo {
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify)
 )]
-#[serde(tag = "role")]
-#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(tag = "role", rename_all = "camelCase")]
 pub enum SharingRole {
 	Sharer(ShareInfo),
 	Receiver(ShareInfo),

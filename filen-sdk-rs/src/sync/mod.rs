@@ -46,13 +46,11 @@ impl Client {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 mod js_impl {
 	use std::sync::Arc;
 
 	use serde::Deserialize;
-	use tsify::Tsify;
-	use wasm_bindgen::prelude::wasm_bindgen;
 
 	use crate::{
 		Error,
@@ -61,25 +59,45 @@ mod js_impl {
 		sync::lock::{self},
 	};
 
-	#[wasm_bindgen]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen
+	)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 	pub struct ResourceLock(Arc<lock::ResourceLock>);
 
-	#[wasm_bindgen]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen]
 	impl ResourceLock {
 		/// Utility function to be able to immediately drop the lock from JS
-		#[wasm_bindgen]
+		#[wasm_bindgen::prelude::wasm_bindgen]
 		pub fn drop(self) {}
+	}
 
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
+	impl ResourceLock {
 		/// The resource this lock is for
-		#[wasm_bindgen]
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen
+		)]
 		pub fn resource(&self) -> String {
 			self.0.resource().to_string()
 		}
 	}
 
-	#[derive(Deserialize, Tsify)]
-	#[tsify(from_wasm_abi)]
+	#[derive(Deserialize)]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		derive(tsify::Tsify),
+		tsify(from_wasm_abi)
+	)]
 	#[serde(rename_all = "camelCase")]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 	pub struct AcquireLockParams {
 		resource: String,
 		#[serde(default)]
@@ -87,28 +105,37 @@ mod js_impl {
 			all(target_family = "wasm", target_os = "unknown"),
 			tsify(type = "number")
 		)]
+		#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 		max_sleep_time: Option<u32>,
 		#[serde(default)]
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			tsify(type = "number")
 		)]
+		#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 		attempts: Option<u32>,
 	}
 
-	#[wasm_bindgen]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl JsClient {
-		#[wasm_bindgen(js_name = "lockDrive")]
-		pub async fn lock_drive_js(&self) -> Result<ResourceLock, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "lockDrive")
+		)]
+		pub async fn lock_drive(&self) -> Result<ResourceLock, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.lock_drive().await.map(ResourceLock) }).await
 		}
 
-		#[wasm_bindgen(js_name = "acquireLock")]
-		pub async fn acquire_lock_js(
-			&self,
-			params: AcquireLockParams,
-		) -> Result<ResourceLock, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "acquireLock")
+		)]
+		pub async fn acquire_lock(&self, params: AcquireLockParams) -> Result<ResourceLock, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.acquire_lock(

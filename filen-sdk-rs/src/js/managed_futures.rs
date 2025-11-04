@@ -69,7 +69,10 @@ mod pausable {
 		}
 	}
 
-	#[wasm_bindgen(js_name = "PauseSignal")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "PauseSignal")
+	)]
 	#[derive(Clone)]
 	pub struct PauseSignalRust {
 		sender: tokio::sync::watch::Sender<bool>,
@@ -107,14 +110,23 @@ mod pausable {
 		}
 	}
 
-	#[wasm_bindgen(js_class = "PauseSignal")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "PauseSignal")
+	)]
 	impl PauseSignalRust {
-		#[wasm_bindgen(constructor)]
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(constructor)
+		)]
 		pub fn new() -> Self {
 			Self::default()
 		}
 
-		#[wasm_bindgen(js_name = "isPaused")]
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "isPaused")
+		)]
 		pub fn is_paused(&self) -> bool {
 			*self.receiver.borrow()
 		}

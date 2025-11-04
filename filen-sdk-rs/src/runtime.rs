@@ -123,9 +123,9 @@ mod worker_handle {
 	use wasm_bindgen::prelude::*;
 	use web_sys::{DedicatedWorkerGlobalScope, js_sys::Object};
 
-	#[wasm_bindgen]
+	#[wasm_bindgen::prelude::wasm_bindgen]
 	extern "C" {
-		#[wasm_bindgen(thread_local_v2, js_name = self)]
+		#[wasm_bindgen::prelude::wasm_bindgen(thread_local_v2, js_name = self)]
 		static SELF: Option<Object>;
 	}
 
@@ -153,22 +153,17 @@ mod worker_handle {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod commander_thread {
 	use std::{mem::ManuallyDrop, pin::Pin, sync::OnceLock};
 
-	use futures::{Stream, stream::FuturesUnordered};
+	use futures::Stream;
 
 	use pin_project_lite::pin_project;
-	use tokio::sync::mpsc::UnboundedSender;
-	use wasm_bindgen::UnwrapThrowExt;
 
-	use crate::auth::JsClient;
-
-	use super::{spawn_local, wasm_threading::spawn_worker};
+	use crate::util::{MaybeSend, WasmResultExt};
 
 	// Sender for commander worker tasks
-	static COMMANDER_WORKER_SENDER: OnceLock<UnboundedSender<Box<dyn FnOnceBox>>> = OnceLock::new();
+	static COMMANDER_RUNTIME_HANDLE: OnceLock<RuntimeHandle> = OnceLock::new();
 
 	trait FnOnceBox: Send + 'static {
 		fn call_box(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + 'static>>;
@@ -184,42 +179,104 @@ mod commander_thread {
 		}
 	}
 
-	fn get_or_init_commander_sender()
-	-> &'static tokio::sync::mpsc::UnboundedSender<Box<dyn FnOnceBox>> {
-		COMMANDER_WORKER_SENDER.get_or_init(|| {
-			let (sender, mut receiver) =
-				tokio::sync::mpsc::unbounded_channel::<Box<dyn FnOnceBox>>();
+	struct RuntimeHandle {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		sender: tokio::sync::mpsc::UnboundedSender<Box<dyn FnOnceBox>>,
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		tokio_handle: tokio::runtime::Handle,
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		close_sender: tokio::sync::oneshot::Sender<()>,
+	}
 
-			spawn_worker(move || {
-				spawn_local(async move {
-					let mut futures = FuturesUnordered::new();
+	struct JoinHandle {}
 
-					loop {
-						use futures::StreamExt;
+	impl RuntimeHandle {
+		fn new() -> Self {
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				use super::{spawn, spawn_local};
+				use futures::{StreamExt, stream::FuturesUnordered};
 
-						tokio::select! {
-							val = receiver.recv() => {
-								match val {
-									Some(task_constructor) => {
-										// Construct the future on THIS thread
-										let fut = task_constructor.call_box();
-										futures.push(fut);
-									},
-									None => {
-										while (futures.next().await).is_some() {}
-										break;
-									},
-								}
-							},
-							_ = futures.next() => {}
+				let (sender, mut receiver) =
+					tokio::sync::mpsc::unbounded_channel::<Box<dyn FnOnceBox>>();
+
+				spawn(move || {
+					spawn_local(async move {
+						let mut futures = FuturesUnordered::new();
+
+						loop {
+							tokio::select! {
+								val = receiver.recv() => {
+									match val {
+										Some(task_constructor) => {
+											// Construct the future on THIS thread
+											let fut = task_constructor.call_box();
+											futures.push(fut);
+										},
+										None => {
+											while (futures.next().await).is_some() {}
+											log::debug!("Commander worker shutting down");
+											break;
+										},
+									}
+								},
+								_ = futures.next() => {}
+							}
 						}
-					}
+					});
 				});
-			})
-			.expect_throw("Failed to spawn commander worker");
 
-			sender
-		})
+				Self { sender }
+			}
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.enable_all()
+					.build()
+					.expect_or_throw("Failed to create commander runtime");
+				let handle = runtime.handle().clone();
+
+				let (close_sender, close_receiver) = tokio::sync::oneshot::channel::<()>();
+
+				std::thread::spawn(move || {
+					runtime.block_on(async {
+						let _ = close_receiver.await;
+						log::debug!("Commander runtime shutting down");
+					});
+				});
+
+				Self {
+					tokio_handle: handle,
+					close_sender,
+				}
+			}
+		}
+
+		fn build_and_spawn<F, Fut>(&self, fut_builder: CommanderFutBuilder<F, Fut, Fut::Output>)
+		where
+			F: FnOnce() -> Fut + Send + 'static,
+			Fut: Future + MaybeSend + 'static,
+			Fut::Output: Send + 'static,
+		{
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				self.sender
+					.send(Box::new(move || {
+						Box::pin(async move {
+							fut_builder.build().await;
+						}) as Pin<Box<dyn Future<Output = ()> + 'static>>
+					}))
+					.expect_or_throw("Failed to send task to commander worker");
+			}
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				self.tokio_handle.spawn(fut_builder.build());
+			}
+		}
+	}
+
+	fn get_or_init_async_runtime() -> &'static RuntimeHandle {
+		COMMANDER_RUNTIME_HANDLE.get_or_init(RuntimeHandle::new)
 	}
 
 	pin_project! {
@@ -274,7 +331,7 @@ mod commander_thread {
 			let this = self.project();
 			this.result_receiver
 				.poll(cx)
-				.map(|res| res.expect_throw("CommanderFuture panicked"))
+				.map(|res| res.expect_or_throw("CommanderFuture panicked"))
 		}
 	}
 
@@ -425,20 +482,14 @@ mod commander_thread {
 	) -> CommanderFutHandle<Fut::Output>
 	where
 		F: FnOnce() -> Fut + Send + 'static,
-		Fut: Future + 'static,
+		Fut: Future + MaybeSend + 'static,
 		Fut::Output: Send + 'static,
 	{
-		let sender = get_or_init_commander_sender();
+		let runtime = get_or_init_async_runtime();
 
 		let (fut_builder, handle) = make_future_builder_with_handle(pause_signal, f);
 
-		sender
-			.send(Box::new(move || {
-				Box::pin(async move {
-					fut_builder.build().await;
-				}) as Pin<Box<dyn Future<Output = ()> + 'static>>
-			}))
-			.expect_throw("Failed to send task to commander worker");
+		runtime.build_and_spawn(fut_builder);
 
 		handle
 	}
@@ -451,7 +502,7 @@ mod commander_thread {
 	pub(crate) fn do_on_commander<F, Fut>(f: F) -> CommanderFutHandle<Fut::Output>
 	where
 		F: FnOnce() -> Fut + Send + 'static,
-		Fut: Future + 'static,
+		Fut: Future + MaybeSend + 'static,
 		Fut::Output: Send + 'static,
 	{
 		inner_do_on_commander(None, f)
@@ -466,18 +517,16 @@ mod commander_thread {
 	) -> CommanderFutHandle<Fut::Output>
 	where
 		F: FnOnce() -> Fut + Send + 'static,
-		Fut: Future + 'static,
+		Fut: Future + MaybeSend + 'static,
 		Fut::Output: Send + 'static,
 	{
 		inner_do_on_commander(Some(channel), f)
 	}
-
-	impl JsClient {}
 }
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+pub(crate) use commander_thread::do_on_commander;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub(crate) use commander_thread::{
-	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
-};
+pub(crate) use commander_thread::{CommanderFutHandle, do_with_pause_channel_on_commander};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod wasm_threading {

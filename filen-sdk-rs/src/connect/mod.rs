@@ -33,7 +33,7 @@ use crate::{
 
 pub mod contacts;
 pub mod fs;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js_impls;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +69,7 @@ trait MakePasswordSaltAndHash {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(untagged)]
 pub enum PasswordState {
 	Known(String),
@@ -103,6 +104,7 @@ impl PasswordState {
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[serde(rename_all = "camelCase")]
 pub struct FilePublicLink {
 	link_uuid: UuidStr,
@@ -173,6 +175,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[serde(rename_all = "camelCase")]
 pub struct DirPublicLink {
 	link_uuid: UuidStr,

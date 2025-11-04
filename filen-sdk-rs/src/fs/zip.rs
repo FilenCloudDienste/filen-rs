@@ -437,7 +437,6 @@ mod js_impl {
 	};
 
 	use futures::AsyncWriteExt;
-	use wasm_bindgen::prelude::*;
 
 	fn spawn_write_future(
 		mut data_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -484,10 +483,16 @@ mod js_impl {
 		});
 	}
 
-	#[wasm_bindgen(js_class = "Client")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+	)]
 	impl JsClient {
-		#[wasm_bindgen(js_name = "downloadItemsToZip")]
-		pub async fn download_items_to_zip_js(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadItemsToZip")
+		)]
+		pub async fn download_items_to_zip(
 			&self,
 			params: DownloadFileToZipParams,
 		) -> Result<(), Error> {

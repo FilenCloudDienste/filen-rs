@@ -167,6 +167,12 @@ impl std::fmt::Debug for V2Key {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MasterKey(pub(crate) V2Key);
 
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(MasterKey, String, {
+	lower : |key: &MasterKey| key.as_ref().to_string(),
+	try_lift : |s: String| MasterKey::try_from(s).map_err(|e| uniffi::deps::anyhow::anyhow!(e))
+});
+
 impl Serialize for MasterKey {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where

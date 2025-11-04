@@ -9,7 +9,7 @@ pub mod crypto;
 pub mod error;
 pub mod fs;
 pub mod io;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js;
 pub mod notes;
 pub mod runtime;
@@ -23,3 +23,6 @@ pub mod user;
 pub mod util;
 
 pub use error::{Error, ErrorKind};
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();

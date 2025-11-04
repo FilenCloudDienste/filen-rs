@@ -38,6 +38,7 @@ impl From<ObjectType> for ObjectType2 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ParentUuid {
 	Uuid(UuidStr),
 	Trash,
@@ -146,14 +147,25 @@ mod uuid {
 	use wasm_bindgen::{
 		convert::{FromWasmAbi, RefFromWasmAbi},
 		describe::WasmDescribe,
-		prelude::wasm_bindgen,
 	};
 
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
 
+	#[cfg(feature = "uniffi")]
+	uniffi::custom_type!(UuidStr, String, {
+		remote,
+		lower: |uuid: &UuidStr| uuid.as_ref().to_string(),
+		try_lift: |s: String| {
+			UuidStr::from_str(&s).map_err(|_| uniffi::deps::anyhow::anyhow!("invalid UUID string: {}", s))
+		},
+	});
+
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	#[wasm_bindgen(typescript_custom_section)]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)
+	)]
 	const TS_PARENT_UUID: &'static str =
 		r#"export type UuidStr = `${string}-${string}-${string}-${string}`;"#;
 

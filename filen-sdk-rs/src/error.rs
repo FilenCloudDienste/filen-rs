@@ -59,6 +59,7 @@ impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ErrorKind {
 	/// Returned by the server
 	Server,
@@ -87,7 +88,7 @@ pub enum ErrorKind {
 	ImageError,
 	/// Tried to use metadata for an item that failed to decrypt metadata
 	MetadataWasNotDecrypted,
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 	/// Operation was cancelled
 	Cancelled,
 	#[cfg(feature = "heif-decoder")]
@@ -103,6 +104,7 @@ pub enum ErrorKind {
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct FilenSDKError {
 	kind: ErrorKind,
 	inner: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -119,15 +121,23 @@ pub type Error = FilenSDKError;
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen
 )]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl FilenSDKError {
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(getter)
 	)]
+	// #[cfg_attr(feature = "uniffi", uniffi::method)]
 	pub fn kind(&self) -> ErrorKind {
 		self.kind
 	}
+}
 
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen
+)]
+impl FilenSDKError {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "toString")]
 	pub fn js_to_string(&self) -> String {
@@ -281,7 +291,7 @@ impl_from!(
 
 #[derive(Debug, Error)]
 #[error("Operation was cancelled")]
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub(crate) struct AbortedError;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 impl_from!(AbortedError, ErrorKind::Cancelled);

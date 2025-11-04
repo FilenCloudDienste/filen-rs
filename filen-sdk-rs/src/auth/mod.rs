@@ -45,16 +45,17 @@ use crate::{
 use crate::sockets::{SocketConfig, SocketConnectionState};
 
 pub mod http;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js_impls;
 pub mod v1;
 pub mod v2;
 pub mod v3;
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub use js_impls::JsClient;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub(crate) enum MetaKey {
 	V1(v2::MetaKey),
 	V2(v2::MetaKey),
@@ -278,6 +279,7 @@ impl Eq for Client {}
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[serde(rename_all = "camelCase")]
 pub struct StringifiedClient {
 	pub email: String,
@@ -292,12 +294,14 @@ pub struct StringifiedClient {
 		tsify(type = "number")
 	)]
 	#[serde(default)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub max_parallel_requests: Option<u32>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "number")
 	)]
 	#[serde(default)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub max_io_memory_usage: Option<u32>,
 }
 
@@ -821,6 +825,7 @@ impl Client {
 	derive(Serialize, tsify::Tsify),
 	tsify(into_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct TwoFASecret {
 	secret: String,
 	url: String,

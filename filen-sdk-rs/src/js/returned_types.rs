@@ -14,6 +14,7 @@ use tsify::Tsify;
 	derive(Tsify),
 	tsify(into_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type")]
 #[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub enum NonRootItemTagged {
@@ -38,8 +39,21 @@ impl From<NonRootFSObject<'_>> for NonRootItemTagged {
 	derive(Tsify),
 	tsify(into_wasm_abi, large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DirSizeResponse {
 	pub size: u64,
 	pub files: u64,
 	pub dirs: u64,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DirsAndFiles {
+	pub dirs: Vec<Dir>,
+	pub files: Vec<File>,
 }

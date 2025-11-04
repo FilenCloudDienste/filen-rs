@@ -19,6 +19,37 @@ pub enum NoteOrChatKey {
 	V3(EncryptionKey),
 }
 
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(
+	NoteOrChatKey,
+	String,
+	{
+		lower : |key: &NoteOrChatKey| key.to_string(),
+		try_lift : |s: String| NoteOrChatKey::from_cow_str(Cow::Owned(s)).map_err(|e| uniffi::deps::anyhow::anyhow!(e))
+	}
+);
+
+impl NoteOrChatKey {
+	pub(crate) fn from_cow_str(s: Cow<str>) -> Result<Self, crate::crypto::error::ConversionError> {
+		match s.len() {
+			32 => Ok(NoteOrChatKey::V2(MasterKey::try_from(s.into_owned())?.0)),
+			64 => Ok(NoteOrChatKey::V3(EncryptionKey::from_str(&s)?)),
+			len => Err(crate::crypto::error::ConversionError::InvalidStringLength(
+				len, 32,
+			)),
+		}
+	}
+}
+
+impl std::fmt::Display for NoteOrChatKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			NoteOrChatKey::V2(key) => write!(f, "{}", key.as_ref()),
+			NoteOrChatKey::V3(key) => write!(f, "{}", key),
+		}
+	}
+}
+
 impl Serialize for NoteOrChatKey {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
@@ -37,19 +68,7 @@ impl<'de> Deserialize<'de> for NoteOrChatKey {
 		D: serde::Deserializer<'de>,
 	{
 		let key = String::deserialize(deserializer)?;
-		match key.len() {
-			32 => Ok(NoteOrChatKey::V2(
-				MasterKey::try_from(key)
-					.map_err(serde::de::Error::custom)?
-					.0,
-			)),
-			64 => Ok(NoteOrChatKey::V3(
-				EncryptionKey::from_str(&key).map_err(serde::de::Error::custom)?,
-			)),
-			len => Err(serde::de::Error::custom(format!(
-				"Invalid key length: {len}"
-			))),
-		}
+		Self::from_cow_str(Cow::Owned(key)).map_err(serde::de::Error::custom)
 	}
 }
 

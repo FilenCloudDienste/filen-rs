@@ -7,13 +7,14 @@ repository = "https://github.com/FilenCloudDienste/filen-rs"
 license = "AGPL-3.0"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "rlib", "staticlib"]
 
 [features]
 default = []
 malformed = []
 heif-decoder = ["dep:heif-decoder"]
 avif-decoder = ["image/avif-native"]
+uniffi = ["dep:uniffi", "filen-types/uniffi"]
 
 [dependencies]
 reqwest = { version = "0.12.22", features = [
@@ -78,6 +79,15 @@ urlencoding = "2.1.3"
 base32 = "0.5.1"
 regex = "1.11.3"
 rayon = "1.11.0"
+pin-project-lite = "0.2.16"
+
+# ios dependencies
+[target.'cfg(target_os="ios")'.dependencies]
+oslog = "0.2.0"
+
+# android dependencies
+[target.'cfg(target_os="android")'.dependencies]
+android_logger = "0.15.0"
 
 # native (not wasm) only dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
@@ -101,6 +111,7 @@ tokio-stream = { version = "0.1.17", default-features = false, features = [
 	"sync",
 	"fs",
 ] }
+uniffi = { version = "0.29.4", optional = true }
 
 # wasm only dependencies
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
@@ -130,7 +141,6 @@ web-sys = { version = "0.3.22", default-features = false, features = [
 wasm-logger = "0.2.0"
 console_error_panic_hook = "0.1.5"
 wasm-streams = "0.4.2"
-pin-project-lite = "0.2.16"
 wasm-bindgen-rayon = "1.3.0"
 # we don't need this directly, but wasmtimer uses it and doesn't enable the nightly feature
 # which meant that wasm_atomic was not being used

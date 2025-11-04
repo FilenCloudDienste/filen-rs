@@ -55,7 +55,10 @@ beforeAll(async () => {
 			if (!env.VITE_TEST_PASSWORD) {
 				throw new Error("VITE_TEST_PASSWORD environment variable is not set")
 			}
-			state = await login(env.VITE_TEST_EMAIL, env.VITE_TEST_PASSWORD)
+			state = await login({
+				email: env.VITE_TEST_EMAIL,
+				password: env.VITE_TEST_PASSWORD
+			})
 
 			listenerHandles.push(
 				await state.addSocketListener(null, event => {
@@ -83,7 +86,7 @@ beforeAll(async () => {
 			if (!env.VITE_TEST_SHARE_PASSWORD) {
 				throw new Error("VITE_TEST_SHARE_PASSWORD environment variable is not set")
 			}
-			shareClient = await login(env.VITE_TEST_SHARE_EMAIL, env.VITE_TEST_SHARE_PASSWORD)
+			shareClient = await login({ email: env.VITE_TEST_SHARE_EMAIL, password: env.VITE_TEST_SHARE_PASSWORD })
 		})()
 	])
 }, 120000)
@@ -115,15 +118,14 @@ test("list root directory", async () => {
 	expect(root.uuid).toBeDefined()
 	const resp = await state.listDir(root)
 	expect(resp).toBeDefined()
-	expect(resp.length).toBe(2)
-	expect(resp[0]).toBeInstanceOf(Array)
-	expect(resp[1]).toBeInstanceOf(Array)
+	expect(resp.dirs).toBeInstanceOf(Array)
+	expect(resp.files).toBeInstanceOf(Array)
 })
 
 test("Directory", async () => {
 	const before = new Date().getTime()
 	let dir = await state.createDir(testDir, "test-dir")
-	const [dirs, files] = await state.listDir(dir)
+	const { dirs, files } = await state.listDir(dir)
 	expect(dirs.length).toBe(0)
 	expect(files.length).toBe(0)
 
@@ -273,7 +275,7 @@ test("abort", async () => {
 		expect((e as FilenSDKError).kind).toBe("Cancelled")
 	}
 	const fileB = await fileBPromise
-	const [, files] = await state.listDir(testDir)
+	const { files } = await state.listDir(testDir)
 
 	expect(files).toContainEqual(fileB)
 	for (const file of files) {
@@ -440,15 +442,16 @@ test("sharing", async () => {
 	expect(contact).toBeDefined()
 	await state.shareDir(dir, contact)
 	const shared = await state.listOutShared(null, contact)
-	const sharedDir = shared[0].find(d => d.dir.uuid === dir.uuid)
+	const sharedDir = shared.dirs.find(d => d.dir.uuid === dir.uuid)
 	expect(sharedDir).toBeDefined()
-	expect(sharedDir.dir.uuid).toEqual(dir.uuid)
+	expect(sharedDir?.dir?.uuid).toEqual(dir.uuid)
 
 	await shareClient.listInShared()
-	const sharedDirs = await shareClient.listInShared()
-	const sharedDirIn = sharedDirs[0].find(d => d.dir.uuid === dir.uuid)
+	const sharedDirs = (await shareClient.listInShared()).dirs
+	const sharedDirIn = sharedDirs.find(d => d.dir.uuid === dir.uuid)
 	expect(sharedDirIn).toBeDefined()
-	const [, files] = await shareClient.listInShared(sharedDirIn.dir)
+
+	const files = (await shareClient.listInShared(sharedDirIn?.dir)).files
 	expect(files.find(f => f.file.uuid === file.uuid)).toBeDefined()
 
 	await state.deleteContact(contact.uuid)
@@ -638,9 +641,9 @@ test("notes", async () => {
 	expect(content).toBe("This is the note content")
 
 	let tag = await state.createNoteTag("Test Tag")
-	const [note1, tag1] = await state.addTagToNote(note, tag)
-	note = note1
-	tag = tag1
+	const resp = await state.addTagToNote(note, tag)
+	note = resp.note
+	tag = resp.tag
 	expect(note.tags).toBeDefined()
 	expect(note.tags!.length).toBe(1)
 	expect(note.tags![0].uuid).toBe(tag.uuid)

@@ -79,13 +79,10 @@ impl Client {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 mod js_impls {
 	use image::codecs::webp::WebPEncoder;
 	use serde::{Deserialize, Serialize};
-	use serde_bytes::ByteBuf;
-	use tsify::Tsify;
-	use wasm_bindgen::prelude::wasm_bindgen;
 
 	use crate::{
 		Error,
@@ -95,33 +92,49 @@ mod js_impls {
 		runtime::{self, do_on_commander},
 	};
 
-	#[derive(Deserialize, Tsify)]
+	#[derive(Deserialize)]
 	#[serde(rename_all = "camelCase")]
-	#[tsify(from_wasm_abi)]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		derive(tsify::Tsify),
+		tsify(from_wasm_abi)
+	)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 	pub struct MakeThumbnailInMemoryParams {
 		pub file: File,
 		pub max_width: u32,
 		pub max_height: u32,
 	}
 
-	#[derive(Serialize, Tsify)]
+	#[derive(Serialize)]
 	#[serde(rename_all = "camelCase")]
-	#[tsify(into_wasm_abi)]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		derive(tsify::Tsify),
+		tsify(into_wasm_abi)
+	)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 	pub struct MakeThumbnailInMemoryResult {
 		// this is correct, ts requires the specifity
 		// because of https://github.com/microsoft/typescript/issues/62546
 		// not sure who to upstream this to, tsify, js_sys, or wasm-bindgen
-		#[cfg_attr(
-			all(target_family = "wasm", target_os = "unknown"),
-			tsify(type = "Uint8Array<ArrayBuffer>")
-		)]
-		pub webp_data: ByteBuf,
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		#[tsify(type = "Uint8Array<ArrayBuffer>")]
+		pub webp_data: serde_bytes::ByteBuf,
+		#[cfg(feature = "uniffi")]
+		pub webp_data: Vec<u8>,
 	}
 
-	#[wasm_bindgen(js_class = "Client")]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+	)]
 	impl JsClient {
-		#[wasm_bindgen(js_name = "makeThumbnailInMemory")]
-		pub async fn make_thumbnail_in_memory_js(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailInMemory")
+		)]
+		pub async fn make_thumbnail_in_memory(
 			&self,
 			params: MakeThumbnailInMemoryParams,
 		) -> Result<Option<MakeThumbnailInMemoryResult>, Error> {
@@ -146,9 +159,17 @@ mod js_impls {
 						// really wish I knew the exact size beforehand so we could preallocate
 						let mut image_data = Vec::new();
 						image.write_with_encoder(WebPEncoder::new_lossless(&mut image_data))?;
-						Ok(Some(MakeThumbnailInMemoryResult {
-							webp_data: ByteBuf::from(image_data),
-						}))
+						let webp_data = {
+							#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+							{
+								serde_bytes::ByteBuf::from(image_data)
+							}
+							#[cfg(feature = "uniffi")]
+							{
+								image_data
+							}
+						};
+						Ok(Some(MakeThumbnailInMemoryResult { webp_data }))
 					},
 				)
 				.await

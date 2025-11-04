@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},
@@ -15,7 +16,7 @@ use crate::{
 		enums::RemoteFileType,
 		meta::{DecryptedFileMeta as SDKDecryptedFileMeta, FileMeta as SDKFileMeta},
 	},
-	js::{AsEncodedOrDecoded, DateTime, EncodedOrDecoded},
+	js::{AsEncodedOrDecoded, EncodedOrDecoded},
 	thumbnail::is_supported_thumbnail_mime,
 };
 
@@ -29,6 +30,7 @@ use tsify::Tsify;
 	tsify(large_number_types_as_bigints)
 )]
 #[cfg_attr(test, derive(Debug))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DecryptedFileMeta {
 	pub name: String,
 	pub mime: String,
@@ -41,13 +43,13 @@ pub struct DecryptedFileMeta {
 		skip_serializing_if = "Option::is_none",
 		default
 	)]
-	pub created: Option<DateTime>,
+	pub created: Option<DateTime<Utc>>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "chrono::serde::ts_milliseconds")]
-	pub modified: DateTime,
+	pub modified: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "Uint8Array")
@@ -96,6 +98,7 @@ impl TryFrom<DecryptedFileMeta> for SDKDecryptedFileMeta<'static> {
 
 #[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(test, derive(Debug))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum FileMeta {
 	Decoded(DecryptedFileMeta),
 	DecryptedUTF8(String),
@@ -190,6 +193,7 @@ impl<'a>
 	serde(rename_all = "camelCase")
 )]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct File {
 	pub uuid: UuidStr,
 	#[cfg_attr(
@@ -212,7 +216,7 @@ pub struct File {
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
-	pub timestamp: DateTime,
+	pub timestamp: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
@@ -268,6 +272,7 @@ impl TryFrom<File> for RemoteFile {
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RootFile {
 	pub uuid: UuidStr,
 	pub size: u64,
@@ -278,7 +283,7 @@ pub struct RootFile {
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
-	pub timestamp: DateTime,
+	pub timestamp: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(optional, type = "DecryptedDirMeta")
@@ -330,6 +335,7 @@ impl From<RemoteRootFile> for RootFile {
 	derive(Tsify),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[serde(rename_all = "camelCase")]
 pub struct SharedFile {
 	pub file: RootFile,
@@ -378,6 +384,8 @@ impl TryFrom<FileEnum> for RemoteFileType<'static> {
 }
 
 mod serde_impls {
+	use chrono::{DateTime, Utc};
+
 	use crate::js::HIDDEN_META_KEY;
 
 	use super::*;
@@ -394,7 +402,7 @@ mod serde_impls {
 		region: Cow<'a, str>,
 		bucket: Cow<'a, str>,
 		#[serde(with = "chrono::serde::ts_milliseconds")]
-		timestamp: DateTime,
+		timestamp: DateTime<Utc>,
 		chunks: u64,
 
 		meta: Option<Cow<'a, DecryptedFileMeta>>,
@@ -470,7 +478,7 @@ mod serde_impls {
 		region: Cow<'a, str>,
 		bucket: Cow<'a, str>,
 		#[serde(with = "chrono::serde::ts_milliseconds")]
-		timestamp: DateTime,
+		timestamp: DateTime<Utc>,
 		meta: Option<Cow<'a, DecryptedFileMeta>>,
 		// HIDDEN_META_KEY
 		#[serde(rename = "__hiddenMeta")]

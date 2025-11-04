@@ -222,17 +222,43 @@ impl<'a> DecryptedFileMeta<'a> {
 		if let Some(last_modified) = changes.last_modified {
 			self.last_modified = last_modified;
 		}
-		if let Some(created) = changes.created {
-			self.created = created;
+		#[cfg(not(feature = "uniffi"))]
+		{
+			if let Some(created) = changes.created {
+				self.created = created;
+			}
+		}
+
+		#[cfg(feature = "uniffi")]
+		{
+			self.created = match changes.created {
+				CreatedTime::Keep => self.created,
+				CreatedTime::Unset => None,
+				CreatedTime::Set(t) => Some(t),
+			};
 		}
 	}
 
 	pub fn borrowed_with_changes(&'a self, changes: &'a FileMetaChanges) -> Self {
+		let created = {
+			#[cfg(feature = "uniffi")]
+			{
+				match &changes.created {
+					CreatedTime::Keep => self.created,
+					CreatedTime::Unset => None,
+					CreatedTime::Set(t) => Some(*t),
+				}
+			}
+			#[cfg(not(feature = "uniffi"))]
+			{
+				changes.created.unwrap_or(self.created)
+			}
+		};
 		Self {
 			name: Cow::Borrowed(changes.name.as_deref().unwrap_or(&self.name)),
 			mime: Cow::Borrowed(changes.mime.as_deref().unwrap_or(&self.mime)),
 			last_modified: changes.last_modified.unwrap_or(self.last_modified),
-			created: changes.created.unwrap_or(self.created),
+			created,
 			key: Cow::Borrowed(&self.key),
 			size: self.size,
 			hash: self.hash,
@@ -289,6 +315,15 @@ impl<'a> DecryptedFileMeta<'a> {
 	}
 }
 
+#[cfg(feature = "uniffi")]
+#[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize, uniffi::Enum)]
+pub enum CreatedTime {
+	#[default]
+	Keep,
+	Unset,
+	Set(DateTime<Utc>),
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
@@ -296,25 +331,30 @@ impl<'a> DecryptedFileMeta<'a> {
 	derive(tsify::Tsify),
 	tsify(from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileMetaChanges {
 	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	name: Option<String>,
 	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	mime: Option<String>,
 	#[serde(default, with = "filen_types::serde::time::optional")]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	last_modified: Option<DateTime<Utc>>,
+	#[cfg(not(feature = "uniffi"))]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint | null")
@@ -324,6 +364,8 @@ pub struct FileMetaChanges {
 		deserialize_with = "crate::serde::deserialize_double_option_timestamp"
 	)]
 	created: Option<Option<DateTime<Utc>>>,
+	#[cfg(feature = "uniffi")]
+	created: CreatedTime,
 }
 
 impl FileMetaChanges {
@@ -349,7 +391,17 @@ impl FileMetaChanges {
 	}
 
 	pub fn created(mut self, created: Option<DateTime<Utc>>) -> Self {
-		self.created = Some(created.map(|t| t.round_subsecs(3)));
+		#[cfg(feature = "uniffi")]
+		{
+			self.created = match created {
+				Some(t) => CreatedTime::Set(t.round_subsecs(3)),
+				None => CreatedTime::Unset,
+			};
+		}
+		#[cfg(not(feature = "uniffi"))]
+		{
+			self.created = Some(created.map(|t| t.round_subsecs(3)));
+		}
 		self
 	}
 }

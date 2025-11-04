@@ -6,28 +6,39 @@ mod managed_futures;
 mod params;
 mod returned_types;
 
+#[cfg(feature = "uniffi")]
+use std::{borrow::Cow, str::FromStr};
+
 pub use dir::*;
 pub use file::*;
+#[cfg(feature = "uniffi")]
+use filen_types::serde::rsa::RsaDerPublicKey;
 pub use item::*;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use managed_futures::*;
 pub use params::*;
 pub use returned_types::*;
+#[cfg(feature = "uniffi")]
+use rsa::RsaPublicKey;
+use serde::Deserialize;
 use shared::*;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::{
 	Error,
 	auth::{Client, JsClient, StringifiedClient},
+	runtime::do_on_commander,
 };
 
 const HIDDEN_META_KEY: &str = "__hiddenMeta";
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[wasm_bindgen(start)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(start)
+)]
 pub fn main_js() -> Result<(), JsValue> {
 	console_error_panic_hook::set_once();
 	#[cfg(debug_assertions)]
@@ -37,26 +48,54 @@ pub fn main_js() -> Result<(), JsValue> {
 	Ok(())
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[wasm_bindgen]
-pub async fn login(
-	email: String,
-	password: &str,
-	#[wasm_bindgen(js_name = "twoFactorCode")] two_factor_code: Option<String>,
-) -> Result<JsClient, JsValue> {
-	Ok(JsClient::new(
-		Client::login(
-			email,
-			password,
-			two_factor_code.as_deref().unwrap_or("XXXXXX"),
-		)
-		.await?,
-	))
+#[derive(Deserialize, Debug)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(from_wasm_abi)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[serde(rename_all = "camelCase")]
+pub struct LoginParams {
+	pub email: String,
+	pub password: String,
+	#[serde(default)]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
+	)]
+	// #[cfg_attr(
+	// 	feature = "uniffi",
+	// 	uniffi(default = None)
+	// )]
+	pub two_factor_code: Option<String>,
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[wasm_bindgen(js_name = "fromStringified")]
-pub fn from_stringified(serialized: StringifiedClient) -> Result<JsClient, JsValue> {
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub async fn login(params: LoginParams) -> Result<JsClient, Error> {
+	log::info!("Logging in user: {:?}", params);
+	let client = do_on_commander(move || async move {
+		Client::login(
+			params.email,
+			&params.password,
+			params.two_factor_code.as_deref().unwrap_or("XXXXXX"),
+		)
+		.await
+	})
+	.await?;
+	Ok(JsClient::new(client))
+	// Ok(JsClient::new(
+	// 	,
+	// ))
+}
+
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen(js_name = "fromStringified")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn from_stringified(serialized: StringifiedClient) -> Result<JsClient, Error> {
 	Ok(JsClient::new(
 		Client::from_stringified(serialized).map_err(Error::from)?,
 	))
@@ -92,7 +131,18 @@ mod shared {
 	}
 }
 
-type DateTime = chrono::DateTime<chrono::Utc>;
+#[cfg(feature = "uniffi")]
+uniffi::use_remote_type!(filen_types::filen_types::fs::UuidStr);
+
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(RsaPublicKey, String, {
+	remote,
+	lower: |key: &RsaPublicKey| RsaDerPublicKey(Cow::Borrowed(&key)).to_string(),
+	try_lift: |s: &str| {
+		RsaDerPublicKey::from_str(&s).map(|k| k.0.into_owned()).map_err(|e| uniffi::deps::anyhow::anyhow!("failed to parse RSA public key from string: {}", e))
+	},
+});
+
 #[cfg(all(test, target_family = "wasm", target_os = "unknown"))]
 mod tests {
 	use std::str::FromStr;

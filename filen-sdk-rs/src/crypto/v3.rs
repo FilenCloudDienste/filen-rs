@@ -29,6 +29,12 @@ pub struct EncryptionKey {
 	pub cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
 }
 
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(EncryptionKey, String, {
+	lower : |key: &EncryptionKey| key.to_string(),
+	try_lift : |s: String| EncryptionKey::from_str(&s).map_err(|e| uniffi::deps::anyhow::anyhow!(e))
+});
+
 impl EncryptionKey {
 	pub fn new(key: [u8; 32]) -> Self {
 		let cipher = AesGcm::new(&key.into());

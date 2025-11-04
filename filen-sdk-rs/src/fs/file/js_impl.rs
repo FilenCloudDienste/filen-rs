@@ -1,16 +1,28 @@
-use std::{cmp::min, sync::Arc};
-
 use crate::{
-	Error, ErrorKind,
-	auth::JsClient,
-	fs::file::{HasFileInfo, enums::RemoteFileType, meta::FileMetaChanges},
-	js::{File, FileEnum, UploadFileParams},
-	runtime::{self, do_on_commander},
+	Error, auth::JsClient, fs::file::meta::FileMetaChanges, js::File, runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, future::BoxFuture};
-use wasm_bindgen::prelude::*;
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod wasm_imports {
+	pub(super) use std::{cmp::min, sync::Arc};
+
+	pub(super) use crate::{
+		ErrorKind,
+		fs::file::{enums::RemoteFileType, traits::HasFileInfo},
+		js::{FileEnum, UploadFileParams},
+		runtime,
+		util::WasmResultExt,
+	};
+
+	pub(super) use futures::{
+		AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, future::BoxFuture,
+	};
+	pub(super) use wasm_bindgen::prelude::JsValue;
+}
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_imports::*;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) struct StreamWriter {
 	sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 	// change to stack based future once https://github.com/rust-lang/rust/issues/63063 is stabilized
@@ -18,6 +30,7 @@ pub(crate) struct StreamWriter {
 	current_chunk: Option<Vec<u8>>,
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl StreamWriter {
 	pub fn new(sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
 		Self {
@@ -28,8 +41,10 @@ impl StreamWriter {
 	}
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) const MAX_BUFFER_SIZE_BEFORE_FLUSH: usize = 64 * 1024; // 64 KB
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 async fn make_flush_fut(
 	sender: tokio::sync::mpsc::Sender<Vec<u8>>,
 	chunk: Vec<u8>,
@@ -37,6 +52,7 @@ async fn make_flush_fut(
 	sender.send(chunk).await.map_err(std::io::Error::other)
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl StreamWriter {
 	fn get_or_make_flush_fut(
 		&mut self,
@@ -62,6 +78,7 @@ impl StreamWriter {
 	}
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl AsyncWrite for StreamWriter {
 	fn poll_write(
 		self: std::pin::Pin<&mut Self>,
@@ -161,11 +178,13 @@ impl AsyncWrite for StreamWriter {
 	}
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 struct StreamReader {
 	receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
 	current_chunk: Option<Vec<u8>>,
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 impl AsyncRead for StreamReader {
 	fn poll_read(
 		mut self: std::pin::Pin<&mut Self>,
@@ -197,13 +216,14 @@ impl AsyncRead for StreamReader {
 	}
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) fn spawn_write_future(
 	mut data_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
 	mut writer: wasm_streams::writable::IntoAsyncWrite<'static>,
 	progress_callback: Option<impl Fn(u64) + 'static>,
 	result_sender: tokio::sync::oneshot::Sender<Result<(), Error>>,
 ) {
-	runtime::spawn_local(async move {
+	crate::runtime::spawn_local(async move {
 		let mut read = 0u64;
 
 		while let Some(data) = data_receiver.recv().await {
@@ -214,7 +234,7 @@ pub(crate) fn spawn_write_future(
 				)));
 				return;
 			}
-			read += u64::try_from(data.len()).unwrap_throw();
+			read += u64::try_from(data.len()).unwrap_or_throw();
 			if let Some(callback) = &progress_callback {
 				callback(read);
 			}
@@ -231,17 +251,11 @@ pub(crate) fn spawn_write_future(
 	});
 }
 
-#[wasm_bindgen(js_class = "Client")]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 impl JsClient {
-	#[wasm_bindgen(js_name = "getFile")]
-	pub async fn get_file_js(&self, uuid: UuidStr) -> Result<File, Error> {
-		let this = self.inner();
-		do_on_commander(move || async move { this.get_file(uuid).await.map(File::from) }).await
-		// Ok(self.get_file(uuid).awaiDt?.into())
-	}
-
-	#[wasm_bindgen(js_name = "uploadFile")]
-	pub async fn upload_file_js(
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "uploadFile")]
+	pub async fn upload_file(
 		&self,
 		data: Vec<u8>,
 		params: UploadFileParams,
@@ -259,8 +273,8 @@ impl JsClient {
 		Ok(file.into())
 	}
 
-	#[wasm_bindgen(js_name = "downloadFile")]
-	pub async fn download_file_js(&self, file: FileEnum) -> Result<Vec<u8>, Error> {
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFile")]
+	pub async fn download_file(&self, file: FileEnum) -> Result<Vec<u8>, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
 			this.download_file(&RemoteFileType::try_from(file)?).await
@@ -268,26 +282,8 @@ impl JsClient {
 		.await
 	}
 
-	#[wasm_bindgen(js_name = "trashFile")]
-	pub async fn trash_file_js(&self, file: File) -> Result<File, Error> {
-		let this = self.inner();
-		do_on_commander(move || async move {
-			let mut file = file.try_into()?;
-			this.trash_file(&mut file).await?;
-			Ok(file.into())
-		})
-		.await
-	}
-
-	#[wasm_bindgen(js_name = "deleteFilePermanently")]
-	pub async fn delete_file_permanently_js(&self, file: File) -> Result<(), Error> {
-		let this = self.inner();
-		do_on_commander(move || async move { this.delete_file_permanently(file.try_into()?).await })
-			.await
-	}
-
-	#[wasm_bindgen(js_name = "downloadFileToWriter")]
-	pub async fn download_file_to_writer_js(
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFileToWriter")]
+	pub async fn download_file_to_writer(
 		&self,
 		params: crate::js::DownloadFileStreamParams,
 	) -> Result<(), Error> {
@@ -341,8 +337,8 @@ impl JsClient {
 			.await
 	}
 
-	#[wasm_bindgen(js_name = "uploadFileFromReader")]
-	pub async fn upload_file_from_reader_js(
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "uploadFileFromReader")]
+	pub async fn upload_file_from_reader(
 		&self,
 		params: crate::js::UploadFileStreamParams,
 	) -> Result<File, JsValue> {
@@ -438,9 +434,52 @@ impl JsClient {
 
 		Ok(file.into())
 	}
+}
 
-	#[wasm_bindgen(js_name = "updateFileMetadata")]
-	pub async fn update_file_metadata_js(
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl JsClient {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getFile")
+	)]
+	pub async fn get_file(&self, uuid: UuidStr) -> Result<File, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.get_file(uuid).await.map(File::from) }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "trashFile")
+	)]
+	pub async fn trash_file(&self, file: File) -> Result<File, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			let mut file = file.try_into()?;
+			this.trash_file(&mut file).await?;
+			Ok(file.into())
+		})
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteFilePermanently")
+	)]
+	pub async fn delete_file_permanently(&self, file: File) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.delete_file_permanently(file.try_into()?).await })
+			.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "updateFileMetadata")
+	)]
+	pub async fn update_file_metadata(
 		&self,
 		file: File,
 		changes: FileMetaChanges,

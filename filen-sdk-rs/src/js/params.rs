@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::{
@@ -9,7 +10,7 @@ use crate::{
 		dir::UnsharedDirectoryType,
 		file::{FileBuilder, RemoteFile},
 	},
-	js::{DateTime, Dir, DirEnum, File},
+	js::{Dir, DirEnum, File},
 };
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::{fs::zip::ZipProgressCallback, js::ManagedFuture, runtime};
@@ -29,6 +30,7 @@ use web_sys::js_sys::{self, BigInt, Function};
 	derive(Tsify),
 	tsify(from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(untagged)]
 pub enum NonRootItem {
 	File(File),
@@ -47,6 +49,7 @@ impl TryFrom<NonRootItem> for NonRootFSObject<'static> {
 
 #[derive(Deserialize)]
 #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileBuilderParams {
 	pub parent: DirEnum,
 	pub name: String,
@@ -55,18 +58,19 @@ pub struct FileBuilderParams {
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "filen_types::serde::time::optional", default)]
-	pub created: Option<DateTime>,
+	pub created: Option<DateTime<Utc>>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint")
 	)]
 	#[serde(with = "filen_types::serde::time::optional", default)]
-	pub modified: Option<DateTime>,
+	pub modified: Option<DateTime<Utc>>,
 	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub mime: Option<String>,
 }
 
@@ -76,6 +80,7 @@ pub struct FileBuilderParams {
 	derive(Tsify),
 	tsify(from_wasm_abi)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[serde(rename_all = "camelCase")]
 pub struct UploadFileParams {
 	#[serde(flatten)]
@@ -148,12 +153,12 @@ pub struct DownloadFileStreamParams {
 	pub managed_future: ManagedFuture,
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen::prelude::wasm_bindgen]
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 unsafe extern "C" {
-	#[wasm_bindgen(extends = Function, is_type_of = JsValue::is_function, typescript_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void")]
+	#[wasm_bindgen::prelude::wasm_bindgen(extends = Function, is_type_of = JsValue::is_function, typescript_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void")]
 	pub type ZipProgressCallbackJS;
-	#[wasm_bindgen(method, catch, js_name = call)]
+	#[wasm_bindgen::prelude::wasm_bindgen(method, catch, js_name = call)]
 	pub unsafe fn call4(
 		this: &ZipProgressCallbackJS,
 		context: &JsValue,

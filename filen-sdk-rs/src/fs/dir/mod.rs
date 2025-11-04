@@ -21,7 +21,7 @@ use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
 pub mod client_impl;
 pub mod enums;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js_impl;
 pub mod meta;
 pub mod traits;

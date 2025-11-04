@@ -33,8 +33,10 @@ jobs:
       - name: Install dependencies for avif-decoder
         run: |
           sudo apt-get install -y libdav1d-dev pkg-config
-      - name: Run clippy
+      - name: Run clippy all features
         run: cargo clippy --all-features -- -D warnings
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
       - name: Run clippy on tests
         run: cargo clippy --tests -- -D warnings
       - name: Run rustfmt
@@ -71,8 +73,10 @@ jobs:
           choco install pkgconfiglite --allow-empty-checksums
           vcpkg install dav1d:x64-windows
           echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
-      - name: Run clippy
+      - name: Run clippy all features
         run: cargo clippy --all-features -- -D warnings
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
 
   ci-macos:
     # also runs iOS and Android clippy
@@ -113,8 +117,10 @@ jobs:
           brew install dav1d pkg-config
       - name: Run clippy Android
         run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder -- -D warnings
-      - name: Run clippy
+      - name: Run clippy all features
         run: cargo clippy --all-features -- -D warnings
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
       - name: Run clippy iOS
         run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder -- -D warnings
 

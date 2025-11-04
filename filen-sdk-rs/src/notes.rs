@@ -32,6 +32,7 @@ use crypto::*;
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteTag {
 	uuid: UuidStr,
 	// none if decryption fails
@@ -101,6 +102,7 @@ struct NoteParticipantParts {
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteParticipant {
 	user_id: u64,
 	is_owner: bool,
@@ -134,6 +136,7 @@ impl NoteParticipant {
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Note {
 	uuid: UuidStr,
 	owner_id: u64,
@@ -243,6 +246,7 @@ impl Note {
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteHistory {
 	id: u64,
 	#[cfg_attr(
@@ -1029,55 +1033,85 @@ impl Client {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
 pub mod js_impls {
-	use std::borrow::Cow;
-
 	use filen_types::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
-	use serde::Serialize;
-	use tsify::Tsify;
-	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 	use crate::{
-		Error, auth::JsClient, connect::js_impls::Contact, fs::dir::js_impl::tuple_to_jsvalue,
-		notes::NoteParticipant, runtime::do_on_commander,
+		Error, auth::JsClient, connect::js_impls::Contact, notes::NoteParticipant,
+		runtime::do_on_commander,
 	};
 
 	use super::{Note, NoteHistory, NoteTag};
 
-	#[derive(Serialize, Tsify)]
-	#[tsify(into_wasm_abi)]
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		derive(serde::Serialize, tsify::Tsify),
+		tsify(into_wasm_abi)
+	)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 	pub struct DuplicateNoteResponse {
 		pub original: Note,
 		pub duplicated: Note,
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		derive(serde::Serialize, tsify::Tsify),
+		tsify(into_wasm_abi)
+	)]
+	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+	pub struct AddTagToNoteResponse {
+		pub note: Note,
+		pub tag: NoteTag,
 	}
 
 	/// Decrypts note data using the provided chat key.
 	/// Meant to be used in socket event handlers where this cannot currently be done automatically.
 	///
 	/// Should not be used outside of that context.
-	#[wasm_bindgen(js_name = "decrypMetaWithNoteKey")]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "decryptMetaWithNoteKey")]
 	pub async fn decrypt_meta_with_note_key(
 		note: Note,
 		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: String,
 	) -> Result<String, Error> {
 		do_on_commander(move || async move {
-			note.decrypt_string(&EncryptedString(Cow::Owned(encrypted)))
+			note.decrypt_string(&EncryptedString(std::borrow::Cow::Owned(encrypted)))
 				.await
 		})
 		.await
 	}
 
-	#[wasm_bindgen(js_class = "Client")]
+	#[cfg(feature = "uniffi")]
+	#[uniffi::export]
+	pub async fn decrypt_meta_with_note_key(
+		note: Note,
+		encrypted: EncryptedString<'static>,
+	) -> Result<String, Error> {
+		do_on_commander(move || async move { note.decrypt_string(&encrypted).await }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
 	impl JsClient {
-		#[wasm_bindgen(js_name = "listNotes")]
-		pub async fn js_list_notes(&self) -> Result<Vec<Note>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "listNotes")
+		)]
+		pub async fn list_notes(&self) -> Result<Vec<Note>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.list_notes().await }).await
 		}
 
-		#[wasm_bindgen(js_name = "addNoteParticipant")]
-		pub async fn js_add_note_participant(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "addNoteParticipant")
+		)]
+		pub async fn add_note_participant(
 			&self,
 			mut note: Note,
 			contact: Contact,
@@ -1092,8 +1126,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "removeNoteParticipant")]
-		pub async fn js_remove_note_participant(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "removeNoteParticipant")
+		)]
+		pub async fn remove_note_participant(
 			&self,
 			mut note: Note,
 			participant_id: u64,
@@ -1107,10 +1144,13 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "setNoteParticipantPermission")]
-		pub async fn js_set_note_participant_permission(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNoteParticipantPermission")
+		)]
+		pub async fn set_note_participant_permission(
 			&self,
-			#[wasm_bindgen(js_name = "noteUuid")] note_uuid: UuidStr,
+			note_uuid: UuidStr,
 			mut participant: NoteParticipant,
 			write: bool,
 		) -> Result<NoteParticipant, Error> {
@@ -1123,26 +1163,38 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "getNote")]
-		pub async fn js_get_note(&self, note_uuid: UuidStr) -> Result<Option<Note>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "getNote")
+		)]
+		pub async fn get_note(&self, note_uuid: UuidStr) -> Result<Option<Note>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.get_note(note_uuid).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "createNote")]
-		pub async fn js_create_note(&self, title: Option<String>) -> Result<Note, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "createNote")
+		)]
+		pub async fn create_note(&self, title: Option<String>) -> Result<Note, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.create_note(title).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "getNoteContent")]
-		pub async fn js_get_note_content(&self, mut note: Note) -> Result<Option<String>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "getNoteContent")
+		)]
+		pub async fn get_note_content(&self, mut note: Note) -> Result<Option<String>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.get_note_content(&mut note).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "setNoteType")]
-		pub async fn js_set_note_type(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNoteType")
+		)]
+		pub async fn set_note_type(
 			&self,
 			mut note: Note,
 			note_type: NoteType,
@@ -1157,8 +1209,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "setNoteContent")]
-		pub async fn js_set_note_content(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNoteContent")
+		)]
+		pub async fn set_note_content(
 			&self,
 			mut note: Note,
 			new_content: String,
@@ -1173,8 +1228,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "setNoteTitle")]
-		pub async fn js_set_note_title(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNoteTitle")
+		)]
+		pub async fn set_note_title(
 			&self,
 			mut note: Note,
 			new_title: String,
@@ -1187,14 +1245,20 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "deleteNote")]
-		pub async fn js_delete_note(&self, note: Note) -> Result<(), Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteNote")
+		)]
+		pub async fn delete_note(&self, note: Note) -> Result<(), Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.delete_note(note).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "archiveNote")]
-		pub async fn js_archive_note(&self, mut note: Note) -> Result<Note, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveNote")
+		)]
+		pub async fn archive_note(&self, mut note: Note) -> Result<Note, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.archive_note(&mut note).await?;
@@ -1203,8 +1267,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "trashNote")]
-		pub async fn js_trash_note(&self, mut note: Note) -> Result<Note, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "trashNote")
+		)]
+		pub async fn trash_note(&self, mut note: Note) -> Result<Note, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.trash_note(&mut note).await?;
@@ -1213,8 +1280,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "setNoteFavorited")]
-		pub async fn js_set_note_favorited(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNoteFavorited")
+		)]
+		pub async fn set_note_favorited(
 			&self,
 			mut note: Note,
 			favorite: bool,
@@ -1227,12 +1297,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "setNotePinned")]
-		pub async fn js_set_note_pinned(
-			&self,
-			mut note: Note,
-			pinned: bool,
-		) -> Result<Note, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNotePinned")
+		)]
+		pub async fn set_note_pinned(&self, mut note: Note, pinned: bool) -> Result<Note, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.set_note_pinned(&mut note, pinned).await?;
@@ -1241,8 +1310,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "restoreNote")]
-		pub async fn js_restore_note(&self, mut note: Note) -> Result<Note, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "restoreNote")
+		)]
+		pub async fn restore_note(&self, mut note: Note) -> Result<Note, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				this.restore_note(&mut note).await?;
@@ -1251,11 +1323,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "duplicateNote")]
-		pub async fn js_duplicate_note(
-			&self,
-			mut note: Note,
-		) -> Result<DuplicateNoteResponse, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "duplicateNote")
+		)]
+		pub async fn duplicate_note(&self, mut note: Note) -> Result<DuplicateNoteResponse, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
 				let new = this.duplicate_note(&mut note).await?;
@@ -1268,14 +1340,20 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "getNoteHistory")]
-		pub async fn js_get_note_history(&self, note: Note) -> Result<Vec<NoteHistory>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "getNoteHistory")
+		)]
+		pub async fn get_note_history(&self, note: Note) -> Result<Vec<NoteHistory>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.get_note_history(&note).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "restoreNoteFromHistory")]
-		pub async fn js_restore_note_from_history(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "restoreNoteFromHistory")
+		)]
+		pub async fn restore_note_from_history(
 			&self,
 			mut note: Note,
 			history: NoteHistory,
@@ -1288,29 +1366,39 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "listNoteTags")]
-		pub async fn js_list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "listNoteTags")
+		)]
+		pub async fn list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.list_note_tags().await }).await
 		}
 
-		#[wasm_bindgen(unchecked_return_type = "[Note, NoteTag]", js_name = "addTagToNote")]
-		pub async fn js_add_tag_to_note(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "addTagToNote")
+		)]
+		pub async fn add_tag_to_note(
 			&self,
 			mut note: Note,
 			mut tag: NoteTag,
-		) -> Result<JsValue, Error> {
+		) -> Result<AddTagToNoteResponse, Error> {
 			let this = self.inner();
 			let (note, tag) = do_on_commander(move || async move {
 				this.add_tag_to_note(&mut note, &mut tag).await?;
 				Ok::<_, Error>((note, tag))
 			})
 			.await?;
-			Ok(tuple_to_jsvalue!(note, tag))
+
+			Ok(AddTagToNoteResponse { note, tag })
 		}
 
-		#[wasm_bindgen(js_name = "removeTagFromNote")]
-		pub async fn js_remove_tag_from_note(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "removeTagFromNote")
+		)]
+		pub async fn remove_tag_from_note(
 			&self,
 			mut note: Note,
 			tag: NoteTag,
@@ -1323,14 +1411,20 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "createNoteTag")]
-		pub async fn js_create_note_tag(&self, name: String) -> Result<NoteTag, Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "createNoteTag")
+		)]
+		pub async fn create_note_tag(&self, name: String) -> Result<NoteTag, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.create_note_tag(name).await }).await
 		}
 
-		#[wasm_bindgen(js_name = "renameNoteTag")]
-		pub async fn js_rename_note_tag(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "renameNoteTag")
+		)]
+		pub async fn rename_note_tag(
 			&self,
 			mut tag: NoteTag,
 			new_name: String,
@@ -1343,8 +1437,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "setNoteTagFavorited")]
-		pub async fn js_set_note_tag_favorited(
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNoteTagFavorited")
+		)]
+		pub async fn set_note_tag_favorited(
 			&self,
 			mut tag: NoteTag,
 			favorite: bool,
@@ -1357,8 +1454,11 @@ pub mod js_impls {
 			.await
 		}
 
-		#[wasm_bindgen(js_name = "deleteNoteTag")]
-		pub async fn js_delete_note_tag(&self, tag: NoteTag) -> Result<(), Error> {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteNoteTag")
+		)]
+		pub async fn delete_note_tag(&self, tag: NoteTag) -> Result<(), Error> {
 			let this = self.inner();
 			do_on_commander(move || async move { this.delete_note_tag(tag).await }).await
 		}
