@@ -37,8 +37,7 @@ jobs:
           ndk-version: 27.0.12077973
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ''
-          shared-key: cargo-build-release-js
+          key: cargo-build-release-js
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/cache-cargo-install-action@v2
         with:

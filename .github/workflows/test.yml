@@ -9,11 +9,11 @@ on:
 
   # Run on push if commit message contains [test]
   push:
-    branches: ["**"]
+    branches: ['**']
 
   # Run on PR if title or description contains [test]
   pull_request:
-    branches: ["**"]
+    branches: ['**']
 
 concurrency:
   group: test-${{ github.ref }}
@@ -41,8 +41,7 @@ jobs:
           toolchain: nightly-2025-08-14
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ''
-          shared-key: cargo-build-test-${{ matrix.os }}
+          key: cargo-build-test-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
         if: runner.os == 'Linux'
@@ -93,8 +92,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ''
-          shared-key: cargo-build-release-wasm
+          key: cargo-build-test-wasm
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
