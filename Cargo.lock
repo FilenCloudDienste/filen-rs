@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "filen-sdk-rs"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "aes-gcm",
  "android_logger",
