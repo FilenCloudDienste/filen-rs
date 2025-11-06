@@ -41,7 +41,8 @@ jobs:
           toolchain: nightly-2025-08-14
       - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
-          key: cargo-build-test-${{ matrix.os }}
+          shared-key: cargo-build-test-${{ matrix.os }}
+          prefix-key: ''
           add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
@@ -93,7 +94,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
-          key: cargo-build-test-wasm
+          shared-key: cargo-build-test-wasm
+          prefix-key: ''
           add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/cache-cargo-install-action@v2
