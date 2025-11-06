@@ -40,7 +40,6 @@ jobs:
           shared-key: cargo-build-release-js
           prefix-key: ''
           add-rust-environment-hash-key: 'false'
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
           # waiting on a new release that includes
