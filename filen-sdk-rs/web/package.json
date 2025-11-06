@@ -8,7 +8,7 @@
     "ubrn:ios": "ubrn build ios --and-generate",
     "ubrn:android": "ubrn build android --and-generate",
     "ubrn:checkout": "ubrn checkout",
-    "ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release"
+    "ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release --and-generate"
   },
   "homepage": "https://github.com/FilenCloudDienste/filen-rs",
   "author": "Filen",
