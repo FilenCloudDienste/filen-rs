@@ -16,9 +16,12 @@
     "Enduriel <endur1el@protonmail.com>"
   ],
   "files": [
-    "browser",
-    "filen-sdk-worker-thread.js",
+    "sdk-rs_bg.wasm",
+    "sdk-rs_bg.wasm.d.ts",
+    "sdk-rs.d.ts",
+    "sdk-rs.js",
     "snippets",
+    "filen-sdk-worker-thread.js",
     "android/src/main/",
     "android/build.gradle",
     "android/CMakeLists.txt",
@@ -29,7 +32,7 @@
     "src",
     "SdkRs.podspec"
   ],
-  "main": "./browser/sdk-rs.js",
+  "main": "./sdk-rs.js",
   "react-native": "./src/index.tsx",
   "exports": {
     ".": {
@@ -38,13 +41,16 @@
         "types": "./src/index.tsx"
       },
       "browser": {
-        "import": "./browser/sdk-rs.js",
-        "types": "./browser/sdk-rs.d.ts"
-      }
-    }
+        "import": "./sdk-rs.js",
+        "types": "./sdk-rs.d.ts"
+      },
+      "types": "./sdk-rs.d.ts",
+      "default": "./sdk-rs.js"
+    },
+    "./sdk-rs_bg.wasm": "./sdk-rs_bg.wasm"
   },
   "sideEffects": [
-    "/browser/sdk-rs.js"
+    "./sdk-rs.js"
   ],
   "license": "AGPL-3.0-only",
   "keywords": [

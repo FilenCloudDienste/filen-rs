@@ -10,7 +10,7 @@ import init, {
 	EventListenerHandle,
 	type SocketEvent,
 	decryptMetaWithChatKey
-} from "./browser/sdk-rs.js"
+} from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
 
