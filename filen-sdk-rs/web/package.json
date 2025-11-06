@@ -1,28 +1,52 @@
 {
   "name": "@filen/sdk-rs",
   "version": "0.3.20",
-  "description": "Filen WASM SDK using filen-sdk-rs",
+  "description": "Filen JS SDK using filen-sdk-rs",
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "ubrn:ios": "ubrn build ios --and-generate",
+    "ubrn:android": "ubrn build android --and-generate",
+    "ubrn:checkout": "ubrn checkout",
+    "ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release"
   },
+  "homepage": "https://github.com/FilenCloudDienste/filen-rs",
   "author": "Filen",
   "collaborators": [
     "Enduriel <endur1el@protonmail.com>"
   ],
   "files": [
-    "sdk-rs.js",
-    "sdk-rs.d.ts",
-    "sdk-rs_bg.wasm",
-    "sdk-rs_bg.wasm.d.ts",
-    "snippets"
+    "browser",
+    "filen-sdk-worker-thread.js",
+    "snippets",
+    "android/build/src/main",
+    "android/build/build.gradle",
+    "android/build/CMakeLists.txt",
+    "android/build/cpp-adapter.cpp",
+    "cpp",
+    "ios",
+    "FilenSdkRsFramework.xcframework",
+    "src",
+    "SdkRs.podspec"
   ],
-  "main": "sdk-rs.js",
-  "types": "sdk-rs.d.ts",
+  "main": "./browser/sdk-rs.js",
+  "react-native": "./src/index.tsx",
+  "exports": {
+    ".": {
+      "react-native": {
+        "source": "./src/index.tsx",
+        "types": "./src/index.tsx"
+      },
+      "browser": {
+        "import": "./browser/sdk-rs.js",
+        "types": "./browser/sdk-rs.d.ts"
+      }
+    }
+  },
   "sideEffects": [
-    "/sdk-rs.js"
+    "/browser/sdk-rs.js"
   ],
-  "license": "AGPLv3",
+  "license": "AGPL-3.0-only",
   "keywords": [
     "filen"
   ],
@@ -42,5 +66,16 @@
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.5.0",
     "vitest": "^3.2.4"
+  },
+  "codegenConfig": {
+    "name": "FilenSdkRsTurboModule",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "io.filen.sdkrsturbomodule"
+    }
+  },
+  "dependencies": {
+    "uniffi-bindgen-react-native": "github:Enduriel/uniffi-bindgen-react-native#430b88aca9d09d0f02f7871a34c123e64ed4f0ef"
   }
 }

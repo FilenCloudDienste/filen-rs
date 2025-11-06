@@ -5,3 +5,11 @@
 /sdk-rs.d.ts
 /snippets
 /__screenshots__
+/browser
+/react-native
+/android
+/cpp
+/ios
+/FilenSdkRsFramework.xcframework
+/src
+/SdkRs.podspec
