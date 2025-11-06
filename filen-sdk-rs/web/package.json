@@ -64,11 +64,14 @@
     "node": ">=23"
   },
   "devDependencies": {
+    "@types/serviceworker": "^0.0.165",
     "@vitest/browser": "^3.2.4",
     "@zip.js/zip.js": "^2.7.72",
     "playwright": "^1.56.0",
     "typescript": "~5.8.3",
     "vite": "^7.1.2",
+    "vite-plugin-node-polyfills": "^0.24.0",
+    "vite-plugin-pwa": "^1.1.0",
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.5.0",
     "vitest": "^3.2.4"

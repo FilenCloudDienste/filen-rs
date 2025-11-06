@@ -1,0 +1,60 @@
+{
+	"files.eol": "\n",
+	"editor.formatOnPaste": false,
+	"editor.formatOnSave": true,
+	"editor.formatOnType": false,
+	"editor.defaultFormatter": "esbenp.prettier-vscode",
+	"editor.codeActionsOnSave": {
+		"source.fixAll.eslint": "never",
+		"source.fixAll.format": "never"
+	},
+	"typescript.tsdk": "node_modules\\typescript\\lib",
+	"files.readonlyInclude": {
+		"**/routeTree.gen.ts": true
+	},
+	"files.watcherExclude": {
+		"**/routeTree.gen.ts": true
+	},
+	"search.exclude": {
+		"**/routeTree.gen.ts": true
+	},
+	"eslint.validate": ["javascript", "javascriptreact", "html", "typescriptreact", "javascriptreact", "typescript"],
+	"eslint.useFlatConfig": true,
+	"eslint.enable": true,
+	"eslint.format.enable": false,
+	"editor.quickSuggestions": {
+		"strings": "on"
+	},
+	"typescript.preferences.autoImportSpecifierExcludeRegexes": ["^(node:)?os$"],
+	"tailwindCSS.classAttributes": [
+		"class",
+		"className",
+		"headerClassName",
+		"contentContainerClassName",
+		"columnWrapperClassName",
+		"endFillColorClassName",
+		"imageClassName",
+		"tintColorClassName",
+		"ios_backgroundColorClassName",
+		"thumbColorClassName",
+		"trackColorOnClassName",
+		"trackColorOffClassName",
+		"selectionColorClassName",
+		"cursorColorClassName",
+		"underlineColorAndroidClassName",
+		"placeholderTextColorClassName",
+		"selectionHandleColorClassName",
+		"colorsClassName",
+		"progressBackgroundColorClassName",
+		"titleColorClassName",
+		"underlayColorClassName",
+		"colorClassName",
+		"drawerBackgroundColorClassName",
+		"statusBarBackgroundColorClassName",
+		"backdropColorClassName",
+		"backgroundColorClassName",
+		"ListFooterComponentClassName",
+		"ListHeaderComponentClassName"
+	],
+	"tailwindCSS.classFunctions": ["useResolveClassNames"]
+}
