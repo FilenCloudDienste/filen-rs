@@ -64,9 +64,12 @@ pub fn init() {
 	}
 	#[cfg(target_os = "ios")]
 	{
-		oslog::OsLogger::new("io.filen.filen-sdk-rs")
+		if let Err(e) = oslog::OsLogger::new("io.filen.filen-sdk-rs")
 			.level_filter(log::LevelFilter::Info)
-			.init();
+			.init()
+		{
+			eprintln!("Failed to initialize oslog logger: {}", e);
+		}
 	}
 }
 
