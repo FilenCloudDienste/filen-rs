@@ -82,6 +82,6 @@
     }
   },
   "dependencies": {
-    "uniffi-bindgen-react-native": "github:Enduriel/uniffi-bindgen-react-native#430b88aca9d09d0f02f7871a34c123e64ed4f0ef"
+    "uniffi-bindgen-react-native": "github:Enduriel/uniffi-bindgen-react-native#e0282ad3eb972eaea74225dcc06247b7a67204dd"
   }
 }
