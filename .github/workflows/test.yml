@@ -42,6 +42,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cargo-build-test-${{ matrix.os }}
+          add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
         if: runner.os == 'Linux'
@@ -93,6 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cargo-build-test-wasm
+          add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/cache-cargo-install-action@v2
         with:

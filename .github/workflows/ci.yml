@@ -24,6 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cargo-build-ci-linux-latest
+          add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install C++ Build Dependencies
         run: |
@@ -63,6 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cargo-build-ci-windows-latest
+          add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dependencies for avif-decoder
         run: |
@@ -92,6 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cargo-build-ci-macos-latest
+          add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Setup JDK 17
         uses: actions/setup-java@v4
@@ -136,6 +139,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cargo-build-ci-wasm
+          add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run clippy
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
