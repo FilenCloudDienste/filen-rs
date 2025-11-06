@@ -1,6 +1,6 @@
 {
   "name": "@filen/sdk-rs",
-  "version": "0.3.21",
+  "version": "0.3.22",
   "description": "Filen JS SDK using filen-sdk-rs",
   "type": "module",
   "scripts": {
