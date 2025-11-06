@@ -35,7 +35,7 @@ jobs:
           build-tools-version: 35.0.0
           cmake-version: 3.10.2.4988404
           ndk-version: 27.0.12077973
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           key: cargo-build-release-js
           add-rust-environment-hash-key: 'false'

@@ -21,7 +21,7 @@ jobs:
         with:
           toolchain: nightly-2025-08-14
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           key: cargo-build-ci-linux-latest
           add-rust-environment-hash-key: 'false'
@@ -61,7 +61,7 @@ jobs:
         with:
           toolchain: nightly-2025-08-14
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           key: cargo-build-ci-windows-latest
           add-rust-environment-hash-key: 'false'
@@ -91,7 +91,7 @@ jobs:
           toolchain: nightly-2025-08-14
           components: clippy,rustfmt
           targets: aarch64-apple-ios,aarch64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           key: cargo-build-ci-macos-latest
           add-rust-environment-hash-key: 'false'
@@ -136,7 +136,7 @@ jobs:
           toolchain: nightly-2025-08-14
           components: clippy,rustfmt
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           key: cargo-build-ci-wasm
           add-rust-environment-hash-key: 'false'
