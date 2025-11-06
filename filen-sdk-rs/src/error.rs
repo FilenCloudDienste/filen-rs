@@ -127,9 +127,16 @@ impl FilenSDKError {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(getter)
 	)]
-	// #[cfg_attr(feature = "uniffi", uniffi::method)]
 	pub fn kind(&self) -> ErrorKind {
 		self.kind
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen
+	)]
+	pub fn message(&self) -> String {
+		format!("{}", self)
 	}
 }
 
@@ -141,12 +148,6 @@ impl FilenSDKError {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "toString")]
 	pub fn js_to_string(&self) -> String {
-		format!("{}", self)
-	}
-
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	#[wasm_bindgen::prelude::wasm_bindgen(getter, js_name = "message")]
-	pub fn js_message(&self) -> String {
 		format!("{}", self)
 	}
 }
