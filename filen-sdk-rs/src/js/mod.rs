@@ -64,10 +64,10 @@ pub struct LoginParams {
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "string")
 	)]
-	// #[cfg_attr(
-	// 	feature = "uniffi",
-	// 	uniffi(default = None)
-	// )]
+	#[cfg_attr(
+		feature = "uniffi",
+		uniffi(default = None)
+	)]
 	pub two_factor_code: Option<String>,
 }
 
