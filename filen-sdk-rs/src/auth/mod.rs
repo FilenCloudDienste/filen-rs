@@ -42,7 +42,7 @@ use crate::{
 };
 
 #[cfg(feature = "wasm-full")]
-use crate::sockets::{SocketConfig, SocketConnectionState};
+use crate::socket::{SocketConfig, SocketConnectionState};
 
 pub mod http;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]

@@ -1169,7 +1169,7 @@ mod js_impl {
 		Error,
 		auth::JsClient,
 		runtime::{self, do_on_commander},
-		sockets::EventListenerHandle,
+		socket::EventListenerHandle,
 	};
 
 	#[cfg_attr(
