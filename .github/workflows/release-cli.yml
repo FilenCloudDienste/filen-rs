@@ -74,6 +74,9 @@ jobs:
       target: ${{ matrix.target }}
       os: ${{ matrix.os }}
       version: ${{ needs.tag.outputs.version }}
+    defaults:
+      run:
+        shell: bash # on windows too
     steps:
       - uses: actions/checkout@v5
       - name: Setup Rust toolchain
