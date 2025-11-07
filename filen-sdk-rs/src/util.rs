@@ -151,6 +151,30 @@ uniffi::custom_type!(DateTime, i64, {
 	},
 });
 
+#[cfg(feature = "multi-threaded-crypto")]
+pub(crate) trait IntoMaybeParallelIterator: rayon::iter::IntoParallelIterator {
+	fn into_maybe_par_iter(self) -> Self::Iter
+	where
+		Self: Sized,
+	{
+		Self::into_par_iter(self)
+	}
+}
+#[cfg(feature = "multi-threaded-crypto")]
+impl<T> IntoMaybeParallelIterator for T where T: rayon::iter::IntoParallelIterator {}
+
+#[cfg(not(feature = "multi-threaded-crypto"))]
+pub(crate) trait IntoMaybeParallelIterator: IntoIterator {
+	fn into_maybe_par_iter(self) -> Self::IntoIter
+	where
+		Self: Sized,
+	{
+		Self::into_iter(self)
+	}
+}
+#[cfg(not(feature = "multi-threaded-crypto"))]
+impl<T> IntoMaybeParallelIterator for T where T: IntoIterator {}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

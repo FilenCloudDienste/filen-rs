@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use futures::TryFutureExt;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "multi-threaded-crypto")]
+use rayon::iter::ParallelIterator;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::ErrorKind;
@@ -26,7 +27,7 @@ use crate::{
 		file::{RemoteFile, meta::FileMeta},
 	},
 	runtime::{blocking_join, do_cpu_intensive},
-	util::PathIteratorExt,
+	util::{IntoMaybeParallelIterator, PathIteratorExt},
 };
 
 use super::{DirectoryType, HasContents, RemoteDirectory, traits::UpdateDirMeta};
@@ -166,7 +167,7 @@ impl Client {
 			let (dirs, files) = blocking_join!(
 				|| response
 					.dirs
-					.into_par_iter()
+					.into_maybe_par_iter()
 					.map(|d| {
 						RemoteDirectory::blocking_from_encrypted(
 							d.uuid,
@@ -181,7 +182,7 @@ impl Client {
 					.collect::<Vec<_>>(),
 				|| response
 					.files
-					.into_par_iter()
+					.into_maybe_par_iter()
 					.map(|f| {
 						let meta =
 							FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
@@ -224,7 +225,7 @@ impl Client {
 			let (dirs, files) = blocking_join!(
 				|| response
 					.dirs
-					.into_par_iter()
+					.into_maybe_par_iter()
 					.filter_map(|response_dir| {
 						Some(RemoteDirectory::blocking_from_encrypted(
 							response_dir.uuid,
@@ -243,7 +244,7 @@ impl Client {
 					.collect::<Vec<_>>(),
 				|| response
 					.files
-					.into_par_iter()
+					.into_maybe_par_iter()
 					.map(|f| {
 						let meta =
 							FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);

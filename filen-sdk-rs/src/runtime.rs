@@ -53,6 +53,7 @@ mod async_scoped_task {
 	///
 	/// # Safety
 	/// The caller must guarantee that the closure does not outlive any references it captures.
+	#[cfg(feature = "multi-threaded-crypto")]
 	unsafe fn spawn_unchecked<F>(f: F)
 	where
 		F: FnOnce() + Send,
@@ -100,20 +101,26 @@ mod async_scoped_task {
 		F: FnOnce() -> R + Send,
 		R: Send,
 	{
-		let (async_sender, async_receiver) = tokio::sync::oneshot::channel::<R>();
+		#[cfg(feature = "multi-threaded-crypto")]
+		{
+			let (async_sender, async_receiver) = tokio::sync::oneshot::channel::<R>();
 
-		let handle = AsyncTaskHandle {
-			async_receiver: ManuallyDrop::new(async_receiver),
-		};
-
-		unsafe {
-			spawn_unchecked(move || {
-				let res = f();
-				let _ = async_sender.send(res);
-			});
-		};
-
-		handle
+			let handle = AsyncTaskHandle {
+				async_receiver: ManuallyDrop::new(async_receiver),
+			};
+			unsafe {
+				spawn_unchecked(move || {
+					let res = f();
+					let _ = async_sender.send(res);
+				});
+			};
+			handle
+		}
+		#[cfg(not(feature = "multi-threaded-crypto"))]
+		{
+			// without being able to spawn on a threadpool, we just run the function asynchronously
+			async move { f() }
+		}
 	}
 }
 pub(crate) use async_scoped_task::do_cpu_intensive;
@@ -632,6 +639,7 @@ where
 /// I want to make a generic version of this but I want to expand the left side before the right side
 /// which I'm not sure how to do in macros while keeping the order of the returned tuple the same
 /// so for now this only supports up to 4 expressions.
+#[cfg(feature = "multi-threaded-crypto")]
 macro_rules! blocking_join {
 	($e:expr) => {
 		$e
@@ -649,10 +657,27 @@ macro_rules! blocking_join {
 	($e1:expr, $e2:expr, $e3:expr, $e4:expr) => {{
 		let (((a, b), c), d) = rayon::join(|| rayon::join(|| rayon::join($e1, $e2), $e3), $e4);
 		(a, b, c, d)
-	}}; // ($($rest:expr),+ $e:expr) => {{
-	    // 	let (left, right) = rayon::join(|| blocking_join!($($rest),+), $e);
-	    // 	(left, right)
-	    // }};
+	}};
+}
+
+// Fallback implementation that just runs the expressions sequentially
+#[cfg(not(feature = "multi-threaded-crypto"))]
+macro_rules! blocking_join {
+	($e:expr) => {
+		$e
+	};
+
+	($e1:expr, $e2:expr) => {
+		($e1(), $e2())
+	};
+
+	($e1:expr, $e2:expr, $e3:expr) => {
+		($e1(), $e2(), $e3())
+	};
+
+	($e1:expr, $e2:expr, $e3:expr, $e4:expr) => {
+		($e1(), $e2(), $e3(), $e4())
+	};
 }
 
 pub(crate) use blocking_join;

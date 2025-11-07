@@ -14,7 +14,8 @@ use filen_types::{
 	traits::CowHelpers,
 };
 use futures::{StreamExt, stream::FuturesUnordered};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "multi-threaded-crypto")]
+use rayon::iter::ParallelIterator;
 
 use crate::{
 	Error, ErrorKind, api,
@@ -25,6 +26,7 @@ use crate::{
 	},
 	error::{MetadataWasNotDecryptedError, ResultExt},
 	runtime::{blocking_join, do_cpu_intensive},
+	util::IntoMaybeParallelIterator,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,7 +371,7 @@ impl Client {
 
 		let messages = do_cpu_intensive(|| {
 			resp.0
-				.into_par_iter()
+				.into_maybe_par_iter()
 				.map(|message| ChatMessage::blocking_decrypt(message, chat.key.as_ref()))
 				.collect::<Vec<_>>()
 		})
@@ -448,7 +450,7 @@ impl Client {
 
 		Ok(do_cpu_intensive(|| {
 			resp.0
-				.into_par_iter()
+				.into_maybe_par_iter()
 				.map(|chat| self.blocking_decrypt_chat(chat))
 				.collect::<Vec<_>>()
 		})

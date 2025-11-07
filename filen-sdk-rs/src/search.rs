@@ -5,7 +5,8 @@ use std::{
 };
 
 use filen_types::api::v3::search::{add::SearchAddItem, find::SearchFindItem};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "multi-threaded-crypto")]
+use rayon::iter::ParallelIterator;
 
 use crate::{
 	api,
@@ -18,6 +19,7 @@ use crate::{
 		file::{RemoteFile, meta::FileMeta},
 	},
 	runtime::do_cpu_intensive,
+	util::IntoMaybeParallelIterator,
 };
 
 pub struct SplitName<'a> {
@@ -163,7 +165,7 @@ impl Client {
 		do_cpu_intensive(|| {
 			response
 				.items
-				.into_par_iter()
+				.into_maybe_par_iter()
 				.map(|item| {
 					let (item, metadata_path) = match item {
 						SearchFindItem::Dir(found_dir) => (

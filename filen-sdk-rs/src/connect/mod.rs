@@ -14,7 +14,8 @@ use filen_types::{
 };
 use fs::{SharedDirectory, SharedFile};
 use futures::stream::{FuturesUnordered, StreamExt};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "multi-threaded-crypto")]
+use rayon::iter::ParallelIterator;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -28,7 +29,7 @@ use crate::{
 		file::{RemoteFile, meta::FileMeta},
 	},
 	runtime::{blocking_join, do_cpu_intensive},
-	util::MaybeSendBoxFuture,
+	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture},
 };
 
 pub mod contacts;
@@ -716,7 +717,7 @@ impl Client {
 			let (dirs, files) = blocking_join!(
 				|| response
 					.dirs
-					.into_par_iter()
+					.into_maybe_par_iter()
 					.map(|d| {
 						RemoteDirectory::blocking_from_encrypted(
 							d.uuid,
@@ -731,7 +732,7 @@ impl Client {
 					.collect::<Vec<_>>(),
 				|| response
 					.files
-					.into_par_iter()
+					.into_maybe_par_iter()
 					.map(|f| {
 						let meta =
 							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
@@ -877,14 +878,14 @@ impl Client {
 				|| {
 					response
 						.dirs
-						.into_par_iter()
+						.into_maybe_par_iter()
 						.map(|d| SharedDirectory::blocking_from_shared_out(d, &*crypter))
 						.collect::<Result<Vec<_>, _>>()
 				},
 				|| {
 					response
 						.files
-						.into_par_iter()
+						.into_maybe_par_iter()
 						.map(|f| SharedFile::blocking_from_shared_out(f, &*crypter))
 						.collect::<Result<Vec<_>, _>>()
 				}
@@ -929,14 +930,14 @@ impl Client {
 				|| {
 					response
 						.dirs
-						.into_par_iter()
+						.into_maybe_par_iter()
 						.map(|d| SharedDirectory::blocking_from_shared_in(d, priv_key))
 						.collect::<Result<Vec<_>, _>>()
 				},
 				|| {
 					response
 						.files
-						.into_par_iter()
+						.into_maybe_par_iter()
 						.map(|f| SharedFile::blocking_from_shared_in(f, priv_key))
 						.collect::<Result<Vec<_>, _>>()
 				}

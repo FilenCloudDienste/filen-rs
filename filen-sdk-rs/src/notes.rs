@@ -9,7 +9,8 @@ use filen_types::{
 	crypto::EncryptedString,
 	fs::UuidStr,
 };
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+#[cfg(feature = "multi-threaded-crypto")]
+use rayon::iter::ParallelIterator;
 use rsa::RsaPublicKey;
 
 use crate::{
@@ -21,6 +22,7 @@ use crate::{
 	},
 	error::{MetadataWasNotDecryptedError, ResultExt},
 	runtime::{blocking_join, do_cpu_intensive},
+	util::IntoMaybeParallelIterator,
 };
 
 use crypto::*;
@@ -373,8 +375,8 @@ impl Client {
 
 		let tags_closure = || {
 			note.tags
-				.par_iter()
-				.map(|tag| NoteTag::blocking_decrypt_with_key(tag, crypter))
+				.into_maybe_par_iter()
+				.map(|tag| NoteTag::blocking_decrypt_with_key(&tag, crypter))
 				.collect::<Vec<_>>()
 		};
 
@@ -436,7 +438,7 @@ impl Client {
 		let notes = do_cpu_intensive(|| {
 			notes
 				.0
-				.into_par_iter()
+				.into_maybe_par_iter()
 				.map(|note| self.blocking_decrypt_note(&*crypter, note))
 				.collect::<Vec<_>>()
 		})
@@ -862,8 +864,8 @@ impl Client {
 		let histories = do_cpu_intensive(|| {
 			let mut histories = histories
 				.0
-				.par_iter()
-				.map(|h| NoteHistory::blocking_decrypt_with_key(h, note_key))
+				.into_maybe_par_iter()
+				.map(|h| NoteHistory::blocking_decrypt_with_key(&h, note_key))
 				.collect::<Vec<_>>();
 			histories.sort_by_key(|h| h.edited_timestamp);
 			histories
@@ -939,8 +941,8 @@ impl Client {
 		let tags = do_cpu_intensive(|| {
 			response
 				.0
-				.par_iter()
-				.map(|tag| NoteTag::blocking_decrypt_with_key(tag, &*crypter))
+				.into_maybe_par_iter()
+				.map(|tag| NoteTag::blocking_decrypt_with_key(&tag, &*crypter))
 				.collect::<Vec<_>>()
 		})
 		.await;
