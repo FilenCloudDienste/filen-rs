@@ -57,19 +57,18 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-          - target: armv7-unknown-linux-gnueabihf
-            os: ubuntu-latest
-          - target: armv7-unknown-linux-musleabihf
-            os: ubuntu-latest
-          - target: arm-unknown-linux-gnueabihf
-            os: ubuntu-latest
-          - target: arm-unknown-linux-musleabihf
-            os: ubuntu-latest
+          #- target: armv7-unknown-linux-gnueabihf
+          #  os: ubuntu-latest
+          #- target: armv7-unknown-linux-musleabihf
+          #  os: ubuntu-latest
+          #- target: arm-unknown-linux-gnueabihf
+          #  os: ubuntu-latest
+          #- target: arm-unknown-linux-musleabihf
+          #  os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            # todo: check if all these targets are even supported
     runs-on: ${{ matrix.os }}
     env:
       target: ${{ matrix.target }}
