@@ -35,7 +35,9 @@ jobs:
         run: |
           sudo apt-get install -y libdav1d-dev pkg-config
       - name: Run clippy all features
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
+      - name: Run clippy single-threaded
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
@@ -76,7 +78,9 @@ jobs:
           vcpkg install dav1d:x64-windows
           echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
       - name: Run clippy all features
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
+      - name: Run clippy single-threaded
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
@@ -121,7 +125,9 @@ jobs:
       - name: Run clippy Android
         run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder -- -D warnings
       - name: Run clippy all features
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
+      - name: Run clippy single-threaded
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy iOS
@@ -145,8 +151,11 @@ jobs:
           prefix-key: ''
           add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run clippy
-        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - name: Run clippy wasm-full
+        run: cargo clippy --target wasm32-unknown-unknown -F wasm-full -- -D warnings
+        working-directory: ./filen-sdk-rs
+      - name: Run clippy service-worker
+        run: cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings
         working-directory: ./filen-sdk-rs
       - name: Run rustfmt in filen-wasm
         run: cargo fmt -- --check
