@@ -97,6 +97,14 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listTrash")
+	)]
+	pub async fn list_trash(&self) -> Result<DirsAndFiles, Error> {
+		self.list_dir_inner_wasm(ParentUuid::Trash).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
 	)]
 	pub async fn list_dir_recursive(&self, dir: DirEnum) -> Result<DirsAndFiles, Error> {
