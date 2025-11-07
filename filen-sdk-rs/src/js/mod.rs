@@ -32,6 +32,7 @@ pub use params::*;
 pub use returned_types::*;
 #[cfg(feature = "uniffi")]
 use rsa::RsaPublicKey;
+#[cfg(feature = "wasm-full")]
 pub(crate) use service_worker::shared::*;
 use shared::*;
 

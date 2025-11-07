@@ -7,6 +7,7 @@ use crate::{
 	fs::file::{enums::RemoteFileType, service_worker::StreamWriter, traits::HasFileInfo},
 };
 
+#[cfg(feature = "wasm-full")]
 use futures::AsyncWriteExt;
 
 use super::shared::*;
