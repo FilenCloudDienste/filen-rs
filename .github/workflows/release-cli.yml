@@ -104,6 +104,11 @@ jobs:
           [target.aarch64-unknown-linux-musl]
           linker = "aarch64-linux-gnu-gcc"
           EOF
+      - name: Install C++ build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
       - name: Install rust target
         run: rustup target add $target
       - name: Run build
