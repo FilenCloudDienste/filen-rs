@@ -125,11 +125,10 @@ jobs:
             chmod +x ./artifact/filen-cli-$version-$target
           fi
       - name: Archive artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
-          name: binaries
-          path: |
-            ./artifact/*
+          name: binaries-${{ matrix.target }}
+          path: ./artifact/*
 
   release:
     needs: ["tag", "build-binaries"]
@@ -165,10 +164,9 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v3
         with:
-          name: binaries
           path: artifacts
       - name: List artifacts
-        run: ls artifacts
+        run: ls -R artifacts
 
       # create release, push readme
       - name: Create GitHub Release with changelog and assets
@@ -178,7 +176,7 @@ jobs:
           repository: FilenCloudDienste/filen-cli-releases
           name: Filen CLI v${{ needs.tag.outputs.version }}
           tag_name: ${{ needs.tag.outputs.version }}
-          files: artifacts/*
+          files: artifacts/**
           body_path: release_notes.md
           prerelease: true
       - name: Copy Readme to target repository
