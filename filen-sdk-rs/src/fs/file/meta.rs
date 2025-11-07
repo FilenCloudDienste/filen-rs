@@ -326,39 +326,23 @@ pub enum CreatedTime {
 
 #[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(from_wasm_abi)
-)]
+#[cfg_attr(feature = "wasm-full", derive(tsify::Tsify), tsify(from_wasm_abi))]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileMetaChanges {
 	#[serde(default)]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "string"))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	name: Option<String>,
 	#[serde(default)]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "string"))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	mime: Option<String>,
 	#[serde(default, with = "filen_types::serde::time::optional")]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	last_modified: Option<DateTime<Utc>>,
 	#[cfg(not(feature = "uniffi"))]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint | null")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint | null"))]
 	#[serde(
 		default,
 		deserialize_with = "crate::serde::deserialize_double_option_timestamp"

@@ -15,6 +15,8 @@ malformed = []
 heif-decoder = ["dep:heif-decoder"]
 avif-decoder = ["image/avif-native"]
 uniffi = ["dep:uniffi", "filen-types/uniffi"]
+wasm-full = ["multi-threaded-crypto"]
+service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 
 [dependencies]

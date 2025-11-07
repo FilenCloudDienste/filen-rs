@@ -1,8 +1,61 @@
 import { defineConfig } from "vite"
+import { VitePWA } from "vite-plugin-pwa"
 import wasm from "vite-plugin-wasm"
+import { nodePolyfills } from "vite-plugin-node-polyfills"
+import topLevelAwait from "vite-plugin-top-level-await"
 
 export default defineConfig({
-	plugins: [wasm()],
+	plugins: [
+		nodePolyfills({
+			include: ["buffer", "path"],
+			globals: {
+				Buffer: true
+			},
+			protocolImports: true
+		}),
+		wasm(),
+		VitePWA({
+			srcDir: "./",
+			filename: "sw.ts",
+			outDir: "dist",
+			strategies: "injectManifest",
+			workbox: {
+				maximumFileSizeToCacheInBytes: Number.MAX_SAFE_INTEGER
+			},
+			injectRegister: false,
+			manifest: false,
+			injectManifest: {
+				injectionPoint: undefined,
+				rollupFormat: "iife",
+				minify: true,
+				sourcemap: true,
+				target: "es2018",
+				buildPlugins: {
+					vite: [
+						nodePolyfills({
+							include: ["buffer", "path"],
+							globals: {
+								Buffer: true
+							},
+							protocolImports: true
+						}),
+						wasm(),
+						topLevelAwait({
+							promiseExportName: "__tla",
+							promiseImportName: i => `__tla_${i}`
+						})
+					]
+				}
+			},
+			devOptions: {
+				enabled: true
+			}
+		}),
+		topLevelAwait({
+			promiseExportName: "__tla",
+			promiseImportName: i => `__tla_${i}`
+		})
+	],
 	server: {
 		headers: {
 			"Cross-Origin-Embedder-Policy": "require-corp",

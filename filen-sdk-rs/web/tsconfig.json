@@ -3,7 +3,7 @@
     "target": "ES2022",
     "useDefineForClassFields": true,
     "module": "ESNext",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": ["DOM", "DOM.Iterable", "WebWorker", "Webworker.Iterable", "esnext", "DOM.AsyncIterable", "WebWorker.AsyncIterable"],
     "skipLibCheck": true,
 
     /* Bundler mode */
@@ -20,5 +20,7 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true,
+
+    "types": ["vite/client"]
   },
 }

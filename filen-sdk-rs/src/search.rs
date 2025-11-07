@@ -245,7 +245,7 @@ impl Client {
 	}
 }
 
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod js_impl {
 	use serde::Serialize;
 

@@ -31,7 +31,7 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -41,7 +41,7 @@ pub struct ChatParticipant {
 	user_id: u64,
 	email: String,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
@@ -49,14 +49,14 @@ pub struct ChatParticipant {
 	nick_name: String,
 	permissions_add: bool,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
 	added: DateTime<Utc>,
 	appear_offline: bool,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
@@ -71,7 +71,7 @@ impl ChatParticipant {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(
 		into_wasm_abi,
@@ -85,20 +85,20 @@ impl ChatParticipant {
 pub struct Chat {
 	uuid: UuidStr,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none")
 	)]
 	last_message: Option<ChatMessage>,
 	owner_id: u64,
 	// none if decryption fails
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
 	key: Option<NoteOrChatKey>,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
@@ -107,13 +107,13 @@ pub struct Chat {
 	participants: Vec<ChatParticipant>,
 	muted: bool,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
 	created: DateTime<Utc>,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "filen_types::serde::time::optional"),
 		tsify(type = "bigint")
 	)]
@@ -193,7 +193,7 @@ impl Chat {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -204,7 +204,7 @@ pub struct ChatMessagePartial {
 	sender_id: u64,
 	sender_email: String,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
@@ -212,7 +212,7 @@ pub struct ChatMessagePartial {
 	sender_nick_name: String,
 	// none if decryption fails
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
@@ -242,7 +242,7 @@ impl ChatMessagePartial {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	// hashmap_as_object is needed here as a workaround to https://github.com/madonoharu/tsify/issues/69
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints, hashmap_as_object),
@@ -251,23 +251,23 @@ impl ChatMessagePartial {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatMessage {
 	chat: UuidStr,
-	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
+	#[cfg_attr(feature = "wasm-full", serde(flatten))]
 	inner: ChatMessagePartial,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none",)
 	)]
 	reply_to: Option<ChatMessagePartial>,
 	embed_disabled: bool,
 	edited: bool,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
 	edited_timestamp: DateTime<Utc>,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
@@ -891,7 +891,7 @@ impl Client {
 	}
 }
 
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls {
 	use chrono::TimeZone;
 	use filen_types::{

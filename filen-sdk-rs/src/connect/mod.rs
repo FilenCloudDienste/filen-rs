@@ -34,7 +34,7 @@ use crate::{
 
 pub mod contacts;
 pub mod fs;
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +101,7 @@ impl PasswordState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
@@ -110,18 +110,12 @@ impl PasswordState {
 pub struct FilePublicLink {
 	link_uuid: UuidStr,
 	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string | Uint8Array")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "string | Uint8Array"))]
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
 	#[serde(with = "serde_bytes")]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "Uint8Array")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "Uint8Array"))]
 	salt: Vec<u8>,
 }
 
@@ -172,7 +166,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi)
 )]
@@ -183,17 +177,11 @@ pub struct DirPublicLink {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	link_key: Option<MetaKey>,
 	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string | Uint8Array")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "string | Uint8Array"))]
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	enable_download: bool,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "Uint8Array")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "Uint8Array"))]
 	#[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
 	salt: Option<Vec<u8>>,
 }

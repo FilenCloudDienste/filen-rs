@@ -14,8 +14,6 @@ import init, {
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
 
-const env = (import.meta as any).env as Record<string, string | undefined>
-
 console.log("Initializing WASM...")
 await init()
 const threads = Math.max((navigator.hardwareConcurrency || 5) - 1, 1)
@@ -49,15 +47,15 @@ function assertNoMaps(value: unknown): boolean {
 beforeAll(async () => {
 	await Promise.all([
 		(async () => {
-			if (!env.VITE_TEST_EMAIL) {
+			if (!import.meta.env.VITE_TEST_EMAIL) {
 				throw new Error("VITE_TEST_EMAIL environment variable is not set")
 			}
-			if (!env.VITE_TEST_PASSWORD) {
+			if (!import.meta.env.VITE_TEST_PASSWORD) {
 				throw new Error("VITE_TEST_PASSWORD environment variable is not set")
 			}
 			state = await login({
-				email: env.VITE_TEST_EMAIL,
-				password: env.VITE_TEST_PASSWORD
+				email: import.meta.env.VITE_TEST_EMAIL,
+				password: import.meta.env.VITE_TEST_PASSWORD
 			})
 
 			listenerHandles.push(
@@ -80,13 +78,13 @@ beforeAll(async () => {
 			testDir = await state.createDir(state.root(), "wasm-test-dir")
 		})(),
 		(async () => {
-			if (!env.VITE_TEST_SHARE_EMAIL) {
+			if (!import.meta.env.VITE_TEST_SHARE_EMAIL) {
 				throw new Error("VITE_TEST_SHARE_EMAIL environment variable is not set")
 			}
-			if (!env.VITE_TEST_SHARE_PASSWORD) {
+			if (!import.meta.env.VITE_TEST_SHARE_PASSWORD) {
 				throw new Error("VITE_TEST_SHARE_PASSWORD environment variable is not set")
 			}
-			shareClient = await login({ email: env.VITE_TEST_SHARE_EMAIL, password: env.VITE_TEST_SHARE_PASSWORD })
+			shareClient = await login({ email: import.meta.env.VITE_TEST_SHARE_EMAIL, password: import.meta.env.VITE_TEST_SHARE_PASSWORD })
 		})()
 	])
 }, 120000)
@@ -424,20 +422,20 @@ test("sharing", async () => {
 	const contacts = await state.getContacts()
 	let contact
 	for (const c of contacts) {
-		if (c.email === env.VITE_TEST_SHARE_EMAIL) {
+		if (c.email === import.meta.env.VITE_TEST_SHARE_EMAIL) {
 			contact = c
 			break
 		}
 	}
 	if (!contact) {
-		const reqUuid = await state.sendContactRequest(env.VITE_TEST_SHARE_EMAIL!)
+		const reqUuid = await state.sendContactRequest(import.meta.env.VITE_TEST_SHARE_EMAIL!)
 		const reqs = await shareClient.listIncomingContactRequests()
 		const req = reqs.find(r => r.uuid === reqUuid)
 		if (!req) {
 			throw new Error("Contact request not found")
 		}
 		await shareClient.acceptContactRequest(req.uuid)
-		contact = (await state.getContacts()).find(c => c.email === env.VITE_TEST_SHARE_EMAIL!)!
+		contact = (await state.getContacts()).find(c => c.email === import.meta.env.VITE_TEST_SHARE_EMAIL!)!
 	}
 	expect(contact).toBeDefined()
 	await state.shareDir(dir, contact)
@@ -461,7 +459,7 @@ test("block", async () => {
 	const contacts = await state.getContacts()
 	let contact
 	for (const c of contacts) {
-		if (c.email === env.VITE_TEST_SHARE_EMAIL) {
+		if (c.email === import.meta.env.VITE_TEST_SHARE_EMAIL) {
 			contact = c
 			break
 		}
@@ -474,9 +472,9 @@ test("block", async () => {
 			await state.cancelContactRequest(req.uuid)
 		}
 	}
-	await state.sendContactRequest(env.VITE_TEST_SHARE_EMAIL!)
+	await state.sendContactRequest(import.meta.env.VITE_TEST_SHARE_EMAIL!)
 	const requests = await shareClient.listIncomingContactRequests()
-	const req = requests.find(r => r.email === env.VITE_TEST_EMAIL)
+	const req = requests.find(r => r.email === import.meta.env.VITE_TEST_EMAIL)
 	if (!req) {
 		throw new Error("Contact request not found")
 	}
@@ -484,7 +482,7 @@ test("block", async () => {
 	await shareClient.blockContact(req.email)
 	const blocked = await shareClient.getBlockedContacts()
 	expect(blocked.length).toBe(1)
-	expect(blocked[0].email).toBe(env.VITE_TEST_EMAIL)
+	expect(blocked[0].email).toBe(import.meta.env.VITE_TEST_EMAIL)
 
 	const requestsAfter = await shareClient.listIncomingContactRequests()
 	expect(requestsAfter.length).toBe(0)
@@ -495,7 +493,7 @@ test("block", async () => {
 
 	const requestsFinal = await shareClient.listIncomingContactRequests()
 	expect(requestsFinal.length).toBe(1)
-	expect(requestsFinal[0].email).toBe(env.VITE_TEST_EMAIL)
+	expect(requestsFinal[0].email).toBe(import.meta.env.VITE_TEST_EMAIL)
 })
 
 test("thumbnail", async () => {
@@ -753,6 +751,45 @@ test("sockets", async () => {
 	expect(await state.isSocketConnected()).toBe(false)
 })
 
+test("service worker", async () => {
+	if (!("serviceWorker" in navigator)) {
+		throw new Error("Service workers are not supported in this environment")
+	}
+
+	const serviceWorker = await window.navigator.serviceWorker.register(
+		import.meta.env.MODE === "production" ? "/sw.js" : "/dev-sw.js?dev-sw",
+		{
+			scope: "/",
+			type: import.meta.env.MODE === "production" ? "classic" : "module"
+		}
+	)
+
+	await serviceWorker.update()
+
+	console.log("Service worker registered:", serviceWorker)
+
+	if (!serviceWorker || !serviceWorker.active) {
+		throw new Error("Service worker is not active")
+	}
+
+	const jsonClient = JSON.stringify(await state.toStringified(), jsonBigIntReplacer)
+
+	const initRes = await fetch(`/serviceWorker/init/?stringifiedClient=${encodeURIComponent(jsonClient)}`)
+	expect(initRes.ok).toBe(true)
+
+	const file = await state.uploadFile(new TextEncoder().encode("service worker file content"), {
+		parent: testDir,
+		name: "sw-file.txt"
+	})
+
+	const stringifiedFile = JSON.stringify(file, jsonBigIntReplacer)
+
+	const res = await fetch("/serviceWorker/download/?file=" + encodeURIComponent(stringifiedFile))
+	expect(res.ok).toBe(true)
+	const text = await res.text()
+	expect(text).toBe("service worker file content")
+})
+
 afterAll(async () => {
 	if (state && testDir) {
 		await state?.deleteDirPermanently(testDir)
@@ -779,4 +816,12 @@ async function streamToUint8Array(readableStream: ReadableStream<Uint8Array>): P
 	}
 
 	return result
+}
+
+export function jsonBigIntReplacer(_: string, value: unknown) {
+	if (typeof value === "bigint") {
+		return `$bigint:${value.toString()}n`
+	}
+
+	return value
 }

@@ -41,17 +41,17 @@ use crate::{
 	sync::lock::ResourceLock,
 };
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(feature = "wasm-full")]
 use crate::sockets::{SocketConfig, SocketConnectionState};
 
 pub mod http;
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls;
 pub mod v1;
 pub mod v2;
 pub mod v3;
 
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub use js_impls::JsClient;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,7 +252,7 @@ pub struct Client {
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
 	pub open_file_semaphore: tokio::sync::Semaphore,
 
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[cfg(feature = "wasm-full")]
 	pub(crate) socket_connection: SocketConnectionState,
 }
 
@@ -303,6 +303,18 @@ pub struct StringifiedClient {
 	#[serde(default)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub max_io_memory_usage: Option<u32>,
+}
+
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "fromStringified")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn from_stringified(serialized: StringifiedClient) -> Result<JsClient, Error> {
+	Ok(JsClient::new(
+		Client::from_stringified(serialized).map_err(Error::from)?,
+	))
 }
 
 impl From<FilenSDKConfig> for StringifiedClient {
@@ -371,7 +383,7 @@ impl Client {
 					.unwrap_or(crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET),
 			),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			#[cfg(feature = "wasm-full")]
 			socket_connection: SocketConnectionState::new(http_client, SocketConfig::default()),
 		})
 	}
@@ -592,7 +604,7 @@ impl Client {
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
 			),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			#[cfg(feature = "wasm-full")]
 			socket_connection: SocketConnectionState::new(http_client, SocketConfig::default()),
 		})
 	}
@@ -821,7 +833,7 @@ impl Client {
 }
 
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(Serialize, tsify::Tsify),
 	tsify(into_wasm_abi)
 )]

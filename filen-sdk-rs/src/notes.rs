@@ -29,7 +29,7 @@ use crypto::*;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -39,20 +39,20 @@ pub struct NoteTag {
 	uuid: UuidStr,
 	// none if decryption fails
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
 	name: Option<String>,
 	favorite: bool,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
 	edited_timestamp: DateTime<Utc>,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
@@ -99,7 +99,7 @@ struct NoteParticipantParts {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -110,7 +110,7 @@ pub struct NoteParticipant {
 	is_owner: bool,
 	email: String,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
@@ -118,7 +118,7 @@ pub struct NoteParticipant {
 	nick_name: String,
 	permissions_write: bool,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
@@ -133,7 +133,7 @@ impl NoteParticipant {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -149,21 +149,21 @@ pub struct Note {
 	note_type: NoteType,
 	// none if decryption fails
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
 	encryption_key: Option<NoteOrChatKey>,
 	// none if decryption fails
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
 	title: Option<String>,
 	// none if decryption fails
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
@@ -171,13 +171,13 @@ pub struct Note {
 	trash: bool,
 	archive: bool,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
 	created_timestamp: DateTime<Utc>,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
@@ -243,7 +243,7 @@ impl Note {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -252,19 +252,19 @@ impl Note {
 pub struct NoteHistory {
 	id: u64,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
 	preview: Option<String>,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
 	content: Option<String>,
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
@@ -1035,7 +1035,7 @@ impl Client {
 	}
 }
 
-#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls {
 	use filen_types::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
 

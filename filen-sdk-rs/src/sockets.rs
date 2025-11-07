@@ -1157,7 +1157,7 @@ impl Client {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(feature = "wasm-full")]
 mod js_impl {
 	use std::borrow::Cow;
 

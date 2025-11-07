@@ -250,3 +250,19 @@ pub async fn register_js(params: RegisterParams) -> Result<(), Error> {
 	})
 	.await
 }
+
+#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub async fn login(params: crate::js::LoginParams) -> Result<JsClient, Error> {
+	log::info!("Logging in user: {:?}", params);
+	let client = do_on_commander(move || async move {
+		Client::login(
+			params.email,
+			&params.password,
+			params.two_factor_code.as_deref().unwrap_or("XXXXXX"),
+		)
+		.await
+	})
+	.await?;
+	Ok(JsClient::new(client))
+}

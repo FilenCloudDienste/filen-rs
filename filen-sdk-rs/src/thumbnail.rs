@@ -79,7 +79,7 @@ impl Client {
 	}
 }
 
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod js_impls {
 	use image::codecs::webp::WebPEncoder;
 	use serde::{Deserialize, Serialize};

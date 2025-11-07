@@ -40,7 +40,11 @@ pub struct ChatMessageEncrypted<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	target_family = "wasm",
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]

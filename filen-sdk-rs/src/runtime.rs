@@ -1,4 +1,4 @@
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(feature = "wasm-full")]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
 mod async_scoped_task {
@@ -160,6 +160,11 @@ mod worker_handle {
 	}
 }
 
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
 mod commander_thread {
 	use std::{mem::ManuallyDrop, pin::Pin, sync::OnceLock};
 
@@ -530,12 +535,12 @@ mod commander_thread {
 		inner_do_on_commander(Some(channel), f)
 	}
 }
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
-pub(crate) use commander_thread::do_on_commander;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub(crate) use commander_thread::{CommanderFutHandle, do_with_pause_channel_on_commander};
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+pub(crate) use commander_thread::{
+	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
+};
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(feature = "wasm-full")]
 mod wasm_threading {
 	use serde::Serialize;
 	use wasm_bindgen::prelude::*;
@@ -604,6 +609,11 @@ mod wasm_threading {
 	}
 }
 
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
 pub fn spawn<F>(f: F)
 where
 	F: FnOnce() + Send + 'static,
@@ -619,6 +629,11 @@ where
 	}
 }
 
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
 pub fn spawn_local<F>(f: F)
 where
 	F: Future<Output = ()> + 'static,

@@ -24,10 +24,12 @@ use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 pub(crate) mod chunk;
 pub mod client_impl;
 pub mod enums;
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impl;
 pub mod meta;
 pub mod read;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) mod service_worker;
 pub mod traits;
 pub mod write;
 

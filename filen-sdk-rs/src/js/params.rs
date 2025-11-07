@@ -3,6 +3,8 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::js::ManagedFuture;
 use crate::{
 	auth::Client,
 	fs::{
@@ -12,17 +14,13 @@ use crate::{
 	},
 	js::{Dir, DirEnum, File},
 };
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use crate::{fs::zip::ZipProgressCallback, js::ManagedFuture, runtime};
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use crate::js::{FileEnum, Item};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use web_sys::js_sys::{self, BigInt, Function};
+use web_sys::js_sys::{self};
 
 #[derive(Deserialize)]
 #[cfg_attr(
@@ -129,109 +127,25 @@ pub struct UploadFileStreamParams {
 	pub progress: js_sys::Function,
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[derive(Deserialize, Tsify)]
-#[tsify(from_wasm_abi, large_number_types_as_bigints)]
+#[derive(Deserialize, Debug)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(from_wasm_abi)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[serde(rename_all = "camelCase")]
-pub struct DownloadFileStreamParams {
-	pub file: FileEnum,
-	#[tsify(type = "WritableStream<Uint8Array>")]
-	#[serde(with = "serde_wasm_bindgen::preserve")]
-	pub writer: web_sys::WritableStream,
-	#[tsify(type = "(bytes: bigint) => void")]
-	#[serde(default, with = "serde_wasm_bindgen::preserve")]
-	pub progress: js_sys::Function,
+pub struct LoginParams {
+	pub email: String,
+	pub password: String,
 	#[serde(default)]
-	#[tsify(type = "bigint")]
-	pub start: Option<u64>,
-	#[serde(default)]
-	#[tsify(type = "bigint")]
-	pub end: Option<u64>,
-	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
-	// #[serde(flatten)]
-	#[serde(default)]
-	pub managed_future: ManagedFuture,
-}
-
-#[wasm_bindgen::prelude::wasm_bindgen]
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-unsafe extern "C" {
-	#[wasm_bindgen::prelude::wasm_bindgen(extends = Function, is_type_of = JsValue::is_function, typescript_type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void")]
-	pub type ZipProgressCallbackJS;
-	#[wasm_bindgen::prelude::wasm_bindgen(method, catch, js_name = call)]
-	pub unsafe fn call4(
-		this: &ZipProgressCallbackJS,
-		context: &JsValue,
-		arg1: &JsValue,
-		arg2: &JsValue,
-		arg3: &JsValue,
-		arg4: &JsValue,
-	) -> Result<JsValue, JsValue>;
-}
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-impl Default for ZipProgressCallbackJS {
-	fn default() -> Self {
-		JsValue::undefined().unchecked_into()
-	}
-}
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-impl ZipProgressCallbackJS {
-	pub(crate) fn into_rust_callback(self) -> Option<impl ZipProgressCallback> {
-		if self.is_undefined() {
-			None
-		} else {
-			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-
-			runtime::spawn_local(async move {
-				while let Some((bytes_written, files_dirs_written, bytes_total, files_dirs_total)) =
-					receiver.recv().await
-				{
-					let _ = unsafe {
-						self.call4(
-							&JsValue::NULL,
-							&BigInt::from(bytes_written).into(),
-							&BigInt::from(files_dirs_written).into(),
-							&BigInt::from(bytes_total).into(),
-							&BigInt::from(files_dirs_total).into(),
-						)
-					};
-				}
-			});
-			Some(
-				move |bytes_written: u64,
-				      files_dirs_written: u64,
-				      bytes_total: u64,
-				      files_dirs_total: u64| {
-					let _ = sender.send((
-						bytes_written,
-						files_dirs_written,
-						bytes_total,
-						files_dirs_total,
-					));
-				},
-			)
-		}
-	}
-}
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[derive(Deserialize, Tsify)]
-#[tsify(from_wasm_abi)]
-#[serde(rename_all = "camelCase")]
-pub struct DownloadFileToZipParams {
-	pub items: Vec<Item>,
-	#[tsify(type = "WritableStream<Uint8Array>")]
-	#[serde(with = "serde_wasm_bindgen::preserve")]
-	pub writer: web_sys::WritableStream,
-	#[serde(default, with = "serde_wasm_bindgen::preserve")]
-	#[tsify(
-		type = "(bytesWritten: bigint, totalBytes: bigint, itemsProcessed: bigint, totalItems: bigint) => void"
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string")
 	)]
-	pub progress: ZipProgressCallbackJS,
-	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
-	// #[serde(flatten)]
-	#[serde(default)]
-	pub managed_future: ManagedFuture,
+	#[cfg_attr(
+		feature = "uniffi",
+		uniffi(default = None)
+	)]
+	pub two_factor_code: Option<String>,
 }

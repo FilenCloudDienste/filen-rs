@@ -88,7 +88,11 @@ pub struct HandShake<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(tag = "type", content = "data", rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi, large_number_types_as_bigints, hashmap_as_object)
 )]
@@ -217,14 +221,22 @@ impl SocketEvent<'_> {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "service-worker")
+))]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_SOCKET_EVENT_TYPE: &str = r#"export type SocketEventType = SocketEvent["type"]"#;
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -235,7 +247,11 @@ pub struct NewEvent<'a> {
 	pub event_type: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -246,7 +262,11 @@ pub struct NewEvent<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -259,7 +279,11 @@ pub struct FileRename<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -273,7 +297,11 @@ pub struct FileArchiveRestored<'a> {
 	// rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -290,7 +318,11 @@ pub struct FileArchiveRestored<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -303,7 +335,11 @@ pub struct FileNew<'a> {
 	// rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -320,7 +356,11 @@ pub struct FileNew<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -333,7 +373,11 @@ pub struct FileRestore<'a> {
 	// rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -350,7 +394,11 @@ pub struct FileRestore<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -363,7 +411,11 @@ pub struct FileMove<'a> {
 	// pub rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -380,7 +432,11 @@ pub struct FileMove<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -391,7 +447,11 @@ pub struct FileTrash {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -402,7 +462,11 @@ pub struct FileArchived {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -415,7 +479,11 @@ pub struct FolderRename<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -427,7 +495,11 @@ pub struct FolderTrash {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -438,7 +510,11 @@ pub struct FolderMove<'a> {
 	pub parent: UuidStr,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -449,7 +525,11 @@ pub struct FolderMove<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -460,7 +540,11 @@ pub struct FolderSubCreated<'a> {
 	pub parent: UuidStr,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -471,7 +555,11 @@ pub struct FolderSubCreated<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -482,7 +570,11 @@ pub struct FolderRestore<'a> {
 	pub parent: UuidStr,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -493,7 +585,11 @@ pub struct FolderRestore<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -506,7 +602,11 @@ pub struct FolderColorChanged<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints, hashmap_as_object)
 )]
@@ -520,7 +620,11 @@ pub struct ChatMessageNew<'a> {
 		deserialize_with = "crate::serde::option::result_to_option::deserialize",
 		skip_serializing_if = "Option::is_none"
 	)]
-	// #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), tsify(optional))]
+	// #[cfg_attr(all(
+	// 	target_family = "wasm",
+	// 	target_os = "unknown",
+	// 	not(feature = "service-worker")
+	// ), tsify(optional))]
 	pub reply_to: Option<ChatMessagePartialEncrypted<'a>>,
 	pub embed_disabled: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -544,7 +648,11 @@ impl<'a> From<ChatMessageNew<'a>> for ChatMessageEncrypted<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -560,7 +668,11 @@ pub struct ChatTyping<'a> {
 	pub sender_id: u64,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
@@ -571,7 +683,11 @@ pub struct ChatTyping<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -581,7 +697,11 @@ pub struct ChatConversationsNew<'a> {
 	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub added_timestamp: DateTime<Utc>,
@@ -590,7 +710,11 @@ pub struct ChatConversationsNew<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -601,7 +725,11 @@ pub struct ChatMessageDelete {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -613,7 +741,11 @@ pub struct NoteContentEdited<'a> {
 	pub editor_id: u64,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub edited_timestamp: DateTime<Utc>,
@@ -622,7 +754,11 @@ pub struct NoteContentEdited<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -633,7 +769,11 @@ pub struct NoteArchived {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -644,7 +784,11 @@ pub struct NoteDeleted {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -657,7 +801,11 @@ pub struct NoteTitleEdited<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -670,7 +818,11 @@ pub struct NoteParticipantPermissions {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -681,7 +833,11 @@ pub struct NoteRestored {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -693,7 +849,11 @@ pub struct NoteParticipantRemoved {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints, hashmap_as_object)
 )]
@@ -706,7 +866,11 @@ pub struct NoteParticipantNew<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -717,7 +881,11 @@ pub struct NoteNew {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -728,7 +896,11 @@ pub struct ChatMessageEmbedDisabled {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -740,7 +912,11 @@ pub struct ChatConversationParticipantLeft {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -751,7 +927,11 @@ pub struct ChatConversationDeleted {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -763,7 +943,11 @@ pub struct ChatMessageEdited<'a> {
 	pub message: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub edited_timestamp: DateTime<Utc>,
@@ -772,7 +956,11 @@ pub struct ChatMessageEdited<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -785,7 +973,11 @@ pub struct ChatConversationNameEdited<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -800,7 +992,11 @@ pub struct ContactRequestReceived<'a> {
 	pub sender_nick_name: Option<Cow<'a, str>>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub sent_timestamp: DateTime<Utc>,
@@ -809,7 +1005,11 @@ pub struct ContactRequestReceived<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -826,7 +1026,11 @@ pub struct ItemFavorite<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -845,7 +1049,11 @@ pub struct ChatConversationParticipantNew<'a> {
 	pub permissions_add: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
+		all(
+			target_family = "wasm",
+			target_os = "unknown",
+			not(feature = "service-worker")
+		),
 		tsify(type = "bigint")
 	)]
 	pub added_timestamp: DateTime<Utc>,
@@ -854,7 +1062,11 @@ pub struct ChatConversationParticipantNew<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -865,7 +1077,11 @@ pub struct FileDeletedPermanent {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -878,7 +1094,11 @@ pub struct FolderMetadataChanged<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
@@ -895,7 +1115,11 @@ pub struct FileMetadataChanged<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		not(feature = "service-worker")
+	),
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
