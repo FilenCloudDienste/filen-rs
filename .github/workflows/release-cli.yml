@@ -1,0 +1,194 @@
+name: Release Filen CLI
+
+# This workflow is used to create releases of filen-cli.
+# To create a new release, create a commit with a message including "release filen-cli vX.Y.Z".
+# Make sure that the version in filen-cli/Cargo.toml matches and
+# that a corresponding changelog entry is found in filen-cli/CHANGELOG.md.
+# A tag will be created like "filen-cli@vX.Y.Z" and a GitHub Release (prerelease) will be created in the release repository.
+# The filen-cli/README.md will be modified according to the "ORIGIN ONLY" and "TARGET ONLY" sections and pushed to the release repository.
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: ["main", "test-cli-releases"] # todo: remove tmp "test-cli-releases" branch
+
+jobs:
+  tag:
+    if: contains(github.event.head_commit.message, 'release filen-cli')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # create tag
+      - name: Create Tag
+        uses: christophebedard/tag-version-commit@v1
+        id: create-tag
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version_regex: "release filen-cli v([0-9]+\\.[0-9]+\\.[0-9]+)"
+          version_assertion_command: 'grep -q "version = \"$version\"" filen-cli/Cargo.toml'
+          version_tag_prefix: "filen-cli@v"
+      - name: Fail if no tag was created
+        if: steps.create-tag.outputs.tag == ''
+        run: |
+          echo "No tag was created. Failing the job."
+          exit 1
+      - name: Extract version from tag name
+        id: extract-version
+        run: |
+          TAG="${{ steps.create-tag.outputs.tag }}"
+          echo "version=${TAG#filen-cli@v}" >> $GITHUB_OUTPUT
+
+  # adapted from https://github.com/nicolas-van/rust-cross-compile-example/blob/main/.github/workflows/rust.yml
+  build-binaries:
+    needs: tag
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-latest
+          - target: arm-unknown-linux-musleabihf
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            # todo: check if all these targets are even supported
+    runs-on: ${{ matrix.os }}
+    env:
+      target: ${{ matrix.target }}
+      os: ${{ matrix.os }}
+      version: ${{ needs.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-14
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ""
+          shared-key: cargo-build-release-cli
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install and configure dependencies
+        run: |
+          # dependencies are only needed on ubuntu as that's the only place where
+          # we make cross-compilation
+          if [[ $os =~ ^ubuntu.*$ ]]; then
+            sudo apt-get install -qq crossbuild-essential-arm64 crossbuild-essential-armhf
+          fi
+          # some additional configuration for cross-compilation on linux
+          cat >>~/.cargo/config <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-linux-gnu-gcc"
+          [target.armv7-unknown-linux-gnueabihf]
+          linker = "arm-linux-gnueabihf-gcc"
+          [target.armv7-unknown-linux-musleabihf]
+          linker = "arm-linux-gnueabihf-gcc"
+          [target.arm-unknown-linux-gnueabihf]
+          linker = "arm-linux-gnueabihf-gcc"
+          [target.arm-unknown-linux-musleabihf]
+          linker = "arm-linux-gnueabihf-gcc"
+          EOF
+      - name: Install rust target
+        run: rustup target add $target
+      - name: Run build
+        run: cargo build --release --verbose --target $target
+      - name: List target
+        run: find ./target
+      - name: Prepare artifact
+        run: |
+          mkdir -p ./artifact
+          if [[ $os =~ ^windows.*$ ]]; then
+            cp ./target/release/filen-cli.exe ./artifact/filen-cli-$version-$target.exe
+          else
+            cp ./target/release/filen-cli ./artifact/filen-cli-$version-$target
+            chmod +x ./artifact/filen-cli-$version-$target
+          fi
+      - name: Archive artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: binaries
+          path: |
+            ./artifact/*
+
+  release:
+    needs: ["tag", "build-binaries"]
+    runs-on: ubuntu-latest
+    env:
+      version: ${{ needs.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # generate release notes
+      - name: Install parse-changelog
+        uses: taiki-e/install-action@parse-changelog
+      - name: Generate release notes from changelog
+        run: |
+          printf "## $(parse-changelog filen-cli/CHANGELOG.md $version --title)\n\n$(parse-changelog filen-cli/CHANGELOG.md $version)" > filen-cli/release_notes.md
+          echo filen-cli/release_notes.md
+
+      # modify readme
+      - name: Do substitutions in Readme
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            let readme = fs.readFileSync("filen-cli/README.md", "utf8");
+            console.log("Original Readme:\n" + readme);
+            readme = `<!-- v${process.env.version} -->\n\n${readme}`;
+            readme = readme.replace(/<\!-- START: ORIGIN ONLY([\s\S]*)END: ORIGIN ONLY -->/g, "<!-- (ORIGIN ONLY) -->");
+            readme = readme.replace(/<\!-- START: TARGET ONLY([\s\S]*)END: TARGET ONLY -->/g, "$1");
+            console.log("\n\nModified Readme:\n" + readme);
+            fs.writeFileSync("filen-cli/README.md", readme);
+
+      # copy artifacts
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: binaries
+          path: artifacts
+      - name: List artifacts
+        run: ls artifacts
+
+      # create release, push readme
+      - name: Create GitHub Release with changelog and assets
+        uses: softprops/action-gh-release@v1
+        with:
+          token: ${{ secrets.FILEN_BOT_PAT }}
+          repository: FilenCloudDienste/filen-cli-releases
+          name: Filen CLI v${{ needs.tag.outputs.version }}
+          tag_name: ${{ needs.tag.outputs.version }}
+          files: artifacts/*
+          body_path: release_notes.md
+          prerelease: true
+      - name: Copy Readme to target repository
+        run: |
+          git clone https://x-access-token:${{ secrets.FILEN_BOT_PAT }}@github.com/FilenCloudDienste/filen-cli-releases.git target-repo
+          cp filen-cli/README.md target-repo/
+          cd target-repo
+          git add README.md
+          git config user.name "github actions[bot]"
+          git config user.email "34767606+JupiterPi@users.noreply.github.com"
+          git commit -m "${{ format('release filen-cli v{0}', needs.tag.outputs.version) }}"
+          git push origin main
+        # todo: use different PAT (and update commit user and email accordingly)
