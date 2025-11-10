@@ -1,12 +1,16 @@
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::js::ManagedFuture;
 use crate::{
 	Error, ErrorKind,
 	fs::{file::service_worker::MAX_BUFFER_SIZE_BEFORE_FLUSH, zip::ZipProgressCallback},
-	js::{FileEnum, Item, ManagedFuture},
+	js::{FileEnum, Item},
 };
 
 use futures::AsyncWriteExt;
 use serde::Deserialize;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::JsValue;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use web_sys::js_sys::{BigInt, Function};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -29,6 +33,7 @@ pub struct DownloadFileStreamParams {
 	pub end: Option<u64>,
 	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
 	// #[serde(flatten)]
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[serde(default)]
 	pub managed_future: ManagedFuture,
 }

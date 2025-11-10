@@ -1,18 +1,24 @@
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use std::{cmp::min, sync::Arc};
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::{
-	Error, ErrorKind,
-	auth::JsClient,
-	fs::file::{enums::RemoteFileType, meta::FileMetaChanges, traits::HasFileInfo},
-	js::{File, FileEnum, UploadFileParams},
-	runtime::do_on_commander,
+	ErrorKind,
+	fs::file::{enums::RemoteFileType, traits::HasFileInfo},
+	js::{FileEnum, UploadFileParams},
+};
+
+use crate::{
+	Error, auth::JsClient, fs::file::meta::FileMetaChanges, js::File, runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use futures::{AsyncRead, AsyncReadExt};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::JsValue;
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) use super::service_worker::{MAX_BUFFER_SIZE_BEFORE_FLUSH, StreamWriter};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]

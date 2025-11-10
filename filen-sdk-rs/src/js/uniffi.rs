@@ -1,3 +1,8 @@
+use std::{borrow::Cow, str::FromStr};
+
+use filen_types::serde::rsa::RsaDerPublicKey;
+use rsa::RsaPublicKey;
+
 #[cfg(feature = "uniffi")]
 uniffi::use_remote_type!(filen_types::filen_types::fs::UuidStr);
 

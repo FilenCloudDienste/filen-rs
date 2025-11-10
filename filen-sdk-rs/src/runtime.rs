@@ -535,7 +535,9 @@ mod commander_thread {
 		inner_do_on_commander(Some(channel), f)
 	}
 }
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg(feature = "uniffi")]
+pub(crate) use commander_thread::do_on_commander;
+#[cfg(feature = "wasm-full")]
 pub(crate) use commander_thread::{
 	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
 };
