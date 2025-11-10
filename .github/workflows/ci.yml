@@ -124,6 +124,8 @@ jobs:
           brew install dav1d pkg-config
       - name: Run clippy Android
         run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder -- -D warnings
+      - name: Run clippy Android uniffi
+        run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder,uniffi -- -D warnings
       - name: Run clippy all features
         run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
       - name: Run clippy single-threaded
@@ -132,6 +134,8 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: Run clippy iOS
         run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder -- -D warnings
+      - name: Run clippy iOS uniffi
+        run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder,uniffi -- -D warnings
 
   ci-wasm:
     runs-on: ubuntu-latest
