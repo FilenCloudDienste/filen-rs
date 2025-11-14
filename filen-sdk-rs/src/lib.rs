@@ -18,7 +18,6 @@ pub mod notes;
 pub mod runtime;
 pub mod search;
 pub(crate) mod serde;
-#[cfg(feature = "wasm-full")]
 pub mod socket;
 pub mod sync;
 pub mod thumbnail;

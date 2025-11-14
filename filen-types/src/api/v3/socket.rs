@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use filen_macros::CowHelpers;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 
 use crate::{
@@ -79,13 +79,15 @@ impl TryFrom<u8> for MessageType {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct HandShake<'a> {
+	#[serde(borrow)]
 	pub sid: Cow<'a, str>,
+	#[serde(borrow)]
 	pub upgrades: Vec<Cow<'a, str>>,
 	pub ping_interval: u64,
 	pub ping_timeout: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(tag = "type", content = "data", rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -168,6 +170,146 @@ pub enum SocketEvent<'a> {
 	FolderDeletedPermanent(FolderDeletedPermanent),
 	#[serde(borrow)]
 	FileMetadataChanged(FileMetadataChanged<'a>),
+}
+
+impl<'de> Deserialize<'de> for SocketEvent<'de> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		struct SocketEventVisitor;
+
+		impl<'de> serde::de::Visitor<'de> for SocketEventVisitor {
+			type Value = SocketEvent<'de>;
+
+			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+				formatter.write_str("a tuple of [event_name, optional_event_data]")
+			}
+
+			fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+			where
+				A: serde::de::SeqAccess<'de>,
+			{
+				let event_name = seq
+					.next_element::<crate::serde::cow::CowStrWrapper>()?
+					.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?
+					.0;
+				let event_name = kebab_to_camel(event_name);
+
+				let event = match event_name.as_ref() {
+					"authSuccess" => Some(SocketEvent::AuthSuccess),
+					"authFailed" => Some(SocketEvent::AuthFailed),
+					"reconnecting" => Some(SocketEvent::Reconnecting),
+					"trashEmpty" => Some(SocketEvent::TrashEmpty),
+					"passwordChanged" => Some(SocketEvent::PasswordChanged),
+					"newEvent" => seq.next_element()?.map(SocketEvent::NewEvent),
+					"fileRename" => seq.next_element()?.map(SocketEvent::FileRename),
+					"fileArchiveRestored" => {
+						seq.next_element()?.map(SocketEvent::FileArchiveRestored)
+					}
+					"fileNew" => seq.next_element()?.map(SocketEvent::FileNew),
+					"fileRestore" => seq.next_element()?.map(SocketEvent::FileRestore),
+					"fileMove" => seq.next_element()?.map(SocketEvent::FileMove),
+					"fileTrash" => seq.next_element()?.map(SocketEvent::FileTrash),
+					"fileArchived" => seq.next_element()?.map(SocketEvent::FileArchived),
+					"folderRename" => seq.next_element()?.map(SocketEvent::FolderRename),
+					"folderTrash" => seq.next_element()?.map(SocketEvent::FolderTrash),
+					"folderMove" => seq.next_element()?.map(SocketEvent::FolderMove),
+					"folderSubCreated" => seq.next_element()?.map(SocketEvent::FolderSubCreated),
+					"folderRestore" => seq.next_element()?.map(SocketEvent::FolderRestore),
+					"folderColorChanged" => {
+						seq.next_element()?.map(SocketEvent::FolderColorChanged)
+					}
+					"chatMessageNew" => seq.next_element()?.map(SocketEvent::ChatMessageNew),
+					"chatTyping" => seq.next_element()?.map(SocketEvent::ChatTyping),
+					"chatConversationsNew" => {
+						seq.next_element()?.map(SocketEvent::ChatConversationsNew)
+					}
+					"chatMessageDelete" => seq.next_element()?.map(SocketEvent::ChatMessageDelete),
+					"noteContentEdited" => seq.next_element()?.map(SocketEvent::NoteContentEdited),
+					"noteArchived" => seq.next_element()?.map(SocketEvent::NoteArchived),
+					"noteDeleted" => seq.next_element()?.map(SocketEvent::NoteDeleted),
+					"noteTitleEdited" => seq.next_element()?.map(SocketEvent::NoteTitleEdited),
+					"noteParticipantPermissions" => seq
+						.next_element()?
+						.map(SocketEvent::NoteParticipantPermissions),
+					"noteRestored" => seq.next_element()?.map(SocketEvent::NoteRestored),
+					"noteParticipantRemoved" => {
+						seq.next_element()?.map(SocketEvent::NoteParticipantRemoved)
+					}
+					"noteParticipantNew" => {
+						seq.next_element()?.map(SocketEvent::NoteParticipantNew)
+					}
+					"noteNew" => seq.next_element()?.map(SocketEvent::NoteNew),
+					"chatMessageEmbedDisabled" => seq
+						.next_element()?
+						.map(SocketEvent::ChatMessageEmbedDisabled),
+					"chatConversationParticipantLeft" => seq
+						.next_element()?
+						.map(SocketEvent::ChatConversationParticipantLeft),
+					"chatConversationDeleted" => seq
+						.next_element()?
+						.map(SocketEvent::ChatConversationDeleted),
+					"chatMessageEdited" => seq.next_element()?.map(SocketEvent::ChatMessageEdited),
+					"chatConversationNameEdited" => seq
+						.next_element()?
+						.map(SocketEvent::ChatConversationNameEdited),
+					"contactRequestReceived" => {
+						seq.next_element()?.map(SocketEvent::ContactRequestReceived)
+					}
+					"itemFavorite" => seq.next_element()?.map(SocketEvent::ItemFavorite),
+					"chatConversationParticipantNew" => seq
+						.next_element()?
+						.map(SocketEvent::ChatConversationParticipantNew),
+					"fileDeletedPermanent" => {
+						seq.next_element()?.map(SocketEvent::FileDeletedPermanent)
+					}
+					"folderMetadataChanged" => {
+						seq.next_element()?.map(SocketEvent::FolderMetadataChanged)
+					}
+					"folderDeletedPermanent" => {
+						seq.next_element()?.map(SocketEvent::FolderDeletedPermanent)
+					}
+					"fileMetadataChanged" => {
+						seq.next_element()?.map(SocketEvent::FileMetadataChanged)
+					}
+					unknown => {
+						return Err(serde::de::Error::custom(format!(
+							"unknown event type: {}",
+							unknown
+						)));
+					}
+				}
+				.ok_or_else(|| {
+					serde::de::Error::custom(format!("missing data for event type: {}", event_name))
+				})?;
+
+				Ok(event)
+			}
+		}
+
+		deserializer.deserialize_seq(SocketEventVisitor)
+	}
+}
+
+fn kebab_to_camel<'a>(event_name: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
+	let mut event_name = event_name.into();
+	let mut curr_idx = 0;
+
+	while let Some(i) = event_name[curr_idx..].find('-') {
+		let mut_string = event_name.to_mut();
+		mut_string.remove(curr_idx + i);
+
+		if mut_string[curr_idx + i..]
+			.chars()
+			.next()
+			.is_some_and(|c| c.is_ascii_lowercase())
+		{
+			mut_string[curr_idx + i..=curr_idx + i].make_ascii_uppercase();
+		}
+		curr_idx += i;
+	}
+	event_name
 }
 
 impl SocketEvent<'_> {
@@ -1125,4 +1267,24 @@ pub struct FileMetadataChanged<'a> {
 )]
 pub struct FolderDeletedPermanent {
 	pub uuid: UuidStr,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn camelify_name_from_kebab() {
+		assert_eq!(kebab_to_camel("file-rename"), "fileRename");
+		assert_eq!(
+			kebab_to_camel("file-archive-restored"),
+			"fileArchiveRestored"
+		);
+		assert_eq!(kebab_to_camel("auth-success"), "authSuccess");
+		assert_eq!(kebab_to_camel("simpleevent"), "simpleevent");
+		assert_eq!(kebab_to_camel("simpleEvent"), "simpleEvent");
+		assert_eq!(kebab_to_camel("-----"), "");
+		assert_eq!(kebab_to_camel("-----a"), "A");
+		assert_eq!(kebab_to_camel("-----aaa"), "Aaa");
+	}
 }
