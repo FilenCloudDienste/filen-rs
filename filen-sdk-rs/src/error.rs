@@ -206,11 +206,16 @@ impl FilenSDKError {
 
 impl std::fmt::Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "Error of kind {:?}: ", self.kind)?;
+		write!(f, "Error of kind {:?}", self.kind)?;
 		if let Some(context) = &self.context {
-			write!(f, "context: {}", context)?;
+			write!(f, ": context: {}", context)?;
 		}
 		if let Some(inner) = &self.inner {
+			if self.context.is_some() {
+				write!(f, ", ")?;
+			} else {
+				write!(f, ": ")?;
+			}
 			write!(f, "error: {}", inner)?;
 		}
 		Ok(())
