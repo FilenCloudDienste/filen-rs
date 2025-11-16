@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr, sync::Arc, time::Instant};
 
 use chrono::DateTime;
 use filen_sdk_rs::fs::{
-	HasUUID,
+	HasName, HasUUID,
 	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 	file::{RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 };
@@ -368,7 +368,7 @@ impl AuthCacheState {
 					)));
 				};
 				if let Some(hash) = meta.hash {
-					let local_hash = self.hash_local_file(&file.uuid).await?;
+					let local_hash = self.hash_local_file(&file.uuid, Some(&meta.name)).await?;
 					if local_hash == Some(hash.into()) {
 						return Ok(false);
 					}
@@ -966,13 +966,15 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		let file: RemoteFile = file.try_into()?;
-		match (file.hash(), self.hash_local_file(file.uuid()).await) {
+		match (
+			file.hash(),
+			self.hash_local_file(file.uuid(), file.name()).await,
+		) {
 			(Some(remote_hash), Ok(Some(local_hash))) => {
 				// Remote file has a hash and local file exists
 				if remote_hash == local_hash {
 					return self
-						.cache_dir
-						.join(file.uuid().as_ref())
+						.get_cached_file_path(&file)
 						.into_os_string()
 						.into_string()
 						.map_err(|e| {
@@ -988,8 +990,7 @@ impl AuthCacheState {
 					&& old_file == file
 				{
 					return self
-						.cache_dir
-						.join(file.uuid().as_ref())
+						.get_cached_file_path(&file)
 						.into_os_string()
 						.into_string()
 						.map_err(|e| {
@@ -1007,15 +1008,11 @@ impl AuthCacheState {
 			}
 		}
 
-		let path = self
-			.download_file_io(&file, progress_callback)
+		self.download_file_io(&file, progress_callback)
 			.await?
 			.into_os_string()
 			.into_string()
-			.map_err(|e| {
-				CacheError::conversion(format!("Failed to convert path to string: {e:?}"))
-			})?;
-		Ok(path)
+			.map_err(|e| CacheError::conversion(format!("Failed to convert path to string: {e:?}")))
 	}
 
 	async fn inner_move_item(

@@ -129,29 +129,6 @@ impl AuthCacheState {
 		self.get_cached_file_path_from_name(file.uuid().as_ref(), file.name())
 	}
 
-	pub(crate) async fn try_get_local_file_with_uuid(
-		&self,
-		uuid: &UuidStr,
-	) -> Result<Option<PathBuf>, io::Error> {
-		let dir_path = self.cache_dir.join(uuid.as_ref());
-		match tokio::fs::read_dir(&dir_path).await {
-			Ok(mut entries) => {
-				if let Ok(Some(entry)) = entries.next_entry().await {
-					if let Ok(Some(_)) = entries.next_entry().await {
-						return Err(io::Error::other(format!(
-							"Multiple files found for UUID {} in cache",
-							uuid.as_ref()
-						)));
-					}
-					return Ok(Some(entry.path()));
-				}
-				Ok(None)
-			}
-			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-			Err(e) => Err(e),
-		}
-	}
-
 	pub async fn download_file_io(
 		&self,
 		file: &RemoteFile,
@@ -200,10 +177,9 @@ impl AuthCacheState {
 	pub async fn hash_local_file(
 		&self,
 		file_uuid: &UuidStr,
+		file_name: Option<&str>,
 	) -> Result<Option<Sha512Hash>, io::Error> {
-		let Some(path) = self.try_get_local_file_with_uuid(file_uuid).await? else {
-			return Ok(None);
-		};
+		let path = self.get_cached_file_path_from_name(file_uuid.as_ref(), file_name);
 		let mut os_file = match tokio::fs::File::open(path).await {
 			Ok(file) => file,
 			Err(e) if e.kind() == io::ErrorKind::NotFound => {
