@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use std::{
 	borrow::Cow,
 	cell::Cell,
@@ -187,7 +186,18 @@ struct AuthMessage<'a> {
 	api_key: Cow<'a, str>,
 }
 
-fn parse_message(msg: &str) -> Result<Option<(String, Option<serde_json::Value>)>, Error> {
+fn try_handle_event(event_str: &str, listener_manager: &ListenerManager) -> Result<(), Error> {
+	let socket_event: SocketEvent = serde_json::from_str(event_str).map_err(|e| {
+		Error::custom(
+			crate::ErrorKind::Server,
+			format!("Failed to parse WebSocket event: {}", e),
+		)
+	})?;
+	listener_manager.handle_event(&socket_event);
+	Ok(())
+}
+
+fn parse_message(msg: &str) -> Result<Option<&str>, Error> {
 	let message_type = msg.bytes().next().ok_or_else(|| {
 		Error::custom(
 			crate::ErrorKind::Server,
@@ -198,66 +208,23 @@ fn parse_message(msg: &str) -> Result<Option<(String, Option<serde_json::Value>)
 	match MessageType::try_from(message_type) {
 		Err(e) => {
 			log::error!("Invalid message type: {}", e);
-			return Ok(None);
+			Ok(None)
 		}
 		Ok(MessageType::Event) => {
-			// continue
+			log::info!("Received event message: {}", &msg[1..]);
+			Ok(Some(&msg[1..]))
 		}
 		Ok(_) => {
 			// ignore other message types for now
-			return Ok(None);
+			Ok(None)
 		}
 	}
-
-	let json_value: serde_json::Value = serde_json::from_str(&msg[1..]).map_err(|e| {
-		Error::custom(
-			crate::ErrorKind::Server,
-			format!("Failed to parse WebSocket message: {}", e),
-		)
-	})?;
-
-	if let serde_json::Value::Array(arr) = json_value
-		&& let mut arr_iter = arr.into_iter()
-		&& let Some(event_name) = arr_iter.next()
-	{
-		let serde_json::Value::String(event_name) = event_name else {
-			return Err(Error::custom(
-				crate::ErrorKind::Server,
-				format!("Invalid event name in WebSocket message: {:?}", event_name),
-			));
-		};
-
-		Ok(Some((event_name, arr_iter.next())))
-	} else {
-		Ok(None)
-	}
 }
 
-fn try_handle_event(
-	event_name: &str,
-	data: Option<serde_json::Value>,
-	listener_manager: &ListenerManager,
-) -> Result<(), Error> {
-	let event_name = normalize_event_name(event_name);
-	let mut serialized_value = serde_json::Map::with_capacity(2);
-	serialized_value.insert(
-		"type".to_string(),
-		serde_json::Value::String(event_name.into_owned()),
-	);
-	if let Some(data) = data {
-		serialized_value.insert("data".to_string(), data);
-	}
-	let serialized_value = serde_json::Value::Object(serialized_value);
-	let socket_event = SocketEvent::deserialize(&serialized_value).map_err(|e| {
-		Error::custom(
-			crate::ErrorKind::Server,
-			format!("Failed to parse WebSocket event: {}", e),
-		)
-	})?;
-
-	listener_manager.handle_event(&socket_event);
-	Ok(())
-}
+const AUTHED_FALSE_MESSAGE: &str = r#"["authed",false]"#;
+const AUTHED_TRUE_MESSAGE: &str = r#"["authed",true]"#;
+const AUTH_SUCCESS_MESSAGE: &str = r#"["authSuccess"]"#;
+const AUTH_FAILED_MESSAGE: &str = r#"["authFailed"]"#;
 
 fn handle_unauthed_message(
 	ws: &std::rc::Weak<WebSocket>,
@@ -266,84 +233,85 @@ fn handle_unauthed_message(
 	broadcaster: tokio::sync::broadcast::Sender<bool>,
 ) -> Result<SocketConnectionStateEnum, (SocketConnectionStateEnum, Error)> {
 	match parse_message(msg) {
-		Ok(Some((event_name, data))) => match event_name.as_str() {
-			"authed" => {
-				if data.as_ref().and_then(|d| d.as_bool()) == Some(false) {
-					let client = &*connection.config.client;
-					let api_key = client.get_api_key();
-					let msg = Some(&AuthMessage {
-						api_key: Cow::Borrowed(&api_key.0),
-					});
-					let Some(ws) = ws.upgrade() else {
-						std::mem::drop(api_key);
-						log::error!("WebSocket was closed before authentication could be sent");
-						return Err((
-							SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
-								config: connection.config,
-							}),
-							Error::custom(
-								crate::ErrorKind::Server,
-								"WebSocket was closed before authentication could be sent",
-							),
-						));
-					};
-					if let Err(e) = send_event(&ws, "auth", msg) {
-						std::mem::drop(api_key);
-						log::error!("Failed to send auth event: {}", e);
-						return Err((
-							SocketConnectionStateEnum::Initializing(connection, broadcaster),
-							e,
-						));
-					}
-				}
-				Ok(SocketConnectionStateEnum::Initializing(
-					connection,
-					broadcaster,
-				))
-			}
-			other => match other {
-				"authFailed" => {
-					log::error!("WebSocket authentication failed");
-					// first notify listeners, then drop them
-					let res = match try_handle_event(other, data, &connection.listener_manager) {
-						Ok(()) => Ok(SocketConnectionStateEnum::Uninintialized(
-							UninitSocketConnection {
-								config: connection.config,
-							},
-						)),
-						Err(e) => Err((
-							SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
-								config: connection.config,
-							}),
-							e,
-						)),
-					};
-					let _ = broadcaster.send(false);
-					res
-				}
-				"authSuccess" => {
-					let _ = broadcaster.send(true);
-					match try_handle_event(other, data, &connection.listener_manager) {
-						Ok(()) => Ok(SocketConnectionStateEnum::Initialized(connection)),
-						Err(e) => Err((
-							SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
-								config: connection.config,
-							}),
-							e,
-						)),
-					}
-				}
-				other => match try_handle_event(other, data, &connection.listener_manager) {
-					Ok(()) => Ok(SocketConnectionStateEnum::Initializing(
-						connection,
-						broadcaster,
-					)),
-					Err(e) => Err((
+		Ok(Some(AUTHED_FALSE_MESSAGE)) => {
+			{
+				let client = &*connection.config.client;
+				let api_key = client.get_api_key();
+				let msg = Some(&AuthMessage {
+					api_key: Cow::Borrowed(&api_key.0),
+				});
+				let Some(ws) = ws.upgrade() else {
+					std::mem::drop(api_key);
+					log::error!("WebSocket was closed before authentication could be sent");
+					return Err((
+						SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
+							config: connection.config,
+						}),
+						Error::custom(
+							crate::ErrorKind::Server,
+							"WebSocket was closed before authentication could be sent",
+						),
+					));
+				};
+				if let Err(e) = send_event(&ws, "auth", msg) {
+					std::mem::drop(api_key);
+					log::error!("Failed to send auth event: {}", e);
+					return Err((
 						SocketConnectionStateEnum::Initializing(connection, broadcaster),
 						e,
-					)),
-				},
-			},
+					));
+				}
+			}
+
+			Ok(SocketConnectionStateEnum::Initializing(
+				connection,
+				broadcaster,
+			))
+		}
+		Ok(Some(AUTHED_TRUE_MESSAGE)) => Ok(SocketConnectionStateEnum::Initializing(
+			connection,
+			broadcaster,
+		)),
+		Ok(Some(AUTH_SUCCESS_MESSAGE)) => {
+			let _ = broadcaster.send(true);
+			match try_handle_event(AUTH_SUCCESS_MESSAGE, &connection.listener_manager) {
+				Ok(()) => Ok(SocketConnectionStateEnum::Initialized(connection)),
+				Err(e) => Err((
+					SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
+						config: connection.config,
+					}),
+					e,
+				)),
+			}
+		}
+		Ok(Some(AUTH_FAILED_MESSAGE)) => {
+			log::error!("WebSocket authentication failed");
+			// first notify listeners, then drop them
+			let res = match try_handle_event(AUTH_FAILED_MESSAGE, &connection.listener_manager) {
+				Ok(()) => Ok(SocketConnectionStateEnum::Uninintialized(
+					UninitSocketConnection {
+						config: connection.config,
+					},
+				)),
+				Err(e) => Err((
+					SocketConnectionStateEnum::Uninintialized(UninitSocketConnection {
+						config: connection.config,
+					}),
+					e,
+				)),
+			};
+			let _ = broadcaster.send(false);
+			res
+		}
+		Ok(Some(other)) => match try_handle_event(other, &connection.listener_manager) {
+			Ok(()) => Ok(SocketConnectionStateEnum::Initializing(
+				connection,
+				broadcaster,
+			)),
+			Err(e) => Err((
+				SocketConnectionStateEnum::Initializing(connection, broadcaster),
+				e,
+			)),
 		},
 		Ok(None) => Ok(SocketConnectionStateEnum::Initializing(
 			connection,
@@ -361,50 +329,24 @@ fn handle_authed_message(
 	msg: &str,
 	connection: &InitSocketConnection,
 ) -> Result<(), Error> {
-	if let Some((event_name, data)) = parse_message(msg)? {
-		match event_name.as_str() {
-			"authed" => {
-				if data.as_ref().and_then(|d| d.as_bool()) == Some(false) {
-					let client = &*connection.config.client;
-					let api_key = client.get_api_key();
-					let msg = Some(&AuthMessage {
-						api_key: Cow::Borrowed(&api_key.0),
-					});
+	match parse_message(msg) {
+		Ok(Some(AUTHED_TRUE_MESSAGE)) => {
+			let client = &*connection.config.client;
+			let api_key = client.get_api_key();
+			let msg = Some(&AuthMessage {
+				api_key: Cow::Borrowed(&api_key.0),
+			});
 
-					if let Some(ws) = ws.upgrade() {
-						send_event(&ws, "auth", msg)?;
-					}
-				}
-			}
-			other => {
-				try_handle_event(other, data, &connection.listener_manager)?;
+			if let Some(ws) = ws.upgrade() {
+				send_event(&ws, "auth", msg)?;
 			}
 		}
+		Ok(Some(AUTHED_FALSE_MESSAGE)) => {}
+		Ok(Some(other)) => try_handle_event(other, &connection.listener_manager)?,
+		Ok(None) => {}
+		Err(e) => return Err(e),
 	}
 	Ok(())
-}
-
-fn normalize_event_name(name: &str) -> Cow<'_, str> {
-	let dashes = name
-		.bytes()
-		.enumerate()
-		.rev()
-		.filter_map(|(i, c)| if c == b'-' { Some(i) } else { None });
-	let mut cow = Cow::Borrowed(name);
-	for i in dashes {
-		let mut_string = cow.to_mut();
-
-		mut_string.remove(i);
-		// SAFETY: we potentially convert a single byte ASCII lowercase character to uppercase
-		// which is still valid UTF-8 and we are not changing the length of the string
-		let mut_vec = unsafe { mut_string.as_mut_vec() };
-		if let Some(c) = mut_vec.get(i)
-			&& c.is_ascii_lowercase()
-		{
-			mut_vec[i] = c.to_ascii_uppercase();
-		}
-	}
-	cow
 }
 
 const PING_MESSAGE: &str = match str::from_utf8(&[PacketType::Ping as u8]) {
@@ -1244,25 +1186,5 @@ mod js_impl {
 			})
 			.await
 		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn camelify_name_from_kebab() {
-		assert_eq!(normalize_event_name("file-rename"), "fileRename");
-		assert_eq!(
-			normalize_event_name("file-archive-restored"),
-			"fileArchiveRestored"
-		);
-		assert_eq!(normalize_event_name("auth-success"), "authSuccess");
-		assert_eq!(normalize_event_name("simpleevent"), "simpleevent");
-		assert_eq!(normalize_event_name("simpleEvent"), "simpleEvent");
-		assert_eq!(normalize_event_name("-----"), "");
-		assert_eq!(normalize_event_name("-----a"), "A");
-		assert_eq!(normalize_event_name("-----aaa"), "Aaa");
 	}
 }
