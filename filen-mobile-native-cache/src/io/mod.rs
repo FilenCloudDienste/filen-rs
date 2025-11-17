@@ -293,9 +293,9 @@ impl AuthCacheState {
 			.parent()
 			.expect("cached file path parent should always exist");
 		tokio::fs::create_dir_all(parent).await?;
-		tokio::fs::rename(&old_path, new_path).await?;
+		tokio::fs::rename(&old_path, &new_path).await?;
 		if let Some(parent) = old_path.parent()
-			&& let Err(e) = tokio::fs::remove_dir(parent).await
+			&& let Err(e) = tokio::fs::remove_dir_all(parent).await
 		{
 			log::warn!(
 				"Failed to remove old parent directory {}: {}",
