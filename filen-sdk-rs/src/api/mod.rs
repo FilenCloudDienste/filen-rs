@@ -68,7 +68,7 @@ pub(crate) async fn retry_wrap<T>(
 			#[cfg(target_family = "wasm")]
 			wasmtimer::tokio::sleep(delay).await;
 			log::warn!(
-				"Retrying: {endpoint} ({i}/{attempts}) after {}ms)",
+				"Retrying: {endpoint} ({i}/{attempts}) after {}ms",
 				delay.as_millis()
 			);
 		}
