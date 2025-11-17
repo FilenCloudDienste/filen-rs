@@ -439,6 +439,26 @@ async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
 	while (futures.next().await).is_some() {}
 }
 
+async fn next_entry_filter_icloud_files(
+	dir: &mut tokio::fs::ReadDir,
+) -> io::Result<Option<tokio::fs::DirEntry>> {
+	#[cfg(any(target_os = "ios", target_os = "macos"))]
+	loop {
+		let entry = match dir.next_entry().await? {
+			Some(e) => e,
+			None => return Ok(None),
+		};
+		let file_name = entry.file_name();
+		let file_name = file_name.to_string_lossy();
+		if file_name.starts_with(".") && file_name.ends_with(".icloud") {
+			continue;
+		}
+		return Ok(Some(entry));
+	}
+	#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+	dir.next_entry().await
+}
+
 async fn process_subdir(
 	subdir_entry: tokio::fs::DirEntry,
 ) -> std::io::Result<Option<(PathBuf, DateTime<Utc>, u64)>> {
@@ -459,7 +479,7 @@ async fn process_subdir(
 
 	// then we read the contents of the subfolder
 	let mut contents = tokio::fs::read_dir(&path).await?;
-	let Some(file_entry) = contents.next_entry().await? else {
+	let Some(file_entry) = next_entry_filter_icloud_files(&mut contents).await? else {
 		tokio::fs::remove_dir_all(path).await?;
 		return Ok(None);
 	};
@@ -467,7 +487,10 @@ async fn process_subdir(
 	let file_type = file_entry.file_type().await?;
 	if file_type.is_file() {
 		// make sure there is only one file
-		if contents.next_entry().await?.is_some() {
+		if next_entry_filter_icloud_files(&mut contents)
+			.await?
+			.is_some()
+		{
 			log::warn!(
 				"Multiple files found in cache subdirectory {}, removing all",
 				path.display()
