@@ -159,6 +159,7 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           path: artifacts
+          merge-multiple: true
       - name: List artifacts
         run: ls -R artifacts
 
@@ -171,7 +172,7 @@ jobs:
           name: Filen CLI v${{ needs.tag.outputs.version }}
           tag_name: ${{ needs.tag.outputs.version }}
           files: artifacts/**
-          body_path: release_notes.md
+          body_path: filen-cli/release_notes.md
           prerelease: true
       - name: Copy Readme to target repository
         run: |
