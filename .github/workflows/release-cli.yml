@@ -113,9 +113,9 @@ jobs:
         run: |
           mkdir -p ./artifact
           if [[ $os =~ ^windows.*$ ]]; then
-            cp ./target/release/filen-cli.exe ./artifact/filen-cli-$version-$target.exe
+            cp ./target/$target/release/filen-cli.exe ./artifact/filen-cli-$version-$target.exe
           else
-            cp ./target/release/filen-cli ./artifact/filen-cli-$version-$target
+            cp ./target/$target/release/filen-cli ./artifact/filen-cli-$version-$target
             chmod +x ./artifact/filen-cli-$version-$target
           fi
       - name: Archive artifact
