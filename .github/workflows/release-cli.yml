@@ -106,6 +106,7 @@ jobs:
         run: rustup target add $target
       - name: Run build
         run: cargo build --release --verbose --target $target
+        working-directory: ./filen-cli
       - name: List target
         run: find ./target
       - name: Prepare artifact
