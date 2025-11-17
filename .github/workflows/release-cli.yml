@@ -156,7 +156,7 @@ jobs:
 
       # copy artifacts
       - name: Download build artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
       - name: List artifacts
