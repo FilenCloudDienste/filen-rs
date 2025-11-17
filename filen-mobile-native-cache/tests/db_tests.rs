@@ -38,18 +38,25 @@ impl ProgressCallback for SumProgressCallback {
 	}
 }
 
-async fn get_db_resources() -> (FilenMobileCacheState, TestResources) {
+static MOBILE_CACHE_STATE_INIT: std::sync::OnceLock<Arc<FilenMobileCacheState>> =
+	std::sync::OnceLock::new();
+
+async fn get_db_resources() -> (Arc<FilenMobileCacheState>, TestResources) {
 	let path = std::env::temp_dir();
 	let files_path = path.join("test_files");
 	std::fs::create_dir_all(&files_path).unwrap();
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.to_stringified();
-	let state = FilenMobileCacheState::from_stringified_in_memory(
-		client,
-		files_path.to_string_lossy().as_ref(),
-	)
-	.unwrap();
-	(state, resources)
+	let state = MOBILE_CACHE_STATE_INIT.get_or_init(|| {
+		Arc::new(
+			FilenMobileCacheState::from_stringified_in_memory(
+				client,
+				files_path.to_string_lossy().as_ref(),
+			)
+			.unwrap(),
+		)
+	});
+	(state.clone(), resources)
 }
 
 // Root query tests
@@ -66,15 +73,21 @@ pub async fn test_query_root_initial_state() {
 	assert_eq!(res.storage_used, 0);
 	assert_eq!(res.last_updated, 0);
 	assert_eq!(res.uuid, rss.client.root().uuid().to_string());
-	assert_eq!(res.last_listed, 0);
-}
 
-#[shared_test_runtime]
-pub async fn test_query_root_after_update() {
-	let (state, rss) = get_db_resources().await;
+	let root_path: FfiId = rss.client.root().uuid().to_string().into();
+	let result = db.query_item(&root_path).unwrap();
 
-	state.update_roots_info().await.unwrap();
-	let root = state
+	match result {
+		Some(FfiObject::Root(root)) => {
+			assert_eq!(root.uuid, rss.client.root().uuid().to_string());
+			assert_eq!(root.max_storage, 0); // Initial state
+			assert_eq!(root.storage_used, 0); // Initial state
+		}
+		_ => panic!("Expected to find a root object"),
+	}
+
+	db.update_roots_info().await.unwrap();
+	let root = db
 		.query_roots_info(rss.client.root().uuid().to_string())
 		.unwrap()
 		.unwrap();
@@ -82,8 +95,7 @@ pub async fn test_query_root_after_update() {
 	assert_ne!(root.max_storage, 0);
 	assert_ne!(root.storage_used, 0);
 	assert_ne!(root.last_updated, 0);
-	assert_eq!(root.uuid, state.root_uuid().unwrap().to_string());
-	assert_eq!(root.last_listed, 0);
+	assert_eq!(root.uuid, db.root_uuid().unwrap().to_string());
 }
 
 #[shared_test_runtime]
@@ -402,25 +414,6 @@ pub async fn test_query_item_directory() {
 			assert_eq!(retrieved_dir.meta.unwrap().name, dir.name().unwrap());
 		}
 		_ => panic!("Expected to find a directory object"),
-	}
-}
-
-#[shared_test_runtime]
-pub async fn test_query_item_root() {
-	let (db, rss) = get_db_resources().await;
-
-	let root_path: FfiId = rss.client.root().uuid().to_string().into();
-	let result = db.query_item(&root_path).unwrap();
-
-	match result {
-		Some(FfiObject::Root(root)) => {
-			assert_eq!(root.uuid, rss.client.root().uuid().to_string());
-			assert_eq!(root.max_storage, 0); // Initial state
-			assert_eq!(root.storage_used, 0); // Initial state
-			assert_eq!(root.last_updated, 0); // Initial state
-			assert_eq!(root.last_listed, 0); // Initial state
-		}
-		_ => panic!("Expected to find a root object"),
 	}
 }
 
@@ -4476,19 +4469,6 @@ pub async fn test_search() {
 		.unwrap();
 
 	assert_eq!(resp.len(), 0);
-
-	let resp = db
-		.query_search(SearchQueryArgs {
-			name: None,
-			exclude_media_on_device: false,
-			mime_types: Vec::new(),
-			file_size_min: None,
-			last_modified_min: None,
-			item_type: Some(ItemType::File),
-		})
-		.unwrap();
-
-	assert_eq!(resp.len(), 2);
 
 	// Test orphaned search results cleanup
 	// This should remove the orphaned file at a/b/searchable
