@@ -455,6 +455,33 @@ pub(crate) fn select_search(
 	.collect::<SQLResult<Vec<_>>>()
 }
 
+pub fn dump_db(conn: &Connection, title: &str) -> SQLResult<()> {
+	let mut stmt = conn.prepare_cached(include_str!("../../sql/dump_db.sql"))?;
+	let mut dump = String::new();
+	use std::fmt::Write;
+
+	writeln!(&mut dump, "Database contents {title}:").unwrap();
+
+	stmt.query_and_then([], |row| {
+		writeln!(
+			&mut dump,
+			"UUID: {}, Name: {}, Parent: {:?}, is_recent: {}, local_data: {:?}",
+			row.get::<_, String>(0)?,
+			row.get::<_, String>(1)?,
+			row.get::<_, Option<String>>(2)?,
+			row.get::<_, bool>(3)?,
+			row.get::<_, Option<String>>(4)?
+		)
+		.unwrap();
+		Ok(())
+		// Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+	})?
+	.collect::<SQLResult<()>>()?;
+	log::info!("{}", dump);
+
+	Ok(())
+}
+
 /// Accepts an iterator over UUIDs
 /// and returns a vector of positions (usize)
 /// which correspond to the indices of the passed UUIDs

@@ -81,6 +81,21 @@ pub struct FilenMobileCacheState {
 	// to disable the provider, will always check if currently disabled
 	allow_auth_disable: bool,
 }
+
+impl FilenMobileCacheState {
+	pub async fn dump_db(&self, title: &str) {
+		match &self.state.read().await.status {
+			AuthStatus::Authenticated(auth_state) => {
+				let conn = auth_state.conn();
+				sql::dump_db(&conn, title).expect("Failed to dump database");
+			}
+			AuthStatus::Unauthenticated(_) => {
+				log::info!("Cannot dump database, unauthenticated");
+			}
+		}
+	}
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SavedDBState {
