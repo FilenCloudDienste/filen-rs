@@ -89,13 +89,13 @@ jobs:
             sudo apt-get update
             sudo apt-get install crossbuild-essential-arm64 crossbuild-essential-armhf
           fi
-        # some additional configuration for cross-compilation on linux
-        #cat >>~/.cargo/config <<EOF
-        #[target.aarch64-unknown-linux-gnu]
-        #linker = "aarch64-linux-gnu-gcc"
-        #[target.aarch64-unknown-linux-musl]
-        #linker = "aarch64-linux-gnu-gcc"
-        #EOF
+          # some additional configuration for cross-compilation on linux
+          cat >>~/.cargo/config <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
       - name: Install C++ build dependencies
         if: runner.os == 'Linux'
         run: |
