@@ -51,16 +51,22 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            command: cross
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            command: cross
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            command: cross
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
+            command: cross
           - target: x86_64-apple-darwin
             os: macos-latest
+            command: cargo
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            command: cargo
     runs-on: ${{ matrix.os }}
     env:
       target: ${{ matrix.target }}
@@ -104,8 +110,14 @@ jobs:
           sudo apt-get install musl-tools
       - name: Install rust target
         run: rustup target add $target
+      - name: Install Cross
+        if: matrix.command == 'cross'
+        shell: bash
+        run: |
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall --no-confirm cross
       - name: Run build
-        run: cargo build --release --verbose --target $target
+        run: ${{ matrix.command }} build --release --verbose --locked --target $target
         working-directory: ./filen-cli
       - name: List target
         run: find ./target
