@@ -13,6 +13,7 @@ pub use uuid::UuidStr;
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ObjectType {
 	#[serde(rename = "file")]
 	File,

@@ -98,9 +98,9 @@ hyper-util = { version = "0.1.16", features = ["client-legacy"] }
 heif-decoder = { path = "../heif-decoder", optional = true }
 tokio-tungstenite = { version = "0.28.0", features = [
 	"rustls",
-	"rustls-tls-native-roots",
+	"rustls-tls-webpki-roots",
 ] }
-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 tokio = { version = "1.47.1", default-features = false, features = [
 	"sync",
 	"macros",

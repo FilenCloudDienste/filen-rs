@@ -35,7 +35,7 @@ impl Client {
 			.await
 	}
 
-	pub async fn is_socket_connected(&self) -> bool {
+	pub fn is_socket_connected(&self) -> bool {
 		self.socket_handle.lock().unwrap().request_sender.is_some()
 	}
 
@@ -141,6 +141,7 @@ fn guarantee_send_remove_listener(sender: tokio::sync::mpsc::Sender<SocketReques
 	}
 }
 
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct ListenerHandle {
 	idx: u64,
 	remove_listener_sender: Option<tokio::sync::mpsc::Sender<SocketRequest>>,

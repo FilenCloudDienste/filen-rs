@@ -125,6 +125,20 @@ pub struct NoteParticipant {
 	added_timestamp: DateTime<Utc>,
 }
 
+impl From<filen_types::api::v3::notes::NoteParticipant<'_>> for NoteParticipant {
+	fn from(participant: filen_types::api::v3::notes::NoteParticipant<'_>) -> Self {
+		Self {
+			user_id: participant.user_id,
+			is_owner: participant.is_owner,
+			email: participant.email.into_owned(),
+			avatar: participant.avatar.map(|a| a.into_owned()),
+			nick_name: participant.nick_name.into_owned(),
+			permissions_write: participant.permissions_write,
+			added_timestamp: participant.added_timestamp,
+		}
+	}
+}
+
 impl NoteParticipant {
 	pub fn user_id(&self) -> u64 {
 		self.user_id
@@ -384,15 +398,7 @@ impl Client {
 			let mut participants = note
 				.participants
 				.into_iter()
-				.map(|p| NoteParticipant {
-					user_id: p.user_id,
-					is_owner: p.is_owner,
-					email: p.email.into_owned(),
-					avatar: p.avatar.map(|a| a.into_owned()),
-					nick_name: p.nick_name.into_owned(),
-					permissions_write: p.permissions_write,
-					added_timestamp: p.added_timestamp,
-				})
+				.map(NoteParticipant::from)
 				.collect::<Vec<_>>();
 
 			participants.sort_by_key(|p| p.added_timestamp);

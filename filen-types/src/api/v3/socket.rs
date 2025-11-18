@@ -582,6 +582,7 @@ pub struct FileMove<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileTrash {
 	pub uuid: UuidStr,
 }
@@ -597,6 +598,7 @@ pub struct FileTrash {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileArchived {
 	pub uuid: UuidStr,
 }
@@ -629,6 +631,7 @@ pub struct FolderRename<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FolderTrash {
 	pub parent: UuidStr,
 	pub uuid: UuidStr,
@@ -860,6 +863,7 @@ pub struct ChatConversationsNew<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatMessageDelete {
 	pub uuid: UuidStr,
 }
@@ -904,6 +908,7 @@ pub struct NoteContentEdited<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteArchived {
 	pub note: UuidStr,
 }
@@ -919,6 +924,7 @@ pub struct NoteArchived {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteDeleted {
 	pub note: UuidStr,
 }
@@ -951,6 +957,7 @@ pub struct NoteTitleEdited<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteParticipantPermissions {
 	pub note: UuidStr,
 	pub user_id: u64,
@@ -968,6 +975,7 @@ pub struct NoteParticipantPermissions {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteRestored {
 	pub note: UuidStr,
 }
@@ -983,6 +991,7 @@ pub struct NoteRestored {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteParticipantRemoved {
 	pub note: UuidStr,
 	pub user_id: u64,
@@ -1016,6 +1025,7 @@ pub struct NoteParticipantNew<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteNew {
 	pub note: UuidStr,
 }
@@ -1031,6 +1041,7 @@ pub struct NoteNew {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatMessageEmbedDisabled {
 	pub uuid: UuidStr,
 }
@@ -1046,6 +1057,7 @@ pub struct ChatMessageEmbedDisabled {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatConversationParticipantLeft {
 	pub uuid: UuidStr,
 	pub user_id: u64,
@@ -1062,6 +1074,7 @@ pub struct ChatConversationParticipantLeft {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatConversationDeleted {
 	pub uuid: UuidStr,
 }
@@ -1212,6 +1225,7 @@ pub struct ChatConversationParticipantNew<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileDeletedPermanent {
 	pub uuid: UuidStr,
 }
@@ -1265,6 +1279,7 @@ pub struct FileMetadataChanged<'a> {
 	derive(tsify::Tsify),
 	tsify(large_number_types_as_bigints)
 )]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FolderDeletedPermanent {
 	pub uuid: UuidStr,
 }
