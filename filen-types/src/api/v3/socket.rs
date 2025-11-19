@@ -571,7 +571,7 @@ pub struct FileMove<'a> {
 	pub favorited: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -587,7 +587,7 @@ pub struct FileTrash {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -620,7 +620,7 @@ pub struct FolderRename<'a> {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -765,11 +765,6 @@ pub struct ChatMessageNew<'a> {
 		deserialize_with = "crate::serde::option::result_to_option::deserialize",
 		skip_serializing_if = "Option::is_none"
 	)]
-	// #[cfg_attr(all(
-	// 	target_family = "wasm",
-	// 	target_os = "unknown",
-	// 	not(feature = "service-worker")
-	// ), tsify(optional))]
 	pub reply_to: Option<ChatMessagePartialEncrypted<'a>>,
 	pub embed_disabled: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -852,7 +847,7 @@ pub struct ChatConversationsNew<'a> {
 	pub added_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -897,7 +892,7 @@ pub struct NoteContentEdited<'a> {
 	pub edited_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -913,7 +908,7 @@ pub struct NoteArchived {
 	pub note: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -946,7 +941,7 @@ pub struct NoteTitleEdited<'a> {
 	pub title: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -964,7 +959,7 @@ pub struct NoteParticipantPermissions {
 	pub permissions_write: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -980,7 +975,7 @@ pub struct NoteRestored {
 	pub note: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -1014,7 +1009,7 @@ pub struct NoteParticipantNew<'a> {
 	pub participant: NoteParticipant<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -1030,7 +1025,7 @@ pub struct NoteNew {
 	pub note: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -1046,7 +1041,7 @@ pub struct ChatMessageEmbedDisabled {
 	pub uuid: UuidStr,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -1063,7 +1058,7 @@ pub struct ChatConversationParticipantLeft {
 	pub user_id: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -1214,7 +1209,7 @@ pub struct ChatConversationParticipantNew<'a> {
 	pub added_timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -1268,7 +1263,7 @@ pub struct FileMetadataChanged<'a> {
 	pub old_metadata: EncryptedString<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(
 	all(

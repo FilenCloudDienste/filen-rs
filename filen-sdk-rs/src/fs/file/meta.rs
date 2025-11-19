@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
+use filen_macros::CowHelpers;
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},
@@ -27,9 +28,12 @@ pub(crate) struct FileMetaSeed(pub(crate) FileEncryptionVersion);
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawFileMeta<'a> {
+	#[serde(borrow)]
 	pub(super) name: Cow<'a, str>,
 	pub(super) size: u64,
+	#[serde(borrow)]
 	pub(super) mime: Cow<'a, str>,
+	#[serde(borrow)]
 	pub(super) key: Cow<'a, str>,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
 	pub(super) last_modified: DateTime<Utc>,
@@ -64,7 +68,7 @@ impl<'de> DeserializeSeed<'de> for FileMetaSeed {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub enum FileMeta<'a> {
 	Decoded(DecryptedFileMeta<'a>),
 	DecryptedRaw(Cow<'a, [u8]>),
@@ -101,14 +105,14 @@ macro_rules! get_value_from_decrypted_optional {
 	};
 }
 
-impl FileMeta<'static> {
+impl<'a> FileMeta<'a> {
 	pub fn blocking_from_encrypted(
-		meta: EncryptedString<'_>,
+		meta: EncryptedString<'a>,
 		decrypter: &impl MetaCrypter,
 		file_encryption_version: FileEncryptionVersion,
 	) -> Self {
 		let Ok(decrypted) = decrypter.blocking_decrypt_meta(&meta) else {
-			return Self::Encrypted(meta.into_owned_cow());
+			return Self::Encrypted(meta);
 		};
 		let seed = FileMetaSeed(file_encryption_version);
 		let Ok(meta) = seed.deserialize(&mut serde_json::Deserializer::from_str(&decrypted)) else {
@@ -118,13 +122,13 @@ impl FileMeta<'static> {
 	}
 
 	pub fn blocking_from_rsa_encrypted(
-		meta: RSAEncryptedString<'_>,
+		meta: RSAEncryptedString<'a>,
 		private_key: &RsaPrivateKey,
 		file_encryption_version: FileEncryptionVersion,
 	) -> Self {
 		let Ok(decrypted) = crypto::rsa::blocking_decrypt_with_private_key(private_key, &meta)
 		else {
-			return Self::RSAEncrypted(meta.into_owned_cow());
+			return Self::RSAEncrypted(meta);
 		};
 		let seed = FileMetaSeed(file_encryption_version);
 		let Ok(meta) = seed.deserialize(&mut serde_json::Deserializer::from_slice(&decrypted))
@@ -181,12 +185,15 @@ impl<'a> FileMeta<'a> {
 	get_value_from_decrypted_optional!(hash, Option<Sha512Hash>);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptedFileMeta<'a> {
+	#[serde(borrow)]
 	pub name: Cow<'a, str>,
 	pub size: u64,
+	#[serde(borrow)]
 	pub mime: Cow<'a, str>,
+	#[serde(borrow)]
 	pub key: Cow<'a, FileKey>,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
 	pub last_modified: DateTime<Utc>,

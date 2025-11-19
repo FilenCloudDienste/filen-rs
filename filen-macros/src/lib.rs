@@ -287,6 +287,14 @@ pub fn derive_transmute_lifetime(input: TokenStream) -> TokenStream {
 pub fn derive_cow_helpers(input: TokenStream) -> TokenStream {
 	let input = parse_macro_input!(input as DeriveInput);
 	let name = &input.ident;
+	if input.generics.lifetimes().next().is_none() {
+		return syn::Error::new_spanned(
+			name,
+			"CowHelpers is pointless for types without lifetime parameters",
+		)
+		.to_compile_error()
+		.into();
+	}
 
 	match &input.data {
 		Data::Struct(data) => derive_for_struct(&input, name, &data.fields),

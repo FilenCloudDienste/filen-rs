@@ -10,6 +10,7 @@ use filen_types::{
 		},
 	},
 	fs::UuidStr,
+	traits::CowHelpers,
 };
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
@@ -162,7 +163,8 @@ impl SharedFile {
 			shared_file.metadata,
 			private_key,
 			shared_file.version,
-		);
+		)
+		.into_owned_cow();
 
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
@@ -190,7 +192,8 @@ impl SharedFile {
 		crypter: &impl MetaCrypter,
 	) -> Result<Self, Error> {
 		let meta =
-			FileMeta::blocking_from_encrypted(shared_file.metadata, crypter, shared_file.version);
+			FileMeta::blocking_from_encrypted(shared_file.metadata, crypter, shared_file.version)
+				.into_owned_cow();
 		let file = RemoteRootFile::from_meta(
 			shared_file.uuid,
 			shared_file.size,

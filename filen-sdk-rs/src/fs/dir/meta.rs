@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
+use filen_macros::CowHelpers;
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	traits::CowHelpers,
@@ -14,7 +15,7 @@ use crate::{
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 };
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, CowHelpers)]
 pub enum DirectoryMeta<'a> {
 	Decoded(DecryptedDirectoryMeta<'a>),
 	DecryptedRaw(Cow<'a, [u8]>),
@@ -170,7 +171,7 @@ impl<'a> DirectoryMeta<'a> {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, CowHelpers)]
 pub struct DecryptedDirectoryMeta<'a> {
 	pub name: Cow<'a, str>,
 	#[serde(
@@ -215,32 +216,6 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 		// - serde_json::to_string always suceeds if we have string keys and serialization cannot fail
 		serde_json::to_string(self)
 			.expect("Failed to serialize directory meta (should be impossible)")
-	}
-}
-
-impl CowHelpers for DecryptedDirectoryMeta<'_> {
-	type CowBorrowed<'borrow>
-		= DecryptedDirectoryMeta<'borrow>
-	where
-		Self: 'borrow;
-
-	type CowStatic = DecryptedDirectoryMeta<'static>;
-
-	fn as_borrowed_cow<'borrow>(&'borrow self) -> Self::CowBorrowed<'borrow>
-	where
-		Self: 'borrow,
-	{
-		DecryptedDirectoryMeta {
-			name: Cow::Borrowed(&self.name),
-			created: self.created,
-		}
-	}
-
-	fn into_owned_cow(self) -> Self::CowStatic {
-		DecryptedDirectoryMeta {
-			name: Cow::Owned(self.name.into_owned()),
-			created: self.created,
-		}
 	}
 }
 
