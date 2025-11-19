@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tokio::fs;
 
 use crate::ui::UI;
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
+
+const LAST_CHECK_VALIDITY: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Checks for updates by querying the GitHub releases API and downloading
 /// and installing the latest release if a newer version is available.
@@ -13,12 +16,36 @@ const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
 /// executable will be saved with the updated version in its name, and the
 /// old executable will be deleted. Otherwise, the current executable will
 /// be replaced in place.
-pub(crate) async fn check_for_updates(ui: &mut UI) -> Result<()> {
-	// todo: don't check again in quick succession of runs (cache last check time in config file)
-
+pub(crate) async fn check_for_updates(ui: &mut UI, config_path: &std::path::Path) -> Result<()> {
 	if cfg!(debug_assertions) {
 		log::info!("Skipping update check in debug build");
 		return Ok(());
+	}
+
+	let last_checked_config = LastCheckedConfig::new(config_path);
+	let last_checked = match last_checked_config.read().await {
+		Ok(timestamp) => chrono::DateTime::from_timestamp(timestamp, 0)
+			.ok_or(anyhow::anyhow!("Failed to parse timestamp"))?,
+		Err(e) => {
+			log::warn!("Failed to read last update check: {}", e);
+			chrono::DateTime::<chrono::Utc>::MIN_UTC
+		}
+	};
+	if last_checked.timestamp() + LAST_CHECK_VALIDITY.as_secs() as i64
+		> chrono::Utc::now().timestamp()
+	{
+		log::info!(
+			"Skipping update check; last checked at {} UTC",
+			last_checked.format("%Y-%m-%d %H:%M:%S")
+		);
+		return Ok(());
+	} else if last_checked == chrono::DateTime::<chrono::Utc>::MIN_UTC {
+		log::info!("No previous update check found, proceeding with update check");
+	} else {
+		log::info!(
+			"Last update check at {} UTC, proceeding with update check",
+			last_checked.format("%Y-%m-%d %H:%M:%S")
+		);
 	}
 
 	let github_api = GitHubApiClient::new();
@@ -65,6 +92,8 @@ pub(crate) async fn check_for_updates(ui: &mut UI) -> Result<()> {
 			);
 		}
 	}
+
+	last_checked_config.write().await?;
 	Ok(())
 }
 
@@ -76,6 +105,46 @@ async fn download_file(url: &str, destination: &std::path::Path) -> Result<()> {
 	let content = response.bytes().await?;
 	tokio::io::copy(&mut content.as_ref(), &mut file).await?;
 	Ok(())
+}
+
+// last checked config
+
+struct LastCheckedConfig {
+	path: std::path::PathBuf,
+}
+
+impl LastCheckedConfig {
+	fn new(config_dir: &std::path::Path) -> Self {
+		Self {
+			path: config_dir.join("last_update_check"),
+		}
+	}
+
+	async fn read(&self) -> Result<i64> {
+		let content = fs::read_to_string(&self.path).await.with_context(|| {
+			format!(
+				"Failed to read last update check from {}",
+				self.path.display()
+			)
+		})?;
+		let timestamp = content
+			.parse::<i64>()
+			.with_context(|| format!("Failed to parse last update check timestamp: {}", content))?;
+		Ok(timestamp)
+	}
+
+	async fn write(&self) -> Result<()> {
+		let now = chrono::Utc::now().timestamp();
+		fs::write(&self.path, now.to_string())
+			.await
+			.with_context(|| {
+				format!(
+					"Failed to write last update check to {}",
+					self.path.display()
+				)
+			})?;
+		Ok(())
+	}
 }
 
 // github api

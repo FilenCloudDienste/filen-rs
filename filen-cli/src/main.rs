@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
 	let mut ui = ui::UI::new(cli_args.quiet);
 
 	if !cli_args.skip_update {
-		check_for_updates(&mut ui).await?;
+		check_for_updates(&mut ui, &config.config_dir).await?;
 	}
 
 	let mut client =
