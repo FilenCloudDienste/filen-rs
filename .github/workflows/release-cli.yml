@@ -87,6 +87,7 @@ jobs:
           prefix-key: ""
           shared-key: cargo-build-release-cli
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # note: I'm not sure if all these extra build dependencies are actually required, but it's not worth figuring it out right now
       - name: Install and configure dependencies
         run: |
           # dependencies are only needed on ubuntu as that's the only place where
@@ -192,8 +193,11 @@ jobs:
           cp filen-cli/README.md target-repo/
           cd target-repo
           git add README.md
-          git config user.name "github actions[bot]"
-          git config user.email "34767606+JupiterPi@users.noreply.github.com"
+          git config user.name "${{ env.FILEN_BOT_NAME }}"
+          git config user.email "${{ env.FILEN_BOT_EMAIL }}"
           git commit -m "${{ format('release filen-cli v{0}', needs.tag.outputs.version) }}"
           git push origin main
-        # todo: use different PAT (and update commit user and email accordingly)
+        env:
+          FILEN_BOT_NAME: filen-bot
+          FILEN_BOT_EMAIL: 242448422+filen-bot@users.noreply.github.com
+          # todo: make these repository env variables
