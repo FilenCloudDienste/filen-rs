@@ -8,12 +8,14 @@ use log::{LevelFilter, info};
 use crate::{
 	commands::{Commands, execute_command},
 	ui::CustomLogger,
+	updater::check_for_updates,
 	util::RemotePath,
 };
 
 mod auth;
 mod commands;
 mod ui;
+mod updater;
 mod util;
 
 #[derive(Debug, Parser)]
@@ -42,6 +44,10 @@ pub(crate) struct CliArgs {
 	/// Path to auth config file
 	#[arg(long)]
 	auth_config_path: Option<String>,
+
+	/// Skip checking for updates
+	#[arg(short, long)]
+	skip_update: bool,
 
 	#[command(subcommand)]
 	command: Option<Commands>,
@@ -106,6 +112,10 @@ async fn main() -> Result<()> {
 	info!("Full log file: {}", log_file.display());
 
 	let mut ui = ui::UI::new(cli_args.quiet);
+
+	if !cli_args.skip_update {
+		check_for_updates(&mut ui).await?;
+	}
 
 	let mut client =
 		auth::LazyClient::new(cli_args.email, cli_args.password, cli_args.auth_config_path);
