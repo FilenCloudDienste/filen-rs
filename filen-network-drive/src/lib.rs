@@ -354,7 +354,8 @@ async fn start_rclone_mount_process(
 				.ok_or(anyhow::anyhow!("Failed to format log file path"))?,
 		);
 	}
-	if std::env::consts::FAMILY == "windows" {
+	#[cfg(target_family = "windows")]
+	{
 		args.extend_from_slice(&[
 			"--volname",
 			"\\\\Filen\\Filen",
@@ -362,7 +363,9 @@ async fn start_rclone_mount_process(
 			"FileSecurity=D:P(A;;FA;;;WD)",
 			"--network-mode",
 		]);
-	} else {
+	}
+	#[cfg(not(target_family = "windows"))]
+	{
 		args.extend_from_slice(&["--volname", "Filen"]);
 	}
 	let macfuse_installed = false; // todo
@@ -371,14 +374,15 @@ async fn start_rclone_mount_process(
 			args.extend_from_slice(&["-o", "jail_symlinks"]);
 		} else {
 			args.extend_from_slice(&[
-				"-o",
+				/* "-o",
 				"nomtime",
 				"-o",
 				"backend=nfs",
 				"-o",
 				"location=Filen",
 				"-o",
-				"nonamedattr",
+				"nonamedattr", */
+				// todo: should these be reintroduced? generally, check what these args are for and if they're needed
 			]);
 		}
 	}
