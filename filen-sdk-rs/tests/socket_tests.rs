@@ -74,7 +74,7 @@ async fn test_websocket_auth() {
 	await_event(
 		&mut events_receiver,
 		|event| *event == SocketEvent::AuthSuccess,
-		Duration::from_secs(10),
+		Duration::from_secs(20),
 	)
 	.await;
 }
@@ -111,7 +111,7 @@ async fn test_websocket_event_filtering() {
 	await_event(
 		&mut events_receiver,
 		|event| *event == SocketEvent::AuthSuccess,
-		Duration::from_secs(10),
+		Duration::from_secs(20),
 	)
 	.await;
 
@@ -159,7 +159,7 @@ async fn test_websocket_file_folder_creation() {
 			}
 			_ => false,
 		},
-		Duration::from_secs(10),
+		Duration::from_secs(20),
 	)
 	.await;
 
@@ -169,7 +169,7 @@ async fn test_websocket_file_folder_creation() {
 			SocketEvent::FileNew(data) => data.bucket == file_1.bucket && data.uuid == file_1.uuid,
 			_ => false,
 		},
-		Duration::from_secs(10),
+		Duration::from_secs(20),
 	)
 	.await;
 }

@@ -105,6 +105,8 @@ pub enum SocketEvent<'a> {
 	AuthFailed,
 	/// Sent when the socket has unexpectedly closed and begins attempting to reconnect
 	Reconnecting,
+	/// Sent when the handle to the event listener has been dropped and the listener is removed
+	Unsubscribed,
 	#[serde(borrow)]
 	NewEvent(NewEvent<'a>),
 	#[serde(borrow)]
@@ -318,6 +320,7 @@ impl SocketEvent<'_> {
 			SocketEvent::AuthSuccess => "authSuccess",
 			SocketEvent::AuthFailed => "authFailed",
 			SocketEvent::Reconnecting => "reconnecting",
+			SocketEvent::Unsubscribed => "unsubscribed",
 			SocketEvent::NewEvent(_) => "newEvent",
 			SocketEvent::FileRename(_) => "fileRename",
 			SocketEvent::FileArchiveRestored(_) => "fileArchiveRestored",

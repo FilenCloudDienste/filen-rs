@@ -27,6 +27,8 @@ pub enum SocketEvent {
 	AuthFailed,
 	/// Sent when the socket has unexpectedly closed and begins attempting to reconnect
 	Reconnecting,
+	/// Sent when the handle to the event listener has been dropped and the listener is removed
+	Unsubscribed,
 	NewEvent(NewEvent),
 	FileRename(FileRename),
 	FileArchiveRestored(FileArchiveRestored),
@@ -76,6 +78,7 @@ impl From<&BorrowedSocketEvent<'_>> for SocketEvent {
 			BorrowedSocketEvent::AuthSuccess => Self::AuthSuccess,
 			BorrowedSocketEvent::AuthFailed => Self::AuthFailed,
 			BorrowedSocketEvent::Reconnecting => Self::Reconnecting,
+			BorrowedSocketEvent::Unsubscribed => Self::Unsubscribed,
 			BorrowedSocketEvent::NewEvent(e) => Self::NewEvent(e.into()),
 			BorrowedSocketEvent::FileRename(e) => Self::FileRename(e.into()),
 			BorrowedSocketEvent::FileArchiveRestored(e) => Self::FileArchiveRestored(e.into()),

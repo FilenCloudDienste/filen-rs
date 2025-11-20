@@ -402,6 +402,10 @@ impl Client {
 		self.http_client.clone()
 	}
 
+	pub(crate) fn arc_client_ref(&self) -> &Arc<AuthClient> {
+		&self.http_client
+	}
+
 	pub fn crypter(&self) -> Arc<impl MetaCrypter> {
 		self.auth_info
 			.read()

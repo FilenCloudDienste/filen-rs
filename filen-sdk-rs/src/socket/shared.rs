@@ -122,8 +122,8 @@ mod listener_manager {
 			this_id
 		}
 
-		fn remove_listener(&mut self, id: u64) {
-			self.callbacks_mut().remove(&id);
+		fn remove_listener(&mut self, id: u64) -> Option<EventListenerCallback> {
+			let callback = self.callbacks_mut().remove(&id);
 			let mut empty_event_types = Vec::new();
 			for (event_type, callbacks) in self.callbacks_for_event_mut().iter_mut() {
 				callbacks.retain(|&callback_id| callback_id != id);
@@ -136,6 +136,8 @@ mod listener_manager {
 			}
 			self.global_callbacks_mut()
 				.retain(|&callback_id| callback_id != id);
+
+			callback
 		}
 	}
 
@@ -285,7 +287,10 @@ mod listener_manager {
 		}
 
 		fn remove_listener(&mut self, id: u64) {
-			ListenerManagerExtInner::remove_listener(self, id);
+			let callback = ListenerManagerExtInner::remove_listener(self, id);
+			if let Some(callback) = callback {
+				callback(&SocketEvent::Unsubscribed);
+			}
 			self.new_ids.retain(|new_id_struct| new_id_struct.id != id);
 		}
 	}
@@ -369,7 +374,10 @@ mod listener_manager {
 		}
 
 		fn remove_listener(&mut self, id: u64) {
-			ListenerManagerExtInner::remove_listener(self, id);
+			let callback = ListenerManagerExtInner::remove_listener(self, id);
+			if let Some(callback) = callback {
+				callback(&SocketEvent::Unsubscribed);
+			}
 		}
 	}
 }

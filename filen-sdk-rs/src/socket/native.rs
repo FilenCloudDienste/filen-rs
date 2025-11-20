@@ -27,8 +27,8 @@ impl Client {
 		event_types: Option<Vec<Cow<'static, str>>>,
 	) -> Result<ListenerHandle, Error> {
 		let request_sender = {
-			let mut socket_handle = self.socket_handle.lock().unwrap();
-			socket_handle.get_request_sender(self.arc_client())
+			let mut socket_handle = self.socket_handle.lock().unwrap_or_else(|e| e.into_inner());
+			socket_handle.get_request_sender(self.arc_client_ref())
 		};
 		request_sender
 			.add_event_listener(callback, event_types)
@@ -36,7 +36,10 @@ impl Client {
 	}
 
 	pub fn is_socket_connected(&self) -> bool {
-		self.socket_handle.lock().unwrap().request_sender.is_some()
+		self.socket_handle
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.is_connected()
 	}
 
 	// we need to expose this for v3 because most of the returned events are encrypted
@@ -54,7 +57,7 @@ impl Client {
 #[derive(Default)]
 pub(crate) struct WebSocketHandle {
 	// closes websocket thread on drop
-	request_sender: Option<tokio::sync::mpsc::Sender<SocketRequest>>,
+	request_sender: Option<tokio::sync::mpsc::WeakSender<SocketRequest>>,
 }
 
 struct RequestSender(tokio::sync::mpsc::Sender<SocketRequest>);
@@ -93,15 +96,21 @@ impl RequestSender {
 }
 
 impl WebSocketHandle {
-	fn get_request_sender(&mut self, client: Arc<AuthClient>) -> RequestSender {
-		RequestSender(match &self.request_sender {
-			Some(s) => s.clone(),
-			None => {
-				let request_sender = spawn_websocket_thread(client);
-				self.request_sender = Some(request_sender.clone());
-				request_sender
-			}
-		})
+	fn get_request_sender(&mut self, client: &Arc<AuthClient>) -> RequestSender {
+		if let Some(weak_sender) = &self.request_sender
+			&& let Some(sender) = weak_sender.upgrade()
+		{
+			return RequestSender(sender);
+		}
+		let sender = spawn_websocket_thread(Arc::clone(client));
+		self.request_sender = Some(sender.downgrade());
+		RequestSender(sender)
+	}
+
+	fn is_connected(&self) -> bool {
+		self.request_sender
+			.as_ref()
+			.is_some_and(|weak| weak.strong_count() > 0)
 	}
 }
 
@@ -319,7 +328,7 @@ fn handle_message(
 /// Handles a socket request, modifying the listener manager as needed.
 ///
 /// Returns true if there are no more listeners after handling the request.
-fn handle_request(request: SocketRequest, listeners: &mut impl ListenerManagerExt) -> bool {
+fn handle_request(request: SocketRequest, listeners: &mut impl ListenerManagerExt) {
 	match request {
 		SocketRequest::AddListener {
 			id_sender,
@@ -338,7 +347,6 @@ fn handle_request(request: SocketRequest, listeners: &mut impl ListenerManagerEx
 			listeners.remove_listener(idx);
 		}
 	}
-	listeners.is_empty()
 }
 
 /// Handles the initialized websocket connection, processing incoming messages and managing listeners.
@@ -360,11 +368,7 @@ async fn handle_initialized_websocket(
 					should_retry = false;
 					break;
 				};
-				should_retry = !handle_request(request, listeners);
-				if !should_retry {
-					// no more listeners, shutting down websocket task
-					break;
-				}
+				handle_request(request, listeners);
 			}
 			message_result = streams.read.next() => {
 				if let Err((should_continue, error)) = handle_message(message_result, listeners) {
