@@ -74,6 +74,12 @@ async fn start_rclone_mount() {
 		panic!("Directory already exists remotely before creation");
 	}
 
+	// list mount directory
+	let mut entries = fs::read_dir(&network_drive.mount_point).await.unwrap();
+	while let Some(entry) = entries.next_entry().await.unwrap() {
+		info!("Mount entry: {}", entry.path().display());
+	}
+
 	// create local dir inside mount
 	debug!(
 		"Trying to create local dir at: {}",
