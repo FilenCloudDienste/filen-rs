@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use filen_macros::CowHelpers;
 use serde::{Deserialize, Serialize};
 
 use crate::{fs::UuidStr, traits::CowHelpers};
@@ -54,32 +53,6 @@ impl<'a, 'de> Deserialize<'de> for DirColor<'a> {
 			Some(Helper::Gray) => DirColor::Gray,
 			Some(Helper::Custom(c)) => DirColor::Custom(c),
 		})
-	}
-}
-
-impl<'a> DirColor<'a> {
-	pub fn borrow_clone(&'a self) -> DirColor<'a> {
-		match self {
-			DirColor::Default => DirColor::Default,
-			DirColor::Blue => DirColor::Blue,
-			DirColor::Green => DirColor::Green,
-			DirColor::Purple => DirColor::Purple,
-			DirColor::Red => DirColor::Red,
-			DirColor::Gray => DirColor::Gray,
-			DirColor::Custom(c) => DirColor::Custom(Cow::Borrowed(c)),
-		}
-	}
-
-	pub fn into_owned(self) -> DirColor<'static> {
-		match self {
-			DirColor::Default => DirColor::Default,
-			DirColor::Blue => DirColor::Blue,
-			DirColor::Green => DirColor::Green,
-			DirColor::Purple => DirColor::Purple,
-			DirColor::Red => DirColor::Red,
-			DirColor::Gray => DirColor::Gray,
-			DirColor::Custom(c) => DirColor::Custom(Cow::Owned(c.into_owned())),
-		}
 	}
 }
 

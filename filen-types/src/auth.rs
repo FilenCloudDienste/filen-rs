@@ -6,11 +6,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
-use crate::impl_cow_helpers_for_newtype;
+use crate::traits::CowHelpers;
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct APIKey<'a>(pub Cow<'a, str>);
-impl_cow_helpers_for_newtype!(APIKey);
 
 impl Display for APIKey<'_> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

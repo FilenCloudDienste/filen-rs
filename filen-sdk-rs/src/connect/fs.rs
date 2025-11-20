@@ -102,12 +102,12 @@ impl SharedDirectory {
 			DirInfo {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
-				color: shared_dir.color.into_owned(),
+				color: shared_dir.color.into_owned_cow(),
 				metadata: DirectoryMeta::blocking_from_rsa_encrypted(
 					shared_dir.metadata,
 					private_key,
 				)
-				.into_owned(),
+				.into_owned_cow(),
 				timestamp: shared_dir.timestamp,
 				write_access: shared_dir.write_access,
 			},
@@ -127,9 +127,9 @@ impl SharedDirectory {
 			DirInfo {
 				uuid: shared_dir.uuid,
 				parent: shared_dir.parent,
-				color: shared_dir.color.into_owned(),
+				color: shared_dir.color.into_owned_cow(),
 				metadata: DirectoryMeta::blocking_from_encrypted(shared_dir.metadata, crypter)
-					.into_owned(),
+					.into_owned_cow(),
 				timestamp: shared_dir.timestamp,
 				write_access: shared_dir.write_access,
 			},

@@ -5,6 +5,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
+use filen_types::traits::CowHelpers;
 use futures::TryFutureExt;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
@@ -520,11 +521,11 @@ impl Client {
 			self.client(),
 			&api::v3::dir::color::Request {
 				uuid: *dir.uuid(),
-				color: color.borrow_clone(),
+				color: color.as_borrowed_cow(),
 			},
 		)
 		.await?;
-		dir.color = color.into_owned();
+		dir.color = color.into_owned_cow();
 		Ok(())
 	}
 }

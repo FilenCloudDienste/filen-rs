@@ -5,6 +5,7 @@ use filen_types::{
 	api::v3::dir::color::DirColor,
 	crypto::EncryptedString,
 	fs::{ObjectType, ParentUuid, UuidStr},
+	traits::CowHelpers,
 };
 use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, UpdateDirMeta};
 
@@ -154,7 +155,7 @@ impl RemoteDirectory {
 		meta: EncryptedString<'_>,
 		decrypter: &impl MetaCrypter,
 	) -> Self {
-		let meta = DirectoryMeta::blocking_from_encrypted(meta, decrypter).into_owned();
+		let meta = DirectoryMeta::blocking_from_encrypted(meta, decrypter).into_owned_cow();
 		Self {
 			uuid,
 			parent,
@@ -295,6 +296,6 @@ impl SetRemoteInfo for RemoteDirectory {
 
 impl HasRemoteDirInfo for RemoteDirectory {
 	fn color(&self) -> DirColor<'_> {
-		self.color.borrow_clone()
+		self.color.as_borrowed_cow()
 	}
 }

@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
-use filen_macros::CowHelpers;
 use serde::{Deserialize, Serialize};
 
 use crate::{crypto::EncryptedString, fs::UuidStr, traits::CowHelpers};

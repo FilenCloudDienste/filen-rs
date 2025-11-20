@@ -2,7 +2,6 @@ use std::borrow::Cow;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_macros::CowHelpers;
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	traits::CowHelpers,
@@ -22,26 +21,6 @@ pub enum DirectoryMeta<'a> {
 	DecryptedUTF8(Cow<'a, str>),
 	Encrypted(EncryptedString<'a>),
 	RSAEncrypted(RSAEncryptedString<'a>),
-}
-
-impl DirectoryMeta<'_> {
-	pub fn into_owned(self) -> DirectoryMeta<'static> {
-		match self {
-			DirectoryMeta::Decoded(meta) => DirectoryMeta::Decoded(meta.into_owned_cow()),
-			DirectoryMeta::DecryptedRaw(raw) => {
-				DirectoryMeta::DecryptedRaw(Cow::Owned(raw.into_owned()))
-			}
-			DirectoryMeta::DecryptedUTF8(utf8) => {
-				DirectoryMeta::DecryptedUTF8(Cow::Owned(utf8.into_owned()))
-			}
-			DirectoryMeta::Encrypted(encrypted) => {
-				DirectoryMeta::Encrypted(EncryptedString(Cow::Owned(encrypted.0.into_owned())))
-			}
-			DirectoryMeta::RSAEncrypted(encrypted) => DirectoryMeta::RSAEncrypted(
-				RSAEncryptedString(Cow::Owned(encrypted.0.into_owned())),
-			),
-		}
-	}
 }
 
 impl<'a> DirectoryMeta<'a> {

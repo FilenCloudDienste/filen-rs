@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
-use filen_macros::CowHelpers;
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},

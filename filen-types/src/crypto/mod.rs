@@ -2,21 +2,18 @@ pub mod rsa;
 use std::{borrow::Cow, fmt::Formatter};
 
 use base64::prelude::*;
-use filen_macros::CowHelpers;
 use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 
 use crate::traits::CowHelpers;
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
 pub struct DerivedPassword<'a>(pub Cow<'a, str>);
-impl_cow_helpers_for_newtype!(DerivedPassword);
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
 pub struct EncodedString<'a>(pub Cow<'a, str>);
-impl_cow_helpers_for_newtype!(EncodedString);
 
 impl TryFrom<&EncodedString<'_>> for Vec<u8> {
 	type Error = base64::DecodeError;
@@ -25,10 +22,9 @@ impl TryFrom<&EncodedString<'_>> for Vec<u8> {
 	}
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
 pub struct EncryptedString<'a>(pub Cow<'a, str>);
-impl_cow_helpers_for_newtype!(EncryptedString);
 
 pub type EncryptedStringStatic = EncryptedString<'static>;
 #[cfg(feature = "uniffi")]
@@ -103,20 +99,17 @@ uniffi::custom_type!(
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_ENCRYPTED_STRING: &'static str = r#"export type EncryptedString = unknown"#;
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
 pub struct EncryptedMasterKeys<'a>(pub EncryptedString<'a>);
-impl_cow_helpers_for_newtype!(EncryptedMasterKeys);
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
 pub struct EncryptedDEK<'a>(pub EncryptedString<'a>);
-impl_cow_helpers_for_newtype!(EncryptedDEK);
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
 pub struct EncryptedMetaKey<'a>(pub EncryptedString<'a>);
-impl_cow_helpers_for_newtype!(EncryptedMetaKey);
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

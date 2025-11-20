@@ -1,7 +1,6 @@
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
-use filen_macros::CowHelpers;
 use filen_types::{
 	api::v3::{
 		dir::color::DirColor,
