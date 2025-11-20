@@ -4,10 +4,10 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
-	fs::{HasUUID, file::meta::FileMetaChanges},
+	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
 	socket::DecryptedSocketEvent,
 };
-use filen_types::traits::CowHelpers;
+use filen_types::{api::v3::dir::color::DirColor, crypto::MaybeEncrypted, traits::CowHelpers};
 
 async fn await_event<F, T>(
 	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
@@ -27,6 +27,30 @@ where
 				let event = event.expect("Expected to receive event");
 				if filter(&event) {
 					return event;
+				}
+			}
+		}
+	}
+}
+
+async fn await_map_event<F, T, R>(
+	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+	mut filter: F,
+	timeout: Duration,
+) -> R
+where
+	F: FnMut(T) -> Option<R>,
+{
+	let sleep_until = tokio::time::Instant::now() + timeout;
+	loop {
+		tokio::select! {
+			_ = tokio::time::sleep_until(sleep_until) => {
+				panic!("Timed out waiting for event");
+			}
+			event = receiver.recv() => {
+				let event = event.expect("Expected to receive event");
+				if let Some(mapped) = filter(event) {
+					return mapped;
 				}
 			}
 		}
@@ -121,70 +145,6 @@ async fn test_websocket_event_filtering() {
 }
 
 #[shared_test_runtime]
-async fn test_websocket_file_folder_creation() {
-	let resouces = test_utils::RESOURCES.get_resources().await;
-	let client = &resouces.client;
-	let dir = &resouces.dir;
-
-	let (events_sender, mut events_receiver) = tokio::sync::mpsc::unbounded_channel();
-
-	let _handle = client
-		.add_event_listener(
-			Box::new(move |event| {
-				let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
-			}),
-			None,
-		)
-		.await
-		.unwrap();
-
-	let dir_a = client.create_dir(dir, "a".to_string()).await.unwrap();
-
-	let file_1 = client.make_file_builder("file1.txt", &dir_a).build();
-	let file_1 = client
-		.upload_file(file_1.into(), b"file 1 contents")
-		.await
-		.unwrap();
-
-	let event = await_event(
-		&mut events_receiver,
-		|event| match event {
-			DecryptedSocketEvent::FolderSubCreated(data) => data.0.uuid == *dir_a.uuid(),
-			_ => false,
-		},
-		Duration::from_secs(20),
-	)
-	.await;
-
-	match event {
-		DecryptedSocketEvent::FolderSubCreated(data) => {
-			assert_eq!(data.0, dir_a);
-		}
-		_ => panic!("Unexpected event type"),
-	}
-
-	let event = await_event(
-		&mut events_receiver,
-		|event| match event {
-			DecryptedSocketEvent::FileNew(data) => data.0.uuid == *file_1.uuid(),
-			_ => false,
-		},
-		Duration::from_secs(20),
-	)
-	.await;
-
-	match event {
-		DecryptedSocketEvent::FileNew(mut data) => {
-			// size is currently included in the event
-			// todo fix this in the future
-			data.0.size = file_1.size;
-			assert_eq!(data.0, file_1);
-		}
-		_ => panic!("Unexpected event type"),
-	}
-}
-
-#[shared_test_runtime]
 async fn test_websocket_bad_auth() {
 	let client = test_utils::RESOURCES.client().await;
 
@@ -212,6 +172,306 @@ async fn test_websocket_bad_auth() {
 		&mut events_receiver,
 		|event| *event == DecryptedSocketEvent::AuthFailed,
 		Duration::from_secs(5),
+	)
+	.await;
+}
+
+#[shared_test_runtime]
+async fn test_websocket_file_events() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let dir = &resources.dir;
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = sender.send(event.as_borrowed_cow().into_owned_cow());
+			}),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let file_a = client.make_file_builder("file_a.txt", dir).build();
+	let mut file_a = client
+		.upload_file(file_a.into(), b"file a contents")
+		.await
+		.unwrap();
+
+	let mut event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileNew(data) => {
+				if data.0.uuid == *file_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+
+	// todo remove when backend gets fixed
+	event.0.size = file_a.size;
+	assert_eq!(event.0, file_a);
+
+	client.trash_file(&mut file_a).await.unwrap();
+	await_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileTrash(data) => data.uuid == *file_a.uuid(),
+			_ => false,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+
+	client.restore_file(&mut file_a).await.unwrap();
+
+	let mut event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileRestore(data) => {
+				if data.0.uuid == *file_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+
+	event.0.size = file_a.size;
+	assert_eq!(event.0, file_a);
+
+	let old_file_a = file_a.clone();
+	let new_name = "file_a_renamed.txt";
+
+	client
+		.update_file_metadata(
+			&mut file_a,
+			FileMetaChanges::default()
+				.name(new_name.to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileMetadataChanged(data) => {
+				if data.uuid == *file_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+
+	assert_eq!(file_a.meta, event.metadata);
+	assert_eq!(old_file_a.meta, event.old_metadata);
+	assert_eq!(
+		MaybeEncrypted::Decrypted(Cow::Borrowed(new_name)),
+		event.name
+	);
+
+	let new_parent = client
+		.create_dir(dir, "move_target".to_string())
+		.await
+		.unwrap();
+
+	client.move_file(&mut file_a, &new_parent).await.unwrap();
+
+	let mut event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileMove(data) => {
+				if data.0.uuid == *file_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+
+	event.0.size = file_a.size;
+	assert_eq!(event.0, file_a);
+
+	let uuid = *file_a.uuid();
+
+	client.delete_file_permanently(file_a).await.unwrap();
+	await_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileDeletedPermanent(data) => data.uuid == uuid,
+			_ => false,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+}
+
+#[shared_test_runtime]
+async fn test_websocket_folder_events() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let dir = &resources.dir;
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = sender.send(event.as_borrowed_cow().into_owned_cow());
+			}),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let mut dir_a = client.create_dir(dir, "a".to_string()).await.unwrap();
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FolderSubCreated(data) => {
+				if data.0.uuid == *dir_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+	assert_eq!(event.0, dir_a);
+
+	client.trash_dir(&mut dir_a).await.unwrap();
+	await_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FolderTrash(data) => data.uuid == *dir_a.uuid(),
+			_ => false,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+
+	client.restore_dir(&mut dir_a).await.unwrap();
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FolderRestore(data) => {
+				if data.0.uuid == *dir_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+	assert_eq!(event.0, dir_a);
+
+	client
+		.update_dir_metadata(
+			&mut dir_a,
+			DirectoryMetaChanges::default()
+				.name("a_changed".to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FolderMetadataChanged(data) => {
+				if data.uuid == *dir_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+	assert_eq!(event.meta, dir_a.meta);
+
+	let new_parent_dir = client
+		.create_dir(dir, "new_parent".to_string())
+		.await
+		.unwrap();
+	client.move_dir(&mut dir_a, &new_parent_dir).await.unwrap();
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FolderMove(data) => {
+				if data.0.uuid == *dir_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+	assert_eq!(event.0, dir_a);
+	// todo should be moved to the top later when all the events return DirColor
+	// so we can test them properly
+	client
+		.set_dir_color(&mut dir_a, DirColor::Blue)
+		.await
+		.unwrap();
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FolderColorChanged(data) => {
+				if data.uuid == *dir_a.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+	)
+	.await;
+
+	assert_eq!(event.color, DirColor::Blue);
+
+	let uuid = *dir_a.uuid();
+	client.delete_dir_permanently(dir_a).await.unwrap();
+
+	await_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FolderDeletedPermanent(data) => data.uuid == uuid,
+			_ => false,
+		},
+		Duration::from_secs(20),
 	)
 	.await;
 }

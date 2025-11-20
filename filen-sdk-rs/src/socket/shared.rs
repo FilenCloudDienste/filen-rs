@@ -423,27 +423,27 @@ pub(super) use listener_manager::{
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
 pub enum DecryptedSocketEvent<'a> {
 	/// Sent after successful authentication, including on reconnect
-	AuthSuccess,
+	AuthSuccess, // tested
 	/// Sent after failed authentication, including on reconnect, after which the socket is closed and all listeners removed
-	AuthFailed,
+	AuthFailed, // tested
 	/// Sent when the socket has unexpectedly closed and begins attempting to reconnect
 	Reconnecting,
 	/// Sent when the handle to the event listener has been dropped and the listener is removed
-	Unsubscribed,
+	Unsubscribed, // tested
 	NewEvent(NewEvent<'a>),
-	FileRename(FileRename<'a>),
-	FileArchiveRestored(FileArchiveRestored),
-	FileNew(FileNew),
-	FileRestore(FileRestore),
-	FileMove(FileMove),
-	FileTrash(FileTrash),
-	FileArchived(FileArchived),
-	FolderRename(FolderRename<'a>),
-	FolderTrash(FolderTrash),
-	FolderMove(FolderMove),
-	FolderSubCreated(FolderSubCreated),
-	FolderRestore(FolderRestore),
-	FolderColorChanged(FolderColorChanged<'a>),
+	FileRename(FileRename<'a>), // rust never uses this, so no way to test it
+	FileArchiveRestored(FileArchiveRestored), // not sure what this is for
+	FileNew(FileNew),           // tested, needs size added
+	FileRestore(FileRestore),   // tested, needs size added
+	FileMove(FileMove),         // tested, needs size added
+	FileTrash(FileTrash),       // tested, might want to add enough info to build a RemoteFile here
+	FileArchived(FileArchived), // untested, not sure what this is for
+	FolderRename(FolderRename<'a>), // rust never uses this, so no way to test it
+	FolderTrash(FolderTrash),   // tested, might want to add enough info to build a RemoteFolder here
+	FolderMove(FolderMove),     // tested, needs color added
+	FolderSubCreated(FolderSubCreated), // tested, needs color added
+	FolderRestore(FolderRestore), // tested, needs color added
+	FolderColorChanged(FolderColorChanged<'a>), // tested
 	TrashEmpty,
 	PasswordChanged,
 	ChatMessageNew(ChatMessageNew),
@@ -467,10 +467,10 @@ pub enum DecryptedSocketEvent<'a> {
 	ContactRequestReceived(ContactRequestReceived<'a>),
 	ItemFavorite(ItemFavorite),
 	ChatConversationParticipantNew(ChatConversationParticipantNew<'a>),
-	FileDeletedPermanent(FileDeletedPermanent),
-	FolderMetadataChanged(FolderMetadataChanged<'a>),
-	FolderDeletedPermanent(FolderDeletedPermanent),
-	FileMetadataChanged(FileMetadataChanged<'a>),
+	FileDeletedPermanent(FileDeletedPermanent), // tested
+	FolderMetadataChanged(FolderMetadataChanged<'a>), // tested
+	FolderDeletedPermanent(FolderDeletedPermanent), // tested
+	FileMetadataChanged(FileMetadataChanged<'a>), // tested
 }
 
 impl DecryptedSocketEvent<'_> {
