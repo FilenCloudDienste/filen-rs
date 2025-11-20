@@ -34,6 +34,10 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
+            - name: Install WinFsp
+              if: runner.os == 'Windows'
+              run: |
+                  choco install winfsp
             - name: Run tests
               run: cargo test
               working-directory: ./filen-network-drive
