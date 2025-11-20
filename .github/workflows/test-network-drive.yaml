@@ -13,7 +13,8 @@ jobs:
     test:
         strategy:
             matrix:
-                os: [macos-latest, windows-latest, ubuntu-latest]
+                # according to https://github.com/actions/runner-images/issues/598, macFUSE does not work on GitHub runners, therefore we can't test it in ci
+                os: [windows-latest, ubuntu-latest]
                 version: [V1, V2] # This remains to define which version of the secrets to use
         runs-on: ${{ matrix.os }}
         steps:
