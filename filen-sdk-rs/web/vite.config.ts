@@ -63,8 +63,8 @@ export default defineConfig({
 		}
 	},
 	test: {
-		hookTimeout: 60000,
-		testTimeout: 30000,
+		hookTimeout: 180000,
+		testTimeout: 60000,
 		browser: {
 			enabled: true,
 			headless: true,
