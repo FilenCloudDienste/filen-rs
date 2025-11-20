@@ -1,0 +1,46 @@
+# temporary test that should be deleted once the main tests work again
+
+name: Test network-drive
+on:
+    # Allow manual triggering from GitHub UI
+    workflow_dispatch:
+
+concurrency:
+    group: test-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    test:
+        strategy:
+            matrix:
+                os: [macos-latest, windows-latest, ubuntu-latest]
+                version: [V1, V2] # This remains to define which version of the secrets to use
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  submodules: true
+            - uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: nightly-2025-08-14
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  prefix-key: ""
+                  shared-key: cargo-build-test-${{ matrix.os }}
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
+            - name: Install C++ Build Dependencies
+              if: runner.os == 'Linux'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
+            - name: Run tests
+              run: cargo test
+              working-directory: ./filen-network-drive
+              env:
+                  TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
+                  TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
+                  TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+                  TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+                  IMAP_EMAIL_USER: ${{ secrets['IMAP_EMAIL_USER'] }}
+                  IMAP_EMAIL_PASSWORD: ${{ secrets['IMAP_EMAIL_PASSWORD'] }}
+                  RUST_LOG: debug
