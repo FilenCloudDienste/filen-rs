@@ -81,7 +81,7 @@ async fn start_rclone_mount() {
 			.join(&created_dir_path)
 			.display()
 	);
-	fs::create_dir(PathBuf::from(network_drive.mount_point.clone()).join(&created_dir_path))
+	fs::create_dir_all(PathBuf::from(network_drive.mount_point.clone()).join(&created_dir_path))
 		.await
 		.unwrap();
 
