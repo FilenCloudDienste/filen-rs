@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use filen_macros::CowHelpers;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
+use yoke::Yokeable;
 
 use crate::{
 	api::v3::{
@@ -14,7 +15,7 @@ use crate::{
 	},
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
-	fs::{ObjectType, UuidStr},
+	fs::{ObjectType, ParentUuid, UuidStr},
 	traits::CowHelpers,
 };
 
@@ -87,7 +88,7 @@ pub struct HandShake<'a> {
 	pub ping_timeout: u64,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
 #[serde(tag = "type", content = "data", rename_all = "camelCase")]
 #[cfg_attr(
 	all(
@@ -434,7 +435,7 @@ pub struct FileRename<'a> {
 )]
 pub struct FileArchiveRestored<'a> {
 	pub current_uuid: UuidStr,
-	pub parent: UuidStr,
+	pub parent: ParentUuid,
 	pub uuid: UuidStr,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
@@ -472,7 +473,7 @@ pub struct FileArchiveRestored<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct FileNew<'a> {
-	pub parent: UuidStr,
+	pub parent: ParentUuid,
 	pub uuid: UuidStr,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
@@ -510,7 +511,7 @@ pub struct FileNew<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct FileRestore<'a> {
-	pub parent: UuidStr,
+	pub parent: ParentUuid,
 	pub uuid: UuidStr,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
@@ -548,7 +549,7 @@ pub struct FileRestore<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct FileMove<'a> {
-	pub parent: UuidStr,
+	pub parent: ParentUuid,
 	pub uuid: UuidStr,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
@@ -655,7 +656,7 @@ pub struct FolderMove<'a> {
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
 	pub uuid: UuidStr,
-	pub parent: UuidStr,
+	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
 		all(
@@ -685,7 +686,7 @@ pub struct FolderSubCreated<'a> {
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
 	pub uuid: UuidStr,
-	pub parent: UuidStr,
+	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
 		all(
@@ -715,7 +716,7 @@ pub struct FolderRestore<'a> {
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
 	pub uuid: UuidStr,
-	pub parent: UuidStr,
+	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
 		all(
@@ -1241,8 +1242,8 @@ pub struct FileDeletedPermanent {
 )]
 pub struct FolderMetadataChanged<'a> {
 	pub uuid: UuidStr,
-	#[serde(borrow)]
-	pub name: EncryptedString<'a>,
+	#[serde(borrow, rename = "name")]
+	pub meta: EncryptedString<'a>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]

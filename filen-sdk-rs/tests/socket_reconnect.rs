@@ -1,16 +1,17 @@
 use std::{borrow::Cow, time::Duration};
 
 use filen_macros::shared_test_runtime;
-use filen_types::{api::v3::socket::SocketEvent, traits::CowHelpers};
+use filen_sdk_rs::socket::DecryptedSocketEvent;
+use filen_types::traits::CowHelpers;
 // separate file because it needs to avoid interference with other tests
 
-async fn await_event<F>(
-	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<SocketEvent<'static>>,
+async fn await_event<F, T>(
+	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
 	mut filter: F,
 	timeout: Duration,
-) -> Result<SocketEvent<'static>, Cow<'static, str>>
+) -> Result<T, Cow<'static, str>>
 where
-	F: FnMut(&SocketEvent) -> bool,
+	F: FnMut(&T) -> bool,
 {
 	let sleep_until = tokio::time::Instant::now() + timeout;
 	loop {
@@ -51,7 +52,7 @@ async fn test_websocket_disconnect_reconnect() {
 
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, SocketEvent::AuthSuccess),
+		|event| matches!(event, DecryptedSocketEvent::AuthSuccess),
 		Duration::from_secs(20),
 	)
 	.await
@@ -61,7 +62,7 @@ async fn test_websocket_disconnect_reconnect() {
 	assert!(!client.is_socket_connected());
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, SocketEvent::Unsubscribed),
+		|event| matches!(event, DecryptedSocketEvent::Unsubscribed),
 		Duration::from_secs(20),
 	)
 	.await
@@ -88,7 +89,7 @@ async fn test_websocket_disconnect_reconnect() {
 
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, SocketEvent::AuthSuccess),
+		|event| matches!(event, DecryptedSocketEvent::AuthSuccess),
 		Duration::from_secs(20),
 	)
 	.await
@@ -98,7 +99,7 @@ async fn test_websocket_disconnect_reconnect() {
 	assert!(!client.is_socket_connected());
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, SocketEvent::Unsubscribed),
+		|event| matches!(event, DecryptedSocketEvent::Unsubscribed),
 		Duration::from_secs(20),
 	)
 	.await

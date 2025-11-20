@@ -23,14 +23,13 @@ use crate::{
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
 	tsify(large_number_types_as_bigints)
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(test, derive(Debug))]
 pub struct DecryptedDirMeta {
 	pub name: String,
 	#[cfg_attr(
@@ -63,8 +62,7 @@ impl From<DecryptedDirMeta> for SDKDecryptedDirMeta<'static> {
 	}
 }
 
-#[derive(Clone, PartialEq, Eq)]
-#[cfg_attr(test, derive(Debug))]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DirMeta {
 	Decoded(DecryptedDirMeta),
@@ -215,13 +213,12 @@ impl From<DirColor> for filen_types::api::v3::dir::color::DirColor<'static> {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
 	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
 )]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Dir {
 	pub uuid: UuidStr,

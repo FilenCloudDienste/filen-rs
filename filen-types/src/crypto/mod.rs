@@ -2,10 +2,11 @@ pub mod rsa;
 use std::{borrow::Cow, fmt::Formatter};
 
 use base64::prelude::*;
+use filen_macros::CowHelpers;
 use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 
-use crate::impl_cow_helpers_for_newtype;
+use crate::traits::CowHelpers;
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(transparent)]
@@ -65,6 +66,36 @@ impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
 		}))
 	}
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum MaybeEncrypted<'a> {
+	Decrypted(Cow<'a, str>),
+	Encrypted(EncryptedString<'a>),
+}
+
+pub type MaybeEncryptedStatic = MaybeEncrypted<'static>;
+
+#[cfg(feature = "uniffi")]
+#[derive(uniffi::Enum)]
+pub enum MaybeEncryptedUniffi {
+	Decrypted(String),
+	Encrypted(EncryptedString<'static>),
+}
+
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(
+	MaybeEncryptedStatic,
+	MaybeEncryptedUniffi, {
+		lower: |v: EncryptedStringStatic| match v {
+			MaybeEncrypted::Decrypted(s) => MaybeEncryptedUniffi::Decrypted(s.into_owned()),
+			MaybeEncrypted::Encrypted(e) => MaybeEncryptedUniffi::Encrypted(e.into_owned_cow()),
+		},
+		try_lift: |v: MaybeDecryptedUniffi| match v {
+			MaybeEncryptedUniffi::Decrypted(s) => Ok(MaybeEncrypted::Decrypted(Cow::Owned(s))),
+			MaybeEncryptedUniffi::Encrypted(e) => Ok(MaybeEncrypted::Encrypted(e)),
+		}
+	}
+);
 
 // claude said to do this to define the type in TS
 // without allowing it to be constructed in TS

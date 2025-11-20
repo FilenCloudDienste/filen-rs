@@ -3,12 +3,14 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 use filen_types::{
 	api::v3::socket::{HandShake, MessageType, PacketType, SocketEvent},
 	crypto::EncryptedString,
+	traits::CowHelpers,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, stream::FuturesOrdered};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::{ClientRequestBuilder, Message, Utf8Bytes};
+use yoke::Yoke;
 
 use crate::{
 	Error, ErrorKind,
@@ -28,7 +30,7 @@ impl Client {
 	) -> Result<ListenerHandle, Error> {
 		let request_sender = {
 			let mut socket_handle = self.socket_handle.lock().unwrap_or_else(|e| e.into_inner());
-			socket_handle.get_request_sender(self.arc_client_ref())
+			socket_handle.get_request_sender(self.arc_client_ref(), self.crypter())
 		};
 		request_sender
 			.add_event_listener(callback, event_types)
@@ -96,13 +98,17 @@ impl RequestSender {
 }
 
 impl WebSocketHandle {
-	fn get_request_sender(&mut self, client: &Arc<AuthClient>) -> RequestSender {
+	fn get_request_sender(
+		&mut self,
+		client: &Arc<AuthClient>,
+		crypter: Arc<impl MetaCrypter + 'static>,
+	) -> RequestSender {
 		if let Some(weak_sender) = &self.request_sender
 			&& let Some(sender) = weak_sender.upgrade()
 		{
 			return RequestSender(sender);
 		}
-		let sender = spawn_websocket_thread(Arc::clone(client));
+		let sender = spawn_websocket_thread(Arc::clone(client), crypter);
 		self.request_sender = Some(sender.downgrade());
 		RequestSender(sender)
 	}
@@ -216,113 +222,109 @@ impl Future for ListenerRegisterGuard {
 	}
 }
 
-fn handle_message(
-	maybe_message: Option<Result<Message, tungstenite::Error>>,
-	listeners: &mut ConnectedListenerManager,
-) -> Result<(), (bool, Error)> {
-	let msg = maybe_message
-		.ok_or_else(|| {
-			(
-				false,
-				Error::custom(
+fn try_parse_message(
+	msg: Message,
+) -> Result<Option<Yoke<SocketEvent<'static>, Box<Utf8Bytes>>>, Error> {
+	let Message::Text(text) = msg else {
+		return Err(Error::custom(
+			ErrorKind::Server,
+			format!(
+				"expected text message while handling websocket message, received: {:?}",
+				msg
+			),
+		));
+	};
+
+	let yoked: Yoke<Option<SocketEvent<'static>>, Box<Utf8Bytes>> =
+		Yoke::try_attach_to_cart(Box::new(text), |msg| {
+			let mut text_bytes = msg.bytes();
+			let Some(packet_type) = text_bytes.next() else {
+				return Err(Error::custom(
 					ErrorKind::Server,
-					"websocket closed unexpectedly while handling message",
-				),
+					"Empty message received over WebSocket",
+				));
+			};
+
+			match PacketType::try_from(packet_type) {
+				Err(e) => {
+					return Err(Error::custom(
+						ErrorKind::Server,
+						format!("Invalid packet type: {}", e),
+					));
+				}
+				Ok(PacketType::Message) => {}
+				Ok(PacketType::Connect) => {
+					return Err(Error::custom(
+						ErrorKind::InvalidState,
+						"Received unexpected connect packet after initialization",
+					));
+				}
+				Ok(_) => {
+					return Ok(None);
+				}
+			}
+
+			let Some(message_type) = text_bytes.next() else {
+				return Err(Error::custom(
+					ErrorKind::Server,
+					"PacketType::Message received with no MessageType",
+				));
+			};
+
+			match MessageType::try_from(message_type) {
+				Err(e) => {
+					return Err(Error::custom(
+						ErrorKind::Server,
+						format!("Invalid message type: {}", e),
+					));
+				}
+				Ok(MessageType::Event) => {
+					// continue
+				}
+				Ok(_) => {
+					// ignore other message types for now
+					return Ok(None);
+				}
+			}
+
+			let event_str = &msg.as_str()[2..];
+
+			if event_str == r#"["authed",true]"# {
+				// ignore authed true messages
+				return Ok(None);
+			}
+			match serde_json::from_str::<SocketEvent>(event_str) {
+				Ok(parsed_event) => Ok(Some(parsed_event)),
+				Err(e) => Err(Error::custom_with_source(
+					ErrorKind::Conversion,
+					e,
+					Some("deserializing SocketEvent"),
+				)),
+			}
+		})?;
+
+	Ok(yoked
+		.try_map_project(|maybe_event: Option<SocketEvent<'_>>, _| maybe_event.ok_or(()))
+		.ok())
+}
+
+fn try_get_message(
+	maybe_message: Option<Result<Message, tungstenite::Error>>,
+) -> Result<Message, Error> {
+	maybe_message
+		.ok_or_else(|| {
+			Error::custom(
+				ErrorKind::Server,
+				"websocket closed unexpectedly while handling message",
 			)
 		})?
 		.map_err(|e| {
-			(
-				false,
-				Error::custom_with_source(
-					ErrorKind::Server,
-					e,
-					Some("failed to read websocket message"),
-				),
+			Error::custom_with_source(
+				ErrorKind::Server,
+				e,
+				Some("failed to read websocket message"),
 			)
-		})?;
-
-	let Message::Text(text) = msg else {
-		return Err((
-			true,
-			Error::custom(
-				ErrorKind::Server,
-				format!(
-					"expected text message while handling websocket message, received: {:?}",
-					msg
-				),
-			),
-		));
-	};
-
-	let mut text_bytes = text.bytes();
-	let Some(packet_type) = text_bytes.next() else {
-		return Err((
-			true,
-			Error::custom(ErrorKind::Server, "Empty message received over WebSocket"),
-		));
-	};
-	match PacketType::try_from(packet_type) {
-		Err(e) => {
-			return Err((
-				true,
-				Error::custom(ErrorKind::Server, format!("Invalid packet type: {}", e)),
-			));
-		}
-		Ok(PacketType::Message) => {}
-		Ok(PacketType::Connect) => {
-			return Err((
-				true,
-				Error::custom(
-					ErrorKind::InvalidState,
-					"Received unexpected connect packet after initialization",
-				),
-			));
-		}
-		Ok(_) => {
-			return Ok(());
-		}
-	}
-
-	let Some(message_type) = text_bytes.next() else {
-		return Err((
-			true,
-			Error::custom(
-				ErrorKind::Server,
-				"PacketType::Message received with no MessageType",
-			),
-		));
-	};
-
-	match MessageType::try_from(message_type) {
-		Err(e) => {
-			return Err((
-				true,
-				Error::custom(ErrorKind::Server, format!("Invalid message type: {}", e)),
-			));
-		}
-		Ok(MessageType::Event) => {
-			// continue
-		}
-		Ok(_) => {
-			// ignore other message types for now
-			return Ok(());
-		}
-	}
-
-	let event_str = &text.as_str()[2..];
-	if event_str == r#"["authed",true]"# {
-		// ignore authed true messages
-		return Ok(());
-	}
-	let event: SocketEvent = serde_json::from_str(event_str).map_err(|e| {
-		(
-			true,
-			Error::custom_with_source(ErrorKind::Conversion, e, Some("deserializing SocketEvent")),
-		)
-	})?;
-
-	listeners.broadcast_event(&event);
-	Ok(())
+		})
 }
 
 /// Handles a socket request, modifying the listener manager as needed.
@@ -355,9 +357,12 @@ async fn handle_initialized_websocket(
 	mut streams: WebSocketStreams,
 	request_receiver: &mut tokio::sync::mpsc::Receiver<SocketRequest>,
 	listeners: &mut ConnectedListenerManager,
+	crypter: &impl MetaCrypter,
 ) -> bool {
 	let ping_task = spawn_ping_task(streams.write, config.ping_interval);
 	let mut should_retry = true;
+
+	let mut decryption_futures = FuturesOrdered::new();
 
 	loop {
 		tokio::select! {
@@ -369,17 +374,47 @@ async fn handle_initialized_websocket(
 					break;
 				};
 				handle_request(request, listeners);
-			}
+			},
+			// we generally want to prioritize decrypting messages over reading new ones
+			// and we need to make sure we don't try to call next here if there are no futures
+			// as it would resolve immediately and starve the read side
+			decrypted = decryption_futures.next(), if !decryption_futures.is_empty() => {
+				if let Some(decrypted) = decrypted {
+					listeners.broadcast_event(&decrypted);
+				}
+			},
 			message_result = streams.read.next() => {
-				if let Err((should_continue, error)) = handle_message(message_result, listeners) {
-					if should_continue {
-						log::error!("Error handling WebSocket message: {}", error);
-					} else {
-						log::error!("Critical error handling WebSocket message: {}, shutting down WebSocket task, will retry", error);
+				let message = match try_get_message(message_result) {
+					Ok(msg) => msg,
+					Err(e) => {
+						log::error!(
+							"Critical error handling WebSocket message: {}, shutting down WebSocket task",
+							e
+						);
 						break;
 					}
+				};
+				match try_parse_message(message) {
+					Ok(Some(event_yoke)) => {
+						if listeners.should_decrypt_event(event_yoke.get()) {
+							decryption_futures.push_back(async move {
+								// this performs unnecessary cloning, ideally we would use an async
+								// yoke try_map_project_async but this does not currently exist
+								// https://github.com/unicode-org/icu4x/issues/7253
+								DecryptedSocketEvent::from_encrypted(crypter, event_yoke.get().as_borrowed_cow()).await.into_owned_cow()
+							});
+						}
+					},
+					// ignore non-event messages
+					Ok(None) => {},
+					Err(e) => {
+						log::error!(
+							"Error parsing WebSocket message: {}, continuing...",
+							e
+						);
+					}
 				}
-			}
+			},
 		}
 	}
 	ping_task.abort();
@@ -429,7 +464,10 @@ async fn initialize_websocket(
 	}
 }
 
-fn spawn_websocket_thread(client: Arc<AuthClient>) -> tokio::sync::mpsc::Sender<SocketRequest> {
+fn spawn_websocket_thread(
+	client: Arc<AuthClient>,
+	crypter: Arc<impl MetaCrypter + 'static>,
+) -> tokio::sync::mpsc::Sender<SocketRequest> {
 	let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
 
 	let mut config = WebSocketConfig {
@@ -468,6 +506,7 @@ fn spawn_websocket_thread(client: Arc<AuthClient>) -> tokio::sync::mpsc::Sender<
 					streams,
 					&mut request_receiver,
 					&mut connected_listeners,
+					&*crypter,
 				)
 				.await;
 

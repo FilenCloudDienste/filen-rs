@@ -51,7 +51,6 @@ impl Serialize for FileKey {
 	}
 }
 
-// todo, handle v1?
 pub(crate) struct FileKeySeed(pub(crate) FileEncryptionVersion);
 
 impl<'de> DeserializeSeed<'de> for FileKeySeed {

@@ -23,13 +23,12 @@ use crate::{
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
 	tsify(large_number_types_as_bigints)
 )]
-#[cfg_attr(test, derive(Debug))]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DecryptedFileMeta {
 	pub name: String,
@@ -96,8 +95,7 @@ impl TryFrom<DecryptedFileMeta> for SDKDecryptedFileMeta<'static> {
 	}
 }
 
-#[derive(Clone, PartialEq, Eq)]
-#[cfg_attr(test, derive(Debug))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum FileMeta {
 	Decoded(DecryptedFileMeta),
@@ -185,14 +183,13 @@ impl<'a>
 	}
 }
 
-#[derive(Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
 )]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct File {
 	pub uuid: UuidStr,

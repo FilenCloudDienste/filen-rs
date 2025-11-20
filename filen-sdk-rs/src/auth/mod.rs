@@ -406,7 +406,7 @@ impl Client {
 		&self.http_client
 	}
 
-	pub fn crypter(&self) -> Arc<impl MetaCrypter> {
+	pub fn crypter(&self) -> Arc<impl MetaCrypter + 'static> {
 		self.auth_info
 			.read()
 			.unwrap_or_else(|e| e.into_inner())

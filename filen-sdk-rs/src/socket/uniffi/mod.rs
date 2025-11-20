@@ -1,6 +1,11 @@
 use std::{borrow::Cow, sync::Arc};
 
-use crate::{Error, auth::JsClient, runtime::do_on_commander, socket::native::ListenerHandle};
+use crate::{
+	Error,
+	auth::JsClient,
+	runtime::do_on_commander,
+	socket::{DecryptedSocketEvent, native::ListenerHandle},
+};
 
 mod events;
 
@@ -22,16 +27,17 @@ impl JsClient {
 		let this = self.inner();
 		let listener: Arc<dyn SocketEventListener> = Arc::from(listener);
 		do_on_commander(move || async move {
+			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+			tokio::task::spawn_blocking(move || {
+				while let Some(event) = receiver.blocking_recv() {
+					listener.on_event(event);
+				}
+			});
+
 			this.add_event_listener(
-				Box::new(
-					move |event: &filen_types::api::v3::socket::SocketEvent<'_>| {
-						let event = SocketEvent::from(event);
-						let listener = Arc::clone(&listener);
-						tokio::task::spawn_blocking(move || {
-							listener.on_event(event);
-						});
-					},
-				),
+				Box::new(move |event: &DecryptedSocketEvent<'_>| {
+					let _ = sender.send(event.into());
+				}),
 				events_types.map(|v| {
 					v.into_iter()
 						.map(Cow::Owned)

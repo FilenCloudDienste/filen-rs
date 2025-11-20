@@ -4,16 +4,18 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
-	fs::{HasParent, HasUUID},
+	fs::{HasUUID, file::meta::FileMetaChanges},
+	socket::DecryptedSocketEvent,
 };
-use filen_types::{api::v3::socket::SocketEvent, fs::ParentUuid, traits::CowHelpers};
+use filen_types::traits::CowHelpers;
 
-async fn await_event<F>(
-	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<SocketEvent<'static>>,
+async fn await_event<F, T>(
+	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
 	mut filter: F,
 	timeout: Duration,
-) where
-	F: FnMut(&SocketEvent) -> bool,
+) -> T
+where
+	F: FnMut(&T) -> bool,
 {
 	let sleep_until = tokio::time::Instant::now() + timeout;
 	loop {
@@ -24,19 +26,20 @@ async fn await_event<F>(
 			event = receiver.recv() => {
 				let event = event.expect("Expected to receive event");
 				if filter(&event) {
-					return;
+					return event;
 				}
 			}
 		}
 	}
 }
 
-async fn await_not_event<F>(
-	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<SocketEvent<'static>>,
+async fn await_not_event<F, T>(
+	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
 	mut filter: F,
 	timeout: Duration,
 ) where
-	F: FnMut(&SocketEvent) -> bool,
+	F: FnMut(&T) -> bool,
+	T: std::fmt::Debug,
 {
 	let sleep_until = tokio::time::Instant::now() + timeout;
 	loop {
@@ -63,9 +66,7 @@ async fn test_websocket_auth() {
 	let _handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				events_sender
-					.send(event.as_borrowed_cow().into_owned_cow())
-					.unwrap();
+				let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
 			}),
 			None,
 		)
@@ -73,7 +74,7 @@ async fn test_websocket_auth() {
 		.unwrap();
 	await_event(
 		&mut events_receiver,
-		|event| *event == SocketEvent::AuthSuccess,
+		|event| *event == DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(20),
 	)
 	.await;
@@ -87,9 +88,7 @@ async fn test_websocket_event_filtering() {
 
 	let handle1_fut = client.add_event_listener(
 		Box::new(move |event| {
-			events_sender
-				.send(event.as_borrowed_cow().into_owned_cow())
-				.unwrap();
+			let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
 		}),
 		None,
 	);
@@ -99,9 +98,7 @@ async fn test_websocket_event_filtering() {
 
 	let handle2_fut = client.add_event_listener(
 		Box::new(move |event| {
-			filtered_events_sender
-				.send(event.as_borrowed_cow().into_owned_cow())
-				.unwrap();
+			let _ = filtered_events_sender.send(event.as_borrowed_cow().into_owned_cow());
 		}),
 		Some(vec![Cow::Borrowed("authSuccess")]),
 	);
@@ -110,14 +107,14 @@ async fn test_websocket_event_filtering() {
 
 	await_event(
 		&mut events_receiver,
-		|event| *event == SocketEvent::AuthSuccess,
+		|event| *event == DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(20),
 	)
 	.await;
 
 	await_not_event(
 		&mut filtered_events_receiver,
-		|event| *event != SocketEvent::AuthSuccess,
+		|event| *event != DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(1),
 	)
 	.await;
@@ -134,9 +131,7 @@ async fn test_websocket_file_folder_creation() {
 	let _handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				events_sender
-					.send(event.as_borrowed_cow().into_owned_cow())
-					.unwrap();
+				let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
 			}),
 			None,
 		)
@@ -151,27 +146,42 @@ async fn test_websocket_file_folder_creation() {
 		.await
 		.unwrap();
 
-	await_event(
+	let event = await_event(
 		&mut events_receiver,
 		|event| match event {
-			SocketEvent::FolderSubCreated(data) => {
-				ParentUuid::Uuid(data.parent) == *dir_a.parent() && data.uuid == *dir_a.uuid()
-			}
+			DecryptedSocketEvent::FolderSubCreated(data) => data.0.uuid == *dir_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
 	)
 	.await;
 
-	await_event(
+	match event {
+		DecryptedSocketEvent::FolderSubCreated(data) => {
+			assert_eq!(data.0, dir_a);
+		}
+		_ => panic!("Unexpected event type"),
+	}
+
+	let event = await_event(
 		&mut events_receiver,
 		|event| match event {
-			SocketEvent::FileNew(data) => data.bucket == file_1.bucket && data.uuid == file_1.uuid,
+			DecryptedSocketEvent::FileNew(data) => data.0.uuid == *file_1.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
 	)
 	.await;
+
+	match event {
+		DecryptedSocketEvent::FileNew(mut data) => {
+			// size is currently included in the event
+			// todo fix this in the future
+			data.0.size = file_1.size;
+			assert_eq!(data.0, file_1);
+		}
+		_ => panic!("Unexpected event type"),
+	}
 }
 
 #[shared_test_runtime]
@@ -186,9 +196,7 @@ async fn test_websocket_bad_auth() {
 	let result = client
 		.add_event_listener(
 			Box::new(move |event| {
-				events_sender
-					.send(event.as_borrowed_cow().into_owned_cow())
-					.unwrap();
+				let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
 			}),
 			None,
 		)
@@ -202,7 +210,7 @@ async fn test_websocket_bad_auth() {
 
 	await_event(
 		&mut events_receiver,
-		|event| *event == SocketEvent::AuthFailed,
+		|event| *event == DecryptedSocketEvent::AuthFailed,
 		Duration::from_secs(5),
 	)
 	.await;

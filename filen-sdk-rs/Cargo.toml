@@ -84,6 +84,7 @@ regex = "1.11.3"
 rayon = { version = "1.11.0", optional = true }
 pin-project-lite = "0.2.16"
 filen-macros = { path = "../filen-macros" }
+yoke = "0.8.1"
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
