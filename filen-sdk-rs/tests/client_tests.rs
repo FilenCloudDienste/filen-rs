@@ -51,7 +51,7 @@ async fn cleanup_test_dirs() {
 }
 
 async fn enable_2fa_for_client(client: &Client, secret: &TwoFASecret) -> String {
-	for _ in 0..10 {
+	for _ in 0..60 {
 		let result = client
 			.enable_2fa(
 				&secret
