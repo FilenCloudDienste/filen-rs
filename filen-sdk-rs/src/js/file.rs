@@ -334,3 +334,62 @@ impl TryFrom<FileEnum> for RemoteFileType<'static> {
 		})
 	}
 }
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct FileVersion {
+	pub bucket: String,
+	pub region: String,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
+	pub chunks: u64,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
+	pub size: u64,
+	pub metadata: FileMeta,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint")
+	)]
+	#[serde(with = "chrono::serde::ts_milliseconds")]
+	pub timestamp: DateTime<Utc>,
+	pub uuid: UuidStr,
+}
+
+impl From<crate::fs::file::FileVersion> for FileVersion {
+	fn from(version: crate::fs::file::FileVersion) -> Self {
+		FileVersion {
+			bucket: version.bucket,
+			region: version.region,
+			chunks: version.chunks,
+			size: version.size,
+			metadata: version.metadata.into(),
+			timestamp: version.timestamp,
+			uuid: version.uuid,
+		}
+	}
+}
+
+impl TryFrom<FileVersion> for crate::fs::file::FileVersion {
+	type Error = ConversionError;
+	fn try_from(version: FileVersion) -> Result<Self, Self::Error> {
+		Ok(crate::fs::file::FileVersion {
+			bucket: version.bucket,
+			region: version.region,
+			chunks: version.chunks,
+			size: version.size,
+			metadata: version.metadata.try_into()?,
+			timestamp: version.timestamp,
+			uuid: version.uuid,
+		})
+	}
+}

@@ -1,7 +1,10 @@
 use std::{borrow::Cow, sync::Arc};
 
+use chrono::Utc;
 use filen_types::fs::{ParentUuid, UuidStr};
 use futures::AsyncRead;
+#[cfg(feature = "multi-threaded-crypto")]
+use rayon::iter::ParallelIterator;
 
 use crate::{
 	api,
@@ -13,12 +16,13 @@ use crate::{
 		HasUUID,
 		dir::HasUUIDContents,
 		file::{
+			FileVersion,
 			meta::{FileMeta, FileMetaChanges},
 			traits::HasFileMeta,
 		},
 	},
 	runtime::{self, blocking_join, do_cpu_intensive},
-	util::MaybeSendCallback,
+	util::{IntoMaybeParallelIterator, MaybeSendCallback},
 };
 
 use super::{
@@ -212,6 +216,54 @@ impl Client {
 		callback: MaybeSendCallback<'a, u64>,
 	) -> Result<FileWriter<'a>, Error> {
 		self.inner_get_file_writer(file.into(), Some(callback), None)
+	}
+
+	pub async fn list_file_versions(&self, file: &RemoteFile) -> Result<Vec<FileVersion>, Error> {
+		let response = api::v3::file::versions::post(
+			self.client(),
+			&api::v3::file::versions::Request { uuid: *file.uuid() },
+		)
+		.await?;
+		let crypter = self.crypter();
+		do_cpu_intensive(move || {
+			Ok(response
+				.versions
+				.into_maybe_par_iter()
+				.map(|v| FileVersion::blocking_from_response(&*crypter, v))
+				.collect())
+		})
+		.await
+	}
+
+	pub async fn restore_file_version(
+		&self,
+		file: &mut RemoteFile,
+		version: FileVersion,
+	) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
+		let response = api::v3::file::version::restore::post(
+			self.client(),
+			&api::v3::file::version::restore::Request {
+				current: *file.uuid(),
+				uuid: version.uuid,
+			},
+		)
+		.await?;
+
+		file.bucket = version.bucket;
+		file.region = version.region;
+		// CRITICAL TODO: size needs to be added here
+		// as otherwise downloads for file versions with a different size will fail
+		// file.size = version.size;
+		file.chunks = version.chunks;
+		file.timestamp = version.timestamp;
+		file.meta = version.metadata;
+		file.uuid = version.uuid;
+		file.favorited = response.favorited;
+		// need to do this or the old sync engine doesn't work properly because it relies purely on modtime.
+		self.update_file_metadata(file, FileMetaChanges::default().last_modified(Utc::now()))
+			.await?;
+		Ok(())
 	}
 
 	#[cfg(feature = "malformed")]

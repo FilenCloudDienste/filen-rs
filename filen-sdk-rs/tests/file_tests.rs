@@ -8,7 +8,10 @@ use filen_sdk_rs::{
 	fs::{
 		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject,
 		dir::RemoteDirectory,
-		file::{meta::FileMetaChanges, traits::HasFileInfo},
+		file::{
+			meta::FileMetaChanges,
+			traits::{HasFileInfo, HasFileMeta},
+		},
 	},
 	util::MaybeSendCallback,
 };
@@ -516,6 +519,48 @@ async fn file_read_range() {
 	buf.clear();
 	reader.read_to_end(&mut buf).await.unwrap();
 	assert_eq!(str::from_utf8(&buf).unwrap(), "Hello, Filen");
+}
+
+#[shared_test_runtime]
+async fn file_versions() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let mut versions = Vec::new();
+	// TODO: when backend supports size in version info, use different lengths for these strings
+	for content in ["Version 1", "Version 2", "Version 3", "Version 4"] {
+		let base_file = client.make_file_builder("test", test_dir).build();
+		let file = client
+			.upload_file(base_file.clone().into(), content.as_bytes())
+			.await
+			.unwrap();
+		versions.push((file, content));
+	}
+	let mut current = versions.pop().unwrap().0;
+
+	let mut listed_versions = client.list_file_versions(&current).await.unwrap();
+
+	let current_version = listed_versions.remove(0);
+
+	assert_eq!(current_version.metadata(), current.get_meta());
+	assert_eq!(current_version.timestamp(), current.timestamp);
+
+	assert_eq!(listed_versions.len(), versions.len());
+	for (listed, (expected, expected_content)) in
+		listed_versions.into_iter().zip(versions.iter().rev())
+	{
+		assert_eq!(listed.metadata(), expected.get_meta());
+		// assert_eq!(listed.size(), expected.size()); TODO: re-enable after backend starts sending size in version info
+		assert_eq!(listed.timestamp(), expected.timestamp);
+		client
+			.restore_file_version(&mut current, listed)
+			.await
+			.unwrap();
+		let downloaded = client.download_file(&current).await.unwrap();
+		assert_eq!(&downloaded, expected_content.as_bytes());
+		assert_eq!(&current, expected);
+	}
 }
 
 #[cfg(feature = "malformed")]

@@ -9,7 +9,11 @@ use crate::{
 };
 
 use crate::{
-	Error, auth::JsClient, fs::file::meta::FileMetaChanges, js::File, runtime::do_on_commander,
+	Error,
+	auth::JsClient,
+	fs::file::meta::FileMetaChanges,
+	js::{File, FileVersion},
+	runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
 
@@ -301,6 +305,40 @@ impl JsClient {
 		do_on_commander(move || async move {
 			let mut file = file.try_into()?;
 			this.update_file_metadata(&mut file, changes).await?;
+			Ok(file.into())
+		})
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listFileVersions")
+	)]
+	pub async fn list_file_versions(&self, file: File) -> Result<Vec<FileVersion>, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			let file = file.try_into()?;
+			let versions = this.list_file_versions(&file).await?;
+			Ok(versions.into_iter().map(FileVersion::from).collect())
+		})
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "restoreFileVersion")
+	)]
+	pub async fn restore_file_version(
+		&self,
+		file: File,
+		version: FileVersion,
+	) -> Result<File, Error> {
+		let this = self.inner();
+		let mut file = file.try_into()?;
+		let version = version.try_into()?;
+
+		do_on_commander(move || async move {
+			this.restore_file_version(&mut file, version).await?;
 			Ok(file.into())
 		})
 		.await

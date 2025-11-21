@@ -4,13 +4,14 @@ use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	crypto::Sha512Hash,
 	fs::{ObjectType, ParentUuid, UuidStr},
+	traits::CowHelpers,
 };
 use meta::DecryptedFileMeta;
 use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, UpdateFileMeta};
 
 use crate::{
 	auth::Client,
-	crypto::file::FileKey,
+	crypto::{file::FileKey, shared::MetaCrypter},
 	error::{Error, MetadataWasNotDecryptedError},
 	fs::{
 		SetRemoteInfo,
@@ -546,4 +547,49 @@ pub(crate) fn make_mime(name: &str, mime: Option<String>) -> String {
 			.first_or_octet_stream()
 			.to_string(),
 	)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileVersion {
+	pub(crate) bucket: String,
+	pub(crate) region: String,
+	pub(crate) chunks: u64,
+	pub(crate) size: u64,
+	pub(crate) metadata: FileMeta<'static>,
+	pub(crate) timestamp: DateTime<Utc>,
+	pub(crate) uuid: UuidStr,
+}
+
+impl FileVersion {
+	pub fn size(&self) -> u64 {
+		self.size
+	}
+
+	pub fn timestamp(&self) -> DateTime<Utc> {
+		self.timestamp
+	}
+
+	pub fn metadata(&self) -> &FileMeta<'_> {
+		&self.metadata
+	}
+
+	pub(crate) fn blocking_from_response(
+		crypter: &impl MetaCrypter,
+		response: filen_types::api::v3::file::versions::FileVersion<'_>,
+	) -> Self {
+		Self {
+			bucket: response.bucket.into_owned(),
+			region: response.region.into_owned(),
+			chunks: response.chunks,
+			size: 0, // todo when backend adds size to versions response
+			metadata: FileMeta::blocking_from_encrypted(
+				response.metadata,
+				crypter,
+				response.version,
+			)
+			.into_owned_cow(),
+			timestamp: response.timestamp,
+			uuid: response.uuid,
+		}
+	}
 }

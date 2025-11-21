@@ -1,13 +1,3 @@
-pub mod delete;
-pub mod exists;
-pub mod link;
-pub mod metadata;
-pub mod r#move;
-pub mod restore;
-pub mod trash;
-pub mod version;
-pub mod versions;
-
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
@@ -19,30 +9,29 @@ use crate::{
 	fs::{ParentUuid, UuidStr},
 };
 
-pub const ENDPOINT: &str = "v3/file";
+pub const ENDPOINT: &str = "v3/file/version/restore";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub uuid: UuidStr,
+	pub current: UuidStr,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
 	pub uuid: UuidStr,
-	pub region: Cow<'a, str>,
-	pub bucket: Cow<'a, str>,
-	pub name_encrypted: EncryptedString<'a>,
-	pub name_hashed: Cow<'a, str>,
-	pub size_encrypted: EncryptedString<'a>,
-	pub mime_encrypted: EncryptedString<'a>,
+	#[serde(rename = "currentUUID")]
+	pub current_uuid: UuidStr,
 	pub metadata: EncryptedString<'a>,
+	pub bucket: Cow<'a, str>,
+	pub region: Cow<'a, str>,
+	pub chunks: u64,
+	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
-	pub size: u64,
-	pub parent: ParentUuid,
-	pub versioned: bool,
-	pub trash: bool,
 	pub version: FileEncryptionVersion,
+	#[serde(with = "crate::serde::boolean::number")]
+	pub favorited: bool,
 }

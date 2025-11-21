@@ -5,6 +5,8 @@ pub(crate) mod metadata;
 pub(crate) mod r#move;
 pub(crate) mod restore;
 pub(crate) mod trash;
+pub(crate) mod version;
+pub(crate) mod versions;
 
 pub use filen_types::api::v3::file::{ENDPOINT, Request, Response};
 
