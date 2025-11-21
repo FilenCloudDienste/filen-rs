@@ -9,7 +9,6 @@ mod params;
 mod returned_types;
 #[cfg(all(target_family = "wasm", target_os = "unknown",))]
 mod service_worker;
-mod shared;
 #[cfg(all(test, feature = "wasm-full"))]
 mod test;
 #[cfg(feature = "uniffi")]
@@ -28,6 +27,5 @@ pub use params::*;
 pub use returned_types::*;
 #[cfg(feature = "wasm-full")]
 pub(crate) use service_worker::shared::*;
-use shared::*;
 
 const HIDDEN_META_KEY: &str = "__hiddenMeta";

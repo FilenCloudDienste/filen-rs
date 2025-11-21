@@ -9,7 +9,11 @@ import init, {
 	FilenSDKError,
 	EventListenerHandle,
 	type SocketEvent,
-	decryptMetaWithChatKey
+	decryptMetaWithChatKey,
+	type FileMeta,
+	type DecryptedFileMeta,
+	type DecryptedDirMeta,
+	type DirMeta
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
@@ -98,6 +102,22 @@ afterEach(() => {
 	}
 })
 
+function getFileMeta(meta: FileMeta): DecryptedFileMeta | null {
+	if (meta.type === "Decoded") {
+		return meta
+	} else {
+		return null
+	}
+}
+
+function getDirMeta(meta: DirMeta): DecryptedDirMeta | null {
+	if (meta.type === "Decoded") {
+		return meta
+	} else {
+		return null
+	}
+}
+
 test("login", async () => {
 	expect(state).toBeDefined()
 	expect(state.root().uuid).toBeDefined()
@@ -131,9 +151,10 @@ test("Directory", async () => {
 	expect(dir).toBeDefined()
 	expect(dir.uuid).toBeDefined()
 	expect(dir.parent).toBe(testDir.uuid)
-	expect(dir.meta?.name).toBe("test-dir")
-	expect(dir.meta?.created).toBeGreaterThanOrEqual(before)
-	expect(dir.meta?.created).toBeLessThanOrEqual(after)
+	const meta = getDirMeta(dir.meta)
+	expect(meta?.name).toBe("test-dir")
+	expect(meta?.created).toBeGreaterThanOrEqual(before)
+	expect(meta?.created).toBeLessThanOrEqual(after)
 	dir = await state.trashDir(dir)
 	expect(dir.parent).toBe("trash")
 	await state.deleteDirPermanently(dir)
@@ -151,10 +172,11 @@ test("File", async () => {
 	expect(file).toBeDefined()
 	expect(file.uuid).toBeDefined()
 	expect(file.parent).toBe(testDir.uuid)
-	expect(file.meta?.name).toBe("test-file.txt")
-	expect(file.meta?.created).toStrictEqual(created)
-	expect(file.meta?.modified).toBeGreaterThanOrEqual(before)
-	expect(file.meta?.modified).toBeLessThanOrEqual(after)
+	const meta = getFileMeta(file.meta)
+	expect(meta?.name).toBe("test-file.txt")
+	expect(meta?.created).toStrictEqual(created)
+	expect(meta?.modified).toBeGreaterThanOrEqual(before)
+	expect(meta?.modified).toBeLessThanOrEqual(after)
 	expect(file.size).toBe(BigInt("test-file.txt".length))
 	const data = await state.downloadFile(file)
 	expect(new TextDecoder().decode(data)).toBe("test-file.txt")
@@ -277,8 +299,9 @@ test("abort", async () => {
 
 	expect(files).toContainEqual(fileB)
 	for (const file of files) {
-		expect(file.meta?.name).not.toBe("abort a.txt")
-		expect(file.meta?.name).not.toBe("abort c.txt")
+		const meta = getFileMeta(file.meta)
+		expect(meta?.name).not.toBe("abort a.txt")
+		expect(meta?.name).not.toBe("abort c.txt")
 	}
 })
 
@@ -329,7 +352,8 @@ test("pause", async () => {
 	const fileC = await fileCPromise
 	console.log("file c done")
 	expect(fileC).toBeDefined()
-	expect(fileC.meta?.name).toBe("pause c.txt")
+	const metaC = getFileMeta(fileC.meta)
+	expect(metaC?.name).toBe("pause c.txt")
 	await new Promise(resolve => setTimeout(resolve, 5000))
 	expect(fileAPromiseResolved).toBe(false)
 	expect(fileBPromiseResolved).toBe(false)
@@ -339,14 +363,16 @@ test("pause", async () => {
 	const fileA = await fileAPromise
 	console.log("file a done")
 	expect(fileA).toBeDefined()
-	expect(fileA.meta?.name).toBe("pause a.txt")
+	const metaA = getFileMeta(fileA.meta)
+	expect(metaA?.name).toBe("pause a.txt")
 	console.log("awaiting b")
 	await new Promise(resolve => setTimeout(resolve, 5000))
 	console.log("checking b")
 	expect(fileBPromiseResolved).toBe(true)
 	const fileB = await fileBPromise
 	expect(fileB).toBeDefined()
-	expect(fileB.meta?.name).toBe("pause b.txt")
+	const metaB = getFileMeta(fileB.meta)
+	expect(metaB?.name).toBe("pause b.txt")
 })
 
 test("Zip Download", async () => {
@@ -396,8 +422,9 @@ test("Zip Download", async () => {
 			throw new Error("Expected entry to be a FileEntry, but it was a directory")
 		}
 		// zip.js has bad precision for dates, so we compare in seconds
-		expect(BigInt(entry.creationDate!.getTime())).toEqual(expectedFile.meta?.created)
-		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(expectedFile.meta?.modified) / 1000))
+		const meta = getFileMeta(expectedFile.meta)
+		expect(BigInt(entry.creationDate!.getTime())).toEqual(meta?.created)
+		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(meta?.modified) / 1000))
 		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
 		const { readable, writable } = new TransformStream()
 		// we don't await here because TransformStream doesn't have a buffer
@@ -519,7 +546,7 @@ test("thumbnail", async () => {
 			})
 
 			if (!file.canMakeThumbnail) {
-				console.warn(`Skipping thumbnail test for unsupported mime type: ${file.meta?.mime}`)
+				console.warn(`Skipping thumbnail test for unsupported mime type: ${getFileMeta(file.meta)?.mime}`)
 				return
 			}
 
@@ -562,34 +589,38 @@ test("meta updates", async () => {
 		parent: testDir,
 		name: "meta-file.txt"
 	})
-
-	expect(file.meta?.name).toBe("meta-file.txt")
-	expect(file.meta?.created).toBeDefined()
-	expect(file.meta?.modified).toBeDefined()
+	const meta = getFileMeta(file.meta)
+	expect(meta?.name).toBe("meta-file.txt")
+	expect(meta?.created).toBeDefined()
+	expect(meta?.modified).toBeDefined()
 
 	let updatedFile = await state.updateFileMetadata(file, {
 		created: null
 	})
-	expect(updatedFile.meta?.created).toBeUndefined()
+	const updatedMeta = getFileMeta(updatedFile.meta)
+	expect(updatedMeta?.created).toBeUndefined()
 
 	updatedFile = await state.updateFileMetadata(file, {
 		name: "meta-file-renamed.txt"
 	})
-	expect(updatedFile.meta?.name).toBe("meta-file-renamed.txt")
+	const renamedMeta = getFileMeta(updatedFile.meta)
+	expect(renamedMeta?.name).toBe("meta-file-renamed.txt")
 
 	const dir = await state.createDir(testDir, "meta-dir")
-	expect(dir.meta?.name).toBe("meta-dir")
-	expect(dir.meta?.created).toBeDefined()
-
+	const dirMeta = getDirMeta(dir.meta)
+	expect(dirMeta?.name).toBe("meta-dir")
+	expect(dirMeta?.created).toBeDefined()
 	let updatedDir = await state.updateDirMetadata(dir, {
 		created: null
 	})
-	expect(updatedDir.meta?.created).toBeUndefined()
+	const updatedDirMeta = getDirMeta(updatedDir.meta)
+	expect(updatedDirMeta?.created).toBeUndefined()
 
 	updatedDir = await state.updateDirMetadata(dir, {
 		name: "meta-dir-renamed"
 	})
-	expect(updatedDir.meta?.name).toBe("meta-dir-renamed")
+	const renamedDirMeta = getDirMeta(updatedDir.meta)
+	expect(renamedDirMeta?.name).toBe("meta-dir-renamed")
 
 	updatedFile = (await state.setFavorite(updatedFile, true)) as File
 	updatedDir = (await state.setFavorite(updatedDir, true)) as Dir
