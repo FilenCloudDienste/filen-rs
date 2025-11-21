@@ -433,6 +433,7 @@ pub struct FileRename<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct FileArchiveRestored<'a> {
+	#[serde(rename = "currentUUID")]
 	pub current_uuid: UuidStr,
 	pub parent: ParentUuid,
 	pub uuid: UuidStr,

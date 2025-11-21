@@ -64,6 +64,10 @@ pub(super) const PING_INTERVAL: Duration = Duration::from_secs(15);
 pub(super) const WEBSOCKET_URL_CORE: &str =
 	"wss://socket.filen.io/socket.io/?EIO=3&transport=websocket&t=";
 
+pub(super) const AUTHED_TRUE: &str = r#"["authed",true]"#;
+pub(super) const VERSIONED_EVENT_PREFIXES: &[&str] =
+	&[r#"["file-versioned","#, r#"["fileVersioned","#];
+
 mod listener_manager {
 	use std::{
 		borrow::Cow,
@@ -752,25 +756,31 @@ impl<'a> FromEncryptedSocketEvent<'a> for FileRename<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileArchiveRestored(pub RemoteFile);
+pub struct FileArchiveRestored {
+	pub current_uuid: UuidStr,
+	pub file: RemoteFile,
+}
 
 impl<'a> FromEncryptedSocketEvent<'a> for FileArchiveRestored {
 	type Event = filen_types::api::v3::socket::FileArchiveRestored<'a>;
 
 	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
 		// todo, what is the difference between uuid and current_uuid here?
-		Self(RemoteFile {
-			uuid: event.current_uuid,
-			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
-				.into_owned_cow(),
-			parent: event.parent,
-			size: 0, // TODO fix
-			favorited: event.favorited,
-			region: event.region.into_owned(),
-			bucket: event.bucket.into_owned(),
-			timestamp: event.timestamp,
-			chunks: event.chunks,
-		})
+		Self {
+			current_uuid: event.current_uuid,
+			file: RemoteFile {
+				uuid: event.uuid,
+				meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
+					.into_owned_cow(),
+				parent: event.parent,
+				size: 0, // TODO fix
+				favorited: event.favorited,
+				region: event.region.into_owned(),
+				bucket: event.bucket.into_owned(),
+				timestamp: event.timestamp,
+				chunks: event.chunks,
+			},
+		}
 	}
 }
 

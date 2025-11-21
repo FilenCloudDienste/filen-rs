@@ -289,10 +289,20 @@ fn try_parse_message(
 
 			let event_str = &msg.as_str()[2..];
 
-			if event_str == r#"["authed",true]"# {
+			if event_str == AUTHED_TRUE {
 				// ignore authed true messages
 				return Ok(None);
 			}
+
+			// these are duplicates of FileArchived, so we can just ignore them
+			if VERSIONED_EVENT_PREFIXES
+				.iter()
+				.any(|prefix| event_str.starts_with(prefix))
+			{
+				// ignore versioned events for now
+				return Ok(None);
+			}
+
 			match serde_json::from_str::<SocketEvent>(event_str) {
 				Ok(parsed_event) => Ok(Some(parsed_event)),
 				Err(e) => Err(Error::custom_with_source(

@@ -4,7 +4,11 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
-	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
+	fs::{
+		HasUUID,
+		dir::meta::DirectoryMetaChanges,
+		file::meta::{FileMeta, FileMetaChanges},
+	},
 	socket::DecryptedSocketEvent,
 };
 use filen_types::{api::v3::dir::color::DirColor, crypto::MaybeEncrypted, traits::CowHelpers};
@@ -13,6 +17,7 @@ async fn await_event<F, T>(
 	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
 	mut filter: F,
 	timeout: Duration,
+	event: &str,
 ) -> T
 where
 	F: FnMut(&T) -> bool,
@@ -21,7 +26,7 @@ where
 	loop {
 		tokio::select! {
 			_ = tokio::time::sleep_until(sleep_until) => {
-				panic!("Timed out waiting for event");
+				panic!("Timed out waiting for event {event}");
 			}
 			event = receiver.recv() => {
 				let event = event.expect("Expected to receive event");
@@ -37,6 +42,7 @@ async fn await_map_event<F, T, R>(
 	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
 	mut filter: F,
 	timeout: Duration,
+	event: &str,
 ) -> R
 where
 	F: FnMut(T) -> Option<R>,
@@ -45,7 +51,7 @@ where
 	loop {
 		tokio::select! {
 			_ = tokio::time::sleep_until(sleep_until) => {
-				panic!("Timed out waiting for event");
+				panic!("Timed out waiting for event {event}");
 			}
 			event = receiver.recv() => {
 				let event = event.expect("Expected to receive event");
@@ -100,6 +106,7 @@ async fn test_websocket_auth() {
 		&mut events_receiver,
 		|event| *event == DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(20),
+		"authSuccess",
 	)
 	.await;
 }
@@ -133,6 +140,7 @@ async fn test_websocket_event_filtering() {
 		&mut events_receiver,
 		|event| *event == DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(20),
+		"authSuccess",
 	)
 	.await;
 
@@ -172,6 +180,7 @@ async fn test_websocket_bad_auth() {
 		&mut events_receiver,
 		|event| *event == DecryptedSocketEvent::AuthFailed,
 		Duration::from_secs(5),
+		"authFailed",
 	)
 	.await;
 }
@@ -211,6 +220,7 @@ async fn test_websocket_file_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"fileNew",
 	)
 	.await;
 
@@ -226,6 +236,7 @@ async fn test_websocket_file_events() {
 			_ => false,
 		},
 		Duration::from_secs(20),
+		"fileTrash",
 	)
 	.await;
 
@@ -244,11 +255,78 @@ async fn test_websocket_file_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"fileRestore",
 	)
 	.await;
 
 	event.0.size = file_a.size;
 	assert_eq!(event.0, file_a);
+
+	let old_file_a = file_a;
+
+	let file_a = client.make_file_builder("file_a.txt", dir).build();
+	let mut file_a = client
+		.upload_file(file_a.into(), b"file b contents")
+		.await
+		.unwrap();
+
+	await_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileArchived(file) => file.uuid == *old_file_a.uuid(),
+			_ => false,
+		},
+		Duration::from_secs(20),
+		"fileArchived",
+	)
+	.await;
+
+	let old_version = client
+		.list_file_versions(&file_a)
+		.await
+		.unwrap()
+		.pop()
+		.unwrap();
+
+	client
+		.restore_file_version(&mut file_a, old_version)
+		.await
+		.unwrap();
+
+	let mut event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileArchiveRestored(file)
+				if file.file.uuid() == file_a.uuid() =>
+			{
+				Some(file)
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+		"fileArchiveRestored",
+	)
+	.await;
+	if let (FileMeta::Decoded(event_meta), FileMeta::Decoded(meta)) =
+		(&mut event.file.meta, &file_a.meta)
+	{
+		// restore file version updates the last modified time to fix a bug in the old sync engine
+		// so we need to adjust that here before we assert_eq
+		event_meta.last_modified = meta.last_modified;
+	}
+	event.file.size = file_a.size;
+	assert_eq!(event.file, file_a);
+
+	await_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::FileMetadataChanged(data) => data.uuid == *file_a.uuid(),
+			_ => false,
+		},
+		Duration::from_secs(20),
+		"fileMetadataChanged",
+	)
+	.await;
 
 	let old_file_a = file_a.clone();
 	let new_name = "file_a_renamed.txt";
@@ -276,6 +354,7 @@ async fn test_websocket_file_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"fileMetadataChanged",
 	)
 	.await;
 
@@ -306,6 +385,7 @@ async fn test_websocket_file_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"fileMove",
 	)
 	.await;
 
@@ -322,6 +402,7 @@ async fn test_websocket_file_events() {
 			_ => false,
 		},
 		Duration::from_secs(20),
+		"fileDeletedPermanent",
 	)
 	.await;
 }
@@ -356,6 +437,7 @@ async fn test_websocket_folder_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"folderSubCreated",
 	)
 	.await;
 	assert_eq!(event.0, dir_a);
@@ -368,6 +450,7 @@ async fn test_websocket_folder_events() {
 			_ => false,
 		},
 		Duration::from_secs(20),
+		"folderTrash",
 	)
 	.await;
 
@@ -385,6 +468,7 @@ async fn test_websocket_folder_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"folderRestore",
 	)
 	.await;
 	assert_eq!(event.0, dir_a);
@@ -411,6 +495,7 @@ async fn test_websocket_folder_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"folderMetadataChanged",
 	)
 	.await;
 	assert_eq!(event.meta, dir_a.meta);
@@ -434,6 +519,7 @@ async fn test_websocket_folder_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"folderMove",
 	)
 	.await;
 	assert_eq!(event.0, dir_a);
@@ -457,6 +543,7 @@ async fn test_websocket_folder_events() {
 			_ => None,
 		},
 		Duration::from_secs(20),
+		"folderColorChanged",
 	)
 	.await;
 
@@ -472,6 +559,7 @@ async fn test_websocket_folder_events() {
 			_ => false,
 		},
 		Duration::from_secs(20),
+		"folderDeletedPermanent",
 	)
 	.await;
 }

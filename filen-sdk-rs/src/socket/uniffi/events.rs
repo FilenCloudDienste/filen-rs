@@ -180,13 +180,15 @@ impl From<&crate::socket::shared::FileRename<'_>> for FileRename {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FileArchiveRestored {
+	pub current_uuid: UuidStr,
 	pub file: File,
 }
 
 impl From<&crate::socket::shared::FileArchiveRestored> for FileArchiveRestored {
 	fn from(event: &crate::socket::shared::FileArchiveRestored) -> Self {
 		Self {
-			file: (event.0.clone()).into(),
+			current_uuid: event.current_uuid,
+			file: (event.file.clone()).into(),
 		}
 	}
 }
