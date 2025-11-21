@@ -370,10 +370,20 @@ impl Client {
 		.await?;
 
 		let messages = do_cpu_intensive(|| {
-			resp.0
+			let mut resp = resp
+				.0
 				.into_maybe_par_iter()
 				.map(|message| ChatMessage::blocking_decrypt(message, chat.key.as_ref()))
-				.collect::<Vec<_>>()
+				.collect::<Vec<_>>();
+			resp.sort_by(|a, b| {
+				let order = a.sent_timestamp.cmp(&b.sent_timestamp);
+				if order == std::cmp::Ordering::Equal {
+					a.inner.uuid.as_ref().cmp(b.inner.uuid.as_ref())
+				} else {
+					order
+				}
+			});
+			resp
 		})
 		.await;
 
@@ -449,10 +459,17 @@ impl Client {
 		let resp = api::v3::chat::conversations::get(self.client()).await?;
 
 		Ok(do_cpu_intensive(|| {
-			resp.0
+			let mut chats = resp
+				.0
 				.into_maybe_par_iter()
 				.map(|chat| self.blocking_decrypt_chat(chat))
-				.collect::<Vec<_>>()
+				.collect::<Vec<_>>();
+			chats.sort_by_key(|c| {
+				c.last_message()
+					.map(|m| m.sent_timestamp)
+					.unwrap_or(c.created)
+			});
+			chats
 		})
 		.await)
 	}
