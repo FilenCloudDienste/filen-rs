@@ -388,8 +388,8 @@ impl From<&crate::socket::shared::NoteParticipantNew<'_>> for NoteParticipantNew
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ChatMessageEdited;
 
-impl From<&crate::socket::shared::ChatMessageEdited> for ChatMessageEdited {
-	fn from(_event: &crate::socket::shared::ChatMessageEdited) -> Self {
+impl From<&crate::socket::shared::ChatMessageEdited<'_>> for ChatMessageEdited {
+	fn from(_event: &crate::socket::shared::ChatMessageEdited<'_>) -> Self {
 		Self
 	}
 }

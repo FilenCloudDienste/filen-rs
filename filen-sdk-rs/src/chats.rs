@@ -303,6 +303,10 @@ impl ChatMessage {
 		self.inner.message.as_deref()
 	}
 
+	pub fn uuid(&self) -> &UuidStr {
+		&self.inner.uuid
+	}
+
 	pub fn into_inner(self) -> ChatMessagePartial {
 		self.inner
 	}
@@ -312,7 +316,7 @@ impl ChatMessage {
 	}
 }
 
-mod crypto {
+pub(crate) mod crypto {
 	use std::borrow::Cow;
 
 	use serde::{Deserialize, Serialize};
@@ -327,7 +331,7 @@ mod crypto {
 	impl_note_or_chat_carrier_crypto!(ChatName, name, "chat name", str);
 
 	#[derive(Deserialize, Serialize)]
-	pub(super) struct ChatMessage<'a> {
+	pub(crate) struct ChatMessage<'a> {
 		#[serde(borrow)]
 		message: Cow<'a, str>,
 	}

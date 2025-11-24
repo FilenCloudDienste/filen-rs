@@ -743,4 +743,27 @@ async fn chat() {
 	.await;
 
 	assert_eq!(&event.0, msg);
+
+	let mut msg = msg.clone();
+
+	client
+		.edit_message(&chat, &mut msg, "hello edited".to_string())
+		.await
+		.unwrap();
+
+	let event = await_map_event(
+		&mut share_receiver,
+		|event| match event {
+			DecryptedSocketEvent::ChatMessageEdited(data) if data.uuid == *msg.uuid() => Some(data),
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"chatMessageEdited",
+	)
+	.await;
+
+	assert_eq!(
+		MaybeEncrypted::Decrypted(Cow::Borrowed(msg.message().unwrap())),
+		event.new_content
+	);
 }

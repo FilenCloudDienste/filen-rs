@@ -1107,6 +1107,7 @@ pub struct ChatMessageEdited<'a> {
 		tsify(type = "bigint")
 	)]
 	pub edited_timestamp: DateTime<Utc>,
+	pub metadata: RSAEncryptedString<'a>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
