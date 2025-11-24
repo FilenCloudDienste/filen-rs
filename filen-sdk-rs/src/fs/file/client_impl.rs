@@ -147,7 +147,7 @@ impl Client {
 			response.region,
 			response.bucket,
 			response.timestamp,
-			false,
+			response.favorited,
 			meta,
 		))
 	}
@@ -241,7 +241,7 @@ impl Client {
 		version: FileVersion,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
-		let response = api::v3::file::version::restore::post(
+		api::v3::file::version::restore::post(
 			self.client(),
 			&api::v3::file::version::restore::Request {
 				current: *file.uuid(),
@@ -259,7 +259,6 @@ impl Client {
 		file.timestamp = version.timestamp;
 		file.meta = version.metadata;
 		file.uuid = version.uuid;
-		file.favorited = response.favorited;
 		// need to do this or the old sync engine doesn't work properly because it relies purely on modtime.
 		self.update_file_metadata(file, FileMetaChanges::default().last_modified(Utc::now()))
 			.await?;

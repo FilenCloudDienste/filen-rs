@@ -45,4 +45,5 @@ pub struct Response<'a> {
 	pub versioned: bool,
 	pub trash: bool,
 	pub version: FileEncryptionVersion,
+	pub favorited: bool,
 }
