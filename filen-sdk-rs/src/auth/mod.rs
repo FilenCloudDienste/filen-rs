@@ -240,7 +240,7 @@ pub struct Client {
 	meta_encryption_version: MetaEncryptionVersion,
 
 	public_key: RsaPublicKey,
-	private_key: RsaPrivateKey,
+	private_key: Arc<RsaPrivateKey>,
 	pub(crate) hmac_key: HMACKey,
 
 	http_client: Arc<AuthClient>,
@@ -364,7 +364,7 @@ impl Client {
 			meta_encryption_version,
 			public_key: RsaPublicKey::from(&private_key),
 			hmac_key: HMACKey::new(&private_key),
-			private_key,
+			private_key: Arc::new(private_key),
 			http_client: http_client.clone(),
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
@@ -415,6 +415,10 @@ impl Client {
 
 	pub fn private_key(&self) -> &RsaPrivateKey {
 		&self.private_key
+	}
+
+	pub fn arc_private_key(&self) -> Arc<RsaPrivateKey> {
+		self.private_key.clone()
 	}
 
 	pub fn public_key(&self) -> &RsaPublicKey {
@@ -602,7 +606,7 @@ impl Client {
 			file_encryption_version,
 			meta_encryption_version,
 			public_key,
-			private_key,
+			private_key: Arc::new(private_key),
 			hmac_key: hmac,
 			http_client: http_client.clone(),
 			drive_lock: tokio::sync::RwLock::new(None),

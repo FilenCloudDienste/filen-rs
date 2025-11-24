@@ -13,7 +13,7 @@ use crate::{
 		notes::{NoteParticipant, NoteType},
 	},
 	auth::FileEncryptionVersion,
-	crypto::EncryptedString,
+	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ObjectType, ParentUuid, UuidStr},
 	traits::CowHelpers,
 };
@@ -773,6 +773,8 @@ pub struct ChatMessageNew<'a> {
 	pub embed_disabled: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub sent_timestamp: DateTime<Utc>,
+	#[serde(borrow)]
+	pub metadata: RSAEncryptedString<'a>,
 }
 
 impl<'a> From<ChatMessageNew<'a>> for ChatMessageEncrypted<'a> {

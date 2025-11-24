@@ -6,6 +6,7 @@ use filen_types::{
 	traits::CowHelpers,
 };
 use futures::{SinkExt, StreamExt, stream::FuturesOrdered};
+use rsa::RsaPrivateKey;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
@@ -30,7 +31,7 @@ impl Client {
 	) -> Result<ListenerHandle, Error> {
 		let request_sender = {
 			let mut socket_handle = self.socket_handle.lock().unwrap_or_else(|e| e.into_inner());
-			socket_handle.get_request_sender(self.arc_client_ref(), self.crypter())
+			socket_handle.get_request_sender(self.arc_client_ref(), self)
 		};
 		request_sender
 			.add_event_listener(callback, event_types)
@@ -100,15 +101,20 @@ impl RequestSender {
 impl WebSocketHandle {
 	fn get_request_sender(
 		&mut self,
-		client: &Arc<AuthClient>,
-		crypter: Arc<impl MetaCrypter + 'static>,
+		auth_client: &Arc<AuthClient>,
+		client: &Client,
 	) -> RequestSender {
 		if let Some(weak_sender) = &self.request_sender
 			&& let Some(sender) = weak_sender.upgrade()
 		{
 			return RequestSender(sender);
 		}
-		let sender = spawn_websocket_thread(Arc::clone(client), crypter);
+
+		let sender = spawn_websocket_thread(
+			Arc::clone(auth_client),
+			client.crypter(),
+			client.arc_private_key(),
+		);
 		self.request_sender = Some(sender.downgrade());
 		RequestSender(sender)
 	}
@@ -368,6 +374,7 @@ async fn handle_initialized_websocket(
 	request_receiver: &mut tokio::sync::mpsc::Receiver<SocketRequest>,
 	listeners: &mut ConnectedListenerManager,
 	crypter: &impl MetaCrypter,
+	private_key: &RsaPrivateKey,
 ) -> bool {
 	let ping_task = spawn_ping_task(streams.write, config.ping_interval);
 	let mut should_retry = true;
@@ -411,7 +418,7 @@ async fn handle_initialized_websocket(
 								// this performs unnecessary cloning, ideally we would use an async
 								// yoke try_map_project_async but this does not currently exist
 								// https://github.com/unicode-org/icu4x/issues/7253
-								match DecryptedSocketEvent::try_from_encrypted(crypter, event_yoke.get().as_borrowed_cow()).await {
+								match DecryptedSocketEvent::try_from_encrypted(crypter, private_key, event_yoke.get().as_borrowed_cow()).await {
 									Ok(v) => Some(v.into_owned_cow()),
 									Err(e) => {
 										log::error!(
@@ -486,6 +493,7 @@ async fn initialize_websocket(
 fn spawn_websocket_thread(
 	client: Arc<AuthClient>,
 	crypter: Arc<impl MetaCrypter + 'static>,
+	private_key: Arc<RsaPrivateKey>,
 ) -> tokio::sync::mpsc::Sender<SocketRequest> {
 	let (request_sender, mut request_receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
 
@@ -526,6 +534,7 @@ fn spawn_websocket_thread(
 					&mut request_receiver,
 					&mut connected_listeners,
 					&*crypter,
+					&private_key,
 				)
 				.await;
 

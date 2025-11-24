@@ -1,7 +1,9 @@
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
+use chrono::{DateTime, Utc};
 use filen_types::{
 	api::v3::{
+		chat::messages::ChatMessageEncrypted,
 		dir::color::DirColor,
 		socket::{MessageType, PacketType, SocketEvent},
 	},
@@ -10,6 +12,7 @@ use filen_types::{
 	fs::UuidStr,
 	traits::CowHelpers,
 };
+use rsa::RsaPrivateKey;
 use yoke::Yokeable;
 
 pub use filen_types::api::v3::socket::{
@@ -23,9 +26,9 @@ pub use filen_types::api::v3::socket::{
 use crate::{
 	Error, ErrorKind,
 	auth::http::AuthClient,
-	chats::ChatParticipant,
+	chats::{ChatMessage, ChatParticipant},
 	consts::CHUNK_SIZE,
-	crypto::shared::MetaCrypter,
+	crypto::{notes_and_chats::NoteOrChatKeyStruct, shared::MetaCrypter},
 	fs::{
 		NonRootFSObject,
 		dir::{RemoteDirectory, meta::DirectoryMeta},
@@ -537,6 +540,7 @@ impl DecryptedSocketEvent<'_> {
 
 	pub(crate) async fn try_from_encrypted<'a>(
 		crypter: &impl MetaCrypter,
+		private_key: &RsaPrivateKey,
 		event: SocketEvent<'a>,
 	) -> Result<DecryptedSocketEvent<'a>, Error> {
 		Ok(match event {
@@ -621,11 +625,11 @@ impl DecryptedSocketEvent<'_> {
 			SocketEvent::PasswordChanged => DecryptedSocketEvent::PasswordChanged,
 			SocketEvent::ChatMessageNew(e) => {
 				runtime::do_cpu_intensive(|| {
-					DecryptedSocketEvent::ChatMessageNew(ChatMessageNew::blocking_from_encrypted(
-						crypter, e,
+					Ok::<_, Error>(DecryptedSocketEvent::ChatMessageNew(
+						ChatMessageNew::try_blocking_from_rsa_encrypted(private_key, e)?,
 					))
 				})
-				.await
+				.await?
 			}
 			SocketEvent::ChatTyping(e) => DecryptedSocketEvent::ChatTyping(e),
 			SocketEvent::ChatConversationsNew(e) => {
@@ -923,13 +927,26 @@ impl<'a> FolderRestore {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatMessageNew;
+pub struct ChatMessageNew(pub ChatMessage);
 impl<'a> ChatMessageNew {
-	fn blocking_from_encrypted(
-		_crypter: &impl MetaCrypter,
-		_event: filen_types::api::v3::socket::ChatMessageNew<'a>,
-	) -> Self {
-		Self
+	fn try_blocking_from_rsa_encrypted(
+		private_key: &RsaPrivateKey,
+		event: filen_types::api::v3::socket::ChatMessageNew<'a>,
+	) -> Result<Self, Error> {
+		let key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)?;
+		let chat_message_encrypted = ChatMessageEncrypted {
+			chat: event.chat,
+			inner: event.inner,
+			reply_to: event.reply_to,
+			embed_disabled: event.embed_disabled,
+			edited: false,
+			edited_timestamp: DateTime::<Utc>::default(),
+			sent_timestamp: event.sent_timestamp,
+		};
+		Ok(Self(ChatMessage::blocking_decrypt(
+			chat_message_encrypted,
+			Some(&key),
+		)))
 	}
 }
 

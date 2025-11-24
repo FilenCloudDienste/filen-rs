@@ -275,7 +275,7 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-	fn blocking_decrypt(
+	pub(crate) fn blocking_decrypt(
 		encrypted: filen_types::api::v3::chat::messages::ChatMessageEncrypted<'_>,
 		private_key: Option<&NoteOrChatKey>,
 	) -> Self {

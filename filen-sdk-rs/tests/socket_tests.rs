@@ -658,7 +658,7 @@ async fn chat() {
 	assert_eq!(event.sender_email, client.email());
 	let info = client.get_user_info().await.unwrap();
 	assert_eq!(event.sender_id, info.id);
-	assert_eq!(event.sender_avatar, Some(info.avatar_url));
+	assert_eq!(event.sender_avatar.unwrap_or_default(), info.avatar_url);
 
 	let share_contact = client
 		.get_contacts()
@@ -668,7 +668,7 @@ async fn chat() {
 		.find(|c| c.email == share_client.email())
 		.unwrap();
 
-	let chat = client.create_chat(&[share_contact]).await.unwrap();
+	let mut chat = client.create_chat(&[share_contact]).await.unwrap();
 
 	// let event = await_map_event(
 	// 	&mut receiver,
@@ -723,4 +723,24 @@ async fn chat() {
 	.await;
 
 	assert_eq!(event.participant.email(), share_client.email());
+
+	let msg = client
+		.send_chat_message(&mut chat, "hello".to_string(), None)
+		.await
+		.unwrap();
+
+	let event = await_map_event(
+		&mut share_receiver,
+		|event| match event {
+			DecryptedSocketEvent::ChatMessageNew(data) if data.0.message() == msg.message() => {
+				Some(data)
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"chatMessageNew",
+	)
+	.await;
+
+	assert_eq!(&event.0, msg);
 }
