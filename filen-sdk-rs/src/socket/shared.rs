@@ -22,9 +22,12 @@ pub use filen_types::api::v3::socket::{
 };
 
 use crate::{
+	Error, ErrorKind,
 	auth::http::AuthClient,
+	consts::CHUNK_SIZE,
 	crypto::shared::MetaCrypter,
 	fs::{
+		NonRootFSObject,
 		dir::{RemoteDirectory, meta::DirectoryMeta},
 		file::{RemoteFile, meta::FileMeta},
 	},
@@ -691,11 +694,11 @@ impl DecryptedSocketEvent<'_> {
 			}
 			SocketEvent::ItemFavorite(e) => {
 				runtime::do_cpu_intensive(|| {
-					DecryptedSocketEvent::ItemFavorite(ItemFavorite::blocking_from_encrypted(
-						crypter, e,
+					Ok::<_, Error>(DecryptedSocketEvent::ItemFavorite(
+						ItemFavorite::try_blocking_from_encrypted(crypter, e)?,
 					))
 				})
-				.await
+				.await?
 			}
 			SocketEvent::ChatConversationParticipantNew(e) => {
 				runtime::do_cpu_intensive(|| {
@@ -991,13 +994,83 @@ impl<'a> ChatConversationNameEdited {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ItemFavorite;
+pub struct ItemFavorite(pub NonRootFSObject<'static>);
 impl<'a> ItemFavorite {
-	fn blocking_from_encrypted(
-		_crypter: &impl MetaCrypter,
-		_event: filen_types::api::v3::socket::ItemFavorite<'a>,
-	) -> Self {
-		Self
+	fn try_blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::ItemFavorite<'a>,
+	) -> Result<Self, Error> {
+		Ok(ItemFavorite(match event.item_type {
+			filen_types::fs::ObjectType::File => {
+				let size = event.size.ok_or_else(|| {
+					Error::custom(ErrorKind::Response, "missing size for file favorite event")
+				})?;
+				NonRootFSObject::File(Cow::Owned(RemoteFile {
+					uuid: event.uuid,
+					meta: FileMeta::blocking_from_encrypted(
+						event.metadata.ok_or_else(|| {
+							Error::custom(
+								ErrorKind::Response,
+								"missing metadata for file favorite event",
+							)
+						})?,
+						crypter,
+						event.version.ok_or_else(|| {
+							Error::custom(
+								ErrorKind::Response,
+								"missing version for file favorite event",
+							)
+						})?,
+					)
+					.into_owned_cow(),
+					parent: event.parent,
+					size,
+					favorited: event.value,
+					region: event
+						.region
+						.ok_or_else(|| {
+							Error::custom(
+								ErrorKind::Response,
+								"missing region for file favorite event",
+							)
+						})?
+						.into_owned(),
+					bucket: event
+						.bucket
+						.ok_or_else(|| {
+							Error::custom(
+								ErrorKind::Response,
+								"missing bucket for file favorite event",
+							)
+						})?
+						.into_owned(),
+					timestamp: event.timestamp,
+					// todo use actual chunk count once this is returned from backend
+					chunks: if size == 0 {
+						0
+					} else {
+						size / CHUNK_SIZE as u64 + 1
+					},
+				}))
+			}
+			filen_types::fs::ObjectType::Dir => NonRootFSObject::Dir(Cow::Owned(RemoteDirectory {
+				uuid: event.uuid,
+				parent: event.parent,
+				color: event.color.into_owned_cow(),
+				favorited: event.value,
+				timestamp: event.timestamp,
+				meta: DirectoryMeta::blocking_from_encrypted(
+					event.name_encrypted.ok_or_else(|| {
+						Error::custom(
+							ErrorKind::Response,
+							"missing metadata for file favorite event",
+						)
+					})?,
+					crypter,
+				)
+				.into_owned_cow(),
+			})),
+		}))
 	}
 }
 

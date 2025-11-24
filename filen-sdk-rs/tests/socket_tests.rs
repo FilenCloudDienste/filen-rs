@@ -5,7 +5,7 @@ use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	fs::{
-		HasUUID,
+		HasUUID, NonRootFSObject,
 		dir::meta::DirectoryMetaChanges,
 		file::meta::{FileMeta, FileMetaChanges},
 	},
@@ -281,6 +281,26 @@ async fn test_websocket_file_events() {
 	)
 	.await;
 
+	client.set_favorite(&mut file_a, true).await.unwrap();
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::ItemFavorite(inner) => {
+				if inner.0.uuid() == file_a.uuid() {
+					Some(inner)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+		"itemFavorite",
+	)
+	.await;
+
+	assert_eq!(event.0, NonRootFSObject::File(Cow::Borrowed(&file_a)));
+
 	let old_version = client
 		.list_file_versions(&file_a)
 		.await
@@ -314,6 +334,12 @@ async fn test_websocket_file_events() {
 		// so we need to adjust that here before we assert_eq
 		event_meta.last_modified = meta.last_modified;
 	}
+	// og favorited status is kept in the event and listed history
+	// but is not set in the updated file during restore
+	// so we need to adjust that here before we assert_eq
+	event.file.favorited = file_a.favorited;
+
+	// todo remove when backend gets fixed
 	event.file.size = file_a.size;
 	assert_eq!(event.file, file_a);
 
@@ -472,6 +498,25 @@ async fn test_websocket_folder_events() {
 	)
 	.await;
 	assert_eq!(event.0, dir_a);
+
+	client.set_favorite(&mut dir_a, true).await.unwrap();
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::ItemFavorite(inner) => {
+				if inner.0.uuid() == dir_a.uuid() {
+					Some(inner)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(20),
+		"itemFavorite",
+	)
+	.await;
+	assert_eq!(event.0, NonRootFSObject::Dir(Cow::Borrowed(&dir_a)));
 
 	client
 		.update_dir_metadata(

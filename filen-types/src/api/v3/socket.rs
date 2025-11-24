@@ -1173,8 +1173,21 @@ pub struct ItemFavorite<'a> {
 	pub item_type: ObjectType,
 	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
 	pub value: bool,
+	pub parent: ParentUuid,
 	#[serde(borrow)]
-	pub metadata: EncryptedString<'a>,
+	pub metadata: Option<EncryptedString<'a>>,
+	#[serde(borrow)]
+	pub name_encrypted: Option<EncryptedString<'a>>,
+	#[serde(borrow)]
+	pub region: Option<Cow<'a, str>>,
+	#[serde(borrow)]
+	pub bucket: Option<Cow<'a, str>>,
+	pub size: Option<u64>,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub timestamp: DateTime<Utc>,
+	#[serde(borrow)]
+	pub color: DirColor<'a>,
+	pub version: Option<FileEncryptionVersion>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
