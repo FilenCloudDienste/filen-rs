@@ -409,7 +409,7 @@ pub struct ContactRequestReceived {
 	pub sender_id: u64,
 	pub sender_email: String,
 	pub sender_avatar: Option<String>,
-	pub sender_nick_name: Option<String>,
+	pub sender_nick_name: String,
 	pub sent_timestamp: DateTime<Utc>,
 }
 
@@ -420,7 +420,7 @@ impl From<&crate::socket::shared::ContactRequestReceived<'_>> for ContactRequest
 			sender_id: event.sender_id,
 			sender_email: event.sender_email.to_string(),
 			sender_avatar: event.sender_avatar.as_ref().map(|s| s.to_string()),
-			sender_nick_name: event.sender_nick_name.as_ref().map(|s| s.to_string()),
+			sender_nick_name: event.sender_nick_name.to_string(),
 			sent_timestamp: event.sent_timestamp,
 		}
 	}

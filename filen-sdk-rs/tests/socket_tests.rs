@@ -615,6 +615,7 @@ async fn chat() {
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 	let (share_sender, mut share_receiver) = tokio::sync::mpsc::unbounded_channel();
+
 	let _handle = client
 		.add_event_listener(
 			Box::new(move |event| {
@@ -636,7 +637,28 @@ async fn chat() {
 		.unwrap();
 
 	let _locks = test_utils::set_up_contact(&client, &share_client).await;
-	log::info!("Contact set up done");
+
+	let event = await_map_event(
+		&mut share_receiver,
+		|event| match event {
+			DecryptedSocketEvent::ContactRequestReceived(event) => {
+				if event.sender_email == client.email() {
+					Some(event)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"contactRequestReceived",
+	)
+	.await;
+
+	assert_eq!(event.sender_email, client.email());
+	let info = client.get_user_info().await.unwrap();
+	assert_eq!(event.sender_id, info.id);
+	assert_eq!(event.sender_avatar, Some(info.avatar_url));
 
 	let share_contact = client
 		.get_contacts()

@@ -1143,7 +1143,7 @@ pub struct ContactRequestReceived<'a> {
 	#[serde(borrow)]
 	pub sender_avatar: Option<Cow<'a, str>>,
 	#[serde(borrow)]
-	pub sender_nick_name: Option<Cow<'a, str>>,
+	pub sender_nick_name: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
 		all(
