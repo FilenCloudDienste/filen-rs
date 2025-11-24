@@ -532,11 +532,11 @@ impl DecryptedSocketEvent<'_> {
 		}
 	}
 
-	pub(crate) async fn from_encrypted<'a>(
+	pub(crate) async fn try_from_encrypted<'a>(
 		crypter: &impl MetaCrypter,
 		event: SocketEvent<'a>,
-	) -> DecryptedSocketEvent<'a> {
-		match event {
+	) -> Result<DecryptedSocketEvent<'a>, Error> {
+		Ok(match event {
 			SocketEvent::AuthSuccess => DecryptedSocketEvent::AuthSuccess,
 			SocketEvent::AuthFailed => DecryptedSocketEvent::AuthFailed,
 			SocketEvent::Reconnecting => DecryptedSocketEvent::Reconnecting,
@@ -725,13 +725,8 @@ impl DecryptedSocketEvent<'_> {
 				})
 				.await
 			}
-		}
+		})
 	}
-}
-
-trait FromEncryptedSocketEvent<'a> {
-	type Event;
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
@@ -740,10 +735,11 @@ pub struct FileRename<'a> {
 	pub metadata: FileMeta<'a>,
 }
 
-impl<'a> FromEncryptedSocketEvent<'a> for FileRename<'a> {
-	type Event = filen_types::api::v3::socket::FileRename<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FileRename<'a> {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FileRename<'a>,
+	) -> Self {
 		Self {
 			uuid: event.uuid,
 			metadata: FileMeta::blocking_from_encrypted(
@@ -761,11 +757,11 @@ pub struct FileArchiveRestored {
 	pub file: RemoteFile,
 }
 
-impl<'a> FromEncryptedSocketEvent<'a> for FileArchiveRestored {
-	type Event = filen_types::api::v3::socket::FileArchiveRestored<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
-		// todo, what is the difference between uuid and current_uuid here?
+impl<'a> FileArchiveRestored {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FileArchiveRestored<'a>,
+	) -> Self {
 		Self {
 			current_uuid: event.current_uuid,
 			file: RemoteFile {
@@ -787,10 +783,11 @@ impl<'a> FromEncryptedSocketEvent<'a> for FileArchiveRestored {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileNew(pub RemoteFile);
 
-impl<'a> FromEncryptedSocketEvent<'a> for FileNew {
-	type Event = filen_types::api::v3::socket::FileNew<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FileNew {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FileNew<'a>,
+	) -> Self {
 		Self(RemoteFile {
 			uuid: event.uuid,
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
@@ -809,10 +806,11 @@ impl<'a> FromEncryptedSocketEvent<'a> for FileNew {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRestore(pub RemoteFile);
 
-impl<'a> FromEncryptedSocketEvent<'a> for FileRestore {
-	type Event = filen_types::api::v3::socket::FileRestore<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FileRestore {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FileRestore<'a>,
+	) -> Self {
 		Self(RemoteFile {
 			uuid: event.uuid,
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
@@ -830,10 +828,11 @@ impl<'a> FromEncryptedSocketEvent<'a> for FileRestore {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMove(pub RemoteFile);
-impl<'a> FromEncryptedSocketEvent<'a> for FileMove {
-	type Event = filen_types::api::v3::socket::FileMove<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FileMove {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FileMove<'a>,
+	) -> Self {
 		Self(RemoteFile {
 			uuid: event.uuid,
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
@@ -855,10 +854,11 @@ pub struct FolderRename<'a> {
 	pub uuid: UuidStr,
 }
 
-impl<'a> FromEncryptedSocketEvent<'a> for FolderRename<'a> {
-	type Event = filen_types::api::v3::socket::FolderRename<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FolderRename<'a> {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FolderRename<'a>,
+	) -> Self {
 		Self {
 			uuid: event.uuid,
 			name: match crypter.blocking_decrypt_meta(&event.name) {
@@ -872,10 +872,11 @@ impl<'a> FromEncryptedSocketEvent<'a> for FolderRename<'a> {
 // todo test meta vs name FolderMove
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderMove(pub RemoteDirectory);
-impl<'a> FromEncryptedSocketEvent<'a> for FolderMove {
-	type Event = filen_types::api::v3::socket::FolderMove<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FolderMove {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FolderMove<'a>,
+	) -> Self {
 		Self(RemoteDirectory {
 			uuid: event.uuid,
 			parent: event.parent,
@@ -889,10 +890,11 @@ impl<'a> FromEncryptedSocketEvent<'a> for FolderMove {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderSubCreated(pub RemoteDirectory);
-impl<'a> FromEncryptedSocketEvent<'a> for FolderSubCreated {
-	type Event = filen_types::api::v3::socket::FolderSubCreated<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FolderSubCreated {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FolderSubCreated<'a>,
+	) -> Self {
 		Self(RemoteDirectory {
 			uuid: event.uuid,
 			parent: event.parent,
@@ -906,10 +908,11 @@ impl<'a> FromEncryptedSocketEvent<'a> for FolderSubCreated {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderRestore(pub RemoteDirectory);
-impl<'a> FromEncryptedSocketEvent<'a> for FolderRestore {
-	type Event = filen_types::api::v3::socket::FolderRestore<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FolderRestore {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FolderRestore<'a>,
+	) -> Self {
 		Self(RemoteDirectory {
 			uuid: event.uuid,
 			parent: event.parent,
@@ -923,70 +926,77 @@ impl<'a> FromEncryptedSocketEvent<'a> for FolderRestore {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessageNew;
-impl<'a> FromEncryptedSocketEvent<'a> for ChatMessageNew {
-	type Event = filen_types::api::v3::socket::ChatMessageNew<'a>;
-
-	fn blocking_from_encrypted(_crypter: &impl MetaCrypter, _event: Self::Event) -> Self {
+impl<'a> ChatMessageNew {
+	fn blocking_from_encrypted(
+		_crypter: &impl MetaCrypter,
+		_event: filen_types::api::v3::socket::ChatMessageNew<'a>,
+	) -> Self {
 		Self
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatConversationsNew;
-impl<'a> FromEncryptedSocketEvent<'a> for ChatConversationsNew {
-	type Event = filen_types::api::v3::socket::ChatConversationsNew<'a>;
-
-	fn blocking_from_encrypted(_crypter: &impl MetaCrypter, _event: Self::Event) -> Self {
+impl<'a> ChatConversationsNew {
+	fn blocking_from_encrypted(
+		_crypter: &impl MetaCrypter,
+		_event: filen_types::api::v3::socket::ChatConversationsNew<'a>,
+	) -> Self {
 		Self
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteContentEdited;
-impl<'a> FromEncryptedSocketEvent<'a> for NoteContentEdited {
-	type Event = filen_types::api::v3::socket::NoteContentEdited<'a>;
-
-	fn blocking_from_encrypted(_crypter: &impl MetaCrypter, _event: Self::Event) -> Self {
+impl<'a> NoteContentEdited {
+	fn blocking_from_encrypted(
+		_crypter: &impl MetaCrypter,
+		_event: filen_types::api::v3::socket::NoteContentEdited<'a>,
+	) -> Self {
 		Self
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteTitleEdited;
-impl<'a> FromEncryptedSocketEvent<'a> for NoteTitleEdited {
-	type Event = filen_types::api::v3::socket::NoteTitleEdited<'a>;
-
-	fn blocking_from_encrypted(_crypter: &impl MetaCrypter, _event: Self::Event) -> Self {
+impl<'a> NoteTitleEdited {
+	fn blocking_from_encrypted(
+		_crypter: &impl MetaCrypter,
+		_event: filen_types::api::v3::socket::NoteTitleEdited<'a>,
+	) -> Self {
 		Self
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessageEdited;
-impl<'a> FromEncryptedSocketEvent<'a> for ChatMessageEdited {
-	type Event = filen_types::api::v3::socket::ChatMessageEdited<'a>;
-
-	fn blocking_from_encrypted(_crypter: &impl MetaCrypter, _event: Self::Event) -> Self {
+impl<'a> ChatMessageEdited {
+	fn blocking_from_encrypted(
+		_crypter: &impl MetaCrypter,
+		_event: filen_types::api::v3::socket::ChatMessageEdited<'a>,
+	) -> Self {
 		Self
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatConversationNameEdited;
-impl<'a> FromEncryptedSocketEvent<'a> for ChatConversationNameEdited {
-	type Event = filen_types::api::v3::socket::ChatConversationNameEdited<'a>;
-
-	fn blocking_from_encrypted(_crypter: &impl MetaCrypter, _event: Self::Event) -> Self {
+impl<'a> ChatConversationNameEdited {
+	fn blocking_from_encrypted(
+		_crypter: &impl MetaCrypter,
+		_event: filen_types::api::v3::socket::ChatConversationNameEdited<'a>,
+	) -> Self {
 		Self
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemFavorite;
-impl<'a> FromEncryptedSocketEvent<'a> for ItemFavorite {
-	type Event = filen_types::api::v3::socket::ItemFavorite<'a>;
-
-	fn blocking_from_encrypted(_crypter: &impl MetaCrypter, _event: Self::Event) -> Self {
+impl<'a> ItemFavorite {
+	fn blocking_from_encrypted(
+		_crypter: &impl MetaCrypter,
+		_event: filen_types::api::v3::socket::ItemFavorite<'a>,
+	) -> Self {
 		Self
 	}
 }
@@ -1003,10 +1013,11 @@ pub struct ChatConversationParticipantNew<'a> {
 	pub added_timestamp: DateTime<Utc>,
 }
 
-impl<'a> FromEncryptedSocketEvent<'a> for ChatConversationParticipantNew<'a> {
-	type Event = filen_types::api::v3::socket::ChatConversationParticipantNew<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> ChatConversationParticipantNew<'a> {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::ChatConversationParticipantNew<'a>,
+	) -> Self {
 		Self {
 			chat: event.chat,
 			user_id: event.user_id,
@@ -1029,10 +1040,11 @@ pub struct FolderMetadataChanged<'a> {
 	pub meta: DirectoryMeta<'a>,
 }
 
-impl<'a> FromEncryptedSocketEvent<'a> for FolderMetadataChanged<'a> {
-	type Event = filen_types::api::v3::socket::FolderMetadataChanged<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FolderMetadataChanged<'a> {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FolderMetadataChanged<'a>,
+	) -> Self {
 		Self {
 			uuid: event.uuid,
 			meta: DirectoryMeta::blocking_from_encrypted(event.meta, crypter),
@@ -1048,10 +1060,11 @@ pub struct FileMetadataChanged<'a> {
 	pub old_metadata: FileMeta<'a>,
 }
 
-impl<'a> FromEncryptedSocketEvent<'a> for FileMetadataChanged<'a> {
-	type Event = filen_types::api::v3::socket::FileMetadataChanged<'a>;
-
-	fn blocking_from_encrypted(crypter: &impl MetaCrypter, event: Self::Event) -> Self {
+impl<'a> FileMetadataChanged<'a> {
+	fn blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		event: filen_types::api::v3::socket::FileMetadataChanged<'a>,
+	) -> Self {
 		let (name, metadata, old_metadata) = runtime::blocking_join!(
 			|| {
 				match crypter.blocking_decrypt_meta(&event.name) {

@@ -389,7 +389,7 @@ async fn handle_initialized_websocket(
 			// and we need to make sure we don't try to call next here if there are no futures
 			// as it would resolve immediately and starve the read side
 			decrypted = decryption_futures.next(), if !decryption_futures.is_empty() => {
-				if let Some(decrypted) = decrypted {
+				if let Some(Some(decrypted)) = decrypted {
 					listeners.broadcast_event(&decrypted);
 				}
 			},
@@ -411,7 +411,16 @@ async fn handle_initialized_websocket(
 								// this performs unnecessary cloning, ideally we would use an async
 								// yoke try_map_project_async but this does not currently exist
 								// https://github.com/unicode-org/icu4x/issues/7253
-								DecryptedSocketEvent::from_encrypted(crypter, event_yoke.get().as_borrowed_cow()).await.into_owned_cow()
+								match DecryptedSocketEvent::try_from_encrypted(crypter, event_yoke.get().as_borrowed_cow()).await {
+									Ok(v) => Some(v.into_owned_cow()),
+									Err(e) => {
+										log::error!(
+											"Error decrypting WebSocket event: {}, skipping event",
+											e
+										);
+										None
+									}
+								}
 							});
 						}
 					},
