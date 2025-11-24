@@ -9,7 +9,7 @@ use filen_sdk_rs::{
 		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject,
 		dir::RemoteDirectory,
 		file::{
-			meta::FileMetaChanges,
+			meta::{FileMeta, FileMetaChanges},
 			traits::{HasFileInfo, HasFileMeta},
 		},
 	},
@@ -548,7 +548,7 @@ async fn file_versions() {
 
 	assert_eq!(listed_versions.len(), versions.len());
 	for (listed, (expected, expected_content)) in
-		listed_versions.into_iter().zip(versions.iter().rev())
+		listed_versions.into_iter().zip(versions.iter_mut().rev())
 	{
 		assert_eq!(listed.metadata(), expected.get_meta());
 		// assert_eq!(listed.size(), expected.size()); TODO: re-enable after backend starts sending size in version info
@@ -559,6 +559,13 @@ async fn file_versions() {
 			.unwrap();
 		let downloaded = client.download_file(&current).await.unwrap();
 		assert_eq!(&downloaded, expected_content.as_bytes());
+		if let (FileMeta::Decoded(expected_meta), FileMeta::Decoded(meta)) =
+			(&mut expected.meta, &current.meta)
+		{
+			// restore file version updates the last modified time to fix a bug in the old sync engine
+			// so we need to adjust that here before we assert_eq
+			expected_meta.last_modified = meta.last_modified;
+		}
 		assert_eq!(&current, expected);
 	}
 }
