@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 
 pub use filen_macros::CowHelpers;
 
@@ -19,7 +19,7 @@ pub trait CowHelpers {
 impl<'a, T> CowHelpers for Cow<'a, T>
 where
 	T: ToOwned + ?Sized,
-	T::Owned: Clone + AsRef<T>,
+	T::Owned: Clone + Borrow<T>,
 	Cow<'static, T>: 'static,
 {
 	type CowBorrowed<'borrow>
@@ -36,7 +36,7 @@ where
 	{
 		match self {
 			Cow::Borrowed(b) => Cow::Borrowed(*b),
-			Cow::Owned(o) => Cow::Borrowed(o.as_ref()),
+			Cow::Owned(o) => Cow::Borrowed(o.borrow()),
 		}
 	}
 

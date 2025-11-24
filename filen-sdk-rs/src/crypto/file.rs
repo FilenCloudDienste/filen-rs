@@ -14,12 +14,6 @@ pub enum FileKey {
 	V3(v3::EncryptionKey),
 }
 
-impl AsRef<FileKey> for FileKey {
-	fn as_ref(&self) -> &FileKey {
-		self
-	}
-}
-
 impl FileKey {
 	pub fn to_str(&self) -> Cow<'_, str> {
 		match self {
