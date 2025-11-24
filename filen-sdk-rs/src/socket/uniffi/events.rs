@@ -17,6 +17,7 @@ use filen_types::{
 use crate::{
 	js::{Dir, DirColor, DirMeta, File, FileMeta},
 	notes::NoteParticipant,
+	socket::shared::ChatConversationParticipantNew,
 };
 
 use crate::socket::shared::DecryptedSocketEvent;
@@ -132,7 +133,7 @@ impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
 			}
 			DecryptedSocketEvent::ItemFavorite(e) => Self::ItemFavorite(e.into()),
 			DecryptedSocketEvent::ChatConversationParticipantNew(e) => {
-				Self::ChatConversationParticipantNew(e.into())
+				Self::ChatConversationParticipantNew(e.clone())
 			}
 			DecryptedSocketEvent::FileDeletedPermanent(e) => Self::FileDeletedPermanent(e.clone()),
 			DecryptedSocketEvent::FolderMetadataChanged(e) => Self::FolderMetadataChanged(e.into()),
@@ -431,35 +432,6 @@ pub struct ItemFavorite;
 impl From<&crate::socket::shared::ItemFavorite> for ItemFavorite {
 	fn from(_event: &crate::socket::shared::ItemFavorite) -> Self {
 		Self
-	}
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct ChatConversationParticipantNew {
-	pub chat: UuidStr,
-	pub user_id: u64,
-	pub email: String,
-	pub avatar: Option<String>,
-	pub nick_name: Option<String>,
-	pub metadata: MaybeEncrypted<'static>,
-	pub permissions_add: bool,
-	pub added_timestamp: DateTime<Utc>,
-}
-
-impl From<&crate::socket::shared::ChatConversationParticipantNew<'_>>
-	for ChatConversationParticipantNew
-{
-	fn from(event: &crate::socket::shared::ChatConversationParticipantNew<'_>) -> Self {
-		Self {
-			chat: event.chat,
-			user_id: event.user_id,
-			email: event.email.to_string(),
-			avatar: event.avatar.as_ref().map(|s| s.to_string()),
-			nick_name: event.nick_name.as_ref().map(|s| s.to_string()),
-			metadata: event.metadata.as_borrowed_cow().into_owned_cow(),
-			permissions_add: event.permissions_add,
-			added_timestamp: event.added_timestamp,
-		}
 	}
 }
 

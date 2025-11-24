@@ -4393,6 +4393,7 @@ dependencies = [
  "env_logger",
  "filen-sdk-rs",
  "futures",
+ "log 0.4.28",
  "rand 0.9.2",
  "tokio",
 ]

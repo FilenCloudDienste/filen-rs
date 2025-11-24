@@ -38,29 +38,29 @@ use crate::{
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatParticipant {
-	user_id: u64,
-	email: String,
+	pub(crate) user_id: u64,
+	pub(crate) email: String,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
-	avatar: Option<String>,
-	nick_name: String,
-	permissions_add: bool,
+	pub(crate) avatar: Option<String>,
+	pub(crate) nick_name: String,
+	pub(crate) permissions_add: bool,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
-	added: DateTime<Utc>,
-	appear_offline: bool,
+	pub(crate) added: DateTime<Utc>,
+	pub(crate) appear_offline: bool,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
-	last_active: DateTime<Utc>,
+	pub(crate) last_active: DateTime<Utc>,
 }
 
 impl ChatParticipant {

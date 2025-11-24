@@ -1,6 +1,5 @@
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use chrono::{DateTime, Utc};
 use filen_types::{
 	api::v3::{
 		dir::color::DirColor,
@@ -24,6 +23,7 @@ pub use filen_types::api::v3::socket::{
 use crate::{
 	Error, ErrorKind,
 	auth::http::AuthClient,
+	chats::ChatParticipant,
 	consts::CHUNK_SIZE,
 	crypto::shared::MetaCrypter,
 	fs::{
@@ -473,7 +473,7 @@ pub enum DecryptedSocketEvent<'a> {
 	ChatConversationNameEdited(ChatConversationNameEdited),
 	ContactRequestReceived(ContactRequestReceived<'a>),
 	ItemFavorite(ItemFavorite),
-	ChatConversationParticipantNew(ChatConversationParticipantNew<'a>),
+	ChatConversationParticipantNew(ChatConversationParticipantNew),
 	FileDeletedPermanent(FileDeletedPermanent), // tested
 	FolderMetadataChanged(FolderMetadataChanged<'a>), // tested
 	FolderDeletedPermanent(FolderDeletedPermanent), // tested
@@ -701,12 +701,7 @@ impl DecryptedSocketEvent<'_> {
 				.await?
 			}
 			SocketEvent::ChatConversationParticipantNew(e) => {
-				runtime::do_cpu_intensive(|| {
-					DecryptedSocketEvent::ChatConversationParticipantNew(
-						ChatConversationParticipantNew::blocking_from_encrypted(crypter, e),
-					)
-				})
-				.await
+				DecryptedSocketEvent::ChatConversationParticipantNew(e.into())
 			}
 			SocketEvent::FileDeletedPermanent(e) => DecryptedSocketEvent::FileDeletedPermanent(e),
 			SocketEvent::FolderMetadataChanged(e) => {
@@ -1074,35 +1069,29 @@ impl<'a> ItemFavorite {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
-pub struct ChatConversationParticipantNew<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ChatConversationParticipantNew {
 	pub chat: UuidStr,
-	pub user_id: u64,
-	pub email: Cow<'a, str>,
-	pub avatar: Option<Cow<'a, str>>,
-	pub nick_name: Option<Cow<'a, str>>,
-	pub metadata: MaybeEncrypted<'a>,
-	pub permissions_add: bool,
-	pub added_timestamp: DateTime<Utc>,
+	pub participant: ChatParticipant,
 }
 
-impl<'a> ChatConversationParticipantNew<'a> {
-	fn blocking_from_encrypted(
-		crypter: &impl MetaCrypter,
-		event: filen_types::api::v3::socket::ChatConversationParticipantNew<'a>,
-	) -> Self {
+impl<'a> From<filen_types::api::v3::socket::ChatConversationParticipantNew<'a>>
+	for ChatConversationParticipantNew
+{
+	fn from(event: filen_types::api::v3::socket::ChatConversationParticipantNew<'a>) -> Self {
 		Self {
 			chat: event.chat,
-			user_id: event.user_id,
-			email: event.email,
-			avatar: event.avatar,
-			nick_name: event.nick_name,
-			metadata: match crypter.blocking_decrypt_meta(&event.metadata) {
-				Ok(decrypted_metadata) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted_metadata)),
-				Err(_) => MaybeEncrypted::Encrypted(event.metadata),
+			participant: ChatParticipant {
+				user_id: event.user_id,
+				email: event.email.into_owned(),
+				avatar: event.avatar.map(|a| a.into_owned()),
+				nick_name: event.nick_name.into_owned(),
+				permissions_add: event.permissions_add,
+				added: event.added_timestamp,
+				appear_offline: event.appear_offline,
+				last_active: event.last_active,
 			},
-			permissions_add: event.permissions_add,
-			added_timestamp: event.added_timestamp,
 		}
 	}
 }

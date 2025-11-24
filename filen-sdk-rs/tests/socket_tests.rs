@@ -608,3 +608,97 @@ async fn test_websocket_folder_events() {
 	)
 	.await;
 }
+
+#[shared_test_runtime]
+async fn chat() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let (share_sender, mut share_receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = sender.send(event.as_borrowed_cow().into_owned_cow());
+			}),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let _handle = share_client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = share_sender.send(event.as_borrowed_cow().into_owned_cow());
+			}),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let _locks = test_utils::set_up_contact(&client, &share_client).await;
+	log::info!("Contact set up done");
+
+	let share_contact = client
+		.get_contacts()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|c| c.email == share_client.email())
+		.unwrap();
+
+	let chat = client.create_chat(&[share_contact]).await.unwrap();
+
+	// let event = await_map_event(
+	// 	&mut receiver,
+	// 	|event| match event {
+	// 		DecryptedSocketEvent::ChatConversationsNew(data) => {
+	// 			// if data.0.uuid == *chat.uuid() {
+	// 			// 	Some(data)
+	// 			// } else {
+	// 			// 	None
+	// 			// }
+	// 			Some(data)
+	// 		}
+	// 		_ => None,
+	// 	},
+	// 	Duration::from_secs(10),
+	// 	"chatConversationNew",
+	// )
+	// .await;
+	// let event = await_map_event(
+	// 	&mut share_receiver,
+	// 	|event| match event {
+	// 		DecryptedSocketEvent::ChatConversationsNew(data) => {
+	// 			// if data.0.uuid == *chat.uuid() {
+	// 			// 	Some(data)
+	// 			// } else {
+	// 			// 	None
+	// 			// }
+	// 			Some(data)
+	// 		}
+	// 		_ => None,
+	// 	},
+	// 	Duration::from_secs(10),
+	// 	"chatConversationNew",
+	// )
+	// .await;
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::ChatConversationParticipantNew(data) => {
+				if data.chat == chat.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"chatConversationParticipantNew",
+	)
+	.await;
+
+	assert_eq!(event.participant.email(), share_client.email());
+}

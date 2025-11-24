@@ -1210,9 +1210,7 @@ pub struct ChatConversationParticipantNew<'a> {
 	#[serde(borrow)]
 	pub avatar: Option<Cow<'a, str>>,
 	#[serde(borrow)]
-	pub nick_name: Option<Cow<'a, str>>,
-	#[serde(borrow)]
-	pub metadata: EncryptedString<'a>,
+	pub nick_name: Cow<'a, str>,
 	pub permissions_add: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
@@ -1224,6 +1222,9 @@ pub struct ChatConversationParticipantNew<'a> {
 		tsify(type = "bigint")
 	)]
 	pub added_timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
+	pub last_active: DateTime<Utc>,
+	pub appear_offline: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
