@@ -1,5 +1,9 @@
 use core::panic;
-use std::collections::{HashMap, HashSet};
+use std::{
+	borrow::Cow,
+	collections::{HashMap, HashSet},
+	time::Duration,
+};
 
 use base64::{
 	Engine,
@@ -9,10 +13,13 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::{Client, RegisteredInfo, TwoFASecret},
 	fs::HasName,
+	socket::DecryptedSocketEvent,
 };
+use filen_types::traits::CowHelpersExt;
 use futures::{StreamExt, stream::FuturesUnordered};
 use regex::Regex;
 use scraper::{Html, Selector};
+use test_utils::await_event;
 
 // all tests must be multi_threaded, otherwise drop will deadlock for TestResources
 #[shared_test_runtime]
@@ -346,7 +353,7 @@ fn delete_account(client: Client, register_data: &mut RegisterTest) {
 fn register_and_reset_password_no_export() {
 	let mut register_data = init_register_test();
 
-	activate_account(&mut register_data);
+	let old_client = activate_account(&mut register_data);
 
 	test_utils::rt().block_on(async {
 		filen_sdk_rs::auth::start_password_reset(&register_data.email)
@@ -369,6 +376,18 @@ fn register_and_reset_password_no_export() {
 	let new_password: [u8; 64] = rand::random();
 	let new_password = BASE64_STANDARD_NO_PAD.encode(new_password);
 	let client = test_utils::rt().block_on(async {
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+		let _handle = old_client
+			.add_event_listener(
+				Box::new(move |event| {
+					let _ = sender.send(event.to_owned_cow());
+				}),
+				Some(vec![Cow::Borrowed("passwordChanged")]),
+			)
+			.await
+			.unwrap();
+
 		let client = Client::complete_password_reset(
 			reset_token,
 			register_data.email.clone(),
@@ -377,6 +396,15 @@ fn register_and_reset_password_no_export() {
 		)
 		.await
 		.unwrap();
+
+		await_event(
+			&mut receiver,
+			|e| matches!(e, DecryptedSocketEvent::PasswordChanged),
+			Duration::from_secs(10),
+			"password changed event",
+		)
+		.await;
+
 		client.list_dir(client.root()).await.unwrap();
 		Client::login(register_data.email.clone(), &new_password, "XXXXXX")
 			.await
