@@ -1,9 +1,10 @@
-# temporary test that should be deleted once the main tests work again
+# todo: temporary test that should be deleted once the main tests work again
 
 name: Test network-drive
 on:
     push:
         branches: ["network-drive-on-other-platforms"]
+    workflow_dispatch:
 
 concurrency:
     group: test-${{ github.ref }}
@@ -13,8 +14,10 @@ jobs:
     test:
         strategy:
             matrix:
-                # according to https://github.com/actions/runner-images/issues/598, macFUSE does not work on GitHub runners, therefore we can't test it in ci
-                os: [macos-latest, windows-latest, ubuntu-latest]
+                # according to https://github.com/actions/runner-images/issues/598
+                # and https://github.com/actions/runner-images/issues/5583#issuecomment-1196763627,
+                # macFUSE does not work on GitHub runners, therefore we can't test it in ci
+                os: [windows-latest, ubuntu-latest]
                 version: [V1, V2] # This remains to define which version of the secrets to use
         runs-on: ${{ matrix.os }}
         steps:
@@ -34,10 +37,6 @@ jobs:
               run: |
                   sudo apt-get update
                   sudo apt-get install -y cmake clang libc++-dev libc++abi-dev
-            - name: Install macFUSE
-              if: runner.os == 'macOS'
-              run: |
-                  brew install --cask macfuse
             - name: Install WinFsp
               if: runner.os == 'Windows'
               run: |
