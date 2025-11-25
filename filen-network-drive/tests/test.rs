@@ -9,6 +9,11 @@ use tokio::fs;
 const TEST_ROOT_DIR_PREFIX: &str = "filen-rs-filen-network-drive-tests";
 const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tests.";
 
+// according to https://github.com/actions/runner-images/issues/598
+// and https://github.com/actions/runner-images/issues/5583#issuecomment-1196763627,
+// macFUSE does not work on GitHub runners, therefore we can't test it in ci
+// for local tests, run with `cargo test -- --ignored`
+#[cfg(not(target_os = "macos"))]
 #[shared_test_runtime]
 async fn start_rclone_mount() {
 	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
