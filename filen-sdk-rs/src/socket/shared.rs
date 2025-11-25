@@ -32,6 +32,7 @@ use crate::{
 		notes_and_chats::{NoteOrChatCarrierCryptoExt, NoteOrChatKeyStruct},
 		shared::MetaCrypter,
 	},
+	error::ResultExt,
 	fs::{
 		NonRootFSObject,
 		dir::{RemoteDirectory, meta::DirectoryMeta},
@@ -476,7 +477,7 @@ pub enum DecryptedSocketEvent<'a> {
 	ChatConversationParticipantLeft(ChatConversationParticipantLeft),
 	ChatConversationDeleted(ChatConversationDeleted),
 	ChatMessageEdited(ChatMessageEdited<'a>),
-	ChatConversationNameEdited(ChatConversationNameEdited),
+	ChatConversationNameEdited(ChatConversationNameEdited<'a>),
 	ContactRequestReceived(ContactRequestReceived<'a>),
 	ItemFavorite(ItemFavorite),
 	ChatConversationParticipantNew(ChatConversationParticipantNew),
@@ -690,11 +691,14 @@ impl DecryptedSocketEvent<'_> {
 			}
 			SocketEvent::ChatConversationNameEdited(e) => {
 				runtime::do_cpu_intensive(|| {
-					DecryptedSocketEvent::ChatConversationNameEdited(
-						ChatConversationNameEdited::blocking_from_encrypted(crypter, e),
-					)
+					Ok::<_, Error>(DecryptedSocketEvent::ChatConversationNameEdited(
+						ChatConversationNameEdited::try_blocking_from_rsa_encrypted(
+							private_key,
+							e,
+						)?,
+					))
 				})
-				.await
+				.await?
 			}
 			SocketEvent::ContactRequestReceived(e) => {
 				DecryptedSocketEvent::ContactRequestReceived(e)
@@ -1014,14 +1018,29 @@ impl<'a> ChatMessageEdited<'a> {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatConversationNameEdited;
-impl<'a> ChatConversationNameEdited {
-	fn blocking_from_encrypted(
-		_crypter: &impl MetaCrypter,
-		_event: filen_types::api::v3::socket::ChatConversationNameEdited<'a>,
-	) -> Self {
-		Self
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub struct ChatConversationNameEdited<'a> {
+	pub chat: UuidStr,
+	pub new_name: MaybeEncrypted<'a>,
+}
+
+impl<'a> ChatConversationNameEdited<'a> {
+	fn try_blocking_from_rsa_encrypted(
+		private_key: &RsaPrivateKey,
+		event: filen_types::api::v3::socket::ChatConversationNameEdited<'a>,
+	) -> Result<Self, Error> {
+		let chat_key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)
+			.context("ChatConversationNameEdited")?;
+		Ok(Self {
+			chat: event.uuid,
+			new_name: match crate::chats::crypto::ChatName::blocking_try_decrypt(
+				&chat_key,
+				&event.name,
+			) {
+				Ok(decrypted_name) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted_name)),
+				Err(_) => MaybeEncrypted::Encrypted(event.name),
+			},
+		})
 	}
 }
 

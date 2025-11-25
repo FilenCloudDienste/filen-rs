@@ -324,7 +324,7 @@ pub(crate) mod crypto {
 	use crate::crypto::notes_and_chats::impl_note_or_chat_carrier_crypto;
 
 	#[derive(Deserialize, Serialize)]
-	pub(super) struct ChatName<'a> {
+	pub(crate) struct ChatName<'a> {
 		#[serde(borrow)]
 		name: Cow<'a, str>,
 	}

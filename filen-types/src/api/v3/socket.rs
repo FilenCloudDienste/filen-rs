@@ -1125,6 +1125,8 @@ pub struct ChatConversationNameEdited<'a> {
 	pub uuid: UuidStr,
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
+	#[serde(borrow)]
+	pub metadata: RSAEncryptedString<'a>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]

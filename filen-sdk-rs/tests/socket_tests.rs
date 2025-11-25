@@ -766,4 +766,26 @@ async fn chat() {
 		MaybeEncrypted::Decrypted(Cow::Borrowed(msg.message().unwrap())),
 		event.new_content
 	);
+
+	client
+		.rename_chat(&mut chat, "new name".to_string())
+		.await
+		.unwrap();
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::ChatConversationNameEdited(data) if data.chat == chat.uuid() => {
+				Some(data)
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"chatConversationNameEdited",
+	)
+	.await;
+	assert_eq!(
+		MaybeEncrypted::Decrypted(Cow::Borrowed(chat.name().unwrap())),
+		event.new_name
+	);
 }

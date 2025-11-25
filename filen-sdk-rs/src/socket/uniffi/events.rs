@@ -395,11 +395,17 @@ impl From<&crate::socket::shared::ChatMessageEdited<'_>> for ChatMessageEdited {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct ChatConversationNameEdited;
+pub struct ChatConversationNameEdited {
+	pub chat: UuidStr,
+	pub new_name: MaybeEncrypted<'static>,
+}
 
-impl From<&crate::socket::shared::ChatConversationNameEdited> for ChatConversationNameEdited {
-	fn from(_event: &crate::socket::shared::ChatConversationNameEdited) -> Self {
-		Self
+impl From<&crate::socket::shared::ChatConversationNameEdited<'_>> for ChatConversationNameEdited {
+	fn from(event: &crate::socket::shared::ChatConversationNameEdited<'_>) -> Self {
+		Self {
+			chat: event.chat,
+			new_name: event.new_name.to_owned_cow(),
+		}
 	}
 }
 
