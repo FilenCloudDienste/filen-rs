@@ -2,7 +2,7 @@ use std::{borrow::Cow, time::Duration};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::socket::DecryptedSocketEvent;
-use filen_types::traits::CowHelpers;
+use filen_types::traits::CowHelpersExt;
 // separate file because it needs to avoid interference with other tests
 
 async fn await_event<F, T>(
@@ -40,9 +40,7 @@ async fn test_websocket_disconnect_reconnect() {
 	let handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				events_sender
-					.send(event.as_borrowed_cow().into_owned_cow())
-					.unwrap();
+				events_sender.send(event.to_owned_cow()).unwrap();
 			}),
 			None,
 		)
@@ -77,9 +75,7 @@ async fn test_websocket_disconnect_reconnect() {
 	let handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				events_sender
-					.send(event.as_borrowed_cow().into_owned_cow())
-					.unwrap();
+				events_sender.send(event.to_owned_cow()).unwrap();
 			}),
 			None,
 		)

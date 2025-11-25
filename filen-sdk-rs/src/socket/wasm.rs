@@ -1103,7 +1103,9 @@ impl Client {
 mod js_impl {
 	use std::borrow::Cow;
 
-	use filen_types::{api::v3::socket::SocketEvent, crypto::EncryptedString, traits::CowHelpers};
+	use filen_types::{
+		api::v3::socket::SocketEvent, crypto::EncryptedString, traits::CowHelpersExt,
+	};
 	use wasm_bindgen::JsValue;
 	use web_sys::js_sys;
 
@@ -1150,7 +1152,7 @@ mod js_impl {
 
 			let callback = Box::new(move |event: &SocketEvent<'_>| {
 				// let event = event.to_owned();
-				let _ = sender.send(event.as_borrowed_cow().into_owned_cow());
+				let _ = sender.send(event.to_owned_cow());
 			});
 
 			let this = self.inner();

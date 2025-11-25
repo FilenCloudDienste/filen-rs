@@ -11,7 +11,7 @@ use filen_types::{
 	},
 	crypto::MaybeEncrypted,
 	fs::UuidStr,
-	traits::CowHelpers,
+	traits::{CowHelpers, CowHelpersExt},
 };
 
 use crate::{
@@ -243,7 +243,7 @@ pub struct FolderRename {
 impl From<&crate::socket::shared::FolderRename<'_>> for FolderRename {
 	fn from(event: &crate::socket::shared::FolderRename<'_>) -> Self {
 		Self {
-			name: event.name.as_borrowed_cow().into_owned_cow(),
+			name: event.name.to_owned_cow(),
 			uuid: event.uuid,
 		}
 	}
@@ -462,7 +462,7 @@ impl From<&crate::socket::shared::FileMetadataChanged<'_>> for FileMetadataChang
 	fn from(event: &crate::socket::shared::FileMetadataChanged<'_>) -> Self {
 		Self {
 			uuid: event.uuid,
-			name: event.name.as_borrowed_cow().into_owned_cow(),
+			name: event.name.to_owned_cow(),
 			metadata: event.metadata.as_borrowed_cow().into(),
 			old_metadata: event.old_metadata.as_borrowed_cow().into(),
 		}

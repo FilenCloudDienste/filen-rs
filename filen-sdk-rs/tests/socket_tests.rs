@@ -11,7 +11,7 @@ use filen_sdk_rs::{
 	},
 	socket::DecryptedSocketEvent,
 };
-use filen_types::{api::v3::dir::color::DirColor, crypto::MaybeEncrypted, traits::CowHelpers};
+use filen_types::{api::v3::dir::color::DirColor, crypto::MaybeEncrypted, traits::CowHelpersExt};
 
 async fn await_event<F, T>(
 	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
@@ -96,7 +96,7 @@ async fn test_websocket_auth() {
 	let _handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
+				let _ = events_sender.send(event.to_owned_cow());
 			}),
 			None,
 		)
@@ -119,7 +119,7 @@ async fn test_websocket_event_filtering() {
 
 	let handle1_fut = client.add_event_listener(
 		Box::new(move |event| {
-			let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
+			let _ = events_sender.send(event.to_owned_cow());
 		}),
 		None,
 	);
@@ -129,7 +129,7 @@ async fn test_websocket_event_filtering() {
 
 	let handle2_fut = client.add_event_listener(
 		Box::new(move |event| {
-			let _ = filtered_events_sender.send(event.as_borrowed_cow().into_owned_cow());
+			let _ = filtered_events_sender.send(event.to_owned_cow());
 		}),
 		Some(vec![Cow::Borrowed("authSuccess")]),
 	);
@@ -164,7 +164,7 @@ async fn test_websocket_bad_auth() {
 	let result = client
 		.add_event_listener(
 			Box::new(move |event| {
-				let _ = events_sender.send(event.as_borrowed_cow().into_owned_cow());
+				let _ = events_sender.send(event.to_owned_cow());
 			}),
 			None,
 		)
@@ -194,7 +194,7 @@ async fn test_websocket_file_events() {
 	let _handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				let _ = sender.send(event.as_borrowed_cow().into_owned_cow());
+				let _ = sender.send(event.to_owned_cow());
 			}),
 			None,
 		)
@@ -442,7 +442,7 @@ async fn test_websocket_folder_events() {
 	let _handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				let _ = sender.send(event.as_borrowed_cow().into_owned_cow());
+				let _ = sender.send(event.to_owned_cow());
 			}),
 			None,
 		)
@@ -619,7 +619,7 @@ async fn chat() {
 	let _handle = client
 		.add_event_listener(
 			Box::new(move |event| {
-				let _ = sender.send(event.as_borrowed_cow().into_owned_cow());
+				let _ = sender.send(event.to_owned_cow());
 			}),
 			None,
 		)
@@ -629,7 +629,7 @@ async fn chat() {
 	let _handle = share_client
 		.add_event_listener(
 			Box::new(move |event| {
-				let _ = share_sender.send(event.as_borrowed_cow().into_owned_cow());
+				let _ = share_sender.send(event.to_owned_cow());
 			}),
 			None,
 		)

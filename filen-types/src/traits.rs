@@ -16,6 +16,23 @@ pub trait CowHelpers {
 	fn into_owned_cow(self) -> Self::CowStatic;
 }
 
+trait Sealed {}
+impl<T> Sealed for T where T: ?Sized + CowHelpers {}
+
+#[allow(private_bounds)]
+pub trait CowHelpersExt: Sealed + CowHelpers {
+	fn to_owned_cow<'a>(
+		&'a self,
+	) -> <<Self as CowHelpers>::CowBorrowed<'a> as CowHelpers>::CowStatic
+	where
+		Self::CowBorrowed<'a>: CowHelpers,
+	{
+		self.as_borrowed_cow().into_owned_cow()
+	}
+}
+
+impl<T> CowHelpersExt for T where T: ?Sized + Sealed + CowHelpers {}
+
 impl<'a, T> CowHelpers for Cow<'a, T>
 where
 	T: ToOwned + ?Sized,
