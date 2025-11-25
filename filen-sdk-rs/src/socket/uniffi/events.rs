@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use filen_types::{
 	api::v3::{
 		chat::typing::ChatTypingType,
+		notes::NoteType,
 		socket::{
 			ChatConversationDeleted, ChatConversationParticipantLeft, ChatMessageDelete,
 			ChatMessageEmbedDisabled, FileArchived, FileDeletedPermanent, FileTrash,
@@ -353,20 +354,38 @@ impl From<&crate::socket::shared::ChatConversationsNew> for ChatConversationsNew
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct NoteContentEdited;
+pub struct NoteContentEdited {
+	pub note: UuidStr,
+	pub content: MaybeEncrypted<'static>,
+	pub note_type: NoteType,
+	pub editor_id: u64,
+	pub edited_timestamp: DateTime<Utc>,
+}
 
-impl From<&crate::socket::shared::NoteContentEdited> for NoteContentEdited {
-	fn from(_event: &crate::socket::shared::NoteContentEdited) -> Self {
-		Self
+impl From<&crate::socket::shared::NoteContentEdited<'_>> for NoteContentEdited {
+	fn from(event: &crate::socket::shared::NoteContentEdited<'_>) -> Self {
+		Self {
+			note: event.note,
+			content: event.content.to_owned_cow(),
+			note_type: event.note_type,
+			editor_id: event.editor_id,
+			edited_timestamp: event.edited_timestamp,
+		}
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct NoteTitleEdited;
+pub struct NoteTitleEdited {
+	pub note: UuidStr,
+	pub new_title: MaybeEncrypted<'static>,
+}
 
-impl From<&crate::socket::shared::NoteTitleEdited> for NoteTitleEdited {
-	fn from(_event: &crate::socket::shared::NoteTitleEdited) -> Self {
-		Self
+impl From<&crate::socket::shared::NoteTitleEdited<'_>> for NoteTitleEdited {
+	fn from(event: &crate::socket::shared::NoteTitleEdited<'_>) -> Self {
+		Self {
+			note: event.note,
+			new_title: event.new_title.to_owned_cow(),
+		}
 	}
 }
 
@@ -376,11 +395,11 @@ pub struct NoteParticipantNew {
 	pub participant: NoteParticipant,
 }
 
-impl From<&crate::socket::shared::NoteParticipantNew<'_>> for NoteParticipantNew {
-	fn from(event: &crate::socket::shared::NoteParticipantNew<'_>) -> Self {
+impl From<&crate::socket::shared::NoteParticipantNew> for NoteParticipantNew {
+	fn from(event: &crate::socket::shared::NoteParticipantNew) -> Self {
 		Self {
 			note: event.note,
-			participant: NoteParticipant::from(event.participant.as_borrowed_cow()),
+			participant: event.participant.clone(),
 		}
 	}
 }

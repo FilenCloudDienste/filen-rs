@@ -1,33 +1,10 @@
-use std::{borrow::Cow, time::Duration};
+use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::socket::DecryptedSocketEvent;
 use filen_types::traits::CowHelpersExt;
+use test_utils::await_event;
 // separate file because it needs to avoid interference with other tests
-
-async fn await_event<F, T>(
-	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
-	mut filter: F,
-	timeout: Duration,
-) -> Result<T, Cow<'static, str>>
-where
-	F: FnMut(&T) -> bool,
-{
-	let sleep_until = tokio::time::Instant::now() + timeout;
-	loop {
-		tokio::select! {
-			_ = tokio::time::sleep_until(sleep_until) => {
-				return Err("Timed out waiting for event".into());
-			}
-			event = receiver.recv() => {
-				let event = event.ok_or(Cow::Borrowed("Expected to receive event"))?;
-				if filter(&event) {
-					return Ok(event);
-				}
-			}
-		}
-	}
-}
 
 #[shared_test_runtime]
 async fn test_websocket_disconnect_reconnect() {
@@ -52,9 +29,9 @@ async fn test_websocket_disconnect_reconnect() {
 		&mut events_receiver,
 		|event| matches!(event, DecryptedSocketEvent::AuthSuccess),
 		Duration::from_secs(20),
+		"authSuccess 1",
 	)
-	.await
-	.unwrap();
+	.await;
 
 	std::mem::drop(handle);
 	assert!(!client.is_socket_connected());
@@ -62,9 +39,9 @@ async fn test_websocket_disconnect_reconnect() {
 		&mut events_receiver,
 		|event| matches!(event, DecryptedSocketEvent::Unsubscribed),
 		Duration::from_secs(20),
+		"unsubscribed 1",
 	)
-	.await
-	.unwrap();
+	.await;
 
 	// making sure it can reconnect
 
@@ -87,9 +64,9 @@ async fn test_websocket_disconnect_reconnect() {
 		&mut events_receiver,
 		|event| matches!(event, DecryptedSocketEvent::AuthSuccess),
 		Duration::from_secs(20),
+		"authSuccess 2",
 	)
-	.await
-	.unwrap();
+	.await;
 
 	std::mem::drop(handle);
 	assert!(!client.is_socket_connected());
@@ -97,7 +74,7 @@ async fn test_websocket_disconnect_reconnect() {
 		&mut events_receiver,
 		|event| matches!(event, DecryptedSocketEvent::Unsubscribed),
 		Duration::from_secs(20),
+		"unsubscribed 2",
 	)
-	.await
-	.unwrap();
+	.await;
 }

@@ -11,81 +11,12 @@ use filen_sdk_rs::{
 	},
 	socket::DecryptedSocketEvent,
 };
-use filen_types::{api::v3::dir::color::DirColor, crypto::MaybeEncrypted, traits::CowHelpersExt};
-
-async fn await_event<F, T>(
-	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
-	mut filter: F,
-	timeout: Duration,
-	event: &str,
-) -> T
-where
-	F: FnMut(&T) -> bool,
-{
-	let sleep_until = tokio::time::Instant::now() + timeout;
-	loop {
-		tokio::select! {
-			_ = tokio::time::sleep_until(sleep_until) => {
-				panic!("Timed out waiting for event {event}");
-			}
-			event = receiver.recv() => {
-				let event = event.expect("Expected to receive event");
-				if filter(&event) {
-					return event;
-				}
-			}
-		}
-	}
-}
-
-async fn await_map_event<F, T, R>(
-	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
-	mut filter: F,
-	timeout: Duration,
-	event: &str,
-) -> R
-where
-	F: FnMut(T) -> Option<R>,
-{
-	let sleep_until = tokio::time::Instant::now() + timeout;
-	loop {
-		tokio::select! {
-			_ = tokio::time::sleep_until(sleep_until) => {
-				panic!("Timed out waiting for event {event}");
-			}
-			event = receiver.recv() => {
-				let event = event.expect("Expected to receive event");
-				if let Some(mapped) = filter(event) {
-					return mapped;
-				}
-			}
-		}
-	}
-}
-
-async fn await_not_event<F, T>(
-	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
-	mut filter: F,
-	timeout: Duration,
-) where
-	F: FnMut(&T) -> bool,
-	T: std::fmt::Debug,
-{
-	let sleep_until = tokio::time::Instant::now() + timeout;
-	loop {
-		tokio::select! {
-			_ = tokio::time::sleep_until(sleep_until) => {
-				return;
-			}
-			event = receiver.recv() => {
-				let event = event.expect("Expected to receive event");
-				if filter(&event) {
-					panic!("Received unexpected event: {:?}", event);
-				}
-			}
-		}
-	}
-}
+use filen_types::{
+	api::v3::{chat::typing::ChatTypingType, dir::color::DirColor},
+	crypto::MaybeEncrypted,
+	traits::CowHelpersExt,
+};
+use test_utils::{await_event, await_map_event, await_not_event};
 
 #[shared_test_runtime]
 async fn test_websocket_auth() {
@@ -787,5 +718,130 @@ async fn chat() {
 	assert_eq!(
 		MaybeEncrypted::Decrypted(Cow::Borrowed(chat.name().unwrap())),
 		event.new_name
+	);
+
+	client
+		.send_typing_signal(&chat, ChatTypingType::Down)
+		.await
+		.unwrap();
+	let event = await_map_event(
+		&mut share_receiver,
+		|event| match event {
+			DecryptedSocketEvent::ChatTyping(data) if data.chat == chat.uuid() => Some(data),
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"chatTyping",
+	)
+	.await;
+
+	assert_eq!(event.typing_type, ChatTypingType::Down);
+}
+
+#[shared_test_runtime]
+async fn note() {
+	let client = test_utils::RESOURCES.client().await;
+	let shared_client = test_utils::SHARE_RESOURCES.client().await;
+	let _locks = test_utils::set_up_contact(&client, &shared_client).await;
+
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = sender.send(event.to_owned_cow());
+			}),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let mut note = client
+		.create_note(Some("Test Note".to_string()))
+		.await
+		.unwrap();
+
+	await_event(
+		&mut receiver,
+		|event| matches!(event, DecryptedSocketEvent::NoteNew(data) if data.note == *note.uuid()),
+		Duration::from_secs(10),
+		"noteCreated",
+	)
+	.await;
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::NoteParticipantNew(data) if data.note == *note.uuid() => {
+				Some(data)
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"noteTitleEdited",
+	)
+	.await;
+
+	assert_eq!(note.participants().first().unwrap(), &event.participant);
+
+	client
+		.set_note_content(&mut note, "new note content", "preview".to_string())
+		.await
+		.unwrap();
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::NoteContentEdited(data) if data.note == *note.uuid() => {
+				Some(data)
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"noteCreated",
+	)
+	.await;
+
+	assert_eq!(
+		MaybeEncrypted::Decrypted(Cow::Borrowed("new note content")),
+		event.content
+	);
+
+	client.archive_note(&mut note).await.unwrap();
+	await_event(
+		&mut receiver,
+		|event| matches!(event, DecryptedSocketEvent::NoteArchived(data) if data.note == *note.uuid()),
+		Duration::from_secs(10),
+		"noteArchived",
+	)
+	.await;
+
+	client.restore_note(&mut note).await.unwrap();
+	await_event(
+		&mut receiver,
+		|event| matches!(event, DecryptedSocketEvent::NoteRestored(data) if data.note == *note.uuid()),
+		Duration::from_secs(10),
+		"noteRestored",
+	)
+	.await;
+
+	client
+		.set_note_title(&mut note, "new title".to_string())
+		.await
+		.unwrap();
+
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::NoteTitleEdited(data) if data.note == *note.uuid() => Some(data),
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"noteTitleEdited",
+	)
+	.await;
+
+	assert_eq!(
+		MaybeEncrypted::Decrypted(Cow::Borrowed(note.title().unwrap())),
+		event.new_title
 	);
 }

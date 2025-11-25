@@ -5,6 +5,7 @@ use filen_types::{
 	api::v3::{
 		chat::messages::ChatMessageEncrypted,
 		dir::color::DirColor,
+		notes::NoteType,
 		socket::{MessageType, PacketType, SocketEvent},
 	},
 	auth::FileEncryptionVersion,
@@ -19,7 +20,7 @@ pub use filen_types::api::v3::socket::{
 	ChatConversationDeleted, ChatConversationParticipantLeft, ChatMessageDelete,
 	ChatMessageEmbedDisabled, ChatTyping, ContactRequestReceived, FileArchived,
 	FileDeletedPermanent, FileTrash, FolderColorChanged, FolderDeletedPermanent, FolderTrash,
-	NewEvent, NoteArchived, NoteDeleted, NoteNew, NoteParticipantNew, NoteParticipantPermissions,
+	NewEvent, NoteArchived, NoteDeleted, NoteNew, NoteParticipantPermissions,
 	NoteParticipantRemoved, NoteRestored,
 };
 
@@ -38,6 +39,7 @@ use crate::{
 		dir::{RemoteDirectory, meta::DirectoryMeta},
 		file::{RemoteFile, meta::FileMeta},
 	},
+	notes::NoteParticipant,
 	runtime,
 };
 
@@ -444,34 +446,34 @@ pub enum DecryptedSocketEvent<'a> {
 	Reconnecting,
 	/// Sent when the handle to the event listener has been dropped and the listener is removed
 	Unsubscribed, // tested
-	NewEvent(NewEvent<'a>),
-	FileRename(FileRename<'a>), // rust never uses this, so no way to test it
-	FileArchiveRestored(FileArchiveRestored), // not sure what this is for
-	FileNew(FileNew),           // tested, needs size added
-	FileRestore(FileRestore),   // tested, needs size added
-	FileMove(FileMove),         // tested, needs size added
-	FileTrash(FileTrash),       // tested, might want to add enough info to build a RemoteFile here
-	FileArchived(FileArchived), // untested, not sure what this is for
+	NewEvent(NewEvent<'a>),                     // unused by rust, legacy
+	FileRename(FileRename<'a>),                 // rust never uses this, so no way to test it
+	FileArchiveRestored(FileArchiveRestored),   // not sure what this is for
+	FileNew(FileNew),                           // tested, needs size added
+	FileRestore(FileRestore),                   // tested, needs size added
+	FileMove(FileMove),                         // tested, needs size added
+	FileTrash(FileTrash), // tested, might want to add enough info to build a RemoteFile here
+	FileArchived(FileArchived), // tested
 	FolderRename(FolderRename<'a>), // rust never uses this, so no way to test it
-	FolderTrash(FolderTrash),   // tested, might want to add enough info to build a RemoteFolder here
-	FolderMove(FolderMove),     // tested, needs color added
+	FolderTrash(FolderTrash), // tested, might want to add enough info to build a RemoteFolder here
+	FolderMove(FolderMove), // tested, needs color added
 	FolderSubCreated(FolderSubCreated), // tested, needs color added
 	FolderRestore(FolderRestore), // tested, needs color added
 	FolderColorChanged(FolderColorChanged<'a>), // tested
 	TrashEmpty,
 	PasswordChanged,
-	ChatMessageNew(ChatMessageNew),
+	ChatMessageNew(ChatMessageNew), // tested
 	ChatTyping(ChatTyping<'a>),
 	ChatConversationsNew(ChatConversationsNew),
 	ChatMessageDelete(ChatMessageDelete),
-	NoteContentEdited(NoteContentEdited),
+	NoteContentEdited(NoteContentEdited<'a>),
 	NoteArchived(NoteArchived),
 	NoteDeleted(NoteDeleted),
-	NoteTitleEdited(NoteTitleEdited),
+	NoteTitleEdited(NoteTitleEdited<'a>),
 	NoteParticipantPermissions(NoteParticipantPermissions),
 	NoteRestored(NoteRestored),
 	NoteParticipantRemoved(NoteParticipantRemoved),
-	NoteParticipantNew(NoteParticipantNew<'a>),
+	NoteParticipantNew(NoteParticipantNew),
 	NoteNew(NoteNew),
 	ChatMessageEmbedDisabled(ChatMessageEmbedDisabled),
 	ChatConversationParticipantLeft(ChatConversationParticipantLeft),
@@ -647,21 +649,21 @@ impl DecryptedSocketEvent<'_> {
 			SocketEvent::ChatMessageDelete(e) => DecryptedSocketEvent::ChatMessageDelete(e),
 			SocketEvent::NoteContentEdited(e) => {
 				runtime::do_cpu_intensive(|| {
-					DecryptedSocketEvent::NoteContentEdited(
-						NoteContentEdited::blocking_from_encrypted(crypter, e),
-					)
+					Ok::<_, Error>(DecryptedSocketEvent::NoteContentEdited(
+						NoteContentEdited::try_blocking_from_rsa_encrypted(private_key, e)?,
+					))
 				})
-				.await
+				.await?
 			}
 			SocketEvent::NoteArchived(e) => DecryptedSocketEvent::NoteArchived(e),
 			SocketEvent::NoteDeleted(e) => DecryptedSocketEvent::NoteDeleted(e),
 			SocketEvent::NoteTitleEdited(e) => {
 				runtime::do_cpu_intensive(|| {
-					DecryptedSocketEvent::NoteTitleEdited(NoteTitleEdited::blocking_from_encrypted(
-						crypter, e,
+					Ok::<_, Error>(DecryptedSocketEvent::NoteTitleEdited(
+						NoteTitleEdited::try_blocking_from_rsa_encrypted(private_key, e)?,
 					))
 				})
-				.await
+				.await?
 			}
 			SocketEvent::NoteParticipantPermissions(e) => {
 				DecryptedSocketEvent::NoteParticipantPermissions(e)
@@ -670,7 +672,9 @@ impl DecryptedSocketEvent<'_> {
 			SocketEvent::NoteParticipantRemoved(e) => {
 				DecryptedSocketEvent::NoteParticipantRemoved(e)
 			}
-			SocketEvent::NoteParticipantNew(e) => DecryptedSocketEvent::NoteParticipantNew(e),
+			SocketEvent::NoteParticipantNew(e) => {
+				DecryptedSocketEvent::NoteParticipantNew(e.into())
+			}
 			SocketEvent::NoteNew(e) => DecryptedSocketEvent::NoteNew(e),
 			SocketEvent::ChatMessageEmbedDisabled(e) => {
 				DecryptedSocketEvent::ChatMessageEmbedDisabled(e)
@@ -968,25 +972,75 @@ impl<'a> ChatConversationsNew {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoteContentEdited;
-impl<'a> NoteContentEdited {
-	fn blocking_from_encrypted(
-		_crypter: &impl MetaCrypter,
-		_event: filen_types::api::v3::socket::NoteContentEdited<'a>,
-	) -> Self {
-		Self
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub struct NoteContentEdited<'a> {
+	pub note: UuidStr,
+	pub content: MaybeEncrypted<'a>,
+	pub note_type: NoteType,
+	pub editor_id: u64,
+	pub edited_timestamp: DateTime<Utc>,
+}
+
+impl<'a> NoteContentEdited<'a> {
+	fn try_blocking_from_rsa_encrypted(
+		private_key: &RsaPrivateKey,
+		event: filen_types::api::v3::socket::NoteContentEdited<'a>,
+	) -> Result<Self, Error> {
+		let note_key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)?;
+		Ok(Self {
+			note: event.note,
+			note_type: event.note_type,
+			editor_id: event.editor_id,
+			edited_timestamp: event.edited_timestamp,
+			content: match crate::notes::crypto::NoteContent::blocking_try_decrypt(
+				&note_key,
+				&event.content,
+			) {
+				Ok(decrypted_content) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted_content)),
+				Err(_) => MaybeEncrypted::Encrypted(event.content),
+			},
+		})
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub struct NoteTitleEdited<'a> {
+	pub note: UuidStr,
+	pub new_title: MaybeEncrypted<'a>,
+}
+
+impl<'a> NoteTitleEdited<'a> {
+	fn try_blocking_from_rsa_encrypted(
+		private_key: &RsaPrivateKey,
+		event: filen_types::api::v3::socket::NoteTitleEdited<'a>,
+	) -> Result<Self, Error> {
+		let note_key = NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &event.metadata)
+			.context("NoteTitleEdited")?;
+		Ok(Self {
+			note: event.note,
+			new_title: match crate::notes::crypto::NoteTitle::blocking_try_decrypt(
+				&note_key,
+				&event.title,
+			) {
+				Ok(decrypted_title) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted_title)),
+				Err(_) => MaybeEncrypted::Encrypted(event.title),
+			},
+		})
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoteTitleEdited;
-impl<'a> NoteTitleEdited {
-	fn blocking_from_encrypted(
-		_crypter: &impl MetaCrypter,
-		_event: filen_types::api::v3::socket::NoteTitleEdited<'a>,
-	) -> Self {
-		Self
+pub struct NoteParticipantNew {
+	pub note: UuidStr,
+	pub participant: NoteParticipant,
+}
+
+impl From<filen_types::api::v3::socket::NoteParticipantNew<'_>> for NoteParticipantNew {
+	fn from(value: filen_types::api::v3::socket::NoteParticipantNew<'_>) -> Self {
+		Self {
+			note: value.note,
+			participant: value.participant.into(),
+		}
 	}
 }
 

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
 use std::borrow::Cow;
 use yoke::Yokeable;
 
@@ -202,8 +202,16 @@ impl<'de> Deserialize<'de> for SocketEvent<'de> {
 					"authSuccess" => Some(SocketEvent::AuthSuccess),
 					"authFailed" => Some(SocketEvent::AuthFailed),
 					"reconnecting" => Some(SocketEvent::Reconnecting),
-					"trashEmpty" => Some(SocketEvent::TrashEmpty),
-					"passwordChanged" => Some(SocketEvent::PasswordChanged),
+					"trashEmpty" => {
+						// timestamp and messageId we don't care about
+						let _ = seq.next_element::<IgnoredAny>()?;
+						Some(SocketEvent::TrashEmpty)
+					}
+					"passwordChanged" => {
+						// timestamp and messageId we don't care about
+						let _ = seq.next_element::<IgnoredAny>()?;
+						Some(SocketEvent::PasswordChanged)
+					}
 					"newEvent" => seq.next_element()?.map(SocketEvent::NewEvent),
 					"fileRename" => seq.next_element()?.map(SocketEvent::FileRename),
 					"fileArchiveRestored" => {
@@ -882,6 +890,7 @@ pub struct ChatMessageDelete {
 )]
 pub struct NoteContentEdited<'a> {
 	pub note: UuidStr,
+	#[serde(borrow)]
 	pub content: EncryptedString<'a>,
 	#[serde(rename = "type")]
 	pub note_type: NoteType,
@@ -896,6 +905,8 @@ pub struct NoteContentEdited<'a> {
 		tsify(type = "bigint")
 	)]
 	pub edited_timestamp: DateTime<Utc>,
+	#[serde(borrow)]
+	pub metadata: RSAEncryptedString<'a>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -945,6 +956,8 @@ pub struct NoteTitleEdited<'a> {
 	pub note: UuidStr,
 	#[serde(borrow)]
 	pub title: EncryptedString<'a>,
+	#[serde(borrow)]
+	pub metadata: RSAEncryptedString<'a>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]

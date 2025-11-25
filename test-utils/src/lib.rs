@@ -1,6 +1,7 @@
 use std::{
 	env,
 	sync::{Arc, OnceLock},
+	time::Duration,
 };
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
@@ -251,4 +252,78 @@ pub async fn set_up_contact<'a>(
 		.unwrap();
 
 	(lock1, lock2, num_shared_out, num_shared_in)
+}
+
+pub async fn await_event<F, T>(
+	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+	mut filter: F,
+	timeout: Duration,
+	event: &str,
+) -> T
+where
+	F: FnMut(&T) -> bool,
+{
+	let sleep_until = tokio::time::Instant::now() + timeout;
+	loop {
+		tokio::select! {
+			_ = tokio::time::sleep_until(sleep_until) => {
+				panic!("Timed out waiting for event {event}");
+			}
+			event = receiver.recv() => {
+				let event = event.expect("Expected to receive event");
+				if filter(&event) {
+					return event;
+				}
+			}
+		}
+	}
+}
+
+pub async fn await_map_event<F, T, R>(
+	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+	mut filter: F,
+	timeout: Duration,
+	event: &str,
+) -> R
+where
+	F: FnMut(T) -> Option<R>,
+{
+	let sleep_until = tokio::time::Instant::now() + timeout;
+	loop {
+		tokio::select! {
+			_ = tokio::time::sleep_until(sleep_until) => {
+				panic!("Timed out waiting for event {event}");
+			}
+			event = receiver.recv() => {
+				let event = event.expect("Expected to receive event");
+				if let Some(mapped) = filter(event) {
+					return mapped;
+				}
+			}
+		}
+	}
+}
+
+pub async fn await_not_event<F, T>(
+	receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+	mut filter: F,
+	timeout: Duration,
+) where
+	F: FnMut(&T) -> bool,
+	T: std::fmt::Debug,
+{
+	let sleep_until = tokio::time::Instant::now() + timeout;
+	loop {
+		tokio::select! {
+			_ = tokio::time::sleep_until(sleep_until) => {
+				return;
+			}
+			event = receiver.recv() => {
+				let event = event.expect("Expected to receive event");
+				if filter(&event) {
+					panic!("Received unexpected event: {:?}", event);
+				}
+			}
+		}
+	}
 }

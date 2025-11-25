@@ -321,7 +321,7 @@ impl NoteHistory {
 	}
 }
 
-mod crypto {
+pub(crate) mod crypto {
 	use std::borrow::Cow;
 
 	use serde::{Deserialize, Serialize};
@@ -329,14 +329,14 @@ mod crypto {
 	use crate::crypto::notes_and_chats::impl_note_or_chat_carrier_crypto;
 
 	#[derive(Deserialize, Serialize)]
-	pub(super) struct NoteTitle<'a> {
+	pub(crate) struct NoteTitle<'a> {
 		#[serde(borrow)]
 		title: Cow<'a, str>,
 	}
 	impl_note_or_chat_carrier_crypto!(NoteTitle, title, "note title", str);
 
 	#[derive(Deserialize, Serialize)]
-	pub(super) struct NotePreview<'a> {
+	pub(crate) struct NotePreview<'a> {
 		#[serde(borrow)]
 		preview: Cow<'a, str>,
 	}
@@ -350,7 +350,7 @@ mod crypto {
 	impl_note_or_chat_carrier_crypto!(NoteTagName, name, "note tag name", str);
 
 	#[derive(Deserialize, Serialize)]
-	pub(super) struct NoteContent<'a> {
+	pub(crate) struct NoteContent<'a> {
 		#[serde(borrow)]
 		content: Cow<'a, str>,
 	}
