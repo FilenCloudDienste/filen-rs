@@ -559,14 +559,25 @@ async fn file_versions() {
 			.unwrap();
 		let downloaded = client.download_file(&current).await.unwrap();
 		assert_eq!(&downloaded, expected_content.as_bytes());
+		let mut old_last_modified = None;
 		if let (FileMeta::Decoded(expected_meta), FileMeta::Decoded(meta)) =
 			(&mut expected.meta, &current.meta)
 		{
 			// restore file version updates the last modified time to fix a bug in the old sync engine
 			// so we need to adjust that here before we assert_eq
+			old_last_modified = Some(expected_meta.last_modified);
 			expected_meta.last_modified = meta.last_modified;
 		}
 		assert_eq!(&current, expected);
+
+		if let Some(old_last_modified) = old_last_modified {
+			if let FileMeta::Decoded(expected) = &mut expected.meta {
+				// undo the previous change for the next iteration
+				expected.last_modified = old_last_modified;
+			} else {
+				unreachable!();
+			}
+		}
 	}
 }
 
