@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, ops::Deref};
 
 use chrono::{DateTime, Utc};
 use filen_types::{
@@ -14,7 +14,8 @@ use filen_types::{
 	traits::CowHelpers,
 };
 use rsa::RsaPrivateKey;
-use yoke::Yokeable;
+use stable_deref_trait::StableDeref;
+use yoke::{Yoke, Yokeable};
 
 pub use filen_types::api::v3::socket::{
 	ChatConversationDeleted, ChatConversationParticipantLeft, ChatMessageDelete,
@@ -26,7 +27,6 @@ pub use filen_types::api::v3::socket::{
 
 use crate::{
 	Error, ErrorKind,
-	auth::http::AuthClient,
 	chats::{ChatMessage, ChatParticipant},
 	consts::CHUNK_SIZE,
 	crypto::{
@@ -43,398 +43,99 @@ use crate::{
 	runtime,
 };
 
-pub type EventListenerCallback = Box<dyn Fn(&DecryptedSocketEvent<'_>) + Send + 'static>;
+use super::consts::{AUTHED_TRUE, VERSIONED_EVENT_PREFIXES};
 
-pub(super) struct WebSocketConfig {
-	pub(super) client: Arc<AuthClient>,
-	pub(super) reconnect_delay: Duration,
-	pub(super) max_reconnect_delay: Duration,
-	pub(super) ping_interval: Duration,
+pub(super) fn try_parse_message_from_str<T>(
+	msg: T,
+) -> Result<Option<Yoke<SocketEvent<'static>, T>>, Error>
+where
+	T: StableDeref,
+	<T as Deref>::Target: AsRef<str> + 'static,
+{
+	let yoked: Yoke<Option<SocketEvent<'static>>, T> = Yoke::try_attach_to_cart(msg, |msg| {
+		let msg = msg.as_ref();
+		let mut text_bytes = msg.bytes();
+		let Some(packet_type) = text_bytes.next() else {
+			return Err(Error::custom(
+				ErrorKind::Server,
+				"Empty message received over WebSocket",
+			));
+		};
+
+		match PacketType::try_from(packet_type) {
+			Err(e) => {
+				return Err(Error::custom(
+					ErrorKind::Server,
+					format!("Invalid packet type: {}", e),
+				));
+			}
+			Ok(PacketType::Message) => {}
+			Ok(PacketType::Connect) => {
+				return Err(Error::custom(
+					ErrorKind::InvalidState,
+					"Received unexpected connect packet after initialization",
+				));
+			}
+			Ok(_) => {
+				return Ok(None);
+			}
+		}
+
+		let Some(message_type) = text_bytes.next() else {
+			return Err(Error::custom(
+				ErrorKind::Server,
+				"PacketType::Message received with no MessageType",
+			));
+		};
+
+		match MessageType::try_from(message_type) {
+			Err(e) => {
+				return Err(Error::custom(
+					ErrorKind::Server,
+					format!("Invalid message type: {}", e),
+				));
+			}
+			Ok(MessageType::Event) => {
+				// continue
+			}
+			Ok(_) => {
+				// ignore other message types for now
+				return Ok(None);
+			}
+		}
+
+		let event_str = &msg[2..];
+
+		log::info!("Received WebSocket event: {}", event_str);
+
+		if event_str == AUTHED_TRUE {
+			// ignore authed true messages
+			return Ok(None);
+		}
+
+		// these are duplicates of FileArchived, so we can just ignore them
+		if VERSIONED_EVENT_PREFIXES
+			.iter()
+			.any(|prefix| event_str.starts_with(prefix))
+		{
+			// ignore versioned events for now
+			return Ok(None);
+		}
+
+		match serde_json::from_str::<SocketEvent>(event_str) {
+			Ok(parsed_event) => Ok(Some(parsed_event)),
+			Err(e) => Err(Error::custom_with_source(
+				ErrorKind::Conversion,
+				e,
+				Some("deserializing SocketEvent"),
+			)),
+		}
+	})?;
+
+	Ok(yoked
+		.try_map_project(|maybe_event: Option<SocketEvent<'_>>, _| maybe_event.ok_or(()))
+		.ok())
 }
-
-pub(super) const MESSAGE_EVENT_PAYLOAD: &str =
-	match str::from_utf8(&[PacketType::Message as u8, MessageType::Event as u8]) {
-		Ok(s) => s,
-		Err(_) => panic!("Failed to create handshake payload string"),
-	};
-
-pub(super) const MESSAGE_CONNECT_PAYLOAD: &str =
-	match str::from_utf8(&[PacketType::Message as u8, MessageType::Connect as u8]) {
-		Ok(s) => s,
-		Err(_) => panic!("Failed to create handshake payload string"),
-	};
-
-pub(super) const PING_MESSAGE: &str = match str::from_utf8(&[PacketType::Ping as u8]) {
-	Ok(s) => s,
-	Err(_) => panic!("Failed to create ping message string"),
-};
-
-pub(super) const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-pub(super) const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
-pub(super) const PING_INTERVAL: Duration = Duration::from_secs(15);
-
-pub(super) const WEBSOCKET_URL_CORE: &str =
-	"wss://socket.filen.io/socket.io/?EIO=3&transport=websocket&t=";
-
-pub(super) const AUTHED_TRUE: &str = r#"["authed",true]"#;
-pub(super) const VERSIONED_EVENT_PREFIXES: &[&str] =
-	&[r#"["file-versioned","#, r#"["fileVersioned","#];
-
-mod listener_manager {
-	use std::{
-		borrow::Cow,
-		collections::HashMap,
-		hash::{BuildHasherDefault, Hasher},
-	};
-
-	use filen_types::api::v3::socket::SocketEvent;
-
-	use crate::{Error, socket::shared::DecryptedSocketEvent};
-
-	use super::EventListenerCallback;
-
-	#[derive(Default)]
-	struct IdentityHasher(u64);
-
-	impl Hasher for IdentityHasher {
-		fn write(&mut self, _: &[u8]) {
-			unreachable!("IdentityHasher only supports u64")
-		}
-
-		fn write_u64(&mut self, i: u64) {
-			self.0 = i;
-		}
-
-		fn finish(&self) -> u64 {
-			self.0
-		}
-	}
-
-	type U64Map<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
-
-	trait ListenerManager {
-		fn callbacks(&self) -> &U64Map<EventListenerCallback>;
-		fn callbacks_mut(&mut self) -> &mut U64Map<EventListenerCallback>;
-		fn callbacks_for_event(&self) -> &HashMap<String, Vec<u64>>;
-		fn callbacks_for_event_mut(&mut self) -> &mut HashMap<String, Vec<u64>>;
-		fn global_callbacks(&self) -> &Vec<u64>;
-		fn global_callbacks_mut(&mut self) -> &mut Vec<u64>;
-		fn last_id(&mut self) -> &mut u64;
-	}
-
-	trait ListenerManagerExtInner: ListenerManager {
-		fn broadcast_event(&self, event: &DecryptedSocketEvent<'_>) {
-			if let Some(callback_ids) = self.callbacks_for_event().get(event.event_type()) {
-				for &callback_id in callback_ids {
-					if let Some(callback) = self.callbacks().get(&callback_id) {
-						callback(event);
-					}
-				}
-			}
-			for &callback_id in self.global_callbacks() {
-				if let Some(callback) = self.callbacks().get(&callback_id) {
-					callback(event);
-				}
-			}
-		}
-
-		fn add_listener<'a>(
-			&mut self,
-			callback: EventListenerCallback,
-			event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
-		) -> u64 {
-			let this_id = *self.last_id();
-			self.callbacks_mut().insert(this_id, callback);
-			*self.last_id() += 1;
-
-			if let Some(event_types) = event_types {
-				for event_type in event_types {
-					if let Some(value) = self.callbacks_for_event_mut().get_mut(event_type.as_ref())
-					{
-						// event type is already present
-						value.push(this_id);
-						continue;
-					} else {
-						// new event type
-						self.callbacks_for_event_mut()
-							.insert(event_type.into_owned(), vec![this_id]);
-					}
-				}
-			} else {
-				self.global_callbacks_mut().push(this_id);
-			}
-
-			this_id
-		}
-
-		fn remove_listener(&mut self, id: u64) -> Option<EventListenerCallback> {
-			let callback = self.callbacks_mut().remove(&id);
-			let mut empty_event_types = Vec::new();
-			for (event_type, callbacks) in self.callbacks_for_event_mut().iter_mut() {
-				callbacks.retain(|&callback_id| callback_id != id);
-				if callbacks.is_empty() {
-					empty_event_types.push(event_type.clone());
-				}
-			}
-			for event_type in empty_event_types {
-				self.callbacks_for_event_mut().remove(&event_type);
-			}
-			self.global_callbacks_mut()
-				.retain(|&callback_id| callback_id != id);
-
-			callback
-		}
-	}
-
-	impl<T> ListenerManagerExtInner for T where T: ListenerManager {}
-
-	// don't want it to be implemented outside of this module
-	#[allow(private_bounds)]
-	pub(crate) trait ListenerManagerExt: ListenerManager {
-		fn is_empty(&self) -> bool {
-			self.callbacks().is_empty()
-		}
-
-		fn add_listener<'a>(
-			&mut self,
-			callback: EventListenerCallback,
-			cancel_receiver: tokio::sync::oneshot::Receiver<()>,
-			id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
-			event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
-		);
-
-		fn remove_listener(&mut self, id: u64);
-	}
-
-	struct NewIdStruct {
-		id: u64,
-		id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
-		cancel_receiver: tokio::sync::oneshot::Receiver<()>,
-	}
-
-	pub(crate) struct DisconnectedListenerManager {
-		callbacks: U64Map<EventListenerCallback>,
-		callbacks_for_event: HashMap<String, Vec<u64>>,
-		global_callbacks: Vec<u64>,
-		last_id: u64,
-		new_ids: Vec<NewIdStruct>,
-	}
-
-	impl ListenerManager for DisconnectedListenerManager {
-		fn callbacks(&self) -> &U64Map<EventListenerCallback> {
-			&self.callbacks
-		}
-
-		fn callbacks_mut(&mut self) -> &mut U64Map<EventListenerCallback> {
-			&mut self.callbacks
-		}
-
-		fn callbacks_for_event(&self) -> &HashMap<String, Vec<u64>> {
-			&self.callbacks_for_event
-		}
-
-		fn callbacks_for_event_mut(&mut self) -> &mut HashMap<String, Vec<u64>> {
-			&mut self.callbacks_for_event
-		}
-
-		fn global_callbacks(&self) -> &Vec<u64> {
-			&self.global_callbacks
-		}
-
-		fn global_callbacks_mut(&mut self) -> &mut Vec<u64> {
-			&mut self.global_callbacks
-		}
-
-		fn last_id(&mut self) -> &mut u64 {
-			&mut self.last_id
-		}
-	}
-
-	impl DisconnectedListenerManager {
-		pub(crate) fn new() -> Self {
-			Self {
-				callbacks: U64Map::default(),
-				callbacks_for_event: HashMap::new(),
-				global_callbacks: Vec::new(),
-				last_id: 0,
-				new_ids: Vec::new(),
-			}
-		}
-
-		pub(crate) fn broadcast_auth_failed(&mut self) {
-			ListenerManagerExtInner::broadcast_event(self, &DecryptedSocketEvent::AuthFailed);
-			for NewIdStruct {
-				id_sender: sender, ..
-			} in self.new_ids.drain(..)
-			{
-				let _ = sender.send(Err(Error::custom(
-					crate::error::ErrorKind::Unauthenticated,
-					"socket authentication failed",
-				)));
-			}
-		}
-
-		pub(crate) fn into_connected(mut self) -> ConnectedListenerManager {
-			let mut ids_to_remove = Vec::new();
-
-			// we drain here so we can call ListenerManagerExtInner::remove_listener
-			for NewIdStruct {
-				id,
-				id_sender: sender,
-				mut cancel_receiver,
-			} in self.new_ids.drain(..)
-			{
-				if sender.send(Ok(id)).is_err() {
-					ids_to_remove.push(id);
-				} else if let Ok(()) = cancel_receiver.try_recv() {
-					ids_to_remove.push(id);
-				}
-			}
-
-			for id in ids_to_remove {
-				ListenerManagerExtInner::remove_listener(&mut self, id);
-			}
-
-			let DisconnectedListenerManager {
-				callbacks,
-				callbacks_for_event,
-				global_callbacks,
-				last_id,
-				..
-			} = self;
-
-			let new = ConnectedListenerManager {
-				callbacks,
-				callbacks_for_event,
-				global_callbacks,
-				last_id,
-			};
-
-			new.broadcast_event(&DecryptedSocketEvent::AuthSuccess);
-			new
-		}
-	}
-
-	impl ListenerManagerExt for DisconnectedListenerManager {
-		fn add_listener<'a>(
-			&mut self,
-			callback: EventListenerCallback,
-			cancel_receiver: tokio::sync::oneshot::Receiver<()>,
-			id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
-			event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
-		) {
-			let id = ListenerManagerExtInner::add_listener(self, callback, event_types);
-			self.new_ids.push(NewIdStruct {
-				id,
-				id_sender,
-				cancel_receiver,
-			});
-		}
-
-		fn remove_listener(&mut self, id: u64) {
-			let callback = ListenerManagerExtInner::remove_listener(self, id);
-			if let Some(callback) = callback {
-				callback(&DecryptedSocketEvent::Unsubscribed);
-			}
-			self.new_ids.retain(|new_id_struct| new_id_struct.id != id);
-		}
-	}
-
-	pub(crate) struct ConnectedListenerManager {
-		callbacks: U64Map<EventListenerCallback>,
-		callbacks_for_event: HashMap<String, Vec<u64>>,
-		global_callbacks: Vec<u64>,
-		last_id: u64,
-	}
-
-	impl ListenerManager for ConnectedListenerManager {
-		fn callbacks(&self) -> &U64Map<EventListenerCallback> {
-			&self.callbacks
-		}
-
-		fn callbacks_mut(&mut self) -> &mut U64Map<EventListenerCallback> {
-			&mut self.callbacks
-		}
-
-		fn callbacks_for_event(&self) -> &HashMap<String, Vec<u64>> {
-			&self.callbacks_for_event
-		}
-
-		fn callbacks_for_event_mut(&mut self) -> &mut HashMap<String, Vec<u64>> {
-			&mut self.callbacks_for_event
-		}
-
-		fn global_callbacks(&self) -> &Vec<u64> {
-			&self.global_callbacks
-		}
-
-		fn global_callbacks_mut(&mut self) -> &mut Vec<u64> {
-			&mut self.global_callbacks
-		}
-
-		fn last_id(&mut self) -> &mut u64 {
-			&mut self.last_id
-		}
-	}
-
-	impl ConnectedListenerManager {
-		pub(crate) fn broadcast_event(&self, event: &DecryptedSocketEvent<'_>) {
-			ListenerManagerExtInner::broadcast_event(self, event);
-		}
-
-		pub(crate) fn into_disconnected(self) -> DisconnectedListenerManager {
-			self.broadcast_event(&DecryptedSocketEvent::Reconnecting);
-			let ConnectedListenerManager {
-				callbacks,
-				callbacks_for_event,
-				global_callbacks,
-				last_id,
-			} = self;
-
-			DisconnectedListenerManager {
-				callbacks,
-				callbacks_for_event,
-				global_callbacks,
-				last_id,
-				new_ids: Vec::new(),
-			}
-		}
-
-		pub(crate) fn should_decrypt_event(&self, event: &SocketEvent<'_>) -> bool {
-			!self.global_callbacks().is_empty()
-				|| self.callbacks_for_event().contains_key(event.event_type())
-		}
-	}
-
-	impl ListenerManagerExt for ConnectedListenerManager {
-		fn add_listener<'a>(
-			&mut self,
-			callback: EventListenerCallback,
-			mut cancel_receiver: tokio::sync::oneshot::Receiver<()>,
-			id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
-			event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
-		) {
-			let id = ListenerManagerExtInner::add_listener(self, callback, event_types);
-
-			if id_sender.send(Ok(id)).is_err() {
-				ListenerManagerExtInner::remove_listener(self, id);
-			} else if let Ok(()) = cancel_receiver.try_recv() {
-				ListenerManagerExtInner::remove_listener(self, id);
-			}
-		}
-
-		fn remove_listener(&mut self, id: u64) {
-			let callback = ListenerManagerExtInner::remove_listener(self, id);
-			if let Some(callback) = callback {
-				callback(&DecryptedSocketEvent::Unsubscribed);
-			}
-		}
-	}
-}
-
-pub(super) use listener_manager::{
-	ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
 pub enum DecryptedSocketEvent<'a> {
@@ -550,10 +251,6 @@ impl DecryptedSocketEvent<'_> {
 		event: SocketEvent<'a>,
 	) -> Result<DecryptedSocketEvent<'a>, Error> {
 		Ok(match event {
-			SocketEvent::AuthSuccess => DecryptedSocketEvent::AuthSuccess,
-			SocketEvent::AuthFailed => DecryptedSocketEvent::AuthFailed,
-			SocketEvent::Reconnecting => DecryptedSocketEvent::Reconnecting,
-			SocketEvent::Unsubscribed => DecryptedSocketEvent::Unsubscribed,
 			SocketEvent::NewEvent(e) => DecryptedSocketEvent::NewEvent(e),
 			SocketEvent::FileRename(e) => {
 				runtime::do_cpu_intensive(|| {
@@ -1181,6 +878,11 @@ impl<'a> ItemFavorite {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify, serde::Serialize),
+	tsify(large_number_types_as_bigints)
+)]
 pub struct ChatConversationParticipantNew {
 	pub chat: UuidStr,
 	pub participant: ChatParticipant,

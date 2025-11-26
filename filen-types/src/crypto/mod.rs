@@ -63,7 +63,12 @@ impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, CowHelpers)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(into_wasm_abi)
+)]
 pub enum MaybeEncrypted<'a> {
 	Decrypted(Cow<'a, str>),
 	Encrypted(EncryptedString<'a>),

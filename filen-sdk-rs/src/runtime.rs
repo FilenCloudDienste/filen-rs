@@ -636,6 +636,37 @@ where
 	target_os = "unknown",
 	not(feature = "wasm-full")
 )))]
+pub fn spawn_async<F, Fut>(f: F)
+where
+	F: FnOnce() -> Fut + Send + 'static,
+	Fut: Future<Output = ()> + 'static,
+{
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	{
+		use wasm_bindgen::UnwrapThrowExt;
+		wasm_threading::spawn_worker(|| {
+			wasm_bindgen_futures::spawn_local(f());
+		})
+		.expect_throw("Failed to spawn worker");
+	}
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	{
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("failed to create websocket runtime");
+
+			runtime.block_on(f());
+		});
+	}
+}
+
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
 pub fn spawn_local<F>(f: F)
 where
 	F: Future<Output = ()> + 'static,

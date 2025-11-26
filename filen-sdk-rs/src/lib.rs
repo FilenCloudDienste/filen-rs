@@ -18,6 +18,10 @@ pub mod notes;
 pub mod runtime;
 pub mod search;
 pub(crate) mod serde;
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
 pub mod socket;
 pub mod sync;
 pub mod thumbnail;

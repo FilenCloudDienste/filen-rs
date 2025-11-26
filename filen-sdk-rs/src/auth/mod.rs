@@ -20,8 +20,6 @@ use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use crate::socket::native::WebSocketHandle;
 use crate::{
 	api,
 	auth::http::AuthorizedClient,
@@ -43,8 +41,11 @@ use crate::{
 	sync::lock::ResourceLock,
 };
 
-#[cfg(feature = "wasm-full")]
-use crate::socket::wasm::{SocketConfig, SocketConnectionState};
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+use crate::socket::WebSocketHandle;
 
 pub mod http;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
@@ -254,9 +255,10 @@ pub struct Client {
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
 	pub open_file_semaphore: tokio::sync::Semaphore,
 
-	#[cfg(feature = "wasm-full")]
-	pub(crate) socket_connection: SocketConnectionState,
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
 	pub(crate) socket_handle: std::sync::Mutex<WebSocketHandle>,
 }
 
@@ -387,9 +389,10 @@ impl Client {
 					.unwrap_or(crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET),
 			),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
-			#[cfg(feature = "wasm-full")]
-			socket_connection: SocketConnectionState::new(http_client, SocketConfig::default()),
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
 			socket_handle: std::sync::Mutex::new(WebSocketHandle::default()),
 		})
 	}
@@ -618,9 +621,10 @@ impl Client {
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,
 			),
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
-			#[cfg(feature = "wasm-full")]
-			socket_connection: SocketConnectionState::new(http_client, SocketConfig::default()),
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
 			socket_handle: std::sync::Mutex::new(WebSocketHandle::default()),
 		})
 	}

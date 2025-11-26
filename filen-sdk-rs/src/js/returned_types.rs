@@ -8,7 +8,7 @@ use crate::{
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use tsify::Tsify;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
@@ -16,7 +16,6 @@ use tsify::Tsify;
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type")]
-#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
 pub enum NonRootItemTagged {
 	#[serde(rename = "dir")]
 	Dir(Dir),
