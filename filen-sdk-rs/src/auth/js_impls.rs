@@ -254,7 +254,6 @@ pub async fn register_js(params: RegisterParams) -> Result<(), Error> {
 #[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub async fn login(params: crate::js::LoginParams) -> Result<JsClient, Error> {
-	log::info!("Logging in user: {:?}", params);
 	let client = do_on_commander(move || async move {
 		Client::login(
 			params.email,
