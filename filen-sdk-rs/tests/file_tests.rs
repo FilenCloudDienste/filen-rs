@@ -535,6 +535,8 @@ async fn file_versions() {
 			.upload_file(base_file.clone().into(), content.as_bytes())
 			.await
 			.unwrap();
+		// we do this because timestamps have a resolution of 1 second on the backend
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 		versions.push((file, content));
 	}
 	let mut current = versions.pop().unwrap().0;

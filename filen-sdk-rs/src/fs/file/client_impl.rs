@@ -226,11 +226,15 @@ impl Client {
 		.await?;
 		let crypter = self.crypter();
 		do_cpu_intensive(move || {
-			Ok(response
+			let mut versions: Vec<FileVersion> = response
 				.versions
 				.into_maybe_par_iter()
 				.map(|v| FileVersion::blocking_from_response(&*crypter, v))
-				.collect())
+				.collect();
+
+			// newest first
+			versions.sort_by_key(|v| -v.timestamp().timestamp());
+			Ok(versions)
 		})
 		.await
 	}
