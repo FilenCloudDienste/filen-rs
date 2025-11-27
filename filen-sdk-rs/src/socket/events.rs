@@ -21,14 +21,13 @@ pub use filen_types::api::v3::socket::{
 	ChatConversationDeleted, ChatConversationParticipantLeft, ChatMessageDelete,
 	ChatMessageEmbedDisabled, ChatTyping, ContactRequestReceived, FileArchived,
 	FileDeletedPermanent, FileTrash, FolderColorChanged, FolderDeletedPermanent, FolderTrash,
-	NewEvent, NoteArchived, NoteDeleted, NoteNew, NoteParticipantPermissions,
-	NoteParticipantRemoved, NoteRestored,
+	NewEvent, NoteArchived, NoteDeleted, NoteParticipantPermissions, NoteParticipantRemoved,
+	NoteRestored,
 };
 
 use crate::{
 	Error, ErrorKind,
 	chats::{Chat, ChatMessage, ChatParticipant},
-	consts::CHUNK_SIZE,
 	crypto::{
 		notes_and_chats::{NoteOrChatCarrierCryptoExt, NoteOrChatKeyStruct},
 		shared::MetaCrypter,
@@ -373,7 +372,7 @@ impl DecryptedSocketEvent<'_> {
 			SocketEvent::NoteParticipantNew(e) => {
 				DecryptedSocketEvent::NoteParticipantNew(e.into())
 			}
-			SocketEvent::NoteNew(e) => DecryptedSocketEvent::NoteNew(e),
+			SocketEvent::NoteNew(e) => DecryptedSocketEvent::NoteNew(e.into()),
 			SocketEvent::ChatMessageEmbedDisabled(e) => {
 				DecryptedSocketEvent::ChatMessageEmbedDisabled(e)
 			}
@@ -580,7 +579,6 @@ impl<'a> FolderRename<'a> {
 	}
 }
 
-// todo test meta vs name FolderMove
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderMove(pub RemoteDirectory);
 impl<'a> FolderMove {
@@ -758,6 +756,16 @@ impl From<filen_types::api::v3::socket::NoteParticipantNew<'_>> for NoteParticip
 			note: value.note,
 			participant: value.participant.into(),
 		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteNew {
+	pub note: UuidStr,
+}
+impl From<filen_types::api::v3::socket::NoteNew<'_>> for NoteNew {
+	fn from(value: filen_types::api::v3::socket::NoteNew<'_>) -> Self {
+		Self { note: value.note }
 	}
 }
 

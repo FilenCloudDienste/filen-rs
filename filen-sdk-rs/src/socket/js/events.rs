@@ -6,7 +6,7 @@ use filen_types::{
 		socket::{
 			ChatConversationDeleted, ChatConversationParticipantLeft, ChatMessageDelete,
 			ChatMessageEmbedDisabled, FileArchived, FileDeletedPermanent, FileTrash,
-			FolderDeletedPermanent, FolderTrash, NoteArchived, NoteDeleted, NoteNew,
+			FolderDeletedPermanent, FolderTrash, NoteArchived, NoteDeleted,
 			NoteParticipantPermissions, NoteParticipantRemoved, NoteRestored,
 		},
 	},
@@ -123,7 +123,7 @@ impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
 				Self::NoteParticipantRemoved(e.clone())
 			}
 			DecryptedSocketEvent::NoteParticipantNew(e) => Self::NoteParticipantNew(e.into()),
-			DecryptedSocketEvent::NoteNew(e) => Self::NoteNew(e.clone()),
+			DecryptedSocketEvent::NoteNew(e) => Self::NoteNew(e.into()),
 			DecryptedSocketEvent::ChatMessageEmbedDisabled(e) => {
 				Self::ChatMessageEmbedDisabled(e.clone())
 			}
@@ -540,6 +540,22 @@ impl From<&crate::socket::events::NoteParticipantNew> for NoteParticipantNew {
 			note: event.note,
 			participant: event.participant.clone(),
 		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown",),
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(large_number_types_as_bigints)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct NoteNew {
+	pub note: UuidStr,
+}
+impl From<&crate::socket::events::NoteNew> for NoteNew {
+	fn from(value: &crate::socket::events::NoteNew) -> Self {
+		Self { note: value.note }
 	}
 }
 

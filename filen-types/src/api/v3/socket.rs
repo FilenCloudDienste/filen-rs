@@ -136,7 +136,8 @@ pub enum SocketEvent<'a> {
 	NoteParticipantRemoved(NoteParticipantRemoved),
 	#[serde(borrow)]
 	NoteParticipantNew(NoteParticipantNew<'a>),
-	NoteNew(NoteNew),
+	#[serde(borrow)]
+	NoteNew(NoteNew<'a>),
 	ChatMessageEmbedDisabled(ChatMessageEmbedDisabled),
 	ChatConversationParticipantLeft(ChatConversationParticipantLeft),
 	ChatConversationDeleted(ChatConversationDeleted),
@@ -788,20 +789,12 @@ pub struct NoteParticipantNew<'a> {
 	pub participant: NoteParticipant<'a>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(
-	all(
-		target_family = "wasm",
-		target_os = "unknown",
-		not(feature = "service-worker")
-	),
-	derive(tsify::Tsify),
-	tsify(large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct NoteNew {
+pub struct NoteNew<'a> {
 	pub note: UuidStr,
+	#[serde(borrow)]
+	pub title: EncryptedString<'a>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
