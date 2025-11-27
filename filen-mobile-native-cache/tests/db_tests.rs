@@ -11,7 +11,6 @@ use filen_sdk_rs::fs::{HasName, HasUUID, file::traits::HasFileInfo};
 use filen_types::fs::UuidStr;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rand::TryRngCore;
-use test_log::test;
 use test_utils::TestResources;
 
 pub struct NoOpProgressCallback;
