@@ -885,7 +885,7 @@ impl TwoFASecret {
 		&self.url
 	}
 
-	pub fn make_totp_code(&self, for_time: DateTime<Utc>) -> Result<u32, Error> {
+	pub fn make_totp_code(&self, for_time: DateTime<Utc>) -> Result<String, Error> {
 		let decoded_secret =
 			base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &self.secret).ok_or_else(
 				|| {
@@ -915,7 +915,7 @@ impl TwoFASecret {
 			| (hash[offset + 2] as u32) << 8
 			| (hash[offset + 3] as u32);
 
-		Ok(code % 1_000_000)
+		Ok(format!("{:06}", code % 1_000_000))
 	}
 }
 

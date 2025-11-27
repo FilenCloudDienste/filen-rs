@@ -58,18 +58,14 @@ async fn cleanup_test_dirs() {
 }
 
 async fn enable_2fa_for_client(client: &Client, secret: &TwoFASecret) -> String {
-	for _ in 0..60 {
+	for _ in 0..10 {
 		let result = client
-			.enable_2fa(
-				&secret
-					.make_totp_code(chrono::Utc::now())
-					.unwrap()
-					.to_string(),
-			)
+			.enable_2fa(&secret.make_totp_code(chrono::Utc::now()).unwrap())
 			.await;
 		match result {
 			Err(e) => {
 				log::warn!("Failed to enable 2FA: {}, retrying...", e);
+				tokio::time::sleep(Duration::from_secs(5)).await;
 				continue;
 			}
 			Ok(recovery_key) => return recovery_key,
