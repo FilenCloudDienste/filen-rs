@@ -114,7 +114,11 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 pub fn rt() -> &'static tokio::runtime::Runtime {
 	RUNTIME.get_or_init(|| {
-		let _ = env_logger::try_init();
+		env_logger::Builder::from_default_env()
+			.filter_module("reqwest", log::LevelFilter::Info)
+			.filter_module("html5ever", log::LevelFilter::Info)
+			.filter_module("selectors", log::LevelFilter::Info)
+			.init();
 		tokio::runtime::Builder::new_multi_thread()
 			.enable_all()
 			.build()
