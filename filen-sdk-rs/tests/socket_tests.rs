@@ -678,9 +678,7 @@ async fn chat() {
 	let event = await_map_event(
 		&mut share_receiver,
 		|event| match event {
-			DecryptedSocketEvent::ChatMessageNew(data) if data.0.message() == msg.message() => {
-				Some(data)
-			}
+			DecryptedSocketEvent::ChatMessageNew(data) if data.0.uuid() == msg.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),
