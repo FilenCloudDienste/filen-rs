@@ -218,6 +218,13 @@ impl HasRemoteInfo for DirectoryMetaType<'_> {
 			DirectoryMetaType::Dir(dir) => dir.favorited(),
 		}
 	}
+
+	fn timestamp(&self) -> chrono::DateTime<chrono::Utc> {
+		match self {
+			DirectoryMetaType::Root(dir) => dir.timestamp(),
+			DirectoryMetaType::Dir(dir) => dir.timestamp(),
+		}
+	}
 }
 
 impl HasMeta for DirectoryMetaType<'_> {

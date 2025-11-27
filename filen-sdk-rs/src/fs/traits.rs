@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use chrono::{DateTime, Utc};
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ObjectType, ParentUuid, UuidStr},
@@ -14,6 +15,7 @@ pub trait HasParent {
 
 pub trait HasRemoteInfo {
 	fn favorited(&self) -> bool;
+	fn timestamp(&self) -> DateTime<Utc>;
 }
 
 pub trait SetRemoteInfo {

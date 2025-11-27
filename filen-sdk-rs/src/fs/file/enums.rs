@@ -114,6 +114,13 @@ impl HasRemoteInfo for RemoteFileType<'_> {
 			RemoteFileType::SharedFile(file) => file.favorited(),
 		}
 	}
+
+	fn timestamp(&self) -> DateTime<Utc> {
+		match self {
+			RemoteFileType::File(file) => file.timestamp(),
+			RemoteFileType::SharedFile(file) => file.timestamp(),
+		}
+	}
 }
 
 impl HasRemoteFileInfo for RemoteFileType<'_> {

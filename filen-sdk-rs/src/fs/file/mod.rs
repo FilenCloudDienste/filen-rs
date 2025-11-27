@@ -376,6 +376,10 @@ impl HasRemoteInfo for RemoteFile {
 	fn favorited(&self) -> bool {
 		self.favorited
 	}
+
+	fn timestamp(&self) -> DateTime<Utc> {
+		self.timestamp
+	}
 }
 
 impl SetRemoteInfo for RemoteFile {
@@ -511,6 +515,10 @@ impl HasFileInfo for RemoteRootFile {
 impl HasRemoteInfo for RemoteRootFile {
 	fn favorited(&self) -> bool {
 		false
+	}
+
+	fn timestamp(&self) -> DateTime<Utc> {
+		self.timestamp
 	}
 }
 

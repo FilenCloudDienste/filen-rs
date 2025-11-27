@@ -131,6 +131,10 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 	fn favorited(&self) -> bool {
 		false
 	}
+
+	fn timestamp(&self) -> DateTime<Utc> {
+		self.timestamp
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,6 +289,10 @@ impl HasDirInfo for RemoteDirectory {
 impl HasRemoteInfo for RemoteDirectory {
 	fn favorited(&self) -> bool {
 		self.favorited
+	}
+
+	fn timestamp(&self) -> DateTime<Utc> {
+		self.timestamp
 	}
 }
 
