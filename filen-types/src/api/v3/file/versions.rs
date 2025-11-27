@@ -24,6 +24,7 @@ pub struct FileVersion<'a> {
 	pub timestamp: DateTime<Utc>,
 	pub uuid: UuidStr,
 	pub version: FileEncryptionVersion,
+	pub size: u64,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

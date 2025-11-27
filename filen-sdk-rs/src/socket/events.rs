@@ -480,7 +480,7 @@ impl<'a> FileArchiveRestored {
 				meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 					.into_owned_cow(),
 				parent: event.parent,
-				size: 0, // TODO fix
+				size: event.size,
 				favorited: event.favorited,
 				region: event.region.into_owned(),
 				bucket: event.bucket.into_owned(),
@@ -504,7 +504,7 @@ impl<'a> FileNew {
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 				.into_owned_cow(),
 			parent: event.parent,
-			size: 0, // TODO fix
+			size: event.size,
 			favorited: event.favorited,
 			region: event.region.into_owned(),
 			bucket: event.bucket.into_owned(),
@@ -527,7 +527,7 @@ impl<'a> FileRestore {
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 				.into_owned_cow(),
 			parent: event.parent,
-			size: 0, // TODO fix
+			size: event.size,
 			favorited: event.favorited,
 			region: event.region.into_owned(),
 			bucket: event.bucket.into_owned(),
@@ -549,7 +549,7 @@ impl<'a> FileMove {
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 				.into_owned_cow(),
 			parent: event.parent,
-			size: 0, // TODO fix
+			size: event.size,
 			favorited: event.favorited,
 			region: event.region.into_owned(),
 			bucket: event.bucket.into_owned(),
@@ -867,12 +867,12 @@ impl<'a> ItemFavorite {
 						})?
 						.into_owned(),
 					timestamp: event.timestamp,
-					// todo use actual chunk count once this is returned from backend
-					chunks: if size == 0 {
-						0
-					} else {
-						size / CHUNK_SIZE as u64 + 1
-					},
+					chunks: event.chunks.ok_or_else(|| {
+						Error::custom(
+							ErrorKind::Response,
+							"missing chunks for file favorite event",
+						)
+					})?,
 				}))
 			}
 			filen_types::fs::ObjectType::Dir => NonRootFSObject::Dir(Cow::Owned(RemoteDirectory {

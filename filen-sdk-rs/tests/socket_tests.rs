@@ -138,7 +138,7 @@ async fn test_websocket_file_events() {
 		.await
 		.unwrap();
 
-	let mut event = await_map_event(
+	let event = await_map_event(
 		&mut receiver,
 		|event| match event {
 			DecryptedSocketEvent::FileNew(data) => {
@@ -155,8 +155,6 @@ async fn test_websocket_file_events() {
 	)
 	.await;
 
-	// todo remove when backend gets fixed
-	event.0.size = file_a.size;
 	assert_eq!(event.0, file_a);
 
 	client.trash_file(&mut file_a).await.unwrap();
@@ -173,7 +171,7 @@ async fn test_websocket_file_events() {
 
 	client.restore_file(&mut file_a).await.unwrap();
 
-	let mut event = await_map_event(
+	let event = await_map_event(
 		&mut receiver,
 		|event| match event {
 			DecryptedSocketEvent::FileRestore(data) => {
@@ -190,7 +188,6 @@ async fn test_websocket_file_events() {
 	)
 	.await;
 
-	event.0.size = file_a.size;
 	assert_eq!(event.0, file_a);
 
 	let old_file_a = file_a;
@@ -270,8 +267,6 @@ async fn test_websocket_file_events() {
 	// so we need to adjust that here before we assert_eq
 	event.file.favorited = file_a.favorited;
 
-	// todo remove when backend gets fixed
-	event.file.size = file_a.size;
 	assert_eq!(event.file, file_a);
 
 	await_event(
@@ -329,7 +324,7 @@ async fn test_websocket_file_events() {
 
 	client.move_file(&mut file_a, &new_parent).await.unwrap();
 
-	let mut event = await_map_event(
+	let event = await_map_event(
 		&mut receiver,
 		|event| match event {
 			DecryptedSocketEvent::FileMove(data) => {
@@ -346,7 +341,6 @@ async fn test_websocket_file_events() {
 	)
 	.await;
 
-	event.0.size = file_a.size;
 	assert_eq!(event.0, file_a);
 
 	let uuid = *file_a.uuid();

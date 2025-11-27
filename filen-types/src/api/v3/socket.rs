@@ -394,6 +394,7 @@ pub struct FileArchiveRestored<'a> {
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
+	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
 	#[serde(borrow)]
@@ -415,6 +416,7 @@ pub struct FileNew<'a> {
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
+	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
 	#[serde(borrow)]
@@ -436,6 +438,7 @@ pub struct FileRestore<'a> {
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
+	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
 	#[serde(borrow)]
@@ -457,6 +460,7 @@ pub struct FileMove<'a> {
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub chunks: u64,
+	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
 	#[serde(borrow)]
@@ -905,6 +909,7 @@ pub struct ItemFavorite<'a> {
 	#[serde(borrow)]
 	pub bucket: Option<Cow<'a, str>>,
 	pub size: Option<u64>,
+	pub chunks: Option<u64>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	#[serde(borrow)]

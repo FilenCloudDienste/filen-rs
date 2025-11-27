@@ -252,9 +252,7 @@ impl Client {
 
 		file.bucket = version.bucket;
 		file.region = version.region;
-		// CRITICAL TODO: size needs to be added here
-		// as otherwise downloads for file versions with a different size will fail
-		// file.size = version.size;
+		file.size = version.size;
 		file.chunks = version.chunks;
 		file.timestamp = version.timestamp;
 		file.meta = version.metadata;

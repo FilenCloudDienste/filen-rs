@@ -581,7 +581,7 @@ impl FileVersion {
 			bucket: response.bucket.into_owned(),
 			region: response.region.into_owned(),
 			chunks: response.chunks,
-			size: 0, // todo when backend adds size to versions response
+			size: response.size,
 			metadata: FileMeta::blocking_from_encrypted(
 				response.metadata,
 				crypter,

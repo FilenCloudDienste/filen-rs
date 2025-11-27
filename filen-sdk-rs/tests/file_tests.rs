@@ -529,7 +529,7 @@ async fn file_versions() {
 
 	let mut versions = Vec::new();
 	// TODO: when backend supports size in version info, use different lengths for these strings
-	for content in ["Version 1", "Version 2", "Version 3", "Version 4"] {
+	for content in ["Version 1", "Version a 2", "Version as 3", "Version asd 4"] {
 		let base_file = client.make_file_builder("test", test_dir).build();
 		let file = client
 			.upload_file(base_file.clone().into(), content.as_bytes())
@@ -551,8 +551,8 @@ async fn file_versions() {
 		listed_versions.into_iter().zip(versions.iter_mut().rev())
 	{
 		assert_eq!(listed.metadata(), expected.get_meta());
-		// assert_eq!(listed.size(), expected.size()); TODO: re-enable after backend starts sending size in version info
-		assert_eq!(listed.timestamp(), expected.timestamp);
+		assert_eq!(listed.size(), expected.size());
+		assert_eq!(listed.timestamp(), expected.timestamp());
 		client
 			.restore_file_version(&mut current, listed)
 			.await
