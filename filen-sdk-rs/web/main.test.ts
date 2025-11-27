@@ -9,7 +9,6 @@ import init, {
 	FilenSDKError,
 	ListenerHandle,
 	type SocketEvent,
-	decryptMetaWithChatKey,
 	type FileMeta,
 	type DecryptedFileMeta,
 	type DecryptedDirMeta,
@@ -700,33 +699,17 @@ test("chats", async () => {
 	expect(fetchedChat).toEqual(chat)
 
 	// sleep for 5s
-	// await new Promise(resolve => setTimeout(resolve, 5000))
+	await new Promise(resolve => setTimeout(resolve, 5000))
 
-	// const first = allEvents[0]!
+	const chatEvent = allEvents.find(e => e.type === "chatMessageNew" && e.msg.chat === chat.uuid)
 
-	// const chatEvent = allEvents.find(e => e.type === "chatMessageNew" && e.data.conversation === chat.uuid)
+	expect(chatEvent).toBeDefined()
 
-	// expect(chatEvent).toBeDefined()
+	if (chatEvent?.type !== "chatMessageNew") {
+		throw new Error("Expected chatMessageNew event")
+	}
 
-	// if (chatEvent?.type !== "chatMessageNew") {
-	// 	throw new Error("Expected chatMessageNew event")
-	// }
-
-	// const { conversation, ...rest } = chatEvent.data
-
-	// const receivedChatMessage = {
-	// 	...rest,
-	// 	replyTo: rest.replyTo && {
-	// 		...rest.replyTo,
-	// 		message: JSON.parse(await decryptMetaWithChatKey(chat, rest.replyTo.message)).message
-	// 	},
-	// 	message: JSON.parse(await decryptMetaWithChatKey(chat, rest.message)).message,
-	// 	chat: conversation,
-	// 	edited: false,
-	// 	editedTimestamp: 0n
-	// }
-
-	// expect(receivedChatMessage).toEqual(fetchedChat?.lastMessage)
+	expect(chatEvent.msg).toEqual(fetchedChat?.lastMessage)
 })
 
 test("search", async () => {

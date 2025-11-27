@@ -16,7 +16,7 @@ use filen_types::{
 };
 
 use crate::{
-	chats::Chat,
+	chats::{Chat, ChatMessage},
 	js::{Dir, DirColor, DirMeta, File, FileMeta, NonRootItemTagged},
 	notes::NoteParticipant,
 	socket::events::ChatConversationParticipantNew,
@@ -401,11 +401,15 @@ impl From<&crate::socket::events::FolderColorChanged<'_>> for FolderColorChanged
 	serde(rename_all = "camelCase"),
 	tsify(large_number_types_as_bigints)
 )]
-pub struct ChatMessageNew {}
+pub struct ChatMessageNew {
+	pub msg: ChatMessage,
+}
 
 impl From<&crate::socket::events::ChatMessageNew> for ChatMessageNew {
-	fn from(_event: &crate::socket::events::ChatMessageNew) -> Self {
-		Self {}
+	fn from(event: &crate::socket::events::ChatMessageNew) -> Self {
+		Self {
+			msg: event.0.clone(),
+		}
 	}
 }
 

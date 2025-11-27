@@ -1043,7 +1043,7 @@ impl Client {
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls {
-	use filen_types::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
+	use filen_types::{api::v3::notes::NoteType, fs::UuidStr};
 
 	use crate::{
 		Error, auth::JsClient, connect::js_impls::Contact, notes::NoteParticipant,
@@ -1072,32 +1072,6 @@ pub mod js_impls {
 	pub struct AddTagToNoteResponse {
 		pub note: Note,
 		pub tag: NoteTag,
-	}
-
-	/// Decrypts note data using the provided chat key.
-	/// Meant to be used in socket event handlers where this cannot currently be done automatically.
-	///
-	/// Should not be used outside of that context.
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "decryptMetaWithNoteKey")]
-	pub async fn decrypt_meta_with_note_key(
-		note: Note,
-		#[wasm_bindgen(unchecked_param_type = "EncryptedString")] encrypted: String,
-	) -> Result<String, Error> {
-		do_on_commander(move || async move {
-			note.decrypt_string(&EncryptedString(std::borrow::Cow::Owned(encrypted)))
-				.await
-		})
-		.await
-	}
-
-	#[cfg(feature = "uniffi")]
-	#[uniffi::export]
-	pub async fn decrypt_meta_with_note_key(
-		note: Note,
-		encrypted: EncryptedString<'static>,
-	) -> Result<String, Error> {
-		do_on_commander(move || async move { note.decrypt_string(&encrypted).await }).await
 	}
 
 	#[cfg_attr(
