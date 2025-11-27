@@ -27,7 +27,7 @@ pub use filen_types::api::v3::socket::{
 
 use crate::{
 	Error, ErrorKind,
-	chats::{ChatMessage, ChatParticipant},
+	chats::{Chat, ChatMessage, ChatParticipant},
 	consts::CHUNK_SIZE,
 	crypto::{
 		notes_and_chats::{NoteOrChatCarrierCryptoExt, NoteOrChatKeyStruct},
@@ -248,6 +248,7 @@ impl DecryptedSocketEvent<'_> {
 	pub(crate) async fn try_from_encrypted<'a>(
 		crypter: &impl MetaCrypter,
 		private_key: &RsaPrivateKey,
+		user_id: u64,
 		event: SocketEvent<'a>,
 	) -> Result<DecryptedSocketEvent<'a>, Error> {
 		Ok(match event {
@@ -338,7 +339,7 @@ impl DecryptedSocketEvent<'_> {
 			SocketEvent::ChatConversationsNew(e) => {
 				runtime::do_cpu_intensive(|| {
 					DecryptedSocketEvent::ChatConversationsNew(
-						ChatConversationsNew::blocking_from_encrypted(crypter, e),
+						ChatConversationsNew::blocking_from_rsa_encrypted(private_key, user_id, e),
 					)
 				})
 				.await
@@ -659,13 +660,32 @@ impl<'a> ChatMessageNew {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatConversationsNew;
+pub struct ChatConversationsNew(pub Chat);
 impl<'a> ChatConversationsNew {
-	fn blocking_from_encrypted(
-		_crypter: &impl MetaCrypter,
-		_event: filen_types::api::v3::socket::ChatConversationsNew<'a>,
+	fn blocking_from_rsa_encrypted(
+		private_key: &RsaPrivateKey,
+		user_id: u64,
+		event: filen_types::api::v3::socket::ChatConversationsNew<'a>,
 	) -> Self {
-		Self
+		let (key, _, _, participants) = crate::chats::blocking_decrypt_chat_parts(
+			user_id,
+			private_key,
+			event.participants,
+			None,
+			None,
+		);
+
+		Self(Chat {
+			uuid: event.uuid,
+			last_message: None,
+			owner_id: event.owner_id,
+			key,
+			name: None,
+			participants,
+			muted: false,
+			created: event.added_timestamp,
+			last_focus: None,
+		})
 	}
 }
 

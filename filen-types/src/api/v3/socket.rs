@@ -6,6 +6,7 @@ use yoke::Yokeable;
 use crate::{
 	api::v3::{
 		chat::{
+			conversations::ChatConversationParticipant,
 			messages::{ChatMessageEncrypted, ChatMessagePartialEncrypted},
 			typing::ChatTypingType,
 		},
@@ -646,6 +647,9 @@ pub struct ChatConversationsNew<'a> {
 	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub added_timestamp: DateTime<Utc>,
+	pub owner_id: u64,
+	#[serde(borrow)]
+	pub participants: Vec<ChatConversationParticipant<'a>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]

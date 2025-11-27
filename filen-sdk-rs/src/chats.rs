@@ -16,6 +16,7 @@ use filen_types::{
 use futures::{StreamExt, stream::FuturesUnordered};
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
+use rsa::RsaPrivateKey;
 
 use crate::{
 	Error, ErrorKind, api,
@@ -29,7 +30,7 @@ use crate::{
 	util::IntoMaybeParallelIterator,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 #[cfg_attr(
 	feature = "wasm-full",
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
@@ -63,6 +64,19 @@ pub struct ChatParticipant {
 	pub(crate) last_active: DateTime<Utc>,
 }
 
+impl PartialEq for ChatParticipant {
+	fn eq(&self, other: &Self) -> bool {
+		self.user_id == other.user_id
+			&& self.email == other.email
+			&& self.avatar == other.avatar
+			&& self.nick_name == other.nick_name
+			&& self.permissions_add == other.permissions_add
+			&& self.added == other.added
+			&& self.appear_offline == other.appear_offline
+		// ignore last_active in equality checks
+	}
+}
+
 impl ChatParticipant {
 	pub fn email(&self) -> &str {
 		&self.email
@@ -83,41 +97,41 @@ impl ChatParticipant {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct Chat {
-	uuid: UuidStr,
+	pub(crate) uuid: UuidStr,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none")
 	)]
-	last_message: Option<ChatMessage>,
-	owner_id: u64,
+	pub(crate) last_message: Option<ChatMessage>,
+	pub(crate) owner_id: u64,
 	// none if decryption fails
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
-	key: Option<NoteOrChatKey>,
+	pub(crate) key: Option<NoteOrChatKey>,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none"),
 		tsify(type = "string")
 	)]
 	// none if decryption fails
-	name: Option<String>,
-	participants: Vec<ChatParticipant>,
-	muted: bool,
+	pub(crate) name: Option<String>,
+	pub(crate) participants: Vec<ChatParticipant>,
+	pub(crate) muted: bool,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
-	created: DateTime<Utc>,
+	pub(crate) created: DateTime<Utc>,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(with = "filen_types::serde::time::optional"),
 		tsify(type = "bigint")
 	)]
-	last_focus: Option<DateTime<Utc>>,
+	pub(crate) last_focus: Option<DateTime<Utc>>,
 }
 
 impl Chat {
@@ -143,6 +157,10 @@ impl Chat {
 
 	pub fn muted(&self) -> bool {
 		self.muted
+	}
+
+	pub fn created(&self) -> DateTime<Utc> {
+		self.created
 	}
 
 	pub async fn update_name_from_encrypted(
@@ -189,6 +207,105 @@ impl Chat {
 			.await
 			.context("decrypt_chat_message")
 	}
+
+	pub(crate) fn blocking_decrypt(
+		user_id: u64,
+		private_key: &RsaPrivateKey,
+		encrypted: filen_types::api::v3::chat::conversations::ChatConversation<'_>,
+	) -> Self {
+		let (key, name, last_message, participants) = blocking_decrypt_chat_parts(
+			user_id,
+			private_key,
+			encrypted.participants,
+			encrypted.name.as_ref(),
+			encrypted.last_message_full,
+		);
+
+		Chat {
+			uuid: encrypted.uuid,
+			last_message,
+			owner_id: encrypted.owner_id,
+			key,
+			name,
+			participants,
+			muted: encrypted.muted,
+			created: encrypted.created_timestamp,
+			last_focus: encrypted.last_focus,
+		}
+	}
+}
+
+pub(crate) fn blocking_decrypt_chat_parts(
+	user_id: u64,
+	private_key: &RsaPrivateKey,
+	participants: Vec<filen_types::api::v3::chat::conversations::ChatConversationParticipant<'_>>,
+	encrypted_name: Option<&EncryptedString<'_>>,
+	encrypted_last_messsage: Option<filen_types::api::v3::chat::messages::ChatMessageEncrypted<'_>>,
+) -> (
+	Option<NoteOrChatKey>,
+	Option<String>,
+	Option<ChatMessage>,
+	Vec<ChatParticipant>,
+) {
+	let key = blocking_decrypt_chat_key(private_key, user_id, &participants).ok();
+
+	let participants_closure = || {
+		let mut participants = participants
+			.into_iter()
+			.map(|p| ChatParticipant {
+				user_id: p.user_id,
+				email: p.email.into_owned(),
+				avatar: p.avatar.map(Cow::into_owned),
+				nick_name: p.nick_name.into_owned(),
+				permissions_add: p.permissions_add,
+				added: p.added_timestamp,
+				appear_offline: p.appear_offline,
+				// this is so that our own last_active is always 0
+				// this is because otherwise it is impossible to test
+				last_active: if p.user_id == user_id {
+					DateTime::<Utc>::default()
+				} else {
+					p.last_active
+				},
+			})
+			.collect::<Vec<_>>();
+
+		participants.sort_by_key(|p| p.added);
+		participants
+	};
+
+	let (name, last_message, participants) = match key.as_ref() {
+		Some(k) => {
+			blocking_join!(
+				|| {
+					encrypted_name
+						.as_ref()
+						.and_then(|name| crypto::ChatName::blocking_try_decrypt(k, name).ok())
+				},
+				|| {
+					encrypted_last_messsage.map(|msg| ChatMessage::blocking_decrypt(msg, Some(k)))
+				},
+				participants_closure
+			)
+		}
+		None => (None, None, participants_closure()),
+	};
+	(key, name, last_message, participants)
+}
+
+fn blocking_decrypt_chat_key(
+	private_key: &RsaPrivateKey,
+	user_id: u64,
+	participants: &[filen_types::api::v3::chat::conversations::ChatConversationParticipant<'_>],
+) -> Result<NoteOrChatKey, Error> {
+	let participant = participants
+		.iter()
+		.find(|p| p.user_id == user_id)
+		.ok_or_else(|| {
+			Error::custom(ErrorKind::Response, "User is not a participant in the chat")
+		})?;
+
+	NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &participant.metadata)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,21 +456,6 @@ pub(crate) mod crypto {
 }
 
 impl Client {
-	fn blocking_decrypt_chat_key(
-		&self,
-		chat: &filen_types::api::v3::chat::conversations::ChatConversation<'_>,
-	) -> Result<NoteOrChatKey, Error> {
-		let participant = chat
-			.participants
-			.iter()
-			.find(|p| p.user_id == self.user_id)
-			.ok_or_else(|| {
-				Error::custom(ErrorKind::Response, "User is not a participant in the chat")
-			})?;
-
-		NoteOrChatKeyStruct::blocking_try_decrypt_rsa(self.private_key(), &participant.metadata)
-	}
-
 	pub async fn list_messages(&self, chat: &Chat) -> Result<Vec<ChatMessage>, Error> {
 		self.list_messages_before(chat, chrono::Utc::now() + chrono::Duration::days(1))
 			.await
@@ -394,79 +496,17 @@ impl Client {
 		Ok(messages)
 	}
 
-	fn blocking_decrypt_chat(
-		&self,
-		encrypted: filen_types::api::v3::chat::conversations::ChatConversation<'_>,
-	) -> Chat {
-		let key = self.blocking_decrypt_chat_key(&encrypted).ok();
-
-		let participants_closure = || {
-			let mut participants = encrypted
-				.participants
-				.into_iter()
-				.map(|p| ChatParticipant {
-					user_id: p.user_id,
-					email: p.email.into_owned(),
-					avatar: p.avatar.map(Cow::into_owned),
-					nick_name: p.nick_name.into_owned(),
-					permissions_add: p.permissions_add,
-					added: p.added_timestamp,
-					appear_offline: p.appear_offline,
-					// this is so that our own last_active is always 0
-					// this is because otherwise it is impossible to test
-					last_active: if p.user_id == self.user_id {
-						DateTime::<Utc>::default()
-					} else {
-						p.last_active
-					},
-				})
-				.collect::<Vec<_>>();
-
-			participants.sort_by_key(|p| p.added);
-			participants
-		};
-
-		let (name, last_message, participants) = match key.as_ref() {
-			Some(k) => {
-				blocking_join!(
-					|| {
-						encrypted
-							.name
-							.as_ref()
-							.and_then(|name| crypto::ChatName::blocking_try_decrypt(k, name).ok())
-					},
-					|| {
-						encrypted
-							.last_message_full
-							.map(|msg| ChatMessage::blocking_decrypt(msg, Some(k)))
-					},
-					participants_closure
-				)
-			}
-			None => (None, None, participants_closure()),
-		};
-
-		Chat {
-			uuid: encrypted.uuid,
-			last_message,
-			owner_id: encrypted.owner_id,
-			key,
-			name,
-			participants,
-			muted: encrypted.muted,
-			created: encrypted.created_timestamp,
-			last_focus: encrypted.last_focus,
-		}
-	}
-
 	pub async fn list_chats(&self) -> Result<Vec<Chat>, Error> {
 		let resp = api::v3::chat::conversations::get(self.client()).await?;
+
+		let user_id = self.user_id;
+		let private_key = self.private_key();
 
 		Ok(do_cpu_intensive(|| {
 			let mut chats = resp
 				.0
 				.into_maybe_par_iter()
-				.map(|chat| self.blocking_decrypt_chat(chat))
+				.map(|chat| Chat::blocking_decrypt(user_id, private_key, chat))
 				.collect::<Vec<_>>();
 			chats.sort_by_key(|c| {
 				c.last_message()

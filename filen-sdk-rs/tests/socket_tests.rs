@@ -599,42 +599,57 @@ async fn chat() {
 		.find(|c| c.email == share_client.email())
 		.unwrap();
 
-	let mut chat = client.create_chat(&[share_contact]).await.unwrap();
+	let mut chat = client.create_chat(&[]).await.unwrap();
 
-	// let event = await_map_event(
-	// 	&mut receiver,
-	// 	|event| match event {
-	// 		DecryptedSocketEvent::ChatConversationsNew(data) => {
-	// 			// if data.0.uuid == *chat.uuid() {
-	// 			// 	Some(data)
-	// 			// } else {
-	// 			// 	None
-	// 			// }
-	// 			Some(data)
-	// 		}
-	// 		_ => None,
-	// 	},
-	// 	Duration::from_secs(10),
-	// 	"chatConversationNew",
-	// )
-	// .await;
-	// let event = await_map_event(
-	// 	&mut share_receiver,
-	// 	|event| match event {
-	// 		DecryptedSocketEvent::ChatConversationsNew(data) => {
-	// 			// if data.0.uuid == *chat.uuid() {
-	// 			// 	Some(data)
-	// 			// } else {
-	// 			// 	None
-	// 			// }
-	// 			Some(data)
-	// 		}
-	// 		_ => None,
-	// 	},
-	// 	Duration::from_secs(10),
-	// 	"chatConversationNew",
-	// )
-	// .await;
+	let event = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::ChatConversationsNew(data) => {
+				if data.0.uuid() == chat.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"chatConversationNew",
+	)
+	.await;
+
+	assert_eq!(event.0, chat);
+
+	client
+		.add_chat_participant(&mut chat, &share_contact)
+		.await
+		.unwrap();
+
+	let share_event = await_map_event(
+		&mut share_receiver,
+		|event| match event {
+			DecryptedSocketEvent::ChatConversationsNew(data) => {
+				if data.0.uuid() == chat.uuid() {
+					Some(data)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		},
+		Duration::from_secs(10),
+		"chatConversationNew",
+	)
+	.await;
+
+	// we compare fields one by one to avoid issues with created time being different
+	// since it depends on when the user was added
+
+	assert_eq!(share_event.0.participants(), chat.participants());
+	assert_eq!(share_event.0.name(), chat.name());
+	assert_eq!(share_event.0.uuid(), chat.uuid());
+	assert_eq!(share_event.0.last_message(), chat.last_message());
+	assert_eq!(share_event.0.muted(), chat.muted());
 
 	let event = await_map_event(
 		&mut receiver,

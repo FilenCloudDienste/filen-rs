@@ -55,6 +55,7 @@ impl WebSocketHandle {
 			Arc::clone(auth_client),
 			client.crypter(),
 			client.arc_private_key(),
+			client.user_id,
 		);
 		self.request_sender = Some(sender.downgrade());
 		RequestSender(sender)
@@ -223,12 +224,14 @@ pub(super) struct WebSocketConfig {
 	pub(super) reconnect_delay: Duration,
 	pub(super) max_reconnect_delay: Duration,
 	pub(super) ping_interval: Duration,
+	pub(super) user_id: u64,
 }
 
 fn spawn_websocket_thread(
 	client: Arc<AuthClient>,
 	crypter: Arc<impl MetaCrypter + 'static>,
 	private_key: Arc<RsaPrivateKey>,
+	user_id: u64,
 ) -> tokio::sync::mpsc::Sender<SocketRequest> {
 	let (request_sender, request_receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
 
@@ -237,6 +240,7 @@ fn spawn_websocket_thread(
 		reconnect_delay: RECONNECT_DELAY,
 		max_reconnect_delay: MAX_RECONNECT_DELAY,
 		ping_interval: PING_INTERVAL,
+		user_id,
 	};
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -327,7 +331,6 @@ where
 					}
 				};
 
-
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
 						if listeners.should_decrypt_event(event_yoke.get()) {
@@ -335,7 +338,7 @@ where
 								// this performs unnecessary cloning, ideally we would use an async
 								// yoke try_map_project_async but this does not currently exist
 								// https://github.com/unicode-org/icu4x/issues/7253
-								match DecryptedSocketEvent::try_from_encrypted(crypter, private_key, event_yoke.get().as_borrowed_cow()).await {
+								match DecryptedSocketEvent::try_from_encrypted(crypter, private_key, config.user_id, event_yoke.get().as_borrowed_cow()).await {
 									Ok(v) => Some(v.into_owned_cow()),
 									Err(e) => {
 										log::error!(

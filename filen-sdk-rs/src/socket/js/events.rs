@@ -16,6 +16,7 @@ use filen_types::{
 };
 
 use crate::{
+	chats::Chat,
 	js::{Dir, DirColor, DirMeta, File, FileMeta, NonRootItemTagged},
 	notes::NoteParticipant,
 	socket::events::ChatConversationParticipantNew,
@@ -453,11 +454,15 @@ impl From<&crate::socket::events::ChatTyping<'_>> for ChatTyping {
 	serde(rename_all = "camelCase"),
 	tsify(large_number_types_as_bigints)
 )]
-pub struct ChatConversationsNew {}
+pub struct ChatConversationsNew {
+	pub chat: Chat,
+}
 
 impl From<&crate::socket::events::ChatConversationsNew> for ChatConversationsNew {
-	fn from(_event: &crate::socket::events::ChatConversationsNew) -> Self {
-		Self {}
+	fn from(event: &crate::socket::events::ChatConversationsNew) -> Self {
+		Self {
+			chat: event.0.clone(),
+		}
 	}
 }
 

@@ -16,6 +16,7 @@ use crate::{
 	api::v3::chat::messages::ChatMessageEncrypted,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::UuidStr,
+	traits::CowHelpers,
 };
 
 pub const ENDPOINT: &str = "v3/chat/conversations";
@@ -40,7 +41,7 @@ pub struct ChatConversation<'a> {
 	pub last_focus: Option<DateTime<Utc>>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatConversationParticipant<'a> {
 	pub user_id: u64,
