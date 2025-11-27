@@ -645,7 +645,7 @@ where
 	{
 		use wasm_bindgen::UnwrapThrowExt;
 		wasm_threading::spawn_worker(|| {
-			wasm_bindgen_futures::spawn_local(f());
+			wasm_threading::spawn_local_on_worker(f());
 		})
 		.expect_throw("Failed to spawn worker");
 	}
