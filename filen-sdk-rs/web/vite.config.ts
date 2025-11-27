@@ -63,8 +63,10 @@ export default defineConfig({
 		}
 	},
 	test: {
-		hookTimeout: 180000,
-		testTimeout: 60000,
+		// 20 minutes, the tests are contending with other tests for account locks
+		// which means they can sometimes take a long time to complete
+		hookTimeout: 12_000_000,
+		testTimeout: 12_000_000,
 		browser: {
 			enabled: true,
 			headless: true,
