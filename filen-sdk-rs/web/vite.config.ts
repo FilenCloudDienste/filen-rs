@@ -4,6 +4,8 @@ import wasm from "vite-plugin-wasm"
 import { nodePolyfills } from "vite-plugin-node-polyfills"
 import topLevelAwait from "vite-plugin-top-level-await"
 
+const now = Date.now()
+
 export default defineConfig({
 	plugins: [
 		nodePolyfills({
@@ -17,7 +19,7 @@ export default defineConfig({
 		VitePWA({
 			srcDir: "./",
 			filename: "sw.ts",
-			outDir: "dist",
+			outDir: "./",
 			strategies: "injectManifest",
 			workbox: {
 				maximumFileSizeToCacheInBytes: Number.MAX_SAFE_INTEGER
@@ -27,8 +29,8 @@ export default defineConfig({
 			injectManifest: {
 				injectionPoint: undefined,
 				rollupFormat: "iife",
-				minify: true,
-				sourcemap: true,
+				minify: false,
+				sourcemap: false,
 				target: "es2018",
 				buildPlugins: {
 					vite: [
@@ -48,7 +50,7 @@ export default defineConfig({
 				}
 			},
 			devOptions: {
-				enabled: true
+				enabled: false
 			}
 		}),
 		topLevelAwait({
@@ -56,29 +58,62 @@ export default defineConfig({
 			promiseImportName: i => `__tla_${i}`
 		})
 	],
+	build: {
+		target: "esnext",
+		sourcemap: false,
+		cssMinify: "esbuild",
+		minify: "esbuild",
+		outDir: "./dist",
+		chunkSizeWarningLimit: Infinity,
+		rollupOptions: {
+			output: {
+				chunkFileNames() {
+					return `[name].[hash].${now}.js`
+				},
+				entryFileNames() {
+					return `[name].${now}.js`
+				},
+				assetFileNames() {
+					return `assets/[name]-[hash].${now}[extname]`
+				}
+			}
+		}
+	},
+	worker: {
+		format: "es",
+		plugins: () => [
+			nodePolyfills({
+				include: ["buffer", "path"],
+				globals: {
+					Buffer: true
+				},
+				protocolImports: true
+			}),
+			wasm(),
+			topLevelAwait({
+				promiseExportName: "__tla",
+				promiseImportName: i => `__tla_${i}`
+			})
+		]
+	},
 	server: {
 		headers: {
 			"Cross-Origin-Embedder-Policy": "require-corp",
-			"Cross-Origin-Opener-Policy": "same-origin"
+			"Cross-Origin-Opener-Policy": "same-origin",
+			"Cross-Origin-Resource-Policy": "cross-origin",
+			"Access-Control-Allow-Origin": "*",
+			"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+			"Access-Control-Allow-Headers": "*"
 		}
 	},
-	test: {
-		// 20 minutes, the tests are contending with other tests for account locks
-		// which means they can sometimes take a long time to complete
-		hookTimeout: 12_000_000,
-		testTimeout: 12_000_000,
-		browser: {
-			enabled: true,
-			headless: true,
-			provider: "playwright",
-
-			instances: [
-				{ browser: "chromium" },
-				{ browser: "firefox" }
-				// running the tests in parallel causes issues becaues they share the account
-				// so we do it manually in the CI
-				// but we have to specify a browser here or vitest complains
-			]
+	preview: {
+		headers: {
+			"Cross-Origin-Embedder-Policy": "require-corp",
+			"Cross-Origin-Opener-Policy": "same-origin",
+			"Cross-Origin-Resource-Policy": "cross-origin",
+			"Access-Control-Allow-Origin": "*",
+			"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+			"Access-Control-Allow-Headers": "*"
 		}
 	},
 	publicDir: "test-assets"

@@ -120,8 +120,7 @@ jobs:
         run: |
           npm install
           npx playwright install --with-deps
-          npx vitest run --browser=chromium
-          npx vitest run --browser=firefox
+          npm run test
         working-directory: ./filen-sdk-rs/web
         env:
           VITE_TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}

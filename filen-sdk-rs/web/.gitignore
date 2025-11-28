@@ -14,3 +14,6 @@
 /src
 /SdkRs.podspec
 /service-worker
+/dist
+/sw.js
+/assets

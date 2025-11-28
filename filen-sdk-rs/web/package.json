@@ -4,7 +4,8 @@
   "description": "Filen JS SDK using filen-sdk-rs",
   "type": "module",
   "scripts": {
-    "test": "vitest run",
+    "build": "vite build",
+    "test": "npm run build && vitest run --browser.name=chromium && vitest run --browser.name=firefox",
     "ubrn:ios": "ubrn build ios --and-generate",
     "ubrn:android": "ubrn build android --and-generate",
     "ubrn:checkout": "ubrn checkout",
@@ -86,17 +87,19 @@
     "node": ">=23"
   },
   "devDependencies": {
-    "@types/serviceworker": "^0.0.165",
-    "@vitest/browser": "^3.2.4",
-    "@zip.js/zip.js": "^2.7.72",
-    "playwright": "^1.56.0",
-    "typescript": "~5.8.3",
-    "vite": "^7.1.2",
+    "@types/node": "^24.10.1",
+    "@types/serviceworker": "^0.0.167",
+    "@vitest/browser": "^4.0.14",
+    "@vitest/browser-playwright": "^4.0.14",
+    "@zip.js/zip.js": "^2.8.11",
+    "playwright": "^1.57.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4",
     "vite-plugin-node-polyfills": "^0.24.0",
-    "vite-plugin-pwa": "^1.1.0",
+    "vite-plugin-pwa": "^1.2.0",
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.5.0",
-    "vitest": "^3.2.4"
+    "vitest": "^4.0.14"
   },
   "codegenConfig": {
     "name": "FilenSdkRsTurboModule",

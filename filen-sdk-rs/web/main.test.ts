@@ -778,42 +778,65 @@ test("service worker", async () => {
 	}
 
 	const serviceWorker = await window.navigator.serviceWorker.register(
-		import.meta.env.MODE === "production" ? "/sw.js" : "/dev-sw.js?dev-sw",
+		"/sw.js",
 		{
 			scope: "/",
-			type: import.meta.env.MODE === "production" ? "classic" : "module"
+			type: "classic"
 		}
 	)
 
 	await serviceWorker.update()
 
-	console.log("Service worker registered:", serviceWorker)
+	const intervalId = setInterval(() => {
+		console.log(Date.now(), "Service worker state:", serviceWorker.active?.state)
+	}, 1000)
 
-	if (!serviceWorker || !serviceWorker.active) {
-		throw new Error("Service worker is not active")
+	try {
+		if (!serviceWorker || !serviceWorker.active) {
+			throw new Error("Service worker is not active")
+		}
+
+		await new Promise<void>(resolve => {
+			(async () => {
+				while(!serviceWorker.active?.state || serviceWorker.active.state !== "activated") {
+					await new Promise<void>(resolve => setTimeout(resolve, 100))
+				}
+
+				resolve()
+			})()
+		})
+
+		// wait a bit to ensure service worker is ready and wasm is loaded
+		await new Promise<void>(resolve => setTimeout(resolve, 5000))
+
+		const jsonClient = JSON.stringify(await state.toStringified(), jsonBigIntReplacer)
+
+		const initRes = await fetch(`/serviceWorker/init?stringifiedClient=${encodeURIComponent(jsonClient)}`)
+
+		expect(initRes.ok).toBe(true)
+
+		// wait a bit to ensure service worker is ready and client is loaded
+		await new Promise<void>(resolve => setTimeout(resolve, 5000))
+
+		const file = await state.uploadFile(new TextEncoder().encode("service worker file content"), {
+			parent: testDir,
+			name: "sw-file.txt"
+		})
+
+		const stringifiedFile = JSON.stringify(file, jsonBigIntReplacer)
+
+		const res = await fetch("/serviceWorker/download?file=" + encodeURIComponent(stringifiedFile))
+		expect(res.ok).toBe(true)
+		const text = await res.text()
+		expect(text).toBe("service worker file content")
+	} finally {
+		clearInterval(intervalId)
 	}
-
-	const jsonClient = JSON.stringify(await state.toStringified(), jsonBigIntReplacer)
-
-	const initRes = await fetch(`/serviceWorker/init/?stringifiedClient=${encodeURIComponent(jsonClient)}`)
-	expect(initRes.ok).toBe(true)
-
-	const file = await state.uploadFile(new TextEncoder().encode("service worker file content"), {
-		parent: testDir,
-		name: "sw-file.txt"
-	})
-
-	const stringifiedFile = JSON.stringify(file, jsonBigIntReplacer)
-
-	const res = await fetch("/serviceWorker/download/?file=" + encodeURIComponent(stringifiedFile))
-	expect(res.ok).toBe(true)
-	const text = await res.text()
-	expect(text).toBe("service worker file content")
 })
 
 afterAll(async () => {
 	if (state && testDir) {
-		await state?.deleteDirPermanently(testDir)
+		await state.deleteDirPermanently(testDir)
 	}
 })
 
