@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
+	Error,
 	auth::Client,
 	fs::file::{BaseFile, RemoteFile, traits::File},
 	util::MaybeSendCallback,
@@ -16,7 +17,7 @@ impl Client {
 		file: &'a dyn File,
 		writer: &mut T,
 		callback: Option<MaybeSendCallback<'a, u64>>,
-	) -> Result<(), crate::error::Error>
+	) -> Result<(), Error>
 	where
 		T: 'a + AsyncWrite + Unpin,
 	{
@@ -31,7 +32,7 @@ impl Client {
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		start: u64,
 		end: u64,
-	) -> Result<(), crate::error::Error>
+	) -> Result<(), Error>
 	where
 		T: 'a + AsyncWrite + Unpin,
 	{
@@ -55,7 +56,7 @@ impl Client {
 	// would need to allocate a buffer of file.size() + FILE_CHUNK_SIZE_EXTRA
 	// and download to it sequentially, decrypting in place
 	// and finally shrinking the buffer to file.size()
-	pub async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, crate::error::Error> {
+	pub async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, Error> {
 		let mut writer = Vec::with_capacity(file.size() as usize);
 		self.download_file_to_writer(file, &mut writer, None)
 			.await?;
@@ -68,7 +69,7 @@ impl Client {
 		reader: &mut T,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		known_size: Option<u64>,
-	) -> Result<RemoteFile, crate::error::Error>
+	) -> Result<RemoteFile, Error>
 	where
 		T: 'a + AsyncReadExt + Unpin,
 	{
@@ -86,11 +87,7 @@ impl Client {
 		Ok(writer.into_remote_file().unwrap())
 	}
 
-	pub async fn upload_file(
-		&self,
-		file: Arc<BaseFile>,
-		data: &[u8],
-	) -> Result<RemoteFile, crate::error::Error> {
+	pub async fn upload_file(&self, file: Arc<BaseFile>, data: &[u8]) -> Result<RemoteFile, Error> {
 		let mut reader = data;
 		self.upload_file_from_reader(
 			file,

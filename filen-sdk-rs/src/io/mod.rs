@@ -7,6 +7,11 @@ use std::time::Duration;
 use chrono::SubsecRound;
 use chrono::{DateTime, Utc};
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod dir_upload;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod fs_tree_builder;
+// mod bulk_upload;
 pub mod client_impl;
 
 const WINDOWS_TICKS_PER_MILLI: u64 = 10_000;
