@@ -97,11 +97,16 @@ mod wasm {
 						.serialize_maps_as_objects(true)
 						.serialize_large_number_types_as_bigints(true);
 
-					let _ = listener.call1(
-						&JsValue::UNDEFINED,
-						&serde::Serialize::serialize(&event, &serializer)
-							.expect("failed to serialize event to JsValue (should be impossible)"),
-					);
+					log::info!("Dispatching socket event to JS listener: {:?}", event);
+					let serialized = match serde::Serialize::serialize(&event, &serializer) {
+						Ok(v) => v,
+						Err(e) => {
+							log::error!("Failed to serialize socket event to JsValue: {:?}", e);
+							continue;
+						}
+					};
+
+					let _ = listener.call1(&JsValue::UNDEFINED, &serialized);
 				}
 			});
 
