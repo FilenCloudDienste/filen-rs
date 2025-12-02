@@ -1,10 +1,18 @@
-use std::sync::Arc;
+use std::{
+	path::PathBuf,
+	sync::{Arc, atomic::Ordering},
+};
 
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
+	Error,
 	auth::Client,
-	fs::file::{BaseFile, RemoteFile, traits::File},
+	fs::{
+		dir::RemoteDirectory,
+		file::{BaseFile, RemoteFile, traits::File},
+	},
+	io::fs_tree_builder,
 	util::MaybeSendCallback,
 };
 
@@ -16,7 +24,7 @@ impl Client {
 		file: &'a dyn File,
 		writer: &mut T,
 		callback: Option<MaybeSendCallback<'a, u64>>,
-	) -> Result<(), crate::error::Error>
+	) -> Result<(), Error>
 	where
 		T: 'a + AsyncWrite + Unpin,
 	{
@@ -31,7 +39,7 @@ impl Client {
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		start: u64,
 		end: u64,
-	) -> Result<(), crate::error::Error>
+	) -> Result<(), Error>
 	where
 		T: 'a + AsyncWrite + Unpin,
 	{
@@ -55,7 +63,7 @@ impl Client {
 	// would need to allocate a buffer of file.size() + FILE_CHUNK_SIZE_EXTRA
 	// and download to it sequentially, decrypting in place
 	// and finally shrinking the buffer to file.size()
-	pub async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, crate::error::Error> {
+	pub async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, Error> {
 		let mut writer = Vec::with_capacity(file.size() as usize);
 		self.download_file_to_writer(file, &mut writer, None)
 			.await?;
@@ -68,7 +76,7 @@ impl Client {
 		reader: &mut T,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		known_size: Option<u64>,
-	) -> Result<RemoteFile, crate::error::Error>
+	) -> Result<RemoteFile, Error>
 	where
 		T: 'a + AsyncReadExt + Unpin,
 	{
@@ -86,11 +94,7 @@ impl Client {
 		Ok(writer.into_remote_file().unwrap())
 	}
 
-	pub async fn upload_file(
-		&self,
-		file: Arc<BaseFile>,
-		data: &[u8],
-	) -> Result<RemoteFile, crate::error::Error> {
+	pub async fn upload_file(&self, file: Arc<BaseFile>, data: &[u8]) -> Result<RemoteFile, Error> {
 		let mut reader = data;
 		self.upload_file_from_reader(
 			file,
@@ -99,5 +103,43 @@ impl Client {
 			Some(data.len().try_into().unwrap()),
 		)
 		.await
+	}
+
+	pub async fn upload_dir_recursively(
+		self: Arc<Self>,
+		dir_path: PathBuf,
+		callback: Arc<dyn super::dir_upload::DirUploadCallback>,
+		target: &RemoteDirectory,
+	) -> Result<(), Error> {
+		let drop_canceller = AtomicDropCanceller {
+			cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		};
+
+		let (tree, stats) = fs_tree_builder::build_fs_tree_from_walkdir_iterator(
+			&dir_path,
+			&mut |errors| {
+				callback.on_scan_errors(errors);
+			},
+			&mut |dirs, files, bytes| {
+				callback.on_scan_progress(dirs, files, bytes);
+			},
+			&drop_canceller.cancelled,
+		)?;
+
+		let (dirs, files, bytes) = stats.snapshot();
+		callback.on_scan_complete(dirs, files, bytes);
+
+		self.upload_fs_tree_from_path_into_target(callback, dir_path, &tree, target)
+			.await
+	}
+}
+
+struct AtomicDropCanceller {
+	cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for AtomicDropCanceller {
+	fn drop(&mut self) {
+		self.cancelled.store(true, Ordering::Relaxed);
 	}
 }

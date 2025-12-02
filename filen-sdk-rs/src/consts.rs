@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, time::Duration};
 
 use filen_types::auth::{AuthVersion, FileEncryptionVersion, MetaEncryptionVersion};
 
@@ -71,3 +71,6 @@ pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
 pub(crate) const MAX_OPEN_FILES: usize = 64;
 
 pub const RSA_KEY_SIZE: usize = 4096;
+
+/// How often callbacks should be called during long operations
+pub(crate) const CALLBACK_INTERVAL: Duration = Duration::from_millis(200);

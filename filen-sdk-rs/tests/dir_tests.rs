@@ -2,6 +2,9 @@ use std::{
 	borrow::Cow,
 	fs::File,
 	io::{BufReader, Read, Seek},
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::{Duration, SystemTime},
 };
 
 use chrono::{SubsecRound, Utc};
@@ -11,10 +14,20 @@ use filen_sdk_rs::{
 	fs::{
 		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
 		client_impl::ObjectOrRemainingPath,
-		dir::{UnsharedDirectoryType, meta::DirectoryMetaChanges},
-		file::{RemoteFile, traits::HasFileInfo},
+		dir::{
+			RemoteDirectory, UnsharedDirectoryType,
+			meta::{DirectoryMeta, DirectoryMetaChanges},
+			traits::HasDirMeta,
+		},
+		file::{
+			RemoteFile,
+			meta::FileMeta,
+			traits::{HasFileInfo, HasFileMeta},
+		},
 	},
+	io::{DirUploadCallback, FilenMetaExt, WalkError},
 };
+use futures::StreamExt;
 use tokio::time;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use zip::{ExtraField, read::ZipFile};
@@ -38,6 +51,229 @@ async fn create_list_trash() {
 	}
 
 	client.trash_dir(&mut dir).await.unwrap();
+}
+
+#[derive(Default)]
+struct DebugDirUploadCallback {}
+
+impl DirUploadCallback for DebugDirUploadCallback {
+	fn on_scan_progress(&self, _known_dirs: u64, _known_files: u64, _known_bytes: u64) {}
+
+	fn on_scan_errors(&self, _error: Vec<WalkError>) {}
+
+	fn on_scan_complete(&self, _total_dirs: u64, _total_files: u64, _total_bytes: u64) {}
+
+	fn on_upload_progress(
+		&self,
+		_uploaded_dirs: Vec<filen_sdk_rs::fs::dir::RemoteDirectory>,
+		_uploaded_files: Vec<RemoteFile>,
+		_uploaded_bytes: u64,
+	) {
+	}
+
+	fn on_upload_errors(&self, _errors: Vec<(PathBuf, filen_sdk_rs::Error)>) {}
+}
+
+struct TestFile {
+	relative_path: &'static str,
+	content: &'static str,
+	modified_days_ago: u64,
+}
+
+fn expected_contents() -> Vec<TestFile> {
+	vec![
+		TestFile {
+			relative_path: "readme.txt",
+			content: "This is the root readme file.\n",
+			modified_days_ago: 0,
+		},
+		TestFile {
+			relative_path: "config.json",
+			content: r#"{"version": 1, "name": "test"}"#,
+			modified_days_ago: 7,
+		},
+		TestFile {
+			relative_path: "documents/report.txt",
+			content: "Monthly report content here.\n",
+			modified_days_ago: 30,
+		},
+		TestFile {
+			relative_path: "documents/notes.md",
+			content: "# Notes\n\n- Item 1\n- Item 2\n",
+			modified_days_ago: 14,
+		},
+		TestFile {
+			relative_path: "images/metadata.json",
+			content: r#"{"images": []}"#,
+			modified_days_ago: 3,
+		},
+		TestFile {
+			relative_path: "nested/deeply/buried/secret.txt",
+			content: "You found the deeply nested file!\n",
+			modified_days_ago: 365,
+		},
+		TestFile {
+			relative_path: "empty.txt",
+			content: "",
+			modified_days_ago: 1,
+		},
+	]
+}
+
+async fn create_dummy_folder(base_path: &Path) -> std::io::Result<()> {
+	tokio::fs::create_dir_all(base_path).await?;
+
+	let subdirs = [
+		"documents",
+		"images",
+		"nested/deeply/buried",
+		"extra/nested",
+	];
+	for subdir in subdirs {
+		tokio::fs::create_dir_all(base_path.join(subdir)).await?;
+	}
+
+	for test_file in expected_contents() {
+		let full_path = base_path.join(test_file.relative_path);
+		tokio::fs::write(&full_path, test_file.content).await?;
+
+		let modified_time =
+			SystemTime::now() - Duration::from_secs(test_file.modified_days_ago * 24 * 60 * 60);
+
+		let file = File::open(&full_path)?;
+		file.set_modified(modified_time)?;
+	}
+
+	Ok(())
+}
+
+async fn check_remote_matches_local(
+	client: &filen_sdk_rs::auth::Client,
+	remote_dir: &RemoteDirectory,
+	local_path: &Path,
+) -> std::io::Result<()> {
+	let mut walk = walkdir::WalkDir::new(local_path).into_iter();
+	let _ = walk.next(); // skip root
+
+	futures::stream::iter(walk)
+		.filter_map(|entry| async move {
+			let entry = match entry {
+				Ok(e) => e,
+				Err(e) => {
+					log::error!("Failed to read directory entry: {:?}", e);
+					return None;
+				}
+			};
+			let path = entry.path().to_path_buf();
+			let relative_path = path.strip_prefix(local_path).unwrap().to_path_buf();
+			let meta = tokio::fs::metadata(&path).await.ok()?;
+			Some((path, relative_path, meta))
+		})
+		.map(|(path, relative_path, meta)| async move {
+			let (_, item) = client
+				.get_items_in_path_starting_at(
+					relative_path.to_str().unwrap(),
+					UnsharedDirectoryType::Dir(Cow::Borrowed(remote_dir)),
+				)
+				.await
+				.unwrap();
+
+			let ObjectOrRemainingPath::Object(object) = item else {
+				panic!("Uploaded item not found: {:?}", relative_path);
+			};
+
+			if meta.is_dir() {
+				match object {
+					UnsharedFSObject::Dir(dir) => {
+						let dir = dir.as_ref();
+						assert_eq!(
+							dir.name().unwrap(),
+							path.file_name().unwrap().to_str().unwrap(),
+							"Directory name mismatch for path: {:?}",
+							path
+						);
+						let mtime = FilenMetaExt::created(&meta);
+						let DirectoryMeta::Decoded(decrypted_meta) = dir.get_meta() else {
+							panic!("Directory meta not found for path: {:?}", path);
+						};
+						assert_eq!(
+							decrypted_meta.created,
+							Some(mtime),
+							"Directory created time mismatch for path: {:?}",
+							path
+						);
+					}
+					_ => panic!("Expected directory for path: {:?}", path),
+				}
+			} else if meta.is_file() {
+				match object {
+					UnsharedFSObject::File(file) => {
+						let file = file.as_ref();
+						assert_eq!(
+							file.name().unwrap(),
+							path.file_name().unwrap().to_str().unwrap(),
+							"File name mismatch for path: {:?}",
+							path
+						);
+						let FileMeta::Decoded(decrypted_meta) = file.get_meta() else {
+							panic!("File meta not found for path: {:?}", path);
+						};
+						let mtime = FilenMetaExt::modified(&meta);
+						assert_eq!(
+							decrypted_meta.last_modified(),
+							mtime,
+							"File modified time mismatch for path: {:?}",
+							path
+						);
+						let ctime = FilenMetaExt::created(&meta);
+						assert_eq!(
+							decrypted_meta.created,
+							Some(ctime),
+							"File created time mismatch for path: {:?}",
+							path
+						);
+					}
+					_ => panic!("Expected file for path: {:?}", relative_path),
+				}
+			} else {
+				panic!("Unknown file type for path: {:?}", relative_path);
+			}
+		})
+		.buffer_unordered(20) // Adjust concurrency limit as needed
+		.collect::<Vec<_>>()
+		.await;
+
+	Ok(())
+}
+
+#[shared_test_runtime]
+async fn test_recursive_upload() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+
+	let temp_dir = std::env::temp_dir().join(format!("test_upload_{}", std::process::id()));
+
+	// Clean up if it exists from a previous run
+	let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+	create_dummy_folder(&temp_dir).await.unwrap();
+	client
+		.clone()
+		.upload_dir_recursively(
+			temp_dir.clone(),
+			Arc::new(DebugDirUploadCallback::default()),
+			test_dir,
+		)
+		.await
+		.unwrap();
+
+	check_remote_matches_local(&client, test_dir, &temp_dir)
+		.await
+		.unwrap();
+
+	// Clean up
+	let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }
 
 #[shared_test_runtime]

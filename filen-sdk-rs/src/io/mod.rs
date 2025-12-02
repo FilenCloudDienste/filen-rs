@@ -7,10 +7,18 @@ use std::time::Duration;
 use chrono::SubsecRound;
 use chrono::{DateTime, Utc};
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod dir_upload;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod fs_tree_builder;
+// mod bulk_upload;
 pub mod client_impl;
 
 const WINDOWS_TICKS_PER_MILLI: u64 = 10_000;
 const MILLIS_TO_UNIX_EPOCH: u64 = 11_644_473_600_000; // 11644473600000 milliseconds from 1601-01-01 to 1970-01-01
+
+pub use dir_upload::DirUploadCallback;
+pub use fs_tree_builder::WalkError;
 
 pub trait FilenMetaExt {
 	/// Returns the size of the file in bytes.

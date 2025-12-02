@@ -88,7 +88,6 @@ pub enum ErrorKind {
 	ImageError,
 	/// Tried to use metadata for an item that failed to decrypt metadata
 	MetadataWasNotDecrypted,
-	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 	/// Operation was cancelled
 	Cancelled,
 	#[cfg(feature = "heif-decoder")]
@@ -96,6 +95,8 @@ pub enum ErrorKind {
 	HeifError,
 	/// there was an issue with the provided recovery key
 	BadRecoveryKey,
+	/// Internal logic error
+	Internal,
 }
 
 /// Custom error type for the SDK
