@@ -1,11 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
-use filen_sdk_rs::{
-	ErrorKind,
-	auth::{Client, StringifiedClient},
-};
+use filen_cli::{deserialize_auth_config, serialize_auth_config};
+use filen_sdk_rs::{ErrorKind, auth::Client};
 use filen_types::error::ResponseError;
 
 use crate::{ui::UI, util::LongKeyringEntry};
@@ -73,12 +70,19 @@ pub(crate) async fn authenticate_and_get_password(
 	auth_config_path_arg: Option<&str>,
 ) -> Result<Client> {
 	if let Some(client) = authenticate_from_cli_args(ui, email_arg, password_arg).await? {
+		log::info!("Authenticated from CLI arguments");
 		Ok(client)
 	} else if let Some(client) = authenticate_from_auth_config(auth_config_path_arg)? {
+		log::info!(
+			"Authenticated from auth config file {}",
+			auth_config_path_arg.unwrap()
+		);
 		Ok(client)
 	} else if let Some(client) = authenticate_from_environment_variables(ui).await? {
+		log::info!("Authenticated from environment variables");
 		Ok(client)
 	} else if let Some(client) = authenticate_from_keyring().await? {
+		log::info!("Authenticated from keyring");
 		Ok(client)
 	} else {
 		authenticate_from_prompt(ui).await
@@ -130,7 +134,7 @@ async fn authenticate_from_cli_args(
 	Ok(Some(client))
 }
 
-/// Authenticate using SDK config stored in a file ("auth config").
+/// Authenticate using SDK config stored in a file ("auth config") exported from the CLI.
 fn authenticate_from_auth_config(path_arg: Option<&str>) -> Result<Option<Client>> {
 	let Some(path) = path_arg else {
 		return Ok(None);
@@ -185,7 +189,7 @@ async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 	Ok(client)
 }
 
-pub(crate) fn export_auth_config(client: &Client, path: &PathBuf) -> Result<()> {
+pub fn export_auth_config(client: &Client, path: &PathBuf) -> Result<()> {
 	let sdk_config = serialize_auth_config(client)?;
 	std::fs::write(path, sdk_config).context(format!(
 		"Failed to write auth config to file {}",
@@ -200,25 +204,4 @@ pub(crate) fn delete_credentials() -> Result<bool> {
 		.delete()
 		.context("Failed to delete SDK config from keyring")?;
 	Ok(deleted)
-}
-
-const AUTH_CONFIG_PREFIX: &str = "filen_cli_auth_config_1:";
-
-fn serialize_auth_config(client: &Client) -> Result<String> {
-	let sdk_config = client.to_stringified();
-	let sdk_config = serde_json::to_string(&sdk_config).unwrap();
-	let sdk_config = format!("{}{}", AUTH_CONFIG_PREFIX, base64.encode(sdk_config));
-	Ok(sdk_config)
-}
-
-fn deserialize_auth_config(sdk_config: &str) -> Result<Client> {
-	let sdk_config = sdk_config
-		.strip_prefix(AUTH_CONFIG_PREFIX)
-		.ok_or_else(|| anyhow!("Invalid auth config format (missing or invalid prefix)"))?;
-	let sdk_config = base64.decode(sdk_config)?;
-	let sdk_config = serde_json::from_slice::<StringifiedClient>(&sdk_config)
-		.context("Failed to parse auth config (it may be corrupt)")?;
-	let client =
-		Client::from_stringified(sdk_config).context("Failed to create client from SDK config")?;
-	Ok(client)
 }

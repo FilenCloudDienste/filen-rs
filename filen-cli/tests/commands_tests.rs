@@ -1,0 +1,283 @@
+use assert_fs::prelude::{FileWriteStr, PathChild};
+use filen_macros::shared_test_runtime;
+use filen_sdk_rs::fs::HasName;
+use predicates::prelude::PredicateBooleanExt as _;
+use rand::TryRngCore;
+
+async fn authenticated_cli_with_args<I, S>(args: I) -> assert_cmd::assert::Assert
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<std::ffi::OsStr>,
+{
+	let client = test_utils::RESOURCES.client().await;
+	let auth_config_file = assert_fs::TempDir::new()
+		.unwrap()
+		.child("filen-cli-auth-config");
+	auth_config_file
+		.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
+		.unwrap();
+	assert_cmd::cargo::cargo_bin_cmd!()
+		.args([
+			"--auth-config-path",
+			auth_config_file.to_str().unwrap(),
+			"-v",
+		])
+		.args(args)
+		.assert()
+}
+
+// todo: test `cmd` command (see note in test.rs regarding testing interactive clis)
+
+#[shared_test_runtime]
+async fn cmd_ls() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call ls on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	client.upload_file(file.into(), &[]).await.unwrap();
+
+	// ls
+	authenticated_cli_with_args(["ls", test_dir.name().unwrap()])
+		.await
+		.success()
+		.stdout(predicates::str::contains("testfile.txt"));
+}
+
+#[shared_test_runtime]
+async fn cmd_cat() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call cat on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	let content = "Hello, Filen!";
+	client
+		.upload_file(file.into(), content.as_bytes())
+		.await
+		.unwrap();
+
+	// cat
+	authenticated_cli_with_args(["cat", &format!("{}/testfile.txt", test_dir.name().unwrap())])
+		.await
+		.success()
+		.stdout(predicates::str::contains(content));
+}
+
+#[shared_test_runtime]
+async fn cmd_head_tail() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call head/tail on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	let content = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n";
+	client
+		.upload_file(file.into(), content.as_bytes())
+		.await
+		.unwrap();
+
+	// head
+	authenticated_cli_with_args([
+		"head",
+		&format!("{}/testfile.txt", test_dir.name().unwrap()),
+		"-n1",
+	])
+	.await
+	.success()
+	.stdout(predicates::str::contains("Line 1").and(predicates::str::contains("Line 2").not()));
+
+	// tail
+	authenticated_cli_with_args([
+		"tail",
+		&format!("{}/testfile.txt", test_dir.name().unwrap()),
+		"-n1",
+	])
+	.await
+	.success()
+	.stdout(predicates::str::contains("Line 5").and(predicates::str::contains("Line 4").not()));
+}
+
+#[shared_test_runtime]
+async fn cmd_stat() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call stat on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	let mut contents = vec![0u8; 1024];
+	rand::rng().try_fill_bytes(&mut contents).unwrap();
+	client.upload_file(file.into(), &contents).await.unwrap();
+
+	// stat
+	authenticated_cli_with_args([
+		"stat",
+		&format!("{}/testfile.txt", test_dir.name().unwrap()),
+	])
+	.await
+	.success()
+	.stdout(predicates::str::contains("1 KiB"));
+
+	// stat on root drive
+	authenticated_cli_with_args(["stat", "/"])
+		.await
+		.success()
+		.stdout(predicates::str::contains("Drive"));
+}
+
+#[shared_test_runtime]
+async fn cmd_mkdir() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let new_dir_name = "new_test_dir";
+
+	// mkdir
+	authenticated_cli_with_args([
+		"mkdir",
+		&format!("{}/{}", test_dir.name().unwrap(), new_dir_name),
+	])
+	.await
+	.success()
+	.stdout(predicates::str::contains("Directory created"));
+
+	// verify dir was created
+	let created_dir = client
+		.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), new_dir_name))
+		.await
+		.unwrap();
+	assert!(created_dir.is_some());
+}
+
+#[shared_test_runtime]
+async fn cmd_rm() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call rm on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	let content = "Hello, Filen!";
+	client
+		.upload_file(file.into(), content.as_bytes())
+		.await
+		.unwrap();
+
+	// create test directory to call rm on
+	client
+		.create_dir(test_dir, String::from("testdir_to_delete"))
+		.await
+		.unwrap();
+
+	// rm
+	authenticated_cli_with_args(["rm", &format!("{}/testfile.txt", test_dir.name().unwrap())])
+		.await
+		.success()
+		.stdout(predicates::str::contains("Trashed file"));
+	authenticated_cli_with_args([
+		"rm",
+		&format!("{}/testdir_to_delete", test_dir.name().unwrap()),
+	])
+	.await
+	.success()
+	.stdout(predicates::str::contains("Trashed directory"));
+
+	// verify file was deleted
+	let deleted_file = client
+		.find_item_at_path(&format!("{}/testfile.txt", test_dir.name().unwrap()))
+		.await
+		.unwrap();
+	assert!(deleted_file.is_none());
+
+	// verify directory was deleted
+	let deleted_dir = client
+		.find_item_at_path(&format!("{}/testdir_to_delete", test_dir.name().unwrap()))
+		.await
+		.unwrap();
+	assert!(deleted_dir.is_none());
+}
+
+#[shared_test_runtime]
+async fn cmd_mv_cp() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call mv on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	let content = "Hello, Filen!";
+	client
+		.upload_file(file.into(), content.as_bytes())
+		.await
+		.unwrap();
+
+	// mv
+	authenticated_cli_with_args([
+		"mv",
+		&format!("{}/testfile.txt", test_dir.name().unwrap()),
+		test_dir.name().unwrap(),
+	])
+	.await
+	.success()
+	.stdout(predicates::str::contains("Moved"));
+
+	// verify file was moved
+	let old_file = client
+		.find_item_at_path(&format!("{}/testfile.txt", test_dir.name().unwrap()))
+		.await
+		.unwrap();
+	assert!(old_file.is_none());
+	let new_file = client
+		.find_item_at_path(&format!("{}/testfile.txt", test_dir.name().unwrap()))
+		.await
+		.unwrap();
+	assert!(new_file.is_some());
+}
+
+#[shared_test_runtime]
+async fn cmd_favorite_unfavorite() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call favorite on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	let content = "Hello, Filen!";
+	client
+		.upload_file(file.into(), content.as_bytes())
+		.await
+		.unwrap();
+
+	let file_path = format!("{}/testfile.txt", test_dir.name().unwrap());
+
+	// favorite
+	authenticated_cli_with_args(["favorite", &file_path])
+		.await
+		.success()
+		.stdout(predicates::str::contains("Favorited"));
+
+	// verify file is favorited
+	match client.find_item_at_path(&file_path).await.unwrap().unwrap() {
+		filen_sdk_rs::fs::FSObject::File(file) => assert!(file.favorited),
+		_ => panic!("Expected a file"),
+	}
+
+	// unfavorite
+	authenticated_cli_with_args(["unfavorite", &file_path])
+		.await
+		.success()
+		.stdout(predicates::str::contains("Unfavorited"));
+
+	// verify file is unfavorited
+	match client.find_item_at_path(&file_path).await.unwrap().unwrap() {
+		filen_sdk_rs::fs::FSObject::File(file) => assert!(!file.favorited),
+		_ => panic!("Expected a file"),
+	}
+}
+
+// todo: list-trash, empty-trash cmds

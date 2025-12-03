@@ -41,7 +41,7 @@ pub(crate) struct CliArgs {
 	#[arg(short, long)]
 	password: Option<String>,
 
-	/// Path to auth config file
+	/// Path to auth config file (exported via `filen export-auth-config`)
 	#[arg(long)]
 	auth_config_path: Option<String>,
 

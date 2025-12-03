@@ -32,14 +32,16 @@ pub(crate) enum Commands {
 	/// Print the first lines of a file
 	Head {
 		file: String,
-		/// Number of lines to print (default: 10)
-		lines: Option<usize>,
+		/// Number of lines to print
+		#[arg(short = 'n', long, default_value_t = 10)]
+		lines: usize,
 	},
 	/// Print the last lines of a file
 	Tail {
 		file: String,
-		/// Number of lines to print (default: 10)
-		lines: Option<usize>,
+		/// Number of lines to print
+		#[arg(short = 'n', long, default_value_t = 10)]
+		lines: usize,
 	},
 	/// Show information about a file, a directory or the Filen drive
 	Stat {
@@ -121,25 +123,11 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::Head { file, lines } => {
-			print_file(
-				ui,
-				client,
-				working_path,
-				&file,
-				PrintFileLines::Head(lines.unwrap_or(10)),
-			)
-			.await?;
+			print_file(ui, client, working_path, &file, PrintFileLines::Head(lines)).await?;
 			None
 		}
 		Commands::Tail { file, lines } => {
-			print_file(
-				ui,
-				client,
-				working_path,
-				&file,
-				PrintFileLines::Tail(lines.unwrap_or(10)),
-			)
-			.await?;
+			print_file(ui, client, working_path, &file, PrintFileLines::Tail(lines)).await?;
 			None
 		}
 		Commands::Stat { file_or_directory } => {
