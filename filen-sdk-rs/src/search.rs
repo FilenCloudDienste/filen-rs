@@ -51,7 +51,12 @@ impl<'a> SplitName<'a> {
 				}
 			}
 			Cow::Owned(mut s) => {
-				trim_string_in_place(&mut s);
+				if s.chars().any(|c| c.is_uppercase()) {
+					// no std to_lowercase_in_place, so just recreate the string
+					s = s.trim().to_lowercase();
+				} else {
+					trim_string_in_place(&mut s);
+				}
 				Cow::Owned(s)
 			}
 		};
