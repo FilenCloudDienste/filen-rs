@@ -37,7 +37,7 @@ fn trim_string_in_place(s: &mut String) {
 		.count();
 
 	s.drain(..left_trim);
-	s.truncate(s.len() - right_trim - left_trim);
+	s.truncate(s.len().checked_sub(right_trim).unwrap_or_default());
 }
 
 impl<'a> SplitName<'a> {
@@ -301,6 +301,33 @@ mod js_impl {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn trim_string_in_place_test() {
+		let mut st = String::from(" newstr something    ");
+		trim_string_in_place(&mut st);
+		assert_eq!(st, "newstr something");
+
+		let mut st = String::from("");
+		trim_string_in_place(&mut st);
+		assert_eq!(st, "");
+
+		let mut st = String::from("  hello");
+		trim_string_in_place(&mut st);
+		assert_eq!(st, "hello");
+
+		let mut st = String::from("hello  ");
+		trim_string_in_place(&mut st);
+		assert_eq!(st, "hello");
+
+		let mut st = String::from("   ");
+		trim_string_in_place(&mut st);
+		assert_eq!(st, "");
+
+		let mut st = String::from(" ");
+		trim_string_in_place(&mut st);
+		assert_eq!(st, "");
+	}
 
 	#[test]
 	fn split_name_iter() {
