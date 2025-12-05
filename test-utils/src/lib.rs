@@ -331,3 +331,44 @@ pub async fn await_not_event<F, T>(
 		}
 	}
 }
+
+pub async fn authenticated_cli_with_args<I, S>(
+	bin: &mut assert_cmd::Command,
+	args: I,
+) -> assert_cmd::assert::Assert
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<std::ffi::OsStr>,
+{
+	#[cfg(feature = "cli")]
+	{
+		use assert_fs::prelude::{FileWriteStr, PathChild};
+		let client = RESOURCES.client().await;
+		let auth_config_file = assert_fs::TempDir::new()
+			.unwrap()
+			.child("filen-cli-auth-config");
+		auth_config_file
+			.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
+			.unwrap();
+		return bin
+			.args([
+				"--auth-config-path",
+				auth_config_file.to_str().unwrap(),
+				"-v",
+			])
+			.args(args)
+			.assert();
+	}
+	#[cfg(not(feature = "cli"))]
+	{
+		compile_error!("authenticated_cli_with_args! macro requires the `cli` feature");
+	}
+}
+
+#[cfg(feature = "cli")]
+#[macro_export]
+macro_rules! authenticated_cli_with_args {
+	($($arg:expr),*) => {
+		authenticated_cli_with_args(&mut assert_cmd::cargo::cargo_bin_cmd!("filen-cli"), &[$($arg),*]).await
+	};
+}

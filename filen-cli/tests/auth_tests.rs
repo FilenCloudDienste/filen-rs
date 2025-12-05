@@ -1,4 +1,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
+use filen_macros::shared_test_runtime;
+use test_utils::authenticated_cli_with_args;
 
 fn get_testing_credentials() -> (String, String) {
 	dotenv::dotenv().ok();
@@ -28,14 +30,21 @@ fn authenticate_from_cli_args() {
 		));
 }
 
-#[test]
-fn export_and_authenticate_from_auth_config() {
+#[shared_test_runtime]
+async fn export_and_authenticate_from_auth_config() {
 	let workdir = assert_fs::TempDir::new().unwrap();
-	cargo_bin_cmd!()
-		.current_dir(workdir.path())
-		.args(["-v", "export-auth-config"])
-		.assert()
-		.success();
+	authenticated_cli_with_args!("export-auth-config")
+		.success()
+		.stdout(predicates::str::contains("Exported auth config"));
+	tokio::fs::copy(
+		"filen-cli-auth-config",
+		workdir.path().join("filen-cli-auth-config"),
+	)
+	.await
+	.unwrap();
+	tokio::fs::remove_file("filen-cli-auth-config")
+		.await
+		.unwrap();
 	cargo_bin_cmd!()
 		.args([
 			"--auth-config-path",
