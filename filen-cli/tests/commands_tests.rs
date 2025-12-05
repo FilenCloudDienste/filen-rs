@@ -1,30 +1,8 @@
-use assert_fs::prelude::{FileWriteStr, PathChild};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::HasName;
 use predicates::prelude::PredicateBooleanExt as _;
 use rand::TryRngCore;
-
-async fn authenticated_cli_with_args<I, S>(args: I) -> assert_cmd::assert::Assert
-where
-	I: IntoIterator<Item = S>,
-	S: AsRef<std::ffi::OsStr>,
-{
-	let client = test_utils::RESOURCES.client().await;
-	let auth_config_file = assert_fs::TempDir::new()
-		.unwrap()
-		.child("filen-cli-auth-config");
-	auth_config_file
-		.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
-		.unwrap();
-	assert_cmd::cargo::cargo_bin_cmd!()
-		.args([
-			"--auth-config-path",
-			auth_config_file.to_str().unwrap(),
-			"-v",
-		])
-		.args(args)
-		.assert()
-}
+use test_utils::authenticated_cli_with_args;
 
 // todo: test `cmd` command (see note in test.rs regarding testing interactive clis)
 
@@ -39,8 +17,7 @@ async fn cmd_ls() {
 	client.upload_file(file.into(), &[]).await.unwrap();
 
 	// ls
-	authenticated_cli_with_args(["ls", test_dir.name().unwrap()])
-		.await
+	authenticated_cli_with_args!("ls", test_dir.name().unwrap())
 		.success()
 		.stdout(predicates::str::contains("testfile.txt"));
 }
@@ -60,8 +37,7 @@ async fn cmd_cat() {
 		.unwrap();
 
 	// cat
-	authenticated_cli_with_args(["cat", &format!("{}/testfile.txt", test_dir.name().unwrap())])
-		.await
+	authenticated_cli_with_args!("cat", &format!("{}/testfile.txt", test_dir.name().unwrap()))
 		.success()
 		.stdout(predicates::str::contains(content));
 }
@@ -81,22 +57,20 @@ async fn cmd_head_tail() {
 		.unwrap();
 
 	// head
-	authenticated_cli_with_args([
+	authenticated_cli_with_args!(
 		"head",
 		&format!("{}/testfile.txt", test_dir.name().unwrap()),
-		"-n1",
-	])
-	.await
+		"-n1"
+	)
 	.success()
 	.stdout(predicates::str::contains("Line 1").and(predicates::str::contains("Line 2").not()));
 
 	// tail
-	authenticated_cli_with_args([
+	authenticated_cli_with_args!(
 		"tail",
 		&format!("{}/testfile.txt", test_dir.name().unwrap()),
-		"-n1",
-	])
-	.await
+		"-n1"
+	)
 	.success()
 	.stdout(predicates::str::contains("Line 5").and(predicates::str::contains("Line 4").not()));
 }
@@ -114,17 +88,15 @@ async fn cmd_stat() {
 	client.upload_file(file.into(), &contents).await.unwrap();
 
 	// stat
-	authenticated_cli_with_args([
+	authenticated_cli_with_args!(
 		"stat",
-		&format!("{}/testfile.txt", test_dir.name().unwrap()),
-	])
-	.await
+		&format!("{}/testfile.txt", test_dir.name().unwrap())
+	)
 	.success()
 	.stdout(predicates::str::contains("1 KiB"));
 
 	// stat on root drive
-	authenticated_cli_with_args(["stat", "/"])
-		.await
+	authenticated_cli_with_args!("stat", "/")
 		.success()
 		.stdout(predicates::str::contains("Drive"));
 }
@@ -138,11 +110,10 @@ async fn cmd_mkdir() {
 	let new_dir_name = "new_test_dir";
 
 	// mkdir
-	authenticated_cli_with_args([
+	authenticated_cli_with_args!(
 		"mkdir",
-		&format!("{}/{}", test_dir.name().unwrap(), new_dir_name),
-	])
-	.await
+		&format!("{}/{}", test_dir.name().unwrap(), new_dir_name)
+	)
 	.success()
 	.stdout(predicates::str::contains("Directory created"));
 
@@ -175,15 +146,13 @@ async fn cmd_rm() {
 		.unwrap();
 
 	// rm
-	authenticated_cli_with_args(["rm", &format!("{}/testfile.txt", test_dir.name().unwrap())])
-		.await
+	authenticated_cli_with_args!("rm", &format!("{}/testfile.txt", test_dir.name().unwrap()))
 		.success()
 		.stdout(predicates::str::contains("Trashed file"));
-	authenticated_cli_with_args([
+	authenticated_cli_with_args!(
 		"rm",
-		&format!("{}/testdir_to_delete", test_dir.name().unwrap()),
-	])
-	.await
+		&format!("{}/testdir_to_delete", test_dir.name().unwrap())
+	)
 	.success()
 	.stdout(predicates::str::contains("Trashed directory"));
 
@@ -217,12 +186,11 @@ async fn cmd_mv_cp() {
 		.unwrap();
 
 	// mv
-	authenticated_cli_with_args([
+	authenticated_cli_with_args!(
 		"mv",
 		&format!("{}/testfile.txt", test_dir.name().unwrap()),
-		test_dir.name().unwrap(),
-	])
-	.await
+		test_dir.name().unwrap()
+	)
 	.success()
 	.stdout(predicates::str::contains("Moved"));
 
@@ -256,8 +224,7 @@ async fn cmd_favorite_unfavorite() {
 	let file_path = format!("{}/testfile.txt", test_dir.name().unwrap());
 
 	// favorite
-	authenticated_cli_with_args(["favorite", &file_path])
-		.await
+	authenticated_cli_with_args!("favorite", &file_path)
 		.success()
 		.stdout(predicates::str::contains("Favorited"));
 
@@ -268,8 +235,7 @@ async fn cmd_favorite_unfavorite() {
 	}
 
 	// unfavorite
-	authenticated_cli_with_args(["unfavorite", &file_path])
-		.await
+	authenticated_cli_with_args!("unfavorite", &file_path)
 		.success()
 		.stdout(predicates::str::contains("Unfavorited"));
 
