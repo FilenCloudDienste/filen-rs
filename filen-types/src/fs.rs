@@ -191,11 +191,11 @@ mod uuid {
 		pub const LENGTH: usize = Hyphenated::LENGTH;
 
 		pub fn new_v4() -> Self {
-			Uuid::new_v4().into()
+			(&Uuid::new_v4()).into()
 		}
 
 		pub fn nil() -> Self {
-			Uuid::nil().into()
+			(&Uuid::nil()).into()
 		}
 	}
 
@@ -203,7 +203,7 @@ mod uuid {
 		type Err = <Uuid as FromStr>::Err;
 
 		fn from_str(s: &str) -> Result<Self, Self::Err> {
-			Ok(Uuid::from_str(s)?.into())
+			Ok((&Uuid::from_str(s)?).into())
 		}
 	}
 
@@ -220,8 +220,8 @@ mod uuid {
 		}
 	}
 
-	impl From<UuidStr> for Uuid {
-		fn from(uuid_string: UuidStr) -> Self {
+	impl From<&UuidStr> for Uuid {
+		fn from(uuid_string: &UuidStr) -> Self {
 			// SAFETY: The string is guaranteed to be a valid Hyphenated UUID string
 			unsafe {
 				Hyphenated::from_str(uuid_string.as_ref())
@@ -231,9 +231,9 @@ mod uuid {
 		}
 	}
 
-	impl From<Uuid> for UuidStr {
-		fn from(uuid: Uuid) -> Self {
-			let hyphenated = uuid.hyphenated();
+	impl From<&Uuid> for UuidStr {
+		fn from(uuid: &Uuid) -> Self {
+			let hyphenated = uuid.as_hyphenated();
 			let mut bytes = [0u8; Hyphenated::LENGTH];
 			hyphenated.encode_lower(&mut bytes);
 			UuidStr(bytes)

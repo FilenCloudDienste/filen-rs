@@ -1522,6 +1522,7 @@ dependencies = [
  "console_error_panic_hook",
  "digest",
  "dotenv",
+ "env_logger",
  "faster-hex",
  "filen-macros",
  "filen-types",

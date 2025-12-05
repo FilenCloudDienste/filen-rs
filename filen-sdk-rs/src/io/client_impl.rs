@@ -1,18 +1,11 @@
-use std::{
-	path::PathBuf,
-	sync::{Arc, atomic::Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
 	Error,
 	auth::Client,
-	fs::{
-		dir::RemoteDirectory,
-		file::{BaseFile, RemoteFile, traits::File},
-	},
-	io::fs_tree_builder,
+	fs::file::{BaseFile, RemoteFile, traits::File},
 	util::MaybeSendCallback,
 };
 
@@ -105,17 +98,18 @@ impl Client {
 		.await
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn upload_dir_recursively(
 		self: Arc<Self>,
-		dir_path: PathBuf,
+		dir_path: std::path::PathBuf,
 		callback: Arc<dyn super::dir_upload::DirUploadCallback>,
-		target: &RemoteDirectory,
+		target: &crate::fs::dir::RemoteDirectory,
 	) -> Result<(), Error> {
 		let drop_canceller = AtomicDropCanceller {
 			cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 		};
 
-		let (tree, stats) = fs_tree_builder::build_fs_tree_from_walkdir_iterator(
+		let (tree, stats) = super::fs_tree::build_fs_tree_from_walkdir_iterator(
 			&dir_path,
 			&mut |errors| {
 				callback.on_scan_errors(errors);

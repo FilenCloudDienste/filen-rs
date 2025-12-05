@@ -17,8 +17,8 @@ use crate::{
 	error::ResultExt,
 	fs::{HasUUID, dir::RemoteDirectory, file::RemoteFile},
 	io::{
-		FilenMetaExt,
-		fs_tree_builder::{DirChildrenInfo, Entry, WalkError},
+		FilenMetaExt, WalkError,
+		fs_tree::{DirChildrenInfo, Entry},
 	},
 };
 
@@ -50,7 +50,10 @@ impl Client {
 		self: Arc<Self>,
 		callback: Arc<dyn DirUploadCallback>,
 		path: PathBuf,
-		tree: &super::fs_tree_builder::FSTree,
+		tree: &super::fs_tree::FSTree<
+			super::fs_tree::ExtraLocalDirData,
+			super::fs_tree::ExtraLocalFileData,
+		>,
 		target_folder: &RemoteDirectory,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
@@ -382,17 +385,4 @@ struct EntryToUploadInfo {
 enum EntryToUpload {
 	File(PathBuf),
 	Dir(PathBuf, DirChildrenInfo),
-}
-
-/// Callback trait for folder download operations
-///
-/// Folder downloads are implemented using a single sweep
-/// While scanning the folder contents, files are downloaded in parallel
-/// Progress is reported during the download process.
-pub trait DirDownloadCallback {
-	fn on_scan_progress(&self, known_dir: u64, known_files: u64, known_bytes: u64);
-	fn on_scan_complete(&self, total_dirs: u64, total_files: u64, total_bytes: u64);
-	fn on_download_update(&self, uploaded_dirs: u64, uploaded_files: u64, uploaded_bytes: u64);
-	fn on_download_error(&self, path: &Path, error: Error);
-	fn on_download_complete(&self);
 }
