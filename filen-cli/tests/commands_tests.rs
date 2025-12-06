@@ -185,11 +185,18 @@ async fn cmd_mv_cp() {
 		.await
 		.unwrap();
 
+	// create destination directory
+	let destination_dir = format!("{}/moved_dir", test_dir.name().unwrap());
+	client
+		.create_dir(test_dir, String::from("moved_dir"))
+		.await
+		.unwrap();
+
 	// mv
 	authenticated_cli_with_args!(
 		"mv",
 		&format!("{}/testfile.txt", test_dir.name().unwrap()),
-		test_dir.name().unwrap()
+		&destination_dir
 	)
 	.success()
 	.stdout(predicates::str::contains("Moved"));
@@ -201,7 +208,7 @@ async fn cmd_mv_cp() {
 		.unwrap();
 	assert!(old_file.is_none());
 	let new_file = client
-		.find_item_at_path(&format!("{}/testfile.txt", test_dir.name().unwrap()))
+		.find_item_at_path(&format!("{}/testfile.txt", &destination_dir))
 		.await
 		.unwrap();
 	assert!(new_file.is_some());
