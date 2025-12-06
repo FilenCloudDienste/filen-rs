@@ -350,18 +350,17 @@ where
 		auth_config_file
 			.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
 			.unwrap();
-		return bin
-			.args([
-				"--auth-config-path",
-				auth_config_file.to_str().unwrap(),
-				"-v",
-			])
-			.args(args)
-			.assert();
+		bin.args([
+			"--auth-config-path",
+			auth_config_file.to_str().unwrap(),
+			"-v",
+		])
+		.args(args)
+		.assert()
 	}
 	#[cfg(not(feature = "cli"))]
 	{
-		compile_error!("authenticated_cli_with_args! macro requires the `cli` feature");
+		panic!("authenticated_cli_with_args requires the `cli` feature");
 	}
 }
 
