@@ -81,11 +81,18 @@ pub(crate) async fn authenticate_and_get_password(
 	} else if let Some(client) = authenticate_from_environment_variables(ui).await? {
 		log::info!("Authenticated from environment variables");
 		Ok(client)
-	} else if let Some(client) = authenticate_from_keyring().await? {
-		log::info!("Authenticated from keyring");
-		Ok(client)
 	} else {
-		authenticate_from_prompt(ui).await
+		match authenticate_from_keyring().await {
+			Ok(Some(client)) => {
+				log::info!("Authenticated from keyring");
+				Ok(client)
+			}
+			Ok(None) => authenticate_from_prompt(ui).await,
+			Err(e) => {
+				log::warn!("Failed to authenticate from keyring: {:?}", e);
+				authenticate_from_prompt(ui).await
+			}
+		}
 	}
 }
 
@@ -139,7 +146,8 @@ fn authenticate_from_auth_config(path_arg: Option<&str>) -> Result<Option<Client
 	let Some(path) = path_arg else {
 		return Ok(None);
 	};
-	let sdk_config = std::fs::read_to_string(path).context("Failed to read auth config file")?;
+	let sdk_config = std::fs::read_to_string(path)
+		.with_context(|| format!("Failed to read auth config file from {}", path))?;
 	Ok(Some(deserialize_auth_config(&sdk_config)?))
 }
 

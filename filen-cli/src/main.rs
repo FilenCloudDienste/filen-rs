@@ -58,7 +58,15 @@ pub(crate) struct CliConfig {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+	// translate errors to non-zero exit code
+	match inner_main().await {
+		Ok(_) => {}
+		Err(_) => std::process::exit(1)
+	}
+}
+
+async fn inner_main() -> Result<()> {
 	let cli_args = CliArgs::parse();
 	// todo: add colors and styling to clap help texts
 
@@ -123,9 +131,12 @@ async fn main() -> Result<()> {
 	let mut working_path = RemotePath::new("");
 
 	if let Some(command) = cli_args.command {
-		if let Err(e) = execute_command(&config, &mut ui, &mut client, &working_path, command).await
-		{
-			ui.print_failure_or_error(&e);
+		match execute_command(&config, &mut ui, &mut client, &working_path, command).await {
+			Ok(_) => Ok(()),
+			Err(e) => {
+				ui.print_failure_or_error(&e);
+				Err(e)
+			}
 		}
 	} else {
 		ui.print_banner();
@@ -180,9 +191,8 @@ async fn main() -> Result<()> {
 				}
 			}
 		}
+		Ok(())
 	}
-
-	Ok(())
 }
 
 /// Information returned by a command execution.
