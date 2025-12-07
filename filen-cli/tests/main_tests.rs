@@ -92,7 +92,7 @@ fn unknown_command() {
 		));
 }
 
-#[cfg(unix)] // rexpect only works on unix
+#[cfg(target_os = "linux")] // rexpect only works on linux
 #[shared_test_runtime]
 async fn interactive_repl() {
 	let test_resources = test_utils::RESOURCES.get_resources().await;
