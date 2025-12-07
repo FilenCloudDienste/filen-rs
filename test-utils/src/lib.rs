@@ -48,31 +48,35 @@ impl TestResources {
 }
 
 impl Resources {
+	pub fn get_credentials(&self) -> (String, String, String) {
+		dotenv::dotenv().ok();
+		let email = env::var(format!("{}_EMAIL", self.account_prefix)).unwrap_or_else(|_| {
+			panic!(
+				"Failed to get Filen testing account email from environment variable {}_EMAIL",
+				self.account_prefix
+			)
+		});
+		let password = env::var(format!("{}_PASSWORD", self.account_prefix)).unwrap_or_else(|_| {
+			panic!(
+				"Failed to get Filen testing account password from environment variable {}_PASSWORD",
+				self.account_prefix
+			)
+		});
+		let two_factor_code =
+			env::var(format!("{}_2FA_CODE", self.account_prefix)).unwrap_or("XXXXXX".to_string());
+		(email, password, two_factor_code)
+	}
+
 	pub async fn client(&self) -> Arc<Client> {
 		self.client
 			.get_or_init(|| async {
-				dotenv::dotenv().ok();
-				let client = Client::login(
-					env::var(format!("{}_EMAIL", self.account_prefix)).unwrap_or_else(|_| {
-						panic!(
-							"Failed to get Filen testing account email from environment variable {}_EMAIL",
-							self.account_prefix
-						)
-					}),
-					&env::var(format!("{}_PASSWORD", self.account_prefix)).unwrap_or_else(|_| {
-						panic!(
-							"Failed to get Filen testing account password from environment variable {}_PASSWORD",
-							self.account_prefix
-						)
-					}),
-					&env::var(format!("{}_2FA_CODE", self.account_prefix))
-						.unwrap_or("XXXXXX".to_string()),
-				)
-				.await
-				.inspect_err(|e| {
-					println!("Failed to login: {}, error: {}", self.account_prefix, e);
-				})
-				.unwrap();
+				let (email, password, two_factor_code) = self.get_credentials();
+				let client = Client::login(email, &password, &two_factor_code)
+					.await
+					.inspect_err(|e| {
+						println!("Failed to login: {}, error: {}", self.account_prefix, e);
+					})
+					.unwrap();
 				Arc::new(client)
 			})
 			.await
@@ -333,35 +337,43 @@ pub async fn await_not_event<F, T>(
 }
 
 #[cfg(feature = "cli")]
-pub async fn authenticated_cli_with_args<I, S>(
-	bin: &mut assert_cmd::Command,
-	args: I,
-) -> assert_cmd::assert::Assert
-where
-	I: IntoIterator<Item = S>,
-	S: AsRef<std::ffi::OsStr>,
-{
+pub mod cli {
+	use crate::RESOURCES;
 	use assert_fs::prelude::{FileWriteStr, PathChild};
-	let client = RESOURCES.client().await;
-	let auth_config_file = assert_fs::TempDir::new()
-		.unwrap()
-		.child("filen-cli-auth-config");
-	auth_config_file
-		.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
-		.unwrap();
-	bin.args([
-		"--auth-config-path",
-		auth_config_file.to_str().unwrap(),
-		"-v",
-	])
-	.args(args)
-	.assert()
-}
 
-#[cfg(feature = "cli")]
-#[macro_export]
-macro_rules! authenticated_cli_with_args {
-	($($arg:expr),*) => {
-		authenticated_cli_with_args(&mut assert_cmd::cargo::cargo_bin_cmd!("filen-cli"), &[$($arg),*]).await
-	};
+	pub async fn run_authenticated_cli_with_args<I, S>(
+		bin: &mut assert_cmd::Command,
+		args: I,
+	) -> assert_cmd::assert::Assert
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<std::ffi::OsStr>,
+	{
+		let auth_config_file = prepare_cli_auth_config().await;
+		bin.args([
+			"--auth-config-path",
+			auth_config_file.to_str().unwrap(),
+			"-v",
+		])
+		.args(args)
+		.assert()
+	}
+
+	pub async fn prepare_cli_auth_config() -> assert_fs::fixture::ChildPath {
+		let client = RESOURCES.client().await;
+		let auth_config_file = assert_fs::TempDir::new()
+			.unwrap()
+			.child("filen-cli-auth-config");
+		auth_config_file
+			.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
+			.unwrap();
+		auth_config_file
+	}
+
+	#[macro_export]
+	macro_rules! authenticated_cli_with_args {
+		($($arg:expr),*) => {
+			$crate::cli::run_authenticated_cli_with_args(&mut assert_cmd::cargo::cargo_bin_cmd!("filen-cli"), &[$($arg),*]).await
+		};
+	}
 }
