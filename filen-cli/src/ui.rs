@@ -86,7 +86,10 @@ impl UI {
 	/// Print a colorful banner at the top of the application (contains app name and version)
 	pub(crate) fn print_banner(&self) {
 		let banner_text = format!("Filen CLI v{}", FILEN_CLI_VERSION);
-		let width: usize = termsize::get().map(|size| size.cols).unwrap_or(20).into();
+		let width = match termsize::get().map(|size| size.cols) {
+			Some(w) if w as usize > banner_text.len() + 2 => w as usize,
+			_ => banner_text.len() + 6,
+		};
 		let banner = "=".repeat((width - banner_text.len() - 2) / 2)
 			+ " " + &banner_text
 			+ " " + &"=".repeat((width - banner_text.len() - 2) / 2);

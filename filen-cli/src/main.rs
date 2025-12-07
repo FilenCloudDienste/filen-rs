@@ -62,7 +62,7 @@ async fn main() {
 	// translate errors to non-zero exit code
 	match inner_main().await {
 		Ok(_) => {}
-		Err(_) => std::process::exit(1)
+		Err(_) => std::process::exit(1),
 	}
 }
 

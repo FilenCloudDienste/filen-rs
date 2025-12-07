@@ -1,5 +1,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_fs::TempDir;
+use filen_macros::shared_test_runtime;
+use filen_sdk_rs::fs::HasName;
 use predicates::prelude::PredicateBooleanExt;
 
 #[test]
@@ -90,11 +92,24 @@ fn unknown_command() {
 		));
 }
 
-// todo: testing interactive clis is hard
-// so we want to use [rexpect](https://docs.rs/rexpect/latest/rexpect/)
-// since it does not work on windows, I'll write this test later
-// we should test not only basic interactiev input prompts, but also y/n prompts etc.
-// maybe a solution would be to mock input? but that seems really complicated and not worth it
+#[cfg(unix)] // rexpect only works on unix
+#[shared_test_runtime]
+async fn interactive_repl() {
+	let test_resources = test_utils::RESOURCES.get_resources().await;
+	let (email, password, _) = test_utils::RESOURCES.get_credentials();
+	let mut p = rexpect::spawn(env!("CARGO_BIN_EXE_filen-cli"), Some(5000)).unwrap();
+	p.exp_string("Email").unwrap();
+	p.send_line(&email).unwrap();
+	p.exp_string("Password").unwrap();
+	p.send_line(&password).unwrap();
+	p.exp_string("Keep me logged in?").unwrap();
+	p.send_line("n").unwrap();
+	p.exp_string(&format!("({})", email)).unwrap();
+	p.send_line("ls").unwrap();
+	p.exp_string(test_resources.dir.name().unwrap()).unwrap();
+	p.send_line("exit").unwrap();
+	p.exp_eof().unwrap();
+}
 
 // todo: add more tests:
 
