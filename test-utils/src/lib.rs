@@ -332,6 +332,7 @@ pub async fn await_not_event<F, T>(
 	}
 }
 
+#[cfg(feature = "cli")]
 pub async fn authenticated_cli_with_args<I, S>(
 	bin: &mut assert_cmd::Command,
 	args: I,
@@ -340,28 +341,21 @@ where
 	I: IntoIterator<Item = S>,
 	S: AsRef<std::ffi::OsStr>,
 {
-	#[cfg(feature = "cli")]
-	{
-		use assert_fs::prelude::{FileWriteStr, PathChild};
-		let client = RESOURCES.client().await;
-		let auth_config_file = assert_fs::TempDir::new()
-			.unwrap()
-			.child("filen-cli-auth-config");
-		auth_config_file
-			.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
-			.unwrap();
-		bin.args([
-			"--auth-config-path",
-			auth_config_file.to_str().unwrap(),
-			"-v",
-		])
-		.args(args)
-		.assert()
-	}
-	#[cfg(not(feature = "cli"))]
-	{
-		panic!("authenticated_cli_with_args requires the `cli` feature");
-	}
+	use assert_fs::prelude::{FileWriteStr, PathChild};
+	let client = RESOURCES.client().await;
+	let auth_config_file = assert_fs::TempDir::new()
+		.unwrap()
+		.child("filen-cli-auth-config");
+	auth_config_file
+		.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
+		.unwrap();
+	bin.args([
+		"--auth-config-path",
+		auth_config_file.to_str().unwrap(),
+		"-v",
+	])
+	.args(args)
+	.assert()
 }
 
 #[cfg(feature = "cli")]
