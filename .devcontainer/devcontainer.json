@@ -1,0 +1,27 @@
+{
+	"image": "mcr.microsoft.com/devcontainers/rust:latest",
+	"mounts": [
+		// cargo build cache
+		{
+			"source": "devcontainer-cargo-cache-${devcontainerId}",
+			"target": "/usr/local/cargo",
+			"type": "volume"
+		}
+	],
+	"postCreateCommand": {
+		"install build dependencies": "sudo apt-get update && sudo apt-get install -y cmake clang libc++-dev libc++abi-dev",
+		"install avif-decoder build dependencies": "sudo apt-get install -y libdav1d-dev pkg-config",
+		"install rust toolchain components": "rustup component add --toolchain nightly-2025-08-14-x86_64-unknown-linux-gnu clippy rustfmt"
+	},
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"[rust]": {
+					"editor.defaultFormatter": "rust-lang.rust-analyzer",
+					"editor.formatOnSave": true
+				},
+				"rust-analyzer.check.command": "clippy"
+			}
+		}
+	}
+}
