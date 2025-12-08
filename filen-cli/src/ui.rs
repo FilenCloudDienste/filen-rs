@@ -46,10 +46,12 @@ pub(crate) struct UI {
 	theme: dialoguer::theme::ColorfulTheme,
 	repl_input_theme: dialoguer::theme::ColorfulTheme,
 	history: dialoguer::BasicHistory,
+	overwrite_terminal_width: Option<usize>,
+	output: Vec<String>,
 }
 
 impl UI {
-	pub(crate) fn new(quiet: bool) -> Self {
+	pub(crate) fn new(quiet: bool, overwrite_terminal_width: Option<usize>) -> Self {
 		UI {
 			quiet,
 			theme: dialoguer::theme::ColorfulTheme {
@@ -60,6 +62,8 @@ impl UI {
 			},
 			repl_input_theme: Self::repl_input_theme_for_user(None),
 			history: dialoguer::BasicHistory::new().no_duplicates(true),
+			overwrite_terminal_width,
+			output: Vec::new(),
 		}
 	}
 
@@ -83,11 +87,18 @@ impl UI {
 		}
 	}
 
+	fn get_terminal_width(&self) -> Option<usize> {
+		match self.overwrite_terminal_width {
+			Some(size) => Some(size),
+			None => termsize::get().map(|size| size.cols as usize),
+		}
+	}
+
 	/// Print a colorful banner at the top of the application (contains app name and version)
-	pub(crate) fn print_banner(&self) {
+	pub(crate) fn print_banner(&mut self) {
 		let banner_text = format!("Filen CLI v{}", FILEN_CLI_VERSION);
-		let width = match termsize::get().map(|size| size.cols) {
-			Some(w) if w as usize > banner_text.len() + 2 => w as usize,
+		let width = match self.get_terminal_width() {
+			Some(w) if w > banner_text.len() + 2 => w,
 			_ => banner_text.len() + 6,
 		};
 		let banner = "=".repeat((width - banner_text.len() - 2) / 2)
@@ -99,26 +110,23 @@ impl UI {
 		let banner = banner.gradient([filen_blue, filen_violet, filen_green]);
 		// the string outputted by tiny_gradient has many "0m" sequences that reset formatting, so we're applying the bold formatting manually
 		let banner = banner.to_string().replace("0m", "1m");
-		println!("{}", banner);
+		self.print(&banner);
 	}
 
-	pub(crate) fn print(&self, msg: &str) {
+	pub(crate) fn print(&mut self, msg: &str) {
 		println!("{}", msg);
+		self.output.push(msg.to_string());
 		// todo: use ui.println() everywhere?
 		info!("[PRINT] {}", msg);
 	}
 	pub(crate) fn print_hidden(&self, msg: &str) {
 		info!("[PRINT] {}", msg);
 	}
-	pub(crate) fn eprint(&self, msg: &str) {
-		eprintln!("{}", msg);
-		error!("[PRINT] {}", msg);
-	}
 
 	// print with formatting
 
 	/// Print a message with a success icon
-	pub(crate) fn print_success(&self, msg: &str) {
+	pub(crate) fn print_success(&mut self, msg: &str) {
 		if !self.quiet {
 			self.print(&format!("{} {}", style("✔").green(), msg));
 		} else {
@@ -127,8 +135,8 @@ impl UI {
 	}
 
 	/// Print a message with a failure icon
-	pub(crate) fn print_failure(&self, msg: &str) {
-		self.eprint(&format!("{} {}", style("✘").red(), msg));
+	pub(crate) fn print_failure(&mut self, msg: &str) {
+		self.print(&format!("{} {}", style("✘").red(), msg));
 	}
 
 	/// Return an error with a user-friendly error message
@@ -139,12 +147,12 @@ impl UI {
 	/// Print an error or failure message
 	/// User-friendly failures created with `UI::failure` will be printed as-is,
 	/// other errors will be printed with a generic message and a link to report bugs.
-	pub(crate) fn print_failure_or_error(&self, err: &anyhow::Error) {
+	pub(crate) fn print_failure_or_error(&mut self, err: &anyhow::Error) {
 		error!("{:#}", err);
 		let err_msg = format!("{}", err);
 		let is_failure = err_msg.starts_with(&format!("{}", style("✘").red()));
 		if is_failure {
-			self.eprint(&err_msg);
+			self.print(&err_msg);
 		} else {
 			self.print_failure(&format!("An unexpected error occurred: {}", err));
 			self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
@@ -152,16 +160,16 @@ impl UI {
 	}
 
 	/// Print an error with a failure icon
-	pub(crate) fn print_err(&self, err: &anyhow::Error) {
+	pub(crate) fn print_err(&mut self, err: &anyhow::Error) {
 		self.print_failure(&format!("{}", err));
 	}
 
-	pub(crate) fn print_muted(&self, msg: &str) {
+	pub(crate) fn print_muted(&mut self, msg: &str) {
 		self.print(&style(msg).dim().to_string());
 	}
 
 	/// Print a table of key-value pairs
-	pub(crate) fn print_key_value_table(&self, table: &[(&str, &str)]) {
+	pub(crate) fn print_key_value_table(&mut self, table: &[(&str, &str)]) {
 		let key_width = table.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
 		for (key, value) in table {
 			self.print(&format!("{:>key_width$} {}", style(key).dim(), value));
@@ -169,12 +177,12 @@ impl UI {
 	}
 
 	/// Print a grid of strings (like an ls command's output)
-	pub(crate) fn print_grid(&self, items: &[&str]) {
+	pub(crate) fn print_grid(&mut self, items: &[&str]) {
 		if items.is_empty() {
 			self.print("");
 			return;
 		}
-		let terminal_width = termsize::get().map(|size| size.cols).unwrap_or(10) as usize;
+		let terminal_width = self.get_terminal_width().unwrap_or(10);
 		let min_text_width = items.iter().map(|item| item.width()).max().unwrap_or(0);
 		if min_text_width > terminal_width {
 			// it won't fit, so just print one per line
@@ -265,4 +273,39 @@ pub(crate) fn format_date(date: &chrono::DateTime<chrono::Utc>) -> String {
 
 pub(crate) fn format_size(size: u64) -> String {
 	humansize::format_size(size, humansize::BINARY)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_ui() {
+		let test = |ui: &mut UI| {
+			ui.print_banner();
+			ui.print("Should just show");
+			ui.print_hidden("Shouldn't show");
+			ui.print_success("Success!");
+			ui.print_failure("Something went wrong");
+			ui.print_err(&anyhow::anyhow!("This is an error"));
+			ui.print_muted("This is muted text");
+			ui.print_key_value_table(&[("Key1", "Value1"), ("LongerKey2", "Value2")]);
+			ui.print_grid(&[
+				"file1.txt",
+				"file2.txt",
+				"a_very_long_filename_document.pdf",
+				"image.png",
+				"video.mp4",
+				"archive.zip",
+			]);
+		};
+
+		// for different terminal sizes
+		let mut small_ui = UI::new(false, Some(30));
+		test(&mut small_ui);
+		insta::assert_snapshot!(small_ui.output.join("\n"));
+		let mut large_ui = UI::new(false, Some(100));
+		test(&mut large_ui);
+		insta::assert_snapshot!(large_ui.output.join("\n"));
+	}
 }

@@ -119,7 +119,7 @@ async fn inner_main() -> Result<()> {
 	info!("Logging level: {}", logging_level);
 	info!("Full log file: {}", log_file.display());
 
-	let mut ui = ui::UI::new(cli_args.quiet);
+	let mut ui = ui::UI::new(cli_args.quiet, None);
 
 	if !cli_args.skip_update {
 		check_for_updates(&mut ui, &config.config_dir).await?;
