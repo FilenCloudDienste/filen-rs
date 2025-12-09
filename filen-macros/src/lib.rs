@@ -713,8 +713,7 @@ fn find_cli_doc_fragments() -> Vec<CliDocFragment> {
 	// extract cli docs fragments from source files
 	fn visit_source_files(dir: &std::path::Path) -> Vec<CliDocFragment> {
 		let mut fragments = Vec::<CliDocFragment>::new();
-		let cli_doc_comment_id_marker =
-			regex::Regex::new(r"\/\/[\/!] \[filen-cli-doc\] ?(.*)").unwrap();
+		let cli_doc_comment_id_marker = regex::Regex::new(r"\/\/[\/!] \[cli-doc\] ?(.*)").unwrap();
 		let cli_doc_comment_content = regex::Regex::new(r"\/\/[\/!] ?(.*)").unwrap();
 		for entry in std::fs::read_dir(dir).unwrap() {
 			let path = entry.unwrap().path();

@@ -1,4 +1,4 @@
-//! [filen-cli-doc] updates
+//! [cli-doc] updates
 //! The updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-releases
 //! when the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).
 //! The executable will be replaced in place, with the filename updated if it contains the version number.
