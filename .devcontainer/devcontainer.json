@@ -11,7 +11,8 @@
 	"postCreateCommand": {
 		"install build dependencies": "sudo apt-get update && sudo apt-get install -y cmake clang libc++-dev libc++abi-dev",
 		"install avif-decoder build dependencies": "sudo apt-get install -y libdav1d-dev pkg-config",
-		"install rust toolchain components": "rustup component add --toolchain nightly-2025-08-14-x86_64-unknown-linux-gnu clippy rustfmt cargo-insta"
+		"install rust toolchain components": "rustup component add --toolchain nightly-2025-08-14-x86_64-unknown-linux-gnu clippy rustfmt",
+		"install cargo-insta": "cargo install cargo-insta"
 	},
 	"customizations": {
 		"vscode": {
