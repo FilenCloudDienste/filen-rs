@@ -1,7 +1,7 @@
 use std::{borrow::Cow, fmt::Debug, str::FromStr};
 
 use aes_gcm::{
-	AesGcm, KeyInit, Nonce,
+	AesGcm, Nonce,
 	aead::{Aead, AeadInPlace},
 	aes::Aes256,
 };
@@ -25,8 +25,13 @@ pub const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4,
 
 #[derive(Clone)]
 pub struct EncryptionKey {
-	pub bytes: [u8; 32],
-	pub cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
+	bytes: [u8; 32],
+}
+
+impl EncryptionKey {
+	fn cipher(&self) -> AesGcm<Aes256, NonceSize, TagSize> {
+		<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(&self.bytes.into())
+	}
 }
 
 #[cfg(feature = "uniffi")]
@@ -37,11 +42,7 @@ uniffi::custom_type!(EncryptionKey, String, {
 
 impl EncryptionKey {
 	pub fn new(key: [u8; 32]) -> Self {
-		let cipher = AesGcm::new(&key.into());
-		Self {
-			bytes: key,
-			cipher: Box::new(cipher),
-		}
+		Self { bytes: key }
 	}
 }
 
@@ -127,7 +128,7 @@ impl MetaCrypter for EncryptionKey {
 
 		// SAFETY: This cannot fail unless we encrypt more than 64GiB of metadata at a time
 		// which we will never do we also don't have AAD which could cause issues
-		let encrypted = self.cipher.encrypt(nonce, meta.as_bytes()).unwrap();
+		let encrypted = self.cipher().encrypt(nonce, meta.as_bytes()).unwrap();
 		BASE64_STANDARD.encode_string(encrypted, &mut out);
 		EncryptedString(Cow::Owned(out))
 	}
@@ -164,7 +165,7 @@ impl MetaCrypter for EncryptionKey {
 		if let Err(e) = BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE * 2 + 3..], &mut out) {
 			return Err((e.into(), out));
 		}
-		if let Err(e) = self.cipher.decrypt_in_place(&nonce, &[], &mut out) {
+		if let Err(e) = self.cipher().decrypt_in_place(&nonce, &[], &mut out) {
 			return Err((e.into(), out));
 		}
 		String::from_utf8(out).map_err(|e| (e.utf8_error().into(), e.into_bytes()))
@@ -173,11 +174,11 @@ impl MetaCrypter for EncryptionKey {
 
 impl DataCrypter for EncryptionKey {
 	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		super::shared::encrypt_data(&self.cipher, data)
+		super::shared::encrypt_data(&self.cipher(), data)
 	}
 
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		super::shared::decrypt_data(&self.cipher, data)
+		super::shared::decrypt_data(&self.cipher(), data)
 	}
 }
 

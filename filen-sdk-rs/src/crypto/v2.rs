@@ -51,7 +51,13 @@ impl AsRef<str> for BadNonce {
 #[derive(Clone)]
 pub struct V2Key {
 	key: String,
-	cipher: Box<AesGcm<Aes256, NonceSize, TagSize>>,
+	derived_key: [u8; 32],
+}
+
+impl V2Key {
+	fn cipher(&self) -> AesGcm<Aes256, NonceSize, TagSize> {
+		<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(&self.derived_key.into())
+	}
 }
 
 impl PartialEq for V2Key {
@@ -80,7 +86,8 @@ impl V2Key {
 		if let Err(e) = BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE + 3..], &mut out) {
 			return Err((e.into(), out));
 		}
-		if let Err(e) = self.cipher.decrypt_in_place(nonce, &[], &mut out) {
+
+		if let Err(e) = self.cipher().decrypt_in_place(nonce, &[], &mut out) {
 			return Err((e.into(), out));
 		}
 
@@ -110,7 +117,10 @@ impl MetaCrypter for V2Key {
 
 		// SAFETY: This cannot fail unless we encrypt more than 64GiB of metadata at a time, which we will never do
 		// we also don't have AAD
-		let encrypted = self.cipher.encrypt(&nonce.into(), meta.as_bytes()).unwrap();
+		let encrypted = self
+			.cipher()
+			.encrypt(&nonce.into(), meta.as_bytes())
+			.unwrap();
 
 		BASE64_STANDARD.encode_string(encrypted, &mut out);
 		EncryptedString(Cow::Owned(out))
@@ -146,11 +156,11 @@ impl MetaCrypter for V2Key {
 
 impl DataCrypter for V2Key {
 	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		super::shared::encrypt_data(&self.cipher, data)
+		super::shared::encrypt_data(&self.cipher(), data)
 	}
 
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		super::shared::decrypt_data(&self.cipher, data)
+		super::shared::decrypt_data(&self.cipher(), data)
 	}
 }
 
@@ -302,11 +312,7 @@ impl TryFrom<String> for MasterKey {
 		let mut derived_key = [0u8; 32];
 		pbkdf2::pbkdf2::<Hmac<Sha512>>(key.as_bytes(), key.as_bytes(), 1, &mut derived_key)?;
 
-		let cipher = <AesGcm<Aes256, NonceSize> as digest::KeyInit>::new(&derived_key.into());
-		Ok(Self(V2Key {
-			key,
-			cipher: Box::new(cipher),
-		}))
+		Ok(Self(V2Key { key, derived_key }))
 	}
 }
 
@@ -316,14 +322,12 @@ pub struct FileKey(pub(crate) V2Key);
 impl TryFrom<String> for FileKey {
 	type Error = ConversionError;
 	fn try_from(key: String) -> Result<Self, Self::Error> {
-		if key.len() != 32 {
-			return Err(ConversionError::InvalidStringLength(key.len(), 32));
-		}
-		let cipher = <AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(key.as_bytes().into());
-		Ok(Self(V2Key {
-			key,
-			cipher: Box::new(cipher),
-		}))
+		let derived_key = key
+			.as_bytes()
+			.try_into()
+			.map_err(|_| ConversionError::InvalidStringLength(key.len(), 32))?;
+
+		Ok(Self(V2Key { key, derived_key }))
 	}
 }
 

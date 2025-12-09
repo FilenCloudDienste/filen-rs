@@ -10,6 +10,7 @@ use super::{
 	file::{RemoteFile, RemoteRootFile},
 };
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsharedFSObject<'a> {
 	Dir(Cow<'a, RemoteDirectory>),
@@ -70,6 +71,7 @@ impl<'a> From<&'a FSObject<'_>> for FSObject<'a> {
 	}
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FsObjectIntoTypes<'a> {
 	Dir(DirectoryType<'a>),
 	File(RemoteFileType<'a>),
@@ -87,6 +89,7 @@ impl<'a> From<FSObject<'a>> for FsObjectIntoTypes<'a> {
 	}
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NonRootFSObject<'a> {
 	Dir(Cow<'a, RemoteDirectory>),
