@@ -2,7 +2,10 @@ use std::{fs::FileTimes, path::Path, time::SystemTime};
 
 use chrono::{DateTime, SubsecRound, Utc};
 
-use crate::io::{HasFileInfo, RemoteDirectory, RemoteFile};
+use crate::{
+	fs::HasRemoteInfo,
+	io::{HasFileInfo, RemoteDirectory, RemoteFile},
+};
 
 #[cfg(windows)]
 // thanks Microsoft!
@@ -76,7 +79,10 @@ impl FilenMetaExt for std::fs::Metadata {
 
 impl RemoteDirectory {
 	pub(crate) fn set_dir_times(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-		let file_times = get_file_times(self.created().map(Into::into), None);
+		let file_times = get_file_times(
+			self.created().unwrap_or_else(|| self.timestamp()).into(),
+			None,
+		);
 		set_file_times_for_dir(path, file_times)
 	}
 }
@@ -84,7 +90,7 @@ impl RemoteDirectory {
 impl RemoteFile {
 	pub(crate) fn get_file_times(&self) -> FileTimes {
 		get_file_times(
-			self.created().map(Into::into),
+			self.created().unwrap_or_else(|| self.timestamp()).into(),
 			self.last_modified().map(Into::into),
 		)
 	}
@@ -110,7 +116,7 @@ fn set_file_times_for_dir(path: &Path, times: FileTimes) -> Result<(), std::io::
 }
 
 // underscore so clippy doesn't complain on linux about unused variable
-fn get_file_times(_created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
+fn get_file_times(created: SystemTime, modified: Option<SystemTime>) -> FileTimes {
 	#[cfg(target_vendor = "apple")]
 	use std::os::darwin::fs::FileTimesExt;
 	#[cfg(windows)]
@@ -118,14 +124,20 @@ fn get_file_times(_created: Option<SystemTime>, modified: Option<SystemTime>) ->
 	let mut times = FileTimes::new();
 	#[cfg(any(target_vendor = "apple", windows))]
 	{
-		if let Some(created) = _created {
-			times = times.set_created(created);
+		times = times.set_created(created);
+		if let Some(modified) = modified {
+			times = times.set_modified(modified);
+		}
+	}
+	#[cfg(not(any(target_vendor = "apple", windows)))]
+	{
+		if let Some(modified) = modified {
+			times = times.set_modified(modified);
+		} else {
+			times = times.set_modified(created);
 		}
 	}
 
-	if let Some(modified) = modified {
-		times = times.set_modified(modified);
-	}
 	times
 }
 
@@ -142,7 +154,7 @@ mod tests {
 		let dt_created = Utc.with_ymd_and_hms(2020, 5, 1, 12, 0, 0).unwrap();
 		let dt_modified = Utc.with_ymd_and_hms(2021, 6, 2, 13, 30, 0).unwrap();
 
-		let file_times = get_file_times(Some(dt_created.into()), Some(dt_modified.into()));
+		let file_times = get_file_times(dt_created.into(), Some(dt_modified.into()));
 		let tmp_dir = env::temp_dir().join("test_times");
 		let _ = std::fs::remove_dir_all(&tmp_dir);
 		std::fs::create_dir(&tmp_dir).unwrap();
