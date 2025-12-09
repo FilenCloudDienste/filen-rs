@@ -1,3 +1,12 @@
+//! [filen-cli-doc] auth
+//! There are multiple ways to authenticate:
+//! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)
+//! - specify an auth config via the `--auth-config-path` flag
+//!   (exported) via `filen export-auth-config`
+//! - set environment variables (`FILEN_CLI_EMAIL` and `FILEN_CLI_PASSWORD`)
+//! - if none of these is set, you will be prompted for credentials
+//!   with the option to save them securely in the system keychain
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
@@ -6,6 +15,8 @@ use filen_sdk_rs::{ErrorKind, auth::Client};
 use filen_types::error::ResponseError;
 
 use crate::{ui::UI, util::LongKeyringEntry};
+
+// todo: two-factor code in env vars, cli args
 
 /// A lazily authenticated client.
 /// Since some commands (e. g. logout) don't need the user to be authenticated, we only authenticate when necessary.

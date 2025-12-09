@@ -15,4 +15,5 @@ default = []
 [dependencies]
 proc-macro2 = "1.0"
 quote = "1.0"
+regex = "1.12.2"
 syn = { version = "2.0", features = ["full", "visit-mut", "fold"] }
