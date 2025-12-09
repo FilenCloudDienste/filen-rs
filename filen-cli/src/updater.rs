@@ -1,8 +1,15 @@
+//! [filen-cli-doc] updates
+//! The updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-releases
+//! when the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).
+//! The executable will be replaced in place, with the filename updated if it contains the version number.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::ui::UI;
+
+// todo: flag to force update check?
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs

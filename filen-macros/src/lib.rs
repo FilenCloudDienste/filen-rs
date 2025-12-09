@@ -698,3 +698,106 @@ fn type_has_lifetime(ty: &Type) -> bool {
 		_ => true,
 	}
 }
+
+#[derive(Debug)]
+struct CliDocFragment {
+	id: String,
+	content: String,
+}
+// (!) also needs to be updated in the generated code below
+
+/// Searches source files for cli doc fragments,
+/// which are doc comments used to generate CLI documentation.
+/// See filen-cli/src/docs.rs
+fn find_cli_doc_fragments() -> Vec<CliDocFragment> {
+	// extract cli docs fragments from source files
+	fn visit_source_files(dir: &std::path::Path) -> Vec<CliDocFragment> {
+		let mut fragments = Vec::<CliDocFragment>::new();
+		let cli_doc_comment_id_marker =
+			regex::Regex::new(r"\/\/[\/!] \[filen-cli-doc\] ?(.*)").unwrap();
+		let cli_doc_comment_content = regex::Regex::new(r"\/\/[\/!] ?(.*)").unwrap();
+		for entry in std::fs::read_dir(dir).unwrap() {
+			let path = entry.unwrap().path();
+			if path.is_dir() {
+				fragments.extend(visit_source_files(&path));
+			} else if let Some(ext) = path.extension()
+				&& ext == "rs"
+			{
+				// search files for markers and doc content
+				let mut id_buffer: Option<String> = None;
+				let mut content_buffer = String::new();
+				fn flush_buffers(
+					fragments: &mut Vec<CliDocFragment>,
+					id_buffer: &mut Option<String>,
+					content_buffer: &mut String,
+				) {
+					if let Some(id) = id_buffer.take() {
+						fragments.push(CliDocFragment {
+							id,
+							content: content_buffer
+								.trim_start_matches("\n")
+								.trim_end_matches("\n")
+								.to_string(),
+						});
+						content_buffer.clear();
+					}
+				}
+				for line in std::fs::read_to_string(&path).unwrap().lines() {
+					if let Some(doc_id) = cli_doc_comment_id_marker
+						.captures(line.trim())
+						.map(|captures| captures.get(1).unwrap().as_str())
+					{
+						// found doc id, flush buffers
+						flush_buffers(&mut fragments, &mut id_buffer, &mut content_buffer);
+						id_buffer = Some(doc_id.to_string());
+					} else if let Some(doc_content) = cli_doc_comment_content
+						.captures(line.trim())
+						.map(|captures| captures.get(1).unwrap().as_str())
+					{
+						// found doc content, append if there is a current id
+						if id_buffer.is_some() {
+							content_buffer.push_str(doc_content);
+							content_buffer.push('\n');
+						}
+					} else {
+						// non-doc line, flush buffers
+						flush_buffers(&mut fragments, &mut id_buffer, &mut content_buffer);
+					}
+				}
+				flush_buffers(&mut fragments, &mut id_buffer, &mut content_buffer);
+			}
+		}
+		fragments
+	}
+	let src_dir = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
+	visit_source_files(&src_dir)
+}
+
+#[proc_macro]
+pub fn extract_cli_doc_fragments(_item: TokenStream) -> TokenStream {
+	let fragments = find_cli_doc_fragments();
+	let serialized_fragments = fragments.iter().map(|frag| {
+		let id = &frag.id;
+		let content = &frag.content;
+		quote! {
+			CliDocFragment {
+				id: #id.to_string(),
+				content: #content.to_string(),
+			}
+		}
+	});
+	quote! {
+		#[derive(Debug)]
+		struct CliDocFragment {
+			id: String,
+			content: String,
+		}
+
+		fn get_cli_doc_fragments() -> Vec<CliDocFragment> {
+			vec![
+				#(#serialized_fragments),*
+			]
+		}
+	}
+	.into()
+}

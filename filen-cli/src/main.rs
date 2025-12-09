@@ -1,3 +1,10 @@
+//! [filen-cli-doc] main
+//!
+//! Welcome to the Filen CLI!
+//!
+//! Invoke the Filen CLI with no command specified to enter interactive mode.
+//! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
+
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
@@ -7,6 +14,7 @@ use log::{LevelFilter, info};
 
 use crate::{
 	commands::{Commands, execute_command},
+	docs::generate_markdown_docs,
 	ui::CustomLogger,
 	updater::check_for_updates,
 	util::RemotePath,
@@ -17,6 +25,9 @@ mod commands;
 mod ui;
 mod updater;
 mod util;
+
+#[cfg(feature = "docs")]
+mod docs;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Filen CLI", version)]
@@ -51,6 +62,9 @@ pub(crate) struct CliArgs {
 
 	#[command(subcommand)]
 	command: Option<Commands>,
+
+	#[arg(long, hide = true)]
+	export_markdown_docs: bool,
 }
 
 pub(crate) struct CliConfig {
@@ -120,6 +134,20 @@ async fn inner_main() -> Result<()> {
 	info!("Full log file: {}", log_file.display());
 
 	let mut ui = ui::UI::new(cli_args.quiet, None);
+
+	if cli_args.export_markdown_docs {
+		#[cfg(feature = "docs")]
+		{
+			generate_markdown_docs().inspect_err(|e| {
+				ui.print_failure_or_error(e);
+			})?;
+		}
+		#[cfg(not(feature = "docs"))]
+		{
+			log::error!("Cannot export markdown docs: feature 'docs' not enabled");
+			return Err(anyhow::anyhow!("Feature 'docs' not enabled"));
+		}
+	}
 
 	if !cli_args.skip_update {
 		check_for_updates(&mut ui, &config.config_dir).await?;
