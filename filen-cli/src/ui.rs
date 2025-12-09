@@ -279,6 +279,8 @@ pub(crate) fn format_size(size: u64) -> String {
 mod tests {
 	use super::*;
 
+	// run using: cargo insta test --review -- --test test_ui
+
 	#[test]
 	fn test_ui() {
 		let test = |ui: &mut UI| {
