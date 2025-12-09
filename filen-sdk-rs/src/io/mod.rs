@@ -2,6 +2,7 @@
 use core::panic;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
+use std::{fs::FileTimes, path::Path, time::SystemTime};
 
 #[cfg(unix)]
 use chrono::SubsecRound;
@@ -18,6 +19,11 @@ mod fs_tree;
 pub use dir_upload::DirUploadCallback;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use fs_tree::WalkError;
+
+use crate::fs::{
+	dir::RemoteDirectory,
+	file::{RemoteFile, traits::HasFileInfo},
+};
 
 const WINDOWS_TICKS_PER_MILLI: u64 = 10_000;
 const MILLIS_TO_UNIX_EPOCH: u64 = 11_644_473_600_000; // 11644473600000 milliseconds from 1601-01-01 to 1970-01-01
@@ -99,5 +105,104 @@ impl FilenMetaExt for std::fs::Metadata {
 		.round_subsecs(3);
 		#[cfg(target_family = "wasm")]
 		panic!("Cannot get file accessed time on wasm32");
+	}
+}
+
+impl RemoteDirectory {
+	pub(crate) fn set_dir_times(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+		let file_times = get_file_times(self.created().map(Into::into), None);
+		set_file_times_for_dir(path, file_times)
+	}
+}
+
+impl RemoteFile {
+	pub(crate) fn get_file_times(&self) -> FileTimes {
+		get_file_times(
+			self.created().map(Into::into),
+			self.last_modified().map(Into::into),
+		)
+	}
+}
+
+fn set_file_times_for_dir(path: &Path, times: FileTimes) -> Result<(), std::io::Error> {
+	let dir_as_file = {
+		#[cfg(windows)]
+		{
+			use std::os::windows::fs::OpenOptionsExt;
+
+			std::fs::OpenOptions::new()
+				.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+				.write(true)
+				.open(path)?
+		}
+		#[cfg(unix)]
+		{
+			std::fs::OpenOptions::new().read(true).open(path)?
+		}
+	};
+	dir_as_file.set_times(times)
+}
+
+#[cfg(windows)]
+fn get_file_times(created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
+	use std::os::windows::fs::FileTimesExt;
+	let mut times = FileTimes::new();
+	if let Some(created) = created {
+		times = times.set_created(created);
+	}
+	if let Some(modified) = modified {
+		times = times.set_modified(modified);
+	}
+	times
+}
+
+#[cfg(unix)]
+fn get_file_times(created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
+	let mut times = FileTimes::new();
+	if let Some(modified) = modified {
+		times = times.set_modified(modified);
+	} else if let Some(created) = created {
+		times = times.set_modified(created);
+	}
+	times
+}
+
+#[cfg(test)]
+mod tests {
+	use std::env;
+
+	use chrono::TimeZone;
+
+	use super::*;
+
+	#[test]
+	fn set_file_and_folder_times() {
+		let dt_created = Utc.with_ymd_and_hms(2020, 5, 1, 12, 0, 0).unwrap();
+		let dt_modified = Utc.with_ymd_and_hms(2021, 6, 2, 13, 30, 0).unwrap();
+
+		let file_times = get_file_times(Some(dt_created.into()), Some(dt_modified.into()));
+		let tmp_dir = env::temp_dir().join("test_times");
+		let _ = std::fs::remove_dir_all(&tmp_dir);
+		std::fs::create_dir(&tmp_dir).unwrap();
+
+		set_file_times_for_dir(&tmp_dir, file_times).unwrap();
+
+		let metadata = std::fs::metadata(&tmp_dir).unwrap();
+		#[cfg(windows)]
+		{
+			assert_eq!(FilenMetaExt::created(&metadata), dt_created);
+		}
+		assert_eq!(FilenMetaExt::modified(&metadata), dt_modified);
+
+		let file_path = tmp_dir.join("test_file.txt");
+		let file = std::fs::File::create(&file_path).unwrap();
+
+		file.set_times(file_times).unwrap();
+		let metadata = std::fs::metadata(&file_path).unwrap();
+		#[cfg(windows)]
+		{
+			assert_eq!(FilenMetaExt::created(&metadata), dt_created);
+		}
+		assert_eq!(FilenMetaExt::modified(&metadata), dt_modified);
 	}
 }

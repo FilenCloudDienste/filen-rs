@@ -123,6 +123,9 @@ uniffi = { version = "0.29.4", optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false }
 walkdir = "2.5.0"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 # wasm only dependencies
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 getrandom_v3 = { package = "getrandom", version = "0.3", features = [
