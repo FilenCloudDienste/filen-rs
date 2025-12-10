@@ -1,35 +1,82 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashMap, collections::HashSet, path::PathBuf, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use clap::CommandFactory;
 use filen_macros::extract_cli_doc_fragments;
 use serde::Deserialize;
 
-use crate::CliArgs;
+use crate::{CliArgs, ui::UI};
 
 extract_cli_doc_fragments!();
 
-// markdown docs
-
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum MdDocElement {
-	Heading { heading: u8, text: String },
-	DocFragment { fragment_id: String },
-	CommandHelp { command: String },
+enum DocElement {
+	Heading1(&'static str),
+	DocFragment(&'static str),
+	CommandHelp(&'static str),
 }
 
 #[derive(Debug, Deserialize)]
-struct MdDocFile {
-	filename: String,
-	title: String,
-	elements: Vec<MdDocElement>,
+struct DocSection {
+	title: &'static str,
+	elements: Vec<DocElement>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MdDocOutline {
-	files: Vec<MdDocFile>,
-}
+static DOC_OUTLINE: LazyLock<HashMap<&'static str, DocSection>> = LazyLock::new(|| {
+	HashMap::from([
+		(
+			"main",
+			DocSection {
+				title: "Usage",
+				elements: vec![
+					DocElement::DocFragment("main-usage"),
+					DocElement::CommandHelp("exit"),
+					DocElement::Heading1("Updates"),
+					DocElement::DocFragment("updates"),
+					DocElement::Heading1("Mounting"),
+					DocElement::CommandHelp("mount"),
+				],
+			},
+		),
+		(
+			"auth",
+			DocSection {
+				title: "Authentication",
+				elements: vec![
+					DocElement::DocFragment("auth-methods"),
+					DocElement::CommandHelp("export-auth-config"),
+					DocElement::CommandHelp("logout"),
+				],
+			},
+		),
+		(
+			"access-files",
+			DocSection {
+				title: "Access Files",
+				elements: vec![
+					DocElement::CommandHelp("cd"),
+					DocElement::CommandHelp("ls"),
+					DocElement::CommandHelp("cat"),
+					DocElement::CommandHelp("head"),
+					DocElement::CommandHelp("tail"),
+					DocElement::CommandHelp("stat"),
+					DocElement::CommandHelp("mkdir"),
+					DocElement::CommandHelp("rm"),
+					DocElement::CommandHelp("mv"),
+					DocElement::CommandHelp("cp"),
+					DocElement::CommandHelp("favorite"),
+					DocElement::CommandHelp("unfavorite"),
+					DocElement::CommandHelp("list-trash"),
+					DocElement::CommandHelp("empty-trash"),
+				],
+			},
+		),
+	])
+});
+// todo: also specify here where global flags are documented?
+
+// markdown docs
 
 /// This function generates documentation for the CLI in markdown format.
 /// It reads the outline of the documentation (none of the text!) from a YAML file,
@@ -43,32 +90,25 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 	let cli_doc_fragments = get_cli_doc_fragments();
 	let mut used_doc_fragments = HashSet::new();
 
-	let markdown_structure_source = include_str!("../docs/markdown_docs_outline.yaml");
-	let markdown_structure = serde_yaml::from_str::<MdDocOutline>(markdown_structure_source)
-		.context("Failed to parse markdown docs outline")?;
-
 	// generate markdown
 	struct OutputFile {
 		filename: String,
 		content: String,
 	}
-	let doc_files = markdown_structure
-		.files
-		.into_iter()
-		.map(|doc_file| {
-			let elements = doc_file
+	let doc_files = DOC_OUTLINE
+		.iter()
+		.map(|(name, doc_section)| {
+			let elements = doc_section
 				.elements
 				.iter()
 				.map(|element| match element {
-					MdDocElement::Heading { heading, text } => {
-						Ok(format!("{} {}", "#".repeat((heading + 1) as usize), text))
-					}
-					MdDocElement::DocFragment { fragment_id } => {
+					DocElement::Heading1(text) => Ok(format!("## {}", text)),
+					DocElement::DocFragment(fragment_id) => {
 						if let Some(fragment) = cli_doc_fragments
 							.iter()
 							.find(|fragment| fragment.id == *fragment_id)
 						{
-							used_doc_fragments.insert(fragment_id.clone());
+							used_doc_fragments.insert(fragment.id.clone());
 							Ok(fragment.content.to_string())
 						} else {
 							Err(anyhow::anyhow!(
@@ -77,7 +117,7 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 							))
 						}
 					}
-					MdDocElement::CommandHelp { command } => {
+					DocElement::CommandHelp(command) => {
 						if let Some(command) = commands.find_subcommand_mut(command) {
 							used_commands.insert(command.get_name().to_string());
 							Ok(format!("```\n{}\n```", command.render_long_help()))
@@ -91,10 +131,10 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 				})
 				.collect::<Result<Vec<String>>>()?;
 			let mut markdown_content = String::new();
-			markdown_content.push_str(&format!("# {}\n\n", doc_file.title));
+			markdown_content.push_str(&format!("# {}\n\n", doc_section.title));
 			markdown_content.push_str(&elements.join("\n\n"));
 			Ok(OutputFile {
-				filename: doc_file.filename,
+				filename: format!("{}.md", name),
 				content: markdown_content,
 			})
 		})
@@ -103,17 +143,19 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 	// write markdown files
 	let output_dir = PathBuf::from("filen-cli-markdown-docs");
 	std::fs::create_dir_all(&output_dir).context("Failed to create markdown docs output dir")?;
-	for doc_file in doc_files {
-		std::fs::write(output_dir.join(doc_file.filename.clone()), doc_file.content).with_context(
-			|| format!("Failed to write markdown doc file '{}'", doc_file.filename),
-		)?;
+	for doc_file in &doc_files {
+		std::fs::write(
+			output_dir.join(doc_file.filename.clone()),
+			doc_file.content.clone(),
+		)
+		.with_context(|| format!("Failed to write markdown doc file '{}'", doc_file.filename))?;
 	}
 
 	// ensure that all doc fragments and commands were used
 	let unused_doc_fragments = cli_doc_fragments
 		.iter()
 		.map(|fragment| &fragment.id)
-		.filter(|id| !used_doc_fragments.contains(*id))
+		.filter(|id| !used_doc_fragments.contains(id.as_str()))
 		.collect::<Vec<&String>>();
 	if !unused_doc_fragments.is_empty() {
 		return Err(anyhow::anyhow!(
@@ -134,4 +176,21 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 	}
 
 	Ok(())
+}
+
+// in-app docs
+
+pub(crate) fn print_in_app_docs(ui: &mut UI, command_or_topic: String) {
+	if let Some(doc_fragment) = get_cli_doc_fragments()
+		.iter()
+		.find(|fragment| fragment.id == command_or_topic)
+	{
+		// doc fragment
+		ui.print(&doc_fragment.content);
+	} else if let Some(command) = CliArgs::command().find_subcommand_mut(&command_or_topic) {
+		// command help
+		ui.print(&format!("{}", command.render_long_help()));
+	} else {
+		ui.print_failure(&format!("No help found for '{}'", command_or_topic));
+	}
 }
