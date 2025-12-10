@@ -21,4 +21,8 @@ pub enum WalkError {
 	InvalidName(PathBuf),
 	#[error("encrypted metadata could not be read for UUID {0}")]
 	EncryptedMeta(Uuid),
+	#[error("Error {0} occured during remote walk")]
+	RemoteError(crate::Error),
+	#[error("Multiple entries with the same path {0} were detected, these entries were skipped")]
+	DuplicateName(String),
 }

@@ -7,6 +7,7 @@ use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use filen_types::traits::CowHelpers;
 use futures::TryFutureExt;
+use rand::Rng;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
@@ -207,22 +208,18 @@ impl Client {
 		.await
 	}
 
-	pub async fn list_dir_recursive(
+	async fn inner_list_dir_recursive<Fut>(
 		&self,
-		dir: &dyn HasContents,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
-		let response = api::v3::dir::download::post(
-			self.client(),
-			&api::v3::dir::download::Request {
-				uuid: dir.uuid_as_parent(),
-				skip_cache: false,
-			},
-		)
-		.await?;
-
+		inner_func: Fut,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		Fut: Future<Output = Result<api::v3::dir::download::Response<'static>, Error>>,
+	{
+		let response = inner_func.await?;
 		let crypter = self.crypter();
 
-		do_cpu_intensive(|| {
+		let time = std::time::Instant::now();
+		let res = do_cpu_intensive(|| {
 			let (dirs, files) = blocking_join!(
 				|| response
 					.dirs
@@ -263,7 +260,67 @@ impl Client {
 					})
 					.collect::<Result<Vec<_>, _>>()
 			);
-			Ok((dirs, files?))
+			Ok::<_, Error>((dirs, files?))
+		})
+		.await?;
+		let file_name = res.1[rand::rng().random_range(0..res.1.len())].name();
+		let dir_name = res.0[rand::rng().random_range(0..res.0.len())].name();
+		log::info!(
+			"decrypting {} dirs and {} files took {:.2} s",
+			res.0.len(),
+			res.1.len(),
+			time.elapsed().as_secs_f64()
+		);
+		println!(
+			"sample decrypted dir name: {:?}, sample decrypted file name: {:?}",
+			dir_name, file_name
+		);
+		Ok(res)
+	}
+
+	pub(crate) async fn list_dir_recursive_no_callback(
+		&self,
+		dir: &dyn HasContents,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
+		self.inner_list_dir_recursive(async {
+			api::v3::dir::download::post(
+				self.client(),
+				&api::v3::dir::download::Request {
+					uuid: dir.uuid_as_parent(),
+					skip_cache: false,
+				},
+			)
+			.await
+		})
+		.await
+	}
+
+	/// Recursively lists all directories and files inside the given directory.
+	///
+	/// This might take a long time and use a lot of memory (>1GiB) for large directories.
+	/// Since the entire directory structure needs to be held in memory while decrypting,
+	/// this function might fail with an Out Of Memory error on platforms with limited memory,
+	/// such as WASM.
+	///
+	/// The progress callback receives the number of bytes downloaded so far and the total number of bytes to download, if known.
+	pub async fn list_dir_recursive<F>(
+		&self,
+		dir: &dyn HasContents,
+		progress_callback: &mut F,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: FnMut(u64, Option<u64>),
+	{
+		self.inner_list_dir_recursive(async {
+			api::v3::dir::download::post_large(
+				self.client(),
+				&api::v3::dir::download::Request {
+					uuid: dir.uuid_as_parent(),
+					skip_cache: false,
+				},
+				progress_callback,
+			)
+			.await
 		})
 		.await
 	}

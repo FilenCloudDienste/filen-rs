@@ -103,25 +103,25 @@ impl JsClient {
 		self.list_dir_inner_wasm(ParentUuid::Trash).await
 	}
 
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
-	)]
-	pub async fn list_dir_recursive(&self, dir: DirEnum) -> Result<DirsAndFiles, Error> {
-		let this = self.inner();
-		let (dirs, files) = do_on_commander(move || async move {
-			this.list_dir_recursive(&UnsharedDirectoryType::from(dir))
-				.await
-				.map(|(dirs, files)| {
-					(
-						dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
-						files.into_iter().map(File::from).collect::<Vec<_>>(),
-					)
-				})
-		})
-		.await?;
-		Ok(DirsAndFiles { dirs, files })
-	}
+	// #[cfg_attr(
+	// 	all(target_family = "wasm", target_os = "unknown"),
+	// 	wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
+	// )]
+	// pub async fn list_dir_recursive(&self, dir: DirEnum) -> Result<DirsAndFiles, Error> {
+	// 	let this = self.inner();
+	// 	let (dirs, files) = do_on_commander(move || async move {
+	// 		this.list_dir_recursive(&UnsharedDirectoryType::from(dir))
+	// 			.await
+	// 			.map(|(dirs, files)| {
+	// 				(
+	// 					dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+	// 					files.into_iter().map(File::from).collect::<Vec<_>>(),
+	// 				)
+	// 			})
+	// 	})
+	// 	.await?;
+	// 	Ok(DirsAndFiles { dirs, files })
+	// }
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),

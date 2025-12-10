@@ -352,7 +352,7 @@ impl Client {
 			},
 			async move {
 				if let NonRootFSObject::Dir(dir) = item {
-					let (dirs, files) = self.list_dir_recursive(dir.as_ref()).await?;
+					let (dirs, files) = self.list_dir_recursive_no_callback(dir.as_ref()).await?;
 					Ok(std::iter::once(NonRootFSObject::Dir(dir))
 						.chain(dirs.into_iter().map(Into::into))
 						.chain(files.into_iter().map(Into::into))
@@ -429,9 +429,16 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn public_link_dir(&self, dir: &RemoteDirectory) -> Result<DirPublicLink, Error> {
+	pub async fn public_link_dir<F>(
+		&self,
+		dir: &RemoteDirectory,
+		progress_callback: &mut F,
+	) -> Result<DirPublicLink, Error>
+	where
+		F: FnMut(u64, Option<u64>),
+	{
 		let public_link = DirPublicLink::new(self.make_meta_key());
-		let (dirs, files) = self.list_dir_recursive(dir).await?;
+		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
 			link_key: self
@@ -776,12 +783,16 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn share_dir(
+	pub async fn share_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
 		client: &Contact<'_>,
-	) -> Result<(), Error> {
-		let (dirs, files) = self.list_dir_recursive(dir).await?;
+		progress_callback: &mut F,
+	) -> Result<(), Error>
+	where
+		F: Fn(u64, Option<u64>),
+	{
+		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
 
 		let shared_user = client.into();
 		let shared_user = &shared_user;

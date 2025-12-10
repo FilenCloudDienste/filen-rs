@@ -47,6 +47,7 @@ impl From<filen_types::error::ConversionError> for Error {
 }
 impl_from!(std::io::Error, ErrorKind::IO);
 impl_from!(serde_json::Error, ErrorKind::Response);
+impl_from!(rmp_serde::decode::Error, ErrorKind::Response);
 impl_from!(ImageError, ErrorKind::ImageError);
 #[cfg(feature = "heif-decoder")]
 impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
@@ -97,6 +98,9 @@ pub enum ErrorKind {
 	BadRecoveryKey,
 	/// Internal logic error
 	Internal,
+	/// Not enough memory to complete the operation
+	/// might be returned by WASM targets when parsing a large response (eg dir/download)
+	InsufficientMemory,
 }
 
 /// Custom error type for the SDK

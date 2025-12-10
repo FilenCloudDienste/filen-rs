@@ -6,26 +6,26 @@ use string_interner::DefaultSymbol;
 use super::WalkError;
 
 pub(super) trait DFSWalkerEntry {
-	type WalkerDirEntry<'a>: DFSWalkerDirEntry
-	where
-		Self: 'a;
-	type WalkerFileEntry<'a>: DFSWalkerFileEntry
-	where
-		Self: 'a;
+	type WalkerDirEntry: DFSWalkerDirEntry;
+	type WalkerFileEntry: DFSWalkerFileEntry;
+	type CompareStrategy: CompareStrategy<
+			<Self::WalkerDirEntry as DFSWalkerDirEntry>::Extra,
+			<Self::WalkerFileEntry as DFSWalkerFileEntry>::Extra,
+		>;
 	fn depth(&self) -> usize;
 	fn name(&self) -> Result<&str, WalkError>;
-	fn entry_type<'a>(&'a self) -> EntryType<Self::WalkerDirEntry<'a>, Self::WalkerFileEntry<'a>>;
+	fn into_entry_type(self) -> EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry>;
 }
 
 pub(super) trait DFSWalkerFileEntry {
-	type Extra: Copy + Clone + 'static;
-	fn into_extra_data(self) -> Result<Self::Extra, WalkError>;
+	type Extra: Clone + 'static;
+	fn into_extra_data(self) -> Self::Extra;
 	fn size(&self) -> Result<u64, WalkError>;
 }
 
 pub(super) trait DFSWalkerDirEntry {
-	type Extra: Copy + Clone + 'static;
-	fn into_extra_data(self) -> Result<Self::Extra, WalkError>;
+	type Extra: Clone + 'static;
+	fn into_extra_data(self) -> Self::Extra;
 }
 
 pub(super) enum EntryType<D, F> {
@@ -47,6 +47,10 @@ impl<Extra> FileEntry<Extra> {
 	pub(crate) fn new(name: DefaultSymbol, extra_data: Extra) -> Self {
 		Self { name, extra_data }
 	}
+
+	pub(crate) fn extra_data(&self) -> &Extra {
+		&self.extra_data
+	}
 }
 
 impl<Extra> EntryName for FileEntry<Extra> {
@@ -58,6 +62,12 @@ impl<Extra> EntryName for FileEntry<Extra> {
 pub(super) struct UnfinalizedDirEntry<Extra> {
 	name: DefaultSymbol,
 	extra_data: Extra,
+}
+
+impl<Extra> EntryName for UnfinalizedDirEntry<Extra> {
+	fn name(&self) -> DefaultSymbol {
+		self.name
+	}
 }
 
 impl<Extra> UnfinalizedDirEntry<Extra> {
@@ -83,6 +93,10 @@ impl<Extra> DirEntry<Extra> {
 			children_info,
 			extra_data: unfinalized.extra_data,
 		}
+	}
+
+	pub(crate) fn extra_data(&self) -> &Extra {
+		&self.extra_data
 	}
 }
 
@@ -117,6 +131,10 @@ impl DirChildrenInfo {
 		let end = start + self.num_children as usize;
 		start..end
 	}
+
+	pub(super) fn into_num_children(self) -> u32 {
+		self.num_children
+	}
 }
 
 #[derive(Debug)]
@@ -132,6 +150,12 @@ impl<DirExtra, FileExtra> EntryName for Entry<DirExtra, FileExtra> {
 			Entry::Dir(d) => d.name(),
 		}
 	}
+}
+
+/// Trait for deciding which node wins in a name conflict.
+pub(crate) trait CompareStrategy<D, F> {
+	/// Returns `true` if `new` should replace `existing`.
+	fn should_replace(existing: &Entry<D, F>, new: &Entry<D, F>) -> bool;
 }
 
 pub(super) enum UnfinalizedEntry<DirExtra, FileExtra> {

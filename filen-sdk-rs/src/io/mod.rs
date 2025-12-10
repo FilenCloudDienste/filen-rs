@@ -1,6 +1,8 @@
 pub mod client_impl;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod dir_download;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod dir_upload;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod fs_tree;

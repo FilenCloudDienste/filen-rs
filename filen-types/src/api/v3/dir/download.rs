@@ -49,8 +49,10 @@ pub struct File<'a> {
 	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::maybe_float_u64")]
 	pub chunks: u64,
 	pub size: EncryptedString<'a>,
+	#[serde(with = "crate::serde::number::maybe_float_u64")]
 	pub chunks_size: u64,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,

@@ -47,6 +47,7 @@ pub enum ParentUuid {
 	Favorites,
 	Links,
 }
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_PARENT_UUID: &'static str =
@@ -167,7 +168,7 @@ mod uuid {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)
 	)]
-	const TS_PARENT_UUID: &'static str =
+	const TS_PARENT_UUID: &'stac str =
 		r#"export type UuidStr = `${string}-${string}-${string}-${string}`;"#;
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]

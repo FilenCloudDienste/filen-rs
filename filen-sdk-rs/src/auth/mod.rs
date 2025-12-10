@@ -251,6 +251,7 @@ pub struct Client {
 	pub(crate) chats_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 	pub(crate) auth_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 
+	pub(crate) max_parallel_requests: usize,
 	pub(crate) api_semaphore: tokio::sync::Semaphore,
 	pub(crate) memory_semaphore: tokio::sync::Semaphore,
 	pub open_file_semaphore: tokio::sync::Semaphore,
@@ -357,6 +358,11 @@ impl Client {
 
 		let http_client = Arc::new(AuthClient::new(APIKey(Cow::Owned(stringified.api_key))));
 
+		let parallel_requests = stringified
+			.max_parallel_requests
+			.map(|v| usize::try_from(v).unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS))
+			.unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS);
+
 		Ok(Client {
 			email: stringified.email,
 			user_id: stringified.user_id,
@@ -372,14 +378,8 @@ impl Client {
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
 			auth_lock: tokio::sync::RwLock::new(None),
-			api_semaphore: tokio::sync::Semaphore::new(
-				stringified
-					.max_parallel_requests
-					.map(|v| {
-						usize::try_from(v).unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS)
-					})
-					.unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
-			),
+			max_parallel_requests: parallel_requests,
+			api_semaphore: tokio::sync::Semaphore::new(parallel_requests),
 			memory_semaphore: tokio::sync::Semaphore::new(
 				stringified
 					.max_io_memory_usage
@@ -616,6 +616,7 @@ impl Client {
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
 			auth_lock: tokio::sync::RwLock::new(None),
+			max_parallel_requests: crate::consts::MAX_SMALL_PARALLEL_REQUESTS,
 			api_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_SMALL_PARALLEL_REQUESTS),
 			memory_semaphore: tokio::sync::Semaphore::new(
 				crate::consts::MAX_DEFAULT_MEMORY_USAGE_TARGET,

@@ -32,3 +32,29 @@ pub use error::{Error, ErrorKind};
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+struct TrackingAllocator;
+
+unsafe impl GlobalAlloc for TrackingAllocator {
+	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+		ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+		unsafe { System.alloc(layout) }
+	}
+
+	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+		ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
+		unsafe { System.dealloc(ptr, layout) }
+	}
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+pub fn current_allocation() -> usize {
+	ALLOCATED.load(Ordering::Relaxed)
+}

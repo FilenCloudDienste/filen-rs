@@ -220,6 +220,9 @@ pub struct RemoteFile {
 	pub chunks: u64,
 }
 
+const SIZE_OF: usize = std::mem::size_of::<RemoteFile>();
+const SIZE_OF_UUIDSTR: usize = std::mem::size_of::<UuidStr>();
+
 impl PartialEq<BaseFile> for RemoteFile {
 	fn eq(&self, other: &BaseFile) -> bool {
 		self.uuid == other.uuid()

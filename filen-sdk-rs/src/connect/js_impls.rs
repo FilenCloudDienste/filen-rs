@@ -242,15 +242,19 @@ pub struct SharedDirsAndFiles {
 impl JsClient {
 	// Public Links
 
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkDir")
-	)]
-	pub async fn public_link_dir(&self, dir: Dir) -> Result<DirPublicLink, Error> {
-		let this = self.inner();
-		runtime::do_on_commander(move || async move { this.public_link_dir(&dir.into()).await })
-			.await
-	}
+	// #[cfg_attr(
+	// 	all(target_family = "wasm", target_os = "unknown"),
+	// 	wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkDir")
+	// )]
+	// pub async fn public_link_dir(&self, dir: Dir) -> Result<DirPublicLink, Error> {
+	// 	todo!("add callback support")
+	// 	let this = self.inner();
+	// 	runtime::do_on_commander(move || async move {
+	// 		this.public_link_dir::<fn(u64, Option<u64>)>(&dir.into(), None)
+	// 			.await
+	// 	})
+	// 	.await
+	// }
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -495,15 +499,18 @@ impl JsClient {
 
 	// Sharing
 
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "shareDir")
-	)]
-	pub async fn share_dir(&self, dir: Dir, contact: Contact) -> Result<(), Error> {
-		let this = self.inner();
-		do_on_commander(move || async move { this.share_dir(&dir.into(), &contact.into()).await })
-			.await
-	}
+	// #[cfg_attr(
+	// 	all(target_family = "wasm", target_os = "unknown"),
+	// 	wasm_bindgen::prelude::wasm_bindgen(js_name = "shareDir")
+	// )]
+	// pub async fn share_dir(&self, dir: Dir, contact: Contact) -> Result<(), Error> {
+	// 	let this = self.inner();
+	// 	do_on_commander(move || async move {
+	// 		this.share_dir::<fn(u64, Option<u64>)>(&dir.into(), &contact.into(), None)
+	// 			.await
+	// 	})
+	// 	.await
+	// }
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),

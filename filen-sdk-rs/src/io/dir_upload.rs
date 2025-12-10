@@ -44,6 +44,7 @@ pub trait DirUploadCallback: Send + Sync {
 	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>);
 }
 
+// todo, accept &impl HasUuidContents instead of RemoteDirectory for target_folder
 impl Client {
 	// this could definitely be optimized further, but for now it works
 	pub(crate) async fn upload_fs_tree_from_path_into_target(
@@ -57,15 +58,6 @@ impl Client {
 		target_folder: &RemoteDirectory,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
-		let fs_root = match tree.root() {
-			Entry::File(_) => {
-				return Err(Error::custom(
-					ErrorKind::IO,
-					"upload_folder_from_path_into_target: root path is a file",
-				));
-			}
-			Entry::Dir(dir_entry) => dir_entry,
-		};
 
 		let (file_upload_result_sender, mut file_upload_result_receiver) =
 			tokio::sync::mpsc::channel::<FileUploadResult>(16);
@@ -88,7 +80,7 @@ impl Client {
 		dir_upload_result_sender
 			.send(DirUploadResult(
 				// have to clone here
-				Ok((target_folder.clone(), fs_root.children_info())),
+				Ok((target_folder.clone(), tree.root_children())),
 				path,
 			))
 			.await
