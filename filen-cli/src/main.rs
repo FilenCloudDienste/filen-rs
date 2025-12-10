@@ -14,7 +14,7 @@ use log::{LevelFilter, info};
 
 use crate::{
 	commands::{Commands, execute_command},
-	docs::generate_markdown_docs,
+	docs::{generate_markdown_docs, print_in_app_docs},
 	ui::CustomLogger,
 	updater::check_for_updates,
 	util::RemotePath,
@@ -30,8 +30,17 @@ mod util;
 mod docs;
 
 #[derive(Debug, Parser)]
-#[clap(name = "Filen CLI", version)]
+#[clap(
+	name = "Filen CLI",
+	version,
+	disable_help_flag = true,
+	disable_help_subcommand = true
+)]
 pub(crate) struct CliArgs {
+	/// Print help about a command or topic
+	#[arg(short, long, num_args = 0..=1, default_missing_value = "main", hide = true)]
+	help: Option<String>,
+
 	/// Increase verbosity (-v, -vv, -vvv)
 	#[arg(short, long, action = clap::ArgAction::Count)]
 	verbose: u8,
@@ -135,6 +144,7 @@ async fn inner_main() -> Result<()> {
 
 	let mut ui = ui::UI::new(cli_args.quiet, None);
 
+	// --export-markdown-docs
 	if cli_args.export_markdown_docs {
 		#[cfg(feature = "docs")]
 		{
@@ -147,6 +157,12 @@ async fn inner_main() -> Result<()> {
 			log::error!("Cannot export markdown docs: feature 'docs' not enabled");
 			return Err(anyhow::anyhow!("Feature 'docs' not enabled"));
 		}
+	}
+
+	// --help
+	if let Some(help_topic) = cli_args.help {
+		print_in_app_docs(&mut ui, help_topic);
+		return Ok(());
 	}
 
 	if !cli_args.skip_update {

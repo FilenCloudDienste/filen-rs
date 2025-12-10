@@ -14,12 +14,16 @@ use filen_types::fs::ParentUuid;
 use crate::{
 	CliConfig, CommandResult,
 	auth::{LazyClient, export_auth_config},
+	docs::print_in_app_docs,
 	ui::{self, UI},
 	util::RemotePath,
 };
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+	/// Print help about a command or topic (default: general help)
+	#[clap(hide = true)]
+	Help { command_or_topic: Option<String> },
 	/// Change the working directory (in REPL)
 	Cd { directory: String },
 	/// List files in a directory
@@ -98,6 +102,7 @@ pub(crate) enum Commands {
 	/// Exit the REPL
 	Exit,
 }
+// (!) every command needs to be mentioned in the docs outline
 
 pub(crate) async fn execute_command(
 	config: &CliConfig,
@@ -107,6 +112,10 @@ pub(crate) async fn execute_command(
 	command: Commands,
 ) -> Result<CommandResult> {
 	let result: Option<CommandResult> = match command {
+		Commands::Help { command_or_topic } => {
+			print_in_app_docs(ui, command_or_topic.unwrap_or("main".to_string()));
+			None
+		}
 		Commands::Cd { directory } => {
 			let working_path = working_path.navigate(&directory);
 			Some(CommandResult {
