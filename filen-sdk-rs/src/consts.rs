@@ -2,7 +2,8 @@ use std::{num::NonZeroU32, time::Duration};
 
 use filen_types::auth::{AuthVersion, FileEncryptionVersion, MetaEncryptionVersion};
 
-pub const GATEWAY_URLS: [&str; 8] = [
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+const GATEWAY_URLS: [&str; 8] = [
 	"https://gateway.filen.io",
 	"https://gateway.filen.net",
 	"https://gateway.filen-1.net",
@@ -13,7 +14,8 @@ pub const GATEWAY_URLS: [&str; 8] = [
 	"https://gateway.filen-6.net",
 ];
 
-pub const EGEST_URLS: [&str; 8] = [
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+const EGEST_URLS: [&str; 8] = [
 	"https://egest.filen.io",
 	"https://egest.filen.net",
 	"https://egest.filen-1.net",
@@ -24,7 +26,8 @@ pub const EGEST_URLS: [&str; 8] = [
 	"https://egest.filen-6.net",
 ];
 
-pub const INGEST_URLS: [&str; 8] = [
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+const INGEST_URLS: [&str; 8] = [
 	"https://ingest.filen.io",
 	"https://ingest.filen.net",
 	"https://ingest.filen-1.net",
@@ -35,20 +38,38 @@ pub const INGEST_URLS: [&str; 8] = [
 	"https://ingest.filen-6.net",
 ];
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub fn random_gateway_url() -> &'static str {
 	GATEWAY_URLS[rand::random_range(0..GATEWAY_URLS.len())]
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub fn random_gateway_url() -> &'static str {
+	"https://gateway.filen.io"
 }
 
 pub fn gateway_url(path: &str) -> String {
 	format!("{}/{}", random_gateway_url(), path)
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub fn random_egest_url() -> &'static str {
 	EGEST_URLS[rand::random_range(0..EGEST_URLS.len())]
 }
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub fn random_egest_url() -> &'static str {
+	"https://egest.filen.io"
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub fn random_ingest_url() -> &'static str {
 	INGEST_URLS[rand::random_range(0..INGEST_URLS.len())]
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub fn random_ingest_url() -> &'static str {
+	"https://ingest.filen.io"
 }
 
 pub const V2FILE_ENCRYPTION_VERSION: FileEncryptionVersion = FileEncryptionVersion::V2;
