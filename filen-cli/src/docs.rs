@@ -6,7 +6,7 @@
 //! The doc fragments are doc comments in the source code marked with
 //! `[cli-doc] <fragment-id>`, right next to the code they document.
 
-use std::{collections::HashMap, collections::HashSet, path::PathBuf, sync::LazyLock};
+use std::{collections::HashSet, path::PathBuf, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use clap::CommandFactory;
@@ -32,174 +32,167 @@ enum ParsedDocElement {
 
 #[derive(Debug)]
 struct DocSection {
+	id: &'static str,
 	title: &'static str,
 	elements: Vec<DocElement>,
 }
 
 #[derive(Debug)]
 struct ParsedDocSection {
+	id: String,
 	title: String,
 	elements: Vec<ParsedDocElement>,
 }
 
-static PARSED_DOC_OUTLINE: LazyLock<Result<HashMap<&'static str, ParsedDocSection>>> =
-	LazyLock::new(|| {
-		let doc_outline = HashMap::from([
-			(
-				"usage",
-				DocSection {
-					title: "Usage",
-					elements: vec![
-						DocElement::DocFragment("main-usage"),
-						DocElement::CommandHelp("help"),
-						DocElement::CommandHelp("exit"),
-						DocElement::Heading1("Updates"),
-						DocElement::DocFragment("updates"),
-						DocElement::Heading1("Mounting"),
-						DocElement::CommandHelp("mount"),
-					],
-				},
-			),
-			(
-				"auth",
-				DocSection {
-					title: "Authentication",
-					elements: vec![
-						DocElement::DocFragment("auth-methods"),
-						DocElement::CommandHelp("export-auth-config"),
-						DocElement::CommandHelp("logout"),
-					],
-				},
-			),
-			(
-				"access-files",
-				DocSection {
-					title: "Accessing Files",
-					elements: vec![
-						DocElement::CommandHelp("cd"),
-						DocElement::CommandHelp("ls"),
-						DocElement::CommandHelp("cat"),
-						DocElement::CommandHelp("head"),
-						DocElement::CommandHelp("tail"),
-						DocElement::CommandHelp("stat"),
-						DocElement::CommandHelp("mkdir"),
-						DocElement::CommandHelp("rm"),
-						DocElement::CommandHelp("mv"),
-						DocElement::CommandHelp("cp"),
-						DocElement::CommandHelp("favorite"),
-						DocElement::CommandHelp("unfavorite"),
-						DocElement::CommandHelp("list-trash"),
-						DocElement::CommandHelp("empty-trash"),
-					],
-				},
-			),
-		]);
+static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::new(|| {
+	let doc_outline = [
+		DocSection {
+			id: "usage",
+			title: "Usage",
+			elements: vec![
+				DocElement::DocFragment("main-usage"),
+				DocElement::CommandHelp("help"),
+				DocElement::CommandHelp("exit"),
+				DocElement::Heading1("Updates"),
+				DocElement::DocFragment("updates"),
+				DocElement::Heading1("Mounting"),
+				DocElement::CommandHelp("mount"),
+			],
+		},
+		DocSection {
+			id: "auth",
+			title: "Authentication",
+			elements: vec![
+				DocElement::DocFragment("auth-methods"),
+				DocElement::CommandHelp("export-auth-config"),
+				DocElement::CommandHelp("logout"),
+			],
+		},
+		DocSection {
+			id: "access-files",
+			title: "Accessing Files",
+			elements: vec![
+				DocElement::CommandHelp("cd"),
+				DocElement::CommandHelp("ls"),
+				DocElement::CommandHelp("cat"),
+				DocElement::CommandHelp("head"),
+				DocElement::CommandHelp("tail"),
+				DocElement::CommandHelp("stat"),
+				DocElement::CommandHelp("mkdir"),
+				DocElement::CommandHelp("rm"),
+				DocElement::CommandHelp("mv"),
+				DocElement::CommandHelp("cp"),
+				DocElement::CommandHelp("favorite"),
+				DocElement::CommandHelp("unfavorite"),
+				DocElement::CommandHelp("list-trash"),
+				DocElement::CommandHelp("empty-trash"),
+			],
+		},
+	];
 
-		// parse doc elements
-		let mut commands = CliArgs::command();
-		let mut used_commands = HashSet::new();
-		let cli_doc_fragments = get_cli_doc_fragments();
-		let mut used_doc_fragments = HashSet::new();
-		let parsed_outline = doc_outline
-			.iter()
-			.map(|(name, section)| {
-				let parsed_elements = section
-					.elements
-					.iter()
-					.map(|element| match element {
-						DocElement::Heading1(text) => Ok(ParsedDocElement::Heading1 {
-							text: text.to_string(),
-						}),
-						DocElement::DocFragment(fragment_id) => {
-							if let Some(fragment) = cli_doc_fragments
-								.iter()
-								.find(|fragment| fragment.id == *fragment_id)
-							{
-								used_doc_fragments.insert(fragment.id.clone());
-								Ok(ParsedDocElement::DocFragment {
-									text: fragment.content.to_string(),
-								})
-							} else {
-								Err(anyhow::anyhow!(
-									"Doc fragment with id '{}' not found",
-									fragment_id
-								))
-							}
+	// parse doc elements
+	let mut commands = CliArgs::command();
+	let mut used_commands = HashSet::new();
+	let cli_doc_fragments = get_cli_doc_fragments();
+	let mut used_doc_fragments = HashSet::new();
+	let parsed_outline = doc_outline
+		.iter()
+		.map(|section| {
+			let parsed_elements = section
+				.elements
+				.iter()
+				.map(|element| match element {
+					DocElement::Heading1(text) => Ok(ParsedDocElement::Heading1 {
+						text: text.to_string(),
+					}),
+					DocElement::DocFragment(fragment_id) => {
+						if let Some(fragment) = cli_doc_fragments
+							.iter()
+							.find(|fragment| fragment.id == *fragment_id)
+						{
+							used_doc_fragments.insert(fragment.id.clone());
+							Ok(ParsedDocElement::DocFragment {
+								text: fragment.content.to_string(),
+							})
+						} else {
+							Err(anyhow::anyhow!(
+								"Doc fragment with id '{}' not found",
+								fragment_id
+							))
 						}
-						DocElement::CommandHelp(command) => {
-							if let Some(command) = commands.find_subcommand_mut(command) {
-								used_commands.insert(command.get_name().to_string());
-								Ok(ParsedDocElement::CommandHelp {
-									command: Box::new(command.clone()),
-								})
-							} else {
-								Err(anyhow::anyhow!(
-									"Command '{}' not found in CLI structure",
-									command
-								))
-							}
+					}
+					DocElement::CommandHelp(command) => {
+						if let Some(command) = commands.find_subcommand_mut(command) {
+							used_commands.insert(command.get_name().to_string());
+							Ok(ParsedDocElement::CommandHelp {
+								command: Box::new(command.clone()),
+							})
+						} else {
+							Err(anyhow::anyhow!(
+								"Command '{}' not found in CLI structure",
+								command
+							))
 						}
-					})
-					.collect::<Result<Vec<ParsedDocElement>>>()
-					.with_context(|| {
-						format!("Failed to parse doc elements for section '{}'", name)
-					})?;
-				Ok((
-					*name,
-					ParsedDocSection {
-						title: section.title.to_string(),
-						elements: parsed_elements,
-					},
-				))
+					}
+				})
+				.collect::<Result<Vec<ParsedDocElement>>>()
+				.with_context(|| {
+					format!("Failed to parse doc elements for section '{}'", section.id)
+				})?;
+			Ok(ParsedDocSection {
+				id: section.id.to_string(),
+				title: section.title.to_string(),
+				elements: parsed_elements,
 			})
-			.collect::<Result<HashMap<&'static str, ParsedDocSection>>>();
+		})
+		.collect::<Result<Vec<ParsedDocSection>>>()?;
 
-		// ensure that all doc fragments and commands were used
-		let unused_doc_fragments = cli_doc_fragments
-			.iter()
-			.map(|fragment| &fragment.id)
-			.filter(|id| !used_doc_fragments.contains(id.as_str()))
-			.collect::<Vec<&String>>();
-		if !unused_doc_fragments.is_empty() {
-			return Err(anyhow::anyhow!(
-				"Some CLI doc fragments were not used in the markdown docs: {:?}",
-				unused_doc_fragments
-			));
-		}
-		let unused_commands = commands
-			.get_subcommands()
-			.map(|cmd| cmd.get_name().to_string())
-			.filter(|name| !used_commands.contains(name))
-			.collect::<Vec<String>>();
-		if !unused_commands.is_empty() {
-			return Err(anyhow::anyhow!(
-				"Some CLI commands were not documented in the markdown docs: {:?}",
-				unused_commands
-			));
-		}
+	// ensure that all doc fragments and commands were used
+	let unused_doc_fragments = cli_doc_fragments
+		.iter()
+		.map(|fragment| &fragment.id)
+		.filter(|id| !used_doc_fragments.contains(id.as_str()))
+		.collect::<Vec<&String>>();
+	if !unused_doc_fragments.is_empty() {
+		return Err(anyhow::anyhow!(
+			"Some CLI doc fragments were not used in the markdown docs: {:?}",
+			unused_doc_fragments
+		));
+	}
+	let unused_commands = commands
+		.get_subcommands()
+		.map(|cmd| cmd.get_name().to_string())
+		.filter(|name| !used_commands.contains(name))
+		.collect::<Vec<String>>();
+	if !unused_commands.is_empty() {
+		return Err(anyhow::anyhow!(
+			"Some CLI commands were not documented in the markdown docs: {:?}",
+			unused_commands
+		));
+	}
 
-		// ensure ids are unique among sections, doc fragments and commands
-		let mut ids = doc_outline
-			.iter()
-			.flat_map(|(section_id, section)| {
-				let mut ids = vec![*section_id];
-				ids.extend(section.elements.iter().filter_map(|element| match element {
-					DocElement::DocFragment(fragment_id) => Some(*fragment_id),
-					DocElement::CommandHelp(command_id) => Some(*command_id),
-					_ => None,
-				}));
-				ids
-			})
-			.collect::<Vec<&'static str>>();
-		ids.sort();
-		for i in 1..ids.len() {
-			if ids[i] == ids[i - 1] {
-				return Err(anyhow::anyhow!("Duplicate doc id found: '{}'", ids[i]));
-			}
+	// ensure ids are unique among sections, doc fragments and commands
+	let mut ids = doc_outline
+		.iter()
+		.flat_map(|section| {
+			let mut ids = vec![section.id];
+			ids.extend(section.elements.iter().filter_map(|element| match element {
+				DocElement::DocFragment(fragment_id) => Some(fragment_id),
+				DocElement::CommandHelp(command_id) => Some(command_id),
+				_ => None,
+			}));
+			ids
+		})
+		.collect::<Vec<&'static str>>();
+	ids.sort();
+	for i in 1..ids.len() {
+		if ids[i] == ids[i - 1] {
+			return Err(anyhow::anyhow!("Duplicate doc id found: '{}'", ids[i]));
 		}
+	}
 
-		parsed_outline
-	});
+	Ok(parsed_outline)
+});
 // todo: also specify here where global flags are documented?
 
 // markdown docs
@@ -212,7 +205,8 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 		.as_ref()
 		.map_err(|e| anyhow::anyhow!("Failed to parse CLI doc outline: {}", e))?
 		.iter()
-		.try_for_each(|(title, section)| {
+		.enumerate()
+		.try_for_each(|(i, section)| {
 			let elements = section
 				.elements
 				.iter()
@@ -228,8 +222,11 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 			markdown_content.push_str(&format!("# {}\n\n", section.title));
 			markdown_content.push_str(&elements.join("\n\n"));
 
-			std::fs::write(output_dir.join(format!("{}.md", title)), markdown_content)
-				.with_context(|| format!("Failed to write markdown doc file '{}'", title))
+			std::fs::write(
+				output_dir.join(format!("{:02}-{}.md", i, section.id)), // todo: is this how Docusaurus wants it?
+				markdown_content,
+			)
+			.with_context(|| format!("Failed to write markdown doc file '{}'", section.id))
 		})?;
 
 	Ok(())
@@ -246,7 +243,7 @@ pub(crate) fn print_in_app_docs(
 		.as_ref()
 		.map_err(|e| anyhow::anyhow!("Failed to parse CLI doc outline: {}", e))?;
 	let command_or_topic = section_or_command_or_topic.unwrap_or(String::from(MAIN_SECTION));
-	if let Some(section) = parsed_doc_outline.get(command_or_topic.as_str()) {
+	if let Some(section) = parsed_doc_outline.iter().find(|s| s.id == command_or_topic) {
 		// doc section
 		ui.print(&UI::format_text_heading(&section.title));
 		ui.print("");
@@ -271,13 +268,13 @@ pub(crate) fn print_in_app_docs(
 			ui.print(
 				&parsed_doc_outline
 					.iter()
-					.filter_map(|(id, section)| {
-						if *id != MAIN_SECTION {
+					.filter_map(|section| {
+						if section.id != MAIN_SECTION {
 							Some(format!(
 								"{}  {} {}",
 								dialoguer::console::style(&section.title).underlined(),
 								dialoguer::console::style("→").dim(),
-								dialoguer::console::style(format!("help {}", id)).green()
+								dialoguer::console::style(format!("help {}", section.id)).green()
 							))
 						} else {
 							None
