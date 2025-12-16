@@ -178,6 +178,26 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<HashMap<&'static str, ParsedDocSectio
 			));
 		}
 
+		// ensure ids are unique among sections, doc fragments and commands
+		let mut ids = doc_outline
+			.iter()
+			.flat_map(|(section_id, section)| {
+				let mut ids = vec![*section_id];
+				ids.extend(section.elements.iter().filter_map(|element| match element {
+					DocElement::DocFragment(fragment_id) => Some(*fragment_id),
+					DocElement::CommandHelp(command_id) => Some(*command_id),
+					_ => None,
+				}));
+				ids
+			})
+			.collect::<Vec<&'static str>>();
+		ids.sort();
+		for i in 1..ids.len() {
+			if ids[i] == ids[i - 1] {
+				return Err(anyhow::anyhow!("Duplicate doc id found: '{}'", ids[i]));
+			}
+		}
+
 		parsed_outline
 	});
 // todo: also specify here where global flags are documented?
