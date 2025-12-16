@@ -1,4 +1,4 @@
-//! [cli-doc] auth
+//! [cli-doc] auth-methods
 //! There are multiple ways to authenticate:
 //! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)
 //! - specify an auth config via the `--auth-config-path` flag

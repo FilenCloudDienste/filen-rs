@@ -1,4 +1,4 @@
-//! [cli-doc] main
+//! [cli-doc] main-usage
 //!
 //! Welcome to the Filen CLI!
 //!
