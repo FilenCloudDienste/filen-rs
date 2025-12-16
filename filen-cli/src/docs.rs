@@ -9,7 +9,7 @@
 use std::{collections::HashSet, path::PathBuf, sync::LazyLock};
 
 use anyhow::{Context, Result};
-use clap::CommandFactory;
+use clap::{CommandFactory, builder::Styles};
 use filen_macros::extract_cli_doc_fragments;
 
 use crate::{CliArgs, ui::UI};
@@ -214,7 +214,7 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 					ParsedDocElement::Heading1 { text } => format!("## {}", text),
 					ParsedDocElement::DocFragment { text } => text.to_string(),
 					ParsedDocElement::CommandHelp { command } => {
-						format!("```\n{}\n```", command.clone().render_long_help().ansi())
+						format_markdown_command_help(&mut command.clone())
 					}
 				})
 				.collect::<Vec<String>>();
@@ -230,6 +230,50 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 		})?;
 
 	Ok(())
+}
+
+fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
+	let render_help_text_template = |template: &'static str| {
+		cmd.clone()
+			.styles(
+				Styles::styled()
+					.literal(anstyle::Style::new())
+					.header(anstyle::Style::new())
+					.usage(anstyle::Style::new()),
+			)
+			.help_template(template)
+			.render_help()
+			.to_string()
+	};
+	let usage = render_help_text_template("{usage}");
+	let about = render_help_text_template("{about}");
+	let args = render_help_text_template("{positionals}\n{options}")
+		.lines()
+		.map(|l| {
+			let parts = l
+				.trim()
+				.split("  ")
+				.map(|part| part.trim())
+				.filter(|part| !part.is_empty())
+				.collect::<Vec<&str>>();
+			if parts.len() == 2 {
+				format!("🠊 `{}` {}", parts[0], parts[1])
+			} else {
+				log::warn!(
+					"Unexpected args line format: '{}' for command '{}' (maybe it misses a description)",
+					l,
+					cmd.get_name()
+				);
+				format!("🠊 {}", l.trim())
+			}
+		})
+		.collect::<Vec<_>>();
+	format!(
+		"> `{}`  \n> {}  \n> {}",
+		usage.trim(),
+		about.trim(),
+		args.join("  \n> ")
+	)
 }
 
 // in-app docs

@@ -23,7 +23,10 @@ use crate::{
 pub(crate) enum Commands {
 	/// Print help about a command or topic (default: general help)
 	#[clap(hide = true)]
-	Help { command_or_topic: Option<String> },
+	Help {
+		/// Command or topic to show help about
+		command_or_topic: Option<String>,
+	},
 	/// Change the working directory (in REPL)
 	Cd {
 		/// Directory to navigate into (supports "..")
@@ -35,7 +38,10 @@ pub(crate) enum Commands {
 		directory: Option<String>,
 	},
 	/// Print the contents of a file
-	Cat { file: String },
+	Cat {
+		/// File to print
+		file: String,
+	},
 	/// Print the first lines of a file
 	Head {
 		/// File to print
@@ -101,7 +107,10 @@ pub(crate) enum Commands {
 	/// Export an auth config (to be used with --auth-config-path option)
 	ExportAuthConfig,
 	/// Mount Filen as a network drive
-	Mount { mount_point: Option<String> },
+	Mount {
+		/// Where to mount the network drive (default: system default)
+		mount_point: Option<String>,
+	},
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
