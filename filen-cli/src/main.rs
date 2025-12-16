@@ -38,7 +38,7 @@ mod docs;
 )]
 pub(crate) struct CliArgs {
 	/// Print help about a command or topic
-	#[arg(short, long, num_args = 0..=1, default_missing_value = "main", hide = true)]
+	#[arg(short, long, num_args = 0..=1, default_missing_value = "", hide = true)]
 	help: Option<String>,
 
 	/// Increase verbosity (-v, -vv, -vvv)
@@ -161,7 +161,16 @@ async fn inner_main() -> Result<()> {
 
 	// --help
 	if let Some(help_topic) = cli_args.help {
-		print_in_app_docs(&mut ui, help_topic);
+		if let Err(e) = print_in_app_docs(
+			&mut ui,
+			if help_topic.is_empty() {
+				None
+			} else {
+				Some(help_topic)
+			},
+		) {
+			ui.print_failure_or_error(&e);
+		}
 		return Ok(());
 	}
 

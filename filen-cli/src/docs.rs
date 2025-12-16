@@ -27,7 +27,7 @@ enum DocElement {
 enum ParsedDocElement {
 	Heading1 { text: String },
 	DocFragment { text: String },
-	CommandHelp { help_text: String },
+	CommandHelp { command: Box<clap::Command> },
 }
 
 #[derive(Debug)]
@@ -130,7 +130,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<HashMap<&'static str, ParsedDocSectio
 							if let Some(command) = commands.find_subcommand_mut(command) {
 								used_commands.insert(command.get_name().to_string());
 								Ok(ParsedDocElement::CommandHelp {
-									help_text: format!("{}", command.render_long_help()),
+									command: Box::new(command.clone()),
 								})
 							} else {
 								Err(anyhow::anyhow!(
@@ -199,8 +199,8 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 				.map(|element| match element {
 					ParsedDocElement::Heading1 { text } => format!("## {}", text),
 					ParsedDocElement::DocFragment { text } => text.to_string(),
-					ParsedDocElement::CommandHelp { help_text } => {
-						format!("```\n{}\n```", help_text)
+					ParsedDocElement::CommandHelp { command } => {
+						format!("```\n{}\n```", command.clone().render_long_help().ansi())
 					}
 				})
 				.collect::<Vec<String>>();
@@ -217,8 +217,57 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 
 // in-app docs
 
-pub(crate) fn print_in_app_docs(ui: &mut UI, command_or_topic: String) {
-	if let Some(doc_fragment) = get_cli_doc_fragments()
+pub(crate) fn print_in_app_docs(
+	ui: &mut UI,
+	section_or_command_or_topic: Option<String>,
+) -> Result<()> {
+	const MAIN_SECTION: &str = "usage";
+	let parsed_doc_outline = PARSED_DOC_OUTLINE
+		.as_ref()
+		.map_err(|e| anyhow::anyhow!("Failed to parse CLI doc outline: {}", e))?;
+	let command_or_topic = section_or_command_or_topic.unwrap_or(String::from(MAIN_SECTION));
+	if let Some(section) = parsed_doc_outline.get(command_or_topic.as_str()) {
+		// doc section
+		ui.print(&UI::format_text_heading(&section.title));
+		ui.print("");
+		let elements = section
+			.elements
+			.iter()
+			.map(|element| match element {
+				ParsedDocElement::Heading1 { text } => UI::format_text_heading(text),
+				ParsedDocElement::DocFragment { text } => text.to_string(),
+				ParsedDocElement::CommandHelp { command } => {
+					UI::format_text_blockquote(&UI::format_command_help(&mut command.clone()))
+				}
+			})
+			.collect::<Vec<String>>();
+		ui.print(&elements.join("\n\n"));
+
+		// print table of contents for main section
+		if command_or_topic == MAIN_SECTION {
+			ui.print("");
+			ui.print(&UI::format_text_heading("More help topics"));
+			ui.print("");
+			ui.print(
+				&parsed_doc_outline
+					.iter()
+					.filter_map(|(id, section)| {
+						if *id != MAIN_SECTION {
+							Some(format!(
+								"{}  {} {}",
+								dialoguer::console::style(&section.title).underlined(),
+								dialoguer::console::style("→").dim(),
+								dialoguer::console::style(format!("help {}", id)).green()
+							))
+						} else {
+							None
+						}
+					})
+					.collect::<Vec<String>>()
+					.join("\n"),
+			);
+		}
+	} else if let Some(doc_fragment) = get_cli_doc_fragments()
 		.iter()
 		.find(|fragment| fragment.id == command_or_topic)
 	{
@@ -226,8 +275,10 @@ pub(crate) fn print_in_app_docs(ui: &mut UI, command_or_topic: String) {
 		ui.print(&doc_fragment.content);
 	} else if let Some(command) = CliArgs::command().find_subcommand_mut(&command_or_topic) {
 		// command help
-		ui.print(&format!("{}", command.render_long_help()));
+		ui.print(&UI::format_command_help(&mut command.clone()));
 	} else {
 		ui.print_failure(&format!("No help found for '{}'", command_or_topic));
 	}
+
+	Ok(())
 }
