@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clap::builder::Styles;
 use dialoguer::console::style;
 use log::{error, info};
 use tiny_gradient::{GradientStr, RGB};
@@ -253,6 +254,50 @@ impl UI {
 			.interact()
 			.context("Failed to read confirmation prompt")?;
 		Ok(result)
+	}
+
+	// format help text
+
+	pub(crate) fn format_command_help(cmd: &mut clap::Command) -> String {
+		let styled_str = cmd
+			.clone()
+			.styles(
+				Styles::styled()
+					.literal(anstyle::AnsiColor::Green.on_default())
+					.placeholder(anstyle::AnsiColor::Green.on_default())
+					.context(anstyle::Style::new().dimmed())
+					.header(anstyle::AnsiColor::Yellow.on_default()),
+			)
+			.help_template("{positionals}\n{options}")
+			.render_help();
+		let formatted_usage = cmd
+			.clone()
+			.styles(Styles::styled().literal(anstyle::AnsiColor::Green.on_default().underline()))
+			.help_template("{usage}\n{about}")
+			.render_help();
+		format!(
+			"{}{}",
+			//style("◊").green().bold().bright(),
+			formatted_usage.ansi(),
+			styled_str
+				.ansi()
+				.to_string()
+				.lines()
+				.map(|l| format!("{} {}", style("→").dim(), l.trim()))
+				.collect::<Vec<_>>()
+				.join("\n")
+		)
+	}
+
+	pub(crate) fn format_text_blockquote(text: &str) -> String {
+		text.lines()
+			.map(|l| format!("┃ {}", l))
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	pub(crate) fn format_text_heading(text: &str) -> String {
+		style(text).bold().underlined().to_string()
 	}
 }
 

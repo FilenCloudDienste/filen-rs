@@ -25,7 +25,10 @@ pub(crate) enum Commands {
 	#[clap(hide = true)]
 	Help { command_or_topic: Option<String> },
 	/// Change the working directory (in REPL)
-	Cd { directory: String },
+	Cd {
+		/// Directory to navigate into (supports "..")
+		directory: String,
+	},
 	/// List files in a directory
 	Ls {
 		/// Directory to list files in (default: the current working directory)
@@ -35,6 +38,7 @@ pub(crate) enum Commands {
 	Cat { file: String },
 	/// Print the first lines of a file
 	Head {
+		/// File to print
 		file: String,
 		/// Number of lines to print
 		#[arg(short = 'n', long, default_value_t = 10)]
@@ -42,6 +46,7 @@ pub(crate) enum Commands {
 	},
 	/// Print the last lines of a file
 	Tail {
+		/// File to print
 		file: String,
 		/// Number of lines to print
 		#[arg(short = 'n', long, default_value_t = 10)]
@@ -113,7 +118,7 @@ pub(crate) async fn execute_command(
 ) -> Result<CommandResult> {
 	let result: Option<CommandResult> = match command {
 		Commands::Help { command_or_topic } => {
-			print_in_app_docs(ui, command_or_topic.unwrap_or("main".to_string()));
+			print_in_app_docs(ui, command_or_topic)?;
 			None
 		}
 		Commands::Cd { directory } => {
