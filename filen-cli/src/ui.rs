@@ -294,6 +294,7 @@ impl UI {
 				.ansi()
 				.to_string()
 				.lines()
+				.filter(|l| !l.contains("--help")) // filter out help flag line that is erraneously included by clap
 				.map(|l| format!("{} {}", style("→").dim(), l.trim()))
 				.collect::<Vec<_>>()
 				.join("\n")
