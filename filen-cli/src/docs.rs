@@ -249,6 +249,7 @@ fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
 	let about = render_help_text_template("{about}");
 	let args = render_help_text_template("{positionals}\n{options}")
 		.lines()
+		.filter(|l| !l.contains("--help")) // filter out help flag line that is erraneously included by clap
 		.map(|l| {
 			let parts = l
 				.trim()
@@ -257,22 +258,22 @@ fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
 				.filter(|part| !part.is_empty())
 				.collect::<Vec<&str>>();
 			if parts.len() == 2 {
-				format!("🠊 `{}` {}", parts[0], parts[1])
+				format!("  \n> 🠊 `{}` {}", parts[0], parts[1])
 			} else {
 				log::warn!(
 					"Unexpected args line format: '{}' for command '{}' (maybe it misses a description)",
 					l,
 					cmd.get_name()
 				);
-				format!("🠊 {}", l.trim())
+				format!("  \n> 🠊 {}", l.trim())
 			}
 		})
 		.collect::<Vec<_>>();
 	format!(
-		"> `{}`  \n> {}  \n> {}",
+		"> `{}`  \n> {}{}",
 		usage.trim(),
 		about.trim(),
-		args.join("  \n> ")
+		args.join("")
 	)
 }
 

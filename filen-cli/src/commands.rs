@@ -22,7 +22,6 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
 	/// Print help about a command or topic (default: general help)
-	#[clap(hide = true)]
 	Help {
 		/// Command or topic to show help about
 		command_or_topic: Option<String>,
