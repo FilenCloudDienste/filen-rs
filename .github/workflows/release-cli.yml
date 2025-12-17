@@ -12,7 +12,7 @@ permissions:
 
 on:
   push:
-    branches: ["main", "test-cli-releases"] # todo: remove tmp "test-cli-releases" branch
+    branches: ["*"]
 
 jobs:
   tag:
@@ -167,6 +167,15 @@ jobs:
             console.log("\n\nModified Readme:\n" + readme);
             fs.writeFileSync("filen-cli/README.md", readme);
 
+      # generate markdown docs
+      - name: Generate markdown docs
+        run: cargo run -- --export-markdown-docs exit
+        working-directory: ./filen-cli
+      - name: Zip markdown docs
+        run: |
+          mkdir -p filen-cli-markdown-docs
+          zip -j filen-cli-markdown-docs/filen-cli-$version-docs.zip filen-cli/filen-cli-markdown-docs/*.md
+
       # copy artifacts
       - name: Download build artifacts
         uses: actions/download-artifact@v5
@@ -184,7 +193,9 @@ jobs:
           repository: FilenCloudDienste/filen-cli-releases
           name: Filen CLI v${{ needs.tag.outputs.version }}
           tag_name: ${{ needs.tag.outputs.version }}
-          files: artifacts/**
+          files: |
+            artifacts/**
+            filen-cli-markdown-docs/**
           body_path: filen-cli/release_notes.md
           prerelease: true
       - name: Copy Readme to target repository
