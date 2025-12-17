@@ -1,4 +1,9 @@
-use std::{borrow::Cow, cmp::min, time::Duration};
+use std::{
+	borrow::Cow,
+	cmp::min,
+	sync::atomic::{AtomicU64, AtomicUsize},
+	time::Duration,
+};
 
 use bytes::Bytes;
 use filen_types::{api::response::FilenResponse, error::ResponseError};
@@ -6,10 +11,11 @@ use futures::StreamExt;
 use reqwest::RequestBuilder;
 
 use crate::{
-	ErrorKind,
+	ErrorKind, GLOBAL_PARALLEL_REQUESTS,
 	auth::http::{AuthorizedClient, UnauthorizedClient},
 	consts::{CALLBACK_INTERVAL, gateway_url},
 	error::{Error, ErrorExt, ResultExt},
+	util::{MaybeSend, MaybeSendCallback},
 };
 
 pub(crate) mod download;
@@ -101,13 +107,24 @@ pub(crate) async fn retry_wrap<T>(
 		// fortunately cloning it is allocation free
 		// cloning a new request builder is not free
 		// which is why we use a closure rather than cloning.
-		let time = std::time::Instant::now();
-		let resp = match request_builder_fn()
+		let current = GLOBAL_PARALLEL_REQUESTS
+			.get_or_init(|| std::sync::Arc::new(AtomicUsize::new(0)))
+			.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+		crate::PEAK_PARALLEL_REQUESTS
+			.get_or_init(|| std::sync::Arc::new(AtomicUsize::new(0)))
+			.fetch_max(current, std::sync::atomic::Ordering::Relaxed);
+		let resp = request_builder_fn()
 			.timeout(Duration::from_secs(300))
 			.body(body_bytes.clone())
 			.send()
-			.await
-		{
+			.await;
+
+		GLOBAL_PARALLEL_REQUESTS
+			.get_or_init(|| std::sync::Arc::new(AtomicUsize::new(0)))
+			.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+		let resp = match resp {
 			Ok(resp) => resp,
 			Err(e) if e.is_timeout() => {
 				log::warn!("Request to {endpoint} timed out");
@@ -142,11 +159,6 @@ pub(crate) async fn retry_wrap<T>(
 				return Err(e.with_context(endpoint));
 			}
 		};
-
-		log::info!(
-			"Request to {endpoint} took {:.2} s",
-			time.elapsed().as_secs_f64()
-		);
 
 		match response_handler(resp).await {
 			Ok(data) => return Ok(data),
@@ -208,17 +220,16 @@ where
 	.await
 }
 
-pub(crate) async fn handle_large_request<U, F>(
+pub(crate) async fn handle_large_request<U>(
 	body_bytes: Bytes,
 	request_builder_fn: impl Fn() -> RequestBuilder,
 	endpoint: &'static str,
 	attempts: usize,
 	max_retry_time: Duration,
-	progress_callback: &mut F,
+	progress_callback: Option<MaybeSendCallback<'_, (u64, Option<u64>)>>,
 ) -> Result<FilenResponse<'static, U>, Error>
 where
 	U: serde::de::DeserializeOwned,
-	F: FnMut(u64, Option<u64>),
 {
 	large_retry_wrap(
 		body_bytes,
@@ -256,12 +267,16 @@ where
 				})?;
 
 				body_bytes.extend_from_slice(&chunk);
-				if last_update_time.elapsed() >= CALLBACK_INTERVAL {
-					progress_callback(body_bytes.len() as u64, real_content_length);
+				if last_update_time.elapsed() >= CALLBACK_INTERVAL
+					&& let Some(progress_callback) = &progress_callback
+				{
+					progress_callback((body_bytes.len() as u64, real_content_length));
 					last_update_time = std::time::Instant::now();
 				}
 			}
-			progress_callback(body_bytes.len() as u64, real_content_length);
+			if let Some(progress_callback) = &progress_callback {
+				progress_callback((body_bytes.len() as u64, real_content_length));
+			}
 
 			let body = match rmp_serde::from_slice::<FilenResponse<U>>(&body_bytes) {
 				Ok(body) => body,
@@ -408,16 +423,15 @@ where
 	.context(endpoint)
 }
 
-pub(crate) async fn post_large_auth_request<T, U, F>(
+pub(crate) async fn post_large_auth_request<T, U>(
 	client: impl AuthorizedClient,
 	request: &T,
 	endpoint: &'static str,
-	callback: &mut F,
+	callback: Option<MaybeSendCallback<'_, (u64, Option<u64>)>>,
 ) -> Result<U, Error>
 where
 	T: serde::Serialize,
 	U: serde::de::DeserializeOwned + std::fmt::Debug,
-	F: FnMut(u64, Option<u64>),
 {
 	let _permit = client.get_semaphore_permit().await;
 	handle_large_request(
@@ -436,6 +450,10 @@ where
 	.await?
 	.into_data()
 	.context(endpoint)
+}
+
+fn send_fut<F: Future + Send>(fut: F) -> impl Future<Output = F::Output> + Send {
+	fut
 }
 
 pub(crate) async fn post_auth_request<T, U>(

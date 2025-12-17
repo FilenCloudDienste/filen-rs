@@ -29,7 +29,7 @@ use crate::{
 		file::{RemoteFile, meta::FileMeta},
 	},
 	runtime::{blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture},
+	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 pub mod contacts;
@@ -432,11 +432,8 @@ impl Client {
 	pub async fn public_link_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
-		progress_callback: &mut F,
-	) -> Result<DirPublicLink, Error>
-	where
-		F: FnMut(u64, Option<u64>),
-	{
+		progress_callback: MaybeSendCallback<'_, (u64, Option<u64>)>,
+	) -> Result<DirPublicLink, Error> {
 		let public_link = DirPublicLink::new(self.make_meta_key());
 		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
 		let link = ListedPublicLink {
@@ -787,11 +784,8 @@ impl Client {
 		&self,
 		dir: &RemoteDirectory,
 		client: &Contact<'_>,
-		progress_callback: &mut F,
-	) -> Result<(), Error>
-	where
-		F: Fn(u64, Option<u64>),
-	{
+		progress_callback: MaybeSendCallback<'_, (u64, Option<u64>)>,
+	) -> Result<(), Error> {
 		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
 
 		let shared_user = client.into();

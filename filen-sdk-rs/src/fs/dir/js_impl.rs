@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
 	Error,
 	auth::JsClient,
@@ -31,6 +33,16 @@ impl JsClient {
 		.await?;
 		Ok(DirsAndFiles { dirs, files })
 	}
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export(with_foreign)]
+pub trait ListDirRecursiveCallback: Send + Sync {
+	fn on_request_progress(&self, downloaded_bytes: u64, total_bytes: Option<u64>);
+}
+
+fn send_fut<F: Future + Send>(fut: F) -> impl Future<Output = F::Output> + Send {
+	fut
 }
 
 #[cfg_attr(
@@ -103,25 +115,37 @@ impl JsClient {
 		self.list_dir_inner_wasm(ParentUuid::Trash).await
 	}
 
-	// #[cfg_attr(
-	// 	all(target_family = "wasm", target_os = "unknown"),
-	// 	wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
-	// )]
-	// pub async fn list_dir_recursive(&self, dir: DirEnum) -> Result<DirsAndFiles, Error> {
-	// 	let this = self.inner();
-	// 	let (dirs, files) = do_on_commander(move || async move {
-	// 		this.list_dir_recursive(&UnsharedDirectoryType::from(dir))
-	// 			.await
-	// 			.map(|(dirs, files)| {
-	// 				(
-	// 					dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
-	// 					files.into_iter().map(File::from).collect::<Vec<_>>(),
-	// 				)
-	// 			})
-	// 	})
-	// 	.await?;
-	// 	Ok(DirsAndFiles { dirs, files })
-	// }
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
+	)]
+	pub async fn list_dir_recursive(
+		&self,
+		dir: DirEnum,
+		callback: Arc<dyn ListDirRecursiveCallback>,
+	) -> Result<DirsAndFiles, Error> {
+		let this = self.inner();
+		let (dirs, files) = do_on_commander(move || async move {
+			this.list_dir_recursive(
+				&UnsharedDirectoryType::from(dir),
+				Arc::new(|(downloaded, total)| {
+					let callback = Arc::clone(&callback);
+					tokio::spawn(async move {
+						callback.on_request_progress(downloaded, total);
+					});
+				}),
+			)
+			.await
+			.map(|(dirs, files)| {
+				(
+					dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+					files.into_iter().map(File::from).collect::<Vec<_>>(),
+				)
+			})
+		})
+		.await?;
+		Ok(DirsAndFiles { dirs, files })
+	}
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),

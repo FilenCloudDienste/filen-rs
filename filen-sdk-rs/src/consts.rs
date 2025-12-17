@@ -85,7 +85,7 @@ pub const FILE_CHUNK_SIZE_EXTRA_USIZE: usize = FILE_CHUNK_SIZE_EXTRA.get() as us
 pub(crate) const MAX_SMALL_PARALLEL_REQUESTS: usize = 64;
 #[cfg(not(target_os = "ios"))]
 pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
-	(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 4; // 4 full Chunks
+	(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 16; // 4 full Chunks
 #[cfg(target_os = "ios")]
 pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
 	(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 2; // 4 full Chunks

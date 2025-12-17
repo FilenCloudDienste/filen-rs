@@ -1,7 +1,6 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, hash_map},
-	marker::PhantomData,
 	path::{Path, PathBuf},
 	sync::atomic::AtomicBool,
 };
@@ -10,13 +9,7 @@ use string_interner::{DefaultBackend, StringInterner};
 
 use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL};
 
-use super::{
-	WalkError,
-	entry::{
-		CompareStrategy, DFSWalkerDirEntry, DFSWalkerEntry, DFSWalkerFileEntry, DirChildrenInfo,
-		DirEntry, Entry, EntryName, EntryType, FileEntry, UnfinalizedDirEntry,
-	},
-};
+use super::{WalkError, entry::*};
 
 pub(super) mod local;
 pub(super) mod remote;
@@ -115,13 +108,8 @@ impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
 	}
 }
 
-pub(crate) struct FSTreeDFSIterator<'a, DirExtra, FileExtra> {
-	stack: Vec<LevelState>,
-	tree: &'a FSTree<DirExtra, FileExtra>,
-}
-
 impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
-	type Item = (&'a Entry<DirExtra, FileExtra>, PathBuf); // entry and depth
+	type Item = (&'a Entry<DirExtra, FileExtra>, PathBuf); // entry and path
 
 	fn next(&mut self) -> Option<Self::Item> {
 		let Some(next_index) = self.stack.last_mut()?.next_index() else {
@@ -143,6 +131,11 @@ impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIteratorWithPath<'a, DirExtr
 	}
 }
 
+pub(crate) struct FSTreeDFSIterator<'a, DirExtra, FileExtra> {
+	stack: Vec<LevelState>,
+	tree: &'a FSTree<DirExtra, FileExtra>,
+}
+
 impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIterator<'a, DirExtra, FileExtra> {
 	type Item = (&'a Entry<DirExtra, FileExtra>, usize); // entry and depth
 
@@ -154,6 +147,7 @@ impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIterator<'a, DirExtra, FileE
 		};
 
 		let entry = &self.tree.entries[next_index];
+		let depth = self.stack.len() - 1;
 
 		if let Entry::Dir(dir_entry) = entry {
 			let children_info = dir_entry.children_info();
@@ -161,7 +155,7 @@ impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIterator<'a, DirExtra, FileE
 				.push(LevelState::from_dir_children_info(children_info));
 		}
 
-		Some((entry, self.stack.len()))
+		Some((entry, depth))
 	}
 }
 
@@ -183,6 +177,8 @@ fn build_fs_tree<DFSE>(
 ) -> Result<(FSTreeForDFSE<DFSE>, FSStats), Error>
 where
 	DFSE: DFSWalkerEntry,
+	<<DFSE as DFSWalkerEntry>::WalkerDirEntry as DFSWalkerDirEntry>::Extra: std::fmt::Debug,
+	<<DFSE as DFSWalkerEntry>::WalkerFileEntry as DFSWalkerFileEntry>::Extra: std::fmt::Debug,
 {
 	let mut builder = FSTreeBuilder::new();
 
@@ -214,19 +210,6 @@ where
 	println!("Finalizing FS tree...");
 	Ok((fs_tree, stats))
 }
-
-// type AncestorStack<DirExtra, FileExtra> = Vec<(
-// 	UnfinalizedDirEntry<DirExtra>,
-// 	Vec<Entry<DirExtra, FileExtra>>,
-// )>;
-
-// struct AncestorStack<DirExtra, FileExtra> {
-// 	entries: Vec<(
-// 		UnfinalizedDirEntry<DirExtra>,
-// 		Vec<Entry<DirExtra, FileExtra>>,
-// 	)>,
-// 	root_children: Vec<Entry<DirExtra, FileExtra>>,
-// }
 
 type AncestorStackLevel<DirExtra, FileExtra> = (
 	UnfinalizedDirEntry<DirExtra>,
@@ -285,7 +268,11 @@ pub(super) struct FSTreeBuilder<DirExtra, FileExtra> {
 	last_callback: std::time::Instant,
 }
 
-impl<DirExtra, FileExtra> FSTreeBuilder<DirExtra, FileExtra> {
+impl<DirExtra, FileExtra> FSTreeBuilder<DirExtra, FileExtra>
+where
+	DirExtra: Clone + std::fmt::Debug + 'static,
+	FileExtra: Clone + std::fmt::Debug + 'static,
+{
 	pub(super) fn new() -> Self {
 		Self {
 			interner: StringInterner::default(),
@@ -344,6 +331,7 @@ impl<DirExtra, FileExtra> FSTreeBuilder<DirExtra, FileExtra> {
 					.append_to_top_level(Entry::File(FileEntry::new(
 						name_symbol,
 						file.into_extra_data().into(),
+						size,
 					)));
 			}
 			EntryType::Dir(dir) => {
@@ -387,22 +375,51 @@ impl<DirExtra, FileExtra> FSTreeBuilder<DirExtra, FileExtra> {
 		let dir_children = res?.unwrap();
 		self.errors.extend(errors);
 
-		self.interner.shrink_to_fit();
-		self.final_entries.shrink_to_fit();
-
-		// todo!("recalculate stats based on accessible entries");
-
-		let tree = super::FSTree {
+		let first_tree = super::FSTree {
 			interner: self.interner,
 			entries: self.final_entries,
 			root_num_children: dir_children.into_num_children(),
 		};
 
-		let mut files = 0;
-		let mut dirs = 0;
-		let mut bytes = 0;
+		let iter = first_tree.dfs_iter().map(|(entry, depth)| match entry {
+			Entry::Dir(dir) => SecondPassEntry::dir(
+				SecondPassDirEntry::new(first_tree.get_name(dir), dir.extra_data().clone()),
+				depth + 1,
+			),
+			Entry::File(file_entry) => SecondPassEntry::file(
+				SecondPassFileEntry::new(
+					first_tree.get_name(file_entry),
+					file_entry.extra_data().clone(),
+					file_entry.size(),
+				),
+				depth + 1,
+			),
+		});
 
-		Ok((tree, self.stats, std::mem::take(&mut self.errors)))
+		let mut second_pass = Self::new();
+
+		for entry in iter {
+			second_pass
+				.process_entry::<SecondPassEntry<DirExtra, FileExtra>>(Ok(entry))
+				.unwrap();
+		}
+
+		let (res, _) =
+			second_pass.adjust_stack_until_depth::<PanicCompareStrategy<DirExtra, FileExtra>>(0);
+		let dir_children = res.unwrap().unwrap();
+
+		second_pass.interner.shrink_to_fit();
+		second_pass.final_entries.shrink_to_fit();
+
+		let stats = second_pass.stats;
+
+		let final_tree = super::FSTree {
+			interner: second_pass.interner,
+			entries: second_pass.final_entries,
+			root_num_children: dir_children.into_num_children(),
+		};
+
+		Ok((final_tree, stats, std::mem::take(&mut self.errors)))
 	}
 
 	fn adjust_stack_until_depth<C>(
@@ -462,7 +479,11 @@ fn filter_children<DirExtra, FileExtra, C: CompareStrategy<DirExtra, FileExtra>>
 	parent_name: Option<&str>,
 	mut children: Vec<Entry<DirExtra, FileExtra>>,
 	interner: &StringInterner<DefaultBackend>,
-) -> (Vec<Entry<DirExtra, FileExtra>>, Vec<WalkError>) {
+) -> (Vec<Entry<DirExtra, FileExtra>>, Vec<WalkError>)
+where
+	DirExtra: std::fmt::Debug,
+	FileExtra: std::fmt::Debug,
+{
 	let mut by_name: HashMap<_, (_, Vec<_>)> = HashMap::new();
 
 	for child in children.drain(..) {
@@ -520,6 +541,7 @@ fn filter_children<DirExtra, FileExtra, C: CompareStrategy<DirExtra, FileExtra>>
 	(children, errors)
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct FSStats {
 	dirs: u64,
 	files: u64,

@@ -13,6 +13,7 @@ use rayon::iter::ParallelIterator;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::ErrorKind;
+use crate::util::{MaybeSend, MaybeSendCallback, MaybeSendSync};
 use crate::{
 	api,
 	auth::Client,
@@ -283,12 +284,13 @@ impl Client {
 		dir: &dyn HasContents,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		self.inner_list_dir_recursive(async {
-			api::v3::dir::download::post(
+			api::v3::dir::download::post_large(
 				self.client(),
 				&api::v3::dir::download::Request {
 					uuid: dir.uuid_as_parent(),
 					skip_cache: false,
 				},
+				None,
 			)
 			.await
 		})
@@ -303,14 +305,11 @@ impl Client {
 	/// such as WASM.
 	///
 	/// The progress callback receives the number of bytes downloaded so far and the total number of bytes to download, if known.
-	pub async fn list_dir_recursive<F>(
+	pub async fn list_dir_recursive(
 		&self,
 		dir: &dyn HasContents,
-		progress_callback: &mut F,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
-	where
-		F: FnMut(u64, Option<u64>),
-	{
+		progress_callback: MaybeSendCallback<'_, (u64, Option<u64>)>,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		self.inner_list_dir_recursive(async {
 			api::v3::dir::download::post_large(
 				self.client(),
@@ -318,7 +317,7 @@ impl Client {
 					uuid: dir.uuid_as_parent(),
 					skip_cache: false,
 				},
-				progress_callback,
+				Some(progress_callback),
 			)
 			.await
 		})

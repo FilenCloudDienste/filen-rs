@@ -2,6 +2,8 @@ use std::sync::{Arc, atomic::Ordering};
 
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use crate::fs::dir::UnsharedDirectoryType;
 use crate::{
 	Error,
 	auth::Client,
@@ -125,6 +127,52 @@ impl Client {
 
 		self.upload_fs_tree_from_path_into_target(callback, dir_path, &tree, target)
 			.await
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub async fn download_dir_recursively(
+		self: Arc<Self>,
+		dir_path: std::path::PathBuf,
+		callback: &impl super::dir_download::DirDownloadCallback,
+		target: UnsharedDirectoryType<'_>,
+	) -> Result<(), Error> {
+		use filen_types::traits::CowHelpers;
+
+		let drop_canceller = AtomicDropCanceller {
+			cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		};
+
+		let (tree, stats) = super::fs_tree::build_fs_tree_from_remote_iterator(
+			Arc::clone(&self),
+			target.as_borrowed_cow(),
+			&mut |errors| {
+				callback.on_scan_errors(errors);
+			},
+			&mut |dirs, files, bytes| {
+				callback.on_scan_progress(dirs, files, bytes);
+			},
+			&mut |current_bytes, total_bytes| {
+				callback.on_query_download_progress(current_bytes, total_bytes);
+			},
+			&drop_canceller.cancelled,
+		)
+		.await?;
+
+		let (dirs, files, bytes) = stats.snapshot();
+		callback.on_scan_complete(dirs, files, bytes);
+
+		self.download_fs_tree_from_target_into_path(
+			&mut |errors| {
+				callback.on_download_errors(errors);
+			},
+			&mut |downloaded_dirs, downloaded_files, bytes| {
+				callback.on_download_update(downloaded_dirs, downloaded_files, bytes);
+			},
+			dir_path,
+			tree,
+			target.into_owned_cow(),
+		)
+		.await
 	}
 }
 

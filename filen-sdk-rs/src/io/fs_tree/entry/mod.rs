@@ -41,15 +41,24 @@ pub(crate) trait EntryName {
 pub(crate) struct FileEntry<Extra> {
 	name: DefaultSymbol,
 	extra_data: Extra,
+	size: u64,
 }
 
 impl<Extra> FileEntry<Extra> {
-	pub(crate) fn new(name: DefaultSymbol, extra_data: Extra) -> Self {
-		Self { name, extra_data }
+	pub(crate) fn new(name: DefaultSymbol, extra_data: Extra, size: u64) -> Self {
+		Self {
+			name,
+			extra_data,
+			size,
+		}
 	}
 
 	pub(crate) fn extra_data(&self) -> &Extra {
 		&self.extra_data
+	}
+
+	pub(crate) fn size(&self) -> u64 {
+		self.size
 	}
 }
 
@@ -73,6 +82,128 @@ impl<Extra> EntryName for UnfinalizedDirEntry<Extra> {
 impl<Extra> UnfinalizedDirEntry<Extra> {
 	pub(super) fn new(name: DefaultSymbol, extra_data: Extra) -> Self {
 		Self { name, extra_data }
+	}
+}
+
+pub(super) struct SecondPassFileEntry<'a, Extra> {
+	name: &'a str,
+	extra_data: Extra,
+	size: u64,
+}
+
+impl<'a, Extra> SecondPassFileEntry<'a, Extra> {
+	pub(super) fn new(name: &'a str, extra_data: Extra, size: u64) -> Self {
+		Self {
+			name,
+			extra_data,
+			size,
+		}
+	}
+}
+
+pub(super) struct SecondPassDirEntry<'a, DirExtra> {
+	name: &'a str,
+	extra_data: DirExtra,
+}
+
+impl<Extra> DFSWalkerFileEntry for SecondPassFileEntry<'_, Extra>
+where
+	Extra: Clone + 'static,
+{
+	type Extra = Extra;
+
+	fn into_extra_data(self) -> Self::Extra {
+		self.extra_data
+	}
+
+	fn size(&self) -> Result<u64, WalkError> {
+		Ok(self.size)
+	}
+}
+
+impl<'a, DirExtra> SecondPassDirEntry<'a, DirExtra> {
+	pub(super) fn new(name: &'a str, extra_data: DirExtra) -> Self {
+		Self { name, extra_data }
+	}
+}
+
+impl<Extra> DFSWalkerDirEntry for SecondPassDirEntry<'_, Extra>
+where
+	Extra: Clone + 'static,
+{
+	type Extra = Extra;
+
+	fn into_extra_data(self) -> Self::Extra {
+		self.extra_data
+	}
+}
+
+pub(super) struct SecondPassEntry<'a, DirExtra, FileExtra> {
+	inner: SecondPassEntryInner<'a, DirExtra, FileExtra>,
+	depth: usize,
+}
+
+impl<'a, DirExtra, FileExtra> SecondPassEntry<'a, DirExtra, FileExtra> {
+	pub(super) fn file(file: SecondPassFileEntry<'a, FileExtra>, depth: usize) -> Self {
+		Self {
+			inner: SecondPassEntryInner::File(file),
+			depth,
+		}
+	}
+
+	pub(super) fn dir(dir: SecondPassDirEntry<'a, DirExtra>, depth: usize) -> Self {
+		Self {
+			inner: SecondPassEntryInner::Dir(dir),
+			depth,
+		}
+	}
+}
+
+enum SecondPassEntryInner<'a, DirExtra, FileExtra> {
+	Dir(SecondPassDirEntry<'a, DirExtra>),
+	File(SecondPassFileEntry<'a, FileExtra>),
+}
+
+pub(super) struct PanicCompareStrategy<DirExtra, FileExtra>(
+	std::marker::PhantomData<(DirExtra, FileExtra)>,
+);
+
+impl<DirExtra, FileExtra> CompareStrategy<DirExtra, FileExtra>
+	for PanicCompareStrategy<DirExtra, FileExtra>
+{
+	fn should_replace(
+		_existing: &Entry<DirExtra, FileExtra>,
+		_new: &Entry<DirExtra, FileExtra>,
+	) -> bool {
+		panic!("PanicCompareStrategy should never be used to compare entries");
+	}
+}
+
+impl<'a, DirExtra, FileExtra> DFSWalkerEntry for SecondPassEntry<'a, DirExtra, FileExtra>
+where
+	DirExtra: Clone + 'static,
+	FileExtra: Clone + 'static,
+{
+	type WalkerDirEntry = SecondPassDirEntry<'a, DirExtra>;
+	type WalkerFileEntry = SecondPassFileEntry<'a, FileExtra>;
+	type CompareStrategy = PanicCompareStrategy<DirExtra, FileExtra>;
+
+	fn depth(&self) -> usize {
+		self.depth
+	}
+
+	fn name(&self) -> Result<&str, WalkError> {
+		match &self.inner {
+			SecondPassEntryInner::Dir(d) => Ok(d.name),
+			SecondPassEntryInner::File(f) => Ok(f.name),
+		}
+	}
+
+	fn into_entry_type(self) -> EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry> {
+		match self.inner {
+			SecondPassEntryInner::Dir(d) => EntryType::Dir(d),
+			SecondPassEntryInner::File(f) => EntryType::File(f),
+		}
 	}
 }
 
