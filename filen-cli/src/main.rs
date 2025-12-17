@@ -22,12 +22,10 @@ use crate::{
 
 mod auth;
 mod commands;
+mod docs;
 mod ui;
 mod updater;
 mod util;
-
-#[cfg(feature = "docs")]
-mod docs;
 
 #[derive(Debug, Parser)]
 #[clap(
@@ -146,17 +144,9 @@ async fn inner_main() -> Result<()> {
 
 	// --export-markdown-docs
 	if cli_args.export_markdown_docs {
-		#[cfg(feature = "docs")]
-		{
-			generate_markdown_docs().inspect_err(|e| {
-				ui.print_failure_or_error(e);
-			})?;
-		}
-		#[cfg(not(feature = "docs"))]
-		{
-			log::error!("Cannot export markdown docs: feature 'docs' not enabled");
-			return Err(anyhow::anyhow!("Feature 'docs' not enabled"));
-		}
+		generate_markdown_docs().inspect_err(|e| {
+			ui.print_failure_or_error(e);
+		})?;
 	}
 
 	// --help
