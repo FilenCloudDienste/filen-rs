@@ -227,11 +227,11 @@ jobs:
       # push markdown docs to filen-docs
       - name: Copy markdown docs to target repository
         run: |
-          git clone https://x-access-token:${{ secrets.FILEN_BOT_PAT }}@github.com/FilenCloudDienste/filen-docs.git target-repo
-          rm target-repo/docs/cli-rs/*.md
-          cp filen-cli/filen-cli-markdown-docs/*.md target-repo/docs/cli-rs/
-          cp filen-cli/README-for-docs.md target-repo/docs/cli-rs/00-readme.md
-          cd target-repo
+          git clone https://x-access-token:${{ secrets.FILEN_BOT_PAT }}@github.com/FilenCloudDienste/filen-docs.git docs-repo
+          rm docs-repo/docs/cli-rs/*.md
+          cp filen-cli/filen-cli-markdown-docs/*.md docs-repo/docs/cli-rs/
+          cp filen-cli/README-for-docs.md docs-repo/docs/cli-rs/00-readme.md
+          cd docs-repo
           git add docs/cli-rs/*.md
           git config user.name "${{ env.FILEN_BOT_NAME }}"
           git config user.email "${{ env.FILEN_BOT_EMAIL }}"
