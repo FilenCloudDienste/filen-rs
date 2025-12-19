@@ -5,7 +5,8 @@ name: Release Filen CLI
 # Make sure that the version in filen-cli/Cargo.toml matches and
 # that a corresponding changelog entry is found in filen-cli/CHANGELOG.md.
 # A tag will be created like "filen-cli@vX.Y.Z" and a GitHub Release (prerelease) will be created in the release repository.
-# The filen-cli/README.md will be modified according to the "ORIGIN ONLY" and "TARGET ONLY" sections and pushed to the release repository.
+# The filen-cli/README.md will be pushed to the release repository,
+# as well as to the documentation repository along with the generated markdown docs.
 
 permissions:
   contents: write
