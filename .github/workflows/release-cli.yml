@@ -154,18 +154,26 @@ jobs:
           echo filen-cli/release_notes.md
 
       # modify readme
-      - name: Do substitutions in Readme
+      - name: Insert version into Readme
         uses: actions/github-script@v8
         with:
           script: |
             const fs = require("fs");
             let readme = fs.readFileSync("filen-cli/README.md", "utf8");
             console.log("Original Readme:\n" + readme);
-            readme = `<!-- v${process.env.version} -->\n\n${readme}`;
-            readme = readme.replace(/<\!-- START: ORIGIN ONLY([\s\S]*)END: ORIGIN ONLY -->/g, "<!-- (ORIGIN ONLY) -->");
-            readme = readme.replace(/<\!-- START: TARGET ONLY([\s\S]*)END: TARGET ONLY -->/g, "$1");
+            readme = `${readme}\n\n<!-- v${process.env.version} -->`;
             console.log("\n\nModified Readme:\n" + readme);
             fs.writeFileSync("filen-cli/README.md", readme);
+      - name: Insert version footer into Readme for docs
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            let readme = fs.readFileSync("filen-cli/README.md", "utf8");
+            console.log("Original Readme:\n" + readme);
+            readme = `${readme}\n\n<small style={{opacity: 0.5}}>Documentation for Filen CLI **v${process.env.version}**</small>`;
+            console.log("\n\nModified Readme:\n" + readme);
+            fs.writeFileSync("filen-cli/README-for-docs.md", readme);
 
       # generate markdown docs
       - name: Generate markdown docs
@@ -185,7 +193,7 @@ jobs:
       - name: List artifacts
         run: ls -R artifacts
 
-      # create release, push readme
+      # create release
       - name: Create GitHub Release with changelog and assets
         uses: softprops/action-gh-release@v1
         with:
@@ -198,10 +206,12 @@ jobs:
             filen-cli-markdown-docs/**
           body_path: filen-cli/release_notes.md
           prerelease: true
+
+      # push readme to filen-cli-releases
       - name: Copy Readme to target repository
         run: |
           git clone https://x-access-token:${{ secrets.FILEN_BOT_PAT }}@github.com/FilenCloudDienste/filen-cli-releases.git target-repo
-          cp filen-cli/README.md target-repo/
+          cp filen-cli/README.md target-repo/README.md
           cd target-repo
           git add README.md
           git config user.name "${{ env.FILEN_BOT_NAME }}"
@@ -212,3 +222,20 @@ jobs:
           FILEN_BOT_NAME: filen-bot
           FILEN_BOT_EMAIL: 242448422+filen-bot@users.noreply.github.com
           # todo: make these repository env variables
+        
+      # push markdown docs to filen-docs
+      - name: Copy markdown docs to target repository
+        run: |
+          git clone https://x-access-token:${{ secrets.FILEN_BOT_PAT }}@github.com/FilenCloudDienste/filen-docs.git target-repo
+          rm target-repo/docs/cli-rs/*.md
+          cp filen-cli/filen-cli-markdown-docs/*.md target-repo/docs/cli-rs/
+          cp filen-cli/README-for-docs.md target-repo/docs/cli-rs/00-readme.md
+          cd target-repo
+          git add docs/cli-rs/*.md
+          git config user.name "${{ env.FILEN_BOT_NAME }}"
+          git config user.email "${{ env.FILEN_BOT_EMAIL }}"
+          git commit -m "${{ format('update cli-rs docs for filen-cli v{0}', needs.tag.outputs.version) }}"
+          git push origin main
+        env:
+          FILEN_BOT_NAME: filen-bot
+          FILEN_BOT_EMAIL: 242448422+filen-bot@users.noreply.github.com

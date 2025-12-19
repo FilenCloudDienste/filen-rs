@@ -223,7 +223,7 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 			markdown_content.push_str(&elements.join("\n\n"));
 
 			std::fs::write(
-				output_dir.join(format!("{:02}-{}.md", i, section.id)), // todo: is this how Docusaurus wants it?
+				output_dir.join(format!("{:02}-{}.md", i + 1, section.id)),
 				markdown_content,
 			)
 			.with_context(|| format!("Failed to write markdown doc file '{}'", section.id))
