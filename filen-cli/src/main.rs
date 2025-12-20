@@ -68,8 +68,12 @@ pub(crate) struct CliArgs {
 	auth_config_path: Option<String>,
 
 	/// Skip checking for updates
-	#[arg(short, long)]
+	#[arg(long)]
 	skip_update: bool,
+
+	/// Force checking for updates
+	#[arg(long)]
+	force_update_check: bool,
 
 	#[command(subcommand)]
 	command: Option<Commands>,
@@ -93,7 +97,6 @@ async fn main() {
 
 async fn inner_main() -> Result<()> {
 	let cli_args = CliArgs::parse();
-	// todo: add colors and styling to clap help texts
 
 	let is_dev = cfg!(debug_assertions);
 	let config = CliConfig {
@@ -169,7 +172,7 @@ async fn inner_main() -> Result<()> {
 	}
 
 	if !cli_args.skip_update {
-		check_for_updates(&mut ui, &config.config_dir).await?;
+		check_for_updates(&mut ui, cli_args.force_update_check, &config.config_dir).await?;
 	}
 
 	let mut client = auth::LazyClient::new(
@@ -200,10 +203,9 @@ async fn inner_main() -> Result<()> {
 				}
 			}
 			// authenticate, so the username is shown in the prompt.
-			// this essentially defeats the purpose of LazyClient, so maybe scrapping it would be better?
+			// this essentially defeats the purpose of LazyClient, but:
 			// it does make a difference so non-authenticated commands (e.g. logout) can still be run ..
 			// .. without authentication when called directly (no REPL)
-			// todo: improve LazyClient?
 
 			let line = ui.prompt_repl(&working_path.to_string())?;
 			let line = line.trim();

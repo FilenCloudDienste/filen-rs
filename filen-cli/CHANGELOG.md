@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - accept two-factor code in cli args and env variables
 - display global options help in docs
+- `--force-update-check` flag to ignore recent update checks
 
 ## 0.2.1 - 2025-12-19
 

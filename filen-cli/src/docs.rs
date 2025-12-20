@@ -214,7 +214,6 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 
 	Ok(parsed_outline)
 });
-// todo: also specify here where global flags are documented?
 
 // markdown docs
 

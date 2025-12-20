@@ -9,8 +9,6 @@ use tokio::fs;
 
 use crate::ui::UI;
 
-// todo: flag to force update check?
-
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
 
@@ -19,40 +17,52 @@ const LAST_CHECK_VALIDITY: std::time::Duration = std::time::Duration::from_mins(
 /// Checks for updates by querying the GitHub releases API and downloading
 /// and installing the latest release if a newer version is available.
 /// This function skips the update check in debug builds.
+/// It also doesn't check for some time if the last check was recent enough.
 /// If the current executable's name contains the version string, the new
 /// executable will be saved with the updated version in its name, and the
 /// old executable will be deleted. Otherwise, the current executable will
 /// be replaced in place.
-pub(crate) async fn check_for_updates(ui: &mut UI, config_path: &std::path::Path) -> Result<()> {
+pub(crate) async fn check_for_updates(
+	ui: &mut UI,
+	force_update_check: bool,
+	config_path: &std::path::Path,
+) -> Result<()> {
 	if cfg!(debug_assertions) {
 		log::info!("Skipping update check in debug build");
 		return Ok(());
 	}
 
-	let last_checked_config = LastCheckedConfig::new(config_path);
-	let last_checked = match last_checked_config.read().await {
-		Ok(timestamp) => chrono::DateTime::from_timestamp(timestamp, 0)
-			.ok_or(anyhow::anyhow!("Failed to parse timestamp"))?,
-		Err(e) => {
-			log::warn!("Failed to read last update check: {}", e);
-			chrono::DateTime::<chrono::Utc>::MIN_UTC
-		}
-	};
-	if last_checked.timestamp() + LAST_CHECK_VALIDITY.as_secs() as i64
-		> chrono::Utc::now().timestamp()
-	{
-		log::info!(
-			"Skipping update check; last checked at {} UTC",
-			last_checked.format("%Y-%m-%d %H:%M:%S")
-		);
-		return Ok(());
-	} else if last_checked == chrono::DateTime::<chrono::Utc>::MIN_UTC {
-		log::info!("No previous update check found, proceeding with update check");
+	let write_update_check: Option<_>;
+	if force_update_check {
+		log::info!("Update check forced via --force-update-check");
+		write_update_check = None;
 	} else {
-		log::info!(
-			"Last update check at {} UTC, proceeding with update check",
-			last_checked.format("%Y-%m-%d %H:%M:%S")
-		);
+		let last_checked_config = LastCheckedConfig::new(config_path);
+		let last_checked = match last_checked_config.read().await {
+			Ok(timestamp) => chrono::DateTime::from_timestamp(timestamp, 0)
+				.ok_or(anyhow::anyhow!("Failed to parse timestamp"))?,
+			Err(e) => {
+				log::warn!("Failed to read last update check: {}", e);
+				chrono::DateTime::<chrono::Utc>::MIN_UTC
+			}
+		};
+		if last_checked.timestamp() + LAST_CHECK_VALIDITY.as_secs() as i64
+			> chrono::Utc::now().timestamp()
+		{
+			log::info!(
+				"Skipping update check; last checked at {} UTC",
+				last_checked.format("%Y-%m-%d %H:%M:%S")
+			);
+			return Ok(());
+		} else if last_checked == chrono::DateTime::<chrono::Utc>::MIN_UTC {
+			log::info!("No previous update check found, proceeding with update check");
+		} else {
+			log::info!(
+				"Last update check at {} UTC, proceeding with update check",
+				last_checked.format("%Y-%m-%d %H:%M:%S")
+			);
+		}
+		write_update_check = Some(move || async move { last_checked_config.write().await });
 	}
 
 	let github_api = GitHubApiClient::new();
@@ -100,7 +110,10 @@ pub(crate) async fn check_for_updates(ui: &mut UI, config_path: &std::path::Path
 		}
 	}
 
-	last_checked_config.write().await?;
+	if let Some(write_update_check) = write_update_check {
+		write_update_check().await?;
+	}
+
 	Ok(())
 }
 
