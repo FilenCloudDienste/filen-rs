@@ -143,8 +143,14 @@ impl UI {
 	}
 
 	/// Return an error with a user-friendly error message
-	pub(crate) fn failure(msg: &str) -> Result<()> {
-		Err(anyhow::anyhow!("{} {}", style("✘").red(), msg))
+	pub(crate) fn failure_err(msg: &str) -> Result<()> {
+		Err(UI::failure(msg))
+		// todo: don't really use this, be more explicit with an Err(UI::failure(...)) instead
+	}
+
+	/// Return an error with a user-friendly error message
+	pub(crate) fn failure(msg: &str) -> anyhow::Error {
+		anyhow::anyhow!("{} {}", style("✘").red(), msg)
 	}
 
 	/// Print an error or failure message

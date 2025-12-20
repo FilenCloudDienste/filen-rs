@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use dialoguer::console::style;
@@ -8,6 +10,7 @@ use filen_sdk_rs::{
 		dir::{DirectoryType, HasContents},
 		file::{enums::RemoteFileType, traits::HasFileInfo as _},
 	},
+	io::RemoteDirectory,
 };
 use filen_types::fs::ParentUuid;
 
@@ -66,6 +69,9 @@ pub(crate) enum Commands {
 	Mkdir {
 		/// Directory to create
 		directory: String,
+		/// Recursively create parent directories
+		#[arg(short, long)]
+		recursive: bool,
 	},
 	/// Remove a file or directory
 	Rm {
@@ -156,8 +162,11 @@ pub(crate) async fn execute_command(
 			print_file_or_directory_info(ui, client, working_path, &file_or_directory).await?;
 			None
 		}
-		Commands::Mkdir { directory } => {
-			create_directory(ui, client, working_path, &directory).await?;
+		Commands::Mkdir {
+			directory,
+			recursive,
+		} => {
+			create_directory(ui, client, working_path, &directory, recursive).await?;
 			None
 		}
 		Commands::Rm {
@@ -289,13 +298,13 @@ async fn list_directory(
 		.await
 		.context("Failed to find parent directory")?
 	else {
-		return UI::failure(&format!("No such directory: {}", directory_str));
+		return UI::failure_err(&format!("No such directory: {}", directory_str));
 	};
 	let directory = match directory {
 		FSObject::Dir(dir) => DirectoryType::Dir(dir),
 		FSObject::Root(root) => DirectoryType::Root(root),
 		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
-		_ => return UI::failure(&format!("Not a directory: {}", directory_str)),
+		_ => return UI::failure_err(&format!("Not a directory: {}", directory_str)),
 	};
 	list_directory_by_uuid(ui, client, directory.uuid()).await
 	// todo: ls -l flag
@@ -306,7 +315,6 @@ async fn list_directory_by_uuid(
 	client: &Client,
 	directory: &dyn HasContents,
 ) -> Result<()> {
-	dbg!(directory.uuid_as_parent());
 	let items = client
 		.list_dir(directory)
 		.await
@@ -360,12 +368,12 @@ async fn print_file(
 		.await
 		.context("Failed to find cat file")?
 	else {
-		return UI::failure(&format!("No such file: {}", file_str));
+		return UI::failure_err(&format!("No such file: {}", file_str));
 	};
 	let file = match file {
 		FSObject::File(file) => RemoteFileType::File(file),
 		FSObject::SharedFile(file) => RemoteFileType::SharedFile(file),
-		_ => return UI::failure(&format!("Not a file: {}", file_str)),
+		_ => return UI::failure_err(&format!("Not a file: {}", file_str)),
 	};
 	if file.size() < 1024
 		|| ui.prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
@@ -400,7 +408,7 @@ async fn print_file_or_directory_info(
 		.await
 		.context("Failed to find item")?
 	else {
-		return UI::failure(&format!(
+		return UI::failure_err(&format!(
 			"No such file or directory: {}",
 			file_or_directory_str
 		));
@@ -457,7 +465,7 @@ async fn print_file_or_directory_info(
 			]);
 		}
 		FSObject::SharedFile(_) => {
-			return UI::failure("Cannot show information for shared file");
+			return UI::failure_err("Cannot show information for shared file");
 		}
 	}
 	Ok(())
@@ -468,33 +476,54 @@ async fn create_directory(
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	directory_str: &str,
+	recursive: bool,
 ) -> Result<()> {
 	let directory_str = working_path.navigate(directory_str);
 	let parent_str = directory_str.navigate("..");
 	let client = client.get(ui).await?;
 	if parent_str.0 == directory_str.0 {
-		return UI::failure("Cannot create root directory");
+		return UI::failure_err("Cannot create root directory");
 	}
-	let Some(parent) = client
-		.find_item_at_path(&parent_str.0)
-		.await
-		.context("Failed to find parent directory")?
-	else {
-		return UI::failure(&format!("No such parent directory: {}", parent_str));
-	};
-	let parent = match parent {
-		FSObject::Dir(dir) => DirectoryType::Dir(dir),
-		FSObject::Root(root) => DirectoryType::Root(root),
-		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
-		_ => return UI::failure(&format!("Not a directory: {}", parent_str)),
-	};
-	client
-		.create_dir(&parent, directory_str.basename().unwrap().to_string())
-		.await
-		.context("Failed to create directory")?;
+	let _ = create_directory_(client, &directory_str, recursive).await?;
 	ui.print_success(&format!("Directory created: {}", directory_str));
 	Ok(())
-	// todo: recursive flag
+}
+
+async fn create_directory_(
+	client: &Client,
+	directory: &RemotePath,
+	recursive: bool,
+) -> Result<RemoteDirectory> {
+	let parent = directory.navigate("..");
+	let parent = match client.find_item_at_path(&parent.0).await {
+		Err(e) => {
+			if e.kind() == filen_sdk_rs::ErrorKind::InvalidType {
+				return Err(UI::failure(&format!(
+					"Path contains a file inbetween: {}",
+					parent.0
+				)));
+			} else {
+				return Err(e).context("Failed to find parent directory");
+			}
+		}
+		Ok(Some(FSObject::Dir(parent_dir))) => Ok(DirectoryType::Dir(parent_dir)),
+		Ok(Some(FSObject::Root(root))) => Ok(DirectoryType::Root(root)),
+		Ok(Some(FSObject::RootWithMeta(root))) => Ok(DirectoryType::RootWithMeta(root)),
+		Ok(Some(_)) => Err(UI::failure(&format!("Not a directory: {}", parent.0))),
+		Ok(None) => {
+			if recursive {
+				Box::pin(create_directory_(client, &parent, true))
+					.await
+					.map(|d| DirectoryType::Dir(Cow::Owned(d)))
+			} else {
+				Err(UI::failure_err(&format!("No such parent directory: {}", parent)).unwrap_err())
+			}
+		}
+	}?;
+	client
+		.create_dir(&parent, directory.basename().unwrap().to_string())
+		.await
+		.context("Failed to create directory")
 }
 
 async fn delete_file_or_directory(
@@ -511,7 +540,7 @@ async fn delete_file_or_directory(
 		.await
 		.context("Failed to find file or directory")?
 	else {
-		return UI::failure(&format!(
+		return UI::failure_err(&format!(
 			"No such file or directory: {}",
 			file_or_directory_str
 		));
@@ -521,7 +550,6 @@ async fn delete_file_or_directory(
 			&format!("Permanently delete {}?", file_or_directory_str),
 			false,
 		)? {
-		// todo: make formatting of ui.prompt and ui.print_success more consistent
 		return Ok(());
 	}
 	match item {
@@ -562,12 +590,12 @@ async fn delete_file_or_directory(
 			}
 		}
 		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-			return UI::failure("Cannot delete root directory");
+			return UI::failure_err("Cannot delete root directory");
 		}
 		FSObject::SharedFile(_) => {
-			return UI::failure("Cannot delete shared file");
+			return UI::failure_err("Cannot delete shared file");
 		}
-	} // todo: simplify this match statement?
+	}
 	Ok(())
 }
 
@@ -591,7 +619,7 @@ async fn move_or_copy_file_or_directory(
 		.await
 		.context("Failed to find source file or directory")?
 	else {
-		return UI::failure(&format!(
+		return UI::failure_err(&format!(
 			"No such source file or directory: {}",
 			source_str.0
 		));
@@ -601,7 +629,7 @@ async fn move_or_copy_file_or_directory(
 		.await
 		.context("Failed to find destination directory")?
 	else {
-		return UI::failure(&format!(
+		return UI::failure_err(&format!(
 			"No such destination directory: {}",
 			destination_str.0
 		));
@@ -610,7 +638,7 @@ async fn move_or_copy_file_or_directory(
 		FSObject::Dir(dir) => DirectoryType::Dir(dir),
 		FSObject::Root(root) => DirectoryType::Root(root),
 		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
-		_ => return UI::failure(&format!("Not a directory: {}", destination_str.0)),
+		_ => return UI::failure_err(&format!("Not a directory: {}", destination_str.0)),
 	};
 	match action {
 		MoveOrCopy::Move => match source_file_or_directory {
@@ -627,10 +655,10 @@ async fn move_or_copy_file_or_directory(
 					.context("Failed to move directory")?;
 			}
 			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-				return UI::failure("Cannot move root directory");
+				return UI::failure_err("Cannot move root directory");
 			}
 			FSObject::SharedFile(_) => {
-				return UI::failure("Cannot move shared file");
+				return UI::failure_err("Cannot move shared file");
 			}
 		},
 		MoveOrCopy::Copy => match source_file_or_directory {
@@ -641,10 +669,10 @@ async fn move_or_copy_file_or_directory(
 				todo!("Implement directory copy"); // filen-sdk-rs does not support directory copy yet
 			}
 			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-				return UI::failure("Cannot copy root directory");
+				return UI::failure_err("Cannot copy root directory");
 			}
 			FSObject::SharedFile(_) => {
-				return UI::failure("Cannot copy shared file");
+				return UI::failure_err("Cannot copy shared file");
 			}
 		},
 	}
@@ -674,7 +702,7 @@ async fn set_file_or_directory_favorite(
 		.await
 		.context("Failed to find file or directory")?
 	else {
-		return UI::failure(&format!(
+		return UI::failure_err(&format!(
 			"No such file or directory: {}",
 			file_or_directory_str
 		));
@@ -703,10 +731,10 @@ async fn set_file_or_directory_favorite(
 			));
 		}
 		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
-			return UI::failure("Cannot change favorite status of root directory");
+			return UI::failure_err("Cannot change favorite status of root directory");
 		}
 		FSObject::SharedFile(_) => {
-			return UI::failure("Cannot change favorite status of shared file");
+			return UI::failure_err("Cannot change favorite status of shared file");
 		}
 	}
 	Ok(())
@@ -715,7 +743,7 @@ async fn set_file_or_directory_favorite(
 async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
 	list_directory_by_uuid(ui, client, &ParentUuid::Trash).await
-	// todo: this should work, maybe it is an underlying issue?
+	// todo: this should work, it is an underlying issue
 }
 
 async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {

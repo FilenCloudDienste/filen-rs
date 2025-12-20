@@ -123,6 +123,16 @@ async fn cmd_mkdir() {
 		.await
 		.unwrap();
 	assert!(created_dir.is_some());
+
+	// mkdir -r
+	let nested_dir_path = format!("{}/parent_dir/nested_dir", test_dir.name().unwrap());
+	authenticated_cli_with_args!("mkdir", "-r", &nested_dir_path)
+		.success()
+		.stdout(predicates::str::contains("Directory created"));
+
+	// verify nested dir was created
+	let created_nested_dir = client.find_item_at_path(&nested_dir_path).await.unwrap();
+	assert!(created_nested_dir.is_some());
 }
 
 #[shared_test_runtime]
