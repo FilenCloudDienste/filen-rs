@@ -82,3 +82,4 @@ fn authenticate_from_env_vars() {
 // see note in test.rs regarding testing interactive clis
 
 // todo: test prompting for 2fa code (need another test account with 2fa enabled for that?)
+// -> I think there isn't currently one in CI, so do that later

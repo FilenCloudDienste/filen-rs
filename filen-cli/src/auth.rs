@@ -1,10 +1,12 @@
 //! [cli-doc] auth-methods
 //! There are multiple ways to authenticate:
-//! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)
+//! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)  
+//!   (when the two-factor code is omitted and required, you will be prompted for it)
 //! - specify an auth config via the `--auth-config-path` flag
 //!   (exported) via `filen export-auth-config`
-//! - set environment variables (`FILEN_CLI_EMAIL` and `FILEN_CLI_PASSWORD`)
-//! - if none of these is set, you will be prompted for credentials
+//! - set environment variables (`FILEN_CLI_EMAIL` and `FILEN_CLI_PASSWORD`, optionally `FILEN_CLI_2FA_CODE`)  
+//!   (when the two-factor code is omitted and required, you will be prompted for it)
+//! - if none of these is set, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
 
 use std::path::PathBuf;
@@ -16,8 +18,6 @@ use filen_types::error::ResponseError;
 
 use crate::{ui::UI, util::LongKeyringEntry};
 
-// todo: two-factor code in env vars, cli args
-
 /// A lazily authenticated client.
 /// Since some commands (e. g. logout) don't need the user to be authenticated, we only authenticate when necessary.
 pub(crate) enum LazyClient {
@@ -25,6 +25,7 @@ pub(crate) enum LazyClient {
 		email_arg: Option<String>,
 		password_arg: Option<String>,
 		auth_config_path_arg: Option<String>,
+		two_factor_code_arg: Option<String>,
 	},
 	Authenticated {
 		client: Box<Client>,
@@ -35,11 +36,13 @@ impl LazyClient {
 	pub(crate) fn new(
 		email_arg: Option<String>,
 		password_arg: Option<String>,
+		two_factor_code_arg: Option<String>,
 		auth_config_path_arg: Option<String>,
 	) -> Self {
 		Self::Unauthenticated {
 			email_arg,
 			password_arg,
+			two_factor_code_arg,
 			auth_config_path_arg,
 		}
 	}
@@ -51,11 +54,13 @@ impl LazyClient {
 				email_arg,
 				password_arg,
 				auth_config_path_arg,
+				two_factor_code_arg,
 			} => {
 				let client = authenticate_and_get_password(
 					ui,
 					email_arg.to_owned(),
 					password_arg.as_deref(),
+					two_factor_code_arg.as_deref(),
 					auth_config_path_arg.as_deref(),
 				)
 				.await?;
@@ -78,9 +83,12 @@ pub(crate) async fn authenticate_and_get_password(
 	ui: &mut UI,
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
+	two_factor_code_arg: Option<&str>,
 	auth_config_path_arg: Option<&str>,
 ) -> Result<Client> {
-	if let Some(client) = authenticate_from_cli_args(ui, email_arg, password_arg).await? {
+	if let Some(client) =
+		authenticate_from_cli_args(ui, email_arg, password_arg, two_factor_code_arg).await?
+	{
 		log::info!("Authenticated from CLI arguments");
 		Ok(client)
 	} else if let Some(client) = authenticate_from_auth_config(auth_config_path_arg)? {
@@ -111,28 +119,30 @@ async fn login_and_optionally_prompt_two_factor_code(
 	ui: &mut UI,
 	email: String,
 	password: &str,
+	two_factor_code: Option<&str>,
 ) -> Result<Client> {
-	let unhandled_err = match Client::login(email.clone(), password, "XXXXXX").await {
-		Ok(client) => return Ok(client),
-		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
-			Ok(ResponseError::ApiError { code, .. }) => {
-				if code.as_deref() == Some("enter_2fa") {
-					let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
-					let client = Client::login(email, password, two_factor_code.trim())
-						.await
-						.context("Failed to log in (with 2fa code)")?;
-					return Ok(client);
-				} else {
-					return Err(anyhow::anyhow!(
-						"Failed to log in (code {})",
-						code.as_deref().unwrap_or("")
-					));
+	let unhandled_err =
+		match Client::login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX")).await {
+			Ok(client) => return Ok(client),
+			Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
+				Ok(ResponseError::ApiError { code, .. }) => {
+					if code.as_deref() == Some("enter_2fa") {
+						let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
+						let client = Client::login(email, password, two_factor_code.trim())
+							.await
+							.context("Failed to log in (with 2fa code)")?;
+						return Ok(client);
+					} else {
+						return Err(anyhow::anyhow!(
+							"Failed to log in (code {})",
+							code.as_deref().unwrap_or("")
+						));
+					}
 				}
-			}
+				Err(e) => anyhow!(e),
+			},
 			Err(e) => anyhow!(e),
-		},
-		Err(e) => anyhow!(e),
-	};
+		};
 	eprintln!("Login error: {:?}", unhandled_err);
 	Err(unhandled_err.context("Failed to log in"))
 }
@@ -142,13 +152,18 @@ async fn authenticate_from_cli_args(
 	ui: &mut UI,
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
+	two_factor_code_arg: Option<&str>,
 ) -> Result<Option<Client>> {
-	if email_arg.is_none() && password_arg.is_none() {
+	if email_arg.is_none() && password_arg.is_none() && two_factor_code_arg.is_none() {
 		return Ok(None);
 	}
-	let email = email_arg.context("Email is required")?;
-	let password = password_arg.context("Password is required")?;
-	let client = login_and_optionally_prompt_two_factor_code(ui, email, password).await?;
+	let client = login_and_optionally_prompt_two_factor_code(
+		ui,
+		email_arg.context("Email is required")?,
+		password_arg.context("Password is required")?,
+		two_factor_code_arg,
+	)
+	.await?;
 	Ok(Some(client))
 }
 
@@ -166,12 +181,17 @@ fn authenticate_from_auth_config(path_arg: Option<&str>) -> Result<Option<Client
 async fn authenticate_from_environment_variables(ui: &mut UI) -> Result<Option<Client>> {
 	let email_var = std::env::var("FILEN_CLI_EMAIL").ok();
 	let password_var = std::env::var("FILEN_CLI_PASSWORD").ok();
-	if email_var.is_none() && password_var.is_none() {
+	let two_factor_code_var = std::env::var("FILEN_CLI_2FA_CODE").ok();
+	if email_var.is_none() && password_var.is_none() && two_factor_code_var.is_none() {
 		return Ok(None);
 	}
-	let email = email_var.context("FILEN_CLI_EMAIL is required")?;
-	let password = password_var.context("FILEN_CLI_PASSWORD is required")?;
-	let client = login_and_optionally_prompt_two_factor_code(ui, email, &password).await?;
+	let client = login_and_optionally_prompt_two_factor_code(
+		ui,
+		email_var.context("FILEN_CLI_EMAIL is required")?,
+		&password_var.context("FILEN_CLI_PASSWORD is required")?,
+		two_factor_code_var.as_deref(),
+	)
+	.await?;
 	Ok(Some(client))
 }
 
@@ -192,9 +212,13 @@ async fn authenticate_from_keyring() -> Result<Option<Client>> {
 async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 	let email = ui.prompt("Email:")?;
 	let password = ui.prompt_password("Password: ")?;
-	let client =
-		login_and_optionally_prompt_two_factor_code(ui, email.trim().to_string(), password.trim())
-			.await?;
+	let client = login_and_optionally_prompt_two_factor_code(
+		ui,
+		email.trim().to_string(),
+		password.trim(),
+		None,
+	)
+	.await?;
 
 	// optionally, save credentials
 	if ui.prompt_confirm("Keep me logged in?", true)? {
@@ -204,6 +228,8 @@ async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 			.context("Failed to write SDK config to keyring")?;
 		ui.print_success("Saved credentials");
 	}
+
+	// todo: better fallback for when system keyring is not available
 
 	Ok(client)
 }

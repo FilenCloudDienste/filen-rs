@@ -59,6 +59,10 @@ pub(crate) struct CliArgs {
 	#[arg(short, long)]
 	password: Option<String>,
 
+	/// Filen account two-factor code (optional, requires --email and --password)
+	#[arg(short, long)]
+	two_factor_code: Option<String>,
+
 	/// Path to auth config file (exported via `filen export-auth-config`)
 	#[arg(long)]
 	auth_config_path: Option<String>,
@@ -168,8 +172,12 @@ async fn inner_main() -> Result<()> {
 		check_for_updates(&mut ui, &config.config_dir).await?;
 	}
 
-	let mut client =
-		auth::LazyClient::new(cli_args.email, cli_args.password, cli_args.auth_config_path);
+	let mut client = auth::LazyClient::new(
+		cli_args.email,
+		cli_args.password,
+		cli_args.two_factor_code,
+		cli_args.auth_config_path,
+	);
 
 	let mut working_path = RemotePath::new("");
 
