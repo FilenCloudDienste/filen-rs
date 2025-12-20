@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--force-update-check` flag to ignore recent update checks
 - `mkdir -r` flag to recursively create parent directories
 
+### Fixed
+
+- bug where command history didn't work in interactive mode
+
 ## 0.2.1 - 2025-12-19
 
 ### Added

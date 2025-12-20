@@ -310,7 +310,6 @@ async fn list_directory(
 		_ => return Err(UI::failure(&format!("Not a directory: {}", directory_str))),
 	};
 	list_directory_by_uuid(ui, client, directory.uuid()).await
-	// todo: ls -l flag
 }
 
 async fn list_directory_by_uuid(

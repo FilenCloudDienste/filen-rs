@@ -234,7 +234,7 @@ impl UI {
 		let input = dialoguer::Input::with_theme(&self.repl_input_theme)
 			.history_with(&mut self.history)
 			.with_prompt(path.trim())
-			.interact()
+			.interact_text()
 			.context("Failed to read input prompt")?;
 		Ok(input)
 	}
@@ -244,7 +244,7 @@ impl UI {
 		let input = dialoguer::Input::with_theme(&self.theme)
 			.history_with(&mut self.history)
 			.with_prompt(msg.trim())
-			.interact()
+			.interact_text()
 			.context("Failed to read input prompt")?;
 		Ok(input)
 	}
