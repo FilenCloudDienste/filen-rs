@@ -121,30 +121,28 @@ async fn login_and_optionally_prompt_two_factor_code(
 	password: &str,
 	two_factor_code: Option<&str>,
 ) -> Result<Client> {
-	let unhandled_err =
-		match Client::login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX")).await {
-			Ok(client) => return Ok(client),
-			Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
-				Ok(ResponseError::ApiError { code, .. }) => {
-					if code.as_deref() == Some("enter_2fa") {
-						let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
-						let client = Client::login(email, password, two_factor_code.trim())
-							.await
-							.context("Failed to log in (with 2fa code)")?;
-						return Ok(client);
-					} else {
-						return Err(anyhow::anyhow!(
-							"Failed to log in (code {})",
-							code.as_deref().unwrap_or("")
-						));
-					}
+	match Client::login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX")).await {
+		Ok(client) => Ok(client),
+		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
+			Ok(ResponseError::ApiError { code, .. }) => {
+				if code.as_deref() == Some("enter_2fa") {
+					let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
+					Client::login(email, password, two_factor_code.trim())
+						.await
+						.context("Failed to log in (with 2fa code)")
+				} else if code.as_deref() == Some("email_or_password_wrong") {
+					Err(UI::failure("Email or password wrong"))
+				} else {
+					Err(anyhow::anyhow!(
+						"Failed to log in (code {})",
+						code.as_deref().unwrap_or("")
+					))
 				}
-				Err(e) => anyhow!(e),
-			},
-			Err(e) => anyhow!(e),
-		};
-	eprintln!("Login error: {:?}", unhandled_err);
-	Err(unhandled_err.context("Failed to log in"))
+			}
+			Err(e) => Err(anyhow!(e)).context("Failed to log in"),
+		},
+		Err(e) => Err(anyhow!(e)).context("Failed to log in"),
+	}
 }
 
 /// Authenticate using credentials provided in the CLI arguments.

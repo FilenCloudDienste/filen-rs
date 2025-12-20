@@ -70,7 +70,6 @@ impl UI {
 		}
 	}
 
-	// todo: is this necessary anymore?
 	pub(crate) fn set_user(&mut self, user: Option<&str>) {
 		self.repl_input_theme = Self::repl_input_theme_for_user(user);
 	}
@@ -160,11 +159,6 @@ impl UI {
 			self.print_failure(&format!("An unexpected error occurred: {}", err));
 			self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
 		}
-	}
-
-	/// Print an error with a failure icon
-	pub(crate) fn print_err(&mut self, err: &anyhow::Error) {
-		self.print_failure(&format!("{}", err));
 	}
 
 	pub(crate) fn print_muted(&mut self, msg: &str) {
@@ -366,7 +360,6 @@ mod tests {
 			ui.print_hidden("Shouldn't show");
 			ui.print_success("Success!");
 			ui.print_failure("Something went wrong");
-			ui.print_err(&anyhow::anyhow!("This is an error"));
 			ui.print_muted("This is muted text");
 			ui.print_key_value_table(&[("Key1", "Value1"), ("LongerKey2", "Value2")]);
 			ui.print_grid(&[

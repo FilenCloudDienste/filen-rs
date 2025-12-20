@@ -392,7 +392,7 @@ async fn print_file(
 				.collect::<Vec<&str>>()
 				.join("\n"),
 		};
-		println!("{}", content);
+		ui.print(&content);
 	}
 	Ok(())
 }

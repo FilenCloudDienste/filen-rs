@@ -198,7 +198,7 @@ async fn inner_main() -> Result<()> {
 			match client.get(&mut ui).await {
 				Ok(_) => {}
 				Err(e) => {
-					ui.print_err(&e);
+					ui.print_failure_or_error(&e);
 					break;
 				}
 			}
@@ -214,10 +214,10 @@ async fn inner_main() -> Result<()> {
 			}
 			let mut args = shlex::split(line).context("Invalid quoting")?;
 			args.insert(0, String::from("filen"));
-			let cli_args = match CliArgs::try_parse_from(args).map_err(|e| e.to_string()) {
+			let cli_args = match CliArgs::try_parse_from(args) {
 				Ok(cli) => cli,
 				Err(e) => {
-					eprintln!("{}", e);
+					ui.print_failure_or_error(&anyhow::anyhow!(e));
 					continue;
 				}
 			};
