@@ -2,7 +2,7 @@
 //!
 //! Welcome to the Filen CLI!
 //!
-//! Invoke the Filen CLI with no command specified to enter interactive mode.
+//! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
 
 use std::{fs, path::PathBuf};

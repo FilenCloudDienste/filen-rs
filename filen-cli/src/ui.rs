@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
-use clap::builder::Styles;
+use clap::{CommandFactory, builder::Styles};
 use dialoguer::console::style;
 use log::{error, info};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
+
+use crate::CliArgs;
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -299,6 +301,34 @@ impl UI {
 				.collect::<Vec<_>>()
 				.join("\n")
 		)
+	}
+
+	pub(crate) fn format_global_options_help() -> String {
+		CliArgs::command()
+			.clone()
+			.styles(
+				Styles::styled()
+					.literal(anstyle::AnsiColor::Green.on_default())
+					.placeholder(anstyle::AnsiColor::Green.on_default())
+					.context(anstyle::Style::new().dimmed())
+					.header(anstyle::AnsiColor::Yellow.on_default()),
+			)
+			.help_template("{options}")
+			.render_help()
+			.ansi()
+			.to_string()
+			.lines()
+			.filter(|l| !l.is_empty())
+			.map(|l| {
+				// if line contains an ansi code, it's the definition line
+				if l.trim().contains("[") {
+					format!("{} {}", style("→").dim(), l.trim())
+				} else {
+					format!("  {}", l.trim())
+				}
+			})
+			.collect::<Vec<_>>()
+			.join("\n")
 	}
 
 	pub(crate) fn format_text_blockquote(text: &str) -> String {

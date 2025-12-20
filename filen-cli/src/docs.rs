@@ -21,6 +21,7 @@ enum DocElement {
 	Heading1(&'static str),
 	DocFragment(&'static str),
 	CommandHelp(&'static str),
+	GlobalOptions,
 }
 
 #[derive(Debug)]
@@ -28,6 +29,7 @@ enum ParsedDocElement {
 	Heading1 { text: String },
 	DocFragment { text: String },
 	CommandHelp { command: Box<clap::Command> },
+	GlobalOptions,
 }
 
 #[derive(Debug)]
@@ -51,12 +53,13 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 			title: "Usage",
 			elements: vec![
 				DocElement::DocFragment("main-usage"),
-				DocElement::CommandHelp("help"),
-				DocElement::CommandHelp("exit"),
+				DocElement::Heading1("Options"),
+				DocElement::GlobalOptions,
 				DocElement::Heading1("Updates"),
 				DocElement::DocFragment("updates"),
-				DocElement::Heading1("Mounting"),
-				DocElement::CommandHelp("mount"),
+				DocElement::Heading1("Commands"),
+				DocElement::CommandHelp("help"),
+				DocElement::CommandHelp("exit"),
 			],
 		},
 		DocSection {
@@ -88,6 +91,14 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::CommandHelp("empty-trash"),
 			],
 		},
+		DocSection {
+			id: "mounting",
+			title: "Mounting a Virtual Drive",
+			elements: vec![
+				DocElement::CommandHelp("mount"),
+				// todo: missing more extensive mount help text
+			],
+		},
 	];
 
 	// parse doc elements
@@ -95,6 +106,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 	let mut used_commands = HashSet::new();
 	let cli_doc_fragments = get_cli_doc_fragments();
 	let mut used_doc_fragments = HashSet::new();
+	let mut used_global_options = false;
 	let parsed_outline = doc_outline
 		.iter()
 		.map(|section| {
@@ -134,6 +146,10 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 							))
 						}
 					}
+					DocElement::GlobalOptions => {
+						used_global_options = true;
+						Ok(ParsedDocElement::GlobalOptions)
+					}
 				})
 				.collect::<Result<Vec<ParsedDocElement>>>()
 				.with_context(|| {
@@ -147,7 +163,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 		})
 		.collect::<Result<Vec<ParsedDocSection>>>()?;
 
-	// ensure that all doc fragments and commands were used
+	// ensure that all doc fragments, commands and global options were used
 	let unused_doc_fragments = cli_doc_fragments
 		.iter()
 		.map(|fragment| &fragment.id)
@@ -168,6 +184,11 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 		return Err(anyhow::anyhow!(
 			"Some CLI commands were not documented in the markdown docs: {:?}",
 			unused_commands
+		));
+	}
+	if !used_global_options {
+		return Err(anyhow::anyhow!(
+			"Global CLI options were not documented in the markdown docs"
 		));
 	}
 
@@ -216,6 +237,21 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 					ParsedDocElement::CommandHelp { command } => {
 						format_markdown_command_help(&mut command.clone())
 					}
+					ParsedDocElement::GlobalOptions => CliArgs::command()
+						.clone()
+						.help_template("{options}")
+						.render_help()
+						.to_string()
+						.lines()
+						.map(|l| {
+							if l.trim().starts_with("-") {
+								format!("- `{}`", l.trim())
+							} else {
+								format!("  {}", l.trim())
+							}
+						})
+						.collect::<Vec<String>>()
+						.join("  \n"),
 				})
 				.collect::<Vec<String>>();
 			let mut markdown_content = String::new();
@@ -301,6 +337,7 @@ pub(crate) fn print_in_app_docs(
 				ParsedDocElement::CommandHelp { command } => {
 					UI::format_text_blockquote(&UI::format_command_help(&mut command.clone()))
 				}
+				ParsedDocElement::GlobalOptions => UI::format_global_options_help(),
 			})
 			.collect::<Vec<String>>();
 		ui.print(&elements.join("\n\n"));
