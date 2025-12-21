@@ -90,11 +90,25 @@ pub(crate) struct CliConfig {
 	pub(crate) config_dir: PathBuf,
 }
 
+pub(crate) const EXIT_CODE_ERROR_PREFIX: &str = "Exit with code ";
+
+pub(crate) fn construct_exit_code_error(code: i32) -> anyhow::Error {
+	anyhow::anyhow!("{}{}", EXIT_CODE_ERROR_PREFIX, code)
+}
+
 #[tokio::main]
 async fn main() {
 	// translate errors to non-zero exit code
 	match inner_main().await {
 		Ok(_) => {}
+		Err(e) if e.to_string().starts_with(EXIT_CODE_ERROR_PREFIX) => {
+			if let Some(code_str) = e.to_string().strip_prefix(EXIT_CODE_ERROR_PREFIX)
+				&& let Ok(code) = code_str.parse::<i32>()
+			{
+				std::process::exit(code);
+			}
+			std::process::exit(1);
+		}
 		Err(_) => std::process::exit(1),
 	}
 }

@@ -280,15 +280,20 @@ pub(crate) async fn execute_command(
 			)
 			.await
 			.context("Failed to initialize rclone installation")?;
-			rclone
+			let exit_code = rclone
 				.execute(&cmd.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
 				.await
 				.spawn()
 				.context("Failed to execute rclone command")?
 				.wait()
 				.await
-				.context("Failed to wait for rclone command")?;
-			// todo: need to handle exit code?
+				.context("Failed to wait for rclone command")?
+				.code();
+			if let Some(exit_code) = exit_code
+				&& exit_code != 0
+			{
+				return Err(crate::construct_exit_code_error(exit_code));
+			}
 			None
 		}
 		Commands::Logout => {

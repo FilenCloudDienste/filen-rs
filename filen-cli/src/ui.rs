@@ -5,7 +5,7 @@ use log::{error, info};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
 
-use crate::CliArgs;
+use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX};
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -155,6 +155,9 @@ impl UI {
 	pub(crate) fn print_failure_or_error(&mut self, err: &anyhow::Error) {
 		error!("{:#}", err);
 		let err_msg = format!("{}", err);
+		if err_msg.starts_with(EXIT_CODE_ERROR_PREFIX) {
+			return;
+		}
 		let is_failure = err_msg.starts_with(&format!("{}", style("✘").red()));
 		if is_failure {
 			self.print(&err_msg);
