@@ -118,7 +118,6 @@ impl UI {
 	pub(crate) fn print(&mut self, msg: &str) {
 		println!("{}", msg);
 		self.output.push(msg.to_string());
-		// todo: use ui.println() everywhere?
 		info!("[PRINT] {}", msg);
 	}
 	pub(crate) fn print_hidden(&self, msg: &str) {

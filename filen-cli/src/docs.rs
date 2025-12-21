@@ -60,6 +60,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::Heading1("Commands"),
 				DocElement::CommandHelp("help"),
 				DocElement::CommandHelp("exit"),
+				DocElement::CommandHelp("rclone"),
 			],
 		},
 		DocSection {

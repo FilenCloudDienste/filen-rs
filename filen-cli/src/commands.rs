@@ -116,6 +116,13 @@ pub(crate) enum Commands {
 		/// Where to mount the network drive (default: system default)
 		mount_point: Option<String>,
 	},
+	/// Execute an Rclone command using filen-rclone.
+	/// The installation is downloaded and configured automatically.
+	Rclone {
+		/// The command to execute. Your Filen drive is available as the "filen" remote.
+		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+		cmd: Vec<String>,
+	},
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -264,6 +271,24 @@ pub(crate) async fn execute_command(
 				}));
 			}
 			None
+		}
+		Commands::Rclone { cmd } => {
+			let rclone = filen_network_drive::rclone_installation::RcloneInstallation::initialize(
+				client.get(ui).await?,
+				&config.config_dir.join("rclone"),
+			)
+			.await
+			.context("Failed to initialize rclone installation")?;
+			rclone
+				.execute(&cmd.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
+				.await
+				.spawn()
+				.context("Failed to execute rclone command")?
+				.wait()
+				.await
+				.context("Failed to wait for rclone command")?;
+			None
+			// todo: test this?
 		}
 		Commands::Logout => {
 			let deleted = crate::auth::delete_credentials()?;

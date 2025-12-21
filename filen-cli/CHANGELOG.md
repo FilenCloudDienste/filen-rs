@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - display global options help in docs
 - `--force-update-check` flag to ignore recent update checks
 - `mkdir -r` flag to recursively create parent directories
+- `rclone` subcommand that executes commands using an automatically downloaded
+  and managed installation of filen-rclone
 
 ### Fixed
 
