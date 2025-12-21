@@ -263,4 +263,28 @@ async fn cmd_favorite_unfavorite() {
 	}
 }
 
+#[shared_test_runtime]
+async fn cmd_rclone() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create test file to call rclone on
+	let file = client.make_file_builder("testfile.txt", test_dir).build();
+	let content = "Hello, Filen!";
+	client
+		.upload_file(file.into(), content.as_bytes())
+		.await
+		.unwrap();
+
+	// list file using rclone
+	authenticated_cli_with_args!(
+		"rclone",
+		"lsf",
+		&format!("filen:{}", test_dir.name().unwrap())
+	)
+	.success()
+	.stdout(predicates::str::contains("testfile.txt"));
+}
+
 // todo: list-trash, empty-trash cmds

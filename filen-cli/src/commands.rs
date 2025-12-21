@@ -288,8 +288,8 @@ pub(crate) async fn execute_command(
 				.wait()
 				.await
 				.context("Failed to wait for rclone command")?;
+			// todo: need to handle exit code?
 			None
-			// todo: test this?
 		}
 		Commands::Logout => {
 			let deleted = crate::auth::delete_credentials()?;
