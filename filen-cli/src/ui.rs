@@ -51,10 +51,13 @@ pub(crate) struct UI {
 	history: dialoguer::BasicHistory,
 	overwrite_terminal_width: Option<usize>,
 	output: Vec<String>,
+
+	/// Whether to output machine-readable JSON where applicable
+	pub(crate) json: bool,
 }
 
 impl UI {
-	pub(crate) fn new(quiet: bool, overwrite_terminal_width: Option<usize>) -> Self {
+	pub(crate) fn new(quiet: bool, json: bool, overwrite_terminal_width: Option<usize>) -> Self {
 		UI {
 			quiet,
 			theme: dialoguer::theme::ColorfulTheme {
@@ -67,6 +70,7 @@ impl UI {
 			history: dialoguer::BasicHistory::new().no_duplicates(true),
 			overwrite_terminal_width,
 			output: Vec::new(),
+			json,
 		}
 	}
 
@@ -218,6 +222,11 @@ impl UI {
 				break;
 			}
 		}
+	}
+
+	pub(crate) fn print_json(&mut self, value: serde_json::Value) -> Result<()> {
+		self.print(&serde_json::to_string_pretty(&value).context("Failed to serialize JSON")?);
+		Ok(())
 	}
 
 	// prompt
@@ -372,10 +381,10 @@ mod tests {
 		};
 
 		// for different terminal sizes
-		let mut small_ui = UI::new(false, Some(30));
+		let mut small_ui = UI::new(false, false, Some(30));
 		test(&mut small_ui);
 		insta::assert_snapshot!(small_ui.output.join("\n"));
-		let mut large_ui = UI::new(false, Some(100));
+		let mut large_ui = UI::new(false, false, Some(100));
 		test(&mut large_ui);
 		insta::assert_snapshot!(large_ui.output.join("\n"));
 	}

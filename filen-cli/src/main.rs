@@ -75,6 +75,10 @@ pub(crate) struct CliArgs {
 	#[arg(long)]
 	force_update_check: bool,
 
+	/// Format command output as machine-readable JSON (where applicable)
+	#[arg(long)]
+	json: bool,
+
 	#[command(subcommand)]
 	command: Option<Commands>,
 
@@ -147,7 +151,7 @@ async fn inner_main() -> Result<()> {
 	info!("Logging level: {}", logging_level);
 	info!("Full log file: {}", log_file.display());
 
-	let mut ui = ui::UI::new(cli_args.quiet, None);
+	let mut ui = ui::UI::new(cli_args.quiet, cli_args.json, None);
 
 	// --export-markdown-docs
 	if cli_args.export_markdown_docs {

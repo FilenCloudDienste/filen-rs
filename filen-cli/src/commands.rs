@@ -13,6 +13,7 @@ use filen_sdk_rs::{
 	io::RemoteDirectory,
 };
 use filen_types::fs::ParentUuid;
+use serde_json::json;
 
 use crate::{
 	CliConfig, CommandResult,
@@ -358,21 +359,28 @@ async fn list_directory_by_uuid(
 		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()).to_string())
 		.collect::<Vec<String>>();
 	files.sort();
-	// print directory names in blue
-	let directories = directories
-		.iter()
-		.map(|s| style(s).blue().to_string())
-		.collect::<Vec<String>>();
-	let all_items = directories
-		.iter()
-		.chain(files.iter())
-		.map(|s| s.as_ref())
-		.collect::<Vec<&str>>();
-	if all_items.is_empty() {
-		ui.print_muted("Directory is empty");
-		return Ok(());
+	if ui.json {
+		ui.print_json(json!({
+			"directories": directories,
+			"files": files,
+		}))?;
+	} else {
+		// print directory names in blue
+		let directories = directories
+			.iter()
+			.map(|s| style(s).blue().to_string())
+			.collect::<Vec<String>>();
+		let all_items = directories
+			.iter()
+			.chain(files.iter())
+			.map(|s| s.as_ref())
+			.collect::<Vec<&str>>();
+		if all_items.is_empty() {
+			ui.print_muted("Directory is empty");
+			return Ok(());
+		}
+		ui.print_grid(&all_items);
 	}
-	ui.print_grid(&all_items);
 	Ok(())
 }
 
@@ -442,54 +450,82 @@ async fn print_file_or_directory_info(
 	};
 	match item {
 		FSObject::File(file) => {
-			ui.print_key_value_table(&[
-				("Name", file.name().unwrap_or_else(|| file.uuid().as_ref())),
-				("Type", "File"),
-				(
-					"Size",
-					&humansize::format_size(file.size(), humansize::BINARY),
-				),
-				(
-					"Modified",
-					&file
-						.last_modified()
-						.map(|d| ui::format_date(&d))
-						.unwrap_or("-".to_string()),
-				),
-				(
-					"Created",
-					&file
-						.created()
-						.map(|d| ui::format_date(&d))
-						.unwrap_or("-".to_string()),
-				),
-				("UUID", file.uuid().as_ref()),
-			]);
+			if ui.json {
+				ui.print_json(json!({
+					"name": file.name().unwrap_or_else(|| file.uuid().as_ref()),
+					"type": "file",
+					"size": file.size(),
+					"modified": file.last_modified(),
+					"created": file.created(),
+					"uuid": file.uuid(),
+				}))?;
+			} else {
+				ui.print_key_value_table(&[
+					("Name", file.name().unwrap_or_else(|| file.uuid().as_ref())),
+					("Type", "File"),
+					(
+						"Size",
+						&humansize::format_size(file.size(), humansize::BINARY),
+					),
+					(
+						"Modified",
+						&file
+							.last_modified()
+							.map(|d| ui::format_date(&d))
+							.unwrap_or("-".to_string()),
+					),
+					(
+						"Created",
+						&file
+							.created()
+							.map(|d| ui::format_date(&d))
+							.unwrap_or("-".to_string()),
+					),
+					("UUID", file.uuid().as_ref()),
+				]);
+			}
 		}
 		FSObject::Dir(dir) => {
-			ui.print_key_value_table(&[
-				("Name", dir.name().unwrap_or_else(|| dir.uuid().as_ref())),
-				("Type", "Directory"),
-				(
-					"Created",
-					&dir.created()
-						.map(|d| ui::format_date(&d))
-						.unwrap_or("-".to_string()),
-				),
-				("UUID", dir.uuid().as_ref()),
-				// todo: aggregate directory size, file count, ...?
-			]);
+			if ui.json {
+				ui.print_json(json!({
+					"name": dir.name().unwrap_or_else(|| dir.uuid().as_ref()),
+					"type": "directory",
+					"created": dir.created(),
+					"uuid": dir.uuid(),
+				}))?;
+			} else {
+				ui.print_key_value_table(&[
+					("Name", dir.name().unwrap_or_else(|| dir.uuid().as_ref())),
+					("Type", "Directory"),
+					(
+						"Created",
+						&dir.created()
+							.map(|d| ui::format_date(&d))
+							.unwrap_or("-".to_string()),
+					),
+					("UUID", dir.uuid().as_ref()),
+					// todo: aggregate directory size, file count, ...?
+				]);
+			}
 		}
 		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
 			let user_info = client
 				.get_user_info()
 				.await
 				.context("Failed to get user info")?;
-			ui.print_key_value_table(&[
-				("Type", "Drive"),
-				("Used", &ui::format_size(user_info.storage_used)),
-				("Total", &ui::format_size(user_info.max_storage)),
-			]);
+			if ui.json {
+				ui.print_json(json!({
+					"type": "drive",
+					"usedStorage": user_info.storage_used,
+					"totalStorage": user_info.max_storage,
+				}))?;
+			} else {
+				ui.print_key_value_table(&[
+					("Type", "Drive"),
+					("Used", &ui::format_size(user_info.storage_used)),
+					("Total", &ui::format_size(user_info.max_storage)),
+				]);
+			}
 		}
 		FSObject::SharedFile(_) => {
 			return Err(UI::failure("Cannot show information for shared file"));
