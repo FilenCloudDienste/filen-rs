@@ -189,12 +189,7 @@ fn authenticate_from_auth_config(
 	let auth_config_paths = if let Some(path) = path_arg {
 		vec![PathBuf::from(path)]
 	} else {
-		vec![
-			std::env::current_dir()
-				.context("Failed to get current working directory")?
-				.join(AUTH_CONFIG_FILENAME),
-			config.config_dir.join(AUTH_CONFIG_FILENAME),
-		]
+		find_auth_config_default_locations(config)
 	};
 	for path in auth_config_paths {
 		if path.exists() {
@@ -205,6 +200,20 @@ fn authenticate_from_auth_config(
 		}
 	}
 	Ok(None)
+}
+
+/// Find default locations where auth config files are present.
+pub(crate) fn find_auth_config_default_locations(config: &CliConfig) -> Vec<PathBuf> {
+	vec![
+		std::env::current_dir()
+			.context("Failed to get current working directory")
+			.unwrap()
+			.join(AUTH_CONFIG_FILENAME),
+		config.config_dir.join(AUTH_CONFIG_FILENAME),
+	]
+	.into_iter()
+	.filter(|path| path.exists())
+	.collect()
 }
 
 /// Authenticate from credentials provided via environment variables.
@@ -276,18 +285,14 @@ async fn authenticate_from_prompt(config: &CliConfig, ui: &mut UI) -> Result<Cli
 		}
 	}
 
-	// todo: better fallback for when system keyring is not available
-
 	Ok(client)
 }
 
 const AUTH_CONFIG_FILENAME: &str = "filen-cli-auth-config.txt"; // (!) referenced in module docs
 
+/// Export an auth config to `{parent_dir}/filen-cli-auth-config.txt`.
 pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<PathBuf> {
 	let path = parent_dir.join(AUTH_CONFIG_FILENAME);
-	if path.exists() {
-		return Err(anyhow::anyhow!("File {} already exists", path.display()));
-	}
 	let sdk_config = serialize_auth_config(client)?;
 	std::fs::write(&path, sdk_config).context(format!(
 		"Failed to write auth config to file {}",
@@ -296,10 +301,38 @@ pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<P
 	Ok(path)
 }
 
-/// Deletes credentials from the keyring. Returns true if successful.
-pub(crate) fn delete_credentials() -> Result<bool> {
-	let deleted = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
-		.delete()
-		.context("Failed to delete SDK config from keyring")?;
-	Ok(deleted)
+/// Log out by deleting stored credentials from the keyring and auth config files, prompting the user for confirmation.
+pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
+	let mut found_any_credentials = false;
+	if let Ok(Some(_)) = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME).read() {
+		found_any_credentials = true;
+		if ui.prompt_confirm("Delete credentials stored in system keyring?", false)? {
+			let deleted = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
+				.delete()
+				.context("Failed to delete SDK config from keyring")?;
+			if deleted {
+				ui.print_success("Credentials deleted from keyring");
+			} else {
+				ui.print_failure("No credentials found in keyring");
+			}
+		}
+	}
+	for path in find_auth_config_default_locations(config) {
+		found_any_credentials = true;
+		if ui.prompt_confirm(
+			&format!("Delete auth config file at {}?", path.display()),
+			false,
+		)? {
+			std::fs::remove_file(&path).with_context(|| {
+				format!("Failed to delete auth config file at {}", path.display())
+			})?;
+			ui.print_success(&format!("Deleted auth config file at {}", path.display()));
+		}
+	}
+	if found_any_credentials {
+		Ok(true)
+	} else {
+		ui.print_muted("No credentials found in system keyring or auth config default locations");
+		Ok(false)
+	}
 }

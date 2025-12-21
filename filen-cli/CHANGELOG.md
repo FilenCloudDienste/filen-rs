@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `rclone` subcommand that executes commands using an automatically downloaded
   and managed installation of filen-rclone
 - `--json` global flag to output machine-readable JSON where applicable
+- fallback to exporting an auth config when system keyring fails,
+  `logout` by deleting credentials from keyring or auth configs
 
 ### Fixed
 

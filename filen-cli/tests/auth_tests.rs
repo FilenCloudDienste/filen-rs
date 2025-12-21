@@ -37,12 +37,12 @@ async fn export_and_authenticate_from_auth_config() {
 		.success()
 		.stdout(predicates::str::contains("Exported auth config"));
 	tokio::fs::copy(
-		"filen-cli-auth-config",
-		workdir.path().join("filen-cli-auth-config"),
+		"filen-cli-auth-config.txt",
+		workdir.path().join("filen-cli-auth-config.txt"),
 	)
 	.await
 	.unwrap();
-	tokio::fs::remove_file("filen-cli-auth-config")
+	tokio::fs::remove_file("filen-cli-auth-config.txt")
 		.await
 		.unwrap();
 	cargo_bin_cmd!()
@@ -50,7 +50,7 @@ async fn export_and_authenticate_from_auth_config() {
 			"--auth-config-path",
 			workdir
 				.path()
-				.join("filen-cli-auth-config")
+				.join("filen-cli-auth-config.txt")
 				.to_str()
 				.unwrap(),
 			"-v",

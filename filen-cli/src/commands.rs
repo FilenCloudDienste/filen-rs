@@ -17,7 +17,7 @@ use serde_json::json;
 
 use crate::{
 	CliConfig, CommandResult,
-	auth::{LazyClient, export_auth_config},
+	auth::{self, LazyClient, export_auth_config},
 	docs::print_in_app_docs,
 	ui::{self, UI},
 	util::RemotePath,
@@ -297,17 +297,14 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::Logout => {
-			// todo: logout from either keyring or auth config file
-			let deleted = crate::auth::delete_credentials()?;
-			if deleted {
-				ui.print_success("Credentials deleted");
+			if auth::logout(config, ui)? {
+				Some(CommandResult {
+					exit: true,
+					..Default::default()
+				})
 			} else {
-				ui.print_failure("No credentials found");
+				None
 			}
-			Some(CommandResult {
-				exit: true,
-				..Default::default()
-			})
 		}
 		Commands::Exit => Some(CommandResult {
 			exit: true,
