@@ -117,8 +117,7 @@ pub(crate) enum Commands {
 		/// Where to mount the network drive (default: system default)
 		mount_point: Option<String>,
 	},
-	/// Execute an Rclone command using filen-rclone.
-	/// The installation is downloaded and configured automatically.
+	/// Execute an Rclone command using filen-rclone
 	Rclone {
 		/// The command to execute. Your Filen drive is available as the "filen" remote.
 		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -246,54 +245,11 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::Mount { mount_point } => {
-			let client = client.get(ui).await?;
-			let mut network_drive = filen_network_drive::mount_network_drive(
-				client,
-				&config.config_dir,
-				mount_point.as_deref(),
-				false,
-			)
-			.await
-			.context("Failed to mount network drive")?;
-			network_drive
-				.wait_until_active()
-				.await
-				.context("Failed to mount network drive")?;
-			ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)");
-			let code = network_drive
-				.process
-				.wait()
-				.await
-				.context("Failed to wait for mount process")?;
-			if !code.success() {
-				return Err(anyhow::anyhow!(match code.code() {
-					Some(c) => format!("Mount process exited with code: {}", c),
-					None => "Mount process exited with unknown code".to_string(),
-				}));
-			}
+			rclone::mount(config, ui, client, mount_point).await?;
 			None
 		}
 		Commands::Rclone { cmd } => {
-			let rclone = filen_network_drive::rclone_installation::RcloneInstallation::initialize(
-				client.get(ui).await?,
-				&config.config_dir.join("rclone"),
-			)
-			.await
-			.context("Failed to initialize rclone installation")?;
-			let exit_code = rclone
-				.execute(&cmd.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
-				.await
-				.spawn()
-				.context("Failed to execute rclone command")?
-				.wait()
-				.await
-				.context("Failed to wait for rclone command")?
-				.code();
-			if let Some(exit_code) = exit_code
-				&& exit_code != 0
-			{
-				return Err(crate::construct_exit_code_error(exit_code));
-			}
+			rclone::execute_rclone(config, ui, client, cmd).await?;
 			None
 		}
 		Commands::Logout => {
@@ -827,4 +783,77 @@ async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	client.empty_trash().await?;
 	ui.print_success("Emptied trash");
 	Ok(())
+}
+
+mod rclone {
+	//! [cli-doc] managed-rclone
+	//! The Filen CLI includes a managed installation of [filen-rclone](https://github.com/FilenCloudDienste/filen-rclone).
+	//! It is automatically downloaded and configured (authenticated) when you run the `rclone` or `mount` commands.
+
+	use anyhow::{Context as _, Result};
+
+	use crate::{CliConfig, auth::LazyClient, ui::UI};
+
+	pub(crate) async fn mount(
+		config: &CliConfig,
+		ui: &mut UI,
+		client: &mut LazyClient,
+		mount_point: Option<String>,
+	) -> Result<()> {
+		let client = client.get(ui).await?;
+		let mut network_drive = filen_network_drive::mount_network_drive(
+			client,
+			&config.config_dir,
+			mount_point.as_deref(),
+			false,
+		)
+		.await
+		.context("Failed to mount network drive")?;
+		network_drive
+			.wait_until_active()
+			.await
+			.context("Failed to mount network drive")?;
+		ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)");
+		let code = network_drive
+			.process
+			.wait()
+			.await
+			.context("Failed to wait for mount process")?;
+		if !code.success() {
+			return Err(anyhow::anyhow!(match code.code() {
+				Some(c) => format!("Mount process exited with code: {}", c),
+				None => "Mount process exited with unknown code".to_string(),
+			}));
+		}
+		Ok(())
+	}
+
+	pub(crate) async fn execute_rclone(
+		config: &CliConfig,
+		ui: &mut UI,
+		client: &mut LazyClient,
+		cmd: Vec<String>,
+	) -> Result<()> {
+		let rclone = filen_network_drive::rclone_installation::RcloneInstallation::initialize(
+			client.get(ui).await?,
+			&config.config_dir.join("rclone"),
+		)
+		.await
+		.context("Failed to initialize rclone installation")?;
+		let exit_code = rclone
+			.execute(&cmd.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
+			.await
+			.spawn()
+			.context("Failed to execute rclone command")?
+			.wait()
+			.await
+			.context("Failed to wait for rclone command")?
+			.code();
+		if let Some(exit_code) = exit_code
+			&& exit_code != 0
+		{
+			return Err(crate::construct_exit_code_error(exit_code));
+		}
+		Ok(())
+	}
 }

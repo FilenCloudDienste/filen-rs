@@ -60,7 +60,6 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::Heading1("Commands"),
 				DocElement::CommandHelp("help"),
 				DocElement::CommandHelp("exit"),
-				DocElement::CommandHelp("rclone"),
 			],
 		},
 		DocSection {
@@ -93,11 +92,12 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 			],
 		},
 		DocSection {
-			id: "mounting",
-			title: "Mounting a Virtual Drive",
+			id: "managed-rclone",
+			title: "Managed Rclone",
 			elements: vec![
+				DocElement::DocFragment("managed-rclone"),
 				DocElement::CommandHelp("mount"),
-				// todo: missing more extensive mount help text
+				DocElement::CommandHelp("rclone"),
 			],
 		},
 	];
@@ -193,17 +193,16 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 		));
 	}
 
-	// ensure ids are unique among sections, doc fragments and commands
+	// ensure ids are unique among doc fragments and commands
+	// (sections are allowed to have the same id, then they take precedence)
 	let mut ids = doc_outline
 		.iter()
 		.flat_map(|section| {
-			let mut ids = vec![section.id];
-			ids.extend(section.elements.iter().filter_map(|element| match element {
-				DocElement::DocFragment(fragment_id) => Some(fragment_id),
-				DocElement::CommandHelp(command_id) => Some(command_id),
+			section.elements.iter().filter_map(|element| match element {
+				DocElement::DocFragment(fragment_id) => Some(*fragment_id),
+				DocElement::CommandHelp(command_id) => Some(*command_id),
 				_ => None,
-			}));
-			ids
+			})
 		})
 		.collect::<Vec<&'static str>>();
 	ids.sort();

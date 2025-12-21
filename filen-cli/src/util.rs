@@ -8,7 +8,6 @@ pub(crate) struct RemotePath(pub(crate) String);
 impl RemotePath {
 	pub(crate) fn new(path: &str) -> Self {
 		RemotePath(String::from("/") + path.trim_start_matches("/"))
-		//TODO check for correct syntax?
 	}
 
 	/// Navigate to a new path.
