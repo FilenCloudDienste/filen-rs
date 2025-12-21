@@ -3,25 +3,31 @@
 //! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)  
 //!   (when the two-factor code is omitted and required, you will be prompted for it)
 //! - specify an auth config via the `--auth-config-path` flag
-//!   (exported) via `filen export-auth-config`
+//!   (exported via `filen export-auth-config`),
+//!   or put an auth config in one of the default locations:
+//!   (unless overwritten by the `--config-dir` flag)
+//!   - `./filen-cli-auth-config.txt` (current working directory)
+//!   - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`
+//!   - Windows: `%appdata%\filen-cli\filen-cli-auth-config.txt`
 //! - set environment variables (`FILEN_CLI_EMAIL` and `FILEN_CLI_PASSWORD`, optionally `FILEN_CLI_2FA_CODE`)  
 //!   (when the two-factor code is omitted and required, you will be prompted for it)
 //! - if none of these is set, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use filen_cli::{deserialize_auth_config, serialize_auth_config};
 use filen_sdk_rs::{ErrorKind, auth::Client};
 use filen_types::error::ResponseError;
 
-use crate::{ui::UI, util::LongKeyringEntry};
+use crate::{CliConfig, ui::UI, util::LongKeyringEntry};
 
 /// A lazily authenticated client.
 /// Since some commands (e. g. logout) don't need the user to be authenticated, we only authenticate when necessary.
 pub(crate) enum LazyClient {
 	Unauthenticated {
+		config: CliConfig,
 		email_arg: Option<String>,
 		password_arg: Option<String>,
 		auth_config_path_arg: Option<String>,
@@ -34,12 +40,14 @@ pub(crate) enum LazyClient {
 
 impl LazyClient {
 	pub(crate) fn new(
+		config: CliConfig,
 		email_arg: Option<String>,
 		password_arg: Option<String>,
 		two_factor_code_arg: Option<String>,
 		auth_config_path_arg: Option<String>,
 	) -> Self {
 		Self::Unauthenticated {
+			config,
 			email_arg,
 			password_arg,
 			two_factor_code_arg,
@@ -51,12 +59,14 @@ impl LazyClient {
 		match self {
 			Self::Authenticated { client } => Ok(client),
 			Self::Unauthenticated {
+				config,
 				email_arg,
 				password_arg,
 				auth_config_path_arg,
 				two_factor_code_arg,
 			} => {
 				let client = authenticate_and_get_password(
+					config,
 					ui,
 					email_arg.to_owned(),
 					password_arg.as_deref(),
@@ -80,6 +90,7 @@ impl LazyClient {
 /// Authenticate by one of the available authentication methods.
 /// Also returns the password (it's needed for Rclone config).
 pub(crate) async fn authenticate_and_get_password(
+	config: &CliConfig,
 	ui: &mut UI,
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
@@ -91,10 +102,12 @@ pub(crate) async fn authenticate_and_get_password(
 	{
 		log::info!("Authenticated from CLI arguments");
 		Ok(client)
-	} else if let Some(client) = authenticate_from_auth_config(auth_config_path_arg)? {
+	} else if let Some((client, export_path)) =
+		authenticate_from_auth_config(config, auth_config_path_arg)?
+	{
 		log::info!(
 			"Authenticated from auth config file {}",
-			auth_config_path_arg.unwrap()
+			export_path.display()
 		);
 		Ok(client)
 	} else if let Some(client) = authenticate_from_environment_variables(ui).await? {
@@ -106,10 +119,10 @@ pub(crate) async fn authenticate_and_get_password(
 				log::info!("Authenticated from keyring");
 				Ok(client)
 			}
-			Ok(None) => authenticate_from_prompt(ui).await,
+			Ok(None) => authenticate_from_prompt(config, ui).await,
 			Err(e) => {
 				log::warn!("Failed to authenticate from keyring: {:?}", e);
-				authenticate_from_prompt(ui).await
+				authenticate_from_prompt(config, ui).await
 			}
 		}
 	}
@@ -166,13 +179,32 @@ async fn authenticate_from_cli_args(
 }
 
 /// Authenticate using SDK config stored in a file ("auth config") exported from the CLI.
-fn authenticate_from_auth_config(path_arg: Option<&str>) -> Result<Option<Client>> {
-	let Some(path) = path_arg else {
-		return Ok(None);
+/// Checks the path provided via CLI argument (if any), or default locations: (! referenced in module docs)
+/// - `./filen-cli-auth-config.txt` (current working directory)
+/// - `{config_dir}/filen-cli-auth-config.txt`
+fn authenticate_from_auth_config(
+	config: &CliConfig,
+	path_arg: Option<&str>,
+) -> Result<Option<(Client, PathBuf)>> {
+	let auth_config_paths = if let Some(path) = path_arg {
+		vec![PathBuf::from(path)]
+	} else {
+		vec![
+			std::env::current_dir()
+				.context("Failed to get current working directory")?
+				.join(AUTH_CONFIG_FILENAME),
+			config.config_dir.join(AUTH_CONFIG_FILENAME),
+		]
 	};
-	let sdk_config = std::fs::read_to_string(path)
-		.with_context(|| format!("Failed to read auth config file from {}", path))?;
-	Ok(Some(deserialize_auth_config(&sdk_config)?))
+	for path in auth_config_paths {
+		if path.exists() {
+			let sdk_config = std::fs::read_to_string(&path).with_context(|| {
+				format!("Failed to read auth config file from {}", path.display())
+			})?;
+			return Ok(Some((deserialize_auth_config(&sdk_config)?, path)));
+		}
+	}
+	Ok(None)
 }
 
 /// Authenticate from credentials provided via environment variables.
@@ -210,7 +242,7 @@ async fn authenticate_from_keyring() -> Result<Option<Client>> {
 }
 
 /// Authenticate using credentials provided interactively.
-async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
+async fn authenticate_from_prompt(config: &CliConfig, ui: &mut UI) -> Result<Client> {
 	let email = ui.prompt("Email:")?;
 	let password = ui.prompt_password("Password: ")?;
 	let client = login_and_optionally_prompt_two_factor_code(
@@ -224,10 +256,24 @@ async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 	// optionally, save credentials
 	if ui.prompt_confirm("Keep me logged in?", true)? {
 		let sdk_config = serialize_auth_config(&client)?;
-		LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
-			.write(&sdk_config)
-			.context("Failed to write SDK config to keyring")?;
-		ui.print_success("Saved credentials");
+		match LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME).write(&sdk_config) {
+			Ok(_) => {
+				ui.print_success("Saved credentials");
+			}
+			Err(_) => {
+				ui.print_failure("Failed to save credentials in keyring");
+				if ui.prompt_confirm(
+					&format!(
+						"Instead, export an auth config to {}?",
+						config.config_dir.join(AUTH_CONFIG_FILENAME).display()
+					),
+					false,
+				)? {
+					export_auth_config(&client, &config.config_dir)
+						.context("Failed to export auth config")?;
+				}
+			}
+		}
 	}
 
 	// todo: better fallback for when system keyring is not available
@@ -235,13 +281,19 @@ async fn authenticate_from_prompt(ui: &mut UI) -> Result<Client> {
 	Ok(client)
 }
 
-pub fn export_auth_config(client: &Client, path: &PathBuf) -> Result<()> {
+const AUTH_CONFIG_FILENAME: &str = "filen-cli-auth-config.txt"; // (!) referenced in module docs
+
+pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<PathBuf> {
+	let path = parent_dir.join(AUTH_CONFIG_FILENAME);
+	if path.exists() {
+		return Err(anyhow::anyhow!("File {} already exists", path.display()));
+	}
 	let sdk_config = serialize_auth_config(client)?;
-	std::fs::write(path, sdk_config).context(format!(
+	std::fs::write(&path, sdk_config).context(format!(
 		"Failed to write auth config to file {}",
 		path.display()
 	))?;
-	Ok(())
+	Ok(path)
 }
 
 /// Deletes credentials from the keyring. Returns true if successful.

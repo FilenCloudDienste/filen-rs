@@ -47,7 +47,7 @@ pub(crate) struct CliArgs {
 	#[arg(short, long)]
 	quiet: bool,
 
-	/// Config directory
+	/// Config directory (overwrite system default)
 	#[arg(long)]
 	config_dir: Option<PathBuf>,
 
@@ -86,6 +86,7 @@ pub(crate) struct CliArgs {
 	export_markdown_docs: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct CliConfig {
 	pub(crate) config_dir: PathBuf,
 }
@@ -194,6 +195,7 @@ async fn inner_main() -> Result<()> {
 	}
 
 	let mut client = auth::LazyClient::new(
+		config.clone(),
 		cli_args.email,
 		cli_args.password,
 		cli_args.two_factor_code,

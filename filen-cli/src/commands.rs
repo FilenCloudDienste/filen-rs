@@ -235,10 +235,10 @@ pub(crate) async fn execute_command(
 		}
 		Commands::ExportAuthConfig => {
 			let client = client.get(ui).await?;
-			let export_path = std::env::current_dir()
-				.context("Failed to get current directory")?
-				.join("filen-cli-auth-config");
-			export_auth_config(client, &export_path)?;
+			let export_path = export_auth_config(
+				client,
+				&std::env::current_dir().context("Failed to get current working directory")?,
+			)?;
 			ui.print_success(&format!(
 				"Exported auth config to {}",
 				export_path.display()
@@ -297,6 +297,7 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::Logout => {
+			// todo: logout from either keyring or auth config file
 			let deleted = crate::auth::delete_credentials()?;
 			if deleted {
 				ui.print_success("Credentials deleted");
