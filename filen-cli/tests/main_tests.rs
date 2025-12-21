@@ -99,6 +99,9 @@ fn unknown_command() {
 async fn interactive_repl() {
 	let test_resources = test_utils::RESOURCES.get_resources().await;
 	let (email, password, _) = test_utils::RESOURCES.get_credentials();
+	unsafe {
+		std::env::set_var("FILEN_CLI_TESTING_DISABLE_KEYRING", "1");
+	}
 	let mut p = rexpect::spawn(env!("CARGO_BIN_EXE_filen-cli"), Some(5000)).unwrap();
 	p.exp_string("Email").unwrap();
 	p.send_line(&email).unwrap();

@@ -197,6 +197,9 @@ const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
 
 /// Authenticate using SDK config stored in the keyring.
 async fn authenticate_from_keyring() -> Result<Option<Client>> {
+	if std::env::var("FILEN_CLI_TESTING_DISABLE_KEYRING") == Ok("1".to_string()) {
+		return Ok(None);
+	}
 	let sdk_config = LongKeyringEntry::new(KEYRING_SDK_CONFIG_NAME)
 		.read()
 		.context("Failed to read SDK config from keyring")?;
