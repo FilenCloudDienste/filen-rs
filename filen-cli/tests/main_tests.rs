@@ -7,12 +7,14 @@ use predicates::prelude::PredicateBooleanExt;
 #[test]
 fn print_help_text() {
 	cargo_bin_cmd!().arg("--help").assert().success().stdout(
-		predicates::str::contains("filen-cli")
-			.and(predicates::str::contains("[OPTIONS] [COMMAND]")),
+		predicates::str::contains("filen-cli").and(predicates::str::contains(
+			"Invoke the Filen CLI with no command specified to enter interactive mode",
+		)),
 	);
 	cargo_bin_cmd!().arg("help").assert().success().stdout(
-		predicates::str::contains("filen-cli")
-			.and(predicates::str::contains("[OPTIONS] [COMMAND]")),
+		predicates::str::contains("filen-cli").and(predicates::str::contains(
+			"Invoke the Filen CLI with no command specified to enter interactive mode",
+		)),
 	);
 }
 
