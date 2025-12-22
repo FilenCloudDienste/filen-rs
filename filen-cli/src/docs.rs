@@ -10,6 +10,7 @@ use std::{collections::HashSet, path::PathBuf, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
+use dialoguer::console;
 use filen_macros::extract_cli_doc_fragments;
 
 use crate::{CliArgs, ui::UI};
@@ -270,12 +271,14 @@ pub(crate) fn generate_markdown_docs() -> Result<()> {
 fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
 	let render_help_text_template = |template: &'static str| {
 		cmd.clone()
-			.styles(
+			.styles(if console::colors_enabled() {
 				Styles::styled()
 					.literal(anstyle::Style::new())
 					.header(anstyle::Style::new())
-					.usage(anstyle::Style::new()),
-			)
+					.usage(anstyle::Style::new())
+			} else {
+				Styles::plain()
+			})
 			.help_template(template)
 			.render_help()
 			.to_string()

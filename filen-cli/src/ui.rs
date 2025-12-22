@@ -285,18 +285,24 @@ impl UI {
 	pub(crate) fn format_command_help(cmd: &mut clap::Command) -> String {
 		let styled_str = cmd
 			.clone()
-			.styles(
+			.styles(if console::colors_enabled() {
 				Styles::styled()
 					.literal(anstyle::AnsiColor::Green.on_default())
 					.placeholder(anstyle::AnsiColor::Green.on_default())
 					.context(anstyle::Style::new().dimmed())
-					.header(anstyle::AnsiColor::Yellow.on_default()),
-			)
+					.header(anstyle::AnsiColor::Yellow.on_default())
+			} else {
+				Styles::plain()
+			})
 			.help_template("{positionals}\n{options}")
 			.render_help();
 		let formatted_usage = cmd
 			.clone()
-			.styles(Styles::styled().literal(anstyle::AnsiColor::Green.on_default().underline()))
+			.styles(if console::colors_enabled() {
+				Styles::styled().literal(anstyle::AnsiColor::Green.on_default().underline())
+			} else {
+				Styles::plain()
+			})
 			.help_template("{usage}\n{about}")
 			.render_help();
 		format!(
@@ -317,13 +323,15 @@ impl UI {
 	pub(crate) fn format_global_options_help() -> String {
 		CliArgs::command()
 			.clone()
-			.styles(
+			.styles(if console::colors_enabled() {
 				Styles::styled()
 					.literal(anstyle::AnsiColor::Green.on_default())
 					.placeholder(anstyle::AnsiColor::Green.on_default())
 					.context(anstyle::Style::new().dimmed())
-					.header(anstyle::AnsiColor::Yellow.on_default()),
-			)
+					.header(anstyle::AnsiColor::Yellow.on_default())
+			} else {
+				Styles::plain()
+			})
 			.help_template("{options}")
 			.render_help()
 			.ansi()
@@ -332,7 +340,7 @@ impl UI {
 			.filter(|l| !l.is_empty())
 			.map(|l| {
 				// if line contains an ansi code, it's the definition line
-				if l.trim().contains("[") {
+				if l.trim().contains("[") || l.trim().starts_with("-") {
 					format!("{} {}", style("→").dim(), l.trim())
 				} else {
 					format!("  {}", l.trim())
