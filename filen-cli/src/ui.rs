@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
-use dialoguer::console::style;
+use dialoguer::console::{self, style};
 use log::{error, info};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
@@ -110,13 +110,19 @@ impl UI {
 		let banner = "=".repeat((width - banner_text.len() - 2) / 2)
 			+ " " + &banner_text
 			+ " " + &"=".repeat((width - banner_text.len() - 2) / 2);
-		let filen_blue = RGB::new(0x1d, 0x57, 0xb9);
-		let filen_violet = RGB::new(0x99, 0x66, 0xCC);
-		let filen_green = RGB::new(0x50, 0xC8, 0x78);
-		let banner = banner.gradient([filen_blue, filen_violet, filen_green]);
-		// the string outputted by tiny_gradient has many "0m" sequences that reset formatting, so we're applying the bold formatting manually
-		let banner = banner.to_string().replace("0m", "1m");
-		self.print(&banner);
+		if console::colors_enabled() {
+			let filen_blue = RGB::new(0x1d, 0x57, 0xb9);
+			let filen_violet = RGB::new(0x99, 0x66, 0xCC);
+			let filen_green = RGB::new(0x50, 0xC8, 0x78);
+			let banner = banner.gradient([filen_blue, filen_violet, filen_green]);
+			// the string outputted by tiny_gradient has many "0m" sequences that reset formatting, so we're applying the bold formatting manually
+			let banner = banner.to_string().replace("0m", "1m");
+			// add reset at the end
+			let banner = format!("{}{}", banner, "\x1b[0m");
+			self.print(&banner);
+		} else {
+			self.print(&banner);
+		}
 	}
 
 	pub(crate) fn print(&mut self, msg: &str) {
@@ -363,9 +369,10 @@ mod tests {
 	// run using: cargo insta test --review -- --test test_ui
 
 	#[test]
-	#[ignore = "fails in ci for platforms reasons, will fix later"] // todo: fix
 	fn test_ui() {
-		let test = |ui: &mut UI| {
+		console::set_colors_enabled(true); // even in CI
+
+		fn test(ui: &mut UI) {
 			ui.print_banner();
 			ui.print("Should just show");
 			ui.print_hidden("Shouldn't show");
@@ -381,14 +388,20 @@ mod tests {
 				"video.mp4",
 				"archive.zip",
 			]);
-		};
+		}
 
-		// for different terminal sizes
+		// different terminal sizes
 		let mut small_ui = UI::new(false, false, Some(30));
 		test(&mut small_ui);
 		insta::assert_snapshot!(small_ui.output.join("\n"));
 		let mut large_ui = UI::new(false, false, Some(100));
 		test(&mut large_ui);
 		insta::assert_snapshot!(large_ui.output.join("\n"));
+
+		// no color
+		console::set_colors_enabled(false);
+		let mut no_color_ui = UI::new(false, false, Some(100));
+		test(&mut no_color_ui);
+		insta::assert_snapshot!(no_color_ui.output.join("\n"));
 	}
 }

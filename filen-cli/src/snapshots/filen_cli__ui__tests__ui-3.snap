@@ -1,0 +1,12 @@
+---
+source: filen-cli/src/ui.rs
+expression: "no_color_ui.output.join(\"\\n\")"
+---
+========================================= Filen CLI v0.2.1 =========================================
+Should just show
+✔ Success!
+✘ Something went wrong
+This is muted text
+      Key1 Value1
+LongerKey2 Value2
+file1.txt  file2.txt  a_very_long_filename_document.pdf  image.png  video.mp4  archive.zip
