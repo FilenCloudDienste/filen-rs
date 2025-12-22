@@ -9,7 +9,6 @@ use tokio::fs;
 
 use crate::ui::UI;
 
-const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: &str = env!("BUILD_TARGET"); // injected in build.rs
 
 const LAST_CHECK_VALIDITY: std::time::Duration = std::time::Duration::from_mins(5);
@@ -27,7 +26,12 @@ pub(crate) async fn check_for_updates(
 	force_update_check: bool,
 	config_path: &std::path::Path,
 ) -> Result<()> {
-	if cfg!(debug_assertions) {
+	let (is_testing, version) = match std::env::var("FILEN_CLI_TESTING_UPDATE") {
+		Ok(val) if val == "1" => (true, "0.0.0-test"),
+		_ => (false, env!("CARGO_PKG_VERSION")),
+	};
+
+	if cfg!(debug_assertions) && !is_testing {
 		log::info!("Skipping update check in debug build");
 		return Ok(());
 	}
@@ -68,13 +72,10 @@ pub(crate) async fn check_for_updates(
 	let github_api = GitHubApiClient::new();
 	let latest_release = github_api.get_latest_release().await?;
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
-	if latest_tag == FILEN_CLI_VERSION {
-		log::info!("Up to date: {}", FILEN_CLI_VERSION);
+	if latest_tag == version {
+		log::info!("Up to date: {}", version);
 	} else {
-		ui.print(&format!(
-			"Updating from v{} to v{}...",
-			FILEN_CLI_VERSION, latest_tag
-		));
+		ui.print(&format!("Updating from v{} to v{}...", version, latest_tag));
 		let asset = latest_release
 			.assets
 			.iter()
@@ -95,9 +96,9 @@ pub(crate) async fn check_for_updates(
 			.ok_or(anyhow::anyhow!("Failed to get current executable name"))?
 			.to_str()
 			.ok_or(anyhow::anyhow!("Failed to get current executable name"))?;
-		if current_executable_name.contains(FILEN_CLI_VERSION) {
+		if current_executable_name.contains(version) {
 			let update_path = curent_executable
-				.with_file_name(current_executable_name.replace(FILEN_CLI_VERSION, latest_tag));
+				.with_file_name(current_executable_name.replace(version, latest_tag));
 			tokio::fs::rename(download_path, &update_path).await?;
 			ui.print_muted(&format!("Downloaded update to {}", update_path.display()));
 			self_replace::self_delete().context("Failed to delete old binary")?;
@@ -163,6 +164,10 @@ impl LastCheckedConfig {
 					self.path.display()
 				)
 			})?;
+		log::info!(
+			"Wrote last update check timestamp to {}",
+			&self.path.display()
+		);
 		Ok(())
 	}
 }

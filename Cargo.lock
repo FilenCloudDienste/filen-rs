@@ -1450,6 +1450,7 @@ dependencies = [
  "log 0.4.28",
  "predicates",
  "rand 0.9.2",
+ "regex",
  "reqwest",
  "rexpect",
  "self-replace",

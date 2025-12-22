@@ -166,6 +166,8 @@ async fn inner_main() -> Result<()> {
 	info!("Logging level: {}", logging_level);
 	info!("Full log file: {}", log_file.display());
 
+	info!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
+
 	let mut ui = ui::UI::new(cli_args.quiet, cli_args.json, None);
 
 	// --export-markdown-docs

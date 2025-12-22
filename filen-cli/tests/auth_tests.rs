@@ -78,8 +78,8 @@ fn authenticate_from_env_vars() {
 		));
 }
 
-// todo: test authenticating from prompt and storing credentials in keyring
-// see note in test.rs regarding testing interactive clis
+// notes:
+// keyring authentication is hard to test here, so ignore it for now
 
 // todo: test prompting for 2fa code (need another test account with 2fa enabled for that?)
 // -> I think there isn't currently one in CI, so do that later

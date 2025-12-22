@@ -4,8 +4,6 @@ use predicates::prelude::PredicateBooleanExt as _;
 use rand::TryRngCore;
 use test_utils::authenticated_cli_with_args;
 
-// todo: test `cmd` command (see note in test.rs regarding testing interactive clis)
-
 #[shared_test_runtime]
 async fn cmd_ls() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -287,4 +285,4 @@ async fn cmd_rclone() {
 	.stdout(predicates::str::contains("testfile.txt"));
 }
 
-// todo: list-trash, empty-trash cmds
+// todo: list-trash, empty-trash cmds -> waiting for fix

@@ -115,16 +115,3 @@ async fn interactive_repl() {
 	p.send_line("exit").unwrap();
 	p.exp_eof().unwrap();
 }
-
-// todo: add more tests:
-
-// main.rs:
-// updater (?)
-// print user-facing failure
-// invalid quotes
-
-// ui.rs:
-// snapshot-test something with a lot of formatted stuff (maybe actually unit-test)
-
-// updater.rs:
-// what *can* we even test here? do we need to mock something?
