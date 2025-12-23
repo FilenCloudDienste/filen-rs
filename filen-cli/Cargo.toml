@@ -1,6 +1,6 @@
 [package]
 name = "filen-cli"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["FilenCloudDienste"]
 edition = "2024"
 repository = "https://github.com/FilenCloudDienste/filen-rs"
