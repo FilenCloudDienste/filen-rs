@@ -48,6 +48,7 @@ self-replace = "1.5.0"
 tempfile = "3.23.0"
 clap_builder = "4.5.53"
 anstyle = "1.0.13"
+semver = "1.0.27"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }

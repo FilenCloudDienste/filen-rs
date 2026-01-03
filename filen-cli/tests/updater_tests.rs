@@ -10,7 +10,7 @@ fn test_updater() {
 
 	// run once, should update
 	unsafe {
-		std::env::set_var("FILEN_CLI_TESTING_UPDATE", "1");
+		std::env::set_var("FILEN_CLI_TESTING_MOCK_VERSION", "0.0.0-test");
 	}
 	let assert = assert_cmd::Command::new(dir.path().join(binary.file_name().unwrap()))
 		.args(["-vv", "--config-dir", dir.path().to_str().unwrap(), "exit"])
@@ -29,7 +29,7 @@ fn test_updater() {
 
 	// run again, should be up to date and not check again
 	unsafe {
-		std::env::set_var("FILEN_CLI_TESTING_UPDATE", "0");
+		std::env::set_var("FILEN_CLI_TESTING_MOCK_VERSION", "off");
 	}
 	assert_cmd::Command::new(dir.path().join(binary.file_name().unwrap()))
 		.args(["-vv", "--config-dir", dir.path().to_str().unwrap(), "exit"])

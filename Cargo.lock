@@ -1484,6 +1484,7 @@ dependencies = [
  "reqwest",
  "rexpect",
  "self-replace",
+ "semver",
  "serde",
  "serde_json",
  "shlex",

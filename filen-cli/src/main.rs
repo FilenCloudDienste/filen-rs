@@ -193,7 +193,20 @@ async fn inner_main() -> Result<()> {
 	}
 
 	if !cli_args.skip_update {
-		check_for_updates(&mut ui, cli_args.force_update_check, &config.config_dir).await?;
+		match check_for_updates(
+			&mut ui,
+			cli_args.force_update_check,
+			&config.config_dir,
+			cli_args.command.is_none(),
+		)
+		.await
+		{
+			Ok(_) => {}
+			Err(e) => {
+				ui.print_failure_or_error(&e);
+				return Err(e);
+			}
+		}
 	}
 
 	let mut client = auth::LazyClient::new(

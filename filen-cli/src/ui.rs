@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
 use dialoguer::console::{self, style};
-use log::{error, info};
+use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
 
@@ -135,6 +135,16 @@ impl UI {
 	}
 
 	// print with formatting
+
+	/// Print an announcement message (used for important info from updates)
+	pub(crate) fn print_announcement(&mut self, msg: &str) {
+		warn!("[ANNOUNCEMENT] {}", msg);
+		self.print(&format!(
+			"{} {}",
+			style("[i]").yellow().bold(),
+			style(msg).yellow()
+		));
+	}
 
 	/// Print a message with a success icon
 	pub(crate) fn print_success(&mut self, msg: &str) {
