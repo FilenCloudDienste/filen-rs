@@ -135,64 +135,87 @@
 // 	assert!(!sub_files.contains(&sub_sub_file));
 // }
 
-// #[shared_test_runtime]
-// async fn file_public_link() {
-// 	let resources = test_utils::RESOURCES.get_resources().await;
-// 	let client = &resources.client;
-// 	let test_dir = &resources.dir;
+use filen_macros::shared_test_runtime;
+use filen_sdk_rs::{
+	connect::PasswordState,
+	fs::{
+		HasName, HasUUID,
+		file::{meta::FileMetaChanges, traits::HasRemoteFileInfo},
+	},
+	io::HasFileInfo,
+};
+use filen_types::api::v3::dir::link::PublicLinkExpiration;
 
-// 	let file = client.make_file_builder("a.txt", test_dir).build();
-// 	let mut file = client
-// 		.upload_file(file.into(), b"Hello, world!")
-// 		.await
-// 		.unwrap();
+#[shared_test_runtime]
+async fn file_public_link() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
 
-// 	let mut link = client.public_link_file(&file).await.unwrap();
-// 	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
-// 	assert_eq!(
-// 		&link.uuid(),
-// 		&found_link.uuid(),
-// 		"get_file_link_status didn't match created link"
-// 	);
+	let share_client = &share_resources.client;
 
-// 	let password = "some_password";
+	let file = client.make_file_builder("a.txt", test_dir).build();
+	let mut file = client
+		.upload_file(file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 
-// 	link.set_password(password.to_string());
-// 	link.set_expiration(PublicLinkExpiration::OneHour);
-// 	client.update_file_link(&file, &link).await.unwrap();
-// 	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
-// 	let mut cloned_found_link = found_link.clone();
-// 	cloned_found_link.set_password(password.to_string());
-// 	assert_eq!(&link, &cloned_found_link);
+	let mut link = client.public_link_file(&file).await.unwrap();
+	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
+	assert_eq!(
+		&link.uuid(),
+		&found_link.uuid(),
+		"get_file_link_status didn't match created link"
+	);
 
-// 	let linked_info = client.get_linked_file(&link).await.unwrap();
-// 	assert_eq!(linked_info.uuid, *file.uuid());
-// 	assert_eq!(linked_info.name.as_deref(), file.name());
-// 	assert_eq!(linked_info.mime.as_deref(), file.mime());
-// 	assert_eq!(
-// 		&PasswordState::Hashed(linked_info.hashed_password.clone().unwrap()),
-// 		found_link.password()
-// 	);
-// 	assert_eq!(linked_info.chunks, file.chunks());
-// 	assert_eq!(linked_info.size, file.size());
-// 	assert_eq!(linked_info.region, file.region());
-// 	assert_eq!(linked_info.bucket, file.bucket());
+	let password = "some_password";
 
-// 	let found_linked_info = client.get_linked_file(&found_link).await.unwrap();
-// 	assert_eq!(found_linked_info, linked_info);
+	link.set_password(password.to_string());
+	link.set_expiration(PublicLinkExpiration::OneHour);
+	client.update_file_link(&file, &link).await.unwrap();
+	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
+	let mut cloned_found_link = found_link.clone();
+	cloned_found_link.set_password(password.to_string());
+	assert_eq!(&link, &cloned_found_link);
 
-// 	client
-// 		.update_file_metadata(
-// 			&mut file,
-// 			FileMetaChanges::default()
-// 				.name("new_file_name.txt".to_string())
-// 				.unwrap(),
-// 		)
-// 		.await
-// 		.unwrap();
-// 	let linked_info = client.get_linked_file(&link).await.unwrap();
-// 	assert_eq!(linked_info.name.unwrap(), "new_file_name.txt");
-// }
+	let file_key = file.key().unwrap().to_str();
+
+	let linked_info = share_client
+		.get_linked_file(&link, file_key.clone())
+		.await
+		.unwrap();
+	assert_eq!(linked_info.uuid, *file.uuid());
+	assert_eq!(linked_info.name.as_deref(), file.name());
+	assert_eq!(linked_info.mime.as_deref(), file.mime());
+	assert_eq!(
+		&PasswordState::Hashed(linked_info.hashed_password.clone().unwrap()),
+		found_link.password()
+	);
+	assert_eq!(linked_info.chunks, file.chunks());
+	assert_eq!(linked_info.size, file.size());
+	assert_eq!(linked_info.region, file.region());
+	assert_eq!(linked_info.bucket, file.bucket());
+
+	let found_linked_info = share_client
+		.get_linked_file(&found_link, file_key)
+		.await
+		.unwrap();
+	assert_eq!(found_linked_info, linked_info);
+
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name("new_file_name.txt".to_string())
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let file_key = file.key().unwrap().to_str();
+	let linked_info = share_client.get_linked_file(&link, file_key).await.unwrap();
+	assert_eq!(linked_info.name.unwrap(), "new_file_name.txt");
+}
 
 // #[shared_test_runtime]
 // async fn contact_interactions() {

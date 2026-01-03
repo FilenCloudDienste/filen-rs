@@ -1,5 +1,5 @@
 use core::panic;
-use std::{fmt::Write, sync::Arc};
+use std::{borrow::Cow, fmt::Write, sync::Arc};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_macros::shared_test_runtime;
@@ -44,7 +44,7 @@ fn get_compat_test_file(client: &Client, parent: &impl HasUUIDContents) -> (File
 		))
 		.key(
 			FileKey::from_string_with_version(
-				file_key_str.to_string(),
+				Cow::Borrowed(file_key_str),
 				client.file_encryption_version(),
 			)
 			.unwrap(),

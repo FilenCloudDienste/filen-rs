@@ -89,7 +89,10 @@ impl TryFrom<DecryptedFileMeta> for SDKDecryptedFileMeta<'static> {
 			last_modified: meta.modified,
 			hash: meta.hash,
 			size: meta.size,
-			key: Cow::Owned(FileKey::from_string_with_version(meta.key, meta.version)?),
+			key: Cow::Owned(FileKey::from_string_with_version(
+				Cow::Owned(meta.key),
+				meta.version,
+			)?),
 		})
 	}
 }

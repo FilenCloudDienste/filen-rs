@@ -14,7 +14,7 @@ use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 
 use crate::crypto::error::ConversionError;
-use crate::crypto::shared::DataCrypter;
+use crate::crypto::shared::{DataCrypter, MetaCrypter};
 use crate::crypto::v2::V2Key;
 
 use super::v2::{MasterKey, MasterKeys};
@@ -178,6 +178,20 @@ impl DataCrypter for FileKey {
 
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		decrypt_data(&self.key, data)
+	}
+}
+
+impl MetaCrypter for FileKey {
+	fn blocking_encrypt_meta_into(&self, _meta: &str, _out: String) -> EncryptedString<'static> {
+		unimplemented!("Meta encryption for V1 is not supported");
+	}
+
+	fn blocking_decrypt_meta_into(
+		&self,
+		meta: &EncryptedString,
+		out: Vec<u8>,
+	) -> Result<String, (ConversionError, Vec<u8>)> {
+		decrypt_meta(&self.key, meta, out)
 	}
 }
 

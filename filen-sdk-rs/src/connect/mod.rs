@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	api,
 	auth::{Client, MetaKey},
-	crypto::shared::MetaCrypter,
+	crypto::{file::FileKey, shared::MetaCrypter},
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
@@ -598,7 +598,11 @@ impl Client {
 	}
 
 	// doesn't require auth, should be moved to a different module in the future
-	pub async fn get_linked_file(&self, link: &FilePublicLink) -> Result<LinkedFileInfo, Error> {
+	pub async fn get_linked_file(
+		&self,
+		link: &FilePublicLink,
+		link_key: Cow<'_, str>,
+	) -> Result<LinkedFileInfo, Error> {
 		let response = api::v3::file::link::info::post(
 			self.client(),
 			&api::v3::file::link::info::Request {
@@ -608,7 +612,7 @@ impl Client {
 		)
 		.await?;
 
-		let crypter = self.crypter();
+		let crypter = FileKey::from_string_and_meta(link_key, &response.mime)?.to_meta_key()?;
 
 		let (decrypted_size, decrypted_name, decrypted_mime) = futures::join!(
 			crypter.decrypt_meta(&response.size),

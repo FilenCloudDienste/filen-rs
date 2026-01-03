@@ -297,10 +297,11 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		let crypter = self.client.crypter();
 
 		let empty_request_future = do_cpu_intensive(move || {
+			let file_key = file.key().to_meta_key()?;
 			let (name, size, mime, metadata) = blocking_join!(
-				|| crypter.blocking_encrypt_meta(file.name()),
-				|| crypter.blocking_encrypt_meta(&self.written.to_string()),
-				|| crypter.blocking_encrypt_meta(file.as_ref().mime()),
+				|| file_key.blocking_encrypt_meta(file.name()),
+				|| file_key.blocking_encrypt_meta(&self.written.to_string()),
+				|| file_key.blocking_encrypt_meta(file.as_ref().mime()),
 				|| Ok::<_, Error>(crypter.blocking_encrypt_meta(&serde_json::to_string(
 					&DecryptedFileMeta {
 						name: Cow::Borrowed(file.name()),

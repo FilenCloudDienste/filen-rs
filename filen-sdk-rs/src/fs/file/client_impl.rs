@@ -10,7 +10,7 @@ use crate::{
 	api,
 	auth::Client,
 	consts::CHUNK_SIZE_U64,
-	crypto::shared::MetaCrypter,
+	crypto::{error::ConversionError, shared::MetaCrypter},
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 	fs::{
 		HasUUID,
@@ -104,10 +104,18 @@ impl Client {
 		let crypter = self.crypter();
 
 		let (name, metadata) = do_cpu_intensive(|| {
-			blocking_join!(|| crypter.blocking_encrypt_meta(&temp_meta.name), || {
-				let meta_json = serde_json::to_string(&temp_meta)?;
-				Ok::<_, Error>(crypter.blocking_encrypt_meta(&meta_json))
-			})
+			blocking_join!(
+				|| Ok::<_, ConversionError>(
+					temp_meta
+						.key()
+						.to_meta_key()?
+						.blocking_encrypt_meta(&temp_meta.name)
+				),
+				|| {
+					let meta_json = serde_json::to_string(&temp_meta)?;
+					Ok::<_, Error>(crypter.blocking_encrypt_meta(&meta_json))
+				}
+			)
 		})
 		.await;
 
@@ -115,7 +123,7 @@ impl Client {
 			self.client(),
 			&api::v3::file::metadata::Request {
 				uuid: *file.uuid(),
-				name,
+				name: name?,
 				name_hashed: Cow::Owned(self.hash_name(temp_meta.name())),
 				metadata: metadata?,
 			},
