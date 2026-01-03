@@ -126,7 +126,9 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 						{
 							used_doc_fragments.insert(fragment.id.clone());
 							Ok(ParsedDocElement::DocFragment {
-								text: fragment.content.to_string(),
+								text: fragment
+									.content
+									.replace("{{VERSION}}", env!("CARGO_PKG_VERSION")),
 							})
 						} else {
 							Err(anyhow::anyhow!(

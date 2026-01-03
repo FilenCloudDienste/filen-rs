@@ -1,6 +1,6 @@
 //! [cli-doc] main-usage
 //!
-//! Welcome to the Filen CLI!
+//! Welcome to Filen CLI v{{VERSION}}!
 //!
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
