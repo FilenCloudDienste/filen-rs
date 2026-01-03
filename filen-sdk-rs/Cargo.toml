@@ -24,6 +24,7 @@ reqwest = { version = "0.12.22", features = [
 	"json",
 	"stream",
 	"rustls-tls",
+	"gzip",
 ], default-features = false }
 
 filen-types = { path = "../filen-types" }
