@@ -9,10 +9,7 @@ pub mod crypto;
 pub mod error;
 pub mod fs;
 pub mod io;
-#[cfg(any(
-	all(target_family = "wasm", target_os = "unknown",),
-	feature = "uniffi"
-))]
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js;
 pub mod notes;
 pub mod runtime;

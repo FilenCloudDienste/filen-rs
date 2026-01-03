@@ -170,7 +170,16 @@ async fn make_rs_compat_dir() {
 	client.upload_file(empty_file.into(), b"").await.unwrap();
 
 	let (contact, _lock1, _lock2) = get_contact(client).await;
-	client.share_dir(&compat_dir, &contact).await.unwrap();
+	client
+		.share_dir(&compat_dir, &contact, &mut |downloaded, total| {
+			log::trace!(
+				"Shared compat-rs dir: downloaded {} / {:?}",
+				downloaded,
+				total
+			);
+		})
+		.await
+		.unwrap();
 
 	let small_file = client.make_file_builder("small.txt", &compat_dir).build();
 	client

@@ -465,7 +465,9 @@ test("sharing", async () => {
 		contact = (await state.getContacts()).find(c => c.email === import.meta.env.VITE_TEST_SHARE_EMAIL!)!
 	}
 	expect(contact).toBeDefined()
-	await state.shareDir(dir, contact)
+	await state.shareDir(dir, contact, (downloaded: number, total: number | undefined) => {
+		console.log(`Shared dir upload progress: ${downloaded}/${total}`)
+	})
 	const shared = await state.listOutShared(null, contact)
 	const sharedDir = shared.dirs.find(d => d.dir.uuid === dir.uuid)
 	expect(sharedDir).toBeDefined()

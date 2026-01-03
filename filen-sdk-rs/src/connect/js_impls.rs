@@ -1,10 +1,14 @@
 use std::borrow::Cow;
+#[cfg(feature = "uniffi")]
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::UuidStr;
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "uniffi")]
+use crate::fs::dir::js_impl::DirContentDownloadProgressCallback;
 use crate::{
 	Error,
 	auth::JsClient,
@@ -234,6 +238,136 @@ pub struct SharedDirsAndFiles {
 	pub files: Vec<SharedFile>,
 }
 
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl JsClient {
+	pub async fn public_link_dir(
+		&self,
+		dir: Dir,
+		callback: Arc<dyn DirContentDownloadProgressCallback>,
+	) -> Result<DirPublicLink, Error> {
+		let this = self.inner();
+		runtime::do_on_commander(move || async move {
+			let dir = dir.into();
+			this.public_link_dir(&dir, &mut |downloaded, total| {
+				let callback = Arc::clone(&callback);
+				tokio::task::spawn_blocking(move || {
+					callback.on_progress(downloaded, total);
+				});
+			})
+			.await
+		})
+		.await
+	}
+
+	pub async fn share_dir(
+		&self,
+		dir: Dir,
+		contact: Contact,
+		callback: Arc<dyn DirContentDownloadProgressCallback>,
+	) -> Result<(), Error> {
+		let this = self.inner();
+
+		do_on_commander(move || {
+			let contact = contact.into();
+			let dir = dir.into();
+			async move {
+				this.share_dir(&dir, &contact, &mut |downloaded, total| {
+					let callback = Arc::clone(&callback);
+					tokio::task::spawn_blocking(move || {
+						callback.on_progress(downloaded, total);
+					});
+				})
+				.await
+			}
+		})
+		.await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+impl JsClient {
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkDir")]
+	pub async fn public_link_dir(
+		&self,
+		dir: Dir,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+		)]
+		callback: web_sys::js_sys::Function,
+	) -> Result<DirPublicLink, Error> {
+		use crate::runtime;
+		use wasm_bindgen::JsValue;
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+		runtime::spawn_local(async move {
+			while let Some((downloaded, total)) = receiver.recv().await {
+				let _ = callback.call2(
+					&JsValue::UNDEFINED,
+					&JsValue::from_f64(downloaded as f64),
+					&match total {
+						Some(v) => JsValue::from_f64(v as f64),
+						None => JsValue::UNDEFINED,
+					},
+				);
+			}
+		});
+
+		let this = self.inner();
+		runtime::do_on_commander(move || async move {
+			let dir = dir.into();
+			this.public_link_dir(&dir, &mut |downloaded, total| {
+				let _ = sender.send((downloaded, total));
+			})
+			.await
+		})
+		.await
+	}
+
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "shareDir")]
+	pub async fn share_dir(
+		&self,
+		dir: Dir,
+		contact: Contact,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+		)]
+		callback: web_sys::js_sys::Function,
+	) -> Result<(), Error> {
+		use crate::runtime;
+		use wasm_bindgen::JsValue;
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+		runtime::spawn_local(async move {
+			while let Some((downloaded, total)) = receiver.recv().await {
+				let _ = callback.call2(
+					&JsValue::UNDEFINED,
+					&JsValue::from_f64(downloaded as f64),
+					&match total {
+						Some(v) => JsValue::from_f64(v as f64),
+						None => JsValue::UNDEFINED,
+					},
+				);
+			}
+		});
+
+		let this = self.inner();
+
+		do_on_commander(move || {
+			let contact = contact.into();
+			let dir = dir.into();
+			async move {
+				this.share_dir(&dir, &contact, &mut |downloaded, total| {
+					let _ = sender.send((downloaded, total));
+				})
+				.await
+			}
+		})
+		.await
+	}
+}
+
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
@@ -241,17 +375,6 @@ pub struct SharedDirsAndFiles {
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsClient {
 	// Public Links
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkDir")
-	)]
-	pub async fn public_link_dir(&self, dir: Dir) -> Result<DirPublicLink, Error> {
-		let this = self.inner();
-		runtime::do_on_commander(move || async move { this.public_link_dir(&dir.into()).await })
-			.await
-	}
-
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkFile")
@@ -494,16 +617,6 @@ impl JsClient {
 	}
 
 	// Sharing
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "shareDir")
-	)]
-	pub async fn share_dir(&self, dir: Dir, contact: Contact) -> Result<(), Error> {
-		let this = self.inner();
-		do_on_commander(move || async move { this.share_dir(&dir.into(), &contact.into()).await })
-			.await
-	}
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),

@@ -1,13 +1,18 @@
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::time::Instant;
 use std::{borrow::Cow, cmp::min, time::Duration};
 
 use bytes::Bytes;
 use filen_types::{api::response::FilenResponse, error::ResponseError};
+use futures::StreamExt;
 use reqwest::RequestBuilder;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasmtimer::std::Instant;
 
 use crate::{
 	ErrorKind,
 	auth::http::{AuthorizedClient, UnauthorizedClient},
-	consts::gateway_url,
+	consts::{CALLBACK_INTERVAL, gateway_url},
 	error::{Error, ErrorExt, ResultExt},
 };
 
@@ -35,6 +40,29 @@ fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
 pub(crate) enum RetryError {
 	Retry(Error),
 	NoRetry(Error),
+}
+
+pub(crate) async fn large_retry_wrap<T>(
+	body_bytes: Bytes,
+	request_builder_fn: impl Fn() -> RequestBuilder,
+	endpoint: impl Into<Cow<'static, str>>,
+	response_handler: impl AsyncFnMut(reqwest::Response) -> Result<T, RetryError>,
+	attempts: usize,
+	max_retry_time: Duration,
+) -> Result<T, Error> {
+	retry_wrap(
+		body_bytes,
+		|| {
+			request_builder_fn()
+				.timeout(Duration::from_secs(600))
+				.header("msgpack", "1")
+		},
+		endpoint,
+		response_handler,
+		attempts,
+		max_retry_time,
+	)
+	.await
 }
 
 /// Retries a request with exponential backoff using the Fibonacci sequence for delays.
@@ -145,6 +173,93 @@ where
 		endpoint,
 		async |resp| {
 			let body = match resp.json::<FilenResponse<U>>().await {
+				Ok(body) => body,
+				Err(e) => {
+					log::error!("Failed to parse response from {endpoint}: {e}");
+					return Err(RetryError::NoRetry(e.with_context(endpoint)));
+				}
+			};
+
+			if let Some(ResponseError::ApiError { message, code }) = body.as_error() {
+				log::warn!("Request to {endpoint} failed. message: {message:?}, code: {code:?}");
+				if let Some("internal_error") = code.as_deref() {
+					log::warn!("Internal error, retrying: {message:?}");
+					return Err(RetryError::Retry(
+						ResponseError::ApiError { message, code }.with_context(endpoint),
+					));
+				} else {
+					return Err(RetryError::NoRetry(
+						ResponseError::ApiError { message, code }.with_context(endpoint),
+					));
+				}
+			}
+			Ok(body)
+		},
+		attempts,
+		max_retry_time,
+	)
+	.await
+}
+
+pub(crate) async fn handle_large_request<U>(
+	body_bytes: Bytes,
+	request_builder_fn: impl Fn() -> RequestBuilder,
+	endpoint: &'static str,
+	attempts: usize,
+	max_retry_time: Duration,
+	mut progress_callback: Option<&mut impl FnMut(u64, Option<u64>)>,
+) -> Result<FilenResponse<'static, U>, Error>
+where
+	U: serde::de::DeserializeOwned,
+{
+	large_retry_wrap(
+		body_bytes,
+		request_builder_fn,
+		endpoint,
+		async move |resp| {
+			let real_content_length = resp
+				.headers()
+				.get("X-Cl")
+				.and_then(|h| h.to_str().ok().and_then(|h| str::parse::<u64>(h).ok()));
+			let content_length: usize = real_content_length
+				.unwrap_or_default()
+				.try_into()
+				.map_err(|e| {
+					RetryError::NoRetry(Error::custom_with_source(
+						ErrorKind::InsufficientMemory,
+						e,
+						Some(format!("content length too large for {endpoint}")),
+					))
+				})?;
+			let mut body_bytes = Vec::with_capacity(content_length);
+			let mut body = resp.bytes_stream();
+
+			let mut last_update_time = Instant::now();
+
+			while let Some(chunk) = body.next().await {
+				let chunk = chunk.map_err(|e| {
+					if e.is_timeout() {
+						log::warn!("Request to {endpoint} timed out during download");
+						RetryError::Retry(e.with_context(endpoint))
+					} else {
+						log::error!("Request to {endpoint} failed during download: {e}");
+						RetryError::NoRetry(e.with_context(endpoint))
+					}
+				})?;
+
+				body_bytes.extend_from_slice(&chunk);
+				if last_update_time.elapsed() >= CALLBACK_INTERVAL
+					&& let Some(ref mut progress_callback) = progress_callback
+				{
+					progress_callback(body_bytes.len() as u64, real_content_length);
+					last_update_time = Instant::now();
+				}
+			}
+			if let Some(ref mut progress_callback) = progress_callback {
+				progress_callback(body_bytes.len() as u64, real_content_length);
+			}
+
+			let body = match rmp_serde::from_slice::<FilenResponse<U>>(&body_bytes) {
 				Ok(body) => body,
 				Err(e) => {
 					log::error!("Failed to parse response from {endpoint}: {e}");
@@ -286,6 +401,35 @@ where
 	)
 	.await?
 	.ignore_data()
+	.context(endpoint)
+}
+
+pub(crate) async fn post_large_auth_request<T, U>(
+	client: &impl AuthorizedClient,
+	request: &T,
+	endpoint: &'static str,
+	progress_callback: Option<&mut impl FnMut(u64, Option<u64>)>,
+) -> Result<U, Error>
+where
+	T: serde::Serialize,
+	U: serde::de::DeserializeOwned + std::fmt::Debug,
+{
+	let _permit = client.get_semaphore_permit().await;
+	handle_large_request(
+		Bytes::from_owner(serde_json::to_vec(request).context(endpoint)?),
+		|| {
+			client.post_auth_request(gateway_url(endpoint)).header(
+				reqwest::header::CONTENT_TYPE,
+				reqwest::header::HeaderValue::from_static("application/json"),
+			)
+		},
+		endpoint,
+		DEFAULT_NUM_RETRIES,
+		DEFAULT_MAX_RETRY_TIME,
+		progress_callback,
+	)
+	.await?
+	.into_data()
 	.context(endpoint)
 }
 

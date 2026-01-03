@@ -207,19 +207,14 @@ impl Client {
 		.await
 	}
 
-	pub async fn list_dir_recursive(
+	async fn inner_list_dir_recursive<Fut>(
 		&self,
-		dir: &dyn HasContents,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
-		let response = api::v3::dir::download::post(
-			self.client(),
-			&api::v3::dir::download::Request {
-				uuid: dir.uuid_as_parent(),
-				skip_cache: false,
-			},
-		)
-		.await?;
-
+		inner_func: Fut,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		Fut: Future<Output = Result<api::v3::dir::download::Response<'static>, Error>>,
+	{
+		let response = inner_func.await?;
 		let crypter = self.crypter();
 
 		do_cpu_intensive(|| {
@@ -264,6 +259,48 @@ impl Client {
 					.collect::<Result<Vec<_>, _>>()
 			);
 			Ok((dirs, files?))
+		})
+		.await
+	}
+
+	pub(crate) async fn list_dir_recursive_no_callback(
+		&self,
+		dir: &dyn HasContents,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
+		self.inner_list_dir_recursive(api::v3::dir::download::post_large(
+			self,
+			&api::v3::dir::download::Request {
+				uuid: dir.uuid_as_parent(),
+				skip_cache: false,
+			},
+			None::<&mut fn(u64, Option<u64>)>,
+		))
+		.await
+	}
+
+	/// Recursively lists all directories and files inside the given directory.
+	///
+	/// This might take a long time and use a lot of memory (>1GiB) for large directories.
+	/// Since the entire directory structure needs to be held in memory while decrypting,
+	/// this function might fail with an Out Of Memory error on platforms with limited memory,
+	/// such as WASM.
+	///
+	/// The progress callback receives the number of bytes downloaded so far and the total number of bytes to download, if known.
+	pub async fn list_dir_recursive(
+		&self,
+		dir: &dyn HasContents,
+		progress_callback: &mut impl FnMut(u64, Option<u64>),
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
+		self.inner_list_dir_recursive(async {
+			api::v3::dir::download::post_large(
+				self,
+				&api::v3::dir::download::Request {
+					uuid: dir.uuid_as_parent(),
+					skip_cache: false,
+				},
+				Some(progress_callback),
+			)
+			.await
 		})
 		.await
 	}

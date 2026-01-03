@@ -33,6 +33,94 @@ impl JsClient {
 	}
 }
 
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+pub trait DirContentDownloadProgressCallback: Send + Sync {
+	fn on_progress(&self, bytes_downloaded: u64, total_bytes: Option<u64>);
+}
+
+#[cfg(feature = "uniffi")]
+impl JsClient {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
+	)]
+	pub async fn list_dir_recursive(
+		&self,
+		dir: DirEnum,
+		callback: std::sync::Arc<dyn DirContentDownloadProgressCallback>,
+	) -> Result<DirsAndFiles, Error> {
+		self.inner_list_dir_recursive(dir, move |downloaded, total| {
+			let callback = std::sync::Arc::clone(&callback);
+			tokio::task::spawn_blocking(move || {
+				callback.on_progress(downloaded, total);
+			});
+		})
+		.await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+impl JsClient {
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")]
+	pub async fn list_dir_recursive(
+		&self,
+		dir: DirEnum,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+		)]
+		callback: web_sys::js_sys::Function,
+	) -> Result<DirsAndFiles, Error> {
+		use crate::runtime;
+		use wasm_bindgen::JsValue;
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+		runtime::spawn_local(async move {
+			while let Some((downloaded, total)) = receiver.recv().await {
+				let _ = callback.call2(
+					&JsValue::UNDEFINED,
+					&JsValue::from_f64(downloaded as f64),
+					&match total {
+						Some(v) => JsValue::from_f64(v as f64),
+						None => JsValue::UNDEFINED,
+					},
+				);
+			}
+		});
+
+		self.inner_list_dir_recursive(dir, move |downloaded, total| {
+			let _ = sender.send((downloaded, total));
+		})
+		.await
+	}
+}
+
+impl JsClient {
+	async fn inner_list_dir_recursive(
+		&self,
+		dir: DirEnum,
+		callback: impl Fn(u64, Option<u64>) + Send + Sync + 'static,
+	) -> Result<DirsAndFiles, Error> {
+		let this = self.inner();
+		let (dirs, files) = do_on_commander(move || async move {
+			let dir_type = UnsharedDirectoryType::from(dir);
+			this.list_dir_recursive(&dir_type, &mut |downloaded, bytes| {
+				callback(downloaded, bytes);
+			})
+			.await
+			.map(|(dirs, files)| {
+				(
+					dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+					files.into_iter().map(File::from).collect::<Vec<_>>(),
+				)
+			})
+		})
+		.await?;
+		Ok(DirsAndFiles { dirs, files })
+	}
+}
+
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
@@ -101,26 +189,6 @@ impl JsClient {
 	)]
 	pub async fn list_trash(&self) -> Result<DirsAndFiles, Error> {
 		self.list_dir_inner_wasm(ParentUuid::Trash).await
-	}
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
-	)]
-	pub async fn list_dir_recursive(&self, dir: DirEnum) -> Result<DirsAndFiles, Error> {
-		let this = self.inner();
-		let (dirs, files) = do_on_commander(move || async move {
-			this.list_dir_recursive(&UnsharedDirectoryType::from(dir))
-				.await
-				.map(|(dirs, files)| {
-					(
-						dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
-						files.into_iter().map(File::from).collect::<Vec<_>>(),
-					)
-				})
-		})
-		.await?;
-		Ok(DirsAndFiles { dirs, files })
 	}
 
 	#[cfg_attr(

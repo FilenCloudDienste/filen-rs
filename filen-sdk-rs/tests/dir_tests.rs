@@ -400,7 +400,16 @@ async fn list_recursive() {
 	let dir_b = client.create_dir(&dir_a, "b".to_string()).await.unwrap();
 	let dir_c = client.create_dir(&dir_b, "c".to_string()).await.unwrap();
 
-	let (dirs, _) = client.list_dir_recursive(test_dir).await.unwrap();
+	let (dirs, _) = client
+		.list_dir_recursive(test_dir, &mut |downloaded, total| {
+			log::trace!(
+				"List dir recursive progress: downloaded {} / {:?}",
+				downloaded,
+				total
+			);
+		})
+		.await
+		.unwrap();
 
 	assert!(dirs.contains(&dir_a));
 	assert!(dirs.contains(&dir_b));
