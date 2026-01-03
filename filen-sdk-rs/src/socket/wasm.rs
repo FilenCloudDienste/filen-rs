@@ -225,7 +225,6 @@ impl
 		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel::<Result<String, Error>>(16);
 		let on_msg_closure = wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::MessageEvent)>::new(
 			move |e: web_sys::MessageEvent| {
-				log::info!("WebSocket message received");
 				let result = e.data().as_string().ok_or_else(|| {
 					Error::custom(
 						ErrorKind::Server,

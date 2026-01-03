@@ -105,8 +105,6 @@ where
 
 		let event_str = &msg[2..];
 
-		log::info!("Received WebSocket event: {}", event_str);
-
 		if event_str == AUTHED_TRUE {
 			// ignore authed true messages
 			return Ok(None);
