@@ -11,12 +11,12 @@ use crate::{api, auth::Client, error::Error};
 
 impl Client {
 	pub async fn get_contacts(&self) -> Result<Vec<Contact<'static>>, Error> {
-		api::v3::contacts::get(self.client()).await.map(|r| r.0)
+		api::v3::contacts::get(self).await.map(|r| r.0)
 	}
 
 	pub async fn send_contact_request(&self, email: &str) -> Result<UuidStr, Error> {
 		Ok(api::v3::contacts::requests::send::post(
-			self.client(),
+			self,
 			&api::v3::contacts::requests::send::Request {
 				email: std::borrow::Cow::Borrowed(email),
 			},
@@ -27,7 +27,7 @@ impl Client {
 
 	pub async fn cancel_contact_request(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		api::v3::contacts::requests::out::delete::post(
-			self.client(),
+			self,
 			&api::v3::contacts::requests::out::delete::Request { uuid: contact_uuid },
 		)
 		.await
@@ -35,7 +35,7 @@ impl Client {
 
 	pub async fn accept_contact_request(&self, contact_uuid: UuidStr) -> Result<UuidStr, Error> {
 		Ok(api::v3::contacts::requests::accept::post(
-			self.client(),
+			self,
 			&api::v3::contacts::requests::accept::Request { uuid: contact_uuid },
 		)
 		.await?
@@ -44,7 +44,7 @@ impl Client {
 
 	pub async fn deny_contact_request(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		api::v3::contacts::requests::deny::post(
-			self.client(),
+			self,
 			&api::v3::contacts::requests::deny::Request { uuid: contact_uuid },
 		)
 		.await
@@ -52,7 +52,7 @@ impl Client {
 
 	pub async fn delete_contact(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		api::v3::contacts::delete::post(
-			self.client(),
+			self,
 			&api::v3::contacts::delete::Request { uuid: contact_uuid },
 		)
 		.await
@@ -61,7 +61,7 @@ impl Client {
 	pub async fn list_incoming_contact_requests(
 		&self,
 	) -> Result<Vec<ContactRequestIn<'static>>, Error> {
-		api::v3::contacts::requests::r#in::get(self.client())
+		api::v3::contacts::requests::r#in::get(self)
 			.await
 			.map(|r| r.0)
 	}
@@ -69,20 +69,18 @@ impl Client {
 	pub async fn list_outgoing_contact_requests(
 		&self,
 	) -> Result<Vec<ContactRequestOut<'static>>, Error> {
-		api::v3::contacts::requests::out::get(self.client())
+		api::v3::contacts::requests::out::get(self)
 			.await
 			.map(|r| r.0)
 	}
 
 	pub async fn get_blocked_contacts(&self) -> Result<Vec<BlockedContact<'static>>, Error> {
-		api::v3::contacts::blocked::get(self.client())
-			.await
-			.map(|r| r.0)
+		api::v3::contacts::blocked::get(self).await.map(|r| r.0)
 	}
 
 	pub async fn block_contact(&self, email: &str) -> Result<UuidStr, Error> {
 		Ok(api::v3::contacts::blocked::add::post(
-			self.client(),
+			self,
 			&api::v3::contacts::blocked::add::Request {
 				email: email.to_string(),
 			},
@@ -93,7 +91,7 @@ impl Client {
 
 	pub async fn unblock_contact(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		api::v3::contacts::blocked::delete::post(
-			self.client(),
+			self,
 			&api::v3::contacts::blocked::delete::Request { uuid: contact_uuid },
 		)
 		.await

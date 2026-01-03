@@ -35,11 +35,8 @@ use super::{
 impl Client {
 	pub async fn trash_file(&self, file: &mut RemoteFile) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
-		api::v3::file::trash::post(
-			self.client(),
-			&api::v3::file::trash::Request { uuid: *file.uuid() },
-		)
-		.await?;
+		api::v3::file::trash::post(self, &api::v3::file::trash::Request { uuid: *file.uuid() })
+			.await?;
 		file.parent = ParentUuid::Trash;
 		Ok(())
 	}
@@ -47,16 +44,13 @@ impl Client {
 	pub async fn restore_file(&self, file: &mut RemoteFile) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::restore::post(
-			self.client(),
+			self,
 			&api::v3::file::restore::Request { uuid: *file.uuid() },
 		)
 		.await?;
 		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
-		let resp = api::v3::file::post(
-			self.client(),
-			&api::v3::file::Request { uuid: *file.uuid() },
-		)
-		.await?;
+		let resp =
+			api::v3::file::post(self, &api::v3::file::Request { uuid: *file.uuid() }).await?;
 
 		file.parent = resp.parent;
 		Ok(())
@@ -65,7 +59,7 @@ impl Client {
 	pub async fn delete_file_permanently(&self, file: RemoteFile) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::delete::permanent::post(
-			self.client(),
+			self,
 			&api::v3::file::delete::permanent::Request { uuid: *file.uuid() },
 		)
 		.await
@@ -78,7 +72,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::r#move::post(
-			self.client(),
+			self,
 			&api::v3::file::r#move::Request {
 				uuid: *file.uuid(),
 				new_parent: *new_parent.uuid(),
@@ -120,7 +114,7 @@ impl Client {
 		.await;
 
 		api::v3::file::metadata::post(
-			self.client(),
+			self,
 			&api::v3::file::metadata::Request {
 				uuid: *file.uuid(),
 				name: name?,
@@ -137,7 +131,7 @@ impl Client {
 	}
 
 	pub async fn get_file(&self, uuid: UuidStr) -> Result<RemoteFile, Error> {
-		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
+		let response = api::v3::file::post(self, &api::v3::file::Request { uuid }).await?;
 		let meta = runtime::do_cpu_intensive(|| {
 			FileMeta::blocking_from_encrypted(response.metadata, &*self.crypter(), response.version)
 		})
@@ -166,7 +160,7 @@ impl Client {
 		parent: &impl HasUUIDContents,
 	) -> Result<Option<UuidStr>, Error> {
 		api::v3::file::exists::post(
-			self.client(),
+			self,
 			&api::v3::file::exists::Request {
 				name_hashed: self.hash_name(name),
 				parent: (*parent.uuid()).into(),
@@ -228,7 +222,7 @@ impl Client {
 
 	pub async fn list_file_versions(&self, file: &RemoteFile) -> Result<Vec<FileVersion>, Error> {
 		let response = api::v3::file::versions::post(
-			self.client(),
+			self,
 			&api::v3::file::versions::Request { uuid: *file.uuid() },
 		)
 		.await?;
@@ -254,7 +248,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::version::restore::post(
-			self.client(),
+			self,
 			&api::v3::file::version::restore::Request {
 				current: *file.uuid(),
 				uuid: version.uuid,
@@ -287,7 +281,7 @@ impl Client {
 		use filen_types::crypto::EncryptedString;
 		let uuid = UuidStr::new_v4();
 		api::v3::upload::empty::post(
-			self.client(),
+			self,
 			&api::v3::upload::empty::Request {
 				name_hashed: Cow::Owned(self.hash_name(name)),
 				uuid,

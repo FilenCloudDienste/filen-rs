@@ -196,7 +196,7 @@ where
 }
 
 pub(crate) async fn post_request<T, U>(
-	client: impl UnauthorizedClient,
+	client: &impl UnauthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<U, Error>
@@ -222,7 +222,7 @@ where
 }
 
 pub(crate) async fn post_request_debug<T, U>(
-	client: impl UnauthorizedClient,
+	client: &impl UnauthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<U, Error>
@@ -245,7 +245,7 @@ where
 }
 
 pub(crate) async fn post_request_empty<T>(
-	client: impl UnauthorizedClient,
+	client: &impl UnauthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<(), Error>
@@ -265,7 +265,7 @@ where
 }
 
 pub(crate) async fn post_request_empty_debug<T>(
-	client: impl UnauthorizedClient,
+	client: &impl UnauthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<(), Error>
@@ -290,7 +290,7 @@ where
 }
 
 pub(crate) async fn post_auth_request<T, U>(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<U, Error>
@@ -317,7 +317,7 @@ where
 }
 
 pub(crate) async fn post_auth_request_debug<T, U>(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<U, Error>
@@ -343,7 +343,7 @@ where
 }
 
 pub(crate) async fn post_auth_request_no_body_empty(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	endpoint: &'static str,
 ) -> Result<(), Error> {
 	let _permit = client.get_semaphore_permit().await;
@@ -360,7 +360,7 @@ pub(crate) async fn post_auth_request_no_body_empty(
 }
 
 pub(crate) async fn post_auth_request_empty<T>(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<(), Error>
@@ -386,7 +386,7 @@ where
 }
 
 pub(crate) async fn post_auth_request_empty_debug<T>(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	request: &T,
 	endpoint: &'static str,
 ) -> Result<(), Error>
@@ -411,7 +411,7 @@ where
 }
 
 pub(crate) async fn get_auth_request<T>(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	endpoint: &'static str,
 ) -> Result<T, Error>
 where
@@ -431,7 +431,7 @@ where
 }
 
 pub(crate) async fn get_auth_request_debug<T>(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	endpoint: &'static str,
 ) -> Result<T, Error>
 where

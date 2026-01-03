@@ -7,6 +7,6 @@ pub(crate) mod delete;
 pub(crate) mod favorite;
 pub(crate) mod rename;
 
-pub(crate) async fn post(client: impl AuthorizedClient) -> Result<Response<'static>, Error> {
+pub(crate) async fn post(client: &impl AuthorizedClient) -> Result<Response<'static>, Error> {
 	get_auth_request(client, ENDPOINT).await
 }

@@ -189,12 +189,10 @@ impl Client {
 		retry_wrap(
 			bytes,
 			|| {
-				self.client()
-					.post_auth_request(gateway_url(endpoint))
-					.header(
-						reqwest::header::CONTENT_TYPE,
-						reqwest::header::HeaderValue::from_static("application/json"),
-					)
+				self.post_auth_request(gateway_url(endpoint)).header(
+					reqwest::header::CONTENT_TYPE,
+					reqwest::header::HeaderValue::from_static("application/json"),
+				)
 			},
 			endpoint,
 			async |resp| {

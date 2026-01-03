@@ -7,7 +7,7 @@ pub struct UnauthClient {
 	client: reqwest::Client,
 }
 
-impl UnauthorizedClient for &UnauthClient {
+impl UnauthorizedClient for UnauthClient {
 	fn get_client(&self) -> &reqwest::Client {
 		&self.client
 	}
@@ -80,13 +80,13 @@ impl AuthClient {
 	}
 }
 
-impl UnauthorizedClient for &AuthClient {
+impl UnauthorizedClient for AuthClient {
 	fn get_client(&self) -> &reqwest::Client {
 		&self.client
 	}
 }
 
-impl AuthorizedClient for &AuthClient {
+impl AuthorizedClient for AuthClient {
 	fn get_api_key(&'_ self) -> std::sync::RwLockReadGuard<'_, APIKey<'_>> {
 		self.inner_get_api_key()
 	}
@@ -98,13 +98,13 @@ impl AuthorizedClient for &AuthClient {
 
 impl UnauthorizedClient for crate::auth::Client {
 	fn get_client(&self) -> &reqwest::Client {
-		&self.client().client
+		&self.http_client.client
 	}
 }
 
 impl AuthorizedClient for crate::auth::Client {
 	fn get_api_key(&'_ self) -> std::sync::RwLockReadGuard<'_, APIKey<'_>> {
-		self.client().inner_get_api_key()
+		self.http_client.inner_get_api_key()
 	}
 
 	async fn get_semaphore_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
@@ -146,7 +146,7 @@ pub(crate) trait AuthorizedClient: UnauthorizedClient {
 impl crate::auth::Client {
 	pub fn update_api_key(&self, new_key: APIKey<'static>) {
 		*self
-			.client()
+			.http_client
 			.api_key
 			.write()
 			.unwrap_or_else(|e| e.into_inner()) = new_key;

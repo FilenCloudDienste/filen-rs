@@ -16,7 +16,7 @@ pub(crate) mod done;
 pub(crate) mod empty;
 
 pub(crate) async fn upload_file_chunk(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	file: &BaseFile,
 	upload_key: &str,
 	chunk_idx: u64,

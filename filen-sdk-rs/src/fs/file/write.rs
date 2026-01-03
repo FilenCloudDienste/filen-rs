@@ -100,7 +100,7 @@ impl<'a> FileWriterUploadingState<'a> {
 
 			let chunk_bytes: Bytes = chunk_bytes.into();
 			let result = api::v3::upload::upload_file_chunk(
-				client.client(),
+				client,
 				&file,
 				&upload_key,
 				chunk_idx,
@@ -332,8 +332,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 			Result<filen_types::api::v3::upload::empty::Response, Error>,
 		> = if self.written == 0 {
 			Box::pin(async move {
-				api::v3::upload::empty::post(self.client.client(), &empty_request_future.await?)
-					.await
+				api::v3::upload::empty::post(self.client, &empty_request_future.await?).await
 			})
 		} else {
 			let upload_key = self.upload_key.clone();
@@ -343,7 +342,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 					&mut rand::rng(),
 				));
 				api::v3::upload::done::post(
-					self.client.client(),
+					self.client,
 					&api::v3::upload::done::Request {
 						empty_request: empty_request_future.await?,
 						chunks: self.num_chunks,

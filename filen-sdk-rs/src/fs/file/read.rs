@@ -104,8 +104,7 @@ impl<'a> FileReader<'a> {
 		let client = self.client;
 		let file = self.file;
 		self.futures.push_back(Box::pin(async move {
-			api::download::download_file_chunk(client.client(), file, chunk_idx, out_data.as_mut())
-				.await?;
+			api::download::download_file_chunk(client, file, chunk_idx, out_data.as_mut()).await?;
 			file.key()
 				.ok_or(MetadataWasNotDecryptedError)?
 				.decrypt_data(out_data.as_mut())

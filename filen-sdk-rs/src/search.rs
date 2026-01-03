@@ -151,7 +151,7 @@ impl Client {
 		I: HasName + HasUUID + HasType,
 	{
 		let items = self.generate_search_items_for_item(item)?;
-		api::v3::search::add::post(self.client(), &api::v3::search::add::Request { items }).await
+		api::v3::search::add::post(self, &api::v3::search::add::Request { items }).await
 	}
 
 	pub async fn find_item_matches_for_name(
@@ -160,7 +160,7 @@ impl Client {
 	) -> Result<Vec<(NonRootFSObject<'static>, String)>, crate::error::Error> {
 		let name = name.trim().to_lowercase();
 		let response = api::v3::search::find::post(
-			self.client(),
+			self,
 			&api::v3::search::find::Request {
 				hashes: vec![self.hmac_key.hash(name.as_bytes())],
 			},

@@ -10,7 +10,7 @@ use crate::{
 	fs::file::traits::File,
 };
 pub(crate) async fn download_file_chunk(
-	client: impl AuthorizedClient,
+	client: &impl AuthorizedClient,
 	file: &dyn File,
 	chunk_idx: u64,
 	out_chunk: &mut Vec<u8>,

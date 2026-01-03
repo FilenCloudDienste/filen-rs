@@ -397,10 +397,6 @@ impl Client {
 		})
 	}
 
-	pub fn client(&self) -> &AuthClient {
-		&self.http_client
-	}
-
 	pub fn arc_client(&self) -> Arc<AuthClient> {
 		self.http_client.clone()
 	}
@@ -650,7 +646,7 @@ impl Client {
 					}),
 				AuthInfo::V3(info) => vec![info.dek.to_string()],
 			},
-			api_key: self.client().get_api_key().to_string(),
+			api_key: self.http_client.get_api_key().to_string(),
 			private_key: BASE64_STANDARD
 				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
 			public_key: BASE64_STANDARD.encode(self.public_key.to_pkcs1_der().unwrap().as_bytes()),
@@ -664,7 +660,7 @@ impl Client {
 	}
 
 	pub async fn generate_2fa_secret(&self) -> Result<TwoFASecret, Error> {
-		let resp = api::v3::user::settings::get(self.client()).await?;
+		let resp = api::v3::user::settings::get(self).await?;
 
 		Ok(TwoFASecret::new(
 			resp.two_factor_key.into_owned(),
@@ -676,7 +672,7 @@ impl Client {
 	pub async fn enable_2fa(&self, current_2fa_code: &str) -> Result<String, Error> {
 		let _lock = self.lock_auth().await?;
 		let resp = api::v3::user::two_fa::enable::post(
-			self.client(),
+			self,
 			&api::v3::user::two_fa::enable::Request {
 				code: Cow::Borrowed(current_2fa_code),
 			},
@@ -689,7 +685,7 @@ impl Client {
 	pub async fn disable_2fa(&self, current_2fa_code: &str) -> Result<(), Error> {
 		let _lock = self.lock_auth().await?;
 		api::v3::user::two_fa::disable::post(
-			self.client(),
+			self,
 			&api::v3::user::two_fa::disable::Request {
 				code: Cow::Borrowed(current_2fa_code),
 			},
@@ -700,7 +696,7 @@ impl Client {
 
 	pub async fn delete_account(&self, two_factor_code: &str) -> Result<(), Error> {
 		api::v3::user::delete::post(
-			self.client(),
+			self,
 			&api::v3::user::delete::Request {
 				two_factor_key: Cow::Borrowed(two_factor_code),
 			},
@@ -716,7 +712,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_auth().await?;
 		let auth_info_resp = api::v3::auth::info::post(
-			self.client(),
+			self,
 			&api::v3::auth::info::Request {
 				email: Cow::Borrowed(&self.email),
 			},
@@ -759,7 +755,7 @@ impl Client {
 		let encrypted = master_keys.to_encrypted().await;
 
 		let resp = api::v3::user::settings::password::change::post(
-			self.client(),
+			self,
 			&api::v3::user::settings::password::change::Request {
 				current_password: current_derived,
 				password: new_derive,
@@ -773,7 +769,7 @@ impl Client {
 		self.update_api_key(resp.new_api_key);
 
 		api::v3::user::key_pair::update::post(
-			self.client(),
+			self,
 			&api::v3::user::key_pair::update::Request {
 				public_key: RsaDerPublicKey(Cow::Borrowed(&self.public_key)),
 				private_key: private_key_encrypted,
@@ -796,7 +792,7 @@ impl Client {
 			.unwrap_or_else(|e| e.into_inner())
 			.as_ref()
 			.convert_into_exportable(self.user_id)?;
-		api::v3::user::did_export_master_keys::post(self.client())
+		api::v3::user::did_export_master_keys::post(self)
 			.await
 			.map(|_| exportable)
 	}
