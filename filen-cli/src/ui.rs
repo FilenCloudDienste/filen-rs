@@ -57,9 +57,9 @@ pub(crate) struct UI {
 }
 
 impl UI {
-	pub(crate) fn new(quiet: bool, json: bool, overwrite_terminal_width: Option<usize>) -> Self {
+	pub(crate) fn new() -> Self {
 		UI {
-			quiet,
+			quiet: false,
 			theme: dialoguer::theme::ColorfulTheme {
 				prompt_prefix: style("›".to_string()).cyan().bold(),
 				prompt_suffix: style("›".to_string()).dim().bold(),
@@ -68,10 +68,21 @@ impl UI {
 			},
 			repl_input_theme: Self::repl_input_theme_for_user(None),
 			history: dialoguer::BasicHistory::new().no_duplicates(true),
-			overwrite_terminal_width,
+			overwrite_terminal_width: None,
 			output: Vec::new(),
-			json,
+			json: false,
 		}
+	}
+
+	pub(crate) fn initialize(
+		&mut self,
+		quiet: bool,
+		json: bool,
+		overwrite_terminal_width: Option<usize>,
+	) {
+		self.quiet = quiet;
+		self.json = json;
+		self.overwrite_terminal_width = overwrite_terminal_width;
 	}
 
 	pub(crate) fn set_user(&mut self, user: Option<&str>) {
@@ -409,16 +420,19 @@ mod tests {
 		}
 
 		// different terminal sizes
-		let mut small_ui = UI::new(false, false, Some(30));
+		let mut small_ui = UI::new();
+		small_ui.initialize(false, false, Some(30));
 		test(&mut small_ui);
 		insta::assert_snapshot!(small_ui.output.join("\n"));
-		let mut large_ui = UI::new(false, false, Some(100));
+		let mut large_ui = UI::new();
+		large_ui.initialize(false, false, Some(100));
 		test(&mut large_ui);
 		insta::assert_snapshot!(large_ui.output.join("\n"));
 
 		// no color
 		console::set_colors_enabled(false);
-		let mut no_color_ui = UI::new(false, false, Some(100));
+		let mut no_color_ui = UI::new();
+		no_color_ui.initialize(false, false, Some(100));
 		test(&mut no_color_ui);
 		insta::assert_snapshot!(no_color_ui.output.join("\n"));
 	}

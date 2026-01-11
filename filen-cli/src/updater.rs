@@ -87,7 +87,6 @@ pub(crate) async fn check_for_updates(
 	// display announcements
 	{
 		let version = semver::Version::parse(&version)?;
-		dbg!(announcements.clone());
 		announcements
 			.into_iter()
 			.filter(|announcement| announcement.version_range.matches(&version))

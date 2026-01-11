@@ -99,10 +99,14 @@ pub(crate) fn construct_exit_code_error(code: i32) -> anyhow::Error {
 
 #[tokio::main]
 async fn main() {
+	let mut ui = ui::UI::new();
+	// call ui.initialize() later after parsing args
+
 	// translate errors to non-zero exit code
-	match inner_main().await {
+	match inner_main(&mut ui).await {
 		Ok(_) => {}
 		Err(e) if e.to_string().starts_with(EXIT_CODE_ERROR_PREFIX) => {
+			ui.print_failure_or_error(&e);
 			if let Some(code_str) = e.to_string().strip_prefix(EXIT_CODE_ERROR_PREFIX)
 				&& let Ok(code) = code_str.parse::<i32>()
 			{
@@ -114,7 +118,7 @@ async fn main() {
 	}
 }
 
-async fn inner_main() -> Result<()> {
+async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 	let cli_args = CliArgs::parse();
 
 	let is_dev = cfg!(debug_assertions);
@@ -168,45 +172,34 @@ async fn inner_main() -> Result<()> {
 
 	info!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
 
-	let mut ui = ui::UI::new(cli_args.quiet, cli_args.json, None);
+	ui.initialize(cli_args.quiet, cli_args.json, None);
 
 	// --export-markdown-docs
 	if cli_args.export_markdown_docs {
-		generate_markdown_docs().inspect_err(|e| {
-			ui.print_failure_or_error(e);
-		})?;
+		generate_markdown_docs()?;
 	}
 
 	// --help
 	if let Some(help_topic) = cli_args.help {
-		if let Err(e) = print_in_app_docs(
-			&mut ui,
+		print_in_app_docs(
+			ui,
 			if help_topic.is_empty() {
 				None
 			} else {
 				Some(help_topic)
 			},
-		) {
-			ui.print_failure_or_error(&e);
-		}
+		)?;
 		return Ok(());
 	}
 
 	if !cli_args.skip_update {
-		match check_for_updates(
-			&mut ui,
+		check_for_updates(
+			ui,
 			cli_args.force_update_check,
 			&config.config_dir,
 			cli_args.command.is_none(),
 		)
-		.await
-		{
-			Ok(_) => {}
-			Err(e) => {
-				ui.print_failure_or_error(&e);
-				return Err(e);
-			}
-		}
+		.await?;
 	}
 
 	let mut client = auth::LazyClient::new(
@@ -220,28 +213,18 @@ async fn inner_main() -> Result<()> {
 	let mut working_path = RemotePath::new("");
 
 	if let Some(command) = cli_args.command {
-		match execute_command(&config, &mut ui, &mut client, &working_path, command).await {
-			Ok(_) => Ok(()),
-			Err(e) => {
-				ui.print_failure_or_error(&e);
-				Err(e)
-			}
-		}
+		let _ = execute_command(&config, ui, &mut client, &working_path, command).await?;
+		Ok(())
 	} else {
 		ui.print_banner();
-		loop {
-			match client.get(&mut ui).await {
-				Ok(_) => {}
-				Err(e) => {
-					ui.print_failure_or_error(&e);
-					break;
-				}
-			}
-			// authenticate, so the username is shown in the prompt.
-			// this essentially defeats the purpose of LazyClient, but:
-			// it does make a difference so non-authenticated commands (e.g. logout) can still be run ..
-			// .. without authentication when called directly (no REPL)
 
+		client.get(ui).await?;
+		// authenticate, so the username is shown in the prompt.
+		// this essentially defeats the purpose of LazyClient, but:
+		// it does make a difference so non-authenticated commands (e.g. logout) can still be run ..
+		// .. without authentication when called directly (no REPL)
+
+		loop {
 			let line = ui.prompt_repl(&working_path.to_string())?;
 			let line = line.trim();
 			if line.is_empty() {
@@ -261,7 +244,7 @@ async fn inner_main() -> Result<()> {
 			}
 			match execute_command(
 				&config,
-				&mut ui,
+				ui,
 				&mut client,
 				&working_path,
 				cli_args.command.unwrap(),
