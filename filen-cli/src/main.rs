@@ -114,7 +114,10 @@ async fn main() {
 			}
 			std::process::exit(1);
 		}
-		Err(_) => std::process::exit(1),
+		Err(e) => {
+			ui.print_failure_or_error(&e);
+			std::process::exit(1);
+		}
 	}
 }
 

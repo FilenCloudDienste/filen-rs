@@ -44,6 +44,8 @@ impl log::Log for CustomLogger {
 	fn flush(&self) {}
 }
 
+const FAILED_TO_READ_INPUT_PROMPT: &str = "Failed to read input prompt";
+
 pub(crate) struct UI {
 	quiet: bool,
 	theme: dialoguer::theme::ColorfulTheme,
@@ -188,6 +190,11 @@ impl UI {
 		let is_failure = err_msg.starts_with(&format!("{}", style("✘").red()));
 		if is_failure {
 			self.print(&err_msg);
+		} else if err_msg.contains(FAILED_TO_READ_INPUT_PROMPT) {
+			self.print_failure("Failed to read input from terminal. Please ensure that the terminal supports interactive input.");
+			if cfg!(feature = "is_docker") {
+				self.print_failure("It seems you are running the CLI in a Docker container. Make sure to run the container with the -it flags to enable interactive input.");
+			}
 		} else {
 			self.print_failure(&format!("An unexpected error occurred: {}", err));
 			self.print_failure("If you believe this is a bug, please report it at https://github.com/FilenCloudDienste/filen-rs/issues");
@@ -263,42 +270,38 @@ impl UI {
 
 	/// Prompt the user for input in the REPL (contains some special formatting)
 	pub(crate) fn prompt_repl(&mut self, path: &str) -> Result<String> {
-		let input = dialoguer::Input::with_theme(&self.repl_input_theme)
+		dialoguer::Input::with_theme(&self.repl_input_theme)
 			.history_with(&mut self.history)
 			.with_prompt(path.trim())
 			.interact_text()
-			.context("Failed to read input prompt")?;
-		Ok(input)
+			.context(FAILED_TO_READ_INPUT_PROMPT)
 	}
 
 	/// Prompt the user for text input
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
-		let input = dialoguer::Input::with_theme(&self.theme)
+		dialoguer::Input::with_theme(&self.theme)
 			.history_with(&mut self.history)
 			.with_prompt(msg.trim())
 			.interact_text()
-			.context("Failed to read input prompt")?;
-		Ok(input)
+			.context(FAILED_TO_READ_INPUT_PROMPT)
 	}
 
 	/// Prompt the user for a password (no echo)
 	pub(crate) fn prompt_password(&mut self, msg: &str) -> Result<String> {
-		let password = dialoguer::Password::with_theme(&self.theme)
+		dialoguer::Password::with_theme(&self.theme)
 			.with_prompt(msg.trim())
 			.interact()
-			.context("Failed to read password input prompt")?;
-		Ok(password)
+			.context(FAILED_TO_READ_INPUT_PROMPT)
 	}
 
 	/// Prompt the user for a yes/no input
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
-		let result = dialoguer::Confirm::with_theme(&self.theme)
+		dialoguer::Confirm::with_theme(&self.theme)
 			.with_prompt(msg.trim())
 			.default(default)
 			.report(true)
 			.interact()
-			.context("Failed to read confirmation prompt")?;
-		Ok(result)
+			.context(FAILED_TO_READ_INPUT_PROMPT)
 	}
 
 	// format help text
