@@ -99,6 +99,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::DocFragment("managed-rclone"),
 				DocElement::CommandHelp("mount"),
 				DocElement::CommandHelp("rclone"),
+				DocElement::CommandHelp("export-api-key"),
 			],
 		},
 	];

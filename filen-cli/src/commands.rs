@@ -123,6 +123,8 @@ pub(crate) enum Commands {
 		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
 		cmd: Vec<String>,
 	},
+	/// Exports your user API key (for use with non-managed Rclone)
+	ExportApiKey,
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -250,6 +252,21 @@ pub(crate) async fn execute_command(
 		}
 		Commands::Rclone { cmd } => {
 			rclone::execute_rclone(config, ui, client, cmd).await?;
+			None
+		}
+		Commands::ExportApiKey => {
+			let client = client.get(ui).await?.to_stringified();
+			if ui.json {
+				ui.print_json(json!({
+					"email": client.email,
+					"apiKey": client.api_key,
+				}))?;
+			} else {
+				ui.print_key_value_table(&[(
+					&format!("API Key for {}:", client.email),
+					client.api_key.as_str(),
+				)]);
+			}
 			None
 		}
 		Commands::Logout => {
