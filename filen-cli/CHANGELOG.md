@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- /
+
+## 0.2.3 - 2026-01-12
+
 ### Added
 
+- updater can display important announcements fetched from the release repo
 - Docker builds
 - `export-api-key` command for use with unmanaged Rclone
 
