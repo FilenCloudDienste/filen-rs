@@ -1,5 +1,5 @@
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::{auth, fs::HasName};
+use filen_sdk_rs::fs::HasName;
 use predicates::prelude::PredicateBooleanExt as _;
 use rand::TryRngCore;
 use test_utils::authenticated_cli_with_args;
