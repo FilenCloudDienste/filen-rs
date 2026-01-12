@@ -1,0 +1,8 @@
+blank_issues_enabled: true # might change later
+contact_links:
+  - name: Discord Community
+    url: https://discord.gg/A9cxbuA
+    about: You can ask questions and get support in our Discord community
+  - name: Reddit
+    url: https://www.reddit.com/r/filen_io/
+    about: Join the Filen subreddit to discuss and get help from other users
