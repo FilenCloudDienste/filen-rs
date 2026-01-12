@@ -168,6 +168,11 @@ impl UI {
 		}
 	}
 
+	/// Print a message with a warning icon
+	pub(crate) fn print_warning(&mut self, msg: &str) {
+		self.print(&format!("{} {}", style("⚠").yellow(), style(msg).yellow()));
+	}
+
 	/// Print a message with a failure icon
 	pub(crate) fn print_failure(&mut self, msg: &str) {
 		self.print(&format!("{} {}", style("✘").red(), msg));

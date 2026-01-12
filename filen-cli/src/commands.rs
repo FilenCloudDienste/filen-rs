@@ -262,6 +262,7 @@ pub(crate) async fn execute_command(
 					"apiKey": client.api_key,
 				}))?;
 			} else {
+				ui.print_warning("Keep your API key secret! Do not share it with anyone.");
 				ui.print_key_value_table(&[(
 					&format!("API Key for {}:", client.email),
 					client.api_key.as_str(),
