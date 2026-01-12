@@ -1,5 +1,5 @@
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::HasName;
+use filen_sdk_rs::{auth, fs::HasName};
 use predicates::prelude::PredicateBooleanExt as _;
 use rand::TryRngCore;
 use test_utils::authenticated_cli_with_args;
@@ -285,4 +285,39 @@ async fn cmd_rclone() {
 	.stdout(predicates::str::contains("testfile.txt"));
 }
 
-// todo: list-trash, empty-trash cmds -> waiting for fix
+#[shared_test_runtime]
+async fn cmd_list_trash_empty_trash() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+
+	// create test file to trash
+	let test_dir = &resources.dir;
+	let file = client
+		.make_file_builder("testfile_from_cli_test_list_trash.txt", test_dir)
+		.build();
+	let content = "Hello, Filen!";
+	let mut file = client
+		.upload_file(file.into(), content.as_bytes())
+		.await
+		.unwrap();
+
+	// trash the file
+	client.trash_file(&mut file).await.unwrap();
+
+	// list-trash
+	authenticated_cli_with_args!("list-trash")
+		.success()
+		.stdout(predicates::str::contains(
+			"testfile_from_cli_test_list_trash.txt",
+		));
+
+	// empty-trash
+	authenticated_cli_with_args!("empty-trash")
+		.success()
+		.stdout(predicates::str::contains("Emptied trash"));
+
+	// verify trash is listed as empty
+	authenticated_cli_with_args!("list-trash")
+		.success()
+		.stdout(predicates::str::contains("Trash is empty"));
+}
