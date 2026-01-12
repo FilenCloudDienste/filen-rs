@@ -312,13 +312,14 @@ async fn list_directory(
 		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
 		_ => return Err(UI::failure(&format!("Not a directory: {}", directory_str))),
 	};
-	list_directory_by_uuid(ui, client, directory.uuid()).await
+	list_directory_by_uuid(ui, client, directory.uuid(), None).await
 }
 
 async fn list_directory_by_uuid(
 	ui: &mut UI,
 	client: &Client,
 	directory: &dyn HasContents,
+	directory_label: Option<&str>,
 ) -> Result<()> {
 	let items = client
 		.list_dir(directory)
@@ -353,7 +354,10 @@ async fn list_directory_by_uuid(
 			.map(|s| s.as_ref())
 			.collect::<Vec<&str>>();
 		if all_items.is_empty() {
-			ui.print_muted("Directory is empty");
+			ui.print_muted(&format!(
+				"{} is empty",
+				directory_label.unwrap_or("Directory")
+			));
 			return Ok(());
 		}
 		ui.print_grid(&all_items);
@@ -792,8 +796,7 @@ async fn set_file_or_directory_favorite(
 
 async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
-	list_directory_by_uuid(ui, client, &ParentUuid::Trash).await
-	// todo: this should work, it is an underlying issue
+	list_directory_by_uuid(ui, client, &ParentUuid::Trash, Some("Trash")).await
 }
 
 async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
