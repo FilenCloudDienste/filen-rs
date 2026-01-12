@@ -1,6 +1,5 @@
 name: CLI Bug Report
 description: File a bug report about the Filen CLI v0.2.3 or later
-title: ""
 labels: ["cli", "bug"]
 body:
   - type: markdown
