@@ -174,7 +174,7 @@ impl Client {
 							d.uuid,
 							d.parent,
 							d.color,
-							d.favorited,
+							d.favorited.unwrap_or(false),
 							d.timestamp,
 							d.meta,
 							&*crypter,

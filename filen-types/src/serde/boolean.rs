@@ -1,5 +1,6 @@
-pub(crate) mod number {
-	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
+struct NumberBoolean(bool);
+impl<'de> serde::de::Deserialize<'de> for NumberBoolean {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
@@ -27,7 +28,19 @@ pub(crate) mod number {
 				Ok(v != 0)
 			}
 		}
-		deserializer.deserialize_any(BooleanVisitor)
+		let v = deserializer.deserialize_any(BooleanVisitor)?;
+		Ok(Self(v))
+	}
+}
+
+pub(crate) mod number {
+	use serde::Deserialize;
+
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		super::NumberBoolean::deserialize(deserializer).map(|b| b.0)
 	}
 
 	pub(crate) fn serialize<S>(v: &bool, serializer: S) -> Result<S::Ok, S::Error>
@@ -36,6 +49,31 @@ pub(crate) mod number {
 	{
 		let value = if *v { 1 } else { 0 };
 		serializer.serialize_u8(value)
+	}
+}
+
+pub(crate) mod maybe_number {
+	use serde::Deserialize;
+
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let opt = Option::<super::NumberBoolean>::deserialize(deserializer)?;
+		Ok(opt.map(|b| b.0))
+	}
+
+	pub(crate) fn serialize<S>(v: &Option<bool>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		match v {
+			Some(value) => {
+				let num = if *value { 1 } else { 0 };
+				serializer.serialize_u8(num)
+			}
+			None => serializer.serialize_none(),
+		}
 	}
 }
 

@@ -12,7 +12,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	crypto::shared::generate_random_base64_values,
 	fs::{
-		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
+		FSObject, HasName, HasParent, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
 		client_impl::ObjectOrRemainingPath,
 		dir::{
 			RemoteDirectory, UnsharedDirectoryType,
@@ -27,6 +27,7 @@ use filen_sdk_rs::{
 	},
 	io::{DirUploadCallback, FilenMetaExt, WalkError},
 };
+use filen_types::fs::ParentUuid;
 use futures::StreamExt;
 use tokio::time;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -51,6 +52,16 @@ async fn create_list_trash() {
 	}
 
 	client.trash_dir(&mut dir).await.unwrap();
+
+	let (trashed_dirs, _) = client.list_dir(&ParentUuid::Trash).await.unwrap();
+	let found = trashed_dirs
+		.into_iter()
+		.find(|d| d.uuid() == dir.uuid())
+		.unwrap();
+	assert_eq!(*found.parent(), ParentUuid::Uuid(*test_dir.uuid()));
+
+	let found_dir = client.get_dir(*dir.uuid()).await.unwrap();
+	assert_eq!(dir, found_dir);
 }
 
 #[derive(Default)]

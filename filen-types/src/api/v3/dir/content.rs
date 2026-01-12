@@ -55,12 +55,12 @@ pub struct Directory<'a> {
 	pub color: DirColor<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
-	#[serde(with = "crate::serde::boolean::number")]
-	pub favorited: bool,
-	#[serde(with = "crate::serde::boolean::number")]
+	#[serde(with = "crate::serde::boolean::maybe_number", default)]
+	pub favorited: Option<bool>,
+	#[serde(with = "crate::serde::boolean::maybe_number", default)]
 	#[serde(rename = "is_sync")]
-	pub is_sync: bool,
-	#[serde(with = "crate::serde::boolean::number")]
+	pub is_sync: Option<bool>,
+	#[serde(with = "crate::serde::boolean::maybe_number", default)]
 	#[serde(rename = "is_default")]
-	pub is_default: bool,
+	pub is_default: Option<bool>,
 }
