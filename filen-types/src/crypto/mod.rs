@@ -3,7 +3,6 @@ use std::{borrow::Cow, fmt::Formatter};
 
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::Sha512;
 
 use crate::traits::CowHelpers;
 
@@ -118,53 +117,48 @@ pub struct EncryptedMetaKey<'a>(pub EncryptedString<'a>);
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Sha512Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 64]);
+pub struct Blake3Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 32]);
+
 #[cfg(feature = "uniffi")]
 uniffi::custom_type!(
-	Sha512Hash,
+	Blake3Hash,
 	Vec<u8>, {
-	lower: |v: &Sha512Hash| v.0.to_vec(),
+	lower: |v: &Blake3Hash| v.0.to_vec(),
 	try_lift: |v: Vec<u8>| {
-		let slice: [u8; 64] = v.as_slice().try_into().map_err(|_| {
-			uniffi::deps::anyhow::anyhow!("expected 64 bytes for Sha512Hash, got {}", v.len())
+		let slice: [u8; 32] = v.as_slice().try_into().map_err(|_| {
+			uniffi::deps::anyhow::anyhow!("expected 32 bytes for Blake3Hash, got {}", v.len())
 		})?;
-		Ok(Sha512Hash(slice))
+		Ok(Blake3Hash(slice))
 	}}
 );
 
-impl std::fmt::Debug for Sha512Hash {
+impl std::fmt::Debug for Blake3Hash {
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		write!(f, "Sha512Hash({})", faster_hex::hex_string(&self.0))
+		write!(f, "Blake3Hash({})", faster_hex::hex_string(&self.0))
 	}
 }
 
-impl From<digest::Output<Sha512>> for Sha512Hash {
-	fn from(hash: digest::Output<Sha512>) -> Self {
+impl From<blake3::Hash> for Blake3Hash {
+	fn from(hash: blake3::Hash) -> Self {
 		Self(hash.into())
 	}
 }
 
-impl From<Sha512Hash> for digest::Output<Sha512> {
-	fn from(hash: Sha512Hash) -> Self {
-		hash.0.into()
+impl From<[u8; 32]> for Blake3Hash {
+	fn from(hash: [u8; 32]) -> Self {
+		Self(hash)
 	}
 }
 
-impl From<Sha512Hash> for [u8; 64] {
-	fn from(hash: Sha512Hash) -> Self {
+impl From<Blake3Hash> for [u8; 32] {
+	fn from(hash: Blake3Hash) -> Self {
 		hash.0
 	}
 }
 
-impl AsRef<[u8]> for Sha512Hash {
+impl AsRef<[u8]> for Blake3Hash {
 	fn as_ref(&self) -> &[u8] {
 		&self.0
-	}
-}
-
-impl From<[u8; 64]> for Sha512Hash {
-	fn from(hash: [u8; 64]) -> Self {
-		Self(hash)
 	}
 }
 

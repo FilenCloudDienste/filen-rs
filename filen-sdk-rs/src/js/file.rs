@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use filen_types::{
 	auth::FileEncryptionVersion,
-	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},
+	crypto::{Blake3Hash, EncryptedString, rsa::RSAEncryptedString},
 	fs::{ParentUuid, UuidStr},
 };
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ pub struct DecryptedFileMeta {
 		tsify(type = "Uint8Array")
 	)]
 	#[serde(skip_serializing_if = "Option::is_none", default)]
-	pub hash: Option<Sha512Hash>,
+	pub hash: Option<Blake3Hash>,
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),

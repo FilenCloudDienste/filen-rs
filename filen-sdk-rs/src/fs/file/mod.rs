@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
-	crypto::Sha512Hash,
+	crypto::Blake3Hash,
 	fs::{ObjectType, ParentUuid, UuidStr},
 	traits::CowHelpers,
 };
@@ -277,7 +277,7 @@ pub struct FlatRemoteFile {
 	pub region: String,
 	pub bucket: String,
 	pub timestamp: DateTime<Utc>,
-	pub hash: Option<Sha512Hash>,
+	pub hash: Option<Blake3Hash>,
 }
 
 impl From<FlatRemoteFile> for RemoteFile {
@@ -397,7 +397,7 @@ impl HasRemoteFileInfo for RemoteFile {
 		&self.bucket
 	}
 
-	fn hash(&self) -> Option<Sha512Hash> {
+	fn hash(&self) -> Option<Blake3Hash> {
 		self.meta.hash()
 	}
 }
@@ -531,7 +531,7 @@ impl HasRemoteFileInfo for RemoteRootFile {
 		&self.bucket
 	}
 
-	fn hash(&self) -> Option<Sha512Hash> {
+	fn hash(&self) -> Option<Blake3Hash> {
 		self.meta.hash()
 	}
 }

@@ -1,11 +1,10 @@
-use filen_types::crypto::Sha256Hash;
+use filen_types::crypto::Blake3Hash;
 use lazy_static::lazy_static;
-use sha2::Digest;
 
 // Generic
 pub(crate) const INIT: &str = include_str!("../../sql/init.sql");
 lazy_static! {
-	pub static ref DB_INIT_HASH: Sha256Hash = sha2::Sha256::digest(INIT.as_bytes()).into();
+	pub static ref DB_INIT_HASH: Blake3Hash = blake3::hash(INIT.as_bytes()).into();
 }
 pub(crate) const SELECT_ID_BY_UUID: &str = "SELECT id FROM items WHERE uuid = ?;";
 pub(crate) const DELETE_BY_UUID: &str = "DELETE FROM items WHERE uuid = ?;";

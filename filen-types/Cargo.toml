@@ -26,6 +26,7 @@ serde_bytes = "0.11.17"
 filen-macros = { path = "../filen-macros" }
 uniffi = { version = "0.29.4", optional = true }
 yoke = "0.8.1"
+blake3 = "1.8.3"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen = "0.2.100"

@@ -20,7 +20,6 @@ use filen_types::{
 };
 use log::trace;
 use rusqlite::{CachedStatement, Connection, Result};
-use sha2::Digest;
 
 use crate::{
 	ffi::ItemType,
@@ -43,12 +42,12 @@ pub(crate) struct DBDecryptedFileMeta {
 	pub(crate) key_version: u8,
 	pub(crate) modified: i64,
 	pub(crate) created: Option<i64>,
-	pub(crate) hash: Option<[u8; 64]>,
+	pub(crate) hash: Option<[u8; 32]>,
 }
 
 impl Debug for DBDecryptedFileMeta {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let key_hash_str = faster_hex::hex_string(&sha2::Sha256::digest(self.key.as_bytes()));
+		let key_hash_str = faster_hex::hex_string(blake3::hash(self.key.as_bytes()).as_bytes());
 		let hash_hashed_str = self.hash.map(|h| faster_hex::hex_string(&h));
 
 		f.debug_struct("DBDecryptedFileMeta")
@@ -275,7 +274,7 @@ impl DBFile {
 				decrypted_meta.key.version() as u8,
 				decrypted_meta.created.map(|dt| dt.timestamp_millis()),
 				decrypted_meta.last_modified.timestamp_millis(),
-				decrypted_meta.hash.map(<[u8; 64]>::from),
+				decrypted_meta.hash.map(<[u8; 32]>::from),
 			))?;
 		} else {
 			delete_file_meta.execute([id])?;

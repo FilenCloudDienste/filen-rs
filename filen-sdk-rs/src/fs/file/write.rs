@@ -6,9 +6,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use filen_types::crypto::Sha512Hash;
+use filen_types::crypto::Blake3Hash;
 use futures::{AsyncWrite, FutureExt, StreamExt, stream::FuturesUnordered};
-use sha2::Digest;
 
 use crate::{
 	api,
@@ -54,7 +53,7 @@ struct FileWriterUploadingState<'a> {
 	size: Option<u64>,
 	next_chunk_idx: u64,
 	written: u64,
-	hasher: sha2::Sha512,
+	hasher: blake3::Hasher,
 	remote_file_info: Arc<OnceLock<RemoteFileInfo>>,
 	upload_key: Arc<String>,
 	client: &'a Client,
@@ -84,7 +83,7 @@ impl<'a> FileWriterUploadingState<'a> {
 		let file = self.file.clone();
 		let upload_key = self.upload_key.clone();
 		let callback = self.callback.clone();
-		self.hasher.update(&out_data);
+		self.hasher.update_rayon(out_data.as_ref());
 		let remote_file_info = self.remote_file_info.clone();
 		self.futures.push(Box::pin(async move {
 			// encrypt the data
@@ -160,7 +159,7 @@ impl<'a> FileWriterUploadingState<'a> {
 		self,
 	) -> Result<FileWriterWaitingForDriveLockState<'a>, Error> {
 		let lock_future = self.client.lock_drive();
-		let hash = Sha512Hash::from(self.hasher.finalize());
+		let hash = Blake3Hash::from(self.hasher.finalize());
 
 		let remote_file_info = match Arc::try_unwrap(self.remote_file_info) {
 			Ok(lock) => lock.into_inner().unwrap_or_default(),
@@ -280,7 +279,7 @@ impl<'a> FileWriterUploadingState<'a> {
 struct FileWriterWaitingForDriveLockState<'a> {
 	file: Arc<BaseFile>,
 	lock_future: MaybeSendBoxFuture<'a, Result<Arc<ResourceLock>, Error>>,
-	hash: Sha512Hash,
+	hash: Blake3Hash,
 	remote_file_info: RemoteFileInfo,
 	upload_key: Arc<String>,
 	written: u64,
@@ -382,7 +381,7 @@ struct FileWriterCompletingState<'a> {
 	file: Arc<BaseFile>,
 	drive_lock: Arc<ResourceLock>,
 	future: MaybeSendBoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
-	hash: Sha512Hash,
+	hash: Blake3Hash,
 	remote_file_info: RemoteFileInfo,
 	client: &'a Client,
 }
@@ -515,7 +514,7 @@ impl<'a> FileWriterState<'a> {
 			curr_chunk: None,
 			next_chunk_idx: 0,
 			written: 0,
-			hasher: sha2::Sha512::new(),
+			hasher: blake3::Hasher::new(),
 			remote_file_info: Arc::new(OnceLock::new()),
 			upload_key: Arc::new(crypto::shared::generate_random_base64_values(
 				32,

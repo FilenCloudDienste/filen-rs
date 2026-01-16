@@ -9,7 +9,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{auth::StringifiedClient, fs::HasUUID};
-use filen_types::{auth::FilenSDKConfig, crypto::Sha256Hash};
+use filen_types::{auth::FilenSDKConfig, crypto::Blake3Hash};
 use log::{debug, info, trace};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -99,7 +99,7 @@ impl FilenMobileCacheState {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SavedDBState {
-	pub(crate) db_hash: Sha256Hash,
+	pub(crate) db_hash: Blake3Hash,
 	#[serde(default)]
 	pub(crate) version: Option<u64>,
 	#[serde(default)]

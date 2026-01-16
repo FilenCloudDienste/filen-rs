@@ -138,7 +138,7 @@ impl HasRemoteFileInfo for RemoteFileType<'_> {
 		}
 	}
 
-	fn hash(&self) -> Option<filen_types::crypto::Sha512Hash> {
+	fn hash(&self) -> Option<filen_types::crypto::Blake3Hash> {
 		match self {
 			RemoteFileType::File(file) => file.hash(),
 			RemoteFileType::SharedFile(file) => file.hash(),

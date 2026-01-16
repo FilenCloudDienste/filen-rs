@@ -32,7 +32,6 @@ image = { version = "0.25.6", default-features = false } # only need the error t
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "fs"] }
 log = "0.4.27"
 tokio-util = { version = "0.7.16", features = ["compat"] }
-sha2 = "0.10.9"
 once_cell = "1.21.3"
 thiserror = "2.0.14"
 faster-hex = "0.10.0"
@@ -40,6 +39,7 @@ serde_json = "1.0.142"
 serde = { version = "1.0.219", features = ["derive"] }
 lazy_static = "1.5.0"
 tokio-stream = { version = "0.1.17", features = ["fs"] }
+blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
 
 [target.'cfg(target_os="ios")'.dependencies]
 oslog = "0.2.0"

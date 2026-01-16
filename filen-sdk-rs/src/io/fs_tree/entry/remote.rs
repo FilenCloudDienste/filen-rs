@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use filen_types::crypto::Sha512Hash;
+use filen_types::crypto::Blake3Hash;
 use uuid::Uuid;
 
 use crate::{
@@ -53,7 +53,7 @@ pub(crate) struct ExtraRemoteFileData {
 	size: u64,
 	modified: DateTime<Utc>,
 	created: Option<DateTime<Utc>>,
-	hash: Option<Sha512Hash>,
+	hash: Option<Blake3Hash>,
 }
 
 impl super::DFSWalkerFileEntry for &RemoteFile {

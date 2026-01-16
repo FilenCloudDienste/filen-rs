@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use filen_types::crypto::Sha512Hash;
+use filen_types::crypto::Blake3Hash;
 
 use crate::{
 	consts::CHUNK_SIZE_U64,
@@ -14,7 +14,7 @@ use crate::{
 pub trait HasRemoteFileInfo: HasRemoteInfo + HasFileInfo {
 	fn region(&self) -> &str;
 	fn bucket(&self) -> &str;
-	fn hash(&self) -> Option<Sha512Hash>;
+	fn hash(&self) -> Option<Blake3Hash>;
 }
 
 pub trait HasFileInfo {

@@ -23,11 +23,10 @@ use filen_sdk_rs::{
 	},
 	io::FilenMetaExt,
 };
-use filen_types::{crypto::Sha512Hash, fs::UuidStr};
+use filen_types::{crypto::Blake3Hash, fs::UuidStr};
 use futures::{StreamExt, stream::FuturesUnordered};
 use log::{debug, error, info, trace};
-use sha2::Digest;
-use tokio::{fs::DirEntry, io::AsyncReadExt, sync::mpsc::UnboundedReceiver};
+use tokio::{fs::DirEntry, sync::mpsc::UnboundedReceiver};
 use tokio_util::compat::{
 	FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
 };
@@ -178,31 +177,18 @@ impl AuthCacheState {
 		&self,
 		file_uuid: &UuidStr,
 		file_name: Option<&str>,
-	) -> Result<Option<Sha512Hash>, io::Error> {
+	) -> Result<Option<Blake3Hash>, io::Error> {
 		let path = self.get_cached_file_path_from_name(file_uuid.as_ref(), file_name);
-		let mut os_file = match tokio::fs::File::open(path).await {
-			Ok(file) => file,
-			Err(e) if e.kind() == io::ErrorKind::NotFound => {
-				return Ok(None);
+		tokio::task::spawn_blocking(move || {
+			let mut hasher = blake3::Hasher::new();
+			match hasher.update_mmap_rayon(&path) {
+				Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+				Err(e) => Err(e),
+				Ok(_) => Ok(Some(hasher.finalize().into())),
 			}
-			Err(e) => return Err(e),
-		};
-		let file_size = os_file
-			.metadata()
-			.await
-			.map(|m| FilenMetaExt::size(&m).min(BUFFER_SIZE))
-			.unwrap_or(BUFFER_SIZE);
-		let mut buffer = vec![0; (file_size as usize).min(BUFFER_SIZE as usize)];
-		let mut hasher = sha2::Sha512::new();
-		loop {
-			let bytes_read = os_file.read(&mut buffer).await?;
-			if bytes_read == 0 {
-				break;
-			}
-			hasher.update(&buffer[..bytes_read]);
-		}
-		let hash = hasher.finalize();
-		Ok(Some(hash.into()))
+		})
+		.await
+		.unwrap()
 	}
 
 	pub(crate) async fn io_upload_file(

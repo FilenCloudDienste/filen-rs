@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	auth::FileEncryptionVersion,
-	crypto::{EncryptedString, Sha512Hash, rsa::RSAEncryptedString},
+	crypto::{Blake3Hash, EncryptedString, rsa::RSAEncryptedString},
 	traits::CowHelpers,
 };
 use rsa::RsaPrivateKey;
@@ -40,9 +40,8 @@ struct RawFileMeta<'a> {
 	#[serde(rename = "creation")]
 	#[serde(default)]
 	pub(super) created: Option<DateTime<Utc>>,
-	#[serde(with = "empty_hash_is_none")]
-	#[serde(default)]
-	pub(super) hash: Option<Sha512Hash>,
+	#[serde(default, with = "empty_hash_is_none", rename = "blake3")]
+	pub(super) hash: Option<Blake3Hash>,
 }
 
 impl<'de> DeserializeSeed<'de> for FileMetaSeed {
@@ -181,7 +180,7 @@ impl<'a> FileMeta<'a> {
 	get_value_from_decrypted!(last_modified, DateTime<Utc>);
 	get_value_from_decrypted!(key, &FileKey);
 	get_value_from_decrypted_optional!(created, Option<DateTime<Utc>>);
-	get_value_from_decrypted_optional!(hash, Option<Sha512Hash>);
+	get_value_from_decrypted_optional!(hash, Option<Blake3Hash>);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, CowHelpers)]
@@ -200,7 +199,8 @@ pub struct DecryptedFileMeta<'a> {
 	#[serde(rename = "creation")]
 	#[serde(default)]
 	pub created: Option<DateTime<Utc>>,
-	pub hash: Option<Sha512Hash>,
+	#[serde(rename = "blake3")]
+	pub hash: Option<Blake3Hash>,
 }
 
 impl<'a> DecryptedFileMeta<'a> {
@@ -308,7 +308,7 @@ impl<'a> DecryptedFileMeta<'a> {
 		self.created = Some(created.round_subsecs(3));
 	}
 
-	pub fn hash(&self) -> Option<Sha512Hash> {
+	pub fn hash(&self) -> Option<Blake3Hash> {
 		self.hash
 	}
 
@@ -399,28 +399,28 @@ impl FileMetaChanges {
 pub(super) mod empty_hash_is_none {
 	use std::borrow::Cow;
 
-	use filen_types::crypto::Sha512Hash;
+	use filen_types::crypto::Blake3Hash;
 	use serde::{Deserialize, Serialize, Serializer, de::IntoDeserializer};
 
-	pub(crate) fn serialize<S>(value: &Option<Sha512Hash>, serializer: S) -> Result<S::Ok, S::Error>
+	pub(crate) fn serialize<S>(value: &Option<Blake3Hash>, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: Serializer,
 	{
 		if let Some(value) = value {
-			Sha512Hash::serialize(value, serializer)
+			Blake3Hash::serialize(value, serializer)
 		} else {
 			serializer.serialize_none()
 		}
 	}
 
-	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Sha512Hash>, D::Error>
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Blake3Hash>, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
 		let option = Option::<Cow<str>>::deserialize(deserializer)?;
 		match option {
 			Some(cow) if !cow.is_empty() => {
-				let hash = Sha512Hash::deserialize(cow.into_deserializer())?;
+				let hash = Blake3Hash::deserialize(cow.into_deserializer())?;
 				Ok(Some(hash))
 			}
 			_ => Ok(None),
