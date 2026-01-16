@@ -1,7 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
 use filen_macros::shared_test_runtime;
-use filen_network_drive::mount_network_drive;
 use filen_sdk_rs::fs::FSObject;
 use log::{debug, info, trace};
 use tokio::fs;
@@ -16,6 +15,8 @@ const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tes
 #[cfg(not(target_os = "macos"))]
 #[shared_test_runtime]
 async fn start_rclone_mount() {
+	use filen_rclone_wrapper::network_drive::NetworkDrive;
+
 	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
 
 	let client = test_utils::RESOURCES.client().await;
@@ -34,7 +35,7 @@ async fn start_rclone_mount() {
 	}
 
 	// mount network drive (is killed on drop)
-	let mut network_drive = mount_network_drive(&client, &config_dir, None, false)
+	let mut network_drive = NetworkDrive::mount(&client, &config_dir, None, false)
 		.await
 		.unwrap();
 	info!("Network drive mounted at: {}", network_drive.mount_point);

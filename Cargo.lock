@@ -1470,7 +1470,7 @@ dependencies = [
  "dotenv",
  "env_logger",
  "filen-macros",
- "filen-network-drive",
+ "filen-rclone-wrapper",
  "filen-sdk-rs",
  "filen-types",
  "ftail",
@@ -1541,7 +1541,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "filen-network-drive"
+name = "filen-rclone-wrapper"
 version = "0.0.0"
 dependencies = [
  "anyhow",
