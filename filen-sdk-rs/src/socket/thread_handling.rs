@@ -387,7 +387,7 @@ where
 {
 	let api_key = config
 		.client
-		.api_key
+		.api_key()
 		.read()
 		.unwrap_or_else(|poisoned| poisoned.into_inner())
 		.0

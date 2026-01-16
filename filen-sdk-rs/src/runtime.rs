@@ -1,6 +1,8 @@
 #[cfg(feature = "wasm-full")]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
+use crate::util::MaybeSend;
+
 mod async_scoped_task {
 	use std::mem::ManuallyDrop;
 
@@ -282,7 +284,8 @@ mod commander_thread {
 			}
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{
-				self.tokio_handle.spawn(fut_builder.build());
+				self.tokio_handle
+					.spawn(async move { fut_builder.build().await });
 			}
 		}
 	}
@@ -628,6 +631,51 @@ where
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{
 		std::thread::spawn(f);
+	}
+}
+
+#[derive(Debug)]
+pub(crate) struct SpawnTaskHandle {
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	_handle: (),
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	handle: tokio::task::JoinHandle<()>,
+}
+
+impl SpawnTaskHandle {
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+		Self { handle }
+	}
+
+	pub(crate) fn is_finished(&self) -> bool {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			true
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			self.handle.is_finished()
+		}
+	}
+}
+
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
+pub(crate) fn spawn_task<F>(f: F) -> SpawnTaskHandle
+where
+	F: Future<Output = ()> + MaybeSend + 'static,
+{
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	{
+		todo!();
+	}
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	{
+		SpawnTaskHandle::new(tokio::spawn(f))
 	}
 }
 

@@ -171,13 +171,17 @@ async fn make_rs_compat_dir() {
 
 	let (contact, _lock1, _lock2) = get_contact(client).await;
 	client
-		.share_dir(&compat_dir, &contact, &mut |downloaded, total| {
-			log::trace!(
-				"Shared compat-rs dir: downloaded {} / {:?}",
-				downloaded,
-				total
-			);
-		})
+		.share_dir(
+			&compat_dir,
+			&contact,
+			Arc::new(|downloaded, total| {
+				log::trace!(
+					"Shared compat-rs dir: downloaded {} / {:?}",
+					downloaded,
+					total
+				);
+			}),
+		)
 		.await
 		.unwrap();
 

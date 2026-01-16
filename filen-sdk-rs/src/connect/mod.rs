@@ -250,7 +250,7 @@ impl Client {
 		I: HasMeta + HasUUID + Debug,
 	{
 		api::v3::item::shared::rename::post(
-			self,
+			self.client(),
 			&api::v3::item::shared::rename::Request {
 				uuid: *item.uuid(),
 				receiver_id: user.id,
@@ -273,7 +273,7 @@ impl Client {
 		I: HasMeta + HasUUID,
 	{
 		api::v3::item::linked::rename::post(
-			self,
+			self.client(),
 			&api::v3::item::linked::rename::Request {
 				uuid: *item.uuid(),
 				link_uuid,
@@ -293,14 +293,14 @@ impl Client {
 		let (linked, shared) = futures::try_join!(
 			async {
 				api::v3::item::linked::post(
-					self,
+					self.client(),
 					&api::v3::item::linked::Request { uuid: *item.uuid() },
 				)
 				.await
 			},
 			async {
 				api::v3::item::shared::post(
-					self,
+					self.client(),
 					&api::v3::item::shared::Request { uuid: *item.uuid() },
 				)
 				.await
@@ -343,10 +343,12 @@ impl Client {
 
 		let (linked, shared, items_to_process) = futures::try_join!(
 			async {
-				api::v3::item::linked::post(self, &api::v3::item::linked::Request { uuid }).await
+				api::v3::item::linked::post(self.client(), &api::v3::item::linked::Request { uuid })
+					.await
 			},
 			async {
-				api::v3::item::shared::post(self, &api::v3::item::shared::Request { uuid }).await
+				api::v3::item::shared::post(self.client(), &api::v3::item::shared::Request { uuid })
+					.await
 			},
 			async move {
 				if let NonRootFSObject::Dir(dir) = item {
@@ -409,7 +411,7 @@ impl Client {
 		I: HasParent + HasMeta + HasUUID + HasType + ?Sized,
 	{
 		api::v3::dir::link::add::post(
-			self,
+			self.client(),
 			&api::v3::dir::link::add::Request {
 				uuid: *item.uuid(),
 				parent: Some((*item.parent()).try_into()?),
@@ -427,11 +429,14 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn public_link_dir(
+	pub async fn public_link_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
-		progress_callback: &mut impl FnMut(u64, Option<u64>),
-	) -> Result<DirPublicLink, Error> {
+		progress_callback: Arc<F>,
+	) -> Result<DirPublicLink, Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+	{
 		let public_link = DirPublicLink::new(self.make_meta_key());
 		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
 		let link = ListedPublicLink {
@@ -454,7 +459,7 @@ impl Client {
 		let key = key.ok_or(MetadataWasNotDecryptedError)?;
 		futures.push(Box::pin(async move {
 			api::v3::dir::link::add::post(
-				self,
+				self.client(),
 				&api::v3::dir::link::add::Request {
 					uuid: *dir.uuid(),
 					parent: None,
@@ -498,7 +503,7 @@ impl Client {
 		let file_link = FilePublicLink::new();
 
 		api::v3::file::link::edit::post(
-			self,
+			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: file_link.link_uuid,
 				file_uuid: *file.uuid(),
@@ -523,7 +528,7 @@ impl Client {
 		link: &DirPublicLink,
 	) -> Result<(), Error> {
 		api::v3::dir::link::edit::post(
-			self,
+			self.client(),
 			&api::v3::dir::link::edit::Request {
 				uuid: *dir.uuid(),
 				expiration: link.expiration,
@@ -544,7 +549,7 @@ impl Client {
 		link: &FilePublicLink,
 	) -> Result<(), Error> {
 		api::v3::file::link::edit::post(
-			self,
+			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: link.link_uuid,
 				file_uuid: *file.uuid(),
@@ -565,7 +570,7 @@ impl Client {
 		file: &RemoteFile,
 	) -> Result<Option<FilePublicLink>, Error> {
 		let response = api::v3::file::link::status::post(
-			self,
+			self.client(),
 			&api::v3::file::link::status::Request { uuid: *file.uuid() },
 		)
 		.await?;
@@ -578,7 +583,7 @@ impl Client {
 		};
 
 		let password_response = api::v3::file::link::password::post(
-			self,
+			self.client(),
 			&api::v3::file::link::password::Request {
 				uuid: link_status.uuid,
 			},
@@ -606,7 +611,7 @@ impl Client {
 		link_key: Cow<'_, str>,
 	) -> Result<LinkedFileInfo, Error> {
 		let response = api::v3::file::link::info::post(
-			self,
+			self.client(),
 			&api::v3::file::link::info::Request {
 				uuid: link.link_uuid,
 				password: Cow::Borrowed(&link.get_password_hash()?),
@@ -650,7 +655,7 @@ impl Client {
 		dir: &RemoteDirectory,
 	) -> Result<Option<DirPublicLink>, Error> {
 		let response = api::v3::dir::link::status::post(
-			self,
+			self.client(),
 			&api::v3::dir::link::status::Request { uuid: *dir.uuid() },
 		)
 		.await?;
@@ -665,7 +670,7 @@ impl Client {
 		let (info_response, decrypted_link_key) = futures::join!(
 			async {
 				api::v3::dir::link::info::post(
-					self,
+					self.client(),
 					&api::v3::dir::link::info::Request {
 						uuid: link_status.uuid,
 					},
@@ -696,7 +701,7 @@ impl Client {
 		link: &DirPublicLink,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::link::content::post(
-			self,
+			self.client(),
 			&api::v3::dir::link::content::Request {
 				uuid: link.link_uuid,
 				password: Cow::Borrowed(&link.get_password_hash()?),
@@ -752,7 +757,7 @@ impl Client {
 
 	pub async fn remove_dir_link(&self, link: DirPublicLink) -> Result<(), Error> {
 		api::v3::dir::link::remove::post(
-			self,
+			self.client(),
 			&api::v3::dir::link::remove::Request {
 				uuid: link.link_uuid,
 			},
@@ -766,7 +771,7 @@ impl Client {
 		I: HasParent + HasMeta + HasUUID + HasType,
 	{
 		api::v3::item::share::post(
-			self,
+			self.client(),
 			&api::v3::item::share::Request {
 				uuid: *item.uuid(),
 				parent: Some((*item.parent()).try_into()?),
@@ -782,12 +787,15 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn share_dir(
+	pub async fn share_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
 		client: &Contact<'_>,
-		progress_callback: &mut impl FnMut(u64, Option<u64>),
-	) -> Result<(), Error> {
+		progress_callback: Arc<F>,
+	) -> Result<(), Error>
+	where
+		F: Fn(u64, Option<u64>) + 'static + Send + Sync,
+	{
 		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
 
 		let shared_user = client.into();
@@ -797,7 +805,7 @@ impl Client {
 
 		futures.push(Box::pin(async move {
 			api::v3::item::share::post(
-				self,
+				self.client(),
 				&api::v3::item::share::Request {
 					uuid: *dir.uuid(),
 					parent: None,
@@ -837,7 +845,7 @@ impl Client {
 
 	pub async fn share_file(&self, file: &RemoteFile, contact: &Contact<'_>) -> Result<(), Error> {
 		api::v3::item::share::post(
-			self,
+			self.client(),
 			&api::v3::item::share::Request {
 				uuid: *file.uuid(),
 				parent: None,
@@ -858,7 +866,7 @@ impl Client {
 		contact: Option<&Contact<'_>>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		let response = api::v3::shared::out::post(
-			self,
+			self.client(),
 			&api::v3::shared::out::Request {
 				uuid: dir.map(|d| *d.uuid()),
 				receiver_id: contact.map(|u| u.user_id),
@@ -911,7 +919,7 @@ impl Client {
 		dir: Option<&impl HasUUIDContents>,
 	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
 		let response = api::v3::shared::r#in::post(
-			self,
+			self.client(),
 			&api::v3::shared::r#in::Request {
 				uuid: dir.map(|d| *d.uuid()),
 			},
@@ -955,7 +963,7 @@ impl Client {
 
 	pub async fn remove_shared_link_in(&self, uuid: UuidStr) -> Result<(), Error> {
 		api::v3::item::shared::r#in::remove::post(
-			self,
+			self.client(),
 			&api::v3::item::shared::r#in::remove::Request { uuid },
 		)
 		.await?;
@@ -968,7 +976,7 @@ impl Client {
 		receiver_id: u64,
 	) -> Result<(), Error> {
 		api::v3::item::shared::out::remove::post(
-			self,
+			self.client(),
 			&api::v3::item::shared::out::remove::Request { uuid, receiver_id },
 		)
 		.await?;

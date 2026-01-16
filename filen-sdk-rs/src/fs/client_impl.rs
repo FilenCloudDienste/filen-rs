@@ -109,7 +109,7 @@ impl Client {
 	}
 
 	pub async fn empty_trash(&self) -> Result<(), Error> {
-		api::v3::trash::empty::post(self).await?;
+		api::v3::trash::empty::post(self.client()).await?;
 		Ok(())
 	}
 
@@ -118,7 +118,7 @@ impl Client {
 		T: SetRemoteInfo + HasUUID + HasType,
 	{
 		let resp = api::v3::item::favorite::post(
-			self,
+			self.client(),
 			&api::v3::item::favorite::Request {
 				uuid: *object.uuid(),
 				r#type: object.object_type(),

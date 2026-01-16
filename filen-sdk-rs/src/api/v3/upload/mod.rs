@@ -1,15 +1,10 @@
 use bytes::Bytes;
-use filen_types::api::response::FilenResponse;
 pub use filen_types::api::v3::upload::{ENDPOINT, Response};
 use log::debug;
 use sha2::{Digest, Sha512};
 
 use crate::{
-	api::{DEFAULT_MAX_RETRY_TIME, DEFAULT_NUM_RETRIES, retry_wrap},
-	auth::http::AuthorizedClient,
-	consts::random_ingest_url,
-	error::Error,
-	fs::file::BaseFile,
+	auth::http::AuthorizedClient, consts::random_ingest_url, error::Error, fs::file::BaseFile,
 };
 
 pub(crate) mod done;
@@ -28,10 +23,12 @@ pub(crate) async fn upload_file_chunk(
 		chunk.len()
 	);
 
+	let ingest_url = random_ingest_url();
+
 	let data_hash = Sha512::digest(&chunk);
 	let url = format!(
 		"{}/{}?uuid={}&index={}&parent={}&uploadKey={}&hash={}",
-		random_ingest_url(),
+		ingest_url,
 		ENDPOINT,
 		file.uuid(),
 		chunk_idx,
@@ -40,22 +37,7 @@ pub(crate) async fn upload_file_chunk(
 		faster_hex::hex_string(data_hash.as_slice()),
 	);
 
-	let _permit = client.get_semaphore_permit().await;
-
-	retry_wrap(
-		chunk,
-		|| client.post_auth_request(&url),
-		url.clone(),
-		async |response| {
-			response
-				.json::<FilenResponse<Response>>()
-				.await
-				.map(|resp| resp.into_data())
-				.map_err(|e| crate::api::RetryError::NoRetry(e.into()))
-		},
-		DEFAULT_NUM_RETRIES,
-		DEFAULT_MAX_RETRY_TIME,
-	)
-	.await?
-	.map_err(Into::into)
+	client
+		.post_raw_bytes_auth(chunk, &url, ingest_url.into())
+		.await
 }

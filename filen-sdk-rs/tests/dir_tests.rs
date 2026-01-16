@@ -412,13 +412,16 @@ async fn list_recursive() {
 	let dir_c = client.create_dir(&dir_b, "c".to_string()).await.unwrap();
 
 	let (dirs, _) = client
-		.list_dir_recursive(test_dir, &mut |downloaded, total| {
-			log::trace!(
-				"List dir recursive progress: downloaded {} / {:?}",
-				downloaded,
-				total
-			);
-		})
+		.list_dir_recursive(
+			test_dir,
+			Arc::new(|downloaded, total| {
+				log::trace!(
+					"List dir recursive progress: downloaded {} / {:?}",
+					downloaded,
+					total
+				);
+			}),
+		)
 		.await
 		.unwrap();
 

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
@@ -59,7 +60,7 @@ impl Client {
 		let (mut uuid, meta) = RemoteDirectory::make_parts(name, created)?;
 
 		let response = api::v3::dir::create::post(
-			self,
+			self.client(),
 			&api::v3::dir::create::Request {
 				uuid,
 				parent: *parent.uuid(),
@@ -100,7 +101,7 @@ impl Client {
 
 		let uuid = UuidStr::new_v4();
 		let response = api::v3::dir::create::post(
-			self,
+			self.client(),
 			&api::v3::dir::create::Request {
 				uuid,
 				parent: *parent.uuid(),
@@ -113,7 +114,7 @@ impl Client {
 	}
 
 	pub async fn get_dir(&self, uuid: UuidStr) -> Result<RemoteDirectory, Error> {
-		let response = api::v3::dir::post(self, &api::v3::dir::Request { uuid }).await?;
+		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
 		Ok(do_cpu_intensive(|| {
 			RemoteDirectory::blocking_from_encrypted(
@@ -140,7 +141,7 @@ impl Client {
 		name: &str,
 	) -> Result<Option<UuidStr>, Error> {
 		api::v3::dir::exists::post(
-			self,
+			self.client(),
 			&api::v3::dir::exists::Request {
 				parent: *parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(name.as_ref())),
@@ -155,7 +156,7 @@ impl Client {
 		dir: &dyn HasContents,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let response = api::v3::dir::content::post(
-			self,
+			self.client(),
 			&api::v3::dir::content::Request {
 				uuid: dir.uuid_as_parent(),
 			},
@@ -268,12 +269,12 @@ impl Client {
 		dir: &dyn HasContents,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		self.inner_list_dir_recursive(api::v3::dir::download::post_large(
-			self,
+			self.client(),
 			&api::v3::dir::download::Request {
 				uuid: dir.uuid_as_parent(),
 				skip_cache: false,
 			},
-			None::<&mut fn(u64, Option<u64>)>,
+			None::<Arc<fn(u64, Option<u64>)>>,
 		))
 		.await
 	}
@@ -286,14 +287,17 @@ impl Client {
 	/// such as WASM.
 	///
 	/// The progress callback receives the number of bytes downloaded so far and the total number of bytes to download, if known.
-	pub async fn list_dir_recursive(
+	pub async fn list_dir_recursive<F>(
 		&self,
 		dir: &dyn HasContents,
-		progress_callback: &mut impl FnMut(u64, Option<u64>),
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
+		progress_callback: Arc<F>,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+	{
 		self.inner_list_dir_recursive(async {
 			api::v3::dir::download::post_large(
-				self,
+				self.client(),
 				&api::v3::dir::download::Request {
 					uuid: dir.uuid_as_parent(),
 					skip_cache: false,
@@ -307,19 +311,26 @@ impl Client {
 
 	pub async fn trash_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
-		api::v3::dir::trash::post(self, &api::v3::dir::trash::Request { uuid: *dir.uuid() })
-			.await?;
+		api::v3::dir::trash::post(
+			self.client(),
+			&api::v3::dir::trash::Request { uuid: *dir.uuid() },
+		)
+		.await?;
 		dir.parent = ParentUuid::Trash;
 		Ok(())
 	}
 
 	pub async fn restore_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
-		api::v3::dir::restore::post(self, &api::v3::dir::restore::Request { uuid: *dir.uuid() })
-			.await?;
+		api::v3::dir::restore::post(
+			self.client(),
+			&api::v3::dir::restore::Request { uuid: *dir.uuid() },
+		)
+		.await?;
 
 		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
-		let resp = api::v3::dir::post(self, &api::v3::dir::Request { uuid: *dir.uuid() }).await?;
+		let resp =
+			api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid: *dir.uuid() }).await?;
 		dir.parent = resp.parent;
 		Ok(())
 	}
@@ -327,7 +338,7 @@ impl Client {
 	pub async fn delete_dir_permanently(&self, dir: RemoteDirectory) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::delete::permanent::post(
-			self,
+			self.client(),
 			&api::v3::dir::delete::permanent::Request { uuid: *dir.uuid() },
 		)
 		.await?;
@@ -356,7 +367,7 @@ impl Client {
 		);
 
 		api::v3::dir::metadata::post(
-			self,
+			self.client(),
 			&api::v3::dir::metadata::Request {
 				uuid: *dir.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
@@ -492,7 +503,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::r#move::post(
-			self,
+			self.client(),
 			&api::v3::dir::r#move::Request {
 				uuid: *dir.uuid(),
 				to: *new_parent.uuid(),
@@ -538,7 +549,7 @@ impl Client {
 				trash: false,
 			},
 		};
-		api::v3::dir::size::post(self, &request).await
+		api::v3::dir::size::post(self.client(), &request).await
 	}
 
 	pub async fn set_dir_color(
@@ -548,7 +559,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::color::post(
-			self,
+			self.client(),
 			&api::v3::dir::color::Request {
 				uuid: *dir.uuid(),
 				color: color.as_borrowed_cow(),

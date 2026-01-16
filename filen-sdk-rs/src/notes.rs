@@ -362,7 +362,7 @@ impl Client {
 		&self,
 		uuid: UuidStr,
 	) -> Result<api::v3::item::shared::Response<'static>, Error> {
-		api::v3::item::shared::post(self, &api::v3::item::shared::Request { uuid }).await
+		api::v3::item::shared::post(self.client(), &api::v3::item::shared::Request { uuid }).await
 	}
 
 	fn blocking_decrypt_note_key(
@@ -437,7 +437,7 @@ impl Client {
 	}
 
 	pub async fn list_notes(&self) -> Result<Vec<Note>, Error> {
-		let notes = crate::api::v3::notes::get(self).await?;
+		let notes = crate::api::v3::notes::get(self.client()).await?;
 
 		let crypter = self.crypter();
 
@@ -475,7 +475,7 @@ impl Client {
 		})?;
 
 		let response = crate::api::v3::notes::participants::add::post(
-			self,
+			self.client(),
 			&crate::api::v3::notes::participants::add::Request {
 				uuid: note.uuid,
 				contact_uuid,
@@ -523,7 +523,7 @@ impl Client {
 		participant_id: u64,
 	) -> Result<(), Error> {
 		crate::api::v3::notes::participants::remove::post(
-			self,
+			self.client(),
 			&crate::api::v3::notes::participants::remove::Request {
 				uuid: note.uuid,
 				user_id: participant_id,
@@ -542,7 +542,7 @@ impl Client {
 		write: bool,
 	) -> Result<(), Error> {
 		crate::api::v3::notes::participants::permissions::post(
-			self,
+			self.client(),
 			&crate::api::v3::notes::participants::permissions::Request {
 				uuid: note_uuid,
 				user_id: participant.user_id,
@@ -581,7 +581,7 @@ impl Client {
 		);
 
 		let response = api::v3::notes::create::post(
-			self,
+			self.client(),
 			&api::v3::notes::create::Request {
 				uuid,
 				title: title_string,
@@ -625,7 +625,7 @@ impl Client {
 
 	pub async fn get_note_content(&self, note: &mut Note) -> Result<Option<String>, Error> {
 		let response = api::v3::notes::content::post(
-			self,
+			self.client(),
 			&api::v3::notes::content::Request { uuid: note.uuid },
 		)
 		.await?;
@@ -687,7 +687,7 @@ impl Client {
 		.await;
 
 		let resp = api::v3::notes::r#type::change::post(
-			self,
+			self.client(),
 			&api::v3::notes::r#type::change::Request {
 				uuid: note.uuid,
 				preview,
@@ -725,7 +725,7 @@ impl Client {
 		);
 
 		let response = api::v3::notes::content::edit::post(
-			self,
+			self.client(),
 			&api::v3::notes::content::edit::Request {
 				uuid: note.uuid,
 				content,
@@ -752,7 +752,7 @@ impl Client {
 		);
 
 		api::v3::notes::title::edit::post(
-			self,
+			self.client(),
 			&api::v3::notes::title::edit::Request {
 				uuid: note.uuid,
 				title,
@@ -765,14 +765,20 @@ impl Client {
 
 	pub async fn delete_note(&self, note: Note) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::delete::post(self, &api::v3::notes::delete::Request { uuid: note.uuid })
-			.await
+		api::v3::notes::delete::post(
+			self.client(),
+			&api::v3::notes::delete::Request { uuid: note.uuid },
+		)
+		.await
 	}
 
 	pub async fn archive_note(&self, note: &mut Note) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::archive::post(self, &api::v3::notes::archive::Request { uuid: note.uuid })
-			.await?;
+		api::v3::notes::archive::post(
+			self.client(),
+			&api::v3::notes::archive::Request { uuid: note.uuid },
+		)
+		.await?;
 		note.archive = true;
 		note.trash = false;
 		Ok(())
@@ -780,8 +786,11 @@ impl Client {
 
 	pub async fn trash_note(&self, note: &mut Note) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::trash::post(self, &api::v3::notes::trash::Request { uuid: note.uuid })
-			.await?;
+		api::v3::notes::trash::post(
+			self.client(),
+			&api::v3::notes::trash::Request { uuid: note.uuid },
+		)
+		.await?;
 		note.trash = true;
 		note.archive = false;
 		Ok(())
@@ -790,7 +799,7 @@ impl Client {
 	pub async fn set_note_favorited(&self, note: &mut Note, favorite: bool) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
 		api::v3::notes::favorite::post(
-			self,
+			self.client(),
 			&api::v3::notes::favorite::Request {
 				uuid: note.uuid,
 				favorite,
@@ -804,7 +813,7 @@ impl Client {
 	pub async fn set_note_pinned(&self, note: &mut Note, pinned: bool) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
 		api::v3::notes::pinned::post(
-			self,
+			self.client(),
 			&api::v3::notes::pinned::Request {
 				uuid: note.uuid,
 				pinned,
@@ -818,8 +827,11 @@ impl Client {
 	/// Restore a note from the archive or trash.
 	pub async fn restore_note(&self, note: &mut Note) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
-		api::v3::notes::restore::post(self, &api::v3::notes::restore::Request { uuid: note.uuid })
-			.await?;
+		api::v3::notes::restore::post(
+			self.client(),
+			&api::v3::notes::restore::Request { uuid: note.uuid },
+		)
+		.await?;
 		note.archive = false;
 		note.trash = false;
 		Ok(())
@@ -850,7 +862,7 @@ impl Client {
 			.ok_or(MetadataWasNotDecryptedError)?;
 
 		let histories = api::v3::notes::history::post(
-			self,
+			self.client(),
 			&api::v3::notes::history::Request { uuid: note.uuid },
 		)
 		.await?;
@@ -876,7 +888,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
 		api::v3::notes::history::restore::post(
-			self,
+			self.client(),
 			&api::v3::notes::history::restore::Request {
 				uuid: note.uuid,
 				id: history.id,
@@ -895,7 +907,7 @@ impl Client {
 	pub async fn add_tag_to_note(&self, note: &mut Note, tag: &mut NoteTag) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
 		let resp = api::v3::notes::tag::post(
-			self,
+			self.client(),
 			&api::v3::notes::tag::Request {
 				uuid: note.uuid,
 				tag: tag.uuid,
@@ -916,7 +928,7 @@ impl Client {
 	pub async fn remove_tag_from_note(&self, note: &mut Note, tag: &NoteTag) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
 		api::v3::notes::untag::post(
-			self,
+			self.client(),
 			&api::v3::notes::untag::Request {
 				uuid: note.uuid,
 				tag: tag.uuid,
@@ -929,7 +941,7 @@ impl Client {
 	}
 
 	pub async fn list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
-		let response = api::v3::notes::tags::post(self).await?;
+		let response = api::v3::notes::tags::post(self.client()).await?;
 		let crypter = self.crypter();
 
 		let tags = do_cpu_intensive(|| {
@@ -964,7 +976,7 @@ impl Client {
 		);
 
 		let response = api::v3::notes::tags::create::post(
-			self,
+			self.client(),
 			&api::v3::notes::tags::create::Request {
 				name: encrypted_name,
 			},
@@ -988,7 +1000,7 @@ impl Client {
 		);
 
 		let resp = api::v3::notes::tags::rename::post(
-			self,
+			self.client(),
 			&api::v3::notes::tags::rename::Request {
 				uuid: tag.uuid,
 				name: encrypted_name,
@@ -1007,7 +1019,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
 		let resp = api::v3::notes::tags::favorite::post(
-			self,
+			self.client(),
 			&api::v3::notes::tags::favorite::Request {
 				uuid: tag.uuid,
 				favorite,
@@ -1022,7 +1034,7 @@ impl Client {
 	pub async fn delete_note_tag(&self, tag: NoteTag) -> Result<(), Error> {
 		let _lock = self.lock_notes().await?;
 		api::v3::notes::tags::delete::post(
-			self,
+			self.client(),
 			&api::v3::notes::tags::delete::Request { uuid: tag.uuid },
 		)
 		.await
