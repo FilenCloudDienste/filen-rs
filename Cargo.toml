@@ -11,6 +11,7 @@ members = [
 	"uniffi-bindgen",
 	"uniffi-bindgen-swift",
 	"filen-cli",
+	"filen-rclone-wrapper",
 ]
 
 [profile.test]

@@ -812,6 +812,7 @@ mod rclone {
 	//! It is automatically downloaded and configured (authenticated) when you run the `rclone` or `mount` commands.
 
 	use anyhow::{Context as _, Result};
+	use filen_rclone_wrapper::network_drive::NetworkDrive;
 
 	use crate::{CliConfig, auth::LazyClient, ui::UI};
 
@@ -822,14 +823,10 @@ mod rclone {
 		mount_point: Option<String>,
 	) -> Result<()> {
 		let client = client.get(ui).await?;
-		let mut network_drive = filen_network_drive::mount_network_drive(
-			client,
-			&config.config_dir,
-			mount_point.as_deref(),
-			false,
-		)
-		.await
-		.context("Failed to mount network drive")?;
+		let mut network_drive =
+			NetworkDrive::mount(client, &config.config_dir, mount_point.as_deref(), false)
+				.await
+				.context("Failed to mount network drive")?;
 		network_drive
 			.wait_until_active()
 			.await
@@ -855,7 +852,7 @@ mod rclone {
 		client: &mut LazyClient,
 		cmd: Vec<String>,
 	) -> Result<()> {
-		let rclone = filen_network_drive::rclone_installation::RcloneInstallation::initialize(
+		let rclone = filen_rclone_wrapper::rclone_installation::RcloneInstallation::initialize(
 			client.get(ui).await?,
 			&config.config_dir.join("rclone"),
 		)

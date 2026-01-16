@@ -54,6 +54,7 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 	let rclone_binary_download_url = match (platform_str, arch_str) {
 		(Some(platform), Some(arch)) => format!(
 			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.14/rclone-v1.70.0-filen.14-{}-{}{}",
+			// todo: update this to rclone v1.73 when filen-rclone is merged upstream
 			platform,
 			arch,
 			if platform == "windows" { ".exe" } else { "" }

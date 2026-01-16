@@ -20,10 +20,7 @@ use crate::{
 	rclone_rc_api::{RcloneApiClient, VfsListResponse},
 };
 
-pub mod rclone_installation;
-mod rclone_rc_api;
-
-pub struct MountedNetworkDrive {
+pub struct NetworkDrive {
 	/// The path where the network drive is mounted
 	pub mount_point: String,
 	/// The `rclone mount` child process. Will be killed on drop.
@@ -31,32 +28,164 @@ pub struct MountedNetworkDrive {
 	api_client: RcloneApiClient,
 }
 
-/// Mount Filen as a network drive using Rclone.
-/// Downloads Rclone binary if necessary, writes config file, and starts the `rclone mount` process.
-pub async fn mount_network_drive(
-	client: &Client,
-	config_dir: &Path,
-	mount_point: Option<&str>,
-	read_only: bool,
-) -> Result<MountedNetworkDrive> {
-	let rclone = RcloneInstallation::initialize(client, config_dir).await?;
-	let mount_point = resolve_mount_point(mount_point).await?;
-	let rc_port =
-		free_local_ipv4_port().ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
-	let process = start_rclone_mount_process(
-		&rclone,
-		&config_dir.join("network-drive-rclone/cache"),
-		&mount_point,
-		&rc_port,
-		read_only,
-		None,
-	)
-	.await?;
-	Ok(MountedNetworkDrive {
-		mount_point: mount_point.to_string(),
-		process,
-		api_client: RcloneApiClient::new(rc_port),
-	})
+impl NetworkDrive {
+	/// Mount Filen as a network drive using Rclone.
+	/// Downloads Rclone binary if necessary, writes config file, and starts the `rclone mount` process.
+	pub async fn mount(
+		client: &Client,
+		config_dir: &Path,
+		mount_point: Option<&str>,
+		read_only: bool,
+	) -> Result<NetworkDrive> {
+		let rclone = RcloneInstallation::initialize(client, config_dir).await?;
+		let mount_point = resolve_mount_point(mount_point).await?;
+		let rc_port = free_local_ipv4_port()
+			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
+		let cache_path = config_dir.join("network-drive-rclone/cache");
+
+		// calculate cache size from available disk space
+		let available_disk_space = get_available_disk_space(&cache_path)?;
+		let os_disk_buffer: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+		let cache_size = match available_disk_space.checked_sub(os_disk_buffer) {
+			Some(size) => size,
+			None => available_disk_space,
+		};
+
+		// stringify args
+		let cache_path = cache_path
+			.to_str()
+			.ok_or(anyhow::anyhow!("Failed to format cache path"))?;
+		let cache_size_formatted = format!("{}Gi", cache_size);
+		let rc_addr_formatted = format!("127.0.0.1:{}", rc_port);
+
+		// construct args
+		let mut args = vec![
+			"mount",
+			"filen:",
+			&mount_point,
+			"--config",
+			rclone.rclone_config_path.to_str().unwrap(),
+			"--vfs-cache-mode",
+			"full",
+			"--cache-dir",
+			cache_path,
+			"--vfs-cache-max-size",
+			cache_size_formatted.as_str(),
+			"--vfs-cache-min-free-space",
+			"5Gi",
+			"--vfs-cache-max-age",
+			"720h",
+			"--vfs-cache-poll-interval",
+			"1m",
+			"--dir-cache-time",
+			"3s",
+			"--cache-info-age",
+			"5s",
+			"--no-gzip-encoding",
+			"--use-mmap",
+			"--disable-http2",
+			"--file-perms",
+			"0666",
+			"--dir-perms",
+			"0777",
+			"--use-server-modtime",
+			"--vfs-read-chunk-size",
+			"128Mi",
+			"--buffer-size",
+			"0",
+			"--vfs-read-ahead",
+			"1024Mi",
+			"--vfs-read-chunk-size-limit",
+			"0",
+			"--no-checksum",
+			"--transfers",
+			"16",
+			"--vfs-fast-fingerprint",
+			"--rc",
+			"--rc-addr",
+			rc_addr_formatted.as_str(),
+			"--devname",
+			"Filen",
+		];
+		if read_only {
+			args.push("--read-only");
+		}
+		let log_file_path: Option<&Path> = None; // todo: add option for log file
+		if let Some(log_file_path) = log_file_path {
+			args.push("--log-file");
+			args.push(
+				log_file_path
+					.to_str()
+					.ok_or(anyhow::anyhow!("Failed to format log file path"))?,
+			);
+		}
+		#[cfg(target_family = "windows")]
+		{
+			args.extend_from_slice(&[
+				"--volname",
+				"\\\\Filen\\Filen",
+				"-o",
+				"FileSecurity=D:P(A;;FA;;;WD)",
+				"--network-mode",
+			]);
+		}
+		#[cfg(not(target_family = "windows"))]
+		{
+			args.extend_from_slice(&["--volname", "Filen"]);
+		}
+		let macfuse_installed = false; // todo
+		if std::env::consts::OS == "macos" {
+			if macfuse_installed {
+				args.extend_from_slice(&["-o", "jail_symlinks"]);
+			} else {
+				args.extend_from_slice(&[
+				/* "-o",
+				"nomtime",
+				"-o",
+				"backend=nfs",
+				"-o",
+				"location=Filen",
+				"-o",
+				"nonamedattr", */
+				// todo: should these be reintroduced? generally, check what these args are for and if they're needed
+			]);
+			}
+		}
+
+		debug!(
+			"Starting Rclone mount process with args: {}",
+			args.join(" ")
+		);
+		let mut process = Command::new(&rclone.rclone_binary_path)
+			.args(args)
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.kill_on_drop(true)
+			.spawn()
+			.context("Failed to start Rclone mount process")?;
+
+		// log stdout and stderr
+		let process_stdout = process.stdout.take().unwrap();
+		tokio::spawn(async move {
+			let mut reader = BufReader::new(process_stdout).lines();
+			while let Ok(Some(line)) = reader.next_line().await {
+				info!("[rclone stdout] {}", line);
+			}
+		});
+		let process_stderr = process.stderr.take().unwrap();
+		tokio::spawn(async move {
+			let mut reader = BufReader::new(process_stderr).lines();
+			while let Ok(Some(line)) = reader.next_line().await {
+				info!("[rclone stderr] {}", line);
+			}
+		});
+
+		Ok(NetworkDrive {
+			mount_point: mount_point.to_string(),
+			process,
+			api_client: RcloneApiClient::new(rc_port),
+		})
+	}
 }
 
 async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> {
@@ -114,153 +243,6 @@ pub async fn get_available_drive_letters() -> Result<Vec<String>> {
 	Ok(available_letters)
 }
 
-async fn start_rclone_mount_process(
-	rclone: &RcloneInstallation,
-	cache_path: &Path,
-	mount_point: &str,
-	rc_port: &u16,
-	read_only: bool,
-	log_file_path: Option<&Path>,
-) -> Result<Child> {
-	// calculate cache size from available disk space
-	let available_disk_space = get_available_disk_space(cache_path)?;
-	let os_disk_buffer: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
-	let cache_size = match available_disk_space.checked_sub(os_disk_buffer) {
-		Some(size) => size,
-		None => available_disk_space,
-	};
-
-	// stringify args
-	let cache_path = cache_path
-		.to_str()
-		.ok_or(anyhow::anyhow!("Failed to format cache path"))?;
-	let cache_size_formatted = format!("{}Gi", cache_size);
-	let rc_addr_formatted = format!("127.0.0.1:{}", rc_port);
-
-	// construct args
-	let mut args = vec![
-		"mount",
-		"filen:",
-		mount_point,
-		"--config",
-		rclone.rclone_config_path.to_str().unwrap(),
-		"--vfs-cache-mode",
-		"full",
-		"--cache-dir",
-		cache_path,
-		"--vfs-cache-max-size",
-		cache_size_formatted.as_str(),
-		"--vfs-cache-min-free-space",
-		"5Gi",
-		"--vfs-cache-max-age",
-		"720h",
-		"--vfs-cache-poll-interval",
-		"1m",
-		"--dir-cache-time",
-		"3s",
-		"--cache-info-age",
-		"5s",
-		"--no-gzip-encoding",
-		"--use-mmap",
-		"--disable-http2",
-		"--file-perms",
-		"0666",
-		"--dir-perms",
-		"0777",
-		"--use-server-modtime",
-		"--vfs-read-chunk-size",
-		"128Mi",
-		"--buffer-size",
-		"0",
-		"--vfs-read-ahead",
-		"1024Mi",
-		"--vfs-read-chunk-size-limit",
-		"0",
-		"--no-checksum",
-		"--transfers",
-		"16",
-		"--vfs-fast-fingerprint",
-		"--rc",
-		"--rc-addr",
-		rc_addr_formatted.as_str(),
-		"--devname",
-		"Filen",
-	];
-	if read_only {
-		args.push("--read-only");
-	}
-	if let Some(log_file_path) = log_file_path {
-		args.push("--log-file");
-		args.push(
-			log_file_path
-				.to_str()
-				.ok_or(anyhow::anyhow!("Failed to format log file path"))?,
-		);
-	}
-	#[cfg(target_family = "windows")]
-	{
-		args.extend_from_slice(&[
-			"--volname",
-			"\\\\Filen\\Filen",
-			"-o",
-			"FileSecurity=D:P(A;;FA;;;WD)",
-			"--network-mode",
-		]);
-	}
-	#[cfg(not(target_family = "windows"))]
-	{
-		args.extend_from_slice(&["--volname", "Filen"]);
-	}
-	let macfuse_installed = false; // todo
-	if std::env::consts::OS == "macos" {
-		if macfuse_installed {
-			args.extend_from_slice(&["-o", "jail_symlinks"]);
-		} else {
-			args.extend_from_slice(&[
-				/* "-o",
-				"nomtime",
-				"-o",
-				"backend=nfs",
-				"-o",
-				"location=Filen",
-				"-o",
-				"nonamedattr", */
-				// todo: should these be reintroduced? generally, check what these args are for and if they're needed
-			]);
-		}
-	}
-
-	debug!(
-		"Starting Rclone mount process with args: {}",
-		args.join(" ")
-	);
-	let mut process = Command::new(&rclone.rclone_binary_path)
-		.args(args)
-		.stdout(Stdio::piped())
-		.stderr(Stdio::piped())
-		.kill_on_drop(true)
-		.spawn()
-		.context("Failed to start Rclone mount process")?;
-
-	// log stdout and stderr
-	let process_stdout = process.stdout.take().unwrap();
-	tokio::spawn(async move {
-		let mut reader = BufReader::new(process_stdout).lines();
-		while let Ok(Some(line)) = reader.next_line().await {
-			info!("[rclone stdout] {}", line);
-		}
-	});
-	let process_stderr = process.stderr.take().unwrap();
-	tokio::spawn(async move {
-		let mut reader = BufReader::new(process_stderr).lines();
-		while let Ok(Some(line)) = reader.next_line().await {
-			info!("[rclone stderr] {}", line);
-		}
-	});
-
-	Ok(process)
-}
-
 fn get_available_disk_space(path: &Path) -> Result<u64> {
 	Disks::new_with_refreshed_list()
 		.list()
@@ -285,7 +267,7 @@ pub enum NetworkDriveStatus {
 	Exited { status_code: ExitStatus },
 }
 
-impl MountedNetworkDrive {
+impl NetworkDrive {
 	pub async fn is_active(&mut self) -> NetworkDriveStatus {
 		if let Ok(Some(status_code)) = self.process.try_wait() {
 			return NetworkDriveStatus::Exited { status_code };
@@ -351,7 +333,7 @@ pub struct NetworkDriveTransfer {
 	pub speed: f64,
 }
 
-impl MountedNetworkDrive {
+impl NetworkDrive {
 	pub async fn get_stats(&self) -> Result<NetworkDriveStats> {
 		let core_stats = self.api_client.core_stats().await?;
 		let vfs_stats = self.api_client.vfs_stats().await?;
