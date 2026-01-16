@@ -2,7 +2,7 @@
 source: filen-cli/src/ui.rs
 expression: "no_color_ui.output.join(\"\\n\")"
 ---
-========================================= Filen CLI v0.2.1 =========================================
+====================================== Filen CLI v0.0.0-test ======================================
 Should just show
 ✔ Success!
 ✘ Something went wrong
