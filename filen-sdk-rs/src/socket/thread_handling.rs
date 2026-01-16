@@ -154,6 +154,8 @@ fn guarantee_send_remove_listener(sender: tokio::sync::mpsc::Sender<SocketReques
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen
 )]
+/// Handle to a registered WebSocket event listener.
+/// When this handle is dropped, the listener is automatically unregistered.
 pub struct ListenerHandle {
 	idx: u64,
 	remove_listener_sender: Option<tokio::sync::mpsc::Sender<SocketRequest>>,
