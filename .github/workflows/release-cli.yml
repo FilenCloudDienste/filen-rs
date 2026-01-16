@@ -179,7 +179,12 @@ jobs:
       
       # append notice about Docker build to release notes
       - name: Append Docker notice to release notes
-        run: echo -e '\n\n**Docker image available as `filen/cli:$version`**' >> filen-cli/release_notes.md
+        run: |
+          echo -e '\n\n---' >> filen-cli/release_notes.md
+          export BACKTICK='`'
+          echo "**Docker image available as ${BACKTICK}filen/cli:$version${BACKTICK}**" >> filen-cli/release_notes.md
+        env:
+          version: ${{ needs.tag.outputs.version }}
 
       # modify readme
       - name: Insert version into Readme
