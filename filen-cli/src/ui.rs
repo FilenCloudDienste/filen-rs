@@ -115,7 +115,10 @@ impl UI {
 
 	/// Print a colorful banner at the top of the application (contains app name and version)
 	pub(crate) fn print_banner(&mut self) {
-		let banner_text = format!("Filen CLI v{}", FILEN_CLI_VERSION);
+		self.print_banner_(FILEN_CLI_VERSION);
+	}
+	fn print_banner_(&mut self, version: &str) {
+		let banner_text = format!("Filen CLI v{}", version);
 		let width = match self.get_terminal_width() {
 			Some(w) if w > banner_text.len() + 2 => w,
 			_ => banner_text.len() + 6,
@@ -410,7 +413,7 @@ mod tests {
 		console::set_colors_enabled(true); // even in CI
 
 		fn test(ui: &mut UI) {
-			ui.print_banner();
+			ui.print_banner_("0.0.0-test");
 			ui.print("Should just show");
 			ui.print_hidden("Shouldn't show");
 			ui.print_success("Success!");
