@@ -6,13 +6,23 @@ use anyhow::{Context, Result};
 use filen_sdk_rs::auth::Client;
 use hex_literal::hex;
 use log::{debug, info};
+use port_check::free_local_ipv4_port;
 use sha2::{Digest as _, Sha256};
-use std::path::{Path, PathBuf};
-use tokio::{fs, process::Command};
+use std::{
+	path::{Path, PathBuf},
+	process::{ExitStatus, Stdio},
+};
+use tokio::{
+	fs,
+	io::{AsyncBufReadExt as _, BufReader},
+	process::{Child, Command},
+};
+
+use crate::rclone_rc_api::RcloneApiClient;
 
 pub struct RcloneInstallation {
-	pub(crate) rclone_binary_path: PathBuf,
-	pub(crate) rclone_config_path: PathBuf,
+	rclone_binary_path: PathBuf,
+	rclone_config_path: PathBuf,
 }
 
 impl RcloneInstallation {
@@ -29,10 +39,63 @@ impl RcloneInstallation {
 		})
 	}
 
-	pub async fn execute(&self, args: &[&str]) -> Command {
+	pub async fn execute(&self, args: &[&str]) -> Result<ExitStatus> {
+		let status = self
+			.configured_rclone(args)
+			.spawn()
+			.context("Failed to execute rclone command")?
+			.wait()
+			.await
+			.context("Failed to wait for rclone command")?;
+		Ok(status)
+	}
+
+	/// Executes an rclone command in the background,
+	/// piping stdout and stderr to the log
+	/// and exposing the Rclone RC Api
+	pub(crate) async fn execute_in_background(
+		&self,
+		args: &[&str],
+	) -> Result<(Child, RcloneApiClient)> {
+		let rc_port = free_local_ipv4_port()
+			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
+		let mut process = self
+			.configured_rclone(args)
+			.args([
+				"--rc",
+				"--rc-no-auth", // otherwise, certain endpoints are inaccessible
+				"--rc-addr",
+				&format!("127.0.0.1:{}", rc_port),
+			])
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.kill_on_drop(true)
+			.spawn()
+			.context("Failed to execute rclone command")?;
+
+		// log stdout and stderr
+		let process_stdout = process.stdout.take().unwrap();
+		tokio::spawn(async move {
+			let mut reader = BufReader::new(process_stdout).lines();
+			while let Ok(Some(line)) = reader.next_line().await {
+				info!("[rclone stdout] {}", line);
+			}
+		});
+		let process_stderr = process.stderr.take().unwrap();
+		tokio::spawn(async move {
+			let mut reader = BufReader::new(process_stderr).lines();
+			while let Ok(Some(line)) = reader.next_line().await {
+				info!("[rclone stderr] {}", line);
+			}
+		});
+
+		Ok((process, RcloneApiClient::new(rc_port)))
+	}
+
+	fn configured_rclone(&self, args: &[&str]) -> Command {
 		let mut cmd = Command::new(&self.rclone_binary_path);
 		cmd.args(["--config", self.rclone_config_path.to_str().unwrap()])
-			.args(args);
+			.args(args.iter().filter(|arg| !arg.is_empty()));
 		cmd
 	}
 }

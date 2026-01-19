@@ -1,19 +1,10 @@
-use port_check::free_local_ipv4_port;
-use std::{
-	borrow::Cow,
-	path::Path,
-	process::{ExitStatus, Stdio},
-};
+use std::{borrow::Cow, path::Path, process::ExitStatus};
 use sysinfo::Disks;
-use tokio::{
-	fs,
-	io::{AsyncBufReadExt, BufReader},
-	process::{Child, Command},
-};
+use tokio::{fs, process::Child};
 
 use anyhow::{Context, Result};
 use filen_sdk_rs::auth::Client;
-use log::{debug, info, trace};
+use log::{debug, trace};
 
 use crate::{
 	rclone_installation::RcloneInstallation,
@@ -39,8 +30,6 @@ impl NetworkDrive {
 	) -> Result<NetworkDrive> {
 		let rclone = RcloneInstallation::initialize(client, config_dir).await?;
 		let mount_point = resolve_mount_point(mount_point).await?;
-		let rc_port = free_local_ipv4_port()
-			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
 		let cache_path = config_dir.join("network-drive-rclone/cache");
 
 		// calculate cache size from available disk space
@@ -56,15 +45,12 @@ impl NetworkDrive {
 			.to_str()
 			.ok_or(anyhow::anyhow!("Failed to format cache path"))?;
 		let cache_size_formatted = format!("{}Gi", cache_size);
-		let rc_addr_formatted = format!("127.0.0.1:{}", rc_port);
 
 		// construct args
 		let mut args = vec![
 			"mount",
 			"filen:",
 			&mount_point,
-			"--config",
-			rclone.rclone_config_path.to_str().unwrap(),
 			"--vfs-cache-mode",
 			"full",
 			"--cache-dir",
@@ -101,9 +87,6 @@ impl NetworkDrive {
 			"--transfers",
 			"16",
 			"--vfs-fast-fingerprint",
-			"--rc",
-			"--rc-addr",
-			rc_addr_formatted.as_str(),
 			"--devname",
 			"Filen",
 		];
@@ -156,34 +139,15 @@ impl NetworkDrive {
 			"Starting Rclone mount process with args: {}",
 			args.join(" ")
 		);
-		let mut process = Command::new(&rclone.rclone_binary_path)
-			.args(args)
-			.stdout(Stdio::piped())
-			.stderr(Stdio::piped())
-			.kill_on_drop(true)
-			.spawn()
-			.context("Failed to start Rclone mount process")?;
-
-		// log stdout and stderr
-		let process_stdout = process.stdout.take().unwrap();
-		tokio::spawn(async move {
-			let mut reader = BufReader::new(process_stdout).lines();
-			while let Ok(Some(line)) = reader.next_line().await {
-				info!("[rclone stdout] {}", line);
-			}
-		});
-		let process_stderr = process.stderr.take().unwrap();
-		tokio::spawn(async move {
-			let mut reader = BufReader::new(process_stderr).lines();
-			while let Ok(Some(line)) = reader.next_line().await {
-				info!("[rclone stderr] {}", line);
-			}
-		});
+		let (process, api) = rclone
+			.execute_in_background(&args)
+			.await
+			.context("Failed to run Rclone mount process")?;
 
 		Ok(NetworkDrive {
 			mount_point: mount_point.to_string(),
 			process,
-			api_client: RcloneApiClient::new(rc_port),
+			api_client: api,
 		})
 	}
 }
