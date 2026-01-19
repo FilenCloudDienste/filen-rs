@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use dialoguer::console::style;
+use filen_rclone_wrapper::serve::BasicServerOptions;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
@@ -112,17 +113,90 @@ pub(crate) enum Commands {
 	EmptyTrash,
 	/// Export an auth config (to be used with --auth-config-path option)
 	ExportAuthConfig,
-	/// Mount Filen as a network drive
-	Mount {
-		/// Where to mount the network drive (default: system default)
-		mount_point: Option<String>,
-	},
 	/// Execute an Rclone command using filen-rclone
 	Rclone {
 		/// The command to execute. Your Filen drive is available as the "filen" remote.
 		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
 		cmd: Vec<String>,
 	},
+	/// Mount Filen as a network drive
+	Mount {
+		/// Where to mount the network drive (default: system default)
+		mount_point: Option<String>,
+	},
+	/// Runs a WebDAV server exposing your Filen drive
+	Webdav {
+		/// URL for the server (default: 127.0.0.1:8080)
+		#[arg(long)]
+		url: Option<String>,
+		/// Directory that the server exposes (default: the entire Filen drive)
+		#[arg(long)]
+		root: Option<String>,
+		/// Username for authentication to the server (default: no authentication)
+		#[arg(long)]
+		user: Option<String>,
+		/// Password for authentication to the server (default: no authentication)
+		#[arg(long)]
+		password: Option<String>,
+		/// The server is read-only
+		#[arg(long)]
+		read_only: bool,
+	},
+	/// Runs an FTP server exposing your Filen drive
+	Ftp {
+		/// URL for the server (default: 127.0.0.1:8080)
+		#[arg(long)]
+		url: Option<String>,
+		/// Directory that the server exposes (default: the entire Filen drive)
+		#[arg(long)]
+		root: Option<String>,
+		/// Username for authentication to the server (default: no authentication)
+		#[arg(long)]
+		user: Option<String>,
+		/// Password for authentication to the server (default: no authentication)
+		#[arg(long)]
+		password: Option<String>,
+		/// The server is read-only
+		#[arg(long)]
+		read_only: bool,
+	},
+	/// Runs an SFTP server exposing your Filen drive
+	Sftp {
+		/// URL for the server (default: 127.0.0.1:8080)
+		#[arg(long)]
+		url: Option<String>,
+		/// Directory that the server exposes (default: the entire Filen drive)
+		#[arg(long)]
+		root: Option<String>,
+		/// Username for authentication to the server
+		#[arg(long)]
+		user: String,
+		/// Password for authentication to the server
+		#[arg(long)]
+		password: String,
+		/// The server is read-only
+		#[arg(long)]
+		read_only: bool,
+	},
+	/// Runs an HTTP server exposing your Filen drive
+	HttpServer {
+		/// URL for the server (default: 127.0.0.1:8080)
+		#[arg(long)]
+		url: Option<String>,
+		/// Directory that the server exposes (default: the entire Filen drive)
+		#[arg(long)]
+		root: Option<String>,
+		/// Username for authentication to the server (default: no authentication)
+		#[arg(long)]
+		user: Option<String>,
+		/// Password for authentication to the server (default: no authentication)
+		#[arg(long)]
+		password: Option<String>,
+		/// The server is read-only
+		#[arg(long)]
+		read_only: bool,
+	},
+	// todo: s3 server
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
 	/// Delete saved credentials and exit
@@ -246,12 +320,108 @@ pub(crate) async fn execute_command(
 			));
 			None
 		}
+		Commands::Rclone { cmd } => {
+			rclone::execute_rclone(config, ui, client, cmd).await?;
+			None
+		}
 		Commands::Mount { mount_point } => {
 			rclone::mount(config, ui, client, mount_point).await?;
 			None
 		}
-		Commands::Rclone { cmd } => {
-			rclone::execute_rclone(config, ui, client, cmd).await?;
+		Commands::Webdav {
+			url,
+			root,
+			user,
+			password,
+			read_only,
+		} => {
+			rclone::start_server(
+				config,
+				ui,
+				client,
+				"webdav",
+				"WebDAV",
+				BasicServerOptions {
+					url,
+					root,
+					user,
+					password,
+					read_only,
+				},
+			)
+			.await?;
+			None
+		}
+		Commands::Ftp {
+			url,
+			root,
+			user,
+			password,
+			read_only,
+		} => {
+			rclone::start_server(
+				config,
+				ui,
+				client,
+				"ftp",
+				"FTP",
+				BasicServerOptions {
+					url,
+					root,
+					user,
+					password,
+					read_only,
+				},
+			)
+			.await?;
+			None
+		}
+		Commands::Sftp {
+			url,
+			root,
+			user,
+			password,
+			read_only,
+		} => {
+			rclone::start_server(
+				config,
+				ui,
+				client,
+				"sftp",
+				"SFTP",
+				BasicServerOptions {
+					url,
+					root,
+					user: Some(user),
+					password: Some(password),
+					read_only,
+				},
+			)
+			.await?;
+			None
+		}
+		Commands::HttpServer {
+			url,
+			root,
+			user,
+			password,
+			read_only,
+		} => {
+			rclone::start_server(
+				config,
+				ui,
+				client,
+				"http",
+				"HTTP",
+				BasicServerOptions {
+					url,
+					root,
+					user,
+					password,
+					read_only,
+				},
+			)
+			.await?;
 			None
 		}
 		Commands::ExportApiKey => {
@@ -809,10 +979,10 @@ async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 mod rclone {
 	//! [cli-doc] managed-rclone
 	//! The Filen CLI includes a managed installation of [filen-rclone](https://github.com/FilenCloudDienste/filen-rclone).
-	//! It is automatically downloaded and configured (authenticated) when you run the `rclone` or `mount` commands.
+	//! It is automatically downloaded and configured (authenticated) when you run the commands like `rclone`, `mount`, etc.
 
 	use anyhow::{Context as _, Result};
-	use filen_rclone_wrapper::network_drive::NetworkDrive;
+	use filen_rclone_wrapper::serve::BasicServerOptions;
 
 	use crate::{CliConfig, auth::LazyClient, ui::UI};
 
@@ -823,15 +993,19 @@ mod rclone {
 		mount_point: Option<String>,
 	) -> Result<()> {
 		let client = client.get(ui).await?;
-		let mut network_drive =
-			NetworkDrive::mount(client, &config.config_dir, mount_point.as_deref(), false)
-				.await
-				.context("Failed to mount network drive")?;
+		let mut network_drive = filen_rclone_wrapper::network_drive::NetworkDrive::mount(
+			client,
+			&config.config_dir,
+			mount_point.as_deref(),
+			false,
+		)
+		.await
+		.context("Failed to mount network drive")?;
 		network_drive
 			.wait_until_active()
 			.await
 			.context("Failed to mount network drive")?;
-		ui.print_success("Mounted network drive (press Ctrl+C to unmount and exit)");
+		ui.print_success("Mounted network drive (kill the CLI to unmount and exit)");
 		let code = network_drive
 			.process
 			.wait()
@@ -841,6 +1015,54 @@ mod rclone {
 			return Err(anyhow::anyhow!(match code.code() {
 				Some(c) => format!("Mount process exited with code: {}", c),
 				None => "Mount process exited with unknown code".to_string(),
+			}));
+		}
+		Ok(())
+	}
+
+	pub(crate) async fn start_server(
+		config: &CliConfig,
+		ui: &mut UI,
+		client: &mut LazyClient,
+		server_type: &str,
+		display_server_type: &str,
+		options: BasicServerOptions,
+	) -> Result<()> {
+		let client = client.get(ui).await?;
+		let mut server = filen_rclone_wrapper::serve::start_basic_server(
+			client,
+			&config.config_dir,
+			server_type,
+			options,
+		)
+		.await
+		.with_context(|| format!("Failed to start {} server", display_server_type))?;
+		ui.print_success(&format!(
+			"Started {} server on http://{} with {} (kill the CLI to stop)",
+			display_server_type,
+			server.url,
+			if let Some(auth) = &server.auth {
+				format!(
+					"username \"{}\" and password \"{}\"",
+					auth.user, auth.password
+				)
+			} else {
+				"no authentication".to_string()
+			}
+		));
+		let code = server.process.wait().await.with_context(|| {
+			format!("Failed to wait for {} server process", display_server_type)
+		})?;
+		if !code.success() {
+			return Err(anyhow::anyhow!(match code.code() {
+				Some(c) => format!(
+					"{} server process exited with code: {} (use --verbose for more info)",
+					display_server_type, c
+				),
+				None => format!(
+					"{} server process exited with unknown code",
+					display_server_type
+				),
 			}));
 		}
 		Ok(())
@@ -860,12 +1082,7 @@ mod rclone {
 		.context("Failed to initialize rclone installation")?;
 		let exit_code = rclone
 			.execute(&cmd.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
-			.await
-			.spawn()
-			.context("Failed to execute rclone command")?
-			.wait()
-			.await
-			.context("Failed to wait for rclone command")?
+			.await?
 			.code();
 		if let Some(exit_code) = exit_code
 			&& exit_code != 0
