@@ -196,6 +196,25 @@ pub(crate) enum Commands {
 		#[arg(long)]
 		read_only: bool,
 	},
+	// todo: make clearer what is meant by "url"
+	/// Runs an S3 server exposing your Filen drive
+	S3 {
+		/// URL for the server (default: 127.0.0.1:8080)
+		#[arg(long)]
+		url: Option<String>,
+		/// Directory that the server exposes (default: the entire Filen drive)
+		#[arg(long)]
+		root: Option<String>,
+		/// Access key ID for authentication to the server
+		#[arg(long, default_value = "user")]
+		access_key_id: String,
+		/// Secret access key for authentication to the server
+		#[arg(long, default_value = "password")]
+		secret_access_key: String,
+		/// The server is read-only
+		#[arg(long)]
+		read_only: bool,
+	},
 	// todo: s3 server
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
@@ -418,6 +437,30 @@ pub(crate) async fn execute_command(
 					root,
 					user,
 					password,
+					read_only,
+				},
+			)
+			.await?;
+			None
+		}
+		Commands::S3 {
+			url,
+			root,
+			access_key_id,
+			secret_access_key,
+			read_only,
+		} => {
+			rclone::start_server(
+				config,
+				ui,
+				client,
+				"s3",
+				"S3",
+				BasicServerOptions {
+					url,
+					root,
+					user: Some(access_key_id),
+					password: Some(secret_access_key),
 					read_only,
 				},
 			)
@@ -1038,16 +1081,27 @@ mod rclone {
 		.await
 		.with_context(|| format!("Failed to start {} server", display_server_type))?;
 		ui.print_success(&format!(
-			"Started {} server on http://{} with {} (kill the CLI to stop)",
+			"Started {} server on http://{} {} (kill the CLI to stop)",
 			display_server_type,
 			server.url,
 			if let Some(auth) = &server.auth {
 				format!(
-					"username \"{}\" and password \"{}\"",
-					auth.user, auth.password
+					"with {} \"{}\" and {} \"{}\"",
+					if server_type == "s3" {
+						"Access Key ID"
+					} else {
+						"username"
+					},
+					auth.user,
+					if server_type == "s3" {
+						"Secret Access Key"
+					} else {
+						"password"
+					},
+					auth.password
 				)
 			} else {
-				"no authentication".to_string()
+				"without authentication".to_string()
 			}
 		));
 		let code = server.process.wait().await.with_context(|| {
