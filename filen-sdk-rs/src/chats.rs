@@ -467,7 +467,7 @@ impl Client {
 		before: DateTime<Utc>,
 	) -> Result<Vec<ChatMessage>, Error> {
 		let resp = api::v3::chat::messages::post(
-			self,
+			self.client(),
 			&api::v3::chat::messages::Request {
 				conversation: chat.uuid,
 				timestamp: before,
@@ -497,7 +497,7 @@ impl Client {
 	}
 
 	pub async fn list_chats(&self) -> Result<Vec<Chat>, Error> {
-		let resp = api::v3::chat::conversations::get(self).await?;
+		let resp = api::v3::chat::conversations::get(self.client()).await?;
 
 		let user_id = self.user_id;
 		let private_key = self.private_key();
@@ -537,7 +537,7 @@ impl Client {
 			self.lock_chats()
 		);
 		let resp = api::v3::chat::conversations::participants::add::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::participants::add::Request {
 				uuid: chat_uuid,
 				contact_uuid: contact.uuid,
@@ -574,7 +574,7 @@ impl Client {
 		);
 
 		let resp = api::v3::chat::conversations::create::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::create::Request {
 				uuid,
 				metadata: key_asymm_string?.as_borrowed_cow(),
@@ -654,7 +654,7 @@ impl Client {
 		let _lock = _lock?;
 
 		api::v3::chat::conversations::name::edit::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::name::edit::Request {
 				uuid: chat.uuid,
 				name: encrypted_name,
@@ -671,7 +671,7 @@ impl Client {
 		let _lock = self.lock_chats().await?;
 
 		api::v3::chat::conversations::delete::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::delete::Request { uuid: chat.uuid },
 		)
 		.await
@@ -694,7 +694,7 @@ impl Client {
 			do_cpu_intensive(|| crypto::ChatMessage::blocking_encrypt(key, &message)).await;
 
 		let resp = api::v3::chat::send::post(
-			self,
+			self.client(),
 			&api::v3::chat::send::Request {
 				conversation: chat.uuid,
 				uuid,
@@ -745,7 +745,7 @@ impl Client {
 			do_cpu_intensive(|| crypto::ChatMessage::blocking_encrypt(key, &new_message)).await;
 
 		let resp = api::v3::chat::edit::post(
-			self,
+			self.client(),
 			&api::v3::chat::edit::Request {
 				conversation: message.chat,
 				uuid: message.inner.uuid,
@@ -769,7 +769,7 @@ impl Client {
 		let _lock = self.lock_chats().await?;
 
 		api::v3::chat::delete::post(
-			self,
+			self.client(),
 			&api::v3::chat::delete::Request {
 				uuid: message.inner.uuid,
 			},
@@ -790,7 +790,7 @@ impl Client {
 
 	pub async fn disable_message_embed(&self, message: &mut ChatMessage) -> Result<(), Error> {
 		api::v3::chat::message::embed::disable::post(
-			self,
+			self.client(),
 			&api::v3::chat::message::embed::disable::Request {
 				uuid: message.inner.uuid,
 			},
@@ -807,7 +807,7 @@ impl Client {
 		signal_type: ChatTypingType,
 	) -> Result<(), Error> {
 		api::v3::chat::typing::post(
-			self,
+			self.client(),
 			&api::v3::chat::typing::Request {
 				conversation: chat.uuid,
 				signal_type,
@@ -844,7 +844,7 @@ impl Client {
 		let _lock = self.lock_chats().await?;
 
 		api::v3::chat::conversations::participants::remove::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::participants::remove::Request {
 				uuid: chat.uuid,
 				user_id: contact.user_id,
@@ -858,7 +858,7 @@ impl Client {
 
 	pub async fn mark_chat_read(&self, chat: &Chat) -> Result<(), Error> {
 		api::v3::chat::conversations::read::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::read::Request { uuid: chat.uuid },
 		)
 		.await
@@ -866,7 +866,7 @@ impl Client {
 
 	pub async fn get_chat_unread_count(&self, chat: &Chat) -> Result<u64, Error> {
 		Ok(api::v3::chat::conversations::unread::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::unread::Request { uuid: chat.uuid },
 		)
 		.await?
@@ -874,12 +874,12 @@ impl Client {
 	}
 
 	pub async fn get_all_chats_unread_count(&self) -> Result<u64, Error> {
-		Ok(api::v3::chat::unread::get(self).await?.unread)
+		Ok(api::v3::chat::unread::get(self.client()).await?.unread)
 	}
 
 	pub async fn update_chat_online_status(&self, chat: &mut Chat) -> Result<(), Error> {
 		let resp = api::v3::chat::conversations::online::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::online::Request {
 				conversation: chat.uuid,
 			},
@@ -910,7 +910,7 @@ impl Client {
 
 		let _lock = self.lock_chats().await?;
 		api::v3::chat::conversations::leave::post(
-			self,
+			self.client(),
 			&api::v3::chat::conversations::leave::Request { uuid: chat.uuid },
 		)
 		.await
@@ -919,7 +919,7 @@ impl Client {
 	pub async fn update_last_chat_focus_times_now(&self, chats: &mut [Chat]) -> Result<(), Error> {
 		let now = Utc::now().round_subsecs(3);
 		api::v3::chat::last_focus_update::post(
-			self,
+			self.client(),
 			&api::v3::chat::last_focus_update::Request {
 				conversations: chats
 					.iter()
@@ -938,7 +938,7 @@ impl Client {
 	pub async fn mute_chat(&self, chat: &mut Chat, mute: bool) -> Result<(), Error> {
 		let _lock = self.lock_chats().await?;
 		api::v3::chat::mute::post(
-			self,
+			self.client(),
 			&api::v3::chat::mute::Request {
 				uuid: chat.uuid,
 				mute,

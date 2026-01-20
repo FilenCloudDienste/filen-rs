@@ -155,7 +155,10 @@ mod client_impl {
 	};
 
 	use async_zip::{ZipEntryBuilder, base::write::ZipFileWriter};
-	use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
+	use futures::{
+		AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, future::LocalBoxFuture,
+		stream::FuturesUnordered,
+	};
 	use log::warn;
 	use tokio::sync::Mutex;
 
@@ -384,7 +387,7 @@ mod client_impl {
 			)));
 
 			let root_path = "";
-			let mut futures: FuturesUnordered<MaybeSendBoxFuture<Result<(), Error>>> = items
+			let mut futures: FuturesUnordered<LocalBoxFuture<Result<(), Error>>> = items
 				.iter()
 				.map(|i| {
 					let zip = zip.clone();
@@ -406,7 +409,7 @@ mod client_impl {
 						};
 						self.download_dir_to_zip(&dir, zip, state, progress_callback, root_path)
 							.await
-					}) as MaybeSendBoxFuture<Result<(), Error>>
+					}) as LocalBoxFuture<Result<(), Error>>
 				})
 				.collect();
 

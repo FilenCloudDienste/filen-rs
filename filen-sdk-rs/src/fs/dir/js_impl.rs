@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
 	Error,
 	auth::JsClient,
@@ -50,12 +52,15 @@ impl JsClient {
 		dir: DirEnum,
 		callback: std::sync::Arc<dyn DirContentDownloadProgressCallback>,
 	) -> Result<DirsAndFiles, Error> {
-		self.inner_list_dir_recursive(dir, move |downloaded, total| {
-			let callback = std::sync::Arc::clone(&callback);
-			tokio::task::spawn_blocking(move || {
-				callback.on_progress(downloaded, total);
-			});
-		})
+		self.inner_list_dir_recursive(
+			dir,
+			Arc::new(move |downloaded, total| {
+				let callback = std::sync::Arc::clone(&callback);
+				tokio::task::spawn_blocking(move || {
+					callback.on_progress(downloaded, total);
+				});
+			}),
+		)
 		.await
 	}
 }
@@ -89,32 +94,36 @@ impl JsClient {
 			}
 		});
 
-		self.inner_list_dir_recursive(dir, move |downloaded, total| {
-			let _ = sender.send((downloaded, total));
-		})
+		self.inner_list_dir_recursive(
+			dir,
+			Arc::new(move |downloaded, total| {
+				let _ = sender.send((downloaded, total));
+			}),
+		)
 		.await
 	}
 }
 
 impl JsClient {
-	async fn inner_list_dir_recursive(
+	async fn inner_list_dir_recursive<F>(
 		&self,
 		dir: DirEnum,
-		callback: impl Fn(u64, Option<u64>) + Send + Sync + 'static,
-	) -> Result<DirsAndFiles, Error> {
+		callback: Arc<F>,
+	) -> Result<DirsAndFiles, Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+	{
 		let this = self.inner();
 		let (dirs, files) = do_on_commander(move || async move {
 			let dir_type = UnsharedDirectoryType::from(dir);
-			this.list_dir_recursive(&dir_type, &mut |downloaded, bytes| {
-				callback(downloaded, bytes);
-			})
-			.await
-			.map(|(dirs, files)| {
-				(
-					dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
-					files.into_iter().map(File::from).collect::<Vec<_>>(),
-				)
-			})
+			this.list_dir_recursive(&dir_type, callback)
+				.await
+				.map(|(dirs, files)| {
+					(
+						dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+						files.into_iter().map(File::from).collect::<Vec<_>>(),
+					)
+				})
 		})
 		.await?;
 		Ok(DirsAndFiles { dirs, files })

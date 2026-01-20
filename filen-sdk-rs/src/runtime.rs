@@ -1,6 +1,8 @@
 #[cfg(feature = "wasm-full")]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
+use crate::util::MaybeSend;
+
 mod async_scoped_task {
 	use std::mem::ManuallyDrop;
 
@@ -282,7 +284,8 @@ mod commander_thread {
 			}
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{
-				self.tokio_handle.spawn(fut_builder.build());
+				self.tokio_handle
+					.spawn(async move { fut_builder.build().await });
 			}
 		}
 	}
@@ -601,14 +604,16 @@ mod wasm_threading {
 		(*closure)();
 		std::mem::drop(worker_handle);
 	}
+}
 
-	pub(super) fn spawn_local_on_worker(f: impl Future<Output = ()> + 'static) {
-		let maybe_handle = WORKER_HANDLE.with_borrow(|weak_handle| weak_handle.upgrade());
-		wasm_bindgen_futures::spawn_local(async move {
-			f.await;
-			std::mem::drop(maybe_handle);
-		});
-	}
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn spawn_local_on_worker(f: impl Future<Output = ()> + 'static) {
+	let maybe_handle =
+		worker_handle::WORKER_HANDLE.with_borrow(|weak_handle| weak_handle.upgrade());
+	wasm_bindgen_futures::spawn_local(async move {
+		f.await;
+		std::mem::drop(maybe_handle);
+	});
 }
 
 #[cfg(not(all(
@@ -631,6 +636,59 @@ where
 	}
 }
 
+#[derive(Debug)]
+pub(crate) struct SpawnTaskHandle<T> {
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	receiver: tokio::sync::oneshot::Receiver<T>,
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> SpawnTaskHandle<T> {
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+		Self { handle }
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	pub(crate) fn new(receiver: tokio::sync::oneshot::Receiver<T>) -> Self {
+		Self { receiver }
+	}
+
+	pub(crate) fn is_finished(&self) -> bool {
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			!self.receiver.is_empty()
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			self.handle.is_finished()
+		}
+	}
+}
+
+pub(crate) fn spawn_task_maybe_send<F, T>(f: F) -> SpawnTaskHandle<T>
+where
+	F: Future<Output = T> + MaybeSend + 'static,
+	T: 'static + MaybeSend,
+{
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	{
+		let (sender, receiver) = tokio::sync::oneshot::channel();
+		spawn_local_on_worker(async move {
+			if sender.send(f.await).is_err() {
+				panic!("receiver closed");
+			}
+		});
+
+		SpawnTaskHandle::new(receiver)
+	}
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	{
+		SpawnTaskHandle::new(tokio::spawn(f))
+	}
+}
+
 #[cfg(not(all(
 	target_family = "wasm",
 	target_os = "unknown",
@@ -645,7 +703,7 @@ where
 	{
 		use wasm_bindgen::UnwrapThrowExt;
 		wasm_threading::spawn_worker(|| {
-			wasm_threading::spawn_local_on_worker(f());
+			spawn_local_on_worker(f());
 		})
 		.expect_throw("Failed to spawn worker");
 	}
@@ -673,7 +731,7 @@ where
 {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	{
-		wasm_threading::spawn_local_on_worker(f);
+		spawn_local_on_worker(f);
 	}
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{

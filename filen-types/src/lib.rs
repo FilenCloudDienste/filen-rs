@@ -1,3 +1,4 @@
+#![feature(min_specialization)]
 pub mod api;
 pub mod auth;
 pub mod crypto;

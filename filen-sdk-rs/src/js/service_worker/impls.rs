@@ -151,7 +151,7 @@ impl ServiceWorkerClient {
 
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = "fromStringified")]
 pub fn from_stringified(serialized: StringifiedClient) -> Result<ServiceWorkerClient, Error> {
-	Ok(ServiceWorkerClient::new(
-		Client::from_stringified(serialized).map_err(Error::from)?,
-	))
+	Ok(ServiceWorkerClient::new(Client::from_stringified(
+		serialized,
+	)?))
 }

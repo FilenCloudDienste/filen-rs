@@ -1,16 +1,16 @@
+use std::cmp::min;
 use std::sync::Weak;
+use std::time::Duration;
 use std::{borrow::Cow, sync::Arc, time};
 
 use bytes::Bytes;
-use filen_types::api::response::FilenResponse;
 use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
 use log::debug;
 
 use crate::ErrorKind;
-use crate::api::{RetryError, retry_wrap};
+// use crate::api::{RetryError, retry_wrap};
 use crate::auth::http::AuthorizedClient;
 use crate::consts::gateway_url;
-use crate::error::ErrorExt;
 use crate::{
 	api,
 	auth::{Client, http::AuthClient},
@@ -168,6 +168,21 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 	});
 }
 
+pub(crate) const DEFAULT_NUM_RETRIES: usize = 7;
+pub(crate) const DEFAULT_MAX_RETRY_TIME: Duration = Duration::from_secs(30);
+
+fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
+	std::iter::successors(
+		Some((
+			max_retry_time,
+			Duration::from_secs(0),
+			Duration::from_millis(250),
+		)),
+		|&(max, a, b)| Some((max, b, min(max, a + b))),
+	)
+	.map(|(_, a, _)| a)
+}
+
 impl Client {
 	/// Attempts to acquire a lock on the specified resource.
 	/// If the lock is acquired, it returns a [`ResourceLock`] that releases the lock when dropped.
@@ -184,52 +199,48 @@ impl Client {
 			r#type: LockType::Acquire,
 			resource: Cow::Borrowed(&resource),
 		})?);
+		let url = gateway_url(api::v3::user::lock::ENDPOINT);
 		let endpoint = api::v3::user::lock::ENDPOINT;
-		debug!("Acquiring lock on resource: {resource} with uuid: {uuid}");
-		retry_wrap(
-			bytes,
-			|| {
-				self.post_auth_request(gateway_url(endpoint)).header(
-					reqwest::header::CONTENT_TYPE,
-					reqwest::header::HeaderValue::from_static("application/json"),
+		for (i, delay) in (0..attempts).zip(fibonacci_iter(max_sleep_time)) {
+			let resp = self
+				.arc_client()
+				.post_raw_bytes_auth::<api::v3::user::lock::Response>(
+					bytes.clone(),
+					&url,
+					endpoint.into(),
 				)
-			},
-			endpoint,
-			async |resp| {
-				let body = match resp
-					.json::<FilenResponse<api::v3::user::lock::Response>>()
-					.await
-				{
-					Ok(body) => body,
-					Err(e) => {
-						log::error!("Failed to parse response from {endpoint}: {e}");
-						return Err(RetryError::NoRetry(e.with_context(endpoint)));
-					}
-				};
+				.await?;
 
-				let resp = body
-					.into_data()
-					.map_err(|e| RetryError::NoRetry(e.with_context(endpoint)))?;
+			if !resp.acquired {
+				debug!(
+					"Attempt {}/{}: Failed to acquire lock on resource: {}. Retrying in {:?}",
+					i + 1,
+					attempts,
+					resource,
+					delay
+				);
+				#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+				tokio::time::sleep(delay).await;
+				#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+				wasmtimer::tokio::sleep(delay).await
+			} else {
+				let lock = Arc::new(ResourceLock {
+					uuid,
+					client: self.arc_client(),
+					resource,
+				});
+				keep_lock_alive(Arc::downgrade(&lock));
+				return Ok(lock);
+			}
+		}
 
-				if resp.acquired {
-					let lock = Arc::new(ResourceLock {
-						uuid,
-						client: self.arc_client(),
-						resource: resource.clone(),
-					});
-					keep_lock_alive(Arc::downgrade(&lock));
-					Ok(lock)
-				} else {
-					Err(RetryError::Retry(Error::custom(
-						ErrorKind::Server,
-						format!("Failed to acquire lock: {}", resp.resource),
-					)))
-				}
-			},
-			attempts,
-			max_sleep_time,
-		)
-		.await
+		Err(Error::custom(
+			ErrorKind::RetryFailed,
+			format!(
+				"Failed to acquire lock on resource '{}' after {attempts} attempts",
+				resource
+			),
+		))
 	}
 
 	pub async fn acquire_lock_with_default(

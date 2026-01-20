@@ -1,4 +1,7 @@
-use std::borrow::Cow;
+use std::{
+	borrow::Cow,
+	sync::{Arc, RwLock},
+};
 
 use filen_types::crypto::{EncryptedString, rsa::EncryptedPrivateKey};
 use rsa::RsaPublicKey;
@@ -65,7 +68,7 @@ pub(super) async fn login(
 	)
 	.await?;
 
-	let auth_client = super::AuthClient::new_from_client(response.api_key, client);
+	let auth_client = client.into_authed(Arc::new(RwLock::new(response.api_key)));
 
 	let master_keys = if let Some(master_keys_str) = response.master_keys {
 		crypto::v2::MasterKeys::new(master_keys_str, master_key).await?

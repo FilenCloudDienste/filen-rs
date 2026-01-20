@@ -2,7 +2,7 @@ use std::{
 	borrow::Cow,
 	fmt::{Debug, Display},
 	str::FromStr,
-	sync::{Arc, Weak},
+	sync::{Arc, RwLock, Weak},
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -15,14 +15,14 @@ use filen_types::{
 	serde::rsa::RsaDerPublicKey,
 	traits::CowHelpers,
 };
-use http::{AuthClient, UnauthClient};
+use http::AuthClient;
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
-	auth::http::AuthorizedClient,
+	auth::http::{ClientConfig, SharedClientState, UnauthClient},
 	consts::{
 		NEW_ACCOUNT_AUTH_VERSION, RSA_KEY_SIZE, V2FILE_ENCRYPTION_VERSION,
 		V2META_ENCRYPTION_VERSION,
@@ -318,9 +318,7 @@ pub struct StringifiedClient {
 )]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn from_stringified(serialized: StringifiedClient) -> Result<JsClient, Error> {
-	Ok(JsClient::new(
-		Client::from_stringified(serialized).map_err(Error::from)?,
-	))
+	Ok(JsClient::new(Client::from_stringified(serialized)?))
 }
 
 impl From<FilenSDKConfig> for StringifiedClient {
@@ -340,7 +338,7 @@ impl From<FilenSDKConfig> for StringifiedClient {
 }
 
 impl Client {
-	pub fn from_stringified(stringified: StringifiedClient) -> Result<Self, ConversionError> {
+	pub fn from_stringified(stringified: StringifiedClient) -> Result<Self, Error> {
 		let auth_info =
 			AuthInfo::from_string_and_version(&stringified.auth_info, stringified.auth_version)?;
 		let file_encryption_version = match auth_info {
@@ -352,22 +350,32 @@ impl Client {
 			AuthInfo::V3(_) => MetaEncryptionVersion::V3,
 		};
 
-		let private_key =
-			RsaPrivateKey::from_pkcs8_der(&BASE64_STANDARD.decode(stringified.private_key)?)?;
+		let private_key = RsaPrivateKey::from_pkcs8_der(
+			&BASE64_STANDARD
+				.decode(stringified.private_key)
+				.map_err(ConversionError::from)?,
+		)
+		.map_err(ConversionError::from)?;
 
-		let http_client = Arc::new(AuthClient::new(APIKey(Cow::Owned(stringified.api_key))));
+		let http_client = Arc::new(
+			UnauthClient::new(SharedClientState::new(ClientConfig::default())?).into_authed(
+				Arc::new(RwLock::new(APIKey(Cow::Owned(stringified.api_key)))),
+			),
+		);
 
 		Ok(Client {
 			email: stringified.email,
 			user_id: stringified.user_id,
-			root_dir: RootDirectory::new(UuidStr::from_str(&stringified.root_uuid)?),
+			root_dir: RootDirectory::new(
+				UuidStr::from_str(&stringified.root_uuid).map_err(ConversionError::from)?,
+			),
 			auth_info: std::sync::RwLock::new(Arc::new(auth_info)),
 			file_encryption_version,
 			meta_encryption_version,
 			public_key: RsaPublicKey::from(&private_key),
 			hmac_key: HMACKey::new(&private_key),
 			private_key: Arc::new(private_key),
-			http_client: http_client.clone(),
+			http_client,
 			drive_lock: tokio::sync::RwLock::new(None),
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
@@ -397,7 +405,11 @@ impl Client {
 		})
 	}
 
-	pub fn arc_client(&self) -> Arc<AuthClient> {
+	pub(crate) fn client(&self) -> &AuthClient {
+		&self.http_client
+	}
+
+	pub(crate) fn arc_client(&self) -> Arc<AuthClient> {
 		self.http_client.clone()
 	}
 
@@ -528,7 +540,7 @@ impl Client {
 	}
 
 	pub async fn login(email: String, pwd: &str, two_factor_code: &str) -> Result<Self, Error> {
-		let client = UnauthClient::default();
+		let client = UnauthClient::new(SharedClientState::new(ClientConfig::default())?);
 
 		let info_response = api::v3::auth::info::post(
 			&client,
@@ -646,7 +658,12 @@ impl Client {
 					}),
 				AuthInfo::V3(info) => vec![info.dek.to_string()],
 			},
-			api_key: self.http_client.get_api_key().to_string(),
+			api_key: self
+				.http_client
+				.api_key()
+				.read()
+				.unwrap_or_else(|e| e.into_inner())
+				.to_string(),
 			private_key: BASE64_STANDARD
 				.encode(self.private_key.to_pkcs8_der().unwrap().as_bytes()),
 			public_key: BASE64_STANDARD.encode(self.public_key.to_pkcs1_der().unwrap().as_bytes()),
@@ -660,7 +677,7 @@ impl Client {
 	}
 
 	pub async fn generate_2fa_secret(&self) -> Result<TwoFASecret, Error> {
-		let resp = api::v3::user::settings::get(self).await?;
+		let resp = api::v3::user::settings::get(self.client()).await?;
 
 		Ok(TwoFASecret::new(
 			resp.two_factor_key.into_owned(),
@@ -672,7 +689,7 @@ impl Client {
 	pub async fn enable_2fa(&self, current_2fa_code: &str) -> Result<String, Error> {
 		let _lock = self.lock_auth().await?;
 		let resp = api::v3::user::two_fa::enable::post(
-			self,
+			self.client(),
 			&api::v3::user::two_fa::enable::Request {
 				code: Cow::Borrowed(current_2fa_code),
 			},
@@ -685,7 +702,7 @@ impl Client {
 	pub async fn disable_2fa(&self, current_2fa_code: &str) -> Result<(), Error> {
 		let _lock = self.lock_auth().await?;
 		api::v3::user::two_fa::disable::post(
-			self,
+			self.client(),
 			&api::v3::user::two_fa::disable::Request {
 				code: Cow::Borrowed(current_2fa_code),
 			},
@@ -696,7 +713,7 @@ impl Client {
 
 	pub async fn delete_account(&self, two_factor_code: &str) -> Result<(), Error> {
 		api::v3::user::delete::post(
-			self,
+			self.client(),
 			&api::v3::user::delete::Request {
 				two_factor_key: Cow::Borrowed(two_factor_code),
 			},
@@ -712,7 +729,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_auth().await?;
 		let auth_info_resp = api::v3::auth::info::post(
-			self,
+			self.client(),
 			&api::v3::auth::info::Request {
 				email: Cow::Borrowed(&self.email),
 			},
@@ -755,7 +772,7 @@ impl Client {
 		let encrypted = master_keys.to_encrypted().await;
 
 		let resp = api::v3::user::settings::password::change::post(
-			self,
+			self.client(),
 			&api::v3::user::settings::password::change::Request {
 				current_password: current_derived,
 				password: new_derive,
@@ -766,10 +783,14 @@ impl Client {
 		)
 		.await?;
 
-		self.update_api_key(resp.new_api_key);
+		*self
+			.client()
+			.api_key()
+			.write()
+			.unwrap_or_else(|e| e.into_inner()) = resp.new_api_key;
 
 		api::v3::user::key_pair::update::post(
-			self,
+			self.client(),
 			&api::v3::user::key_pair::update::Request {
 				public_key: RsaDerPublicKey(Cow::Borrowed(&self.public_key)),
 				private_key: private_key_encrypted,
@@ -792,7 +813,7 @@ impl Client {
 			.unwrap_or_else(|e| e.into_inner())
 			.as_ref()
 			.convert_into_exportable(self.user_id)?;
-		api::v3::user::did_export_master_keys::post(self)
+		api::v3::user::did_export_master_keys::post(self.client())
 			.await
 			.map(|_| exportable)
 	}
@@ -803,7 +824,7 @@ impl Client {
 		new_password: &str,
 		recovery_key: Option<&str>,
 	) -> Result<Self, Error> {
-		let client = UnauthClient::default();
+		let client = UnauthClient::new(SharedClientState::new(ClientConfig::default())?);
 
 		let auth_info_resp = api::v3::auth::info::post(
 			&client,
@@ -965,7 +986,7 @@ impl RegisteredInfo {
 		ref_id: Option<&str>,
 		aff_id: Option<&str>,
 	) -> Result<Self, Error> {
-		let client = UnauthClient::default();
+		let client = UnauthClient::new(SharedClientState::new(ClientConfig::default())?);
 
 		let (derived_pwd, salt, auth_info) = match NEW_ACCOUNT_AUTH_VERSION {
 			AuthVersion::V1 => unreachable!("V1 is not supported for new accounts"),
@@ -1008,7 +1029,7 @@ impl RegisteredInfo {
 }
 
 pub async fn start_password_reset(email: &str) -> Result<(), Error> {
-	let client = UnauthClient::default();
+	let client = UnauthClient::new(SharedClientState::new(ClientConfig::default())?);
 	api::v3::user::password::forgot::post(
 		&client,
 		&api::v3::user::password::forgot::Request {
@@ -1039,7 +1060,6 @@ impl std::fmt::Debug for Client {
 				)),
 			)
 			.field("hmac_key", &self.hmac_key)
-			.field("http_client", &self.http_client)
 			.finish()
 	}
 }

@@ -92,7 +92,7 @@ impl<'a> FileReader<'a> {
 	/// Pushes the future to fetch the next chunk.
 	///
 	/// Requires that `out_data` have the necessary capacity to store the entire chunk returned from the server
-	fn push_fetch_next_chunk(&mut self, mut out_data: Chunk<'a>) {
+	fn push_fetch_next_chunk(&mut self, out_data: Chunk<'a>) {
 		if self.file.chunks() <= self.next_chunk_idx {
 			return;
 		}
@@ -104,18 +104,20 @@ impl<'a> FileReader<'a> {
 		let client = self.client;
 		let file = self.file;
 		self.futures.push_back(Box::pin(async move {
-			api::download::download_file_chunk(client, file, chunk_idx, out_data.as_mut()).await?;
+			let (_, permits) = out_data.into_parts();
+			let data = api::download::download_file_chunk(client.client(), file, chunk_idx).await?;
+			let mut chunk = Chunk::from_parts(data, permits);
 			file.key()
 				.ok_or(MetadataWasNotDecryptedError)?
-				.decrypt_data(out_data.as_mut())
+				.decrypt_data(chunk.as_mut())
 				.await?;
 
 			Ok(if first_chunk {
-				let mut cursor = Cursor::new(out_data);
+				let mut cursor = Cursor::new(chunk);
 				cursor.set_position(index % CHUNK_SIZE_U64);
 				cursor
 			} else {
-				Cursor::new(out_data)
+				Cursor::new(chunk)
 			})
 		}));
 	}

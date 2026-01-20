@@ -1,3 +1,6 @@
+// stabilized in Rust 1.92
+#![feature(min_specialization)]
+#![feature(unsigned_nonzero_div_ceil)]
 #![allow(dead_code)]
 
 pub(crate) mod api;
@@ -29,3 +32,7 @@ pub use error::{Error, ErrorKind};
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
+
+pub(crate) async fn require_send<F: Send + Future>(fut: F) -> F::Output {
+	fut.await
+}

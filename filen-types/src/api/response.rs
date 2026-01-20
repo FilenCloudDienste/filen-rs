@@ -59,3 +59,31 @@ impl<T> FilenResponse<'_, T> {
 		}
 	}
 }
+
+pub trait ResponseIntoData<T> {
+	fn into_data(self) -> Result<T, ResponseError>;
+}
+
+impl<T> ResponseIntoData<T> for FilenResponse<'_, T> {
+	default fn into_data(self) -> Result<T, ResponseError> {
+		match (self.status, self.data) {
+			(Some(true), Some(data)) => Ok(data),
+			_ => Err(ResponseError::ApiError {
+				message: self.message.map(|s| s.into_owned()),
+				code: self.code.map(|s| s.into_owned()),
+			}),
+		}
+	}
+}
+
+impl ResponseIntoData<()> for FilenResponse<'_, ()> {
+	fn into_data(self) -> Result<(), ResponseError> {
+		match self.status {
+			Some(true) => Ok(()),
+			_ => Err(ResponseError::ApiError {
+				message: self.message.map(|s| s.into_owned()),
+				code: self.code.map(|s| s.into_owned()),
+			}),
+		}
+	}
+}
