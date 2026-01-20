@@ -1,5 +1,3 @@
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use std::time::Instant;
 use std::{num::NonZeroU32, sync::Arc, task::Poll};
 
 use futures::task::AtomicWaker;
@@ -8,8 +6,6 @@ use governor::{
 	state::{InMemoryState, NotKeyed},
 };
 use tower::{Layer, Service};
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use wasmtimer::std::Instant;
 
 use crate::runtime::{self, SpawnTaskHandle};
 
@@ -147,9 +143,7 @@ where
 					let waker_clone = waker.clone();
 					self.state = RateLimiterServiceState::AwaitingPermit {
 						handle: runtime::spawn_task_maybe_send(async move {
-							let now = Instant::now();
 							limiter.until_ready().await;
-							log::info!("Rate limiter waited {:?} for permit", now.elapsed());
 							waker_clone.wake();
 						}),
 						waker: waker.clone(),
