@@ -19,7 +19,7 @@ export default defineConfig({
 		VitePWA({
 			srcDir: "./",
 			filename: "sw.ts",
-			outDir: "./",
+			outDir: "./test-assets/",
 			strategies: "injectManifest",
 			workbox: {
 				maximumFileSizeToCacheInBytes: Number.MAX_SAFE_INTEGER

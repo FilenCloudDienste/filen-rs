@@ -15,5 +15,5 @@
 /SdkRs.podspec
 /service-worker
 /dist
-/sw.js
+/test-assets/sw.js
 /assets
