@@ -124,93 +124,24 @@ pub(crate) enum Commands {
 		/// Where to mount the network drive (default: system default)
 		mount_point: Option<String>,
 	},
-	/// Runs a WebDAV server exposing your Filen drive
-	Webdav {
-		/// URL for the server (default: 127.0.0.1:8080)
-		#[arg(long)]
-		url: Option<String>,
+	/// Runs a WebDAV, FTP, SFTP or HTTP server exposing your Filen drive
+	Serve {
+		/// The type of server to run: webdav, ftp, sftp, http
+		server: String,
+		/// IP and port for the server (`<ip>:<port>` or `:<port>`)
+		#[arg(long = "addr", default_value = ":8080")]
+		address: String,
 		/// Directory that the server exposes (default: the entire Filen drive)
 		#[arg(long)]
 		root: Option<String>,
-		/// Username for authentication to the server (default: no authentication)
+		/// Username for authentication to the server (default: no authentication).
+		/// On S3 servers, this is the Access Key ID.
 		#[arg(long)]
 		user: Option<String>,
-		/// Password for authentication to the server (default: no authentication)
+		/// Password for authentication to the server (default: no authentication).
+		/// On S3 servers, this is the Secret Access Key.
 		#[arg(long)]
 		password: Option<String>,
-		/// The server is read-only
-		#[arg(long)]
-		read_only: bool,
-	},
-	/// Runs an FTP server exposing your Filen drive
-	Ftp {
-		/// URL for the server (default: 127.0.0.1:8080)
-		#[arg(long)]
-		url: Option<String>,
-		/// Directory that the server exposes (default: the entire Filen drive)
-		#[arg(long)]
-		root: Option<String>,
-		/// Username for authentication to the server (default: no authentication)
-		#[arg(long)]
-		user: Option<String>,
-		/// Password for authentication to the server (default: no authentication)
-		#[arg(long)]
-		password: Option<String>,
-		/// The server is read-only
-		#[arg(long)]
-		read_only: bool,
-	},
-	/// Runs an SFTP server exposing your Filen drive
-	Sftp {
-		/// URL for the server (default: 127.0.0.1:8080)
-		#[arg(long)]
-		url: Option<String>,
-		/// Directory that the server exposes (default: the entire Filen drive)
-		#[arg(long)]
-		root: Option<String>,
-		/// Username for authentication to the server
-		#[arg(long)]
-		user: String,
-		/// Password for authentication to the server
-		#[arg(long)]
-		password: String,
-		/// The server is read-only
-		#[arg(long)]
-		read_only: bool,
-	},
-	/// Runs an HTTP server exposing your Filen drive
-	HttpServer {
-		/// URL for the server (default: 127.0.0.1:8080)
-		#[arg(long)]
-		url: Option<String>,
-		/// Directory that the server exposes (default: the entire Filen drive)
-		#[arg(long)]
-		root: Option<String>,
-		/// Username for authentication to the server (default: no authentication)
-		#[arg(long)]
-		user: Option<String>,
-		/// Password for authentication to the server (default: no authentication)
-		#[arg(long)]
-		password: Option<String>,
-		/// The server is read-only
-		#[arg(long)]
-		read_only: bool,
-	},
-	// todo: make clearer what is meant by "url"
-	/// Runs an S3 server exposing your Filen drive
-	S3 {
-		/// URL for the server (default: 127.0.0.1:8080)
-		#[arg(long)]
-		url: Option<String>,
-		/// Directory that the server exposes (default: the entire Filen drive)
-		#[arg(long)]
-		root: Option<String>,
-		/// Access key ID for authentication to the server
-		#[arg(long, default_value = "user")]
-		access_key_id: String,
-		/// Secret access key for authentication to the server
-		#[arg(long, default_value = "password")]
-		secret_access_key: String,
 		/// The server is read-only
 		#[arg(long)]
 		read_only: bool,
@@ -347,120 +278,38 @@ pub(crate) async fn execute_command(
 			rclone::mount(config, ui, client, mount_point).await?;
 			None
 		}
-		Commands::Webdav {
-			url,
+		Commands::Serve {
+			server,
+			address,
 			root,
 			user,
 			password,
 			read_only,
 		} => {
+			let display_server_type = match server.as_str() {
+				"webdav" => "WebDAV",
+				"ftp" => "FTP",
+				"sftp" => "SFTP",
+				"http" => "HTTP",
+				"s3" => "S3",
+				_ => {
+					return Err(UI::failure(&format!(
+						"Unsupported server type: {}. Supported types are: webdav, ftp, sftp, http, s3",
+						server
+					)));
+				}
+			};
 			rclone::start_server(
 				config,
 				ui,
 				client,
-				"webdav",
-				"WebDAV",
+				&server,
+				display_server_type,
 				BasicServerOptions {
-					url,
+					address,
 					root,
 					user,
 					password,
-					read_only,
-				},
-			)
-			.await?;
-			None
-		}
-		Commands::Ftp {
-			url,
-			root,
-			user,
-			password,
-			read_only,
-		} => {
-			rclone::start_server(
-				config,
-				ui,
-				client,
-				"ftp",
-				"FTP",
-				BasicServerOptions {
-					url,
-					root,
-					user,
-					password,
-					read_only,
-				},
-			)
-			.await?;
-			None
-		}
-		Commands::Sftp {
-			url,
-			root,
-			user,
-			password,
-			read_only,
-		} => {
-			rclone::start_server(
-				config,
-				ui,
-				client,
-				"sftp",
-				"SFTP",
-				BasicServerOptions {
-					url,
-					root,
-					user: Some(user),
-					password: Some(password),
-					read_only,
-				},
-			)
-			.await?;
-			None
-		}
-		Commands::HttpServer {
-			url,
-			root,
-			user,
-			password,
-			read_only,
-		} => {
-			rclone::start_server(
-				config,
-				ui,
-				client,
-				"http",
-				"HTTP",
-				BasicServerOptions {
-					url,
-					root,
-					user,
-					password,
-					read_only,
-				},
-			)
-			.await?;
-			None
-		}
-		Commands::S3 {
-			url,
-			root,
-			access_key_id,
-			secret_access_key,
-			read_only,
-		} => {
-			rclone::start_server(
-				config,
-				ui,
-				client,
-				"s3",
-				"S3",
-				BasicServerOptions {
-					url,
-					root,
-					user: Some(access_key_id),
-					password: Some(secret_access_key),
 					read_only,
 				},
 			)
@@ -1087,7 +936,7 @@ mod rclone {
 		ui.print_success(&format!(
 			"Started {} server on http://{} {} (kill the CLI to stop)",
 			display_server_type,
-			server.url,
+			server.address,
 			if let Some(auth) = &server.auth {
 				format!(
 					"with {} \"{}\" and {} \"{}\"",

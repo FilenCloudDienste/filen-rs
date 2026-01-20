@@ -11,7 +11,7 @@ pub struct BasicAuthentication {
 }
 
 pub struct BasicServerOptions {
-	pub url: Option<String>,
+	pub address: String,
 	pub root: Option<String>,
 	pub user: Option<String>,
 	pub password: Option<String>,
@@ -19,7 +19,7 @@ pub struct BasicServerOptions {
 }
 
 pub struct BasicServerDetails {
-	pub url: String,
+	pub address: String,
 	pub auth: Option<BasicAuthentication>,
 	/// Will be killed on drop.
 	pub process: Child,
@@ -36,14 +36,18 @@ pub async fn start_basic_server(
 	if !["webdav", "ftp", "sftp", "http", "s3"].contains(&server_type) {
 		return Err(anyhow!("Unsupported server type: {}", server_type));
 	}
-	let url = options.url.unwrap_or("127.0.0.1:8080".to_string());
+	let address = if options.address.starts_with(":") {
+		format!("127.0.0.1{}", options.address)
+	} else {
+		options.address.clone()
+	};
 	let remote_str = format!("filen:{}", options.root.unwrap_or("".to_string()));
 	let mut args = vec![
 		"serve",
 		server_type,
 		&remote_str,
 		"--addr",
-		&url,
+		&address,
 		if options.read_only { "--read-only" } else { "" },
 	];
 	let (user, password) = (
@@ -61,7 +65,7 @@ pub async fn start_basic_server(
 		.execute_in_background(&args)
 		.await?;
 	Ok(BasicServerDetails {
-		url,
+		address,
 		auth: if server_type == "s3" || (options.user.is_some() || options.password.is_some()) {
 			Some(BasicAuthentication {
 				user: user.clone(),
