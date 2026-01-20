@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `webdav`, `ftp`, `sftp`, `http-server` commands to serve the drive via managed Rclone
+- `webdav`, `ftp`, `sftp`, `http-server`, `s3` shorthand commands to serve the drive via managed Rclone
 
 ## 0.2.3 - 2026-01-12
 

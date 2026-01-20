@@ -103,6 +103,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::CommandHelp("ftp"),
 				DocElement::CommandHelp("sftp"),
 				DocElement::CommandHelp("http-server"),
+				DocElement::CommandHelp("s3"),
 				DocElement::CommandHelp("export-api-key"),
 			],
 		},
