@@ -26,11 +26,16 @@ pub struct RcloneInstallation {
 }
 
 impl RcloneInstallation {
+	/// Checks if Rclone is already downloaded. If not, it will be downloaded on initialization.
+	pub async fn check_already_downloaded(config_dir: &Path) -> bool {
+		ensure_rclone_binary(config_dir, true).await.is_ok()
+	}
+
 	pub async fn initialize(client: &Client, config_dir: &Path) -> Result<Self> {
 		fs::create_dir_all(&config_dir)
 			.await
 			.context("Failed to create Rclone installation directory")?;
-		let rclone_binary_path = ensure_rclone_binary(config_dir).await?;
+		let rclone_binary_path = ensure_rclone_binary(config_dir, false).await?;
 		let rclone_config_path =
 			write_rclone_config(&rclone_binary_path, client, config_dir).await?;
 		Ok(Self {
@@ -100,8 +105,9 @@ impl RcloneInstallation {
 	}
 }
 
-/// Returns the path to the rclone binary, downloading it if necessary
-async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
+/// Returns the path to the rclone binary, downloading it if necessary.
+/// When `disallow_downloading` is true, returns an error "Rclone not found" instead of downloading it.
+async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> Result<PathBuf> {
 	// determine download url
 	let platform_str = match std::env::consts::OS {
 		"windows" => Some("windows"),
@@ -139,6 +145,10 @@ async fn ensure_rclone_binary(config_dir: &Path) -> Result<PathBuf> {
 	if rclone_binary_path.exists() {
 		info!("Rclone binary already exists, skipping download");
 	} else {
+		if disallow_downloading {
+			return Err(anyhow::anyhow!("Rclone not found"));
+		}
+
 		info!(
 			"Downloading Rclone binary from {}...",
 			rclone_binary_download_url

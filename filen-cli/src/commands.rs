@@ -1036,9 +1036,11 @@ mod rclone {
 		mount_point: Option<String>,
 	) -> Result<()> {
 		let client = client.get(ui).await?;
+		let config_dir = config.config_dir.join("rclone");
+		check_already_downloaded(ui, &config_dir).await;
 		let mut network_drive = filen_rclone_wrapper::network_drive::NetworkDrive::mount(
 			client,
-			&config.config_dir,
+			&config_dir,
 			mount_point.as_deref(),
 			false,
 		)
@@ -1072,9 +1074,11 @@ mod rclone {
 		options: BasicServerOptions,
 	) -> Result<()> {
 		let client = client.get(ui).await?;
+		let config_dir = config.config_dir.join("rclone");
+		check_already_downloaded(ui, &config_dir).await;
 		let mut server = filen_rclone_wrapper::serve::start_basic_server(
 			client,
-			&config.config_dir,
+			&config_dir,
 			server_type,
 			options,
 		)
@@ -1128,9 +1132,11 @@ mod rclone {
 		client: &mut LazyClient,
 		cmd: Vec<String>,
 	) -> Result<()> {
+		let config_dir = config.config_dir.join("rclone");
+		check_already_downloaded(ui, &config_dir).await;
 		let rclone = filen_rclone_wrapper::rclone_installation::RcloneInstallation::initialize(
 			client.get(ui).await?,
-			&config.config_dir.join("rclone"),
+			&config_dir,
 		)
 		.await
 		.context("Failed to initialize rclone installation")?;
@@ -1144,5 +1150,15 @@ mod rclone {
 			return Err(crate::construct_exit_code_error(exit_code));
 		}
 		Ok(())
+	}
+
+	async fn check_already_downloaded(ui: &mut UI, config_dir: &std::path::Path) {
+		if !filen_rclone_wrapper::rclone_installation::RcloneInstallation::check_already_downloaded(
+			config_dir,
+		)
+		.await
+		{
+			ui.print_muted("Downloading filen-rclone...");
+		}
 	}
 }
