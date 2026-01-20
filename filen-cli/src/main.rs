@@ -75,6 +75,11 @@ pub(crate) struct CliArgs {
 	#[arg(long)]
 	force_update_check: bool,
 
+	/// Force checking for updates and install them automatically.
+	/// Usually, updates are only installed in REPL mode
+	#[arg(long)]
+	always_update: bool,
+
 	/// Format command output as machine-readable JSON (where applicable)
 	#[arg(long)]
 	json: bool,
@@ -198,7 +203,8 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 	if !cli_args.skip_update {
 		check_for_updates(
 			ui,
-			cli_args.force_update_check,
+			cli_args.force_update_check || cli_args.always_update,
+			cli_args.always_update,
 			&config.config_dir,
 			cli_args.command.is_none(),
 		)

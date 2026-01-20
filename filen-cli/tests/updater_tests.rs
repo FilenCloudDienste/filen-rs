@@ -13,12 +13,18 @@ fn test_updater() {
 		std::env::set_var("FILEN_CLI_TESTING_MOCK_VERSION", "0.0.0-test");
 	}
 	let assert = assert_cmd::Command::new(dir.path().join(binary.file_name().unwrap()))
-		.args(["-vv", "--config-dir", dir.path().to_str().unwrap(), "exit"])
+		.args([
+			"-vv",
+			"--config-dir",
+			dir.path().to_str().unwrap(),
+			"--always-update",
+			"exit",
+		])
 		.assert()
 		.success()
 		.stdout(predicates::str::contains("Update installed successfully"));
 	let output = assert.get_output();
-	let new_version = Regex::new(r#"Updating from v.* to v(.*)\.\.\."#)
+	let new_version = Regex::new(r#"Automatically updating from v.* to v(.*)\.\.\."#)
 		.unwrap()
 		.captures(std::str::from_utf8(&output.stdout).unwrap())
 		.unwrap()
@@ -26,11 +32,20 @@ fn test_updater() {
 		.unwrap()
 		.as_str();
 	println!("New version installed: {}", new_version);
-
-	// run again, should be up to date and not check again
 	unsafe {
 		std::env::set_var("FILEN_CLI_TESTING_MOCK_VERSION", "off");
 	}
+
+	// run again, so the last checked time is updated
+	assert_cmd::Command::new(dir.path().join(binary.file_name().unwrap()))
+		.args(["-vv", "--config-dir", dir.path().to_str().unwrap(), "exit"])
+		.assert()
+		.success()
+		.stdout(predicates::str::contains(
+			"Wrote last update check timestamp",
+		));
+
+	// run again, should be up to date and not check again
 	assert_cmd::Command::new(dir.path().join(binary.file_name().unwrap()))
 		.args(["-vv", "--config-dir", dir.path().to_str().unwrap(), "exit"])
 		.assert()

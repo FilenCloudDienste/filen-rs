@@ -28,6 +28,7 @@ const LAST_CHECK_VALIDITY: std::time::Duration = std::time::Duration::from_mins(
 pub(crate) async fn check_for_updates(
 	ui: &mut UI,
 	force_update_check: bool,
+	automatically_update: bool,
 	config_path: &std::path::Path,
 	is_repl: bool,
 ) -> Result<()> {
@@ -100,13 +101,18 @@ pub(crate) async fn check_for_updates(
 	let latest_tag = latest_release.tag_name.trim_start_matches('v');
 	if latest_tag == version {
 		log::info!("Up to date: {}", version);
-	} else if !is_repl {
+	} else if !is_repl && !automatically_update {
 		ui.print_announcement(&format!(
 			"Please update from v{} to v{} by invoking the CLI with no command specified (REPL).",
 			version, latest_tag
 		));
 	} else {
-		if !ui
+		if automatically_update {
+			ui.print_muted(&format!(
+				"Automatically updating from v{} to v{}...",
+				version, latest_tag
+			));
+		} else if !ui
 			.prompt_confirm(
 				&format!("Update now from v{} to v{}", version, latest_tag),
 				true,
