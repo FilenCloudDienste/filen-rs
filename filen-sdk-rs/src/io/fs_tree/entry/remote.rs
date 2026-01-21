@@ -1,10 +1,10 @@
-use chrono::{DateTime, Utc};
-use filen_types::crypto::Blake3Hash;
+use std::cmp::Ordering;
+
 use uuid::Uuid;
 
 use crate::{
 	fs::{
-		HasName, HasUUID,
+		HasName, HasRemoteInfo, HasUUID,
 		dir::{RemoteDirectory, meta::DirectoryMeta, traits::HasDirMeta},
 		enums::NonRootFSObject,
 		file::{
@@ -13,7 +13,7 @@ use crate::{
 			traits::{HasFileInfo, HasFileMeta},
 		},
 	},
-	io::WalkError,
+	io::fs_tree::WalkError,
 };
 
 pub(crate) struct RemoteFSObjectEntry<'a> {
@@ -21,15 +21,28 @@ pub(crate) struct RemoteFSObjectEntry<'a> {
 	depth: usize,
 }
 
+impl<'a> RemoteFSObjectEntry<'a> {
+	pub(crate) fn new(obj: NonRootFSObject<'a>, depth: usize) -> Self {
+		Self { obj, depth }
+	}
+
+	pub(crate) fn depth(&self) -> usize {
+		self.depth
+	}
+
+	pub(crate) fn obj(&self) -> &NonRootFSObject<'a> {
+		&self.obj
+	}
+
+	pub(crate) fn into_obj(self) -> NonRootFSObject<'a> {
+		self.obj
+	}
+}
+
 impl super::DFSWalkerEntry for RemoteFSObjectEntry<'_> {
-	type WalkerFileEntry<'a>
-		= &'a RemoteFile
-	where
-		Self: 'a;
-	type WalkerDirEntry<'a>
-		= &'a RemoteDirectory
-	where
-		Self: 'a;
+	type WalkerFileEntry = RemoteFile;
+	type WalkerDirEntry = RemoteDirectory;
+	type CompareStrategy = RemoteCompareStrategy;
 
 	fn depth(&self) -> usize {
 		self.depth
@@ -39,60 +52,106 @@ impl super::DFSWalkerEntry for RemoteFSObjectEntry<'_> {
 		HasName::name(&self.obj).ok_or_else(|| WalkError::EncryptedMeta(self.obj.uuid().into()))
 	}
 
-	fn entry_type(&self) -> super::EntryType<&RemoteDirectory, &RemoteFile> {
-		match &self.obj {
-			NonRootFSObject::Dir(dir) => super::EntryType::Dir(dir),
-			NonRootFSObject::File(file) => super::EntryType::File(file),
+	fn into_entry_type(self) -> super::EntryType<RemoteDirectory, RemoteFile> {
+		match self.obj {
+			NonRootFSObject::Dir(dir) => super::EntryType::Dir(dir.into_owned()),
+			NonRootFSObject::File(file) => super::EntryType::File(file.into_owned()),
 		}
 	}
 }
 
-#[derive(Copy, Clone)]
-pub(crate) struct ExtraRemoteFileData {
-	uuid: Uuid,
-	size: u64,
-	modified: DateTime<Utc>,
-	created: Option<DateTime<Utc>>,
-	hash: Option<Blake3Hash>,
-}
+impl super::DFSWalkerFileEntry for RemoteFile {
+	type Extra = RemoteFile;
 
-impl super::DFSWalkerFileEntry for &RemoteFile {
-	type Extra = ExtraRemoteFileData;
-
-	fn into_extra_data(self) -> Result<Self::Extra, WalkError> {
-		match self.get_meta() {
-			FileMeta::Decoded(decrypted_file_meta) => Ok(ExtraRemoteFileData {
-				uuid: self.uuid().into(),
-				size: self.size(),
-				modified: decrypted_file_meta.last_modified(),
-				created: decrypted_file_meta.created(),
-				hash: decrypted_file_meta.hash(),
-			}),
-			_ => Err(WalkError::EncryptedMeta(self.uuid().into())),
-		}
+	fn into_extra_data(self) -> Self::Extra {
+		self
 	}
 
 	fn size(&self) -> Result<u64, WalkError> {
-		Ok(HasFileInfo::size(*self))
+		Ok(HasFileInfo::size(self))
 	}
 }
 
-#[derive(Copy, Clone)]
-pub(crate) struct ExtraRemoteDirData {
-	uuid: Uuid,
-	created: Option<DateTime<Utc>>,
+impl super::DFSWalkerDirEntry for RemoteDirectory {
+	type Extra = RemoteDirectory;
+
+	fn into_extra_data(self) -> Self::Extra {
+		self
+	}
 }
 
-impl super::DFSWalkerDirEntry for &RemoteDirectory {
-	type Extra = ExtraRemoteDirData;
+pub(crate) struct RemoteCompareStrategy;
+impl super::CompareStrategy<RemoteDirectory, RemoteFile> for RemoteCompareStrategy {
+	fn should_replace(
+		existing: &super::Entry<RemoteDirectory, RemoteFile>,
+		new: &super::Entry<RemoteDirectory, RemoteFile>,
+	) -> bool {
+		let replace = {
+			match (existing, new) {
+				// prefer dirs over files
+				(super::Entry::Dir(_), super::Entry::File(_)) => false,
+				(super::Entry::File(_), super::Entry::Dir(_)) => true,
+				(super::Entry::File(existing), super::Entry::File(new)) => {
+					let existing = existing.extra_data();
+					let new = new.extra_data();
+					match (existing.get_meta(), new.get_meta()) {
+						(FileMeta::Decoded(existing_meta), FileMeta::Decoded(new_meta)) => {
+							match existing_meta.last_modified.cmp(&new_meta.last_modified) {
+								Ordering::Less => return true,
+								Ordering::Greater => return false,
+								Ordering::Equal => {}
+							}
+							match existing_meta.created.cmp(&new_meta.created) {
+								Ordering::Less => return true,
+								Ordering::Greater => return false,
+								Ordering::Equal => {}
+							}
+						}
+						(_, FileMeta::Decoded(_)) => return true,
+						_ => {}
+					}
+					match existing.timestamp().cmp(&new.timestamp()) {
+						Ordering::Less => true,
+						Ordering::Greater => false,
+						Ordering::Equal => Uuid::from(existing.uuid()) < Uuid::from(new.uuid()),
+					}
+				}
+				(super::Entry::Dir(existing), super::Entry::Dir(new)) => {
+					let existing = existing.extra_data();
+					let new = new.extra_data();
+					match (existing.get_meta(), new.get_meta()) {
+						(
+							DirectoryMeta::Decoded(existing_meta),
+							DirectoryMeta::Decoded(new_meta),
+						) => {
+							if let (Some(existing_created), Some(new_created)) =
+								(existing_meta.created, new_meta.created)
+							{
+								match existing_created.cmp(&new_created) {
+									Ordering::Less => return true,
+									Ordering::Greater => return false,
+									Ordering::Equal => {}
+								}
+							}
+						}
+						(_, DirectoryMeta::Decoded(_)) => return true,
+						_ => {}
+					};
+					match existing.timestamp().cmp(&new.timestamp()) {
+						Ordering::Less => true,
+						Ordering::Greater => false,
+						Ordering::Equal => Uuid::from(existing.uuid()) < Uuid::from(new.uuid()),
+					}
+				}
+			}
+		};
 
-	fn into_extra_data(self) -> Result<Self::Extra, WalkError> {
-		match self.get_meta() {
-			DirectoryMeta::Decoded(decrypted_dir_meta) => Ok(ExtraRemoteDirData {
-				uuid: self.uuid().into(),
-				created: decrypted_dir_meta.created(),
-			}),
-			_ => Err(WalkError::EncryptedMeta(self.uuid().into())),
-		}
+		log::info!(
+			"Conflict detected between entries. Existing: {:?}, New: {:?}. Resolved by choosing new: {}",
+			existing,
+			new,
+			replace
+		);
+		replace
 	}
 }

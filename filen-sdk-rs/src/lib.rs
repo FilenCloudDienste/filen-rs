@@ -32,7 +32,3 @@ pub use error::{Error, ErrorKind};
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
-
-pub(crate) async fn require_send<F: Send + Future>(fut: F) -> F::Output {
-	fut.await
-}

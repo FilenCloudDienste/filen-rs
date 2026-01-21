@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 
-use filen_types::fs::{ObjectType, UuidStr};
+use filen_types::{
+	fs::{ObjectType, UuidStr},
+	traits::CowHelpers,
+};
 
 use crate::{
 	connect::fs::SharedDirectory,
@@ -104,7 +107,7 @@ impl<'a> From<&'a DirectoryTypeWithShareInfo<'_>> for DirectoryTypeWithShareInfo
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, CowHelpers)]
 pub enum UnsharedDirectoryType<'a> {
 	Root(Cow<'a, RootDirectory>),
 	Dir(Cow<'a, RemoteDirectory>),
@@ -157,9 +160,21 @@ impl From<RemoteDirectory> for UnsharedDirectoryType<'static> {
 	}
 }
 
+impl<'a> From<&'a RemoteDirectory> for UnsharedDirectoryType<'a> {
+	fn from(dir: &'a RemoteDirectory) -> Self {
+		UnsharedDirectoryType::Dir(Cow::Borrowed(dir))
+	}
+}
+
 impl From<RootDirectory> for UnsharedDirectoryType<'static> {
 	fn from(dir: RootDirectory) -> Self {
 		UnsharedDirectoryType::Root(Cow::Owned(dir))
+	}
+}
+
+impl<'a> From<&'a RootDirectory> for UnsharedDirectoryType<'a> {
+	fn from(dir: &'a RootDirectory) -> Self {
+		UnsharedDirectoryType::Root(Cow::Borrowed(dir))
 	}
 }
 

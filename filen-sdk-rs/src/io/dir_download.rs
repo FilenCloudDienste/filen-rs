@@ -1,0 +1,326 @@
+use std::{
+	borrow::Cow,
+	io::Read,
+	path::PathBuf,
+	sync::{Arc, atomic::AtomicU64},
+};
+
+use md5::Digest;
+use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+use crate::{
+	Error,
+	auth::Client,
+	consts::CALLBACK_INTERVAL,
+	error::{ErrorExt, ResultExt},
+	fs::{
+		NonRootFSObject,
+		dir::{RemoteDirectory, UnsharedDirectoryType},
+		file::{RemoteFile, traits::HasRemoteFileInfo},
+	},
+	io::{FilenMetaExt, HasFileInfo},
+};
+
+use super::fs_tree::Entry;
+
+type EntryResult = (Result<(), Error>, PathBuf, NonRootFSObject<'static>);
+
+impl Client {
+	pub(crate) async fn download_fs_tree_from_target_into_path(
+		self: Arc<Self>,
+		error_callback: &mut impl FnMut(Vec<(Error, PathBuf, NonRootFSObject<'static>)>),
+		progress_callback: &mut impl FnMut(
+			Vec<(RemoteDirectory, PathBuf)>,
+			Vec<(RemoteFile, PathBuf)>,
+			u64,
+		),
+		path: PathBuf,
+		tree: super::fs_tree::FSTree<RemoteDirectory, RemoteFile>,
+		target_folder: UnsharedDirectoryType<'static>,
+	) -> Result<(), Error> {
+		let (entry_complete_sender, mut entry_complete_receiver) =
+			tokio::sync::mpsc::channel::<EntryResult>(16);
+
+		let mut update_interval = tokio::time::interval(CALLBACK_INTERVAL);
+
+		let (file_download_request_sender, file_download_request_receiver) =
+			tokio::sync::mpsc::channel::<(RemoteFile, PathBuf)>(self.max_parallel_requests);
+
+		let downloaded_bytes = Arc::new(AtomicU64::new(0));
+
+		let dir_handle = Arc::clone(&self).spawn_folder_maker_task(
+			tree,
+			entry_complete_sender.clone(),
+			file_download_request_sender,
+			target_folder,
+			path,
+		);
+
+		let file_handle = self.spawn_file_downloader_task(
+			file_download_request_receiver,
+			entry_complete_sender,
+			Arc::clone(&downloaded_bytes),
+		);
+
+		let mut completed_files = Vec::new();
+		let mut completed_dirs = Vec::new();
+		let mut errors = Vec::new();
+
+		loop {
+			tokio::select! {
+				_ = update_interval.tick() => {
+					let bytes = downloaded_bytes.swap(0, std::sync::atomic::Ordering::Relaxed);
+					if !errors.is_empty() {
+						error_callback(std::mem::take(&mut errors));
+					}
+					if completed_dirs.is_empty() && completed_files.is_empty() && bytes == 0 {
+						continue;
+					}
+					progress_callback(
+						std::mem::take(&mut completed_dirs),
+						std::mem::take(&mut completed_files),
+						bytes,
+					);
+				}
+				entry_result = entry_complete_receiver.recv() => {
+					let (res, path, obj) = match entry_result {
+						Some(er) => er,
+						None => break,
+					};
+					match res {
+						Ok(()) => {
+							match obj {
+								NonRootFSObject::Dir(dir) => {
+									completed_dirs.push((dir.into_owned(), path));
+								}
+								NonRootFSObject::File(file) => {
+									completed_files.push((file.into_owned(), path));
+								}
+							}
+						}
+						Err(e) => {
+							errors.push((e, path, obj));
+						}
+					}
+				}
+			}
+		}
+
+		// make sure everything is finalized
+		dir_handle.await.unwrap()?;
+		file_handle.await.unwrap();
+
+		if !errors.is_empty() {
+			error_callback(std::mem::take(&mut errors));
+		}
+		let bytes = downloaded_bytes.swap(0, std::sync::atomic::Ordering::Relaxed);
+		if !completed_dirs.is_empty() || !completed_files.is_empty() || bytes != 0 {
+			progress_callback(
+				std::mem::take(&mut completed_dirs),
+				std::mem::take(&mut completed_files),
+				bytes,
+			);
+		}
+
+		Ok(())
+	}
+
+	fn spawn_folder_maker_task(
+		self: Arc<Self>,
+		tree: super::fs_tree::FSTree<RemoteDirectory, RemoteFile>,
+		entry_complete_sender: tokio::sync::mpsc::Sender<EntryResult>,
+		file_download_request_sender: tokio::sync::mpsc::Sender<(RemoteFile, PathBuf)>,
+		target_folder: UnsharedDirectoryType<'static>,
+		root_path: PathBuf,
+	) -> tokio::task::JoinHandle<Result<(), Error>> {
+		tokio::task::spawn_blocking(move || {
+			match (std::fs::create_dir_all(&root_path), &target_folder) {
+				(Ok(()), UnsharedDirectoryType::Dir(target_folder)) => target_folder
+					.set_dir_times(&root_path)
+					.context("couldn't set directory times for newly created root directory")?,
+				(Err(e), _) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+					if let UnsharedDirectoryType::Dir(target_folder) = target_folder {
+						target_folder
+							.set_dir_times(&root_path)
+							.context("couldn't set directory times for root directory")?
+					}
+				}
+				(Err(e), _) => {
+					return Err(e.with_context("couldn't create root directory for dir download"));
+				}
+				_ => {}
+			};
+
+			for (entry, path) in tree.dfs_iter_with_path(&root_path) {
+				match entry {
+					Entry::Dir(dir_entry) => {
+						let dir = dir_entry.extra_data().clone();
+						if let Err(e) = std::fs::create_dir(&path)
+							&& e.kind() != std::io::ErrorKind::AlreadyExists
+						{
+							entry_complete_sender
+								.blocking_send((
+									Err(e.with_context(
+										"couldn't create directory during dir download",
+									)),
+									path,
+									NonRootFSObject::Dir(Cow::Owned(dir)),
+								))
+								.unwrap();
+							continue;
+						}
+						if let Err(e) = dir.set_dir_times(&path) {
+							log::error!(
+								"Failed to set dir times for downloaded dir {:?}: {}",
+								path,
+								e
+							);
+							entry_complete_sender
+								.blocking_send((
+									Err(e.with_context(
+										"couldn't set directory times during dir download",
+									)),
+									path,
+									NonRootFSObject::Dir(Cow::Owned(dir)),
+								))
+								.unwrap();
+							continue;
+						}
+						entry_complete_sender
+							.blocking_send((Ok(()), path, NonRootFSObject::Dir(Cow::Owned(dir))))
+							.unwrap();
+					}
+					Entry::File(file_entry) => {
+						let file = file_entry.extra_data().clone();
+						file_download_request_sender
+							.blocking_send((file, path))
+							.unwrap();
+					}
+				}
+			}
+			Ok(())
+		})
+	}
+
+	fn spawn_file_downloader_task(
+		self: Arc<Self>,
+		mut file_download_request_receiver: tokio::sync::mpsc::Receiver<(RemoteFile, PathBuf)>,
+		entry_complete_sender: tokio::sync::mpsc::Sender<(
+			Result<(), Error>,
+			PathBuf,
+			NonRootFSObject<'static>,
+		)>,
+		downloaded_bytes: Arc<AtomicU64>,
+	) -> tokio::task::JoinHandle<()> {
+		tokio::task::spawn(async move {
+			let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_parallel_requests));
+
+			let mut join_set = tokio::task::JoinSet::new();
+			while let Some((remote_file, path)) = file_download_request_receiver.recv().await {
+				let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+				let client = Arc::clone(&self);
+				let entry_complete_sender = entry_complete_sender.clone();
+				let downloaded_bytes = Arc::clone(&downloaded_bytes);
+				join_set.spawn(async move {
+					let (res, path, file) = client
+						.inner_download_file_to_path(remote_file, path, &downloaded_bytes)
+						.await;
+
+					let _ = entry_complete_sender
+						.send((res, path, NonRootFSObject::File(Cow::Owned(file))))
+						.await;
+					drop(permit);
+				});
+			}
+			join_set.join_all().await;
+		})
+	}
+
+	async fn inner_download_file_to_path(
+		&self,
+		remote_file: RemoteFile,
+		path: PathBuf,
+		downloaded_bytes: &AtomicU64,
+	) -> (Result<(), Error>, PathBuf, RemoteFile) {
+		let (local_file, path, remote_file) = match tokio::task::spawn_blocking(|| {
+			if let Ok(meta) = std::fs::metadata(&path)
+				&& FilenMetaExt::size(&meta) == remote_file.size()
+				&& let Ok(mut file) = std::fs::File::open(&path)
+				&& let Some(hash) = remote_file.hash()
+			{
+				let mut hasher = sha2::Sha512::new();
+
+				let mut buffer = [0u8; 65536];
+				loop {
+					let bytes_read = match file.read(&mut buffer) {
+						Ok(n) => n,
+						Err(e) => return (Err(e.into()), path, remote_file),
+					};
+					if bytes_read == 0 {
+						break;
+					}
+					hasher.update(&buffer[..bytes_read]);
+				}
+				if hasher.finalize().as_slice() == hash.as_ref() {
+					return (Ok(None), path, remote_file);
+				}
+			}
+			let local_file = match std::fs::File::create(&path) {
+				Ok(f) => f,
+				Err(e) => return (Err(e.into()), path, remote_file),
+			};
+			(Ok(Some(local_file)), path, remote_file)
+		})
+		.await
+		.unwrap()
+		{
+			(Ok(Some(local_file)), path, remote_file) => (local_file, path, remote_file),
+			(res, path, remote_file) => {
+				return (res.map(|_| ()), path, remote_file);
+			}
+		};
+
+		let local_file = tokio::fs::File::from_std(local_file);
+
+		match self
+			.download_file_to_writer(
+				&remote_file,
+				&mut local_file.compat_write(),
+				Some(Arc::new(|bytes| {
+					downloaded_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+				})),
+			)
+			.await
+		{
+			Ok(_) => (Ok(()), path, remote_file),
+			Err(e) => (Err(e), path, remote_file),
+		}
+	}
+}
+
+/// Callback trait for folder download operations
+///
+/// Folder downloads are implemented using a single sweep
+/// While scanning the folder contents, files are downloaded in parallel
+/// Progress is reported during the download process.
+pub trait DirDownloadCallback: Send + Sync {
+	/// Called periodically while /dir/download is listing the directory contents
+	fn on_query_download_progress(&self, known_bytes: u64, total_bytes: Option<u64>);
+	/// Called during tree building
+	fn on_scan_progress(&self, known_dirs: u64, known_files: u64, known_bytes: u64);
+	/// Called when errors occur during tree building
+	fn on_scan_errors(&self, errors: Vec<Error>);
+	/// Called when tree building is complete
+	fn on_scan_complete(&self, total_dirs: u64, total_files: u64, total_bytes: u64);
+	/// Called periodically during the download process
+	fn on_download_update(
+		&self,
+		downloaded_dirs: Vec<(RemoteDirectory, PathBuf)>,
+		downloaded_files: Vec<(RemoteFile, PathBuf)>,
+		downloaded_bytes: u64,
+	);
+	/// Called when errors occur during the download process
+	fn on_download_errors(&self, errors: Vec<(Error, PathBuf, NonRootFSObject<'static>)>);
+}
+
+struct FileDownloadResult(Result<RemoteFile, (Error, PathBuf)>);

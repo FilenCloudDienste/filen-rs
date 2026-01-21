@@ -1,15 +1,15 @@
 use walkdir::DirEntry;
 
-use crate::io::WalkError;
+use crate::io::fs_tree::WalkError;
 
-pub(crate) struct LocalDirEntry<'a>(&'a DirEntry);
+pub(crate) struct LocalDirEntry(DirEntry);
 
-pub(crate) struct LocalFileEntry<'a>(&'a DirEntry);
+pub(crate) struct LocalFileEntry(DirEntry);
 
 impl super::DFSWalkerEntry for DirEntry {
-	type WalkerFileEntry<'a> = LocalFileEntry<'a>;
-	type WalkerDirEntry<'a> = LocalDirEntry<'a>;
-
+	type WalkerFileEntry = LocalFileEntry;
+	type WalkerDirEntry = LocalDirEntry;
+	type CompareStrategy = LocalCompareStrategy;
 	fn depth(&self) -> usize {
 		self.depth()
 	}
@@ -20,7 +20,7 @@ impl super::DFSWalkerEntry for DirEntry {
 			.ok_or_else(|| WalkError::InvalidName(self.path().to_path_buf()))
 	}
 
-	fn entry_type<'a>(&'a self) -> super::EntryType<LocalDirEntry<'a>, LocalFileEntry<'a>> {
+	fn into_entry_type(self) -> super::EntryType<LocalDirEntry, LocalFileEntry> {
 		if self.file_type().is_dir() {
 			super::EntryType::Dir(LocalDirEntry(self))
 		} else if self.file_type().is_file() {
@@ -34,11 +34,11 @@ impl super::DFSWalkerEntry for DirEntry {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ExtraLocalFileData;
 
-impl super::DFSWalkerFileEntry for LocalFileEntry<'_> {
+impl super::DFSWalkerFileEntry for LocalFileEntry {
 	type Extra = ExtraLocalFileData;
 
-	fn into_extra_data(self) -> Result<Self::Extra, WalkError> {
-		Ok(ExtraLocalFileData)
+	fn into_extra_data(self) -> Self::Extra {
+		ExtraLocalFileData
 	}
 
 	fn size(&self) -> Result<u64, WalkError> {
@@ -54,10 +54,23 @@ impl super::DFSWalkerFileEntry for LocalFileEntry<'_> {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ExtraLocalDirData;
 
-impl super::DFSWalkerDirEntry for LocalDirEntry<'_> {
+impl super::DFSWalkerDirEntry for LocalDirEntry {
 	type Extra = ExtraLocalDirData;
 
-	fn into_extra_data(self) -> Result<Self::Extra, WalkError> {
-		Ok(ExtraLocalDirData)
+	fn into_extra_data(self) -> Self::Extra {
+		ExtraLocalDirData
+	}
+}
+
+pub(crate) struct LocalCompareStrategy;
+impl super::CompareStrategy<ExtraLocalDirData, ExtraLocalFileData> for LocalCompareStrategy {
+	fn should_replace(
+		existing: &super::Entry<ExtraLocalDirData, ExtraLocalFileData>,
+		new: &super::Entry<ExtraLocalDirData, ExtraLocalFileData>,
+	) -> bool {
+		matches!(
+			(existing, new),
+			(super::Entry::Dir(_), super::Entry::File(_))
+		)
 	}
 }

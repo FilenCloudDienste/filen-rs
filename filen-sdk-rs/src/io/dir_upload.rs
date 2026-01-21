@@ -1,5 +1,6 @@
 use std::{
 	collections::VecDeque,
+	ops::Deref,
 	path::{Path, PathBuf},
 	sync::{
 		Arc,
@@ -17,7 +18,7 @@ use crate::{
 	error::ResultExt,
 	fs::{HasUUID, dir::RemoteDirectory, file::RemoteFile},
 	io::{
-		FilenMetaExt, WalkError,
+		FilenMetaExt,
 		fs_tree::{DirChildrenInfo, Entry},
 	},
 };
@@ -33,9 +34,9 @@ use crate::{
 /// from the folder between the two steps.
 pub trait DirUploadCallback: Send + Sync {
 	fn on_scan_progress(&self, known_dirs: u64, known_files: u64, known_bytes: u64);
-	fn on_scan_errors(&self, error: Vec<WalkError>);
+	fn on_scan_errors(&self, errors: Vec<Error>);
 	fn on_scan_complete(&self, total_dirs: u64, total_files: u64, total_bytes: u64);
-	fn on_upload_progress(
+	fn on_upload_update(
 		&self,
 		uploaded_dirs: Vec<RemoteDirectory>,
 		uploaded_files: Vec<RemoteFile>,
@@ -44,28 +45,23 @@ pub trait DirUploadCallback: Send + Sync {
 	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>);
 }
 
+// todo, accept &impl HasUuidContents instead of RemoteDirectory for target_folder
 impl Client {
 	// this could definitely be optimized further, but for now it works
-	pub(crate) async fn upload_fs_tree_from_path_into_target(
+	pub(crate) async fn upload_fs_tree_from_path_into_target<C>(
 		self: Arc<Self>,
-		callback: Arc<dyn DirUploadCallback>,
+		callback: impl Deref<Target = C>,
 		path: PathBuf,
 		tree: &super::fs_tree::FSTree<
 			super::fs_tree::ExtraLocalDirData,
 			super::fs_tree::ExtraLocalFileData,
 		>,
 		target_folder: &RemoteDirectory,
-	) -> Result<(), Error> {
+	) -> Result<(), Error>
+	where
+		C: DirUploadCallback + ?Sized,
+	{
 		let _lock = self.lock_drive().await?;
-		let fs_root = match tree.root() {
-			Entry::File(_) => {
-				return Err(Error::custom(
-					ErrorKind::IO,
-					"upload_folder_from_path_into_target: root path is a file",
-				));
-			}
-			Entry::Dir(dir_entry) => dir_entry,
-		};
 
 		let (file_upload_result_sender, mut file_upload_result_receiver) =
 			tokio::sync::mpsc::channel::<FileUploadResult>(16);
@@ -88,7 +84,7 @@ impl Client {
 		dir_upload_result_sender
 			.send(DirUploadResult(
 				// have to clone here
-				Ok((target_folder.clone(), fs_root.children_info())),
+				Ok((target_folder.clone(), tree.root_children())),
 				path,
 			))
 			.await
@@ -111,7 +107,7 @@ impl Client {
 						&mut uploaded_files,
 						&uploaded_bytes,
 						&mut upload_errors,
-						callback.as_ref(),
+						&callback,
 					);
 					drain_unsent_entries(&entry_to_upload_sender, &mut unsent_children, &mut in_flight)?;
 					if in_flight == 0 && unsent_children.is_empty() {
@@ -179,7 +175,7 @@ impl Client {
 			&mut uploaded_files,
 			&uploaded_bytes,
 			&mut upload_errors,
-			callback.as_ref(),
+			&callback,
 		);
 		Ok(())
 	}
@@ -354,16 +350,19 @@ fn drain_unsent_entries(
 	Ok(())
 }
 
-fn send_callbacks(
+fn send_callbacks<C>(
 	uploaded_dirs: &mut Vec<RemoteDirectory>,
 	uploaded_files: &mut Vec<RemoteFile>,
 	uploaded_bytes: &Arc<AtomicU64>,
 	upload_errors: &mut Vec<(PathBuf, Error)>,
-	callback: &dyn DirUploadCallback,
-) {
+	callback: &impl Deref<Target = C>,
+) where
+	C: DirUploadCallback + ?Sized,
+{
+	let callback = callback.deref();
 	let bytes = uploaded_bytes.swap(0, Ordering::Relaxed);
 	if !uploaded_dirs.is_empty() || !uploaded_files.is_empty() || bytes > 0 {
-		callback.on_upload_progress(
+		callback.on_upload_update(
 			std::mem::take(uploaded_dirs),
 			std::mem::take(uploaded_files),
 			bytes,

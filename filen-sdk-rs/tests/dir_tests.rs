@@ -3,13 +3,13 @@ use std::{
 	fs::File,
 	io::{BufReader, Read, Seek},
 	path::{Path, PathBuf},
-	sync::Arc,
 	time::{Duration, SystemTime},
 };
 
 use chrono::{SubsecRound, Utc};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
+	Error,
 	crypto::shared::generate_random_base64_values,
 	fs::{
 		FSObject, HasName, HasParent, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
@@ -25,7 +25,7 @@ use filen_sdk_rs::{
 			traits::{HasFileInfo, HasFileMeta},
 		},
 	},
-	io::{DirUploadCallback, FilenMetaExt, WalkError},
+	io::{DirUploadCallback, FilenMetaExt},
 };
 use filen_types::fs::ParentUuid;
 use futures::StreamExt;
@@ -70,11 +70,11 @@ struct DebugDirUploadCallback {}
 impl DirUploadCallback for DebugDirUploadCallback {
 	fn on_scan_progress(&self, _known_dirs: u64, _known_files: u64, _known_bytes: u64) {}
 
-	fn on_scan_errors(&self, _error: Vec<WalkError>) {}
+	fn on_scan_errors(&self, _error: Vec<Error>) {}
 
 	fn on_scan_complete(&self, _total_dirs: u64, _total_files: u64, _total_bytes: u64) {}
 
-	fn on_upload_progress(
+	fn on_upload_update(
 		&self,
 		_uploaded_dirs: Vec<filen_sdk_rs::fs::dir::RemoteDirectory>,
 		_uploaded_files: Vec<RemoteFile>,
@@ -273,7 +273,7 @@ async fn test_recursive_upload() {
 		.clone()
 		.upload_dir_recursively(
 			temp_dir.clone(),
-			Arc::new(DebugDirUploadCallback::default()),
+			&DebugDirUploadCallback::default(),
 			test_dir,
 		)
 		.await

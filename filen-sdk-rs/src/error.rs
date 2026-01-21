@@ -101,6 +101,8 @@ pub enum ErrorKind {
 	/// Not enough memory to complete the operation
 	/// might be returned by WASM targets when parsing a large response (eg dir/download)
 	InsufficientMemory,
+	/// Error occurred when walking through a directory structure:
+	Walk,
 }
 
 /// Custom error type for the SDK
