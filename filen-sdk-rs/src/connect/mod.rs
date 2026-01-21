@@ -432,7 +432,7 @@ impl Client {
 	pub async fn public_link_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
-		progress_callback: Arc<F>,
+		progress_callback: &F,
 	) -> Result<DirPublicLink, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
@@ -791,10 +791,10 @@ impl Client {
 		&self,
 		dir: &RemoteDirectory,
 		client: &Contact<'_>,
-		progress_callback: Arc<F>,
+		progress_callback: &F,
 	) -> Result<(), Error>
 	where
-		F: Fn(u64, Option<u64>) + 'static + Send + Sync,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
 

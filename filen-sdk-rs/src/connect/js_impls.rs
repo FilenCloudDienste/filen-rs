@@ -1,4 +1,6 @@
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
+#[cfg(feature = "uniffi")]
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::UuidStr;
@@ -242,28 +244,19 @@ pub struct SharedDirsAndFiles {
 // errors.
 // Probably due to compiler bugs with async.
 impl JsClient {
-	async fn inner_public_link_dir<F>(
-		&self,
-		dir: Dir,
-		callback: Arc<F>,
-	) -> Result<DirPublicLink, Error>
+	async fn inner_public_link_dir<F>(&self, dir: Dir, callback: F) -> Result<DirPublicLink, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			let dir = dir.into();
-			this.public_link_dir(&dir, callback).await
+			this.public_link_dir(&dir, &callback).await
 		})
 		.await
 	}
 
-	async fn inner_share_dir<F>(
-		&self,
-		dir: Dir,
-		contact: Contact,
-		callback: Arc<F>,
-	) -> Result<(), Error>
+	async fn inner_share_dir<F>(&self, dir: Dir, contact: Contact, callback: F) -> Result<(), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
@@ -271,7 +264,7 @@ impl JsClient {
 		do_on_commander(move || {
 			let contact = contact.into();
 			let dir = dir.into();
-			async move { this.share_dir(&dir, &contact, callback).await }
+			async move { this.share_dir(&dir, &contact, &callback).await }
 		})
 		.await
 	}
@@ -285,15 +278,12 @@ impl JsClient {
 		dir: Dir,
 		callback: Arc<dyn DirContentDownloadProgressCallback>,
 	) -> Result<DirPublicLink, Error> {
-		self.inner_public_link_dir(
-			dir,
-			Arc::new(move |downloaded, total| {
-				let callback = Arc::clone(&callback);
-				tokio::task::spawn_blocking(move || {
-					callback.on_progress(downloaded, total);
-				});
-			}),
-		)
+		self.inner_public_link_dir(dir, move |downloaded, total| {
+			let callback = Arc::clone(&callback);
+			tokio::task::spawn_blocking(move || {
+				callback.on_progress(downloaded, total);
+			});
+		})
 		.await
 	}
 
@@ -303,16 +293,12 @@ impl JsClient {
 		contact: Contact,
 		callback: Arc<dyn DirContentDownloadProgressCallback>,
 	) -> Result<(), Error> {
-		self.inner_share_dir(
-			dir,
-			contact,
-			Arc::new(move |downloaded, total| {
-				let callback = Arc::clone(&callback);
-				tokio::task::spawn_blocking(move || {
-					callback.on_progress(downloaded, total);
-				});
-			}),
-		)
+		self.inner_share_dir(dir, contact, move |downloaded, total| {
+			let callback = Arc::clone(&callback);
+			tokio::task::spawn_blocking(move || {
+				callback.on_progress(downloaded, total);
+			});
+		})
 		.await
 	}
 }
@@ -349,12 +335,9 @@ impl JsClient {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			let dir = dir.into();
-			this.public_link_dir(
-				&dir,
-				Arc::new(move |downloaded, total| {
-					let _ = sender.send((downloaded, total));
-				}),
-			)
+			this.public_link_dir(&dir, &move |downloaded, total| {
+				let _ = sender.send((downloaded, total));
+			})
 			.await
 		})
 		.await
@@ -393,13 +376,9 @@ impl JsClient {
 			let contact = contact.into();
 			let dir = dir.into();
 			async move {
-				this.share_dir(
-					&dir,
-					&contact,
-					Arc::new(move |downloaded, total| {
-						let _ = sender.send((downloaded, total));
-					}),
-				)
+				this.share_dir(&dir, &contact, &move |downloaded, total| {
+					let _ = sender.send((downloaded, total));
+				})
 				.await
 			}
 		})

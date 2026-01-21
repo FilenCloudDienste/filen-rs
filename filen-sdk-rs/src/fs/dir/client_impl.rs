@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::path::Path;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
@@ -274,7 +273,7 @@ impl Client {
 				uuid: dir.uuid_as_parent(),
 				skip_cache: false,
 			},
-			None::<Arc<fn(u64, Option<u64>)>>,
+			None::<&fn(u64, Option<u64>)>,
 		))
 		.await
 	}
@@ -290,10 +289,10 @@ impl Client {
 	pub async fn list_dir_recursive<F>(
 		&self,
 		dir: &dyn HasContents,
-		progress_callback: Arc<F>,
+		progress_callback: &F,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
 	where
-		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		self.inner_list_dir_recursive(async {
 			api::v3::dir::download::post_large(

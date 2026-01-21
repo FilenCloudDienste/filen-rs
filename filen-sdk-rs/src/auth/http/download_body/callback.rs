@@ -4,93 +4,65 @@ use crate::Error;
 
 use super::super::retry::RetryError;
 
-pub(crate) struct DownloadWithCallbackLayer<'a, FRef, F>
-where
-	FRef: 'a,
-{
-	callback: Option<FRef>,
-	_phantom: std::marker::PhantomData<F>,
-	_lifetime: std::marker::PhantomData<&'a ()>,
+pub(crate) struct DownloadWithCallbackLayer<'a, F> {
+	callback: Option<&'a F>,
 }
 
-impl<FRef, F> Clone for DownloadWithCallbackLayer<'_, FRef, F>
-where
-	FRef: Clone,
-{
+impl<F> Clone for DownloadWithCallbackLayer<'_, F> {
 	fn clone(&self) -> Self {
 		Self {
-			callback: self.callback.clone(),
-			_phantom: self._phantom,
-			_lifetime: self._lifetime,
+			callback: self.callback,
 		}
 	}
 }
 
-impl<'a, FRef, F> DownloadWithCallbackLayer<'a, FRef, F>
+impl<'a, F> DownloadWithCallbackLayer<'a, F>
 where
 	F: Fn(u64, Option<u64>),
 {
-	pub(crate) fn new(callback: Option<FRef>) -> Self
-	where
-		FRef: 'a,
-	{
-		Self {
-			callback,
-			_phantom: std::marker::PhantomData,
-			_lifetime: std::marker::PhantomData,
-		}
+	pub(crate) fn new(callback: Option<&'a F>) -> Self {
+		Self { callback }
 	}
 }
 
-impl<'a, S, FRef, F> Layer<S> for DownloadWithCallbackLayer<'a, FRef, F>
-where
-	FRef: Clone,
-{
-	type Service = DownloadWithCallbackService<'a, S, FRef, F>;
+impl<'a, S, F> Layer<S> for DownloadWithCallbackLayer<'a, F> {
+	type Service = DownloadWithCallbackService<'a, S, F>;
 
 	fn layer(&self, inner: S) -> Self::Service {
 		DownloadWithCallbackService {
 			inner,
-			callback: self.callback.clone(),
-			_phantom: self._phantom,
-			_lifetime: self._lifetime,
+			callback: self.callback,
 		}
 	}
 }
 
-pub(crate) struct DownloadWithCallbackService<'a, S, FRef, F> {
+pub(crate) struct DownloadWithCallbackService<'a, S, F> {
 	inner: S,
-	callback: Option<FRef>,
-	_phantom: std::marker::PhantomData<F>,
-	_lifetime: std::marker::PhantomData<&'a ()>,
+	callback: Option<&'a F>,
 }
 
-impl<'a, S, FRef, F> Clone for DownloadWithCallbackService<'a, S, FRef, F>
+impl<'a, S, F> Clone for DownloadWithCallbackService<'a, S, F>
 where
 	S: Clone,
-	FRef: Clone,
 {
 	fn clone(&self) -> Self {
 		Self {
 			inner: self.inner.clone(),
-			callback: self.callback.clone(),
-			_phantom: self._phantom,
-			_lifetime: self._lifetime,
+			callback: self.callback,
 		}
 	}
 }
 
-impl<'a, S, Req, FRef, F> Service<Req> for DownloadWithCallbackService<'a, S, FRef, F>
+impl<'a, S, Req, F> Service<Req> for DownloadWithCallbackService<'a, S, F>
 where
 	S: Service<Req, Response = reqwest::Response, Error = RetryError<Error>>,
 	S::Future: 'a,
-	FRef: AsRef<F> + Clone + 'a,
 	F: Fn(u64, Option<u64>),
 {
 	type Response = Vec<u8>;
 	type Error = RetryError<Error>;
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	type Future = DownloadWithCallbackFuture<S::Future, FRef, F>;
+	type Future = DownloadWithCallbackFuture<'a, S::Future, F>;
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	type Future = DownloadWithCallbackFuture<'a>;
 
@@ -99,10 +71,9 @@ where
 	}
 
 	fn call(&mut self, req: Req) -> Self::Future {
-		let progress_callback = self.callback.clone();
 		let fut = self.inner.call(req);
 
-		DownloadWithCallbackFuture::new(fut, progress_callback)
+		DownloadWithCallbackFuture::new(fut, self.callback)
 	}
 }
 
@@ -123,11 +94,10 @@ mod boxed {
 	}
 
 	impl<'a> DownloadWithCallbackFuture<'a> {
-		pub(super) fn new<SFut, FRef, F>(inner: SFut, callback: Option<FRef>) -> Self
+		pub(super) fn new<SFut, F>(inner: SFut, callback: Option<&'a F>) -> Self
 		where
 			SFut: Future<Output = Result<reqwest::Response, RetryError<Error>>> + 'a,
-			FRef: AsRef<F> + Clone + 'a,
-			F: Fn(u64, Option<u64>),
+			F: Fn(u64, Option<u64>) + 'a,
 		{
 			let fut = Box::pin(async move {
 				let resp = inner.await?;
@@ -164,7 +134,7 @@ mod boxed {
 					if last_update_time.elapsed() >= CALLBACK_INTERVAL
 						&& let Some(callback) = &callback
 					{
-						callback.as_ref()(collected.len() as u64, real_content_length);
+						callback(collected.len() as u64, real_content_length);
 						last_update_time = Instant::now();
 					}
 				}
@@ -212,32 +182,28 @@ mod native {
 	}
 
 	#[pin_project::pin_project(project = DownloadWithCallbackFutureProj)]
-	pub(crate) struct DownloadWithCallbackFuture<S, FRef, F> {
-		callback: Option<FRef>,
+	pub(crate) struct DownloadWithCallbackFuture<'a, S, F> {
+		callback: Option<&'a F>,
 		#[pin]
 		state: DownloadWithCallbackFutureState<S>,
-		_phantom: std::marker::PhantomData<F>,
 	}
 
-	impl<S, FRef, F> DownloadWithCallbackFuture<S, FRef, F>
+	impl<'a, S, F> DownloadWithCallbackFuture<'a, S, F>
 	where
 		S: Future<Output = Result<reqwest::Response, RetryError<Error>>>,
-		FRef: AsRef<F>,
 		F: Fn(u64, Option<u64>),
 	{
-		pub(crate) fn new(inner: S, callback: Option<FRef>) -> Self {
+		pub(crate) fn new(inner: S, callback: Option<&'a F>) -> Self {
 			Self {
 				callback,
 				state: DownloadWithCallbackFutureState::AwaitingInner(inner),
-				_phantom: std::marker::PhantomData,
 			}
 		}
 	}
 
-	impl<S, FRef, F> Future for DownloadWithCallbackFuture<S, FRef, F>
+	impl<S, F> Future for DownloadWithCallbackFuture<'_, S, F>
 	where
 		S: Future<Output = Result<reqwest::Response, RetryError<Error>>>,
-		FRef: AsRef<F>,
 		F: Fn(u64, Option<u64>),
 	{
 		type Output = Result<Vec<u8>, RetryError<Error>>;
@@ -288,7 +254,7 @@ mod native {
 								if last_update_time.elapsed() >= CALLBACK_INTERVAL
 									&& let Some(callback) = &this.callback
 								{
-									callback.as_ref()(collected.len() as u64, *real_content_length);
+									callback(collected.len() as u64, *real_content_length);
 									*last_update_time = Instant::now();
 								}
 							}
@@ -300,7 +266,7 @@ mod native {
 							}
 							Poll::Ready(None) => {
 								if let Some(callback) = this.callback {
-									callback.as_ref()(collected.len() as u64, *real_content_length);
+									callback(collected.len() as u64, *real_content_length);
 								}
 								return Poll::Ready(Ok(std::mem::take(collected)));
 							}

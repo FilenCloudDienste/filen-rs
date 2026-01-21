@@ -199,12 +199,12 @@ impl UnauthClient {
 		request: Request<(), String>,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<Arc<F>>,
+		callback: Option<&F>,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Sync + Send + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
@@ -389,13 +389,13 @@ impl AuthClient {
 		request: Request<(), &str>,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<Arc<F>>,
+		callback: Option<&F>,
 		auth: bool,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Sync + Send + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		// This could be improved, all the boxes should be removable with type_alias_impl_trait
 		// and using references instead of Arcs
@@ -592,12 +592,12 @@ pub(crate) trait UnauthorizedClient {
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<Arc<F>>,
+		callback: Option<&F>,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Sync + Send + 'static;
+		F: Fn(u64, Option<u64>) + Send + Sync + 'static;
 }
 
 impl UnauthorizedClient for UnauthClient {
@@ -639,12 +639,12 @@ impl UnauthorizedClient for UnauthClient {
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<Arc<F>>,
+		callback: Option<&F>,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Sync + Send + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		self.inner_post_large(
 			Request {
@@ -702,12 +702,12 @@ impl UnauthorizedClient for AuthClient {
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<Arc<F>>,
+		callback: Option<&F>,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Sync + Send + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
 		self.inner_post_large(
 			Request {
@@ -741,12 +741,12 @@ pub(crate) trait AuthorizedClient: Send + Sync {
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<Arc<F>>,
+		callback: Option<&F>,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Sync + Send + 'static;
+		F: Fn(u64, Option<u64>) + Send + Sync;
 
 	async fn post_raw_bytes_auth<Res>(
 		&self,
@@ -809,12 +809,12 @@ impl AuthorizedClient for AuthClient {
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		callback: Option<Arc<F>>,
+		callback: Option<&F>,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Sync + Send + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		self.inner_post_large(
 			Request {
