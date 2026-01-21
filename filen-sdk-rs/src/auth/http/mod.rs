@@ -64,7 +64,7 @@ pub(crate) struct ClientConfig {
 impl Default for ClientConfig {
 	fn default() -> Self {
 		Self {
-			concurrency: 32,
+			concurrency: 16,
 			retry_budget: TpsBudget::default(),
 			rate_limit_per_sec: NonZeroU32::new(64).unwrap(),
 			upload_bandwidth_kilobytes_per_sec: None,
