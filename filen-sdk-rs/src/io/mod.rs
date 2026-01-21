@@ -6,6 +6,8 @@ mod dir_download;
 mod dir_upload;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod fs_tree;
+#[cfg(feature = "uniffi")]
+mod js_impl;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod meta_ext;
 
