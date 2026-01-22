@@ -1,12 +1,8 @@
 use std::{
 	borrow::Cow,
-	io::Read,
 	path::PathBuf,
 	sync::{Arc, atomic::AtomicU64},
 };
-
-use md5::Digest;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::{
 	Error,
@@ -16,9 +12,9 @@ use crate::{
 	fs::{
 		NonRootFSObject,
 		dir::{RemoteDirectory, UnsharedDirectoryType},
-		file::{RemoteFile, traits::HasRemoteFileInfo},
+		file::RemoteFile,
 	},
-	io::{FilenMetaExt, HasFileInfo},
+	io::meta_ext::DirTimesExt,
 };
 
 use super::fs_tree::Entry;
@@ -136,12 +132,12 @@ impl Client {
 		tokio::task::spawn_blocking(move || {
 			match (std::fs::create_dir_all(&root_path), &target_folder) {
 				(Ok(()), UnsharedDirectoryType::Dir(target_folder)) => target_folder
-					.set_dir_times(&root_path)
+					.blocking_set_dir_times(&root_path)
 					.context("couldn't set directory times for newly created root directory")?,
 				(Err(e), _) if e.kind() == std::io::ErrorKind::AlreadyExists => {
 					if let UnsharedDirectoryType::Dir(target_folder) = target_folder {
 						target_folder
-							.set_dir_times(&root_path)
+							.blocking_set_dir_times(&root_path)
 							.context("couldn't set directory times for root directory")?
 					}
 				}
@@ -169,7 +165,7 @@ impl Client {
 								.unwrap();
 							continue;
 						}
-						if let Err(e) = dir.set_dir_times(&path) {
+						if let Err(e) = dir.blocking_set_dir_times(&path) {
 							log::error!(
 								"Failed to set dir times for downloaded dir {:?}: {}",
 								path,
@@ -223,7 +219,7 @@ impl Client {
 				let downloaded_bytes = Arc::clone(&downloaded_bytes);
 				join_set.spawn(async move {
 					let (res, path, file) = client
-						.inner_download_file_to_path(remote_file, path, &downloaded_bytes)
+						.download_file_to_path_in_dir_download(remote_file, path, &downloaded_bytes)
 						.await;
 
 					let _ = entry_complete_sender
@@ -236,65 +232,23 @@ impl Client {
 		})
 	}
 
-	async fn inner_download_file_to_path(
+	async fn download_file_to_path_in_dir_download(
 		&self,
 		remote_file: RemoteFile,
 		path: PathBuf,
 		downloaded_bytes: &AtomicU64,
 	) -> (Result<(), Error>, PathBuf, RemoteFile) {
-		let (local_file, path, remote_file) = match tokio::task::spawn_blocking(|| {
-			if let Ok(meta) = std::fs::metadata(&path)
-				&& FilenMetaExt::size(&meta) == remote_file.size()
-				&& let Ok(mut file) = std::fs::File::open(&path)
-				&& let Some(hash) = remote_file.hash()
-			{
-				let mut hasher = sha2::Sha512::new();
-
-				let mut buffer = [0u8; 65536];
-				loop {
-					let bytes_read = match file.read(&mut buffer) {
-						Ok(n) => n,
-						Err(e) => return (Err(e.into()), path, remote_file),
-					};
-					if bytes_read == 0 {
-						break;
-					}
-					hasher.update(&buffer[..bytes_read]);
-				}
-				if hasher.finalize().as_slice() == hash.as_ref() {
-					return (Ok(None), path, remote_file);
-				}
-			}
-			let local_file = match std::fs::File::create(&path) {
-				Ok(f) => f,
-				Err(e) => return (Err(e.into()), path, remote_file),
-			};
-			(Ok(Some(local_file)), path, remote_file)
-		})
-		.await
-		.unwrap()
-		{
-			(Ok(Some(local_file)), path, remote_file) => (local_file, path, remote_file),
-			(res, path, remote_file) => {
-				return (res.map(|_| ()), path, remote_file);
-			}
-		};
-
-		let local_file = tokio::fs::File::from_std(local_file);
-
-		match self
-			.download_file_to_writer(
+		let (res, path) = self
+			.inner_download_to_path_with_hash_check(
 				&remote_file,
-				&mut local_file.compat_write(),
+				path,
 				Some(Arc::new(|bytes| {
 					downloaded_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
 				})),
 			)
-			.await
-		{
-			Ok(_) => (Ok(()), path, remote_file),
-			Err(e) => (Err(e), path, remote_file),
-		}
+			.await;
+
+		(res, path, remote_file)
 	}
 }
 

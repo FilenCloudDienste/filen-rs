@@ -3,8 +3,8 @@ use std::{fs::FileTimes, path::Path, time::SystemTime};
 use chrono::{DateTime, SubsecRound, Utc};
 
 use crate::{
-	fs::HasRemoteInfo,
-	io::{HasFileInfo, RemoteDirectory, RemoteFile},
+	fs::{HasRemoteInfo, dir::traits::HasDirInfo},
+	io::HasFileInfo,
 };
 
 #[cfg(windows)]
@@ -77,26 +77,50 @@ impl FilenMetaExt for std::fs::Metadata {
 	}
 }
 
-impl RemoteDirectory {
-	pub(crate) fn set_dir_times(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-		let file_times = get_file_times(
-			self.created().unwrap_or_else(|| self.timestamp()).into(),
-			None,
-		);
-		set_file_times_for_dir(path, file_times)
+pub(crate) trait FileTimesExt {
+	fn get_file_times(&self) -> FileTimes;
+	fn set_file_times(&self, file: &Path) -> Result<(), std::io::Error> {
+		let times = self.get_file_times();
+		std::fs::OpenOptions::new()
+			.write(true)
+			.open(file)?
+			.set_times(times)
 	}
 }
 
-impl RemoteFile {
-	pub(crate) fn get_file_times(&self) -> FileTimes {
-		get_file_times(
-			self.created().unwrap_or_else(|| self.timestamp()).into(),
-			self.last_modified().map(Into::into),
-		)
+impl<F> FileTimesExt for F
+where
+	F: HasFileInfo + HasRemoteInfo + ?Sized,
+{
+	fn get_file_times(&self) -> FileTimes {
+		let created = self.created().unwrap_or_else(|| self.timestamp()).into();
+		let modified = self.last_modified().map(Into::into);
+		get_file_times(created, modified)
 	}
 }
 
-fn set_file_times_for_dir(path: &Path, times: FileTimes) -> Result<(), std::io::Error> {
+pub(crate) trait DirTimesExt {
+	fn get_dir_times(&self) -> FileTimes;
+	fn blocking_set_dir_times(&self, dir: &Path) -> Result<(), std::io::Error> {
+		let times = self.get_dir_times();
+		blocking_set_file_times_for_dir(dir, times)
+	}
+}
+
+impl<D> DirTimesExt for D
+where
+	D: HasDirInfo + HasRemoteInfo + ?Sized,
+{
+	fn get_dir_times(&self) -> FileTimes {
+		let created = self.created().unwrap_or_else(|| self.timestamp()).into();
+		get_file_times(created, None)
+	}
+}
+
+pub(crate) fn blocking_set_file_times_for_dir(
+	path: &Path,
+	times: FileTimes,
+) -> Result<(), std::io::Error> {
 	let dir_as_file = {
 		#[cfg(windows)]
 		{
@@ -160,7 +184,7 @@ mod tests {
 		std::fs::create_dir(&tmp_dir).unwrap();
 		println!("Setting times for dir {:?}", &tmp_dir);
 
-		set_file_times_for_dir(&tmp_dir, file_times).unwrap();
+		blocking_set_file_times_for_dir(&tmp_dir, file_times).unwrap();
 
 		let metadata = std::fs::metadata(&tmp_dir).unwrap();
 		#[cfg(any(target_vendor = "apple", windows))]

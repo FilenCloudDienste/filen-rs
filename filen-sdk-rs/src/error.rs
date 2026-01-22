@@ -103,6 +103,8 @@ pub enum ErrorKind {
 	InsufficientMemory,
 	/// Error occurred when walking through a directory structure:
 	Walk,
+	/// Target file changed during upload or download
+	FileChangedDuringSync,
 }
 
 /// Custom error type for the SDK
