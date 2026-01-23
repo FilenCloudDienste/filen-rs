@@ -66,11 +66,18 @@ async fn export_and_authenticate_from_auth_config() {
 
 #[test]
 fn authenticate_from_env_vars() {
+	let config_dir = assert_fs::TempDir::new().unwrap();
 	let (email, password) = get_testing_credentials();
 	cargo_bin_cmd!()
 		.env("FILEN_CLI_EMAIL", &email)
 		.env("FILEN_CLI_PASSWORD", &password)
-		.args(["-v", "stat", "/"])
+		.args([
+			"--config-dir",
+			config_dir.path().to_str().unwrap(),
+			"-v",
+			"stat",
+			"/",
+		])
 		.assert()
 		.success()
 		.stdout(predicates::str::contains(
