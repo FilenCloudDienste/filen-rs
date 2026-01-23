@@ -1,10 +1,13 @@
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Instant};
 
 use chrono::DateTime;
-use filen_sdk_rs::fs::{
-	HasName, HasUUID,
-	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
-	file::{RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
+use filen_sdk_rs::{
+	fs::{
+		HasName, HasUUID,
+		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
+		file::{RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
+	},
+	io::client_impl::UploadInfo,
 };
 use filen_types::fs::{ParentUuid, UuidStr};
 use log::debug;
@@ -376,7 +379,7 @@ impl AuthCacheState {
 
 				self.io_upload_updated_file(
 					file.uuid.as_ref(),
-					&meta.name,
+					meta.name,
 					file.parent.try_into().map_err(|e| {
 						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
 					})?,
@@ -394,9 +397,10 @@ impl AuthCacheState {
 			UpdateItemsInPath::Partial(remaining, parent)
 				if remaining == path_values.name_or_uuid =>
 			{
-				self.io_upload_new_file(path_values.name_or_uuid, parent.uuid(), None)
-					.await?
-					.0
+				let builder = self
+					.client
+					.make_file_builder(path_values.name_or_uuid.to_owned(), &parent.uuid());
+				self.io_upload_new_file(builder).await?.0
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
 				return Err(CacheError::remote(format!(
@@ -463,10 +467,8 @@ impl AuthCacheState {
 			file = file.mime(mime);
 		}
 
-		let os_file = tokio::fs::File::open(&os_path).await?;
-
-		let remote_file = self
-			.io_upload_file(file.build(), os_file, progress_callback)
+		let (remote_file, _) = self
+			.io_upload_file(os_path, UploadInfo::Builder(file), progress_callback)
 			.await?;
 
 		let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
@@ -500,11 +502,12 @@ impl AuthCacheState {
 				)));
 			}
 		};
-		let path = parent_path.join(&name);
-		let pvs = path.as_path()?;
-		let (file, os_path) = self
-			.io_upload_new_file(pvs.name_or_uuid, parent.uuid(), mime)
-			.await?;
+
+		let mut builder = self.client.make_file_builder(name, &parent.uuid());
+		if let Some(mime) = mime {
+			builder = builder.mime(mime);
+		}
+		let (file, os_path) = self.io_upload_new_file(builder).await?;
 		let mut conn = self.conn();
 		let file = DBFile::upsert_from_remote(&mut conn, file)?;
 		Ok(CreateFileResponse {

@@ -1,7 +1,10 @@
 use std::{borrow::Cow, sync::Arc};
 
 use chrono::Utc;
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::{
+	crypto::Blake3Hash,
+	fs::{ParentUuid, UuidStr},
+};
 use futures::AsyncRead;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
@@ -19,10 +22,11 @@ use crate::{
 			FileVersion,
 			meta::{FileMeta, FileMetaChanges},
 			traits::HasFileMeta,
+			write::FileWriterDefault,
 		},
 	},
 	runtime::{self, blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, MaybeSendCallback},
+	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback},
 };
 
 use super::{
@@ -197,12 +201,17 @@ impl Client {
 		FileBuilder::new(name, parent, self)
 	}
 
-	pub(crate) fn inner_get_file_writer<'a>(
+	pub(crate) fn inner_get_file_writer<'a, F, Fut>(
 		&'a self,
 		file: Arc<BaseFile>,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
-	) -> Result<FileWriter<'a>, Error> {
+		confirm_completion_callback: Option<F>,
+	) -> Result<FileWriter<'a, F, Fut>, Error>
+	where
+		F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+		Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
+	{
 		if file.root.name.is_empty() {
 			let name = match Arc::try_unwrap(file).map(|f| f.root.name) {
 				Ok(name) => name,
@@ -210,20 +219,29 @@ impl Client {
 			};
 			Err(InvalidNameError(name).into())
 		} else {
-			Ok(FileWriter::new(file, self, callback, size))
+			Ok(FileWriter::new(
+				file,
+				self,
+				callback,
+				size,
+				confirm_completion_callback,
+			))
 		}
 	}
 
-	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> Result<FileWriter<'_>, Error> {
-		self.inner_get_file_writer(file.into(), None, None)
+	pub fn get_file_writer(
+		&self,
+		file: impl Into<Arc<BaseFile>>,
+	) -> Result<FileWriterDefault<'_>, Error> {
+		self.inner_get_file_writer(file.into(), None, None, None)
 	}
 
 	pub fn get_file_writer_with_callback<'a>(
 		&'a self,
 		file: impl Into<Arc<BaseFile>>,
 		callback: MaybeSendCallback<'a, u64>,
-	) -> Result<FileWriter<'a>, Error> {
-		self.inner_get_file_writer(file.into(), Some(callback), None)
+	) -> Result<FileWriterDefault<'a>, Error> {
+		self.inner_get_file_writer(file.into(), Some(callback), None, None)
 	}
 
 	pub async fn list_file_versions(&self, file: &RemoteFile) -> Result<Vec<FileVersion>, Error> {

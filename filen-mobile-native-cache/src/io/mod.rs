@@ -17,19 +17,18 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
+	error::FilenSDKError,
 	fs::{
 		HasName, HasUUID,
-		file::{BaseFile, FileBuilder, RemoteFile, traits::HasFileInfo},
+		file::{FileBuilder, RemoteFile, traits::HasFileInfo},
 	},
-	io::FilenMetaExt,
+	io::{FilenMetaExt, client_impl::UploadInfo},
 };
 use filen_types::{crypto::Blake3Hash, fs::UuidStr};
 use futures::{StreamExt, stream::FuturesUnordered};
 use log::{debug, error, info, trace};
 use tokio::{fs::DirEntry, sync::mpsc::UnboundedReceiver};
-use tokio_util::compat::{
-	FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
-};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 #[cfg(windows)]
 fn get_file_times(created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
@@ -75,7 +74,7 @@ pub(crate) fn init(files_path: &Path) -> Result<(PathBuf, PathBuf, PathBuf), io:
 	Ok((cache_dir, tmp_dir, thumbnail_dir))
 }
 
-async fn update_task(
+pub(crate) async fn update_task(
 	mut receiver: UnboundedReceiver<u64>,
 	file_size: u64,
 	callback: Arc<dyn ProgressCallback + Send + Sync>,
@@ -193,14 +192,15 @@ impl AuthCacheState {
 
 	pub(crate) async fn io_upload_file(
 		&self,
-		file: BaseFile,
-		os_file: tokio::fs::File,
+		path: PathBuf,
+		info: UploadInfo<'_>,
 		callback: Option<Arc<dyn ProgressCallback>>,
-	) -> Result<RemoteFile, io::Error> {
-		let meta = os_file.metadata().await?;
-		let file_size = FilenMetaExt::size(&meta);
-
+	) -> Result<(RemoteFile, std::fs::File), FilenSDKError> {
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
+		// redundant metadata call, we do it again in upload_file_from_path, but we need the size here
+		// annoying to work around
+		let file_size = FilenMetaExt::size(&tokio::fs::metadata(&path).await?);
+
 		let reader_callback = if let Some(callback) = callback {
 			tokio::task::spawn(async move {
 				update_task(receiver, file_size, callback).await;
@@ -212,67 +212,27 @@ impl AuthCacheState {
 			None
 		};
 
-		let mut os_file = os_file.compat();
-
-		let remote_file = self
-			.client
-			.upload_file_from_reader(file.into(), &mut os_file, reader_callback, Some(file_size))
+		self.client
+			.upload_file_from_path_with_info(info, path, reader_callback)
 			.await
-			.map_err(|e| io::Error::other(format!("Failed to upload file: {e}")))?;
-
-		Ok(remote_file)
-	}
-
-	async fn inner_upload_file(
-		&self,
-		file_builder: FileBuilder,
-		os_file: tokio::fs::File,
-		callback: Option<Arc<dyn ProgressCallback>>,
-	) -> Result<(RemoteFile, tokio::fs::File), io::Error> {
-		let meta = os_file.metadata().await?;
-		let file = file_builder
-			.created(FilenMetaExt::created(&meta))
-			.modified(FilenMetaExt::modified(&meta))
-			.build();
-
-		let file_size = FilenMetaExt::size(&meta);
-
-		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
-		let reader_callback = if let Some(callback) = callback {
-			tokio::task::spawn(async move {
-				update_task(receiver, file_size, callback).await;
-			});
-			Some(Arc::new(move |bytes_written: u64| {
-				let _ = sender.send(bytes_written);
-			}) as Arc<dyn Fn(u64) + Send + Sync>)
-		} else {
-			None
-		};
-
-		let mut os_file = os_file.compat();
-
-		let remote_file = self
-			.client
-			.upload_file_from_reader(file.into(), &mut os_file, reader_callback, Some(file_size))
-			.await
-			.map_err(|e| io::Error::other(format!("Failed to upload file: {e}")))?;
-
-		Ok((remote_file, os_file.into_inner()))
 	}
 
 	pub(crate) async fn io_upload_updated_file(
 		&self,
 		old_uuid: &str,
-		name: &str,
+		name: String,
 		parent_uuid: UuidStr,
 		mime: String,
 		callback: Option<Arc<dyn ProgressCallback>>,
-	) -> Result<RemoteFile, io::Error> {
-		let old_path = self.get_cached_file_path_from_name(old_uuid, Some(name));
-		let old_file = tokio::fs::File::open(&old_path).await?;
+	) -> Result<RemoteFile, FilenSDKError> {
+		let old_path = self.get_cached_file_path_from_name(old_uuid, Some(&name));
 		let file_builder = self.client.make_file_builder(name, &parent_uuid).mime(mime);
 		let (file, _) = self
-			.inner_upload_file(file_builder, old_file, callback)
+			.io_upload_file(
+				old_path.clone(),
+				UploadInfo::Builder(file_builder),
+				callback,
+			)
 			.await?;
 		let new_path = self.get_cached_file_path(&file);
 		let parent = new_path
@@ -294,16 +254,10 @@ impl AuthCacheState {
 
 	pub(crate) async fn io_upload_new_file(
 		&self,
-		name: &str,
-		parent_uuid: UuidStr,
-		mime: Option<String>,
-	) -> Result<(RemoteFile, PathBuf), io::Error> {
-		let mut file_builder = self.client.make_file_builder(name, &parent_uuid);
-		if let Some(mime) = mime {
-			file_builder = file_builder.mime(mime);
-		}
-		let target_path =
-			self.get_cached_file_path_from_name(file_builder.get_uuid().as_ref(), Some(name));
+		builder: FileBuilder,
+	) -> Result<(RemoteFile, PathBuf), FilenSDKError> {
+		let target_path = self
+			.get_cached_file_path_from_name(builder.get_uuid().as_ref(), Some(builder.get_name()));
 		let parent_path = target_path
 			.parent()
 			.expect("cached file path should always have a parent");
@@ -314,7 +268,10 @@ impl AuthCacheState {
 			.create(true)
 			.open(&target_path)
 			.await?;
-		let (file, _) = self.inner_upload_file(file_builder, os_file, None).await?;
+		drop(os_file);
+		let (file, _) = self
+			.io_upload_file(target_path.clone(), UploadInfo::Builder(builder), None)
+			.await?;
 		Ok((file, target_path))
 	}
 

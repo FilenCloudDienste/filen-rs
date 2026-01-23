@@ -9,7 +9,6 @@ use std::{
 };
 
 use filen_types::fs::UuidStr;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
 	Error, ErrorKind,
@@ -246,40 +245,16 @@ impl Client {
 		parent: &UuidStr,
 		uploaded_bytes: Arc<AtomicU64>,
 	) -> Result<RemoteFile, Error> {
-		let os_file = tokio::fs::File::open(path).await.map_err(|e| {
-			Error::custom_with_source(ErrorKind::IO, e, Some(format!("opening file {:?}", path)))
-		})?;
-		let meta = os_file.metadata().await.map_err(|e| {
-			Error::custom_with_source(
-				ErrorKind::IO,
-				e,
-				Some(format!("getting metadata for file {:?}", path)),
-			)
-		})?;
-		let size = FilenMetaExt::size(&meta);
-
-		let base_file = self
-			.make_file_builder(
-				path.file_name()
-					.expect("path name should be valid")
-					.to_str()
-					.expect("path name should be utf8"),
-				parent,
-			)
-			.created(FilenMetaExt::created(&meta))
-			.modified(FilenMetaExt::modified(&meta))
-			.build();
-
-		self.upload_file_from_reader(
-			base_file.into(),
-			&mut os_file.compat(),
+		self.upload_file_from_path(
+			parent,
 			Some(Arc::new(|bytes_downloaded| {
 				uploaded_bytes.fetch_add(bytes_downloaded, Ordering::Relaxed);
 			})),
-			Some(size),
+			path.to_owned(),
 		)
 		.await
 		.context("uploading file from path")
+		.map(|(file, _)| file)
 	}
 
 	async fn upload_child_dir_from_path(

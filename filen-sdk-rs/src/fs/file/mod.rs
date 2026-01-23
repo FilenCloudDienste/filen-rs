@@ -92,6 +92,18 @@ impl FileBuilder {
 		self.uuid
 	}
 
+	pub fn get_created(&self) -> Option<DateTime<Utc>> {
+		self.created
+	}
+
+	pub fn get_modified(&self) -> Option<DateTime<Utc>> {
+		self.modified
+	}
+
+	pub fn get_name(&self) -> &str {
+		&self.name
+	}
+
 	pub fn build(self) -> BaseFile {
 		BaseFile {
 			root: RootFile {

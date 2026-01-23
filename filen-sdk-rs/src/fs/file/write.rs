@@ -21,7 +21,7 @@ use crate::{
 	fs::file::chunk::Chunk,
 	runtime::{blocking_join, do_cpu_intensive},
 	sync::lock::ResourceLock,
-	util::{MaybeSendBoxFuture, MaybeSendCallback},
+	util::{MaybeSend, MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 use super::{BaseFile, RemoteFile, meta::DecryptedFileMeta};
@@ -41,11 +41,28 @@ impl Default for RemoteFileInfo {
 	}
 }
 
-struct FileWriterUploadingState<'a> {
+pub struct DummyFuture;
+
+impl Future for DummyFuture {
+	type Output = Result<(), Error>;
+
+	fn poll(
+		self: std::pin::Pin<&mut Self>,
+		_cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Self::Output> {
+		std::task::Poll::Ready(Ok(()))
+	}
+}
+
+struct FileWriterUploadingState<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+{
 	file: Arc<BaseFile>,
 	callback: Option<MaybeSendCallback<'a, u64>>,
 	futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<Chunk<'a>, Error>>>,
 	alloc_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
+	confirm_upload_callback: Option<F>,
 	// annoying that I have to split it up like this, but Cursor doesn't implement Write
 	// for impl AsMut<Vec<u8>> so we can't use Cursor<Chunk<'a>> directly
 	curr_chunk: Option<Chunk<'a>>,
@@ -59,7 +76,49 @@ struct FileWriterUploadingState<'a> {
 	client: &'a Client,
 }
 
-impl<'a> FileWriterUploadingState<'a> {
+impl<'a, F, Fut> FileWriterUploadingState<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+	Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
+{
+	fn into_waiting_for_drive_lock_state(
+		self,
+	) -> Result<FileWriterWaitingForDriveLockState<'a>, Error> {
+		let lock_future = self.client.lock_drive();
+		let hash = Blake3Hash::from(self.hasher.finalize());
+
+		let remote_file_info = match Arc::try_unwrap(self.remote_file_info) {
+			Ok(lock) => lock.into_inner().unwrap_or_default(),
+			Err(arc) => (*arc).get().cloned().unwrap_or_default(),
+		};
+
+		let combined_future = Box::pin(async move {
+			futures::try_join!(lock_future, async {
+				if let Some(confirm_upload_callback) = self.confirm_upload_callback {
+					confirm_upload_callback(hash, self.written).await
+				} else {
+					Ok(())
+				}
+			})
+		});
+
+		Ok(FileWriterWaitingForDriveLockState {
+			file: self.file,
+			lock_and_confirm_upload_future: combined_future,
+			hash,
+			remote_file_info,
+			upload_key: self.upload_key,
+			written: self.written,
+			num_chunks: self.next_chunk_idx,
+			client: self.client,
+		})
+	}
+}
+
+impl<'a, F, Fut> FileWriterUploadingState<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+{
 	fn next_chunk_size(&self) -> Option<NonZeroU32> {
 		match self.size {
 			Some(0) => None,
@@ -153,29 +212,6 @@ impl<'a> FileWriterUploadingState<'a> {
 		}
 
 		Ok(written)
-	}
-
-	fn into_waiting_for_drive_lock_state(
-		self,
-	) -> Result<FileWriterWaitingForDriveLockState<'a>, Error> {
-		let lock_future = self.client.lock_drive();
-		let hash = Blake3Hash::from(self.hasher.finalize());
-
-		let remote_file_info = match Arc::try_unwrap(self.remote_file_info) {
-			Ok(lock) => lock.into_inner().unwrap_or_default(),
-			Err(arc) => (*arc).get().cloned().unwrap_or_default(),
-		};
-
-		Ok(FileWriterWaitingForDriveLockState {
-			file: self.file,
-			lock_future: Box::pin(lock_future),
-			hash,
-			remote_file_info,
-			upload_key: self.upload_key,
-			written: self.written,
-			num_chunks: self.next_chunk_idx,
-			client: self.client,
-		})
 	}
 
 	fn poll_write(
@@ -278,7 +314,7 @@ impl<'a> FileWriterUploadingState<'a> {
 
 struct FileWriterWaitingForDriveLockState<'a> {
 	file: Arc<BaseFile>,
-	lock_future: MaybeSendBoxFuture<'a, Result<Arc<ResourceLock>, Error>>,
+	lock_and_confirm_upload_future: MaybeSendBoxFuture<'a, Result<(Arc<ResourceLock>, ()), Error>>,
 	hash: Blake3Hash,
 	remote_file_info: RemoteFileInfo,
 	upload_key: Arc<String>,
@@ -368,8 +404,8 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		&mut self,
 		cx: &mut std::task::Context<'_>,
 	) -> std::task::Poll<std::io::Result<Arc<ResourceLock>>> {
-		match self.lock_future.poll_unpin(cx) {
-			std::task::Poll::Ready(Ok(drive_lock)) => std::task::Poll::Ready(Ok(drive_lock)),
+		match self.lock_and_confirm_upload_future.poll_unpin(cx) {
+			std::task::Poll::Ready(Ok((res, _))) => std::task::Poll::Ready(Ok(res)),
 			std::task::Poll::Ready(Err(e)) => {
 				std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
 			}
@@ -492,8 +528,11 @@ struct FileWriterCompleteState {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum FileWriterState<'a> {
-	Uploading(FileWriterUploadingState<'a>),
+enum FileWriterState<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+{
+	Uploading(FileWriterUploadingState<'a, F, Fut>),
 	WaitingForDriveLock(FileWriterWaitingForDriveLockState<'a>),
 	Completing(FileWriterCompletingState<'a>),
 	Finalizing(FileWriterFinalizingState<'a>),
@@ -501,12 +540,17 @@ enum FileWriterState<'a> {
 	Error(&'a str),
 }
 
-impl<'a> FileWriterState<'a> {
+impl<'a, F, Fut> FileWriterState<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+	Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
+{
 	fn new(
 		file: Arc<BaseFile>,
 		client: &'a Client,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
+		confirm_upload_callback: Option<F>,
 	) -> Self {
 		FileWriterState::Uploading(FileWriterUploadingState {
 			file,
@@ -515,6 +559,7 @@ impl<'a> FileWriterState<'a> {
 			curr_chunk: None,
 			next_chunk_idx: 0,
 			written: 0,
+			confirm_upload_callback,
 			hasher: blake3::Hasher::new(),
 			remote_file_info: Arc::new(OnceLock::new()),
 			upload_key: Arc::new(crypto::shared::generate_random_base64_values(
@@ -528,24 +573,34 @@ impl<'a> FileWriterState<'a> {
 		})
 	}
 
-	fn take_with_err(&mut self, error: &'a str) -> FileWriterState<'a> {
+	fn take_with_err(&mut self, error: &'a str) -> FileWriterState<'a, F, Fut> {
 		std::mem::replace(self, FileWriterState::Error(error))
 	}
 }
 
-pub struct FileWriter<'a> {
-	state: FileWriterState<'a>,
+pub struct FileWriter<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+{
+	state: FileWriterState<'a, F, Fut>,
 }
 
-impl<'a> FileWriter<'a> {
+pub type FileWriterDefault<'a> = FileWriter<'a, fn(Blake3Hash, u64) -> DummyFuture, DummyFuture>;
+
+impl<'a, F, Fut> FileWriter<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+	Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
+{
 	pub(crate) fn new(
 		file: Arc<BaseFile>,
 		client: &'a Client,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
+		confirm_upload_callback: Option<F>,
 	) -> Self {
 		Self {
-			state: FileWriterState::new(file, client, callback, size),
+			state: FileWriterState::new(file, client, callback, size, confirm_upload_callback),
 		}
 	}
 
@@ -557,7 +612,12 @@ impl<'a> FileWriter<'a> {
 	}
 }
 
-impl AsyncWrite for FileWriter<'_> {
+impl<'a, F, Fut> AsyncWrite for FileWriter<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+	Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
+	Self: Unpin,
+{
 	fn poll_write(
 		mut self: std::pin::Pin<&mut Self>,
 		cx: &mut std::task::Context<'_>,

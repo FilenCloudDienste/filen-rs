@@ -1,6 +1,4 @@
 use std::borrow::Cow;
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
@@ -10,8 +8,6 @@ use futures::TryFutureExt;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use crate::ErrorKind;
 use crate::{
 	api,
 	auth::Client,
@@ -567,90 +563,5 @@ impl Client {
 		.await?;
 		dir.color = color.into_owned_cow();
 		Ok(())
-	}
-}
-
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-impl Client {
-	pub async fn recursive_upload_dir(
-		&self,
-		dir: &Path,
-		name: String,
-		parent: &dyn HasUUIDContents,
-		created: DateTime<Utc>,
-	) -> Result<RemoteDirectory, Error> {
-		use futures::StreamExt;
-
-		use crate::{consts::MAX_SMALL_PARALLEL_REQUESTS, io::FilenMetaExt};
-
-		let _lock = self.lock_drive().await?;
-
-		let read_dir = tokio::fs::read_dir(dir).await?;
-		let remote_dir = self.create_dir_with_created(parent, name, created).await?;
-		let stream = tokio_stream::wrappers::ReadDirStream::new(read_dir);
-
-		let stream = stream
-			.map(|entry| async {
-				let entry = entry?;
-				let path = entry.path();
-				let meta = entry.metadata().await?;
-				if meta.is_dir() {
-					let name = entry.file_name().into_string().map_err(|_| {
-						Error::custom(
-							ErrorKind::Conversion,
-							"Failed to convert OsString to String",
-						)
-					})?;
-					Box::pin(self.recursive_upload_dir(
-						&path,
-						name,
-						&remote_dir,
-						FilenMetaExt::created(&meta),
-					))
-					.await?;
-				} else if meta.is_file() {
-					use tokio_util::compat::TokioAsyncReadCompatExt;
-
-					let name = entry.file_name().into_string().map_err(|_| {
-						Error::custom(
-							ErrorKind::Conversion,
-							"Failed to convert OsString to String",
-						)
-					})?;
-					// stop from overloading client with too many open files
-					let _sem = self.open_file_semaphore.acquire().await.unwrap();
-					let os_file = tokio::fs::File::open(&path).await?;
-					let file = self
-						.make_file_builder(name, &remote_dir)
-						.modified(FilenMetaExt::modified(&meta))
-						.created(FilenMetaExt::created(&meta))
-						.build();
-
-					self.upload_file_from_reader(
-						file.into(),
-						&mut os_file.compat(),
-						None,
-						Some(meta.size()),
-					)
-					.await?;
-				} else {
-					return Err(Error::custom(
-						ErrorKind::IO,
-						format!("Unsupported file type for path: {}", path.display()),
-					));
-				}
-				Ok::<_, Error>(())
-			})
-			.buffer_unordered(MAX_SMALL_PARALLEL_REQUESTS);
-
-		{
-			tokio::pin!(stream);
-			while let Some(result) = stream.next().await {
-				use crate::error::ResultExt;
-				result.context("recursive_upload_dir")?; // propagate any errors
-			}
-		}
-
-		Ok(remote_dir)
 	}
 }
