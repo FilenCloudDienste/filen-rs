@@ -15,6 +15,30 @@ const TEST_FILE_CONTENT: &str = "This is a test file for filen-network-drive tes
 #[cfg(not(target_os = "macos"))]
 #[shared_test_runtime]
 async fn start_rclone_mount() {
+	// for some reason, the directory has to be explicitly unounted on linux after killing the process
+	// this does not seem to be a problem when using it through the filen-cli
+	// todo: see what the underlying issue for needing to explicitly unmount is
+	#[cfg(target_os = "linux")]
+	{
+		use log::warn;
+		use tokio::process::Command;
+		let mount_path = "/tmp/filen";
+		let umount_status = Command::new("fusermount")
+			.arg("-u")
+			.arg(mount_path)
+			/* .stdout(Stdio::null())
+			.stderr(Stdio::null()) */
+			.status()
+			.await
+			.unwrap()
+			.success();
+		if !umount_status {
+			warn!("Failed to unmount network drive at {}", mount_path);
+		} else {
+			info!("Network drive unmounted successfully");
+		}
+	}
+
 	use filen_rclone_wrapper::network_drive::NetworkDrive;
 
 	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
@@ -26,7 +50,7 @@ async fn start_rclone_mount() {
 	{
 		// try to mount on invalid drive letter
 		assert!(
-			mount_network_drive(&client, &config_dir, Some("C:\\"), false)
+			NetworkDrive::mount(&client, &config_dir, Some("C:\\"), false)
 				.await
 				.is_err(),
 			"Mounting on used drive letter should fail"
@@ -193,8 +217,13 @@ async fn start_rclone_mount() {
 		_ => panic!("Uploaded item is not a file"),
 	}
 
-	drop(network_drive.process);
-	info!("Network drive unmounted");
+	//drop(network_drive.process);
+	//info!("Network drive unmounted");
+
+	// wait for process to end
+	network_drive.process.kill().await.unwrap();
+	network_drive.process.wait().await.unwrap();
+	info!("Network drive process killed");
 
 	// cleanup test root dir
 	client

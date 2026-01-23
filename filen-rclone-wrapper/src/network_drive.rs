@@ -187,9 +187,14 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 	#[cfg(not(windows))]
 	{
 		let mount_point = mount_point.unwrap_or("/tmp/filen");
-		fs::create_dir_all(mount_point)
+		if !fs::try_exists(mount_point)
 			.await
-			.context("Failed to create mount point directory")?;
+			.context("Failed to check if mount point directory exists")?
+		{
+			fs::create_dir_all(mount_point)
+				.await
+				.context("Failed to create missing mount point directory")?;
+		}
 		Ok(Cow::Borrowed(mount_point))
 	}
 }
