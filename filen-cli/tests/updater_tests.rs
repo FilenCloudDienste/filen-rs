@@ -3,6 +3,8 @@ use std::fs;
 use regex::Regex;
 
 #[test]
+// do not run in aarch64-apple-darwin, because there is no release asset for that
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 fn test_updater() {
 	let binary = assert_cmd::cargo::cargo_bin!();
 	let dir = tempfile::tempdir().unwrap();
