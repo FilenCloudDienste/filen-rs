@@ -26,7 +26,7 @@ use crate::{
 use crate::{
 	ErrorKind,
 	error::ErrorExt,
-	fs::dir::{HasUUIDContents, UnsharedDirectoryType},
+	fs::dir::{DirectoryTypeWithShareInfo, HasUUIDContents},
 	io::{FilenMetaExt, dir_download::DirDownloadCallback, meta_ext::FileTimesExt},
 };
 
@@ -213,7 +213,7 @@ impl Client {
 		self: Arc<Self>,
 		dir_path: PathBuf,
 		callback: impl Deref<Target = C>,
-		target: UnsharedDirectoryType<'_>,
+		target: DirectoryTypeWithShareInfo<'_>,
 	) -> Result<(), Error>
 	where
 		C: DirDownloadCallback + ?Sized,

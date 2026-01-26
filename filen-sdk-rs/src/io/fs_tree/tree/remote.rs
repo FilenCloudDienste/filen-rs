@@ -4,7 +4,7 @@ use crate::{
 	Error,
 	fs::{
 		HasParent, HasUUID, NonRootFSObject,
-		dir::{HasUUIDContents, RemoteDirectory, UnsharedDirectoryType},
+		dir::{DirectoryTypeWithShareInfo, HasUUIDContents, RemoteDirectory},
 		file::RemoteFile,
 	},
 	io::fs_tree::{WalkError, entry::remote::RemoteFSObjectEntry},
@@ -92,7 +92,7 @@ impl Iterator for WalkDirFromHashMap {
 
 pub(crate) async fn build_fs_tree_from_remote_iterator<F>(
 	client: std::sync::Arc<crate::auth::Client>,
-	dir: UnsharedDirectoryType<'_>,
+	dir: DirectoryTypeWithShareInfo<'_>,
 	error_callback: &mut impl FnMut(Vec<Error>),
 	progress_callback: &mut impl FnMut(u64, u64, u64),
 	list_dir_progress_callback: &F,

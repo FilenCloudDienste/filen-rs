@@ -66,7 +66,7 @@ impl From<RemoteDirectory> for DirectoryType<'static> {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, CowHelpers)]
 pub enum DirectoryTypeWithShareInfo<'a> {
 	Root(Cow<'a, RootDirectory>),
 	SharedDir(Cow<'a, SharedDirectory>),
@@ -103,6 +103,26 @@ impl<'a> From<&'a DirectoryTypeWithShareInfo<'_>> for DirectoryTypeWithShareInfo
 			DirectoryTypeWithShareInfo::Dir(dir) => {
 				DirectoryTypeWithShareInfo::Dir(Cow::Borrowed(dir))
 			}
+		}
+	}
+}
+
+impl HasContents for DirectoryTypeWithShareInfo<'_> {
+	fn uuid_as_parent(&self) -> filen_types::fs::ParentUuid {
+		match self {
+			DirectoryTypeWithShareInfo::Root(dir) => dir.uuid_as_parent(),
+			DirectoryTypeWithShareInfo::SharedDir(dir) => dir.dir.uuid_as_parent(),
+			DirectoryTypeWithShareInfo::Dir(dir) => dir.uuid_as_parent(),
+		}
+	}
+}
+
+impl HasUUID for DirectoryTypeWithShareInfo<'_> {
+	fn uuid(&self) -> &UuidStr {
+		match self {
+			DirectoryTypeWithShareInfo::Root(dir) => dir.uuid(),
+			DirectoryTypeWithShareInfo::SharedDir(dir) => dir.dir.uuid(),
+			DirectoryTypeWithShareInfo::Dir(dir) => dir.uuid(),
 		}
 	}
 }

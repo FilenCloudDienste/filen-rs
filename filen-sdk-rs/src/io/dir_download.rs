@@ -11,7 +11,7 @@ use crate::{
 	error::{ErrorExt, ResultExt},
 	fs::{
 		NonRootFSObject,
-		dir::{RemoteDirectory, UnsharedDirectoryType},
+		dir::{DirectoryTypeWithShareInfo, RemoteDirectory},
 		file::RemoteFile,
 	},
 	io::meta_ext::DirTimesExt,
@@ -32,7 +32,7 @@ impl Client {
 		),
 		path: PathBuf,
 		tree: super::fs_tree::FSTree<RemoteDirectory, RemoteFile>,
-		target_folder: UnsharedDirectoryType<'static>,
+		target_folder: DirectoryTypeWithShareInfo<'static>,
 	) -> Result<(), Error> {
 		let (entry_complete_sender, mut entry_complete_receiver) =
 			tokio::sync::mpsc::channel::<EntryResult>(16);
@@ -126,16 +126,20 @@ impl Client {
 		tree: super::fs_tree::FSTree<RemoteDirectory, RemoteFile>,
 		entry_complete_sender: tokio::sync::mpsc::Sender<EntryResult>,
 		file_download_request_sender: tokio::sync::mpsc::Sender<(RemoteFile, PathBuf)>,
-		target_folder: UnsharedDirectoryType<'static>,
+		target_folder: DirectoryTypeWithShareInfo<'static>,
 		root_path: PathBuf,
 	) -> tokio::task::JoinHandle<Result<(), Error>> {
 		tokio::task::spawn_blocking(move || {
 			match (std::fs::create_dir_all(&root_path), &target_folder) {
-				(Ok(()), UnsharedDirectoryType::Dir(target_folder)) => target_folder
+				(Ok(()), DirectoryTypeWithShareInfo::Dir(target_folder)) => target_folder
+					.blocking_set_dir_times(&root_path)
+					.context("couldn't set directory times for newly created root directory")?,
+				(Ok(()), DirectoryTypeWithShareInfo::SharedDir(shared_folder)) => shared_folder
+					.dir
 					.blocking_set_dir_times(&root_path)
 					.context("couldn't set directory times for newly created root directory")?,
 				(Err(e), _) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-					if let UnsharedDirectoryType::Dir(target_folder) = target_folder {
+					if let DirectoryTypeWithShareInfo::Dir(target_folder) = target_folder {
 						target_folder
 							.blocking_set_dir_times(&root_path)
 							.context("couldn't set directory times for root directory")?

@@ -5,7 +5,7 @@ use crate::{
 	auth::JsClient,
 	error::FilenSDKError,
 	io::RemoteDirectory,
-	js::{Dir, DirEnum, File, NonRootItemTagged},
+	js::{AnyDirEnumWithShareInfo, Dir, File, NonRootItemTagged},
 	runtime::do_on_commander,
 };
 
@@ -266,7 +266,7 @@ impl JsClient {
 		&self,
 		dir_path: String,
 		callback: Arc<dyn JsDirDownloadCallback>,
-		target: DirEnum,
+		target: AnyDirEnumWithShareInfo,
 	) -> Result<(), Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
