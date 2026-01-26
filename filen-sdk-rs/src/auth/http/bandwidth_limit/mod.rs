@@ -1,15 +1,7 @@
 use std::num::NonZeroU32;
 
-use governor::{
-	RateLimiter,
-	clock::DefaultClock,
-	state::{InMemoryState, NotKeyed},
-};
-
 mod download;
 mod upload;
-
-pub(crate) type BandwidthLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 const BANDWIDTH_CHUNK_SIZE_KB: NonZeroU32 = NonZeroU32::new(16).unwrap();
 const BANDWIDTH_CHUNK_USIZE_KB: usize = BANDWIDTH_CHUNK_SIZE_KB.get() as usize;

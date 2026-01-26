@@ -1,19 +1,21 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::num::NonZeroU32;
 
 use bytes::Bytes;
 use futures::Stream;
-use governor::{Quota, RateLimiter};
 use reqwest::Body;
 use tower::{Layer, Service};
 
 use crate::{Error, ErrorKind};
 
-use super::{super::Request, BYTES_PER_KILOBYTE_USIZE, BandwidthLimiter};
+use super::{
+	super::{Request, limit::RateLimiter},
+	BYTES_PER_KILOBYTE_USIZE,
+};
 
 const BANDWIDTH_CHUNK_SIZE_KB: NonZeroU32 = NonZeroU32::new(16).unwrap();
 const BANDWIDTH_CHUNK_USIZE_KB: usize = BANDWIDTH_CHUNK_SIZE_KB.get() as usize;
 
-pub(crate) fn new_upload_bandwidth_limiter(kbps: NonZeroU32) -> Result<BandwidthLimiter, Error> {
+pub(crate) fn new_upload_bandwidth_limiter(kbps: NonZeroU32) -> Result<RateLimiter, Error> {
 	if kbps < BANDWIDTH_CHUNK_SIZE_KB {
 		return Err(Error::custom(
 			ErrorKind::InvalidState,
@@ -24,12 +26,12 @@ pub(crate) fn new_upload_bandwidth_limiter(kbps: NonZeroU32) -> Result<Bandwidth
 		));
 	}
 
-	Ok(RateLimiter::direct(Quota::per_second(kbps)))
+	Ok(RateLimiter::new(kbps))
 }
 
 #[derive(Clone)]
 pub(crate) struct UploadBandwidthLimiterLayer<'a> {
-	limiter: Option<&'a Arc<BandwidthLimiter>>,
+	limiter: &'a RateLimiter,
 }
 
 impl<'a, S> Layer<S> for UploadBandwidthLimiterLayer<'a> {
@@ -44,7 +46,7 @@ impl<'a, S> Layer<S> for UploadBandwidthLimiterLayer<'a> {
 }
 
 impl<'a> UploadBandwidthLimiterLayer<'a> {
-	pub(crate) fn new(limiter: Option<&'a Arc<BandwidthLimiter>>) -> Self {
+	pub(crate) fn new(limiter: &'a RateLimiter) -> Self {
 		Self { limiter }
 	}
 }
@@ -52,7 +54,7 @@ impl<'a> UploadBandwidthLimiterLayer<'a> {
 #[derive(Clone)]
 pub(crate) struct UploadBandwidthLimiterService<'a, S> {
 	inner: S,
-	limiter: Option<&'a Arc<BandwidthLimiter>>,
+	limiter: &'a RateLimiter,
 }
 
 impl<'a, S> Service<Request<bytes::Bytes, reqwest::Url>> for UploadBandwidthLimiterService<'a, S>
@@ -71,15 +73,12 @@ where
 	}
 
 	fn call(&mut self, req: Request<bytes::Bytes, reqwest::Url>) -> Self::Future {
-		let req = req.into_builder_map_body(|bytes| match self.limiter {
-			Some(limiter) => limit_upload(limiter, bytes),
-			None => bytes.into(),
-		});
+		let req = req.into_builder_map_body(|bytes| limit_upload(self.limiter, bytes));
 		self.inner.call(req)
 	}
 }
 
-pub fn limit_upload(limiter: &Arc<BandwidthLimiter>, bytes: Bytes) -> Body {
+pub fn limit_upload(limiter: &RateLimiter, bytes: Bytes) -> Body {
 	match make_stream_from_body(bytes, limiter.clone()) {
 		Ok(stream) => Body::wrap_stream(stream),
 		Err(bytes) => Body::from(bytes),
@@ -88,7 +87,7 @@ pub fn limit_upload(limiter: &Arc<BandwidthLimiter>, bytes: Bytes) -> Body {
 
 fn make_stream_from_body(
 	buffer: Bytes,
-	limiter: Arc<BandwidthLimiter>,
+	limiter: RateLimiter,
 ) -> Result<impl Stream<Item = Result<Bytes, std::convert::Infallible>>, Bytes> {
 	if buffer.is_empty() {
 		return Err(buffer);
@@ -104,7 +103,7 @@ fn make_stream_from_body(
 					.min(buffer.len());
 
 				limiter
-					.until_n_ready(chunk_size_kilobytes)
+					.acquire_amount(chunk_size_kilobytes)
 					.await
 					.expect("BANDWIDTH_CHUNK_SIZE should be < BandwidthManager limit");
 

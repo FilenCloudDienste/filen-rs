@@ -1,6 +1,7 @@
 use std::{
 	borrow::Cow,
 	fmt::{Debug, Display},
+	num::NonZeroU32,
 	str::FromStr,
 	sync::{Arc, RwLock, Weak},
 };
@@ -357,16 +358,19 @@ impl Client {
 		)
 		.map_err(ConversionError::from)?;
 
-		let http_client = Arc::new(
-			UnauthClient::new(SharedClientState::new(ClientConfig::default())?).into_authed(
-				Arc::new(RwLock::new(APIKey(Cow::Owned(stringified.api_key)))),
-			),
-		);
-
-		let parallel_requests = stringified
+		let max_parallel_requests = stringified
 			.max_parallel_requests
 			.map(|v| usize::try_from(v).unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS))
 			.unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS);
+
+		let http_client = Arc::new(
+			UnauthClient::new(SharedClientState::new(
+				ClientConfig::default().with_concurrency(max_parallel_requests),
+			)?)
+			.into_authed(Arc::new(RwLock::new(APIKey(Cow::Owned(
+				stringified.api_key,
+			))))),
+		);
 
 		Ok(Client {
 			email: stringified.email,
@@ -385,7 +389,7 @@ impl Client {
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
 			auth_lock: tokio::sync::RwLock::new(None),
-			max_parallel_requests: parallel_requests,
+			max_parallel_requests,
 			memory_semaphore: tokio::sync::Semaphore::new(
 				stringified
 					.max_io_memory_usage
@@ -672,6 +676,23 @@ impl Client {
 			tmp_path: "".to_string(), // ?
 			connect_to_socket: false,
 		}
+	}
+
+	pub async fn set_request_rate_limit(&self, requests_per_second: NonZeroU32) {
+		self.client()
+			.set_request_rate_limit(requests_per_second)
+			.await;
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub async fn set_bandwidth_limits(
+		&self,
+		upload_kbps: Option<NonZeroU32>,
+		download_kbps: Option<NonZeroU32>,
+	) {
+		self.client()
+			.set_bandwidth_limits(upload_kbps, download_kbps)
+			.await;
 	}
 
 	pub async fn generate_2fa_secret(&self) -> Result<TwoFASecret, Error> {

@@ -202,12 +202,10 @@ where
 
 	let (fs_tree, stats, errors) = builder.finalize::<DFSE::CompareStrategy>()?;
 
-	println!("Final walk completed, checking for errors...");
 	if !errors.is_empty() {
 		error_callback(errors);
 	}
 
-	println!("Finalizing FS tree...");
 	Ok((fs_tree, stats))
 }
 

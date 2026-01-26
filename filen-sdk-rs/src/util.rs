@@ -46,6 +46,17 @@ impl PathIteratorExt for str {
 	}
 }
 
+pub async fn sleep(until: std::time::Duration) {
+	#[cfg(not(target_family = "wasm"))]
+	{
+		tokio::time::sleep(until).await;
+	}
+	#[cfg(target_family = "wasm")]
+	{
+		wasmtimer::tokio::sleep(until).await;
+	}
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub type MaybeSendBoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 #[cfg(target_family = "wasm")]

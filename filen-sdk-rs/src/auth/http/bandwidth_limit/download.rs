@@ -1,19 +1,20 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::num::NonZeroU32;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, future::BoxFuture};
-use governor::{Quota, RateLimiter};
 use tower::{Layer, Service};
 
-use super::{BYTES_PER_KILOBYTE, BYTES_PER_KILOBYTE_USIZE, BandwidthLimiter};
+use crate::auth::http::limit::RateLimiter;
 
-pub(crate) fn new_download_bandwidth_limiter(kbps: NonZeroU32) -> BandwidthLimiter {
-	RateLimiter::direct(Quota::per_second(kbps))
+use super::{BYTES_PER_KILOBYTE, BYTES_PER_KILOBYTE_USIZE};
+
+pub(crate) fn new_download_bandwidth_limiter(kbps: NonZeroU32) -> RateLimiter {
+	RateLimiter::new(kbps)
 }
 
 #[derive(Clone)]
 pub(crate) struct DownloadBandwidthLimiterLayer {
-	limiter: Option<Arc<BandwidthLimiter>>,
+	pub(crate) limiter: RateLimiter,
 }
 
 impl<S> Layer<S> for DownloadBandwidthLimiterLayer {
@@ -28,7 +29,7 @@ impl<S> Layer<S> for DownloadBandwidthLimiterLayer {
 }
 
 impl DownloadBandwidthLimiterLayer {
-	pub(crate) fn new(limiter: Option<Arc<BandwidthLimiter>>) -> Self {
+	pub(crate) fn new(limiter: RateLimiter) -> Self {
 		Self { limiter }
 	}
 }
@@ -36,7 +37,7 @@ impl DownloadBandwidthLimiterLayer {
 #[derive(Clone)]
 pub(crate) struct DownloadBandwidthLimiterService<S> {
 	inner: S,
-	limiter: Option<Arc<BandwidthLimiter>>,
+	limiter: RateLimiter,
 }
 
 impl<S, Req> Service<Req> for DownloadBandwidthLimiterService<S>
@@ -62,23 +63,17 @@ where
 		let limiter = self.limiter.clone();
 		Box::pin(async move {
 			let response = fut.await?;
-			match limiter {
-				Some(limiter) => Ok(map_download_response(limiter, response)),
-				None => Ok(response),
-			}
+			Ok(map_download_response(limiter, response))
 		})
 	}
 }
 
-fn map_download_response(
-	limiter: Arc<BandwidthLimiter>,
-	response: reqwest::Response,
-) -> reqwest::Response {
+fn map_download_response(limiter: RateLimiter, response: reqwest::Response) -> reqwest::Response {
 	limit_download_response(limiter, response)
 }
 
 pub fn limit_download_response(
-	limiter: Arc<BandwidthLimiter>,
+	limiter: RateLimiter,
 	response: reqwest::Response,
 ) -> reqwest::Response {
 	let http_response: http::Response<reqwest::Body> = response.into();
@@ -95,7 +90,7 @@ pub fn limit_download_response(
 
 fn limit_response_stream<S, E>(
 	stream: S,
-	limiter: Arc<BandwidthLimiter>,
+	limiter: RateLimiter,
 ) -> impl Stream<Item = Result<Bytes, E>>
 where
 	S: Stream<Item = Result<Bytes, E>>,
@@ -107,13 +102,13 @@ where
 			match item {
 				Ok(mut bytes) => {
 					while let Some(chunk_size)= NonZeroU32::new(bytes.len().min(u32::MAX as usize) as u32){
-						match limiter.until_n_ready(chunk_size.div_ceil(BYTES_PER_KILOBYTE)).await {
+						match limiter.acquire_amount(chunk_size.div_ceil(BYTES_PER_KILOBYTE)).await {
 							Ok(()) => {
 								yield Ok(bytes);
 								break;
 							},
 							Err(capacity_err) => {
-								limiter.until_n_ready(NonZeroU32::new(capacity_err.0).expect("minimum allowed capacity should be non-zero")).await.expect("cannot be more than the error capacity");
+								limiter.acquire_amount(NonZeroU32::new(capacity_err.0).expect("minimum allowed capacity should be non-zero")).await.expect("cannot be more than the error capacity");
 								let bytes_capacity = (capacity_err.0 as usize) * BYTES_PER_KILOBYTE_USIZE;
 								let bytes = bytes.split_to(bytes_capacity);
 								yield Ok(bytes);

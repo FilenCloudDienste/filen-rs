@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use serde::Deserialize;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -151,6 +151,36 @@ impl JsClient {
 	pub async fn disable_2fa(&self, two_factor_code: String) -> Result<(), Error> {
 		let this = self.inner();
 		do_on_commander(move || async move { this.disable_2fa(&two_factor_code).await }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "setRequestRateLimit")
+	)]
+	pub async fn set_request_rate_limit(&self, requests_per_sec: u32) -> Result<(), Error> {
+		let this = self.inner();
+
+		let requests_per_sec = NonZeroU32::new(requests_per_sec).ok_or_else(|| {
+			Error::custom(
+				crate::ErrorKind::InvalidState,
+				"requests per second rate limit needs to be > 0",
+			)
+		})?;
+		do_on_commander(move || async move { this.set_request_rate_limit(requests_per_sec).await })
+			.await;
+		Ok(())
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub async fn set_bandwidth_limits(&self, upload_kbps: u32, download_kbps: u32) {
+		let upload_kbps = NonZeroU32::new(upload_kbps);
+		let download_kbps = NonZeroU32::new(download_kbps);
+
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.set_bandwidth_limits(upload_kbps, download_kbps).await
+		})
+		.await;
 	}
 }
 

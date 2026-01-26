@@ -21,8 +21,8 @@ use crate::{
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use bandwidth_limit::{
-	BandwidthLimiter, DownloadBandwidthLimiterLayer, UploadBandwidthLimiterLayer,
-	new_download_bandwidth_limiter, new_upload_bandwidth_limiter,
+	DownloadBandwidthLimiterLayer, UploadBandwidthLimiterLayer, new_download_bandwidth_limiter,
+	new_upload_bandwidth_limiter,
 };
 
 mod auth;
@@ -61,6 +61,44 @@ pub(crate) struct ClientConfig {
 	log_level: log::LevelFilter,
 }
 
+impl ClientConfig {
+	pub(crate) fn with_concurrency(mut self, concurrency: usize) -> Self {
+		self.concurrency = concurrency;
+		self
+	}
+
+	pub(crate) fn with_retry(mut self, retry_budget: TpsBudget) -> Self {
+		self.retry_budget = retry_budget;
+		self
+	}
+
+	pub(crate) fn with_rate(mut self, rate_limit_per_sec: NonZeroU32) -> Self {
+		self.rate_limit_per_sec = rate_limit_per_sec;
+		self
+	}
+
+	pub(crate) fn with_upload(
+		mut self,
+		upload_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
+	) -> Self {
+		self.upload_bandwidth_kilobytes_per_sec = upload_bandwidth_kilobytes_per_sec;
+		self
+	}
+
+	pub(crate) fn with_download(
+		mut self,
+		download_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
+	) -> Self {
+		self.download_bandwidth_kilobytes_per_sec = download_bandwidth_kilobytes_per_sec;
+		self
+	}
+
+	pub(crate) fn with_log_level(mut self, log_level: log::LevelFilter) -> Self {
+		self.log_level = log_level;
+		self
+	}
+}
+
 impl Default for ClientConfig {
 	fn default() -> Self {
 		Self {
@@ -80,7 +118,7 @@ pub(crate) struct SharedClientState {
 	retry: retry::RetryMapLayer,
 	rate_limiter: limit::GlobalRateLimitLayer,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	upload_limiter: Option<Arc<BandwidthLimiter>>,
+	upload_limiter: limit::RateLimiter,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	download_limiter: DownloadBandwidthLimiterLayer,
 	log_level: log::LevelFilter,
@@ -88,25 +126,31 @@ pub(crate) struct SharedClientState {
 
 impl SharedClientState {
 	pub(crate) fn new(config: ClientConfig) -> Result<Self, Error> {
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		let upload_limiter = {
+			if let Some(upload_kbps) = config.upload_bandwidth_kilobytes_per_sec {
+				new_upload_bandwidth_limiter(upload_kbps)?
+			} else {
+				limit::RateLimiter::default()
+			}
+		};
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		let download_limiter = {
+			if let Some(download_kbps) = config.download_bandwidth_kilobytes_per_sec {
+				DownloadBandwidthLimiterLayer::new(new_download_bandwidth_limiter(download_kbps))
+			} else {
+				DownloadBandwidthLimiterLayer::new(limit::RateLimiter::default())
+			}
+		};
+
 		Ok(Self {
 			concurrency: GlobalConcurrencyLimitLayer::new(config.concurrency),
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
-			rate_limiter: limit::GlobalRateLimitLayer::new(limit::RateConfig::new(
-				config.rate_limit_per_sec,
-				std::time::Duration::from_secs(1),
-			))
-			.expect("1s is a valid duration"),
+			rate_limiter: limit::GlobalRateLimitLayer::new(config.rate_limit_per_sec),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			upload_limiter: config
-				.upload_bandwidth_kilobytes_per_sec
-				.map(|kbps| Ok::<_, Error>(Arc::new(new_upload_bandwidth_limiter(kbps)?)))
-				.transpose()?,
+			upload_limiter,
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			download_limiter: DownloadBandwidthLimiterLayer::new(
-				config
-					.download_bandwidth_kilobytes_per_sec
-					.map(|kbps| Arc::new(new_download_bandwidth_limiter(kbps))),
-			),
+			download_limiter,
 			log_level: config.log_level,
 		})
 	}
@@ -178,9 +222,7 @@ impl UnauthClient {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{
 				builder
-					.layer(UploadBandwidthLimiterLayer::new(
-						self.state.upload_limiter.as_ref(),
-					)) // required to map Request to RequestBuilder
+					.layer(UploadBandwidthLimiterLayer::new(&self.state.upload_limiter)) // required to map Request to RequestBuilder
 					.layer(self.state.download_limiter.clone()) // optional
 			}
 			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -222,9 +264,7 @@ impl UnauthClient {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{
 				builder
-					.layer(UploadBandwidthLimiterLayer::new(
-						self.state.upload_limiter.as_ref(),
-					)) // required to map Request to RequestBuilder
+					.layer(UploadBandwidthLimiterLayer::new(&self.state.upload_limiter)) // required to map Request to RequestBuilder
 					.layer(self.state.download_limiter.clone()) // optional
 			}
 			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -330,6 +370,34 @@ impl AuthClient {
 		&self.api_key
 	}
 
+	pub(crate) async fn set_request_rate_limit(&self, rate_limit_per_second: NonZeroU32) {
+		self.unauthed
+			.state
+			.rate_limiter
+			.limiter
+			.change_rate_per_sec(Some(rate_limit_per_second))
+			.await;
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	pub(crate) async fn set_bandwidth_limits(
+		&self,
+		upload_kbps: Option<NonZeroU32>,
+		download_kbps: Option<NonZeroU32>,
+	) {
+		futures::join!(
+			self.unauthed
+				.state
+				.upload_limiter
+				.change_rate_per_sec(upload_kbps),
+			self.unauthed
+				.state
+				.download_limiter
+				.limiter
+				.change_rate_per_sec(download_kbps)
+		);
+	}
+
 	async fn inner_post<Req, Res>(
 		&self,
 		request: Request<(), String>,
@@ -361,7 +429,7 @@ impl AuthClient {
 			{
 				builder
 					.layer(UploadBandwidthLimiterLayer::new(
-						self.unauthed.state.upload_limiter.as_ref(),
+						&self.unauthed.state.upload_limiter,
 					)) // required to map Request to RequestBuilder
 					.layer(self.unauthed.state.download_limiter.clone()) // optional
 			}
@@ -418,7 +486,7 @@ impl AuthClient {
 			{
 				builder
 					.layer(UploadBandwidthLimiterLayer::new(
-						self.unauthed.state.upload_limiter.as_ref(),
+						&self.unauthed.state.upload_limiter,
 					)) // required to map Request to RequestBuilder
 					.layer(self.unauthed.state.download_limiter.clone()) // optional
 			}
@@ -514,7 +582,7 @@ impl AuthClient {
 			{
 				builder
 					.layer(UploadBandwidthLimiterLayer::new(
-						self.unauthed.state.upload_limiter.as_ref(),
+						&self.unauthed.state.upload_limiter,
 					)) // required to map Request to RequestBuilder
 					.layer(self.unauthed.state.download_limiter.clone()) // optional
 			}
