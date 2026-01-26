@@ -5,6 +5,20 @@ use rand::TryRngCore;
 use test_utils::authenticated_cli_with_args;
 
 #[shared_test_runtime]
+async fn cmd_cd() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let test_dir = &resources.dir;
+
+	// cd into existing directory
+	authenticated_cli_with_args!("cd", test_dir.name().unwrap()).success();
+
+	// try to cd into non-existing directory
+	authenticated_cli_with_args!("cd", "/non_existing_directory")
+		.failure()
+		.stdout(predicates::str::contains("No such directory"));
+}
+
+#[shared_test_runtime]
 async fn cmd_ls() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

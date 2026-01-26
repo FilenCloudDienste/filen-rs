@@ -169,7 +169,7 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::Cd { directory } => {
-			let working_path = working_path.navigate(&directory);
+			let working_path = cd(ui, client, working_path, &directory).await?;
 			Some(CommandResult {
 				working_path: Some(working_path),
 				..Default::default()
@@ -348,6 +348,27 @@ pub(crate) async fn execute_command(
 		}),
 	};
 	Ok(result.unwrap_or_default())
+}
+
+async fn cd(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	directory: &str,
+) -> Result<RemotePath> {
+	let client = client.get(ui).await?;
+	let directory = working_path.navigate(directory);
+	match client
+		.find_item_at_path(&directory.0)
+		.await
+		.context("Failed to find directory")?
+	{
+		Some(dir) => match dir {
+			FSObject::Dir(_) | FSObject::Root(_) | FSObject::RootWithMeta(_) => Ok(directory),
+			_ => Err(UI::failure(&format!("Not a directory: {}", directory.0))),
+		},
+		None => Err(UI::failure(&format!("No such directory: {}", directory.0))),
+	}
 }
 
 async fn list_directory(
