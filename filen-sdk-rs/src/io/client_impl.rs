@@ -5,33 +5,28 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use filen_types::crypto::Blake3Hash;
 use filen_types::fs::UuidStr;
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_util::compat::TokioAsyncReadCompatExt;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use tokio_util::compat::TokioAsyncWriteCompatExt;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{
 	Error,
 	auth::Client,
 	consts::CHUNK_SIZE_U64,
-	error::ErrorExt,
-	fs::{
-		dir::HasUUIDContents,
-		file::{
-			BaseFile, FileBuilder, RemoteFile,
-			traits::File,
-			write::{DummyFuture, FileWriter},
-		},
+	fs::file::{
+		BaseFile, FileBuilder, RemoteFile,
+		traits::File,
+		write::{DummyFuture, FileWriter},
 	},
 	util::{MaybeSend, MaybeSendCallback},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::{
 	ErrorKind,
-	fs::dir::UnsharedDirectoryType,
+	error::ErrorExt,
+	fs::dir::{HasUUIDContents, UnsharedDirectoryType},
 	io::{FilenMetaExt, dir_download::DirDownloadCallback, meta_ext::FileTimesExt},
 };
 
