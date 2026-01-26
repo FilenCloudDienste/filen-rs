@@ -16,6 +16,8 @@ pub use crate::fs::{
 	file::{RemoteFile, traits::HasFileInfo},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use dir_download::DirDownloadCallback;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use dir_upload::DirUploadCallback;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use meta_ext::FilenMetaExt;

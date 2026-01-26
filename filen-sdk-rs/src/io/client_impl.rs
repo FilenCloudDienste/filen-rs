@@ -394,8 +394,8 @@ impl Client {
 	pub async fn upload_file_from_path(
 		&self,
 		parent: &impl HasUUIDContents,
-		callback: Option<MaybeSendCallback<'_, u64>>,
 		path: PathBuf,
+		callback: Option<MaybeSendCallback<'_, u64>>,
 	) -> Result<(RemoteFile, std::fs::File), Error> {
 		self.upload_file_from_path_with_info(UploadInfo::Parent(parent.uuid()), path, callback)
 			.await

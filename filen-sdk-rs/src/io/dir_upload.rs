@@ -247,10 +247,10 @@ impl Client {
 	) -> Result<RemoteFile, Error> {
 		self.upload_file_from_path(
 			parent,
+			path.to_owned(),
 			Some(Arc::new(|bytes_downloaded| {
 				uploaded_bytes.fetch_add(bytes_downloaded, Ordering::Relaxed);
 			})),
-			path.to_owned(),
 		)
 		.await
 		.context("uploading file from path")
