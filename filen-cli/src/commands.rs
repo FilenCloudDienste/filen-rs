@@ -123,6 +123,12 @@ pub(crate) enum Commands {
 	Mount {
 		/// Where to mount the network drive (default: system default)
 		mount_point: Option<String>,
+		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: calculated from available disk space)
+		#[arg(long)]
+		cache_size: Option<String>,
+		/// The number of parallel transfers
+		#[arg(long)]
+		transfers: Option<usize>,
 	},
 	/// Runs a WebDAV, FTP, SFTP or HTTP server exposing your Filen drive
 	Serve {
@@ -145,6 +151,12 @@ pub(crate) enum Commands {
 		/// The server is read-only
 		#[arg(long)]
 		read_only: bool,
+		/// The maximum cache size (e.g. "500Mi", "10Gi") (default: calculated from available disk space)
+		#[arg(long)]
+		cache_size: Option<String>,
+		/// The number of parallel transfers
+		#[arg(long)]
+		transfers: Option<usize>,
 	},
 	// todo: s3 server
 	/// Exports your user API key (for use with non-managed Rclone)
@@ -274,8 +286,12 @@ pub(crate) async fn execute_command(
 			rclone::execute_rclone(config, ui, client, cmd).await?;
 			None
 		}
-		Commands::Mount { mount_point } => {
-			rclone::mount(config, ui, client, mount_point).await?;
+		Commands::Mount {
+			mount_point,
+			cache_size,
+			transfers,
+		} => {
+			rclone::mount(config, ui, client, mount_point, cache_size, transfers).await?;
 			None
 		}
 		Commands::Serve {
@@ -285,6 +301,8 @@ pub(crate) async fn execute_command(
 			user,
 			password,
 			read_only,
+			cache_size,
+			transfers,
 		} => {
 			let display_server_type = match server.as_str() {
 				"webdav" => "WebDAV",
@@ -311,6 +329,8 @@ pub(crate) async fn execute_command(
 					user,
 					password,
 					read_only,
+					cache_size,
+					transfers,
 				},
 			)
 			.await?;
@@ -904,6 +924,8 @@ mod rclone {
 		ui: &mut UI,
 		client: &mut LazyClient,
 		mount_point: Option<String>,
+		cache_size: Option<String>,
+		transfers: Option<usize>,
 	) -> Result<()> {
 		let client = client.get(ui).await?;
 		let config_dir = config.config_dir.join("rclone");
@@ -913,6 +935,8 @@ mod rclone {
 			&config_dir,
 			mount_point.as_deref(),
 			false,
+			cache_size,
+			transfers,
 		)
 		.await
 		.context("Failed to mount network drive")?;

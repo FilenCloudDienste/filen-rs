@@ -1,10 +1,9 @@
 use std::{borrow::Cow, path::Path, process::ExitStatus};
-use sysinfo::Disks;
 use tokio::{fs, process::Child};
 
 use anyhow::{Context, Result};
 use filen_sdk_rs::auth::Client;
-use log::{debug, trace};
+use log::trace;
 
 use crate::{
 	rclone_installation::RcloneInstallation,
@@ -27,46 +26,17 @@ impl NetworkDrive {
 		config_dir: &Path,
 		mount_point: Option<&str>,
 		read_only: bool,
+		cache_size: Option<String>,
+		transfers: Option<usize>,
 	) -> Result<NetworkDrive> {
 		let rclone = RcloneInstallation::initialize(client, config_dir).await?;
 		let mount_point = resolve_mount_point(mount_point).await?;
-		let cache_path = config_dir.join("network-drive-rclone/cache");
-
-		// calculate cache size from available disk space
-		let available_disk_space = get_available_disk_space(&cache_path)?;
-		let os_disk_buffer: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
-		let cache_size = match available_disk_space.checked_sub(os_disk_buffer) {
-			Some(size) => size,
-			None => available_disk_space,
-		};
-
-		// stringify args
-		let cache_path = cache_path
-			.to_str()
-			.ok_or(anyhow::anyhow!("Failed to format cache path"))?;
-		let cache_size_formatted = format!("{}Gi", cache_size);
 
 		// construct args
 		let mut args = vec![
 			"mount",
 			"filen:",
 			&mount_point,
-			"--vfs-cache-mode",
-			"full",
-			"--cache-dir",
-			cache_path,
-			"--vfs-cache-max-size",
-			cache_size_formatted.as_str(),
-			"--vfs-cache-min-free-space",
-			"5Gi",
-			"--vfs-cache-max-age",
-			"720h",
-			"--vfs-cache-poll-interval",
-			"1m",
-			"--dir-cache-time",
-			"3s",
-			"--cache-info-age",
-			"5s",
 			"--no-gzip-encoding",
 			"--use-mmap",
 			"--disable-http2",
@@ -90,9 +60,21 @@ impl NetworkDrive {
 			"--devname",
 			"Filen",
 		];
+
 		if read_only {
 			args.push("--read-only");
 		}
+
+		let cache_args = RcloneInstallation::construct_cache_args(config_dir, cache_size)?;
+		args.extend(cache_args.split(' '));
+
+		let transfers_str;
+		if let Some(t) = transfers.map(|t| t.to_string()) {
+			transfers_str = t;
+			args.push("--transfers");
+			args.push(&transfers_str);
+		}
+
 		let log_file_path: Option<&Path> = None; // todo: add option for log file
 		if let Some(log_file_path) = log_file_path {
 			args.push("--log-file");
@@ -135,10 +117,6 @@ impl NetworkDrive {
 			}
 		}
 
-		debug!(
-			"Starting Rclone mount process with args: {}",
-			args.join(" ")
-		);
 		let (process, api) = rclone
 			.execute_in_background(&args)
 			.await
@@ -210,20 +188,6 @@ pub async fn get_available_drive_letters() -> Result<Vec<String>> {
 		}
 	}
 	Ok(available_letters)
-}
-
-fn get_available_disk_space(path: &Path) -> Result<u64> {
-	Disks::new_with_refreshed_list()
-		.list()
-		.iter()
-		.find(|disk| path.starts_with(disk.mount_point()))
-		.map(|disk| disk.available_space())
-		.ok_or_else(|| {
-			anyhow::anyhow!(
-				"Failed to get available disk space for path: {}",
-				path.display()
-			)
-		})
 }
 
 #[derive(PartialEq)]

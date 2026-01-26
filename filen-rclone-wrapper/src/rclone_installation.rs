@@ -12,6 +12,7 @@ use std::{
 	path::{Path, PathBuf},
 	process::{ExitStatus, Stdio},
 };
+use sysinfo::Disks;
 use tokio::{
 	fs,
 	io::{AsyncBufReadExt as _, BufReader},
@@ -45,6 +46,7 @@ impl RcloneInstallation {
 	}
 
 	pub async fn execute(&self, args: &[&str]) -> Result<ExitStatus> {
+		debug!("Executing rclone with args: {}", args.join(" "));
 		let status = self
 			.configured_rclone(args)
 			.spawn()
@@ -64,6 +66,11 @@ impl RcloneInstallation {
 	) -> Result<(Child, RcloneApiClient)> {
 		let rc_port = free_local_ipv4_port()
 			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
+		debug!(
+			"Executing rclone with args: {} --rc --rc-no-auth --rc-addr 127.0.0.1:{}",
+			args.join(" "),
+			rc_port
+		);
 		let mut process = self
 			.configured_rclone(args)
 			.args([
@@ -102,6 +109,32 @@ impl RcloneInstallation {
 		cmd.args(["--config", self.rclone_config_path.to_str().unwrap()])
 			.args(args.iter().filter(|arg| !arg.is_empty()));
 		cmd
+	}
+
+	pub fn construct_cache_args(config_dir: &Path, cache_size: Option<String>) -> Result<String> {
+		let cache_path = config_dir.join("network-drive-rclone/cache");
+
+		let cache_size = match cache_size {
+			Some(cache_size) => cache_size,
+			None => {
+				// calculate cache size from available disk space
+				let available_disk_space = get_available_disk_space(&cache_path)?;
+				let os_disk_buffer: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+				let cache_size = match available_disk_space.checked_sub(os_disk_buffer) {
+					Some(size) => size,
+					None => available_disk_space,
+				};
+				format!("{}B", cache_size)
+			}
+		};
+
+		Ok(format!(
+			"--vfs-cache-mode full --cache-dir {} --vfs-cache-max-size {} --vfs-cache-min-free-space 5Gi --vfs-cache-max-age 720h --vfs-cache-poll-interval 1m --dir-cache-time 3s --cache-info-age 5s",
+			cache_path
+				.to_str()
+				.ok_or(anyhow::anyhow!("Failed to format cache path"))?,
+			cache_size
+		).to_string())
 	}
 }
 
@@ -257,4 +290,18 @@ async fn obscure_password_for_rclone(rclone_binary_path: &Path, password: &str) 
 		.unwrap_or(&obscured_password)
 		.trim();
 	Ok(obscured_password.to_string())
+}
+
+fn get_available_disk_space(path: &Path) -> Result<u64> {
+	Disks::new_with_refreshed_list()
+		.list()
+		.iter()
+		.find(|disk| path.starts_with(disk.mount_point()))
+		.map(|disk| disk.available_space())
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"Failed to get available disk space for path: {}",
+				path.display()
+			)
+		})
 }

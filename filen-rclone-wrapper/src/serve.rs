@@ -16,6 +16,8 @@ pub struct BasicServerOptions {
 	pub user: Option<String>,
 	pub password: Option<String>,
 	pub read_only: bool,
+	pub cache_size: Option<String>,
+	pub transfers: Option<usize>,
 }
 
 pub struct BasicServerDetails {
@@ -50,6 +52,15 @@ pub async fn start_basic_server(
 		&address,
 		if options.read_only { "--read-only" } else { "" },
 	];
+	let cache_args =
+		RcloneInstallation::construct_cache_args(config_dir, options.cache_size.clone())?;
+	args.extend(cache_args.split(' '));
+	let transfers_str;
+	if let Some(t) = options.transfers.map(|t| t.to_string()) {
+		transfers_str = t;
+		args.push("--transfers");
+		args.push(&transfers_str);
+	}
 	let (user, password) = (
 		options.user.clone().unwrap_or("user".to_string()),
 		options.password.clone().unwrap_or("password".to_string()),
