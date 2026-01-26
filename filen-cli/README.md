@@ -17,8 +17,14 @@ For now, syncing, drive mounting, etc. are available through the managed [Filen 
 
 ## Installation and updates
 
-You can download the latest binaries from the [release page](https://github.com/FilenCloudDienste/filen-cli-releases/releases/latest).  
-Docker images are also available as [`filen/cli`](https://hub.docker.com/repository/docker/filen/cli) (you need to specify a version instead of using `:latest`).
+💻 **Linux** and **macOS**: 
+```bash
+curl -sL https://raw.githubusercontent.com/FilenCloudDienste/filen-rs/refs/heads/main/filen-cli/install.sh | bash
+```
+
+💻 **Windows**: Download the latest binaries from the [release page](https://github.com/FilenCloudDienste/filen-cli-releases/releases/latest). 
+
+🐋 Docker images are also available as [`filen/cli`](https://hub.docker.com/repository/docker/filen/cli) (you need to specify a version instead of using `:latest`).
 
 The CLI includes an automatic updater.
 

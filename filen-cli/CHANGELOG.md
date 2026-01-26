@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - rclone commands (`mount`, `serve`) are more customizable via `--cache-size` and `--transfers` flags
   as well as the option to take any number of custom Rclone options
+- convenient install script on Linux and macOS
 
 ## 0.2.4 - 2026-01-20
 
