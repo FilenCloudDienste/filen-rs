@@ -59,9 +59,10 @@ async fn start_rclone_mount() {
 	}
 
 	// mount network drive (is killed on drop)
-	let mut network_drive = NetworkDrive::mount(&client, &config_dir, None, false, None, None)
-		.await
-		.unwrap();
+	let mut network_drive =
+		NetworkDrive::mount(&client, &config_dir, None, false, None, None, vec![])
+			.await
+			.unwrap();
 	info!("Network drive mounted at: {}", network_drive.mount_point);
 
 	let created_dir_path = format!("{}/created_dir", test_root_dir);
