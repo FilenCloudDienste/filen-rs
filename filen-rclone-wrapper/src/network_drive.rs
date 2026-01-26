@@ -28,6 +28,7 @@ impl NetworkDrive {
 		read_only: bool,
 		cache_size: Option<String>,
 		transfers: Option<usize>,
+		rclone_args: Vec<String>,
 	) -> Result<NetworkDrive> {
 		let rclone = RcloneInstallation::initialize(client, config_dir).await?;
 		let mount_point = resolve_mount_point(mount_point).await?;
@@ -116,6 +117,10 @@ impl NetworkDrive {
 			]);
 			}
 		}
+
+		args.extend(rclone_args.iter().map(String::as_str));
+
+		dbg!(args.clone());
 
 		let (process, api) = rclone
 			.execute_in_background(&args)

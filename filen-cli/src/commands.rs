@@ -129,6 +129,8 @@ pub(crate) enum Commands {
 		/// The number of parallel transfers
 		#[arg(long)]
 		transfers: Option<usize>,
+		/// Additional arguments to Rclone
+		rclone_args: Vec<String>,
 	},
 	/// Runs a WebDAV, FTP, SFTP or HTTP server exposing your Filen drive
 	Serve {
@@ -157,6 +159,8 @@ pub(crate) enum Commands {
 		/// The number of parallel transfers
 		#[arg(long)]
 		transfers: Option<usize>,
+		/// Additional arguments to Rclone
+		rclone_args: Vec<String>,
 	},
 	// todo: s3 server
 	/// Exports your user API key (for use with non-managed Rclone)
@@ -290,8 +294,18 @@ pub(crate) async fn execute_command(
 			mount_point,
 			cache_size,
 			transfers,
+			rclone_args,
 		} => {
-			rclone::mount(config, ui, client, mount_point, cache_size, transfers).await?;
+			rclone::mount(
+				config,
+				ui,
+				client,
+				mount_point,
+				cache_size,
+				transfers,
+				rclone_args,
+			)
+			.await?;
 			None
 		}
 		Commands::Serve {
@@ -303,6 +317,7 @@ pub(crate) async fn execute_command(
 			read_only,
 			cache_size,
 			transfers,
+			rclone_args,
 		} => {
 			let display_server_type = match server.as_str() {
 				"webdav" => "WebDAV",
@@ -332,6 +347,7 @@ pub(crate) async fn execute_command(
 					cache_size,
 					transfers,
 				},
+				rclone_args,
 			)
 			.await?;
 			None
@@ -926,6 +942,7 @@ mod rclone {
 		mount_point: Option<String>,
 		cache_size: Option<String>,
 		transfers: Option<usize>,
+		rclone_args: Vec<String>,
 	) -> Result<()> {
 		let client = client.get(ui).await?;
 		let config_dir = config.config_dir.join("rclone");
@@ -937,13 +954,14 @@ mod rclone {
 			false,
 			cache_size,
 			transfers,
+			rclone_args,
 		)
 		.await
-		.context("Failed to mount network drive")?;
+		.context("Failed to mount network drive (use --verbose for more info)")?;
 		network_drive
 			.wait_until_active()
 			.await
-			.context("Failed to mount network drive")?;
+			.context("Failed to mount network drive (use --verbose for more info)")?;
 		ui.print_success("Mounted network drive (kill the CLI to unmount and exit)");
 		let code = network_drive
 			.process
@@ -966,6 +984,7 @@ mod rclone {
 		server_type: &str,
 		display_server_type: &str,
 		options: BasicServerOptions,
+		rclone_args: Vec<String>,
 	) -> Result<()> {
 		let client = client.get(ui).await?;
 		let config_dir = config.config_dir.join("rclone");
@@ -975,6 +994,7 @@ mod rclone {
 			&config_dir,
 			server_type,
 			options,
+			rclone_args,
 		)
 		.await
 		.with_context(|| format!("Failed to start {} server", display_server_type))?;

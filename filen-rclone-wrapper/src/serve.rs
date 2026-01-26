@@ -34,6 +34,7 @@ pub async fn start_basic_server(
 	config_dir: &Path,
 	server_type: &str,
 	options: BasicServerOptions,
+	rclone_args: Vec<String>,
 ) -> Result<BasicServerDetails> {
 	if !["webdav", "ftp", "sftp", "http", "s3"].contains(&server_type) {
 		return Err(anyhow!("Unsupported server type: {}", server_type));
@@ -71,6 +72,7 @@ pub async fn start_basic_server(
 	} else if options.user.is_some() || options.password.is_some() {
 		args.extend(["--user", &user, "--pass", &password]);
 	}
+	args.extend(rclone_args.iter().map(String::as_str));
 	let (process, _) = RcloneInstallation::initialize(client, config_dir)
 		.await?
 		.execute_in_background(&args)
