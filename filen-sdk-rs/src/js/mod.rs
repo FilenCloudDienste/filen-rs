@@ -1,7 +1,7 @@
 mod dir;
 mod file;
 mod item;
-#[cfg(all(target_family = "wasm", target_os = "unknown",))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 mod managed_futures;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod params;
@@ -19,7 +19,7 @@ mod wasm;
 pub use dir::*;
 pub use file::*;
 pub use item::*;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub use params::*;

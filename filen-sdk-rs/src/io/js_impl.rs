@@ -6,7 +6,6 @@ use crate::{
 	error::FilenSDKError,
 	io::RemoteDirectory,
 	js::{AnyDirEnumWithShareInfo, Dir, File, NonRootItemTagged},
-	runtime::do_on_commander,
 };
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -251,15 +250,17 @@ impl JsClient {
 		dir_path: String,
 		callback: Arc<dyn JsDirUploadCallback>,
 		target: Dir,
+		managed_future: crate::js::ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move {
-			let target = target.into();
-			let dir_path = PathBuf::from(dir_path);
-			this.upload_dir_recursively(dir_path, &callback, &target)
-				.await
-		})
-		.await
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let target = target.into();
+				let dir_path = PathBuf::from(dir_path);
+				this.upload_dir_recursively(dir_path, &callback, &target)
+					.await
+			})
+			.await
 	}
 
 	pub async fn download_dir_recursively(
@@ -267,16 +268,18 @@ impl JsClient {
 		dir_path: String,
 		callback: Arc<dyn JsDirDownloadCallback>,
 		target: AnyDirEnumWithShareInfo,
+		managed_future: crate::js::ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move {
-			let target = target.into();
-			let dir_path = PathBuf::from(dir_path);
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let target = target.into();
+				let dir_path = PathBuf::from(dir_path);
 
-			this.download_dir_recursively(dir_path, &callback, target)
-				.await
-		})
-		.await
+				this.download_dir_recursively(dir_path, &callback, target)
+					.await
+			})
+			.await
 	}
 
 	pub async fn upload_file(
@@ -284,25 +287,27 @@ impl JsClient {
 		parent_dir: Dir,
 		file_path: String,
 		callback: Arc<dyn JsFileUploadCallback>,
+		managed_future: crate::js::ManagedFuture,
 	) -> Result<File, Error> {
 		let this = self.inner();
-		do_on_commander(move || async move {
-			let parent_dir: RemoteDirectory = parent_dir.into();
-			let file_path = PathBuf::from(file_path);
-			this.upload_file_from_path(
-				&parent_dir,
-				file_path,
-				Some(Arc::new(|downloaded_bytes| {
-					let callback = callback.clone();
-					tokio::task::spawn_blocking(move || {
-						JsFileUploadCallback::on_update(callback.as_ref(), downloaded_bytes);
-					});
-				})),
-			)
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let parent_dir: RemoteDirectory = parent_dir.into();
+				let file_path = PathBuf::from(file_path);
+				this.upload_file_from_path(
+					&parent_dir,
+					file_path,
+					Some(Arc::new(|downloaded_bytes| {
+						let callback = callback.clone();
+						tokio::task::spawn_blocking(move || {
+							JsFileUploadCallback::on_update(callback.as_ref(), downloaded_bytes);
+						});
+					})),
+				)
+				.await
+				.map(|(file, _)| File::from(file))
+			})
 			.await
-			.map(|(file, _)| File::from(file))
-		})
-		.await
 	}
 
 	pub async fn download_file(
@@ -310,24 +315,26 @@ impl JsClient {
 		file: File,
 		file_path: String,
 		callback: Arc<dyn JsFileDownloadCallback>,
+		managed_future: crate::js::ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move {
-			let file: crate::io::RemoteFile = file.try_into()?;
-			let target_path = PathBuf::from(file_path);
-			this.download_file_to_path(
-				&file,
-				target_path,
-				Some(Arc::new(|downloaded_bytes| {
-					let callback = callback.clone();
-					tokio::task::spawn_blocking(move || {
-						JsFileDownloadCallback::on_update(callback.as_ref(), downloaded_bytes);
-					});
-				})),
-			)
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let file: crate::io::RemoteFile = file.try_into()?;
+				let target_path = PathBuf::from(file_path);
+				this.download_file_to_path(
+					&file,
+					target_path,
+					Some(Arc::new(|downloaded_bytes| {
+						let callback = callback.clone();
+						tokio::task::spawn_blocking(move || {
+							JsFileDownloadCallback::on_update(callback.as_ref(), downloaded_bytes);
+						});
+					})),
+				)
+				.await
+			})
 			.await
-		})
-		.await
 	}
 }
 
