@@ -168,6 +168,7 @@ wasm-streams = "0.4.2"
 # which meant that wasm_atomic was not being used
 parking_lot = { version = "0.12", features = ["nightly"] }
 wasm-bindgen-rayon = { version = "1.3.0", optional = true }
+futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
 
 # dev-dependencies
 # native (not wasm) only dev-dependencies
