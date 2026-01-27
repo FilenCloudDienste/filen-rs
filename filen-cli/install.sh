@@ -22,6 +22,9 @@ else
     platform=linux
   elif [[ "$(uname -s)" == "Darwin" ]] ; then
     platform=macos
+  else
+    echo -e "${CROSS_MARK} Unsupported operating system: $(uname -s)"
+    exit 1
   fi
 
   # determine glibc vs musl
