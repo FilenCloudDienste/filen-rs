@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
 use dialoguer::console::{self, style};
@@ -280,9 +282,42 @@ impl UI {
 	pub(crate) fn prompt_repl(&mut self, path: &str) -> Result<String> {
 		dialoguer::Input::with_theme(&self.repl_input_theme)
 			.history_with(&mut self.history)
+			.completion_with(&DialoguerCompleter)
 			.with_prompt(path.trim())
 			.interact_text()
 			.context(FAILED_TO_READ_INPUT_PROMPT)
+	}
+
+	// for DialoguerCompleter
+	fn completer(input: &str) -> Result<Option<String>> {
+		let args = shlex::split(input)
+			.context("Invalid quoting")?
+			.iter()
+			.map(|str| str.into())
+			.collect::<Vec<OsString>>();
+		if args.is_empty() {
+			return Ok(None);
+		}
+		let args_index = args.len();
+		match clap_complete::engine::complete(
+			&mut CliArgs::command(),
+			vec!["filen"]
+				.into_iter()
+				.map(OsString::from)
+				.chain(args.clone())
+				.collect(),
+			args_index,
+			std::env::current_dir().ok().as_deref(),
+		) {
+			Ok(candidates) => Ok(candidates.first().and_then(|candidate| {
+				let completion = candidate.get_value().to_string_lossy().to_string();
+				let replace_word = args.last().unwrap();
+				input
+					.strip_suffix(replace_word.to_str().unwrap())
+					.map(|prefix| format!("{}{}", prefix, completion))
+			})),
+			Err(_) => Ok(None),
+		}
 	}
 
 	/// Prompt the user for text input
@@ -400,6 +435,14 @@ pub(crate) fn format_date(date: &chrono::DateTime<chrono::Utc>) -> String {
 
 pub(crate) fn format_size(size: u64) -> String {
 	humansize::format_size(size, humansize::BINARY)
+}
+
+struct DialoguerCompleter;
+
+impl dialoguer::Completion for DialoguerCompleter {
+	fn get(&self, input: &str) -> Option<String> {
+		UI::completer(input).ok().flatten()
+	}
 }
 
 #[cfg(test)]
