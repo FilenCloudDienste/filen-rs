@@ -19,6 +19,7 @@ use serde_json::json;
 use crate::{
 	CliConfig, CommandResult,
 	auth::{self, LazyClient, export_auth_config},
+	custom_arg_values::FilenCompleter,
 	docs::print_in_app_docs,
 	ui::{self, UI},
 	util::RemotePath,
@@ -34,21 +35,25 @@ pub(crate) enum Commands {
 	/// Change the working directory (in REPL)
 	Cd {
 		/// Directory to navigate into (supports "..")
+		#[arg(add = FilenCompleter::directory())]
 		directory: String,
 	},
 	/// List files in a directory
 	Ls {
 		/// Directory to list files in (default: the current working directory)
+		#[arg(add = FilenCompleter::directory())]
 		directory: Option<String>,
 	},
 	/// Print the contents of a file
 	Cat {
 		/// File to print
+		#[arg(add = FilenCompleter::file())]
 		file: String,
 	},
 	/// Print the first lines of a file
 	Head {
 		/// File to print
+		#[arg(add = FilenCompleter::file())]
 		file: String,
 		/// Number of lines to print
 		#[arg(short = 'n', long, default_value_t = 10)]
@@ -57,6 +62,7 @@ pub(crate) enum Commands {
 	/// Print the last lines of a file
 	Tail {
 		/// File to print
+		#[arg(add = FilenCompleter::file())]
 		file: String,
 		/// Number of lines to print
 		#[arg(short = 'n', long, default_value_t = 10)]
@@ -65,11 +71,13 @@ pub(crate) enum Commands {
 	/// Show information about a file, a directory or the Filen drive
 	Stat {
 		/// File or directory to show information about ("/" for the Filen drive)
+		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 	},
 	/// Create a new directory
 	Mkdir {
 		/// Directory to create
+		#[arg(add = FilenCompleter::directory())]
 		directory: String,
 		/// Recursively create parent directories
 		#[arg(short, long)]
@@ -78,6 +86,7 @@ pub(crate) enum Commands {
 	/// Remove a file or directory
 	Rm {
 		/// File or directory to remove
+		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 		/// Permanently delete the file or directory (default: move to trash)
 		#[arg(short, long)]
@@ -86,25 +95,31 @@ pub(crate) enum Commands {
 	/// Move a file or directory
 	Mv {
 		/// Source file or directory
+		#[arg(add = FilenCompleter::file_or_directory())]
 		source: String,
 		/// Destination parent directory
+		#[arg(add = FilenCompleter::directory())]
 		destination: String,
 	},
 	/// Copy a file or directory
 	Cp {
 		/// Source file or directory
+		#[arg(add = FilenCompleter::file_or_directory())]
 		source: String,
 		/// Destination parent directory
+		#[arg(add = FilenCompleter::directory())]
 		destination: String,
 	},
 	/// Favorite a file or directory
 	Favorite {
 		/// File or directory to favorite
+		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 	},
 	/// Unfavorite a file or directory
 	Unfavorite {
 		/// File or directory to unfavorite
+		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 	},
 	/// List trashed items with option to restore or permanently delete them
@@ -140,7 +155,7 @@ pub(crate) enum Commands {
 		#[arg(long = "addr", default_value = ":8080")]
 		address: String,
 		/// Directory that the server exposes (default: the entire Filen drive)
-		#[arg(long)]
+		#[arg(long, add = FilenCompleter::directory())]
 		root: Option<String>,
 		/// Username for authentication to the server (default: no authentication).
 		/// On S3 servers, this is the Access Key ID.

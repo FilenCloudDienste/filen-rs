@@ -22,6 +22,7 @@ use crate::{
 
 mod auth;
 mod commands;
+mod custom_arg_values;
 mod docs;
 mod ui;
 mod updater;
@@ -234,7 +235,7 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		// .. without authentication when called directly (no REPL)
 
 		loop {
-			let line = ui.prompt_repl(&working_path.to_string())?;
+			let line = ui.prompt_repl(client.get_arc().unwrap(), &working_path)?;
 			let line = line.trim();
 			if line.is_empty() {
 				continue;

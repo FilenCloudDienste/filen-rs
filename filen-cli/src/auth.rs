@@ -14,7 +14,10 @@
 //! - if none of these is set, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
 
-use std::path::{Path, PathBuf};
+use std::{
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow};
 use filen_cli::{deserialize_auth_config, serialize_auth_config};
@@ -34,7 +37,7 @@ pub(crate) enum LazyClient {
 		two_factor_code_arg: Option<String>,
 	},
 	Authenticated {
-		client: Box<Client>,
+		client: Arc<Client>,
 	},
 }
 
@@ -76,13 +79,20 @@ impl LazyClient {
 				.await?;
 				ui.set_user(Some(client.email()));
 				*self = Self::Authenticated {
-					client: Box::new(client),
+					client: Arc::new(client),
 				};
 				let Self::Authenticated { client } = self else {
 					unreachable!();
 				};
 				Ok(client)
 			}
+		}
+	}
+
+	pub(crate) fn get_arc(&self) -> Option<Arc<Client>> {
+		match self {
+			Self::Authenticated { client } => Some(client.clone()),
+			Self::Unauthenticated { .. } => None,
 		}
 	}
 }

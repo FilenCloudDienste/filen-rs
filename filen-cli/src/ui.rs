@@ -1,13 +1,14 @@
-use std::ffi::OsString;
+use std::{ffi::OsString, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
 use dialoguer::console::{self, style};
+use filen_sdk_rs::auth::Client;
 use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
 
-use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX};
+use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX, custom_arg_values::FilenCompleter, util::RemotePath};
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -279,17 +280,29 @@ impl UI {
 	// prompt
 
 	/// Prompt the user for input in the REPL (contains some special formatting)
-	pub(crate) fn prompt_repl(&mut self, path: &str) -> Result<String> {
+	pub(crate) fn prompt_repl(
+		&mut self,
+		client: Arc<Client>,
+		working_path: &RemotePath,
+	) -> Result<String> {
 		dialoguer::Input::with_theme(&self.repl_input_theme)
 			.history_with(&mut self.history)
-			.completion_with(&DialoguerCompleter)
-			.with_prompt(path.trim())
+			.completion_with(&DialoguerCompleter {
+				client,
+				working_path,
+			})
+			.with_prompt(working_path.to_string())
 			.interact_text()
 			.context(FAILED_TO_READ_INPUT_PROMPT)
+		// todo: terminal has weird graphical glitches when using the completer
 	}
 
 	// for DialoguerCompleter
-	fn completer(input: &str) -> Result<Option<String>> {
+	fn completer(
+		input: &str,
+		client: Arc<Client>,
+		working_path: &RemotePath,
+	) -> Result<Option<String>> {
 		let args = shlex::split(input)
 			.context("Invalid quoting")?
 			.iter()
@@ -299,8 +312,10 @@ impl UI {
 			return Ok(None);
 		}
 		let args_index = args.len();
+		let mut cli = CliArgs::command();
+		cli = FilenCompleter::initialize_completers_in_command(cli, client, working_path);
 		match clap_complete::engine::complete(
-			&mut CliArgs::command(),
+			&mut cli,
 			vec!["filen"]
 				.into_iter()
 				.map(OsString::from)
@@ -437,11 +452,16 @@ pub(crate) fn format_size(size: u64) -> String {
 	humansize::format_size(size, humansize::BINARY)
 }
 
-struct DialoguerCompleter;
+struct DialoguerCompleter<'a> {
+	client: Arc<Client>,
+	working_path: &'a RemotePath,
+}
 
-impl dialoguer::Completion for DialoguerCompleter {
+impl dialoguer::Completion for DialoguerCompleter<'_> {
 	fn get(&self, input: &str) -> Option<String> {
-		UI::completer(input).ok().flatten()
+		UI::completer(input, self.client.clone(), self.working_path)
+			.ok()
+			.flatten()
 	}
 }
 
