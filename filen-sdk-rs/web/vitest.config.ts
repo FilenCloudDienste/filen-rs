@@ -10,7 +10,7 @@ export default defineConfig({
 			teardownTimeout: 3600_000,
 			browser: {
 				enabled: true,
-				headless: true,
+				headless: false,
 				provider: playwright({
 					actionTimeout: 3600_000
 				}),

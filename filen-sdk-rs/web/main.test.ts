@@ -779,13 +779,10 @@ test("service worker", async () => {
 		throw new Error("Service workers are not supported in this environment")
 	}
 
-	const serviceWorker = await window.navigator.serviceWorker.register(
-		"/sw.js",
-		{
-			scope: "/",
-			type: "classic"
-		}
-	)
+	const serviceWorker = await window.navigator.serviceWorker.register("/sw.js", {
+		scope: "/",
+		type: "classic"
+	})
 
 	await serviceWorker.update()
 
@@ -799,8 +796,8 @@ test("service worker", async () => {
 		}
 
 		await new Promise<void>(resolve => {
-			(async () => {
-				while(!serviceWorker.active?.state || serviceWorker.active.state !== "activated") {
+			;(async () => {
+				while (!serviceWorker.active?.state || serviceWorker.active.state !== "activated") {
 					await new Promise<void>(resolve => setTimeout(resolve, 100))
 				}
 
