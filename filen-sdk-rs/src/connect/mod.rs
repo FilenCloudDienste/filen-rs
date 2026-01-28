@@ -70,6 +70,11 @@ trait MakePasswordSaltAndHash {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi)
+)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(untagged)]
 pub enum PasswordState {
@@ -99,24 +104,127 @@ impl PasswordState {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct FilePublicLink {
 	link_uuid: UuidStr,
-	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string | Uint8Array"))]
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
-	#[serde(with = "serde_bytes")]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "Uint8Array"))]
 	salt: Vec<u8>,
+}
+
+#[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
+impl FilePublicLink {
+	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "password")
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi::method(name = "password"))]
+	pub fn password_cloned(&self) -> PasswordState {
+		self.password.clone()
+	}
+
+	pub fn uuid(&self) -> UuidStr {
+		self.link_uuid
+	}
+
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "setPassword")
+	)]
+	pub fn set_password(&mut self, password: String) {
+		self.password = PasswordState::Known(password);
+	}
+
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "clearPassword")
+	)]
+	pub fn clear_password(&mut self) {
+		self.password = PasswordState::None;
+	}
+
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "setExpiration")
+	)]
+	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
+		self.expiration = expiration;
+	}
+
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "setDownloadable")
+	)]
+	pub fn set_downloadable(&mut self, enable_download: bool) {
+		self.downloadable = enable_download;
+	}
+}
+
+impl FilePublicLink {
+	pub fn password(&self) -> &PasswordState {
+		&self.password
+	}
+}
+
+#[cfg(feature = "uniffi")]
+#[derive(uniffi::Object)]
+pub struct FilePublicLinkU {
+	inner: std::sync::Mutex<FilePublicLink>,
+}
+
+#[cfg(feature = "uniffi")]
+impl From<FilePublicLink> for FilePublicLinkU {
+	fn from(inner: FilePublicLink) -> Self {
+		Self {
+			inner: std::sync::Mutex::new(inner),
+		}
+	}
+}
+
+#[cfg(feature = "uniffi")]
+impl FilePublicLinkU {
+	pub fn uuid(&self) -> UuidStr {
+		self.inner.lock().unwrap_or_else(|e| e.into_inner()).uuid()
+	}
+
+	pub fn password(&self) -> PasswordState {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.password()
+			.clone()
+	}
+
+	pub fn set_password(&self, password: String) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.set_password(password);
+	}
+
+	pub fn clear_password(&mut self) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.clear_password();
+	}
+
+	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.set_expiration(expiration);
+	}
+
+	pub fn set_downloadable(&mut self, enable_download: bool) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.set_downloadable(enable_download);
+	}
 }
 
 impl FilePublicLink {
@@ -128,29 +236,6 @@ impl FilePublicLink {
 			downloadable: true,
 			salt: rand::random::<[u8; 256]>().to_vec(),
 		}
-	}
-
-	pub fn uuid(&self) -> UuidStr {
-		self.link_uuid
-	}
-
-	pub fn set_password(&mut self, password: String) {
-		self.password = PasswordState::Known(password);
-	}
-
-	pub fn clear_password(&mut self) {
-		self.password = PasswordState::None;
-	}
-	pub fn password(&self) -> &PasswordState {
-		&self.password
-	}
-
-	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
-		self.expiration = expiration;
-	}
-
-	pub fn set_downloadable(&mut self, enable_download: bool) {
-		self.downloadable = enable_download;
 	}
 }
 
@@ -164,25 +249,14 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct DirPublicLink {
 	link_uuid: UuidStr,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	link_key: Option<MetaKey>,
-	#[serde(default, skip_serializing_if = "PasswordState::is_none")]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string | Uint8Array"))]
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	enable_download: bool,
-	#[cfg_attr(feature = "wasm-full", tsify(type = "Uint8Array"))]
-	#[serde(with = "serde_bytes", default, skip_serializing_if = "Option::is_none")]
 	salt: Option<Vec<u8>>,
 }
 
@@ -198,10 +272,21 @@ impl DirPublicLink {
 		}
 	}
 
+	pub(crate) fn crypter(&self) -> Option<&impl MetaCrypter> {
+		self.link_key.as_ref()
+	}
+}
+
+#[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
+impl DirPublicLink {
 	pub fn uuid(&self) -> UuidStr {
 		self.link_uuid
 	}
 
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "setPassword")
+	)]
 	pub fn set_password(&mut self, password: String) {
 		match self.salt {
 			Some(ref mut salt) => {
@@ -217,20 +302,87 @@ impl DirPublicLink {
 		self.password = PasswordState::Known(password);
 	}
 
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "clearPassword")
+	)]
 	pub fn clear_password(&mut self) {
 		self.password = PasswordState::None;
 	}
 
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "setExpiration")
+	)]
 	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
 		self.expiration = expiration;
 	}
 
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "setEnableDownload")
+	)]
 	pub fn set_enable_download(&mut self, enable_download: bool) {
 		self.enable_download = enable_download;
 	}
+}
 
-	pub(crate) fn crypter(&self) -> Option<&impl MetaCrypter> {
-		self.link_key.as_ref()
+#[cfg(feature = "uniffi")]
+#[derive(uniffi::Object)]
+pub struct DirPublicLinkU {
+	inner: std::sync::Mutex<DirPublicLink>,
+}
+
+#[cfg(feature = "uniffi")]
+impl From<DirPublicLink> for DirPublicLinkU {
+	fn from(inner: DirPublicLink) -> Self {
+		Self {
+			inner: std::sync::Mutex::new(inner),
+		}
+	}
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl DirPublicLinkU {
+	pub fn uuid(&self) -> UuidStr {
+		self.inner.lock().unwrap_or_else(|e| e.into_inner()).uuid()
+	}
+
+	pub fn password(&self) -> PasswordState {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.password()
+			.clone()
+	}
+
+	pub fn set_password(&self, password: String) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.set_password(password);
+	}
+
+	pub fn clear_password(&self) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.clear_password();
+	}
+
+	pub fn set_expiration(&self, expiration: PublicLinkExpiration) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.set_expiration(expiration);
+	}
+
+	pub fn set_enable_download(&self, enable_download: bool) {
+		self.inner
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.set_enable_download(enable_download);
 	}
 }
 

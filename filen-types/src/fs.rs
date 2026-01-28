@@ -146,7 +146,7 @@ mod uuid {
 	use uuid::{Uuid, fmt::Hyphenated};
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	use wasm_bindgen::{
-		convert::{FromWasmAbi, RefFromWasmAbi},
+		convert::{FromWasmAbi, IntoWasmAbi, RefFromWasmAbi},
 		describe::WasmDescribe,
 	};
 
@@ -184,6 +184,15 @@ mod uuid {
 		unsafe fn from_abi(abi: Self::Abi) -> Self {
 			let s = unsafe { <str>::ref_from_abi(abi) };
 			UuidStr::from_str(&s).expect("Invalid UUID string passed from JS")
+		}
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	impl IntoWasmAbi for UuidStr {
+		type Abi = <String as IntoWasmAbi>::Abi;
+
+		fn into_abi(self) -> Self::Abi {
+			self.as_ref().to_string().into_abi()
 		}
 	}
 

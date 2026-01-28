@@ -7,8 +7,6 @@ use filen_types::fs::UuidStr;
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "uniffi")]
-use crate::fs::dir::js_impl::DirContentDownloadProgressCallback;
 use crate::{
 	Error,
 	auth::JsClient,
@@ -16,6 +14,11 @@ use crate::{
 	fs::dir::DirectoryMetaType,
 	js::{Dir, DirWithMetaEnum, DirsAndFiles, File, SharedDir, SharedFile},
 	runtime::{self, do_on_commander},
+};
+#[cfg(feature = "uniffi")]
+use crate::{
+	connect::{DirPublicLinkU, FilePublicLinkU},
+	fs::dir::js_impl::DirContentDownloadProgressCallback,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -277,7 +280,7 @@ impl JsClient {
 		&self,
 		dir: Dir,
 		callback: Arc<dyn DirContentDownloadProgressCallback>,
-	) -> Result<DirPublicLink, Error> {
+	) -> Result<DirPublicLinkU, Error> {
 		self.inner_public_link_dir(dir, move |downloaded, total| {
 			let callback = Arc::clone(&callback);
 			tokio::task::spawn_blocking(move || {
@@ -285,6 +288,24 @@ impl JsClient {
 			});
 		})
 		.await
+		.map(DirPublicLinkU::from)
+	}
+
+	pub async fn update_dir_link(&self, dir: Dir, link: Arc<DirPublicLinkU>) -> Result<(), Error> {
+		let link = match Arc::try_unwrap(link) {
+			Ok(link) => link.inner.into_inner().unwrap_or_else(|e| e.into_inner()),
+			Err(e) => e.inner.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+		};
+		self.update_dir_link_inner(dir, link).await
+	}
+
+	pub async fn get_dir_link_status(
+		&self,
+		dir: Dir,
+	) -> Result<Option<Arc<DirPublicLinkU>>, Error> {
+		self.get_dir_link_status_inner(dir)
+			.await
+			.map(|o| o.map(|link| Arc::new(DirPublicLinkU::from(link))))
 	}
 
 	pub async fn share_dir(
@@ -300,6 +321,55 @@ impl JsClient {
 			});
 		})
 		.await
+	}
+
+	pub async fn update_file_link(
+		&self,
+		file: File,
+		link: Arc<FilePublicLinkU>,
+	) -> Result<(), Error> {
+		let link = match Arc::try_unwrap(link) {
+			Ok(link) => link.inner.into_inner().unwrap_or_else(|e| e.into_inner()),
+			Err(e) => e.inner.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+		};
+
+		self.update_file_link_inner(file, link).await
+	}
+
+	pub async fn get_file_link_status(
+		&self,
+		file: File,
+	) -> Result<Option<Arc<FilePublicLinkU>>, Error> {
+		self.get_file_link_status_inner(file)
+			.await
+			.map(|o| o.map(|link| Arc::new(FilePublicLinkU::from(link))))
+	}
+
+	pub async fn public_link_file(&self, file: File) -> Result<Arc<FilePublicLinkU>, Error> {
+		self.public_link_file_inner(file)
+			.await
+			.map(|link| Arc::new(FilePublicLinkU::from(link)))
+	}
+
+	pub async fn remove_dir_link(&self, link: Arc<DirPublicLinkU>) -> Result<(), Error> {
+		let link = match Arc::try_unwrap(link) {
+			Ok(link) => link.inner.into_inner().unwrap_or_else(|e| e.into_inner()),
+			Err(e) => e.inner.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+		};
+		self.remove_dir_link_inner(link).await
+	}
+
+	pub async fn list_linked_dir(
+		&self,
+		dir: DirWithMetaEnum,
+		link: Arc<DirPublicLinkU>,
+	) -> Result<DirsAndFiles, Error> {
+		let link = match Arc::try_unwrap(link) {
+			Ok(link) => link.inner.into_inner().unwrap_or_else(|e| e.into_inner()),
+			Err(e) => e.inner.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+		};
+
+		self.list_linked_dir_inner(dir, link).await
 	}
 }
 
@@ -390,38 +460,17 @@ impl JsClient {
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
 )]
-#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsClient {
 	// Public Links
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkFile")
-	)]
-	pub async fn public_link_file(&self, file: File) -> Result<FilePublicLink, Error> {
-		let this = self.inner();
-		runtime::do_on_commander(
-			move || async move { this.public_link_file(&file.try_into()?).await },
-		)
-		.await
-	}
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "updateDirLink")
-	)]
-	pub async fn update_dir_link(&self, dir: Dir, link: DirPublicLink) -> Result<(), Error> {
-		let this = self.inner();
-		runtime::do_on_commander(
-			move || async move { this.update_dir_link(&dir.into(), &link).await },
-		)
-		.await
-	}
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "updateFileLink")
 	)]
-	pub async fn update_file_link(&self, file: File, link: FilePublicLink) -> Result<(), Error> {
+	pub async fn update_file_link_inner(
+		&self,
+		file: File,
+		link: FilePublicLink,
+	) -> Result<(), Error> {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			this.update_file_link(&file.try_into()?, &link).await
@@ -433,7 +482,10 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "getFileLinkStatus")
 	)]
-	pub async fn get_file_link_status(&self, file: File) -> Result<Option<FilePublicLink>, Error> {
+	pub async fn get_file_link_status_inner(
+		&self,
+		file: File,
+	) -> Result<Option<FilePublicLink>, Error> {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			this.get_file_link_status(&file.try_into()?).await
@@ -441,24 +493,38 @@ impl JsClient {
 		.await
 	}
 
-	// This is annoying because I can't map this to either of the basic file types
-	// I probably have to make a new base file type and implement everything for it
-	// then pass that around just for this one use case
-	// #[cfg_attr(
-	// all(target_family = "wasm", target_os = "unknown"),
-	// wasm_bindgen::prelude::wasm_bindgen(js_name = "getLinkedFile"))]
-	// pub async fn get_linked_file(
-	// 	&self,
-	// 	link: FilePublicLink,
-	// ) -> Result<JsValue, Error> {
-	// 	todo!()
-	// }
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkFile")
+	)]
+	pub async fn public_link_file_inner(&self, file: File) -> Result<FilePublicLink, Error> {
+		let this = self.inner();
+		runtime::do_on_commander(
+			move || async move { this.public_link_file(&file.try_into()?).await },
+		)
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "updateDirLink")
+	)]
+	pub async fn update_dir_link_inner(&self, dir: Dir, link: DirPublicLink) -> Result<(), Error> {
+		let this = self.inner();
+		runtime::do_on_commander(
+			move || async move { this.update_dir_link(&dir.into(), &link).await },
+		)
+		.await
+	}
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirLinkStatus")
 	)]
-	pub async fn get_dir_link_status(&self, dir: Dir) -> Result<Option<DirPublicLink>, Error> {
+	pub async fn get_dir_link_status_inner(
+		&self,
+		dir: Dir,
+	) -> Result<Option<DirPublicLink>, Error> {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move { this.get_dir_link_status(&dir.into()).await })
 			.await
@@ -466,9 +532,18 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "removeDirLink")
+	)]
+	pub async fn remove_dir_link_inner(&self, link: DirPublicLink) -> Result<(), Error> {
+		let this = self.inner();
+		runtime::do_on_commander(move || async move { this.remove_dir_link(link).await }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDir")
 	)]
-	pub async fn list_linked_dir(
+	pub async fn list_linked_dir_inner(
 		&self,
 		dir: DirWithMetaEnum,
 		link: DirPublicLink,
@@ -488,15 +563,26 @@ impl JsClient {
 
 		Ok(DirsAndFiles { dirs, files })
 	}
+}
 
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "removeDirLink")
-	)]
-	pub async fn remove_dir_link(&self, link: DirPublicLink) -> Result<(), Error> {
-		let this = self.inner();
-		runtime::do_on_commander(move || async move { this.remove_dir_link(link).await }).await
-	}
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl JsClient {
+	// This is annoying because I can't map this to either of the basic file types
+	// I probably have to make a new base file type and implement everything for it
+	// then pass that around just for this one use case
+	// #[cfg_attr(
+	// all(target_family = "wasm", target_os = "unknown"),
+	// wasm_bindgen::prelude::wasm_bindgen(js_name = "getLinkedFile"))]
+	// pub async fn get_linked_file(
+	// 	&self,
+	// 	link: FilePublicLink,
+	// ) -> Result<JsValue, Error> {
+	// 	todo!()
+	// }
 
 	// Contacts
 

@@ -10,7 +10,8 @@ pub mod status;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify)
+	derive(tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi)
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PublicLinkExpiration {
