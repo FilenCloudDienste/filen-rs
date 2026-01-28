@@ -71,21 +71,21 @@ mod abortable {
 	use crate::error::AbortedError;
 
 	#[derive(uniffi::Object)]
-	pub struct AbortController {
+	pub struct ManagedAbortController {
 		sender: tokio::sync::watch::Sender<bool>,
 		receiver: tokio::sync::watch::Receiver<bool>,
 	}
 
 	#[uniffi::export]
-	impl AbortController {
+	impl ManagedAbortController {
 		#[uniffi::constructor]
 		pub fn new() -> Self {
 			let (sender, receiver) = tokio::sync::watch::channel(false);
 			Self { sender, receiver }
 		}
 
-		pub fn signal(&self) -> AbortSignal {
-			AbortSignal {
+		pub fn signal(&self) -> ManagedAbortSignal {
+			ManagedAbortSignal {
 				receiver: self.receiver.clone(),
 			}
 		}
@@ -96,18 +96,18 @@ mod abortable {
 	}
 
 	#[derive(Clone, uniffi::Object)]
-	pub struct AbortSignal {
+	pub struct ManagedAbortSignal {
 		receiver: tokio::sync::watch::Receiver<bool>,
 	}
 
 	#[uniffi::export]
-	impl AbortSignal {
+	impl ManagedAbortSignal {
 		pub fn aborted(&self) -> bool {
 			*self.receiver.borrow()
 		}
 	}
 
-	impl AbortSignal {
+	impl ManagedAbortSignal {
 		pub(super) fn into_future(self) -> AbortSignalFuture<impl Future<Output = AbortedError>> {
 			AbortSignalFuture::Some {
 				fut: async move {
@@ -163,7 +163,7 @@ mod managed {
 
 	#[derive(uniffi::Record)]
 	pub struct ManagedFuture {
-		pub abort_signal: Option<Arc<AbortSignal>>,
+		pub abort_signal: Option<Arc<ManagedAbortSignal>>,
 		pub pause_signal: Option<Arc<PauseSignal>>,
 	}
 
