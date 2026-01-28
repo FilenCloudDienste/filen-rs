@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{
 	Error,
 	auth::JsClient,
-	error::FilenSDKError,
+	error::FilenSdkError,
 	io::RemoteDirectory,
 	js::{AnyDirEnumWithShareInfo, Dir, File, NonRootItemTagged},
 };
@@ -11,7 +11,7 @@ use crate::{
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct UploadError {
 	pub path: String,
-	pub error: Arc<FilenSDKError>,
+	pub error: Arc<FilenSdkError>,
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export(with_foreign))]

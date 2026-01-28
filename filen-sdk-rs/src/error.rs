@@ -6,9 +6,9 @@ use thiserror::Error;
 
 macro_rules! impl_from {
 	($error_type:ty, $kind:expr) => {
-		impl From<$error_type> for FilenSDKError {
+		impl From<$error_type> for FilenSdkError {
 			fn from(e: $error_type) -> Self {
-				FilenSDKError {
+				FilenSdkError {
 					kind: $kind,
 					inner: Some(Box::new(e)),
 					context: None,
@@ -114,7 +114,7 @@ pub enum ErrorKind {
 	wasm_bindgen::prelude::wasm_bindgen
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
-pub struct FilenSDKError {
+pub struct FilenSdkError {
 	kind: ErrorKind,
 	inner: Option<Box<dyn std::error::Error + Send + Sync>>,
 	context: Option<Cow<'static, str>>,
@@ -124,14 +124,14 @@ pub struct FilenSDKError {
 // this is because TS doesn't allow Error as a type name,
 // and this was causing issues with uniffi
 // https://github.com/jhugman/uniffi-bindgen-react-native/issues/321
-pub type Error = FilenSDKError;
+pub type Error = FilenSdkError;
 
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen
 )]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
-impl FilenSDKError {
+impl FilenSdkError {
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(getter)
@@ -153,7 +153,7 @@ impl FilenSDKError {
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen
 )]
-impl FilenSDKError {
+impl FilenSdkError {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "toString")]
 	pub fn js_to_string(&self) -> String {
@@ -161,7 +161,7 @@ impl FilenSDKError {
 	}
 }
 
-impl FilenSDKError {
+impl FilenSdkError {
 	/// Adds context to the error, which can be used to provide more information about the error
 	pub fn with_context(mut self, context: impl Into<Cow<'static, str>>) -> Self {
 		match self.context {

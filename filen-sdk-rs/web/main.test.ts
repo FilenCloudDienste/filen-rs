@@ -6,7 +6,7 @@ import init, {
 	type Dir,
 	type File,
 	PauseSignal,
-	FilenSDKError,
+	FilenSdkError,
 	ListenerHandle,
 	type SocketEvent,
 	type FileMeta,
@@ -285,14 +285,14 @@ test("abort", async () => {
 	try {
 		await fileAPromise
 	} catch (e) {
-		expect(e).toBeInstanceOf(FilenSDKError)
-		expect((e as FilenSDKError).kind).toBe("Cancelled")
+		expect(e).toBeInstanceOf(FilenSdkError)
+		expect((e as FilenSdkError).kind).toBe("Cancelled")
 	}
 	try {
 		await fileCPromise
 	} catch (e) {
-		expect(e).toBeInstanceOf(FilenSDKError)
-		expect((e as FilenSDKError).kind).toBe("Cancelled")
+		expect(e).toBeInstanceOf(FilenSdkError)
+		expect((e as FilenSdkError).kind).toBe("Cancelled")
 	}
 	const fileB = await fileBPromise
 	const { files } = await state.listDir(testDir)
@@ -734,9 +734,9 @@ test("authError", async () => {
 		await badState.listDir(badState.root())
 		expect.fail("Expected error to be thrown")
 	} catch (e) {
-		expect(e).toBeInstanceOf(FilenSDKError)
-		expect((e as FilenSDKError).kind).toEqual("Unauthenticated")
-		expect((e as FilenSDKError).toString()).toContain("v3/dir/content")
+		expect(e).toBeInstanceOf(FilenSdkError)
+		expect((e as FilenSdkError).kind).toEqual("Unauthenticated")
+		expect((e as FilenSdkError).toString()).toContain("v3/dir/content")
 	}
 
 	let gotAuthFailedEvent = false
@@ -753,9 +753,9 @@ test("authError", async () => {
 		)
 		expect.fail("Expected error to be thrown")
 	} catch (e) {
-		expect(e).toBeInstanceOf(FilenSDKError)
-		expect((e as FilenSDKError).kind).toEqual("Unauthenticated")
-		expect((e as FilenSDKError).toString()).toContain("socket")
+		expect(e).toBeInstanceOf(FilenSdkError)
+		expect((e as FilenSdkError).kind).toEqual("Unauthenticated")
+		expect((e as FilenSdkError).toString()).toContain("socket")
 		expect(gotAuthFailedEvent).toBe(true)
 	}
 })

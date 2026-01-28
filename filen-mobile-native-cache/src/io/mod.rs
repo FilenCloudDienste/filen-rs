@@ -17,7 +17,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
-	error::FilenSDKError,
+	error::FilenSdkError,
 	fs::{
 		HasName, HasUUID,
 		file::{FileBuilder, RemoteFile, traits::HasFileInfo},
@@ -195,7 +195,7 @@ impl AuthCacheState {
 		path: PathBuf,
 		info: UploadInfo<'_>,
 		callback: Option<Arc<dyn ProgressCallback>>,
-	) -> Result<(RemoteFile, std::fs::File), FilenSDKError> {
+	) -> Result<(RemoteFile, std::fs::File), FilenSdkError> {
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
 		// redundant metadata call, we do it again in upload_file_from_path, but we need the size here
 		// annoying to work around
@@ -224,7 +224,7 @@ impl AuthCacheState {
 		parent_uuid: UuidStr,
 		mime: String,
 		callback: Option<Arc<dyn ProgressCallback>>,
-	) -> Result<RemoteFile, FilenSDKError> {
+	) -> Result<RemoteFile, FilenSdkError> {
 		let old_path = self.get_cached_file_path_from_name(old_uuid, Some(&name));
 		let file_builder = self.client.make_file_builder(name, &parent_uuid).mime(mime);
 		let (file, _) = self
@@ -255,7 +255,7 @@ impl AuthCacheState {
 	pub(crate) async fn io_upload_new_file(
 		&self,
 		builder: FileBuilder,
-	) -> Result<(RemoteFile, PathBuf), FilenSDKError> {
+	) -> Result<(RemoteFile, PathBuf), FilenSdkError> {
 		let target_path = self
 			.get_cached_file_path_from_name(builder.get_uuid().as_ref(), Some(builder.get_name()));
 		let parent_path = target_path
