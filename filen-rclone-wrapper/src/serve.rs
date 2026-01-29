@@ -39,18 +39,13 @@ pub async fn start_basic_server(
 	if !["webdav", "ftp", "sftp", "http", "s3"].contains(&server_type) {
 		return Err(anyhow!("Unsupported server type: {}", server_type));
 	}
-	let address = if options.address.starts_with(":") {
-		format!("127.0.0.1{}", options.address)
-	} else {
-		options.address.clone()
-	};
 	let remote_str = format!("filen:{}", options.root.unwrap_or("".to_string()));
 	let mut args = vec![
 		"serve",
 		server_type,
 		&remote_str,
 		"--addr",
-		&address,
+		&options.address,
 		if options.read_only { "--read-only" } else { "" },
 	];
 	let cache_args =
@@ -78,7 +73,11 @@ pub async fn start_basic_server(
 		.execute_in_background(&args)
 		.await?;
 	Ok(BasicServerDetails {
-		address,
+		address: if options.address.starts_with(":") {
+			format!("127.0.0.1{}", options.address)
+		} else {
+			options.address.clone()
+		},
 		auth: if server_type == "s3" || (options.user.is_some() || options.password.is_some()) {
 			Some(BasicAuthentication {
 				user: user.clone(),

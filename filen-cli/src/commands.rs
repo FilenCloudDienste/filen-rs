@@ -136,8 +136,8 @@ pub(crate) enum Commands {
 	Serve {
 		/// The type of server to run: webdav, ftp, sftp, http
 		server: String,
-		/// IP and port for the server (`<ip>:<port>` or `:<port>`)
-		#[arg(long = "addr", default_value = ":8080")]
+		/// IP and port for the server ("<ip>:<port>" or ":<port>")
+		#[arg(long = "addr", default_value = ":80")]
 		address: String,
 		/// Directory that the server exposes (default: the entire Filen drive)
 		#[arg(long)]
