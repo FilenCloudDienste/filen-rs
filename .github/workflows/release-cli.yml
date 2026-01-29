@@ -174,8 +174,9 @@ jobs:
         uses: taiki-e/install-action@parse-changelog
       - name: Generate release notes from changelog
         run: |
+          # make sure the version exists in the changelog and the job fails otherwise
+          parse-changelog filen-cli/CHANGELOG.md $version
           printf "## $(parse-changelog filen-cli/CHANGELOG.md $version --title)\n\n$(parse-changelog filen-cli/CHANGELOG.md $version)" > filen-cli/release_notes.md
-          echo filen-cli/release_notes.md
       
       # add link to git tag in release notes header
       - name: Add tag link to release notes
