@@ -282,6 +282,7 @@ impl Client {
 			.join(remote_file.uuid().as_ref())
 			.with_extension("filendl");
 		let tmp_file = tokio::fs::OpenOptions::new()
+			.write(true)
 			.create(true)
 			.truncate(true)
 			.open(&tmp_path)
