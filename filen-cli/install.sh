@@ -17,11 +17,11 @@ if [[ ! -z $(which filen) ]] ; then
   echo "To reinstall, please first uninstall the existing version."
 else
 
-  # determine platform as "linux" or "macos"
+  # determine platform
   if [[ "$(uname -s)" == "Linux" ]] ; then
     platform=linux
   elif [[ "$(uname -s)" == "Darwin" ]] ; then
-    platform=macos
+    platform=darwin
   else
     echo -e "${CROSS_MARK} Unsupported operating system: $(uname -s)"
     exit 1
@@ -36,10 +36,15 @@ else
     fi
   fi
 
-  # determine architecture as "x64" or "arm64"
+  # determine architecture
   if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] ; then
     arch=aarch64
   else
+    arch=x86_64
+  fi
+
+  # for darwin-aarch64, use the darwin-x86_64 binary instead (might be changed later)
+  if [[ $platform == "darwin" && $arch == "aarch64" ]] ; then
     arch=x86_64
   fi
 

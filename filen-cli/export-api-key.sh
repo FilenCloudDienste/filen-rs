@@ -13,11 +13,11 @@ CROSS_MARK="${RED}\u2718${COLOR_OFF}"
 WARNING_SIGN="${YELLOW}\u26A0${COLOR_OFF}"
 # see https://stackoverflow.com/a/28938235/13164753
 
-# determine platform as "linux" or "macos"
+# determine platform
 if [[ "$(uname -s)" == "Linux" ]] ; then
   platform=linux
 elif [[ "$(uname -s)" == "Darwin" ]] ; then
-  platform=macos
+  platform=darwin
 else
   echo -e "${CROSS_MARK} Unsupported operating system: $(uname -s)"
   exit 1
@@ -32,10 +32,15 @@ if [[ $platform == "linux" ]] ; then
   fi
 fi
 
-# determine architecture as "x64" or "arm64"
+# determine architecture
 if [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] ; then
   arch=aarch64
 else
+  arch=x86_64
+fi
+
+# for darwin-aarch64, use the darwin-x86_64 binary instead (might be changed later)
+if [[ $platform == "darwin" && $arch == "aarch64" ]] ; then
   arch=x86_64
 fi
 
