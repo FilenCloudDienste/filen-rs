@@ -3,8 +3,6 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use crate::js::ManagedFuture;
 use crate::{
 	auth::Client,
 	fs::{
@@ -12,7 +10,7 @@ use crate::{
 		dir::UnsharedDirectoryType,
 		file::{FileBuilder, RemoteFile},
 	},
-	js::{Dir, DirEnum, File},
+	js::{Dir, DirEnum, File, ManagedFuture},
 };
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -45,48 +43,48 @@ impl TryFrom<NonRootItem> for NonRootFSObject<'static> {
 	}
 }
 
-#[derive(Deserialize)]
-#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), derive(Tsify))]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify, Deserialize)
+)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileBuilderParams {
 	pub parent: DirEnum,
 	pub name: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "filen_types::serde::time::optional", default)
 	)]
-	#[serde(with = "filen_types::serde::time::optional", default)]
 	pub created: Option<DateTime<Utc>>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "filen_types::serde::time::optional", default)
 	)]
-	#[serde(with = "filen_types::serde::time::optional", default)]
 	pub modified: Option<DateTime<Utc>>,
-	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default)
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub mime: Option<String>,
 }
 
-#[derive(Deserialize)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(from_wasm_abi)
+	derive(Tsify, Deserialize),
+	tsify(from_wasm_abi),
+	serde(rename_all = "camelCase")
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
 pub struct UploadFileParams {
-	#[serde(flatten)]
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
 	pub file_builder_params: FileBuilderParams,
 	// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
 	// #[serde(flatten)]
-	#[serde(default)]
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	pub managed_future: ManagedFuture,
 }
 

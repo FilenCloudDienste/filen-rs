@@ -1,18 +1,21 @@
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use std::{cmp::min, sync::Arc};
+use std::cmp::min;
+use std::sync::Arc;
 
+#[cfg(feature = "uniffi")]
+use crate::js::ManagedFuture;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::{
 	ErrorKind,
 	fs::file::{enums::RemoteFileType, traits::HasFileInfo},
-	js::{FileEnum, UploadFileParams},
+	js::FileEnum,
 };
 
 use crate::{
 	Error,
 	auth::JsClient,
 	fs::file::meta::FileMetaChanges,
-	js::{File, FileVersion},
+	js::{File, FileVersion, UploadFileParams},
 	runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
@@ -289,6 +292,38 @@ impl JsClient {
 	pub async fn delete_file_permanently(&self, file: File) -> Result<(), Error> {
 		let this = self.inner();
 		do_on_commander(move || async move { this.delete_file_permanently(file.try_into()?).await })
+			.await
+	}
+
+	#[cfg(feature = "uniffi")]
+	pub async fn upload_file_from_bytes(
+		&self,
+		data: Vec<u8>,
+		params: UploadFileParams,
+	) -> Result<File, Error> {
+		let this = self.inner();
+		params
+			.managed_future
+			.into_js_managed_commander_future(move || async move {
+				let builder = params.file_builder_params.into_file_builder(&this);
+				this.upload_file(Arc::new(builder.build()), &data).await
+			})
+			.await
+			.map(Into::into)
+	}
+
+	#[cfg(feature = "uniffi")]
+	pub async fn download_file_to_bytes(
+		&self,
+		file: File,
+		managed_future: ManagedFuture,
+	) -> Result<Vec<u8>, Error> {
+		let this = self.inner();
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				this.download_file(&crate::io::RemoteFile::try_from(file)?)
+					.await
+			})
 			.await
 	}
 

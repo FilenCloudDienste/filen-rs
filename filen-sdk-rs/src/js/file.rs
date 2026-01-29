@@ -323,6 +323,7 @@ impl From<crate::connect::fs::SharedFile> for SharedFile {
 	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
 )]
 #[serde(untagged)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum FileEnum {
 	File(File),
 	RootFile(RootFile),
