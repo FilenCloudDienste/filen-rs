@@ -4,8 +4,9 @@ use crate::{
 	Error,
 	auth::JsClient,
 	error::FilenSdkError,
-	io::RemoteDirectory,
-	js::{AnyDirEnumWithShareInfo, Dir, File, NonRootItemTagged},
+	fs::dir::UnsharedDirectoryType,
+	js::{AnyDirEnumWithShareInfo, Dir, DirEnum, File, NonRootItemTagged},
+	util::MaybeSendCallback,
 };
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -284,28 +285,28 @@ impl JsClient {
 
 	pub async fn upload_file(
 		&self,
-		parent_dir: Dir,
+		parent_dir: DirEnum,
 		file_path: String,
-		callback: Arc<dyn JsFileUploadCallback>,
+		callback: Option<Arc<dyn JsFileUploadCallback>>,
 		managed_future: crate::js::ManagedFuture,
 	) -> Result<File, Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
-				let parent_dir: RemoteDirectory = parent_dir.into();
-				let file_path = PathBuf::from(file_path);
-				this.upload_file_from_path(
-					&parent_dir,
-					file_path,
-					Some(Arc::new(|downloaded_bytes| {
-						let callback = callback.clone();
+				let callback = callback.as_ref().map(|cb| {
+					Arc::new(|downloaded_bytes| {
+						let inner_cb = Arc::clone(cb);
 						tokio::task::spawn_blocking(move || {
-							JsFileUploadCallback::on_update(callback.as_ref(), downloaded_bytes);
+							JsFileUploadCallback::on_update(inner_cb.as_ref(), downloaded_bytes);
 						});
-					})),
-				)
-				.await
-				.map(|(file, _)| File::from(file))
+					}) as MaybeSendCallback<u64>
+				});
+
+				let parent_dir = UnsharedDirectoryType::from(parent_dir);
+				let file_path = PathBuf::from(file_path);
+				this.upload_file_from_path(&parent_dir, file_path, callback)
+					.await
+					.map(|(file, _)| File::from(file))
 			})
 			.await
 	}
@@ -314,25 +315,25 @@ impl JsClient {
 		&self,
 		file: File,
 		file_path: String,
-		callback: Arc<dyn JsFileDownloadCallback>,
+		callback: Option<Arc<dyn JsFileDownloadCallback>>,
 		managed_future: crate::js::ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
+				let callback = callback.as_ref().map(|cb| {
+					Arc::new(|downloaded_bytes| {
+						let inner_cb = Arc::clone(cb);
+						tokio::task::spawn_blocking(move || {
+							JsFileDownloadCallback::on_update(inner_cb.as_ref(), downloaded_bytes);
+						});
+					}) as MaybeSendCallback<u64>
+				});
+
 				let file: crate::io::RemoteFile = file.try_into()?;
 				let target_path = PathBuf::from(file_path);
-				this.download_file_to_path(
-					&file,
-					target_path,
-					Some(Arc::new(|downloaded_bytes| {
-						let callback = callback.clone();
-						tokio::task::spawn_blocking(move || {
-							JsFileDownloadCallback::on_update(callback.as_ref(), downloaded_bytes);
-						});
-					})),
-				)
-				.await
+				this.download_file_to_path(&file, target_path, callback)
+					.await
 			})
 			.await
 	}
