@@ -1,5 +1,8 @@
 pub mod rsa;
-use std::{borrow::Cow, fmt::Formatter};
+use std::{
+	borrow::{Borrow, Cow},
+	fmt::Formatter,
+};
 
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -62,18 +65,36 @@ impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, CowHelpers)]
+#[derive(Debug, PartialEq, Eq, Serialize, CowHelpers)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify),
 	tsify(into_wasm_abi)
 )]
-pub enum MaybeEncrypted<'a> {
-	Decrypted(Cow<'a, str>),
+pub enum MaybeEncrypted<'a, T>
+where
+	T: ToOwned + ?Sized,
+	T::Owned: Clone + Borrow<T> + std::fmt::Debug,
+	Cow<'static, T>: 'static,
+{
+	Decrypted(Cow<'a, T>),
 	Encrypted(EncryptedString<'a>),
 }
 
-pub type MaybeEncryptedStatic = MaybeEncrypted<'static>;
+impl<T> Clone for MaybeEncrypted<'_, T>
+where
+	T: ToOwned + ?Sized,
+	T::Owned: Clone + Borrow<T> + std::fmt::Debug,
+{
+	fn clone(&self) -> Self {
+		match self {
+			MaybeEncrypted::Decrypted(s) => MaybeEncrypted::Decrypted(s.clone()),
+			MaybeEncrypted::Encrypted(e) => MaybeEncrypted::Encrypted(e.clone()),
+		}
+	}
+}
+
+pub type MaybeEncryptedStatic = MaybeEncrypted<'static, str>;
 
 #[cfg(feature = "uniffi")]
 #[derive(uniffi::Enum)]

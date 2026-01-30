@@ -558,7 +558,7 @@ impl<'a> FileMove {
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct FolderRename<'a> {
-	pub name: MaybeEncrypted<'a>,
+	pub name: MaybeEncrypted<'a, str>,
 	pub uuid: UuidStr,
 }
 
@@ -688,7 +688,7 @@ impl<'a> ChatConversationsNew {
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct NoteContentEdited<'a> {
 	pub note: UuidStr,
-	pub content: MaybeEncrypted<'a>,
+	pub content: MaybeEncrypted<'a, str>,
 	pub note_type: NoteType,
 	pub editor_id: u64,
 	pub edited_timestamp: DateTime<Utc>,
@@ -719,7 +719,7 @@ impl<'a> NoteContentEdited<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct NoteTitleEdited<'a> {
 	pub note: UuidStr,
-	pub new_title: MaybeEncrypted<'a>,
+	pub new_title: MaybeEncrypted<'a, str>,
 }
 
 impl<'a> NoteTitleEdited<'a> {
@@ -772,7 +772,7 @@ pub struct ChatMessageEdited<'a> {
 	pub chat: UuidStr,
 	pub uuid: UuidStr,
 	pub edited_timestamp: DateTime<Utc>,
-	pub new_content: MaybeEncrypted<'a>,
+	pub new_content: MaybeEncrypted<'a, str>,
 }
 impl<'a> ChatMessageEdited<'a> {
 	fn try_blocking_from_rsa_encrypted(
@@ -798,7 +798,7 @@ impl<'a> ChatMessageEdited<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct ChatConversationNameEdited<'a> {
 	pub chat: UuidStr,
-	pub new_name: MaybeEncrypted<'a>,
+	pub new_name: MaybeEncrypted<'a, str>,
 }
 
 impl<'a> ChatConversationNameEdited<'a> {
@@ -955,7 +955,7 @@ impl<'a> FolderMetadataChanged<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct FileMetadataChanged<'a> {
 	pub uuid: UuidStr,
-	pub name: MaybeEncrypted<'a>,
+	pub name: MaybeEncrypted<'a, str>,
 	pub metadata: FileMeta<'a>,
 	pub old_metadata: FileMeta<'a>,
 }

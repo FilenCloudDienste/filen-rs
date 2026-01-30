@@ -298,7 +298,7 @@ impl From<&crate::socket::events::FileMove> for FileMove {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct FolderRename {
-	pub name: MaybeEncrypted<'static>,
+	pub name: MaybeEncrypted<'static, str>,
 	pub uuid: UuidStr,
 }
 
@@ -480,7 +480,7 @@ impl From<&crate::socket::events::ChatConversationsNew> for ChatConversationsNew
 )]
 pub struct NoteContentEdited {
 	pub note: UuidStr,
-	pub content: MaybeEncrypted<'static>,
+	pub content: MaybeEncrypted<'static, str>,
 	pub note_type: NoteType,
 	pub editor_id: u64,
 	#[cfg_attr(
@@ -513,7 +513,7 @@ impl From<&crate::socket::events::NoteContentEdited<'_>> for NoteContentEdited {
 )]
 pub struct NoteTitleEdited {
 	pub note: UuidStr,
-	pub new_title: MaybeEncrypted<'static>,
+	pub new_title: MaybeEncrypted<'static, str>,
 }
 
 impl From<&crate::socket::events::NoteTitleEdited<'_>> for NoteTitleEdited {
@@ -574,7 +574,7 @@ impl From<&crate::socket::events::NoteNew> for NoteNew {
 pub struct ChatMessageEdited {
 	pub chat: UuidStr,
 	pub uuid: UuidStr,
-	pub new_content: MaybeEncrypted<'static>,
+	pub new_content: MaybeEncrypted<'static, str>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		serde(with = "chrono::serde::ts_milliseconds")
@@ -603,7 +603,7 @@ impl From<&crate::socket::events::ChatMessageEdited<'_>> for ChatMessageEdited {
 )]
 pub struct ChatConversationNameEdited {
 	pub chat: UuidStr,
-	pub new_name: MaybeEncrypted<'static>,
+	pub new_name: MaybeEncrypted<'static, str>,
 }
 
 impl From<&crate::socket::events::ChatConversationNameEdited<'_>> for ChatConversationNameEdited {
@@ -701,7 +701,7 @@ impl From<&crate::socket::events::FolderMetadataChanged<'_>> for FolderMetadataC
 )]
 pub struct FileMetadataChanged {
 	pub uuid: UuidStr,
-	pub name: MaybeEncrypted<'static>,
+	pub name: MaybeEncrypted<'static, str>,
 	pub metadata: FileMeta,
 	pub old_metadata: FileMeta,
 }
