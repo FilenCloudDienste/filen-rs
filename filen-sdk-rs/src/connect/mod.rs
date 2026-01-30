@@ -104,7 +104,7 @@ impl PasswordState {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 #[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct FilePublicLink {
 	link_uuid: UuidStr,
@@ -112,6 +112,34 @@ pub struct FilePublicLink {
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
 	salt: Vec<u8>,
+}
+
+impl PartialEq for FilePublicLink {
+	fn eq(&self, other: &Self) -> bool {
+		let password_match = match (&self.password, &self.salt, &other.password, &other.salt) {
+			(PasswordState::Known(a), _, PasswordState::Known(b), _) => a == b,
+			(PasswordState::Hashed(a), _, PasswordState::Hashed(b), _) => a == b,
+			(PasswordState::None, _, PasswordState::None, _) => true,
+			(PasswordState::Known(a), a_salt, PasswordState::Hashed(b), b_salt)
+			| (PasswordState::Hashed(b), b_salt, PasswordState::Known(a), a_salt) => {
+				if a_salt != b_salt {
+					return false;
+				} else {
+					match crate::crypto::connect::derive_password_for_link(Some(a), a_salt) {
+						Ok(hash) => b == &hash,
+						Err(_) => false,
+					}
+				}
+			}
+			_ => false,
+		};
+
+		self.link_uuid == other.link_uuid
+			&& password_match
+			&& self.expiration == other.expiration
+			&& self.downloadable == other.downloadable
+			&& self.salt == other.salt
+	}
 }
 
 #[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
@@ -136,6 +164,7 @@ impl FilePublicLink {
 	)]
 	pub fn set_password(&mut self, password: String) {
 		self.password = PasswordState::Known(password);
+		self.salt = rand::random::<[u8; 256]>().to_vec();
 	}
 
 	#[cfg_attr(
@@ -144,6 +173,7 @@ impl FilePublicLink {
 	)]
 	pub fn clear_password(&mut self) {
 		self.password = PasswordState::None;
+		self.salt.clear();
 	}
 
 	#[cfg_attr(
@@ -234,7 +264,7 @@ impl FilePublicLink {
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
 			downloadable: true,
-			salt: rand::random::<[u8; 256]>().to_vec(),
+			salt: Vec::new(),
 		}
 	}
 }
@@ -653,6 +683,12 @@ impl Client {
 
 	pub async fn public_link_file(&self, file: &RemoteFile) -> Result<FilePublicLink, Error> {
 		let file_link = FilePublicLink::new();
+		// why does this just hash_name empty? Who knows,
+		// we should fix this with the v4 api
+		let tmp_salt = rand::random::<[u8; 256]>();
+		let password_hash =
+			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, &tmp_salt))
+				.await?;
 
 		api::v3::file::link::edit::post(
 			self.client(),
@@ -661,10 +697,8 @@ impl Client {
 				file_uuid: *file.uuid(),
 				expiration: PublicLinkExpiration::Never,
 				password: false,
-				// why does this just hash_name empty? Who knows,
-				// we should fix this with the v4 api
-				password_hashed: Cow::Borrowed(&file_link.get_password_hash()?),
-				salt: Cow::Borrowed(&file_link.salt),
+				password_hashed: Cow::Borrowed(&password_hash),
+				salt: Cow::Borrowed(&tmp_salt),
 				download_btn: true,
 				r#type: FileLinkAction::Enable,
 			},
@@ -700,21 +734,69 @@ impl Client {
 		file: &RemoteFile,
 		link: &FilePublicLink,
 	) -> Result<(), Error> {
+		let (password, password_hashed, salt) = if link.password().is_known() {
+			(
+				true,
+				do_cpu_intensive(|| link.get_password_hash()).await?,
+				Cow::Borrowed(link.salt()),
+			)
+		} else {
+			// why does this just hash_name empty? Who knows,
+			// we should fix this with the v4 api
+			let tmp_salt = rand::random::<[u8; 256]>().to_vec();
+			(
+				false,
+				Cow::Owned(
+					do_cpu_intensive(|| {
+						crate::crypto::connect::derive_password_for_link(None, &tmp_salt)
+					})
+					.await?,
+				),
+				Cow::Owned(tmp_salt),
+			)
+		};
+
 		api::v3::file::link::edit::post(
 			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: link.link_uuid,
 				file_uuid: *file.uuid(),
 				expiration: link.expiration,
-				password: link.password().is_known(),
-				password_hashed: Cow::Borrowed(&link.get_password_hash()?),
-				salt: Cow::Borrowed(link.salt()),
+				password,
+				password_hashed,
+				salt,
 				download_btn: link.downloadable,
 				r#type: FileLinkAction::Enable,
 			},
 		)
 		.await?;
 		Ok(())
+	}
+
+	pub async fn remove_file_link(
+		&self,
+		file: &RemoteFile,
+		link: FilePublicLink,
+	) -> Result<(), Error> {
+		let tmp_salt = rand::random::<[u8; 256]>();
+		let password_hash =
+			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, &tmp_salt))
+				.await?;
+
+		api::v3::file::link::edit::post(
+			self.client(),
+			&api::v3::file::link::edit::Request {
+				uuid: link.link_uuid,
+				file_uuid: *file.uuid(),
+				expiration: PublicLinkExpiration::Never,
+				password: false,
+				password_hashed: Cow::Borrowed(&password_hash),
+				salt: Cow::Borrowed(&tmp_salt),
+				download_btn: false,
+				r#type: FileLinkAction::Disable,
+			},
+		)
+		.await
 	}
 
 	pub async fn get_file_link_status(

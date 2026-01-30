@@ -336,6 +336,18 @@ impl JsClient {
 		self.update_file_link_inner(file, link).await
 	}
 
+	pub async fn remove_file_link(
+		&self,
+		file: File,
+		link: Arc<FilePublicLinkU>,
+	) -> Result<(), Error> {
+		let link = match Arc::try_unwrap(link) {
+			Ok(link) => link.inner.into_inner().unwrap_or_else(|e| e.into_inner()),
+			Err(e) => e.inner.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+		};
+		self.remove_file_link_inner(file, link).await
+	}
+
 	pub async fn get_file_link_status(
 		&self,
 		file: File,
@@ -474,6 +486,18 @@ impl JsClient {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			this.update_file_link(&file.try_into()?, &link).await
+		})
+		.await
+	}
+
+	pub async fn remove_file_link_inner(
+		&self,
+		file: File,
+		link: FilePublicLink,
+	) -> Result<(), Error> {
+		let this = self.inner();
+		runtime::do_on_commander(move || async move {
+			this.remove_file_link(&file.try_into()?, link).await
 		})
 		.await
 	}

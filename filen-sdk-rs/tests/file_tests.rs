@@ -205,6 +205,37 @@ async fn file_delete_permanently() {
 }
 
 #[shared_test_runtime]
+async fn file_link() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file_name = "file.txt";
+	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.upload_file(file.into(), b"Hello World from Rust!")
+		.await
+		.unwrap();
+
+	let link = client.public_link_file(&file).await.unwrap();
+	let got_link = client.get_file_link_status(&file).await.unwrap();
+	assert_eq!(Some(&link), got_link.as_ref());
+	client.remove_file_link(&file, link).await.unwrap();
+	let got_link = client.get_file_link_status(&file).await.unwrap();
+	assert_eq!(None, got_link);
+
+	let mut link = client.public_link_file(&file).await.unwrap();
+	let password = "test";
+	link.set_password(password.to_owned());
+	client.update_file_link(&file, &link).await.unwrap();
+	let got_link = client.get_file_link_status(&file).await.unwrap();
+	assert_eq!(Some(&link), got_link.as_ref());
+	client.remove_file_link(&file, link).await.unwrap();
+	let got_link = client.get_file_link_status(&file).await.unwrap();
+	assert_eq!(None, got_link);
+}
+
+#[shared_test_runtime]
 async fn file_move() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
