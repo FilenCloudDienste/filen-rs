@@ -40,11 +40,8 @@ pub trait DirContentDownloadProgressCallback: Send + Sync {
 }
 
 #[cfg(feature = "uniffi")]
+#[uniffi::export]
 impl JsClient {
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")
-	)]
 	pub async fn list_dir_recursive(
 		&self,
 		dir: DirEnum,
