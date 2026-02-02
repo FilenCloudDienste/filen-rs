@@ -432,7 +432,7 @@ async fn list_recursive() {
 	let (dirs, _) = client
 		.clone()
 		.list_dir_recursive_with_paths(
-			DirectoryType::Dir(Cow::Borrowed(&test_dir)),
+			DirectoryType::Dir(Cow::Borrowed(test_dir)),
 			&|_downloaded, _total| {},
 			&mut |errors| {
 				panic!("received unexpected errors: {:?}", errors);
