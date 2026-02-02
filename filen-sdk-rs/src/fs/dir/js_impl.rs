@@ -34,7 +34,7 @@ impl JsClient {
 }
 
 #[cfg(feature = "uniffi")]
-#[uniffi::export]
+#[uniffi::export(with_foreign)]
 pub trait DirContentDownloadProgressCallback: Send + Sync {
 	fn on_progress(&self, bytes_downloaded: u64, total_bytes: Option<u64>);
 }
