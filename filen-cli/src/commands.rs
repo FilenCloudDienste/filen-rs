@@ -932,7 +932,8 @@ mod rclone {
 
 	use anyhow::{Context as _, Result};
 	use filen_rclone_wrapper::{
-		rclone_installation::RcloneInstallationConfig, serve::BasicServerOptions,
+		rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
+		serve::BasicServerOptions,
 	};
 
 	use crate::{CliConfig, auth::LazyClient, ui::UI};
@@ -960,6 +961,7 @@ mod rclone {
 		)
 		.await
 		.context("Failed to mount network drive (use --verbose for more info)")?;
+		RcloneInstallation::pipe_output_to_logs(&mut network_drive.process);
 		network_drive
 			.wait_until_active()
 			.await
@@ -1000,6 +1002,7 @@ mod rclone {
 		)
 		.await
 		.with_context(|| format!("Failed to start {} server", display_server_type))?;
+		RcloneInstallation::pipe_output_to_logs(&mut server.process);
 		ui.print_success(&format!(
 			"Started {} server on http://{} {} (kill the CLI to stop)",
 			display_server_type,

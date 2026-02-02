@@ -76,8 +76,7 @@ impl RcloneInstallation {
 	}
 
 	/// Executes an rclone command in the background,
-	/// piping stdout and stderr to the log
-	/// and exposing the Rclone RC Api
+	/// exposing the Rclone RC Api
 	pub(crate) async fn execute_in_background(
 		&self,
 		args: &[&str],
@@ -89,7 +88,7 @@ impl RcloneInstallation {
 			args.join(" "),
 			rc_port
 		);
-		let mut process = self
+		let process = self
 			.configured_rclone(args)
 			.args([
 				"--rc",
@@ -103,7 +102,10 @@ impl RcloneInstallation {
 			.spawn()
 			.context("Failed to execute rclone command")?;
 
-		// log stdout and stderr
+		Ok((process, RcloneApiClient::new(rc_port)))
+	}
+
+	pub fn pipe_output_to_logs(process: &mut Child) {
 		let process_stdout = process.stdout.take().unwrap();
 		tokio::spawn(async move {
 			let mut reader = BufReader::new(process_stdout).lines();
@@ -118,8 +120,6 @@ impl RcloneInstallation {
 				info!("[rclone stderr] {}", line);
 			}
 		});
-
-		Ok((process, RcloneApiClient::new(rc_port)))
 	}
 
 	fn configured_rclone(&self, args: &[&str]) -> Command {
