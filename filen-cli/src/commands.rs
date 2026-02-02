@@ -931,7 +931,9 @@ mod rclone {
 	//! It is automatically downloaded and configured (authenticated) when you run the commands like `rclone`, `mount`, etc.
 
 	use anyhow::{Context as _, Result};
-	use filen_rclone_wrapper::serve::BasicServerOptions;
+	use filen_rclone_wrapper::{
+		rclone_installation::RcloneInstallationConfig, serve::BasicServerOptions,
+	};
 
 	use crate::{CliConfig, auth::LazyClient, ui::UI};
 
@@ -949,7 +951,7 @@ mod rclone {
 		check_already_downloaded(ui, &config_dir).await;
 		let mut network_drive = filen_rclone_wrapper::network_drive::NetworkDrive::mount(
 			client,
-			&config_dir,
+			&RcloneInstallationConfig::new(&config_dir),
 			mount_point.as_deref(),
 			false,
 			cache_size,
@@ -991,7 +993,7 @@ mod rclone {
 		check_already_downloaded(ui, &config_dir).await;
 		let mut server = filen_rclone_wrapper::serve::start_basic_server(
 			client,
-			&config_dir,
+			&RcloneInstallationConfig::new(&config_dir),
 			server_type,
 			options,
 			rclone_args,
@@ -1050,7 +1052,7 @@ mod rclone {
 		check_already_downloaded(ui, &config_dir).await;
 		let rclone = filen_rclone_wrapper::rclone_installation::RcloneInstallation::initialize(
 			client.get(ui).await?,
-			&config_dir,
+			&RcloneInstallationConfig::new(&config_dir),
 		)
 		.await
 		.context("Failed to initialize rclone installation")?;
@@ -1068,7 +1070,7 @@ mod rclone {
 
 	async fn check_already_downloaded(ui: &mut UI, config_dir: &std::path::Path) {
 		if !filen_rclone_wrapper::rclone_installation::RcloneInstallation::check_already_downloaded(
-			config_dir,
+			&RcloneInstallationConfig::new(config_dir),
 		)
 		.await
 		{

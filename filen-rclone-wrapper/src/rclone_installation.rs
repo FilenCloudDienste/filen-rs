@@ -21,6 +21,22 @@ use tokio::{
 
 use crate::rclone_rc_api::RcloneApiClient;
 
+pub struct RcloneInstallationConfig {
+	/// Where the Rclone config and other files (cache, ...) will be stored
+	pub config_dir: PathBuf,
+	/// Where the Rclone binary will be stored (can be separate)
+	pub rclone_binary_dir: PathBuf,
+}
+
+impl RcloneInstallationConfig {
+	pub fn new(config_dir: &Path) -> Self {
+		Self {
+			config_dir: config_dir.to_path_buf(),
+			rclone_binary_dir: config_dir.to_path_buf(),
+		}
+	}
+}
+
 pub struct RcloneInstallation {
 	rclone_binary_path: PathBuf,
 	rclone_config_path: PathBuf,
@@ -28,17 +44,19 @@ pub struct RcloneInstallation {
 
 impl RcloneInstallation {
 	/// Checks if Rclone is already downloaded. If not, it will be downloaded on initialization.
-	pub async fn check_already_downloaded(config_dir: &Path) -> bool {
-		ensure_rclone_binary(config_dir, true).await.is_ok()
+	pub async fn check_already_downloaded(config: &RcloneInstallationConfig) -> bool {
+		ensure_rclone_binary(&config.rclone_binary_dir, true)
+			.await
+			.is_ok()
 	}
 
-	pub async fn initialize(client: &Client, config_dir: &Path) -> Result<Self> {
-		fs::create_dir_all(&config_dir)
+	pub async fn initialize(client: &Client, config: &RcloneInstallationConfig) -> Result<Self> {
+		fs::create_dir_all(&config.config_dir)
 			.await
 			.context("Failed to create Rclone installation directory")?;
-		let rclone_binary_path = ensure_rclone_binary(config_dir, false).await?;
+		let rclone_binary_path = ensure_rclone_binary(&config.rclone_binary_dir, false).await?;
 		let rclone_config_path =
-			write_rclone_config(&rclone_binary_path, client, config_dir).await?;
+			write_rclone_config(&rclone_binary_path, client, &config.config_dir).await?;
 		Ok(Self {
 			rclone_binary_path,
 			rclone_config_path,

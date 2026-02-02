@@ -1,9 +1,8 @@
 use anyhow::{Result, anyhow};
 use filen_sdk_rs::auth::Client;
-use std::path::Path;
 use tokio::process::Child;
 
-use crate::rclone_installation::RcloneInstallation;
+use crate::rclone_installation::{RcloneInstallation, RcloneInstallationConfig};
 
 pub struct BasicAuthentication {
 	pub user: String,
@@ -31,7 +30,7 @@ pub struct BasicServerDetails {
 /// "s3" server options take the Access Key ID as `options.user` and Secret Access Key as `options.password`.
 pub async fn start_basic_server(
 	client: &Client,
-	config_dir: &Path,
+	config: &RcloneInstallationConfig,
 	server_type: &str,
 	options: BasicServerOptions,
 	rclone_args: Vec<String>,
@@ -49,7 +48,7 @@ pub async fn start_basic_server(
 		if options.read_only { "--read-only" } else { "" },
 	];
 	let cache_args =
-		RcloneInstallation::construct_cache_args(config_dir, options.cache_size.clone())?;
+		RcloneInstallation::construct_cache_args(&config.config_dir, options.cache_size.clone())?;
 	args.extend(cache_args.split(' '));
 	let transfers_str;
 	if let Some(t) = options.transfers.map(|t| t.to_string()) {
@@ -68,7 +67,7 @@ pub async fn start_basic_server(
 		args.extend(["--user", &user, "--pass", &password]);
 	}
 	args.extend(rclone_args.iter().map(String::as_str));
-	let (process, _) = RcloneInstallation::initialize(client, config_dir)
+	let (process, _) = RcloneInstallation::initialize(client, config)
 		.await?
 		.execute_in_background(&args)
 		.await?;

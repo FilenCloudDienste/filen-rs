@@ -6,7 +6,7 @@ use filen_sdk_rs::auth::Client;
 use log::trace;
 
 use crate::{
-	rclone_installation::RcloneInstallation,
+	rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
 	rclone_rc_api::{RcloneApiClient, VfsListResponse},
 };
 
@@ -23,14 +23,14 @@ impl NetworkDrive {
 	/// Downloads Rclone binary if necessary, writes config file, and starts the `rclone mount` process.
 	pub async fn mount(
 		client: &Client,
-		config_dir: &Path,
+		config: &RcloneInstallationConfig,
 		mount_point: Option<&str>,
 		read_only: bool,
 		cache_size: Option<String>,
 		transfers: Option<usize>,
 		rclone_args: Vec<String>,
 	) -> Result<NetworkDrive> {
-		let rclone = RcloneInstallation::initialize(client, config_dir).await?;
+		let rclone = RcloneInstallation::initialize(client, config).await?;
 		let mount_point = resolve_mount_point(mount_point).await?;
 
 		// construct args
@@ -66,7 +66,7 @@ impl NetworkDrive {
 			args.push("--read-only");
 		}
 
-		let cache_args = RcloneInstallation::construct_cache_args(config_dir, cache_size)?;
+		let cache_args = RcloneInstallation::construct_cache_args(&config.config_dir, cache_size)?;
 		args.extend(cache_args.split(' '));
 
 		let transfers_str;
@@ -119,8 +119,6 @@ impl NetworkDrive {
 		}
 
 		args.extend(rclone_args.iter().map(String::as_str));
-
-		dbg!(args.clone());
 
 		let (process, api) = rclone
 			.execute_in_background(&args)

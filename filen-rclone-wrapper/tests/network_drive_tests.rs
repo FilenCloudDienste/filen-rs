@@ -39,7 +39,9 @@ async fn start_rclone_mount() {
 		}
 	}
 
-	use filen_rclone_wrapper::network_drive::NetworkDrive;
+	use filen_rclone_wrapper::{
+		network_drive::NetworkDrive, rclone_installation::RcloneInstallationConfig,
+	};
 
 	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
 
@@ -67,10 +69,17 @@ async fn start_rclone_mount() {
 	}
 
 	// mount network drive (is killed on drop)
-	let mut network_drive =
-		NetworkDrive::mount(&client, &config_dir, None, false, None, None, vec![])
-			.await
-			.unwrap();
+	let mut network_drive = NetworkDrive::mount(
+		&client,
+		&RcloneInstallationConfig::new(&config_dir),
+		None,
+		false,
+		None,
+		None,
+		vec![],
+	)
+	.await
+	.unwrap();
 	info!("Network drive mounted at: {}", network_drive.mount_point);
 
 	let created_dir_path = format!("{}/created_dir", test_root_dir);
