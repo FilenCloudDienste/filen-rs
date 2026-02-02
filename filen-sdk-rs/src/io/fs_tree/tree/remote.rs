@@ -4,7 +4,7 @@ use crate::{
 	Error,
 	fs::{
 		HasParent, HasUUID, NonRootFSObject,
-		dir::{DirectoryTypeWithShareInfo, HasUUIDContents, RemoteDirectory},
+		dir::{DirectoryType, RemoteDirectory},
 		file::RemoteFile,
 	},
 	io::fs_tree::{WalkError, entry::remote::RemoteFSObjectEntry},
@@ -22,7 +22,7 @@ pub(crate) struct WalkDirFromHashMap {
 
 impl WalkDirFromHashMap {
 	pub fn new(
-		root: &impl HasUUIDContents,
+		root_uuid: Uuid,
 		dirs: Vec<RemoteDirectory>,
 		files: Vec<RemoteFile>,
 	) -> Result<Self, Error> {
@@ -55,7 +55,7 @@ impl WalkDirFromHashMap {
 				.or_default()
 				.push(NonRootFSObject::File(Cow::Owned(file)));
 		}
-		let stack = vec![root.uuid().into()];
+		let stack = vec![root_uuid];
 		Ok(Self { map, stack })
 	}
 }
@@ -92,7 +92,7 @@ impl Iterator for WalkDirFromHashMap {
 
 pub(crate) async fn build_fs_tree_from_remote_iterator<F>(
 	client: std::sync::Arc<crate::auth::Client>,
-	dir: DirectoryTypeWithShareInfo<'_>,
+	dir: DirectoryType<'_>,
 	error_callback: &mut impl FnMut(Vec<Error>),
 	progress_callback: &mut impl FnMut(u64, u64, u64),
 	list_dir_progress_callback: &F,
@@ -101,11 +101,12 @@ pub(crate) async fn build_fs_tree_from_remote_iterator<F>(
 where
 	F: Fn(u64, Option<u64>) + Send + Sync,
 {
+	let root_uuid = dir.uuid().into();
 	let (dirs, files) = client
-		.list_dir_recursive(&dir, list_dir_progress_callback)
+		.list_dir_recursive(dir, list_dir_progress_callback)
 		.await?;
 
-	let iter = WalkDirFromHashMap::new(&dir, dirs, files)?;
+	let iter = WalkDirFromHashMap::new(root_uuid, dirs, files)?;
 
 	super::build_fs_tree(iter, error_callback, progress_callback, should_cancel)
 }

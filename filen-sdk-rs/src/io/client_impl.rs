@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::{
 	ops::Deref,
@@ -26,7 +26,7 @@ use crate::{
 use crate::{
 	ErrorKind,
 	error::ErrorExt,
-	fs::dir::{DirectoryTypeWithShareInfo, HasUUIDContents},
+	fs::dir::{DirectoryType, HasUUIDContents},
 	io::{FilenMetaExt, dir_download::DirDownloadCallback, meta_ext::FileTimesExt},
 };
 
@@ -185,9 +185,9 @@ impl Client {
 	where
 		C: super::dir_upload::DirUploadCallback + ?Sized,
 	{
-		let drop_canceller = AtomicDropCanceller {
-			cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-		};
+		use crate::util::AtomicDropCanceller;
+
+		let drop_canceller = AtomicDropCanceller::default();
 		let ref_callback = callback.deref();
 
 		let (tree, stats) = super::fs_tree::build_fs_tree_from_walkdir_iterator(
@@ -198,7 +198,7 @@ impl Client {
 			&mut |dirs, files, bytes| {
 				ref_callback.on_scan_progress(dirs, files, bytes);
 			},
-			&drop_canceller.cancelled,
+			drop_canceller.cancelled(),
 		)?;
 
 		let (dirs, files, bytes) = stats.snapshot();
@@ -211,18 +211,18 @@ impl Client {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn download_dir_recursively<C>(
 		self: Arc<Self>,
-		dir_path: PathBuf,
+		dir_path: String,
 		callback: impl Deref<Target = C>,
-		target: DirectoryTypeWithShareInfo<'_>,
+		target: DirectoryType<'_>,
 	) -> Result<(), Error>
 	where
 		C: DirDownloadCallback + ?Sized,
 	{
 		use filen_types::traits::CowHelpers;
 
-		let drop_canceller = AtomicDropCanceller {
-			cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-		};
+		use crate::util::AtomicDropCanceller;
+
+		let drop_canceller = AtomicDropCanceller::default();
 
 		let callback_ref = callback.deref();
 
@@ -238,7 +238,7 @@ impl Client {
 			&|current_bytes, total_bytes| {
 				callback_ref.on_query_download_progress(current_bytes, total_bytes);
 			},
-			&drop_canceller.cancelled,
+			drop_canceller.cancelled(),
 		)
 		.await?;
 
@@ -495,15 +495,5 @@ impl Client {
 			)
 			.await?;
 		Ok((file, reader.into_inner().into_std().await))
-	}
-}
-
-struct AtomicDropCanceller {
-	cancelled: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Drop for AtomicDropCanceller {
-	fn drop(&mut self) {
-		self.cancelled.store(true, Ordering::Relaxed);
 	}
 }

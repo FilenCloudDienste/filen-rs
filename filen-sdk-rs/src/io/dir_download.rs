@@ -11,7 +11,7 @@ use crate::{
 	error::{ErrorExt, ResultExt},
 	fs::{
 		NonRootFSObject,
-		dir::{DirectoryTypeWithShareInfo, RemoteDirectory},
+		dir::{DirectoryType, RemoteDirectory},
 		file::RemoteFile,
 	},
 	io::meta_ext::DirTimesExt,
@@ -19,20 +19,20 @@ use crate::{
 
 use super::fs_tree::Entry;
 
-type EntryResult = (Result<(), Error>, PathBuf, NonRootFSObject<'static>);
+type EntryResult = (Result<(), Error>, String, NonRootFSObject<'static>);
 
 impl Client {
 	pub(crate) async fn download_fs_tree_from_target_into_path(
 		self: Arc<Self>,
-		error_callback: &mut impl FnMut(Vec<(Error, PathBuf, NonRootFSObject<'static>)>),
+		error_callback: &mut impl FnMut(Vec<(Error, String, NonRootFSObject<'static>)>),
 		progress_callback: &mut impl FnMut(
-			Vec<(RemoteDirectory, PathBuf)>,
-			Vec<(RemoteFile, PathBuf)>,
+			Vec<(RemoteDirectory, String)>,
+			Vec<(RemoteFile, String)>,
 			u64,
 		),
-		path: PathBuf,
+		path: String,
 		tree: super::fs_tree::FSTree<RemoteDirectory, RemoteFile>,
-		target_folder: DirectoryTypeWithShareInfo<'static>,
+		target_folder: DirectoryType<'static>,
 	) -> Result<(), Error> {
 		let (entry_complete_sender, mut entry_complete_receiver) =
 			tokio::sync::mpsc::channel::<EntryResult>(16);
@@ -40,7 +40,7 @@ impl Client {
 		let mut update_interval = tokio::time::interval(CALLBACK_INTERVAL);
 
 		let (file_download_request_sender, file_download_request_receiver) =
-			tokio::sync::mpsc::channel::<(RemoteFile, PathBuf)>(self.max_parallel_requests);
+			tokio::sync::mpsc::channel::<(RemoteFile, String)>(self.max_parallel_requests);
 
 		let downloaded_bytes = Arc::new(AtomicU64::new(0));
 
@@ -125,23 +125,22 @@ impl Client {
 		self: Arc<Self>,
 		tree: super::fs_tree::FSTree<RemoteDirectory, RemoteFile>,
 		entry_complete_sender: tokio::sync::mpsc::Sender<EntryResult>,
-		file_download_request_sender: tokio::sync::mpsc::Sender<(RemoteFile, PathBuf)>,
-		target_folder: DirectoryTypeWithShareInfo<'static>,
-		root_path: PathBuf,
+		file_download_request_sender: tokio::sync::mpsc::Sender<(RemoteFile, String)>,
+		target_folder: DirectoryType<'static>,
+		root_path: String,
 	) -> tokio::task::JoinHandle<Result<(), Error>> {
 		tokio::task::spawn_blocking(move || {
 			match (std::fs::create_dir_all(&root_path), &target_folder) {
-				(Ok(()), DirectoryTypeWithShareInfo::Dir(target_folder)) => target_folder
-					.blocking_set_dir_times(&root_path)
+				(Ok(()), DirectoryType::Dir(target_folder)) => target_folder
+					.blocking_set_dir_times(root_path.as_ref())
 					.context("couldn't set directory times for newly created root directory")?,
-				(Ok(()), DirectoryTypeWithShareInfo::SharedDir(shared_folder)) => shared_folder
-					.dir
-					.blocking_set_dir_times(&root_path)
+				(Ok(()), DirectoryType::RootWithMeta(shared_folder)) => shared_folder
+					.blocking_set_dir_times(root_path.as_ref())
 					.context("couldn't set directory times for newly created root directory")?,
 				(Err(e), _) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-					if let DirectoryTypeWithShareInfo::Dir(target_folder) = target_folder {
+					if let DirectoryType::Dir(target_folder) = target_folder {
 						target_folder
-							.blocking_set_dir_times(&root_path)
+							.blocking_set_dir_times(root_path.as_ref())
 							.context("couldn't set directory times for root directory")?
 					}
 				}
@@ -169,7 +168,7 @@ impl Client {
 								.unwrap();
 							continue;
 						}
-						if let Err(e) = dir.blocking_set_dir_times(&path) {
+						if let Err(e) = dir.blocking_set_dir_times(path.as_ref()) {
 							log::error!(
 								"Failed to set dir times for downloaded dir {:?}: {}",
 								path,
@@ -204,10 +203,10 @@ impl Client {
 
 	fn spawn_file_downloader_task(
 		self: Arc<Self>,
-		mut file_download_request_receiver: tokio::sync::mpsc::Receiver<(RemoteFile, PathBuf)>,
+		mut file_download_request_receiver: tokio::sync::mpsc::Receiver<(RemoteFile, String)>,
 		entry_complete_sender: tokio::sync::mpsc::Sender<(
 			Result<(), Error>,
-			PathBuf,
+			String,
 			NonRootFSObject<'static>,
 		)>,
 		downloaded_bytes: Arc<AtomicU64>,
@@ -222,8 +221,12 @@ impl Client {
 				let entry_complete_sender = entry_complete_sender.clone();
 				let downloaded_bytes = Arc::clone(&downloaded_bytes);
 				join_set.spawn(async move {
-					let (res, path, file) = client
-						.download_file_to_path_in_dir_download(remote_file, path, &downloaded_bytes)
+					let (res, _, file) = client
+						.download_file_to_path_in_dir_download(
+							remote_file,
+							path.clone().into(),
+							&downloaded_bytes,
+						)
 						.await;
 
 					let _ = entry_complete_sender
@@ -273,12 +276,12 @@ pub trait DirDownloadCallback: Send + Sync {
 	/// Called periodically during the download process
 	fn on_download_update(
 		&self,
-		downloaded_dirs: Vec<(RemoteDirectory, PathBuf)>,
-		downloaded_files: Vec<(RemoteFile, PathBuf)>,
+		downloaded_dirs: Vec<(RemoteDirectory, String)>,
+		downloaded_files: Vec<(RemoteFile, String)>,
 		downloaded_bytes: u64,
 	);
 	/// Called when errors occur during the download process
-	fn on_download_errors(&self, errors: Vec<(Error, PathBuf, NonRootFSObject<'static>)>);
+	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootFSObject<'static>)>);
 }
 
-struct FileDownloadResult(Result<RemoteFile, (Error, PathBuf)>);
+struct FileDownloadResult(Result<RemoteFile, (Error, String)>);

@@ -5,7 +5,10 @@ use crate::{
 		DirectoryType, DirectoryTypeWithShareInfo, UnsharedDirectoryType,
 		meta::DirectoryMetaChanges,
 	},
-	js::{Dir, DirColor, DirEnum, DirsAndFiles, File, NonRootItemTagged, Root},
+	js::{
+		Dir, DirColor, DirEnum, DirWithPath, DirsAndFiles, DirsAndFilesWithPaths, File,
+		FileWithPath, NonRootItemTagged, Root,
+	},
 	runtime::do_on_commander,
 };
 use crate::{
@@ -40,11 +43,17 @@ pub trait DirContentDownloadProgressCallback: Send + Sync {
 }
 
 #[cfg(feature = "uniffi")]
+#[uniffi::export(with_foreign)]
+pub trait DirContentDownloadErrorCallback: Send + Sync {
+	fn on_errors(&self, errors: Vec<std::sync::Arc<Error>>);
+}
+
+#[cfg(feature = "uniffi")]
 #[uniffi::export]
 impl JsClient {
 	pub async fn list_dir_recursive(
 		&self,
-		dir: DirEnum,
+		dir: AnyDirEnum,
 		callback: std::sync::Arc<dyn DirContentDownloadProgressCallback>,
 	) -> Result<DirsAndFiles, Error> {
 		self.inner_list_dir_recursive(dir, move |downloaded, total| {
@@ -55,6 +64,34 @@ impl JsClient {
 		})
 		.await
 	}
+
+	pub async fn list_dir_recursive_with_paths(
+		&self,
+		dir: AnyDirEnum,
+		list_dir_progress_callback: std::sync::Arc<dyn DirContentDownloadProgressCallback>,
+		scan_error_callback: std::sync::Arc<dyn DirContentDownloadErrorCallback>,
+	) -> Result<DirsAndFilesWithPaths, Error> {
+		self.inner_list_dir_recursive_with_paths(
+			dir,
+			move |downloaded, total| {
+				let callback = std::sync::Arc::clone(&list_dir_progress_callback);
+				tokio::task::spawn_blocking(move || {
+					callback.on_progress(downloaded, total);
+				});
+			},
+			move |errors| {
+				let callback = std::sync::Arc::clone(&scan_error_callback);
+				let errors = errors
+					.into_iter()
+					.map(std::sync::Arc::new)
+					.collect::<Vec<_>>();
+				tokio::task::spawn_blocking(move || {
+					callback.on_errors(errors);
+				});
+			},
+		)
+		.await
+	}
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -63,7 +100,7 @@ impl JsClient {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursive")]
 	pub async fn list_dir_recursive(
 		&self,
-		dir: DirEnum,
+		dir: AnyDirEnum,
 		#[wasm_bindgen(
 			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
 		)]
@@ -91,12 +128,63 @@ impl JsClient {
 		})
 		.await
 	}
+
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listDirRecursiveWithPaths")]
+	pub async fn list_dir_recursive_with_paths(
+		&self,
+		dir: AnyDirEnum,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+		)]
+		list_dir_progress_callback: web_sys::js_sys::Function,
+		#[wasm_bindgen(unchecked_param_type = "(errors: [FilenSdkError]) => void")]
+		scan_error_callback: web_sys::js_sys::Function,
+	) -> Result<DirsAndFilesWithPaths, Error> {
+		use crate::runtime;
+		use wasm_bindgen::JsValue;
+		let (ls_sender, mut ls_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+		runtime::spawn_local(async move {
+			while let Some((downloaded, total)) = ls_receiver.recv().await {
+				let _ = list_dir_progress_callback.call2(
+					&JsValue::UNDEFINED,
+					&JsValue::from_f64(downloaded as f64),
+					&match total {
+						Some(v) => JsValue::from_f64(v as f64),
+						None => JsValue::UNDEFINED,
+					},
+				);
+			}
+		});
+
+		let (err_sender, mut err_receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<Error>>();
+		runtime::spawn_local(async move {
+			while let Some(errors) = err_receiver.recv().await {
+				let js_errors = web_sys::js_sys::Array::new();
+				for error in errors {
+					js_errors.push(&JsValue::from(error));
+				}
+				let _ = scan_error_callback.call1(&JsValue::UNDEFINED, &js_errors);
+			}
+		});
+
+		self.inner_list_dir_recursive_with_paths(
+			dir,
+			move |downloaded, total| {
+				let _ = ls_sender.send((downloaded, total));
+			},
+			move |errors| {
+				let _ = err_sender.send(errors);
+			},
+		)
+		.await
+	}
 }
 
 impl JsClient {
 	async fn inner_list_dir_recursive<F>(
 		&self,
-		dir: DirEnum,
+		dir: AnyDirEnum,
 		callback: F,
 	) -> Result<DirsAndFiles, Error>
 	where
@@ -104,8 +192,8 @@ impl JsClient {
 	{
 		let this = self.inner();
 		let (dirs, files) = do_on_commander(move || async move {
-			let dir_type = UnsharedDirectoryType::from(dir);
-			this.list_dir_recursive(&dir_type, &callback)
+			let dir_type = DirectoryType::from(dir);
+			this.list_dir_recursive(dir_type, &callback)
 				.await
 				.map(|(dirs, files)| {
 					(
@@ -116,6 +204,47 @@ impl JsClient {
 		})
 		.await?;
 		Ok(DirsAndFiles { dirs, files })
+	}
+
+	async fn inner_list_dir_recursive_with_paths<F, F1>(
+		&self,
+		dir: AnyDirEnum,
+		list_dir_callback: F,
+		mut scan_errors_callback: F1,
+	) -> Result<DirsAndFilesWithPaths, Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+		F1: FnMut(Vec<Error>) + Send + Sync + 'static,
+	{
+		let this = self.inner();
+		let (dirs, files) = do_on_commander(move || async move {
+			let dir_type = DirectoryType::from(dir);
+			this.list_dir_recursive_with_paths(
+				dir_type,
+				&list_dir_callback,
+				&mut scan_errors_callback,
+			)
+			.await
+			.map(|(dirs, files)| {
+				(
+					dirs.into_iter()
+						.map(|(dir, path)| DirWithPath {
+							dir: Dir::from(dir),
+							path,
+						})
+						.collect::<Vec<_>>(),
+					files
+						.into_iter()
+						.map(|(file, path)| FileWithPath {
+							file: File::from(file),
+							path,
+						})
+						.collect::<Vec<_>>(),
+				)
+			})
+		})
+		.await?;
+		Ok(DirsAndFilesWithPaths { dirs, files })
 	}
 }
 

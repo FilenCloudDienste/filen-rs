@@ -1,3 +1,4 @@
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(super) mod local;
 pub(super) mod remote;
 

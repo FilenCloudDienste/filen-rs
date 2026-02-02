@@ -5,7 +5,7 @@ use crate::{
 	auth::JsClient,
 	error::FilenSdkError,
 	fs::dir::UnsharedDirectoryType,
-	js::{AnyDirEnumWithShareInfo, Dir, DirEnum, File, NonRootItemTagged},
+	js::{AnyDirEnum, Dir, DirEnum, DirWithPath, File, FileWithPath, NonRootItemTagged},
 	util::MaybeSendCallback,
 };
 
@@ -99,18 +99,6 @@ impl crate::io::DirUploadCallback for Arc<dyn JsDirUploadCallback> {
 }
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct DirWithPath {
-	pub path: String,
-	pub dir: Dir,
-}
-
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct FileWithPath {
-	pub path: String,
-	pub file: File,
-}
-
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct DownloadError {
 	pub error: Arc<Error>,
 	pub path: String,
@@ -186,8 +174,8 @@ impl crate::io::DirDownloadCallback for Arc<dyn JsDirDownloadCallback> {
 
 	fn on_download_update(
 		&self,
-		downloaded_dirs: Vec<(super::RemoteDirectory, PathBuf)>,
-		downloaded_files: Vec<(super::RemoteFile, PathBuf)>,
+		downloaded_dirs: Vec<(super::RemoteDirectory, String)>,
+		downloaded_files: Vec<(super::RemoteFile, String)>,
 		downloaded_bytes: u64,
 	) {
 		let this = self.clone();
@@ -197,14 +185,14 @@ impl crate::io::DirDownloadCallback for Arc<dyn JsDirDownloadCallback> {
 				downloaded_dirs
 					.into_iter()
 					.map(|(dir, path)| DirWithPath {
-						path: path.into_string_lossy(),
+						path,
 						dir: dir.into(),
 					})
 					.collect(),
 				downloaded_files
 					.into_iter()
 					.map(|(file, path)| FileWithPath {
-						path: path.into_string_lossy(),
+						path,
 						file: file.into(),
 					})
 					.collect(),
@@ -215,7 +203,7 @@ impl crate::io::DirDownloadCallback for Arc<dyn JsDirDownloadCallback> {
 
 	fn on_download_errors(
 		&self,
-		errors: Vec<(Error, PathBuf, crate::fs::NonRootFSObject<'static>)>,
+		errors: Vec<(Error, String, crate::fs::NonRootFSObject<'static>)>,
 	) {
 		let this = self.clone();
 		tokio::task::spawn_blocking(move || {
@@ -225,7 +213,7 @@ impl crate::io::DirDownloadCallback for Arc<dyn JsDirDownloadCallback> {
 					.into_iter()
 					.map(|(e, path, object)| DownloadError {
 						error: Arc::new(e),
-						path: path.into_string_lossy(),
+						path,
 						item: object.into(),
 					})
 					.collect(),
@@ -268,15 +256,13 @@ impl JsClient {
 		&self,
 		dir_path: String,
 		callback: Arc<dyn JsDirDownloadCallback>,
-		target: AnyDirEnumWithShareInfo,
+		target: AnyDirEnum,
 		managed_future: crate::js::ManagedFuture,
 	) -> Result<(), Error> {
 		let this = self.inner();
 		managed_future
 			.into_js_managed_commander_future(move || async move {
 				let target = target.into();
-				let dir_path = PathBuf::from(dir_path);
-
 				this.download_dir_recursively(dir_path, &callback, target)
 					.await
 			})

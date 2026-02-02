@@ -1,7 +1,6 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, hash_map},
-	path::{Path, PathBuf},
 	sync::atomic::AtomicBool,
 };
 
@@ -11,6 +10,7 @@ use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL};
 
 use super::{WalkError, entry::*};
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(super) mod local;
 pub(super) mod remote;
 // #[cfg(test)]
@@ -46,7 +46,7 @@ impl<DirExtra, FileExtra> FSTree<DirExtra, FileExtra> {
 
 	pub(crate) fn dfs_iter_with_path<'a>(
 		&'a self,
-		root: &'a Path,
+		root: &'a str,
 	) -> FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
 		FSTreeDFSIteratorWithPath {
 			stack: vec![LevelState::from_dir_children_info(self.root_children())],
@@ -88,28 +88,33 @@ impl LevelState {
 pub(crate) struct FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
 	stack: Vec<LevelState>,
 	tree: &'a FSTree<DirExtra, FileExtra>,
-	root: &'a Path,
+	root: &'a str,
 }
 
 impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
-	fn build_path(&self, root: &Path, current_name: &str) -> PathBuf {
+	fn build_path(&self, root: &str, current_name: &str) -> String {
 		std::iter::once(root)
+			.filter(|r| !r.is_empty())
 			.chain(
 				self.stack
 					.iter()
 					.take(self.stack.len().saturating_sub(1))
 					.map(|level| {
 						let entry = &self.tree.entries[level.range.start - 1];
-						self.tree.get_name(entry).as_ref()
+						self.tree.get_name(entry)
 					}),
 			)
-			.chain(std::iter::once(current_name.as_ref()))
-			.collect()
+			.chain(std::iter::once(current_name))
+			// should be replaced by an intersperse + collect after
+			// https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.intersperse
+			// is stabilized
+			.collect::<Vec<_>>()
+			.join("/")
 	}
 }
 
 impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
-	type Item = (&'a Entry<DirExtra, FileExtra>, PathBuf); // entry and path
+	type Item = (&'a Entry<DirExtra, FileExtra>, String); // entry and path
 
 	fn next(&mut self) -> Option<Self::Item> {
 		let Some(next_index) = self.stack.last_mut()?.next_index() else {

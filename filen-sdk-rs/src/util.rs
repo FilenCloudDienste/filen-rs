@@ -1,3 +1,5 @@
+use std::sync::{Arc, atomic::Ordering};
+
 pub struct PathIterator<'a> {
 	path: &'a str,
 	split: std::str::MatchIndices<'a, char>,
@@ -185,6 +187,30 @@ pub(crate) trait IntoMaybeParallelIterator: IntoIterator {
 }
 #[cfg(not(feature = "multi-threaded-crypto"))]
 impl<T> IntoMaybeParallelIterator for T where T: IntoIterator {}
+
+pub(crate) struct AtomicDropCanceller {
+	cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AtomicDropCanceller {
+	pub fn cancelled(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+		&self.cancelled
+	}
+}
+
+impl Default for AtomicDropCanceller {
+	fn default() -> Self {
+		Self {
+			cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		}
+	}
+}
+
+impl Drop for AtomicDropCanceller {
+	fn drop(&mut self) {
+		self.cancelled.store(true, Ordering::Relaxed);
+	}
+}
 
 #[cfg(test)]
 mod tests {

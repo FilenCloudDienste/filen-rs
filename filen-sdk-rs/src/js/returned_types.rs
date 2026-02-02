@@ -56,3 +56,39 @@ pub struct DirsAndFiles {
 	pub dirs: Vec<Dir>,
 	pub files: Vec<File>,
 }
+
+#[derive(Serialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DirWithPath {
+	pub path: String,
+	pub dir: Dir,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct FileWithPath {
+	pub path: String,
+	pub file: File,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct DirsAndFilesWithPaths {
+	pub dirs: Vec<DirWithPath>,
+	pub files: Vec<FileWithPath>,
+}

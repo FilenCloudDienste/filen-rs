@@ -25,7 +25,7 @@ use crate::{
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	fs::{
 		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
-		dir::{HasUUIDContents, RemoteDirectory},
+		dir::{DirectoryType, HasUUIDContents, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
 	runtime::{blocking_join, do_cpu_intensive},
@@ -620,7 +620,9 @@ impl Client {
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
 		let public_link = DirPublicLink::new(self.make_meta_key());
-		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
+		let (dirs, files) = self
+			.list_dir_recursive(DirectoryType::Dir(Cow::Borrowed(dir)), progress_callback)
+			.await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
 			link_key: self
@@ -1030,7 +1032,9 @@ impl Client {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let (dirs, files) = self.list_dir_recursive(dir, progress_callback).await?;
+		let (dirs, files) = self
+			.list_dir_recursive(DirectoryType::Dir(Cow::Borrowed(dir)), progress_callback)
+			.await?;
 
 		let shared_user = client.into();
 		let shared_user = &shared_user;

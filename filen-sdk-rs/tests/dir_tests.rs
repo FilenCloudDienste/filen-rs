@@ -15,7 +15,7 @@ use filen_sdk_rs::{
 		FSObject, HasName, HasParent, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
 		client_impl::ObjectOrRemainingPath,
 		dir::{
-			RemoteDirectory, UnsharedDirectoryType,
+			DirectoryType, RemoteDirectory, UnsharedDirectoryType,
 			meta::{DirectoryMeta, DirectoryMetaChanges},
 			traits::HasDirMeta,
 		},
@@ -412,19 +412,38 @@ async fn list_recursive() {
 	let dir_c = client.create_dir(&dir_b, "c".to_string()).await.unwrap();
 
 	let (dirs, _) = client
-		.list_dir_recursive(test_dir, &|downloaded, total| {
-			log::trace!(
-				"List dir recursive progress: downloaded {} / {:?}",
-				downloaded,
-				total
-			);
-		})
+		.list_dir_recursive(
+			DirectoryType::Dir(Cow::Borrowed(test_dir)),
+			&|downloaded, total| {
+				log::trace!(
+					"List dir recursive progress: downloaded {} / {:?}",
+					downloaded,
+					total
+				);
+			},
+		)
 		.await
 		.unwrap();
 
 	assert!(dirs.contains(&dir_a));
 	assert!(dirs.contains(&dir_b));
 	assert!(dirs.contains(&dir_c));
+
+	let (dirs, _) = client
+		.clone()
+		.list_dir_recursive_with_paths(
+			DirectoryType::Dir(Cow::Borrowed(&test_dir)),
+			&|_downloaded, _total| {},
+			&mut |errors| {
+				panic!("received unexpected errors: {:?}", errors);
+			},
+		)
+		.await
+		.unwrap();
+
+	assert!(dirs.contains(&(dir_a, "a".to_string())));
+	assert!(dirs.contains(&(dir_b, "a/b".to_string())));
+	assert!(dirs.contains(&(dir_c, "a/b/c".to_string())));
 }
 
 #[shared_test_runtime]

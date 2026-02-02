@@ -18,7 +18,7 @@ use super::{
 	traits::{HasDirInfo, HasDirMeta},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, CowHelpers)]
 pub enum DirectoryType<'a> {
 	Root(Cow<'a, RootDirectory>),
 	RootWithMeta(Cow<'a, RootDirectoryWithMeta>),

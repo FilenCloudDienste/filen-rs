@@ -5,13 +5,18 @@ use uuid::Uuid;
 mod entry;
 mod tree;
 
+pub(crate) use entry::Entry;
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use entry::{
-	DirChildrenInfo, Entry,
+	DirChildrenInfo,
 	local::{ExtraLocalDirData, ExtraLocalFileData},
 };
-pub(crate) use tree::{
-	FSTree, local::build_fs_tree_from_walkdir_iterator, remote::build_fs_tree_from_remote_iterator,
-};
+
+pub(crate) use tree::{FSTree, remote::build_fs_tree_from_remote_iterator};
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) use tree::local::build_fs_tree_from_walkdir_iterator;
 
 use crate::ErrorKind;
 

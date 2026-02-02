@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
@@ -8,6 +9,7 @@ use futures::TryFutureExt;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
+use crate::util::AtomicDropCanceller;
 use crate::{
 	api,
 	auth::Client,
@@ -284,7 +286,7 @@ impl Client {
 	/// The progress callback receives the number of bytes downloaded so far and the total number of bytes to download, if known.
 	pub async fn list_dir_recursive<F>(
 		&self,
-		dir: &dyn HasContents,
+		dir: DirectoryType<'_>,
 		progress_callback: &F,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
 	where
@@ -563,5 +565,50 @@ impl Client {
 		.await?;
 		dir.color = color.into_owned_cow();
 		Ok(())
+	}
+
+	pub async fn list_dir_recursive_with_paths<F, F1>(
+		self: Arc<Self>,
+		dir: DirectoryType<'_>,
+		list_dir_progress_callback: &F,
+		scan_errors_callback: &mut F1,
+	) -> Result<(Vec<(RemoteDirectory, String)>, Vec<(RemoteFile, String)>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+		F1: FnMut(Vec<Error>),
+	{
+		let drop_canceller = AtomicDropCanceller::default();
+
+		let (tree, stats) = crate::io::fs_tree::build_fs_tree_from_remote_iterator(
+			self,
+			dir,
+			scan_errors_callback,
+			&mut |_dirs, _files, _bytes| {
+				// this can be a noop because we download everything all at once and then scan it
+				// which means that this should be very fast
+			},
+			list_dir_progress_callback,
+			drop_canceller.cancelled(),
+		)
+		.await?;
+
+		let iter = tree.dfs_iter_with_path("");
+		let (num_dirs, num_files, _) = stats.snapshot();
+
+		let mut files = Vec::with_capacity(num_files as usize);
+		let mut dirs = Vec::with_capacity(num_dirs as usize);
+
+		for (entry, path) in iter {
+			match entry {
+				crate::io::fs_tree::Entry::Dir(dir_entry) => {
+					dirs.push((dir_entry.extra_data().clone(), path))
+				}
+				crate::io::fs_tree::Entry::File(file_entry) => {
+					files.push((file_entry.extra_data().clone(), path))
+				}
+			}
+		}
+
+		Ok((dirs, files))
 	}
 }
