@@ -22,11 +22,11 @@ impl From<filen_types::error::ResponseError> for Error {
 	fn from(e: filen_types::error::ResponseError) -> Self {
 		let kind = {
 			let filen_types::error::ResponseError::ApiError { code, .. } = &e;
-			// this is the code returned by the server when the API key is invalid
-			if code.as_deref() == Some("api_key_not_found") {
-				ErrorKind::Unauthenticated
-			} else {
-				ErrorKind::Server
+			match code.as_deref() {
+				// this is the code returned by the server when the API key is invalid
+				Some("api_key_not_found") => ErrorKind::Unauthenticated,
+				Some("invalid_folder") | Some("folder_not_found") => ErrorKind::FolderNotFound,
+				_ => ErrorKind::Server,
 			}
 		};
 
@@ -105,6 +105,8 @@ pub enum ErrorKind {
 	Walk,
 	/// Target file changed during upload or download
 	FileChangedDuringSync,
+	/// Specified folder was not found
+	FolderNotFound,
 }
 
 /// Custom error type for the SDK

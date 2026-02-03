@@ -9,7 +9,7 @@ use std::{
 use chrono::{SubsecRound, Utc};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
-	Error,
+	Error, ErrorKind,
 	crypto::shared::generate_random_base64_values,
 	fs::{
 		FSObject, HasName, HasParent, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
@@ -790,4 +790,20 @@ async fn download_to_zip() {
 		b"file 3 content",
 		&file_3,
 	);
+}
+
+#[shared_test_runtime]
+async fn not_found_error() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let new_dir = client
+		.create_dir(test_dir, "to_be_deleted".to_string())
+		.await
+		.unwrap();
+
+	client.trash_dir(&mut new_dir.clone()).await.unwrap();
+	let err = client.list_dir(&new_dir).await.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::FolderNotFound)
 }
