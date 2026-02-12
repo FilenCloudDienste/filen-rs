@@ -312,6 +312,20 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "restoreDir")
+	)]
+	pub async fn restore_dir(&self, dir: Dir) -> Result<Dir, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			let mut dir = dir.into();
+			this.restore_dir(&mut dir).await?;
+			Ok(dir.into())
+		})
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "listTrash")
 	)]
 	pub async fn list_trash(&self) -> Result<DirsAndFiles, Error> {

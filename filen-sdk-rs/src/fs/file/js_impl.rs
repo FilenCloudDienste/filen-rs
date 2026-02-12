@@ -287,6 +287,21 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "restoreFile")
+	)]
+	pub async fn restore_file(&self, file: File) -> Result<File, Error> {
+		let this = self.inner();
+
+		do_on_commander(move || async move {
+			let mut file = file.try_into()?;
+			this.restore_file(&mut file).await?;
+			Ok(file.into())
+		})
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteFilePermanently")
 	)]
 	pub async fn delete_file_permanently(&self, file: File) -> Result<(), Error> {
@@ -377,5 +392,16 @@ impl JsClient {
 			Ok(file.into())
 		})
 		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteFileVersion")
+	)]
+	pub async fn delete_file_version(&self, version: FileVersion) -> Result<(), Error> {
+		let this = self.inner();
+		let version = version.try_into()?;
+
+		do_on_commander(move || async move { this.delete_file_version(version).await }).await
 	}
 }

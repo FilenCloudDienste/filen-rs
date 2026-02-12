@@ -293,6 +293,15 @@ impl Client {
 		Ok(())
 	}
 
+	pub async fn delete_file_version(&self, version: FileVersion) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
+		api::v3::file::delete::permanent::post(
+			self.client(),
+			&api::v3::file::delete::permanent::Request { uuid: version.uuid },
+		)
+		.await
+	}
+
 	#[cfg(feature = "malformed")]
 	pub async fn create_malformed_file(
 		&self,
