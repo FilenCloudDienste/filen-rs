@@ -511,12 +511,9 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn get_dir_size<'a, T>(
-		&self,
-		dir: &'a T,
-	) -> Result<api::v3::dir::size::Response, Error>
+	pub async fn get_dir_size<'a, T>(&self, dir: T) -> Result<api::v3::dir::size::Response, Error>
 	where
-		&'a T: Into<DirectoryTypeWithShareInfo<'a>>,
+		T: Into<DirectoryTypeWithShareInfo<'a>>,
 	{
 		let request = match dir.into() {
 			DirectoryTypeWithShareInfo::Root(r) => api::v3::dir::size::Request {

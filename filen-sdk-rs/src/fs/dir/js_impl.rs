@@ -384,7 +384,7 @@ impl JsClient {
 		let this = self.inner();
 
 		do_on_commander(move || async move {
-			this.get_dir_size(&DirectoryTypeWithShareInfo::from(dir))
+			this.get_dir_size(DirectoryTypeWithShareInfo::from(dir))
 				.await
 				.map(|resp| DirSizeResponse {
 					size: resp.size,
