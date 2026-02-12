@@ -535,10 +535,13 @@ impl Client {
 			async move {
 				if let NonRootFSObject::Dir(dir) = item {
 					let (dirs, files) = self.list_dir_recursive_no_callback(dir.as_ref()).await?;
+
+					// not using the closure here causes a borrow checker error
+					#[allow(clippy::redundant_closure)]
 					Ok(std::iter::once(NonRootFSObject::Dir(dir))
-						.chain(dirs.into_iter().map(Into::into))
-						.chain(files.into_iter().map(Into::into))
-						.collect::<Vec<_>>())
+						.chain(dirs.into_iter().map(|d| NonRootFSObject::from(d)))
+						.chain(files.into_iter().map(|f| NonRootFSObject::from(f)))
+						.collect::<Vec<NonRootFSObject<'_>>>())
 				} else {
 					Ok(vec![item])
 				}

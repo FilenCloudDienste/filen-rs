@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+pub use filen_macros::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo};
 use filen_types::crypto::Blake3Hash;
 
 use crate::{

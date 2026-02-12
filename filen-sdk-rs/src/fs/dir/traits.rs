@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+pub use filen_macros::{HasContents, HasDirInfo, HasDirMeta, HasRemoteDirInfo};
 use filen_types::{
 	api::v3::dir::color::DirColor,
 	fs::{ParentUuid, UuidStr},

@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
-use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
+use filen_macros::CowFrom;
+
+use filen_types::{fs::ObjectType, traits::CowHelpers};
 
 use crate::fs::file::enums::RemoteFileType;
 
@@ -10,8 +12,7 @@ use super::{
 	file::{RemoteFile, RemoteRootFile},
 };
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, CowFrom, HasUUID, CowHelpers)]
 pub enum UnsharedFSObject<'a> {
 	Dir(Cow<'a, RemoteDirectory>),
 	Root(Cow<'a, RootDirectory>),
@@ -28,19 +29,7 @@ impl<'a> From<UnsharedFSObject<'a>> for FSObject<'a> {
 	}
 }
 
-impl From<RemoteFile> for UnsharedFSObject<'static> {
-	fn from(file: RemoteFile) -> Self {
-		UnsharedFSObject::File(Cow::Owned(file))
-	}
-}
-
-impl From<RemoteDirectory> for UnsharedFSObject<'static> {
-	fn from(dir: RemoteDirectory) -> Self {
-		UnsharedFSObject::Dir(Cow::Owned(dir))
-	}
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, CowFrom, CowHelpers)]
 pub enum FSObject<'a> {
 	Dir(Cow<'a, RemoteDirectory>),
 	Root(Cow<'a, RootDirectory>),
@@ -71,7 +60,7 @@ impl<'a> From<&'a FSObject<'_>> for FSObject<'a> {
 	}
 }
 
-#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq, CowFrom, CowHelpers)]
 pub(crate) enum FsObjectIntoTypes<'a> {
 	Dir(DirectoryType<'a>),
 	File(RemoteFileType<'a>),
@@ -90,79 +79,12 @@ impl<'a> From<FSObject<'a>> for FsObjectIntoTypes<'a> {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(
+	Clone, Debug, PartialEq, Eq, HasParent, HasUUID, HasName, HasMeta, CowFrom, CowHelpers,
+)]
 pub enum NonRootFSObject<'a> {
 	Dir(Cow<'a, RemoteDirectory>),
 	File(Cow<'a, RemoteFile>),
-}
-
-impl<'a> From<&'a RemoteFile> for NonRootFSObject<'a> {
-	fn from(file: &'a RemoteFile) -> Self {
-		NonRootFSObject::File(Cow::Borrowed(file))
-	}
-}
-
-impl From<RemoteFile> for NonRootFSObject<'_> {
-	fn from(file: RemoteFile) -> Self {
-		NonRootFSObject::File(Cow::Owned(file))
-	}
-}
-
-impl<'a> From<&'a RemoteDirectory> for NonRootFSObject<'a> {
-	fn from(dir: &'a RemoteDirectory) -> Self {
-		NonRootFSObject::Dir(Cow::Borrowed(dir))
-	}
-}
-
-impl From<RemoteDirectory> for NonRootFSObject<'_> {
-	fn from(dir: RemoteDirectory) -> Self {
-		NonRootFSObject::Dir(Cow::Owned(dir))
-	}
-}
-
-impl<'a, 'b> From<&'b NonRootFSObject<'a>> for NonRootFSObject<'b> {
-	fn from(item: &'b NonRootFSObject<'a>) -> Self {
-		match item {
-			NonRootFSObject::Dir(cow) => NonRootFSObject::Dir(Cow::Borrowed(cow)),
-			NonRootFSObject::File(cow) => NonRootFSObject::File(Cow::Borrowed(cow)),
-		}
-	}
-}
-
-impl HasParent for NonRootFSObject<'_> {
-	fn parent(&self) -> &ParentUuid {
-		match self {
-			NonRootFSObject::Dir(dir) => dir.parent(),
-			NonRootFSObject::File(file) => file.parent(),
-		}
-	}
-}
-
-impl HasName for NonRootFSObject<'_> {
-	fn name(&self) -> Option<&str> {
-		match self {
-			NonRootFSObject::Dir(dir) => dir.name(),
-			NonRootFSObject::File(file) => file.name(),
-		}
-	}
-}
-
-impl HasMeta for NonRootFSObject<'_> {
-	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
-		match self {
-			NonRootFSObject::Dir(dir) => dir.get_meta_string(),
-			NonRootFSObject::File(file) => file.get_meta_string(),
-		}
-	}
-}
-
-impl HasUUID for NonRootFSObject<'_> {
-	fn uuid(&self) -> &UuidStr {
-		match self {
-			NonRootFSObject::Dir(dir) => dir.uuid(),
-			NonRootFSObject::File(file) => file.uuid(),
-		}
-	}
 }
 
 impl HasType for NonRootFSObject<'_> {

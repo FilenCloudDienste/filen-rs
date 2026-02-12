@@ -5,11 +5,12 @@ use syn::spanned::Spanned;
 use syn::token::Comma;
 use syn::{
 	Attribute, Block, Data, DeriveInput, Fields, FnArg, GenericParam, Ident, ItemFn, Lifetime,
-	LifetimeParam, Type, Variant, parse_macro_input,
+	LifetimeParam, Type, TypePath, Variant, parse_macro_input,
 };
 use syn::{Item, WherePredicate};
 
 mod anchored_ref;
+mod sdk_type_derives;
 
 #[derive(PartialEq, Eq)]
 enum SelfPrefix {
@@ -799,4 +800,291 @@ pub fn extract_cli_doc_fragments(_item: TokenStream) -> TokenStream {
 		}
 	}
 	.into()
+}
+
+// fs traits
+
+#[proc_macro_derive(HasParent)]
+pub fn derive_has_parent(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::traits::HasParent),
+		&[quote!(
+			fn parent(&self) -> &filen_types::fs::ParentUuid;
+		)],
+	)
+}
+
+#[proc_macro_derive(HasRemoteInfo)]
+pub fn derive_has_remote_info(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::traits::HasRemoteInfo),
+		&[
+			quote!(
+				fn favorited(&self) -> bool;
+			),
+			quote!(
+				fn timestamp(&self) -> chrono::DateTime<chrono::Utc>;
+			),
+		],
+	)
+}
+
+#[proc_macro_derive(HasUUID)]
+pub fn derive_has_uuid(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::traits::HasUUID),
+		&[quote!(
+			fn uuid(&self) -> &filen_types::fs::UuidStr;
+		)],
+	)
+}
+
+#[proc_macro_derive(HasName)]
+pub fn derive_has_name(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::traits::HasName),
+		&[quote!(
+			fn name(&self) -> Option<&str>;
+		)],
+	)
+}
+#[proc_macro_derive(HasMeta)]
+pub fn derive_has_meta(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::traits::HasMeta),
+		&[quote!(
+			fn get_meta_string(&self) -> Option<std::borrow::Cow<'_, str>>;
+		)],
+	)
+}
+
+// file traits
+
+#[proc_macro_derive(HasRemoteFileInfo)]
+pub fn derive_has_remote_file_info(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::file::traits::HasRemoteFileInfo),
+		&[
+			quote!(
+				fn region(&self) -> &str;
+			),
+			quote!(
+				fn bucket(&self) -> &str;
+			),
+			quote!(
+				fn hash(&self) -> Option<filen_types::crypto::Blake3Hash>;
+			),
+		],
+	)
+}
+
+#[proc_macro_derive(HasFileInfo)]
+pub fn derive_has_file_info(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::file::traits::HasFileInfo),
+		&[
+			quote!(
+				fn mime(&self) -> Option<&str>;
+			),
+			quote!(
+				fn created(&self) -> Option<chrono::DateTime<chrono::Utc>>;
+			),
+			quote!(
+				fn last_modified(&self) -> Option<chrono::DateTime<chrono::Utc>>;
+			),
+			quote!(
+				fn size(&self) -> u64;
+			),
+			quote!(
+				fn chunks(&self) -> u64;
+			),
+			quote!(
+				fn key(&self) -> Option<&crate::crypto::file::FileKey>;
+			),
+		],
+	)
+}
+
+#[proc_macro_derive(HasFileMeta)]
+pub fn derive_has_file_meta(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::file::traits::HasFileMeta),
+		&[quote!(
+			fn get_meta(&self) -> &FileMeta<'_>;
+		)],
+	)
+}
+
+#[proc_macro_derive(File)]
+pub fn derive_is_file(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(input, quote!(crate::fs::file::traits::File), &[])
+}
+
+// dir traits
+#[proc_macro_derive(HasContents)]
+pub fn derive_has_contents(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::dir::traits::HasContents),
+		&[quote!(
+			fn uuid_as_parent(&self) -> filen_types::fs::ParentUuid;
+		)],
+	)
+}
+
+#[proc_macro_derive(HasRemoteDirInfo)]
+pub fn derive_has_remote_dir_info(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::dir::traits::HasRemoteDirInfo),
+		&[quote!(
+			fn color(&self) -> filen_types::api::v3::dir::color::DirColor<'_>;
+		)],
+	)
+}
+
+#[proc_macro_derive(HasDirInfo)]
+pub fn derive_has_dir_info(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::dir::traits::HasDirInfo),
+		&[quote!(
+			fn created(&self) -> Option<chrono::DateTime<chrono::Utc>>;
+		)],
+	)
+}
+
+#[proc_macro_derive(HasDirMeta)]
+pub fn derive_has_dir_meta(input: TokenStream) -> TokenStream {
+	sdk_type_derives::delegate_trait(
+		input,
+		quote!(crate::fs::dir::traits::HasDirMeta),
+		&[quote!(
+			fn get_meta(&self) -> &crate::fs::dir::meta::DirectoryMeta<'_>;
+		)],
+	)
+}
+
+#[proc_macro_derive(CowFrom)]
+pub fn cow_from_derive(input: TokenStream) -> TokenStream {
+	let input = parse_macro_input!(input as DeriveInput);
+	let enum_name = &input.ident;
+
+	// Extract the lifetime parameter (assume first lifetime is the one we need)
+	let lifetime = input.generics.lifetimes().next().map(|l| &l.lifetime);
+
+	let generics = &input.generics;
+
+	let variants = match &input.data {
+		Data::Enum(data_enum) => &data_enum.variants,
+		_ => panic!("CowFrom can only be derived for enums"),
+	};
+
+	let mut impls = Vec::new();
+
+	for variant in variants {
+		let variant_name = &variant.ident;
+
+		// Get the inner type from Cow<'a, T>
+		if let Fields::Unnamed(fields) = &variant.fields {
+			if fields.unnamed.len() != 1 {
+				continue;
+			}
+
+			let field = fields.unnamed.first().unwrap();
+
+			// Extract the inner type T from Cow<'a, T>
+			if let Type::Path(TypePath { path, .. }) = &field.ty {
+				let last_segment = path.segments.last().unwrap();
+
+				if last_segment.ident != "Cow" {
+					continue;
+				}
+
+				// Extract the generic argument (the T in Cow<'a, T>)
+				if let syn::PathArguments::AngleBracketed(args) = &last_segment.arguments {
+					// Find the type argument (skip lifetime arguments)
+					let inner_type = args
+						.args
+						.iter()
+						.find_map(|arg| {
+							if let syn::GenericArgument::Type(ty) = arg {
+								Some(ty)
+							} else {
+								None
+							}
+						})
+						.expect("Cow should have a type argument");
+
+					// Generate From<&'a T> for Enum<'a>
+					if let Some(lt) = lifetime {
+						let impl_borrowed = quote! {
+							impl #generics From<&#lt #inner_type> for #enum_name #generics {
+								fn from(value: &#lt #inner_type) -> Self {
+									#enum_name::#variant_name(::std::borrow::Cow::Borrowed(value))
+								}
+							}
+						};
+						impls.push(impl_borrowed);
+					}
+
+					// Generate From<T> for Enum<'static>
+					// Build generics with 'static lifetime
+					let static_generics = if lifetime.is_some() {
+						// Replace lifetime with 'static
+						let params: Vec<_> = input
+							.generics
+							.params
+							.iter()
+							.map(|param| match param {
+								GenericParam::Lifetime(_) => {
+									let static_lt: Lifetime = syn::parse_quote!('static);
+									quote! { #static_lt }
+								}
+								GenericParam::Type(ty) => {
+									let ident = &ty.ident;
+									quote! { #ident }
+								}
+								GenericParam::Const(c) => {
+									let ident = &c.ident;
+									quote! { #ident }
+								}
+							})
+							.collect();
+
+						if params.is_empty() {
+							quote! {}
+						} else {
+							quote! { <#(#params),*> }
+						}
+					} else {
+						quote! {}
+					};
+
+					let impl_owned = quote! {
+						impl From<#inner_type> for #enum_name #static_generics {
+							fn from(value: #inner_type) -> Self {
+								#enum_name::#variant_name(::std::borrow::Cow::Owned(value))
+							}
+						}
+					};
+					impls.push(impl_owned);
+				}
+			}
+		}
+	}
+
+	let expanded = quote! {
+		#(#impls)*
+	};
+
+	TokenStream::from(expanded)
 }

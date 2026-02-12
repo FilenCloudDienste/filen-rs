@@ -9,6 +9,8 @@ use rsa::RsaPublicKey;
 
 use crate::{crypto::shared::MetaCrypter, runtime::do_cpu_intensive};
 
+pub use filen_macros::{HasMeta, HasName, HasParent, HasRemoteInfo, HasUUID};
+
 pub trait HasParent {
 	fn parent(&self) -> &ParentUuid;
 }
