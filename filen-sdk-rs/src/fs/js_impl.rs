@@ -36,4 +36,17 @@ impl JsClient {
 		})
 		.await
 	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "emptyTrash")
+	)]
+	pub async fn empty_trash(&self) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.empty_trash().await?;
+			Ok(())
+		})
+		.await
+	}
 }
