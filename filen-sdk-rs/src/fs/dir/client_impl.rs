@@ -152,20 +152,31 @@ impl Client {
 		&self,
 		dir: &dyn HasContents,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
-		let response = api::v3::dir::content::post(
-			self.client(),
-			&api::v3::dir::content::Request {
-				uuid: dir.uuid_as_parent(),
-			},
-		)
-		.await?;
+		let parent_uuid = dir.uuid_as_parent();
+
+		let (files, dirs) = if parent_uuid == ParentUuid::Links {
+			api::v3::dir::link_content::post(
+				self.client(),
+				&api::v3::dir::link_content::Request {
+					uuid: ParentUuid::Links,
+				},
+			)
+			.await
+			.map(|resp| (resp.files, resp.dirs))?
+		} else {
+			api::v3::dir::content::post(
+				self.client(),
+				&api::v3::dir::content::Request { uuid: parent_uuid },
+			)
+			.await
+			.map(|resp| (resp.files, resp.dirs))?
+		};
 
 		let crypter = self.crypter();
 
 		do_cpu_intensive(|| {
 			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
+				|| dirs
 					.into_maybe_par_iter()
 					.map(|d| {
 						RemoteDirectory::blocking_from_encrypted(
@@ -179,8 +190,7 @@ impl Client {
 						)
 					})
 					.collect::<Vec<_>>(),
-				|| response
-					.files
+				|| files
 					.into_maybe_par_iter()
 					.map(|f| {
 						let meta =

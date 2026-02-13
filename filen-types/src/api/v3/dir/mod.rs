@@ -5,6 +5,7 @@ pub mod delete;
 pub mod download;
 pub mod exists;
 pub mod link;
+pub mod link_content;
 pub mod metadata;
 pub mod r#move;
 pub mod restore;
