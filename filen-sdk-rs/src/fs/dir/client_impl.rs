@@ -154,23 +154,22 @@ impl Client {
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
 		let parent_uuid = dir.uuid_as_parent();
 
-		let (files, dirs) = if parent_uuid == ParentUuid::Links {
-			api::v3::dir::link_content::post(
-				self.client(),
-				&api::v3::dir::link_content::Request {
-					uuid: ParentUuid::Links,
-				},
-			)
-			.await
-			.map(|resp| (resp.files, resp.dirs))?
-		} else {
-			api::v3::dir::content::post(
-				self.client(),
-				&api::v3::dir::content::Request { uuid: parent_uuid },
-			)
-			.await
-			.map(|resp| (resp.files, resp.dirs))?
-		};
+		let (files, dirs) =
+			if parent_uuid == ParentUuid::Links || parent_uuid == ParentUuid::Favorites {
+				api::v3::dir::link_content::post(
+					self.client(),
+					&api::v3::dir::link_content::Request { uuid: parent_uuid },
+				)
+				.await
+				.map(|resp| (resp.files, resp.dirs))?
+			} else {
+				api::v3::dir::content::post(
+					self.client(),
+					&api::v3::dir::content::Request { uuid: parent_uuid },
+				)
+				.await
+				.map(|resp| (resp.files, resp.dirs))?
+			};
 
 		let crypter = self.crypter();
 

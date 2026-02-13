@@ -795,6 +795,28 @@ test("listLinkedItems", async () => {
 	expect(foundFile).toEqual(file)
 })
 
+test("favorites", async () => {
+	let dir = await state.createDir(testDir, "favorites-dir")
+	let file = await state.uploadFile(new TextEncoder().encode("favorites file content"), {
+		parent: testDir,
+		name: "favorites-file.txt"
+	})
+
+	expect(dir.favorited).toBe(false)
+
+	let favorites = await state.listFavorites()
+	expect(favorites.dirs.find(i => i.uuid === dir.uuid)).toBeUndefined()
+	expect(favorites.files.find(i => i.uuid === file.uuid)).toBeUndefined()
+
+	dir = (await state.setFavorite(dir, true)) as Dir
+	file = (await state.setFavorite(file, true)) as File
+	favorites = await state.listFavorites()
+	const foundDir = favorites.dirs.find(i => i.uuid === dir.uuid)
+	expect(foundDir).toBeDefined()
+	const foundFile = favorites.files.find(i => i.uuid === file.uuid)
+	expect(foundFile).toBeDefined()
+})
+
 test("service worker", async () => {
 	if (!("serviceWorker" in navigator)) {
 		throw new Error("Service workers are not supported in this environment")
