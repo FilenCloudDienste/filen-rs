@@ -83,6 +83,8 @@ jobs:
         run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
+      - name: Run clippy on tests
+        run: cargo clippy --tests -- -D warnings
 
   ci-macos:
     # also runs iOS and Android clippy
@@ -132,6 +134,8 @@ jobs:
         run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
+      - name: Run clippy on tests
+        run: cargo clippy --tests -- -D warnings
       - name: Run clippy iOS
         run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder -- -D warnings
       - name: Run clippy iOS uniffi
