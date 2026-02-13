@@ -774,6 +774,27 @@ test("sockets", async () => {
 	expect(await state.isSocketConnected()).toBe(false)
 })
 
+test("listLinkedItems", async () => {
+	const dir = await state.createDir(testDir, "linked-items-dir")
+	const file = await state.uploadFile(new TextEncoder().encode("linked file content"), {
+		parent: dir,
+		name: "linked-file.txt"
+	})
+	await state.publicLinkDir(dir, (downloaded, total) => {
+		console.log("callback", downloaded, total)
+	})
+	let linkedItems = await state.listLinkedItems()
+	const found = linkedItems.dirs.find(i => i.uuid === dir.uuid)
+	expect(found).toBeDefined()
+	expect(found).toEqual(dir)
+
+	await state.publicLinkFile(file)
+	linkedItems = await state.listLinkedItems()
+	const foundFile = linkedItems.files.find(i => i.uuid === file.uuid)
+	expect(foundFile).toBeDefined()
+	expect(foundFile).toEqual(file)
+})
+
 test("service worker", async () => {
 	if (!("serviceWorker" in navigator)) {
 		throw new Error("Service workers are not supported in this environment")

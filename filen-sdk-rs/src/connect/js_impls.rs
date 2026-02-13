@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use filen_types::fs::UuidStr;
+use filen_types::fs::{ParentUuid, UuidStr};
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
@@ -582,6 +582,25 @@ impl JsClient {
 						files.into_iter().map(File::from).collect::<Vec<_>>(),
 					)
 				})
+		})
+		.await?;
+
+		Ok(DirsAndFiles { dirs, files })
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedItems")
+	)]
+	pub async fn list_linked_items(&self) -> Result<DirsAndFiles, Error> {
+		let this = self.inner();
+		let (dirs, files) = runtime::do_on_commander(move || async move {
+			this.list_dir(&ParentUuid::Links).await.map(|(d, f)| {
+				(
+					d.into_iter().map(Dir::from).collect(),
+					f.into_iter().map(File::from).collect(),
+				)
+			})
 		})
 		.await?;
 
