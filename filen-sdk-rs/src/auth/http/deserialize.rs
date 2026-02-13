@@ -115,21 +115,37 @@ where
 				Poll::Ready(Ok(res)) => {
 					let response: FilenResponse<Res> = if *this.response_type == ResponseType::Large
 					{
-						rmp_serde::from_slice(res.as_ref()).map_err(|e| {
-							RetryError::NoRetry(Error::custom_with_source(
-								ErrorKind::Response,
-								e,
-								Some("msgpack deserialization"),
-							))
-						})?
+						match rmp_serde::from_slice(res.as_ref()) {
+							Ok(resp) => resp,
+							Err(e) => {
+								return Poll::Ready(Err(RetryError::NoRetry(
+									Error::custom_with_source(
+										ErrorKind::Response,
+										e,
+										Some(format!(
+											"Failed to deserialize msgpack response: {}",
+											String::from_utf8_lossy(res.as_ref())
+										)),
+									),
+								)));
+							}
+						}
 					} else {
-						serde_json::from_slice(res.as_ref()).map_err(|e| {
-							RetryError::NoRetry(Error::custom_with_source(
-								ErrorKind::Response,
-								e,
-								Some("json deserialization"),
-							))
-						})?
+						match serde_json::from_slice(res.as_ref()) {
+							Ok(resp) => resp,
+							Err(e) => {
+								return Poll::Ready(Err(RetryError::NoRetry(
+									Error::custom_with_source(
+										ErrorKind::Response,
+										e,
+										Some(format!(
+											"Failed to deserialize json response: {}",
+											String::from_utf8_lossy(res.as_ref())
+										)),
+									),
+								)));
+							}
+						}
 					};
 
 					match ResponseIntoData::into_data(response) {
