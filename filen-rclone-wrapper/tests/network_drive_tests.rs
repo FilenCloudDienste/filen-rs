@@ -54,7 +54,7 @@ async fn start_rclone_mount() {
 		assert!(
 			NetworkDrive::mount(
 				&client,
-				&config_dir,
+				&RcloneInstallationConfig::new(&config_dir),
 				Some("C:\\"),
 				false,
 				None,
