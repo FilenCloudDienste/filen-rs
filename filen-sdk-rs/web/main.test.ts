@@ -802,19 +802,30 @@ test("favorites", async () => {
 		name: "favorites-file.txt"
 	})
 
-	expect(dir.favorited).toBe(false)
-
 	let favorites = await state.listFavorites()
+
 	expect(favorites.dirs.find(i => i.uuid === dir.uuid)).toBeUndefined()
 	expect(favorites.files.find(i => i.uuid === file.uuid)).toBeUndefined()
 
-	dir = (await state.setFavorite(dir, true)) as Dir
-	file = (await state.setFavorite(file, true)) as File
+	const setDir = await state.setFavorite(dir, true)
+	if (setDir.type !== "dir") {
+		throw new Error("Expected setFavorite to return a Dir")
+	}
+	dir = setDir
+	const setFile = await state.setFavorite(file, true)
+	if (setFile.type !== "file") {
+		throw new Error("Expected setFavorite to return a File")
+	}
+	file = setFile
+
 	favorites = await state.listFavorites()
 	const foundDir = favorites.dirs.find(i => i.uuid === dir.uuid)
 	expect(foundDir).toBeDefined()
+	expect(dir).toMatchObject(foundDir as Dir)
+
 	const foundFile = favorites.files.find(i => i.uuid === file.uuid)
 	expect(foundFile).toBeDefined()
+	expect(file).toMatchObject(foundFile as File)
 })
 
 test("service worker", async () => {
