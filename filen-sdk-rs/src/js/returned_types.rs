@@ -12,7 +12,7 @@ use tsify::Tsify;
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(Tsify),
-	tsify(into_wasm_abi)
+	tsify(into_wasm_abi, large_number_types_as_bigints)
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "type")]
