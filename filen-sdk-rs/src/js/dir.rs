@@ -232,7 +232,8 @@ pub struct Dir {
 	pub color: DirColor,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "chrono::serde::ts_milliseconds")
 	)]
 	pub timestamp: DateTime<Utc>,
 	pub favorited: bool,
@@ -319,7 +320,8 @@ pub struct RootWithMeta {
 	pub color: DirColor,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "chrono::serde::ts_milliseconds")
 	)]
 	pub timestamp: DateTime<Utc>,
 	pub meta: DirMeta,

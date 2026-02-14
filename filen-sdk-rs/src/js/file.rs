@@ -172,7 +172,8 @@ pub struct File {
 	pub bucket: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "chrono::serde::ts_milliseconds")
 	)]
 	pub timestamp: DateTime<Utc>,
 	#[cfg_attr(
@@ -240,7 +241,8 @@ pub struct RootFile {
 	pub bucket: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "chrono::serde::ts_milliseconds")
 	)]
 	pub timestamp: DateTime<Utc>,
 	pub meta: FileMeta,
