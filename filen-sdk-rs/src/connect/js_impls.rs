@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-#[cfg(feature = "uniffi")]
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -7,16 +6,19 @@ use filen_types::fs::{ParentUuid, UuidStr};
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::auth::js_impls::UnauthJsClient;
 use crate::{
 	Error,
-	auth::JsClient,
-	connect::{DirPublicLink, FilePublicLink},
+	auth::{JsClient, http::UnauthorizedClient, shared_client::SharedClient},
+	connect::{DirPublicLink, FilePublicLink, PublicLinkSharedClientExt},
 	fs::dir::DirectoryMetaType,
 	js::{Dir, DirWithMetaEnum, DirsAndFiles, File, SharedDir, SharedFile},
 	runtime::{self, do_on_commander},
 };
 #[cfg(feature = "uniffi")]
 use crate::{
+	auth::js_impls::UnauthJsClient,
 	connect::{DirPublicLinkU, FilePublicLinkU},
 	fs::dir::js_impl::DirContentDownloadProgressCallback,
 };
@@ -370,19 +372,6 @@ impl JsClient {
 		};
 		self.remove_dir_link_inner(link).await
 	}
-
-	pub async fn list_linked_dir(
-		&self,
-		dir: DirWithMetaEnum,
-		link: Arc<DirPublicLinkU>,
-	) -> Result<DirsAndFiles, Error> {
-		let link = match Arc::try_unwrap(link) {
-			Ok(link) => link.inner.into_inner().unwrap_or_else(|e| e.into_inner()),
-			Err(e) => e.inner.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-		};
-
-		self.list_linked_dir_inner(dir, link).await
-	}
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -561,31 +550,6 @@ impl JsClient {
 	pub async fn remove_dir_link_inner(&self, link: DirPublicLink) -> Result<(), Error> {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move { this.remove_dir_link(link).await }).await
-	}
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDir")
-	)]
-	pub async fn list_linked_dir_inner(
-		&self,
-		dir: DirWithMetaEnum,
-		link: DirPublicLink,
-	) -> Result<DirsAndFiles, Error> {
-		let this = self.inner();
-		let (dirs, files) = runtime::do_on_commander(move || async move {
-			this.list_linked_dir(&DirectoryMetaType::from(dir), &link)
-				.await
-				.map(|(dirs, files)| {
-					(
-						dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
-						files.into_iter().map(File::from).collect::<Vec<_>>(),
-					)
-				})
-		})
-		.await?;
-
-		Ok(DirsAndFiles { dirs, files })
 	}
 
 	#[cfg_attr(
@@ -867,5 +831,150 @@ impl JsClient {
 			move || async move { this.remove_shared_link_out(link_uuid, receiver_id).await },
 		)
 		.await
+	}
+}
+
+async fn list_linked_dir_inner_generic<F, T, C>(
+	client: Arc<T>,
+	dir: DirWithMetaEnum,
+	link: DirPublicLink,
+	callback: F,
+) -> Result<DirsAndFiles, Error>
+where
+	F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+	T: SharedClient<C> + Send + Sync + 'static,
+	C: UnauthorizedClient + 'static,
+{
+	let (dirs, files) = runtime::do_on_commander(move || async move {
+		client
+			.list_linked_dir(&DirectoryMetaType::from(dir), &link, &callback)
+			.await
+			.map(|(dirs, files)| {
+				(
+					dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+					files.into_iter().map(File::from).collect::<Vec<_>>(),
+				)
+			})
+	})
+	.await?;
+
+	Ok(DirsAndFiles { dirs, files })
+}
+
+#[cfg(feature = "uniffi")]
+async fn list_linked_dir_uniffi<T, C>(
+	client: Arc<T>,
+	dir: DirWithMetaEnum,
+	link: Arc<DirPublicLinkU>,
+	callback: Arc<dyn DirContentDownloadProgressCallback>,
+) -> Result<DirsAndFiles, Error>
+where
+	T: SharedClient<C> + Send + Sync + 'static,
+	C: UnauthorizedClient + 'static,
+{
+	let link = match Arc::try_unwrap(link) {
+		Ok(link) => link.inner.into_inner().unwrap_or_else(|e| e.into_inner()),
+		Err(e) => e.inner.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+	};
+	list_linked_dir_inner_generic(client, dir, link, move |downloaded, total| {
+		let callback = Arc::clone(&callback);
+		tokio::task::spawn_blocking(move || {
+			callback.on_progress(downloaded, total);
+		});
+	})
+	.await
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl JsClient {
+	pub async fn list_linked_dir(
+		&self,
+		dir: DirWithMetaEnum,
+		link: Arc<DirPublicLinkU>,
+		callback: Arc<dyn DirContentDownloadProgressCallback>,
+	) -> Result<DirsAndFiles, Error> {
+		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
+	}
+}
+
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl UnauthJsClient {
+	pub async fn list_linked_dir(
+		&self,
+		dir: DirWithMetaEnum,
+		link: Arc<DirPublicLinkU>,
+		callback: Arc<dyn DirContentDownloadProgressCallback>,
+	) -> Result<DirsAndFiles, Error> {
+		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+async fn list_linked_dir_wasm<T, C>(
+	client: Arc<T>,
+	dir: DirWithMetaEnum,
+	link: DirPublicLink,
+	callback: web_sys::js_sys::Function,
+) -> Result<DirsAndFiles, Error>
+where
+	T: SharedClient<C> + Send + Sync + 'static,
+	C: UnauthorizedClient + 'static,
+{
+	use crate::runtime;
+	use wasm_bindgen::JsValue;
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+	runtime::spawn_local(async move {
+		while let Some((downloaded, total)) = receiver.recv().await {
+			let _ = callback.call2(
+				&JsValue::UNDEFINED,
+				&JsValue::from_f64(downloaded as f64),
+				&match total {
+					Some(v) => JsValue::from_f64(v as f64),
+					None => JsValue::UNDEFINED,
+				},
+			);
+		}
+	});
+
+	list_linked_dir_inner_generic(client, dir, link, move |downloaded, total| {
+		let _ = sender.send((downloaded, total));
+	})
+	.await
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+impl JsClient {
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDir")]
+	pub async fn list_linked_dir(
+		&self,
+		dir: DirWithMetaEnum,
+		link: DirPublicLink,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+		)]
+		callback: web_sys::js_sys::Function,
+	) -> Result<DirsAndFiles, Error> {
+		list_linked_dir_wasm(self.inner(), dir, link, callback).await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
+impl UnauthJsClient {
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDir")]
+	pub async fn list_linked_dir(
+		&self,
+		dir: DirWithMetaEnum,
+		link: DirPublicLink,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+		)]
+		callback: web_sys::js_sys::Function,
+	) -> Result<DirsAndFiles, Error> {
+		list_linked_dir_wasm(self.inner(), dir, link, callback).await
 	}
 }

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
-	auth::{Client, MetaKey},
+	auth::{Client, MetaKey, http::UnauthorizedClient, shared_client::SharedClient},
 	crypto::{file::FileKey, shared::MetaCrypter},
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	fs::{
@@ -29,7 +29,7 @@ use crate::{
 		file::{RemoteFile, meta::FileMeta},
 	},
 	runtime::{blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture},
+	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture, MaybeSendSync},
 };
 
 pub mod contacts;
@@ -934,66 +934,6 @@ impl Client {
 		}))
 	}
 
-	pub async fn list_linked_dir(
-		&self,
-		dir: &dyn HasUUIDContents,
-		link: &DirPublicLink,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
-		let response = api::v3::dir::link::content::post(
-			self.client(),
-			&api::v3::dir::link::content::Request {
-				uuid: link.link_uuid,
-				password: Cow::Borrowed(&link.get_password_hash()?),
-				parent: *dir.uuid(),
-			},
-		)
-		.await?;
-
-		let crypter = link.crypter().ok_or(MetadataWasNotDecryptedError)?;
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
-					.into_maybe_par_iter()
-					.map(|d| {
-						RemoteDirectory::blocking_from_encrypted(
-							d.uuid,
-							d.parent.into(),
-							d.color,
-							false,
-							d.timestamp,
-							d.metadata,
-							crypter,
-						)
-					})
-					.collect::<Vec<_>>(),
-				|| response
-					.files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							f.parent.into(),
-							f.size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							false,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, Error>>()
-			);
-
-			Ok((dirs, files?))
-		})
-		.await
-	}
-
 	pub async fn remove_dir_link(&self, link: DirPublicLink) -> Result<(), Error> {
 		api::v3::dir::link::remove::post(
 			self.client(),
@@ -1222,5 +1162,215 @@ impl Client {
 		)
 		.await?;
 		Ok(())
+	}
+}
+
+#[allow(private_bounds, async_fn_in_trait)]
+pub trait PublicLinkSharedClientExt<'a, C>: SharedClient<C> {
+	// async fn decode_public_file_link(
+	// 	&self,
+	// 	link_uuid: UuidStr,
+	// 	link_password: Option<String>,
+	// 	link_key: String,
+	// ) -> Result<LinkedFile, Error>;
+
+	/// The returned dirs here should not be used as normal RemoteDirectories,
+	/// they can only be listed via list_linked_dir again.
+	async fn list_linked_dir<F>(
+		&self,
+		dir: &dyn HasUUIDContents,
+		link: &DirPublicLink,
+		callback: &F,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync;
+
+	/// The returned dirs here should not be used as normal RemoteDirectories,
+	/// they can only be listed via list_linked_dir again.
+	async fn list_linked_dir_recursive<F>(
+		&self,
+		dir: &dyn HasUUIDContents,
+		link: &DirPublicLink,
+		callback: &F,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync;
+}
+
+impl<'a, T, C> PublicLinkSharedClientExt<'a, C> for T
+where
+	T: SharedClient<C>,
+	C: UnauthorizedClient + MaybeSendSync + 'a,
+{
+	// async fn decode_public_file_link(
+	// 	&self,
+	// 	link_uuid: UuidStr,
+	// 	link_password: Option<String>,
+	// 	link_key: String,
+	// ) -> Result<LinkedFile, Error> {
+	// 	let info = api::v3::file::link::password::post(
+	// 		self.get_unauth_client(),
+	// 		&api::v3::file::link::password::Request { uuid: link_uuid },
+	// 	)
+	// 	.await?;
+
+	// 	let password_hash = match (info.has_password, link_password.as_deref()) {
+	// 		(true, None) => {
+	// 			return Err(Error::custom(
+	// 				ErrorKind::Unauthenticated,
+	// 				"Password required for this link",
+	// 			));
+	// 		}
+	// 		(_, maybe_pw) => {
+	// 			crate::crypto::connect::derive_password_for_link(maybe_pw, &info.salt)?
+	// 		}
+	// 	};
+
+	// 	let response = api::v3::file::link::info::post(
+	// 		self.get_unauth_client(),
+	// 		&api::v3::file::link::info::Request {
+	// 			uuid: link_uuid,
+	// 			password: Cow::Borrowed(&password_hash),
+	// 		},
+	// 	)
+	// 	.await?;
+
+	// 	let file_key = FileKey::from_string_and_meta(Cow::Owned(link_key), &response.mime)?;
+	// 	let meta_key = file_key.to_meta_key()?;
+	// 	do_cpu_intensive(|| LinkedFile::blocking_from_response(file_key, meta_key, response)).await
+	// }
+
+	async fn list_linked_dir<F>(
+		&self,
+		dir: &dyn HasUUIDContents,
+		link: &DirPublicLink,
+		callback: &F,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		let response = api::v3::dir::link::content::post_large(
+			self.get_unauth_client(),
+			&api::v3::dir::link::content::Request {
+				uuid: link.link_uuid,
+				password: Cow::Borrowed(&link.get_password_hash()?),
+				parent: *dir.uuid(),
+			},
+			Some(callback),
+		)
+		.await?;
+
+		let crypter = link.crypter().ok_or(MetadataWasNotDecryptedError)?;
+
+		do_cpu_intensive(|| {
+			let (dirs, files) = blocking_join!(
+				|| response
+					.dirs
+					.into_maybe_par_iter()
+					.map(|d| {
+						RemoteDirectory::blocking_from_encrypted(
+							d.uuid,
+							d.parent.into(),
+							d.color,
+							false,
+							d.timestamp,
+							d.metadata,
+							crypter,
+						)
+					})
+					.collect::<Vec<_>>(),
+				|| response
+					.files
+					.into_maybe_par_iter()
+					.map(|f| {
+						let meta =
+							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
+						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+							f.uuid,
+							f.parent.into(),
+							f.size,
+							f.chunks,
+							f.region,
+							f.bucket,
+							f.timestamp,
+							false,
+							meta,
+						))
+					})
+					.collect::<Result<Vec<_>, Error>>()
+			);
+
+			Ok((dirs, files?))
+		})
+		.await
+	}
+
+	async fn list_linked_dir_recursive<F>(
+		&self,
+		dir: &dyn HasUUIDContents,
+		link: &DirPublicLink,
+		callback: &F,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		let response = api::v3::dir::download::link::post_large(
+			self.get_unauth_client(),
+			&api::v3::dir::download::link::Request {
+				uuid: link.link_uuid,
+				password: Cow::Borrowed(&link.get_password_hash()?),
+				parent: *dir.uuid(),
+				skip_cache: false,
+			},
+			Some(callback),
+		)
+		.await?;
+
+		let crypter = link.crypter().ok_or(MetadataWasNotDecryptedError)?;
+
+		do_cpu_intensive(|| {
+			let (dirs, files) = blocking_join!(
+				|| response
+					.dirs
+					.into_maybe_par_iter()
+					.filter_map(|response_dir| {
+						Some(RemoteDirectory::blocking_from_encrypted(
+							response_dir.uuid,
+							match response_dir.parent {
+								// the request returns the base dir for the request as one of its dirs, we filter it out here
+								None => return None,
+								Some(parent) => parent,
+							},
+							response_dir.color,
+							response_dir.favorited,
+							response_dir.timestamp,
+							response_dir.meta,
+							crypter,
+						))
+					})
+					.collect::<Vec<_>>(),
+				|| response
+					.files
+					.into_maybe_par_iter()
+					.map(|f| {
+						let meta =
+							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
+						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+							f.uuid,
+							f.parent,
+							f.chunks_size,
+							f.chunks,
+							f.region,
+							f.bucket,
+							f.timestamp,
+							f.favorited,
+							meta,
+						))
+					})
+					.collect::<Result<Vec<_>, _>>()
+			);
+			Ok((dirs, files?))
+		})
+		.await
 	}
 }

@@ -8,7 +8,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use filen_sdk_rs::{auth::StringifiedClient, fs::HasUUID};
+use filen_sdk_rs::{
+	auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+	fs::HasUUID,
+};
 use filen_types::{auth::FilenSDKConfig, crypto::Blake3Hash};
 use log::{debug, info, trace};
 use rusqlite::Connection;
@@ -503,7 +506,8 @@ impl AuthCacheState {
 		max_thumbnail_files_budget: u64,
 		max_cache_files_budget: u64,
 	) -> Result<Self, CacheError> {
-		let client = filen_sdk_rs::auth::Client::from_stringified(config.into())?;
+		let unauth_client = UnauthClient::from_config(ClientConfig::default())?;
+		let client = unauth_client.from_stringified(config.into())?;
 
 		let cache_state_file = files_dir.join("db_state.json");
 
@@ -552,7 +556,9 @@ impl AuthCacheState {
 			"Creating FilenMobileCacheState from strings for email: {}",
 			client.email
 		);
-		let client = filen_sdk_rs::auth::Client::from_stringified(client)?;
+
+		let unauth_client = UnauthClient::from_config(ClientConfig::default())?;
+		let client = unauth_client.from_stringified(client)?;
 
 		let cache_state_file = std::convert::AsRef::<Path>::as_ref(files_dir).join("db_state.json");
 

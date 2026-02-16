@@ -586,7 +586,7 @@ impl Client {
 		let drop_canceller = AtomicDropCanceller::default();
 
 		let (tree, stats) = crate::io::fs_tree::build_fs_tree_from_remote_iterator(
-			self,
+			&self,
 			dir,
 			scan_errors_callback,
 			&mut |_dirs, _files, _bytes| {

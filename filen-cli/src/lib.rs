@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
-use filen_sdk_rs::auth::{Client, StringifiedClient};
+use filen_sdk_rs::auth::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
 
 const AUTH_CONFIG_PREFIX: &str = "filen_cli_auth_config_1:";
 
@@ -18,8 +18,10 @@ pub fn deserialize_auth_config(sdk_config: &str) -> Result<Client> {
 	let sdk_config = base64.decode(sdk_config)?;
 	let sdk_config = serde_json::from_slice::<StringifiedClient>(&sdk_config)
 		.context("Failed to parse auth config (it may be corrupt)")?;
-	let client =
-		Client::from_stringified(sdk_config).context("Failed to create client from SDK config")?;
+	let client = UnauthClient::from_config(ClientConfig::default())?;
+	let client = client
+		.from_stringified(sdk_config)
+		.context("Failed to create client from SDK config")?;
 	Ok(client)
 }
 

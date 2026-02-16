@@ -13,14 +13,15 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{
 	Error,
-	auth::Client,
+	auth::{Client, http::UnauthorizedClient, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	fs::file::{
 		BaseFile, FileBuilder, RemoteFile,
+		client_impl::FileReaderSharedClientExt,
 		traits::File,
 		write::{DummyFuture, FileWriter},
 	},
-	util::{MaybeSend, MaybeSendCallback},
+	util::{MaybeSend, MaybeSendCallback, MaybeSendSync},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::{
@@ -38,63 +39,7 @@ pub enum UploadInfo<'a> {
 }
 
 impl Client {
-	// todo make private, use download_file_to_path instead
-	pub async fn download_file_to_writer<'a, T>(
-		&'a self,
-		file: &'a dyn File,
-		writer: &mut T,
-		callback: Option<MaybeSendCallback<'a, u64>>,
-	) -> Result<(), Error>
-	where
-		T: 'a + AsyncWrite + Unpin,
-	{
-		self.download_file_to_writer_for_range(file, writer, callback, 0, file.size())
-			.await
-	}
-
-	pub async fn download_file_to_writer_for_range<'a, T>(
-		&'a self,
-		file: &'a dyn File,
-		writer: &mut T,
-		callback: Option<MaybeSendCallback<'a, u64>>,
-		start: u64,
-		end: u64,
-	) -> Result<(), Error>
-	where
-		T: 'a + AsyncWrite + Unpin,
-	{
-		let mut reader = self.get_file_reader_for_range(file, start, end);
-		let buffer_size =
-			std::cmp::min(end.checked_sub(start).unwrap_or_default(), CHUNK_SIZE_U64) as usize;
-		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
-		// https://github.com/rust-lang/rust/issues/117693
-		let mut buffer = vec![0u8; buffer_size];
-		loop {
-			let bytes_read = reader.read(&mut buffer).await?;
-			if bytes_read == 0 {
-				break;
-			}
-			writer.write_all(&buffer[..bytes_read]).await?;
-			if let Some(callback) = &callback {
-				callback(bytes_read as u64);
-			}
-		}
-		writer.close().await?;
-		Ok(())
-	}
-
-	// this could be optimized to avoid allocations by downloading directly to the writer
-	// would need to allocate a buffer of file.size() + FILE_CHUNK_SIZE_EXTRA
-	// and download to it sequentially, decrypting in place
-	// and finally shrinking the buffer to file.size()
-	pub async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, Error> {
-		let mut writer = Vec::with_capacity(file.size() as usize);
-		self.download_file_to_writer(file, &mut writer, None)
-			.await?;
-		Ok(writer)
-	}
-
-	pub async fn inner_upload_file_from_reader<'a, T, F, Fut>(
+	pub(crate) async fn inner_upload_file_from_reader<'a, T, F, Fut>(
 		&'a self,
 		base_file: Arc<BaseFile>,
 		reader: &mut T,
@@ -227,7 +172,7 @@ impl Client {
 		let callback_ref = callback.deref();
 
 		let (tree, stats) = super::fs_tree::build_fs_tree_from_remote_iterator(
-			Arc::clone(&self),
+			&self,
 			target.as_borrowed_cow(),
 			&mut |errors| {
 				callback_ref.on_scan_errors(errors);
@@ -379,19 +324,6 @@ impl Client {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub async fn download_file_to_path<'a>(
-		&'a self,
-		remote_file: &'a dyn File,
-		path: PathBuf,
-		callback: Option<MaybeSendCallback<'a, u64>>,
-	) -> Result<(), Error> {
-		let (res, _path) = self
-			.inner_download_to_path_with_hash_check(remote_file, path, callback)
-			.await;
-		res
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn upload_file_from_path(
 		&self,
 		parent: &impl HasUUIDContents,
@@ -495,5 +427,238 @@ impl Client {
 			)
 			.await?;
 		Ok((file, reader.into_inner().into_std().await))
+	}
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn inner_download_file_to_path<'a, SC, C>(
+	unauth_client: &SC,
+	remote_file: &dyn File,
+	path: &Path,
+	callback: Option<MaybeSendCallback<'_, u64>>,
+) -> Result<(), Error>
+where
+	SC: SharedClient<C>,
+	C: UnauthorizedClient + MaybeSendSync + 'a,
+{
+	let mod_time = match tokio::fs::metadata(path).await {
+		Ok(m) => Some(FilenMetaExt::modified(&m)),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+		Err(e) => return Err(e.into()),
+	};
+
+	let parent = path.parent().ok_or_else(|| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			"Provided path has no parent directory",
+		)
+	})?;
+	let tmp_path = parent
+		.join(remote_file.uuid().as_ref())
+		.with_extension("filendl");
+	let tmp_file = tokio::fs::OpenOptions::new()
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.open(&tmp_path)
+		.await?;
+	let mut writer = tmp_file.compat_write();
+
+	unauth_client
+		.download_file_to_writer(remote_file, &mut writer, callback)
+		.await?;
+
+	let file_times = FileTimesExt::get_file_times(remote_file);
+
+	let tmp_file = writer.into_inner().into_std().await;
+	tokio::task::spawn_blocking(move || tmp_file.set_times(file_times))
+		.await
+		.unwrap()?;
+
+	// Try and make sure we are not overwriting a file that has changed since we started downloading
+	// There's still an unavoidable race condition if the file changes between the metadata check and the rename
+	// but there is literally no way to avoid that without an OS-level exclusive file lock or atomic file swap
+	// which are not widely supported across platforms
+	// This at least covers the common case where the file is modified while we are downloading
+	if let Some(mod_time) = mod_time {
+		let current_meta = tokio::fs::metadata(&tmp_path).await?;
+		let current_mod_time = FilenMetaExt::modified(&current_meta);
+		if current_mod_time != mod_time {
+			return Err(Error::custom(
+				ErrorKind::FileChangedDuringSync,
+				format!("File at path {:?} was modified during download", path),
+			));
+		}
+	}
+
+	tokio::fs::rename(&tmp_path, path).await?;
+	Ok(())
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) async fn inner_download_to_path_with_hash_check<'a, SC, C>(
+	unauth_client: &SC,
+	remote_file: &dyn File,
+	path: PathBuf,
+	callback: Option<MaybeSendCallback<'_, u64>>,
+) -> (Result<(), Error>, PathBuf)
+where
+	SC: SharedClient<C>,
+	C: UnauthorizedClient + MaybeSendSync + 'a,
+{
+	let size = remote_file.size();
+	let hash = remote_file.hash();
+	let mtime = remote_file
+		.last_modified()
+		.unwrap_or_else(|| remote_file.timestamp());
+	let (need_download, path) =
+		tokio::task::spawn_blocking(move || -> (Result<bool, std::io::Error>, PathBuf) {
+			let file = match std::fs::File::open(&path) {
+				Ok(f) => f,
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Ok(true), path),
+				Err(e) => return (Err(e), path),
+			};
+			let meta = match file.metadata() {
+				Ok(m) => m,
+				Err(e) => return (Err(e), path),
+			};
+
+			if FilenMetaExt::size(&meta) != size {
+				return (Ok(true), path);
+			}
+
+			if let Some(expected_hash) = hash {
+				let mut hasher = blake3::Hasher::new();
+				match hasher.update_reader(&file) {
+					Ok(_) => {}
+					Err(e) => return (Err(e), path),
+				};
+				let computed_hash: Blake3Hash = hasher.finalize().into();
+				(Ok(computed_hash != expected_hash), path)
+			} else {
+				// fallback to mtime check
+				let local_mtime = FilenMetaExt::modified(&meta);
+				(Ok(local_mtime < mtime), path)
+			}
+		})
+		.await
+		.unwrap();
+	let need_download = match need_download {
+		Ok(v) => v,
+		Err(e) => return (Err(e.into()), path),
+	};
+
+	if need_download {
+		let res = inner_download_file_to_path(unauth_client, remote_file, &path, callback).await;
+		(res, path)
+	} else {
+		(Ok(()), path)
+	}
+}
+
+#[allow(private_bounds, async_fn_in_trait)]
+pub trait IoSharedClientExt<'a, C>: SharedClient<C> {
+	// todo make private, use download_file_to_path instead
+	async fn download_file_to_writer<'b, T>(
+		&'a self,
+		file: &'b dyn File,
+		writer: &mut T,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error>
+	where
+		T: 'b + AsyncWrite + Unpin;
+
+	async fn download_file_to_writer_for_range<'b, T>(
+		&'b self,
+		file: &'b dyn File,
+		writer: &mut T,
+		callback: Option<MaybeSendCallback<'a, u64>>,
+		start: u64,
+		end: u64,
+	) -> Result<(), Error>
+	where
+		T: 'b + AsyncWrite + Unpin;
+
+	// this could be optimized to avoid allocations by downloading directly to the writer
+	// would need to allocate a buffer of file.size() + FILE_CHUNK_SIZE_EXTRA
+	// and download to it sequentially, decrypting in place
+	// and finally shrinking the buffer to file.size()
+	async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, Error>;
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn download_file_to_path<'b>(
+		&'b self,
+		remote_file: &'b dyn File,
+		path: PathBuf,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error>;
+}
+
+impl<'a, SC, C> IoSharedClientExt<'a, C> for SC
+where
+	SC: SharedClient<C>,
+	C: UnauthorizedClient + MaybeSendSync + 'a,
+{
+	async fn download_file_to_writer<'b, T>(
+		&'a self,
+		file: &'b dyn File,
+		writer: &mut T,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error>
+	where
+		T: 'b + AsyncWrite + Unpin,
+	{
+		self.download_file_to_writer_for_range(file, writer, callback, 0, file.size())
+			.await
+	}
+
+	async fn download_file_to_writer_for_range<'b, T>(
+		&'b self,
+		file: &'b dyn File,
+		writer: &mut T,
+		callback: Option<MaybeSendCallback<'a, u64>>,
+		start: u64,
+		end: u64,
+	) -> Result<(), Error>
+	where
+		T: 'b + AsyncWrite + Unpin,
+	{
+		let mut reader = self.get_file_reader_for_range(file, start, end);
+		let buffer_size =
+			std::cmp::min(end.checked_sub(start).unwrap_or_default(), CHUNK_SIZE_U64) as usize;
+		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
+		// https://github.com/rust-lang/rust/issues/117693
+		let mut buffer = vec![0u8; buffer_size];
+		loop {
+			let bytes_read = reader.read(&mut buffer).await?;
+			if bytes_read == 0 {
+				break;
+			}
+			writer.write_all(&buffer[..bytes_read]).await?;
+			if let Some(callback) = &callback {
+				callback(bytes_read as u64);
+			}
+		}
+		writer.close().await?;
+		Ok(())
+	}
+
+	async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, Error> {
+		let mut writer = Vec::with_capacity(file.size() as usize);
+		self.download_file_to_writer(file, &mut writer, None)
+			.await?;
+		Ok(writer)
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn download_file_to_path<'b>(
+		&'b self,
+		remote_file: &'b dyn File,
+		path: PathBuf,
+		callback: Option<MaybeSendCallback<'b, u64>>,
+	) -> Result<(), Error> {
+		let (res, _path) =
+			inner_download_to_path_with_hash_check(self, remote_file, path, callback).await;
+		res
 	}
 }

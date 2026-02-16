@@ -216,6 +216,7 @@ mod managed {
 
 	#[derive(Deserialize, Default, Tsify)]
 	#[serde(rename_all = "camelCase")]
+	#[tsify(from_wasm_abi)]
 	pub struct ManagedFuture {
 		#[serde(default)]
 		abort_signal: AbortSignal,

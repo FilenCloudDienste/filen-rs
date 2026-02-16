@@ -11,7 +11,7 @@ use futures::{AsyncWrite, FutureExt, StreamExt, stream::FuturesUnordered};
 
 use crate::{
 	api,
-	auth::Client,
+	auth::{Client, http::UnauthorizedClient},
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::{
 		self,
@@ -193,8 +193,9 @@ where
 					if let Some(size) = self.next_chunk_size()
 						&& self.alloc_future.is_none()
 					{
-						self.alloc_future = Some(Box::pin(Chunk::acquire(size, self.client))
-							as MaybeSendBoxFuture<'a, Chunk<'a>>);
+						self.alloc_future =
+							Some(Box::pin(Chunk::acquire(size, self.client.client().state()))
+								as MaybeSendBoxFuture<'a, Chunk<'a>>);
 					}
 					return Ok(0);
 				}

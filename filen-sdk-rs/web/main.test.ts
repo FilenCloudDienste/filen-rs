@@ -1,8 +1,6 @@
 import init, {
 	initThreadPool,
-	login,
 	Client,
-	fromStringified,
 	type Dir,
 	type File,
 	PauseSignal,
@@ -12,7 +10,8 @@ import init, {
 	type FileMeta,
 	type DecryptedFileMeta,
 	type DecryptedDirMeta,
-	type DirMeta
+	type DirMeta,
+	UnauthClient
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 import { ZipReader, type Entry } from "@zip.js/zip.js"
@@ -47,6 +46,8 @@ function assertNoMaps(value: unknown): boolean {
 	return true
 }
 
+const unauthClient = UnauthClient.from_config({})
+
 beforeAll(async () => {
 	await Promise.all([
 		(async () => {
@@ -56,7 +57,7 @@ beforeAll(async () => {
 			if (!import.meta.env.VITE_TEST_PASSWORD) {
 				throw new Error("VITE_TEST_PASSWORD environment variable is not set")
 			}
-			state = await login({
+			state = await unauthClient.login({
 				email: import.meta.env.VITE_TEST_EMAIL,
 				password: import.meta.env.VITE_TEST_PASSWORD
 			})
@@ -88,7 +89,10 @@ beforeAll(async () => {
 			if (!import.meta.env.VITE_TEST_SHARE_PASSWORD) {
 				throw new Error("VITE_TEST_SHARE_PASSWORD environment variable is not set")
 			}
-			shareClient = await login({ email: import.meta.env.VITE_TEST_SHARE_EMAIL, password: import.meta.env.VITE_TEST_SHARE_PASSWORD })
+			shareClient = await unauthClient.login({
+				email: import.meta.env.VITE_TEST_SHARE_EMAIL,
+				password: import.meta.env.VITE_TEST_SHARE_PASSWORD
+			})
 		})()
 	])
 }, 120000)
@@ -126,7 +130,7 @@ test("login", async () => {
 test("serialization", async () => {
 	const serializedState = await state.toStringified()
 	expect(serializedState.rootUuid).toEqual(state.root().uuid)
-	const newState = fromStringified(serializedState)
+	const newState = unauthClient.fromStringified(serializedState)
 	expect(newState.root().uuid).toEqual(state.root().uuid)
 })
 
@@ -729,7 +733,7 @@ test("search", async () => {
 test("authError", async () => {
 	const badStringified = await state.toStringified()
 	badStringified.apiKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	const badState = fromStringified(badStringified)
+	const badState = unauthClient.fromStringified(badStringified)
 	try {
 		await badState.listDir(badState.root())
 		expect.fail("Expected error to be thrown")

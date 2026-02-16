@@ -1,8 +1,9 @@
 use crate::{
-	auth::http::AuthorizedClient, consts::random_egest_url, error::Error, fs::file::traits::File,
+	auth::http::UnauthorizedClient, consts::random_egest_url, error::Error, fs::file::traits::File,
 };
+
 pub(crate) async fn download_file_chunk(
-	client: &impl AuthorizedClient,
+	client: &impl UnauthorizedClient,
 	file: &dyn File,
 	chunk_idx: u64,
 ) -> Result<Vec<u8>, Error> {
@@ -16,5 +17,5 @@ pub(crate) async fn download_file_chunk(
 		chunk_idx
 	);
 
-	client.get_raw_bytes_auth(&url, endpoint.into()).await
+	client.get_raw_bytes(&url, endpoint.into()).await
 }

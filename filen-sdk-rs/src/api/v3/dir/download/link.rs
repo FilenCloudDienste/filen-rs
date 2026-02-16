@@ -1,4 +1,4 @@
-pub use filen_types::api::v3::dir::link::content::{ENDPOINT, Request, Response};
+pub use filen_types::api::v3::dir::download::link::{ENDPOINT, Request, Response};
 
 use crate::{auth::http::UnauthorizedClient, error::Error};
 

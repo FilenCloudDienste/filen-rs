@@ -12,6 +12,7 @@ use filen_sdk_rs::{
 		dir::{HasUUIDContents, RemoteDirectory},
 		file::FileBuilder,
 	},
+	io::client_impl::IoSharedClientExt,
 	sync::lock::ResourceLock,
 };
 use filen_types::auth::{AuthVersion, FileEncryptionVersion};

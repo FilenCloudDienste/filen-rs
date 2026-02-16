@@ -43,6 +43,8 @@ async fn start_rclone_mount() {
 		network_drive::NetworkDrive, rclone_installation::RcloneInstallationConfig,
 	};
 
+	use filen_sdk_rs::io::client_impl::IoSharedClientExt;
+
 	let test_root_dir = format!("{}-{}", TEST_ROOT_DIR_PREFIX, uuid::Uuid::new_v4());
 
 	let client = test_utils::RESOURCES.client().await;

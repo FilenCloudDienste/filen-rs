@@ -14,10 +14,13 @@ use reqwest::{
 use serde::{Serialize, de::DeserializeOwned};
 use tower::{ServiceBuilder, ServiceExt, limit::GlobalConcurrencyLimitLayer};
 
+#[cfg(not(target_os = "ios"))]
+use crate::consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE};
 use crate::{
 	Error,
-	auth::{Client, http::auth::AuthLayer},
+	auth::{Client, http::auth::AuthLayer, unauth::UnauthClient},
 	consts::gateway_url,
+	util::{MaybeSend, MaybeSendSync},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use bandwidth_limit::{
@@ -52,9 +55,10 @@ impl Client {
 	}
 }
 
-pub(crate) struct ClientConfig {
+pub struct ClientConfig {
 	concurrency: usize,
 	retry_budget: TpsBudget,
+	file_io_memory_budget: usize,
 	rate_limit_per_sec: NonZeroU32,
 	upload_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
 	download_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
@@ -62,30 +66,27 @@ pub(crate) struct ClientConfig {
 }
 
 impl ClientConfig {
-	pub(crate) fn with_concurrency(mut self, concurrency: usize) -> Self {
+	pub fn with_concurrency(mut self, concurrency: usize) -> Self {
 		self.concurrency = concurrency;
 		self
 	}
 
-	pub(crate) fn with_retry(mut self, retry_budget: TpsBudget) -> Self {
+	pub fn with_retry(mut self, retry_budget: TpsBudget) -> Self {
 		self.retry_budget = retry_budget;
 		self
 	}
 
-	pub(crate) fn with_rate(mut self, rate_limit_per_sec: NonZeroU32) -> Self {
+	pub fn with_rate(mut self, rate_limit_per_sec: NonZeroU32) -> Self {
 		self.rate_limit_per_sec = rate_limit_per_sec;
 		self
 	}
 
-	pub(crate) fn with_upload(
-		mut self,
-		upload_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
-	) -> Self {
+	pub fn with_upload(mut self, upload_bandwidth_kilobytes_per_sec: Option<NonZeroU32>) -> Self {
 		self.upload_bandwidth_kilobytes_per_sec = upload_bandwidth_kilobytes_per_sec;
 		self
 	}
 
-	pub(crate) fn with_download(
+	pub fn with_download(
 		mut self,
 		download_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
 	) -> Self {
@@ -93,8 +94,13 @@ impl ClientConfig {
 		self
 	}
 
-	pub(crate) fn with_log_level(mut self, log_level: log::LevelFilter) -> Self {
+	pub fn with_log_level(mut self, log_level: log::LevelFilter) -> Self {
 		self.log_level = log_level;
+		self
+	}
+
+	pub fn with_memory_budget(mut self, file_io_memory_budget: usize) -> Self {
+		self.file_io_memory_budget = file_io_memory_budget;
 		self
 	}
 }
@@ -107,8 +113,115 @@ impl Default for ClientConfig {
 			rate_limit_per_sec: NonZeroU32::new(64).unwrap(),
 			upload_bandwidth_kilobytes_per_sec: None,
 			download_bandwidth_kilobytes_per_sec: None,
-			log_level: log::LevelFilter::Info,
+			log_level: log::LevelFilter::Debug,
+			file_io_memory_budget: {
+				#[cfg(not(target_os = "ios"))]
+				{
+					// 4 full Chunks
+					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 4
+				}
+				#[cfg(target_os = "ios")]
+				{
+					// 2 full Chunks
+					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 2
+				}
+			},
 		}
+	}
+}
+
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify, serde::Deserialize, serde::Serialize),
+	tsify(from_wasm_abi, into_wasm_abi)
+)]
+pub enum LogLevel {
+	Off,
+	Error,
+	Warn,
+	#[default]
+	Info,
+	Debug,
+	Trace,
+}
+
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+impl From<LogLevel> for log::LevelFilter {
+	fn from(value: LogLevel) -> Self {
+		match value {
+			LogLevel::Off => log::LevelFilter::Off,
+			LogLevel::Error => log::LevelFilter::Error,
+			LogLevel::Warn => log::LevelFilter::Warn,
+			LogLevel::Info => log::LevelFilter::Info,
+			LogLevel::Debug => log::LevelFilter::Debug,
+			LogLevel::Trace => log::LevelFilter::Trace,
+		}
+	}
+}
+
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify, serde::Deserialize),
+	tsify(from_wasm_abi)
+)]
+pub struct JsClientConfig {
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	pub concurrency: Option<u32>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	pub rate_limit_per_sec: Option<u32>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	pub upload_bandwidth_kilobytes_per_sec: Option<u32>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	pub download_bandwidth_kilobytes_per_sec: Option<u32>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	pub log_level: Option<LogLevel>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	pub file_io_memory_budget: Option<u64>,
+}
+
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+impl From<JsClientConfig> for ClientConfig {
+	fn from(value: JsClientConfig) -> Self {
+		let mut config = ClientConfig::default();
+		if let Some(concurrency) = value.concurrency {
+			config = config.with_concurrency(concurrency as usize);
+		}
+		if let Some(rate_limit_per_sec) = value.rate_limit_per_sec
+			&& let Some(nz) = NonZeroU32::new(rate_limit_per_sec)
+		{
+			config = config.with_rate(nz);
+		}
+		if let Some(upload_kbps) = value.upload_bandwidth_kilobytes_per_sec
+			&& let Some(nz) = NonZeroU32::new(upload_kbps)
+		{
+			config = config.with_upload(Some(nz));
+		}
+		if let Some(download_kbps) = value.download_bandwidth_kilobytes_per_sec
+			&& let Some(nz) = NonZeroU32::new(download_kbps)
+		{
+			config = config.with_download(Some(nz));
+		}
+		if let Some(log_level) = value.log_level {
+			let level = match log_level {
+				LogLevel::Off => log::LevelFilter::Off,
+				LogLevel::Error => log::LevelFilter::Error,
+				LogLevel::Warn => log::LevelFilter::Warn,
+				LogLevel::Info => log::LevelFilter::Info,
+				LogLevel::Debug => log::LevelFilter::Debug,
+				LogLevel::Trace => log::LevelFilter::Trace,
+			};
+			config = config.with_log_level(level);
+		}
+		if let Some(file_io_memory_budget) = value.file_io_memory_budget {
+			config =
+				config.with_memory_budget(file_io_memory_budget.try_into().unwrap_or(usize::MAX));
+		}
+		config
 	}
 }
 
@@ -122,6 +235,8 @@ pub(crate) struct SharedClientState {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	download_limiter: DownloadBandwidthLimiterLayer,
 	log_level: log::LevelFilter,
+	zip_lock: Arc<tokio::sync::Mutex<()>>,
+	memory_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl SharedClientState {
@@ -152,28 +267,17 @@ impl SharedClientState {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			download_limiter,
 			log_level: config.log_level,
+			zip_lock: Arc::new(tokio::sync::Mutex::new(())),
+			memory_semaphore: Arc::new(tokio::sync::Semaphore::new(config.file_io_memory_budget)),
 		})
 	}
-}
 
-pub(crate) struct UnauthClient {
-	state: SharedClientState,
-	reqwest_client: reqwest::Client,
-}
-
-impl UnauthClient {
-	pub(crate) fn new(state: SharedClientState) -> Self {
-		Self {
-			reqwest_client: reqwest::Client::new(),
-			state,
-		}
+	pub(crate) async fn zip_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+		self.zip_lock.lock().await
 	}
 
-	pub(crate) fn into_authed(self, api_key: Arc<RwLock<APIKey<'static>>>) -> AuthClient {
-		AuthClient {
-			unauthed: self,
-			api_key,
-		}
+	pub(crate) fn memory_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+		&self.memory_semaphore
 	}
 }
 
@@ -245,7 +349,7 @@ impl UnauthClient {
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
+		Req: Serialize + Debug + Sync,
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		let builder = ServiceBuilder::new()
@@ -311,9 +415,37 @@ impl UnauthClient {
 
 		builder.service_fn(execute_request).oneshot(request).await
 	}
+
+	async fn inner_get_raw_bytes(
+		&self,
+		request: Request<(), &str>,
+		endpoint: Cow<'static, str>,
+	) -> Result<Vec<u8>, Error> {
+		let builder = ServiceBuilder::new()
+			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
+			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.retry.clone()) // required to map RetryError to Error
+			.layer(self.state.rate_limiter.clone()) // optional
+			.map_request(|request: Request<(), reqwest::Url>| {
+				request.into_builder_map_body(|()| bytes::Bytes::new())
+			}) // required to map Request to RequestBuilder
+			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
+		let builder = {
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				builder.layer(self.state.download_limiter.clone()) // optional
+			}
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				builder
+			}
+		};
+		builder.service_fn(execute_request).oneshot(request).await
+	}
 }
 
-pub(crate) struct AuthClient {
+pub struct AuthClient {
 	unauthed: UnauthClient,
 	api_key: Arc<RwLock<APIKey<'static>>>,
 }
@@ -377,6 +509,17 @@ impl AuthClient {
 			.limiter
 			.change_rate_per_sec(Some(rate_limit_per_second))
 			.await;
+	}
+
+	pub(crate) fn from_unauthed(
+		unauthed: UnauthClient,
+		api_key: Arc<RwLock<APIKey<'static>>>,
+	) -> Self {
+		Self { unauthed, api_key }
+	}
+
+	pub(crate) fn to_unauthed(&self) -> UnauthClient {
+		self.unauthed.clone()
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -605,50 +748,9 @@ impl AuthClient {
 			.oneshot(request)
 			.await
 	}
-
-	async fn inner_get_raw_bytes(
-		&self,
-		request: Request<(), &str>,
-		endpoint: Cow<'static, str>,
-		auth: bool,
-	) -> Result<Vec<u8>, Error> {
-		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(
-				self.unauthed.state.log_level,
-				endpoint,
-			)) // optional logging
-			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.unauthed.state.concurrency.clone()) // optional
-			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
-			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.map_request(|request: Request<(), reqwest::Url>| {
-				request.into_builder_map_body(|()| bytes::Bytes::new())
-			}) // required to map Request to RequestBuilder
-			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
-		let builder = {
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			{
-				builder.layer(self.unauthed.state.download_limiter.clone()) // optional
-			}
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				builder
-			}
-		};
-		builder
-			.option_layer(if auth {
-				// optional
-				Some(auth::AuthLayer::new(&self.api_key))
-			} else {
-				None
-			})
-			.service_fn(execute_request)
-			.oneshot(request)
-			.await
-	}
 }
 
-pub(crate) trait UnauthorizedClient {
+pub(crate) trait UnauthorizedClient: MaybeSendSync {
 	async fn get<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug;
@@ -656,16 +758,22 @@ pub(crate) trait UnauthorizedClient {
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug;
-	async fn post_large_response<Req, Res, F>(
+	fn post_large_response<Req, Res, F>(
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
 		callback: Option<&F>,
-	) -> Result<Res, Error>
+	) -> impl Future<Output = Result<Res, Error>> + MaybeSend
 	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Send + Sync + 'static;
+		Res: DeserializeOwned + Debug + Send,
+		Req: Serialize + Debug + Sync,
+		F: Fn(u64, Option<u64>) + Send + Sync;
+	fn state(&self) -> &SharedClientState;
+	fn get_raw_bytes(
+		&self,
+		url: &str,
+		endpoint: Cow<'static, str>,
+	) -> impl Future<Output = Result<Vec<u8>, Error>> + MaybeSend;
 }
 
 impl UnauthorizedClient for UnauthClient {
@@ -703,15 +811,15 @@ impl UnauthorizedClient for UnauthClient {
 		.await
 	}
 
-	async fn post_large_response<Req, Res, F>(
+	fn post_large_response<Req, Res, F>(
 		&self,
 		endpoint: Cow<'static, str>,
 		body: &Req,
 		callback: Option<&F>,
-	) -> Result<Res, Error>
+	) -> impl Future<Output = Result<Res, Error>> + MaybeSend
 	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
+		Res: DeserializeOwned + Debug + Send,
+		Req: Serialize + Debug + Sync,
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		self.inner_post_large(
@@ -724,6 +832,26 @@ impl UnauthorizedClient for UnauthClient {
 			endpoint,
 			body,
 			callback,
+		)
+	}
+
+	fn state(&self) -> &SharedClientState {
+		&self.state
+	}
+
+	async fn get_raw_bytes(
+		&self,
+		url: &str,
+		endpoint: Cow<'static, str>,
+	) -> Result<Vec<u8>, Error> {
+		self.inner_get_raw_bytes(
+			Request {
+				method: RequestMethod::Get,
+				response_type: ResponseType::Standard,
+				url,
+				client: self.reqwest_client.clone(),
+			},
+			endpoint,
 		)
 		.await
 	}
@@ -775,7 +903,7 @@ impl UnauthorizedClient for AuthClient {
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		self.inner_post_large(
 			Request {
@@ -791,9 +919,31 @@ impl UnauthorizedClient for AuthClient {
 		)
 		.await
 	}
+
+	fn state(&self) -> &SharedClientState {
+		&self.unauthed.state
+	}
+
+	async fn get_raw_bytes(
+		&self,
+		url: &str,
+		endpoint: Cow<'static, str>,
+	) -> Result<Vec<u8>, Error> {
+		self.unauthed
+			.inner_get_raw_bytes(
+				Request {
+					method: RequestMethod::Get,
+					response_type: ResponseType::Standard,
+					url,
+					client: self.unauthed.reqwest_client.clone(),
+				},
+				endpoint,
+			)
+			.await
+	}
 }
 
-pub(crate) trait AuthorizedClient: Send + Sync {
+pub(crate) trait AuthorizedClient: MaybeSendSync {
 	async fn get_auth<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug;
@@ -824,12 +974,6 @@ pub(crate) trait AuthorizedClient: Send + Sync {
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug;
-
-	async fn get_raw_bytes_auth(
-		&self,
-		url: &str,
-		endpoint: Cow<'static, str>,
-	) -> Result<Vec<u8>, Error>;
 }
 
 impl AuthorizedClient for AuthClient {
@@ -911,24 +1055,6 @@ impl AuthorizedClient for AuthClient {
 		self.inner_post_raw_bytes(
 			Request {
 				method: RequestMethod::Post(request),
-				response_type: ResponseType::Standard,
-				url,
-				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			true,
-		)
-		.await
-	}
-
-	async fn get_raw_bytes_auth(
-		&self,
-		url: &str,
-		endpoint: Cow<'static, str>,
-	) -> Result<Vec<u8>, Error> {
-		self.inner_get_raw_bytes(
-			Request {
-				method: RequestMethod::Get,
 				response_type: ResponseType::Standard,
 				url,
 				client: self.unauthed.reqwest_client.clone(),

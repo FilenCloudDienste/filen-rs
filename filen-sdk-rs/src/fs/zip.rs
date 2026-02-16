@@ -168,7 +168,10 @@ mod client_impl {
 		fs::{
 			FSObject, FsObjectIntoTypes, HasName, HasUUID,
 			dir::DirectoryType,
-			file::traits::{File, HasFileInfo},
+			file::{
+				client_impl::FileReaderSharedClientExt,
+				traits::{File, HasFileInfo},
+			},
 			zip::{ZipProgressCallback, ZipState, add_dir_times, add_file_times},
 		},
 		util::{MaybeSendBoxFuture, MaybeSendSync},

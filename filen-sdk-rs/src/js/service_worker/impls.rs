@@ -5,10 +5,8 @@ use crate::{
 	auth::{Client, StringifiedClient},
 	crypto::error::ConversionError,
 	fs::file::{enums::RemoteFileType, service_worker::StreamWriter, traits::HasFileInfo},
+	io::client_impl::IoSharedClientExt,
 };
-
-#[cfg(feature = "wasm-full")]
-use futures::AsyncWriteExt;
 
 use super::shared::*;
 
@@ -151,7 +149,9 @@ impl ServiceWorkerClient {
 
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = "fromStringified")]
 pub fn from_stringified(serialized: StringifiedClient) -> Result<ServiceWorkerClient, Error> {
-	Ok(ServiceWorkerClient::new(Client::from_stringified(
-		serialized,
-	)?))
+	let unauth_client =
+		crate::auth::unauth::UnauthClient::from_config(crate::auth::http::ClientConfig::default())?;
+	Ok(ServiceWorkerClient::new(
+		unauth_client.from_stringified(serialized)?,
+	))
 }

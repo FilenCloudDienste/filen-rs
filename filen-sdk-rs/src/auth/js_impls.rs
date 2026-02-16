@@ -8,7 +8,11 @@ use wasm_bindgen::prelude::*;
 
 use crate::{
 	Error,
-	auth::{Client, RegisteredInfo, StringifiedClient, TwoFASecret, start_password_reset},
+	auth::{
+		Client, StringifiedClient, TwoFASecret,
+		http::{ClientConfig, JsClientConfig},
+		unauth::UnauthClient,
+	},
 	runtime::do_on_commander,
 };
 
@@ -182,15 +186,14 @@ impl JsClient {
 		})
 		.await;
 	}
-}
 
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen(js_name = "startPasswordReset")
-)]
-#[cfg_attr(feature = "uniffi", uniffi::export(name = "startPasswordReset"))]
-pub async fn start_password_reset_js(email: String) -> Result<(), Error> {
-	do_on_commander(move || async move { start_password_reset(&email).await }).await
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "getUnauthed")
+	)]
+	pub fn get_unauthed(&self) -> UnauthJsClient {
+		UnauthJsClient::new(self.inner_ref().get_unauthed())
+	}
 }
 
 #[derive(Deserialize)]
@@ -212,27 +215,6 @@ pub struct CompletePasswordResetParams {
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub recover_key: Option<String>,
-}
-
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen(js_name = "completePasswordReset")
-)]
-#[cfg_attr(feature = "uniffi", uniffi::export(name = "completePasswordReset"))]
-pub async fn complete_password_reset_js(
-	params: CompletePasswordResetParams,
-) -> Result<JsClient, Error> {
-	let client = do_on_commander(move || async move {
-		Client::complete_password_reset(
-			&params.token,
-			params.email,
-			&params.new_password,
-			params.recover_key.as_deref(),
-		)
-		.await
-	})
-	.await?;
-	Ok(JsClient::new(client))
 }
 
 #[derive(Deserialize)]
@@ -262,36 +244,123 @@ pub struct RegisterParams {
 	pub aff_id: Option<String>,
 }
 
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen(js_name = "register")
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "UnauthClient")
 )]
-#[cfg_attr(feature = "uniffi", uniffi::export(name = "register"))]
-pub async fn register_js(params: RegisterParams) -> Result<(), Error> {
-	do_on_commander(move || async move {
-		RegisteredInfo::register(
-			params.email,
-			&params.password,
-			params.ref_id.as_deref(),
-			params.aff_id.as_deref(),
-		)
-		.await
-		.map(|_| ())
-	})
-	.await
+pub struct UnauthJsClient {
+	inner: Arc<UnauthClient>,
 }
 
-#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
+impl UnauthJsClient {
+	pub(crate) fn new(unauth: UnauthClient) -> Self {
+		Self {
+			inner: Arc::new(unauth),
+		}
+	}
+
+	pub(crate) fn inner(&self) -> Arc<UnauthClient> {
+		Arc::clone(&self.inner)
+	}
+
+	pub(crate) fn inner_ref(&self) -> &UnauthClient {
+		&self.inner
+	}
+}
+
 #[cfg_attr(feature = "uniffi", uniffi::export)]
-pub async fn login(params: crate::js::LoginParams) -> Result<JsClient, Error> {
-	let client = do_on_commander(move || async move {
-		Client::login(
-			params.email,
-			&params.password,
-			params.two_factor_code.as_deref().unwrap_or("XXXXXX"),
-		)
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+impl UnauthClient {}
+
+#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
+)]
+impl UnauthJsClient {
+	#[cfg_attr(feature = "uniffi", uniffi::constructor)]
+	pub fn from_config(client_config: JsClientConfig) -> Result<Self, Error> {
+		let config: ClientConfig = client_config.into();
+		Ok(Self::new(UnauthClient::from_config(config)?))
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "fromStringified")
+	)]
+	pub fn from_stringified(
+		&self,
+		serialized: StringifiedClient,
+	) -> Result<super::JsClient, Error> {
+		Ok(super::JsClient::new(
+			self.inner_ref().from_stringified(serialized)?,
+		))
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "startPasswordReset")
+	)]
+	pub async fn start_password_reset(&self, email: String) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.start_password_reset(&email).await }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "completePasswordReset")
+	)]
+	pub async fn complete_password_reset(
+		&self,
+		params: CompletePasswordResetParams,
+	) -> Result<JsClient, Error> {
+		let this = self.inner();
+		let client = do_on_commander(move || async move {
+			this.complete_password_reset(
+				&params.token,
+				params.email,
+				&params.new_password,
+				params.recover_key.as_deref(),
+			)
+			.await
+		})
+		.await?;
+		Ok(JsClient::new(client))
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "register")
+	)]
+	pub async fn register(&self, params: RegisterParams) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.register(
+				params.email,
+				&params.password,
+				params.ref_id.as_deref(),
+				params.aff_id.as_deref(),
+			)
+			.await
+			.map(|_| ())
+		})
 		.await
-	})
-	.await?;
-	Ok(JsClient::new(client))
+	}
+
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
+	pub async fn login(&self, params: crate::js::LoginParams) -> Result<JsClient, Error> {
+		let this = self.inner();
+		let client = do_on_commander(move || async move {
+			this.login(
+				params.email,
+				&params.password,
+				params.two_factor_code.as_deref().unwrap_or("XXXXXX"),
+			)
+			.await
+		})
+		.await?;
+		Ok(JsClient::new(client))
+	}
 }

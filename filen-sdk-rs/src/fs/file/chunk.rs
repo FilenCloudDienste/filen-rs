@@ -3,7 +3,7 @@ use std::{io::Write, mem::ManuallyDrop, num::NonZeroU32};
 use log::debug;
 use tokio::sync::SemaphorePermit;
 
-use crate::{auth::Client, consts::FILE_CHUNK_SIZE_EXTRA_USIZE};
+use crate::{auth::http::SharedClientState, consts::FILE_CHUNK_SIZE_EXTRA_USIZE};
 
 pub(crate) struct Chunk<'a> {
 	data: Vec<u8>,
@@ -29,9 +29,9 @@ impl AsMut<Vec<u8>> for Chunk<'_> {
 }
 
 impl<'a> Chunk<'a> {
-	pub fn try_acquire(chunk_size: NonZeroU32, client: &'a Client) -> Option<Chunk<'a>> {
-		client
-			.memory_semaphore
+	pub fn try_acquire(chunk_size: NonZeroU32, state: &'a SharedClientState) -> Option<Chunk<'a>> {
+		state
+			.memory_semaphore()
 			.try_acquire_many(chunk_size.get())
 			.ok()
 			.map(|permits| {
@@ -49,9 +49,9 @@ impl<'a> Chunk<'a> {
 			})
 	}
 
-	pub async fn acquire(chunk_size: NonZeroU32, client: &'a Client) -> Chunk<'a> {
-		let permits = client
-			.memory_semaphore
+	pub async fn acquire(chunk_size: NonZeroU32, state: &'a SharedClientState) -> Chunk<'a> {
+		let permits = state
+			.memory_semaphore()
 			.acquire_many(chunk_size.get())
 			.await
 			.unwrap();

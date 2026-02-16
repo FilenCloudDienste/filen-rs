@@ -9,6 +9,7 @@ use crate::{
 	auth::Client,
 	error::{Error, MetadataWasNotDecryptedError},
 	fs::file::{RemoteFile, traits::HasFileInfo},
+	io::client_impl::IoSharedClientExt,
 	runtime,
 };
 

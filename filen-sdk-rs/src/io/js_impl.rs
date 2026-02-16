@@ -297,7 +297,7 @@ impl JsClient {
 			.await
 	}
 
-	pub async fn download_file(
+	pub async fn download_file_to_path(
 		&self,
 		file: File,
 		file_path: String,
@@ -318,8 +318,13 @@ impl JsClient {
 
 				let file: crate::io::RemoteFile = file.try_into()?;
 				let target_path = PathBuf::from(file_path);
-				this.download_file_to_path(&file, target_path, callback)
-					.await
+				super::client_impl::IoSharedClientExt::download_file_to_path(
+					this.as_ref(),
+					&file,
+					target_path,
+					callback,
+				)
+				.await
 			})
 			.await
 	}

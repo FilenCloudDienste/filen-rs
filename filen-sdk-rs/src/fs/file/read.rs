@@ -7,18 +7,18 @@ use futures::{StreamExt, stream::FuturesOrdered};
 
 use crate::{
 	api,
-	auth::Client,
+	auth::http::UnauthorizedClient,
 	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
 	error::{Error, MetadataWasNotDecryptedError},
-	util::MaybeSendBoxFuture,
+	util::{MaybeSendBoxFuture, MaybeSendSync},
 };
 
 use super::{chunk::Chunk, traits::File};
 
-pub(super) struct FileReader<'a> {
+pub struct FileReader<'a, C> {
 	file: &'a dyn File,
-	client: &'a Client,
+	client: &'a C,
 	index: u64,
 	limit: u64,
 	next_chunk_idx: u64,
@@ -27,17 +27,16 @@ pub(super) struct FileReader<'a> {
 	allocate_chunk_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
 }
 
-impl<'a> FileReader<'a> {
-	pub(crate) fn new(file: &'a dyn File, client: &'a Client) -> Self {
+#[allow(private_bounds)]
+impl<'a, C> FileReader<'a, C>
+where
+	C: UnauthorizedClient + MaybeSendSync,
+{
+	pub(crate) fn new(file: &'a dyn File, client: &'a C) -> Self {
 		Self::new_for_range(file, client, 0, file.size())
 	}
 
-	pub(crate) fn new_for_range(
-		file: &'a dyn File,
-		client: &'a Client,
-		start: u64,
-		end: u64,
-	) -> Self {
+	pub(crate) fn new_for_range(file: &'a dyn File, client: &'a C, start: u64, end: u64) -> Self {
 		let size = file.size();
 		let limit = end.min(size);
 		let index = start.min(limit);
@@ -81,12 +80,13 @@ impl<'a> FileReader<'a> {
 	fn try_allocate_next_chunk(&self) -> Option<Chunk<'a>> {
 		let chunk_size = self.next_chunk_size()?;
 
-		Chunk::try_acquire(chunk_size, self.client)
+		Chunk::try_acquire(chunk_size, self.client.state())
 	}
 
 	fn allocate_next_chunk(&self) -> Option<MaybeSendBoxFuture<'a, Chunk<'a>>> {
 		let chunk_size = self.next_chunk_size()?;
-		Some(Box::pin(Chunk::acquire(chunk_size, self.client)) as MaybeSendBoxFuture<'a, Chunk<'a>>)
+		Some(Box::pin(Chunk::acquire(chunk_size, self.client.state()))
+			as MaybeSendBoxFuture<'a, Chunk<'a>>)
 	}
 
 	/// Pushes the future to fetch the next chunk.
@@ -105,7 +105,7 @@ impl<'a> FileReader<'a> {
 		let file = self.file;
 		self.futures.push_back(Box::pin(async move {
 			let (_, permits) = out_data.into_parts();
-			let data = api::download::download_file_chunk(client.client(), file, chunk_idx).await?;
+			let data = api::download::download_file_chunk(client, file, chunk_idx).await?;
 			let mut chunk = Chunk::from_parts(data, permits);
 			file.key()
 				.ok_or(MetadataWasNotDecryptedError)?
@@ -153,7 +153,10 @@ impl<'a> FileReader<'a> {
 	}
 }
 
-impl futures::io::AsyncRead for FileReader<'_> {
+impl<C> futures::io::AsyncRead for FileReader<'_, C>
+where
+	C: UnauthorizedClient + MaybeSendSync,
+{
 	fn poll_read(
 		mut self: std::pin::Pin<&mut Self>,
 		cx: &mut std::task::Context<'_>,

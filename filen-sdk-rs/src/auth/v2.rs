@@ -8,6 +8,7 @@ use rsa::RsaPublicKey;
 
 use crate::{
 	Error, api,
+	auth::{http::AuthClient, unauth::UnauthClient},
 	crypto::{
 		self,
 		error::ConversionError,
@@ -15,8 +16,6 @@ use crate::{
 		v2::{MasterKeys, hash},
 	},
 };
-
-use super::http::UnauthClient;
 
 pub(crate) use crate::crypto::v2::MasterKey as MetaKey;
 
@@ -44,10 +43,10 @@ pub(super) async fn login(
 	pwd: &str,
 	two_factor_code: &str,
 	info: &api::v3::auth::info::Response<'_>,
-	client: UnauthClient,
+	client: &UnauthClient,
 ) -> Result<
 	(
-		super::AuthClient,
+		AuthClient,
 		super::AuthInfo,
 		Option<EncryptedPrivateKey<'static>>,
 		Option<RsaPublicKey>,
@@ -58,7 +57,7 @@ pub(super) async fn login(
 		crypto::v2::derive_password_and_mk(pwd.as_bytes(), info.salt.as_bytes())?;
 
 	let response = api::v3::login::post(
-		&client,
+		client,
 		&api::v3::login::Request {
 			email: Cow::Borrowed(email),
 			password: pwd,
@@ -68,7 +67,8 @@ pub(super) async fn login(
 	)
 	.await?;
 
-	let auth_client = client.into_authed(Arc::new(RwLock::new(response.api_key)));
+	let auth_client =
+		AuthClient::from_unauthed(client.clone(), Arc::new(RwLock::new(response.api_key)));
 
 	let master_keys = if let Some(master_keys_str) = response.master_keys {
 		crypto::v2::MasterKeys::new(master_keys_str, master_key).await?

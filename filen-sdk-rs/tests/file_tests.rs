@@ -9,10 +9,12 @@ use filen_sdk_rs::{
 		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject,
 		dir::RemoteDirectory,
 		file::{
+			client_impl::FileReaderSharedClientExt,
 			meta::{FileMeta, FileMetaChanges},
 			traits::{HasFileInfo, HasFileMeta},
 		},
 	},
+	io::client_impl::IoSharedClientExt,
 	util::MaybeSendCallback,
 };
 use futures::AsyncReadExt;

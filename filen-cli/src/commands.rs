@@ -11,7 +11,7 @@ use filen_sdk_rs::{
 		dir::{DirectoryType, HasContents},
 		file::{enums::RemoteFileType, traits::HasFileInfo as _},
 	},
-	io::RemoteDirectory,
+	io::{RemoteDirectory, client_impl::IoSharedClientExt},
 };
 use filen_types::fs::ParentUuid;
 use serde_json::json;

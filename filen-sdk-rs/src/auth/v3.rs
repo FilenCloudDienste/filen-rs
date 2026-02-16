@@ -9,6 +9,7 @@ use rsa::RsaPublicKey;
 
 use crate::{
 	ErrorKind, api,
+	auth::{http::AuthClient, unauth::UnauthClient},
 	crypto::{
 		error::ConversionError,
 		rsa::HMACKey,
@@ -18,7 +19,6 @@ use crate::{
 	error::Error,
 };
 
-use super::http::UnauthClient;
 pub(crate) use crate::crypto::v3::EncryptionKey as MetaKey;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthInfo {
@@ -44,10 +44,10 @@ pub(super) async fn login(
 	pwd: &str,
 	two_factor_code: &str,
 	info: &api::v3::auth::info::Response<'_>,
-	client: UnauthClient,
+	client: &UnauthClient,
 ) -> Result<
 	(
-		super::AuthClient,
+		AuthClient,
 		super::AuthInfo,
 		Option<EncryptedPrivateKey<'static>>,
 		Option<RsaPublicKey>,
@@ -58,7 +58,7 @@ pub(super) async fn login(
 		crate::crypto::v3::derive_password_and_kek(pwd.as_bytes(), info.salt.as_bytes())?;
 
 	let response = api::v3::login::post(
-		&client,
+		client,
 		&api::v3::login::Request {
 			email: Cow::Borrowed(email),
 			password: pwd,
@@ -68,7 +68,8 @@ pub(super) async fn login(
 	)
 	.await?;
 
-	let auth_client = client.into_authed(Arc::new(RwLock::new(response.api_key)));
+	let auth_client =
+		AuthClient::from_unauthed(client.clone(), Arc::new(RwLock::new(response.api_key)));
 
 	let dek_str = response.dek.ok_or(Error::custom(
 		ErrorKind::Response,

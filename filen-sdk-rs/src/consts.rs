@@ -83,12 +83,6 @@ pub const FILE_CHUNK_SIZE_EXTRA: NonZeroU32 = NonZeroU32::new(28).unwrap(); // a
 pub const FILE_CHUNK_SIZE_EXTRA_USIZE: usize = FILE_CHUNK_SIZE_EXTRA.get() as usize;
 
 pub(crate) const MAX_SMALL_PARALLEL_REQUESTS: usize = 64;
-#[cfg(not(target_os = "ios"))]
-pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
-	(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 4; // 4 full Chunks
-#[cfg(target_os = "ios")]
-pub(crate) const MAX_DEFAULT_MEMORY_USAGE_TARGET: usize =
-	(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 2; // 4 full Chunks
 pub(crate) const MAX_OPEN_FILES: usize = 64;
 
 pub const RSA_KEY_SIZE: usize = 4096;

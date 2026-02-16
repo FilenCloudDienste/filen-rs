@@ -1,6 +1,6 @@
 //! [cli-doc] auth-methods
 //! There are multiple ways to authenticate:
-//! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)  
+//! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)
 //!   (when the two-factor code is omitted and required, you will be prompted for it)
 //! - specify an auth config via the `--auth-config-path` flag
 //!   (exported via `filen export-auth-config`),
@@ -9,7 +9,7 @@
 //!   - `./filen-cli-auth-config.txt` (current working directory)
 //!   - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`
 //!   - Windows: `%appdata%\filen-cli\filen-cli-auth-config.txt`
-//! - set environment variables (`FILEN_CLI_EMAIL` and `FILEN_CLI_PASSWORD`, optionally `FILEN_CLI_2FA_CODE`)  
+//! - set environment variables (`FILEN_CLI_EMAIL` and `FILEN_CLI_PASSWORD`, optionally `FILEN_CLI_2FA_CODE`)
 //!   (when the two-factor code is omitted and required, you will be prompted for it)
 //! - if none of these is set, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use filen_cli::{deserialize_auth_config, serialize_auth_config};
-use filen_sdk_rs::{ErrorKind, auth::Client};
+use filen_sdk_rs::{
+	ErrorKind,
+	auth::{Client, http::ClientConfig, unauth::UnauthClient},
+};
 use filen_types::error::ResponseError;
 
 use crate::{CliConfig, ui::UI, util::LongKeyringEntry};
@@ -134,13 +137,19 @@ async fn login_and_optionally_prompt_two_factor_code(
 	password: &str,
 	two_factor_code: Option<&str>,
 ) -> Result<Client> {
-	match Client::login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX")).await {
+	let unauth_client = UnauthClient::from_config(ClientConfig::default())?;
+
+	match unauth_client
+		.login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX"))
+		.await
+	{
 		Ok(client) => Ok(client),
 		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
 			Ok(ResponseError::ApiError { code, .. }) => {
 				if code.as_deref() == Some("enter_2fa") {
 					let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
-					Client::login(email, password, two_factor_code.trim())
+					unauth_client
+						.login(email, password, two_factor_code.trim())
 						.await
 						.context("Failed to log in (with 2fa code)")
 				} else if code.as_deref() == Some("email_or_password_wrong") {

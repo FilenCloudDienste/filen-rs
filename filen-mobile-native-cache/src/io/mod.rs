@@ -20,9 +20,14 @@ use filen_sdk_rs::{
 	error::FilenSdkError,
 	fs::{
 		HasName, HasUUID,
-		file::{FileBuilder, RemoteFile, traits::HasFileInfo},
+		file::{
+			FileBuilder, RemoteFile, client_impl::FileReaderSharedClientExt, traits::HasFileInfo,
+		},
 	},
-	io::{FilenMetaExt, client_impl::UploadInfo},
+	io::{
+		FilenMetaExt,
+		client_impl::{IoSharedClientExt, UploadInfo},
+	},
 };
 use filen_types::{crypto::Blake3Hash, fs::UuidStr};
 use futures::{StreamExt, stream::FuturesUnordered};

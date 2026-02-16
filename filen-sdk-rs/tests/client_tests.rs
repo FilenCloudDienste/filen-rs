@@ -11,8 +11,9 @@ use base64::{
 };
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
-	auth::{Client, RegisteredInfo, TwoFASecret},
+	auth::{Client, TwoFASecret, http::ClientConfig, unauth::UnauthClient},
 	fs::HasName,
+	io::client_impl::IoSharedClientExt,
 	socket::DecryptedSocketEvent,
 };
 use filen_types::traits::CowHelpersExt;
@@ -32,7 +33,8 @@ async fn test_stringification() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let stringified = client.to_stringified();
-	assert_eq!(Client::from_stringified(stringified).unwrap(), **client)
+	let unauthed = client.get_unauthed();
+	assert_eq!(unauthed.from_stringified(stringified).unwrap(), **client)
 }
 
 #[shared_test_runtime]
@@ -240,16 +242,17 @@ fn init_register_test() -> RegisterTest {
 	}
 }
 
-fn activate_account(register_data: &mut RegisterTest) -> Client {
+fn activate_account(register_data: &mut RegisterTest, unauth_client: &UnauthClient) -> Client {
 	test_utils::rt().block_on(async {
-		RegisteredInfo::register(
-			register_data.email.clone(),
-			&register_data.password,
-			None,
-			None,
-		)
-		.await
-		.unwrap();
+		unauth_client
+			.register(
+				register_data.email.clone(),
+				&register_data.password,
+				None,
+				None,
+			)
+			.await
+			.unwrap();
 	});
 
 	let body = await_email(
@@ -265,13 +268,14 @@ fn activate_account(register_data: &mut RegisterTest) -> Client {
 	let (activate_link, _) = match_regex_in_email_body(&body, &activate_regex);
 	test_utils::rt().block_on(async {
 		reqwest::get(activate_link).await.unwrap();
-		let client = Client::login(
-			register_data.email.clone(),
-			&register_data.password,
-			"XXXXXX",
-		)
-		.await
-		.unwrap();
+		let client = unauth_client
+			.login(
+				register_data.email.clone(),
+				&register_data.password,
+				"XXXXXX",
+			)
+			.await
+			.unwrap();
 		client.list_dir(client.root()).await.unwrap();
 		client
 	})
@@ -347,12 +351,14 @@ fn delete_account(client: Client, register_data: &mut RegisterTest) {
 
 #[test]
 fn register_and_reset_password_no_export() {
+	let unauth_client = UnauthClient::from_config(ClientConfig::default()).unwrap();
 	let mut register_data = init_register_test();
 
-	let old_client = activate_account(&mut register_data);
+	let old_client = activate_account(&mut register_data, &unauth_client);
 
 	test_utils::rt().block_on(async {
-		filen_sdk_rs::auth::start_password_reset(&register_data.email)
+		unauth_client
+			.start_password_reset(&register_data.email)
 			.await
 			.unwrap();
 	});
@@ -384,14 +390,15 @@ fn register_and_reset_password_no_export() {
 			.await
 			.unwrap();
 
-		let client = Client::complete_password_reset(
-			reset_token,
-			register_data.email.clone(),
-			&new_password,
-			None,
-		)
-		.await
-		.unwrap();
+		let client = unauth_client
+			.complete_password_reset(
+				reset_token,
+				register_data.email.clone(),
+				&new_password,
+				None,
+			)
+			.await
+			.unwrap();
 
 		await_event(
 			&mut receiver,
@@ -402,7 +409,8 @@ fn register_and_reset_password_no_export() {
 		.await;
 
 		client.list_dir(client.root()).await.unwrap();
-		Client::login(register_data.email.clone(), &new_password, "XXXXXX")
+		unauth_client
+			.login(register_data.email.clone(), &new_password, "XXXXXX")
 			.await
 			.unwrap();
 		client
@@ -415,7 +423,8 @@ fn register_and_reset_password_no_export() {
 #[test]
 fn register_change_and_reset_password_with_export() {
 	let mut register_data = init_register_test();
-	let client = activate_account(&mut register_data);
+	let unauth_client = UnauthClient::from_config(ClientConfig::default()).unwrap();
+	let client = activate_account(&mut register_data, &unauth_client);
 
 	let (recovery_key, files) = test_utils::rt().block_on(async {
 		client.list_dir(client.root()).await.unwrap();
@@ -440,7 +449,8 @@ fn register_change_and_reset_password_with_export() {
 			.await
 			.unwrap();
 
-		let relogin_client = Client::login(register_data.email.clone(), &new_password, "XXXXXX")
+		let relogin_client = unauth_client
+			.login(register_data.email.clone(), &new_password, "XXXXXX")
 			.await
 			.unwrap();
 
@@ -473,7 +483,8 @@ fn register_change_and_reset_password_with_export() {
 			.await
 			.unwrap_or_else(|e| panic!("Failed to export master keys: {}", e));
 
-		filen_sdk_rs::auth::start_password_reset(&register_data.email)
+		unauth_client
+			.start_password_reset(&register_data.email)
 			.await
 			.unwrap();
 		(exported_keys_string, (first_file, second_file, third_file))
@@ -494,14 +505,15 @@ fn register_change_and_reset_password_with_export() {
 	let new_password: [u8; 64] = rand::random();
 	let new_password = BASE64_STANDARD_NO_PAD.encode(new_password);
 	let client = test_utils::rt().block_on(async {
-		let client = Client::complete_password_reset(
-			reset_token,
-			register_data.email.clone(),
-			&new_password,
-			Some(&recovery_key),
-		)
-		.await
-		.unwrap();
+		let client = unauth_client
+			.complete_password_reset(
+				reset_token,
+				register_data.email.clone(),
+				&new_password,
+				Some(&recovery_key),
+			)
+			.await
+			.unwrap();
 
 		let (first_file, second_file, third_file) = files;
 

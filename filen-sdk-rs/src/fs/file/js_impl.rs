@@ -2,20 +2,17 @@
 use std::cmp::min;
 use std::sync::Arc;
 
-#[cfg(feature = "uniffi")]
-use crate::js::ManagedFuture;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use crate::{
-	ErrorKind,
-	fs::file::{enums::RemoteFileType, traits::HasFileInfo},
-	js::FileEnum,
-};
+use crate::{ErrorKind, fs::file::traits::HasFileInfo};
 
 use crate::{
 	Error,
-	auth::JsClient,
-	fs::file::meta::FileMetaChanges,
-	js::{File, FileVersion, UploadFileParams},
+	auth::{
+		JsClient, http::UnauthorizedClient, js_impls::UnauthJsClient, shared_client::SharedClient,
+	},
+	fs::file::{enums::RemoteFileType, meta::FileMetaChanges},
+	io::client_impl::IoSharedClientExt,
+	js::{File, FileEnum, FileVersion, ManagedFuture, UploadFileParams},
 	runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
@@ -86,75 +83,6 @@ impl JsClient {
 			.await?;
 
 		Ok(file.into())
-	}
-
-	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFile")]
-	pub async fn download_file(&self, file: FileEnum) -> Result<Vec<u8>, Error> {
-		let this = self.inner();
-		do_on_commander(move || async move {
-			this.download_file(&RemoteFileType::try_from(file)?).await
-		})
-		.await
-	}
-
-	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFileToWriter")]
-	pub async fn download_file_to_writer(
-		&self,
-		params: crate::js::DownloadFileStreamParams,
-	) -> Result<(), Error> {
-		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
-
-		let writer = wasm_streams::WritableStream::from_raw(params.writer)
-			.try_into_async_write()
-			.map_err(|(e, _)| {
-				Error::custom(
-					ErrorKind::Conversion,
-					format!("got error when converting to WritableStream: {:?}", e),
-				)
-			})?;
-
-		// we handle the progress callback here because it's easier to not have to spawn another local task
-		// to pass through the progress updates
-		let progress_callback = if params.progress.is_undefined() {
-			None
-		} else {
-			Some(move |bytes: u64| {
-				let _ = params.progress.call1(&JsValue::UNDEFINED, &bytes.into());
-			})
-		};
-
-		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
-
-		crate::js::spawn_buffered_write_future(
-			data_receiver,
-			writer,
-			progress_callback,
-			result_sender,
-		);
-
-		let this = self.inner();
-		params
-			.managed_future
-			.into_js_managed_commander_future(move || async move {
-				let mut writer = StreamWriter::new(data_sender);
-
-				let file = RemoteFileType::try_from(params.file)?;
-				this.download_file_to_writer_for_range(
-					&file,
-					&mut writer,
-					None,
-					params.start.unwrap_or(0),
-					params.end.unwrap_or(file.size()),
-				)
-				.await?;
-				result_receiver.await.unwrap_or_else(|_| {
-					Err(Error::custom(
-						ErrorKind::Cancelled,
-						"download task cancelled",
-					))
-				})
-			})?
-			.await
 	}
 
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "uploadFileFromReader")]
@@ -327,21 +255,6 @@ impl JsClient {
 			.map(Into::into)
 	}
 
-	#[cfg(feature = "uniffi")]
-	pub async fn download_file_to_bytes(
-		&self,
-		file: File,
-		managed_future: ManagedFuture,
-	) -> Result<Vec<u8>, Error> {
-		let this = self.inner();
-		managed_future
-			.into_js_managed_commander_future(move || async move {
-				this.download_file(&crate::io::RemoteFile::try_from(file)?)
-					.await
-			})
-			.await
-	}
-
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "updateFileMetadata")
@@ -403,5 +316,152 @@ impl JsClient {
 		let version = version.try_into()?;
 
 		do_on_commander(move || async move { this.delete_file_version(version).await }).await
+	}
+}
+
+async fn download_file_generic<T, C>(
+	client: Arc<T>,
+	file: FileEnum,
+	managed_future: Option<ManagedFuture>,
+) -> Result<Vec<u8>, Error>
+where
+	T: SharedClient<C> + Send + Sync + 'static,
+	C: UnauthorizedClient + 'static,
+{
+	let fut = move || async move { client.download_file(&RemoteFileType::try_from(file)?).await };
+
+	if let Some(managed_future) = managed_future {
+		let res = managed_future.into_js_managed_commander_future(fut);
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			res?.await
+		}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			res.await
+		}
+	} else {
+		do_on_commander(fut).await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+async fn download_file_to_writer_generic<T, C>(
+	client: Arc<T>,
+	params: crate::js::DownloadFileStreamParams,
+) -> Result<(), Error>
+where
+	T: SharedClient<C> + Send + Sync + 'static,
+	C: UnauthorizedClient + 'static,
+{
+	let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+
+	let writer = wasm_streams::WritableStream::from_raw(params.writer)
+		.try_into_async_write()
+		.map_err(|(e, _)| {
+			Error::custom(
+				ErrorKind::Conversion,
+				format!("got error when converting to WritableStream: {:?}", e),
+			)
+		})?;
+
+	// we handle the progress callback here because it's easier to not have to spawn another local task
+	// to pass through the progress updates
+	let progress_callback = if params.progress.is_undefined() {
+		None
+	} else {
+		Some(move |bytes: u64| {
+			let _ = params.progress.call1(&JsValue::UNDEFINED, &bytes.into());
+		})
+	};
+
+	let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
+
+	crate::js::spawn_buffered_write_future(data_receiver, writer, progress_callback, result_sender);
+
+	params
+		.managed_future
+		.into_js_managed_commander_future(move || async move {
+			let mut writer = StreamWriter::new(data_sender);
+
+			let file = RemoteFileType::try_from(params.file)?;
+			client
+				.download_file_to_writer_for_range(
+					&file,
+					&mut writer,
+					None,
+					params.start.unwrap_or(0),
+					params.end.unwrap_or(file.size()),
+				)
+				.await?;
+			result_receiver.await.unwrap_or_else(|_| {
+				Err(Error::custom(
+					ErrorKind::Cancelled,
+					"download task cancelled",
+				))
+			})
+		})?
+		.await
+}
+
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl JsClient {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFile")
+	)]
+	pub async fn download_file(
+		&self,
+		file: FileEnum,
+		managed_future: Option<ManagedFuture>,
+	) -> Result<Vec<u8>, Error> {
+		download_file_generic(self.inner(), file, managed_future).await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+impl JsClient {
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFileToWriter")]
+	pub async fn download_file_to_writer(
+		&self,
+		params: crate::js::DownloadFileStreamParams,
+	) -> Result<(), Error> {
+		download_file_to_writer_generic(self.inner(), params).await
+	}
+}
+
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl UnauthJsClient {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFile")
+	)]
+	pub async fn download_file(
+		&self,
+		file: FileEnum,
+		managed_future: Option<ManagedFuture>,
+	) -> Result<Vec<u8>, Error> {
+		download_file_generic(self.inner(), file, managed_future).await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
+impl UnauthJsClient {
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFileToWriter")]
+	pub async fn download_file_to_writer(
+		&self,
+		params: crate::js::DownloadFileStreamParams,
+	) -> Result<(), Error> {
+		download_file_to_writer_generic(self.inner(), params).await
 	}
 }

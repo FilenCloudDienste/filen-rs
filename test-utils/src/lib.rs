@@ -6,7 +6,7 @@ use std::{
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
-	auth::Client,
+	auth::{Client, http::ClientConfig, unauth::UnauthClient},
 	fs::{HasName, HasUUID, dir::RemoteDirectory},
 	sync::lock::ResourceLock,
 };
@@ -71,7 +71,9 @@ impl Resources {
 		self.client
 			.get_or_init(|| async {
 				let (email, password, two_factor_code) = self.get_credentials();
-				let client = Client::login(email, &password, &two_factor_code)
+				let client = UnauthClient::from_config(ClientConfig::default())
+					.unwrap()
+					.login(email, &password, &two_factor_code)
 					.await
 					.inspect_err(|e| {
 						println!("Failed to login: {}, error: {}", self.account_prefix, e);

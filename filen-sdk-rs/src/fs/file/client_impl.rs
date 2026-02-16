@@ -5,13 +5,12 @@ use filen_types::{
 	crypto::Blake3Hash,
 	fs::{ParentUuid, UuidStr},
 };
-use futures::AsyncRead;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
 use crate::{
 	api,
-	auth::Client,
+	auth::{Client, http::UnauthorizedClient, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	crypto::{error::ConversionError, shared::MetaCrypter},
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
@@ -26,7 +25,7 @@ use crate::{
 		},
 	},
 	runtime::{self, blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback},
+	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback, MaybeSendSync},
 };
 
 use super::{
@@ -180,19 +179,6 @@ impl Client {
 		.map(|r| r.0)
 	}
 
-	pub fn get_file_reader<'a>(&'a self, file: &'a dyn File) -> impl AsyncRead + 'a {
-		FileReader::new(file, self)
-	}
-
-	pub fn get_file_reader_for_range<'a>(
-		&'a self,
-		file: &'a dyn File,
-		start: u64,
-		end: u64,
-	) -> impl AsyncRead + 'a {
-		FileReader::new_for_range(file, self, start, end)
-	}
-
 	pub fn make_file_builder(
 		&self,
 		name: impl Into<String>,
@@ -328,5 +314,36 @@ impl Client {
 		)
 		.await?;
 		Ok(uuid)
+	}
+}
+
+#[allow(private_bounds)]
+pub trait FileReaderSharedClientExt<'a, C>: SharedClient<C> {
+	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a, C>;
+
+	fn get_file_reader_for_range(
+		&'a self,
+		file: &'a dyn File,
+		start: u64,
+		end: u64,
+	) -> FileReader<'a, C>;
+}
+
+impl<'a, T, C> FileReaderSharedClientExt<'a, C> for T
+where
+	T: SharedClient<C>,
+	C: UnauthorizedClient + MaybeSendSync + 'a,
+{
+	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a, C> {
+		FileReader::new(file, self.get_unauth_client())
+	}
+
+	fn get_file_reader_for_range(
+		&'a self,
+		file: &'a dyn File,
+		start: u64,
+		end: u64,
+	) -> FileReader<'a, C> {
+		FileReader::new_for_range(file, self.get_unauth_client(), start, end)
 	}
 }

@@ -10,6 +10,8 @@ use crate::{
 	fs::{ParentUuid, UuidStr},
 };
 
+pub mod link;
+
 pub const ENDPOINT: &str = "v3/dir/download";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

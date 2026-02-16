@@ -6,17 +6,22 @@ use std::{
 use filen_types::crypto::rsa::EncryptedPrivateKey;
 use rsa::RsaPublicKey;
 
-use crate::{ErrorKind, api, auth::http::UnauthClient, crypto, error::Error};
+use crate::{
+	ErrorKind, api,
+	auth::{http::AuthClient, unauth::UnauthClient},
+	crypto,
+	error::Error,
+};
 
 pub(super) async fn login(
 	email: &str,
 	pwd: &str,
 	two_factor_code: &str,
 	info: &api::v3::auth::info::Response<'_>,
-	client: UnauthClient,
+	client: &UnauthClient,
 ) -> Result<
 	(
-		super::AuthClient,
+		AuthClient,
 		super::AuthInfo,
 		EncryptedPrivateKey<'static>,
 		RsaPublicKey,
@@ -26,7 +31,7 @@ pub(super) async fn login(
 	let (master_key, pwd) = crypto::v1::derive_password_and_mk(pwd.as_bytes())?;
 
 	let response = api::v3::login::post(
-		&client,
+		client,
 		&api::v3::login::Request {
 			email: Cow::Borrowed(email),
 			password: pwd,
@@ -36,7 +41,8 @@ pub(super) async fn login(
 	)
 	.await?;
 
-	let auth_client = client.into_authed(Arc::new(RwLock::new(response.api_key)));
+	let auth_client =
+		AuthClient::from_unauthed(client.clone(), Arc::new(RwLock::new(response.api_key)));
 
 	let master_keys_str = response.master_keys.ok_or(Error::custom(
 		ErrorKind::Response,

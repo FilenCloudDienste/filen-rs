@@ -3,7 +3,6 @@ use std::{borrow::Cow, time::Duration};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
-	auth::Client,
 	fs::{
 		HasUUID, NonRootFSObject,
 		dir::meta::DirectoryMetaChanges,
@@ -91,7 +90,10 @@ async fn test_websocket_bad_auth() {
 
 	let mut stringified = client.to_stringified();
 	stringified.api_key = "invalid_api_key".to_string();
-	let client = Client::from_stringified(stringified).unwrap();
+
+	let unauthed = client.get_unauthed();
+
+	let client = unauthed.from_stringified(stringified).unwrap();
 	let result = client
 		.add_event_listener(
 			Box::new(move |event| {
