@@ -14,7 +14,6 @@ use reqwest::{
 use serde::{Serialize, de::DeserializeOwned};
 use tower::{ServiceBuilder, ServiceExt, limit::GlobalConcurrencyLimitLayer};
 
-#[cfg(not(target_os = "ios"))]
 use crate::consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE};
 use crate::{
 	Error,
