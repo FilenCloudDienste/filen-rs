@@ -551,25 +551,6 @@ impl JsClient {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move { this.remove_dir_link(link).await }).await
 	}
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedItems")
-	)]
-	pub async fn list_linked_items(&self) -> Result<DirsAndFiles, Error> {
-		let this = self.inner();
-		let (dirs, files) = runtime::do_on_commander(move || async move {
-			this.list_dir(&ParentUuid::Links).await.map(|(d, f)| {
-				(
-					d.into_iter().map(Dir::from).collect(),
-					f.into_iter().map(File::from).collect(),
-				)
-			})
-		})
-		.await?;
-
-		Ok(DirsAndFiles { dirs, files })
-	}
 }
 
 #[cfg_attr(
@@ -590,6 +571,26 @@ impl JsClient {
 	// ) -> Result<JsValue, Error> {
 	// 	todo!()
 	// }
+	//
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedItems")
+	)]
+	pub async fn list_linked_items(&self) -> Result<DirsAndFiles, Error> {
+		let this = self.inner();
+		let (dirs, files) = runtime::do_on_commander(move || async move {
+			this.list_dir(&ParentUuid::Links).await.map(|(d, f)| {
+				(
+					d.into_iter().map(Dir::from).collect(),
+					f.into_iter().map(File::from).collect(),
+				)
+			})
+		})
+		.await?;
+
+		Ok(DirsAndFiles { dirs, files })
+	}
 
 	// Contacts
 
