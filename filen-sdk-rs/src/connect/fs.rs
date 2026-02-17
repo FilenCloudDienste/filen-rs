@@ -19,7 +19,11 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::Error,
 	fs::{
-		dir::{DirectoryMetaType, RemoteDirectory, RootDirectoryWithMeta, meta::DirectoryMeta},
+		HasUUID,
+		dir::{
+			DirectoryMetaType, HasContents, RemoteDirectory, RootDirectoryWithMeta,
+			meta::DirectoryMeta,
+		},
 		file::{RemoteRootFile, meta::FileMeta},
 	},
 };
@@ -52,6 +56,18 @@ pub struct SharedDirectory {
 	pub(crate) dir: DirectoryMetaType<'static>,
 	pub(crate) sharing_role: SharingRole,
 	pub(crate) write_access: bool,
+}
+
+impl HasUUID for SharedDirectory {
+	fn uuid(&self) -> &UuidStr {
+		self.dir.uuid()
+	}
+}
+
+impl HasContents for SharedDirectory {
+	fn uuid_as_parent(&self) -> filen_types::fs::ParentUuid {
+		self.dir.uuid_as_parent()
+	}
 }
 
 struct DirInfo {
@@ -152,6 +168,12 @@ impl SharedDirectory {
 pub struct SharedFile {
 	pub(crate) file: RemoteRootFile,
 	pub(crate) sharing_role: SharingRole,
+}
+
+impl HasUUID for SharedFile {
+	fn uuid(&self) -> &UuidStr {
+		self.file.uuid()
+	}
 }
 
 impl SharedFile {

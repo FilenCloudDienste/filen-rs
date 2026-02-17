@@ -4,7 +4,10 @@ use filen_macros::CowFrom;
 
 use filen_types::{fs::ObjectType, traits::CowHelpers};
 
-use crate::fs::file::enums::RemoteFileType;
+use crate::{
+	connect::fs::{SharedDirectory, SharedFile, SharingRole},
+	fs::file::enums::RemoteFileType,
+};
 
 use super::{
 	HasMeta, HasName, HasParent, HasType, HasUUID,
@@ -78,7 +81,6 @@ impl<'a> From<FSObject<'a>> for FsObjectIntoTypes<'a> {
 	}
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(
 	Clone, Debug, PartialEq, Eq, HasParent, HasUUID, HasName, HasMeta, CowFrom, CowHelpers,
 )]
@@ -103,4 +105,19 @@ pub enum FSObject1 {
 	RootWithMeta(RootDirectoryWithMeta),
 	File(RemoteFile),
 	SharedFile(RemoteRootFile),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CowFrom, CowHelpers, HasUUID)]
+pub enum SharedRootItem<'a> {
+	Dir(Cow<'a, SharedDirectory>),
+	File(Cow<'a, SharedFile>),
+}
+
+impl SharedRootItem<'_> {
+	pub(crate) fn role(&self) -> &SharingRole {
+		match self {
+			SharedRootItem::Dir(dir) => &dir.sharing_role,
+			SharedRootItem::File(file) => &file.sharing_role,
+		}
+	}
 }

@@ -1,4 +1,5 @@
 use std::{
+	borrow::Cow,
 	env,
 	sync::{Arc, OnceLock},
 	time::Duration,
@@ -7,7 +8,7 @@ use std::{
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
 	auth::{Client, http::ClientConfig, unauth::UnauthClient},
-	fs::{HasName, HasUUID, dir::RemoteDirectory},
+	fs::{HasName, SharedRootItem, dir::RemoteDirectory},
 	sync::lock::ResourceLock,
 };
 
@@ -184,16 +185,16 @@ pub async fn set_up_contact_no_add<'a>(
 					if d.get_dir().name().unwrap().starts_with("compat-") {
 						None
 					} else {
-						Some((*d.get_dir().uuid(), d.get_source_id()))
+						Some(SharedRootItem::Dir(Cow::Owned(d)))
 					}
 				})
 				.chain(
 					out_files
 						.into_iter()
-						.map(|f| (*f.get_file().uuid(), f.get_source_id())),
+						.map(|f| SharedRootItem::File(Cow::Owned(f))),
 				)
-				.map(|(uuid, source_id)| async move {
-					let _ = client.remove_shared_link_out(uuid, source_id).await;
+				.map(|item| async move {
+					let _ = client.remove_shared_item(item).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (out_futures.next().await).is_some() {}
@@ -207,12 +208,16 @@ pub async fn set_up_contact_no_add<'a>(
 					if d.get_dir().name().unwrap().starts_with("compat-") {
 						None
 					} else {
-						Some(*d.get_dir().uuid())
+						Some(SharedRootItem::Dir(Cow::Owned(d)))
 					}
 				})
-				.chain(in_files.into_iter().map(|f| *f.get_file().uuid()))
-				.map(|uuid| async move {
-					let _ = share_client.remove_shared_link_in(uuid).await;
+				.chain(
+					in_files
+						.into_iter()
+						.map(|f| SharedRootItem::File(Cow::Owned(f))),
+				)
+				.map(|item| async move {
+					let _ = share_client.remove_shared_item(item).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (in_futures.next().await).is_some() {}

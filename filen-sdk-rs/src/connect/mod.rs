@@ -24,7 +24,7 @@ use crate::{
 	crypto::{file::FileKey, shared::MetaCrypter},
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	fs::{
-		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject,
+		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject, SharedRootItem,
 		dir::{DirectoryType, HasUUIDContents, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
@@ -1142,26 +1142,26 @@ impl Client {
 		self.inner_list_in_shared(Some(dir)).await
 	}
 
-	pub async fn remove_shared_link_in(&self, uuid: UuidStr) -> Result<(), Error> {
-		api::v3::item::shared::r#in::remove::post(
-			self.client(),
-			&api::v3::item::shared::r#in::remove::Request { uuid },
-		)
-		.await?;
-		Ok(())
-	}
-
-	pub async fn remove_shared_link_out(
-		&self,
-		uuid: UuidStr,
-		receiver_id: u64,
-	) -> Result<(), Error> {
-		api::v3::item::shared::out::remove::post(
-			self.client(),
-			&api::v3::item::shared::out::remove::Request { uuid, receiver_id },
-		)
-		.await?;
-		Ok(())
+	pub async fn remove_shared_item(&self, item: SharedRootItem<'_>) -> Result<(), Error> {
+		match item.role() {
+			fs::SharingRole::Sharer(_) => {
+				api::v3::item::shared::r#in::remove::post(
+					self.client(),
+					&api::v3::item::shared::r#in::remove::Request { uuid: *item.uuid() },
+				)
+				.await
+			}
+			fs::SharingRole::Receiver(share_info) => {
+				api::v3::item::shared::out::remove::post(
+					self.client(),
+					&api::v3::item::shared::out::remove::Request {
+						uuid: *item.uuid(),
+						receiver_id: share_info.id,
+					},
+				)
+				.await
+			}
+		}
 	}
 }
 

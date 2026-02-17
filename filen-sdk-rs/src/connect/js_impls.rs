@@ -13,7 +13,7 @@ use crate::{
 	auth::{JsClient, http::UnauthorizedClient, shared_client::SharedClient},
 	connect::{DirPublicLink, FilePublicLink, PublicLinkSharedClientExt},
 	fs::dir::DirectoryMetaType,
-	js::{Dir, DirWithMetaEnum, DirsAndFiles, File, SharedDir, SharedFile},
+	js::{Dir, DirWithMetaEnum, DirsAndFiles, File, SharedDir, SharedFile, SharedRootItem},
 	runtime::{self, do_on_commander},
 };
 #[cfg(feature = "uniffi")]
@@ -793,44 +793,12 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "removeSharedLinkIn")
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "removeSharedItem")
 	)]
-	pub async fn remove_shared_link_in(&self, link_uuid: UuidStr) -> Result<(), Error> {
+	pub async fn remove_shared_item(&self, item: SharedRootItem) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.remove_shared_link_in(link_uuid).await }).await
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub async fn remove_shared_link_out(
-		&self,
-		link_uuid: UuidStr,
-		receiver_id: u64,
-	) -> Result<(), Error> {
-		let this = self.inner();
-		do_on_commander(
-			move || async move { this.remove_shared_link_out(link_uuid, receiver_id).await },
-		)
-		.await
-	}
-}
-
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
-)]
-impl JsClient {
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "removeSharedLinkOut")]
-	pub async fn remove_shared_link_out(
-		&self,
-		#[wasm_bindgen(js_name = "linkUuid")] link_uuid: UuidStr,
-		#[wasm_bindgen(unchecked_param_type = "bigint", js_name = "receiverId")] receiver_id: u64,
-	) -> Result<(), Error> {
-		let this = self.inner();
-		do_on_commander(
-			move || async move { this.remove_shared_link_out(link_uuid, receiver_id).await },
-		)
-		.await
+		do_on_commander(move || async move { this.remove_shared_item(item.try_into()?).await })
+			.await
 	}
 }
 
