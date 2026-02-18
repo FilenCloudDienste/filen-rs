@@ -10,9 +10,12 @@ use crate::{
 	auth::{
 		JsClient, http::UnauthorizedClient, js_impls::UnauthJsClient, shared_client::SharedClient,
 	},
-	fs::file::{enums::RemoteFileType, meta::FileMetaChanges},
+	fs::{
+		dir::UnsharedDirectoryType,
+		file::{enums::RemoteFileType, meta::FileMetaChanges},
+	},
 	io::client_impl::IoSharedClientExt,
-	js::{File, FileEnum, FileVersion, ManagedFuture, UploadFileParams},
+	js::{DirEnum, File, FileEnum, FileVersion, ManagedFuture, UploadFileParams},
 	runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
@@ -223,6 +226,21 @@ impl JsClient {
 		do_on_commander(move || async move {
 			let mut file = file.try_into()?;
 			this.restore_file(&mut file).await?;
+			Ok(file.into())
+		})
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "moveFile")
+	)]
+	pub async fn move_file(&self, file: File, new_parent: DirEnum) -> Result<File, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			let mut file = file.try_into()?;
+			this.move_file(&mut file, &UnsharedDirectoryType::from(new_parent))
+				.await?;
 			Ok(file.into())
 		})
 		.await
