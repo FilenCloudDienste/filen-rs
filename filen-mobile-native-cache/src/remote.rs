@@ -682,7 +682,7 @@ impl AuthCacheState {
 			&& object.certain_parent() != parent.uuid()
 		{
 			let new_path = parent_path.join(object.uuid().as_ref());
-			let item = self.inner_move_item(object, parent.uuid()).await?;
+			let item = self.inner_move_item(object, parent).await?;
 			return Ok(ObjectWithPathResponse {
 				object: DBObject::from(item).into(),
 				id: new_path,
@@ -746,7 +746,7 @@ impl AuthCacheState {
 			}
 		)?;
 
-		let obj = self.inner_move_item(obj, new_parent_dir.uuid()).await?;
+		let obj = self.inner_move_item(obj, new_parent_dir).await?;
 		Ok(ObjectWithPathResponse {
 			object: DBObject::from(obj).into(),
 			id: new_parent.join(item_pvs.name_or_uuid),
@@ -1021,13 +1021,13 @@ impl AuthCacheState {
 	async fn inner_move_item(
 		&self,
 		item: DBNonRootObject,
-		new_parent_uuid: UuidStr,
+		new_parent: DBDirObject,
 	) -> Result<DBNonRootObject, CacheError> {
 		match item {
 			DBNonRootObject::Dir(dir) => {
 				let mut remote_dir: RemoteDirectory = dir.into();
 				self.client
-					.move_dir(&mut remote_dir, &new_parent_uuid)
+					.move_dir(&mut remote_dir, &new_parent.into())
 					.await?;
 				let mut conn = self.conn();
 
@@ -1038,7 +1038,7 @@ impl AuthCacheState {
 			DBNonRootObject::File(file) => {
 				let mut remote_file: RemoteFile = file.try_into()?;
 				self.client
-					.move_file(&mut remote_file, &new_parent_uuid)
+					.move_file(&mut remote_file, &new_parent.into())
 					.await?;
 				let mut conn = self.conn();
 				Ok(DBNonRootObject::File(DBFile::upsert_from_remote(

@@ -8,7 +8,7 @@ use filen_sdk_rs::{
 	connect::fs::SharedDirectory,
 	crypto::file::FileKey,
 	fs::{
-		FSObject, HasName, HasUUID, NonRootFSObject,
+		HasName, HasUUID, NonRootFSObject, UnsharedFSObject,
 		dir::{HasUUIDContents, RemoteDirectory},
 		file::FileBuilder,
 	},
@@ -153,7 +153,7 @@ async fn make_rs_compat_dir() {
 
 	let _lock = client.acquire_lock_with_default("test:rs").await.unwrap();
 
-	if let Some(FSObject::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
+	if let Some(UnsharedFSObject::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
 		client.trash_dir(&mut dir.into_owned()).await.unwrap();
 	}
 
@@ -413,7 +413,7 @@ async fn check_go_compat_dir() {
 	let _lock = client.acquire_lock_with_default("test:go").await.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-go").await.unwrap() {
-		Some(FSObject::Dir(dir)) => dir.into_owned(),
+		Some(UnsharedFSObject::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
 	};
 
@@ -429,7 +429,7 @@ async fn check_ts_compat_dir() {
 	let _lock = client.acquire_lock_with_default("test:ts").await.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-ts").await.unwrap() {
-		Some(FSObject::Dir(dir)) => dir.into_owned(),
+		Some(UnsharedFSObject::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-ts directory not found"),
 	};
 

@@ -302,7 +302,7 @@ async fn find_at_path() {
 			.find_item_at_path(&format!("{}/a/b/c", test_dir.name().unwrap()))
 			.await
 			.unwrap(),
-		Some(FSObject::Dir(std::borrow::Cow::Borrowed(&dir_c)))
+		Some(UnsharedFSObject::Dir(std::borrow::Cow::Borrowed(&dir_c)))
 	);
 
 	assert_eq!(
@@ -384,7 +384,7 @@ async fn find_or_create() {
 	let nested_dir = client.find_or_create_dir(&path).await.unwrap();
 
 	assert_eq!(
-		Some(Into::<FSObject<'_>>::into(nested_dir.clone())),
+		Some(Into::<UnsharedFSObject<'_>>::into(nested_dir.clone())),
 		client.find_item_at_path(&path).await.unwrap()
 	);
 
@@ -393,7 +393,7 @@ async fn find_or_create() {
 		.await
 		.unwrap();
 	assert_eq!(
-		Some(Into::<FSObject<'_>>::into(nested_dir.clone())),
+		Some(Into::<UnsharedFSObject<'_>>::into(nested_dir.clone())),
 		client
 			.find_item_at_path(&format!("{path}/d/e"))
 			.await
@@ -476,7 +476,7 @@ async fn dir_move() {
 
 	assert!(client.list_dir(&dir_b).await.unwrap().0.is_empty());
 
-	client.move_dir(&mut dir_a, &dir_b).await.unwrap();
+	client.move_dir(&mut dir_a, &(&dir_b).into()).await.unwrap();
 	assert!(client.list_dir(&dir_b).await.unwrap().0.contains(&dir_a));
 }
 
@@ -585,7 +585,7 @@ async fn dir_update_meta() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), dir_name))
 			.await
 			.unwrap(),
-		Some(FSObject::Dir(Cow::Borrowed(&dir)))
+		Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir)))
 	);
 
 	client
@@ -608,7 +608,7 @@ async fn dir_update_meta() {
 			))
 			.await
 			.unwrap(),
-		Some(FSObject::Dir(Cow::Borrowed(&dir)))
+		Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir)))
 	);
 
 	let created = Utc::now() - chrono::Duration::days(1);

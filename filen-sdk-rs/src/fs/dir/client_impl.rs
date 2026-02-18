@@ -9,6 +9,7 @@ use futures::TryFutureExt;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
+use crate::fs::dir::UnsharedDirectoryType;
 use crate::util::AtomicDropCanceller;
 use crate::{
 	api,
@@ -455,9 +456,9 @@ impl Client {
 
 	pub async fn find_or_create_dir_starting_at<'a>(
 		&self,
-		dir: DirectoryType<'a>,
+		dir: UnsharedDirectoryType<'a>,
 		path: &str,
-	) -> Result<DirectoryType<'a>, Error> {
+	) -> Result<UnsharedDirectoryType<'a>, Error> {
 		let _lock = self.lock_drive().await?;
 		let mut curr_dir = dir;
 		for (component, remaining_path) in path.path_iter() {
@@ -465,7 +466,7 @@ impl Client {
 
 			let dir_uuid_match = match self.inner_find_item_in_dirs(dirs, component) {
 				Some(ObjectMatch::Name(dir)) => {
-					curr_dir = DirectoryType::Dir(Cow::Owned(dir));
+					curr_dir = UnsharedDirectoryType::Dir(Cow::Owned(dir));
 					continue;
 				}
 				Some(ObjectMatch::Uuid(obj)) => Some(obj),
@@ -485,19 +486,22 @@ impl Client {
 			};
 
 			if let Some(dir) = dir_uuid_match {
-				curr_dir = DirectoryType::Dir(Cow::Owned(dir));
+				curr_dir = UnsharedDirectoryType::Dir(Cow::Owned(dir));
 				continue;
 			}
 
 			let new_dir = self.create_dir(&curr_dir, component.to_string()).await?;
-			curr_dir = DirectoryType::Dir(Cow::Owned(new_dir));
+			curr_dir = UnsharedDirectoryType::Dir(Cow::Owned(new_dir));
 		}
 		Ok(curr_dir)
 	}
 
-	pub async fn find_or_create_dir(&self, path: &str) -> Result<DirectoryType<'_>, Error> {
-		self.find_or_create_dir_starting_at(DirectoryType::Root(Cow::Borrowed(self.root())), path)
-			.await
+	pub async fn find_or_create_dir(&self, path: &str) -> Result<UnsharedDirectoryType<'_>, Error> {
+		self.find_or_create_dir_starting_at(
+			UnsharedDirectoryType::Root(Cow::Borrowed(self.root())),
+			path,
+		)
+		.await
 	}
 
 	// todo add overwriting
@@ -505,7 +509,7 @@ impl Client {
 	pub async fn move_dir(
 		&self,
 		dir: &mut RemoteDirectory,
-		new_parent: &dyn HasUUIDContents,
+		new_parent: &UnsharedDirectoryType<'_>,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::r#move::post(

@@ -13,8 +13,6 @@ use crate::{
 	util::PathIteratorExt,
 };
 
-use super::enums::FSObject;
-
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectOrRemainingPath<'a, 'b> {
@@ -31,14 +29,11 @@ impl Client {
 	pub async fn find_item_at_path<'a>(
 		&'a self,
 		path: &str,
-	) -> Result<Option<FSObject<'a>>, Error> {
+	) -> Result<Option<UnsharedFSObject<'a>>, Error> {
 		let (_, item): (_, ObjectOrRemainingPath<'a, '_>) =
 			self.get_items_in_path(path).await.map_err(|(e, _, _)| e)?;
 		match item {
-			ObjectOrRemainingPath::Object(fs_object) => {
-				let fs_object: FSObject = fs_object.into();
-				Ok(Some(fs_object))
-			}
+			ObjectOrRemainingPath::Object(fs_object) => Ok(Some(fs_object)),
 			ObjectOrRemainingPath::RemainingPath(_) => Ok(None),
 		}
 	}

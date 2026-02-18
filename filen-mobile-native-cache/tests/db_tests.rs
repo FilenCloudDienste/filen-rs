@@ -4030,7 +4030,10 @@ pub async fn test_update_local_data_remote_move() {
 		.unwrap();
 	ffi_file.local_data = Some(local_data);
 
-	rss.client.move_file(&mut file, &new_parent).await.unwrap();
+	rss.client
+		.move_file(&mut file, &(&new_parent).into())
+		.await
+		.unwrap();
 
 	db.update_dir_children(new_parent_path.clone())
 		.await

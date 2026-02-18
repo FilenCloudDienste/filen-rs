@@ -6,7 +6,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	crypto::shared::generate_random_base64_values,
 	fs::{
-		FSObject, HasName, HasRemoteInfo, HasUUID, NonRootFSObject,
+		HasName, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
 		dir::RemoteDirectory,
 		file::{
 			client_impl::FileReaderSharedClientExt,
@@ -37,7 +37,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 		.await
 		.unwrap()
 	{
-		Some(FSObject::File(file)) => file.into_owned(),
+		Some(UnsharedFSObject::File(file)) => file.into_owned(),
 		_ => panic!("Expected a file"),
 	};
 	assert_eq!(
@@ -138,7 +138,7 @@ async fn file_trash() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 
 	let _lock = client
@@ -161,7 +161,7 @@ async fn file_trash() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 }
 
@@ -183,7 +183,7 @@ async fn file_delete_permanently() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 
 	client.delete_file_permanently(file.clone()).await.unwrap();
@@ -255,14 +255,17 @@ async fn file_move() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 
 	let second_dir = client
 		.create_dir(test_dir, "second_dir".to_string())
 		.await
 		.unwrap();
-	client.move_file(&mut file, &second_dir).await.unwrap();
+	client
+		.move_file(&mut file, &(&second_dir).into())
+		.await
+		.unwrap();
 
 	assert!(
 		client
@@ -282,7 +285,7 @@ async fn file_move() {
 			))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 }
 
@@ -304,7 +307,7 @@ async fn file_update_meta() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 
 	client
@@ -327,7 +330,7 @@ async fn file_update_meta() {
 			))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 
 	let created = Utc::now() - chrono::Duration::days(1);
@@ -431,7 +434,7 @@ async fn file_trash_empty() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(FSObject::File(Cow::Borrowed(&file)))
+		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
 	);
 	let _lock = client
 		.acquire_lock("test:rs:trash", std::time::Duration::from_secs(1), 600)

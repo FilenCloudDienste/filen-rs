@@ -16,7 +16,7 @@ use crate::{
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 	fs::{
 		HasUUID,
-		dir::HasUUIDContents,
+		dir::{HasUUIDContents, UnsharedDirectoryType},
 		file::{
 			FileVersion,
 			meta::{FileMeta, FileMetaChanges},
@@ -77,7 +77,7 @@ impl Client {
 	pub async fn move_file(
 		&self,
 		file: &mut RemoteFile,
-		new_parent: &impl HasUUIDContents,
+		new_parent: &UnsharedDirectoryType<'_>,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::r#move::post(

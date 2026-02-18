@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use filen_sdk_rs::fs::{
 	HasName, HasParent, HasRemoteInfo, HasUUID,
 	dir::{
-		DecryptedDirectoryMeta, RemoteDirectory, RootDirectory,
+		DecryptedDirectoryMeta, RemoteDirectory, RootDirectory, UnsharedDirectoryType,
 		meta::DirectoryMeta,
 		traits::{HasDirMeta, HasRemoteDirInfo},
 	},
@@ -497,6 +497,15 @@ impl TryFrom<DBObject> for DBDirObject {
 			DBObject::Dir(dir) => Ok(DBDirObject::Dir(dir)),
 			DBObject::Root(root) => Ok(DBDirObject::Root(root)),
 			DBObject::File(_) => Err(SQLError::UnexpectedType(ItemType::File, ItemType::Dir)),
+		}
+	}
+}
+
+impl From<DBDirObject> for UnsharedDirectoryType<'static> {
+	fn from(obj: DBDirObject) -> Self {
+		match obj {
+			DBDirObject::Dir(dir) => UnsharedDirectoryType::Dir(Cow::Owned(dir.into())),
+			DBDirObject::Root(root) => UnsharedDirectoryType::Root(Cow::Owned(root.into())),
 		}
 	}
 }

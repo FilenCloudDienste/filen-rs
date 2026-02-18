@@ -7,9 +7,9 @@ use filen_rclone_wrapper::serve::BasicServerOptions;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
-		FSObject, HasName as _, HasUUID,
-		dir::{DirectoryType, HasContents},
-		file::{enums::RemoteFileType, traits::HasFileInfo as _},
+		HasName as _, HasUUID, UnsharedFSObject,
+		dir::{DirectoryType, HasContents, UnsharedDirectoryType},
+		file::traits::HasFileInfo as _,
 	},
 	io::{RemoteDirectory, client_impl::IoSharedClientExt},
 };
@@ -400,7 +400,7 @@ async fn cd(
 		.context("Failed to find directory")?
 	{
 		Some(dir) => match dir {
-			FSObject::Dir(_) | FSObject::Root(_) | FSObject::RootWithMeta(_) => Ok(directory),
+			UnsharedFSObject::Dir(_) | UnsharedFSObject::Root(_) => Ok(directory),
 			_ => Err(UI::failure(&format!("Not a directory: {}", directory.0))),
 		},
 		None => Err(UI::failure(&format!("No such directory: {}", directory.0))),
@@ -426,9 +426,8 @@ async fn list_directory(
 		)));
 	};
 	let directory = match directory {
-		FSObject::Dir(dir) => DirectoryType::Dir(dir),
-		FSObject::Root(root) => DirectoryType::Root(root),
-		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
+		UnsharedFSObject::Dir(dir) => DirectoryType::Dir(dir),
+		UnsharedFSObject::Root(root) => DirectoryType::Root(root),
 		_ => return Err(UI::failure(&format!("Not a directory: {}", directory_str))),
 	};
 	list_directory_by_uuid(ui, client, directory.uuid(), None).await
@@ -506,14 +505,13 @@ async fn print_file(
 		return Err(UI::failure(&format!("No such file: {}", file_str)));
 	};
 	let file = match file {
-		FSObject::File(file) => RemoteFileType::File(file),
-		FSObject::SharedFile(file) => RemoteFileType::SharedFile(file),
+		UnsharedFSObject::File(file) => file,
 		_ => return Err(UI::failure(&format!("Not a file: {}", file_str))),
 	};
 	if file.size() < 1024
 		|| ui.prompt_confirm("File is larger than 1KB, do you want to continue?", false)?
 	{
-		let content = client.download_file(&file).await?;
+		let content = client.download_file(file.as_ref()).await?;
 		let content = String::from_utf8_lossy(&content);
 		let content = match lines {
 			PrintFileLines::Full => content.to_string(),
@@ -549,7 +547,7 @@ async fn print_file_or_directory_info(
 		)));
 	};
 	match item {
-		FSObject::File(file) => {
+		UnsharedFSObject::File(file) => {
 			if ui.json {
 				ui.print_json(json!({
 					"name": file.name().unwrap_or_else(|| file.uuid().as_ref()),
@@ -585,7 +583,7 @@ async fn print_file_or_directory_info(
 				]);
 			}
 		}
-		FSObject::Dir(dir) => {
+		UnsharedFSObject::Dir(dir) => {
 			if ui.json {
 				ui.print_json(json!({
 					"name": dir.name().unwrap_or_else(|| dir.uuid().as_ref()),
@@ -608,7 +606,7 @@ async fn print_file_or_directory_info(
 				]);
 			}
 		}
-		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+		UnsharedFSObject::Root(_) => {
 			let user_info = client
 				.get_user_info()
 				.await
@@ -626,9 +624,6 @@ async fn print_file_or_directory_info(
 					("Total", &ui::format_size(user_info.max_storage)),
 				]);
 			}
-		}
-		FSObject::SharedFile(_) => {
-			return Err(UI::failure("Cannot show information for shared file"));
 		}
 	}
 	Ok(())
@@ -669,9 +664,8 @@ async fn create_directory_(
 				return Err(e).context("Failed to find parent directory");
 			}
 		}
-		Ok(Some(FSObject::Dir(parent_dir))) => Ok(DirectoryType::Dir(parent_dir)),
-		Ok(Some(FSObject::Root(root))) => Ok(DirectoryType::Root(root)),
-		Ok(Some(FSObject::RootWithMeta(root))) => Ok(DirectoryType::RootWithMeta(root)),
+		Ok(Some(UnsharedFSObject::Dir(parent_dir))) => Ok(DirectoryType::Dir(parent_dir)),
+		Ok(Some(UnsharedFSObject::Root(root))) => Ok(DirectoryType::Root(root)),
 		Ok(Some(_)) => Err(UI::failure(&format!("Not a directory: {}", parent.0))),
 		Ok(None) => {
 			if recursive {
@@ -719,7 +713,7 @@ async fn delete_file_or_directory(
 		return Ok(());
 	}
 	match item {
-		FSObject::File(mut file) => {
+		UnsharedFSObject::File(mut file) => {
 			if permanent {
 				client
 					.delete_file_permanently(file.into_owned())
@@ -737,7 +731,7 @@ async fn delete_file_or_directory(
 				ui.print_success(&format!("Trashed file: {}", file_or_directory_str));
 			}
 		}
-		FSObject::Dir(mut dir) => {
+		UnsharedFSObject::Dir(mut dir) => {
 			if permanent {
 				client
 					.delete_dir_permanently(dir.into_owned())
@@ -755,11 +749,8 @@ async fn delete_file_or_directory(
 				ui.print_success(&format!("Trashed directory: {}", file_or_directory_str));
 			}
 		}
-		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+		UnsharedFSObject::Root(_) => {
 			return Err(UI::failure("Cannot delete root directory"));
-		}
-		FSObject::SharedFile(_) => {
-			return Err(UI::failure("Cannot delete shared file"));
 		}
 	}
 	Ok(())
@@ -801,9 +792,8 @@ async fn move_or_copy_file_or_directory(
 		)));
 	};
 	let destination_dir = match destination_dir {
-		FSObject::Dir(dir) => DirectoryType::Dir(dir),
-		FSObject::Root(root) => DirectoryType::Root(root),
-		FSObject::RootWithMeta(root) => DirectoryType::RootWithMeta(root),
+		UnsharedFSObject::Dir(dir) => UnsharedDirectoryType::Dir(dir),
+		UnsharedFSObject::Root(root) => UnsharedDirectoryType::Root(root),
 		_ => {
 			return Err(UI::failure(&format!(
 				"Not a directory: {}",
@@ -813,37 +803,31 @@ async fn move_or_copy_file_or_directory(
 	};
 	match action {
 		MoveOrCopy::Move => match source_file_or_directory {
-			FSObject::File(file) => {
+			UnsharedFSObject::File(file) => {
 				client
 					.move_file(&mut file.into_owned(), &destination_dir)
 					.await
 					.context("Failed to move file or directory")?;
 			}
-			FSObject::Dir(dir) => {
+			UnsharedFSObject::Dir(dir) => {
 				client
 					.move_dir(&mut dir.into_owned(), &destination_dir)
 					.await
 					.context("Failed to move directory")?;
 			}
-			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+			UnsharedFSObject::Root(_) => {
 				return Err(UI::failure("Cannot move root directory"));
-			}
-			FSObject::SharedFile(_) => {
-				return Err(UI::failure("Cannot move shared file"));
 			}
 		},
 		MoveOrCopy::Copy => match source_file_or_directory {
-			FSObject::File(_) => {
+			UnsharedFSObject::File(_) => {
 				todo!("Implement file copy"); // filen-sdk-rs does not support file copy yet
 			}
-			FSObject::Dir(_) => {
+			UnsharedFSObject::Dir(_) => {
 				todo!("Implement directory copy"); // filen-sdk-rs does not support directory copy yet
 			}
-			FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+			UnsharedFSObject::Root(_) => {
 				return Err(UI::failure("Cannot copy root directory"));
-			}
-			FSObject::SharedFile(_) => {
-				return Err(UI::failure("Cannot copy shared file"));
 			}
 		},
 	}
@@ -879,7 +863,7 @@ async fn set_file_or_directory_favorite(
 		)));
 	};
 	match file_or_directory {
-		FSObject::File(mut file) => {
+		UnsharedFSObject::File(mut file) => {
 			client
 				.set_favorite(file.to_mut(), favorite)
 				.await
@@ -890,7 +874,7 @@ async fn set_file_or_directory_favorite(
 				file_or_directory_str
 			));
 		}
-		FSObject::Dir(mut dir) => {
+		UnsharedFSObject::Dir(mut dir) => {
 			client
 				.set_favorite(dir.to_mut(), favorite)
 				.await
@@ -901,13 +885,10 @@ async fn set_file_or_directory_favorite(
 				file_or_directory_str
 			));
 		}
-		FSObject::Root(_) | FSObject::RootWithMeta(_) => {
+		UnsharedFSObject::Root(_) => {
 			return Err(UI::failure(
 				"Cannot change favorite status of root directory",
 			));
-		}
-		FSObject::SharedFile(_) => {
-			return Err(UI::failure("Cannot change favorite status of shared file"));
 		}
 	}
 	Ok(())

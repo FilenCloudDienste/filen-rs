@@ -324,7 +324,10 @@ async fn test_websocket_file_events() {
 		.await
 		.unwrap();
 
-	client.move_file(&mut file_a, &new_parent).await.unwrap();
+	client
+		.move_file(&mut file_a, &(&new_parent).into())
+		.await
+		.unwrap();
 
 	let event = await_map_event(
 		&mut receiver,
@@ -476,7 +479,10 @@ async fn test_websocket_folder_events() {
 		.create_dir(dir, "new_parent".to_string())
 		.await
 		.unwrap();
-	client.move_dir(&mut dir_a, &new_parent_dir).await.unwrap();
+	client
+		.move_dir(&mut dir_a, &(&new_parent_dir).into())
+		.await
+		.unwrap();
 
 	let event = await_map_event(
 		&mut receiver,
