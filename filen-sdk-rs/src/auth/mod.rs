@@ -271,6 +271,10 @@ impl Client {
 		self.http_client.to_unauthed()
 	}
 
+	pub(crate) fn unauthed(&self) -> &UnauthClient {
+		&self.http_client.unauthed
+	}
+
 	pub(crate) fn client(&self) -> &AuthClient {
 		&self.http_client
 	}
@@ -514,7 +518,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let _lock = self.lock_auth().await?;
 		let auth_info_resp = api::v3::auth::info::post(
-			self.client(),
+			self.unauthed(),
 			&api::v3::auth::info::Request {
 				email: Cow::Borrowed(&self.email),
 			},

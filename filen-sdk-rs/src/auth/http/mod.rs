@@ -19,7 +19,7 @@ use crate::{
 	Error,
 	auth::{Client, http::auth::AuthLayer, unauth::UnauthClient},
 	consts::gateway_url,
-	util::{MaybeSend, MaybeSendSync},
+	util::MaybeSend,
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use bandwidth_limit::{
@@ -300,152 +300,8 @@ impl RequestCallTrait for () {
 	}
 }
 
-impl UnauthClient {
-	async fn inner_post<Req, Res>(
-		&self,
-		request: Request<(), String>,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-	{
-		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
-			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
-			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
-			.layer(self.state.retry.clone()) // required to map RetryError to Error
-			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
-			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
-
-		let builder = {
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			{
-				builder
-					.layer(UploadBandwidthLimiterLayer::new(&self.state.upload_limiter)) // required to map Request to RequestBuilder
-					.layer(self.state.download_limiter.clone()) // optional
-			}
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				builder.map_request(|r: Request<Bytes, reqwest::Url>| -> RequestBuilder {
-					r.into_builder_map_body(|b| b)
-				})
-			}
-		};
-
-		builder.service_fn(execute_request).oneshot(request).await
-	}
-
-	async fn inner_post_large<Req, Res, F>(
-		&self,
-		request: Request<(), String>,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-		callback: Option<&F>,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug + Sync,
-		F: Fn(u64, Option<u64>) + Send + Sync,
-	{
-		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
-			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
-			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
-			.layer(self.state.retry.clone()) // required to map RetryError to Error
-			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
-			.layer(download_body::callback::DownloadWithCallbackLayer::new(
-				callback,
-			)); // required to download full response body to bytes
-
-		let builder = {
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			{
-				builder
-					.layer(UploadBandwidthLimiterLayer::new(&self.state.upload_limiter)) // required to map Request to RequestBuilder
-					.layer(self.state.download_limiter.clone()) // optional
-			}
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				builder.map_request(|r: Request<Bytes, reqwest::Url>| -> RequestBuilder {
-					r.into_builder_map_body(|b| b)
-				})
-			}
-		};
-
-		builder.service_fn(execute_request).oneshot(request).await
-	}
-
-	async fn inner_get<Res>(
-		&self,
-		request: Request<(), String>,
-		endpoint: Cow<'static, str>,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-	{
-		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
-			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
-			.layer(self.state.retry.clone()) // required to map RetryError to Error
-			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
-			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
-			.map_request(|request: Request<(), reqwest::Url>| {
-				request.into_builder_map_body(|()| bytes::Bytes::new())
-			}); // required to map Request to RequestBuilder
-
-		let builder = {
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			{
-				builder.layer(self.state.download_limiter.clone()) // optional
-			}
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				builder
-			}
-		};
-
-		builder.service_fn(execute_request).oneshot(request).await
-	}
-
-	async fn inner_get_raw_bytes(
-		&self,
-		request: Request<(), &str>,
-		endpoint: Cow<'static, str>,
-	) -> Result<Vec<u8>, Error> {
-		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
-			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
-			.layer(self.state.retry.clone()) // required to map RetryError to Error
-			.layer(self.state.rate_limiter.clone()) // optional
-			.map_request(|request: Request<(), reqwest::Url>| {
-				request.into_builder_map_body(|()| bytes::Bytes::new())
-			}) // required to map Request to RequestBuilder
-			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
-		let builder = {
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			{
-				builder.layer(self.state.download_limiter.clone()) // optional
-			}
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				builder
-			}
-		};
-		builder.service_fn(execute_request).oneshot(request).await
-	}
-}
-
 pub struct AuthClient {
-	unauthed: UnauthClient,
+	pub(crate) unauthed: UnauthClient,
 	api_key: Arc<RwLock<APIKey<'static>>>,
 }
 
@@ -501,6 +357,10 @@ impl AuthClient {
 		&self.api_key
 	}
 
+	pub(crate) fn state(&self) -> &SharedClientState {
+		&self.unauthed.state
+	}
+
 	pub(crate) async fn set_request_rate_limit(&self, rate_limit_per_second: NonZeroU32) {
 		self.unauthed
 			.state
@@ -539,18 +399,241 @@ impl AuthClient {
 				.change_rate_per_sec(download_kbps)
 		);
 	}
+}
 
-	async fn inner_post<Req, Res>(
+impl UnauthClient {
+	pub(crate) fn state(&self) -> &SharedClientState {
+		&self.state
+	}
+
+	pub(crate) async fn get<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
+	where
+		Res: DeserializeOwned + Debug,
+	{
+		let url = gateway_url(&endpoint);
+
+		let builder = ServiceBuilder::new()
+			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
+			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.retry.clone()) // required to map RetryError to Error
+			.layer(self.state.rate_limiter.clone()) // optional
+			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
+			.map_request(|request: Request<(), reqwest::Url>| {
+				request.into_builder_map_body(|()| bytes::Bytes::new())
+			}); // required to map Request to RequestBuilder
+
+		let builder = {
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				builder.layer(self.state.download_limiter.clone()) // optional
+			}
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				builder
+			}
+		};
+
+		builder
+			.service_fn(execute_request)
+			.oneshot(Request {
+				method: RequestMethod::Get,
+				response_type: ResponseType::Standard,
+				url,
+				client: self.reqwest_client.clone(),
+			})
+			.await
+	}
+
+	pub(crate) async fn post<Req, Res>(
 		&self,
-		request: Request<(), String>,
 		endpoint: Cow<'static, str>,
 		body: &Req,
-		auth: bool,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
 	{
+		let url = gateway_url(&endpoint);
+
+		let builder = ServiceBuilder::new()
+			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
+			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
+			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.retry.clone()) // required to map RetryError to Error
+			.layer(self.state.rate_limiter.clone()) // optional
+			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
+
+		let builder = {
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				builder
+					.layer(UploadBandwidthLimiterLayer::new(&self.state.upload_limiter)) // required to map Request to RequestBuilder
+					.layer(self.state.download_limiter.clone()) // optional
+			}
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				builder.map_request(|r: Request<Bytes, reqwest::Url>| -> RequestBuilder {
+					r.into_builder_map_body(|b| b)
+				})
+			}
+		};
+
+		builder
+			.service_fn(execute_request)
+			.oneshot(Request {
+				method: RequestMethod::Post(()),
+				response_type: ResponseType::Standard,
+				url,
+				client: self.reqwest_client.clone(),
+			})
+			.await
+	}
+
+	pub(crate) fn post_large_response<Req, Res, F>(
+		&self,
+		endpoint: Cow<'static, str>,
+		body: &Req,
+		callback: Option<&F>,
+	) -> impl Future<Output = Result<Res, Error>> + MaybeSend
+	where
+		Res: DeserializeOwned + Debug + Send,
+		Req: Serialize + Debug + Sync,
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		let url = gateway_url(&endpoint);
+
+		let builder = ServiceBuilder::new()
+			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
+			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
+			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.retry.clone()) // required to map RetryError to Error
+			.layer(self.state.rate_limiter.clone()) // optional
+			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(download_body::callback::DownloadWithCallbackLayer::new(
+				callback,
+			)); // required to download full response body to bytes
+
+		let builder = {
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				builder
+					.layer(UploadBandwidthLimiterLayer::new(&self.state.upload_limiter)) // required to map Request to RequestBuilder
+					.layer(self.state.download_limiter.clone()) // optional
+			}
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				builder.map_request(|r: Request<Bytes, reqwest::Url>| -> RequestBuilder {
+					r.into_builder_map_body(|b| b)
+				})
+			}
+		};
+
+		builder.service_fn(execute_request).oneshot(Request {
+			method: RequestMethod::Post(()),
+			response_type: ResponseType::Large,
+			url,
+			client: self.reqwest_client.clone(),
+		})
+	}
+
+	pub(crate) async fn get_raw_bytes(
+		&self,
+		url: &str,
+		endpoint: Cow<'static, str>,
+	) -> Result<Vec<u8>, Error> {
+		let builder = ServiceBuilder::new()
+			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
+			.layer(self.state.concurrency.clone()) // optional
+			.layer(self.state.retry.clone()) // required to map RetryError to Error
+			.layer(self.state.rate_limiter.clone()) // optional
+			.map_request(|request: Request<(), reqwest::Url>| {
+				request.into_builder_map_body(|()| bytes::Bytes::new())
+			}) // required to map Request to RequestBuilder
+			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
+		let builder = {
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				builder.layer(self.state.download_limiter.clone()) // optional
+			}
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				builder
+			}
+		};
+		builder
+			.service_fn(execute_request)
+			.oneshot(Request {
+				method: RequestMethod::Get,
+				response_type: ResponseType::Standard,
+				url,
+				client: self.reqwest_client.clone(),
+			})
+			.await
+	}
+}
+
+impl AuthClient {
+	pub(crate) async fn get_auth<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
+	where
+		Res: DeserializeOwned + Debug,
+	{
+		let url = gateway_url(&endpoint);
+
+		let builder = ServiceBuilder::new()
+			.layer(logging::LogLayer::new(
+				self.unauthed.state.log_level,
+				endpoint,
+			)) // optional logging
+			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
+			.layer(self.unauthed.state.concurrency.clone()) // optional
+			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
+			.layer(self.unauthed.state.rate_limiter.clone()) // optional
+			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
+			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
+			.map_request(|request: Request<(), reqwest::Url>| {
+				request.into_builder_map_body(|()| "")
+			}); // required to map Request to RequestBuilder
+
+		let builder = {
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			{
+				builder.layer(self.unauthed.state.download_limiter.clone()) // optional
+			}
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				builder
+			}
+		};
+
+		builder
+			.layer(auth::AuthLayer::new(&self.api_key))
+			.service_fn(execute_request)
+			.oneshot(Request {
+				method: RequestMethod::Get,
+				response_type: ResponseType::Standard,
+				url,
+				client: self.unauthed.reqwest_client.clone(),
+			})
+			.await
+	}
+
+	pub(crate) async fn post_auth<Req, Res>(
+		&self,
+		endpoint: Cow<'static, str>,
+		body: &Req,
+	) -> Result<Res, Error>
+	where
+		Res: DeserializeOwned + Debug,
+		Req: Serialize + Debug,
+	{
+		let url = gateway_url(&endpoint);
+
 		// This could be improved, all the boxes should be removable with type_alias_impl_trait
 		// and using references instead of Arcs
 		let builder = ServiceBuilder::new()
@@ -584,29 +667,30 @@ impl AuthClient {
 		};
 
 		builder
-			.option_layer(if auth {
-				Some(AuthLayer::new(&self.api_key))
-			} else {
-				None
-			})
+			.layer(AuthLayer::new(&self.api_key))
 			.service_fn(execute_request)
-			.oneshot(request)
+			.oneshot(Request {
+				method: RequestMethod::Post(()),
+				response_type: ResponseType::Standard,
+				url,
+				client: self.unauthed.reqwest_client.clone(),
+			})
 			.await // optional
 	}
 
-	async fn inner_post_large<Req, Res, F>(
+	pub(crate) async fn post_large_response_auth<Req, Res, F>(
 		&self,
-		request: Request<(), &str>,
 		endpoint: Cow<'static, str>,
 		body: &Req,
 		callback: Option<&F>,
-		auth: bool,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
 		Req: Serialize + Debug,
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
+		let url = gateway_url(&endpoint);
+
 		// This could be improved, all the boxes should be removable with type_alias_impl_trait
 		// and using references instead of Arcs
 		let builder = ServiceBuilder::new()
@@ -640,69 +724,22 @@ impl AuthClient {
 			}
 		};
 		builder
-			.option_layer(if auth {
-				// optional
-				Some(auth::AuthLayer::new(&self.api_key))
-			} else {
-				None
-			})
+			.layer(auth::AuthLayer::new(&self.api_key))
 			.service_fn(execute_request)
-			.oneshot(request)
+			.oneshot(Request {
+				method: RequestMethod::Post(()),
+				response_type: ResponseType::Large,
+				url,
+				client: self.unauthed.reqwest_client.clone(),
+			})
 			.await
 	}
 
-	async fn inner_get<Res>(
+	pub(crate) async fn post_raw_bytes_auth<Res>(
 		&self,
-		request: Request<(), String>,
+		request: Bytes,
+		url: &str,
 		endpoint: Cow<'static, str>,
-		auth: bool,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-	{
-		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(
-				self.unauthed.state.log_level,
-				endpoint,
-			)) // optional logging
-			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.unauthed.state.concurrency.clone()) // optional
-			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
-			.layer(self.unauthed.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
-			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
-			.map_request(|request: Request<(), reqwest::Url>| {
-				request.into_builder_map_body(|()| "")
-			}); // required to map Request to RequestBuilder
-
-		let builder = {
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			{
-				builder.layer(self.unauthed.state.download_limiter.clone()) // optional
-			}
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				builder
-			}
-		};
-
-		builder
-			.option_layer(if auth {
-				// optional
-				Some(auth::AuthLayer::new(&self.api_key))
-			} else {
-				None
-			})
-			.service_fn(execute_request)
-			.oneshot(request)
-			.await
-	}
-
-	async fn inner_post_raw_bytes<Res>(
-		&self,
-		request: Request<Bytes, &str>,
-		endpoint: Cow<'static, str>,
-		auth: bool,
 	) -> Result<Res, Error>
 	where
 		Res: DeserializeOwned + Debug,
@@ -737,331 +774,15 @@ impl AuthClient {
 		};
 
 		builder
-			.option_layer(if auth {
-				// optional
-				Some(auth::AuthLayer::new(&self.api_key))
-			} else {
-				None
-			})
+			.layer(auth::AuthLayer::new(&self.api_key))
 			.service_fn(execute_request)
-			.oneshot(request)
-			.await
-	}
-}
-
-pub(crate) trait UnauthorizedClient: MaybeSendSync {
-	async fn get<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug;
-	async fn post<Req, Res>(&self, endpoint: Cow<'static, str>, body: &Req) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug;
-	fn post_large_response<Req, Res, F>(
-		&self,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-		callback: Option<&F>,
-	) -> impl Future<Output = Result<Res, Error>> + MaybeSend
-	where
-		Res: DeserializeOwned + Debug + Send,
-		Req: Serialize + Debug + Sync,
-		F: Fn(u64, Option<u64>) + Send + Sync;
-	fn state(&self) -> &SharedClientState;
-	fn get_raw_bytes(
-		&self,
-		url: &str,
-		endpoint: Cow<'static, str>,
-	) -> impl Future<Output = Result<Vec<u8>, Error>> + MaybeSend;
-}
-
-impl UnauthorizedClient for UnauthClient {
-	async fn get<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-	{
-		self.inner_get(
-			Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
-				url: gateway_url(&endpoint),
-				client: self.reqwest_client.clone(),
-			},
-			endpoint,
-		)
-		.await
-	}
-
-	async fn post<Req, Res>(&self, endpoint: Cow<'static, str>, body: &Req) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-	{
-		self.inner_post(
-			Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Standard,
-				url: gateway_url(&endpoint),
-				client: self.reqwest_client.clone(),
-			},
-			endpoint,
-			body,
-		)
-		.await
-	}
-
-	fn post_large_response<Req, Res, F>(
-		&self,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-		callback: Option<&F>,
-	) -> impl Future<Output = Result<Res, Error>> + MaybeSend
-	where
-		Res: DeserializeOwned + Debug + Send,
-		Req: Serialize + Debug + Sync,
-		F: Fn(u64, Option<u64>) + Send + Sync,
-	{
-		self.inner_post_large(
-			Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Large,
-				url: gateway_url(&endpoint),
-				client: self.reqwest_client.clone(),
-			},
-			endpoint,
-			body,
-			callback,
-		)
-	}
-
-	fn state(&self) -> &SharedClientState {
-		&self.state
-	}
-
-	async fn get_raw_bytes(
-		&self,
-		url: &str,
-		endpoint: Cow<'static, str>,
-	) -> Result<Vec<u8>, Error> {
-		self.inner_get_raw_bytes(
-			Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
-				url,
-				client: self.reqwest_client.clone(),
-			},
-			endpoint,
-		)
-		.await
-	}
-}
-
-impl UnauthorizedClient for AuthClient {
-	async fn get<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-	{
-		self.inner_get(
-			Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
-				url: gateway_url(&endpoint),
-				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			false,
-		)
-		.await
-	}
-
-	async fn post<Req, Res>(&self, endpoint: Cow<'static, str>, body: &Req) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-	{
-		self.inner_post(
-			Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Standard,
-				url: gateway_url(&endpoint),
-				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			body,
-			false,
-		)
-		.await
-	}
-
-	async fn post_large_response<Req, Res, F>(
-		&self,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-		callback: Option<&F>,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Send + Sync,
-	{
-		self.inner_post_large(
-			Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Large,
-				url: &gateway_url(&endpoint),
-				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			body,
-			callback,
-			false,
-		)
-		.await
-	}
-
-	fn state(&self) -> &SharedClientState {
-		&self.unauthed.state
-	}
-
-	async fn get_raw_bytes(
-		&self,
-		url: &str,
-		endpoint: Cow<'static, str>,
-	) -> Result<Vec<u8>, Error> {
-		self.unauthed
-			.inner_get_raw_bytes(
-				Request {
-					method: RequestMethod::Get,
-					response_type: ResponseType::Standard,
-					url,
-					client: self.unauthed.reqwest_client.clone(),
-				},
-				endpoint,
-			)
-			.await
-	}
-}
-
-pub(crate) trait AuthorizedClient: MaybeSendSync {
-	async fn get_auth<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug;
-	async fn post_auth<Req, Res>(
-		&self,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug;
-	async fn post_large_response_auth<Req, Res, F>(
-		&self,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-		callback: Option<&F>,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Send + Sync;
-
-	async fn post_raw_bytes_auth<Res>(
-		&self,
-		request: Bytes,
-		url: &str,
-		endpoint: Cow<'static, str>,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug;
-}
-
-impl AuthorizedClient for AuthClient {
-	async fn get_auth<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-	{
-		self.inner_get(
-			Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
-				url: gateway_url(&endpoint),
-				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			true,
-		)
-		.await
-	}
-
-	async fn post_auth<Req, Res>(
-		&self,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-	{
-		self.inner_post(
-			Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Standard,
-				url: gateway_url(&endpoint),
-				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			body,
-			true,
-		)
-		.await
-	}
-
-	async fn post_large_response_auth<Req, Res, F>(
-		&self,
-		endpoint: Cow<'static, str>,
-		body: &Req,
-		callback: Option<&F>,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-		Req: Serialize + Debug,
-		F: Fn(u64, Option<u64>) + Send + Sync,
-	{
-		self.inner_post_large(
-			Request {
-				method: RequestMethod::Post(()),
-				response_type: ResponseType::Large,
-				url: &gateway_url(&endpoint),
-				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			body,
-			callback,
-			true,
-		)
-		.await
-	}
-
-	async fn post_raw_bytes_auth<Res>(
-		&self,
-		request: Bytes,
-		url: &str,
-		endpoint: Cow<'static, str>,
-	) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-	{
-		self.inner_post_raw_bytes(
-			Request {
+			.oneshot(Request {
 				method: RequestMethod::Post(request),
 				response_type: ResponseType::Standard,
 				url,
 				client: self.unauthed.reqwest_client.clone(),
-			},
-			endpoint,
-			true,
-		)
-		.await
+			})
+			.await
 	}
 }
 

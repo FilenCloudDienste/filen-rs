@@ -10,7 +10,7 @@ use rayon::iter::ParallelIterator;
 
 use crate::{
 	api,
-	auth::{Client, http::UnauthorizedClient, shared_client::SharedClient},
+	auth::{Client, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	crypto::{error::ConversionError, shared::MetaCrypter},
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
@@ -25,7 +25,7 @@ use crate::{
 		},
 	},
 	runtime::{self, blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback, MaybeSendSync},
+	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback},
 };
 
 use super::{
@@ -318,23 +318,22 @@ impl Client {
 }
 
 #[allow(private_bounds)]
-pub trait FileReaderSharedClientExt<'a, C>: SharedClient<C> {
-	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a, C>;
+pub trait FileReaderSharedClientExt<'a>: SharedClient {
+	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a>;
 
 	fn get_file_reader_for_range(
 		&'a self,
 		file: &'a dyn File,
 		start: u64,
 		end: u64,
-	) -> FileReader<'a, C>;
+	) -> FileReader<'a>;
 }
 
-impl<'a, T, C> FileReaderSharedClientExt<'a, C> for T
+impl<'a, T> FileReaderSharedClientExt<'a> for T
 where
-	T: SharedClient<C>,
-	C: UnauthorizedClient + MaybeSendSync + 'a,
+	T: SharedClient,
 {
-	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a, C> {
+	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a> {
 		FileReader::new(file, self.get_unauth_client())
 	}
 
@@ -343,7 +342,7 @@ where
 		file: &'a dyn File,
 		start: u64,
 		end: u64,
-	) -> FileReader<'a, C> {
+	) -> FileReader<'a> {
 		FileReader::new_for_range(file, self.get_unauth_client(), start, end)
 	}
 }

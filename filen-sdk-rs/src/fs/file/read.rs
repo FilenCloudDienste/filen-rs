@@ -7,18 +7,18 @@ use futures::{StreamExt, stream::FuturesOrdered};
 
 use crate::{
 	api,
-	auth::http::UnauthorizedClient,
+	auth::unauth::UnauthClient,
 	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
 	error::{Error, MetadataWasNotDecryptedError},
-	util::{MaybeSendBoxFuture, MaybeSendSync},
+	util::MaybeSendBoxFuture,
 };
 
 use super::{chunk::Chunk, traits::File};
 
-pub struct FileReader<'a, C> {
+pub struct FileReader<'a> {
 	file: &'a dyn File,
-	client: &'a C,
+	client: &'a UnauthClient,
 	index: u64,
 	limit: u64,
 	next_chunk_idx: u64,
@@ -28,15 +28,17 @@ pub struct FileReader<'a, C> {
 }
 
 #[allow(private_bounds)]
-impl<'a, C> FileReader<'a, C>
-where
-	C: UnauthorizedClient + MaybeSendSync,
-{
-	pub(crate) fn new(file: &'a dyn File, client: &'a C) -> Self {
+impl<'a> FileReader<'a> {
+	pub(crate) fn new(file: &'a dyn File, client: &'a UnauthClient) -> Self {
 		Self::new_for_range(file, client, 0, file.size())
 	}
 
-	pub(crate) fn new_for_range(file: &'a dyn File, client: &'a C, start: u64, end: u64) -> Self {
+	pub(crate) fn new_for_range(
+		file: &'a dyn File,
+		client: &'a UnauthClient,
+		start: u64,
+		end: u64,
+	) -> Self {
 		let size = file.size();
 		let limit = end.min(size);
 		let index = start.min(limit);
@@ -153,10 +155,7 @@ where
 	}
 }
 
-impl<C> futures::io::AsyncRead for FileReader<'_, C>
-where
-	C: UnauthorizedClient + MaybeSendSync,
-{
+impl futures::io::AsyncRead for FileReader<'_> {
 	fn poll_read(
 		mut self: std::pin::Pin<&mut Self>,
 		cx: &mut std::task::Context<'_>,

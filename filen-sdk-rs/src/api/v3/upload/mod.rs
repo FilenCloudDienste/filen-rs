@@ -3,15 +3,13 @@ pub use filen_types::api::v3::upload::{ENDPOINT, Response};
 use log::debug;
 use sha2::{Digest, Sha512};
 
-use crate::{
-	auth::http::AuthorizedClient, consts::random_ingest_url, error::Error, fs::file::BaseFile,
-};
+use crate::{auth::http::AuthClient, consts::random_ingest_url, error::Error, fs::file::BaseFile};
 
 pub(crate) mod done;
 pub(crate) mod empty;
 
 pub(crate) async fn upload_file_chunk(
-	client: &impl AuthorizedClient,
+	client: &AuthClient,
 	file: &BaseFile,
 	upload_key: &str,
 	chunk_idx: u64,

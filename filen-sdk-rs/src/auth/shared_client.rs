@@ -1,17 +1,17 @@
-use crate::auth::{Client, http::AuthClient, unauth::UnauthClient};
+use crate::auth::{Client, unauth::UnauthClient};
 
-pub(crate) trait SharedClient<C> {
-	fn get_unauth_client(&self) -> &C;
+pub(crate) trait SharedClient {
+	fn get_unauth_client(&self) -> &UnauthClient;
 }
 
-impl SharedClient<UnauthClient> for UnauthClient {
+impl SharedClient for UnauthClient {
 	fn get_unauth_client(&self) -> &UnauthClient {
 		self
 	}
 }
 
-impl SharedClient<AuthClient> for Client {
-	fn get_unauth_client(&self) -> &AuthClient {
-		self.client()
+impl SharedClient for Client {
+	fn get_unauth_client(&self) -> &UnauthClient {
+		self.unauthed()
 	}
 }

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
-	auth::{Client, MetaKey, http::UnauthorizedClient, shared_client::SharedClient},
+	auth::{Client, MetaKey, shared_client::SharedClient},
 	crypto::{file::FileKey, shared::MetaCrypter},
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	fs::{
@@ -29,7 +29,7 @@ use crate::{
 		file::{RemoteFile, meta::FileMeta},
 	},
 	runtime::{blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture, MaybeSendSync},
+	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture},
 };
 
 pub mod contacts;
@@ -677,7 +677,7 @@ impl Client {
 		};
 
 		let password_response = api::v3::file::link::password::post(
-			self.client(),
+			self.unauthed(),
 			&api::v3::file::link::password::Request {
 				uuid: link_status.uuid,
 			},
@@ -709,7 +709,7 @@ impl Client {
 		link_key: Cow<'_, str>,
 	) -> Result<LinkedFileInfo, Error> {
 		let response = api::v3::file::link::info::post(
-			self.client(),
+			self.unauthed(),
 			&api::v3::file::link::info::Request {
 				uuid: link.link_uuid,
 				password: Cow::Borrowed(&link.get_password_hash()?),
@@ -1025,7 +1025,7 @@ impl Client {
 }
 
 #[allow(private_bounds, async_fn_in_trait)]
-pub trait PublicLinkSharedClientExt<'a, C>: SharedClient<C> {
+pub trait PublicLinkSharedClientExt<'a>: SharedClient {
 	// async fn decode_public_file_link(
 	// 	&self,
 	// 	link_uuid: UuidStr,
@@ -1056,10 +1056,9 @@ pub trait PublicLinkSharedClientExt<'a, C>: SharedClient<C> {
 		F: Fn(u64, Option<u64>) + Send + Sync;
 }
 
-impl<'a, T, C> PublicLinkSharedClientExt<'a, C> for T
+impl<'a, T> PublicLinkSharedClientExt<'a> for T
 where
-	T: SharedClient<C>,
-	C: UnauthorizedClient + MaybeSendSync + 'a,
+	T: SharedClient,
 {
 	// async fn decode_public_file_link(
 	// 	&self,

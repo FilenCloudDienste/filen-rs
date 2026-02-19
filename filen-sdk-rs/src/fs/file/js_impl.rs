@@ -7,9 +7,7 @@ use crate::{ErrorKind, fs::file::traits::HasFileInfo};
 
 use crate::{
 	Error,
-	auth::{
-		JsClient, http::UnauthorizedClient, js_impls::UnauthJsClient, shared_client::SharedClient,
-	},
+	auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
 	fs::{
 		dir::UnsharedDirectoryType,
 		file::{enums::RemoteFileType, meta::FileMetaChanges},
@@ -337,14 +335,13 @@ impl JsClient {
 	}
 }
 
-async fn download_file_generic<T, C>(
+async fn download_file_generic<T>(
 	client: Arc<T>,
 	file: FileEnum,
 	managed_future: Option<ManagedFuture>,
 ) -> Result<Vec<u8>, Error>
 where
-	T: SharedClient<C> + Send + Sync + 'static,
-	C: UnauthorizedClient + 'static,
+	T: SharedClient + Send + Sync + 'static,
 {
 	let fut = move || async move { client.download_file(&RemoteFileType::try_from(file)?).await };
 
@@ -364,13 +361,12 @@ where
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-async fn download_file_to_writer_generic<T, C>(
+async fn download_file_to_writer_generic<T>(
 	client: Arc<T>,
 	params: crate::js::DownloadFileStreamParams,
 ) -> Result<(), Error>
 where
-	T: SharedClient<C> + Send + Sync + 'static,
-	C: UnauthorizedClient + 'static,
+	T: SharedClient + Send + Sync + 'static,
 {
 	let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
 

@@ -4,10 +4,10 @@ pub(crate) mod rename;
 
 pub use filen_types::api::v3::item::shared::{ENDPOINT, Request, Response};
 
-use crate::{auth::http::AuthorizedClient, error::Error};
+use crate::{auth::http::AuthClient, error::Error};
 
 pub(crate) async fn post(
-	client: &impl AuthorizedClient,
+	client: &AuthClient,
 	request: &Request,
 ) -> Result<Response<'static>, Error> {
 	client.post_auth(ENDPOINT.into(), request).await

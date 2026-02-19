@@ -11,7 +11,7 @@ use futures::{AsyncWrite, FutureExt, StreamExt, stream::FuturesUnordered};
 
 use crate::{
 	api,
-	auth::{Client, http::UnauthorizedClient},
+	auth::Client,
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::{
 		self,

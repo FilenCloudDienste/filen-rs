@@ -13,7 +13,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{
 	Error,
-	auth::{Client, http::UnauthorizedClient, shared_client::SharedClient},
+	auth::{Client, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	fs::file::{
 		BaseFile, FileBuilder, RemoteFile,
@@ -21,7 +21,7 @@ use crate::{
 		traits::File,
 		write::{DummyFuture, FileWriter},
 	},
-	util::{MaybeSend, MaybeSendCallback, MaybeSendSync},
+	util::{MaybeSend, MaybeSendCallback},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::{
@@ -431,15 +431,14 @@ impl Client {
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-async fn inner_download_file_to_path<'a, SC, C>(
+async fn inner_download_file_to_path<SC>(
 	unauth_client: &SC,
 	remote_file: &dyn File,
 	path: &Path,
 	callback: Option<MaybeSendCallback<'_, u64>>,
 ) -> Result<(), Error>
 where
-	SC: SharedClient<C>,
-	C: UnauthorizedClient + MaybeSendSync + 'a,
+	SC: SharedClient,
 {
 	let mod_time = match tokio::fs::metadata(path).await {
 		Ok(m) => Some(FilenMetaExt::modified(&m)),
@@ -496,15 +495,14 @@ where
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub(crate) async fn inner_download_to_path_with_hash_check<'a, SC, C>(
+pub(crate) async fn inner_download_to_path_with_hash_check<SC>(
 	unauth_client: &SC,
 	remote_file: &dyn File,
 	path: PathBuf,
 	callback: Option<MaybeSendCallback<'_, u64>>,
 ) -> (Result<(), Error>, PathBuf)
 where
-	SC: SharedClient<C>,
-	C: UnauthorizedClient + MaybeSendSync + 'a,
+	SC: SharedClient,
 {
 	let size = remote_file.size();
 	let hash = remote_file.hash();
@@ -557,7 +555,7 @@ where
 }
 
 #[allow(private_bounds, async_fn_in_trait)]
-pub trait IoSharedClientExt<'a, C>: SharedClient<C> {
+pub trait IoSharedClientExt<'a>: SharedClient {
 	// todo make private, use download_file_to_path instead
 	async fn download_file_to_writer<'b, T>(
 		&'a self,
@@ -594,10 +592,9 @@ pub trait IoSharedClientExt<'a, C>: SharedClient<C> {
 	) -> Result<(), Error>;
 }
 
-impl<'a, SC, C> IoSharedClientExt<'a, C> for SC
+impl<'a, SC> IoSharedClientExt<'a> for SC
 where
-	SC: SharedClient<C>,
-	C: UnauthorizedClient + MaybeSendSync + 'a,
+	SC: SharedClient,
 {
 	async fn download_file_to_writer<'b, T>(
 		&'a self,

@@ -1,11 +1,11 @@
 pub use filen_types::api::v3::dir::download::{ENDPOINT, Request, Response};
 
-use crate::{auth::http::AuthorizedClient, error::Error};
+use crate::{auth::http::AuthClient, error::Error};
 
 pub(crate) mod link;
 
 pub(crate) async fn post_large<F>(
-	client: &impl AuthorizedClient,
+	client: &AuthClient,
 	request: &Request,
 	callback: Option<&F>,
 ) -> Result<Response<'static>, Error>

@@ -7,13 +7,10 @@ use bytes::Bytes;
 use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
 use log::debug;
 
-use crate::ErrorKind;
-// use crate::api::{RetryError, retry_wrap};
-use crate::auth::http::AuthorizedClient;
-use crate::consts::gateway_url;
 use crate::{
-	api,
+	ErrorKind, api,
 	auth::{Client, http::AuthClient},
+	consts::gateway_url,
 	error::Error,
 };
 

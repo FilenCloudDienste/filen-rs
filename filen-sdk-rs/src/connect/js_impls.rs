@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::js_impls::UnauthJsClient;
 use crate::{
 	Error,
-	auth::{JsClient, http::UnauthorizedClient, shared_client::SharedClient},
+	auth::{JsClient, shared_client::SharedClient},
 	connect::{DirPublicLink, FilePublicLink, PasswordState, PublicLinkSharedClientExt},
 	fs::dir::DirectoryMetaType,
 	js::{Dir, DirWithMetaEnum, DirsAndFiles, File, SharedDir, SharedFile, SharedRootItem},
@@ -755,7 +755,7 @@ impl JsClient {
 	}
 }
 
-async fn list_linked_dir_inner_generic<F, T, C>(
+async fn list_linked_dir_inner_generic<F, T>(
 	client: Arc<T>,
 	dir: DirWithMetaEnum,
 	link: DirPublicLink,
@@ -763,8 +763,7 @@ async fn list_linked_dir_inner_generic<F, T, C>(
 ) -> Result<DirsAndFiles, Error>
 where
 	F: Fn(u64, Option<u64>) + Send + Sync + 'static,
-	T: SharedClient<C> + Send + Sync + 'static,
-	C: UnauthorizedClient + 'static,
+	T: SharedClient + Send + Sync + 'static,
 {
 	let (dirs, files) = runtime::do_on_commander(move || async move {
 		client
@@ -783,15 +782,14 @@ where
 }
 
 #[cfg(feature = "uniffi")]
-async fn list_linked_dir_uniffi<T, C>(
+async fn list_linked_dir_uniffi<T>(
 	client: Arc<T>,
 	dir: DirWithMetaEnum,
 	link: DirPublicLink,
 	callback: Arc<dyn DirContentDownloadProgressCallback>,
 ) -> Result<DirsAndFiles, Error>
 where
-	T: SharedClient<C> + Send + Sync + 'static,
-	C: UnauthorizedClient + 'static,
+	T: SharedClient + Send + Sync + 'static,
 {
 	list_linked_dir_inner_generic(client, dir, link, move |downloaded, total| {
 		let callback = Arc::clone(&callback);
@@ -829,15 +827,14 @@ impl UnauthJsClient {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-async fn list_linked_dir_wasm<T, C>(
+async fn list_linked_dir_wasm<T>(
 	client: Arc<T>,
 	dir: DirWithMetaEnum,
 	link: DirPublicLink,
 	callback: web_sys::js_sys::Function,
 ) -> Result<DirsAndFiles, Error>
 where
-	T: SharedClient<C> + Send + Sync + 'static,
-	C: UnauthorizedClient + 'static,
+	T: SharedClient + Send + Sync + 'static,
 {
 	use crate::runtime;
 	use wasm_bindgen::JsValue;
