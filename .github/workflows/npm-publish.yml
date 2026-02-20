@@ -21,7 +21,7 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-08-14
+          toolchain: nightly-2026-02-20
           targets: wasm32-unknown-unknown, aarch64-linux-android, x86_64-linux-android, aarch64-apple-ios, aarch64-apple-ios-sim
       - name: Setup JDK 17
         uses: actions/setup-java@v4

@@ -3,5 +3,5 @@
 #
 # At time of writing this was causing issues with "implementation of `std::marker::Send` is not general enough"
 # errors with the reworked `filen_sdk_rs::api::handle_request` function.
-channel = "nightly-2025-08-14"
+channel = "nightly-2026-02-20"
 components = ["rust-src"]

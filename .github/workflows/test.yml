@@ -38,7 +38,7 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-08-14
+          toolchain: nightly-2026-02-20
       - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           shared-key: cargo-build-test-${{ matrix.os }}
@@ -90,7 +90,7 @@ jobs:
           submodules: true
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-08-14
+          toolchain: nightly-2026-02-20
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:

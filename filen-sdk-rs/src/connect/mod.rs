@@ -69,7 +69,7 @@ trait MakePasswordSaltAndHash {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(tsify::Tsify),
@@ -81,13 +81,8 @@ pub enum PasswordState {
 	Known(String),
 	#[serde(with = "serde_bytes")]
 	Hashed(Vec<u8>),
+	#[default]
 	None,
-}
-
-impl Default for PasswordState {
-	fn default() -> Self {
-		Self::None
-	}
 }
 
 impl PasswordState {

@@ -1,6 +1,4 @@
-// stabilized in Rust 1.92
 #![feature(min_specialization)]
-#![feature(unsigned_nonzero_div_ceil)]
 #![allow(dead_code)]
 
 pub(crate) mod api;

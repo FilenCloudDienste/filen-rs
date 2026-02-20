@@ -13,7 +13,7 @@ permissions:
 
 on:
   push:
-    branches: ["*"]
+    branches: ['*']
 
 jobs:
   tag:
@@ -32,7 +32,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           version_regex: "release filen-cli v([0-9]+\\.[0-9]+\\.[0-9]+)"
           version_assertion_command: 'grep -q "version = \"$version\"" filen-cli/Cargo.toml'
-          version_tag_prefix: "filen-cli@v"
+          version_tag_prefix: 'filen-cli@v'
       - name: Fail if no tag was created
         if: steps.create-tag.outputs.tag == ''
         run: |
@@ -81,11 +81,11 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-08-14
+          toolchain: nightly-2026-02-20
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: ""
+          prefix-key: ''
           shared-key: cargo-build-release-cli
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # note: I'm not sure if all these extra build dependencies are actually required, but it's not worth figuring it out right now
@@ -162,7 +162,7 @@ jobs:
           push: true
 
   release:
-    needs: ["tag", "build-binaries", "build-docker"]
+    needs: ['tag', 'build-binaries', 'build-docker']
     runs-on: ubuntu-latest
     env:
       version: ${{ needs.tag.outputs.version }}
@@ -177,14 +177,14 @@ jobs:
           # make sure the version exists in the changelog and the job fails otherwise
           parse-changelog filen-cli/CHANGELOG.md $version
           printf "## $(parse-changelog filen-cli/CHANGELOG.md $version --title)\n\n$(parse-changelog filen-cli/CHANGELOG.md $version)" > filen-cli/release_notes.md
-      
+
       # add link to git tag in release notes header
       - name: Add tag link to release notes
         run: |
           TAG_URL="https://github.com/FilenCloudDienste/filen-rs/releases/tag/filen-cli%40v$version"
           # replace the version string (e.g. "0.0.0") with the markdown-formatted link (e.g. "[0.0.0](url)")
           sed -i "s|# $version|# [$version]($TAG_URL)|" filen-cli/release_notes.md
-      
+
       # append notice about Docker build to release notes
       - name: Append Docker notice to release notes
         run: |
@@ -263,7 +263,7 @@ jobs:
           FILEN_BOT_NAME: filen-bot
           FILEN_BOT_EMAIL: 242448422+filen-bot@users.noreply.github.com
           # todo: make these repository env variables
-        
+
       # push markdown docs to filen-docs
       - name: Copy markdown docs to target repository
         run: |

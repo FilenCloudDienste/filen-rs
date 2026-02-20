@@ -37,7 +37,7 @@ fn trim_string_in_place(s: &mut String) {
 		.count();
 
 	s.drain(..left_trim);
-	s.truncate(s.len().checked_sub(right_trim).unwrap_or_default());
+	s.truncate(s.len().saturating_sub(right_trim));
 }
 
 impl<'a> SplitName<'a> {

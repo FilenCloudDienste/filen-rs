@@ -621,8 +621,7 @@ where
 		T: 'b + AsyncWrite + Unpin,
 	{
 		let mut reader = self.get_file_reader_for_range(file, start, end);
-		let buffer_size =
-			std::cmp::min(end.checked_sub(start).unwrap_or_default(), CHUNK_SIZE_U64) as usize;
+		let buffer_size = std::cmp::min(end.saturating_sub(start), CHUNK_SIZE_U64) as usize;
 		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
 		// https://github.com/rust-lang/rust/issues/117693
 		let mut buffer = vec![0u8; buffer_size];

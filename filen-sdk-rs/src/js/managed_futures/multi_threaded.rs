@@ -8,7 +8,7 @@ mod pausable {
 
 	use pin_project_lite::pin_project;
 	use serde::Deserialize;
-	use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
+	use wasm_bindgen::{JsCast, JsValue};
 	use web_sys::js_sys;
 
 	use crate::{
