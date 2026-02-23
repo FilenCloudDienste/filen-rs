@@ -18,10 +18,7 @@ pub(crate) fn build_fs_tree_from_walkdir_iterator(
 		.into_iter()
 		.filter_map(|res| match res {
 			Ok(v) => Some(Ok(v)),
-			// hope we get if let guards to make this cleaner someday
-			// https://github.com/rust-lang/rust/issues/51114
-			Err(e) if e.loop_ancestor().is_some() => {
-				let path = e.loop_ancestor().unwrap().to_path_buf();
+			Err(e) if let Some(path) = e.loop_ancestor().map(|p| p.to_path_buf()) => {
 				Some(Err(WalkError::Loop(path)))
 			}
 			Err(e) => {
