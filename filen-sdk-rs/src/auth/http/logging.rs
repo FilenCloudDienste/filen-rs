@@ -68,7 +68,7 @@ where
 	}
 
 	fn call(&mut self, req: Req) -> Self::Future {
-		if self.level_filter >= log::LevelFilter::Debug {
+		if self.level_filter >= log::LevelFilter::Trace {
 			log::debug!("calling {} with ", self.endpoint);
 		}
 		LoggedFuture {
@@ -99,8 +99,8 @@ where
 		match this.inner.poll(cx) {
 			Poll::Ready(output) => match output {
 				Ok(res) => {
-					if *this.filter >= log::LevelFilter::Debug {
-						log::debug!(
+					if *this.filter >= log::LevelFilter::Trace {
+						log::trace!(
 							"call to {} succeeded with response: {:?}",
 							this.endpoint,
 							res
