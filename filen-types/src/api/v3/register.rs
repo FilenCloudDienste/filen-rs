@@ -2,10 +2,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-	auth::{APIKey, AuthVersion},
-	crypto::DerivedPassword,
-};
+use crate::{auth::AuthVersion, crypto::DerivedPassword};
 
 pub const ENDPOINT: &str = "v3/register";
 
@@ -18,10 +15,4 @@ pub struct Request<'a> {
 	pub auth_version: AuthVersion,
 	pub ref_id: Option<Cow<'a, str>>,
 	pub aff_id: Option<Cow<'a, str>>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Response<'a> {
-	pub api_key: APIKey<'a>,
 }

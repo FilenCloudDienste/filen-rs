@@ -283,7 +283,7 @@ impl UnauthClient {
 			}
 		};
 
-		let resp = api::v3::register::post(
+		api::v3::register::post(
 			self,
 			&api::v3::register::Request {
 				email: Cow::Borrowed(&email),
@@ -300,7 +300,6 @@ impl UnauthClient {
 			email,
 			salt,
 			auth_info,
-			api_key: resp.api_key,
 		})
 	}
 
@@ -333,7 +332,6 @@ pub struct RegisteredInfo {
 	email: String,
 	salt: String,
 	auth_info: RegisteredAuthInfo,
-	api_key: APIKey<'static>,
 }
 
 fn master_keys_from_exportable(recovery_key: &str, user_id: u64) -> Result<Vec<MasterKey>, Error> {
