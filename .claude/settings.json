@@ -1,0 +1,27 @@
+{
+	"apiKeyHelper": "cat ~/keys/claude.key",
+	"permissions": {
+		"allow": ["Bash(cargo clippy:*)", "Bash(cargo test:*)", "Bash(cargo build:*)", "Bash(bash wasm-pack.sh)", "Bash(sh wasm-pack.sh)"],
+		"deny": [
+			"Read(.env)",
+			"Read(.env.*)",
+			"Read(**/.env)",
+			"Read(**/.env.*)",
+			"Bash(cat .env*)",
+			"Bash(cat **/.env*)",
+			"Bash(grep * .env*)"
+		]
+	},
+	"hooks": {
+		"UserPromptSubmit": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "sh .claude/hooks/UserPromptSubmit.sh"
+					}
+				]
+			}
+		]
+	}
+}
