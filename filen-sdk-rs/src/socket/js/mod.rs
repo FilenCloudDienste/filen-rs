@@ -67,10 +67,8 @@ mod wasm {
 		Error,
 		auth::JsClient,
 		runtime,
-		socket::{DecryptedSocketEvent, thread_handling::ListenerHandle},
+		socket::{DecryptedSocketEvent, js::events::SocketEvent, thread_handling::ListenerHandle},
 	};
-
-	use super::events::SocketEvent;
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),

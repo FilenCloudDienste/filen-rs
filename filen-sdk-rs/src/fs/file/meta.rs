@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
+use filen_macros::js_type;
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{Blake3Hash, EncryptedString, rsa::RSAEncryptedString},
@@ -330,28 +331,30 @@ pub enum CreatedTime {
 	Set(DateTime<Utc>),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "wasm-full", derive(tsify::Tsify), tsify(from_wasm_abi))]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[derive(Default)]
+#[js_type(import)]
 pub struct FileMetaChanges {
-	#[serde(default)]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string"))]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	name: Option<String>,
-	#[serde(default)]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string"))]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	mime: Option<String>,
-	#[serde(default, with = "filen_types::serde::time::optional")]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	#[cfg_attr(
+		feature = "wasm-full",
+		tsify(type = "bigint"),
+		serde(default, with = "filen_types::serde::time::optional")
+	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	last_modified: Option<DateTime<Utc>>,
 	#[cfg(not(feature = "uniffi"))]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint | null"))]
-	#[serde(
-		default,
-		deserialize_with = "crate::serde::deserialize_double_option_timestamp"
+	#[cfg_attr(
+		feature = "wasm-full",
+		tsify(type = "bigint | null"),
+		serde(
+			default,
+			deserialize_with = "crate::serde::deserialize_double_option_timestamp"
+		)
 	)]
 	created: Option<Option<DateTime<Utc>>>,
 	#[cfg(feature = "uniffi")]

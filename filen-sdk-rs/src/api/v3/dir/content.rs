@@ -8,3 +8,16 @@ pub(crate) async fn post(
 ) -> Result<Response<'static>, Error> {
 	client.post_auth(ENDPOINT.into(), request).await
 }
+
+pub(crate) async fn post_large<F>(
+	client: &AuthClient,
+	request: &Request,
+	callback: Option<&F>,
+) -> Result<Response<'static>, Error>
+where
+	F: Fn(u64, Option<u64>) + Send + Sync,
+{
+	client
+		.post_large_response_auth(ENDPOINT.into(), request, callback)
+		.await
+}

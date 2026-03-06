@@ -5,32 +5,19 @@ use filen_macros::CowFrom;
 use filen_types::{fs::ObjectType, traits::CowHelpers};
 
 use crate::{
-	connect::fs::{SharedDirectory, SharedFile, SharingRole},
-	fs::file::enums::RemoteFileType,
+	connect::fs::{SharedDirectory, SharedRootFile},
+	fs::{
+		categories::{Category, NonRootItemType},
+		dir::LinkedDirectory,
+		file::{LinkedFile, enums::RemoteFileType},
+	},
 };
 
 use super::{
-	HasMeta, HasName, HasParent, HasType, HasUUID,
+	HasType,
 	dir::{DirectoryType, RemoteDirectory, RootDirectory, RootDirectoryWithMeta},
 	file::{RemoteFile, RemoteRootFile},
 };
-
-#[derive(Debug, Clone, PartialEq, Eq, CowFrom, HasUUID, CowHelpers)]
-pub enum UnsharedFSObject<'a> {
-	Dir(Cow<'a, RemoteDirectory>),
-	Root(Cow<'a, RootDirectory>),
-	File(Cow<'a, RemoteFile>),
-}
-
-impl<'a> From<UnsharedFSObject<'a>> for FSObject<'a> {
-	fn from(item: UnsharedFSObject<'a>) -> Self {
-		match item {
-			UnsharedFSObject::Dir(dir) => FSObject::Dir(dir),
-			UnsharedFSObject::Root(dir) => FSObject::Root(dir),
-			UnsharedFSObject::File(file) => FSObject::File(file),
-		}
-	}
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, CowFrom, CowHelpers)]
 pub enum FSObject<'a> {
@@ -39,16 +26,6 @@ pub enum FSObject<'a> {
 	RootWithMeta(Cow<'a, RootDirectoryWithMeta>),
 	File(Cow<'a, RemoteFile>),
 	SharedFile(Cow<'a, RemoteRootFile>),
-}
-
-impl<'a> From<DirectoryType<'a>> for FSObject<'a> {
-	fn from(dir: DirectoryType<'a>) -> Self {
-		match dir {
-			DirectoryType::Root(dir) => FSObject::Root(dir),
-			DirectoryType::Dir(dir) => FSObject::Dir(dir),
-			DirectoryType::RootWithMeta(cow) => FSObject::RootWithMeta(cow),
-		}
-	}
 }
 
 impl<'a> From<&'a FSObject<'_>> for FSObject<'a> {
@@ -69,31 +46,23 @@ pub(crate) enum FsObjectIntoTypes<'a> {
 	File(RemoteFileType<'a>),
 }
 
-impl<'a> From<FSObject<'a>> for FsObjectIntoTypes<'a> {
-	fn from(item: FSObject<'a>) -> Self {
-		match item {
-			FSObject::Dir(cow) => FsObjectIntoTypes::Dir(DirectoryType::Dir(cow)),
-			FSObject::Root(cow) => FsObjectIntoTypes::Dir(DirectoryType::Root(cow)),
-			FSObject::RootWithMeta(cow) => FsObjectIntoTypes::Dir(DirectoryType::RootWithMeta(cow)),
-			FSObject::File(cow) => FsObjectIntoTypes::File(RemoteFileType::File(cow)),
-			FSObject::SharedFile(cow) => FsObjectIntoTypes::File(RemoteFileType::SharedFile(cow)),
-		}
-	}
-}
+// impl<'a> From<FSObject<'a>> for FsObjectIntoTypes<'a> {
+// 	fn from(item: FSObject<'a>) -> Self {
+// 		match item {
+// 			FSObject::Dir(cow) => FsObjectIntoTypes::Dir(DirectoryType::Dir(cow)),
+// 			FSObject::Root(cow) => FsObjectIntoTypes::Dir(DirectoryType::Root(cow)),
+// 			FSObject::RootWithMeta(cow) => FsObjectIntoTypes::Dir(DirectoryType::LinkedRoot(cow)),
+// 			FSObject::File(cow) => FsObjectIntoTypes::File(RemoteFileType::File(cow)),
+// 			FSObject::SharedFile(cow) => FsObjectIntoTypes::File(RemoteFileType::Shared(cow)),
+// 		}
+// 	}
+// }
 
-#[derive(
-	Clone, Debug, PartialEq, Eq, HasParent, HasUUID, HasName, HasMeta, CowFrom, CowHelpers,
-)]
-pub enum NonRootFSObject<'a> {
-	Dir(Cow<'a, RemoteDirectory>),
-	File(Cow<'a, RemoteFile>),
-}
-
-impl HasType for NonRootFSObject<'_> {
+impl<Cat: Category> HasType for NonRootItemType<'_, Cat> {
 	fn object_type(&self) -> ObjectType {
 		match self {
-			NonRootFSObject::Dir(_) => ObjectType::Dir,
-			NonRootFSObject::File(_) => ObjectType::File,
+			Self::Dir(_) => ObjectType::Dir,
+			Self::File(_) => ObjectType::File,
 		}
 	}
 }
@@ -107,17 +76,17 @@ pub enum FSObject1 {
 	SharedFile(RemoteRootFile),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, CowFrom, CowHelpers, HasUUID)]
-pub enum SharedRootItem<'a> {
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum SharedItem<'a> {
+	RootFile(Cow<'a, SharedRootFile>),
 	Dir(Cow<'a, SharedDirectory>),
-	File(Cow<'a, SharedFile>),
+	File(Cow<'a, RemoteDirectory>),
 }
 
-impl SharedRootItem<'_> {
-	pub(crate) fn role(&self) -> &SharingRole {
-		match self {
-			SharedRootItem::Dir(dir) => &dir.sharing_role,
-			SharedRootItem::File(file) => &file.sharing_role,
-		}
-	}
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum LinkedItem<'a> {
+	RootDir(Cow<'a, RootDirectoryWithMeta>),
+	RootFile(Cow<'a, LinkedFile>),
+	Dir(Cow<'a, LinkedDirectory>),
+	File(Cow<'a, RemoteDirectory>),
 }

@@ -2,60 +2,58 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_macros::js_type;
+use filen_types::fs::UuidStr;
 use rsa::RsaPublicKey;
-use serde::{Deserialize, Serialize};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::auth::js_impls::UnauthJsClient;
 use crate::{
 	Error,
 	auth::{JsClient, shared_client::SharedClient},
-	connect::{DirPublicLink, FilePublicLink, PasswordState, PublicLinkSharedClientExt},
-	fs::dir::DirectoryMetaType,
-	js::{Dir, DirWithMetaEnum, DirsAndFiles, File, SharedDir, SharedFile, SharedRootItem},
+	connect::{
+		DirPublicLink, FilePublicLink, PasswordState, PublicLinkSharedClientExt, fs::SharingRole,
+	},
+	fs::categories::{DirType, Linked},
+	js::{
+		AnyLinkedDir, AnySharedDir, Dir, File, LinkedDir, LinkedDirsAndFiles, LinkedFile,
+		NormalDirsAndFiles, SharedDir, SharedFileTagged, SharedRootDirTagged, SharedRootItem,
+	},
 	runtime::{self, do_on_commander},
 };
 #[cfg(feature = "uniffi")]
 use crate::{auth::js_impls::UnauthJsClient, fs::dir::js_impl::DirContentDownloadProgressCallback};
 
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(import, export)]
 pub struct Contact {
 	pub uuid: UuidStr,
 	pub user_id: u64,
 	pub email: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default, skip_serializing_if = "Option::is_none")
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub avatar: Option<String>,
 	pub nick_name: String,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "chrono::serde::ts_milliseconds")
 	)]
 	pub last_active: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "chrono::serde::ts_milliseconds")
 	)]
-	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(with = "filen_types::serde::rsa::public_key_der")
 	)]
-	#[serde(with = "filen_types::serde::rsa::public_key_der")]
 	pub public_key: RsaPublicKey,
 }
 
@@ -89,31 +87,24 @@ impl From<Contact> for filen_types::api::v3::contacts::Contact<'static> {
 	}
 }
 
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(import, export)]
 pub struct BlockedContact {
 	pub uuid: UuidStr,
 	pub user_id: u64,
 	pub email: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default, skip_serializing_if = "Option::is_none")
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub avatar: Option<String>,
 	pub nick_name: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "bigint")
+		tsify(type = "bigint"),
+		serde(with = "chrono::serde::ts_milliseconds")
 	)]
-	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub timestamp: DateTime<Utc>,
 }
 
@@ -130,22 +121,15 @@ impl From<filen_types::api::v3::contacts::blocked::BlockedContact<'_>> for Block
 	}
 }
 
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(export)]
 pub struct ContactRequestIn {
 	pub uuid: UuidStr,
 	pub user_id: u64,
 	pub email: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default, skip_serializing_if = "Option::is_none")
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub avatar: Option<String>,
@@ -180,21 +164,14 @@ impl<'a> From<&'a ContactRequestIn>
 	}
 }
 
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(export)]
 pub struct ContactRequestOut {
 	pub uuid: UuidStr,
 	pub email: String,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default, skip_serializing_if = "Option::is_none")
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub avatar: Option<String>,
@@ -227,16 +204,16 @@ impl<'a> From<&'a ContactRequestOut>
 	}
 }
 
-#[derive(Serialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(export)]
 pub struct SharedDirsAndFiles {
 	pub dirs: Vec<SharedDir>,
-	pub files: Vec<SharedFile>,
+	pub files: Vec<File>,
+}
+
+#[js_type(export, no_deser)]
+pub struct SharedRootDirsAndFiles {
+	pub dirs: Vec<SharedRootDirTagged>,
+	pub files: Vec<SharedFileTagged>,
 }
 
 #[cfg(feature = "uniffi")]
@@ -529,19 +506,21 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedItems")
 	)]
-	pub async fn list_linked_items(&self) -> Result<DirsAndFiles, Error> {
+	pub async fn list_linked_items(&self) -> Result<NormalDirsAndFiles, Error> {
 		let this = self.inner();
 		let (dirs, files) = runtime::do_on_commander(move || async move {
-			this.list_dir(&ParentUuid::Links).await.map(|(d, f)| {
-				(
-					d.into_iter().map(Dir::from).collect(),
-					f.into_iter().map(File::from).collect(),
-				)
-			})
+			this.list_linked(None::<&fn(u64, Option<u64>)>)
+				.await
+				.map(|(d, f)| {
+					(
+						d.into_iter().map(Dir::from).collect(),
+						f.into_iter().map(File::from).collect(),
+					)
+				})
 		})
 		.await?;
 
-		Ok(DirsAndFiles { dirs, files })
+		Ok(NormalDirsAndFiles { dirs, files })
 	}
 
 	// Contacts
@@ -696,47 +675,21 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "listOutShared")
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listSharedDir")
 	)]
-	pub async fn list_out_shared(
+	pub async fn list_shared_dir(
 		&self,
-		dir: Option<DirWithMetaEnum>,
-		contact: Option<Contact>,
+		dir: AnySharedDir,
+		role: SharingRole,
 	) -> Result<SharedDirsAndFiles, Error> {
 		let this = self.inner();
 		let (dirs, files) = runtime::do_on_commander(move || async move {
-			this.inner_list_out_shared(
-				dir.map(DirectoryMetaType::from).as_ref(),
-				contact.map(Into::into).as_ref(),
-			)
-			.await
-			.map(|(dirs, files)| {
-				(
-					dirs.into_iter().map(SharedDir::from).collect::<Vec<_>>(),
-					files.into_iter().map(SharedFile::from).collect::<Vec<_>>(),
-				)
-			})
-		})
-		.await?;
-		Ok(SharedDirsAndFiles { dirs, files })
-	}
-
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen(js_name = "listInShared",)
-	)]
-	pub async fn list_in_shared(
-		&self,
-		dir: Option<DirWithMetaEnum>,
-	) -> Result<SharedDirsAndFiles, Error> {
-		let this = self.inner();
-		let (dirs, files) = runtime::do_on_commander(move || async move {
-			this.inner_list_in_shared(dir.map(DirectoryMetaType::from).as_ref())
+			this.list_shared_dir(&dir.into(), &role, None::<&fn(u64, Option<u64>)>)
 				.await
 				.map(|(dirs, files)| {
 					(
 						dirs.into_iter().map(SharedDir::from).collect::<Vec<_>>(),
-						files.into_iter().map(SharedFile::from).collect::<Vec<_>>(),
+						files.into_iter().map(File::from).collect::<Vec<_>>(),
 					)
 				})
 		})
@@ -746,48 +699,122 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listInShared")
+	)]
+	pub async fn list_in_shared_root(&self) -> Result<SharedRootDirsAndFiles, Error> {
+		let this = self.inner();
+		let (dirs, files) = runtime::do_on_commander(move || async move {
+			this.list_in_shared_root(None::<&fn(u64, Option<u64>)>)
+				.await
+				.map(|(dirs, files)| {
+					(
+						dirs.into_iter()
+							.map(SharedRootDirTagged::from)
+							.collect::<Vec<_>>(),
+						files
+							.into_iter()
+							.map(SharedFileTagged::from)
+							.collect::<Vec<_>>(),
+					)
+				})
+		})
+		.await?;
+		Ok(SharedRootDirsAndFiles { dirs, files })
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "listOutShared")
+	)]
+	pub async fn list_out_shared(
+		&self,
+		contact: Option<Contact>,
+	) -> Result<SharedRootDirsAndFiles, Error> {
+		let this = self.inner();
+		let (dirs, files) = runtime::do_on_commander(move || async move {
+			this.list_out_shared(
+				contact.map(Into::into).as_ref(),
+				None::<&fn(u64, Option<u64>)>,
+			)
+			.await
+			.map(|(dirs, files)| {
+				(
+					dirs.into_iter()
+						.map(SharedRootDirTagged::from)
+						.collect::<Vec<_>>(),
+					files
+						.into_iter()
+						.map(SharedFileTagged::from)
+						.collect::<Vec<_>>(),
+				)
+			})
+		})
+		.await?;
+		Ok(SharedRootDirsAndFiles { dirs, files })
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "removeSharedItem")
 	)]
 	pub async fn remove_shared_item(&self, item: SharedRootItem) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.remove_shared_item(item.try_into()?).await })
+		do_on_commander(move || async move { this.remove_shared_item(&item.try_into()?).await })
 			.await
 	}
 }
 
+async fn get_linked_file<T>(
+	client: Arc<T>,
+	link_uuid: UuidStr,
+	file_key: String,
+	link_password: Option<String>,
+) -> Result<LinkedFile, Error>
+where
+	T: SharedClient + Send + Sync + 'static,
+{
+	runtime::do_on_commander(move || async move {
+		client
+			.get_linked_file(link_uuid, Cow::Owned(file_key), link_password.as_deref())
+			.await
+			.map(LinkedFile::from)
+	})
+	.await
+}
+
 async fn list_linked_dir_inner_generic<F, T>(
 	client: Arc<T>,
-	dir: DirWithMetaEnum,
+	dir: AnyLinkedDir,
 	link: DirPublicLink,
 	callback: F,
-) -> Result<DirsAndFiles, Error>
+) -> Result<LinkedDirsAndFiles, Error>
 where
 	F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	T: SharedClient + Send + Sync + 'static,
 {
 	let (dirs, files) = runtime::do_on_commander(move || async move {
 		client
-			.list_linked_dir(&DirectoryMetaType::from(dir), &link, &callback)
+			.list_linked_dir(&DirType::<Linked>::from(dir), &link, &callback)
 			.await
 			.map(|(dirs, files)| {
 				(
-					dirs.into_iter().map(Dir::from).collect::<Vec<_>>(),
+					dirs.into_iter().map(LinkedDir::from).collect::<Vec<_>>(),
 					files.into_iter().map(File::from).collect::<Vec<_>>(),
 				)
 			})
 	})
 	.await?;
 
-	Ok(DirsAndFiles { dirs, files })
+	Ok(LinkedDirsAndFiles { dirs, files })
 }
 
 #[cfg(feature = "uniffi")]
 async fn list_linked_dir_uniffi<T>(
 	client: Arc<T>,
-	dir: DirWithMetaEnum,
+	dir: AnyLinkedDir,
 	link: DirPublicLink,
 	callback: Arc<dyn DirContentDownloadProgressCallback>,
-) -> Result<DirsAndFiles, Error>
+) -> Result<LinkedDirsAndFiles, Error>
 where
 	T: SharedClient + Send + Sync + 'static,
 {
@@ -805,10 +832,10 @@ where
 impl JsClient {
 	pub async fn list_linked_dir(
 		&self,
-		dir: DirWithMetaEnum,
+		dir: AnyLinkedDir,
 		link: DirPublicLink,
 		callback: Arc<dyn DirContentDownloadProgressCallback>,
-	) -> Result<DirsAndFiles, Error> {
+	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
 	}
 }
@@ -818,10 +845,10 @@ impl JsClient {
 impl UnauthJsClient {
 	pub async fn list_linked_dir(
 		&self,
-		dir: DirWithMetaEnum,
+		dir: AnyLinkedDir,
 		link: DirPublicLink,
 		callback: Arc<dyn DirContentDownloadProgressCallback>,
-	) -> Result<DirsAndFiles, Error> {
+	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
 	}
 }
@@ -829,10 +856,10 @@ impl UnauthJsClient {
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 async fn list_linked_dir_wasm<T>(
 	client: Arc<T>,
-	dir: DirWithMetaEnum,
+	dir: AnyLinkedDir,
 	link: DirPublicLink,
 	callback: web_sys::js_sys::Function,
-) -> Result<DirsAndFiles, Error>
+) -> Result<LinkedDirsAndFiles, Error>
 where
 	T: SharedClient + Send + Sync + 'static,
 {
@@ -865,13 +892,13 @@ impl JsClient {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDir")]
 	pub async fn list_linked_dir(
 		&self,
-		dir: DirWithMetaEnum,
+		dir: AnyLinkedDir,
 		link: DirPublicLink,
 		#[wasm_bindgen(
 			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
 		)]
 		callback: web_sys::js_sys::Function,
-	) -> Result<DirsAndFiles, Error> {
+	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_wasm(self.inner(), dir, link, callback).await
 	}
 }
@@ -882,13 +909,13 @@ impl UnauthJsClient {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDir")]
 	pub async fn list_linked_dir(
 		&self,
-		dir: DirWithMetaEnum,
+		dir: AnyLinkedDir,
 		link: DirPublicLink,
 		#[wasm_bindgen(
 			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
 		)]
 		callback: web_sys::js_sys::Function,
-	) -> Result<DirsAndFiles, Error> {
+	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_wasm(self.inner(), dir, link, callback).await
 	}
 }

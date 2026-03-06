@@ -1,5 +1,6 @@
 #![feature(min_specialization)]
 #![allow(dead_code)]
+#![allow(type_alias_bounds)]
 
 pub(crate) mod api;
 pub mod auth;

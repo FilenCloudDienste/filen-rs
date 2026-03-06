@@ -12,7 +12,7 @@ use base64::{
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::{Client, TwoFASecret, http::ClientConfig, unauth::UnauthClient},
-	fs::HasName,
+	fs::{HasName, HasUUID},
 	io::client_impl::IoSharedClientExt,
 	socket::DecryptedSocketEvent,
 };
@@ -43,7 +43,10 @@ async fn cleanup_test_dirs() {
 	let client = &resources.client;
 	let _lock = client.lock_drive().await.unwrap();
 
-	let (dirs, _) = client.list_dir(client.root()).await.unwrap();
+	let (dirs, _) = client
+		.list_dir(&(client.root()).into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
 	let mut futures = FuturesUnordered::new();
 	let now = chrono::Utc::now();
 	for dir in dirs {
@@ -276,7 +279,10 @@ fn activate_account(register_data: &mut RegisterTest, unauth_client: &UnauthClie
 			)
 			.await
 			.unwrap();
-		client.list_dir(client.root()).await.unwrap();
+		client
+			.list_dir(&(client.root()).into(), None::<&fn(u64, Option<u64>)>)
+			.await
+			.unwrap();
 		client
 	})
 }
@@ -408,7 +414,10 @@ fn register_and_reset_password_no_export() {
 		)
 		.await;
 
-		client.list_dir(client.root()).await.unwrap();
+		client
+			.list_dir(&(client.root()).into(), None::<&fn(u64, Option<u64>)>)
+			.await
+			.unwrap();
 		unauth_client
 			.login(register_data.email.clone(), &new_password, "XXXXXX")
 			.await
@@ -427,8 +436,13 @@ fn register_change_and_reset_password_with_export() {
 	let client = activate_account(&mut register_data, &unauth_client);
 
 	let (recovery_key, files) = test_utils::rt().block_on(async {
-		client.list_dir(client.root()).await.unwrap();
-		let first_file = client.make_file_builder("first.txt", client.root()).build();
+		client
+			.list_dir(&(client.root()).into(), None::<&fn(u64, Option<u64>)>)
+			.await
+			.unwrap();
+		let first_file = client
+			.make_file_builder("first.txt", *client.root().uuid())
+			.build();
 
 		let first_file = client
 			.upload_file(first_file.into(), b"Hello, world!")
@@ -443,7 +457,9 @@ fn register_change_and_reset_password_with_export() {
 			.await
 			.unwrap();
 
-		let second_file = client.make_file_builder("second", client.root()).build();
+		let second_file = client
+			.make_file_builder("second", *client.root().uuid())
+			.build();
 		let second_file = client
 			.upload_file(second_file.into(), b"Hello, world!")
 			.await
@@ -455,7 +471,7 @@ fn register_change_and_reset_password_with_export() {
 			.unwrap();
 
 		let third_file = relogin_client
-			.make_file_builder("third", client.root())
+			.make_file_builder("third", *client.root().uuid())
 			.build();
 
 		let third_file = relogin_client
@@ -464,7 +480,10 @@ fn register_change_and_reset_password_with_export() {
 			.unwrap();
 
 		let (_, files) = relogin_client
-			.list_dir(relogin_client.root())
+			.list_dir(
+				&(relogin_client.root()).into(),
+				None::<&fn(u64, Option<u64>)>,
+			)
 			.await
 			.unwrap();
 
@@ -517,7 +536,10 @@ fn register_change_and_reset_password_with_export() {
 
 		let (first_file, second_file, third_file) = files;
 
-		let (_, files) = client.list_dir(client.root()).await.unwrap();
+		let (_, files) = client
+			.list_dir(&(client.root()).into(), None::<&fn(u64, Option<u64>)>)
+			.await
+			.unwrap();
 
 		assert_eq!(files.len(), 3);
 		assert!(files.contains(&first_file));

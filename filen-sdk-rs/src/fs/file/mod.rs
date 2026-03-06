@@ -2,7 +2,8 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
-	crypto::Blake3Hash,
+	auth::FileEncryptionVersion,
+	crypto::{Blake3Hash, MaybeEncrypted},
 	fs::{ObjectType, ParentUuid, UuidStr},
 	traits::CowHelpers,
 };
@@ -15,9 +16,9 @@ use crate::{
 	error::{Error, MetadataWasNotDecryptedError},
 	fs::{
 		SetRemoteInfo,
-		dir::HasUUIDContents,
 		file::meta::{FileMeta, FileMetaChanges},
 	},
+	runtime::blocking_join,
 };
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
@@ -46,15 +47,11 @@ pub struct FileBuilder {
 }
 
 impl FileBuilder {
-	pub(crate) fn new(
-		name: impl Into<String>,
-		parent: &impl HasUUIDContents,
-		client: &Client,
-	) -> Self {
+	pub(crate) fn new(name: impl Into<String>, parent_uuid: UuidStr, client: &Client) -> Self {
 		Self {
 			uuid: UuidStr::new_v4(),
 			name: name.into(),
-			parent: *parent.uuid(),
+			parent: parent_uuid,
 			key: client.make_file_key(),
 			mime: None,
 			created: None,
@@ -613,3 +610,198 @@ impl FileVersion {
 		}
 	}
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedFile {
+	pub(crate) uuid: UuidStr,
+	pub(crate) name: MaybeEncrypted<'static, str>,
+	pub(crate) mime: MaybeEncrypted<'static, str>,
+	pub(crate) size: u64,
+	pub(crate) chunks: u64,
+	pub(crate) region: String,
+	pub(crate) bucket: String,
+	pub(crate) version: FileEncryptionVersion,
+	pub(crate) timestamp: DateTime<Utc>,
+	pub(crate) file_key: FileKey,
+}
+
+impl LinkedFile {
+	pub(crate) fn blocking_from_response(
+		file_key: FileKey,
+		response: filen_types::api::v3::file::link::info::Response<'static>,
+	) -> Result<Self, Error> {
+		let meta_key = file_key.to_meta_key()?;
+		let (name, mime, size) = blocking_join!(
+			|| match meta_key.blocking_decrypt_meta(&response.name) {
+				Ok(decrypted) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted)),
+				Err(_) => MaybeEncrypted::Encrypted(response.name.into_owned_cow()),
+			},
+			|| match meta_key.blocking_decrypt_meta(&response.mime) {
+				Ok(decrypted) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted)),
+				Err(_) => MaybeEncrypted::Encrypted(response.mime.into_owned_cow()),
+			},
+			|| meta_key
+				.blocking_decrypt_meta(&response.size)
+				.map_err(Error::from)
+				.and_then(
+					|s| str::parse::<u64>(&s).map_err(|e| Error::custom_with_source(
+						crate::ErrorKind::Conversion,
+						e,
+						Some("Failed to parse decrypted size string to u64")
+					))
+				)
+		);
+
+		Ok(Self {
+			uuid: response.uuid,
+			name,
+			mime,
+			size: size?,
+			chunks: response.chunks,
+			region: response.region.into_owned(),
+			bucket: response.bucket.into_owned(),
+			version: response.version,
+			timestamp: response.timestamp,
+			file_key,
+		})
+	}
+}
+
+impl HasFileInfo for LinkedFile {
+	fn mime(&self) -> Option<&str> {
+		match &self.mime {
+			MaybeEncrypted::Decrypted(mime) => Some(mime.as_ref()),
+			MaybeEncrypted::Encrypted(_) => None,
+		}
+	}
+
+	fn created(&self) -> Option<DateTime<Utc>> {
+		None
+	}
+
+	fn last_modified(&self) -> Option<DateTime<Utc>> {
+		Some(self.timestamp)
+	}
+
+	fn size(&self) -> u64 {
+		self.size
+	}
+
+	fn chunks(&self) -> u64 {
+		self.chunks
+	}
+
+	fn key(&self) -> Option<&FileKey> {
+		Some(&self.file_key)
+	}
+}
+
+impl HasUUID for LinkedFile {
+	fn uuid(&self) -> &UuidStr {
+		&self.uuid
+	}
+}
+
+impl HasRemoteInfo for LinkedFile {
+	fn favorited(&self) -> bool {
+		false
+	}
+
+	fn timestamp(&self) -> DateTime<Utc> {
+		self.timestamp
+	}
+}
+
+impl HasRemoteFileInfo for LinkedFile {
+	fn region(&self) -> &str {
+		&self.region
+	}
+
+	fn bucket(&self) -> &str {
+		&self.bucket
+	}
+
+	fn hash(&self) -> Option<Blake3Hash> {
+		None
+	}
+}
+
+impl HasMeta for LinkedFile {
+	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
+		None
+	}
+}
+
+impl HasName for LinkedFile {
+	fn name(&self) -> Option<&str> {
+		match &self.name {
+			MaybeEncrypted::Decrypted(name) => Some(name),
+			MaybeEncrypted::Encrypted(_) => None,
+		}
+	}
+}
+
+impl File for LinkedFile {}
+
+impl PartialEq<RemoteFile> for LinkedFile {
+	fn eq(&self, other: &RemoteFile) -> bool {
+		self.uuid == other.uuid
+			&& self.name() == other.name()
+			&& self.mime() == other.mime()
+			&& self.size == other.size()
+			&& self.chunks == other.chunks
+			&& self.region == other.region
+			&& self.bucket == other.bucket
+	}
+}
+
+// #[cfg_attr(feature = "uniffi", uniffi::export)]
+// #[cfg_attr(
+// 	all(target_family = "wasm", target_os = "unknown"),
+// 	wasm_bindgen::prelude::wasm_bindgen
+// )]
+// impl LinkedFile {
+// 	#[cfg_attr(feature = "uniffi", uniffi::method(name = "uuid"))]
+// 	#[cfg_attr(
+// 		all(target_family = "wasm", target_os = "unknown"),
+// 		wasm_bindgen::prelude::wasm_bindgen(getter, js_name = "uuid")
+// 	)]
+// 	fn inner_uuid(&self) -> UuidStr {
+// 		self.uuid
+// 	}
+
+// 	#[cfg_attr(feature = "uniffi", uniffi::method(name = "size"))]
+// 	#[cfg_attr(
+// 		all(target_family = "wasm", target_os = "unknown"),
+// 		wasm_bindgen::prelude::wasm_bindgen(getter, js_name = "size")
+// 	)]
+// 	fn inner_size(&self) -> u64 {
+// 		self.size
+// 	}
+// }
+
+// #[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+// #[cfg_attr(feature = "uniffi", uniffi::export)]
+// #[cfg_attr(
+// 	all(target_family = "wasm", target_os = "unknown"),
+// 	wasm_bindgen::prelude::wasm_bindgen
+// )]
+// impl LinkedFile {
+// 	#[cfg_attr(feature = "uniffi", uniffi::method(name = "name"))]
+// 	#[cfg_attr(
+// 		all(target_family = "wasm", target_os = "unknown"),
+// 		wasm_bindgen::prelude::wasm_bindgen(getter, js_name = "name")
+// 	)]
+// 	fn name_clone(&self) -> Option<String> {
+// 		self.name().map(|s| s.to_string())
+// 	}
+
+// 	#[cfg_attr(feature = "uniffi", uniffi::method(name = "mime"))]
+// 	#[cfg_attr(
+// 		all(target_family = "wasm", target_os = "unknown"),
+// 		wasm_bindgen::prelude::wasm_bindgen(getter, js_name = "mime")
+// 	)]
+// 	fn mime_clone(&self) -> Option<String> {
+// 		self.mime().map(|s| s.to_string())
+// 	}
+// }

@@ -231,7 +231,7 @@ impl AuthCacheState {
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<RemoteFile, FilenSdkError> {
 		let old_path = self.get_cached_file_path_from_name(old_uuid, Some(&name));
-		let file_builder = self.client.make_file_builder(name, &parent_uuid).mime(mime);
+		let file_builder = self.client.make_file_builder(name, parent_uuid).mime(mime);
 		let (file, _) = self
 			.io_upload_file(
 				old_path.clone(),

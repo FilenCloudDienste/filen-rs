@@ -1,6 +1,7 @@
 use filen_sdk_rs::{
 	fs::{
-		HasUUID, NonRootFSObject,
+		HasUUID,
+		categories::{NonRootItemType, Normal},
 		dir::{RemoteDirectory, meta::DirectoryMeta},
 		file::{RemoteFile, meta::FileMeta},
 	},
@@ -266,7 +267,7 @@ pub(crate) fn update_search_items<'a, I>(
 	items: I,
 ) -> Result<Vec<DBNonRootObject>, rusqlite::Error>
 where
-	I: IntoIterator<Item = (NonRootFSObject<'a>, String)>,
+	I: IntoIterator<Item = (NonRootItemType<'a, Normal>, String)>,
 {
 	let tx = conn.transaction()?;
 	let items = {
@@ -290,7 +291,7 @@ where
 		items
 			.into_iter()
 			.map(|(item, path)| match item {
-				NonRootFSObject::Dir(cow) => {
+				NonRootItemType::Dir(cow) => {
 					let dir = DBDir::upsert_from_remote_stmts(
 						cow.into_owned(),
 						&mut upsert_item_stmt,
@@ -301,7 +302,7 @@ where
 					update_search_path.execute((path, dir.id))?;
 					Ok(DBNonRootObject::Dir(dir))
 				}
-				NonRootFSObject::File(cow) => {
+				NonRootItemType::File(cow) => {
 					let file = DBFile::upsert_from_remote_stmts(
 						cow.into_owned(),
 						&mut upsert_item_stmt,

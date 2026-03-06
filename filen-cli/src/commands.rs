@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use dialoguer::console::style;
@@ -7,13 +5,12 @@ use filen_rclone_wrapper::serve::BasicServerOptions;
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
-		HasName as _, HasUUID, UnsharedFSObject,
-		dir::{DirectoryType, HasContents, UnsharedDirectoryType},
+		HasName as _, HasUUID,
+		categories::{DirType, NonRootFileType, Normal},
 		file::traits::HasFileInfo as _,
 	},
-	io::{RemoteDirectory, client_impl::IoSharedClientExt},
+	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 };
-use filen_types::fs::ParentUuid;
 use serde_json::json;
 
 use crate::{
@@ -400,7 +397,7 @@ async fn cd(
 		.context("Failed to find directory")?
 	{
 		Some(dir) => match dir {
-			UnsharedFSObject::Dir(_) | UnsharedFSObject::Root(_) => Ok(directory),
+			NonRootFileType::Dir(_) | NonRootFileType::Root(_) => Ok(directory),
 			_ => Err(UI::failure(&format!("Not a directory: {}", directory.0))),
 		},
 		None => Err(UI::failure(&format!("No such directory: {}", directory.0))),
@@ -425,40 +422,34 @@ async fn list_directory(
 			directory_str
 		)));
 	};
-	let directory = match directory {
-		UnsharedFSObject::Dir(dir) => DirectoryType::Dir(dir),
-		UnsharedFSObject::Root(root) => DirectoryType::Root(root),
+	let directory: DirType<'_, Normal> = match directory {
+		NonRootFileType::Dir(dir) => DirType::Dir(dir),
+		NonRootFileType::Root(root) => DirType::Root(root),
 		_ => return Err(UI::failure(&format!("Not a directory: {}", directory_str))),
 	};
-	list_directory_by_uuid(ui, client, directory.uuid(), None).await
+	list_directory_by_dir(ui, client, &directory, None).await
 }
 
-async fn list_directory_by_uuid(
+fn print_items_after_list(
 	ui: &mut UI,
-	client: &Client,
-	directory: &dyn HasContents,
+	dirs: Vec<RemoteDirectory>,
+	files: Vec<RemoteFile>,
 	directory_label: Option<&str>,
 ) -> Result<()> {
-	let items = client
-		.list_dir(directory)
-		.await
-		.context("Failed to list directory")?;
-	let mut directories = items
-		.0
+	let mut directories = dirs
 		.iter()
 		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()))
 		.collect::<Vec<&str>>();
 	directories.sort();
-	let mut files = items
-		.1
+	let mut file_names = files
 		.iter()
 		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()).to_string())
 		.collect::<Vec<String>>();
-	files.sort();
+	file_names.sort();
 	if ui.json {
 		ui.print_json(json!({
 			"directories": directories,
-			"files": files,
+			"files": file_names,
 		}))?;
 	} else {
 		// print directory names in blue
@@ -468,7 +459,7 @@ async fn list_directory_by_uuid(
 			.collect::<Vec<String>>();
 		let all_items = directories
 			.iter()
-			.chain(files.iter())
+			.chain(file_names.iter())
 			.map(|s| s.as_ref())
 			.collect::<Vec<&str>>();
 		if all_items.is_empty() {
@@ -481,6 +472,19 @@ async fn list_directory_by_uuid(
 		ui.print_grid(&all_items);
 	}
 	Ok(())
+}
+
+async fn list_directory_by_dir(
+	ui: &mut UI,
+	client: &Client,
+	directory: &DirType<'_, Normal>,
+	directory_label: Option<&str>,
+) -> Result<()> {
+	let (dirs, files) = client
+		.list_dir::<_, Normal>(directory, None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list directory")?;
+	print_items_after_list(ui, dirs, files, directory_label)
 }
 
 enum PrintFileLines {
@@ -505,7 +509,7 @@ async fn print_file(
 		return Err(UI::failure(&format!("No such file: {}", file_str)));
 	};
 	let file = match file {
-		UnsharedFSObject::File(file) => file,
+		NonRootFileType::File(file) => file,
 		_ => return Err(UI::failure(&format!("Not a file: {}", file_str))),
 	};
 	if file.size() < 1024
@@ -547,7 +551,7 @@ async fn print_file_or_directory_info(
 		)));
 	};
 	match item {
-		UnsharedFSObject::File(file) => {
+		NonRootFileType::File(file) => {
 			if ui.json {
 				ui.print_json(json!({
 					"name": file.name().unwrap_or_else(|| file.uuid().as_ref()),
@@ -583,7 +587,7 @@ async fn print_file_or_directory_info(
 				]);
 			}
 		}
-		UnsharedFSObject::Dir(dir) => {
+		NonRootFileType::Dir(dir) => {
 			if ui.json {
 				ui.print_json(json!({
 					"name": dir.name().unwrap_or_else(|| dir.uuid().as_ref()),
@@ -606,7 +610,7 @@ async fn print_file_or_directory_info(
 				]);
 			}
 		}
-		UnsharedFSObject::Root(_) => {
+		NonRootFileType::Root(_) => {
 			let user_info = client
 				.get_user_info()
 				.await
@@ -664,14 +668,14 @@ async fn create_directory_(
 				return Err(e).context("Failed to find parent directory");
 			}
 		}
-		Ok(Some(UnsharedFSObject::Dir(parent_dir))) => Ok(DirectoryType::Dir(parent_dir)),
-		Ok(Some(UnsharedFSObject::Root(root))) => Ok(DirectoryType::Root(root)),
+		Ok(Some(NonRootFileType::Dir(parent_dir))) => Ok(DirType::Dir(parent_dir)),
+		Ok(Some(NonRootFileType::Root(root))) => Ok(DirType::Root(root)),
 		Ok(Some(_)) => Err(UI::failure(&format!("Not a directory: {}", parent.0))),
 		Ok(None) => {
 			if recursive {
 				Box::pin(create_directory_(client, &parent, true))
 					.await
-					.map(|d| DirectoryType::Dir(Cow::Owned(d)))
+					.map(|d| DirType::Dir(std::borrow::Cow::Owned(d)))
 			} else {
 				Err(UI::failure(&format!(
 					"No such parent directory: {}",
@@ -713,7 +717,7 @@ async fn delete_file_or_directory(
 		return Ok(());
 	}
 	match item {
-		UnsharedFSObject::File(mut file) => {
+		NonRootFileType::File(mut file) => {
 			if permanent {
 				client
 					.delete_file_permanently(file.into_owned())
@@ -731,7 +735,7 @@ async fn delete_file_or_directory(
 				ui.print_success(&format!("Trashed file: {}", file_or_directory_str));
 			}
 		}
-		UnsharedFSObject::Dir(mut dir) => {
+		NonRootFileType::Dir(mut dir) => {
 			if permanent {
 				client
 					.delete_dir_permanently(dir.into_owned())
@@ -749,7 +753,7 @@ async fn delete_file_or_directory(
 				ui.print_success(&format!("Trashed directory: {}", file_or_directory_str));
 			}
 		}
-		UnsharedFSObject::Root(_) => {
+		NonRootFileType::Root(_) => {
 			return Err(UI::failure("Cannot delete root directory"));
 		}
 	}
@@ -792,8 +796,8 @@ async fn move_or_copy_file_or_directory(
 		)));
 	};
 	let destination_dir = match destination_dir {
-		UnsharedFSObject::Dir(dir) => UnsharedDirectoryType::Dir(dir),
-		UnsharedFSObject::Root(root) => UnsharedDirectoryType::Root(root),
+		NonRootFileType::Dir(dir) => DirType::Dir(dir),
+		NonRootFileType::Root(root) => DirType::Root(root),
 		_ => {
 			return Err(UI::failure(&format!(
 				"Not a directory: {}",
@@ -803,30 +807,30 @@ async fn move_or_copy_file_or_directory(
 	};
 	match action {
 		MoveOrCopy::Move => match source_file_or_directory {
-			UnsharedFSObject::File(file) => {
+			NonRootFileType::File(file) => {
 				client
 					.move_file(&mut file.into_owned(), &destination_dir)
 					.await
 					.context("Failed to move file or directory")?;
 			}
-			UnsharedFSObject::Dir(dir) => {
+			NonRootFileType::Dir(dir) => {
 				client
 					.move_dir(&mut dir.into_owned(), &destination_dir)
 					.await
 					.context("Failed to move directory")?;
 			}
-			UnsharedFSObject::Root(_) => {
+			NonRootFileType::Root(_) => {
 				return Err(UI::failure("Cannot move root directory"));
 			}
 		},
 		MoveOrCopy::Copy => match source_file_or_directory {
-			UnsharedFSObject::File(_) => {
+			NonRootFileType::File(_) => {
 				todo!("Implement file copy"); // filen-sdk-rs does not support file copy yet
 			}
-			UnsharedFSObject::Dir(_) => {
+			NonRootFileType::Dir(_) => {
 				todo!("Implement directory copy"); // filen-sdk-rs does not support directory copy yet
 			}
-			UnsharedFSObject::Root(_) => {
+			NonRootFileType::Root(_) => {
 				return Err(UI::failure("Cannot copy root directory"));
 			}
 		},
@@ -863,9 +867,9 @@ async fn set_file_or_directory_favorite(
 		)));
 	};
 	match file_or_directory {
-		UnsharedFSObject::File(mut file) => {
+		NonRootFileType::File(mut file) => {
 			client
-				.set_favorite(file.to_mut(), favorite)
+				.set_file_favorite(file.to_mut(), favorite)
 				.await
 				.context("Failed to set file favorite status")?;
 			ui.print_success(&format!(
@@ -874,9 +878,9 @@ async fn set_file_or_directory_favorite(
 				file_or_directory_str
 			));
 		}
-		UnsharedFSObject::Dir(mut dir) => {
+		NonRootFileType::Dir(mut dir) => {
 			client
-				.set_favorite(dir.to_mut(), favorite)
+				.set_dir_favorite(dir.to_mut(), favorite)
 				.await
 				.context("Failed to set directory favorite status")?;
 			ui.print_success(&format!(
@@ -885,7 +889,7 @@ async fn set_file_or_directory_favorite(
 				file_or_directory_str
 			));
 		}
-		UnsharedFSObject::Root(_) => {
+		NonRootFileType::Root(_) => {
 			return Err(UI::failure(
 				"Cannot change favorite status of root directory",
 			));
@@ -896,7 +900,11 @@ async fn set_file_or_directory_favorite(
 
 async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
-	list_directory_by_uuid(ui, client, &ParentUuid::Trash, Some("Trash")).await
+	let (dirs, files) = client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list trash")?;
+	print_items_after_list(ui, dirs, files, Some("Trash"))
 }
 
 async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {

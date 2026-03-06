@@ -82,8 +82,8 @@ impl Client {
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod js_impls {
+	use filen_macros::js_type;
 	use image::codecs::webp::WebPEncoder;
-	use serde::{Deserialize, Serialize};
 
 	use crate::{
 		Error,
@@ -93,33 +93,19 @@ mod js_impls {
 		runtime::{self, do_on_commander},
 	};
 
-	#[derive(Deserialize)]
-	#[serde(rename_all = "camelCase")]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		derive(tsify::Tsify),
-		tsify(from_wasm_abi)
-	)]
-	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+	#[js_type(import)]
 	pub struct MakeThumbnailInMemoryParams {
 		pub file: File,
 		pub max_width: u32,
 		pub max_height: u32,
 	}
 
-	#[derive(Serialize)]
-	#[serde(rename_all = "camelCase")]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		derive(tsify::Tsify),
-		tsify(into_wasm_abi)
-	)]
-	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+	#[js_type(export)]
 	pub struct MakeThumbnailInMemoryResult {
 		// this is correct, ts requires the specifity
 		// because of https://github.com/microsoft/typescript/issues/62546
 		// not sure who to upstream this to, tsify, js_sys, or wasm-bindgen
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		#[cfg(feature = "wasm-full")]
 		#[tsify(type = "Uint8Array<ArrayBuffer>")]
 		pub webp_data: serde_bytes::ByteBuf,
 		#[cfg(feature = "uniffi")]

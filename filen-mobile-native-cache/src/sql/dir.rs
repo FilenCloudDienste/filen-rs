@@ -3,8 +3,9 @@ use std::{borrow::Cow, fmt::Debug};
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::fs::{
 	HasName, HasParent, HasRemoteInfo, HasUUID,
+	categories::{DirType, Normal},
 	dir::{
-		DecryptedDirectoryMeta, RemoteDirectory, RootDirectory, UnsharedDirectoryType,
+		DecryptedDirectoryMeta, RemoteDirectory, RootDirectory,
 		meta::DirectoryMeta,
 		traits::{HasDirMeta, HasRemoteDirInfo},
 	},
@@ -475,6 +476,7 @@ impl From<DBRoot> for RootDirectory {
 		RootDirectory::new(value.uuid)
 	}
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DBDirObject {
 	Dir(DBDir),
 	Root(DBRoot),
@@ -501,11 +503,20 @@ impl TryFrom<DBObject> for DBDirObject {
 	}
 }
 
-impl From<DBDirObject> for UnsharedDirectoryType<'static> {
+impl From<DBDirObject> for DirType<'static, Normal> {
 	fn from(obj: DBDirObject) -> Self {
 		match obj {
-			DBDirObject::Dir(dir) => UnsharedDirectoryType::Dir(Cow::Owned(dir.into())),
-			DBDirObject::Root(root) => UnsharedDirectoryType::Root(Cow::Owned(root.into())),
+			DBDirObject::Dir(dir) => DirType::Dir(Cow::Owned(dir.into())),
+			DBDirObject::Root(root) => DirType::Root(Cow::Owned(root.into())),
+		}
+	}
+}
+
+impl From<&DBDirObject> for DirType<'static, Normal> {
+	fn from(obj: &DBDirObject) -> Self {
+		match obj {
+			DBDirObject::Dir(dir) => DirType::Dir(Cow::Owned(dir.clone().into())),
+			DBDirObject::Root(root) => DirType::Root(Cow::Owned(root.clone().into())),
 		}
 	}
 }

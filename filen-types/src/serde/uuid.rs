@@ -74,6 +74,4 @@ macro_rules! uuid_option_module {
 }
 
 uuid_option_module!(base, "base");
-uuid_option_module!(shared_out, "shared-out");
-uuid_option_module!(shared_in, "shared-in");
 uuid_option_module!(none, "none");

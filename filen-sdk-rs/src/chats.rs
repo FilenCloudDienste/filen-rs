@@ -4,6 +4,7 @@ use std::{
 };
 
 use chrono::{DateTime, SubsecRound, Utc};
+use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
 		chat::{last_focus_update::ChatLastFocusValues, typing::ChatTypingType},
@@ -31,13 +32,7 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Eq)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export, no_default)]
 pub struct ChatParticipant {
 	pub(crate) user_id: u64,
 	pub(crate) email: String,
@@ -83,19 +78,7 @@ impl ChatParticipant {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(
-		into_wasm_abi,
-		from_wasm_abi,
-		large_number_types_as_bigints,
-		hashmap_as_object
-	),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export)]
 pub struct Chat {
 	pub(crate) uuid: UuidStr,
 	#[cfg_attr(
@@ -308,14 +291,7 @@ fn blocking_decrypt_chat_key(
 	NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &participant.metadata)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import)]
 pub struct ChatMessagePartial {
 	uuid: UuidStr,
 	sender_id: u64,
@@ -357,15 +333,7 @@ impl ChatMessagePartial {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	// hashmap_as_object is needed here as a workaround to https://github.com/madonoharu/tsify/issues/69
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints, hashmap_as_object),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export)]
 pub struct ChatMessage {
 	chat: UuidStr,
 	#[cfg_attr(feature = "wasm-full", serde(flatten))]

@@ -1,56 +1,47 @@
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use filen_types::traits::CowHelpers;
 use futures::TryFutureExt;
-#[cfg(feature = "multi-threaded-crypto")]
-use rayon::iter::ParallelIterator;
 
-use crate::fs::dir::UnsharedDirectoryType;
-use crate::util::AtomicDropCanceller;
 use crate::{
 	api,
 	auth::Client,
-	connect::fs::{ShareInfo, SharingRole},
 	crypto::shared::MetaCrypter,
 	error::{Error, ErrorExt, InvalidTypeError, MetadataWasNotDecryptedError},
 	fs::{
-		HasName, HasParent, HasUUID, NonRootFSObject,
+		HasUUID,
+		categories::{
+			DirType, Normal,
+			fs::{CategoryFS, ObjectMatch, find_item_in_dirs, find_item_in_files},
+		},
 		dir::{
-			DirectoryTypeWithShareInfo, HasUUIDContents,
 			meta::{DirectoryMeta, DirectoryMetaChanges},
 			traits::HasDirMeta,
 		},
-		file::{RemoteFile, meta::FileMeta},
+		file::RemoteFile,
 	},
-	runtime::{blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, PathIteratorExt},
+	runtime::do_cpu_intensive,
+	util::PathIteratorExt,
 };
 
-use super::{DirectoryType, HasContents, RemoteDirectory, traits::UpdateDirMeta};
-
-enum ObjectMatch<T> {
-	Name(T),
-	Uuid(T),
-}
+use super::{RemoteDirectory, traits::UpdateDirMeta};
 
 impl Client {
-	// todo, do not allow using shared dirs here
 	pub async fn create_dir(
 		&self,
-		parent: &dyn HasUUIDContents,
+		parent: &DirType<'_, Normal>,
 		name: String,
 	) -> Result<RemoteDirectory, Error> {
 		self.create_dir_with_created(parent, name, chrono::Utc::now())
 			.await
 	}
 
-	pub async fn create_dir_with_created(
+	pub(crate) async fn inner_create_dir_with_created(
 		&self,
-		parent: &dyn HasUUIDContents,
+		parent: UuidStr,
 		name: String,
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
@@ -75,22 +66,32 @@ impl Client {
 		let dir: RemoteDirectory = RemoteDirectory::new_from_parts(
 			uuid,
 			meta,
-			parent.uuid_as_parent(),
+			(*parent.uuid()).into(),
 			response.timestamp,
 		);
 
 		futures::try_join!(
 			self.update_search_hashes_for_item(&dir)
 				.map_err(Error::from),
-			self.update_item_with_maybe_connected_parent(&dir),
+			self.update_item_with_maybe_connected_parent((&dir).into()),
 		)?;
 		Ok(dir)
+	}
+
+	pub async fn create_dir_with_created(
+		&self,
+		parent: &DirType<'_, Normal>,
+		name: String,
+		created: DateTime<Utc>,
+	) -> Result<RemoteDirectory, Error> {
+		self.inner_create_dir_with_created(*parent.uuid(), name, created)
+			.await
 	}
 
 	#[cfg(feature = "malformed")]
 	pub async fn create_malformed_dir(
 		&self,
-		parent: &dyn HasUUIDContents,
+		parent: &DirType<'_, Normal>,
 		name: &str,
 		contents: &str,
 	) -> Result<UuidStr, Error> {
@@ -135,7 +136,7 @@ impl Client {
 
 	pub async fn dir_exists(
 		&self,
-		parent: &dyn HasUUIDContents,
+		parent: &DirType<'_, Normal>,
 		name: &str,
 	) -> Result<Option<UuidStr>, Error> {
 		api::v3::dir::exists::post(
@@ -149,141 +150,62 @@ impl Client {
 		.map(|r| r.0)
 	}
 
-	pub async fn list_dir(
+	#[allow(private_bounds)]
+	pub async fn list_dir<'a, F, Cat>(
 		&self,
-		dir: &dyn HasContents,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
-		let parent_uuid = dir.uuid_as_parent();
-
-		let (files, dirs) =
-			if parent_uuid == ParentUuid::Links || parent_uuid == ParentUuid::Favorites {
-				api::v3::dir::link_content::post(
-					self.client(),
-					&api::v3::dir::link_content::Request { uuid: parent_uuid },
-				)
-				.await
-				.map(|resp| (resp.files, resp.dirs))?
-			} else {
-				api::v3::dir::content::post(
-					self.client(),
-					&api::v3::dir::content::Request { uuid: parent_uuid },
-				)
-				.await
-				.map(|resp| (resp.files, resp.dirs))?
-			};
-
-		let crypter = self.crypter();
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| dirs
-					.into_maybe_par_iter()
-					.map(|d| {
-						RemoteDirectory::blocking_from_encrypted(
-							d.uuid,
-							d.parent,
-							d.color,
-							d.favorited.unwrap_or(false),
-							d.timestamp,
-							d.meta,
-							&*crypter,
-						)
-					})
-					.collect::<Vec<_>>(),
-				|| files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							f.parent,
-							f.size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							f.favorited,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, _>>()
-			);
-
-			Ok((dirs, files?))
-		})
-		.await
+		parent: &DirType<'_, Cat>,
+		progress: Option<&F>,
+	) -> Result<(Vec<Cat::Dir>, Vec<Cat::File>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+		Cat: CategoryFS<Client = Self>,
+		Cat::ListDirContext<'a>: Default,
+	{
+		Cat::list_dir(self, parent, progress, Cat::ListDirContext::default()).await
 	}
 
-	async fn inner_list_dir_recursive<Fut>(
+	pub async fn list_linked<F>(
 		&self,
-		inner_func: Fut,
+		progress: Option<&F>,
 	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
 	where
-		Fut: Future<Output = Result<api::v3::dir::download::Response<'static>, Error>>,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let response = inner_func.await?;
-		let crypter = self.crypter();
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
-					.into_maybe_par_iter()
-					.filter_map(|response_dir| {
-						Some(RemoteDirectory::blocking_from_encrypted(
-							response_dir.uuid,
-							match response_dir.parent {
-								// the request returns the base dir for the request as one of its dirs, we filter it out here
-								None => return None,
-								Some(parent) => parent,
-							},
-							response_dir.color,
-							response_dir.favorited,
-							response_dir.timestamp,
-							response_dir.meta,
-							&*crypter,
-						))
-					})
-					.collect::<Vec<_>>(),
-				|| response
-					.files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							f.parent,
-							f.chunks_size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							f.favorited,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, _>>()
-			);
-			Ok((dirs, files?))
-		})
-		.await
+		// todo check if returned parent is ParentUuid::Linked or not
+		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Links, progress).await
 	}
 
-	pub(crate) async fn list_dir_recursive_no_callback(
+	pub async fn list_favorites<F>(
 		&self,
-		dir: &dyn HasContents,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error> {
-		self.inner_list_dir_recursive(api::v3::dir::download::post_large(
-			self.client(),
-			&api::v3::dir::download::Request {
-				uuid: dir.uuid_as_parent(),
-				skip_cache: false,
-			},
-			None::<&fn(u64, Option<u64>)>,
-		))
-		.await
+		progress: Option<&F>,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		// todo check if returned parent is ParentUuid::Favorites or not
+		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Favorites, progress).await
+	}
+
+	pub async fn list_recents<F>(
+		&self,
+		progress: Option<&F>,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		// todo check if returned parent is ParentUuid::Recents or not
+		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Recents, progress).await
+	}
+
+	pub async fn list_trash<F>(
+		&self,
+		progress: Option<&F>,
+	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		// todo check if returned parent is ParentUuid::Trash or not
+		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Trash, progress).await
 	}
 
 	/// Recursively lists all directories and files inside the given directory.
@@ -294,25 +216,23 @@ impl Client {
 	/// such as WASM.
 	///
 	/// The progress callback receives the number of bytes downloaded so far and the total number of bytes to download, if known.
-	pub async fn list_dir_recursive<F>(
+	#[allow(private_bounds)]
+	pub async fn list_dir_recursive<Cat, F>(
 		&self,
-		dir: DirectoryType<'_>,
+		dir: &DirType<'_, Cat>,
 		progress_callback: &F,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<Cat::Dir>, Vec<Cat::File>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
+		Cat: CategoryFS<Client = Self>,
+		Cat::ListDirContext<'static>: Default,
 	{
-		self.inner_list_dir_recursive(async {
-			api::v3::dir::download::post_large(
-				self.client(),
-				&api::v3::dir::download::Request {
-					uuid: dir.uuid_as_parent(),
-					skip_cache: false,
-				},
-				Some(progress_callback),
-			)
-			.await
-		})
+		Cat::list_dir_recursive(
+			self,
+			dir,
+			Some(progress_callback),
+			Cat::ListDirContext::default(),
+		)
 		.await
 	}
 
@@ -389,91 +309,32 @@ impl Client {
 		Ok(())
 	}
 
-	fn inner_find_item_in_dirs(
-		&self,
-		dirs: Vec<RemoteDirectory>,
-		name_or_uuid: &str,
-	) -> Option<ObjectMatch<RemoteDirectory>> {
-		let mut uuid_match = None;
-
-		for dir in dirs {
-			if dir.name().is_some_and(|n| n == name_or_uuid) {
-				return Some(ObjectMatch::Name(dir));
-			} else if dir.uuid().as_ref() == name_or_uuid {
-				uuid_match = Some(ObjectMatch::Uuid(dir));
-			}
-		}
-		uuid_match
-	}
-
-	fn inner_find_item_in_files(
-		&self,
-		files: Vec<RemoteFile>,
-		name_or_uuid: &str,
-	) -> Option<ObjectMatch<RemoteFile>> {
-		let mut uuid_match = None;
-
-		for file in files {
-			if file.name().is_some_and(|n| n == name_or_uuid) {
-				return Some(ObjectMatch::Name(file));
-			} else if file.uuid().as_ref() == name_or_uuid {
-				uuid_match = Some(ObjectMatch::Uuid(file));
-			}
-		}
-		uuid_match
-	}
-
-	fn inner_find_item_in_dirs_and_files(
-		&self,
-		dirs: Vec<RemoteDirectory>,
-		files: Vec<RemoteFile>,
-		name_or_uuid: &str,
-	) -> Option<NonRootFSObject<'static>> {
-		let uuid_match = match self.inner_find_item_in_dirs(dirs, name_or_uuid) {
-			Some(ObjectMatch::Name(dir)) => return Some(NonRootFSObject::Dir(Cow::Owned(dir))),
-			Some(ObjectMatch::Uuid(dir)) => Some(dir),
-			None => None,
-		};
-		match self.inner_find_item_in_files(files, name_or_uuid) {
-			Some(ObjectMatch::Name(file)) => Some(NonRootFSObject::File(Cow::Owned(file))),
-			Some(ObjectMatch::Uuid(file)) => Some(NonRootFSObject::File(Cow::Owned(file))),
-			None => uuid_match.map(|dir| NonRootFSObject::Dir(Cow::Owned(dir))),
-		}
-	}
-
-	/// Finds an item in the directory by name or UUID.
-	/// Returns the match by name if one exists, otherwise returns the match by UUID.
-	/// If no match is found, returns None.
-	pub async fn find_item_in_dir(
-		&self,
-		// TODO, disallow shared dirs here
-		dir: &dyn HasContents,
-		name_or_uuid: &str,
-	) -> Result<Option<NonRootFSObject<'static>>, Error> {
-		let (dirs, files) = self.list_dir(dir).await?;
-		Ok(self.inner_find_item_in_dirs_and_files(dirs, files, name_or_uuid))
-	}
+	// /// Finds an item in the directory by name or UUID.
+	// /// Returns the match by name if one exists, otherwise returns the match by UUID.
+	// /// If no match is found, returns None.
 
 	pub async fn find_or_create_dir_starting_at<'a>(
 		&self,
-		dir: UnsharedDirectoryType<'a>,
+		dir: DirType<'a, Normal>,
 		path: &str,
-	) -> Result<UnsharedDirectoryType<'a>, Error> {
+	) -> Result<DirType<'a, Normal>, Error> {
 		let _lock = self.lock_drive().await?;
 		let mut curr_dir = dir;
 		for (component, remaining_path) in path.path_iter() {
-			let (dirs, files) = self.list_dir(&curr_dir).await?;
+			let (dirs, files) = self
+				.list_dir::<_, Normal>(&curr_dir, None::<&fn(u64, Option<u64>)>)
+				.await?;
 
-			let dir_uuid_match = match self.inner_find_item_in_dirs(dirs, component) {
+			let dir_uuid_match = match find_item_in_dirs::<Normal>(dirs, component) {
 				Some(ObjectMatch::Name(dir)) => {
-					curr_dir = UnsharedDirectoryType::Dir(Cow::Owned(dir));
+					curr_dir = DirType::Dir(Cow::Owned(dir));
 					continue;
 				}
 				Some(ObjectMatch::Uuid(obj)) => Some(obj),
 				None => None,
 			};
 
-			match self.inner_find_item_in_files(files, component) {
+			match find_item_in_files::<Normal>(files, component) {
 				Some(ObjectMatch::Name(_)) | Some(ObjectMatch::Uuid(_)) => {
 					return Err(InvalidTypeError {
 						actual: ObjectType::File,
@@ -486,22 +347,19 @@ impl Client {
 			};
 
 			if let Some(dir) = dir_uuid_match {
-				curr_dir = UnsharedDirectoryType::Dir(Cow::Owned(dir));
+				curr_dir = DirType::Dir(Cow::Owned(dir));
 				continue;
 			}
 
 			let new_dir = self.create_dir(&curr_dir, component.to_string()).await?;
-			curr_dir = UnsharedDirectoryType::Dir(Cow::Owned(new_dir));
+			curr_dir = DirType::Dir(Cow::Owned(new_dir));
 		}
 		Ok(curr_dir)
 	}
 
-	pub async fn find_or_create_dir(&self, path: &str) -> Result<UnsharedDirectoryType<'_>, Error> {
-		self.find_or_create_dir_starting_at(
-			UnsharedDirectoryType::Root(Cow::Borrowed(self.root())),
-			path,
-		)
-		.await
+	pub async fn find_or_create_dir(&self, path: &str) -> Result<DirType<'_, Normal>, Error> {
+		self.find_or_create_dir_starting_at(DirType::Root(Cow::Borrowed(self.root())), path)
+			.await
 	}
 
 	// todo add overwriting
@@ -509,7 +367,7 @@ impl Client {
 	pub async fn move_dir(
 		&self,
 		dir: &mut RemoteDirectory,
-		new_parent: &UnsharedDirectoryType<'_>,
+		new_parent: &DirType<'_, Normal>,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::r#move::post(
@@ -522,41 +380,6 @@ impl Client {
 		.await?;
 		dir.set_parent((*new_parent.uuid()).into());
 		Ok(())
-	}
-
-	pub async fn get_dir_size<'a, T>(&self, dir: T) -> Result<api::v3::dir::size::Response, Error>
-	where
-		T: Into<DirectoryTypeWithShareInfo<'a>>,
-	{
-		let request = match dir.into() {
-			DirectoryTypeWithShareInfo::Root(r) => api::v3::dir::size::Request {
-				uuid: *r.uuid(),
-				sharer_id: None,
-				receiver_id: None,
-				trash: false,
-			},
-			DirectoryTypeWithShareInfo::Dir(d) => api::v3::dir::size::Request {
-				uuid: *d.uuid(),
-				sharer_id: None,
-				receiver_id: None,
-				trash: *d.parent() == ParentUuid::Trash,
-			},
-			DirectoryTypeWithShareInfo::SharedDir(d) => api::v3::dir::size::Request {
-				uuid: *d.dir.uuid(),
-				sharer_id: if let SharingRole::Sharer(ShareInfo { id, .. }) = d.sharing_role {
-					Some(id)
-				} else {
-					None
-				},
-				receiver_id: if let SharingRole::Receiver(ShareInfo { id, .. }) = d.sharing_role {
-					Some(id)
-				} else {
-					None
-				},
-				trash: false,
-			},
-		};
-		api::v3::dir::size::post(self.client(), &request).await
 	}
 
 	pub async fn set_dir_color(
@@ -576,49 +399,37 @@ impl Client {
 		dir.color = color.into_owned_cow();
 		Ok(())
 	}
-
-	pub async fn list_dir_recursive_with_paths<F, F1>(
-		self: Arc<Self>,
-		dir: DirectoryType<'_>,
-		list_dir_progress_callback: &F,
-		scan_errors_callback: &mut F1,
-	) -> Result<(Vec<(RemoteDirectory, String)>, Vec<(RemoteFile, String)>), Error>
-	where
-		F: Fn(u64, Option<u64>) + Send + Sync,
-		F1: FnMut(Vec<Error>),
-	{
-		let drop_canceller = AtomicDropCanceller::default();
-
-		let (tree, stats) = crate::io::fs_tree::build_fs_tree_from_remote_iterator(
-			&self,
-			dir,
-			scan_errors_callback,
-			&mut |_dirs, _files, _bytes| {
-				// this can be a noop because we download everything all at once and then scan it
-				// which means that this should be very fast
-			},
-			list_dir_progress_callback,
-			drop_canceller.cancelled(),
-		)
-		.await?;
-
-		let iter = tree.dfs_iter_with_path("");
-		let (num_dirs, num_files, _) = stats.snapshot();
-
-		let mut files = Vec::with_capacity(num_files as usize);
-		let mut dirs = Vec::with_capacity(num_dirs as usize);
-
-		for (entry, path) in iter {
-			match entry {
-				crate::io::fs_tree::Entry::Dir(dir_entry) => {
-					dirs.push((dir_entry.extra_data().clone(), path))
-				}
-				crate::io::fs_tree::Entry::File(file_entry) => {
-					files.push((file_entry.extra_data().clone(), path))
-				}
-			}
-		}
-
-		Ok((dirs, files))
-	}
 }
+
+// pub(crate) trait CategoryDirExt<Cat: CategoryFS> {
+// 	async fn find_item_in_dir<F>(
+// 		client: &Cat::Client,
+// 		dir: &DirType<'_, Cat>,
+// 		progress_callback: Option<&F>,
+// 		name_or_uuid: &str,
+// 		list_dir_context: Cat::ListDirContext<'_>,
+// 	) -> Result<Option<NonRootItemType<'static, Cat>>, Error>
+// 	where
+// 		F: Fn(u64, Option<u64>) + Send + Sync {
+
+// 		}
+// }
+
+// impl<Cat: CategoryFS> CategoryDirExt<Cat> for Cat {
+// 	async
+// }
+
+// #[allow(private_bounds)]
+// pub async fn find_item_in_dir<F, CatExt>(
+// 	&self,
+// 	dir: &DirType<'_, CatExt>,
+// 	progress_callback: Option<&F>,
+// 	name_or_uuid: &str,
+// 	list_dir_context: CatExt::ListDirContext<'_>,
+// ) -> Result<Option<NonRootItemType<'static, CatExt>>, Error>
+// where
+// 	CatExt: CategoryFSExt<Client = Self>,
+// 	F: Fn(u64, Option<u64>) + Send + Sync,
+// {
+
+// }

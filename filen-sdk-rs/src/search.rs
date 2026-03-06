@@ -14,7 +14,8 @@ use crate::{
 	crypto::shared::MetaCrypter,
 	error::{Error, MetadataWasNotDecryptedError},
 	fs::{
-		HasName, HasType, HasUUID, NonRootFSObject,
+		HasName, HasType, HasUUID,
+		categories::{NonRootItemType, Normal},
 		dir::{DecryptedDirectoryMeta, RemoteDirectory},
 		file::{RemoteFile, meta::FileMeta},
 	},
@@ -157,7 +158,7 @@ impl Client {
 	pub async fn find_item_matches_for_name(
 		&self,
 		name: &str,
-	) -> Result<Vec<(NonRootFSObject<'static>, String)>, crate::error::Error> {
+	) -> Result<Vec<(NonRootItemType<'static, Normal>, String)>, crate::error::Error> {
 		let name = name.trim().to_lowercase();
 		let response = api::v3::search::find::post(
 			self.client(),
@@ -174,7 +175,7 @@ impl Client {
 				.map(|item| {
 					let (item, metadata_path) = match item {
 						SearchFindItem::Dir(found_dir) => (
-							NonRootFSObject::Dir(Cow::Owned(
+							NonRootItemType::Dir(Cow::Owned(
 								RemoteDirectory::blocking_from_encrypted(
 									found_dir.uuid,
 									found_dir.parent.into(),
@@ -194,7 +195,7 @@ impl Client {
 								found_file.version,
 							);
 							(
-								NonRootFSObject::File(Cow::Owned(RemoteFile::from_meta(
+								NonRootItemType::File(Cow::Owned(RemoteFile::from_meta(
 									found_file.uuid,
 									found_file.parent.into(),
 									found_file.size,
@@ -252,17 +253,11 @@ impl Client {
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod js_impl {
-	use serde::Serialize;
+	use filen_macros::js_type;
 
 	use crate::{auth::JsClient, js::NonRootItemTagged, runtime::do_on_commander};
 
-	#[derive(Serialize)]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		derive(tsify::Tsify),
-		tsify(into_wasm_abi)
-	)]
-	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+	#[js_type(export, no_deser)]
 	pub struct ItemMatch {
 		pub item: NonRootItemTagged,
 		pub path: String,

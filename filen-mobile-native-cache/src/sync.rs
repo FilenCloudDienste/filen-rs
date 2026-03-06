@@ -4,9 +4,11 @@ use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	fs::{
-		UnsharedFSObject,
-		client_impl::ObjectOrRemainingPath,
-		dir::{RemoteDirectory, RootDirectory, UnsharedDirectoryType},
+		categories::{
+			DirType, NonRootFileType, Normal,
+			fs::{CategoryFSExt, ObjectOrRemainingPath},
+		},
+		dir::{RemoteDirectory, RootDirectory},
 		file::RemoteFile,
 	},
 };
@@ -29,7 +31,7 @@ enum LocalRemoteComparison<'a> {
 	DifferentDir(DBDir, RemoteDirectory),
 	SameFile(DBFile, RemoteFile),
 	DifferentFile(DBFile, RemoteFile),
-	Force(DBObject, UnsharedFSObject<'a>),
+	Force(DBObject, NonRootFileType<'a, Normal>),
 	NotFound(DBObject),
 	Root(DBRoot),
 }
@@ -37,17 +39,19 @@ enum LocalRemoteComparison<'a> {
 impl LocalRemoteComparison<'_> {
 	fn force(self) -> Self {
 		match self {
-			LocalRemoteComparison::SameDir(dir, remote_dir) => {
-				LocalRemoteComparison::Force(DBObject::Dir(dir), remote_dir.into())
-			}
-			LocalRemoteComparison::SameFile(file, remote_file) => {
-				LocalRemoteComparison::Force(DBObject::File(file), remote_file.into())
-			}
+			LocalRemoteComparison::SameDir(dir, remote_dir) => LocalRemoteComparison::Force(
+				DBObject::Dir(dir),
+				NonRootFileType::Dir(Cow::Owned(remote_dir)),
+			),
+			LocalRemoteComparison::SameFile(file, remote_file) => LocalRemoteComparison::Force(
+				DBObject::File(file),
+				NonRootFileType::File(Cow::Owned(remote_file)),
+			),
 			LocalRemoteComparison::Root(root) => {
 				let remote_root = Cow::Owned(RootDirectory::new(root.uuid()));
 				LocalRemoteComparison::Force(
 					DBObject::Root(root),
-					UnsharedFSObject::Root(remote_root),
+					NonRootFileType::Root(remote_root),
 				)
 			}
 			other => other,
@@ -128,15 +132,15 @@ where
 
 fn update_dirs(
 	conn: &mut Connection,
-	dirs: Vec<UnsharedDirectoryType<'_>>,
+	dirs: Vec<DirType<'_, Normal>>,
 ) -> Result<DBDirObject, CacheError> {
 	let mut last_dir_obj = None;
 	for dir in dirs {
 		match dir {
-			UnsharedDirectoryType::Root(root) => {
+			DirType::Root(root) => {
 				last_dir_obj = Some(DBRoot::upsert_from_remote(conn, &root)?.into());
 			}
-			UnsharedDirectoryType::Dir(dir) => {
+			DirType::Dir(dir) => {
 				last_dir_obj = Some(DBDir::upsert_from_remote(conn, dir.into_owned())?.into());
 			}
 		}
@@ -148,12 +152,15 @@ impl AuthCacheState {
 	async fn update_items_in_path_starting_at<'a>(
 		&self,
 		path: &'a str,
-		parent: UnsharedDirectoryType<'_>,
+		parent: DirType<'_, Normal>,
 	) -> Result<UpdateItemsInPath<'a>, CacheError> {
-		match self
-			.client
-			.get_items_in_path_starting_at(path, parent)
-			.await
+		match <Normal as CategoryFSExt>::get_items_in_path_starting_at(
+			&self.client,
+			path,
+			parent,
+			(),
+		)
+		.await
 		{
 			Ok((dirs, ObjectOrRemainingPath::Object(last_item))) => {
 				let conn = &mut self.conn();
@@ -268,8 +275,8 @@ impl AuthCacheState {
 			return Ok(UpdateItemsInPath::Complete(last_valid_obj));
 		}
 		let last_dir = match last_valid_obj {
-			DBObject::Dir(dir) => UnsharedDirectoryType::Dir(Cow::Owned(dir.into())),
-			DBObject::Root(root) => UnsharedDirectoryType::Root(Cow::Owned(root.into())),
+			DBObject::Dir(dir) => DirType::Dir(Cow::Owned(dir.into())),
+			DBObject::Root(root) => DirType::Root(Cow::Owned(root.into())),
 			DBObject::File(_) => {
 				return Err(
 					filen_sdk_rs::Error::from(filen_sdk_rs::error::InvalidTypeError {

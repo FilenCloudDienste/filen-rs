@@ -1,8 +1,6 @@
 use std::{num::NonZeroU32, sync::Arc};
 
-use serde::Deserialize;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use tsify::Tsify;
+use filen_macros::js_type;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
 
@@ -42,14 +40,7 @@ impl JsClient {
 	}
 }
 
-#[derive(Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(import)]
 pub struct ChangePasswordParams {
 	pub current_password: String,
 	pub new_password: String,
@@ -196,49 +187,35 @@ impl JsClient {
 	}
 }
 
-#[derive(Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(import)]
 pub struct CompletePasswordResetParams {
 	pub token: String,
 	pub email: String,
 	pub new_password: String,
-	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default)
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub recover_key: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(import)]
 pub struct RegisterParams {
 	pub email: String,
 	pub password: String,
-	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default)
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub ref_id: Option<String>,
-	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "string")
+		tsify(type = "string"),
+		serde(default)
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub aff_id: Option<String>,

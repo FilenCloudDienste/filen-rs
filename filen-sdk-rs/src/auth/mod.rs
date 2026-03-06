@@ -9,6 +9,7 @@ use std::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use digest::{Digest, FixedOutput, KeyInit, Update};
+use filen_macros::js_type;
 use filen_types::{
 	auth::{AuthVersion, FileEncryptionVersion, FilenSDKConfig, MetaEncryptionVersion},
 	crypto::{EncryptedMetaKey, EncryptedString},
@@ -218,14 +219,9 @@ impl PartialEq for Client {
 
 impl Eq for Client {}
 
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(from_wasm_abi, into_wasm_abi, large_number_types_as_bigints)
-)]
-#[derive(Serialize, Deserialize)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[js_type(import, export, wasm_all, no_ser, no_deser)]
 pub struct StringifiedClient {
 	pub email: String,
 	pub user_id: u64,
@@ -608,12 +604,7 @@ impl Client {
 	}
 }
 
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(Serialize, tsify::Tsify),
-	tsify(into_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(export)]
 pub struct TwoFASecret {
 	secret: String,
 	url: String,

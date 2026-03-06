@@ -3,11 +3,13 @@ use std::{borrow::Cow, collections::HashMap};
 use crate::{
 	Error,
 	fs::{
-		HasParent, HasUUID, NonRootFSObject,
-		dir::{DirectoryType, RemoteDirectory},
-		file::RemoteFile,
+		HasParent, HasUUID,
+		categories::{Category, DirType, NonRootItemType, fs::CategoryFSExt},
 	},
-	io::fs_tree::{WalkError, entry::remote::RemoteFSObjectEntry},
+	io::fs_tree::{
+		WalkError,
+		entry::{DFSWalkerDirEntry, DFSWalkerFileEntry, remote::RemoteFSObjectEntry},
+	},
 };
 
 use filen_types::fs::ParentUuid;
@@ -15,18 +17,14 @@ use uuid::Uuid;
 
 use super::{FSStats, FSTree};
 
-pub(crate) struct WalkDirFromHashMap {
-	map: HashMap<Uuid, Vec<NonRootFSObject<'static>>>,
+pub(crate) struct WalkDirFromHashMap<Cat: Category + ?Sized> {
+	map: HashMap<Uuid, Vec<NonRootItemType<'static, Cat>>>,
 	stack: Vec<Uuid>,
 }
 
-impl WalkDirFromHashMap {
-	pub fn new(
-		root_uuid: Uuid,
-		dirs: Vec<RemoteDirectory>,
-		files: Vec<RemoteFile>,
-	) -> Result<Self, Error> {
-		let mut map: HashMap<Uuid, Vec<NonRootFSObject<'static>>> = HashMap::new();
+impl<Cat: Category + ?Sized> WalkDirFromHashMap<Cat> {
+	pub fn new(root_uuid: Uuid, dirs: Vec<Cat::Dir>, files: Vec<Cat::File>) -> Result<Self, Error> {
+		let mut map: HashMap<Uuid, Vec<NonRootItemType<'static, Cat>>> = HashMap::new();
 		for dir in dirs {
 			let ParentUuid::Uuid(parent_uuid) = dir.parent() else {
 				return Err(Error::custom(
@@ -39,7 +37,7 @@ impl WalkDirFromHashMap {
 			};
 			map.entry(Uuid::from(parent_uuid))
 				.or_default()
-				.push(NonRootFSObject::Dir(Cow::Owned(dir)));
+				.push(NonRootItemType::<Cat>::Dir(Cow::Owned(dir)));
 		}
 		for file in files {
 			let ParentUuid::Uuid(parent_uuid) = file.parent() else {
@@ -53,15 +51,18 @@ impl WalkDirFromHashMap {
 			};
 			map.entry(Uuid::from(parent_uuid))
 				.or_default()
-				.push(NonRootFSObject::File(Cow::Owned(file)));
+				.push(NonRootItemType::<Cat>::File(Cow::Owned(file)));
 		}
 		let stack = vec![root_uuid];
 		Ok(Self { map, stack })
 	}
 }
 
-impl Iterator for WalkDirFromHashMap {
-	type Item = Result<RemoteFSObjectEntry<'static>, WalkError>;
+impl<Cat> Iterator for WalkDirFromHashMap<Cat>
+where
+	Cat: Category + ?Sized,
+{
+	type Item = Result<RemoteFSObjectEntry<'static, Cat>, WalkError>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		let current_parent = self.stack.last()?;
@@ -82,7 +83,7 @@ impl Iterator for WalkDirFromHashMap {
 
 		let depth = self.stack.len();
 
-		if let NonRootFSObject::Dir(dir) = &obj {
+		if let NonRootItemType::<Cat>::Dir(dir) = &obj {
 			self.stack.push(Uuid::from(dir.uuid()));
 		}
 
@@ -90,23 +91,26 @@ impl Iterator for WalkDirFromHashMap {
 	}
 }
 
-pub(crate) async fn build_fs_tree_from_remote_iterator<F>(
-	client: &crate::auth::Client,
-	dir: DirectoryType<'_>,
+#[allow(private_bounds)]
+pub(crate) async fn build_fs_tree_from_remote_iterator<F, Cat>(
+	client: &Cat::Client,
+	dir: DirType<'_, Cat>,
 	error_callback: &mut impl FnMut(Vec<Error>),
 	progress_callback: &mut impl FnMut(u64, u64, u64),
-	list_dir_progress_callback: &F,
+	list_dir_progress_callback: Option<&F>,
 	should_cancel: &std::sync::atomic::AtomicBool,
-) -> Result<(FSTree<RemoteDirectory, RemoteFile>, FSStats), Error>
+	context: Cat::ListDirContext<'_>,
+) -> Result<(FSTree<Cat::Dir, Cat::File>, FSStats), Error>
 where
 	F: Fn(u64, Option<u64>) + Send + Sync,
+	Cat: CategoryFSExt + ?Sized,
+	Cat::File: DFSWalkerFileEntry<Extra = Cat::File>,
+	Cat::Dir: DFSWalkerDirEntry<Extra = Cat::Dir>,
 {
 	let root_uuid = dir.uuid().into();
-	let (dirs, files) = client
-		.list_dir_recursive(dir, list_dir_progress_callback)
-		.await?;
-
-	let iter = WalkDirFromHashMap::new(root_uuid, dirs, files)?;
+	let (dirs, files) =
+		Cat::list_dir_recursive(client, &dir, list_dir_progress_callback, context).await?;
+	let iter = WalkDirFromHashMap::<Cat>::new(root_uuid, dirs, files)?;
 
 	super::build_fs_tree(iter, error_callback, progress_callback, should_cancel)
 }

@@ -4,41 +4,39 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::rsa::RSAEncryptedString,
+	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
 	fs::UuidStr,
 };
 
-pub const ENDPOINT: &str = "v3/shared/in";
+pub const ENDPOINT: &str = "v3/shared/out";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	#[serde(with = "crate::serde::uuid::shared_in")]
-	pub uuid: Option<UuidStr>,
+	pub uuid: UuidStr,
+	pub receiver_id: u64,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
 	#[serde(rename = "uploads")]
-	pub files: Vec<SharedFileIn<'a>>,
+	pub files: Vec<SharedFileOut<'a>>,
 	#[serde(rename = "folders")]
-	pub dirs: Vec<SharedDirIn<'a>>,
+	pub dirs: Vec<SharedDirOut<'a>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SharedFileIn<'a> {
+pub struct SharedFileOut<'a> {
 	pub uuid: UuidStr,
-	pub parent: Option<UuidStr>,
-	pub metadata: RSAEncryptedString<'a>,
+	pub parent: UuidStr,
+	pub metadata: EncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
 	pub chunks: u64,
 	pub size: u64,
 	pub version: FileEncryptionVersion,
-	pub sharer_email: Cow<'a, str>,
-	pub sharer_id: u64,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub write_access: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -47,12 +45,12 @@ pub struct SharedFileIn<'a> {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SharedDirIn<'a> {
+pub struct SharedDirOut<'a> {
 	pub uuid: UuidStr,
-	pub parent: Option<UuidStr>,
-	pub metadata: RSAEncryptedString<'a>,
-	pub sharer_email: Cow<'a, str>,
-	pub sharer_id: u64,
+	pub parent: UuidStr,
+	pub metadata: EncryptedString<'a>,
+	// pub receiver_email: Cow<'a, str>,
+	// pub receiver_id: u64,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub write_access: bool,
 	pub color: DirColor<'a>,

@@ -549,19 +549,17 @@ pub(crate) use commander_thread::{
 
 #[cfg(feature = "wasm-full")]
 mod wasm_threading {
-	use serde::Serialize;
+	use filen_macros::js_type;
 	use wasm_bindgen::prelude::*;
 
 	use super::worker_handle::{WORKER_HANDLE, WorkerHandle};
 
-	#[derive(Serialize, tsify::Tsify)]
-	#[tsify(into_wasm_abi)]
-	#[serde(rename_all = "camelCase")]
+	#[js_type(export, no_deser, no_default)]
 	pub struct WorkerInitEvent {
-		#[serde(with = "serde_wasm_bindgen::preserve")]
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
-			tsify(type = "WebAssembly.Memory")
+			tsify(type = "WebAssembly.Memory"),
+			serde(with = "serde_wasm_bindgen::preserve")
 		)]
 		memory: JsValue,
 		closure_ptr: usize,

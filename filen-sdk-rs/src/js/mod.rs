@@ -1,6 +1,4 @@
-mod dir;
-mod file;
-mod item;
+mod categories;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 mod managed_futures;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
@@ -9,16 +7,34 @@ mod params;
 mod returned_types;
 #[cfg(all(target_family = "wasm", target_os = "unknown",))]
 mod service_worker;
-#[cfg(all(test, feature = "wasm-full"))]
-mod test;
 #[cfg(feature = "uniffi")]
 mod uniffi;
 #[cfg(feature = "wasm-full")]
 mod wasm;
 
-pub use dir::*;
-pub use file::*;
-pub use item::*;
+#[allow(unused_imports)]
+pub(crate) use categories::{
+	common::{
+		dir::{color::DirColor, meta::DirMeta},
+		enums::{
+			NonRootItem,
+			dir::{AnyDirWithContext, DirByCategoryWithContext, NonRootDir},
+			file::AnyFile,
+		},
+		file::{File, meta::FileMeta, version::FileVersion},
+	},
+	linked::{AnyLinkedDir, LinkedDir, LinkedFile},
+	normal::{AnyNormalDir, Dir, NonRootNormalItem, Root},
+	shared::{AnySharedDir, SharedDir, SharedFile, SharedRootDir, SharedRootItem},
+};
+
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+pub(crate) use categories::{
+	common::enums::{NonRootItemTagged, dir::NonRootDirTagged},
+	normal::NonRootNormalItemTagged,
+	shared::{SharedFileTagged, SharedRootDirTagged},
+};
+
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]

@@ -3,10 +3,16 @@ use std::borrow::Cow;
 use filen_macros::CowFrom;
 use filen_types::{fs::ObjectType, traits::CowHelpers};
 
-use crate::fs::{HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, file::traits::File};
+use crate::{
+	connect::fs::SharedRootFile,
+	fs::{
+		HasMeta, HasName, HasRemoteInfo, HasType, HasUUID,
+		file::{LinkedFile, traits::File},
+	},
+};
 
 use super::{
-	RemoteFile, RemoteRootFile,
+	RemoteFile,
 	traits::{HasFileInfo, HasRemoteFileInfo},
 };
 
@@ -27,7 +33,8 @@ use super::{
 )]
 pub enum RemoteFileType<'a> {
 	File(Cow<'a, RemoteFile>),
-	SharedFile(Cow<'a, RemoteRootFile>),
+	Shared(Cow<'a, SharedRootFile>),
+	Linked(Cow<'a, LinkedFile>),
 }
 
 impl HasType for RemoteFileType<'_> {

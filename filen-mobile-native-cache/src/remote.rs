@@ -4,6 +4,7 @@ use chrono::DateTime;
 use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
+		categories::{DirType, Normal},
 		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 		file::{RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 	},
@@ -264,7 +265,10 @@ impl AuthCacheState {
 	}
 
 	pub(crate) async fn update_recents(&self) -> Result<(), CacheError> {
-		let (dirs, files) = self.client.list_dir(&ParentUuid::Recents).await?;
+		let (dirs, files) = self
+			.client
+			.list_recents(None::<&fn(u64, Option<u64>)>)
+			.await?;
 		println!("Updating recents with {dirs:?} dirs and {files:?} files");
 		sql::update_recents(&mut self.conn(), dirs, files)?;
 		self.last_recents_update
@@ -275,7 +279,10 @@ impl AuthCacheState {
 	}
 
 	pub(crate) async fn update_trash(&self) -> Result<(), CacheError> {
-		let (dirs, files) = self.client.list_dir(&ParentUuid::Trash).await?;
+		let (dirs, files) = self
+			.client
+			.list_trash(None::<&fn(u64, Option<u64>)>)
+			.await?;
 		println!("Updating recents with {dirs:?} dirs and {files:?} files");
 		sql::update_items_with_parent(&mut self.conn(), dirs, files, ParentUuid::Trash)?;
 		self.last_trash_update
@@ -399,7 +406,7 @@ impl AuthCacheState {
 			{
 				let builder = self
 					.client
-					.make_file_builder(path_values.name_or_uuid.to_owned(), &parent.uuid());
+					.make_file_builder(path_values.name_or_uuid.to_owned(), parent.uuid());
 				self.io_upload_new_file(builder).await?.0
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
@@ -446,7 +453,7 @@ impl AuthCacheState {
 			}
 		};
 
-		let mut file = self.client.make_file_builder(name, &parent.uuid());
+		let mut file = self.client.make_file_builder(name, parent.uuid());
 		if let Some(creation) = info.creation {
 			file = file.created(DateTime::from_timestamp_millis(creation).ok_or_else(|| {
 				CacheError::conversion(format!(
@@ -503,7 +510,7 @@ impl AuthCacheState {
 			}
 		};
 
-		let mut builder = self.client.make_file_builder(name, &parent.uuid());
+		let mut builder = self.client.make_file_builder(name, parent.uuid());
 		if let Some(mime) = mime {
 			builder = builder.mime(mime);
 		}
@@ -543,11 +550,12 @@ impl AuthCacheState {
 			}
 		};
 
+		let parent_dir_type = DirType::<'static, Normal>::from(parent);
 		let dir = match created {
 			Some(time) => {
 				self.client
 					.create_dir_with_created(
-						&parent.uuid(),
+						&parent_dir_type,
 						name,
 						DateTime::from_timestamp_millis(time).ok_or_else(|| {
 							CacheError::conversion(format!(
@@ -557,7 +565,7 @@ impl AuthCacheState {
 					)
 					.await?
 			}
-			None => self.client.create_dir(&parent.uuid(), name).await?,
+			None => self.client.create_dir(&parent_dir_type, name).await?,
 		};
 
 		let mut conn = self.conn();
@@ -928,7 +936,7 @@ impl AuthCacheState {
 					// update server-side favorite status
 					let mut remote_file: RemoteFile = dbfile.try_into()?;
 					self.client
-						.set_favorite(&mut remote_file, favorite_rank > 0)
+						.set_file_favorite(&mut remote_file, favorite_rank > 0)
 						.await?;
 					dbfile = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 				}
@@ -941,7 +949,7 @@ impl AuthCacheState {
 					// update server-side favorite status
 					let mut remote_dir: RemoteDirectory = dbdir.into();
 					self.client
-						.set_favorite(&mut remote_dir, favorite_rank > 0)
+						.set_dir_favorite(&mut remote_dir, favorite_rank > 0)
 						.await?;
 					dbdir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
 				}
@@ -1050,7 +1058,10 @@ impl AuthCacheState {
 	}
 
 	async fn inner_update_dir(&self, dir: &mut DBDirObject) -> Result<(), CacheError> {
-		let (dirs, files) = self.client.list_dir(&dir.uuid()).await?;
+		let (dirs, files) = self
+			.client
+			.list_dir(&DirType::from(&*dir), None::<&fn(u64, Option<u64>)>)
+			.await?;
 		let mut conn = self.conn();
 		dir.update_dir_last_listed_now(&conn)?;
 		dir.update_children(&mut conn, dirs, files)?;

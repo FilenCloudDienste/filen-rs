@@ -1,6 +1,7 @@
 use std::{borrow::Cow, ops::Deref};
 
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
 		chat::messages::ChatMessageEncrypted,
@@ -34,7 +35,7 @@ use crate::{
 	},
 	error::ResultExt,
 	fs::{
-		NonRootFSObject,
+		categories::{NonRootItemType, Normal},
 		dir::{RemoteDirectory, meta::DirectoryMeta},
 		file::{RemoteFile, meta::FileMeta},
 	},
@@ -822,7 +823,7 @@ impl<'a> ChatConversationNameEdited<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ItemFavorite(pub NonRootFSObject<'static>);
+pub struct ItemFavorite(pub NonRootItemType<'static, Normal>);
 impl<'a> ItemFavorite {
 	fn try_blocking_from_encrypted(
 		crypter: &impl MetaCrypter,
@@ -833,7 +834,7 @@ impl<'a> ItemFavorite {
 				let size = event.size.ok_or_else(|| {
 					Error::custom(ErrorKind::Response, "missing size for file favorite event")
 				})?;
-				NonRootFSObject::File(Cow::Owned(RemoteFile {
+				NonRootItemType::File(Cow::Owned(RemoteFile {
 					uuid: event.uuid,
 					meta: FileMeta::blocking_from_encrypted(
 						event.metadata.ok_or_else(|| {
@@ -881,7 +882,7 @@ impl<'a> ItemFavorite {
 					})?,
 				}))
 			}
-			filen_types::fs::ObjectType::Dir => NonRootFSObject::Dir(Cow::Owned(RemoteDirectory {
+			filen_types::fs::ObjectType::Dir => NonRootItemType::Dir(Cow::Owned(RemoteDirectory {
 				uuid: event.uuid,
 				parent: event.parent,
 				color: event.color.into_owned_cow(),
@@ -902,13 +903,7 @@ impl<'a> ItemFavorite {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify, serde::Serialize),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct ChatConversationParticipantNew {
 	pub chat: UuidStr,
 	pub participant: ChatParticipant,

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
 		chat::typing::ChatTypingType,
@@ -24,14 +25,7 @@ use crate::{
 
 use crate::socket::events::DecryptedSocketEvent;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(tag = "type", rename_all = "camelCase"),
-	tsify(into_wasm_abi, large_number_types_as_bigints, hashmap_as_object)
-)]
+#[js_type(export, no_deser, tagged)]
 pub enum SocketEvent {
 	/// Sent after successful authentication, including on reconnect
 	AuthSuccess,
@@ -154,14 +148,7 @@ impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct NewEvent {
 	pub uuid: UuidStr,
 	pub event_type: String,
@@ -185,14 +172,7 @@ impl From<&crate::socket::events::NewEvent<'_>> for NewEvent {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FileRename {
 	pub uuid: UuidStr,
 	pub metadata: FileMeta,
@@ -207,14 +187,7 @@ impl From<&crate::socket::events::FileRename<'_>> for FileRename {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FileArchiveRestored {
 	pub current_uuid: UuidStr,
 	pub file: File,
@@ -229,14 +202,7 @@ impl From<&crate::socket::events::FileArchiveRestored> for FileArchiveRestored {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FileNew {
 	pub file: File,
 }
@@ -249,14 +215,7 @@ impl From<&crate::socket::events::FileNew> for FileNew {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FileRestore {
 	pub file: File,
 }
@@ -269,14 +228,7 @@ impl From<&crate::socket::events::FileRestore> for FileRestore {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FileMove {
 	pub file: File,
 }
@@ -289,14 +241,7 @@ impl From<&crate::socket::events::FileMove> for FileMove {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FolderRename {
 	pub name: MaybeEncrypted<'static, str>,
 	pub uuid: UuidStr,
@@ -311,14 +256,7 @@ impl From<&crate::socket::events::FolderRename<'_>> for FolderRename {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FolderMove {
 	pub dir: Dir,
 }
@@ -331,14 +269,7 @@ impl From<&crate::socket::events::FolderMove> for FolderMove {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FolderSubCreated {
 	pub dir: Dir,
 }
@@ -351,14 +282,7 @@ impl From<&crate::socket::events::FolderSubCreated> for FolderSubCreated {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FolderRestore {
 	pub dir: Dir,
 }
@@ -371,14 +295,7 @@ impl From<&crate::socket::events::FolderRestore> for FolderRestore {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FolderColorChanged {
 	pub uuid: UuidStr,
 	pub color: DirColor,
@@ -393,14 +310,7 @@ impl From<&crate::socket::events::FolderColorChanged<'_>> for FolderColorChanged
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct ChatMessageNew {
 	pub msg: ChatMessage,
 }
@@ -413,14 +323,7 @@ impl From<&crate::socket::events::ChatMessageNew> for ChatMessageNew {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct ChatTyping {
 	pub chat: UuidStr,
 	pub sender_avatar: Option<String>,
@@ -450,14 +353,7 @@ impl From<&crate::socket::events::ChatTyping<'_>> for ChatTyping {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct ChatConversationsNew {
 	pub chat: Chat,
 }
@@ -470,14 +366,7 @@ impl From<&crate::socket::events::ChatConversationsNew> for ChatConversationsNew
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct NoteContentEdited {
 	pub note: UuidStr,
 	pub content: MaybeEncrypted<'static, str>,
@@ -503,14 +392,7 @@ impl From<&crate::socket::events::NoteContentEdited<'_>> for NoteContentEdited {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct NoteTitleEdited {
 	pub note: UuidStr,
 	pub new_title: MaybeEncrypted<'static, str>,
@@ -525,14 +407,7 @@ impl From<&crate::socket::events::NoteTitleEdited<'_>> for NoteTitleEdited {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct NoteParticipantNew {
 	pub note: UuidStr,
 	pub participant: NoteParticipant,
@@ -547,13 +422,7 @@ impl From<&crate::socket::events::NoteParticipantNew> for NoteParticipantNew {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown",),
-	derive(serde::Serialize, tsify::Tsify),
-	tsify(large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type]
 pub struct NoteNew {
 	pub note: UuidStr,
 }
@@ -563,14 +432,7 @@ impl From<&crate::socket::events::NoteNew> for NoteNew {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct ChatMessageEdited {
 	pub chat: UuidStr,
 	pub uuid: UuidStr,
@@ -593,14 +455,7 @@ impl From<&crate::socket::events::ChatMessageEdited<'_>> for ChatMessageEdited {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct ChatConversationNameEdited {
 	pub chat: UuidStr,
 	pub new_name: MaybeEncrypted<'static, str>,
@@ -615,14 +470,7 @@ impl From<&crate::socket::events::ChatConversationNameEdited<'_>> for ChatConver
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct ContactRequestReceived {
 	pub uuid: UuidStr,
 	pub sender_id: u64,
@@ -649,14 +497,7 @@ impl From<&crate::socket::events::ContactRequestReceived<'_>> for ContactRequest
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type(no_deser)]
 pub struct ItemFavorite {
 	pub item: NonRootItemTagged,
 }
@@ -669,14 +510,7 @@ impl From<&crate::socket::events::ItemFavorite> for ItemFavorite {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FolderMetadataChanged {
 	pub uuid: UuidStr,
 	pub meta: DirMeta,
@@ -691,14 +525,7 @@ impl From<&crate::socket::events::FolderMetadataChanged<'_>> for FolderMetadataC
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, tsify::Tsify),
-	serde(rename_all = "camelCase"),
-	tsify(large_number_types_as_bigints)
-)]
+#[js_type]
 pub struct FileMetadataChanged {
 	pub uuid: UuidStr,
 	pub name: MaybeEncrypted<'static, str>,

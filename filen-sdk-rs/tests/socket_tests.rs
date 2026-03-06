@@ -4,7 +4,8 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	fs::{
-		HasUUID, NonRootFSObject,
+		HasUUID,
+		categories::NonRootItemType,
 		dir::meta::DirectoryMetaChanges,
 		file::meta::{FileMeta, FileMetaChanges},
 	},
@@ -134,7 +135,7 @@ async fn test_websocket_file_events() {
 		.await
 		.unwrap();
 
-	let file_a = client.make_file_builder("file_a.txt", dir).build();
+	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).build();
 	let mut file_a = client
 		.upload_file(file_a.into(), b"file a contents")
 		.await
@@ -194,7 +195,7 @@ async fn test_websocket_file_events() {
 
 	let old_file_a = file_a;
 
-	let file_a = client.make_file_builder("file_a.txt", dir).build();
+	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).build();
 	let mut file_a = client
 		.upload_file(file_a.into(), b"file b contents")
 		.await
@@ -211,7 +212,7 @@ async fn test_websocket_file_events() {
 	)
 	.await;
 
-	client.set_favorite(&mut file_a, true).await.unwrap();
+	client.set_file_favorite(&mut file_a, true).await.unwrap();
 	let event = await_map_event(
 		&mut receiver,
 		|event| match event {
@@ -229,7 +230,7 @@ async fn test_websocket_file_events() {
 	)
 	.await;
 
-	assert_eq!(event.0, NonRootFSObject::File(Cow::Borrowed(&file_a)));
+	assert_eq!(event.0, NonRootItemType::File(Cow::Borrowed(&file_a)));
 
 	let old_version = client
 		.list_file_versions(&file_a)
@@ -320,7 +321,7 @@ async fn test_websocket_file_events() {
 	);
 
 	let new_parent = client
-		.create_dir(dir, "move_target".to_string())
+		.create_dir(&dir.into(), "move_target".to_string())
 		.await
 		.unwrap();
 
@@ -379,7 +380,10 @@ async fn test_websocket_folder_events() {
 		.await
 		.unwrap();
 
-	let mut dir_a = client.create_dir(dir, "a".to_string()).await.unwrap();
+	let mut dir_a = client
+		.create_dir(&dir.into(), "a".to_string())
+		.await
+		.unwrap();
 	let event = await_map_event(
 		&mut receiver,
 		|event| match event {
@@ -429,7 +433,7 @@ async fn test_websocket_folder_events() {
 	.await;
 	assert_eq!(event.0, dir_a);
 
-	client.set_favorite(&mut dir_a, true).await.unwrap();
+	client.set_dir_favorite(&mut dir_a, true).await.unwrap();
 	let event = await_map_event(
 		&mut receiver,
 		|event| match event {
@@ -446,7 +450,7 @@ async fn test_websocket_folder_events() {
 		"itemFavorite",
 	)
 	.await;
-	assert_eq!(event.0, NonRootFSObject::Dir(Cow::Borrowed(&dir_a)));
+	assert_eq!(event.0, NonRootItemType::Dir(Cow::Borrowed(&dir_a)));
 
 	client
 		.update_dir_metadata(
@@ -476,7 +480,7 @@ async fn test_websocket_folder_events() {
 	assert_eq!(event.meta, dir_a.meta);
 
 	let new_parent_dir = client
-		.create_dir(dir, "new_parent".to_string())
+		.create_dir(&dir.into(), "new_parent".to_string())
 		.await
 		.unwrap();
 	client

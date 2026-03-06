@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ConversionError;
 
-pub use uuid::UuidStr;
+pub use uuid::{UUID_STR_NIL, UuidStr};
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -152,6 +152,8 @@ mod uuid {
 
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
+
+	pub static UUID_STR_NIL: UuidStr = UuidStr([0u8; Hyphenated::LENGTH]);
 
 	#[cfg(feature = "uniffi")]
 	uniffi::custom_type!(UuidStr, String, {

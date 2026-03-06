@@ -85,11 +85,6 @@ impl HasUUID for RootDirectoryWithMeta {
 		&self.uuid
 	}
 }
-impl HasContents for RootDirectoryWithMeta {
-	fn uuid_as_parent(&self) -> ParentUuid {
-		self.uuid.into()
-	}
-}
 
 impl HasType for RootDirectoryWithMeta {
 	fn object_type(&self) -> ObjectType {
@@ -307,3 +302,19 @@ impl HasRemoteDirInfo for RemoteDirectory {
 		self.color.as_borrowed_cow()
 	}
 }
+
+#[derive(
+	Debug,
+	Clone,
+	PartialEq,
+	Eq,
+	HasUUID,
+	HasName,
+	HasMeta,
+	HasDirInfo,
+	HasDirMeta,
+	HasRemoteInfo,
+	HasRemoteDirInfo,
+	HasParent,
+)]
+pub struct LinkedDirectory(pub(crate) RemoteDirectory);

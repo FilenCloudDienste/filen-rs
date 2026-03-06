@@ -16,7 +16,7 @@ use crate::{
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 	fs::{
 		HasUUID,
-		dir::{HasUUIDContents, UnsharedDirectoryType},
+		categories::{DirType, Normal},
 		file::{
 			FileVersion,
 			meta::{FileMeta, FileMetaChanges},
@@ -77,7 +77,7 @@ impl Client {
 	pub async fn move_file(
 		&self,
 		file: &mut RemoteFile,
-		new_parent: &UnsharedDirectoryType<'_>,
+		new_parent: &DirType<'_, Normal>,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::r#move::post(
@@ -166,7 +166,7 @@ impl Client {
 	pub async fn file_exists(
 		&self,
 		name: &str,
-		parent: &impl HasUUIDContents,
+		parent: &DirType<'_, Normal>,
 	) -> Result<Option<UuidStr>, Error> {
 		api::v3::file::exists::post(
 			self.client(),
@@ -179,12 +179,8 @@ impl Client {
 		.map(|r| r.0)
 	}
 
-	pub fn make_file_builder(
-		&self,
-		name: impl Into<String>,
-		parent: &impl HasUUIDContents,
-	) -> FileBuilder {
-		FileBuilder::new(name, parent, self)
+	pub fn make_file_builder(&self, name: impl Into<String>, parent_uuid: UuidStr) -> FileBuilder {
+		FileBuilder::new(name, parent_uuid, self)
 	}
 
 	pub(crate) fn inner_get_file_writer<'a, F, Fut>(
@@ -291,7 +287,7 @@ impl Client {
 	#[cfg(feature = "malformed")]
 	pub async fn create_malformed_file(
 		&self,
-		parent: &impl HasUUIDContents,
+		parent: &DirType<'_, Normal>,
 		name: &str,
 		meta: &str,
 		mime: &str,

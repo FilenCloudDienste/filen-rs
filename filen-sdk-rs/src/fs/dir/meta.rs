@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
+use filen_macros::js_type;
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	traits::CowHelpers,
@@ -198,21 +199,21 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "wasm-full", derive(tsify::Tsify), tsify(from_wasm_abi))]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[derive(Default)]
+#[js_type(import)]
 pub struct DirectoryMetaChanges {
-	#[serde(default)]
-	#[cfg_attr(feature = "wasm-full", tsify(type = "string"))]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	name: Option<String>,
 	// double option because we need to distinguish between
 	// "not set" and "set to None"
-	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint | null"))]
-	#[serde(
-		default,
-		deserialize_with = "crate::serde::deserialize_double_option_timestamp"
+	#[cfg_attr(
+		feature = "wasm-full",
+		tsify(type = "bigint | null"),
+		serde(
+			default,
+			deserialize_with = "crate::serde::deserialize_double_option_timestamp"
+		)
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	created: Option<Option<DateTime<Utc>>>,

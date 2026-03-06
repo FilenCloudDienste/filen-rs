@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::fs::UuidStr;
 
+pub mod link;
+
 pub const ENDPOINT: &str = "v3/dir/size";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

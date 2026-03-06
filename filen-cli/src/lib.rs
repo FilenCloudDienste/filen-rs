@@ -5,8 +5,7 @@ use filen_sdk_rs::auth::{Client, StringifiedClient, http::ClientConfig, unauth::
 const AUTH_CONFIG_PREFIX: &str = "filen_cli_auth_config_1:";
 
 pub fn serialize_auth_config(client: &Client) -> Result<String> {
-	let sdk_config = client.to_stringified();
-	let sdk_config = serde_json::to_string(&sdk_config).unwrap();
+	let sdk_config = serde_json::to_string(&client.to_stringified()).unwrap();
 	let sdk_config = format!("{}{}", AUTH_CONFIG_PREFIX, base64.encode(sdk_config));
 	Ok(sdk_config)
 }

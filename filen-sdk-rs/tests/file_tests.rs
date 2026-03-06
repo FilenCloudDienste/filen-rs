@@ -2,11 +2,13 @@ use std::{borrow::Cow, sync::Arc};
 
 use chrono::{SubsecRound, Utc};
 use filen_macros::shared_test_runtime;
+
 use filen_sdk_rs::{
 	auth::Client,
 	crypto::shared::generate_random_base64_values,
 	fs::{
-		HasName, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
+		HasName, HasRemoteInfo, HasUUID,
+		categories::{NonRootFileType, NonRootItemType},
 		dir::RemoteDirectory,
 		file::{
 			client_impl::FileReaderSharedClientExt,
@@ -29,7 +31,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder(name, test_dir).build();
+	let file = client.make_file_builder(name, *test_dir.uuid()).build();
 	let file = client.upload_file(file.into(), contents).await.unwrap();
 
 	let found_file = match client
@@ -37,7 +39,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 		.await
 		.unwrap()
 	{
-		Some(UnsharedFSObject::File(file)) => file.into_owned(),
+		Some(NonRootFileType::File(file)) => file.into_owned(),
 		_ => panic!("Expected a file"),
 	};
 	assert_eq!(
@@ -76,7 +78,7 @@ async fn file_search() {
 	let test_dir = &resources.dir;
 
 	let second_dir = client
-		.create_dir(test_dir, "second_dir".to_string())
+		.create_dir(&test_dir.into(), "second_dir".to_string())
 		.await
 		.unwrap();
 
@@ -86,7 +88,9 @@ async fn file_search() {
 
 	let file_name = format!("{file_random_part_long}{file_random_part_short}.txt");
 
-	let file = client.make_file_builder(&file_name, &second_dir).build();
+	let file = client
+		.make_file_builder(&file_name, *second_dir.uuid())
+		.build();
 	let file = client.upload_file(file.into(), &[]).await.unwrap();
 
 	let found_items = client
@@ -97,7 +101,7 @@ async fn file_search() {
 	assert_eq!(
 		found_items,
 		vec![(
-			NonRootFSObject::File(Cow::Owned(file.clone())),
+			NonRootItemType::File(Cow::Owned(file.clone())),
 			format!(
 				"/{}/{}",
 				test_dir.name().unwrap(),
@@ -112,7 +116,7 @@ async fn file_search() {
 		.unwrap();
 
 	assert!(found_items.iter().any(|(item, _)| {
-		if let NonRootFSObject::File(found_file) = item {
+		if let NonRootItemType::File(found_file) = item {
 			*found_file.clone() == file
 		} else {
 			false
@@ -127,7 +131,9 @@ async fn file_trash() {
 	let test_dir = &resources.dir;
 
 	let file_name = "file.txt";
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
@@ -138,7 +144,7 @@ async fn file_trash() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 
 	let _lock = client
@@ -161,7 +167,7 @@ async fn file_trash() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 }
 
@@ -172,7 +178,9 @@ async fn file_delete_permanently() {
 	let test_dir = &resources.dir;
 
 	let file_name = "file.txt";
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
@@ -183,7 +191,7 @@ async fn file_delete_permanently() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 
 	client.delete_file_permanently(file.clone()).await.unwrap();
@@ -213,7 +221,9 @@ async fn file_link() {
 	let test_dir = &resources.dir;
 
 	let file_name = "file.txt";
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
@@ -244,7 +254,9 @@ async fn file_move() {
 	let test_dir = &resources.dir;
 
 	let file_name = "file.txt";
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
@@ -255,11 +267,11 @@ async fn file_move() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 
 	let second_dir = client
-		.create_dir(test_dir, "second_dir".to_string())
+		.create_dir(&test_dir.into(), "second_dir".to_string())
 		.await
 		.unwrap();
 	client
@@ -285,7 +297,7 @@ async fn file_move() {
 			))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 }
 
@@ -296,7 +308,9 @@ async fn file_update_meta() {
 	let test_dir = &resources.dir;
 
 	let file_name = "file.txt";
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
@@ -307,7 +321,7 @@ async fn file_update_meta() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 
 	client
@@ -330,7 +344,7 @@ async fn file_update_meta() {
 			))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 
 	let created = Utc::now() - chrono::Duration::days(1);
@@ -371,13 +385,15 @@ async fn file_exists() {
 
 	assert!(
 		client
-			.file_exists(file_name, test_dir)
+			.file_exists(file_name, &test_dir.into())
 			.await
 			.unwrap()
 			.is_none()
 	);
 
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
@@ -385,7 +401,7 @@ async fn file_exists() {
 
 	assert_eq!(
 		client
-			.file_exists(file.name().unwrap(), test_dir)
+			.file_exists(file.name().unwrap(), &test_dir.into())
 			.await
 			.unwrap(),
 		Some(*file.uuid())
@@ -403,13 +419,16 @@ async fn file_exists() {
 		.unwrap();
 
 	assert_eq!(
-		client.file_exists(new_name, test_dir).await.unwrap(),
+		client
+			.file_exists(new_name, &test_dir.into())
+			.await
+			.unwrap(),
 		Some(*file.uuid())
 	);
 
 	assert!(
 		client
-			.file_exists(file_name, test_dir)
+			.file_exists(file_name, &test_dir.into())
 			.await
 			.unwrap()
 			.is_none(),
@@ -423,7 +442,9 @@ async fn file_trash_empty() {
 	let test_dir = &resources.dir;
 
 	let file_name = "file.txt";
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
 		.await
@@ -434,7 +455,7 @@ async fn file_trash_empty() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), file_name))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::File(Cow::Borrowed(&file)))
+		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 	let _lock = client
 		.acquire_lock("test:rs:trash", std::time::Duration::from_secs(1), 600)
@@ -460,7 +481,9 @@ async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, content
 	let mut contents = vec![0u8; contents_len];
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
 	let file_name = format!("file_{contents_len}.txt");
-	let file = client.make_file_builder(file_name, test_dir).build();
+	let file = client
+		.make_file_builder(file_name, *test_dir.uuid())
+		.build();
 	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
 	client
 		.upload_file_from_reader(
@@ -501,15 +524,15 @@ async fn file_favorite() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder("test", test_dir).build();
+	let file = client.make_file_builder("test", *test_dir.uuid()).build();
 	let mut file = client.upload_file(file.into(), b"").await.unwrap();
 
 	assert!(!file.favorited());
 
-	client.set_favorite(&mut file, true).await.unwrap();
+	client.set_file_favorite(&mut file, true).await.unwrap();
 	assert!(file.favorited());
 
-	client.set_favorite(&mut file, false).await.unwrap();
+	client.set_file_favorite(&mut file, false).await.unwrap();
 	assert!(!file.favorited());
 }
 
@@ -519,7 +542,7 @@ async fn file_read_range() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder("test", test_dir).build();
+	let file = client.make_file_builder("test", *test_dir.uuid()).build();
 	let file = client
 		.upload_file(file.into(), b"Hello, Filen!")
 		.await
@@ -534,7 +557,7 @@ async fn file_read_range() {
 	reader.read_to_end(&mut buf).await.unwrap();
 	assert_eq!(str::from_utf8(&buf).unwrap(), "Hello");
 
-	let file = client.make_file_builder("test2", test_dir).build();
+	let file = client.make_file_builder("test2", *test_dir.uuid()).build();
 
 	let border_contents = b"Hello, Filen";
 	let mut big_contents = vec![0u8; 1024 * 1024 * 3 + border_contents.len() / 2];
@@ -566,7 +589,7 @@ async fn file_versions() {
 	let mut versions = Vec::new();
 	// TODO: when backend supports size in version info, use different lengths for these strings
 	for content in ["Version 1", "Version a 2", "Version as 3", "Version asd 4"] {
-		let base_file = client.make_file_builder("test", test_dir).build();
+		let base_file = client.make_file_builder("test", *test_dir.uuid()).build();
 		let file = client
 			.upload_file(base_file.clone().into(), content.as_bytes())
 			.await
@@ -630,7 +653,7 @@ async fn file_malformed_meta() {
 
 	let uuid = client
 		.create_malformed_file(
-			test_dir,
+			&test_dir.into(),
 			"malformed_meta",
 			"malformed_meta",
 			"asdfsadfasfd",
@@ -642,7 +665,11 @@ async fn file_malformed_meta() {
 	let file = client.get_file(uuid).await.unwrap();
 	assert!(matches!(file.get_meta(), FileMeta::Encrypted(_)));
 
-	let files = client.list_dir(test_dir).await.unwrap().1;
+	let files = client
+		.list_dir(&test_dir.into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap()
+		.1;
 	assert!(files.iter().any(|f| *f.uuid() == uuid));
 	assert_eq!(files.len(), 1);
 }

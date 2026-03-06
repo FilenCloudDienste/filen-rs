@@ -5,18 +5,24 @@ use filen_types::{fs::ObjectType, traits::CowHelpers};
 
 use crate::{
 	connect::fs::SharedDirectory,
-	fs::{HasMeta, HasName, HasRemoteInfo, HasType, HasUUID, UnsharedFSObject},
+	fs::{
+		HasMeta, HasName, HasRemoteInfo, HasType, HasUUID,
+		categories::{DirType, Normal},
+		dir::LinkedDirectory,
+	},
 };
 
 use super::{
-	HasContents, RemoteDirectory, RootDirectory, RootDirectoryWithMeta,
+	RemoteDirectory, RootDirectory, RootDirectoryWithMeta,
 	traits::{HasDirInfo, HasDirMeta},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, CowHelpers, CowFrom, HasUUID, HasContents)]
+#[derive(Clone, Debug, PartialEq, Eq, CowHelpers, CowFrom, HasUUID)]
 pub enum DirectoryType<'a> {
 	Root(Cow<'a, RootDirectory>),
-	RootWithMeta(Cow<'a, RootDirectoryWithMeta>),
+	LinkedRoot(Cow<'a, RootDirectoryWithMeta>),
+	LinkedDir(Cow<'a, LinkedDirectory>),
+	SharedDir(Cow<'a, SharedDirectory>),
 	Dir(Cow<'a, RemoteDirectory>),
 }
 
@@ -33,33 +39,18 @@ pub enum DirectoryTypeWithShareInfo<'a> {
 	Dir(Cow<'a, RemoteDirectory>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, CowHelpers, CowFrom, HasUUID, HasContents)]
-pub enum UnsharedDirectoryType<'a> {
-	Root(Cow<'a, RootDirectory>),
-	Dir(Cow<'a, RemoteDirectory>),
-}
-
-impl<'a> From<UnsharedDirectoryType<'a>> for DirectoryType<'a> {
-	fn from(dir: UnsharedDirectoryType<'a>) -> Self {
+impl<'a> From<DirType<'a, Normal>> for DirectoryType<'a> {
+	fn from(dir: DirType<'a, Normal>) -> Self {
 		match dir {
-			UnsharedDirectoryType::Root(dir) => DirectoryType::Root(dir),
-			UnsharedDirectoryType::Dir(dir) => DirectoryType::Dir(dir),
+			DirType::Root(dir) => DirectoryType::Root(dir),
+			DirType::Dir(dir) => DirectoryType::Dir(dir),
 		}
 	}
 }
 
-impl HasType for UnsharedDirectoryType<'_> {
+impl HasType for DirType<'_, Normal> {
 	fn object_type(&self) -> ObjectType {
 		ObjectType::Dir
-	}
-}
-
-impl<'a> From<UnsharedDirectoryType<'a>> for UnsharedFSObject<'a> {
-	fn from(dir: UnsharedDirectoryType<'a>) -> Self {
-		match dir {
-			UnsharedDirectoryType::Root(dir) => UnsharedFSObject::Root(dir),
-			UnsharedDirectoryType::Dir(dir) => UnsharedFSObject::Dir(dir),
-		}
 	}
 }
 
@@ -71,7 +62,6 @@ impl<'a> From<UnsharedDirectoryType<'a>> for UnsharedFSObject<'a> {
 	CowHelpers,
 	CowFrom,
 	HasUUID,
-	HasContents,
 	HasName,
 	HasDirInfo,
 	HasRemoteInfo,

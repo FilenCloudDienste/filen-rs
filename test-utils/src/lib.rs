@@ -8,7 +8,11 @@ use std::{
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
 	auth::{Client, http::ClientConfig, unauth::UnauthClient},
-	fs::{HasName, SharedRootItem, dir::RemoteDirectory},
+	fs::{
+		HasName,
+		categories::{RootItemType, Shared},
+		dir::RemoteDirectory,
+	},
 	sync::lock::ResourceLock,
 };
 
@@ -92,7 +96,10 @@ impl Resources {
 			BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
 		);
 		let client = self.client().await;
-		let test_dir = client.create_dir(client.root(), name).await.unwrap();
+		let test_dir = client
+			.create_dir(&(client.root()).into(), name)
+			.await
+			.unwrap();
 		TestResources {
 			client,
 			dir: test_dir,
@@ -106,7 +113,10 @@ impl Resources {
 		);
 		let client = self.client().await;
 		let lock = client.lock_drive().await.unwrap();
-		let test_dir = client.create_dir(client.root(), name).await.unwrap();
+		let test_dir = client
+			.create_dir(&(client.root()).into(), name)
+			.await
+			.unwrap();
 		(
 			TestResources {
 				client,
@@ -178,29 +188,35 @@ pub async fn set_up_contact_no_add<'a>(
 			}
 		},
 		async {
-			let (out_dirs, out_files) = client.list_out_shared(None).await.unwrap();
+			let (out_dirs, out_files) = client
+				.list_out_shared(None, None::<&fn(u64, Option<u64>)>)
+				.await
+				.unwrap();
 			let mut out_futures = out_dirs
 				.into_iter()
 				.filter_map(|d| {
 					if d.get_dir().name().unwrap().starts_with("compat-") {
 						None
 					} else {
-						Some(SharedRootItem::Dir(Cow::Owned(d)))
+						Some(RootItemType::<Shared>::Dir(Cow::Owned(d)))
 					}
 				})
 				.chain(
 					out_files
 						.into_iter()
-						.map(|f| SharedRootItem::File(Cow::Owned(f))),
+						.map(|f| RootItemType::<Shared>::File(Cow::Owned(f))),
 				)
 				.map(|item| async move {
-					let _ = client.remove_shared_item(item).await;
+					let _ = client.remove_shared_item(&item).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (out_futures.next().await).is_some() {}
 		},
 		async {
-			let (in_dirs, in_files) = share_client.list_in_shared().await.unwrap();
+			let (in_dirs, in_files) = share_client
+				.list_in_shared_root(None::<&fn(u64, Option<u64>)>)
+				.await
+				.unwrap();
 
 			let mut in_futures = in_dirs
 				.into_iter()
@@ -208,16 +224,16 @@ pub async fn set_up_contact_no_add<'a>(
 					if d.get_dir().name().unwrap().starts_with("compat-") {
 						None
 					} else {
-						Some(SharedRootItem::Dir(Cow::Owned(d)))
+						Some(RootItemType::<Shared>::Dir(Cow::Owned(d)))
 					}
 				})
 				.chain(
 					in_files
 						.into_iter()
-						.map(|f| SharedRootItem::File(Cow::Owned(f))),
+						.map(|f| RootItemType::<Shared>::File(Cow::Owned(f))),
 				)
 				.map(|item| async move {
-					let _ = share_client.remove_shared_item(item).await;
+					let _ = share_client.remove_shared_item(&item).await;
 				})
 				.collect::<FuturesUnordered<_>>();
 			while (in_futures.next().await).is_some() {}
@@ -244,8 +260,14 @@ pub async fn set_up_contact_no_add<'a>(
 		}
 	);
 	// tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-	let (out_dirs, _) = client.list_out_shared(None).await.unwrap();
-	let (in_dirs, _) = share_client.list_in_shared().await.unwrap();
+	let (out_dirs, _) = client
+		.list_out_shared(None, None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap_or_default();
+	let (in_dirs, _) = share_client
+		.list_in_shared_root(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
 	(lock1, lock2, out_dirs.len(), in_dirs.len())
 }
 

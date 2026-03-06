@@ -1,6 +1,6 @@
 use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
-use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
 		contacts::Contact,
@@ -8,28 +8,30 @@ use filen_types::{
 		file::link::edit::FileLinkAction,
 		item::{linked::ListedPublicLink, shared::SharedUser},
 	},
-	auth::FileEncryptionVersion,
 	fs::{ObjectType, UuidStr},
 	traits::CowHelpers,
 };
-use fs::{SharedDirectory, SharedFile};
+use fs::{SharedDirectory, SharedRootFile};
 use futures::stream::{FuturesUnordered, StreamExt};
-#[cfg(feature = "multi-threaded-crypto")]
-use rayon::iter::ParallelIterator;
-use serde::{Deserialize, Serialize};
 
 use crate::{
 	api,
 	auth::{Client, MetaKey, shared_client::SharedClient},
+	connect::fs::{SharedRootDirectory, SharingRole},
 	crypto::{file::FileKey, shared::MetaCrypter},
-	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
+	error::{Error, MetadataWasNotDecryptedError},
 	fs::{
-		HasMeta, HasMetaExt, HasParent, HasType, HasUUID, NonRootFSObject, SharedRootItem,
-		dir::{DirectoryType, HasUUIDContents, RemoteDirectory},
-		file::{RemoteFile, meta::FileMeta},
+		HasMeta, HasMetaExt, HasParent, HasType, HasUUID,
+		categories::{
+			DirType, Linked, NonRootItemType, Normal, RootItemType, Shared,
+			fs::CategoryFS,
+			shared::{list_all_in_shared, list_all_out_shared},
+		},
+		dir::{LinkedDirectory, RemoteDirectory},
+		file::{LinkedFile, RemoteFile},
 	},
-	runtime::{blocking_join, do_cpu_intensive},
-	util::{IntoMaybeParallelIterator, MaybeSendBoxFuture},
+	runtime::do_cpu_intensive,
+	util::MaybeSendBoxFuture,
 };
 
 pub mod contacts;
@@ -37,21 +39,7 @@ pub mod fs;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LinkedFileInfo {
-	pub uuid: UuidStr,
-	pub name: Option<String>,
-	pub mime: Option<String>,
-	pub hashed_password: Option<Vec<u8>>,
-	pub chunks: u64,
-	pub size: u64,
-	pub region: String,
-	pub bucket: String,
-	pub timestamp: DateTime<Utc>,
-	pub version: FileEncryptionVersion,
-}
-
-trait MakePasswordSaltAndHash {
+pub(crate) trait MakePasswordSaltAndHash {
 	fn password(&self) -> &PasswordState;
 	fn salt(&self) -> &[u8];
 
@@ -64,22 +52,16 @@ trait MakePasswordSaltAndHash {
 			}
 		};
 		Ok(Cow::Owned(
-			crate::crypto::connect::derive_password_for_link(password, self.salt())?,
+			crate::crypto::connect::derive_password_for_link(password, Some(self.salt()))?,
 		))
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-#[serde(tag = "type")]
+#[derive(Default)]
+#[js_type(tagged)]
 pub enum PasswordState {
 	Known(String),
-	#[serde(with = "serde_bytes")]
+	#[cfg_attr(feature = "wasm-full", serde(with = "serde_bytes"))]
 	Hashed(Vec<u8>),
 	#[default]
 	None,
@@ -100,22 +82,13 @@ impl PasswordState {
 }
 
 #[derive(Debug, Clone, Eq)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify, Serialize, Deserialize),
-	tsify(into_wasm_abi, from_wasm_abi),
-	serde(tag = "type")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export, no_default)]
 pub struct FilePublicLink {
 	link_uuid: UuidStr,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		serde(with = "serde_bytes")
-	)]
+	#[cfg_attr(feature = "wasm-full", serde(with = "serde_bytes"))]
 	salt: Option<Vec<u8>>,
 }
 
@@ -132,7 +105,7 @@ impl PartialEq for FilePublicLink {
 				} else {
 					match crate::crypto::connect::derive_password_for_link(
 						Some(a),
-						a_salt.as_deref().unwrap_or(&[]),
+						a_salt.as_deref(),
 					) {
 						Ok(hash) => b == &hash,
 						Err(_) => false,
@@ -160,6 +133,19 @@ impl FilePublicLink {
 	}
 
 	pub fn set_password(&mut self, password: String) {
+		if let PasswordState::Known(ref current) = self.password
+			&& &password == current
+		{
+			return;
+		}
+		if let PasswordState::Hashed(ref current_hashed) = self.password
+			&& let Ok(new_hashed) = crate::crypto::connect::derive_password_for_link(
+				Some(&password),
+				self.salt.as_deref(),
+			) && &new_hashed == current_hashed
+		{
+			return;
+		}
 		self.password = PasswordState::Known(password);
 		self.salt = Some(rand::random::<[u8; 256]>().to_vec());
 	}
@@ -200,15 +186,9 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(tsify::Tsify, Serialize, Deserialize),
-	tsify(into_wasm_abi, from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export)]
 pub struct DirPublicLink {
-	link_uuid: UuidStr,
+	pub(crate) link_uuid: UuidStr,
 	link_key: Option<MetaKey>,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
@@ -368,9 +348,8 @@ impl Client {
 
 	pub(crate) async fn update_item_with_maybe_connected_parent(
 		&self,
-		item: impl Into<NonRootFSObject<'_>>,
+		item: NonRootItemType<'_, Normal>,
 	) -> Result<(), Error> {
-		let item = item.into();
 		let uuid = (*item.parent()).try_into()?;
 
 		let (linked, shared, items_to_process) = futures::try_join!(
@@ -383,15 +362,21 @@ impl Client {
 					.await
 			},
 			async move {
-				if let NonRootFSObject::Dir(dir) = item {
-					let (dirs, files) = self.list_dir_recursive_no_callback(dir.as_ref()).await?;
+				if let NonRootItemType::Dir(dir) = item {
+					let (dirs, files) = Normal::list_dir_recursive(
+						self,
+						&DirType::Dir(Cow::Borrowed(dir.as_ref())),
+						None::<&fn(u64, Option<u64>)>,
+						(),
+					)
+					.await?;
 
 					// not using the closure here causes a borrow checker error
 					#[allow(clippy::redundant_closure)]
-					Ok(std::iter::once(NonRootFSObject::Dir(dir))
-						.chain(dirs.into_iter().map(|d| NonRootFSObject::from(d)))
-						.chain(files.into_iter().map(|f| NonRootFSObject::from(f)))
-						.collect::<Vec<NonRootFSObject<'_>>>())
+					Ok(std::iter::once(NonRootItemType::<Normal>::Dir(dir))
+						.chain(dirs.into_iter().map(|d| NonRootItemType::from(d)))
+						.chain(files.into_iter().map(|f| NonRootItemType::from(f)))
+						.collect::<Vec<NonRootItemType<'_, Normal>>>())
 				} else {
 					Ok(vec![item])
 				}
@@ -436,15 +421,17 @@ impl Client {
 		Ok(())
 	}
 
-	pub(crate) async fn add_item_to_directory_link<I>(
+	pub(crate) async fn add_item_to_directory_link(
 		&self,
-		item: &I,
+		item: &NonRootItemType<'_, Normal>,
 		link: &ListedPublicLink<'_>,
 		link_crypter: &impl MetaCrypter,
-	) -> Result<(), Error>
-	where
-		I: HasParent + HasMeta + HasUUID + HasType + ?Sized,
-	{
+	) -> Result<(), Error> {
+		let meta = match item {
+			NonRootItemType::Dir(cow) => cow.get_encrypted_meta(link_crypter).await,
+			NonRootItemType::File(cow) => cow.get_encrypted_meta(link_crypter).await,
+		};
+
 		api::v3::dir::link::add::post(
 			self.client(),
 			&api::v3::dir::link::add::Request {
@@ -452,10 +439,7 @@ impl Client {
 				parent: Some((*item.parent()).try_into()?),
 				link_uuid: link.link_uuid,
 				r#type: item.object_type(),
-				metadata: item
-					.get_encrypted_meta(link_crypter)
-					.await
-					.ok_or(MetadataWasNotDecryptedError)?,
+				metadata: meta.ok_or(MetadataWasNotDecryptedError)?,
 				key: link.link_key.as_borrowed_cow(),
 				expiration: PublicLinkExpiration::Never,
 			},
@@ -470,11 +454,11 @@ impl Client {
 		progress_callback: &F,
 	) -> Result<DirPublicLink, Error>
 	where
-		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		let public_link = DirPublicLink::new(self.make_meta_key());
 		let (dirs, files) = self
-			.list_dir_recursive(DirectoryType::Dir(Cow::Borrowed(dir)), progress_callback)
+			.list_dir_recursive::<Normal, _>(&DirType::Dir(Cow::Borrowed(dir)), progress_callback)
 			.await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
@@ -515,14 +499,16 @@ impl Client {
 
 		// link descendants
 		for dir in dirs {
-			futures.push(Box::pin(
-				async move { self.add_item_to_directory_link(&dir, link, key).await },
-			) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+			futures.push(Box::pin(async move {
+				self.add_item_to_directory_link(&(&dir).into(), link, key)
+					.await
+			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 		for file in files {
-			futures.push(Box::pin(
-				async move { self.add_item_to_directory_link(&file, link, key).await },
-			) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+			futures.push(Box::pin(async move {
+				self.add_item_to_directory_link(&(&file).into(), link, key)
+					.await
+			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 
 		while let Some(result) = futures.next().await {
@@ -542,7 +528,7 @@ impl Client {
 		// we should fix this with the v4 api
 		let tmp_salt = rand::random::<[u8; 256]>();
 		let password_hash =
-			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, &tmp_salt))
+			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, None))
 				.await?;
 
 		api::v3::file::link::edit::post(
@@ -603,7 +589,7 @@ impl Client {
 				false,
 				Cow::Owned(
 					do_cpu_intensive(|| {
-						crate::crypto::connect::derive_password_for_link(None, &tmp_salt)
+						crate::crypto::connect::derive_password_for_link(None, None)
 					})
 					.await?,
 				),
@@ -635,7 +621,7 @@ impl Client {
 	) -> Result<(), Error> {
 		let tmp_salt = rand::random::<[u8; 256]>();
 		let password_hash =
-			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, &tmp_salt))
+			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, None))
 				.await?;
 
 		api::v3::file::link::edit::post(
@@ -698,50 +684,6 @@ impl Client {
 	}
 
 	// doesn't require auth, should be moved to a different module in the future
-	pub async fn get_linked_file(
-		&self,
-		link: &FilePublicLink,
-		link_key: Cow<'_, str>,
-	) -> Result<LinkedFileInfo, Error> {
-		let response = api::v3::file::link::info::post(
-			self.unauthed(),
-			&api::v3::file::link::info::Request {
-				uuid: link.link_uuid,
-				password: Cow::Borrowed(&link.get_password_hash()?),
-			},
-		)
-		.await?;
-
-		let crypter = FileKey::from_string_and_meta(link_key, &response.mime)?.to_meta_key()?;
-
-		let (decrypted_size, decrypted_name, decrypted_mime) = futures::join!(
-			crypter.decrypt_meta(&response.size),
-			crypter.decrypt_meta(&response.name),
-			crypter.decrypt_meta(&response.mime),
-		);
-
-		let decrypted_size = decrypted_size?;
-		let size = decrypted_size.parse::<u64>().map_err(|_| {
-			Error::custom(
-				ErrorKind::Conversion,
-				format!("Failed to parse size: {decrypted_size}"),
-			)
-		})?;
-
-		let file_info = LinkedFileInfo {
-			uuid: response.uuid,
-			name: decrypted_name.ok(),
-			mime: decrypted_mime.ok(),
-			hashed_password: response.password.map(|v| v.into_owned()),
-			chunks: response.chunks,
-			size,
-			region: response.region.into_owned(),
-			bucket: response.bucket.into_owned(),
-			timestamp: response.timestamp,
-			version: response.version,
-		};
-		Ok(file_info)
-	}
 
 	pub async fn get_dir_link_status(
 		&self,
@@ -799,10 +741,15 @@ impl Client {
 		Ok(())
 	}
 
-	async fn inner_share_item<I>(&self, item: &I, user: &SharedUser<'_>) -> Result<(), Error>
-	where
-		I: HasParent + HasMeta + HasUUID + HasType,
-	{
+	async fn inner_share_item(
+		&self,
+		item: &NonRootItemType<'_, Normal>,
+		user: &SharedUser<'_>,
+	) -> Result<(), Error> {
+		let meta = match item {
+			NonRootItemType::Dir(cow) => cow.get_rsa_encrypted_meta(&user.public_key).await,
+			NonRootItemType::File(cow) => cow.get_rsa_encrypted_meta(&user.public_key).await,
+		};
 		api::v3::item::share::post(
 			self.client(),
 			&api::v3::item::share::Request {
@@ -810,10 +757,7 @@ impl Client {
 				parent: Some((*item.parent()).try_into()?),
 				email: user.email.as_borrowed_cow(),
 				r#type: item.object_type(),
-				metadata: item
-					.get_rsa_encrypted_meta(&user.public_key)
-					.await
-					.ok_or(MetadataWasNotDecryptedError)?,
+				metadata: meta.ok_or(MetadataWasNotDecryptedError)?,
 			},
 		)
 		.await?;
@@ -830,7 +774,7 @@ impl Client {
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		let (dirs, files) = self
-			.list_dir_recursive(DirectoryType::Dir(Cow::Borrowed(dir)), progress_callback)
+			.list_dir_recursive::<Normal, _>(&DirType::Dir(Cow::Borrowed(dir)), progress_callback)
 			.await?;
 
 		let shared_user = client.into();
@@ -856,17 +800,15 @@ impl Client {
 		}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 
 		for dir in dirs {
-			futures.push(
-				Box::pin(async move { self.inner_share_item(&dir, shared_user).await })
-					as MaybeSendBoxFuture<'_, Result<(), Error>>,
-			);
+			futures.push(Box::pin(async move {
+				self.inner_share_item(&(&dir).into(), shared_user).await
+			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 
 		for file in files {
-			futures.push(
-				Box::pin(async move { self.inner_share_item(&file, shared_user).await })
-					as MaybeSendBoxFuture<'_, Result<(), Error>>,
-			);
+			futures.push(Box::pin(async move {
+				self.inner_share_item(&(&file).into(), shared_user).await
+			}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
 		}
 		while let Some(result) = futures.next().await {
 			match result {
@@ -895,109 +837,45 @@ impl Client {
 		.await
 	}
 
-	pub(crate) async fn inner_list_out_shared(
-		&self,
-		dir: Option<&impl HasUUIDContents>,
-		contact: Option<&Contact<'_>>,
-	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		let response = api::v3::shared::out::post(
-			self.client(),
-			&api::v3::shared::out::Request {
-				uuid: dir.map(|d| *d.uuid()),
-				receiver_id: contact.map(|u| u.user_id),
-			},
-		)
-		.await?;
-
-		let crypter = self.crypter();
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| {
-					response
-						.dirs
-						.into_maybe_par_iter()
-						.map(|d| SharedDirectory::blocking_from_shared_out(d, &*crypter))
-						.collect::<Result<Vec<_>, _>>()
-				},
-				|| {
-					response
-						.files
-						.into_maybe_par_iter()
-						.map(|f| SharedFile::blocking_from_shared_out(f, &*crypter))
-						.collect::<Result<Vec<_>, _>>()
-				}
-			);
-			Ok((dirs?, files?))
-		})
-		.await
-	}
-
-	pub async fn list_out_shared(
+	pub async fn list_out_shared<F>(
 		&self,
 		contact: Option<&Contact<'_>>,
-	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_out_shared(None::<&RemoteDirectory>, contact)
-			.await
+		callback: Option<&F>,
+	) -> Result<(Vec<SharedRootDirectory>, Vec<SharedRootFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		list_all_out_shared(self, contact.map(|c| c.user_id), callback).await
 	}
 
-	pub async fn list_out_shared_dir(
+	pub async fn list_shared_dir<F>(
 		&self,
-		dir: &impl HasUUIDContents,
-		contact: &Contact<'_>,
-	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_out_shared(Some(dir), Some(contact)).await
+		dir: &DirType<'_, Shared>,
+		sharer_info: &SharingRole,
+		callback: Option<&F>,
+	) -> Result<(Vec<SharedDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		Shared::list_dir(self, dir, callback, sharer_info).await
 	}
 
-	pub(crate) async fn inner_list_in_shared(
+	pub async fn list_in_shared_root<F>(
 		&self,
-		dir: Option<&impl HasUUIDContents>,
-	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		let response = api::v3::shared::r#in::post(
-			self.client(),
-			&api::v3::shared::r#in::Request {
-				uuid: dir.map(|d| *d.uuid()),
-			},
-		)
-		.await?;
-
-		let priv_key = self.private_key();
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| {
-					response
-						.dirs
-						.into_maybe_par_iter()
-						.map(|d| SharedDirectory::blocking_from_shared_in(d, priv_key))
-						.collect::<Result<Vec<_>, _>>()
-				},
-				|| {
-					response
-						.files
-						.into_maybe_par_iter()
-						.map(|f| SharedFile::blocking_from_shared_in(f, priv_key))
-						.collect::<Result<Vec<_>, _>>()
-				}
-			);
-			Ok((dirs?, files?))
-		})
-		.await
+		callback: Option<&F>,
+	) -> Result<(Vec<SharedRootDirectory>, Vec<SharedRootFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		list_all_in_shared(self, callback).await
 	}
 
-	pub async fn list_in_shared(&self) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_in_shared(None::<&RemoteDirectory>).await
-	}
-
-	pub async fn list_in_shared_dir(
-		&self,
-		dir: &impl HasUUIDContents,
-	) -> Result<(Vec<SharedDirectory>, Vec<SharedFile>), Error> {
-		self.inner_list_in_shared(Some(dir)).await
-	}
-
-	pub async fn remove_shared_item(&self, item: SharedRootItem<'_>) -> Result<(), Error> {
-		match item.role() {
+	pub async fn remove_shared_item(&self, item: &RootItemType<'_, Shared>) -> Result<(), Error> {
+		let share_role = match item {
+			RootItemType::Dir(dir) => &dir.info.sharing_role,
+			RootItemType::File(file) => &file.sharing_role,
+		};
+		match share_role {
 			fs::SharingRole::Sharer(_) => {
 				api::v3::item::shared::r#in::remove::post(
 					self.client(),
@@ -1020,22 +898,20 @@ impl Client {
 }
 
 #[allow(private_bounds, async_fn_in_trait)]
-pub trait PublicLinkSharedClientExt<'a>: SharedClient {
-	// async fn decode_public_file_link(
-	// 	&self,
-	// 	link_uuid: UuidStr,
-	// 	link_password: Option<String>,
-	// 	link_key: String,
-	// ) -> Result<LinkedFile, Error>;
+pub trait PublicLinkSharedClientExt: SharedClient {
+	async fn get_linked_file(
+		&self,
+		link_uuid: UuidStr,
+		file_key: Cow<'_, str>,
+		password: Option<&str>,
+	) -> Result<LinkedFile, Error>;
 
-	/// The returned dirs here should not be used as normal RemoteDirectories,
-	/// they can only be listed via list_linked_dir again.
 	async fn list_linked_dir<F>(
 		&self,
-		dir: &dyn HasUUIDContents,
+		dir: &DirType<'_, Linked>,
 		link: &DirPublicLink,
 		callback: &F,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync;
 
@@ -1043,187 +919,85 @@ pub trait PublicLinkSharedClientExt<'a>: SharedClient {
 	/// they can only be listed via list_linked_dir again.
 	async fn list_linked_dir_recursive<F>(
 		&self,
-		dir: &dyn HasUUIDContents,
+		dir: &DirType<'_, Linked>,
 		link: &DirPublicLink,
 		callback: &F,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync;
 }
 
-impl<'a, T> PublicLinkSharedClientExt<'a> for T
+impl<T> PublicLinkSharedClientExt for T
 where
 	T: SharedClient,
 {
-	// async fn decode_public_file_link(
-	// 	&self,
-	// 	link_uuid: UuidStr,
-	// 	link_password: Option<String>,
-	// 	link_key: String,
-	// ) -> Result<LinkedFile, Error> {
-	// 	let info = api::v3::file::link::password::post(
-	// 		self.get_unauth_client(),
-	// 		&api::v3::file::link::password::Request { uuid: link_uuid },
-	// 	)
-	// 	.await?;
-
-	// 	let password_hash = match (info.has_password, link_password.as_deref()) {
-	// 		(true, None) => {
-	// 			return Err(Error::custom(
-	// 				ErrorKind::Unauthenticated,
-	// 				"Password required for this link",
-	// 			));
-	// 		}
-	// 		(_, maybe_pw) => {
-	// 			crate::crypto::connect::derive_password_for_link(maybe_pw, &info.salt)?
-	// 		}
-	// 	};
-
-	// 	let response = api::v3::file::link::info::post(
-	// 		self.get_unauth_client(),
-	// 		&api::v3::file::link::info::Request {
-	// 			uuid: link_uuid,
-	// 			password: Cow::Borrowed(&password_hash),
-	// 		},
-	// 	)
-	// 	.await?;
-
-	// 	let file_key = FileKey::from_string_and_meta(Cow::Owned(link_key), &response.mime)?;
-	// 	let meta_key = file_key.to_meta_key()?;
-	// 	do_cpu_intensive(|| LinkedFile::blocking_from_response(file_key, meta_key, response)).await
-	// }
-
-	async fn list_linked_dir<F>(
+	async fn get_linked_file(
 		&self,
-		dir: &dyn HasUUIDContents,
-		link: &DirPublicLink,
-		callback: &F,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
-	where
-		F: Fn(u64, Option<u64>) + Send + Sync,
-	{
-		let response = api::v3::dir::link::content::post_large(
+		link_uuid: UuidStr,
+		file_key: Cow<'_, str>,
+		password: Option<&str>,
+	) -> Result<LinkedFile, Error> {
+		let (password, salt) = match password {
+			None => (None, None),
+			Some(password) => {
+				let resp = api::v3::file::link::password::post(
+					self.get_unauth_client(),
+					&api::v3::file::link::password::Request { uuid: link_uuid },
+				)
+				.await?;
+				(Some(password), Some(resp.salt))
+			}
+		};
+		let password_hashed = do_cpu_intensive(|| {
+			crate::crypto::connect::derive_password_for_link(password, salt.as_deref())
+		})
+		.await?;
+		let response = api::v3::file::link::info::post(
 			self.get_unauth_client(),
-			&api::v3::dir::link::content::Request {
-				uuid: link.link_uuid,
-				password: Cow::Borrowed(&link.get_password_hash()?),
-				parent: *dir.uuid(),
+			&api::v3::file::link::info::Request {
+				uuid: link_uuid,
+				password: Cow::Borrowed(&password_hashed),
 			},
-			Some(callback),
 		)
 		.await?;
 
-		let crypter = link.crypter().ok_or(MetadataWasNotDecryptedError)?;
+		let key = FileKey::from_string_and_meta(file_key, &response.mime)?;
+		do_cpu_intensive(|| LinkedFile::blocking_from_response(key, response)).await
+	}
 
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
-					.into_maybe_par_iter()
-					.map(|d| {
-						RemoteDirectory::blocking_from_encrypted(
-							d.uuid,
-							d.parent.into(),
-							d.color,
-							false,
-							d.timestamp,
-							d.metadata,
-							crypter,
-						)
-					})
-					.collect::<Vec<_>>(),
-				|| response
-					.files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							f.parent.into(),
-							f.size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							false,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, Error>>()
-			);
-
-			Ok((dirs, files?))
-		})
+	async fn list_linked_dir<F>(
+		&self,
+		dir: &DirType<'_, Linked>,
+		link: &DirPublicLink,
+		callback: &F,
+	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		Linked::list_dir(
+			self.get_unauth_client(),
+			dir,
+			Some(callback),
+			Cow::Borrowed(link),
+		)
 		.await
 	}
 
 	async fn list_linked_dir_recursive<F>(
 		&self,
-		dir: &dyn HasUUIDContents,
+		dir: &DirType<'_, Linked>,
 		link: &DirPublicLink,
 		callback: &F,
-	) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let response = api::v3::dir::download::link::post_large(
+		Linked::list_dir_recursive(
 			self.get_unauth_client(),
-			&api::v3::dir::download::link::Request {
-				uuid: link.link_uuid,
-				password: Cow::Borrowed(&link.get_password_hash()?),
-				parent: *dir.uuid(),
-				skip_cache: false,
-			},
+			dir,
 			Some(callback),
+			Cow::Borrowed(link),
 		)
-		.await?;
-
-		let crypter = link.crypter().ok_or(MetadataWasNotDecryptedError)?;
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
-					.into_maybe_par_iter()
-					.filter_map(|response_dir| {
-						Some(RemoteDirectory::blocking_from_encrypted(
-							response_dir.uuid,
-							match response_dir.parent {
-								// the request returns the base dir for the request as one of its dirs, we filter it out here
-								None => return None,
-								Some(parent) => parent,
-							},
-							response_dir.color,
-							response_dir.favorited,
-							response_dir.timestamp,
-							response_dir.meta,
-							crypter,
-						))
-					})
-					.collect::<Vec<_>>(),
-				|| response
-					.files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							f.parent,
-							f.chunks_size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							f.favorited,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, _>>()
-			);
-			Ok((dirs, files?))
-		})
 		.await
 	}
 }

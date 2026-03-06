@@ -5,32 +5,27 @@ use filen_types::fs::ObjectType;
 use crate::{
 	api,
 	auth::Client,
-	error::{Error, InvalidTypeError},
+	error::Error,
 	fs::{
-		HasType, HasUUID, NonRootFSObject, SetRemoteInfo, UnsharedFSObject,
-		dir::UnsharedDirectoryType,
+		HasUUID, SetRemoteInfo,
+		categories::{
+			DirType, NonRootFileType, NonRootItemType, Normal,
+			fs::{
+				CategoryFSExt, GetItemsResponseError, GetItemsResponseSuccess,
+				ObjectOrRemainingPath,
+			},
+		},
+		dir::RemoteDirectory,
+		file::RemoteFile,
 	},
-	util::PathIteratorExt,
 };
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ObjectOrRemainingPath<'a, 'b> {
-	Object(UnsharedFSObject<'a>),
-	RemainingPath(&'b str),
-}
-pub type GetItemsResponseSuccess<'a, 'b> = (
-	Vec<UnsharedDirectoryType<'a>>,
-	ObjectOrRemainingPath<'a, 'b>,
-);
-pub type GetItemsResponseError<'a> = (Vec<UnsharedDirectoryType<'a>>, UnsharedFSObject<'a>);
 
 impl Client {
 	pub async fn find_item_at_path<'a>(
 		&'a self,
 		path: &str,
-	) -> Result<Option<UnsharedFSObject<'a>>, Error> {
-		let (_, item): (_, ObjectOrRemainingPath<'a, '_>) =
+	) -> Result<Option<NonRootFileType<'a, Normal>>, Error> {
+		let (_, item): (_, ObjectOrRemainingPath<'a, '_, Normal>) =
 			self.get_items_in_path(path).await.map_err(|(e, _, _)| e)?;
 		match item {
 			ObjectOrRemainingPath::Object(fs_object) => Ok(Some(fs_object)),
@@ -38,67 +33,18 @@ impl Client {
 		}
 	}
 
-	pub async fn get_items_in_path_starting_at<'a, 'b>(
-		&'a self,
-		path: &'b str,
-		mut curr_dir: UnsharedDirectoryType<'a>,
-	) -> Result<GetItemsResponseSuccess<'a, 'b>, (Error, GetItemsResponseError<'a>, &'b str)> {
-		let mut dirs: Vec<UnsharedDirectoryType> =
-			Vec::with_capacity(path.chars().filter(|c| *c == '/').count() + 1);
-
-		let mut path_iter = path.path_iter().peekable();
-		let mut last_rest_of_path = path;
-		let _lock = match self.lock_drive().await {
-			Ok(lock) => lock,
-			Err(e) => return Err((e, (dirs, curr_dir.into()), path)),
-		};
-		while let Some((component, rest_of_path)) = path_iter.next() {
-			match self.find_item_in_dir(&curr_dir, component).await {
-				Ok(Some(NonRootFSObject::Dir(dir))) => {
-					let old_dir = std::mem::replace(&mut curr_dir, UnsharedDirectoryType::Dir(dir));
-					dirs.push(old_dir);
-					if path_iter.peek().is_none() {
-						return Ok((dirs, ObjectOrRemainingPath::Object(curr_dir.into())));
-					}
-					last_rest_of_path = rest_of_path;
-					continue;
-				}
-				Ok(Some(NonRootFSObject::File(file))) => {
-					let file = UnsharedFSObject::File(file);
-					dirs.push(curr_dir);
-					if path_iter.peek().is_some() {
-						return Err((
-							InvalidTypeError {
-								actual: ObjectType::File,
-								expected: ObjectType::Dir,
-							}
-							.into(),
-							(dirs, file),
-							rest_of_path,
-						));
-					}
-					return Ok((dirs, ObjectOrRemainingPath::Object(file)));
-				}
-				Ok(None) => {
-					dirs.push(curr_dir);
-					return Ok((
-						dirs,
-						ObjectOrRemainingPath::RemainingPath(last_rest_of_path),
-					));
-				}
-				Err(e) => return Err((e, (dirs, curr_dir.into()), rest_of_path)),
-			}
-		}
-		Ok((dirs, ObjectOrRemainingPath::Object(curr_dir.into())))
-	}
-
 	pub async fn get_items_in_path<'a, 'b>(
 		&'a self,
 		path: &'b str,
-	) -> Result<GetItemsResponseSuccess<'a, 'b>, (Error, GetItemsResponseError<'a>, &'b str)> {
-		self.get_items_in_path_starting_at(
+	) -> Result<
+		GetItemsResponseSuccess<'a, 'b, Normal>,
+		(Error, GetItemsResponseError<'a, Normal>, &'b str),
+	> {
+		<Normal as CategoryFSExt>::get_items_in_path_starting_at(
+			self,
 			path,
-			UnsharedDirectoryType::Root(Cow::Borrowed(self.root())),
+			DirType::<Normal>::Root(Cow::Borrowed(self.root())),
+			(),
 		)
 		.await
 	}
@@ -108,20 +54,46 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn set_favorite<T>(&self, object: &mut T, value: bool) -> Result<(), Error>
-	where
-		T: SetRemoteInfo + HasUUID + HasType,
-	{
+	pub async fn set_dir_favorite(
+		&self,
+		dir: &mut RemoteDirectory,
+		value: bool,
+	) -> Result<(), Error> {
 		let resp = api::v3::item::favorite::post(
 			self.client(),
 			&api::v3::item::favorite::Request {
-				uuid: *object.uuid(),
-				r#type: object.object_type(),
+				uuid: *dir.uuid(),
+				r#type: ObjectType::Dir,
 				value,
 			},
 		)
 		.await?;
-		object.set_favorited(resp.value);
+		dir.set_favorited(resp.value);
 		Ok(())
+	}
+
+	pub async fn set_file_favorite(&self, file: &mut RemoteFile, value: bool) -> Result<(), Error> {
+		let resp = api::v3::item::favorite::post(
+			self.client(),
+			&api::v3::item::favorite::Request {
+				uuid: *file.uuid(),
+				r#type: ObjectType::File,
+				value,
+			},
+		)
+		.await?;
+		file.set_favorited(resp.value);
+		Ok(())
+	}
+
+	pub async fn set_favorite(
+		&self,
+		object: &mut NonRootItemType<'static, Normal>,
+		value: bool,
+	) -> Result<(), Error> {
+		match object {
+			NonRootItemType::Dir(dir) => self.set_dir_favorite(dir.to_mut(), value).await,
+			NonRootItemType::File(file) => self.set_file_favorite(file.to_mut(), value).await,
+		}
 	}
 }

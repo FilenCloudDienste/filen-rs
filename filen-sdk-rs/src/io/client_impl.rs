@@ -27,8 +27,8 @@ use crate::{
 use crate::{
 	ErrorKind,
 	error::ErrorExt,
-	fs::dir::{DirectoryType, HasUUIDContents},
-	io::{FilenMetaExt, dir_download::DirDownloadCallback, meta_ext::FileTimesExt},
+	fs::categories::{DirType, Normal},
+	io::{FilenMetaExt, meta_ext::FileTimesExt},
 };
 
 const IO_BUFFER_SIZE: usize = 1024 * 64; // 64 KiB
@@ -153,56 +153,56 @@ impl Client {
 			.await
 	}
 
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub async fn download_dir_recursively<C>(
-		self: Arc<Self>,
-		dir_path: String,
-		callback: impl Deref<Target = C>,
-		target: DirectoryType<'_>,
-	) -> Result<(), Error>
-	where
-		C: DirDownloadCallback + ?Sized,
-	{
-		use filen_types::traits::CowHelpers;
+	// #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	// pub async fn download_dir_recursively<C>(
+	// 	self: Arc<Self>,
+	// 	dir_path: String,
+	// 	callback: impl Deref<Target = C>,
+	// 	target: DirectoryType<'_>,
+	// ) -> Result<(), Error>
+	// where
+	// 	C: DirDownloadCallback + ?Sized,
+	// {
+	// 	use filen_types::traits::CowHelpers;
 
-		use crate::util::AtomicDropCanceller;
+	// 	use crate::util::AtomicDropCanceller;
 
-		let drop_canceller = AtomicDropCanceller::default();
+	// 	let drop_canceller = AtomicDropCanceller::default();
 
-		let callback_ref = callback.deref();
+	// 	let callback_ref = callback.deref();
 
-		let (tree, stats) = super::fs_tree::build_fs_tree_from_remote_iterator(
-			&self,
-			target.as_borrowed_cow(),
-			&mut |errors| {
-				callback_ref.on_scan_errors(errors);
-			},
-			&mut |dirs, files, bytes| {
-				callback_ref.on_scan_progress(dirs, files, bytes);
-			},
-			&|current_bytes, total_bytes| {
-				callback_ref.on_query_download_progress(current_bytes, total_bytes);
-			},
-			drop_canceller.cancelled(),
-		)
-		.await?;
+	// 	let (tree, stats) = super::fs_tree::build_fs_tree_from_remote_iterator(
+	// 		&self,
+	// 		target.as_borrowed_cow(),
+	// 		&mut |errors| {
+	// 			callback_ref.on_scan_errors(errors);
+	// 		},
+	// 		&mut |dirs, files, bytes| {
+	// 			callback_ref.on_scan_progress(dirs, files, bytes);
+	// 		},
+	// 		&|current_bytes, total_bytes| {
+	// 			callback_ref.on_query_download_progress(current_bytes, total_bytes);
+	// 		},
+	// 		drop_canceller.cancelled(),
+	// 	)
+	// 	.await?;
 
-		let (dirs, files, bytes) = stats.snapshot();
-		callback_ref.on_scan_complete(dirs, files, bytes);
+	// 	let (dirs, files, bytes) = stats.snapshot();
+	// 	callback_ref.on_scan_complete(dirs, files, bytes);
 
-		self.download_fs_tree_from_target_into_path(
-			&mut |errors| {
-				callback_ref.on_download_errors(errors);
-			},
-			&mut |downloaded_dirs, downloaded_files, bytes| {
-				callback_ref.on_download_update(downloaded_dirs, downloaded_files, bytes);
-			},
-			dir_path,
-			tree,
-			target.into_owned_cow(),
-		)
-		.await
-	}
+	// 	self.download_fs_tree_from_target_into_path(
+	// 		&mut |errors| {
+	// 			callback_ref.on_download_errors(errors);
+	// 		},
+	// 		&mut |downloaded_dirs, downloaded_files, bytes| {
+	// 			callback_ref.on_download_update(downloaded_dirs, downloaded_files, bytes);
+	// 		},
+	// 		dir_path,
+	// 		tree,
+	// 		target.into_owned_cow(),
+	// 	)
+	// 	.await
+	// }
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	async fn inner_download_file_to_path(
@@ -265,71 +265,14 @@ impl Client {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub(crate) async fn inner_download_to_path_with_hash_check(
-		&self,
-		remote_file: &dyn File,
-		path: PathBuf,
-		callback: Option<MaybeSendCallback<'_, u64>>,
-	) -> (Result<(), Error>, PathBuf) {
-		let size = remote_file.size();
-		let hash = remote_file.hash();
-		let mtime = remote_file
-			.last_modified()
-			.unwrap_or_else(|| remote_file.timestamp());
-		let (need_download, path) =
-			tokio::task::spawn_blocking(move || -> (Result<bool, std::io::Error>, PathBuf) {
-				let file = match std::fs::File::open(&path) {
-					Ok(f) => f,
-					Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Ok(true), path),
-					Err(e) => return (Err(e), path),
-				};
-				let meta = match file.metadata() {
-					Ok(m) => m,
-					Err(e) => return (Err(e), path),
-				};
-
-				if FilenMetaExt::size(&meta) != size {
-					return (Ok(true), path);
-				}
-
-				if let Some(expected_hash) = hash {
-					let mut hasher = blake3::Hasher::new();
-					match hasher.update_reader(&file) {
-						Ok(_) => {}
-						Err(e) => return (Err(e), path),
-					};
-					let computed_hash: Blake3Hash = hasher.finalize().into();
-					(Ok(computed_hash != expected_hash), path)
-				} else {
-					// fallback to mtime check
-					let local_mtime = FilenMetaExt::modified(&meta);
-					(Ok(local_mtime < mtime), path)
-				}
-			})
-			.await
-			.unwrap();
-		let need_download = match need_download {
-			Ok(v) => v,
-			Err(e) => return (Err(e.into()), path),
-		};
-
-		if need_download {
-			let res = self
-				.inner_download_file_to_path(remote_file, &path, callback)
-				.await;
-			(res, path)
-		} else {
-			(Ok(()), path)
-		}
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn upload_file_from_path(
 		&self,
-		parent: &impl HasUUIDContents,
+		parent: &DirType<'_, Normal>,
 		path: PathBuf,
 		callback: Option<MaybeSendCallback<'_, u64>>,
 	) -> Result<(RemoteFile, std::fs::File), Error> {
+		use crate::fs::HasUUID;
+
 		self.upload_file_from_path_with_info(UploadInfo::Parent(parent.uuid()), path, callback)
 			.await
 	}
@@ -372,7 +315,7 @@ impl Client {
 					})?
 					.to_owned();
 
-				self.make_file_builder(name, parent_uuid)
+				self.make_file_builder(name, *parent_uuid)
 			}
 		};
 

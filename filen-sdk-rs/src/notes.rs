@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
 		contacts::Contact,
@@ -27,14 +28,7 @@ use crate::{
 
 use crypto::*;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export)]
 pub struct NoteTag {
 	uuid: UuidStr,
 	// none if decryption fails
@@ -97,14 +91,7 @@ struct NoteParticipantParts {
 	email: String,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export)]
 pub struct NoteParticipant {
 	user_id: u64,
 	is_owner: bool,
@@ -145,14 +132,7 @@ impl NoteParticipant {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export)]
 pub struct Note {
 	uuid: UuidStr,
 	owner_id: u64,
@@ -255,14 +235,7 @@ impl Note {
 	}
 }
 
-#[derive(Clone, Debug)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi, large_number_types_as_bigints),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, export)]
 pub struct NoteHistory {
 	id: u64,
 	#[cfg_attr(
@@ -1043,6 +1016,7 @@ impl Client {
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impls {
+	use filen_macros::js_type;
 	use filen_types::{api::v3::notes::NoteType, fs::UuidStr};
 
 	use crate::{
@@ -1052,23 +1026,13 @@ pub mod js_impls {
 
 	use super::{Note, NoteHistory, NoteTag};
 
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		derive(serde::Serialize, tsify::Tsify),
-		tsify(into_wasm_abi)
-	)]
-	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+	#[js_type(export)]
 	pub struct DuplicateNoteResponse {
 		pub original: Note,
 		pub duplicated: Note,
 	}
 
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		derive(serde::Serialize, tsify::Tsify),
-		tsify(into_wasm_abi)
-	)]
-	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+	#[js_type(export)]
 	pub struct AddTagToNoteResponse {
 		pub note: Note,
 		pub tag: NoteTag,

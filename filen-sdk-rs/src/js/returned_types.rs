@@ -1,94 +1,58 @@
-use serde::Serialize;
+use filen_macros::js_type;
 
-use crate::{
-	fs::NonRootFSObject,
-	js::{Dir, File},
-};
+use crate::js::{Dir, File, LinkedDir, NonRootDirTagged};
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use tsify::Tsify;
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-#[serde(tag = "type")]
-pub enum NonRootItemTagged {
-	#[serde(rename = "dir")]
-	Dir(Dir),
-	#[serde(rename = "file")]
-	File(File),
-}
-
-impl From<NonRootFSObject<'_>> for NonRootItemTagged {
-	fn from(obj: NonRootFSObject<'_>) -> Self {
-		match obj {
-			NonRootFSObject::Dir(dir) => NonRootItemTagged::Dir(dir.into_owned().into()),
-			NonRootFSObject::File(file) => NonRootItemTagged::File(file.into_owned().into()),
-		}
-	}
-}
-
-#[derive(Serialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(export)]
 pub struct DirSizeResponse {
 	pub size: u64,
 	pub files: u64,
 	pub dirs: u64,
 }
 
-#[derive(Serialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(export, no_deser)]
 pub struct DirsAndFiles {
+	pub dirs: Vec<NonRootDirTagged>,
+	pub files: Vec<File>,
+}
+
+#[js_type(export)]
+pub struct NormalDirsAndFiles {
 	pub dirs: Vec<Dir>,
 	pub files: Vec<File>,
 }
 
-#[derive(Serialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct DirWithPath {
+#[js_type(export)]
+pub struct LinkedDirsAndFiles {
+	pub dirs: Vec<LinkedDir>,
+	pub files: Vec<File>,
+}
+
+#[js_type(export)]
+pub struct NormalDirWithPath {
 	pub path: String,
 	pub dir: Dir,
 }
 
-#[derive(Serialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(export, no_deser)]
+pub struct DirWithPath {
+	pub path: String,
+	pub dir: NonRootDirTagged,
+}
+
+#[js_type(export)]
 pub struct FileWithPath {
 	pub path: String,
 	pub file: File,
 }
 
-#[derive(Serialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(export, no_deser)]
 pub struct DirsAndFilesWithPaths {
 	pub dirs: Vec<DirWithPath>,
+	pub files: Vec<FileWithPath>,
+}
+
+#[js_type(export)]
+pub struct NormalDirsAndFilesWithPaths {
+	pub dirs: Vec<NormalDirWithPath>,
 	pub files: Vec<FileWithPath>,
 }

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 use crate::{
 	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
@@ -10,29 +10,40 @@ use crate::{
 
 pub const ENDPOINT: &str = "v3/shared/out";
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct Request {
-	#[serde(with = "crate::serde::uuid::shared_out")]
-	pub uuid: Option<UuidStr>,
-	#[serde(with = "crate::serde::option::default")]
 	pub receiver_id: Option<u64>,
+}
+
+impl Serialize for Request {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let len = if self.receiver_id.is_some() { 2 } else { 1 };
+
+		let mut state = serializer.serialize_struct("Request", len)?;
+		if let Some(receiver_id) = self.receiver_id {
+			state.serialize_field("receiverId", &receiver_id)?;
+		}
+		state.serialize_field("uuid", "shared-out")?;
+		state.end()
+	}
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
 	#[serde(rename = "uploads")]
-	pub files: Vec<SharedFileOut<'a>>,
+	pub files: Vec<SharedRootFileOut<'a>>,
 	#[serde(rename = "folders")]
-	pub dirs: Vec<SharedDirOut<'a>>,
+	pub dirs: Vec<SharedRootDirOut<'a>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SharedFileOut<'a> {
+pub struct SharedRootFileOut<'a> {
 	pub uuid: UuidStr,
-	pub parent: Option<UuidStr>,
 	pub metadata: EncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
@@ -49,9 +60,8 @@ pub struct SharedFileOut<'a> {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SharedDirOut<'a> {
+pub struct SharedRootDirOut<'a> {
 	pub uuid: UuidStr,
-	pub parent: Option<UuidStr>,
 	pub metadata: EncryptedString<'a>,
 	pub receiver_email: Cow<'a, str>,
 	pub receiver_id: u64,

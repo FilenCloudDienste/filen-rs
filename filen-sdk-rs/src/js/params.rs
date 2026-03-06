@@ -1,55 +1,25 @@
-use std::borrow::Cow;
-
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use filen_macros::js_type;
 
 use crate::{
 	auth::Client,
 	fs::{
-		NonRootFSObject,
-		dir::UnsharedDirectoryType,
-		file::{FileBuilder, RemoteFile},
+		HasUUID,
+		categories::{DirType, Normal},
+		file::FileBuilder,
 	},
-	js::{Dir, DirEnum, File, ManagedFuture},
+	js::{AnyNormalDir, ManagedFuture},
 };
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use tsify::Tsify;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use wasm_bindgen::prelude::*;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use web_sys::js_sys::{self};
+use {
+	wasm_bindgen::prelude::*,
+	web_sys::js_sys::{self},
+};
 
-#[derive(Deserialize)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify),
-	tsify(from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-#[serde(untagged)]
-pub enum NonRootItem {
-	File(File),
-	Dir(Dir),
-}
-
-impl TryFrom<NonRootItem> for NonRootFSObject<'static> {
-	type Error = <RemoteFile as TryFrom<File>>::Error;
-	fn try_from(value: NonRootItem) -> Result<Self, Self::Error> {
-		Ok(match value {
-			NonRootItem::Dir(dir) => Self::Dir(Cow::Owned(dir.into())),
-			NonRootItem::File(file) => Self::File(Cow::Owned(file.try_into()?)),
-		})
-	}
-}
-
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify, Deserialize)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, no_ser)]
 pub struct FileBuilderParams {
-	pub parent: DirEnum,
+	pub parent: AnyNormalDir,
 	pub name: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -72,13 +42,7 @@ pub struct FileBuilderParams {
 	pub mime: Option<String>,
 }
 
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(Tsify, Deserialize),
-	tsify(from_wasm_abi),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[js_type(import, no_ser, no_default)]
 pub struct UploadFileParams {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
 	pub file_builder_params: FileBuilderParams,
@@ -90,8 +54,10 @@ pub struct UploadFileParams {
 
 impl FileBuilderParams {
 	pub(crate) fn into_file_builder(self, client: &Client) -> FileBuilder {
-		let mut file_builder =
-			client.make_file_builder(self.name, &UnsharedDirectoryType::from(self.parent));
+		let mut file_builder = client.make_file_builder(
+			self.name,
+			*DirType::<'static, Normal>::from(self.parent).uuid(),
+		);
 		if let Some(mime) = self.mime {
 			file_builder = file_builder.mime(mime);
 		}
@@ -109,10 +75,8 @@ impl FileBuilderParams {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-#[derive(Deserialize, Tsify)]
-#[tsify(from_wasm_abi, large_number_types_as_bigints)]
-#[serde(rename_all = "camelCase")]
+#[cfg(feature = "wasm-full")]
+#[js_type(import, no_ser, no_default)]
 pub struct UploadFileStreamParams {
 	#[serde(flatten)]
 	pub file_params: UploadFileParams,
@@ -125,20 +89,13 @@ pub struct UploadFileStreamParams {
 	pub progress: js_sys::Function,
 }
 
-#[derive(Deserialize, Debug)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[serde(rename_all = "camelCase")]
+#[js_type(import)]
 pub struct LoginParams {
 	pub email: String,
 	pub password: String,
-	#[serde(default)]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		serde(default),
 		tsify(type = "string")
 	)]
 	#[cfg_attr(

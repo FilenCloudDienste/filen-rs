@@ -50,7 +50,7 @@ impl Client {
 mod js_impl {
 	use std::sync::Arc;
 
-	use serde::Deserialize;
+	use filen_macros::js_type;
 
 	use crate::{
 		Error,
@@ -90,28 +90,13 @@ mod js_impl {
 		}
 	}
 
-	#[derive(Deserialize)]
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown"),
-		derive(tsify::Tsify),
-		tsify(from_wasm_abi)
-	)]
-	#[serde(rename_all = "camelCase")]
-	#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+	#[js_type(import)]
 	pub struct AcquireLockParams {
 		resource: String,
-		#[serde(default)]
-		#[cfg_attr(
-			all(target_family = "wasm", target_os = "unknown"),
-			tsify(type = "number")
-		)]
+		#[cfg_attr(feature = "wasm-full", tsify(type = "number"), serde(default))]
 		#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 		max_sleep_time: Option<u32>,
-		#[serde(default)]
-		#[cfg_attr(
-			all(target_family = "wasm", target_os = "unknown"),
-			tsify(type = "number")
-		)]
+		#[cfg_attr(feature = "wasm-full", tsify(type = "number"), serde(default))]
 		#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 		attempts: Option<u32>,
 	}

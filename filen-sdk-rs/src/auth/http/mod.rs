@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use filen_macros::js_type;
 use filen_types::auth::APIKey;
 use reqwest::{
 	IntoUrl, RequestBuilder,
@@ -129,14 +130,8 @@ impl Default for ClientConfig {
 	}
 }
 
-#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
-#[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify, serde::Deserialize, serde::Serialize),
-	tsify(from_wasm_abi, into_wasm_abi)
-)]
+#[derive(Default)]
+#[js_type(wasm_all)]
 pub enum LogLevel {
 	Off,
 	Error,
@@ -162,12 +157,7 @@ impl From<LogLevel> for log::LevelFilter {
 }
 
 #[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify, serde::Deserialize),
-	tsify(from_wasm_abi)
-)]
+#[js_type(import, no_ser, wasm_all)]
 pub struct JsClientConfig {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	pub concurrency: Option<u32>,
@@ -227,6 +217,7 @@ impl From<JsClientConfig> for ClientConfig {
 #[derive(Clone)]
 pub(crate) struct SharedClientState {
 	concurrency: GlobalConcurrencyLimitLayer,
+	max_concurrency: usize,
 	retry: retry::RetryMapLayer,
 	rate_limiter: limit::GlobalRateLimitLayer,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -259,6 +250,7 @@ impl SharedClientState {
 
 		Ok(Self {
 			concurrency: GlobalConcurrencyLimitLayer::new(config.concurrency),
+			max_concurrency: config.concurrency,
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
 			rate_limiter: limit::GlobalRateLimitLayer::new(config.rate_limit_per_sec),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -277,6 +269,10 @@ impl SharedClientState {
 
 	pub(crate) fn memory_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
 		&self.memory_semaphore
+	}
+
+	pub(crate) fn max_concurrency(&self) -> usize {
+		self.max_concurrency
 	}
 }
 

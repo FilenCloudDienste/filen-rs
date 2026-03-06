@@ -3,13 +3,14 @@ use std::{borrow::Cow, fmt::Write, sync::Arc};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use filen_macros::shared_test_runtime;
+
 use filen_sdk_rs::{
 	auth::Client,
-	connect::fs::SharedDirectory,
 	crypto::file::FileKey,
 	fs::{
-		HasName, HasUUID, NonRootFSObject, UnsharedFSObject,
-		dir::{HasUUIDContents, RemoteDirectory},
+		HasName, HasUUID,
+		categories::{NonRootFileType, NonRootItemType, Normal, fs::CategoryFSExt},
+		dir::RemoteDirectory,
 		file::FileBuilder,
 	},
 	io::client_impl::IoSharedClientExt,
@@ -19,7 +20,10 @@ use filen_types::auth::{AuthVersion, FileEncryptionVersion};
 
 use rand::TryRngCore;
 
-fn get_compat_test_file(client: &Client, parent: &impl HasUUIDContents) -> (FileBuilder, String) {
+fn get_compat_test_file(
+	client: &Client,
+	parent_uuid: filen_types::fs::UuidStr,
+) -> (FileBuilder, String) {
 	let file_key_str = match client.file_encryption_version() {
 		FileEncryptionVersion::V1 => "0123456789abcdefghijklmnopqrstuv",
 		FileEncryptionVersion::V2 => "0123456789abcdefghijklmnopqrstuv",
@@ -28,7 +32,7 @@ fn get_compat_test_file(client: &Client, parent: &impl HasUUIDContents) -> (File
 		}
 	};
 	let file = client
-		.make_file_builder("large_sample-20mb.txt", parent)
+		.make_file_builder("large_sample-20mb.txt", parent_uuid)
 		.created(DateTime::<Utc>::from_naive_utc_and_offset(
 			NaiveDateTime::new(
 				NaiveDate::from_ymd_opt(2025, 1, 11).unwrap(),
@@ -153,21 +157,23 @@ async fn make_rs_compat_dir() {
 
 	let _lock = client.acquire_lock_with_default("test:rs").await.unwrap();
 
-	if let Some(UnsharedFSObject::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
+	if let Some(NonRootFileType::Dir(dir)) = client.find_item_at_path("compat-rs").await.unwrap() {
 		client.trash_dir(&mut dir.into_owned()).await.unwrap();
 	}
 
 	let compat_dir = client
-		.create_dir(client.root(), "compat-rs".to_string())
+		.create_dir(&client.root().into(), "compat-rs".to_string())
 		.await
 		.unwrap();
 
 	client
-		.create_dir(&compat_dir, "dir".to_string())
+		.create_dir(&(&compat_dir).into(), "dir".to_string())
 		.await
 		.unwrap();
 
-	let empty_file = client.make_file_builder("empty.txt", &compat_dir).build();
+	let empty_file = client
+		.make_file_builder("empty.txt", *compat_dir.uuid())
+		.build();
 	client.upload_file(empty_file.into(), b"").await.unwrap();
 
 	let (contact, _lock1, _lock2) = get_contact(client).await;
@@ -182,7 +188,9 @@ async fn make_rs_compat_dir() {
 		.await
 		.unwrap();
 
-	let small_file = client.make_file_builder("small.txt", &compat_dir).build();
+	let small_file = client
+		.make_file_builder("small.txt", *compat_dir.uuid())
+		.build();
 	client
 		.upload_file(small_file.into(), b"Hello World from Rust!")
 		.await
@@ -196,7 +204,9 @@ async fn make_rs_compat_dir() {
 	let mut big_random_bytes = vec![0u8; 1024 * 1024 * 4];
 	// fill with random bytes
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
-	let big_file = client.make_file_builder("big.txt", &compat_dir).build();
+	let big_file = client
+		.make_file_builder("big.txt", *compat_dir.uuid())
+		.build();
 	client
 		.upload_file(
 			big_file.into(),
@@ -205,7 +215,7 @@ async fn make_rs_compat_dir() {
 		.await
 		.unwrap();
 
-	let (file, test_str) = get_compat_test_file(client, &compat_dir);
+	let (file, test_str) = get_compat_test_file(client, *compat_dir.uuid());
 	let file = file.build();
 	client
 		.upload_file(file.into(), test_str.as_bytes())
@@ -213,7 +223,7 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 
 	let file = client
-		.make_file_builder("nameSplitter.json", &compat_dir)
+		.make_file_builder("nameSplitter.json", *compat_dir.uuid())
 		.build();
 	client
 		.upload_file(
@@ -239,12 +249,12 @@ async fn prep_shared_compat_tests(client: &Client, language: &str, shortened: &s
 		.unwrap();
 
 	let share_dirs = share_client
-		.list_in_shared()
+		.list_in_shared_root(None::<&fn(u64, Option<u64>)>)
 		.await
 		.unwrap()
 		.0
 		.into_iter()
-		.filter(|d| d.get_dir().name() == Some(&format!("compat-{shortened}")))
+		.filter(|d| d.get_dir().name() == Some(format!("compat-{shortened}").as_str()))
 		.collect::<Vec<_>>();
 
 	assert_eq!(
@@ -260,44 +270,36 @@ async fn prep_shared_compat_tests(client: &Client, language: &str, shortened: &s
 
 async fn run_shared_compat_tests(
 	share_client: &Client,
-	compat_dir: SharedDirectory,
+	compat_dir: filen_sdk_rs::connect::fs::SharedRootDirectory,
 	language: &str,
 ) {
+	use filen_sdk_rs::fs::categories::{DirType, Shared};
 	let (dirs, files) = share_client
-		.list_in_shared_dir(compat_dir.get_dir())
+		.list_shared_dir(
+			&DirType::<Shared>::Root(Cow::Borrowed(&compat_dir)),
+			compat_dir.sharing_role(),
+			None::<&fn(u64, Option<u64>)>,
+		)
 		.await
 		.unwrap();
 	assert!(dirs.iter().any(|d| d.get_dir().name() == Some("dir")));
 
-	let Some(empty_file) = files
-		.iter()
-		.find(|f| f.get_file().name() == Some("empty.txt"))
-	else {
+	let Some(empty_file) = files.iter().find(|f| f.name() == Some("empty.txt")) else {
 		panic!("empty.txt not found in shared compat dir for {language}");
 	};
 
 	assert_eq!(
-		share_client
-			.download_file(empty_file.get_file())
-			.await
-			.unwrap()
-			.len(),
+		share_client.download_file(empty_file).await.unwrap().len(),
 		0,
 		"empty.txt should be empty"
 	);
 
-	let Some(small_file) = files
-		.iter()
-		.find(|f| f.get_file().name() == Some("small.txt"))
-	else {
+	let Some(small_file) = files.iter().find(|f| f.name() == Some("small.txt")) else {
 		panic!("small.txt not found in shared compat dir for {language}");
 	};
 
 	assert_eq!(
-		share_client
-			.download_file(small_file.get_file())
-			.await
-			.unwrap(),
+		share_client.download_file(small_file).await.unwrap(),
 		format!("Hello World from {language}!").as_bytes(),
 		"small.txt contents mismatch"
 	);
@@ -309,16 +311,27 @@ async fn run_compat_tests(
 	language: &str,
 	shortened: &str,
 ) {
-	match client.find_item_in_dir(&compat_dir, "dir").await.unwrap() {
-		Some(NonRootFSObject::Dir(_)) => {}
+	let find = |name: &'static str| {
+		let compat_dir = &compat_dir;
+		async move {
+			<Normal as CategoryFSExt>::find_item_in_dir(
+				client,
+				&compat_dir.into(),
+				None::<&fn(u64, Option<u64>)>,
+				name,
+				(),
+			)
+			.await
+			.unwrap()
+		}
+	};
+
+	match find("dir").await {
+		Some(NonRootItemType::Dir(_)) => {}
 		_ => panic!("dir not found in compat-{shortened} directory"),
 	}
-	match client
-		.find_item_in_dir(&compat_dir, "empty.txt")
-		.await
-		.unwrap()
-	{
-		Some(NonRootFSObject::File(file)) => {
+	match find("empty.txt").await {
+		Some(NonRootItemType::File(file)) => {
 			assert_eq!(
 				client.download_file(file.as_ref()).await.unwrap().len(),
 				0,
@@ -327,12 +340,8 @@ async fn run_compat_tests(
 		}
 		_ => panic!("empty.txt not found in compat-{shortened} directory"),
 	}
-	match client
-		.find_item_in_dir(&compat_dir, "small.txt")
-		.await
-		.unwrap()
-	{
-		Some(NonRootFSObject::File(file)) => {
+	match find("small.txt").await {
+		Some(NonRootItemType::File(file)) => {
 			assert_eq!(
 				client.download_file(file.as_ref()).await.unwrap(),
 				format!("Hello World from {language}!").as_bytes(),
@@ -342,12 +351,8 @@ async fn run_compat_tests(
 		_ => panic!("small.txt not found in compat-{shortened} directory"),
 	}
 
-	match client
-		.find_item_in_dir(&compat_dir, "nameSplitter.json")
-		.await
-		.unwrap()
-	{
-		Some(NonRootFSObject::File(file)) => {
+	match find("nameSplitter.json").await {
+		Some(NonRootItemType::File(file)) => {
 			let buf = client.download_file(file.as_ref()).await.unwrap();
 			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
 			name_splitter.split1.sort_unstable();
@@ -360,36 +365,28 @@ async fn run_compat_tests(
 				"nameSplitter.json contents mismatch"
 			);
 		}
-		_ => panic!("nameSplitter.json not found in compat-go directory"),
+		_ => panic!("nameSplitter.json not found in compat-{shortened} directory"),
 	};
 
 	if client.auth_version() == AuthVersion::V1 {
 		// we weren't able to upload files larger than 1MiB to the V1 account
 		return;
 	}
-	match client
-		.find_item_in_dir(&compat_dir, "big.txt")
-		.await
-		.unwrap()
-	{
-		Some(NonRootFSObject::File(file)) => {
+	match find("big.txt").await {
+		Some(NonRootItemType::File(file)) => {
 			assert_eq!(
 				client.download_file(file.as_ref()).await.unwrap().len(),
 				1024 * 1024 * 4 * 2,
 				"big.txt should be 8MiB of random bytes"
 			);
 		}
-		_ => panic!("big.txt not found in compat-go directory"),
+		_ => panic!("big.txt not found in compat-{shortened} directory"),
 	}
 
-	let (compat_test_file, test_str) = get_compat_test_file(client, &compat_dir);
+	let (compat_test_file, test_str) = get_compat_test_file(client, *compat_dir.uuid());
 
-	match client
-		.find_item_in_dir(&compat_dir, "large_sample-20mb.txt")
-		.await
-		.unwrap()
-	{
-		Some(NonRootFSObject::File(file)) => {
+	match find("large_sample-20mb.txt").await {
+		Some(NonRootItemType::File(file)) => {
 			let compat_test_file = compat_test_file.uuid(*file.uuid()).build();
 			assert_eq!(*file, compat_test_file, "file inner_file mismatch");
 
@@ -401,7 +398,7 @@ async fn run_compat_tests(
 				"file contents mismatch"
 			);
 		}
-		_ => panic!("large_sample-20mb.txt not found in compat-go directory"),
+		_ => panic!("large_sample-20mb.txt not found in compat-{shortened} directory"),
 	}
 }
 
@@ -413,7 +410,7 @@ async fn check_go_compat_dir() {
 	let _lock = client.acquire_lock_with_default("test:go").await.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-go").await.unwrap() {
-		Some(UnsharedFSObject::Dir(dir)) => dir.into_owned(),
+		Some(NonRootFileType::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-go directory not found"),
 	};
 
@@ -429,7 +426,7 @@ async fn check_ts_compat_dir() {
 	let _lock = client.acquire_lock_with_default("test:ts").await.unwrap();
 
 	let compat_dir = match client.find_item_at_path("compat-ts").await.unwrap() {
-		Some(UnsharedFSObject::Dir(dir)) => dir.into_owned(),
+		Some(NonRootFileType::Dir(dir)) => dir.into_owned(),
 		_ => panic!("compat-ts directory not found"),
 	};
 

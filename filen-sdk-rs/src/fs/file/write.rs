@@ -18,7 +18,7 @@ use crate::{
 		shared::{DataCrypter, MetaCrypter},
 	},
 	error::Error,
-	fs::file::chunk::Chunk,
+	fs::{categories::NonRootItemType, file::chunk::Chunk},
 	runtime::{blocking_join, do_cpu_intensive},
 	sync::lock::ResourceLock,
 	util::{MaybeSend, MaybeSendBoxFuture, MaybeSendCallback},
@@ -468,7 +468,9 @@ impl<'a> FileWriterCompletingState<'a> {
 		let temp_file = file.clone();
 		futures.push(Box::pin(async move {
 			self.client
-				.update_item_with_maybe_connected_parent(temp_file.as_ref())
+				.update_item_with_maybe_connected_parent(NonRootItemType::File(Cow::Borrowed(
+					temp_file.as_ref(),
+				)))
 				.await?;
 			Ok(())
 		}) as MaybeSendBoxFuture<'a, Result<(), Error>>);

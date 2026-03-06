@@ -1,6 +1,9 @@
 use std::fmt::Debug;
 
-use filen_sdk_rs::fs::{UnsharedFSObject, dir::RemoteDirectory};
+use filen_sdk_rs::fs::{
+	categories::{NonRootFileType, Normal},
+	dir::RemoteDirectory,
+};
 use filen_types::fs::{ParentUuid, UuidStr};
 use log::trace;
 use rusqlite::{Connection, Result};
@@ -72,15 +75,18 @@ impl DBObject {
 		}
 	}
 
-	pub(crate) fn upsert_from_remote(conn: &mut Connection, obj: UnsharedFSObject) -> Result<Self> {
+	pub(crate) fn upsert_from_remote(
+		conn: &mut Connection,
+		obj: NonRootFileType<'_, Normal>,
+	) -> Result<Self> {
 		match obj {
-			UnsharedFSObject::File(file) => {
+			NonRootFileType::File(file) => {
 				Ok(DBFile::upsert_from_remote(conn, file.into_owned())?.into())
 			}
-			UnsharedFSObject::Dir(dir) => {
+			NonRootFileType::Dir(dir) => {
 				Ok(DBDir::upsert_from_remote(conn, dir.into_owned())?.into())
 			}
-			UnsharedFSObject::Root(root) => Ok(DBRoot::upsert_from_remote(conn, &root)?.into()),
+			NonRootFileType::Root(root) => Ok(DBRoot::upsert_from_remote(conn, &root)?.into()),
 		}
 	}
 }

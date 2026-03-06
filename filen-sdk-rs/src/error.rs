@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use filen_macros::js_type;
 use filen_types::fs::ObjectType;
 use image::ImageError;
 use thiserror::Error;
@@ -26,6 +27,7 @@ impl From<filen_types::error::ResponseError> for Error {
 				// this is the code returned by the server when the API key is invalid
 				Some("api_key_not_found") => ErrorKind::Unauthenticated,
 				Some("invalid_folder") | Some("folder_not_found") => ErrorKind::FolderNotFound,
+				Some("wrong_password") => ErrorKind::WrongPassword,
 				_ => ErrorKind::Server,
 			}
 		};
@@ -54,13 +56,8 @@ impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
 
 /// Enum for all the error kinds that can occur in the SDK.
 #[non_exhaustive]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown"),
-	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[derive(Copy)]
+#[js_type(export, wasm_all, untagged)]
 pub enum ErrorKind {
 	/// Returned by the server
 	Server,
@@ -107,6 +104,8 @@ pub enum ErrorKind {
 	FileChangedDuringSync,
 	/// Specified folder was not found
 	FolderNotFound,
+	/// Incorrect password provided
+	WrongPassword,
 }
 
 /// Custom error type for the SDK

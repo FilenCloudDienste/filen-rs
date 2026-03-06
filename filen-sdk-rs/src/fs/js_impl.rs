@@ -1,8 +1,8 @@
 use crate::{
 	Error,
 	auth::JsClient,
-	fs::NonRootFSObject,
-	js::{NonRootItem, NonRootItemTagged},
+	fs::categories::{NonRootItemType, Normal},
+	js::{NonRootNormalItem, NonRootNormalItemTagged},
 	runtime::do_on_commander,
 };
 
@@ -18,20 +18,13 @@ impl JsClient {
 	)]
 	pub async fn set_favorite(
 		&self,
-		item: NonRootItem,
+		item: NonRootNormalItem,
 		favorited: bool,
-	) -> Result<NonRootItemTagged, Error> {
+	) -> Result<NonRootNormalItemTagged, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
-			let mut item: NonRootFSObject = item.try_into()?;
-			match item {
-				NonRootFSObject::Dir(ref mut dir) => {
-					this.set_favorite(dir.to_mut(), favorited).await?
-				}
-				NonRootFSObject::File(ref mut file) => {
-					this.set_favorite(file.to_mut(), favorited).await?
-				}
-			}
+			let mut item: NonRootItemType<'static, Normal> = item.try_into()?;
+			this.set_favorite(&mut item, favorited).await?;
 			Ok(item.into())
 		})
 		.await

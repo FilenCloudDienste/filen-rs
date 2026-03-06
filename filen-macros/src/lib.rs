@@ -1,11 +1,12 @@
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::Comma;
 use syn::{
-	Attribute, Block, Data, DeriveInput, Fields, FnArg, GenericParam, Ident, ItemFn, Lifetime,
-	LifetimeParam, Type, TypePath, Variant, parse_macro_input,
+	Attribute, Block, Data, DeriveInput, Fields, FnArg, GenericParam, Ident, ItemEnum, ItemFn,
+	ItemStruct, Lifetime, LifetimeParam, Meta, Type, TypePath, Variant, parse_macro_input,
 };
 use syn::{Item, WherePredicate};
 
@@ -1087,4 +1088,529 @@ pub fn cow_from_derive(input: TokenStream) -> TokenStream {
 	};
 
 	TokenStream::from(expanded)
+}
+
+#[allow(dead_code)]
+fn default_derives(no_default: bool) -> TokenStream2 {
+	if no_default {
+		quote! {}
+	} else {
+		quote! {
+			#[derive(Debug, Clone, PartialEq, Eq)]
+		}
+	}
+}
+
+fn add_comma_if_needed(tokens: TokenStream2) -> TokenStream2 {
+	if tokens.is_empty() {
+		tokens
+	} else {
+		quote! { #tokens, }
+	}
+}
+
+/// Given a `syn::Type`, if it's a simple path type (e.g. `AnySharedDir`),
+/// returns a new `syn::Type` with `Tagged` appended to the final segment
+/// (e.g. `AnySharedDirTagged`). Panics via a compile error if the type isn't
+/// a plain path.
+fn make_tagged_type(ty: &syn::Type) -> syn::Type {
+	match ty {
+		syn::Type::Path(type_path) => {
+			let mut new_path = type_path.clone();
+			let last = new_path
+				.path
+				.segments
+				.last_mut()
+				.expect("Type path must have at least one segment");
+			last.ident = format_ident!("{}Tagged", last.ident);
+			syn::Type::Path(new_path)
+		}
+		_ => panic!("#[js(tagged)] can only be applied to plain path types (e.g. `MyType`)"),
+	}
+}
+
+/// Returns true and strips the `#[js_type(tagged)]` attribute from `attrs`
+/// if it was present.
+fn extract_tagged_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
+	let mut found = false;
+	attrs.retain(|attr| {
+		if attr.path().is_ident("js_type_tagged") {
+			found = true;
+			false
+		} else {
+			true
+		}
+	});
+	found
+}
+
+fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream {
+	let from_abi = add_comma_if_needed(state.from_abi);
+
+	let mut any_tagged = false;
+	let wasm_condition = &state.wasm_condition;
+
+	// Clone fields so we can produce two versions: one with original types
+	// (for the real struct, minus the js_type(tagged) attr) and one with
+	// swapped types (for the Tagged struct).
+	let tagged_fields: syn::Fields = match &mut item_struct.fields {
+		syn::Fields::Named(named) => {
+			let new_named: Vec<syn::Field> = named
+				.named
+				.iter_mut()
+				.map(|field| {
+					let mut f = field.clone();
+					let is_tagged = extract_tagged_attr(&mut field.attrs);
+					if is_tagged {
+						any_tagged = true;
+						f.ty = make_tagged_type(&f.ty);
+						// Also strip the marker attr from the tagged-struct copy
+						extract_tagged_attr(&mut f.attrs);
+					}
+					f
+				})
+				.collect();
+
+			syn::Fields::Named(syn::FieldsNamed {
+				brace_token: named.brace_token,
+				named: new_named.into_iter().collect(),
+			})
+		}
+		syn::Fields::Unnamed(unnamed) => {
+			let new_unnamed: Vec<syn::Field> = unnamed
+				.unnamed
+				.iter_mut()
+				.map(|field| {
+					let mut f = field.clone();
+					let is_tagged = extract_tagged_attr(&mut field.attrs);
+					if is_tagged {
+						any_tagged = true;
+						f.ty = make_tagged_type(&f.ty);
+						extract_tagged_attr(&mut f.attrs);
+					}
+					f
+				})
+				.collect();
+
+			syn::Fields::Unnamed(syn::FieldsUnnamed {
+				paren_token: unnamed.paren_token,
+				unnamed: new_unnamed.into_iter().collect(),
+			})
+		}
+		syn::Fields::Unit => syn::Fields::Unit,
+	};
+
+	// Scan fields for #[js_type(tagged)] and build the Tagged struct if needed.
+	// We also strip the attribute from the real struct's fields.
+	let tagged_struct = if !state.into_abi.is_empty() && any_tagged {
+		{
+			let name = &item_struct.ident;
+			let tagged_name = format_ident!("{}Tagged", name);
+			let vis = &item_struct.vis;
+			let attrs = &item_struct.attrs;
+			let generics = &item_struct.generics;
+			let derives = default_derives(state.no_default);
+			let semi = &item_struct.semi_token;
+
+			let into_abi = &state.into_abi;
+
+			let constructor = match &item_struct.fields {
+				syn::Fields::Named(named) => {
+					let field_conversions = named.named.iter().map(|field| {
+						let ident = field.ident.as_ref().unwrap();
+						quote! { #ident: value.#ident.into() }
+					});
+					quote! {
+						#tagged_name {
+							#( #field_conversions ),*
+						}
+					}
+				}
+				syn::Fields::Unnamed(unnamed) => {
+					let field_conversions = (0..unnamed.unnamed.len()).map(|i| {
+						let index = syn::Index::from(i);
+						quote! { value.#index.into() }
+					});
+					quote! {
+						#tagged_name(
+							#( #field_conversions ),*
+						)
+					}
+				}
+				syn::Fields::Unit => quote! { #tagged_name },
+			};
+
+			quote! {
+				#[cfg(#wasm_condition)]
+				#(#attrs)*
+				#derives
+				#[derive(tsify::Tsify, serde::Serialize)]
+				#[#into_abi]
+				#[serde(rename_all = "camelCase")]
+				#vis struct #tagged_name #generics #tagged_fields #semi
+
+				#[cfg(#wasm_condition)]
+				impl<T> From<T> for #tagged_name where T: Into<#name> {
+					fn from(value: T) -> Self {
+						let value = value.into();
+						#constructor
+					}
+				}
+
+				/// Uniffi alias so downstream code can refer to `{Name}Tagged` on all platforms.
+				#[cfg(feature = "uniffi")]
+				#vis type #tagged_name = #name;
+
+
+			}
+		}
+	} else {
+		quote!()
+	};
+	let into_abi = add_comma_if_needed(state.into_abi);
+
+	let attrs = item_struct.attrs.clone();
+	let vis = item_struct.vis.clone();
+	let name = item_struct.ident.clone();
+	let generics = item_struct.generics.clone();
+	let fields = item_struct.fields.clone();
+	let semi = item_struct.semi_token;
+	let derives = default_derives(state.no_default);
+
+	// `no_ser` suppresses only the serde::Serialize derive, not the tsify export annotation.
+	// This allows callers to provide serde impls unconditionally while keeping tsify wasm export.
+	let ser_derive = if state.no_ser {
+		quote! {}
+	} else {
+		quote! { derive(serde::Serialize), }
+	};
+
+	let into_abi = if any_tagged {
+		quote! {}
+	} else {
+		quote! {
+			#ser_derive
+			#into_abi
+		}
+	};
+
+	let deserialize = if state.no_deser {
+		quote! {}
+	} else {
+		quote! {
+			, serde::Deserialize
+		}
+	};
+
+	// When both no_ser and no_deser are set, serde is managed externally (unconditional derives).
+	// Don't add serde(rename_all) inside cfg_attr to avoid duplicating it.
+	let serde_rename = if state.no_ser && state.no_deser {
+		quote! {}
+	} else {
+		quote! { serde(rename_all = "camelCase") }
+	};
+
+	let expanded = quote! {
+		#(#attrs)*
+		#derives
+		#[cfg_attr(
+			#wasm_condition,
+			derive(tsify::Tsify #deserialize),
+			#from_abi
+			#into_abi
+			#serde_rename
+		)]
+		#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+		#vis struct #name #generics #fields #semi
+
+		#tagged_struct
+	};
+
+	expanded.into()
+}
+
+fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
+	let name = &item_enum.ident;
+	let vis = &item_enum.vis;
+	let derives = default_derives(state.no_default);
+	let wasm_condition = &state.wasm_condition;
+
+	let (tagged, tagged_attrs) = if !state.into_abi.is_empty() && (!state.tagged && !state.untagged)
+	{
+		let tagged_name = format_ident!("{}Tagged", name);
+
+		// Build match arms AND the tagged enum's variants simultaneously,
+		// stripping #[js_type(tagged)] from the real enum's fields as we go.
+		let mut match_arms = Vec::new();
+		let mut tagged_variants: syn::punctuated::Punctuated<syn::Variant, syn::Token![,]> =
+			syn::punctuated::Punctuated::new();
+
+		for variant in item_enum.variants.iter_mut() {
+			let ident = &variant.ident;
+
+			match &mut variant.fields {
+				Fields::Unnamed(unnamed) => {
+					// Capture paren_token and build tagged_fields while the
+					// mutable borrow of `variant.fields` is still active.
+					// We must NOT call variant.clone() inside this arm.
+					let paren_token = unnamed.paren_token;
+					let tagged_fields: Vec<syn::Field> = unnamed
+						.unnamed
+						.iter_mut()
+						.map(|field| {
+							let mut f = field.clone();
+							let is_tagged = extract_tagged_attr(&mut field.attrs);
+							if is_tagged {
+								f.ty = make_tagged_type(&f.ty);
+								// strip from the copy too
+								extract_tagged_attr(&mut f.attrs);
+							}
+							f
+						})
+						.collect();
+					// Mutable borrow of variant.fields ends here — safe to clone now.
+					let mut tagged_variant = variant.clone();
+					tagged_variant.fields = Fields::Unnamed(syn::FieldsUnnamed {
+						paren_token,
+						unnamed: tagged_fields.into_iter().collect(),
+					});
+					// Strip any remaining js_type attrs from the tagged copy
+					tagged_variant
+						.attrs
+						.retain(|a| !a.path().is_ident("js_type"));
+					tagged_variants.push(tagged_variant);
+
+					match_arms.push(quote! {
+						#name::#ident(inner) =>
+							#tagged_name::#ident(inner.into())
+					});
+				}
+				Fields::Unit => {
+					let mut tagged_variant = variant.clone();
+					tagged_variant
+						.attrs
+						.retain(|a| !a.path().is_ident("js_type"));
+					tagged_variants.push(tagged_variant);
+
+					match_arms.push(quote! {
+						#name::#ident =>
+							#tagged_name::#ident
+					});
+				}
+				Fields::Named(_) => {
+					let mut tagged_variant = variant.clone();
+					tagged_variant
+						.attrs
+						.retain(|a| !a.path().is_ident("js_type"));
+					tagged_variants.push(tagged_variant);
+
+					match_arms.push(quote! {
+						#name::#ident { .. } => {
+							unreachable!("Struct variants not supported yet")
+						}
+					});
+				}
+			}
+		}
+
+		let into_abi = state.into_abi;
+
+		let serialize = if state.no_ser {
+			quote! {}
+		} else {
+			quote! {, serde::Serialize}
+		};
+
+		(
+			quote! {
+				#[cfg(#wasm_condition)]
+				#derives
+				#[derive(tsify::Tsify #serialize)]
+				#[#into_abi]
+				#[serde(tag = "type", rename_all = "camelCase")]
+				#vis enum #tagged_name {
+					#tagged_variants
+				}
+
+				#[cfg(#wasm_condition)]
+				impl<T> From<T> for #tagged_name where T: Into<#name> {
+					fn from(value: T) -> Self {
+						let value = value.into();
+						match value {
+							#( #match_arms ),*
+						}
+					}
+				}
+
+				#[cfg(feature = "uniffi")]
+				#vis type #tagged_name = #name;
+			},
+			quote! {
+				serde(untagged)
+			},
+		)
+	} else if state.tagged {
+		let into_abi = if state.into_abi.is_empty() {
+			quote! {
+				derive(serde::Serialize),
+			}
+		} else {
+			let into_abi = add_comma_if_needed(state.into_abi);
+			quote! {
+				#into_abi
+				derive(serde::Serialize),
+			}
+		};
+
+		(
+			quote! {},
+			quote! {
+				#into_abi
+				serde(tag = "type", rename_all = "camelCase")
+			},
+		)
+	} else if state.untagged {
+		let into_abi = if state.into_abi.is_empty() {
+			quote! {
+				derive(serde::Serialize),
+			}
+		} else {
+			let into_abi = add_comma_if_needed(state.into_abi);
+			quote! {
+				#into_abi
+				derive(serde::Serialize),
+			}
+		};
+		(
+			quote! {},
+			quote! {
+				#into_abi
+				serde(untagged, rename_all = "camelCase")
+			},
+		)
+	} else {
+		(quote! {}, quote! {serde(untagged)})
+	};
+
+	let from_abi = add_comma_if_needed(state.from_abi);
+
+	// Rebuild variants without the js_type(tagged) field attrs for the real enum.
+	// (extract_tagged_attr already mutated them in-place above.)
+	let variants = &item_enum.variants;
+
+	let derialize = if state.no_deser {
+		quote! {}
+	} else {
+		quote! {, serde::Deserialize}
+	};
+
+	let expanded = quote! {
+		#derives
+		#[cfg_attr(
+			#wasm_condition,
+			derive(tsify::Tsify #derialize),
+			#from_abi
+			#tagged_attrs
+		)]
+		#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+		#vis enum #name {
+			#variants
+		}
+
+		#tagged
+	};
+
+	expanded.into()
+}
+
+fn parse_args(args: Vec<Meta>) -> Result<JsTypeState, syn::Error> {
+	let mut state = JsTypeState {
+		from_abi: quote! {},
+		into_abi: quote! {},
+		wasm_condition: quote! {all(target_family = "wasm", target_os = "unknown", feature = "wasm-full")},
+		no_ser: false,
+		no_deser: false,
+		no_default: false,
+		tagged: false,
+		untagged: false,
+	};
+
+	for arg in args {
+		match arg {
+			Meta::Path(path) if path.is_ident("import") => {
+				state.from_abi = quote!(tsify(from_wasm_abi));
+			}
+			Meta::Path(path) if path.is_ident("export") => {
+				state.into_abi =
+					quote! {tsify(into_wasm_abi, large_number_types_as_bigints, hashmap_as_object)};
+			}
+			Meta::Path(path) if path.is_ident("no_ser") => {
+				state.no_ser = true;
+			}
+			Meta::Path(path) if path.is_ident("no_deser") => {
+				state.no_deser = true;
+			}
+			Meta::Path(path) if path.is_ident("no_default") => {
+				state.no_default = true;
+			}
+			Meta::Path(path) if path.is_ident("tagged") => {
+				state.tagged = true;
+			}
+			Meta::Path(path) if path.is_ident("untagged") => {
+				state.untagged = true;
+			}
+			Meta::Path(path) if path.is_ident("wasm_all") => {
+				state.wasm_condition = quote! {all(target_family = "wasm", target_os = "unknown")};
+			}
+			Meta::Path(path) if path.is_ident("wasm_worker") => {
+				state.wasm_condition = quote! {all(target_family = "wasm", target_os = "unknown", feature = "wasm-worker")};
+			}
+			other => {
+				return Err(syn::Error::new_spanned(
+					other,
+					"Unknown argument for js_type",
+				));
+			}
+		}
+	}
+
+	Ok(state)
+}
+
+#[proc_macro_attribute]
+pub fn js_type(attr: TokenStream, item: TokenStream) -> TokenStream {
+	let input = parse_macro_input!(item as Item);
+
+	let args = parse_macro_input!(attr with syn::punctuated::Punctuated<Meta, syn::Token![,]>::parse_terminated);
+
+	let args = args.into_iter().collect();
+
+	let state = match parse_args(args) {
+		Ok(state) => state,
+		Err(e) => return e.to_compile_error().into(),
+	};
+
+	match input {
+		Item::Struct(item_struct) => parse_struct(item_struct, state),
+		Item::Enum(item_enum) => parse_enum(item_enum, state),
+		_ => syn::Error::new_spanned(input, "#[js_type] can only be used on structs or enums")
+			.to_compile_error()
+			.into(),
+	}
+}
+
+#[proc_macro_attribute]
+pub fn js_type_tagged(_attr: TokenStream, passthrough: TokenStream) -> TokenStream {
+	passthrough
+}
+
+struct JsTypeState {
+	from_abi: TokenStream2,
+	into_abi: TokenStream2,
+	no_ser: bool,
+	no_deser: bool,
+	no_default: bool,
+	tagged: bool,
+	untagged: bool,
+	wasm_condition: TokenStream2,
 }

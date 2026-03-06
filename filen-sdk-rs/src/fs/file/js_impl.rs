@@ -9,11 +9,11 @@ use crate::{
 	Error,
 	auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
 	fs::{
-		dir::UnsharedDirectoryType,
+		categories::{DirType, Normal},
 		file::{enums::RemoteFileType, meta::FileMetaChanges},
 	},
 	io::client_impl::IoSharedClientExt,
-	js::{DirEnum, File, FileEnum, FileVersion, ManagedFuture, UploadFileParams},
+	js::{AnyFile, AnyNormalDir, File, FileVersion, ManagedFuture, UploadFileParams},
 	runtime::do_on_commander,
 };
 use filen_types::fs::UuidStr;
@@ -24,7 +24,7 @@ use futures::{AsyncRead, AsyncReadExt};
 use wasm_bindgen::prelude::JsValue;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub(crate) use super::service_worker::{MAX_BUFFER_SIZE_BEFORE_FLUSH, StreamWriter};
+pub(crate) use super::service_worker::StreamWriter;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 struct StreamReader {
@@ -233,11 +233,11 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "moveFile")
 	)]
-	pub async fn move_file(&self, file: File, new_parent: DirEnum) -> Result<File, Error> {
+	pub async fn move_file(&self, file: File, new_parent: AnyNormalDir) -> Result<File, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
 			let mut file = file.try_into()?;
-			this.move_file(&mut file, &UnsharedDirectoryType::from(new_parent))
+			this.move_file(&mut file, &DirType::<'static, Normal>::from(new_parent))
 				.await?;
 			Ok(file.into())
 		})
@@ -337,7 +337,7 @@ impl JsClient {
 
 async fn download_file_generic<T>(
 	client: Arc<T>,
-	file: FileEnum,
+	file: AnyFile,
 	managed_future: Option<ManagedFuture>,
 ) -> Result<Vec<u8>, Error>
 where
@@ -430,7 +430,7 @@ impl JsClient {
 	)]
 	pub async fn download_file(
 		&self,
-		file: FileEnum,
+		file: AnyFile,
 		managed_future: Option<ManagedFuture>,
 	) -> Result<Vec<u8>, Error> {
 		download_file_generic(self.inner(), file, managed_future).await
@@ -461,7 +461,7 @@ impl UnauthJsClient {
 	)]
 	pub async fn download_file(
 		&self,
-		file: FileEnum,
+		file: AnyFile,
 		managed_future: Option<ManagedFuture>,
 	) -> Result<Vec<u8>, Error> {
 		download_file_generic(self.inner(), file, managed_future).await

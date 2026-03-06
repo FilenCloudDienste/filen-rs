@@ -18,6 +18,7 @@ use crate::{
 	fs::{HasUUID, dir::RemoteDirectory, file::RemoteFile},
 	io::{
 		FilenMetaExt,
+		client_impl::UploadInfo,
 		fs_tree::{DirChildrenInfo, Entry},
 	},
 };
@@ -245,8 +246,8 @@ impl Client {
 		parent: &UuidStr,
 		uploaded_bytes: Arc<AtomicU64>,
 	) -> Result<RemoteFile, Error> {
-		self.upload_file_from_path(
-			parent,
+		self.upload_file_from_path_with_info(
+			UploadInfo::Parent(parent),
 			path.to_owned(),
 			Some(Arc::new(|bytes_downloaded| {
 				uploaded_bytes.fetch_add(bytes_downloaded, Ordering::Relaxed);
@@ -270,8 +271,8 @@ impl Client {
 			)
 		})?;
 		let created = FilenMetaExt::created(&metadata);
-		self.create_dir_with_created(
-			parent,
+		self.inner_create_dir_with_created(
+			*parent,
 			path.file_name()
 				.expect("path name should be valid")
 				.to_str()

@@ -64,7 +64,7 @@ beforeAll(async () => {
 
 			console.log("logged in, setting up socket listener")
 			listenerHandles.push(
-				await state.addEventListener(event => {
+				await state.addEventListener((event: SocketEvent) => {
 					if (!assertNoMaps(event)) {
 						listenerErrors.push(new Error("Socket event contained a Map", { cause: event }))
 					}
@@ -74,7 +74,7 @@ beforeAll(async () => {
 
 			const maybeDir = await state.findItemInDir(state.root(), "wasm-test-dir")
 			if (maybeDir) {
-				if (maybeDir.type === "dir") {
+				if (maybeDir.type === "normalDir") {
 					await state.deleteDirPermanently(maybeDir)
 				} else {
 					throw new Error("Expected testDir to be a Dir, but it was a File")
@@ -107,7 +107,7 @@ afterEach(() => {
 })
 
 function getFileMeta(meta: FileMeta): DecryptedFileMeta | null {
-	if (meta.type === "Decoded") {
+	if (meta.type === "decoded") {
 		return meta
 	} else {
 		return null
@@ -115,7 +115,7 @@ function getFileMeta(meta: FileMeta): DecryptedFileMeta | null {
 }
 
 function getDirMeta(meta: DirMeta): DecryptedDirMeta | null {
-	if (meta.type === "Decoded") {
+	if (meta.type === "decoded") {
 		return meta
 	} else {
 		return null
@@ -202,7 +202,7 @@ test("File Streams", async () => {
 		progress: (bytes: bigint) => {
 			progress = bytes
 		},
-		knownSize: BigInt(data.length)
+		knownSize: data.length
 	})
 
 	expect(progress).toBe(BigInt(data.length))
@@ -379,69 +379,79 @@ test("pause", async () => {
 	expect(metaB?.name).toBe("pause b.txt")
 })
 
-test("Zip Download", async () => {
-	const dirA = await state.createDir(testDir, "a")
-	const dirB = await state.createDir(dirA, "b")
-	await state.createDir(testDir, "c")
+// ⚠️ UNRESOLVABLE: "Zip Download"
+// Issue: Client.downloadItemsToZip was removed from the WASM API surface in the
+//        Category-trait refactor (commits a00c7af / 9dc1310). The method no longer
+//        exists on the generated Client class.
+// Required Rust change: Re-expose downloadItemsToZip (or an equivalent) on the
+//        WASM Client that accepts a mixed list of normal Files and Dirs, a
+//        WritableStream, and a four-parameter progress callback
+//        (bytesWritten, totalBytes, itemsProcessed, totalItems).
+// Test preserved as-is pending Rust SDK update.
+// test("Zip Download", async () => {
+// 	const dirA = await state.createDir(testDir, "a")
+// 	const dirB = await state.createDir(dirA, "b")
+// 	await state.createDir(testDir, "c")
 
-	const file = await state.uploadFile(new TextEncoder().encode("root file content"), {
-		parent: testDir,
-		name: "file.txt"
-	})
-	const file1 = await state.uploadFile(new TextEncoder().encode("file 1 content"), {
-		parent: dirA,
-		name: "file1.txt"
-	})
-	const file2 = await state.uploadFile(new TextEncoder().encode("file 2 content"), {
-		parent: dirB,
-		name: "file2.txt"
-	})
-	const file3 = await state.uploadFile(new TextEncoder().encode("file 3 content"), {
-		parent: dirB,
-		name: "file3.txt"
-	})
+// 	const file = await state.uploadFile(new TextEncoder().encode("root file content"), {
+// 		parent: testDir,
+// 		name: "file.txt"
+// 	})
+// 	const file1 = await state.uploadFile(new TextEncoder().encode("file 1 content"), {
+// 		parent: dirA,
+// 		name: "file1.txt"
+// 	})
+// 	const file2 = await state.uploadFile(new TextEncoder().encode("file 2 content"), {
+// 		parent: dirB,
+// 		name: "file2.txt"
+// 	})
+// 	const file3 = await state.uploadFile(new TextEncoder().encode("file 3 content"), {
+// 		parent: dirB,
+// 		name: "file3.txt"
+// 	})
 
-	const { readable, writable } = new TransformStream()
+// 	const { readable, writable } = new TransformStream()
 
-	// we don't await here because TransformStream doesn't have a buffer
-	// so this would hang forever
-	state.downloadItemsToZip({
-		items: [file, dirA],
-		writer: writable,
-		progress: (_bytesWritten, _totalBytes, _itemsProcessed, _totalItems) => {
-			//
-		}
-	})
+// 	// we don't await here because TransformStream doesn't have a buffer
+// 	// so this would hang forever
+// 	// @ts-expect-error downloadItemsToZip was removed from the SDK — see UNRESOLVABLE comment above
+// 	state.downloadItemsToZip({
+// 		items: [file, dirA],
+// 		writer: writable,
+// 		progress: (_bytesWritten: unknown, _totalBytes: unknown, _itemsProcessed: unknown, _totalItems: unknown) => {
+// 			//
+// 		}
+// 	})
 
-	const zipReader = new ZipReader(readable)
+// 	const zipReader = new ZipReader(readable)
 
-	const entries = await zipReader.getEntries()
-	const map = new Map<string, Entry>()
-	for (const entry of entries) {
-		map.set(entry.filename, entry)
-	}
+// 	const entries = await zipReader.getEntries()
+// 	const map = new Map<string, Entry>()
+// 	for (const entry of entries) {
+// 		map.set(entry.filename, entry)
+// 	}
 
-	const compareFileToEntry = async (entry: Entry, expected: Uint8Array, expectedFile: File) => {
-		if (entry.directory) {
-			throw new Error("Expected entry to be a FileEntry, but it was a directory")
-		}
-		// zip.js has bad precision for dates, so we compare in seconds
-		const meta = getFileMeta(expectedFile.meta)
-		expect(BigInt(entry.creationDate!.getTime())).toEqual(meta?.created)
-		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(meta?.modified) / 1000))
-		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
-		const { readable, writable } = new TransformStream()
-		// we don't await here because TransformStream doesn't have a buffer
-		// so this would hang forever
-		entry.getData!(writable)
-		expect(await streamToUint8Array(readable)).toEqual(expected)
-	}
+// 	const compareFileToEntry = async (entry: Entry, expected: Uint8Array, expectedFile: File) => {
+// 		if (entry.directory) {
+// 			throw new Error("Expected entry to be a FileEntry, but it was a directory")
+// 		}
+// 		// zip.js has bad precision for dates, so we compare in seconds
+// 		const meta = getFileMeta(expectedFile.meta)
+// 		expect(BigInt(entry.creationDate!.getTime())).toEqual(meta?.created)
+// 		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(meta?.modified) / 1000))
+// 		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
+// 		const { readable, writable } = new TransformStream()
+// 		// we don't await here because TransformStream doesn't have a buffer
+// 		// so this would hang forever
+// 		entry.getData!(writable)
+// 		expect(await streamToUint8Array(readable)).toEqual(expected)
+// 	}
 
-	await compareFileToEntry(map.get("file.txt")!, new TextEncoder().encode("root file content"), file)
-	await compareFileToEntry(map.get("a/file1.txt")!, new TextEncoder().encode("file 1 content"), file1)
-	await compareFileToEntry(map.get("a/b/file2.txt")!, new TextEncoder().encode("file 2 content"), file2)
-	await compareFileToEntry(map.get("a/b/file3.txt")!, new TextEncoder().encode("file 3 content"), file3)
-})
+// 	await compareFileToEntry(map.get("file.txt")!, new TextEncoder().encode("root file content"), file)
+// 	await compareFileToEntry(map.get("a/file1.txt")!, new TextEncoder().encode("file 1 content"), file1)
+// 	await compareFileToEntry(map.get("a/b/file2.txt")!, new TextEncoder().encode("file 2 content"), file2)
+// 	await compareFileToEntry(map.get("a/b/file3.txt")!, new TextEncoder().encode("file 3 content"), file3)
+// })
 
 test("sharing", async () => {
 	const dir = await state.createDir(testDir, "share-test-dir")
@@ -472,18 +482,19 @@ test("sharing", async () => {
 	await state.shareDir(dir, contact, (downloaded: number, total: number | undefined) => {
 		console.log(`Shared dir upload progress: ${downloaded}/${total}`)
 	})
-	const shared = await state.listOutShared(null, contact)
-	const sharedDir = shared.dirs.find(d => d.dir.uuid === dir.uuid)
+	const shared = await state.listOutShared(contact)
+	const sharedDir = shared.dirs.find(d => d.inner.uuid === dir.uuid)
 	expect(sharedDir).toBeDefined()
-	expect(sharedDir?.dir?.uuid).toEqual(dir.uuid)
+	expect(sharedDir?.inner?.uuid).toEqual(dir.uuid)
 
 	await shareClient.listInShared()
 	const sharedDirs = (await shareClient.listInShared()).dirs
-	const sharedDirIn = sharedDirs.find(d => d.dir.uuid === dir.uuid)
+	let sharedDirIn = sharedDirs.find(d => d.inner.uuid === dir.uuid)
 	expect(sharedDirIn).toBeDefined()
+	sharedDirIn = sharedDirIn!
 
-	const files = (await shareClient.listInShared(sharedDirIn?.dir)).files
-	expect(files.find(f => f.file.uuid === file.uuid)).toBeDefined()
+	const files = (await shareClient.listSharedDir(sharedDirIn, sharedDirIn.sharingRole)).files
+	expect(files.find(f => f.uuid === file.uuid)).toBeDefined()
 
 	await state.deleteContact(contact.uuid)
 })
@@ -628,8 +639,16 @@ test("meta updates", async () => {
 	const renamedDirMeta = getDirMeta(updatedDir.meta)
 	expect(renamedDirMeta?.name).toBe("meta-dir-renamed")
 
-	updatedFile = (await state.setFavorite(updatedFile, true)) as File
-	updatedDir = (await state.setFavorite(updatedDir, true)) as Dir
+	const favFileResult = await state.setFavorite(updatedFile, true)
+	if (favFileResult.type !== "file") {
+		throw new Error("Expected setFavorite to return a File")
+	}
+	updatedFile = favFileResult
+	const favDirResult = await state.setFavorite(updatedDir, true)
+	if (favDirResult.type !== "dir") {
+		throw new Error("Expected setFavorite to return a Dir")
+	}
+	updatedDir = favDirResult
 	expect(updatedFile.favorited).toBe(true)
 	expect(updatedDir.favorited).toBe(true)
 })
@@ -726,8 +745,9 @@ test("search", async () => {
 	})
 
 	const results = await state.findItemMatchesForName("124asdfas;dlkfj")
-	expect(results.find(i => i.item.uuid === dir.uuid)).toBeDefined()
-	expect(results.find(i => i.item.uuid === file.uuid)).toBeDefined()
+	// Narrow to NormalDir/File before accessing uuid (SharedDir/LinkedDir variants have no direct uuid)
+	expect(results.find(i => (i.item.type === "normalDir" || i.item.type === "file") && i.item.uuid === dir.uuid)).toBeDefined()
+	expect(results.find(i => (i.item.type === "normalDir" || i.item.type === "file") && i.item.uuid === file.uuid)).toBeDefined()
 })
 
 test("authError", async () => {
@@ -746,7 +766,7 @@ test("authError", async () => {
 	let gotAuthFailedEvent = false
 	try {
 		await badState.addEventListener(
-			event => {
+			(event: SocketEvent) => {
 				if (event.type === "authFailed") {
 					gotAuthFailedEvent = true
 				} else {

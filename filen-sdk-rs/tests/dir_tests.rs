@@ -1,37 +1,34 @@
 use std::{
 	borrow::Cow,
 	fs::File,
-	io::{BufReader, Read, Seek},
 	path::{Path, PathBuf},
 	time::{Duration, SystemTime},
 };
 
 use chrono::{SubsecRound, Utc};
 use filen_macros::shared_test_runtime;
+
 use filen_sdk_rs::{
 	Error, ErrorKind,
 	crypto::shared::generate_random_base64_values,
 	fs::{
-		FSObject, HasName, HasParent, HasRemoteInfo, HasUUID, NonRootFSObject, UnsharedFSObject,
-		client_impl::ObjectOrRemainingPath,
+		HasName, HasParent, HasRemoteInfo, HasUUID,
+		categories::{
+			DirType, NonRootFileType, NonRootItemType, Normal,
+			fs::{CategoryFS, CategoryFSExt, ObjectOrRemainingPath},
+		},
 		dir::{
-			DirectoryType, RemoteDirectory, UnsharedDirectoryType,
+			RemoteDirectory,
 			meta::{DirectoryMeta, DirectoryMetaChanges},
 			traits::HasDirMeta,
 		},
-		file::{
-			RemoteFile,
-			meta::FileMeta,
-			traits::{HasFileInfo, HasFileMeta},
-		},
+		file::{RemoteFile, meta::FileMeta, traits::HasFileMeta},
 	},
 	io::{DirUploadCallback, FilenMetaExt},
 };
 use filen_types::fs::ParentUuid;
 use futures::StreamExt;
 use tokio::time;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
-use zip::{ExtraField, read::ZipFile};
 
 #[shared_test_runtime]
 async fn create_list_trash() {
@@ -40,12 +37,15 @@ async fn create_list_trash() {
 	let test_dir = &resources.dir;
 
 	let mut dir = client
-		.create_dir(test_dir, "test_dir".to_string())
+		.create_dir(&test_dir.into(), "test_dir".to_string())
 		.await
 		.unwrap();
 	assert_eq!(dir.name().unwrap(), "test_dir");
 
-	let (dirs, _) = client.list_dir(test_dir).await.unwrap();
+	let (dirs, _) = client
+		.list_dir(&test_dir.into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
 
 	if !dirs.contains(&dir) {
 		panic!("Directory not found in root directory");
@@ -53,7 +53,10 @@ async fn create_list_trash() {
 
 	client.trash_dir(&mut dir).await.unwrap();
 
-	let (trashed_dirs, _) = client.list_dir(&ParentUuid::Trash).await.unwrap();
+	let (trashed_dirs, _) = client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
 	let found = trashed_dirs
 		.into_iter()
 		.find(|d| d.uuid() == dir.uuid())
@@ -181,13 +184,14 @@ async fn check_remote_matches_local(
 			Some((path, relative_path, meta))
 		})
 		.map(|(path, relative_path, meta)| async move {
-			let (_, item) = client
-				.get_items_in_path_starting_at(
-					relative_path.to_str().unwrap(),
-					UnsharedDirectoryType::Dir(Cow::Borrowed(remote_dir)),
-				)
-				.await
-				.unwrap();
+			let (_, item) = <Normal as CategoryFSExt>::get_items_in_path_starting_at(
+				client,
+				relative_path.to_str().unwrap(),
+				DirType::Dir(Cow::Borrowed(remote_dir)),
+				(),
+			)
+			.await
+			.unwrap();
 
 			let ObjectOrRemainingPath::Object(object) = item else {
 				panic!("Uploaded item not found: {:?}", relative_path);
@@ -195,7 +199,7 @@ async fn check_remote_matches_local(
 
 			if meta.is_dir() {
 				match object {
-					UnsharedFSObject::Dir(dir) => {
+					NonRootFileType::Dir(dir) => {
 						let dir = dir.as_ref();
 						assert_eq!(
 							dir.name().unwrap(),
@@ -218,7 +222,7 @@ async fn check_remote_matches_local(
 				}
 			} else if meta.is_file() {
 				match object {
-					UnsharedFSObject::File(file) => {
+					NonRootFileType::File(file) => {
 						let file = file.as_ref();
 						assert_eq!(
 							file.name().unwrap(),
@@ -293,16 +297,25 @@ async fn find_at_path() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
-	let dir_b = client.create_dir(&dir_a, "b".to_string()).await.unwrap();
-	let dir_c = client.create_dir(&dir_b, "c".to_string()).await.unwrap();
+	let dir_a = client
+		.create_dir(&test_dir.into(), "a".to_string())
+		.await
+		.unwrap();
+	let dir_b = client
+		.create_dir(&(&dir_a).into(), "b".to_string())
+		.await
+		.unwrap();
+	let dir_c = client
+		.create_dir(&(&dir_b).into(), "c".to_string())
+		.await
+		.unwrap();
 
 	assert_eq!(
 		client
 			.find_item_at_path(&format!("{}/a/b/c", test_dir.name().unwrap()))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::Dir(std::borrow::Cow::Borrowed(&dir_c)))
+		Some(NonRootFileType::Dir(std::borrow::Cow::Borrowed(&dir_c)))
 	);
 
 	assert_eq!(
@@ -318,55 +331,43 @@ async fn find_at_path() {
 	let items = client.get_items_in_path(&path).await.unwrap();
 
 	assert_eq!(items.0.len(), 4);
-	assert!(
-		items
-			.0
-			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_a)))
-	);
-	assert!(
-		items
-			.0
-			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_b)))
-	);
-	assert!(
-		!items
-			.0
-			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_c)))
-	);
+	assert!(items.0.contains(&DirType::Dir(Cow::Borrowed(&dir_a))));
+	assert!(items.0.contains(&DirType::Dir(Cow::Borrowed(&dir_b))));
+	assert!(!items.0.contains(&DirType::Dir(Cow::Borrowed(&dir_c))));
 	assert!(matches!(
 		items.1,
-		ObjectOrRemainingPath::Object(UnsharedFSObject::Dir(dir)) if *dir == dir_c
+		ObjectOrRemainingPath::Object(NonRootFileType::Dir(dir)) if *dir == dir_c
 	));
 
-	let items = client
-		.get_items_in_path_starting_at("b/c", UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_a)))
-		.await
-		.unwrap();
+	let items = <Normal as CategoryFSExt>::get_items_in_path_starting_at(
+		&**client,
+		"b/c",
+		DirType::Dir(Cow::Borrowed(&dir_a)),
+		(),
+	)
+	.await
+	.unwrap();
 	assert_eq!(items.0.len(), 2);
-	assert!(
-		items
-			.0
-			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_a)))
-	);
-	assert!(
-		items
-			.0
-			.contains(&UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_b)))
-	);
+	assert!(items.0.contains(&DirType::Dir(Cow::Borrowed(&dir_a))));
+	assert!(items.0.contains(&DirType::Dir(Cow::Borrowed(&dir_b))));
 	assert!(matches!(
 		items.1,
-		ObjectOrRemainingPath::Object(UnsharedFSObject::Dir(dir)) if *dir == dir_c
+		ObjectOrRemainingPath::Object(NonRootFileType::Dir(dir)) if *dir == dir_c
 	));
 
-	let resp = client
-		.get_items_in_path_starting_at("c/d/e", UnsharedDirectoryType::Dir(Cow::Borrowed(&dir_b)))
-		.await
-		.unwrap();
+	let resp = <Normal as CategoryFSExt>::get_items_in_path_starting_at(
+		&**client,
+		"c/d/e",
+		DirType::Dir(Cow::Borrowed(&dir_b)),
+		(),
+	)
+	.await
+	.unwrap();
 	// Expecting None because "c/d/e" does not exist in the path
 	// and the last item in dirs be the directory "c"
 	match resp {
 		(mut dirs, ObjectOrRemainingPath::RemainingPath(path)) => match dirs.pop() {
-			Some(UnsharedDirectoryType::Dir(dir)) if *dir == dir_c => {
+			Some(DirType::Dir(dir)) if *dir == dir_c => {
 				assert_eq!(path, "d/e");
 			}
 			other => panic!("Expected last directory to be 'c', but got: {other:?}"),
@@ -384,7 +385,9 @@ async fn find_or_create() {
 	let nested_dir = client.find_or_create_dir(&path).await.unwrap();
 
 	assert_eq!(
-		Some(Into::<UnsharedFSObject<'_>>::into(nested_dir.clone())),
+		Some(Into::<NonRootFileType<'_, Normal>>::into(
+			nested_dir.clone()
+		)),
 		client.find_item_at_path(&path).await.unwrap()
 	);
 
@@ -393,7 +396,9 @@ async fn find_or_create() {
 		.await
 		.unwrap();
 	assert_eq!(
-		Some(Into::<UnsharedFSObject<'_>>::into(nested_dir.clone())),
+		Some(Into::<NonRootFileType<'_, Normal>>::into(
+			nested_dir.clone()
+		)),
 		client
 			.find_item_at_path(&format!("{path}/d/e"))
 			.await
@@ -407,21 +412,27 @@ async fn list_recursive() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
-	let dir_b = client.create_dir(&dir_a, "b".to_string()).await.unwrap();
-	let dir_c = client.create_dir(&dir_b, "c".to_string()).await.unwrap();
+	let dir_a = client
+		.create_dir(&test_dir.into(), "a".to_string())
+		.await
+		.unwrap();
+	let dir_b = client
+		.create_dir(&(&dir_a).into(), "b".to_string())
+		.await
+		.unwrap();
+	let dir_c = client
+		.create_dir(&(&dir_b).into(), "c".to_string())
+		.await
+		.unwrap();
 
 	let (dirs, _) = client
-		.list_dir_recursive(
-			DirectoryType::Dir(Cow::Borrowed(test_dir)),
-			&|downloaded, total| {
-				log::trace!(
-					"List dir recursive progress: downloaded {} / {:?}",
-					downloaded,
-					total
-				);
-			},
-		)
+		.list_dir_recursive(&test_dir.into(), &|downloaded, total| {
+			log::trace!(
+				"List dir recursive progress: downloaded {} / {:?}",
+				downloaded,
+				total
+			);
+		})
 		.await
 		.unwrap();
 
@@ -429,17 +440,17 @@ async fn list_recursive() {
 	assert!(dirs.contains(&dir_b));
 	assert!(dirs.contains(&dir_c));
 
-	let (dirs, _) = client
-		.clone()
-		.list_dir_recursive_with_paths(
-			DirectoryType::Dir(Cow::Borrowed(test_dir)),
-			&|_downloaded, _total| {},
-			&mut |errors| {
-				panic!("received unexpected errors: {:?}", errors);
-			},
-		)
-		.await
-		.unwrap();
+	let (dirs, _) = Normal::list_dir_recursive_with_paths(
+		resources.client.clone(),
+		test_dir.into(),
+		Some(&|_: u64, _: Option<u64>| {}),
+		&mut |errors| {
+			panic!("received unexpected errors: {:?}", errors);
+		},
+		(),
+	)
+	.await
+	.unwrap();
 
 	assert!(dirs.contains(&(dir_a, "a".to_string())));
 	assert!(dirs.contains(&(dir_b, "a/b".to_string())));
@@ -452,17 +463,36 @@ async fn exists() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
+	assert!(
+		client
+			.dir_exists(&test_dir.into(), "a")
+			.await
+			.unwrap()
+			.is_none()
+	);
 
-	let mut dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	let mut dir_a = client
+		.create_dir(&test_dir.into(), "a".to_string())
+		.await
+		.unwrap();
 
 	assert_eq!(
 		Some(dir_a.uuid()),
-		client.dir_exists(test_dir, "a").await.unwrap().as_ref()
+		client
+			.dir_exists(&test_dir.into(), "a")
+			.await
+			.unwrap()
+			.as_ref()
 	);
 
 	client.trash_dir(&mut dir_a).await.unwrap();
-	assert!(client.dir_exists(test_dir, "a").await.unwrap().is_none());
+	assert!(
+		client
+			.dir_exists(&test_dir.into(), "a")
+			.await
+			.unwrap()
+			.is_none()
+	);
 }
 
 #[shared_test_runtime]
@@ -471,13 +501,33 @@ async fn dir_move() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let mut dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
-	let dir_b = client.create_dir(test_dir, "b".to_string()).await.unwrap();
+	let mut dir_a = client
+		.create_dir(&test_dir.into(), "a".to_string())
+		.await
+		.unwrap();
+	let dir_b = client
+		.create_dir(&test_dir.into(), "b".to_string())
+		.await
+		.unwrap();
 
-	assert!(client.list_dir(&dir_b).await.unwrap().0.is_empty());
+	assert!(
+		client
+			.list_dir(&(&dir_b).into(), None::<&fn(u64, Option<u64>)>)
+			.await
+			.unwrap()
+			.0
+			.is_empty()
+	);
 
 	client.move_dir(&mut dir_a, &(&dir_b).into()).await.unwrap();
-	assert!(client.list_dir(&dir_b).await.unwrap().0.contains(&dir_a));
+	assert!(
+		client
+			.list_dir(&(&dir_b).into(), None::<&fn(u64, Option<u64>)>)
+			.await
+			.unwrap()
+			.0
+			.contains(&dir_a)
+	);
 }
 
 #[shared_test_runtime]
@@ -486,36 +536,36 @@ async fn size() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	assert_eq!(
-		client.get_dir_size(test_dir).await.unwrap(),
-		filen_types::api::v3::dir::size::Response {
-			size: 0,
-			files: 0,
-			dirs: 0
-		}
-	);
+	let size = Normal::dir_size(&**client, &test_dir.into(), ())
+		.await
+		.unwrap();
+	assert_eq!(size.size, 0);
+	assert_eq!(size.files, 0);
+	assert_eq!(size.dirs, 0);
 
-	client.create_dir(test_dir, "a".to_string()).await.unwrap();
+	client
+		.create_dir(&test_dir.into(), "a".to_string())
+		.await
+		.unwrap();
 	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
-	assert_eq!(
-		client.get_dir_size(test_dir).await.unwrap(),
-		filen_types::api::v3::dir::size::Response {
-			size: 0,
-			files: 0,
-			dirs: 1
-		}
-	);
+	let size = Normal::dir_size(&**client, &test_dir.into(), ())
+		.await
+		.unwrap();
+	assert_eq!(size.size, 0);
+	assert_eq!(size.files, 0);
+	assert_eq!(size.dirs, 1);
 
-	client.create_dir(test_dir, "b".to_string()).await.unwrap();
+	client
+		.create_dir(&test_dir.into(), "b".to_string())
+		.await
+		.unwrap();
 	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
-	assert_eq!(
-		client.get_dir_size(test_dir).await.unwrap(),
-		filen_types::api::v3::dir::size::Response {
-			size: 0,
-			files: 0,
-			dirs: 2
-		}
-	);
+	let size = Normal::dir_size(&**client, &test_dir.into(), ())
+		.await
+		.unwrap();
+	assert_eq!(size.size, 0);
+	assert_eq!(size.files, 0);
+	assert_eq!(size.dirs, 2);
 }
 
 #[shared_test_runtime]
@@ -525,7 +575,7 @@ async fn dir_search() {
 	let test_dir = &resources.dir;
 
 	let second_dir = client
-		.create_dir(test_dir, "second_dir".to_string())
+		.create_dir(&test_dir.into(), "second_dir".to_string())
 		.await
 		.unwrap();
 
@@ -535,7 +585,10 @@ async fn dir_search() {
 
 	let dir_name = format!("{dir_random_part_long}{dir_random_part_short}");
 
-	let dir = client.create_dir(&second_dir, dir_name).await.unwrap();
+	let dir = client
+		.create_dir(&(&second_dir).into(), dir_name)
+		.await
+		.unwrap();
 
 	let found_items = client
 		.find_item_matches_for_name(&dir_random_part_long)
@@ -545,7 +598,7 @@ async fn dir_search() {
 	assert_eq!(
 		found_items,
 		vec![(
-			NonRootFSObject::Dir(Cow::Owned(dir.clone())),
+			NonRootItemType::Dir(Cow::Owned(dir.clone())),
 			format!(
 				"/{}/{}",
 				test_dir.name().unwrap(),
@@ -560,7 +613,7 @@ async fn dir_search() {
 		.unwrap();
 
 	assert!(found_items.iter().any(|(item, _)| {
-		if let NonRootFSObject::Dir(found_dir) = item {
+		if let NonRootItemType::Dir(found_dir) = item {
 			*found_dir.clone() == dir
 		} else {
 			false
@@ -576,7 +629,7 @@ async fn dir_update_meta() {
 
 	let dir_name = "dir";
 	let mut dir = client
-		.create_dir(test_dir, dir_name.to_string())
+		.create_dir(&test_dir.into(), dir_name.to_string())
 		.await
 		.unwrap();
 
@@ -585,7 +638,7 @@ async fn dir_update_meta() {
 			.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), dir_name))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir)))
+		Some(NonRootFileType::Dir(Cow::Borrowed(&dir)))
 	);
 
 	client
@@ -608,7 +661,7 @@ async fn dir_update_meta() {
 			))
 			.await
 			.unwrap(),
-		Some(UnsharedFSObject::Dir(Cow::Borrowed(&dir)))
+		Some(NonRootFileType::Dir(Cow::Borrowed(&dir)))
 	);
 
 	let created = Utc::now() - chrono::Duration::days(1);
@@ -633,16 +686,16 @@ async fn dir_favorite() {
 	let test_dir = &resources.dir;
 
 	let mut dir = client
-		.create_dir(test_dir, "test_dir".to_string())
+		.create_dir(&test_dir.into(), "test_dir".to_string())
 		.await
 		.unwrap();
 
 	assert!(!dir.favorited());
 
-	client.set_favorite(&mut dir, true).await.unwrap();
+	client.set_dir_favorite(&mut dir, true).await.unwrap();
 	assert!(dir.favorited());
 
-	client.set_favorite(&mut dir, false).await.unwrap();
+	client.set_dir_favorite(&mut dir, false).await.unwrap();
 	assert!(!dir.favorited());
 }
 
@@ -655,11 +708,15 @@ async fn dir_malformed_meta() {
 	let test_dir = &resources.dir;
 
 	let uuid = client
-		.create_malformed_dir(test_dir, "malformed", "malformed meta")
+		.create_malformed_dir(&test_dir.into(), "malformed", "malformed meta")
 		.await
 		.unwrap();
 
-	let dirs = client.list_dir(test_dir).await.unwrap().0;
+	let dirs = client
+		.list_dir(&test_dir.into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap()
+		.0;
 	assert!(dirs.iter().any(|d| *d.uuid() == uuid));
 	assert!(matches!(dirs[0].get_meta(), DirectoryMeta::Encrypted(_)));
 
@@ -667,130 +724,131 @@ async fn dir_malformed_meta() {
 	assert!(matches!(dir.get_meta(), DirectoryMeta::Encrypted(_)));
 }
 
-#[shared_test_runtime]
-async fn download_to_zip() {
-	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
-	let test_dir = &resources.dir;
+// TODO: uncomment when download_items_to_zip is reimplemented
+// #[shared_test_runtime]
+// async fn download_to_zip() {
+// 	let resources = test_utils::RESOURCES.get_resources().await;
+// 	let client = &resources.client;
+// 	let test_dir = &resources.dir;
+//
+// 	let dir_a = client.create_dir(&test_dir.into(), "a".to_string()).await.unwrap();
+// 	let dir_b = client.create_dir(&(&dir_a).into(), "b".to_string()).await.unwrap();
+// 	let _dir_c = client.create_dir(&test_dir.into(), "c".to_string()).await.unwrap();
+//
+// 	let file = client.make_file_builder("file.txt", *test_dir.uuid()).build();
+// 	let file = client
+// 		.upload_file(file.into(), b"root file content")
+// 		.await
+// 		.unwrap();
 
-	let dir_a = client.create_dir(test_dir, "a".to_string()).await.unwrap();
-	let dir_b = client.create_dir(&dir_a, "b".to_string()).await.unwrap();
-	let _dir_c = client.create_dir(test_dir, "c".to_string()).await.unwrap();
+// 	let file_1 = client.make_file_builder("file1.txt", &dir_a).build();
+// 	let file_1 = client
+// 		.upload_file(file_1.into(), b"file 1 content")
+// 		.await
+// 		.unwrap();
+// 	let file_2 = client.make_file_builder("file2.txt", &dir_b).build();
+// 	let file_2 = client
+// 		.upload_file(file_2.into(), b"file 2 content")
+// 		.await
+// 		.unwrap();
+// 	let file_3 = client.make_file_builder("file3.txt", &dir_b).build();
+// 	let file_3 = client
+// 		.upload_file(file_3.into(), b"file 3 content")
+// 		.await
+// 		.unwrap();
 
-	let file = client.make_file_builder("file.txt", test_dir).build();
-	let file = client
-		.upload_file(file.into(), b"root file content")
-		.await
-		.unwrap();
+// 	let tmp = std::env::temp_dir();
+// 	let mut options = tokio::fs::OpenOptions::new();
+// 	options.create(true).write(true).read(true).truncate(true);
+// 	let zip_file = options
+// 		.open(tmp.join("test.zip"))
+// 		.await
+// 		.unwrap()
+// 		.compat_write();
+// 	let zip_file = client
+// 		.download_items_to_zip(
+// 			&[
+// 				FSObject::File(Cow::Borrowed(&file)),
+// 				FSObject::Dir(Cow::Borrowed(&dir_a)),
+// 			],
+// 			zip_file,
+// 			None::<&fn(u64, u64, u64, u64)>,
+// 		)
+// 		.await
+// 		.unwrap();
+// 	let mut zip_file = zip_file.into_inner().into_std().await;
+// 	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+// 	let mut archive = zip::ZipArchive::new(BufReader::new(zip_file)).unwrap();
+// 	let names = archive.file_names().collect::<Vec<_>>();
+// 	assert!(names.contains(&"a/"));
+// 	assert!(names.contains(&"a/b/"));
+// 	assert!(names.contains(&"file.txt"));
+// 	assert!(names.contains(&"a/file1.txt"));
+// 	assert!(names.contains(&"a/b/file2.txt"));
+// 	assert!(names.contains(&"a/b/file3.txt"));
 
-	let file_1 = client.make_file_builder("file1.txt", &dir_a).build();
-	let file_1 = client
-		.upload_file(file_1.into(), b"file 1 content")
-		.await
-		.unwrap();
-	let file_2 = client.make_file_builder("file2.txt", &dir_b).build();
-	let file_2 = client
-		.upload_file(file_2.into(), b"file 2 content")
-		.await
-		.unwrap();
-	let file_3 = client.make_file_builder("file3.txt", &dir_b).build();
-	let file_3 = client
-		.upload_file(file_3.into(), b"file 3 content")
-		.await
-		.unwrap();
+// 	assert!(archive.by_name("a/").unwrap().is_dir());
+// 	assert!(archive.by_name("a/b/").unwrap().is_dir());
 
-	let tmp = std::env::temp_dir();
-	let mut options = tokio::fs::OpenOptions::new();
-	options.create(true).write(true).read(true).truncate(true);
-	let zip_file = options
-		.open(tmp.join("test.zip"))
-		.await
-		.unwrap()
-		.compat_write();
-	let zip_file = client
-		.download_items_to_zip(
-			&[
-				FSObject::File(Cow::Borrowed(&file)),
-				FSObject::Dir(Cow::Borrowed(&dir_a)),
-			],
-			zip_file,
-			None::<&fn(u64, u64, u64, u64)>,
-		)
-		.await
-		.unwrap();
-	let mut zip_file = zip_file.into_inner().into_std().await;
-	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
-	let mut archive = zip::ZipArchive::new(BufReader::new(zip_file)).unwrap();
-	let names = archive.file_names().collect::<Vec<_>>();
-	assert!(names.contains(&"a/"));
-	assert!(names.contains(&"a/b/"));
-	assert!(names.contains(&"file.txt"));
-	assert!(names.contains(&"a/file1.txt"));
-	assert!(names.contains(&"a/b/file2.txt"));
-	assert!(names.contains(&"a/b/file3.txt"));
+// 	let assert_file_eq =
+// 		|file: &mut ZipFile<BufReader<File>>, expected: &[u8], expected_file: &RemoteFile| {
+// 			assert!(file.is_file());
+// 			let mut buf = Vec::new();
+// 			file.read_to_end(&mut buf).unwrap();
+// 			assert_eq!(buf, expected);
+// 			let extra_fields = file.extra_data_fields().collect::<Vec<_>>();
+// 			assert!(extra_fields.len() >= 2);
+// 			for field in &extra_fields {
+// 				match field {
+// 					ExtraField::ExtendedTimestamp(data) => {
+// 						if let Some(modified) = expected_file.last_modified() {
+// 							assert_eq!(data.mod_time(), Some(modified.timestamp() as u32));
+// 						}
+// 						if let Some(created) = expected_file.created() {
+// 							assert_eq!(data.cr_time(), Some(created.timestamp() as u32));
+// 						}
+// 					}
+// 					ExtraField::Ntfs(data) => {
+// 						if let Some(modified) = expected_file.last_modified() {
+// 							assert_eq!(
+// 								data.mtime(),
+// 								filen_sdk_rs::io::unix_time_to_nt_time(modified)
+// 							);
+// 						}
+// 						if let Some(created) = expected_file.created() {
+// 							assert_eq!(
+// 								data.ctime(),
+// 								filen_sdk_rs::io::unix_time_to_nt_time(created)
+// 							);
+// 						}
+// 					}
+// 					#[allow(unreachable_patterns)]
+// 					_ => {}
+// 				}
+// 			}
+// 		};
 
-	assert!(archive.by_name("a/").unwrap().is_dir());
-	assert!(archive.by_name("a/b/").unwrap().is_dir());
-
-	let assert_file_eq =
-		|file: &mut ZipFile<BufReader<File>>, expected: &[u8], expected_file: &RemoteFile| {
-			assert!(file.is_file());
-			let mut buf = Vec::new();
-			file.read_to_end(&mut buf).unwrap();
-			assert_eq!(buf, expected);
-			let extra_fields = file.extra_data_fields().collect::<Vec<_>>();
-			assert!(extra_fields.len() >= 2);
-			for field in &extra_fields {
-				match field {
-					ExtraField::ExtendedTimestamp(data) => {
-						if let Some(modified) = expected_file.last_modified() {
-							assert_eq!(data.mod_time(), Some(modified.timestamp() as u32));
-						}
-						if let Some(created) = expected_file.created() {
-							assert_eq!(data.cr_time(), Some(created.timestamp() as u32));
-						}
-					}
-					ExtraField::Ntfs(data) => {
-						if let Some(modified) = expected_file.last_modified() {
-							assert_eq!(
-								data.mtime(),
-								filen_sdk_rs::io::unix_time_to_nt_time(modified)
-							);
-						}
-						if let Some(created) = expected_file.created() {
-							assert_eq!(
-								data.ctime(),
-								filen_sdk_rs::io::unix_time_to_nt_time(created)
-							);
-						}
-					}
-					#[allow(unreachable_patterns)]
-					_ => {}
-				}
-			}
-		};
-
-	assert_file_eq(
-		&mut archive.by_name("file.txt").unwrap(),
-		b"root file content",
-		&file,
-	);
-	assert_file_eq(
-		&mut archive.by_name("a/file1.txt").unwrap(),
-		b"file 1 content",
-		&file_1,
-	);
-	assert_file_eq(
-		&mut archive.by_name("a/b/file2.txt").unwrap(),
-		b"file 2 content",
-		&file_2,
-	);
-	assert_file_eq(
-		&mut archive.by_name("a/b/file3.txt").unwrap(),
-		b"file 3 content",
-		&file_3,
-	);
-}
+// 	assert_file_eq(
+// 		&mut archive.by_name("file.txt").unwrap(),
+// 		b"root file content",
+// 		&file,
+// 	);
+// 	assert_file_eq(
+// 		&mut archive.by_name("a/file1.txt").unwrap(),
+// 		b"file 1 content",
+// 		&file_1,
+// 	);
+// 	assert_file_eq(
+// 		&mut archive.by_name("a/b/file2.txt").unwrap(),
+// 		b"file 2 content",
+// 		&file_2,
+// 	);
+// 	assert_file_eq(
+// 		&mut archive.by_name("a/b/file3.txt").unwrap(),
+// 		b"file 3 content",
+// 		&file_3,
+// 	);
+// }
 
 #[shared_test_runtime]
 async fn not_found_error() {
@@ -799,11 +857,14 @@ async fn not_found_error() {
 	let test_dir = &resources.dir;
 
 	let new_dir = client
-		.create_dir(test_dir, "to_be_deleted".to_string())
+		.create_dir(&test_dir.into(), "to_be_deleted".to_string())
 		.await
 		.unwrap();
 
 	client.trash_dir(&mut new_dir.clone()).await.unwrap();
-	let err = client.list_dir(&new_dir).await.unwrap_err();
+	let err = client
+		.list_dir(&(&new_dir).into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::FolderNotFound)
 }

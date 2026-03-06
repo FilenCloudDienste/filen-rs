@@ -65,16 +65,20 @@ impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, CowHelpers)]
+#[derive(Debug, PartialEq, Eq, CowHelpers)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify),
-	tsify(into_wasm_abi)
+	derive(tsify::Tsify, serde::Serialize, serde::Deserialize),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(bound(
+		serialize = "T: serde::Serialize, T::Owned: serde::Serialize",
+		deserialize = "T::Owned: serde::de::DeserializeOwned"
+	))
 )]
 pub enum MaybeEncrypted<'a, T>
 where
 	T: ToOwned + ?Sized,
-	T::Owned: Clone + Borrow<T> + std::fmt::Debug,
+	T::Owned: Clone + Borrow<T> + std::fmt::Debug + serde::de::DeserializeOwned,
 	Cow<'static, T>: 'static,
 {
 	Decrypted(Cow<'a, T>),
@@ -84,7 +88,7 @@ where
 impl<T> Clone for MaybeEncrypted<'_, T>
 where
 	T: ToOwned + ?Sized,
-	T::Owned: Clone + Borrow<T> + std::fmt::Debug,
+	T::Owned: Clone + Borrow<T> + std::fmt::Debug + serde::de::DeserializeOwned,
 {
 	fn clone(&self) -> Self {
 		match self {

@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub mod link;
+pub mod shared;
 
 pub const ENDPOINT: &str = "v3/dir/download";
 
