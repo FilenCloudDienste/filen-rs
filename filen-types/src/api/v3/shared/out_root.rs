@@ -20,12 +20,8 @@ impl Serialize for Request {
 	where
 		S: serde::Serializer,
 	{
-		let len = if self.receiver_id.is_some() { 2 } else { 1 };
-
-		let mut state = serializer.serialize_struct("Request", len)?;
-		if let Some(receiver_id) = self.receiver_id {
-			state.serialize_field("receiverId", &receiver_id)?;
-		}
+		let mut state = serializer.serialize_struct("Request", 2)?;
+		state.serialize_field("receiverId", &self.receiver_id.unwrap_or_default())?;
 		state.serialize_field("uuid", "shared-out")?;
 		state.end()
 	}
