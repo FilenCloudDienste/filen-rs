@@ -960,13 +960,7 @@ impl<'a> FileMetadataChanged<'a> {
 		crypter: &impl MetaCrypter,
 		event: filen_types::api::v3::socket::FileMetadataChanged<'a>,
 	) -> Self {
-		let (name, metadata, old_metadata) = runtime::blocking_join!(
-			|| {
-				match crypter.blocking_decrypt_meta(&event.name) {
-					Ok(decrypted_name) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted_name)),
-					Err(_) => MaybeEncrypted::Encrypted(event.name),
-				}
-			},
+		let (metadata, old_metadata) = runtime::blocking_join!(
 			|| {
 				FileMeta::blocking_from_encrypted(
 					event.metadata,
@@ -982,6 +976,17 @@ impl<'a> FileMetadataChanged<'a> {
 				)
 			}
 		);
+
+		// The `name` field in FileMetadataChanged is encrypted with the file's
+		// own key (from the file metadata), not the master key. Decrypt metadata
+		// first, extract the file key, then use it to decrypt name.
+		// Fall back to the master key crypter if file key decryption fails.
+		let name = metadata
+			.key()
+			.and_then(|file_key| file_key.to_meta_key().ok())
+			.and_then(|file_key_crypter| file_key_crypter.blocking_decrypt_meta(&event.name).ok())
+			.map(|s| MaybeEncrypted::Decrypted(Cow::Owned(s)))
+			.unwrap_or_else(|| MaybeEncrypted::Encrypted(event.name));
 
 		Self {
 			uuid: event.uuid,
