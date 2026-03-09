@@ -11,25 +11,6 @@ use crate::{
 	crypto::error::ConversionError, io::RemoteFile, thumbnail::is_supported_thumbnail_mime,
 };
 
-#[js_type(import, export)]
-pub struct RootFile {
-	pub uuid: UuidStr,
-	pub size: u64,
-	pub chunks: u64,
-	pub region: String,
-	pub bucket: String,
-	#[cfg_attr(
-		feature = "wasm-full",
-		tsify(type = "bigint"),
-		serde(with = "chrono::serde::ts_milliseconds")
-	)]
-	pub timestamp: DateTime<Utc>,
-	pub meta: FileMeta,
-	// JS only field, indicates if the file can have a thumbnail generated
-	// this is here to avoid having to call into WASM to check mime types
-	pub can_make_thumbnail: bool,
-}
-
 #[js_type(import, export, wasm_all)]
 pub struct File {
 	pub(crate) uuid: UuidStr,
