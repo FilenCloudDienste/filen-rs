@@ -114,7 +114,7 @@ impl NetworkDrive {
 				"-o",
 				"nonamedattr", */
 				// todo: should these be reintroduced? generally, check what these args are for and if they're needed
-			]);
+				]);
 			}
 		}
 
@@ -168,13 +168,23 @@ async fn resolve_mount_point(mount_point: Option<&str>) -> Result<Cow<'_, str>> 
 	#[cfg(not(windows))]
 	{
 		let mount_point = mount_point.unwrap_or("/tmp/filen");
-		if !fs::try_exists(mount_point)
-			.await
-			.context("Failed to check if mount point directory exists")?
-		{
-			fs::create_dir_all(mount_point)
-				.await
-				.context("Failed to create missing mount point directory")?;
+		match fs::metadata(mount_point).await {
+			Ok(metadata) => {
+				if !metadata.is_dir() {
+					return Err(anyhow::anyhow!(
+						"Mount point exists but is not a directory: {}",
+						mount_point
+					));
+				}
+			}
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+				fs::create_dir_all(mount_point)
+					.await
+					.context("Failed to create missing mount point directory")?;
+			}
+			Err(err) => {
+				return Err(err).context("Failed to inspect mount point path");
+			}
 		}
 		Ok(Cow::Borrowed(mount_point))
 	}
@@ -320,5 +330,45 @@ mod tests {
 		assert!(resolve_mount_point(Some("a")).await.is_err());
 		assert!(resolve_mount_point(Some("AB")).await.is_err());
 		assert!(resolve_mount_point(Some("/path")).await.is_err());
+	}
+}
+
+#[cfg(not(windows))]
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	fn unique_test_path(name: &str) -> String {
+		let nanos = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_nanos();
+		format!("/tmp/filen-rs-{name}-{nanos}")
+	}
+
+	#[tokio::test]
+	async fn test_resolve_mount_point_creates_missing_directory() {
+		let mount_point = unique_test_path("mount-dir");
+		let resolved = resolve_mount_point(Some(&mount_point))
+			.await
+			.unwrap()
+			.into_owned();
+		assert_eq!(resolved, mount_point);
+		assert!(fs::metadata(&resolved).await.unwrap().is_dir());
+		fs::remove_dir_all(&resolved).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn test_resolve_mount_point_rejects_existing_file() {
+		let mount_point = unique_test_path("mount-file");
+		fs::write(&mount_point, b"not a directory").await.unwrap();
+		let error = resolve_mount_point(Some(&mount_point)).await.unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("Mount point exists but is not a directory")
+		);
+		fs::remove_file(&mount_point).await.unwrap();
 	}
 }
