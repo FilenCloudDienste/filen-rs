@@ -25,32 +25,57 @@ pub struct FileReader<'a> {
 	curr_chunk: Option<Cursor<Chunk<'a>>>,
 	futures: FuturesOrdered<MaybeSendBoxFuture<'a, Result<Cursor<Chunk<'a>>, Error>>>,
 	allocate_chunk_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
+	max_buffer_size: u64,
 }
 
-#[allow(private_bounds)]
-impl<'a> FileReader<'a> {
-	pub(crate) fn new(file: &'a dyn File, client: &'a UnauthClient) -> Self {
-		Self::new_for_range(file, client, 0, file.size())
+pub struct FileReaderBuilder<'a> {
+	client: &'a UnauthClient,
+	file: &'a dyn File,
+	start: Option<u64>,
+	end: Option<u64>,
+	max_buffer_size: Option<u64>,
+}
+
+impl<'a> FileReaderBuilder<'a> {
+	pub fn new(client: &'a UnauthClient, file: &'a dyn File) -> FileReaderBuilder<'a> {
+		FileReaderBuilder {
+			client,
+			file,
+			start: None,
+			end: None,
+			max_buffer_size: None,
+		}
 	}
 
-	pub(crate) fn new_for_range(
-		file: &'a dyn File,
-		client: &'a UnauthClient,
-		start: u64,
-		end: u64,
-	) -> Self {
-		let size = file.size();
-		let limit = end.min(size);
-		let index = start.min(limit);
-		let mut new = Self {
-			file,
-			client,
+	pub fn with_start(mut self, start: u64) -> Self {
+		self.start = Some(start);
+		self
+	}
+
+	pub fn with_end(mut self, end: u64) -> Self {
+		self.end = Some(end);
+		self
+	}
+
+	pub fn with_max_buffer_size(mut self, max_buffer_size: u64) -> Self {
+		self.max_buffer_size = Some(max_buffer_size);
+		self
+	}
+
+	pub fn build(self) -> FileReader<'a> {
+		let size = self.file.size();
+		let limit = self.end.unwrap_or(size).min(size);
+		let index = self.start.unwrap_or(0).min(limit);
+		let mut new = FileReader {
+			file: self.file,
+			client: self.client,
 			index,
 			limit,
 			curr_chunk: None,
 			futures: FuturesOrdered::new(),
 			next_chunk_idx: index / CHUNK_SIZE_U64,
 			allocate_chunk_future: None,
+			max_buffer_size: self.max_buffer_size.unwrap_or(size),
 		};
 
 		// allocate memory and prefetch chunks
@@ -60,6 +85,24 @@ impl<'a> FileReader<'a> {
 		new.allocate_chunk_future = new.allocate_next_chunk();
 
 		new
+	}
+}
+
+impl<'a> FileReader<'a> {
+	pub(crate) fn new(file: &'a dyn File, client: &'a UnauthClient) -> Self {
+		FileReaderBuilder::new(client, file).build()
+	}
+
+	pub(crate) fn new_for_range(
+		file: &'a dyn File,
+		client: &'a UnauthClient,
+		start: u64,
+		end: u64,
+	) -> Self {
+		FileReaderBuilder::new(client, file)
+			.with_start(start)
+			.with_end(end)
+			.build()
 	}
 
 	fn next_chunk_size(&self) -> Option<NonZeroU32> {
@@ -81,6 +124,13 @@ impl<'a> FileReader<'a> {
 
 	fn try_allocate_next_chunk(&self) -> Option<Chunk<'a>> {
 		let chunk_size = self.next_chunk_size()?;
+
+		let current_allocated = (self.allocate_chunk_future.is_some() as u64
+			+ self.futures.len() as u64)
+			* CHUNK_SIZE_U64;
+		if current_allocated + u64::from(chunk_size.get()) > self.max_buffer_size {
+			return None;
+		}
 
 		Chunk::try_acquire(chunk_size, self.client.state())
 	}
@@ -161,6 +211,11 @@ impl futures::io::AsyncRead for FileReader<'_> {
 		cx: &mut std::task::Context<'_>,
 		buf: &mut [u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
+		// first try to queue more chunks
+		while let Some(chunk) = self.try_allocate_next_chunk() {
+			self.push_fetch_next_chunk(chunk);
+		}
+
 		// first see if our allocation future is ready
 		let mut should_pend = false;
 		if let Some(mut fut) = self.allocate_chunk_future.take() {

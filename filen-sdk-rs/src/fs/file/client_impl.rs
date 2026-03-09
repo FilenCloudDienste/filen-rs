@@ -315,20 +315,6 @@ impl Client {
 
 #[allow(private_bounds)]
 pub trait FileReaderSharedClientExt<'a>: SharedClient {
-	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a>;
-
-	fn get_file_reader_for_range(
-		&'a self,
-		file: &'a dyn File,
-		start: u64,
-		end: u64,
-	) -> FileReader<'a>;
-}
-
-impl<'a, T> FileReaderSharedClientExt<'a> for T
-where
-	T: SharedClient,
-{
 	fn get_file_reader(&'a self, file: &'a dyn File) -> FileReader<'a> {
 		FileReader::new(file, self.get_unauth_client())
 	}
@@ -342,3 +328,5 @@ where
 		FileReader::new_for_range(file, self.get_unauth_client(), start, end)
 	}
 }
+
+impl<'a, T> FileReaderSharedClientExt<'a> for T where T: SharedClient {}
