@@ -2,13 +2,18 @@ use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 use crate::{
 	Error,
-	auth::JsClient,
+	auth::{JsClient, js_impls::UnauthJsClient},
 	error::FilenSdkError,
-	fs::categories::{Category, DirType, Linked, NonRootItemType, Normal, Shared, fs::CategoryFS},
-	io::{DirDownloadCallback, dir_download::CategoryDirDownloadExt},
+	fs::{
+		categories::{Category, DirType, Linked, NonRootItemType, Normal, Shared, fs::CategoryFS},
+		file::enums::RemoteFileType,
+	},
+	io::{
+		DirDownloadCallback, client_impl::IoSharedClientExt, dir_download::CategoryDirDownloadExt,
+	},
 	js::{
-		AnyDirWithContext, AnyNormalDir, Dir, DirByCategoryWithContext, DirWithPath, File,
-		FileWithPath, NonRootDir, NonRootItem,
+		AnyDirWithContext, AnyFile, AnyNormalDir, Dir, DirByCategoryWithContext, DirWithPath, File,
+		FileWithPath, LinkedFile, NonRootDir, NonRootItem,
 	},
 	util::MaybeSendCallback,
 };
@@ -338,7 +343,7 @@ impl JsClient {
 
 	pub async fn download_file_to_path(
 		&self,
-		file: File,
+		file: AnyFile,
 		file_path: String,
 		callback: Option<Arc<dyn JsFileDownloadCallback>>,
 		managed_future: crate::js::ManagedFuture,
@@ -355,7 +360,7 @@ impl JsClient {
 					}) as MaybeSendCallback<u64>
 				});
 
-				let file: crate::io::RemoteFile = file.try_into()?;
+				let file: RemoteFileType = file.try_into()?;
 				let target_path = PathBuf::from(file_path);
 				super::client_impl::IoSharedClientExt::download_file_to_path(
 					this.as_ref(),
@@ -382,5 +387,35 @@ impl PathToStringExt for PathBuf {
 			Ok(s) => s,
 			Err(s) => s.to_string_lossy().into_owned(),
 		}
+	}
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl UnauthJsClient {
+	pub async fn download_file_to_path(
+		&self,
+		file: LinkedFile,
+		file_path: String,
+		callback: Option<Arc<dyn JsFileDownloadCallback>>,
+		managed_future: crate::js::ManagedFuture,
+	) -> Result<(), Error> {
+		let this = self.inner();
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let callback = callback.as_ref().map(|cb| {
+					Arc::new(|downloaded_bytes| {
+						let inner_cb = Arc::clone(cb);
+						tokio::task::spawn_blocking(move || {
+							JsFileDownloadCallback::on_update(inner_cb.as_ref(), downloaded_bytes);
+						});
+					}) as MaybeSendCallback<u64>
+				});
+
+				let file: crate::fs::file::LinkedFile = file.try_into()?;
+				let target_path = PathBuf::from(file_path);
+				this.download_file_to_path(&file, target_path, callback)
+					.await
+			})
+			.await
 	}
 }
