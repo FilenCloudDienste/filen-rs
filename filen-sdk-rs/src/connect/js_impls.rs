@@ -17,7 +17,7 @@ use crate::{
 	fs::categories::{DirType, Linked},
 	js::{
 		AnyLinkedDir, AnySharedDir, Dir, File, LinkedDir, LinkedDirsAndFiles, LinkedFile,
-		NormalDirsAndFiles, SharedDir, SharedFileTagged, SharedRootDirTagged, SharedRootItem,
+		NormalDirsAndFiles, SharedDir, SharedFile, SharedRootDir, SharedRootItem,
 	},
 	runtime::{self, do_on_commander},
 };
@@ -212,8 +212,8 @@ pub struct SharedDirsAndFiles {
 
 #[js_type(export, no_deser)]
 pub struct SharedRootDirsAndFiles {
-	pub dirs: Vec<SharedRootDirTagged>,
-	pub files: Vec<SharedFileTagged>,
+	pub dirs: Vec<SharedRootDir>,
+	pub files: Vec<SharedFile>,
 }
 
 #[cfg(feature = "uniffi")]
@@ -709,12 +709,9 @@ impl JsClient {
 				.map(|(dirs, files)| {
 					(
 						dirs.into_iter()
-							.map(SharedRootDirTagged::from)
+							.map(SharedRootDir::from)
 							.collect::<Vec<_>>(),
-						files
-							.into_iter()
-							.map(SharedFileTagged::from)
-							.collect::<Vec<_>>(),
+						files.into_iter().map(SharedFile::from).collect::<Vec<_>>(),
 					)
 				})
 		})
@@ -740,12 +737,9 @@ impl JsClient {
 			.map(|(dirs, files)| {
 				(
 					dirs.into_iter()
-						.map(SharedRootDirTagged::from)
+						.map(SharedRootDir::from)
 						.collect::<Vec<_>>(),
-					files
-						.into_iter()
-						.map(SharedFileTagged::from)
-						.collect::<Vec<_>>(),
+					files.into_iter().map(SharedFile::from).collect::<Vec<_>>(),
 				)
 			})
 		})

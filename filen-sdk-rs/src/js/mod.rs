@@ -34,7 +34,6 @@ pub(crate) use categories::{
 pub(crate) use categories::{
 	common::enums::{NonRootItemTagged, dir::NonRootDirTagged},
 	normal::NonRootNormalItemTagged,
-	shared::{SharedFileTagged, SharedRootDirTagged},
 };
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]

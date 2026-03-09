@@ -20,9 +20,6 @@ use crate::{
 	},
 };
 
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use crate::connect::fs::SharingRoleTagged;
-
 impl CategoryJSExt for Shared {
 	type RootJS = SharedRootDir;
 	type DirJS = SharedDir;
@@ -33,7 +30,6 @@ impl CategoryJSExt for Shared {
 #[js_type(export)]
 pub struct SharedRootDir {
 	inner: RootDirWithMeta,
-	#[js_type_tagged]
 	sharing_role: SharingRole,
 	write_access: bool,
 }
@@ -92,7 +88,6 @@ pub struct SharedFile {
 	chunks: u64,
 	timestamp: DateTime<Utc>,
 	meta: FileMeta,
-	#[js_type_tagged]
 	sharing_role: SharingRole,
 	__shared_tag: bool,
 }
@@ -160,7 +155,7 @@ impl From<RootItemType<'static, Shared>> for SharedRootItem {
 #[js_type(import, export)]
 pub enum AnySharedDir {
 	Dir(SharedDir),
-	Root(#[js_type_tagged] SharedRootDir),
+	Root(SharedRootDir),
 }
 
 impl From<AnySharedDir> for DirType<'static, Shared> {

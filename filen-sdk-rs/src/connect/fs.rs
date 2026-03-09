@@ -40,7 +40,7 @@ pub struct ShareInfo {
 	pub id: u64,
 }
 
-#[js_type(import, export, wasm_all)]
+#[js_type(import, export, wasm_all, tagged)]
 pub enum SharingRole {
 	Sharer(ShareInfo),
 	Receiver(ShareInfo),
