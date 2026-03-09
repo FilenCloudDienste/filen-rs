@@ -30,8 +30,8 @@ pub struct AnySharedDirWithContext {
 #[js_type(import)]
 pub struct AnyLinkedDirWithContext {
 	#[js_type_tagged]
-	dir: AnyLinkedDir,
-	link: DirPublicLink,
+	pub(crate) dir: AnyLinkedDir,
+	pub(crate) link: DirPublicLink,
 }
 
 pub(crate) enum DirByCategoryWithContext {

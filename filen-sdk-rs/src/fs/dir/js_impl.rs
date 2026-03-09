@@ -2,7 +2,7 @@ use std::{borrow::Cow, sync::Arc};
 
 use crate::{
 	Error,
-	auth::{Client, JsClient},
+	auth::{Client, JsClient, js_impls::UnauthJsClient},
 	fs::{
 		categories::{
 			DirType, Normal,
@@ -11,9 +11,9 @@ use crate::{
 		dir::meta::DirectoryMetaChanges,
 	},
 	js::{
-		AnyDirWithContext, AnyNormalDir, Dir, DirByCategoryWithContext, DirColor, DirWithPath,
-		DirsAndFiles, DirsAndFilesWithPaths, File, FileWithPath, NonRootDirTagged,
-		NonRootItemTagged, NormalDirsAndFiles, Root,
+		AnyDirWithContext, AnyLinkedDirWithContext, AnyNormalDir, Dir, DirByCategoryWithContext,
+		DirColor, DirSizeResponse, DirWithPath, DirsAndFiles, DirsAndFilesWithPaths, File,
+		FileWithPath, NonRootDirTagged, NonRootItemTagged, NormalDirsAndFiles, Root,
 	},
 	runtime::do_on_commander,
 };
@@ -545,24 +545,34 @@ impl JsClient {
 		.await
 	}
 
-	// #[cfg_attr(
-	// 	all(target_family = "wasm", target_os = "unknown"),
-	// 	wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirSize")
-	// )]
-	// pub async fn get_dir_size(&self, dir: AnyDirWithContext) -> Result<DirSizeResponse, Error> {
-	// 	let this = self.inner();
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirSize")
+	)]
+	pub async fn get_dir_size(&self, dir: AnyDirWithContext) -> Result<DirSizeResponse, Error> {
+		let this = self.inner();
 
-	// 	do_on_commander(move || async move {
-	// 		this.get_dir_size(DirectoryTypeWithShareInfo::from(dir))
-	// 			.await
-	// 			.map(|resp| DirSizeResponse {
-	// 				size: resp.size,
-	// 				files: resp.files,
-	// 				dirs: resp.dirs,
-	// 			})
-	// 	})
-	// 	.await
-	// }
+		do_on_commander(move || async move {
+			let dir_by_category = DirByCategoryWithContext::from(dir);
+
+			let info = match dir_by_category {
+				DirByCategoryWithContext::Normal(dir) => Normal::dir_size(&*this, &dir, ()).await?,
+				DirByCategoryWithContext::Shared(dir, share_info) => {
+					Shared::dir_size(&*this, &dir, &share_info).await?
+				}
+				DirByCategoryWithContext::Linked(dir, link_info) => {
+					Linked::dir_size(this.unauthed(), &dir, Cow::Owned(link_info)).await?
+				}
+			};
+
+			Ok(DirSizeResponse {
+				size: info.size,
+				files: info.files,
+				dirs: info.dirs,
+			})
+		})
+		.await
+	}
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -606,5 +616,36 @@ impl JsClient {
 		#[wasm_bindgen(unchecked_param_type = "DirColor")] color: DirColor,
 	) -> Result<Dir, Error> {
 		self.set_dir_color(dir, color).await
+	}
+}
+
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl UnauthJsClient {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirSize")
+	)]
+	pub async fn get_dir_size(
+		&self,
+		dir: AnyLinkedDirWithContext,
+	) -> Result<DirSizeResponse, Error> {
+		let this = self.inner();
+
+		do_on_commander(move || async move {
+			let parsed_dir = DirType::from(dir.dir);
+
+			Linked::dir_size(&*this, &parsed_dir, Cow::Owned(dir.link))
+				.await
+				.map(|resp| DirSizeResponse {
+					size: resp.size,
+					files: resp.files,
+					dirs: resp.dirs,
+				})
+		})
+		.await
 	}
 }

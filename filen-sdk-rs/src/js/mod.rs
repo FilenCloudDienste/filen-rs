@@ -18,7 +18,9 @@ pub(crate) use categories::{
 		dir::{color::DirColor, meta::DirMeta},
 		enums::{
 			NonRootItem,
-			dir::{AnyDirWithContext, DirByCategoryWithContext, NonRootDir},
+			dir::{
+				AnyDirWithContext, AnyLinkedDirWithContext, DirByCategoryWithContext, NonRootDir,
+			},
 			file::AnyFile,
 		},
 		file::{File, meta::FileMeta, version::FileVersion},
