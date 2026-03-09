@@ -261,7 +261,7 @@ impl JsClient {
 			.await
 	}
 
-	pub async fn download_dir_recurisively(
+	pub async fn download_dir_recursively(
 		&self,
 		dir_path: String,
 		callback: Arc<dyn JsDirDownloadCallback>,
