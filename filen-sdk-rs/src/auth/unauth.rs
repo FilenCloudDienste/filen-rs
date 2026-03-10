@@ -38,6 +38,9 @@ use crate::{
 	fs::dir::RootDirectory,
 };
 
+#[cfg(feature = "http-provider")]
+use {crate::http_provider::HttpProviderHandle, std::sync::Weak, tokio::sync::Mutex};
+
 use super::{v1, v2, v3};
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
@@ -45,6 +48,8 @@ use super::{v1, v2, v3};
 pub struct UnauthClient {
 	pub(crate) state: SharedClientState,
 	pub(crate) reqwest_client: reqwest::Client,
+	#[cfg(feature = "http-provider")]
+	pub(crate) http_provider: Arc<Mutex<Weak<HttpProviderHandle>>>,
 }
 
 impl UnauthClient {
@@ -53,6 +58,8 @@ impl UnauthClient {
 		Ok(Self {
 			reqwest_client: reqwest::Client::new(),
 			state,
+			#[cfg(feature = "http-provider")]
+			http_provider: Arc::new(Mutex::new(Weak::new())),
 		})
 	}
 

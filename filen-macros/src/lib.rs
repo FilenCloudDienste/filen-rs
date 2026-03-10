@@ -1450,15 +1450,19 @@ fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
 			},
 		)
 	} else if state.tagged {
-		let into_abi = if state.into_abi.is_empty() {
+		let into_abi = if state.no_ser {
+			quote! {}
+		} else if state.into_abi.is_empty() {
 			quote! {
 				derive(serde::Serialize),
+				serde(tag = "type", rename_all = "camelCase")
 			}
 		} else {
 			let into_abi = add_comma_if_needed(state.into_abi);
 			quote! {
 				#into_abi
 				derive(serde::Serialize),
+				serde(tag = "type", rename_all = "camelCase")
 			}
 		};
 
@@ -1466,26 +1470,28 @@ fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
 			quote! {},
 			quote! {
 				#into_abi
-				serde(tag = "type", rename_all = "camelCase")
 			},
 		)
 	} else if state.untagged {
-		let into_abi = if state.into_abi.is_empty() {
+		let into_abi = if state.no_ser {
+			quote! {}
+		} else if state.into_abi.is_empty() {
 			quote! {
 				derive(serde::Serialize),
+				serde(untagged, rename_all = "camelCase")
 			}
 		} else {
 			let into_abi = add_comma_if_needed(state.into_abi);
 			quote! {
 				#into_abi
 				derive(serde::Serialize),
+				serde(untagged, rename_all = "camelCase")
 			}
 		};
 		(
 			quote! {},
 			quote! {
 				#into_abi
-				serde(untagged, rename_all = "camelCase")
 			},
 		)
 	} else {

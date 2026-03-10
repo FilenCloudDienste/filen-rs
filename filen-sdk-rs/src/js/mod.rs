@@ -30,6 +30,9 @@ pub(crate) use categories::{
 	shared::{AnySharedDir, SharedDir, SharedFile, SharedRootDir, SharedRootItem},
 };
 
+#[cfg(feature = "http-provider")]
+pub(crate) use categories::common::enums::file::ProviderAnyFile;
+
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub(crate) use categories::{
 	common::enums::{NonRootItemTagged, dir::NonRootDirTagged},

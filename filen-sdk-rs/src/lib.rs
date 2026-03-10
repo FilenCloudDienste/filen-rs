@@ -10,6 +10,8 @@ pub mod consts;
 pub mod crypto;
 pub mod error;
 pub mod fs;
+#[cfg(all(feature = "http-provider", feature = "uniffi"))]
+pub mod http_provider;
 pub mod io;
 #[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js;

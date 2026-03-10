@@ -12,7 +12,9 @@ use crate::{
 	fs::file::meta::{DecryptedFileMeta as DecryptedFileMetaRs, FileMeta as FileMetaRs},
 };
 
-#[js_type(wasm_all)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[js_type(wasm_all, no_deser, no_ser)]
 pub struct DecryptedFileMeta {
 	pub name: String,
 	pub mime: String,
@@ -81,7 +83,9 @@ impl TryFrom<DecryptedFileMeta> for DecryptedFileMetaRs<'static> {
 	}
 }
 
-#[js_type(tagged, wasm_all)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+#[js_type(tagged, wasm_all, no_deser, no_ser)]
 pub enum FileMeta {
 	Decoded(DecryptedFileMeta),
 	DecryptedUTF8(String),

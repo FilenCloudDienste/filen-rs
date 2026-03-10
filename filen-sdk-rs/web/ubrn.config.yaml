@@ -4,14 +4,14 @@ rust:
   manifestPath: filen-sdk-rs/Cargo.toml
 
 android:
-  cargoExtras: ['--features', 'uniffi,heif-decoder']
+  cargoExtras: ['--features', 'uniffi,heif-decoder,http-provider']
   targets:
     - arm64-v8a
     - x86_64
   useSharedLibrary: true
 
 ios:
-  cargoExtras: ['--features', 'uniffi,heif-decoder']
+  cargoExtras: ['--features', 'uniffi,heif-decoder,http-provider']
   targets:
     - aarch64-apple-ios
     - aarch64-apple-ios-sim

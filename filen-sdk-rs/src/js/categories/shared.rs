@@ -79,7 +79,9 @@ impl From<SharedDir> for SharedDirectory {
 	}
 }
 
-#[js_type(export, wasm_all)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[js_type(export, wasm_all, no_deser, no_ser)]
 pub struct SharedFile {
 	uuid: UuidStr,
 	size: u64,

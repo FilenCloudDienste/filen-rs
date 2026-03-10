@@ -34,13 +34,16 @@ use crate::{
 	io::HasFileInfo,
 };
 
-#[js_type(wasm_all)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[js_type(wasm_all, no_deser, no_ser)]
 pub struct ShareInfo {
 	pub email: String,
 	pub id: u64,
 }
 
-#[js_type(import, export, wasm_all, tagged)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+#[js_type(import, export, wasm_all, tagged, no_deser, no_ser)]
 pub enum SharingRole {
 	Sharer(ShareInfo),
 	Receiver(ShareInfo),

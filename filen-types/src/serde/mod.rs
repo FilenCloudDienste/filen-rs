@@ -1,5 +1,5 @@
 pub(crate) mod boolean;
-pub(crate) mod cow;
+pub mod cow;
 pub(crate) mod hex;
 pub(crate) mod number;
 pub(crate) mod option;

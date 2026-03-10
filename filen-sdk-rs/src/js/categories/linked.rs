@@ -23,7 +23,9 @@ impl CategoryJSExt for Linked {
 	type RootFileJS = LinkedFile;
 }
 
-#[js_type(wasm_all)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[js_type(wasm_all, no_deser, no_ser)]
 pub struct LinkedFile {
 	uuid: UuidStr,
 	name: MaybeEncrypted<'static, str>,

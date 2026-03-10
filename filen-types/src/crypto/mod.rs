@@ -65,16 +65,16 @@ impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, CowHelpers)]
+#[derive(Debug, PartialEq, Eq, CowHelpers, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	derive(tsify::Tsify, serde::Serialize, serde::Deserialize),
-	tsify(into_wasm_abi, from_wasm_abi),
-	serde(bound(
-		serialize = "T: serde::Serialize, T::Owned: serde::Serialize",
-		deserialize = "T::Owned: serde::de::DeserializeOwned"
-	))
+	derive(tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi)
 )]
+#[serde(bound(
+	serialize = "T: serde::Serialize, T::Owned: serde::Serialize",
+	deserialize = "T::Owned: serde::de::DeserializeOwned"
+))]
 pub enum MaybeEncrypted<'a, T>
 where
 	T: ToOwned + ?Sized,
