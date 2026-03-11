@@ -1,7 +1,7 @@
 ---
 name: wasm-test-refactor
 description: "Use this agent when the Rust SDK has been updated and the TypeScript WASM tests in filen-sdk-rs/web/main.test.ts need to be updated to reflect those changes. This agent should be invoked after making changes to the Rust SDK that affect the WASM-exposed API surface.\\n\\n<example>\\nContext: The user has just updated the Rust SDK's WASM bindings, changing function signatures or exported types.\\nuser: \"I've updated the authentication API in filen-sdk-rs to use the new V3 auth flow. The WASM bindings have changed accordingly.\"\\nassistant: \"I'll use the wasm-test-refactor agent to compile the updated SDK and update the TypeScript tests to match the new API.\"\\n<commentary>\\nSince the Rust SDK's WASM surface has changed, use the wasm-test-refactor agent to rebuild and reconcile the TS tests.\\n</commentary>\\n</example>\\n\\n<example>\\nContext: A developer notices the TS tests are failing after a Rust SDK update.\\nuser: \"The TypeScript tests are all failing after the recent SDK changes. Can you fix the tests?\"\\nassistant: \"Let me launch the wasm-test-refactor agent to compile the updated WASM build and reconcile the test file with the new API.\"\\n<commentary>\\nTest failures after SDK updates are exactly the trigger for the wasm-test-refactor agent.\\n</commentary>\\n</example>"
-model: sonnet[1m]
+model: sonnet
 color: blue
 memory: project
 ---

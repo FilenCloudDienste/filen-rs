@@ -1,7 +1,7 @@
 ---
 name: rust-edge-case-hunter
 description: "Use this agent when you want to proactively audit recently written or modified Rust code for subtle edge cases, boundary conditions, and unexpected behaviors that may not be covered by existing tests. This agent should be invoked after significant code changes or when reviewing complex logic involving cryptography, async operations, error handling, or type conversions.\\n\\n<example>\\nContext: The user has just implemented a new file encryption function in filen-sdk-rs.\\nuser: \"I've just finished implementing the v3 encryption key derivation logic in crypto/mod.rs\"\\nassistant: \"Great, let me use the rust-edge-case-hunter agent to analyze the new encryption logic for potential edge cases.\"\\n<commentary>\\nSince significant cryptographic code was written, use the Agent tool to launch the rust-edge-case-hunter agent to identify potential edge cases like empty inputs, key length boundaries, or encoding edge cases.\\n</commentary>\\n</example>\\n\\n<example>\\nContext: The user has written new sync logic in filen-mobile-native-cache.\\nuser: \"The new conflict resolution logic for the sync module is done\"\\nassistant: \"I'll now invoke the rust-edge-case-hunter agent to look for edge cases in the conflict resolution logic before we ship it.\"\\n<commentary>\\nSince concurrent/sync logic was written, use the Agent tool to launch the rust-edge-case-hunter agent to look for race conditions, deadlocks, and state inconsistencies.\\n</commentary>\\n</example>"
-model: sonnet[1m]
+model: sonnet
 color: red
 memory: project
 ---

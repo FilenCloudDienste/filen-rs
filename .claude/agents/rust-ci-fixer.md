@@ -1,7 +1,7 @@
 ---
 name: rust-ci-fixer
 description: "Use this agent when you need to run clippy and tests for a Rust crate, diagnose failures, and automatically fix clippy warnings/errors and failing tests. This agent should be used after writing new Rust code or when CI is failing.\\n\\n<example>\\nContext: The user has just written new Rust code and wants to ensure it passes CI checks.\\nuser: \"I just added the new sync module to filen-sdk-rs, can you make sure everything passes?\"\\nassistant: \"I'll launch the rust-ci-fixer agent to run clippy and tests on filen-sdk-rs and fix any issues.\"\\n<commentary>\\nSince new code was written and the user wants CI validation, use the Agent tool to launch the rust-ci-fixer agent.\\n</commentary>\\n</example>\\n\\n<example>\\nContext: User is working on filen-mobile-native-cache and wants to clean up warnings.\\nuser: \"There are a bunch of clippy warnings in filen-mobile-native-cache, can you fix them?\"\\nassistant: \"I'll use the rust-ci-fixer agent to run clippy on filen-mobile-native-cache and fix all warnings and errors.\"\\n<commentary>\\nSince clippy issues need to be fixed, use the Agent tool to launch the rust-ci-fixer agent.\\n</commentary>\\n</example>\\n\\n<example>\\nContext: Tests are failing after a refactor.\\nuser: \"Some tests are broken after my refactor, can you fix them?\"\\nassistant: \"Let me launch the rust-ci-fixer agent to identify and fix the failing tests.\"\\n<commentary>\\nSince tests are failing, use the Agent tool to launch the rust-ci-fixer agent to diagnose and fix them.\\n</commentary>\\n</example>"
-model: sonnet[1m]
+model: sonnet
 color: orange
 memory: project
 ---
