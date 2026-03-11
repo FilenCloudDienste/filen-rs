@@ -53,7 +53,7 @@ impl FromStr for EncryptionKey {
 			return Err(ConversionError::InvalidStringLength(key.len(), 64));
 		}
 		let mut array = [0u8; 32];
-		faster_hex::hex_decode(key.as_bytes(), &mut array).expect("Invalid hex string");
+		faster_hex::hex_decode(key.as_bytes(), &mut array)?;
 		Ok(Self::new(array))
 	}
 }

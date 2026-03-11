@@ -48,6 +48,9 @@ fn evp_bytes_to_key<'a>(
 }
 
 fn decrypt(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
+	if data.len() < 16 {
+		return Err(ConversionError::InvalidStringLength(data.len(), 16));
+	}
 	let salt = &data[8..16];
 	let mut tmp = [0u8; KEY_LEN + IV_LEN];
 	let (key_bytes, iv_bytes) = evp_bytes_to_key(key, salt, IV_LEN, &mut tmp);
@@ -70,9 +73,6 @@ fn decrypt_meta(
 	out.clear();
 	if let Err(e) = BASE64_STANDARD.decode_vec(meta.0.as_ref(), &mut out) {
 		return Err((e.into(), out));
-	}
-	if out.len() < 16 {
-		return Err((ConversionError::InvalidStringLength(out.len(), 16), out));
 	}
 
 	if let Err(e) = decrypt(key, &mut out) {
@@ -173,6 +173,7 @@ impl FromStr for FileKey {
 
 impl DataCrypter for FileKey {
 	fn blocking_encrypt_data(&self, _data: &mut Vec<u8>) -> Result<(), ConversionError> {
+		// this is intentional, do not write code for this, this does not need to be supported
 		unimplemented!("Data encryption for V1 is not supported");
 	}
 

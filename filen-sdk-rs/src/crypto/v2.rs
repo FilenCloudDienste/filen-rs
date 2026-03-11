@@ -262,7 +262,7 @@ impl MasterKeys {
 			.split('|')
 			.map(MasterKey::from_str)
 			.collect::<Result<Vec<_>, ConversionError>>()?;
-		if keys.is_empty() {
+		if keys.is_empty() || decrypted.is_empty() {
 			return Err(ConversionError::InvalidStringLength(decrypted.len(), 1));
 		}
 		Ok(Self(keys))
