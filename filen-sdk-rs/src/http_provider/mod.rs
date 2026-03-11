@@ -127,6 +127,15 @@ impl HttpProviderHandle {
 	}
 }
 
+#[cfg(feature = "uniffi")]
+#[uniffi::export]
+impl HttpProviderHandle {
+	#[uniffi::method(name = "getFileUrl")]
+	pub fn get_file_url_uniffi(&self, file: crate::js::AnyFile) -> Result<String, Error> {
+		Ok(self.get_file_url(&file.try_into()?))
+	}
+}
+
 #[derive(Clone)]
 struct ProviderState {
 	client: Arc<UnauthClient>,
