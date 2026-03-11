@@ -182,12 +182,10 @@ fn get_real_bounds(file: &RemoteFileType, (start, end): (Bound<u64>, Bound<u64>)
 
 fn single_range_response_builder(
 	file: RemoteFileType<'static>,
-	range: (Bound<u64>, Bound<u64>),
+	(start, end): (u64, u64),
 	client: Arc<UnauthClient>,
 	mut builder: response::Builder,
 ) -> Result<Response, http::Error> {
-	let (start, end) = get_real_bounds(&file, range);
-
 	let size = file.size();
 
 	let status = if start == 0 && end == size {
@@ -198,7 +196,11 @@ fn single_range_response_builder(
 
 	builder = builder
 		.status(status)
-		.header(CONTENT_LENGTH, end.saturating_sub(start).to_string());
+		.header(CONTENT_LENGTH, end.saturating_sub(start).to_string())
+		.header(
+			CONTENT_TYPE,
+			file.mime().unwrap_or("application/octet-stream"),
+		);
 
 	let stream = async_stream::stream! {
 		let mut reader = FileReaderBuilder::new(&client, &file)
@@ -225,11 +227,51 @@ fn single_range_response_builder(
 }
 
 fn multiple_range_response_builder(
-	_file: RemoteFileType<'static>,
-	_ranges: Vec<(Bound<u64>, Bound<u64>)>,
-	_client: Arc<UnauthClient>,
+	file: RemoteFileType<'static>,
+	ranges: Vec<(u64, u64)>,
+	client: Arc<UnauthClient>,
+	mut builder: response::Builder,
 ) -> Result<Response, http::Error> {
-	todo!()
+	let boundary = BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>());
+	builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
+		CONTENT_TYPE,
+		format!("multipart/byteranges; boundary={}", boundary),
+	);
+
+	let stream = async_stream::stream! {
+		let mime = file.mime().unwrap_or("application/octet-stream");
+		let mut first = true;
+		for (start, end) in ranges {
+			// RFC 2046 §5.1: encapsulation boundary is CRLF + "--" + boundary.
+			// The first boundary has no leading CRLF (it is the dash-boundary itself).
+			let prefix = if first { "" } else { "\r\n" };
+			first = false;
+			let header = format!(
+				"{prefix}--{boundary}\r\nContent-Type: {mime}\r\nContent-Range: bytes {start}-{end_incl}/{size}\r\n\r\n",
+				end_incl = end.saturating_sub(1),
+				size = file.size(),
+			);
+			yield Ok(header.into_bytes());
+			let mut reader = FileReaderBuilder::new(&client, &file)
+				.with_start(start)
+				.with_end(end)
+				.build();
+			let mut buf = vec![0; 8192];
+			loop {
+				match reader.read(&mut buf).await {
+					Ok(0) => break, // EOF
+					Ok(n) => yield Ok(buf[..n].to_vec()),
+					Err(e) => {
+						yield Err(e);
+					}
+				}
+			}
+		}
+		// RFC 2046 §5.1: close-delimiter is CRLF + "--" + boundary + "--".
+		yield Ok(format!("\r\n--{boundary}--\r\n").into_bytes());
+	};
+
+	builder.body(axum::body::Body::from_stream(stream))
 }
 
 async fn file_handler(
@@ -237,42 +279,52 @@ async fn file_handler(
 	State(state): State<ProviderState>,
 	range: Option<TypedHeader<Range>>,
 ) -> impl IntoResponse {
-	let mut ranges = if let Some(TypedHeader(range)) = range {
+	let ranges = if let Some(TypedHeader(range)) = range {
 		range
 			.satisfiable_ranges(params.file.size())
+			.filter_map(|r| {
+				let (start, end) = get_real_bounds(&params.file, r);
+				if start < end {
+					Some((start, end))
+				} else {
+					None
+				}
+			})
 			.collect::<Vec<_>>()
 	} else {
-		Vec::new()
+		vec![(0, params.file.size())]
 	};
 
-	if ranges.is_empty() {
-		ranges.push((Bound::Included(0), Bound::Unbounded))
-	}
+	let response_builder = http::Response::builder().header(http::header::ACCEPT_RANGES, "bytes");
 
-	let response_builder = http::Response::builder()
-		.header(
-			CONTENT_TYPE,
-			params.file.mime().unwrap_or("application/octet-stream"),
-		)
-		.header(http::header::ACCEPT_RANGES, "bytes");
-
-	let response = if ranges.len() == 1 {
-		single_range_response_builder(
+	match ranges {
+		ranges if let [range] = *ranges => single_range_response_builder(
 			params.file,
-			ranges[0],
+			range,
 			state.client.clone(),
 			response_builder,
-		)
-	} else {
-		multiple_range_response_builder(params.file, ranges, state.client.clone())
-	};
-	match response {
-		Ok(response) => response,
-		Err(e) => http::Response::builder()
+		),
+		ranges if ranges.is_empty() => response_builder
+			.status(StatusCode::RANGE_NOT_SATISFIABLE)
+			.header(
+				http::header::CONTENT_RANGE,
+				format!("bytes */{}", params.file.size()),
+			)
+			.body(axum::body::Body::empty()),
+
+		ranges => multiple_range_response_builder(
+			params.file,
+			ranges,
+			state.client.clone(),
+			response_builder,
+		),
+	}
+	.unwrap_or_else(|e| {
+		http::Response::builder()
 			.status(StatusCode::INTERNAL_SERVER_ERROR)
 			.body(axum::body::Body::from(format!(
 				"Error building response: {e}"
 			)))
-			.expect("should always be able to build a response"),
-	}
+			.expect("should always be able to build a response")
+	})
 }

@@ -1736,6 +1736,7 @@ dependencies = [
  "md2",
  "md4",
  "mime_guess 2.0.5 (git+https://github.com/abonander/mime_guess?rev=90f3d09696f7c08dcac94ca2bb2a279383bb20ce)",
+ "multer",
  "oslog",
  "parking_lot",
  "pbkdf2",

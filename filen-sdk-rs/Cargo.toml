@@ -179,6 +179,7 @@ futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
 # dev-dependencies
 # native (not wasm) only dev-dependencies
 [target.'cfg(not(all(target_family="wasm", target_os= "unknown")))'.dev-dependencies]
+multer = "3.1.0"
 dotenv = "0.15.0"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = { version = "0.7.16", default-features = false, features = [

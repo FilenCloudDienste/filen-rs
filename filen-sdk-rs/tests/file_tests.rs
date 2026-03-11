@@ -645,26 +645,6 @@ async fn file_versions() {
 /// HTTP provider tests.
 ///
 /// Run with: `cargo test -p filen-sdk-rs --features http-provider,uniffi --test file_tests`
-///
-/// Known bugs (tests below document their behaviour):
-///
-/// 1. **Content-Length is off by one** (`single_range_response_builder`).
-///    The header value is `end - start` but the range is inclusive, so it should be
-///    `end - start + 1`.  A full-file request for a 13-byte file reports `Content-Length: 12`.
-///
-/// 2. **Empty-file overflow** (`get_real_bounds`).
-///    `file.size() - 1` wraps to `u64::MAX` when the file is empty (size == 0), which
-///    panics in debug / test builds due to integer overflow checks.
-///
-/// 3. **Missing `Content-Range` header in 206 responses** (RFC 7233 §4.1).
-///    When the server returns 206 Partial Content it must include a `Content-Range` header,
-///    but currently none is emitted.
-///
-/// 4. **Unsatisfiable range leads to `todo!()` panic**.
-///    A `Range` header whose bounds lie entirely outside the file size causes
-///    `satisfiable_ranges` to return an empty iterator.  The code then calls
-///    `multiple_range_response_builder` (which is `todo!()`), panicking instead of
-///    returning 416 Range Not Satisfiable.
 #[cfg(feature = "http-provider")]
 mod http_provider_tests {
 	use filen_macros::shared_test_runtime;
@@ -682,10 +662,32 @@ mod http_provider_tests {
 		client.upload_file(file.into(), contents).await.unwrap()
 	}
 
+	/// Parses a `multipart/byteranges` response body into `(headers, body)` pairs.
+	async fn parse_multipart_body(
+		body: bytes::Bytes,
+		content_type: &str,
+	) -> Vec<(http::HeaderMap, bytes::Bytes)> {
+		let boundary = content_type
+			.split(';')
+			.map(str::trim)
+			.find_map(|s| s.strip_prefix("boundary="))
+			.unwrap_or_else(|| panic!("no boundary in content-type: {content_type}"))
+			.to_string();
+		let stream = futures::stream::once(async move { Ok::<_, std::convert::Infallible>(body) });
+		let mut multipart = multer::Multipart::new(stream, boundary);
+		let mut parts = Vec::new();
+		while let Some(field) = multipart.next_field().await.unwrap() {
+			let headers = field.headers().clone();
+			let body = field.bytes().await.unwrap();
+			parts.push((headers, body));
+		}
+		parts
+	}
+
 	// ─── basic serving ────────────────────────────────────────────────────────
 
-	/// The provider serves the full file contents when no Range header is sent.
-	/// Also documents Bug 1: Content-Length is off by one for this case.
+	/// The provider serves the full file when no Range header is sent:
+	/// 200 OK, correct Content-Length, Accept-Ranges: bytes, and correct body.
 	#[shared_test_runtime]
 	async fn http_provider_full_file_download() {
 		let resources = test_utils::RESOURCES.get_resources().await;
@@ -707,7 +709,16 @@ mod http_provider_tests {
 			.and_then(|v| v.to_str().ok())
 			.and_then(|v| v.parse().ok())
 			.expect("server must set Content-Length");
-		assert_eq!(content_length, content.len() as u64,);
+		assert_eq!(content_length, content.len() as u64);
+
+		assert_eq!(
+			response
+				.headers()
+				.get("accept-ranges")
+				.and_then(|v| v.to_str().ok()),
+			Some("bytes"),
+			"server must advertise Accept-Ranges: bytes"
+		);
 
 		let body = response.bytes().await.unwrap();
 		assert_eq!(&body[..], content);
@@ -762,22 +773,23 @@ mod http_provider_tests {
 		);
 	}
 
-	/// A partial range request returns the correct bytes and 206 Partial Content status.
-	/// Also documents Bug 1 (Content-Length) and Bug 3 (missing Content-Range header).
+	// ─── single-range requests ────────────────────────────────────────────────
+
+	/// A partial range request (bytes=7-12) returns 206 with a correct Content-Range
+	/// header, correct Content-Length, and the expected byte slice.
 	#[shared_test_runtime]
 	async fn http_provider_range_request() {
 		let resources = test_utils::RESOURCES.get_resources().await;
 		let client = &resources.client;
 		let test_dir = &resources.dir;
 
-		// Use "Hello, Filen!" so the known substring can be sliced.
+		// "Hello, Filen!" — bytes 7-12 inclusive are "Filen!"
 		let content = b"Hello, Filen!";
 		let file = upload_test_file(client, test_dir, "http_provider_range.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
 		let url = handle.get_file_url(&(&file).into());
 
-		// Request bytes 7–12 inclusive → "Filen!"
 		let response = reqwest::Client::new()
 			.get(&url)
 			.header("Range", "bytes=7-12")
@@ -787,27 +799,30 @@ mod http_provider_tests {
 
 		assert_eq!(response.status(), 206, "partial request must return 206");
 
-		// Bug 3: RFC 7233 §4.1 requires Content-Range in 206 responses.
-		assert!(
-			response.headers().get("content-range").is_some_and(|v| {
-				v.to_str().unwrap() == format!("bytes 7-12/{}", content.len())
-			}),
+		// RFC 7233 §4.1 requires a Content-Range header in 206 responses.
+		assert_eq!(
+			response
+				.headers()
+				.get("content-range")
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 7-12/{}", content.len()).as_str()),
+			"206 response must include Content-Range"
 		);
 
-		// Bug 1: Content-Length for range bytes=7-12 (6 bytes) is reported as 5.
 		let content_length: u64 = response
 			.headers()
 			.get("content-length")
 			.and_then(|v| v.to_str().ok())
 			.and_then(|v| v.parse().ok())
 			.expect("server must set Content-Length");
-		assert_eq!(content_length, 6,);
+		assert_eq!(content_length, 6, "bytes 7-12 is 6 bytes");
 
 		let body = response.bytes().await.unwrap();
 		assert_eq!(&body[..], b"Filen!");
 	}
 
-	/// Range covering the entire file returns 200 OK (not 206).
+	/// A range that spans the entire file returns 200 OK (not 206 Partial Content),
+	/// per RFC 7233 §4.1.
 	#[shared_test_runtime]
 	async fn http_provider_range_full_file() {
 		let resources = test_utils::RESOURCES.get_resources().await;
@@ -829,14 +844,13 @@ mod http_provider_tests {
 			.await
 			.unwrap();
 
-		// A range spanning the whole file should be 200 OK, not 206.
 		assert_eq!(response.status(), 200);
 
 		let body = response.bytes().await.unwrap();
 		assert_eq!(&body[..], content);
 	}
 
-	/// Range request starting from offset 0 with a high end returns the correct slice.
+	/// `bytes=0-N` (start=0, explicit end) returns 206 with the correct slice.
 	#[shared_test_runtime]
 	async fn http_provider_range_from_start() {
 		let resources = test_utils::RESOURCES.get_resources().await;
@@ -850,7 +864,7 @@ mod http_provider_tests {
 		let handle = client.start_http_provider(None).await.unwrap();
 		let url = handle.get_file_url(&(&file).into());
 
-		// Request bytes 0–4 inclusive → "Hello"
+		// bytes 0-4 inclusive → "Hello"
 		let response = reqwest::Client::new()
 			.get(&url)
 			.header("Range", "bytes=0-4")
@@ -863,7 +877,70 @@ mod http_provider_tests {
 		assert_eq!(&body[..], b"Hello");
 	}
 
-	/// A large file (spanning multiple chunks) is served correctly without a Range header.
+	/// `bytes=N-` (open-ended range from offset N) returns 206 with every byte from N
+	/// to the end of the file.
+	#[shared_test_runtime]
+	async fn http_provider_open_ended_range() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+
+		let content = b"Hello, Filen!";
+		let file =
+			upload_test_file(client, test_dir, "http_provider_open_ended.txt", content).await;
+
+		let handle = client.start_http_provider(None).await.unwrap();
+		let url = handle.get_file_url(&(&file).into());
+
+		let response = reqwest::Client::new()
+			.get(&url)
+			.header("Range", "bytes=7-")
+			.send()
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), 206);
+
+		assert_eq!(
+			response
+				.headers()
+				.get("content-range")
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 7-12/{}", content.len()).as_str()),
+		);
+
+		let body = response.bytes().await.unwrap();
+		assert_eq!(&body[..], b"Filen!");
+	}
+
+	/// `bytes=-N` (suffix range: last N bytes) returns 206 with the last N bytes.
+	#[shared_test_runtime]
+	async fn http_provider_suffix_range() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+
+		let content = b"Hello, Filen!";
+		let file = upload_test_file(client, test_dir, "http_provider_suffix.txt", content).await;
+
+		let handle = client.start_http_provider(None).await.unwrap();
+		let url = handle.get_file_url(&(&file).into());
+
+		let response = reqwest::Client::new()
+			.get(&url)
+			.header("Range", "bytes=-5")
+			.send()
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), 206);
+
+		let body = response.bytes().await.unwrap();
+		assert_eq!(&body[..], b"ilen!");
+	}
+
+	/// A large file (spanning multiple encrypted chunks) is served correctly without a
+	/// Range header.
 	#[shared_test_runtime]
 	async fn http_provider_large_file_download() {
 		let resources = test_utils::RESOURCES.get_resources().await;
@@ -882,8 +959,9 @@ mod http_provider_tests {
 		assert_eq!(&body[..], &content[..]);
 	}
 
+	/// An empty file (size 0) is served as 200 OK with an empty body and Content-Length: 0.
 	#[shared_test_runtime]
-	async fn http_provider_empty_file_bug2() {
+	async fn http_provider_empty_file() {
 		let resources = test_utils::RESOURCES.get_resources().await;
 		let client = &resources.client;
 		let test_dir = &resources.dir;
@@ -893,29 +971,35 @@ mod http_provider_tests {
 		let handle = client.start_http_provider(None).await.unwrap();
 		let url = handle.get_file_url(&(&file).into());
 
-		// Bug 2: the server panics inside `get_real_bounds` because `0u64 - 1` overflows.
-		// The panic is caught by axum's panic handler and turned into a 500, but the
-		// panic is still logged. When the overflow check fix is applied, this test should
-		// instead return 200 with an empty body.
 		let response = reqwest::get(&url).await.unwrap();
 		assert_eq!(response.status(), 200);
+
+		let content_length: u64 = response
+			.headers()
+			.get("content-length")
+			.and_then(|v| v.to_str().ok())
+			.and_then(|v| v.parse().ok())
+			.unwrap_or(u64::MAX);
+		assert_eq!(content_length, 0);
+
 		let body = response.bytes().await.unwrap();
 		assert_eq!(&body[..], b"");
 	}
 
+	/// A Range header whose bounds lie entirely beyond EOF returns 416 Range Not
+	/// Satisfiable with a `Content-Range: bytes */size` header (RFC 7233 §4.4).
 	#[shared_test_runtime]
-	async fn http_provider_unsatisfiable_range_bug4() {
+	async fn http_provider_unsatisfiable_range() {
 		let resources = test_utils::RESOURCES.get_resources().await;
 		let client = &resources.client;
 		let test_dir = &resources.dir;
 
 		let content = b"Short file";
-		let file = upload_test_file(client, test_dir, "http_provider_bug4.txt", content).await;
+		let file = upload_test_file(client, test_dir, "http_provider_unsat.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
 		let url = handle.get_file_url(&(&file).into());
 
-		// Range well beyond EOF → should return 416 but currently panics with todo!().
 		let response = reqwest::Client::new()
 			.get(&url)
 			.header("Range", "bytes=9999-99999")
@@ -923,116 +1007,249 @@ mod http_provider_tests {
 			.await
 			.unwrap();
 
-		assert_ne!(
-			response.status().as_u16(),
+		assert_eq!(
+			response.status(),
 			416,
-			"Bug 4: unsatisfiable range should return 416 but currently panics (todo!())"
+			"unsatisfiable range must return 416"
+		);
+		assert_eq!(
+			response
+				.headers()
+				.get("content-range")
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes */{}", content.len()).as_str()),
+			"416 response must include Content-Range: bytes */size"
 		);
 	}
 
-	// ─── multi-part range tests (commented out — implementation is todo!()) ────
+	// ─── multi-range (multipart/byteranges) requests ──────────────────────────
 
-	// /// Multi-part range request: `Range: bytes=0-4, 7-12` should return a
-	// /// `multipart/byteranges` response (RFC 7233 §4.1).
-	// ///
-	// /// Currently this panics because `multiple_range_response_builder` is `todo!()`.
-	// #[shared_test_runtime]
-	// async fn http_provider_multipart_range() {
-	// 	let resources = test_utils::RESOURCES.get_resources().await;
-	// 	let client = &resources.client;
-	// 	let test_dir = &resources.dir;
-	//
-	// 	let content = b"Hello, Filen!";
-	// 	let file =
-	// 		upload_test_file(client, test_dir, "http_provider_multipart.txt", content).await;
-	//
-	// 	let handle = client.start_http_provider(None).await.unwrap();
-	// 	let url = handle.get_file_url(&(&file).into());
-	//
-	// 	// Two non-overlapping ranges in one request.
-	// 	let response = reqwest::Client::new()
-	// 		.get(&url)
-	// 		.header("Range", "bytes=0-4, 7-12")
-	// 		.send()
-	// 		.await
-	// 		.unwrap();
-	//
-	// 	assert_eq!(response.status(), 206);
-	// 	let ct = response
-	// 		.headers()
-	// 		.get("content-type")
-	// 		.and_then(|v| v.to_str().ok())
-	// 		.unwrap_or("");
-	// 	assert!(
-	// 		ct.starts_with("multipart/byteranges"),
-	// 		"multi-range response must use multipart/byteranges, got: {ct}"
-	// 	);
-	//
-	// 	// Parse the multipart body and verify each part.
-	// 	// (Parsing logic depends on a multipart library; sketch only.)
-	// 	// let parts = parse_multipart_byteranges(response.bytes().await.unwrap(), ct);
-	// 	// assert_eq!(parts[0].data, b"Hello");
-	// 	// assert_eq!(parts[1].data, b"Filen!");
-	// }
+	/// A multi-range request (`Range: bytes=0-4, 7-12`) returns a proper
+	/// `multipart/byteranges` response (RFC 7233 §4.1) with the correct bytes in each part.
+	#[shared_test_runtime]
+	async fn http_provider_multipart_range() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
 
-	// /// Adjacent ranges in a single multi-range request should each be returned as
-	// /// a separate part, not merged.
-	// #[shared_test_runtime]
-	// async fn http_provider_multipart_adjacent_ranges() {
-	// 	let resources = test_utils::RESOURCES.get_resources().await;
-	// 	let client = &resources.client;
-	// 	let test_dir = &resources.dir;
-	//
-	// 	let content: Vec<u8> = (b'A'..=b'Z').collect(); // 26 bytes
-	// 	let file =
-	// 		upload_test_file(client, test_dir, "http_provider_multipart_adj.txt", &content)
-	// 			.await;
-	//
-	// 	let handle = client.start_http_provider(None).await.unwrap();
-	// 	let url = handle.get_file_url(&(&file).into());
-	//
-	// 	let response = reqwest::Client::new()
-	// 		.get(&url)
-	// 		.header("Range", "bytes=0-9, 10-19, 20-25")
-	// 		.send()
-	// 		.await
-	// 		.unwrap();
-	//
-	// 	assert_eq!(response.status(), 206);
-	// }
+		// "Hello, Filen!" (13 bytes)
+		// bytes 0-4  → "Hello"
+		// bytes 7-12 → "Filen!"
+		let content = b"Hello, Filen!";
+		let file = upload_test_file(client, test_dir, "http_provider_multipart.txt", content).await;
 
-	// /// A mix of satisfiable and unsatisfiable sub-ranges in one request.
-	// /// RFC 7233 says the server must respond with 416 only if ALL sub-ranges are
-	// /// unsatisfiable; if at least one is satisfiable, the satisfiable ones are served.
-	// #[shared_test_runtime]
-	// async fn http_provider_multipart_partial_satisfiable() {
-	// 	let resources = test_utils::RESOURCES.get_resources().await;
-	// 	let client = &resources.client;
-	// 	let test_dir = &resources.dir;
-	//
-	// 	let content = b"Short";
-	// 	let file = upload_test_file(
-	// 		client,
-	// 		test_dir,
-	// 		"http_provider_multipart_partial.txt",
-	// 		content,
-	// 	)
-	// 	.await;
-	//
-	// 	let handle = client.start_http_provider(None).await.unwrap();
-	// 	let url = handle.get_file_url(&(&file).into());
-	//
-	// 	// bytes=0-2 is satisfiable; bytes=9999-99999 is not.
-	// 	let response = reqwest::Client::new()
-	// 		.get(&url)
-	// 		.header("Range", "bytes=0-2, 9999-99999")
-	// 		.send()
-	// 		.await
-	// 		.unwrap();
-	//
-	// 	// At least the satisfiable sub-range should be served.
-	// 	assert_eq!(response.status(), 206);
-	// }
+		let handle = client.start_http_provider(None).await.unwrap();
+		let url = handle.get_file_url(&(&file).into());
+
+		let response = reqwest::Client::new()
+			.get(&url)
+			.header("Range", "bytes=0-4, 7-12")
+			.send()
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), 206);
+
+		let ct = response
+			.headers()
+			.get("content-type")
+			.and_then(|v| v.to_str().ok())
+			.unwrap_or("")
+			.to_string();
+		assert!(
+			ct.starts_with("multipart/byteranges"),
+			"multi-range response must use multipart/byteranges, got: {ct}"
+		);
+
+		let raw_body = response.bytes().await.unwrap();
+		let parts = parse_multipart_body(raw_body, &ct).await;
+
+		assert_eq!(parts.len(), 2, "expected exactly 2 parts");
+
+		let size = content.len();
+
+		// Each part must carry both Content-Type and Content-Range headers.
+		for (i, (headers, _)) in parts.iter().enumerate() {
+			assert!(
+				headers.contains_key(http::header::CONTENT_TYPE),
+				"part {i} is missing Content-Type header"
+			);
+			assert!(
+				headers.contains_key(http::header::CONTENT_RANGE),
+				"part {i} is missing Content-Range header"
+			);
+		}
+
+		assert_eq!(
+			parts[0]
+				.0
+				.get(http::header::CONTENT_RANGE)
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 0-4/{size}").as_str()),
+			"part 0 Content-Range mismatch"
+		);
+		assert_eq!(&parts[0].1[..], b"Hello", "part 0 body mismatch");
+
+		assert_eq!(
+			parts[1]
+				.0
+				.get(http::header::CONTENT_RANGE)
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 7-12/{size}").as_str()),
+			"part 1 Content-Range mismatch"
+		);
+		assert_eq!(&parts[1].1[..], b"Filen!", "part 1 body mismatch");
+	}
+
+	/// Adjacent ranges in a multi-range request are each returned as a separate part
+	/// with correct headers and body bytes, not merged.
+	#[shared_test_runtime]
+	async fn http_provider_multipart_adjacent_ranges() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+
+		// "ABCDEFGHIJKLMNOPQRSTUVWXYZ" (26 bytes)
+		let content: Vec<u8> = (b'A'..=b'Z').collect();
+		let file = upload_test_file(
+			client,
+			test_dir,
+			"http_provider_multipart_adj.txt",
+			&content,
+		)
+		.await;
+
+		let handle = client.start_http_provider(None).await.unwrap();
+		let url = handle.get_file_url(&(&file).into());
+
+		let response = reqwest::Client::new()
+			.get(&url)
+			.header("Range", "bytes=0-9, 10-19, 20-25")
+			.send()
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), 206);
+
+		let ct = response
+			.headers()
+			.get("content-type")
+			.and_then(|v| v.to_str().ok())
+			.unwrap_or("")
+			.to_string();
+		assert!(
+			ct.starts_with("multipart/byteranges"),
+			"expected multipart/byteranges, got: {ct}"
+		);
+
+		let raw_body = response.bytes().await.unwrap();
+		let parts = parse_multipart_body(raw_body, &ct).await;
+
+		assert_eq!(parts.len(), 3, "expected 3 parts for 3 ranges");
+
+		let size = content.len();
+
+		assert_eq!(
+			parts[0]
+				.0
+				.get(http::header::CONTENT_RANGE)
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 0-9/{size}").as_str()),
+		);
+		assert_eq!(&parts[0].1[..], b"ABCDEFGHIJ");
+
+		assert_eq!(
+			parts[1]
+				.0
+				.get(http::header::CONTENT_RANGE)
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 10-19/{size}").as_str()),
+		);
+		assert_eq!(&parts[1].1[..], b"KLMNOPQRST");
+
+		assert_eq!(
+			parts[2]
+				.0
+				.get(http::header::CONTENT_RANGE)
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 20-25/{size}").as_str()),
+		);
+		assert_eq!(&parts[2].1[..], b"UVWXYZ");
+	}
+
+	/// When a multi-range request mixes satisfiable and unsatisfiable sub-ranges, only
+	/// the satisfiable ones are served as a `multipart/byteranges` response.
+	/// RFC 7233 §4.4: 416 is returned only when ALL sub-ranges are unsatisfiable.
+	#[shared_test_runtime]
+	async fn http_provider_multipart_partial_satisfiable() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+
+		// "Short" (5 bytes): bytes=0-2 and bytes=3-4 are satisfiable;
+		// bytes=9999-99999 is not and gets filtered out before reaching the handler.
+		let content = b"Short";
+		let file = upload_test_file(
+			client,
+			test_dir,
+			"http_provider_multipart_partial.txt",
+			content,
+		)
+		.await;
+
+		let handle = client.start_http_provider(None).await.unwrap();
+		let url = handle.get_file_url(&(&file).into());
+
+		let response = reqwest::Client::new()
+			.get(&url)
+			.header("Range", "bytes=0-2, 3-4, 9999-99999")
+			.send()
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), 206);
+
+		let ct = response
+			.headers()
+			.get("content-type")
+			.and_then(|v| v.to_str().ok())
+			.unwrap_or("")
+			.to_string();
+		assert!(
+			ct.starts_with("multipart/byteranges"),
+			"two satisfiable ranges should produce multipart/byteranges, got: {ct}"
+		);
+
+		let raw_body = response.bytes().await.unwrap();
+		let parts = parse_multipart_body(raw_body, &ct).await;
+
+		// Only the two satisfiable sub-ranges are served.
+		assert_eq!(
+			parts.len(),
+			2,
+			"expected 2 parts (unsatisfiable range filtered out)"
+		);
+
+		let size = content.len();
+
+		assert_eq!(
+			parts[0]
+				.0
+				.get(http::header::CONTENT_RANGE)
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 0-2/{size}").as_str()),
+		);
+		assert_eq!(&parts[0].1[..], b"Sho");
+
+		assert_eq!(
+			parts[1]
+				.0
+				.get(http::header::CONTENT_RANGE)
+				.and_then(|v| v.to_str().ok()),
+			Some(format!("bytes 3-4/{size}").as_str()),
+		);
+		assert_eq!(&parts[1].1[..], b"rt");
+	}
 }
 
 #[cfg(feature = "malformed")]
