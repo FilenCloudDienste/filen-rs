@@ -4556,7 +4556,7 @@ pub async fn test_malformed() {
 	// Create a directory with a malformed name
 	let dir = rss
 		.client
-		.create_malformed_dir(&rss.dir, "asdfs", "dsfsdf")
+		.create_malformed_dir(&(&rss.dir).into(), "asdfs", "dsfsdf")
 		.await
 		.unwrap();
 
@@ -4571,7 +4571,7 @@ pub async fn test_malformed() {
 
 	let file = rss
 		.client
-		.create_malformed_file(&rss.dir, "asdfsa", "asdfsa", "asdf", "asdf")
+		.create_malformed_file(&(&rss.dir).into(), "asdfsa", "asdfsa", "asdf", "asdf")
 		.await
 		.unwrap();
 
