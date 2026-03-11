@@ -1,4 +1,4 @@
-#![feature(min_specialization)]
+#![feature(min_specialization, try_with_capacity)]
 #![allow(dead_code)]
 #![allow(type_alias_bounds)]
 

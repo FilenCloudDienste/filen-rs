@@ -89,7 +89,7 @@ mod native {
 	use http_body::Body;
 	use std::future::Future;
 
-	use crate::{Error, auth::http::retry::RetryError};
+	use crate::{Error, ErrorKind, auth::http::retry::RetryError};
 
 	#[pin_project::pin_project(project = DownloadBodyFutureProj)]
 	pub(crate) enum DownloadBodyFuture<'a, S> {
@@ -138,7 +138,25 @@ mod native {
 							});
 							self.set(DownloadBodyFuture::ReadingBody {
 								body,
-								collected: Vec::with_capacity(size_to_alloc as usize),
+								collected: Vec::try_with_capacity(
+									size_to_alloc.try_into().map_err(|e| {
+										RetryError::NoRetry(Error::custom_with_source(
+											ErrorKind::InsufficientMemory,
+											e,
+											Some(
+												"Could not convert size hint to usize for body allocation"
+													.to_string(),
+											),
+										))
+									})?,
+								)
+								.map_err(|e| {
+									RetryError::NoRetry(Error::custom_with_source(
+										ErrorKind::InsufficientMemory,
+										e,
+										Some("Failed to allocate memory for body".to_string()),
+									))
+								})?,
 							});
 						}
 						Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
