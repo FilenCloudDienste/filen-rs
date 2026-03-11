@@ -88,6 +88,8 @@ pub struct SharedFile {
 	region: String,
 	bucket: String,
 	chunks: u64,
+	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[cfg_attr(target_family = "wasm", tsify(type = "bigint"))]
 	timestamp: DateTime<Utc>,
 	meta: FileMeta,
 	sharing_role: SharingRole,

@@ -35,6 +35,8 @@ pub struct LinkedFile {
 	region: String,
 	bucket: String,
 	version: FileEncryptionVersion,
+	#[serde(with = "chrono::serde::ts_milliseconds")]
+	#[cfg_attr(target_family = "wasm", tsify(type = "bigint"))]
 	timestamp: DateTime<Utc>,
 	file_key: String,
 	__linked_tag: bool,
