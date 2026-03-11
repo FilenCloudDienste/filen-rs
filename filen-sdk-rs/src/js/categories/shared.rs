@@ -79,17 +79,18 @@ impl From<SharedDir> for SharedDirectory {
 	}
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-#[js_type(export, wasm_all, no_deser, no_ser)]
+#[js_type(export, wasm_all)]
 pub struct SharedFile {
 	uuid: UuidStr,
 	size: u64,
 	region: String,
 	bucket: String,
 	chunks: u64,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
-	#[cfg_attr(target_family = "wasm", tsify(type = "bigint"))]
+	#[cfg_attr(
+		target_family = "wasm",
+		serde(with = "chrono::serde::ts_milliseconds"),
+		tsify(type = "bigint")
+	)]
 	timestamp: DateTime<Utc>,
 	meta: FileMeta,
 	sharing_role: SharingRole,

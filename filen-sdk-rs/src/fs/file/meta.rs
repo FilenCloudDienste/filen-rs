@@ -68,6 +68,11 @@ impl<'de> DeserializeSeed<'de> for FileMetaSeed {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+#[cfg_attr(
+	feature = "http-provider",
+	derive(serde::Serialize),
+	serde(rename_all = "camelCase")
+)]
 pub enum FileMeta<'a> {
 	Decoded(DecryptedFileMeta<'a>),
 	DecryptedRaw(Cow<'a, [u8]>),
@@ -187,12 +192,9 @@ impl<'a> FileMeta<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptedFileMeta<'a> {
-	#[serde(borrow)]
 	pub name: Cow<'a, str>,
 	pub size: u64,
-	#[serde(borrow)]
 	pub mime: Cow<'a, str>,
-	#[serde(borrow)]
 	pub key: Cow<'a, FileKey>,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
 	pub last_modified: DateTime<Utc>,
@@ -396,6 +398,127 @@ impl FileMetaChanges {
 			self.created = Some(created.map(|t| t.round_subsecs(3)));
 		}
 		self
+	}
+}
+
+#[cfg(feature = "http-provider")]
+pub mod serde_stateless {
+	use std::borrow::Cow;
+
+	use chrono::{DateTime, Utc};
+	use filen_types::{
+		auth::FileEncryptionVersion,
+		crypto::{Blake3Hash, EncryptedString, rsa::RSAEncryptedString},
+	};
+	use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+	use crate::crypto::file::FileKey;
+
+	use super::{DecryptedFileMeta, FileMeta};
+
+	#[derive(Serialize)]
+	#[serde(rename_all = "camelCase")]
+	struct DecodedSerHelper<'a> {
+		name: &'a str,
+		size: u64,
+		mime: &'a str,
+		key_version: FileEncryptionVersion,
+		key: &'a FileKey,
+		#[serde(with = "chrono::serde::ts_milliseconds")]
+		last_modified: DateTime<Utc>,
+		#[serde(with = "filen_types::serde::time::optional")]
+		#[serde(rename = "creation")]
+		#[serde(default)]
+		created: Option<DateTime<Utc>>,
+		#[serde(default, with = "super::empty_hash_is_none", rename = "blake3")]
+		hash: Option<Blake3Hash>,
+	}
+
+	#[derive(Serialize)]
+	#[serde(rename_all = "camelCase")]
+	enum FileMetaSerHelper<'a> {
+		Decoded(DecodedSerHelper<'a>),
+		DecryptedRaw(&'a [u8]),
+		DecryptedUTF8(&'a str),
+		Encrypted(&'a EncryptedString<'a>),
+		RSAEncrypted(&'a RSAEncryptedString<'a>),
+	}
+
+	#[derive(Deserialize)]
+	#[serde(rename_all = "camelCase")]
+	struct DecodedDeserHelper {
+		name: String,
+		size: u64,
+		mime: String,
+		key_version: FileEncryptionVersion,
+		key: String,
+		#[serde(with = "chrono::serde::ts_milliseconds")]
+		last_modified: DateTime<Utc>,
+		#[serde(with = "filen_types::serde::time::optional")]
+		#[serde(rename = "creation")]
+		#[serde(default)]
+		created: Option<DateTime<Utc>>,
+		#[serde(default, with = "super::empty_hash_is_none", rename = "blake3")]
+		hash: Option<Blake3Hash>,
+	}
+
+	#[derive(Deserialize)]
+	#[serde(rename_all = "camelCase")]
+	enum FileMetaDeserHelper {
+		Decoded(DecodedDeserHelper),
+		DecryptedRaw(Vec<u8>),
+		DecryptedUTF8(String),
+		Encrypted(EncryptedString<'static>),
+		RSAEncrypted(RSAEncryptedString<'static>),
+	}
+
+	pub fn serialize<S>(meta: &FileMeta<'_>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let helper = match meta {
+			FileMeta::Decoded(m) => FileMetaSerHelper::Decoded(DecodedSerHelper {
+				name: m.name.as_ref(),
+				size: m.size,
+				mime: m.mime.as_ref(),
+				key_version: m.key.version(),
+				key: m.key.as_ref(),
+				last_modified: m.last_modified,
+				created: m.created,
+				hash: m.hash,
+			}),
+			FileMeta::DecryptedRaw(b) => FileMetaSerHelper::DecryptedRaw(b.as_ref()),
+			FileMeta::DecryptedUTF8(s) => FileMetaSerHelper::DecryptedUTF8(s.as_ref()),
+			FileMeta::Encrypted(e) => FileMetaSerHelper::Encrypted(e),
+			FileMeta::RSAEncrypted(e) => FileMetaSerHelper::RSAEncrypted(e),
+		};
+		helper.serialize(serializer)
+	}
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<FileMeta<'static>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let helper = FileMetaDeserHelper::deserialize(deserializer)?;
+		match helper {
+			FileMetaDeserHelper::Decoded(h) => {
+				let key = FileKey::from_string_with_version(Cow::Owned(h.key), h.key_version)
+					.map_err(serde::de::Error::custom)?;
+				Ok(FileMeta::Decoded(DecryptedFileMeta {
+					name: Cow::Owned(h.name),
+					size: h.size,
+					mime: Cow::Owned(h.mime),
+					key: Cow::Owned(key),
+					last_modified: h.last_modified,
+					created: h.created,
+					hash: h.hash,
+				}))
+			}
+			FileMetaDeserHelper::DecryptedRaw(b) => Ok(FileMeta::DecryptedRaw(Cow::Owned(b))),
+			FileMetaDeserHelper::DecryptedUTF8(s) => Ok(FileMeta::DecryptedUTF8(Cow::Owned(s))),
+			FileMetaDeserHelper::Encrypted(e) => Ok(FileMeta::Encrypted(e)),
+			FileMetaDeserHelper::RSAEncrypted(e) => Ok(FileMeta::RSAEncrypted(e)),
+		}
 	}
 }
 

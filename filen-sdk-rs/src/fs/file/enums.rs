@@ -31,6 +31,11 @@ use super::{
 	HasRemoteFileInfo,
 	File,
 )]
+#[cfg_attr(
+	feature = "http-provider",
+	derive(serde::Serialize, serde::Deserialize),
+	serde(tag = "type")
+)]
 pub enum RemoteFileType<'a> {
 	File(Cow<'a, RemoteFile>),
 	Shared(Cow<'a, SharedRootFile>),

@@ -11,9 +11,7 @@ use crate::{
 	crypto::error::ConversionError, io::RemoteFile, thumbnail::is_supported_thumbnail_mime,
 };
 
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-#[js_type(import, export, wasm_all, no_deser, no_ser)]
+#[js_type(import, export, wasm_all)]
 pub struct File {
 	pub(crate) uuid: UuidStr,
 	pub(crate) meta: FileMeta,

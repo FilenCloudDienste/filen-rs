@@ -215,9 +215,15 @@ impl TryFrom<RemoteFile> for BaseFile {
 	}
 }
 
+#[cfg_attr(
+	feature = "http-provider",
+	derive(serde::Serialize, serde::Deserialize),
+	serde(rename_all = "camelCase")
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
 	pub uuid: UuidStr,
+	#[cfg_attr(feature = "http-provider", serde(with = "meta::serde_stateless"))]
 	pub meta: FileMeta<'static>,
 
 	pub parent: ParentUuid,
@@ -425,6 +431,11 @@ impl PartialEq<RemoteRootFile> for RemoteFile {
 impl File for RemoteFile {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "http-provider",
+	derive(serde::Serialize, serde::Deserialize),
+	serde(rename_all = "camelCase")
+)]
 pub struct RemoteRootFile {
 	pub(crate) uuid: UuidStr,
 	pub(crate) size: u64,
@@ -432,6 +443,7 @@ pub struct RemoteRootFile {
 	pub(crate) bucket: String,
 	pub(crate) chunks: u64,
 	pub(crate) timestamp: DateTime<Utc>,
+	#[cfg_attr(feature = "http-provider", serde(with = "meta::serde_stateless"))]
 	pub(crate) meta: FileMeta<'static>,
 }
 
@@ -612,6 +624,11 @@ impl FileVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "http-provider",
+	derive(serde::Serialize),
+	serde(rename_all = "camelCase")
+)]
 pub struct LinkedFile {
 	pub(crate) uuid: UuidStr,
 	pub(crate) name: MaybeEncrypted<'static, str>,
@@ -621,8 +638,53 @@ pub struct LinkedFile {
 	pub(crate) region: String,
 	pub(crate) bucket: String,
 	pub(crate) version: FileEncryptionVersion,
+	#[cfg_attr(
+		feature = "http-provider",
+		serde(with = "chrono::serde::ts_milliseconds")
+	)]
 	pub(crate) timestamp: DateTime<Utc>,
 	pub(crate) file_key: FileKey,
+}
+
+#[cfg(feature = "http-provider")]
+impl<'de> serde::Deserialize<'de> for LinkedFile {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		#[derive(serde::Deserialize)]
+		struct LinkedFileHelper<'a> {
+			uuid: UuidStr,
+			name: MaybeEncrypted<'static, str>,
+			mime: MaybeEncrypted<'static, str>,
+			size: u64,
+			chunks: u64,
+			region: String,
+			bucket: String,
+			version: FileEncryptionVersion,
+			#[serde(with = "chrono::serde::ts_milliseconds")]
+			timestamp: DateTime<Utc>,
+			#[serde(borrow)]
+			file_key: Cow<'a, str>,
+		}
+
+		let helper = LinkedFileHelper::deserialize(deserializer)?;
+		let file_key = FileKey::from_string_with_version(helper.file_key, helper.version)
+			.map_err(serde::de::Error::custom)?;
+
+		Ok(Self {
+			uuid: helper.uuid,
+			name: helper.name,
+			mime: helper.mime,
+			size: helper.size,
+			chunks: helper.chunks,
+			region: helper.region,
+			bucket: helper.bucket,
+			version: helper.version,
+			timestamp: helper.timestamp,
+			file_key,
+		})
+	}
 }
 
 impl LinkedFile {

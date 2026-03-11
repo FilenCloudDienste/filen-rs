@@ -665,7 +665,7 @@ async fn file_versions() {
 ///    `satisfiable_ranges` to return an empty iterator.  The code then calls
 ///    `multiple_range_response_builder` (which is `todo!()`), panicking instead of
 ///    returning 416 Range Not Satisfiable.
-#[cfg(all(feature = "http-provider", feature = "uniffi"))]
+#[cfg(feature = "http-provider")]
 mod http_provider_tests {
 	use filen_macros::shared_test_runtime;
 	use filen_sdk_rs::{fs::HasUUID, http_provider::client_impl::HttpProviderSharedClientExt};
@@ -696,7 +696,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_full.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&file);
+		let url = handle.get_file_url(&(&file).into());
 
 		let response = reqwest::get(&url).await.unwrap();
 		assert_eq!(response.status(), 200);
@@ -775,7 +775,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_range.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&file);
+		let url = handle.get_file_url(&(&file).into());
 
 		// Request bytes 7–12 inclusive → "Filen!"
 		let response = reqwest::Client::new()
@@ -819,7 +819,7 @@ mod http_provider_tests {
 			upload_test_file(client, test_dir, "http_provider_range_full.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&file);
+		let url = handle.get_file_url(&(&file).into());
 
 		let len = content.len() as u64;
 		let response = reqwest::Client::new()
@@ -848,7 +848,7 @@ mod http_provider_tests {
 			upload_test_file(client, test_dir, "http_provider_range_start.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&file);
+		let url = handle.get_file_url(&(&file).into());
 
 		// Request bytes 0–4 inclusive → "Hello"
 		let response = reqwest::Client::new()
@@ -874,7 +874,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_large.bin", &content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&file);
+		let url = handle.get_file_url(&(&file).into());
 
 		let response = reqwest::get(&url).await.unwrap();
 		assert_eq!(response.status(), 200);
@@ -891,7 +891,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_empty.txt", b"").await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&file);
+		let url = handle.get_file_url(&(&file).into());
 
 		// Bug 2: the server panics inside `get_real_bounds` because `0u64 - 1` overflows.
 		// The panic is caught by axum's panic handler and turned into a 500, but the
@@ -913,7 +913,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_bug4.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&file);
+		let url = handle.get_file_url(&(&file).into());
 
 		// Range well beyond EOF → should return 416 but currently panics with todo!().
 		let response = reqwest::Client::new()
@@ -947,7 +947,7 @@ mod http_provider_tests {
 	// 		upload_test_file(client, test_dir, "http_provider_multipart.txt", content).await;
 	//
 	// 	let handle = client.start_http_provider(None).await.unwrap();
-	// 	let url = handle.get_file_url(&file);
+	// 	let url = handle.get_file_url(&(&file).into());
 	//
 	// 	// Two non-overlapping ranges in one request.
 	// 	let response = reqwest::Client::new()
@@ -989,7 +989,7 @@ mod http_provider_tests {
 	// 			.await;
 	//
 	// 	let handle = client.start_http_provider(None).await.unwrap();
-	// 	let url = handle.get_file_url(&file);
+	// 	let url = handle.get_file_url(&(&file).into());
 	//
 	// 	let response = reqwest::Client::new()
 	// 		.get(&url)
@@ -1020,7 +1020,7 @@ mod http_provider_tests {
 	// 	.await;
 	//
 	// 	let handle = client.start_http_provider(None).await.unwrap();
-	// 	let url = handle.get_file_url(&file);
+	// 	let url = handle.get_file_url(&(&file).into());
 	//
 	// 	// bytes=0-2 is satisfiable; bytes=9999-99999 is not.
 	// 	let response = reqwest::Client::new()

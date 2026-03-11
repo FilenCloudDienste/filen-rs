@@ -281,6 +281,11 @@ impl HasMeta for SharedRootDirectory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "http-provider",
+	derive(serde::Serialize, serde::Deserialize),
+	serde(rename_all = "camelCase")
+)]
 pub struct SharedRootFile {
 	pub(crate) file: RemoteRootFile,
 	pub(crate) sharing_role: SharingRole,
