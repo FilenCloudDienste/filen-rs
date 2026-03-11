@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use filen_macros::js_type;
 use filen_types::fs::ObjectType;
 use image::ImageError;
 use thiserror::Error;
@@ -56,8 +55,13 @@ impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
 
 /// Enum for all the error kinds that can occur in the SDK.
 #[non_exhaustive]
-#[derive(Copy)]
-#[js_type(export, wasm_all, untagged)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ErrorKind {
 	/// Returned by the server
 	Server,
