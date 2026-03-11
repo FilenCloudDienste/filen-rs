@@ -1,5 +1,4 @@
 {
-	"apiKeyHelper": "cat ~/keys/claude.key",
 	"permissions": {
 		"allow": ["Bash(cargo clippy:*)", "Bash(cargo test:*)", "Bash(cargo build:*)", "Bash(bash wasm-pack.sh)", "Bash(sh wasm-pack.sh)"],
 		"deny": [
@@ -23,5 +22,9 @@
 				]
 			}
 		]
+	},
+	"env": { "ENABLE_LSP_TOOL": "1" },
+	"enabledPlugins": {
+		"rust-analyzer-lsp@claude-plugins-official": true
 	}
 }
