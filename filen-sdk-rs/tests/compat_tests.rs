@@ -33,6 +33,7 @@ fn get_compat_test_file(
 	};
 	let file = client
 		.make_file_builder("large_sample-20mb.txt", parent_uuid)
+		.unwrap()
 		.created(DateTime::<Utc>::from_naive_utc_and_offset(
 			NaiveDateTime::new(
 				NaiveDate::from_ymd_opt(2025, 1, 11).unwrap(),
@@ -162,17 +163,18 @@ async fn make_rs_compat_dir() {
 	}
 
 	let compat_dir = client
-		.create_dir(&client.root().into(), "compat-rs".to_string())
+		.create_dir(&client.root().into(), "compat-rs")
 		.await
 		.unwrap();
 
 	client
-		.create_dir(&(&compat_dir).into(), "dir".to_string())
+		.create_dir(&(&compat_dir).into(), "dir")
 		.await
 		.unwrap();
 
 	let empty_file = client
 		.make_file_builder("empty.txt", *compat_dir.uuid())
+		.unwrap()
 		.build();
 	client.upload_file(empty_file.into(), b"").await.unwrap();
 
@@ -190,6 +192,7 @@ async fn make_rs_compat_dir() {
 
 	let small_file = client
 		.make_file_builder("small.txt", *compat_dir.uuid())
+		.unwrap()
 		.build();
 	client
 		.upload_file(small_file.into(), b"Hello World from Rust!")
@@ -206,6 +209,7 @@ async fn make_rs_compat_dir() {
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
 	let big_file = client
 		.make_file_builder("big.txt", *compat_dir.uuid())
+		.unwrap()
 		.build();
 	client
 		.upload_file(
@@ -224,6 +228,7 @@ async fn make_rs_compat_dir() {
 
 	let file = client
 		.make_file_builder("nameSplitter.json", *compat_dir.uuid())
+		.unwrap()
 		.build();
 	client
 		.upload_file(

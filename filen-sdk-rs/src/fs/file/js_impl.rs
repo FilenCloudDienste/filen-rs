@@ -78,7 +78,7 @@ impl JsClient {
 		let file = params
 			.managed_future
 			.into_js_managed_commander_future(move || async move {
-				let builder = params.file_builder_params.into_file_builder(&this);
+				let builder = params.file_builder_params.into_file_builder(&this)?;
 				this.upload_file(Arc::new(builder.build()), &data).await
 			})?
 			.await?;
@@ -162,7 +162,7 @@ impl JsClient {
 				let builder = params
 					.file_params
 					.file_builder_params
-					.into_file_builder(&this);
+					.into_file_builder(&this)?;
 				let file = this
 					.upload_file_from_reader(
 						Arc::new(builder.build()),
@@ -264,7 +264,7 @@ impl JsClient {
 		params
 			.managed_future
 			.into_js_managed_commander_future(move || async move {
-				let builder = params.file_builder_params.into_file_builder(&this);
+				let builder = params.file_builder_params.into_file_builder(&this)?;
 				this.upload_file(Arc::new(builder.build()), &data).await
 			})
 			.await

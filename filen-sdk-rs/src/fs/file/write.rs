@@ -453,7 +453,7 @@ impl<'a> FileWriterCompletingState<'a> {
 			timestamp: response.timestamp,
 			chunks: response.chunks,
 			meta: super::meta::FileMeta::Decoded(DecryptedFileMeta {
-				name: Cow::Owned(file.root.name),
+				name: Cow::Owned(file.root.name.into()),
 				size: response.size,
 				mime: Cow::Owned(file.root.mime),
 				key: Cow::Owned(file.root.key),

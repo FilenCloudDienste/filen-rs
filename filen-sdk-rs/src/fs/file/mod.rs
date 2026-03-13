@@ -13,10 +13,11 @@ use traits::{File, HasFileInfo, HasFileMeta, HasRemoteFileInfo, UpdateFileMeta};
 use crate::{
 	auth::Client,
 	crypto::{file::FileKey, shared::MetaCrypter},
-	error::{Error, MetadataWasNotDecryptedError},
+	error::Error,
 	fs::{
 		SetRemoteInfo,
 		file::meta::{FileMeta, FileMetaChanges},
+		name::{EntryNameError, ValidatedName},
 	},
 	runtime::blocking_join,
 };
@@ -38,7 +39,7 @@ pub struct FileBuilder {
 	uuid: UuidStr,
 	key: FileKey,
 
-	name: String,
+	name: ValidatedName,
 	parent: UuidStr,
 
 	mime: Option<String>,
@@ -47,16 +48,20 @@ pub struct FileBuilder {
 }
 
 impl FileBuilder {
-	pub(crate) fn new(name: impl Into<String>, parent_uuid: UuidStr, client: &Client) -> Self {
-		Self {
+	pub(crate) fn new(
+		name: &str,
+		parent_uuid: UuidStr,
+		client: &Client,
+	) -> Result<Self, EntryNameError> {
+		Ok(Self {
 			uuid: UuidStr::new_v4(),
-			name: name.into(),
+			name: ValidatedName::try_from(name)?,
 			parent: parent_uuid,
 			key: client.make_file_key(),
 			mime: None,
 			created: None,
 			modified: None,
-		}
+		})
 	}
 
 	pub fn mime(mut self, mime: String) -> Self {
@@ -98,14 +103,14 @@ impl FileBuilder {
 	}
 
 	pub fn get_name(&self) -> &str {
-		&self.name
+		self.name.as_ref()
 	}
 
 	pub fn build(self) -> BaseFile {
 		BaseFile {
 			root: RootFile {
 				uuid: self.uuid,
-				mime: make_mime(&self.name, self.mime),
+				mime: make_mime(self.name.as_ref(), self.mime),
 				name: self.name,
 				key: self.key,
 				created: self.created.unwrap_or_else(Utc::now).round_subsecs(3),
@@ -119,7 +124,7 @@ impl FileBuilder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootFile {
 	pub uuid: UuidStr,
-	pub name: String,
+	pub name: ValidatedName,
 	pub mime: String,
 	pub key: FileKey,
 	pub created: DateTime<Utc>,
@@ -132,7 +137,7 @@ impl RootFile {
 	}
 
 	pub fn name(&self) -> &str {
-		&self.name
+		self.name.as_ref()
 	}
 
 	pub fn mime(&self) -> &str {
@@ -189,29 +194,6 @@ impl BaseFile {
 
 	pub fn parent(&self) -> UuidStr {
 		self.parent
-	}
-}
-
-impl TryFrom<RemoteFile> for BaseFile {
-	type Error = crate::error::Error;
-	fn try_from(file: RemoteFile) -> Result<Self, Self::Error> {
-		let meta = match file.meta {
-			FileMeta::Decoded(decrypted_file_meta) => decrypted_file_meta,
-			_ => {
-				return Err(MetadataWasNotDecryptedError.into());
-			}
-		};
-		Ok(Self {
-			root: RootFile {
-				uuid: file.uuid,
-				name: meta.name.into_owned(),
-				mime: meta.mime.into_owned(),
-				key: meta.key.into_owned(),
-				created: meta.created.unwrap_or_default(),
-				modified: meta.last_modified,
-			},
-			parent: file.parent.try_into()?,
-		})
 	}
 }
 

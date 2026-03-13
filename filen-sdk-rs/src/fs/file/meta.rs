@@ -20,7 +20,10 @@ use crate::{
 		shared::MetaCrypter,
 	},
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
-	fs::file::make_mime,
+	fs::{
+		file::make_mime,
+		name::{EntryNameError, ValidatedName},
+	},
 };
 
 pub(crate) struct FileMetaSeed(pub(crate) FileEncryptionVersion);
@@ -223,7 +226,7 @@ impl<'a> DecryptedFileMeta<'a> {
 		if let Some(name) = changes.name {
 			// don't need to check for empty name here,
 			// because it was already checked in FileMetaChanger::set_name
-			self.name = Cow::Owned(name);
+			self.name = Cow::Owned(name.into());
 		}
 		if let Some(mime) = changes.mime {
 			self.mime = Cow::Owned(mime);
@@ -264,7 +267,11 @@ impl<'a> DecryptedFileMeta<'a> {
 			}
 		};
 		Self {
-			name: Cow::Borrowed(changes.name.as_deref().unwrap_or(&self.name)),
+			name: if let Some(name) = &changes.name {
+				Cow::Borrowed(name.as_ref())
+			} else {
+				Cow::Borrowed(self.name.as_ref())
+			},
 			mime: Cow::Borrowed(changes.mime.as_deref().unwrap_or(&self.mime)),
 			last_modified: changes.last_modified.unwrap_or(self.last_modified),
 			created,
@@ -338,7 +345,7 @@ pub enum CreatedTime {
 pub struct FileMetaChanges {
 	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
-	name: Option<String>,
+	name: Option<ValidatedName>,
 	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	mime: Option<String>,
@@ -364,12 +371,10 @@ pub struct FileMetaChanges {
 }
 
 impl FileMetaChanges {
-	pub fn name(mut self, name: String) -> Result<Self, Error> {
-		if name.is_empty() {
-			return Err(InvalidNameError(name).into());
-		}
+	pub fn name(mut self, name: &str) -> Result<Self, EntryNameError> {
+		let name = ValidatedName::try_from(name)?;
 		if self.mime.is_none() {
-			self.mime = Some(make_mime(&name, None));
+			self.mime = Some(make_mime(name.as_ref(), None));
 		}
 		self.name = Some(name);
 		Ok(self)

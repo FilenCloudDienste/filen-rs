@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 
 use crate::{
+	Error,
 	auth::Client,
 	fs::{
 		HasUUID,
@@ -53,11 +54,11 @@ pub struct UploadFileParams {
 }
 
 impl FileBuilderParams {
-	pub(crate) fn into_file_builder(self, client: &Client) -> FileBuilder {
+	pub(crate) fn into_file_builder(self, client: &Client) -> Result<FileBuilder, Error> {
 		let mut file_builder = client.make_file_builder(
-			self.name,
+			&self.name,
 			*DirType::<'static, Normal>::from(self.parent).uuid(),
-		);
+		)?;
 		if let Some(mime) = self.mime {
 			file_builder = file_builder.mime(mime);
 		}
@@ -71,7 +72,7 @@ impl FileBuilderParams {
 			}
 			(None, None) => {}
 		};
-		file_builder
+		Ok(file_builder)
 	}
 }
 

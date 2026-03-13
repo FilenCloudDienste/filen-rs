@@ -23,6 +23,7 @@ use filen_sdk_rs::{
 			traits::HasDirMeta,
 		},
 		file::{RemoteFile, meta::FileMeta, traits::HasFileMeta},
+		name::EntryNameError,
 	},
 	io::{DirUploadCallback, FilenMetaExt},
 };
@@ -37,7 +38,7 @@ async fn create_list_trash() {
 	let test_dir = &resources.dir;
 
 	let mut dir = client
-		.create_dir(&test_dir.into(), "test_dir".to_string())
+		.create_dir(&test_dir.into(), "test_dir")
 		.await
 		.unwrap();
 	assert_eq!(dir.name().unwrap(), "test_dir");
@@ -297,18 +298,9 @@ async fn find_at_path() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = client
-		.create_dir(&test_dir.into(), "a".to_string())
-		.await
-		.unwrap();
-	let dir_b = client
-		.create_dir(&(&dir_a).into(), "b".to_string())
-		.await
-		.unwrap();
-	let dir_c = client
-		.create_dir(&(&dir_b).into(), "c".to_string())
-		.await
-		.unwrap();
+	let dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
+	let dir_b = client.create_dir(&(&dir_a).into(), "b").await.unwrap();
+	let dir_c = client.create_dir(&(&dir_b).into(), "c").await.unwrap();
 
 	assert_eq!(
 		client
@@ -412,18 +404,9 @@ async fn list_recursive() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let dir_a = client
-		.create_dir(&test_dir.into(), "a".to_string())
-		.await
-		.unwrap();
-	let dir_b = client
-		.create_dir(&(&dir_a).into(), "b".to_string())
-		.await
-		.unwrap();
-	let dir_c = client
-		.create_dir(&(&dir_b).into(), "c".to_string())
-		.await
-		.unwrap();
+	let dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
+	let dir_b = client.create_dir(&(&dir_a).into(), "b").await.unwrap();
+	let dir_c = client.create_dir(&(&dir_b).into(), "c").await.unwrap();
 
 	let (dirs, _) = client
 		.list_dir_recursive(&test_dir.into(), &|downloaded, total| {
@@ -471,10 +454,7 @@ async fn exists() {
 			.is_none()
 	);
 
-	let mut dir_a = client
-		.create_dir(&test_dir.into(), "a".to_string())
-		.await
-		.unwrap();
+	let mut dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
 
 	assert_eq!(
 		Some(dir_a.uuid()),
@@ -501,14 +481,8 @@ async fn dir_move() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let mut dir_a = client
-		.create_dir(&test_dir.into(), "a".to_string())
-		.await
-		.unwrap();
-	let dir_b = client
-		.create_dir(&test_dir.into(), "b".to_string())
-		.await
-		.unwrap();
+	let mut dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
+	let dir_b = client.create_dir(&test_dir.into(), "b").await.unwrap();
 
 	assert!(
 		client
@@ -543,10 +517,7 @@ async fn size() {
 	assert_eq!(size.files, 0);
 	assert_eq!(size.dirs, 0);
 
-	client
-		.create_dir(&test_dir.into(), "a".to_string())
-		.await
-		.unwrap();
+	client.create_dir(&test_dir.into(), "a").await.unwrap();
 	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
 	let size = Normal::dir_size(&**client, &test_dir.into(), ())
 		.await
@@ -555,10 +526,7 @@ async fn size() {
 	assert_eq!(size.files, 0);
 	assert_eq!(size.dirs, 1);
 
-	client
-		.create_dir(&test_dir.into(), "b".to_string())
-		.await
-		.unwrap();
+	client.create_dir(&test_dir.into(), "b").await.unwrap();
 	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
 	let size = Normal::dir_size(&**client, &test_dir.into(), ())
 		.await
@@ -575,7 +543,7 @@ async fn dir_search() {
 	let test_dir = &resources.dir;
 
 	let second_dir = client
-		.create_dir(&test_dir.into(), "second_dir".to_string())
+		.create_dir(&test_dir.into(), "second_dir")
 		.await
 		.unwrap();
 
@@ -586,7 +554,7 @@ async fn dir_search() {
 	let dir_name = format!("{dir_random_part_long}{dir_random_part_short}");
 
 	let dir = client
-		.create_dir(&(&second_dir).into(), dir_name)
+		.create_dir(&(&second_dir).into(), &dir_name)
 		.await
 		.unwrap();
 
@@ -628,10 +596,7 @@ async fn dir_update_meta() {
 	let test_dir = &resources.dir;
 
 	let dir_name = "dir";
-	let mut dir = client
-		.create_dir(&test_dir.into(), dir_name.to_string())
-		.await
-		.unwrap();
+	let mut dir = client.create_dir(&test_dir.into(), dir_name).await.unwrap();
 
 	assert_eq!(
 		client
@@ -644,9 +609,7 @@ async fn dir_update_meta() {
 	client
 		.update_dir_metadata(
 			&mut dir,
-			DirectoryMetaChanges::default()
-				.name("new_name".to_string())
-				.unwrap(),
+			DirectoryMetaChanges::default().name("new_name").unwrap(),
 		)
 		.await
 		.unwrap();
@@ -686,7 +649,7 @@ async fn dir_favorite() {
 	let test_dir = &resources.dir;
 
 	let mut dir = client
-		.create_dir(&test_dir.into(), "test_dir".to_string())
+		.create_dir(&test_dir.into(), "test_dir")
 		.await
 		.unwrap();
 
@@ -731,9 +694,9 @@ async fn dir_malformed_meta() {
 // 	let client = &resources.client;
 // 	let test_dir = &resources.dir;
 //
-// 	let dir_a = client.create_dir(&test_dir.into(), "a".to_string()).await.unwrap();
-// 	let dir_b = client.create_dir(&(&dir_a).into(), "b".to_string()).await.unwrap();
-// 	let _dir_c = client.create_dir(&test_dir.into(), "c".to_string()).await.unwrap();
+// 	let dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
+// 	let dir_b = client.create_dir(&(&dir_a).into(), "b").await.unwrap();
+// 	let _dir_c = client.create_dir(&test_dir.into(), "c").await.unwrap();
 //
 // 	let file = client.make_file_builder("file.txt", *test_dir.uuid()).build();
 // 	let file = client
@@ -857,7 +820,7 @@ async fn not_found_error() {
 	let test_dir = &resources.dir;
 
 	let new_dir = client
-		.create_dir(&test_dir.into(), "to_be_deleted".to_string())
+		.create_dir(&test_dir.into(), "to_be_deleted")
 		.await
 		.unwrap();
 
@@ -867,4 +830,225 @@ async fn not_found_error() {
 		.await
 		.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::FolderNotFound)
+}
+
+// ── Name validation: DirectoryMetaChanges ───────────────────────────
+
+#[test]
+fn dir_meta_changes_rejects_invalid_names() {
+	assert_eq!(
+		DirectoryMetaChanges::default().name("").unwrap_err(),
+		EntryNameError::Empty
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name(".").unwrap_err(),
+		EntryNameError::DotEntry
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name("..").unwrap_err(),
+		EntryNameError::DotEntry
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default()
+			.name(" leading")
+			.unwrap_err(),
+		EntryNameError::LeadingSpace
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default()
+			.name("trailing.")
+			.unwrap_err(),
+		EntryNameError::TrailingDotOrSpace
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default()
+			.name("trailing ")
+			.unwrap_err(),
+		EntryNameError::TrailingDotOrSpace
+	);
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a/b"),
+		Err(EntryNameError::ForbiddenChar { ch: '/', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a\\b"),
+		Err(EntryNameError::ForbiddenChar { ch: '\\', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a:b"),
+		Err(EntryNameError::ForbiddenChar { ch: ':', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a*b"),
+		Err(EntryNameError::ForbiddenChar { ch: '*', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a?b"),
+		Err(EntryNameError::ForbiddenChar { ch: '?', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a\"b"),
+		Err(EntryNameError::ForbiddenChar { ch: '"', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a<b"),
+		Err(EntryNameError::ForbiddenChar { ch: '<', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a>b"),
+		Err(EntryNameError::ForbiddenChar { ch: '>', .. })
+	));
+	assert!(matches!(
+		DirectoryMetaChanges::default().name("a|b"),
+		Err(EntryNameError::ForbiddenChar { ch: '|', .. })
+	));
+	assert_eq!(
+		DirectoryMetaChanges::default().name("CON").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name("con").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name("PRN").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name("AUX").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name("NUL").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name("COM1").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		DirectoryMetaChanges::default().name("LPT9").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert!(matches!(
+		DirectoryMetaChanges::default().name(&"x".repeat(256)),
+		Err(EntryNameError::TooLong { .. })
+	));
+}
+
+#[test]
+fn dir_meta_changes_accepts_valid_names() {
+	for name in [
+		"hello",
+		"file.txt",
+		".hidden",
+		"CON.txt",
+		"NUL.log",
+		"COM1.dat",
+		"CONSOLE",
+		"NULL",
+		"日本語",
+		"café",
+	] {
+		assert!(
+			DirectoryMetaChanges::default().name(name).is_ok(),
+			"expected {name:?} to be accepted"
+		);
+	}
+}
+
+// ── Name validation: create_dir ─────────────────────────────────────
+
+#[shared_test_runtime]
+async fn create_dir_rejects_invalid_names() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let err = client.create_dir(&test_dir.into(), "").await.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::InvalidName);
+
+	let err = client
+		.create_dir(&test_dir.into(), "CON")
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::InvalidName);
+
+	let err = client
+		.create_dir(&test_dir.into(), "foo/bar")
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::InvalidName);
+
+	let err = client
+		.create_dir(&test_dir.into(), "trailing.")
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::InvalidName);
+}
+
+#[shared_test_runtime]
+async fn create_dir_normalizes_nfc() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// NFD: e + combining acute accent
+	let nfd_name = "caf\u{0065}\u{0301}";
+	let nfc_name = "caf\u{00E9}";
+
+	let dir = client.create_dir(&test_dir.into(), nfd_name).await.unwrap();
+	assert_eq!(dir.name().unwrap(), nfc_name);
+}
+
+// ── Name validation: update_dir_metadata ────────────────────────────
+
+#[shared_test_runtime]
+async fn update_dir_meta_rejects_invalid_name() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let mut dir = client
+		.create_dir(&test_dir.into(), "valid_name")
+		.await
+		.unwrap();
+
+	assert!(DirectoryMetaChanges::default().name("").is_err());
+	assert!(DirectoryMetaChanges::default().name("CON").is_err());
+	assert!(DirectoryMetaChanges::default().name("a*b").is_err());
+
+	// Valid rename should work
+	client
+		.update_dir_metadata(
+			&mut dir,
+			DirectoryMetaChanges::default().name("renamed").unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(dir.name().unwrap(), "renamed");
+}
+
+#[shared_test_runtime]
+async fn update_dir_meta_normalizes_nfc() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let mut dir = client
+		.create_dir(&test_dir.into(), "nfc_test")
+		.await
+		.unwrap();
+
+	let nfd_name = "u\u{0308}ber"; // ü as u + combining diaeresis
+	let nfc_name = "\u{00FC}ber"; // ü as single codepoint
+
+	client
+		.update_dir_metadata(
+			&mut dir,
+			DirectoryMetaChanges::default().name(nfd_name).unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(dir.name().unwrap(), nfc_name);
 }

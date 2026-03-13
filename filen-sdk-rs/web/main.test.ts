@@ -11,10 +11,11 @@ import init, {
 	type DecryptedFileMeta,
 	type DecryptedDirMeta,
 	type DirMeta,
-	UnauthClient
+	UnauthClient,
+	parseName
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
-import { ZipReader, type Entry } from "@zip.js/zip.js"
+// import { ZipReader, type Entry } from "@zip.js/zip.js" // used by commented-out "Zip Download" test
 
 console.log("Initializing WASM...")
 await init()
@@ -911,33 +912,185 @@ test("service worker", async () => {
 	}
 })
 
+test("name validation", () => {
+	// Helper: call parseName and return the error kind, or fail if it didn't throw
+	function expectErrorKind(name: string, expectedKind: string) {
+		try {
+			parseName(name)
+			expect.fail(`Expected parseName(${JSON.stringify(name)}) to throw, but it returned successfully`)
+		} catch (e: unknown) {
+			const err = e as { kind: string; message: string }
+			expect(err.kind).toBe(expectedKind)
+			expect(err.message).toBeTruthy()
+		}
+	}
+
+	// Helper: generate all 2^n case combinations for an ASCII string
+	function allCaseCombinations(s: string): string[] {
+		const chars = s.split("")
+		const n = chars.length
+		const results: string[] = []
+		for (let mask = 0; mask < 1 << n; mask++) {
+			results.push(chars.map((ch, i) => (mask & (1 << i) ? ch.toUpperCase() : ch.toLowerCase())).join(""))
+		}
+		return results
+	}
+
+	// ── Valid simple names ──
+	for (const name of ["hello", "file.txt", "my-document.pdf", "image_001.png", "a", "ab"]) {
+		expect(parseName(name)).toBe(name)
+	}
+
+	// ── Valid unicode names ──
+	for (const name of ["日本語.txt", "über.doc", "café", "файл.txt", "🎉"]) {
+		const result = parseName(name)
+		expect(result).toBeDefined()
+	}
+
+	// ── Valid names with dots ──
+	for (const name of ["file.tar.gz", ".hidden", ".gitignore", "a.b.c.d"]) {
+		expect(parseName(name)).toBe(name)
+	}
+
+	// ── Valid at max length (255 bytes) ──
+	expect(parseName("a".repeat(255))).toBe("a".repeat(255))
+
+	// ── Empty ──
+	expectErrorKind("", "Empty")
+
+	// ── Dot entries ──
+	expectErrorKind(".", "DotEntry")
+	expectErrorKind("..", "DotEntry")
+
+	// ── Too long ──
+	expectErrorKind("a".repeat(256), "TooLong")
+	// Multibyte: 🎉 is 4 UTF-8 bytes, 64 × 4 = 256 > 255
+	expectErrorKind("🎉".repeat(64), "TooLong")
+
+	// ── Leading space ──
+	expectErrorKind(" foo", "LeadingSpace")
+	expectErrorKind("  bar", "LeadingSpace")
+	expectErrorKind(" ", "LeadingSpace")
+
+	// ── Trailing dot or space ──
+	expectErrorKind("foo.", "TrailingDotOrSpace")
+	expectErrorKind("foo..", "TrailingDotOrSpace")
+	expectErrorKind("foo ", "TrailingDotOrSpace")
+	expectErrorKind("foo  ", "TrailingDotOrSpace")
+
+	// ── Forbidden special characters ──
+	for (const ch of ["/", "\\", ":", "*", "?", '"', "<", ">", "|"]) {
+		expectErrorKind(`file${ch}name`, "ForbiddenChar")
+	}
+
+	// ── Forbidden control characters (0x01–0x1F) ──
+	for (let byte = 1; byte <= 0x1f; byte++) {
+		expectErrorKind(`file${String.fromCharCode(byte)}name`, "ForbiddenChar")
+	}
+
+	// ── Forbidden DEL (0x7F) ──
+	expectErrorKind("file\x7fname", "ForbiddenChar")
+
+	// ── Reserved names — all case combinations ──
+	for (const base of ["con", "prn", "aux", "nul"]) {
+		for (const variant of allCaseCombinations(base)) {
+			expectErrorKind(variant, "ReservedName")
+		}
+	}
+
+	// ── COM0–COM9, all case combinations ──
+	for (let digit = 0; digit <= 9; digit++) {
+		for (const variant of allCaseCombinations(`com${digit}`)) {
+			expectErrorKind(variant, "ReservedName")
+		}
+	}
+
+	// ── LPT0–LPT9, all case combinations ──
+	for (let digit = 0; digit <= 9; digit++) {
+		for (const variant of allCaseCombinations(`lpt${digit}`)) {
+			expectErrorKind(variant, "ReservedName")
+		}
+	}
+
+	// ── Reserved names with extensions (should be accepted) ──
+	for (const name of [
+		"CON.txt",
+		"con.txt",
+		"Con.log",
+		"PRN.txt",
+		"prn.doc",
+		"AUX.dat",
+		"aux.bin",
+		"NUL.txt",
+		"nul.csv",
+		"COM1.txt",
+		"com1.log",
+		"COM9.txt",
+		"LPT1.txt",
+		"lpt1.dat",
+		"LPT9.bin"
+	]) {
+		expect(parseName(name)).toBe(name)
+	}
+
+	// ── Not-reserved lookalikes (should be accepted) ──
+	for (const name of [
+		"CONSOLE",
+		"PRINT",
+		"AUXILIARY",
+		"NULL",
+		"COMA",
+		"LPTA",
+		"COM",
+		"LPT",
+		"CO",
+		"LP",
+		"CONX",
+		"PRNX",
+		"AUXX",
+		"NULX"
+	]) {
+		expect(parseName(name)).toBe(name)
+	}
+
+	// ── NFC normalization ──
+	// é as e + combining acute (NFD) should normalize to single codepoint (NFC)
+	const nfd = "e\u0301" // NFD: e + combining acute accent
+	const nfc = "\u00E9" // NFC: é as a single codepoint
+	expect(parseName(nfd)).toBe(nfc)
+
+	// Already-NFC input stays unchanged
+	expect(parseName("café")).toBe("café")
+})
+
 afterAll(async () => {
 	if (state && testDir) {
 		await state.deleteDirPermanently(testDir)
 	}
 })
 
-async function streamToUint8Array(readableStream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-	const chunks = []
-	const reader = readableStream.getReader()
-
-	while (true) {
-		const { done, value } = await reader.read()
-		if (done) break
-		chunks.push(value)
-	}
-
-	// Concatenate all chunks
-	const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-	const result = new Uint8Array(totalLength)
-	let offset = 0
-	for (const chunk of chunks) {
-		result.set(chunk, offset)
-		offset += chunk.length
-	}
-
-	return result
-}
+// streamToUint8Array is used by the commented-out "Zip Download" test; preserved here for when that test is restored.
+// async function streamToUint8Array(readableStream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+// 	const chunks = []
+// 	const reader = readableStream.getReader()
+//
+// 	while (true) {
+// 		const { done, value } = await reader.read()
+// 		if (done) break
+// 		chunks.push(value)
+// 	}
+//
+// 	// Concatenate all chunks
+// 	const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+// 	const result = new Uint8Array(totalLength)
+// 	let offset = 0
+// 	for (const chunk of chunks) {
+// 		result.set(chunk, offset)
+// 		offset += chunk.length
+// 	}
+//
+// 	return result
+// }
 
 export function jsonBigIntReplacer(_: string, value: unknown) {
 	if (typeof value === "bigint") {

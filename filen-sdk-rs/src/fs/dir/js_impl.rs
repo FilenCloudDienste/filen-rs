@@ -366,7 +366,7 @@ impl JsClient {
 	pub async fn create_dir(&self, parent: AnyNormalDir, name: String) -> Result<Dir, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
-			this.create_dir(&DirType::<'static, Normal>::from(parent), name)
+			this.create_dir(&DirType::<'static, Normal>::from(parent), &name)
 				.await
 				.map(Dir::from)
 		})

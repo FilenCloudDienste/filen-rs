@@ -4,6 +4,8 @@ use filen_types::fs::ObjectType;
 use image::ImageError;
 use thiserror::Error;
 
+use crate::fs::name::EntryNameError;
+
 macro_rules! impl_from {
 	($error_type:ty, $kind:expr) => {
 		impl From<$error_type> for FilenSdkError {
@@ -59,7 +61,7 @@ impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
-	tsify(into_wasm_abi, from_wasm_abi)
+	tsify(into_wasm_abi)
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ErrorKind {
@@ -315,3 +317,5 @@ impl_from!(
 pub(crate) struct AbortedError;
 #[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 impl_from!(AbortedError, ErrorKind::Cancelled);
+
+impl_from!(EntryNameError, ErrorKind::InvalidName);

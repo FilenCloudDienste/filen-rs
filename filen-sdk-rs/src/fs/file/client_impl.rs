@@ -13,7 +13,7 @@ use crate::{
 	auth::{Client, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	crypto::{error::ConversionError, shared::MetaCrypter},
-	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
+	error::{Error, MetadataWasNotDecryptedError},
 	fs::{
 		HasUUID,
 		categories::{DirType, Normal},
@@ -23,6 +23,7 @@ use crate::{
 			traits::HasFileMeta,
 			write::FileWriterDefault,
 		},
+		name::EntryNameError,
 	},
 	runtime::{self, blocking_join, do_cpu_intensive},
 	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback},
@@ -112,7 +113,7 @@ impl Client {
 					temp_meta
 						.key()
 						.to_meta_key()?
-						.blocking_encrypt_meta(&temp_meta.name)
+						.blocking_encrypt_meta(temp_meta.name.as_ref())
 				),
 				|| {
 					let meta_json = serde_json::to_string(&temp_meta)?;
@@ -179,7 +180,11 @@ impl Client {
 		.map(|r| r.0)
 	}
 
-	pub fn make_file_builder(&self, name: impl Into<String>, parent_uuid: UuidStr) -> FileBuilder {
+	pub fn make_file_builder(
+		&self,
+		name: &str,
+		parent_uuid: UuidStr,
+	) -> Result<FileBuilder, EntryNameError> {
 		FileBuilder::new(name, parent_uuid, self)
 	}
 
@@ -189,32 +194,15 @@ impl Client {
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
 		confirm_completion_callback: Option<F>,
-	) -> Result<FileWriter<'a, F, Fut>, Error>
+	) -> FileWriter<'a, F, Fut>
 	where
 		F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
 		Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
 	{
-		if file.root.name.is_empty() {
-			let name = match Arc::try_unwrap(file).map(|f| f.root.name) {
-				Ok(name) => name,
-				Err(file) => file.name().to_string(),
-			};
-			Err(InvalidNameError(name).into())
-		} else {
-			Ok(FileWriter::new(
-				file,
-				self,
-				callback,
-				size,
-				confirm_completion_callback,
-			))
-		}
+		FileWriter::new(file, self, callback, size, confirm_completion_callback)
 	}
 
-	pub fn get_file_writer(
-		&self,
-		file: impl Into<Arc<BaseFile>>,
-	) -> Result<FileWriterDefault<'_>, Error> {
+	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> FileWriterDefault<'_> {
 		self.inner_get_file_writer(file.into(), None, None, None)
 	}
 
@@ -222,7 +210,7 @@ impl Client {
 		&'a self,
 		file: impl Into<Arc<BaseFile>>,
 		callback: MaybeSendCallback<'a, u64>,
-	) -> Result<FileWriterDefault<'a>, Error> {
+	) -> FileWriterDefault<'a> {
 		self.inner_get_file_writer(file.into(), Some(callback), None, None)
 	}
 

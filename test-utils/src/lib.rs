@@ -97,7 +97,7 @@ impl Resources {
 		);
 		let client = self.client().await;
 		let test_dir = client
-			.create_dir(&(client.root()).into(), name)
+			.create_dir(&(client.root()).into(), &name)
 			.await
 			.unwrap();
 		TestResources {
@@ -114,7 +114,7 @@ impl Resources {
 		let client = self.client().await;
 		let lock = client.lock_drive().await.unwrap();
 		let test_dir = client
-			.create_dir(&(client.root()).into(), name)
+			.create_dir(&(client.root()).into(), &name)
 			.await
 			.unwrap();
 		(

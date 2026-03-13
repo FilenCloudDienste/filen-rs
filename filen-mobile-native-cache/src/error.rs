@@ -64,6 +64,7 @@ pub enum CacheError {
 	Unsupported(ErrorContext),
 	NotADirectory(ErrorContext),
 	FailedToDecrypt(ErrorContext),
+	InvalidName(ErrorContext),
 }
 
 impl CacheError {
@@ -117,6 +118,9 @@ impl CacheError {
 			CacheError::FailedToDecrypt(err) => CacheError::FailedToDecrypt(ErrorContext(
 				format!("{}: {}", context.into(), err.0).into(),
 			)),
+			CacheError::InvalidName(err) => CacheError::InvalidName(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
 		}
 	}
 }
@@ -147,6 +151,7 @@ impl std::fmt::Display for CacheError {
 			CacheError::Unsupported(err) => err.fmt(f),
 			CacheError::NotADirectory(err) => err.fmt(f),
 			CacheError::FailedToDecrypt(err) => err.fmt(f),
+			CacheError::InvalidName(err) => err.fmt(f),
 		}
 	}
 }
@@ -194,5 +199,11 @@ impl From<std::io::Error> for CacheError {
 impl From<image::ImageError> for CacheError {
 	fn from(err: image::ImageError) -> Self {
 		CacheError::Image(err.into_error_context())
+	}
+}
+
+impl From<filen_sdk_rs::fs::name::EntryNameError> for CacheError {
+	fn from(err: filen_sdk_rs::fs::name::EntryNameError) -> Self {
+		CacheError::InvalidName(err.into_error_context())
 	}
 }

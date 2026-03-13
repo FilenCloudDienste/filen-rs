@@ -406,7 +406,7 @@ impl AuthCacheState {
 			{
 				let builder = self
 					.client
-					.make_file_builder(path_values.name_or_uuid.to_owned(), parent.uuid());
+					.make_file_builder(path_values.name_or_uuid, parent.uuid())?;
 				self.io_upload_new_file(builder).await?.0
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
@@ -453,7 +453,7 @@ impl AuthCacheState {
 			}
 		};
 
-		let mut file = self.client.make_file_builder(name, parent.uuid());
+		let mut file = self.client.make_file_builder(&name, parent.uuid())?;
 		if let Some(creation) = info.creation {
 			file = file.created(DateTime::from_timestamp_millis(creation).ok_or_else(|| {
 				CacheError::conversion(format!(
@@ -510,7 +510,7 @@ impl AuthCacheState {
 			}
 		};
 
-		let mut builder = self.client.make_file_builder(name, parent.uuid());
+		let mut builder = self.client.make_file_builder(&name, parent.uuid())?;
 		if let Some(mime) = mime {
 			builder = builder.mime(mime);
 		}
@@ -556,7 +556,7 @@ impl AuthCacheState {
 				self.client
 					.create_dir_with_created(
 						&parent_dir_type,
-						name,
+						&name,
 						DateTime::from_timestamp_millis(time).ok_or_else(|| {
 							CacheError::conversion(format!(
 								"Failed to convert timestamp {time} to DateTime"
@@ -565,7 +565,7 @@ impl AuthCacheState {
 					)
 					.await?
 			}
-			None => self.client.create_dir(&parent_dir_type, name).await?,
+			None => self.client.create_dir(&parent_dir_type, &name).await?,
 		};
 
 		let mut conn = self.conn();
@@ -795,7 +795,7 @@ impl AuthCacheState {
 		let obj = match obj {
 			DBNonRootObject::Dir(dbdir) => {
 				let mut remote_dir: RemoteDirectory = dbdir.into();
-				let changes = DirectoryMetaChanges::default().name(new_name)?;
+				let changes = DirectoryMetaChanges::default().name(&new_name)?;
 				self.client
 					.update_dir_metadata(&mut remote_dir, changes)
 					.await?;
@@ -804,7 +804,7 @@ impl AuthCacheState {
 			}
 			DBNonRootObject::File(dbfile) => {
 				let mut remote_file: RemoteFile = dbfile.try_into()?;
-				let changes = FileMetaChanges::default().name(new_name)?;
+				let changes = FileMetaChanges::default().name(&new_name)?;
 				self.client
 					.update_file_metadata(&mut remote_file, changes)
 					.await?;

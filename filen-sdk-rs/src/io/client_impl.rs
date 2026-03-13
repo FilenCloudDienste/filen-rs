@@ -58,7 +58,7 @@ impl Client {
 			callback,
 			known_size,
 			confirm_completion_callback,
-		)?;
+		);
 		let buffer_size = known_size
 			.map(|size| std::cmp::min(size, CHUNK_SIZE_U64) as usize)
 			.unwrap_or(IO_BUFFER_SIZE);
@@ -90,7 +90,7 @@ impl Client {
 		let mut writer = self
 			.inner_get_file_writer::<'a, fn(Blake3Hash, u64) -> DummyFuture, DummyFuture>(
 				base_file, callback, known_size, None,
-			)?;
+			);
 		let buffer_size = known_size
 			.map(|size| std::cmp::min(size, CHUNK_SIZE_U64) as usize)
 			.unwrap_or(IO_BUFFER_SIZE);
@@ -315,7 +315,7 @@ impl Client {
 					})?
 					.to_owned();
 
-				self.make_file_builder(name, *parent_uuid)
+				self.make_file_builder(&name, *parent_uuid)?
 			}
 		};
 

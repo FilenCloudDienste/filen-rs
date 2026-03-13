@@ -103,6 +103,7 @@ axum-extra = { version = "0.12.5", features = [
 	"multipart",
 	"typed-header",
 ], optional = true }
+unicode-normalization = "0.1.25"
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]

@@ -15,6 +15,7 @@ use filen_sdk_rs::{
 			meta::{FileMeta, FileMetaChanges},
 			traits::{HasFileInfo, HasFileMeta},
 		},
+		name::EntryNameError,
 	},
 	io::client_impl::IoSharedClientExt,
 	util::MaybeSendCallback,
@@ -31,7 +32,10 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder(name, *test_dir.uuid()).build();
+	let file = client
+		.make_file_builder(name, *test_dir.uuid())
+		.unwrap()
+		.build();
 	let file = client.upload_file(file.into(), contents).await.unwrap();
 
 	let found_file = match client
@@ -78,7 +82,7 @@ async fn file_search() {
 	let test_dir = &resources.dir;
 
 	let second_dir = client
-		.create_dir(&test_dir.into(), "second_dir".to_string())
+		.create_dir(&test_dir.into(), "second_dir")
 		.await
 		.unwrap();
 
@@ -90,6 +94,7 @@ async fn file_search() {
 
 	let file = client
 		.make_file_builder(&file_name, *second_dir.uuid())
+		.unwrap()
 		.build();
 	let file = client.upload_file(file.into(), &[]).await.unwrap();
 
@@ -133,6 +138,7 @@ async fn file_trash() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
@@ -180,6 +186,7 @@ async fn file_delete_permanently() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
@@ -223,6 +230,7 @@ async fn file_link() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
@@ -256,6 +264,7 @@ async fn file_move() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
@@ -271,7 +280,7 @@ async fn file_move() {
 	);
 
 	let second_dir = client
-		.create_dir(&test_dir.into(), "second_dir".to_string())
+		.create_dir(&test_dir.into(), "second_dir")
 		.await
 		.unwrap();
 	client
@@ -310,6 +319,7 @@ async fn file_update_meta() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
@@ -327,9 +337,7 @@ async fn file_update_meta() {
 	client
 		.update_file_metadata(
 			&mut file,
-			FileMetaChanges::default()
-				.name("new_name.json".to_string())
-				.unwrap(),
+			FileMetaChanges::default().name("new_name.json").unwrap(),
 		)
 		.await
 		.unwrap();
@@ -393,6 +401,7 @@ async fn file_exists() {
 
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
@@ -411,9 +420,7 @@ async fn file_exists() {
 	client
 		.update_file_metadata(
 			&mut file,
-			FileMetaChanges::default()
-				.name(new_name.to_string())
-				.unwrap(),
+			FileMetaChanges::default().name(new_name).unwrap(),
 		)
 		.await
 		.unwrap();
@@ -444,6 +451,7 @@ async fn file_trash_empty() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello World from Rust!")
@@ -482,7 +490,8 @@ async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, content
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
 	let file_name = format!("file_{contents_len}.txt");
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(&file_name, *test_dir.uuid())
+		.unwrap()
 		.build();
 	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
 	client
@@ -524,7 +533,10 @@ async fn file_favorite() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder("test", *test_dir.uuid()).build();
+	let file = client
+		.make_file_builder("test", *test_dir.uuid())
+		.unwrap()
+		.build();
 	let mut file = client.upload_file(file.into(), b"").await.unwrap();
 
 	assert!(!file.favorited());
@@ -542,7 +554,10 @@ async fn file_read_range() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder("test", *test_dir.uuid()).build();
+	let file = client
+		.make_file_builder("test", *test_dir.uuid())
+		.unwrap()
+		.build();
 	let file = client
 		.upload_file(file.into(), b"Hello, Filen!")
 		.await
@@ -557,7 +572,10 @@ async fn file_read_range() {
 	reader.read_to_end(&mut buf).await.unwrap();
 	assert_eq!(str::from_utf8(&buf).unwrap(), "Hello");
 
-	let file = client.make_file_builder("test2", *test_dir.uuid()).build();
+	let file = client
+		.make_file_builder("test2", *test_dir.uuid())
+		.unwrap()
+		.build();
 
 	let border_contents = b"Hello, Filen";
 	let mut big_contents = vec![0u8; 1024 * 1024 * 3 + border_contents.len() / 2];
@@ -589,7 +607,10 @@ async fn file_versions() {
 	let mut versions = Vec::new();
 	// TODO: when backend supports size in version info, use different lengths for these strings
 	for content in ["Version 1", "Version a 2", "Version as 3", "Version asd 4"] {
-		let base_file = client.make_file_builder("test", *test_dir.uuid()).build();
+		let base_file = client
+			.make_file_builder("test", *test_dir.uuid())
+			.unwrap()
+			.build();
 		let file = client
 			.upload_file(base_file.clone().into(), content.as_bytes())
 			.await
@@ -658,7 +679,10 @@ mod http_provider_tests {
 		name: &str,
 		contents: &[u8],
 	) -> filen_sdk_rs::fs::file::RemoteFile {
-		let file = client.make_file_builder(name, *test_dir.uuid()).build();
+		let file = client
+			.make_file_builder(name, *test_dir.uuid())
+			.unwrap()
+			.build();
 		client.upload_file(file.into(), contents).await.unwrap()
 	}
 
@@ -1282,4 +1306,243 @@ async fn file_malformed_meta() {
 		.1;
 	assert!(files.iter().any(|f| *f.uuid() == uuid));
 	assert_eq!(files.len(), 1);
+}
+
+// ── Name validation: FileMetaChanges ────────────────────────────────
+
+#[test]
+fn file_meta_changes_rejects_invalid_names() {
+	assert_eq!(
+		FileMetaChanges::default().name("").unwrap_err(),
+		EntryNameError::Empty
+	);
+	assert_eq!(
+		FileMetaChanges::default().name(".").unwrap_err(),
+		EntryNameError::DotEntry
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("..").unwrap_err(),
+		EntryNameError::DotEntry
+	);
+	assert_eq!(
+		FileMetaChanges::default().name(" leading").unwrap_err(),
+		EntryNameError::LeadingSpace
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("trailing.").unwrap_err(),
+		EntryNameError::TrailingDotOrSpace
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("trailing ").unwrap_err(),
+		EntryNameError::TrailingDotOrSpace
+	);
+	assert!(matches!(
+		FileMetaChanges::default().name("a/b"),
+		Err(EntryNameError::ForbiddenChar { ch: '/', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a\\b"),
+		Err(EntryNameError::ForbiddenChar { ch: '\\', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a:b"),
+		Err(EntryNameError::ForbiddenChar { ch: ':', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a*b"),
+		Err(EntryNameError::ForbiddenChar { ch: '*', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a?b"),
+		Err(EntryNameError::ForbiddenChar { ch: '?', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a\"b"),
+		Err(EntryNameError::ForbiddenChar { ch: '"', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a<b"),
+		Err(EntryNameError::ForbiddenChar { ch: '<', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a>b"),
+		Err(EntryNameError::ForbiddenChar { ch: '>', .. })
+	));
+	assert!(matches!(
+		FileMetaChanges::default().name("a|b"),
+		Err(EntryNameError::ForbiddenChar { ch: '|', .. })
+	));
+	assert_eq!(
+		FileMetaChanges::default().name("CON").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("con").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("PRN").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("AUX").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("NUL").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("COM1").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert_eq!(
+		FileMetaChanges::default().name("LPT9").unwrap_err(),
+		EntryNameError::ReservedName
+	);
+	assert!(matches!(
+		FileMetaChanges::default().name(&"x".repeat(256)),
+		Err(EntryNameError::TooLong { .. })
+	));
+}
+
+#[test]
+fn file_meta_changes_accepts_valid_names() {
+	for name in [
+		"hello.txt",
+		"file",
+		".hidden",
+		"CON.txt",
+		"NUL.log",
+		"COM1.dat",
+		"CONSOLE",
+		"NULL",
+		"日本語.txt",
+		"café.doc",
+	] {
+		assert!(
+			FileMetaChanges::default().name(name).is_ok(),
+			"expected {name:?} to be accepted"
+		);
+	}
+}
+
+// ── Name validation: make_file_builder ──────────────────────────────
+
+#[shared_test_runtime]
+async fn make_file_builder_rejects_invalid_names() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	assert!(matches!(
+		client.make_file_builder("", *test_dir.uuid()),
+		Err(EntryNameError::Empty)
+	));
+	assert!(matches!(
+		client.make_file_builder("CON", *test_dir.uuid()),
+		Err(EntryNameError::ReservedName)
+	));
+	assert!(matches!(
+		client.make_file_builder("foo/bar", *test_dir.uuid()),
+		Err(EntryNameError::ForbiddenChar { ch: '/', .. })
+	));
+	assert!(matches!(
+		client.make_file_builder("trail.", *test_dir.uuid()),
+		Err(EntryNameError::TrailingDotOrSpace)
+	));
+}
+
+#[shared_test_runtime]
+async fn make_file_builder_normalizes_nfc() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// NFD: e + combining acute accent
+	let nfd_name = "caf\u{0065}\u{0301}.txt";
+	let nfc_name = "caf\u{00E9}.txt";
+
+	let builder = client
+		.make_file_builder(nfd_name, *test_dir.uuid())
+		.unwrap();
+	assert_eq!(builder.get_name(), nfc_name);
+}
+
+#[shared_test_runtime]
+async fn file_upload_normalizes_nfc() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let nfd_name = "caf\u{0065}\u{0301}.txt";
+	let nfc_name = "caf\u{00E9}.txt";
+
+	let file = client
+		.make_file_builder(nfd_name, *test_dir.uuid())
+		.unwrap()
+		.build();
+	let file = client.upload_file(file.into(), b"nfc test").await.unwrap();
+	assert_eq!(file.name().unwrap(), nfc_name);
+
+	// Should be findable by NFC name
+	let found = client
+		.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), nfc_name))
+		.await
+		.unwrap();
+	assert!(matches!(found, Some(NonRootFileType::File(_))));
+}
+
+// ── Name validation: update_file_metadata ───────────────────────────
+
+#[shared_test_runtime]
+async fn update_file_meta_rejects_invalid_name() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client
+		.make_file_builder("valid.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let mut file = client.upload_file(file.into(), b"content").await.unwrap();
+
+	assert!(FileMetaChanges::default().name("").is_err());
+	assert!(FileMetaChanges::default().name("CON").is_err());
+	assert!(FileMetaChanges::default().name("a*b").is_err());
+
+	// Valid rename should work
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default().name("renamed.txt").unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(file.name().unwrap(), "renamed.txt");
+}
+
+#[shared_test_runtime]
+async fn update_file_meta_normalizes_nfc() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client
+		.make_file_builder("nfc_test.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let mut file = client.upload_file(file.into(), b"content").await.unwrap();
+
+	let nfd_name = "u\u{0308}ber.txt"; // ü as u + combining diaeresis
+	let nfc_name = "\u{00FC}ber.txt"; // ü as single codepoint
+
+	client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default().name(nfd_name).unwrap(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(file.name().unwrap(), nfc_name);
 }

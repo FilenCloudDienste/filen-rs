@@ -5,6 +5,7 @@ pub mod enums;
 pub mod file;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impl;
+pub mod name;
 pub mod traits;
 pub mod zip;
 

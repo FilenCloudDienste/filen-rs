@@ -11,10 +11,11 @@ use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, UpdateDirMeta};
 
 use crate::{
 	crypto::shared::MetaCrypter,
-	error::{Error, InvalidNameError},
+	error::Error,
 	fs::{
 		SetRemoteInfo,
 		dir::meta::{DirectoryMeta, DirectoryMetaChanges},
+		name::{EntryNameError, ValidatedName},
 	},
 };
 
@@ -184,16 +185,13 @@ impl RemoteDirectory {
 	}
 
 	pub fn make_parts(
-		name: String,
+		name: &str,
 		created: DateTime<Utc>,
-	) -> Result<(UuidStr, DecryptedDirectoryMeta<'static>), Error> {
-		if name.is_empty() {
-			return Err(InvalidNameError(name).into());
-		}
+	) -> Result<(UuidStr, DecryptedDirectoryMeta<'static>), EntryNameError> {
 		Ok((
 			UuidStr::new_v4(),
 			DecryptedDirectoryMeta {
-				name: Cow::Owned(name),
+				name: Cow::Owned(ValidatedName::try_from(name)?.into()),
 				created: Some(created.round_subsecs(3)),
 			},
 		))

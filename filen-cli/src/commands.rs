@@ -685,7 +685,7 @@ async fn create_directory_(
 		}
 	}?;
 	client
-		.create_dir(&parent, directory.basename().unwrap().to_string())
+		.create_dir(&parent, directory.basename().unwrap())
 		.await
 		.context("Failed to create directory")
 }

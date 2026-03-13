@@ -276,8 +276,7 @@ impl Client {
 			path.file_name()
 				.expect("path name should be valid")
 				.to_str()
-				.expect("path name should be utf8")
-				.to_owned(),
+				.expect("path name should be utf8"),
 			created,
 		)
 		.await

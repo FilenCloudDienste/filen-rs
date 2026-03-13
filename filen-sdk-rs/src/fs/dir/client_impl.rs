@@ -33,7 +33,7 @@ impl Client {
 	pub async fn create_dir(
 		&self,
 		parent: &DirType<'_, Normal>,
-		name: String,
+		name: &str,
 	) -> Result<RemoteDirectory, Error> {
 		self.create_dir_with_created(parent, name, chrono::Utc::now())
 			.await
@@ -42,7 +42,7 @@ impl Client {
 	pub(crate) async fn inner_create_dir_with_created(
 		&self,
 		parent: UuidStr,
-		name: String,
+		name: &str,
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
 		let _lock = self.lock_drive().await?;
@@ -81,7 +81,7 @@ impl Client {
 	pub async fn create_dir_with_created(
 		&self,
 		parent: &DirType<'_, Normal>,
-		name: String,
+		name: &str,
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
 		self.inner_create_dir_with_created(*parent.uuid(), name, created)
@@ -351,7 +351,7 @@ impl Client {
 				continue;
 			}
 
-			let new_dir = self.create_dir(&curr_dir, component.to_string()).await?;
+			let new_dir = self.create_dir(&curr_dir, component).await?;
 			curr_dir = DirType::Dir(Cow::Owned(new_dir));
 		}
 		Ok(curr_dir)

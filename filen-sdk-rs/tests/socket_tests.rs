@@ -135,7 +135,10 @@ async fn test_websocket_file_events() {
 		.await
 		.unwrap();
 
-	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).build();
+	let file_a = client
+		.make_file_builder("file_a.txt", *dir.uuid())
+		.unwrap()
+		.build();
 	let mut file_a = client
 		.upload_file(file_a.into(), b"file a contents")
 		.await
@@ -195,7 +198,10 @@ async fn test_websocket_file_events() {
 
 	let old_file_a = file_a;
 
-	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).build();
+	let file_a = client
+		.make_file_builder("file_a.txt", *dir.uuid())
+		.unwrap()
+		.build();
 	let mut file_a = client
 		.upload_file(file_a.into(), b"file b contents")
 		.await
@@ -289,9 +295,7 @@ async fn test_websocket_file_events() {
 	client
 		.update_file_metadata(
 			&mut file_a,
-			FileMetaChanges::default()
-				.name(new_name.to_string())
-				.unwrap(),
+			FileMetaChanges::default().name(new_name).unwrap(),
 		)
 		.await
 		.unwrap();
@@ -320,10 +324,7 @@ async fn test_websocket_file_events() {
 		event.name
 	);
 
-	let new_parent = client
-		.create_dir(&dir.into(), "move_target".to_string())
-		.await
-		.unwrap();
+	let new_parent = client.create_dir(&dir.into(), "move_target").await.unwrap();
 
 	client
 		.move_file(&mut file_a, &(&new_parent).into())
@@ -380,10 +381,7 @@ async fn test_websocket_folder_events() {
 		.await
 		.unwrap();
 
-	let mut dir_a = client
-		.create_dir(&dir.into(), "a".to_string())
-		.await
-		.unwrap();
+	let mut dir_a = client.create_dir(&dir.into(), "a").await.unwrap();
 	let event = await_map_event(
 		&mut receiver,
 		|event| match event {
@@ -455,9 +453,7 @@ async fn test_websocket_folder_events() {
 	client
 		.update_dir_metadata(
 			&mut dir_a,
-			DirectoryMetaChanges::default()
-				.name("a_changed".to_string())
-				.unwrap(),
+			DirectoryMetaChanges::default().name("a_changed").unwrap(),
 		)
 		.await
 		.unwrap();
@@ -479,10 +475,7 @@ async fn test_websocket_folder_events() {
 	.await;
 	assert_eq!(event.meta, dir_a.meta);
 
-	let new_parent_dir = client
-		.create_dir(&dir.into(), "new_parent".to_string())
-		.await
-		.unwrap();
+	let new_parent_dir = client.create_dir(&dir.into(), "new_parent").await.unwrap();
 	client
 		.move_dir(&mut dir_a, &(&new_parent_dir).into())
 		.await

@@ -101,7 +101,7 @@
 // 		.update_file_metadata(
 // 			&mut sub_sub_file,
 // 			FileMetaChanges::default()
-// 				.name("new_file_name.txt".to_string())
+// 				.name("new_file_name.txt")
 // 				.unwrap(),
 // 		)
 // 		.await
@@ -153,7 +153,10 @@ async fn file_public_link() {
 	let share_client = &share_resources.client;
 	let unauth_client = share_client.get_unauthed();
 
-	let file = client.make_file_builder("a.txt", *test_dir.uuid()).build();
+	let file = client
+		.make_file_builder("a.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
 	let mut file = client
 		.upload_file(file.into(), b"Hello, world!")
 		.await
@@ -194,7 +197,7 @@ async fn file_public_link() {
 		.update_file_metadata(
 			&mut file,
 			FileMetaChanges::default()
-				.name("new_file_name.txt".to_string())
+				.name("new_file_name.txt")
 				.unwrap(),
 		)
 		.await
@@ -519,7 +522,7 @@ async fn file_public_link() {
 // 		.update_file_metadata(
 // 			&mut dir_file,
 // 			FileMetaChanges::default()
-// 				.name("new_file_name.txt".to_string())
+// 				.name("new_file_name.txt")
 // 				.unwrap(),
 // 		)
 // 		.await
@@ -553,7 +556,7 @@ async fn file_public_link() {
 
 // 	let _locks = set_up_contact(client, share_client).await;
 
-// 	let file = client.make_file_builder("a.txt", *test_dir.uuid()).build();
+// 	let file = client.make_file_builder("a.txt", *test_dir.uuid()).unwrap().build();
 // 	let mut file = client
 // 		.upload_file(file.into(), b"Hello, world!")
 // 		.await
@@ -580,7 +583,7 @@ async fn file_public_link() {
 
 // 	let new_created = Utc::now();
 // 	let changes = FileMetaChanges::default()
-// 		.name("new_file_name.txt".to_string())
+// 		.name("new_file_name.txt")
 // 		.unwrap()
 // 		.created(Some(new_created));
 // 	client

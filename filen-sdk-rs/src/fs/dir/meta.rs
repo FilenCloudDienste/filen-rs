@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	crypto::{self, shared::MetaCrypter},
-	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
+	error::{Error, MetadataWasNotDecryptedError},
+	fs::name::{EntryNameError, ValidatedName},
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, CowHelpers)]
@@ -121,7 +122,7 @@ impl<'a> DirectoryMeta<'a> {
 				*self = Self::Decoded(DecryptedDirectoryMeta {
 					name: changes
 						.name
-						.map(Cow::Owned)
+						.map(|v| Cow::Owned(v.into()))
 						.ok_or(MetadataWasNotDecryptedError)?,
 					created: changes.created.ok_or(MetadataWasNotDecryptedError)?,
 				})
@@ -140,11 +141,11 @@ impl<'a> DirectoryMeta<'a> {
 			| Self::DecryptedUTF8(_)
 			| Self::Encrypted(_)
 			| Self::RSAEncrypted(_) => Self::Decoded(DecryptedDirectoryMeta {
-				name: changes
-					.name
-					.as_deref()
-					.map(Cow::Borrowed)
-					.ok_or(MetadataWasNotDecryptedError)?,
+				name: if let Some(name) = &changes.name {
+					Cow::Borrowed(name.as_ref())
+				} else {
+					return Err(MetadataWasNotDecryptedError.into());
+				},
 				created: changes.created.ok_or(MetadataWasNotDecryptedError)?,
 			}),
 		})
@@ -173,9 +174,7 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 
 	fn apply_changes(&mut self, changes: DirectoryMetaChanges) {
 		if let Some(name) = changes.name {
-			// don't need to check for empty name here,
-			// because it was already checked in DirectoryMetaChanger::set_name
-			self.name = Cow::Owned(name);
+			self.name = Cow::Owned(name.into());
 		}
 		if let Some(created) = changes.created {
 			self.created = created;
@@ -184,7 +183,11 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 
 	pub fn borrowed_with_changes(&'a self, changes: &'a DirectoryMetaChanges) -> Self {
 		Self {
-			name: Cow::Borrowed(changes.name.as_deref().unwrap_or(&self.name)),
+			name: if let Some(name) = &changes.name {
+				Cow::Borrowed(name.as_ref())
+			} else {
+				Cow::Borrowed(&self.name)
+			},
 			created: changes.created.unwrap_or(self.created),
 		}
 	}
@@ -204,7 +207,7 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 pub struct DirectoryMetaChanges {
 	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
-	name: Option<String>,
+	name: Option<ValidatedName>,
 	// double option because we need to distinguish between
 	// "not set" and "set to None"
 	#[cfg_attr(
@@ -220,11 +223,8 @@ pub struct DirectoryMetaChanges {
 }
 
 impl DirectoryMetaChanges {
-	pub fn name(mut self, name: String) -> Result<Self, Error> {
-		if name.is_empty() {
-			return Err(InvalidNameError(name).into());
-		}
-		self.name = Some(name);
+	pub fn name(mut self, name: &str) -> Result<Self, EntryNameError> {
+		self.name = Some(ValidatedName::try_from(name)?);
 		Ok(self)
 	}
 
