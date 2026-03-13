@@ -551,8 +551,16 @@ where
 		if total_size < size_budget || file_count < MIN_CACHED_FILES {
 			break;
 		}
-		// remove dir all because we store files in per-file directories
-		tokio::fs::remove_dir_all(&path).await?;
+		// Cache files live inside per-file directories (cache/<uuid>/<name>), so we
+		// remove the parent directory to avoid leaving empty UUID directories behind.
+		// Thumbnail files live directly in the thumbnail dir, so we remove the file itself.
+		if let Some(parent) = path.parent()
+			&& parent != dir
+		{
+			tokio::fs::remove_dir_all(parent).await?;
+		} else {
+			tokio::fs::remove_file(&path).await?;
+		}
 		total_size = total_size.saturating_sub(size);
 		file_count -= 1;
 	}
