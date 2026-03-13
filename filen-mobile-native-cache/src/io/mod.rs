@@ -20,9 +20,7 @@ use filen_sdk_rs::{
 	error::FilenSdkError,
 	fs::{
 		HasName, HasUUID,
-		file::{
-			FileBuilder, RemoteFile, client_impl::FileReaderSharedClientExt, traits::HasFileInfo,
-		},
+		file::{FileBuilder, RemoteFile, traits::HasFileInfo},
 	},
 	io::{
 		FilenMetaExt,
@@ -33,7 +31,7 @@ use filen_types::{crypto::Blake3Hash, fs::UuidStr};
 use futures::{StreamExt, stream::FuturesUnordered};
 use log::{debug, error, info, trace};
 use tokio::{fs::DirEntry, sync::mpsc::UnboundedReceiver};
-use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 #[cfg(windows)]
 fn get_file_times(created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
@@ -61,7 +59,6 @@ pub const CACHE_DIR: &str = "cache";
 const TMP_DIR: &str = "tmp";
 const THUMBNAIL_DIR: &str = "thumbnails";
 
-const BUFFER_SIZE: u64 = 64 * 1024; // 64 KiB
 const CALLBACK_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(crate) fn get_paths(files_path: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -137,9 +134,7 @@ impl AuthCacheState {
 		file: &RemoteFile,
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<PathBuf, io::Error> {
-		let reader = self.client.get_file_reader(file).compat();
 		let src = self.tmp_dir.join(file.uuid().as_ref());
-		tokio::io::BufReader::with_capacity(BUFFER_SIZE.min(file.size) as usize, reader);
 		let mut os_file = tokio::fs::File::create(&src).await?.compat_write();
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
 		let file_size = file.size();
