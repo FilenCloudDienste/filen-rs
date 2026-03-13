@@ -448,7 +448,7 @@ async fn process_subdir(
 		} else {
 			let meta = file_entry.metadata().await?;
 			Ok(Some((
-				path,
+				file_entry.path(),
 				FilenMetaExt::accessed_or_modified(&meta),
 				FilenMetaExt::size(&meta),
 			)))
