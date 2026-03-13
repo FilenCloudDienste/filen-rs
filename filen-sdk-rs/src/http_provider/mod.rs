@@ -328,3 +328,117 @@ async fn file_handler(
 			.expect("should always be able to build a response")
 	})
 }
+
+/// Unit tests for http_provider logic that do not require network credentials.
+///
+/// These tests use the `http-provider` feature flag and a local Tokio runtime.
+/// They document and guard behavioral contracts of the provider lifecycle.
+#[cfg(all(test, feature = "http-provider"))]
+mod tests {
+	use crate::{
+		auth::{http::ClientConfig, unauth::UnauthClient},
+		http_provider::client_impl::HttpProviderSharedClientExt,
+	};
+
+	/// When `start_http_provider` is called a second time while an existing provider is
+	/// still live (its `Arc` has not been dropped), the second call silently discards
+	/// the `port` argument and returns a handle to the already-running provider.
+	///
+	/// Hypothesis: the returned handle from both calls has the same port number, and that
+	/// port is the port chosen when the *first* provider was started — not the port
+	/// explicitly requested in the second call.
+	///
+	/// This is not a bug; it is the documented "only one provider at a time" contract.
+	/// The test exists to:
+	/// 1. Make the silent-port-discard contract explicit and visible in CI.
+	/// 2. Catch any future regression where the second call spawns a second provider
+	///    on the requested port instead of reusing the first.
+	#[tokio::test]
+	async fn test_start_http_provider_second_call_discards_port_arg() {
+		let client = UnauthClient::from_config(ClientConfig::default())
+			.expect("default ClientConfig should always succeed");
+
+		// Start a provider on an OS-assigned ephemeral port.
+		let handle1 = client
+			.start_http_provider(None)
+			.await
+			.expect("first start_http_provider call should succeed");
+		let port1 = handle1.port();
+		assert_ne!(port1, 0, "OS should assign a non-zero ephemeral port");
+
+		// Request a second provider on a *different* explicit port.
+		// The current implementation returns the same provider as handle1.
+		let handle2 = client
+			.start_http_provider(Some(port1.wrapping_add(1)))
+			.await
+			.expect("second start_http_provider call should succeed");
+		let port2 = handle2.port();
+
+		// Both handles must refer to the same underlying server (same port).
+		// If this assertion fails it means a second, independent provider was
+		// created on the requested port — breaking the singleton guarantee.
+		assert_eq!(
+			port1, port2,
+			"second call with a different port should reuse the existing provider \
+			 (port1={port1}, port2={port2}); the `port` argument is silently ignored \
+			 when a provider is already live"
+		);
+
+		// Verify the provider is still reachable on port1 (not the discarded port).
+		let url = format!("http://127.0.0.1:{port1}/file?file=x");
+		// We expect a 400 (bad `file` param) not a connection error — confirming the
+		// server is alive on port1.
+		let resp = reqwest::get(&url)
+			.await
+			.expect("server on port1 should accept connections");
+		assert_eq!(
+			resp.status(),
+			400,
+			"server should return 400 for an invalid `file` query param, not a connection error"
+		);
+
+		drop(handle1);
+		drop(handle2);
+	}
+
+	/// Verifies that after all `Arc<HttpProviderHandle>` clones are dropped, the provider
+	/// stops and its port no longer accepts connections.
+	///
+	/// Hypothesis: the graceful-shutdown path (cancel_sender + axum graceful shutdown)
+	/// causes the server to stop within a reasonable time after the last handle is dropped.
+	#[tokio::test]
+	async fn test_start_http_provider_stops_after_all_handles_dropped() {
+		let client = UnauthClient::from_config(ClientConfig::default())
+			.expect("default ClientConfig should always succeed");
+
+		let handle = client
+			.start_http_provider(None)
+			.await
+			.expect("start_http_provider should succeed");
+		let port = handle.port();
+
+		// Confirm the server is up.
+		let alive_resp = reqwest::get(format!("http://127.0.0.1:{port}/file?file=x"))
+			.await
+			.expect("server should be reachable while handle is live");
+		assert_eq!(
+			alive_resp.status(),
+			400,
+			"pre-drop: expect 400 for bad file param"
+		);
+
+		// Drop the only handle — this sends the cancel signal.
+		drop(handle);
+
+		// Give axum's graceful shutdown up to 1 s to complete.
+		tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+		// The server should now refuse new connections.
+		let dead_result = reqwest::get(format!("http://127.0.0.1:{port}/file?file=x")).await;
+		assert!(
+			dead_result.is_err(),
+			"after all handles dropped and 1s elapsed, the server should no longer \
+			 accept connections on port {port}"
+		);
+	}
+}
