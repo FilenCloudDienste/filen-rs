@@ -2424,7 +2424,7 @@ pub async fn test_rename_item_empty_name() {
 	let result = db.rename_item(file_path, "".to_string()).await;
 
 	let err = result.unwrap_err();
-	assert!(err.to_string().contains("Invalid Name ''"));
+	assert!(err.to_string().contains("filename is empty"));
 }
 
 #[shared_test_runtime]
