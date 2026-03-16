@@ -1,5 +1,3 @@
-#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-use filen_macros::js_type;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
@@ -63,11 +61,26 @@ pub enum EntryNameErrorKindJS {
 	DotEntry,
 }
 
+#[derive(Debug)]
+#[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-#[js_type(export)]
 pub struct EntryNameErrorJS {
 	kind: EntryNameErrorKindJS,
 	message: String,
+}
+
+#[cfg_attr(feature = "wasm-full", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+impl EntryNameErrorJS {
+	pub fn kind(&self) -> EntryNameErrorKindJS {
+		self.kind
+	}
+
+	pub fn message(&self) -> String {
+		self.message.clone()
+	}
 }
 
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]

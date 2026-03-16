@@ -12,7 +12,8 @@ import init, {
 	type DecryptedDirMeta,
 	type DirMeta,
 	UnauthClient,
-	parseName
+	parseName,
+	EntryNameErrorJS
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 // import { ZipReader, type Entry } from "@zip.js/zip.js" // used by commented-out "Zip Download" test
@@ -919,9 +920,9 @@ test("name validation", () => {
 			parseName(name)
 			expect.fail(`Expected parseName(${JSON.stringify(name)}) to throw, but it returned successfully`)
 		} catch (e: unknown) {
-			const err = e as { kind: string; message: string }
-			expect(err.kind).toBe(expectedKind)
-			expect(err.message).toBeTruthy()
+			const err = e as EntryNameErrorJS
+			expect(err.kind()).toBe(expectedKind)
+			expect(err.message()).toBeTruthy()
 		}
 	}
 
