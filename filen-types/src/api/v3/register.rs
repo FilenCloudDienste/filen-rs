@@ -16,3 +16,7 @@ pub struct Request<'a> {
 	pub ref_id: Option<Cow<'a, str>>,
 	pub aff_id: Option<Cow<'a, str>>,
 }
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Response {}
