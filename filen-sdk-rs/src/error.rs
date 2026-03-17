@@ -29,6 +29,7 @@ impl From<filen_types::error::ResponseError> for Error {
 				Some("api_key_not_found") => ErrorKind::Unauthenticated,
 				Some("invalid_folder") | Some("folder_not_found") => ErrorKind::FolderNotFound,
 				Some("wrong_password") => ErrorKind::WrongPassword,
+				Some("max_storage_reached") => ErrorKind::MaxStorageReached,
 				_ => ErrorKind::Server,
 			}
 		};
@@ -112,6 +113,8 @@ pub enum ErrorKind {
 	FolderNotFound,
 	/// Incorrect password provided
 	WrongPassword,
+	/// Max storage limit reached for the account
+	MaxStorageReached,
 }
 
 /// Custom error type for the SDK
