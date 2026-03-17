@@ -92,10 +92,7 @@ impl RcloneInstallation {
 
 	/// Executes an rclone command in the background,
 	/// exposing the Rclone RC Api
-	pub(crate) async fn execute_in_background(
-		&self,
-		args: &[&str],
-	) -> Result<(Child, RcloneApiClient)> {
+	pub async fn execute_in_background(&self, args: &[&str]) -> Result<(Child, RcloneApiClient)> {
 		let rc_port = free_local_ipv4_port()
 			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
 		debug!(

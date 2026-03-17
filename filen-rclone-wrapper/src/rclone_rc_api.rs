@@ -3,39 +3,39 @@ use log::debug;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct CoreStatsResponse {
-	pub(crate) transferring: Option<Vec<CoreStatsResponseTransfer>>,
+pub struct CoreStatsResponse {
+	pub transferring: Option<Vec<CoreStatsResponseTransfer>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct CoreStatsResponseTransfer {
-	pub(crate) name: String,
+pub struct CoreStatsResponseTransfer {
+	pub name: String,
 	/// in bytes
-	pub(crate) size: i64,
+	pub size: i64,
 	/// in bytes per second
-	pub(crate) speed: f64,
+	pub speed: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VfsStatsResponse {
-	pub(crate) disk_cache: VfsStatsResponseDiskCache,
+pub struct VfsStatsResponse {
+	pub disk_cache: VfsStatsResponseDiskCache,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct VfsStatsResponseDiskCache {
-	pub(crate) uploads_in_progress: i32,
-	pub(crate) uploads_queued: i32,
-	pub(crate) errored_files: i32,
+pub struct VfsStatsResponseDiskCache {
+	pub uploads_in_progress: i32,
+	pub uploads_queued: i32,
+	pub errored_files: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct VfsListResponse {
-	pub(crate) vfses: Vec<String>,
+pub struct VfsListResponse {
+	pub vfses: Vec<String>,
 }
 
-pub(crate) struct RcloneApiClient {
+pub struct RcloneApiClient {
 	client: reqwest::Client,
 	root: String,
 }
@@ -84,15 +84,15 @@ impl RcloneApiClient {
 		}
 	}
 
-	pub(crate) async fn core_stats(&self) -> Result<CoreStatsResponse> {
+	pub async fn core_stats(&self) -> Result<CoreStatsResponse> {
 		self.request("core/stats", None).await
 	}
 
-	pub(crate) async fn vfs_stats(&self) -> Result<VfsStatsResponse> {
+	pub async fn vfs_stats(&self) -> Result<VfsStatsResponse> {
 		self.request("vfs/stats", None).await
 	}
 
-	pub(crate) async fn vfs_list(&self) -> Result<VfsListResponse> {
+	pub async fn vfs_list(&self) -> Result<VfsListResponse> {
 		self.request("vfs/list", None).await
 	}
 }
