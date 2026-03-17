@@ -2650,7 +2650,7 @@ pub async fn test_rename_item_long_name() {
 	db.update_dir_children(parent_path).await.unwrap();
 
 	// Try to rename to a very long name
-	let long_name = "a".repeat(255) + ".txt"; // 255 'a' characters plus extension
+	let long_name = "a".repeat(251) + ".txt"; // longest name is now 255 chars including extension
 	let result = db.rename_item(file_path, long_name.clone()).await;
 
 	let new_path = result.unwrap().unwrap();
