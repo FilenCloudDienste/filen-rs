@@ -56,7 +56,22 @@ impl RcloneInstallation {
 			.context("Failed to create Rclone installation directory")?;
 		let rclone_binary_path = ensure_rclone_binary(&config.rclone_binary_dir, false).await?;
 		let rclone_config_path =
-			write_rclone_config(&rclone_binary_path, client, &config.config_dir).await?;
+			write_rclone_config(&rclone_binary_path, Some(client), &config.config_dir).await?;
+		Ok(Self {
+			rclone_binary_path,
+			rclone_config_path,
+		})
+	}
+
+	/// Initializes Rclone without a configuration containing an authenticated remote.
+	/// Executing commands that require the "filen" remote to be configured will fail.
+	pub async fn initialize_unauthenticated(config: &RcloneInstallationConfig) -> Result<Self> {
+		fs::create_dir_all(&config.config_dir)
+			.await
+			.context("Failed to create Rclone installation directory")?;
+		let rclone_binary_path = ensure_rclone_binary(&config.rclone_binary_dir, false).await?;
+		let rclone_config_path =
+			write_rclone_config(&rclone_binary_path, None, &config.config_dir).await?;
 		Ok(Self {
 			rclone_binary_path,
 			rclone_config_path,
@@ -263,25 +278,30 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 
 async fn write_rclone_config(
 	rclone_binary_path: &Path,
-	client: &Client,
+	client: Option<&Client>,
 	config_dir: &Path,
 ) -> Result<PathBuf> {
 	let rclone_config_path = config_dir.join("rclone.conf");
 
-	let client_sdk_config = client.to_sdk_config();
-	let rclone_config_content = format!(
-		// using "internal" fields to avoid needing the plaintext password here
-		// ref: https://github.com/FilenCloudDienste/filen-rclone/blob/784979078ecd573af0d9809d2c5a07bafaad2c41/backend/filen/filen.go#L136
-		"[filen]\ntype = filen\npassword = {}\nemail = {}\nmaster_keys = {}\napi_key = {}\npublic_key = {}\nprivate_key = {}\nauth_version = {}\nbase_folder_uuid = {}\n",
-		obscure_password_for_rclone(rclone_binary_path, "INTERNAL").await?,
-		client.email(),
-		client_sdk_config.master_keys.join("|"),
-		obscure_password_for_rclone(rclone_binary_path, &client_sdk_config.api_key).await?,
-		client_sdk_config.public_key,
-		client_sdk_config.private_key,
-		client_sdk_config.auth_version as u8,
-		client_sdk_config.base_folder_uuid
-	);
+	let rclone_config_content = if let Some(client) = client {
+		let client_sdk_config = client.to_sdk_config();
+		format!(
+			// using "internal" fields to avoid needing the plaintext password here
+			// ref: https://github.com/FilenCloudDienste/filen-rclone/blob/784979078ecd573af0d9809d2c5a07bafaad2c41/backend/filen/filen.go#L136
+			"[filen]\ntype = filen\npassword = {}\nemail = {}\nmaster_keys = {}\napi_key = {}\npublic_key = {}\nprivate_key = {}\nauth_version = {}\nbase_folder_uuid = {}\n",
+			obscure_password_for_rclone(rclone_binary_path, "INTERNAL").await?,
+			client.email(),
+			client_sdk_config.master_keys.join("|"),
+			obscure_password_for_rclone(rclone_binary_path, &client_sdk_config.api_key).await?,
+			client_sdk_config.public_key,
+			client_sdk_config.private_key,
+			client_sdk_config.auth_version as u8,
+			client_sdk_config.base_folder_uuid
+		)
+	} else {
+		debug!("No client provided, writing empty Rclone config");
+		"".to_string()
+	};
 
 	fs::write(&rclone_config_path, rclone_config_content)
 		.await
