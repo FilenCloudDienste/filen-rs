@@ -110,7 +110,7 @@ afterEach(() => {
 
 function getFileMeta(meta: FileMeta): DecryptedFileMeta | null {
 	if (meta.type === "decoded") {
-		return meta
+		return meta.data
 	} else {
 		return null
 	}
@@ -118,7 +118,7 @@ function getFileMeta(meta: FileMeta): DecryptedFileMeta | null {
 
 function getDirMeta(meta: DirMeta): DecryptedDirMeta | null {
 	if (meta.type === "decoded") {
-		return meta
+		return meta.data
 	} else {
 		return null
 	}

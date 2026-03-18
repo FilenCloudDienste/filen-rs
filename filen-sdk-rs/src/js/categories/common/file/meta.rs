@@ -81,7 +81,15 @@ impl TryFrom<DecryptedFileMeta> for DecryptedFileMetaRs<'static> {
 	}
 }
 
-#[js_type(tagged, wasm_all)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	// we have to set content due to:
+	// https://github.com/serde-rs/serde/issues/1307
+	serde(tag = "type", content = "data", rename_all = "camelCase"),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum FileMeta {
 	Decoded(DecryptedFileMeta),
 	DecryptedUTF8(String),

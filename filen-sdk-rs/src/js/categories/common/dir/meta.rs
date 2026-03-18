@@ -39,7 +39,15 @@ impl From<DecryptedDirMeta> for DecryptedDirectoryMetaRS<'static> {
 	}
 }
 
-#[js_type(tagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	// we have to set content due to:
+	// https://github.com/serde-rs/serde/issues/1307
+	serde(tag = "type", content = "data", rename_all = "camelCase"),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum DirMeta {
 	Decoded(DecryptedDirMeta),
 	DecryptedRaw(Vec<u8>),
