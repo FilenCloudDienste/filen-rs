@@ -252,6 +252,7 @@ mod managed {
 
 	#[derive(Deserialize, Default, Tsify)]
 	#[serde(rename_all = "camelCase")]
+	#[cfg_attr(feature = "service-worker", tsify(from_wasm_abi))]
 	pub struct ManagedFuture {
 		#[serde(default)]
 		abort_signal: AbortSignal,

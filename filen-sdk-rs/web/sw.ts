@@ -59,8 +59,6 @@ self.addEventListener("fetch", (e: FetchEvent) => {
 							status: 400
 						})
 					)
-
-					return
 				}
 
 				e.respondWith(

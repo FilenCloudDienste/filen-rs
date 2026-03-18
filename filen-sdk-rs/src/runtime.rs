@@ -720,24 +720,12 @@ where
 	}
 }
 
-#[cfg(not(all(
-	target_family = "wasm",
-	target_os = "unknown",
-	not(feature = "wasm-full")
-)))]
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub fn spawn_local<F>(f: F)
 where
 	F: Future<Output = ()> + 'static,
 {
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	{
-		spawn_local_on_worker(f);
-	}
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	{
-		std::mem::drop(f);
-		panic!("spawn_local is only currently supported on wasm targets");
-	}
+	spawn_local_on_worker(f);
 }
 
 /// A macro to run blocking code in parallel using rayon's thread pool by nesting [rayon::join].

@@ -8,6 +8,8 @@ pub enum ConversionError {
 	RsaPublicKeyError(#[from] rsa::pkcs8::spki::Error),
 	#[error("Failed to convert ParentUuid to Uuid: `{0}`")]
 	ParentUuidError(String),
+	#[error("Invalid enum value: `{0}` for enum {1}, allowed range `{2}`-`{3}`")]
+	InvalidEnumValue(u8, &'static str, u8, u8),
 }
 
 #[derive(Debug, Error)]

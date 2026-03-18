@@ -304,7 +304,7 @@ impl JsClient {
 							dir_path,
 							&DownloadCallbackWrapper(callback),
 							dir,
-							Cow::Owned(public_link),
+							Cow::Owned(public_link.try_into()?),
 						)
 						.await
 					}

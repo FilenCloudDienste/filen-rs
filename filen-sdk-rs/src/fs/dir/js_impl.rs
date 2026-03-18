@@ -275,7 +275,7 @@ impl JsClient {
 						this.unauthed(),
 						&dir,
 						callback.as_ref(),
-						Cow::Owned(dir_public_link),
+						Cow::Owned(dir_public_link.try_into()?),
 					)
 					.await
 					.map(dirs_and_files_into_js)
@@ -325,7 +325,7 @@ impl JsClient {
 						dir,
 						list_dir_callback.as_ref(),
 						&mut scan_errors_callback,
-						Cow::Owned(dir_public_link),
+						Cow::Owned(dir_public_link.try_into()?),
 					)
 					.await
 					.map(dirs_and_files_into_js_with_paths)
@@ -536,7 +536,7 @@ impl JsClient {
 					&dir,
 					None::<&fn(u64, Option<u64>)>,
 					&name_or_uuid,
-					Cow::Owned(link_info),
+					Cow::Owned(link_info.try_into()?),
 				)
 				.await?
 				.map(NonRootItemTagged::from),
@@ -561,7 +561,8 @@ impl JsClient {
 					Shared::dir_size(&*this, &dir, &share_info).await?
 				}
 				DirByCategoryWithContext::Linked(dir, link_info) => {
-					Linked::dir_size(this.unauthed(), &dir, Cow::Owned(link_info)).await?
+					Linked::dir_size(this.unauthed(), &dir, Cow::Owned(link_info.try_into()?))
+						.await?
 				}
 			};
 
@@ -638,7 +639,7 @@ impl UnauthJsClient {
 		do_on_commander(move || async move {
 			let parsed_dir = DirType::from(dir.dir);
 
-			Linked::dir_size(&*this, &parsed_dir, Cow::Owned(dir.link))
+			Linked::dir_size(&*this, &parsed_dir, Cow::Owned(dir.link.try_into()?))
 				.await
 				.map(|resp| DirSizeResponse {
 					size: resp.size,

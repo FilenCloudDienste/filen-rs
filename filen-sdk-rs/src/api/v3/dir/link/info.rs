@@ -1,10 +1,10 @@
 pub use filen_types::api::v3::dir::link::info::{ENDPOINT, Request, Response};
 
-use crate::{auth::http::AuthClient, error::Error};
+use crate::{auth::unauth::UnauthClient, error::Error};
 
 pub(crate) async fn post(
-	client: &AuthClient,
+	client: &UnauthClient,
 	request: &Request,
 ) -> Result<Response<'static>, Error> {
-	client.post_auth(ENDPOINT.into(), request).await
+	client.post(ENDPOINT.into(), request).await
 }

@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
-use crate::traits::CowHelpers;
+use crate::{error::ConversionError, traits::CowHelpers};
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct APIKey<'a>(pub Cow<'a, str>);
@@ -38,13 +38,20 @@ pub enum FileEncryptionVersion {
 const TS_FILE_ENCRYPTION_VERSION: &'static str =
 	r#"export type FileEncryptionVersion = 1 | 2 | 3;"#;
 
-impl From<u8> for FileEncryptionVersion {
-	fn from(value: u8) -> Self {
+impl TryFrom<u8> for FileEncryptionVersion {
+	type Error = ConversionError;
+
+	fn try_from(value: u8) -> Result<Self, Self::Error> {
 		match value {
-			1 => FileEncryptionVersion::V1,
-			2 => FileEncryptionVersion::V2,
-			3 => FileEncryptionVersion::V3,
-			o => panic!("Invalid FileEncryptionVersion value {o}"),
+			1 => Ok(FileEncryptionVersion::V1),
+			2 => Ok(FileEncryptionVersion::V2),
+			3 => Ok(FileEncryptionVersion::V3),
+			o => Err(ConversionError::InvalidEnumValue(
+				o,
+				"FileEncryptionVersion",
+				1,
+				3,
+			)),
 		}
 	}
 }
@@ -55,6 +62,24 @@ pub enum MetaEncryptionVersion {
 	V1 = 1,
 	V2 = 2,
 	V3 = 3,
+}
+
+impl TryFrom<u8> for MetaEncryptionVersion {
+	type Error = ConversionError;
+
+	fn try_from(value: u8) -> Result<Self, Self::Error> {
+		match value {
+			1 => Ok(MetaEncryptionVersion::V1),
+			2 => Ok(MetaEncryptionVersion::V2),
+			3 => Ok(MetaEncryptionVersion::V3),
+			o => Err(ConversionError::InvalidEnumValue(
+				o,
+				"MetaEncryptionVersion",
+				1,
+				3,
+			)),
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

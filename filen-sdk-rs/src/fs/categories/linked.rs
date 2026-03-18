@@ -7,8 +7,7 @@ use crate::{
 	Error,
 	api::{self},
 	auth::unauth::UnauthClient,
-	connect::{DirPublicLink, MakePasswordSaltAndHash},
-	error::MetadataWasNotDecryptedError,
+	connect::DirPublicLink,
 	fs::{
 		HasUUID,
 		categories::{Category, DirType, fs::CategoryFS},
@@ -42,12 +41,12 @@ impl CategoryFS for Linked {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let crypter = context.crypter().ok_or(MetadataWasNotDecryptedError)?;
+		let crypter = context.crypter();
 
 		let response = api::v3::dir::link::content::post_large(
 			client,
 			&api::v3::dir::link::content::Request {
-				uuid: context.link_uuid,
+				uuid: *context.uuid(),
 				password: Cow::Borrowed(&context.get_password_hash()?),
 				parent: *parent.uuid(),
 			},
@@ -110,7 +109,7 @@ impl CategoryFS for Linked {
 		let response = api::v3::dir::download::link::post_large(
 			client,
 			&api::v3::dir::download::link::Request {
-				uuid: context.link_uuid,
+				uuid: *context.uuid(),
 				password: Cow::Borrowed(&context.get_password_hash()?),
 				parent: *parent.uuid(),
 				skip_cache: false,
@@ -119,7 +118,7 @@ impl CategoryFS for Linked {
 		)
 		.await?;
 
-		let crypter = context.crypter().ok_or(MetadataWasNotDecryptedError)?;
+		let crypter = context.crypter();
 
 		do_cpu_intensive(|| {
 			let (dirs, files) = blocking_join!(
@@ -174,7 +173,7 @@ impl CategoryFS for Linked {
 	) -> Result<super::fs::DirSizeInfo, Error> {
 		let request = api::v3::dir::size::link::Request {
 			uuid: *parent.uuid(),
-			link_uuid: context.link_uuid,
+			link_uuid: *context.uuid(),
 		};
 		api::v3::dir::size::link::post(client, &request)
 			.await

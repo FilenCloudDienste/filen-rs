@@ -2,10 +2,19 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::{auth::FileEncryptionVersion, crypto::MaybeEncrypted, fs::UuidStr};
+use filen_types::{
+	api::v3::dir::link::PublicLinkExpiration,
+	auth::{FileEncryptionVersion, MetaEncryptionVersion},
+	crypto::MaybeEncrypted,
+	fs::UuidStr,
+};
 
 use crate::{
+	Error,
+	auth::MetaKey,
+	connect::PasswordState,
 	crypto::{error::ConversionError, file::FileKey},
+	error::ResultExt,
 	fs::{
 		categories::{DirType, Linked},
 		dir::{LinkedDirectory, RootDirectoryWithMeta},
@@ -80,7 +89,7 @@ impl TryFrom<LinkedFile> for LinkedFileRS {
 	}
 }
 
-#[js_type]
+#[js_type(wasm_all)]
 pub struct LinkedDir {
 	inner: super::normal::Dir,
 	__linked_tag: bool,
@@ -101,7 +110,7 @@ impl From<LinkedDir> for LinkedDirectory {
 	}
 }
 
-#[js_type]
+#[js_type(wasm_all)]
 pub struct LinkedRootDir {
 	inner: RootDirWithMeta,
 	__linked_tag: bool,
@@ -132,7 +141,7 @@ impl From<LinkedRootDir> for RootDirectoryWithMeta {
 	}
 }
 
-#[js_type(import, export)]
+#[js_type(import, export, wasm_all)]
 pub enum AnyLinkedDir {
 	Root(LinkedRootDir),
 	Dir(LinkedDir),
@@ -153,5 +162,102 @@ impl From<DirType<'static, Linked>> for AnyLinkedDir {
 			DirType::Root(dir) => Self::Root(dir.into_owned().into()),
 			DirType::Dir(dir) => Self::Dir(dir.into_owned().into()),
 		}
+	}
+}
+
+#[js_type(import, export, wasm_all)]
+/// Converting from a DirPublicLinkRW to a DirPublicLink IS allowed
+/// if all fields are compatible
+/// but converting from a DirPublicLink to a DirPublicLinkRW is not allowed
+pub struct DirPublicLink {
+	link_uuid: UuidStr,
+	link_key: String,
+	link_key_version: u8,
+	password: Option<String>,
+	enable_download: bool,
+	salt: Option<Vec<u8>>,
+}
+
+impl From<crate::connect::DirPublicLink> for DirPublicLink {
+	fn from(value: crate::connect::DirPublicLink) -> Self {
+		Self {
+			link_uuid: value.link_uuid,
+			link_key: value.link_key.to_string(),
+			link_key_version: value.link_key.version() as u8,
+			password: value.password,
+			enable_download: value.enable_download,
+			salt: value.salt,
+		}
+	}
+}
+
+impl TryFrom<DirPublicLink> for crate::connect::DirPublicLink {
+	type Error = Error;
+
+	fn try_from(value: DirPublicLink) -> Result<Self, Self::Error> {
+		Ok(Self {
+			link_uuid: value.link_uuid,
+			link_key: MetaKey::from_str_and_version(
+				&value.link_key,
+				MetaEncryptionVersion::try_from(value.link_key_version)
+					.context("DirPublicLink from JS")?,
+			)
+			.context("DirPublicLink from JS")?,
+			password: value.password,
+			enable_download: value.enable_download,
+			salt: value.salt,
+		})
+	}
+}
+
+#[js_type(import, export, wasm_all)]
+/// Converting from a DirPublicLinkRW to a DirPublicLink IS allowed
+/// if all fields are compatible
+/// but converting from a DirPublicLink to a DirPublicLinkRW is not allowed
+pub struct DirPublicLinkRW {
+	link_uuid: UuidStr,
+	link_key: Option<String>,
+	link_key_version: Option<u8>,
+	password: PasswordState,
+	expiration: PublicLinkExpiration,
+	enable_download: bool,
+	salt: Option<Vec<u8>>,
+}
+
+impl From<crate::connect::DirPublicLinkRW> for DirPublicLinkRW {
+	fn from(value: crate::connect::DirPublicLinkRW) -> Self {
+		Self {
+			link_uuid: value.link_uuid,
+			link_key_version: value.link_key.as_ref().map(|k| k.version() as u8),
+			link_key: value.link_key.map(|k| k.to_string()),
+			password: value.password,
+			expiration: value.expiration,
+			enable_download: value.enable_download,
+			salt: value.salt,
+		}
+	}
+}
+
+impl TryFrom<DirPublicLinkRW> for crate::connect::DirPublicLinkRW {
+	type Error = Error;
+
+	fn try_from(value: DirPublicLinkRW) -> Result<Self, Self::Error> {
+		Ok(Self {
+			link_uuid: value.link_uuid,
+			link_key: match (value.link_key, value.link_key_version) {
+				(Some(k), Some(v)) => Some(
+					MetaKey::from_str_and_version(
+						&k,
+						MetaEncryptionVersion::try_from(v).context("DirPublicLinkRW from JS")?,
+					)
+					.context("DirPublicLinkRW from JS")?,
+				),
+				_ => None,
+			},
+			password: value.password,
+			expiration: value.expiration,
+			enable_download: value.enable_download,
+			salt: value.salt,
+		})
 	}
 }

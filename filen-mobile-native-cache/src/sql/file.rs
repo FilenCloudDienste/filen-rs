@@ -381,7 +381,7 @@ impl TryFrom<DBFile> for RemoteFile {
 					mime: Cow::Owned(decrypted_meta.mime),
 					key: Cow::Owned(FileKey::from_string_with_version(
 						Cow::Owned(decrypted_meta.key),
-						FileEncryptionVersion::from(decrypted_meta.key_version),
+						FileEncryptionVersion::try_from(decrypted_meta.key_version)?,
 					)?),
 					created: decrypted_meta
 						.created

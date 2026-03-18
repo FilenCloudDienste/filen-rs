@@ -6,7 +6,7 @@ use filen_types::crypto::{EncryptedString, rsa::RSAEncryptedString};
 
 use crate::fs::dir::{DecryptedDirectoryMeta as DecryptedDirectoryMetaRS, meta::DirectoryMeta};
 
-#[js_type]
+#[js_type(wasm_all)]
 pub struct DecryptedDirMeta {
 	pub name: String,
 	#[cfg_attr(
@@ -41,7 +41,7 @@ impl From<DecryptedDirMeta> for DecryptedDirectoryMetaRS<'static> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
-	feature = "wasm-full",
+	all(target_family = "wasm", target_os = "unknown"),
 	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
 	// we have to set content due to:
 	// https://github.com/serde-rs/serde/issues/1307

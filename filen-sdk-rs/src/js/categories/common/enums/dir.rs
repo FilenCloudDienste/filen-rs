@@ -1,33 +1,33 @@
 use filen_macros::js_type;
 
 use crate::{
-	connect::{
-		DirPublicLink,
-		fs::{SharedDirectory, SharingRole},
-	},
+	connect::fs::{SharedDirectory, SharingRole},
 	fs::{
 		categories::{DirType, Linked, Normal, Shared},
 		dir::LinkedDirectory,
 	},
 	io::RemoteDirectory,
-	js::{AnyLinkedDir, AnyNormalDir, AnySharedDir, Dir, LinkedDir, SharedDir},
+	js::{
+		AnyLinkedDir, AnyNormalDir, AnySharedDir, Dir, LinkedDir, SharedDir,
+		categories::linked::DirPublicLink,
+	},
 };
 
-#[js_type(import)]
+#[js_type(import, wasm_all)]
 pub enum AnyDirWithContext {
 	Shared(AnySharedDirWithContext),
 	Linked(AnyLinkedDirWithContext),
 	Normal(AnyNormalDir),
 }
 
-#[js_type(import)]
+#[js_type(import, wasm_all)]
 pub struct AnySharedDirWithContext {
 	#[js_type_tagged]
 	dir: AnySharedDir,
 	share_info: SharingRole,
 }
 
-#[js_type(import)]
+#[js_type(import, wasm_all)]
 pub struct AnyLinkedDirWithContext {
 	#[js_type_tagged]
 	pub(crate) dir: AnyLinkedDir,

@@ -18,7 +18,7 @@ use filen_types::{
 use http::AuthClient;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
 	api,
@@ -54,12 +54,23 @@ pub mod v3;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub use js_impls::JsClient;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MetaKey {
 	V1(v2::MetaKey),
 	V2(v2::MetaKey),
 	V3(v3::MetaKey),
+}
+
+impl Serialize for MetaKey {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		match self {
+			MetaKey::V1(key) | MetaKey::V2(key) => key.serialize(serializer),
+			MetaKey::V3(key) => key.serialize(serializer),
+		}
+	}
 }
 
 impl MetaCrypter for MetaKey {
@@ -78,6 +89,60 @@ impl MetaCrypter for MetaKey {
 		match self {
 			MetaKey::V1(info) | MetaKey::V2(info) => info.blocking_encrypt_meta_into(meta, out),
 			MetaKey::V3(info) => info.blocking_encrypt_meta_into(meta, out),
+		}
+	}
+}
+
+impl MetaKey {
+	pub(crate) fn from_str_and_version(
+		s: &str,
+		version: MetaEncryptionVersion,
+	) -> Result<Self, ConversionError> {
+		match version {
+			MetaEncryptionVersion::V1 => Ok(MetaKey::V1(v2::MetaKey::from_str(s)?)),
+			MetaEncryptionVersion::V2 => Ok(MetaKey::V2(v2::MetaKey::from_str(s)?)),
+			MetaEncryptionVersion::V3 => Ok(MetaKey::V3(v3::MetaKey::from_str(s)?)),
+		}
+	}
+
+	pub(crate) fn from_str_and_meta(
+		key: &str,
+		encrypted_meta: &EncryptedString<'_>,
+	) -> Result<Self, ConversionError> {
+		let key_version = if encrypted_meta.0.starts_with("U2FsdGVk") {
+			MetaEncryptionVersion::V1
+		} else if encrypted_meta.0.starts_with("002") {
+			MetaEncryptionVersion::V2
+		} else if encrypted_meta.0.starts_with("003") {
+			MetaEncryptionVersion::V3
+		} else {
+			return Err(ConversionError::InvalidVersion(
+				encrypted_meta.0.to_string(),
+				vec![
+					"V1 (starts with U2FsdGVk)".to_string(),
+					"V2 (starts with 002)".to_string(),
+					"V3 (starts with 003)".to_string(),
+				],
+			));
+		};
+
+		Self::from_str_and_version(key, key_version)
+	}
+
+	pub(crate) fn version(&self) -> MetaEncryptionVersion {
+		match self {
+			MetaKey::V1(_) => MetaEncryptionVersion::V1,
+			MetaKey::V2(_) => MetaEncryptionVersion::V2,
+			MetaKey::V3(_) => MetaEncryptionVersion::V3,
+		}
+	}
+}
+
+impl std::fmt::Display for MetaKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			MetaKey::V1(key) | MetaKey::V2(key) => Display::fmt(key.as_ref(), f),
+			MetaKey::V3(key) => Display::fmt(&key, f),
 		}
 	}
 }

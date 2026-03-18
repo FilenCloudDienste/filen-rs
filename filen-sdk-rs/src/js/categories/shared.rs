@@ -27,7 +27,7 @@ impl CategoryJSExt for Shared {
 	type RootFileJS = SharedFile;
 }
 
-#[js_type(export)]
+#[js_type(export, wasm_all)]
 pub struct SharedRootDir {
 	inner: RootDirWithMeta,
 	sharing_role: SharingRole,
@@ -56,7 +56,7 @@ impl From<SharedRootDir> for SharedRootDirectory {
 	}
 }
 
-#[js_type]
+#[js_type(wasm_all)]
 pub struct SharedDir {
 	inner: super::normal::Dir,
 	__shared_tag: bool,
@@ -157,7 +157,7 @@ impl From<RootItemType<'static, Shared>> for SharedRootItem {
 	}
 }
 
-#[js_type(import, export)]
+#[js_type(import, export, wasm_all)]
 pub enum AnySharedDir {
 	Dir(SharedDir),
 	Root(SharedRootDir),

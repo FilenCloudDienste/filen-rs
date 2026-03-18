@@ -4,7 +4,7 @@ use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
 		contacts::Contact,
-		dir::link::PublicLinkExpiration,
+		dir::{color::DirColor, link::PublicLinkExpiration},
 		file::link::edit::FileLinkAction,
 		item::{linked::ListedPublicLink, shared::SharedUser},
 	},
@@ -15,7 +15,7 @@ use fs::{SharedDirectory, SharedRootFile};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::{
-	api,
+	ErrorKind, api,
 	auth::{Client, MetaKey, shared_client::SharedClient},
 	connect::fs::{SharedRootDirectory, SharingRole},
 	crypto::{file::FileKey, shared::MetaCrypter},
@@ -27,7 +27,7 @@ use crate::{
 			fs::CategoryFS,
 			shared::{list_all_in_shared, list_all_out_shared},
 		},
-		dir::{LinkedDirectory, RemoteDirectory},
+		dir::{LinkedDirectory, RemoteDirectory, RootDirectoryWithMeta, meta::DirectoryMeta},
 		file::{LinkedFile, RemoteFile},
 	},
 	runtime::do_cpu_intensive,
@@ -58,7 +58,7 @@ pub(crate) trait MakePasswordSaltAndHash {
 }
 
 #[derive(Default)]
-#[js_type(tagged)]
+#[js_type(tagged, wasm_all)]
 pub enum PasswordState {
 	Known(String),
 	#[cfg_attr(feature = "wasm-full", serde(with = "serde_bytes"))]
@@ -186,17 +186,67 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 	}
 }
 
-#[js_type(import, export)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirPublicLink {
 	pub(crate) link_uuid: UuidStr,
-	link_key: Option<MetaKey>,
-	password: PasswordState,
-	expiration: PublicLinkExpiration,
-	enable_download: bool,
-	salt: Option<Vec<u8>>,
+	pub(crate) link_key: MetaKey,
+	pub(crate) password: Option<String>,
+	pub(crate) enable_download: bool,
+	pub(crate) salt: Option<Vec<u8>>,
 }
 
 impl DirPublicLink {
+	pub(crate) fn crypter(&self) -> &impl MetaCrypter {
+		&self.link_key
+	}
+
+	pub(crate) fn uuid(&self) -> &UuidStr {
+		&self.link_uuid
+	}
+
+	pub(crate) fn get_password_hash(&self) -> Result<Cow<'_, [u8]>, Error> {
+		Ok(Cow::Owned(
+			crate::crypto::connect::derive_password_for_link(
+				self.password.as_deref(),
+				self.salt.as_deref(),
+			)?,
+		))
+	}
+}
+
+pub struct DirPublicLinkRW {
+	pub(crate) link_uuid: UuidStr,
+	pub(crate) link_key: Option<MetaKey>,
+	pub(crate) password: PasswordState,
+	pub(crate) expiration: PublicLinkExpiration,
+	pub(crate) enable_download: bool,
+	pub(crate) salt: Option<Vec<u8>>,
+}
+
+impl TryFrom<DirPublicLinkRW> for DirPublicLink {
+	type Error = Error;
+
+	fn try_from(value: DirPublicLinkRW) -> Result<Self, Self::Error> {
+		Ok(Self {
+			link_uuid: value.link_uuid,
+			link_key: value.link_key.ok_or_else(|| {
+				Error::custom(
+					ErrorKind::MetadataWasNotDecrypted,
+					"Cannot convert DirPublicLinkRW without decrypted link key to DirPublicLink",
+				)
+			})?,
+			password: match value.password {
+				PasswordState::Known(password) => Some(password),
+				PasswordState::Hashed(_) => None,
+				PasswordState::None => None,
+			},
+			enable_download: value.enable_download,
+			salt: value.salt,
+		})
+	}
+}
+
+impl DirPublicLinkRW {
 	pub(crate) fn new(link_key: MetaKey) -> Self {
 		Self {
 			link_uuid: UuidStr::new_v4(),
@@ -213,9 +263,13 @@ impl DirPublicLink {
 	}
 }
 
-impl DirPublicLink {
+impl DirPublicLinkRW {
 	pub fn uuid(&self) -> UuidStr {
 		self.link_uuid
+	}
+
+	pub fn key_string(&self) -> Option<String> {
+		self.link_key.as_ref().map(|k| k.to_string())
 	}
 
 	pub fn set_password(&mut self, password: String) {
@@ -246,7 +300,7 @@ impl DirPublicLink {
 	}
 }
 
-impl MakePasswordSaltAndHash for DirPublicLink {
+impl MakePasswordSaltAndHash for DirPublicLinkRW {
 	fn password(&self) -> &PasswordState {
 		&self.password
 	}
@@ -452,11 +506,11 @@ impl Client {
 		&self,
 		dir: &RemoteDirectory,
 		progress_callback: &F,
-	) -> Result<DirPublicLink, Error>
+	) -> Result<DirPublicLinkRW, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let public_link = DirPublicLink::new(self.make_meta_key());
+		let public_link = DirPublicLinkRW::new(self.make_meta_key());
 		let (dirs, files) = self
 			.list_dir_recursive::<Normal, _>(&DirType::Dir(Cow::Borrowed(dir)), progress_callback)
 			.await?;
@@ -552,7 +606,7 @@ impl Client {
 	pub async fn update_dir_link(
 		&self,
 		dir: &RemoteDirectory,
-		link: &DirPublicLink,
+		link: &DirPublicLinkRW,
 	) -> Result<(), Error> {
 		api::v3::dir::link::edit::post(
 			self.client(),
@@ -685,10 +739,10 @@ impl Client {
 
 	// doesn't require auth, should be moved to a different module in the future
 
-	pub async fn get_dir_link_status(
+	pub async fn get_dir_link_rw(
 		&self,
 		dir: &RemoteDirectory,
-	) -> Result<Option<DirPublicLink>, Error> {
+	) -> Result<Option<DirPublicLinkRW>, Error> {
 		let response = api::v3::dir::link::status::post(
 			self.client(),
 			&api::v3::dir::link::status::Request { uuid: *dir.uuid() },
@@ -705,7 +759,7 @@ impl Client {
 		let (info_response, decrypted_link_key) = futures::join!(
 			async {
 				api::v3::dir::link::info::post(
-					self.client(),
+					self.unauthed(),
 					&api::v3::dir::link::info::Request {
 						uuid: link_status.uuid,
 					},
@@ -720,7 +774,7 @@ impl Client {
 			Some(password) => PasswordState::Hashed(password.into_owned()),
 			None => PasswordState::None,
 		};
-		Ok(Some(DirPublicLink {
+		Ok(Some(DirPublicLinkRW {
 			link_uuid: link_status.uuid,
 			link_key: decrypted_link_key.ok(),
 			password,
@@ -730,7 +784,7 @@ impl Client {
 		}))
 	}
 
-	pub async fn remove_dir_link(&self, link: DirPublicLink) -> Result<(), Error> {
+	pub async fn remove_dir_link(&self, link: DirPublicLinkRW) -> Result<(), Error> {
 		api::v3::dir::link::remove::post(
 			self.client(),
 			&api::v3::dir::link::remove::Request {
@@ -925,6 +979,45 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync;
+
+	async fn get_dir_public_link_info(
+		&self,
+		link_uuid: UuidStr,
+		link_key: &str,
+	) -> Result<DirPublicInfo, Error> {
+		let resp = api::v3::dir::link::info::post(
+			self.get_unauth_client(),
+			&api::v3::dir::link::info::Request { uuid: link_uuid },
+		)
+		.await?;
+
+		let key = MetaKey::from_str_and_meta(link_key, &resp.metadata)?;
+
+		let meta =
+			do_cpu_intensive(|| DirectoryMeta::blocking_from_encrypted(resp.metadata, &key)).await;
+		let root =
+			RootDirectoryWithMeta::from_meta(resp.parent, DirColor::Default, resp.timestamp, meta);
+
+		let link = DirPublicLink {
+			link_uuid,
+			link_key: key,
+			password: None,
+			enable_download: resp.download_btn,
+			salt: None,
+		};
+
+		Ok(DirPublicInfo {
+			root,
+			link,
+			has_password: resp.has_password,
+		})
+	}
+}
+
+pub struct DirPublicInfo {
+	pub root: RootDirectoryWithMeta,
+	pub link: DirPublicLink,
+	pub has_password: bool,
 }
 
 impl<T> PublicLinkSharedClientExt for T

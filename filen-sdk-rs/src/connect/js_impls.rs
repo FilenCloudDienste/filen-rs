@@ -11,13 +11,12 @@ use crate::auth::js_impls::UnauthJsClient;
 use crate::{
 	Error,
 	auth::{JsClient, shared_client::SharedClient},
-	connect::{
-		DirPublicLink, FilePublicLink, PasswordState, PublicLinkSharedClientExt, fs::SharingRole,
-	},
+	connect::{FilePublicLink, PasswordState, PublicLinkSharedClientExt, fs::SharingRole},
 	fs::categories::{DirType, Linked},
 	js::{
-		AnyLinkedDir, AnySharedDir, Dir, File, LinkedDir, LinkedDirsAndFiles, LinkedFile,
-		NormalDirsAndFiles, SharedDir, SharedFile, SharedRootDir, SharedRootItem,
+		AnyLinkedDir, AnySharedDir, Dir, DirPublicLink, DirPublicLinkRW, File, LinkedDir,
+		LinkedDirsAndFiles, LinkedFile, LinkedRootDir, NormalDirsAndFiles, SharedDir, SharedFile,
+		SharedRootDir, SharedRootItem,
 	},
 	runtime::{self, do_on_commander},
 };
@@ -222,14 +221,20 @@ pub struct SharedRootDirsAndFiles {
 // errors.
 // Probably due to compiler bugs with async.
 impl JsClient {
-	async fn inner_public_link_dir<F>(&self, dir: Dir, callback: F) -> Result<DirPublicLink, Error>
+	async fn inner_public_link_dir<F>(
+		&self,
+		dir: Dir,
+		callback: F,
+	) -> Result<DirPublicLinkRW, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			let dir = dir.into();
-			this.public_link_dir(&dir, &callback).await
+			this.public_link_dir(&dir, &callback)
+				.await
+				.map(|link| link.into())
 		})
 		.await
 	}
@@ -255,7 +260,7 @@ impl JsClient {
 		&self,
 		dir: Dir,
 		callback: Arc<dyn DirContentDownloadProgressCallback>,
-	) -> Result<DirPublicLink, Error> {
+	) -> Result<DirPublicLinkRW, Error> {
 		self.inner_public_link_dir(dir, move |downloaded, total| {
 			let callback = Arc::clone(&callback);
 			tokio::task::spawn_blocking(move || {
@@ -292,7 +297,7 @@ impl JsClient {
 			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
 		)]
 		callback: web_sys::js_sys::Function,
-	) -> Result<DirPublicLink, Error> {
+	) -> Result<DirPublicLinkRW, Error> {
 		use crate::runtime;
 		use wasm_bindgen::JsValue;
 		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -317,6 +322,7 @@ impl JsClient {
 				let _ = sender.send((downloaded, total));
 			})
 			.await
+			.map(|link| link.into())
 		})
 		.await
 	}
@@ -379,12 +385,13 @@ impl JsClient {
 	pub async fn update_dir_link(
 		&self,
 		dir: Dir,
-		mut link: DirPublicLink,
-	) -> Result<DirPublicLink, Error> {
+		link: DirPublicLinkRW,
+	) -> Result<DirPublicLinkRW, Error> {
 		let this = self.inner();
 		// If JS sets the password to a new value, it probably hasn't set the salt
 		// So if the salt is missing but the password is present
 		// we should assume that the password was updated and generate a new salt for it
+		let mut link = crate::connect::DirPublicLinkRW::try_from(link)?;
 		if link.salt.is_none()
 			&& let PasswordState::Known(_) = link.password
 		{
@@ -398,7 +405,7 @@ impl JsClient {
 		runtime::do_on_commander(move || async move {
 			this.update_dir_link(&dir.into(), &link)
 				.await
-				.map(|()| link)
+				.map(|()| link.into())
 		})
 		.await
 	}
@@ -407,19 +414,26 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirLinkStatus")
 	)]
-	pub async fn get_dir_link_status(&self, dir: Dir) -> Result<Option<DirPublicLink>, Error> {
+	pub async fn get_dir_link_status(&self, dir: Dir) -> Result<Option<DirPublicLinkRW>, Error> {
 		let this = self.inner();
-		runtime::do_on_commander(move || async move { this.get_dir_link_status(&dir.into()).await })
-			.await
+		runtime::do_on_commander(move || async move {
+			this.get_dir_link_rw(&dir.into())
+				.await
+				.map(|maybe_link| maybe_link.map(|link| link.into()))
+		})
+		.await
 	}
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "removeDirLink")
 	)]
-	pub async fn remove_dir_link(&self, link: DirPublicLink) -> Result<(), Error> {
+	pub async fn remove_dir_link(&self, link: DirPublicLinkRW) -> Result<(), Error> {
 		let this = self.inner();
-		runtime::do_on_commander(move || async move { this.remove_dir_link(link).await }).await
+		runtime::do_on_commander(
+			move || async move { this.remove_dir_link(link.try_into()?).await },
+		)
+		.await
 	}
 	// This is annoying because I can't map this to either of the basic file types
 	// I probably have to make a new base file type and implement everything for it
@@ -788,7 +802,7 @@ where
 {
 	let (dirs, files) = runtime::do_on_commander(move || async move {
 		client
-			.list_linked_dir(&DirType::<Linked>::from(dir), &link, &callback)
+			.list_linked_dir(&DirType::<Linked>::from(dir), &link.try_into()?, &callback)
 			.await
 			.map(|(dirs, files)| {
 				(
@@ -911,5 +925,64 @@ impl UnauthJsClient {
 		callback: web_sys::js_sys::Function,
 	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_wasm(self.inner(), dir, link, callback).await
+	}
+}
+
+#[js_type(export)]
+pub struct DirPublicInfo {
+	root: LinkedRootDir,
+	link: DirPublicLink,
+	has_password: bool,
+}
+
+impl From<crate::connect::DirPublicInfo> for DirPublicInfo {
+	fn from(info: crate::connect::DirPublicInfo) -> Self {
+		Self {
+			root: info.root.into(),
+			link: info.link.into(),
+			has_password: info.has_password,
+		}
+	}
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg_attr(
+	feature = "wasm-full",
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+)]
+impl JsClient {
+	pub async fn get_dir_public_link_info(
+		&self,
+		link_uuid: UuidStr,
+		link_key: String,
+	) -> Result<DirPublicInfo, Error> {
+		let this = self.inner();
+		runtime::do_on_commander(move || async move {
+			this.get_dir_public_link_info(link_uuid, &link_key)
+				.await
+				.map(DirPublicInfo::from)
+		})
+		.await
+	}
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg_attr(
+	feature = "wasm-full",
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
+)]
+impl UnauthJsClient {
+	pub async fn get_dir_public_link_info(
+		&self,
+		link_uuid: UuidStr,
+		link_key: String,
+	) -> Result<DirPublicInfo, Error> {
+		let this = self.inner();
+		runtime::do_on_commander(move || async move {
+			this.get_dir_public_link_info(link_uuid, &link_key)
+				.await
+				.map(DirPublicInfo::from)
+		})
+		.await
 	}
 }

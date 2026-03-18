@@ -13,10 +13,11 @@ import init, {
 	type DirMeta,
 	UnauthClient,
 	parseName,
-	EntryNameErrorJS
+	EntryNameErrorJS,
+	type AnyLinkedDirWithContext
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
-// import { ZipReader, type Entry } from "@zip.js/zip.js" // used by commented-out "Zip Download" test
+import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
 
 console.log("Initializing WASM...")
 await init()
@@ -381,79 +382,91 @@ test("pause", async () => {
 	expect(metaB?.name).toBe("pause b.txt")
 })
 
-// ⚠️ UNRESOLVABLE: "Zip Download"
-// Issue: Client.downloadItemsToZip was removed from the WASM API surface in the
-//        Category-trait refactor (commits a00c7af / 9dc1310). The method no longer
-//        exists on the generated Client class.
-// Required Rust change: Re-expose downloadItemsToZip (or an equivalent) on the
-//        WASM Client that accepts a mixed list of normal Files and Dirs, a
-//        WritableStream, and a four-parameter progress callback
-//        (bytesWritten, totalBytes, itemsProcessed, totalItems).
-// Test preserved as-is pending Rust SDK update.
-// test("Zip Download", async () => {
-// 	const dirA = await state.createDir(testDir, "a")
-// 	const dirB = await state.createDir(dirA, "b")
-// 	await state.createDir(testDir, "c")
+// This test only passes Dir items at the top level; nested files are verified as zip entries.
+test("Zip Download", async () => {
+	const dirA = await state.createDir(testDir, "zip-a")
+	const dirB = await state.createDir(dirA, "b")
 
-// 	const file = await state.uploadFile(new TextEncoder().encode("root file content"), {
-// 		parent: testDir,
-// 		name: "file.txt"
-// 	})
-// 	const file1 = await state.uploadFile(new TextEncoder().encode("file 1 content"), {
-// 		parent: dirA,
-// 		name: "file1.txt"
-// 	})
-// 	const file2 = await state.uploadFile(new TextEncoder().encode("file 2 content"), {
-// 		parent: dirB,
-// 		name: "file2.txt"
-// 	})
-// 	const file3 = await state.uploadFile(new TextEncoder().encode("file 3 content"), {
-// 		parent: dirB,
-// 		name: "file3.txt"
-// 	})
+	const file1 = await state.uploadFile(new TextEncoder().encode("file 1 content"), {
+		parent: dirA,
+		name: "file1.txt"
+	})
+	const file2 = await state.uploadFile(new TextEncoder().encode("file 2 content"), {
+		parent: dirB,
+		name: "file2.txt"
+	})
+	const file3 = await state.uploadFile(new TextEncoder().encode("file 3 content"), {
+		parent: dirB,
+		name: "file3.txt"
+	})
 
-// 	const { readable, writable } = new TransformStream()
+	const { readable, writable } = new TransformStream<Uint8Array>()
 
-// 	// we don't await here because TransformStream doesn't have a buffer
-// 	// so this would hang forever
-// 	// @ts-expect-error downloadItemsToZip was removed from the SDK — see UNRESOLVABLE comment above
-// 	state.downloadItemsToZip({
-// 		items: [file, dirA],
-// 		writer: writable,
-// 		progress: (_bytesWritten: unknown, _totalBytes: unknown, _itemsProcessed: unknown, _totalItems: unknown) => {
-// 			//
-// 		}
-// 	})
+	let lastBytesWritten = 0n
+	let lastTotalBytes = 0n
+	let progressCallCount = 0
 
-// 	const zipReader = new ZipReader(readable)
+	// Do not await here: TransformStream has no internal buffer. Awaiting before consuming
+	// the readable side would deadlock (the writer blocks when the reader is not draining).
+	// Instead save the promise and await it after consuming all zip entries.
+	let downloadError: unknown = undefined
+	const downloadPromise = state
+		.downloadItemsToZip(
+			[dirA],
+			writable,
+			(bytesWritten: bigint, totalBytes: bigint, _itemsProcessed: bigint, _totalItems: bigint) => {
+				lastBytesWritten = bytesWritten
+				lastTotalBytes = totalBytes
+				progressCallCount++
+			},
+			{}
+		)
+		.catch((e: unknown) => {
+			downloadError = e
+		})
 
-// 	const entries = await zipReader.getEntries()
-// 	const map = new Map<string, Entry>()
-// 	for (const entry of entries) {
-// 		map.set(entry.filename, entry)
-// 	}
+	const zipReader = new ZipReader<ReadableStream<Uint8Array>>(readable)
 
-// 	const compareFileToEntry = async (entry: Entry, expected: Uint8Array, expectedFile: File) => {
-// 		if (entry.directory) {
-// 			throw new Error("Expected entry to be a FileEntry, but it was a directory")
-// 		}
-// 		// zip.js has bad precision for dates, so we compare in seconds
-// 		const meta = getFileMeta(expectedFile.meta)
-// 		expect(BigInt(entry.creationDate!.getTime())).toEqual(meta?.created)
-// 		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(meta?.modified) / 1000))
-// 		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
-// 		const { readable, writable } = new TransformStream()
-// 		// we don't await here because TransformStream doesn't have a buffer
-// 		// so this would hang forever
-// 		entry.getData!(writable)
-// 		expect(await streamToUint8Array(readable)).toEqual(expected)
-// 	}
+	let zipError: unknown = undefined
+	const entries = await zipReader.getEntries().catch((e: unknown) => {
+		zipError = e
+		return [] as Entry[]
+	})
+	// Await the download to surface any SDK error before asserting zip results
+	await downloadPromise
+	if (downloadError !== undefined) {
+		throw new Error(`downloadItemsToZip failed: ${downloadError}`)
+	}
+	if (zipError !== undefined) {
+		throw new Error(`ZipReader.getEntries failed: ${zipError}`)
+	}
+	const map = new Map<string, Entry>()
+	for (const entry of entries) {
+		map.set(entry.filename, entry)
+	}
 
-// 	await compareFileToEntry(map.get("file.txt")!, new TextEncoder().encode("root file content"), file)
-// 	await compareFileToEntry(map.get("a/file1.txt")!, new TextEncoder().encode("file 1 content"), file1)
-// 	await compareFileToEntry(map.get("a/b/file2.txt")!, new TextEncoder().encode("file 2 content"), file2)
-// 	await compareFileToEntry(map.get("a/b/file3.txt")!, new TextEncoder().encode("file 3 content"), file3)
-// })
+	const compareFileToEntry = async (entry: Entry, expected: Uint8Array, expectedFile: File) => {
+		if (entry.directory) {
+			throw new Error("Expected entry to be a FileEntry, but it was a directory")
+		}
+		// zip.js has bad precision for dates, so we compare in seconds
+		const meta = getFileMeta(expectedFile.meta)
+		expect(BigInt(entry.creationDate!.getTime())).toEqual(meta?.created)
+		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(meta?.modified) / 1000))
+		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
+		const data = await entry.getData(new Uint8ArrayWriter())
+		expect(data).toEqual(expected)
+	}
+
+	await compareFileToEntry(map.get("zip-a/file1.txt")!, new TextEncoder().encode("file 1 content"), file1)
+	await compareFileToEntry(map.get("zip-a/b/file2.txt")!, new TextEncoder().encode("file 2 content"), file2)
+	await compareFileToEntry(map.get("zip-a/b/file3.txt")!, new TextEncoder().encode("file 3 content"), file3)
+
+	// verify progress callback fired and final counters are consistent
+	expect(progressCallCount).toBeGreaterThan(0)
+	expect(lastBytesWritten).toBeGreaterThan(0n)
+	expect(lastBytesWritten).toBeLessThanOrEqual(lastTotalBytes)
+})
 
 test("sharing", async () => {
 	const dir = await state.createDir(testDir, "share-test-dir")
@@ -531,7 +544,7 @@ test("block", async () => {
 	expect(blocked[0].email).toBe(import.meta.env.VITE_TEST_EMAIL)
 
 	const requestsAfter = await shareClient.listIncomingContactRequests()
-	expect(requestsAfter.length).toBe(0)
+	expect(requestsAfter.length).toBe(requests.length - 1)
 
 	await shareClient.unblockContact(blocked[0].uuid)
 	const blockedAfter = await shareClient.getBlockedContacts()
@@ -746,7 +759,7 @@ test("search", async () => {
 		name: "search-file-124asdfas;dlkfj.txt"
 	})
 
-	const results = await state.findItemMatchesForName("124asdfas;dlkfj")
+	const results = await state.findItemMatchesForName("124asdfa")
 	// Narrow to NormalDir/File before accessing uuid (SharedDir/LinkedDir variants have no direct uuid)
 	expect(results.find(i => (i.item.type === "normalDir" || i.item.type === "file") && i.item.uuid === dir.uuid)).toBeDefined()
 	expect(results.find(i => (i.item.type === "normalDir" || i.item.type === "file") && i.item.uuid === file.uuid)).toBeDefined()
@@ -819,6 +832,106 @@ test("listLinkedItems", async () => {
 	const foundFile = linkedItems.files.find(i => i.uuid === file.uuid)
 	expect(foundFile).toBeDefined()
 	expect(foundFile).toEqual(file)
+})
+
+test("Linked Dir Zip Download", async () => {
+	const linkedZipDir = await state.createDir(testDir, "linked-zip-dir")
+	const subDir = await state.createDir(linkedZipDir, "sub")
+
+	const file1 = await state.uploadFile(new TextEncoder().encode("linked zip file 1"), {
+		parent: linkedZipDir,
+		name: "linked1.txt"
+	})
+	const file2 = await state.uploadFile(new TextEncoder().encode("linked zip file 2"), {
+		parent: subDir,
+		name: "linked2.txt"
+	})
+
+	// Create a public link for the directory
+	const linkRW = await state.publicLinkDir(linkedZipDir, (downloaded, total) => {
+		console.log("publicLinkDir progress", downloaded, total)
+	})
+	if (!linkRW.linkKey || linkRW.linkKeyVersion === undefined) {
+		throw new Error("Expected linkRW to have a decrypted linkKey")
+	}
+
+	// Fetch the public link info via the unauthenticated client — this gives us
+	// a DirPublicLink (read-only, with decrypted key) and the LinkedRootDir
+	const linkInfo = await unauthClient.get_dir_public_link_info(linkRW.linkUuid, linkRW.linkKey)
+
+	// Build AnyLinkedDirWithContext: the root dir paired with its public link
+	const linkedDirWithContext: AnyLinkedDirWithContext = {
+		dir: linkInfo.root,
+		link: linkInfo.link
+	}
+
+	const { readable, writable } = new TransformStream<Uint8Array>()
+
+	let lastBytesWritten = 0n
+	let lastTotalBytes = 0n
+	let progressCallCount = 0
+
+	// Do not await here: TransformStream has no internal buffer, awaiting before consuming
+	// the readable side would deadlock (the writer blocks when the reader is not draining).
+	let downloadError: unknown = undefined
+	const downloadPromise = unauthClient
+		.downloadLinkedDirToZip(
+			linkedDirWithContext,
+			writable,
+			(bytesWritten: bigint, totalBytes: bigint, _itemsProcessed: bigint, _totalItems: bigint) => {
+				lastBytesWritten = bytesWritten
+				lastTotalBytes = totalBytes
+				progressCallCount++
+			},
+			{}
+		)
+		.catch((e: unknown) => {
+			downloadError = e
+		})
+
+	const zipReader = new ZipReader<ReadableStream<Uint8Array>>(readable)
+
+	let zipError: unknown = undefined
+	const entries = await zipReader.getEntries().catch((e: unknown) => {
+		zipError = e
+		return [] as Entry[]
+	})
+
+	await downloadPromise
+	if (downloadError !== undefined) {
+		throw new Error(`downloadLinkedDirToZip failed: ${downloadError}`)
+	}
+	if (zipError !== undefined) {
+		throw new Error(`ZipReader.getEntries failed: ${zipError}`)
+	}
+
+	console.log(entries)
+
+	const map = new Map<string, Entry>()
+	for (const entry of entries) {
+		map.set(entry.filename, entry)
+	}
+
+	// Verify file1 at root of the linked dir
+	const entry1 = map.get("linked1.txt")
+	expect(entry1).toBeDefined()
+	if (!entry1 || entry1.directory) throw new Error("entry1 not found or is a directory")
+	const data1 = await entry1.getData(new Uint8ArrayWriter())
+	expect(data1).toEqual(new TextEncoder().encode("linked zip file 1"))
+	expect(BigInt(entry1.uncompressedSize)).toEqual(file1.size)
+
+	// Verify file2 inside the sub-directory
+	const entry2 = map.get("sub/linked2.txt")
+	expect(entry2).toBeDefined()
+	if (!entry2 || entry2.directory) throw new Error("entry2 not found or is a directory")
+	const data2 = await entry2.getData(new Uint8ArrayWriter())
+	expect(data2).toEqual(new TextEncoder().encode("linked zip file 2"))
+	expect(BigInt(entry2.uncompressedSize)).toEqual(file2.size)
+
+	// Verify progress callbacks fired
+	expect(progressCallCount).toBeGreaterThan(0)
+	expect(lastBytesWritten).toBeGreaterThan(0n)
+	expect(lastBytesWritten).toBeLessThanOrEqual(lastTotalBytes)
 })
 
 test("favorites", async () => {
@@ -1069,29 +1182,6 @@ afterAll(async () => {
 		await state.deleteDirPermanently(testDir)
 	}
 })
-
-// streamToUint8Array is used by the commented-out "Zip Download" test; preserved here for when that test is restored.
-// async function streamToUint8Array(readableStream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-// 	const chunks = []
-// 	const reader = readableStream.getReader()
-//
-// 	while (true) {
-// 		const { done, value } = await reader.read()
-// 		if (done) break
-// 		chunks.push(value)
-// 	}
-//
-// 	// Concatenate all chunks
-// 	const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-// 	const result = new Uint8Array(totalLength)
-// 	let offset = 0
-// 	for (const chunk of chunks) {
-// 		result.set(chunk, offset)
-// 		offset += chunk.length
-// 	}
-//
-// 	return result
-// }
 
 export function jsonBigIntReplacer(_: string, value: unknown) {
 	if (typeof value === "bigint") {

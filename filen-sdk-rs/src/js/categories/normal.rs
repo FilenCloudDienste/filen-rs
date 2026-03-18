@@ -22,7 +22,7 @@ impl CategoryJSExt for Normal {
 	type RootFileJS = File;
 }
 
-#[js_type(export)]
+#[js_type(export, wasm_all)]
 pub struct Root {
 	pub uuid: UuidStr,
 }
@@ -39,7 +39,7 @@ impl From<Root> for RootDirectory {
 	}
 }
 
-#[js_type(import, export)]
+#[js_type(import, export, wasm_all)]
 pub struct Dir {
 	pub uuid: UuidStr,
 	pub parent: ParentUuid,
@@ -80,7 +80,7 @@ impl From<Dir> for RemoteDirectory {
 	}
 }
 
-#[js_type(import)]
+#[js_type(import, wasm_all)]
 pub enum AnyNormalDir {
 	Dir(Dir),
 	Root(Root),

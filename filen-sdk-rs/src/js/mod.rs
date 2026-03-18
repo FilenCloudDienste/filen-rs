@@ -25,7 +25,7 @@ pub(crate) use categories::{
 		},
 		file::{File, meta::FileMeta, version::FileVersion},
 	},
-	linked::{AnyLinkedDir, LinkedDir, LinkedFile},
+	linked::{AnyLinkedDir, DirPublicLink, DirPublicLinkRW, LinkedDir, LinkedFile, LinkedRootDir},
 	normal::{AnyNormalDir, Dir, NonRootNormalItem, Root},
 	shared::{AnySharedDir, SharedDir, SharedFile, SharedRootDir, SharedRootItem},
 };
@@ -42,7 +42,9 @@ pub use managed_futures::*;
 pub use params::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub use returned_types::*;
-#[cfg(feature = "wasm-full")]
+#[cfg(feature = "service-worker")]
+pub(crate) use service_worker::impls::*;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) use service_worker::shared::*;
 
 const HIDDEN_META_KEY: &str = "__hiddenMeta";

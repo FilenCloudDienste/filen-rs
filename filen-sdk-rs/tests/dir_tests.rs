@@ -10,6 +10,7 @@ use filen_macros::shared_test_runtime;
 
 use filen_sdk_rs::{
 	Error, ErrorKind,
+	connect::{DirPublicLink, PublicLinkSharedClientExt},
 	crypto::shared::generate_random_base64_values,
 	fs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID,
@@ -687,131 +688,264 @@ async fn dir_malformed_meta() {
 	assert!(matches!(dir.get_meta(), DirectoryMeta::Encrypted(_)));
 }
 
-// TODO: uncomment when download_items_to_zip is reimplemented
-// #[shared_test_runtime]
-// async fn download_to_zip() {
-// 	let resources = test_utils::RESOURCES.get_resources().await;
-// 	let client = &resources.client;
-// 	let test_dir = &resources.dir;
-//
-// 	let dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
-// 	let dir_b = client.create_dir(&(&dir_a).into(), "b").await.unwrap();
-// 	let _dir_c = client.create_dir(&test_dir.into(), "c").await.unwrap();
-//
-// 	let file = client.make_file_builder("file.txt", *test_dir.uuid()).build();
-// 	let file = client
-// 		.upload_file(file.into(), b"root file content")
-// 		.await
-// 		.unwrap();
+#[shared_test_runtime]
+async fn download_to_zip() {
+	use std::io::{BufReader, Read, Seek};
 
-// 	let file_1 = client.make_file_builder("file1.txt", &dir_a).build();
-// 	let file_1 = client
-// 		.upload_file(file_1.into(), b"file 1 content")
-// 		.await
-// 		.unwrap();
-// 	let file_2 = client.make_file_builder("file2.txt", &dir_b).build();
-// 	let file_2 = client
-// 		.upload_file(file_2.into(), b"file 2 content")
-// 		.await
-// 		.unwrap();
-// 	let file_3 = client.make_file_builder("file3.txt", &dir_b).build();
-// 	let file_3 = client
-// 		.upload_file(file_3.into(), b"file 3 content")
-// 		.await
-// 		.unwrap();
+	use filen_sdk_rs::fs::file::traits::HasFileInfo;
+	use tokio_util::compat::TokioAsyncWriteCompatExt;
+	use zip::{ZipArchive, extra_fields::ExtraField, read::ZipFile};
 
-// 	let tmp = std::env::temp_dir();
-// 	let mut options = tokio::fs::OpenOptions::new();
-// 	options.create(true).write(true).read(true).truncate(true);
-// 	let zip_file = options
-// 		.open(tmp.join("test.zip"))
-// 		.await
-// 		.unwrap()
-// 		.compat_write();
-// 	let zip_file = client
-// 		.download_items_to_zip(
-// 			&[
-// 				FSObject::File(Cow::Borrowed(&file)),
-// 				FSObject::Dir(Cow::Borrowed(&dir_a)),
-// 			],
-// 			zip_file,
-// 			None::<&fn(u64, u64, u64, u64)>,
-// 		)
-// 		.await
-// 		.unwrap();
-// 	let mut zip_file = zip_file.into_inner().into_std().await;
-// 	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
-// 	let mut archive = zip::ZipArchive::new(BufReader::new(zip_file)).unwrap();
-// 	let names = archive.file_names().collect::<Vec<_>>();
-// 	assert!(names.contains(&"a/"));
-// 	assert!(names.contains(&"a/b/"));
-// 	assert!(names.contains(&"file.txt"));
-// 	assert!(names.contains(&"a/file1.txt"));
-// 	assert!(names.contains(&"a/b/file2.txt"));
-// 	assert!(names.contains(&"a/b/file3.txt"));
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
 
-// 	assert!(archive.by_name("a/").unwrap().is_dir());
-// 	assert!(archive.by_name("a/b/").unwrap().is_dir());
+	let dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
+	let dir_b = client.create_dir(&(&dir_a).into(), "b").await.unwrap();
+	let _dir_c = client.create_dir(&test_dir.into(), "c").await.unwrap();
 
-// 	let assert_file_eq =
-// 		|file: &mut ZipFile<BufReader<File>>, expected: &[u8], expected_file: &RemoteFile| {
-// 			assert!(file.is_file());
-// 			let mut buf = Vec::new();
-// 			file.read_to_end(&mut buf).unwrap();
-// 			assert_eq!(buf, expected);
-// 			let extra_fields = file.extra_data_fields().collect::<Vec<_>>();
-// 			assert!(extra_fields.len() >= 2);
-// 			for field in &extra_fields {
-// 				match field {
-// 					ExtraField::ExtendedTimestamp(data) => {
-// 						if let Some(modified) = expected_file.last_modified() {
-// 							assert_eq!(data.mod_time(), Some(modified.timestamp() as u32));
-// 						}
-// 						if let Some(created) = expected_file.created() {
-// 							assert_eq!(data.cr_time(), Some(created.timestamp() as u32));
-// 						}
-// 					}
-// 					ExtraField::Ntfs(data) => {
-// 						if let Some(modified) = expected_file.last_modified() {
-// 							assert_eq!(
-// 								data.mtime(),
-// 								filen_sdk_rs::io::unix_time_to_nt_time(modified)
-// 							);
-// 						}
-// 						if let Some(created) = expected_file.created() {
-// 							assert_eq!(
-// 								data.ctime(),
-// 								filen_sdk_rs::io::unix_time_to_nt_time(created)
-// 							);
-// 						}
-// 					}
-// 					#[allow(unreachable_patterns)]
-// 					_ => {}
-// 				}
-// 			}
-// 		};
+	let file = client
+		.make_file_builder("file.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let file = client
+		.upload_file(file.into(), b"root file content")
+		.await
+		.unwrap();
 
-// 	assert_file_eq(
-// 		&mut archive.by_name("file.txt").unwrap(),
-// 		b"root file content",
-// 		&file,
-// 	);
-// 	assert_file_eq(
-// 		&mut archive.by_name("a/file1.txt").unwrap(),
-// 		b"file 1 content",
-// 		&file_1,
-// 	);
-// 	assert_file_eq(
-// 		&mut archive.by_name("a/b/file2.txt").unwrap(),
-// 		b"file 2 content",
-// 		&file_2,
-// 	);
-// 	assert_file_eq(
-// 		&mut archive.by_name("a/b/file3.txt").unwrap(),
-// 		b"file 3 content",
-// 		&file_3,
-// 	);
-// }
+	let file_1 = client
+		.make_file_builder("file1.txt", *dir_a.uuid())
+		.unwrap()
+		.build();
+	let file_1 = client
+		.upload_file(file_1.into(), b"file 1 content")
+		.await
+		.unwrap();
+	let file_2 = client
+		.make_file_builder("file2.txt", *dir_b.uuid())
+		.unwrap()
+		.build();
+	let file_2 = client
+		.upload_file(file_2.into(), b"file 2 content")
+		.await
+		.unwrap();
+	let file_3 = client
+		.make_file_builder("file3.txt", *dir_b.uuid())
+		.unwrap()
+		.build();
+	let file_3 = client
+		.upload_file(file_3.into(), b"file 3 content")
+		.await
+		.unwrap();
+
+	let tmp = std::env::temp_dir();
+	let mut options = tokio::fs::OpenOptions::new();
+	options.create(true).write(true).read(true).truncate(true);
+	let zip_file = options
+		.open(tmp.join("test.zip"))
+		.await
+		.unwrap()
+		.compat_write();
+	let zip_file = client
+		.download_items_to_zip::<Normal, _>(
+			&[
+				NonRootFileType::File(Cow::Borrowed(&file)),
+				NonRootFileType::Dir(Cow::Borrowed(&dir_a)),
+			],
+			zip_file,
+			None::<&fn(u64, u64, u64, u64)>,
+			(),
+		)
+		.await
+		.unwrap();
+	let mut zip_file = zip_file.into_inner().into_std().await;
+	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+	let mut archive = ZipArchive::new(BufReader::new(zip_file)).unwrap();
+	let names = archive.file_names().collect::<Vec<_>>();
+	assert!(names.contains(&"a/"));
+	assert!(names.contains(&"a/b/"));
+	assert!(names.contains(&"file.txt"));
+	assert!(names.contains(&"a/file1.txt"));
+	assert!(names.contains(&"a/b/file2.txt"));
+	assert!(names.contains(&"a/b/file3.txt"));
+
+	assert!(archive.by_name("a/").unwrap().is_dir());
+	assert!(archive.by_name("a/b/").unwrap().is_dir());
+
+	let assert_file_eq =
+		|file: &mut ZipFile<BufReader<File>>, expected: &[u8], expected_file: &RemoteFile| {
+			assert!(file.is_file());
+			let mut buf = Vec::new();
+			file.read_to_end(&mut buf).unwrap();
+			assert_eq!(buf, expected);
+			let extra_fields = file.extra_data_fields().collect::<Vec<_>>();
+			assert!(extra_fields.len() >= 2);
+			for field in &extra_fields {
+				match field {
+					ExtraField::ExtendedTimestamp(data) => {
+						if let Some(modified) = expected_file.last_modified() {
+							assert_eq!(data.mod_time(), Some(modified.timestamp() as u32));
+						}
+						if let Some(created) = expected_file.created() {
+							assert_eq!(data.cr_time(), Some(created.timestamp() as u32));
+						}
+					}
+					ExtraField::Ntfs(data) => {
+						if let Some(modified) = expected_file.last_modified() {
+							assert_eq!(
+								data.mtime(),
+								filen_sdk_rs::io::unix_time_to_nt_time(modified)
+							);
+						}
+						if let Some(created) = expected_file.created() {
+							assert_eq!(
+								data.ctime(),
+								filen_sdk_rs::io::unix_time_to_nt_time(created)
+							);
+						}
+					}
+					#[allow(unreachable_patterns)]
+					_ => {}
+				}
+			}
+		};
+
+	assert_file_eq(
+		&mut archive.by_name("file.txt").unwrap(),
+		b"root file content",
+		&file,
+	);
+	assert_file_eq(
+		&mut archive.by_name("a/file1.txt").unwrap(),
+		b"file 1 content",
+		&file_1,
+	);
+	assert_file_eq(
+		&mut archive.by_name("a/b/file2.txt").unwrap(),
+		b"file 2 content",
+		&file_2,
+	);
+	assert_file_eq(
+		&mut archive.by_name("a/b/file3.txt").unwrap(),
+		b"file 3 content",
+		&file_3,
+	);
+}
+
+#[shared_test_runtime]
+async fn download_linked_dir_to_zip() {
+	use std::io::{BufReader, Read, Seek};
+
+	use filen_sdk_rs::{
+		auth::unauth::UnauthClient,
+		fs::categories::{Linked, NonRootFileType},
+	};
+	use tokio_util::compat::TokioAsyncWriteCompatExt;
+	use zip::ZipArchive;
+
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// Create a dir structure to link
+	let dir_a = client
+		.create_dir(&test_dir.into(), "linked_a")
+		.await
+		.unwrap();
+	let dir_b = client
+		.create_dir(&(&dir_a).into(), "linked_b")
+		.await
+		.unwrap();
+
+	let file_1 = client
+		.make_file_builder("link_file1.txt", *dir_a.uuid())
+		.unwrap()
+		.build();
+	let _file_1 = client
+		.upload_file(file_1.into(), b"linked file 1")
+		.await
+		.unwrap();
+	let file_2 = client
+		.make_file_builder("link_file2.txt", *dir_b.uuid())
+		.unwrap()
+		.build();
+	let _file_2 = client
+		.upload_file(file_2.into(), b"linked file 2")
+		.await
+		.unwrap();
+
+	// Create a public link for the directory
+	let link = client.public_link_dir(&dir_a, &|_, _| {}).await.unwrap();
+
+	// Use a fresh UnauthClient (simulating a non-authenticated user)
+	let unauth_client =
+		UnauthClient::from_config(filen_sdk_rs::auth::http::ClientConfig::default()).unwrap();
+
+	let link_uuid = link.uuid();
+	let link_key = link.key_string().unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(link_uuid, &link_key)
+		.await
+		.unwrap();
+
+	let expected_link: DirPublicLink = link.try_into().unwrap();
+	assert_eq!(info.link, expected_link);
+
+	// Download to zip using the UnauthClient
+	let tmp = std::env::temp_dir();
+	let mut options = tokio::fs::OpenOptions::new();
+	options.create(true).write(true).read(true).truncate(true);
+	let zip_file = options
+		.open(tmp.join("test_linked.zip"))
+		.await
+		.unwrap()
+		.compat_write();
+	let zip_file = unauth_client
+		.download_items_to_zip::<Linked, _>(
+			&[NonRootFileType::Root(Cow::Borrowed(&info.root))],
+			zip_file,
+			None::<&fn(u64, u64, u64, u64)>,
+			Cow::Borrowed(&info.link),
+		)
+		.await
+		.unwrap();
+	let mut zip_file = zip_file.into_inner().into_std().await;
+	zip_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+	let mut archive = ZipArchive::new(BufReader::new(zip_file)).unwrap();
+	let names = archive.file_names().collect::<Vec<_>>();
+	assert!(
+		names.contains(&"link_file1.txt"),
+		"expected link_file1.txt in zip, got: {:?}",
+		names
+	);
+	assert!(
+		names.contains(&"linked_b/"),
+		"expected linked_b/ in zip, got: {:?}",
+		names
+	);
+	assert!(
+		names.contains(&"linked_b/link_file2.txt"),
+		"expected linked_b/link_file2.txt in zip, got: {:?}",
+		names
+	);
+
+	// Verify file contents
+	let mut buf = Vec::new();
+	archive
+		.by_name("link_file1.txt")
+		.unwrap()
+		.read_to_end(&mut buf)
+		.unwrap();
+	assert_eq!(buf, b"linked file 1");
+
+	buf.clear();
+	archive
+		.by_name("linked_b/link_file2.txt")
+		.unwrap()
+		.read_to_end(&mut buf)
+		.unwrap();
+	assert_eq!(buf, b"linked file 2");
+}
 
 #[shared_test_runtime]
 async fn not_found_error() {
