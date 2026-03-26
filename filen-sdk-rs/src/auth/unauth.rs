@@ -342,23 +342,29 @@ pub struct RegisteredInfo {
 }
 
 fn master_keys_from_exportable(recovery_key: &str, user_id: u64) -> Result<Vec<MasterKey>, Error> {
-	let decoded = BASE64_STANDARD.decode(recovery_key).map_err(|_| {
-		Error::custom(
-			crate::ErrorKind::BadRecoveryKey,
-			"Failed to decode recovery key from base64",
-		)
-	})?;
-	let decoded = String::from_utf8(decoded).map_err(|_| {
-		Error::custom(
-			crate::ErrorKind::BadRecoveryKey,
-			"Failed to decode recovery key from UTF-8",
-		)
-	})?;
 	let regex =
 		regex::Regex::new(r"_VALID_FILEN_MASTERKEY_([A-Fa-f0-9]{64})@(\d+)_VALID_FILEN_MASTERKEY_")
 			.expect("Failed to compile recovery key regex");
 
-	let mut caps = regex.captures_iter(&decoded).peekable();
+	let mut key = Cow::Borrowed(recovery_key);
+
+	let mut caps = regex.captures_iter(&key).peekable();
+	if caps.peek().is_none() {
+		let decoded = BASE64_STANDARD.decode(recovery_key).map_err(|_| {
+			Error::custom(
+				crate::ErrorKind::BadRecoveryKey,
+				"Failed to decode recovery key from base64",
+			)
+		})?;
+		key = Cow::Owned(String::from_utf8(decoded).map_err(|_| {
+			Error::custom(
+				crate::ErrorKind::BadRecoveryKey,
+				"Failed to decode recovery key from UTF-8",
+			)
+		})?);
+		caps = regex.captures_iter(&key).peekable();
+	};
+
 	if caps.peek().is_none() {
 		return Err(Error::custom(
 			crate::ErrorKind::BadRecoveryKey,
@@ -426,5 +432,23 @@ mod tests {
 		};
 		let master_keys_vec = master_keys_from_exportable(&exported, 123456).unwrap();
 		assert_eq!(master_keys_vec, expected_master_keys);
+	}
+
+	#[test]
+	fn auth_info_convert_into_exportable_non_base64() {
+		let keys = vec![
+			MasterKey::from_str("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+				.unwrap(),
+			MasterKey::from_str("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
+				.unwrap(),
+		];
+		let not_base_64_exported =
+			crate::auth::make_master_key_string_from_keys(123456, &keys).unwrap();
+		assert_eq!(
+			not_base_64_exported,
+			"_VALID_FILEN_MASTERKEY_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@123456_VALID_FILEN_MASTERKEY_|_VALID_FILEN_MASTERKEY_fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210@123456_VALID_FILEN_MASTERKEY_"
+		);
+		let master_keys_vec = master_keys_from_exportable(&not_base_64_exported, 123456).unwrap();
+		assert_eq!(master_keys_vec, keys);
 	}
 }

@@ -29,7 +29,7 @@ use crate::{
 		file::FileKey,
 		rsa::HMACKey,
 		shared::{CreateRandom, MetaCrypter},
-		v2::MasterKeys,
+		v2::{MasterKey, MasterKeys},
 	},
 	error::Error,
 	fs::{HasUUID, dir::RootDirectory},
@@ -210,24 +210,28 @@ impl MetaCrypter for AuthInfo {
 	}
 }
 
+fn make_master_key_string_from_keys(user_id: u64, keys: &[MasterKey]) -> Result<String, Error> {
+	let mut iter = keys.iter().map(|k| {
+		format!(
+			"_VALID_FILEN_MASTERKEY_{}@{}_VALID_FILEN_MASTERKEY_",
+			k.as_ref(),
+			user_id
+		)
+	});
+	let first = iter.next().ok_or_else(|| {
+		Error::custom(
+			crate::ErrorKind::InvalidState,
+			"Account has no master keys to export",
+		)
+	})?;
+	Ok(iter.fold(first, |acc, x| format!("{}|{}", acc, x)))
+}
+
 impl AuthInfo {
 	pub fn convert_into_exportable(&self, user_id: u64) -> Result<String, Error> {
 		let exported_keys_string = match self {
 			AuthInfo::V1(info) | AuthInfo::V2(info) => {
-				let mut iter = info.master_keys.0.iter().map(|k| {
-					format!(
-						"_VALID_FILEN_MASTERKEY_{}@{}_VALID_FILEN_MASTERKEY_",
-						k.as_ref(),
-						user_id
-					)
-				});
-				let first = iter.next().ok_or_else(|| {
-					Error::custom(
-						crate::ErrorKind::InvalidState,
-						"Account has no master keys to export",
-					)
-				})?;
-				iter.fold(first, |acc, x| format!("{}|{}", acc, x))
+				make_master_key_string_from_keys(user_id, &info.master_keys.0)?
 			}
 			AuthInfo::V3(_) => panic!("Exporting V3 accounts is not supported"),
 		};
