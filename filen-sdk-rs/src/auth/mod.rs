@@ -529,6 +529,13 @@ impl Client {
 	pub async fn generate_2fa_secret(&self) -> Result<TwoFASecret, Error> {
 		let resp = api::v3::user::settings::get(self.client()).await?;
 
+		if resp.two_factor_key.is_empty() {
+			return Err(Error::custom(
+				crate::ErrorKind::InvalidState,
+				"2FA is already enabled for this account, cannot generate new secret",
+			));
+		}
+
 		Ok(TwoFASecret::new(
 			resp.two_factor_key.into_owned(),
 			&resp.email,
