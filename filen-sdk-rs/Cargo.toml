@@ -145,7 +145,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 # wasm only dependencies
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-getrandom_v3 = { package = "getrandom", version = "0.3", features = [
+getrandom_v4 = { package = "getrandom", version = "0.4", features = [
 	"wasm_js",
 ] }
 getrandom = { version = "0.2", features = ["js"] }
