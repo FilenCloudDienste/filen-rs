@@ -130,6 +130,11 @@ test("login", async () => {
 	expect(state.root().uuid).toBeDefined()
 })
 
+test("account info", async () => {
+	const info = await state.getUserInfo()
+	expect(info.email).toBe(import.meta.env.VITE_TEST_EMAIL)
+})
+
 test("serialization", async () => {
 	const serializedState = await state.toStringified()
 	expect(serializedState.rootUuid).toEqual(state.root().uuid)

@@ -1,3 +1,4 @@
+pub(crate) mod account;
 pub(crate) mod base_folder;
 pub(crate) mod delete;
 pub(crate) mod did_export_master_keys;

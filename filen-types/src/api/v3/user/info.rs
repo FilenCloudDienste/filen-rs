@@ -2,6 +2,8 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fs::UuidStr;
+
 pub const ENDPOINT: &str = "v3/user/info";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -16,5 +18,5 @@ pub struct Response<'a> {
 	#[serde(rename = "avatarURL")]
 	pub avatar_url: Cow<'a, str>,
 	#[serde(rename = "baseFolderUUID")]
-	pub root_dir_uuid: Cow<'a, str>,
+	pub root_dir_uuid: UuidStr,
 }

@@ -5,6 +5,7 @@ use filen_sdk_rs::{
 		dir::{RemoteDirectory, meta::DirectoryMeta},
 		file::{RemoteFile, meta::FileMeta},
 	},
+	user::UserInfo,
 	util::PathIteratorExt,
 };
 use filen_types::fs::{ParentUuid, UuidStr};
@@ -141,7 +142,7 @@ pub(crate) fn insert_root(conn: &mut Connection, root: UuidStr) -> Result<(), ru
 pub(crate) fn update_root(
 	conn: &Connection,
 	root_uuid: UuidStr,
-	response: &filen_types::api::v3::user::info::Response<'_>,
+	response: &UserInfo,
 ) -> Result<(), rusqlite::Error> {
 	let id: i64 = conn.query_one(SELECT_ID_BY_UUID, [root_uuid], |row| row.get(0))?;
 	let mut stmt = conn.prepare(UPDATE_ROOT)?;

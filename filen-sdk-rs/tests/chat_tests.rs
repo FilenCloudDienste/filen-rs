@@ -265,3 +265,11 @@ async fn chat_msgs() {
 	let fetched = client.get_chat(chat.uuid()).await.unwrap().unwrap();
 	assert_eq!(chat, fetched);
 }
+
+#[shared_test_runtime]
+async fn user_info() {
+	let client = test_utils::RESOURCES.client().await;
+
+	let info = client.get_user_info().await.unwrap();
+	assert_eq!(info.email, client.email());
+}

@@ -1,3 +1,4 @@
+pub mod account;
 pub mod base_folder;
 pub mod delete;
 pub mod did_export_master_keys;
