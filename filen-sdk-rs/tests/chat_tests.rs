@@ -156,7 +156,7 @@ async fn conversation_participant_management() {
 	assert_eq!(chat.participants().len(), 2);
 
 	client
-		.remove_chat_participant(&mut chat, &contact)
+		.remove_chat_participant(&mut chat, contact.user_id)
 		.await
 		.unwrap();
 	let fetched = client.get_chat(chat.uuid()).await.unwrap().unwrap();

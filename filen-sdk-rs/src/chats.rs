@@ -807,7 +807,7 @@ impl Client {
 	pub async fn remove_chat_participant(
 		&self,
 		chat: &mut Chat,
-		contact: &Contact<'_>,
+		participant_id: u64,
 	) -> Result<(), Error> {
 		let _lock = self.lock_chats().await?;
 
@@ -815,12 +815,12 @@ impl Client {
 			self.client(),
 			&api::v3::chat::conversations::participants::remove::Request {
 				uuid: chat.uuid,
-				user_id: contact.user_id,
+				user_id: participant_id,
 			},
 		)
 		.await?;
 
-		chat.participants.retain(|p| p.user_id != contact.user_id);
+		chat.participants.retain(|p| p.user_id != participant_id);
 		Ok(())
 	}
 
@@ -1135,11 +1135,11 @@ pub mod js_impls {
 		pub async fn remove_chat_participant(
 			&self,
 			mut chat: Chat,
-			contact: Contact,
+			participant_id: u64,
 		) -> Result<Chat, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
-				this.remove_chat_participant(&mut chat, &contact.into())
+				this.remove_chat_participant(&mut chat, participant_id)
 					.await?;
 				Ok(chat)
 			})
