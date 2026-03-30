@@ -5,15 +5,15 @@ use crate::{
 	auth::{JsClient, js_impls::UnauthJsClient},
 	error::FilenSdkError,
 	fs::{
-		categories::{Category, DirType, Linked, NonRootItemType, Normal, Shared, fs::CategoryFS},
+		categories::{Category, Linked, NonRootItemType, Normal, Shared, fs::CategoryFS},
 		file::enums::RemoteFileType,
 	},
 	io::{
 		DirDownloadCallback, client_impl::IoSharedClientExt, dir_download::CategoryDirDownloadExt,
 	},
 	js::{
-		AnyDirWithContext, AnyFile, AnyNormalDir, Dir, DirByCategoryWithContext, DirWithPath, File,
-		FileWithPath, LinkedFile, NonRootDir, NonRootItem,
+		AnyDirWithContext, AnyFile, Dir, DirByCategoryWithContext, DirWithPath, File,
+		FileBuilderParamsOptionalName, FileWithPath, LinkedFile, NonRootDir, NonRootItem,
 	},
 	util::MaybeSendCallback,
 };
@@ -315,7 +315,7 @@ impl JsClient {
 
 	pub async fn upload_file(
 		&self,
-		parent_dir: AnyNormalDir,
+		params: FileBuilderParamsOptionalName,
 		file_path: String,
 		callback: Option<Arc<dyn JsFileUploadCallback>>,
 		managed_future: crate::js::ManagedFuture,
@@ -332,9 +332,8 @@ impl JsClient {
 					}) as MaybeSendCallback<u64>
 				});
 
-				let parent_dir = DirType::<'static, Normal>::from(parent_dir);
 				let file_path = PathBuf::from(file_path);
-				this.upload_file_from_path(&parent_dir, file_path, callback)
+				this.upload_file_from_path_with_builder(params.try_into()?, file_path, callback)
 					.await
 					.map(|(file, _)| File::from(file))
 			})

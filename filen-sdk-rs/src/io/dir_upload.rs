@@ -15,10 +15,13 @@ use crate::{
 	auth::Client,
 	consts::{CALLBACK_INTERVAL, MAX_SMALL_PARALLEL_REQUESTS},
 	error::ResultExt,
-	fs::{HasUUID, dir::RemoteDirectory, file::RemoteFile},
+	fs::{
+		HasUUID,
+		dir::RemoteDirectory,
+		file::{FileBuilderOptionalName, RemoteFile},
+	},
 	io::{
 		FilenMetaExt,
-		client_impl::UploadInfo,
 		fs_tree::{DirChildrenInfo, Entry},
 	},
 };
@@ -246,8 +249,8 @@ impl Client {
 		parent: &UuidStr,
 		uploaded_bytes: Arc<AtomicU64>,
 	) -> Result<RemoteFile, Error> {
-		self.upload_file_from_path_with_info(
-			UploadInfo::Parent(parent),
+		self.upload_file_from_path_with_builder(
+			FileBuilderOptionalName::new(*parent),
 			path.to_owned(),
 			Some(Arc::new(|bytes_downloaded| {
 				uploaded_bytes.fetch_add(bytes_downloaded, Ordering::Relaxed);

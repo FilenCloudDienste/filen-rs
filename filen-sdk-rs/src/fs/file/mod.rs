@@ -53,15 +53,29 @@ impl FileBuilder {
 		parent_uuid: UuidStr,
 		client: &Client,
 	) -> Result<Self, EntryNameError> {
-		Ok(Self {
-			uuid: UuidStr::new_v4(),
-			name: ValidatedName::try_from(name)?,
+		Ok(Self::new_valid_name(
+			ValidatedName::try_from(name)?,
+			UuidStr::new_v4(),
+			parent_uuid,
+			client,
+		))
+	}
+
+	fn new_valid_name(
+		name: ValidatedName,
+		uuid: UuidStr,
+		parent_uuid: UuidStr,
+		client: &Client,
+	) -> Self {
+		Self {
+			uuid,
+			name,
 			parent: parent_uuid,
 			key: client.make_file_key(),
 			mime: None,
 			created: None,
 			modified: None,
-		})
+		}
 	}
 
 	pub fn mime(mut self, mime: String) -> Self {
@@ -118,6 +132,81 @@ impl FileBuilder {
 			},
 			parent: self.parent,
 		}
+	}
+}
+
+pub struct FileBuilderOptionalName {
+	name: Option<ValidatedName>,
+	uuid: UuidStr,
+	parent: UuidStr,
+
+	mime: Option<String>,
+	created: Option<DateTime<Utc>>,
+	modified: Option<DateTime<Utc>>,
+}
+
+impl FileBuilderOptionalName {
+	pub fn new(parent_uuid: UuidStr) -> Self {
+		Self {
+			name: None,
+			uuid: UuidStr::new_v4(),
+			parent: parent_uuid,
+			mime: None,
+			created: None,
+			modified: None,
+		}
+	}
+
+	pub fn name(&mut self, name: &str) -> Result<&mut Self, EntryNameError> {
+		self.name = Some(ValidatedName::try_from(name)?);
+		Ok(self)
+	}
+
+	pub fn mime(&mut self, mime: String) -> &mut Self {
+		self.mime = Some(mime);
+		self
+	}
+
+	pub fn created(&mut self, created: DateTime<Utc>) -> &mut Self {
+		self.created = Some(created);
+		self
+	}
+
+	pub fn modified(&mut self, modified: DateTime<Utc>) -> &mut Self {
+		self.modified = Some(modified);
+		self
+	}
+
+	pub fn into_builder<'a>(
+		self,
+		name_maker: &'a impl Fn() -> Result<&'a str, Error>,
+		client: &Client,
+	) -> Result<FileBuilder, Error> {
+		let name = match self.name {
+			Some(name) => name,
+			None => ValidatedName::try_from(name_maker()?)?,
+		};
+		let mut builder = FileBuilder::new_valid_name(name, self.uuid, self.parent, client);
+
+		if let Some(mime) = self.mime {
+			builder = builder.mime(mime);
+		}
+		if let Some(created) = self.created {
+			builder = builder.created(created);
+		}
+		if let Some(modified) = self.modified {
+			builder = builder.modified(modified);
+		}
+
+		Ok(builder)
+	}
+
+	pub fn get_name(&self) -> Option<&str> {
+		self.name.as_ref().map(|n| n.as_ref())
+	}
+
+	pub fn get_uuid(&self) -> UuidStr {
+		self.uuid
 	}
 }
 

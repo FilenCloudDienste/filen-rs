@@ -20,12 +20,9 @@ use filen_sdk_rs::{
 	error::FilenSdkError,
 	fs::{
 		HasName, HasUUID,
-		file::{FileBuilder, RemoteFile, traits::HasFileInfo},
+		file::{FileBuilderOptionalName, RemoteFile, traits::HasFileInfo},
 	},
-	io::{
-		FilenMetaExt,
-		client_impl::{IoSharedClientExt, UploadInfo},
-	},
+	io::{FilenMetaExt, client_impl::IoSharedClientExt},
 };
 use filen_types::{crypto::Blake3Hash, fs::UuidStr};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -193,7 +190,7 @@ impl AuthCacheState {
 	pub(crate) async fn io_upload_file(
 		&self,
 		path: PathBuf,
-		info: UploadInfo<'_>,
+		builder: FileBuilderOptionalName,
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<(RemoteFile, std::fs::File), FilenSdkError> {
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
@@ -213,7 +210,7 @@ impl AuthCacheState {
 		};
 
 		self.client
-			.upload_file_from_path_with_info(info, path, reader_callback)
+			.upload_file_from_path_with_builder(builder, path, reader_callback)
 			.await
 	}
 
@@ -226,16 +223,12 @@ impl AuthCacheState {
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<RemoteFile, FilenSdkError> {
 		let old_path = self.get_cached_file_path_from_name(old_uuid, Some(&name));
-		let file_builder = self
-			.client
-			.make_file_builder(&name, parent_uuid)?
-			.mime(mime);
+
+		let mut file_builder = FileBuilderOptionalName::new(parent_uuid);
+		file_builder.name(&name)?;
+		file_builder.mime(mime);
 		let (file, _) = self
-			.io_upload_file(
-				old_path.clone(),
-				UploadInfo::Builder(file_builder),
-				callback,
-			)
+			.io_upload_file(old_path.clone(), file_builder, callback)
 			.await?;
 		let new_path = self.get_cached_file_path(&file);
 		let parent = new_path
@@ -257,10 +250,10 @@ impl AuthCacheState {
 
 	pub(crate) async fn io_upload_new_file(
 		&self,
-		builder: FileBuilder,
+		builder: FileBuilderOptionalName,
 	) -> Result<(RemoteFile, PathBuf), FilenSdkError> {
-		let target_path = self
-			.get_cached_file_path_from_name(builder.get_uuid().as_ref(), Some(builder.get_name()));
+		let target_path =
+			self.get_cached_file_path_from_name(builder.get_uuid().as_ref(), builder.get_name());
 		let parent_path = target_path
 			.parent()
 			.expect("cached file path should always have a parent");
@@ -273,7 +266,7 @@ impl AuthCacheState {
 			.await?;
 		drop(os_file);
 		let (file, _) = self
-			.io_upload_file(target_path.clone(), UploadInfo::Builder(builder), None)
+			.io_upload_file(target_path.clone(), builder, None)
 			.await?;
 		Ok((file, target_path))
 	}

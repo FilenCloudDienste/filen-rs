@@ -7,7 +7,7 @@ use crate::{
 	fs::{
 		HasUUID,
 		categories::{DirType, Normal},
-		file::FileBuilder,
+		file::{FileBuilder, FileBuilderOptionalName},
 	},
 	js::{AnyNormalDir, ManagedFuture},
 };
@@ -41,6 +41,53 @@ pub struct FileBuilderParams {
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub mime: Option<String>,
+}
+
+#[js_type(import, no_ser)]
+pub struct FileBuilderParamsOptionalName {
+	pub parent: AnyNormalDir,
+	pub name: Option<String>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint"),
+		serde(with = "filen_types::serde::time::optional", default)
+	)]
+	pub created: Option<DateTime<Utc>>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "bigint"),
+		serde(with = "filen_types::serde::time::optional", default)
+	)]
+	pub modified: Option<DateTime<Utc>>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string"),
+		serde(default)
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub mime: Option<String>,
+}
+
+impl TryFrom<FileBuilderParamsOptionalName> for FileBuilderOptionalName {
+	type Error = Error;
+	fn try_from(params: FileBuilderParamsOptionalName) -> Result<Self, Self::Error> {
+		let dir = DirType::<Normal>::from(params.parent);
+
+		let mut builder = FileBuilderOptionalName::new(*dir.uuid());
+		if let Some(name) = params.name {
+			builder.name(&name)?;
+		}
+		if let Some(mime) = params.mime {
+			builder.mime(mime);
+		}
+		if let Some(created) = params.created {
+			builder.created(created);
+		}
+		if let Some(modified) = params.modified {
+			builder.modified(modified);
+		}
+		Ok(builder)
+	}
 }
 
 #[js_type(import, no_ser, no_default)]

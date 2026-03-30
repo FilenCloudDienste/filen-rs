@@ -1,14 +1,11 @@
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Instant};
 
 use chrono::DateTime;
-use filen_sdk_rs::{
-	fs::{
-		HasName, HasUUID,
-		categories::{DirType, Normal},
-		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
-		file::{RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
-	},
-	io::client_impl::UploadInfo,
+use filen_sdk_rs::fs::{
+	HasName, HasUUID,
+	categories::{DirType, Normal},
+	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
+	file::{FileBuilderOptionalName, RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 };
 use filen_types::fs::{ParentUuid, UuidStr};
 use log::debug;
@@ -404,9 +401,8 @@ impl AuthCacheState {
 			UpdateItemsInPath::Partial(remaining, parent)
 				if remaining == path_values.name_or_uuid =>
 			{
-				let builder = self
-					.client
-					.make_file_builder(path_values.name_or_uuid, parent.uuid())?;
+				let mut builder = FileBuilderOptionalName::new(parent.uuid());
+				builder.name(path_values.name_or_uuid)?;
 				self.io_upload_new_file(builder).await?.0
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
@@ -453,29 +449,30 @@ impl AuthCacheState {
 			}
 		};
 
-		let mut file = self.client.make_file_builder(&name, parent.uuid())?;
+		let mut builder = FileBuilderOptionalName::new(parent.uuid());
+		builder.name(&name)?;
 		if let Some(creation) = info.creation {
-			file = file.created(DateTime::from_timestamp_millis(creation).ok_or_else(|| {
+			builder.created(DateTime::from_timestamp_millis(creation).ok_or_else(|| {
 				CacheError::conversion(format!(
 					"Failed to convert creation timestamp {creation} to DateTime"
 				))
 			})?);
 		}
 		if let Some(modification) = info.modification {
-			file = file.modified(DateTime::from_timestamp_millis(modification).ok_or_else(
-				|| {
+			builder.modified(
+				DateTime::from_timestamp_millis(modification).ok_or_else(|| {
 					CacheError::conversion(format!(
 						"Failed to convert modification timestamp {modification} to DateTime"
 					))
-				},
-			)?);
+				})?,
+			);
 		}
 		if let Some(mime) = info.mime {
-			file = file.mime(mime);
+			builder.mime(mime);
 		}
 
 		let (remote_file, _) = self
-			.io_upload_file(os_path, UploadInfo::Builder(file), progress_callback)
+			.io_upload_file(os_path, builder, progress_callback)
 			.await?;
 
 		let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
@@ -510,9 +507,10 @@ impl AuthCacheState {
 			}
 		};
 
-		let mut builder = self.client.make_file_builder(&name, parent.uuid())?;
+		let mut builder = FileBuilderOptionalName::new(parent.uuid());
+		builder.name(&name)?;
 		if let Some(mime) = mime {
-			builder = builder.mime(mime);
+			builder.mime(mime);
 		}
 		let (file, os_path) = self.io_upload_new_file(builder).await?;
 		let mut conn = self.conn();

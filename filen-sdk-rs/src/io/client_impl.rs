@@ -6,7 +6,6 @@ use std::{
 };
 
 use filen_types::crypto::Blake3Hash;
-use filen_types::fs::UuidStr;
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -16,7 +15,7 @@ use crate::{
 	auth::{Client, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	fs::file::{
-		BaseFile, FileBuilder, RemoteFile,
+		BaseFile, RemoteFile,
 		client_impl::FileReaderSharedClientExt,
 		traits::File,
 		write::{DummyFuture, FileWriter},
@@ -27,16 +26,14 @@ use crate::{
 use crate::{
 	ErrorKind,
 	error::ErrorExt,
-	fs::categories::{DirType, Normal},
+	fs::{
+		categories::{DirType, Normal},
+		file::FileBuilderOptionalName,
+	},
 	io::{FilenMetaExt, meta_ext::FileTimesExt},
 };
 
 const IO_BUFFER_SIZE: usize = 1024 * 64; // 64 KiB
-
-pub enum UploadInfo<'a> {
-	Builder(FileBuilder),
-	Parent(&'a UuidStr),
-}
 
 impl Client {
 	pub(crate) async fn inner_upload_file_from_reader<'a, T, F, Fut>(
@@ -273,14 +270,18 @@ impl Client {
 	) -> Result<(RemoteFile, std::fs::File), Error> {
 		use crate::fs::HasUUID;
 
-		self.upload_file_from_path_with_info(UploadInfo::Parent(parent.uuid()), path, callback)
-			.await
+		self.upload_file_from_path_with_builder(
+			FileBuilderOptionalName::new(*parent.uuid()),
+			path,
+			callback,
+		)
+		.await
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub async fn upload_file_from_path_with_info<'a>(
+	pub async fn upload_file_from_path_with_builder(
 		&self,
-		info: UploadInfo<'a>,
+		builder: FileBuilderOptionalName,
 		path: PathBuf,
 		callback: Option<MaybeSendCallback<'_, u64>>,
 	) -> Result<(RemoteFile, std::fs::File), Error> {
@@ -292,11 +293,9 @@ impl Client {
 		.await
 		.unwrap()?;
 
-		let mut file_builder = match info {
-			UploadInfo::Builder(builder) => builder,
-			UploadInfo::Parent(parent_uuid) => {
-				let name = path
-					.file_name()
+		let mut file_builder = builder.into_builder(
+			&|| {
+				path.file_name()
 					.ok_or_else(|| {
 						Error::custom(
 							ErrorKind::IO,
@@ -312,12 +311,10 @@ impl Client {
 								path.display()
 							),
 						)
-					})?
-					.to_owned();
-
-				self.make_file_builder(&name, *parent_uuid)?
-			}
-		};
+					})
+			},
+			self,
+		)?;
 
 		if file_builder.get_created().is_none() {
 			file_builder = file_builder.created(FilenMetaExt::created(&meta));
