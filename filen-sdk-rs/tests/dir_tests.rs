@@ -519,7 +519,7 @@ async fn size() {
 	assert_eq!(size.dirs, 0);
 
 	client.create_dir(&test_dir.into(), "a").await.unwrap();
-	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
+	time::sleep(time::Duration::from_secs(2400)).await; // ddos protection
 	let size = Normal::dir_size(&**client, &test_dir.into(), ())
 		.await
 		.unwrap();
@@ -528,7 +528,7 @@ async fn size() {
 	assert_eq!(size.dirs, 1);
 
 	client.create_dir(&test_dir.into(), "b").await.unwrap();
-	time::sleep(time::Duration::from_secs(1200)).await; // ddos protection
+	time::sleep(time::Duration::from_secs(2400)).await; // ddos protection
 	let size = Normal::dir_size(&**client, &test_dir.into(), ())
 		.await
 		.unwrap();
@@ -953,12 +953,12 @@ async fn not_found_error() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let new_dir = client
+	let mut new_dir = client
 		.create_dir(&test_dir.into(), "to_be_deleted")
 		.await
 		.unwrap();
 
-	client.trash_dir(&mut new_dir.clone()).await.unwrap();
+	client.trash_dir(&mut new_dir).await.unwrap();
 	let err = client
 		.list_dir(&(&new_dir).into(), None::<&fn(u64, Option<u64>)>)
 		.await

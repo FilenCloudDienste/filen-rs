@@ -154,7 +154,7 @@ async fn file_trash() {
 	);
 
 	let _lock = client
-		.acquire_lock("test:rs:trash", std::time::Duration::from_secs(1), 600)
+		.acquire_lock_with_default("test:rs:trash")
 		.await
 		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
@@ -466,7 +466,7 @@ async fn file_trash_empty() {
 		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 	let _lock = client
-		.acquire_lock("test:rs:trash", std::time::Duration::from_secs(1), 600)
+		.acquire_lock_with_default("test:rs:trash")
 		.await
 		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
