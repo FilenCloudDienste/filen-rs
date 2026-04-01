@@ -156,7 +156,7 @@ async fn create_dummy_folder(base_path: &Path) -> std::io::Result<()> {
 		let modified_time =
 			SystemTime::now() - Duration::from_secs(test_file.modified_days_ago * 24 * 60 * 60);
 
-		let file = File::open(&full_path)?;
+		let file = File::options().write(true).open(&full_path)?;
 		file.set_modified(modified_time)?;
 	}
 
