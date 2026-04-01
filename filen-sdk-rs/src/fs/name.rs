@@ -130,7 +130,7 @@ fn is_reserved_name_on_windows(name: &str) -> bool {
 				b2.to_ascii_uppercase(),
 			];
 			match &prefix {
-				b"COM" | b"LPT" => digit.is_ascii_digit(),
+				b"COM" | b"LPT" => matches!(digit, b'1'..=b'9'),
 				_ => false,
 			}
 		}
@@ -427,7 +427,7 @@ mod tests {
 
 	#[test]
 	fn reserved_com_all_digits_all_cases() {
-		for digit in b'0'..=b'9' {
+		for digit in b'1'..=b'9' {
 			let base = format!("com{}", digit as char);
 			for variant in all_case_combinations(&base) {
 				assert_eq!(
@@ -441,7 +441,7 @@ mod tests {
 
 	#[test]
 	fn reserved_lpt_all_digits_all_cases() {
-		for digit in b'0'..=b'9' {
+		for digit in b'1'..=b'9' {
 			let base = format!("lpt{}", digit as char);
 			for variant in all_case_combinations(&base) {
 				assert_eq!(
@@ -481,6 +481,8 @@ mod tests {
 			"LPTA",
 			"COM",
 			"LPT",
+			"COM0",
+			"LPT0",
 			"CO",
 			"LP",
 			"CONX",
