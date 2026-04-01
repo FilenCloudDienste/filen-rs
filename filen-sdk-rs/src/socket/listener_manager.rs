@@ -4,11 +4,11 @@ use std::{
 	hash::{BuildHasherDefault, Hasher},
 };
 
-use filen_types::api::v3::socket::SocketEvent;
+use filen_types::api::v3::socket::SocketEventType;
 
-use crate::Error;
+use crate::{Error, socket::events::DecryptedSocketEvent};
 
-use super::{events::DecryptedSocketEvent, traits::EventListenerCallback};
+use super::{events::DecryptedSocketEventType, traits::EventListenerCallback};
 
 #[derive(Default)]
 struct IdentityHasher(u64);
@@ -178,7 +178,10 @@ impl DisconnectedListenerManager {
 	}
 
 	pub(crate) fn broadcast_auth_failed(&mut self) {
-		ListenerManagerExtInner::broadcast_event(self, &DecryptedSocketEvent::AuthFailed);
+		ListenerManagerExtInner::broadcast_event(
+			self,
+			&DecryptedSocketEvent::new_without_id(DecryptedSocketEventType::AuthFailed),
+		);
 		for NewIdStruct {
 			id_sender: sender, ..
 		} in self.new_ids.drain(..)
@@ -226,7 +229,9 @@ impl DisconnectedListenerManager {
 			last_id,
 		};
 
-		new.broadcast_event(&DecryptedSocketEvent::AuthSuccess);
+		new.broadcast_event(&DecryptedSocketEvent::new_without_id(
+			DecryptedSocketEventType::AuthSuccess,
+		));
 		new
 	}
 }
@@ -250,7 +255,9 @@ impl ListenerManagerExt for DisconnectedListenerManager {
 	fn remove_listener(&mut self, id: u64) {
 		let callback = ListenerManagerExtInner::remove_listener(self, id);
 		if let Some(callback) = callback {
-			callback(&DecryptedSocketEvent::Unsubscribed);
+			callback(&DecryptedSocketEvent::new_without_id(
+				DecryptedSocketEventType::Unsubscribed,
+			));
 		}
 		self.new_ids.retain(|new_id_struct| new_id_struct.id != id);
 	}
@@ -299,7 +306,9 @@ impl ConnectedListenerManager {
 	}
 
 	pub(crate) fn into_disconnected(self) -> DisconnectedListenerManager {
-		self.broadcast_event(&DecryptedSocketEvent::Reconnecting);
+		self.broadcast_event(&DecryptedSocketEvent::new_without_id(
+			DecryptedSocketEventType::Reconnecting,
+		));
 		let ConnectedListenerManager {
 			callbacks,
 			callbacks_for_event,
@@ -316,7 +325,7 @@ impl ConnectedListenerManager {
 		}
 	}
 
-	pub(crate) fn should_decrypt_event(&self, event: &SocketEvent<'_>) -> bool {
+	pub(crate) fn should_decrypt_event(&self, event: &SocketEventType<'_>) -> bool {
 		!self.global_callbacks().is_empty()
 			|| self.callbacks_for_event().contains_key(event.event_type())
 	}
@@ -342,7 +351,9 @@ impl ListenerManagerExt for ConnectedListenerManager {
 	fn remove_listener(&mut self, id: u64) {
 		let callback = ListenerManagerExtInner::remove_listener(self, id);
 		if let Some(callback) = callback {
-			callback(&DecryptedSocketEvent::Unsubscribed);
+			callback(&DecryptedSocketEvent::new_without_id(
+				DecryptedSocketEventType::Unsubscribed,
+			));
 		}
 	}
 }

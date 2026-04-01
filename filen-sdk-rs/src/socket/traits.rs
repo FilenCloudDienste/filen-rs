@@ -67,8 +67,8 @@ where
 
 pub(super) trait IntoStableDeref
 where
-	Self::Output: Deref,
-	<Self::Output as Deref>::Target: 'static,
+	Self::Output: Deref + Send,
+	<Self::Output as Deref>::Target: 'static + Send,
 {
 	type Output: StableDeref + 'static;
 

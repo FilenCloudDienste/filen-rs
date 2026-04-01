@@ -746,15 +746,15 @@ test("chats", async () => {
 	// sleep for 5s
 	await new Promise(resolve => setTimeout(resolve, 5000))
 
-	const chatEvent = allEvents.find(e => e.type === "chatMessageNew" && e.msg.chat === chat.uuid)
+	const chatEvent = allEvents.find(e => e.inner.type === "chatMessageNew" && e.inner.msg.chat === chat.uuid)
 
 	expect(chatEvent).toBeDefined()
 
-	if (chatEvent?.type !== "chatMessageNew") {
+	if (chatEvent?.inner.type !== "chatMessageNew") {
 		throw new Error("Expected chatMessageNew event")
 	}
 
-	expect(chatEvent.msg).toEqual(fetchedChat?.lastMessage)
+	expect(chatEvent.inner.msg).toEqual(fetchedChat?.lastMessage)
 })
 
 test("search", async () => {
@@ -787,7 +787,7 @@ test("authError", async () => {
 	try {
 		await badState.addEventListener(
 			(event: SocketEvent) => {
-				if (event.type === "authFailed") {
+				if (event.inner.type === "authFailed") {
 					gotAuthFailedEvent = true
 				} else {
 					throw new Error("Expected authFailed event")

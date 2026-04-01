@@ -19,7 +19,7 @@ use traits::EventListenerCallback;
 
 pub(crate) use thread_handling::WebSocketHandle;
 
-pub use events::DecryptedSocketEvent;
+pub use events::DecryptedSocketEventType;
 
 impl Client {
 	pub async fn add_event_listener(

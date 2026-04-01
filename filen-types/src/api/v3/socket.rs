@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize, de::IgnoredAny};
-use std::borrow::Cow;
+use serde::{
+	Deserialize, Deserializer, Serialize,
+	de::{DeserializeSeed, MapAccess, Visitor},
+};
+use serde_json::value::RawValue;
+use std::{borrow::Cow, fmt::Formatter, marker::PhantomData};
 use yoke::Yokeable;
 
 use crate::{
@@ -16,6 +20,7 @@ use crate::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
 	fs::{ObjectType, ParentUuid, UuidStr},
+	serde::cow::CowStrWrapper,
 	traits::CowHelpers,
 };
 
@@ -88,9 +93,186 @@ pub struct HandShake<'a> {
 	pub ping_timeout: u64,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
-#[serde(tag = "type", content = "data", rename_all = "camelCase")]
-pub enum SocketEvent<'a> {
+/// Wraps a serde_json object deserializer, injecting a `"type"` tag entry
+/// before the object's own entries. Presents wire-format data
+/// `["event-name", {fields...}]` as internally-tagged `{"type": "eventName", fields...}`.
+pub(crate) struct InjectTagDeserializer<'de> {
+	pub variant: Cow<'de, str>,
+	pub data: &'de RawValue,
+}
+
+impl<'de> Deserializer<'de> for InjectTagDeserializer<'de> {
+	type Error = serde_json::Error;
+
+	fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+		self.deserialize_map(visitor)
+	}
+
+	fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+		let wrapper = InjectTagVisitor {
+			inner: visitor,
+			variant: self.variant,
+		};
+		let mut de = serde_json::Deserializer::from_str(self.data.get());
+		de.deserialize_map(wrapper)
+	}
+
+	fn deserialize_struct<V>(
+		self,
+		_name: &'static str,
+		_fields: &'static [&'static str],
+		visitor: V,
+	) -> Result<V::Value, Self::Error>
+	where
+		V: Visitor<'de>,
+	{
+		self.deserialize_map(visitor)
+	}
+
+	serde::forward_to_deserialize_any! {
+		bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+		bytes byte_buf option unit unit_struct newtype_struct seq tuple
+		tuple_struct enum identifier ignored_any
+	}
+}
+
+/// Intercepts serde_json's visit_map to wrap the MapAccess with tag injection.
+struct InjectTagVisitor<'de, V> {
+	inner: V,
+	variant: Cow<'de, str>,
+}
+
+impl<'de, V: Visitor<'de>> Visitor<'de> for InjectTagVisitor<'de, V> {
+	type Value = V::Value;
+
+	fn expecting(&self, f: &mut Formatter) -> std::fmt::Result {
+		self.inner.expecting(f)
+	}
+
+	fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<V::Value, A::Error> {
+		self.inner.visit_map(InjectTagMapAccess {
+			variant: Some(self.variant),
+			inner: map,
+		})
+	}
+}
+
+/// MapAccess wrapper that prepends a "type" entry, then delegates to inner.
+struct InjectTagMapAccess<'de, A> {
+	variant: Option<Cow<'de, str>>,
+	inner: A,
+}
+
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for InjectTagMapAccess<'de, A> {
+	type Error = A::Error;
+
+	fn next_key_seed<K: DeserializeSeed<'de>>(
+		&mut self,
+		seed: K,
+	) -> Result<Option<K::Value>, Self::Error> {
+		if self.variant.is_some() {
+			// Yield "type" as the first key
+			seed.deserialize(serde::de::value::BorrowedStrDeserializer::new("enum_type"))
+				.map(Some)
+		} else {
+			self.inner.next_key_seed(seed)
+		}
+	}
+
+	fn next_value_seed<V: DeserializeSeed<'de>>(
+		&mut self,
+		seed: V,
+	) -> Result<V::Value, Self::Error> {
+		match self.variant.take() {
+			// Yield the variant name as the value for "type"
+			Some(variant) => seed.deserialize(CowStrDeserializer(variant, PhantomData)),
+			// Delegate to serde_json for all real data fields
+			None => self.inner.next_value_seed(seed),
+		}
+	}
+}
+
+/// Deserializes a Cow<str>, preserving borrowed vs owned.
+struct CowStrDeserializer<'de, E>(Cow<'de, str>, PhantomData<E>);
+
+impl<'de, E: serde::de::Error> Deserializer<'de> for CowStrDeserializer<'de, E> {
+	type Error = E;
+
+	fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+		match self.0 {
+			Cow::Borrowed(s) => visitor.visit_borrowed_str(s),
+			Cow::Owned(s) => visitor.visit_string(s),
+		}
+	}
+
+	serde::forward_to_deserialize_any! {
+		bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+		bytes byte_buf option unit unit_struct newtype_struct seq tuple
+		tuple_struct map struct enum identifier ignored_any
+	}
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSocketEvent<'a> {
+	#[serde(flatten, borrow)]
+	pub inner: SocketEventType<'a>,
+	pub global_message_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
+pub struct SocketEvent<'a> {
+	pub inner: SocketEventType<'a>,
+	pub global_message_id: u64,
+}
+
+impl<'de> Deserialize<'de> for SocketEvent<'de> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		struct SocketEventVisitor;
+
+		impl<'de> serde::de::Visitor<'de> for SocketEventVisitor {
+			type Value = SocketEvent<'de>;
+
+			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+				formatter.write_str("a tuple of [event_name, event_data]")
+			}
+
+			fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+			where
+				A: serde::de::SeqAccess<'de>,
+			{
+				let name = kebab_to_camel(
+					seq.next_element::<CowStrWrapper>()?
+						.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?
+						.0,
+				);
+				let raw: &'de RawValue = seq
+					.next_element()?
+					.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+
+				let event = RawSocketEvent::deserialize(InjectTagDeserializer {
+					variant: name,
+					data: raw,
+				})
+				.map_err(serde::de::Error::custom)?;
+
+				Ok(SocketEvent {
+					inner: event.inner,
+					global_message_id: event.global_message_id,
+				})
+			}
+		}
+
+		deserializer.deserialize_seq(SocketEventVisitor)
+	}
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(tag = "enum_type", rename_all = "camelCase")]
+pub enum SocketEventType<'a> {
 	#[serde(borrow)]
 	NewEvent(NewEvent<'a>),
 	#[serde(borrow)]
@@ -159,131 +341,6 @@ pub enum SocketEvent<'a> {
 	FileMetadataChanged(FileMetadataChanged<'a>),
 }
 
-impl<'de> Deserialize<'de> for SocketEvent<'de> {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: Deserializer<'de>,
-	{
-		struct SocketEventVisitor;
-
-		impl<'de> serde::de::Visitor<'de> for SocketEventVisitor {
-			type Value = SocketEvent<'de>;
-
-			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-				formatter.write_str("a tuple of [event_name, event_data]")
-			}
-
-			fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-			where
-				A: serde::de::SeqAccess<'de>,
-			{
-				let event_name = seq
-					.next_element::<crate::serde::cow::CowStrWrapper>()?
-					.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?
-					.0;
-				let event_name = kebab_to_camel(event_name);
-
-				let event = match event_name.as_ref() {
-					"trashEmpty" => {
-						// timestamp and messageId we don't care about
-						let _ = seq.next_element::<IgnoredAny>()?;
-						Some(SocketEvent::TrashEmpty)
-					}
-					"passwordChanged" => {
-						// timestamp and messageId we don't care about
-						let _ = seq.next_element::<IgnoredAny>()?;
-						Some(SocketEvent::PasswordChanged)
-					}
-					"newEvent" => seq.next_element()?.map(SocketEvent::NewEvent),
-					"fileRename" => seq.next_element()?.map(SocketEvent::FileRename),
-					"fileArchiveRestored" => {
-						seq.next_element()?.map(SocketEvent::FileArchiveRestored)
-					}
-					"fileNew" => seq.next_element()?.map(SocketEvent::FileNew),
-					"fileRestore" => seq.next_element()?.map(SocketEvent::FileRestore),
-					"fileMove" => seq.next_element()?.map(SocketEvent::FileMove),
-					"fileTrash" => seq.next_element()?.map(SocketEvent::FileTrash),
-					"fileArchived" => seq.next_element()?.map(SocketEvent::FileArchived),
-					"folderRename" => seq.next_element()?.map(SocketEvent::FolderRename),
-					"folderTrash" => seq.next_element()?.map(SocketEvent::FolderTrash),
-					"folderMove" => seq.next_element()?.map(SocketEvent::FolderMove),
-					"folderSubCreated" => seq.next_element()?.map(SocketEvent::FolderSubCreated),
-					"folderRestore" => seq.next_element()?.map(SocketEvent::FolderRestore),
-					"folderColorChanged" => {
-						seq.next_element()?.map(SocketEvent::FolderColorChanged)
-					}
-					"chatMessageNew" => seq.next_element()?.map(SocketEvent::ChatMessageNew),
-					"chatTyping" => seq.next_element()?.map(SocketEvent::ChatTyping),
-					"chatConversationsNew" => {
-						seq.next_element()?.map(SocketEvent::ChatConversationsNew)
-					}
-					"chatMessageDelete" => seq.next_element()?.map(SocketEvent::ChatMessageDelete),
-					"noteContentEdited" => seq.next_element()?.map(SocketEvent::NoteContentEdited),
-					"noteArchived" => seq.next_element()?.map(SocketEvent::NoteArchived),
-					"noteDeleted" => seq.next_element()?.map(SocketEvent::NoteDeleted),
-					"noteTitleEdited" => seq.next_element()?.map(SocketEvent::NoteTitleEdited),
-					"noteParticipantPermissions" => seq
-						.next_element()?
-						.map(SocketEvent::NoteParticipantPermissions),
-					"noteRestored" => seq.next_element()?.map(SocketEvent::NoteRestored),
-					"noteParticipantRemoved" => {
-						seq.next_element()?.map(SocketEvent::NoteParticipantRemoved)
-					}
-					"noteParticipantNew" => {
-						seq.next_element()?.map(SocketEvent::NoteParticipantNew)
-					}
-					"noteNew" => seq.next_element()?.map(SocketEvent::NoteNew),
-					"chatMessageEmbedDisabled" => seq
-						.next_element()?
-						.map(SocketEvent::ChatMessageEmbedDisabled),
-					"chatConversationParticipantLeft" => seq
-						.next_element()?
-						.map(SocketEvent::ChatConversationParticipantLeft),
-					"chatConversationDeleted" => seq
-						.next_element()?
-						.map(SocketEvent::ChatConversationDeleted),
-					"chatMessageEdited" => seq.next_element()?.map(SocketEvent::ChatMessageEdited),
-					"chatConversationNameEdited" => seq
-						.next_element()?
-						.map(SocketEvent::ChatConversationNameEdited),
-					"contactRequestReceived" => {
-						seq.next_element()?.map(SocketEvent::ContactRequestReceived)
-					}
-					"itemFavorite" => seq.next_element()?.map(SocketEvent::ItemFavorite),
-					"chatConversationParticipantNew" => seq
-						.next_element()?
-						.map(SocketEvent::ChatConversationParticipantNew),
-					"fileDeletedPermanent" => {
-						seq.next_element()?.map(SocketEvent::FileDeletedPermanent)
-					}
-					"folderMetadataChanged" => {
-						seq.next_element()?.map(SocketEvent::FolderMetadataChanged)
-					}
-					"folderDeletedPermanent" => {
-						seq.next_element()?.map(SocketEvent::FolderDeletedPermanent)
-					}
-					"fileMetadataChanged" => {
-						seq.next_element()?.map(SocketEvent::FileMetadataChanged)
-					}
-					unknown => {
-						return Err(serde::de::Error::custom(format!(
-							"unknown event type: {}",
-							unknown
-						)));
-					}
-				}
-				.ok_or_else(|| {
-					serde::de::Error::custom(format!("missing data for event type: {}", event_name))
-				})?;
-
-				Ok(event)
-			}
-		}
-
-		deserializer.deserialize_seq(SocketEventVisitor)
-	}
-}
-
 fn kebab_to_camel<'a>(event_name: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
 	let mut event_name = event_name.into();
 	let mut curr_idx = 0;
@@ -304,50 +361,52 @@ fn kebab_to_camel<'a>(event_name: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
 	event_name
 }
 
-impl SocketEvent<'_> {
+impl SocketEventType<'_> {
 	pub fn event_type(&self) -> &'static str {
 		match self {
-			SocketEvent::NewEvent(_) => "newEvent",
-			SocketEvent::FileRename(_) => "fileRename",
-			SocketEvent::FileArchiveRestored(_) => "fileArchiveRestored",
-			SocketEvent::FileNew(_) => "fileNew",
-			SocketEvent::FileRestore(_) => "fileRestore",
-			SocketEvent::FileMove(_) => "fileMove",
-			SocketEvent::FileTrash(_) => "fileTrash",
-			SocketEvent::FileArchived(_) => "fileArchived",
-			SocketEvent::FolderRename(_) => "folderRename",
-			SocketEvent::FolderTrash(_) => "folderTrash",
-			SocketEvent::FolderMove(_) => "folderMove",
-			SocketEvent::FolderSubCreated(_) => "folderSubCreated",
-			SocketEvent::FolderRestore(_) => "folderRestore",
-			SocketEvent::FolderColorChanged(_) => "folderColorChanged",
-			SocketEvent::TrashEmpty => "trashEmpty",
-			SocketEvent::PasswordChanged => "passwordChanged",
-			SocketEvent::ChatMessageNew(_) => "chatMessageNew",
-			SocketEvent::ChatTyping(_) => "chatTyping",
-			SocketEvent::ChatConversationsNew(_) => "chatConversationsNew",
-			SocketEvent::ChatMessageDelete(_) => "chatMessageDelete",
-			SocketEvent::NoteContentEdited(_) => "noteContentEdited",
-			SocketEvent::NoteArchived(_) => "noteArchived",
-			SocketEvent::NoteDeleted(_) => "noteDeleted",
-			SocketEvent::NoteTitleEdited(_) => "noteTitleEdited",
-			SocketEvent::NoteParticipantPermissions(_) => "noteParticipantPermissions",
-			SocketEvent::NoteRestored(_) => "noteRestored",
-			SocketEvent::NoteParticipantRemoved(_) => "noteParticipantRemoved",
-			SocketEvent::NoteParticipantNew(_) => "noteParticipantNew",
-			SocketEvent::NoteNew(_) => "noteNew",
-			SocketEvent::ChatMessageEmbedDisabled(_) => "chatMessageEmbedDisabled",
-			SocketEvent::ChatConversationParticipantLeft(_) => "chatConversationParticipantLeft",
-			SocketEvent::ChatConversationDeleted(_) => "chatConversationDeleted",
-			SocketEvent::ChatMessageEdited(_) => "chatMessageEdited",
-			SocketEvent::ChatConversationNameEdited(_) => "chatConversationNameEdited",
-			SocketEvent::ContactRequestReceived(_) => "contactRequestReceived",
-			SocketEvent::ItemFavorite(_) => "itemFavorite",
-			SocketEvent::ChatConversationParticipantNew(_) => "chatConversationParticipantNew",
-			SocketEvent::FileDeletedPermanent(_) => "fileDeletedPermanent",
-			SocketEvent::FolderMetadataChanged(_) => "folderMetadataChanged",
-			SocketEvent::FolderDeletedPermanent(_) => "folderDeletedPermanent",
-			SocketEvent::FileMetadataChanged(_) => "fileMetadataChanged",
+			SocketEventType::NewEvent(_) => "newEvent",
+			SocketEventType::FileRename(_) => "fileRename",
+			SocketEventType::FileArchiveRestored(_) => "fileArchiveRestored",
+			SocketEventType::FileNew(_) => "fileNew",
+			SocketEventType::FileRestore(_) => "fileRestore",
+			SocketEventType::FileMove(_) => "fileMove",
+			SocketEventType::FileTrash(_) => "fileTrash",
+			SocketEventType::FileArchived(_) => "fileArchived",
+			SocketEventType::FolderRename(_) => "folderRename",
+			SocketEventType::FolderTrash(_) => "folderTrash",
+			SocketEventType::FolderMove(_) => "folderMove",
+			SocketEventType::FolderSubCreated(_) => "folderSubCreated",
+			SocketEventType::FolderRestore(_) => "folderRestore",
+			SocketEventType::FolderColorChanged(_) => "folderColorChanged",
+			SocketEventType::TrashEmpty => "trashEmpty",
+			SocketEventType::PasswordChanged => "passwordChanged",
+			SocketEventType::ChatMessageNew(_) => "chatMessageNew",
+			SocketEventType::ChatTyping(_) => "chatTyping",
+			SocketEventType::ChatConversationsNew(_) => "chatConversationsNew",
+			SocketEventType::ChatMessageDelete(_) => "chatMessageDelete",
+			SocketEventType::NoteContentEdited(_) => "noteContentEdited",
+			SocketEventType::NoteArchived(_) => "noteArchived",
+			SocketEventType::NoteDeleted(_) => "noteDeleted",
+			SocketEventType::NoteTitleEdited(_) => "noteTitleEdited",
+			SocketEventType::NoteParticipantPermissions(_) => "noteParticipantPermissions",
+			SocketEventType::NoteRestored(_) => "noteRestored",
+			SocketEventType::NoteParticipantRemoved(_) => "noteParticipantRemoved",
+			SocketEventType::NoteParticipantNew(_) => "noteParticipantNew",
+			SocketEventType::NoteNew(_) => "noteNew",
+			SocketEventType::ChatMessageEmbedDisabled(_) => "chatMessageEmbedDisabled",
+			SocketEventType::ChatConversationParticipantLeft(_) => {
+				"chatConversationParticipantLeft"
+			}
+			SocketEventType::ChatConversationDeleted(_) => "chatConversationDeleted",
+			SocketEventType::ChatMessageEdited(_) => "chatMessageEdited",
+			SocketEventType::ChatConversationNameEdited(_) => "chatConversationNameEdited",
+			SocketEventType::ContactRequestReceived(_) => "contactRequestReceived",
+			SocketEventType::ItemFavorite(_) => "itemFavorite",
+			SocketEventType::ChatConversationParticipantNew(_) => "chatConversationParticipantNew",
+			SocketEventType::FileDeletedPermanent(_) => "fileDeletedPermanent",
+			SocketEventType::FolderMetadataChanged(_) => "folderMetadataChanged",
+			SocketEventType::FolderDeletedPermanent(_) => "folderDeletedPermanent",
+			SocketEventType::FileMetadataChanged(_) => "fileMetadataChanged",
 		}
 	}
 }
@@ -358,7 +417,7 @@ impl SocketEvent<'_> {
 	not(feature = "service-worker")
 ))]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
-const TS_SOCKET_EVENT_TYPE: &str = r#"export type SocketEventType = SocketEvent["type"]"#;
+const TS_SOCKET_EVENT_TYPE: &str = r#"export type SocketEventTypeNames = SocketEvent["type"]"#;
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]

@@ -1,11 +1,9 @@
 use std::{borrow::Cow, ops::Deref, sync::Arc, time::Duration};
 
-use filen_types::{
-	api::v3::socket::{HandShake, PacketType},
-	traits::CowHelpers,
-};
+use filen_types::api::v3::socket::{HandShake, PacketType};
 use futures::{StreamExt, stream::FuturesOrdered};
 use rsa::RsaPrivateKey;
+use yoke::Yoke;
 
 use crate::{
 	Error, ErrorKind,
@@ -19,7 +17,7 @@ use super::{
 		MAX_RECONNECT_DELAY, MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL,
 		RECONNECT_DELAY,
 	},
-	events::DecryptedSocketEvent,
+	events::DecryptedSocketEventType,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
 	traits::*,
 };
@@ -283,8 +281,8 @@ where
 	W: Socket<T, UW, S, R, RV, US, UR, PT>,
 	S: Sender,
 	R: Receiver<RV>,
-	RV: IntoStableDeref + AsRef<str>,
-	<RV::Output as Deref>::Target: AsRef<str>,
+	RV: IntoStableDeref + AsRef<str> + Send,
+	<RV::Output as Deref>::Target: AsRef<str> + Send,
 	US: UnauthedSender<AuthedType = S>,
 	UR: UnauthedReceiver<RV, AuthedType = R>,
 	UW: UnauthedSocket<US, UR, RV>,
@@ -312,8 +310,9 @@ where
 			// and we need to make sure we don't try to call next here if there are no futures
 			// as it would resolve immediately and starve the read side
 			decrypted = decryption_futures.next(), if !decryption_futures.is_empty() => {
+				let decrypted: Option<Option<Yoke<_, <RV as IntoStableDeref>::Output>>> = decrypted;
 				if let Some(Some(decrypted)) = decrypted {
-					listeners.broadcast_event(&decrypted);
+					listeners.broadcast_event(decrypted.get());
 				}
 			},
 			message_result = receiver.receive() => {
@@ -332,16 +331,17 @@ where
 						break;
 					}
 				};
+				log::info!("Received WebSocket message: {}", message.as_ref());
 
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
-						if listeners.should_decrypt_event(event_yoke.get()) {
+						if listeners.should_decrypt_event(&event_yoke.get().inner) {
 							decryption_futures.push_back(async move {
 								// this performs unnecessary cloning, ideally we would use an async
 								// yoke try_map_project_async but this does not currently exist
 								// https://github.com/unicode-org/icu4x/issues/7253
-								match DecryptedSocketEvent::try_from_encrypted(crypter, private_key, config.user_id, event_yoke.get().as_borrowed_cow()).await {
-									Ok(v) => Some(v.into_owned_cow()),
+								match DecryptedSocketEventType::try_from_encrypted(crypter, private_key, config.user_id, event_yoke).await {
+									Ok(v) => Some(v),
 									Err(e) => {
 										log::error!(
 											"Error decrypting WebSocket event: {}, skipping event",
@@ -432,7 +432,7 @@ async fn run_async_websocket_task<W, S, R, RV, US, UR, T, UW, PT>(
 	W: Socket<T, UW, S, R, RV, US, UR, PT>,
 	S: Sender,
 	R: Receiver<RV>,
-	RV: IntoStableDeref + AsRef<str>,
+	RV: IntoStableDeref + AsRef<str> + Send,
 	<RV::Output as Deref>::Target: AsRef<str>,
 	US: UnauthedSender<AuthedType = S>,
 	UR: UnauthedReceiver<RV, AuthedType = R>,

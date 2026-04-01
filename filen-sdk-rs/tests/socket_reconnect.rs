@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::socket::DecryptedSocketEvent;
+use filen_sdk_rs::socket::DecryptedSocketEventType;
 use filen_types::traits::CowHelpersExt;
 use test_utils::await_event;
 // separate file because it needs to avoid interference with other tests
@@ -27,7 +27,7 @@ async fn test_websocket_disconnect_reconnect() {
 
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, DecryptedSocketEvent::AuthSuccess),
+		|event| matches!(event.inner(), DecryptedSocketEventType::AuthSuccess),
 		Duration::from_secs(20),
 		"authSuccess 1",
 	)
@@ -37,7 +37,7 @@ async fn test_websocket_disconnect_reconnect() {
 	assert!(!client.is_socket_connected());
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, DecryptedSocketEvent::Unsubscribed),
+		|event| matches!(event.inner(), DecryptedSocketEventType::Unsubscribed),
 		Duration::from_secs(20),
 		"unsubscribed 1",
 	)
@@ -62,7 +62,7 @@ async fn test_websocket_disconnect_reconnect() {
 
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, DecryptedSocketEvent::AuthSuccess),
+		|event| matches!(event.inner(), DecryptedSocketEventType::AuthSuccess),
 		Duration::from_secs(20),
 		"authSuccess 2",
 	)
@@ -72,7 +72,7 @@ async fn test_websocket_disconnect_reconnect() {
 	assert!(!client.is_socket_connected());
 	await_event(
 		&mut events_receiver,
-		|event| matches!(event, DecryptedSocketEvent::Unsubscribed),
+		|event| matches!(event.inner(), DecryptedSocketEventType::Unsubscribed),
 		Duration::from_secs(20),
 		"unsubscribed 2",
 	)

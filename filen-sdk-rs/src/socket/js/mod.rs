@@ -8,10 +8,10 @@ mod uniffi {
 		Error,
 		auth::JsClient,
 		runtime::do_on_commander,
-		socket::{DecryptedSocketEvent, thread_handling::ListenerHandle},
+		socket::{
+			events::DecryptedSocketEvent, js::events::SocketEvent, thread_handling::ListenerHandle,
+		},
 	};
-
-	use super::events::SocketEvent;
 
 	#[uniffi::export(callback_interface)]
 	pub trait SocketEventListener: Send + Sync {
@@ -67,7 +67,9 @@ mod wasm {
 		Error,
 		auth::JsClient,
 		runtime,
-		socket::{DecryptedSocketEvent, js::events::SocketEvent, thread_handling::ListenerHandle},
+		socket::{
+			events::DecryptedSocketEvent, js::events::SocketEvent, thread_handling::ListenerHandle,
+		},
 	};
 
 	#[cfg_attr(
@@ -83,9 +85,8 @@ mod wasm {
 			&self,
 			#[wasm_bindgen(unchecked_param_type = "(event: SocketEvent) => void")]
 			listener: js_sys::Function,
-			#[wasm_bindgen(unchecked_param_type = "SocketEventType[] | null")] event_types: Option<
-				Vec<String>,
-			>,
+			#[wasm_bindgen(unchecked_param_type = "SocketEventTypeNames[] | null")]
+			event_types: Option<Vec<String>>,
 		) -> Result<ListenerHandle, Error> {
 			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<SocketEvent>();
 
