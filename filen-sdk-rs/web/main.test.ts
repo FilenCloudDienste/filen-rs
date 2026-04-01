@@ -1182,6 +1182,35 @@ test("name validation", () => {
 	expect(parseName("café")).toBe("café")
 })
 
+test("getItemPath", async () => {
+	// Create a two-level hierarchy: testDir -> path-parent -> path-child (dir) and path-parent -> path-file.txt
+	const parentDir = await state.createDir(testDir, "path-parent")
+	const childDir = await state.createDir(parentDir, "path-child")
+	const childFile = await state.uploadFile(new TextEncoder().encode("path test content"), {
+		parent: parentDir,
+		name: "path-file.txt"
+	})
+
+	// Test nested dir: path ends with "/" and includes ancestors + own name
+	const dirResult = await state.getItemPath(childDir)
+	expect(dirResult.path).toBe("wasm-test-dir/path-parent/path-child/")
+	expect(dirResult.ancestors).toBeInstanceOf(Array)
+	expect(dirResult.ancestors.length).toBe(2)
+	expect(getDirMeta(dirResult.ancestors[1].meta)?.name).toBe("path-parent")
+
+	// Test nested file: path does NOT end with "/" and includes ancestors + own name
+	const fileResult = await state.getItemPath(childFile)
+	expect(fileResult.path).toBe("wasm-test-dir/path-parent/path-file.txt")
+	expect(fileResult.ancestors).toBeInstanceOf(Array)
+	expect(fileResult.ancestors.length).toBe(2)
+	expect(getDirMeta(fileResult.ancestors[1].meta)?.name).toBe("path-parent")
+
+	// Test item directly under root:
+	const topLevelDirResult = await state.getItemPath(testDir)
+	expect(topLevelDirResult.path).toBe("wasm-test-dir/")
+	expect(topLevelDirResult.ancestors.length).toBe(0)
+})
+
 afterAll(async () => {
 	if (state && testDir) {
 		await state.deleteDirPermanently(testDir)

@@ -1,8 +1,10 @@
+use filen_macros::js_type;
+
 use crate::{
 	Error,
 	auth::JsClient,
 	fs::categories::{NonRootItemType, Normal},
-	js::{NonRootNormalItem, NonRootNormalItemTagged},
+	js::{Dir, NonRootNormalItem, NonRootNormalItemTagged},
 	runtime::do_on_commander,
 };
 
@@ -42,4 +44,28 @@ impl JsClient {
 		})
 		.await
 	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getItemPath")
+	)]
+	pub async fn get_item_path(&self, item: NonRootNormalItem) -> Result<GetItemPathResult, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			let item: NonRootItemType<'static, Normal> = item.try_into()?;
+			this.get_item_path(&item)
+				.await
+				.map(|(path, ancestors)| GetItemPathResult {
+					path,
+					ancestors: ancestors.into_iter().map(Dir::from).collect(),
+				})
+		})
+		.await
+	}
+}
+
+#[js_type(export)]
+pub struct GetItemPathResult {
+	pub path: String,
+	pub ancestors: Vec<Dir>,
 }

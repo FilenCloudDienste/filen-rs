@@ -1,13 +1,13 @@
 use std::borrow::Cow;
 
-use filen_types::fs::ObjectType;
+use filen_types::fs::{ObjectType, ParentUuid};
 
 use crate::{
-	api,
+	ErrorKind, api,
 	auth::Client,
 	error::Error,
 	fs::{
-		HasUUID, SetRemoteInfo,
+		HasName, HasParent, HasUUID, SetRemoteInfo,
 		categories::{
 			DirType, NonRootFileType, NonRootItemType, Normal,
 			fs::{
@@ -47,6 +47,104 @@ impl Client {
 			(),
 		)
 		.await
+	}
+
+	/// Gets the path of an item by traversing up the directory tree until it reaches the root.
+	/// Returns the full path (directories end with `/`, files do not)
+	/// and a vector of the ancestors (excluding the item itself).
+	pub async fn get_item_path(
+		&self,
+		item: &NonRootItemType<'_, Normal>,
+	) -> Result<(String, Vec<RemoteDirectory>), Error> {
+		let _lock = self.lock_drive().await?;
+		let mut current_item = Cow::Borrowed(item);
+		let mut ancestors: Vec<RemoteDirectory> = Vec::new();
+		loop {
+			let parent_uuid = match current_item.parent() {
+				ParentUuid::Uuid(uuid) => *uuid,
+				_ => {
+					// If the parent UUID is not a real UUID,
+					// we try to refetch the item to see if we can get a valid parent UUID.
+					// If not, we return an error.
+					let parent_uuid = match current_item.as_ref() {
+						NonRootItemType::Dir(dir) => {
+							let dir = self.get_dir(*dir.uuid()).await?;
+							let parent_uuid = *dir.parent();
+							if let Some(last) = ancestors.last_mut()
+								&& last.uuid() == dir.uuid()
+							{
+								*last = dir;
+							}
+							parent_uuid
+						}
+						NonRootItemType::File(file) => {
+							let file = self.get_file(*file.uuid()).await?;
+							*file.parent()
+						}
+					};
+					match parent_uuid {
+						ParentUuid::Uuid(uuid) => uuid,
+						_ => {
+							return Err(Error::custom(
+								ErrorKind::MetadataWasNotDecrypted,
+								format!(
+									"Item {} does not have a valid parent: {}",
+									item.uuid(),
+									parent_uuid.as_ref()
+								),
+							));
+						}
+					}
+				}
+			};
+
+			if &parent_uuid == self.root().uuid() {
+				break;
+			}
+
+			let parent = self.get_dir(parent_uuid).await?;
+			ancestors.push(parent);
+			current_item = Cow::Owned(NonRootItemType::Dir(Cow::Borrowed(
+				ancestors.last().unwrap(),
+			)));
+		}
+
+		ancestors.reverse();
+
+		let mut path = ancestors
+			.iter()
+			.try_fold(String::new(), |mut acc, ancestor| {
+				match ancestor.name() {
+					Some(name) => {
+						acc.push_str(name);
+						acc.push('/');
+					}
+					None => {
+						return Err(Error::custom(
+							ErrorKind::MetadataWasNotDecrypted,
+							format!("Name for item {} could not be decrypted", item.uuid()),
+						));
+					}
+				}
+				Ok(acc)
+			})?;
+
+		match item.name() {
+			Some(name) => {
+				path.push_str(name);
+				if matches!(item, NonRootItemType::Dir(_)) {
+					path.push('/');
+				}
+			}
+			None => {
+				return Err(Error::custom(
+					ErrorKind::MetadataWasNotDecrypted,
+					format!("Name for item {} could not be decrypted", item.uuid()),
+				));
+			}
+		}
+
+		Ok((path, ancestors))
 	}
 
 	pub async fn empty_trash(&self) -> Result<(), Error> {
