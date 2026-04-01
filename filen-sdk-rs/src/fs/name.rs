@@ -525,8 +525,9 @@ mod tests {
 		use std::fs;
 		use std::path::{Path, PathBuf};
 
-		fn test_dir() -> PathBuf {
-			let dir = std::env::temp_dir().join(format!("filen_name_test_{}", std::process::id()));
+		fn test_dir(suffix: &str) -> PathBuf {
+			let dir = std::env::temp_dir()
+				.join(format!("filen_name_test_{suffix}_{}", std::process::id()));
 			fs::create_dir_all(&dir).unwrap();
 			dir
 		}
@@ -558,7 +559,7 @@ mod tests {
 
 		#[test]
 		fn win_forbidden_chars_rejected() {
-			let dir = test_dir();
+			let dir = test_dir("forbidden_chars");
 			for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
 				let name = format!("test{ch}file");
 				assert!(
@@ -575,7 +576,7 @@ mod tests {
 
 		#[test]
 		fn win_control_chars_rejected() {
-			let dir = test_dir();
+			let dir = test_dir("control_chars");
 			for byte in 1u8..=0x1F {
 				let name = format!("f{}\x61", byte as char);
 				assert!(
@@ -592,7 +593,7 @@ mod tests {
 
 		#[test]
 		fn win_reserved_bare_names_rejected() {
-			let dir = test_dir();
+			let dir = test_dir("reserved_bare");
 			for base in ["con", "prn", "aux", "nul"] {
 				for variant in super::all_case_combinations(base) {
 					assert!(
@@ -610,7 +611,7 @@ mod tests {
 
 		#[test]
 		fn win_reserved_com_lpt_match_validator() {
-			let dir = test_dir();
+			let dir = test_dir("com_lpt");
 			for digit in b'0'..=b'9' {
 				for prefix in ["COM", "com", "LPT", "lpt"] {
 					let name = format!("{prefix}{}", digit as char);
@@ -627,7 +628,7 @@ mod tests {
 
 		#[test]
 		fn win_reserved_with_extension_match_validator() {
-			let dir = test_dir();
+			let dir = test_dir("reserved_ext");
 			for name in [
 				"CON.txt", "con.txt", "PRN.log", "AUX.dat", "NUL.bin", "COM1.txt", "com1.txt",
 				"LPT1.txt", "lpt1.txt",
@@ -644,7 +645,7 @@ mod tests {
 
 		#[test]
 		fn win_trailing_dot_space_not_preserved() {
-			let dir = test_dir();
+			let dir = test_dir("trailing");
 			// Windows silently strips trailing dots and spaces,
 			// so the file name doesn't match what was requested.
 			// Our validator rejects these proactively.
@@ -663,7 +664,7 @@ mod tests {
 
 		#[test]
 		fn win_valid_names_accepted() {
-			let dir = test_dir();
+			let dir = test_dir("valid");
 			for name in [
 				"hello.txt",
 				"my-file",
@@ -686,7 +687,7 @@ mod tests {
 
 		#[test]
 		fn win_unicode_names_accepted() {
-			let dir = test_dir();
+			let dir = test_dir("unicode");
 			for name in ["日本語.txt", "über.doc", "café"] {
 				assert!(
 					windows_accepts(&dir, name),
