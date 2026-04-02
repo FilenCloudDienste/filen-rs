@@ -184,3 +184,27 @@ impl CategoryFS for Linked {
 			})
 	}
 }
+
+impl From<LinkedDirectory> for DirType<'static, Linked> {
+	fn from(value: LinkedDirectory) -> Self {
+		Self::Dir(Cow::Owned(value))
+	}
+}
+
+impl From<RootDirectoryWithMeta> for DirType<'static, Linked> {
+	fn from(value: RootDirectoryWithMeta) -> Self {
+		Self::Root(Cow::Owned(value))
+	}
+}
+
+impl<'a> From<&'a LinkedDirectory> for DirType<'a, Linked> {
+	fn from(value: &'a LinkedDirectory) -> Self {
+		Self::Dir(Cow::Borrowed(value))
+	}
+}
+
+impl<'a> From<&'a RootDirectoryWithMeta> for DirType<'a, Linked> {
+	fn from(value: &'a RootDirectoryWithMeta) -> Self {
+		Self::Root(Cow::Borrowed(value))
+	}
+}

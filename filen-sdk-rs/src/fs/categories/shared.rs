@@ -1,5 +1,10 @@
+use std::borrow::Cow;
+
 use filen_types::{
-	api::v3::shared::{in_uuid::SharedFileIn, out_uuid::SharedFileOut},
+	api::v3::{
+		dir::color::DirColor,
+		shared::{in_uuid::SharedFileIn, out_uuid::SharedFileOut},
+	},
 	traits::CowHelpers,
 };
 #[cfg(feature = "multi-threaded-crypto")]
@@ -7,7 +12,7 @@ use rayon::iter::ParallelIterator;
 use rsa::RsaPrivateKey;
 
 use crate::{
-	Error, ErrorKind, api,
+	Error, api,
 	auth::Client,
 	connect::fs::{
 		DirInfo, ShareInfo, SharedDirectory, SharedRootDirectory, SharedRootFile, SharingRole,
@@ -149,10 +154,14 @@ impl CategoryFS for Shared {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		if let SharingRole::Sharer(_) = context {
-			return Err(Error::custom(
-				ErrorKind::Internal,
-				"Cannot dir download directories shared by you. This is a limitation of the API.",
+		if let SharingRole::Receiver(_) = context {
+			let (dirs, files) =
+				super::normal::list_recursive_parent_uuid(client, *parent.uuid(), progress).await?;
+			return Ok((
+				dirs.into_iter()
+					.map(|d| SharedDirectory { inner: d })
+					.collect(),
+				files,
 			));
 		}
 
@@ -178,7 +187,7 @@ impl CategoryFS for Shared {
 							Some(parent) => Some(SharedDirectory::from_dir_info(DirInfo {
 								uuid: d.uuid,
 								parent,
-								color: d.color,
+								color: DirColor::Default,
 								timestamp: d.timestamp,
 								metadata: DirectoryMeta::blocking_from_rsa_encrypted(d.meta, key),
 							})),
@@ -361,4 +370,28 @@ where
 		Ok((dirs?, files?))
 	})
 	.await
+}
+
+impl From<SharedDirectory> for DirType<'static, Shared> {
+	fn from(value: SharedDirectory) -> Self {
+		Self::Dir(Cow::Owned(value))
+	}
+}
+
+impl From<SharedRootDirectory> for DirType<'static, Shared> {
+	fn from(value: SharedRootDirectory) -> Self {
+		Self::Root(Cow::Owned(value))
+	}
+}
+
+impl<'a> From<&'a SharedDirectory> for DirType<'a, Shared> {
+	fn from(value: &'a SharedDirectory) -> Self {
+		Self::Dir(Cow::Borrowed(value))
+	}
+}
+
+impl<'a> From<&'a SharedRootDirectory> for DirType<'a, Shared> {
+	fn from(value: &'a SharedRootDirectory) -> Self {
+		Self::Root(Cow::Borrowed(value))
+	}
 }

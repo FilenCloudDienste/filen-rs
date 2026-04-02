@@ -316,3 +316,9 @@ impl HasRemoteDirInfo for RemoteDirectory {
 	HasParent,
 )]
 pub struct LinkedDirectory(pub(crate) RemoteDirectory);
+
+impl LinkedDirectory {
+	pub fn inner(&self) -> &RemoteDirectory {
+		&self.0
+	}
+}

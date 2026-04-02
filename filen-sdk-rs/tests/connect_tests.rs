@@ -18,128 +18,183 @@
 // use filen_types::api::v3::dir::link::PublicLinkExpiration;
 // use futures::{StreamExt, stream::FuturesUnordered};
 
-// #[shared_test_runtime]
-// async fn dir_public_link() {
-// 	let resources = test_utils::RESOURCES.get_resources().await;
-// 	let client = &resources.client;
-// 	let test_dir = &resources.dir;
+#[shared_test_runtime]
+async fn dir_public_link() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
 
-// 	let dir = client
-// 		.create_dir(test_dir, "dir".to_string())
-// 		.await
-// 		.unwrap();
-// 	let mut sub_dir = client
-// 		.create_dir(&dir, "sub_dir".to_string())
-// 		.await
-// 		.unwrap();
+	let unauth_client = client.get_unauthed();
 
-// 	let dir_file = client.make_file_builder("empty_dir.txt", &dir).build();
-// 	let dir_file = client.upload_file(dir_file.into(), b"").await.unwrap();
+	let dir = client.create_dir(&test_dir.into(), "dir").await.unwrap();
+	let mut sub_dir = client.create_dir(&(&dir).into(), "sub_dir").await.unwrap();
 
-// 	let file = client.make_file_builder("a.txt", &sub_dir).build();
-// 	let file = client
-// 		.upload_file(file.into(), b"Hello, world!")
-// 		.await
-// 		.unwrap();
+	let dir_file = client
+		.make_file_builder("empty_dir.txt", *dir.uuid())
+		.unwrap()
+		.build();
+	let dir_file = client.upload_file(dir_file.into(), b"").await.unwrap();
 
-// 	let empty_file = client.make_file_builder("empty.txt", &sub_dir).build();
-// 	let empty_file = client.upload_file(empty_file.into(), b"").await.unwrap();
+	let file = client
+		.make_file_builder("a.txt", *sub_dir.uuid())
+		.unwrap()
+		.build();
+	let file = client
+		.upload_file(file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 
-// 	let mut link = client.public_link_dir(&dir).await.unwrap();
+	let empty_file = client
+		.make_file_builder("empty.txt", *sub_dir.uuid())
+		.unwrap()
+		.build();
+	let empty_file = client.upload_file(empty_file.into(), b"").await.unwrap();
 
-// 	let found_link = client.get_dir_link_status(&dir).await.unwrap().unwrap();
-// 	assert_eq!(
-// 		&link, &found_link,
-// 		"get_dir_link_status didn't match created link"
-// 	);
+	let mut link_rw = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.await
+		.unwrap();
 
-// 	let (dirs, files) = client.list_linked_dir(&dir, &link).await.unwrap();
-// 	assert_eq!(&dirs, &vec![sub_dir.clone()]);
-// 	assert_eq!(&files, &vec![dir_file.clone()]);
+	let found_link = client.get_dir_link_rw(&dir).await.unwrap().unwrap();
+	assert_eq!(
+		&link_rw, &found_link,
+		"get_dir_link_status didn't match created link"
+	);
 
-// 	let (sub_dirs, sub_files) = client.list_linked_dir(&sub_dir, &found_link).await.unwrap();
-// 	assert_eq!(sub_dirs.len(), 0);
-// 	assert_eq!(sub_files.len(), 2);
-// 	assert!(sub_files.contains(&file));
-// 	assert!(sub_files.contains(&empty_file));
+	let link: DirPublicLink = found_link.try_into().unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
 
-// 	let (dirs, files) = client.list_linked_dir(&dir, &found_link).await.unwrap();
-// 	assert_eq!(&dirs, &vec![sub_dir.clone()]);
-// 	assert_eq!(&files, &vec![dir_file.clone()]);
+	let (dirs, files) = client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &link, None)
+		.await
+		.unwrap();
+	let linked_sub_dir = dirs.iter().find(|d| d.inner() == &sub_dir).unwrap();
 
-// 	let password = "some_password";
-// 	link.set_password(password.to_string());
-// 	link.set_expiration(PublicLinkExpiration::OneHour);
-// 	client.update_dir_link(&dir, &link).await.unwrap();
+	assert_eq!(&files, &vec![dir_file.clone()]);
 
-// 	let found_link = client.get_dir_link_status(&dir).await.unwrap().unwrap();
-// 	assert_eq!(
-// 		&link.uuid(),
-// 		&found_link.uuid(),
-// 		"get_dir_link_status didn't match created link"
-// 	);
+	let (sub_dirs, sub_files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!(sub_dirs.len(), 0);
+	assert_eq!(sub_files.len(), 2);
+	assert!(sub_files.contains(&file));
+	assert!(sub_files.contains(&empty_file));
 
-// 	let mut sub_sub_dir = client
-// 		.create_dir(&sub_dir, "sub_sub_dir".to_string())
-// 		.await
-// 		.unwrap();
-// 	let sub_sub_file = client
-// 		.make_file_builder("sub_sub_file.txt", &sub_dir)
-// 		.build();
-// 	let mut sub_sub_file = client
-// 		.upload_file(sub_sub_file.into(), b"Hello, world!")
-// 		.await
-// 		.unwrap();
+	let (dirs, files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	let linked_sub_dir = dirs.iter().find(|d| d.inner() == &sub_dir).unwrap();
+	assert_eq!(&files, &vec![dir_file.clone()]);
 
-// 	let (sub_dirs, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
-// 	assert_eq!(sub_dirs.len(), 1);
-// 	assert!(sub_dirs.contains(&sub_sub_dir));
-// 	assert!(sub_files.contains(&sub_sub_file));
-// 	assert_eq!(sub_files.len(), 3);
+	let password = "some_password";
+	link_rw.set_password(password.to_string());
+	link_rw.set_expiration(PublicLinkExpiration::OneHour);
+	client.update_dir_link(&dir, &link_rw).await.unwrap();
 
-// 	client
-// 		.update_file_metadata(
-// 			&mut sub_sub_file,
-// 			FileMetaChanges::default()
-// 				.name("new_file_name.txt")
-// 				.unwrap(),
-// 		)
-// 		.await
-// 		.unwrap();
+	let found_link = client.get_dir_link_rw(&dir).await.unwrap().unwrap();
+	assert_eq!(
+		link.uuid(),
+		&found_link.uuid(),
+		"get_dir_link_status didn't match created link"
+	);
 
-// 	let (_, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
-// 	let found_file = sub_files
-// 		.iter()
-// 		.find(|f| f.name().is_some_and(|n| n == "new_file_name.txt"));
-// 	assert!(found_file.is_some());
+	let mut sub_sub_dir = client
+		.create_dir(&(&sub_dir).into(), "sub_sub_dir")
+		.await
+		.unwrap();
+	let sub_sub_file = client
+		.make_file_builder("sub_sub_file.txt", *sub_dir.uuid())
+		.unwrap()
+		.build();
+	let mut sub_sub_file = client
+		.upload_file(sub_sub_file.into(), b"Hello, world!")
+		.await
+		.unwrap();
 
-// 	client
-// 		.update_dir_metadata(
-// 			&mut sub_dir,
-// 			DirectoryMetaChanges::default()
-// 				.name("new_dir_name".to_string())
-// 				.unwrap(),
-// 		)
-// 		.await
-// 		.unwrap();
-// 	let (dirs, _) = client.list_linked_dir(&dir, &link).await.unwrap();
-// 	assert_eq!(dirs.len(), 1);
-// 	assert_eq!(dirs[0].name(), Some("new_dir_name"));
+	let err = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &link, None)
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::WrongPassword);
 
-// 	client.trash_dir(&mut sub_sub_dir).await.unwrap();
-// 	client.trash_file(&mut sub_sub_file).await.unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
 
-// 	let (sub_dirs, sub_files) = client.list_linked_dir(&sub_dir, &link).await.unwrap();
-// 	assert_eq!(sub_dirs.len(), 0);
-// 	assert_eq!(sub_files.len(), 2);
-// 	assert!(!sub_files.contains(&sub_sub_file));
-// }
+	let mut link = info.link;
+	link.set_password(password.to_string());
+
+	let (sub_dirs, sub_files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &link, None)
+		.await
+		.unwrap();
+	assert_eq!(sub_dirs.len(), 1);
+	assert_eq!(sub_dirs[0].inner(), &sub_sub_dir);
+	assert!(sub_files.contains(&sub_sub_file));
+	assert_eq!(sub_files.len(), 3);
+
+	client
+		.update_file_metadata(
+			&mut sub_sub_file,
+			FileMetaChanges::default()
+				.name("new_file_name.txt")
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	let (_, sub_files) = client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &link, None)
+		.await
+		.unwrap();
+	let found_file = sub_files
+		.iter()
+		.find(|f| f.name().is_some_and(|n| n == "new_file_name.txt"));
+	assert!(found_file.is_some());
+
+	client
+		.update_dir_metadata(
+			&mut sub_dir,
+			DirectoryMetaChanges::default()
+				.name("new_dir_name")
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let (dirs, _) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &link, None)
+		.await
+		.unwrap();
+	assert_eq!(dirs.len(), 1);
+	assert_eq!(dirs[0].name(), Some("new_dir_name"));
+
+	client.trash_dir(&mut sub_sub_dir).await.unwrap();
+	client.trash_file(&mut sub_sub_file).await.unwrap();
+
+	let (sub_dirs, sub_files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &link, None)
+		.await
+		.unwrap();
+	assert_eq!(sub_dirs.len(), 0);
+	assert_eq!(sub_files.len(), 2);
+	assert!(!sub_files.contains(&sub_sub_file));
+}
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
-	connect::PublicLinkSharedClientExt,
-	fs::{HasUUID, file::meta::FileMetaChanges},
-	io::HasFileInfo,
+	ErrorKind,
+	connect::{DirPublicLink, PublicLinkSharedClientExt},
+	fs::{
+		HasName, HasUUID, categories::Shared, dir::meta::DirectoryMetaChanges,
+		file::meta::FileMetaChanges,
+	},
+	io::{HasFileInfo, client_impl::IoSharedClientExt},
 };
 use filen_types::{api::v3::dir::link::PublicLinkExpiration, traits::CowHelpers};
 
@@ -418,132 +473,185 @@ async fn file_public_link() {
 // 	(lock1, lock2, num_shared_out, num_shared_in)
 // }
 
-// #[shared_test_runtime]
-// async fn share_dir() {
-// 	let resources = test_utils::RESOURCES.get_resources().await;
-// 	let client = &resources.client;
-// 	let test_dir = &resources.dir;
+#[shared_test_runtime]
+async fn share_dir() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
 
-// 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
-// 	let share_client = &share_resources.client;
+	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;
+	let share_client = &share_resources.client;
 
-// 	let mut dir = client
-// 		.create_dir(test_dir, "dir".to_string())
-// 		.await
-// 		.unwrap();
-// 	let sub_dir = client
-// 		.create_dir(&dir, "sub_dir".to_string())
-// 		.await
-// 		.unwrap();
-// 	let dir_file = client.make_file_builder("a.txt", &dir).build();
-// 	let mut dir_file = client
-// 		.upload_file(dir_file.into(), b"Hello, world!")
-// 		.await
-// 		.unwrap();
-// 	let file = client.make_file_builder("a.txt", &sub_dir).build();
-// 	client.upload_file(file.into(), b"").await.unwrap();
+	let mut dir = client.create_dir(&test_dir.into(), "dir").await.unwrap();
+	let sub_dir = client.create_dir(&(&dir).into(), "sub_dir").await.unwrap();
+	let dir_file = client
+		.make_file_builder("a.txt", *dir.uuid())
+		.unwrap()
+		.build();
+	let mut dir_file = client
+		.upload_file(dir_file.into(), b"Hello, world!")
+		.await
+		.unwrap();
+	let file = client
+		.make_file_builder("a.txt", *sub_dir.uuid())
+		.unwrap()
+		.build();
+	let sub_file = client.upload_file(file.into(), b"").await.unwrap();
 
-// 	let (_lock1, _lock2, num_shared_out, num_shared_in) =
-// 		set_up_contact(client, share_client).await;
+	let (_lock1, _lock2, num_shared_out, num_shared_in) =
+		test_utils::set_up_contact(client, share_client).await;
 
-// 	let contacts = client.get_contacts().await.unwrap();
-// 	assert_eq!(contacts.len(), 1);
-// 	let contact = &contacts[0];
-// 	assert_eq!(contact.email, share_client.email());
-// 	client.share_dir(&dir, contact).await.unwrap();
+	let contacts = client.get_contacts().await.unwrap();
+	assert_eq!(contacts.len(), 1);
+	let contact = &contacts[0];
+	assert_eq!(contact.email, share_client.email());
+	client
+		.share_dir::<fn(u64, Option<u64>)>(&dir, contact, None)
+		.await
+		.unwrap();
+	// sleep because sometimes this takes a second to become available on the backend
+	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-// 	let (shared_dirs_out, _) = client.list_out_shared(None).await.unwrap();
-// 	assert_eq!(shared_dirs_out.len(), num_shared_out + 1);
-// 	assert!(
-// 		shared_dirs_out
-// 			.iter()
-// 			.any(|d| d.get_dir().uuid() == dir.uuid())
-// 	);
+	let (shared_dirs_out, _) = client
+		.list_out_shared::<fn(u64, Option<u64>)>(None, None)
+		.await
+		.unwrap();
+	assert_eq!(shared_dirs_out.len(), num_shared_out + 1);
+	assert!(
+		shared_dirs_out
+			.iter()
+			.any(|d| d.get_dir().uuid() == dir.uuid())
+	);
 
-// 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
-// 	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
+	let (shared_dirs_in, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
 
-// 	let shared_dir_in = shared_dirs_in
-// 		.iter()
-// 		.find(|d| d.get_dir().uuid() == dir.uuid())
-// 		.unwrap();
+	let shared_dir_in = shared_dirs_in
+		.iter()
+		.find(|d| d.get_dir().uuid() == dir.uuid())
+		.unwrap();
 
-// 	let shared_dir_out = shared_dirs_out
-// 		.iter()
-// 		.find(|d| d.get_dir().uuid() == dir.uuid())
-// 		.unwrap();
+	let shared_dir_out = shared_dirs_out
+		.iter()
+		.find(|d| d.get_dir().uuid() == dir.uuid())
+		.unwrap();
 
-// 	assert_eq!(shared_dir_in.get_dir(), shared_dir_out.get_dir());
+	assert_eq!(shared_dir_in.get_dir(), shared_dir_out.get_dir());
 
-// 	let (shared_dirs_out, shared_files_out) =
-// 		client.list_out_shared_dir(&dir, contact).await.unwrap();
-// 	let (shared_dirs_in, shared_files_in) = share_client.list_in_shared_dir(&dir).await.unwrap();
+	let (shared_dirs_out, shared_files_out) = client
+		.list_shared_dir::<fn(u64, Option<u64>)>(
+			&shared_dir_out.into(),
+			shared_dir_out.sharing_role(),
+			None,
+		)
+		.await
+		.unwrap();
+	let (shared_dirs_in, shared_files_in) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(
+			&shared_dir_in.into(),
+			shared_dir_in.sharing_role(),
+			None,
+		)
+		.await
+		.unwrap();
 
-// 	assert_eq!(shared_dirs_out.len(), 1);
-// 	assert_eq!(shared_dirs_in.len(), 1);
-// 	assert_eq!(shared_files_out.len(), 1);
-// 	assert_eq!(shared_files_in.len(), 1);
+	assert_eq!(shared_dirs_out.len(), 1);
+	assert_eq!(shared_dirs_in.len(), 1);
+	assert_eq!(shared_files_out.len(), 1);
+	assert_eq!(shared_files_in.len(), 1);
 
-// 	assert_eq!(shared_dirs_in[0].get_dir(), shared_dirs_out[0].get_dir());
-// 	assert_eq!(
-// 		shared_files_out[0].get_file(),
-// 		shared_files_in[0].get_file()
-// 	);
+	assert_eq!(shared_dirs_in[0].get_dir(), shared_dirs_out[0].get_dir());
+	assert_eq!(shared_files_out[0], shared_files_in[0]);
 
-// 	assert_eq!(
-// 		&share_client
-// 			.download_file(shared_files_in[0].get_file())
-// 			.await
-// 			.unwrap(),
-// 		b"Hello, world!"
-// 	);
-// 	assert_eq!(shared_files_in[0].get_file(), &dir_file);
-// 	assert_eq!(
-// 		client
-// 			.download_file(shared_files_out[0].get_file())
-// 			.await
-// 			.unwrap(),
-// 		b"Hello, world!"
-// 	);
-// 	assert_eq!(shared_files_out[0].get_file(), &dir_file);
+	assert_eq!(
+		&share_client
+			.download_file(&shared_files_in[0])
+			.await
+			.unwrap(),
+		b"Hello, world!"
+	);
+	assert_eq!(&shared_files_in[0], &dir_file);
+	assert_eq!(
+		client.download_file(&shared_files_out[0]).await.unwrap(),
+		b"Hello, world!"
+	);
+	assert_eq!(&shared_files_out[0], &dir_file);
 
-// 	// change metadata
-// 	client
-// 		.update_dir_metadata(
-// 			&mut dir,
-// 			DirectoryMetaChanges::default()
-// 				.name("new_name".to_string())
-// 				.unwrap(),
-// 		)
-// 		.await
-// 		.unwrap();
+	let (dirs, files) = client
+		.list_dir_recursive::<Shared, fn(u64, Option<u64>)>(
+			&shared_dir_out.into(),
+			None,
+			shared_dir_out.sharing_role(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(dirs.len(), 1);
+	assert_eq!(files.len(), 2);
+	assert_eq!(dirs[0].get_dir(), &sub_dir);
+	assert!(files.contains(&dir_file));
+	assert!(files.contains(&sub_file));
 
-// 	client
-// 		.update_file_metadata(
-// 			&mut dir_file,
-// 			FileMetaChanges::default()
-// 				.name("new_file_name.txt")
-// 				.unwrap(),
-// 		)
-// 		.await
-// 		.unwrap();
-// 	let (shared_dirs_in, _) = share_client.list_in_shared().await.unwrap();
-// 	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
+	let (dirs, files) = share_client
+		.list_dir_recursive::<Shared, fn(u64, Option<u64>)>(
+			&shared_dir_in.into(),
+			None,
+			shared_dir_in.sharing_role(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(dirs.len(), 1);
+	assert_eq!(files.len(), 2);
+	assert_eq!(dirs[0].get_dir().uuid(), sub_dir.uuid());
+	assert_eq!(dirs[0].get_dir().name(), sub_dir.name());
+	assert!(files.contains(&dir_file));
 
-// 	let shared_dir_in = shared_dirs_in
-// 		.iter()
-// 		.find(|d| d.get_dir().uuid() == dir.uuid())
-// 		.unwrap();
+	// change metadata
+	client
+		.update_dir_metadata(
+			&mut dir,
+			DirectoryMetaChanges::default().name("new_name").unwrap(),
+		)
+		.await
+		.unwrap();
 
-// 	assert_eq!(shared_dir_in.get_dir().name().unwrap(), "new_name");
+	client
+		.update_file_metadata(
+			&mut dir_file,
+			FileMetaChanges::default()
+				.name("new_file_name.txt")
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let (shared_dirs_in, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	assert_eq!(shared_dirs_in.len(), num_shared_in + 1);
 
-// 	let (_, shared_files_in) = share_client.list_in_shared_dir(&dir).await.unwrap();
-// 	assert_eq!(shared_files_in.len(), 1);
-// 	assert_eq!(
-// 		shared_files_in[0].get_file().name().unwrap(),
-// 		"new_file_name.txt"
-// 	);
-// }
+	let shared_dir_in = shared_dirs_in
+		.iter()
+		.find(|d| d.get_dir().uuid() == dir.uuid())
+		.unwrap();
+
+	assert_eq!(shared_dir_in.get_dir().name().unwrap(), "new_name");
+
+	let (_, shared_files_in) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(
+			&shared_dir_in.into(),
+			shared_dir_in.sharing_role(),
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(shared_files_in.len(), 1);
+	assert_eq!(shared_files_in[0].name().unwrap(), "new_file_name.txt");
+
+	assert!(files.contains(&sub_file));
+}
 
 // #[shared_test_runtime]
 // async fn share_file() {

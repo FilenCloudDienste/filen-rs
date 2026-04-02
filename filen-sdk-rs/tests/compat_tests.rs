@@ -180,13 +180,7 @@ async fn make_rs_compat_dir() {
 
 	let (contact, _lock1, _lock2) = get_contact(client).await;
 	client
-		.share_dir(&compat_dir, &contact, &|downloaded, total| {
-			log::trace!(
-				"Shared compat-rs dir: downloaded {} / {:?}",
-				downloaded,
-				total
-			);
-		})
+		.share_dir::<fn(u64, Option<u64>)>(&compat_dir, &contact, None)
 		.await
 		.unwrap();
 

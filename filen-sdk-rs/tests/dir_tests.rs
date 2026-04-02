@@ -410,13 +410,7 @@ async fn list_recursive() {
 	let dir_c = client.create_dir(&(&dir_b).into(), "c").await.unwrap();
 
 	let (dirs, _) = client
-		.list_dir_recursive(&test_dir.into(), &|downloaded, total| {
-			log::trace!(
-				"List dir recursive progress: downloaded {} / {:?}",
-				downloaded,
-				total
-			);
-		})
+		.list_dir_recursive::<_, fn(u64, Option<u64>)>(&test_dir.into(), None, ())
 		.await
 		.unwrap();
 
@@ -875,7 +869,10 @@ async fn download_linked_dir_to_zip() {
 		.unwrap();
 
 	// Create a public link for the directory
-	let link = client.public_link_dir(&dir_a, &|_, _| {}).await.unwrap();
+	let link = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir_a, None)
+		.await
+		.unwrap();
 
 	// Use a fresh UnauthClient (simulating a non-authenticated user)
 	let unauth_client =

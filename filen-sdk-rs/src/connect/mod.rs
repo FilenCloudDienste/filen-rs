@@ -200,8 +200,16 @@ impl DirPublicLink {
 		&self.link_key
 	}
 
-	pub(crate) fn uuid(&self) -> &UuidStr {
+	pub fn uuid(&self) -> &UuidStr {
 		&self.link_uuid
+	}
+
+	pub fn key_string(&self) -> String {
+		self.link_key.to_string()
+	}
+
+	pub fn set_password(&mut self, password: String) {
+		self.password = Some(password);
 	}
 
 	pub(crate) fn get_password_hash(&self) -> Result<Cow<'_, [u8]>, Error> {
@@ -214,6 +222,7 @@ impl DirPublicLink {
 	}
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct DirPublicLinkRW {
 	pub(crate) link_uuid: UuidStr,
 	pub(crate) link_key: Option<MetaKey>,
@@ -505,14 +514,18 @@ impl Client {
 	pub async fn public_link_dir<F>(
 		&self,
 		dir: &RemoteDirectory,
-		progress_callback: &F,
+		progress_callback: Option<&F>,
 	) -> Result<DirPublicLinkRW, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
 		let public_link = DirPublicLinkRW::new(self.make_meta_key());
 		let (dirs, files) = self
-			.list_dir_recursive::<Normal, _>(&DirType::Dir(Cow::Borrowed(dir)), progress_callback)
+			.list_dir_recursive::<Normal, _>(
+				&DirType::Dir(Cow::Borrowed(dir)),
+				progress_callback,
+				(),
+			)
 			.await?;
 		let link = ListedPublicLink {
 			link_uuid: public_link.link_uuid,
@@ -822,14 +835,13 @@ impl Client {
 		&self,
 		dir: &RemoteDirectory,
 		client: &Contact<'_>,
-		progress_callback: &F,
+		progress_callback: Option<&F>,
 	) -> Result<(), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let (dirs, files) = self
-			.list_dir_recursive::<Normal, _>(&DirType::Dir(Cow::Borrowed(dir)), progress_callback)
-			.await?;
+		let (dirs, files) =
+			Normal::list_dir_recursive(self, &dir.into(), progress_callback, ()).await?;
 
 		let shared_user = client.into();
 		let shared_user = &shared_user;
@@ -914,6 +926,18 @@ impl Client {
 		Shared::list_dir(self, dir, callback, sharer_info).await
 	}
 
+	pub async fn list_shared_dir_recursive<F>(
+		&self,
+		dir: &DirType<'_, Shared>,
+		sharer_info: &SharingRole,
+		callback: Option<&F>,
+	) -> Result<(Vec<SharedDirectory>, Vec<RemoteFile>), Error>
+	where
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		Shared::list_dir_recursive(self, dir, callback, sharer_info).await
+	}
+
 	pub async fn list_in_shared_root<F>(
 		&self,
 		callback: Option<&F>,
@@ -964,10 +988,13 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 		&self,
 		dir: &DirType<'_, Linked>,
 		link: &DirPublicLink,
-		callback: &F,
+		callback: Option<&F>,
 	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
 	where
-		F: Fn(u64, Option<u64>) + Send + Sync;
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		Linked::list_dir(self.get_unauth_client(), dir, callback, Cow::Borrowed(link)).await
+	}
 
 	/// The returned dirs here should not be used as normal RemoteDirectories,
 	/// they can only be listed via list_linked_dir again.
@@ -978,7 +1005,16 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 		callback: &F,
 	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
 	where
-		F: Fn(u64, Option<u64>) + Send + Sync;
+		F: Fn(u64, Option<u64>) + Send + Sync,
+	{
+		Linked::list_dir_recursive(
+			self.get_unauth_client(),
+			dir,
+			Some(callback),
+			Cow::Borrowed(link),
+		)
+		.await
+	}
 
 	async fn get_dir_public_link_info(
 		&self,
@@ -1003,7 +1039,7 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 			link_key: key,
 			password: None,
 			enable_download: resp.download_btn,
-			salt: None,
+			salt: resp.salt.map(|v| v.into_owned()),
 		};
 
 		Ok(DirPublicInfo {
@@ -1056,41 +1092,5 @@ where
 
 		let key = FileKey::from_string_and_meta(file_key, &response.mime)?;
 		do_cpu_intensive(|| LinkedFile::blocking_from_response(key, response)).await
-	}
-
-	async fn list_linked_dir<F>(
-		&self,
-		dir: &DirType<'_, Linked>,
-		link: &DirPublicLink,
-		callback: &F,
-	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
-	where
-		F: Fn(u64, Option<u64>) + Send + Sync,
-	{
-		Linked::list_dir(
-			self.get_unauth_client(),
-			dir,
-			Some(callback),
-			Cow::Borrowed(link),
-		)
-		.await
-	}
-
-	async fn list_linked_dir_recursive<F>(
-		&self,
-		dir: &DirType<'_, Linked>,
-		link: &DirPublicLink,
-		callback: &F,
-	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
-	where
-		F: Fn(u64, Option<u64>) + Send + Sync,
-	{
-		Linked::list_dir_recursive(
-			self.get_unauth_client(),
-			dir,
-			Some(callback),
-			Cow::Borrowed(link),
-		)
-		.await
 	}
 }

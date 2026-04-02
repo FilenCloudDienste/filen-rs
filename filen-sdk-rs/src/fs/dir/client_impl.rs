@@ -220,20 +220,14 @@ impl Client {
 	pub async fn list_dir_recursive<Cat, F>(
 		&self,
 		dir: &DirType<'_, Cat>,
-		progress_callback: &F,
+		progress_callback: Option<&F>,
+		context: Cat::ListDirContext<'_>,
 	) -> Result<(Vec<Cat::Dir>, Vec<Cat::File>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 		Cat: CategoryFS<Client = Self>,
-		Cat::ListDirContext<'static>: Default,
 	{
-		Cat::list_dir_recursive(
-			self,
-			dir,
-			Some(progress_callback),
-			Cat::ListDirContext::default(),
-		)
-		.await
+		Cat::list_dir_recursive(self, dir, progress_callback, context).await
 	}
 
 	pub async fn trash_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {

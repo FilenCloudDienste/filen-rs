@@ -224,7 +224,7 @@ impl JsClient {
 	async fn inner_public_link_dir<F>(
 		&self,
 		dir: Dir,
-		callback: F,
+		callback: Option<F>,
 	) -> Result<DirPublicLinkRW, Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
@@ -232,14 +232,19 @@ impl JsClient {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			let dir = dir.into();
-			this.public_link_dir(&dir, &callback)
+			this.public_link_dir(&dir, callback.as_ref())
 				.await
 				.map(|link| link.into())
 		})
 		.await
 	}
 
-	async fn inner_share_dir<F>(&self, dir: Dir, contact: Contact, callback: F) -> Result<(), Error>
+	async fn inner_share_dir<F>(
+		&self,
+		dir: Dir,
+		contact: Contact,
+		callback: Option<F>,
+	) -> Result<(), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync + 'static,
 	{
@@ -247,7 +252,7 @@ impl JsClient {
 		do_on_commander(move || {
 			let contact = contact.into();
 			let dir = dir.into();
-			async move { this.share_dir(&dir, &contact, &callback).await }
+			async move { this.share_dir(&dir, &contact, callback.as_ref()).await }
 		})
 		.await
 	}
@@ -259,14 +264,19 @@ impl JsClient {
 	pub async fn public_link_dir(
 		&self,
 		dir: Dir,
-		callback: Arc<dyn DirContentDownloadProgressCallback>,
+		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
 	) -> Result<DirPublicLinkRW, Error> {
-		self.inner_public_link_dir(dir, move |downloaded, total| {
-			let callback = Arc::clone(&callback);
-			tokio::task::spawn_blocking(move || {
-				callback.on_progress(downloaded, total);
-			});
-		})
+		self.inner_public_link_dir(
+			dir,
+			callback.map(|cb| {
+				move |downloaded, total| {
+					let callback = Arc::clone(&cb);
+					tokio::task::spawn_blocking(move || {
+						callback.on_progress(downloaded, total);
+					});
+				}
+			}),
+		)
 		.await
 	}
 
@@ -274,14 +284,20 @@ impl JsClient {
 		&self,
 		dir: Dir,
 		contact: Contact,
-		callback: Arc<dyn DirContentDownloadProgressCallback>,
+		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
 	) -> Result<(), Error> {
-		self.inner_share_dir(dir, contact, move |downloaded, total| {
-			let callback = Arc::clone(&callback);
-			tokio::task::spawn_blocking(move || {
-				callback.on_progress(downloaded, total);
-			});
-		})
+		self.inner_share_dir(
+			dir,
+			contact,
+			callback.map(|cb| {
+				move |downloaded, total| {
+					let callback = Arc::clone(&cb);
+					tokio::task::spawn_blocking(move || {
+						callback.on_progress(downloaded, total);
+					});
+				}
+			}),
+		)
 		.await
 	}
 }
@@ -294,35 +310,40 @@ impl JsClient {
 		&self,
 		dir: Dir,
 		#[wasm_bindgen(
-			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
 		)]
 		callback: web_sys::js_sys::Function,
 	) -> Result<DirPublicLinkRW, Error> {
 		use crate::runtime;
 		use wasm_bindgen::JsValue;
-		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+		let callback = if callback.is_undefined() {
+			None
+		} else {
+			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
-		runtime::spawn_local(async move {
-			while let Some((downloaded, total)) = receiver.recv().await {
-				let _ = callback.call2(
-					&JsValue::UNDEFINED,
-					&JsValue::from_f64(downloaded as f64),
-					&match total {
-						Some(v) => JsValue::from_f64(v as f64),
-						None => JsValue::UNDEFINED,
-					},
-				);
-			}
-		});
+			runtime::spawn_local(async move {
+				while let Some((downloaded, total)) = receiver.recv().await {
+					let _ = callback.call2(
+						&JsValue::UNDEFINED,
+						&JsValue::from_f64(downloaded as f64),
+						&match total {
+							Some(v) => JsValue::from_f64(v as f64),
+							None => JsValue::UNDEFINED,
+						},
+					);
+				}
+			});
+			Some(move |downloaded, total| {
+				let _ = sender.send((downloaded, total));
+			})
+		};
 
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
 			let dir = dir.into();
-			this.public_link_dir(&dir, &move |downloaded, total| {
-				let _ = sender.send((downloaded, total));
-			})
-			.await
-			.map(|link| link.into())
+			this.public_link_dir(&dir, callback.as_ref())
+				.await
+				.map(|link| link.into())
 		})
 		.await
 	}
@@ -333,38 +354,41 @@ impl JsClient {
 		dir: Dir,
 		contact: Contact,
 		#[wasm_bindgen(
-			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
 		)]
 		callback: web_sys::js_sys::Function,
 	) -> Result<(), Error> {
 		use crate::runtime;
 		use wasm_bindgen::JsValue;
-		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
-		runtime::spawn_local(async move {
-			while let Some((downloaded, total)) = receiver.recv().await {
-				let _ = callback.call2(
-					&JsValue::UNDEFINED,
-					&JsValue::from_f64(downloaded as f64),
-					&match total {
-						Some(v) => JsValue::from_f64(v as f64),
-						None => JsValue::UNDEFINED,
-					},
-				);
-			}
-		});
+		let callback = if callback.is_undefined() {
+			None
+		} else {
+			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+			runtime::spawn_local(async move {
+				while let Some((downloaded, total)) = receiver.recv().await {
+					let _ = callback.call2(
+						&JsValue::UNDEFINED,
+						&JsValue::from_f64(downloaded as f64),
+						&match total {
+							Some(v) => JsValue::from_f64(v as f64),
+							None => JsValue::UNDEFINED,
+						},
+					);
+				}
+			});
+			Some(move |downloaded, total| {
+				let _ = sender.send((downloaded, total));
+			})
+		};
 
 		let this = self.inner();
 
 		do_on_commander(move || {
 			let contact = contact.into();
 			let dir = dir.into();
-			async move {
-				this.share_dir(&dir, &contact, &move |downloaded, total| {
-					let _ = sender.send((downloaded, total));
-				})
-				.await
-			}
+			async move { this.share_dir(&dir, &contact, callback.as_ref()).await }
 		})
 		.await
 	}
@@ -794,7 +818,7 @@ async fn list_linked_dir_inner_generic<F, T>(
 	client: Arc<T>,
 	dir: AnyLinkedDir,
 	link: DirPublicLink,
-	callback: F,
+	callback: Option<F>,
 ) -> Result<LinkedDirsAndFiles, Error>
 where
 	F: Fn(u64, Option<u64>) + Send + Sync + 'static,
@@ -802,7 +826,11 @@ where
 {
 	let (dirs, files) = runtime::do_on_commander(move || async move {
 		client
-			.list_linked_dir(&DirType::<Linked>::from(dir), &link.try_into()?, &callback)
+			.list_linked_dir(
+				&DirType::<Linked>::from(dir),
+				&link.try_into()?,
+				callback.as_ref(),
+			)
 			.await
 			.map(|(dirs, files)| {
 				(
@@ -821,17 +849,24 @@ async fn list_linked_dir_uniffi<T>(
 	client: Arc<T>,
 	dir: AnyLinkedDir,
 	link: DirPublicLink,
-	callback: Arc<dyn DirContentDownloadProgressCallback>,
+	callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
 ) -> Result<LinkedDirsAndFiles, Error>
 where
 	T: SharedClient + Send + Sync + 'static,
 {
-	list_linked_dir_inner_generic(client, dir, link, move |downloaded, total| {
-		let callback = Arc::clone(&callback);
-		tokio::task::spawn_blocking(move || {
-			callback.on_progress(downloaded, total);
-		});
-	})
+	list_linked_dir_inner_generic(
+		client,
+		dir,
+		link,
+		callback.map(|cb| {
+			move |downloaded, total| {
+				let callback = Arc::clone(&cb);
+				tokio::task::spawn_blocking(move || {
+					callback.on_progress(downloaded, total);
+				});
+			}
+		}),
+	)
 	.await
 }
 
@@ -842,7 +877,7 @@ impl JsClient {
 		&self,
 		dir: AnyLinkedDir,
 		link: DirPublicLink,
-		callback: Arc<dyn DirContentDownloadProgressCallback>,
+		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
 	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
 	}
@@ -855,7 +890,7 @@ impl UnauthJsClient {
 		&self,
 		dir: AnyLinkedDir,
 		link: DirPublicLink,
-		callback: Arc<dyn DirContentDownloadProgressCallback>,
+		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
 	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
 	}
@@ -873,25 +908,30 @@ where
 {
 	use crate::runtime;
 	use wasm_bindgen::JsValue;
-	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
-	runtime::spawn_local(async move {
-		while let Some((downloaded, total)) = receiver.recv().await {
-			let _ = callback.call2(
-				&JsValue::UNDEFINED,
-				&JsValue::from_f64(downloaded as f64),
-				&match total {
-					Some(v) => JsValue::from_f64(v as f64),
-					None => JsValue::UNDEFINED,
-				},
-			);
-		}
-	});
+	let callback = if callback.is_undefined() {
+		None
+	} else {
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
-	list_linked_dir_inner_generic(client, dir, link, move |downloaded, total| {
-		let _ = sender.send((downloaded, total));
-	})
-	.await
+		runtime::spawn_local(async move {
+			while let Some((downloaded, total)) = receiver.recv().await {
+				let _ = callback.call2(
+					&JsValue::UNDEFINED,
+					&JsValue::from_f64(downloaded as f64),
+					&match total {
+						Some(v) => JsValue::from_f64(v as f64),
+						None => JsValue::UNDEFINED,
+					},
+				);
+			}
+		});
+		Some(move |downloaded, total| {
+			let _ = sender.send((downloaded, total));
+		})
+	};
+
+	list_linked_dir_inner_generic(client, dir, link, callback).await
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -903,7 +943,7 @@ impl JsClient {
 		dir: AnyLinkedDir,
 		link: DirPublicLink,
 		#[wasm_bindgen(
-			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
 		)]
 		callback: web_sys::js_sys::Function,
 	) -> Result<LinkedDirsAndFiles, Error> {
@@ -920,7 +960,7 @@ impl UnauthJsClient {
 		dir: AnyLinkedDir,
 		link: DirPublicLink,
 		#[wasm_bindgen(
-			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void"
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
 		)]
 		callback: web_sys::js_sys::Function,
 	) -> Result<LinkedDirsAndFiles, Error> {

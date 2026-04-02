@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use filen_types::fs::ParentUuid;
+use filen_types::fs::{ParentUuid, UuidStr};
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
@@ -52,62 +52,7 @@ impl CategoryFS for Normal {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		let response = api::v3::dir::download::post_large(
-			client.client(),
-			&api::v3::dir::download::Request {
-				uuid: ParentUuid::Uuid(*parent.uuid()),
-				skip_cache: false,
-			},
-			progress,
-		)
-		.await?;
-
-		let crypter = client.crypter();
-
-		do_cpu_intensive(|| {
-			let (dirs, files) = blocking_join!(
-				|| response
-					.dirs
-					.into_maybe_par_iter()
-					.filter_map(|response_dir| {
-						Some(RemoteDirectory::blocking_from_encrypted(
-							response_dir.uuid,
-							match response_dir.parent {
-								// the request returns the base dir for the request as one of its dirs, we filter it out here
-								None => return None,
-								Some(parent) => parent,
-							},
-							response_dir.color,
-							response_dir.favorited,
-							response_dir.timestamp,
-							response_dir.meta,
-							&*crypter,
-						))
-					})
-					.collect::<Vec<_>>(),
-				|| response
-					.files
-					.into_maybe_par_iter()
-					.map(|f| {
-						let meta =
-							FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
-							f.uuid,
-							f.parent,
-							f.chunks_size,
-							f.chunks,
-							f.region,
-							f.bucket,
-							f.timestamp,
-							f.favorited,
-							meta,
-						))
-					})
-					.collect::<Result<Vec<_>, _>>()
-			);
-			Ok((dirs, files?))
-		})
-		.await
+		list_recursive_parent_uuid(client, *parent.uuid(), progress).await
 	}
 
 	async fn dir_size(
@@ -141,6 +86,71 @@ impl CategoryFS for Normal {
 				dirs: resp.dirs,
 			})
 	}
+}
+
+pub(crate) async fn list_recursive_parent_uuid<F>(
+	client: &Client,
+	parent_uuid: UuidStr,
+	progress: Option<&F>,
+) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
+where
+	F: Fn(u64, Option<u64>) + Send + Sync,
+{
+	let response = api::v3::dir::download::post_large(
+		client.client(),
+		&api::v3::dir::download::Request {
+			uuid: ParentUuid::Uuid(parent_uuid),
+			skip_cache: false,
+		},
+		progress,
+	)
+	.await?;
+
+	let crypter = client.crypter();
+
+	do_cpu_intensive(|| {
+		let (dirs, files) = blocking_join!(
+			|| response
+				.dirs
+				.into_maybe_par_iter()
+				.filter_map(|response_dir| {
+					Some(RemoteDirectory::blocking_from_encrypted(
+						response_dir.uuid,
+						match response_dir.parent {
+							// the request returns the base dir for the request as one of its dirs, we filter it out here
+							None => return None,
+							Some(parent) => parent,
+						},
+						response_dir.color,
+						response_dir.favorited,
+						response_dir.timestamp,
+						response_dir.meta,
+						&*crypter,
+					))
+				})
+				.collect::<Vec<_>>(),
+			|| response
+				.files
+				.into_maybe_par_iter()
+				.map(|f| {
+					let meta = FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
+					Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+						f.uuid,
+						f.parent,
+						f.chunks_size,
+						f.chunks,
+						f.region,
+						f.bucket,
+						f.timestamp,
+						f.favorited,
+						meta,
+					))
+				})
+				.collect::<Result<Vec<_>, _>>()
+		);
+		Ok((dirs, files?))
+	})
+	.await
 }
 
 pub(crate) async fn list_parent_uuid<F>(
