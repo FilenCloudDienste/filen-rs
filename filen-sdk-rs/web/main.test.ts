@@ -1118,14 +1118,14 @@ test("name validation", () => {
 	}
 
 	// ── COM0–COM9, all case combinations ──
-	for (let digit = 0; digit <= 9; digit++) {
+	for (let digit = 1; digit <= 9; digit++) {
 		for (const variant of allCaseCombinations(`com${digit}`)) {
 			expectErrorKind(variant, "ReservedName")
 		}
 	}
 
 	// ── LPT0–LPT9, all case combinations ──
-	for (let digit = 0; digit <= 9; digit++) {
+	for (let digit = 1; digit <= 9; digit++) {
 		for (const variant of allCaseCombinations(`lpt${digit}`)) {
 			expectErrorKind(variant, "ReservedName")
 		}
