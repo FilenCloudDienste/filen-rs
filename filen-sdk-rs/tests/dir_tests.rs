@@ -537,6 +537,8 @@ async fn dir_search() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
+	let _lock = client.lock_drive().await.unwrap();
+
 	let second_dir = client
 		.create_dir(&test_dir.into(), "second_dir")
 		.await
