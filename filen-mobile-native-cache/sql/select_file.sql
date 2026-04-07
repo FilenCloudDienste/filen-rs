@@ -15,4 +15,4 @@ SELECT
 	files_meta.modified,
 	files_meta.hash
 FROM files LEFT JOIN files_meta ON files.id = files_meta.id
-WHERE files.id = ? LIMIT 1;
+WHERE files.id = ?;

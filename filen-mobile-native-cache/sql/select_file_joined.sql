@@ -21,4 +21,4 @@ SELECT
 FROM items
 INNER JOIN files ON items.id = files.i
 LEFT JOIN files_meta ON items.id = files_meta.id
-WHERE items.uuid = ? LIMIT 1;
+WHERE items.uuid = ?;

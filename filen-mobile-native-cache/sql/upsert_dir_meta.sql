@@ -7,5 +7,5 @@ INSERT INTO dirs_meta (
 	?,
 	?
 ) ON CONFLICT (id) DO UPDATE SET
-name = excluded.name,
-created = excluded.created;
+	name = excluded.name,
+	created = excluded.created;

@@ -3,5 +3,5 @@ INSERT INTO roots (
 ) VALUES (
 	?
 ) ON CONFLICT (id) DO UPDATE SET
-id = id
+	id = id
 RETURNING storage_used, max_storage, last_updated;

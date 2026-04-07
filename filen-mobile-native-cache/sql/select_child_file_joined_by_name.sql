@@ -21,4 +21,4 @@ SELECT
 FROM items
 INNER JOIN files ON items.id = files.id
 LEFT JOIN files_meta ON items.id = files_meta.id
-WHERE items.parent = ? AND files.name = ? LIMIT 1;
+WHERE items.parent = ? AND files.name = ?;

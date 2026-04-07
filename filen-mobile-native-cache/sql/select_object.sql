@@ -37,5 +37,4 @@ LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 LEFT JOIN files ON items.id = files.id
 LEFT JOIN files_meta ON items.id = files_meta.id
 LEFT JOIN roots ON items.id = roots.id
-WHERE items.uuid = ?
-LIMIT 1;
+WHERE items.uuid = ?;

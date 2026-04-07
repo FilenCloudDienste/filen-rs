@@ -5,4 +5,4 @@ SELECT
 	local_data,
 	type
 FROM items
-WHERE uuid = ? LIMIT 1;
+WHERE uuid = ?;

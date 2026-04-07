@@ -107,8 +107,8 @@ AFTER UPDATE OF uuid ON items
 FOR EACH ROW
 WHEN old.uuid != new.uuid AND old.type != 2 -- Ensure it's not a file
 BEGIN
-DELETE FROM items
-WHERE parent = old.uuid AND parent_path IS NULL;
+	DELETE FROM items
+	WHERE parent = old.uuid AND parent_path IS NULL;
 END;
 
 CREATE TRIGGER cascade_on_delete_delete_children
@@ -116,6 +116,6 @@ AFTER DELETE ON items
 FOR EACH ROW
 WHEN old.type != 2 -- Ensure it's not a file
 BEGIN
-DELETE FROM items
-WHERE parent = old.uuid AND parent_path IS NULL;
+	DELETE FROM items
+	WHERE parent = old.uuid AND parent_path IS NULL;
 END;

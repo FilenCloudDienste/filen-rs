@@ -56,10 +56,10 @@ VALUES (
 	) -- is_recent
 )
 ON CONFLICT (id) DO UPDATE SET
-uuid = excluded.uuid,
-parent = excluded.parent,
-local_data = excluded.local_data,
-type = excluded.type,
-is_recent = excluded.is_recent,
-is_stale = FALSE
+	uuid = excluded.uuid,
+	parent = excluded.parent,
+	local_data = excluded.local_data,
+	type = excluded.type,
+	is_recent = excluded.is_recent,
+	is_stale = FALSE
 RETURNING id, local_data;
