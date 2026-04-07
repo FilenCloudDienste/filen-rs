@@ -345,6 +345,12 @@ impl ListenerManagerExt for ConnectedListenerManager {
 			ListenerManagerExtInner::remove_listener(self, id);
 		} else if let Ok(()) = cancel_receiver.try_recv() {
 			ListenerManagerExtInner::remove_listener(self, id);
+		} else if let Some(cb) = self.callbacks().get(&id) {
+			// Socket is already authenticated — replay authSuccess to the new listener
+			// so it doesn't have to special-case whether it was added before or after auth.
+			cb(&DecryptedSocketEvent::new_without_id(
+				DecryptedSocketEventType::AuthSuccess,
+			));
 		}
 	}
 
