@@ -14,12 +14,14 @@ mod traits;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod wasm;
 
-use thread_handling::ListenerHandle;
 use traits::EventListenerCallback;
 
 pub(crate) use thread_handling::WebSocketHandle;
 
-pub use events::DecryptedSocketEventType;
+pub use {
+	events::{DecryptedSocketEvent, DecryptedSocketEventType},
+	thread_handling::ListenerHandle,
+};
 
 impl Client {
 	pub async fn add_event_listener(

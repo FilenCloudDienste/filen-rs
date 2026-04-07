@@ -21,6 +21,8 @@ use crate::{
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
+#[cfg(feature = "cache")]
+pub mod cache;
 pub mod client_impl;
 pub mod enums;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]

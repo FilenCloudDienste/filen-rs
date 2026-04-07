@@ -19,6 +19,7 @@ wasm-full = ["multi-threaded-crypto"]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 http-provider = ["dep:axum", "dep:axum-extra"]
+cache = []
 
 [dependencies]
 reqwest = { version = "0.12.22", features = [

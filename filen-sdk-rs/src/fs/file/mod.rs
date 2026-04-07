@@ -24,6 +24,8 @@ use crate::{
 
 use super::{HasMeta, HasName, HasParent, HasRemoteInfo, HasType, HasUUID};
 
+#[cfg(feature = "cache")]
+pub mod cache;
 pub(crate) mod chunk;
 pub mod client_impl;
 pub mod enums;

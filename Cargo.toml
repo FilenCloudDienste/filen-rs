@@ -13,6 +13,7 @@ members = [
 	"filen-cli",
 	"filen-rclone-wrapper",
 	"filen-sync-core",
+	"filen-cache",
 ]
 
 [profile.test]
