@@ -259,7 +259,9 @@ pub async fn set_up_contact_no_add<'a>(
 			while (futures.next().await).is_some() {}
 		}
 	);
-	tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+	if std::env::var("SHORT_CONTACT_SETUP").as_deref() != Ok("1") {
+		tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+	}
 	let (out_dirs, _) = client
 		.list_out_shared(None, None::<&fn(u64, Option<u64>)>)
 		.await
