@@ -125,7 +125,7 @@ impl<'a> FileMeta<'a> {
 		let Ok(meta) = seed.deserialize(&mut serde_json::Deserializer::from_str(&decrypted)) else {
 			return Self::DecryptedUTF8(Cow::Owned(decrypted));
 		};
-		Self::Decoded(meta.into_owned())
+		Self::Decoded(meta.into_owned_cow())
 	}
 
 	pub fn blocking_from_rsa_encrypted(
@@ -145,7 +145,7 @@ impl<'a> FileMeta<'a> {
 				Err(err) => return Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
 			}
 		};
-		Self::Decoded(meta.into_owned())
+		Self::Decoded(meta.into_owned_cow())
 	}
 }
 
@@ -210,18 +210,6 @@ pub struct DecryptedFileMeta<'a> {
 }
 
 impl<'a> DecryptedFileMeta<'a> {
-	pub fn into_owned(self) -> DecryptedFileMeta<'static> {
-		DecryptedFileMeta {
-			name: Cow::Owned(self.name.into_owned()),
-			size: self.size,
-			mime: Cow::Owned(self.mime.into_owned()),
-			key: Cow::Owned(self.key.into_owned()),
-			last_modified: self.last_modified,
-			created: self.created,
-			hash: self.hash,
-		}
-	}
-
 	fn apply_changes(&mut self, changes: FileMetaChanges) {
 		if let Some(name) = changes.name {
 			// don't need to check for empty name here,
