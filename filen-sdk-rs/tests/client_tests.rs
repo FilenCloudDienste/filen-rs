@@ -14,7 +14,7 @@ use filen_sdk_rs::{
 	auth::{Client, TwoFASecret, http::ClientConfig, unauth::UnauthClient},
 	fs::{HasName, HasUUID},
 	io::client_impl::IoSharedClientExt,
-	socket::DecryptedSocketEventType,
+	socket::{DecryptedGeneralEvent, DecryptedSocketEvent},
 };
 use filen_types::traits::CowHelpersExt;
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -408,7 +408,15 @@ fn register_and_reset_password_no_export() {
 
 		await_event(
 			&mut receiver,
-			|e| matches!(e.inner(), DecryptedSocketEventType::PasswordChanged),
+			|e| {
+				matches!(
+					e,
+					DecryptedSocketEvent::General {
+						inner: DecryptedGeneralEvent::PasswordChanged,
+						..
+					}
+				)
+			},
 			Duration::from_secs(10),
 			"password changed event",
 		)

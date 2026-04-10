@@ -23,164 +23,240 @@ use crate::{
 	socket::events::{ChatConversationParticipantNew, DecryptedSocketEvent},
 };
 
-use crate::socket::events::DecryptedSocketEventType;
+use crate::socket::events::{
+	DecryptedChatEvent, DecryptedContactEvent, DecryptedDriveEvent, DecryptedGeneralEvent,
+	DecryptedNoteEvent,
+};
+
+#[js_type(export, no_deser, tagged)]
+pub enum SocketEvent {
+	AuthSuccess,
+	AuthFailed,
+	Reconnecting,
+	Unsubscribed,
+	Drive(DriveSocketEvent),
+	Chat(ChatSocketEvent),
+	Note(NoteSocketEvent),
+	Contact(ContactSocketEvent),
+	General(GeneralSocketEvent),
+}
 
 #[js_type(export, no_deser)]
-pub struct SocketEvent {
-	pub inner: SocketEventType,
-	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint | null"))]
-	pub global_message_id: Option<u64>,
+pub struct DriveSocketEvent {
+	pub inner: DriveEvent,
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub drive_message_id: u64,
+}
+
+#[js_type(export, no_deser)]
+pub struct ChatSocketEvent {
+	pub inner: ChatEvent,
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub chat_message_id: u64,
+}
+
+#[js_type(export, no_deser)]
+pub struct NoteSocketEvent {
+	pub inner: NoteEvent,
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub note_message_id: u64,
+}
+
+#[js_type(export, no_deser)]
+pub struct ContactSocketEvent {
+	pub inner: ContactEvent,
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub contact_message_id: u64,
+}
+
+#[js_type(export, no_deser)]
+pub struct GeneralSocketEvent {
+	pub inner: GeneralEvent,
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub general_message_id: u64,
 }
 
 #[js_type(export, no_deser, tagged)]
-pub enum SocketEventType {
-	/// Sent after successful authentication, including on reconnect
-	AuthSuccess,
-	/// Sent after failed authentication, including on reconnect, after which the socket is closed and all listeners removed
-	AuthFailed,
-	/// Sent when the socket has unexpectedly closed and begins attempting to reconnect
-	Reconnecting,
-	/// Sent when the handle to the event listener has been dropped and the listener is removed
-	Unsubscribed,
-	NewEvent(NewEvent),
-	FileRename(FileRename),
-	FileArchiveRestored(FileArchiveRestored),
+pub enum DriveEvent {
 	FileNew(FileNew),
 	FileRestore(FileRestore),
 	FileMove(FileMove),
 	FileTrash(FileTrash),
 	FileArchived(FileArchived),
-	FolderRename(FolderRename),
-	FolderTrash(FolderTrash),
-	FolderMove(FolderMove),
+	FileArchiveRestored(FileArchiveRestored),
+	FileDeletedPermanent(FileDeletedPermanent),
+	FileMetadataChanged(FileMetadataChanged),
 	FolderSubCreated(FolderSubCreated),
+	FolderMove(FolderMove),
+	FolderTrash(FolderTrash),
 	FolderRestore(FolderRestore),
 	FolderColorChanged(FolderColorChanged),
-	TrashEmpty,
-	PasswordChanged,
-	ChatMessageNew(ChatMessageNew),
-	ChatTyping(ChatTyping),
-	ChatConversationsNew(ChatConversationsNew),
-	ChatMessageDelete(ChatMessageDelete),
-	NoteContentEdited(NoteContentEdited),
-	NoteArchived(NoteArchived),
-	NoteDeleted(NoteDeleted),
-	NoteTitleEdited(NoteTitleEdited),
-	NoteParticipantPermissions(NoteParticipantPermissions),
-	NoteRestored(NoteRestored),
-	NoteParticipantRemoved(NoteParticipantRemoved),
-	NoteParticipantNew(NoteParticipantNew),
-	NoteNew(NoteNew),
-	ChatMessageEmbedDisabled(ChatMessageEmbedDisabled),
-	ChatConversationParticipantLeft(ChatConversationParticipantLeft),
-	ChatConversationDeleted(ChatConversationDeleted),
-	ChatMessageEdited(ChatMessageEdited),
-	ChatConversationNameEdited(ChatConversationNameEdited),
-	ContactRequestReceived(ContactRequestReceived),
-	ItemFavorite(ItemFavorite),
-	ChatConversationParticipantNew(ChatConversationParticipantNew),
-	FileDeletedPermanent(FileDeletedPermanent),
 	FolderMetadataChanged(FolderMetadataChanged),
 	FolderDeletedPermanent(FolderDeletedPermanent),
-	FileMetadataChanged(FileMetadataChanged),
+	ItemFavorite(ItemFavorite),
+	TrashEmpty,
+	DeleteAll,
+	DeleteVersioned,
+}
+
+#[js_type(export, no_deser, tagged)]
+pub enum ChatEvent {
+	MessageNew(ChatMessageNew),
+	Typing(ChatTyping),
+	ConversationsNew(ChatConversationsNew),
+	MessageDelete(ChatMessageDelete),
+	MessageEmbedDisabled(ChatMessageEmbedDisabled),
+	ConversationParticipantLeft(ChatConversationParticipantLeft),
+	ConversationDeleted(ChatConversationDeleted),
+	MessageEdited(ChatMessageEdited),
+	ConversationNameEdited(ChatConversationNameEdited),
+	ConversationParticipantNew(ChatConversationParticipantNew),
+}
+
+#[js_type(export, no_deser, tagged)]
+pub enum NoteEvent {
+	ContentEdited(NoteContentEdited),
+	Archived(NoteArchived),
+	Deleted(NoteDeleted),
+	TitleEdited(NoteTitleEdited),
+	ParticipantPermissions(NoteParticipantPermissions),
+	Restored(NoteRestored),
+	ParticipantRemoved(NoteParticipantRemoved),
+	ParticipantNew(NoteParticipantNew),
+	New(NoteNew),
+}
+
+#[js_type(export, no_deser, tagged)]
+pub enum ContactEvent {
+	ContactRequestReceived(ContactRequestReceived),
+}
+
+#[js_type(export, no_deser, tagged)]
+pub enum GeneralEvent {
+	PasswordChanged,
+	NewEvent(NewEvent),
 }
 
 impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
 	fn from(event: &DecryptedSocketEvent<'_>) -> Self {
-		let event_type = match event.inner() {
-			DecryptedSocketEventType::AuthSuccess => SocketEventType::AuthSuccess,
-			DecryptedSocketEventType::AuthFailed => SocketEventType::AuthFailed,
-			DecryptedSocketEventType::Reconnecting => SocketEventType::Reconnecting,
-			DecryptedSocketEventType::Unsubscribed => SocketEventType::Unsubscribed,
-			DecryptedSocketEventType::NewEvent(e) => SocketEventType::NewEvent(e.into()),
-			DecryptedSocketEventType::FileRename(e) => SocketEventType::FileRename(e.into()),
-			DecryptedSocketEventType::FileArchiveRestored(e) => {
-				SocketEventType::FileArchiveRestored(e.into())
-			}
-			DecryptedSocketEventType::FileNew(e) => SocketEventType::FileNew(e.into()),
-			DecryptedSocketEventType::FileRestore(e) => SocketEventType::FileRestore(e.into()),
-			DecryptedSocketEventType::FileMove(e) => SocketEventType::FileMove(e.into()),
-			DecryptedSocketEventType::FileTrash(e) => SocketEventType::FileTrash(e.clone()),
-			DecryptedSocketEventType::FileArchived(e) => SocketEventType::FileArchived(e.clone()),
-			DecryptedSocketEventType::FolderRename(e) => SocketEventType::FolderRename(e.into()),
-			DecryptedSocketEventType::FolderTrash(e) => SocketEventType::FolderTrash(e.clone()),
-			DecryptedSocketEventType::FolderMove(e) => SocketEventType::FolderMove(e.into()),
-			DecryptedSocketEventType::FolderSubCreated(e) => {
-				SocketEventType::FolderSubCreated(e.into())
-			}
-			DecryptedSocketEventType::FolderRestore(e) => SocketEventType::FolderRestore(e.into()),
-			DecryptedSocketEventType::FolderColorChanged(e) => {
-				SocketEventType::FolderColorChanged(e.into())
-			}
-			DecryptedSocketEventType::TrashEmpty => SocketEventType::TrashEmpty,
-			DecryptedSocketEventType::PasswordChanged => SocketEventType::PasswordChanged,
-			DecryptedSocketEventType::ChatMessageNew(e) => {
-				SocketEventType::ChatMessageNew(e.into())
-			}
-			DecryptedSocketEventType::ChatTyping(e) => SocketEventType::ChatTyping(e.into()),
-			DecryptedSocketEventType::ChatConversationsNew(e) => {
-				SocketEventType::ChatConversationsNew(e.into())
-			}
-			DecryptedSocketEventType::ChatMessageDelete(e) => {
-				SocketEventType::ChatMessageDelete(e.clone())
-			}
-			DecryptedSocketEventType::NoteContentEdited(e) => {
-				SocketEventType::NoteContentEdited(e.into())
-			}
-			DecryptedSocketEventType::NoteArchived(e) => SocketEventType::NoteArchived(e.clone()),
-			DecryptedSocketEventType::NoteDeleted(e) => SocketEventType::NoteDeleted(e.clone()),
-			DecryptedSocketEventType::NoteTitleEdited(e) => {
-				SocketEventType::NoteTitleEdited(e.into())
-			}
-			DecryptedSocketEventType::NoteParticipantPermissions(e) => {
-				SocketEventType::NoteParticipantPermissions(e.clone())
-			}
-			DecryptedSocketEventType::NoteRestored(e) => SocketEventType::NoteRestored(e.clone()),
-			DecryptedSocketEventType::NoteParticipantRemoved(e) => {
-				SocketEventType::NoteParticipantRemoved(e.clone())
-			}
-			DecryptedSocketEventType::NoteParticipantNew(e) => {
-				SocketEventType::NoteParticipantNew(e.into())
-			}
-			DecryptedSocketEventType::NoteNew(e) => SocketEventType::NoteNew(e.into()),
-			DecryptedSocketEventType::ChatMessageEmbedDisabled(e) => {
-				SocketEventType::ChatMessageEmbedDisabled(e.clone())
-			}
-			DecryptedSocketEventType::ChatConversationParticipantLeft(e) => {
-				SocketEventType::ChatConversationParticipantLeft(e.clone())
-			}
-			DecryptedSocketEventType::ChatConversationDeleted(e) => {
-				SocketEventType::ChatConversationDeleted(e.clone())
-			}
-			DecryptedSocketEventType::ChatMessageEdited(e) => {
-				SocketEventType::ChatMessageEdited(e.into())
-			}
-			DecryptedSocketEventType::ChatConversationNameEdited(e) => {
-				SocketEventType::ChatConversationNameEdited(e.into())
-			}
-			DecryptedSocketEventType::ContactRequestReceived(e) => {
-				SocketEventType::ContactRequestReceived(e.into())
-			}
-			DecryptedSocketEventType::ItemFavorite(e) => SocketEventType::ItemFavorite(e.into()),
-			DecryptedSocketEventType::ChatConversationParticipantNew(e) => {
-				SocketEventType::ChatConversationParticipantNew(e.clone())
-			}
-			DecryptedSocketEventType::FileDeletedPermanent(e) => {
-				SocketEventType::FileDeletedPermanent(e.clone())
-			}
-			DecryptedSocketEventType::FolderMetadataChanged(e) => {
-				SocketEventType::FolderMetadataChanged(e.into())
-			}
-			DecryptedSocketEventType::FolderDeletedPermanent(e) => {
-				SocketEventType::FolderDeletedPermanent(e.clone())
-			}
-			DecryptedSocketEventType::FileMetadataChanged(e) => {
-				SocketEventType::FileMetadataChanged(e.into())
-			}
-		};
-		SocketEvent {
-			inner: event_type,
-			global_message_id: event.global_message_id(),
+		match event {
+			DecryptedSocketEvent::AuthSuccess => SocketEvent::AuthSuccess,
+			DecryptedSocketEvent::AuthFailed => SocketEvent::AuthFailed,
+			DecryptedSocketEvent::Reconnecting => SocketEvent::Reconnecting,
+			DecryptedSocketEvent::Unsubscribed => SocketEvent::Unsubscribed,
+			DecryptedSocketEvent::Drive {
+				inner,
+				drive_message_id,
+			} => SocketEvent::Drive(DriveSocketEvent {
+				drive_message_id: *drive_message_id,
+				inner: match inner {
+					DecryptedDriveEvent::FileNew(e) => DriveEvent::FileNew(e.into()),
+					DecryptedDriveEvent::FileRestore(e) => DriveEvent::FileRestore(e.into()),
+					DecryptedDriveEvent::FileMove(e) => DriveEvent::FileMove(e.into()),
+					DecryptedDriveEvent::FileTrash(e) => DriveEvent::FileTrash(e.clone()),
+					DecryptedDriveEvent::FileArchived(e) => DriveEvent::FileArchived(e.clone()),
+					DecryptedDriveEvent::FileArchiveRestored(e) => {
+						DriveEvent::FileArchiveRestored(e.into())
+					}
+					DecryptedDriveEvent::FileDeletedPermanent(e) => {
+						DriveEvent::FileDeletedPermanent(e.clone())
+					}
+					DecryptedDriveEvent::FileMetadataChanged(e) => {
+						DriveEvent::FileMetadataChanged(e.into())
+					}
+					DecryptedDriveEvent::FolderSubCreated(e) => {
+						DriveEvent::FolderSubCreated(e.into())
+					}
+					DecryptedDriveEvent::FolderMove(e) => DriveEvent::FolderMove(e.into()),
+					DecryptedDriveEvent::FolderTrash(e) => DriveEvent::FolderTrash(e.clone()),
+					DecryptedDriveEvent::FolderRestore(e) => DriveEvent::FolderRestore(e.into()),
+					DecryptedDriveEvent::FolderColorChanged(e) => {
+						DriveEvent::FolderColorChanged(e.into())
+					}
+					DecryptedDriveEvent::FolderMetadataChanged(e) => {
+						DriveEvent::FolderMetadataChanged(e.into())
+					}
+					DecryptedDriveEvent::FolderDeletedPermanent(e) => {
+						DriveEvent::FolderDeletedPermanent(e.clone())
+					}
+					DecryptedDriveEvent::ItemFavorite(e) => DriveEvent::ItemFavorite(e.into()),
+					DecryptedDriveEvent::TrashEmpty => DriveEvent::TrashEmpty,
+					DecryptedDriveEvent::DeleteAll => DriveEvent::DeleteAll,
+					DecryptedDriveEvent::DeleteVersioned => DriveEvent::DeleteVersioned,
+				},
+			}),
+			DecryptedSocketEvent::Chat {
+				inner,
+				chat_message_id,
+			} => SocketEvent::Chat(ChatSocketEvent {
+				chat_message_id: *chat_message_id,
+				inner: match inner {
+					DecryptedChatEvent::MessageNew(e) => ChatEvent::MessageNew(e.into()),
+					DecryptedChatEvent::Typing(e) => ChatEvent::Typing(e.into()),
+					DecryptedChatEvent::ConversationsNew(e) => {
+						ChatEvent::ConversationsNew(e.into())
+					}
+					DecryptedChatEvent::MessageDelete(e) => ChatEvent::MessageDelete(e.clone()),
+					DecryptedChatEvent::MessageEmbedDisabled(e) => {
+						ChatEvent::MessageEmbedDisabled(e.clone())
+					}
+					DecryptedChatEvent::ConversationParticipantLeft(e) => {
+						ChatEvent::ConversationParticipantLeft(e.clone())
+					}
+					DecryptedChatEvent::ConversationDeleted(e) => {
+						ChatEvent::ConversationDeleted(e.clone())
+					}
+					DecryptedChatEvent::MessageEdited(e) => ChatEvent::MessageEdited(e.into()),
+					DecryptedChatEvent::ConversationNameEdited(e) => {
+						ChatEvent::ConversationNameEdited(e.into())
+					}
+					DecryptedChatEvent::ConversationParticipantNew(e) => {
+						ChatEvent::ConversationParticipantNew(e.clone())
+					}
+				},
+			}),
+			DecryptedSocketEvent::Note {
+				inner,
+				note_message_id,
+			} => SocketEvent::Note(NoteSocketEvent {
+				note_message_id: *note_message_id,
+				inner: match inner {
+					DecryptedNoteEvent::ContentEdited(e) => NoteEvent::ContentEdited(e.into()),
+					DecryptedNoteEvent::Archived(e) => NoteEvent::Archived(e.clone()),
+					DecryptedNoteEvent::Deleted(e) => NoteEvent::Deleted(e.clone()),
+					DecryptedNoteEvent::TitleEdited(e) => NoteEvent::TitleEdited(e.into()),
+					DecryptedNoteEvent::ParticipantPermissions(e) => {
+						NoteEvent::ParticipantPermissions(e.clone())
+					}
+					DecryptedNoteEvent::Restored(e) => NoteEvent::Restored(e.clone()),
+					DecryptedNoteEvent::ParticipantRemoved(e) => {
+						NoteEvent::ParticipantRemoved(e.clone())
+					}
+					DecryptedNoteEvent::ParticipantNew(e) => NoteEvent::ParticipantNew(e.into()),
+					DecryptedNoteEvent::New(e) => NoteEvent::New(e.into()),
+				},
+			}),
+			DecryptedSocketEvent::Contact {
+				inner,
+				contact_message_id,
+			} => SocketEvent::Contact(ContactSocketEvent {
+				contact_message_id: *contact_message_id,
+				inner: match inner {
+					DecryptedContactEvent::ContactRequestReceived(e) => {
+						ContactEvent::ContactRequestReceived(e.into())
+					}
+				},
+			}),
+			DecryptedSocketEvent::General {
+				inner,
+				general_message_id,
+			} => SocketEvent::General(GeneralSocketEvent {
+				general_message_id: *general_message_id,
+				inner: match inner {
+					DecryptedGeneralEvent::PasswordChanged => GeneralEvent::PasswordChanged,
+					DecryptedGeneralEvent::NewEvent(e) => GeneralEvent::NewEvent(e.into()),
+				},
+			}),
 		}
 	}
 }
@@ -205,21 +281,6 @@ impl From<&crate::socket::events::NewEvent<'_>> for NewEvent {
 			event_type: event.event_type.to_string(),
 			timestamp: event.timestamp,
 			info: event.info.to_string(),
-		}
-	}
-}
-
-#[js_type]
-pub struct FileRename {
-	pub uuid: UuidStr,
-	pub metadata: FileMeta,
-}
-
-impl From<&crate::socket::events::FileRename<'_>> for FileRename {
-	fn from(event: &crate::socket::events::FileRename<'_>) -> Self {
-		Self {
-			uuid: event.uuid,
-			metadata: event.metadata.as_borrowed_cow().into(),
 		}
 	}
 }
@@ -274,21 +335,6 @@ impl From<&crate::socket::events::FileMove> for FileMove {
 	fn from(event: &crate::socket::events::FileMove) -> Self {
 		Self {
 			file: event.0.clone().into(),
-		}
-	}
-}
-
-#[js_type]
-pub struct FolderRename {
-	pub name: MaybeEncrypted<'static, str>,
-	pub uuid: UuidStr,
-}
-
-impl From<&crate::socket::events::FolderRename<'_>> for FolderRename {
-	fn from(event: &crate::socket::events::FolderRename<'_>) -> Self {
-		Self {
-			name: event.name.to_owned_cow(),
-			uuid: event.uuid,
 		}
 	}
 }
@@ -566,18 +612,14 @@ impl From<&crate::socket::events::FolderMetadataChanged<'_>> for FolderMetadataC
 #[js_type]
 pub struct FileMetadataChanged {
 	pub uuid: UuidStr,
-	pub name: MaybeEncrypted<'static, str>,
 	pub metadata: FileMeta,
-	pub old_metadata: FileMeta,
 }
 
 impl From<&crate::socket::events::FileMetadataChanged<'_>> for FileMetadataChanged {
 	fn from(event: &crate::socket::events::FileMetadataChanged<'_>) -> Self {
 		Self {
 			uuid: event.uuid,
-			name: event.name.to_owned_cow(),
 			metadata: event.metadata.as_borrowed_cow().into(),
-			old_metadata: event.old_metadata.as_borrowed_cow().into(),
 		}
 	}
 }

@@ -212,18 +212,210 @@ impl<'de, E: serde::de::Error> Deserializer<'de> for CowStrDeserializer<'de, E> 
 	}
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawSocketEvent<'a> {
-	#[serde(flatten, borrow)]
-	pub inner: SocketEventType<'a>,
-	pub global_message_id: u64,
+macro_rules! extract_id {
+	($raw:expr, $field:literal) => {{
+		#[derive(Deserialize)]
+		struct ExtractId {
+			#[serde(rename = $field)]
+			id: u64,
+		}
+		serde_json::from_str::<ExtractId>($raw.get()).map(|h| h.id)
+	}};
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventCategory {
+	Drive,
+	Chat,
+	Note,
+	Contact,
+	General,
+}
+
+/// Maps the raw wire event name to its category and the camelCase serde variant name.
+fn classify_event(name: &str) -> Option<(EventCategory, &'static str)> {
+	use EventCategory::*;
+	Some(match name {
+		// Drive events (kebab-case from backend)
+		"file-new" => (Drive, "fileNew"),
+		"file-move" => (Drive, "fileMove"),
+		"file-trash" => (Drive, "fileTrash"),
+		"file-rename" => (Drive, "fileRename"),
+		"file-restore" => (Drive, "fileRestore"),
+		"file-archived" => (Drive, "fileArchived"),
+		"file-archive-restored" => (Drive, "fileArchiveRestored"),
+		"file-deleted-permanent" => (Drive, "fileDeletedPermanent"),
+		"file-metadata-changed" => (Drive, "fileMetadataChanged"),
+		"folder-sub-created" => (Drive, "folderSubCreated"),
+		"folder-move" => (Drive, "folderMove"),
+		"folder-trash" => (Drive, "folderTrash"),
+		"folder-rename" => (Drive, "folderRename"),
+		"folder-restore" => (Drive, "folderRestore"),
+		"folder-color-changed" => (Drive, "folderColorChanged"),
+		"folder-metadata-changed" => (Drive, "folderMetadataChanged"),
+		"folder-deleted-permanent" => (Drive, "folderDeletedPermanent"),
+		"item-favorite" => (Drive, "itemFavorite"),
+		"trash-empty" => (Drive, "trashEmpty"),
+		"deleteAll" => (Drive, "deleteAll"),
+		"deleteVersioned" => (Drive, "deleteVersioned"),
+
+		// Chat events (camelCase from backend)
+		"chatMessageNew" => (Chat, "chatMessageNew"),
+		"chatMessageDelete" => (Chat, "chatMessageDelete"),
+		"chatMessageEdited" => (Chat, "chatMessageEdited"),
+		"chatMessageEmbedDisabled" => (Chat, "chatMessageEmbedDisabled"),
+		"chatTyping" => (Chat, "chatTyping"),
+		"chatConversationsNew" => (Chat, "chatConversationsNew"),
+		"chatConversationDeleted" => (Chat, "chatConversationDeleted"),
+		"chatConversationNameEdited" => (Chat, "chatConversationNameEdited"),
+		"chatConversationParticipantLeft" => (Chat, "chatConversationParticipantLeft"),
+		"chatConversationParticipantNew" => (Chat, "chatConversationParticipantNew"),
+
+		// Note events (camelCase from backend)
+		"noteNew" => (Note, "noteNew"),
+		"noteArchived" => (Note, "noteArchived"),
+		"noteDeleted" => (Note, "noteDeleted"),
+		"noteRestored" => (Note, "noteRestored"),
+		"noteContentEdited" => (Note, "noteContentEdited"),
+		"noteTitleEdited" => (Note, "noteTitleEdited"),
+		"noteParticipantNew" => (Note, "noteParticipantNew"),
+		"noteParticipantRemoved" => (Note, "noteParticipantRemoved"),
+		"noteParticipantPermissions" => (Note, "noteParticipantPermissions"),
+
+		// Contact events
+		"contactRequestReceived" => (Contact, "contactRequestReceived"),
+
+		// General events
+		"new-event" => (General, "newEvent"),
+		"passwordChanged" => (General, "passwordChanged"),
+
+		_ => return None,
+	})
+}
+
+// ── Per-category event enums ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(tag = "enum_type", rename_all = "camelCase")]
+pub enum DriveEventType<'a> {
+	FileArchived(FileArchived),
+	#[serde(borrow)]
+	FileArchiveRestored(FileArchiveRestored<'a>),
+	FileDeletedPermanent(FileDeletedPermanent),
+	#[serde(borrow)]
+	FileMetadataChanged(FileMetadataChanged<'a>),
+	#[serde(borrow)]
+	FileRename(FileRename<'a>),
+	#[serde(borrow)]
+	FileMove(FileMove<'a>),
+	#[serde(borrow)]
+	FileNew(FileNew<'a>),
+	#[serde(borrow)]
+	FileRestore(FileRestore<'a>),
+	FileTrash(FileTrash),
+
+	#[serde(borrow)]
+	FolderRename(FolderRename<'a>),
+	FolderTrash(FolderTrash),
+	#[serde(borrow)]
+	FolderMove(FolderMove<'a>),
+	#[serde(borrow)]
+	FolderSubCreated(FolderSubCreated<'a>),
+	#[serde(borrow)]
+	FolderRestore(FolderRestore<'a>),
+	#[serde(borrow)]
+	FolderColorChanged(FolderColorChanged<'a>),
+	#[serde(borrow)]
+	FolderMetadataChanged(FolderMetadataChanged<'a>),
+	FolderDeletedPermanent(FolderDeletedPermanent),
+
+	#[serde(borrow)]
+	ItemFavorite(ItemFavorite<'a>),
+
+	TrashEmpty,
+	DeleteAll,
+	DeleteVersioned,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(tag = "enum_type", rename_all = "camelCase")]
+#[allow(clippy::large_enum_variant)]
+pub enum ChatEventType<'a> {
+	#[serde(borrow)]
+	ChatMessageNew(ChatMessageNew<'a>),
+	#[serde(borrow)]
+	ChatTyping(ChatTyping<'a>),
+	#[serde(borrow)]
+	ChatConversationsNew(ChatConversationsNew<'a>),
+	ChatMessageDelete(ChatMessageDelete),
+	ChatMessageEmbedDisabled(ChatMessageEmbedDisabled),
+	ChatConversationParticipantLeft(ChatConversationParticipantLeft),
+	ChatConversationDeleted(ChatConversationDeleted),
+	#[serde(borrow)]
+	ChatMessageEdited(ChatMessageEdited<'a>),
+	#[serde(borrow)]
+	ChatConversationNameEdited(ChatConversationNameEdited<'a>),
+	#[serde(borrow)]
+	ChatConversationParticipantNew(ChatConversationParticipantNew<'a>),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(tag = "enum_type", rename_all = "camelCase")]
+pub enum NoteEventType<'a> {
+	NoteArchived(NoteArchived),
+	#[serde(borrow)]
+	NoteContentEdited(NoteContentEdited<'a>),
+	NoteDeleted(NoteDeleted),
+	#[serde(borrow)]
+	NoteTitleEdited(NoteTitleEdited<'a>),
+	NoteParticipantPermissions(NoteParticipantPermissions),
+	NoteRestored(NoteRestored),
+	NoteParticipantRemoved(NoteParticipantRemoved),
+	#[serde(borrow)]
+	NoteParticipantNew(NoteParticipantNew<'a>),
+	#[serde(borrow)]
+	NoteNew(NoteNew<'a>),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(tag = "enum_type", rename_all = "camelCase")]
+pub enum ContactEventType<'a> {
+	#[serde(borrow)]
+	ContactRequestReceived(ContactRequestReceived<'a>),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(tag = "enum_type", rename_all = "camelCase")]
+pub enum GeneralEventType<'a> {
+	PasswordChanged,
+	#[serde(borrow)]
+	NewEvent(NewEvent<'a>),
+}
+
+// ── Top-level event ─────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
-pub struct SocketEvent<'a> {
-	pub inner: SocketEventType<'a>,
-	pub global_message_id: u64,
+pub enum SocketEvent<'a> {
+	Drive {
+		inner: DriveEventType<'a>,
+		drive_message_id: u64,
+	},
+	Chat {
+		inner: ChatEventType<'a>,
+		chat_message_id: u64,
+	},
+	Note {
+		inner: NoteEventType<'a>,
+		note_message_id: u64,
+	},
+	Contact {
+		inner: ContactEventType<'a>,
+		contact_message_id: u64,
+	},
+	General {
+		inner: GeneralEventType<'a>,
+		general_message_id: u64,
+	},
 }
 
 impl<'de> Deserialize<'de> for SocketEvent<'de> {
@@ -236,7 +428,7 @@ impl<'de> Deserialize<'de> for SocketEvent<'de> {
 		impl<'de> serde::de::Visitor<'de> for SocketEventVisitor {
 			type Value = SocketEvent<'de>;
 
-			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+			fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
 				formatter.write_str("a tuple of [event_name, event_data]")
 			}
 
@@ -244,25 +436,79 @@ impl<'de> Deserialize<'de> for SocketEvent<'de> {
 			where
 				A: serde::de::SeqAccess<'de>,
 			{
-				let name = kebab_to_camel(
-					seq.next_element::<CowStrWrapper>()?
-						.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?
-						.0,
-				);
+				let event_name: CowStrWrapper = seq
+					.next_element()?
+					.ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
 				let raw: &'de RawValue = seq
 					.next_element()?
 					.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
 
-				let event = RawSocketEvent::deserialize(InjectTagDeserializer {
-					variant: name,
+				let (category, variant) =
+					classify_event(event_name.0.as_ref()).ok_or_else(|| {
+						serde::de::Error::custom(format!(
+							"unknown socket event type: {}",
+							event_name.0
+						))
+					})?;
+				let inject = InjectTagDeserializer {
+					variant: Cow::Borrowed(variant),
 					data: raw,
-				})
-				.map_err(serde::de::Error::custom)?;
+				};
 
-				Ok(SocketEvent {
-					inner: event.inner,
-					global_message_id: event.global_message_id,
-				})
+				let event = match category {
+					EventCategory::Drive => {
+						let inner = DriveEventType::deserialize(inject)
+							.map_err(serde::de::Error::custom)?;
+						let drive_message_id =
+							extract_id!(raw, "driveMessageId").map_err(serde::de::Error::custom)?;
+						SocketEvent::Drive {
+							inner,
+							drive_message_id,
+						}
+					}
+					EventCategory::Chat => {
+						let inner =
+							ChatEventType::deserialize(inject).map_err(serde::de::Error::custom)?;
+						let chat_message_id =
+							extract_id!(raw, "chatMessageId").map_err(serde::de::Error::custom)?;
+						SocketEvent::Chat {
+							inner,
+							chat_message_id,
+						}
+					}
+					EventCategory::Note => {
+						let inner =
+							NoteEventType::deserialize(inject).map_err(serde::de::Error::custom)?;
+						let note_message_id =
+							extract_id!(raw, "noteMessageId").map_err(serde::de::Error::custom)?;
+						SocketEvent::Note {
+							inner,
+							note_message_id,
+						}
+					}
+					EventCategory::Contact => {
+						let inner = ContactEventType::deserialize(inject)
+							.map_err(serde::de::Error::custom)?;
+						let contact_message_id = extract_id!(raw, "contactMessageId")
+							.map_err(serde::de::Error::custom)?;
+						SocketEvent::Contact {
+							inner,
+							contact_message_id,
+						}
+					}
+					EventCategory::General => {
+						let inner = GeneralEventType::deserialize(inject)
+							.map_err(serde::de::Error::custom)?;
+						let general_message_id = extract_id!(raw, "generalMessageId")
+							.map_err(serde::de::Error::custom)?;
+						SocketEvent::General {
+							inner,
+							general_message_id,
+						}
+					}
+				};
+
+				Ok(event)
 			}
 		}
 
@@ -270,143 +516,92 @@ impl<'de> Deserialize<'de> for SocketEvent<'de> {
 	}
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
-#[serde(tag = "enum_type", rename_all = "camelCase")]
-pub enum SocketEventType<'a> {
-	#[serde(borrow)]
-	NewEvent(NewEvent<'a>),
-	#[serde(borrow)]
-	FileRename(FileRename<'a>),
-	#[serde(borrow)]
-	FileArchiveRestored(FileArchiveRestored<'a>),
-	#[serde(borrow)]
-	FileNew(FileNew<'a>),
-	#[serde(borrow)]
-	FileRestore(FileRestore<'a>),
-	#[serde(borrow)]
-	FileMove(FileMove<'a>),
-	FileTrash(FileTrash),
-	FileArchived(FileArchived),
-	#[serde(borrow)]
-	FolderRename(FolderRename<'a>),
-	FolderTrash(FolderTrash),
-	#[serde(borrow)]
-	FolderMove(FolderMove<'a>),
-	#[serde(borrow)]
-	FolderSubCreated(FolderSubCreated<'a>),
-	#[serde(borrow)]
-	FolderRestore(FolderRestore<'a>),
-	#[serde(borrow)]
-	FolderColorChanged(FolderColorChanged<'a>),
-	TrashEmpty,
-	PasswordChanged,
-	#[serde(borrow)]
-	ChatMessageNew(ChatMessageNew<'a>),
-	#[serde(borrow)]
-	ChatTyping(ChatTyping<'a>),
-	#[serde(borrow)]
-	ChatConversationsNew(ChatConversationsNew<'a>),
-	ChatMessageDelete(ChatMessageDelete),
-	#[serde(borrow)]
-	NoteContentEdited(NoteContentEdited<'a>),
-	NoteArchived(NoteArchived),
-	NoteDeleted(NoteDeleted),
-	#[serde(borrow)]
-	NoteTitleEdited(NoteTitleEdited<'a>),
-	NoteParticipantPermissions(NoteParticipantPermissions),
-	NoteRestored(NoteRestored),
-	NoteParticipantRemoved(NoteParticipantRemoved),
-	#[serde(borrow)]
-	NoteParticipantNew(NoteParticipantNew<'a>),
-	#[serde(borrow)]
-	NoteNew(NoteNew<'a>),
-	ChatMessageEmbedDisabled(ChatMessageEmbedDisabled),
-	ChatConversationParticipantLeft(ChatConversationParticipantLeft),
-	ChatConversationDeleted(ChatConversationDeleted),
-	#[serde(borrow)]
-	ChatMessageEdited(ChatMessageEdited<'a>),
-	#[serde(borrow)]
-	ChatConversationNameEdited(ChatConversationNameEdited<'a>),
-	#[serde(borrow)]
-	ContactRequestReceived(ContactRequestReceived<'a>),
-	#[serde(borrow)]
-	ItemFavorite(ItemFavorite<'a>),
-	#[serde(borrow)]
-	ChatConversationParticipantNew(ChatConversationParticipantNew<'a>),
-	FileDeletedPermanent(FileDeletedPermanent),
-	#[serde(borrow)]
-	FolderMetadataChanged(FolderMetadataChanged<'a>),
-	FolderDeletedPermanent(FolderDeletedPermanent),
-	#[serde(borrow)]
-	FileMetadataChanged(FileMetadataChanged<'a>),
-}
-
-fn kebab_to_camel<'a>(event_name: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
-	let mut event_name = event_name.into();
-	let mut curr_idx = 0;
-
-	while let Some(i) = event_name[curr_idx..].find('-') {
-		let mut_string = event_name.to_mut();
-		mut_string.remove(curr_idx + i);
-
-		if mut_string[curr_idx + i..]
-			.chars()
-			.next()
-			.is_some_and(|c| c.is_ascii_lowercase())
-		{
-			mut_string[curr_idx + i..=curr_idx + i].make_ascii_uppercase();
-		}
-		curr_idx += i;
-	}
-	event_name
-}
-
-impl SocketEventType<'_> {
+impl DriveEventType<'_> {
 	pub fn event_type(&self) -> &'static str {
 		match self {
-			SocketEventType::NewEvent(_) => "newEvent",
-			SocketEventType::FileRename(_) => "fileRename",
-			SocketEventType::FileArchiveRestored(_) => "fileArchiveRestored",
-			SocketEventType::FileNew(_) => "fileNew",
-			SocketEventType::FileRestore(_) => "fileRestore",
-			SocketEventType::FileMove(_) => "fileMove",
-			SocketEventType::FileTrash(_) => "fileTrash",
-			SocketEventType::FileArchived(_) => "fileArchived",
-			SocketEventType::FolderRename(_) => "folderRename",
-			SocketEventType::FolderTrash(_) => "folderTrash",
-			SocketEventType::FolderMove(_) => "folderMove",
-			SocketEventType::FolderSubCreated(_) => "folderSubCreated",
-			SocketEventType::FolderRestore(_) => "folderRestore",
-			SocketEventType::FolderColorChanged(_) => "folderColorChanged",
-			SocketEventType::TrashEmpty => "trashEmpty",
-			SocketEventType::PasswordChanged => "passwordChanged",
-			SocketEventType::ChatMessageNew(_) => "chatMessageNew",
-			SocketEventType::ChatTyping(_) => "chatTyping",
-			SocketEventType::ChatConversationsNew(_) => "chatConversationsNew",
-			SocketEventType::ChatMessageDelete(_) => "chatMessageDelete",
-			SocketEventType::NoteContentEdited(_) => "noteContentEdited",
-			SocketEventType::NoteArchived(_) => "noteArchived",
-			SocketEventType::NoteDeleted(_) => "noteDeleted",
-			SocketEventType::NoteTitleEdited(_) => "noteTitleEdited",
-			SocketEventType::NoteParticipantPermissions(_) => "noteParticipantPermissions",
-			SocketEventType::NoteRestored(_) => "noteRestored",
-			SocketEventType::NoteParticipantRemoved(_) => "noteParticipantRemoved",
-			SocketEventType::NoteParticipantNew(_) => "noteParticipantNew",
-			SocketEventType::NoteNew(_) => "noteNew",
-			SocketEventType::ChatMessageEmbedDisabled(_) => "chatMessageEmbedDisabled",
-			SocketEventType::ChatConversationParticipantLeft(_) => {
-				"chatConversationParticipantLeft"
-			}
-			SocketEventType::ChatConversationDeleted(_) => "chatConversationDeleted",
-			SocketEventType::ChatMessageEdited(_) => "chatMessageEdited",
-			SocketEventType::ChatConversationNameEdited(_) => "chatConversationNameEdited",
-			SocketEventType::ContactRequestReceived(_) => "contactRequestReceived",
-			SocketEventType::ItemFavorite(_) => "itemFavorite",
-			SocketEventType::ChatConversationParticipantNew(_) => "chatConversationParticipantNew",
-			SocketEventType::FileDeletedPermanent(_) => "fileDeletedPermanent",
-			SocketEventType::FolderMetadataChanged(_) => "folderMetadataChanged",
-			SocketEventType::FolderDeletedPermanent(_) => "folderDeletedPermanent",
-			SocketEventType::FileMetadataChanged(_) => "fileMetadataChanged",
+			Self::FileArchived(_) => "fileArchived",
+			Self::FileArchiveRestored(_) => "fileArchiveRestored",
+			Self::FileDeletedPermanent(_) => "fileDeletedPermanent",
+			Self::FileMetadataChanged(_) => "fileMetadataChanged",
+			Self::FileRename(_) => "fileRename",
+			Self::FileMove(_) => "fileMove",
+			Self::FileNew(_) => "fileNew",
+			Self::FileRestore(_) => "fileRestore",
+			Self::FileTrash(_) => "fileTrash",
+			Self::FolderRename(_) => "folderRename",
+			Self::FolderTrash(_) => "folderTrash",
+			Self::FolderMove(_) => "folderMove",
+			Self::FolderSubCreated(_) => "folderSubCreated",
+			Self::FolderRestore(_) => "folderRestore",
+			Self::FolderColorChanged(_) => "folderColorChanged",
+			Self::FolderMetadataChanged(_) => "folderMetadataChanged",
+			Self::FolderDeletedPermanent(_) => "folderDeletedPermanent",
+			Self::ItemFavorite(_) => "itemFavorite",
+			Self::TrashEmpty => "trashEmpty",
+			Self::DeleteAll => "deleteAll",
+			Self::DeleteVersioned => "deleteVersioned",
+		}
+	}
+}
+
+impl ChatEventType<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::ChatMessageNew(_) => "chatMessageNew",
+			Self::ChatTyping(_) => "chatTyping",
+			Self::ChatConversationsNew(_) => "chatConversationsNew",
+			Self::ChatMessageDelete(_) => "chatMessageDelete",
+			Self::ChatMessageEmbedDisabled(_) => "chatMessageEmbedDisabled",
+			Self::ChatConversationParticipantLeft(_) => "chatConversationParticipantLeft",
+			Self::ChatConversationDeleted(_) => "chatConversationDeleted",
+			Self::ChatMessageEdited(_) => "chatMessageEdited",
+			Self::ChatConversationNameEdited(_) => "chatConversationNameEdited",
+			Self::ChatConversationParticipantNew(_) => "chatConversationParticipantNew",
+		}
+	}
+}
+
+impl NoteEventType<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::NoteArchived(_) => "noteArchived",
+			Self::NoteContentEdited(_) => "noteContentEdited",
+			Self::NoteDeleted(_) => "noteDeleted",
+			Self::NoteTitleEdited(_) => "noteTitleEdited",
+			Self::NoteParticipantPermissions(_) => "noteParticipantPermissions",
+			Self::NoteRestored(_) => "noteRestored",
+			Self::NoteParticipantRemoved(_) => "noteParticipantRemoved",
+			Self::NoteParticipantNew(_) => "noteParticipantNew",
+			Self::NoteNew(_) => "noteNew",
+		}
+	}
+}
+
+impl ContactEventType<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::ContactRequestReceived(_) => "contactRequestReceived",
+		}
+	}
+}
+
+impl GeneralEventType<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::PasswordChanged => "passwordChanged",
+			Self::NewEvent(_) => "newEvent",
+		}
+	}
+}
+
+impl SocketEvent<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::Drive { inner, .. } => inner.event_type(),
+			Self::Chat { inner, .. } => inner.event_type(),
+			Self::Note { inner, .. } => inner.event_type(),
+			Self::Contact { inner, .. } => inner.event_type(),
+			Self::General { inner, .. } => inner.event_type(),
 		}
 	}
 }
@@ -417,7 +612,8 @@ impl SocketEventType<'_> {
 	not(feature = "service-worker")
 ))]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
-const TS_SOCKET_EVENT_TYPE: &str = r#"export type SocketEventTypeNames = SocketEvent["type"]"#;
+const TS_SOCKET_EVENT_TYPE: &str =
+	r#"export type SocketEventTypeNames = SocketEventCategory["type"]"#;
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
@@ -1046,17 +1242,72 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn camelify_name_from_kebab() {
-		assert_eq!(kebab_to_camel("file-rename"), "fileRename");
+	fn classify_known_events() {
 		assert_eq!(
-			kebab_to_camel("file-archive-restored"),
-			"fileArchiveRestored"
+			classify_event("file-new"),
+			Some((EventCategory::Drive, "fileNew"))
 		);
-		assert_eq!(kebab_to_camel("auth-success"), "authSuccess");
-		assert_eq!(kebab_to_camel("simpleevent"), "simpleevent");
-		assert_eq!(kebab_to_camel("simpleEvent"), "simpleEvent");
-		assert_eq!(kebab_to_camel("-----"), "");
-		assert_eq!(kebab_to_camel("-----a"), "A");
-		assert_eq!(kebab_to_camel("-----aaa"), "Aaa");
+		assert_eq!(
+			classify_event("chatMessageNew"),
+			Some((EventCategory::Chat, "chatMessageNew"))
+		);
+		assert_eq!(
+			classify_event("noteArchived"),
+			Some((EventCategory::Note, "noteArchived"))
+		);
+		assert_eq!(
+			classify_event("contactRequestReceived"),
+			Some((EventCategory::Contact, "contactRequestReceived"))
+		);
+		assert_eq!(
+			classify_event("new-event"),
+			Some((EventCategory::General, "newEvent"))
+		);
+		assert_eq!(classify_event("unknown-event"), None);
+	}
+
+	#[test]
+	fn deserialize_drive_event() {
+		let json = r#"["file-new",{"driveMessageId":42,"parent":"00000000-0000-0000-0000-000000000000","uuid":"11111111-1111-1111-1111-111111111111","metadata":"encrypted","timestamp":1700000,"chunks":1,"size":100,"bucket":"b","region":"r","version":2,"favorited":0}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		assert!(matches!(
+			event,
+			SocketEvent::Drive {
+				drive_message_id: 42,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn deserialize_chat_event() {
+		let json = r#"["chatMessageDelete",{"chatMessageId":7,"uuid":"11111111-1111-1111-1111-111111111111"}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		assert!(matches!(
+			event,
+			SocketEvent::Chat {
+				chat_message_id: 7,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn deserialize_general_event() {
+		let json = r#"["passwordChanged",{"generalMessageId":1}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		assert!(matches!(
+			event,
+			SocketEvent::General {
+				general_message_id: 1,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn deserialize_unknown_event_fails() {
+		let json = r#"["unknown-event",{"messageId":1}]"#;
+		assert!(serde_json::from_str::<SocketEvent>(json).is_err());
 	}
 }

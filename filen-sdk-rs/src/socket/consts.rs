@@ -27,5 +27,4 @@ pub(super) const WEBSOCKET_URL_CORE: &str =
 	"wss://socket.filen.io/socket.io/?EIO=3&transport=websocket&t=";
 
 pub(super) const AUTHED_TRUE: &str = r#"["authed",true]"#;
-pub(super) const VERSIONED_EVENT_PREFIXES: &[&str] =
-	&[r#"["file-versioned","#, r#"["fileVersioned","#];
+pub(super) const VERSIONED_EVENT_PREFIXES: &[&str] = &[r#"["file-versioned","#];

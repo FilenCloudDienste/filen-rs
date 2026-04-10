@@ -19,7 +19,10 @@ use traits::EventListenerCallback;
 pub(crate) use thread_handling::WebSocketHandle;
 
 pub use {
-	events::{DecryptedSocketEvent, DecryptedSocketEventType},
+	events::{
+		DecryptedChatEvent, DecryptedContactEvent, DecryptedDriveEvent, DecryptedGeneralEvent,
+		DecryptedNoteEvent, DecryptedSocketEvent,
+	},
 	thread_handling::ListenerHandle,
 };
 

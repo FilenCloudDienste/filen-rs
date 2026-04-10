@@ -9,7 +9,10 @@ use filen_sdk_rs::{
 		dir::meta::DirectoryMetaChanges,
 		file::meta::{FileMeta, FileMetaChanges},
 	},
-	socket::DecryptedSocketEventType,
+	socket::{
+		DecryptedChatEvent, DecryptedContactEvent, DecryptedDriveEvent, DecryptedNoteEvent,
+		DecryptedSocketEvent,
+	},
 };
 use filen_types::{
 	api::v3::{chat::typing::ChatTypingType, dir::color::DirColor},
@@ -35,7 +38,7 @@ async fn test_websocket_auth() {
 		.unwrap();
 	await_event(
 		&mut events_receiver,
-		|event| *event.inner() == DecryptedSocketEventType::AuthSuccess,
+		|event| *event == DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(20),
 		"authSuccess",
 	)
@@ -69,7 +72,7 @@ async fn test_websocket_event_filtering() {
 
 	await_event(
 		&mut events_receiver,
-		|event| *event.inner() == DecryptedSocketEventType::AuthSuccess,
+		|event| *event == DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(20),
 		"authSuccess",
 	)
@@ -77,7 +80,7 @@ async fn test_websocket_event_filtering() {
 
 	await_not_event(
 		&mut filtered_events_receiver,
-		|event| *event.inner() != DecryptedSocketEventType::AuthSuccess,
+		|event| *event != DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(1),
 	)
 	.await;
@@ -112,7 +115,7 @@ async fn test_websocket_bad_auth() {
 
 	await_event(
 		&mut events_receiver,
-		|event| *event.inner() == DecryptedSocketEventType::AuthFailed,
+		|event| *event == DecryptedSocketEvent::AuthFailed,
 		Duration::from_secs(5),
 		"authFailed",
 	)
@@ -146,8 +149,11 @@ async fn test_websocket_file_events() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FileNew(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileNew(data),
+				..
+			} => {
 				if data.0.uuid == *file_a.uuid() {
 					Some(data)
 				} else {
@@ -166,8 +172,11 @@ async fn test_websocket_file_events() {
 	client.trash_file(&mut file_a).await.unwrap();
 	await_event(
 		&mut receiver,
-		|event| match event.inner() {
-			DecryptedSocketEventType::FileTrash(data) => data.uuid == *file_a.uuid(),
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileTrash(data),
+				..
+			} => data.uuid == *file_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -179,8 +188,11 @@ async fn test_websocket_file_events() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FileRestore(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileRestore(data),
+				..
+			} => {
 				if data.0.uuid == *file_a.uuid() {
 					Some(data)
 				} else {
@@ -209,8 +221,11 @@ async fn test_websocket_file_events() {
 
 	await_event(
 		&mut receiver,
-		|event| match event.inner() {
-			DecryptedSocketEventType::FileArchived(file) => file.uuid == *old_file_a.uuid(),
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileArchived(file),
+				..
+			} => file.uuid == *old_file_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -221,8 +236,11 @@ async fn test_websocket_file_events() {
 	client.set_file_favorite(&mut file_a, true).await.unwrap();
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ItemFavorite(inner) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::ItemFavorite(inner),
+				..
+			} => {
 				if inner.0.uuid() == file_a.uuid() {
 					Some(inner)
 				} else {
@@ -252,12 +270,11 @@ async fn test_websocket_file_events() {
 
 	let mut event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FileArchiveRestored(file)
-				if file.file.uuid() == file_a.uuid() =>
-			{
-				Some(file)
-			}
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileArchiveRestored(file),
+				..
+			} if file.file.uuid() == file_a.uuid() => Some(file),
 			_ => None,
 		},
 		Duration::from_secs(20),
@@ -280,8 +297,11 @@ async fn test_websocket_file_events() {
 
 	await_event(
 		&mut receiver,
-		|event| match event.inner() {
-			DecryptedSocketEventType::FileMetadataChanged(data) => data.uuid == *file_a.uuid(),
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileMetadataChanged(data),
+				..
+			} => data.uuid == *file_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -289,7 +309,6 @@ async fn test_websocket_file_events() {
 	)
 	.await;
 
-	let old_file_a = file_a.clone();
 	let new_name = "file_a_renamed.txt";
 
 	client
@@ -302,8 +321,11 @@ async fn test_websocket_file_events() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FileMetadataChanged(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileMetadataChanged(data),
+				..
+			} => {
 				if data.uuid == *file_a.uuid() {
 					Some(data)
 				} else {
@@ -318,11 +340,6 @@ async fn test_websocket_file_events() {
 	.await;
 
 	assert_eq!(file_a.meta, event.metadata);
-	assert_eq!(old_file_a.meta, event.old_metadata);
-	assert_eq!(
-		MaybeEncrypted::Decrypted(Cow::Borrowed(new_name)),
-		event.name
-	);
 
 	let new_parent = client.create_dir(&dir.into(), "move_target").await.unwrap();
 
@@ -333,8 +350,11 @@ async fn test_websocket_file_events() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FileMove(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileMove(data),
+				..
+			} => {
 				if data.0.uuid == *file_a.uuid() {
 					Some(data)
 				} else {
@@ -355,8 +375,11 @@ async fn test_websocket_file_events() {
 	client.delete_file_permanently(file_a).await.unwrap();
 	await_event(
 		&mut receiver,
-		|event| match event.inner() {
-			DecryptedSocketEventType::FileDeletedPermanent(data) => data.uuid == uuid,
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileDeletedPermanent(data),
+				..
+			} => data.uuid == uuid,
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -384,8 +407,11 @@ async fn test_websocket_folder_events() {
 	let mut dir_a = client.create_dir(&dir.into(), "a").await.unwrap();
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FolderSubCreated(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderSubCreated(data),
+				..
+			} => {
 				if data.0.uuid == *dir_a.uuid() {
 					Some(data)
 				} else {
@@ -403,8 +429,11 @@ async fn test_websocket_folder_events() {
 	client.trash_dir(&mut dir_a).await.unwrap();
 	await_event(
 		&mut receiver,
-		|event| match event.inner() {
-			DecryptedSocketEventType::FolderTrash(data) => data.uuid == *dir_a.uuid(),
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderTrash(data),
+				..
+			} => data.uuid == *dir_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -415,8 +444,11 @@ async fn test_websocket_folder_events() {
 	client.restore_dir(&mut dir_a).await.unwrap();
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FolderRestore(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderRestore(data),
+				..
+			} => {
 				if data.0.uuid == *dir_a.uuid() {
 					Some(data)
 				} else {
@@ -434,8 +466,11 @@ async fn test_websocket_folder_events() {
 	client.set_dir_favorite(&mut dir_a, true).await.unwrap();
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ItemFavorite(inner) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::ItemFavorite(inner),
+				..
+			} => {
 				if inner.0.uuid() == dir_a.uuid() {
 					Some(inner)
 				} else {
@@ -459,8 +494,11 @@ async fn test_websocket_folder_events() {
 		.unwrap();
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FolderMetadataChanged(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderMetadataChanged(data),
+				..
+			} => {
 				if data.uuid == *dir_a.uuid() {
 					Some(data)
 				} else {
@@ -483,8 +521,11 @@ async fn test_websocket_folder_events() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FolderMove(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderMove(data),
+				..
+			} => {
 				if data.0.uuid == *dir_a.uuid() {
 					Some(data)
 				} else {
@@ -507,8 +548,11 @@ async fn test_websocket_folder_events() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::FolderColorChanged(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderColorChanged(data),
+				..
+			} => {
 				if data.uuid == *dir_a.uuid() {
 					Some(data)
 				} else {
@@ -529,8 +573,11 @@ async fn test_websocket_folder_events() {
 
 	await_event(
 		&mut receiver,
-		|event| match event.inner() {
-			DecryptedSocketEventType::FolderDeletedPermanent(data) => data.uuid == uuid,
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderDeletedPermanent(data),
+				..
+			} => data.uuid == uuid,
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -570,8 +617,11 @@ async fn chat() {
 
 	let event = await_map_event(
 		&mut share_receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ContactRequestReceived(event) => {
+		|event| match event {
+			DecryptedSocketEvent::Contact {
+				inner: DecryptedContactEvent::ContactRequestReceived(event),
+				..
+			} => {
 				if event.sender_email == client.email() {
 					Some(event)
 				} else {
@@ -602,8 +652,11 @@ async fn chat() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ChatConversationsNew(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Chat {
+				inner: DecryptedChatEvent::ConversationsNew(data),
+				..
+			} => {
 				if data.0.uuid() == chat.uuid() {
 					Some(data)
 				} else {
@@ -626,8 +679,11 @@ async fn chat() {
 
 	let share_event = await_map_event(
 		&mut share_receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ChatConversationsNew(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Chat {
+				inner: DecryptedChatEvent::ConversationsNew(data),
+				..
+			} => {
 				if data.0.uuid() == chat.uuid() {
 					Some(data)
 				} else {
@@ -652,8 +708,11 @@ async fn chat() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ChatConversationParticipantNew(data) => {
+		|event| match event {
+			DecryptedSocketEvent::Chat {
+				inner: DecryptedChatEvent::ConversationParticipantNew(data),
+				..
+			} => {
 				if data.chat == chat.uuid() {
 					Some(data)
 				} else {
@@ -676,10 +735,11 @@ async fn chat() {
 
 	let event = await_map_event(
 		&mut share_receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ChatMessageNew(data) if data.0.uuid() == msg.uuid() => {
-				Some(data)
-			}
+		|event| match event {
+			DecryptedSocketEvent::Chat {
+				inner: DecryptedChatEvent::MessageNew(data),
+				..
+			} if data.0.uuid() == msg.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),
@@ -698,10 +758,11 @@ async fn chat() {
 
 	let event = await_map_event(
 		&mut share_receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ChatMessageEdited(data) if data.uuid == *msg.uuid() => {
-				Some(data)
-			}
+		|event| match event {
+			DecryptedSocketEvent::Chat {
+				inner: DecryptedChatEvent::MessageEdited(data),
+				..
+			} if data.uuid == *msg.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),
@@ -721,12 +782,11 @@ async fn chat() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ChatConversationNameEdited(data)
-				if data.chat == chat.uuid() =>
-			{
-				Some(data)
-			}
+		|event| match event {
+			DecryptedSocketEvent::Chat {
+				inner: DecryptedChatEvent::ConversationNameEdited(data),
+				..
+			} if data.chat == chat.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),
@@ -744,8 +804,11 @@ async fn chat() {
 		.unwrap();
 	let event = await_map_event(
 		&mut share_receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::ChatTyping(data) if data.chat == chat.uuid() => Some(data),
+		|event| match event {
+			DecryptedSocketEvent::Chat {
+				inner: DecryptedChatEvent::Typing(data),
+				..
+			} if data.chat == chat.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),
@@ -780,7 +843,7 @@ async fn note() {
 
 	await_event(
 		&mut receiver,
-		|event| matches!(event.inner(), DecryptedSocketEventType::NoteNew(data) if data.note == *note.uuid()),
+		|event| matches!(event, DecryptedSocketEvent::Note { inner: DecryptedNoteEvent::New(data), .. } if data.note == *note.uuid()),
 		Duration::from_secs(10),
 		"noteCreated",
 	)
@@ -788,10 +851,11 @@ async fn note() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::NoteParticipantNew(data) if data.note == *note.uuid() => {
-				Some(data)
-			}
+		|event| match event {
+			DecryptedSocketEvent::Note {
+				inner: DecryptedNoteEvent::ParticipantNew(data),
+				..
+			} if data.note == *note.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),
@@ -808,10 +872,11 @@ async fn note() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::NoteContentEdited(data) if data.note == *note.uuid() => {
-				Some(data)
-			}
+		|event| match event {
+			DecryptedSocketEvent::Note {
+				inner: DecryptedNoteEvent::ContentEdited(data),
+				..
+			} if data.note == *note.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),
@@ -827,7 +892,7 @@ async fn note() {
 	client.archive_note(&mut note).await.unwrap();
 	await_event(
 		&mut receiver,
-		|event| matches!(event.inner(), DecryptedSocketEventType::NoteArchived(data) if data.note == *note.uuid()),
+		|event| matches!(event, DecryptedSocketEvent::Note { inner: DecryptedNoteEvent::Archived(data), .. } if data.note == *note.uuid()),
 		Duration::from_secs(10),
 		"noteArchived",
 	)
@@ -836,7 +901,7 @@ async fn note() {
 	client.restore_note(&mut note).await.unwrap();
 	await_event(
 		&mut receiver,
-		|event| matches!(event.inner(), DecryptedSocketEventType::NoteRestored(data) if data.note == *note.uuid()),
+		|event| matches!(event, DecryptedSocketEvent::Note { inner: DecryptedNoteEvent::Restored(data), .. } if data.note == *note.uuid()),
 		Duration::from_secs(10),
 		"noteRestored",
 	)
@@ -849,10 +914,11 @@ async fn note() {
 
 	let event = await_map_event(
 		&mut receiver,
-		|event| match event.into_inner() {
-			DecryptedSocketEventType::NoteTitleEdited(data) if data.note == *note.uuid() => {
-				Some(data)
-			}
+		|event| match event {
+			DecryptedSocketEvent::Note {
+				inner: DecryptedNoteEvent::TitleEdited(data),
+				..
+			} if data.note == *note.uuid() => Some(data),
 			_ => None,
 		},
 		Duration::from_secs(10),

@@ -17,7 +17,7 @@ use super::{
 		MAX_RECONNECT_DELAY, MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL,
 		RECONNECT_DELAY,
 	},
-	events::DecryptedSocketEventType,
+	events::DecryptedSocketEvent,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
 	traits::*,
 };
@@ -335,12 +335,12 @@ where
 
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
-						if listeners.should_decrypt_event(&event_yoke.get().inner) {
+						if listeners.should_decrypt_event(event_yoke.get()) {
 							decryption_futures.push_back(async move {
 								// this performs unnecessary cloning, ideally we would use an async
 								// yoke try_map_project_async but this does not currently exist
 								// https://github.com/unicode-org/icu4x/issues/7253
-								match DecryptedSocketEventType::try_from_encrypted(crypter, private_key, config.user_id, event_yoke).await {
+								match DecryptedSocketEvent::try_from_encrypted(crypter, private_key, config.user_id, event_yoke).await {
 									Ok(v) => Some(v),
 									Err(e) => {
 										log::error!(

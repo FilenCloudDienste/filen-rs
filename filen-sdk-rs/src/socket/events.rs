@@ -7,10 +7,13 @@ use filen_types::{
 		chat::messages::ChatMessageEncrypted,
 		dir::color::DirColor,
 		notes::NoteType,
-		socket::{MessageType, PacketType, SocketEvent, SocketEventType},
+		socket::{
+			ChatEventType, ContactEventType, DriveEventType, GeneralEventType, MessageType,
+			NoteEventType, PacketType, SocketEvent,
+		},
 	},
 	auth::FileEncryptionVersion,
-	crypto::MaybeEncrypted,
+	crypto::{EncryptedString, MaybeEncrypted},
 	fs::UuidStr,
 	traits::CowHelpers,
 };
@@ -136,146 +139,211 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers, Yokeable)]
-pub struct DecryptedSocketEvent<'a> {
-	inner: DecryptedSocketEventType<'a>,
-	global_message_id: Option<u64>,
+pub enum DecryptedSocketEvent<'a> {
+	// Local events (not from wire, no message ID)
+	AuthSuccess,
+	AuthFailed,
+	Reconnecting,
+	Unsubscribed,
+
+	// Wire events by category
+	Drive {
+		inner: DecryptedDriveEvent<'a>,
+		drive_message_id: u64,
+	},
+	Chat {
+		inner: DecryptedChatEvent<'a>,
+		chat_message_id: u64,
+	},
+	Note {
+		inner: DecryptedNoteEvent<'a>,
+		note_message_id: u64,
+	},
+	Contact {
+		inner: DecryptedContactEvent<'a>,
+		contact_message_id: u64,
+	},
+	General {
+		inner: DecryptedGeneralEvent<'a>,
+		general_message_id: u64,
+	},
 }
 
-impl<'a> DecryptedSocketEvent<'a> {
+impl DecryptedSocketEvent<'_> {
 	pub fn event_type(&self) -> &'static str {
-		self.inner.event_type()
-	}
-
-	pub(crate) fn new_without_id(inner: DecryptedSocketEventType<'a>) -> Self {
-		Self {
-			inner,
-			global_message_id: None,
+		match self {
+			Self::AuthSuccess => "authSuccess",
+			Self::AuthFailed => "authFailed",
+			Self::Reconnecting => "reconnecting",
+			Self::Unsubscribed => "unsubscribed",
+			Self::Drive { inner, .. } => inner.event_type(),
+			Self::Chat { inner, .. } => inner.event_type(),
+			Self::Note { inner, .. } => inner.event_type(),
+			Self::Contact { inner, .. } => inner.event_type(),
+			Self::General { inner, .. } => inner.event_type(),
 		}
 	}
 
-	pub fn inner(&self) -> &DecryptedSocketEventType<'a> {
-		&self.inner
-	}
-
-	pub fn global_message_id(&self) -> Option<u64> {
-		self.global_message_id
-	}
-
-	pub fn into_inner(self) -> DecryptedSocketEventType<'a> {
-		self.inner
+	pub fn message_id(&self) -> Option<u64> {
+		match self {
+			Self::AuthSuccess | Self::AuthFailed | Self::Reconnecting | Self::Unsubscribed => None,
+			Self::Drive {
+				drive_message_id, ..
+			} => Some(*drive_message_id),
+			Self::Chat {
+				chat_message_id, ..
+			} => Some(*chat_message_id),
+			Self::Note {
+				note_message_id, ..
+			} => Some(*note_message_id),
+			Self::Contact {
+				contact_message_id, ..
+			} => Some(*contact_message_id),
+			Self::General {
+				general_message_id, ..
+			} => Some(*general_message_id),
+		}
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
-pub enum DecryptedSocketEventType<'a> {
-	/// Sent after successful authentication, including on reconnect
-	AuthSuccess, // tested
-	/// Sent after failed authentication, including on reconnect, after which the socket is closed and all listeners removed
-	AuthFailed, // tested
-	/// Sent when the socket has unexpectedly closed and begins attempting to reconnect
-	Reconnecting,
-	/// Sent when the client was offline and messages were missed
-	// MissedMessages,
-	/// Sent when the handle to the event listener has been dropped and the listener is removed
-	Unsubscribed, // tested
-	NewEvent(NewEvent<'a>),                     // unused by rust, legacy
-	FileRename(FileRename<'a>),                 // rust never uses this, so no way to test it
-	FileArchiveRestored(FileArchiveRestored),   // not sure what this is for
-	FileNew(FileNew),                           // tested, needs size added
-	FileRestore(FileRestore),                   // tested, needs size added
-	FileMove(FileMove),                         // tested, needs size added
-	FileTrash(FileTrash), // tested, might want to add enough info to build a RemoteFile here
-	FileArchived(FileArchived), // tested
-	FolderRename(FolderRename<'a>), // rust never uses this, so no way to test it
-	FolderTrash(FolderTrash), // tested, might want to add enough info to build a RemoteFolder here
-	FolderMove(FolderMove), // tested, needs color added
-	FolderSubCreated(FolderSubCreated), // tested, needs color added
-	FolderRestore(FolderRestore), // tested, needs color added
-	FolderColorChanged(FolderColorChanged<'a>), // tested
+pub enum DecryptedDriveEvent<'a> {
+	FileArchiveRestored(FileArchiveRestored),
+	FileNew(FileNew),
+	FileRestore(FileRestore),
+	FileMove(FileMove),
+	FileTrash(FileTrash),
+	FileArchived(FileArchived),
+	FolderTrash(FolderTrash),
+	FolderMove(FolderMove),
+	FolderSubCreated(FolderSubCreated),
+	FolderRestore(FolderRestore),
+	FolderColorChanged(FolderColorChanged<'a>),
 	TrashEmpty,
-	PasswordChanged,
-	ChatMessageNew(ChatMessageNew), // tested
-	ChatTyping(ChatTyping<'a>),
-	ChatConversationsNew(ChatConversationsNew),
-	ChatMessageDelete(ChatMessageDelete),
-	NoteContentEdited(NoteContentEdited<'a>),
-	NoteArchived(NoteArchived),
-	NoteDeleted(NoteDeleted),
-	NoteTitleEdited(NoteTitleEdited<'a>),
-	NoteParticipantPermissions(NoteParticipantPermissions),
-	NoteRestored(NoteRestored),
-	NoteParticipantRemoved(NoteParticipantRemoved),
-	NoteParticipantNew(NoteParticipantNew),
-	NoteNew(NoteNew),
-	ChatMessageEmbedDisabled(ChatMessageEmbedDisabled),
-	ChatConversationParticipantLeft(ChatConversationParticipantLeft),
-	ChatConversationDeleted(ChatConversationDeleted),
-	ChatMessageEdited(ChatMessageEdited<'a>),
-	ChatConversationNameEdited(ChatConversationNameEdited<'a>),
-	ContactRequestReceived(ContactRequestReceived<'a>),
 	ItemFavorite(ItemFavorite),
-	ChatConversationParticipantNew(ChatConversationParticipantNew),
-	FileDeletedPermanent(FileDeletedPermanent), // tested
-	FolderMetadataChanged(FolderMetadataChanged<'a>), // tested
-	FolderDeletedPermanent(FolderDeletedPermanent), // tested
-	FileMetadataChanged(FileMetadataChanged<'a>), // tested
+	FileDeletedPermanent(FileDeletedPermanent),
+	FolderMetadataChanged(FolderMetadataChanged<'a>),
+	FolderDeletedPermanent(FolderDeletedPermanent),
+	FileMetadataChanged(FileMetadataChanged<'a>),
+	DeleteAll,
+	DeleteVersioned,
 }
 
-impl DecryptedSocketEventType<'_> {
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum DecryptedChatEvent<'a> {
+	MessageNew(ChatMessageNew),
+	Typing(ChatTyping<'a>),
+	ConversationsNew(ChatConversationsNew),
+	MessageDelete(ChatMessageDelete),
+	MessageEmbedDisabled(ChatMessageEmbedDisabled),
+	ConversationParticipantLeft(ChatConversationParticipantLeft),
+	ConversationDeleted(ChatConversationDeleted),
+	MessageEdited(ChatMessageEdited<'a>),
+	ConversationNameEdited(ChatConversationNameEdited<'a>),
+	ConversationParticipantNew(ChatConversationParticipantNew),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum DecryptedNoteEvent<'a> {
+	ContentEdited(NoteContentEdited<'a>),
+	Archived(NoteArchived),
+	Deleted(NoteDeleted),
+	TitleEdited(NoteTitleEdited<'a>),
+	ParticipantPermissions(NoteParticipantPermissions),
+	Restored(NoteRestored),
+	ParticipantRemoved(NoteParticipantRemoved),
+	ParticipantNew(NoteParticipantNew),
+	New(NoteNew),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum DecryptedContactEvent<'a> {
+	ContactRequestReceived(ContactRequestReceived<'a>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
+pub enum DecryptedGeneralEvent<'a> {
+	PasswordChanged,
+	NewEvent(NewEvent<'a>),
+}
+
+impl DecryptedDriveEvent<'_> {
 	pub fn event_type(&self) -> &'static str {
 		match self {
-			DecryptedSocketEventType::AuthSuccess => "authSuccess",
-			DecryptedSocketEventType::AuthFailed => "authFailed",
-			DecryptedSocketEventType::Reconnecting => "reconnecting",
-			DecryptedSocketEventType::Unsubscribed => "unsubscribed",
-			DecryptedSocketEventType::NewEvent(_) => "newEvent",
-			DecryptedSocketEventType::FileRename(_) => "fileRename",
-			DecryptedSocketEventType::FileArchiveRestored(_) => "fileArchiveRestored",
-			DecryptedSocketEventType::FileNew(_) => "fileNew",
-			DecryptedSocketEventType::FileRestore(_) => "fileRestore",
-			DecryptedSocketEventType::FileMove(_) => "fileMove",
-			DecryptedSocketEventType::FileTrash(_) => "fileTrash",
-			DecryptedSocketEventType::FileArchived(_) => "fileArchived",
-			DecryptedSocketEventType::FolderRename(_) => "folderRename",
-			DecryptedSocketEventType::FolderTrash(_) => "folderTrash",
-			DecryptedSocketEventType::FolderMove(_) => "folderMove",
-			DecryptedSocketEventType::FolderSubCreated(_) => "folderSubCreated",
-			DecryptedSocketEventType::FolderRestore(_) => "folderRestore",
-			DecryptedSocketEventType::FolderColorChanged(_) => "folderColorChanged",
-			DecryptedSocketEventType::TrashEmpty => "trashEmpty",
-			DecryptedSocketEventType::PasswordChanged => "passwordChanged",
-			DecryptedSocketEventType::ChatMessageNew(_) => "chatMessageNew",
-			DecryptedSocketEventType::ChatTyping(_) => "chatTyping",
-			DecryptedSocketEventType::ChatConversationsNew(_) => "chatConversationsNew",
-			DecryptedSocketEventType::ChatMessageDelete(_) => "chatMessageDelete",
-			DecryptedSocketEventType::NoteContentEdited(_) => "noteContentEdited",
-			DecryptedSocketEventType::NoteArchived(_) => "noteArchived",
-			DecryptedSocketEventType::NoteDeleted(_) => "noteDeleted",
-			DecryptedSocketEventType::NoteTitleEdited(_) => "noteTitleEdited",
-			DecryptedSocketEventType::NoteParticipantPermissions(_) => "noteParticipantPermissions",
-			DecryptedSocketEventType::NoteRestored(_) => "noteRestored",
-			DecryptedSocketEventType::NoteParticipantRemoved(_) => "noteParticipantRemoved",
-			DecryptedSocketEventType::NoteParticipantNew(_) => "noteParticipantNew",
-			DecryptedSocketEventType::NoteNew(_) => "noteNew",
-			DecryptedSocketEventType::ChatMessageEmbedDisabled(_) => "chatMessageEmbedDisabled",
-			DecryptedSocketEventType::ChatConversationParticipantLeft(_) => {
-				"chatConversationParticipantLeft"
-			}
-			DecryptedSocketEventType::ChatConversationDeleted(_) => "chatConversationDeleted",
-			DecryptedSocketEventType::ChatMessageEdited(_) => "chatMessageEdited",
-			DecryptedSocketEventType::ChatConversationNameEdited(_) => "chatConversationNameEdited",
-			DecryptedSocketEventType::ContactRequestReceived(_) => "contactRequestReceived",
-			DecryptedSocketEventType::ItemFavorite(_) => "itemFavorite",
-			DecryptedSocketEventType::ChatConversationParticipantNew(_) => {
-				"chatConversationParticipantNew"
-			}
-			DecryptedSocketEventType::FileDeletedPermanent(_) => "fileDeletedPermanent",
-			DecryptedSocketEventType::FolderMetadataChanged(_) => "folderMetadataChanged",
-			DecryptedSocketEventType::FolderDeletedPermanent(_) => "folderDeletedPermanent",
-			DecryptedSocketEventType::FileMetadataChanged(_) => "fileMetadataChanged",
+			Self::FileArchiveRestored(_) => "fileArchiveRestored",
+			Self::FileNew(_) => "fileNew",
+			Self::FileRestore(_) => "fileRestore",
+			Self::FileMove(_) => "fileMove",
+			Self::FileTrash(_) => "fileTrash",
+			Self::FileArchived(_) => "fileArchived",
+			Self::FolderTrash(_) => "folderTrash",
+			Self::FolderMove(_) => "folderMove",
+			Self::FolderSubCreated(_) => "folderSubCreated",
+			Self::FolderRestore(_) => "folderRestore",
+			Self::FolderColorChanged(_) => "folderColorChanged",
+			Self::TrashEmpty => "trashEmpty",
+			Self::ItemFavorite(_) => "itemFavorite",
+			Self::FileDeletedPermanent(_) => "fileDeletedPermanent",
+			Self::FolderMetadataChanged(_) => "folderMetadataChanged",
+			Self::FolderDeletedPermanent(_) => "folderDeletedPermanent",
+			Self::FileMetadataChanged(_) => "fileMetadataChanged",
+			Self::DeleteAll => "deleteAll",
+			Self::DeleteVersioned => "deleteVersioned",
 		}
 	}
+}
 
+impl DecryptedChatEvent<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::MessageNew(_) => "chatMessageNew",
+			Self::Typing(_) => "chatTyping",
+			Self::ConversationsNew(_) => "chatConversationsNew",
+			Self::MessageDelete(_) => "chatMessageDelete",
+			Self::MessageEmbedDisabled(_) => "chatMessageEmbedDisabled",
+			Self::ConversationParticipantLeft(_) => "chatConversationParticipantLeft",
+			Self::ConversationDeleted(_) => "chatConversationDeleted",
+			Self::MessageEdited(_) => "chatMessageEdited",
+			Self::ConversationNameEdited(_) => "chatConversationNameEdited",
+			Self::ConversationParticipantNew(_) => "chatConversationParticipantNew",
+		}
+	}
+}
+
+impl DecryptedNoteEvent<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::ContentEdited(_) => "noteContentEdited",
+			Self::Archived(_) => "noteArchived",
+			Self::Deleted(_) => "noteDeleted",
+			Self::TitleEdited(_) => "noteTitleEdited",
+			Self::ParticipantPermissions(_) => "noteParticipantPermissions",
+			Self::Restored(_) => "noteRestored",
+			Self::ParticipantRemoved(_) => "noteParticipantRemoved",
+			Self::ParticipantNew(_) => "noteParticipantNew",
+			Self::New(_) => "noteNew",
+		}
+	}
+}
+
+impl DecryptedContactEvent<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::ContactRequestReceived(_) => "contactRequestReceived",
+		}
+	}
+}
+
+impl DecryptedGeneralEvent<'_> {
+	pub fn event_type(&self) -> &'static str {
+		match self {
+			Self::PasswordChanged => "passwordChanged",
+			Self::NewEvent(_) => "newEvent",
+		}
+	}
+}
+
+impl DecryptedSocketEvent<'_> {
 	pub(crate) async fn try_from_encrypted<T>(
 		crypter: &impl MetaCrypter,
 		private_key: &RsaPrivateKey,
@@ -288,137 +356,208 @@ impl DecryptedSocketEventType<'_> {
 	{
 		runtime::do_cpu_intensive(|| {
 			event.try_map_project(|e, _| {
-				let decrypted = match e.inner {
-					SocketEventType::NewEvent(e) => DecryptedSocketEventType::NewEvent(e),
-					SocketEventType::FileRename(e) => DecryptedSocketEventType::FileRename(
-						FileRename::blocking_from_encrypted(crypter, e),
-					),
-					SocketEventType::FileArchiveRestored(e) => {
-						DecryptedSocketEventType::FileArchiveRestored(
-							FileArchiveRestored::blocking_from_encrypted(crypter, e),
-						)
-					}
-					SocketEventType::FileNew(e) => DecryptedSocketEventType::FileNew(
-						FileNew::blocking_from_encrypted(crypter, e),
-					),
-					SocketEventType::FileRestore(e) => DecryptedSocketEventType::FileRestore(
-						FileRestore::blocking_from_encrypted(crypter, e),
-					),
-					SocketEventType::FileMove(e) => DecryptedSocketEventType::FileMove(
-						FileMove::blocking_from_encrypted(crypter, e),
-					),
-					SocketEventType::FileTrash(e) => DecryptedSocketEventType::FileTrash(e),
-					SocketEventType::FileArchived(e) => DecryptedSocketEventType::FileArchived(e),
-					SocketEventType::FolderRename(e) => DecryptedSocketEventType::FolderRename(
-						FolderRename::blocking_from_encrypted(crypter, e),
-					),
-					SocketEventType::FolderTrash(e) => DecryptedSocketEventType::FolderTrash(e),
-					SocketEventType::FolderMove(e) => DecryptedSocketEventType::FolderMove(
-						FolderMove::blocking_from_encrypted(crypter, e),
-					),
-					SocketEventType::FolderSubCreated(e) => {
-						DecryptedSocketEventType::FolderSubCreated(
-							FolderSubCreated::blocking_from_encrypted(crypter, e),
-						)
-					}
-					SocketEventType::FolderRestore(e) => DecryptedSocketEventType::FolderRestore(
-						FolderRestore::blocking_from_encrypted(crypter, e),
-					),
-					SocketEventType::FolderColorChanged(e) => {
-						DecryptedSocketEventType::FolderColorChanged(e)
-					}
-					SocketEventType::TrashEmpty => DecryptedSocketEventType::TrashEmpty,
-					SocketEventType::PasswordChanged => DecryptedSocketEventType::PasswordChanged,
-					SocketEventType::ChatMessageNew(e) => DecryptedSocketEventType::ChatMessageNew(
-						ChatMessageNew::try_blocking_from_rsa_encrypted(private_key, e)?,
-					),
-					SocketEventType::ChatTyping(e) => DecryptedSocketEventType::ChatTyping(e),
-					SocketEventType::ChatConversationsNew(e) => {
-						DecryptedSocketEventType::ChatConversationsNew(
-							ChatConversationsNew::blocking_from_rsa_encrypted(
-								private_key,
-								user_id,
-								e,
+				Ok(match e {
+					SocketEvent::Drive {
+						inner,
+						drive_message_id,
+					} => {
+						let inner = match inner {
+							DriveEventType::FileRename(e) => {
+								DecryptedDriveEvent::FileMetadataChanged(
+									FileMetadataChanged::blocking_from_encrypted(
+										crypter, e.uuid, e.metadata,
+									),
+								)
+							}
+							DriveEventType::FileArchiveRestored(e) => {
+								DecryptedDriveEvent::FileArchiveRestored(
+									FileArchiveRestored::blocking_from_encrypted(crypter, e),
+								)
+							}
+							DriveEventType::FileNew(e) => DecryptedDriveEvent::FileNew(
+								FileNew::blocking_from_encrypted(crypter, e),
 							),
-						)
+							DriveEventType::FileRestore(e) => DecryptedDriveEvent::FileRestore(
+								FileRestore::blocking_from_encrypted(crypter, e),
+							),
+							DriveEventType::FileMove(e) => DecryptedDriveEvent::FileMove(
+								FileMove::blocking_from_encrypted(crypter, e),
+							),
+							DriveEventType::FileTrash(e) => DecryptedDriveEvent::FileTrash(e),
+							DriveEventType::FileArchived(e) => DecryptedDriveEvent::FileArchived(e),
+							DriveEventType::FolderRename(e) => {
+								DecryptedDriveEvent::FolderMetadataChanged(
+									FolderMetadataChanged::blocking_from_encrypted(
+										crypter, e.uuid, e.name,
+									),
+								)
+							}
+							DriveEventType::FolderTrash(e) => DecryptedDriveEvent::FolderTrash(e),
+							DriveEventType::FolderMove(e) => DecryptedDriveEvent::FolderMove(
+								FolderMove::blocking_from_encrypted(crypter, e),
+							),
+							DriveEventType::FolderSubCreated(e) => {
+								DecryptedDriveEvent::FolderSubCreated(
+									FolderSubCreated::blocking_from_encrypted(crypter, e),
+								)
+							}
+							DriveEventType::FolderRestore(e) => DecryptedDriveEvent::FolderRestore(
+								FolderRestore::blocking_from_encrypted(crypter, e),
+							),
+							DriveEventType::FolderColorChanged(e) => {
+								DecryptedDriveEvent::FolderColorChanged(e)
+							}
+							DriveEventType::FolderMetadataChanged(e) => {
+								DecryptedDriveEvent::FolderMetadataChanged(
+									FolderMetadataChanged::blocking_from_encrypted(
+										crypter, e.uuid, e.meta,
+									),
+								)
+							}
+							DriveEventType::FolderDeletedPermanent(e) => {
+								DecryptedDriveEvent::FolderDeletedPermanent(e)
+							}
+							DriveEventType::FileDeletedPermanent(e) => {
+								DecryptedDriveEvent::FileDeletedPermanent(e)
+							}
+							DriveEventType::FileMetadataChanged(e) => {
+								DecryptedDriveEvent::FileMetadataChanged(
+									FileMetadataChanged::blocking_from_encrypted(
+										crypter, e.uuid, e.metadata,
+									),
+								)
+							}
+							DriveEventType::ItemFavorite(e) => DecryptedDriveEvent::ItemFavorite(
+								ItemFavorite::try_blocking_from_encrypted(crypter, e)?,
+							),
+							DriveEventType::TrashEmpty => DecryptedDriveEvent::TrashEmpty,
+							DriveEventType::DeleteAll => DecryptedDriveEvent::DeleteAll,
+							DriveEventType::DeleteVersioned => DecryptedDriveEvent::DeleteVersioned,
+						};
+						DecryptedSocketEvent::Drive {
+							inner,
+							drive_message_id,
+						}
 					}
-					SocketEventType::ChatMessageDelete(e) => {
-						DecryptedSocketEventType::ChatMessageDelete(e)
+					SocketEvent::Chat {
+						inner,
+						chat_message_id,
+					} => {
+						let inner = match inner {
+							ChatEventType::ChatMessageNew(e) => DecryptedChatEvent::MessageNew(
+								ChatMessageNew::try_blocking_from_rsa_encrypted(private_key, e)?,
+							),
+							ChatEventType::ChatTyping(e) => DecryptedChatEvent::Typing(e),
+							ChatEventType::ChatConversationsNew(e) => {
+								DecryptedChatEvent::ConversationsNew(
+									ChatConversationsNew::blocking_from_rsa_encrypted(
+										private_key,
+										user_id,
+										e,
+									),
+								)
+							}
+							ChatEventType::ChatMessageDelete(e) => {
+								DecryptedChatEvent::MessageDelete(e)
+							}
+							ChatEventType::ChatMessageEmbedDisabled(e) => {
+								DecryptedChatEvent::MessageEmbedDisabled(e)
+							}
+							ChatEventType::ChatConversationParticipantLeft(e) => {
+								DecryptedChatEvent::ConversationParticipantLeft(e)
+							}
+							ChatEventType::ChatConversationDeleted(e) => {
+								DecryptedChatEvent::ConversationDeleted(e)
+							}
+							ChatEventType::ChatMessageEdited(e) => {
+								DecryptedChatEvent::MessageEdited(
+									ChatMessageEdited::try_blocking_from_rsa_encrypted(
+										private_key,
+										e,
+									)?,
+								)
+							}
+							ChatEventType::ChatConversationNameEdited(e) => {
+								DecryptedChatEvent::ConversationNameEdited(
+									ChatConversationNameEdited::try_blocking_from_rsa_encrypted(
+										private_key,
+										e,
+									)?,
+								)
+							}
+							ChatEventType::ChatConversationParticipantNew(e) => {
+								DecryptedChatEvent::ConversationParticipantNew(e.into())
+							}
+						};
+						DecryptedSocketEvent::Chat {
+							inner,
+							chat_message_id,
+						}
 					}
-					SocketEventType::NoteContentEdited(e) => {
-						DecryptedSocketEventType::NoteContentEdited(
-							NoteContentEdited::try_blocking_from_rsa_encrypted(private_key, e)?,
-						)
+					SocketEvent::Note {
+						inner,
+						note_message_id,
+					} => {
+						let inner = match inner {
+							NoteEventType::NoteContentEdited(e) => {
+								DecryptedNoteEvent::ContentEdited(
+									NoteContentEdited::try_blocking_from_rsa_encrypted(
+										private_key,
+										e,
+									)?,
+								)
+							}
+							NoteEventType::NoteArchived(e) => DecryptedNoteEvent::Archived(e),
+							NoteEventType::NoteDeleted(e) => DecryptedNoteEvent::Deleted(e),
+							NoteEventType::NoteTitleEdited(e) => DecryptedNoteEvent::TitleEdited(
+								NoteTitleEdited::try_blocking_from_rsa_encrypted(private_key, e)?,
+							),
+							NoteEventType::NoteParticipantPermissions(e) => {
+								DecryptedNoteEvent::ParticipantPermissions(e)
+							}
+							NoteEventType::NoteRestored(e) => DecryptedNoteEvent::Restored(e),
+							NoteEventType::NoteParticipantRemoved(e) => {
+								DecryptedNoteEvent::ParticipantRemoved(e)
+							}
+							NoteEventType::NoteParticipantNew(e) => {
+								DecryptedNoteEvent::ParticipantNew(e.into())
+							}
+							NoteEventType::NoteNew(e) => DecryptedNoteEvent::New(e.into()),
+						};
+						DecryptedSocketEvent::Note {
+							inner,
+							note_message_id,
+						}
 					}
-					SocketEventType::NoteArchived(e) => DecryptedSocketEventType::NoteArchived(e),
-					SocketEventType::NoteDeleted(e) => DecryptedSocketEventType::NoteDeleted(e),
-					SocketEventType::NoteTitleEdited(e) => {
-						DecryptedSocketEventType::NoteTitleEdited(
-							NoteTitleEdited::try_blocking_from_rsa_encrypted(private_key, e)?,
-						)
+					SocketEvent::Contact {
+						inner,
+						contact_message_id,
+					} => {
+						let inner = match inner {
+							ContactEventType::ContactRequestReceived(e) => {
+								DecryptedContactEvent::ContactRequestReceived(e)
+							}
+						};
+						DecryptedSocketEvent::Contact {
+							inner,
+							contact_message_id,
+						}
 					}
-					SocketEventType::NoteParticipantPermissions(e) => {
-						DecryptedSocketEventType::NoteParticipantPermissions(e)
+					SocketEvent::General {
+						inner,
+						general_message_id,
+					} => {
+						let inner = match inner {
+							GeneralEventType::PasswordChanged => {
+								DecryptedGeneralEvent::PasswordChanged
+							}
+							GeneralEventType::NewEvent(e) => DecryptedGeneralEvent::NewEvent(e),
+						};
+						DecryptedSocketEvent::General {
+							inner,
+							general_message_id,
+						}
 					}
-					SocketEventType::NoteRestored(e) => DecryptedSocketEventType::NoteRestored(e),
-					SocketEventType::NoteParticipantRemoved(e) => {
-						DecryptedSocketEventType::NoteParticipantRemoved(e)
-					}
-					SocketEventType::NoteParticipantNew(e) => {
-						DecryptedSocketEventType::NoteParticipantNew(e.into())
-					}
-					SocketEventType::NoteNew(e) => DecryptedSocketEventType::NoteNew(e.into()),
-					SocketEventType::ChatMessageEmbedDisabled(e) => {
-						DecryptedSocketEventType::ChatMessageEmbedDisabled(e)
-					}
-					SocketEventType::ChatConversationParticipantLeft(e) => {
-						DecryptedSocketEventType::ChatConversationParticipantLeft(e)
-					}
-					SocketEventType::ChatConversationDeleted(e) => {
-						DecryptedSocketEventType::ChatConversationDeleted(e)
-					}
-					SocketEventType::ChatMessageEdited(e) => {
-						DecryptedSocketEventType::ChatMessageEdited(
-							ChatMessageEdited::try_blocking_from_rsa_encrypted(private_key, e)?,
-						)
-					}
-					SocketEventType::ChatConversationNameEdited(e) => {
-						DecryptedSocketEventType::ChatConversationNameEdited(
-							ChatConversationNameEdited::try_blocking_from_rsa_encrypted(
-								private_key,
-								e,
-							)?,
-						)
-					}
-					SocketEventType::ContactRequestReceived(e) => {
-						DecryptedSocketEventType::ContactRequestReceived(e)
-					}
-					SocketEventType::ItemFavorite(e) => DecryptedSocketEventType::ItemFavorite(
-						ItemFavorite::try_blocking_from_encrypted(crypter, e)?,
-					),
-					SocketEventType::ChatConversationParticipantNew(e) => {
-						DecryptedSocketEventType::ChatConversationParticipantNew(e.into())
-					}
-					SocketEventType::FileDeletedPermanent(e) => {
-						DecryptedSocketEventType::FileDeletedPermanent(e)
-					}
-					SocketEventType::FolderMetadataChanged(e) => {
-						DecryptedSocketEventType::FolderMetadataChanged(
-							FolderMetadataChanged::blocking_from_encrypted(crypter, e),
-						)
-					}
-					SocketEventType::FolderDeletedPermanent(e) => {
-						DecryptedSocketEventType::FolderDeletedPermanent(e)
-					}
-					SocketEventType::FileMetadataChanged(e) => {
-						DecryptedSocketEventType::FileMetadataChanged(
-							FileMetadataChanged::blocking_from_encrypted(crypter, e),
-						)
-					}
-				};
-				Ok(DecryptedSocketEvent {
-					inner: decrypted,
-					global_message_id: Some(e.global_message_id),
 				})
 			})
 		})
@@ -542,27 +681,6 @@ impl<'a> FileMove {
 			timestamp: event.timestamp,
 			chunks: event.chunks,
 		})
-	}
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
-pub struct FolderRename<'a> {
-	pub name: MaybeEncrypted<'a, str>,
-	pub uuid: UuidStr,
-}
-
-impl<'a> FolderRename<'a> {
-	fn blocking_from_encrypted(
-		crypter: &impl MetaCrypter,
-		event: filen_types::api::v3::socket::FolderRename<'a>,
-	) -> Self {
-		Self {
-			uuid: event.uuid,
-			name: match crypter.blocking_decrypt_meta(&event.name) {
-				Ok(decrypted_name) => MaybeEncrypted::Decrypted(Cow::Owned(decrypted_name)),
-				Err(_) => MaybeEncrypted::Encrypted(event.name),
-			},
-		}
 	}
 }
 
@@ -926,11 +1044,12 @@ pub struct FolderMetadataChanged<'a> {
 impl<'a> FolderMetadataChanged<'a> {
 	fn blocking_from_encrypted(
 		crypter: &impl MetaCrypter,
-		event: filen_types::api::v3::socket::FolderMetadataChanged<'a>,
+		uuid: UuidStr,
+		encrypted_string: EncryptedString<'a>,
 	) -> Self {
 		Self {
-			uuid: event.uuid,
-			meta: DirectoryMeta::blocking_from_encrypted(event.meta, crypter),
+			uuid,
+			meta: DirectoryMeta::blocking_from_encrypted(encrypted_string, crypter),
 		}
 	}
 }
@@ -938,49 +1057,18 @@ impl<'a> FolderMetadataChanged<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct FileMetadataChanged<'a> {
 	pub uuid: UuidStr,
-	pub name: MaybeEncrypted<'a, str>,
 	pub metadata: FileMeta<'a>,
-	pub old_metadata: FileMeta<'a>,
 }
 
 impl<'a> FileMetadataChanged<'a> {
 	fn blocking_from_encrypted(
 		crypter: &impl MetaCrypter,
-		event: filen_types::api::v3::socket::FileMetadataChanged<'a>,
+		uuid: UuidStr,
+		new_meta: EncryptedString<'a>,
 	) -> Self {
-		let (metadata, old_metadata) = runtime::blocking_join!(
-			|| {
-				FileMeta::blocking_from_encrypted(
-					event.metadata,
-					crypter,
-					FileEncryptionVersion::V2,
-				)
-			},
-			|| {
-				FileMeta::blocking_from_encrypted(
-					event.old_metadata,
-					crypter,
-					FileEncryptionVersion::V2,
-				)
-			}
-		);
+		let metadata =
+			FileMeta::blocking_from_encrypted(new_meta, crypter, FileEncryptionVersion::V2);
 
-		// The `name` field in FileMetadataChanged is encrypted with the file's
-		// own key (from the file metadata), not the master key. Decrypt metadata
-		// first, extract the file key, then use it to decrypt name.
-		// Fall back to the master key crypter if file key decryption fails.
-		let name = metadata
-			.key()
-			.and_then(|file_key| file_key.to_meta_key().ok())
-			.and_then(|file_key_crypter| file_key_crypter.blocking_decrypt_meta(&event.name).ok())
-			.map(|s| MaybeEncrypted::Decrypted(Cow::Owned(s)))
-			.unwrap_or_else(|| MaybeEncrypted::Encrypted(event.name));
-
-		Self {
-			uuid: event.uuid,
-			name,
-			metadata,
-			old_metadata,
-		}
+		Self { uuid, metadata }
 	}
 }
