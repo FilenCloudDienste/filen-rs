@@ -12,4 +12,9 @@ INSERT INTO dirs (
 	?,
 	?,
 	?
-);
+) ON CONFLICT (id) DO UPDATE SET
+	favorite = excluded.favorite,
+	color = excluded.color,
+	timestamp = excluded.timestamp,
+	name = excluded.name,
+	created = excluded.created;

@@ -12,11 +12,11 @@ use filen_sdk_rs::{
 	crypto::file::FileKey,
 	fs::{
 		HasUUID,
-		dir::meta::{DecryptedDirectoryMeta, DirectoryMeta},
-		file::meta::{DecryptedFileMeta, FileMeta},
+		dir::meta::{DecryptedDirectoryMeta, DirectoryMeta, DirectoryMetaChanges},
+		file::meta::{DecryptedFileMeta, FileMeta, FileMetaChanges},
 	},
 	io::{RemoteDirectory, RemoteFile},
-	socket::DecryptedSocketEventType,
+	socket::DecryptedSocketEvent,
 };
 use filen_types::{
 	api::v3::dir::color::DirColor,
@@ -26,8 +26,6 @@ use filen_types::{
 };
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Generate a unique temporary cache DB path.
 fn temp_cache_path() -> PathBuf {
@@ -100,6 +98,17 @@ fn query_cached_file(db_path: &Path, uuid: Uuid) -> Option<(String, i64, String,
 	.ok()
 }
 
+/// Query the file's favorite status in the cache for the given UUID.
+fn query_cached_file_favorite(db_path: &Path, uuid: Uuid) -> Option<bool> {
+	let conn = open_read_db(db_path).ok()?;
+	conn.query_row(
+		"SELECT f.favorite FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+		params![uuid],
+		|row| row.get(0),
+	)
+	.ok()
+}
+
 /// Query the directory metadata stored in the cache for the given UUID.
 /// Returns (name, color, parent_uuid) if found.
 fn query_cached_dir(db_path: &Path, uuid: Uuid) -> Option<(String, Option<String>, Vec<u8>)> {
@@ -112,6 +121,90 @@ fn query_cached_dir(db_path: &Path, uuid: Uuid) -> Option<(String, Option<String
 		|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
 	)
 	.ok()
+}
+
+/// Poll until the file's name in the cache matches the expected value, or timeout.
+async fn poll_for_file_name(
+	db_path: &Path,
+	uuid: Uuid,
+	expected_name: &str,
+	timeout: Duration,
+) -> bool {
+	let deadline = tokio::time::Instant::now() + timeout;
+	loop {
+		if tokio::time::Instant::now() >= deadline {
+			return false;
+		}
+		if let Some((name, _, _, _)) = query_cached_file(db_path, uuid)
+			&& name == expected_name
+		{
+			return true;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+}
+
+/// Poll until the dir's name in the cache matches the expected value, or timeout.
+async fn poll_for_dir_name(
+	db_path: &Path,
+	uuid: Uuid,
+	expected_name: &str,
+	timeout: Duration,
+) -> bool {
+	let deadline = tokio::time::Instant::now() + timeout;
+	loop {
+		if tokio::time::Instant::now() >= deadline {
+			return false;
+		}
+		if let Some((name, _, _)) = query_cached_dir(db_path, uuid)
+			&& name == expected_name
+		{
+			return true;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+}
+
+/// Poll until the dir's color in the cache matches the expected value, or timeout.
+async fn poll_for_dir_color(
+	db_path: &Path,
+	uuid: Uuid,
+	expected_color: &str,
+	timeout: Duration,
+) -> bool {
+	let deadline = tokio::time::Instant::now() + timeout;
+	loop {
+		if tokio::time::Instant::now() >= deadline {
+			return false;
+		}
+		if let Some((_, color, _)) = query_cached_dir(db_path, uuid)
+			&& color.as_deref() == Some(expected_color)
+		{
+			return true;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+}
+
+/// Poll until the file's favorite status matches the expected value, or timeout.
+async fn poll_for_file_favorite(
+	db_path: &Path,
+	uuid: Uuid,
+	expected: bool,
+	timeout: Duration,
+) -> bool {
+	let deadline = tokio::time::Instant::now() + timeout;
+	loop {
+		if tokio::time::Instant::now() >= deadline {
+			return false;
+		}
+		if let Some(fav) = query_cached_file_favorite(db_path, uuid)
+			&& fav == expected
+		{
+			return true;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
 }
 
 /// Query the item type for the given UUID. Returns the type code (0=Root, 1=Dir, 2=File).
@@ -194,7 +287,7 @@ async fn ensure_socket_ready(client: &Client) {
 
 	test_utils::await_event(
 		&mut rx,
-		|event| *event.inner() == DecryptedSocketEventType::AuthSuccess,
+		|event| *event == DecryptedSocketEvent::AuthSuccess,
 		Duration::from_secs(20),
 		"authSuccess (cache setup)",
 	)
@@ -519,10 +612,8 @@ async fn test_cache_dir_move_via_socket() {
 		.await
 		.unwrap();
 
-	tokio::time::sleep(Duration::from_secs(3)).await;
-
 	assert!(
-		poll_for_item(cache.db_path(), move_dir_uuid, Duration::from_secs(5)).await,
+		poll_for_item(cache.db_path(), move_dir_uuid, Duration::from_secs(30)).await,
 		"moved dir should still exist in cache"
 	);
 }
@@ -782,75 +873,350 @@ async fn test_cache_mixed_socket_and_manual_events() {
 	);
 }
 
-// ─── Event Extension Points ─────────────────────────────────────────────────
-//
-// The following test stubs document future event types that the cache should handle
-// as the CacheEventType enum is extended. Each stub shows the socket event trigger
-// pattern and the expected cache behavior.
-//
-// To add a new event type:
-// 1. Add a variant to CacheEventType in state.rs
-// 2. Add the socket event mapping in make_socket_event_callback
-// 3. Add handler logic in handle_event / handle_*_event
-// 4. Uncomment and fill in the corresponding test below
-//
+// ─── File Restore Tests ────────────────────────────────────────────────────
 
-// #[shared_test_runtime]
-// async fn test_cache_file_restore_via_socket() {
-//     // Trigger: client.restore_file(&mut file)
-//     // Expected: DecryptedSocketEventType::FileRestore → file re-inserted into cache
-// }
+#[shared_test_runtime]
+async fn test_cache_file_restore_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
 
-// #[shared_test_runtime]
-// async fn test_cache_file_metadata_changed_via_socket() {
-//     // Trigger: client.update_file_metadata(&mut file, changes)
-//     // Expected: DecryptedSocketEventType::FileMetadataChanged → file metadata updated
-// }
+	let file = client
+		.make_file_builder("cache_file_restore.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let mut file = client
+		.upload_file(file.into(), b"restore me")
+		.await
+		.unwrap();
+	let file_uuid: Uuid = file.uuid().into();
 
-// #[shared_test_runtime]
-// async fn test_cache_file_deleted_permanently_via_socket() {
-//     // Trigger: client.delete_file_permanently(file)
-//     // Expected: DecryptedSocketEventType::FileDeletedPermanent → file removed from cache
-// }
+	assert!(
+		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
+		"file should appear in cache"
+	);
 
-// #[shared_test_runtime]
-// async fn test_cache_dir_restore_via_socket() {
-//     // Trigger: client.restore_dir(&mut dir)
-//     // Expected: DecryptedSocketEventType::FolderRestore → dir re-inserted into cache
-// }
+	client.trash_file(&mut file).await.unwrap();
 
-// #[shared_test_runtime]
-// async fn test_cache_dir_metadata_changed_via_socket() {
-//     // Trigger: client.update_dir_metadata(&mut dir, changes)
-//     // Expected: DecryptedSocketEventType::FolderMetadataChanged → dir metadata updated
-// }
+	assert!(
+		poll_for_item_absent(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
+		"file should be removed after trash"
+	);
 
-// #[shared_test_runtime]
-// async fn test_cache_dir_color_changed_via_socket() {
-//     // Trigger: client.set_dir_color(&mut dir, DirColor::Blue)
-//     // Expected: DecryptedSocketEventType::FolderColorChanged → dir color updated
-// }
+	client.restore_file(&mut file).await.unwrap();
 
-// #[shared_test_runtime]
-// async fn test_cache_dir_deleted_permanently_via_socket() {
-//     // Trigger: client.delete_dir_permanently(dir)
-//     // Expected: DecryptedSocketEventType::FolderDeletedPermanent → dir removed from cache
-// }
+	assert!(
+		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
+		"file should reappear in cache after FileRestore event"
+	);
 
-// #[shared_test_runtime]
-// async fn test_cache_item_favorite_via_socket() {
-//     // Trigger: client.set_file_favorite(&mut file, true)
-//     // Expected: DecryptedSocketEventType::ItemFavorite → favorite flag updated
-// }
+	let (name, _, _, _) = query_cached_file(cache.db_path(), file_uuid).unwrap();
+	assert_eq!(name, "cache_file_restore.txt");
+}
 
-// #[shared_test_runtime]
-// async fn test_cache_file_archived_via_socket() {
-//     // Trigger: Upload file with same name as existing file
-//     // Expected: DecryptedSocketEventType::FileArchived → old version handled
-// }
+// ─── File Metadata Changed Tests ───────────────────────────────────────────
 
-// #[shared_test_runtime]
-// async fn test_cache_trash_empty_via_socket() {
-//     // Trigger: client.empty_trash()
-//     // Expected: DecryptedSocketEventType::TrashEmpty → relevant items purged
-// }
+#[shared_test_runtime]
+async fn test_cache_file_metadata_changed_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	let file = client
+		.make_file_builder("cache_file_rename_old.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let mut file = client.upload_file(file.into(), b"rename me").await.unwrap();
+	let file_uuid: Uuid = file.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
+		"file should appear in cache"
+	);
+
+	let changes = FileMetaChanges::default()
+		.name("cache_file_rename_new.txt")
+		.unwrap();
+	client
+		.update_file_metadata(&mut file, changes)
+		.await
+		.unwrap();
+
+	assert!(
+		poll_for_file_name(
+			cache.db_path(),
+			file_uuid,
+			"cache_file_rename_new.txt",
+			Duration::from_secs(30)
+		)
+		.await,
+		"file name should be updated in cache after FileMetadataChanged event"
+	);
+}
+
+// ─── File Deleted Permanently Tests ────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_file_deleted_permanently_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	let file = client
+		.make_file_builder("cache_file_perm_delete.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let mut file = client
+		.upload_file(file.into(), b"delete me forever")
+		.await
+		.unwrap();
+	let file_uuid: Uuid = file.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
+		"file should appear in cache"
+	);
+
+	client.trash_file(&mut file).await.unwrap();
+
+	assert!(
+		poll_for_item_absent(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
+		"file should be removed after trash"
+	);
+
+	client.delete_file_permanently(file).await.unwrap();
+
+	// Should remain absent (permanent delete event should not re-add it)
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert!(
+		query_cached_file(cache.db_path(), file_uuid).is_none(),
+		"file should remain absent after permanent delete"
+	);
+}
+
+// ─── Dir Restore Tests ─────────────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_dir_restore_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	let mut dir = client
+		.create_dir(&test_dir.into(), "cache_dir_restore")
+		.await
+		.unwrap();
+	let dir_uuid: Uuid = dir.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
+		"dir should appear in cache"
+	);
+
+	client.trash_dir(&mut dir).await.unwrap();
+
+	assert!(
+		poll_for_item_absent(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
+		"dir should be removed after trash"
+	);
+
+	client.restore_dir(&mut dir).await.unwrap();
+
+	assert!(
+		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
+		"dir should reappear in cache after FolderRestore event"
+	);
+
+	let (name, _, _) = query_cached_dir(cache.db_path(), dir_uuid).unwrap();
+	assert_eq!(name, "cache_dir_restore");
+}
+
+// ─── Dir Metadata Changed Tests ────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_dir_metadata_changed_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	let mut dir = client
+		.create_dir(&test_dir.into(), "cache_dir_rename_old")
+		.await
+		.unwrap();
+	let dir_uuid: Uuid = dir.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
+		"dir should appear in cache"
+	);
+
+	let changes = DirectoryMetaChanges::default()
+		.name("cache_dir_rename_new")
+		.unwrap();
+	client.update_dir_metadata(&mut dir, changes).await.unwrap();
+
+	assert!(
+		poll_for_dir_name(
+			cache.db_path(),
+			dir_uuid,
+			"cache_dir_rename_new",
+			Duration::from_secs(30)
+		)
+		.await,
+		"dir name should be updated in cache after FolderMetadataChanged event"
+	);
+}
+
+// ─── Dir Color Changed Tests ───────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_dir_color_changed_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	let mut dir = client
+		.create_dir(&test_dir.into(), "cache_dir_color")
+		.await
+		.unwrap();
+	let dir_uuid: Uuid = dir.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
+		"dir should appear in cache"
+	);
+
+	client
+		.set_dir_color(&mut dir, DirColor::Blue)
+		.await
+		.unwrap();
+
+	assert!(
+		poll_for_dir_color(cache.db_path(), dir_uuid, "blue", Duration::from_secs(30)).await,
+		"dir color should be updated in cache after FolderColorChanged event"
+	);
+}
+
+// ─── Dir Deleted Permanently Tests ─────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_dir_deleted_permanently_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	let mut dir = client
+		.create_dir(&test_dir.into(), "cache_dir_perm_delete")
+		.await
+		.unwrap();
+	let dir_uuid: Uuid = dir.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
+		"dir should appear in cache"
+	);
+
+	client.trash_dir(&mut dir).await.unwrap();
+
+	assert!(
+		poll_for_item_absent(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
+		"dir should be removed after trash"
+	);
+
+	client.delete_dir_permanently(dir).await.unwrap();
+
+	// Should remain absent
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert!(
+		query_cached_dir(cache.db_path(), dir_uuid).is_none(),
+		"dir should remain absent after permanent delete"
+	);
+}
+
+// ─── Item Favorite Tests ───────────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_item_favorite_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	let file = client
+		.make_file_builder("cache_file_favorite.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let mut file = client
+		.upload_file(file.into(), b"favorite me")
+		.await
+		.unwrap();
+	let file_uuid: Uuid = file.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
+		"file should appear in cache"
+	);
+
+	client.set_file_favorite(&mut file, true).await.unwrap();
+
+	assert!(
+		poll_for_file_favorite(cache.db_path(), file_uuid, true, Duration::from_secs(30)).await,
+		"file should be favorited in cache after ItemFavorite event"
+	);
+}
+
+// ─── File Archived Tests ───────────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_file_archived_via_socket() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let cache = TestCache::new(client).await;
+
+	// Upload original file
+	let file = client
+		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let _original = client
+		.upload_file(file.into(), b"original content")
+		.await
+		.unwrap();
+	let original_uuid: Uuid = _original.uuid().into();
+
+	assert!(
+		poll_for_item(cache.db_path(), original_uuid, Duration::from_secs(30)).await,
+		"original file should appear in cache"
+	);
+
+	// Upload a new file with the same name — this archives the old one
+	let replacement = client
+		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let replacement = client
+		.upload_file(replacement.into(), b"replacement content")
+		.await
+		.unwrap();
+	let replacement_uuid: Uuid = replacement.uuid().into();
+
+	// Original should be removed (archived) from cache
+	assert!(
+		poll_for_item_absent(cache.db_path(), original_uuid, Duration::from_secs(30)).await,
+		"original file should be removed from cache after FileArchived event"
+	);
+
+	// Replacement should appear in cache
+	assert!(
+		poll_for_item(cache.db_path(), replacement_uuid, Duration::from_secs(30)).await,
+		"replacement file should appear in cache"
+	);
+}

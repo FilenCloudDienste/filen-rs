@@ -1,6 +1,10 @@
 use std::borrow::Borrow;
 
-use filen_sdk_rs::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
+use filen_sdk_rs::fs::{
+	dir::{DecryptedDirectoryMeta, cache::CacheableDir},
+	file::{cache::CacheableFile, meta::DecryptedFileMeta},
+};
+use filen_types::api::v3::dir::color::DirColor;
 use itertools::Itertools;
 use rusqlite::config::DbConfig;
 use uuid::Uuid;
@@ -88,6 +92,57 @@ impl CacheState {
 
 			transaction.commit()?;
 		}
+		Ok(())
+	}
+
+	pub(crate) fn delete_all_non_root(&mut self) -> rusqlite::Result<()> {
+		self.db.execute(statements::ITEM_DELETE_ALL_NON_ROOT, [])?;
+		Ok(())
+	}
+
+	pub(crate) fn update_file_meta(
+		&mut self,
+		uuid: Uuid,
+		meta: &DecryptedFileMeta<'_>,
+	) -> rusqlite::Result<()> {
+		self.db.execute(
+			statements::FILE_UPDATE_META,
+			rusqlite::params![
+				meta.size,
+				meta.name,
+				meta.mime,
+				meta.key.to_str(),
+				meta.key.version() as i8,
+				meta.created.map(|c| c.timestamp_millis()),
+				meta.last_modified.timestamp_millis(),
+				meta.hash.as_ref().map(|h| h.as_ref()),
+				uuid,
+			],
+		)?;
+		Ok(())
+	}
+
+	pub(crate) fn update_dir_name(
+		&mut self,
+		uuid: Uuid,
+		meta: &DecryptedDirectoryMeta<'_>,
+	) -> rusqlite::Result<()> {
+		self.db.execute(
+			statements::DIR_UPDATE_NAME,
+			rusqlite::params![meta.name, meta.created.map(|c| c.timestamp_millis()), uuid],
+		)?;
+		Ok(())
+	}
+
+	pub(crate) fn update_dir_color(
+		&mut self,
+		uuid: Uuid,
+		color: &DirColor<'_>,
+	) -> rusqlite::Result<()> {
+		self.db.execute(
+			statements::DIR_UPDATE_COLOR,
+			rusqlite::params![color.as_ref(), uuid],
+		)?;
 		Ok(())
 	}
 
@@ -770,6 +825,310 @@ mod tests {
 			.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
 			.unwrap();
 		assert_eq!(remaining, 2, "should have 2 files left after deleting 3");
+	}
+
+	// ─── File Meta Update Tests ─────────────────────────────────────────────
+
+	#[test]
+	fn test_update_file_meta() {
+		let mut state = test_cache_state();
+		let file = make_cacheable_file(state.root_uuid);
+		state.upsert_files(once(&file)).unwrap();
+
+		let new_key = make_file_key();
+		let new_modified = Utc::now();
+
+		let meta = DecryptedFileMeta {
+			name: Cow::Borrowed("renamed.txt"),
+			size: 2048,
+			mime: Cow::Borrowed("application/octet-stream"),
+			key: Cow::Borrowed(&new_key),
+			last_modified: new_modified,
+			created: None,
+			hash: None,
+		};
+
+		state.update_file_meta(file.uuid, &meta).unwrap();
+
+		let (name, size, mime): (String, i64, String) = state
+			.db
+			.query_row(
+				"SELECT f.name, f.size, f.mime FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+				params![file.uuid],
+				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			)
+			.unwrap();
+		assert_eq!(name, "renamed.txt");
+		assert_eq!(size, 2048);
+		assert_eq!(mime, "application/octet-stream");
+	}
+
+	#[test]
+	fn test_update_file_meta_preserves_non_meta_fields() {
+		let mut state = test_cache_state();
+		let file = make_cacheable_file(state.root_uuid);
+		state.upsert_files(once(&file)).unwrap();
+
+		let meta = DecryptedFileMeta {
+			name: Cow::Borrowed("new_name.txt"),
+			size: 999,
+			mime: Cow::Borrowed("text/html"),
+			key: Cow::Borrowed(&file.key),
+			last_modified: file.last_modified,
+			created: file.created,
+			hash: None,
+		};
+
+		// Update only the metadata
+		state.update_file_meta(file.uuid, &meta).unwrap();
+
+		// Verify non-meta fields (region, bucket, favorite, chunks) are unchanged
+		let (region, bucket, favorite, chunks): (String, String, bool, i64) = state
+			.db
+			.query_row(
+				"SELECT f.region, f.bucket, f.favorite, f.chunks FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+				params![file.uuid],
+				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+			)
+			.unwrap();
+		assert_eq!(region, "us-east-1");
+		assert_eq!(bucket, "test-bucket");
+		assert!(!favorite);
+		assert_eq!(chunks, 1);
+	}
+
+	#[test]
+	fn test_update_file_meta_nonexistent_is_noop() {
+		let mut state = test_cache_state();
+
+		let meta = DecryptedFileMeta {
+			name: Cow::Borrowed("ghost.txt"),
+			size: 0,
+			mime: Cow::Borrowed("text/plain"),
+			key: Cow::Borrowed(&make_file_key()),
+			last_modified: Utc::now(),
+			created: None,
+			hash: None,
+		};
+		// Updating a nonexistent file should not error (0 rows affected)
+		state.update_file_meta(Uuid::new_v4(), &meta).unwrap();
+	}
+
+	// ─── Dir Name Update Tests ──────────────────────────────────────────────
+
+	#[test]
+	fn test_update_dir_name() {
+		let mut state = test_cache_state();
+		let dir = make_cacheable_dir(state.root_uuid);
+		state.upsert_dirs(once(&dir)).unwrap();
+
+		let decrypted_meta = DecryptedDirectoryMeta {
+			name: Cow::Borrowed("renamed_dir"),
+			created: None,
+		};
+
+		state.update_dir_name(dir.uuid, &decrypted_meta).unwrap();
+
+		let name: String = state
+			.db
+			.query_row(
+				"SELECT d.name FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+				params![dir.uuid],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert_eq!(name, "renamed_dir");
+	}
+
+	#[test]
+	fn test_update_dir_name_preserves_other_fields() {
+		let mut state = test_cache_state();
+		let dir = CacheableDir {
+			uuid: Uuid::new_v4(),
+			parent: state.root_uuid,
+			color: DirColor::Purple,
+			favorited: true,
+			timestamp: Utc::now(),
+			name: Cow::Owned("original".to_string()),
+			created: Some(Utc::now()),
+		};
+		state.upsert_dirs(once(&dir)).unwrap();
+
+		let decrypted_meta = DecryptedDirectoryMeta {
+			name: Cow::Borrowed("updated"),
+			created: dir.created,
+		};
+
+		state.update_dir_name(dir.uuid, &decrypted_meta).unwrap();
+
+		let (name, favorite, color): (String, bool, Option<String>) = state
+			.db
+			.query_row(
+				"SELECT d.name, d.favorite, d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+				params![dir.uuid],
+				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			)
+			.unwrap();
+		assert_eq!(name, "updated");
+		assert!(favorite, "favorite should be preserved");
+		assert_eq!(
+			color.as_deref(),
+			Some("purple"),
+			"color should be preserved"
+		);
+	}
+
+	#[test]
+	fn test_update_dir_name_nonexistent_is_noop() {
+		let mut state = test_cache_state();
+		let decrypted_meta = DecryptedDirectoryMeta {
+			name: Cow::Borrowed("ghost_dir"),
+			created: None,
+		};
+
+		state
+			.update_dir_name(Uuid::new_v4(), &decrypted_meta)
+			.unwrap();
+	}
+
+	// ─── Dir Color Update Tests ─────────────────────────────────────────────
+
+	#[test]
+	fn test_update_dir_color() {
+		let mut state = test_cache_state();
+		let dir = make_cacheable_dir(state.root_uuid);
+		state.upsert_dirs(once(&dir)).unwrap();
+
+		state.update_dir_color(dir.uuid, &DirColor::Red).unwrap();
+
+		let color: Option<String> = state
+			.db
+			.query_row(
+				"SELECT d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+				params![dir.uuid],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert_eq!(color.as_deref(), Some("red"));
+	}
+
+	#[test]
+	fn test_update_dir_color_preserves_other_fields() {
+		let mut state = test_cache_state();
+		let dir = CacheableDir {
+			uuid: Uuid::new_v4(),
+			parent: state.root_uuid,
+			color: DirColor::Blue,
+			favorited: true,
+			timestamp: Utc::now(),
+			name: Cow::Owned("my_dir".to_string()),
+			created: Some(Utc::now()),
+		};
+		state.upsert_dirs(once(&dir)).unwrap();
+
+		state.update_dir_color(dir.uuid, &DirColor::Green).unwrap();
+
+		let (name, favorite, color): (String, bool, Option<String>) = state
+			.db
+			.query_row(
+				"SELECT d.name, d.favorite, d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+				params![dir.uuid],
+				|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			)
+			.unwrap();
+		assert_eq!(name, "my_dir", "name should be preserved");
+		assert!(favorite, "favorite should be preserved");
+		assert_eq!(color.as_deref(), Some("green"));
+	}
+
+	#[test]
+	fn test_update_dir_color_nonexistent_is_noop() {
+		let mut state = test_cache_state();
+		state
+			.update_dir_color(Uuid::new_v4(), &DirColor::Blue)
+			.unwrap();
+	}
+
+	// ─── Delete All Non-Root Tests ──────────────────────────────────────────
+
+	#[test]
+	fn test_delete_all_non_root() {
+		let mut state = test_cache_state();
+
+		// Insert some dirs and files
+		let dirs: Vec<_> = (0..5)
+			.map(|_| make_cacheable_dir(state.root_uuid))
+			.collect();
+		let files: Vec<_> = (0..5)
+			.map(|_| make_cacheable_file(state.root_uuid))
+			.collect();
+		state.upsert_dirs(dirs.iter()).unwrap();
+		state.upsert_files(files.iter()).unwrap();
+
+		// Verify items exist
+		let total: usize = state
+			.db
+			.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(total, 11, "should have 1 root + 5 dirs + 5 files");
+
+		// Delete all non-root
+		state.delete_all_non_root().unwrap();
+
+		// Only root should remain
+		let total: usize = state
+			.db
+			.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(total, 1, "only root should remain");
+
+		let root_exists: bool = state
+			.db
+			.query_row(
+				"SELECT COUNT(*) > 0 FROM items WHERE uuid = ? AND type = 0",
+				params![state.root_uuid],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert!(root_exists, "root should still exist");
+	}
+
+	#[test]
+	fn test_delete_all_non_root_cascades_metadata() {
+		let mut state = test_cache_state();
+
+		state
+			.upsert_dirs(once(&make_cacheable_dir(state.root_uuid)))
+			.unwrap();
+		state
+			.upsert_files(once(&make_cacheable_file(state.root_uuid)))
+			.unwrap();
+
+		state.delete_all_non_root().unwrap();
+
+		let file_count: usize = state
+			.db
+			.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+			.unwrap();
+		let dir_count: usize = state
+			.db
+			.query_row("SELECT COUNT(*) FROM dirs", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(file_count, 0, "files table should be empty");
+		assert_eq!(dir_count, 0, "dirs table should be empty");
+	}
+
+	#[test]
+	fn test_delete_all_non_root_on_empty_db() {
+		let mut state = test_cache_state();
+		// Should not error when only root exists
+		state.delete_all_non_root().unwrap();
+
+		let total: usize = state
+			.db
+			.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(total, 1, "root should still exist");
 	}
 
 	// ─── Stress Tests ───────────────────────────────────────────────────────

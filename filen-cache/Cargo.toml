@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = "0.4"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 filen-sdk-rs = { path = "../filen-sdk-rs", features = ["cache"] }
+filen-types = { path = "../filen-types" }
 itertools = "0.14.0"
 log = "0.4.28"
 rusqlite = { version = "0.37.0", features = ["uuid"] }
@@ -14,7 +16,5 @@ uuid = "1.22.0"
 
 [dev-dependencies]
 filen-macros = { path = "../filen-macros" }
-filen-types = { path = "../filen-types" }
 test-utils = { path = "../test-utils" }
 tokio = { version = "1.50.0", features = ["full"] }
-chrono = "0.4"

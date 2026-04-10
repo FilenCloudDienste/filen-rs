@@ -10,13 +10,17 @@ def_sql_user_version!(1);
 pub(crate) const VACUUM: &str = "VACUUM;";
 pub(crate) const GET_USER_VERSION: &str = "PRAGMA user_version;";
 
+pub(crate) const DIR_UPDATE_COLOR: &str = include_str!("raw/dir_update_color.sql");
+pub(crate) const DIR_UPDATE_NAME: &str = include_str!("raw/dir_update_name.sql");
 pub(crate) const DIR_UPSERT: &str = include_str!("raw/dir_upsert.sql");
 
+pub(crate) const FILE_UPDATE_META: &str = include_str!("raw/file_update_meta.sql");
 pub(crate) const FILE_UPSERT: &str = include_str!("raw/file_upsert.sql");
 
 pub(crate) const INIT: &str = include_str!("raw/init.sql");
 
 pub(crate) const ITEM_DELETE: &str = include_str!("raw/item_delete.sql");
+pub(crate) const ITEM_DELETE_ALL_NON_ROOT: &str = include_str!("raw/item_delete_all_non_root.sql");
 pub(crate) const ITEM_UPDATE_OWN_ROOT_ID: &str = include_str!("raw/item_update_own_root_id.sql");
 pub(crate) const ITEM_UPSERT: &str = include_str!("raw/item_upsert.sql");
 
