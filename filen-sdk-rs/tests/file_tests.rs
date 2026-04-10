@@ -76,6 +76,7 @@ async fn file_upload_download() {
 }
 
 #[shared_test_runtime]
+#[ignore = "search backend changes pending"]
 async fn file_search() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

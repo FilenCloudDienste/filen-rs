@@ -532,6 +532,7 @@ async fn size() {
 }
 
 #[shared_test_runtime]
+#[ignore = "search backend changes pending"]
 async fn dir_search() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

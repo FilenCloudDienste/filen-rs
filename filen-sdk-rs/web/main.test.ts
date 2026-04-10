@@ -757,7 +757,7 @@ test("chats", async () => {
 	expect(chatEvent.inner.msg).toEqual(fetchedChat?.lastMessage)
 })
 
-test("search", async () => {
+test.skip("search", async () => {
 	const dir = await state.createDir(testDir, "search-dir-124asdfas;dlkfj")
 	const file = await state.uploadFile(new TextEncoder().encode("search file content"), {
 		parent: dir,
