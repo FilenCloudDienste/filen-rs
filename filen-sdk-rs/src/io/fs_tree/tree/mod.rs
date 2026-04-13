@@ -6,15 +6,13 @@ use std::{
 
 use string_interner::{DefaultBackend, StringInterner};
 
-use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL};
+use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL, io::CanonicalPath};
 
 use super::{WalkError, entry::*};
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(super) mod local;
 pub(super) mod remote;
-// #[cfg(test)]
-// mod test;
 
 pub(crate) struct FSTree<DirExtra, FileExtra> {
 	interner: StringInterner<DefaultBackend>,
@@ -48,11 +46,7 @@ impl<DirExtra, FileExtra> FSTree<DirExtra, FileExtra> {
 		&'a self,
 		root: &'a str,
 	) -> FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
-		FSTreeDFSIteratorWithPath {
-			stack: vec![LevelState::from_dir_children_info(self.root_children())],
-			tree: self,
-			root,
-		}
+		FSTreeDFSIteratorWithPath::new(self.root_children(), self, root)
 	}
 
 	pub(crate) fn dfs_iter<'a>(&'a self) -> FSTreeDFSIterator<'a, DirExtra, FileExtra> {
@@ -91,40 +85,60 @@ pub(crate) struct FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
 	root: &'a str,
 }
 
-impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
-	fn build_path(&self, root: &str, current_name: &str) -> String {
-		std::iter::once(root)
-			.filter(|r| !r.is_empty())
-			.chain(
-				self.stack
-					.iter()
-					.take(self.stack.len().saturating_sub(1))
-					.map(|level| {
-						let entry = &self.tree.entries[level.range.start - 1];
-						self.tree.get_name(entry)
-					}),
-			)
-			.chain(std::iter::once(current_name))
-			// should be replaced by an intersperse + collect after
-			// https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.intersperse
-			// is stabilized
-			.collect::<Vec<_>>()
-			.join("/")
+impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
+	fn new(info: DirChildrenInfo, tree: &'a FSTree<DirExtra, FileExtra>, root: &'a str) -> Self {
+		Self {
+			stack: vec![LevelState::from_dir_children_info(info)],
+			tree,
+			root,
+		}
+	}
+
+	pub(crate) fn canonicalize(
+		self,
+	) -> Result<FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra>, std::io::Error> {
+		FSTreeDFSIteratorWithPathCanonicalized::new(self)
 	}
 }
 
-impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
-	type Item = (&'a Entry<DirExtra, FileExtra>, String); // entry and path
+impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
+	fn descendants<'a>(&'a self, current_name: &'a str) -> impl Iterator<Item = &'a str> + Clone {
+		self.stack
+			.iter()
+			.take(self.stack.len().saturating_sub(1))
+			.map(|level| {
+				let entry = &self.tree.entries[level.range.start - 1];
+				self.tree.get_name(entry)
+			})
+			.chain(std::iter::once(current_name))
+	}
 
-	fn next(&mut self) -> Option<Self::Item> {
+	fn build_path_str(&self, root: &str, current_name: &str) -> String {
+		std::iter::once(root)
+			.chain(self.descendants(current_name))
+			.intersperse(std::path::MAIN_SEPARATOR_STR)
+			.collect()
+	}
+
+	fn build_path_canonical(&self, root: &CanonicalPath, current_name: &str) -> CanonicalPath {
+		root.create_descendant_path(self.descendants(current_name))
+	}
+}
+
+impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
+	fn inner_next<Ref: ?Sized, Own>(
+		&mut self,
+		root: &Ref,
+		path_builder: &impl Fn(&Self, &Ref, &str) -> Own,
+	) -> Option<(&'a Entry<DirExtra, FileExtra>, Own)> {
 		let Some(next_index) = self.stack.last_mut()?.next_index() else {
 			self.stack.pop();
 			// switch to become in the future (tail call)
-			return self.next();
+			return self.inner_next(root, path_builder);
 		};
 
 		let entry = &self.tree.entries[next_index];
-		let path = self.build_path(self.root, self.tree.get_name(entry));
+		let path = path_builder(self, root, self.tree.get_name(entry));
 
 		if let Entry::Dir(dir_entry) = entry {
 			let children_info = dir_entry.children_info();
@@ -133,6 +147,43 @@ impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIteratorWithPath<'a, DirExtr
 		}
 
 		Some((entry, path))
+	}
+}
+
+impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra> {
+	type Item = (&'a Entry<DirExtra, FileExtra>, String); // entry and path
+
+	fn next(&mut self) -> Option<Self::Item> {
+		self.inner_next(self.root, &Self::build_path_str)
+	}
+}
+
+pub(crate) struct FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra> {
+	inner: FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra>,
+	root: CanonicalPath,
+}
+
+impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra> {
+	fn new(
+		inner: FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra>,
+	) -> Result<Self, std::io::Error> {
+		Ok(Self {
+			root: CanonicalPath::new(inner.root.as_ref())?,
+			inner,
+		})
+	}
+}
+
+impl<'a, DirExtra, FileExtra> Iterator
+	for FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra>
+{
+	type Item = (&'a Entry<DirExtra, FileExtra>, CanonicalPath);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		self.inner.inner_next(
+			&self.root,
+			&FSTreeDFSIteratorWithPath::<DirExtra, FileExtra>::build_path_canonical,
+		)
 	}
 }
 

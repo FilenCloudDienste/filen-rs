@@ -9,7 +9,8 @@ use crate::{
 		file::enums::RemoteFileType,
 	},
 	io::{
-		DirDownloadCallback, client_impl::IoSharedClientExt, dir_download::CategoryDirDownloadExt,
+		DirDownloadCallback, client_impl::IoSharedClientExt,
+		dir_download::CategoryDirDownloadExtPub,
 	},
 	js::{
 		AnyDirWithContext, AnyFile, Dir, DirByCategoryWithContext, DirWithPath, File,
@@ -360,11 +361,10 @@ impl JsClient {
 				});
 
 				let file: RemoteFileType = file.try_into()?;
-				let target_path = PathBuf::from(file_path);
 				super::client_impl::IoSharedClientExt::download_file_to_path(
 					this.as_ref(),
 					&file,
-					target_path,
+					file_path.as_ref(),
 					callback,
 				)
 				.await
@@ -411,8 +411,7 @@ impl UnauthJsClient {
 				});
 
 				let file: crate::fs::file::LinkedFile = file.try_into()?;
-				let target_path = PathBuf::from(file_path);
-				this.download_file_to_path(&file, target_path, callback)
+				this.download_file_to_path(&file, file_path.as_ref(), callback)
 					.await
 			})
 			.await

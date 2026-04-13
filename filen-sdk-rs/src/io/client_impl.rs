@@ -30,7 +30,7 @@ use crate::{
 		categories::{DirType, Normal},
 		file::FileBuilderOptionalName,
 	},
-	io::{FilenMetaExt, meta_ext::FileTimesExt},
+	io::{CanonicalPath, FilenMetaExt, meta_ext::FileTimesExt},
 };
 
 const IO_BUFFER_SIZE: usize = 1024 * 64; // 64 KiB
@@ -374,7 +374,7 @@ impl Client {
 async fn inner_download_file_to_path<SC>(
 	unauth_client: &SC,
 	remote_file: &dyn File,
-	path: &Path,
+	path: &CanonicalPath,
 	callback: Option<MaybeSendCallback<'_, u64>>,
 ) -> Result<(), Error>
 where
@@ -386,7 +386,7 @@ where
 		Err(e) => return Err(e.into()),
 	};
 
-	let parent = path.parent().ok_or_else(|| {
+	let parent = path.as_ref().parent().ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidInput,
 			"Provided path has no parent directory",
@@ -438,9 +438,9 @@ where
 pub(crate) async fn inner_download_to_path_with_hash_check<SC>(
 	unauth_client: &SC,
 	remote_file: &dyn File,
-	path: PathBuf,
+	path: CanonicalPath,
 	callback: Option<MaybeSendCallback<'_, u64>>,
-) -> (Result<(), Error>, PathBuf)
+) -> (Result<(), Error>, CanonicalPath)
 where
 	SC: SharedClient,
 {
@@ -450,7 +450,7 @@ where
 		.last_modified()
 		.unwrap_or_else(|| remote_file.timestamp());
 	let (need_download, path) =
-		tokio::task::spawn_blocking(move || -> (Result<bool, std::io::Error>, PathBuf) {
+		tokio::task::spawn_blocking(move || -> (Result<bool, std::io::Error>, CanonicalPath) {
 			let file = match std::fs::File::open(&path) {
 				Ok(f) => f,
 				Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Ok(true), path),
@@ -527,7 +527,7 @@ pub trait IoSharedClientExt<'a>: SharedClient {
 	async fn download_file_to_path<'b>(
 		&'b self,
 		remote_file: &'b dyn File,
-		path: PathBuf,
+		path: &Path,
 		callback: Option<MaybeSendCallback<'b, u64>>,
 	) -> Result<(), Error>;
 }
@@ -590,11 +590,22 @@ where
 	async fn download_file_to_path<'b>(
 		&'b self,
 		remote_file: &'b dyn File,
-		path: PathBuf,
+		path: &Path,
 		callback: Option<MaybeSendCallback<'b, u64>>,
 	) -> Result<(), Error> {
-		let (res, _path) =
-			inner_download_to_path_with_hash_check(self, remote_file, path, callback).await;
+		let (res, _path) = inner_download_to_path_with_hash_check(
+			self,
+			remote_file,
+			CanonicalPath::new(path).map_err(|e| {
+				Error::custom_with_source(
+					ErrorKind::IO,
+					e,
+					Some(format!("Failed to canonicalize path: {}", path.display())),
+				)
+			})?,
+			callback,
+		)
+		.await;
 		res
 	}
 }

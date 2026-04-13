@@ -1,4 +1,4 @@
-#![feature(min_specialization, try_with_capacity, ascii_char)]
+#![feature(min_specialization, try_with_capacity, ascii_char, iter_intersperse)]
 #![allow(dead_code)]
 #![allow(type_alias_bounds)]
 

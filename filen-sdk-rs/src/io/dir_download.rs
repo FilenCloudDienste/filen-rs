@@ -1,7 +1,6 @@
 use std::{
 	borrow::Cow,
 	ops::Deref,
-	path::PathBuf,
 	sync::{Arc, atomic::AtomicU64},
 };
 
@@ -15,7 +14,7 @@ use crate::{
 		file::RemoteFile,
 	},
 	io::{
-		client_impl::inner_download_to_path_with_hash_check,
+		CanonicalPath, client_impl::inner_download_to_path_with_hash_check,
 		fs_tree::build_fs_tree_from_remote_iterator, meta_ext::DirTimesExt,
 	},
 };
@@ -58,9 +57,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 	fn download_file_to_path_in_dir_download(
 		client: &Self::Client,
 		remote_file: Self::File,
-		path: PathBuf,
+		path: CanonicalPath,
 		downloaded_bytes: &AtomicU64,
-	) -> impl Future<Output = (Result<(), Error>, PathBuf, Self::File)> + Send {
+	) -> impl Future<Output = (Result<(), Error>, CanonicalPath, Self::File)> + Send {
 		async {
 			let (res, path) = inner_download_to_path_with_hash_check(
 				client,
@@ -79,7 +78,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 	fn spawn_folder_maker_task(
 		tree: super::fs_tree::FSTree<Self::Dir, Self::File>,
 		entry_complete_sender: tokio::sync::mpsc::Sender<EntryResult<Self>>,
-		file_download_request_sender: tokio::sync::mpsc::Sender<(Self::File, String)>,
+		file_download_request_sender: tokio::sync::mpsc::Sender<(Self::File, CanonicalPath)>,
 		target_folder: DirType<'static, Self>,
 		root_path: String,
 	) -> tokio::task::JoinHandle<Result<(), Error>> {
@@ -101,7 +100,9 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 				_ => {}
 			};
 
-			for (entry, path) in tree.dfs_iter_with_path(&root_path) {
+			let iter = tree.dfs_iter_with_path(&root_path);
+
+			for (entry, path) in iter.canonicalize()? {
 				match entry {
 					Entry::Dir(dir_entry) => {
 						let dir = dir_entry.extra_data().clone();
@@ -113,7 +114,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 									Err(e.with_context(
 										"couldn't create directory during dir download",
 									)),
-									path,
+									path.into_string(),
 									NonRootItemType::<Self>::Dir(Cow::Owned(dir)),
 								))
 								.unwrap();
@@ -130,7 +131,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 									Err(e.with_context(
 										"couldn't set directory times during dir download",
 									)),
-									path,
+									path.into_string(),
 									NonRootItemType::<Self>::Dir(Cow::Owned(dir)),
 								))
 								.unwrap();
@@ -139,7 +140,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 						entry_complete_sender
 							.blocking_send((
 								Ok(()),
-								path,
+								path.into_string(),
 								NonRootItemType::<Self>::Dir(Cow::Owned(dir)),
 							))
 							.unwrap();
@@ -158,7 +159,10 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 
 	fn spawn_file_downloader_task(
 		client: Arc<Self::Client>,
-		mut file_download_request_receiver: tokio::sync::mpsc::Receiver<(Self::File, String)>,
+		mut file_download_request_receiver: tokio::sync::mpsc::Receiver<(
+			Self::File,
+			CanonicalPath,
+		)>,
 		entry_complete_sender: tokio::sync::mpsc::Sender<(
 			Result<(), Error>,
 			String,
@@ -181,13 +185,17 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 					let (res, _, file) = Self::download_file_to_path_in_dir_download(
 						&client,
 						remote_file,
-						path.clone().into(),
+						path.clone(),
 						&downloaded_bytes,
 					)
 					.await;
 
 					let _ = entry_complete_sender
-						.send((res, path, NonRootItemType::<Self>::File(Cow::Owned(file))))
+						.send((
+							res,
+							path.into_string(),
+							NonRootItemType::<Self>::File(Cow::Owned(file)),
+						))
 						.await;
 					drop(permit);
 				});
@@ -210,7 +218,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		let mut update_interval = tokio::time::interval(CALLBACK_INTERVAL);
 
 		let (file_download_request_sender, file_download_request_receiver) =
-			tokio::sync::mpsc::channel::<(Self::File, String)>(
+			tokio::sync::mpsc::channel::<(Self::File, CanonicalPath)>(
 				client.get_unauth_client().state().max_concurrency(),
 			);
 
