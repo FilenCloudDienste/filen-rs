@@ -4442,6 +4442,7 @@ pub async fn test_recents() {
 }
 
 #[shared_test_runtime]
+#[ignore = "search backend changes pending"]
 pub async fn test_search() {
 	let (db, rss) = get_db_resources().await;
 
