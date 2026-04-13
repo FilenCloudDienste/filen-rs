@@ -46,7 +46,7 @@ use crate::{
 	runtime,
 };
 
-use super::consts::{AUTHED_TRUE, VERSIONED_EVENT_PREFIXES};
+use super::consts::{ARCHIVED_EVENT_PREFIX, AUTHED_TRUE};
 
 pub(super) fn try_parse_message_from_str<T>(
 	msg: T,
@@ -114,12 +114,8 @@ where
 			return Ok(None);
 		}
 
-		// these are duplicates of FileArchived, so we can just ignore them
-		if VERSIONED_EVENT_PREFIXES
-			.iter()
-			.any(|prefix| event_str.starts_with(prefix))
-		{
-			// ignore versioned events for now
+		// these are duplicates of FileVersioned, so we can just ignore them
+		if event_str.starts_with(ARCHIVED_EVENT_PREFIX) {
 			return Ok(None);
 		}
 

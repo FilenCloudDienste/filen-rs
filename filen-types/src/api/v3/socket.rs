@@ -242,7 +242,7 @@ fn classify_event(name: &str) -> Option<(EventCategory, &'static str)> {
 		"file-trash" => (Drive, "fileTrash"),
 		"file-rename" => (Drive, "fileRename"),
 		"file-restore" => (Drive, "fileRestore"),
-		"file-archived" => (Drive, "fileArchived"),
+		"file-versioned" => (Drive, "fileArchived"),
 		"file-archive-restored" => (Drive, "fileArchiveRestored"),
 		"file-deleted-permanent" => (Drive, "fileDeletedPermanent"),
 		"file-metadata-changed" => (Drive, "fileMetadataChanged"),
