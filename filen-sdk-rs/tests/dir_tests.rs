@@ -26,7 +26,7 @@ use filen_sdk_rs::{
 		file::{RemoteFile, meta::FileMeta, traits::HasFileMeta},
 		name::EntryNameError,
 	},
-	io::{DirUploadCallback, FilenMetaExt},
+	io::{CategoryDirDownloadExtPub, DirDownloadCallback, DirUploadCallback, FilenMetaExt},
 };
 use filen_types::fs::ParentUuid;
 use futures::StreamExt;
@@ -964,6 +964,111 @@ async fn not_found_error() {
 		.await
 		.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::FolderNotFound)
+}
+
+#[derive(Default)]
+struct DebugDirDownloadCallback {
+	errors: std::sync::Mutex<Vec<String>>,
+}
+
+impl DirDownloadCallback<Normal> for DebugDirDownloadCallback {
+	fn on_query_download_progress(&self, _known_bytes: u64, _total_bytes: Option<u64>) {}
+	fn on_scan_progress(&self, _known_dirs: u64, _known_files: u64, _known_bytes: u64) {}
+	fn on_scan_errors(&self, _errors: Vec<Error>) {}
+	fn on_scan_complete(&self, _total_dirs: u64, _total_files: u64, _total_bytes: u64) {}
+	fn on_download_update(
+		&self,
+		_downloaded_dirs: Vec<(RemoteDirectory, String)>,
+		_downloaded_files: Vec<(RemoteFile, String)>,
+		_downloaded_bytes: u64,
+	) {
+	}
+	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
+		let mut errs = self.errors.lock().unwrap();
+		for (e, path, _) in &errors {
+			errs.push(format!("{path}: {e}"));
+		}
+	}
+}
+
+#[shared_test_runtime]
+async fn download_dir_with_long_names() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+
+	// 255-char directory/file names (max on most filesystems)
+	let long_name_a = "a".repeat(255);
+	let long_name_b = "b".repeat(255);
+	let long_file_name = format!("{}.txt", "c".repeat(251)); // 255 chars total with .txt
+
+	// Build the local directory structure:
+	//   <upload_dir>/<long_name_a>/<long_name_b>/<long_file_name>
+	let upload_dir =
+		std::env::temp_dir().join(format!("test_long_name_upload_{}", std::process::id()));
+	let _ = tokio::fs::remove_dir_all(&upload_dir).await;
+
+	let nested = upload_dir.join(&long_name_a).join(&long_name_b);
+	tokio::fs::create_dir_all(&nested).await.unwrap();
+	tokio::fs::write(nested.join(&long_file_name), b"long name file content")
+		.await
+		.unwrap();
+
+	// Upload the directory
+	client
+		.clone()
+		.upload_dir_recursively(
+			upload_dir.clone(),
+			&DebugDirUploadCallback::default(),
+			test_dir,
+		)
+		.await
+		.unwrap();
+
+	// Download to a different path
+	let download_dir =
+		std::env::temp_dir().join(format!("test_long_name_download_{}", std::process::id()));
+	let _ = tokio::fs::remove_dir_all(&download_dir).await;
+	tokio::fs::create_dir_all(&download_dir).await.unwrap();
+
+	let download_target = download_dir.join(test_dir.name().unwrap());
+	let callback = DebugDirDownloadCallback::default();
+
+	Normal::download_dir_recursively(
+		client.clone(),
+		download_target.to_str().unwrap().to_string(),
+		&callback,
+		DirType::Dir(Cow::Owned(test_dir.clone())),
+		(),
+	)
+	.await
+	.unwrap();
+
+	{
+		let errors = callback.errors.lock().unwrap();
+		assert!(errors.is_empty(), "download had errors: {:?}", *errors);
+	}
+
+	// Verify the nested structure exists and has the correct content
+	let downloaded_file = download_target
+		.join(&long_name_a)
+		.join(&long_name_b)
+		.join(&long_file_name);
+	assert!(
+		downloaded_file.exists(),
+		"downloaded file does not exist at {}",
+		downloaded_file.display()
+	);
+	let content = tokio::fs::read_to_string(&downloaded_file).await.unwrap();
+	assert_eq!(content, "long name file content");
+
+	// Verify the canonical path is valid — no symlink trickery
+	let canonical = std::fs::canonicalize(&downloaded_file).unwrap();
+	assert!(canonical.ends_with(&long_file_name));
+
+	// Clean up
+	let _ = tokio::fs::remove_dir_all(&upload_dir).await;
+	let _ = tokio::fs::remove_dir_all(&download_dir).await;
 }
 
 // ── Name validation: DirectoryMetaChanges ───────────────────────────
