@@ -532,7 +532,7 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "publicLinkFile")
 	)]
-	pub async fn public_link_file_inner(&self, file: File) -> Result<FilePublicLink, Error> {
+	pub async fn public_link_file(&self, file: File) -> Result<FilePublicLink, Error> {
 		let this = self.inner();
 		runtime::do_on_commander(
 			move || async move { this.public_link_file(&file.try_into()?).await },
