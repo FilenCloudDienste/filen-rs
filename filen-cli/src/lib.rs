@@ -23,16 +23,3 @@ pub fn deserialize_auth_config(sdk_config: &str) -> Result<Client> {
 		.context("Failed to create client from SDK config")?;
 	Ok(client)
 }
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[tokio::test]
-	async fn test_serialize_deserialize_auth_config() {
-		let original_client = test_utils::RESOURCES.client().await;
-		let serialized = serialize_auth_config(&original_client).unwrap();
-		let deserialized_client = deserialize_auth_config(&serialized).unwrap();
-		assert_eq!(original_client.email(), deserialized_client.email());
-	}
-}

@@ -1,5 +1,5 @@
 // use assert_cmd::cargo::cargo_bin_cmd;
-// use filen_macros::shared_test_runtime;
+use filen_macros::shared_test_runtime;
 // use test_utils::authenticated_cli_with_args;
 
 // fn get_testing_credentials() -> (String, String) {
@@ -8,6 +8,14 @@
 // 	let password = std::env::var("TEST_PASSWORD").expect("TEST_PASSWORD not set in .env file");
 // 	(email, password)
 // }
+
+#[shared_test_runtime]
+async fn test_serialize_deserialize_auth_config() {
+	let original_client = test_utils::RESOURCES.client().await;
+	let serialized = filen_cli::serialize_auth_config(&original_client).unwrap();
+	let deserialized_client = filen_cli::deserialize_auth_config(&serialized).unwrap();
+	assert_eq!(original_client.email(), deserialized_client.email());
+}
 
 // #[test]
 // fn authenticate_from_cli_args() {
