@@ -56,6 +56,14 @@ jobs:
           taplo fmt --check
       - name: Run sqlfluff
         run: sqlfluff lint .
+      - name: Run unit tests
+        run: cargo test --lib --no-fail-fast
+        env:
+          TEST_EMAIL: 'test@filen.io'
+          TEST_PASSWORD: 'testpassword'
+          TEST_SHARE_EMAIL: 'test_share@filen.io'
+          TEST_SHARE_PASSWORD: 'test_share_password'
+          RUST_LOG: debug
 
   ci-windows:
     runs-on: windows-latest
@@ -89,6 +97,14 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
         run: cargo clippy --tests -- -D warnings
+      - name: Run unit tests
+        run: cargo test --lib --no-fail-fast
+        env:
+          TEST_EMAIL: 'test@filen.io'
+          TEST_PASSWORD: 'testpassword'
+          TEST_SHARE_EMAIL: 'test_share@filen.io'
+          TEST_SHARE_PASSWORD: 'test_share_password'
+          RUST_LOG: debug
 
   ci-macos:
     # also runs iOS and Android clippy
@@ -144,6 +160,14 @@ jobs:
         run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder -- -D warnings
       - name: Run clippy iOS uniffi
         run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder,uniffi -- -D warnings
+      - name: Run unit tests
+        run: cargo test --lib --no-fail-fast
+        env:
+          TEST_EMAIL: 'test@filen.io'
+          TEST_PASSWORD: 'testpassword'
+          TEST_SHARE_EMAIL: 'test_share@filen.io'
+          TEST_SHARE_PASSWORD: 'test_share_password'
+          RUST_LOG: debug
 
   ci-wasm:
     runs-on: ubuntu-latest
