@@ -196,59 +196,6 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 		})
 	}
 
-	async fn download_dir_recursively<C>(
-		client: Arc<Self::Client>,
-		dir_path: String,
-		callback: impl Deref<Target = C>,
-		target: DirType<'static, Self>,
-		context: Self::ListDirContext<'_>,
-	) -> Result<(), Error>
-	where
-		C: DirDownloadCallback<Self> + ?Sized,
-	{
-		use filen_types::traits::CowHelpers;
-
-		use crate::util::AtomicDropCanceller;
-
-		let drop_canceller = AtomicDropCanceller::default();
-
-		let callback_ref = callback.deref();
-
-		let (tree, stats) = build_fs_tree_from_remote_iterator::<_, Self>(
-			&client,
-			target.as_borrowed_cow(),
-			&mut |errors| {
-				callback_ref.on_scan_errors(errors);
-			},
-			&mut |dirs, files, bytes| {
-				callback_ref.on_scan_progress(dirs, files, bytes);
-			},
-			Some(&|current_bytes, total_bytes| {
-				callback_ref.on_query_download_progress(current_bytes, total_bytes);
-			}),
-			drop_canceller.cancelled(),
-			context,
-		)
-		.await?;
-
-		let (dirs, files, bytes) = stats.snapshot();
-		callback_ref.on_scan_complete(dirs, files, bytes);
-
-		Self::download_fs_tree_from_target_into_path(
-			client,
-			&mut |errors| {
-				callback_ref.on_download_errors(errors);
-			},
-			&mut |downloaded_dirs, downloaded_files, bytes| {
-				callback_ref.on_download_update(downloaded_dirs, downloaded_files, bytes);
-			},
-			dir_path,
-			tree,
-			target,
-		)
-		.await
-	}
-
 	async fn download_fs_tree_from_target_into_path(
 		client: Arc<Self::Client>,
 		error_callback: &mut impl FnMut(Vec<(Error, String, NonRootItemType<'static, Self>)>),
@@ -349,3 +296,63 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 }
 
 impl<T> CategoryDirDownloadExt for T where T: CategoryFSExt {}
+
+#[allow(private_bounds)]
+pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
+	fn download_dir_recursively<C>(
+		client: Arc<Self::Client>,
+		dir_path: String,
+		callback: impl Deref<Target = C>,
+		target: DirType<'static, Self>,
+		context: Self::ListDirContext<'_>,
+	) -> impl std::future::Future<Output = Result<(), Error>>
+	where
+		C: DirDownloadCallback<Self> + ?Sized,
+	{
+		async move {
+			use filen_types::traits::CowHelpers;
+
+			use crate::util::AtomicDropCanceller;
+
+			let drop_canceller = AtomicDropCanceller::default();
+
+			let callback_ref = callback.deref();
+
+			let (tree, stats) = build_fs_tree_from_remote_iterator::<_, Self>(
+				&client,
+				target.as_borrowed_cow(),
+				&mut |errors| {
+					callback_ref.on_scan_errors(errors);
+				},
+				&mut |dirs, files, bytes| {
+					callback_ref.on_scan_progress(dirs, files, bytes);
+				},
+				Some(&|current_bytes, total_bytes| {
+					callback_ref.on_query_download_progress(current_bytes, total_bytes);
+				}),
+				drop_canceller.cancelled(),
+				context,
+			)
+			.await?;
+
+			let (dirs, files, bytes) = stats.snapshot();
+			callback_ref.on_scan_complete(dirs, files, bytes);
+
+			Self::download_fs_tree_from_target_into_path(
+				client,
+				&mut |errors| {
+					callback_ref.on_download_errors(errors);
+				},
+				&mut |downloaded_dirs, downloaded_files, bytes| {
+					callback_ref.on_download_update(downloaded_dirs, downloaded_files, bytes);
+				},
+				dir_path,
+				tree,
+				target,
+			)
+			.await
+		}
+	}
+}
+
+impl<T> CategoryDirDownloadExtPub for T where T: CategoryDirDownloadExt {}
