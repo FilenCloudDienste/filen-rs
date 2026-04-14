@@ -113,7 +113,7 @@ impl Default for ClientConfig {
 			rate_limit_per_sec: NonZeroU32::new(64).unwrap(),
 			upload_bandwidth_kilobytes_per_sec: None,
 			download_bandwidth_kilobytes_per_sec: None,
-			log_level: log::LevelFilter::Debug,
+			log_level: log::max_level(),
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
 				{
