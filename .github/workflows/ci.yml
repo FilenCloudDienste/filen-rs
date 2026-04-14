@@ -170,23 +170,55 @@ jobs:
           RUST_LOG: debug
 
   ci-wasm:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     name: CI on wasm
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           submodules: true
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-02-20
           components: clippy,rustfmt
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown, aarch64-linux-android, x86_64-linux-android, aarch64-apple-ios, aarch64-apple-ios-sim
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+      - name: Setup Android SDK
+        uses: amyu/setup-android@v4
+        with:
+          sdk-version: 36
+          build-tools-version: 35.0.0
+          cmake-version: 3.10.2.4988404
+          ndk-version: 27.0.12077973
       - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
           shared-key: cargo-build-ci-wasm
           prefix-key: ''
           add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          # waiting on a new release that includes
+          # https://github.com/drager/wasm-pack/pull/1428
+          tool: wasm-pack
+          git: https://github.com/drager/wasm-pack
+          rev: cd1718aa7babb656796b8aae3c177ddacce28028
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          # Can't use the latest version until https://github.com/bbqsrc/cargo-ndk/issues/181 is resolved
+          tool: cargo-ndk@3.5.4
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
       - name: Run clippy wasm-full
         run: cargo clippy --target wasm32-unknown-unknown -F wasm-full -- -D warnings
         working-directory: ./filen-sdk-rs
@@ -196,3 +228,12 @@ jobs:
       - name: Run rustfmt in filen-wasm
         run: cargo fmt -- --check
         working-directory: ./filen-sdk-rs
+      - name: Build WASM bundle
+        run: sh wasm-pack.sh
+        working-directory: ./filen-sdk-rs
+      - name: Install dependencies
+        run: npm install --package-lock-only && npm ci
+        working-directory: ./filen-sdk-rs/web
+      - name: Build React Native Bundle
+        run: npm run ubrn:release
+        working-directory: ./filen-sdk-rs/web
