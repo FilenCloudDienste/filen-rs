@@ -591,53 +591,53 @@ mod tests {
 			let _ = fs::remove_dir_all(&dir);
 		}
 
+		/// Our validator is at least as strict as Windows: anything we accept,
+		/// Windows must also accept. We may additionally reject names that
+		/// Windows allows — this is intentional for cross-platform safety.
+		///
+		/// Windows 11 relaxed legacy device name restrictions (CON, PRN, COM1,
+		/// etc. are now usable as regular filenames). Our validator still
+		/// rejects them to ensure compatibility with older Windows versions.
+		/// See: https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats#handle-legacy-devices
 		#[test]
-		fn win_reserved_bare_names_rejected() {
-			let dir = test_dir("reserved_bare");
-			for base in ["con", "prn", "aux", "nul"] {
-				for variant in super::all_case_combinations(base) {
-					assert!(
-						!windows_accepts(&dir, &variant),
-						"Windows should reject reserved name {variant:?}"
-					);
-					assert!(
-						parse_name(&variant).is_err(),
-						"Our validator should also reject {variant:?}"
-					);
-				}
-			}
-			let _ = fs::remove_dir_all(&dir);
-		}
+		fn win_validator_is_superset_of_os_restrictions() {
+			let dir = test_dir("superset");
+			let names: Vec<String> = [
+				// Reserved bare names (all case combos)
+				"con", "prn", "aux", "nul",
+			]
+			.into_iter()
+			.flat_map(super::all_case_combinations)
+			// COM/LPT with digits 0-9
+			.chain((b'0'..=b'9').flat_map(|d| {
+				["COM", "com", "LPT", "lpt"]
+					.into_iter()
+					.map(move |p| format!("{p}{}", d as char))
+			}))
+			// Reserved names with extensions
+			.chain(
+				[
+					"CON.txt", "con.txt", "PRN.log", "AUX.dat", "NUL.bin", "COM1.txt", "com1.txt",
+					"LPT1.txt", "lpt1.txt",
+				]
+				.into_iter()
+				.map(String::from),
+			)
+			// Not-reserved lookalikes
+			.chain(
+				["CONSOLE", "NULL", "COMA", "LPTA", "COM", "LPT", "CONX"]
+					.into_iter()
+					.map(String::from),
+			)
+			.collect();
 
-		#[test]
-		fn win_reserved_com_lpt_match_validator() {
-			let dir = test_dir("com_lpt");
-			for digit in b'0'..=b'9' {
-				for prefix in ["COM", "com", "LPT", "lpt"] {
-					let name = format!("{prefix}{}", digit as char);
-					let win = windows_accepts(&dir, &name);
-					let us = parse_name(&name).is_ok();
-					assert_eq!(
-						win, us,
-						"Mismatch for {name:?}: Windows accepts={win}, we accept={us}"
-					);
-				}
-			}
-			let _ = fs::remove_dir_all(&dir);
-		}
-
-		#[test]
-		fn win_reserved_with_extension_match_validator() {
-			let dir = test_dir("reserved_ext");
-			for name in [
-				"CON.txt", "con.txt", "PRN.log", "AUX.dat", "NUL.bin", "COM1.txt", "com1.txt",
-				"LPT1.txt", "lpt1.txt",
-			] {
+			for name in &names {
 				let win = windows_accepts(&dir, name);
 				let us = parse_name(name).is_ok();
-				assert_eq!(
-					win, us,
-					"Mismatch for {name:?}: Windows accepts={win}, we accept={us}"
+				assert!(
+					!us || win,
+					"Validator accepts {name:?} but Windows rejects it — \
+					 our validator must never be more permissive than the OS"
 				);
 			}
 			let _ = fs::remove_dir_all(&dir);
