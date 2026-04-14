@@ -1,8 +1,8 @@
 name: Tests
 on:
-  # Run at 3 AM every day
+  # Run at 2 AM CEST every day
   schedule:
-    - cron: '0 3 * * *'
+    - cron: '0 0 * * *'
 
   # Allow manual triggering from GitHub UI
   workflow_dispatch:
