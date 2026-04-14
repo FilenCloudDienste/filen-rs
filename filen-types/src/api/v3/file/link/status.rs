@@ -25,16 +25,19 @@ pub struct LinkStatus<'a> {
 	pub password: Option<Cow<'a, [u8]>>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RawResponse<'a> {
 	enabled: bool,
+	#[serde(default)]
 	uuid: Option<UuidStr>,
-	#[serde(with = "crate::serde::time::optional")]
+	#[serde(with = "crate::serde::time::optional", default)]
 	expiration: Option<DateTime<Utc>>,
+	#[serde(default)]
 	expiration_text: Option<PublicLinkExpiration>,
+	#[serde(default)]
 	download_btn: Option<u8>,
-	#[serde(with = "crate::serde::hex::optional")]
+	#[serde(with = "crate::serde::hex::optional", default)]
 	password: Option<Cow<'a, [u8]>>,
 }
 
@@ -73,35 +76,5 @@ impl<'de> Deserialize<'de> for Response<'static> {
 			download_btn: download_btn == 1,
 			password: raw.password,
 		})))
-	}
-}
-
-impl Serialize for Response<'_> {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		let raw = match &self.0 {
-			Some(link_status) => RawResponse {
-				enabled: true,
-				uuid: Some(link_status.uuid),
-				expiration: Some(link_status.expiration),
-				expiration_text: Some(link_status.expiration_text),
-				download_btn: Some(if link_status.download_btn { 1 } else { 0 }),
-				password: link_status
-					.password
-					.as_ref()
-					.map(|c| Cow::Borrowed(c.as_ref())),
-			},
-			None => RawResponse {
-				enabled: false,
-				uuid: None,
-				expiration: None,
-				expiration_text: None,
-				download_btn: None,
-				password: None,
-			},
-		};
-		raw.serialize(serializer)
 	}
 }

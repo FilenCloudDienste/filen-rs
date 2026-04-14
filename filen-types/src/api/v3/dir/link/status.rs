@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{
 	Deserialize, Deserializer, Serialize,
-	de::{self, IntoDeserializer},
+	de::{self},
 };
 
 use crate::{crypto::EncryptedMetaKey, fs::UuidStr};
@@ -35,13 +35,18 @@ pub struct LinkStatus<'a> {
 #[serde(rename_all = "camelCase")]
 struct RawResponse<'a> {
 	exists: bool,
+	#[serde(default)]
 	uuid: Option<UuidStr>,
+	#[serde(default)]
 	key: Option<EncryptedMetaKey<'a>>,
-	#[serde(with = "crate::serde::time::optional")]
+	#[serde(with = "crate::serde::time::optional", default)]
 	expiration: Option<DateTime<Utc>>,
+	#[serde(default)]
 	expiration_text: Option<PublicLinkExpiration>,
+	#[serde(default)]
 	download_btn: Option<u8>,
-	pub password: Option<Cow<'a, str>>,
+	#[serde(with = "crate::serde::hex::optional", default)]
+	password: Option<Cow<'a, [u8]>>,
 }
 
 impl<'de> Deserialize<'de> for Response<'static> {
@@ -73,51 +78,13 @@ impl<'de> Deserialize<'de> for Response<'static> {
 			return Err(de::Error::custom("downloadBtn must be either 0 or 1"));
 		}
 
-		let password = if let Some(p) = raw.password {
-			Some(faster_hex::nopfx_ignorecase::deserialize(
-				p.into_deserializer(),
-			)?)
-		} else {
-			None
-		};
-
 		Ok(Response(Some(LinkStatus {
 			uuid,
 			key,
 			expiration,
 			expiration_text,
 			download_btn: download_btn == 1,
-			password,
+			password: raw.password,
 		})))
 	}
 }
-
-// impl Serialize for Response {
-// 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-// 	where
-// 		S: serde::Serializer,
-// 	{
-// 		let raw_response = match &self.0 {
-// 			Some(link_status) => RawResponse {
-// 				exists: true,
-// 				uuid: Some(link_status.uuid),
-// 				key: Some(link_status.key.clone()),
-// 				expiration: Some(link_status.expiration),
-// 				expiration_text: Some(link_status.expiration_text),
-// 				download_btn: Some(if link_status.download_btn { 1 } else { 0 }),
-// 				password: Some(link_status.password),
-// 			},
-// 			None => RawResponse {
-// 				exists: false,
-// 				uuid: None,
-// 				key: None,
-// 				expiration: None,
-// 				expiration_text: None,
-// 				download_btn: None,
-// 				password: None,
-// 			},
-// 		};
-
-// 		raw_response.serialize(serializer)
-// 	}
-// }

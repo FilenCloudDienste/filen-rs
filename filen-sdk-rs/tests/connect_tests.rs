@@ -50,6 +50,9 @@ async fn dir_public_link() {
 		.build();
 	let empty_file = client.upload_file(empty_file.into(), b"").await.unwrap();
 
+	let no_link = client.get_dir_link_rw(&dir).await.unwrap();
+	assert_eq!(no_link, None);
+
 	let mut link_rw = client
 		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
 		.await
@@ -216,6 +219,9 @@ async fn file_public_link() {
 		.upload_file(file.into(), b"Hello, world!")
 		.await
 		.unwrap();
+
+	let no_link = client.get_file_link_status(&file).await.unwrap();
+	assert_eq!(no_link, None);
 
 	let mut link = client.public_link_file(&file).await.unwrap();
 	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
