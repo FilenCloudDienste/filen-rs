@@ -746,11 +746,11 @@ test("chats", async () => {
 	// sleep for 5s
 	await new Promise(resolve => setTimeout(resolve, 5000))
 
-	const chatEvent = allEvents.find(e => e.type === "chat" && e.inner.type === "chatMessageNew" && e.inner.msg.chat === chat.uuid)
+	const chatEvent = allEvents.find(e => e.type === "chat" && e.inner.type === "messageNew" && e.inner.msg.chat === chat.uuid)
 
 	expect(chatEvent).toBeDefined()
 
-	if (chatEvent?.type !== "chat" || chatEvent.inner.type !== "chatMessageNew") {
+	if (chatEvent?.type !== "chat" || chatEvent.inner.type !== "messageNew") {
 		throw new Error("Expected chatMessageNew event")
 	}
 
