@@ -115,6 +115,7 @@ impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
 
 	fn build_path_str(&self, root: &str, current_name: &str) -> String {
 		std::iter::once(root)
+			.skip_while(|s| s.is_empty())
 			.chain(self.descendants(current_name))
 			.intersperse(std::path::MAIN_SEPARATOR_STR)
 			.collect()
