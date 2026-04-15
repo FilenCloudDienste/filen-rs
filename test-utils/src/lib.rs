@@ -285,6 +285,10 @@ pub async fn set_up_contact<'a>(
 		.await
 		.unwrap();
 
+	if std::env::var("SHORT_CONTACT_SETUP").as_deref() != Ok("1") {
+		tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+	}
+
 	share_client
 		.accept_contact_request(request_uuid)
 		.await
