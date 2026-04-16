@@ -1,13 +1,13 @@
+use std::sync::Arc;
+
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::{auth::Client, chats::Chat};
+use filen_sdk_rs::{auth::Client, chats::Chat, sync::lock::ResourceLock};
+use test_utils::set_up_contact;
 
 #[shared_test_runtime]
 async fn conversation_creation() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
+	let _lock = lock_chat(&client).await;
 
 	let chat = client.create_chat(&[]).await.unwrap();
 
@@ -20,10 +20,7 @@ async fn conversation_creation() {
 #[shared_test_runtime]
 async fn conversation_deletion() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
+	let _lock = lock_chat(&client).await;
 
 	let chat = client.create_chat(&[]).await.unwrap();
 	let chats = client.list_chats().await.unwrap();
@@ -37,10 +34,7 @@ async fn conversation_deletion() {
 #[shared_test_runtime]
 async fn conversation_renaming() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
+	let _lock = lock_chat(&client).await;
 
 	let mut chat = client.create_chat(&[]).await.unwrap();
 	let chats = client.list_chats().await.unwrap();
@@ -60,10 +54,7 @@ async fn conversation_renaming() {
 #[shared_test_runtime]
 async fn conversation_muting() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
+	let _lock = lock_chat(&client).await;
 
 	let mut chat = client.create_chat(&[]).await.unwrap();
 	let fetched = client.get_chat(chat.uuid()).await.unwrap().unwrap();
@@ -78,10 +69,43 @@ async fn conversation_muting() {
 	let fetched = client.get_chat(chat.uuid()).await.unwrap().unwrap();
 	assert_eq!(chat, fetched);
 }
-async fn make_chat(client: &Client, share_client: &Client) -> Chat {
-	if let Ok(uuid) = client.send_contact_request(share_client.email()).await {
-		let _ = share_client.accept_contact_request(uuid).await;
-	}
+
+async fn lock_chat(client: &Client) -> Arc<ResourceLock> {
+	client
+		.acquire_lock_with_default("test:chats")
+		.await
+		.unwrap()
+}
+
+async fn lock_chats(
+	client: &Client,
+	share_client: &Client,
+) -> (
+	Arc<ResourceLock>,
+	Arc<ResourceLock>,
+	Arc<ResourceLock>,
+	Arc<ResourceLock>,
+) {
+	let lock1 = lock_chat(client).await;
+	let lock2 = lock_chat(share_client).await;
+
+	let (lock3, lock4, _, _) = set_up_contact(client, share_client).await;
+	(lock1, lock2, lock3, lock4)
+}
+
+async fn make_chat(
+	client: &Client,
+	share_client: &Client,
+) -> (
+	(
+		Arc<ResourceLock>,
+		Arc<ResourceLock>,
+		Arc<ResourceLock>,
+		Arc<ResourceLock>,
+	),
+	Chat,
+) {
+	let locks = lock_chats(client, share_client).await;
 
 	let chats = client.list_chats().await.unwrap();
 	for chat in chats {
@@ -102,21 +126,14 @@ async fn make_chat(client: &Client, share_client: &Client) -> Chat {
 		.find(|c| c.email == share_client.email())
 		.unwrap();
 
-	client.create_chat(&[contact]).await.unwrap()
+	(locks, client.create_chat(&[contact]).await.unwrap())
 }
 
 #[shared_test_runtime]
 async fn conversation_participant_management() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let _lock = client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
-	let _lock1 = share_client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
+	let _locks = lock_chats(&client, &share_client).await;
 
 	let chats = client.list_chats().await.unwrap();
 	for chat in chats {
@@ -168,16 +185,8 @@ async fn conversation_participant_management() {
 async fn chat_msgs() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
-	let _lock = client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
-	let _lock1 = share_client
-		.acquire_lock_with_default("test:chats")
-		.await
-		.unwrap();
 
-	let mut chat = make_chat(&client, &share_client).await;
+	let (_locks, mut chat) = make_chat(&client, &share_client).await;
 
 	client
 		.send_chat_message(&mut chat, "Hello!".to_string(), None)
