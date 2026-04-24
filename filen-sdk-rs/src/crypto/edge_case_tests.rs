@@ -88,7 +88,7 @@ mod tests {
 
 	#[test]
 	fn test_v3_decrypt_meta_wrong_version_tag_returns_error() {
-		let key = EncryptionKey::new([0xABu8; 32]);
+		let key = EncryptionKey::new(&[0xABu8; 32]);
 
 		let fake_meta = format!("002{}", "a".repeat(NONCE_SIZE * 2 + 20));
 		let meta = EncryptedString(Cow::Borrowed(&fake_meta));
@@ -107,7 +107,7 @@ mod tests {
 
 	#[test]
 	fn test_shared_encrypt_decrypt_empty_plaintext_roundtrip() {
-		let key = EncryptionKey::new([0x42u8; 32]);
+		let key = EncryptionKey::new(&[0x42u8; 32]);
 
 		let mut data: Vec<u8> = Vec::new();
 		key.blocking_encrypt_data(&mut data)
@@ -130,7 +130,7 @@ mod tests {
 
 	#[test]
 	fn test_shared_decrypt_data_too_short_returns_error() {
-		let key = EncryptionKey::new([0x42u8; 32]);
+		let key = EncryptionKey::new(&[0x42u8; 32]);
 
 		let mut data = vec![0u8; NONCE_SIZE + TAG_SIZE - 1];
 		let result = key.blocking_decrypt_data(&mut data);
@@ -181,7 +181,7 @@ mod tests {
 
 	#[test]
 	fn test_v3_encrypt_decrypt_empty_meta_roundtrip() {
-		let key = EncryptionKey::new([0x77u8; 32]);
+		let key = EncryptionKey::new(&[0x77u8; 32]);
 		let encrypted = key.blocking_encrypt_meta("");
 		let decrypted = key
 			.blocking_decrypt_meta(&encrypted)

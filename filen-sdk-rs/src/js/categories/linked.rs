@@ -64,7 +64,7 @@ impl From<LinkedFileRS> for LinkedFile {
 			bucket: value.bucket,
 			version: value.version,
 			timestamp: value.timestamp,
-			file_key: value.file_key.to_str().into_owned(),
+			file_key: value.file_key.to_string(),
 			__linked_tag: true,
 		}
 	}

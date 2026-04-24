@@ -189,6 +189,8 @@ async fn dir_public_link() {
 	assert!(!sub_files.contains(&sub_sub_file));
 }
 
+use std::borrow::Cow;
+
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
@@ -199,7 +201,7 @@ use filen_sdk_rs::{
 	},
 	io::{HasFileInfo, client_impl::IoSharedClientExt},
 };
-use filen_types::{api::v3::dir::link::PublicLinkExpiration, traits::CowHelpers};
+use filen_types::api::v3::dir::link::PublicLinkExpiration;
 
 #[shared_test_runtime]
 async fn file_public_link() {
@@ -230,10 +232,10 @@ async fn file_public_link() {
 		&found_link.uuid(),
 		"get_file_link_status didn't match created link"
 	);
-	let file_key = file.key().unwrap().to_str();
+	let file_key = file.key().unwrap().as_ref();
 
 	let linked_file = unauth_client
-		.get_linked_file(link.uuid(), file_key.as_borrowed_cow(), None)
+		.get_linked_file(link.uuid(), Cow::Borrowed(file_key), None)
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
@@ -249,7 +251,7 @@ async fn file_public_link() {
 	assert_eq!(&link, &cloned_found_link);
 
 	let linked_file = unauth_client
-		.get_linked_file(link.uuid(), file_key.as_borrowed_cow(), Some(password))
+		.get_linked_file(link.uuid(), Cow::Borrowed(file_key), Some(password))
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
@@ -263,9 +265,9 @@ async fn file_public_link() {
 		)
 		.await
 		.unwrap();
-	let file_key = file.key().unwrap().to_str();
+	let file_key = file.key().unwrap().as_ref();
 	let linked_file = share_client
-		.get_linked_file(link.uuid(), file_key.as_borrowed_cow(), Some(password))
+		.get_linked_file(link.uuid(), Cow::Borrowed(file_key), Some(password))
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);

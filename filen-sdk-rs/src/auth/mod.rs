@@ -470,7 +470,7 @@ impl Client {
 				unimplemented!("V1 encryption is not supported in this version of the SDK")
 			}
 			MetaKey::V2(key) => self.crypter().encrypt_meta(key.as_ref()).await,
-			MetaKey::V3(key) => self.crypter().encrypt_meta(&key.to_string()).await,
+			MetaKey::V3(key) => self.crypter().encrypt_meta(key.as_ref()).await,
 		})
 	}
 

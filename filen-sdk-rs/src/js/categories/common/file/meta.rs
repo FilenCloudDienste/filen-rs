@@ -58,7 +58,7 @@ impl From<DecryptedFileMetaRs<'_>> for DecryptedFileMeta {
 			hash: meta.hash,
 			size: meta.size,
 			version: meta.key.version(),
-			key: meta.key.to_str().into_owned(),
+			key: meta.key.to_string(),
 		}
 	}
 }

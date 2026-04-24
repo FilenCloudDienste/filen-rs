@@ -111,7 +111,7 @@ impl CacheState {
 				meta.size,
 				meta.name,
 				meta.mime,
-				meta.key.to_str(),
+				meta.key.as_ref().as_ref(),
 				meta.key.version() as i8,
 				meta.created.map(|c| c.timestamp_millis()),
 				meta.last_modified.timestamp_millis(),

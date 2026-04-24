@@ -29,7 +29,7 @@ pub(super) fn upsert_file_with_stmts(
 		file.size,
 		file.name,
 		file.mime,
-		file.key.to_str(),
+		file.key.as_ref().as_ref(),
 		file.key.version() as i8,
 		file.created.map(|c| c.timestamp_millis()),
 		file.last_modified.timestamp_millis(),

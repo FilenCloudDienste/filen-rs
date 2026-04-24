@@ -11,7 +11,10 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use crate::crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize};
+use crate::{
+	crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize},
+	util::HexString,
+};
 
 use super::{
 	error::ConversionError,
@@ -23,14 +26,18 @@ pub const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4,
 	Err(_) => panic!("Failed to create Argon2 params"),
 };
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptionKey {
-	bytes: [u8; 32],
+	hex_string: HexString<32>,
 }
 
 impl EncryptionKey {
+	fn to_bytes(&self) -> [u8; 32] {
+		self.hex_string.decoded()
+	}
+
 	fn cipher(&self) -> AesGcm<Aes256, NonceSize, TagSize> {
-		<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(&self.bytes.into())
+		<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(&self.to_bytes().into())
 	}
 }
 
@@ -41,26 +48,31 @@ uniffi::custom_type!(EncryptionKey, String, {
 });
 
 impl EncryptionKey {
-	pub fn new(key: [u8; 32]) -> Self {
-		Self { bytes: key }
+	pub fn new(key: &[u8; 32]) -> Self {
+		Self {
+			hex_string: HexString::new(key),
+		}
 	}
 }
 
 impl FromStr for EncryptionKey {
 	type Err = ConversionError;
 	fn from_str(key: &str) -> Result<Self, ConversionError> {
-		if key.len() != 64 {
-			return Err(ConversionError::InvalidStringLength(key.len(), 64));
-		}
-		let mut array = [0u8; 32];
-		faster_hex::hex_decode(key.as_bytes(), &mut array)?;
-		Ok(Self::new(array))
+		Ok(Self {
+			hex_string: HexString::new_from_hex_str(key)?,
+		})
+	}
+}
+
+impl AsRef<str> for EncryptionKey {
+	fn as_ref(&self) -> &str {
+		self.hex_string.as_ref()
 	}
 }
 
 impl std::fmt::Display for EncryptionKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", faster_hex::hex_string(&self.bytes))
+		write!(f, "{}", self.hex_string)
 	}
 }
 
@@ -69,8 +81,7 @@ impl Serialize for EncryptionKey {
 	where
 		S: serde::Serializer,
 	{
-		let hex = faster_hex::hex_string(&self.bytes);
-		serializer.serialize_str(&hex)
+		serializer.serialize_str(self.as_ref())
 	}
 }
 
@@ -86,20 +97,12 @@ impl<'de> Deserialize<'de> for EncryptionKey {
 
 impl Debug for EncryptionKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let key_hash_str = faster_hex::hex_string(&sha2::Sha512::digest(self.bytes));
+		let key_hash_str = faster_hex::hex_string(&sha2::Sha512::digest(self.hex_string.decoded()));
 		f.debug_struct("EncryptionKey")
 			.field("bytes (hashed)", &key_hash_str)
 			.finish()
 	}
 }
-
-impl PartialEq for EncryptionKey {
-	fn eq(&self, other: &Self) -> bool {
-		self.bytes == other.bytes
-	}
-}
-
-impl Eq for EncryptionKey {}
 
 impl MetaCrypter for EncryptionKey {
 	fn blocking_encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
@@ -184,7 +187,7 @@ impl DataCrypter for EncryptionKey {
 
 impl CreateRandom for EncryptionKey {
 	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
-		Self::new(rng.random())
+		Self::new(&rng.random())
 	}
 }
 

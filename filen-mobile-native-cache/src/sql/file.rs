@@ -80,7 +80,7 @@ impl PartialEq<DecryptedFileMeta<'_>> for DBDecryptedFileMeta {
 	fn eq(&self, other: &DecryptedFileMeta) -> bool {
 		self.name == other.name()
 			&& self.mime == other.mime()
-			&& self.key == other.key().to_str()
+			&& self.key == other.key().as_ref()
 			&& self.created == other.created().map(|dt| dt.timestamp_millis())
 			&& self.modified == other.last_modified().timestamp_millis()
 			&& self.hash == other.hash().map(|h| h.into())
@@ -92,7 +92,7 @@ impl From<DecryptedFileMeta<'_>> for DBDecryptedFileMeta {
 		Self {
 			name: meta.name.into_owned(),
 			mime: meta.mime.into_owned(),
-			key: meta.key.to_str().to_string(),
+			key: meta.key.to_string(),
 			key_version: meta.key.version() as u8,
 			created: meta.created.map(|dt| dt.timestamp_millis()),
 			modified: meta.last_modified.timestamp_millis(),
@@ -270,7 +270,7 @@ impl DBFile {
 				id,
 				&decrypted_meta.name,
 				&decrypted_meta.mime,
-				decrypted_meta.key.to_str(),
+				decrypted_meta.key.to_string(),
 				decrypted_meta.key.version() as u8,
 				decrypted_meta.created.map(|dt| dt.timestamp_millis()),
 				decrypted_meta.last_modified.timestamp_millis(),
