@@ -5,7 +5,12 @@ pub(crate) struct CanonicalPath(PathBuf);
 
 impl CanonicalPath {
 	pub(crate) fn new(path: &Path) -> Result<Self, std::io::Error> {
-		std::fs::canonicalize(path).map(CanonicalPath)
+		if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+			std::fs::canonicalize(parent)
+				.map(|canonical_parent| CanonicalPath(canonical_parent.join(name)))
+		} else {
+			std::fs::canonicalize(path).map(CanonicalPath)
+		}
 	}
 }
 

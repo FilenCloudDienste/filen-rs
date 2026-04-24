@@ -1547,3 +1547,87 @@ async fn update_file_meta_normalizes_nfc() {
 		.unwrap();
 	assert_eq!(file.name().unwrap(), nfc_name);
 }
+
+#[shared_test_runtime]
+async fn download_file_to_path_creates_nonexistent_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let contents = b"download_file_to_path test contents";
+	let file = client
+		.make_file_builder("download_to_path.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let file = client.upload_file(file.into(), contents).await.unwrap();
+
+	let download_dir = std::env::temp_dir().join(format!(
+		"test_download_to_path_{}_{}",
+		std::process::id(),
+		uuid::Uuid::new_v4()
+	));
+	tokio::fs::create_dir_all(&download_dir).await.unwrap();
+	let download_path = download_dir.join("downloaded.txt");
+	assert!(
+		!download_path.exists(),
+		"precondition: target path should not exist"
+	);
+
+	let result = client
+		.download_file_to_path(&file, &download_path, None)
+		.await;
+
+	let cleanup = async || {
+		let _ = tokio::fs::remove_dir_all(&download_dir).await;
+	};
+
+	if let Err(e) = result {
+		cleanup().await;
+		panic!("download_file_to_path failed: {e}");
+	}
+
+	let downloaded = tokio::fs::read(&download_path).await.unwrap();
+	assert_eq!(downloaded, contents, "downloaded contents do not match");
+
+	cleanup().await;
+}
+
+#[shared_test_runtime]
+async fn download_file_to_path_fails_when_parent_missing() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client
+		.make_file_builder("download_missing_parent.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let file = client
+		.upload_file(file.into(), b"parent missing test")
+		.await
+		.unwrap();
+
+	let missing_parent = std::env::temp_dir().join(format!(
+		"test_download_missing_parent_{}_{}",
+		std::process::id(),
+		uuid::Uuid::new_v4()
+	));
+	assert!(
+		!missing_parent.exists(),
+		"precondition: parent directory should not exist"
+	);
+	let download_path = missing_parent.join("downloaded.txt");
+
+	let result = client
+		.download_file_to_path(&file, &download_path, None)
+		.await;
+
+	assert!(
+		result.is_err(),
+		"expected download to fail when parent directory is missing, got Ok"
+	);
+	assert!(
+		!download_path.exists(),
+		"target file should not have been created when parent is missing"
+	);
+}
