@@ -236,7 +236,12 @@ mod hex {
 	{
 	}
 
-	impl core::fmt::Display for HexString<32> {
+	impl<const N: usize> core::fmt::Display for HexString<N>
+	where
+		Const<N>: ToUInt,
+		U<N>: Mul<U2> + ArrayLength,
+		Prod<U<N>, U2>: ArrayLength,
+	{
 		fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 			write!(f, "{}", self.as_ref())
 		}
