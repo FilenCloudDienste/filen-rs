@@ -37,8 +37,8 @@ impl AsRef<str> for FileKey {
 impl core::fmt::Display for FileKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			FileKey::V1(key) => key.fmt(f),
-			FileKey::V2(key) => key.fmt(f),
+			FileKey::V1(key) => core::fmt::Display::fmt(key, f),
+			FileKey::V2(key) => core::fmt::Display::fmt(key, f),
 			FileKey::V3(key) => core::fmt::Display::fmt(key, f),
 		}
 	}
@@ -148,6 +148,10 @@ impl FileKey {
 
 #[cfg(test)]
 mod tests {
+	use rand::rng;
+
+	use crate::crypto::shared::CreateRandom;
+
 	use super::*;
 
 	#[test]
@@ -161,5 +165,17 @@ mod tests {
 		let v3 = FileKey::from_string_with_version(Cow::Borrowed(&a64), FileEncryptionVersion::V3)
 			.unwrap();
 		assert_eq!(v3.as_ref(), a64);
+	}
+
+	#[test]
+	fn serialize_file_key() {
+		let key = FileKey::V2(v2::FileKey::seeded_generate(&mut rng()));
+
+		let serialized_key = serde_json::to_string(&key).unwrap();
+
+		let deser_string = serde_json::from_str::<String>(&serialized_key).unwrap();
+		let deser_key =
+			FileKey::from_string_with_version(Cow::Owned(deser_string), key.version()).unwrap();
+		assert_eq!(key, deser_key);
 	}
 }

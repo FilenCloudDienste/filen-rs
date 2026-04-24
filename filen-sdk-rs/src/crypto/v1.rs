@@ -158,6 +158,12 @@ impl AsRef<str> for FileKey {
 	}
 }
 
+impl core::fmt::Display for FileKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.as_ref())
+	}
+}
+
 impl FromStr for FileKey {
 	type Err = ConversionError;
 

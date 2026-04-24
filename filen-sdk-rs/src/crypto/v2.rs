@@ -319,6 +319,12 @@ impl TryFrom<String> for MasterKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileKey(pub(crate) V2Key);
 
+impl core::fmt::Display for FileKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.as_ref())
+	}
+}
+
 impl TryFrom<String> for FileKey {
 	type Error = ConversionError;
 	fn try_from(key: String) -> Result<Self, Self::Error> {
