@@ -32,7 +32,7 @@ impl CategoryJSExt for Linked {
 	type RootFileJS = LinkedFile;
 }
 
-#[js_type(wasm_all)]
+#[js_type(wasm_all, export)]
 pub struct LinkedFile {
 	uuid: UuidStr,
 	name: MaybeEncrypted<'static, str>,
