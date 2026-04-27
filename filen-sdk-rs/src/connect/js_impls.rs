@@ -459,19 +459,6 @@ impl JsClient {
 		)
 		.await
 	}
-	// This is annoying because I can't map this to either of the basic file types
-	// I probably have to make a new base file type and implement everything for it
-	// then pass that around just for this one use case
-	// #[cfg_attr(
-	// all(target_family = "wasm", target_os = "unknown"),
-	// wasm_bindgen::prelude::wasm_bindgen(js_name = "getLinkedFile"))]
-	// pub async fn get_linked_file(
-	// 	&self,
-	// 	link: FilePublicLink,
-	// ) -> Result<JsValue, Error> {
-	// 	todo!()
-	// }
-	//
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -991,6 +978,10 @@ impl From<crate::connect::DirPublicInfo> for DirPublicInfo {
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
 )]
 impl JsClient {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirPublicLinkInfo")
+	)]
 	pub async fn get_dir_public_link_info(
 		&self,
 		link_uuid: UuidStr,
@@ -1004,6 +995,19 @@ impl JsClient {
 		})
 		.await
 	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getLinkedFile")
+	)]
+	pub async fn get_linked_file(
+		&self,
+		link_uuid: UuidStr,
+		file_key: String,
+		link_password: Option<String>,
+	) -> Result<LinkedFile, Error> {
+		get_linked_file(self.inner(), link_uuid, file_key, link_password).await
+	}
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export)]
@@ -1012,6 +1016,10 @@ impl JsClient {
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
 )]
 impl UnauthJsClient {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirPublicLinkInfo")
+	)]
 	pub async fn get_dir_public_link_info(
 		&self,
 		link_uuid: UuidStr,
@@ -1024,5 +1032,18 @@ impl UnauthJsClient {
 				.map(DirPublicInfo::from)
 		})
 		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getLinkedFile")
+	)]
+	pub async fn get_linked_file(
+		&self,
+		link_uuid: UuidStr,
+		file_key: String,
+		link_password: Option<String>,
+	) -> Result<LinkedFile, Error> {
+		get_linked_file(self.inner(), link_uuid, file_key, link_password).await
 	}
 }
