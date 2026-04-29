@@ -831,8 +831,64 @@ where
 	Ok(LinkedDirsAndFiles { dirs, files })
 }
 
+async fn list_linked_dir_recursive_inner_generic<F, T>(
+	client: Arc<T>,
+	dir: AnyLinkedDir,
+	link: DirPublicLink,
+	callback: Option<F>,
+) -> Result<LinkedDirsAndFiles, Error>
+where
+	F: Fn(u64, Option<u64>) + Send + Sync + 'static,
+	T: SharedClient + Send + Sync + 'static,
+{
+	let (dirs, files) = runtime::do_on_commander(move || async move {
+		client
+			.list_linked_dir_recursive(
+				&DirType::<Linked>::from(dir),
+				&link.try_into()?,
+				callback.as_ref(),
+			)
+			.await
+			.map(|(dirs, files)| {
+				(
+					dirs.into_iter().map(LinkedDir::from).collect::<Vec<_>>(),
+					files.into_iter().map(File::from).collect::<Vec<_>>(),
+				)
+			})
+	})
+	.await?;
+
+	Ok(LinkedDirsAndFiles { dirs, files })
+}
+
 #[cfg(feature = "uniffi")]
 async fn list_linked_dir_uniffi<T>(
+	client: Arc<T>,
+	dir: AnyLinkedDir,
+	link: DirPublicLink,
+	callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
+) -> Result<LinkedDirsAndFiles, Error>
+where
+	T: SharedClient + Send + Sync + 'static,
+{
+	list_linked_dir_inner_generic(
+		client,
+		dir,
+		link,
+		callback.map(|cb| {
+			move |downloaded, total| {
+				let callback = Arc::clone(&cb);
+				tokio::task::spawn_blocking(move || {
+					callback.on_progress(downloaded, total);
+				});
+			}
+		}),
+	)
+	.await
+}
+
+#[cfg(feature = "uniffi")]
+async fn list_linked_dir_recursive_uniffi<T>(
 	client: Arc<T>,
 	dir: AnyLinkedDir,
 	link: DirPublicLink,
@@ -868,6 +924,15 @@ impl JsClient {
 	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
 	}
+
+	pub async fn list_linked_dir_recursive(
+		&self,
+		dir: AnyLinkedDir,
+		link: DirPublicLink,
+		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
+	) -> Result<LinkedDirsAndFiles, Error> {
+		list_linked_dir_recursive_uniffi(self.inner(), dir, link, callback).await
+	}
 }
 
 #[cfg(feature = "uniffi")]
@@ -880,6 +945,15 @@ impl UnauthJsClient {
 		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
 	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_uniffi(self.inner(), dir, link, callback).await
+	}
+
+	pub async fn list_linked_dir_recursive(
+		&self,
+		dir: AnyLinkedDir,
+		link: DirPublicLink,
+		callback: Option<Arc<dyn DirContentDownloadProgressCallback>>,
+	) -> Result<LinkedDirsAndFiles, Error> {
+		list_linked_dir_recursive_uniffi(self.inner(), dir, link, callback).await
 	}
 }
 
@@ -922,6 +996,44 @@ where
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+async fn list_linked_dir_recursive_wasm<T>(
+	client: Arc<T>,
+	dir: AnyLinkedDir,
+	link: DirPublicLink,
+	callback: web_sys::js_sys::Function,
+) -> Result<LinkedDirsAndFiles, Error>
+where
+	T: SharedClient + Send + Sync + 'static,
+{
+	use crate::runtime;
+	use wasm_bindgen::JsValue;
+
+	let callback = if callback.is_undefined() {
+		None
+	} else {
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+		runtime::spawn_local(async move {
+			while let Some((downloaded, total)) = receiver.recv().await {
+				let _ = callback.call2(
+					&JsValue::UNDEFINED,
+					&JsValue::from_f64(downloaded as f64),
+					&match total {
+						Some(v) => JsValue::from_f64(v as f64),
+						None => JsValue::UNDEFINED,
+					},
+				);
+			}
+		});
+		Some(move |downloaded, total| {
+			let _ = sender.send((downloaded, total));
+		})
+	};
+
+	list_linked_dir_recursive_inner_generic(client, dir, link, callback).await
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 impl JsClient {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDir")]
@@ -935,6 +1047,19 @@ impl JsClient {
 		callback: web_sys::js_sys::Function,
 	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_wasm(self.inner(), dir, link, callback).await
+	}
+
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDirRecursive")]
+	pub async fn list_linked_dir_recursive(
+		&self,
+		dir: AnyLinkedDir,
+		link: DirPublicLink,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
+		)]
+		callback: web_sys::js_sys::Function,
+	) -> Result<LinkedDirsAndFiles, Error> {
+		list_linked_dir_recursive_wasm(self.inner(), dir, link, callback).await
 	}
 }
 
@@ -952,6 +1077,19 @@ impl UnauthJsClient {
 		callback: web_sys::js_sys::Function,
 	) -> Result<LinkedDirsAndFiles, Error> {
 		list_linked_dir_wasm(self.inner(), dir, link, callback).await
+	}
+
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listLinkedDirRecursive")]
+	pub async fn list_linked_dir_recursive(
+		&self,
+		dir: AnyLinkedDir,
+		link: DirPublicLink,
+		#[wasm_bindgen(
+			unchecked_param_type = "(downloadedBytes: number, totalBytes: number | undefined) => void | undefined"
+		)]
+		callback: web_sys::js_sys::Function,
+	) -> Result<LinkedDirsAndFiles, Error> {
+		list_linked_dir_recursive_wasm(self.inner(), dir, link, callback).await
 	}
 }
 

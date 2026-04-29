@@ -1002,18 +1002,13 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 		&self,
 		dir: &DirType<'_, Linked>,
 		link: &DirPublicLink,
-		callback: &F,
+		callback: Option<&F>,
 	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		Linked::list_dir_recursive(
-			self.get_unauth_client(),
-			dir,
-			Some(callback),
-			Cow::Borrowed(link),
-		)
-		.await
+		Linked::list_dir_recursive(self.get_unauth_client(), dir, callback, Cow::Borrowed(link))
+			.await
 	}
 
 	async fn get_dir_public_link_info(
