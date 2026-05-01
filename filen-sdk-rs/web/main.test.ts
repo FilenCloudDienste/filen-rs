@@ -862,7 +862,7 @@ test("Linked Dir Zip Download", async () => {
 
 	// Fetch the public link info via the unauthenticated client — this gives us
 	// a DirPublicLink (read-only, with decrypted key) and the LinkedRootDir
-	const linkInfo = await unauthClient.get_dir_public_link_info(linkRW.linkUuid, linkRW.linkKey)
+	const linkInfo = await unauthClient.getDirPublicLinkInfo(linkRW.linkUuid, linkRW.linkKey)
 
 	// Build AnyLinkedDirWithContext: the root dir paired with its public link
 	const linkedDirWithContext: AnyLinkedDirWithContext = {
