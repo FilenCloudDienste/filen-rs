@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::fs::UuidStr;
+use filen_types::{api::v3::dir::link::info::LinkPasswordSalt, fs::UuidStr};
 use rsa::RsaPublicKey;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -416,7 +416,7 @@ impl JsClient {
 		// So if the salt is missing but the password is present
 		// we should assume that the password was updated and generate a new salt for it
 		let mut link = crate::connect::DirPublicLinkRW::try_from(link)?;
-		if link.salt.is_none()
+		if link.salt == LinkPasswordSalt::None
 			&& let PasswordState::Known(_) = link.password
 		{
 			let PasswordState::Known(password) =
@@ -473,7 +473,7 @@ impl JsClient {
 		// If JS sets the password to a new value, it probably hasn't set the salt
 		// So if the salt is missing but the password is present
 		// we should assume that the password was updated and generate a new salt for it
-		if link.salt.is_none()
+		if link.salt == LinkPasswordSalt::None
 			&& let PasswordState::Known(_) = link.password
 		{
 			let PasswordState::Known(password) =

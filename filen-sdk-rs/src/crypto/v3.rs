@@ -6,15 +6,17 @@ use aes_gcm::{
 	aes::Aes256,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
-use filen_types::crypto::{DerivedPassword, EncryptedString};
+use filen_types::{
+	api::v3::dir::link::info::LinkPasswordSalt,
+	crypto::{DerivedPassword, EncryptedString},
+	serde::str::{SizedHexString, StackSizedString},
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use typenum::{U32, U64, U256};
 
-use crate::{
-	crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize},
-	util::HexString,
-};
+use crate::crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize};
 
 use super::{
 	error::ConversionError,
@@ -28,16 +30,16 @@ pub const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4,
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct EncryptionKey {
-	hex_string: HexString<32>,
+	hex_string: SizedHexString<U32>,
 }
 
 impl EncryptionKey {
-	fn to_bytes(&self) -> [u8; 32] {
-		self.hex_string.decoded()
+	fn as_bytes(&self) -> &[u8; 32] {
+		self.hex_string.as_ref()
 	}
 
 	fn cipher(&self) -> AesGcm<Aes256, NonceSize, TagSize> {
-		<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(&self.to_bytes().into())
+		<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(self.as_bytes().into())
 	}
 }
 
@@ -48,10 +50,14 @@ uniffi::custom_type!(EncryptionKey, String, {
 });
 
 impl EncryptionKey {
-	pub fn new(key: &[u8; 32]) -> Self {
+	pub fn new(key: [u8; 32]) -> Self {
 		Self {
-			hex_string: HexString::new(key),
+			hex_string: SizedHexString::from(key),
 		}
+	}
+
+	pub fn to_str(&self) -> StackSizedString<U64> {
+		self.hex_string.to_str()
 	}
 }
 
@@ -59,14 +65,8 @@ impl FromStr for EncryptionKey {
 	type Err = ConversionError;
 	fn from_str(key: &str) -> Result<Self, ConversionError> {
 		Ok(Self {
-			hex_string: HexString::new_from_hex_str(key)?,
+			hex_string: SizedHexString::new_from_hex_str(key)?,
 		})
-	}
-}
-
-impl AsRef<str> for EncryptionKey {
-	fn as_ref(&self) -> &str {
-		self.hex_string.as_ref()
 	}
 }
 
@@ -81,7 +81,7 @@ impl Serialize for EncryptionKey {
 	where
 		S: serde::Serializer,
 	{
-		serializer.serialize_str(self.as_ref())
+		self.hex_string.serialize(serializer)
 	}
 }
 
@@ -90,14 +90,15 @@ impl<'de> Deserialize<'de> for EncryptionKey {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let hex = String::deserialize(deserializer)?;
-		EncryptionKey::from_str(&hex).map_err(serde::de::Error::custom)
+		Ok(Self {
+			hex_string: SizedHexString::deserialize(deserializer)?,
+		})
 	}
 }
 
 impl Debug for EncryptionKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let key_hash_str = faster_hex::hex_string(&sha2::Sha512::digest(self.hex_string.decoded()));
+		let key_hash_str = hex::encode(sha2::Sha512::digest(self.hex_string.as_slice()));
 		f.debug_struct("EncryptionKey")
 			.field("bytes (hashed)", &key_hash_str)
 			.finish()
@@ -120,7 +121,7 @@ impl MetaCrypter for EncryptionKey {
 			let out = out.as_mut_vec();
 			let out_len = out.len();
 			out.resize(out_len + nonce.len() * 2, 0);
-			faster_hex::hex_encode(nonce.as_slice(), &mut out[out_len..]).unwrap_unchecked();
+			hex::encode_to_slice(nonce.as_slice(), &mut out[out_len..]).unwrap_unchecked();
 		}
 
 		// not allocating here is very difficult, so we don't bother
@@ -157,7 +158,7 @@ impl MetaCrypter for EncryptionKey {
 			));
 		}
 		let mut nonce = [0u8; NONCE_SIZE];
-		if let Err(e) = faster_hex::hex_decode(
+		if let Err(e) = hex::decode_to_slice(
 			&meta.as_bytes()[3..3 + NONCE_SIZE * 2],
 			nonce.as_mut_slice(),
 		) {
@@ -187,33 +188,40 @@ impl DataCrypter for EncryptionKey {
 
 impl CreateRandom for EncryptionKey {
 	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
-		Self::new(&rng.random())
+		Self::new(rng.random())
 	}
 }
 
-pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], ConversionError> {
+pub(crate) fn derive_password(
+	password: &[u8],
+	salt: &SizedHexString<U256>,
+) -> Result<[u8; 64], ConversionError> {
 	let argon2 = argon2::Argon2::new(
 		argon2::Algorithm::Argon2id,
 		argon2::Version::V0x13,
 		ARGON2_PARAMS,
 	);
 	let mut derived_data = [0u8; 64];
-	argon2.hash_password_into(password, salt, &mut derived_data)?;
+
+	argon2.hash_password_into(password, salt.as_slice(), &mut derived_data)?;
 	Ok(derived_data)
 }
 
 pub(crate) fn derive_password_and_kek(
 	pwd: &[u8],
-	salt: &[u8],
+	salt: &SizedHexString<U256>,
 ) -> Result<(EncryptionKey, DerivedPassword<'static>), ConversionError> {
-	let mut decoded_salt = [0u8; 256];
-	faster_hex::hex_decode(salt, &mut decoded_salt)?;
-
-	let derived_data = derive_password(pwd, &decoded_salt)?;
-	let derived_str = faster_hex::hex_string(&derived_data);
+	let derived_data = SizedHexString::<U64>::from(derive_password(pwd, salt)?);
+	let derived_str = derived_data.to_str();
 
 	let kek = EncryptionKey::from_str(&derived_str[0..64])?;
 	let password = DerivedPassword(Cow::Owned(derived_str[64..128].to_string()));
 
 	Ok((kek, password))
+}
+
+pub(crate) fn make_link_salt() -> LinkPasswordSalt<'static> {
+	LinkPasswordSalt::V3(Box::new(SizedHexString::<U256>::from(rand::random::<
+		[u8; 256],
+	>())))
 }

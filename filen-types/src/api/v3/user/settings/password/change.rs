@@ -1,10 +1,10 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
+use typenum::U256;
 
 use crate::{
 	auth::{APIKey, AuthVersion},
 	crypto::{DerivedPassword, EncryptedMasterKeys},
+	serde::str::SizedHexString,
 };
 
 pub const ENDPOINT: &str = "v3/user/settings/password/change";
@@ -15,7 +15,7 @@ pub struct Request<'a> {
 	pub password: DerivedPassword<'a>,
 	pub current_password: DerivedPassword<'a>,
 	pub auth_version: AuthVersion,
-	pub salt: Cow<'a, str>,
+	pub salt: SizedHexString<U256>,
 	pub master_keys: EncryptedMasterKeys<'a>,
 }
 

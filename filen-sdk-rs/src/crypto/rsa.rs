@@ -2,9 +2,12 @@ use std::borrow::Cow;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use digest::Digest;
-use filen_types::crypto::{
-	Sha256Hash,
-	rsa::{EncryptedPrivateKey, RSAEncryptedString},
+use filen_types::{
+	crypto::{
+		Sha256Hash,
+		rsa::{EncryptedPrivateKey, RSAEncryptedString},
+	},
+	serde::str::SizedHexString,
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -14,6 +17,7 @@ use rsa::{
 	traits::PrivateKeyParts,
 };
 use sha2::{Sha256, Sha512};
+use typenum::U32;
 
 use crate::runtime;
 
@@ -26,8 +30,11 @@ pub(crate) struct HMACKey([u8; 32]);
 
 impl std::fmt::Debug for HMACKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let hmac_hash_str = faster_hex::hex_string(&sha2::Sha512::digest(self.0));
-		write!(f, "HMACKey({hmac_hash_str})")
+		write!(
+			f,
+			"HMACKey({})",
+			hex::display(&sha2::Sha512::digest(self.0))
+		)
 	}
 }
 
@@ -48,8 +55,8 @@ impl HMACKey {
 		hmac.finalize().into_bytes().into()
 	}
 
-	pub(crate) fn hash_to_string(&self, data: &[u8]) -> String {
-		faster_hex::hex_string(self.hash(data).as_ref())
+	pub(crate) fn hash_to_string(&self, data: &[u8]) -> SizedHexString<U32> {
+		self.hash(data).into()
 	}
 }
 

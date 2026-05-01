@@ -1,12 +1,13 @@
-use std::borrow::Cow;
-
 use chrono::{DateTime, Utc};
 use serde::{
 	Deserialize, Deserializer, Serialize,
 	de::{self},
 };
 
-use crate::{crypto::EncryptedMetaKey, fs::UuidStr};
+use crate::{
+	crypto::{EncryptedMetaKey, LinkHashedPassword},
+	fs::UuidStr,
+};
 
 use super::PublicLinkExpiration;
 
@@ -28,7 +29,7 @@ pub struct LinkStatus<'a> {
 	pub expiration: DateTime<Utc>,
 	pub expiration_text: PublicLinkExpiration,
 	pub download_btn: bool,
-	pub password: Option<Cow<'a, [u8]>>,
+	pub password: Option<LinkHashedPassword<'a>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -45,8 +46,8 @@ struct RawResponse<'a> {
 	expiration_text: Option<PublicLinkExpiration>,
 	#[serde(default)]
 	download_btn: Option<u8>,
-	#[serde(with = "crate::serde::hex::optional", default)]
-	password: Option<Cow<'a, [u8]>>,
+	#[serde(default)]
+	password: Option<LinkHashedPassword<'a>>,
 }
 
 impl<'de> Deserialize<'de> for Response<'static> {

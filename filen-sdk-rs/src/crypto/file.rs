@@ -1,7 +1,8 @@
 use std::{borrow::Cow, fmt::Debug, str::FromStr};
 
-use filen_types::auth::FileEncryptionVersion;
+use filen_types::{auth::FileEncryptionVersion, serde::str::StackSizedString};
 use serde::{Deserialize, Serialize, de::DeserializeSeed};
+use typenum::U64;
 
 use crate::{Error, ErrorKind, auth::AuthInfo, crypto::v1};
 
@@ -14,22 +15,34 @@ pub enum FileKey {
 	V3(v3::EncryptionKey),
 }
 
+enum FileKeyStr<'a> {
+	Borrowed(&'a str),
+	Owned(StackSizedString<U64>),
+}
+
+impl AsRef<str> for FileKeyStr<'_> {
+	fn as_ref(&self) -> &str {
+		match self {
+			FileKeyStr::Borrowed(s) => s,
+			FileKeyStr::Owned(s) => s.as_ref(),
+		}
+	}
+}
+
 impl FileKey {
+	pub fn to_str<'a>(&'a self) -> impl AsRef<str> + 'a {
+		match self {
+			FileKey::V1(key) => FileKeyStr::Borrowed(key.as_ref()),
+			FileKey::V2(key) => FileKeyStr::Borrowed(key.as_ref()),
+			FileKey::V3(key) => FileKeyStr::Owned(key.to_str()),
+		}
+	}
+
 	pub fn version(&self) -> FileEncryptionVersion {
 		match self {
 			FileKey::V1(_) => FileEncryptionVersion::V1,
 			FileKey::V2(_) => FileEncryptionVersion::V2,
 			FileKey::V3(_) => FileEncryptionVersion::V3,
-		}
-	}
-}
-
-impl AsRef<str> for FileKey {
-	fn as_ref(&self) -> &str {
-		match self {
-			FileKey::V1(key) => key.as_ref(),
-			FileKey::V2(key) => key.as_ref(),
-			FileKey::V3(key) => key.as_ref(),
 		}
 	}
 }
@@ -142,7 +155,7 @@ impl FileKey {
 			FileKey::V2(_) => 2,
 			FileKey::V3(_) => 3,
 		};
-		AuthInfo::from_string_and_version(self.as_ref(), version)
+		AuthInfo::from_string_and_version(self.to_str().as_ref(), version)
 	}
 }
 
@@ -161,10 +174,10 @@ mod tests {
 		let a32 = "a".repeat(32);
 		let v2 = FileKey::from_string_with_version(Cow::Borrowed(&a32), FileEncryptionVersion::V2)
 			.unwrap();
-		assert_eq!(v2.as_ref(), a32);
+		assert_eq!(v2.to_str().as_ref(), a32);
 		let v3 = FileKey::from_string_with_version(Cow::Borrowed(&a64), FileEncryptionVersion::V3)
 			.unwrap();
-		assert_eq!(v3.as_ref(), a64);
+		assert_eq!(v3.to_str().as_ref(), a64);
 	}
 
 	#[test]

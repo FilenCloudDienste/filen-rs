@@ -47,7 +47,7 @@ impl CategoryFS for Linked {
 			client,
 			&api::v3::dir::link::content::Request {
 				uuid: *context.uuid(),
-				password: Cow::Borrowed(&context.get_password_hash()?),
+				password: context.get_password_hash()?,
 				parent: *parent.uuid(),
 			},
 			progress,
@@ -110,7 +110,7 @@ impl CategoryFS for Linked {
 			client,
 			&api::v3::dir::download::link::Request {
 				uuid: *context.uuid(),
-				password: Cow::Borrowed(&context.get_password_hash()?),
+				password: context.get_password_hash()?,
 				parent: *parent.uuid(),
 				skip_cache: false,
 			},

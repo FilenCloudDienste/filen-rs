@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
+	api::v3::dir::color::DirColor,
+	auth::FileEncryptionVersion,
+	crypto::{EncryptedString, LinkHashedPassword},
 	fs::UuidStr,
 };
 
@@ -14,8 +16,7 @@ pub const ENDPOINT: &str = "v3/dir/link/content";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub uuid: UuidStr,
-	#[serde(with = "faster_hex::nopfx_ignorecase")]
-	pub password: Cow<'a, [u8]>,
+	pub password: LinkHashedPassword<'a>,
 	pub parent: UuidStr,
 }
 

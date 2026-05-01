@@ -46,7 +46,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 digest = "0.10.7"
 serde = "1.0.219"
 serde_json = "1.0.142"
-faster-hex = { version = "0.10.0", features = ["serde"] }
+hex = { package = "const-hex", version = "1.18.1", features = ["serde"] }
 argon2 = { version = "0.5.3", features = ["std"] }
 serde_path_to_error = "0.1.17"
 sha1 = "0.10.6"
@@ -105,6 +105,7 @@ axum-extra = { version = "0.12.5", features = [
 	"typed-header",
 ], optional = true }
 unicode-normalization = "0.1.25"
+typenum = "1.20.0"
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]

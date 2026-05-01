@@ -1,13 +1,11 @@
 pub mod rsa;
-use std::{
-	borrow::{Borrow, Cow},
-	fmt::Formatter,
-};
+use std::borrow::{Borrow, Cow};
 
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
+use typenum::U32;
 
-use crate::traits::CowHelpers;
+use crate::{serde::str::SizedHexString, traits::CowHelpers};
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
@@ -23,6 +21,21 @@ impl TryFrom<&EncodedString<'_>> for Vec<u8> {
 		BASE64_STANDARD.decode(value.0.as_ref())
 	}
 }
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
+#[serde(transparent)]
+pub struct LinkHashedPassword<'a>(pub Cow<'a, str>);
+
+pub type LinkHashedPasswordStatic = LinkHashedPassword<'static>;
+
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(
+	LinkHashedPasswordStatic,
+	String, {
+		lower: |v: &LinkHashedPasswordStatic| v.0.to_string(),
+		try_lift: |v: String| Ok(LinkHashedPassword(Cow::Owned(v)))
+	}
+);
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(transparent)]
@@ -140,83 +153,85 @@ pub struct EncryptedDEK<'a>(pub EncryptedString<'a>);
 #[serde(transparent)]
 pub struct EncryptedMetaKey<'a>(pub EncryptedString<'a>);
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(transparent)]
-pub struct Blake3Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 32]);
+pub struct Blake3Hash(SizedHexString<U32>);
 
 #[cfg(feature = "uniffi")]
 uniffi::custom_type!(
 	Blake3Hash,
 	Vec<u8>, {
-	lower: |v: &Blake3Hash| v.0.to_vec(),
+	lower: |v: &Blake3Hash| v.0.as_slice().to_vec(),
 	try_lift: |v: Vec<u8>| {
 		let slice: [u8; 32] = v.as_slice().try_into().map_err(|_| {
 			uniffi::deps::anyhow::anyhow!("expected 32 bytes for Blake3Hash, got {}", v.len())
 		})?;
-		Ok(Blake3Hash(slice))
+		Ok(Blake3Hash(SizedHexString::from(slice)))
 	}}
 );
 
-impl std::fmt::Debug for Blake3Hash {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		write!(f, "Blake3Hash({})", faster_hex::hex_string(&self.0))
+impl Blake3Hash {
+	pub fn as_sized_str(&self) -> &SizedHexString<U32> {
+		&self.0
 	}
 }
 
 impl From<blake3::Hash> for Blake3Hash {
 	fn from(hash: blake3::Hash) -> Self {
-		Self(hash.into())
+		let hash = <[u8; 32]>::from(hash);
+
+		Self(SizedHexString::<U32>::from(hash))
 	}
 }
 
 impl From<[u8; 32]> for Blake3Hash {
 	fn from(hash: [u8; 32]) -> Self {
-		Self(hash)
+		Self(SizedHexString::from(hash))
 	}
 }
 
 impl From<Blake3Hash> for [u8; 32] {
 	fn from(hash: Blake3Hash) -> Self {
-		hash.0
+		*hash.0.as_ref()
 	}
 }
 
-impl AsRef<[u8]> for Blake3Hash {
-	fn as_ref(&self) -> &[u8] {
-		&self.0
+impl AsRef<[u8; 32]> for Blake3Hash {
+	fn as_ref(&self) -> &[u8; 32] {
+		self.0.as_ref()
 	}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(transparent)]
-pub struct Sha256Hash(#[serde(with = "crate::serde::hex::const_size")] [u8; 32]);
+pub struct Sha256Hash(SizedHexString<U32>);
 
 impl From<digest::Output<sha2::Sha256>> for Sha256Hash {
 	fn from(hash: digest::Output<sha2::Sha256>) -> Self {
-		Self(hash.into())
-	}
-}
-
-impl std::fmt::Debug for Sha256Hash {
-	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-		write!(f, "Sha256Hash({})", faster_hex::hex_string(&self.0))
+		Self(SizedHexString::from(<[u8; _]>::from(hash)))
 	}
 }
 
 impl From<Sha256Hash> for digest::Output<sha2::Sha256> {
 	fn from(hash: Sha256Hash) -> Self {
-		hash.0.into()
+		(*hash.0.as_ref()).into()
 	}
 }
 
 impl From<Sha256Hash> for [u8; 32] {
 	fn from(hash: Sha256Hash) -> Self {
-		hash.0
+		*hash.0.as_ref()
 	}
 }
 
-impl AsRef<[u8]> for Sha256Hash {
-	fn as_ref(&self) -> &[u8] {
-		&self.0
+impl AsRef<[u8; 32]> for Sha256Hash {
+	fn as_ref(&self) -> &[u8; 32] {
+		self.0.as_ref()
+	}
+}
+
+impl From<Sha256Hash> for SizedHexString<U32> {
+	fn from(hash: Sha256Hash) -> Self {
+		hash.0
 	}
 }

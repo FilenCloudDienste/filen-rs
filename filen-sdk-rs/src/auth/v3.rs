@@ -4,8 +4,12 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
-use filen_types::crypto::{EncryptedString, rsa::EncryptedPrivateKey};
+use filen_types::{
+	crypto::{EncryptedString, rsa::EncryptedPrivateKey},
+	serde::str::SizedHexString,
+};
 use rsa::RsaPublicKey;
+use typenum::U32;
 
 use crate::{
 	ErrorKind, api,
@@ -16,7 +20,7 @@ use crate::{
 		shared::{CreateRandom, MetaCrypter},
 		v3::EncryptionKey,
 	},
-	error::Error,
+	error::{Error, ResultExt},
 };
 
 pub(crate) use crate::crypto::v3::EncryptionKey as MetaKey;
@@ -54,8 +58,12 @@ pub(super) async fn login(
 	),
 	Error,
 > {
-	let (kek, pwd) =
-		crate::crypto::v3::derive_password_and_kek(pwd.as_bytes(), info.salt.as_bytes())?;
+	let (kek, pwd) = crate::crypto::v3::derive_password_and_kek(
+		pwd.as_bytes(),
+		&SizedHexString::new_from_hex_str(&info.salt)
+			.map_err(ConversionError::HexDecodeError)
+			.context(format!("salt into SizedHexString: {}", info.salt))?,
+	)?;
 
 	let response = api::v3::login::post(
 		client,
@@ -87,7 +95,7 @@ pub(super) async fn login(
 	))
 }
 
-pub(super) fn hash_name(name: &str, hmac_key: &HMACKey) -> String {
+pub(super) fn hash_name(name: &str, hmac_key: &HMACKey) -> SizedHexString<U32> {
 	hmac_key.hash_to_string(name.to_lowercase().as_bytes())
 }
 

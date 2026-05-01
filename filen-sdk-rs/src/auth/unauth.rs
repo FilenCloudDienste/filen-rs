@@ -8,7 +8,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::{
 	auth::{APIKey, AuthVersion, FileEncryptionVersion, MetaEncryptionVersion},
 	fs::UuidStr,
-	serde::rsa::RsaDerPublicKey,
+	serde::{rsa::RsaDerPublicKey, str::SizedHexString},
 	traits::CowHelpers,
 };
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::DecodePrivateKey};
@@ -233,7 +233,7 @@ impl UnauthClient {
 		.await?;
 
 		let salt: [u8; 256] = rand::random();
-		let salt = faster_hex::hex_string(&salt);
+		let salt = hex::encode(salt);
 		let (mk, password) =
 			crypto::v2::derive_password_and_mk(new_password.as_bytes(), salt.as_bytes())?;
 
@@ -276,17 +276,15 @@ impl UnauthClient {
 			AuthVersion::V1 => unreachable!("V1 is not supported for new accounts"),
 			AuthVersion::V2 => {
 				let salt: [u8; 128] = rand::random();
-				let salt = faster_hex::hex_string(&salt);
+				let salt = hex::encode(salt);
 				let (mk, pwd) =
 					crypto::v2::derive_password_and_mk(password.as_bytes(), salt.as_bytes())?;
 				(pwd, salt, RegisteredAuthInfo::V2(mk))
 			}
 			AuthVersion::V3 => {
-				let salt: [u8; 256] = rand::random();
-				let salt = faster_hex::hex_string(&salt);
-				let (kek, pwd) =
-					crypto::v3::derive_password_and_kek(password.as_bytes(), salt.as_bytes())?;
-				(pwd, salt, RegisteredAuthInfo::V3(kek))
+				let salt = SizedHexString::from(rand::random::<[u8; 256]>());
+				let (kek, pwd) = crypto::v3::derive_password_and_kek(password.as_bytes(), &salt)?;
+				(pwd, salt.to_string(), RegisteredAuthInfo::V3(kek))
 			}
 		};
 

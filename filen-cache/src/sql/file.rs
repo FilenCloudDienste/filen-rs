@@ -29,11 +29,14 @@ pub(super) fn upsert_file_with_stmts(
 		file.size,
 		file.name,
 		file.mime,
-		file.key.as_ref().as_ref(),
+		file.key.as_ref().to_str().as_ref(),
 		file.key.version() as i8,
 		file.created.map(|c| c.timestamp_millis()),
 		file.last_modified.timestamp_millis(),
-		file.hash.as_ref().map(|h| h.as_ref()),
+		file.hash
+			.as_ref()
+			.map(|h| h.as_sized_str().to_str())
+			.as_deref(),
 	])?;
 	Ok(())
 }

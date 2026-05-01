@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 use filen_types::{
-	api::v3::dir::link::PublicLinkExpiration,
+	api::v3::dir::link::{PublicLinkExpiration, info::LinkPasswordSaltOwned},
 	auth::{FileEncryptionVersion, MetaEncryptionVersion},
 	crypto::MaybeEncrypted,
 	fs::UuidStr,
@@ -175,7 +175,7 @@ pub struct DirPublicLink {
 	link_key_version: u8,
 	password: Option<String>,
 	enable_download: bool,
-	salt: Option<Vec<u8>>,
+	salt: LinkPasswordSaltOwned,
 }
 
 impl From<crate::connect::DirPublicLink> for DirPublicLink {
@@ -221,7 +221,7 @@ pub struct DirPublicLinkRW {
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	enable_download: bool,
-	salt: Option<Vec<u8>>,
+	salt: LinkPasswordSaltOwned,
 }
 
 impl From<crate::connect::DirPublicLinkRW> for DirPublicLinkRW {

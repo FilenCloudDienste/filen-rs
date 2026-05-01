@@ -1,9 +1,9 @@
 pub(crate) mod boolean;
 pub mod cow;
-pub(crate) mod hex;
 pub(crate) mod number;
 pub(crate) mod option;
 pub(crate) mod parent_uuid;
 pub mod rsa;
+pub mod str;
 pub mod time;
 pub(crate) mod uuid;

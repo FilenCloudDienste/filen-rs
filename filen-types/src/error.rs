@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ConversionError {
-	#[error("Failed to convert EncodedString to Vec<u8>: `{0}`")]
+	#[error("base64 decoding failed: `{0}`")]
 	Base64DecodeError(#[from] base64::DecodeError),
 	#[error("Failed to convert EncodedPublicKey to RsaPublicKey: `{0}`")]
 	RsaPublicKeyError(#[from] rsa::pkcs8::spki::Error),
@@ -10,6 +10,8 @@ pub enum ConversionError {
 	ParentUuidError(String),
 	#[error("Invalid enum value: `{0}` for enum {1}, allowed range `{2}`-`{3}`")]
 	InvalidEnumValue(u8, &'static str, u8, u8),
+	#[error("Invalid length: `{0}`, expected `{1}`")]
+	InvalidLength(usize, usize),
 }
 
 #[derive(Debug, Error)]

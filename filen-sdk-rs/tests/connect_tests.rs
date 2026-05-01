@@ -232,10 +232,10 @@ async fn file_public_link() {
 		&found_link.uuid(),
 		"get_file_link_status didn't match created link"
 	);
-	let file_key = file.key().unwrap().as_ref();
+	let file_key = file.key().unwrap().to_str();
 
 	let linked_file = unauth_client
-		.get_linked_file(link.uuid(), Cow::Borrowed(file_key), None)
+		.get_linked_file(link.uuid(), Cow::Borrowed(file_key.as_ref()), None)
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
@@ -251,10 +251,15 @@ async fn file_public_link() {
 	assert_eq!(&link, &cloned_found_link);
 
 	let linked_file = unauth_client
-		.get_linked_file(link.uuid(), Cow::Borrowed(file_key), Some(password))
+		.get_linked_file(
+			link.uuid(),
+			Cow::Borrowed(file_key.as_ref()),
+			Some(password),
+		)
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
+	drop(file_key);
 
 	client
 		.update_file_metadata(
@@ -265,9 +270,13 @@ async fn file_public_link() {
 		)
 		.await
 		.unwrap();
-	let file_key = file.key().unwrap().as_ref();
+	let file_key = file.key().unwrap().to_str();
 	let linked_file = share_client
-		.get_linked_file(link.uuid(), Cow::Borrowed(file_key), Some(password))
+		.get_linked_file(
+			link.uuid(),
+			Cow::Borrowed(file_key.as_ref()),
+			Some(password),
+		)
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);

@@ -5,7 +5,7 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum ConversionError {
 	#[error("Failed to convert hex encoded string to Vec<u8>: `{0}`")]
-	HexDecodeError(#[from] faster_hex::Error),
+	HexDecodeError(#[from] hex::FromHexError),
 	#[error("Invalid string length for conversion: `{0}` expected `{1}`")]
 	InvalidStringLength(usize, usize),
 	#[error("AES GCM Error")]

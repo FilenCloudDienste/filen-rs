@@ -13,12 +13,13 @@ use filen_macros::js_type;
 use filen_types::{
 	auth::{AuthVersion, FileEncryptionVersion, FilenSDKConfig, MetaEncryptionVersion},
 	crypto::{EncryptedMetaKey, EncryptedString},
-	serde::rsa::RsaDerPublicKey,
+	serde::{rsa::RsaDerPublicKey, str::SizedHexString},
 };
 use http::AuthClient;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use rsa::{pkcs1::EncodeRsaPublicKey, pkcs8::EncodePrivateKey};
 use serde::Serialize;
+use typenum::U256;
 
 use crate::{
 	api,
@@ -378,8 +379,8 @@ impl Client {
 			.unwrap_or_else(|e| e.into_inner())
 			.as_ref()
 		{
-			AuthInfo::V1(_) | AuthInfo::V2(_) => v2::hash_name(name),
-			AuthInfo::V3(_) => v3::hash_name(name, &self.hmac_key),
+			AuthInfo::V1(_) | AuthInfo::V2(_) => v2::hash_name(name).to_string(),
+			AuthInfo::V3(_) => v3::hash_name(name, &self.hmac_key).to_string(),
 		}
 	}
 
@@ -442,8 +443,7 @@ impl Client {
 	) -> Result<MetaKey, ConversionError> {
 		let mut meta_version = self.meta_encryption_version();
 		if meta_version == MetaEncryptionVersion::V3
-			&& (!faster_hex::hex_check(decrypted_key_str.as_bytes())
-				|| decrypted_key_str.len() != 64)
+			&& (hex::check(decrypted_key_str).is_err() || decrypted_key_str.len() != 64)
 		{
 			meta_version = MetaEncryptionVersion::V2;
 		}
@@ -470,7 +470,7 @@ impl Client {
 				unimplemented!("V1 encryption is not supported in this version of the SDK")
 			}
 			MetaKey::V2(key) => self.crypter().encrypt_meta(key.as_ref()).await,
-			MetaKey::V3(key) => self.crypter().encrypt_meta(key.as_ref()).await,
+			MetaKey::V3(key) => self.crypter().encrypt_meta(&key.to_str()).await,
 		})
 	}
 
@@ -608,8 +608,8 @@ impl Client {
 				));
 			}
 		};
-		let new_salt: [u8; 256] = rand::random();
-		let new_salt = faster_hex::hex_string(&new_salt);
+
+		let new_salt: SizedHexString<U256> = rand::random::<[u8; 256]>().into();
 
 		let current_derived = match auth_info_resp.auth_version {
 			AuthVersion::V1 => crypto::v1::derive_password_and_mk(current_password.as_bytes())?.1,
@@ -623,8 +623,10 @@ impl Client {
 			AuthVersion::V3 => unreachable!("we checked for v3 above"),
 		};
 
-		let (new_master_key, new_derive) =
-			crypto::v2::derive_password_and_mk(new_password.as_bytes(), new_salt.as_bytes())?;
+		let (new_master_key, new_derive) = crypto::v2::derive_password_and_mk(
+			new_password.as_bytes(),
+			new_salt.to_string().as_bytes(),
+		)?;
 
 		master_keys.0.insert(0, new_master_key);
 		let private_key_encrypted =
@@ -638,7 +640,7 @@ impl Client {
 				current_password: current_derived,
 				password: new_derive,
 				auth_version: AuthVersion::V2,
-				salt: Cow::Borrowed(&new_salt),
+				salt: new_salt,
 				master_keys: encrypted,
 			},
 		)
@@ -774,13 +776,13 @@ impl std::fmt::Debug for Client {
 			.field("meta_encryption_version", &self.meta_encryption_version)
 			.field(
 				"public_key",
-				&faster_hex::hex_string(&sha2::Sha256::digest(
+				&hex::encode(sha2::Sha256::digest(
 					self.public_key.to_pkcs1_der().unwrap(),
 				)),
 			)
 			.field(
 				"private_key",
-				&faster_hex::hex_string(&sha2::Sha256::digest(
+				&hex::encode(sha2::Sha256::digest(
 					self.private_key.to_pkcs8_der().unwrap().as_bytes(),
 				)),
 			)

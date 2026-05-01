@@ -6,11 +6,16 @@ use aes_gcm::{
 	aes::Aes256,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
-use filen_types::crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString};
+use filen_types::{
+	api::v3::dir::link::info::LinkPasswordSalt,
+	crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString},
+	serde::str::{SizedHexString, SizedStringBase64Chars},
+};
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rand::distr::Distribution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+use typenum::U64;
 
 use crate::crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize};
 
@@ -166,8 +171,10 @@ impl DataCrypter for V2Key {
 
 impl std::fmt::Debug for V2Key {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let hash_key_str =
-			faster_hex::hex_string(sha2::Sha512::digest(self.key.as_bytes()).as_ref());
+		let hash_key_str = SizedHexString::<U64>::from(<[u8; 64]>::from(sha2::Sha512::digest(
+			self.key.as_bytes(),
+		)))
+		.to_str();
 		f.debug_struct("V2Key")
 			.field("key (hashed)", &hash_key_str)
 			.finish()
@@ -381,10 +388,8 @@ impl CreateRandom for FileKey {
 pub(crate) fn hash(name: &[u8]) -> [u8; 20] {
 	let mut temp = [0u8; 128];
 	// SAFETY: The length of hashed_named must be 2x the length of a Sha512 hash, which is 128 bytes
-	let sha2 = unsafe {
-		faster_hex::hex_encode(&sha2::Sha512::digest(name), &mut temp).unwrap_unchecked()
-	};
-	sha1::Sha1::digest(sha2).into()
+	unsafe { hex::encode_to_slice(sha2::Sha512::digest(name), &mut temp).unwrap_unchecked() };
+	sha1::Sha1::digest(temp).into()
 }
 
 pub(crate) fn derive_password(password: &[u8], salt: &[u8]) -> Result<[u8; 64], ConversionError> {
@@ -398,14 +403,19 @@ pub(crate) fn derive_password_and_mk(
 	salt: &[u8],
 ) -> Result<(MasterKey, DerivedPassword<'static>), ConversionError> {
 	let derived_data = derive_password(password, salt)?;
-	let derived_str = faster_hex::hex_string(&derived_data);
+	let derived_str = hex::encode(derived_data);
 	let (master_key_str, derived_password_str) = derived_str.split_at(64);
 
 	let master_key = MasterKey::from_str(master_key_str)?;
 
 	let mut hasher = Sha512::new();
 	hasher.update(derived_password_str);
-	let derived_password = DerivedPassword(Cow::Owned(faster_hex::hex_string(&hasher.finalize())));
+	let derived_password = DerivedPassword(Cow::Owned(hex::encode(hasher.finalize())));
 
 	Ok((master_key, derived_password))
+}
+
+pub(crate) fn make_link_salt() -> LinkPasswordSalt<'static> {
+	let mut rng = rand::rng();
+	LinkPasswordSalt::V2(SizedStringBase64Chars::new_random(&mut rng))
 }

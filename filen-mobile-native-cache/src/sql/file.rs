@@ -47,8 +47,8 @@ pub(crate) struct DBDecryptedFileMeta {
 
 impl Debug for DBDecryptedFileMeta {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let key_hash_str = faster_hex::hex_string(blake3::hash(self.key.as_bytes()).as_bytes());
-		let hash_hashed_str = self.hash.map(|h| faster_hex::hex_string(&h));
+		let key_hash_str = hex::encode(blake3::hash(self.key.as_bytes()).as_bytes());
+		let hash_hashed_str = self.hash.map(hex::encode);
 
 		f.debug_struct("DBDecryptedFileMeta")
 			.field("name", &self.name)
@@ -80,7 +80,7 @@ impl PartialEq<DecryptedFileMeta<'_>> for DBDecryptedFileMeta {
 	fn eq(&self, other: &DecryptedFileMeta) -> bool {
 		self.name == other.name()
 			&& self.mime == other.mime()
-			&& self.key == other.key().as_ref()
+			&& self.key == other.key().to_str().as_ref()
 			&& self.created == other.created().map(|dt| dt.timestamp_millis())
 			&& self.modified == other.last_modified().timestamp_millis()
 			&& self.hash == other.hash().map(|h| h.into())

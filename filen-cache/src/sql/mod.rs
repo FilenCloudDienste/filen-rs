@@ -111,11 +111,14 @@ impl CacheState {
 				meta.size,
 				meta.name,
 				meta.mime,
-				meta.key.as_ref().as_ref(),
+				meta.key.as_ref().to_str().as_ref(),
 				meta.key.version() as i8,
 				meta.created.map(|c| c.timestamp_millis()),
 				meta.last_modified.timestamp_millis(),
-				meta.hash.as_ref().map(|h| h.as_ref()),
+				meta.hash
+					.as_ref()
+					.map(|h| h.as_sized_str().to_str())
+					.as_deref(),
 				uuid,
 			],
 		)?;

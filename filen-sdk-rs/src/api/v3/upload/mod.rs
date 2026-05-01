@@ -32,7 +32,7 @@ pub(crate) async fn upload_file_chunk(
 		chunk_idx,
 		file.parent(),
 		upload_key,
-		faster_hex::hex_string(data_hash.as_slice()),
+		hex::display(data_hash.as_slice()),
 	);
 
 	client

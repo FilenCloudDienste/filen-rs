@@ -3,8 +3,12 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
-use filen_types::crypto::{EncryptedString, rsa::EncryptedPrivateKey};
+use filen_types::{
+	crypto::{EncryptedString, rsa::EncryptedPrivateKey},
+	serde::str::SizedHexString,
+};
 use rsa::RsaPublicKey;
+use typenum::U20;
 
 use crate::{
 	Error, api,
@@ -94,8 +98,8 @@ pub(super) async fn login(
 	))
 }
 
-pub(crate) fn hash_name(name: &str) -> String {
-	faster_hex::hex_string(&hash(name.to_lowercase().as_bytes()))
+pub(crate) fn hash_name(name: &str) -> SizedHexString<U20> {
+	hash(name.to_lowercase().as_bytes()).into()
 }
 
 pub(super) fn generate_file_key() -> crypto::v2::FileKey {

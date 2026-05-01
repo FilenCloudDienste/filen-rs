@@ -5,7 +5,9 @@ use aes_gcm::aes::{self};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
 use filen_types::crypto::{DerivedPassword, EncryptedString};
+use filen_types::serde::str::SizedHexString;
 use md2::{Digest, Md2};
 use md4::Md4;
 use md5::Md5;
@@ -209,19 +211,15 @@ fn hash_password(password: &[u8]) -> DerivedPassword<'static> {
 	// since the size of the output is fixed and we allocate 256 bytes.
 	// additionally, since the output is hex-encoded, it will always be valid UTF-8.
 	let pass = unsafe {
-		let sha1 =
-			faster_hex::hex_encode(&Sha1::digest(password), &mut out[0..40]).unwrap_unchecked();
-		let sha256 =
-			faster_hex::hex_encode(&Sha256::digest(sha1), &mut out[0..64]).unwrap_unchecked();
-		let sha384 =
-			faster_hex::hex_encode(&Sha384::digest(sha256), &mut out[0..96]).unwrap_unchecked();
-		faster_hex::hex_encode(&Sha512::digest(sha384), &mut out[0..128]).unwrap_unchecked();
+		let sha1 = hex::encode_to_str(Sha1::digest(password), &mut out[0..40]).unwrap_unchecked();
+		let sha256 = hex::encode_to_str(Sha256::digest(sha1), &mut out[0..64]).unwrap_unchecked();
+		let sha384 = hex::encode_to_str(Sha384::digest(sha256), &mut out[0..96]).unwrap_unchecked();
+		hex::encode_to_str(Sha512::digest(sha384), &mut out[0..128]).unwrap_unchecked();
 
-		let md2 =
-			faster_hex::hex_encode(&Md2::digest(password), &mut out[128..160]).unwrap_unchecked();
-		let md4 = faster_hex::hex_encode(&Md4::digest(md2), &mut out[128..160]).unwrap_unchecked();
-		let md5 = faster_hex::hex_encode(&Md5::digest(md4), &mut out[128..160]).unwrap_unchecked();
-		faster_hex::hex_encode(&Sha512::digest(md5), &mut out[128..256]).unwrap_unchecked();
+		let md2 = hex::encode_to_str(Md2::digest(password), &mut out[128..160]).unwrap_unchecked();
+		let md4 = hex::encode_to_str(Md4::digest(md2), &mut out[128..160]).unwrap_unchecked();
+		let md5 = hex::encode_to_str(Md5::digest(md4), &mut out[128..160]).unwrap_unchecked();
+		hex::encode_to_str(Sha512::digest(md5), &mut out[128..256]).unwrap_unchecked();
 		String::from_utf8_unchecked(out)
 	};
 
@@ -231,12 +229,17 @@ fn hash_password(password: &[u8]) -> DerivedPassword<'static> {
 pub fn derive_password_and_mk(
 	password: &[u8],
 ) -> Result<(MasterKey, DerivedPassword<'static>), ConversionError> {
-	let master_key_str = faster_hex::hex_string(&super::v2::hash(password));
+	let master_key_str = SizedHexString::from(super::v2::hash(password)).to_str();
 
 	Ok((
 		MasterKey::from_str(&master_key_str)?,
 		hash_password(password),
 	))
+}
+
+pub(crate) fn make_link_salt() -> LinkPasswordSalt<'static> {
+	// link salt in v1 is unused and always empty
+	LinkPasswordSalt::None
 }
 
 #[cfg(test)]
@@ -256,34 +259,25 @@ mod tests {
 		let out = &mut [0u8; 48];
 		let (key, iv) = evp_bytes_to_key(b"password123", b"salt1234", 16, out);
 		assert_eq!(
-			faster_hex::hex_string(key),
+			hex::encode(key),
 			"989181c1bf686a99c71c6f61d905f649dcc916e96ed05a9c7c67828a0ceda50f"
 		);
-		assert_eq!(
-			faster_hex::hex_string(iv),
-			"cc43215aabc1e94258b228c01401d0d0"
-		);
+		assert_eq!(hex::encode(iv), "cc43215aabc1e94258b228c01401d0d0");
 
 		let out = &mut [0u8; 47];
 		let (key, iv) = evp_bytes_to_key(b"password123", b"salt1234", 16, out);
 		assert_eq!(
-			faster_hex::hex_string(key),
+			hex::encode(key),
 			"989181c1bf686a99c71c6f61d905f649dcc916e96ed05a9c7c67828a0ceda5"
 		);
-		assert_eq!(
-			faster_hex::hex_string(iv),
-			"0fcc43215aabc1e94258b228c01401d0"
-		);
+		assert_eq!(hex::encode(iv), "0fcc43215aabc1e94258b228c01401d0");
 
 		let out = &mut [0u8; 49];
 		let (key, iv) = evp_bytes_to_key(b"password123", b"salt1234", 16, out);
 		assert_eq!(
-			faster_hex::hex_string(key),
+			hex::encode(key),
 			"989181c1bf686a99c71c6f61d905f649dcc916e96ed05a9c7c67828a0ceda50fcc"
 		);
-		assert_eq!(
-			faster_hex::hex_string(iv),
-			"43215aabc1e94258b228c01401d0d098"
-		);
+		assert_eq!(hex::encode(iv), "43215aabc1e94258b228c01401d0d098");
 	}
 }

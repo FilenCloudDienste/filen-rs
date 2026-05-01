@@ -4,10 +4,17 @@ use filen_macros::js_type;
 use filen_types::{
 	api::v3::{
 		contacts::Contact,
-		dir::{color::DirColor, link::PublicLinkExpiration},
+		dir::{
+			color::DirColor,
+			link::{
+				PublicLinkExpiration,
+				info::{LinkPasswordSalt, LinkPasswordSaltOwned},
+			},
+		},
 		file::link::edit::FileLinkAction,
 		item::{linked::ListedPublicLink, shared::SharedUser},
 	},
+	crypto::{LinkHashedPassword, LinkHashedPasswordStatic},
 	fs::{ObjectType, UuidStr},
 	traits::CowHelpers,
 };
@@ -41,19 +48,20 @@ pub mod js_impls;
 
 pub(crate) trait MakePasswordSaltAndHash {
 	fn password(&self) -> &PasswordState;
-	fn salt(&self) -> &[u8];
+	fn salt(&self) -> &LinkPasswordSalt<'_>;
 
-	fn get_password_hash(&self) -> Result<Cow<'_, [u8]>, Error> {
+	fn get_password_hash(&self) -> Result<LinkHashedPassword<'_>, Error> {
 		let password = match self.password() {
 			PasswordState::None => None,
 			PasswordState::Known(password) => Some(password.as_str()),
 			PasswordState::Hashed(password_vec) => {
-				return Ok(Cow::Borrowed(password_vec));
+				return Ok(password_vec.as_borrowed_cow());
 			}
 		};
-		Ok(Cow::Owned(
-			crate::crypto::connect::derive_password_for_link(password, Some(self.salt()))?,
-		))
+		Ok(crate::crypto::connect::derive_password_for_link(
+			password,
+			self.salt(),
+		)?)
 	}
 }
 
@@ -61,8 +69,7 @@ pub(crate) trait MakePasswordSaltAndHash {
 #[js_type(tagged, wasm_all)]
 pub enum PasswordState {
 	Known(String),
-	#[cfg_attr(feature = "wasm-full", serde(with = "serde_bytes"))]
-	Hashed(Vec<u8>),
+	Hashed(LinkHashedPasswordStatic),
 	#[default]
 	None,
 }
@@ -88,8 +95,7 @@ pub struct FilePublicLink {
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
-	#[cfg_attr(feature = "wasm-full", serde(with = "serde_bytes"))]
-	salt: Option<Vec<u8>>,
+	salt: LinkPasswordSaltOwned,
 }
 
 impl PartialEq for FilePublicLink {
@@ -103,10 +109,7 @@ impl PartialEq for FilePublicLink {
 				if a_salt != b_salt {
 					return false;
 				} else {
-					match crate::crypto::connect::derive_password_for_link(
-						Some(a),
-						a_salt.as_deref(),
-					) {
+					match crate::crypto::connect::derive_password_for_link(Some(a), a_salt) {
 						Ok(hash) => b == &hash,
 						Err(_) => false,
 					}
@@ -139,20 +142,19 @@ impl FilePublicLink {
 			return;
 		}
 		if let PasswordState::Hashed(ref current_hashed) = self.password
-			&& let Ok(new_hashed) = crate::crypto::connect::derive_password_for_link(
-				Some(&password),
-				self.salt.as_deref(),
-			) && &new_hashed == current_hashed
+			&& let Ok(new_hashed) =
+				crate::crypto::connect::derive_password_for_link(Some(&password), &self.salt)
+			&& &new_hashed == current_hashed
 		{
 			return;
 		}
 		self.password = PasswordState::Known(password);
-		self.salt = Some(rand::random::<[u8; 256]>().to_vec());
+		self.salt = crate::crypto::connect::new_random_salt();
 	}
 
 	pub fn clear_password(&mut self) {
 		self.password = PasswordState::None;
-		self.salt = None;
+		self.salt = crate::crypto::connect::new_random_salt();
 	}
 
 	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
@@ -171,7 +173,7 @@ impl FilePublicLink {
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
 			downloadable: true,
-			salt: None,
+			salt: crate::crypto::connect::new_random_salt(),
 		}
 	}
 }
@@ -181,8 +183,8 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 		&self.password
 	}
 
-	fn salt(&self) -> &[u8] {
-		self.salt.as_deref().unwrap_or(&[])
+	fn salt(&self) -> &LinkPasswordSalt<'_> {
+		&self.salt
 	}
 }
 
@@ -192,7 +194,7 @@ pub struct DirPublicLink {
 	pub(crate) link_key: MetaKey,
 	pub(crate) password: Option<String>,
 	pub(crate) enable_download: bool,
-	pub(crate) salt: Option<Vec<u8>>,
+	pub(crate) salt: LinkPasswordSalt<'static>,
 }
 
 impl DirPublicLink {
@@ -212,13 +214,11 @@ impl DirPublicLink {
 		self.password = Some(password);
 	}
 
-	pub(crate) fn get_password_hash(&self) -> Result<Cow<'_, [u8]>, Error> {
-		Ok(Cow::Owned(
-			crate::crypto::connect::derive_password_for_link(
-				self.password.as_deref(),
-				self.salt.as_deref(),
-			)?,
-		))
+	pub(crate) fn get_password_hash(&self) -> Result<LinkHashedPassword<'_>, Error> {
+		Ok(crate::crypto::connect::derive_password_for_link(
+			self.password.as_deref(),
+			&self.salt,
+		)?)
 	}
 }
 
@@ -229,7 +229,7 @@ pub struct DirPublicLinkRW {
 	pub(crate) password: PasswordState,
 	pub(crate) expiration: PublicLinkExpiration,
 	pub(crate) enable_download: bool,
-	pub(crate) salt: Option<Vec<u8>>,
+	pub(crate) salt: LinkPasswordSalt<'static>,
 }
 
 impl TryFrom<DirPublicLinkRW> for DirPublicLink {
@@ -263,7 +263,7 @@ impl DirPublicLinkRW {
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
 			enable_download: true,
-			salt: None,
+			salt: LinkPasswordSalt::None,
 		}
 	}
 
@@ -282,22 +282,13 @@ impl DirPublicLinkRW {
 	}
 
 	pub fn set_password(&mut self, password: String) {
-		match self.salt {
-			Some(ref mut salt) => {
-				if salt.len() != 256 {
-					// migrate links to argon2id salt
-					*salt = rand::random::<[u8; 256]>().to_vec()
-				}
-			}
-			ref mut none => {
-				*none = Some(rand::random::<[u8; 256]>().to_vec());
-			}
-		}
 		self.password = PasswordState::Known(password);
+		self.salt = crate::crypto::connect::new_random_salt()
 	}
 
 	pub fn clear_password(&mut self) {
 		self.password = PasswordState::None;
+		self.salt = LinkPasswordSalt::None;
 	}
 
 	pub fn set_expiration(&mut self, expiration: PublicLinkExpiration) {
@@ -314,8 +305,8 @@ impl MakePasswordSaltAndHash for DirPublicLinkRW {
 		&self.password
 	}
 
-	fn salt(&self) -> &[u8] {
-		self.salt.as_deref().unwrap_or(&[])
+	fn salt(&self) -> &LinkPasswordSalt<'_> {
+		&self.salt
 	}
 }
 
@@ -591,12 +582,13 @@ impl Client {
 
 	pub async fn public_link_file(&self, file: &RemoteFile) -> Result<FilePublicLink, Error> {
 		let file_link = FilePublicLink::new();
+
 		// why does this just hash_name empty? Who knows,
 		// we should fix this with the v4 api
-		let tmp_salt = rand::random::<[u8; 256]>();
-		let password_hash =
-			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, None))
-				.await?;
+		let password_hashed = do_cpu_intensive(|| {
+			crate::crypto::connect::derive_password_for_link(None, &file_link.salt)
+		})
+		.await?;
 
 		api::v3::file::link::edit::post(
 			self.client(),
@@ -605,8 +597,8 @@ impl Client {
 				file_uuid: *file.uuid(),
 				expiration: PublicLinkExpiration::Never,
 				password: false,
-				password_hashed: Cow::Borrowed(&password_hash),
-				salt: Cow::Borrowed(&tmp_salt),
+				password_hashed,
+				salt: file_link.salt.as_borrowed_cow(),
 				download_btn: true,
 				r#type: FileLinkAction::Enable,
 			},
@@ -627,8 +619,8 @@ impl Client {
 				uuid: *dir.uuid(),
 				expiration: link.expiration,
 				password: link.password().is_known(),
-				password_hashed: Cow::Borrowed(&link.get_password_hash()?),
-				salt: Cow::Borrowed(link.salt()),
+				password_hashed: link.get_password_hash()?,
+				salt: link.salt().as_borrowed_cow(),
 				download_btn: link.enable_download,
 			},
 		)
@@ -642,37 +634,15 @@ impl Client {
 		file: &RemoteFile,
 		link: &FilePublicLink,
 	) -> Result<(), Error> {
-		let (password, password_hashed, salt) = if link.password().is_known() {
-			(
-				true,
-				do_cpu_intensive(|| link.get_password_hash()).await?,
-				Cow::Borrowed(link.salt()),
-			)
-		} else {
-			// why does this just hash_name empty? Who knows,
-			// we should fix this with the v4 api
-			let tmp_salt = rand::random::<[u8; 256]>().to_vec();
-			(
-				false,
-				Cow::Owned(
-					do_cpu_intensive(|| {
-						crate::crypto::connect::derive_password_for_link(None, None)
-					})
-					.await?,
-				),
-				Cow::Owned(tmp_salt),
-			)
-		};
-
 		api::v3::file::link::edit::post(
 			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: link.link_uuid,
 				file_uuid: *file.uuid(),
 				expiration: link.expiration,
-				password,
-				password_hashed,
-				salt,
+				password: link.password().is_known(),
+				password_hashed: do_cpu_intensive(|| link.get_password_hash()).await?,
+				salt: link.salt().as_borrowed_cow(),
 				download_btn: link.downloadable,
 				r#type: FileLinkAction::Enable,
 			},
@@ -686,11 +656,6 @@ impl Client {
 		file: &RemoteFile,
 		link: FilePublicLink,
 	) -> Result<(), Error> {
-		let tmp_salt = rand::random::<[u8; 256]>();
-		let password_hash =
-			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(None, None))
-				.await?;
-
 		api::v3::file::link::edit::post(
 			self.client(),
 			&api::v3::file::link::edit::Request {
@@ -698,8 +663,8 @@ impl Client {
 				file_uuid: *file.uuid(),
 				expiration: PublicLinkExpiration::Never,
 				password: false,
-				password_hashed: Cow::Borrowed(&password_hash),
-				salt: Cow::Borrowed(&tmp_salt),
+				password_hashed: crate::crypto::connect::empty_hash(),
+				salt: link.salt().as_borrowed_cow(),
 				download_btn: false,
 				r#type: FileLinkAction::Disable,
 			},
@@ -733,7 +698,7 @@ impl Client {
 		.await?;
 
 		let password = match link_status.password {
-			Some(password) => PasswordState::Hashed(password.into_owned()),
+			Some(password) => PasswordState::Hashed(password),
 			None => PasswordState::None,
 		};
 
@@ -742,11 +707,7 @@ impl Client {
 			password,
 			expiration: link_status.expiration_text,
 			downloadable: link_status.download_btn,
-			salt: if password_response.salt.is_empty() {
-				None
-			} else {
-				Some(password_response.salt.into_owned())
-			},
+			salt: password_response.salt,
 		}))
 	}
 
@@ -784,7 +745,7 @@ impl Client {
 
 		let info_response = info_response?;
 		let password = match link_status.password {
-			Some(password) => PasswordState::Hashed(password.into_owned()),
+			Some(password) => PasswordState::Hashed(password),
 			None => PasswordState::None,
 		};
 		Ok(Some(DirPublicLinkRW {
@@ -793,7 +754,7 @@ impl Client {
 			password,
 			expiration: link_status.expiration_text,
 			enable_download: link_status.download_btn,
-			salt: info_response.salt.map(|v| v.into_owned()),
+			salt: info_response.salt.unwrap_or_default(),
 		}))
 	}
 
@@ -1034,7 +995,7 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 			link_key: key,
 			password: None,
 			enable_download: resp.download_btn,
-			salt: resp.salt.map(|v| v.into_owned()),
+			salt: resp.salt.unwrap_or_default(),
 		};
 
 		Ok(DirPublicInfo {
@@ -1062,25 +1023,24 @@ where
 		password: Option<&str>,
 	) -> Result<LinkedFile, Error> {
 		let (password, salt) = match password {
-			None => (None, None),
+			None => (None, LinkPasswordSalt::None),
 			Some(password) => {
 				let resp = api::v3::file::link::password::post(
 					self.get_unauth_client(),
 					&api::v3::file::link::password::Request { uuid: link_uuid },
 				)
 				.await?;
-				(Some(password), Some(resp.salt))
+				(Some(password), resp.salt)
 			}
 		};
-		let password_hashed = do_cpu_intensive(|| {
-			crate::crypto::connect::derive_password_for_link(password, salt.as_deref())
-		})
-		.await?;
+		let password_hashed =
+			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(password, &salt))
+				.await?;
 		let response = api::v3::file::link::info::post(
 			self.get_unauth_client(),
 			&api::v3::file::link::info::Request {
 				uuid: link_uuid,
-				password: Cow::Borrowed(&password_hashed),
+				password: password_hashed,
 			},
 		)
 		.await?;

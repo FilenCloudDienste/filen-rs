@@ -1,8 +1,6 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::{api::v3::dir::link::info::LinkPasswordSalt, fs::UuidStr};
 
 pub const ENDPOINT: &str = "v3/file/link/password";
 
@@ -16,6 +14,5 @@ pub struct Request {
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
 	pub has_password: bool,
-	#[serde(with = "faster_hex::nopfx_ignorecase")]
-	pub salt: Cow<'a, [u8]>,
+	pub salt: LinkPasswordSalt<'a>,
 }

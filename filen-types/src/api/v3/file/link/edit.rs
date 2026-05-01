@@ -1,8 +1,10 @@
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
-use crate::{api::v3::dir::link::PublicLinkExpiration, fs::UuidStr};
+use crate::{
+	api::v3::dir::link::{PublicLinkExpiration, info::LinkPasswordSalt},
+	crypto::LinkHashedPassword,
+	fs::UuidStr,
+};
 
 pub const ENDPOINT: &str = "v3/file/link/edit";
 
@@ -15,10 +17,8 @@ pub struct Request<'a> {
 	pub expiration: PublicLinkExpiration,
 	#[serde(with = "crate::serde::boolean::empty_notempty")]
 	pub password: bool,
-	#[serde(with = "faster_hex::nopfx_ignorecase")]
-	pub password_hashed: Cow<'a, [u8]>,
-	#[serde(with = "faster_hex::nopfx_ignorecase")]
-	pub salt: Cow<'a, [u8]>,
+	pub password_hashed: LinkHashedPassword<'a>,
+	pub salt: LinkPasswordSalt<'a>,
 	pub download_btn: bool,
 	pub r#type: FileLinkAction,
 }

@@ -27,9 +27,7 @@ fn get_compat_test_file(
 	let file_key_str = match client.file_encryption_version() {
 		FileEncryptionVersion::V1 => "0123456789abcdefghijklmnopqrstuv",
 		FileEncryptionVersion::V2 => "0123456789abcdefghijklmnopqrstuv",
-		FileEncryptionVersion::V3 => {
-			&faster_hex::hex_string("0123456789abcdefghijklmnopqrstuv".as_bytes())
-		}
+		FileEncryptionVersion::V3 => &hex::encode("0123456789abcdefghijklmnopqrstuv".as_bytes()),
 	};
 	let file = client
 		.make_file_builder("large_sample-20mb.txt", parent_uuid)
@@ -206,10 +204,7 @@ async fn make_rs_compat_dir() {
 		.unwrap()
 		.build();
 	client
-		.upload_file(
-			big_file.into(),
-			faster_hex::hex_string(&big_random_bytes).as_bytes(),
-		)
+		.upload_file(big_file.into(), hex::encode(&big_random_bytes).as_bytes())
 		.await
 		.unwrap();
 
