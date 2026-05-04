@@ -138,20 +138,20 @@ mod tests {
 
 	#[test]
 	fn new_from_hex_str_with_0x_prefix_lowercase() {
-		// Lowercase 0x prefix is ignored.
+		// Prefix is ignored.
 		let hs = HexString::new_from_hex_str("0xdeadbeef").unwrap();
+		assert_eq!(hs.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
+	}
+
+	#[test]
+	fn new_from_hex_str_with_0x_prefix_uppercase() {
+		let hs = HexString::new_from_hex_str("0XDEADBEEF").unwrap();
 		assert_eq!(hs.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
 	}
 
 	#[test]
 	fn new_from_hex_str_with_0x_prefix_mixed_case_body() {
 		let hs = HexString::new_from_hex_str("0xDeAdBeEf").unwrap();
-		assert_eq!(hs.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
-	}
-
-	#[test]
-	fn new_from_hex_str_with_0x_prefix_uppercase_body() {
-		let hs = HexString::new_from_hex_str("0xDEADBEEF").unwrap();
 		assert_eq!(hs.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
 	}
 
@@ -167,21 +167,6 @@ mod tests {
 		let with = HexString::new_from_hex_str("0xcafebabe").unwrap();
 		let without = HexString::new_from_hex_str("cafebabe").unwrap();
 		assert_eq!(with, without);
-	}
-
-	#[test]
-	fn new_from_hex_str_uppercase_prefix_fails() {
-		// Only lowercase "0x" is accepted as a prefix; "0X" is not stripped,
-		// so the leading 'X' is treated as an invalid hex character.
-		let err = HexString::new_from_hex_str("0XDEADBEEF").unwrap_err();
-		assert!(matches!(err, hex::FromHexError::InvalidHexCharacter { .. }));
-	}
-
-	#[test]
-	fn new_from_hex_str_uppercase_prefix_only_fails() {
-		// "0X" alone: 'X' is not a valid hex digit.
-		let err = HexString::new_from_hex_str("0X").unwrap_err();
-		assert!(matches!(err, hex::FromHexError::InvalidHexCharacter { .. }));
 	}
 
 	#[test]
@@ -448,14 +433,14 @@ mod tests {
 
 	#[test]
 	fn deserialize_with_0x_prefix() {
-		// Lowercase prefix is ignored on deserialize too.
+		// Prefix is ignored on deserialize too.
 		let hs: HexString = serde_json::from_str("\"0xdeadbeef\"").unwrap();
 		assert_eq!(hs.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
 	}
 
 	#[test]
-	fn deserialize_with_0x_prefix_uppercase_body() {
-		let hs: HexString = serde_json::from_str("\"0xDEADBEEF\"").unwrap();
+	fn deserialize_with_uppercase_prefix() {
+		let hs: HexString = serde_json::from_str("\"0XDEADBEEF\"").unwrap();
 		assert_eq!(hs.as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
 	}
 
@@ -470,13 +455,6 @@ mod tests {
 		let with: HexString = serde_json::from_str("\"0xcafebabe\"").unwrap();
 		let without: HexString = serde_json::from_str("\"cafebabe\"").unwrap();
 		assert_eq!(with, without);
-	}
-
-	#[test]
-	fn deserialize_uppercase_prefix_fails() {
-		// "0X" is not a recognized prefix, so the 'X' is an invalid hex char.
-		let result: Result<HexString, _> = serde_json::from_str("\"0XDEADBEEF\"");
-		assert!(result.is_err());
 	}
 
 	#[test]
