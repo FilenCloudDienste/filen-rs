@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{auth::Client, chats::Chat, sync::lock::ResourceLock};
+use filen_types::traits::CowHelpers;
 use test_utils::set_up_contact;
 
 #[shared_test_runtime]

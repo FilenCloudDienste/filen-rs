@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::Utc;
-use filen_cache::CacheHandle;
+use filen_cache::{CacheError, CacheHandle, CacheMessage};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	auth::Client,
@@ -21,10 +21,12 @@ use filen_sdk_rs::{
 use filen_types::{
 	api::v3::dir::color::DirColor,
 	auth::FileEncryptionVersion,
+	crypto::EncryptedString,
 	fs::{ParentUuid, UuidStr},
 	traits::CowHelpersExt,
 };
 use rusqlite::{Connection, OpenFlags, params};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// Generate a unique temporary cache DB path.
@@ -255,6 +257,80 @@ fn make_test_remote_file(name: &str, parent: &UuidStr) -> RemoteFile {
 	)
 }
 
+/// Build a synthetic RemoteFile with encrypted (un-decryptable) metadata. The conversion
+/// to `CacheableFile` should fail because the meta is not in the `Decoded` variant.
+fn make_test_remote_file_encrypted_meta(parent: &UuidStr) -> RemoteFile {
+	let now = Utc::now();
+	RemoteFile::from_meta(
+		UuidStr::new_v4(),
+		ParentUuid::Uuid(*parent),
+		1024,
+		1,
+		"us-east-1",
+		"test-bucket",
+		now,
+		false,
+		FileMeta::Encrypted(EncryptedString(Cow::Owned("encrypted_blob".to_string()))),
+	)
+}
+
+/// Build a synthetic RemoteFile parented to a non-UUID slot (Trash). Conversion should fail
+/// because `CacheableFile` only accepts a real `Uuid` parent.
+fn make_test_remote_file_bad_parent(name: &str) -> RemoteFile {
+	let key_hex = "a".repeat(64);
+	let file_key =
+		FileKey::from_string_with_version(Cow::Owned(key_hex), FileEncryptionVersion::V3).unwrap();
+	let now = Utc::now();
+	RemoteFile::from_meta(
+		UuidStr::new_v4(),
+		ParentUuid::Trash,
+		1024,
+		1,
+		"us-east-1",
+		"test-bucket",
+		now,
+		false,
+		FileMeta::Decoded(DecryptedFileMeta {
+			name: Cow::Owned(name.to_string()),
+			size: 1024,
+			mime: Cow::Owned("text/plain".to_string()),
+			key: Cow::Owned(file_key),
+			last_modified: now,
+			created: Some(now),
+			hash: None,
+		}),
+	)
+}
+
+/// Build a synthetic RemoteDirectory with encrypted (un-decryptable) metadata.
+fn make_test_remote_dir_encrypted_meta(parent: &UuidStr) -> RemoteDirectory {
+	let now = Utc::now();
+	RemoteDirectory::from_meta(
+		UuidStr::new_v4(),
+		ParentUuid::Uuid(*parent),
+		DirColor::Default,
+		false,
+		now,
+		DirectoryMeta::Encrypted(EncryptedString(Cow::Owned("encrypted_blob".to_string()))),
+	)
+}
+
+/// Build a synthetic RemoteDirectory parented to a non-UUID slot (Trash).
+fn make_test_remote_dir_bad_parent(name: &str) -> RemoteDirectory {
+	let now = Utc::now();
+	RemoteDirectory::from_meta(
+		UuidStr::new_v4(),
+		ParentUuid::Trash,
+		DirColor::Default,
+		false,
+		now,
+		DirectoryMeta::Decoded(DecryptedDirectoryMeta {
+			name: Cow::Owned(name.to_string()),
+			created: Some(now),
+		}),
+	)
+}
+
 /// Build a synthetic RemoteDirectory with decoded metadata for testing ListDirRecursive.
 fn make_test_remote_dir(name: &str, parent: &UuidStr) -> RemoteDirectory {
 	let now = Utc::now();
@@ -294,22 +370,64 @@ async fn ensure_socket_ready(client: &Client) {
 	.await;
 }
 
+/// Shared queue of `CacheMessage`s captured from a `CacheHandle`'s status callback.
+/// Wrapping in an `Arc<Mutex<_>>` is the simplest way to share with the `'static`
+/// callback while letting the test thread inspect the contents.
+type MessageLog = std::sync::Arc<Mutex<Vec<CacheMessage>>>;
+
 /// A test cache wrapping CacheHandle with automatic temp DB cleanup.
 struct TestCache {
 	path: PathBuf,
 	handle: CacheHandle,
+	messages: MessageLog,
 }
 
 impl TestCache {
 	async fn new(client: &Client) -> Self {
 		let path = temp_cache_path();
-		let handle = CacheHandle::new(client, path.clone()).await.unwrap();
+		let messages: MessageLog = std::sync::Arc::new(Mutex::new(Vec::new()));
+		let messages_cb = messages.clone();
+		let handle = CacheHandle::new(client, path.clone(), move |msgs| {
+			let messages_cb = messages_cb.clone();
+			tokio::task::spawn(async move {
+				messages_cb.lock().await.extend(msgs);
+			});
+		})
+		.await
+		.unwrap();
 		ensure_socket_ready(client).await;
-		Self { path, handle }
+		Self {
+			path,
+			handle,
+			messages,
+		}
 	}
 
 	fn db_path(&self) -> &Path {
 		&self.path
+	}
+
+	/// Wait until at least `count` messages have been received, then run `inspect` while
+	/// holding the lock. Returns whatever the inspection returned, or `None` on timeout.
+	async fn wait_and_inspect_messages<R>(
+		&self,
+		count: usize,
+		timeout: Duration,
+		inspect: impl FnOnce(&[CacheMessage]) -> R,
+	) -> Option<R> {
+		let deadline = tokio::time::Instant::now() + timeout;
+		loop {
+			{
+				let guard = self.messages.lock().await;
+				if guard.len() >= count {
+					return Some(inspect(&guard));
+				}
+			}
+			if tokio::time::Instant::now() >= deadline {
+				return None;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
 	}
 }
 
@@ -708,7 +826,9 @@ async fn test_cache_shutdown_on_drop() {
 	let path = temp_cache_path();
 
 	{
-		let _cache = CacheHandle::new(&client, path.clone()).await.unwrap();
+		let _cache = CacheHandle::new(&client, path.clone(), |_| {})
+			.await
+			.unwrap();
 	}
 
 	assert!(path.exists(), "DB file should persist after cache drop");
@@ -738,7 +858,9 @@ async fn test_cache_reopen_preserves_data() {
 	let dir = make_test_remote_dir("reopen_test_dir", test_dir_uuid);
 	let dir_uuid: Uuid = dir.uuid().into();
 	{
-		let cache = CacheHandle::new(client, path.clone()).await.unwrap();
+		let cache = CacheHandle::new(client, path.clone(), |_| {})
+			.await
+			.unwrap();
 		ensure_socket_ready(client).await;
 		cache
 			.update_list_dir_recursive(vec![dir], vec![])
@@ -748,7 +870,9 @@ async fn test_cache_reopen_preserves_data() {
 	}
 
 	{
-		let _cache = CacheHandle::new(client, path.clone()).await.unwrap();
+		let _cache = CacheHandle::new(client, path.clone(), |_| {})
+			.await
+			.unwrap();
 
 		assert!(
 			poll_for_item(&path, dir_uuid, Duration::from_secs(5)).await,
@@ -1219,4 +1343,219 @@ async fn test_cache_file_archived_via_socket() {
 		poll_for_item(cache.db_path(), replacement_uuid, Duration::from_secs(30)).await,
 		"replacement file should appear in cache"
 	);
+}
+
+// ─── Error Path Tests ──────────────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn test_cache_error_on_file_with_encrypted_meta() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client).await;
+	let test_dir_uuid = resources.dir.uuid();
+
+	let bad_file = make_test_remote_file_encrypted_meta(test_dir_uuid);
+	let bad_file_uuid: Uuid = bad_file.uuid().into();
+
+	cache
+		.handle
+		.update_list_dir_recursive(vec![], vec![bad_file])
+		.await
+		.unwrap();
+
+	let saw_expected_error = cache
+		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+			msgs.iter().any(|msg| match msg {
+				CacheMessage::Error(errors) => errors.iter().any(|e| {
+					matches!(e, CacheError::FileCacheableConversion(failed)
+						if Uuid::from(failed.file.uuid()) == bad_file_uuid)
+				}),
+			})
+		})
+		.await
+		.unwrap_or(false);
+
+	assert!(
+		saw_expected_error,
+		"expected a FileCacheableConversion error for the encrypted-meta file"
+	);
+
+	assert!(
+		query_cached_file(cache.db_path(), bad_file_uuid).is_none(),
+		"file with encrypted meta should not be inserted into the cache"
+	);
+}
+
+#[shared_test_runtime]
+async fn test_cache_error_on_dir_with_encrypted_meta() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client).await;
+	let test_dir_uuid = resources.dir.uuid();
+
+	let bad_dir = make_test_remote_dir_encrypted_meta(test_dir_uuid);
+	let bad_dir_uuid: Uuid = bad_dir.uuid().into();
+
+	cache
+		.handle
+		.update_list_dir_recursive(vec![bad_dir], vec![])
+		.await
+		.unwrap();
+
+	let saw_expected_error = cache
+		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+			msgs.iter().any(|msg| match msg {
+				CacheMessage::Error(errors) => errors.iter().any(|e| {
+					matches!(e, CacheError::DirCacheableConversion(failed)
+						if Uuid::from(failed.dir.uuid()) == bad_dir_uuid)
+				}),
+			})
+		})
+		.await
+		.unwrap_or(false);
+
+	assert!(
+		saw_expected_error,
+		"expected a DirCacheableConversion error for the encrypted-meta dir"
+	);
+
+	assert!(
+		query_cached_dir(cache.db_path(), bad_dir_uuid).is_none(),
+		"dir with encrypted meta should not be inserted into the cache"
+	);
+}
+
+#[shared_test_runtime]
+async fn test_cache_error_on_file_with_non_uuid_parent() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client).await;
+
+	let bad_file = make_test_remote_file_bad_parent("trashed_file.txt");
+	let bad_file_uuid: Uuid = bad_file.uuid().into();
+
+	cache
+		.handle
+		.update_list_dir_recursive(vec![], vec![bad_file])
+		.await
+		.unwrap();
+
+	let saw_expected_error = cache
+		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+			msgs.iter().any(|msg| match msg {
+				CacheMessage::Error(errors) => errors.iter().any(|e| {
+					matches!(e, CacheError::FileCacheableConversion(failed)
+						if Uuid::from(failed.file.uuid()) == bad_file_uuid)
+				}),
+			})
+		})
+		.await
+		.unwrap_or(false);
+
+	assert!(
+		saw_expected_error,
+		"expected a FileCacheableConversion error for the non-UUID parent file"
+	);
+}
+
+#[shared_test_runtime]
+async fn test_cache_error_on_dir_with_non_uuid_parent() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client).await;
+
+	let bad_dir = make_test_remote_dir_bad_parent("trashed_dir");
+	let bad_dir_uuid: Uuid = bad_dir.uuid().into();
+
+	cache
+		.handle
+		.update_list_dir_recursive(vec![bad_dir], vec![])
+		.await
+		.unwrap();
+
+	let saw_expected_error = cache
+		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+			msgs.iter().any(|msg| match msg {
+				CacheMessage::Error(errors) => errors.iter().any(|e| {
+					matches!(e, CacheError::DirCacheableConversion(failed)
+						if Uuid::from(failed.dir.uuid()) == bad_dir_uuid)
+				}),
+			})
+		})
+		.await
+		.unwrap_or(false);
+
+	assert!(
+		saw_expected_error,
+		"expected a DirCacheableConversion error for the non-UUID parent dir"
+	);
+}
+
+#[shared_test_runtime]
+async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client).await;
+	let test_dir_uuid = resources.dir.uuid();
+
+	// Two good dirs, two bad dirs (one encrypted, one bad parent)
+	let good_dirs: Vec<RemoteDirectory> = (0..2)
+		.map(|i| make_test_remote_dir(&format!("partial_dir_{i}"), test_dir_uuid))
+		.collect();
+	let good_dir_uuids: Vec<Uuid> = good_dirs.iter().map(|d| d.uuid().into()).collect();
+	let bad_dir_encrypted = make_test_remote_dir_encrypted_meta(test_dir_uuid);
+	let bad_dir_parent = make_test_remote_dir_bad_parent("partial_bad_parent_dir");
+
+	// Three good files, two bad files (one encrypted, one bad parent)
+	let good_files: Vec<RemoteFile> = (0..3)
+		.map(|i| make_test_remote_file(&format!("partial_file_{i}.txt"), test_dir_uuid))
+		.collect();
+	let good_file_uuids: Vec<Uuid> = good_files.iter().map(|f| f.uuid().into()).collect();
+	let bad_file_encrypted = make_test_remote_file_encrypted_meta(test_dir_uuid);
+	let bad_file_parent = make_test_remote_file_bad_parent("partial_bad_parent_file.txt");
+
+	let mut all_dirs = good_dirs;
+	all_dirs.push(bad_dir_encrypted);
+	all_dirs.push(bad_dir_parent);
+	let mut all_files = good_files;
+	all_files.push(bad_file_encrypted);
+	all_files.push(bad_file_parent);
+
+	cache
+		.handle
+		.update_list_dir_recursive(all_dirs, all_files)
+		.await
+		.unwrap();
+
+	// Good items should be inserted despite the bad ones in the same batch.
+	for (i, uuid) in good_dir_uuids.iter().enumerate() {
+		assert!(
+			poll_for_item(cache.db_path(), *uuid, Duration::from_secs(10)).await,
+			"good dir {i} should appear in cache despite bad items in same batch"
+		);
+	}
+	for (i, uuid) in good_file_uuids.iter().enumerate() {
+		assert!(
+			poll_for_item(cache.db_path(), *uuid, Duration::from_secs(10)).await,
+			"good file {i} should appear in cache despite bad items in same batch"
+		);
+	}
+
+	// Exactly four conversion errors should have been reported in a single message batch.
+	let (file_errs, dir_errs) = cache
+		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+			let mut file_errs = 0usize;
+			let mut dir_errs = 0usize;
+			for msg in msgs {
+				let CacheMessage::Error(errors) = msg;
+				for err in errors {
+					match err {
+						CacheError::FileCacheableConversion(_) => file_errs += 1,
+						CacheError::DirCacheableConversion(_) => dir_errs += 1,
+						_ => {}
+					}
+				}
+			}
+			(file_errs, dir_errs)
+		})
+		.await
+		.unwrap_or((0, 0));
+
+	assert_eq!(file_errs, 2, "expected 2 file conversion errors");
+	assert_eq!(dir_errs, 2, "expected 2 dir conversion errors");
 }

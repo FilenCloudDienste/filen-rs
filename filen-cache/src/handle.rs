@@ -10,7 +10,7 @@ use filen_sdk_rs::{
 };
 
 use crate::{
-	CacheControlMessage, CacheState,
+	CacheControlMessage, CacheError, CacheState,
 	state::{CacheEvent, ManualEvent},
 };
 
@@ -21,13 +21,23 @@ pub struct CacheHandle {
 	_listener_handle: ListenerHandle,
 }
 
+#[derive(Debug)]
+pub enum CacheMessage {
+	Error(Vec<CacheError>),
+}
+
 impl CacheHandle {
-	pub async fn new(client: &Client, cache_path: PathBuf) -> Result<Self, Error> {
+	pub async fn new(
+		client: &Client,
+		cache_path: PathBuf,
+		status_event_callback: impl Fn(Vec<CacheMessage>) + Send + 'static,
+	) -> Result<Self, Error> {
 		let (res_sender, res_receiver) = tokio::sync::oneshot::channel();
+		let (msg_sender, mut msg_receiver) = tokio::sync::mpsc::channel(100);
 
 		let root_uuid = client.root().uuid().into();
 		let handle = std::thread::spawn(move || {
-			let state = match CacheState::new(&cache_path, root_uuid) {
+			let state = match CacheState::new(&cache_path, root_uuid, msg_sender) {
 				Ok((state, callback, control_sender, event_sender)) => {
 					if res_sender
 						.send(Ok((callback, control_sender, event_sender)))
@@ -46,6 +56,12 @@ impl CacheHandle {
 			};
 
 			state.run();
+		});
+
+		tokio::task::spawn(async move {
+			while let Some(msg) = msg_receiver.recv().await {
+				status_event_callback(msg);
+			}
 		});
 
 		let (callback, control_sender, manual_event_sender) = res_receiver.await.unwrap()?;

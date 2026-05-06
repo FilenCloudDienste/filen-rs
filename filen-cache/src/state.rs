@@ -3,19 +3,17 @@ use std::{iter::once, path::Path};
 use crossbeam::channel::{Receiver, Sender, TrySendError};
 use filen_sdk_rs::{
 	fs::{
-		HasUUID,
 		categories::NonRootItemType,
-		dir::{DecryptedDirectoryMeta, cache::CacheableDir, meta::DirectoryMeta},
-		file::{
-			cache::CacheableFile,
-			meta::{DecryptedFileMeta, FileMeta},
-		},
+		dir::{cache::CacheableDir, meta::DirectoryMeta},
+		file::{cache::CacheableFile, meta::FileMeta},
 	},
 	io::{RemoteDirectory, RemoteFile},
 	socket::{DecryptedDriveEvent, DecryptedSocketEvent},
 };
 use filen_types::{api::v3::dir::color::DirColor, traits::CowHelpers};
 use uuid::Uuid;
+
+use crate::{CacheError, handle::CacheMessage};
 
 // Should be enough to buffer events while we're processing them
 // if we get more than that we can just drop them and log an error
@@ -27,6 +25,7 @@ pub(crate) struct CacheState {
 	pub(crate) db: rusqlite::Connection,
 	event_receiver: Receiver<CacheEvent>,
 	control_receiver: Receiver<CacheControlMessage>,
+	msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 	pub(crate) root_uuid: Uuid,
 }
 
@@ -39,11 +38,14 @@ impl CacheState {
 		let (control_sender, control_receiver) = crossbeam::channel::bounded(8);
 		drop(event_sender);
 		drop(control_sender);
+		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel(1);
+		drop(msg_receiver);
 
 		let mut state = Self {
 			db: rusqlite::Connection::open_in_memory().unwrap(),
 			event_receiver,
 			control_receiver,
+			msg_sender,
 			root_uuid,
 		};
 		state.init_db().unwrap();
@@ -68,10 +70,7 @@ enum FileEvent {
 	Archived(Uuid),
 	Restore(RemoteFile),
 	ArchiveRestored(RemoteFile),
-	MetadataChanged {
-		uuid: Uuid,
-		meta: Option<DecryptedFileMeta<'static>>,
-	},
+	MetadataChanged { uuid: Uuid, meta: FileMeta<'static> },
 	Favorite(RemoteFile),
 }
 
@@ -83,7 +82,7 @@ enum DirEvent {
 	Restore(RemoteDirectory),
 	MetadataChanged {
 		uuid: Uuid,
-		meta: Option<DecryptedDirectoryMeta<'static>>,
+		meta: DirectoryMeta<'static>,
 	},
 	ColorChanged {
 		uuid: Uuid,
@@ -118,20 +117,6 @@ impl CacheEvent {
 
 pub enum CacheControlMessage {
 	Shutdown,
-}
-
-fn try_extract_file_meta(meta: &FileMeta<'_>) -> Option<DecryptedFileMeta<'static>> {
-	match meta {
-		FileMeta::Decoded(decoded) => Some(decoded.clone().into_owned_cow()),
-		_ => None,
-	}
-}
-
-fn try_extract_dir_meta(meta: &DirectoryMeta<'_>) -> Option<DecryptedDirectoryMeta<'static>> {
-	match meta {
-		DirectoryMeta::Decoded(decoded) => Some(decoded.clone().into_owned_cow()),
-		_ => None,
-	}
 }
 
 fn make_socket_event_callback(
@@ -172,7 +157,7 @@ fn make_socket_event_callback(
 			DecryptedDriveEvent::FileMetadataChanged(changed) => {
 				CacheEventType::File(FileEvent::MetadataChanged {
 					uuid: (&changed.uuid).into(),
-					meta: try_extract_file_meta(&changed.metadata),
+					meta: changed.metadata.clone().into_owned_cow(),
 				})
 			}
 
@@ -195,7 +180,7 @@ fn make_socket_event_callback(
 			DecryptedDriveEvent::FolderMetadataChanged(changed) => {
 				CacheEventType::Dir(DirEvent::MetadataChanged {
 					uuid: (&changed.uuid).into(),
-					meta: try_extract_dir_meta(&changed.meta),
+					meta: changed.meta.clone().into_owned_cow(),
 				})
 			}
 			DecryptedDriveEvent::FolderColorChanged(changed) => {
@@ -244,6 +229,7 @@ impl CacheState {
 	pub(crate) fn new(
 		cache_path: &Path,
 		root_uuid: Uuid,
+		msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 	) -> Result<InitResult, filen_sdk_rs::Error> {
 		let connection = rusqlite::Connection::open(cache_path).map_err(|e| {
 			filen_sdk_rs::Error::custom_with_source(
@@ -260,6 +246,7 @@ impl CacheState {
 			db: connection,
 			event_receiver,
 			control_receiver,
+			msg_sender,
 			root_uuid,
 		};
 
@@ -298,13 +285,17 @@ impl CacheState {
 						return;
 					};
 
-					self.handle_event(event);
+					if let Err(e) = self.handle_event(event)
+						&& let Err(e) = self.msg_sender.try_send(vec![CacheMessage::Error(e)]) {
+							log::error!("Failed to send cache error message to main thread: {:?}, assuming main thread has died, shutting down", e);
+							return;
+						}
 				}
 			}
 		}
 	}
 
-	fn handle_event(&mut self, event: CacheEvent) {
+	fn handle_event(&mut self, event: CacheEvent) -> Result<(), Vec<CacheError>> {
 		match event.event {
 			CacheEventType::File(file_event) => self.handle_file_event(file_event),
 			CacheEventType::Dir(dir_event) => self.handle_dir_event(dir_event),
@@ -313,7 +304,7 @@ impl CacheState {
 		}
 	}
 
-	fn handle_file_event(&mut self, event: FileEvent) {
+	fn handle_file_event(&mut self, event: FileEvent) -> Result<(), Vec<CacheError>> {
 		match event {
 			FileEvent::New(file)
 			| FileEvent::Move(file)
@@ -321,51 +312,42 @@ impl CacheState {
 			| FileEvent::ArchiveRestored(file)
 			| FileEvent::Favorite(file) => {
 				let cacheable = match CacheableFile::try_from(&file) {
-					Ok(cacheable) => cacheable,
+					Ok(file) => file,
 					Err(e) => {
-						log::error!(
-							"Failed to convert RemoteFile to CacheableFile for file {:?}: {:?}",
-							file.uuid(),
-							e
-						);
-						// TODO: proper handling with error callbacks
-						return;
+						return Err(vec![CacheError::file_cachable_conversion(file, e)]);
 					}
 				};
-				if let Err(e) = self.upsert_files(once(&cacheable)) {
-					log::error!(
-						"Failed to upsert file {:?} into cache: {:?}",
-						cacheable.uuid,
-						e
-					);
-					// TODO: proper handling with error callbacks
-				}
+				self.upsert_files(once(&cacheable)).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						format!("failed to upsert file: {:?}", cacheable),
+					)]
+				})
 			}
 			FileEvent::Trash(uuid) | FileEvent::Delete(uuid) | FileEvent::Archived(uuid) => {
-				if let Err(e) = self.delete_items(once(uuid)) {
-					log::error!("Failed to delete file {:?} from cache: {:?}", uuid, e);
-				}
+				self.delete_items(once(uuid)).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						format!("failed to delete file with uuid: {}", uuid),
+					)]
+				})
 			}
 			FileEvent::MetadataChanged { uuid, meta } => {
-				let Some(meta) = meta else {
-					log::error!(
-						"MetadataChanged event for file {:?} does not contain decrypted metadata, cannot update cache",
-						uuid
-					);
-					return;
+				let meta = match meta {
+					FileMeta::Decoded(decoded) => decoded,
+					meta => return Err(vec![CacheError::file_meta_not_decryptable(meta, uuid)]),
 				};
-				if let Err(e) = self.update_file_meta(uuid, &meta) {
-					log::error!(
-						"Failed to update file metadata for {:?} in cache: {:?}",
-						uuid,
-						e
-					);
-				}
+				self.update_file_meta(uuid, &meta).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						format!("updating file meta for uuid {} meta: {:?}", uuid, meta),
+					)]
+				})
 			}
 		}
 	}
 
-	fn handle_dir_event(&mut self, event: DirEvent) {
+	fn handle_dir_event(&mut self, event: DirEvent) -> Result<(), Vec<CacheError>> {
 		match event {
 			DirEvent::New(dir)
 			| DirEvent::Move(dir)
@@ -374,105 +356,140 @@ impl CacheState {
 				let cacheable = match CacheableDir::try_from(&dir) {
 					Ok(cacheable) => cacheable,
 					Err(e) => {
-						log::error!(
-							"Failed to convert RemoteDirectory to CacheableDir for dir {:?}: {:?}",
-							dir.uuid(),
-							e
-						);
-						// TODO: proper handling with error callbacks
-						return;
+						return Err(vec![CacheError::dir_cachable_conversion(dir, e)]);
 					}
 				};
-				if let Err(e) = self.upsert_dirs(once(&cacheable)) {
-					log::error!(
-						"Failed to upsert dir {:?} into cache: {:?}",
-						cacheable.uuid,
-						e
-					);
-				}
+				self.upsert_dirs(once(&cacheable)).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						format!("failed to upsert dir: {:?}", cacheable),
+					)]
+				})
 			}
 			DirEvent::Trash(uuid) | DirEvent::Delete(uuid) => {
-				if let Err(e) = self.delete_items(once(uuid)) {
-					log::error!("Failed to delete dir {:?} from cache: {:?}", uuid, e);
-				}
+				self.delete_items(once(uuid)).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						format!("failed to delete dir with uuid: {}", uuid),
+					)]
+				})
 			}
 			DirEvent::MetadataChanged { uuid, meta } => {
-				let Some(meta) = meta else {
-					log::error!(
-						"MetadataChanged event for dir {:?} does not contain decrypted metadata, cannot update cache",
-						uuid
-					);
-					return;
+				let DirectoryMeta::Decoded(meta) = meta else {
+					return Err(vec![CacheError::dir_meta_not_decryptable(meta, uuid)]);
 				};
-				if let Err(e) = self.update_dir_name(uuid, &meta) {
-					log::error!("Failed to update dir name for {:?} in cache: {:?}", uuid, e);
-				}
+				self.update_dir_name(uuid, &meta).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						format!(
+							"failed to update dir name for uuid {} and meta {:?}",
+							uuid, meta
+						),
+					)]
+				})
 			}
 			DirEvent::ColorChanged { uuid, color } => {
-				if let Err(e) = self.update_dir_color(uuid, &color) {
-					log::error!(
-						"Failed to update dir color for {:?} in cache: {:?}",
-						uuid,
-						e
-					);
-				}
+				self.update_dir_color(uuid, &color).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						format!(
+							"failed to update dir color for uuid {} and color {:?}",
+							uuid, color
+						),
+					)]
+				})
 			}
 		}
 	}
 
-	fn handle_global_event(&mut self, event: GlobalEvent) {
+	fn handle_global_event(&mut self, event: GlobalEvent) -> Result<(), Vec<CacheError>> {
 		match event {
-			GlobalEvent::DeleteAll => {
-				if let Err(e) = self.delete_all_non_root() {
-					log::error!("Failed to delete all non-root in cache: {:?}", e);
-				}
-			}
+			GlobalEvent::DeleteAll => self.delete_all_non_root().map_err(|e| {
+				vec![CacheError::db(
+					e,
+					"failed to delete all non-root items from cache".to_string(),
+				)]
+			}),
 			GlobalEvent::TrashEmpty => {
+				Ok(())
 				// noop, we don't track trashed items
 			}
 			GlobalEvent::DeleteVersioned => {
+				Ok(())
 				// todo, implement version tracking
 			}
 		}
 	}
 
-	fn handle_manual_event(&mut self, event: ManualEvent) {
+	fn handle_manual_event(&mut self, event: ManualEvent) -> Result<(), Vec<CacheError>> {
 		match event {
 			ManualEvent::ListDirRecursive(dirs, files) => {
-				let cacheable_dirs = dirs.iter().filter_map(|dir| {
-					CacheableDir::try_from(dir)
-						.map_err(|e| {
-							// TODO: proper handling with error callbacks
-							log::error!(
-								"Failed to convert RemoteDirectory to CacheableDir for dir {:?}: {:?}",
-								dir.uuid(),
-								e
-							);
-							e
-						})
-						.ok()
-				});
-				if let Err(e) = self.upsert_dirs(cacheable_dirs) {
-					log::error!("Failed to upsert dirs into cache: {:?}", e);
-				}
+				let mut cache_errors = Vec::new();
 
-				let cacheable_files = files.iter().filter_map(|file| {
-					CacheableFile::try_from(file)
-						.map_err(|e| {
-							// TODO: proper handling with error callbacks
-							log::error!(
-								"Failed to convert RemoteFile to CacheableFile for file {:?}: {:?}",
-								file.uuid(),
-								e
-							);
-							e
+				let cacheable_dirs = IteratorWithErrors::new(
+					&mut cache_errors,
+					dirs.into_iter().map(|dir| {
+						CacheableDir::try_from(dir).map_err(|(dir, e)| {
+							Box::new(CacheError::dir_cachable_conversion(dir, e))
 						})
-						.ok()
-				});
-				if let Err(e) = self.upsert_files(cacheable_files) {
-					log::error!("Failed to upsert files into cache: {:?}", e);
+					}),
+				);
+				self.upsert_dirs(cacheable_dirs).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						"Failed when bulk inserting CacheableDirs".to_string(),
+					)]
+				})?;
+
+				let cacheable_files = IteratorWithErrors::new(
+					&mut cache_errors,
+					files.into_iter().map(|file| {
+						CacheableFile::try_from(file).map_err(|(file, e)| {
+							Box::new(CacheError::file_cachable_conversion(file, e))
+						})
+					}),
+				);
+				self.upsert_files(cacheable_files).map_err(|e| {
+					vec![CacheError::db(
+						e,
+						"Failed when bulk inserting CacheableFiles".to_string(),
+					)]
+				})?;
+
+				if cache_errors.is_empty() {
+					Ok(())
+				} else {
+					Err(cache_errors)
 				}
 			}
 		}
+	}
+}
+
+struct IteratorWithErrors<'a, Iter, E> {
+	iter: Iter,
+	errors: &'a mut Vec<E>,
+}
+
+impl<Iter, Item, E> Iterator for IteratorWithErrors<'_, Iter, E>
+where
+	Iter: Iterator<Item = Result<Item, Box<E>>>,
+{
+	type Item = Item;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		for result in self.iter.by_ref() {
+			match result {
+				Ok(item) => return Some(item),
+				Err(e) => self.errors.push(*e),
+			}
+		}
+		None
+	}
+}
+
+impl<'a, Iter, E> IteratorWithErrors<'a, Iter, E> {
+	fn new(errors: &'a mut Vec<E>, iter: Iter) -> Self {
+		Self { iter, errors }
 	}
 }

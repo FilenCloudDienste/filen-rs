@@ -38,33 +38,42 @@ pub struct CacheableFile<'a> {
 }
 
 impl TryFrom<RemoteFile> for CacheableFile<'static> {
-	type Error = Error;
+	type Error = (RemoteFile, Error);
 
-	fn try_from(value: RemoteFile) -> Result<Self, Self::Error> {
+	fn try_from(mut value: RemoteFile) -> Result<Self, Self::Error> {
+		let parent = match value.parent {
+			ParentUuid::Uuid(uuid) => (&uuid).into(),
+			parent => {
+				return Err((
+					value,
+					Error::custom(
+						crate::ErrorKind::InvalidState,
+						format!(
+							"cannot convert remote file to cacheable file with {:?} parent",
+							parent
+						),
+					),
+				));
+			}
+		};
+
 		let decrypted_meta = match value.meta {
 			FileMeta::Decoded(meta) => meta,
-			_ => {
-				return Err(Error::custom(
-					crate::ErrorKind::MetadataWasNotDecrypted,
-					"cannot convert remote file to cacheable file with encrypted meta",
+			other => {
+				value.meta = other;
+				return Err((
+					value,
+					Error::custom(
+						crate::ErrorKind::MetadataWasNotDecrypted,
+						"cannot convert remote file to cacheable file with encrypted meta",
+					),
 				));
 			}
 		};
 
 		Ok(Self {
 			uuid: (&value.uuid).into(),
-			parent: match value.parent {
-				ParentUuid::Uuid(uuid) => (&uuid).into(),
-				parent => {
-					return Err(Error::custom(
-						crate::ErrorKind::InvalidState,
-						format!(
-							"cannot convert remote file to cacheable file with {:?} parent",
-							parent
-						),
-					));
-				}
-			},
+			parent,
 			chunks_size: value.size,
 			chunks: value.chunks,
 			favorited: value.favorited,

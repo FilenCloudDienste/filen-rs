@@ -19,33 +19,42 @@ pub struct CacheableDir<'a> {
 }
 
 impl TryFrom<RemoteDirectory> for CacheableDir<'static> {
-	type Error = Error;
+	type Error = (RemoteDirectory, Error);
 
-	fn try_from(value: RemoteDirectory) -> Result<Self, Self::Error> {
+	fn try_from(mut value: RemoteDirectory) -> Result<Self, Self::Error> {
+		let parent = match value.parent {
+			ParentUuid::Uuid(uuid) => (&uuid).into(),
+			parent => {
+				return Err((
+					value,
+					Error::custom(
+						crate::ErrorKind::InvalidState,
+						format!(
+							"cannot convert remote dir to cacheable dir with {:?} parent",
+							parent
+						),
+					),
+				));
+			}
+		};
+
 		let decrypted_meta = match value.meta {
 			DirectoryMeta::Decoded(meta) => meta,
-			_ => {
-				return Err(Error::custom(
-					crate::ErrorKind::MetadataWasNotDecrypted,
-					"cannot convert remote dir to cacheable dir with encrypted meta",
+			other => {
+				value.meta = other;
+				return Err((
+					value,
+					Error::custom(
+						crate::ErrorKind::MetadataWasNotDecrypted,
+						"cannot convert remote dir to cacheable dir with encrypted meta",
+					),
 				));
 			}
 		};
 
 		Ok(Self {
 			uuid: (&value.uuid).into(),
-			parent: match value.parent {
-				ParentUuid::Uuid(uuid) => (&uuid).into(),
-				parent => {
-					return Err(Error::custom(
-						crate::ErrorKind::InvalidState,
-						format!(
-							"cannot convert remote dir to cacheable dir with {:?} parent",
-							parent
-						),
-					));
-				}
-			},
+			parent,
 			color: value.color,
 			favorited: value.favorited,
 			timestamp: value.timestamp,
