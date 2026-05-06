@@ -283,3 +283,51 @@ async fn user_info() {
 	let info = client.get_user_info().await.unwrap();
 	assert_eq!(info.email, client.email());
 }
+
+#[shared_test_runtime]
+#[ignore = "Currently the server doesn't block messages from blocked contacts, should be re-enabled once that is implemented"]
+async fn test_blocking() {
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let client = test_utils::RESOURCES.client().await;
+	let _locks = set_up_contact(&client, &share_client).await;
+
+	let contacts = share_client.get_contacts().await.unwrap();
+	let contact = contacts.iter().find(|c| c.email == client.email()).unwrap();
+
+	let mut chat = share_client
+		.create_chat(&[contact.as_borrowed_cow()])
+		.await
+		.unwrap();
+
+	let unblocked_msg = "hello";
+
+	share_client
+		.send_chat_message(&mut chat, unblocked_msg.to_string(), None)
+		.await
+		.unwrap();
+
+	let client_chat = client.get_chat(chat.uuid()).await.unwrap().unwrap();
+	assert!(
+		client_chat
+			.last_message()
+			.is_some_and(|msg| msg.message().unwrap() == unblocked_msg)
+	);
+
+	client.block_contact(share_client.email()).await.unwrap();
+
+	tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+	let blocked = client.get_blocked_contacts().await.unwrap();
+	assert!(blocked.iter().any(|c| c.email == share_client.email()));
+
+	let blocked_msg = "goodbye";
+
+	share_client
+		.send_chat_message(&mut chat, blocked_msg.to_string(), None)
+		.await
+		.unwrap();
+
+	let msgs = client.list_messages(&client_chat).await.unwrap();
+	println!("msgs:D {msgs:#?}");
+	assert!(msgs.iter().all(|msg| msg.message().unwrap() != blocked_msg));
+}

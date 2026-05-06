@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::{fs::UuidStr, traits::CowHelpers};
 
 pub mod blocked;
 pub mod delete;
@@ -15,7 +15,7 @@ pub const ENDPOINT: &str = "v3/contacts";
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Response<'a>(pub Vec<Contact<'a>>);
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct Contact<'a> {
 	pub uuid: UuidStr,
