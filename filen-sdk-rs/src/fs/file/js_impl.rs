@@ -428,7 +428,7 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFile")
 	)]
-	pub async fn download_file(
+	pub async fn download_file_to_bytes(
 		&self,
 		file: AnyFile,
 		managed_future: Option<ManagedFuture>,
