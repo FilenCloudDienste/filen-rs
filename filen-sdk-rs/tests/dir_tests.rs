@@ -12,6 +12,7 @@ use filen_sdk_rs::{
 	Error, ErrorKind,
 	connect::{DirPublicLink, PublicLinkSharedClientExt},
 	crypto::shared::generate_random_base64_values,
+	error::ResultExt,
 	fs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID,
 		categories::{
@@ -28,7 +29,7 @@ use filen_sdk_rs::{
 	},
 	io::{CategoryDirDownloadExtPub, DirDownloadCallback, DirUploadCallback, FilenMetaExt},
 };
-use filen_types::fs::ParentUuid;
+use filen_types::fs::{ParentUuid, UuidStr};
 use futures::StreamExt;
 use tokio::time;
 
@@ -964,6 +965,44 @@ async fn not_found_error() {
 		.await
 		.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::FolderNotFound)
+}
+
+// ── FolderNotFound / optional() ─────────────────────────────────────
+
+#[shared_test_runtime]
+async fn get_dir_for_random_uuid_returns_folder_not_found_kind() {
+	let client = test_utils::RESOURCES.client().await;
+
+	let err = client.get_dir(UuidStr::new_v4()).await.unwrap_err();
+	assert_eq!(
+		err.kind(),
+		ErrorKind::FolderNotFound,
+		"expected FolderNotFound, got {err:?}"
+	);
+}
+
+#[shared_test_runtime]
+async fn get_dir_optional_returns_none_for_random_uuid() {
+	let client = test_utils::RESOURCES.client().await;
+
+	let result = client.get_dir(UuidStr::new_v4()).await.optional().unwrap();
+	assert!(result.is_none(), "expected None for random uuid");
+}
+
+#[shared_test_runtime]
+async fn get_dir_optional_returns_some_for_existing_dir() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let dir = client
+		.create_dir(&test_dir.into(), "optional_get_dir")
+		.await
+		.unwrap();
+
+	let got = client.get_dir(*dir.uuid()).await.optional().unwrap();
+	let got = got.expect("expected Some for an existing dir");
+	assert_eq!(got, dir);
 }
 
 #[derive(Default)]

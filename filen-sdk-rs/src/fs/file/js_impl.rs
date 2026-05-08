@@ -8,6 +8,7 @@ use crate::{ErrorKind, fs::file::traits::HasFileInfo};
 use crate::{
 	Error,
 	auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
+	error::ResultExt,
 	fs::{
 		categories::{DirType, Normal},
 		file::{enums::RemoteFileType, meta::FileMetaChanges},
@@ -198,6 +199,14 @@ impl JsClient {
 	pub async fn get_file(&self, uuid: UuidStr) -> Result<File, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move { this.get_file(uuid).await.map(File::from) }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getFileOptional")
+	)]
+	pub async fn get_file_optional(&self, uuid: UuidStr) -> Result<Option<File>, Error> {
+		self.get_file(uuid).await.optional()
 	}
 
 	#[cfg_attr(

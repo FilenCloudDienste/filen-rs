@@ -299,6 +299,30 @@ impl Client {
 		.await?;
 		Ok(uuid)
 	}
+
+	/// Downloads a single file chunk by raw `region`/`bucket`/`uuid`/`chunk_idx`,
+	/// bypassing any local file metadata.
+	///
+	/// Exposed for tests that need to exercise the chunk-download path with
+	/// arbitrary identifiers (e.g. a UUID that does not exist on the backend,
+	/// to verify the `FileChunkNotFound` mapping).
+	#[cfg(feature = "malformed")]
+	pub async fn download_file_chunk_by_uuid(
+		&self,
+		region: &str,
+		bucket: &str,
+		uuid: UuidStr,
+		chunk_idx: u64,
+	) -> Result<Vec<u8>, Error> {
+		api::download::download_file_chunk_by_uuid(
+			self.unauthed(),
+			region,
+			bucket,
+			uuid,
+			chunk_idx,
+		)
+		.await
+	}
 }
 
 #[allow(private_bounds)]

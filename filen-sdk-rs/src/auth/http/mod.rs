@@ -341,15 +341,19 @@ async fn execute_request(
 	let request = request
 		.map_err(Error::from)
 		.map_err(retry::RetryError::NoRetry)?;
-	client.execute(request).await.map_err(|e| {
-		let retryable = !(e.is_builder() || e.is_request());
-		let error = Error::from(e);
-		if retryable {
-			retry::RetryError::Retry(error)
-		} else {
-			retry::RetryError::NoRetry(error)
-		}
-	})
+	client
+		.execute(request)
+		.await
+		.and_then(|resp| resp.error_for_status())
+		.map_err(|e| {
+			let retryable = !(e.is_builder() || e.is_request());
+			let error = Error::from(e);
+			if retryable {
+				retry::RetryError::Retry(error)
+			} else {
+				retry::RetryError::NoRetry(error)
+			}
+		})
 }
 
 impl AuthClient {

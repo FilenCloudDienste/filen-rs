@@ -3,6 +3,7 @@ use std::{borrow::Cow, sync::Arc};
 use crate::{
 	Error,
 	auth::{Client, JsClient, js_impls::UnauthJsClient},
+	error::ResultExt,
 	fs::{
 		categories::{
 			DirType, Normal,
@@ -357,6 +358,14 @@ impl JsClient {
 	pub async fn get_dir(&self, uuid: UuidStr) -> Result<Dir, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move { this.get_dir(uuid).await.map(Dir::from) }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getDirOptional")
+	)]
+	pub async fn get_dir_optional(&self, uuid: UuidStr) -> Result<Option<Dir>, Error> {
+		self.get_dir(uuid).await.optional()
 	}
 
 	#[cfg_attr(

@@ -4,8 +4,10 @@ use chrono::{SubsecRound, Utc};
 use filen_macros::shared_test_runtime;
 
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	crypto::shared::generate_random_base64_values,
+	error::ResultExt,
 	fs::{
 		HasName, HasRemoteInfo, HasUUID,
 		categories::{NonRootFileType, NonRootItemType},
@@ -20,6 +22,7 @@ use filen_sdk_rs::{
 	io::client_impl::IoSharedClientExt,
 	util::MaybeSendCallback,
 };
+use filen_types::fs::UuidStr;
 use futures::AsyncReadExt;
 use rand::TryRngCore;
 
@@ -1279,6 +1282,24 @@ mod http_provider_tests {
 
 #[cfg(feature = "malformed")]
 #[shared_test_runtime]
+async fn download_chunk_for_random_uuid_returns_file_chunk_not_found_kind() {
+	let client = test_utils::RESOURCES.client().await;
+
+	// Pick the same defaults that the SDK uses when a file is created locally —
+	// the egest endpoint will respond with 404 for a UUID it has never seen.
+	let err = client
+		.download_file_chunk_by_uuid("de-1", "filen-empty", UuidStr::new_v4(), 0)
+		.await
+		.unwrap_err();
+	assert_eq!(
+		err.kind(),
+		ErrorKind::FileChunkNotFound,
+		"expected FileChunkNotFound, got {err:?}"
+	);
+}
+
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
 async fn file_malformed_meta() {
 	use filen_sdk_rs::fs::file::{meta::FileMeta, traits::HasFileMeta};
 
@@ -1546,6 +1567,48 @@ async fn update_file_meta_normalizes_nfc() {
 		.await
 		.unwrap();
 	assert_eq!(file.name().unwrap(), nfc_name);
+}
+
+// ── FileNotFound / optional() ───────────────────────────────────────
+
+#[shared_test_runtime]
+async fn get_file_for_random_uuid_returns_file_not_found_kind() {
+	let client = test_utils::RESOURCES.client().await;
+
+	let err = client.get_file(UuidStr::new_v4()).await.unwrap_err();
+	assert_eq!(
+		err.kind(),
+		ErrorKind::FileNotFound,
+		"expected FileNotFound, got {err:?}"
+	);
+}
+
+#[shared_test_runtime]
+async fn get_file_optional_returns_none_for_random_uuid() {
+	let client = test_utils::RESOURCES.client().await;
+
+	let result = client.get_file(UuidStr::new_v4()).await.optional().unwrap();
+	assert!(result.is_none(), "expected None for random uuid");
+}
+
+#[shared_test_runtime]
+async fn get_file_optional_returns_some_for_existing_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let file = client
+		.make_file_builder("optional_get.txt", *test_dir.uuid())
+		.unwrap()
+		.build();
+	let file = client
+		.upload_file(file.into(), b"optional get contents")
+		.await
+		.unwrap();
+
+	let got = client.get_file(*file.uuid()).await.optional().unwrap();
+	let got = got.expect("expected Some for an existing file");
+	assert_eq!(got, file);
 }
 
 #[shared_test_runtime]
