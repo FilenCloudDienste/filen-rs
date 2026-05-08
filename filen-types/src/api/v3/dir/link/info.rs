@@ -53,7 +53,7 @@ uniffi::custom_type!(
 impl<'de> LinkPasswordSalt<'de> {
 	fn from_cow(s: Cow<'de, str>) -> Result<Self, String> {
 		Ok(match s {
-			salt if salt.is_empty() => Self::None,
+			salt if salt.len() <= 1 => Self::None,
 			salt if salt.len() == 32 => Self::V2(
 				SizedStringBase64Chars::try_from(salt)
 					.map_err(|e| format!("invalid V2 salt: {e}"))?,
@@ -102,7 +102,7 @@ impl Serialize for LinkPasswordSalt<'_> {
 		S: serde::Serializer,
 	{
 		match self {
-			Self::None => serializer.serialize_str(""),
+			Self::None => serializer.serialize_str(" "),
 			Self::V2(s) => s.serialize(serializer),
 			Self::V3(s) => s.serialize(serializer),
 		}

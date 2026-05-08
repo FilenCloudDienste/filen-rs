@@ -173,7 +173,7 @@ impl FilePublicLink {
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
 			downloadable: true,
-			salt: crate::crypto::connect::new_random_salt(),
+			salt: LinkPasswordSalt::None,
 		}
 	}
 }
