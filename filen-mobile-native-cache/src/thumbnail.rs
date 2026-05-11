@@ -93,8 +93,8 @@ impl AuthCacheState {
 		{
 			tokio::fs::remove_file(&thumbnail_path).await?;
 			match e.downcast::<ImageError>() {
-				Ok(ImageError::Unsupported(_)) => Ok(None),
-				Ok(e) => Err(CacheError::from(e)),
+				Ok((ImageError::Unsupported(_), _)) => Ok(None),
+				Ok((e, context)) => Err(CacheError::from(e).context(context.join(": "))),
 				Err(e) => Err(CacheError::from(e)),
 			}
 		} else {

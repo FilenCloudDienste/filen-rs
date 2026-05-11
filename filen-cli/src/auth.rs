@@ -145,7 +145,7 @@ async fn login_and_optionally_prompt_two_factor_code(
 	{
 		Ok(client) => Ok(client),
 		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
-			Ok(ResponseError::ApiError { code, .. }) => {
+			Ok((ResponseError::ApiError { code, .. }, _)) => {
 				if code.as_deref() == Some("enter_2fa") {
 					let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
 					unauth_client

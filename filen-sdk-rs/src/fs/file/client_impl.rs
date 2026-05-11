@@ -314,14 +314,8 @@ impl Client {
 		uuid: UuidStr,
 		chunk_idx: u64,
 	) -> Result<Vec<u8>, Error> {
-		api::download::download_file_chunk_by_uuid(
-			self.unauthed(),
-			region,
-			bucket,
-			uuid,
-			chunk_idx,
-		)
-		.await
+		api::download::download_file_chunk_by_uuid(self.unauthed(), region, bucket, uuid, chunk_idx)
+			.await
 	}
 }
 
