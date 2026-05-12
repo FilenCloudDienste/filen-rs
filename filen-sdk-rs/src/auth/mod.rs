@@ -34,6 +34,7 @@ use crate::{
 	},
 	error::Error,
 	fs::{HasUUID, dir::RootDirectory},
+	runtime::do_cpu_intensive,
 	sync::lock::ResourceLock,
 };
 
@@ -679,6 +680,54 @@ impl Client {
 		api::v3::user::did_export_master_keys::post(self.client())
 			.await
 			.map(|_| exportable)
+	}
+
+	pub async fn change_email(&self, password: &str, new_email: &str) -> Result<(), Error> {
+		let auth_info = (**self.auth_info.read().unwrap_or_else(|e| e.into_inner())).clone();
+
+		let (derived_password, auth_version) = match auth_info {
+			AuthInfo::V1(_) => (
+				crypto::v1::derive_password_and_mk(password.as_bytes())?.1,
+				AuthVersion::V1,
+			),
+			AuthInfo::V2(_) => {
+				let auth_info_resp = api::v3::auth::info::post(
+					self.unauthed(),
+					&api::v3::auth::info::Request {
+						email: Cow::Borrowed(&self.email),
+					},
+				)
+				.await?;
+
+				(
+					do_cpu_intensive(|| {
+						crypto::v2::derive_password_and_mk(
+							password.as_bytes(),
+							auth_info_resp.salt.as_bytes(),
+						)
+						.map(|(_, derived)| derived)
+					})
+					.await?,
+					AuthVersion::V2,
+				)
+			}
+			AuthInfo::V3(_) => {
+				return Err(Error::custom(
+					crate::ErrorKind::InvalidState,
+					"Changing email is not supported for V3 accounts",
+				));
+			}
+		};
+
+		api::v3::user::settings::email::change::post(
+			self.client(),
+			&api::v3::user::settings::email::change::Request {
+				email: Cow::Borrowed(new_email),
+				password: derived_password,
+				auth_version,
+			},
+		)
+		.await
 	}
 }
 

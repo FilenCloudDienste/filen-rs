@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+pub mod email;
 pub mod password;
 
 pub const ENDPOINT: &str = "v3/user/settings";

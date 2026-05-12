@@ -29,3 +29,40 @@ pub(crate) mod result_to_option {
 		Ok(deserialized.ok())
 	}
 }
+
+/// `Option<Cow<'_, str>>` <-> JSON string, using the `"__NONE__"` sentinel
+/// (per the Filen backend convention) to represent `None`. Used by the
+/// `v3/user/personal/update` endpoint, where every field is mandatory on the
+/// wire but the sentinel means "leave unchanged".
+pub(crate) mod str_none_sentinel {
+	use std::borrow::Cow;
+
+	use serde::{Deserializer, Serializer};
+
+	const NONE_SENTINEL: &str = "__NONE__";
+
+	pub(crate) fn serialize<S>(
+		value: &Option<Cow<'_, str>>,
+		serializer: S,
+	) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		match value {
+			Some(v) => serializer.serialize_str(v),
+			None => serializer.serialize_str(NONE_SENTINEL),
+		}
+	}
+
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Cow<'de, str>>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let cow = crate::serde::cow::deserialize(deserializer)?;
+		Ok(if cow == NONE_SENTINEL {
+			None
+		} else {
+			Some(cow)
+		})
+	}
+}

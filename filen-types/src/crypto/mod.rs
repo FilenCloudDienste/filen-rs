@@ -3,7 +3,8 @@ use std::borrow::{Borrow, Cow};
 
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
-use typenum::U32;
+use sha2::Digest;
+use typenum::{U32, U64};
 
 use crate::{serde::str::SizedHexString, traits::CowHelpers};
 
@@ -232,6 +233,46 @@ impl AsRef<[u8; 32]> for Sha256Hash {
 
 impl From<Sha256Hash> for SizedHexString<U32> {
 	fn from(hash: Sha256Hash) -> Self {
+		hash.0
+	}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(transparent)]
+pub struct Sha512Hash(SizedHexString<U64>);
+
+impl Sha512Hash {
+	pub fn digest(data: &[u8]) -> Self {
+		Self::from(sha2::Sha512::digest(data))
+	}
+}
+
+impl From<digest::Output<sha2::Sha512>> for Sha512Hash {
+	fn from(hash: digest::Output<sha2::Sha512>) -> Self {
+		Self(SizedHexString::from(<[u8; _]>::from(hash)))
+	}
+}
+
+impl From<Sha512Hash> for digest::Output<sha2::Sha512> {
+	fn from(hash: Sha512Hash) -> Self {
+		(*hash.0.as_ref()).into()
+	}
+}
+
+impl From<Sha512Hash> for [u8; 64] {
+	fn from(hash: Sha512Hash) -> Self {
+		*hash.0.as_ref()
+	}
+}
+
+impl AsRef<[u8; 64]> for Sha512Hash {
+	fn as_ref(&self) -> &[u8; 64] {
+		self.0.as_ref()
+	}
+}
+
+impl From<Sha512Hash> for SizedHexString<U64> {
+	fn from(hash: Sha512Hash) -> Self {
 		hash.0
 	}
 }

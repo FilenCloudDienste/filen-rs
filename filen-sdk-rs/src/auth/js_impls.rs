@@ -185,6 +185,15 @@ impl JsClient {
 	pub fn get_unauthed(&self) -> UnauthJsClient {
 		UnauthJsClient::new(self.inner_ref().get_unauthed())
 	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "changeEmail")
+	)]
+	pub async fn change_email(&self, password: String, new_email: String) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.change_email(&password, &new_email).await }).await
+	}
 }
 
 #[js_type(import)]

@@ -4,9 +4,7 @@ use generic_array::{ArrayLength, GenericArray};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ConversionError, traits::CowHelpers};
-
-use super::SizedString;
+use crate::{error::ConversionError, serde::str::SizedString, traits::CowHelpers};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SizedStringBase64Chars<'a, N: ArrayLength>(SizedString<'a, N>);
