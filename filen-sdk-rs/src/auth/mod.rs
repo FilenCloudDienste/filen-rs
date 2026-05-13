@@ -644,35 +644,44 @@ impl Client {
 		.await?;
 
 		let auth_info = (**self.auth_info.read().unwrap_or_else(|e| e.into_inner())).clone();
-		let mut master_keys = match auth_info {
-			AuthInfo::V1(info) => info.master_keys,
-			AuthInfo::V2(info) => info.master_keys,
-			AuthInfo::V3(_) => {
-				return Err(Error::custom(
-					crate::ErrorKind::InvalidState,
-					"Changing password is not supported for V3 accounts",
-				));
-			}
-		};
-
 		let new_salt: SizedHexString<U256> = rand::random::<[u8; 256]>().into();
-
-		let current_derived = match auth_info_resp.auth_version {
-			AuthVersion::V1 => crypto::v1::derive_password_and_mk(current_password.as_bytes())?.1,
-			AuthVersion::V2 => {
-				crypto::v2::derive_password_and_mk(
-					current_password.as_bytes(),
-					auth_info_resp.salt.as_bytes(),
-				)?
-				.1
-			}
-			AuthVersion::V3 => unreachable!("we checked for v3 above"),
-		};
-
-		let (new_master_key, new_derive) = crypto::v2::derive_password_and_mk(
-			new_password.as_bytes(),
-			new_salt.to_string().as_bytes(),
-		)?;
+		let (mut master_keys, current_derived, new_master_key, new_derive, auth_version) =
+			match auth_info {
+				AuthInfo::V1(info) => {
+					let (new_master_key, new_derive) =
+						crypto::v1::derive_password_and_mk(new_password.as_bytes())?;
+					(
+						info.master_keys,
+						crypto::v1::derive_password_and_mk(current_password.as_bytes())?.1,
+						new_master_key,
+						new_derive,
+						AuthVersion::V1,
+					)
+				}
+				AuthInfo::V2(info) => {
+					let (new_master_key, new_derive) = crypto::v2::derive_password_and_mk(
+						new_password.as_bytes(),
+						(*new_salt.to_str()).as_bytes(),
+					)?;
+					(
+						info.master_keys,
+						crypto::v2::derive_password_and_mk(
+							current_password.as_bytes(),
+							auth_info_resp.salt.as_bytes(),
+						)?
+						.1,
+						new_master_key,
+						new_derive,
+						AuthVersion::V2,
+					)
+				}
+				AuthInfo::V3(_) => {
+					return Err(Error::custom(
+						crate::ErrorKind::InvalidState,
+						"Changing password is not supported for V3 accounts",
+					));
+				}
+			};
 
 		master_keys.0.insert(0, new_master_key);
 		let private_key_encrypted =
@@ -685,7 +694,7 @@ impl Client {
 			&api::v3::user::settings::password::change::Request {
 				current_password: current_derived,
 				password: new_derive,
-				auth_version: AuthVersion::V2,
+				auth_version,
 				salt: new_salt,
 				master_keys: encrypted,
 			},
@@ -707,8 +716,14 @@ impl Client {
 		)
 		.await?;
 
+		let new_auth_info = match auth_version {
+			AuthVersion::V1 => AuthInfo::V1(v2::AuthInfo { master_keys }),
+			AuthVersion::V2 => AuthInfo::V2(v2::AuthInfo { master_keys }),
+			AuthVersion::V3 => unreachable!("checked above"),
+		};
+
 		let mut write_lock = self.auth_info.write().unwrap_or_else(|e| e.into_inner());
-		*write_lock = Arc::new(AuthInfo::V2(v2::AuthInfo { master_keys }));
+		*write_lock = Arc::new(new_auth_info);
 		self.auth_info.clear_poison();
 		std::mem::drop(write_lock);
 
