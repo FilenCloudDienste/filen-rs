@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Heavier checks that run before every push.
+# Mirrors the Linux job in .github/workflows/ci.yml: all clippy configurations + unit tests.
+#
+# To bypass in an emergency: git push --no-verify
+#
+# Env vars:
+#   SKIP_HEAVY_CLIPPY=1   skip the heif-/avif-decoder clippy variants
+#                         (heif-decoder breaks incremental builds — cmake-rs bug)
+#   SKIP_TESTS=1          skip cargo test
+#   SKIP_SQLFLUFF=1       skip the full-repo sqlfluff scan
+
+set -u
+set -o pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+red=$'\033[31m'
+green=$'\033[32m'
+yellow=$'\033[33m'
+bold=$'\033[1m'
+reset=$'\033[0m'
+
+run() {
+	local name=$1
+	shift
+	printf '%s==>%s %s\n' "$bold" "$reset" "$name"
+	if "$@"; then
+		printf '%s    ok%s\n' "$green" "$reset"
+	else
+		printf '%s    failed: %s%s\n' "$red" "$name" "$reset"
+		printf '\n%spre-push failed.%s Fix the issue above, or run with --no-verify to bypass.\n' \
+			"$red$bold" "$reset"
+		exit 1
+	fi
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if ! have cargo; then
+	printf '%scargo not found — cannot run pre-push checks%s\n' "$red" "$reset"
+	exit 1
+fi
+
+# All-features clippy variants (matches CI). The heif-/avif-decoder builds can
+# be slow on cold caches; gate them behind SKIP_HEAVY_CLIPPY for tight loops.
+if [ "${SKIP_HEAVY_CLIPPY:-0}" != "1" ]; then
+	run "cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings" \
+		cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
+	run "cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings" \
+		cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
+else
+	printf '%sSKIP_HEAVY_CLIPPY=1, skipping heif-/avif-decoder clippy variants%s\n' \
+		"$yellow" "$reset"
+fi
+
+run "cargo clippy -- -D warnings" cargo clippy -- -D warnings
+run "cargo clippy --tests -- -D warnings" cargo clippy --tests -- -D warnings
+
+# Full-repo sqlfluff (matches CI).
+if [ "${SKIP_SQLFLUFF:-0}" != "1" ] && have sqlfluff; then
+	run "sqlfluff lint ." sqlfluff lint .
+fi
+
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+	run "cargo test --lib --no-fail-fast" \
+		cargo test --lib --no-fail-fast
+else
+	printf '%sSKIP_TESTS=1, skipping cargo test --lib%s\n' "$yellow" "$reset"
+fi
+
+exit 0

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Fast checks that run before every commit.
+# Mirrors a subset of .github/workflows/ci.yml — see pre-push for the heavier checks.
+#
+# To bypass in an emergency: git commit --no-verify
+
+set -u
+set -o pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+red=$'\033[31m'
+green=$'\033[32m'
+yellow=$'\033[33m'
+bold=$'\033[1m'
+reset=$'\033[0m'
+
+run() {
+	local name=$1
+	shift
+	printf '%s==>%s %s\n' "$bold" "$reset" "$name"
+	if "$@"; then
+		printf '%s    ok%s\n' "$green" "$reset"
+	else
+		printf '%s    failed: %s%s\n' "$red" "$name" "$reset"
+		printf '\n%spre-commit failed.%s Fix the issue above, or run with --no-verify to bypass.\n' \
+			"$red$bold" "$reset"
+		exit 1
+	fi
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Cargo fmt — fast, checks the whole workspace.
+if have cargo; then
+	run "cargo fmt --all -- --check" cargo fmt --all -- --check
+	# Also run rustfmt inside filen-sdk-rs (separate workspace for wasm config).
+	if [ -f filen-sdk-rs/Cargo.toml ]; then
+		run "cargo fmt (filen-sdk-rs) -- --check" \
+			bash -c 'cd filen-sdk-rs && cargo fmt -- --check'
+	fi
+else
+	printf '%scargo not found, skipping rustfmt%s\n' "$yellow" "$reset"
+fi
+
+# Taplo — TOML lint + format.
+if have taplo; then
+	run "taplo lint" env RUST_LOG=error taplo lint
+	run "taplo fmt --check" env RUST_LOG=error taplo fmt --check
+else
+	printf '%staplo not installed, skipping (install: cargo install taplo-cli)%s\n' \
+		"$yellow" "$reset"
+fi
+
+# sqlfluff — only on staged SQL files for speed.
+if have sqlfluff; then
+	staged_sql=$(git diff --cached --name-only --diff-filter=ACM -z \
+		| tr '\0' '\n' | grep -E '\.sql$' || true)
+	if [ -n "$staged_sql" ]; then
+		# shellcheck disable=SC2086
+		run "sqlfluff lint (staged)" bash -c "sqlfluff lint $staged_sql"
+	else
+		printf '%s==>%s sqlfluff: no staged .sql files\n' "$bold" "$reset"
+	fi
+else
+	printf '%ssqlfluff not installed, skipping (install: pip install sqlfluff)%s\n' \
+		"$yellow" "$reset"
+fi
+
+# Default clippy config — the cheapest of the four CI clippy invocations.
+if have cargo; then
+	run "cargo clippy -- -D warnings" cargo clippy --all-targets -- -D warnings
+fi
+
+# WASM clippy (matches ci.yml ci-wasm job; run from filen-sdk-rs sub-workspace).
+if have cargo && [ -f filen-sdk-rs/Cargo.toml ]; then
+	if rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
+		run "cargo clippy --target wasm32-unknown-unknown -F wasm-full (filen-sdk-rs)" \
+			bash -c 'cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F wasm-full -- -D warnings'
+		run "cargo clippy --target wasm32-unknown-unknown -F service-worker (filen-sdk-rs)" \
+			bash -c 'cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings'
+	else
+		printf '%swasm32-unknown-unknown target not installed, skipping WASM clippy%s\n' \
+			"$yellow" "$reset"
+		printf '%s    install: rustup target add wasm32-unknown-unknown%s\n' "$yellow" "$reset"
+	fi
+fi
+
+exit 0
