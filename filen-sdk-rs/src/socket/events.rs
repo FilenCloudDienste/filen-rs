@@ -1021,7 +1021,7 @@ impl<'a> From<filen_types::api::v3::socket::ChatConversationParticipantNew<'a>>
 				user_id: event.user_id,
 				email: event.email.into_owned(),
 				avatar: event.avatar.map(|a| a.into_owned()),
-				nick_name: event.nick_name.into_owned(),
+				nick_name: event.nick_name.map(|n| n.into_owned()),
 				permissions_add: event.permissions_add,
 				added: event.added_timestamp,
 				appear_offline: event.appear_offline,

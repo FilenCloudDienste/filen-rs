@@ -1,5 +1,6 @@
 use std::{
 	borrow::Cow,
+	collections::HashMap,
 	sync::{Arc, Mutex},
 };
 
@@ -42,7 +43,7 @@ pub struct ChatParticipant {
 		tsify(type = "string")
 	)]
 	pub(crate) avatar: Option<String>,
-	pub(crate) nick_name: String,
+	pub(crate) nick_name: Option<String>,
 	pub(crate) permissions_add: bool,
 	#[cfg_attr(
 		feature = "wasm-full",
@@ -239,7 +240,7 @@ pub(crate) fn blocking_decrypt_chat_parts(
 				user_id: p.user_id,
 				email: p.email.into_owned(),
 				avatar: p.avatar.map(Cow::into_owned),
-				nick_name: p.nick_name.into_owned(),
+				nick_name: p.nick_name,
 				permissions_add: p.permissions_add,
 				added: p.added_timestamp,
 				appear_offline: p.appear_offline,
@@ -302,7 +303,7 @@ pub struct ChatMessagePartial {
 		tsify(type = "string")
 	)]
 	sender_avatar: Option<String>,
-	sender_nick_name: String,
+	sender_nick_name: Option<String>,
 	// none if decryption fails
 	#[cfg_attr(
 		feature = "wasm-full",
@@ -322,7 +323,7 @@ impl ChatMessagePartial {
 			sender_id: encrypted.sender_id,
 			sender_email: encrypted.sender_email.into_owned(),
 			sender_avatar: encrypted.sender_avatar.map(Cow::into_owned),
-			sender_nick_name: encrypted.sender_nick_name.into_owned(),
+			sender_nick_name: encrypted.sender_nick_name,
 			message: match chat_key {
 				None => None,
 				Some(chat_key) => {
@@ -443,11 +444,28 @@ impl Client {
 		)
 		.await?;
 
+		let id_to_avatar_map = chat
+			.participants()
+			.iter()
+			.map(|p| (p.user_id, p))
+			.collect::<HashMap<_, _>>();
+
 		let messages = do_cpu_intensive(|| {
 			let mut resp = resp
 				.0
 				.into_maybe_par_iter()
-				.map(|message| ChatMessage::blocking_decrypt(message, chat.key.as_ref()))
+				.map(|message| {
+					let mut msg = ChatMessage::blocking_decrypt(message, chat.key.as_ref());
+					if let Some(v) = id_to_avatar_map.get(&msg.inner.sender_id) {
+						if let Some(avatar_url) = &v.avatar {
+							msg.inner.sender_avatar = Some(avatar_url.clone());
+						}
+						if let Some(nick_name) = &v.nick_name {
+							msg.inner.sender_nick_name = Some(nick_name.clone());
+						}
+					}
+					msg
+				})
 				.collect::<Vec<_>>();
 			resp.sort_by(|a, b| {
 				let order = a.sent_timestamp.cmp(&b.sent_timestamp);
@@ -518,7 +536,7 @@ impl Client {
 			user_id: contact.user_id,
 			email: contact.email.to_string(),
 			avatar: contact.avatar.as_ref().map(|a| a.clone().into_owned()),
-			nick_name: contact.nick_name.clone().into_owned(),
+			nick_name: contact.nick_name.clone(),
 			permissions_add: true,
 			added: resp.timestamp,
 			appear_offline: resp.appear_offline,
@@ -541,22 +559,24 @@ impl Client {
 			self.lock_chats()
 		);
 
-		let resp = api::v3::chat::conversations::create::post(
-			self.client(),
-			&api::v3::chat::conversations::create::Request {
-				uuid,
-				metadata: key_asymm_string?.as_borrowed_cow(),
-				owner_metadata: key_string.as_borrowed_cow(),
-			},
-		)
-		.await?;
+		let req = api::v3::chat::conversations::create::Request {
+			uuid,
+			metadata: key_asymm_string?,
+			owner_metadata: key_string.as_borrowed_cow(),
+		};
+
+		let (resp, avatar_url, nick_name) = futures::try_join!(
+			api::v3::chat::conversations::create::post(self.client(), &req,),
+			async { Ok(self.get_avatar_url().await) },
+			async { Ok(self.get_nick_name().await) },
+		)?;
 
 		let mut participants = Vec::with_capacity(contacts.len() + 1);
 		participants.push(ChatParticipant {
 			user_id: self.user_id,
 			email: self.email().to_string(),
-			avatar: None,
-			nick_name: String::new(), // todo: get real nick name
+			avatar: avatar_url.map(|a| a.to_string()),
+			nick_name: nick_name.map(|n| n.to_string()),
 			permissions_add: true,
 			added: resp.timestamp,
 			appear_offline: false,
@@ -679,8 +699,8 @@ impl Client {
 				sender_id: self.user_id,
 				sender_email: self.email().to_string(),
 				// todo get real avatar
-				sender_avatar: None,
-				sender_nick_name: String::new(),
+				sender_avatar: self.get_avatar_url().await.map(|a| a.to_string()),
+				sender_nick_name: self.get_nick_name().await.map(|n| n.to_string()),
 				message: Some(message),
 			},
 			reply_to,

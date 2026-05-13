@@ -47,7 +47,8 @@ pub struct ChatConversationParticipant<'a> {
 	pub user_id: u64,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,
-	pub nick_name: Cow<'a, str>,
+	#[serde(with = "crate::serde::option::str_empty_is_none_owned")]
+	pub nick_name: Option<String>,
 	pub metadata: RSAEncryptedString<'a>,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub permissions_add: bool,

@@ -27,7 +27,8 @@ pub struct Response {
 	pub refer_count: u64,
 	pub refer_storage: u64,
 	pub storage: u64,
-	pub nick_name: String,
+	#[serde(with = "crate::serde::option::str_empty_is_none_owned")]
+	pub nick_name: Option<String>,
 	pub display_name: String,
 	pub appear_offline: bool,
 	pub subs: Vec<UserAccountSubs>,

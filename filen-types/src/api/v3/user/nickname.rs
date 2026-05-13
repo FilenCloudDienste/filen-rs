@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub const ENDPOINT: &str = "v3/user/nickname";
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub nickname: Cow<'a, str>,
+	#[serde(with = "crate::serde::option::str_empty_is_none_borrowed")]
+	pub nickname: Option<Cow<'a, str>>,
 }

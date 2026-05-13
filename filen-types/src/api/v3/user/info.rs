@@ -15,8 +15,11 @@ pub struct Response<'a> {
 	pub is_premium: bool,
 	pub max_storage: u64,
 	pub storage_used: u64,
-	#[serde(rename = "avatarURL")]
-	pub avatar_url: Cow<'a, str>,
+	#[serde(
+		rename = "avatarURL",
+		with = "crate::serde::option::str_empty_is_none_owned"
+	)]
+	pub avatar_url: Option<String>,
 	#[serde(rename = "baseFolderUUID")]
 	pub root_dir_uuid: UuidStr,
 }

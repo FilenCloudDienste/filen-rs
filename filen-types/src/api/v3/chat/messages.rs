@@ -52,6 +52,7 @@ pub struct ChatMessagePartialEncrypted<'a> {
 	pub sender_id: u64,
 	pub sender_email: Cow<'a, str>,
 	pub sender_avatar: Option<Cow<'a, str>>,
-	pub sender_nick_name: Cow<'a, str>,
+	#[serde(with = "crate::serde::option::str_empty_is_none_owned")]
+	pub sender_nick_name: Option<String>,
 	pub message: EncryptedString<'a>,
 }

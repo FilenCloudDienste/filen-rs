@@ -1175,8 +1175,8 @@ pub struct ChatConversationParticipantNew<'a> {
 	pub email: Cow<'a, str>,
 	#[serde(borrow)]
 	pub avatar: Option<Cow<'a, str>>,
-	#[serde(borrow)]
-	pub nick_name: Cow<'a, str>,
+	#[serde(with = "crate::serde::option::str_empty_is_none_borrowed")]
+	pub nick_name: Option<Cow<'a, str>>,
 	pub permissions_add: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub added_timestamp: DateTime<Utc>,

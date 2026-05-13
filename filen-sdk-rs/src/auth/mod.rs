@@ -271,6 +271,9 @@ pub struct Client {
 		feature = "wasm-full"
 	))]
 	pub(crate) socket_handle: std::sync::Mutex<WebSocketHandle>,
+
+	nickname: std::sync::RwLock<Option<Option<Arc<str>>>>,
+	avatar_url: std::sync::RwLock<Option<Option<Arc<str>>>>,
 }
 
 impl PartialEq for Client {
@@ -352,6 +355,48 @@ impl Client {
 
 	pub(crate) fn arc_client_ref(&self) -> &Arc<AuthClient> {
 		&self.http_client
+	}
+
+	pub async fn get_avatar_url(&self) -> Option<Arc<str>> {
+		if let Some(cached) = self
+			.avatar_url
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.clone()
+		{
+			return cached;
+		}
+		let resp = api::v3::user::info::get(self.client()).await.ok()?;
+		let avatar_url = resp.avatar_url.map(Arc::from);
+
+		*self.avatar_url.write().unwrap_or_else(|e| e.into_inner()) = Some(avatar_url.clone());
+		avatar_url
+	}
+
+	pub async fn get_nick_name(&self) -> Option<Arc<str>> {
+		if let Some(cached) = self
+			.nickname
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.clone()
+		{
+			return cached;
+		}
+		let resp = api::v3::user::account::get(self.client()).await.ok()?;
+		let nick_name = resp.nick_name.map(Arc::from);
+
+		*self.nickname.write().unwrap_or_else(|e| e.into_inner()) = Some(nick_name.clone());
+		nick_name
+	}
+
+	pub(crate) fn update_nickname(&self, new_nickname: Option<String>) {
+		*self.nickname.write().unwrap_or_else(|e| e.into_inner()) =
+			Some(new_nickname.map(Arc::from));
+	}
+
+	pub(crate) fn update_avatar_url(&self, new_avatar_url: Option<String>) {
+		*self.avatar_url.write().unwrap_or_else(|e| e.into_inner()) =
+			Some(new_avatar_url.map(Arc::from));
 	}
 
 	pub fn crypter(&self) -> Arc<impl MetaCrypter + 'static> {

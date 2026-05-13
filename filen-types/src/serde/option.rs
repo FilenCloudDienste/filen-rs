@@ -66,3 +66,64 @@ pub(crate) mod str_none_sentinel {
 		})
 	}
 }
+
+pub(crate) mod str_empty_is_none_owned {
+	use std::borrow::Cow;
+
+	use serde::{Deserializer, Serializer};
+
+	pub(crate) fn serialize<V: AsRef<str>, S>(
+		value: &Option<V>,
+		serializer: S,
+	) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let value = match value {
+			Some(v) => Some(Cow::Borrowed(v.as_ref())),
+			None => None,
+		};
+		super::str_empty_is_none_borrowed::serialize(&value, serializer)
+	}
+
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		super::str_empty_is_none_borrowed::deserialize(deserializer)
+			.map(|opt| opt.map(|cow| cow.into_owned()))
+	}
+}
+
+pub(crate) mod str_empty_is_none_borrowed {
+	use std::borrow::Cow;
+
+	use serde::{Deserialize, Deserializer, Serializer};
+
+	use crate::serde::cow::CowStrWrapper;
+
+	pub(crate) fn serialize<S>(
+		value: &Option<Cow<'_, str>>,
+		serializer: S,
+	) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		match value {
+			Some(v) => serializer.serialize_str(v),
+			None => serializer.serialize_none(),
+		}
+	}
+
+	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Cow<'de, str>>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		let cow = Option::<CowStrWrapper<'de>>::deserialize(deserializer)?;
+		match cow {
+			None => Ok(None),
+			Some(CowStrWrapper(cow)) if cow.is_empty() => Ok(None),
+			Some(CowStrWrapper(cow)) => Ok(Some(cow)),
+		}
+	}
+}

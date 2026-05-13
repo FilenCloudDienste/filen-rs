@@ -638,7 +638,7 @@ async fn chat() {
 	assert_eq!(event.sender_email, client.email());
 	let info = client.get_user_info().await.unwrap();
 	assert_eq!(event.sender_id, info.id);
-	assert_eq!(event.sender_avatar.unwrap_or_default(), info.avatar_url);
+	assert_eq!(event.sender_avatar.as_deref(), info.avatar_url.as_deref());
 
 	let share_contact = client
 		.get_contacts()

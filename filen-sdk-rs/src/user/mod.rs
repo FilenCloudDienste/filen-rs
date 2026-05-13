@@ -35,13 +35,16 @@ impl Client {
 			api::v3::user::account::get(self.client())
 		)?;
 
+		self.update_avatar_url(info.avatar_url.clone());
+		self.update_nickname(account.nick_name.clone());
+
 		Ok(UserInfo {
 			id: info.id,
 			email: info.email.into_owned(),
 			is_premium: info.is_premium,
 			storage_used: info.storage_used,
 			max_storage: info.max_storage,
-			avatar_url: info.avatar_url.into_owned(),
+			avatar_url: info.avatar_url,
 			root_dir_uuid: info.root_dir_uuid,
 
 			two_factor_enabled: settings.two_factor_enabled,
@@ -141,14 +144,16 @@ impl Client {
 		.await
 	}
 
-	pub async fn set_nickname(&self, nickname: &str) -> Result<(), Error> {
+	pub async fn set_nickname(&self, nickname: Option<String>) -> Result<(), Error> {
 		api::v3::user::nickname::post(
 			self.client(),
 			&api::v3::user::nickname::Request {
-				nickname: Cow::Borrowed(nickname),
+				nickname: nickname.as_deref().map(Cow::Borrowed),
 			},
 		)
-		.await
+		.await?;
+		self.update_nickname(nickname);
+		Ok(())
 	}
 
 	pub async fn upload_avatar(&self, buffer: &[u8]) -> Result<Url, Error> {
@@ -234,7 +239,7 @@ pub struct UserInfo {
 	pub storage_used: u64,
 	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
 	pub max_storage: u64,
-	pub avatar_url: String,
+	pub avatar_url: Option<String>,
 	pub root_dir_uuid: UuidStr,
 
 	// user/settings
@@ -271,7 +276,7 @@ pub struct UserInfo {
 	pub refer_count: u64,
 	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
 	pub refer_storage: u64,
-	pub nick_name: String,
+	pub nick_name: Option<String>,
 	pub display_name: String,
 	pub appear_offline: bool,
 	pub subs: Vec<UserAccountSubs>,
@@ -425,9 +430,9 @@ mod js_impl {
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNickname")
 		)]
-		pub async fn set_nickname(&self, nickname: String) -> Result<(), Error> {
+		pub async fn set_nickname(&self, nickname: Option<String>) -> Result<(), Error> {
 			let this = self.inner();
-			do_on_commander(move || async move { this.set_nickname(&nickname).await }).await
+			do_on_commander(move || async move { this.set_nickname(nickname).await }).await
 		}
 
 		#[cfg_attr(

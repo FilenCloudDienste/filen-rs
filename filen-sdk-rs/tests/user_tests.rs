@@ -51,7 +51,7 @@ async fn upload_avatar() {
 	let after = client.get_user_info().await.unwrap();
 	assert_eq!(
 		after.avatar_url,
-		url.to_string(),
+		Some(url.to_string()),
 		"avatar_url should match after upload"
 	);
 
@@ -843,11 +843,11 @@ async fn set_nickname_round_trip() {
 	let suffix: [u8; 6] = rand::random();
 	let new_nick = format!("test-nick-{}", BASE64_URL_SAFE_NO_PAD.encode(suffix));
 
-	client.set_nickname(&new_nick).await.unwrap();
+	client.set_nickname(Some(new_nick.clone())).await.unwrap();
 	let after = client.get_user_info().await.unwrap().nick_name;
-	assert_eq!(after, new_nick, "nickname should be updated");
+	assert_eq!(after, Some(new_nick), "nickname should be updated");
 
-	client.set_nickname(&original).await.unwrap();
+	client.set_nickname(original.clone()).await.unwrap();
 	let restored = client.get_user_info().await.unwrap().nick_name;
 	assert_eq!(restored, original, "nickname should be restored");
 }

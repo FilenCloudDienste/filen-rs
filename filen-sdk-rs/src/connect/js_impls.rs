@@ -35,7 +35,7 @@ pub struct Contact {
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub avatar: Option<String>,
-	pub nick_name: String,
+	pub nick_name: Option<String>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint"),
@@ -63,7 +63,7 @@ impl From<filen_types::api::v3::contacts::Contact<'_>> for Contact {
 			user_id: c.user_id,
 			email: c.email.into_owned(),
 			avatar: c.avatar.map(|a| a.into_owned()),
-			nick_name: c.nick_name.into_owned(),
+			nick_name: c.nick_name,
 			last_active: c.last_active,
 			timestamp: c.timestamp,
 			public_key: c.public_key,
@@ -78,7 +78,7 @@ impl From<Contact> for filen_types::api::v3::contacts::Contact<'static> {
 			user_id: c.user_id,
 			email: Cow::Owned(c.email),
 			avatar: c.avatar.map(Cow::Owned),
-			nick_name: Cow::Owned(c.nick_name),
+			nick_name: c.nick_name,
 			last_active: c.last_active,
 			timestamp: c.timestamp,
 			public_key: c.public_key,
