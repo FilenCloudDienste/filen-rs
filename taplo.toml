@@ -1,3 +1,5 @@
+exclude = ["**/node_modules/**", "**/target/**", "**/dist/**"]
+
 [formatting]
 indent_string = "	"
 allowed_blank_lines = 1
