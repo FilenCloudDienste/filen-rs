@@ -41,6 +41,16 @@ pub struct FileBuilderParams {
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub mime: Option<String>,
+	/// If true, skip EXIF / track-metadata parsing entirely during upload.
+	/// Defaults to false (EXIF parsing runs when MIME matches image/video/audio).
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+	pub no_exif: bool,
+	/// If true, EXIF-parsed times will NOT override caller-supplied
+	/// `created` / `modified`. Defaults to false (EXIF overrides by default).
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+	pub no_exif_override: bool,
 }
 
 #[js_type(import, no_ser)]
@@ -66,6 +76,12 @@ pub struct FileBuilderParamsOptionalName {
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub mime: Option<String>,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+	pub no_exif: bool,
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = false))]
+	pub no_exif_override: bool,
 }
 
 impl TryFrom<FileBuilderParamsOptionalName> for FileBuilderOptionalName {
@@ -85,6 +101,12 @@ impl TryFrom<FileBuilderParamsOptionalName> for FileBuilderOptionalName {
 		}
 		if let Some(modified) = params.modified {
 			builder.modified(modified);
+		}
+		if params.no_exif {
+			builder.no_exif();
+		}
+		if params.no_exif_override {
+			builder.no_exif_override();
 		}
 		Ok(builder)
 	}
@@ -119,6 +141,12 @@ impl FileBuilderParams {
 			}
 			(None, None) => {}
 		};
+		if self.no_exif {
+			file_builder = file_builder.no_exif();
+		}
+		if self.no_exif_override {
+			file_builder = file_builder.no_exif_override();
+		}
 		Ok(file_builder)
 	}
 }

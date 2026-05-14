@@ -19,9 +19,8 @@ async fn get_item_path_file_at_root() {
 	// Create a file directly under root
 	let file = client
 		.make_file_builder("root_file.txt", *client.root().uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), b"hello").await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, b"hello").await.unwrap();
 
 	let item = NonRootItemType::<Normal>::File(Cow::Borrowed(&file));
 	let (path, ancestors) = client.get_item_path(&item).await.unwrap();
@@ -63,9 +62,8 @@ async fn get_item_path_file_vs_dir_same_parent() {
 
 	let file = client
 		.make_file_builder("sibling_file", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), b"data").await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, b"data").await.unwrap();
 
 	let dir_item = NonRootItemType::<Normal>::Dir(Cow::Owned(dir));
 	let file_item = NonRootItemType::<Normal>::File(Cow::Owned(file));
@@ -96,9 +94,8 @@ async fn get_item_path_nested() {
 
 	let file = client
 		.make_file_builder("nested_file.txt", *deep_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), b"deep").await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, b"deep").await.unwrap();
 
 	let item = NonRootItemType::<Normal>::File(Cow::Owned(file));
 	let (path, ancestors) = client.get_item_path(&item).await.unwrap();
@@ -144,9 +141,8 @@ async fn get_item_path_favorited_file() {
 
 	let file = client
 		.make_file_builder("fav_file.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"fav").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"fav").await.unwrap();
 
 	client.set_file_favorite(&mut file, true).await.unwrap();
 	assert!(file.favorited);
@@ -211,9 +207,8 @@ async fn get_item_path_recent_file() {
 
 	let file = client
 		.make_file_builder("recent_file.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), b"recent").await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, b"recent").await.unwrap();
 
 	// Recently uploaded files should appear in recents
 	let (_, recent_files) = client
@@ -245,9 +240,8 @@ async fn get_item_path_trashed_file_from_list_trash() {
 
 	let file = client
 		.make_file_builder("trash_file.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"trash").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"trash").await.unwrap();
 
 	client.trash_file(&mut file).await.unwrap();
 	assert_eq!(*file.parent(), ParentUuid::Trash);
@@ -282,9 +276,8 @@ async fn get_item_path_trashed_file_with_trash_parent_errors() {
 
 	let file = client
 		.make_file_builder("trash_err.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"trash").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"trash").await.unwrap();
 
 	client.trash_file(&mut file).await.unwrap();
 	assert_eq!(*file.parent(), ParentUuid::Trash);
@@ -364,9 +357,8 @@ async fn get_item_path_nested_favorited() {
 
 	let file = client
 		.make_file_builder("nested_fav.txt", *sub_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"nfav").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"nfav").await.unwrap();
 
 	client.set_file_favorite(&mut file, true).await.unwrap();
 

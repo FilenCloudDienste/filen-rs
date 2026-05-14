@@ -172,9 +172,8 @@ async fn make_rs_compat_dir() {
 
 	let empty_file = client
 		.make_file_builder("empty.txt", *compat_dir.uuid())
-		.unwrap()
-		.build();
-	client.upload_file(empty_file.into(), b"").await.unwrap();
+		.unwrap();
+	client.upload_file(empty_file, b"").await.unwrap();
 
 	let (contact, _lock1, _lock2) = get_contact(client).await;
 	client
@@ -184,10 +183,9 @@ async fn make_rs_compat_dir() {
 
 	let small_file = client
 		.make_file_builder("small.txt", *compat_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	client
-		.upload_file(small_file.into(), b"Hello World from Rust!")
+		.upload_file(small_file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -201,27 +199,21 @@ async fn make_rs_compat_dir() {
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
 	let big_file = client
 		.make_file_builder("big.txt", *compat_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	client
-		.upload_file(big_file.into(), hex::encode(&big_random_bytes).as_bytes())
+		.upload_file(big_file, hex::encode(&big_random_bytes).as_bytes())
 		.await
 		.unwrap();
 
 	let (file, test_str) = get_compat_test_file(client, *compat_dir.uuid());
-	let file = file.build();
-	client
-		.upload_file(file.into(), test_str.as_bytes())
-		.await
-		.unwrap();
+	client.upload_file(file, test_str.as_bytes()).await.unwrap();
 
 	let file = client
 		.make_file_builder("nameSplitter.json", *compat_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	client
 		.upload_file(
-			file.into(),
+			file,
 			serde_json::to_string(&get_name_splitter_test_value())
 				.unwrap()
 				.as_bytes(),

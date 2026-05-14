@@ -80,7 +80,7 @@ impl JsClient {
 			.managed_future
 			.into_js_managed_commander_future(move || async move {
 				let builder = params.file_builder_params.into_file_builder(&this)?;
-				this.upload_file(Arc::new(builder.build()), &data).await
+				this.upload_file(builder, &data).await
 			})?
 			.await?;
 
@@ -165,12 +165,7 @@ impl JsClient {
 					.file_builder_params
 					.into_file_builder(&this)?;
 				let file = this
-					.upload_file_from_reader(
-						Arc::new(builder.build()),
-						&mut reader,
-						None,
-						params.known_size,
-					)
+					.upload_file_from_reader(builder, &mut reader, None, params.known_size)
 					.await?;
 				result_receiver.await.unwrap_or_else(|_| {
 					Err(Error::custom(
@@ -274,7 +269,7 @@ impl JsClient {
 			.managed_future
 			.into_js_managed_commander_future(move || async move {
 				let builder = params.file_builder_params.into_file_builder(&this)?;
-				this.upload_file(Arc::new(builder.build()), &data).await
+				this.upload_file(builder, &data).await
 			})
 			.await
 			.map(Into::into)

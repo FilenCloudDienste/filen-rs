@@ -502,10 +502,9 @@ async fn test_cache_file_new_via_socket() {
 
 	let file = client
 		.make_file_builder("cache_file_new.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let file = client
-		.upload_file(file.into(), b"cache test content")
+		.upload_file(file, b"cache test content")
 		.await
 		.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
@@ -534,12 +533,8 @@ async fn test_cache_file_trash_via_socket() {
 
 	let file = client
 		.make_file_builder("cache_file_trash.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client
-		.upload_file(file.into(), b"to be trashed")
-		.await
 		.unwrap();
+	let mut file = client.upload_file(file, b"to be trashed").await.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
 
 	assert!(
@@ -567,14 +562,8 @@ async fn test_cache_multiple_file_events() {
 	for i in 0..3 {
 		let name = format!("cache_multi_{i}.txt");
 		let content = format!("content {i}");
-		let spec = client
-			.make_file_builder(&name, *test_dir.uuid())
-			.unwrap()
-			.build();
-		let file = client
-			.upload_file(spec.into(), content.as_bytes())
-			.await
-			.unwrap();
+		let spec = client.make_file_builder(&name, *test_dir.uuid()).unwrap();
+		let file = client.upload_file(spec, content.as_bytes()).await.unwrap();
 		file_uuids.push(Uuid::from(file.uuid()));
 	}
 
@@ -656,12 +645,8 @@ async fn test_cache_file_move_via_socket() {
 
 	let file = client
 		.make_file_builder("cache_file_move.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client
-		.upload_file(file.into(), b"moveable content")
-		.await
 		.unwrap();
+	let mut file = client.upload_file(file, b"moveable content").await.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
 
 	assert!(
@@ -938,9 +923,8 @@ async fn test_cache_full_file_lifecycle() {
 	// 2. Upload a file
 	let file = client
 		.make_file_builder("cache_lifecycle_file.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"lifecycle").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"lifecycle").await.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -972,9 +956,8 @@ async fn test_cache_mixed_socket_and_manual_events() {
 	// 1. Upload a file via the server (triggers socket event)
 	let file = client
 		.make_file_builder("cache_mixed_socket.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), b"socket").await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, b"socket").await.unwrap();
 	let socket_file_uuid: Uuid = file.uuid().into();
 
 	// 2. Insert a file via manual ListDirRecursive
@@ -1008,12 +991,8 @@ async fn test_cache_file_restore_via_socket() {
 
 	let file = client
 		.make_file_builder("cache_file_restore.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client
-		.upload_file(file.into(), b"restore me")
-		.await
 		.unwrap();
+	let mut file = client.upload_file(file, b"restore me").await.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
 
 	assert!(
@@ -1050,9 +1029,8 @@ async fn test_cache_file_metadata_changed_via_socket() {
 
 	let file = client
 		.make_file_builder("cache_file_rename_old.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"rename me").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"rename me").await.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
 
 	assert!(
@@ -1091,10 +1069,9 @@ async fn test_cache_file_deleted_permanently_via_socket() {
 
 	let file = client
 		.make_file_builder("cache_file_perm_delete.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"delete me forever")
+		.upload_file(file, b"delete me forever")
 		.await
 		.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
@@ -1275,12 +1252,8 @@ async fn test_cache_item_favorite_via_socket() {
 
 	let file = client
 		.make_file_builder("cache_file_favorite.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client
-		.upload_file(file.into(), b"favorite me")
-		.await
 		.unwrap();
+	let mut file = client.upload_file(file, b"favorite me").await.unwrap();
 	let file_uuid: Uuid = file.uuid().into();
 
 	assert!(
@@ -1308,12 +1281,8 @@ async fn test_cache_file_archived_via_socket() {
 	// Upload original file
 	let file = client
 		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let _original = client
-		.upload_file(file.into(), b"original content")
-		.await
 		.unwrap();
+	let _original = client.upload_file(file, b"original content").await.unwrap();
 	let original_uuid: Uuid = _original.uuid().into();
 
 	assert!(
@@ -1324,10 +1293,9 @@ async fn test_cache_file_archived_via_socket() {
 	// Upload a new file with the same name — this archives the old one
 	let replacement = client
 		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let replacement = client
-		.upload_file(replacement.into(), b"replacement content")
+		.upload_file(replacement, b"replacement content")
 		.await
 		.unwrap();
 	let replacement_uuid: Uuid = replacement.uuid().into();

@@ -145,12 +145,9 @@ async fn test_websocket_file_events() {
 		.await
 		.unwrap();
 
-	let file_a = client
-		.make_file_builder("file_a.txt", *dir.uuid())
-		.unwrap()
-		.build();
+	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).unwrap();
 	let mut file_a = client
-		.upload_file(file_a.into(), b"file a contents")
+		.upload_file(file_a, b"file a contents")
 		.await
 		.unwrap();
 
@@ -217,12 +214,9 @@ async fn test_websocket_file_events() {
 
 	let old_file_a = file_a;
 
-	let file_a = client
-		.make_file_builder("file_a.txt", *dir.uuid())
-		.unwrap()
-		.build();
+	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).unwrap();
 	let mut file_a = client
-		.upload_file(file_a.into(), b"file b contents")
+		.upload_file(file_a, b"file b contents")
 		.await
 		.unwrap();
 

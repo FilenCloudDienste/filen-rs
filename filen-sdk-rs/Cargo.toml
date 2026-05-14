@@ -74,7 +74,7 @@ tokio-stream = { version = "0.1.17", default-features = false, features = [
 ] }
 tokio-util = { version = "0.7.16", default-features = false, features = [
 	"compat",
-], optional = true }
+] }
 bytes = "1.10.1"
 log = "0.4.27"
 async_zip = { git = "https://github.com/Enduriel/rs-async-zip.git", rev = "6ad27fd1010b35de2a96143884c1bce95e939e5e", default-features = false, features = [
@@ -107,6 +107,10 @@ axum-extra = { version = "0.12.5", features = [
 unicode-normalization = "0.1.25"
 typenum = "1.20.0"
 url = "2.5.7"
+# Local fork: WASM-compatible feature split (see https://github.com/mindeng/nom-exif/issues/52)
+nom-exif = { git = "https://github.com/Enduriel/nom-exif.git", rev = "ba2a417fa6504c96952098d61c3fac0460074a30", features = [
+	"tokio",
+] }
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
@@ -131,9 +135,6 @@ tokio = { version = "1.47.1", default-features = false, features = [
 	"fs",
 	"rt-multi-thread",
 	"rt",
-] }
-tokio-util = { version = "0.7.16", default-features = false, features = [
-	"compat",
 ] }
 tokio-stream = { version = "0.1.17", default-features = false, features = [
 	"sync",

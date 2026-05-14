@@ -6,8 +6,11 @@ use std::{
 };
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use filen_types::crypto::Blake3Hash;
 use futures::{AsyncWrite, FutureExt, StreamExt, stream::FuturesUnordered};
+
+use super::exif::ExifTeeState;
 
 use crate::{
 	api,
@@ -73,6 +76,12 @@ where
 	hasher: blake3::Hasher,
 	remote_file_info: Arc<OnceLock<RemoteFileInfo>>,
 	upload_key: Arc<String>,
+	// Overrides file.created/file.last_modified at finalization time when Some.
+	final_times: Option<(DateTime<Utc>, DateTime<Utc>)>,
+	// Active when EXIF parsing is enabled and the MIME matches a supported kind.
+	// Tees written bytes into the parser channel and produces resolved times at
+	// finalization time.
+	exif_tee: Option<ExifTeeState>,
 	client: &'a Client,
 }
 
@@ -110,6 +119,7 @@ where
 			upload_key: self.upload_key,
 			written: self.written,
 			num_chunks: self.next_chunk_idx,
+			final_times: self.final_times,
 			client: self.client,
 		})
 	}
@@ -220,71 +230,101 @@ where
 		cx: &mut std::task::Context<'_>,
 		buf: &[u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
-		let mut written = self.write_next_chunk(buf)?;
-		if written >= buf.len() {
-			// we've filled the buffer
-			return std::task::Poll::Ready(Ok(written));
+		// EXIF backpressure: if the tee has bytes still pending into the parser
+		// channel, block here until they drain. Bounds the parser-side buffer to
+		// ~channel-cap + 1 stashed chunk (~5 MiB).
+		if let Some(tee) = self.exif_tee.as_mut()
+			&& let std::task::Poll::Pending = tee.poll_tee(cx, &[])
+		{
+			return std::task::Poll::Pending;
 		}
 
-		let mut should_pend = false;
-		while let Some(mut future) = self.alloc_future.take() {
-			if self.next_chunk_size().is_none() {
-				self.allocated_chunks.clear();
-				break;
+		// Compute the result inside a labeled block so that every Ready(Ok(n))
+		// exit goes through the EXIF tee at the bottom of this function. Early
+		// `return` from the original implementation would have skipped teeing
+		// when write_next_chunk filled the buffer in one go.
+		let res: std::task::Poll<std::io::Result<usize>> = 'compute: {
+			let mut written = match self.write_next_chunk(buf) {
+				Ok(n) => n,
+				Err(e) => break 'compute std::task::Poll::Ready(Err(e)),
+			};
+			if written >= buf.len() {
+				break 'compute std::task::Poll::Ready(Ok(written));
 			}
-			match future.poll_unpin(cx) {
-				std::task::Poll::Ready(chunk) => {
-					self.allocated_chunks.push(chunk);
-					written += self.write_next_chunk(buf)?;
-					if written >= buf.len() {
-						// we've filled the buffer
-						return std::task::Poll::Ready(Ok(written));
-					}
-				}
-				std::task::Poll::Pending => {
-					// put the future back, we need to wait for it
-					self.alloc_future = Some(future);
-					should_pend = true;
+
+			let mut should_pend = false;
+			while let Some(mut future) = self.alloc_future.take() {
+				if self.next_chunk_size().is_none() {
+					self.allocated_chunks.clear();
 					break;
 				}
-			}
-		}
-
-		loop {
-			match self.futures.poll_next_unpin(cx) {
-				std::task::Poll::Ready(Some(Ok(chunk))) => {
-					if self.next_chunk_size().is_some() {
+				match future.poll_unpin(cx) {
+					std::task::Poll::Ready(chunk) => {
 						self.allocated_chunks.push(chunk);
-					} else {
-						self.allocated_chunks.clear();
+						match self.write_next_chunk(&buf[written..]) {
+							Ok(n) => written += n,
+							Err(e) => break 'compute std::task::Poll::Ready(Err(e)),
+						}
+						if written >= buf.len() {
+							break 'compute std::task::Poll::Ready(Ok(written));
+						}
 					}
-					if written < buf.len() {
-						written += self.write_next_chunk(&buf[written..])?;
+					std::task::Poll::Pending => {
+						self.alloc_future = Some(future);
+						should_pend = true;
+						break;
 					}
-					if written >= buf.len() {
-						// we've filled the buffer
-						return std::task::Poll::Ready(Ok(written));
-					}
-				}
-				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
-				}
-				std::task::Poll::Ready(None) => {
-					// all futures are done, return the number of bytes written
-					if should_pend && written == 0 {
-						return std::task::Poll::Pending;
-					}
-					return std::task::Poll::Ready(Ok(written));
-				}
-				std::task::Poll::Pending => {
-					if written > 0 {
-						// we have written some data, return it
-						return std::task::Poll::Ready(Ok(written));
-					}
-					return std::task::Poll::Pending;
 				}
 			}
+
+			loop {
+				match self.futures.poll_next_unpin(cx) {
+					std::task::Poll::Ready(Some(Ok(chunk))) => {
+						if self.next_chunk_size().is_some() {
+							self.allocated_chunks.push(chunk);
+						} else {
+							self.allocated_chunks.clear();
+						}
+						if written < buf.len() {
+							match self.write_next_chunk(&buf[written..]) {
+								Ok(n) => written += n,
+								Err(e) => break 'compute std::task::Poll::Ready(Err(e)),
+							}
+						}
+						if written >= buf.len() {
+							break 'compute std::task::Poll::Ready(Ok(written));
+						}
+					}
+					std::task::Poll::Ready(Some(Err(e))) => {
+						break 'compute std::task::Poll::Ready(Err(std::io::Error::other(
+							e.to_string(),
+						)));
+					}
+					std::task::Poll::Ready(None) => {
+						if should_pend && written == 0 {
+							break 'compute std::task::Poll::Pending;
+						}
+						break 'compute std::task::Poll::Ready(Ok(written));
+					}
+					std::task::Poll::Pending => {
+						if written > 0 {
+							break 'compute std::task::Poll::Ready(Ok(written));
+						}
+						break 'compute std::task::Poll::Pending;
+					}
+				}
+			}
+		};
+
+		// Tee the bytes that were actually accepted to the EXIF parser.
+		// poll_tee may register Pending internally (stashed in `pending`); we
+		// don't care here — the NEXT poll_write call drains it first (see top).
+		if let std::task::Poll::Ready(Ok(n)) = res
+			&& n > 0 && let Some(tee) = self.exif_tee.as_mut()
+		{
+			let _ = tee.poll_tee(cx, &buf[..n]);
 		}
+		res
 	}
 
 	fn poll_close(
@@ -296,20 +336,43 @@ where
 			self.push_upload_next_chunk(last_chunk);
 		}
 
+		// First, drain all in-flight chunk uploads.
 		loop {
 			match self.futures.poll_next_unpin(cx) {
 				std::task::Poll::Ready(Some(Ok(_))) => {}
 				std::task::Poll::Ready(Some(Err(e))) => {
 					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
 				}
-				std::task::Poll::Ready(None) => {
-					return std::task::Poll::Ready(Ok(()));
-				}
+				std::task::Poll::Ready(None) => break,
 				std::task::Poll::Pending => {
 					return std::task::Poll::Pending;
 				}
 			}
 		}
+
+		// Then finalize EXIF (if active) so its result is applied to final_times
+		// before the writer transitions to the Waiting state.
+		if let Some(tee) = self.exif_tee.as_mut() {
+			match tee.poll_finalize(cx) {
+				std::task::Poll::Ready(res) => {
+					match res {
+						Ok((c, m)) => {
+							if self.final_times.is_none() {
+								self.final_times = Some((c, m));
+							}
+						}
+						Err(e) => {
+							// we don't fail the whole upload if EXIF parsing fails, so just log the error and continue without the EXIF times
+							// In the future, ideally callback to something higher up to show the error to the user, but for now just log it
+							log::warn!("EXIF tee failed to finalize: {e}");
+						}
+					}
+				}
+				std::task::Poll::Pending => return std::task::Poll::Pending,
+			}
+		}
+
+		std::task::Poll::Ready(Ok(()))
 	}
 }
 
@@ -321,6 +384,7 @@ struct FileWriterWaitingForDriveLockState<'a> {
 	upload_key: Arc<String>,
 	written: u64,
 	num_chunks: u64,
+	final_times: Option<(DateTime<Utc>, DateTime<Utc>)>,
 	client: &'a Client,
 }
 
@@ -331,6 +395,9 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 	) -> Result<FileWriterCompletingState<'a>, Error> {
 		let file = self.file.clone();
 		let crypter = self.client.crypter();
+		let (final_created, final_modified) = self
+			.final_times
+			.unwrap_or_else(|| (file.created(), file.last_modified()));
 
 		let empty_request_future = do_cpu_intensive(move || {
 			let file_key = file.key().to_meta_key()?;
@@ -344,8 +411,8 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 						size: self.written,
 						mime: Cow::Borrowed(file.mime()),
 						key: Cow::Borrowed(file.key()),
-						created: Some(file.created()),
-						last_modified: file.last_modified(),
+						created: Some(final_created),
+						last_modified: final_modified,
 						hash: Some(self.hash),
 					},
 				)?))
@@ -396,6 +463,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 			future,
 			hash: self.hash,
 			remote_file_info: self.remote_file_info,
+			final_times: (final_created, final_modified),
 			client: self.client,
 			drive_lock,
 		})
@@ -421,6 +489,7 @@ struct FileWriterCompletingState<'a> {
 	future: MaybeSendBoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
 	hash: Blake3Hash,
 	remote_file_info: RemoteFileInfo,
+	final_times: (DateTime<Utc>, DateTime<Utc>),
 	client: &'a Client,
 }
 
@@ -443,6 +512,7 @@ impl<'a> FileWriterCompletingState<'a> {
 		response: filen_types::api::v3::upload::empty::Response,
 	) -> FileWriterFinalizingState<'a> {
 		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
+		let (final_created, final_modified) = self.final_times;
 		let file = Arc::new(RemoteFile {
 			uuid: file.root.uuid,
 			parent: file.parent.into(),
@@ -457,8 +527,8 @@ impl<'a> FileWriterCompletingState<'a> {
 				size: response.size,
 				mime: Cow::Owned(file.root.mime),
 				key: Cow::Owned(file.root.key),
-				last_modified: file.root.modified,
-				created: Some(file.root.created),
+				last_modified: final_modified,
+				created: Some(final_created),
 				hash: Some(self.hash),
 			}),
 		});
@@ -548,12 +618,14 @@ where
 	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
 	Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
 {
+	#[allow(clippy::too_many_arguments)]
 	fn new(
 		file: Arc<BaseFile>,
 		client: &'a Client,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
 		confirm_upload_callback: Option<F>,
+		exif_tee: Option<ExifTeeState>,
 	) -> Self {
 		FileWriterState::Uploading(FileWriterUploadingState {
 			file,
@@ -569,6 +641,8 @@ where
 				32,
 				&mut rand::rng(),
 			)),
+			final_times: None,
+			exif_tee,
 			client,
 			alloc_future: None,
 			allocated_chunks: Vec::new(),
@@ -595,15 +669,24 @@ where
 	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
 	Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
 {
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		file: Arc<BaseFile>,
 		client: &'a Client,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
 		confirm_upload_callback: Option<F>,
+		exif_tee: Option<ExifTeeState>,
 	) -> Self {
 		Self {
-			state: FileWriterState::new(file, client, callback, size, confirm_upload_callback),
+			state: FileWriterState::new(
+				file,
+				client,
+				callback,
+				size,
+				confirm_upload_callback,
+				exif_tee,
+			),
 		}
 	}
 

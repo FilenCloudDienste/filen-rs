@@ -29,12 +29,46 @@ use crate::{
 	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback},
 };
 
+use super::exif::{ExifTeeState, mime_to_exif_kind};
 use super::{
 	BaseFile, FileBuilder, RemoteFile,
 	read::FileReader,
 	traits::{File, UpdateFileMeta},
 	write::FileWriter,
 };
+
+/// Build an `ExifTeeState` from a `FileBuilder` if its flags + effective MIME
+/// indicate EXIF parsing should run.
+pub(crate) fn build_exif_tee_from_builder(
+	builder: FileBuilder,
+) -> (Option<ExifTeeState>, BaseFile) {
+	if !builder.get_parse_exif() {
+		return (None, builder.build());
+	}
+
+	let user_created = builder.get_created();
+	let user_modified = builder.get_modified();
+	let override_with_exif = builder.get_override_with_exif();
+	let fallback_time = builder.get_builder_creation_time();
+
+	let base_file = builder.build();
+
+	let kind = match mime_to_exif_kind(base_file.mime()) {
+		Some(k) => k,
+		None => return (None, base_file),
+	};
+
+	(
+		Some(ExifTeeState::new(
+			kind,
+			override_with_exif,
+			user_created,
+			user_modified,
+			fallback_time,
+		)),
+		base_file,
+	)
+}
 
 impl Client {
 	pub async fn trash_file(&self, file: &mut RemoteFile) -> Result<(), Error> {
@@ -188,30 +222,43 @@ impl Client {
 		FileBuilder::new(name, parent_uuid, self)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn inner_get_file_writer<'a, F, Fut>(
 		&'a self,
 		file: Arc<BaseFile>,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		size: Option<u64>,
 		confirm_completion_callback: Option<F>,
+		exif_tee: Option<ExifTeeState>,
 	) -> FileWriter<'a, F, Fut>
 	where
 		F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
 		Fut: Future<Output = Result<(), Error>> + MaybeSend + 'a,
 	{
-		FileWriter::new(file, self, callback, size, confirm_completion_callback)
+		FileWriter::new(
+			file,
+			self,
+			callback,
+			size,
+			confirm_completion_callback,
+			exif_tee,
+		)
 	}
 
-	pub fn get_file_writer(&self, file: impl Into<Arc<BaseFile>>) -> FileWriterDefault<'_> {
-		self.inner_get_file_writer(file.into(), None, None, None)
+	pub fn get_file_writer(&self, builder: FileBuilder) -> FileWriterDefault<'_> {
+		let (exif_tee, base_file) = build_exif_tee_from_builder(builder);
+		let base_file = Arc::new(base_file);
+		self.inner_get_file_writer(base_file, None, None, None, exif_tee)
 	}
 
 	pub fn get_file_writer_with_callback<'a>(
 		&'a self,
-		file: impl Into<Arc<BaseFile>>,
+		builder: FileBuilder,
 		callback: MaybeSendCallback<'a, u64>,
 	) -> FileWriterDefault<'a> {
-		self.inner_get_file_writer(file.into(), Some(callback), None, None)
+		let (exif_tee, base_file) = build_exif_tee_from_builder(builder);
+		let base_file = Arc::new(base_file);
+		self.inner_get_file_writer(base_file, Some(callback), None, None, exif_tee)
 	}
 
 	pub async fn list_file_versions(&self, file: &RemoteFile) -> Result<Vec<FileVersion>, Error> {

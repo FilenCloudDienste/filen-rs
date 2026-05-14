@@ -134,22 +134,14 @@ async fn versioning_creates_versions_on_duplicate_upload() {
 
 	let first = client
 		.make_file_builder("versioning-test.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let first = client
-		.upload_file(first.into(), b"first content")
-		.await
 		.unwrap();
+	let first = client.upload_file(first, b"first content").await.unwrap();
 	tokio::time::sleep(Duration::from_secs(2)).await;
 
 	let second = client
 		.make_file_builder("versioning-test.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let second = client
-		.upload_file(second.into(), b"second content")
-		.await
 		.unwrap();
+	let second = client.upload_file(second, b"second content").await.unwrap();
 
 	let versions = client.list_file_versions(&second).await.unwrap();
 	assert!(
@@ -171,12 +163,8 @@ async fn versioning_creates_versions_on_duplicate_upload() {
 
 	let third = client
 		.make_file_builder("versioning-test.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let third = client
-		.upload_file(third.into(), b"third content")
-		.await
 		.unwrap();
+	let third = client.upload_file(third, b"third content").await.unwrap();
 
 	let versions_after_disable = client.list_file_versions(&third).await.unwrap();
 	assert!(
@@ -314,12 +302,9 @@ async fn events_file_upload_trash_restore_delete() {
 	let since = chrono::Utc::now();
 
 	let file_name = unique_name("lifecycle");
-	let file = client
-		.make_file_builder(&file_name, *dir.uuid())
-		.unwrap()
-		.build();
+	let file = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"lifecycle file contents")
+		.upload_file(file, b"lifecycle file contents")
 		.await
 		.unwrap();
 
@@ -405,12 +390,8 @@ async fn events_file_metadata_changed_and_move() {
 	let original_name = unique_name("rename");
 	let file = client
 		.make_file_builder(&original_name, *dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client
-		.upload_file(file.into(), b"to be renamed")
-		.await
 		.unwrap();
+	let mut file = client.upload_file(file, b"to be renamed").await.unwrap();
 
 	// rename → fileMetadataChanged event (the backend logs a metadata change)
 	let new_name = unique_name("renamed");
@@ -485,18 +466,12 @@ async fn events_file_versioned_on_duplicate_upload() {
 
 	let file_name = unique_name("versioned");
 
-	let first = client
-		.make_file_builder(&file_name, *dir.uuid())
-		.unwrap()
-		.build();
-	let _first = client.upload_file(first.into(), b"v1").await.unwrap();
+	let first = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
+	let _first = client.upload_file(first, b"v1").await.unwrap();
 	tokio::time::sleep(Duration::from_secs(2)).await;
 
-	let second = client
-		.make_file_builder(&file_name, *dir.uuid())
-		.unwrap()
-		.build();
-	let _second = client.upload_file(second.into(), b"v2").await.unwrap();
+	let second = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
+	let _second = client.upload_file(second, b"v2").await.unwrap();
 
 	// fileVersioned event for our filename should appear after the second upload
 	let versioned_event = poll_for_event(
@@ -695,12 +670,9 @@ async fn events_item_favorite() {
 	let since = chrono::Utc::now();
 
 	let file_name = unique_name("favorite");
-	let file = client
-		.make_file_builder(&file_name, *dir.uuid())
-		.unwrap()
-		.build();
+	let file = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"will be favorited")
+		.upload_file(file, b"will be favorited")
 		.await
 		.unwrap();
 

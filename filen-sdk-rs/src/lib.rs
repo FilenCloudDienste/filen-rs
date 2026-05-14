@@ -1,4 +1,13 @@
-#![feature(min_specialization, try_with_capacity, ascii_char, iter_intersperse)]
+#![feature(
+	min_specialization,
+	try_with_capacity,
+	ascii_char,
+	// only not stable because it broke crates relying on itertools (https://github.com/rust-lang/rust/issues/79524)
+	// is virtually guaranteed to be stabilized as is once https://github.com/rust-lang/rust/issues/89151 is resolved
+	iter_intersperse,
+	// stable in 1.95
+	cfg_select
+)]
 #![allow(dead_code)]
 #![allow(type_alias_bounds)]
 

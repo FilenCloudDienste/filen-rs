@@ -15,8 +15,9 @@ use crate::{
 	auth::{Client, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	fs::file::{
-		BaseFile, RemoteFile,
-		client_impl::FileReaderSharedClientExt,
+		BaseFile, FileBuilder, RemoteFile,
+		client_impl::{FileReaderSharedClientExt, build_exif_tee_from_builder},
+		exif::ExifTeeState,
 		traits::File,
 		write::{DummyFuture, FileWriter},
 	},
@@ -36,6 +37,39 @@ use crate::{
 const IO_BUFFER_SIZE: usize = 1024 * 64; // 64 KiB
 
 impl Client {
+	/// Internal entry point used by `upload_file*`. Takes a `FileBuilder`
+	/// (consumed), constructs an EXIF-teeing writer when applicable, then
+	/// drives the chunked upload via the unified writer pipeline.
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) async fn inner_upload_from_builder<'a, T, F, Fut>(
+		&'a self,
+		builder: FileBuilder,
+		reader: &mut T,
+		callback: Option<MaybeSendCallback<'a, u64>>,
+		known_size: Option<u64>,
+		confirm_completion_callback: Option<F>,
+	) -> Result<RemoteFile, Error>
+	where
+		T: 'a + AsyncReadExt + Unpin,
+		F: 'a + FnOnce(Blake3Hash, u64) -> Fut + MaybeSend,
+		Fut: 'a + Future<Output = Result<(), Error>> + MaybeSend,
+		FileWriter<'a, F, Fut>: Unpin,
+	{
+		let (exif_tee, base_file) = build_exif_tee_from_builder(builder);
+		let base_file = Arc::new(base_file);
+
+		self.inner_upload_file_from_reader(
+			base_file,
+			reader,
+			callback,
+			known_size,
+			confirm_completion_callback,
+			exif_tee,
+		)
+		.await
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn inner_upload_file_from_reader<'a, T, F, Fut>(
 		&'a self,
 		base_file: Arc<BaseFile>,
@@ -43,6 +77,7 @@ impl Client {
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		known_size: Option<u64>,
 		confirm_completion_callback: Option<F>,
+		exif_tee: Option<ExifTeeState>,
 	) -> Result<RemoteFile, Error>
 	where
 		T: 'a + AsyncReadExt + Unpin,
@@ -55,6 +90,7 @@ impl Client {
 			callback,
 			known_size,
 			confirm_completion_callback,
+			exif_tee,
 		);
 		let buffer_size = known_size
 			.map(|size| std::cmp::min(size, CHUNK_SIZE_U64) as usize)
@@ -76,7 +112,7 @@ impl Client {
 
 	pub async fn upload_file_from_reader<'a, T>(
 		&'a self,
-		base_file: Arc<BaseFile>,
+		builder: FileBuilder,
 		reader: &mut T,
 		callback: Option<MaybeSendCallback<'a, u64>>,
 		known_size: Option<u64>,
@@ -84,32 +120,20 @@ impl Client {
 	where
 		T: 'a + AsyncReadExt + Unpin,
 	{
-		let mut writer = self
-			.inner_get_file_writer::<'a, fn(Blake3Hash, u64) -> DummyFuture, DummyFuture>(
-				base_file, callback, known_size, None,
-			);
-		let buffer_size = known_size
-			.map(|size| std::cmp::min(size, CHUNK_SIZE_U64) as usize)
-			.unwrap_or(IO_BUFFER_SIZE);
-		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
-		// https://github.com/rust-lang/rust/issues/117693
-		let mut buffer = vec![0u8; buffer_size];
-		loop {
-			let bytes_read = reader.read(&mut buffer).await?;
-			if bytes_read == 0 {
-				break;
-			}
-			writer.write_all(&buffer[..bytes_read]).await?;
-		}
-		writer.close().await?;
-		// SAFETY: conversion will always succeed because we called close on the writer
-		Ok(writer.into_remote_file().unwrap())
+		self.inner_upload_from_builder::<T, fn(Blake3Hash, u64) -> DummyFuture, DummyFuture>(
+			builder, reader, callback, known_size, None,
+		)
+		.await
 	}
 
-	pub async fn upload_file(&self, file: Arc<BaseFile>, data: &[u8]) -> Result<RemoteFile, Error> {
+	pub async fn upload_file(
+		&self,
+		builder: FileBuilder,
+		data: &[u8],
+	) -> Result<RemoteFile, Error> {
 		let mut reader = data;
 		self.upload_file_from_reader(
-			file,
+			builder,
 			&mut reader,
 			None,
 			Some(data.len().try_into().unwrap()),
@@ -327,11 +351,9 @@ impl Client {
 
 		let mut reader = tokio::fs::File::from_std(file).compat();
 
-		let file = file_builder.build();
-
-		let file = self
-			.inner_upload_file_from_reader(
-				Arc::new(file),
+		let uploaded = self
+			.inner_upload_from_builder(
+				file_builder,
 				&mut reader,
 				callback,
 				Some(original_size),
@@ -366,7 +388,7 @@ impl Client {
 				}),
 			)
 			.await?;
-		Ok((file, reader.into_inner().into_std().await))
+		Ok((uploaded, reader.into_inner().into_std().await))
 	}
 }
 

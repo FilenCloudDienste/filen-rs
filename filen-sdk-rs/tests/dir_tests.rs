@@ -704,37 +704,24 @@ async fn download_to_zip() {
 
 	let file = client
 		.make_file_builder("file.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let file = client
-		.upload_file(file.into(), b"root file content")
+		.upload_file(file, b"root file content")
 		.await
 		.unwrap();
 
 	let file_1 = client
 		.make_file_builder("file1.txt", *dir_a.uuid())
-		.unwrap()
-		.build();
-	let file_1 = client
-		.upload_file(file_1.into(), b"file 1 content")
-		.await
 		.unwrap();
+	let file_1 = client.upload_file(file_1, b"file 1 content").await.unwrap();
 	let file_2 = client
 		.make_file_builder("file2.txt", *dir_b.uuid())
-		.unwrap()
-		.build();
-	let file_2 = client
-		.upload_file(file_2.into(), b"file 2 content")
-		.await
 		.unwrap();
+	let file_2 = client.upload_file(file_2, b"file 2 content").await.unwrap();
 	let file_3 = client
 		.make_file_builder("file3.txt", *dir_b.uuid())
-		.unwrap()
-		.build();
-	let file_3 = client
-		.upload_file(file_3.into(), b"file 3 content")
-		.await
 		.unwrap();
+	let file_3 = client.upload_file(file_3, b"file 3 content").await.unwrap();
 
 	let tmp = std::env::temp_dir();
 	let mut options = tokio::fs::OpenOptions::new();
@@ -857,20 +844,12 @@ async fn download_linked_dir_to_zip() {
 
 	let file_1 = client
 		.make_file_builder("link_file1.txt", *dir_a.uuid())
-		.unwrap()
-		.build();
-	let _file_1 = client
-		.upload_file(file_1.into(), b"linked file 1")
-		.await
 		.unwrap();
+	let _file_1 = client.upload_file(file_1, b"linked file 1").await.unwrap();
 	let file_2 = client
 		.make_file_builder("link_file2.txt", *dir_b.uuid())
-		.unwrap()
-		.build();
-	let _file_2 = client
-		.upload_file(file_2.into(), b"linked file 2")
-		.await
 		.unwrap();
+	let _file_2 = client.upload_file(file_2, b"linked file 2").await.unwrap();
 
 	// Create a public link for the directory
 	let link = client

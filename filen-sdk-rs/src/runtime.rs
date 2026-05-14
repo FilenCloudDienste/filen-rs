@@ -1,3 +1,4 @@
+use futures::FutureExt;
 #[cfg(feature = "wasm-full")]
 pub use wasm_bindgen_rayon::init_thread_pool;
 
@@ -654,15 +655,25 @@ impl<T> SpawnTaskHandle<T> {
 	pub(crate) fn new(receiver: tokio::sync::oneshot::Receiver<T>) -> Self {
 		Self { receiver }
 	}
+}
 
-	pub(crate) fn is_finished(&self) -> bool {
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		{
-			!self.receiver.is_empty()
-		}
-		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		{
-			self.handle.is_finished()
+impl<T> std::future::Future for SpawnTaskHandle<T> {
+	type Output = T;
+
+	fn poll(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Self::Output> {
+		cfg_select! {
+			all(target_family = "wasm", target_os = "unknown") => {
+				self.as_mut().receiver
+					.poll_unpin(cx)
+					.map(|res| res.expect("Spawned task panicked"))
+			}
+			_ => {
+				self.as_mut().handle.poll_unpin(cx)
+					.map(|res| res.expect("Spawned task panicked"))
+			}
 		}
 	}
 }
@@ -676,9 +687,7 @@ where
 	{
 		let (sender, receiver) = tokio::sync::oneshot::channel();
 		spawn_local_on_worker(async move {
-			if sender.send(f.await).is_err() {
-				panic!("receiver closed");
-			}
+			let _ = sender.send(f.await);
 		});
 
 		SpawnTaskHandle::new(receiver)

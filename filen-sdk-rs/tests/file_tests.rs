@@ -35,11 +35,8 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client
-		.make_file_builder(name, *test_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), contents).await.unwrap();
+	let file = client.make_file_builder(name, *test_dir.uuid()).unwrap();
+	let file = client.upload_file(file, contents).await.unwrap();
 
 	let found_file = match client
 		.find_item_at_path(&format!("{}/{}", test_dir.name().unwrap(), name))
@@ -98,9 +95,8 @@ async fn file_search() {
 
 	let file = client
 		.make_file_builder(&file_name, *second_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), &[]).await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, &[]).await.unwrap();
 
 	let found_items = client
 		.find_item_matches_for_name(&file_random_part_long)
@@ -142,10 +138,9 @@ async fn file_trash() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"Hello World from Rust!")
+		.upload_file(file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -190,10 +185,9 @@ async fn file_delete_permanently() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"Hello World from Rust!")
+		.upload_file(file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -234,10 +228,9 @@ async fn file_link() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let file = client
-		.upload_file(file.into(), b"Hello World from Rust!")
+		.upload_file(file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -268,10 +261,9 @@ async fn file_move() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"Hello World from Rust!")
+		.upload_file(file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -323,10 +315,9 @@ async fn file_update_meta() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"Hello World from Rust!")
+		.upload_file(file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -405,10 +396,9 @@ async fn file_exists() {
 
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"Hello World from Rust!")
+		.upload_file(file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -455,10 +445,9 @@ async fn file_trash_empty() {
 	let file_name = "file.txt";
 	let file = client
 		.make_file_builder(file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let mut file = client
-		.upload_file(file.into(), b"Hello World from Rust!")
+		.upload_file(file, b"Hello World from Rust!")
 		.await
 		.unwrap();
 
@@ -495,12 +484,11 @@ async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, content
 	let file_name = format!("file_{contents_len}.txt");
 	let file = client
 		.make_file_builder(&file_name, *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
 	client
 		.upload_file_from_reader(
-			file.into(),
+			file,
 			&mut &contents[..],
 			Some(Arc::new(|bytes_read: u64| {
 				sender.send(bytes_read).unwrap();
@@ -537,11 +525,8 @@ async fn file_favorite() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client
-		.make_file_builder("test", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"").await.unwrap();
+	let file = client.make_file_builder("test", *test_dir.uuid()).unwrap();
+	let mut file = client.upload_file(file, b"").await.unwrap();
 
 	assert!(!file.favorited());
 
@@ -558,14 +543,8 @@ async fn file_read_range() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client
-		.make_file_builder("test", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client
-		.upload_file(file.into(), b"Hello, Filen!")
-		.await
-		.unwrap();
+	let file = client.make_file_builder("test", *test_dir.uuid()).unwrap();
+	let file = client.upload_file(file, b"Hello, Filen!").await.unwrap();
 
 	let mut reader = client.get_file_reader_for_range(&file, 6, 1000000);
 	let mut buf = Vec::new();
@@ -576,10 +555,7 @@ async fn file_read_range() {
 	reader.read_to_end(&mut buf).await.unwrap();
 	assert_eq!(str::from_utf8(&buf).unwrap(), "Hello");
 
-	let file = client
-		.make_file_builder("test2", *test_dir.uuid())
-		.unwrap()
-		.build();
+	let file = client.make_file_builder("test2", *test_dir.uuid()).unwrap();
 
 	let border_contents = b"Hello, Filen";
 	let mut big_contents = vec![0u8; 1024 * 1024 * 3 + border_contents.len() / 2];
@@ -587,10 +563,7 @@ async fn file_read_range() {
 		[1024 * 1024 * 2 - border_contents.len() / 2..1024 * 1024 * 2 + border_contents.len() / 2]
 		.copy_from_slice(&border_contents[..]);
 
-	let file = client
-		.upload_file(file.into(), &big_contents)
-		.await
-		.unwrap();
+	let file = client.upload_file(file, &big_contents).await.unwrap();
 
 	let mut reader = client.get_file_reader_for_range(
 		&file,
@@ -617,12 +590,9 @@ async fn file_versions() {
 	let mut versions = Vec::new();
 	// TODO: when backend supports size in version info, use different lengths for these strings
 	for content in ["Version 1", "Version a 2", "Version as 3", "Version asd 4"] {
-		let base_file = client
-			.make_file_builder("test", *test_dir.uuid())
-			.unwrap()
-			.build();
+		let base_file = client.make_file_builder("test", *test_dir.uuid()).unwrap();
 		let file = client
-			.upload_file(base_file.clone().into(), content.as_bytes())
+			.upload_file(base_file, content.as_bytes())
 			.await
 			.unwrap();
 		// we do this because timestamps have a resolution of 1 second on the backend
@@ -693,7 +663,7 @@ mod http_provider_tests {
 			.make_file_builder(name, *test_dir.uuid())
 			.unwrap()
 			.build();
-		client.upload_file(file.into(), contents).await.unwrap()
+		client.upload_file(file, contents).await.unwrap()
 	}
 
 	/// Parses a `multipart/byteranges` response body into `(headers, body)` pairs.
@@ -1508,9 +1478,8 @@ async fn file_upload_normalizes_nfc() {
 
 	let file = client
 		.make_file_builder(nfd_name, *test_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), b"nfc test").await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, b"nfc test").await.unwrap();
 	assert_eq!(file.name().unwrap(), nfc_name);
 
 	// Should be findable by NFC name
@@ -1531,9 +1500,8 @@ async fn update_file_meta_rejects_invalid_name() {
 
 	let file = client
 		.make_file_builder("valid.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"content").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"content").await.unwrap();
 
 	assert!(FileMetaChanges::default().name("").is_err());
 	assert!(FileMetaChanges::default().name("CON").is_err());
@@ -1558,9 +1526,8 @@ async fn update_file_meta_normalizes_nfc() {
 
 	let file = client
 		.make_file_builder("nfc_test.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let mut file = client.upload_file(file.into(), b"content").await.unwrap();
+		.unwrap();
+	let mut file = client.upload_file(file, b"content").await.unwrap();
 
 	let nfd_name = "u\u{0308}ber.txt"; // ü as u + combining diaeresis
 	let nfc_name = "\u{00FC}ber.txt"; // ü as single codepoint
@@ -1605,10 +1572,9 @@ async fn get_file_optional_returns_some_for_existing_file() {
 
 	let file = client
 		.make_file_builder("optional_get.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let file = client
-		.upload_file(file.into(), b"optional get contents")
+		.upload_file(file, b"optional get contents")
 		.await
 		.unwrap();
 
@@ -1626,9 +1592,8 @@ async fn download_file_to_path_creates_nonexistent_file() {
 	let contents = b"download_file_to_path test contents";
 	let file = client
 		.make_file_builder("download_to_path.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
-	let file = client.upload_file(file.into(), contents).await.unwrap();
+		.unwrap();
+	let file = client.upload_file(file, contents).await.unwrap();
 
 	let download_dir = std::env::temp_dir().join(format!(
 		"test_download_to_path_{}_{}",
@@ -1669,10 +1634,9 @@ async fn download_file_to_path_fails_when_parent_missing() {
 
 	let file = client
 		.make_file_builder("download_missing_parent.txt", *test_dir.uuid())
-		.unwrap()
-		.build();
+		.unwrap();
 	let file = client
-		.upload_file(file.into(), b"parent missing test")
+		.upload_file(file, b"parent missing test")
 		.await
 		.unwrap();
 

@@ -29,6 +29,7 @@ pub mod cache;
 pub(crate) mod chunk;
 pub mod client_impl;
 pub mod enums;
+pub(crate) mod exif;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub mod js_impl;
 pub mod meta;
@@ -47,6 +48,11 @@ pub struct FileBuilder {
 	mime: Option<String>,
 	created: Option<DateTime<Utc>>,
 	modified: Option<DateTime<Utc>>,
+
+	parse_exif: bool,
+	override_with_exif: bool,
+
+	build_creation_time: DateTime<Utc>,
 }
 
 impl FileBuilder {
@@ -77,6 +83,9 @@ impl FileBuilder {
 			mime: None,
 			created: None,
 			modified: None,
+			parse_exif: true,
+			override_with_exif: true,
+			build_creation_time: Utc::now().round_subsecs(3),
 		}
 	}
 
@@ -106,6 +115,19 @@ impl FileBuilder {
 		self
 	}
 
+	/// Disable EXIF/track metadata parsing entirely for this upload.
+	pub fn no_exif(mut self) -> Self {
+		self.parse_exif = false;
+		self
+	}
+
+	/// Disable overriding caller-supplied `created`/`modified` with EXIF-derived times.
+	/// EXIF parsing still runs (gated by [`Self::no_exif`]) but only fills unset values.
+	pub fn no_exif_override(mut self) -> Self {
+		self.override_with_exif = false;
+		self
+	}
+
 	pub fn get_uuid(&self) -> UuidStr {
 		self.uuid
 	}
@@ -120,6 +142,18 @@ impl FileBuilder {
 
 	pub fn get_name(&self) -> &str {
 		self.name.as_ref()
+	}
+
+	pub(crate) fn get_parse_exif(&self) -> bool {
+		self.parse_exif
+	}
+
+	pub(crate) fn get_override_with_exif(&self) -> bool {
+		self.override_with_exif
+	}
+
+	pub(crate) fn get_builder_creation_time(&self) -> DateTime<Utc> {
+		self.build_creation_time
 	}
 
 	pub fn build(self) -> BaseFile {
@@ -145,6 +179,9 @@ pub struct FileBuilderOptionalName {
 	mime: Option<String>,
 	created: Option<DateTime<Utc>>,
 	modified: Option<DateTime<Utc>>,
+
+	parse_exif: bool,
+	override_with_exif: bool,
 }
 
 impl FileBuilderOptionalName {
@@ -156,7 +193,21 @@ impl FileBuilderOptionalName {
 			mime: None,
 			created: None,
 			modified: None,
+			parse_exif: true,
+			override_with_exif: true,
 		}
+	}
+
+	/// Disable EXIF/track metadata parsing entirely for this upload.
+	pub fn no_exif(&mut self) -> &mut Self {
+		self.parse_exif = false;
+		self
+	}
+
+	/// Disable overriding caller-supplied `created`/`modified` with EXIF-derived times.
+	pub fn no_exif_override(&mut self) -> &mut Self {
+		self.override_with_exif = false;
+		self
 	}
 
 	pub fn name(&mut self, name: &str) -> Result<&mut Self, EntryNameError> {
@@ -199,6 +250,8 @@ impl FileBuilderOptionalName {
 		if let Some(modified) = self.modified {
 			builder = builder.modified(modified);
 		}
+		builder.parse_exif = self.parse_exif;
+		builder.override_with_exif = self.override_with_exif;
 
 		Ok(builder)
 	}

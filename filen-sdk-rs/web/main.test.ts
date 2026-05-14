@@ -621,6 +621,76 @@ test("thumbnail", async () => {
 	expect(completed).toContainEqual("webp")
 })
 
+test("exif upload applies DateTimeOriginal", async () => {
+	// Each fixture in test-assets/imgs has EXIF DateTimeOriginal=2020:06:15 10:30:00
+	// injected via exiftool. nom-exif (the WASM-compatible fork) parses jpg, tiff,
+	// heif and avif via the bytes-tee path inside `upload_file`; png and webp
+	// carry the same EXIF on disk but nom-exif does not (yet) parse them.
+	const EXIF_TIME = BigInt(Date.UTC(2020, 5, 15, 10, 30, 0))
+	const formats = ["jpg", "tiff", "heif", "avif"]
+
+	const results = await Promise.all(
+		formats.map(async ext => {
+			const res = await fetch(`imgs/parrot.${ext}`)
+			const bytes = await res.bytes()
+			const file = await state.uploadFile(bytes, {
+				parent: testDir,
+				name: `exif-parrot.${ext}`
+			})
+			const meta = getFileMeta(file.meta)
+			return { ext, created: meta?.created, name: meta?.name }
+		})
+	)
+
+	for (const r of results) {
+		expect(r.name, `${r.ext}: file name preserved`).toBe(`exif-parrot.${r.ext}`)
+		expect(r.created, `${r.ext}: created should equal EXIF DateTimeOriginal`).toStrictEqual(EXIF_TIME)
+	}
+})
+
+test("exif upload respects noExif and noExifOverride flags", async () => {
+	const EXIF_TIME = BigInt(Date.UTC(2020, 5, 15, 10, 30, 0))
+	const USER_TIME = BigInt(Date.UTC(2015, 0, 1, 0, 0, 0))
+	const before = BigInt(Date.now())
+	const parrotImage = await fetch("imgs/parrot.jpg")
+	const bytes = await parrotImage.bytes()
+
+	// noExif: parser never runs. With no user-supplied created, the SDK falls
+	// back to "now", so created should be >= the timestamp we captured before
+	// the upload and not equal to the embedded EXIF time.
+	const skipped = await state.uploadFile(bytes, {
+		parent: testDir,
+		name: "exif-noexif-parrot.jpg",
+		noExif: true
+	})
+	const skippedMeta = getFileMeta(skipped.meta)
+	expect(skippedMeta?.created, "noExif: created must not be EXIF time").not.toStrictEqual(EXIF_TIME)
+	expect(skippedMeta?.created!, "noExif: created should be ~now").toBeGreaterThanOrEqual(before)
+
+	// noExifOverride: parser still runs, but the user-supplied `created` wins
+	// over the EXIF DateTimeOriginal.
+	const preserved = await state.uploadFile(bytes, {
+		parent: testDir,
+		name: "exif-nooverride-parrot.jpg",
+		created: USER_TIME,
+		modified: USER_TIME,
+		noExifOverride: true
+	})
+	const preservedMeta = getFileMeta(preserved.meta)
+	expect(preservedMeta?.created, "noExifOverride: user-set created must win").toStrictEqual(USER_TIME)
+
+	// Sanity: same fixture without flags still gets EXIF time applied. This
+	// guards against the upload-pipeline path silently changing under us.
+	const overridden = await state.uploadFile(bytes, {
+		parent: testDir,
+		name: "exif-default-parrot.jpg",
+		created: USER_TIME,
+		modified: USER_TIME
+	})
+	const overriddenMeta = getFileMeta(overridden.meta)
+	expect(overriddenMeta?.created, "default: EXIF overrides user-set created").toStrictEqual(EXIF_TIME)
+})
+
 test("meta updates", async () => {
 	const file = await state.uploadFile(new TextEncoder().encode("meta file content"), {
 		parent: testDir,
