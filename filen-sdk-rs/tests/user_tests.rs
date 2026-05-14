@@ -112,6 +112,11 @@ async fn versioning_creates_versions_on_duplicate_upload() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
+	let _version_lock = client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+
 	let _lock = client
 		.acquire_lock_with_default(LOCK_VERSIONING)
 		.await

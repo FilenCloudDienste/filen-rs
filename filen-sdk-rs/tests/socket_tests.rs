@@ -126,6 +126,13 @@ async fn test_websocket_bad_auth() {
 async fn test_websocket_file_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
+
+	let _version_lock = client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	client.set_versioning_enabled(true).await.unwrap();
+
 	let dir = &resources.dir;
 	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 	let _handle = client

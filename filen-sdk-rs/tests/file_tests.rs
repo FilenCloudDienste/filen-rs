@@ -605,8 +605,14 @@ async fn file_read_range() {
 #[shared_test_runtime]
 async fn file_versions() {
 	let resources = test_utils::RESOURCES.get_resources().await;
+
 	let client = &resources.client;
 	let test_dir = &resources.dir;
+	let _version_lock = client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	client.set_versioning_enabled(true).await.unwrap();
 
 	let mut versions = Vec::new();
 	// TODO: when backend supports size in version info, use different lengths for these strings
