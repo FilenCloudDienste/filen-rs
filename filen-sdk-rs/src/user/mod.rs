@@ -48,7 +48,7 @@ impl Client {
 			root_dir_uuid: info.root_dir_uuid,
 
 			two_factor_enabled: settings.two_factor_enabled,
-			two_factor_key: if settings.two_factor_enabled {
+			two_factor_key: if !settings.two_factor_enabled {
 				Some(settings.two_factor_key.into_owned())
 			} else {
 				None
