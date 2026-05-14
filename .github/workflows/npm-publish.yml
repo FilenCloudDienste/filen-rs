@@ -44,9 +44,9 @@ jobs:
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
           # waiting on a new release that includes
-          # https://github.com/drager/wasm-pack/pull/1428
+          # https://github.com/wasm-bindgen/wasm-pack/pull/1428
           tool: wasm-pack
-          git: https://github.com/drager/wasm-pack
+          git: https://github.com/wasm-bindgen/wasm-pack
           rev: cd1718aa7babb656796b8aae3c177ddacce28028
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
