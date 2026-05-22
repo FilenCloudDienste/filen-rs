@@ -232,8 +232,7 @@ fn count_items(db_path: &Path) -> usize {
 /// Build a synthetic RemoteFile with decoded metadata for testing ListDirRecursive.
 fn make_test_remote_file(name: &str, parent: &UuidStr) -> RemoteFile {
 	let key_hex = "a".repeat(64);
-	let file_key =
-		FileKey::from_string_with_version(Cow::Owned(key_hex), FileEncryptionVersion::V3).unwrap();
+	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
 	let now = Utc::now();
 
 	RemoteFile::from_meta(
@@ -249,7 +248,7 @@ fn make_test_remote_file(name: &str, parent: &UuidStr) -> RemoteFile {
 			name: Cow::Owned(name.to_string()),
 			size: 1024,
 			mime: Cow::Owned("text/plain".to_string()),
-			key: Cow::Owned(file_key),
+			key: file_key,
 			last_modified: now,
 			created: Some(now),
 			hash: None,
@@ -278,8 +277,7 @@ fn make_test_remote_file_encrypted_meta(parent: &UuidStr) -> RemoteFile {
 /// because `CacheableFile` only accepts a real `Uuid` parent.
 fn make_test_remote_file_bad_parent(name: &str) -> RemoteFile {
 	let key_hex = "a".repeat(64);
-	let file_key =
-		FileKey::from_string_with_version(Cow::Owned(key_hex), FileEncryptionVersion::V3).unwrap();
+	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
 	let now = Utc::now();
 	RemoteFile::from_meta(
 		UuidStr::new_v4(),
@@ -294,7 +292,7 @@ fn make_test_remote_file_bad_parent(name: &str) -> RemoteFile {
 			name: Cow::Owned(name.to_string()),
 			size: 1024,
 			mime: Cow::Owned("text/plain".to_string()),
-			key: Cow::Owned(file_key),
+			key: file_key,
 			last_modified: now,
 			created: Some(now),
 			hash: None,

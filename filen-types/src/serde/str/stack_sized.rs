@@ -21,6 +21,17 @@ where
 	{
 		self.0.into()
 	}
+
+	pub fn as_array<const U: usize>(&self) -> &[u8; U]
+	where
+		Const<U>: IntoArrayLength<ArrayLength = N>,
+	{
+		self.0.as_ref()
+	}
+
+	pub fn as_bytes(&self) -> &[u8] {
+		self.0.as_ref()
+	}
 }
 
 impl<N: ArrayLength> Deref for StackSizedString<N> {

@@ -379,10 +379,10 @@ impl TryFrom<DBFile> for RemoteFile {
 				DBFileMeta::Decoded(decrypted_meta) => FileMeta::Decoded(DecryptedFileMeta {
 					name: Cow::Owned(decrypted_meta.name),
 					mime: Cow::Owned(decrypted_meta.mime),
-					key: Cow::Owned(FileKey::from_string_with_version(
-						Cow::Owned(decrypted_meta.key),
+					key: FileKey::from_str_with_version(
+						&decrypted_meta.key,
 						FileEncryptionVersion::try_from(decrypted_meta.key_version)?,
-					)?),
+					)?,
 					created: decrypted_meta
 						.created
 						.map(DateTime::<Utc>::from_timestamp_millis)

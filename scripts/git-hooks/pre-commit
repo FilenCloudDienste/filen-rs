@@ -69,8 +69,17 @@ else
 fi
 
 # Default clippy config — the cheapest of the four CI clippy invocations.
+# heif-decoder is excluded because its cmake-rs build breaks incremental compiles.
+# See https://github.com/rust-lang/cmake-rs/issues/248
 if have cargo; then
-	run "cargo clippy -- -D warnings" cargo clippy --all-targets -- -D warnings
+	run "cargo clippy -- -D warnings" \
+		cargo clippy --workspace --exclude heif-decoder --all-targets -- -D warnings
+fi
+
+# UniFFI clippy for filen-sdk-rs (matches the mobile bindings build surface).
+if have cargo; then
+	run "cargo clippy -p filen-sdk-rs -F uniffi -- -D warnings" \
+		cargo clippy -p filen-sdk-rs -F uniffi --all-targets -- -D warnings
 fi
 
 # WASM clippy (matches ci.yml ci-wasm job; run from filen-sdk-rs sub-workspace).

@@ -61,7 +61,7 @@ impl<'de> DeserializeSeed<'de> for FileMetaSeed {
 			name: raw_meta.name,
 			size: raw_meta.size,
 			mime: raw_meta.mime,
-			key: Cow::Owned(key),
+			key,
 			last_modified: raw_meta.last_modified,
 			created: raw_meta.created,
 			hash: raw_meta.hash,
@@ -198,7 +198,7 @@ pub struct DecryptedFileMeta<'a> {
 	pub name: Cow<'a, str>,
 	pub size: u64,
 	pub mime: Cow<'a, str>,
-	pub key: Cow<'a, FileKey>,
+	pub key: FileKey,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
 	pub last_modified: DateTime<Utc>,
 	#[serde(with = "filen_types::serde::time::optional")]
@@ -263,7 +263,7 @@ impl<'a> DecryptedFileMeta<'a> {
 			mime: Cow::Borrowed(changes.mime.as_deref().unwrap_or(&self.mime)),
 			last_modified: changes.last_modified.unwrap_or(self.last_modified),
 			created,
-			key: Cow::Borrowed(&self.key),
+			key: self.key,
 			size: self.size,
 			hash: self.hash,
 		}
@@ -475,7 +475,7 @@ pub mod serde_stateless {
 				size: m.size,
 				mime: m.mime.as_ref(),
 				key_version: m.key.version(),
-				key: m.key.as_ref(),
+				key: &m.key,
 				last_modified: m.last_modified,
 				created: m.created,
 				hash: m.hash,
@@ -495,13 +495,13 @@ pub mod serde_stateless {
 		let helper = FileMetaDeserHelper::deserialize(deserializer)?;
 		match helper {
 			FileMetaDeserHelper::Decoded(h) => {
-				let key = FileKey::from_string_with_version(Cow::Owned(h.key), h.key_version)
+				let key = FileKey::from_str_with_version(&h.key, h.key_version)
 					.map_err(serde::de::Error::custom)?;
 				Ok(FileMeta::Decoded(DecryptedFileMeta {
 					name: Cow::Owned(h.name),
 					size: h.size,
 					mime: Cow::Owned(h.mime),
-					key: Cow::Owned(key),
+					key,
 					last_modified: h.last_modified,
 					created: h.created,
 					hash: h.hash,

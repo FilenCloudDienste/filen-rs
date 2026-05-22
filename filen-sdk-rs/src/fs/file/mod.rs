@@ -436,7 +436,7 @@ impl From<FlatRemoteFile> for RemoteFile {
 				size: file.size,
 				name: Cow::Owned(file.name),
 				mime: Cow::Owned(file.mime),
-				key: Cow::Owned(file.key),
+				key: file.key,
 				created: Some(file.created.round_subsecs(3)),
 				last_modified: file.modified.round_subsecs(3),
 				hash: file.hash,
@@ -795,7 +795,7 @@ impl<'de> serde::Deserialize<'de> for LinkedFile {
 		}
 
 		let helper = LinkedFileHelper::deserialize(deserializer)?;
-		let file_key = FileKey::from_string_with_version(helper.file_key, helper.version)
+		let file_key = FileKey::from_str_with_version(&helper.file_key, helper.version)
 			.map_err(serde::de::Error::custom)?;
 
 		Ok(Self {

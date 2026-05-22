@@ -47,11 +47,7 @@ fn get_compat_test_file(
 			Utc,
 		))
 		.key(
-			FileKey::from_string_with_version(
-				Cow::Borrowed(file_key_str),
-				client.file_encryption_version(),
-			)
-			.unwrap(),
+			FileKey::from_str_with_version(file_key_str, client.file_encryption_version()).unwrap(),
 		);
 
 	let mut test_str = String::new();

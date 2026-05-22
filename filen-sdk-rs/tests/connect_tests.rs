@@ -1,22 +1,14 @@
-// use std::sync::Arc;
-
-// use chrono::{SubsecRound, Utc};
-// use filen_macros::shared_test_runtime;
-// use filen_sdk_rs::{
-// 	auth::Client,
-// 	connect::PasswordState,
-// 	fs::{
-// 		HasName, HasUUID,
-// 		dir::meta::DirectoryMetaChanges,
-// 		file::{
-// 			meta::FileMetaChanges,
-// 			traits::{HasFileInfo, HasRemoteFileInfo},
-// 		},
-// 	},
-// 	sync::lock::ResourceLock,
-// };
-// use filen_types::api::v3::dir::link::PublicLinkExpiration;
-// use futures::{StreamExt, stream::FuturesUnordered};
+use filen_macros::shared_test_runtime;
+use filen_sdk_rs::{
+	ErrorKind,
+	connect::{DirPublicLink, PublicLinkSharedClientExt},
+	fs::{
+		HasName, HasUUID, categories::Shared, dir::meta::DirectoryMetaChanges,
+		file::meta::FileMetaChanges,
+	},
+	io::{HasFileInfo, client_impl::IoSharedClientExt},
+};
+use filen_types::api::v3::dir::link::PublicLinkExpiration;
 
 #[shared_test_runtime]
 async fn dir_public_link() {
@@ -180,20 +172,6 @@ async fn dir_public_link() {
 	assert!(!sub_files.contains(&sub_sub_file));
 }
 
-use std::borrow::Cow;
-
-use filen_macros::shared_test_runtime;
-use filen_sdk_rs::{
-	ErrorKind,
-	connect::{DirPublicLink, PublicLinkSharedClientExt},
-	fs::{
-		HasName, HasUUID, categories::Shared, dir::meta::DirectoryMetaChanges,
-		file::meta::FileMetaChanges,
-	},
-	io::{HasFileInfo, client_impl::IoSharedClientExt},
-};
-use filen_types::api::v3::dir::link::PublicLinkExpiration;
-
 #[shared_test_runtime]
 async fn file_public_link() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -220,7 +198,7 @@ async fn file_public_link() {
 	let file_key = file.key().unwrap().to_str();
 
 	let linked_file = unauth_client
-		.get_linked_file(link.uuid(), Cow::Borrowed(file_key.as_ref()), None)
+		.get_linked_file(link.uuid(), file_key.as_ref(), None)
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
@@ -236,11 +214,7 @@ async fn file_public_link() {
 	assert_eq!(&link, &cloned_found_link);
 
 	let linked_file = unauth_client
-		.get_linked_file(
-			link.uuid(),
-			Cow::Borrowed(file_key.as_ref()),
-			Some(password),
-		)
+		.get_linked_file(link.uuid(), file_key.as_ref(), Some(password))
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
@@ -257,11 +231,7 @@ async fn file_public_link() {
 		.unwrap();
 	let file_key = file.key().unwrap().to_str();
 	let linked_file = share_client
-		.get_linked_file(
-			link.uuid(),
-			Cow::Borrowed(file_key.as_ref()),
-			Some(password),
-		)
+		.get_linked_file(link.uuid(), file_key.as_ref(), Some(password))
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);

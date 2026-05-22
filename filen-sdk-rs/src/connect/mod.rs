@@ -941,9 +941,35 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 	async fn get_linked_file(
 		&self,
 		link_uuid: UuidStr,
-		file_key: Cow<'_, str>,
+		file_key: &str,
 		password: Option<&str>,
-	) -> Result<LinkedFile, Error>;
+	) -> Result<LinkedFile, Error> {
+		let (password, salt) = match password {
+			None => (None, LinkPasswordSalt::None),
+			Some(password) => {
+				let resp = api::v3::file::link::password::post(
+					self.get_unauth_client(),
+					&api::v3::file::link::password::Request { uuid: link_uuid },
+				)
+				.await?;
+				(Some(password), resp.salt)
+			}
+		};
+		let password_hashed =
+			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(password, &salt))
+				.await?;
+		let response = api::v3::file::link::info::post(
+			self.get_unauth_client(),
+			&api::v3::file::link::info::Request {
+				uuid: link_uuid,
+				password: password_hashed,
+			},
+		)
+		.await?;
+
+		let key = FileKey::from_string_and_meta(file_key, &response.mime)?;
+		do_cpu_intensive(|| LinkedFile::blocking_from_response(key, response)).await
+	}
 
 	async fn list_linked_dir<F>(
 		&self,
@@ -1012,40 +1038,4 @@ pub struct DirPublicInfo {
 	pub has_password: bool,
 }
 
-impl<T> PublicLinkSharedClientExt for T
-where
-	T: SharedClient,
-{
-	async fn get_linked_file(
-		&self,
-		link_uuid: UuidStr,
-		file_key: Cow<'_, str>,
-		password: Option<&str>,
-	) -> Result<LinkedFile, Error> {
-		let (password, salt) = match password {
-			None => (None, LinkPasswordSalt::None),
-			Some(password) => {
-				let resp = api::v3::file::link::password::post(
-					self.get_unauth_client(),
-					&api::v3::file::link::password::Request { uuid: link_uuid },
-				)
-				.await?;
-				(Some(password), resp.salt)
-			}
-		};
-		let password_hashed =
-			do_cpu_intensive(|| crate::crypto::connect::derive_password_for_link(password, &salt))
-				.await?;
-		let response = api::v3::file::link::info::post(
-			self.get_unauth_client(),
-			&api::v3::file::link::info::Request {
-				uuid: link_uuid,
-				password: password_hashed,
-			},
-		)
-		.await?;
-
-		let key = FileKey::from_string_and_meta(file_key, &response.mime)?;
-		do_cpu_intensive(|| LinkedFile::blocking_from_response(key, response)).await
-	}
-}
+impl<T> PublicLinkSharedClientExt for T where T: SharedClient {}

@@ -9,13 +9,13 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::{
 	api::v3::dir::link::info::LinkPasswordSalt,
 	crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString},
-	serde::str::{SizedHexString, SizedStringBase64Chars},
+	serde::str::{SizedHexString, SizedStringBase64Chars, StackSizedString},
 };
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rand::distr::Distribution;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use typenum::U64;
+use typenum::{U32, U64};
 
 use crate::crypto::shared::{NONCE_SIZE, NonceSize, TAG_SIZE, TagSize};
 
@@ -59,12 +59,6 @@ pub struct V2Key {
 	derived_key: [u8; 32],
 }
 
-impl V2Key {
-	fn cipher(&self) -> AesGcm<Aes256, NonceSize, TagSize> {
-		<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(&self.derived_key.into())
-	}
-}
-
 impl PartialEq for V2Key {
 	fn eq(&self, other: &Self) -> bool {
 		self.key == other.key
@@ -76,6 +70,10 @@ impl AsRef<str> for V2Key {
 	fn as_ref(&self) -> &str {
 		&self.key
 	}
+}
+
+fn cipher(encryption_key: &[u8; 32]) -> AesGcm<Aes256, NonceSize, TagSize> {
+	<AesGcm<Aes256, NonceSize> as aes_gcm::KeyInit>::new(encryption_key.into())
 }
 
 impl V2Key {
@@ -92,7 +90,7 @@ impl V2Key {
 			return Err((e.into(), out));
 		}
 
-		if let Err(e) = self.cipher().decrypt_in_place(nonce, &[], &mut out) {
+		if let Err(e) = cipher(&self.derived_key).decrypt_in_place(nonce, &[], &mut out) {
 			return Err((e.into(), out));
 		}
 
@@ -122,8 +120,7 @@ impl MetaCrypter for V2Key {
 
 		// SAFETY: This cannot fail unless we encrypt more than 64GiB of metadata at a time, which we will never do
 		// we also don't have AAD
-		let encrypted = self
-			.cipher()
+		let encrypted = cipher(&self.derived_key)
 			.encrypt(&nonce.into(), meta.as_bytes())
 			.unwrap();
 
@@ -161,11 +158,11 @@ impl MetaCrypter for V2Key {
 
 impl DataCrypter for V2Key {
 	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		super::shared::encrypt_data(&self.cipher(), data)
+		super::shared::encrypt_data(&cipher(&self.derived_key), data)
 	}
 
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		super::shared::decrypt_data(&self.cipher(), data)
+		super::shared::decrypt_data(&cipher(&self.derived_key), data)
 	}
 }
 
@@ -323,8 +320,11 @@ impl TryFrom<String> for MasterKey {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FileKey(pub(crate) V2Key);
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FileKey {
+	encryption_key: StackSizedString<U32>,
+}
 
 impl core::fmt::Display for FileKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -332,56 +332,34 @@ impl core::fmt::Display for FileKey {
 	}
 }
 
-impl TryFrom<String> for FileKey {
-	type Error = ConversionError;
-	fn try_from(key: String) -> Result<Self, Self::Error> {
-		let derived_key = key
-			.as_bytes()
-			.try_into()
-			.map_err(|_| ConversionError::InvalidStringLength(key.len(), 32))?;
-
-		Ok(Self(V2Key { key, derived_key }))
+impl FromStr for FileKey {
+	type Err = ConversionError;
+	fn from_str(key: &str) -> Result<Self, Self::Err> {
+		Ok(Self {
+			encryption_key: StackSizedString::try_from(key)?,
+		})
 	}
 }
 
 impl AsRef<str> for FileKey {
 	fn as_ref(&self) -> &str {
-		self.0.as_ref()
-	}
-}
-
-impl Serialize for FileKey {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		serializer.serialize_str(self.as_ref())
-	}
-}
-
-impl<'de> Deserialize<'de> for FileKey {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		let key = String::deserialize(deserializer)?;
-		FileKey::try_from(key).map_err(serde::de::Error::custom)
+		self.encryption_key.as_ref()
 	}
 }
 
 impl DataCrypter for FileKey {
 	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		self.0.blocking_encrypt_data(data)
+		super::shared::encrypt_data(&cipher(self.encryption_key.as_array()), data)
 	}
 
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		self.0.blocking_decrypt_data(data)
+		super::shared::decrypt_data(&cipher(self.encryption_key.as_array()), data)
 	}
 }
 
 impl CreateRandom for FileKey {
 	fn seeded_generate(rng: &mut rand::prelude::ThreadRng) -> Self {
-		Self::try_from(super::shared::generate_random_base64_values(32, rng))
+		Self::from_str(super::shared::generate_random_base64_values(32, rng).as_str())
 			.expect("Failed to generate V2 key")
 	}
 }

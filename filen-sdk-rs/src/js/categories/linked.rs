@@ -84,7 +84,7 @@ impl TryFrom<LinkedFile> for LinkedFileRS {
 			bucket: value.bucket,
 			version: value.version,
 			timestamp: value.timestamp,
-			file_key: FileKey::from_string_with_version(Cow::Owned(value.file_key), value.version)?,
+			file_key: FileKey::from_str_with_version(&value.file_key, value.version)?,
 		})
 	}
 }

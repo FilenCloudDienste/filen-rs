@@ -1,14 +1,14 @@
-use std::{borrow::Cow, fmt::Debug, str::FromStr};
+use std::{fmt::Debug, str::FromStr};
 
 use filen_types::{auth::FileEncryptionVersion, serde::str::StackSizedString};
-use serde::{Deserialize, Serialize, de::DeserializeSeed};
+use serde::{Serialize, de::DeserializeSeed};
 use typenum::U64;
 
 use crate::{Error, ErrorKind, auth::AuthInfo, crypto::v1};
 
 use super::{error::ConversionError, shared::DataCrypter, v2, v3};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FileKey {
 	V1(v1::FileKey),
 	V2(v2::FileKey),
@@ -79,14 +79,14 @@ impl<'de> DeserializeSeed<'de> for FileKeySeed {
 	where
 		D: serde::Deserializer<'de>,
 	{
-		let key = String::deserialize(deserializer)?;
+		let key = filen_types::serde::cow::deserialize(deserializer)?;
 		match self.0 {
 			FileEncryptionVersion::V1 => {
 				let v1_key = v1::FileKey::from_str(&key).map_err(serde::de::Error::custom)?;
 				Ok(FileKey::V1(v1_key))
 			}
 			FileEncryptionVersion::V2 => {
-				let v2_key = v2::FileKey::try_from(key).map_err(serde::de::Error::custom)?;
+				let v2_key = v2::FileKey::from_str(&key).map_err(serde::de::Error::custom)?;
 				Ok(FileKey::V2(v2_key))
 			}
 			FileEncryptionVersion::V3 => {
@@ -98,19 +98,19 @@ impl<'de> DeserializeSeed<'de> for FileKeySeed {
 }
 
 impl FileKey {
-	pub fn from_string_with_version(
-		key: Cow<'_, str>,
+	pub fn from_str_with_version(
+		key: &str,
 		version: FileEncryptionVersion,
 	) -> Result<Self, ConversionError> {
 		match version {
-			FileEncryptionVersion::V1 => v1::FileKey::from_str(&key).map(FileKey::V1),
-			FileEncryptionVersion::V2 => v2::FileKey::try_from(key.into_owned()).map(FileKey::V2),
-			FileEncryptionVersion::V3 => v3::EncryptionKey::from_str(&key).map(FileKey::V3),
+			FileEncryptionVersion::V1 => v1::FileKey::from_str(key).map(FileKey::V1),
+			FileEncryptionVersion::V2 => v2::FileKey::from_str(key).map(FileKey::V2),
+			FileEncryptionVersion::V3 => v3::EncryptionKey::from_str(key).map(FileKey::V3),
 		}
 	}
 
 	pub(crate) fn from_string_and_meta(
-		key: Cow<'_, str>,
+		key: &str,
 		meta: &filen_types::crypto::EncryptedString,
 	) -> Result<Self, Error> {
 		let key_version = if meta.0.starts_with("U2FsdGVk") {
@@ -126,7 +126,7 @@ impl FileKey {
 			));
 		};
 
-		Self::from_string_with_version(key, key_version).map_err(Into::into)
+		Self::from_str_with_version(key, key_version).map_err(Into::into)
 	}
 }
 
@@ -149,7 +149,7 @@ impl DataCrypter for FileKey {
 }
 
 impl FileKey {
-	pub(crate) fn to_meta_key(&self) -> Result<AuthInfo, ConversionError> {
+	pub(crate) fn to_meta_key(self) -> Result<AuthInfo, ConversionError> {
 		let version = match self {
 			FileKey::V1(_) => 1,
 			FileKey::V2(_) => 2,
@@ -169,14 +169,12 @@ mod tests {
 
 	#[test]
 	fn stringify_file_key() {
-		assert!(FileKey::from_string_with_version("ab".into(), FileEncryptionVersion::V2).is_err());
+		assert!(FileKey::from_str_with_version("ab", FileEncryptionVersion::V2).is_err());
 		let a64 = "a".repeat(64);
 		let a32 = "a".repeat(32);
-		let v2 = FileKey::from_string_with_version(Cow::Borrowed(&a32), FileEncryptionVersion::V2)
-			.unwrap();
+		let v2 = FileKey::from_str_with_version(&a32, FileEncryptionVersion::V2).unwrap();
 		assert_eq!(v2.to_str().as_ref(), a32);
-		let v3 = FileKey::from_string_with_version(Cow::Borrowed(&a64), FileEncryptionVersion::V3)
-			.unwrap();
+		let v3 = FileKey::from_str_with_version(&a64, FileEncryptionVersion::V3).unwrap();
 		assert_eq!(v3.to_str().as_ref(), a64);
 	}
 
@@ -187,8 +185,7 @@ mod tests {
 		let serialized_key = serde_json::to_string(&key).unwrap();
 
 		let deser_string = serde_json::from_str::<String>(&serialized_key).unwrap();
-		let deser_key =
-			FileKey::from_string_with_version(Cow::Owned(deser_string), key.version()).unwrap();
+		let deser_key = FileKey::from_str_with_version(&deser_string, key.version()).unwrap();
 		assert_eq!(key, deser_key);
 	}
 }

@@ -5,7 +5,7 @@
 /// Do not change a failing test to make it pass — fix the underlying code instead.
 #[cfg(test)]
 mod tests {
-	use std::borrow::Cow;
+	use std::{borrow::Cow, str::FromStr};
 
 	use filen_types::crypto::EncryptedString;
 
@@ -171,11 +171,11 @@ mod tests {
 	#[test]
 	fn test_v2_file_key_wrong_length_returns_error() {
 		assert!(
-			v2::FileKey::try_from("a".repeat(31)).is_err(),
+			v2::FileKey::from_str("a".repeat(31).as_str()).is_err(),
 			"31-byte key must be rejected"
 		);
 		assert!(
-			v2::FileKey::try_from("a".repeat(33)).is_err(),
+			v2::FileKey::from_str("a".repeat(33).as_str()).is_err(),
 			"33-byte key must be rejected"
 		);
 	}

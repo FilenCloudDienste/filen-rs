@@ -7,13 +7,14 @@ use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
 use filen_types::crypto::{DerivedPassword, EncryptedString};
-use filen_types::serde::str::SizedHexString;
+use filen_types::serde::str::{SizedHexString, StackSizedString};
 use md2::{Digest, Md2};
 use md4::Md4;
 use md5::Md5;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
+use typenum::U32;
 
 use crate::crypto::error::ConversionError;
 use crate::crypto::shared::{DataCrypter, MetaCrypter};
@@ -67,7 +68,7 @@ fn decrypt(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
 	Ok(())
 }
 
-fn decrypt_meta(
+pub(crate) fn decrypt_meta(
 	key: &[u8],
 	meta: &EncryptedString,
 	mut out: Vec<u8>,
@@ -149,14 +150,15 @@ impl V2Key {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct FileKey {
-	key: [u8; 32],
+	key: StackSizedString<U32>,
 }
 
 impl AsRef<str> for FileKey {
 	fn as_ref(&self) -> &str {
-		unsafe { std::str::from_utf8_unchecked(&self.key) }
+		self.key.as_ref()
 	}
 }
 
@@ -170,12 +172,9 @@ impl FromStr for FileKey {
 	type Err = ConversionError;
 
 	fn from_str(key: &str) -> Result<Self, Self::Err> {
-		if key.len() != 32 {
-			return Err(ConversionError::InvalidStringLength(key.len(), 32));
-		}
-		let mut bytes = [0u8; 32];
-		bytes.copy_from_slice(key.as_bytes());
-		Ok(Self { key: bytes })
+		Ok(Self {
+			key: StackSizedString::try_from(key)?,
+		})
 	}
 }
 
@@ -186,7 +185,7 @@ impl DataCrypter for FileKey {
 	}
 
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		decrypt_data(&self.key, data)
+		decrypt_data(self.key.as_bytes(), data)
 	}
 }
 
@@ -200,7 +199,7 @@ impl MetaCrypter for FileKey {
 		meta: &EncryptedString,
 		out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
-		decrypt_meta(&self.key, meta, out)
+		decrypt_meta(self.key.as_bytes(), meta, out)
 	}
 }
 

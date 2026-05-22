@@ -794,7 +794,7 @@ where
 {
 	runtime::do_on_commander(move || async move {
 		client
-			.get_linked_file(link_uuid, Cow::Owned(file_key), link_password.as_deref())
+			.get_linked_file(link_uuid, &file_key, link_password.as_deref())
 			.await
 			.map(LinkedFile::from)
 	})

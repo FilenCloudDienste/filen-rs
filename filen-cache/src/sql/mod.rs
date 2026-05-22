@@ -111,7 +111,7 @@ impl CacheState {
 				meta.size,
 				meta.name,
 				meta.mime,
-				meta.key.as_ref().to_str().as_ref(),
+				meta.key.to_str().as_ref(),
 				meta.key.version() as i8,
 				meta.created.map(|c| c.timestamp_millis()),
 				meta.last_modified.timestamp_millis(),
@@ -194,7 +194,7 @@ mod tests {
 
 	fn make_file_key() -> FileKey {
 		let key_hex = "a".repeat(64);
-		FileKey::from_string_with_version(Cow::Owned(key_hex), FileEncryptionVersion::V3).unwrap()
+		FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap()
 	}
 
 	fn make_cacheable_file(parent: Uuid) -> CacheableFile<'static> {
@@ -211,7 +211,7 @@ mod tests {
 			name: Cow::Owned("test_file.txt".to_string()),
 			size: 1024,
 			mime: Cow::Owned("text/plain".to_string()),
-			key: Cow::Owned(make_file_key()),
+			key: make_file_key(),
 			last_modified: now,
 			created: Some(now),
 			hash: None,
@@ -845,7 +845,7 @@ mod tests {
 			name: Cow::Borrowed("renamed.txt"),
 			size: 2048,
 			mime: Cow::Borrowed("application/octet-stream"),
-			key: Cow::Borrowed(&new_key),
+			key: new_key,
 			last_modified: new_modified,
 			created: None,
 			hash: None,
@@ -876,7 +876,7 @@ mod tests {
 			name: Cow::Borrowed("new_name.txt"),
 			size: 999,
 			mime: Cow::Borrowed("text/html"),
-			key: Cow::Borrowed(&file.key),
+			key: file.key,
 			last_modified: file.last_modified,
 			created: file.created,
 			hash: None,
@@ -908,7 +908,7 @@ mod tests {
 			name: Cow::Borrowed("ghost.txt"),
 			size: 0,
 			mime: Cow::Borrowed("text/plain"),
-			key: Cow::Borrowed(&make_file_key()),
+			key: make_file_key(),
 			last_modified: Utc::now(),
 			created: None,
 			hash: None,

@@ -28,7 +28,8 @@ pub const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4,
 	Err(_) => panic!("Failed to create Argon2 params"),
 };
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EncryptionKey {
 	hex_string: SizedHexString<U32>,
 }
@@ -73,26 +74,6 @@ impl FromStr for EncryptionKey {
 impl std::fmt::Display for EncryptionKey {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}", self.hex_string)
-	}
-}
-
-impl Serialize for EncryptionKey {
-	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-	where
-		S: serde::Serializer,
-	{
-		self.hex_string.serialize(serializer)
-	}
-}
-
-impl<'de> Deserialize<'de> for EncryptionKey {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		Ok(Self {
-			hex_string: SizedHexString::deserialize(deserializer)?,
-		})
 	}
 }
 

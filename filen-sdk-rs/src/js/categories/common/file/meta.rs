@@ -73,10 +73,7 @@ impl TryFrom<DecryptedFileMeta> for DecryptedFileMetaRs<'static> {
 			last_modified: meta.modified,
 			hash: meta.hash,
 			size: meta.size,
-			key: Cow::Owned(FileKey::from_string_with_version(
-				Cow::Owned(meta.key),
-				meta.version,
-			)?),
+			key: FileKey::from_str_with_version(&meta.key, meta.version)?,
 		})
 	}
 }
