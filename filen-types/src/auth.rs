@@ -3,6 +3,7 @@ use std::{
 	fmt::{Debug, Display},
 };
 
+use filen_macros::js_type;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
@@ -19,11 +20,16 @@ impl Display for APIKey<'_> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum AuthVersion {
 	V1 = 1,
 	V2 = 2,
 	V3 = 3,
 }
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const TS_AUTH_VERSION: &'static str = r#"export type AuthVersion = 1 | 2 | 3;"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
@@ -84,6 +90,7 @@ impl TryFrom<u8> for MetaEncryptionVersion {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[js_type(export, no_ser, no_deser, no_default, wasm_all)]
 pub struct FilenSDKConfig {
 	pub email: String,
 	pub password: String,

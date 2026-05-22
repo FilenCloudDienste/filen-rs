@@ -1,6 +1,7 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use filen_macros::js_type;
+use filen_types::auth::FilenSDKConfig;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::prelude::*;
 
@@ -193,6 +194,14 @@ impl JsClient {
 	pub async fn change_email(&self, password: String, new_email: String) -> Result<(), Error> {
 		let this = self.inner();
 		do_on_commander(move || async move { this.change_email(&password, &new_email).await }).await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "toSDKConfig")
+	)]
+	pub fn to_sdk_config(&self) -> FilenSDKConfig {
+		self.inner_ref().to_sdk_config()
 	}
 }
 
