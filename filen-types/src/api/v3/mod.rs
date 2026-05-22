@@ -7,6 +7,7 @@ pub mod file;
 pub mod health;
 pub mod item;
 pub mod login;
+pub mod message_ids;
 pub mod notes;
 pub mod register;
 pub mod search;

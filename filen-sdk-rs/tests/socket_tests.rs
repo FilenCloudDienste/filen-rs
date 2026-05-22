@@ -390,6 +390,71 @@ async fn test_websocket_file_events() {
 }
 
 #[shared_test_runtime]
+async fn test_get_last_event_ids() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let dir = &resources.dir;
+
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = sender.send(event.to_owned_cow());
+			}),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let before = client.get_last_event_ids().await.unwrap();
+
+	let file = client
+		.make_file_builder("event_ids_test.txt", *dir.uuid())
+		.unwrap();
+	let file = client.upload_file(file, b"event ids test").await.unwrap();
+
+	let drive_message_id = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileNew(data),
+				drive_message_id,
+			} if data.0.uuid == *file.uuid() => Some(drive_message_id),
+			_ => None,
+		},
+		Duration::from_secs(20),
+		"fileNew",
+	)
+	.await;
+
+	let after = client.get_last_event_ids().await.unwrap();
+
+	// Drive counter must have advanced past our event. Parallel tests may push it
+	// further, so we use `>=` rather than `==`.
+	assert!(
+		after.drive >= drive_message_id,
+		"expected after.drive ({}) >= drive_message_id ({})",
+		after.drive,
+		drive_message_id,
+	);
+
+	// At least our drive event happened between snapshots, so the drive counter
+	// must have strictly increased.
+	assert!(
+		after.drive > before.drive,
+		"expected after.drive ({}) > before.drive ({})",
+		after.drive,
+		before.drive,
+	);
+
+	// Other categories must never regress.
+	assert!(after.chat >= before.chat);
+	assert!(after.contact >= before.contact);
+	assert!(after.note >= before.note);
+	assert!(after.general >= before.general);
+}
+
+#[shared_test_runtime]
 async fn test_websocket_folder_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

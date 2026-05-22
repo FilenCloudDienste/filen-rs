@@ -1,4 +1,25 @@
+use crate::{Error, auth::JsClient, runtime::do_on_commander};
+
 mod events;
+
+#[cfg_attr(feature = "uniffi", ::uniffi::export)]
+#[cfg_attr(
+	feature = "wasm-full",
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+)]
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+impl JsClient {
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getLastEventIds")
+	)]
+	pub async fn get_last_event_ids(
+		&self,
+	) -> Result<filen_types::api::v3::message_ids::Response, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.get_last_event_ids().await }).await
+	}
+}
 
 #[cfg(feature = "uniffi")]
 mod uniffi {

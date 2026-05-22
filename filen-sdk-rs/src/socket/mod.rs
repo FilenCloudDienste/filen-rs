@@ -47,4 +47,10 @@ impl Client {
 			.unwrap_or_else(|e| e.into_inner())
 			.is_connected()
 	}
+
+	pub async fn get_last_event_ids(
+		&self,
+	) -> Result<filen_types::api::v3::message_ids::Response, Error> {
+		crate::api::v3::message_ids::get(self.client()).await
+	}
 }
