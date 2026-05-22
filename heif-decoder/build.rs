@@ -68,7 +68,7 @@ fn config_cmake_for_android(config: &mut Config) {
 		);
 	}
 
-	if let Ok(android_target) = env::var("CARGO_NDK_ANDROID_TARGET") {
+	if let Ok(android_target) = env::var("ANDROID_ABI") {
 		config.define("ANDROID_ABI", android_target);
 	} else {
 		println!("cargo:warning=CARGO_NDK_ANDROID_TARGET is not set, using default Android ABI");

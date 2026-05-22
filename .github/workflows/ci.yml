@@ -139,8 +139,7 @@ jobs:
           ndk-version: 27.0.12077973
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
-          # Can't use the latest version until https://github.com/bbqsrc/cargo-ndk/issues/181 is fixed
-          tool: cargo-ndk@3.5.4
+          tool: cargo-ndk
       - name: Install dependencies for avif-decoder
         run: |
           brew install dav1d pkg-config
@@ -209,8 +208,7 @@ jobs:
           rev: cd1718aa7babb656796b8aae3c177ddacce28028
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
-          # Can't use the latest version until https://github.com/bbqsrc/cargo-ndk/issues/181 is resolved
-          tool: cargo-ndk@3.5.4
+          tool: cargo-ndk
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
