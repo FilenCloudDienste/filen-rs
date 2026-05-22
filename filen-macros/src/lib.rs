@@ -1571,6 +1571,11 @@ fn parse_args(args: Vec<Meta>) -> Result<JsTypeState, syn::Error> {
 			Meta::Path(path) if path.is_ident("wasm_worker") => {
 				state.wasm_condition = quote! {all(target_family = "wasm", target_os = "unknown", feature = "wasm-worker")};
 			}
+			Meta::NameValue(wasm_target) if wasm_target.path.is_ident("wasm_target") => {
+				let custom_config = &wasm_target.value;
+				state.wasm_condition =
+					quote! {all(target_family = "wasm", target_os = "unknown", #custom_config)};
+			}
 			other => {
 				return Err(syn::Error::new_spanned(
 					other,
