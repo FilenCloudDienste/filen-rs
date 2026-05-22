@@ -9,15 +9,17 @@ use base64::{
 	Engine,
 	prelude::{BASE64_STANDARD_NO_PAD, BASE64_URL_SAFE_NO_PAD},
 };
+use chrono::DateTime;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::{Client, TwoFASecret, http::ClientConfig, unauth::UnauthClient},
 	fs::{HasName, HasUUID},
 	io::client_impl::IoSharedClientExt,
 	socket::{DecryptedGeneralEvent, DecryptedSocketEvent},
 };
 use filen_types::traits::CowHelpersExt;
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use regex::Regex;
 use scraper::{Html, Selector};
 use test_utils::await_event;
@@ -80,8 +82,22 @@ async fn enable_2fa_for_client(client: &Client, secret: &TwoFASecret) -> String 
 }
 
 #[shared_test_runtime]
+async fn test_wrong_password() {
+	let client = test_utils::RESOURCES.client().await;
+	let unauthed = client.get_unauthed();
+
+	let (email, _, _) = test_utils::RESOURCES.get_credentials();
+	let err = unauthed
+		.login(email, "wrongpassword", "XXXXXX")
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::EmailOrPasswordWrong);
+}
+
+#[shared_test_runtime]
 async fn test_2fa() {
 	let client = test_utils::RESOURCES.client().await;
+	let unauthed = client.get_unauthed();
 
 	let _lock = client.lock_auth().await.unwrap();
 
@@ -89,9 +105,29 @@ async fn test_2fa() {
 
 	let recovery_key = enable_2fa_for_client(&client, &secret).await;
 
+	let (email, password, _) = test_utils::RESOURCES.get_credentials();
+	let code = secret.make_totp_code(DateTime::default()).unwrap();
+
+	let res = std::panic::AssertUnwindSafe(async move {
+		let err = unauthed
+			.login(email.clone(), &password, &code)
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::Wrong2fa);
+
+		let err = unauthed
+			.login(email, &password, "XXXXXX")
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::Enter2fa);
+	})
+	.catch_unwind()
+	.await;
+
 	// we use the recovery key here rather than the 2fa code
 	// to make sure the test doesn't fail due to a race condition
 	client.disable_2fa(&recovery_key).await.unwrap();
+	res.unwrap();
 }
 struct ImapSession {
 	session: imap::Session<std::boxed::Box<dyn imap::ImapConnection>>,

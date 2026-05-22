@@ -31,6 +31,9 @@ impl From<filen_types::error::ResponseError> for Error {
 				Some("wrong_password") => ErrorKind::WrongPassword,
 				Some("max_storage_reached") => ErrorKind::MaxStorageReached,
 				Some("file_not_found") => ErrorKind::FileNotFound,
+				Some("email_or_password_wrong") => ErrorKind::EmailOrPasswordWrong,
+				Some("enter_2fa") => ErrorKind::Enter2fa,
+				Some("wrong_2fa") => ErrorKind::Wrong2fa,
 				_ => ErrorKind::Server,
 			}
 		};
@@ -112,7 +115,7 @@ pub enum ErrorKind {
 	FileChangedDuringSync,
 	/// Specified folder was not found
 	FolderNotFound,
-	/// Incorrect password provided
+	/// Incorrect password provided for a public link
 	WrongPassword,
 	/// Max storage limit reached for the account
 	MaxStorageReached,
@@ -120,6 +123,12 @@ pub enum ErrorKind {
 	FileChunkNotFound,
 	/// File not found by the backend
 	FileNotFound,
+	/// Email or Password was wrong when trying to authenticate
+	EmailOrPasswordWrong,
+	/// Two-factor authentication code is required
+	Enter2fa,
+	/// Two-factor authentication code provided was invalid
+	Wrong2fa,
 }
 
 /// Custom error type for the SDK
