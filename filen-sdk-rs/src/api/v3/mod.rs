@@ -1,5 +1,6 @@
 pub(crate) mod auth;
 pub(crate) mod chat;
+pub(crate) mod confirmation;
 pub(crate) mod contacts;
 pub(crate) mod dir;
 pub(crate) mod file;

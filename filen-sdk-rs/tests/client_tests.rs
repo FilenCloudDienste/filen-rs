@@ -302,9 +302,30 @@ fn activate_account(register_data: &mut RegisterTest, unauth_client: &UnauthClie
 		std::time::Duration::from_secs(30),
 	);
 
+	test_utils::rt().block_on(async {
+		unauth_client
+			.resend_registration_confirmation(&register_data.email)
+			.await
+			.unwrap();
+	});
+
+	let body_2 = await_email(
+		&mut register_data.imap,
+		&register_data.email,
+		"Confirm your email address",
+		20,
+		std::time::Duration::from_secs(30),
+	);
+
 	let activate_regex = Regex::new(r"https:\/\/filen\.io\/activate\/\w+").unwrap();
 
 	let (activate_link, _) = match_regex_in_email_body(&body, &activate_regex);
+	let (second_activate_link, _) = match_regex_in_email_body(&body_2, &activate_regex);
+	assert_eq!(
+		activate_link, second_activate_link,
+		"Multiple different activation links found in email body"
+	);
+
 	test_utils::rt().block_on(async {
 		reqwest::get(activate_link).await.unwrap();
 		let client = unauth_client

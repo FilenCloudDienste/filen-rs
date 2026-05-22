@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod chat;
+pub mod confirmation;
 pub mod contacts;
 pub mod dir;
 pub mod file;

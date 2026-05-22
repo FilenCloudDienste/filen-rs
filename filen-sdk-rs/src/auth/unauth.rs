@@ -321,6 +321,16 @@ impl UnauthClient {
 		)
 		.await
 	}
+
+	pub async fn resend_registration_confirmation(&self, email: &str) -> Result<(), Error> {
+		api::v3::confirmation::send::post(
+			self,
+			&api::v3::confirmation::send::Request {
+				email: Cow::Borrowed(email),
+			},
+		)
+		.await
+	}
 }
 
 enum RegisteredAuthInfo {

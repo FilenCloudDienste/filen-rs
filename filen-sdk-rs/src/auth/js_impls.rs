@@ -358,4 +358,14 @@ impl UnauthJsClient {
 		.await?;
 		Ok(JsClient::new(client))
 	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen(js_name = "resendRegistrationConfirmation")
+	)]
+	pub async fn resend_registration_confirmation(&self, email: String) -> Result<(), Error> {
+		let this = self.inner();
+		do_on_commander(move || async move { this.resend_registration_confirmation(&email).await })
+			.await
+	}
 }
