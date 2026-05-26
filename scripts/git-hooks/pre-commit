@@ -78,8 +78,8 @@ fi
 
 # UniFFI clippy for filen-sdk-rs (matches the mobile bindings build surface).
 if have cargo; then
-	run "cargo clippy -p filen-sdk-rs -F uniffi -- -D warnings" \
-		cargo clippy -p filen-sdk-rs -F uniffi --all-targets -- -D warnings
+	run "cargo clippy -p filen-sdk-rs -F uniffi,http-provider -- -D warnings" \
+		cargo clippy -p filen-sdk-rs -F uniffi,http-provider --all-targets -- -D warnings
 fi
 
 # WASM clippy (matches ci.yml ci-wasm job; run from filen-sdk-rs sub-workspace).

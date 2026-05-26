@@ -659,10 +659,7 @@ mod http_provider_tests {
 		name: &str,
 		contents: &[u8],
 	) -> filen_sdk_rs::fs::file::RemoteFile {
-		let file = client
-			.make_file_builder(name, *test_dir.uuid())
-			.unwrap()
-			.build();
+		let file = client.make_file_builder(name, *test_dir.uuid()).unwrap();
 		client.upload_file(file, contents).await.unwrap()
 	}
 
