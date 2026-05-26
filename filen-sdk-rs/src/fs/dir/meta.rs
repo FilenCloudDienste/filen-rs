@@ -33,10 +33,10 @@ impl<'a> DirectoryMeta<'a> {
 		let Ok(decrypted) = decrypter.blocking_decrypt_meta(&encrypted) else {
 			return Self::Encrypted(encrypted);
 		};
-		let Ok(meta) = serde_json::from_str(&decrypted) else {
+		let Ok(meta) = serde_json::from_str::<DecryptedDirectoryMeta>(&decrypted) else {
 			return Self::DecryptedUTF8(Cow::Owned(decrypted));
 		};
-		Self::Decoded(meta)
+		Self::Decoded(meta.into_owned_cow())
 	}
 
 	pub(crate) fn blocking_from_rsa_encrypted(
@@ -47,13 +47,13 @@ impl<'a> DirectoryMeta<'a> {
 		else {
 			return Self::RSAEncrypted(encrypted);
 		};
-		let Ok(meta) = serde_json::from_slice(decrypted.as_ref()) else {
+		let Ok(meta) = serde_json::from_slice::<DecryptedDirectoryMeta>(decrypted.as_ref()) else {
 			match String::from_utf8(decrypted) {
 				Ok(decrypted) => return Self::DecryptedUTF8(Cow::Owned(decrypted)),
 				Err(err) => return Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
 			}
 		};
-		Self::Decoded(meta)
+		Self::Decoded(meta.into_owned_cow())
 	}
 }
 
@@ -154,6 +154,7 @@ impl<'a> DirectoryMeta<'a> {
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, CowHelpers)]
 pub struct DecryptedDirectoryMeta<'a> {
+	#[serde(borrow)]
 	pub name: Cow<'a, str>,
 	#[serde(
 		with = "filen_types::serde::time::optional",

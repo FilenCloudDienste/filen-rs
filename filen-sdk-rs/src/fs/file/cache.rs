@@ -1,7 +1,10 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
-use filen_types::{crypto::Blake3Hash, fs::ParentUuid, traits::CowHelpers};
+use filen_types::{
+	auth::FileEncryptionVersion, crypto::Blake3Hash, fs::ParentUuid, traits::CowHelpers,
+};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -35,6 +38,90 @@ pub struct CacheableFile<'a> {
 	pub last_modified: DateTime<Utc>,
 	pub created: Option<DateTime<Utc>>,
 	pub hash: Option<Blake3Hash>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializedCacheableFile<'a> {
+	uuid: Uuid,
+	parent: Uuid,
+
+	chunks_size: u64,
+	chunks: u64,
+	favorited: bool,
+	// TODO: dedup this
+	#[serde(borrow)]
+	region: Cow<'a, str>,
+	// TODO: maybe dedup this too
+	#[serde(borrow)]
+	bucket: Cow<'a, str>,
+	timestamp: DateTime<Utc>,
+
+	#[serde(borrow)]
+	name: Cow<'a, str>,
+	size: u64,
+	#[serde(borrow)]
+	mime: Cow<'a, str>,
+	#[serde(borrow)]
+	key: Cow<'a, str>,
+	file_version: FileEncryptionVersion,
+	last_modified: DateTime<Utc>,
+	created: Option<DateTime<Utc>>,
+	hash: Option<Blake3Hash>,
+}
+
+impl<'de> Deserialize<'de> for CacheableFile<'de> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let raw = SerializedCacheableFile::deserialize(deserializer)?;
+		Ok(Self {
+			uuid: raw.uuid,
+			parent: raw.parent,
+			chunks_size: raw.chunks_size,
+			chunks: raw.chunks,
+			favorited: raw.favorited,
+			region: raw.region,
+			bucket: raw.bucket,
+			timestamp: raw.timestamp,
+			name: raw.name,
+			size: raw.size,
+			mime: raw.mime,
+			key: FileKey::from_str_with_version(&raw.key, raw.file_version)
+				.map_err(serde::de::Error::custom)?,
+			last_modified: raw.last_modified,
+			created: raw.created,
+			hash: raw.hash,
+		})
+	}
+}
+
+impl Serialize for CacheableFile<'_> {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		let key_str = self.key.to_str();
+		SerializedCacheableFile {
+			uuid: self.uuid,
+			parent: self.parent,
+			chunks_size: self.chunks_size,
+			chunks: self.chunks,
+			favorited: self.favorited,
+			region: Cow::Borrowed(&self.region),
+			bucket: Cow::Borrowed(&self.bucket),
+			timestamp: self.timestamp,
+			name: Cow::Borrowed(&self.name),
+			size: self.size,
+			mime: Cow::Borrowed(&self.mime),
+			key: Cow::Borrowed(key_str.as_ref()),
+			file_version: self.key.version(),
+			last_modified: self.last_modified,
+			created: self.created,
+			hash: self.hash,
+		}
+		.serialize(serializer)
+	}
 }
 
 impl TryFrom<RemoteFile> for CacheableFile<'static> {

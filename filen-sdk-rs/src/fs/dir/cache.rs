@@ -2,18 +2,21 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid, traits::CowHelpers};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Error, fs::dir::meta::DirectoryMeta, io::RemoteDirectory};
 
-#[derive(Clone, Debug, PartialEq, Eq, CowHelpers)]
+#[derive(Clone, Debug, PartialEq, Eq, CowHelpers, Serialize, Deserialize)]
 pub struct CacheableDir<'a> {
 	pub uuid: Uuid,
 	pub parent: Uuid,
+	#[serde(borrow)]
 	pub color: DirColor<'a>,
 	pub favorited: bool,
 	pub timestamp: DateTime<Utc>,
 
+	#[serde(borrow)]
 	pub name: Cow<'a, str>,
 	pub created: Option<DateTime<Utc>>,
 }

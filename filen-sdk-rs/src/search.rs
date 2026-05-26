@@ -4,7 +4,10 @@ use std::{
 	collections::{HashSet, VecDeque},
 };
 
-use filen_types::api::v3::search::{add::SearchAddItem, find::SearchFindItem};
+use filen_types::{
+	api::v3::search::{add::SearchAddItem, find::SearchFindItem},
+	traits::CowHelpers,
+};
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
@@ -225,7 +228,7 @@ impl Client {
 								Some(
 									match serde_json::from_str::<DecryptedDirectoryMeta>(&decrypted)
 									{
-										Ok(meta) => Ok(meta),
+										Ok(meta) => Ok(meta.into_owned_cow()),
 										Err(e) => Err(e.into()),
 									},
 								)
