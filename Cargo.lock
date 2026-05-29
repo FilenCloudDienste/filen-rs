@@ -1792,7 +1792,7 @@ dependencies = [
  "filen-types",
  "futures",
  "futures-timer",
- "generic-array 1.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "generic-array 1.4.2",
  "getrandom 0.2.16",
  "getrandom 0.4.2",
  "governor",
@@ -1885,7 +1885,7 @@ dependencies = [
  "const-hex",
  "digest",
  "filen-macros",
- "generic-array 1.4.1 (git+https://github.com/Enduriel/generic-array?rev=7a5e0764d4cef9e7fa767fddc7c75bc2ceb743b8)",
+ "generic-array 1.4.2",
  "rand 0.9.2",
  "rkyv",
  "rsa",
@@ -2133,18 +2133,9 @@ dependencies = [
 
 [[package]]
 name = "generic-array"
-version = "1.4.1"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab9e9188e97a93276e1fe7b56401b851e2b45a46d045ca658100c1303ada649"
-dependencies = [
- "rustversion",
- "typenum",
-]
-
-[[package]]
-name = "generic-array"
-version = "1.4.1"
-source = "git+https://github.com/Enduriel/generic-array?rev=7a5e0764d4cef9e7fa767fddc7c75bc2ceb743b8#7a5e0764d4cef9e7fa767fddc7c75bc2ceb743b8"
+checksum = "fb130435a959a8d525e6bca66ff6c40981a300ee96d70e3ef56f046556d614a3"
 dependencies = [
  "bytecheck",
  "rkyv",
