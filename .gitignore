@@ -2,3 +2,4 @@
 .env
 .DS_store
 *.local.*
+.vscode/
