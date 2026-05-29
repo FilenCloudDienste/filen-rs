@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, parse_quote, Data, DeriveInput, Type};
+use syn::{Data, DeriveInput, Type, parse_macro_input, parse_quote};
 
 /// Wires up the rkyv "archived form is the type itself" traits for a struct or
 /// enum.

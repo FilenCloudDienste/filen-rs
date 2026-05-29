@@ -18,13 +18,7 @@ use traits::EventListenerCallback;
 
 pub(crate) use thread_handling::WebSocketHandle;
 
-pub use {
-	events::{
-		DecryptedChatEvent, DecryptedContactEvent, DecryptedDriveEvent, DecryptedGeneralEvent,
-		DecryptedNoteEvent, DecryptedSocketEvent,
-	},
-	thread_handling::ListenerHandle,
-};
+pub use {events::*, thread_handling::ListenerHandle};
 
 impl Client {
 	pub async fn add_event_listener(
