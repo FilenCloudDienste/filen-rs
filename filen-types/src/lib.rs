@@ -4,6 +4,7 @@ pub mod auth;
 pub mod crypto;
 pub mod error;
 pub mod fs;
+pub mod rkyv;
 pub mod serde;
 pub mod traits;
 #[cfg(feature = "uniffi")]

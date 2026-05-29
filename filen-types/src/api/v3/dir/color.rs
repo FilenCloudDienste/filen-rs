@@ -12,7 +12,18 @@ pub struct Request<'a> {
 	pub color: DirColor<'a>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, CowHelpers)]
+#[derive(
+	Debug,
+	Clone,
+	PartialEq,
+	Eq,
+	Serialize,
+	Default,
+	CowHelpers,
+	rkyv::Serialize,
+	rkyv::Deserialize,
+	rkyv::Archive,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum DirColor<'a> {
 	#[default]

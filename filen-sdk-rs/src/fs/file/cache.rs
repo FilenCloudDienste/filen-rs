@@ -2,8 +2,10 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::{
-	auth::FileEncryptionVersion, crypto::Blake3Hash, fs::ParentUuid, traits::CowHelpers,
+	auth::FileEncryptionVersion, crypto::Blake3Hash, fs::ParentUuid,
+	rkyv::date_time::DateTimeUtcDef, traits::CowHelpers,
 };
+use rkyv::with::Map;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -17,7 +19,9 @@ use crate::{
 	io::RemoteFile,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, CowHelpers)]
+#[derive(
+	Clone, Debug, PartialEq, Eq, CowHelpers, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
+)]
 pub struct CacheableFile<'a> {
 	pub uuid: Uuid,
 	pub parent: Uuid,
@@ -29,13 +33,16 @@ pub struct CacheableFile<'a> {
 	pub region: Cow<'a, str>,
 	// TODO: maybe dedup this too
 	pub bucket: Cow<'a, str>,
+	#[rkyv(with = DateTimeUtcDef)]
 	pub timestamp: DateTime<Utc>,
 
 	pub name: Cow<'a, str>,
 	pub size: u64,
 	pub mime: Cow<'a, str>,
 	pub key: FileKey,
+	#[rkyv(with = DateTimeUtcDef)]
 	pub last_modified: DateTime<Utc>,
+	#[rkyv(with = Map<DateTimeUtcDef>)]
 	pub created: Option<DateTime<Utc>>,
 	pub hash: Option<Blake3Hash>,
 }

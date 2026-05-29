@@ -1,23 +1,28 @@
 use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
-use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid, traits::CowHelpers};
-use serde::{Deserialize, Serialize};
+use filen_types::{
+	api::v3::dir::color::DirColor, fs::ParentUuid, rkyv::date_time::DateTimeUtcDef,
+	traits::CowHelpers,
+};
+use rkyv::with::Map;
 use uuid::Uuid;
 
 use crate::{Error, fs::dir::meta::DirectoryMeta, io::RemoteDirectory};
 
-#[derive(Clone, Debug, PartialEq, Eq, CowHelpers, Serialize, Deserialize)]
+#[derive(
+	Clone, Debug, PartialEq, Eq, CowHelpers, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
+)]
 pub struct CacheableDir<'a> {
 	pub uuid: Uuid,
 	pub parent: Uuid,
-	#[serde(borrow)]
 	pub color: DirColor<'a>,
 	pub favorited: bool,
+	#[rkyv(with = DateTimeUtcDef)]
 	pub timestamp: DateTime<Utc>,
 
-	#[serde(borrow)]
 	pub name: Cow<'a, str>,
+	#[rkyv(with = Map<DateTimeUtcDef>)]
 	pub created: Option<DateTime<Utc>>,
 }
 
