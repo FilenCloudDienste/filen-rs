@@ -107,10 +107,7 @@ axum-extra = { version = "0.12.5", features = [
 unicode-normalization = "0.1.25"
 typenum = "1.20.0"
 url = "2.5.7"
-# Local fork: WASM-compatible feature split (see https://github.com/mindeng/nom-exif/issues/52)
-nom-exif = { git = "https://github.com/Enduriel/nom-exif.git", rev = "ba2a417fa6504c96952098d61c3fac0460074a30", features = [
-	"tokio",
-] }
+nom-exif = { version = "3.6.0", features = ["tokio"] }
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
