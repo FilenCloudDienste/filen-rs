@@ -108,6 +108,7 @@ unicode-normalization = "0.1.25"
 typenum = "1.20.0"
 url = "2.5.7"
 nom-exif = { version = "3.6.0", features = ["tokio"] }
+rkyv = { version = "0.8.16", features = ["uuid-1"] }
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]

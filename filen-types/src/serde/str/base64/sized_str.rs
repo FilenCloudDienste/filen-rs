@@ -1,13 +1,39 @@
 use std::{mem::MaybeUninit, ops::Deref};
 
+use filen_macros::rkyv_self;
 use generic_array::{ArrayLength, GenericArray};
 use rand::Rng;
+use rkyv::{
+	bytecheck::CheckBytes,
+	rancor::{Fallible, ResultExt, Source},
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ConversionError, serde::str::SizedStr};
+use crate::{
+	error::{ConversionError, TransparentError},
+	serde::str::SizedStr,
+};
 
+// `no_check_bytes`: the archived bytes must be valid UTF-8 *and* contain only
+// base64url alphabet characters — stricter than the inner `SizedStr<N>` — so the
+// hand-written `CheckBytes` below is kept rather than delegating to the field.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[rkyv_self(no_check_bytes)]
 pub struct SizedStrBase64Chars<N: ArrayLength>(SizedStr<N>);
+
+unsafe impl<N: ArrayLength, C: Fallible + ?Sized> CheckBytes<C> for SizedStrBase64Chars<N>
+where
+	C::Error: Source,
+{
+	unsafe fn check_bytes(value: *const Self, context: &mut C) -> Result<(), C::Error> {
+		unsafe { SizedStr::<N>::check_bytes(value.cast(), context).into_error()? };
+		let bytes = unsafe { &*(value as *const SizedStr<N>) };
+		match <&Self>::try_from(bytes) {
+			Err(e) => Err(TransparentError::new(e)).into_error(),
+			Ok(_) => Ok(()),
+		}
+	}
+}
 
 impl<N: ArrayLength> SizedStrBase64Chars<N> {
 	pub fn ref_from_str(s: &str) -> Result<&Self, ConversionError> {
@@ -153,6 +179,8 @@ impl<N: ArrayLength> SizedStrBase64Chars<N> {
 
 #[cfg(test)]
 mod tests {
+	use std::{error::Error, str::Utf8Error};
+
 	use super::*;
 	use generic_array::typenum::{U0, U1, U5, U16, U64, U256, U512, U1000, U2048, U10000};
 
@@ -248,5 +276,67 @@ mod tests {
 			"expected full coverage of the alphabet, only saw {} distinct chars",
 			unique.len()
 		);
+	}
+
+	#[test]
+	fn rkyv_round_trip_ascii() {
+		let original = <&SizedStrBase64Chars<U5>>::try_from("12345").unwrap();
+		let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(original).unwrap();
+		let decoded =
+			rkyv::from_bytes::<SizedStrBase64Chars<U5>, rkyv::rancor::Error>(&bytes).unwrap();
+		assert_eq!(&decoded, original);
+	}
+
+	#[test]
+	fn rkyv_round_trip_zero_length() {
+		let original = <&SizedStrBase64Chars<U0>>::try_from("").unwrap();
+		let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(original).unwrap();
+		let decoded =
+			rkyv::from_bytes::<SizedStrBase64Chars<U0>, rkyv::rancor::Error>(&bytes).unwrap();
+		assert_eq!(&decoded, original);
+	}
+
+	#[test]
+	fn rkyv_rejects_invalid_utf8() {
+		// The archived form of `SizedStrBase64Chars<U5>` is the bare 5 UTF-8 bytes (no header).
+		// `0xC3` starts a 2-byte sequence but `0x28` is not a valid continuation byte.
+		let invalid: [u8; 5] = [0x00, 0x00, 0xC3, 0x28, 0x00];
+		let res = rkyv::from_bytes::<SizedStrBase64Chars<U5>, rkyv::rancor::BoxedError>(&invalid);
+		assert!(res.is_err(), "expected UTF-8 validation to reject input");
+		let err = res.unwrap_err();
+		println!("rkyv error: {err}");
+		let source = err.source().unwrap();
+
+		let utf8_err = source.downcast_ref::<Utf8Error>().unwrap();
+
+		assert_eq!(
+			utf8_err.valid_up_to(),
+			2,
+			"expected UTF-8 error to indicate failure at the first byte"
+		);
+	}
+
+	#[test]
+	fn rkyv_rejects_non_base64() {
+		let invalid = b"1234$";
+		let res = rkyv::from_bytes::<SizedStrBase64Chars<U5>, rkyv::rancor::BoxedError>(invalid);
+		assert!(res.is_err(), "expected base64 validation to reject input");
+		let err = res.unwrap_err();
+
+		let source = err.source().unwrap();
+		let conv_err = source.downcast_ref::<ConversionError>().unwrap();
+		match conv_err {
+			ConversionError::Base64DecodeError(base64::DecodeError::InvalidByte(idx, byte)) => {
+				assert_eq!(
+					*idx, 4,
+					"expected invalid byte index to be 4 (the position of '$')"
+				);
+				assert_eq!(
+					*byte, b'$',
+					"expected invalid byte to be b'$' (the offending character)"
+				);
+			}
+			_ => panic!("expected a Base64DecodeError with InvalidByte variant"),
+		}
 	}
 }

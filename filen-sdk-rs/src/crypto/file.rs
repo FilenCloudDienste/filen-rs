@@ -1,5 +1,6 @@
 use std::{fmt::Debug, str::FromStr};
 
+use filen_macros::rkyv_self;
 use filen_types::{auth::FileEncryptionVersion, serde::str::SizedStr};
 use serde::{Serialize, de::DeserializeSeed};
 use typenum::U64;
@@ -9,6 +10,8 @@ use crate::{Error, ErrorKind, auth::AuthInfo, crypto::v1};
 use super::{error::ConversionError, shared::DataCrypter, v2, v3};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[rkyv_self(no_check_bytes)]
+#[repr(u8)]
 pub enum FileKey {
 	V1(v1::FileKey),
 	V2(v2::FileKey),

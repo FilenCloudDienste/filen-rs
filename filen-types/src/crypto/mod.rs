@@ -2,6 +2,7 @@ pub mod rsa;
 use std::borrow::{Borrow, Cow};
 
 use base64::prelude::*;
+use filen_macros::rkyv_self;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use typenum::{U32, U64};
@@ -156,6 +157,7 @@ pub struct EncryptedMetaKey<'a>(pub EncryptedString<'a>);
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(transparent)]
+#[rkyv_self]
 pub struct Blake3Hash(SizedHexString<U32>);
 
 #[cfg(feature = "uniffi")]
@@ -274,5 +276,161 @@ impl AsRef<[u8; 64]> for Sha512Hash {
 impl From<Sha512Hash> for SizedHexString<U64> {
 	fn from(hash: Sha512Hash) -> Self {
 		hash.0
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::Blake3Hash;
+	use crate::serde::str::SizedHexString;
+	use filen_macros::rkyv_self;
+	use generic_array::ArrayLength;
+	use rkyv::rancor::Error;
+	use typenum::U32;
+
+	#[test]
+	fn blake3_hash_rkyv_round_trip() {
+		let original = Blake3Hash::from([0xABu8; 32]);
+		let bytes = rkyv::to_bytes::<Error>(&original).unwrap();
+		let decoded = rkyv::from_bytes::<Blake3Hash, Error>(&bytes).unwrap();
+		assert_eq!(decoded, original);
+	}
+
+	#[test]
+	fn blake3_hash_archived_form_is_identical_bytes() {
+		// `#[rkyv_self]` pins the archived form to the type itself (`as = Self`) over a
+		// `#[repr(transparent)]` wrapper, so the buffer must be exactly the 32 raw bytes
+		// with no rkyv header or padding.
+		let raw = [0x12u8; 32];
+		let hash = Blake3Hash::from(raw);
+		let bytes = rkyv::to_bytes::<Error>(&hash).unwrap();
+		assert_eq!(bytes.len(), 32);
+		assert_eq!(bytes.as_slice(), &raw);
+	}
+
+	#[test]
+	fn blake3_hash_validated_access_round_trips() {
+		// `rkyv::access` runs the generated `CheckBytes` impl (which delegates to the
+		// inner `SizedHexString`), exercising validation rather than unchecked access.
+		let original = Blake3Hash::from([0x7Fu8; 32]);
+		let bytes = rkyv::to_bytes::<Error>(&original).unwrap();
+		let archived = rkyv::access::<Blake3Hash, Error>(&bytes).unwrap();
+		assert_eq!(*archived, original);
+	}
+
+	// Exercises the generic codegen path of `#[rkyv_self]`, which `Blake3Hash` (being
+	// non-generic) does not cover. `SizedHexString<N>` is `Portable`, archives `as =
+	// Self`, and implements `CheckBytes`, satisfying the bounds the macro generates.
+	#[rkyv_self]
+	struct GenericWrapper<N: ArrayLength>(SizedHexString<N>);
+
+	#[test]
+	fn rkyv_self_generic_wrapper_round_trips() {
+		let original = GenericWrapper::<U32>(SizedHexString::<U32>::from([0x5Au8; 32]));
+		let bytes = rkyv::to_bytes::<Error>(&original).unwrap();
+		let decoded = rkyv::from_bytes::<GenericWrapper<U32>, Error>(&bytes).unwrap();
+		assert_eq!(decoded.0, original.0);
+	}
+
+	// Exercises the path where `#[repr(transparent)]` is written explicitly: the
+	// macro must accept it as-is rather than adding a duplicate or erroring.
+	#[rkyv_self]
+	#[repr(transparent)]
+	struct ExplicitReprWrapper(SizedHexString<U32>);
+
+	#[test]
+	fn rkyv_self_accepts_explicit_repr_transparent() {
+		let original = ExplicitReprWrapper(SizedHexString::<U32>::from([0x01u8; 32]));
+		let bytes = rkyv::to_bytes::<Error>(&original).unwrap();
+		let decoded = rkyv::from_bytes::<ExplicitReprWrapper, Error>(&bytes).unwrap();
+		assert_eq!(decoded.0, original.0);
+	}
+
+	// Multi-field struct: the macro adds `#[repr(C)]` and the derived `CheckBytes`
+	// validates each field. Both field types archive as themselves (`SizedHexString`
+	// via `#[rkyv_self]`, `u8` natively) and are `Portable`.
+	#[rkyv_self]
+	#[derive(PartialEq, Eq, Debug)]
+	struct MultiField {
+		hash: SizedHexString<U32>,
+		tag: u8,
+	}
+
+	#[test]
+	fn rkyv_self_multi_field_struct_round_trips() {
+		let original = MultiField {
+			hash: SizedHexString::<U32>::from([0x33u8; 32]),
+			tag: 7,
+		};
+		let bytes = rkyv::to_bytes::<Error>(&original).unwrap();
+		// `rkyv::access` runs the derived per-field `CheckBytes`.
+		let archived = rkyv::access::<MultiField, Error>(&bytes).unwrap();
+		assert_eq!(archived, &original);
+		let decoded = rkyv::from_bytes::<MultiField, Error>(&bytes).unwrap();
+		assert_eq!(decoded, original);
+	}
+
+	// Enum: requires an explicit primitive `repr`; the derived `CheckBytes`
+	// validates the discriminant and the active variant's fields.
+	#[rkyv_self]
+	#[derive(PartialEq, Eq, Debug)]
+	#[repr(u8)]
+	enum Tagged {
+		Empty,
+		Hash(SizedHexString<U32>),
+		Byte(u8),
+	}
+
+	#[test]
+	fn rkyv_self_enum_round_trips() {
+		for original in [
+			Tagged::Empty,
+			Tagged::Hash(SizedHexString::<U32>::from([0x44u8; 32])),
+			Tagged::Byte(9),
+		] {
+			let bytes = rkyv::to_bytes::<Error>(&original).unwrap();
+			let archived = rkyv::access::<Tagged, Error>(&bytes).unwrap();
+			assert_eq!(archived, &original);
+			let decoded = rkyv::from_bytes::<Tagged, Error>(&bytes).unwrap();
+			assert_eq!(decoded, original);
+		}
+	}
+
+	#[test]
+	fn rkyv_self_enum_rejects_invalid_discriminant() {
+		// `#[repr(u8)]` puts the discriminant in the first byte; this enum has three
+		// variants (0..=2), so 99 matches none and the derived `CheckBytes` must reject it.
+		let mut bytes = rkyv::to_bytes::<Error>(&Tagged::Byte(5)).unwrap().to_vec();
+		bytes[0] = 99;
+		assert!(rkyv::access::<Tagged, Error>(&bytes).is_err());
+	}
+
+	// Named-field enum variants (`Variant { field: T }`) go through a distinct code
+	// path in rkyv's/bytecheck's derives than the tuple/unit variants above, so they
+	// get their own round-trip (which also exercises the derived `CheckBytes`).
+	#[rkyv_self]
+	#[derive(PartialEq, Eq, Debug)]
+	#[repr(u8)]
+	enum NamedVariant {
+		Empty,
+		WithHash { hash: SizedHexString<U32> },
+		WithByte { tag: u8 },
+	}
+
+	#[test]
+	fn rkyv_self_enum_named_field_variant_round_trips() {
+		for original in [
+			NamedVariant::Empty,
+			NamedVariant::WithHash {
+				hash: SizedHexString::<U32>::from([0x55u8; 32]),
+			},
+			NamedVariant::WithByte { tag: 42 },
+		] {
+			let bytes = rkyv::to_bytes::<Error>(&original).unwrap();
+			let archived = rkyv::access::<NamedVariant, Error>(&bytes).unwrap();
+			assert_eq!(archived, &original);
+			let decoded = rkyv::from_bytes::<NamedVariant, Error>(&bytes).unwrap();
+			assert_eq!(decoded, original);
+		}
 	}
 }

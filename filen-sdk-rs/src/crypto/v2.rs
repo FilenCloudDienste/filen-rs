@@ -6,6 +6,7 @@ use aes_gcm::{
 	aes::Aes256,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
+use filen_macros::rkyv_self;
 use filen_types::{
 	api::v3::dir::link::info::LinkPasswordSalt,
 	crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString},
@@ -322,6 +323,7 @@ impl TryFrom<String> for MasterKey {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
+#[rkyv_self]
 pub struct FileKey {
 	encryption_key: SizedStr<U32>,
 }

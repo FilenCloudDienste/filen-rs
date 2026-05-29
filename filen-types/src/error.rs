@@ -22,3 +22,26 @@ pub enum ResponseError {
 		code: Option<String>,
 	},
 }
+
+#[derive(Debug)]
+pub(crate) struct TransparentError<T>(T);
+
+impl<T> TransparentError<T> {
+	pub(crate) fn new(inner: T) -> Self {
+		Self(inner)
+	}
+}
+
+impl<T: core::fmt::Display> core::fmt::Display for TransparentError<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}", self.0)
+	}
+}
+
+impl<T: core::error::Error + core::fmt::Debug + 'static> core::error::Error
+	for TransparentError<T>
+{
+	fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+		Some(&self.0)
+	}
+}

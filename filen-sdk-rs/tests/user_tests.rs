@@ -314,7 +314,7 @@ async fn events_file_upload_trash_restore_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FileUploaded(info)
-				if file_meta_name(&info.metadata) == Some(&file_name) =>
+				if file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -332,7 +332,7 @@ async fn events_file_upload_trash_restore_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FileTrash(info)
-				if file_meta_name(&info.metadata) == Some(&file_name) =>
+				if file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -350,7 +350,7 @@ async fn events_file_upload_trash_restore_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FileRestored(info)
-				if file_meta_name(&info.metadata) == Some(&file_name) =>
+				if file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -368,7 +368,7 @@ async fn events_file_upload_trash_restore_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::DeleteFilePermanently(info)
-				if file_meta_name(&info.metadata) == Some(&file_name) =>
+				if file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -408,8 +408,8 @@ async fn events_file_metadata_changed_and_move() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FileMetadataChanged(info)
-				if file_meta_name(&info.metadata) == Some(&new_name)
-					&& file_meta_name(&info.old_metadata) == Some(&original_name) =>
+				if file_meta_name(&info.metadata) == Some(new_name.as_str())
+					&& file_meta_name(&info.old_metadata) == Some(original_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -436,7 +436,7 @@ async fn events_file_metadata_changed_and_move() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FileMoved(info)
-				if file_meta_name(&info.metadata) == Some(&new_name) =>
+				if file_meta_name(&info.metadata) == Some(new_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -479,7 +479,7 @@ async fn events_file_versioned_on_duplicate_upload() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FileVersioned(info)
-				if file_meta_name(&info.metadata) == Some(&file_name) =>
+				if file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -512,7 +512,7 @@ async fn events_folder_creation_rename_color_change() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::SubFolderCreated(info)
-				if dir_meta_name(&info.name) == Some(&folder_name) =>
+				if dir_meta_name(&info.name) == Some(folder_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -537,8 +537,8 @@ async fn events_folder_creation_rename_color_change() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FolderMetadataChanged(info)
-				if dir_meta_name(&info.name) == Some(&new_name)
-					&& dir_meta_name(&info.old_name) == Some(&folder_name) =>
+				if dir_meta_name(&info.name) == Some(new_name.as_str())
+					&& dir_meta_name(&info.old_name) == Some(folder_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -560,7 +560,7 @@ async fn events_folder_creation_rename_color_change() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FolderColorChanged(info)
-				if dir_meta_name(&info.name) == Some(&new_name) =>
+				if dir_meta_name(&info.name) == Some(new_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -589,7 +589,7 @@ async fn events_folder_trash_restore_move_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FolderTrash(info)
-				if dir_meta_name(&info.name) == Some(&folder_name) =>
+				if dir_meta_name(&info.name) == Some(folder_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -607,7 +607,7 @@ async fn events_folder_trash_restore_move_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FolderRestored(info)
-				if dir_meta_name(&info.name) == Some(&folder_name) =>
+				if dir_meta_name(&info.name) == Some(folder_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -632,7 +632,7 @@ async fn events_folder_trash_restore_move_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::FolderMoved(info)
-				if dir_meta_name(&info.name) == Some(&folder_name) =>
+				if dir_meta_name(&info.name) == Some(folder_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -650,7 +650,7 @@ async fn events_folder_trash_restore_move_delete() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::DeleteFolderPermanently(info)
-				if dir_meta_name(&info.name) == Some(&folder_name) =>
+				if dir_meta_name(&info.name) == Some(folder_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -683,7 +683,7 @@ async fn events_item_favorite() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::ItemFavorite(info)
-				if info.value && file_meta_name(&info.metadata) == Some(&file_name) =>
+				if info.value && file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
 			{
 				Some(info.clone())
 			}
@@ -701,7 +701,7 @@ async fn events_item_favorite() {
 		since,
 		|event| match &event.kind {
 			DecryptedUserEventKind::ItemFavorite(info)
-				if !info.value && file_meta_name(&info.metadata) == Some(&file_name) =>
+				if !info.value && file_meta_name(&info.metadata) == Some(file_name.as_str()) =>
 			{
 				Some(info.clone())
 			}

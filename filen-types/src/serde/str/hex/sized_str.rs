@@ -1,12 +1,17 @@
 use std::{marker::PhantomData, ops::Mul};
 
+use filen_macros::rkyv_self;
 use generic_array::{ArrayLength, GenericArray, IntoArrayLength, typenum::Const};
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use typenum::{Prod, U2};
 
 use crate::serde::str::SizedStr;
 
+// `no_check_bytes`: the archived form is raw bytes that are always valid, so the
+// hand-written no-op `CheckBytes` below is kept rather than delegating to the
+// inner field (which would pull in its `CheckBytes` bound for no benefit).
 #[derive(Clone, PartialEq, Eq, Hash)]
+#[rkyv_self]
 pub struct SizedHexString<N: ArrayLength>(pub(in super::super) GenericArray<u8, N>);
 
 impl<N: ArrayLength> Copy for SizedHexString<N> where N::ArrayType<u8>: Copy {}
@@ -120,7 +125,7 @@ mod tests {
 	use generic_array::GenericArray;
 	use std::collections::hash_map::DefaultHasher;
 	use std::hash::{Hash, Hasher};
-	use typenum::{U0, U1, U2, U4, U8, U16, U32};
+	use typenum::{U0, U1, U2, U4, U5, U8, U16, U32};
 
 	fn hash_of<T: Hash>(t: &T) -> u64 {
 		let mut h = DefaultHasher::new();
@@ -528,5 +533,23 @@ mod tests {
 		let with_prefix: SizedHexString<U4> = serde_json::from_str("\"0xdeadbeef\"").unwrap();
 		let without: SizedHexString<U4> = serde_json::from_str("\"deadbeef\"").unwrap();
 		assert_eq!(with_prefix, without);
+	}
+
+	// ---------- rkyv round-trip ----------------------------------------------
+
+	#[test]
+	fn rkyv_round_trip() {
+		let original = SizedHexString::<U5>::new_from_hex_str("aaabacadae").unwrap();
+		let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+		let decoded = rkyv::from_bytes::<SizedHexString<U5>, rkyv::rancor::Error>(&bytes).unwrap();
+		assert_eq!(decoded, original);
+	}
+
+	#[test]
+	fn rkyv_round_trip_zero_length() {
+		let original = SizedHexString::<U0>::new_from_hex_str("").unwrap();
+		let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&original).unwrap();
+		let decoded = rkyv::from_bytes::<SizedHexString<U0>, rkyv::rancor::Error>(&bytes).unwrap();
+		assert_eq!(decoded, original);
 	}
 }

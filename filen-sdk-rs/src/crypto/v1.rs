@@ -5,6 +5,7 @@ use aes_gcm::aes::{self};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use filen_macros::rkyv_self;
 use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
 use filen_types::crypto::{DerivedPassword, EncryptedString};
 use filen_types::serde::str::{SizedHexString, SizedStr};
@@ -152,6 +153,7 @@ impl V2Key {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
+#[rkyv_self]
 pub struct FileKey {
 	key: SizedStr<U32>,
 }

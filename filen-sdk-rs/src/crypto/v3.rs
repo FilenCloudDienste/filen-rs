@@ -6,6 +6,7 @@ use aes_gcm::{
 	aes::Aes256,
 };
 use base64::{Engine, prelude::BASE64_STANDARD};
+use filen_macros::rkyv_self;
 use filen_types::{
 	api::v3::dir::link::info::LinkPasswordSalt,
 	crypto::{DerivedPassword, EncryptedString},
@@ -30,6 +31,7 @@ pub const ARGON2_PARAMS: argon2::Params = match argon2::Params::new(65536, 3, 4,
 
 #[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
+#[rkyv_self]
 pub struct EncryptionKey {
 	hex_string: SizedHexString<U32>,
 }
