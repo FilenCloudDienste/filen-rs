@@ -91,6 +91,7 @@ pub(crate) mod empty_notempty {
 		}
 	}
 
+	#[allow(dead_code)]
 	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
 	where
 		D: Deserializer<'de>,

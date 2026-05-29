@@ -7,8 +7,7 @@ use typenum::{U32, U256};
 use crate::{
 	crypto::EncryptedString,
 	fs::UuidStr,
-	serde::str::{SizedHexString, SizedStringBase64Chars},
-	traits::CowHelpers,
+	serde::str::{SizedHexString, SizedStrBase64Chars},
 };
 
 pub const ENDPOINT: &str = "v3/dir/link/info";
@@ -24,38 +23,36 @@ pub struct Response<'a> {
 	pub parent: UuidStr,
 	pub metadata: EncryptedString<'a>,
 	pub has_password: bool,
-	pub salt: Option<LinkPasswordSalt<'a>>,
+	pub salt: Option<LinkPasswordSalt>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub download_btn: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, CowHelpers, Default)]
-pub enum LinkPasswordSalt<'a> {
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LinkPasswordSalt {
 	#[default]
 	None,
-	V2(SizedStringBase64Chars<'a, U32>),
+	V2(Box<SizedStrBase64Chars<U32>>),
 	V3(Box<SizedHexString<U256>>),
 }
 
-pub type LinkPasswordSaltOwned = LinkPasswordSalt<'static>;
-
 #[cfg(feature = "uniffi")]
 uniffi::custom_type!(
-	LinkPasswordSaltOwned,
+	LinkPasswordSalt,
 	String, {
-	lower: |v: &LinkPasswordSaltOwned| v.to_string(),
+	lower: |v: &LinkPasswordSalt| v.to_string(),
 	try_lift: |v: String| {
-		LinkPasswordSaltOwned::from_cow(Cow::Owned(v)).map_err(|e| uniffi::deps::anyhow::anyhow!(e))
+		LinkPasswordSalt::from_cow(Cow::Owned(v)).map_err(|e| uniffi::deps::anyhow::anyhow!(e))
 	}}
 );
 
-impl<'de> LinkPasswordSalt<'de> {
-	fn from_cow(s: Cow<'de, str>) -> Result<Self, String> {
+impl LinkPasswordSalt {
+	fn from_cow(s: Cow<'_, str>) -> Result<Self, String> {
 		Ok(match s {
 			salt if salt.len() <= 1 => Self::None,
 			salt if salt.len() == 32 => Self::V2(
-				SizedStringBase64Chars::try_from(salt)
+				<Box<SizedStrBase64Chars<U32>>>::try_from(salt.into_owned())
 					.map_err(|e| format!("invalid V2 salt: {e}"))?,
 			),
 			salt if salt.len() == 512 => Self::V3(Box::new(
@@ -77,8 +74,11 @@ impl<'de> LinkPasswordSalt<'de> {
 			Self::V3(s) => s.to_string(),
 		}
 	}
+}
 
-	fn deserialize_ref<D>(deserializer: D) -> Result<Self, D::Error>
+// we do this for now because we're still not using yoke everywhere
+impl<'de> Deserialize<'de> for LinkPasswordSalt {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
 	where
 		D: serde::Deserializer<'de>,
 	{
@@ -86,17 +86,7 @@ impl<'de> LinkPasswordSalt<'de> {
 	}
 }
 
-// we do this for now because we're still not using yoke everywhere
-impl<'de> Deserialize<'de> for LinkPasswordSalt<'_> {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		LinkPasswordSalt::deserialize_ref(deserializer).map(|v| v.into_owned_cow())
-	}
-}
-
-impl Serialize for LinkPasswordSalt<'_> {
+impl Serialize for LinkPasswordSalt {
 	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: serde::Serializer,

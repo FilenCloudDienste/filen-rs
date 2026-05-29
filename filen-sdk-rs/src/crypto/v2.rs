@@ -9,7 +9,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::{
 	api::v3::dir::link::info::LinkPasswordSalt,
 	crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString},
-	serde::str::{SizedHexString, SizedStringBase64Chars, StackSizedString},
+	serde::str::{SizedHexString, SizedStr, SizedStrBase64Chars},
 };
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rand::distr::Distribution;
@@ -323,7 +323,7 @@ impl TryFrom<String> for MasterKey {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FileKey {
-	encryption_key: StackSizedString<U32>,
+	encryption_key: SizedStr<U32>,
 }
 
 impl core::fmt::Display for FileKey {
@@ -336,7 +336,7 @@ impl FromStr for FileKey {
 	type Err = ConversionError;
 	fn from_str(key: &str) -> Result<Self, Self::Err> {
 		Ok(Self {
-			encryption_key: StackSizedString::try_from(key)?,
+			encryption_key: *SizedStr::ref_from_str(key)?,
 		})
 	}
 }
@@ -393,7 +393,7 @@ pub(crate) fn derive_password_and_mk(
 	Ok((master_key, derived_password))
 }
 
-pub(crate) fn make_link_salt() -> LinkPasswordSalt<'static> {
+pub(crate) fn make_link_salt() -> LinkPasswordSalt {
 	let mut rng = rand::rng();
-	LinkPasswordSalt::V2(SizedStringBase64Chars::new_random(&mut rng))
+	LinkPasswordSalt::V2(Box::new(SizedStrBase64Chars::new_random(&mut rng)))
 }

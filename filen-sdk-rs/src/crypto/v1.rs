@@ -7,7 +7,7 @@ use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
 use filen_types::crypto::{DerivedPassword, EncryptedString};
-use filen_types::serde::str::{SizedHexString, StackSizedString};
+use filen_types::serde::str::{SizedHexString, SizedStr};
 use md2::{Digest, Md2};
 use md4::Md4;
 use md5::Md5;
@@ -153,7 +153,7 @@ impl V2Key {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct FileKey {
-	key: StackSizedString<U32>,
+	key: SizedStr<U32>,
 }
 
 impl AsRef<str> for FileKey {
@@ -173,7 +173,7 @@ impl FromStr for FileKey {
 
 	fn from_str(key: &str) -> Result<Self, Self::Err> {
 		Ok(Self {
-			key: StackSizedString::try_from(key)?,
+			key: *SizedStr::ref_from_str(key)?,
 		})
 	}
 }
@@ -236,7 +236,7 @@ pub fn derive_password_and_mk(
 	))
 }
 
-pub(crate) fn make_link_salt() -> LinkPasswordSalt<'static> {
+pub(crate) fn make_link_salt() -> LinkPasswordSalt {
 	// link salt in v1 is unused and always empty
 	LinkPasswordSalt::None
 }

@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use generic_array::ArrayLength;
 use serde::{Deserialize, Serialize};
 
-use super::stack_sized::SizedHexString;
+use super::sized_str::SizedHexString;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct HexString<'a>(Cow<'a, [u8]>);

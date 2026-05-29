@@ -4,10 +4,11 @@ use generic_array::{ArrayLength, GenericArray, IntoArrayLength, typenum::Const};
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 use typenum::{Prod, U2};
 
-use crate::serde::str::StackSizedString;
+use crate::serde::str::SizedStr;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SizedHexString<N: ArrayLength>(pub(in super::super) GenericArray<u8, N>);
+
 impl<N: ArrayLength> Copy for SizedHexString<N> where N::ArrayType<u8>: Copy {}
 
 impl<N: ArrayLength> core::fmt::Display for SizedHexString<N> {
@@ -35,14 +36,14 @@ where
 	N: ArrayLength + Mul<U2>,
 	Prod<N, U2>: ArrayLength,
 {
-	pub fn to_str(&self) -> StackSizedString<Prod<N, U2>> {
+	pub fn to_str(&self) -> SizedStr<Prod<N, U2>> {
 		let mut out = GenericArray::<u8, Prod<N, U2>>::default();
 		// SAFETY: out is exactly 2 * N bytes long, which is what encode_to_slice requires
 		// It also encodes valid UTF-8, since it's just hex encoding of valid bytes
 		unsafe {
 			hex::encode_to_slice(&self.0, &mut out).unwrap_unchecked();
 		}
-		StackSizedString(out)
+		SizedStr(out)
 	}
 }
 

@@ -6,10 +6,7 @@ use filen_types::{
 		contacts::Contact,
 		dir::{
 			color::DirColor,
-			link::{
-				PublicLinkExpiration,
-				info::{LinkPasswordSalt, LinkPasswordSaltOwned},
-			},
+			link::{PublicLinkExpiration, info::LinkPasswordSalt},
 		},
 		file::link::edit::FileLinkAction,
 		item::{linked::ListedPublicLink, shared::SharedUser},
@@ -48,7 +45,7 @@ pub mod js_impls;
 
 pub(crate) trait MakePasswordSaltAndHash {
 	fn password(&self) -> &PasswordState;
-	fn salt(&self) -> &LinkPasswordSalt<'_>;
+	fn salt(&self) -> &LinkPasswordSalt;
 
 	fn get_password_hash(&self) -> Result<LinkHashedPassword<'_>, Error> {
 		let password = match self.password() {
@@ -95,7 +92,7 @@ pub struct FilePublicLink {
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
-	salt: LinkPasswordSaltOwned,
+	salt: LinkPasswordSalt,
 }
 
 impl PartialEq for FilePublicLink {
@@ -183,7 +180,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 		&self.password
 	}
 
-	fn salt(&self) -> &LinkPasswordSalt<'_> {
+	fn salt(&self) -> &LinkPasswordSalt {
 		&self.salt
 	}
 }
@@ -194,7 +191,7 @@ pub struct DirPublicLink {
 	pub(crate) link_key: MetaKey,
 	pub(crate) password: Option<String>,
 	pub(crate) enable_download: bool,
-	pub(crate) salt: LinkPasswordSalt<'static>,
+	pub(crate) salt: LinkPasswordSalt,
 }
 
 impl DirPublicLink {
@@ -229,7 +226,7 @@ pub struct DirPublicLinkRW {
 	pub(crate) password: PasswordState,
 	pub(crate) expiration: PublicLinkExpiration,
 	pub(crate) enable_download: bool,
-	pub(crate) salt: LinkPasswordSalt<'static>,
+	pub(crate) salt: LinkPasswordSalt,
 }
 
 impl TryFrom<DirPublicLinkRW> for DirPublicLink {
@@ -305,7 +302,7 @@ impl MakePasswordSaltAndHash for DirPublicLinkRW {
 		&self.password
 	}
 
-	fn salt(&self) -> &LinkPasswordSalt<'_> {
+	fn salt(&self) -> &LinkPasswordSalt {
 		&self.salt
 	}
 }
@@ -598,7 +595,7 @@ impl Client {
 				expiration: PublicLinkExpiration::Never,
 				password: false,
 				password_hashed,
-				salt: file_link.salt.as_borrowed_cow(),
+				salt: file_link.salt(),
 				download_btn: true,
 				r#type: FileLinkAction::Enable,
 			},
@@ -620,7 +617,7 @@ impl Client {
 				expiration: link.expiration,
 				password: link.password().is_known(),
 				password_hashed: link.get_password_hash()?,
-				salt: link.salt().as_borrowed_cow(),
+				salt: link.salt(),
 				download_btn: link.enable_download,
 			},
 		)
@@ -642,7 +639,7 @@ impl Client {
 				expiration: link.expiration,
 				password: link.password().is_known(),
 				password_hashed: do_cpu_intensive(|| link.get_password_hash()).await?,
-				salt: link.salt().as_borrowed_cow(),
+				salt: link.salt(),
 				download_btn: link.downloadable,
 				r#type: FileLinkAction::Enable,
 			},
@@ -664,7 +661,7 @@ impl Client {
 				expiration: PublicLinkExpiration::Never,
 				password: false,
 				password_hashed: crate::crypto::connect::empty_hash(),
-				salt: link.salt().as_borrowed_cow(),
+				salt: link.salt(),
 				download_btn: false,
 				r#type: FileLinkAction::Disable,
 			},

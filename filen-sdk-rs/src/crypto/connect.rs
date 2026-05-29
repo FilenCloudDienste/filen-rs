@@ -9,7 +9,7 @@ use super::error::ConversionError;
 
 pub(crate) fn derive_password_for_link(
 	password: Option<&str>,
-	salt: &LinkPasswordSalt<'_>,
+	salt: &LinkPasswordSalt,
 ) -> Result<LinkHashedPassword<'static>, ConversionError> {
 	Ok(match (password, salt) {
 		(Some(password), LinkPasswordSalt::V3(salt)) => LinkHashedPassword(Cow::Owned(
@@ -34,7 +34,7 @@ pub(crate) fn empty_hash() -> LinkHashedPassword<'static> {
 	LinkHashedPassword(Cow::Borrowed("empty"))
 }
 
-pub(crate) fn new_random_salt() -> LinkPasswordSalt<'static> {
+pub(crate) fn new_random_salt() -> LinkPasswordSalt {
 	crate::crypto::v3::make_link_salt()
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn new_random_salt() -> LinkPasswordSalt<'static> {
 
 #[cfg(test)]
 mod tests {
-	use filen_types::serde::str::SizedStringBase64Chars;
+	use filen_types::serde::str::SizedStrBase64Chars;
 
 	use super::*;
 	#[test]
@@ -64,7 +64,7 @@ mod tests {
 			derive_password_for_link(
 				None,
 				&LinkPasswordSalt::V2(
-					SizedStringBase64Chars::try_from(
+					SizedStrBase64Chars::owned_from_string(
 						"zm9EsUNlNyfzN3EFbLnHrN9rWR5QuZU8".to_string()
 					)
 					.unwrap()
@@ -79,7 +79,7 @@ mod tests {
 			derive_password_for_link(
 				Some("password"),
 				&LinkPasswordSalt::V2(
-					SizedStringBase64Chars::try_from(
+					SizedStrBase64Chars::owned_from_string(
 						"x__X9T9953af53zes9u-4pIhAqhxOjBx".to_string()
 					)
 					.unwrap()
@@ -94,7 +94,7 @@ mod tests {
 			derive_password_for_link(
 				Some("password2"),
 				&LinkPasswordSalt::V2(
-					SizedStringBase64Chars::try_from(
+					SizedStrBase64Chars::owned_from_string(
 						"rRYk5S_x7je62wFO1etMbEMlctAy-CMr".to_string()
 					)
 					.unwrap()

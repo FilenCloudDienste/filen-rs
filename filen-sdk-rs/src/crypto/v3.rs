@@ -9,7 +9,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::{
 	api::v3::dir::link::info::LinkPasswordSalt,
 	crypto::{DerivedPassword, EncryptedString},
-	serde::str::{SizedHexString, StackSizedString},
+	serde::str::{SizedHexString, SizedStr},
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,7 @@ impl EncryptionKey {
 		}
 	}
 
-	pub fn to_str(&self) -> StackSizedString<U64> {
+	pub fn to_str(&self) -> SizedStr<U64> {
 		self.hex_string.to_str()
 	}
 }
@@ -201,7 +201,7 @@ pub(crate) fn derive_password_and_kek(
 	Ok((kek, password))
 }
 
-pub(crate) fn make_link_salt() -> LinkPasswordSalt<'static> {
+pub(crate) fn make_link_salt() -> LinkPasswordSalt {
 	LinkPasswordSalt::V3(Box::new(SizedHexString::<U256>::from(rand::random::<
 		[u8; 256],
 	>())))

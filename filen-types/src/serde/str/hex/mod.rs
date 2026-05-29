@@ -1,7 +1,7 @@
 use generic_array::{ArrayLength, GenericArray};
 
 pub(super) mod heap_unsized;
-pub(super) mod stack_sized;
+pub(super) mod sized_str;
 
 pub fn hex_decode_to_generic_array<T: AsRef<[u8]>, N: ArrayLength>(
 	input: T,

@@ -12,7 +12,7 @@ pub struct Request {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Response<'a> {
+pub struct Response {
 	pub has_password: bool,
-	pub salt: LinkPasswordSalt<'a>,
+	pub salt: LinkPasswordSalt,
 }

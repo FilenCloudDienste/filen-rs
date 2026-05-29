@@ -1,6 +1,6 @@
 use std::{fmt::Debug, str::FromStr};
 
-use filen_types::{auth::FileEncryptionVersion, serde::str::StackSizedString};
+use filen_types::{auth::FileEncryptionVersion, serde::str::SizedStr};
 use serde::{Serialize, de::DeserializeSeed};
 use typenum::U64;
 
@@ -17,7 +17,7 @@ pub enum FileKey {
 
 enum FileKeyStr<'a> {
 	Borrowed(&'a str),
-	Owned(StackSizedString<U64>),
+	Owned(SizedStr<U64>),
 }
 
 impl AsRef<str> for FileKeyStr<'_> {

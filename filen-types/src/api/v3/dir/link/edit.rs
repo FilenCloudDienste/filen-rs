@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
 	api::v3::dir::link::{PublicLinkExpiration, info::LinkPasswordSalt},
@@ -8,7 +8,7 @@ use crate::{
 
 pub const ENDPOINT: &str = "v3/dir/link/edit";
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub uuid: UuidStr,
@@ -16,6 +16,6 @@ pub struct Request<'a> {
 	#[serde(with = "crate::serde::boolean::empty_notempty")]
 	pub password: bool,
 	pub password_hashed: LinkHashedPassword<'a>,
-	pub salt: LinkPasswordSalt<'a>,
+	pub salt: &'a LinkPasswordSalt,
 	pub download_btn: bool,
 }
