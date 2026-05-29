@@ -1649,6 +1649,7 @@ dependencies = [
  "filen-types",
  "itertools 0.14.0",
  "log 0.4.28",
+ "rkyv",
  "rusqlite",
  "test-utils",
  "tokio",

@@ -12,9 +12,12 @@ use uuid::Uuid;
 use crate::{
 	Error,
 	crypto::file::FileKey,
-	fs::file::{
-		FileVersion,
-		meta::{DecryptedFileMeta, FileMeta},
+	fs::{
+		cache::CacheableConversionError,
+		file::{
+			FileVersion,
+			meta::{DecryptedFileMeta, FileMeta},
+		},
 	},
 	io::RemoteFile,
 };
@@ -132,36 +135,22 @@ impl Serialize for CacheableFile<'_> {
 }
 
 impl TryFrom<RemoteFile> for CacheableFile<'static> {
-	type Error = (RemoteFile, Error);
+	type Error = (RemoteFile, CacheableConversionError);
 
 	fn try_from(mut value: RemoteFile) -> Result<Self, Self::Error> {
 		let parent = match value.parent {
 			ParentUuid::Uuid(uuid) => (&uuid).into(),
-			parent => {
-				return Err((
-					value,
-					Error::custom(
-						crate::ErrorKind::InvalidState,
-						format!(
-							"cannot convert remote file to cacheable file with {:?} parent",
-							parent
-						),
-					),
-				));
+			other => {
+				return Err((value, CacheableConversionError::ParentNotUuid(other)));
 			}
 		};
 
 		let decrypted_meta = match value.meta {
 			FileMeta::Decoded(meta) => meta,
 			other => {
+				let debug = format!("{:?}", other);
 				value.meta = other;
-				return Err((
-					value,
-					Error::custom(
-						crate::ErrorKind::MetadataWasNotDecrypted,
-						"cannot convert remote file to cacheable file with encrypted meta",
-					),
-				));
+				return Err((value, CacheableConversionError::MetadataNotDecrypted(debug)));
 			}
 		};
 
@@ -186,16 +175,16 @@ impl TryFrom<RemoteFile> for CacheableFile<'static> {
 }
 
 impl<'a> TryFrom<&'a RemoteFile> for CacheableFile<'a> {
-	type Error = Error;
+	type Error = CacheableConversionError;
 
 	fn try_from(value: &'a RemoteFile) -> Result<Self, Self::Error> {
 		let decrypted_meta = match &value.meta {
 			FileMeta::Decoded(meta) => meta,
-			_ => {
-				return Err(Error::custom(
-					crate::ErrorKind::MetadataWasNotDecrypted,
-					"cannot convert remote file to cacheable file with encrypted meta",
-				));
+			other => {
+				return Err(CacheableConversionError::MetadataNotDecrypted(format!(
+					"{:?}",
+					other
+				)));
 			}
 		};
 
@@ -203,14 +192,8 @@ impl<'a> TryFrom<&'a RemoteFile> for CacheableFile<'a> {
 			uuid: (&value.uuid).into(),
 			parent: match value.parent {
 				ParentUuid::Uuid(uuid) => (&uuid).into(),
-				parent => {
-					return Err(Error::custom(
-						crate::ErrorKind::InvalidState,
-						format!(
-							"cannot convert remote file to cacheable file with {:?} parent",
-							parent
-						),
-					));
+				other => {
+					return Err(CacheableConversionError::ParentNotUuid(other));
 				}
 			},
 			chunks_size: value.size,

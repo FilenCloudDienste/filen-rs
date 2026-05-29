@@ -1,5 +1,6 @@
 use std::{borrow::Cow, str::FromStr};
 
+use filen_macros::rkyv_self;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConversionError;
@@ -40,6 +41,8 @@ impl From<ObjectType> for ObjectType2 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[rkyv_self]
+#[repr(u8)]
 pub enum ParentUuid {
 	Uuid(UuidStr),
 	Trash,
@@ -142,6 +145,7 @@ impl<'de> Deserialize<'de> for ParentUuid {
 mod uuid {
 	use std::{borrow::Cow, str::FromStr};
 
+	use filen_macros::rkyv_self;
 	use serde::{Deserialize, Serialize};
 	use uuid::{Uuid, fmt::Hyphenated};
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -151,6 +155,7 @@ mod uuid {
 	};
 
 	#[derive(Clone, Copy, PartialEq, Eq)]
+	#[rkyv_self]
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
 
 	pub static UUID_STR_NIL: UuidStr = UuidStr([0u8; Hyphenated::LENGTH]);

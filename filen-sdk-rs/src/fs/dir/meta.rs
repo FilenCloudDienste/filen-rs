@@ -5,8 +5,10 @@ use chrono::{DateTime, SubsecRound, Utc};
 use filen_macros::js_type;
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
+	rkyv::date_time::DateTimeUtcDef,
 	traits::CowHelpers,
 };
+use rkyv::with::Map;
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 
@@ -152,7 +154,18 @@ impl<'a> DirectoryMeta<'a> {
 	}
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, CowHelpers)]
+#[derive(
+	Debug,
+	PartialEq,
+	Eq,
+	Clone,
+	Serialize,
+	Deserialize,
+	CowHelpers,
+	rkyv::Serialize,
+	rkyv::Deserialize,
+	rkyv::Archive,
+)]
 pub struct DecryptedDirectoryMeta<'a> {
 	#[serde(borrow)]
 	pub name: Cow<'a, str>,
@@ -161,6 +174,7 @@ pub struct DecryptedDirectoryMeta<'a> {
 		rename = "creation",
 		default
 	)]
+	#[rkyv(with = Map<DateTimeUtcDef>)]
 	pub created: Option<DateTime<Utc>>,
 }
 

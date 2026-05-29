@@ -11,13 +11,13 @@ use filen_sdk_rs::{
 
 use crate::{
 	CacheControlMessage, CacheError, CacheState,
-	state::{CacheEvent, ManualEvent},
+	state::{CacheThreadEvent, ManualEvent},
 };
 
 pub struct CacheHandle {
 	task_handle: JoinHandle<()>,
 	control_sender: Sender<CacheControlMessage>,
-	manual_event_sender: Sender<CacheEvent>,
+	manual_event_sender: Sender<CacheThreadEvent>,
 	_listener_handle: ListenerHandle,
 }
 
@@ -83,7 +83,7 @@ impl CacheHandle {
 		files: Vec<RemoteFile>,
 	) -> Result<(), Error> {
 		self.manual_event_sender
-			.send(CacheEvent::manual(ManualEvent::ListDirRecursive(
+			.send(CacheThreadEvent::Manual(ManualEvent::ListDirRecursive(
 				dirs, files,
 			)))
 			.map_err(|e| {

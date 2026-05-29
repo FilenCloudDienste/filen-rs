@@ -1,6 +1,6 @@
 use filen_sdk_rs::{
 	error::FilenSdkError,
-	fs::{dir::meta::DirectoryMeta, file::meta::FileMeta},
+	fs::cache::CacheableConversionError,
 	io::{RemoteDirectory, RemoteFile},
 };
 use uuid::Uuid;
@@ -12,21 +12,9 @@ pub struct FileCacheableConversionFailed {
 }
 
 #[derive(Debug)]
-pub struct FileMetaNotDecryptable {
-	pub meta: FileMeta<'static>,
-	pub id: Uuid,
-}
-
-#[derive(Debug)]
 pub struct DirCacheableConversionFailed {
 	pub dir: RemoteDirectory,
 	pub error: FilenSdkError,
-}
-
-#[derive(Debug)]
-pub struct DirMetaNotDecryptable {
-	pub meta: DirectoryMeta<'static>,
-	pub id: Uuid,
 }
 
 #[derive(Debug)]
@@ -35,12 +23,19 @@ pub struct DB {
 	pub context: String,
 }
 
+/// A socket event could not be converted into a cacheable form (e.g. its metadata was not
+/// decrypted, or it referenced a non-uuid parent).
+#[derive(Debug)]
+pub struct EventConversionFailed {
+	pub error: CacheableConversionError,
+	pub uuid: Uuid,
+}
+
 #[derive(Debug)]
 pub enum CacheError {
 	FileCacheableConversion(FileCacheableConversionFailed),
-	FileMetaNotDecryptable(FileMetaNotDecryptable),
 	DirCacheableConversion(DirCacheableConversionFailed),
-	DirMetaNotDecryptable(DirMetaNotDecryptable),
+	EventConversion(EventConversionFailed),
 	DB(DB),
 }
 
@@ -49,19 +44,15 @@ impl CacheError {
 		Self::FileCacheableConversion(FileCacheableConversionFailed { file, error })
 	}
 
-	pub(crate) fn file_meta_not_decryptable(meta: FileMeta<'static>, id: Uuid) -> Self {
-		Self::FileMetaNotDecryptable(FileMetaNotDecryptable { meta, id })
-	}
-
 	pub(crate) fn dir_cachable_conversion(dir: RemoteDirectory, error: FilenSdkError) -> Self {
 		Self::DirCacheableConversion(DirCacheableConversionFailed { dir, error })
 	}
 
-	pub(crate) fn dir_meta_not_decryptable(meta: DirectoryMeta<'static>, id: Uuid) -> Self {
-		Self::DirMetaNotDecryptable(DirMetaNotDecryptable { meta, id })
-	}
-
 	pub(crate) fn db(error: rusqlite::Error, context: String) -> Self {
 		Self::DB(DB { error, context })
+	}
+
+	pub(crate) fn event_conversion(error: CacheableConversionError, uuid: Uuid) -> Self {
+		Self::EventConversion(EventConversionFailed { error, uuid })
 	}
 }

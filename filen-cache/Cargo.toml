@@ -10,6 +10,7 @@ filen-sdk-rs = { path = "../filen-sdk-rs", features = ["cache"] }
 filen-types = { path = "../filen-types" }
 itertools = "0.14.0"
 log = "0.4.28"
+rkyv = { version = "0.8.16", features = ["uuid-1"] }
 rusqlite = { version = "0.37.0", features = ["uuid"] }
 tokio = { version = "1.50.0", default-features = false, features = ["sync"] }
 uuid = "1.22.0"

@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod categories;
 pub mod client_impl;
 pub mod dir;

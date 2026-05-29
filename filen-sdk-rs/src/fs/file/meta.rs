@@ -5,8 +5,10 @@ use filen_macros::js_type;
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{Blake3Hash, EncryptedString, rsa::RSAEncryptedString},
+	rkyv::date_time::DateTimeUtcDef,
 	traits::CowHelpers,
 };
+use rkyv::with::Map;
 use rsa::RsaPrivateKey;
 use serde::{
 	Deserialize, Serialize,
@@ -192,7 +194,17 @@ impl<'a> FileMeta<'a> {
 	get_value_from_decrypted_optional!(hash, Option<Blake3Hash>);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, CowHelpers)]
+#[derive(
+	Debug,
+	Clone,
+	PartialEq,
+	Eq,
+	Serialize,
+	CowHelpers,
+	rkyv::Serialize,
+	rkyv::Deserialize,
+	rkyv::Archive,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptedFileMeta<'a> {
 	pub name: Cow<'a, str>,
@@ -200,10 +212,14 @@ pub struct DecryptedFileMeta<'a> {
 	pub mime: Cow<'a, str>,
 	pub key: FileKey,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
+	#[rkyv(with = DateTimeUtcDef)]
 	pub last_modified: DateTime<Utc>,
-	#[serde(with = "filen_types::serde::time::optional")]
-	#[serde(rename = "creation")]
-	#[serde(default)]
+	#[serde(
+		with = "filen_types::serde::time::optional",
+		rename = "creation",
+		default
+	)]
+	#[rkyv(with = Map<DateTimeUtcDef>)]
 	pub created: Option<DateTime<Utc>>,
 	#[serde(rename = "blake3")]
 	pub hash: Option<Blake3Hash>,

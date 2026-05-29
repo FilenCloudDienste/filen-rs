@@ -8,7 +8,10 @@ use filen_types::{
 use rkyv::with::Map;
 use uuid::Uuid;
 
-use crate::{Error, fs::dir::meta::DirectoryMeta, io::RemoteDirectory};
+use crate::{
+	fs::{cache::CacheableConversionError, dir::meta::DirectoryMeta},
+	io::RemoteDirectory,
+};
 
 #[derive(
 	Clone, Debug, PartialEq, Eq, CowHelpers, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive,
@@ -27,36 +30,22 @@ pub struct CacheableDir<'a> {
 }
 
 impl TryFrom<RemoteDirectory> for CacheableDir<'static> {
-	type Error = (RemoteDirectory, Error);
+	type Error = (RemoteDirectory, CacheableConversionError);
 
 	fn try_from(mut value: RemoteDirectory) -> Result<Self, Self::Error> {
 		let parent = match value.parent {
 			ParentUuid::Uuid(uuid) => (&uuid).into(),
-			parent => {
-				return Err((
-					value,
-					Error::custom(
-						crate::ErrorKind::InvalidState,
-						format!(
-							"cannot convert remote dir to cacheable dir with {:?} parent",
-							parent
-						),
-					),
-				));
+			other => {
+				return Err((value, CacheableConversionError::ParentNotUuid(other)));
 			}
 		};
 
 		let decrypted_meta = match value.meta {
 			DirectoryMeta::Decoded(meta) => meta,
 			other => {
+				let debug = format!("{:?}", other);
 				value.meta = other;
-				return Err((
-					value,
-					Error::custom(
-						crate::ErrorKind::MetadataWasNotDecrypted,
-						"cannot convert remote dir to cacheable dir with encrypted meta",
-					),
-				));
+				return Err((value, CacheableConversionError::MetadataNotDecrypted(debug)));
 			}
 		};
 
@@ -74,16 +63,16 @@ impl TryFrom<RemoteDirectory> for CacheableDir<'static> {
 }
 
 impl<'a> TryFrom<&'a RemoteDirectory> for CacheableDir<'a> {
-	type Error = Error;
+	type Error = CacheableConversionError;
 
 	fn try_from(value: &'a RemoteDirectory) -> Result<Self, Self::Error> {
 		let decrypted_meta = match &value.meta {
 			DirectoryMeta::Decoded(meta) => meta,
-			_ => {
-				return Err(Error::custom(
-					crate::ErrorKind::MetadataWasNotDecrypted,
-					"cannot convert remote dir to cacheable dir with encrypted meta",
-				));
+			other => {
+				return Err(CacheableConversionError::MetadataNotDecrypted(format!(
+					"{:?}",
+					other
+				)));
 			}
 		};
 
@@ -91,14 +80,8 @@ impl<'a> TryFrom<&'a RemoteDirectory> for CacheableDir<'a> {
 			uuid: (&value.uuid).into(),
 			parent: match value.parent {
 				ParentUuid::Uuid(uuid) => (&uuid).into(),
-				parent => {
-					return Err(Error::custom(
-						crate::ErrorKind::InvalidState,
-						format!(
-							"cannot convert remote dir to cacheable dir with {:?} parent",
-							parent
-						),
-					));
+				other => {
+					return Err(CacheableConversionError::ParentNotUuid(other));
 				}
 			},
 			color: value.color.as_borrowed_cow(),
