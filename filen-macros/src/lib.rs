@@ -11,6 +11,7 @@ use syn::{
 use syn::{Item, WherePredicate};
 
 mod anchored_ref;
+mod rkyv_self;
 mod sdk_type_derives;
 
 #[derive(PartialEq, Eq)]
@@ -273,6 +274,81 @@ pub fn shared_test_runtime(_attr: TokenStream, input: TokenStream) -> TokenStrea
 	};
 
 	result.into()
+}
+
+/// Derives the rkyv traits for a struct or enum whose archived form is the type
+/// itself (`#[rkyv(as = Self)]`) — a zero-cost, layout-identical representation.
+///
+/// It injects (and lets rkyv/bytecheck's own derives do the work):
+/// - `#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]` configured
+///   with `#[rkyv(as = Self, archive_bounds(..), deserialize_bounds(..))]`,
+/// - `#[derive(rkyv::Portable)]` — validates the `repr` and bounds each field
+///   `: Portable`,
+/// - `#[derive(rkyv::bytecheck::CheckBytes)]` (unless `no_check_bytes`) — for a
+///   struct it checks every field; for an enum it checks the discriminant and
+///   the selected variant's fields.
+///
+/// Works on single- and multi-field structs and on enums. Every field type must
+/// itself be `Portable` and archive *as itself* (e.g. `u8`, `bool`, `[u8; N]`,
+/// or another `#[rkyv_self]` type) — the `archive_bounds` enforce this.
+///
+/// `repr` handling: an explicit `repr` is kept (and validated by the derives). If
+/// absent, a single-field struct gets `#[repr(transparent)]`, any other struct
+/// gets `#[repr(C)]`. An enum **must** declare its own primitive `repr` (e.g.
+/// `#[repr(u8)]`) — bytecheck rejects `repr(C)` enums. Only unconditional
+/// `#[repr(..)]` attributes are detected (not `cfg_attr`-gated ones). For
+/// `#[repr(C)]` multi-field structs, fields of uniform alignment avoid
+/// inter-field padding; round-trips stay correct regardless, but the exact
+/// archived bytes (padding included) are not part of the contract.
+///
+/// # When this is correct
+///
+/// The generated `CheckBytes` accepts a buffer iff each field is individually
+/// valid (and, for enums, the discriminant is valid). It does **not** know about
+/// invariants that span fields or narrow a field's value range (e.g. a `u8` that
+/// only permits `0..=9`, or a UTF-8-validated string). For those, pass
+/// `#[rkyv_self(no_check_bytes)]` and implement `CheckBytes` by hand.
+///
+/// # Arguments
+///
+/// - `no_check_bytes` — skip the `CheckBytes` derive. Use when the type validates
+///   invariants stricter than per-field validity and supplies its own
+///   `CheckBytes`. `Archive`/`Serialize`/`Deserialize` and `Portable` are still
+///   generated.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+/// #[serde(transparent)]
+/// #[rkyv_self]
+/// pub struct Blake3Hash(SizedHexString<U32>);
+///
+/// #[rkyv_self]
+/// #[repr(u8)]
+/// pub enum Slot {
+///     Empty,
+///     Filled(Blake3Hash),
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn rkyv_self(attr: TokenStream, item: TokenStream) -> TokenStream {
+	let args = parse_macro_input!(attr with Punctuated::<Meta, Comma>::parse_terminated);
+	let mut no_check_bytes = false;
+	for arg in args {
+		match arg {
+			Meta::Path(path) if path.is_ident("no_check_bytes") => no_check_bytes = true,
+			other => {
+				return syn::Error::new_spanned(
+					other,
+					"unknown argument for #[rkyv_self]; the only supported argument is `no_check_bytes`",
+				)
+				.to_compile_error()
+				.into();
+			}
+		}
+	}
+	rkyv_self::rkyv_self(item, no_check_bytes)
 }
 
 /// Derive macro for TransmuteLifetime trait
