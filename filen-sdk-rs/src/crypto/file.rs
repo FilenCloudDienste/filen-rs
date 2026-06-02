@@ -10,7 +10,7 @@ use crate::{Error, ErrorKind, auth::AuthInfo, crypto::v1};
 use super::{error::ConversionError, shared::DataCrypter, v2, v3};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[rkyv_self(no_check_bytes)]
+#[rkyv_self]
 #[repr(u8)]
 pub enum FileKey {
 	V1(v1::FileKey),
