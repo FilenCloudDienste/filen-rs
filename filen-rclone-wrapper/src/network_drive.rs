@@ -45,7 +45,6 @@ impl NetworkDrive {
 			"0666",
 			"--dir-perms",
 			"0777",
-			"--use-server-modtime",
 			"--vfs-read-chunk-size",
 			"128Mi",
 			"--buffer-size",
