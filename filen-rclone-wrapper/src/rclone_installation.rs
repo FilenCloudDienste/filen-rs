@@ -74,6 +74,7 @@ impl RcloneInstallation {
 		debug!("Executing rclone with args: {}", args.join(" "));
 		let status = self
 			.configured_rclone(args)
+			.kill_on_drop(true)
 			.spawn()
 			.context("Failed to execute rclone command")?
 			.wait()
