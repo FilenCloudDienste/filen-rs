@@ -311,3 +311,134 @@ impl From<CacheableFileVersion<'static>> for FileVersion {
 		}
 	}
 }
+
+impl CacheableFile<'_> {
+	/// Two `CacheableFile`s hash equal iff they represent the same logical file *content*,
+	/// regardless of which path built them (a live socket event versus a recursive listing). The
+	/// cache resync diff compares this fingerprint — stored per item — instead of the derived
+	/// [`PartialEq`], so a field that differs *by construction path* (rather than because the file
+	/// actually changed) does not produce a spurious `Changed` event and resync churn.
+	///
+	/// Excluded fields:
+	/// - `region` / `bucket`: physical storage location, not content identity (a server-side
+	///   rebalance must not look like a content change).
+	/// - `timestamp`: socket events carry the *event* time while a listing carries the upload/
+	///   listing time, so it diverges across paths and is not a content signal.
+	/// - `chunks_size`: an exact alias of `size` (both are populated from `RemoteFile::size` in
+	///   [`TryFrom`]), so it carries no information beyond `size`.
+	pub fn content_fingerprint(&self) -> [u8; 32] {
+		use crate::fs::cache::fingerprint::{write_dt_ms, write_opt_dt_ms};
+
+		let mut hasher = blake3::Hasher::new();
+		hasher.update(self.uuid.as_bytes());
+		hasher.update(self.parent.as_bytes());
+		hasher.update(self.name.as_bytes());
+		hasher.update(&self.size.to_le_bytes());
+		hasher.update(self.mime.as_bytes());
+		// Version-tagged: `to_str` is a deterministic, stable encoding for a given key version.
+		hasher.update(&[self.key.version() as u8]);
+		hasher.update(self.key.to_str().as_ref().as_bytes());
+		write_dt_ms(&mut hasher, self.last_modified);
+		write_opt_dt_ms(&mut hasher, self.created);
+		match &self.hash {
+			Some(hash) => {
+				hasher.update(&[1]);
+				hasher.update(hash.as_sized_str().as_slice());
+			}
+			None => {
+				hasher.update(&[0]);
+			}
+		}
+		hasher.update(&self.chunks.to_le_bytes());
+		hasher.update(&[u8::from(self.favorited)]);
+		*hasher.finalize().as_bytes()
+	}
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+	use super::*;
+
+	fn dt(ms: i64) -> DateTime<Utc> {
+		DateTime::from_timestamp_millis(ms).expect("valid timestamp")
+	}
+
+	fn base() -> CacheableFile<'static> {
+		CacheableFile {
+			uuid: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+			parent: Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222),
+			chunks_size: 4096,
+			chunks: 1,
+			favorited: false,
+			region: Cow::Borrowed("de-1"),
+			bucket: Cow::Borrowed("bucket-a"),
+			timestamp: dt(1_700_000_000_000),
+			name: Cow::Borrowed("photo.txt"),
+			size: 4096,
+			mime: Cow::Borrowed("text/plain"),
+			key: FileKey::from_str_with_version(&"c".repeat(32), FileEncryptionVersion::V2)
+				.expect("valid v2 key"),
+			last_modified: dt(1_700_000_000_000),
+			created: Some(dt(1_699_000_000_000)),
+			hash: None,
+		}
+	}
+
+	/// The headline guarantee: fields that differ *only because of which path built the item*
+	/// (storage location, event timestamp, the `chunks_size` alias) must NOT count as a content
+	/// change. A naive change detector using the derived `PartialEq` would flag them and churn the
+	/// resync; the fingerprint must not.
+	#[test]
+	fn fingerprint_excludes_storage_location_timestamp_and_chunks_size() {
+		let a = base();
+		let mut b = a.clone();
+		b.region = Cow::Borrowed("us-east-2");
+		b.bucket = Cow::Borrowed("bucket-z");
+		b.timestamp = dt(1_800_000_000_000);
+		b.chunks_size = 8192;
+
+		// Derived PartialEq sees a difference (this is what would cause spurious `Changed`s):
+		assert_ne!(a, b);
+		// The content fingerprint treats them as the same logical content:
+		assert_eq!(a.content_fingerprint(), b.content_fingerprint());
+	}
+
+	/// Every field that IS part of content identity must change the fingerprint.
+	#[test]
+	fn fingerprint_changes_with_each_content_field() {
+		let base = base();
+		let baseline = base.content_fingerprint();
+		let fp = |mutate: fn(&mut CacheableFile<'static>)| {
+			let mut c = base.clone();
+			mutate(&mut c);
+			c.content_fingerprint()
+		};
+
+		assert_ne!(baseline, fp(|c| c.uuid = Uuid::from_u128(9)));
+		assert_ne!(baseline, fp(|c| c.parent = Uuid::from_u128(9)));
+		assert_ne!(baseline, fp(|c| c.name = Cow::Borrowed("renamed.txt")));
+		assert_ne!(baseline, fp(|c| c.size = 1));
+		assert_ne!(baseline, fp(|c| c.mime = Cow::Borrowed("application/json")));
+		assert_ne!(baseline, fp(|c| c.last_modified = dt(1_701_000_000_000)));
+		assert_ne!(baseline, fp(|c| c.created = None));
+		assert_ne!(baseline, fp(|c| c.created = Some(dt(1_698_000_000_000))));
+		assert_ne!(baseline, fp(|c| c.favorited = true));
+		assert_ne!(baseline, fp(|c| c.chunks = 99));
+		assert_ne!(
+			baseline,
+			fp(|c| c.hash = Some(Blake3Hash::from(blake3::hash(b"data"))))
+		);
+		assert_ne!(
+			baseline,
+			fp(|c| c.key =
+				FileKey::from_str_with_version(&"d".repeat(32), FileEncryptionVersion::V2)
+					.unwrap())
+		);
+	}
+
+	#[test]
+	fn fingerprint_is_deterministic() {
+		let a = base();
+		assert_eq!(a.content_fingerprint(), a.clone().content_fingerprint());
+	}
+}

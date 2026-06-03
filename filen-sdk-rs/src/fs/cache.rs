@@ -30,3 +30,34 @@ impl From<CacheableConversionError> for Error {
 		Error::custom_with_source(kind, value, None::<&str>)
 	}
 }
+
+/// Helpers for the canonical change-detection fingerprint (`content_fingerprint`) on
+/// [`CacheableFile`](crate::fs::file::cache::CacheableFile) and
+/// [`CacheableDir`](crate::fs::dir::cache::CacheableDir).
+///
+/// The fingerprint must be byte-identical across the two paths that build a cacheable item — a live
+/// socket event versus a recursive listing — so timestamps are canonicalized to whole milliseconds
+/// (the precision baked into the encrypted metadata at write time).
+#[cfg(feature = "cache")]
+pub(crate) mod fingerprint {
+	use chrono::{DateTime, Utc};
+
+	/// Mix a timestamp into the hasher, canonicalized to whole milliseconds — robust to any
+	/// sub-millisecond artifact from an rkyv at-rest round-trip versus a fresh decode.
+	pub(crate) fn write_dt_ms(hasher: &mut blake3::Hasher, dt: DateTime<Utc>) {
+		hasher.update(&dt.timestamp_millis().to_le_bytes());
+	}
+
+	/// Mix an optional timestamp, distinguishing `None` from `Some(_)` with a tag byte.
+	pub(crate) fn write_opt_dt_ms(hasher: &mut blake3::Hasher, dt: Option<DateTime<Utc>>) {
+		match dt {
+			Some(dt) => {
+				hasher.update(&[1]);
+				write_dt_ms(hasher, dt);
+			}
+			None => {
+				hasher.update(&[0]);
+			}
+		}
+	}
+}
