@@ -110,7 +110,7 @@ pub(crate) enum Commands {
 	EmptyTrash,
 	/// Export an auth config (to be used with --auth-config-path option)
 	ExportAuthConfig,
-	/// Execute an Rclone command using filen-rclone
+	/// Execute an Rclone command using the managed installation
 	Rclone {
 		/// The command to execute. Your Filen drive is available as the "filen" remote.
 		#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -916,7 +916,7 @@ async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 
 mod rclone {
 	//! [cli-doc] managed-rclone
-	//! The Filen CLI includes a managed installation of [filen-rclone](https://github.com/FilenCloudDienste/filen-rclone).
+	//! The Filen CLI includes a managed installation of [Rclone](https://rclone.org/), which can be used to access Filen.
 	//! It is automatically downloaded and configured (authenticated) when you run the commands like `rclone`, `mount`, etc.
 
 	use anyhow::{Context as _, Result};
@@ -1066,7 +1066,7 @@ mod rclone {
 		)
 		.await
 		{
-			ui.print_muted("Downloading filen-rclone...");
+			ui.print_muted("Downloading managed Rclone...");
 		}
 	}
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # This script exports the API key using a temporary download of the filen-cli binary
-# It is especially useful for filen-rclone
+# It is especially useful for using Filen via Rclone
 
 COLOR_OFF='\033[0m'
 RED='\033[0;31m'

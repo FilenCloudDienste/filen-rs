@@ -1,4 +1,4 @@
-//! Manages an installation of filen-rclone.
+//! Manages an installation of rclone.
 //! Responsible for downloading the binary, writing config files
 //! and executing Rclone commands.
 
@@ -9,6 +9,7 @@ use log::{debug, info};
 use port_check::free_local_ipv4_port;
 use sha2::{Digest as _, Sha256};
 use std::{
+	io::Read,
 	path::{Path, PathBuf},
 	process::{ExitStatus, Stdio},
 };
@@ -158,6 +159,21 @@ impl RcloneInstallation {
 	}
 }
 
+const RCLONE_VERSION: &str = "1.74.2";
+const RCLONE_CHECKSUM_LINUX_AMD64: [u8; 32] =
+	hex!("72a806370072015ccbe4d81bcd348cc5eaf3beca6c65ba693fd43fb31fcca5b1");
+const RCLONE_CHECKSUM_LINUX_ARM64: [u8; 32] =
+	hex!("bc2b2eb8269b743ed7bcea869f3782cfb4931e41efa53fc8befc6dc8308b7a50");
+const RCLONE_CHECKSUM_OSX_AMD64: [u8; 32] =
+	hex!("fc24831eefa3918c278c4a10be4de78288422426e2f7e64509205167f845874d");
+const RCLONE_CHECKSUM_OSX_ARM64: [u8; 32] =
+	hex!("e170fc4f225cbe3685695c4761259fe5883115a2b022a2f39b7298f946b8d898");
+const RCLONE_CHECKSUM_WINDOWS_AMD64: [u8; 32] =
+	hex!("71f376f47428bd467bf92e8bfe7fb36f4c108a4fc4edd3df30fc74dd409c7eef");
+const RCLONE_CHECKSUM_WINDOWS_ARM64: [u8; 32] =
+	hex!("464c8abf9eab9dab843906aac90fbd63386eb07576cd8571d03fbd10483c763e");
+// info: when updating the rclone version here, also update the expected SHA256 checksums by copying them from the supplied file
+
 /// Returns the path to the rclone binary, downloading it if necessary.
 /// When `disallow_downloading` is true, returns an error "Rclone not found" instead of downloading it.
 async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> Result<PathBuf> {
@@ -165,7 +181,7 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 	let platform_str = match std::env::consts::OS {
 		"windows" => Some("windows"),
 		"linux" => Some("linux"),
-		"macos" => Some("macos"),
+		"macos" => Some("osx"),
 		_ => None,
 	};
 	let arch_str = match std::env::consts::ARCH {
@@ -173,14 +189,8 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 		"aarch64" => Some("arm64"),
 		_ => None,
 	};
-	let rclone_binary_download_url = match (platform_str, arch_str) {
-		(Some(platform), Some(arch)) => format!(
-			"https://github.com/FilenCloudDienste/filen-rclone/releases/download/v1.70.0-filen.14/rclone-v1.70.0-filen.14-{}-{}{}",
-			// todo: update this to rclone v1.73 when filen-rclone is merged upstream
-			platform,
-			arch,
-			if platform == "windows" { ".exe" } else { "" }
-		),
+	let rclone_zip_name = match (platform_str, arch_str) {
+		(Some(platform), Some(arch)) => format!("rclone-v{}-{}-{}", RCLONE_VERSION, platform, arch),
 		_ => {
 			return Err(anyhow::anyhow!(
 				"Unsupported platform/architecture: {} {}",
@@ -189,9 +199,16 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 			));
 		}
 	};
+	let rclone_zip_download_url = format!(
+		"https://github.com/rclone/rclone/releases/download/v{}/{}.zip",
+		RCLONE_VERSION, rclone_zip_name
+	);
+	let file_ending = match std::env::consts::OS {
+		"windows" => ".exe",
+		_ => "",
+	};
 
-	let rclone_file_name = rclone_binary_download_url.rsplit_once('/').unwrap().1;
-	let rclone_binary_path = config_dir.join(rclone_file_name);
+	let rclone_binary_path = config_dir.join(format!("{}{}", rclone_zip_name, file_ending));
 	debug!("Rclone binary path: {}", rclone_binary_path.display());
 
 	// download binary if it doesn't exist
@@ -204,45 +221,43 @@ async fn ensure_rclone_binary(config_dir: &Path, disallow_downloading: bool) -> 
 
 		info!(
 			"Downloading Rclone binary from {}...",
-			rclone_binary_download_url
+			rclone_zip_download_url
 		);
-		let response = reqwest::get(rclone_binary_download_url)
+		let zip_bytes = reqwest::get(rclone_zip_download_url)
 			.await
-			.context("Failed to download Rclone binary")?;
-		let bytes = response
+			.context("Failed to download Rclone binary")?
 			.bytes()
 			.await
 			.context("Failed to read Rclone binary response")?;
 
-		// verify checksum
-		let downloaded_checksum = Sha256::digest(&bytes);
-		let expected_checksum = match (std::env::consts::OS, std::env::consts::ARCH) {
-			("windows", "x86_64") => {
-				hex!("c855395339115d314b920c574610f559df03d2baaea096866b4532a59b5b7235")
-			}
-			("windows", "aarch64") => {
-				hex!("ab24619f110ef14f30d4e8e77fcca8e17f5dbe7e413f907a0cf76b46fe3ffaf4")
-			}
-			("linux", "x86_64") => {
-				hex!("265f641844a2aa17c202f3cf6c06bc98dcd9b6c3b3fa228c5c454a203105de07")
-			}
-			("linux", "aarch64") => {
-				hex!("f70689b939c19bb6c81784f9003f09329b97d96be4ab2c70d1f2dc6e8fd417e5")
-			}
-			("macos", "x86_64") => {
-				hex!("1210e92b8adc172356a9bd79216d6a4fe22875b957326292ac2da56f2af6b207")
-			}
-			("macos", "aarch64") => {
-				hex!("cabaee158814afad05ebbe7f8469608e0ea3c4a1979063d52ff0289aaafdf89b")
-			}
+		// verify zip checksum before extracting
+		let zip_checksum = Sha256::digest(&zip_bytes);
+		let expected_zip_checksum = match (std::env::consts::OS, std::env::consts::ARCH) {
+			("windows", "x86_64") => RCLONE_CHECKSUM_WINDOWS_AMD64,
+			("windows", "aarch64") => RCLONE_CHECKSUM_WINDOWS_ARM64,
+			("linux", "x86_64") => RCLONE_CHECKSUM_LINUX_AMD64,
+			("linux", "aarch64") => RCLONE_CHECKSUM_LINUX_ARM64,
+			("macos", "x86_64") => RCLONE_CHECKSUM_OSX_AMD64,
+			("macos", "aarch64") => RCLONE_CHECKSUM_OSX_ARM64,
 			_ => unreachable!(),
 		};
-		if downloaded_checksum.as_slice() != expected_checksum {
+		if zip_checksum.as_slice() != expected_zip_checksum {
 			return Err(anyhow::anyhow!(
-				"Downloaded Rclone binary's checksum doesn't match!"
+				"Downloaded Rclone zip's checksum doesn't match!"
 			));
 		}
 
+		let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+			.context("Failed to read Rclone zip")?;
+		zip.file_names()
+			.for_each(|name| log::info!("Zip file contains: {}", name));
+		let mut rclone_file = zip
+			.by_name(format!("{}/rclone{}", rclone_zip_name, file_ending).as_str())
+			.context("Failed to find Rclone file in zip")?;
+		let mut bytes = Vec::new();
+		rclone_file
+			.read_to_end(&mut bytes)
+			.context("Failed to read Rclone file")?;
 		fs::write(&rclone_binary_path, &bytes).await?;
 
 		#[cfg(unix)]
@@ -310,11 +325,7 @@ async fn obscure_password_for_rclone(rclone_binary_path: &Path, password: &str) 
 		.stdout;
 	let obscured_password = String::from_utf8(obscured_password)
 		.context("Failed to read obscured password for Rclone config")?;
-	let obscured_password = obscured_password
-		.strip_prefix("=== filen-rclone ===\n")
-		.unwrap_or(&obscured_password)
-		.trim();
-	Ok(obscured_password.to_string())
+	Ok(obscured_password.trim().to_string())
 }
 
 fn get_available_disk_space(path: &Path) -> Result<u64> {

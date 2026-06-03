@@ -9,9 +9,8 @@ metadata.workspaces = { independent = true }
 
 [dependencies]
 anyhow = "1.0.98"
-filen-sdk-rs = { path = "../filen-sdk-rs" }
+filen-sdk-rs = { path = "../filen-sdk-rs" } # todo: make sure filen-rclone-wrapper does not depend on filen-sdk-rs
 hex-literal = "1.1.0"
-# todo: make sure filen-rclone-wrapper does not depend on filen-sdk-rs
 log = "0.4.27"
 port_check = "0.3.0"
 regex = "1.12.2"
@@ -27,6 +26,15 @@ tokio = { version = "1.47.1", features = [
 	"macros",
 	"process",
 ] }
+zip = { version = "8.6.0", default-features = false, features = [
+	"bzip2",
+	"deflate",
+	"deflate64",
+	"lzma",
+	"ppmd",
+	"xz",
+	"zstd",
+] } # most default features except for encryption, which we definitely won't need to extract Rclone zip
 
 [dev-dependencies]
 test-utils = { path = "../test-utils" }
