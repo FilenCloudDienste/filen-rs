@@ -1043,8 +1043,8 @@ mod rclone {
 		let config_dir = config.config_dir.join("rclone");
 		check_already_downloaded(ui, &config_dir).await;
 		let rclone = filen_rclone_wrapper::rclone_installation::RcloneInstallation::initialize(
-			client.get(ui).await?,
 			&RcloneInstallationConfig::new(&config_dir),
+			Some(client.get(ui).await?),
 		)
 		.await
 		.context("Failed to initialize rclone installation")?;

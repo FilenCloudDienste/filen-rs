@@ -30,7 +30,7 @@ impl NetworkDrive {
 		transfers: Option<usize>,
 		rclone_args: Vec<String>,
 	) -> Result<NetworkDrive> {
-		let rclone = RcloneInstallation::initialize(client, config).await?;
+		let rclone = RcloneInstallation::initialize(config, Some(client)).await?;
 		let mount_point = resolve_mount_point(mount_point).await?;
 
 		// construct args

@@ -67,7 +67,7 @@ pub async fn start_basic_server(
 		args.extend(["--user", &user, "--pass", &password]);
 	}
 	args.extend(rclone_args.iter().map(String::as_str));
-	let (process, _) = RcloneInstallation::initialize(client, config)
+	let (process, _) = RcloneInstallation::initialize(config, Some(client))
 		.await?
 		.execute_in_background(&args)
 		.await?;

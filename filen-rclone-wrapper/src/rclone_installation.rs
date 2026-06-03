@@ -50,34 +50,25 @@ impl RcloneInstallation {
 			.is_ok()
 	}
 
-	pub async fn initialize(client: &Client, config: &RcloneInstallationConfig) -> Result<Self> {
+	/// Initializes Rclone, downloading the binary if necessary.
+	/// If `client` is provided, an authenticated Filen remote "filen" is configured.
+	pub async fn initialize(
+		config: &RcloneInstallationConfig,
+		client: Option<&Client>,
+	) -> Result<Self> {
 		fs::create_dir_all(&config.config_dir)
 			.await
 			.context("Failed to create Rclone installation directory")?;
 		let rclone_binary_path = ensure_rclone_binary(&config.rclone_binary_dir, false).await?;
 		let rclone_config_path =
-			write_rclone_config(&rclone_binary_path, Some(client), &config.config_dir).await?;
+			write_rclone_config(&rclone_binary_path, client, &config.config_dir).await?;
 		Ok(Self {
 			rclone_binary_path,
 			rclone_config_path,
 		})
 	}
 
-	/// Initializes Rclone without a configuration containing an authenticated remote.
-	/// Executing commands that require the "filen" remote to be configured will fail.
-	pub async fn initialize_unauthenticated(config: &RcloneInstallationConfig) -> Result<Self> {
-		fs::create_dir_all(&config.config_dir)
-			.await
-			.context("Failed to create Rclone installation directory")?;
-		let rclone_binary_path = ensure_rclone_binary(&config.rclone_binary_dir, false).await?;
-		let rclone_config_path =
-			write_rclone_config(&rclone_binary_path, None, &config.config_dir).await?;
-		Ok(Self {
-			rclone_binary_path,
-			rclone_config_path,
-		})
-	}
-
+	/// Executes an rclone command and waits for it to finish.
 	pub async fn execute(&self, args: &[&str]) -> Result<ExitStatus> {
 		debug!("Executing rclone with args: {}", args.join(" "));
 		let status = self
@@ -90,8 +81,7 @@ impl RcloneInstallation {
 		Ok(status)
 	}
 
-	/// Executes an rclone command in the background,
-	/// exposing the Rclone RC Api
+	/// Executes an rclone command in the background, exposing the Rclone RC API.
 	pub async fn execute_in_background(&self, args: &[&str]) -> Result<(Child, RcloneApiClient)> {
 		let rc_port = free_local_ipv4_port()
 			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
