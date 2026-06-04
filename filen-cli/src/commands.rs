@@ -916,7 +916,7 @@ async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 
 mod rclone {
 	//! [cli-doc] managed-rclone
-	//! The Filen CLI includes a managed installation of [Rclone](https://rclone.org/), which can be used to access Filen.
+	//! The Filen CLI includes a managed installation of Rclone, which can be used to [access Filen](https://rclone.org/filen).
 	//! It is automatically downloaded and configured (authenticated) when you run the commands like `rclone`, `mount`, etc.
 
 	use anyhow::{Context as _, Result};
