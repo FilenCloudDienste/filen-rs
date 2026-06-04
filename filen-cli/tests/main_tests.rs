@@ -1,7 +1,5 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use assert_fs::TempDir;
-use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::HasName;
 use predicates::prelude::PredicateBooleanExt;
 
 #[test]
@@ -95,8 +93,10 @@ fn unknown_command() {
 }
 
 #[cfg(target_os = "linux")] // rexpect only works on linux
-#[shared_test_runtime]
+#[filen_macros::shared_test_runtime]
 async fn interactive_repl() {
+	use filen_sdk_rs::fs::HasName;
+
 	let test_resources = test_utils::RESOURCES.get_resources().await;
 	let (email, password, _) = test_utils::RESOURCES.get_credentials();
 	unsafe {
