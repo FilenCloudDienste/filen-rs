@@ -278,38 +278,50 @@ impl UI {
 
 	/// Prompt the user for input in the REPL (contains some special formatting)
 	pub(crate) fn prompt_repl(&mut self, path: &str) -> Result<String> {
-		dialoguer::Input::with_theme(&self.repl_input_theme)
+		info!("[PROMPT] prompt_repl with path: {}", path);
+		let answer = dialoguer::Input::with_theme(&self.repl_input_theme)
 			.history_with(&mut self.history)
 			.with_prompt(path.trim())
 			.interact_text()
-			.context(FAILED_TO_READ_INPUT_PROMPT)
+			.context(FAILED_TO_READ_INPUT_PROMPT)?;
+		info!("[PROMPT] answer: {}", answer);
+		Ok(answer)
 	}
 
 	/// Prompt the user for text input
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
-		dialoguer::Input::with_theme(&self.theme)
+		info!("[PROMPT] prompt with message: {}", msg);
+		let answer = dialoguer::Input::with_theme(&self.theme)
 			.history_with(&mut self.history)
 			.with_prompt(msg.trim())
 			.interact_text()
-			.context(FAILED_TO_READ_INPUT_PROMPT)
+			.context(FAILED_TO_READ_INPUT_PROMPT)?;
+		info!("[PROMPT] answer: {}", answer);
+		Ok(answer)
 	}
 
 	/// Prompt the user for a password (no echo)
 	pub(crate) fn prompt_password(&mut self, msg: &str) -> Result<String> {
-		dialoguer::Password::with_theme(&self.theme)
+		info!("[PROMPT] prompt_password with message: {}", msg);
+		let answer = dialoguer::Password::with_theme(&self.theme)
 			.with_prompt(msg.trim())
 			.interact()
-			.context(FAILED_TO_READ_INPUT_PROMPT)
+			.context(FAILED_TO_READ_INPUT_PROMPT)?;
+		info!("[PROMPT] answer not displayed in logs");
+		Ok(answer)
 	}
 
 	/// Prompt the user for a yes/no input
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
-		dialoguer::Confirm::with_theme(&self.theme)
+		info!("[PROMPT] prompt_confirm with message: {}", msg);
+		let answer = dialoguer::Confirm::with_theme(&self.theme)
 			.with_prompt(msg.trim())
 			.default(default)
 			.report(true)
 			.interact()
-			.context(FAILED_TO_READ_INPUT_PROMPT)
+			.context(FAILED_TO_READ_INPUT_PROMPT)?;
+		info!("[PROMPT] answer: {}", answer);
+		Ok(answer)
 	}
 
 	// format help text

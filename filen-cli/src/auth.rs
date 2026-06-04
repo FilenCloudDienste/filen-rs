@@ -242,6 +242,7 @@ async fn authenticate_from_environment_variables(ui: &mut UI) -> Result<Option<C
 	.await?;
 	Ok(Some(client))
 }
+// todo: clap has an option to read arguments from environment variables, use that instead of doing it manually like this
 
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
 
