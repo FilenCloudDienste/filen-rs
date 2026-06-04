@@ -1,6 +1,7 @@
 //! [cli-doc] auth-methods
 //! There are multiple ways to authenticate:
-//! - set the CLI arguments `--email` and `--password` (optionally `--two-factor-code`)
+//! - set the CLI arguments `--email` (or environment variable `FILEN_CLI_EMAIL`)
+//!   and `--password` (`FILEN_CLI_PASSWORD`), optionally `--two-factor-code` (`FILEN_CLI_2FA_CODE`)
 //!   (when the two-factor code is omitted and required, you will be prompted for it)
 //! - specify an auth config via the `--auth-config-path` flag
 //!   (exported via `filen export-auth-config`),
@@ -9,8 +10,6 @@
 //!   - `./filen-cli-auth-config.txt` (current working directory)
 //!   - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`
 //!   - Windows: `%appdata%\filen-cli\filen-cli-auth-config.txt`
-//! - set environment variables (`FILEN_CLI_EMAIL` and `FILEN_CLI_PASSWORD`, optionally `FILEN_CLI_2FA_CODE`)
-//!   (when the two-factor code is omitted and required, you will be prompted for it)
 //! - if none of these is set, you will be prompted for credentials,
 //!   with the option to save them securely in the system keychain
 
@@ -112,9 +111,6 @@ pub(crate) async fn authenticate_and_get_password(
 			"Authenticated from auth config file {}",
 			export_path.display()
 		);
-		Ok(client)
-	} else if let Some(client) = authenticate_from_environment_variables(ui).await? {
-		log::info!("Authenticated from environment variables");
 		Ok(client)
 	} else {
 		match authenticate_from_keyring().await {
@@ -224,25 +220,6 @@ pub(crate) fn find_auth_config_default_locations(config: &CliConfig) -> Vec<Path
 	.filter(|path| path.exists())
 	.collect()
 }
-
-/// Authenticate from credentials provided via environment variables.
-async fn authenticate_from_environment_variables(ui: &mut UI) -> Result<Option<Client>> {
-	let email_var = std::env::var("FILEN_CLI_EMAIL").ok();
-	let password_var = std::env::var("FILEN_CLI_PASSWORD").ok();
-	let two_factor_code_var = std::env::var("FILEN_CLI_2FA_CODE").ok();
-	if email_var.is_none() && password_var.is_none() && two_factor_code_var.is_none() {
-		return Ok(None);
-	}
-	let client = login_and_optionally_prompt_two_factor_code(
-		ui,
-		email_var.context("FILEN_CLI_EMAIL is required")?,
-		&password_var.context("FILEN_CLI_PASSWORD is required")?,
-		two_factor_code_var.as_deref(),
-	)
-	.await?;
-	Ok(Some(client))
-}
-// todo: clap has an option to read arguments from environment variables, use that instead of doing it manually like this
 
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
 

@@ -52,15 +52,15 @@ pub(crate) struct CliArgs {
 	config_dir: Option<PathBuf>,
 
 	/// Filen account email (requires --password)
-	#[arg(short, long)]
+	#[arg(short, long, env = "FILEN_CLI_EMAIL")]
 	email: Option<String>,
 
 	/// Filen account password (requires --email)
-	#[arg(short, long)]
+	#[arg(short, long, env = "FILEN_CLI_PASSWORD")]
 	password: Option<String>,
 
 	/// Filen account two-factor code (optional, requires --email and --password)
-	#[arg(short, long)]
+	#[arg(short, long, env = "FILEN_CLI_2FA_CODE")]
 	two_factor_code: Option<String>,
 
 	/// Path to auth config file (exported via `filen export-auth-config`)

@@ -9,7 +9,7 @@ metadata.workspaces = { independent = true }
 
 [dependencies]
 anyhow = "1.0.98"
-clap = { version = "4.5.43", features = ["derive"] }
+clap = { version = "4.5.43", features = ["derive", "env"] }
 env_logger = "0.11.8"
 filen-sdk-rs = { path = "../filen-sdk-rs" }
 filen-types = { path = "../filen-types" }

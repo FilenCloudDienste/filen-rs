@@ -383,8 +383,8 @@ impl UI {
 			.lines()
 			.filter(|l| !l.is_empty())
 			.map(|l| {
-				// if line contains an ansi code, it's the definition line
-				if l.trim().contains("[") || l.trim().starts_with("-") {
+				// if line starts with an ansi code, it's the definition line
+				if l.trim().starts_with("[") || l.trim().starts_with("-") {
 					format!("{} {}", style("→").dim(), l.trim())
 				} else {
 					format!("  {}", l.trim())
