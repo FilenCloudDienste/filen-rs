@@ -194,7 +194,7 @@ fn authenticate_from_auth_config(
 	let auth_config_paths = if let Some(path) = path_arg {
 		vec![PathBuf::from(path)]
 	} else {
-		find_auth_config_default_locations(config)
+		get_auth_config_default_locations(config)
 	};
 	for path in auth_config_paths {
 		if path.exists() {
@@ -207,18 +207,18 @@ fn authenticate_from_auth_config(
 	Ok(None)
 }
 
-/// Find default locations where auth config files are present.
-pub(crate) fn find_auth_config_default_locations(config: &CliConfig) -> Vec<PathBuf> {
-	vec![
-		std::env::current_dir()
-			.context("Failed to get current working directory")
-			.unwrap()
-			.join(AUTH_CONFIG_FILENAME),
-		config.config_dir.join(AUTH_CONFIG_FILENAME),
-	]
-	.into_iter()
-	.filter(|path| path.exists())
-	.collect()
+/// Get the default locations for auth config files: inside the current working directory, and the config directory.
+pub(crate) fn get_auth_config_default_locations(config: &CliConfig) -> Vec<PathBuf> {
+	let mut locations = Vec::new();
+	match std::env::current_dir() {
+		Ok(current_dir) => locations.push(current_dir.join(AUTH_CONFIG_FILENAME)),
+		Err(e) => log::warn!(
+			"Failed to get current working directory, so not checking there for an auth config file: {:?}",
+			e
+		),
+	}
+	locations.push(config.config_dir.join(AUTH_CONFIG_FILENAME));
+	locations.into_iter().filter(|path| path.exists()).collect()
 }
 
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
@@ -304,16 +304,18 @@ pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 			}
 		}
 	}
-	for path in find_auth_config_default_locations(config) {
-		found_any_credentials = true;
-		if ui.prompt_confirm(
-			&format!("Delete auth config file at {}?", path.display()),
-			false,
-		)? {
-			std::fs::remove_file(&path).with_context(|| {
-				format!("Failed to delete auth config file at {}", path.display())
-			})?;
-			ui.print_success(&format!("Deleted auth config file at {}", path.display()));
+	for path in get_auth_config_default_locations(config) {
+		if path.exists() {
+			found_any_credentials = true;
+			if ui.prompt_confirm(
+				&format!("Delete auth config file at {}?", path.display()),
+				false,
+			)? {
+				std::fs::remove_file(&path).with_context(|| {
+					format!("Failed to delete auth config file at {}", path.display())
+				})?;
+				ui.print_success(&format!("Deleted auth config file at {}", path.display()));
+			}
 		}
 	}
 	if found_any_credentials {
