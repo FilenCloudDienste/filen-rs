@@ -47,7 +47,7 @@ pub(crate) struct CliArgs {
 	#[arg(short, long)]
 	quiet: bool,
 
-	/// Config directory (overwrite system default)
+	/// Config directory (overrides system default)
 	#[arg(long)]
 	config_dir: Option<PathBuf>,
 

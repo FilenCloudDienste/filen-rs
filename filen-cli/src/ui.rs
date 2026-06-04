@@ -51,7 +51,7 @@ pub(crate) struct UI {
 	theme: dialoguer::theme::ColorfulTheme,
 	repl_input_theme: dialoguer::theme::ColorfulTheme,
 	history: dialoguer::BasicHistory,
-	overwrite_terminal_width: Option<usize>,
+	override_terminal_width: Option<usize>,
 	output: Vec<String>,
 
 	/// Whether to output machine-readable JSON where applicable
@@ -70,7 +70,7 @@ impl UI {
 			},
 			repl_input_theme: Self::repl_input_theme_for_user(None),
 			history: dialoguer::BasicHistory::new().no_duplicates(true),
-			overwrite_terminal_width: None,
+			override_terminal_width: None,
 			output: Vec::new(),
 			json: false,
 		}
@@ -80,11 +80,11 @@ impl UI {
 		&mut self,
 		quiet: bool,
 		json: bool,
-		overwrite_terminal_width: Option<usize>,
+		override_terminal_width: Option<usize>,
 	) {
 		self.quiet = quiet;
 		self.json = json;
-		self.overwrite_terminal_width = overwrite_terminal_width;
+		self.override_terminal_width = override_terminal_width;
 	}
 
 	pub(crate) fn set_user(&mut self, user: Option<&str>) {
@@ -107,7 +107,7 @@ impl UI {
 	}
 
 	fn get_terminal_width(&self) -> Option<usize> {
-		match self.overwrite_terminal_width {
+		match self.override_terminal_width {
 			Some(size) => Some(size),
 			None => termsize::get().map(|size| size.cols as usize),
 		}
