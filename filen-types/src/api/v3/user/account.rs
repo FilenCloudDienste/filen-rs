@@ -139,10 +139,10 @@ pub struct UserAccountSubs {
 		tsify(type = "bigint")
 	)]
 	pub storage: u64,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
-	pub activated: DateTime<Utc>,
-	#[serde(with = "chrono::serde::ts_milliseconds")]
-	pub cancelled: DateTime<Utc>,
+	#[serde(with = "crate::serde::boolean::number")]
+	pub activated: bool,
+	#[serde(with = "crate::serde::boolean::number")]
+	pub cancelled: bool,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
 	pub start_timestamp: DateTime<Utc>,
 	#[serde(with = "chrono::serde::ts_milliseconds")]
