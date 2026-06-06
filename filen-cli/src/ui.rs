@@ -8,7 +8,7 @@ use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
 
-use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX, custom_arg_values::FilenCompleter, util::RemotePath};
+use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX, completion::FilenCompleter, util::RemotePath};
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -285,7 +285,7 @@ impl UI {
 		client: Arc<Client>,
 		working_path: &RemotePath,
 	) -> Result<String> {
-		info!("[PROMPT] prompt_repl with path: {}", path);
+		info!("[PROMPT] prompt_repl with path: {}", working_path);
 		let answer = dialoguer::Input::with_theme(&self.repl_input_theme)
 			.history_with(&mut self.history)
 			.completion_with(&DialoguerCompleter {

@@ -1,41 +1,36 @@
-use std::{fmt::Display, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use clap::builder::OsStr;
 use clap_complete::{ArgValueCompleter, CompletionCandidate, engine::ValueCompleter};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{FSObject, HasName, dir::DirectoryType},
+	fs::categories::{DirType, NonRootFileType, Normal},
 };
 
 use crate::util::RemotePath;
 
-#[derive(PartialEq)]
-pub(crate) enum FilenArgType {
+#[derive(PartialEq, strum::EnumString, strum::Display)]
+enum FilenArgType {
+	#[strum(serialize = "file")]
 	File,
+	#[strum(serialize = "directory")]
 	Directory,
+	#[strum(serialize = "file_or_directory")]
 	FileOrDirectory,
 }
 
-impl From<&str> for FilenArgType {
-	fn from(s: &str) -> Self {
-		match s {
-			"file" => FilenArgType::File,
-			"directory" => FilenArgType::Directory,
-			"file_or_directory" => FilenArgType::FileOrDirectory,
-			_ => panic!("Unknown FilenArgType: {}", s), // todo: style?
-		}
-	}
-}
+impl FilenArgType {
+	const UNINITIALIZED_COMPLETER_OUTPUT: &str = "UNINITIALIZED_COMPLETER_OUTPUT_type=";
 
-impl Display for FilenArgType {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let s = match self {
-			FilenArgType::File => "file",
-			FilenArgType::Directory => "directory",
-			FilenArgType::FileOrDirectory => "file_or_directory",
-		};
-		write!(f, "{}", s)
+	fn get_uninitialized_completion_output(&self) -> String {
+		format!("{}{}", Self::UNINITIALIZED_COMPLETER_OUTPUT, self)
+	}
+
+	fn try_parse_completion_output(output: &str) -> Option<FilenArgType> {
+		output
+			.strip_prefix(Self::UNINITIALIZED_COMPLETER_OUTPUT)
+			.map(|arg_type| FilenArgType::from_str(arg_type).expect("must be valid"))
 	}
 }
 
@@ -47,11 +42,9 @@ pub(crate) struct FilenCompleter(FilenArgType, Option<CompleterContext>);
 
 #[derive(Clone)]
 struct CompleterContext {
-	pub(crate) client: Arc<Client>,
-	pub(crate) working_path: RemotePath,
+	client: Arc<Client>,
+	working_path: RemotePath,
 }
-
-const UNINITIALIZED_COMPLETER_OUTPUT: &str = "UNINITIALIZED_COMPLETER_OUTPUT_type=";
 
 impl FilenCompleter {
 	pub(crate) fn file() -> ArgValueCompleter {
@@ -82,12 +75,12 @@ impl FilenCompleter {
 						.complete(&OsStr::default())
 						.first()
 						.map(|c| c.get_value().to_str())
-					&& let Some(arg_type) = completion.strip_prefix(UNINITIALIZED_COMPLETER_OUTPUT)
+					&& let Some(arg_type) = FilenArgType::try_parse_completion_output(completion)
 				{
 					arg.add(ArgValueCompleter::new(Self(
-						arg_type.into(),
+						arg_type,
 						Some(context.clone()),
-					)))
+					))) // todo: is it right to just add it in addition to the placeholder completer?
 				} else {
 					arg
 				}
@@ -99,10 +92,7 @@ impl FilenCompleter {
 impl ValueCompleter for FilenCompleter {
 	fn complete(&self, _input: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
 		match self.1 {
-			None => vec![CompletionCandidate::new(format!(
-				"{}{}",
-				UNINITIALIZED_COMPLETER_OUTPUT, self.0
-			))],
+			None => vec![self.0.get_uninitialized_completion_output().into()],
 			Some(ref context) => tokio::task::block_in_place(|| {
 				match tokio::runtime::Handle::current().block_on(Self::complete(
 					&self.0,
@@ -134,32 +124,31 @@ impl FilenCompleter {
 		match arg_type {
 			FilenArgType::File | FilenArgType::Directory | FilenArgType::FileOrDirectory => {
 				let path = working_path.navigate(input);
-				let parent = match client
+				let parent: DirType<'_, Normal> = match client // todo: can we infer Normal?
 					.find_item_at_path(&path.parent().0)
 					.await
 					.context("Failed to find parent dir")?
 				{
-					Some(FSObject::Dir(dir)) => DirectoryType::Dir(dir),
-					Some(FSObject::Root(root)) => DirectoryType::Root(root),
-					Some(FSObject::RootWithMeta(root)) => DirectoryType::RootWithMeta(root),
+					Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+					Some(NonRootFileType::Root(root)) => DirType::Root(root),
 					Some(_) => return Err(anyhow!("Parent is not a directory")),
 					None => return Err(anyhow!("Parent directory not found")),
 				};
 				let (dirs, files) = client
-					.list_dir(&parent)
+					.list_dir(&parent, None::<&fn(u64, Option<u64>)>) // todo: ?
 					.await
 					.context("Failed to list parent directory")?;
 				let mut candidates = Vec::new();
 				let basename_input = path.basename().unwrap_or("");
 				for dir in dirs {
-					let name = dir.name().unwrap_or("");
+					let name = dir.meta.name().unwrap_or("");
 					if name.starts_with(basename_input) {
 						candidates.push(format!("{}/", name));
 					}
 				}
 				if arg_type == &FilenArgType::File || arg_type == &FilenArgType::FileOrDirectory {
 					for file in files {
-						let name = file.name().unwrap_or("");
+						let name = file.meta.name().unwrap_or("");
 						if name.starts_with(basename_input) {
 							candidates.push(name.to_string());
 						}
