@@ -2,6 +2,8 @@
 //!
 //! Welcome to Filen CLI v{{VERSION}}!
 //!
+//! You can find out more about the Filen CLI at https://github.com/FilenCloudDienste/filen-cli-releases
+//!
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
 

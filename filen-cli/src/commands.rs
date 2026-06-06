@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::{
 	CliConfig, CommandResult,
 	auth::{self, LazyClient, export_auth_config},
-	docs::print_in_app_docs,
+	docs::{print_in_app_docs, serve_markdown_docs_as_html},
 	ui::{self, UI},
 	util::RemotePath,
 };
@@ -162,6 +162,8 @@ pub(crate) enum Commands {
 	// todo: s3 server
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
+	/// View the documentation (same as --help) locally in a browser rendered as HTML
+	ViewHtmlDocs,
 	/// Delete saved credentials and exit
 	Logout,
 	/// Exit the REPL
@@ -363,6 +365,10 @@ pub(crate) async fn execute_command(
 					client.api_key.as_str(),
 				)]);
 			}
+			None
+		}
+		Commands::ViewHtmlDocs => {
+			serve_markdown_docs_as_html(ui).context("Failed to serve markdown docs as HTML")?;
 			None
 		}
 		Commands::Logout => {

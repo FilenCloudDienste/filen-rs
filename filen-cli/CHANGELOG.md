@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-- /
+### Added
+
+- `view-html-docs` command to view the in-app docs locally in a browser rendered as HTML
 
 ## 0.2.6 - 2026-06-04
 
