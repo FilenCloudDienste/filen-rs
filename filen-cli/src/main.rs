@@ -24,7 +24,7 @@ use crate::{
 
 mod auth;
 mod commands;
-mod custom_arg_values;
+mod completion;
 mod docs;
 mod ui;
 mod updater;

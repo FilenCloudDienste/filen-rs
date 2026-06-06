@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::{
 	CliConfig, CommandResult,
 	auth::{self, LazyClient, export_auth_config},
-	custom_arg_values::FilenCompleter,
+	completion::FilenCompleter,
 	docs::{print_in_app_docs, serve_markdown_docs_as_html},
 	ui::{self, UI},
 	util::RemotePath,

@@ -63,6 +63,7 @@ tiny_http = "0.12.0"
 port_check = "0.3.0"
 open = "5.3.5"
 clap_complete = { version = "4.5.65", features = ["unstable-dynamic"] }
+strum = { version = "0.28.0", features = ["derive"] }
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }
