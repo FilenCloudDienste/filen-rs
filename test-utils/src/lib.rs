@@ -5,11 +5,12 @@ use std::{
 	time::Duration,
 };
 
+use anyhow::{Context, Result};
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_sdk_rs::{
 	auth::{Client, http::ClientConfig, unauth::UnauthClient},
 	fs::{
-		HasName,
+		HasName, HasUUID,
 		categories::{RootItemType, Shared},
 		dir::RemoteDirectory,
 	},
@@ -411,4 +412,38 @@ pub mod cli {
 			$crate::cli::run_authenticated_cli_with_args(&mut assert_cmd::cargo::cargo_bin_cmd!("filen-cli"), &[$($arg),*]).await
 		};
 	}
+}
+
+/// Creates a file structure outline (directories and placeholder files) at the given path.
+/// Items should be specified with their full path relative to `root`,
+/// parents don't need to be explicitly included, and folders must end with a '/', e.g.
+/// `["dir1/", "dir2/file_in_dir2.txt", "file.txt"]`
+pub async fn create_remote_file_structure_outline(
+	client: &Client,
+	root: RemoteDirectory,
+	items: &[&str],
+) -> Result<()> {
+	for item in items {
+		if item.ends_with('/') {
+			// create dir
+			client
+				.find_or_create_dir_starting_at(root.clone().into(), item)
+				.await?;
+		} else {
+			// create file
+			let (parent, filename) = item.rsplit_once('/').unwrap_or(("/", item));
+			let parent_dir = client
+				.find_or_create_dir_starting_at(root.clone().into(), parent)
+				.await?;
+			let file = client
+				.make_file_builder(filename, *parent_dir.uuid())
+				.context("Failed to create file builder")?;
+			let content = "This is just a placeholder file created by test_utils::create_remote_file_structure_outline";
+			client
+				.upload_file(file, content.as_bytes())
+				.await
+				.context("Failed to upload file")?;
+		}
+	}
+	Ok(())
 }

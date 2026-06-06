@@ -1,4 +1,4 @@
-use std::{ffi::OsString, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
@@ -8,7 +8,7 @@ use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
 
-use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX, completion::FilenCompleter, util::RemotePath};
+use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX, util::RemotePath};
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -300,44 +300,6 @@ impl UI {
 		// todo: terminal has weird graphical glitches when using the completer
 	}
 
-	// for DialoguerCompleter
-	fn completer(
-		input: &str,
-		client: Arc<Client>,
-		working_path: &RemotePath,
-	) -> Result<Option<String>> {
-		let args = shlex::split(input)
-			.context("Invalid quoting")?
-			.iter()
-			.map(|str| str.into())
-			.collect::<Vec<OsString>>();
-		if args.is_empty() {
-			return Ok(None);
-		}
-		let args_index = args.len();
-		let mut cli = CliArgs::command();
-		cli = FilenCompleter::initialize_completers_in_command(cli, client, working_path);
-		match clap_complete::engine::complete(
-			&mut cli,
-			vec!["filen"]
-				.into_iter()
-				.map(OsString::from)
-				.chain(args.clone())
-				.collect(),
-			args_index,
-			std::env::current_dir().ok().as_deref(),
-		) {
-			Ok(candidates) => Ok(candidates.first().and_then(|candidate| {
-				let completion = candidate.get_value().to_string_lossy().to_string();
-				let replace_word = args.last().unwrap();
-				input
-					.strip_suffix(replace_word.to_str().unwrap())
-					.map(|prefix| format!("{}{}", prefix, completion))
-			})),
-			Err(_) => Ok(None),
-		}
-	}
-
 	/// Prompt the user for text input
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt with message: {}", msg);
@@ -471,9 +433,9 @@ struct DialoguerCompleter<'a> {
 
 impl dialoguer::Completion for DialoguerCompleter<'_> {
 	fn get(&self, input: &str) -> Option<String> {
-		UI::completer(input, self.client.clone(), self.working_path)
+		crate::completion::completer(input, self.client.clone(), self.working_path)
 			.ok()
-			.flatten()
+			.and_then(|completions| completions.first().cloned())
 	}
 }
 

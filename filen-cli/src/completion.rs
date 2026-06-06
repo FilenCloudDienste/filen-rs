@@ -1,14 +1,14 @@
-use std::{str::FromStr, sync::Arc};
+use std::{ffi::OsString, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
-use clap::builder::OsStr;
+use clap::{CommandFactory as _, builder::OsStr};
 use clap_complete::{ArgValueCompleter, CompletionCandidate, engine::ValueCompleter};
 use filen_sdk_rs::{
 	auth::Client,
 	fs::categories::{DirType, NonRootFileType, Normal},
 };
 
-use crate::util::RemotePath;
+use crate::{CliArgs, util::RemotePath};
 
 #[derive(PartialEq, strum::EnumString, strum::Display)]
 enum FilenArgType {
@@ -169,4 +169,119 @@ impl FilenCompleter {
 	}
 }
 
+// for DialoguerCompleter
+pub(crate) fn completer(
+	input: &str,
+	client: Arc<Client>,
+	working_path: &RemotePath,
+) -> Result<Vec<String>> {
+	let args = shlex::split(input)
+		.context("Invalid quoting")?
+		.iter()
+		.map(|str| str.into())
+		.collect::<Vec<OsString>>();
+	if args.is_empty() {
+		return Ok(Vec::new());
+	}
+	let args_index = args.len();
+	let mut cli = CliArgs::command();
+	cli = FilenCompleter::initialize_completers_in_command(cli, client, working_path);
+	match clap_complete::engine::complete(
+		&mut cli,
+		vec!["filen"]
+			.into_iter()
+			.map(OsString::from)
+			.chain(args.clone())
+			.collect(),
+		args_index,
+		std::env::current_dir().ok().as_deref(),
+	) {
+		Ok(candidates) => Ok(candidates
+			.into_iter()
+			.filter_map(|candidate| {
+				let completion = candidate.get_value().to_string_lossy().to_string();
+				let replace_word = args.last().unwrap();
+				input
+					.strip_suffix(replace_word.to_str().unwrap())
+					.map(|prefix| format!("{}{}", prefix, completion))
+			})
+			.collect::<Vec<_>>()),
+		Err(_) => Ok(Vec::new()),
+	}
+}
+
 // todo: see if we can use this same autocompletion logic for shell completion as well?
+
+#[cfg(test)]
+mod tests {
+	use crate::util::RemotePath;
+
+	#[filen_macros::shared_test_runtime]
+	async fn test_completer() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let root = resources.dir.clone();
+		let root_path = RemotePath::new(root.meta.name().unwrap());
+
+		let test_completer = |input: &str, expected: &[&str]| {
+			let mut expected = Vec::from(expected);
+			expected.sort();
+			match super::completer(input, client.clone(), &root_path) {
+				Ok(completions) => {
+					let mut completions = completions;
+					completions.sort(); // ignore order
+					assert_eq!(
+						completions, expected,
+						"Unexpected completions for input '{}'",
+						input
+					)
+				}
+				Err(e) => panic!("Error during completion: {}", e),
+			}
+		};
+
+		test_utils::create_remote_file_structure_outline(
+			client,
+			root,
+			&[
+				"dir1/",
+				"dir1/file_in_dir1.txt",
+				"dir1/subdir1/file_in_subdir1.txt",
+				"dir2/",
+				"some_file.txt",
+				"some_dir/",
+			],
+		)
+		.await
+		.unwrap();
+
+		// complete commands
+		test_completer("c", &["cat", "cd", "cp"]);
+
+		// basic completion of files and directories
+		test_completer("ls d", &["ls dir1/", "ls dir2/"]);
+		test_completer("ls dir1/", &["ls dir1/"]);
+
+		// complete second arguments
+		test_completer("cp some_file.txt some_d", &["cp some_file.txt some_dir/"]);
+
+		// differentiate between files and directories
+		test_completer("cat some", &["cat some_file.txt", "cat some_dir/"]); // directories should also be suggested for cat, because they might contain files that the user wants to cat
+		test_completer("ls some", &["ls some_dir/"]); // ls only accepts directories
+
+		// completion in subdirectories
+		test_completer("cat dir1/f", &["cat dir1/file_in_dir1.txt"]);
+		test_completer("cat dir1/s", &["cat dir1/subdir1/"]);
+		test_completer(
+			"cat dir1/subdir1/f",
+			&["cat dir1/subdir1/file_in_subdir1.txt"],
+		);
+
+		// completion edge cases
+		test_completer("ls dir1", &["ls dir1/"]);
+		// non-existing path
+		test_completer("ls non_existing", &[]);
+		// empty input
+		test_completer("ls ", &[]);
+	}
+}
