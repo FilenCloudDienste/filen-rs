@@ -54,6 +54,7 @@ comrak = { version = "0.52.0", default-features = false, features = [
 ] } # needed to remove feature "clap", since it would cause clap_builder's dependency "terminal_size" to be included, which would make ugly line breaks in the help rendering
 tiny_http = "0.12.0"
 port_check = "0.3.0"
+open = "5.3.5"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }

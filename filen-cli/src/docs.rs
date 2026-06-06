@@ -411,6 +411,9 @@ pub(crate) fn serve_markdown_docs_as_html(ui: &mut UI) -> Result<()> {
 		"Serving documentation at http://localhost:{}",
 		server_port
 	));
+	if let Err(e) = open::that(format!("http://localhost:{}", server_port)) {
+		log::warn!("Failed to open docs URL in browser automatically: {}", e);
+	}
 
 	for request in server.incoming_requests() {
 		let Some(section) = parsed_doc_outline.iter().find(|section| {
