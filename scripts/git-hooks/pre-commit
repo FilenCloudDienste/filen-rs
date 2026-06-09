@@ -59,7 +59,7 @@ if have sqlfluff; then
 		| tr '\0' '\n' | grep -E '\.sql$' || true)
 	if [ -n "$staged_sql" ]; then
 		# shellcheck disable=SC2086
-		run "sqlfluff lint (staged)" bash -c "sqlfluff lint $staged_sql"
+		run "sqlfluff lint (staged)" bash -c 'sqlfluff lint "$@"' _ $staged_sql
 	else
 		printf '%s==>%s sqlfluff: no staged .sql files\n' "$bold" "$reset"
 	fi
