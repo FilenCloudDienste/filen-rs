@@ -1,3 +1,7 @@
+-- Type-specific metadata upsert. MUST be called AFTER ITEM_UPSERT has
+-- written the `items` row and returned its stable id (passed as the first
+-- `?` here). `content_hash` lives on `items`, not here, so it is
+-- deliberately absent.
 INSERT INTO files (
 	id,
 	chunks_size,

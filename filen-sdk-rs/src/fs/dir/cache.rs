@@ -5,7 +5,7 @@ use filen_types::{
 	api::v3::dir::color::DirColor, fs::ParentUuid, rkyv::date_time::DateTimeUtcDef,
 	traits::CowHelpers,
 };
-use rkyv::with::Map;
+use rkyv::with::{AsOwned, Map};
 use uuid::Uuid;
 
 use crate::{
@@ -24,6 +24,7 @@ pub struct CacheableDir<'a> {
 	#[rkyv(with = DateTimeUtcDef)]
 	pub timestamp: DateTime<Utc>,
 
+	#[rkyv(with = AsOwned)]
 	pub name: Cow<'a, str>,
 	#[rkyv(with = Map<DateTimeUtcDef>)]
 	pub created: Option<DateTime<Utc>>,

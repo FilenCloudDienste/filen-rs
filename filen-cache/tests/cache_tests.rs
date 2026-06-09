@@ -1,435 +1,19 @@
-use std::{
-	borrow::Cow,
-	path::{Path, PathBuf},
-	time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-use chrono::Utc;
-use filen_cache::{CacheError, CacheHandle, CacheMessage};
+use filen_cache::{CacheError, CacheEvent, CacheHandle, CacheMessage, SyncRootCallback};
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
-	auth::Client,
-	crypto::file::FileKey,
-	fs::{
-		HasUUID,
-		dir::meta::{DecryptedDirectoryMeta, DirectoryMeta, DirectoryMetaChanges},
-		file::meta::{DecryptedFileMeta, FileMeta, FileMetaChanges},
-	},
+	ErrorKind,
+	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
 	io::{RemoteDirectory, RemoteFile},
-	socket::DecryptedSocketEvent,
 };
-use filen_types::{
-	api::v3::dir::color::DirColor,
-	auth::FileEncryptionVersion,
-	crypto::EncryptedString,
-	fs::{ParentUuid, UuidStr},
-	traits::CowHelpersExt,
-};
-use rusqlite::{Connection, OpenFlags, params};
+use filen_types::api::v3::dir::color::DirColor;
+use rusqlite::params;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// Generate a unique temporary cache DB path.
-fn temp_cache_path() -> PathBuf {
-	let mut path = std::env::temp_dir();
-	path.push(format!("filen_cache_test_{}.db", Uuid::new_v4()));
-	path
-}
-
-/// Open a read-only SQLite connection to the cache DB.
-fn open_read_db(path: &Path) -> rusqlite::Result<Connection> {
-	Connection::open_with_flags(
-		path,
-		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-	)
-}
-
-/// Poll until the given UUID appears in the items table, or timeout.
-async fn poll_for_item(db_path: &Path, uuid: Uuid, timeout: Duration) -> bool {
-	let deadline = tokio::time::Instant::now() + timeout;
-	loop {
-		if tokio::time::Instant::now() >= deadline {
-			return false;
-		}
-		if let Ok(conn) = open_read_db(db_path) {
-			let exists: Result<bool, _> = conn.query_row(
-				"SELECT COUNT(*) > 0 FROM items WHERE uuid = ?",
-				params![uuid],
-				|row| row.get(0),
-			);
-			if let Ok(true) = exists {
-				return true;
-			}
-		}
-		tokio::time::sleep(Duration::from_millis(200)).await;
-	}
-}
-
-/// Poll until the given UUID is no longer in the items table, or timeout.
-async fn poll_for_item_absent(db_path: &Path, uuid: Uuid, timeout: Duration) -> bool {
-	let deadline = tokio::time::Instant::now() + timeout;
-	loop {
-		if tokio::time::Instant::now() >= deadline {
-			return false;
-		}
-		if let Ok(conn) = open_read_db(db_path) {
-			let absent: Result<bool, _> = conn.query_row(
-				"SELECT COUNT(*) = 0 FROM items WHERE uuid = ?",
-				params![uuid],
-				|row| row.get(0),
-			);
-			if let Ok(true) = absent {
-				return true;
-			}
-		}
-		tokio::time::sleep(Duration::from_millis(200)).await;
-	}
-}
-
-/// Query the file metadata stored in the cache for the given UUID.
-/// Returns (name, size, mime, parent_uuid) if found.
-fn query_cached_file(db_path: &Path, uuid: Uuid) -> Option<(String, i64, String, Vec<u8>)> {
-	let conn = open_read_db(db_path).ok()?;
-	conn.query_row(
-		"SELECT f.name, f.size, f.mime, i.parent
-		 FROM items i JOIN files f ON f.id = i.id
-		 WHERE i.uuid = ?",
-		params![uuid],
-		|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-	)
-	.ok()
-}
-
-/// Query the file's favorite status in the cache for the given UUID.
-fn query_cached_file_favorite(db_path: &Path, uuid: Uuid) -> Option<bool> {
-	let conn = open_read_db(db_path).ok()?;
-	conn.query_row(
-		"SELECT f.favorite FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
-		params![uuid],
-		|row| row.get(0),
-	)
-	.ok()
-}
-
-/// Query the directory metadata stored in the cache for the given UUID.
-/// Returns (name, color, parent_uuid) if found.
-fn query_cached_dir(db_path: &Path, uuid: Uuid) -> Option<(String, Option<String>, Vec<u8>)> {
-	let conn = open_read_db(db_path).ok()?;
-	conn.query_row(
-		"SELECT d.name, d.color, i.parent
-		 FROM items i JOIN dirs d ON d.id = i.id
-		 WHERE i.uuid = ?",
-		params![uuid],
-		|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-	)
-	.ok()
-}
-
-/// Poll until the file's name in the cache matches the expected value, or timeout.
-async fn poll_for_file_name(
-	db_path: &Path,
-	uuid: Uuid,
-	expected_name: &str,
-	timeout: Duration,
-) -> bool {
-	let deadline = tokio::time::Instant::now() + timeout;
-	loop {
-		if tokio::time::Instant::now() >= deadline {
-			return false;
-		}
-		if let Some((name, _, _, _)) = query_cached_file(db_path, uuid)
-			&& name == expected_name
-		{
-			return true;
-		}
-		tokio::time::sleep(Duration::from_millis(200)).await;
-	}
-}
-
-/// Poll until the dir's name in the cache matches the expected value, or timeout.
-async fn poll_for_dir_name(
-	db_path: &Path,
-	uuid: Uuid,
-	expected_name: &str,
-	timeout: Duration,
-) -> bool {
-	let deadline = tokio::time::Instant::now() + timeout;
-	loop {
-		if tokio::time::Instant::now() >= deadline {
-			return false;
-		}
-		if let Some((name, _, _)) = query_cached_dir(db_path, uuid)
-			&& name == expected_name
-		{
-			return true;
-		}
-		tokio::time::sleep(Duration::from_millis(200)).await;
-	}
-}
-
-/// Poll until the dir's color in the cache matches the expected value, or timeout.
-async fn poll_for_dir_color(
-	db_path: &Path,
-	uuid: Uuid,
-	expected_color: &str,
-	timeout: Duration,
-) -> bool {
-	let deadline = tokio::time::Instant::now() + timeout;
-	loop {
-		if tokio::time::Instant::now() >= deadline {
-			return false;
-		}
-		if let Some((_, color, _)) = query_cached_dir(db_path, uuid)
-			&& color.as_deref() == Some(expected_color)
-		{
-			return true;
-		}
-		tokio::time::sleep(Duration::from_millis(200)).await;
-	}
-}
-
-/// Poll until the file's favorite status matches the expected value, or timeout.
-async fn poll_for_file_favorite(
-	db_path: &Path,
-	uuid: Uuid,
-	expected: bool,
-	timeout: Duration,
-) -> bool {
-	let deadline = tokio::time::Instant::now() + timeout;
-	loop {
-		if tokio::time::Instant::now() >= deadline {
-			return false;
-		}
-		if let Some(fav) = query_cached_file_favorite(db_path, uuid)
-			&& fav == expected
-		{
-			return true;
-		}
-		tokio::time::sleep(Duration::from_millis(200)).await;
-	}
-}
-
-/// Query the item type for the given UUID. Returns the type code (0=Root, 1=Dir, 2=File).
-fn query_item_type(db_path: &Path, uuid: Uuid) -> Option<i8> {
-	let conn = open_read_db(db_path).ok()?;
-	conn.query_row(
-		"SELECT type FROM items WHERE uuid = ?",
-		params![uuid],
-		|row| row.get(0),
-	)
-	.ok()
-}
-
-/// Count all items in the cache (including root).
-fn count_items(db_path: &Path) -> usize {
-	let conn = open_read_db(db_path).unwrap();
-	conn.query_row("SELECT COUNT(*) FROM items", [], |row| {
-		row.get::<_, usize>(0)
-	})
-	.unwrap()
-}
-
-/// Build a synthetic RemoteFile with decoded metadata for testing ListDirRecursive.
-fn make_test_remote_file(name: &str, parent: &UuidStr) -> RemoteFile {
-	let key_hex = "a".repeat(64);
-	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
-	let now = Utc::now();
-
-	RemoteFile::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
-		1024,
-		1,
-		"us-east-1",
-		"test-bucket",
-		now,
-		false,
-		FileMeta::Decoded(DecryptedFileMeta {
-			name: Cow::Owned(name.to_string()),
-			size: 1024,
-			mime: Cow::Owned("text/plain".to_string()),
-			key: file_key,
-			last_modified: now,
-			created: Some(now),
-			hash: None,
-		}),
-	)
-}
-
-/// Build a synthetic RemoteFile with encrypted (un-decryptable) metadata. The conversion
-/// to `CacheableFile` should fail because the meta is not in the `Decoded` variant.
-fn make_test_remote_file_encrypted_meta(parent: &UuidStr) -> RemoteFile {
-	let now = Utc::now();
-	RemoteFile::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
-		1024,
-		1,
-		"us-east-1",
-		"test-bucket",
-		now,
-		false,
-		FileMeta::Encrypted(EncryptedString(Cow::Owned("encrypted_blob".to_string()))),
-	)
-}
-
-/// Build a synthetic RemoteFile parented to a non-UUID slot (Trash). Conversion should fail
-/// because `CacheableFile` only accepts a real `Uuid` parent.
-fn make_test_remote_file_bad_parent(name: &str) -> RemoteFile {
-	let key_hex = "a".repeat(64);
-	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
-	let now = Utc::now();
-	RemoteFile::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Trash,
-		1024,
-		1,
-		"us-east-1",
-		"test-bucket",
-		now,
-		false,
-		FileMeta::Decoded(DecryptedFileMeta {
-			name: Cow::Owned(name.to_string()),
-			size: 1024,
-			mime: Cow::Owned("text/plain".to_string()),
-			key: file_key,
-			last_modified: now,
-			created: Some(now),
-			hash: None,
-		}),
-	)
-}
-
-/// Build a synthetic RemoteDirectory with encrypted (un-decryptable) metadata.
-fn make_test_remote_dir_encrypted_meta(parent: &UuidStr) -> RemoteDirectory {
-	let now = Utc::now();
-	RemoteDirectory::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
-		DirColor::Default,
-		false,
-		now,
-		DirectoryMeta::Encrypted(EncryptedString(Cow::Owned("encrypted_blob".to_string()))),
-	)
-}
-
-/// Build a synthetic RemoteDirectory parented to a non-UUID slot (Trash).
-fn make_test_remote_dir_bad_parent(name: &str) -> RemoteDirectory {
-	let now = Utc::now();
-	RemoteDirectory::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Trash,
-		DirColor::Default,
-		false,
-		now,
-		DirectoryMeta::Decoded(DecryptedDirectoryMeta {
-			name: Cow::Owned(name.to_string()),
-			created: Some(now),
-		}),
-	)
-}
-
-/// Build a synthetic RemoteDirectory with decoded metadata for testing ListDirRecursive.
-fn make_test_remote_dir(name: &str, parent: &UuidStr) -> RemoteDirectory {
-	let now = Utc::now();
-
-	RemoteDirectory::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
-		DirColor::Default,
-		false,
-		now,
-		DirectoryMeta::Decoded(DecryptedDirectoryMeta {
-			name: Cow::Owned(name.to_string()),
-			created: Some(now),
-		}),
-	)
-}
-
-/// Ensure the socket is authenticated by registering a temporary listener and waiting for authSuccess.
-async fn ensure_socket_ready(client: &Client) {
-	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-	let _handle = client
-		.add_event_listener(
-			Box::new(move |event| {
-				let _ = tx.send(event.to_owned_cow());
-			}),
-			Some(vec![Cow::Borrowed("authSuccess")]),
-		)
-		.await
-		.unwrap();
-
-	test_utils::await_event(
-		&mut rx,
-		|event| *event == DecryptedSocketEvent::AuthSuccess,
-		Duration::from_secs(20),
-		"authSuccess (cache setup)",
-	)
-	.await;
-}
-
-/// Shared queue of `CacheMessage`s captured from a `CacheHandle`'s status callback.
-/// Wrapping in an `Arc<Mutex<_>>` is the simplest way to share with the `'static`
-/// callback while letting the test thread inspect the contents.
-type MessageLog = std::sync::Arc<Mutex<Vec<CacheMessage>>>;
-
-/// A test cache wrapping CacheHandle with automatic temp DB cleanup.
-struct TestCache {
-	path: PathBuf,
-	handle: CacheHandle,
-	messages: MessageLog,
-}
-
-impl TestCache {
-	async fn new(client: &Client) -> Self {
-		let path = temp_cache_path();
-		let messages: MessageLog = std::sync::Arc::new(Mutex::new(Vec::new()));
-		let messages_cb = messages.clone();
-		let handle = CacheHandle::new(client, path.clone(), move |msgs| {
-			let messages_cb = messages_cb.clone();
-			tokio::task::spawn(async move {
-				messages_cb.lock().await.extend(msgs);
-			});
-		})
-		.await
-		.unwrap();
-		ensure_socket_ready(client).await;
-		Self {
-			path,
-			handle,
-			messages,
-		}
-	}
-
-	fn db_path(&self) -> &Path {
-		&self.path
-	}
-
-	/// Wait until at least `count` messages have been received, then run `inspect` while
-	/// holding the lock. Returns whatever the inspection returned, or `None` on timeout.
-	async fn wait_and_inspect_messages<R>(
-		&self,
-		count: usize,
-		timeout: Duration,
-		inspect: impl FnOnce(&[CacheMessage]) -> R,
-	) -> Option<R> {
-		let deadline = tokio::time::Instant::now() + timeout;
-		loop {
-			{
-				let guard = self.messages.lock().await;
-				if guard.len() >= count {
-					return Some(inspect(&guard));
-				}
-			}
-			if tokio::time::Instant::now() >= deadline {
-				return None;
-			}
-			tokio::time::sleep(Duration::from_millis(100)).await;
-		}
-	}
-}
-
-// ─── Initialization Tests ───────────────────────────────────────────────────
+mod helpers;
+use helpers::*;
 
 #[shared_test_runtime]
 async fn test_cache_init_creates_schema() {
@@ -463,8 +47,12 @@ async fn test_cache_init_creates_schema() {
 		"dirs table should exist"
 	);
 	assert!(
-		tables.contains(&"file_versions".to_string()),
-		"file_versions table should exist"
+		tables.contains(&"events".to_string()),
+		"events table should exist"
+	);
+	assert!(
+		tables.contains(&"cache_meta".to_string()),
+		"cache_meta table should exist"
 	);
 }
 
@@ -488,8 +76,6 @@ async fn test_cache_init_inserts_root() {
 		.unwrap();
 	assert!(root_exists, "root should exist in roots table");
 }
-
-// ─── File Event Tests (via Socket) ──────────────────────────────────────────
 
 #[shared_test_runtime]
 async fn test_cache_file_new_via_socket() {
@@ -578,8 +164,6 @@ async fn test_cache_multiple_file_events() {
 	}
 }
 
-// ─── Directory Event Tests (via Socket) ─────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_dir_new_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -632,8 +216,6 @@ async fn test_cache_dir_trash_via_socket() {
 	);
 }
 
-// ─── File Move Event Tests ──────────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_file_move_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -678,8 +260,6 @@ async fn test_cache_file_move_via_socket() {
 	);
 }
 
-// ─── Directory Move Event Tests ─────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_dir_move_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -718,8 +298,6 @@ async fn test_cache_dir_move_via_socket() {
 		"moved dir should still exist in cache"
 	);
 }
-
-// ─── Manual Event Tests ─────────────────────────────────────────────────────
 
 #[shared_test_runtime]
 async fn test_cache_list_dir_recursive() {
@@ -801,17 +379,20 @@ async fn test_cache_list_dir_recursive_large_batch() {
 	assert!(total >= 151, "expected at least 151 items, got {total}");
 }
 
-// ─── Lifecycle Tests ────────────────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_shutdown_on_drop() {
 	let client = test_utils::RESOURCES.client().await;
 	let path = temp_cache_path();
 
 	{
-		let _cache = CacheHandle::new(&client, path.clone(), |_| {})
-			.await
-			.unwrap();
+		let _cache = CacheHandle::new(
+			client.clone(),
+			path.clone(),
+			whole_account_sync_root(client.as_ref()),
+			|_| {},
+		)
+		.await
+		.unwrap();
 	}
 
 	assert!(path.exists(), "DB file should persist after cache drop");
@@ -841,9 +422,14 @@ async fn test_cache_reopen_preserves_data() {
 	let dir = make_test_remote_dir("reopen_test_dir", test_dir_uuid);
 	let dir_uuid: Uuid = dir.uuid().into();
 	{
-		let cache = CacheHandle::new(client, path.clone(), |_| {})
-			.await
-			.unwrap();
+		let cache = CacheHandle::new(
+			client.clone(),
+			path.clone(),
+			whole_account_sync_root(client.as_ref()),
+			|_| {},
+		)
+		.await
+		.unwrap();
 		ensure_socket_ready(client).await;
 		cache
 			.update_list_dir_recursive(vec![dir], vec![])
@@ -853,9 +439,14 @@ async fn test_cache_reopen_preserves_data() {
 	}
 
 	{
-		let _cache = CacheHandle::new(client, path.clone(), |_| {})
-			.await
-			.unwrap();
+		let _cache = CacheHandle::new(
+			client.clone(),
+			path.clone(),
+			whole_account_sync_root(client.as_ref()),
+			|_| {},
+		)
+		.await
+		.unwrap();
 
 		assert!(
 			poll_for_item(&path, dir_uuid, Duration::from_secs(5)).await,
@@ -867,7 +458,183 @@ async fn test_cache_reopen_preserves_data() {
 	}
 }
 
-// ─── Irrelevant Event Tests ─────────────────────────────────────────────────
+/// App close/resume: the cache catches up on changes that happened while it was offline. After a clean
+/// `shutdown()`, reopening the SAME DB runs the startup gap-check; because the remote drive id advanced
+/// (a dir was created while no cache was running), it resyncs and the offline-created dir appears —
+/// even though no socket event for it is ever delivered to the second session.
+///
+/// The negative case (drive id unchanged → no resync) is covered deterministically by the unit test
+/// `startup_should_resync_gates_on_drive_id_advance`.
+#[shared_test_runtime]
+async fn test_cache_resyncs_on_restart_after_offline_change() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let test_dir_uuid: Uuid = test_dir.uuid().into();
+	let path = temp_cache_path();
+
+	// Session 1: a fresh cache. The startup gap-check (watermark None, remote drive id > 0) resyncs and
+	// populates the cache from the account listing, so the existing test dir shows up.
+	{
+		let cache = CacheHandle::new(
+			client.clone(),
+			path.clone(),
+			whole_account_sync_root(client.as_ref()),
+			|_| {},
+		)
+		.await
+		.unwrap();
+		assert!(
+			poll_for_item(&path, test_dir_uuid, Duration::from_secs(60)).await,
+			"startup resync should populate the cache from the account listing"
+		);
+		cache.shutdown().await; // clean flush + join before reopening the same DB file
+	}
+
+	// Offline change: create a dir while NO cache is running, advancing the remote drive id.
+	let mut offline_dir = client
+		.create_dir(&test_dir.into(), "cache_restart_resync")
+		.await
+		.unwrap();
+	let offline_uuid: Uuid = offline_dir.uuid().into();
+
+	// Session 2: reopen the same DB. The startup gap-check sees the advanced drive id and resyncs, so
+	// the dir created while we were offline appears — with no socket delivery involved.
+	{
+		let cache = CacheHandle::new(
+			client.clone(),
+			path.clone(),
+			whole_account_sync_root(client.as_ref()),
+			|_| {},
+		)
+		.await
+		.unwrap();
+		assert!(
+			poll_for_item(&path, offline_uuid, Duration::from_secs(60)).await,
+			"restart resync should catch up the dir created while the cache was offline"
+		);
+		cache.shutdown().await;
+	}
+
+	let _ = client.trash_dir(&mut offline_dir).await;
+}
+
+/// LIVE exercise of the resync `get_dir` not-found classification: a subdir configured as a sync root is
+/// PERMANENTLY DELETED server-side while the cache is closed. On reopen the startup resync calls
+/// `get_dir` on that root, the server answers not-found, and the cache must drop the root, wipe its
+/// cached subtree, and emit `SyncRootsDeleted`. (The unit tests cover `finalize_resync`'s decision logic
+/// deterministically; this proves the real error path end-to-end.)
+#[shared_test_runtime]
+async fn test_cache_resync_drops_a_permanently_deleted_sync_root() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let path = temp_cache_path();
+
+	// The subdir that will be the sole sync root, plus a child so there is a subtree to wipe.
+	let mut root_dir = client
+		.create_dir(&test_dir.into(), "cache_resync_deleted_root")
+		.await
+		.unwrap();
+	let root_uuid: Uuid = root_dir.uuid().into();
+	let child = client
+		.create_dir(&(&root_dir).into(), "child")
+		.await
+		.unwrap();
+	let child_uuid: Uuid = child.uuid().into();
+
+	// Selective config: sync ONLY `root_dir`. A fresh Vec per open (callbacks are not Clone).
+	let make_roots = || -> Vec<(Uuid, SyncRootCallback)> {
+		vec![(
+			root_uuid,
+			Box::new(|_: &mut dyn Iterator<Item = &CacheEvent<'_>>| {}),
+		)]
+	};
+
+	// Session 1: populate the root + child via the startup resync, then clean shutdown.
+	{
+		let cache = CacheHandle::new(client.clone(), path.clone(), make_roots(), |_| {})
+			.await
+			.unwrap();
+		assert!(
+			poll_for_item(&path, root_uuid, Duration::from_secs(60)).await,
+			"the sync root should be cached after the startup resync"
+		);
+		assert!(
+			poll_for_item(&path, child_uuid, Duration::from_secs(60)).await,
+			"the child should be cached after the startup resync"
+		);
+		cache.shutdown().await;
+	}
+
+	// Permanently delete the root (and its subtree) while the cache is offline.
+	client.trash_dir(&mut root_dir).await.unwrap();
+	client.delete_dir_permanently(root_dir).await.unwrap();
+
+	// The `/v3/dir` metadata lookup is eventually-consistent: a permanently-deleted dir keeps resolving
+	// for a few seconds before the server reports it gone. Wait for that to settle BEFORE reopening, so
+	// the resync's `get_dir` deterministically sees the not-found. (This models the real precondition —
+	// an app reopens long after a deletion, not within the propagation window. A resync that raced the
+	// window would converge the root as still-present, which is the bounded edge the production code
+	// accepts: the next organic resync re-checks it.)
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	loop {
+		match client.get_dir((&root_uuid).into()).await {
+			Err(e) if e.kind() == ErrorKind::FolderNotFound => break,
+			_ => {
+				assert!(
+					tokio::time::Instant::now() < deadline,
+					"the server never reported the permanently-deleted root as gone"
+				);
+				tokio::time::sleep(Duration::from_millis(500)).await;
+			}
+		}
+	}
+
+	// Session 2: reopen with the root STILL configured (the app has not learned it is gone). The startup
+	// resync's `get_dir(root)` returns not-found → drop + wipe subtree + notify. Capture status messages.
+	let messages: MessageLog = Arc::new(Mutex::new(Vec::new()));
+	let messages_cb = messages.clone();
+	let cache = CacheHandle::new(client.clone(), path.clone(), make_roots(), move |msgs| {
+		let messages_cb = messages_cb.clone();
+		tokio::task::spawn(async move {
+			messages_cb.lock().await.extend(msgs);
+		});
+	})
+	.await
+	.unwrap();
+
+	assert!(
+		poll_for_item_absent(&path, root_uuid, Duration::from_secs(60)).await,
+		"the not-found root must be wiped from the cache"
+	);
+	assert!(
+		poll_for_item_absent(&path, child_uuid, Duration::from_secs(60)).await,
+		"the not-found root's subtree must be cascade-wiped"
+	);
+
+	// And a SyncRootsDeleted naming the root must reach the status callback.
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	let mut notified = false;
+	while tokio::time::Instant::now() < deadline {
+		{
+			let guard = messages.lock().await;
+			if guard.iter().any(
+				|m| matches!(m, CacheMessage::SyncRootsDeleted(roots) if roots.contains(&root_uuid)),
+			) {
+				notified = true;
+				break;
+			}
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	assert!(
+		notified,
+		"a SyncRootsDeleted notification for the permanently-deleted root is expected"
+	);
+
+	cache.shutdown().await;
+}
 
 #[shared_test_runtime]
 async fn test_cache_ignores_irrelevant_events() {
@@ -898,8 +665,6 @@ async fn test_cache_ignores_irrelevant_events() {
 	);
 }
 
-// ─── Combined Scenario Tests ────────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_full_file_lifecycle() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -907,7 +672,6 @@ async fn test_cache_full_file_lifecycle() {
 	let test_dir = &resources.dir;
 	let cache = TestCache::new(&resources.client).await;
 
-	// 1. Create a directory
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_lifecycle_dir")
 		.await
@@ -918,7 +682,6 @@ async fn test_cache_full_file_lifecycle() {
 		"lifecycle dir should appear"
 	);
 
-	// 2. Upload a file
 	let file = client
 		.make_file_builder("cache_lifecycle_file.txt", *test_dir.uuid())
 		.unwrap();
@@ -929,14 +692,12 @@ async fn test_cache_full_file_lifecycle() {
 		"lifecycle file should appear"
 	);
 
-	// 3. Trash the file
 	client.trash_file(&mut file).await.unwrap();
 	assert!(
 		poll_for_item_absent(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
 		"lifecycle file should be removed after trash"
 	);
 
-	// 4. Trash the directory
 	client.trash_dir(&mut dir).await.unwrap();
 	assert!(
 		poll_for_item_absent(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
@@ -951,14 +712,12 @@ async fn test_cache_mixed_socket_and_manual_events() {
 	let test_dir = &resources.dir;
 	let cache = TestCache::new(&resources.client).await;
 
-	// 1. Upload a file via the server (triggers socket event)
 	let file = client
 		.make_file_builder("cache_mixed_socket.txt", *test_dir.uuid())
 		.unwrap();
 	let file = client.upload_file(file, b"socket").await.unwrap();
 	let socket_file_uuid: Uuid = file.uuid().into();
 
-	// 2. Insert a file via manual ListDirRecursive
 	let manual_file = make_test_remote_file("cache_mixed_manual.txt", test_dir.uuid());
 	let manual_file_uuid: Uuid = manual_file.uuid().into();
 	cache
@@ -967,7 +726,6 @@ async fn test_cache_mixed_socket_and_manual_events() {
 		.await
 		.unwrap();
 
-	// 3. Both should end up in the cache
 	assert!(
 		poll_for_item(cache.db_path(), socket_file_uuid, Duration::from_secs(30)).await,
 		"socket-triggered file should appear in cache"
@@ -977,8 +735,6 @@ async fn test_cache_mixed_socket_and_manual_events() {
 		"manually-inserted file should appear in cache"
 	);
 }
-
-// ─── File Restore Tests ────────────────────────────────────────────────────
 
 #[shared_test_runtime]
 async fn test_cache_file_restore_via_socket() {
@@ -1015,8 +771,6 @@ async fn test_cache_file_restore_via_socket() {
 	let (name, _, _, _) = query_cached_file(cache.db_path(), file_uuid).unwrap();
 	assert_eq!(name, "cache_file_restore.txt");
 }
-
-// ─── File Metadata Changed Tests ───────────────────────────────────────────
 
 #[shared_test_runtime]
 async fn test_cache_file_metadata_changed_via_socket() {
@@ -1056,8 +810,6 @@ async fn test_cache_file_metadata_changed_via_socket() {
 	);
 }
 
-// ─── File Deleted Permanently Tests ────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_file_deleted_permanently_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -1096,8 +848,6 @@ async fn test_cache_file_deleted_permanently_via_socket() {
 	);
 }
 
-// ─── Dir Restore Tests ─────────────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_dir_restore_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -1134,8 +884,6 @@ async fn test_cache_dir_restore_via_socket() {
 	assert_eq!(name, "cache_dir_restore");
 }
 
-// ─── Dir Metadata Changed Tests ────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_dir_metadata_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -1171,8 +919,6 @@ async fn test_cache_dir_metadata_changed_via_socket() {
 	);
 }
 
-// ─── Dir Color Changed Tests ───────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_dir_color_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -1202,8 +948,6 @@ async fn test_cache_dir_color_changed_via_socket() {
 	);
 }
 
-// ─── Dir Deleted Permanently Tests ─────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_dir_deleted_permanently_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -1231,15 +975,12 @@ async fn test_cache_dir_deleted_permanently_via_socket() {
 
 	client.delete_dir_permanently(dir).await.unwrap();
 
-	// Should remain absent
 	tokio::time::sleep(Duration::from_secs(2)).await;
 	assert!(
 		query_cached_dir(cache.db_path(), dir_uuid).is_none(),
 		"dir should remain absent after permanent delete"
 	);
 }
-
-// ─── Item Favorite Tests ───────────────────────────────────────────────────
 
 #[shared_test_runtime]
 async fn test_cache_item_favorite_via_socket() {
@@ -1267,8 +1008,6 @@ async fn test_cache_item_favorite_via_socket() {
 	);
 }
 
-// ─── File Archived Tests ───────────────────────────────────────────────────
-
 #[shared_test_runtime]
 async fn test_cache_file_archived_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -1276,7 +1015,6 @@ async fn test_cache_file_archived_via_socket() {
 	let test_dir = &resources.dir;
 	let cache = TestCache::new(client).await;
 
-	// Upload original file
 	let file = client
 		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
 		.unwrap();
@@ -1304,14 +1042,11 @@ async fn test_cache_file_archived_via_socket() {
 		"original file should be removed from cache after FileArchived event"
 	);
 
-	// Replacement should appear in cache
 	assert!(
 		poll_for_item(cache.db_path(), replacement_uuid, Duration::from_secs(30)).await,
 		"replacement file should appear in cache"
 	);
 }
-
-// ─── Error Path Tests ──────────────────────────────────────────────────────
 
 #[shared_test_runtime]
 async fn test_cache_error_on_file_with_encrypted_meta() {
@@ -1330,11 +1065,11 @@ async fn test_cache_error_on_file_with_encrypted_meta() {
 
 	let saw_expected_error = cache
 		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
-			msgs.iter().any(|msg| match msg {
-				CacheMessage::Error(errors) => errors.iter().any(|e| {
+			msgs.iter().any(|msg| {
+				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::FileCacheableConversion(failed)
 						if Uuid::from(failed.file.uuid()) == bad_file_uuid)
-				}),
+				})
 			})
 		})
 		.await
@@ -1368,11 +1103,11 @@ async fn test_cache_error_on_dir_with_encrypted_meta() {
 
 	let saw_expected_error = cache
 		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
-			msgs.iter().any(|msg| match msg {
-				CacheMessage::Error(errors) => errors.iter().any(|e| {
+			msgs.iter().any(|msg| {
+				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::DirCacheableConversion(failed)
 						if Uuid::from(failed.dir.uuid()) == bad_dir_uuid)
-				}),
+				})
 			})
 		})
 		.await
@@ -1405,11 +1140,11 @@ async fn test_cache_error_on_file_with_non_uuid_parent() {
 
 	let saw_expected_error = cache
 		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
-			msgs.iter().any(|msg| match msg {
-				CacheMessage::Error(errors) => errors.iter().any(|e| {
+			msgs.iter().any(|msg| {
+				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::FileCacheableConversion(failed)
 						if Uuid::from(failed.file.uuid()) == bad_file_uuid)
-				}),
+				})
 			})
 		})
 		.await
@@ -1437,11 +1172,11 @@ async fn test_cache_error_on_dir_with_non_uuid_parent() {
 
 	let saw_expected_error = cache
 		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
-			msgs.iter().any(|msg| match msg {
-				CacheMessage::Error(errors) => errors.iter().any(|e| {
+			msgs.iter().any(|msg| {
+				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::DirCacheableConversion(failed)
 						if Uuid::from(failed.dir.uuid()) == bad_dir_uuid)
-				}),
+				})
 			})
 		})
 		.await
@@ -1508,8 +1243,7 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 			let mut file_errs = 0usize;
 			let mut dir_errs = 0usize;
 			for msg in msgs {
-				let CacheMessage::Error(errors) = msg;
-				for err in errors {
+				for err in message_errors(msg) {
 					match err {
 						CacheError::FileCacheableConversion(_) => file_errs += 1,
 						CacheError::DirCacheableConversion(_) => dir_errs += 1,
@@ -1524,4 +1258,43 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 
 	assert_eq!(file_errs, 2, "expected 2 file conversion errors");
 	assert_eq!(dir_errs, 2, "expected 2 dir conversion errors");
+}
+
+/// §5.7 #12: `add_sync_root` with a uuid that is not a reachable directory is REJECTED — surfaced as a
+/// `CacheError::InvalidSyncRoot` — so the bad key never enters the active set (which would otherwise make
+/// every subsequent resync's `get_dir` fail and re-trigger a resync on each event: a tight loop).
+#[shared_test_runtime]
+async fn test_add_sync_root_rejects_invalid_uuid() {
+	let client = test_utils::RESOURCES.client().await;
+	let cache = TestCache::new(&client).await;
+
+	// A random uuid that does not correspond to any directory on the account.
+	let bogus = Uuid::new_v4();
+	let noop: SyncRootCallback = Box::new(|_: &mut dyn Iterator<Item = &CacheEvent<'_>>| {});
+	cache.handle.add_sync_root(bogus, noop).unwrap();
+
+	// Poll the status log for the specific rejection (the startup whole-account resync may emit its own
+	// messages first, so a one-shot inspect could race ahead of this one). The deadline is generous
+	// because the worker validates via a `block_on(get_dir)` that competes for the account drive lock
+	// with every other concurrent test's startup resync.
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	let saw_rejection = loop {
+		let present = cache.messages.lock().await.iter().any(|msg| {
+			message_errors(msg)
+				.iter()
+				.any(|e| matches!(e, CacheError::InvalidSyncRoot { uuid, .. } if *uuid == bogus))
+		});
+		if present {
+			break true;
+		}
+		if tokio::time::Instant::now() >= deadline {
+			break false;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	};
+
+	assert!(
+		saw_rejection,
+		"add_sync_root with a bogus uuid should surface CacheError::InvalidSyncRoot"
+	);
 }

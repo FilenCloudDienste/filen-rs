@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use rkyv::with::AsOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::{fs::UuidStr, traits::CowHelpers};
@@ -34,7 +35,7 @@ pub enum DirColor<'a> {
 	Red,
 	Gray,
 	#[serde(untagged)]
-	Custom(Cow<'a, str>),
+	Custom(#[rkyv(with = AsOwned)] Cow<'a, str>),
 }
 
 impl<'a, 'de> Deserialize<'de> for DirColor<'a> {

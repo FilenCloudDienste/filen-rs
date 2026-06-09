@@ -1,20 +1,19 @@
 use filen_sdk_rs::fs::file::cache::CacheableFile;
 use rusqlite::CachedStatement;
-use uuid::Uuid;
 
 use super::item::ItemType;
 
 pub(super) fn upsert_file_with_stmts(
 	file: &CacheableFile,
-	root: Uuid,
 	upsert_file_stmt: &mut CachedStatement<'_>,
 	upsert_item_stmt: &mut CachedStatement<'_>,
 ) -> rusqlite::Result<()> {
+	let content_hash = file.content_fingerprint();
 	let id = super::item::upsert_item_with_stmt(
 		file.uuid,
 		Some(file.parent),
 		ItemType::File,
-		root,
+		Some(&content_hash),
 		upsert_item_stmt,
 	)?;
 

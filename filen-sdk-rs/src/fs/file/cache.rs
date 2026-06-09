@@ -5,7 +5,7 @@ use filen_types::{
 	auth::FileEncryptionVersion, crypto::Blake3Hash, fs::ParentUuid,
 	rkyv::date_time::DateTimeUtcDef, traits::CowHelpers,
 };
-use rkyv::with::Map;
+use rkyv::with::{AsOwned, Map};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -33,14 +33,18 @@ pub struct CacheableFile<'a> {
 	pub chunks: u64,
 	pub favorited: bool,
 	// TODO: dedup this
+	#[rkyv(with = AsOwned)]
 	pub region: Cow<'a, str>,
 	// TODO: maybe dedup this too
+	#[rkyv(with = AsOwned)]
 	pub bucket: Cow<'a, str>,
 	#[rkyv(with = DateTimeUtcDef)]
 	pub timestamp: DateTime<Utc>,
 
+	#[rkyv(with = AsOwned)]
 	pub name: Cow<'a, str>,
 	pub size: u64,
+	#[rkyv(with = AsOwned)]
 	pub mime: Cow<'a, str>,
 	pub key: FileKey,
 	#[rkyv(with = DateTimeUtcDef)]

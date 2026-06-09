@@ -8,7 +8,7 @@ use filen_types::{
 	rkyv::date_time::DateTimeUtcDef,
 	traits::CowHelpers,
 };
-use rkyv::with::Map;
+use rkyv::with::{AsOwned, Map};
 use rsa::RsaPrivateKey;
 use serde::{
 	Deserialize, Serialize,
@@ -207,8 +207,10 @@ impl<'a> FileMeta<'a> {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptedFileMeta<'a> {
+	#[rkyv(with = AsOwned)]
 	pub name: Cow<'a, str>,
 	pub size: u64,
+	#[rkyv(with = AsOwned)]
 	pub mime: Cow<'a, str>,
 	pub key: FileKey,
 	#[serde(with = "filen_types::serde::time::seconds_or_millis")]

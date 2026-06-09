@@ -8,7 +8,7 @@ use filen_types::{
 	rkyv::date_time::DateTimeUtcDef,
 	traits::CowHelpers,
 };
-use rkyv::with::Map;
+use rkyv::with::{AsOwned, Map};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
 
@@ -168,6 +168,7 @@ impl<'a> DirectoryMeta<'a> {
 )]
 pub struct DecryptedDirectoryMeta<'a> {
 	#[serde(borrow)]
+	#[rkyv(with = AsOwned)]
 	pub name: Cow<'a, str>,
 	#[serde(
 		with = "filen_types::serde::time::optional",
