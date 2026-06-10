@@ -39,9 +39,9 @@ const EVENT_SHED_CAP: usize = 50_000;
 /// Dependencies the worker needs to run a write-locked resync: an owned
 /// handle to the SDK [`Client`] and the Tokio runtime [`Handle`](tokio::runtime::Handle) the worker
 /// `block_on`s to drive the async listing from its `std::thread`. Captured once at construction
-/// ([`CacheHandle::new`](crate::cache::handle::CacheHandle::new) runs inside the app's runtime, so
-/// `Handle::current()` is valid there). `None` under unit-test construction (no live client/runtime);
-/// the resync path logs and no-ops when it is absent.
+/// ([`Client::add_sync_root`](crate::auth::Client::add_sync_root) spawns the worker from inside the
+/// app's runtime, so `Handle::current()` is valid there). `None` under unit-test construction (no live
+/// client/runtime); the resync path logs and no-ops when it is absent.
 #[derive(Clone)]
 pub(crate) struct ResyncDeps {
 	pub(crate) client: Arc<Client>,
@@ -64,12 +64,13 @@ pub(crate) struct CacheState {
 	/// The account-root uuid — the single `roots` row, used for upsert `?4` (root_id resolution) and DB
 	/// init. NOT necessarily a sync root (see `sync_roots`).
 	pub(crate) root_uuid: Uuid,
-	/// Configured sync roots → their notification callbacks. An item is cached iff it
+	/// Configured sync roots → their live registrations. An item is cached iff it
 	/// descends from one of these roots (the membership gate, in `sql/membership.rs`); EMPTY ⇒
-	/// nothing is cached. Test constructors default this to `{account_root → no-op}` (whole-account
-	/// sync) so existing tests still exercise the machinery; the production constructor takes the
-	/// app-supplied set.
-	sync_roots: HashMap<Uuid, SyncRootCallback>,
+	/// nothing is cached. The production worker starts EMPTY — registrations arrive via
+	/// [`CacheControlMessage::AddSyncRoot`], and a uuid stops being a sync root when its LAST
+	/// registration is removed. Test constructors default this to `{account_root → no-op}`
+	/// (whole-account sync) so existing tests still exercise the machinery.
+	sync_roots: HashMap<Uuid, RootRegistrations>,
 	/// Client + runtime handle for the write-locked resync island. `None` in unit tests.
 	resync: Option<ResyncDeps>,
 }
@@ -156,6 +157,15 @@ impl CacheState {
 		};
 		(state, producer)
 	}
+
+	/// Test setter: install `map` as the sync roots, wrapping each callback as that root's single
+	/// registration (id 0).
+	pub(crate) fn set_test_sync_roots(&mut self, map: HashMap<Uuid, SyncRootCallback>) {
+		self.sync_roots = map
+			.into_iter()
+			.map(|(uuid, callback)| (uuid, vec![(0, callback)]))
+			.collect();
+	}
 }
 
 /// Producer-side handles retained by [`CacheState::new_in_memory_with_producer`] for tests.
@@ -191,31 +201,51 @@ pub(crate) enum CacheThreadEvent {
 /// (the search / sync engine, which exposes its OWN FFI), so the borrowing shape needs no marshalling.
 pub type SyncRootCallback = Box<dyn Fn(&mut dyn Iterator<Item = &CacheEvent<'_>>) + Send + 'static>;
 
+/// The live registrations for one sync root: `(registration_id, callback)` pairs. Multiple
+/// [`SyncRootHandle`](crate::cache::SyncRootHandle)s may target the same uuid; each holds its own
+/// registration, every callback is notified on dispatch, and the uuid stops being a sync root only
+/// when its last registration is removed.
+pub(crate) type RootRegistrations = Vec<(u64, SyncRootCallback)>;
+
 /// Build the default `{account_root → no-op}` sync-root map: whole-account sync with no notification.
 /// Used by the test constructors so the existing apply/drain/resync tests keep exercising the machinery
-/// (production callers configure their own roots via [`CacheHandle::new`](crate::cache::CacheHandle::new)).
+/// (production registrations arrive via [`Client::add_sync_root`](crate::auth::Client::add_sync_root)).
 #[cfg(test)]
-fn whole_account_sync_roots(account_root: Uuid) -> HashMap<Uuid, SyncRootCallback> {
-	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
-	sync_roots.insert(account_root, Box::new(|_| {}));
+fn whole_account_sync_roots(account_root: Uuid) -> HashMap<Uuid, RootRegistrations> {
+	let mut sync_roots: HashMap<Uuid, RootRegistrations> = HashMap::new();
+	sync_roots.insert(account_root, vec![(0, Box::new(|_| {}))]);
 	sync_roots
 }
 
-/// Control-plane messages delivered to the worker over the bounded control channel — sync-root
+/// Ack for [`CacheControlMessage::AddSyncRoot`]: `Ok(())` once the registration is live
+/// (validation passed), `Err` if the uuid was rejected.
+pub(crate) type AddSyncRootAck = tokio::sync::oneshot::Sender<Result<(), Box<CacheError>>>;
+/// Ack for [`CacheControlMessage::RemoveRegistration`]: `Ok(true)` iff the root's cached
+/// subtree was evicted (the registration was the last one for its uuid and `evict` was requested).
+pub(crate) type RemoveRegistrationAck = tokio::sync::oneshot::Sender<Result<bool, Box<CacheError>>>;
+
+/// Control-plane messages delivered to the worker over the control channel — sync-root
 /// reconfiguration that must be serialized against the drain. Distinct from the data-plane
 /// [`CacheThreadEvent`] channel, which carries the events to apply.
 pub(crate) enum CacheControlMessage {
-	/// Register (or replace) a sync root and converge it. The worker inserts `uuid → callback` into
-	/// `sync_roots` and resyncs so the new root is populated.
+	/// Register a `(registration_id, callback)` pair for `uuid`. A NEW uuid is validated
+	/// (`get_dir`) and converged; an additional registration on an already-active uuid skips both.
+	/// The ack fires after validation + insert, BEFORE the convergence resync.
 	AddSyncRoot {
 		uuid: Uuid,
+		registration_id: u64,
 		callback: SyncRootCallback,
+		ack: AddSyncRootAck,
 	},
-	/// Stop syncing `uuid`. The worker removes it from `sync_roots`; if `evict`, it also deletes that
-	/// root's cached subtree — protecting any still-active nested root.
-	RemoveSyncRoot {
+	/// Remove one registration. When it was the last one for `uuid`, the uuid stops being a sync
+	/// root, and if `evict` its cached subtree is deleted — protecting any still-active nested root.
+	/// `ack` is `None` for the fire-and-forget [`SyncRootHandle`](crate::cache::SyncRootHandle) Drop
+	/// path.
+	RemoveRegistration {
 		uuid: Uuid,
+		registration_id: u64,
 		evict: bool,
+		ack: Option<RemoveRegistrationAck>,
 	},
 	Shutdown,
 }
@@ -274,7 +304,6 @@ impl CacheState {
 	pub(crate) fn new(
 		cache_path: &Path,
 		root_uuid: Uuid,
-		sync_roots: HashMap<Uuid, SyncRootCallback>,
 		msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 		client: Arc<Client>,
 		rt_handle: tokio::runtime::Handle,
@@ -298,8 +327,8 @@ impl CacheState {
 			msg_sender,
 			shed: shed.clone(),
 			root_uuid,
-			// The app-supplied set (empty ⇒ nothing is cached until `add_sync_root`).
-			sync_roots,
+			// Starts EMPTY (nothing cached); registrations arrive via `AddSyncRoot` control messages.
+			sync_roots: HashMap::new(),
 			resync: Some(ResyncDeps { client, rt_handle }),
 		};
 
@@ -312,7 +341,7 @@ impl CacheState {
 		})?;
 
 		// The callback owns the event sender + the shed latch; a clone of `event_sender` is returned for
-		// `CacheHandle` to inject Manual events (list_dir_recursive) onto the same channel.
+		// `SyncRootHandle` to inject Manual events (list_dir_recursive) onto the same channel.
 		let callback = make_socket_event_callback(event_sender.clone(), shed);
 
 		Ok((
@@ -338,23 +367,19 @@ impl CacheState {
 			// intrinsic, so the previous two-channel TOCTOU dance is gone.
 			crossbeam::channel::select_biased! {
 				recv(self.control_receiver) -> control_event => {
-					match control_event {
-						Ok(CacheControlMessage::Shutdown) | Err(_) => {
-							log::info!("Cache shutting down; draining buffered events first...");
-							// `select_biased!` selects a Drop-sent Shutdown ahead of a non-empty event arm,
-							// so the Shutdown case is the NORMAL clean-shutdown path. (`Err(_)` is the
-							// defensive case — the control sender was dropped without a Shutdown — handled
-							// identically.) Either way, drain everything currently buffered into the durable
-							// store before exiting so it is not lost.
-							self.drain_pending(None);
-							return;
-						}
-						Ok(CacheControlMessage::AddSyncRoot { uuid, callback }) => {
-							self.handle_add_sync_root(uuid, callback);
-						}
-						Ok(CacheControlMessage::RemoveSyncRoot { uuid, evict }) => {
-							self.handle_remove_sync_root(uuid, evict);
-						}
+					// `select_biased!` selects a pending control message ahead of a non-empty event arm.
+					// A `Shutdown` — or every control sender having been dropped WITHOUT one (the
+					// defensive `Err(_)` case: the last `SyncRootHandle` and the worker references are
+					// gone) — is the NORMAL clean-shutdown path. Either way, drain everything currently
+					// buffered into the durable store before exiting so it is not lost.
+					let shutdown = match control_event {
+						Ok(first) => self.process_control_burst(first),
+						Err(_) => true,
+					};
+					if shutdown {
+						log::info!("Cache shutting down; draining buffered events first...");
+						self.drain_pending(None);
+						return;
 					}
 				},
 				recv(self.event_receiver) -> event => {
@@ -608,6 +633,10 @@ impl CacheState {
 	/// All roots commit TOGETHER (not per-root) so a crash mid-loop cannot clear `needs_resync` after one
 	/// root and leave another un-converged. If the post-commit drain observes a *fresh* gap (a real
 	/// buffered event above the snapshot id), `needs_resync` is re-set so the next worker cycle resyncs.
+	///
+	/// `mark_resync` keeps the durable `needs_resync` flag SET in the commit (instead of clearing
+	/// it) — passed when the listing pass skipped at least one root transiently, so the skipped
+	/// root gets a durable retry while the converged roots' progress still commits.
 	fn apply_resync(
 		&mut self,
 		per_root: Vec<(
@@ -616,6 +645,7 @@ impl CacheState {
 			Vec<CacheableFile<'static>>,
 		)>,
 		remote_under_lock: u64,
+		mark_resync: bool,
 	) -> Result<(), Box<CacheError>> {
 		let db_err =
 			|e: rusqlite::Error, context: &str| Box::new(CacheError::db(e, context.to_string()));
@@ -678,7 +708,7 @@ impl CacheState {
 			}
 		}
 
-		self.commit_resync_synthetics(&all_synthetics, remote_under_lock)?;
+		self.commit_resync_synthetics(&all_synthetics, remote_under_lock, mark_resync)?;
 
 		// Apply the synthetics. If the drain observes a FRESH hole (a real buffered event above the
 		// snapshot id broke the frontier), `commit_drain_batch` re-sets `needs_resync` atomically — even
@@ -695,72 +725,202 @@ impl CacheState {
 		}
 	}
 
-	/// Handle `AddSyncRoot`: validate the root's `uuid`, register (or replace) its callback,
-	/// and converge.
+	/// Process `first` plus every control message already queued behind it, then run AT MOST ONE
+	/// convergence resync if the burst added any new sync root — so a multi-root startup (N
+	/// `add_sync_root` calls in quick succession) converges with a single listing pass instead of N.
+	/// Returns `true` if a `Shutdown` was encountered (the caller drains and exits; messages queued
+	/// behind the Shutdown are intentionally not processed).
+	fn process_control_burst(&mut self, first: CacheControlMessage) -> bool {
+		let mut added_new_root = false;
+		let mut message = Some(first);
+		while let Some(msg) = message {
+			match msg {
+				CacheControlMessage::Shutdown => return true,
+				CacheControlMessage::AddSyncRoot {
+					uuid,
+					registration_id,
+					callback,
+					ack,
+				} => {
+					added_new_root |=
+						self.handle_add_sync_root(uuid, registration_id, callback, ack);
+				}
+				CacheControlMessage::RemoveRegistration {
+					uuid,
+					registration_id,
+					evict,
+					ack,
+				} => {
+					self.handle_remove_registration(uuid, registration_id, evict, ack);
+				}
+			}
+			message = self.control_receiver.try_recv().ok();
+		}
+		if added_new_root {
+			// Durably schedule the convergence FIRST: the adds were already acked Ok, and a
+			// transient resync failure returns Ok after only a log — without the flag the new
+			// root(s) would silently stay unpopulated for the session (live events for them are
+			// membership-gated out while the watermark keeps advancing, so no hole ever re-flags).
+			// A fully successful resync clears the flag atomically in the watermark commit.
+			if let Err(e) = self.mark_needs_resync() {
+				self.surface_errors(vec![*e]);
+			}
+			// Resync ALL roots so the new root(s) are populated AND the watermark stays accurate for
+			// every root. Resyncing only the new roots could advance the watermark past a pending gap
+			// in an existing root and clear `needs_resync`, masking it. Redundant listings of
+			// already-current roots are accepted in v1; a per-root-bookmark skip is a future
+			// optimization.
+			log::info!("sync root(s) added; resyncing to populate");
+			self.run_resync_surfacing_errors();
+		}
+		false
+	}
+
+	/// Handle `AddSyncRoot`: register `(registration_id, callback)` for `uuid`, validating the
+	/// uuid first when it is not already an active sync root. Returns whether `uuid` is NEWLY active
+	/// (the caller runs the convergence resync once per control burst).
 	///
-	/// VALIDATION: a subdir `uuid` is checked with `get_dir` BEFORE it is inserted. A uuid
-	/// that does not resolve to a reachable directory is rejected — surfaced as
-	/// [`CacheError::InvalidSyncRoot`] and NOT added — so a bad key can never enter `sync_roots` and make
-	/// every later resync's `get_dir` fail (which would re-trigger a resync on each event: a tight loop).
-	/// A transient network failure also rejects the add; the app simply retries. The account root needs
-	/// no check — it always exists and resyncs via `client.root()`, not `get_dir`. (The validating
-	/// `get_dir` is then repeated by `run_resync`'s listing; the extra round-trip is accepted since
-	/// `AddSyncRoot` is rare.)
-	fn handle_add_sync_root(&mut self, uuid: Uuid, callback: SyncRootCallback) {
+	/// VALIDATION: a subdir `uuid` is checked with `get_dir` BEFORE it is inserted, so a bad key
+	/// can never enter `sync_roots` and make every later resync's `get_dir` fail (which would
+	/// re-trigger a resync on each event: a tight loop). A DEFINITIVE not-found rejects with
+	/// [`CacheError::InvalidSyncRoot`] and ALSO wipes any stale subtree a prior session cached under
+	/// the uuid — re-adding after a restart is the only path that learns about an offline deletion,
+	/// and without the wipe those rows would be stranded forever (membership-gated out of live
+	/// events, anchored by no resync diff). Any other validation failure (network/server) rejects
+	/// with [`CacheError::SyncRootUnavailable`]; the app retries the same uuid. The account root
+	/// needs no check — it always exists and resyncs via `client.root()`, not `get_dir`. (The
+	/// validating `get_dir` is then repeated by `run_resync`'s listing; the extra round-trip is
+	/// accepted since `AddSyncRoot` is rare.) An ALREADY-ACTIVE uuid skips validation and the resync —
+	/// its existence is established and its subtree is already converged; the new callback simply
+	/// joins the root's registrations.
+	fn handle_add_sync_root(
+		&mut self,
+		uuid: Uuid,
+		registration_id: u64,
+		callback: SyncRootCallback,
+		ack: AddSyncRootAck,
+	) -> bool {
+		if let Some(registrations) = self.sync_roots.get_mut(&uuid) {
+			registrations.push((registration_id, callback));
+			let _ = ack.send(Ok(()));
+			return false;
+		}
 		if uuid != self.root_uuid
 			&& let Some(deps) = self.resync.clone()
 			&& let Err(e) = deps.rt_handle.block_on(deps.client.get_dir((&uuid).into()))
 		{
-			log::warn!("AddSyncRoot {uuid}: not a reachable directory ({e}); not adding");
-			self.surface_errors(vec![CacheError::invalid_sync_root(uuid, e.to_string())]);
-			return;
+			let error = if matches!(
+				e.kind(),
+				ErrorKind::FolderNotFound | ErrorKind::FileNotFound
+			) {
+				log::warn!("AddSyncRoot {uuid}: directory no longer exists ({e}); rejecting");
+				// Definitively gone: wipe the stale cached subtree from any prior session
+				// (the cascade trigger recurses). The cascade also wipes any still-registered
+				// NESTED root, so snapshot + drop + notify those first, exactly like the socket
+				// `DirEvent::Removed` arm. A delete of an uncached uuid is an idempotent no-op.
+				let dead_roots = self.sync_roots_deleted_by(uuid);
+				match self.delete_items(once(uuid)) {
+					Ok(()) => self.handle_deleted_sync_roots(dead_roots),
+					Err(del_e) => self.surface_errors(db_err_vec(
+						del_e,
+						format!("wiping the stale subtree of deleted sync root {uuid}"),
+					)),
+				}
+				CacheError::invalid_sync_root(uuid, e.to_string())
+			} else {
+				log::warn!("AddSyncRoot {uuid}: validation failed transiently ({e}); rejecting");
+				CacheError::sync_root_unavailable(uuid, e.to_string())
+			};
+			let _ = ack.send(Err(Box::new(error)));
+			return false;
 		}
-		if self.sync_roots.insert(uuid, callback).is_some() {
-			// re-adding an existing key silently replaces the callback.
-			log::warn!("AddSyncRoot: sync root {uuid} re-added; replacing its callback");
-		}
-		// Resync ALL roots so the new root is populated AND the watermark stays accurate for every root.
-		// Resyncing only the new root could advance the watermark past a pending gap in an existing root
-		// and clear `needs_resync`, masking it. Redundant listings of already-current roots are
-		// accepted in v1; a per-root-bookmark skip is a future optimization.
-		log::info!("AddSyncRoot {uuid}: resyncing to populate the new sync root");
-		self.run_resync_surfacing_errors();
+		self.sync_roots
+			.insert(uuid, vec![(registration_id, callback)]);
+		let _ = ack.send(Ok(()));
+		true
 	}
 
-	/// Handle `RemoveSyncRoot`: stop syncing `uuid` and, if `evict`, delete its
-	/// cached subtree while protecting any still-active nested root.
-	fn handle_remove_sync_root(&mut self, uuid: Uuid, evict: bool) {
-		if self.sync_roots.remove(&uuid).is_none() {
-			log::warn!("RemoveSyncRoot: {uuid} was not a configured sync root; ignoring");
-			return;
+	/// Handle `RemoveRegistration`: drop one `(uuid, registration_id)` registration and, when the
+	/// ack is absent (the fire-and-forget Drop path), surface any eviction error to the status
+	/// callback instead.
+	fn handle_remove_registration(
+		&mut self,
+		uuid: Uuid,
+		registration_id: u64,
+		evict: bool,
+		ack: Option<RemoveRegistrationAck>,
+	) {
+		let result = self.remove_registration(uuid, registration_id, evict);
+		match (ack, result) {
+			(Some(ack), result) => {
+				let _ = ack.send(result);
+			}
+			(None, Err(e)) => self.surface_errors(vec![*e]),
+			(None, Ok(_)) => {}
 		}
+	}
+
+	/// Drop one `(uuid, registration_id)` registration. The uuid stays an active sync root while
+	/// other registrations remain — `evict` is then SKIPPED too (deleting the subtree out from under a
+	/// still-active root would fight the membership gate). Removing the last registration stops
+	/// syncing `uuid`, and with `evict` also deletes its cached subtree. An unknown uuid/registration
+	/// (e.g. the root was already dropped server-side) is a harmless no-op — a stale handle's Drop
+	/// must never error. Returns `Ok(true)` iff the subtree was evicted.
+	fn remove_registration(
+		&mut self,
+		uuid: Uuid,
+		registration_id: u64,
+		evict: bool,
+	) -> Result<bool, Box<CacheError>> {
+		let Some(registrations) = self.sync_roots.get_mut(&uuid) else {
+			log::warn!("RemoveRegistration: {uuid} is not an active sync root; ignoring");
+			return Ok(false);
+		};
+		let before = registrations.len();
+		registrations.retain(|(id, _)| *id != registration_id);
+		if registrations.len() == before {
+			log::warn!(
+				"RemoveRegistration: registration {registration_id} not found for sync root {uuid}; ignoring"
+			);
+			return Ok(false);
+		}
+		if !registrations.is_empty() {
+			return Ok(false);
+		}
+		self.sync_roots.remove(&uuid);
 		if !evict {
-			return;
+			return Ok(false);
 		}
+		self.evict_removed_root(uuid)?;
+		Ok(true)
+	}
+
+	/// Delete the cached subtree of a JUST-removed sync root (`uuid` must already be out of
+	/// `sync_roots`), protecting any still-active nested root.
+	fn evict_removed_root(&mut self, uuid: Uuid) -> Result<(), Box<CacheError>> {
+		let db_err =
+			|e: rusqlite::Error, context: &str| Box::new(CacheError::db(e, context.to_string()));
 		if uuid == self.root_uuid {
 			// Evicting the account root = wipe every non-root item (the account-root node stays).
-			if let Err(e) = self.delete_all_non_root() {
-				self.surface_errors(db_err_vec(
-					e,
-					"evicting the account-root subtree".to_string(),
-				));
-				return;
-			}
+			self.delete_all_non_root()
+				.map_err(|e| db_err(e, "evicting the account-root subtree"))?;
 			// the flat `delete_all_non_root` also wiped any STILL-ACTIVE subdir sync
 			// root's subtree (it cannot protect them — there is no per-root anchor for a flat delete). The
 			// local map mutation is not an id event, so without an explicit resync those roots would stay
 			// empty (their ancestry gone → the membership gate drops their live events, and dispatch
-			// can't resolve them). Re-converge the remaining roots.
+			// can't resolve them). Mark durably FIRST — exactly like the `DeleteAll` arm, whose wipe
+			// creates the same ancestry-less state — so a transiently-failing re-convergence is
+			// retried by a later drain instead of stranding the survivors empty; then re-converge.
 			if !self.sync_roots.is_empty() {
+				self.mark_needs_resync()?;
 				self.run_resync_surfacing_errors();
 			}
-			return;
+			return Ok(());
 		}
 		// Protect the remaining active roots (subtrees + ancestor paths) from the eviction + cascade.
 		let protected: Vec<Uuid> = self.sync_roots.keys().copied().collect();
-		if let Err(e) = self.evict_sync_root_subtree(uuid, &protected) {
-			self.surface_errors(db_err_vec(e, format!("evicting sync root {uuid}")));
-		}
+		self.evict_sync_root_subtree(uuid, &protected)
+			.map_err(|e| db_err(e, &format!("evicting sync root {uuid}")))
 	}
 
 	/// The configured sync roots that a deletion of `deleted` removes: `deleted` itself if it
@@ -915,19 +1075,27 @@ impl CacheState {
 		for (root, events) in per_root {
 			// A root deleted during this same drain has already been removed from `sync_roots` by
 			// `handle_deleted_sync_roots` (which notified the app via `SyncRootsDeleted`). Skipping its
-			// now-absent callback here is correct — those events belonged to a root the app knows is gone.
-			let Some(callback) = self.sync_roots.get(&root) else {
+			// now-absent callbacks here is correct — those events belonged to a root the app knows is gone.
+			let Some(registrations) = self.sync_roots.get(&root) else {
 				continue;
 			};
-			let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-				callback(&mut events.iter().map(|event| &**event));
-			}));
-			if let Err(panic) = result {
-				let message = panic_message(&panic);
-				log::error!("sync-root {root} callback panicked: {message}");
-				let _ = self.msg_sender.try_send(vec![CacheMessage::Error(vec![
-					CacheError::sync_root_callback_panic(format!("sync root {root}: {message}")),
-				])]);
+			// Every registration on the root gets the full batch, each under its own `catch_unwind`,
+			// so one handle's panicking callback never starves a sibling registration.
+			for (registration_id, callback) in registrations {
+				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+					callback(&mut events.iter().map(|event| &**event));
+				}));
+				if let Err(panic) = result {
+					let message = panic_message(&panic);
+					log::error!(
+						"sync-root {root} callback (registration {registration_id}) panicked: {message}"
+					);
+					let _ = self.msg_sender.try_send(vec![CacheMessage::Error(vec![
+						CacheError::sync_root_callback_panic(format!(
+							"sync root {root}: {message}"
+						)),
+					])]);
+				}
 			}
 		}
 	}
@@ -1231,7 +1399,11 @@ impl CacheState {
 			self.surface_errors(errors);
 		}
 
-		self.apply_resync(per_root, remote_under_lock)
+		// A PARTIAL transient (some roots listed, some skipped) commits the converged roots'
+		// progress but keeps `needs_resync` SET in the same transaction, so the skipped roots are
+		// durably retried by a later drain instead of stranded stale (or, for a freshly added
+		// root, stranded empty) until the next unrelated gap.
+		self.apply_resync(per_root, remote_under_lock, any_transient)
 	}
 
 	/// Membership gate: is the upsert target's `parent` inside any configured sync root? An

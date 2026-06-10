@@ -1,7 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheHandle, CacheMessage, SyncRootCallback};
+use filen_sdk_rs::cache::CacheError;
 use filen_sdk_rs::{
 	ErrorKind,
 	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
@@ -9,7 +9,6 @@ use filen_sdk_rs::{
 };
 use filen_types::api::v3::dir::color::DirColor;
 use rusqlite::params;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod helpers;
@@ -382,18 +381,20 @@ async fn test_cache_list_dir_recursive_large_batch() {
 #[shared_test_runtime]
 async fn test_cache_shutdown_on_drop() {
 	let client = test_utils::RESOURCES.client().await;
+	let client = derive_client(client.as_ref());
 	let path = temp_cache_path();
+	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
 	{
-		let _cache = CacheHandle::new(
-			client.clone(),
-			path.clone(),
-			whole_account_sync_root(client.as_ref()),
-			|_| {},
-		)
-		.await
-		.unwrap();
+		let _handle = client
+			.clone()
+			.add_sync_root(client.root().uuid().into(), noop_sync_root_callback())
+			.await
+			.unwrap();
 	}
+	// Dropping the last handle shuts the worker down on its own; `flush_cache` joins it so the DB
+	// is deterministically closed before we read it.
+	client.flush_cache().await;
 
 	assert!(path.exists(), "DB file should persist after cache drop");
 
@@ -415,38 +416,36 @@ async fn test_cache_shutdown_on_drop() {
 #[shared_test_runtime]
 async fn test_cache_reopen_preserves_data() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
+	let client = derive_client(resources.client.as_ref());
 	let path = temp_cache_path();
 	let test_dir_uuid = resources.dir.uuid();
+	let account_root: Uuid = client.root().uuid().into();
+	// Configured ONCE — the config (and DB path) survives the worker stopping and respawning.
+	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
 	let dir = make_test_remote_dir("reopen_test_dir", test_dir_uuid);
 	let dir_uuid: Uuid = dir.uuid().into();
 	{
-		let cache = CacheHandle::new(
-			client.clone(),
-			path.clone(),
-			whole_account_sync_root(client.as_ref()),
-			|_| {},
-		)
-		.await
-		.unwrap();
-		ensure_socket_ready(client).await;
-		cache
+		let handle = client
+			.clone()
+			.add_sync_root(account_root, noop_sync_root_callback())
+			.await
+			.unwrap();
+		ensure_socket_ready(&client).await;
+		handle
 			.update_list_dir_recursive(vec![dir], vec![])
 			.await
 			.unwrap();
 		assert!(poll_for_item(&path, dir_uuid, Duration::from_secs(10)).await);
 	}
+	client.flush_cache().await;
 
 	{
-		let _cache = CacheHandle::new(
-			client.clone(),
-			path.clone(),
-			whole_account_sync_root(client.as_ref()),
-			|_| {},
-		)
-		.await
-		.unwrap();
+		let _handle = client
+			.clone()
+			.add_sync_root(account_root, noop_sync_root_callback())
+			.await
+			.unwrap();
 
 		assert!(
 			poll_for_item(&path, dir_uuid, Duration::from_secs(5)).await,
@@ -468,28 +467,27 @@ async fn test_cache_reopen_preserves_data() {
 #[shared_test_runtime]
 async fn test_cache_resyncs_on_restart_after_offline_change() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
+	let client = derive_client(resources.client.as_ref());
 	let test_dir = &resources.dir;
 	let test_dir_uuid: Uuid = test_dir.uuid().into();
+	let account_root: Uuid = client.root().uuid().into();
 	let path = temp_cache_path();
+	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
 	// Session 1: a fresh cache. The startup gap-check (watermark None, remote drive id > 0) resyncs and
 	// populates the cache from the account listing, so the existing test dir shows up.
 	{
-		let cache = CacheHandle::new(
-			client.clone(),
-			path.clone(),
-			whole_account_sync_root(client.as_ref()),
-			|_| {},
-		)
-		.await
-		.unwrap();
+		let _handle = client
+			.clone()
+			.add_sync_root(account_root, noop_sync_root_callback())
+			.await
+			.unwrap();
 		assert!(
 			poll_for_item(&path, test_dir_uuid, Duration::from_secs(60)).await,
 			"startup resync should populate the cache from the account listing"
 		);
-		cache.shutdown().await; // clean flush + join before reopening the same DB file
 	}
+	client.flush_cache().await; // clean flush + join before reopening the same DB file
 
 	// Offline change: create a dir while NO cache is running, advancing the remote drive id.
 	let mut offline_dir = client
@@ -498,40 +496,41 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 		.unwrap();
 	let offline_uuid: Uuid = offline_dir.uuid().into();
 
-	// Session 2: reopen the same DB. The startup gap-check sees the advanced drive id and resyncs, so
-	// the dir created while we were offline appears — with no socket delivery involved.
+	// Session 2: re-adding a sync root respawns the worker on the same DB. The startup gap-check sees
+	// the advanced drive id and resyncs, so the dir created while we were offline appears — with no
+	// socket delivery involved.
 	{
-		let cache = CacheHandle::new(
-			client.clone(),
-			path.clone(),
-			whole_account_sync_root(client.as_ref()),
-			|_| {},
-		)
-		.await
-		.unwrap();
+		let _handle = client
+			.clone()
+			.add_sync_root(account_root, noop_sync_root_callback())
+			.await
+			.unwrap();
 		assert!(
 			poll_for_item(&path, offline_uuid, Duration::from_secs(60)).await,
 			"restart resync should catch up the dir created while the cache was offline"
 		);
-		cache.shutdown().await;
 	}
+	client.flush_cache().await;
 
 	let _ = client.trash_dir(&mut offline_dir).await;
 }
 
-/// LIVE exercise of the resync `get_dir` not-found classification: a subdir configured as a sync root is
-/// PERMANENTLY DELETED server-side while the cache is closed. On reopen the startup resync calls
-/// `get_dir` on that root, the server answers not-found, and the cache must drop the root, wipe its
-/// cached subtree, and emit `SyncRootsDeleted`. (The unit tests cover `finalize_resync`'s decision logic
-/// deterministically; this proves the real error path end-to-end.)
+/// A sync root PERMANENTLY DELETED server-side while the cache is closed: registrations do not
+/// survive a worker restart, so re-adding the root on reopen runs the `add_sync_root` validation —
+/// the server answers not-found and the add is REJECTED with `CacheError::InvalidSyncRoot` (the bad
+/// key never re-enters the active set) AND the stale subtree the prior session cached under the
+/// root is wiped. The stale handle from the previous session stays inert and its drop is a harmless
+/// no-op. (The LIVE not-found classification inside a running resync — drop + wipe +
+/// `SyncRootsDeleted` — is covered deterministically by the `finalize_resync` unit tests.)
 #[shared_test_runtime]
-async fn test_cache_resync_drops_a_permanently_deleted_sync_root() {
+async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
+	let client = derive_client(resources.client.as_ref());
 	let test_dir = &resources.dir;
 	let path = temp_cache_path();
+	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
-	// The subdir that will be the sole sync root, plus a child so there is a subtree to wipe.
+	// The subdir that will be the sole sync root, plus a child so there is a populated subtree.
 	let mut root_dir = client
 		.create_dir(&test_dir.into(), "cache_resync_deleted_root")
 		.await
@@ -543,40 +542,29 @@ async fn test_cache_resync_drops_a_permanently_deleted_sync_root() {
 		.unwrap();
 	let child_uuid: Uuid = child.uuid().into();
 
-	// Selective config: sync ONLY `root_dir`. A fresh Vec per open (callbacks are not Clone).
-	let make_roots = || -> Vec<(Uuid, SyncRootCallback)> {
-		vec![(
-			root_uuid,
-			Box::new(|_: &mut dyn Iterator<Item = &CacheEvent<'_>>| {}),
-		)]
-	};
-
-	// Session 1: populate the root + child via the startup resync, then clean shutdown.
-	{
-		let cache = CacheHandle::new(client.clone(), path.clone(), make_roots(), |_| {})
-			.await
-			.unwrap();
-		assert!(
-			poll_for_item(&path, root_uuid, Duration::from_secs(60)).await,
-			"the sync root should be cached after the startup resync"
-		);
-		assert!(
-			poll_for_item(&path, child_uuid, Duration::from_secs(60)).await,
-			"the child should be cached after the startup resync"
-		);
-		cache.shutdown().await;
-	}
+	// Session 1: selective sync of ONLY `root_dir`; populate via the convergence resync, then flush.
+	let stale_handle = client
+		.clone()
+		.add_sync_root(root_uuid, noop_sync_root_callback())
+		.await
+		.unwrap();
+	assert!(
+		poll_for_item(&path, root_uuid, Duration::from_secs(60)).await,
+		"the sync root should be cached after the convergence resync"
+	);
+	assert!(
+		poll_for_item(&path, child_uuid, Duration::from_secs(60)).await,
+		"the child should be cached after the convergence resync"
+	);
+	client.flush_cache().await;
 
 	// Permanently delete the root (and its subtree) while the cache is offline.
 	client.trash_dir(&mut root_dir).await.unwrap();
 	client.delete_dir_permanently(root_dir).await.unwrap();
 
 	// The `/v3/dir` metadata lookup is eventually-consistent: a permanently-deleted dir keeps resolving
-	// for a few seconds before the server reports it gone. Wait for that to settle BEFORE reopening, so
-	// the resync's `get_dir` deterministically sees the not-found. (This models the real precondition —
-	// an app reopens long after a deletion, not within the propagation window. A resync that raced the
-	// window would converge the root as still-present, which is the bounded edge the production code
-	// accepts: the next organic resync re-checks it.)
+	// for a few seconds before the server reports it gone. Wait for that to settle BEFORE re-adding, so
+	// the validating `get_dir` deterministically sees the not-found.
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 	loop {
 		match client.get_dir((&root_uuid).into()).await {
@@ -591,49 +579,35 @@ async fn test_cache_resync_drops_a_permanently_deleted_sync_root() {
 		}
 	}
 
-	// Session 2: reopen with the root STILL configured (the app has not learned it is gone). The startup
-	// resync's `get_dir(root)` returns not-found → drop + wipe subtree + notify. Capture status messages.
-	let messages: MessageLog = Arc::new(Mutex::new(Vec::new()));
-	let messages_cb = messages.clone();
-	let cache = CacheHandle::new(client.clone(), path.clone(), make_roots(), move |msgs| {
-		let messages_cb = messages_cb.clone();
-		tokio::task::spawn(async move {
-			messages_cb.lock().await.extend(msgs);
-		});
-	})
-	.await
-	.unwrap();
-
+	// Session 2: the app re-adds the root it has not yet learned is gone — validation rejects it.
+	let err = client
+		.clone()
+		.add_sync_root(root_uuid, noop_sync_root_callback())
+		.await
+		.expect_err("re-adding a permanently-deleted sync root must be rejected");
 	assert!(
-		poll_for_item_absent(&path, root_uuid, Duration::from_secs(60)).await,
-		"the not-found root must be wiped from the cache"
-	);
-	assert!(
-		poll_for_item_absent(&path, child_uuid, Duration::from_secs(60)).await,
-		"the not-found root's subtree must be cascade-wiped"
+		matches!(
+			err.downcast_ref::<CacheError>(),
+			Some(CacheError::InvalidSyncRoot { uuid, .. }) if *uuid == root_uuid
+		),
+		"the rejection should carry CacheError::InvalidSyncRoot for the deleted root, got {err:?}"
 	);
 
-	// And a SyncRootsDeleted naming the root must reach the status callback.
-	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-	let mut notified = false;
-	while tokio::time::Instant::now() < deadline {
-		{
-			let guard = messages.lock().await;
-			if guard.iter().any(
-				|m| matches!(m, CacheMessage::SyncRootsDeleted(roots) if roots.contains(&root_uuid)),
-			) {
-				notified = true;
-				break;
-			}
-		}
-		tokio::time::sleep(Duration::from_millis(100)).await;
-	}
+	// The definitive not-found also wiped the stale subtree session 1 cached under the root —
+	// without it those rows would be stranded forever (membership-gated out of live events,
+	// anchored by no resync diff), serving deleted content to any DB reader.
 	assert!(
-		notified,
-		"a SyncRootsDeleted notification for the permanently-deleted root is expected"
+		poll_for_item_absent(&path, root_uuid, Duration::from_secs(30)).await,
+		"the deleted root's stale row must be wiped by the rejected re-add"
+	);
+	assert!(
+		poll_for_item_absent(&path, child_uuid, Duration::from_secs(30)).await,
+		"the deleted root's stale subtree must be cascade-wiped by the rejected re-add"
 	);
 
-	cache.shutdown().await;
+	// The stale session-1 handle is inert (its worker is gone); dropping it must be a no-op.
+	drop(stale_handle);
+	client.flush_cache().await;
 }
 
 #[shared_test_runtime]
@@ -1260,9 +1234,10 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 	assert_eq!(dir_errs, 2, "expected 2 dir conversion errors");
 }
 
-/// §5.7 #12: `add_sync_root` with a uuid that is not a reachable directory is REJECTED — surfaced as a
-/// `CacheError::InvalidSyncRoot` — so the bad key never enters the active set (which would otherwise make
-/// every subsequent resync's `get_dir` fail and re-trigger a resync on each event: a tight loop).
+/// `add_sync_root` with a uuid that is not a reachable directory is REJECTED — the future resolves
+/// to `Err` carrying `CacheError::InvalidSyncRoot` — so the bad key never enters the active set
+/// (which would otherwise make every subsequent resync's `get_dir` fail and re-trigger a resync on
+/// each event: a tight loop).
 #[shared_test_runtime]
 async fn test_add_sync_root_rejects_invalid_uuid() {
 	let client = test_utils::RESOURCES.client().await;
@@ -1270,31 +1245,18 @@ async fn test_add_sync_root_rejects_invalid_uuid() {
 
 	// A random uuid that does not correspond to any directory on the account.
 	let bogus = Uuid::new_v4();
-	let noop: SyncRootCallback = Box::new(|_: &mut dyn Iterator<Item = &CacheEvent<'_>>| {});
-	cache.handle.add_sync_root(bogus, noop).unwrap();
-
-	// Poll the status log for the specific rejection (the startup whole-account resync may emit its own
-	// messages first, so a one-shot inspect could race ahead of this one). The deadline is generous
-	// because the worker validates via a `block_on(get_dir)` that competes for the account drive lock
-	// with every other concurrent test's startup resync.
-	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-	let saw_rejection = loop {
-		let present = cache.messages.lock().await.iter().any(|msg| {
-			message_errors(msg)
-				.iter()
-				.any(|e| matches!(e, CacheError::InvalidSyncRoot { uuid, .. } if *uuid == bogus))
-		});
-		if present {
-			break true;
-		}
-		if tokio::time::Instant::now() >= deadline {
-			break false;
-		}
-		tokio::time::sleep(Duration::from_millis(100)).await;
-	};
+	let err = cache
+		.client
+		.clone()
+		.add_sync_root(bogus, noop_sync_root_callback())
+		.await
+		.expect_err("add_sync_root with a bogus uuid must be rejected");
 
 	assert!(
-		saw_rejection,
-		"add_sync_root with a bogus uuid should surface CacheError::InvalidSyncRoot"
+		matches!(
+			err.downcast_ref::<CacheError>(),
+			Some(CacheError::InvalidSyncRoot { uuid, .. }) if *uuid == bogus
+		),
+		"the rejection should carry CacheError::InvalidSyncRoot, got {err:?}"
 	);
 }

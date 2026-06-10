@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::Utc;
-use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheHandle, CacheMessage, SyncRootCallback};
+use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheMessage, SyncRootCallback, SyncRootHandle};
 use filen_sdk_rs::{
 	auth::Client,
 	crypto::file::FileKey,
@@ -36,13 +36,20 @@ pub fn temp_cache_path() -> PathBuf {
 	path
 }
 
-/// Configure the cache to sync the WHOLE account (the account root as the sole sync root, with a no-op
-/// callback) — the behavior these tests were written against, now that the production default is
-/// explicit sync roots.
-pub fn whole_account_sync_root(client: &Client) -> Vec<(Uuid, SyncRootCallback)> {
-	let root: Uuid = client.root().uuid().into();
-	let noop: SyncRootCallback = Box::new(|_: &mut dyn Iterator<Item = &CacheEvent<'_>>| {});
-	vec![(root, noop)]
+/// A no-op sync-root notification callback.
+pub fn noop_sync_root_callback() -> SyncRootCallback {
+	Box::new(|_: &mut dyn Iterator<Item = &CacheEvent<'_>>| {})
+}
+
+/// Derive a private `Client` for the same account (via the stringified round-trip, like
+/// `socket_tests` does) so each test owns its own cache slot — a `Client` runs ONE cache worker,
+/// and the integration tests run concurrently against the single shared `RESOURCES` client.
+pub fn derive_client(base: &Client) -> Arc<Client> {
+	Arc::new(
+		base.get_unauthed()
+			.from_stringified(base.to_stringified())
+			.unwrap(),
+	)
 }
 
 /// The `CacheError`s carried by a status message, or empty for non-error messages (e.g.
@@ -360,40 +367,46 @@ pub async fn ensure_socket_ready(client: &Client) {
 	.await;
 }
 
-/// Shared queue of `CacheMessage`s captured from a `CacheHandle`'s status callback.
+/// Shared queue of `CacheMessage`s captured from the cache's status callback.
 /// Wrapping in an `Arc<Mutex<_>>` is the simplest way to share with the `'static`
 /// callback while letting the test thread inspect the contents. Note `Mutex` here is
 /// `tokio::sync::Mutex` (async) — lock it with `.lock().await`, not a blocking `.lock()`.
 pub type MessageLog = std::sync::Arc<Mutex<Vec<CacheMessage>>>;
 
-/// A test cache wrapping CacheHandle with automatic temp DB cleanup.
+/// A test cache: a DERIVED private client (its own cache slot, configured onto a unique temp DB)
+/// syncing the WHOLE account via a single no-op sync-root handle.
 pub struct TestCache {
 	path: PathBuf,
-	pub handle: CacheHandle,
+	pub client: Arc<Client>,
+	pub handle: SyncRootHandle,
 	pub messages: MessageLog,
 }
 
 impl TestCache {
-	pub async fn new(client: &Arc<Client>) -> Self {
+	pub async fn new(base: &Arc<Client>) -> Self {
+		let client = derive_client(base.as_ref());
 		let path = temp_cache_path();
 		let messages: MessageLog = Arc::new(Mutex::new(Vec::new()));
 		let messages_cb = messages.clone();
-		let handle = CacheHandle::new(
-			client.clone(),
-			path.clone(),
-			whole_account_sync_root(client.as_ref()),
-			move |msgs| {
+		client
+			.configure_cache(path.clone(), move |msgs| {
 				let messages_cb = messages_cb.clone();
 				tokio::task::spawn(async move {
 					messages_cb.lock().await.extend(msgs);
 				});
-			},
-		)
-		.await
-		.unwrap();
-		ensure_socket_ready(client).await;
+			})
+			.await
+			.unwrap();
+		let root: Uuid = client.root().uuid().into();
+		let handle = client
+			.clone()
+			.add_sync_root(root, noop_sync_root_callback())
+			.await
+			.unwrap();
+		ensure_socket_ready(&client).await;
 		Self {
 			path,
+			client,
 			handle,
 			messages,
 		}

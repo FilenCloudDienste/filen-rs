@@ -284,10 +284,16 @@ impl CacheState {
 	/// by the delete query (post-DeleteAll the listing is empty, so the cache is emptied), and
 	/// `TrashEmpty`/`DeleteVersioned` are cache no-ops. This relies on the server giving read-after-write
 	/// consistency under the lock, which is a foundational assumption of the resync design.
+	///
+	/// `mark_resync` writes `needs_resync` as SET instead of cleared, in the same transaction:
+	/// used when the resync that produced these synthetics also SKIPPED at least one root
+	/// transiently — the watermark still advances for the roots that did converge, while a durable
+	/// retry stays scheduled for the one(s) that did not.
 	pub(crate) fn commit_resync_synthetics(
 		&mut self,
 		synthetics: &[CacheEvent<'_>],
 		remote_under_lock: u64,
+		mark_resync: bool,
 	) -> Result<(), Box<CacheError>> {
 		let tx = self
 			.db
@@ -315,9 +321,12 @@ impl CacheState {
 		.map_err(|e| db_err(e, "advancing watermark in resync commit"))?;
 		tx.execute(
 			super::statements::CACHE_META_SET,
-			params![super::statements::NEEDS_RESYNC_KEY, 0_i64],
+			params![
+				super::statements::NEEDS_RESYNC_KEY,
+				if mark_resync { 1_i64 } else { 0_i64 }
+			],
 		)
-		.map_err(|e| db_err(e, "clearing needs_resync in resync commit"))?;
+		.map_err(|e| db_err(e, "writing needs_resync in resync commit"))?;
 		tx.commit()
 			.map_err(|e| db_err(e, "committing resync batch"))?;
 		Ok(())
@@ -637,7 +646,9 @@ mod tests {
 				CacheEventType::File(FileEvent::Removed(Uuid::from_u128(7))),
 			),
 		];
-		state.commit_resync_synthetics(&synthetics, 99).unwrap();
+		state
+			.commit_resync_synthetics(&synthetics, 99, false)
+			.unwrap();
 
 		// Both rows landed as synthetics (NULL id) and read back in insertion order.
 		let (count, synth_count): (i64, i64) = state
@@ -667,6 +678,22 @@ mod tests {
 		// Watermark advanced to the snapshot id; resync flag cleared.
 		assert_eq!(state.watermark().unwrap(), Some(99));
 		assert!(!state.needs_resync().unwrap());
+	}
+
+	/// `mark_resync = true` (a resync that transiently skipped a root) still advances the
+	/// watermark for the converged roots but leaves the durable retry flag SET, atomically.
+	#[test]
+	fn commit_resync_synthetics_with_mark_resync_keeps_the_flag_set() {
+		let mut state = CacheState::new_in_memory();
+		assert!(!state.needs_resync().unwrap());
+
+		state.commit_resync_synthetics(&[], 42, true).unwrap();
+
+		assert_eq!(state.watermark().unwrap(), Some(42), "progress committed");
+		assert!(
+			state.needs_resync().unwrap(),
+			"durable retry stays scheduled for the skipped root"
+		);
 	}
 
 	#[test]

@@ -29,7 +29,7 @@ impl CacheState {
 	/// Whether `uuid`, or any of its ancestors, is a configured sync root — i.e. the item belongs to at
 	/// least one sync root. The seed key is checked in memory first (the common fast path: a direct child
 	/// of a root); only on a miss do we walk the ancestry. Generic over the map value so it works
-	/// directly against `CacheState::sync_roots` (a `HashMap<Uuid, SyncRootCallback>`) with no per-event
+	/// directly against `CacheState::sync_roots` (a `HashMap<Uuid, RootRegistrations>`) with no per-event
 	/// allocation.
 	pub(crate) fn in_any_sync_root<V>(
 		&self,

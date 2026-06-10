@@ -224,7 +224,8 @@ jobs:
         with:
           node-version: '24.x'
       - name: Run clippy wasm-full
-        run: cargo clippy --target wasm32-unknown-unknown -F wasm-full,cache -- -D warnings
+        # no `cache` here — enabling it on wasm is a deliberate compile error until a wasm port lands
+        run: cargo clippy --target wasm32-unknown-unknown -F wasm-full -- -D warnings
         working-directory: ./filen-sdk-rs
       - name: Run clippy service-worker
         run: cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings

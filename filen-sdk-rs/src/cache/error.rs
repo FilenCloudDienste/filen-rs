@@ -35,10 +35,18 @@ pub enum CacheError {
 	/// A per-sync-root [`SyncRootCallback`](crate::cache::SyncRootCallback) panicked during dispatch; the
 	/// panic was caught so other roots/events still apply. The string is the root uuid + panic payload.
 	SyncRootCallbackPanic(String),
-	/// An `AddSyncRoot` uuid could not be validated as a reachable directory, so the root was NOT added.
-	/// `message` is the underlying SDK error. The app should re-issue `add_sync_root` with a valid uuid
-	/// (or retry the same one if the failure was transient).
+	/// An `AddSyncRoot` uuid is DEFINITIVELY not a reachable directory (the server reported
+	/// not-found), so the root was NOT added — and any stale subtree a prior session cached under it
+	/// has been wiped. `message` is the underlying SDK error. Re-issue `add_sync_root` with a valid
+	/// uuid; retrying the same one is pointless.
 	InvalidSyncRoot {
+		uuid: uuid::Uuid,
+		message: String,
+	},
+	/// An `AddSyncRoot` uuid could not be validated because the check itself failed
+	/// (network/server trouble, NOT a not-found), so the root was NOT added. `message` is the
+	/// underlying SDK error. Retry the same uuid once connectivity recovers.
+	SyncRootUnavailable {
 		uuid: uuid::Uuid,
 		message: String,
 	},
@@ -68,6 +76,10 @@ impl CacheError {
 	pub(crate) fn invalid_sync_root(uuid: uuid::Uuid, message: String) -> Self {
 		Self::InvalidSyncRoot { uuid, message }
 	}
+
+	pub(crate) fn sync_root_unavailable(uuid: uuid::Uuid, message: String) -> Self {
+		Self::SyncRootUnavailable { uuid, message }
+	}
 }
 
 impl std::fmt::Display for CacheError {
@@ -93,6 +105,9 @@ impl std::fmt::Display for CacheError {
 			Self::InvalidSyncRoot { uuid, message } => {
 				write!(f, "invalid sync root {uuid}: {message}")
 			}
+			Self::SyncRootUnavailable { uuid, message } => {
+				write!(f, "sync root {uuid} could not be validated: {message}")
+			}
 		}
 	}
 }
@@ -105,7 +120,8 @@ impl std::error::Error for CacheError {
 			Self::DirCacheableConversion(e) => Some(&e.error),
 			Self::Serialization(_)
 			| Self::SyncRootCallbackPanic(_)
-			| Self::InvalidSyncRoot { .. } => None,
+			| Self::InvalidSyncRoot { .. }
+			| Self::SyncRootUnavailable { .. } => None,
 		}
 	}
 }

@@ -116,6 +116,8 @@ impl UnauthClient {
 				feature = "wasm-full"
 			))]
 			socket_handle: std::sync::Mutex::new(WebSocketHandle::default()),
+			#[cfg(feature = "cache")]
+			cache_slot: Default::default(),
 			nickname: RwLock::new(None),
 			avatar_url: RwLock::new(None),
 		})
@@ -216,6 +218,8 @@ impl UnauthClient {
 				feature = "wasm-full"
 			))]
 			socket_handle: std::sync::Mutex::new(WebSocketHandle::default()),
+			#[cfg(feature = "cache")]
+			cache_slot: Default::default(),
 			nickname: RwLock::new(None),
 			avatar_url: RwLock::new(None),
 		})

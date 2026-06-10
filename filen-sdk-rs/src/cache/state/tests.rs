@@ -9,8 +9,9 @@ fn item_count(state: &CacheState) -> i64 {
 
 /// Async-bridging guard. The worker runs on a `std::thread` (not a runtime thread)
 /// and drives the async resync island through a `tokio::runtime::Handle::block_on` captured at
-/// construction (`CacheHandle::new` calls `Handle::current()` inside the app's multi-threaded
-/// runtime; that handle is stashed in [`ResyncDeps`]). This locks the invariant that such a handle
+/// construction (the worker spawn behind `Client::add_sync_root` calls `Handle::current()` inside
+/// the app's multi-threaded runtime; that handle is stashed in [`ResyncDeps`]). This locks the
+/// invariant that such a handle
 /// can be `block_on`'d from a NON-runtime thread without the "cannot block_on from within a runtime"
 /// panic — i.e. the bridging mechanism the worker relies on is sound.
 #[test]
@@ -268,7 +269,7 @@ fn resync_self_heals_cache_to_listing_and_is_idempotent() {
 	let files = vec![f1_new.clone(), f_new.clone()];
 
 	state
-		.apply_resync(vec![(root, dirs.clone(), files.clone())], 100)
+		.apply_resync(vec![(root, dirs.clone(), files.clone())], 100, false)
 		.unwrap();
 
 	// Converged: vanished file removed; new items created; changed file's hash refreshed.
@@ -329,7 +330,7 @@ fn resync_move_out_of_deleted_parent_preserves_subtree() {
 	// Listing: M moved to root (D_old gone); F still under M, unchanged (so F itself emits nothing).
 	let m_moved = cache_dir(2, root);
 	state
-		.apply_resync(vec![(root, vec![m_moved], vec![f.clone()])], 100)
+		.apply_resync(vec![(root, vec![m_moved], vec![f.clone()])], 100, false)
 		.unwrap();
 
 	assert!(!item_exists(&state, d_old.uuid), "deleted parent removed");
@@ -394,7 +395,7 @@ fn membership_gate_skips_out_of_root_upserts() {
 	state.upsert_dirs(once(&a)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// In-root file (parent = A) → cached.
 	let in_root = cache_file(2, a.uuid, 100);
@@ -433,7 +434,7 @@ fn move_out_of_sync_root_deletes_the_stale_row() {
 	state.upsert_files(once(&file)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 	assert!(item_exists(&state, file.uuid), "file starts cached under A");
 
 	// Move the file OUT of A — to the account root, which is NOT a configured sync root.
@@ -464,7 +465,7 @@ fn move_of_a_sync_root_out_of_its_parent_keeps_its_subtree() {
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// Move sync root B out from under A to directly under the account root (NOT a configured root).
 	let moved_b = cache_dir(2, account_root);
@@ -500,7 +501,7 @@ fn changed_on_out_of_root_sync_root_dir_applies() {
 	state.upsert_dirs(once(&b)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	let before = item_content_hash(&state, b.uuid);
 	// Same uuid + parent, renamed → the fingerprint changes.
@@ -546,7 +547,7 @@ fn apply_resync_converges_each_sync_root_independently() {
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// Listings: A → fA1 + new fA3 (fA2 gone); B → fB1 + new fB2.
 	let fa3 = cache_file(12, a.uuid, 100);
@@ -555,7 +556,7 @@ fn apply_resync_converges_each_sync_root_independently() {
 		(a.uuid, vec![], vec![fa1.clone(), fa3.clone()]),
 		(b.uuid, vec![], vec![fb1.clone(), fb2.clone()]),
 	];
-	state.apply_resync(per_root, 500).unwrap();
+	state.apply_resync(per_root, 500, false).unwrap();
 
 	// A converged.
 	assert!(item_exists(&state, fa1.uuid));
@@ -595,7 +596,7 @@ fn apply_resync_with_no_listings_advances_and_clears_without_deleting() {
 	state.mark_needs_resync().unwrap();
 
 	// Every configured root was skipped (e.g. all unreachable) → nothing listed.
-	state.apply_resync(vec![], 777).unwrap();
+	state.apply_resync(vec![], 777, false).unwrap();
 
 	assert!(
 		item_exists(&state, a.uuid),
@@ -636,9 +637,9 @@ fn remove_sync_root_eviction_protects_nested_root() {
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
-	state.handle_remove_sync_root(a.uuid, true);
+	state.handle_remove_registration(a.uuid, 0, true, None);
 
 	assert!(
 		!state.sync_roots.contains_key(&a.uuid),
@@ -676,9 +677,9 @@ fn remove_sync_root_eviction_leaves_siblings_alone() {
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
-	state.handle_remove_sync_root(a.uuid, true);
+	state.handle_remove_registration(a.uuid, 0, true, None);
 
 	assert!(!item_exists(&state, fa.uuid), "A's file evicted");
 	assert!(
@@ -699,9 +700,9 @@ fn remove_sync_root_without_evict_keeps_items() {
 	state.upsert_files(once(&fa)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
-	state.handle_remove_sync_root(a.uuid, false);
+	state.handle_remove_registration(a.uuid, 0, false, None);
 
 	assert!(!state.sync_roots.contains_key(&a.uuid));
 	assert!(item_exists(&state, fa.uuid), "no eviction → items remain");
@@ -723,7 +724,7 @@ fn dir_removed_of_sync_root_drops_it_and_notifies() {
 	state.upsert_files(once(&child)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// B is deleted server-side.
 	state
@@ -766,7 +767,7 @@ fn cascade_delete_drops_nested_sync_root() {
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// A is deleted server-side; the cascade wipes I and the nested root B.
 	state
@@ -816,7 +817,7 @@ fn dir_move_out_of_root_drops_nested_sync_root() {
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// Move C out from under A to directly under the account root (not a sync root) → C's subtree,
 	// including the nested root B, is cascade-deleted.
@@ -862,7 +863,7 @@ fn finalize_resync_drops_a_server_deleted_root() {
 	state.upsert_files(once(&child)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 	state.mark_needs_resync().unwrap();
 
 	// The locked listing reported B not-found (deleted server-side); nothing else to list or skip.
@@ -901,7 +902,7 @@ fn finalize_resync_all_transient_failure_preserves_watermark_and_flag() {
 	state.upsert_dirs(once(&b)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// A real prior watermark + a pending hole that this resync is meant to heal.
 	state.set_watermark(50).unwrap();
@@ -936,7 +937,7 @@ fn delete_all_marks_needs_resync() {
 	state.upsert_dirs(once(&a)).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	assert!(!state.needs_resync().unwrap(), "starts clear");
 	state
@@ -963,7 +964,7 @@ fn dir_removed_of_non_root_does_not_touch_the_set() {
 	state.upsert_dirs([&a, &sub].into_iter()).unwrap();
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	state
 		.apply_event(CacheEventType::Dir(DirEvent::Removed(sub.uuid)))
@@ -1004,7 +1005,7 @@ fn dispatch_notifies_only_the_owning_sync_root() {
 			}
 		}),
 	);
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// A New under A (in-root) and a New under the account root (out-of-root, not a sync root).
 	let in_root = cache_file(2, a.uuid, 100);
@@ -1069,7 +1070,7 @@ fn dispatch_move_between_sync_roots_notifies_both() {
 			}
 		}),
 	);
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	let moved = cache_file(3, b.uuid, 100); // same uuid, now under B
 	state
@@ -1122,7 +1123,7 @@ fn dispatch_isolates_a_panicking_callback() {
 			}
 		}),
 	);
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	// One New under A (fires A's panicking callback) and one under B.
 	state
@@ -1192,7 +1193,7 @@ fn delete_all_through_drain_wipes_resyncs_and_notifies_all_roots() {
 			}
 		}),
 	);
-	state.sync_roots = sync_roots;
+	state.set_test_sync_roots(sync_roots);
 
 	state
 		.insert_event(&CacheEvent {
@@ -1737,4 +1738,255 @@ fn drain_pending_applies_socket_then_deferred_manual() {
 		"the socket dir applied; the empty manual list added nothing"
 	);
 	assert_eq!(state.watermark().unwrap(), Some(1));
+}
+
+/// registering an additional callback on an ALREADY-ACTIVE root appends it (both
+/// registrations live), acks `Ok`, and requests NO convergence resync — the subtree is already
+/// converged and the uuid's existence is established.
+#[test]
+fn add_registration_to_active_root_appends_without_resync() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	state.upsert_dirs(once(&a)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(a.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	let needs_resync = state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack);
+
+	assert!(!needs_resync, "an already-active root needs no resync");
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
+	assert_eq!(
+		state.sync_roots.get(&a.uuid).unwrap().len(),
+		2,
+		"both registrations live"
+	);
+}
+
+/// registering a NEW root acks `Ok` once it is in the active set and reports that a
+/// convergence resync is needed. (Unit construction has no resync deps, so the `get_dir`
+/// validation is skipped — exactly like the production account-root path.)
+#[test]
+fn add_registration_for_new_root_acks_and_requests_resync() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let b = cache_dir(2, account_root);
+	state.upsert_dirs(once(&b)).unwrap();
+	state.set_test_sync_roots(HashMap::new());
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	let needs_resync = state.handle_add_sync_root(b.uuid, 7, Box::new(|_| {}), ack);
+
+	assert!(needs_resync, "a newly-active root must be converged");
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
+	assert!(state.sync_roots.contains_key(&b.uuid));
+}
+
+/// removing ONE of two registrations keeps the root active and SKIPS the requested
+/// eviction (deleting the subtree out from under the surviving registration would fight the
+/// membership gate); the ack reports `Ok(false)`.
+#[test]
+fn remove_registration_with_survivors_skips_eviction() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	let fa = cache_file(10, a.uuid, 100);
+	state.upsert_dirs(once(&a)).unwrap();
+	state.upsert_files(once(&fa)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(a.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+	let (add_ack, _add_ack_rx) = tokio::sync::oneshot::channel();
+	state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), add_ack);
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	state.handle_remove_registration(a.uuid, 0, true, Some(ack));
+
+	assert!(
+		matches!(ack_rx.try_recv(), Ok(Ok(false))),
+		"eviction skipped while a registration survives"
+	);
+	assert!(state.sync_roots.contains_key(&a.uuid), "root still active");
+	assert!(item_exists(&state, fa.uuid), "subtree intact");
+}
+
+/// removing the LAST registration with `evict` deletes the root's subtree and acks
+/// `Ok(true)`.
+#[test]
+fn remove_last_registration_evicts_and_acks_true() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	let fa = cache_file(10, a.uuid, 100);
+	state.upsert_dirs(once(&a)).unwrap();
+	state.upsert_files(once(&fa)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(a.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	state.handle_remove_registration(a.uuid, 0, true, Some(ack));
+
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(true))), "subtree evicted");
+	assert!(!state.sync_roots.contains_key(&a.uuid), "root inactive");
+	assert!(!item_exists(&state, fa.uuid), "A's file evicted");
+	assert!(item_exists(&state, a.uuid), "the root's own node is kept");
+}
+
+/// a registration removal for a root that was already dropped server-side (a stale
+/// handle's drop) is a harmless no-op acked `Ok(false)`.
+#[test]
+fn remove_registration_after_server_side_deletion_is_noop() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let b = cache_dir(1, account_root);
+	state.upsert_dirs(once(&b)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(b.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	// B is deleted server-side → dropped from the active set (all registrations at once).
+	state
+		.apply_event(CacheEventType::Dir(DirEvent::Removed(b.uuid)))
+		.unwrap();
+	assert!(!state.sync_roots.contains_key(&b.uuid));
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	state.handle_remove_registration(b.uuid, 0, true, Some(ack));
+
+	assert!(
+		matches!(ack_rx.try_recv(), Ok(Ok(false))),
+		"stale removal no-ops"
+	);
+}
+
+/// dispatch fans a batch out to EVERY registration on the owning root, not just one.
+#[test]
+fn dispatch_fires_every_registration_on_a_root() {
+	use std::sync::{Arc, Mutex};
+
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	state.upsert_dirs(once(&a)).unwrap();
+
+	let first_got = Arc::new(Mutex::new(false));
+	let second_got = Arc::new(Mutex::new(false));
+	let (first_cb, second_cb) = (first_got.clone(), second_got.clone());
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(
+		a.uuid,
+		Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
+			if events.next().is_some() {
+				*first_cb.lock().unwrap() = true;
+			}
+		}),
+	);
+	state.set_test_sync_roots(sync_roots);
+	let (add_ack, _add_ack_rx) = tokio::sync::oneshot::channel();
+	state.handle_add_sync_root(
+		a.uuid,
+		1,
+		Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
+			if events.next().is_some() {
+				*second_cb.lock().unwrap() = true;
+			}
+		}),
+		add_ack,
+	);
+
+	let in_root = cache_file(2, a.uuid, 100);
+	state
+		.insert_event(&CacheEvent {
+			id: Some(1),
+			event: CacheEventType::File(FileEvent::New(in_root)),
+		})
+		.unwrap();
+	state.drain_persisted().unwrap();
+
+	assert!(*first_got.lock().unwrap(), "first registration notified");
+	assert!(*second_got.lock().unwrap(), "second registration notified");
+}
+
+/// a control burst registers everything queued behind the first message before the (single)
+/// convergence resync, and a queued `Shutdown` wins immediately.
+#[test]
+fn control_burst_processes_queued_messages_and_shutdown_wins() {
+	let (mut state, producer) = CacheState::new_in_memory_with_producer();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	let b = cache_dir(2, account_root);
+	state.upsert_dirs([&a, &b].into_iter()).unwrap();
+	state.set_test_sync_roots(HashMap::new());
+
+	// Queue a second add behind the first; the burst must pick it up via try_recv.
+	let (b_ack, mut b_ack_rx) = tokio::sync::oneshot::channel();
+	producer
+		.control
+		.send(CacheControlMessage::AddSyncRoot {
+			uuid: b.uuid,
+			registration_id: 1,
+			callback: Box::new(|_| {}),
+			ack: b_ack,
+		})
+		.unwrap();
+	let (a_ack, mut a_ack_rx) = tokio::sync::oneshot::channel();
+	let shutdown = state.process_control_burst(CacheControlMessage::AddSyncRoot {
+		uuid: a.uuid,
+		registration_id: 0,
+		callback: Box::new(|_| {}),
+		ack: a_ack,
+	});
+
+	assert!(!shutdown);
+	assert!(matches!(a_ack_rx.try_recv(), Ok(Ok(()))));
+	assert!(matches!(b_ack_rx.try_recv(), Ok(Ok(()))));
+	assert!(state.sync_roots.contains_key(&a.uuid) && state.sync_roots.contains_key(&b.uuid));
+	assert!(
+		state.needs_resync().unwrap(),
+		"the new roots' convergence is durably scheduled (the unit-ctx resync is a no-op, so the \
+		 flag survives for a later drain to retry)"
+	);
+
+	// A Shutdown anywhere in the burst stops processing immediately.
+	assert!(state.process_control_burst(CacheControlMessage::Shutdown));
+}
+
+/// evicting the account root while a subdir root survives wipes everything flat, then
+/// durably schedules the survivors' re-convergence — so a transiently failing inline resync (a
+/// no-op in unit construction) is retried by a later drain instead of stranding them empty.
+#[test]
+fn account_root_evict_with_survivors_marks_needs_resync() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	let fa = cache_file(10, a.uuid, 100);
+	state.upsert_dirs(once(&a)).unwrap();
+	state.upsert_files(once(&fa)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(account_root, Box::new(|_| {}));
+	sync_roots.insert(a.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	state.handle_remove_registration(account_root, 0, true, Some(ack));
+
+	assert!(
+		matches!(ack_rx.try_recv(), Ok(Ok(true))),
+		"account root evicted"
+	);
+	assert!(
+		!item_exists(&state, fa.uuid),
+		"the flat wipe removed the survivor's file"
+	);
+	assert!(
+		state.sync_roots.contains_key(&a.uuid),
+		"survivor still registered"
+	);
+	assert!(
+		state.needs_resync().unwrap(),
+		"survivor re-convergence durably scheduled"
+	);
 }

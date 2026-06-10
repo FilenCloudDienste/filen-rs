@@ -272,6 +272,12 @@ pub struct Client {
 	))]
 	pub(crate) socket_handle: std::sync::Mutex<WebSocketHandle>,
 
+	/// The cache configuration + a weak reference to the live cache worker (see
+	/// [`Client::add_sync_root`]). A tokio `Mutex` because it is held across the worker
+	/// spawn/join awaits to serialize them.
+	#[cfg(feature = "cache")]
+	pub(crate) cache_slot: tokio::sync::Mutex<crate::cache::CacheSlot>,
+
 	nickname: std::sync::RwLock<Option<Option<Arc<str>>>>,
 	avatar_url: std::sync::RwLock<Option<Option<Arc<str>>>>,
 }

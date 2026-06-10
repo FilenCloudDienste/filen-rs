@@ -13,10 +13,10 @@
 
 pub(crate) mod api;
 pub mod auth;
-#[cfg(all(
-	feature = "cache",
-	not(all(target_family = "wasm", target_os = "unknown"))
-))]
+// Gated on the feature ALONE — deliberately no wasm exclusion: the engine cannot run on wasm yet
+// (rusqlite 0.37, worker thread, block_on islands), and enabling `cache` there should FAIL the
+// build loudly rather than silently compile out, until a real wasm port lands.
+#[cfg(feature = "cache")]
 pub mod cache;
 pub mod chats;
 pub mod connect;
