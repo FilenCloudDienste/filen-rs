@@ -58,13 +58,13 @@ fn frontier_advance_advances_watermark_without_mutating_items() {
 fn file_move_to_virtual_parent_becomes_removed() {
 	use std::borrow::Cow;
 
-	use chrono::Utc;
-	use filen_sdk_rs::{
+	use crate::{
 		crypto::file::FileKey,
 		fs::file::meta::{DecryptedFileMeta, FileMeta},
 		io::RemoteFile,
 		socket::{DecryptedDriveEvent, DecryptedSocketEvent, FileMove},
 	};
+	use chrono::Utc;
 	use filen_types::{auth::FileEncryptionVersion, fs::ParentUuid, fs::UuidStr};
 
 	let uuid = UuidStr::new_v4();
@@ -110,12 +110,12 @@ fn file_move_to_virtual_parent_becomes_removed() {
 fn folder_move_to_virtual_parent_becomes_removed() {
 	use std::borrow::Cow;
 
-	use chrono::Utc;
-	use filen_sdk_rs::{
+	use crate::{
 		fs::dir::meta::{DecryptedDirectoryMeta, DirectoryMeta},
 		io::RemoteDirectory,
 		socket::{DecryptedDriveEvent, DecryptedSocketEvent, FolderMove},
 	};
+	use chrono::Utc;
 	use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid, fs::UuidStr};
 
 	let uuid = UuidStr::new_v4();
@@ -149,8 +149,8 @@ fn folder_move_to_virtual_parent_becomes_removed() {
 fn dir_new_event(id: Option<u64>, uuid: Uuid, parent: Uuid) -> CacheEvent<'static> {
 	use std::borrow::Cow;
 
+	use crate::fs::dir::cache::CacheableDir;
 	use chrono::Utc;
-	use filen_sdk_rs::fs::dir::cache::CacheableDir;
 	use filen_types::api::v3::dir::color::DirColor;
 
 	let dir = CacheableDir {
@@ -188,8 +188,8 @@ fn cache_dir(uuid: u128, parent: Uuid) -> CacheableDir<'static> {
 fn cache_file(uuid: u128, parent: Uuid, size: u64) -> CacheableFile<'static> {
 	use std::borrow::Cow;
 
+	use crate::crypto::file::FileKey;
 	use chrono::Utc;
-	use filen_sdk_rs::crypto::file::FileKey;
 	use filen_types::auth::FileEncryptionVersion;
 
 	CacheableFile {

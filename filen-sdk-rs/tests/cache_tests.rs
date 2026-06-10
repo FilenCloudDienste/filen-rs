@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
-use filen_cache::{CacheError, CacheEvent, CacheHandle, CacheMessage, SyncRootCallback};
 use filen_macros::shared_test_runtime;
+use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheHandle, CacheMessage, SyncRootCallback};
 use filen_sdk_rs::{
 	ErrorKind,
 	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},

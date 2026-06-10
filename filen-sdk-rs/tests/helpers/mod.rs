@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::Utc;
-use filen_cache::{CacheError, CacheEvent, CacheHandle, CacheMessage, SyncRootCallback};
+use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheHandle, CacheMessage, SyncRootCallback};
 use filen_sdk_rs::{
 	auth::Client,
 	crypto::file::FileKey,

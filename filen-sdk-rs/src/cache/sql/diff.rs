@@ -11,12 +11,12 @@
 
 use std::{borrow::Borrow, collections::HashMap};
 
-use filen_sdk_rs::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
+use crate::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
 use rusqlite::{CachedStatement, params};
 use uuid::Uuid;
 
 use super::item::ItemType;
-use crate::{
+use crate::cache::{
 	CacheState,
 	state::{CacheEvent, CacheEventType, DirEvent, FileEvent},
 };
@@ -321,8 +321,8 @@ impl CacheState {
 mod tests {
 	use std::borrow::Cow;
 
+	use crate::{crypto::file::FileKey, fs::dir::cache::CacheableDir};
 	use chrono::Utc;
-	use filen_sdk_rs::{crypto::file::FileKey, fs::dir::cache::CacheableDir};
 	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
 
 	use super::*;

@@ -1,4 +1,4 @@
-use filen_sdk_rs::fs::file::cache::CacheableFile;
+use crate::fs::file::cache::CacheableFile;
 use rusqlite::CachedStatement;
 
 use super::item::ItemType;

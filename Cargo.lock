@@ -1804,24 +1804,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "filen-cache"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "crossbeam",
- "filen-macros",
- "filen-sdk-rs",
- "filen-types",
- "itertools 0.14.0",
- "log 0.4.28",
- "rkyv",
- "rusqlite",
- "test-utils",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "filen-cli"
 version = "0.2.6"
 dependencies = [
@@ -1955,6 +1937,7 @@ dependencies = [
  "chrono",
  "console_error_panic_hook",
  "const-hex",
+ "crossbeam",
  "digest 0.10.7",
  "dotenv",
  "env_logger",
@@ -1975,6 +1958,7 @@ dependencies = [
  "hyper-util",
  "image",
  "imap",
+ "itertools 0.14.0",
  "log 0.4.28",
  "mail-parser",
  "md-5",
@@ -1996,6 +1980,7 @@ dependencies = [
  "rkyv",
  "rmp-serde",
  "rsa",
+ "rusqlite",
  "scraper",
  "serde",
  "serde-wasm-bindgen",

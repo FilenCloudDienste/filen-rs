@@ -1,7 +1,7 @@
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
-use crate::sql::statements::{ITEM_UPDATE_OWN_ROOT_ID, ROOT_INSERT, ROOT_ITEM_INSERT};
+use crate::cache::sql::statements::{ITEM_UPDATE_OWN_ROOT_ID, ROOT_INSERT, ROOT_ITEM_INSERT};
 
 /// Insert the account-root item and its `roots` row in a single transaction.
 ///

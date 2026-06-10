@@ -1,4 +1,4 @@
-use filen_sdk_rs::fs::dir::cache::CacheableDir;
+use crate::fs::dir::cache::CacheableDir;
 use rusqlite::CachedStatement;
 
 use super::item::ItemType;

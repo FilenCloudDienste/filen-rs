@@ -1,4 +1,4 @@
-use filen_sdk_rs::{
+use crate::{
 	fs::{
 		HasUUID,
 		cache::CacheableConversionError,
@@ -122,14 +122,14 @@ impl<'a> CacheEventType<'a> {
 			}
 			DecryptedDriveEvent::TrashEmpty => CacheEventType::Global(GlobalEvent::TrashEmpty),
 			DecryptedDriveEvent::ItemFavorite(ItemFavorite(item)) => match item {
-				filen_sdk_rs::fs::categories::NonRootItemType::File(file) => {
+				crate::fs::categories::NonRootItemType::File(file) => {
 					CacheEventType::File(FileEvent::Changed(
 						file.as_ref()
 							.try_into()
 							.map_err(|e| (e, file.uuid().into()))?,
 					))
 				}
-				filen_sdk_rs::fs::categories::NonRootItemType::Dir(dir) => {
+				crate::fs::categories::NonRootItemType::Dir(dir) => {
 					CacheEventType::Dir(DirEvent::Changed(
 						dir.as_ref()
 							.try_into()
@@ -141,7 +141,7 @@ impl<'a> CacheEventType<'a> {
 				CacheEventType::Dir(DirEvent::MetadataChanged {
 					uuid: uuid.into(),
 					meta: match meta {
-						filen_sdk_rs::fs::dir::meta::DirectoryMeta::Decoded(decoded) => {
+						crate::fs::dir::meta::DirectoryMeta::Decoded(decoded) => {
 							decoded.as_borrowed_cow()
 						}
 						other => {
@@ -160,7 +160,7 @@ impl<'a> CacheEventType<'a> {
 				CacheEventType::File(FileEvent::MetadataChanged {
 					uuid: uuid.into(),
 					meta: match metadata {
-						filen_sdk_rs::fs::file::meta::FileMeta::Decoded(decoded) => {
+						crate::fs::file::meta::FileMeta::Decoded(decoded) => {
 							decoded.as_borrowed_cow()
 						}
 						other => {

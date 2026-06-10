@@ -1,10 +1,10 @@
 use std::{borrow::Cow, iter::once};
 
-use chrono::Utc;
-use filen_sdk_rs::{
+use crate::{
 	crypto::file::FileKey,
 	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
 };
+use chrono::Utc;
 use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
 use rusqlite::params;
 use uuid::Uuid;

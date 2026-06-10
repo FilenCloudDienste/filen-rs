@@ -1,4 +1,4 @@
-use filen_sdk_rs::{
+use crate::{
 	error::FilenSdkError,
 	io::{RemoteDirectory, RemoteFile},
 };
@@ -32,7 +32,7 @@ pub enum CacheError {
 	DB(DB),
 	/// A `CacheEvent` could not be encoded into its durable rkyv blob for the `events` table.
 	Serialization(String),
-	/// A per-sync-root [`SyncRootCallback`](crate::SyncRootCallback) panicked during dispatch; the
+	/// A per-sync-root [`SyncRootCallback`](crate::cache::SyncRootCallback) panicked during dispatch; the
 	/// panic was caught so other roots/events still apply. The string is the root uuid + panic payload.
 	SyncRootCallbackPanic(String),
 	/// An `AddSyncRoot` uuid could not be validated as a reachable directory, so the root was NOT added.

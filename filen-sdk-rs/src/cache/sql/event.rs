@@ -5,7 +5,7 @@
 use rkyv::rancor::Error;
 use rusqlite::{OptionalExtension, params};
 
-use crate::{CacheError, CacheState, state::CacheEvent};
+use crate::cache::{CacheError, CacheState, state::CacheEvent};
 
 /// Serialize a [`CacheEvent`] into the rkyv byte blob persisted in `events.payload`.
 fn serialize(event: &CacheEvent<'_>) -> Result<Vec<u8>, Error> {
@@ -328,19 +328,19 @@ impl CacheState {
 mod tests {
 	use std::borrow::Cow;
 
-	use chrono::{DateTime, Utc};
-	use filen_sdk_rs::{
+	use crate::{
 		crypto::file::FileKey,
 		fs::{
 			dir::{DecryptedDirectoryMeta, cache::CacheableDir},
 			file::{cache::CacheableFile, meta::DecryptedFileMeta},
 		},
 	};
+	use chrono::{DateTime, Utc};
 	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
 	use uuid::Uuid;
 
 	use super::*;
-	use crate::state::{CacheEventType, DirEvent, FileEvent, GlobalEvent};
+	use crate::cache::state::{CacheEventType, DirEvent, FileEvent, GlobalEvent};
 
 	fn dt(ms: i64) -> DateTime<Utc> {
 		DateTime::from_timestamp_millis(ms).expect("valid timestamp")

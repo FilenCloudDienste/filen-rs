@@ -13,6 +13,11 @@
 
 pub(crate) mod api;
 pub mod auth;
+#[cfg(all(
+	feature = "cache",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub mod cache;
 pub mod chats;
 pub mod connect;
 pub mod consts;

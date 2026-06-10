@@ -1,16 +1,16 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, thread::JoinHandle};
 
-use crossbeam::channel::Sender;
-use filen_sdk_rs::{
+use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	fs::HasUUID,
 	io::{RemoteDirectory, RemoteFile},
 	socket::ListenerHandle,
 };
+use crossbeam::channel::Sender;
 use uuid::Uuid;
 
-use crate::{
+use crate::cache::{
 	CacheControlMessage, CacheError, CacheState, SyncRootCallback,
 	state::{CacheThreadEvent, ManualEvent},
 };

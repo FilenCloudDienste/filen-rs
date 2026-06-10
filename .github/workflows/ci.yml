@@ -37,13 +37,15 @@ jobs:
       - name: Install sqlfluff
         run: pip install sqlfluff
       - name: Run clippy all features
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto,cache -- -D warnings
       - name: Run clippy single-threaded
         run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
         run: cargo clippy --tests -- -D warnings
+      - name: Run clippy on tests with cache
+        run: cargo clippy --tests -F cache -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
       - name: Install TOML linter
@@ -57,7 +59,7 @@ jobs:
       - name: Run sqlfluff
         run: sqlfluff lint .
       - name: Run unit tests
-        run: cargo test --lib --no-fail-fast
+        run: cargo test --lib -F cache --no-fail-fast
         env:
           TEST_EMAIL: 'test@filen.io'
           TEST_PASSWORD: 'testpassword'
@@ -90,15 +92,17 @@ jobs:
           vcpkg install dav1d:x64-windows
           echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
       - name: Run clippy all features
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto,cache -- -D warnings
       - name: Run clippy single-threaded
         run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
         run: cargo clippy --tests -- -D warnings
+      - name: Run clippy on tests with cache
+        run: cargo clippy --tests -F cache -- -D warnings
       - name: Run unit tests
-        run: cargo test --lib --no-fail-fast
+        run: cargo test --lib -F cache --no-fail-fast
         env:
           TEST_EMAIL: 'test@filen.io'
           TEST_PASSWORD: 'testpassword'
@@ -144,23 +148,25 @@ jobs:
         run: |
           brew install dav1d pkg-config
       - name: Run clippy Android
-        run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder -- -D warnings
+        run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder,cache -- -D warnings
       - name: Run clippy Android uniffi
         run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder,uniffi -- -D warnings
       - name: Run clippy all features
-        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto -- -D warnings
+        run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto,cache -- -D warnings
       - name: Run clippy single-threaded
         run: cargo clippy -F heif-decoder,avif-decoder,malformed --no-default-features -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
         run: cargo clippy --tests -- -D warnings
+      - name: Run clippy on tests with cache
+        run: cargo clippy --tests -F cache -- -D warnings
       - name: Run clippy iOS
-        run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder -- -D warnings
+        run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder,cache -- -D warnings
       - name: Run clippy iOS uniffi
         run: cargo clippy --target aarch64-apple-ios -F malformed,heif-decoder,uniffi -- -D warnings
       - name: Run unit tests
-        run: cargo test --lib --no-fail-fast
+        run: cargo test --lib -F cache --no-fail-fast
         env:
           TEST_EMAIL: 'test@filen.io'
           TEST_PASSWORD: 'testpassword'
@@ -218,7 +224,7 @@ jobs:
         with:
           node-version: '24.x'
       - name: Run clippy wasm-full
-        run: cargo clippy --target wasm32-unknown-unknown -F wasm-full -- -D warnings
+        run: cargo clippy --target wasm32-unknown-unknown -F wasm-full,cache -- -D warnings
         working-directory: ./filen-sdk-rs
       - name: Run clippy service-worker
         run: cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings

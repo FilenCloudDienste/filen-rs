@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 
-use filen_sdk_rs::fs::{
+use crate::fs::{
 	dir::{DecryptedDirectoryMeta, cache::CacheableDir},
 	file::{cache::CacheableFile, meta::DecryptedFileMeta},
 };
@@ -9,7 +9,7 @@ use itertools::Itertools;
 use rusqlite::config::DbConfig;
 use uuid::Uuid;
 
-use crate::{CacheState, sql::statements::VACUUM};
+use crate::cache::{CacheState, sql::statements::VACUUM};
 
 mod diff;
 mod dir;

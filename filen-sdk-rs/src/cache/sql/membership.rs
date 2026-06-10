@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use rusqlite::params;
 use uuid::Uuid;
 
-use crate::CacheState;
+use crate::cache::CacheState;
 
 impl CacheState {
 	/// The upward ancestor chain of `uuid` — the seed itself plus every ancestor up to (and including)
@@ -98,8 +98,8 @@ impl CacheState {
 mod tests {
 	use std::borrow::Cow;
 
+	use crate::fs::dir::cache::CacheableDir;
 	use chrono::Utc;
-	use filen_sdk_rs::fs::dir::cache::CacheableDir;
 	use filen_types::api::v3::dir::color::DirColor;
 
 	use super::*;

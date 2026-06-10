@@ -8,8 +8,7 @@ use std::{
 	},
 };
 
-use crossbeam::channel::{Receiver, Sender};
-use filen_sdk_rs::{
+use crate::{
 	ErrorKind,
 	auth::Client,
 	fs::{
@@ -20,10 +19,11 @@ use filen_sdk_rs::{
 	io::{RemoteDirectory, RemoteFile},
 	socket::DecryptedSocketEvent,
 };
+use crossbeam::channel::{Receiver, Sender};
 use filen_types::traits::CowHelpers;
 use uuid::Uuid;
 
-use crate::{CacheError, handle::CacheMessage};
+use crate::cache::{CacheError, handle::CacheMessage};
 /// How many durable `events` rows the drain loads and applies per iteration.
 const BATCH_SIZE: usize = 256;
 /// Bounded-memory backstop for the single UNBOUNDED event channel. The socket router runs on
@@ -39,7 +39,7 @@ const EVENT_SHED_CAP: usize = 50_000;
 /// Dependencies the worker needs to run a write-locked resync: an owned
 /// handle to the SDK [`Client`] and the Tokio runtime [`Handle`](tokio::runtime::Handle) the worker
 /// `block_on`s to drive the async listing from its `std::thread`. Captured once at construction
-/// ([`CacheHandle::new`](crate::handle::CacheHandle::new) runs inside the app's runtime, so
+/// ([`CacheHandle::new`](crate::cache::handle::CacheHandle::new) runs inside the app's runtime, so
 /// `Handle::current()` is valid there). `None` under unit-test construction (no live client/runtime);
 /// the resync path logs and no-ops when it is absent.
 #[derive(Clone)]
@@ -193,7 +193,7 @@ pub type SyncRootCallback = Box<dyn Fn(&mut dyn Iterator<Item = &CacheEvent<'_>>
 
 /// Build the default `{account_root → no-op}` sync-root map: whole-account sync with no notification.
 /// Used by the test constructors so the existing apply/drain/resync tests keep exercising the machinery
-/// (production callers configure their own roots via [`CacheHandle::new`](crate::CacheHandle::new)).
+/// (production callers configure their own roots via [`CacheHandle::new`](crate::cache::CacheHandle::new)).
 #[cfg(test)]
 fn whole_account_sync_roots(account_root: Uuid) -> HashMap<Uuid, SyncRootCallback> {
 	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
@@ -278,9 +278,9 @@ impl CacheState {
 		msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 		client: Arc<Client>,
 		rt_handle: tokio::runtime::Handle,
-	) -> Result<InitResult, filen_sdk_rs::Error> {
+	) -> Result<InitResult, crate::Error> {
 		let connection = rusqlite::Connection::open(cache_path).map_err(|e| {
-			filen_sdk_rs::Error::custom_with_source(
+			crate::Error::custom_with_source(
 				ErrorKind::Internal,
 				e,
 				Some("Failed to open SQLite database"),
@@ -304,7 +304,7 @@ impl CacheState {
 		};
 
 		cache_state.init_db().map_err(|e| {
-			filen_sdk_rs::Error::custom_with_source(
+			crate::Error::custom_with_source(
 				ErrorKind::Internal,
 				e,
 				Some("Failed to set up SQLite database"),
@@ -1034,7 +1034,7 @@ impl CacheState {
 		// root uses its already-materialized `roots` row. (Empty `sync_roots` ⇒ no listings, and
 		// `finalize_resync` still advances the watermark + clears the flag so the gap-check does not loop.)
 		#[allow(clippy::type_complexity)]
-		let listing: Result<_, filen_sdk_rs::Error> = deps.rt_handle.block_on(async {
+		let listing: Result<_, crate::Error> = deps.rt_handle.block_on(async {
 			let _lock = deps.client.lock_drive().await?;
 			let remote_under_lock = deps.client.get_last_event_ids().await?.drive;
 			let mut per_root_raw: Vec<(
