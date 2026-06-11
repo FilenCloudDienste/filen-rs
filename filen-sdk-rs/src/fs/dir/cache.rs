@@ -9,7 +9,10 @@ use rkyv::with::{AsOwned, Map};
 use uuid::Uuid;
 
 use crate::{
-	fs::{cache::CacheableConversionError, dir::meta::DirectoryMeta},
+	fs::{
+		cache::CacheableConversionError,
+		dir::meta::{DecryptedDirectoryMeta, DirectoryMeta},
+	},
 	io::RemoteDirectory,
 };
 
@@ -92,6 +95,24 @@ impl<'a> TryFrom<&'a RemoteDirectory> for CacheableDir<'a> {
 			name: Cow::Borrowed(&decrypted_meta.name),
 			created: decrypted_meta.created,
 		})
+	}
+}
+
+// Infallible because a `CacheableDir` is by construction the "decoded metadata, parent is a real
+// uuid" subset of a `RemoteDirectory` (mirrors `From<CacheableFile> for RemoteFile`).
+impl From<CacheableDir<'static>> for RemoteDirectory {
+	fn from(value: CacheableDir<'static>) -> Self {
+		Self::from_meta(
+			(&value.uuid).into(),
+			ParentUuid::Uuid((&value.parent).into()),
+			value.color,
+			value.favorited,
+			value.timestamp,
+			DirectoryMeta::Decoded(DecryptedDirectoryMeta {
+				name: value.name,
+				created: value.created,
+			}),
+		)
 	}
 }
 
@@ -185,5 +206,15 @@ mod fingerprint_tests {
 	fn fingerprint_is_deterministic() {
 		let a = base();
 		assert_eq!(a.content_fingerprint(), a.clone().content_fingerprint());
+	}
+
+	/// The infallible `Cacheable → Remote` direction must round-trip losslessly through the
+	/// fallible reverse (it produces exactly the decoded, uuid-parented subset).
+	#[test]
+	fn cacheable_dir_round_trips_through_remote_directory() {
+		let dir = base();
+		let remote = crate::io::RemoteDirectory::from(dir.clone());
+		let back = CacheableDir::try_from(remote).expect("decoded uuid-parented dir converts");
+		assert_eq!(back, dir);
 	}
 }

@@ -61,8 +61,9 @@ impl SearchConfig {
 	}
 }
 
-/// Which item kinds a search returns.
+/// Which item kinds a search returns. Crosses the FFI boundary directly (fieldless).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum SearchItemType {
 	#[default]
 	All,

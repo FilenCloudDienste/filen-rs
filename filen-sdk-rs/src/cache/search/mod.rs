@@ -90,6 +90,9 @@ use crate::{
 mod config;
 mod engine;
 mod hydrate;
+// UniFFI-only, like `cache::js_impl` (the wasm twin lands with the cache's wasm port).
+#[cfg(feature = "uniffi")]
+pub mod js_impl;
 mod result;
 
 pub use config::{SearchConfig, SearchItemType};
