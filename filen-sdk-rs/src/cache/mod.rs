@@ -2,6 +2,11 @@
 
 mod error;
 mod handle;
+// UniFFI-only (the io-module precedent for native-only features): the cache cannot compile to
+// wasm yet — deliberately, see lib.rs — so the wasm twin of the FFI layer arrives with the wasm
+// port instead of shipping as unbuildable code today.
+#[cfg(feature = "uniffi")]
+pub mod js_impl;
 pub mod search;
 mod sql;
 mod state;
