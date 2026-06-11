@@ -9,7 +9,7 @@ use unicode_normalization::UnicodeNormalization;
 #[non_exhaustive]
 pub struct SearchConfig {
 	/// Substring match on item names. The needle is Unicode-normalized (trim + NFC) and — unless
-	/// [`case_sensitive`](Self::case_sensitive) — matched case-insensitively with full Unicode
+	/// [`case_sensitive`](Self::case_sensitive) — matched case-insensitively with Unicode simple
 	/// case folding. Cached names are ASSUMED to already be NFC-normalized (see the
 	/// [module docs](super)). `None` (or a needle that normalizes to the empty string) matches
 	/// everything.
@@ -19,7 +19,7 @@ pub struct SearchConfig {
 	/// `true` (default): match the whole subtree under the search root; `false`: direct
 	/// children only — which makes the search double as a live, sorted directory listing.
 	pub recursive: bool,
-	/// `false` (default): names match case-insensitively (full Unicode case folding). `true`:
+	/// `false` (default): names match case-insensitively (Unicode simple case folding). `true`:
 	/// byte-exact substring match (after the needle's trim + NFC normalization).
 	pub case_sensitive: bool,
 }
@@ -71,8 +71,9 @@ pub enum SearchItemType {
 }
 
 /// `SearchConfig` compiled into the engine's query-binding form: the needle normalized once
-/// (trim + NFC, then lowercased unless case-sensitive — the SQL matcher expects a PRE-FOLDED
-/// needle), an empty/absent needle collapsed to `None`.
+/// (trim + NFC — NEVER pre-case-folded: the SQL matcher's `(?i)` regex does the folding, and
+/// pre-folding would corrupt needles like "İstanbul", whose lowercase inserts a combining dot),
+/// an empty/absent needle collapsed to `None`.
 #[derive(Debug, Clone)]
 pub(super) struct CompiledFilter {
 	pub(super) needle: Option<String>,
@@ -86,14 +87,7 @@ impl CompiledFilter {
 		let needle = config
 			.name
 			.as_deref()
-			.map(|name| {
-				let normalized: String = name.trim().nfc().collect();
-				if config.case_sensitive {
-					normalized
-				} else {
-					normalized.to_lowercase()
-				}
-			})
+			.map(|name| name.trim().nfc().collect::<String>())
 			.filter(|needle| !needle.is_empty());
 		Self {
 			needle,

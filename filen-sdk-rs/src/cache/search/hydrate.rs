@@ -1,18 +1,21 @@
 //! The search engine's DB side: its own READ-ONLY connection to the cache file (WAL lets it read
 //! concurrently with the worker's writer), the `filen_name_matches` scalar function that gives
-//! SQLite full-Unicode case folding (its built-in `LIKE`/`lower()` are ASCII-only), and the
-//! window/count queries that do ALL filtering, ordering, windowing, and hydration inside SQLite —
-//! the engine holds no result set in memory.
+//! SQLite full-Unicode case-insensitive matching (its built-in `LIKE`/`lower()` are ASCII-only)
+//! via per-query compiled regexes (see `NameMatchers`), and the window/count queries that do ALL
+//! filtering, ordering, windowing, and hydration inside SQLite — the engine holds no result set
+//! in memory.
 //!
-//! NAME NORMALIZATION ASSUMPTION: cached names are assumed to already be NFC-normalized (matching
-//! is byte-based after case folding). Pre-v4 drives can contain NFD names written by old clients;
-//! those may fail to match visually-identical needles until the v4 re-encode normalizes the whole
-//! drive. The NEEDLE is always NFC-normalized in Rust (user input is untrusted either way).
+//! NAME NORMALIZATION ASSUMPTION: cached names are assumed to already be NFC-normalized
+//! (matching compares codepoints; there is no canonical-equivalence pass). Pre-v4 drives can
+//! contain NFD names written by old clients; those may fail to match visually-identical needles
+//! until the v4 re-encode normalizes the whole drive. The NEEDLE is always NFC-normalized in
+//! Rust (user input is untrusted either way).
 
-use std::{borrow::Cow, ops::Range, path::Path, time::Duration};
+use std::{borrow::Cow, ops::Range, path::Path, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::Blake3Hash};
+use regex::bytes::Regex;
 use rusqlite::{Connection, OpenFlags, Row, functions::FunctionFlags, params, types::ValueRef};
 use uuid::Uuid;
 
@@ -40,29 +43,46 @@ pub(super) enum Scope {
 	Children(Uuid),
 }
 
-/// The matcher behind the SQL `filen_name_matches(name, needle, case_insensitive)` function.
-/// For the case-insensitive mode the needle must arrive PRE-FOLDED (lowercased in Rust at bind
-/// time); the haystack folds on the fly — allocation-free for pure-ASCII rows (the overwhelming
-/// majority), one transient fold for rows containing non-ASCII. An empty needle matches
-/// everything.
-pub(super) fn name_matches(haystack: &str, needle: &str, case_insensitive: bool) -> bool {
-	if needle.is_empty() {
-		return true;
+/// The matchers behind the SQL `filen_name_matches(name, needle, case_insensitive)` function:
+/// one escaped-literal regex per case mode, compiled once per query and cached on the needle
+/// argument via SQLite's auxiliary-data slot (`get_or_create_aux` — kept across rows, dropped
+/// when the bound needle changes). An escaped literal compiles to a SIMD-prefiltered substring
+/// scan, so the per-row cost is allocation-free with NO haystack transform — unlike a
+/// `to_lowercase().contains()` fold, which rewrites every non-ASCII name on every row.
+///
+/// BOTH modes are compiled together because the aux slot is keyed on the NEEDLE argument alone:
+/// the case flag is a separate binding whose changes do not invalidate this slot, so the cached
+/// object must serve either flag value.
+///
+/// Case-insensitive matching is Unicode SIMPLE case folding (`(?i)`). Versus folding both sides
+/// through `to_lowercase`: Greek Σ/σ/ς now match position-independently (needle "ΟΔΟΣ" finds
+/// "ΟΔΟΣ.txt", which final-sigma lowercasing got wrong), ſ/s and µ/μ fold together, while İ no
+/// longer folds onto plain "i" (it needs full folding, which neither approach does — same as
+/// ß≠ss). Matching runs on the raw TEXT bytes, so an out-of-contract non-UTF-8 name is matched
+/// bytewise instead of erroring the whole query.
+struct NameMatchers {
+	sensitive: Regex,
+	insensitive: Regex,
+}
+
+impl NameMatchers {
+	/// Only fails on pathological needles (the compiled-size limit); an escaped literal can
+	/// never produce a parse error.
+	fn compile(needle: &str) -> Result<Self, regex::Error> {
+		let literal = regex::escape(needle);
+		Ok(Self {
+			sensitive: Regex::new(&literal)?,
+			insensitive: Regex::new(&format!("(?i){literal}"))?,
+		})
 	}
-	if !case_insensitive {
-		return haystack.contains(needle);
-	}
-	if haystack.is_ascii() && needle.is_ascii() {
-		let haystack = haystack.as_bytes();
-		let needle = needle.as_bytes();
-		if needle.len() > haystack.len() {
-			return false;
+
+	fn matches(&self, name: &[u8], case_insensitive: bool) -> bool {
+		if case_insensitive {
+			self.insensitive.is_match(name)
+		} else {
+			self.sensitive.is_match(name)
 		}
-		return haystack
-			.windows(needle.len())
-			.any(|window| window.eq_ignore_ascii_case(needle));
 	}
-	haystack.to_lowercase().contains(needle)
 }
 
 /// Open the engine's read-only connection and register `filen_name_matches` on it. The function
@@ -84,15 +104,28 @@ pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> 
 			| FunctionFlags::SQLITE_INNOCUOUS,
 		|ctx| {
 			let name = match ctx.get_raw(0) {
-				ValueRef::Text(text) => std::str::from_utf8(text)
-					.map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?,
 				// An items row whose files/dirs companion row is missing (mid-upsert or
 				// corrupt): never a match; the explaining event converges it later.
-				_ => return Ok(false),
+				ValueRef::Null => return Ok(false),
+				ValueRef::Text(bytes) => bytes,
+				other => {
+					return Err(rusqlite::Error::InvalidFunctionParameterType(
+						0,
+						other.data_type(),
+					));
+				}
 			};
-			let needle = ctx.get_raw(1).as_str().map_err(rusqlite::Error::from)?;
+			if matches!(ctx.get_raw(1), ValueRef::Text(needle) if needle.is_empty()) {
+				return Ok(true);
+			}
 			let case_insensitive: bool = ctx.get(2)?;
-			Ok(name_matches(name, needle, case_insensitive))
+			let matchers: Arc<NameMatchers> = ctx.get_or_create_aux(
+				1,
+				|needle| -> Result<_, Box<dyn std::error::Error + Send + Sync + 'static>> {
+					Ok(NameMatchers::compile(needle.as_str()?)?)
+				},
+			)?;
+			Ok(matchers.matches(name, case_insensitive))
 		},
 	)?;
 	Ok(conn)
@@ -274,17 +307,48 @@ mod tests {
 
 	#[test]
 	fn matcher_handles_ascii_unicode_and_the_case_toggle() {
-		// Case-insensitive (needle pre-folded).
-		assert!(name_matches("q3-REPORT.txt", "report", true));
-		assert!(name_matches("Ärger.txt", "ärger", true));
-		assert!(name_matches("anything", "", true));
-		assert!(!name_matches("other.txt", "report", true));
-		assert!(!name_matches("ab", "abc", true));
+		let report = NameMatchers::compile("report").unwrap();
+		assert!(report.matches(b"q3-REPORT.txt", true));
+		assert!(!report.matches(b"other.txt", true));
+		assert!(!report.matches(b"q3-REPORT.txt", false));
+		assert!(!NameMatchers::compile("abc").unwrap().matches(b"ab", true));
+		assert!(
+			NameMatchers::compile("REPORT")
+				.unwrap()
+				.matches(b"q3-REPORT.txt", false)
+		);
 
-		// Case-sensitive: raw bytes.
-		assert!(name_matches("q3-REPORT.txt", "REPORT", false));
-		assert!(!name_matches("q3-REPORT.txt", "report", false));
-		assert!(name_matches("Ärger.txt", "Ärger", false));
+		// Unicode simple case folding, in both directions — the needle arrives RAW (NFC only),
+		// never pre-folded.
+		let umlaut = NameMatchers::compile("ärger").unwrap();
+		assert!(umlaut.matches("Ärger.txt".as_bytes(), true));
+		assert!(!umlaut.matches("Ärger.txt".as_bytes(), false));
+		assert!(
+			NameMatchers::compile("ÄRGER")
+				.unwrap()
+				.matches("ärger.txt".as_bytes(), true)
+		);
+	}
+
+	#[test]
+	fn matcher_folds_sigma_position_independently_and_escapes_metacharacters() {
+		// Lowercasing both sides got this WRONG: "ΟΔΟΣ".to_lowercase() ends in final ς while
+		// "ΟΔΟΣ.txt".to_lowercase() holds non-final σ (the '.' is Case_Ignorable, so the sigma
+		// is not word-final there) — exact-name search failed. Simple case folding puts Σ/σ/ς
+		// in one orbit.
+		let sigma = NameMatchers::compile("ΟΔΟΣ").unwrap();
+		assert!(sigma.matches("ΟΔΟΣ.txt".as_bytes(), true));
+		assert!(sigma.matches("οδος-notes.txt".as_bytes(), true));
+
+		// Pre-lowercasing "İstanbul" would inject a combining dot ("i̇stanbul") and break
+		// self-matching — this asserts the raw-needle contract end to end.
+		let dotted = NameMatchers::compile("İstanbul").unwrap();
+		assert!(dotted.matches("İstanbul.txt".as_bytes(), true));
+
+		// Needles are regex-escaped: metacharacters only match themselves.
+		let punctuated = NameMatchers::compile("a.b(c").unwrap();
+		assert!(punctuated.matches(b"xa.b(cy", false));
+		assert!(!punctuated.matches(b"xaxb(cy", false));
 	}
 
 	fn temp_db_path() -> std::path::PathBuf {
@@ -435,6 +499,31 @@ mod tests {
 		let dirs_only = filter(&SearchConfig::new().with_item_type(SearchItemType::Dir));
 		let results = window_results(&conn, Scope::Account, &dirs_only, &(0..10)).unwrap();
 		assert_eq!(result_names(&results), vec!["sub"]);
+	}
+
+	#[test]
+	fn case_flag_flip_with_unchanged_needle_is_not_confused_by_the_aux_cache() {
+		// The compiled matchers are cached on the NEEDLE binding (SQLite aux data); flipping
+		// only the case flag re-runs the same prepared statement with the needle binding
+		// unchanged, so the cache survives — and must serve both modes correctly.
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+		let insensitive = filter(&SearchConfig::new().with_name("beta"));
+		let sensitive = filter(
+			&SearchConfig::new()
+				.with_name("beta")
+				.with_case_sensitive(true),
+		);
+
+		assert_eq!(
+			count_results(&conn, Scope::Account, &insensitive).unwrap(),
+			1
+		);
+		assert_eq!(count_results(&conn, Scope::Account, &sensitive).unwrap(), 0);
+		assert_eq!(
+			count_results(&conn, Scope::Account, &insensitive).unwrap(),
+			1
+		);
 	}
 
 	#[test]

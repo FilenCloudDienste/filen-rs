@@ -22,11 +22,15 @@
 //!
 //! # Name matching & normalization
 //!
-//! Needles are trimmed + NFC-normalized, and matched case-insensitively (full Unicode case
-//! folding) unless [`SearchConfig::case_sensitive`]. Cached names are ASSUMED to already be
-//! NFC-normalized: every current client writes NFC, but pre-v4 drives can hold NFD names
-//! written by old clients, which may fail to match visually-identical needles — a rare edge
-//! accepted for now and gone for good once the v4 re-encode normalizes the whole drive.
+//! Needles are trimmed + NFC-normalized, and matched case-insensitively with Unicode SIMPLE
+//! case folding unless [`SearchConfig::case_sensitive`] (the matcher compiles the needle into
+//! an escaped-literal `(?i)` regex once per query — per row that is a SIMD-prefiltered
+//! substring scan with no allocation and no haystack transform). Simple folding matches Greek
+//! Σ/σ/ς position-independently but does not equate multi-codepoint folds (ß≠ss, İ≠i). Cached
+//! names are ASSUMED to already be NFC-normalized: every current client writes NFC, but pre-v4
+//! drives can hold NFD names written by old clients, which may fail to match
+//! visually-identical needles — a rare edge accepted for now and gone for good once the v4
+//! re-encode normalizes the whole drive.
 //!
 //! # Consistency model
 //!
