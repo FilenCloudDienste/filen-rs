@@ -1,4 +1,7 @@
-use std::sync::{Arc, Weak};
+use std::{
+	sync::{Arc, Weak},
+	time::Duration,
+};
 
 use crate::{auth::Client, error::Error, sync::lock::ResourceLock};
 
@@ -9,6 +12,25 @@ impl Client {
 		&self,
 		lock: &tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 		name: &str,
+	) -> Result<Arc<ResourceLock>, Error> {
+		self.lock_resource_with(
+			lock,
+			name,
+			lock::MAX_SLEEP_TIME_DEFAULT,
+			lock::ATTEMPTS_DEFAULT,
+		)
+		.await
+	}
+
+	/// [`lock_resource`](Self::lock_resource) with a caller-chosen acquisition schedule. The
+	/// in-process Weak-cache sharing is identical — only how long a server-side-contended
+	/// acquisition keeps polling differs.
+	async fn lock_resource_with(
+		&self,
+		lock: &tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
+		name: &str,
+		max_sleep_time: Duration,
+		attempts: usize,
 	) -> Result<Arc<ResourceLock>, Error> {
 		let read_lock = lock.read().await;
 		if let Some(weak) = read_lock.as_ref()
@@ -23,7 +45,7 @@ impl Client {
 		{
 			return Ok(arc);
 		}
-		let lock = self.acquire_lock_with_default(name).await?;
+		let lock = self.acquire_lock(name, max_sleep_time, attempts).await?;
 		let weak = Arc::downgrade(&lock);
 		write_lock.replace(weak);
 		Ok(lock)
@@ -31,6 +53,20 @@ impl Client {
 
 	pub async fn lock_drive(&self) -> Result<Arc<lock::ResourceLock>, Error> {
 		self.lock_resource(&self.drive_lock, "drive-write").await
+	}
+
+	/// [`lock_drive`](Self::lock_drive) with a BOUNDED acquisition: the same in-process lock
+	/// sharing, but a server-side-contended acquisition gives up with
+	/// [`ErrorKind::RetryFailed`](crate::ErrorKind::RetryFailed) after `attempts` polls instead
+	/// of waiting out the multi-hour default schedule. Used by the cache worker's resync, which
+	/// must yield back to draining events when the lock is contended rather than parking on it.
+	pub(crate) async fn lock_drive_bounded(
+		&self,
+		max_sleep_time: Duration,
+		attempts: usize,
+	) -> Result<Arc<lock::ResourceLock>, Error> {
+		self.lock_resource_with(&self.drive_lock, "drive-write", max_sleep_time, attempts)
+			.await
 	}
 
 	pub async fn lock_notes(&self) -> Result<Arc<lock::ResourceLock>, Error> {

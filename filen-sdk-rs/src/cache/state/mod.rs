@@ -6,6 +6,7 @@ use std::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	},
+	time::{Duration, Instant},
 };
 
 use crate::{
@@ -23,7 +24,10 @@ use crossbeam::channel::{Receiver, Sender};
 use filen_types::traits::CowHelpers;
 use uuid::Uuid;
 
-use crate::cache::{CacheError, handle::CacheMessage};
+use crate::cache::{
+	CacheError,
+	handle::{CacheMessage, ResyncProgress},
+};
 /// How many durable `events` rows the drain loads and applies per iteration.
 const BATCH_SIZE: usize = 256;
 /// Bounded-memory backstop for the single UNBOUNDED event channel. The socket router runs on
@@ -35,6 +39,19 @@ const BATCH_SIZE: usize = 256;
 /// burst; this cap only bounds the worst-case PEAK (each event is on the order of a few hundred bytes,
 /// so tens of MiB here) — important on the mobile (UniFFI) target.
 const EVENT_SHED_CAP: usize = 50_000;
+
+/// Bounded drive-lock acquisition for ONE resync attempt: the fibonacci poll ramp capped at 2 s
+/// over 8 polls is ~7 s of sleeping plus the request round-trips. Deliberately NOT the
+/// effectively-unbounded default schedule — the worker is PARKED inside the resync island
+/// (including the lock WAIT), so a contended attempt must give up and yield back to the event
+/// drain; [`RESYNC_RETRY_INTERVAL`] then schedules the next attempt.
+const RESYNC_LOCK_MAX_SLEEP: Duration = Duration::from_secs(2);
+const RESYNC_LOCK_ATTEMPTS: usize = 8;
+/// The guaranteed event-drain window between two resync attempts: after a non-converged attempt
+/// the worker serves its channels for at least this long before re-parking in the next bounded
+/// acquisition, so sustained lock contention degrades cache LIVENESS gracefully instead of
+/// freezing event application entirely.
+const RESYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Dependencies the worker needs to run a write-locked resync: an owned
 /// handle to the SDK [`Client`] and the Tokio runtime [`Handle`](tokio::runtime::Handle) the worker
@@ -73,6 +90,11 @@ pub(crate) struct CacheState {
 	sync_roots: HashMap<Uuid, RootRegistrations>,
 	/// Client + runtime handle for the write-locked resync island. `None` in unit tests.
 	resync: Option<ResyncDeps>,
+	/// One-shot retry timer armed by a NON-converged resync attempt (lock contention, transient
+	/// listing failures, partial convergence): the run loop's lowest-priority select arm fires
+	/// it and re-attempts. The retry itself is gated on the durable `needs_resync` flag, so a
+	/// stale fire is a no-op. `None` ⇒ nothing scheduled.
+	resync_retry: Option<Receiver<Instant>>,
 }
 
 #[cfg(test)]
@@ -96,6 +118,7 @@ impl CacheState {
 			root_uuid,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
+			resync_retry: None,
 		};
 		state.init_db().unwrap();
 		state
@@ -122,6 +145,7 @@ impl CacheState {
 			root_uuid,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
+			resync_retry: None,
 		};
 		state.init_db().unwrap();
 		state
@@ -147,6 +171,7 @@ impl CacheState {
 			root_uuid,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
+			resync_retry: None,
 		};
 		state.init_db().unwrap();
 
@@ -330,6 +355,7 @@ impl CacheState {
 			// Starts EMPTY (nothing cached); registrations arrive via `AddSyncRoot` control messages.
 			sync_roots: HashMap::new(),
 			resync: Some(ResyncDeps { client, rt_handle }),
+			resync_retry: None,
 		};
 
 		cache_state.init_db().map_err(|e| {
@@ -362,9 +388,16 @@ impl CacheState {
 		self.drain_pending(None);
 		self.maybe_run_startup_resync();
 		loop {
+			// The retry-timer arm uses a `never()` stand-in while nothing is scheduled, so the
+			// select shape stays fixed.
+			let resync_retry = self
+				.resync_retry
+				.clone()
+				.unwrap_or_else(crossbeam::channel::never);
 			// `select_biased!` checks arms top-down: control (shutdown) first, then the single event
-			// channel. A lone FIFO channel needs no spill latch or first-class overflow arm — order is
-			// intrinsic, so the previous two-channel TOCTOU dance is gone.
+			// channel, then the resync retry timer. A lone FIFO channel needs no spill latch or
+			// first-class overflow arm — order is intrinsic, so the previous two-channel TOCTOU
+			// dance is gone.
 			crossbeam::channel::select_biased! {
 				recv(self.control_receiver) -> control_event => {
 					// `select_biased!` selects a pending control message ahead of a non-empty event arm.
@@ -390,6 +423,13 @@ impl CacheState {
 					};
 					self.drain_pending(Some(event));
 					// A drain that observed a hole/corrupt row/failed apply set needs_resync; heal it now.
+					self.maybe_run_resync();
+				},
+				recv(resync_retry) -> _ => {
+					// A previous resync attempt did not converge (drive-lock contention or a
+					// transient failure) and scheduled this one-shot re-attempt. The flag-gated
+					// retry makes a stale fire harmless.
+					self.resync_retry = None;
 					self.maybe_run_resync();
 				},
 			}
@@ -1192,10 +1232,14 @@ impl CacheState {
 	/// the whole subtree under the drive lock, read the snapshot drive message id under the SAME lock
 	/// (so listing + watermark are consistent), then converge the cache via [`apply_resync`].
 	///
-	/// The `block_on` parks the worker for the listing's duration, but the socket callback keeps pushing
+	/// The `block_on` parks the worker for the attempt's duration, but the socket callback keeps pushing
 	/// events onto the unbounded channel during that window (the worker persists + applies them when it
-	/// resumes), so nothing is lost. On a listing/lock failure the flag is left set and nothing is
-	/// committed, so a later cycle retries.
+	/// resumes), so nothing is lost. To keep that parked window BOUNDED, the drive lock is acquired with
+	/// a short schedule ([`RESYNC_LOCK_MAX_SLEEP`]/[`RESYNC_LOCK_ATTEMPTS`]) instead of the
+	/// effectively-unbounded default: a contended attempt fails fast, durably marks `needs_resync`, and
+	/// arms [`RESYNC_RETRY_INTERVAL`] — so under sustained contention the worker alternates bounded
+	/// attempts with guaranteed event-drain windows instead of freezing event application until the lock
+	/// is won. Any listing/lock failure likewise commits nothing and retries on the timer.
 	///
 	/// CONTRACT: `list_dir_recursive` is a single `dir/download` of the whole subtree, so
 	/// the returned tree is ANCESTOR-CLOSED — every returned item's parent chain up to the sync root is
@@ -1214,14 +1258,31 @@ impl CacheState {
 		let account_root = self.root_uuid;
 		let sync_roots: Vec<Uuid> = self.sync_roots.keys().copied().collect();
 
+		// Progress brackets: `Started` fires BEFORE the drive-lock wait (another device can hold
+		// the lock for a while), and every exit path past this point fires `Finished`, so a
+		// consumer's spinner can never hang on a failed attempt.
+		Self::send_resync_progress(
+			&self.msg_sender,
+			ResyncProgress::Started {
+				roots: sync_roots.clone(),
+			},
+		);
+
 		// List EACH sync root's subtree under ONE drive lock, reading the snapshot id under the same lock
 		// so every root's listing is consistent at `remote_under_lock`. A subdir root is resolved via
 		// `get_dir` (which also yields the node to materialize so the diff has an anchor row); the account
 		// root uses its already-materialized `roots` row. (Empty `sync_roots` ⇒ no listings, and
 		// `finalize_resync` still advances the watermark + clears the flag so the gap-check does not loop.)
+		let msg_sender = &self.msg_sender;
 		#[allow(clippy::type_complexity)]
 		let listing: Result<_, crate::Error> = deps.rt_handle.block_on(async {
-			let _lock = deps.client.lock_drive().await?;
+			// BOUNDED acquisition: the worker cannot apply events while parked in this island,
+			// so a contended lock must fail the attempt quickly — the failure arm below leaves
+			// the durable flag set and arms the retry timer, and events drain in between.
+			let _lock = deps
+				.client
+				.lock_drive_bounded(RESYNC_LOCK_MAX_SLEEP, RESYNC_LOCK_ATTEMPTS)
+				.await?;
 			let remote_under_lock = deps.client.get_last_event_ids().await?.drive;
 			let mut per_root_raw: Vec<(
 				Uuid,
@@ -1236,7 +1297,7 @@ impl CacheState {
 			// Set when a root fails with a NON-not-found (network/server) error. `finalize_resync` uses it
 			// to keep an all-transient resync from advancing the watermark past a gap it never reconciled.
 			let mut any_transient = false;
-			for root in &sync_roots {
+			for (root_index, root) in sync_roots.iter().enumerate() {
 				let root_node: Option<RemoteDirectory> = if *root == account_root {
 					// The account root always exists and resyncs via `client.root()`, not `get_dir`.
 					None
@@ -1270,9 +1331,23 @@ impl CacheState {
 					Some(node) => node.into(),
 					None => deps.client.root().into(),
 				};
+				// Forward the listing's byte ticks (cumulative; the HTTP layer throttles them to
+				// ~200 ms) straight onto the status channel.
+				let progress = |bytes_downloaded: u64, total_bytes: Option<u64>| {
+					Self::send_resync_progress(
+						msg_sender,
+						ResyncProgress::Listing {
+							root: *root,
+							root_index,
+							root_count: sync_roots.len(),
+							bytes_downloaded,
+							total_bytes,
+						},
+					);
+				};
 				let listed = deps
 					.client
-					.list_dir_recursive::<Normal, fn(u64, Option<u64>)>(&dir_type, None, ())
+					.list_dir_recursive::<Normal, _>(&dir_type, Some(&progress), ())
 					.await;
 				drop(dir_type);
 				match listed {
@@ -1308,19 +1383,64 @@ impl CacheState {
 		let (per_root_raw, deleted_roots, any_transient, remote_under_lock) = match listing {
 			Ok(listing) => listing,
 			Err(e) => {
-				// lock-loss / snapshot-id failure — leave needs_resync set (untouched) and commit
-				// nothing, so a later worker cycle retries against a fresh snapshot.
-				log::warn!("resync listing failed ({e}); leaving needs_resync set for retry");
+				// Bounded-lock contention (the EXPECTED failure here) or a snapshot-id/network
+				// failure — nothing is committed. Durably mark the flag rather than relying on
+				// the trigger having set it (the startup gap-check resyncs on a watermark lag
+				// WITHOUT marking), then arm the retry timer so even a quiet account re-attempts.
+				if matches!(e.kind(), ErrorKind::RetryFailed) {
+					log::info!(
+						"resync: drive lock contended; yielding to the event drain and retrying in {RESYNC_RETRY_INTERVAL:?}"
+					);
+				} else {
+					log::warn!(
+						"resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
+					);
+				}
+				if let Err(e) = self.mark_needs_resync() {
+					self.surface_errors(vec![*e]);
+				}
+				Self::send_resync_progress(
+					&self.msg_sender,
+					ResyncProgress::Finished { converged: false },
+				);
+				self.resync_retry = Some(crossbeam::channel::after(RESYNC_RETRY_INTERVAL));
 				return Ok(());
 			}
 		};
 
-		self.finalize_resync(
+		Self::send_resync_progress(&self.msg_sender, ResyncProgress::Applying);
+		let result = self.finalize_resync(
 			per_root_raw,
 			deleted_roots,
 			any_transient,
 			remote_under_lock,
-		)
+		);
+		// `converged` is read back from the durable flag — the engine's own definition of "work
+		// remains": a partial or all-transient resync keeps it set (or re-marks it) in the same
+		// transaction that commits any progress, so `Ok` + a clear flag is exactly "nothing
+		// pending".
+		let converged = result.is_ok() && matches!(self.needs_resync(), Ok(false));
+		Self::send_resync_progress(&self.msg_sender, ResyncProgress::Finished { converged });
+		// A non-converged attempt schedules its own re-attempt: without the timer, a pending
+		// resync on a QUIET account (no events to trigger the next drain) would sit until the
+		// next unrelated event — e.g. a freshly added root staying unpopulated indefinitely.
+		self.resync_retry = if converged {
+			None
+		} else {
+			Some(crossbeam::channel::after(RESYNC_RETRY_INTERVAL))
+		};
+		result
+	}
+
+	/// Best-effort resync-progress emission: lossy `try_send` like every status-channel message,
+	/// so a tick can never block the worker (or the listing's HTTP task it is called from) and
+	/// is harmless to drop. An associated fn taking the sender directly, so the listing progress
+	/// closure can emit while `self` is otherwise borrowed.
+	fn send_resync_progress(
+		msg_sender: &tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
+		progress: ResyncProgress,
+	) {
+		let _ = msg_sender.try_send(vec![CacheMessage::ResyncProgress(progress)]);
 	}
 
 	/// Apply the outcome of [`run_resync`]'s locked listing: drop any sync roots the server reported

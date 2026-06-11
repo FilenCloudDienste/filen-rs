@@ -35,10 +35,13 @@
 //! # Consistency model
 //!
 //! Results are CACHE truth, which converges to server truth: a search starts from whatever is
-//! already cached and streams further results in as the cache's convergence resync lands (there
-//! is no explicit "converged" signal in v1 — watch the snapshots/total grow). Queries read the
-//! committed DB directly, so a delivered snapshot is exactly cache truth at query time; after
-//! the last ping of a burst it can trail by at most the debounce interval.
+//! already cached and streams further results in as the cache's convergence resync lands. There
+//! is no per-search "converged" signal — watch the snapshots/total grow, or observe
+//! [`CacheMessage::ResyncProgress`](crate::cache::CacheMessage::ResyncProgress) on the global
+//! status callback: a `Finished { converged: true }` after this search's root was listed means
+//! the cache now holds a complete listing of the subtree. Queries read the committed DB
+//! directly, so a delivered snapshot is exactly cache truth at query time; after the last ping
+//! of a burst it can trail by at most the debounce interval.
 //!
 //! # Termination
 //!
@@ -102,8 +105,11 @@ impl Client {
 	/// Registers `uuid` as a sync root — CHEAP (zero network, zero resync) when `uuid` is
 	/// already an active sync root or is covered by one (cached under it); otherwise the worker
 	/// validates it remotely and runs a convergence resync of the registered roots, which can
-	/// take a while on large accounts. Change filters with [`Search::set_config`] — do NOT
-	/// drop + recreate the search per filter change.
+	/// take a while on large accounts — its progress (per-root listing byte ticks) is reported
+	/// as [`CacheMessage::ResyncProgress`](crate::cache::CacheMessage::ResyncProgress) on the
+	/// [`configure_cache`](Client::configure_cache) status callback, keyed by root uuid. Change
+	/// filters with [`Search::set_config`] — do NOT drop + recreate the search per filter
+	/// change.
 	///
 	/// Errors if [`configure_cache`](Client::configure_cache) was never called, or if
 	/// validation rejects `uuid` — downcast to [`CacheError`](crate::cache::CacheError) to

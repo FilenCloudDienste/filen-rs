@@ -13,7 +13,7 @@ pub(crate) use handle::CacheSlot;
 pub(crate) use state::{CacheControlMessage, CacheState};
 pub use {
 	error::CacheError,
-	handle::{CacheMessage, SyncRootHandle},
+	handle::{CacheMessage, ResyncProgress, SyncRootHandle},
 	search::{
 		Search, SearchConfig, SearchItemType, SearchResult, SearchSnapshot, SearchWindowCallback,
 		SearchWindowHandle,

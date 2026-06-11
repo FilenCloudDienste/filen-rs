@@ -61,7 +61,7 @@ pub fn derive_client(base: &Client) -> Arc<Client> {
 pub fn message_errors(msg: &CacheMessage) -> &[CacheError] {
 	match msg {
 		CacheMessage::Error(errors) => errors,
-		CacheMessage::SyncRootsDeleted(_) => &[],
+		CacheMessage::SyncRootsDeleted(_) | CacheMessage::ResyncProgress(_) => &[],
 	}
 }
 
@@ -420,24 +420,25 @@ impl TestCache {
 		&self.path
 	}
 
-	/// Wait until at least `count` messages have been received, then run `inspect` while
-	/// holding the lock. Returns whatever the inspection returned, or `None` on timeout.
-	pub async fn wait_and_inspect_messages<R>(
+	/// Poll the captured status messages until `predicate` over the WHOLE log returns true, or
+	/// `timeout` elapses (returning false). Never assume which message arrives first or how
+	/// many arrive together — `ResyncProgress` ticks land continuously alongside whatever a
+	/// test is actually waiting for.
+	pub async fn wait_for_messages(
 		&self,
-		count: usize,
 		timeout: Duration,
-		inspect: impl FnOnce(&[CacheMessage]) -> R,
-	) -> Option<R> {
+		predicate: impl Fn(&[CacheMessage]) -> bool,
+	) -> bool {
 		let deadline = tokio::time::Instant::now() + timeout;
 		loop {
 			{
 				let guard = self.messages.lock().await;
-				if guard.len() >= count {
-					return Some(inspect(&guard));
+				if predicate(&guard) {
+					return true;
 				}
 			}
 			if tokio::time::Instant::now() >= deadline {
-				return None;
+				return false;
 			}
 			tokio::time::sleep(Duration::from_millis(100)).await;
 		}

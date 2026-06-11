@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::cache::CacheError;
+use filen_sdk_rs::cache::{CacheError, CacheMessage, ResyncProgress};
 use filen_sdk_rs::{
 	ErrorKind,
 	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
@@ -1038,7 +1038,7 @@ async fn test_cache_error_on_file_with_encrypted_meta() {
 		.unwrap();
 
 	let saw_expected_error = cache
-		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+		.wait_for_messages(Duration::from_secs(10), |msgs| {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::FileCacheableConversion(failed)
@@ -1046,8 +1046,7 @@ async fn test_cache_error_on_file_with_encrypted_meta() {
 				})
 			})
 		})
-		.await
-		.unwrap_or(false);
+		.await;
 
 	assert!(
 		saw_expected_error,
@@ -1076,7 +1075,7 @@ async fn test_cache_error_on_dir_with_encrypted_meta() {
 		.unwrap();
 
 	let saw_expected_error = cache
-		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+		.wait_for_messages(Duration::from_secs(10), |msgs| {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::DirCacheableConversion(failed)
@@ -1084,8 +1083,7 @@ async fn test_cache_error_on_dir_with_encrypted_meta() {
 				})
 			})
 		})
-		.await
-		.unwrap_or(false);
+		.await;
 
 	assert!(
 		saw_expected_error,
@@ -1113,7 +1111,7 @@ async fn test_cache_error_on_file_with_non_uuid_parent() {
 		.unwrap();
 
 	let saw_expected_error = cache
-		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+		.wait_for_messages(Duration::from_secs(10), |msgs| {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::FileCacheableConversion(failed)
@@ -1121,8 +1119,7 @@ async fn test_cache_error_on_file_with_non_uuid_parent() {
 				})
 			})
 		})
-		.await
-		.unwrap_or(false);
+		.await;
 
 	assert!(
 		saw_expected_error,
@@ -1145,7 +1142,7 @@ async fn test_cache_error_on_dir_with_non_uuid_parent() {
 		.unwrap();
 
 	let saw_expected_error = cache
-		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+		.wait_for_messages(Duration::from_secs(10), |msgs| {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::DirCacheableConversion(failed)
@@ -1153,8 +1150,7 @@ async fn test_cache_error_on_dir_with_non_uuid_parent() {
 				})
 			})
 		})
-		.await
-		.unwrap_or(false);
+		.await;
 
 	assert!(
 		saw_expected_error,
@@ -1211,9 +1207,10 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 		);
 	}
 
-	// Exactly four conversion errors should have been reported in a single message batch.
-	let (file_errs, dir_errs) = cache
-		.wait_and_inspect_messages(1, Duration::from_secs(10), |msgs| {
+	// Exactly four conversion errors should be reported (more would mean the good items also
+	// failed; the count only grows, so an overshoot surfaces as a timeout here).
+	let saw_all_errors = cache
+		.wait_for_messages(Duration::from_secs(10), |msgs| {
 			let mut file_errs = 0usize;
 			let mut dir_errs = 0usize;
 			for msg in msgs {
@@ -1225,13 +1222,14 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 					}
 				}
 			}
-			(file_errs, dir_errs)
+			file_errs == 2 && dir_errs == 2
 		})
-		.await
-		.unwrap_or((0, 0));
+		.await;
 
-	assert_eq!(file_errs, 2, "expected 2 file conversion errors");
-	assert_eq!(dir_errs, 2, "expected 2 dir conversion errors");
+	assert!(
+		saw_all_errors,
+		"expected exactly 2 file + 2 dir conversion errors to be reported"
+	);
 }
 
 /// `add_sync_root` with a uuid that is not a reachable directory is REJECTED — the future resolves
@@ -1259,4 +1257,137 @@ async fn test_add_sync_root_rejects_invalid_uuid() {
 		),
 		"the rejection should carry CacheError::InvalidSyncRoot, got {err:?}"
 	);
+}
+
+/// The bounded-acquisition liveness property: while ANOTHER holder owns the account's drive
+/// lock, a worker whose resync cannot acquire it must still apply socket events between its
+/// bounded attempts (under the old unbounded acquisition the worker parked inside the island
+/// until the lock was won, freezing event application for the whole contention window), and the
+/// resync itself must converge via the retry timer once the lock frees up.
+#[shared_test_runtime]
+async fn test_cache_applies_events_while_drive_lock_is_contended() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+
+	// A populated dir that will become the (UNCOVERED) sync root of a derived cache — created
+	// before the lock is taken so server-side propagation isn't racing the lock window.
+	let sub = client
+		.create_dir(&(&resources.dir).into(), "lock_contended_root")
+		.await
+		.unwrap();
+	let sub_uuid: Uuid = sub.uuid().into();
+
+	// A derived cache scoped to `sub` ONLY (no whole-account root), so the add below cannot
+	// take the covered fast path and must run a lock-needing convergence resync.
+	let client2 = derive_client(client.as_ref());
+	let path2 = temp_cache_path();
+	client2
+		.configure_cache(path2.clone(), |_| {})
+		.await
+		.unwrap();
+	ensure_socket_ready(&client2).await;
+
+	// The TEST monopolizes the drive lock (auto-refreshed while held; released on drop).
+	let lock = client.lock_drive().await.unwrap();
+
+	// Validation (`get_dir`, no lock involved) can hit fresh-dir propagation lag — retry.
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	let _handle2 = loop {
+		match client2
+			.clone()
+			.add_sync_root(sub_uuid, noop_sync_root_callback())
+			.await
+		{
+			Ok(handle) => break handle,
+			Err(e) if tokio::time::Instant::now() < deadline => {
+				eprintln!("add_sync_root({sub_uuid}) not accepted yet ({e}); retrying");
+				tokio::time::sleep(Duration::from_millis(1000)).await;
+			}
+			Err(e) => panic!("add_sync_root kept failing: {e:?}"),
+		}
+	};
+
+	// LIVENESS: the worker's resync attempts keep failing on the contended lock, but the
+	// FileNew socket event must apply in a drain window between attempts. (`sub` is a sync-root
+	// key, so its direct children pass the membership gate without any cached ancestry.)
+	let upload_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	let file = loop {
+		let builder = client.make_file_builder("alive.txt", *sub.uuid()).unwrap();
+		match client.upload_file(builder, b"x").await {
+			Ok(file) => break file,
+			Err(e) if tokio::time::Instant::now() < upload_deadline => {
+				eprintln!("upload into fresh dir not accepted yet ({e}); retrying");
+				tokio::time::sleep(Duration::from_millis(1000)).await;
+			}
+			Err(e) => panic!("upload kept failing: {e:?}"),
+		}
+	};
+	let file_uuid: Uuid = file.uuid().into();
+	assert!(
+		poll_for_item(&path2, file_uuid, Duration::from_secs(45)).await,
+		"socket events must keep applying while the drive lock is contended"
+	);
+
+	// CONVERGENCE: once the lock frees up, the retry timer re-attempts and the resync
+	// materializes the root's anchor row (which only the resync writes — no event carries it).
+	drop(lock);
+	assert!(
+		poll_for_item(&path2, sub_uuid, Duration::from_secs(120)).await,
+		"the resync converges after the lock is released"
+	);
+}
+
+#[shared_test_runtime]
+async fn test_cache_resync_reports_progress() {
+	let client = test_utils::RESOURCES.client().await;
+	let cache = TestCache::new(&client).await;
+	let root: Uuid = cache.client.root().uuid().into();
+
+	// `TestCache::new` registered the account root as a NEW sync root, which triggers exactly
+	// the convergence resync whose progress we expect: `Started` carrying the root, byte
+	// `Listing` tick(s) for it (the download layer guarantees a final tick per listing on
+	// native), `Applying`, and `Finished { converged: true }` (transient failures retry and
+	// converge eventually). The worker's startup gap-check can emit an EARLIER empty-roots
+	// Started/Finished pair (it runs before the add is processed) and the status callback
+	// appends batches via spawned tasks (order not guaranteed), so assert PRESENCE of each
+	// step rather than strict ordering.
+	let saw_full_sequence = cache
+		.wait_for_messages(Duration::from_secs(120), |msgs| {
+			let progress: Vec<&ResyncProgress> = msgs
+				.iter()
+				.filter_map(|msg| match msg {
+					CacheMessage::ResyncProgress(progress) => Some(progress),
+					_ => None,
+				})
+				.collect();
+			let started = progress.iter().any(
+				|step| matches!(step, ResyncProgress::Started { roots } if roots.contains(&root)),
+			);
+			let listing = progress.iter().any(|step| {
+				matches!(
+					step,
+					ResyncProgress::Listing {
+						root: listed,
+						root_index: 0,
+						root_count: 1,
+						bytes_downloaded,
+						..
+					} if *listed == root && *bytes_downloaded > 0
+				)
+			});
+			let applying = progress
+				.iter()
+				.any(|step| matches!(step, ResyncProgress::Applying));
+			let finished = progress
+				.iter()
+				.any(|step| matches!(step, ResyncProgress::Finished { converged: true }));
+			started && listing && applying && finished
+		})
+		.await;
+	if !saw_full_sequence {
+		panic!(
+			"timed out waiting for the full resync progress sequence; got: {:?}",
+			*cache.messages.lock().await
+		);
+	}
 }

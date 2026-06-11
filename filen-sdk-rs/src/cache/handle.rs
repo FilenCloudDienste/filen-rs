@@ -32,6 +32,56 @@ pub enum CacheMessage {
 	/// their [`SyncRootHandle`]s are inert from here on — and the app must re-issue
 	/// [`add_sync_root`](Client::add_sync_root) to resume syncing them.
 	SyncRootsDeleted(Vec<Uuid>),
+	/// Progress of a convergence resync (see [`ResyncProgress`] for the lifecycle and its
+	/// attribution caveats). Lossy like every status message — a tick can be dropped under load —
+	/// so treat each one as a fresh snapshot, never accumulate deltas.
+	ResyncProgress(ResyncProgress),
+}
+
+/// One step of a convergence resync's lifecycle: the whole-subtree `dir/download` listings the
+/// worker runs when a NEW sync root is added (e.g. by starting a
+/// [`Search`](crate::cache::Search) on an uncovered directory) or when it heals a detected event
+/// gap. Delivered via [`CacheMessage::ResyncProgress`] on the
+/// [`configure_cache`](Client::configure_cache) status callback.
+///
+/// A resync is WORKER-GLOBAL: it relists EVERY registered root under one drive lock — quick
+/// successive [`add_sync_root`](Client::add_sync_root) calls coalesce into ONE resync, and
+/// gap-healing resyncs run with no add in flight at all — so progress is keyed by ROOT uuid
+/// rather than by caller; correlate with [`SyncRootHandle::uuid`] /
+/// [`Search::root_uuid`](crate::cache::Search::root_uuid). A COVERED add (a uuid already cached
+/// under an active root) triggers no resync and therefore no progress messages at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResyncProgress {
+	/// A resync attempt began. It first waits (bounded) on the drive lock, which another device
+	/// may hold — a contended attempt ends in [`Finished { converged: false }`](Self::Finished)
+	/// within seconds and is retried shortly, each retry emitting its own `Started`. `roots` is
+	/// the full set being converged, in listing order — possibly empty (a watermark-only
+	/// catch-up with no registered roots).
+	Started { roots: Vec<Uuid> },
+	/// Byte progress of one root's whole-subtree listing download (`root_index` indexes
+	/// [`Started`](Self::Started)'s `roots`). `bytes_downloaded` is CUMULATIVE within one HTTP
+	/// attempt (an internal retry restarts it from 0); `total_bytes` is present only when the
+	/// server reports a length; ticks arrive at most every ~200 ms. After the last byte the
+	/// listing is still decrypted before the next root starts, so expect a pause at 100%.
+	Listing {
+		root: Uuid,
+		root_index: usize,
+		root_count: usize,
+		bytes_downloaded: u64,
+		total_bytes: Option<u64>,
+	},
+	/// Every root listed (or was skipped); the worker is diffing and committing the listings into
+	/// the cache. No finer-grained progress — on very large listings this phase can take a while.
+	Applying,
+	/// The attempt ended — always fired once per [`Started`](Self::Started), so a consumer's
+	/// spinner can never hang. `converged: true` means the convergence committed with nothing
+	/// left pending: cache truth now holds a complete listing of every registered root's subtree
+	/// (for a search, the result set is as complete as the server was at the snapshot). `false`
+	/// means the attempt failed or partially failed — errors arrive separately as
+	/// [`CacheMessage::Error`] — and the worker retries on a later cycle (which emits its own
+	/// `Started`).
+	Finished { converged: bool },
 }
 
 /// One-time cache configuration stored on the [`Client`]: the SQLite DB path and the global
