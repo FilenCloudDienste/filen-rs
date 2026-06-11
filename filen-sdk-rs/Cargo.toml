@@ -19,11 +19,20 @@ wasm-full = ["multi-threaded-crypto"]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 http-provider = ["dep:axum", "dep:axum-extra"]
-cache = ["dep:rusqlite", "dep:crossbeam", "dep:itertools"]
+cache = [
+	"dep:rusqlite",
+	"dep:crossbeam",
+	"dep:itertools",
+	"filen-types/rusqlite",
+]
 
 # The cache tests only exist when the `cache` feature is enabled.
 [[test]]
 name = "cache_tests"
+required-features = ["cache"]
+
+[[test]]
+name = "cache_search_tests"
 required-features = ["cache"]
 
 [dependencies]
@@ -119,6 +128,7 @@ rkyv = { version = "0.8.16", features = ["uuid-1"] }
 # silently compiling the engine out, until a real wasm port lands.
 rusqlite = { version = "0.37.0", features = [
 	"bundled",
+	"functions",
 	"uuid",
 ], optional = true }
 crossbeam = { version = "0.8.4", features = [

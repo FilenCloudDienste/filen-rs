@@ -792,7 +792,8 @@ impl CacheState {
 	/// validating `get_dir` is then repeated by `run_resync`'s listing; the extra round-trip is
 	/// accepted since `AddSyncRoot` is rare.) An ALREADY-ACTIVE uuid skips validation and the resync —
 	/// its existence is established and its subtree is already converged; the new callback simply
-	/// joins the root's registrations.
+	/// joins the root's registrations. A COVERED uuid (cached, with its ancestry reaching an active
+	/// root) likewise skips both — see the fast path comment in the body.
 	fn handle_add_sync_root(
 		&mut self,
 		uuid: Uuid,
@@ -802,6 +803,23 @@ impl CacheState {
 	) -> bool {
 		if let Some(registrations) = self.sync_roots.get_mut(&uuid) {
 			registrations.push((registration_id, callback));
+			let _ = ack.send(Ok(()));
+			return false;
+		}
+		// Covered-add fast path: a uuid whose CACHED ancestry reaches a currently-active sync
+		// root needs neither validation nor a convergence resync. Coverage means the subtree's
+		// events were flowing the whole time, so cached existence IS event-stream truth (a
+		// server-side deletion would have arrived as an event and removed the rows), and any gap
+		// is already durably flagged — the scheduled resync lists ALL roots including this one,
+		// so skipping the immediate resync masks nothing. An uncached uuid has no ancestry rows
+		// and falls through; a DB error here also just falls through to the (always-correct)
+		// validate-and-converge slow path.
+		if uuid != self.root_uuid
+			&& matches!(self.in_any_sync_root(uuid, &self.sync_roots), Ok(true))
+		{
+			log::info!("AddSyncRoot {uuid}: covered by an active sync root; registering directly");
+			self.sync_roots
+				.insert(uuid, vec![(registration_id, callback)]);
 			let _ = ack.send(Ok(()));
 			return false;
 		}

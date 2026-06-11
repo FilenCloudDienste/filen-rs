@@ -61,6 +61,15 @@ pub(crate) struct CacheSlot {
 	finished: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
+impl CacheSlot {
+	/// The configured cache DB path, if [`Client::configure_cache`] has run. Stable while a
+	/// worker is live (reconfiguration is rejected then) — the search engine opens its own
+	/// READ-ONLY connection on it.
+	pub(crate) fn db_path(&self) -> Option<PathBuf> {
+		self.config.as_ref().map(|config| config.path.clone())
+	}
+}
+
 /// Worker-side senders shared by every [`SyncRootHandle`] (strongly) and the [`Client`]'s slot
 /// (weakly). Dropping the last strong reference drops `control_sender`, which the worker's run
 /// loop treats as a clean shutdown (drain, close the DB, exit); dropping `listener_handle` then

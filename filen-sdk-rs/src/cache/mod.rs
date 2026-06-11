@@ -2,6 +2,7 @@
 
 mod error;
 mod handle;
+pub mod search;
 mod sql;
 mod state;
 
@@ -13,5 +14,9 @@ pub(crate) use state::{CacheControlMessage, CacheState};
 pub use {
 	error::CacheError,
 	handle::{CacheMessage, SyncRootHandle},
+	search::{
+		Search, SearchConfig, SearchItemType, SearchResult, SearchSnapshot, SearchWindowCallback,
+		SearchWindowHandle,
+	},
 	state::{CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, SyncRootCallback},
 };

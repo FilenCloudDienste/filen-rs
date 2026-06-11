@@ -1990,3 +1990,70 @@ fn account_root_evict_with_survivors_marks_needs_resync() {
 		"survivor re-convergence durably scheduled"
 	);
 }
+
+/// adding a sync root that is COVERED by an active root (cached, ancestry reaches the
+/// active key) takes the fast path: registered immediately, no convergence resync requested.
+#[test]
+fn covered_add_registers_without_resync() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	let nested = cache_dir(2, a.uuid);
+	state.upsert_dirs([&a, &nested].into_iter()).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(account_root, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	let needs_resync = state.handle_add_sync_root(nested.uuid, 1, Box::new(|_| {}), ack);
+
+	assert!(!needs_resync, "covered add must not request a resync");
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
+	assert!(state.sync_roots.contains_key(&nested.uuid));
+	assert!(
+		!state.needs_resync().unwrap(),
+		"no durable resync scheduled for a covered add"
+	);
+}
+
+/// an UNCOVERED uuid (cached rows but no active root above it) still takes the slow path
+/// and requests a convergence resync.
+#[test]
+fn uncovered_add_still_requests_resync() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	state.upsert_dirs(once(&a)).unwrap();
+	// No active roots at all: A's rows exist but nothing covers them.
+	state.set_test_sync_roots(HashMap::new());
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	let needs_resync = state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack);
+
+	assert!(needs_resync, "uncovered add must be converged");
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))));
+	assert!(state.sync_roots.contains_key(&a.uuid));
+}
+
+/// a covered add while a gap is already durably flagged keeps the flag set (the scheduled
+/// resync lists all roots, including the newly covered one) — the fast path masks nothing.
+#[test]
+fn covered_add_keeps_pending_resync_flag() {
+	let mut state = CacheState::new_in_memory();
+	let account_root = state.root_uuid;
+	let a = cache_dir(1, account_root);
+	state.upsert_dirs(once(&a)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(account_root, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+	state.mark_needs_resync().unwrap();
+
+	let (ack, _ack_rx) = tokio::sync::oneshot::channel();
+	let needs_resync = state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack);
+
+	assert!(!needs_resync, "fast path requests no immediate resync");
+	assert!(
+		state.needs_resync().unwrap(),
+		"the pre-existing durable flag stays set for the scheduled resync"
+	);
+}

@@ -1,3 +1,7 @@
+// Shared between the integration-test binaries (cache_tests, cache_search_tests); each binary
+// compiles its own copy and uses a subset.
+#![allow(dead_code)]
+
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},

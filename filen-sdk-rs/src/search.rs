@@ -1,3 +1,8 @@
+//! SERVER-SIDE search: hashed-substring indexing against the `v3/search/*` endpoints — a
+//! network round-trip over the whole account, with no live updates. For a LOCAL, offline,
+//! live-updating search over a cached subtree, see `crate::cache` (`Client::create_search`,
+//! available with the `cache` feature).
+
 use std::{
 	borrow::Cow,
 	cmp::min,

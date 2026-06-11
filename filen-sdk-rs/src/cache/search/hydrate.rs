@@ -1,0 +1,487 @@
+//! The search engine's DB side: its own READ-ONLY connection to the cache file (WAL lets it read
+//! concurrently with the worker's writer), the `filen_name_matches` scalar function that gives
+//! SQLite full-Unicode case folding (its built-in `LIKE`/`lower()` are ASCII-only), and the
+//! window/count queries that do ALL filtering, ordering, windowing, and hydration inside SQLite —
+//! the engine holds no result set in memory.
+//!
+//! NAME NORMALIZATION ASSUMPTION: cached names are assumed to already be NFC-normalized (matching
+//! is byte-based after case folding). Pre-v4 drives can contain NFD names written by old clients;
+//! those may fail to match visually-identical needles until the v4 re-encode normalizes the whole
+//! drive. The NEEDLE is always NFC-normalized in Rust (user input is untrusted either way).
+
+use std::{borrow::Cow, ops::Range, path::Path, time::Duration};
+
+use chrono::{DateTime, Utc};
+use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::Blake3Hash};
+use rusqlite::{Connection, OpenFlags, Row, functions::FunctionFlags, params, types::ValueRef};
+use uuid::Uuid;
+
+use crate::{
+	crypto::file::FileKey,
+	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
+};
+
+use super::{config::CompiledFilter, result::SearchResult};
+
+const SEARCH_WINDOW_ACCOUNT: &str = include_str!("raw/search_window_account.sql");
+const SEARCH_WINDOW_SUBTREE: &str = include_str!("raw/search_window_subtree.sql");
+const SEARCH_WINDOW_CHILDREN: &str = include_str!("raw/search_window_children.sql");
+const SEARCH_COUNT_ACCOUNT: &str = include_str!("raw/search_count_account.sql");
+const SEARCH_COUNT_SUBTREE: &str = include_str!("raw/search_count_subtree.sql");
+const SEARCH_COUNT_CHILDREN: &str = include_str!("raw/search_count_children.sql");
+
+/// What part of the cache a search queries. Derived per query from the search root and the
+/// `recursive` flag: the account root needs no scoping at all (everything cached lives under
+/// it), a subdir scope walks the recursive CTE, and non-recursive mode is a parent lookup.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Scope {
+	Account,
+	Subtree(Uuid),
+	Children(Uuid),
+}
+
+/// The matcher behind the SQL `filen_name_matches(name, needle, case_insensitive)` function.
+/// For the case-insensitive mode the needle must arrive PRE-FOLDED (lowercased in Rust at bind
+/// time); the haystack folds on the fly — allocation-free for pure-ASCII rows (the overwhelming
+/// majority), one transient fold for rows containing non-ASCII. An empty needle matches
+/// everything.
+pub(super) fn name_matches(haystack: &str, needle: &str, case_insensitive: bool) -> bool {
+	if needle.is_empty() {
+		return true;
+	}
+	if !case_insensitive {
+		return haystack.contains(needle);
+	}
+	if haystack.is_ascii() && needle.is_ascii() {
+		let haystack = haystack.as_bytes();
+		let needle = needle.as_bytes();
+		if needle.len() > haystack.len() {
+			return false;
+		}
+		return haystack
+			.windows(needle.len())
+			.any(|window| window.eq_ignore_ascii_case(needle));
+	}
+	haystack.to_lowercase().contains(needle)
+}
+
+/// Open the engine's read-only connection and register `filen_name_matches` on it. The function
+/// lives ONLY on this connection and ONLY in query WHERE clauses — it never appears in the
+/// schema or an index, so the worker's writer connection needs no registration. `NO_MUTEX` is
+/// safe because the connection never leaves the engine task; the busy timeout rides out WAL
+/// checkpoints by the worker.
+pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> {
+	let conn = Connection::open_with_flags(
+		path,
+		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+	)?;
+	conn.busy_timeout(Duration::from_millis(5000))?;
+	conn.create_scalar_function(
+		"filen_name_matches",
+		3,
+		FunctionFlags::SQLITE_UTF8
+			| FunctionFlags::SQLITE_DETERMINISTIC
+			| FunctionFlags::SQLITE_INNOCUOUS,
+		|ctx| {
+			let name = match ctx.get_raw(0) {
+				ValueRef::Text(text) => std::str::from_utf8(text)
+					.map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?,
+				// An items row whose files/dirs companion row is missing (mid-upsert or
+				// corrupt): never a match; the explaining event converges it later.
+				_ => return Ok(false),
+			};
+			let needle = ctx.get_raw(1).as_str().map_err(rusqlite::Error::from)?;
+			let case_insensitive: bool = ctx.get(2)?;
+			Ok(name_matches(name, needle, case_insensitive))
+		},
+	)?;
+	Ok(conn)
+}
+
+fn type_filter_param(filter: &CompiledFilter) -> i64 {
+	use super::config::SearchItemType;
+	match filter.item_type {
+		SearchItemType::All => 0,
+		SearchItemType::Dir => 1,
+		SearchItemType::File => 2,
+	}
+}
+
+/// One window: scope + filter + order + LIMIT/OFFSET + full hydration, all in one statement.
+/// With a needle this scans the scope (substring matches cannot use an index); without one it
+/// is bounded by the scope and the window. Cost notes live in the [module docs](super).
+pub(super) fn window_results(
+	conn: &Connection,
+	scope: Scope,
+	filter: &CompiledFilter,
+	range: &Range<usize>,
+) -> rusqlite::Result<Vec<SearchResult>> {
+	let limit = range.end.saturating_sub(range.start).min(i64::MAX as usize) as i64;
+	let offset = range.start.min(i64::MAX as usize) as i64;
+	if limit == 0 {
+		return Ok(Vec::new());
+	}
+	let needle = filter.needle.as_deref().unwrap_or("");
+	let type_filter = type_filter_param(filter);
+	let case_insensitive = !filter.case_sensitive;
+	match scope {
+		Scope::Account => conn
+			.prepare_cached(SEARCH_WINDOW_ACCOUNT)?
+			.query_map(
+				params![type_filter, needle, case_insensitive, limit, offset],
+				row_to_result,
+			)?
+			.collect(),
+		Scope::Subtree(anchor) => conn
+			.prepare_cached(SEARCH_WINDOW_SUBTREE)?
+			.query_map(
+				params![anchor, type_filter, needle, case_insensitive, limit, offset],
+				row_to_result,
+			)?
+			.collect(),
+		Scope::Children(parent) => conn
+			.prepare_cached(SEARCH_WINDOW_CHILDREN)?
+			.query_map(
+				params![parent, type_filter, needle, case_insensitive, limit, offset],
+				row_to_result,
+			)?
+			.collect(),
+	}
+}
+
+/// The total match count for the same scope + filter as [`window_results`].
+pub(super) fn count_results(
+	conn: &Connection,
+	scope: Scope,
+	filter: &CompiledFilter,
+) -> rusqlite::Result<usize> {
+	let needle = filter.needle.as_deref().unwrap_or("");
+	let type_filter = type_filter_param(filter);
+	let case_insensitive = !filter.case_sensitive;
+	let count: i64 = match scope {
+		Scope::Account => conn
+			.prepare_cached(SEARCH_COUNT_ACCOUNT)?
+			.query_row(params![type_filter, needle, case_insensitive], |row| {
+				row.get(0)
+			})?,
+		Scope::Subtree(anchor) => conn.prepare_cached(SEARCH_COUNT_SUBTREE)?.query_row(
+			params![anchor, type_filter, needle, case_insensitive],
+			|row| row.get(0),
+		)?,
+		Scope::Children(parent) => conn.prepare_cached(SEARCH_COUNT_CHILDREN)?.query_row(
+			params![parent, type_filter, needle, case_insensitive],
+			|row| row.get(0),
+		)?,
+	};
+	Ok(count.max(0) as usize)
+}
+
+fn conversion_error(
+	index: usize,
+	error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+	rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
+}
+
+fn timestamp_millis(index: usize, millis: i64) -> rusqlite::Result<DateTime<Utc>> {
+	DateTime::from_timestamp_millis(millis).ok_or_else(|| {
+		rusqlite::Error::FromSqlConversionFailure(
+			index,
+			rusqlite::types::Type::Integer,
+			Box::new(rusqlite::types::FromSqlError::OutOfRange(millis)),
+		)
+	})
+}
+
+/// One window-query row → the full result payload, mirroring the column encodings written by
+/// `sql/file.rs` / `sql/dir.rs`.
+fn row_to_result(row: &Row<'_>) -> rusqlite::Result<SearchResult> {
+	let uuid: Uuid = row.get(0)?;
+	let parent: Uuid = row.get(1)?;
+	let item_type: i64 = row.get(2)?;
+	match item_type {
+		2 => {
+			let key_str: String = row.get(12)?;
+			let key_version: u8 = row.get(13)?;
+			let key_version = FileEncryptionVersion::try_from(key_version)
+				.map_err(|e| conversion_error(13, e))?;
+			let key = FileKey::from_str_with_version(&key_str, key_version)
+				.map_err(|e| conversion_error(12, e))?;
+			let hash = row
+				.get::<_, Option<String>>(16)?
+				.map(|hex_str| {
+					let mut bytes = [0u8; 32];
+					hex::decode_to_slice(hex_str, &mut bytes)
+						.map_err(|e| conversion_error(16, e))?;
+					Ok::<_, rusqlite::Error>(Blake3Hash::from(bytes))
+				})
+				.transpose()?;
+			Ok(SearchResult::File(CacheableFile {
+				uuid,
+				parent,
+				chunks_size: row.get(3)?,
+				chunks: row.get(4)?,
+				favorited: row.get(5)?,
+				region: Cow::Owned(row.get::<_, String>(6)?),
+				bucket: Cow::Owned(row.get::<_, String>(7)?),
+				timestamp: timestamp_millis(8, row.get(8)?)?,
+				size: row.get(9)?,
+				name: Cow::Owned(row.get::<_, String>(10)?),
+				mime: Cow::Owned(row.get::<_, String>(11)?),
+				key,
+				created: row
+					.get::<_, Option<i64>>(14)?
+					.map(|millis| timestamp_millis(14, millis))
+					.transpose()?,
+				last_modified: timestamp_millis(15, row.get(15)?)?,
+				hash,
+			}))
+		}
+		1 => Ok(SearchResult::Dir(CacheableDir {
+			uuid,
+			parent,
+			favorited: row.get(17)?,
+			color: row
+				.get::<_, Option<DirColor<'static>>>(18)?
+				.unwrap_or_default(),
+			timestamp: timestamp_millis(19, row.get(19)?)?,
+			name: Cow::Owned(row.get::<_, String>(20)?),
+			created: row
+				.get::<_, Option<i64>>(21)?
+				.map(|millis| timestamp_millis(21, millis))
+				.transpose()?,
+		})),
+		other => Err(rusqlite::Error::FromSqlConversionFailure(
+			2,
+			rusqlite::types::Type::Integer,
+			Box::new(rusqlite::types::FromSqlError::OutOfRange(other)),
+		)),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::borrow::Cow;
+
+	use chrono::DateTime;
+	use filen_types::crypto::Blake3Hash;
+	use uuid::Uuid;
+
+	use crate::cache::CacheState;
+
+	use super::super::config::{SearchConfig, SearchItemType};
+	use super::*;
+
+	#[test]
+	fn matcher_handles_ascii_unicode_and_the_case_toggle() {
+		// Case-insensitive (needle pre-folded).
+		assert!(name_matches("q3-REPORT.txt", "report", true));
+		assert!(name_matches("Ärger.txt", "ärger", true));
+		assert!(name_matches("anything", "", true));
+		assert!(!name_matches("other.txt", "report", true));
+		assert!(!name_matches("ab", "abc", true));
+
+		// Case-sensitive: raw bytes.
+		assert!(name_matches("q3-REPORT.txt", "REPORT", false));
+		assert!(!name_matches("q3-REPORT.txt", "report", false));
+		assert!(name_matches("Ärger.txt", "Ärger", false));
+	}
+
+	fn temp_db_path() -> std::path::PathBuf {
+		std::env::temp_dir().join(format!("filen_search_query_test_{}.db", Uuid::new_v4()))
+	}
+
+	fn ms(millis: i64) -> DateTime<Utc> {
+		DateTime::from_timestamp_millis(millis).unwrap()
+	}
+
+	fn test_dir(uuid: Uuid, parent: Uuid, name: &str) -> CacheableDir<'static> {
+		CacheableDir {
+			uuid,
+			parent,
+			color: DirColor::Custom(Cow::Borrowed("#123456")),
+			favorited: true,
+			timestamp: ms(1_700_000_000_000),
+			name: Cow::Owned(name.to_string()),
+			created: Some(ms(1_700_000_000_001)),
+		}
+	}
+
+	fn test_file(uuid: Uuid, parent: Uuid, name: &str) -> CacheableFile<'static> {
+		CacheableFile {
+			uuid,
+			parent,
+			chunks_size: 7,
+			chunks: 2,
+			favorited: true,
+			region: Cow::Borrowed("eu-central-1"),
+			bucket: Cow::Borrowed("bucket-x"),
+			timestamp: ms(1_700_000_000_002),
+			name: Cow::Owned(name.to_string()),
+			size: 1234,
+			mime: Cow::Borrowed("image/png"),
+			key: FileKey::from_str_with_version(&"b".repeat(64), FileEncryptionVersion::V3)
+				.unwrap(),
+			last_modified: ms(1_700_000_000_003),
+			created: Some(ms(1_700_000_000_004)),
+			hash: Some(Blake3Hash::from([7u8; 32])),
+		}
+	}
+
+	/// account_root → { Beta.txt, sub(dir) → { alpha.txt, Übung.txt } }.
+	struct Fixture {
+		path: std::path::PathBuf,
+		root: Uuid,
+		sub: CacheableDir<'static>,
+		beta: CacheableFile<'static>,
+		alpha: CacheableFile<'static>,
+		uebung: CacheableFile<'static>,
+		// Held open: the read connection works alongside the writer (WAL).
+		_state: CacheState,
+	}
+
+	fn fixture() -> Fixture {
+		let path = temp_db_path();
+		let root = Uuid::new_v4();
+		let mut state = CacheState::new_on_path(&path, root);
+		let sub = test_dir(Uuid::new_v4(), root, "sub");
+		let beta = test_file(Uuid::new_v4(), root, "Beta.txt");
+		let alpha = test_file(Uuid::new_v4(), sub.uuid, "alpha.txt");
+		let uebung = test_file(Uuid::new_v4(), sub.uuid, "Übung.txt");
+		state.upsert_dirs(std::iter::once(&sub)).unwrap();
+		state
+			.upsert_files([&beta, &alpha, &uebung].into_iter())
+			.unwrap();
+		Fixture {
+			path,
+			root,
+			sub,
+			beta,
+			alpha,
+			uebung,
+			_state: state,
+		}
+	}
+
+	fn filter(config: &SearchConfig) -> CompiledFilter {
+		CompiledFilter::compile(config)
+	}
+
+	fn result_names(results: &[SearchResult]) -> Vec<String> {
+		results
+			.iter()
+			.map(|result| result.name().to_string())
+			.collect()
+	}
+
+	#[test]
+	fn account_scope_orders_dirs_first_then_case_folded_names() {
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+		let filter = filter(&SearchConfig::new());
+
+		let results = window_results(&conn, Scope::Account, &filter, &(0..10)).unwrap();
+		assert_eq!(
+			result_names(&results),
+			vec!["sub", "alpha.txt", "Beta.txt", "Übung.txt"],
+			"dir first; then alpha < Beta under ASCII case folding; non-ASCII after"
+		);
+		assert_eq!(count_results(&conn, Scope::Account, &filter).unwrap(), 4);
+	}
+
+	#[test]
+	fn subtree_and_children_scopes_bound_the_results() {
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+		let filter = filter(&SearchConfig::new());
+
+		let subtree =
+			window_results(&conn, Scope::Subtree(fixture.sub.uuid), &filter, &(0..10)).unwrap();
+		assert_eq!(result_names(&subtree), vec!["alpha.txt", "Übung.txt"]);
+
+		let children =
+			window_results(&conn, Scope::Children(fixture.root), &filter, &(0..10)).unwrap();
+		assert_eq!(
+			result_names(&children),
+			vec!["sub", "Beta.txt"],
+			"direct children only"
+		);
+		assert_eq!(
+			count_results(&conn, Scope::Children(fixture.root), &filter).unwrap(),
+			2
+		);
+	}
+
+	#[test]
+	fn needle_and_type_filters_apply_in_sql() {
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+
+		let insensitive = filter(&SearchConfig::new().with_name("ÜBUNG"));
+		let results = window_results(&conn, Scope::Account, &insensitive, &(0..10)).unwrap();
+		assert_eq!(result_names(&results), vec!["Übung.txt"]);
+
+		let sensitive = filter(
+			&SearchConfig::new()
+				.with_name("beta")
+				.with_case_sensitive(true),
+		);
+		assert_eq!(
+			count_results(&conn, Scope::Account, &sensitive).unwrap(),
+			0,
+			"case-sensitive mode matches raw bytes only"
+		);
+
+		let dirs_only = filter(&SearchConfig::new().with_item_type(SearchItemType::Dir));
+		let results = window_results(&conn, Scope::Account, &dirs_only, &(0..10)).unwrap();
+		assert_eq!(result_names(&results), vec!["sub"]);
+	}
+
+	#[test]
+	fn windows_paginate_with_limit_offset_and_clamp() {
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+		let filter = filter(&SearchConfig::new());
+
+		let second_page = window_results(&conn, Scope::Account, &filter, &(2..4)).unwrap();
+		assert_eq!(result_names(&second_page), vec!["Beta.txt", "Übung.txt"]);
+
+		let beyond = window_results(&conn, Scope::Account, &filter, &(50..60)).unwrap();
+		assert!(beyond.is_empty());
+
+		let empty = window_results(&conn, Scope::Account, &filter, &(3..3)).unwrap();
+		assert!(empty.is_empty());
+	}
+
+	#[test]
+	fn hydration_round_trips_payloads_faithfully() {
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+		let filter = filter(&SearchConfig::new());
+
+		let results = window_results(&conn, Scope::Account, &filter, &(0..10)).unwrap();
+		let by_uuid = |uuid: Uuid| {
+			results
+				.iter()
+				.find(|result| result.uuid() == uuid)
+				.unwrap()
+				.clone()
+		};
+		assert_eq!(
+			by_uuid(fixture.beta.uuid),
+			SearchResult::File(fixture.beta.clone())
+		);
+		assert_eq!(
+			by_uuid(fixture.alpha.uuid),
+			SearchResult::File(fixture.alpha.clone())
+		);
+		assert_eq!(
+			by_uuid(fixture.uebung.uuid),
+			SearchResult::File(fixture.uebung.clone())
+		);
+		assert_eq!(
+			by_uuid(fixture.sub.uuid),
+			SearchResult::Dir(fixture.sub.clone())
+		);
+	}
+}
