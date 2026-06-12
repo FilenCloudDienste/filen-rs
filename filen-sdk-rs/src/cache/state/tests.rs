@@ -387,7 +387,10 @@ fn membership_gate_skips_out_of_root_upserts() {
 	let in_root = cache_file(2, a.uuid, 100);
 	assert!(
 		state
-			.apply_event(CacheEventType::File(FileEvent::New(in_root.clone())))
+			.apply_event(
+				CacheEventType::File(FileEvent::New(in_root.clone())),
+				EventTrust::Checked
+			)
 			.is_ok()
 	);
 	assert!(item_exists(&state, in_root.uuid), "in-root file is cached");
@@ -397,7 +400,10 @@ fn membership_gate_skips_out_of_root_upserts() {
 	let out_of_root = cache_file(3, account_root, 100);
 	assert!(
 		state
-			.apply_event(CacheEventType::File(FileEvent::New(out_of_root.clone())))
+			.apply_event(
+				CacheEventType::File(FileEvent::New(out_of_root.clone())),
+				EventTrust::Checked
+			)
 			.is_ok(),
 		"an out-of-root event is treated as applied so the watermark advances"
 	);
@@ -426,7 +432,10 @@ fn move_out_of_sync_root_deletes_the_stale_row() {
 	// Move the file OUT of A — to the account root, which is NOT a configured sync root.
 	let moved = cache_file(2, account_root, 100);
 	state
-		.apply_event(CacheEventType::File(FileEvent::Move(moved)))
+		.apply_event(
+			CacheEventType::File(FileEvent::Move(moved)),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert!(
@@ -456,7 +465,10 @@ fn move_of_a_sync_root_out_of_its_parent_keeps_its_subtree() {
 	// Move sync root B out from under A to directly under the account root (NOT a configured root).
 	let moved_b = cache_dir(2, account_root);
 	state
-		.apply_event(CacheEventType::Dir(DirEvent::Move(moved_b)))
+		.apply_event(
+			CacheEventType::Dir(DirEvent::Move(moved_b)),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert!(
@@ -494,7 +506,10 @@ fn changed_on_out_of_root_sync_root_dir_applies() {
 	let mut b_changed = cache_dir(1, account_root);
 	b_changed.name = std::borrow::Cow::Owned("renamed".to_string());
 	state
-		.apply_event(CacheEventType::Dir(DirEvent::Changed(b_changed.clone())))
+		.apply_event(
+			CacheEventType::Dir(DirEvent::Changed(b_changed.clone())),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert_ne!(
@@ -714,7 +729,10 @@ fn dir_removed_of_sync_root_drops_it_and_notifies() {
 
 	// B is deleted server-side.
 	state
-		.apply_event(CacheEventType::Dir(DirEvent::Removed(b.uuid)))
+		.apply_event(
+			CacheEventType::Dir(DirEvent::Removed(b.uuid)),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert!(!item_exists(&state, b.uuid), "B's node is deleted");
@@ -757,7 +775,10 @@ fn cascade_delete_drops_nested_sync_root() {
 
 	// A is deleted server-side; the cascade wipes I and the nested root B.
 	state
-		.apply_event(CacheEventType::Dir(DirEvent::Removed(a.uuid)))
+		.apply_event(
+			CacheEventType::Dir(DirEvent::Removed(a.uuid)),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert!(!item_exists(&state, a.uuid));
@@ -809,7 +830,10 @@ fn dir_move_out_of_root_drops_nested_sync_root() {
 	// including the nested root B, is cascade-deleted.
 	let moved_c = cache_dir(2, account_root);
 	state
-		.apply_event(CacheEventType::Dir(DirEvent::Move(moved_c)))
+		.apply_event(
+			CacheEventType::Dir(DirEvent::Move(moved_c)),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert!(
@@ -927,12 +951,58 @@ fn delete_all_marks_needs_resync() {
 
 	assert!(!state.needs_resync().unwrap(), "starts clear");
 	state
-		.apply_event(CacheEventType::Global(GlobalEvent::DeleteAll))
+		.apply_event(
+			CacheEventType::Global(GlobalEvent::DeleteAll),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert!(
 		state.needs_resync().unwrap(),
 		"DeleteAll wiped the root ancestry, so a resync must be scheduled to re-converge"
+	);
+}
+
+/// `apply_resync` dispatches its synthetics to the owning registrations: creates ride the
+/// per-anchor fast path (owners resolved once per root), while delete-shaped synthetics keep
+/// the exact per-event resolution — both must reach the anchor's callback.
+#[test]
+fn apply_resync_dispatches_synthetics_through_both_owner_paths() {
+	let mut state = CacheState::new_in_memory();
+	let root = state.root_uuid;
+	let received: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let received_cb = received.clone();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(
+		root,
+		Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
+			received_cb
+				.lock()
+				.unwrap()
+				.extend(events.map(|event| format!("{:?}", event.event)));
+		}),
+	);
+	state.set_test_sync_roots(sync_roots);
+
+	// A pre-cached file the listing will NOT contain (→ a Removed synthetic, exact path) and
+	// a listed new dir (→ a New synthetic, fast per-anchor path).
+	let stale = cache_file(7, root, 10);
+	state.upsert_files(once(&stale)).unwrap();
+	let new_dir = cache_dir(2, root);
+	state
+		.apply_resync(vec![(root, vec![new_dir.clone()], vec![])], 50, false)
+		.unwrap();
+
+	let got = received.lock().unwrap();
+	assert!(
+		got.iter()
+			.any(|event| event.contains("New") && event.contains(&new_dir.uuid.to_string())),
+		"the created dir dispatches via the per-anchor owners: {got:?}"
+	);
+	assert!(
+		got.iter()
+			.any(|event| event.contains("Removed") && event.contains(&stale.uuid.to_string())),
+		"the removed file dispatches via the exact per-event owners: {got:?}"
 	);
 }
 
@@ -953,7 +1023,10 @@ fn dir_removed_of_non_root_does_not_touch_the_set() {
 	state.set_test_sync_roots(sync_roots);
 
 	state
-		.apply_event(CacheEventType::Dir(DirEvent::Removed(sub.uuid)))
+		.apply_event(
+			CacheEventType::Dir(DirEvent::Removed(sub.uuid)),
+			EventTrust::Checked,
+		)
 		.unwrap();
 
 	assert!(state.sync_roots.contains_key(&a.uuid), "A still active");
@@ -1949,7 +2022,10 @@ fn remove_registration_after_server_side_deletion_is_noop() {
 
 	// B is deleted server-side → dropped from the active set (all registrations at once).
 	state
-		.apply_event(CacheEventType::Dir(DirEvent::Removed(b.uuid)))
+		.apply_event(
+			CacheEventType::Dir(DirEvent::Removed(b.uuid)),
+			EventTrust::Checked,
+		)
 		.unwrap();
 	assert!(!state.sync_roots.contains_key(&b.uuid));
 

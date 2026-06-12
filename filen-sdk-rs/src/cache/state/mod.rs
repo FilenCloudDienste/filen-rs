@@ -40,6 +40,19 @@ use crate::cache::{
 };
 const BATCH_SIZE: usize = 256;
 
+/// Whether the membership gate must vet an event's parent before an upsert. SOCKET events are
+/// [`Checked`](Self::Checked): the account-wide subscription delivers events for the whole
+/// drive, and out-of-root ones must not be stored. Resync synthetics are
+/// [`TrustedSynthetic`](Self::TrustedSynthetic): the diff computed them against the ANCHORED
+/// subtree listing, so in-root membership holds by construction and the per-event ancestry
+/// walk (one recursive CTE per event, ~166k of them on a populate) is pure waste — a trusted
+/// `Move` in particular is always an in-root re-parent, never a move-out delete.
+#[derive(Clone, Copy, PartialEq)]
+enum EventTrust {
+	Checked,
+	TrustedSynthetic,
+}
+
 /// The drain's cross-batch state: the gap-free frontier (and whether it broke), plus the sticky
 /// resync flag — threaded through [`CacheState::apply_drain_batch`] by value so an aborted bulk
 /// pass leaves the caller's copy untouched for the per-event re-run.
@@ -580,10 +593,14 @@ impl CacheState {
 
 	/// Apply one decoded event to the cache. Every branch must be idempotent (the drain may re-apply
 	/// a hole-held / crash-replayed event — see [`CacheState::drain_persisted`]).
-	fn apply_event(&mut self, event: CacheEventType<'_>) -> Result<(), Vec<CacheError>> {
+	fn apply_event(
+		&mut self,
+		event: CacheEventType<'_>,
+		trust: EventTrust,
+	) -> Result<(), Vec<CacheError>> {
 		match event {
-			CacheEventType::File(file_event) => self.handle_file_event(file_event),
-			CacheEventType::Dir(dir_event) => self.handle_dir_event(dir_event),
+			CacheEventType::File(file_event) => self.handle_file_event(file_event, trust),
+			CacheEventType::Dir(dir_event) => self.handle_dir_event(dir_event, trust),
 			CacheEventType::Global(global_event) => self.handle_global_event(global_event),
 			// Frontier-advance marker: no DB mutation; the drain still advances the watermark for it.
 			CacheEventType::NoOp => Ok(()),
@@ -696,11 +713,11 @@ impl CacheState {
 				// (apply_synthetics_direct) — this arm only consumes LEGACY rows persisted by a
 				// pre-direct-apply session. Idempotent (upsert / delete-of-missing), no
 				// watermark interaction.
-				None => self.apply_event(pe.event.event),
+				None => self.apply_event(pe.event.event, EventTrust::Checked),
 				// Already applied in a prior (possibly crashed) drain: skip, but still delete.
 				Some(id) if watermark.is_some_and(|w| id <= w) => continue,
 				Some(id) => {
-					let result = self.apply_event(pe.event.event);
+					let result = self.apply_event(pe.event.event, EventTrust::Checked);
 					if result.is_ok() {
 						// Advance the frontier ONLY along an unbroken, gap-free run from `watermark`.
 						// `checked_add` avoids a u64 overflow if a malformed id reached the store.
@@ -820,7 +837,7 @@ impl CacheState {
 		// before reaching here). An empty `per_root` means an empty config or an all-roots-deleted
 		// resync — nothing to diff, so the empty-listing guard below must not fire for it.
 		let had_listings = !per_root.is_empty();
-		let mut all_synthetics = Vec::new();
+		let mut per_root_synthetics: Vec<(Uuid, Vec<CacheEvent<'static>>)> = Vec::new();
 		let mut any_listed = false;
 		for (anchor, dirs, files) in per_root {
 			any_listed |= !dirs.is_empty() || !files.is_empty();
@@ -841,7 +858,7 @@ impl CacheState {
 			let synthetics = self
 				.compute_resync_synthetics(anchor, &dir_map, &file_map)
 				.map_err(|e| db_err(e, "computing resync diff"))?;
-			all_synthetics.extend(synthetics);
+			per_root_synthetics.push((anchor, synthetics));
 		}
 
 		// A successful-but-empty listing converges to a full subtree deletion. A transient
@@ -869,7 +886,18 @@ impl CacheState {
 			}
 		}
 
-		self.apply_synthetics_direct(all_synthetics)?;
+		// The per-anchor fast owner path is only sound when EVERY active root listed this
+		// cycle: a transiently-skipped nested root would otherwise permanently miss the
+		// notifications an ancestor's converging diff carries for its subtree (the retry diff
+		// sees already-converged rows and emits nothing). With partial coverage, fall back to
+		// exact per-event owner resolution across the board.
+		let all_roots_listed = self
+			.sync_roots
+			.keys()
+			.all(|root| per_root_synthetics.iter().any(|(anchor, _)| anchor == root));
+		for (anchor, synthetics) in per_root_synthetics {
+			self.apply_synthetics_direct(anchor, synthetics, all_roots_listed)?;
+		}
 		// The watermark jump + flag write commit LAST — strictly after every synthetic landed —
 		// so a crash anywhere above leaves the old watermark and a detectable gap (the durable
 		// flag for triggered resyncs; the startup gap-check otherwise), forcing a fresh listing.
@@ -909,9 +937,19 @@ impl CacheState {
 	/// commits the watermark AFTER all of it.
 	fn apply_synthetics_direct(
 		&mut self,
+		anchor: Uuid,
 		synthetics: Vec<CacheEvent<'static>>,
+		all_roots_listed: bool,
 	) -> Result<(), Box<CacheError>> {
 		let db_err = |e: rusqlite::Error, what: &str| Box::new(CacheError::db(e, what.to_string()));
+		// Dispatch owners, resolved ONCE per anchor instead of one ancestry CTE per event:
+		// every New/Changed/MetadataChanged synthetic's target sits inside the anchor's
+		// subtree, and nested roots are covered by their OWN per-root diff emitting the same
+		// items. Only Move/Removed/Archived need the exact per-event resolution — their
+		// OLD-position roots (a nested root the item left, a deleted nested root itself) are
+		// not derivable from the anchor — and those shapes are rare outside steady state.
+		let mut anchor_owners = Vec::new();
+		self.extend_owning_roots(anchor, &mut anchor_owners);
 		let mut events = synthetics.into_iter().peekable();
 		while events.peek().is_some() {
 			self.db
@@ -920,9 +958,21 @@ impl CacheState {
 			let mut dispatch_buffer: Vec<(Arc<CacheEvent<'static>>, Vec<Uuid>)> = Vec::new();
 			for _ in 0..crate::cache::sql::CHUNK_SIZE {
 				let Some(event) = events.next() else { break };
-				let pre_parent = self.pre_parent_snapshot(&event.event);
+				let needs_exact_owners = !all_roots_listed
+					|| matches!(
+						&event.event,
+						CacheEventType::File(
+							FileEvent::Move(_) | FileEvent::Removed(_) | FileEvent::Archived(_)
+						) | CacheEventType::Dir(DirEvent::Move(_) | DirEvent::Removed(_))
+					);
+				let pre_parent = if needs_exact_owners {
+					self.pre_parent_snapshot(&event.event)
+				} else {
+					None
+				};
 				let event_for_dispatch = Arc::new(event.clone());
-				if let Err(mut errors) = self.apply_event(event.event) {
+				if let Err(mut errors) = self.apply_event(event.event, EventTrust::TrustedSynthetic)
+				{
 					// Synthetics are our own diff output — a failure is corruption/disk-full
 					// class. Roll the chunk back, keep the durable flag SET so the retry
 					// re-lists, surface the rest, and abort with the first error (the caller
@@ -942,7 +992,11 @@ impl CacheState {
 					}
 					return Err(Box::new(first));
 				}
-				let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre_parent);
+				let owners = if needs_exact_owners {
+					self.resolve_dispatch_owners(&event_for_dispatch, pre_parent)
+				} else {
+					anchor_owners.clone()
+				};
 				if !owners.is_empty() {
 					dispatch_buffer.push((event_for_dispatch, owners));
 				}
@@ -1790,12 +1844,16 @@ impl CacheState {
 			})
 	}
 
-	fn handle_file_event(&mut self, event: FileEvent) -> Result<(), Vec<CacheError>> {
+	fn handle_file_event(
+		&mut self,
+		event: FileEvent,
+		trust: EventTrust,
+	) -> Result<(), Vec<CacheError>> {
 		match event {
 			FileEvent::New(file) | FileEvent::Changed(file) => {
 				// skip the upsert for an out-of-root file, but still advance the watermark. (A
 				// New/Changed has no prior in-root row to leave stale, unlike a Move — see below.)
-				if !self.parent_in_sync_root(file.parent)? {
+				if trust == EventTrust::Checked && !self.parent_in_sync_root(file.parent)? {
 					return Ok(());
 				}
 				self.upsert_files(once(&file)).map_err(|e| {
@@ -1810,7 +1868,7 @@ impl CacheState {
 				// OLD parent, where a later cascade-delete of that parent would wrongly remove a still-live
 				// item. delete-of-missing is a no-op if it was never cached; dispatch still notifies the
 				// old root via the pre-move parent snapshot.
-				if self.parent_in_sync_root(file.parent)? {
+				if trust == EventTrust::TrustedSynthetic || self.parent_in_sync_root(file.parent)? {
 					self.upsert_files(once(&file)).map_err(|e| {
 						// uuid only — the file payload carries the FileKey (never log key material).
 						db_err_vec(e, format!("failed to upsert moved file: {}", file.uuid))
@@ -1833,13 +1891,18 @@ impl CacheState {
 		}
 	}
 
-	fn handle_dir_event(&mut self, event: DirEvent) -> Result<(), Vec<CacheError>> {
+	fn handle_dir_event(
+		&mut self,
+		event: DirEvent,
+		trust: EventTrust,
+	) -> Result<(), Vec<CacheError>> {
 		match event {
 			DirEvent::New(dir) | DirEvent::Changed(dir) => {
 				// Skip the upsert for an out-of-root dir, but still advance the watermark. A dir that IS
 				// itself a sync root is the exception (same as the Move arm): a root whose own parent is
 				// out-of-root must still apply its own New/Changed, else its metadata goes stale.
-				if !self.sync_roots.contains_key(&dir.uuid)
+				if trust == EventTrust::Checked
+					&& !self.sync_roots.contains_key(&dir.uuid)
 					&& !self.parent_in_sync_root(dir.parent)?
 				{
 					return Ok(());
@@ -1855,7 +1918,8 @@ impl CacheState {
 				// deleted — it stays a configured root wherever it moves, so its subtree must survive. The
 				// parent gate would otherwise see its new (out-of-root) parent and wrongly wipe the whole
 				// root. (Files are never sync roots, so the file arm above needs no such check.)
-				if self.sync_roots.contains_key(&dir.uuid)
+				if trust == EventTrust::TrustedSynthetic
+					|| self.sync_roots.contains_key(&dir.uuid)
 					|| self.parent_in_sync_root(dir.parent)?
 				{
 					self.upsert_dirs(once(&dir)).map_err(|e| {
