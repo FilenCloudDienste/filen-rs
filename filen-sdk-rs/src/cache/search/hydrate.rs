@@ -222,43 +222,67 @@ fn type_filter_param(filter: &CompiledFilter) -> i64 {
 /// One window: scope + filter + order + LIMIT/OFFSET + full hydration, all in one statement.
 /// With a needle this scans the scope (substring matches cannot use an index); without one it
 /// is bounded by the scope and the window.
-pub(super) fn window_results(
+/// One window of results PLUS the pre-`LIMIT` match total, from a single scan: the window
+/// statements compute `count(*) OVER ()` on every row, so the count costs nothing on top of the
+/// sort the window already pays for. Two cases still fall back to [`count_results`] (same
+/// connection, so within a caller's transaction the totals agree): an empty requested range
+/// (no window pass to piggyback on) and an empty result page (offset past the end, or zero
+/// matches — no rows means no piggybacked total).
+pub(super) fn window_and_count(
 	conn: &Connection,
 	scope: Scope,
 	filter: &CompiledFilter,
 	range: &Range<usize>,
-) -> rusqlite::Result<Vec<SearchResult>> {
+) -> rusqlite::Result<(Vec<SearchResult>, usize)> {
 	let limit = range.end.saturating_sub(range.start).min(i64::MAX as usize) as i64;
 	let offset = range.start.min(i64::MAX as usize) as i64;
 	if limit == 0 {
-		return Ok(Vec::new());
+		return Ok((Vec::new(), count_results(conn, scope, filter)?));
 	}
 	let needle = filter.needle.as_deref().unwrap_or("");
 	let type_filter = type_filter_param(filter);
 	let case_insensitive = !filter.case_sensitive;
-	match scope {
+	let map_row = |row: &Row<'_>| Ok((row_to_result(row)?, row.get::<_, i64>("total")?));
+	let rows: rusqlite::Result<Vec<(SearchResult, i64)>> = match scope {
 		Scope::Account => conn
 			.prepare_cached(SEARCH_WINDOW_ACCOUNT)?
 			.query_map(
 				params![type_filter, needle, case_insensitive, limit, offset],
-				row_to_result,
+				map_row,
 			)?
 			.collect(),
 		Scope::Subtree(anchor) => conn
 			.prepare_cached(SEARCH_WINDOW_SUBTREE)?
 			.query_map(
 				params![anchor, type_filter, needle, case_insensitive, limit, offset],
-				row_to_result,
+				map_row,
 			)?
 			.collect(),
 		Scope::Children(parent) => conn
 			.prepare_cached(SEARCH_WINDOW_CHILDREN)?
 			.query_map(
 				params![parent, type_filter, needle, case_insensitive, limit, offset],
-				row_to_result,
+				map_row,
 			)?
 			.collect(),
-	}
+	};
+	let rows = rows?;
+	let Some(&(_, total)) = rows.first() else {
+		return Ok((Vec::new(), count_results(conn, scope, filter)?));
+	};
+	let results = rows.into_iter().map(|(result, _)| result).collect();
+	Ok((results, total.max(0) as usize))
+}
+
+/// Test-facing shim over [`window_and_count`] for assertions that only care about the page.
+#[cfg(test)]
+pub(super) fn window_results(
+	conn: &Connection,
+	scope: Scope,
+	filter: &CompiledFilter,
+	range: &Range<usize>,
+) -> rusqlite::Result<Vec<SearchResult>> {
+	window_and_count(conn, scope, filter, range).map(|(results, _)| results)
 }
 
 /// The total match count for the same scope + filter as [`window_results`].
@@ -578,6 +602,36 @@ mod tests {
 		let dirs_only = filter(&SearchConfig::new().with_item_type(SearchItemType::Dir));
 		let results = window_results(&conn, Scope::Account, &dirs_only, &(0..10)).unwrap();
 		assert_eq!(result_names(&results), vec!["sub"]);
+	}
+
+	/// `window_and_count` serves the window AND the pre-LIMIT total from one scan — and the
+	/// total must survive the pages that return no rows (offset beyond the end; an empty
+	/// requested range), where it falls back to the dedicated count.
+	#[test]
+	fn window_and_count_reports_the_total_even_for_empty_pages() {
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+		let all = filter(&SearchConfig::new());
+		let expected_total = count_results(&conn, Scope::Account, &all).unwrap();
+		assert!(expected_total >= 4, "fixture sanity");
+
+		let (page, total) = window_and_count(&conn, Scope::Account, &all, &(0..2)).unwrap();
+		assert_eq!(page.len(), 2, "a clamped page");
+		assert_eq!(total, expected_total, "piggybacked total");
+
+		let (beyond, total) = window_and_count(&conn, Scope::Account, &all, &(50..60)).unwrap();
+		assert!(beyond.is_empty());
+		assert_eq!(
+			total, expected_total,
+			"fallback total on an out-of-range page"
+		);
+
+		let (empty, total) = window_and_count(&conn, Scope::Account, &all, &(3..3)).unwrap();
+		assert!(empty.is_empty());
+		assert_eq!(
+			total, expected_total,
+			"fallback total on a zero-length range"
+		);
 	}
 
 	#[test]

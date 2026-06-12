@@ -35,7 +35,10 @@ SELECT
 	d.color,
 	d.timestamp AS dir_timestamp,
 	d.name AS dir_name,
-	d.created AS dir_created
+	d.created AS dir_created,
+	-- the pre-LIMIT match total, piggybacked on every row so one scan
+	-- serves both the window and the count (see hydrate::window_and_count)
+	count(*) OVER () AS total
 FROM items AS i
 INNER JOIN subtree AS s ON i.uuid = s.uuid
 LEFT JOIN files AS f ON i.id = f.id

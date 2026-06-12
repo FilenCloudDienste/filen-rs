@@ -304,13 +304,10 @@ impl Engine {
 		let range = range.clone();
 		let (results, total) = conn
 			.run(move |conn| {
-				// One read transaction so `results` and `total` come from the same DB state
-				// (see `refresh` for the torn-snapshot rationale).
+				// One read transaction so a fallback count (empty page) reads the same DB state
+				// as the window scan (see `refresh` for the torn-snapshot rationale).
 				let tx = conn.unchecked_transaction()?;
-				Ok((
-					hydrate::window_results(&tx, scope, &filter, &range)?,
-					hydrate::count_results(&tx, scope, &filter)?,
-				))
+				hydrate::window_and_count(&tx, scope, &filter, &range)
 			})
 			.await?;
 		Ok(SearchSnapshot {
@@ -378,14 +375,25 @@ impl Engine {
 		let batch = conn
 			.run(move |conn| {
 				let tx = conn.unchecked_transaction()?;
-				let total = hydrate::count_results(&tx, scope, &filter)?;
-				let windows = window_ranges
-					.into_iter()
-					.map(|(id, range)| {
-						let results = hydrate::window_results(&tx, scope, &filter, &range);
-						(id, results)
-					})
-					.collect::<Vec<_>>();
+				// Each window scan carries the match total for free (`count(*) OVER ()`), so a
+				// refresh costs W scans instead of W+1 — and ONE instead of two for the common
+				// single-window search. A dedicated count runs only when no window exists.
+				let mut total: Option<usize> = None;
+				let mut windows = Vec::with_capacity(window_ranges.len());
+				for (id, range) in window_ranges {
+					let results = match hydrate::window_and_count(&tx, scope, &filter, &range) {
+						Ok((results, window_total)) => {
+							total.get_or_insert(window_total);
+							Ok(results)
+						}
+						Err(e) => Err(e),
+					};
+					windows.push((id, results));
+				}
+				let total = match total {
+					Some(total) => total,
+					None => hydrate::count_results(&tx, scope, &filter)?,
+				};
 				Ok((total, windows))
 			})
 			.await;
