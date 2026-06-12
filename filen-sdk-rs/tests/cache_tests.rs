@@ -16,8 +16,8 @@ use helpers::*;
 
 #[shared_test_runtime]
 async fn test_cache_init_creates_schema() {
-	let client = test_utils::RESOURCES.client().await;
-	let cache = TestCache::new(&client).await;
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let conn = open_read_db(cache.db_path()).unwrap();
 
@@ -57,10 +57,11 @@ async fn test_cache_init_creates_schema() {
 
 #[shared_test_runtime]
 async fn test_cache_init_inserts_root() {
-	let client = test_utils::RESOURCES.client().await;
-	let cache = TestCache::new(&client).await;
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
-	let root_uuid: Uuid = client.root().uuid().into();
+	// The ACCOUNT root's row is written by init_db itself, independent of the sync scope.
+	let root_uuid: Uuid = resources.client.root().uuid().into();
 
 	let item_type = query_item_type(cache.db_path(), root_uuid);
 	assert_eq!(item_type, Some(0), "root should be type 0 (Root)");
@@ -81,7 +82,7 @@ async fn test_cache_file_new_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_new.txt", *test_dir.uuid())
@@ -112,7 +113,7 @@ async fn test_cache_file_trash_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_trash.txt", *test_dir.uuid())
@@ -138,7 +139,7 @@ async fn test_cache_multiple_file_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let mut file_uuids = Vec::new();
 
@@ -168,7 +169,7 @@ async fn test_cache_dir_new_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let dir = client
 		.create_dir(&test_dir.into(), "cache_dir_new")
@@ -194,7 +195,7 @@ async fn test_cache_dir_trash_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_trash")
@@ -220,7 +221,7 @@ async fn test_cache_file_move_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_move.txt", *test_dir.uuid())
@@ -264,7 +265,7 @@ async fn test_cache_dir_move_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let mut move_dir = client
 		.create_dir(&test_dir.into(), "cache_dir_to_move")
@@ -301,7 +302,7 @@ async fn test_cache_dir_move_via_socket() {
 #[shared_test_runtime]
 async fn test_cache_list_dir_recursive() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let dirs: Vec<RemoteDirectory> = (0..3)
@@ -345,7 +346,7 @@ async fn test_cache_list_dir_recursive() {
 #[shared_test_runtime]
 async fn test_cache_list_dir_recursive_large_batch() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let dirs: Vec<RemoteDirectory> = (0..50)
@@ -380,15 +381,15 @@ async fn test_cache_list_dir_recursive_large_batch() {
 
 #[shared_test_runtime]
 async fn test_cache_shutdown_on_drop() {
-	let client = test_utils::RESOURCES.client().await;
-	let client = derive_client(client.as_ref());
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
 	let path = temp_cache_path();
 	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
 	{
 		let _handle = client
 			.clone()
-			.add_sync_root(client.root().uuid().into(), noop_sync_root_callback())
+			.add_sync_root(resources.dir.uuid().into(), noop_sync_root_callback())
 			.await
 			.unwrap();
 	}
@@ -419,7 +420,6 @@ async fn test_cache_reopen_preserves_data() {
 	let client = derive_client(resources.client.as_ref());
 	let path = temp_cache_path();
 	let test_dir_uuid = resources.dir.uuid();
-	let account_root: Uuid = client.root().uuid().into();
 	// Configured ONCE — the config (and DB path) survives the worker stopping and respawning.
 	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
@@ -428,7 +428,7 @@ async fn test_cache_reopen_preserves_data() {
 	{
 		let handle = client
 			.clone()
-			.add_sync_root(account_root, noop_sync_root_callback())
+			.add_sync_root(test_dir_uuid.into(), noop_sync_root_callback())
 			.await
 			.unwrap();
 		ensure_socket_ready(&client).await;
@@ -443,7 +443,7 @@ async fn test_cache_reopen_preserves_data() {
 	{
 		let _handle = client
 			.clone()
-			.add_sync_root(account_root, noop_sync_root_callback())
+			.add_sync_root(test_dir_uuid.into(), noop_sync_root_callback())
 			.await
 			.unwrap();
 
@@ -470,7 +470,6 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 	let client = derive_client(resources.client.as_ref());
 	let test_dir = &resources.dir;
 	let test_dir_uuid: Uuid = test_dir.uuid().into();
-	let account_root: Uuid = client.root().uuid().into();
 	let path = temp_cache_path();
 	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
@@ -479,12 +478,12 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 	{
 		let _handle = client
 			.clone()
-			.add_sync_root(account_root, noop_sync_root_callback())
+			.add_sync_root(test_dir_uuid, noop_sync_root_callback())
 			.await
 			.unwrap();
 		assert!(
 			poll_for_item(&path, test_dir_uuid, Duration::from_secs(60)).await,
-			"startup resync should populate the cache from the account listing"
+			"the populate resync should materialize the scope root"
 		);
 	}
 	client.flush_cache().await; // clean flush + join before reopening the same DB file
@@ -502,7 +501,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 	{
 		let _handle = client
 			.clone()
-			.add_sync_root(account_root, noop_sync_root_callback())
+			.add_sync_root(test_dir_uuid, noop_sync_root_callback())
 			.await
 			.unwrap();
 		assert!(
@@ -613,7 +612,7 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 #[shared_test_runtime]
 async fn test_cache_ignores_irrelevant_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let dir = make_test_remote_dir("irrelevant_test_dir", test_dir_uuid);
@@ -644,7 +643,7 @@ async fn test_cache_full_file_lifecycle() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_lifecycle_dir")
@@ -684,7 +683,7 @@ async fn test_cache_mixed_socket_and_manual_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_mixed_socket.txt", *test_dir.uuid())
@@ -715,7 +714,7 @@ async fn test_cache_file_restore_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_restore.txt", *test_dir.uuid())
@@ -751,7 +750,7 @@ async fn test_cache_file_metadata_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_rename_old.txt", *test_dir.uuid())
@@ -789,7 +788,7 @@ async fn test_cache_file_deleted_permanently_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_perm_delete.txt", *test_dir.uuid())
@@ -827,7 +826,7 @@ async fn test_cache_dir_restore_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_restore")
@@ -863,7 +862,7 @@ async fn test_cache_dir_metadata_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_rename_old")
@@ -898,7 +897,7 @@ async fn test_cache_dir_color_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_color")
@@ -927,7 +926,7 @@ async fn test_cache_dir_deleted_permanently_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_perm_delete")
@@ -961,7 +960,7 @@ async fn test_cache_item_favorite_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_favorite.txt", *test_dir.uuid())
@@ -987,7 +986,7 @@ async fn test_cache_file_archived_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client).await;
+	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
 
 	let file = client
 		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
@@ -1025,7 +1024,7 @@ async fn test_cache_file_archived_via_socket() {
 #[shared_test_runtime]
 async fn test_cache_error_on_file_with_encrypted_meta() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let bad_file = make_test_remote_file_encrypted_meta(test_dir_uuid);
@@ -1062,7 +1061,7 @@ async fn test_cache_error_on_file_with_encrypted_meta() {
 #[shared_test_runtime]
 async fn test_cache_error_on_dir_with_encrypted_meta() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let bad_dir = make_test_remote_dir_encrypted_meta(test_dir_uuid);
@@ -1099,7 +1098,7 @@ async fn test_cache_error_on_dir_with_encrypted_meta() {
 #[shared_test_runtime]
 async fn test_cache_error_on_file_with_non_uuid_parent() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let bad_file = make_test_remote_file_bad_parent("trashed_file.txt");
 	let bad_file_uuid: Uuid = bad_file.uuid().into();
@@ -1130,7 +1129,7 @@ async fn test_cache_error_on_file_with_non_uuid_parent() {
 #[shared_test_runtime]
 async fn test_cache_error_on_dir_with_non_uuid_parent() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	let bad_dir = make_test_remote_dir_bad_parent("trashed_dir");
 	let bad_dir_uuid: Uuid = bad_dir.uuid().into();
@@ -1161,7 +1160,7 @@ async fn test_cache_error_on_dir_with_non_uuid_parent() {
 #[shared_test_runtime]
 async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	// Two good dirs, two bad dirs (one encrypted, one bad parent)
@@ -1238,8 +1237,8 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 /// each event: a tight loop).
 #[shared_test_runtime]
 async fn test_add_sync_root_rejects_invalid_uuid() {
-	let client = test_utils::RESOURCES.client().await;
-	let cache = TestCache::new(&client).await;
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
 
 	// A random uuid that does not correspond to any directory on the account.
 	let bogus = Uuid::new_v4();
@@ -1339,11 +1338,18 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 
 #[shared_test_runtime]
 async fn test_cache_resync_reports_progress() {
-	let client = test_utils::RESOURCES.client().await;
-	let cache = TestCache::new(&client).await;
-	let root: Uuid = cache.client.root().uuid().into();
+	let resources = test_utils::RESOURCES.get_resources().await;
+	// Seed the scope dir BEFORE the cache exists so the populate listing is non-empty (the
+	// Listing assertion below wants bytes_downloaded > 0).
+	resources
+		.client
+		.create_dir(&(&resources.dir).into(), "progress_seed")
+		.await
+		.unwrap();
+	let root: Uuid = resources.dir.uuid().into();
+	let cache = TestCache::new(&resources.client, root).await;
 
-	// `TestCache::new` registered the account root as a NEW sync root, which triggers exactly
+	// `TestCache::new` registered the test dir as a NEW sync root, which triggers exactly
 	// the convergence resync whose progress we expect: `Started` carrying the root, byte
 	// `Listing` tick(s) for it (the download layer guarantees a final tick per listing on
 	// native), `Applying`, and `Finished { converged: true }` (transient failures retry and

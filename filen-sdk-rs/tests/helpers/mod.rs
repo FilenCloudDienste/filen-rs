@@ -15,7 +15,6 @@ use filen_sdk_rs::{
 	auth::Client,
 	crypto::file::FileKey,
 	fs::{
-		HasUUID,
 		dir::meta::{DecryptedDirectoryMeta, DirectoryMeta},
 		file::meta::{DecryptedFileMeta, FileMeta},
 	},
@@ -378,7 +377,10 @@ pub async fn ensure_socket_ready(client: &Client) {
 pub type MessageLog = std::sync::Arc<Mutex<Vec<CacheMessage>>>;
 
 /// A test cache: a DERIVED private client (its own cache slot, configured onto a unique temp DB)
-/// syncing the WHOLE account via a single no-op sync-root handle.
+/// syncing `scope_root` — pass the test's own directory, NEVER the account root: the shared test
+/// account accumulates data (multi-100k-item perf trees included), and a whole-account populate
+/// listing serializes every parallel test behind the drive lock for its multi-second duration.
+/// Scoping keeps the resync account-size-independent.
 pub struct TestCache {
 	path: PathBuf,
 	pub client: Arc<Client>,
@@ -387,7 +389,7 @@ pub struct TestCache {
 }
 
 impl TestCache {
-	pub async fn new(base: &Arc<Client>) -> Self {
+	pub async fn new(base: &Arc<Client>, scope_root: Uuid) -> Self {
 		let client = derive_client(base.as_ref());
 		let path = temp_cache_path();
 		let messages: MessageLog = Arc::new(Mutex::new(Vec::new()));
@@ -401,12 +403,23 @@ impl TestCache {
 			})
 			.await
 			.unwrap();
-		let root: Uuid = client.root().uuid().into();
-		let handle = client
-			.clone()
-			.add_sync_root(root, noop_sync_root_callback())
-			.await
-			.unwrap();
+		// A freshly-created scope dir can hit server propagation lag on the validating
+		// `get_dir` — retry rather than flaking (the rejection is otherwise definitive).
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+		let handle = loop {
+			match client
+				.clone()
+				.add_sync_root(scope_root, noop_sync_root_callback())
+				.await
+			{
+				Ok(handle) => break handle,
+				Err(e) if tokio::time::Instant::now() < deadline => {
+					eprintln!("add_sync_root({scope_root}) not accepted yet ({e}); retrying");
+					tokio::time::sleep(Duration::from_millis(1000)).await;
+				}
+				Err(e) => panic!("add_sync_root({scope_root}) kept failing: {e:?}"),
+			}
+		};
 		ensure_socket_ready(&client).await;
 		Self {
 			path,
