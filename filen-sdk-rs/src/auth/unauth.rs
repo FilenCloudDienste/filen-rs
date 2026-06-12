@@ -180,12 +180,91 @@ impl UnauthClient {
 			}
 		};
 
+		finish_login(
+			email,
+			info_response.auth_version,
+			client,
+			auth_info,
+			private_key,
+			public_key,
+		)
+		.await
+	}
+
+	/// Authenticate with an EXISTING API key in place of the `/v3/login` call — no 2FA code is
+	/// ever needed (2FA only guards `/v3/login`; every key this needs is recoverable from the
+	/// API key plus the password-derived key). The account must have completed at least one
+	/// regular login (so its key pair — and for v3 accounts the DEK — is stored server-side).
+	pub async fn login_with_api_key(
+		&self,
+		email: String,
+		pwd: &str,
+		api_key: String,
+	) -> Result<Client, Error> {
+		let info_response = api::v3::auth::info::post(
+			self,
+			&api::v3::auth::info::Request {
+				email: Cow::Borrowed(&email),
+			},
+		)
+		.await?;
+
+		let client = AuthClient::from_unauthed(
+			self.clone(),
+			Arc::new(std::sync::RwLock::new(filen_types::auth::APIKey(
+				Cow::Owned(api_key),
+			))),
+		);
+
+		let auth_info = match info_response.auth_version {
+			AuthVersion::V1 => {
+				return Err(Error::custom(
+					crate::ErrorKind::Conversion,
+					"api-key login is not supported for v1 accounts",
+				));
+			}
+			AuthVersion::V2 => v2::auth_info_with_api_key(pwd, &info_response, &client).await?,
+			AuthVersion::V3 => v3::auth_info_with_api_key(pwd, &info_response, &client).await?,
+		};
+
+		let key_pair = api::v3::user::key_pair::info::get(&client).await?;
+		let (Some(public_key), Some(private_key)) = (key_pair.public_key, key_pair.private_key)
+		else {
+			return Err(Error::custom(
+				crate::ErrorKind::Response,
+				"account has no stored key pair; complete a regular login once",
+			));
+		};
+
+		finish_login(
+			email,
+			info_response.auth_version,
+			client,
+			auth_info,
+			private_key,
+			public_key.0.into_owned(),
+		)
+		.await
+	}
+}
+
+/// The version-independent tail of every login flow: resolve the key pair, fetch the account's
+/// root + user info, and assemble the [`Client`].
+async fn finish_login(
+	email: String,
+	auth_version: AuthVersion,
+	client: AuthClient,
+	auth_info: crate::auth::AuthInfo,
+	private_key: filen_types::crypto::rsa::EncryptedPrivateKey<'static>,
+	public_key: rsa::RsaPublicKey,
+) -> Result<Client, Error> {
+	{
 		let (private_key, public_key, hmac) =
 			crypto::rsa::get_key_pair(public_key, &private_key, &auth_info).await?;
 		let base_folder_uuid = api::v3::user::base_folder::get(&client).await?.uuid;
 		let root_dir = RootDirectory::new(base_folder_uuid);
 
-		let (file_encryption_version, meta_encryption_version) = match &info_response.auth_version {
+		let (file_encryption_version, meta_encryption_version) = match &auth_version {
 			AuthVersion::V1 | AuthVersion::V2 => {
 				(V2FILE_ENCRYPTION_VERSION, V2META_ENCRYPTION_VERSION)
 			}
@@ -224,7 +303,9 @@ impl UnauthClient {
 			avatar_url: RwLock::new(None),
 		})
 	}
+}
 
+impl UnauthClient {
 	pub async fn complete_password_reset(
 		&self,
 		token: &str,

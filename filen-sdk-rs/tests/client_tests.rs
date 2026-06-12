@@ -31,6 +31,20 @@ async fn test_login() {
 }
 
 #[shared_test_runtime]
+async fn test_login_with_api_key() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let stringified = client.to_stringified();
+	let (_, password, _) = test_utils::RESOURCES.get_credentials();
+	let relogged = client
+		.get_unauthed()
+		.login_with_api_key(stringified.email.clone(), &password, stringified.api_key)
+		.await
+		.expect("login_with_api_key failed");
+	assert_eq!(relogged, **client);
+}
+
+#[shared_test_runtime]
 async fn test_stringification() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

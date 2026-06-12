@@ -1,6 +1,7 @@
 pub mod account;
 pub mod avatar;
 pub mod base_folder;
+pub mod dek;
 pub mod delete;
 pub mod did_export_master_keys;
 pub mod event;

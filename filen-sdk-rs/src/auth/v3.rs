@@ -95,6 +95,30 @@ pub(super) async fn login(
 	))
 }
 
+/// Recover the v3 [`AuthInfo`] with an existing API key instead of a `/v3/login` call (so no
+/// 2FA code is needed): the DEK comes from `/v3/user/dek`, decryptable with the
+/// password-derived KEK alone.
+pub(super) async fn auth_info_with_api_key(
+	pwd: &str,
+	info: &api::v3::auth::info::Response<'_>,
+	auth_client: &super::http::AuthClient,
+) -> Result<super::AuthInfo, Error> {
+	let (kek, _pwd) = crate::crypto::v3::derive_password_and_kek(
+		pwd.as_bytes(),
+		&SizedHexString::new_from_hex_str(&info.salt)
+			.map_err(ConversionError::HexDecodeError)
+			.context(format!("salt into SizedHexString: {}", info.salt))?,
+	)?;
+	let response = api::v3::user::dek::get(auth_client).await?;
+	let dek_str = response.dek.ok_or(Error::custom(
+		ErrorKind::Response,
+		"account has no DEK set; complete a regular login once",
+	))?;
+	let dek_str = kek.decrypt_meta(&dek_str.0).await?;
+	let dek = EncryptionKey::from_str(&dek_str)?;
+	Ok(super::AuthInfo::V3(AuthInfo { dek }))
+}
+
 pub(super) fn hash_name(name: &str, hmac_key: &HMACKey) -> SizedHexString<U32> {
 	hmac_key.hash_to_string(name.to_lowercase().as_bytes())
 }

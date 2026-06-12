@@ -26,6 +26,10 @@ cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
 name = "cache_tests"
 required-features = ["cache"]
 
+[[example]]
+name = "cache_search_bench"
+required-features = ["cache"]
+
 [[test]]
 name = "cache_search_tests"
 required-features = ["cache"]

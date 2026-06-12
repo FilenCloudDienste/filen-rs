@@ -1,6 +1,7 @@
 pub(crate) mod account;
 pub(crate) mod avatar;
 pub(crate) mod base_folder;
+pub(crate) mod dek;
 pub(crate) mod delete;
 pub(crate) mod did_export_master_keys;
 pub(crate) mod event;
