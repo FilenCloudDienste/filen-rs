@@ -24,7 +24,7 @@ mod statements;
 // Per-transaction batch size for `execute_chunked`: large enough to amortise the per-commit (WAL
 // fsync) overhead, small enough that one chunk is not a giant long-held write transaction on mobile
 // storage.
-const CHUNK_SIZE: usize = 10_000;
+pub(crate) const CHUNK_SIZE: usize = 10_000;
 
 impl CacheState {
 	/// Run `for_chunk` over `items` in `CHUNK_SIZE` batches, each batch in its OWN transaction (so a huge

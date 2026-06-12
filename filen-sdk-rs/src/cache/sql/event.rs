@@ -301,9 +301,12 @@ impl CacheState {
 	/// used when the resync that produced these synthetics also SKIPPED at least one root
 	/// transiently — the watermark still advances for the roots that did converge, while a durable
 	/// retry stays scheduled for the one(s) that did not.
-	pub(crate) fn commit_resync_synthetics(
+	/// The resync's FINAL commit: jump the watermark to the locked snapshot id and clear (or,
+	/// for a partial resync, keep) the `needs_resync` flag — atomically, and strictly AFTER the
+	/// synthetics were applied (see `apply_synthetics_direct`). A crash before this leaves the
+	/// old watermark and the durable flag/startup gap-check to force a fresh listing.
+	pub(crate) fn commit_resync_watermark(
 		&mut self,
-		synthetics: &[CacheEvent<'_>],
 		remote_under_lock: u64,
 		mark_resync: bool,
 	) -> Result<(), Box<CacheError>> {
@@ -311,21 +314,6 @@ impl CacheState {
 			.db
 			.transaction()
 			.map_err(|e| db_err(e, "begin resync-commit transaction"))?;
-		{
-			let mut stmt = tx
-				.prepare_cached(super::statements::EVENT_INSERT)
-				.map_err(|e| db_err(e, "preparing resync synthetic insert"))?;
-			for event in synthetics {
-				debug_assert!(
-					event.id.is_none(),
-					"resync synthetics must carry id = None (NULL drive_message_id)"
-				);
-				let payload =
-					serialize(event).map_err(|e| Box::new(CacheError::serialization(e)))?;
-				stmt.execute(params![Option::<i64>::None, true, payload])
-					.map_err(|e| db_err(e, "inserting resync synthetic"))?;
-			}
-		}
 		tx.execute(
 			super::statements::CACHE_META_SET,
 			params![super::statements::WATERMARK_KEY, remote_under_lock as i64],
@@ -647,59 +635,31 @@ mod tests {
 	/// The resync commit persists every synthetic (NULL drive_message_id), advances the watermark to
 	/// the snapshot id, and clears `needs_resync` — all atomically.
 	#[test]
-	fn commit_resync_synthetics_persists_synthetics_watermark_and_clears_flag() {
+	fn commit_resync_watermark_advances_watermark_and_clears_flag() {
 		let mut state = CacheState::new_in_memory();
 		state.mark_needs_resync().unwrap();
 
-		let synthetics = vec![
-			ev(None, CacheEventType::Dir(DirEvent::New(cacheable_dir()))),
-			ev(
-				None,
-				CacheEventType::File(FileEvent::Removed(Uuid::from_u128(7))),
-			),
-		];
-		state
-			.commit_resync_synthetics(&synthetics, 99, false)
-			.unwrap();
+		state.commit_resync_watermark(99, false).unwrap();
 
-		// Both rows landed as synthetics (NULL id) and read back in insertion order.
-		let (count, synth_count): (i64, i64) = state
-			.db
-			.query_row(
-				"SELECT COUNT(*), COALESCE(SUM(synthetic), 0) FROM events",
-				[],
-				|row| Ok((row.get(0)?, row.get(1)?)),
-			)
-			.unwrap();
-		assert_eq!(count, 2);
-		assert_eq!(synth_count, 2, "both rows are synthetic");
-
-		let (batch, corrupt) = state.load_event_batch(10).unwrap();
-		assert!(corrupt.is_empty());
-		assert_eq!(batch.len(), 2);
-		assert!(batch.iter().all(|pe| pe.id.is_none()));
-		assert_eq!(
-			format!("{:?}", batch[0].event),
-			format!("{:?}", synthetics[0])
-		);
-		assert_eq!(
-			format!("{:?}", batch[1].event),
-			format!("{:?}", synthetics[1])
-		);
-
-		// Watermark advanced to the snapshot id; resync flag cleared.
+		// Watermark advanced to the snapshot id; resync flag cleared — atomically, with no
+		// events-store traffic (synthetics apply directly from RAM now).
 		assert_eq!(state.watermark().unwrap(), Some(99));
 		assert!(!state.needs_resync().unwrap());
+		let events_rows: i64 = state
+			.db
+			.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(events_rows, 0, "the commit never touches the events store");
 	}
 
 	/// `mark_resync = true` (a resync that transiently skipped a root) still advances the
 	/// watermark for the converged roots but leaves the durable retry flag SET, atomically.
 	#[test]
-	fn commit_resync_synthetics_with_mark_resync_keeps_the_flag_set() {
+	fn commit_resync_watermark_with_mark_resync_keeps_the_flag_set() {
 		let mut state = CacheState::new_in_memory();
 		assert!(!state.needs_resync().unwrap());
 
-		state.commit_resync_synthetics(&[], 42, true).unwrap();
+		state.commit_resync_watermark(42, true).unwrap();
 
 		assert_eq!(state.watermark().unwrap(), Some(42), "progress committed");
 		assert!(

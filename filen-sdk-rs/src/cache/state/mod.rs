@@ -692,9 +692,10 @@ impl CacheState {
 			let pre_parent = self.pre_parent_snapshot(&pe.event.event);
 			let event_for_dispatch = Arc::new(pe.event.clone());
 			let apply_result = match pe.id {
-				// Synthetic diff events (from the resync diff) always apply (no watermark
-				// interaction); every synthetic is idempotent (New/Move/Changed = upsert,
-				// Removed = delete-of-missing), so a crash-window re-apply is safe.
+				// id = None: a synthetic diff event. Resyncs now apply synthetics directly
+				// (apply_synthetics_direct) — this arm only consumes LEGACY rows persisted by a
+				// pre-direct-apply session. Idempotent (upsert / delete-of-missing), no
+				// watermark interaction.
 				None => self.apply_event(pe.event.event),
 				// Already applied in a prior (possibly crashed) drain: skip, but still delete.
 				Some(id) if watermark.is_some_and(|w| id <= w) => continue,
@@ -786,11 +787,14 @@ impl CacheState {
 	/// and compute its diff synthetics (anchored at that root); then atomically persist ALL roots'
 	/// synthetics with the advanced watermark + cleared `needs_resync`, and drain so they apply.
 	///
-	/// The whole thing is crash-idempotent: synthetics are upserts / delete-of-missing, and the
-	/// watermark + flag commit atomically with the synthetic rows (see [`commit_resync_synthetics`]).
-	/// All roots commit TOGETHER (not per-root) so a crash mid-loop cannot clear `needs_resync` after one
-	/// root and leave another un-converged. If the post-commit drain observes a *fresh* gap (a real
-	/// buffered event above the snapshot id), `needs_resync` is re-set so the next worker cycle resyncs.
+	/// The whole thing is crash-safe by re-listing: synthetics are idempotent upserts /
+	/// delete-of-missing applied directly from RAM (see [`apply_synthetics_direct`]), and the
+	/// watermark + flag commit LAST — so a crash mid-apply leaves the old watermark and the
+	/// durable flag (or the startup gap-check) to force a fresh listing. All roots' synthetics
+	/// apply before the ONE watermark commit, so a crash cannot clear `needs_resync` for a
+	/// half-converged root set. If the post-commit drain observes a *fresh* gap (a real
+	/// buffered event above the snapshot id), `needs_resync` is re-set so the next worker cycle
+	/// resyncs.
 	///
 	/// `mark_resync` keeps the durable `needs_resync` flag SET in the commit (instead of clearing
 	/// it) — passed when the listing pass skipped at least one root transiently, so the skipped
@@ -865,12 +869,16 @@ impl CacheState {
 			}
 		}
 
-		self.commit_resync_synthetics(&all_synthetics, remote_under_lock, mark_resync)?;
+		self.apply_synthetics_direct(all_synthetics)?;
+		// The watermark jump + flag write commit LAST — strictly after every synthetic landed —
+		// so a crash anywhere above leaves the old watermark and a detectable gap (the durable
+		// flag for triggered resyncs; the startup gap-check otherwise), forcing a fresh listing.
+		self.commit_resync_watermark(remote_under_lock, mark_resync)?;
 
-		// Apply the synthetics. If the drain observes a FRESH hole (a real buffered event above the
-		// snapshot id broke the frontier), `commit_drain_batch` re-sets `needs_resync` atomically — even
-		// though `commit_resync_synthetics` just cleared it — so the next worker cycle resyncs again
-		// (no separate best-effort re-mark to lose).
+		// Drain any REAL events persisted before or during the resync. If the drain observes a
+		// FRESH hole (a buffered event above the snapshot id broke the frontier),
+		// `commit_drain_batch` re-sets `needs_resync` atomically — even though the commit above
+		// just cleared it — so the next worker cycle resyncs again.
 		self.drain_persisted()?;
 
 		// Best-effort: fold the apply burst's WAL back into the main DB now, while we are idle
@@ -883,6 +891,67 @@ impl CacheState {
 			.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
 		{
 			log::debug!("post-resync wal_checkpoint failed (non-fatal): {e}");
+		}
+		Ok(())
+	}
+
+	/// Apply resync synthetics DIRECTLY from RAM — no durable events-store round-trip. The old
+	/// path rkyv-serialized every synthetic into `events`, read them back in batches, applied,
+	/// and deleted them again: pure overhead at populate scale, buying only crash-resume from
+	/// the store — which the listing makes redundant, since synthetics are idempotent and the
+	/// durable flag/startup gap-check re-derive them from a FRESH listing after a crash
+	/// (recovery costs a re-download instead of a local replay; an accepted trade).
+	///
+	/// Applies run in [`crate::cache::sql::CHUNK_SIZE`]-sized transactions IN EMISSION ORDER —
+	/// the diff's creates/moves → deletes → changes ordering is load-bearing (a descendant
+	/// moving out of a same-resync-deleted dir must re-land before the cascade delete). Each
+	/// chunk dispatches to the sync-root callbacks post-commit, like the drain. The caller
+	/// commits the watermark AFTER all of it.
+	fn apply_synthetics_direct(
+		&mut self,
+		synthetics: Vec<CacheEvent<'static>>,
+	) -> Result<(), Box<CacheError>> {
+		let db_err = |e: rusqlite::Error, what: &str| Box::new(CacheError::db(e, what.to_string()));
+		let mut events = synthetics.into_iter().peekable();
+		while events.peek().is_some() {
+			self.db
+				.execute_batch("BEGIN")
+				.map_err(|e| db_err(e, "begin synthetic apply chunk"))?;
+			let mut dispatch_buffer: Vec<(Arc<CacheEvent<'static>>, Vec<Uuid>)> = Vec::new();
+			for _ in 0..crate::cache::sql::CHUNK_SIZE {
+				let Some(event) = events.next() else { break };
+				let pre_parent = self.pre_parent_snapshot(&event.event);
+				let event_for_dispatch = Arc::new(event.clone());
+				if let Err(mut errors) = self.apply_event(event.event) {
+					// Synthetics are our own diff output — a failure is corruption/disk-full
+					// class. Roll the chunk back, keep the durable flag SET so the retry
+					// re-lists, surface the rest, and abort with the first error (the caller
+					// must NOT advance the watermark).
+					let _ = self.db.execute_batch("ROLLBACK");
+					let first = if errors.is_empty() {
+						CacheError::db(
+							rusqlite::Error::QueryReturnedNoRows,
+							"synthetic apply failed without error detail".to_string(),
+						)
+					} else {
+						errors.swap_remove(0)
+					};
+					self.surface_errors(errors);
+					if let Err(e) = self.mark_needs_resync() {
+						self.surface_errors(vec![*e]);
+					}
+					return Err(Box::new(first));
+				}
+				let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre_parent);
+				if !owners.is_empty() {
+					dispatch_buffer.push((event_for_dispatch, owners));
+				}
+			}
+			self.db.execute_batch("COMMIT").map_err(|e| {
+				let _ = self.db.execute_batch("ROLLBACK");
+				db_err(e, "commit synthetic apply chunk")
+			})?;
+			self.dispatch_batch(dispatch_buffer);
 		}
 		Ok(())
 	}
