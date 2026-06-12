@@ -164,6 +164,9 @@ pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> 
 		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
 	)?;
 	conn.busy_timeout(Duration::from_millis(5000))?;
+	// Scan-heavy reader: give it the same page-cache/mmap budget as the worker connection (a
+	// subtree query touches most of a ~100MB DB at scale; the 2MB default thrashes).
+	conn.execute_batch("PRAGMA cache_size = -32768; PRAGMA mmap_size = 268435456;")?;
 	register_name_matches(&conn)?;
 	Ok(conn)
 }

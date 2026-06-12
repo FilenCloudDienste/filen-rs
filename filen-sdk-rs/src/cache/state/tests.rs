@@ -1597,6 +1597,37 @@ fn route_thread_event_sheds_at_cap() {
 	);
 }
 
+/// the per-connection PRAGMAs apply on every open — including a REOPEN, where the version check
+/// skips INIT — since none of them persist in the DB file.
+#[test]
+fn init_db_applies_per_connection_pragmas_on_reopen() {
+	let dir = std::env::temp_dir().join(format!("filen-cache-pragma-{}", Uuid::new_v4()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let path = dir.join("cache.db");
+	let root = Uuid::new_v4();
+	drop(CacheState::new_on_path(&path, root)); // first open: full INIT
+	let state = CacheState::new_on_path(&path, root); // reopen: INIT skipped
+
+	let synchronous: i64 = state
+		.db
+		.query_row("PRAGMA synchronous", [], |row| row.get(0))
+		.unwrap();
+	assert_eq!(synchronous, 1, "synchronous = NORMAL on every open");
+	let cache_size: i64 = state
+		.db
+		.query_row("PRAGMA cache_size", [], |row| row.get(0))
+		.unwrap();
+	assert_eq!(cache_size, -32768, "page-cache budget on every open");
+	let mmap_size: i64 = state
+		.db
+		.query_row("PRAGMA mmap_size", [], |row| row.get(0))
+		.unwrap();
+	assert_eq!(mmap_size, 268_435_456, "mmap budget on every open");
+
+	drop(state);
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// a failing apply aborts the batched fast path WITHOUT surfacing errors, and the per-event
 /// fallback re-runs the same rows with the pre-batching semantics: the poison event is
 /// quarantined (consumed, no torn item/file row pair), the good event still applies, a resync

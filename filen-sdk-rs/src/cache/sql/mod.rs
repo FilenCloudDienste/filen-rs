@@ -180,10 +180,20 @@ impl CacheState {
 		// keeps the resync staging TEMP table in RAM; `busy_timeout` retries a transient `SQLITE_BUSY`
 		// instead of surfacing it as a mis-quarantined poison event in the drain. (`journal_mode=WAL`
 		// DOES persist in the file header, so it stays in `INIT`.)
+		//
+		// `synchronous=NORMAL` is the canonical WAL pairing (fsync per checkpoint, not per
+		// commit — the bundled SQLite defaults to FULL, which dominated bulk-apply cost). Safe
+		// here: WAL guarantees the DB stays CONSISTENT across power loss either way, and since
+		// the watermark/needs_resync commit only after the rows they describe, rolling back to
+		// an earlier consistent state just re-applies or re-lists — the cache is
+		// server-reconstructible by design. `cache_size`/`mmap_size` size the page cache for a
+		// ~100MB+ working set at scale (mmap is plain page-cache-backed reads — cheap on mobile;
+		// the wasm in-memory VFS ignores both, harmlessly).
 		self.db
 			.busy_timeout(std::time::Duration::from_millis(5000))?;
 		self.db.execute_batch(
-			"PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON; PRAGMA temp_store = MEMORY;",
+			"PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON; PRAGMA temp_store = MEMORY; \
+			 PRAGMA synchronous = NORMAL; PRAGMA cache_size = -32768; PRAGMA mmap_size = 268435456;",
 		)?;
 
 		let version: i64 = self
