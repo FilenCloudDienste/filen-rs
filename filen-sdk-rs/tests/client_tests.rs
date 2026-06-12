@@ -100,6 +100,11 @@ async fn test_wrong_password() {
 	let client = test_utils::RESOURCES.client().await;
 	let unauthed = client.get_unauthed();
 
+	// `test_2fa` temporarily enables 2FA on the shared account under the auth lock; a wrong
+	// password while 2FA is on reports Enter2fa instead of EmailOrPasswordWrong (the server
+	// checks the challenge first). Hold the same lock so the two never overlap.
+	let _lock = client.lock_auth().await.unwrap();
+
 	let (email, _, _) = test_utils::RESOURCES.get_credentials();
 	let err = unauthed
 		.login(email, "wrongpassword", "XXXXXX")

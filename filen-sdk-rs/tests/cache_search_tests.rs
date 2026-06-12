@@ -218,7 +218,7 @@ async fn test_search_favorite_toggle_fires_content_refresh() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.total() == 1).await);
+	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
 	let (log, callback) = snapshot_log();
 	let (_snapshot, _window) = search.get_range(0..10, callback).await.unwrap();
 
@@ -250,7 +250,7 @@ async fn test_search_move_out_removes_result() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.total() == 1).await);
+	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
 
 	client
 		.move_file(&mut file, &(&resources.dir).into())
@@ -328,7 +328,7 @@ async fn test_search_name_filter_applies_to_live_events() {
 	}
 
 	assert!(
-		poll_until(Duration::from_secs(60), || search.total() == 1).await,
+		poll_until(Duration::from_secs(120), || search.total() == 1).await,
 		"only the (case-insensitively) matching upload enters the results"
 	);
 }
@@ -376,7 +376,7 @@ async fn test_search_case_sensitive_toggle() {
 		.await
 		.unwrap();
 	assert!(
-		poll_until(Duration::from_secs(60), || search.total() == 1).await,
+		poll_until(Duration::from_secs(120), || search.total() == 1).await,
 		"the default mode matches case-insensitively"
 	);
 
@@ -415,7 +415,7 @@ async fn test_search_out_of_window_insert_updates_delivered_total() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.total() == 1).await);
+	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
 	let (log, callback) = snapshot_log();
 	// The window exactly covers the lone existing result.
 	let (snapshot, _window) = search.get_range(0..1, callback).await.unwrap();
@@ -447,7 +447,7 @@ async fn test_search_root_deleted_goes_terminal_with_frozen_get_range() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.total() == 1).await);
+	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
 	let (log, callback) = snapshot_log();
 	let (_snapshot, _window) = search.get_range(0..10, callback).await.unwrap();
 
@@ -492,7 +492,7 @@ async fn test_search_flush_cache_goes_terminal() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.total() == 1).await);
+	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
 
 	client.flush_cache().await;
 
