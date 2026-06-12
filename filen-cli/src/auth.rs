@@ -141,24 +141,22 @@ async fn login_and_optionally_prompt_two_factor_code(
 	{
 		Ok(client) => Ok(client),
 		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
-			Ok((ResponseError::ApiError { code, .. }, _)) => {
-				if code.as_deref() == Some("enter_2fa") {
-					let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
-					unauth_client
-						.login(email, password, two_factor_code.trim())
-						.await
-						.context("Failed to log in (with 2fa code)")
-				} else if code.as_deref() == Some("email_or_password_wrong") {
-					Err(UI::failure("Email or password wrong"))
-				} else {
-					Err(anyhow::anyhow!(
-						"Failed to log in (code {})",
-						code.as_deref().unwrap_or("")
-					))
-				}
-			}
+			Ok((ResponseError::ApiError { code, .. }, _)) => Err(anyhow::anyhow!(
+				"Failed to log in (code {})",
+				code.as_deref().unwrap_or("")
+			)),
 			Err(e) => Err(anyhow!(e)).context("Failed to log in"),
 		},
+		Err(e) if e.kind() == ErrorKind::Enter2fa => {
+			let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
+			unauth_client
+				.login(email, password, two_factor_code.trim())
+				.await
+				.context("Failed to log in (with 2fa code)")
+		}
+		Err(e) if e.kind() == ErrorKind::EmailOrPasswordWrong => {
+			Err(UI::failure("Email or password wrong"))
+		}
 		Err(e) => Err(anyhow!(e)).context("Failed to log in"),
 	}
 }
