@@ -36,8 +36,19 @@ use crate::cache::{
 	CacheError,
 	handle::{CacheMessage, ResyncProgress},
 	search::ReadTask,
+	sql::PersistedEvent,
 };
 const BATCH_SIZE: usize = 256;
+
+/// The drain's cross-batch state: the gap-free frontier (and whether it broke), plus the sticky
+/// resync flag — threaded through [`CacheState::apply_drain_batch`] by value so an aborted bulk
+/// pass leaves the caller's copy untouched for the per-event re-run.
+#[derive(Clone, Copy)]
+struct DrainCursor {
+	frontier: Option<u64>,
+	frontier_broken: bool,
+	resync_needed: bool,
+}
 /// Bounded-memory backstop: when the worker cannot drain fast enough and the channel reaches this
 /// many buffered events, the socket router SHEDS further events and latches a `shed` flag; the
 /// worker then records a durable resync — so a shed costs a resync, never a silent loss.
@@ -596,7 +607,6 @@ impl CacheState {
 	/// - The single-step frontier advance (`id == frontier + 1`) is correct ONLY because
 	///   `load_event_batch` returns `ORDER BY synthetic DESC, drive_message_id ASC, seq ASC`.
 	fn drain_persisted(&mut self) -> Result<bool, Box<CacheError>> {
-		let mut resync_needed = false;
 		// Read the persisted watermark ONCE. Within a single drain, ids arrive strictly ascending and
 		// unique (the `ORDER BY drive_message_id ASC` + the partial unique index), so the dedup gate
 		// can only ever fire for an id already applied in a PRIOR (possibly crashed) drain — i.e.
@@ -607,102 +617,167 @@ impl CacheState {
 		// failed apply, or a corrupt row — it stays broken for the rest of this drain (`frontier_broken`)
 		// so no later id can free-seed or jump the watermark past the lost id (a `None` frontier
 		// would otherwise accept ANY later id as "contiguous").
-		let mut frontier = watermark;
-		let mut frontier_broken = false;
+		let mut cursor = DrainCursor {
+			frontier: watermark,
+			frontier_broken: false,
+			resync_needed: false,
+		};
 
 		loop {
 			let (batch, corrupt_seqs) = self.load_event_batch(BATCH_SIZE)?;
 			if batch.is_empty() && corrupt_seqs.is_empty() {
 				break;
 			}
-			if !corrupt_seqs.is_empty() {
-				// A corrupt row is a lost event of (conservatively) unknown id — break the prefix and
-				// force a resync rather than risk advancing the watermark past it.
-				resync_needed = true;
-				frontier_broken = true;
-			}
-
-			let frontier_before = frontier;
-			let mut to_delete = corrupt_seqs; // corrupt rows are quarantined (deleted) with this batch
-			// Per-root dispatch: collect (applied event, owning roots) for delivery AFTER commit.
-			// The event is held in an `Arc` so fan-out to multiple owning roots shares one allocation
-			// instead of deep-cloning the (string-heavy) payload per root.
-			let mut dispatch_buffer: Vec<(Arc<CacheEvent<'static>>, Vec<Uuid>)> = Vec::new();
-
-			for pe in batch {
-				to_delete.push(pe.seq);
-				// snapshot the pre-delete/pre-move parent BEFORE applying, and keep a clone of the
-				// event for the post-commit callback (the original's payload is moved into `apply_event`).
-				let pre_parent = self.pre_parent_snapshot(&pe.event.event);
-				let event_for_dispatch = Arc::new(pe.event.clone());
-				let apply_result = match pe.id {
-					// Synthetic diff events (from the resync diff) always apply (no watermark interaction).
-					// The apply commits in its own tx, separate from the
-					// batched watermark+delete (`commit_drain_batch`). A crash in between re-loads the
-					// synthetic and re-applies it — which is SAFE because every synthetic is idempotent
-					// (New/Move/Changed = upsert, Removed = delete-of-missing) and the resync watermark
-					// jump was already committed by `commit_resync_synthetics`. So the cache is
-					// eventually-consistent across a crash; wrapping apply+delete in one tx would only
-					// remove the transient re-apply, not fix a divergence. Left as a documented residual.
-					None => self.apply_event(pe.event.event),
-					// Already applied in a prior (possibly crashed) drain: skip, but still delete.
-					Some(id) if watermark.is_some_and(|w| id <= w) => continue,
-					Some(id) => {
-						let result = self.apply_event(pe.event.event);
-						if result.is_ok() {
-							// Advance the frontier ONLY along an unbroken, gap-free run from `watermark`.
-							// `checked_add` avoids a u64 overflow if a malformed id reached the store.
-							if !frontier_broken
-								&& frontier.is_none_or(|f| f.checked_add(1) == Some(id))
-							{
-								frontier = Some(id);
-							} else {
-								// a hole below `id` (an SDK-dropped event), or a
-								// previously-broken prefix — never advance the watermark past it.
-								frontier_broken = true;
-								resync_needed = true;
-							}
-						}
-						result
-					}
-				};
-				match apply_result {
-					Err(errors) => {
-						// Quarantine the failing event (already queued for deletion), surface the error,
-						// break the prefix, and keep draining — do NOT abort the loop.
-						self.surface_errors(errors);
-						frontier_broken = true;
-						resync_needed = true;
-					}
-					Ok(()) => {
-						// Applied OK → resolve which sync roots this event touches and queue it for the
-						// post-commit dispatch (using the post-apply state + the pre-snapshot parent).
-						let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre_parent);
-						if !owners.is_empty() {
-							dispatch_buffer.push((event_for_dispatch, owners));
-						}
-					}
+			// FAST PATH: the whole batch's applies land in ONE write transaction — one WAL
+			// commit instead of one per event, which dominated large resync drains (a 166k-item
+			// populate paid 166k commits). A failed apply rolls the entire batch back (nothing
+			// surfaced, nothing quarantined yet) and the SLOW PATH re-runs the same rows —
+			// still present in `events` — with per-event transactions, isolating and
+			// quarantining the poison event with unchanged semantics. Apply failures are
+			// corruption/disk-full class, so the slow path effectively never runs.
+			//
+			// Known residual: a root-deletion event applying INSIDE the bulk tx mutates the
+			// in-memory `sync_roots` map and notifies the app pre-commit; if the batch then
+			// rolls back, the re-run converges (the map mutation is idempotent and the DB
+			// delete re-lands), matching the old per-event behavior when a delete failed.
+			cursor = match self.apply_drain_batch(batch, corrupt_seqs, watermark, cursor, true)? {
+				Some(cursor) => cursor,
+				None => {
+					let (batch, corrupt_seqs) = self.load_event_batch(BATCH_SIZE)?;
+					self.apply_drain_batch(batch, corrupt_seqs, watermark, cursor, false)?
+						.expect("the per-event drain path never aborts")
 				}
-			}
-
-			// Write the watermark only if the frontier actually moved this batch (and past the value
-			// the drain started from). Watermark-before-delete: the applies already committed in their
-			// own transactions; this advances the watermark and deletes the consumed rows together.
-			let advanced = match frontier {
-				Some(f) if frontier != frontier_before && watermark.is_none_or(|w| f > w) => {
-					Some(f)
-				}
-				_ => None,
 			};
-			// Record `needs_resync` ATOMICALLY with this batch's watermark advance + row deletes when
-			// the contiguous frontier is broken, so the "resync needed" signal can never be lost to a
-			// failed best-effort write after the hole's evidence is already deleted. The
-			// flag write is idempotent across batches.
-			self.commit_drain_batch(advanced, &to_delete, resync_needed)?;
-
-			self.dispatch_batch(dispatch_buffer);
 		}
-		Ok(resync_needed)
+		Ok(cursor.resync_needed)
+	}
+
+	/// Process ONE loaded drain batch: apply every event, then commit the watermark advance +
+	/// consumed-row deletes, then dispatch. `bulk` wraps all of it in a single transaction and
+	/// returns `Ok(None)` (after rolling back) on the first apply failure so the caller can
+	/// re-run the same rows with `bulk = false`, where each apply commits alone (via
+	/// `execute_chunked`'s own transactions) and a failure quarantines just that event.
+	fn apply_drain_batch(
+		&mut self,
+		batch: Vec<PersistedEvent>,
+		corrupt_seqs: Vec<i64>,
+		watermark: Option<u64>,
+		cursor: DrainCursor,
+		bulk: bool,
+	) -> Result<Option<DrainCursor>, Box<CacheError>> {
+		let mut cursor = cursor;
+		if bulk {
+			self.db
+				.execute_batch("BEGIN")
+				.map_err(|e| Box::new(CacheError::db(e, "begin drain batch".to_string())))?;
+		}
+		if !corrupt_seqs.is_empty() {
+			// A corrupt row is a lost event of (conservatively) unknown id — break the prefix and
+			// force a resync rather than risk advancing the watermark past it.
+			cursor.resync_needed = true;
+			cursor.frontier_broken = true;
+		}
+
+		let frontier_before = cursor.frontier;
+		let mut to_delete = corrupt_seqs; // corrupt rows are quarantined (deleted) with this batch
+		// Per-root dispatch: collect (applied event, owning roots) for delivery AFTER commit.
+		// The event is held in an `Arc` so fan-out to multiple owning roots shares one allocation
+		// instead of deep-cloning the (string-heavy) payload per root.
+		let mut dispatch_buffer: Vec<(Arc<CacheEvent<'static>>, Vec<Uuid>)> = Vec::new();
+
+		for pe in batch {
+			to_delete.push(pe.seq);
+			// snapshot the pre-delete/pre-move parent BEFORE applying, and keep a clone of the
+			// event for the post-commit callback (the original's payload is moved into `apply_event`).
+			let pre_parent = self.pre_parent_snapshot(&pe.event.event);
+			let event_for_dispatch = Arc::new(pe.event.clone());
+			let apply_result = match pe.id {
+				// Synthetic diff events (from the resync diff) always apply (no watermark
+				// interaction); every synthetic is idempotent (New/Move/Changed = upsert,
+				// Removed = delete-of-missing), so a crash-window re-apply is safe.
+				None => self.apply_event(pe.event.event),
+				// Already applied in a prior (possibly crashed) drain: skip, but still delete.
+				Some(id) if watermark.is_some_and(|w| id <= w) => continue,
+				Some(id) => {
+					let result = self.apply_event(pe.event.event);
+					if result.is_ok() {
+						// Advance the frontier ONLY along an unbroken, gap-free run from `watermark`.
+						// `checked_add` avoids a u64 overflow if a malformed id reached the store.
+						if !cursor.frontier_broken
+							&& cursor.frontier.is_none_or(|f| f.checked_add(1) == Some(id))
+						{
+							cursor.frontier = Some(id);
+						} else {
+							// a hole below `id` (an SDK-dropped event), or a
+							// previously-broken prefix — never advance the watermark past it.
+							cursor.frontier_broken = true;
+							cursor.resync_needed = true;
+						}
+					}
+					result
+				}
+			};
+			match apply_result {
+				Err(errors) => {
+					// In bulk mode, abort the fast path: roll the whole batch back and report
+					// NOTHING — the slow-path re-run owns the surfacing and quarantining
+					// (reporting here too would double-count every error).
+					if bulk {
+						let _ = self.db.execute_batch("ROLLBACK");
+						return Ok(None);
+					}
+					// Quarantine the failing event (already queued for deletion), surface the error,
+					// break the prefix, and keep draining — do NOT abort the loop.
+					self.surface_errors(errors);
+					cursor.frontier_broken = true;
+					cursor.resync_needed = true;
+				}
+				Ok(()) => {
+					// Applied OK → resolve which sync roots this event touches and queue it for the
+					// post-commit dispatch (using the post-apply state + the pre-snapshot parent).
+					let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre_parent);
+					if !owners.is_empty() {
+						dispatch_buffer.push((event_for_dispatch, owners));
+					}
+				}
+			}
+		}
+
+		// Write the watermark only if the frontier actually moved this batch (and past the value
+		// the drain started from). Watermark-before-delete holds in both modes: per-event mode
+		// committed each apply already, and bulk mode commits applies + watermark + deletes
+		// together, which trivially cannot delete an unapplied event.
+		let advanced = match cursor.frontier {
+			Some(f) if cursor.frontier != frontier_before && watermark.is_none_or(|w| f > w) => {
+				Some(f)
+			}
+			_ => None,
+		};
+		// Record `needs_resync` ATOMICALLY with this batch's watermark advance + row deletes when
+		// the contiguous frontier is broken, so the "resync needed" signal can never be lost to a
+		// failed best-effort write after the hole's evidence is already deleted. The
+		// flag write is idempotent across batches.
+		let committed = self
+			.commit_drain_batch(advanced, &to_delete, cursor.resync_needed)
+			.and_then(|()| {
+				if bulk {
+					self.db
+						.execute_batch("COMMIT")
+						.map_err(|e| Box::new(CacheError::db(e, "commit drain batch".to_string())))
+				} else {
+					Ok(())
+				}
+			});
+		if let Err(e) = committed {
+			// Never leak an open transaction to the next select-loop arm.
+			if bulk {
+				let _ = self.db.execute_batch("ROLLBACK");
+			}
+			return Err(e);
+		}
+
+		self.dispatch_batch(dispatch_buffer);
+		Ok(Some(cursor))
 	}
 
 	/// Resync core, independent of the async island so it is unit-testable. Given EACH sync

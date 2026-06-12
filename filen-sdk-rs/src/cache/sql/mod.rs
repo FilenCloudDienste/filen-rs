@@ -14,6 +14,7 @@ use crate::cache::{CacheState, sql::statements::VACUUM};
 mod diff;
 mod dir;
 mod event;
+pub(crate) use event::PersistedEvent;
 mod file;
 mod item;
 mod membership;
@@ -28,16 +29,24 @@ const CHUNK_SIZE: usize = 10_000;
 impl CacheState {
 	/// Run `for_chunk` over `items` in `CHUNK_SIZE` batches, each batch in its OWN transaction (so a huge
 	/// bulk op commits incrementally instead of holding one giant transaction). `for_chunk` prepares its
-	/// statements on the transaction and applies the chunk. Collapses the chunk/loop/commit scaffolding
+	/// statements on the connection and applies the chunk. Collapses the chunk/loop/commit scaffolding
 	/// that the bulk methods below would otherwise each duplicate.
+	///
+	/// NESTING-AWARE: when the caller already holds an open transaction (the drain's batched
+	/// fast path), everything runs bare on that transaction — the caller's commit is the
+	/// durability boundary — since SQLite cannot nest `BEGIN`.
 	fn execute_chunked<T>(
 		&mut self,
 		items: impl Iterator<Item = T>,
 		mut for_chunk: impl FnMut(
-			&rusqlite::Transaction<'_>,
+			&rusqlite::Connection,
 			&mut dyn Iterator<Item = T>,
 		) -> rusqlite::Result<()>,
 	) -> rusqlite::Result<()> {
+		let mut items = items;
+		if !self.db.is_autocommit() {
+			return for_chunk(&self.db, &mut items);
+		}
 		let chunks = items.chunks(CHUNK_SIZE);
 		for mut chunk in &chunks {
 			let transaction = self.db.transaction()?;

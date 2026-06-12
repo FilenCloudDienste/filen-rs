@@ -219,25 +219,35 @@ impl CacheState {
 	/// a held watermark always reads behind the remote drive id — but recording the flag atomically is
 	/// the correct durable design and also covers the live path, which has no gap-check.) The flag write
 	/// is idempotent, so re-passing `true` across batches is harmless.
+	/// NESTING-AWARE like `execute_chunked`: inside an already-open transaction (the drain's
+	/// batched fast path) the statements run bare and the caller's commit is the atomicity
+	/// boundary; standalone (the per-event fallback path) it commits its own transaction.
 	pub(crate) fn commit_drain_batch(
 		&mut self,
 		new_watermark: Option<u64>,
 		deleted_seqs: &[i64],
 		mark_resync: bool,
 	) -> Result<(), Box<CacheError>> {
-		let tx = self
-			.db
-			.transaction()
-			.map_err(|e| db_err(e, "begin drain-commit transaction"))?;
+		let ambient = !self.db.is_autocommit();
+		let tx = if ambient {
+			None
+		} else {
+			Some(
+				self.db
+					.unchecked_transaction()
+					.map_err(|e| db_err(e, "begin drain-commit transaction"))?,
+			)
+		};
+		let conn: &rusqlite::Connection = tx.as_deref().unwrap_or(&self.db);
 		if let Some(id) = new_watermark {
-			tx.execute(
+			conn.execute(
 				super::statements::CACHE_META_SET,
 				params![super::statements::WATERMARK_KEY, id as i64],
 			)
 			.map_err(|e| db_err(e, "advancing watermark in drain commit"))?;
 		}
 		if mark_resync {
-			tx.execute(
+			conn.execute(
 				super::statements::CACHE_META_SET,
 				params![super::statements::NEEDS_RESYNC_KEY, 1_i64],
 			)
@@ -252,11 +262,13 @@ impl CacheState {
 				.map(i64::to_string)
 				.collect::<Vec<_>>()
 				.join(",");
-			tx.execute(&format!("DELETE FROM events WHERE seq IN ({in_list})"), [])
+			conn.execute(&format!("DELETE FROM events WHERE seq IN ({in_list})"), [])
 				.map_err(|e| db_err(e, "deleting consumed events in drain commit"))?;
 		}
-		tx.commit()
-			.map_err(|e| db_err(e, "committing drain batch"))?;
+		if let Some(tx) = tx {
+			tx.commit()
+				.map_err(|e| db_err(e, "committing drain batch"))?;
+		}
 		Ok(())
 	}
 

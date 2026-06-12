@@ -1597,6 +1597,92 @@ fn route_thread_event_sheds_at_cap() {
 	);
 }
 
+/// a failing apply aborts the batched fast path WITHOUT surfacing errors, and the per-event
+/// fallback re-runs the same rows with the pre-batching semantics: the poison event is
+/// quarantined (consumed, no torn item/file row pair), the good event still applies, a resync
+/// is durably recorded, and no transaction leaks open.
+#[test]
+fn drain_falls_back_to_per_event_when_a_bulk_apply_fails() {
+	let (mut state, producer) = CacheState::new_in_memory_with_producer();
+	let root = state.root_uuid;
+
+	let good_dir = cache_dir(2, root);
+	let poison_file = cache_file(3, root, 100);
+	producer
+		.events
+		.try_send(CacheThreadEvent::Socket(
+			CacheEventMaybeDecrypted::Decrypted(CacheEvent {
+				id: Some(1),
+				event: CacheEventType::Dir(DirEvent::New(good_dir.clone())),
+			}),
+		))
+		.unwrap();
+	producer
+		.events
+		.try_send(CacheThreadEvent::Socket(
+			CacheEventMaybeDecrypted::Decrypted(CacheEvent {
+				id: Some(2),
+				event: CacheEventType::File(FileEvent::New(poison_file.clone())),
+			}),
+		))
+		.unwrap();
+	// Make every file apply fail mid-event (after its ITEM_UPSERT): the bulk pass must roll the
+	// whole batch back and the fallback must quarantine ONLY the file event. (A trigger, not a
+	// DROP TABLE: items' own triggers reference `files`, so dropping it would poison dir
+	// applies too.)
+	state
+		.db
+		.execute_batch(
+			"CREATE TRIGGER poison_file_insert BEFORE INSERT ON files BEGIN \
+			 SELECT RAISE(ABORT, 'poisoned'); END;",
+		)
+		.unwrap();
+
+	state.drain_pending(None);
+
+	assert!(
+		state.db.is_autocommit(),
+		"no transaction may leak open after the fallback"
+	);
+	assert!(
+		state.needs_resync().unwrap(),
+		"a quarantined event durably records a resync"
+	);
+	assert!(
+		state.load_event_batch(10).unwrap().0.is_empty(),
+		"both events are consumed (the poison one by quarantine)"
+	);
+	let dir_applied: i64 = state
+		.db
+		.query_row(
+			"SELECT count(*) FROM items WHERE uuid = ?1",
+			[good_dir.uuid],
+			|row| row.get(0),
+		)
+		.unwrap();
+	assert_eq!(
+		dir_applied, 1,
+		"the good event still applies via the fallback"
+	);
+	let torn_file_row: i64 = state
+		.db
+		.query_row(
+			"SELECT count(*) FROM items WHERE uuid = ?1",
+			[poison_file.uuid],
+			|row| row.get(0),
+		)
+		.unwrap();
+	assert_eq!(
+		torn_file_row, 0,
+		"the poison event's partial apply is rolled back (no orphan items row)"
+	);
+	assert_eq!(
+		state.watermark().unwrap(),
+		Some(1),
+		"the watermark holds at the last good id, never crossing the quarantined one"
+	);
+}
+
 /// when the producer shed events, the worker's drain observes the latch, durably records a
 /// resync (so the dropped events are recovered), and clears the latch.
 #[test]
