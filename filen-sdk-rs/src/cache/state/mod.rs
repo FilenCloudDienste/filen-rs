@@ -872,6 +872,18 @@ impl CacheState {
 		// though `commit_resync_synthetics` just cleared it — so the next worker cycle resyncs again
 		// (no separate best-effort re-mark to lose).
 		self.drain_persisted()?;
+
+		// Best-effort: fold the apply burst's WAL back into the main DB now, while we are idle
+		// anyway. A populate-scale apply leaves a WAL as large as the data it wrote; without an
+		// explicit checkpoint, the engine's read snapshots can pin it (blocking the passive
+		// auto-checkpoints) and every post-resync read pays WAL-lookup overhead on top of a cold
+		// page cache. TRUNCATE also returns the disk space. (No-op without WAL, e.g. wasm.)
+		if let Err(e) = self
+			.db
+			.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+		{
+			log::debug!("post-resync wal_checkpoint failed (non-fatal): {e}");
+		}
 		Ok(())
 	}
 

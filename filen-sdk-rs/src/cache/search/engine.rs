@@ -44,11 +44,24 @@ use tokio::time::{Instant as TimerInstant, sleep_until as timer_sleep_until};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasmtimer::{std::Instant as TimerInstant, tokio::sleep_until as timer_sleep_until};
 
-/// Refresh coalescing interval: bursts of pings (a resync flood) collapse into at most one
-/// re-query per interval. A refresh re-runs the count plus every window query — with a needle
-/// that scans the whole scope (order of 100–300 ms on a 100k-item drive), so this is
-/// deliberately coarser than UI-frame latency. `GetRange`/`SetConfig` replies are exempt.
+/// Minimum refresh coalescing interval: bursts of pings (a resync flood) collapse into at most
+/// one re-query per interval. A refresh re-runs every window's scan — with a needle that walks
+/// the whole scope (order of 100–300 ms on a 100k-item drive), so this is deliberately coarser
+/// than UI-frame latency. `GetRange`/`SetConfig` replies are exempt.
 const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Ceiling for the ADAPTIVE debounce (see [`next_debounce`]) so a pathologically slow scan can
+/// never push live updates out beyond UI-tolerable staleness.
+const MAX_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// The next ping-to-refresh delay, scaled to the last refresh's measured cost: refreshing spends
+/// at most ~1/3 of the engine's time even while a resync apply pings continuously (a fixed 250ms
+/// debounce under a multi-second scan re-queries back to back, churning the page cache the
+/// writer needs). Clamped to [`DEBOUNCE`], [`MAX_DEBOUNCE`] — and because the deadline is always
+/// armed by the next ping, the trailing refresh after a burst still fires unconditionally.
+fn next_debounce(last_refresh: Duration) -> Duration {
+	(last_refresh * 3).clamp(DEBOUNCE, MAX_DEBOUNCE)
+}
 
 /// Per-search cap on live windows. Every refresh re-queries ALL windows in one synchronous
 /// closure on the read connection (one ReadTask on wasm — see [`Engine::refresh`]), so this
@@ -132,6 +145,8 @@ struct Engine {
 	next_window_id: u64,
 	shared: Arc<SearchShared>,
 	live: bool,
+	/// Measured cost of the most recent refresh — drives [`next_debounce`].
+	last_refresh: Duration,
 }
 
 pub(super) async fn run(init: EngineInit) {
@@ -158,6 +173,7 @@ pub(super) async fn run(init: EngineInit) {
 		next_window_id: 0,
 		shared,
 		live: true,
+		last_refresh: Duration::ZERO,
 	};
 	engine.build(read_source).await;
 
@@ -190,7 +206,8 @@ pub(super) async fn run(init: EngineInit) {
 				match ping {
 					Some(()) => {
 						if debounce_deadline.is_none() {
-							debounce_deadline = Some(TimerInstant::now() + DEBOUNCE);
+							debounce_deadline =
+								Some(TimerInstant::now() + next_debounce(engine.last_refresh));
 						}
 					}
 					None => {
@@ -360,6 +377,7 @@ impl Engine {
 		let Some(conn) = &self.conn else {
 			return;
 		};
+		let refresh_started = TimerInstant::now();
 		let scope = self.scope();
 		let filter = self.filter.clone();
 		let window_ranges: Vec<(u64, Range<usize>)> = self
@@ -401,6 +419,7 @@ impl Engine {
 			Ok(batch) => batch,
 			Err(e) => {
 				log::error!("search refresh failed: {e}");
+				self.last_refresh = refresh_started.elapsed();
 				return;
 			}
 		};
@@ -438,6 +457,7 @@ impl Engine {
 		for id in poisoned {
 			self.windows.remove(&id);
 		}
+		self.last_refresh = refresh_started.elapsed();
 	}
 
 	/// Re-sends LAST-DELIVERED results (no re-query) with `live: false` — in the deleted-root
@@ -619,6 +639,26 @@ mod tests {
 			.upsert_files(std::iter::once(&test_file(root, "initial")))
 			.unwrap();
 		(path, root, state)
+	}
+
+	#[test]
+	fn adaptive_debounce_clamps_to_floor_and_ceiling() {
+		assert_eq!(next_debounce(Duration::ZERO), DEBOUNCE, "floor");
+		assert_eq!(
+			next_debounce(Duration::from_millis(50)),
+			DEBOUNCE,
+			"cheap refreshes keep the minimum latency"
+		);
+		assert_eq!(
+			next_debounce(Duration::from_millis(700)),
+			Duration::from_millis(2100),
+			"slow refreshes spend at most ~1/3 of the time re-querying"
+		);
+		assert_eq!(
+			next_debounce(Duration::from_secs(10)),
+			MAX_DEBOUNCE,
+			"ceiling bounds staleness"
+		);
 	}
 
 	#[test]
