@@ -1,32 +1,19 @@
 use super::*;
 
+/// Unit constructors have no resync deps, so these futures never touch the network — a minimal
+/// current-thread runtime suffices.
+fn drive<F: Future>(fut: F) -> F::Output {
+	tokio::runtime::Builder::new_current_thread()
+		.build()
+		.unwrap()
+		.block_on(fut)
+}
+
 fn item_count(state: &CacheState) -> i64 {
 	state
 		.db
 		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
 		.unwrap()
-}
-
-/// Async-bridging guard. The worker runs on a `std::thread` (not a runtime thread)
-/// and drives the async resync island through a `tokio::runtime::Handle::block_on` captured at
-/// construction (the worker spawn behind `Client::add_sync_root` calls `Handle::current()` inside
-/// the app's multi-threaded runtime; that handle is stashed in [`ResyncDeps`]). This locks the
-/// invariant that such a handle
-/// can be `block_on`'d from a NON-runtime thread without the "cannot block_on from within a runtime"
-/// panic — i.e. the bridging mechanism the worker relies on is sound.
-#[test]
-fn captured_runtime_handle_block_on_works_from_a_worker_thread() {
-	let rt = tokio::runtime::Builder::new_multi_thread()
-		.worker_threads(1)
-		.build()
-		.unwrap();
-	let rt_handle = rt.handle().clone();
-
-	// Mimic the worker: a plain std::thread (no async context) drives a future to completion.
-	let result = std::thread::spawn(move || rt_handle.block_on(async { 40 + 2 }))
-		.join()
-		.unwrap();
-	assert_eq!(result, 42);
 }
 
 /// A `FrontierAdvance` is persisted as a `NoOp` marker and applied by the drain: it moves
@@ -146,7 +133,6 @@ fn folder_move_to_virtual_parent_becomes_removed() {
 	}
 }
 
-/// A `DirEvent::New` that upserts one item+dir row (observable as a single `items` row).
 fn dir_new_event(id: Option<u64>, uuid: Uuid, parent: Uuid) -> CacheEvent<'static> {
 	use std::borrow::Cow;
 
@@ -639,7 +625,7 @@ fn remove_sync_root_eviction_protects_nested_root() {
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
 	state.set_test_sync_roots(sync_roots);
 
-	state.handle_remove_registration(a.uuid, 0, true, None);
+	drive(state.handle_remove_registration(a.uuid, 0, true, None));
 
 	assert!(
 		!state.sync_roots.contains_key(&a.uuid),
@@ -679,7 +665,7 @@ fn remove_sync_root_eviction_leaves_siblings_alone() {
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
 	state.set_test_sync_roots(sync_roots);
 
-	state.handle_remove_registration(a.uuid, 0, true, None);
+	drive(state.handle_remove_registration(a.uuid, 0, true, None));
 
 	assert!(!item_exists(&state, fa.uuid), "A's file evicted");
 	assert!(
@@ -702,7 +688,7 @@ fn remove_sync_root_without_evict_keeps_items() {
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	state.set_test_sync_roots(sync_roots);
 
-	state.handle_remove_registration(a.uuid, 0, false, None);
+	drive(state.handle_remove_registration(a.uuid, 0, false, None));
 
 	assert!(!state.sync_roots.contains_key(&a.uuid));
 	assert!(item_exists(&state, fa.uuid), "no eviction → items remain");
@@ -1317,7 +1303,7 @@ fn drain_advances_watermark_from_high_first_id() {
 	assert!(state.load_event_batch(10).unwrap().0.is_empty());
 }
 
-/// D2/C3: a hole (id 2 missing) is still applied to `items`, but the watermark holds at the
+/// A hole (id 2 missing) is still applied to `items`, but the watermark holds at the
 /// contiguous frontier (1) and a resync is requested. The durable `needs_resync` flag is set
 /// by the drain ITSELF (atomically, in `commit_drain_batch`) — no separate best-effort write.
 #[test]
@@ -1395,7 +1381,7 @@ fn drain_is_idempotent_across_a_replay() {
 	assert!(state.load_event_batch(10).unwrap().0.is_empty());
 }
 
-/// C1: a corrupt row is quarantined (deleted) during the drain, the good event still applies, and
+/// A corrupt row is quarantined (deleted) during the drain, the good event still applies, and
 /// a resync is requested to recover the lost one.
 #[test]
 fn drain_quarantines_corrupt_row_and_requests_resync() {
@@ -1426,10 +1412,9 @@ fn drain_quarantines_corrupt_row_and_requests_resync() {
 	);
 }
 
-/// a lost LOW id (here a corrupt row at id=1) must NOT let a later good id (id=2)
-/// free-seed the frontier — the watermark must stay below the lost id, with a resync requested.
-/// Before the `frontier_broken` fix, the `None` frontier accepted id=2 as "contiguous" and the
-/// watermark jumped to 2, silently claiming coverage of the lost id=1.
+/// A lost low id (here a corrupt row at id=1) must NOT let a later good id (id=2) free-seed the
+/// frontier — the watermark must stay below the lost id, with a resync requested. A `None`
+/// frontier must not accept a later id as "contiguous" and silently claim coverage of the lost id.
 #[test]
 fn drain_does_not_advance_watermark_past_a_lost_low_id() {
 	let mut state = CacheState::new_in_memory();
@@ -1561,7 +1546,7 @@ fn drain_noop_event_advances_watermark_without_mutating() {
 /// the single unbounded channel and nothing is shed.
 #[test]
 fn route_thread_event_buffers_without_dropping_under_cap() {
-	let (events_tx, events_rx) = crossbeam::channel::unbounded();
+	let (events_tx, events_rx) = tokio::sync::mpsc::channel(EVENT_SHED_CAP);
 	let shed = AtomicBool::new(false);
 
 	let total = 100;
@@ -1570,7 +1555,6 @@ fn route_thread_event_buffers_without_dropping_under_cap() {
 			CacheThreadEvent::Socket(CacheEventMaybeDecrypted::FrontierAdvance { id }),
 			&events_tx,
 			&shed,
-			EVENT_SHED_CAP,
 		);
 	}
 
@@ -1585,13 +1569,13 @@ fn route_thread_event_buffers_without_dropping_under_cap() {
 	);
 }
 
-/// once the channel reaches the cap, the router SHEDS further events (bounded memory) and
-/// latches `shed` instead of growing without bound.
+/// once the channel is full (its capacity IS the shed cap), the router SHEDS further events
+/// (bounded memory) and latches `shed` instead of growing without bound.
 #[test]
 fn route_thread_event_sheds_at_cap() {
-	let (events_tx, events_rx) = crossbeam::channel::unbounded();
-	let shed = AtomicBool::new(false);
 	let cap = 4;
+	let (events_tx, events_rx) = tokio::sync::mpsc::channel(cap);
+	let shed = AtomicBool::new(false);
 
 	// Fill exactly to the cap, then route a handful more.
 	for id in 0..(cap as u64 + 5) {
@@ -1599,7 +1583,6 @@ fn route_thread_event_sheds_at_cap() {
 			CacheThreadEvent::Socket(CacheEventMaybeDecrypted::FrontierAdvance { id }),
 			&events_tx,
 			&shed,
-			cap,
 		);
 	}
 
@@ -1649,7 +1632,7 @@ fn flood_persists_applies_with_zero_loss() {
 			Uuid::from_u128(id as u128),
 			root,
 		)));
-		route_thread_event(event, &producer.events, &producer.shed, EVENT_SHED_CAP);
+		route_thread_event(event, &producer.events, &producer.shed);
 	}
 	assert!(
 		!producer.shed.load(Ordering::Acquire),
@@ -1686,7 +1669,7 @@ fn drain_pending_records_needs_resync_on_a_hole() {
 		// id 2 is missing → a hole
 		producer
 			.events
-			.send(CacheThreadEvent::Socket(
+			.try_send(CacheThreadEvent::Socket(
 				CacheEventMaybeDecrypted::Decrypted(dir_new_event(
 					Some(id),
 					Uuid::from_u128(id as u128),
@@ -1718,13 +1701,13 @@ fn drain_pending_applies_socket_then_deferred_manual() {
 
 	producer
 		.events
-		.send(CacheThreadEvent::Socket(
+		.try_send(CacheThreadEvent::Socket(
 			CacheEventMaybeDecrypted::Decrypted(dir_new_event(Some(1), Uuid::from_u128(1), root)),
 		))
 		.unwrap();
 	producer
 		.events
-		.send(CacheThreadEvent::Manual(ManualEvent::ListDirRecursive(
+		.try_send(CacheThreadEvent::Manual(ManualEvent::ListDirRecursive(
 			vec![],
 			vec![],
 		)))
@@ -1754,7 +1737,7 @@ fn add_registration_to_active_root_appends_without_resync() {
 	state.set_test_sync_roots(sync_roots);
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	let needs_resync = state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack);
+	let needs_resync = drive(state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack));
 
 	assert!(!needs_resync, "an already-active root needs no resync");
 	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
@@ -1766,8 +1749,8 @@ fn add_registration_to_active_root_appends_without_resync() {
 }
 
 /// registering a NEW root acks `Ok` once it is in the active set and reports that a
-/// convergence resync is needed. (Unit construction has no resync deps, so the `get_dir`
-/// validation is skipped — exactly like the production account-root path.)
+/// convergence resync is needed. (Unit construction has no resync deps, so `get_dir` validation
+/// is skipped.)
 #[test]
 fn add_registration_for_new_root_acks_and_requests_resync() {
 	let mut state = CacheState::new_in_memory();
@@ -1777,7 +1760,7 @@ fn add_registration_for_new_root_acks_and_requests_resync() {
 	state.set_test_sync_roots(HashMap::new());
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	let needs_resync = state.handle_add_sync_root(b.uuid, 7, Box::new(|_| {}), ack);
+	let needs_resync = drive(state.handle_add_sync_root(b.uuid, 7, Box::new(|_| {}), ack));
 
 	assert!(needs_resync, "a newly-active root must be converged");
 	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
@@ -1799,10 +1782,10 @@ fn remove_registration_with_survivors_skips_eviction() {
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	state.set_test_sync_roots(sync_roots);
 	let (add_ack, _add_ack_rx) = tokio::sync::oneshot::channel();
-	state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), add_ack);
+	drive(state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), add_ack));
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	state.handle_remove_registration(a.uuid, 0, true, Some(ack));
+	drive(state.handle_remove_registration(a.uuid, 0, true, Some(ack)));
 
 	assert!(
 		matches!(ack_rx.try_recv(), Ok(Ok(false))),
@@ -1827,7 +1810,7 @@ fn remove_last_registration_evicts_and_acks_true() {
 	state.set_test_sync_roots(sync_roots);
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	state.handle_remove_registration(a.uuid, 0, true, Some(ack));
+	drive(state.handle_remove_registration(a.uuid, 0, true, Some(ack)));
 
 	assert!(matches!(ack_rx.try_recv(), Ok(Ok(true))), "subtree evicted");
 	assert!(!state.sync_roots.contains_key(&a.uuid), "root inactive");
@@ -1854,7 +1837,7 @@ fn remove_registration_after_server_side_deletion_is_noop() {
 	assert!(!state.sync_roots.contains_key(&b.uuid));
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	state.handle_remove_registration(b.uuid, 0, true, Some(ack));
+	drive(state.handle_remove_registration(b.uuid, 0, true, Some(ack)));
 
 	assert!(
 		matches!(ack_rx.try_recv(), Ok(Ok(false))),
@@ -1886,7 +1869,7 @@ fn dispatch_fires_every_registration_on_a_root() {
 	);
 	state.set_test_sync_roots(sync_roots);
 	let (add_ack, _add_ack_rx) = tokio::sync::oneshot::channel();
-	state.handle_add_sync_root(
+	drive(state.handle_add_sync_root(
 		a.uuid,
 		1,
 		Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
@@ -1895,7 +1878,7 @@ fn dispatch_fires_every_registration_on_a_root() {
 			}
 		}),
 		add_ack,
-	);
+	));
 
 	let in_root = cache_file(2, a.uuid, 100);
 	state
@@ -1933,12 +1916,14 @@ fn control_burst_processes_queued_messages_and_shutdown_wins() {
 		})
 		.unwrap();
 	let (a_ack, mut a_ack_rx) = tokio::sync::oneshot::channel();
-	let shutdown = state.process_control_burst(CacheControlMessage::AddSyncRoot {
-		uuid: a.uuid,
-		registration_id: 0,
-		callback: Box::new(|_| {}),
-		ack: a_ack,
-	});
+	let shutdown = drive(
+		state.process_control_burst(CacheControlMessage::AddSyncRoot {
+			uuid: a.uuid,
+			registration_id: 0,
+			callback: Box::new(|_| {}),
+			ack: a_ack,
+		}),
+	);
 
 	assert!(!shutdown);
 	assert!(matches!(a_ack_rx.try_recv(), Ok(Ok(()))));
@@ -1951,7 +1936,9 @@ fn control_burst_processes_queued_messages_and_shutdown_wins() {
 	);
 
 	// A Shutdown anywhere in the burst stops processing immediately.
-	assert!(state.process_control_burst(CacheControlMessage::Shutdown));
+	assert!(drive(
+		state.process_control_burst(CacheControlMessage::Shutdown)
+	));
 }
 
 /// evicting the account root while a subdir root survives wipes everything flat, then
@@ -1971,7 +1958,7 @@ fn account_root_evict_with_survivors_marks_needs_resync() {
 	state.set_test_sync_roots(sync_roots);
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	state.handle_remove_registration(account_root, 0, true, Some(ack));
+	drive(state.handle_remove_registration(account_root, 0, true, Some(ack)));
 
 	assert!(
 		matches!(ack_rx.try_recv(), Ok(Ok(true))),
@@ -2005,7 +1992,7 @@ fn covered_add_registers_without_resync() {
 	state.set_test_sync_roots(sync_roots);
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	let needs_resync = state.handle_add_sync_root(nested.uuid, 1, Box::new(|_| {}), ack);
+	let needs_resync = drive(state.handle_add_sync_root(nested.uuid, 1, Box::new(|_| {}), ack));
 
 	assert!(!needs_resync, "covered add must not request a resync");
 	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
@@ -2028,7 +2015,7 @@ fn uncovered_add_still_requests_resync() {
 	state.set_test_sync_roots(HashMap::new());
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	let needs_resync = state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack);
+	let needs_resync = drive(state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack));
 
 	assert!(needs_resync, "uncovered add must be converged");
 	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))));
@@ -2049,7 +2036,7 @@ fn covered_add_keeps_pending_resync_flag() {
 	state.mark_needs_resync().unwrap();
 
 	let (ack, _ack_rx) = tokio::sync::oneshot::channel();
-	let needs_resync = state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack);
+	let needs_resync = drive(state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), ack));
 
 	assert!(!needs_resync, "fast path requests no immediate resync");
 	assert!(

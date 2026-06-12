@@ -90,8 +90,13 @@ use crate::{
 mod config;
 mod engine;
 mod hydrate;
-// UniFFI-only, like `cache::js_impl` (the wasm twin lands with the cache's wasm port).
-#[cfg(feature = "uniffi")]
+// Wasm routes read queries through the worker's connection; export both the task type and the
+// matcher registration so the worker can set up the same `filen_name_matches` function.
+pub(crate) use hydrate::ReadTask;
+pub(in crate::cache) use hydrate::register_name_matches;
+// FFI bindings: UniFFI on native, wasm_bindgen on wasm — gated together because both targets
+// need the public search API exposed to callers outside Rust.
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
 pub mod js_impl;
 mod result;
 
@@ -121,6 +126,11 @@ impl Client {
 	/// [`SyncRootUnavailable`](crate::cache::CacheError::SyncRootUnavailable) means the check
 	/// itself failed (network — retry the same uuid). Must be called from within the app's
 	/// Tokio runtime.
+	///
+	/// HOSTING (wasm): the engine task is spawned on the CALLING thread's local executor and
+	/// pins that thread for the search's lifetime — call this on a long-lived host (the FFI
+	/// entry points route through the commander, which is exactly that). Native hosts the
+	/// engine on its own dedicated thread and has no such requirement.
 	pub async fn create_search(
 		self: Arc<Self>,
 		uuid: Uuid,
@@ -132,9 +142,9 @@ impl Client {
 		// the queries themselves.
 		let (ping_sender, ping_receiver) = tokio::sync::mpsc::unbounded_channel();
 		let callback: SyncRootCallback = Box::new(move |events| {
-			// The engine re-queries the DB on refresh, so the payloads are irrelevant — all
-			// this forwards is "something in the subtree changed", and only for batches that
-			// can affect results (the skipped globals never touch item rows).
+			// The engine re-queries the full DB on refresh, so the event payloads are
+			// irrelevant — only "something in the subtree changed" matters. Globals that
+			// never touch item rows are skipped to avoid spurious re-queries.
 			for event in events {
 				if matches!(
 					event.event,
@@ -153,14 +163,20 @@ impl Client {
 		});
 		let sync_root_handle = self.clone().add_sync_root(uuid, callback).await?;
 
-		// A live registration implies `configure_cache` ran, so the path is present; it is
-		// stable for the search's lifetime (reconfiguration is rejected while a worker lives).
-		let db_path = self.cache_slot.lock().await.db_path().ok_or_else(|| {
-			Error::custom(
-				ErrorKind::InvalidState,
-				"cache is not configured; call configure_cache first",
-			)
-		})?;
+		// Native: the engine opens its own READ-ONLY connection on the configured path (a live
+		// registration implies `configure_cache` ran, and the path is stable for the search's
+		// lifetime — reconfiguration is rejected while a worker lives). Wasm: the VFS supports
+		// neither WAL nor a second connection, so queries route to the worker's connection.
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		let read_source =
+			engine::ReadSource::Path(self.cache_slot.lock().await.db_path().ok_or_else(|| {
+				Error::custom(
+					ErrorKind::InvalidState,
+					"cache is not configured; call configure_cache first",
+				)
+			})?);
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		let read_source = engine::ReadSource::Worker(sync_root_handle.read_task_sender());
 
 		let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
 		let shared = Arc::new(SearchShared {
@@ -173,13 +189,22 @@ impl Client {
 			root: uuid,
 			is_account_root: uuid == account_root,
 			config,
-			db_path,
+			read_source,
 			pings: ping_receiver,
 			commands: command_receiver,
 			shared: shared.clone(),
 			finished: finished_sender,
 		};
+		// Native: a dedicated thread (current-thread tokio runtime) — the engine's direct SQLite
+		// reads may block. Wasm: the engine never blocks (queries round-trip through
+		// `ReadConn::Worker`, the debounce is wasmtimer), so it runs on the CALLING thread's
+		// local executor instead of a dedicated web worker — a per-search worker is needless
+		// weight. (FFI calls arrive on the commander via `do_on_commander`, so that is where
+		// the engine lands; see the method docs for the hosting contract.)
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		crate::runtime::spawn_async(move || engine::run(init));
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		crate::runtime::spawn_local(engine::run(init));
 
 		Ok(Search {
 			commands: command_sender,

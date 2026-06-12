@@ -19,12 +19,7 @@ wasm-full = ["multi-threaded-crypto"]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 http-provider = ["dep:axum", "dep:axum-extra"]
-cache = [
-	"dep:rusqlite",
-	"dep:crossbeam",
-	"dep:itertools",
-	"filen-types/rusqlite",
-]
+cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
 
 # The cache tests only exist when the `cache` feature is enabled.
 [[test]]
@@ -123,16 +118,16 @@ typenum = "1.20.0"
 url = "2.5.7"
 nom-exif = { version = "3.6.0", features = ["tokio"] }
 rkyv = { version = "0.8.16", features = ["uuid-1"] }
-# The cache deps are deliberately NOT in the native-only section: enabling `cache` on a wasm
-# build must fail loudly (rusqlite 0.37 cannot target wasm32-unknown-unknown) instead of
-# silently compiling the engine out, until a real wasm port lands.
-rusqlite = { version = "0.37.0", features = [
+# rusqlite ≥0.38 targets wasm32-unknown-unknown through its default `ffi-sqlite-wasm-rs`
+# backend (real sqlite3.c compiled by `cc` — needs an LLVM clang for wasm objects, see
+# wasm-pack.sh); `bundled` only affects the native libsqlite3-sys build. `fallible_uint`
+# restores the u64/usize ToSql/FromSql impls that 0.38 made opt-in (the cache binds u64
+# sizes/chunks throughout).
+rusqlite = { version = "0.39", features = [
 	"bundled",
 	"functions",
 	"uuid",
-], optional = true }
-crossbeam = { version = "0.8.4", features = [
-	"crossbeam-channel",
+	"fallible_uint",
 ], optional = true }
 itertools = { version = "0.14.0", optional = true }
 
@@ -192,6 +187,7 @@ web-sys = { version = "0.3.22", default-features = false, features = [
 	"WebSocket",
 	"MessageEvent",
 	"CloseEvent",
+	"ErrorEvent",
 	"WorkerOptions",
 	"WorkerType",
 	"DedicatedWorkerGlobalScope",

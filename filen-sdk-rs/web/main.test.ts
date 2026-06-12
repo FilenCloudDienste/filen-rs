@@ -14,7 +14,9 @@ import init, {
 	UnauthClient,
 	parseName,
 	EntryNameErrorJS,
-	type AnyLinkedDirWithContext
+	type AnyLinkedDirWithContext,
+	type CacheStatusMessage,
+	type CacheSearchSnapshot
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
@@ -1279,6 +1281,80 @@ test("getItemPath", async () => {
 	const topLevelDirResult = await state.getItemPath(testDir)
 	expect(topLevelDirResult.path).toBe("wasm-test-dir/")
 	expect(topLevelDirResult.ancestors.length).toBe(0)
+})
+
+test("cache search", async () => {
+	const statusMessages: CacheStatusMessage[] = []
+	await state.configureCache("wasm-test-cache.db", (messages: CacheStatusMessage[]) => {
+		statusMessages.push(...messages)
+	})
+
+	const searchDir = await state.createDir(testDir, "cache-search-dir")
+	await state.uploadFile(new TextEncoder().encode("a"), {
+		parent: searchDir,
+		name: "alpha.txt"
+	})
+	await state.uploadFile(new TextEncoder().encode("b"), {
+		parent: searchDir,
+		name: "Beta.txt"
+	})
+
+	// An uncovered root: the worker spawns, validates remotely, and runs a convergence resync
+	// (whose progress lands on the status listener).
+	const search = await state.createSearch(searchDir.uuid, {
+		name: undefined,
+		itemType: undefined,
+		recursive: true,
+		caseSensitive: false
+	})
+
+	const poll = async (predicate: () => boolean | Promise<boolean>, timeoutMs: number) => {
+		const deadline = Date.now() + timeoutMs
+		while (Date.now() < deadline) {
+			if (await predicate()) return true
+			await new Promise(resolve => setTimeout(resolve, 500))
+		}
+		return false
+	}
+
+	expect(await poll(async () => (await search.total()) === 2n, 90000)).toBe(true)
+
+	const snapshots: CacheSearchSnapshot[] = []
+	const window = await search.getRange(0n, 10n, (snapshot: CacheSearchSnapshot) => {
+		snapshots.push(snapshot)
+	})
+	const initial = window.initialSnapshot()
+	expect(initial).toBeDefined()
+	expect(initial?.total).toBe(2n)
+	expect(initial?.live).toBe(true)
+	const names = initial?.results.map(result => (result.type === "file" ? getFileMeta(result.file.meta)?.name : null))
+	expect(names).toStrictEqual(["alpha.txt", "Beta.txt"])
+	// Consumed on first read.
+	expect(window.initialSnapshot()).toBeUndefined()
+
+	// A live upload pings the engine; the window listener delivers a fresh snapshot.
+	await state.uploadFile(new TextEncoder().encode("c"), {
+		parent: searchDir,
+		name: "gamma.txt"
+	})
+	expect(await poll(() => snapshots.some(snapshot => snapshot.total === 3n && snapshot.live), 120000)).toBe(true)
+
+	// Engine-local refilter.
+	await search.setConfig({
+		name: "beta",
+		itemType: undefined,
+		recursive: true,
+		caseSensitive: false
+	})
+	expect(await search.total()).toBe(1n)
+
+	// The uncovered add ran a resync; its progress arrived on the status listener.
+	expect(await poll(() => statusMessages.some(message => message.type === "resyncProgress"), 60000)).toBe(true)
+
+	await search.close()
+	expect(await search.isLive()).toBe(false)
+	window.free()
+	search.free()
 })
 
 afterAll(async () => {

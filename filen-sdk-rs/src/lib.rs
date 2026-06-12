@@ -13,9 +13,10 @@
 
 pub(crate) mod api;
 pub mod auth;
-// Gated on the feature ALONE — deliberately no wasm exclusion: the engine cannot run on wasm yet
-// (rusqlite 0.37, worker thread, block_on islands), and enabling `cache` there should FAIL the
-// build loudly rather than silently compile out, until a real wasm port lands.
+// Compiles on native AND wasm32-unknown-unknown (rusqlite ≥0.38 bundles a wasm SQLite). On wasm
+// the cache additionally requires `wasm-full` (worker/socket hosting) and the DB is the wasm
+// VFS's named in-memory store — per-session, repopulated by the startup resync; OPFS persistence
+// is a future step.
 #[cfg(feature = "cache")]
 pub mod cache;
 pub mod chats;

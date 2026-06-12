@@ -6,7 +6,7 @@ use std::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
 	},
-	time::{Duration, Instant},
+	time::Duration,
 };
 
 use crate::{
@@ -20,24 +20,30 @@ use crate::{
 	io::{RemoteDirectory, RemoteFile},
 	socket::DecryptedSocketEvent,
 };
-use crossbeam::channel::{Receiver, Sender};
 use filen_types::traits::CowHelpers;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
+
+// The worker is hosted by `runtime::spawn_async`: on native that is a dedicated thread's
+// current-thread tokio runtime (tokio::time available); on wasm it is a web worker with no tokio
+// runtime, so wasmtimer drives the retry timer.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use tokio::time::{Instant as TimerInstant, sleep_until};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasmtimer::{std::Instant as TimerInstant, tokio::sleep_until};
 
 use crate::cache::{
 	CacheError,
 	handle::{CacheMessage, ResyncProgress},
+	search::ReadTask,
 };
-/// How many durable `events` rows the drain loads and applies per iteration.
 const BATCH_SIZE: usize = 256;
-/// Bounded-memory backstop for the single UNBOUNDED event channel. The socket router runs on
-/// the SDK runtime and cannot block or persist, so it pushes to an unbounded channel; if the worker
-/// cannot drain fast enough and the channel reaches this many buffered events, the router SHEDS further
-/// events (drops them) and latches a `shed` flag. The worker then records a durable resync, which
-/// re-lists and recovers whatever was dropped — so a shed costs a resync, never a silent loss.
-/// crossbeam frees consumed blocks, so the channel shrinks back toward empty as the worker drains a
-/// burst; this cap only bounds the worst-case PEAK (each event is on the order of a few hundred bytes,
-/// so tens of MiB here) — important on the mobile (UniFFI) target.
+/// Bounded-memory backstop: when the worker cannot drain fast enough and the channel reaches this
+/// many buffered events, the socket router SHEDS further events and latches a `shed` flag; the
+/// worker then records a durable resync — so a shed costs a resync, never a silent loss.
+/// This bounds the worst-case PEAK (each event is on the order of a few hundred bytes, so tens of
+/// MiB here) — important on the mobile (UniFFI) target. The cap is the channel's CAPACITY, i.e.
+/// semaphore permits: nothing is preallocated, and `try_send` enforces the bound atomically.
 const EVENT_SHED_CAP: usize = 50_000;
 
 /// Bounded drive-lock acquisition for ONE resync attempt: the fibonacci poll ramp capped at 2 s
@@ -53,28 +59,21 @@ const RESYNC_LOCK_ATTEMPTS: usize = 8;
 /// freezing event application entirely.
 const RESYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Dependencies the worker needs to run a write-locked resync: an owned
-/// handle to the SDK [`Client`] and the Tokio runtime [`Handle`](tokio::runtime::Handle) the worker
-/// `block_on`s to drive the async listing from its `std::thread`. Captured once at construction
-/// ([`Client::add_sync_root`](crate::auth::Client::add_sync_root) spawns the worker from inside the
-/// app's runtime, so `Handle::current()` is valid there). `None` under unit-test construction (no live
-/// client/runtime); the resync path logs and no-ops when it is absent.
+/// `None` under unit-test construction (no live client); the resync path logs and no-ops when
+/// it is absent.
 #[derive(Clone)]
 pub(crate) struct ResyncDeps {
 	pub(crate) client: Arc<Client>,
-	pub(crate) rt_handle: tokio::runtime::Handle,
 }
 
 pub(crate) struct CacheState {
 	pub(crate) db: rusqlite::Connection,
-	/// The single UNBOUNDED event channel (Socket events from the callback + Manual events). Unbounded
-	/// so the socket router never blocks; its worst-case memory is bounded by [`EVENT_SHED_CAP`] (the
-	/// router sheds + the worker resyncs past that), and the worker draining it shrinks it back toward
-	/// empty (crossbeam frees consumed blocks).
-	event_receiver: Receiver<CacheThreadEvent>,
-	control_receiver: Receiver<CacheControlMessage>,
+	/// Bounded at [`EVENT_SHED_CAP`]: the socket router must never block, so it uses `try_send` and
+	/// sheds + flags a resync when full.
+	event_receiver: tokio::sync::mpsc::Receiver<CacheThreadEvent>,
+	control_receiver: UnboundedReceiver<CacheControlMessage>,
 	msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
-	/// Shed latch: set by the socket router when the channel hit [`EVENT_SHED_CAP`] and it had
+	/// Shed latch: set by the socket router when the BOUNDED event channel was full and it had
 	/// to drop events. The worker observes it once per drain and records a durable resync to recover the
 	/// dropped events, then clears it.
 	shed: Arc<AtomicBool>,
@@ -85,25 +84,28 @@ pub(crate) struct CacheState {
 	/// descends from one of these roots (the membership gate, in `sql/membership.rs`); EMPTY ⇒
 	/// nothing is cached. The production worker starts EMPTY — registrations arrive via
 	/// [`CacheControlMessage::AddSyncRoot`], and a uuid stops being a sync root when its LAST
-	/// registration is removed. Test constructors default this to `{account_root → no-op}`
-	/// (whole-account sync) so existing tests still exercise the machinery.
+	/// registration is removed.
 	sync_roots: HashMap<Uuid, RootRegistrations>,
 	/// Client + runtime handle for the write-locked resync island. `None` in unit tests.
 	resync: Option<ResyncDeps>,
-	/// One-shot retry timer armed by a NON-converged resync attempt (lock contention, transient
-	/// listing failures, partial convergence): the run loop's lowest-priority select arm fires
-	/// it and re-attempts. The retry itself is gated on the durable `needs_resync` flag, so a
-	/// stale fire is a no-op. `None` ⇒ nothing scheduled.
-	resync_retry: Option<Receiver<Instant>>,
+	/// Deadline of the one-shot retry timer armed by a NON-converged resync attempt (lock
+	/// contention, transient listing failures, partial convergence): the run loop's
+	/// lowest-priority select arm sleeps until it and re-attempts. The retry itself is gated on
+	/// the durable `needs_resync` flag, so a stale fire is a no-op. `None` ⇒ nothing scheduled.
+	resync_retry: Option<TimerInstant>,
+	/// Search read queries served against THIS connection between drains — the wasm read path
+	/// (the wasm VFS supports neither WAL nor a second connection). Native search engines read
+	/// via their own connection and never send here. `None` once every sender is gone (the arm
+	/// disables itself, like the engine's ping arm) and in unit-test construction.
+	read_tasks: Option<UnboundedReceiver<ReadTask>>,
 }
 
 #[cfg(test)]
 impl CacheState {
-	/// Create a CacheState with an in-memory DB for unit testing.
 	pub(crate) fn new_in_memory() -> Self {
 		let root_uuid = Uuid::new_v4();
-		let (event_sender, event_receiver) = crossbeam::channel::unbounded();
-		let (control_sender, control_receiver) = crossbeam::channel::unbounded();
+		let (event_sender, event_receiver) = tokio::sync::mpsc::channel(EVENT_SHED_CAP);
+		let (control_sender, control_receiver) = tokio::sync::mpsc::unbounded_channel();
 		drop(event_sender);
 		drop(control_sender);
 		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel(1);
@@ -119,6 +121,7 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
+			read_tasks: None,
 		};
 		state.init_db().unwrap();
 		state
@@ -129,8 +132,8 @@ impl CacheState {
 	/// app close/resume path). `init_db` only wipes when the `user_version` mismatches, so a second open
 	/// with the matching version preserves the data.
 	pub(crate) fn new_on_path(path: &Path, root_uuid: Uuid) -> Self {
-		let (event_sender, event_receiver) = crossbeam::channel::unbounded();
-		let (control_sender, control_receiver) = crossbeam::channel::unbounded();
+		let (event_sender, event_receiver) = tokio::sync::mpsc::channel(EVENT_SHED_CAP);
+		let (control_sender, control_receiver) = tokio::sync::mpsc::unbounded_channel();
 		drop(event_sender);
 		drop(control_sender);
 		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel(1);
@@ -146,6 +149,7 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
+			read_tasks: None,
 		};
 		state.init_db().unwrap();
 		state
@@ -156,8 +160,8 @@ impl CacheState {
 	/// and then drive the drain.
 	pub(crate) fn new_in_memory_with_producer() -> (Self, TestProducer) {
 		let root_uuid = Uuid::new_v4();
-		let (event_sender, event_receiver) = crossbeam::channel::unbounded();
-		let (control_sender, control_receiver) = crossbeam::channel::unbounded();
+		let (event_sender, event_receiver) = tokio::sync::mpsc::channel(EVENT_SHED_CAP);
+		let (control_sender, control_receiver) = tokio::sync::mpsc::unbounded_channel();
 		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel(100);
 		drop(msg_receiver);
 		let shed = Arc::new(AtomicBool::new(false));
@@ -172,6 +176,7 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
+			read_tasks: None,
 		};
 		state.init_db().unwrap();
 
@@ -183,8 +188,6 @@ impl CacheState {
 		(state, producer)
 	}
 
-	/// Test setter: install `map` as the sync roots, wrapping each callback as that root's single
-	/// registration (id 0).
 	pub(crate) fn set_test_sync_roots(&mut self, map: HashMap<Uuid, SyncRootCallback>) {
 		self.sync_roots = map
 			.into_iter()
@@ -197,8 +200,8 @@ impl CacheState {
 #[cfg(test)]
 #[allow(dead_code)] // `control` kept for symmetry / future shutdown tests
 pub(crate) struct TestProducer {
-	pub(crate) events: Sender<CacheThreadEvent>,
-	pub(crate) control: Sender<CacheControlMessage>,
+	pub(crate) events: tokio::sync::mpsc::Sender<CacheThreadEvent>,
+	pub(crate) control: UnboundedSender<CacheControlMessage>,
 	pub(crate) shed: Arc<AtomicBool>,
 }
 
@@ -209,9 +212,6 @@ pub(crate) enum ManualEvent {
 	ListDirRecursive(Vec<RemoteDirectory>, Vec<RemoteFile>),
 }
 
-/// A message delivered to the cache worker thread: either an event derived from the WebSocket
-/// (which may have failed to convert into a cacheable form) or a manually-injected event such as
-/// a recursive directory listing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum CacheThreadEvent {
@@ -222,8 +222,7 @@ pub(crate) enum CacheThreadEvent {
 /// A per-sync-root notification callback. Invoked POST-COMMIT on the worker thread with a
 /// borrowing iterator over the events applied to that root's subtree, each call wrapped in
 /// `catch_unwind`. `Send` so it can be moved to the worker thread; the iterator borrows a local owned
-/// `Vec`, never the rusqlite transaction. The cache is consumed only by an in-process Rust intermediary
-/// (the search / sync engine, which exposes its OWN FFI), so the borrowing shape needs no marshalling.
+/// `Vec`, never the rusqlite transaction.
 pub type SyncRootCallback = Box<dyn Fn(&mut dyn Iterator<Item = &CacheEvent<'_>>) + Send + 'static>;
 
 /// The live registrations for one sync root: `(registration_id, callback)` pairs. Multiple
@@ -232,9 +231,8 @@ pub type SyncRootCallback = Box<dyn Fn(&mut dyn Iterator<Item = &CacheEvent<'_>>
 /// when its last registration is removed.
 pub(crate) type RootRegistrations = Vec<(u64, SyncRootCallback)>;
 
-/// Build the default `{account_root → no-op}` sync-root map: whole-account sync with no notification.
-/// Used by the test constructors so the existing apply/drain/resync tests keep exercising the machinery
-/// (production registrations arrive via [`Client::add_sync_root`](crate::auth::Client::add_sync_root)).
+/// Default whole-account sync: the root uuid gates all membership and its no-op callback lets tests
+/// exercise the drain/apply/resync machinery without subscribing to notifications.
 #[cfg(test)]
 fn whole_account_sync_roots(account_root: Uuid) -> HashMap<Uuid, RootRegistrations> {
 	let mut sync_roots: HashMap<Uuid, RootRegistrations> = HashMap::new();
@@ -276,7 +274,7 @@ pub(crate) enum CacheControlMessage {
 }
 
 fn make_socket_event_callback(
-	events: Sender<CacheThreadEvent>,
+	events: tokio::sync::mpsc::Sender<CacheThreadEvent>,
 	shed: Arc<AtomicBool>,
 ) -> impl Fn(&DecryptedSocketEvent<'_>) + Send + 'static {
 	move |event| {
@@ -285,44 +283,70 @@ fn make_socket_event_callback(
 				CacheThreadEvent::Socket(event.into_owned_cow()),
 				&events,
 				&shed,
-				EVENT_SHED_CAP,
 			);
 		}
 	}
 }
 
-/// Route one event onto the worker's single UNBOUNDED event channel, UNLESS it already
-/// holds `cap` messages — then SHED it (drop it) and latch `shed`. This runs on the SDK socket
-/// runtime, which must not block or touch the DB, so an unbounded non-blocking `send` is the only
-/// option; `cap` bounds the worst-case PEAK memory, and a shed is recovered by the resync the worker
-/// triggers when it sees the latch. crossbeam frees consumed blocks, so the channel shrinks back toward
-/// empty once the worker drains a burst. Because a single FIFO channel preserves order on its own, the
-/// cap above is the ONLY backpressure — there is no second "overflow" channel or spill latch to manage.
+/// Route one event onto the worker's BOUNDED event channel — a full channel SHEDS the event
+/// (drops it) and latches `shed`. This runs on the SDK socket runtime, which must not block or
+/// touch the DB, so the non-blocking `try_send` is exactly right: the channel's capacity
+/// ([`EVENT_SHED_CAP`]) bounds the worst-case PEAK memory atomically (no shadow counter to keep
+/// in sync), and a shed is recovered by the resync the worker triggers when it sees the latch.
+/// Because a single FIFO channel preserves order on its own, the capacity is the ONLY
+/// backpressure — there is no second "overflow" channel or spill latch to manage.
 fn route_thread_event(
 	event: CacheThreadEvent,
-	events: &Sender<CacheThreadEvent>,
+	events: &tokio::sync::mpsc::Sender<CacheThreadEvent>,
 	shed: &AtomicBool,
-	cap: usize,
 ) {
-	if events.len() >= cap {
-		if !shed.swap(true, Ordering::AcqRel) {
-			log::warn!(
-				"cache event channel reached its {cap}-event cap; shedding events under sustained load — \
-				 a resync will recover the gap"
-			);
+	match events.try_send(event) {
+		Ok(()) => {}
+		Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+			// `event` intentionally dropped.
+			if !shed.swap(true, Ordering::AcqRel) {
+				log::warn!(
+					"cache event channel reached its {EVENT_SHED_CAP}-event cap; shedding events under \
+					 sustained load — a resync will recover the gap"
+				);
+			}
 		}
-		// `event` intentionally dropped.
-	} else {
-		// Unbounded, capped above; `send` never blocks and only errors if the worker has shut down.
-		let _ = events.send(event);
+		// The worker has shut down; nothing is listening.
+		Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+	}
+}
+
+/// Sleep until the resync-retry deadline. The `None` case is unreachable: the select arm is
+/// guarded by `is_some()`.
+async fn resync_retry_sleep(deadline: Option<TimerInstant>) {
+	if let Some(deadline) = deadline {
+		sleep_until(deadline).await;
+	}
+}
+
+/// Run one search read task against the worker's connection, catching panics: a poisoned query
+/// must not kill the worker (native unwinds; on wasm panics abort regardless). The panicked
+/// task's reply sender drops, surfacing as an error on the engine side.
+fn serve_read_task(task: ReadTask, db: &rusqlite::Connection) {
+	if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(db))).is_err() {
+		log::error!("a search read task panicked; the query errors on the engine side");
+	}
+}
+
+/// The `None` receiver case is unreachable: the select arm is guarded by `is_some()`.
+async fn recv_read_task(read_tasks: &mut Option<UnboundedReceiver<ReadTask>>) -> Option<ReadTask> {
+	match read_tasks {
+		Some(receiver) => receiver.recv().await,
+		None => None,
 	}
 }
 
 type InitResult = (
 	CacheState,
 	Box<dyn Fn(&DecryptedSocketEvent<'_>) + Send + 'static>,
-	Sender<CacheControlMessage>,
-	Sender<CacheThreadEvent>,
+	UnboundedSender<CacheControlMessage>,
+	tokio::sync::mpsc::Sender<CacheThreadEvent>,
+	UnboundedSender<ReadTask>,
 );
 
 impl CacheState {
@@ -331,7 +355,6 @@ impl CacheState {
 		root_uuid: Uuid,
 		msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 		client: Arc<Client>,
-		rt_handle: tokio::runtime::Handle,
 	) -> Result<InitResult, crate::Error> {
 		let connection = rusqlite::Connection::open(cache_path).map_err(|e| {
 			crate::Error::custom_with_source(
@@ -341,8 +364,9 @@ impl CacheState {
 			)
 		})?;
 
-		let (event_sender, event_receiver) = crossbeam::channel::unbounded();
-		let (control_sender, control_receiver) = crossbeam::channel::unbounded();
+		let (event_sender, event_receiver) = tokio::sync::mpsc::channel(EVENT_SHED_CAP);
+		let (control_sender, control_receiver) = tokio::sync::mpsc::unbounded_channel();
+		let (read_task_sender, read_task_receiver) = tokio::sync::mpsc::unbounded_channel();
 		let shed = Arc::new(AtomicBool::new(false));
 
 		let mut cache_state = CacheState {
@@ -354,8 +378,9 @@ impl CacheState {
 			root_uuid,
 			// Starts EMPTY (nothing cached); registrations arrive via `AddSyncRoot` control messages.
 			sync_roots: HashMap::new(),
-			resync: Some(ResyncDeps { client, rt_handle }),
+			resync: Some(ResyncDeps { client }),
 			resync_retry: None,
+			read_tasks: Some(read_task_receiver),
 		};
 
 		cache_state.init_db().map_err(|e| {
@@ -363,6 +388,17 @@ impl CacheState {
 				ErrorKind::Internal,
 				e,
 				Some("Failed to set up SQLite database"),
+			)
+		})?;
+
+		// Register the search matcher on the worker's connection too: the wasm read path runs
+		// search queries here (see `read_tasks`); on native this is a harmless extra (searches
+		// use their own connection, which registers it itself).
+		crate::cache::search::register_name_matches(&cache_state.db).map_err(|e| {
+			crate::Error::custom_with_source(
+				ErrorKind::Internal,
+				e,
+				Some("Failed to register the search matcher"),
 			)
 		})?;
 
@@ -375,10 +411,11 @@ impl CacheState {
 			Box::new(callback),
 			control_sender,
 			event_sender,
+			read_task_sender,
 		))
 	}
 
-	pub(crate) fn run(mut self) {
+	pub(crate) async fn run(mut self) {
 		// Startup / app-resume recovery, in order:
 		// 1. Apply anything a prior session persisted to `events` but did not drain (e.g. an abrupt
 		//    close) so the watermark reflects it BEFORE the gap-check — this lets a clean local catch-up
@@ -386,28 +423,25 @@ impl CacheState {
 		// 2. Catch up on changes that landed while the cache was entirely offline (a durably-flagged
 		//    hole, or the remote drive id having advanced past our watermark).
 		self.drain_pending(None);
-		self.maybe_run_startup_resync();
+		self.maybe_run_startup_resync().await;
 		loop {
-			// The retry-timer arm uses a `never()` stand-in while nothing is scheduled, so the
-			// select shape stays fixed.
-			let resync_retry = self
-				.resync_retry
-				.clone()
-				.unwrap_or_else(crossbeam::channel::never);
-			// `select_biased!` checks arms top-down: control (shutdown) first, then the single event
-			// channel, then the resync retry timer. A lone FIFO channel needs no spill latch or
-			// first-class overflow arm — order is intrinsic, so the previous two-channel TOCTOU
-			// dance is gone.
-			crossbeam::channel::select_biased! {
-				recv(self.control_receiver) -> control_event => {
-					// `select_biased!` selects a pending control message ahead of a non-empty event arm.
+			// `biased` checks arms top-down: control (shutdown) first, then search read tasks
+			// (quick SELECTs — prioritized over events so a sustained event flood can never
+			// starve a search query; the engine's debounce bounds read volume, so reads cannot
+			// starve events in return), then the single event channel, then the resync retry
+			// timer. A lone FIFO event channel needs no spill latch or first-class overflow
+			// arm — order is intrinsic, so the previous two-channel TOCTOU dance is gone.
+			tokio::select! {
+				biased;
+				control_event = self.control_receiver.recv() => {
+					// A pending control message is selected ahead of a non-empty event arm.
 					// A `Shutdown` — or every control sender having been dropped WITHOUT one (the
-					// defensive `Err(_)` case: the last `SyncRootHandle` and the worker references are
-					// gone) — is the NORMAL clean-shutdown path. Either way, drain everything currently
+					// `None` case: the last `SyncRootHandle` and the worker references are gone) —
+					// is the NORMAL clean-shutdown path. Either way, drain everything currently
 					// buffered into the durable store before exiting so it is not lost.
 					let shutdown = match control_event {
-						Ok(first) => self.process_control_burst(first),
-						Err(_) => true,
+						Some(first) => self.process_control_burst(first).await,
+						None => true,
 					};
 					if shutdown {
 						log::info!("Cache shutting down; draining buffered events first...");
@@ -415,22 +449,34 @@ impl CacheState {
 						return;
 					}
 				},
-				recv(self.event_receiver) -> event => {
-					let Ok(event) = event else {
+				read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
+					match read_task {
+						// Wasm search read: run against this connection, between drains. The
+						// query is a quick indexed/scan SELECT — never a write. A poisoned
+						// query must not kill the worker (mirrors `dispatch_batch`); its
+						// dropped reply sender surfaces as an error on the engine side.
+						Some(task) => serve_read_task(task, &self.db),
+						// Every sender gone (no live searches and the shared state dropped):
+						// disable the arm — polling a closed receiver in select would spin hot.
+						None => self.read_tasks = None,
+					}
+				},
+				event = self.event_receiver.recv() => {
+					let Some(event) = event else {
 						log::warn!("Event channel closed, draining and shutting down cache...");
 						self.drain_pending(None); // don't drop buffered events on disconnect
 						return;
 					};
 					self.drain_pending(Some(event));
 					// A drain that observed a hole/corrupt row/failed apply set needs_resync; heal it now.
-					self.maybe_run_resync();
+					self.maybe_run_resync().await;
 				},
-				recv(resync_retry) -> _ => {
+				_ = resync_retry_sleep(self.resync_retry), if self.resync_retry.is_some() => {
 					// A previous resync attempt did not converge (drive-lock contention or a
 					// transient failure) and scheduled this one-shot re-attempt. The flag-gated
 					// retry makes a stale fire harmless.
 					self.resync_retry = None;
-					self.maybe_run_resync();
+					self.maybe_run_resync().await;
 				},
 			}
 		}
@@ -508,7 +554,6 @@ impl CacheState {
 			}
 		}
 
-		// Then apply deferred Manual events on top of the freshly-applied socket state.
 		for manual in deferred {
 			if let Err(errors) = self.handle_manual_event(manual) {
 				self.surface_errors(errors);
@@ -516,9 +561,8 @@ impl CacheState {
 		}
 	}
 
-	/// Best-effort surface of cache errors to the main thread.
-	// TODO: distinguish a Full status channel (keep running) from a Closed one (main thread
-	// gone → shut down). For now errors are surfaced best-effort.
+	// TODO: distinguish a Full status channel (keep running) from a Closed one (main thread gone →
+	// shut down). For now errors are surfaced best-effort.
 	fn surface_errors(&self, errors: Vec<CacheError>) {
 		let _ = self.msg_sender.try_send(vec![CacheMessage::Error(errors)]);
 	}
@@ -656,7 +700,6 @@ impl CacheState {
 			// flag write is idempotent across batches.
 			self.commit_drain_batch(advanced, &to_delete, resync_needed)?;
 
-			// POST-COMMIT: notify each sync root's callback of the events that touched its subtree.
 			self.dispatch_batch(dispatch_buffer);
 		}
 		Ok(resync_needed)
@@ -694,10 +737,9 @@ impl CacheState {
 		// all roots' synthetics. They are committed together (below) so a crash mid-loop cannot clear
 		// `needs_resync` after one root while leaving another un-converged.
 		//
-		// `per_root` only holds roots that listed successfully. `finalize_resync` already handled the rest:
-		// a server-deleted root was dropped, and an all-transient-failure resync returned before reaching
-		// here. So an empty `per_root` means an empty config or an all-roots-deleted resync — nothing to
-		// diff and no deletes to fear, so the empty-listing guard below must not fire for it.
+		// `per_root` contains only roots that listed successfully (deleted/transient roots were handled
+		// before reaching here). An empty `per_root` means an empty config or an all-roots-deleted
+		// resync — nothing to diff, so the empty-listing guard below must not fire for it.
 		let had_listings = !per_root.is_empty();
 		let mut all_synthetics = Vec::new();
 		let mut any_listed = false;
@@ -759,8 +801,8 @@ impl CacheState {
 	}
 
 	/// Run the write-locked resync, surfacing any error to the main thread.
-	fn run_resync_surfacing_errors(&mut self) {
-		if let Err(e) = self.run_resync() {
+	async fn run_resync_surfacing_errors(&mut self) {
+		if let Err(e) = self.run_resync().await {
 			self.surface_errors(vec![*e]);
 		}
 	}
@@ -770,7 +812,7 @@ impl CacheState {
 	/// `add_sync_root` calls in quick succession) converges with a single listing pass instead of N.
 	/// Returns `true` if a `Shutdown` was encountered (the caller drains and exits; messages queued
 	/// behind the Shutdown are intentionally not processed).
-	fn process_control_burst(&mut self, first: CacheControlMessage) -> bool {
+	async fn process_control_burst(&mut self, first: CacheControlMessage) -> bool {
 		let mut added_new_root = false;
 		let mut message = Some(first);
 		while let Some(msg) = message {
@@ -782,8 +824,9 @@ impl CacheState {
 					callback,
 					ack,
 				} => {
-					added_new_root |=
-						self.handle_add_sync_root(uuid, registration_id, callback, ack);
+					added_new_root |= self
+						.handle_add_sync_root(uuid, registration_id, callback, ack)
+						.await;
 				}
 				CacheControlMessage::RemoveRegistration {
 					uuid,
@@ -791,7 +834,8 @@ impl CacheState {
 					evict,
 					ack,
 				} => {
-					self.handle_remove_registration(uuid, registration_id, evict, ack);
+					self.handle_remove_registration(uuid, registration_id, evict, ack)
+						.await;
 				}
 			}
 			message = self.control_receiver.try_recv().ok();
@@ -811,7 +855,7 @@ impl CacheState {
 			// already-current roots are accepted in v1; a per-root-bookmark skip is a future
 			// optimization.
 			log::info!("sync root(s) added; resyncing to populate");
-			self.run_resync_surfacing_errors();
+			self.run_resync_surfacing_errors().await;
 		}
 		false
 	}
@@ -834,7 +878,7 @@ impl CacheState {
 	/// its existence is established and its subtree is already converged; the new callback simply
 	/// joins the root's registrations. A COVERED uuid (cached, with its ancestry reaching an active
 	/// root) likewise skips both — see the fast path comment in the body.
-	fn handle_add_sync_root(
+	async fn handle_add_sync_root(
 		&mut self,
 		uuid: Uuid,
 		registration_id: u64,
@@ -865,7 +909,7 @@ impl CacheState {
 		}
 		if uuid != self.root_uuid
 			&& let Some(deps) = self.resync.clone()
-			&& let Err(e) = deps.rt_handle.block_on(deps.client.get_dir((&uuid).into()))
+			&& let Err(e) = deps.client.get_dir((&uuid).into()).await
 		{
 			let error = if matches!(
 				e.kind(),
@@ -901,14 +945,14 @@ impl CacheState {
 	/// Handle `RemoveRegistration`: drop one `(uuid, registration_id)` registration and, when the
 	/// ack is absent (the fire-and-forget Drop path), surface any eviction error to the status
 	/// callback instead.
-	fn handle_remove_registration(
+	async fn handle_remove_registration(
 		&mut self,
 		uuid: Uuid,
 		registration_id: u64,
 		evict: bool,
 		ack: Option<RemoveRegistrationAck>,
 	) {
-		let result = self.remove_registration(uuid, registration_id, evict);
+		let result = self.remove_registration(uuid, registration_id, evict).await;
 		match (ack, result) {
 			(Some(ack), result) => {
 				let _ = ack.send(result);
@@ -924,7 +968,7 @@ impl CacheState {
 	/// syncing `uuid`, and with `evict` also deletes its cached subtree. An unknown uuid/registration
 	/// (e.g. the root was already dropped server-side) is a harmless no-op — a stale handle's Drop
 	/// must never error. Returns `Ok(true)` iff the subtree was evicted.
-	fn remove_registration(
+	async fn remove_registration(
 		&mut self,
 		uuid: Uuid,
 		registration_id: u64,
@@ -949,13 +993,13 @@ impl CacheState {
 		if !evict {
 			return Ok(false);
 		}
-		self.evict_removed_root(uuid)?;
+		self.evict_removed_root(uuid).await?;
 		Ok(true)
 	}
 
 	/// Delete the cached subtree of a JUST-removed sync root (`uuid` must already be out of
 	/// `sync_roots`), protecting any still-active nested root.
-	fn evict_removed_root(&mut self, uuid: Uuid) -> Result<(), Box<CacheError>> {
+	async fn evict_removed_root(&mut self, uuid: Uuid) -> Result<(), Box<CacheError>> {
 		let db_err =
 			|e: rusqlite::Error, context: &str| Box::new(CacheError::db(e, context.to_string()));
 		if uuid == self.root_uuid {
@@ -971,11 +1015,10 @@ impl CacheState {
 			// retried by a later drain instead of stranding the survivors empty; then re-converge.
 			if !self.sync_roots.is_empty() {
 				self.mark_needs_resync()?;
-				self.run_resync_surfacing_errors();
+				self.run_resync_surfacing_errors().await;
 			}
 			return Ok(());
 		}
-		// Protect the remaining active roots (subtrees + ancestor paths) from the eviction + cascade.
 		let protected: Vec<Uuid> = self.sync_roots.keys().copied().collect();
 		self.evict_sync_root_subtree(uuid, &protected)
 			.map_err(|e| db_err(e, &format!("evicting sync root {uuid}")))
@@ -1041,7 +1084,6 @@ impl CacheState {
 		parent.ok().flatten()
 	}
 
-	/// Add the sync roots that own `uuid` (it, or any ancestor, is a sync-root key) to `owners`.
 	fn extend_owning_roots(&self, uuid: Uuid, owners: &mut Vec<Uuid>) {
 		if let Ok(roots) = self.owning_sync_roots(uuid, &self.sync_roots) {
 			owners.extend(roots);
@@ -1161,11 +1203,11 @@ impl CacheState {
 	/// Per-drain check: a hole/corrupt-row/failed-apply observed during LIVE operation set
 	/// `needs_resync`; heal it now. A no-op when the flag is clear, so the common path costs one cheap
 	/// `cache_meta` read per drain.
-	fn maybe_run_resync(&mut self) {
+	async fn maybe_run_resync(&mut self) {
 		match self.needs_resync() {
 			Ok(true) => {
 				log::info!("resync pending (hole flagged during live operation); resyncing");
-				self.run_resync_surfacing_errors();
+				self.run_resync_surfacing_errors().await;
 			}
 			Ok(false) => {}
 			Err(e) => self.surface_errors(vec![*e]),
@@ -1190,19 +1232,19 @@ impl CacheState {
 	/// changes that landed while the cache was offline, while skipping a needless full listing when
 	/// nothing changed. Falls back to the durable-flag-only check if there is no client (unit tests) or
 	/// the remote read fails (the live socket will still surface any later hole).
-	fn maybe_run_startup_resync(&mut self) {
+	async fn maybe_run_startup_resync(&mut self) {
 		let Some(deps) = self.resync.clone() else {
-			self.maybe_run_resync();
+			self.maybe_run_resync().await;
 			return;
 		};
-		let remote = match deps.rt_handle.block_on(deps.client.get_last_event_ids()) {
+		let remote = match deps.client.get_last_event_ids().await {
 			Ok(ids) => ids.drive,
 			Err(e) => {
 				log::warn!(
 					"startup gap-check: could not read the remote drive id ({e}); falling back to \
 					 the durable resync flag"
 				);
-				self.maybe_run_resync();
+				self.maybe_run_resync().await;
 				return;
 			}
 		};
@@ -1213,7 +1255,7 @@ impl CacheState {
 					 was flagged); catching up",
 					self.watermark().ok().flatten()
 				);
-				self.run_resync_surfacing_errors();
+				self.run_resync_surfacing_errors().await;
 			}
 			Ok(false) => log::debug!(
 				"startup: cache is up to date (remote drive id {remote} == watermark); no resync"
@@ -1223,21 +1265,22 @@ impl CacheState {
 			Err(e) => {
 				log::warn!("startup gap-check failed to read cache state; resyncing to be safe");
 				self.surface_errors(vec![*e]);
-				self.run_resync_surfacing_errors();
+				self.run_resync_surfacing_errors().await;
 			}
 		}
 	}
 
-	/// The write-locked resync island: on the worker thread, `block_on` an async listing of
-	/// the whole subtree under the drive lock, read the snapshot drive message id under the SAME lock
-	/// (so listing + watermark are consistent), then converge the cache via [`apply_resync`].
+	/// The write-locked resync: list every sync root's subtree under the drive lock, read the
+	/// snapshot drive message id under the SAME lock (so listing + watermark are consistent), then
+	/// converge the cache via [`apply_resync`].
 	///
-	/// The `block_on` parks the worker for the attempt's duration, but the socket callback keeps pushing
-	/// events onto the unbounded channel during that window (the worker persists + applies them when it
-	/// resumes), so nothing is lost. To keep that parked window BOUNDED, the drive lock is acquired with
-	/// a short schedule ([`RESYNC_LOCK_MAX_SLEEP`]/[`RESYNC_LOCK_ATTEMPTS`]) instead of the
-	/// effectively-unbounded default: a contended attempt fails fast, durably marks `needs_resync`, and
-	/// arms [`RESYNC_RETRY_INTERVAL`] — so under sustained contention the worker alternates bounded
+	/// The await occupies the single-threaded worker loop for the attempt's duration, but the socket
+	/// callback keeps pushing events onto the unbounded channel during that window (the worker
+	/// persists and applies them when it resumes), so nothing is lost. To keep that occupied window
+	/// BOUNDED, the drive lock is acquired with a short schedule
+	/// ([`RESYNC_LOCK_MAX_SLEEP`]/[`RESYNC_LOCK_ATTEMPTS`]) instead of the effectively-unbounded
+	/// default: a contended attempt fails fast, durably marks `needs_resync`, and arms
+	/// [`RESYNC_RETRY_INTERVAL`] — so under sustained contention the worker alternates bounded
 	/// attempts with guaranteed event-drain windows instead of freezing event application until the lock
 	/// is won. Any listing/lock failure likewise commits nothing and retries on the timer.
 	///
@@ -1247,7 +1290,7 @@ impl CacheState {
 	/// from the listing cannot have a listed descendant. MEMORY: the whole subtree plus
 	/// its synthetic events are held in RAM, like `list_dir_recursive` itself (which documents a >1GiB
 	/// footprint for very large trees); bounding this is deferred.
-	fn run_resync(&mut self) -> Result<(), Box<CacheError>> {
+	async fn run_resync(&mut self) -> Result<(), Box<CacheError>> {
 		let Some(deps) = self.resync.clone() else {
 			log::warn!(
 				"resync requested but client/runtime deps are absent (test construction?); skipping"
@@ -1275,8 +1318,8 @@ impl CacheState {
 		// `finalize_resync` still advances the watermark + clears the flag so the gap-check does not loop.)
 		let msg_sender = &self.msg_sender;
 		#[allow(clippy::type_complexity)]
-		let listing: Result<_, crate::Error> = deps.rt_handle.block_on(async {
-			// BOUNDED acquisition: the worker cannot apply events while parked in this island,
+		let island = async {
+			// BOUNDED acquisition: the worker cannot apply EVENTS while parked in this island,
 			// so a contended lock must fail the attempt quickly — the failure arm below leaves
 			// the durable flag set and arms the retry timer, and events drain in between.
 			let _lock = deps
@@ -1378,7 +1421,27 @@ impl CacheState {
 				any_transient,
 				remote_under_lock,
 			))
-		});
+		};
+		// Serve search read queries WHILE the island waits on the network: the worker is parked
+		// here for the lock wait plus the full listings (minutes on a large account), and the
+		// wasm read path has no other server — without this, every search query would queue for
+		// the resync's entire duration. The tasks are pure SELECTs against `self.db`, which the
+		// island never touches (all its DB work happens in `finalize_resync`, after it returns).
+		let listing: Result<_, crate::Error> = {
+			let mut island = std::pin::pin!(island);
+			loop {
+				tokio::select! {
+					biased;
+					listing = &mut island => break listing,
+					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
+						match read_task {
+							Some(task) => serve_read_task(task, &self.db),
+							None => self.read_tasks = None,
+						}
+					},
+				}
+			}
+		};
 
 		let (per_root_raw, deleted_roots, any_transient, remote_under_lock) = match listing {
 			Ok(listing) => listing,
@@ -1403,7 +1466,7 @@ impl CacheState {
 					&self.msg_sender,
 					ResyncProgress::Finished { converged: false },
 				);
-				self.resync_retry = Some(crossbeam::channel::after(RESYNC_RETRY_INTERVAL));
+				self.resync_retry = Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL);
 				return Ok(());
 			}
 		};
@@ -1427,7 +1490,7 @@ impl CacheState {
 		self.resync_retry = if converged {
 			None
 		} else {
-			Some(crossbeam::channel::after(RESYNC_RETRY_INTERVAL))
+			Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL)
 		};
 		result
 	}
@@ -1496,7 +1559,7 @@ impl CacheState {
 			}
 		}
 
-		// See the doc comment: an all-transient resync must not advance the watermark / clear the flag.
+		// An all-transient resync must not advance the watermark / clear the flag.
 		if per_root_raw.is_empty() && any_transient {
 			log::warn!(
 				"resync: every sync root failed to list transiently; leaving needs_resync set for retry"
@@ -1761,8 +1824,6 @@ fn convert_listing(
 	(cacheable_dirs, cacheable_files)
 }
 
-/// Wrap a rusqlite error as the single-element `Vec<CacheError>` the apply handlers return —
-/// centralises the `vec![CacheError::db(e, ...)]` pattern that recurs across every event handler.
 fn db_err_vec(error: rusqlite::Error, context: String) -> Vec<CacheError> {
 	vec![CacheError::db(error, context)]
 }
@@ -1779,7 +1840,6 @@ fn dispatch_presnapshot_target(event: &CacheEventType<'_>) -> Option<Uuid> {
 	}
 }
 
-/// Best-effort string for a caught panic payload.
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 	if let Some(s) = panic.downcast_ref::<&str>() {
 		(*s).to_string()

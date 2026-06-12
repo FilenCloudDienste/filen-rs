@@ -1,18 +1,21 @@
-//! UniFFI exposure of the cache's configuration surface. UniFFI-ONLY for now: the cache cannot
-//! compile to wasm at all yet (a deliberate compile error — see the `cache` module note in
-//! `lib.rs`), so the wasm twin of this module arrives with the wasm port rather than as
-//! unbuildable dead code today.
+//! FFI exposure of the cache's configuration surface, for BOTH UniFFI (mobile) and wasm (web).
 //!
-//! Follows the house FFI shape: owned MIRROR types converted from the core enums (the core
+//! Owned MIRROR types converted from the core enums (the core
 //! [`CacheMessage`] carries payloads that cannot cross the boundary — raw `rusqlite::Error`s and
 //! full `RemoteFile`/`RemoteDirectory` conversion-failure records — so errors are flattened to
-//! display strings), a `with_foreign` listener trait whose every invocation is `spawn_blocking`'d
-//! off the runtime, and a [`JsClient`] method whose body ships to the commander thread via
-//! `do_on_commander`.
+//! display strings). On UniFFI the listener is a `with_foreign` trait whose every invocation is
+//! `spawn_blocking`'d off the runtime; on wasm it is a `js_sys::Function` fed by a channel pump
+//! on the calling thread (the socket-listener pattern), since a JS function can never leave its
+//! thread. Method bodies ship to the commander thread via `do_on_commander`.
 
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+#[cfg(feature = "uniffi")]
+use std::sync::Arc;
 
+use filen_macros::js_type;
 use filen_types::fs::UuidStr;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen::JsValue;
 
 use crate::{
 	Error,
@@ -21,18 +24,10 @@ use crate::{
 	runtime::do_on_commander,
 };
 
-/// Receives every status-message batch the cache worker emits (see [`CacheStatusMessage`]).
-/// Registered ONCE via [`JsClient::configure_cache`] and reused across worker restarts.
-/// Invocations are dispatched with `spawn_blocking`, so a slow foreign implementation cannot
-/// stall the cache — but delivery is BEST-EFFORT (messages can drop under load), so treat each
-/// message as a fresh snapshot, never as a delta to accumulate.
-#[uniffi::export(with_foreign)]
-pub trait CacheStatusListener: Send + Sync {
-	fn on_messages(&self, messages: Vec<CacheStatusMessage>);
-}
-
 /// FFI mirror of [`CacheMessage`] (see its docs for the full semantics of each variant).
-#[derive(Debug, Clone, uniffi::Enum)]
+/// Delivery is BEST-EFFORT on every platform (messages can drop under load): treat each message
+/// as a fresh snapshot, never as a delta to accumulate.
+#[js_type(export, no_deser, tagged)]
 pub enum CacheStatusMessage {
 	/// Mirror of [`CacheMessage::Error`]: non-fatal worker errors, flattened to display strings
 	/// (the structured payloads cannot cross the FFI boundary; definitive failures still arrive
@@ -47,7 +42,7 @@ pub enum CacheStatusMessage {
 
 /// FFI mirror of [`ResyncProgress`] (see its docs for the resync lifecycle and the
 /// worker-global attribution caveats). `root_index`/`root_count` are widened from `usize`.
-#[derive(Debug, Clone, uniffi::Enum)]
+#[js_type(export, no_deser, tagged)]
 pub enum ResyncProgressMessage {
 	Started {
 		roots: Vec<UuidStr>,
@@ -106,6 +101,17 @@ impl From<ResyncProgress> for ResyncProgressMessage {
 	}
 }
 
+/// Receives every status-message batch the cache worker emits (see [`CacheStatusMessage`]).
+/// Registered ONCE via [`JsClient::configure_cache`] and reused across worker restarts.
+/// Invocations are dispatched with `spawn_blocking`, so a slow foreign implementation cannot
+/// stall the cache.
+#[cfg(feature = "uniffi")]
+#[uniffi::export(with_foreign)]
+pub trait CacheStatusListener: Send + Sync {
+	fn on_messages(&self, messages: Vec<CacheStatusMessage>);
+}
+
+#[cfg(feature = "uniffi")]
 #[uniffi::export]
 impl JsClient {
 	/// Pre-warm the cache: store the SQLite DB path and the global status listener on the
@@ -131,6 +137,48 @@ impl JsClient {
 				tokio::task::spawn_blocking(move || {
 					listener.on_messages(messages);
 				});
+			})
+			.await
+		})
+		.await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+impl JsClient {
+	/// Pre-warm the cache: store the DB name and the global status listener on the client.
+	/// PURE STORAGE — the worker (and its in-memory SQLite store: the wasm cache is per-session
+	/// and repopulated by the startup resync) starts with the first sync root.
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "configureCache")]
+	pub async fn configure_cache(
+		&self,
+		cache_path: String,
+		#[wasm_bindgen(unchecked_param_type = "(messages: CacheStatusMessage[]) => void")]
+		status_listener: web_sys::js_sys::Function,
+	) -> Result<(), Error> {
+		// The JS function can never leave this thread: the Send closure stored in the cache
+		// config only forwards mirrors over a channel, and this pump (owning the function)
+		// serializes + invokes on the calling thread — the socket-listener pattern.
+		let (sender, mut receiver) =
+			tokio::sync::mpsc::unbounded_channel::<Vec<CacheStatusMessage>>();
+		crate::runtime::spawn_local(async move {
+			while let Some(messages) = receiver.recv().await {
+				let serializer = serde_wasm_bindgen::Serializer::new()
+					.serialize_maps_as_objects(true)
+					.serialize_large_number_types_as_bigints(true);
+				let _ = status_listener.call1(
+					&JsValue::UNDEFINED,
+					&serde::Serialize::serialize(&messages, &serializer)
+						.expect("failed to serialize cache status messages (should be impossible)"),
+				);
+			}
+		});
+
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.configure_cache(PathBuf::from(cache_path), move |messages| {
+				let _ = sender.send(messages.into_iter().map(Into::into).collect());
 			})
 			.await
 		})

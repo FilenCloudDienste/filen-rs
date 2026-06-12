@@ -5,10 +5,14 @@
 //! events reach it as bare refresh PINGS: any committed batch touching the subtree schedules a
 //! debounced re-query of the count and every window.
 //!
-//! Spawned via [`runtime::spawn_async`](crate::runtime::spawn_async) — on native that is a
-//! dedicated thread running a current-thread tokio runtime (so `tokio::time` is available for
-//! the debounce and blocking SQLite queries are fine: nothing else runs on it); the loop body is
-//! plain async over channels, so the shape ports to a wasm worker later.
+//! Hosted per platform: native spawns a dedicated thread via
+//! [`runtime::spawn_async`](crate::runtime::spawn_async) (a current-thread tokio runtime, so
+//! `tokio::time` drives the debounce and the engine's blocking SQLite reads are fine: nothing
+//! else runs there); wasm runs the loop on the CALLING thread's local executor via
+//! [`runtime::spawn_local`](crate::runtime::spawn_local) — the wasm engine never blocks (reads
+//! round-trip through [`ReadConn::Worker`], wasmtimer drives the debounce), so a dedicated
+//! per-search worker would be needless weight. FFI entry points call `create_search` on the
+//! commander, so that is where the engine lives in practice.
 //!
 //! Channel topology: the PINGS channel's only sender lives inside the sync-root callback on the
 //! cache worker — its disconnect is the TERMINAL signal (root deleted server-side, or the worker
@@ -27,20 +31,29 @@ use std::{
 	time::Duration,
 };
 
-use rusqlite::Connection;
 use uuid::Uuid;
 
 use super::{
 	config::{CompiledFilter, SearchConfig},
-	hydrate::{self, Scope},
+	hydrate::{self, ReadConn, ReadTask, Scope},
 	result::SearchSnapshot,
 };
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use tokio::time::{Instant as TimerInstant, sleep_until as timer_sleep_until};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasmtimer::{std::Instant as TimerInstant, tokio::sleep_until as timer_sleep_until};
 
 /// Refresh coalescing interval: bursts of pings (a resync flood) collapse into at most one
 /// re-query per interval. A refresh re-runs the count plus every window query — with a needle
 /// that scans the whole scope (order of 100–300 ms on a 100k-item drive), so this is
 /// deliberately coarser than UI-frame latency. `GetRange`/`SetConfig` replies are exempt.
 const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Per-search cap on live windows. Every refresh re-queries ALL windows in one synchronous
+/// closure on the read connection (one ReadTask on wasm — see [`Engine::refresh`]), so this
+/// bounds that closure's worst-case stall (~hundreds of ms per window on a 100k-item scope).
+const MAX_WINDOWS: usize = 16;
 
 /// Per-window callback; receives a FRESH snapshot whenever the window's contents (or the total)
 /// change. Runs on the engine task: keep it cheap and non-blocking, and never move the
@@ -84,13 +97,21 @@ impl Drop for LiveGuard {
 	}
 }
 
+/// How the engine reads the cache DB — resolved by `create_search` per platform: native opens a
+/// dedicated READ-ONLY connection on the given path (WAL concurrent reads), wasm ships query
+/// closures to the cache worker's single connection (see [`ReadConn`]).
+pub(super) enum ReadSource {
+	Path(PathBuf),
+	Worker(tokio::sync::mpsc::UnboundedSender<ReadTask>),
+}
+
 pub(super) struct EngineInit {
 	pub(super) root: Uuid,
 	/// `true` when `root` IS the account root: the scope queries then skip the recursive-CTE
 	/// subtree walk entirely (everything cached lives under the account root).
 	pub(super) is_account_root: bool,
 	pub(super) config: SearchConfig,
-	pub(super) db_path: PathBuf,
+	pub(super) read_source: ReadSource,
 	pub(super) pings: tokio::sync::mpsc::UnboundedReceiver<()>,
 	pub(super) commands: tokio::sync::mpsc::UnboundedReceiver<EngineMsg>,
 	pub(super) shared: Arc<SearchShared>,
@@ -102,7 +123,7 @@ struct Engine {
 	root: Uuid,
 	is_account_root: bool,
 	filter: CompiledFilter,
-	conn: Option<Connection>,
+	conn: Option<ReadConn>,
 	/// `Some` when opening the connection failed terminally — replied to gets/set_configs so the
 	/// failure is visible.
 	build_error: Option<String>,
@@ -118,7 +139,7 @@ pub(super) async fn run(init: EngineInit) {
 		root,
 		is_account_root,
 		config,
-		db_path,
+		read_source,
 		pings,
 		mut commands,
 		shared,
@@ -138,9 +159,9 @@ pub(super) async fn run(init: EngineInit) {
 		shared,
 		live: true,
 	};
-	engine.build(&db_path);
+	engine.build(read_source).await;
 
-	let mut debounce_deadline: Option<tokio::time::Instant> = None;
+	let mut debounce_deadline: Option<TimerInstant> = None;
 	loop {
 		tokio::select! {
 			biased;
@@ -148,7 +169,7 @@ pub(super) async fn run(init: EngineInit) {
 				match command {
 					None | Some(EngineMsg::Shutdown) => break,
 					Some(EngineMsg::GetRange { range, callback, reply }) => {
-						let _ = reply.send(engine.add_window(range, callback));
+						let _ = reply.send(engine.add_window(range, callback).await);
 					}
 					Some(EngineMsg::DropWindow(id)) => {
 						engine.windows.remove(&id);
@@ -158,7 +179,7 @@ pub(super) async fn run(init: EngineInit) {
 						// Refresh every window against the new filter right away —
 						// `set_config` semantics stay crisp, no debounce lag.
 						if result.is_ok() {
-							engine.refresh();
+							engine.refresh().await;
 							debounce_deadline = None;
 						}
 						let _ = reply.send(result);
@@ -169,15 +190,13 @@ pub(super) async fn run(init: EngineInit) {
 				match ping {
 					Some(()) => {
 						if debounce_deadline.is_none() {
-							debounce_deadline = Some(tokio::time::Instant::now() + DEBOUNCE);
+							debounce_deadline = Some(TimerInstant::now() + DEBOUNCE);
 						}
 					}
 					None => {
-						// TERMINAL: the worker dropped our registration (root deleted
-						// server-side) or stopped entirely (flush/failure). Disable the pings
-						// arm and fire each window ONCE with its last-delivered results — no
-						// re-query: in the deleted-root case the subtree rows are already
-						// cascade-deleted, so re-querying would deliver an empty "final" view.
+						// TERMINAL: worker dropped our registration (root deleted
+						// server-side) or stopped entirely. Disable the pings arm so the
+						// closed receiver does not spin the select loop hot.
 						engine.pings = None;
 						engine.go_terminal();
 						debounce_deadline = None;
@@ -185,7 +204,7 @@ pub(super) async fn run(init: EngineInit) {
 				}
 			}
 			_ = sleep_until(debounce_deadline), if debounce_deadline.is_some() => {
-				engine.refresh();
+				engine.refresh().await;
 				debounce_deadline = None;
 			}
 		}
@@ -205,10 +224,10 @@ async fn recv_ping(pings: &mut Option<tokio::sync::mpsc::UnboundedReceiver<()>>)
 	}
 }
 
-async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+async fn sleep_until(deadline: Option<TimerInstant>) {
 	// The `None` case is unreachable: the select arm is guarded by `deadline.is_some()`.
 	if let Some(deadline) = deadline {
-		tokio::time::sleep_until(deadline).await;
+		timer_sleep_until(deadline).await;
 	}
 }
 
@@ -225,25 +244,40 @@ impl Engine {
 		}
 	}
 
-	/// Open the read connection and prime the shared total. There is no index to build: queries
+	/// Resolve the read path and prime the shared total. There is no index to build: queries
 	/// always read the CURRENT committed DB, so batches committed before this point are covered
 	/// by the queries themselves and later ones arrive as refresh pings.
-	fn build(&mut self, db_path: &std::path::Path) {
-		let result = (|| -> rusqlite::Result<(Connection, usize)> {
-			let conn = hydrate::open_read_connection(db_path)?;
-			let total = hydrate::count_results(&conn, self.scope(), &self.filter)?;
-			Ok((conn, total))
-		})();
-		match result {
-			Ok((conn, total)) => {
+	async fn build(&mut self, read_source: ReadSource) {
+		let conn = match read_source {
+			ReadSource::Path(path) => match hydrate::open_read_connection(&path) {
+				Ok(conn) => ReadConn::Direct(conn),
+				Err(e) => {
+					log::error!("search engine failed to open its read connection: {e}");
+					self.build_error = Some(e.to_string());
+					return;
+				}
+			},
+			ReadSource::Worker(sender) => ReadConn::Worker(sender),
+		};
+		let scope = self.scope();
+		let filter = self.filter.clone();
+		match conn
+			.run(move |conn| hydrate::count_results(conn, scope, &filter))
+			.await
+		{
+			Ok(total) => {
 				self.shared.total.store(total, Ordering::Release);
-				self.conn = Some(conn);
 			}
 			Err(e) => {
-				log::error!("search engine failed to open its read connection: {e}");
-				self.build_error = Some(e.to_string());
+				// TRANSIENT, not terminal: on the worker path the likeliest cause is a reply
+				// timeout while the worker applies a heavy burst (first sync!) — latching
+				// `build_error` here would brick the search on a one-off slow reply. Keep the
+				// connection; `total` stays 0 until the first ping/getRange re-queries. (A
+				// connection that cannot OPEN is the terminal case, handled above.)
+				log::error!("search engine failed its initial count (will retry on use): {e}");
 			}
 		}
+		self.conn = Some(conn);
 	}
 
 	fn set_config(&mut self, config: &SearchConfig) -> Result<(), String> {
@@ -257,8 +291,7 @@ impl Engine {
 		Ok(())
 	}
 
-	/// One window's fresh contents plus the current total, straight from the DB.
-	fn snapshot(&self, range: &Range<usize>) -> rusqlite::Result<SearchSnapshot> {
+	async fn snapshot(&self, range: &Range<usize>) -> rusqlite::Result<SearchSnapshot> {
 		let Some(conn) = &self.conn else {
 			return Ok(SearchSnapshot {
 				results: Vec::new(),
@@ -266,8 +299,20 @@ impl Engine {
 				live: self.live,
 			});
 		};
-		let results = hydrate::window_results(conn, self.scope(), &self.filter, range)?;
-		let total = hydrate::count_results(conn, self.scope(), &self.filter)?;
+		let scope = self.scope();
+		let filter = self.filter.clone();
+		let range = range.clone();
+		let (results, total) = conn
+			.run(move |conn| {
+				// One read transaction so `results` and `total` come from the same DB state
+				// (see `refresh` for the torn-snapshot rationale).
+				let tx = conn.unchecked_transaction()?;
+				Ok((
+					hydrate::window_results(&tx, scope, &filter, &range)?,
+					hydrate::count_results(&tx, scope, &filter)?,
+				))
+			})
+			.await?;
 		Ok(SearchSnapshot {
 			results,
 			total,
@@ -275,7 +320,7 @@ impl Engine {
 		})
 	}
 
-	fn add_window(
+	async fn add_window(
 		&mut self,
 		range: Range<usize>,
 		callback: SearchWindowCallback,
@@ -286,7 +331,15 @@ impl Engine {
 				.clone()
 				.unwrap_or_else(|| "search connection unavailable".to_string()));
 		}
-		let snapshot = self.snapshot(&range).map_err(|e| e.to_string())?;
+		// Bounds the refresh batch: all windows re-query inside ONE synchronous closure on the
+		// cache worker (wasm), so an unbounded window count would stall the worker — long
+		// enough to starve the drive-lock keep-alive during a resync. A UI needs a handful.
+		if self.windows.len() >= MAX_WINDOWS {
+			return Err(format!(
+				"too many live search windows (max {MAX_WINDOWS}); drop unused window handles"
+			));
+		}
+		let snapshot = self.snapshot(&range).await.map_err(|e| e.to_string())?;
 		let id = self.next_window_id;
 		self.next_window_id += 1;
 		self.windows.insert(
@@ -306,31 +359,53 @@ impl Engine {
 	/// query (e.g. a busy timeout) keeps that window's last-delivered snapshot; the next ping
 	/// retries. A panicking callback is caught (mirroring the cache worker's dispatch) and its
 	/// window dropped — it never kills the engine.
-	fn refresh(&mut self) {
+	async fn refresh(&mut self) {
 		let Some(conn) = &self.conn else {
 			return;
 		};
 		let scope = self.scope();
-		let total = match hydrate::count_results(conn, scope, &self.filter) {
-			Ok(total) => total,
+		let filter = self.filter.clone();
+		let window_ranges: Vec<(u64, Range<usize>)> = self
+			.windows
+			.iter()
+			.map(|(id, window)| (*id, window.requested_range.clone()))
+			.collect();
+		// ONE round-trip for the count plus every window, inside one read transaction: on the
+		// wasm worker path the connection commits event batches BETWEEN tasks, so split queries
+		// could pair a `total` from one DB state with `results` from another (and the equality
+		// suppression below would then sit on torn data); the transaction gives the same
+		// guarantee against the concurrent WAL writer on the native direct path.
+		let batch = conn
+			.run(move |conn| {
+				let tx = conn.unchecked_transaction()?;
+				let total = hydrate::count_results(&tx, scope, &filter)?;
+				let windows = window_ranges
+					.into_iter()
+					.map(|(id, range)| {
+						let results = hydrate::window_results(&tx, scope, &filter, &range);
+						(id, results)
+					})
+					.collect::<Vec<_>>();
+				Ok((total, windows))
+			})
+			.await;
+		let (total, window_results) = match batch {
+			Ok(batch) => batch,
 			Err(e) => {
-				log::error!("search refresh failed counting results: {e}");
+				log::error!("search refresh failed: {e}");
 				return;
 			}
 		};
 		self.shared.total.store(total, Ordering::Release);
-		let ids: Vec<u64> = self.windows.keys().copied().collect();
 		let mut poisoned: Vec<u64> = Vec::new();
-		for id in ids {
-			let window = &self.windows[&id];
-			let results =
-				match hydrate::window_results(conn, scope, &self.filter, &window.requested_range) {
-					Ok(results) => results,
-					Err(e) => {
-						log::error!("search refresh failed querying window {id}: {e}");
-						continue;
-					}
-				};
+		for (id, results) in window_results {
+			let results = match results {
+				Ok(results) => results,
+				Err(e) => {
+					log::error!("search refresh failed querying window {id}: {e}");
+					continue;
+				}
+			};
 			let snapshot = SearchSnapshot {
 				results,
 				total,
@@ -357,8 +432,9 @@ impl Engine {
 		}
 	}
 
-	/// The one-time terminal fire: every window gets its LAST-DELIVERED results re-sent with
-	/// `live: false`.
+	/// Re-sends LAST-DELIVERED results (no re-query) with `live: false` — in the deleted-root
+	/// case the subtree rows are already cascade-deleted, so a re-query would deliver a false
+	/// empty "final" view.
 	fn go_terminal(&mut self) {
 		if !self.live {
 			return;
@@ -441,7 +517,7 @@ mod tests {
 				root,
 				is_account_root: true,
 				config: SearchConfig::new(),
-				db_path,
+				read_source: ReadSource::Path(db_path),
 				pings: ping_receiver,
 				commands: command_receiver,
 				shared: shared.clone(),
@@ -467,6 +543,14 @@ mod tests {
 			range: Range<usize>,
 			callback: SearchWindowCallback,
 		) -> (SearchSnapshot, u64) {
+			self.try_get_range(range, callback).unwrap()
+		}
+
+		fn try_get_range(
+			&self,
+			range: Range<usize>,
+			callback: SearchWindowCallback,
+		) -> Result<(SearchSnapshot, u64), String> {
 			let (reply_sender, reply_receiver) = tokio::sync::oneshot::channel();
 			self.commands
 				.send(EngineMsg::GetRange {
@@ -475,7 +559,7 @@ mod tests {
 					reply: reply_sender,
 				})
 				.unwrap();
-			reply_receiver.blocking_recv().unwrap().unwrap()
+			reply_receiver.blocking_recv().unwrap()
 		}
 
 		fn send_ping(&self) {
@@ -549,6 +633,32 @@ mod tests {
 			.unwrap_or(());
 	}
 
+	/// The per-search window cap bounds the batched refresh closure (one synchronous ReadTask
+	/// re-queries every window on wasm): the cap'th add errors, and dropping a window frees a
+	/// slot.
+	#[test]
+	fn window_cap_rejects_excess_windows_and_frees_on_drop() {
+		let (path, root, _state) = populated_db();
+		let engine = TestEngine::spawn(path, root);
+		let mut ids = Vec::new();
+		for _ in 0..MAX_WINDOWS {
+			let (_captured, callback) = capturing_callback();
+			let (_snapshot, id) = engine.get_range(0..1, callback);
+			ids.push(id);
+		}
+		let (_captured, callback) = capturing_callback();
+		let err = engine
+			.try_get_range(0..1, callback)
+			.expect_err("window {MAX_WINDOWS} must be rejected");
+		assert!(err.contains("too many live search windows"), "got: {err}");
+
+		engine.commands.send(EngineMsg::DropWindow(ids[0])).unwrap();
+		let (_captured, callback) = capturing_callback();
+		engine
+			.try_get_range(0..1, callback)
+			.expect("a freed slot admits a new window");
+	}
+
 	#[test]
 	fn terminal_fires_final_live_false_snapshot_and_keeps_serving() {
 		let (path, root, _state) = populated_db();
@@ -572,7 +682,6 @@ mod tests {
 		);
 		assert!(!engine.shared.live.load(Ordering::Acquire));
 
-		// Terminal but still answering queries over the (now-frozen) cache.
 		let (_captured2, callback2) = capturing_callback();
 		let (frozen, _id2) = engine.get_range(0..10, callback2);
 		assert!(!frozen.live);

@@ -1,16 +1,21 @@
-//! UniFFI exposure of the cache-backed search. UniFFI-ONLY for now, like the parent cache FFI
-//! module (`cache::js_impl`) — the wasm twin arrives with the cache's wasm port.
+//! FFI exposure of the cache-backed search, for BOTH UniFFI (mobile) and wasm (web).
 //!
 //! Results cross as the SAME `Dir`/`File` types the rest of the FFI API returns (via the
 //! lossless `Cacheable* → Remote*` conversions), so a search hit can be fed straight back into
 //! download/move/share calls without a second lookup. The core [`Search`] lives inside
 //! [`CacheSearch`] behind a `Mutex<Option<_>>` because [`Search::close`] consumes it, which an
-//! FFI object (always held behind an `Arc`) can only express by interior take.
+//! FFI object (always held behind a shared handle) can only express by interior take. Window
+//! listeners follow each platform's callback discipline: `spawn_blocking` per invocation on
+//! UniFFI, a channel-pumped `js_sys::Function` on wasm.
 
+#[cfg(feature = "uniffi")]
 use std::sync::Arc;
 
+use filen_macros::js_type;
 use filen_types::fs::UuidStr;
 use uuid::Uuid;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen::JsValue;
 
 use super::{
 	Search, SearchConfig, SearchItemType, SearchResult, SearchSnapshot, SearchWindowHandle,
@@ -23,38 +28,56 @@ use crate::{
 	runtime::do_on_commander,
 };
 
-/// Receives fresh snapshots for ONE window whenever its contents or the total change (the
-/// initial snapshot is returned by [`CacheSearch::get_range`], never delivered here). Dispatched
-/// via `spawn_blocking`, so a slow foreign implementation cannot stall the search engine. A
-/// snapshot with `live: false` is TERMINAL for the whole search and fires at most once per
-/// window.
-#[uniffi::export(with_foreign)]
-pub trait CacheSearchWindowListener: Send + Sync {
-	fn on_snapshot(&self, snapshot: CacheSearchSnapshot);
+/// FFI mirror of [`SearchItemType`]. Hand-rolled derives (not `js_type`): the macro's tagged
+/// twin generation has no use for a fieldless enum, and the config struct's serde derives need
+/// serde on every platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(tsify::Tsify),
+	tsify(from_wasm_abi, into_wasm_abi)
+)]
+pub enum CacheSearchItemType {
+	All,
+	File,
+	Dir,
+}
+
+impl From<CacheSearchItemType> for SearchItemType {
+	fn from(item_type: CacheSearchItemType) -> Self {
+		match item_type {
+			CacheSearchItemType::All => Self::All,
+			CacheSearchItemType::File => Self::File,
+			CacheSearchItemType::Dir => Self::Dir,
+		}
+	}
 }
 
 /// FFI mirror of [`SearchConfig`].
-#[derive(Debug, Clone, uniffi::Record)]
+#[js_type(import)]
 pub struct CacheSearchConfig {
 	/// Substring match on item names (trimmed + NFC-normalized; matched case-insensitively with
 	/// Unicode simple case folding unless `case_sensitive`). `None` matches everything.
-	#[uniffi(default = None)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub name: Option<String>,
-	/// `None` means [`SearchItemType::All`] (UniFFI cannot express an enum-variant default).
-	#[uniffi(default = None)]
-	pub item_type: Option<SearchItemType>,
+	/// `None` means [`CacheSearchItemType::All`] (UniFFI cannot express an enum-variant
+	/// default).
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub item_type: Option<CacheSearchItemType>,
 	/// `true`: match the whole subtree; `false`: direct children only (a live, sorted
 	/// directory listing).
-	#[uniffi(default = true)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = true))]
 	pub recursive: bool,
-	#[uniffi(default = false)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = false))]
 	pub case_sensitive: bool,
 }
 
 impl From<CacheSearchConfig> for SearchConfig {
 	fn from(config: CacheSearchConfig) -> Self {
 		let mut out = Self::new()
-			.with_item_type(config.item_type.unwrap_or_default())
+			.with_item_type(config.item_type.map(Into::into).unwrap_or_default())
 			.with_recursive(config.recursive)
 			.with_case_sensitive(config.case_sensitive);
 		out.name = config.name;
@@ -64,7 +87,7 @@ impl From<CacheSearchConfig> for SearchConfig {
 
 /// FFI mirror of [`SearchResult`]: the same `Dir`/`File` payloads the rest of the API uses,
 /// directly actionable without a second lookup.
-#[derive(Debug, Clone, uniffi::Enum)]
+#[js_type(export, no_deser, tagged)]
 pub enum CacheSearchResult {
 	Dir { dir: Dir },
 	File { file: File },
@@ -85,7 +108,7 @@ impl From<SearchResult> for CacheSearchResult {
 
 /// FFI mirror of [`SearchSnapshot`]: one window's FULL fresh contents plus the total match
 /// count — never a delta. Treat each delivery as the window's new truth.
-#[derive(Debug, Clone, uniffi::Record)]
+#[js_type(export, no_deser)]
 pub struct CacheSearchSnapshot {
 	/// The window's current contents (name-ascending, directories first).
 	pub results: Vec<CacheSearchResult>,
@@ -106,34 +129,98 @@ impl From<SearchSnapshot> for CacheSearchSnapshot {
 	}
 }
 
+/// Keeps one window subscription alive: releasing the foreign handle unsubscribes the window
+/// (its listener never fires again). Holds only a weak engine reference, so an outliving handle
+/// never keeps a closed search alive. UniFFI-only: the wasm window type embeds the core handle
+/// directly, so exporting this to the web bundle would only add a dead, unconstructible class.
+#[cfg(feature = "uniffi")]
+#[derive(uniffi::Object)]
+pub struct CacheSearchWindowHandle {
+	_handle: SearchWindowHandle,
+}
+
 /// One registered window: the window's initial snapshot plus the RAII handle keeping the
 /// subscription alive.
+#[cfg(feature = "uniffi")]
 #[derive(uniffi::Record)]
 pub struct CacheSearchWindow {
 	pub snapshot: CacheSearchSnapshot,
 	pub handle: Arc<CacheSearchWindowHandle>,
 }
 
-/// Keeps one window subscription alive: releasing the foreign handle unsubscribes the window
-/// (its listener never fires again). Holds only a weak engine reference, so an outliving handle
-/// never keeps a closed search alive.
-#[derive(uniffi::Object)]
-pub struct CacheSearchWindowHandle {
-	_handle: SearchWindowHandle,
-}
-
 /// FFI handle to a live cache-backed search (see the cache search module docs for the
 /// consistency model and costs). Releasing the foreign object shuts the engine down best-effort
 /// — like dropping the Rust [`Search`] — and releases the search's sync-root registration;
 /// [`close`](Self::close) does the same deterministically.
-#[derive(uniffi::Object)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen
+)]
 pub struct CacheSearch {
 	root: UuidStr,
 	/// `Some` until [`close`](Self::close) takes it — the core close consumes the [`Search`],
-	/// which an `Arc`-held FFI object can only express by interior take.
+	/// which a shared FFI handle can only express by interior take.
 	inner: tokio::sync::Mutex<Option<Search>>,
 }
 
+impl CacheSearch {
+	async fn total_inner(&self) -> u64 {
+		self.inner
+			.lock()
+			.await
+			.as_ref()
+			.map_or(0, |search| search.total() as u64)
+	}
+
+	async fn is_live_inner(&self) -> bool {
+		self.inner
+			.lock()
+			.await
+			.as_ref()
+			.is_some_and(|search| search.is_live())
+	}
+
+	async fn get_range_inner(
+		&self,
+		start: u64,
+		end: u64,
+		callback: super::SearchWindowCallback,
+	) -> Result<(CacheSearchSnapshot, SearchWindowHandle), Error> {
+		let guard = self.inner.lock().await;
+		let search = guard.as_ref().ok_or_else(search_closed)?;
+		let range = usize::try_from(start).unwrap_or(usize::MAX)
+			..usize::try_from(end).unwrap_or(usize::MAX);
+		let (snapshot, handle) = search.get_range(range, callback).await?;
+		Ok((snapshot.into(), handle))
+	}
+
+	async fn set_config_inner(&self, config: CacheSearchConfig) -> Result<(), Error> {
+		let guard = self.inner.lock().await;
+		let search = guard.as_ref().ok_or_else(search_closed)?;
+		search.set_config(config.into()).await
+	}
+
+	async fn close_inner(&self) {
+		let search = self.inner.lock().await.take();
+		if let Some(search) = search {
+			search.close().await;
+		}
+	}
+}
+
+/// Receives fresh snapshots for ONE window whenever its contents or the total change (the
+/// initial snapshot is returned by [`CacheSearch::get_range`], never delivered here). Dispatched
+/// via `spawn_blocking`, so a slow foreign implementation cannot stall the search engine. A
+/// snapshot with `live: false` is TERMINAL for the whole search and fires at most once per
+/// window.
+#[cfg(feature = "uniffi")]
+#[uniffi::export(with_foreign)]
+pub trait CacheSearchWindowListener: Send + Sync {
+	fn on_snapshot(&self, snapshot: CacheSearchSnapshot);
+}
+
+#[cfg(feature = "uniffi")]
 #[uniffi::export]
 impl CacheSearch {
 	/// The searched directory's uuid — correlate with the `ResyncProgress` /
@@ -145,20 +232,12 @@ impl CacheSearch {
 	/// Total matches currently in the result set. Advisory — each snapshot carries its own
 	/// coherent total. `0` after [`close`](Self::close).
 	pub async fn total(&self) -> u64 {
-		self.inner
-			.lock()
-			.await
-			.as_ref()
-			.map_or(0, |search| search.total() as u64)
+		self.total_inner().await
 	}
 
 	/// `false` once the search went terminal — or after [`close`](Self::close).
 	pub async fn is_live(&self) -> bool {
-		self.inner
-			.lock()
-			.await
-			.as_ref()
-			.is_some_and(|search| search.is_live())
+		self.is_live_inner().await
 	}
 
 	/// Subscribe a window over `start..end` of the sorted result set (CLAMPED to the available
@@ -172,13 +251,10 @@ impl CacheSearch {
 		end: u64,
 		listener: Arc<dyn CacheSearchWindowListener>,
 	) -> Result<CacheSearchWindow, Error> {
-		let guard = self.inner.lock().await;
-		let search = guard.as_ref().ok_or_else(search_closed)?;
-		let range = usize::try_from(start).unwrap_or(usize::MAX)
-			..usize::try_from(end).unwrap_or(usize::MAX);
-		let (snapshot, handle) = search
-			.get_range(
-				range,
+		let (snapshot, handle) = self
+			.get_range_inner(
+				start,
+				end,
 				Box::new(move |snapshot| {
 					let listener = Arc::clone(&listener);
 					let snapshot = CacheSearchSnapshot::from(snapshot);
@@ -191,7 +267,7 @@ impl CacheSearch {
 			)
 			.await?;
 		Ok(CacheSearchWindow {
-			snapshot: snapshot.into(),
+			snapshot,
 			handle: Arc::new(CacheSearchWindowHandle { _handle: handle }),
 		})
 	}
@@ -200,19 +276,126 @@ impl CacheSearch {
 	/// network. THE way to change what the search matches; never close + recreate per filter
 	/// change.
 	pub async fn set_config(&self, config: CacheSearchConfig) -> Result<(), Error> {
-		let guard = self.inner.lock().await;
-		let search = guard.as_ref().ok_or_else(search_closed)?;
-		search.set_config(config.into()).await
+		self.set_config_inner(config).await
 	}
 
-	/// Deterministic teardown: resolves once the engine has exited with its DB connection
-	/// closed. Idempotent; outstanding window handles become inert. Releasing the object
-	/// WITHOUT calling this is equally correct (best-effort shutdown), just not awaitable.
+	/// Deterministic teardown: resolves once the engine has exited. Idempotent; outstanding
+	/// window handles become inert. Releasing the object WITHOUT calling this is equally
+	/// correct (best-effort shutdown), just not awaitable.
 	pub async fn close(&self) {
-		let search = self.inner.lock().await.take();
-		if let Some(search) = search {
-			search.close().await;
-		}
+		self.close_inner().await;
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+impl CacheSearch {
+	/// The searched directory's uuid — correlate with the `ResyncProgress` /
+	/// `SyncRootsDeleted` messages on the cache status listener.
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "rootUuid")]
+	pub fn root_uuid(&self) -> UuidStr {
+		self.root
+	}
+
+	/// Total matches currently in the result set. Advisory — each snapshot carries its own
+	/// coherent total. `0` after `close`.
+	pub async fn total(&self) -> u64 {
+		self.total_inner().await
+	}
+
+	/// `false` once the search went terminal — or after `close`.
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "isLive")]
+	pub async fn is_live(&self) -> bool {
+		self.is_live_inner().await
+	}
+
+	/// Subscribe a window over `start..end` of the sorted result set (CLAMPED — never an
+	/// out-of-bounds error). Returns the window's current snapshot plus its RAII handle (free
+	/// the handle to unsubscribe); from then on `listener` fires with a fresh snapshot whenever
+	/// the window's contents or the total change.
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "getRange")]
+	pub async fn get_range(
+		&self,
+		start: u64,
+		end: u64,
+		#[wasm_bindgen(unchecked_param_type = "(snapshot: CacheSearchSnapshot) => void")]
+		listener: web_sys::js_sys::Function,
+	) -> Result<CacheSearchWindow, Error> {
+		// The JS function stays on this thread; the engine-side Send callback only forwards
+		// mirrors over a channel (the socket-listener pattern).
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<CacheSearchSnapshot>();
+		crate::runtime::spawn_local(async move {
+			while let Some(snapshot) = receiver.recv().await {
+				let serializer = serde_wasm_bindgen::Serializer::new()
+					.serialize_maps_as_objects(true)
+					.serialize_large_number_types_as_bigints(true);
+				let _ = listener.call1(
+					&JsValue::UNDEFINED,
+					&serde::Serialize::serialize(&snapshot, &serializer)
+						.expect("failed to serialize search snapshot (should be impossible)"),
+				);
+			}
+		});
+
+		let (snapshot, handle) = self
+			.get_range_inner(
+				start,
+				end,
+				Box::new(move |snapshot| {
+					let _ = sender.send(snapshot.into());
+				}),
+			)
+			.await?;
+		Ok(CacheSearchWindow {
+			snapshot: Some(snapshot),
+			_handle: handle,
+		})
+	}
+
+	/// Replace the filter configuration: an engine-local refilter — no re-registration, no
+	/// network. THE way to change what the search matches; never close + recreate per filter
+	/// change.
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "setConfig")]
+	pub async fn set_config(&self, config: CacheSearchConfig) -> Result<(), Error> {
+		self.set_config_inner(config).await
+	}
+
+	/// Deterministic teardown: resolves once the engine has exited. Idempotent; outstanding
+	/// window handles become inert. Freeing the object WITHOUT calling this is equally correct
+	/// (best-effort shutdown), just not awaitable.
+	pub async fn close(&self) {
+		self.close_inner().await;
+	}
+}
+
+/// One registered window on wasm: the initial snapshot (read it once via
+/// [`initial_snapshot`](Self::initial_snapshot)) doubling as the RAII subscription handle —
+/// `free()` it to unsubscribe the window.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub struct CacheSearchWindow {
+	snapshot: Option<CacheSearchSnapshot>,
+	_handle: SearchWindowHandle,
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen]
+impl CacheSearchWindow {
+	/// The window's snapshot at registration time (later updates arrive via the listener).
+	/// Consumed on first call — returns `undefined` afterwards.
+	#[wasm_bindgen::prelude::wasm_bindgen(
+		js_name = "initialSnapshot",
+		unchecked_return_type = "CacheSearchSnapshot | undefined"
+	)]
+	pub fn initial_snapshot(&mut self) -> Result<JsValue, Error> {
+		let Some(snapshot) = self.snapshot.take() else {
+			return Ok(JsValue::UNDEFINED);
+		};
+		let serializer = serde_wasm_bindgen::Serializer::new()
+			.serialize_maps_as_objects(true)
+			.serialize_large_number_types_as_bigints(true);
+		Ok(serde::Serialize::serialize(&snapshot, &serializer)
+			.expect("failed to serialize search snapshot (should be impossible)"))
 	}
 }
 
@@ -220,6 +403,7 @@ fn search_closed() -> Error {
 	Error::custom(ErrorKind::InvalidState, "the search has been closed")
 }
 
+#[cfg(feature = "uniffi")]
 #[uniffi::export]
 impl JsClient {
 	/// Create a live, windowed search over the subtree rooted at `uuid`, served from the local
@@ -235,9 +419,32 @@ impl JsClient {
 	) -> Result<CacheSearch, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
-			// The commander runtime is the long-lived multi-thread runtime anchoring every FFI
-			// call — it satisfies create_search's "app Tokio runtime" requirement (the cache
-			// worker's resync `block_on` handle binds to it).
+			let search = this.create_search(Uuid::from(&uuid), config.into()).await?;
+			Ok(CacheSearch {
+				root: uuid,
+				inner: tokio::sync::Mutex::new(Some(search)),
+			})
+		})
+		.await
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+impl JsClient {
+	/// Create a live, windowed search over the subtree rooted at `uuid`, served from the local
+	/// cache (`configureCache` must have run first). CHEAP (zero network, zero resync) when
+	/// `uuid` is already an active sync root or is covered by one; otherwise the worker
+	/// validates it remotely and runs a convergence resync — observable as `ResyncProgress`
+	/// messages on the cache status listener.
+	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "createSearch")]
+	pub async fn create_search(
+		&self,
+		uuid: UuidStr,
+		config: CacheSearchConfig,
+	) -> Result<CacheSearch, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
 			let search = this.create_search(Uuid::from(&uuid), config.into()).await?;
 			Ok(CacheSearch {
 				root: uuid,
@@ -276,7 +483,7 @@ mod tests {
 
 		let config = SearchConfig::from(CacheSearchConfig {
 			name: Some("report".to_string()),
-			item_type: Some(SearchItemType::File),
+			item_type: Some(CacheSearchItemType::File),
 			recursive: false,
 			case_sensitive: true,
 		});
@@ -327,8 +534,6 @@ mod tests {
 		assert_eq!(snapshot.total, 9);
 		assert!(snapshot.live);
 		assert_eq!(snapshot.results.len(), 2);
-		// The mirrors are the SAME types the rest of the FFI API returns, built through the
-		// lossless Cacheable → Remote conversions.
 		assert!(matches!(
 			&snapshot.results[0],
 			CacheSearchResult::Dir { dir: converted } if *converted == Dir::from(RemoteDirectory::from(dir.clone()))

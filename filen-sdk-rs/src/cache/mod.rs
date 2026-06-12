@@ -2,10 +2,9 @@
 
 mod error;
 mod handle;
-// UniFFI-only (the io-module precedent for native-only features): the cache cannot compile to
-// wasm yet — deliberately, see lib.rs — so the wasm twin of the FFI layer arrives with the wasm
-// port instead of shipping as unbuildable code today.
-#[cfg(feature = "uniffi")]
+// UniFFI exports on mobile, wasm-bindgen twins on web. The twins share method names, which is
+// only sound because the two never compile together (`uniffi` is a native-only dependency).
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
 pub mod js_impl;
 pub mod search;
 mod sql;

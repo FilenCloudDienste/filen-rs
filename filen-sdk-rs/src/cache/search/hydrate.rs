@@ -26,6 +26,18 @@ use crate::{
 
 use super::{config::CompiledFilter, result::SearchResult};
 
+// Bounds the worker round-trip in `ReadConn::run` (native `Direct` reads are synchronous).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use tokio::time::timeout as reply_timeout;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasmtimer::tokio::timeout as reply_timeout;
+
+/// How long a [`ReadConn::Worker`] query waits for its reply. The worker serves reads with
+/// priority (including during a resync's network waits), so the residual queue time is one
+/// in-flight unit of worker work — e.g. applying one drained event burst. A timeout surfaces as
+/// a query error: the engine logs it and keeps the window's last snapshot; the next ping retries.
+const READ_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
 const SEARCH_WINDOW_ACCOUNT: &str = include_str!("raw/search_window_account.sql");
 const SEARCH_WINDOW_SUBTREE: &str = include_str!("raw/search_window_subtree.sql");
 const SEARCH_WINDOW_CHILDREN: &str = include_str!("raw/search_window_children.sql");
@@ -33,14 +45,70 @@ const SEARCH_COUNT_ACCOUNT: &str = include_str!("raw/search_count_account.sql");
 const SEARCH_COUNT_SUBTREE: &str = include_str!("raw/search_count_subtree.sql");
 const SEARCH_COUNT_CHILDREN: &str = include_str!("raw/search_count_children.sql");
 
-/// What part of the cache a search queries. Derived per query from the search root and the
-/// `recursive` flag: the account root needs no scoping at all (everything cached lives under
-/// it), a subdir scope walks the recursive CTE, and non-recursive mode is a parent lookup.
+/// What part of the cache a search queries: the account root needs no scoping at all (everything
+/// cached lives under it), a subdir scope walks the recursive CTE, and non-recursive mode is a
+/// parent lookup.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Scope {
 	Account,
 	Subtree(Uuid),
 	Children(Uuid),
+}
+
+/// A read query shipped to the cache worker, run against ITS connection between drains (the
+/// wasm read path — see [`ReadConn::Worker`]).
+pub(crate) type ReadTask = Box<dyn FnOnce(&Connection) + Send + 'static>;
+
+/// Where the engine's queries run. Native uses [`Direct`](Self::Direct): a dedicated READ-ONLY
+/// connection reading concurrently with the worker's writer via WAL. The wasm VFS supports
+/// neither WAL nor a second connection to the same DB, so wasm uses [`Worker`](Self::Worker):
+/// each query is boxed up and run on the cache worker's single connection between drains —
+/// which serializes snapshots behind in-flight worker work (a bounded resync attempt at worst),
+/// instead of reading in parallel.
+pub(super) enum ReadConn {
+	Direct(Connection),
+	Worker(tokio::sync::mpsc::UnboundedSender<ReadTask>),
+}
+
+impl ReadConn {
+	/// Run `query` against the cache DB: synchronously on a [`Direct`](Self::Direct) connection,
+	/// or round-tripped through the worker for [`Worker`](Self::Worker). A worker that shut down
+	/// surfaces as an error (the search is terminal by then anyway).
+	pub(super) async fn run<T, F>(&self, query: F) -> rusqlite::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
+	{
+		match self {
+			Self::Direct(conn) => query(conn),
+			Self::Worker(sender) => {
+				let (reply_sender, reply_receiver) = tokio::sync::oneshot::channel();
+				sender
+					.send(Box::new(move |conn| {
+						let _ = reply_sender.send(query(conn));
+					}))
+					.map_err(|_| worker_gone())?;
+				match reply_timeout(READ_REPLY_TIMEOUT, reply_receiver).await {
+					Ok(reply) => reply.map_err(|_| worker_gone())?,
+					// A worker alive-but-wedged is indistinguishable from dead from here; erroring
+					// beats hanging the search forever (the caller keeps its last snapshot).
+					Err(_) => Err(read_timed_out())?,
+				}
+			}
+		}
+	}
+}
+
+fn read_timed_out() -> rusqlite::Error {
+	rusqlite::Error::UserFunctionError(
+		"cache worker did not answer a search query in time (wedged or overloaded)".into(),
+	)
+}
+
+fn worker_gone() -> rusqlite::Error {
+	rusqlite::Error::UserFunctionError(
+		"cache worker shut down before answering a search query".into(),
+	)
 }
 
 /// The matchers behind the SQL `filen_name_matches(name, needle, case_insensitive)` function:
@@ -85,17 +153,26 @@ impl NameMatchers {
 	}
 }
 
-/// Open the engine's read-only connection and register `filen_name_matches` on it. The function
-/// lives ONLY on this connection and ONLY in query WHERE clauses — it never appears in the
-/// schema or an index, so the worker's writer connection needs no registration. `NO_MUTEX` is
-/// safe because the connection never leaves the engine task; the busy timeout rides out WAL
-/// checkpoints by the worker.
+/// Open the engine's NATIVE read-only connection and register `filen_name_matches` on it (WAL
+/// lets it read concurrently with the worker's writer). `NO_MUTEX` is safe because the
+/// connection never leaves the engine task; the busy timeout rides out WAL checkpoints by the
+/// worker. On wasm the engine never opens this — the wasm VFS supports neither WAL nor a second
+/// connection, so reads route to the worker instead (see [`ReadConn::Worker`]).
 pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> {
 	let conn = Connection::open_with_flags(
 		path,
 		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
 	)?;
 	conn.busy_timeout(Duration::from_millis(5000))?;
+	register_name_matches(&conn)?;
+	Ok(conn)
+}
+
+/// Register the `filen_name_matches` scalar function on `conn` (re-registering replaces, so this
+/// is idempotent). Needed on every connection search queries run against: the engine's own read
+/// connection on native, and the WORKER's single connection (which serves [`ReadConn::Worker`]
+/// queries) on wasm.
+pub(in crate::cache) fn register_name_matches(conn: &Connection) -> rusqlite::Result<()> {
 	conn.create_scalar_function(
 		"filen_name_matches",
 		3,
@@ -127,8 +204,7 @@ pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> 
 			)?;
 			Ok(matchers.matches(name, case_insensitive))
 		},
-	)?;
-	Ok(conn)
+	)
 }
 
 fn type_filter_param(filter: &CompiledFilter) -> i64 {
@@ -142,7 +218,7 @@ fn type_filter_param(filter: &CompiledFilter) -> i64 {
 
 /// One window: scope + filter + order + LIMIT/OFFSET + full hydration, all in one statement.
 /// With a needle this scans the scope (substring matches cannot use an index); without one it
-/// is bounded by the scope and the window. Cost notes live in the [module docs](super).
+/// is bounded by the scope and the window.
 pub(super) fn window_results(
 	conn: &Connection,
 	scope: Scope,

@@ -573,6 +573,17 @@ mod wasm_threading {
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	thread_local! {
+		/// Worker wrappers retained for the life of the spawning thread: Chromium may terminate
+		/// a dedicated worker whose JS wrapper is garbage-collected before the worker's script
+		/// begins executing, so dropping the wrapper right after `new Worker()` races startup
+		/// against the next GC. Retaining the wrapper pins only the JS object — workers still
+		/// close themselves via [`WorkerHandle`] when their work ends.
+		static SPAWNED_WORKERS: std::cell::RefCell<Vec<web_sys::Worker>> =
+			const { std::cell::RefCell::new(Vec::new()) };
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	/// Spawns a web worker to run the given closure.
 	///
 	/// Currently hangs around forever unless manually terminated.
@@ -594,6 +605,17 @@ mod wasm_threading {
 
 		let event = serde_wasm_bindgen::to_value(&event)?;
 		worker.post_message(&event)?;
+
+		// A worker that dies without unwinding (panic=abort traps, script-fetch failures) leaks
+		// every channel sender it owns, so its consumers see SILENCE, not errors — this log is
+		// the only direct evidence of the death (it pairs with the cache's init-ack timeout).
+		let onerror = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(|e: web_sys::ErrorEvent| {
+			log::error!("worker startup/runtime error: {}", e.message());
+		});
+		worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+		// The handler must outlive the worker; one small leaked closure per spawn is acceptable.
+		onerror.forget();
+		SPAWNED_WORKERS.with_borrow_mut(|workers| workers.push(worker));
 
 		Ok(())
 	}

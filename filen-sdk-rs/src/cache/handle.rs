@@ -4,8 +4,13 @@ use std::{
 		Arc, Weak,
 		atomic::{AtomicU64, Ordering},
 	},
-	thread::JoinHandle,
+	time::Duration,
 };
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use tokio::time::timeout as ack_timeout;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasmtimer::tokio::timeout as ack_timeout;
 
 use crate::{
 	Error, ErrorKind,
@@ -14,13 +19,19 @@ use crate::{
 	io::{RemoteDirectory, RemoteFile},
 	socket::ListenerHandle,
 };
-use crossbeam::channel::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 use crate::cache::{
 	CacheControlMessage, CacheError, CacheState, SyncRootCallback,
+	search::ReadTask,
 	state::{CacheThreadEvent, ManualEvent},
 };
+
+/// How long [`spawn_cache_worker`] waits for the new worker's init ack before presuming it dead.
+/// Init is local-only (open the DB, build the schema — no network), so this is generous; it
+/// exists for the wasm failure modes where a worker dies WITHOUT dropping its channels.
+const CACHE_INIT_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub enum CacheMessage {
@@ -100,14 +111,16 @@ pub(crate) struct CacheConfig {
 pub(crate) struct CacheSlot {
 	config: Option<Arc<CacheConfig>>,
 	worker: Weak<CacheWorkerShared>,
-	/// The current (or most recent) worker thread, paired with `finished`. Deposited here
-	/// IMMEDIATELY after the thread spawns (before any await) and reaped via
-	/// [`wait_for_worker_exit`] before any respawn — and by [`Client::flush_cache`] — so even a
-	/// CANCELLED spawn/flush future cannot leave a detached worker overlapping a successor on the
-	/// DB file.
-	join_handle: Option<JoinHandle<()>>,
-	/// Resolves to `true` when the paired worker thread has fully exited (its SQLite connection is
-	/// already closed by then). Awaited cancel-safely BEFORE the `JoinHandle` is taken.
+	/// Resolves to `true` when the most recently spawned worker has fully exited (its SQLite
+	/// connection is already closed by then). Deposited here IMMEDIATELY after the spawn (before
+	/// any await) and awaited via [`wait_for_worker_exit`] before any respawn — and by
+	/// [`Client::flush_cache`] — so even a CANCELLED spawn/flush future cannot leave a detached
+	/// worker overlapping a successor on the DB file. The signal fires on every NATIVE exit
+	/// path including panics (the unwind runs `SignalOnDrop`, which sends — and logs — the
+	/// panic). On wasm, panics ABORT the
+	/// worker without unwinding, leaking the sender: a post-init trap leaves this signal
+	/// permanently pending, so the cache is unrecoverable without a page reload (the in-memory
+	/// DB died with the worker anyway); init-time failures are bounded by the spawn ack timeout.
 	finished: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
@@ -125,8 +138,11 @@ impl CacheSlot {
 /// loop treats as a clean shutdown (drain, close the DB, exit); dropping `listener_handle` then
 /// unregisters the socket listener.
 pub(crate) struct CacheWorkerShared {
-	control_sender: Sender<CacheControlMessage>,
-	manual_event_sender: Sender<CacheThreadEvent>,
+	control_sender: UnboundedSender<CacheControlMessage>,
+	manual_event_sender: tokio::sync::mpsc::Sender<CacheThreadEvent>,
+	/// Ships search read queries to the worker's connection — the WASM read path (no WAL, no
+	/// second connection there). Native searches read via their own connection instead.
+	read_task_sender: UnboundedSender<ReadTask>,
 	next_registration_id: AtomicU64,
 	/// `Some` until either the shared state drops (last handle gone) or [`Client::flush_cache`]
 	/// takes it — inert handles outliving a flush must not keep the websocket subscribed (and
@@ -134,36 +150,43 @@ pub(crate) struct CacheWorkerShared {
 	listener_handle: std::sync::Mutex<Option<ListenerHandle>>,
 }
 
-/// Sends `true` on the paired watch channel when dropped — the worker thread's exit signal,
-/// guaranteed to fire on every exit path including panics. Declared FIRST in the thread closure so
-/// it drops LAST, i.e. after the `CacheState` (and its SQLite connection) is gone.
+/// Sends `true` on the paired watch channel when dropped — the worker's exit signal, guaranteed
+/// to fire on every NATIVE exit path including a panic (the unwind drops the run future's
+/// locals; on wasm a panic aborts the worker without unwinding and the signal is lost — see
+/// [`CacheSlot::finished`]). Declared FIRST in the worker future so it drops LAST, i.e. after
+/// the `CacheState` (and its SQLite connection) is gone.
 struct SignalOnDrop(tokio::sync::watch::Sender<bool>);
 
 impl Drop for SignalOnDrop {
 	fn drop(&mut self) {
+		// Unwinding still SENDS the signal (the worker is gone either way), so this branch is
+		// the only platform-visible record of a native worker panic — mobile's oslog/logcat
+		// never see std's stderr panic message. (Irrelevant on wasm: panics abort, no unwind.)
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		if std::thread::panicking() {
+			log::error!("cache worker panicked; shutting down");
+		}
 		let _ = self.0.send(true);
 	}
 }
 
-/// Wait (cancel-safely) for the slot's current worker thread to exit, then reap it. The
-/// `JoinHandle` and exit signal stay IN the slot until the thread has actually finished, so a
-/// caller cancelled mid-await leaves them behind for the next add/flush to reap — a detached
-/// worker can never overlap a successor on the DB file. No-op when nothing was spawned.
+/// Wait (cancel-safely) for the slot's current worker to exit. The exit signal stays IN the slot
+/// until the worker has actually finished, so a caller cancelled mid-await leaves it behind for
+/// the next add/flush to await — a detached worker can never overlap a successor on the DB file.
+/// No-op when nothing was spawned. (The worker is not joinable: on native it is a detached
+/// `runtime::spawn_async` thread, on wasm a self-closing web worker — the watch signal, sent as
+/// the worker's last action after its DB connection closes, IS the deterministic exit wait.)
 async fn wait_for_worker_exit(slot: &mut CacheSlot) {
 	if let Some(finished) = slot.finished.as_mut() {
-		// `wait_for` returns `Err` when the sender dropped without signalling — the thread is gone
-		// either way.
-		let _ = finished.wait_for(|done| *done).await;
-	}
-	slot.finished = None;
-	if let Some(join_handle) = slot.join_handle.take() {
-		// The exit signal fires as the worker's last action (its DB connection is already closed),
-		// so this join only reaps a finished thread — it returns near-instantly and cannot park
-		// the executor for any meaningful time.
-		if join_handle.join().is_err() {
-			log::error!("cache worker thread panicked");
+		// `Err` means the sender dropped WITHOUT ever signalling. A panicking worker still
+		// signals (its unwind runs `SignalOnDrop`, which also logs the panic), so this only
+		// fires when the worker future was dropped un-run — e.g. the host thread failed to
+		// build its runtime, or an abandoned late starter exited at its entry check.
+		if finished.wait_for(|done| *done).await.is_err() {
+			log::error!("cache worker was torn down before it ever ran");
 		}
 	}
+	slot.finished = None;
 }
 
 /// RAII registration of one sync root, returned by [`Client::add_sync_root`].
@@ -266,7 +289,7 @@ impl Client {
 					ack: ack_sender,
 				}) {
 				Ok(()) => {}
-				Err(crossbeam::channel::SendError(CacheControlMessage::AddSyncRoot {
+				Err(tokio::sync::mpsc::error::SendError(CacheControlMessage::AddSyncRoot {
 					callback: recovered,
 					..
 				})) => {
@@ -379,11 +402,12 @@ impl Client {
 	}
 }
 
-/// Spawn the cache worker thread plus its status-bridge task and register the socket listener.
-/// The thread's `JoinHandle` + exit signal are deposited into `slot` IMMEDIATELY after the spawn —
-/// before the first await — so even if the caller's future is cancelled mid-spawn, the next
-/// add/flush waits the (then channel-disconnected, self-exiting) worker out before touching the DB
-/// file. Failure paths likewise just drop the worker's senders and leave the reaping to the slot.
+/// Spawn the cache worker (a `runtime::spawn_async` host: a dedicated thread's current-thread
+/// runtime on native, a web worker on wasm) plus its status-bridge task, and register the socket
+/// listener. The exit signal is deposited into `slot` IMMEDIATELY after the spawn — before the
+/// first await — so even if the caller's future is cancelled mid-spawn, the next add/flush waits
+/// the (then channel-disconnected, self-exiting) worker out before touching the DB file. Failure
+/// paths likewise just drop the worker's senders and leave the exit-wait to the slot.
 async fn spawn_cache_worker(
 	client: Arc<Client>,
 	config: &CacheConfig,
@@ -395,67 +419,117 @@ async fn spawn_cache_worker(
 
 	let root_uuid = client.root().uuid().into();
 	let cache_path = config.path.clone();
-	// Capture the app's runtime handle here (this fn runs inside it) so the worker `std::thread` can
-	// `block_on` the async resync (which needs an async runtime, but the worker is a plain thread).
+	// Set when the spawner gives up on this worker (init-ack timeout): a LATE-starting worker
+	// (slow worker-script fetch on wasm; a thread unfrozen after a long stall on native) checks
+	// it at entry and exits WITHOUT touching the DB — otherwise it could run its whole init
+	// concurrently with a freshly spawned successor on the same database (destructive on a
+	// version-mismatch wipe; undefined behavior on the single-threaded wasm SQLite build).
+	let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let abandoned_for_worker = abandoned.clone();
 	// The worker owns its own `Arc<Client>` clone; the original stays on this task for
-	// `add_event_listener` below.
-	let rt_handle = tokio::runtime::Handle::current();
+	// `add_event_listener` below. The worker loop is async, so the resync listings are awaited in
+	// place on the host runtime — no captured runtime handle, no `block_on`.
 	let worker_client = client.clone();
-	let join_handle = std::thread::spawn(move || {
+	crate::runtime::spawn_async(move || async move {
 		// Declared first so it drops LAST — the exit signal fires only after `CacheState` (and its
-		// SQLite connection) is gone, on every exit path including panics.
+		// SQLite connection) is gone, on every exit path including a native panic's unwind.
 		let _exit_signal = SignalOnDrop(finished_sender);
-		let state =
-			match CacheState::new(&cache_path, root_uuid, msg_sender, worker_client, rt_handle) {
-				Ok((state, callback, control_sender, event_sender)) => {
-					if res_sender
-						.send(Ok((callback, control_sender, event_sender)))
-						.is_err()
-					{
-						// The spawning future was dropped (e.g. cancelled) before it received the
-						// init result, so nobody is waiting. Exit the worker cleanly instead of
-						// panicking.
-						log::warn!(
-							"cache init result receiver dropped before init completed; worker exiting"
-						);
-						return;
-					}
-					state
-				}
-				Err(e) => {
-					if res_sender.send(Err(e)).is_err() {
-						log::warn!(
-							"cache init result receiver dropped before init failed; worker exiting"
-						);
-					}
+		// BEFORE opening the DB: a worker the spawner has already abandoned must not init (see
+		// the flag's declaration). Its channel senders just drop, which nobody awaits anymore.
+		if abandoned_for_worker.load(Ordering::Acquire) {
+			log::warn!("cache worker started after its spawner gave up on it; exiting untouched");
+			return;
+		}
+		let state = match CacheState::new(&cache_path, root_uuid, msg_sender, worker_client) {
+			Ok((state, callback, control_sender, event_sender, read_task_sender)) => {
+				if res_sender
+					.send(Ok((
+						callback,
+						control_sender,
+						event_sender,
+						read_task_sender,
+					)))
+					.is_err()
+				{
+					// The spawning future was dropped (e.g. cancelled) before it received the
+					// init result, so nobody is waiting. Exit the worker cleanly instead of
+					// panicking.
+					log::warn!(
+						"cache init result receiver dropped before init completed; worker exiting"
+					);
 					return;
 				}
-			};
+				state
+			}
+			Err(e) => {
+				if res_sender.send(Err(e)).is_err() {
+					log::warn!(
+						"cache init result receiver dropped before init failed; worker exiting"
+					);
+				}
+				return;
+			}
+		};
 
-		state.run();
+		state.run().await;
 	});
-	slot.join_handle = Some(join_handle);
 	slot.finished = Some(finished_receiver);
 
-	// Bridge the worker's status channel to the app callback. The bridge task's JoinHandle is
-	// intentionally dropped (detached): the loop ends on its own when the worker drops `msg_sender`
-	// — on shutdown or if the worker thread panics — at which point `recv()` returns `None`.
+	// Bridge the worker's status channel to the app callback. The bridge handle is intentionally
+	// dropped (detached): the loop ends on its own when the worker drops `msg_sender` — on
+	// shutdown or if the worker dies — at which point `recv()` returns `None`.
 	let status_callback = config.status_callback.clone();
-	tokio::task::spawn(async move {
+	drop(crate::runtime::spawn_task_maybe_send(async move {
 		while let Some(msg) = msg_receiver.recv().await {
 			status_callback(msg);
 		}
-	});
+	}));
 
-	let (callback, control_sender, manual_event_sender) = match res_receiver.await {
-		Ok(Ok(parts)) => parts,
-		// `CacheState::new` failed (or the worker died before reporting); the thread is already
-		// exiting on its own and stays reapable via the slot.
-		Ok(Err(e)) => return Err(e),
-		Err(_) => {
+	// BOUNDED wait for the init ack. Init is local-only work (DB open + schema), so a silent
+	// worker past the deadline is presumed dead — on wasm a worker that never started (or
+	// trapped during init: panic=abort leaks the ack sender instead of dropping it) would
+	// otherwise hang this await forever WITH THE SLOT LOCK HELD, wedging every cache call for
+	// the session. The `abandoned` flag (set in the timeout arm) stops a LATE starter at entry,
+	// and one that got past the check exits at its failed ack send — but a straggler frozen
+	// MID-init can still briefly overlap a successor; native therefore KEEPS the exit signal
+	// (see the timeout arm) so respawns wait stragglers out.
+	let (callback, control_sender, manual_event_sender, read_task_sender) = match ack_timeout(
+		CACHE_INIT_ACK_TIMEOUT,
+		res_receiver,
+	)
+	.await
+	{
+		Ok(Ok(Ok(parts))) => parts,
+		// `CacheState::new` failed (or the worker died before reporting); the thread is
+		// already exiting on its own and stays reapable via the slot.
+		Ok(Ok(Err(e))) => return Err(e),
+		Ok(Err(_)) => {
 			return Err(Error::custom(
 				ErrorKind::Internal,
 				"cache worker thread exited before initialization completed",
+			));
+		}
+		Err(_) => {
+			log::error!(
+				"cache worker did not acknowledge initialization within {CACHE_INIT_ACK_TIMEOUT:?}; presuming it dead"
+			);
+			// Tell a late starter to exit at entry instead of initializing onto a DB a
+			// successor may be using (stored BEFORE any successor can spawn — the slot lock is
+			// still held).
+			abandoned.store(true, Ordering::Release);
+			// NATIVE: keep the exit signal — a stalled-but-alive worker that got PAST the
+			// abandoned check still owns the DB file and always fires the signal eventually
+			// (unwind included), so the next add/flush waits it out rather than overlapping
+			// it. WASM: a dead worker can never fire the signal (panic=abort leaks it, no
+			// unwinding) and a late starter exits at the abandoned check, so clearing it here
+			// is what keeps the cache recoverable.
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			{
+				slot.finished = None;
+			}
+			return Err(Error::custom(
+				ErrorKind::Internal,
+				"cache worker did not initialize in time (worker startup failure?)",
 			));
 		}
 	};
@@ -465,6 +539,7 @@ async fn spawn_cache_worker(
 		Ok(listener_handle) => Ok(Arc::new(CacheWorkerShared {
 			control_sender,
 			manual_event_sender,
+			read_task_sender,
 			next_registration_id: AtomicU64::new(0),
 			listener_handle: std::sync::Mutex::new(Some(listener_handle)),
 		})),
@@ -492,6 +567,16 @@ impl SyncRootHandle {
 	/// The sync root this handle registers.
 	pub fn uuid(&self) -> Uuid {
 		self.uuid
+	}
+
+	/// A sender for search read queries served by the worker's connection — the wasm read path
+	/// (unused on native, where searches open their own connection).
+	#[cfg_attr(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		allow(dead_code)
+	)]
+	pub(crate) fn read_task_sender(&self) -> UnboundedSender<ReadTask> {
+		self.shared.read_task_sender.clone()
 	}
 
 	/// Consume the handle, removing its registration AND — when it was the last registration for
@@ -534,8 +619,7 @@ impl SyncRootHandle {
 	///
 	/// LEGACY initial-population path: it is upsert-only (it never deletes vanished items) and is
 	/// applied WITHOUT watermark gating, so using it as a *live* refresh can resurrect items that
-	/// socket events already deleted. The resync diff supersedes it — prefer it for initial population
-	/// only.
+	/// socket events already deleted. Use only for initial population, not as a live refresh.
 	///
 	/// Despite living on a per-root handle, the injection is ACCOUNT-GLOBAL and unvalidated: the
 	/// listed items are upserted regardless of this handle's uuid, membership gating, or whether
@@ -546,16 +630,22 @@ impl SyncRootHandle {
 		files: Vec<RemoteFile>,
 	) -> Result<(), Error> {
 		let event = CacheThreadEvent::Manual(ManualEvent::ListDirRecursive(dirs, files));
-		// The worker's event channel is UNBOUNDED, so `send` never blocks — it only errors if the worker
-		// has shut down (receiver dropped). It is therefore safe to call directly on the async executor
-		// (no need to offload to a blocking task). `map_err(|_| ...)` drops the
-		// (large) un-sent event held by `SendError` so the `Err` stays small.
-		self.shared.manual_event_sender.send(event).map_err(|_| {
-			Error::custom(
-				ErrorKind::Internal,
-				"Failed to send manual event to cache thread (channel closed)",
-			)
-		})
+		// The worker's event channel is BOUNDED (the shed cap): socket events past the cap are
+		// shed, but a Manual injection must never be — so this `send` AWAITS capacity instead.
+		// It only waits while a 50k-event flood is in flight, but then possibly for a LONG time
+		// (the worker frees no capacity while parked in a resync) — never call this from a
+		// `SyncRootCallback` or anywhere that gates the worker's own progress. `map_err` drops
+		// the (large) un-sent event held by `SendError` so the `Err` stays small.
+		self.shared
+			.manual_event_sender
+			.send(event)
+			.await
+			.map_err(|_| {
+				Error::custom(
+					ErrorKind::Internal,
+					"Failed to send manual event to cache thread (channel closed)",
+				)
+			})
 	}
 }
 

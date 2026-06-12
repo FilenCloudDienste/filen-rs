@@ -225,10 +225,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24.x'
+      - name: Install LLVM clang (wasm32 C objects for the cache's bundled SQLite)
+        run: brew install llvm
       - name: Run clippy wasm-full
-        # no `cache` here — enabling it on wasm is a deliberate compile error until a wasm port lands
-        run: cargo clippy --target wasm32-unknown-unknown -F wasm-full -- -D warnings
+        run: cargo clippy --target wasm32-unknown-unknown -F wasm-full,cache -- -D warnings
         working-directory: ./filen-sdk-rs
+        env:
+          CC_wasm32_unknown_unknown: /opt/homebrew/opt/llvm/bin/clang
+          AR_wasm32_unknown_unknown: /opt/homebrew/opt/llvm/bin/llvm-ar
       - name: Run clippy service-worker
         run: cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings
         working-directory: ./filen-sdk-rs
