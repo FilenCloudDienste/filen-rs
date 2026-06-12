@@ -235,7 +235,13 @@ mod commander_thread {
 										},
 									}
 								},
-								_ = futures.next() => {}
+								// The guard is load-bearing: `FuturesUnordered::next()` on an EMPTY set
+								// is `Ready(None)` IMMEDIATELY, so without it this select never returns
+								// `Pending` once the last resident future completes — the commander then
+								// busy-spins and never yields to its JS event loop, starving every
+								// `spawn_local` task on this thread (and nested-worker startup, which the
+								// browser runs as parent-thread event-loop tasks).
+								_ = futures.next(), if !futures.is_empty() => {}
 							}
 						}
 					});
