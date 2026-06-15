@@ -70,17 +70,17 @@ struct DrainCursor {
 /// semaphore permits: nothing is preallocated, and `try_send` enforces the bound atomically.
 const EVENT_SHED_CAP: usize = 50_000;
 
-/// Bounded drive-lock acquisition for ONE resync attempt: the fibonacci poll ramp capped at 2 s
-/// over 8 polls is ~7 s of sleeping plus the request round-trips. Deliberately NOT the
-/// effectively-unbounded default schedule — the worker is PARKED inside the resync island
-/// (including the lock WAIT), so a contended attempt must give up and yield back to the event
-/// drain; [`RESYNC_RETRY_INTERVAL`] then schedules the next attempt.
+/// The resync's drive-lock poll cadence (fibonacci ramp capped at 2 s) and how many polls one
+/// acquisition makes before giving up. This is a SINGLE, PATIENT acquisition: the worker drains
+/// events and serves read queries CONCURRENTLY while it waits (see `run_resync`), so it does not
+/// need to give up early for liveness — and a single acquisition keeps ONE lock uuid for its
+/// whole wait, so if the server queues waiters we hold our place instead of going to the back of
+/// the line behind the unbounded FS-op acquirers on every retry (the starvation that froze
+/// resyncs under contention). ~60 polls x 2 s ~= 2 min before falling back to the retry timer.
 const RESYNC_LOCK_MAX_SLEEP: Duration = Duration::from_secs(2);
-const RESYNC_LOCK_ATTEMPTS: usize = 8;
-/// The guaranteed event-drain window between two resync attempts: after a non-converged attempt
-/// the worker serves its channels for at least this long before re-parking in the next bounded
-/// acquisition, so sustained lock contention degrades cache LIVENESS gracefully instead of
-/// freezing event application entirely.
+const RESYNC_LOCK_PATIENT_ATTEMPTS: usize = 60;
+/// After a patient acquisition still times out (or any listing failure), the worker waits this
+/// long before re-attempting — so even a quiet account with no further events re-tries.
 const RESYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `None` under unit-test construction (no live client); the resync path logs and no-ops when
@@ -1484,15 +1484,15 @@ impl CacheState {
 	/// snapshot drive message id under the SAME lock (so listing + watermark are consistent), then
 	/// converge the cache via [`apply_resync`].
 	///
-	/// The await occupies the single-threaded worker loop for the attempt's duration, but the socket
-	/// callback keeps pushing events onto the unbounded channel during that window (the worker
-	/// persists and applies them when it resumes), so nothing is lost. To keep that occupied window
-	/// BOUNDED, the drive lock is acquired with a short schedule
-	/// ([`RESYNC_LOCK_MAX_SLEEP`]/[`RESYNC_LOCK_ATTEMPTS`]) instead of the effectively-unbounded
-	/// default: a contended attempt fails fast, durably marks `needs_resync`, and arms
-	/// [`RESYNC_RETRY_INTERVAL`] — so under sustained contention the worker alternates bounded
-	/// attempts with guaranteed event-drain windows instead of freezing event application until the lock
-	/// is won. Any listing/lock failure likewise commits nothing and retries on the timer.
+	/// The drive lock is acquired with a SINGLE patient acquisition
+	/// ([`RESYNC_LOCK_MAX_SLEEP`]/[`RESYNC_LOCK_PATIENT_ATTEMPTS`]) that drains events and serves
+	/// read queries CONCURRENTLY while it waits (so event application is never frozen), rather
+	/// than a short attempt that gives up: giving up re-acquired with a fresh lock uuid each
+	/// retry, forfeiting our place behind the unbounded FS-op acquirers and starving the resync
+	/// under contention. If even the patient acquisition times out, nothing is committed — it
+	/// durably marks `needs_resync` and arms [`RESYNC_RETRY_INTERVAL`]; any listing failure does
+	/// the same. The listing reads happen UNDER the lock; events are NOT drained then (that would
+	/// advance the watermark past the snapshot id being committed).
 	///
 	/// CONTRACT: `list_dir_recursive` is a single `dir/download` of the whole subtree, so
 	/// the returned tree is ANCESTOR-CLOSED — every returned item's parent chain up to the sync root is
@@ -1570,16 +1570,82 @@ impl CacheState {
 		// so every root's listing is consistent at `remote_under_lock`. A subdir root is resolved via
 		// `get_dir` (which also yields the node to materialize so the diff has an anchor row); the account
 		// root uses its already-materialized `roots` row.
+		// PATIENT lock acquisition. A SINGLE acquisition (one lock uuid) that NEVER gives up early:
+		// giving up and re-acquiring with a fresh uuid forfeited our place in the server's waiter
+		// set every retry, so the unbounded FS-op acquirers (which keep ONE uuid and wait) starved
+		// the resync under contention. We drain events and serve read queries CONCURRENTLY while we
+		// wait, so the worker stays live (the reason the acquisition used to be bounded — but
+		// bounding is what lost the race). Draining happens only BEFORE we hold the lock; the
+		// snapshot id we read once we hold it is >= any drained watermark (remote ids are
+		// monotonic), so committing it never regresses the watermark.
+		let lock = {
+			let mut acquire = std::pin::pin!(
+				deps.client
+					.lock_drive_bounded(RESYNC_LOCK_MAX_SLEEP, RESYNC_LOCK_PATIENT_ATTEMPTS)
+			);
+			loop {
+				tokio::select! {
+					biased;
+					acquired = &mut acquire => break acquired,
+					event = self.event_receiver.recv() => match event {
+						// `drain_pending` also drains the rest of the channel and handles its own
+						// errors, so one recv keeps the whole backlog applied during the wait.
+						Some(event) => self.drain_pending(Some(event)),
+						// Channel closed = all event senders gone = the worker is shutting down.
+						// Abandon the resync (don't wait out the lock). Mark `needs_resync` so next
+						// session re-runs it — consistent with every other non-converged exit here;
+						// the startup gap-check is the backstop if even this write fails. Emitting
+						// `Finished` keeps progress consumers tidy.
+						None => {
+							if let Err(e) = self.mark_needs_resync() {
+								self.surface_errors(vec![*e]);
+							}
+							Self::send_resync_progress(
+								&self.msg_sender,
+								ResyncProgress::Finished { converged: false },
+							);
+							return Ok(());
+						}
+					},
+					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
+						match read_task {
+							Some(task) => serve_read_task(task, &self.db),
+							None => self.read_tasks = None,
+						}
+					},
+				}
+			}
+		};
+		let lock = match lock {
+			Ok(lock) => lock,
+			Err(e) => {
+				if matches!(e.kind(), ErrorKind::RetryFailed) {
+					log::info!(
+						"resync: drive lock still contended after a patient wait; retrying in {RESYNC_RETRY_INTERVAL:?}"
+					);
+				} else {
+					log::warn!(
+						"resync: drive lock acquisition failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
+					);
+				}
+				if let Err(e) = self.mark_needs_resync() {
+					self.surface_errors(vec![*e]);
+				}
+				Self::send_resync_progress(
+					&self.msg_sender,
+					ResyncProgress::Finished { converged: false },
+				);
+				self.resync_retry = Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL);
+				return Ok(());
+			}
+		};
+
+		// Now hold the lock and list each root. Serve read queries during the network listing, but
+		// do NOT drain events here — that would advance the watermark past `remote_under_lock`,
+		// the snapshot id we commit below.
 		let msg_sender = &self.msg_sender;
 		#[allow(clippy::type_complexity)]
 		let island = async {
-			// BOUNDED acquisition: the worker cannot apply EVENTS while parked in this island,
-			// so a contended lock must fail the attempt quickly — the failure arm below leaves
-			// the durable flag set and arms the retry timer, and events drain in between.
-			let _lock = deps
-				.client
-				.lock_drive_bounded(RESYNC_LOCK_MAX_SLEEP, RESYNC_LOCK_ATTEMPTS)
-				.await?;
 			let remote_under_lock = deps.client.get_last_event_ids().await?.drive;
 			let mut per_root_raw: Vec<(
 				Uuid,
@@ -1676,11 +1742,11 @@ impl CacheState {
 				remote_under_lock,
 			))
 		};
-		// Serve search read queries WHILE the island waits on the network: the worker is parked
-		// here for the lock wait plus the full listings (minutes on a large account), and the
-		// wasm read path has no other server — without this, every search query would queue for
-		// the resync's entire duration. The tasks are pure SELECTs against `self.db`, which the
-		// island never touches (all its DB work happens in `finalize_resync`, after it returns).
+		// Serve search read queries WHILE the listing runs (minutes on a large account): the wasm
+		// read path has no other server, so without this every search query would queue for the
+		// listing's duration. The tasks are pure SELECTs against `self.db`, which the island never
+		// touches (its DB work is in `finalize_resync`, after it returns). (Events are served the
+		// same way during the lock wait above, but NOT here — see the snapshot-consistency note.)
 		let listing: Result<_, crate::Error> = {
 			let mut island = std::pin::pin!(island);
 			loop {
@@ -1696,23 +1762,17 @@ impl CacheState {
 				}
 			}
 		};
+		// Release the drive lock now — `finalize_resync` is local-only DB work.
+		drop(lock);
 
 		let (per_root_raw, deleted_roots, any_transient, remote_under_lock) = match listing {
 			Ok(listing) => listing,
 			Err(e) => {
-				// Bounded-lock contention (the EXPECTED failure here) or a snapshot-id/network
-				// failure — nothing is committed. Durably mark the flag rather than relying on
-				// the trigger having set it (the startup gap-check resyncs on a watermark lag
-				// WITHOUT marking), then arm the retry timer so even a quiet account re-attempts.
-				if matches!(e.kind(), ErrorKind::RetryFailed) {
-					log::info!(
-						"resync: drive lock contended; yielding to the event drain and retrying in {RESYNC_RETRY_INTERVAL:?}"
-					);
-				} else {
-					log::warn!(
-						"resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
-					);
-				}
+				// A snapshot-id read or per-root listing failed (the lock was already held) —
+				// nothing is committed. Durably mark the flag rather than relying on the trigger
+				// having set it (the startup gap-check resyncs on a watermark lag WITHOUT
+				// marking), then arm the retry timer so even a quiet account re-attempts.
+				log::warn!("resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}");
 				if let Err(e) = self.mark_needs_resync() {
 					self.surface_errors(vec![*e]);
 				}
