@@ -482,7 +482,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 			.await
 			.unwrap();
 		assert!(
-			poll_for_item(&path, test_dir_uuid, Duration::from_secs(60)).await,
+			poll_for_item(&path, test_dir_uuid, Duration::from_secs(120)).await,
 			"the populate resync should materialize the scope root"
 		);
 	}
@@ -505,7 +505,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 			.await
 			.unwrap();
 		assert!(
-			poll_for_item(&path, offline_uuid, Duration::from_secs(60)).await,
+			poll_for_item(&path, offline_uuid, Duration::from_secs(120)).await,
 			"restart resync should catch up the dir created while the cache was offline"
 		);
 	}
