@@ -1521,11 +1521,55 @@ impl CacheState {
 			},
 		);
 
+		// FAST PATH — no sync roots: there is nothing to list, so nothing needs the drive lock
+		// OR a consistent snapshot (the lock only ever made the listing consistent with the
+		// snapshot id). Read the remote drive id WITHOUT the lock and advance the watermark to it,
+		// so the startup gap-check stops re-firing. This is the common fresh-worker-boot case (the
+		// gap-check runs before any `AddSyncRoot` is processed) and every integration test's
+		// worker startup — taking the account-wide WRITE lock there is pure waste and serializes
+		// the whole suite. SAFE: with zero roots the cache mirrors nothing, so jumping the
+		// watermark cannot skip an event that affects it, and a later add's convergence resync
+		// re-reads a fresh snapshot UNDER the lock to populate its root consistently.
+		if sync_roots.is_empty() {
+			Self::send_resync_progress(&self.msg_sender, ResyncProgress::Applying);
+			let converged = match deps.client.get_last_event_ids().await {
+				Ok(ids) => match self.commit_resync_watermark(ids.drive, false) {
+					Ok(()) => true,
+					Err(e) => {
+						// The watermark write failed; keep the durable flag set (best-effort —
+						// it is the same DB) so the armed retry actually re-fires this session,
+						// matching the listing-failure arm below.
+						self.surface_errors(vec![*e]);
+						if let Err(e) = self.mark_needs_resync() {
+							self.surface_errors(vec![*e]);
+						}
+						false
+					}
+				},
+				Err(e) => {
+					// Couldn't reach the server to read the snapshot id — leave the watermark be
+					// (the gap-check re-fires on the next event) and arm the retry timer for a
+					// quiet account.
+					log::info!("resync: no sync roots; deferring watermark advance ({e})");
+					if let Err(e) = self.mark_needs_resync() {
+						self.surface_errors(vec![*e]);
+					}
+					false
+				}
+			};
+			Self::send_resync_progress(&self.msg_sender, ResyncProgress::Finished { converged });
+			self.resync_retry = if converged {
+				None
+			} else {
+				Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL)
+			};
+			return Ok(());
+		}
+
 		// List EACH sync root's subtree under ONE drive lock, reading the snapshot id under the same lock
 		// so every root's listing is consistent at `remote_under_lock`. A subdir root is resolved via
 		// `get_dir` (which also yields the node to materialize so the diff has an anchor row); the account
-		// root uses its already-materialized `roots` row. (Empty `sync_roots` ⇒ no listings, and
-		// `finalize_resync` still advances the watermark + clears the flag so the gap-check does not loop.)
+		// root uses its already-materialized `roots` row.
 		let msg_sender = &self.msg_sender;
 		#[allow(clippy::type_complexity)]
 		let island = async {
