@@ -100,9 +100,12 @@ async fn test_wrong_password() {
 	let client = test_utils::RESOURCES.client().await;
 	let unauthed = client.get_unauthed();
 
-	// `test_2fa` temporarily enables 2FA on the shared account under the auth lock; a wrong
-	// password while 2FA is on reports Enter2fa instead of EmailOrPasswordWrong (the server
-	// checks the challenge first). Hold the same lock so the two never overlap.
+	// `test_2fa` is `#[ignore]`d out of the parallel matrix (it toggles 2FA on this shared account,
+	// which would make a wrong-password login report Enter2fa instead of EmailOrPasswordWrong), so
+	// in a normal run 2FA is never on here and this assertion is deterministic. The auth lock stays
+	// as a secondary guard for the isolated `--ignored` 2FA job; it cannot fully protect against a
+	// cross-worker 2FA toggle (other logins don't hold it), so the real isolation is keeping
+	// `test_2fa` off the parallel matrix.
 	let _lock = client.lock_auth().await.unwrap();
 
 	let (email, _, _) = test_utils::RESOURCES.get_credentials();
@@ -113,7 +116,14 @@ async fn test_wrong_password() {
 	assert_eq!(err.kind(), ErrorKind::EmailOrPasswordWrong);
 }
 
+// IGNORED in the default (parallel) test matrix: this enables 2FA on the SHARED `TEST` account,
+// and while 2FA is on EVERY fresh login to that account fails — including other CI workers'
+// `RESOURCES.client()` initialization and `test_wrong_password`. No lock can fully cover that: a
+// fresh login can't hold the auth lock (you need an authenticated client to take it). So run this
+// ISOLATED via `cargo test -- --ignored` in a single-worker job that never overlaps the main
+// matrix on this account, rather than letting it corrupt every concurrent login.
 #[shared_test_runtime]
+#[ignore = "toggles 2FA on the shared account; run isolated via --ignored, never alongside the parallel matrix"]
 async fn test_2fa() {
 	let client = test_utils::RESOURCES.client().await;
 	let unauthed = client.get_unauthed();
