@@ -76,6 +76,50 @@ jobs:
           IMAP_EMAIL_USER: ${{ secrets['IMAP_EMAIL_USER'] }}
           IMAP_EMAIL_PASSWORD: ${{ secrets['IMAP_EMAIL_PASSWORD'] }}
           RUST_LOG: debug
+  test-2fa:
+    # `test_2fa` is #[ignore]'d out of the matrix above because it ENABLES 2FA on the shared
+    # account, which makes EVERY concurrent login to that account fail (the other matrix jobs, and
+    # other workers). Run it ISOLATED here: only AFTER the whole matrix finishes (needs: test, so
+    # nothing else is touching the account) and only on Linux, via the ignored test. Default
+    # features only — the test needs none of malformed/heif/avif, so there are no system deps to
+    # install. `version` mirrors the matrix so 2FA coverage is preserved for each auth version
+    # (V1/V2 use different accounts, so the two are safe to run concurrently with each other).
+    needs: test
+    if: |
+      !cancelled() && (
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch' ||
+        contains(github.event.head_commit.message, '[test]') ||
+        contains(github.event.pull_request.title, '[test]') ||
+        contains(github.event.pull_request.body, '[test]')
+      )
+    strategy:
+      matrix:
+        version: [V1, V2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-test-ubuntu-latest
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: false
+      - name: Run the isolated 2FA test (#[ignore]'d out of the matrix)
+        run: cargo test -p filen-sdk-rs --test client_tests --no-fail-fast -- --ignored
+        env:
+          TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
+          TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          IMAP_EMAIL_USER: ${{ secrets['IMAP_EMAIL_USER'] }}
+          IMAP_EMAIL_PASSWORD: ${{ secrets['IMAP_EMAIL_PASSWORD'] }}
+          RUST_LOG: debug
   test-wasm:
     if: |
       github.event_name == 'schedule' ||
