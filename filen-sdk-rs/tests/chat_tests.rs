@@ -5,6 +5,27 @@ use filen_sdk_rs::{auth::Client, chats::Chat, sync::lock::ResourceLock};
 use filen_types::traits::CowHelpers;
 use test_utils::set_up_contact;
 
+/// Janitor (mirrors `client_tests::cleanup_test_dirs`): sweep stale conversations that prior runs
+/// left behind — the per-test [`ChatGuard`] only clears when a chat test actually runs, so a run
+/// that filters the chat tests out never cleans up, and leaked conversations feed the
+/// `conversations/create` rate limit. Age-filtered (older than a day) so a concurrent run's fresh
+/// conversations are never deleted out from under it; takes the same `test:chats` lock so it
+/// never races a live chat test.
+#[shared_test_runtime]
+async fn cleanup_test_chats() {
+	let client = test_utils::RESOURCES.client().await;
+	let _lock = lock_chat(&client).await;
+
+	let now = chrono::Utc::now();
+	let chats = client.list_chats().await.unwrap();
+	for chat in chats {
+		if now - chat.created() > chrono::Duration::days(1) {
+			let _ = client.leave_chat(&chat).await;
+			let _ = client.delete_chat(chat).await;
+		}
+	}
+}
+
 #[shared_test_runtime]
 async fn conversation_creation() {
 	let client = test_utils::RESOURCES.client().await;
