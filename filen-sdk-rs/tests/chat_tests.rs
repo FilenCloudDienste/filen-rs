@@ -8,9 +8,9 @@ use test_utils::set_up_contact;
 #[shared_test_runtime]
 async fn conversation_creation() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = lock_chat(&client).await;
+	let _guard = ChatGuard::acquire(&client).await;
 
-	let chat = client.create_chat(&[]).await.unwrap();
+	let chat = retry_rate_limited(|| client.create_chat(&[])).await;
 
 	let chats = client.list_chats().await.unwrap();
 
@@ -21,9 +21,9 @@ async fn conversation_creation() {
 #[shared_test_runtime]
 async fn conversation_deletion() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = lock_chat(&client).await;
+	let _guard = ChatGuard::acquire(&client).await;
 
-	let chat = client.create_chat(&[]).await.unwrap();
+	let chat = retry_rate_limited(|| client.create_chat(&[])).await;
 	let chats = client.list_chats().await.unwrap();
 	let found = chats.into_iter().find(|c| c.uuid() == chat.uuid()).unwrap();
 	client.delete_chat(found).await.unwrap();
@@ -35,9 +35,9 @@ async fn conversation_deletion() {
 #[shared_test_runtime]
 async fn conversation_renaming() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = lock_chat(&client).await;
+	let _guard = ChatGuard::acquire(&client).await;
 
-	let mut chat = client.create_chat(&[]).await.unwrap();
+	let mut chat = retry_rate_limited(|| client.create_chat(&[])).await;
 	let chats = client.list_chats().await.unwrap();
 	let found = chats.into_iter().find(|c| c.uuid() == chat.uuid()).unwrap();
 	assert_eq!(chat, found);
@@ -55,9 +55,9 @@ async fn conversation_renaming() {
 #[shared_test_runtime]
 async fn conversation_muting() {
 	let client = test_utils::RESOURCES.client().await;
-	let _lock = lock_chat(&client).await;
+	let _guard = ChatGuard::acquire(&client).await;
 
-	let mut chat = client.create_chat(&[]).await.unwrap();
+	let mut chat = retry_rate_limited(|| client.create_chat(&[])).await;
 	let fetched = client.get_chat(chat.uuid()).await.unwrap().unwrap();
 	assert_eq!(chat, fetched);
 	assert!(!chat.muted());
@@ -76,6 +76,65 @@ async fn lock_chat(client: &Client) -> Arc<ResourceLock> {
 		.acquire_lock_with_default("test:chats")
 		.await
 		.unwrap()
+}
+
+/// Delete every conversation `client` owns or participates in (best-effort). Chat tests
+/// historically leaked the conversations they created — only the deletion test cleaned up — and
+/// the server rate-limits `conversations/create` once enough accumulate on the shared account.
+async fn clear_chats(client: &Client) {
+	if let Ok(chats) = client.list_chats().await {
+		for chat in chats {
+			let _ = client.leave_chat(&chat).await;
+			let _ = client.delete_chat(chat).await;
+		}
+	}
+}
+
+/// RAII clean-slate guard for one client's chats: it holds the account-wide `test:chats` lock (so
+/// chat tests never overlap) and deletes every existing conversation on acquire, so the shared
+/// account never accumulates beyond one in-flight test's worth — the root cause of the
+/// `rate_limited` failures on `conversations/create`.
+struct ChatGuard {
+	_lock: Arc<ResourceLock>,
+}
+
+impl ChatGuard {
+	async fn acquire(client: &Client) -> Self {
+		let lock = lock_chat(client).await;
+		clear_chats(client).await;
+		Self { _lock: lock }
+	}
+}
+
+/// `true` if `error` is the server's `rate_limited` response (it maps to the generic
+/// `ErrorKind::Server`, so the code string is the only discriminator).
+fn is_rate_limited(error: &filen_sdk_rs::Error) -> bool {
+	matches!(
+		error.downcast_ref::<filen_types::error::ResponseError>(),
+		Some(filen_types::error::ResponseError::ApiError { code, .. })
+			if code.as_deref() == Some("rate_limited")
+	)
+}
+
+/// Run `op`, retrying on `rate_limited` with backoff (up to ~60s). The shared account's
+/// conversation backlog can be deep enough on the first post-cleanup run that `create_chat` is
+/// briefly throttled while [`clear_chats`] drains it.
+async fn retry_rate_limited<T, F, Fut>(mut op: F) -> T
+where
+	F: FnMut() -> Fut,
+	Fut: std::future::Future<Output = Result<T, filen_sdk_rs::Error>>,
+{
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	loop {
+		match op().await {
+			Ok(value) => return value,
+			Err(e) if is_rate_limited(&e) && std::time::Instant::now() < deadline => {
+				eprintln!("rate limited; retrying: {e}");
+				tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+			}
+			Err(e) => panic!("chat operation failed: {e:?}"),
+		}
+	}
 }
 
 async fn lock_chats(
@@ -108,16 +167,8 @@ async fn make_chat(
 ) {
 	let locks = lock_chats(client, share_client).await;
 
-	let chats = client.list_chats().await.unwrap();
-	for chat in chats {
-		let _ = client.leave_chat(&chat).await;
-		let _ = client.delete_chat(chat).await;
-	}
-	let chats = share_client.list_chats().await.unwrap();
-	for chat in chats {
-		let _ = share_client.leave_chat(&chat).await;
-		let _ = share_client.delete_chat(chat).await;
-	}
+	clear_chats(client).await;
+	clear_chats(share_client).await;
 
 	let contact = client
 		.get_contacts()
@@ -127,7 +178,8 @@ async fn make_chat(
 		.find(|c| c.email == share_client.email())
 		.unwrap();
 
-	(locks, client.create_chat(&[contact]).await.unwrap())
+	let chat = retry_rate_limited(|| client.create_chat(std::slice::from_ref(&contact))).await;
+	(locks, chat)
 }
 
 #[shared_test_runtime]
@@ -136,20 +188,12 @@ async fn conversation_participant_management() {
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 	let _locks = lock_chats(&client, &share_client).await;
 
-	let chats = client.list_chats().await.unwrap();
-	for chat in chats {
-		let _ = client.leave_chat(&chat).await;
-		let _ = client.delete_chat(chat).await;
-	}
-	let chats = share_client.list_chats().await.unwrap();
-	for chat in chats {
-		let _ = share_client.leave_chat(&chat).await;
-		let _ = share_client.delete_chat(chat).await;
-	}
+	clear_chats(&client).await;
+	clear_chats(&share_client).await;
 	let chats = client.list_chats().await.unwrap();
 	assert!(chats.is_empty());
 
-	let mut chat = client.create_chat(&[]).await.unwrap();
+	let mut chat = retry_rate_limited(|| client.create_chat(&[])).await;
 
 	if let Ok(uuid) = client.send_contact_request(share_client.email()).await {
 		let _ = share_client.accept_contact_request(uuid).await;

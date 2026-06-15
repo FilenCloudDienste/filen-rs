@@ -656,6 +656,21 @@ async fn test_websocket_folder_events() {
 async fn chat() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
+
+	// Serialize with chat_tests on the account-wide chat lock and start from a clean slate:
+	// leaked conversations feed the server's `conversations/create` rate limit (see
+	// chat_tests.rs for the same guard).
+	let _chat_lock = client
+		.acquire_lock_with_default("test:chats")
+		.await
+		.unwrap();
+	if let Ok(chats) = client.list_chats().await {
+		for chat in chats {
+			let _ = client.leave_chat(&chat).await;
+			let _ = client.delete_chat(chat).await;
+		}
+	}
+
 	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 	let (share_sender, mut share_receiver) = tokio::sync::mpsc::unbounded_channel();
 
