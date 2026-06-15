@@ -33,6 +33,16 @@ use filen_types::{
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
 
+/// The cache's worst-case convergence bound under heavy drive-lock contention — a self-heal
+/// resync may need a full patient lock acquisition (~111s) plus a retry cycle before it commits.
+/// NOT the expected duration: the happy path settles in well under a second and a state poll exits
+/// the instant the condition holds; this only bounds the pathological contended case so a test
+/// never gives up while the cache is still legitimately converging. Use it for ANY assertion
+/// waiting on cache-converged state — both [`wait_for_converged_resync`] (convergence-driven) and
+/// `poll_until`/`poll_for_item` on data that may be transiently lost to a membership gap under an
+/// account-wide event shed and then restored only by the self-heal resync.
+pub const CACHE_CONVERGE_TIMEOUT: Duration = Duration::from_secs(240);
+
 /// Generate a unique temporary cache DB path.
 pub fn temp_cache_path() -> PathBuf {
 	let mut path = std::env::temp_dir();

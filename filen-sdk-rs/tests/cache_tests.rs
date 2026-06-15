@@ -14,13 +14,6 @@ use uuid::Uuid;
 mod helpers;
 use helpers::*;
 
-/// Generous safety-net timeout for [`wait_for_converged_resync`] — NOT the expected duration
-/// (convergence is typically sub-second). It must merely exceed the resync's worst-case patience
-/// under heavy drive-lock contention (a ~111s patient acquire plus a retry cycle or two), so a
-/// test never gives up while the resync is still legitimately working. This is the principled
-/// replacement for fixed item-poll windows, which could expire mid-resync.
-const RESYNC_CONVERGE_TIMEOUT: Duration = Duration::from_secs(240);
-
 #[shared_test_runtime]
 async fn test_cache_init_creates_schema() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -257,12 +250,12 @@ async fn test_cache_file_move_via_socket() {
 		.await
 		.unwrap();
 
-	// Give time for the move event to be processed
-	tokio::time::sleep(Duration::from_secs(3)).await;
-
-	// File should still exist in the cache (updated with new parent)
+	// The file must still exist after the move (re-parented, not removed). The new parent is a
+	// NESTED dir, so under an account-wide event shed the move can hit the membership gap
+	// (target_dir momentarily uncached) and the file is transiently deleted, then restored by the
+	// self-heal resync — so wait up to the convergence bound, not a fixed few seconds.
 	assert!(
-		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(5)).await,
+		poll_for_item(cache.db_path(), file_uuid, CACHE_CONVERGE_TIMEOUT).await,
 		"file should still exist in cache after move event"
 	);
 }
@@ -300,8 +293,12 @@ async fn test_cache_dir_move_via_socket() {
 		.await
 		.unwrap();
 
+	// As for the file move: the new parent is a NESTED dir, so under an account-wide event shed
+	// the move can hit the membership gap (target_dir momentarily uncached) and the moved dir is
+	// transiently deleted, then restored by the self-heal resync — wait up to the convergence
+	// bound rather than a fixed window.
 	assert!(
-		poll_for_item(cache.db_path(), move_dir_uuid, Duration::from_secs(30)).await,
+		poll_for_item(cache.db_path(), move_dir_uuid, CACHE_CONVERGE_TIMEOUT).await,
 		"moved dir should still exist in cache"
 	);
 }
@@ -497,7 +494,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 		// the resync can legitimately take longer than any fixed window, and giving up early is the
 		// flakiness we are removing. Once it reports converged, the row is already committed.
 		assert!(
-			wait_for_converged_resync(&messages, test_dir_uuid, since, RESYNC_CONVERGE_TIMEOUT)
+			wait_for_converged_resync(&messages, test_dir_uuid, since, CACHE_CONVERGE_TIMEOUT)
 				.await,
 			"the populate resync should converge"
 		);
@@ -528,7 +525,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 		// `since` skips session 1's convergence (the log persists across the restart), so this waits
 		// for session 2's gap-check resync of the same root, then reads the offline-created child.
 		assert!(
-			wait_for_converged_resync(&messages, test_dir_uuid, since, RESYNC_CONVERGE_TIMEOUT)
+			wait_for_converged_resync(&messages, test_dir_uuid, since, CACHE_CONVERGE_TIMEOUT)
 				.await,
 			"the restart resync should converge"
 		);
@@ -583,7 +580,7 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 	// One convergence resync lists the whole `root_dir` subtree, so awaiting its converged signal
 	// covers both the root and its child — then the rows are already committed.
 	assert!(
-		wait_for_converged_resync(&messages, root_uuid, since, RESYNC_CONVERGE_TIMEOUT).await,
+		wait_for_converged_resync(&messages, root_uuid, since, CACHE_CONVERGE_TIMEOUT).await,
 		"the convergence resync should converge"
 	);
 	assert!(
@@ -1326,14 +1323,21 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 	// take the covered fast path and must run a lock-needing convergence resync.
 	let client2 = derive_client(client.as_ref());
 	let path2 = temp_cache_path();
+	let (messages2, status_cb2) = capturing_status_callback();
 	client2
-		.configure_cache(path2.clone(), |_| {})
+		.configure_cache(path2.clone(), status_cb2)
 		.await
 		.unwrap();
 	ensure_socket_ready(&client2).await;
 
 	// The TEST monopolizes the drive lock (auto-refreshed while held; released on drop).
 	let lock = client.lock_drive().await.unwrap();
+
+	// Snapshot the log BEFORE the add triggers the convergence resync: that resync emits its
+	// `Started` (covering `sub`) up front, before the patient lock wait, so `since` must precede
+	// the add for `wait_for_converged_resync` to pair that `Started` with the post-release
+	// `Finished`. (The contended attempts in between report `converged: false` and never match.)
+	let since = messages_len(&messages2);
 
 	// Validation (`get_dir`, no lock involved) can hit fresh-dir propagation lag — retry.
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -1373,12 +1377,17 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 		"socket events must keep applying while the drive lock is contended"
 	);
 
-	// CONVERGENCE: once the lock frees up, the retry timer re-attempts and the resync
-	// materializes the root's anchor row (which only the resync writes — no event carries it).
+	// CONVERGENCE: once the lock frees up, the patient acquisition (or the next retry) wins it and
+	// the resync materializes the root's anchor row (which only the resync writes — no event
+	// carries it). Wait on the converged signal rather than a fixed window.
 	drop(lock);
 	assert!(
-		poll_for_item(&path2, sub_uuid, Duration::from_secs(120)).await,
+		wait_for_converged_resync(&messages2, sub_uuid, since, CACHE_CONVERGE_TIMEOUT).await,
 		"the resync converges after the lock is released"
+	);
+	assert!(
+		poll_for_item(&path2, sub_uuid, Duration::from_secs(5)).await,
+		"the resync materializes the root anchor row once the lock is released"
 	);
 }
 

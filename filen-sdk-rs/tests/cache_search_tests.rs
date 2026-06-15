@@ -128,7 +128,7 @@ async fn test_search_initial_results_sorted_dirs_first() {
 		.await
 		.unwrap();
 	assert!(
-		poll_until(Duration::from_secs(60), || search.total() == 3).await,
+		poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 3).await,
 		"the convergence resync populates the search"
 	);
 
@@ -164,7 +164,7 @@ async fn test_search_live_upload_fires_window_snapshot() {
 	upload_text(&client, &scratch, "fresh.txt").await;
 
 	assert!(
-		poll_until(Duration::from_secs(60), || {
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
 			last_snapshot(&log).is_some_and(|snapshot| names(&snapshot) == vec!["fresh.txt"])
 		})
 		.await,
@@ -185,7 +185,7 @@ async fn test_search_rename_reorders_results() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.total() == 2).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 2).await);
 	let (log, callback) = snapshot_log();
 	let (snapshot, _window) = search.get_range(0..10, callback).await.unwrap();
 	assert_eq!(names(&snapshot), vec!["alpha.txt", "beta.txt"]);
@@ -197,7 +197,7 @@ async fn test_search_rename_reorders_results() {
 		.unwrap();
 
 	assert!(
-		poll_until(Duration::from_secs(60), || {
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
 			last_snapshot(&log)
 				.is_some_and(|snapshot| names(&snapshot) == vec!["beta.txt", "zeta.txt"])
 		})
@@ -218,14 +218,14 @@ async fn test_search_favorite_toggle_fires_content_refresh() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
 	let (log, callback) = snapshot_log();
 	let (_snapshot, _window) = search.get_range(0..10, callback).await.unwrap();
 
 	client.set_file_favorite(&mut file, true).await.unwrap();
 
 	assert!(
-		poll_until(Duration::from_secs(60), || {
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
 			last_snapshot(&log).is_some_and(|snapshot| {
 				snapshot.results.first().is_some_and(|result| match result {
 					filen_sdk_rs::cache::SearchResult::File(file) => file.favorited,
@@ -250,7 +250,7 @@ async fn test_search_move_out_removes_result() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
 
 	client
 		.move_file(&mut file, &(&resources.dir).into())
@@ -258,7 +258,7 @@ async fn test_search_move_out_removes_result() {
 		.unwrap();
 
 	assert!(
-		poll_until(Duration::from_secs(60), || search.total() == 0).await,
+		poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 0).await,
 		"moving the file out of the searched subtree removes it"
 	);
 }
@@ -304,7 +304,7 @@ async fn test_search_move_in_of_populated_dir_indexes_descendants() {
 		.unwrap();
 
 	assert!(
-		poll_until(Duration::from_secs(120), || search.total() == 2).await,
+		poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 2).await,
 		"the moved-in dir AND its already-cached child are indexed"
 	);
 }
@@ -328,7 +328,7 @@ async fn test_search_name_filter_applies_to_live_events() {
 	}
 
 	assert!(
-		poll_until(Duration::from_secs(120), || search.total() == 1).await,
+		poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await,
 		"only the (case-insensitively) matching upload enters the results"
 	);
 }
@@ -346,7 +346,7 @@ async fn test_search_set_config_refilters_without_reregistration() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.total() == 2).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 2).await);
 
 	// Engine-local: no re-registration, no resync — answers from the cached subtree.
 	search
@@ -376,7 +376,7 @@ async fn test_search_case_sensitive_toggle() {
 		.await
 		.unwrap();
 	assert!(
-		poll_until(Duration::from_secs(120), || search.total() == 1).await,
+		poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await,
 		"the default mode matches case-insensitively"
 	);
 
@@ -415,7 +415,7 @@ async fn test_search_out_of_window_insert_updates_delivered_total() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
 	let (log, callback) = snapshot_log();
 	// The window exactly covers the lone existing result.
 	let (snapshot, _window) = search.get_range(0..1, callback).await.unwrap();
@@ -426,7 +426,7 @@ async fn test_search_out_of_window_insert_updates_delivered_total() {
 	upload_text(&client, &scratch, "zzz.txt").await;
 
 	assert!(
-		poll_until(Duration::from_secs(60), || {
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
 			last_snapshot(&log)
 				.is_some_and(|snapshot| snapshot.total == 2 && names(&snapshot) == vec!["aaa.txt"])
 		})
@@ -447,7 +447,7 @@ async fn test_search_root_deleted_goes_terminal_with_frozen_get_range() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
 	let (log, callback) = snapshot_log();
 	let (_snapshot, _window) = search.get_range(0..10, callback).await.unwrap();
 
@@ -457,11 +457,11 @@ async fn test_search_root_deleted_goes_terminal_with_frozen_get_range() {
 	client.delete_dir_permanently(scratch).await.unwrap();
 
 	assert!(
-		poll_until(Duration::from_secs(60), || !search.is_live()).await,
+		poll_until(CACHE_CONVERGE_TIMEOUT, || !search.is_live()).await,
 		"the search learns its root is gone"
 	);
 	assert!(
-		poll_until(Duration::from_secs(60), || {
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
 			last_snapshot(&log).is_some_and(|snapshot| !snapshot.live)
 		})
 		.await,
@@ -492,12 +492,12 @@ async fn test_search_flush_cache_goes_terminal() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(120), || search.total() == 1).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
 
 	client.flush_cache().await;
 
 	assert!(
-		poll_until(Duration::from_secs(60), || !search.is_live()).await,
+		poll_until(CACHE_CONVERGE_TIMEOUT, || !search.is_live()).await,
 		"a stopped worker is a terminal signal for the search"
 	);
 	// The DB rows survive a flush, so frozen get_range still hydrates fully.
@@ -562,12 +562,14 @@ async fn test_search_drop_releases_the_sync_root() {
 		.create_search(scratch.uuid().into(), SearchConfig::new())
 		.await
 		.unwrap();
-	assert!(poll_until(Duration::from_secs(60), || search.is_live()).await);
+	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.is_live()).await);
 
 	// The search holds the ONLY registration: dropping it lets the cache worker wind down;
-	// flush_cache then joins deterministically (and must not hang).
+	// flush_cache then joins deterministically (and must not hang). The join can wait out an
+	// in-flight resync — the patient-acquire loop doesn't poll the control channel, so a
+	// contended resync delays the shutdown — hence the convergence bound, not a few seconds.
 	drop(search);
-	tokio::time::timeout(Duration::from_secs(30), client.flush_cache())
+	tokio::time::timeout(CACHE_CONVERGE_TIMEOUT, client.flush_cache())
 		.await
 		.expect("worker drains and exits after the last registration drops");
 }
