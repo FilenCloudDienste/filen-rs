@@ -5,12 +5,14 @@
 use std::{
 	borrow::Cow,
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{Arc, Mutex},
 	time::Duration,
 };
 
 use chrono::Utc;
-use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheMessage, SyncRootCallback, SyncRootHandle};
+use filen_sdk_rs::cache::{
+	CacheError, CacheEvent, CacheMessage, ResyncProgress, SyncRootCallback, SyncRootHandle,
+};
 use filen_sdk_rs::{
 	auth::Client,
 	crypto::file::FileKey,
@@ -29,7 +31,6 @@ use filen_types::{
 	traits::CowHelpersExt,
 };
 use rusqlite::{Connection, OpenFlags, params};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// Generate a unique temporary cache DB path.
@@ -370,10 +371,12 @@ pub async fn ensure_socket_ready(client: &Client) {
 	.await;
 }
 
-/// Shared queue of `CacheMessage`s captured from the cache's status callback.
-/// Wrapping in an `Arc<Mutex<_>>` is the simplest way to share with the `'static`
-/// callback while letting the test thread inspect the contents. Note `Mutex` here is
-/// `tokio::sync::Mutex` (async) — lock it with `.lock().await`, not a blocking `.lock()`.
+/// Shared queue of `CacheMessage`s captured from the cache's status callback, in ARRIVAL ORDER.
+/// Wrapping in an `Arc<Mutex<_>>` shares it with the `'static` status callback while letting the
+/// test thread inspect the contents. The `Mutex` is a `std::sync::Mutex` (blocking) ON PURPOSE:
+/// the status callback appends synchronously (no task spawn), so messages — and the `Started`/
+/// `Finished` resync brackets in particular — never reorder, which [`wait_for_converged_resync`]
+/// relies on. Hold the guard only briefly and never across an `.await`.
 pub type MessageLog = std::sync::Arc<Mutex<Vec<CacheMessage>>>;
 
 /// A test cache: a DERIVED private client (its own cache slot, configured onto a unique temp DB)
@@ -396,10 +399,8 @@ impl TestCache {
 		let messages_cb = messages.clone();
 		client
 			.configure_cache(path.clone(), move |msgs| {
-				let messages_cb = messages_cb.clone();
-				tokio::task::spawn(async move {
-					messages_cb.lock().await.extend(msgs);
-				});
+				// Synchronous append (see `MessageLog`): keeps messages in arrival order.
+				messages_cb.lock().unwrap().extend(msgs);
 			})
 			.await
 			.unwrap();
@@ -445,7 +446,7 @@ impl TestCache {
 		let deadline = tokio::time::Instant::now() + timeout;
 		loop {
 			{
-				let guard = self.messages.lock().await;
+				let guard = self.messages.lock().unwrap();
 				if predicate(&guard) {
 					return true;
 				}
@@ -455,5 +456,71 @@ impl TestCache {
 			}
 			tokio::time::sleep(Duration::from_millis(100)).await;
 		}
+	}
+}
+
+/// A `configure_cache` status callback that appends every [`CacheMessage`] into the returned
+/// [`MessageLog`] in ARRIVAL ORDER (synchronous append — no task spawn, so the `Started`/
+/// `Finished` resync brackets never reorder across batches). For tests that build the cache
+/// inline rather than via [`TestCache`]; pair with [`wait_for_converged_resync`].
+pub fn capturing_status_callback() -> (
+	MessageLog,
+	impl Fn(Vec<CacheMessage>) + Send + Sync + 'static,
+) {
+	let log: MessageLog = Arc::new(Mutex::new(Vec::new()));
+	let cb_log = log.clone();
+	(log, move |msgs: Vec<CacheMessage>| {
+		cb_log.lock().unwrap().extend(msgs);
+	})
+}
+
+/// The current number of captured messages. Snapshot this BEFORE an operation, then pass it as
+/// `since` to [`wait_for_converged_resync`] so a PRIOR session's convergence (the log persists
+/// across worker restarts) is not mistaken for this one's.
+pub fn messages_len(log: &MessageLog) -> usize {
+	log.lock().unwrap().len()
+}
+
+/// Wait until a convergence resync that COVERS `root` commits successfully: a
+/// [`ResyncProgress::Finished`] with `converged: true` following a [`ResyncProgress::Started`]
+/// whose `roots` include `root`, among messages at index `>= since`.
+///
+/// This is the DETERMINISTIC signal that the cache now holds a complete listing of `root`'s
+/// subtree, so waiting on it lets a test wait EXACTLY as long as the resync actually takes. The
+/// drive lock is a fairness-free race with no latency bound (see `run_resync`), so a fixed
+/// item-poll window can expire while the resync is still legitimately polling for the lock —
+/// `timeout` here is only a generous safety net against a true hang, NOT the expected duration.
+pub async fn wait_for_converged_resync(
+	log: &MessageLog,
+	root: Uuid,
+	since: usize,
+	timeout: Duration,
+) -> bool {
+	let deadline = tokio::time::Instant::now() + timeout;
+	loop {
+		{
+			let guard = log.lock().unwrap();
+			// Resyncs run sequentially on the worker, so between a `Started` and its `Finished`
+			// there is never another `Started`: tracking the most recent `Started`'s coverage and
+			// returning on the next successful `Finished` correctly pairs the two.
+			let mut covers_root = false;
+			for msg in guard.iter().skip(since) {
+				match msg {
+					CacheMessage::ResyncProgress(ResyncProgress::Started { roots }) => {
+						covers_root = roots.contains(&root);
+					}
+					CacheMessage::ResyncProgress(ResyncProgress::Finished { converged: true })
+						if covers_root =>
+					{
+						return true;
+					}
+					_ => {}
+				}
+			}
+		}
+		if tokio::time::Instant::now() >= deadline {
+			return false;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
 }

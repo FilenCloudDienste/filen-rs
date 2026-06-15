@@ -14,6 +14,13 @@ use uuid::Uuid;
 mod helpers;
 use helpers::*;
 
+/// Generous safety-net timeout for [`wait_for_converged_resync`] — NOT the expected duration
+/// (convergence is typically sub-second). It must merely exceed the resync's worst-case patience
+/// under heavy drive-lock contention (a ~111s patient acquire plus a retry cycle or two), so a
+/// test never gives up while the resync is still legitimately working. This is the principled
+/// replacement for fixed item-poll windows, which could expire mid-resync.
+const RESYNC_CONVERGE_TIMEOUT: Duration = Duration::from_secs(240);
+
 #[shared_test_runtime]
 async fn test_cache_init_creates_schema() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -471,18 +478,31 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 	let test_dir = &resources.dir;
 	let test_dir_uuid: Uuid = test_dir.uuid().into();
 	let path = temp_cache_path();
-	client.configure_cache(path.clone(), |_| {}).await.unwrap();
+	let (messages, status_cb) = capturing_status_callback();
+	client
+		.configure_cache(path.clone(), status_cb)
+		.await
+		.unwrap();
 
 	// Session 1: a fresh cache. The startup gap-check (watermark None, remote drive id > 0) resyncs and
 	// populates the cache from the account listing, so the existing test dir shows up.
 	{
+		let since = messages_len(&messages);
 		let _handle = client
 			.clone()
 			.add_sync_root(test_dir_uuid, noop_sync_root_callback())
 			.await
 			.unwrap();
+		// Wait on the convergence SIGNAL, not a fixed item-poll window: under drive-lock contention
+		// the resync can legitimately take longer than any fixed window, and giving up early is the
+		// flakiness we are removing. Once it reports converged, the row is already committed.
 		assert!(
-			poll_for_item(&path, test_dir_uuid, Duration::from_secs(60)).await,
+			wait_for_converged_resync(&messages, test_dir_uuid, since, RESYNC_CONVERGE_TIMEOUT)
+				.await,
+			"the populate resync should converge"
+		);
+		assert!(
+			poll_for_item(&path, test_dir_uuid, Duration::from_secs(5)).await,
 			"the populate resync should materialize the scope root"
 		);
 	}
@@ -499,13 +519,21 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 	// the advanced drive id and resyncs, so the dir created while we were offline appears — with no
 	// socket delivery involved.
 	{
+		let since = messages_len(&messages);
 		let _handle = client
 			.clone()
 			.add_sync_root(test_dir_uuid, noop_sync_root_callback())
 			.await
 			.unwrap();
+		// `since` skips session 1's convergence (the log persists across the restart), so this waits
+		// for session 2's gap-check resync of the same root, then reads the offline-created child.
 		assert!(
-			poll_for_item(&path, offline_uuid, Duration::from_secs(60)).await,
+			wait_for_converged_resync(&messages, test_dir_uuid, since, RESYNC_CONVERGE_TIMEOUT)
+				.await,
+			"the restart resync should converge"
+		);
+		assert!(
+			poll_for_item(&path, offline_uuid, Duration::from_secs(5)).await,
 			"restart resync should catch up the dir created while the cache was offline"
 		);
 	}
@@ -527,7 +555,11 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 	let client = derive_client(resources.client.as_ref());
 	let test_dir = &resources.dir;
 	let path = temp_cache_path();
-	client.configure_cache(path.clone(), |_| {}).await.unwrap();
+	let (messages, status_cb) = capturing_status_callback();
+	client
+		.configure_cache(path.clone(), status_cb)
+		.await
+		.unwrap();
 
 	// The subdir that will be the sole sync root, plus a child so there is a populated subtree.
 	let mut root_dir = client
@@ -542,17 +574,24 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 	let child_uuid: Uuid = child.uuid().into();
 
 	// Session 1: selective sync of ONLY `root_dir`; populate via the convergence resync, then flush.
+	let since = messages_len(&messages);
 	let stale_handle = client
 		.clone()
 		.add_sync_root(root_uuid, noop_sync_root_callback())
 		.await
 		.unwrap();
+	// One convergence resync lists the whole `root_dir` subtree, so awaiting its converged signal
+	// covers both the root and its child — then the rows are already committed.
 	assert!(
-		poll_for_item(&path, root_uuid, Duration::from_secs(60)).await,
+		wait_for_converged_resync(&messages, root_uuid, since, RESYNC_CONVERGE_TIMEOUT).await,
+		"the convergence resync should converge"
+	);
+	assert!(
+		poll_for_item(&path, root_uuid, Duration::from_secs(5)).await,
 		"the sync root should be cached after the convergence resync"
 	);
 	assert!(
-		poll_for_item(&path, child_uuid, Duration::from_secs(60)).await,
+		poll_for_item(&path, child_uuid, Duration::from_secs(5)).await,
 		"the child should be cached after the convergence resync"
 	);
 	client.flush_cache().await;
@@ -1400,7 +1439,7 @@ async fn test_cache_resync_reports_progress() {
 	if !saw_full_sequence {
 		panic!(
 			"timed out waiting for the full resync progress sequence; got: {:?}",
-			*cache.messages.lock().await
+			*cache.messages.lock().unwrap()
 		);
 	}
 }
