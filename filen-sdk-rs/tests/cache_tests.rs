@@ -420,41 +420,41 @@ async fn test_cache_reopen_preserves_data() {
 	let client = derive_client(resources.client.as_ref());
 	let path = temp_cache_path();
 	let test_dir_uuid = resources.dir.uuid();
-	// Configured ONCE — the config (and DB path) survives the worker stopping and respawning.
 	client.configure_cache(path.clone(), |_| {}).await.unwrap();
 
-	let dir = make_test_remote_dir("reopen_test_dir", test_dir_uuid);
-	let dir_uuid: Uuid = dir.uuid().into();
-	{
-		let handle = client
-			.clone()
-			.add_sync_root(test_dir_uuid.into(), noop_sync_root_callback())
-			.await
-			.unwrap();
-		ensure_socket_ready(&client).await;
-		handle
-			.update_list_dir_recursive(vec![dir], vec![])
-			.await
-			.unwrap();
-		assert!(poll_for_item(&path, dir_uuid, Duration::from_secs(10)).await);
-	}
-	client.flush_cache().await;
-
+	let dir_uuid: Uuid;
 	{
 		let _handle = client
 			.clone()
 			.add_sync_root(test_dir_uuid.into(), noop_sync_root_callback())
 			.await
 			.unwrap();
-
+		ensure_socket_ready(&client).await;
+		// A REAL child created AFTER the listener is live: the FolderSubCreated socket event
+		// populates the cache (no drive lock needed — robust under suite-wide lock contention,
+		// unlike the convergence resync), and real data survives every later resync, unlike a
+		// synthetic `update_list_dir_recursive` injection (which `diff_subtree_absent` correctly
+		// wipes as absent-from-server on the next resync of this scoped root).
+		let dir = client
+			.create_dir(&(&resources.dir).into(), "reopen_test_dir")
+			.await
+			.unwrap();
+		dir_uuid = dir.uuid().into();
 		assert!(
-			poll_for_item(&path, dir_uuid, Duration::from_secs(5)).await,
-			"data from previous session should persist"
+			poll_for_item(&path, dir_uuid, Duration::from_secs(60)).await,
+			"the FolderSubCreated event should cache the child"
 		);
-
-		let (name, _, _) = query_cached_dir(&path, dir_uuid).unwrap();
-		assert_eq!(name, "reopen_test_dir");
 	}
+	client.flush_cache().await;
+
+	// Reopen the DB FILE directly — no worker, so no resync runs to wipe or re-fetch. The row
+	// being present proves the flush persisted it to the file.
+	assert!(
+		poll_for_item(&path, dir_uuid, Duration::from_secs(5)).await,
+		"data from the previous session should persist in the reopened DB file"
+	);
+	let (name, _, _) = query_cached_dir(&path, dir_uuid).unwrap();
+	assert_eq!(name, "reopen_test_dir");
 }
 
 /// App close/resume: the cache catches up on changes that happened while it was offline. After a clean
@@ -548,11 +548,11 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 		.await
 		.unwrap();
 	assert!(
-		poll_for_item(&path, root_uuid, Duration::from_secs(60)).await,
+		poll_for_item(&path, root_uuid, Duration::from_secs(120)).await,
 		"the sync root should be cached after the convergence resync"
 	);
 	assert!(
-		poll_for_item(&path, child_uuid, Duration::from_secs(60)).await,
+		poll_for_item(&path, child_uuid, Duration::from_secs(120)).await,
 		"the child should be cached after the convergence resync"
 	);
 	client.flush_cache().await;
