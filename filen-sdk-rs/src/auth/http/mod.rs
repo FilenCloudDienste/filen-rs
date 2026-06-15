@@ -346,7 +346,11 @@ async fn execute_request(
 		.await
 		.and_then(|resp| resp.error_for_status())
 		.map_err(|e| {
-			let retryable = !(e.is_builder() || e.is_request());
+			// A pooled connection whose hyper dispatch task was dropped (`DispatchGone`) fails
+			// BEFORE the request is written, so it never reached the server — safe to retry even
+			// for non-idempotent endpoints. Every other builder/request error may have been
+			// partially sent, so it stays non-retryable.
+			let retryable = is_dispatch_gone(&e) || !(e.is_builder() || e.is_request());
 			let error = Error::from(e);
 			if retryable {
 				retry::RetryError::Retry(error)
@@ -354,6 +358,82 @@ async fn execute_request(
 				retry::RetryError::NoRetry(error)
 			}
 		})
+}
+
+/// Walks `err` and its [`source`](std::error::Error::source) chain, returning true if any link's
+/// `Display` contains one of `needles`. Used to detect a specific lower-layer error that the
+/// public error API does not otherwise expose.
+fn error_chain_mentions(err: &(dyn std::error::Error + 'static), needles: &[&str]) -> bool {
+	let mut source = Some(err);
+	while let Some(e) = source {
+		let msg = e.to_string();
+		if needles.iter().any(|needle| msg.contains(needle)) {
+			return true;
+		}
+		source = e.source();
+	}
+	false
+}
+
+/// True for hyper's `DispatchGone` (`Kind::User(DispatchGone)`, Display "dispatch task is gone",
+/// inner cause "runtime dropped the dispatch task"): the pooled connection's dispatch task was
+/// dropped — its tokio runtime went away — BEFORE the request was written to the socket, so the
+/// request never reached the server and retrying is safe even for non-idempotent endpoints. This
+/// arises when a connection opened on one runtime (e.g. a short-lived cache-worker runtime) is
+/// later reused from another — a known reqwest/hyper cross-runtime connection-pool hazard. hyper
+/// exposes no predicate for it (`is_canceled()` covers only `Kind::Canceled`; `is_user()` would
+/// also match the partially-sent body-write-abort case), so we match its stable `Display` string.
+fn is_dispatch_gone(err: &reqwest::Error) -> bool {
+	error_chain_mentions(
+		err,
+		&["dispatch task is gone", "runtime dropped the dispatch task"],
+	)
+}
+
+#[cfg(test)]
+mod retry_classification_tests {
+	use super::error_chain_mentions;
+
+	#[derive(Debug)]
+	struct Layered {
+		msg: &'static str,
+		source: Option<Box<Layered>>,
+	}
+
+	impl std::fmt::Display for Layered {
+		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			f.write_str(self.msg)
+		}
+	}
+
+	impl std::error::Error for Layered {
+		fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+			self.source
+				.as_ref()
+				.map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+		}
+	}
+
+	/// Mirrors the reqwest → hyper-util → hyper layering: the `DispatchGone` marker is only on the
+	/// innermost error, so the walk must descend the whole `source` chain.
+	#[test]
+	fn matches_needle_deep_in_the_source_chain() {
+		let err = Layered {
+			msg: "error sending request for url (https://example/v3/dir/create)",
+			source: Some(Box::new(Layered {
+				msg: "client error (SendRequest)",
+				source: Some(Box::new(Layered {
+					msg: "dispatch task is gone",
+					source: None,
+				})),
+			})),
+		};
+		assert!(error_chain_mentions(
+			&err,
+			&["dispatch task is gone", "runtime dropped the dispatch task"]
+		));
+		assert!(!error_chain_mentions(&err, &["connection refused"]));
+	}
 }
 
 impl AuthClient {
