@@ -482,7 +482,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 			.await
 			.unwrap();
 		assert!(
-			poll_for_item(&path, test_dir_uuid, Duration::from_secs(120)).await,
+			poll_for_item(&path, test_dir_uuid, Duration::from_secs(60)).await,
 			"the populate resync should materialize the scope root"
 		);
 	}
@@ -505,7 +505,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 			.await
 			.unwrap();
 		assert!(
-			poll_for_item(&path, offline_uuid, Duration::from_secs(120)).await,
+			poll_for_item(&path, offline_uuid, Duration::from_secs(60)).await,
 			"restart resync should catch up the dir created while the cache was offline"
 		);
 	}
@@ -548,11 +548,11 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 		.await
 		.unwrap();
 	assert!(
-		poll_for_item(&path, root_uuid, Duration::from_secs(120)).await,
+		poll_for_item(&path, root_uuid, Duration::from_secs(60)).await,
 		"the sync root should be cached after the convergence resync"
 	);
 	assert!(
-		poll_for_item(&path, child_uuid, Duration::from_secs(120)).await,
+		poll_for_item(&path, child_uuid, Duration::from_secs(60)).await,
 		"the child should be cached after the convergence resync"
 	);
 	client.flush_cache().await;
@@ -1265,7 +1265,14 @@ async fn test_add_sync_root_rejects_invalid_uuid() {
 /// resync itself must converge via the retry timer once the lock frees up.
 #[shared_test_runtime]
 async fn test_cache_applies_events_while_drive_lock_is_contended() {
-	let resources = test_utils::RESOURCES.get_resources().await;
+	// ISOLATION: this is the ONLY cache test that holds the account-wide drive lock for an
+	// extended window (across the upload + the 45s liveness poll below). The lock is per-account
+	// and admits one holder, so on the shared main account this hold STARVES every other test's
+	// convergence resync until release — the dominant source of suite flakiness. Run it on the
+	// SHARE account instead, which no other cache test touches, so its monopoly contends only
+	// with itself. (`cargo test --test cache_tests` runs as its own process, so the chat/socket
+	// tests that use the share account are not running concurrently.)
+	let resources = test_utils::SHARE_RESOURCES.get_resources().await;
 	let client = &resources.client;
 
 	// A populated dir that will become the (UNCOVERED) sync root of a derived cache — created
