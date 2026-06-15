@@ -122,6 +122,12 @@ pub(crate) struct CacheState {
 	/// via their own connection and never send here. `None` once every sender is gone (the arm
 	/// disables itself, like the engine's ping arm) and in unit-test construction.
 	read_tasks: Option<UnboundedReceiver<ReadTask>>,
+	/// A control message the patient drive-lock acquire in [`run_resync`](Self::run_resync) pulled
+	/// off the channel so it could abort PROMPTLY rather than block a `Shutdown`/registration
+	/// change behind the ~2-minute wait. [`run`](Self::run) applies it (via
+	/// [`process_control_burst`](Self::process_control_burst)) before its next select. A closed
+	/// control channel is stashed as a synthetic `Shutdown`.
+	pending_control: Option<CacheControlMessage>,
 }
 
 #[cfg(test)]
@@ -145,6 +151,7 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
+			pending_control: None,
 			read_tasks: None,
 		};
 		state.init_db().unwrap();
@@ -173,6 +180,7 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
+			pending_control: None,
 			read_tasks: None,
 		};
 		state.init_db().unwrap();
@@ -200,6 +208,7 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
+			pending_control: None,
 			read_tasks: None,
 		};
 		state.init_db().unwrap();
@@ -404,6 +413,7 @@ impl CacheState {
 			sync_roots: HashMap::new(),
 			resync: Some(ResyncDeps { client }),
 			resync_retry: None,
+			pending_control: None,
 			read_tasks: Some(read_task_receiver),
 		};
 
@@ -449,6 +459,19 @@ impl CacheState {
 		self.drain_pending(None);
 		self.maybe_run_startup_resync().await;
 		loop {
+			// A prior resync attempt aborted mid-acquire because a control message arrived;
+			// apply it before anything else. A `Shutdown` (or the synthetic one from a closed
+			// control channel) drains buffered events and exits; an `AddSyncRoot`/
+			// `RemoveRegistration` updates the root set and runs its own convergence resync
+			// from within `process_control_burst`.
+			if let Some(msg) = self.pending_control.take() {
+				if self.process_control_burst(msg).await {
+					log::info!("Cache shutting down; draining buffered events first...");
+					self.drain_pending(None);
+					return;
+				}
+				continue;
+			}
 			// `biased` checks arms top-down: control (shutdown) first, then search read tasks
 			// (quick SELECTs — prioritized over events so a sustained event flood can never
 			// starve a search query; the engine's debounce bounds read volume, so reads cannot
@@ -1606,6 +1629,24 @@ impl CacheState {
 							);
 							return Ok(());
 						}
+					},
+					control = self.control_receiver.recv() => {
+						// A `Shutdown` or a registration change (Add/Remove) arrived mid-wait. STOP
+						// waiting on the contended lock either way: a Shutdown must let the worker exit
+						// promptly instead of blocking out the patient wait, and an add/remove makes
+						// this attempt's root snapshot stale so it should restart against the new set.
+						// Aborting here is clean — NO lock is held yet and nothing is committed. Stash
+						// the message (a closed channel becomes a synthetic `Shutdown`) for `run` to
+						// apply, mark `needs_resync` so a fresh resync follows an add/remove, and finish.
+						self.pending_control = Some(control.unwrap_or(CacheControlMessage::Shutdown));
+						if let Err(e) = self.mark_needs_resync() {
+							self.surface_errors(vec![*e]);
+						}
+						Self::send_resync_progress(
+							&self.msg_sender,
+							ResyncProgress::Finished { converged: false },
+						);
+						return Ok(());
 					},
 					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
 						match read_task {

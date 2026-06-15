@@ -565,11 +565,11 @@ async fn test_search_drop_releases_the_sync_root() {
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.is_live()).await);
 
 	// The search holds the ONLY registration: dropping it lets the cache worker wind down;
-	// flush_cache then joins deterministically (and must not hang). The join can wait out an
-	// in-flight resync — the patient-acquire loop doesn't poll the control channel, so a
-	// contended resync delays the shutdown — hence the convergence bound, not a few seconds.
+	// flush_cache then joins deterministically (and must not hang). A `Shutdown` aborts an
+	// in-flight resync's patient lock-acquire promptly (the acquire loop watches the control
+	// channel), so the join no longer blocks behind a contended resync — a tight guard suffices.
 	drop(search);
-	tokio::time::timeout(CACHE_CONVERGE_TIMEOUT, client.flush_cache())
+	tokio::time::timeout(Duration::from_secs(30), client.flush_cache())
 		.await
 		.expect("worker drains and exits after the last registration drops");
 }
