@@ -1730,7 +1730,7 @@ fn drain_falls_back_to_per_event_when_a_bulk_apply_fails() {
 			}),
 		))
 		.unwrap();
-	// Make every file apply fail mid-event (after its ITEM_UPSERT): the bulk pass must roll the
+	// Make every file apply fail mid-event (after its items row is written): the bulk pass must roll the
 	// whole batch back and the fallback must quarantine ONLY the file event. (A trigger, not a
 	// DROP TABLE: items' own triggers reference `files`, so dropping it would poison dir
 	// applies too.)
@@ -2235,5 +2235,166 @@ fn covered_add_keeps_pending_resync_flag() {
 	assert!(
 		state.needs_resync().unwrap(),
 		"the pre-existing durable flag stays set for the scheduled resync"
+	);
+}
+
+/// `apply_synthetics_direct` multi-row-batches simple `New`/`Changed` upserts (the resync-populate
+/// hot path) and must land every item with the correct type/parent, FK-link the type-specific row
+/// to its `items` row, round-trip metadata through the multi-row bind, and keep the `items` rowid
+/// STABLE across a re-upsert (else the `files`/`dirs` foreign keys would dangle).
+#[test]
+fn apply_synthetics_batches_creates_with_stable_fk() {
+	let mut state = CacheState::new_in_memory();
+	let root = state.root_uuid;
+
+	// dirs A,B under root; files under A and B — interleaved as the diff emits them, so both the
+	// dir batch and the file batch are exercised in one chunk.
+	let a = cache_dir(1, root);
+	let b = cache_dir(2, root);
+	let f1 = cache_file(11, a.uuid, 100);
+	let f2 = cache_file(12, a.uuid, 200);
+	let f3 = cache_file(13, b.uuid, 300);
+
+	let synthetics = vec![
+		CacheEvent {
+			id: None,
+			event: CacheEventType::Dir(DirEvent::New(a.clone())),
+		},
+		CacheEvent {
+			id: None,
+			event: CacheEventType::Dir(DirEvent::New(b.clone())),
+		},
+		CacheEvent {
+			id: None,
+			event: CacheEventType::File(FileEvent::New(f1.clone())),
+		},
+		CacheEvent {
+			id: None,
+			event: CacheEventType::File(FileEvent::New(f2.clone())),
+		},
+		CacheEvent {
+			id: None,
+			event: CacheEventType::File(FileEvent::New(f3.clone())),
+		},
+	];
+
+	state
+		.apply_synthetics_direct(root, synthetics, true)
+		.unwrap();
+
+	for dir in [&a, &b] {
+		let linked: i64 = state
+			.db
+			.query_row(
+				"SELECT COUNT(*) FROM dirs d JOIN items i ON i.id = d.id WHERE i.uuid = ?",
+				[dir.uuid],
+				|r| r.get(0),
+			)
+			.unwrap();
+		assert_eq!(linked, 1, "dir {} FK-linked to its items row", dir.uuid);
+	}
+	for file in [&f1, &f2, &f3] {
+		let linked: i64 = state
+			.db
+			.query_row(
+				"SELECT COUNT(*) FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
+				[file.uuid],
+				|r| r.get(0),
+			)
+			.unwrap();
+		assert_eq!(linked, 1, "file {} FK-linked to its items row", file.uuid);
+	}
+	let f1_size: i64 = state
+		.db
+		.query_row(
+			"SELECT size FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
+			[f1.uuid],
+			|r| r.get(0),
+		)
+		.unwrap();
+	assert_eq!(
+		f1_size, 100,
+		"size round-tripped through the multi-row bind"
+	);
+
+	// FK stability: a Changed must reuse the existing rowid (upsert, not insert-or-replace).
+	let id_before: i64 = state
+		.db
+		.query_row("SELECT id FROM items WHERE uuid = ?", [f1.uuid], |r| {
+			r.get(0)
+		})
+		.unwrap();
+	let mut changed = f1.clone();
+	changed.size = 999;
+	state
+		.apply_synthetics_direct(
+			root,
+			vec![CacheEvent {
+				id: None,
+				event: CacheEventType::File(FileEvent::Changed(changed)),
+			}],
+			true,
+		)
+		.unwrap();
+	let id_after: i64 = state
+		.db
+		.query_row("SELECT id FROM items WHERE uuid = ?", [f1.uuid], |r| {
+			r.get(0)
+		})
+		.unwrap();
+	assert_eq!(
+		id_before, id_after,
+		"re-upsert keeps the items rowid stable"
+	);
+	let f1_size_after: i64 = state
+		.db
+		.query_row(
+			"SELECT size FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
+			[f1.uuid],
+			|r| r.get(0),
+		)
+		.unwrap();
+	assert_eq!(
+		f1_size_after, 999,
+		"the Changed upsert updated the row in place"
+	);
+}
+
+/// A delete in the SAME chunk as preceding batched creates must see those creates applied: the chunk
+/// flushes the pending upsert batch BEFORE applying the delete (preserving the diff's
+/// creates/moves → deletes order). A delete-then-flush bug would no-op the delete on an empty cache
+/// and then resurrect the very rows the delete was meant to remove.
+#[test]
+fn apply_synthetics_flushes_pending_creates_before_a_delete() {
+	let mut state = CacheState::new_in_memory();
+	let root = state.root_uuid;
+	let a = cache_dir(1, root);
+	let f = cache_file(11, a.uuid, 100);
+
+	let synthetics = vec![
+		CacheEvent {
+			id: None,
+			event: CacheEventType::Dir(DirEvent::New(a.clone())),
+		},
+		CacheEvent {
+			id: None,
+			event: CacheEventType::File(FileEvent::New(f.clone())),
+		},
+		CacheEvent {
+			id: None,
+			event: CacheEventType::Dir(DirEvent::Removed(a.uuid)),
+		},
+	];
+	state
+		.apply_synthetics_direct(root, synthetics, true)
+		.unwrap();
+
+	assert!(
+		!item_exists(&state, a.uuid),
+		"the deleted dir is gone — its create was flushed before the delete"
+	);
+	assert!(
+		!item_exists(&state, f.uuid),
+		"its child cascaded away, proving it existed when the delete ran"
 	);
 }

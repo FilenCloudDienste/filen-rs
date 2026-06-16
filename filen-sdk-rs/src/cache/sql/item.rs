@@ -15,19 +15,6 @@ pub(super) enum ItemType {
 	File,
 }
 
-pub(super) fn upsert_item_with_stmt(
-	uuid: Uuid,
-	parent: Option<Uuid>,
-	item_type: ItemType,
-	content_hash: Option<&[u8]>,
-	upsert_item_stmt: &mut CachedStatement<'_>,
-) -> rusqlite::Result<i64> {
-	upsert_item_stmt.query_one(
-		params![uuid, parent, item_type as i8, content_hash],
-		|row| row.get(0),
-	)
-}
-
 pub(super) fn delete_item_with_stmt(
 	uuid: Uuid,
 	delete_item_stmt: &mut CachedStatement<'_>,

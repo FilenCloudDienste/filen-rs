@@ -11,11 +11,10 @@ use uuid::Uuid;
 
 use crate::cache::{CacheState, sql::statements::VACUUM};
 
+mod bulk;
 mod diff;
-mod dir;
 mod event;
 pub(crate) use event::PersistedEvent;
-mod file;
 mod item;
 mod membership;
 mod root;
@@ -60,15 +59,13 @@ impl CacheState {
 		&mut self,
 		dirs: impl Iterator<Item = impl Borrow<CacheableDir<'a>>>,
 	) -> rusqlite::Result<()> {
+		let root_id = self.root_id;
 		self.execute_chunked(dirs, |transaction, chunk| {
-			let mut upsert_item_stmt = transaction.prepare_cached(statements::ITEM_UPSERT)?;
-			let mut upsert_dir_stmt = transaction.prepare_cached(statements::DIR_UPSERT)?;
-			for cache_dir in chunk {
-				dir::upsert_dir_with_stmts(
-					cache_dir.borrow(),
-					&mut upsert_dir_stmt,
-					&mut upsert_item_stmt,
-				)?;
+			// `execute_chunked` bounds each transaction at `CHUNK_SIZE`; within it, sub-batch by the
+			// multi-row parameter cap and apply each sub-batch as one prepared statement per table.
+			let batch: Vec<_> = chunk.collect();
+			for sub in batch.chunks(bulk::MULTI_ROW_CHUNK) {
+				bulk::bulk_upsert_dirs(transaction, sub, root_id)?;
 			}
 			Ok(())
 		})
@@ -78,15 +75,11 @@ impl CacheState {
 		&mut self,
 		files: impl Iterator<Item = impl Borrow<CacheableFile<'a>>>,
 	) -> rusqlite::Result<()> {
+		let root_id = self.root_id;
 		self.execute_chunked(files, |transaction, chunk| {
-			let mut upsert_item_stmt = transaction.prepare_cached(statements::ITEM_UPSERT)?;
-			let mut upsert_file_stmt = transaction.prepare_cached(statements::FILE_UPSERT)?;
-			for cache_file in chunk {
-				file::upsert_file_with_stmts(
-					cache_file.borrow(),
-					&mut upsert_file_stmt,
-					&mut upsert_item_stmt,
-				)?;
+			let batch: Vec<_> = chunk.collect();
+			for sub in batch.chunks(bulk::MULTI_ROW_CHUNK) {
+				bulk::bulk_upsert_files(transaction, sub, root_id)?;
 			}
 			Ok(())
 		})
@@ -200,23 +193,31 @@ impl CacheState {
 			.db
 			.query_one(statements::GET_USER_VERSION, (), |row| row.get(0))?;
 
-		if version == statements::SQL_USER_VERSION {
-			return Ok(());
+		if version != statements::SQL_USER_VERSION {
+			self.db
+				.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, true)?;
+			self.db.execute(VACUUM, [])?;
+			self.db
+				.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, false)?;
+
+			self.db.execute_batch(statements::INIT)?;
+
+			self.db.execute(statements::SET_USER_VERSION, [])?;
+
+			// Propagate a root-insert failure instead of panicking — `init_db` already returns
+			// `rusqlite::Result`, so a SQLite error surfaces to the caller (`CacheState::new`/test
+			// ctors).
+			root::insert_root(self.root_uuid, &mut self.db)?;
 		}
 
-		self.db
-			.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, true)?;
-		self.db.execute(VACUUM, [])?;
-		self.db
-			.set_db_config(DbConfig::SQLITE_DBCONFIG_RESET_DATABASE, false)?;
-
-		self.db.execute_batch(statements::INIT)?;
-
-		self.db.execute(statements::SET_USER_VERSION, [])?;
-
-		// Propagate a root-insert failure instead of panicking — `init_db` already returns
-		// `rusqlite::Result`, so a SQLite error surfaces to the caller (`CacheState::new`/test ctors).
-		root::insert_root(self.root_uuid, &mut self.db)
+		// Cache the lone account-root rowid (fixed for the DB's lifetime — set once at bootstrap and
+		// never reassigned) so the bulk upsert binds it directly rather than re-deriving it via a
+		// `roots` subquery on every row. Set on BOTH paths: a fresh init just created it, a
+		// version-matching reopen already has it.
+		self.root_id = self
+			.db
+			.query_one(statements::SELECT_ROOT_ID, (), |row| row.get(0))?;
+		Ok(())
 	}
 }
 

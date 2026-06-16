@@ -53,6 +53,10 @@ enum EventTrust {
 	TrustedSynthetic,
 }
 
+/// One post-commit dispatch unit: an applied event (shared via `Arc` so fan-out to multiple owning
+/// roots reuses one allocation) paired with the sync roots that should receive it.
+type DispatchEntry = (Arc<CacheEvent<'static>>, Vec<Uuid>);
+
 /// The drain's cross-batch state: the gap-free frontier (and whether it broke), plus the sticky
 /// resync flag — threaded through [`CacheState::apply_drain_batch`] by value so an aborted bulk
 /// pass leaves the caller's copy untouched for the per-event re-run.
@@ -101,9 +105,14 @@ pub(crate) struct CacheState {
 	/// to drop events. The worker observes it once per drain and records a durable resync to recover the
 	/// dropped events, then clears it.
 	shed: Arc<AtomicBool>,
-	/// The account-root uuid — the single `roots` row, used for upsert `?4` (root_id resolution) and DB
-	/// init. NOT necessarily a sync root (see `sync_roots`).
+	/// The account-root uuid — the single `roots` row, used for DB init. NOT necessarily a sync root
+	/// (see `sync_roots`).
 	pub(crate) root_uuid: Uuid,
+	/// The account-root rowid (the lone `roots.id`), cached by `init_db` and fixed for the DB's
+	/// lifetime. Bound directly into every bulk upsert's `items.root_id` so the apply path never
+	/// re-derives it via a per-row `roots` subquery. Placeholder `0` until `init_db` sets it (rowids
+	/// start at 1, so `0` is never a valid value that could leak into a write).
+	pub(crate) root_id: i64,
 	/// Configured sync roots → their live registrations. An item is cached iff it
 	/// descends from one of these roots (the membership gate, in `sql/membership.rs`); EMPTY ⇒
 	/// nothing is cached. The production worker starts EMPTY — registrations arrive via
@@ -148,6 +157,8 @@ impl CacheState {
 			msg_sender,
 			shed: Arc::new(AtomicBool::new(false)),
 			root_uuid,
+			// Placeholder; `init_db` (called below) replaces it with the real account-root rowid.
+			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
@@ -177,6 +188,8 @@ impl CacheState {
 			msg_sender,
 			shed: Arc::new(AtomicBool::new(false)),
 			root_uuid,
+			// Placeholder; `init_db` (called below) replaces it with the real account-root rowid.
+			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
@@ -205,6 +218,8 @@ impl CacheState {
 			msg_sender,
 			shed: shed.clone(),
 			root_uuid,
+			// Placeholder; `init_db` (called below) replaces it with the real account-root rowid.
+			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
@@ -409,6 +424,8 @@ impl CacheState {
 			msg_sender,
 			shed: shed.clone(),
 			root_uuid,
+			// Placeholder; `init_db` (called below) replaces it with the real account-root rowid.
+			root_id: 0,
 			// Starts EMPTY (nothing cached); registrations arrive via `AddSyncRoot` control messages.
 			sync_roots: HashMap::new(),
 			resync: Some(ResyncDeps { client }),
@@ -723,7 +740,7 @@ impl CacheState {
 		// Per-root dispatch: collect (applied event, owning roots) for delivery AFTER commit.
 		// The event is held in an `Arc` so fan-out to multiple owning roots shares one allocation
 		// instead of deep-cloning the (string-heavy) payload per root.
-		let mut dispatch_buffer: Vec<(Arc<CacheEvent<'static>>, Vec<Uuid>)> = Vec::new();
+		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
 
 		for pe in batch {
 			to_delete.push(pe.seq);
@@ -957,7 +974,9 @@ impl CacheState {
 	/// the diff's creates/moves → deletes → changes ordering is load-bearing (a descendant
 	/// moving out of a same-resync-deleted dir must re-land before the cascade delete). Each
 	/// chunk dispatches to the sync-root callbacks post-commit, like the drain. The caller
-	/// commits the watermark AFTER all of it.
+	/// commits the watermark AFTER all of it. The per-chunk work is delegated to
+	/// [`apply_synthetic_chunk`](Self::apply_synthetic_chunk), which multi-row-batches the
+	/// dominant simple-upsert case.
 	fn apply_synthetics_direct(
 		&mut self,
 		anchor: Uuid,
@@ -978,24 +997,15 @@ impl CacheState {
 			self.db
 				.execute_batch("BEGIN")
 				.map_err(|e| db_err(e, "begin synthetic apply chunk"))?;
-			let mut dispatch_buffer: Vec<(Arc<CacheEvent<'static>>, Vec<Uuid>)> = Vec::new();
-			for _ in 0..crate::cache::sql::CHUNK_SIZE {
-				let Some(event) = events.next() else { break };
-				let needs_exact_owners = !all_roots_listed
-					|| matches!(
-						&event.event,
-						CacheEventType::File(
-							FileEvent::Move(_) | FileEvent::Removed(_) | FileEvent::Archived(_)
-						) | CacheEventType::Dir(DirEvent::Move(_) | DirEvent::Removed(_))
-					);
-				let pre_parent = if needs_exact_owners {
-					self.pre_parent_snapshot(&event.event)
-				} else {
-					None
-				};
-				let event_for_dispatch = Arc::new(event.clone());
-				if let Err(mut errors) = self.apply_event(event.event, EventTrust::TrustedSynthetic)
-				{
+			match self.apply_synthetic_chunk(&mut events, &anchor_owners, all_roots_listed) {
+				Ok(dispatch_buffer) => {
+					self.db.execute_batch("COMMIT").map_err(|e| {
+						let _ = self.db.execute_batch("ROLLBACK");
+						db_err(e, "commit synthetic apply chunk")
+					})?;
+					self.dispatch_batch(dispatch_buffer);
+				}
+				Err(mut errors) => {
 					// Synthetics are our own diff output — a failure is corruption/disk-full
 					// class. Roll the chunk back, keep the durable flag SET so the retry
 					// re-lists, surface the rest, and abort with the first error (the caller
@@ -1015,20 +1025,111 @@ impl CacheState {
 					}
 					return Err(Box::new(first));
 				}
-				let owners = if needs_exact_owners {
-					self.resolve_dispatch_owners(&event_for_dispatch, pre_parent)
-				} else {
-					anchor_owners.clone()
-				};
-				if !owners.is_empty() {
-					dispatch_buffer.push((event_for_dispatch, owners));
-				}
 			}
-			self.db.execute_batch("COMMIT").map_err(|e| {
-				let _ = self.db.execute_batch("ROLLBACK");
-				db_err(e, "commit synthetic apply chunk")
-			})?;
-			self.dispatch_batch(dispatch_buffer);
+		}
+		Ok(())
+	}
+
+	/// Apply up to [`CHUNK_SIZE`](crate::cache::sql::CHUNK_SIZE) synthetics from `events` inside the
+	/// caller's already-open transaction, returning the post-commit dispatch buffer.
+	///
+	/// The dominant case at populate scale — `New`/`Changed` under a fully-listed resync, whose
+	/// dispatch owners are exactly `anchor_owners` — is accumulated and applied as multi-row batches
+	/// (one prepared statement per ~[`MULTI_ROW_CHUNK`](crate::cache::sql) rows instead of one per
+	/// event). Everything else (moves, deletes, or any event needing exact per-event owner
+	/// resolution) flushes the pending batch FIRST — preserving the diff's load-bearing creates/moves
+	/// → deletes → changes ordering — then applies one event at a time exactly as the old path did.
+	/// Dispatch entries are pushed in strict emission order regardless of batching, so the
+	/// post-commit dispatch sequence is unchanged.
+	///
+	/// On the first apply failure, returns the collected errors so the caller can roll the chunk
+	/// back; the per-batch precondition that a batch holds no duplicate uuid is met because synthetic
+	/// uuids are unique within a resync.
+	fn apply_synthetic_chunk(
+		&mut self,
+		events: &mut std::iter::Peekable<std::vec::IntoIter<CacheEvent<'static>>>,
+		anchor_owners: &[Uuid],
+		all_roots_listed: bool,
+	) -> Result<Vec<DispatchEntry>, Vec<CacheError>> {
+		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
+		let mut file_batch: Vec<CacheableFile<'static>> = Vec::new();
+		let mut dir_batch: Vec<CacheableDir<'static>> = Vec::new();
+		let mut processed = 0;
+		while processed < crate::cache::sql::CHUNK_SIZE {
+			let Some(event) = events.next() else { break };
+			processed += 1;
+			let needs_exact_owners = !all_roots_listed
+				|| matches!(
+					&event.event,
+					CacheEventType::File(
+						FileEvent::Move(_) | FileEvent::Removed(_) | FileEvent::Archived(_)
+					) | CacheEventType::Dir(DirEvent::Move(_) | DirEvent::Removed(_))
+				);
+			// Fast path: a simple upsert whose dispatch owners are exactly the anchor's. It needs no
+			// pre-apply parent snapshot or post-apply owner walk, so it can be deferred into a
+			// multi-row batch without changing what (or in what order) gets dispatched.
+			if !needs_exact_owners
+				&& matches!(
+					&event.event,
+					CacheEventType::File(FileEvent::New(_) | FileEvent::Changed(_))
+						| CacheEventType::Dir(DirEvent::New(_) | DirEvent::Changed(_))
+				) {
+				if !anchor_owners.is_empty() {
+					dispatch_buffer.push((Arc::new(event.clone()), anchor_owners.to_vec()));
+				}
+				match event.event {
+					CacheEventType::File(FileEvent::New(file) | FileEvent::Changed(file)) => {
+						file_batch.push(file)
+					}
+					CacheEventType::Dir(DirEvent::New(dir) | DirEvent::Changed(dir)) => {
+						dir_batch.push(dir)
+					}
+					_ => unreachable!("guarded by the matches! above"),
+				}
+				continue;
+			}
+
+			// Anything else: flush the pending upsert batch FIRST so accumulated creates/moves land
+			// before this event (the diff orders deletes after the creates/moves they may cascade),
+			// then apply it one event at a time with the exact owner resolution the old path used.
+			self.flush_synthetic_batches(&mut file_batch, &mut dir_batch)?;
+			let pre_parent = if needs_exact_owners {
+				self.pre_parent_snapshot(&event.event)
+			} else {
+				None
+			};
+			let event_for_dispatch = Arc::new(event.clone());
+			self.apply_event(event.event, EventTrust::TrustedSynthetic)?;
+			let owners = if needs_exact_owners {
+				self.resolve_dispatch_owners(&event_for_dispatch, pre_parent)
+			} else {
+				anchor_owners.to_vec()
+			};
+			if !owners.is_empty() {
+				dispatch_buffer.push((event_for_dispatch, owners));
+			}
+		}
+		// Flush whatever the chunk ended on.
+		self.flush_synthetic_batches(&mut file_batch, &mut dir_batch)?;
+		Ok(dispatch_buffer)
+	}
+
+	/// Flush the accumulated multi-row upsert batches, draining both. Dirs go before files, but the
+	/// order is immaterial: `items.parent` has no self-FK, and each `files`/`dirs` row derives its
+	/// own `items.id` independently. A failure maps to a one-element error vec so the chunk caller
+	/// rolls back.
+	fn flush_synthetic_batches(
+		&mut self,
+		files: &mut Vec<CacheableFile<'static>>,
+		dirs: &mut Vec<CacheableDir<'static>>,
+	) -> Result<(), Vec<CacheError>> {
+		if !dirs.is_empty() {
+			self.upsert_dirs(dirs.drain(..))
+				.map_err(|e| vec![CacheError::db(e, "bulk upsert synthetic dirs".to_string())])?;
+		}
+		if !files.is_empty() {
+			self.upsert_files(files.drain(..))
+				.map_err(|e| vec![CacheError::db(e, "bulk upsert synthetic files".to_string())])?;
 		}
 		Ok(())
 	}
@@ -1394,7 +1495,7 @@ impl CacheState {
 	/// on the worker thread over an owned `Vec`. Each callback is wrapped in `catch_unwind` so a panic
 	/// in one root's external code is surfaced as a status error and never stalls other roots or the
 	/// drain. (No-op when there is nothing to dispatch.)
-	fn dispatch_batch(&self, dispatch: Vec<(Arc<CacheEvent<'static>>, Vec<Uuid>)>) {
+	fn dispatch_batch(&self, dispatch: Vec<DispatchEntry>) {
 		if dispatch.is_empty() {
 			return;
 		}

@@ -54,17 +54,20 @@ pub(crate) const NEEDS_RESYNC_KEY: &str = "needs_resync";
 
 pub(crate) const DIR_UPDATE_COLOR: &str = include_str!("raw/dir_update_color.sql");
 pub(crate) const DIR_UPDATE_NAME: &str = include_str!("raw/dir_update_name.sql");
-pub(crate) const DIR_UPSERT: &str = include_str!("raw/dir_upsert.sql");
+// `items`/`files`/`dirs` upserts are built dynamically as multi-row `VALUES` statements in `bulk.rs`
+// (one prepared statement per batch instead of one per row), so there are no static *_UPSERT consts.
 
 pub(crate) const FILE_UPDATE_META: &str = include_str!("raw/file_update_meta.sql");
-pub(crate) const FILE_UPSERT: &str = include_str!("raw/file_upsert.sql");
 
 pub(crate) const INIT: &str = include_str!("raw/init.sql");
 
 pub(crate) const ITEM_DELETE: &str = include_str!("raw/item_delete.sql");
 pub(crate) const ITEM_DELETE_ALL_NON_ROOT: &str = include_str!("raw/item_delete_all_non_root.sql");
 pub(crate) const ITEM_UPDATE_OWN_ROOT_ID: &str = include_str!("raw/item_update_own_root_id.sql");
-pub(crate) const ITEM_UPSERT: &str = include_str!("raw/item_upsert.sql");
+
+// The single account-root rowid (the lone `roots` row), cached on `CacheState` at open so the bulk
+// upsert binds it directly instead of re-deriving it per row.
+pub(crate) const SELECT_ROOT_ID: &str = "SELECT id FROM roots ORDER BY id LIMIT 1";
 
 pub(crate) const ROOT_INSERT: &str = include_str!("raw/root_insert.sql");
 pub(crate) const ROOT_ITEM_INSERT: &str = include_str!("raw/root_item_insert.sql");

@@ -1055,8 +1055,15 @@ fn test_bulk_insert_many_items() {
 	let dirs: Vec<_> = (0..500)
 		.map(|_| make_cacheable_dir(state.root_uuid))
 		.collect();
+	// DISTINCT sizes so the uuid->id map linkage can be verified at scale: if the multi-row
+	// `RETURNING`-built map ever paired a file's metadata with the wrong `items` row, the size read
+	// back by uuid would not match. 1000 files spans multiple `MULTI_ROW_CHUNK` (512) sub-batches.
 	let files: Vec<_> = (0..1000)
-		.map(|_| make_cacheable_file(state.root_uuid))
+		.map(|i| {
+			let mut f = make_cacheable_file(state.root_uuid);
+			f.size = 1_000 + i as u64;
+			f
+		})
 		.collect();
 
 	state.upsert_dirs(dirs.iter()).unwrap();
@@ -1068,6 +1075,57 @@ fn test_bulk_insert_many_items() {
 		.unwrap();
 	// 1 root + 500 dirs + 1000 files = 1501
 	assert_eq!(total, 1501);
+
+	// Every file's metadata must be linked (via its `items.id`) to its OWN uuid — i.e. the
+	// `RETURNING`-built uuid->id map paired each row correctly across all sub-batches.
+	for (i, f) in files.iter().enumerate() {
+		let size: u64 = state
+			.db
+			.query_row(
+				"SELECT fi.size FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
+				[f.uuid],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert_eq!(
+			size,
+			1_000 + i as u64,
+			"file {i}'s metadata is linked to the correct items row"
+		);
+	}
+
+	// Re-upsert the SAME batch: exercises the multi-row `ON CONFLICT(uuid) DO UPDATE` path where
+	// many rows within one statement update existing rows. It must update in place (no new rows) and
+	// keep every rowid stable so the `files`/`dirs` FKs hold.
+	let sample = files[0].uuid;
+	let id_before: i64 = state
+		.db
+		.query_row("SELECT id FROM items WHERE uuid = ?", [sample], |row| {
+			row.get(0)
+		})
+		.unwrap();
+
+	state.upsert_dirs(dirs.iter()).unwrap();
+	state.upsert_files(files.iter()).unwrap();
+
+	let total_after: usize = state
+		.db
+		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+		.unwrap();
+	assert_eq!(
+		total_after, 1501,
+		"re-upsert updates in place, no duplicate rows"
+	);
+	let id_after: i64 = state
+		.db
+		.query_row("SELECT id FROM items WHERE uuid = ?", [sample], |row| {
+			row.get(0)
+		})
+		.unwrap();
+	assert_eq!(
+		id_before, id_after,
+		"re-upsert keeps the items rowid stable"
+	);
 }
 
 #[test]
