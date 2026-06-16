@@ -168,11 +168,15 @@ impl CacheState {
 		state.init_db().unwrap();
 		state
 	}
+}
 
-	/// Like [`new_in_memory`](Self::new_in_memory) but on a real file `path` with a caller-chosen
-	/// `root_uuid`, so a test can open the SAME DB twice and assert that state survives a reopen (the
-	/// app close/resume path). `init_db` only wipes when the `user_version` mismatches, so a second open
-	/// with the matching version preserves the data.
+/// `new_on_path` is ALSO compiled under `bench-internals` (the criterion insertion benchmark needs a
+/// file-backed `CacheState`); the in-memory test constructors stay test-only.
+#[cfg(any(test, feature = "bench-internals"))]
+impl CacheState {
+	/// Open a file-backed cache at `path` with a caller-chosen `root_uuid`. Tests also use it to
+	/// reopen the SAME DB and assert state survives a restart — `init_db` only wipes on a
+	/// `user_version` mismatch, so a matching-version reopen preserves the data.
 	pub(crate) fn new_on_path(path: &Path, root_uuid: Uuid) -> Self {
 		let (event_sender, event_receiver) = tokio::sync::mpsc::channel(EVENT_SHED_CAP);
 		let (control_sender, control_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -199,7 +203,10 @@ impl CacheState {
 		state.init_db().unwrap();
 		state
 	}
+}
 
+#[cfg(test)]
+impl CacheState {
 	/// Like [`new_in_memory`](Self::new_in_memory) but RETAINS the producer side (the event sender, the
 	/// control sender, and the shed latch) so a test can flood the worker the way the real callback does
 	/// and then drive the drain.
@@ -280,8 +287,9 @@ pub type SyncRootCallback = Box<dyn Fn(&mut dyn Iterator<Item = &CacheEvent<'_>>
 pub(crate) type RootRegistrations = Vec<(u64, SyncRootCallback)>;
 
 /// Default whole-account sync: the root uuid gates all membership and its no-op callback lets tests
-/// exercise the drain/apply/resync machinery without subscribing to notifications.
-#[cfg(test)]
+/// exercise the drain/apply/resync machinery without subscribing to notifications. Also compiled
+/// under `bench-internals` (used by `new_on_path`).
+#[cfg(any(test, feature = "bench-internals"))]
 fn whole_account_sync_roots(account_root: Uuid) -> HashMap<Uuid, RootRegistrations> {
 	let mut sync_roots: HashMap<Uuid, RootRegistrations> = HashMap::new();
 	sync_roots.insert(account_root, vec![(0, Box::new(|_| {}))]);

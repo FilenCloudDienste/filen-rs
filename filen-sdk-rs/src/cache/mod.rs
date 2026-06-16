@@ -1,5 +1,10 @@
 #![warn(unreachable_pub, unused_qualifications)]
 
+// Apply-path surface for the criterion insertion benchmark (`benches/cache_insertion.rs`); gated so
+// it never widens the real API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_support;
 mod error;
 mod handle;
 // UniFFI exports on mobile, wasm-bindgen twins on web. The twins share method names, which is

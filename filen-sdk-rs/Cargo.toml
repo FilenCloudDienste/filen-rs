@@ -20,6 +20,9 @@ service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 http-provider = ["dep:axum", "dep:axum-extra"]
 cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
+# Exposes the otherwise-`pub(crate)` cache apply path (`cache::bench_support`) for the criterion
+# insertion benchmark only. Never enable in production builds.
+bench-internals = ["cache"]
 
 # The cache tests only exist when the `cache` feature is enabled.
 [[test]]
@@ -33,6 +36,11 @@ required-features = ["cache"]
 [[test]]
 name = "cache_search_tests"
 required-features = ["cache"]
+
+[[bench]]
+name = "cache_insertion"
+harness = false
+required-features = ["cache", "bench-internals"]
 
 [dependencies]
 reqwest = { version = "0.12.22", features = [
@@ -227,6 +235,8 @@ reqwest = { version = "0.12.22", features = [
 ], default-features = false }
 scraper = "0.24.0"
 env_logger = "0.11.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.23.0"
 
 # wasm only dev-dependencies
 [target.'cfg(all(target_family="wasm", target_os= "unknown"))'.dev-dependencies]
