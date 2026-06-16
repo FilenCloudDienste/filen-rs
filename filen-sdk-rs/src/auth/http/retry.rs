@@ -28,6 +28,17 @@ pub(crate) enum RetryError<E> {
 }
 
 impl<E> RetryError<E> {
+	/// Tag `error` as retryable-or-not from a `bool` — the natural inverse of
+	/// [`into_inner`](Self::into_inner), so call sites read "classify, then tag" instead of
+	/// open-coding the `if retryable { Retry } else { NoRetry }` branch.
+	pub(crate) fn from_retryable(retryable: bool, error: E) -> Self {
+		if retryable {
+			RetryError::Retry(error)
+		} else {
+			RetryError::NoRetry(error)
+		}
+	}
+
 	pub(crate) fn into_inner(self) -> E {
 		match self {
 			RetryError::Retry(e) => e,

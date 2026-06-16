@@ -351,12 +351,7 @@ async fn execute_request(
 			// for non-idempotent endpoints. Every other builder/request error may have been
 			// partially sent, so it stays non-retryable.
 			let retryable = is_dispatch_gone(&e) || !(e.is_builder() || e.is_request());
-			let error = Error::from(e);
-			if retryable {
-				retry::RetryError::Retry(error)
-			} else {
-				retry::RetryError::NoRetry(error)
-			}
+			retry::RetryError::from_retryable(retryable, Error::from(e))
 		})
 }
 

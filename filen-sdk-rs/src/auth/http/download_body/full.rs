@@ -65,13 +65,7 @@ where
 			Box::pin(async move {
 				match fut.await?.bytes().await {
 					Ok(body) => Ok(Vec::from(body)),
-					Err(e) => {
-						if e.is_timeout() {
-							Err(RetryError::Retry(e.into()))
-						} else {
-							Err(RetryError::NoRetry(e.into()))
-						}
-					}
+					Err(e) => Err(RetryError::from_retryable(e.is_timeout(), e.into())),
 				}
 			})
 		}
@@ -173,10 +167,10 @@ mod native {
 								}
 							}
 							Poll::Ready(Some(Err(e))) => {
-								if e.is_timeout() {
-									return Poll::Ready(Err(RetryError::Retry(Error::from(e))));
-								}
-								return Poll::Ready(Err(RetryError::NoRetry(Error::from(e))));
+								return Poll::Ready(Err(RetryError::from_retryable(
+									e.is_timeout(),
+									Error::from(e),
+								)));
 							}
 							Poll::Ready(None) => {
 								return Poll::Ready(Ok(std::mem::take(collected)));
