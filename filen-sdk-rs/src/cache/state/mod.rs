@@ -19,6 +19,7 @@ use crate::{
 	},
 	io::{RemoteDirectory, RemoteFile},
 	socket::DecryptedSocketEvent,
+	util::PeekableReceiver,
 };
 use filen_types::traits::CowHelpers;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -99,7 +100,7 @@ pub(crate) struct CacheState {
 	/// Bounded at [`EVENT_SHED_CAP`]: the socket router must never block, so it uses `try_send` and
 	/// sheds + flags a resync when full.
 	event_receiver: tokio::sync::mpsc::Receiver<CacheThreadEvent>,
-	control_receiver: UnboundedReceiver<CacheControlMessage>,
+	control_receiver: PeekableReceiver<CacheControlMessage>,
 	msg_sender: tokio::sync::mpsc::Sender<Vec<CacheMessage>>,
 	/// Shed latch: set by the socket router when the BOUNDED event channel was full and it had
 	/// to drop events. The worker observes it once per drain and records a durable resync to recover the
@@ -131,12 +132,6 @@ pub(crate) struct CacheState {
 	/// via their own connection and never send here. `None` once every sender is gone (the arm
 	/// disables itself, like the engine's ping arm) and in unit-test construction.
 	read_tasks: Option<UnboundedReceiver<ReadTask>>,
-	/// A control message the patient drive-lock acquire in [`run_resync`](Self::run_resync) pulled
-	/// off the channel so it could abort PROMPTLY rather than block a `Shutdown`/registration
-	/// change behind the ~2-minute wait. [`run`](Self::run) applies it (via
-	/// [`process_control_burst`](Self::process_control_burst)) before its next select. A closed
-	/// control channel is stashed as a synthetic `Shutdown`.
-	pending_control: Option<CacheControlMessage>,
 }
 
 #[cfg(test)]
@@ -153,7 +148,7 @@ impl CacheState {
 		let mut state = Self {
 			db: rusqlite::Connection::open_in_memory().unwrap(),
 			event_receiver,
-			control_receiver,
+			control_receiver: PeekableReceiver::new(control_receiver),
 			msg_sender,
 			shed: Arc::new(AtomicBool::new(false)),
 			root_uuid,
@@ -162,7 +157,6 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
-			pending_control: None,
 			read_tasks: None,
 		};
 		state.init_db().unwrap();
@@ -188,7 +182,7 @@ impl CacheState {
 		let mut state = Self {
 			db: rusqlite::Connection::open(path).unwrap(),
 			event_receiver,
-			control_receiver,
+			control_receiver: PeekableReceiver::new(control_receiver),
 			msg_sender,
 			shed: Arc::new(AtomicBool::new(false)),
 			root_uuid,
@@ -197,7 +191,6 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
-			pending_control: None,
 			read_tasks: None,
 		};
 		state.init_db().unwrap();
@@ -221,7 +214,7 @@ impl CacheState {
 		let mut state = Self {
 			db: rusqlite::Connection::open_in_memory().unwrap(),
 			event_receiver,
-			control_receiver,
+			control_receiver: PeekableReceiver::new(control_receiver),
 			msg_sender,
 			shed: shed.clone(),
 			root_uuid,
@@ -230,7 +223,6 @@ impl CacheState {
 			sync_roots: whole_account_sync_roots(root_uuid),
 			resync: None,
 			resync_retry: None,
-			pending_control: None,
 			read_tasks: None,
 		};
 		state.init_db().unwrap();
@@ -428,7 +420,7 @@ impl CacheState {
 		let mut cache_state = CacheState {
 			db: connection,
 			event_receiver,
-			control_receiver,
+			control_receiver: PeekableReceiver::new(control_receiver),
 			msg_sender,
 			shed: shed.clone(),
 			root_uuid,
@@ -438,7 +430,6 @@ impl CacheState {
 			sync_roots: HashMap::new(),
 			resync: Some(ResyncDeps { client }),
 			resync_retry: None,
-			pending_control: None,
 			read_tasks: Some(read_task_receiver),
 		};
 
@@ -484,19 +475,6 @@ impl CacheState {
 		self.drain_pending(None);
 		self.maybe_run_startup_resync().await;
 		loop {
-			// A prior resync attempt aborted mid-acquire because a control message arrived;
-			// apply it before anything else. A `Shutdown` (or the synthetic one from a closed
-			// control channel) drains buffered events and exits; an `AddSyncRoot`/
-			// `RemoveRegistration` updates the root set and runs its own convergence resync
-			// from within `process_control_burst`.
-			if let Some(msg) = self.pending_control.take() {
-				if self.process_control_burst(msg).await {
-					log::info!("Cache shutting down; draining buffered events first...");
-					self.drain_pending(None);
-					return;
-				}
-				continue;
-			}
 			// `biased` checks arms top-down: control (shutdown) first, then search read tasks
 			// (quick SELECTs — prioritized over events so a sustained event flood can never
 			// starve a search query; the engine's debounce bounds read volume, so reads cannot
@@ -506,11 +484,14 @@ impl CacheState {
 			tokio::select! {
 				biased;
 				control_event = self.control_receiver.recv() => {
-					// A pending control message is selected ahead of a non-empty event arm.
+					// A pending control message is selected ahead of a non-empty event arm. `recv`
+					// drains the peek buffer first, so a message a `run_resync` aborted on (peeked
+					// but left queued) is applied HERE, before any event/read/retry work.
 					// A `Shutdown` — or every control sender having been dropped WITHOUT one (the
-					// `None` case: the last `SyncRootHandle` and the worker references are gone) —
-					// is the NORMAL clean-shutdown path. Either way, drain everything currently
-					// buffered into the durable store before exiting so it is not lost.
+					// `None` case: the last `SyncRootHandle` and the worker references are gone, or a
+					// closed channel observed via the peek) — is the NORMAL clean-shutdown path.
+					// Either way, drain everything currently buffered into the durable store before
+					// exiting so it is not lost.
 					let shutdown = match control_event {
 						Some(first) => self.process_control_burst(first).await,
 						None => true,
@@ -1180,7 +1161,7 @@ impl CacheState {
 						.await;
 				}
 			}
-			message = self.control_receiver.try_recv().ok();
+			message = self.control_receiver.try_recv();
 		}
 		if added_new_root {
 			// Durably schedule the convergence FIRST: the adds were already acked Ok, and a
@@ -1739,15 +1720,16 @@ impl CacheState {
 							return Ok(());
 						}
 					},
-					control = self.control_receiver.recv() => {
-						// A `Shutdown` or a registration change (Add/Remove) arrived mid-wait. STOP
-						// waiting on the contended lock either way: a Shutdown must let the worker exit
-						// promptly instead of blocking out the patient wait, and an add/remove makes
-						// this attempt's root snapshot stale so it should restart against the new set.
-						// Aborting here is clean — NO lock is held yet and nothing is committed. Stash
-						// the message (a closed channel becomes a synthetic `Shutdown`) for `run` to
-						// apply, mark `needs_resync` so a fresh resync follows an add/remove, and finish.
-						self.pending_control = Some(control.unwrap_or(CacheControlMessage::Shutdown));
+					_ = self.control_receiver.peek() => {
+						// A `Shutdown` or a registration change (Add/Remove) arrived mid-wait (or the
+						// channel closed). STOP waiting on the contended lock either way: a Shutdown must
+						// let the worker exit promptly instead of blocking out the patient wait, and an
+						// add/remove makes this attempt's root snapshot stale so it should restart against
+						// the new set. Aborting here is clean — NO lock is held yet and nothing is
+						// committed. `peek` LEFT the message queued (a closed channel stays observable as
+						// `None`), so whoever consumes the channel next applies it: the enclosing
+						// `process_control_burst`'s drain loop, or `run`'s control arm. Mark `needs_resync`
+						// so a fresh resync follows an add/remove, and finish.
 						if let Err(e) = self.mark_needs_resync() {
 							self.surface_errors(vec![*e]);
 						}
