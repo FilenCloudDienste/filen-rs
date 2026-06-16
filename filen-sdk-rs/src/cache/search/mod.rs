@@ -102,7 +102,7 @@ mod result;
 
 pub use config::{SearchConfig, SearchItemType};
 pub use engine::SearchWindowCallback;
-pub use result::{SearchResult, SearchSnapshot};
+pub use result::{SearchHit, SearchResult, SearchSnapshot};
 
 use engine::{EngineInit, EngineMsg, SearchShared};
 

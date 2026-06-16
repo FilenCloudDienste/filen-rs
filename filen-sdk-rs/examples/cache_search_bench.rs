@@ -219,7 +219,11 @@ async fn main() {
 		snapshot
 			.results
 			.iter()
-			.map(|r| r.name())
+			.map(|r| format!(
+				"parent_path: {}, name: {}",
+				r.parent_path(),
+				r.result.name()
+			))
 			.collect::<Vec<_>>()
 	);
 

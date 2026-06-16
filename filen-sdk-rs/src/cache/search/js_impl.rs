@@ -18,7 +18,8 @@ use uuid::Uuid;
 use wasm_bindgen::JsValue;
 
 use super::{
-	Search, SearchConfig, SearchItemType, SearchResult, SearchSnapshot, SearchWindowHandle,
+	Search, SearchConfig, SearchHit, SearchItemType, SearchResult, SearchSnapshot,
+	SearchWindowHandle,
 };
 use crate::{
 	Error, ErrorKind,
@@ -106,12 +107,35 @@ impl From<SearchResult> for CacheSearchResult {
 	}
 }
 
+/// FFI mirror of [`SearchHit`]: a [`CacheSearchResult`] plus its `parent_path` relative to the
+/// search root — the `/`-joined chain of ancestor directory names from the search root
+/// (exclusive) down to the item's parent (inclusive); empty for a direct child of the root. A
+/// wrapper struct (mirroring the `*WithPath` shape used elsewhere in the FFI) rather than extra
+/// fields on the result enum's variants.
+#[js_type(export, no_deser)]
+pub struct CacheSearchHit {
+	/// The item's parent path relative to the search root; empty for a direct child of the root.
+	pub parent_path: String,
+	/// The matched item.
+	pub result: CacheSearchResult,
+}
+
+impl From<SearchHit> for CacheSearchHit {
+	fn from(hit: SearchHit) -> Self {
+		Self {
+			parent_path: String::from(hit.parent_path),
+			result: hit.result.into(),
+		}
+	}
+}
+
 /// FFI mirror of [`SearchSnapshot`]: one window's FULL fresh contents plus the total match
 /// count — never a delta. Treat each delivery as the window's new truth.
 #[js_type(export, no_deser)]
 pub struct CacheSearchSnapshot {
-	/// The window's current contents (name-ascending, directories first).
-	pub results: Vec<CacheSearchResult>,
+	/// The window's current contents (name-ascending, directories first), each paired with its
+	/// `parent_path` relative to the search root.
+	pub results: Vec<CacheSearchHit>,
 	/// Total matches across the WHOLE result set, not just this window.
 	pub total: u64,
 	/// `false` is TERMINAL: the searched directory was deleted server-side or the cache worker
@@ -525,8 +549,14 @@ mod tests {
 
 		let snapshot = CacheSearchSnapshot::from(SearchSnapshot {
 			results: vec![
-				SearchResult::Dir(dir.clone()),
-				SearchResult::File(file.clone()),
+				SearchHit {
+					result: SearchResult::Dir(dir.clone()),
+					parent_path: "".into(),
+				},
+				SearchHit {
+					result: SearchResult::File(file.clone()),
+					parent_path: "docs".into(),
+				},
 			],
 			total: 9,
 			live: true,
@@ -534,12 +564,14 @@ mod tests {
 		assert_eq!(snapshot.total, 9);
 		assert!(snapshot.live);
 		assert_eq!(snapshot.results.len(), 2);
+		assert_eq!(snapshot.results[0].parent_path, "");
 		assert!(matches!(
-			&snapshot.results[0],
+			&snapshot.results[0].result,
 			CacheSearchResult::Dir { dir: converted } if *converted == Dir::from(RemoteDirectory::from(dir.clone()))
 		));
+		assert_eq!(snapshot.results[1].parent_path, "docs");
 		assert!(matches!(
-			&snapshot.results[1],
+			&snapshot.results[1].result,
 			CacheSearchResult::File { file: converted } if *converted == File::from(RemoteFile::from(file.clone()))
 		));
 	}

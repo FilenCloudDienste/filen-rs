@@ -24,7 +24,10 @@ use crate::{
 	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
 };
 
-use super::{config::CompiledFilter, result::SearchResult};
+use super::{
+	config::CompiledFilter,
+	result::{SearchHit, SearchResult},
+};
 
 // Bounds the worker round-trip in `ReadConn::run` (native `Direct` reads are synchronous).
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -50,7 +53,9 @@ const SEARCH_COUNT_CHILDREN: &str = include_str!("raw/search_count_children.sql"
 /// parent lookup.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Scope {
-	Account,
+	/// Carries the account-root uuid — bound as the climb stop-anchor so each result's parent
+	/// path is computed relative to the account root.
+	Account(Uuid),
 	Subtree(Uuid),
 	Children(Uuid),
 }
@@ -233,7 +238,7 @@ pub(super) fn window_and_count(
 	scope: Scope,
 	filter: &CompiledFilter,
 	range: &Range<usize>,
-) -> rusqlite::Result<(Vec<SearchResult>, usize)> {
+) -> rusqlite::Result<(Vec<SearchHit>, usize)> {
 	let limit = range.end.saturating_sub(range.start).min(i64::MAX as usize) as i64;
 	let offset = range.start.min(i64::MAX as usize) as i64;
 	if limit == 0 {
@@ -242,12 +247,20 @@ pub(super) fn window_and_count(
 	let needle = filter.needle.as_deref().unwrap_or("");
 	let type_filter = type_filter_param(filter);
 	let case_insensitive = !filter.case_sensitive;
-	let map_row = |row: &Row<'_>| Ok((row_to_result(row)?, row.get::<_, i64>("total")?));
-	let rows: rusqlite::Result<Vec<(SearchResult, i64)>> = match scope {
-		Scope::Account => conn
+	// `parent_path` and `total` are read by NAME (robust to their column position); the payload
+	// columns are positional (see `row_to_result`).
+	let map_row = |row: &Row<'_>| {
+		let hit = SearchHit {
+			result: row_to_result(row)?,
+			parent_path: row.get::<_, String>("parent_path")?.into(),
+		};
+		Ok((hit, row.get::<_, i64>("total")?))
+	};
+	let rows: rusqlite::Result<Vec<(SearchHit, i64)>> = match scope {
+		Scope::Account(root) => conn
 			.prepare_cached(SEARCH_WINDOW_ACCOUNT)?
 			.query_map(
-				params![type_filter, needle, case_insensitive, limit, offset],
+				params![root, type_filter, needle, case_insensitive, limit, offset],
 				map_row,
 			)?
 			.collect(),
@@ -270,7 +283,7 @@ pub(super) fn window_and_count(
 	let Some(&(_, total)) = rows.first() else {
 		return Ok((Vec::new(), count_results(conn, scope, filter)?));
 	};
-	let results = rows.into_iter().map(|(result, _)| result).collect();
+	let results = rows.into_iter().map(|(hit, _)| hit).collect();
 	Ok((results, total.max(0) as usize))
 }
 
@@ -281,7 +294,7 @@ pub(super) fn window_results(
 	scope: Scope,
 	filter: &CompiledFilter,
 	range: &Range<usize>,
-) -> rusqlite::Result<Vec<SearchResult>> {
+) -> rusqlite::Result<Vec<SearchHit>> {
 	window_and_count(conn, scope, filter, range).map(|(results, _)| results)
 }
 
@@ -295,7 +308,9 @@ pub(super) fn count_results(
 	let type_filter = type_filter_param(filter);
 	let case_insensitive = !filter.case_sensitive;
 	let count: i64 = match scope {
-		Scope::Account => conn
+		// The count SQL is unchanged (no path computation, no anchor param), so the account-root
+		// uuid is unused here.
+		Scope::Account(_) => conn
 			.prepare_cached(SEARCH_COUNT_ACCOUNT)?
 			.query_row(params![type_filter, needle, case_insensitive], |row| {
 				row.get(0)
@@ -534,11 +549,15 @@ mod tests {
 		CompiledFilter::compile(config)
 	}
 
-	fn result_names(results: &[SearchResult]) -> Vec<String> {
+	fn result_names(results: &[SearchHit]) -> Vec<String> {
 		results
 			.iter()
-			.map(|result| result.name().to_string())
+			.map(|hit| hit.result.name().to_string())
 			.collect()
+	}
+
+	fn parent_paths(results: &[SearchHit]) -> Vec<&str> {
+		results.iter().map(|hit| hit.parent_path()).collect()
 	}
 
 	#[test]
@@ -547,13 +566,17 @@ mod tests {
 		let conn = open_read_connection(&fixture.path).unwrap();
 		let filter = filter(&SearchConfig::new());
 
-		let results = window_results(&conn, Scope::Account, &filter, &(0..10)).unwrap();
+		let results =
+			window_results(&conn, Scope::Account(fixture.root), &filter, &(0..10)).unwrap();
 		assert_eq!(
 			result_names(&results),
 			vec!["sub", "alpha.txt", "Beta.txt", "Übung.txt"],
 			"dir first; then alpha < Beta under ASCII case folding; non-ASCII after"
 		);
-		assert_eq!(count_results(&conn, Scope::Account, &filter).unwrap(), 4);
+		assert_eq!(
+			count_results(&conn, Scope::Account(fixture.root), &filter).unwrap(),
+			4
+		);
 	}
 
 	#[test]
@@ -585,7 +608,8 @@ mod tests {
 		let conn = open_read_connection(&fixture.path).unwrap();
 
 		let insensitive = filter(&SearchConfig::new().with_name("ÜBUNG"));
-		let results = window_results(&conn, Scope::Account, &insensitive, &(0..10)).unwrap();
+		let results =
+			window_results(&conn, Scope::Account(fixture.root), &insensitive, &(0..10)).unwrap();
 		assert_eq!(result_names(&results), vec!["Übung.txt"]);
 
 		let sensitive = filter(
@@ -594,13 +618,14 @@ mod tests {
 				.with_case_sensitive(true),
 		);
 		assert_eq!(
-			count_results(&conn, Scope::Account, &sensitive).unwrap(),
+			count_results(&conn, Scope::Account(fixture.root), &sensitive).unwrap(),
 			0,
 			"case-sensitive mode matches raw bytes only"
 		);
 
 		let dirs_only = filter(&SearchConfig::new().with_item_type(SearchItemType::Dir));
-		let results = window_results(&conn, Scope::Account, &dirs_only, &(0..10)).unwrap();
+		let results =
+			window_results(&conn, Scope::Account(fixture.root), &dirs_only, &(0..10)).unwrap();
 		assert_eq!(result_names(&results), vec!["sub"]);
 	}
 
@@ -612,21 +637,24 @@ mod tests {
 		let fixture = fixture();
 		let conn = open_read_connection(&fixture.path).unwrap();
 		let all = filter(&SearchConfig::new());
-		let expected_total = count_results(&conn, Scope::Account, &all).unwrap();
+		let expected_total = count_results(&conn, Scope::Account(fixture.root), &all).unwrap();
 		assert!(expected_total >= 4, "fixture sanity");
 
-		let (page, total) = window_and_count(&conn, Scope::Account, &all, &(0..2)).unwrap();
+		let (page, total) =
+			window_and_count(&conn, Scope::Account(fixture.root), &all, &(0..2)).unwrap();
 		assert_eq!(page.len(), 2, "a clamped page");
 		assert_eq!(total, expected_total, "piggybacked total");
 
-		let (beyond, total) = window_and_count(&conn, Scope::Account, &all, &(50..60)).unwrap();
+		let (beyond, total) =
+			window_and_count(&conn, Scope::Account(fixture.root), &all, &(50..60)).unwrap();
 		assert!(beyond.is_empty());
 		assert_eq!(
 			total, expected_total,
 			"fallback total on an out-of-range page"
 		);
 
-		let (empty, total) = window_and_count(&conn, Scope::Account, &all, &(3..3)).unwrap();
+		let (empty, total) =
+			window_and_count(&conn, Scope::Account(fixture.root), &all, &(3..3)).unwrap();
 		assert!(empty.is_empty());
 		assert_eq!(
 			total, expected_total,
@@ -649,12 +677,15 @@ mod tests {
 		);
 
 		assert_eq!(
-			count_results(&conn, Scope::Account, &insensitive).unwrap(),
+			count_results(&conn, Scope::Account(fixture.root), &insensitive).unwrap(),
 			1
 		);
-		assert_eq!(count_results(&conn, Scope::Account, &sensitive).unwrap(), 0);
 		assert_eq!(
-			count_results(&conn, Scope::Account, &insensitive).unwrap(),
+			count_results(&conn, Scope::Account(fixture.root), &sensitive).unwrap(),
+			0
+		);
+		assert_eq!(
+			count_results(&conn, Scope::Account(fixture.root), &insensitive).unwrap(),
 			1
 		);
 	}
@@ -665,13 +696,15 @@ mod tests {
 		let conn = open_read_connection(&fixture.path).unwrap();
 		let filter = filter(&SearchConfig::new());
 
-		let second_page = window_results(&conn, Scope::Account, &filter, &(2..4)).unwrap();
+		let second_page =
+			window_results(&conn, Scope::Account(fixture.root), &filter, &(2..4)).unwrap();
 		assert_eq!(result_names(&second_page), vec!["Beta.txt", "Übung.txt"]);
 
-		let beyond = window_results(&conn, Scope::Account, &filter, &(50..60)).unwrap();
+		let beyond =
+			window_results(&conn, Scope::Account(fixture.root), &filter, &(50..60)).unwrap();
 		assert!(beyond.is_empty());
 
-		let empty = window_results(&conn, Scope::Account, &filter, &(3..3)).unwrap();
+		let empty = window_results(&conn, Scope::Account(fixture.root), &filter, &(3..3)).unwrap();
 		assert!(empty.is_empty());
 	}
 
@@ -681,29 +714,98 @@ mod tests {
 		let conn = open_read_connection(&fixture.path).unwrap();
 		let filter = filter(&SearchConfig::new());
 
-		let results = window_results(&conn, Scope::Account, &filter, &(0..10)).unwrap();
+		let results =
+			window_results(&conn, Scope::Account(fixture.root), &filter, &(0..10)).unwrap();
 		let by_uuid = |uuid: Uuid| {
 			results
 				.iter()
-				.find(|result| result.uuid() == uuid)
+				.find(|hit| hit.result.uuid() == uuid)
 				.unwrap()
 				.clone()
 		};
 		assert_eq!(
-			by_uuid(fixture.beta.uuid),
+			by_uuid(fixture.beta.uuid).result,
 			SearchResult::File(fixture.beta.clone())
 		);
 		assert_eq!(
-			by_uuid(fixture.alpha.uuid),
+			by_uuid(fixture.alpha.uuid).result,
 			SearchResult::File(fixture.alpha.clone())
 		);
 		assert_eq!(
-			by_uuid(fixture.uebung.uuid),
+			by_uuid(fixture.uebung.uuid).result,
 			SearchResult::File(fixture.uebung.clone())
 		);
 		assert_eq!(
-			by_uuid(fixture.sub.uuid),
+			by_uuid(fixture.sub.uuid).result,
 			SearchResult::Dir(fixture.sub.clone())
 		);
+	}
+
+	/// The parent path is the `/`-joined ancestor-dir chain from the search root (exclusive) down
+	/// to the parent (inclusive): empty for direct children of the root, the parent's name one
+	/// level down, and anchor-relative under a subtree scope.
+	#[test]
+	fn parent_path_is_relative_to_the_search_root() {
+		let fixture = fixture();
+		let conn = open_read_connection(&fixture.path).unwrap();
+		let filter = filter(&SearchConfig::new());
+
+		let account =
+			window_results(&conn, Scope::Account(fixture.root), &filter, &(0..10)).unwrap();
+		let path_of = |uuid: Uuid| {
+			account
+				.iter()
+				.find(|hit| hit.result.uuid() == uuid)
+				.unwrap()
+				.parent_path()
+				.to_string()
+		};
+		assert_eq!(path_of(fixture.sub.uuid), "", "dir directly under the root");
+		assert_eq!(
+			path_of(fixture.beta.uuid),
+			"",
+			"file directly under the root"
+		);
+		assert_eq!(path_of(fixture.alpha.uuid), "sub", "one level down");
+		assert_eq!(path_of(fixture.uebung.uuid), "sub");
+
+		// Anchored at `sub`: its own children sit at the root of the search → empty parent path.
+		let subtree =
+			window_results(&conn, Scope::Subtree(fixture.sub.uuid), &filter, &(0..10)).unwrap();
+		assert_eq!(parent_paths(&subtree), vec!["", ""]);
+
+		// Non-recursive: every result is a direct child of the root.
+		let children =
+			window_results(&conn, Scope::Children(fixture.root), &filter, &(0..10)).unwrap();
+		assert_eq!(parent_paths(&children), vec!["", ""]);
+	}
+
+	/// Exercises the recursive climb STEP (more than one level) and the anchor-relative trimming:
+	/// a file under root/A/B/C reports "A/B/C" account-scoped, but "C" when anchored at B.
+	#[test]
+	fn parent_path_joins_multi_level_ancestry() {
+		let path = temp_db_path();
+		let root = Uuid::new_v4();
+		let mut state = CacheState::new_on_path(&path, root);
+		let a = test_dir(Uuid::new_v4(), root, "A");
+		let b = test_dir(Uuid::new_v4(), a.uuid, "B");
+		let c = test_dir(Uuid::new_v4(), b.uuid, "C");
+		let deep = test_file(Uuid::new_v4(), c.uuid, "deep.txt");
+		state.upsert_dirs([&a, &b, &c].into_iter()).unwrap();
+		state.upsert_files(std::iter::once(&deep)).unwrap();
+
+		let conn = open_read_connection(&path).unwrap();
+		let filter = filter(&SearchConfig::new().with_name("deep.txt"));
+
+		let account = window_results(&conn, Scope::Account(root), &filter, &(0..10)).unwrap();
+		assert_eq!(result_names(&account), vec!["deep.txt"]);
+		assert_eq!(
+			account[0].parent_path(),
+			"A/B/C",
+			"full chain from the account root"
+		);
+
+		let from_b = window_results(&conn, Scope::Subtree(b.uuid), &filter, &(0..10)).unwrap();
+		assert_eq!(from_b[0].parent_path(), "C", "relative to the anchor B");
 	}
 }

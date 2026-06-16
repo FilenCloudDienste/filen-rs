@@ -255,7 +255,7 @@ impl Engine {
 		if !self.filter.recursive {
 			Scope::Children(self.root)
 		} else if self.is_account_root {
-			Scope::Account
+			Scope::Account(self.root)
 		} else {
 			Scope::Subtree(self.root)
 		}

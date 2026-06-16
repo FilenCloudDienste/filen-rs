@@ -1,6 +1,9 @@
 -- One window of a non-recursive search: the DIRECT children of one dir
 -- (a live, sorted directory listing). See search_window_account.sql for
--- the matcher/ordering notes. ?1 = parent uuid, ?2 = type filter
+-- the matcher/ordering notes. Every result's parent IS the search root, so
+-- the PARENT PATH is always empty — emitted as a constant column to keep
+-- the row shape uniform with the account/subtree windows (no climb needed).
+-- ?1 = parent uuid, ?2 = type filter
 -- (0/1/2), ?3 = needle, ?4 = case-insensitive flag, ?5 = limit,
 -- ?6 = offset.
 SELECT
@@ -26,6 +29,8 @@ SELECT
 	d.timestamp AS dir_timestamp,
 	d.name AS dir_name,
 	d.created AS dir_created,
+	-- direct children are always at the root, so the parent path is empty
+	'' AS parent_path,
 	-- the pre-LIMIT match total, piggybacked on every row so one scan
 	-- serves both the window and the count (see hydrate::window_and_count)
 	count(*) OVER () AS total

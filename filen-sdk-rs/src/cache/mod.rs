@@ -24,8 +24,8 @@ pub use {
 	error::CacheError,
 	handle::{CacheMessage, ResyncProgress, SyncRootHandle},
 	search::{
-		Search, SearchConfig, SearchItemType, SearchResult, SearchSnapshot, SearchWindowCallback,
-		SearchWindowHandle,
+		Search, SearchConfig, SearchHit, SearchItemType, SearchResult, SearchSnapshot,
+		SearchWindowCallback, SearchWindowHandle,
 	},
 	state::{CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, SyncRootCallback},
 };

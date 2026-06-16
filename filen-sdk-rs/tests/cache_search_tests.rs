@@ -34,7 +34,7 @@ fn names(snapshot: &SearchSnapshot) -> Vec<String> {
 	snapshot
 		.results
 		.iter()
-		.map(|result| result.name().to_string())
+		.map(|hit| hit.result.name().to_string())
 		.collect()
 }
 
@@ -227,10 +227,13 @@ async fn test_search_favorite_toggle_fires_content_refresh() {
 	assert!(
 		poll_until(CACHE_CONVERGE_TIMEOUT, || {
 			last_snapshot(&log).is_some_and(|snapshot| {
-				snapshot.results.first().is_some_and(|result| match result {
-					filen_sdk_rs::cache::SearchResult::File(file) => file.favorited,
-					_ => false,
-				})
+				snapshot
+					.results
+					.first()
+					.is_some_and(|hit| match &hit.result {
+						filen_sdk_rs::cache::SearchResult::File(file) => file.favorited,
+						_ => false,
+					})
 			})
 		})
 		.await,
