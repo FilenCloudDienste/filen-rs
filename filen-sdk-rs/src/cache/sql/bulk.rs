@@ -50,6 +50,27 @@ const _: () = assert!(
 	"CHUNK_SIZE must be a multiple of MULTI_ROW_CHUNK so transactions hold only full sub-batches",
 );
 
+/// Append `rows` comma-separated `(?, …)` placeholder tuples to `sql`, each `cols` wide with 1-based
+/// positional params: row `k` spans `?{k*cols+1} … ?{k*cols+cols}`. Driving the tuple width from the
+/// caller's `*_PARAMS_PER_ROW` constant keeps it impossible to desync the placeholder count from the
+/// bind order when a column is added (the hazard of hand-spelling 15 `?{}` args).
+fn push_values_rows(sql: &mut String, rows: usize, cols: usize) {
+	for k in 0..rows {
+		if k > 0 {
+			sql.push(',');
+		}
+		let b = k * cols;
+		sql.push('(');
+		for c in 0..cols {
+			if c > 0 {
+				sql.push_str(", ");
+			}
+			let _ = write!(sql, "?{}", b + c + 1);
+		}
+		sql.push(')');
+	}
+}
+
 /// `INSERT INTO items (...) VALUES <rows> ON CONFLICT(uuid) DO UPDATE ... RETURNING id, uuid` for
 /// `rows` items. Per row k the params are `[uuid, parent, type, root_id, content_hash]` at base
 /// `k * 5`. The `id` column is omitted — SQLite assigns a fresh rowid for a new uuid, and the
@@ -58,21 +79,7 @@ const _: () = assert!(
 fn items_upsert_sql(rows: usize) -> String {
 	let mut sql = String::with_capacity(rows * 24 + 320);
 	sql.push_str("INSERT INTO items (uuid, parent, type, root_id, content_hash) VALUES ");
-	for k in 0..rows {
-		if k > 0 {
-			sql.push(',');
-		}
-		let b = k * ITEM_PARAMS_PER_ROW;
-		let _ = write!(
-			sql,
-			"(?{}, ?{}, ?{}, ?{}, ?{})",
-			b + 1,
-			b + 2,
-			b + 3,
-			b + 4,
-			b + 5
-		);
-	}
+	push_values_rows(&mut sql, rows, ITEM_PARAMS_PER_ROW);
 	sql.push_str(
 		" ON CONFLICT (uuid) DO UPDATE SET parent = excluded.parent, type = excluded.type, \
 		 root_id = excluded.root_id, content_hash = excluded.content_hash RETURNING id, uuid",
@@ -89,31 +96,7 @@ fn files_upsert_sql(rows: usize) -> String {
 		"INSERT INTO files (id, chunks_size, chunks, favorite, region, bucket, timestamp, size, \
 		 name, mime, file_key, file_key_version, created, modified, hash) VALUES ",
 	);
-	for k in 0..rows {
-		if k > 0 {
-			sql.push(',');
-		}
-		let b = k * FILE_PARAMS_PER_ROW;
-		let _ = write!(
-			sql,
-			"(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-			b + 1,
-			b + 2,
-			b + 3,
-			b + 4,
-			b + 5,
-			b + 6,
-			b + 7,
-			b + 8,
-			b + 9,
-			b + 10,
-			b + 11,
-			b + 12,
-			b + 13,
-			b + 14,
-			b + 15,
-		);
-	}
+	push_values_rows(&mut sql, rows, FILE_PARAMS_PER_ROW);
 	sql.push_str(
 		" ON CONFLICT (id) DO UPDATE SET chunks_size = excluded.chunks_size, \
 		 chunks = excluded.chunks, favorite = excluded.favorite, region = excluded.region, \
@@ -130,22 +113,7 @@ fn files_upsert_sql(rows: usize) -> String {
 fn dirs_upsert_sql(rows: usize) -> String {
 	let mut sql = String::with_capacity(rows * 32 + 320);
 	sql.push_str("INSERT INTO dirs (id, favorite, color, timestamp, name, created) VALUES ");
-	for k in 0..rows {
-		if k > 0 {
-			sql.push(',');
-		}
-		let b = k * DIR_PARAMS_PER_ROW;
-		let _ = write!(
-			sql,
-			"(?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-			b + 1,
-			b + 2,
-			b + 3,
-			b + 4,
-			b + 5,
-			b + 6,
-		);
-	}
+	push_values_rows(&mut sql, rows, DIR_PARAMS_PER_ROW);
 	sql.push_str(
 		" ON CONFLICT (id) DO UPDATE SET favorite = excluded.favorite, color = excluded.color, \
 		 timestamp = excluded.timestamp, name = excluded.name, created = excluded.created",
@@ -367,4 +335,40 @@ pub(super) fn bulk_upsert_dirs<'a>(
 		}
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn push_values_rows_builds_one_based_placeholder_grid() {
+		let mut sql = String::new();
+		push_values_rows(&mut sql, 2, 3);
+		assert_eq!(sql, "(?1, ?2, ?3),(?4, ?5, ?6)");
+
+		let mut single = String::new();
+		push_values_rows(&mut single, 1, 5);
+		assert_eq!(single, "(?1, ?2, ?3, ?4, ?5)");
+
+		let mut none = String::new();
+		push_values_rows(&mut none, 0, 5);
+		assert_eq!(none, "");
+	}
+
+	#[test]
+	fn upsert_builders_emit_the_expected_values_grid() {
+		// Each builder feeds push_values_rows its own column count; pin the resulting grid so a future
+		// column add that forgets to update the constant is caught here.
+		assert!(
+			items_upsert_sql(2)
+				.contains("VALUES (?1, ?2, ?3, ?4, ?5),(?6, ?7, ?8, ?9, ?10) ON CONFLICT (uuid)")
+		);
+		assert!(dirs_upsert_sql(1).contains("VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (id)"));
+		// files has 15 columns, so row 2 starts at param 16.
+		assert!(files_upsert_sql(2).contains(
+			"(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15),(?16, ?17, ?18, \
+			 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)"
+		));
+	}
 }

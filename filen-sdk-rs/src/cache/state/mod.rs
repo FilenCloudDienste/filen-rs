@@ -95,6 +95,30 @@ pub(crate) struct ResyncDeps {
 	pub(crate) client: Arc<Client>,
 }
 
+/// One sync root's lock-held listing: `(root uuid, the node to materialize as the diff anchor —
+/// `None` for the account root, listed dirs, listed files)`.
+type RootListing = (
+	Uuid,
+	Option<RemoteDirectory>,
+	Vec<RemoteDirectory>,
+	Vec<RemoteFile>,
+);
+
+/// The whole lock-held resync listing handed from [`run_resync`](CacheState::run_resync)'s network
+/// "island" to [`finalize_resync`](CacheState::finalize_resync). Named rather than a 4-tuple so the
+/// scalar `any_transient`/`remote_under_lock` fields stay legible at the seam (and so the two
+/// `#[allow(clippy::type_complexity)]`s the tuple needed are gone).
+struct ResyncListing {
+	/// Per-root listings to apply.
+	per_root_raw: Vec<RootListing>,
+	/// Roots the server reported definitively gone — `finalize_resync` evicts their subtrees.
+	deleted_roots: Vec<Uuid>,
+	/// At least one root failed with a transient (non-not-found) error this pass.
+	any_transient: bool,
+	/// The drive snapshot id read under the lock; the watermark advances to it on a clean apply.
+	remote_under_lock: u64,
+}
+
 pub(crate) struct CacheState {
 	pub(crate) db: rusqlite::Connection,
 	/// Bounded at [`EVENT_SHED_CAP`]: the socket router must never block, so it uses `try_send` and
@@ -579,9 +603,7 @@ impl CacheState {
 		// resync-flag write ALSO fails, the startup gap-check (`remote > watermark`) is the backstop.
 		if let Err(e) = self.insert_events_batch(&to_persist) {
 			self.surface_errors(vec![*e]);
-			if let Err(e) = self.mark_needs_resync() {
-				self.surface_errors(vec![*e]);
-			}
+			self.mark_needs_resync_surfacing_errors();
 		}
 
 		// Apply the ordered, persisted socket events first. The drain records `needs_resync` ATOMICALLY
@@ -1009,9 +1031,7 @@ impl CacheState {
 						errors.swap_remove(0)
 					};
 					self.surface_errors(errors);
-					if let Err(e) = self.mark_needs_resync() {
-						self.surface_errors(vec![*e]);
-					}
+					self.mark_needs_resync_surfacing_errors();
 					return Err(Box::new(first));
 				}
 			}
@@ -1130,6 +1150,32 @@ impl CacheState {
 		}
 	}
 
+	/// Record the durable `needs_resync` flag; if even that write fails, surface it best-effort (the
+	/// next session's startup gap-check is the backstop). The bare `if let Err(e) = mark_needs_resync()
+	/// { surface_errors(vec![*e]) }` shape recurs across the drain/resync paths; this names it.
+	fn mark_needs_resync_surfacing_errors(&self) {
+		if let Err(e) = self.mark_needs_resync() {
+			self.surface_errors(vec![*e]);
+		}
+	}
+
+	/// Abandon the in-flight (non-converged) resync attempt cleanly: durably flag `needs_resync`,
+	/// tell progress consumers the attempt finished without converging, and — only when `arm_retry`
+	/// — schedule a self-retry so a quiet account re-attempts. No lock is held and nothing is
+	/// committed at any caller, so this drops no work. `arm_retry` is `false` on the abort paths
+	/// where a queued control message (Shutdown / Add / Remove) will itself re-drive the loop, so a
+	/// timer would be redundant; it leaves `resync_retry` untouched in that case.
+	fn abort_resync_unconverged(&mut self, arm_retry: bool) {
+		self.mark_needs_resync_surfacing_errors();
+		Self::send_resync_progress(
+			&self.msg_sender,
+			ResyncProgress::Finished { converged: false },
+		);
+		if arm_retry {
+			self.resync_retry = Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL);
+		}
+	}
+
 	/// Process `first` plus every control message already queued behind it, then run AT MOST ONE
 	/// convergence resync if the burst added any new sync root — so a multi-root startup (N
 	/// `add_sync_root` calls in quick succession) converges with a single listing pass instead of N.
@@ -1169,9 +1215,7 @@ impl CacheState {
 			// root(s) would silently stay unpopulated for the session (live events for them are
 			// membership-gated out while the watermark keeps advancing, so no hole ever re-flags).
 			// A fully successful resync clears the flag atomically in the watermark commit.
-			if let Err(e) = self.mark_needs_resync() {
-				self.surface_errors(vec![*e]);
-			}
+			self.mark_needs_resync_surfacing_errors();
 			// Resync ALL roots so the new root(s) are populated AND the watermark stays accurate for
 			// every root. Resyncing only the new roots could advance the watermark past a pending gap
 			// in an existing root and clear `needs_resync`, masking it. Redundant listings of
@@ -1653,9 +1697,7 @@ impl CacheState {
 						// it is the same DB) so the armed retry actually re-fires this session,
 						// matching the listing-failure arm below.
 						self.surface_errors(vec![*e]);
-						if let Err(e) = self.mark_needs_resync() {
-							self.surface_errors(vec![*e]);
-						}
+						self.mark_needs_resync_surfacing_errors();
 						false
 					}
 				},
@@ -1664,9 +1706,7 @@ impl CacheState {
 					// (the gap-check re-fires on the next event) and arm the retry timer for a
 					// quiet account.
 					log::info!("resync: no sync roots; deferring watermark advance ({e})");
-					if let Err(e) = self.mark_needs_resync() {
-						self.surface_errors(vec![*e]);
-					}
+					self.mark_needs_resync_surfacing_errors();
 					false
 				}
 			};
@@ -1710,13 +1750,8 @@ impl CacheState {
 						// the startup gap-check is the backstop if even this write fails. Emitting
 						// `Finished` keeps progress consumers tidy.
 						None => {
-							if let Err(e) = self.mark_needs_resync() {
-								self.surface_errors(vec![*e]);
-							}
-							Self::send_resync_progress(
-								&self.msg_sender,
-								ResyncProgress::Finished { converged: false },
-							);
+							// A queued Shutdown will re-drive the run loop, so no retry timer.
+							self.abort_resync_unconverged(false);
 							return Ok(());
 						}
 					},
@@ -1729,14 +1764,9 @@ impl CacheState {
 						// committed. `peek` LEFT the message queued (a closed channel stays observable as
 						// `None`), so whoever consumes the channel next applies it: the enclosing
 						// `process_control_burst`'s drain loop, or `run`'s control arm. Mark `needs_resync`
-						// so a fresh resync follows an add/remove, and finish.
-						if let Err(e) = self.mark_needs_resync() {
-							self.surface_errors(vec![*e]);
-						}
-						Self::send_resync_progress(
-							&self.msg_sender,
-							ResyncProgress::Finished { converged: false },
-						);
+						// so a fresh resync follows an add/remove, and finish. The queued message will
+						// re-drive the loop, so no retry timer.
+						self.abort_resync_unconverged(false);
 						return Ok(());
 					},
 					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
@@ -1760,14 +1790,7 @@ impl CacheState {
 						"resync: drive lock acquisition failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
 					);
 				}
-				if let Err(e) = self.mark_needs_resync() {
-					self.surface_errors(vec![*e]);
-				}
-				Self::send_resync_progress(
-					&self.msg_sender,
-					ResyncProgress::Finished { converged: false },
-				);
-				self.resync_retry = Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL);
+				self.abort_resync_unconverged(true);
 				return Ok(());
 			}
 		};
@@ -1776,15 +1799,9 @@ impl CacheState {
 		// do NOT drain events here — that would advance the watermark past `remote_under_lock`,
 		// the snapshot id we commit below.
 		let msg_sender = &self.msg_sender;
-		#[allow(clippy::type_complexity)]
 		let island = async {
 			let remote_under_lock = deps.client.get_last_event_ids().await?.drive;
-			let mut per_root_raw: Vec<(
-				Uuid,
-				Option<RemoteDirectory>,
-				Vec<RemoteDirectory>,
-				Vec<RemoteFile>,
-			)> = Vec::with_capacity(sync_roots.len());
+			let mut per_root_raw: Vec<RootListing> = Vec::with_capacity(sync_roots.len());
 			// Roots the server reported GONE (a definitive not-found): `finalize_resync` deletes their
 			// cached subtrees, drops them from the active set, and notifies the app. Kept distinct from a
 			// transient skip so a deleted root is removed rather than re-listed (and re-failed) forever.
@@ -1867,12 +1884,12 @@ impl CacheState {
 					}
 				}
 			}
-			Ok((
+			Ok(ResyncListing {
 				per_root_raw,
 				deleted_roots,
 				any_transient,
 				remote_under_lock,
-			))
+			})
 		};
 		// Serve search read queries WHILE the listing runs (minutes on a large account): the wasm
 		// read path has no other server, so without this every search query would queue for the
@@ -1897,7 +1914,7 @@ impl CacheState {
 		// Release the drive lock now — `finalize_resync` is local-only DB work.
 		drop(lock);
 
-		let (per_root_raw, deleted_roots, any_transient, remote_under_lock) = match listing {
+		let listing = match listing {
 			Ok(listing) => listing,
 			Err(e) => {
 				// A snapshot-id read or per-root listing failed (the lock was already held) —
@@ -1905,25 +1922,13 @@ impl CacheState {
 				// having set it (the startup gap-check resyncs on a watermark lag WITHOUT
 				// marking), then arm the retry timer so even a quiet account re-attempts.
 				log::warn!("resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}");
-				if let Err(e) = self.mark_needs_resync() {
-					self.surface_errors(vec![*e]);
-				}
-				Self::send_resync_progress(
-					&self.msg_sender,
-					ResyncProgress::Finished { converged: false },
-				);
-				self.resync_retry = Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL);
+				self.abort_resync_unconverged(true);
 				return Ok(());
 			}
 		};
 
 		Self::send_resync_progress(&self.msg_sender, ResyncProgress::Applying);
-		let result = self.finalize_resync(
-			per_root_raw,
-			deleted_roots,
-			any_transient,
-			remote_under_lock,
-		);
+		let result = self.finalize_resync(listing);
 		// `converged` is read back from the durable flag — the engine's own definition of "work
 		// remains": a partial or all-transient resync keeps it set (or re-marks it) in the same
 		// transaction that commits any progress, so `Ok` + a clear flag is exactly "nothing
@@ -1968,19 +1973,13 @@ impl CacheState {
 	/// for — a gap that was never healed (silent data loss). An empty config or an all-roots-deleted resync
 	/// has `any_transient == false`, so it still commits + advances the watermark, keeping the gap-check
 	/// from looping.
-	#[allow(clippy::type_complexity)]
-	fn finalize_resync(
-		&mut self,
-		per_root_raw: Vec<(
-			Uuid,
-			Option<RemoteDirectory>,
-			Vec<RemoteDirectory>,
-			Vec<RemoteFile>,
-		)>,
-		deleted_roots: Vec<Uuid>,
-		any_transient: bool,
-		remote_under_lock: u64,
-	) -> Result<(), Box<CacheError>> {
+	fn finalize_resync(&mut self, listing: ResyncListing) -> Result<(), Box<CacheError>> {
+		let ResyncListing {
+			per_root_raw,
+			deleted_roots,
+			any_transient,
+			remote_under_lock,
+		} = listing;
 		// Remove the deleted roots' cached subtrees (the cascade trigger recurses) so we don't leak items
 		// under a root that no longer gates membership, then drop them from the active set + notify. The
 		// account root is never in `deleted_roots` (it is never `get_dir`'d and cannot be deleted).
@@ -1998,9 +1997,7 @@ impl CacheState {
 						e,
 						"deleting server-deleted sync-root subtrees".to_string(),
 					));
-					if let Err(e) = self.mark_needs_resync() {
-						self.surface_errors(vec![*e]);
-					}
+					self.mark_needs_resync_surfacing_errors();
 				}
 			}
 		}

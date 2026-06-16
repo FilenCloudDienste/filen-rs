@@ -878,7 +878,12 @@ fn finalize_resync_drops_a_server_deleted_root() {
 
 	// The locked listing reported B not-found (deleted server-side); nothing else to list or skip.
 	state
-		.finalize_resync(Vec::new(), vec![b.uuid], false, 100)
+		.finalize_resync(ResyncListing {
+			per_root_raw: Vec::new(),
+			deleted_roots: vec![b.uuid],
+			any_transient: false,
+			remote_under_lock: 100,
+		})
 		.unwrap();
 
 	assert!(!item_exists(&state, b.uuid), "B's node is deleted");
@@ -921,7 +926,12 @@ fn finalize_resync_all_transient_failure_preserves_watermark_and_flag() {
 	// The locked block got the lock + snapshot id (remote_under_lock = 100) but every root then failed
 	// transiently: nothing listed, nothing deleted, `any_transient` set.
 	state
-		.finalize_resync(Vec::new(), Vec::new(), true, 100)
+		.finalize_resync(ResyncListing {
+			per_root_raw: Vec::new(),
+			deleted_roots: Vec::new(),
+			any_transient: true,
+			remote_under_lock: 100,
+		})
 		.unwrap();
 
 	assert_eq!(
