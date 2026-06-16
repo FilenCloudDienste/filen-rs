@@ -413,6 +413,26 @@ async fn recv_read_task(read_tasks: &mut Option<UnboundedReceiver<ReadTask>>) ->
 	}
 }
 
+/// Body of the read-task `select!` arm, shared by the three select loops (the worker `run` loop and
+/// `run_resync`'s lock-wait + listing loops). A FREE fn over the two fields it touches — not a
+/// `&mut self` method — so it composes with the listing loop, where the `island` future holds a live
+/// `&self.msg_sender` borrow across the same select (a whole-`self` borrow would conflict).
+fn handle_read_task(
+	read_task: Option<ReadTask>,
+	read_tasks: &mut Option<UnboundedReceiver<ReadTask>>,
+	db: &rusqlite::Connection,
+) {
+	match read_task {
+		// Wasm search read: run against this connection, between drains. The query is a quick
+		// indexed/scan SELECT — never a write. A poisoned query must not kill the worker (mirrors
+		// `dispatch_batch`); its dropped reply sender surfaces as an error on the engine side.
+		Some(task) => serve_read_task(task, db),
+		// Every sender gone (no live searches and the shared state dropped): disable the arm —
+		// polling a closed receiver in select would spin hot.
+		None => *read_tasks = None,
+	}
+}
+
 type InitResult = (
 	CacheState,
 	Box<dyn Fn(&DecryptedSocketEvent<'_>) + Send + 'static>,
@@ -527,16 +547,7 @@ impl CacheState {
 					}
 				},
 				read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
-					match read_task {
-						// Wasm search read: run against this connection, between drains. The
-						// query is a quick indexed/scan SELECT — never a write. A poisoned
-						// query must not kill the worker (mirrors `dispatch_batch`); its
-						// dropped reply sender surfaces as an error on the engine side.
-						Some(task) => serve_read_task(task, &self.db),
-						// Every sender gone (no live searches and the shared state dropped):
-						// disable the arm — polling a closed receiver in select would spin hot.
-						None => self.read_tasks = None,
-					}
+					handle_read_task(read_task, &mut self.read_tasks, &self.db);
 				},
 				event = self.event_receiver.recv() => {
 					let Some(event) = event else {
@@ -602,7 +613,7 @@ impl CacheState {
 		// removed from the channel, but a resync is a full subtree reconcile, so it recovers them; if the
 		// resync-flag write ALSO fails, the startup gap-check (`remote > watermark`) is the backstop.
 		if let Err(e) = self.insert_events_batch(&to_persist) {
-			self.surface_errors(vec![*e]);
+			self.surface_one(e);
 			self.mark_needs_resync_surfacing_errors();
 		}
 
@@ -611,7 +622,7 @@ impl CacheState {
 		// write here; a hole detected here is healed by the subsequent `maybe_run_resync`
 		// in `run`, or by the startup gap-check on the next boot.
 		if let Err(e) = self.drain_persisted() {
-			self.surface_errors(vec![*e]);
+			self.surface_one(e);
 		}
 
 		// if the socket router shed events under sustained over-rate (the channel hit its cap),
@@ -625,7 +636,7 @@ impl CacheState {
 				// retries the mark instead of silently losing the resync signal. (The startup gap-check
 				// remains a backstop, but it only fires on the next boot.)
 				self.shed.store(true, Ordering::Release);
-				self.surface_errors(vec![*e]);
+				self.surface_one(e);
 			}
 		}
 
@@ -640,6 +651,11 @@ impl CacheState {
 	// shut down). For now errors are surfaced best-effort.
 	fn surface_errors(&self, errors: Vec<CacheError>) {
 		let _ = self.msg_sender.try_send(vec![CacheMessage::Error(errors)]);
+	}
+
+	/// Surface a single boxed error — the common `surface_errors(vec![*e])` shape unboxed once.
+	fn surface_one(&self, e: Box<CacheError>) {
+		self.surface_errors(vec![*e]);
 	}
 
 	/// Apply one decoded event to the cache. Every branch must be idempotent (the drain may re-apply
@@ -1146,7 +1162,7 @@ impl CacheState {
 	/// Run the write-locked resync, surfacing any error to the main thread.
 	async fn run_resync_surfacing_errors(&mut self) {
 		if let Err(e) = self.run_resync().await {
-			self.surface_errors(vec![*e]);
+			self.surface_one(e);
 		}
 	}
 
@@ -1155,7 +1171,7 @@ impl CacheState {
 	/// { surface_errors(vec![*e]) }` shape recurs across the drain/resync paths; this names it.
 	fn mark_needs_resync_surfacing_errors(&self) {
 		if let Err(e) = self.mark_needs_resync() {
-			self.surface_errors(vec![*e]);
+			self.surface_one(e);
 		}
 	}
 
@@ -1172,7 +1188,24 @@ impl CacheState {
 			ResyncProgress::Finished { converged: false },
 		);
 		if arm_retry {
-			self.resync_retry = Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL);
+			self.arm_resync_retry();
+		}
+	}
+
+	/// Arm a one-shot resync re-attempt after [`RESYNC_RETRY_INTERVAL`].
+	fn arm_resync_retry(&mut self) {
+		self.resync_retry = Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL);
+	}
+
+	/// Schedule a resync re-attempt iff this attempt did NOT converge, else clear any pending one. A
+	/// non-converged attempt must self-arm: on a QUIET account (no events to trigger the next drain) a
+	/// pending resync would otherwise sit until some unrelated event — e.g. a freshly added root
+	/// staying unpopulated indefinitely.
+	fn schedule_retry_if_unconverged(&mut self, converged: bool) {
+		if converged {
+			self.resync_retry = None;
+		} else {
+			self.arm_resync_retry();
 		}
 	}
 
@@ -1324,7 +1357,7 @@ impl CacheState {
 			(Some(ack), result) => {
 				let _ = ack.send(result);
 			}
-			(None, Err(e)) => self.surface_errors(vec![*e]),
+			(None, Err(e)) => self.surface_one(e),
 			(None, Ok(_)) => {}
 		}
 	}
@@ -1577,7 +1610,7 @@ impl CacheState {
 				self.run_resync_surfacing_errors().await;
 			}
 			Ok(false) => {}
-			Err(e) => self.surface_errors(vec![*e]),
+			Err(e) => self.surface_one(e),
 		}
 	}
 
@@ -1631,7 +1664,7 @@ impl CacheState {
 			// rather than skip — a needless full listing is far cheaper than silently missing a gap.
 			Err(e) => {
 				log::warn!("startup gap-check failed to read cache state; resyncing to be safe");
-				self.surface_errors(vec![*e]);
+				self.surface_one(e);
 				self.run_resync_surfacing_errors().await;
 			}
 		}
@@ -1696,7 +1729,7 @@ impl CacheState {
 						// The watermark write failed; keep the durable flag set (best-effort —
 						// it is the same DB) so the armed retry actually re-fires this session,
 						// matching the listing-failure arm below.
-						self.surface_errors(vec![*e]);
+						self.surface_one(e);
 						self.mark_needs_resync_surfacing_errors();
 						false
 					}
@@ -1711,11 +1744,7 @@ impl CacheState {
 				}
 			};
 			Self::send_resync_progress(&self.msg_sender, ResyncProgress::Finished { converged });
-			self.resync_retry = if converged {
-				None
-			} else {
-				Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL)
-			};
+			self.schedule_retry_if_unconverged(converged);
 			return Ok(());
 		}
 
@@ -1770,10 +1799,7 @@ impl CacheState {
 						return Ok(());
 					},
 					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
-						match read_task {
-							Some(task) => serve_read_task(task, &self.db),
-							None => self.read_tasks = None,
-						}
+						handle_read_task(read_task, &mut self.read_tasks, &self.db);
 					},
 				}
 			}
@@ -1903,10 +1929,7 @@ impl CacheState {
 					biased;
 					listing = &mut island => break listing,
 					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {
-						match read_task {
-							Some(task) => serve_read_task(task, &self.db),
-							None => self.read_tasks = None,
-						}
+						handle_read_task(read_task, &mut self.read_tasks, &self.db);
 					},
 				}
 			}
@@ -1935,14 +1958,7 @@ impl CacheState {
 		// pending".
 		let converged = result.is_ok() && matches!(self.needs_resync(), Ok(false));
 		Self::send_resync_progress(&self.msg_sender, ResyncProgress::Finished { converged });
-		// A non-converged attempt schedules its own re-attempt: without the timer, a pending
-		// resync on a QUIET account (no events to trigger the next drain) would sit until the
-		// next unrelated event — e.g. a freshly added root staying unpopulated indefinitely.
-		self.resync_retry = if converged {
-			None
-		} else {
-			Some(TimerInstant::now() + RESYNC_RETRY_INTERVAL)
-		};
+		self.schedule_retry_if_unconverged(converged);
 		result
 	}
 

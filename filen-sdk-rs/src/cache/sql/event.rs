@@ -34,6 +34,25 @@ fn db_err(error: rusqlite::Error, context: &str) -> Box<CacheError> {
 	Box::new(CacheError::db(error, context.to_string()))
 }
 
+/// Write the contiguous-prefix watermark to `cache_meta` on `conn` (a bare connection OR an open
+/// transaction — `Transaction` derefs to `Connection`). The `u64 → i64` SQLite-boundary cast lives
+/// here, once. The caller wraps the error with its own `db_err` context.
+fn set_watermark_on(conn: &rusqlite::Connection, id: u64) -> rusqlite::Result<usize> {
+	conn.execute(
+		super::statements::CACHE_META_SET,
+		params![super::statements::WATERMARK_KEY, id as i64],
+	)
+}
+
+/// Write the durable `needs_resync` flag (`on as i64`) to `cache_meta` on `conn`. The caller wraps
+/// the error with its own `db_err` context.
+fn set_needs_resync_on(conn: &rusqlite::Connection, on: bool) -> rusqlite::Result<usize> {
+	conn.execute(
+		super::statements::CACHE_META_SET,
+		params![super::statements::NEEDS_RESYNC_KEY, on as i64],
+	)
+}
+
 impl CacheState {
 	/// Persist ONE event to the durable `events` store. `INSERT OR IGNORE` drops an at-least-once
 	/// redelivery of the same `drive_message_id`; synthetic events (`id: None`) are exempt from the dedup
@@ -240,18 +259,12 @@ impl CacheState {
 		};
 		let conn: &rusqlite::Connection = tx.as_deref().unwrap_or(&self.db);
 		if let Some(id) = new_watermark {
-			conn.execute(
-				super::statements::CACHE_META_SET,
-				params![super::statements::WATERMARK_KEY, id as i64],
-			)
-			.map_err(|e| db_err(e, "advancing watermark in drain commit"))?;
+			set_watermark_on(conn, id)
+				.map_err(|e| db_err(e, "advancing watermark in drain commit"))?;
 		}
 		if mark_resync {
-			conn.execute(
-				super::statements::CACHE_META_SET,
-				params![super::statements::NEEDS_RESYNC_KEY, 1_i64],
-			)
-			.map_err(|e| db_err(e, "recording needs_resync in drain commit"))?;
+			set_needs_resync_on(conn, true)
+				.map_err(|e| db_err(e, "recording needs_resync in drain commit"))?;
 		}
 		// Delete every consumed row in ONE statement instead of a per-seq loop. The seqs are i64 rowids
 		// read from `events` (never user input), so an inline IN-list is injection-safe and avoids the
@@ -314,19 +327,10 @@ impl CacheState {
 			.db
 			.transaction()
 			.map_err(|e| db_err(e, "begin resync-commit transaction"))?;
-		tx.execute(
-			super::statements::CACHE_META_SET,
-			params![super::statements::WATERMARK_KEY, remote_under_lock as i64],
-		)
-		.map_err(|e| db_err(e, "advancing watermark in resync commit"))?;
-		tx.execute(
-			super::statements::CACHE_META_SET,
-			params![
-				super::statements::NEEDS_RESYNC_KEY,
-				if mark_resync { 1_i64 } else { 0_i64 }
-			],
-		)
-		.map_err(|e| db_err(e, "writing needs_resync in resync commit"))?;
+		set_watermark_on(&tx, remote_under_lock)
+			.map_err(|e| db_err(e, "advancing watermark in resync commit"))?;
+		set_needs_resync_on(&tx, mark_resync)
+			.map_err(|e| db_err(e, "writing needs_resync in resync commit"))?;
 		tx.commit()
 			.map_err(|e| db_err(e, "committing resync batch"))?;
 		Ok(())
