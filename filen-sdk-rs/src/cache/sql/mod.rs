@@ -20,10 +20,14 @@ mod membership;
 mod root;
 mod statements;
 
-// Per-transaction batch size for `execute_chunked`: large enough to amortise the per-commit (WAL
-// fsync) overhead, small enough that one chunk is not a giant long-held write transaction on mobile
-// storage.
-pub(crate) const CHUNK_SIZE: usize = 10_000;
+// Per-transaction row budget (the commit / WAL-fsync granularity for bulk applies). Benchmarked:
+// raising this from 10k to 50k cut a 166k-item populate's apply by ~19% (fewer commits); past 50k
+// there is no further apply gain. It does shift some cost to the end-of-resync `wal_checkpoint`
+// (a larger WAL to fold), so the net is smaller than the apply delta alone. The longer-held write
+// transaction during a bulk populate is acceptable for this cache (a populate is
+// server-reconstructible; the DB is per-device, so the write lock is uncontended). `bulk.rs`
+// requires CHUNK_SIZE to be a multiple of its `MULTI_ROW_CHUNK`.
+pub(crate) const CHUNK_SIZE: usize = 50_000;
 
 impl CacheState {
 	/// Run `for_chunk` over `items` in `CHUNK_SIZE` batches, each batch in its OWN transaction (so a huge
@@ -59,30 +63,20 @@ impl CacheState {
 		&mut self,
 		dirs: impl Iterator<Item = impl Borrow<CacheableDir<'a>>>,
 	) -> rusqlite::Result<()> {
-		let root_id = self.root_id;
-		self.execute_chunked(dirs, |transaction, chunk| {
-			// `execute_chunked` bounds each transaction at `CHUNK_SIZE`; within it, sub-batch by the
-			// multi-row parameter cap and apply each sub-batch as one prepared statement per table.
-			let batch: Vec<_> = chunk.collect();
-			for sub in batch.chunks(bulk::MULTI_ROW_CHUNK) {
-				bulk::bulk_upsert_dirs(transaction, sub, root_id)?;
-			}
-			Ok(())
-		})
+		// `bulk_upsert_dirs` owns the transaction + sub-batch chunking (it holds the full-size
+		// prepared statements across sub-batches, which needs `&Connection`, not a `&mut`-borrowed
+		// `Transaction`). It is NESTING-AWARE: when the caller already holds a transaction (the
+		// resync apply chunk, the drain) it runs the sub-batches on it directly.
+		let dirs: Vec<_> = dirs.collect();
+		bulk::bulk_upsert_dirs(&self.db, &dirs, self.root_id)
 	}
 
 	pub(crate) fn upsert_files<'a>(
 		&mut self,
 		files: impl Iterator<Item = impl Borrow<CacheableFile<'a>>>,
 	) -> rusqlite::Result<()> {
-		let root_id = self.root_id;
-		self.execute_chunked(files, |transaction, chunk| {
-			let batch: Vec<_> = chunk.collect();
-			for sub in batch.chunks(bulk::MULTI_ROW_CHUNK) {
-				bulk::bulk_upsert_files(transaction, sub, root_id)?;
-			}
-			Ok(())
-		})
+		let files: Vec<_> = files.collect();
+		bulk::bulk_upsert_files(&self.db, &files, self.root_id)
 	}
 
 	pub(crate) fn delete_items(
