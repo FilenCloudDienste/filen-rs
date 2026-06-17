@@ -57,6 +57,27 @@ pub(crate) enum GuardReason {
 	/// The local scan did not complete, so apparent deletions may be phantom (an unmounted root,
 	/// an unreadable subtree). All deletions are held unconditionally.
 	ScanIncomplete,
+	/// First sync of the pair (empty baseline): with no established sync relationship, a
+	/// "deletion" is really a pre-existing destination item the source happens to lack — not a
+	/// propagated removal. Held so a first sync against a non-empty destination cannot wipe it
+	/// (the locked "start from an empty destination" expectation; surfaced rather than silently
+	/// destroyed).
+	FirstSyncWithDeletions { deletions: usize },
+	/// The remote view has never converged (the cache snapshot carries no watermark), so its
+	/// apparent emptiness is untrustworthy — a "remote deletion" may just be an un-observed item.
+	/// Held until the cache converges at least once.
+	RemoteUnconverged { deletions: usize },
+	/// The remote view came back COMPLETELY empty while the baseline still tracks remote items,
+	/// and this pass would delete MORE THAN ONE of them. A converged-but-empty listing is exactly
+	/// what a transient backend/cache fault looks like (the cache logs "every sync root listed
+	/// EMPTY but the cache holds N item(s)" and converges to that), and a small pair sails under
+	/// the volume threshold, so the wipe would apply unchallenged. In effect the volume floor
+	/// drops to one item while the remote lists nothing at all.
+	///
+	/// Deleting the last remaining item is deliberately NOT held: an empty remote is the normal,
+	/// permanent end state of that deletion, so holding it would never release and the pair would
+	/// keep the local copy forever.
+	RemoteEmptied { deletions: usize },
 	/// The deletion count exceeded the configured limit for the tracked-item count.
 	ExceededThreshold { deletions: usize, limit: usize },
 }
@@ -69,13 +90,30 @@ pub(crate) struct GuardDecision {
 	pub(crate) reason: Option<GuardReason>,
 }
 
-/// Screen a plan: hold its deletions if the scan was incomplete or the deletion volume exceeds the
-/// guard's limit; otherwise pass everything through. `tracked` is how many items the pair's
-/// baseline currently holds (the denominator for the ratio).
+/// Inputs to [`screen`] describing how trustworthy this pass's state is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScreenState {
+	/// The local scan finished without errors (a partial scan must not be read as deletions).
+	pub(crate) scan_complete: bool,
+	/// The remote view has converged at least once (the cache snapshot carried a watermark).
+	pub(crate) remote_converged: bool,
+	/// The remote view holds NO items at all while the baseline still tracks at least one item
+	/// with a remote uuid — an all-empty listing that would delete the whole pair.
+	pub(crate) remote_emptied: bool,
+	// (see `GuardReason::RemoteEmptied`: a one-item pair's last deletion is still released)
+	/// This is the pair's first sync (the baseline is empty — no established relationship).
+	pub(crate) first_sync: bool,
+	/// How many items the pair's baseline currently tracks (the ratio denominator).
+	pub(crate) tracked: usize,
+}
+
+/// Screen a plan: hold its deletions when the pass's state is not trustworthy enough to act on
+/// them (incomplete scan, first sync against a non-empty destination, un-converged or wholly empty
+/// remote) or the deletion volume exceeds the guard's limit; otherwise pass everything through. Non-destructive
+/// actions (creates/transfers) always proceed.
 pub(crate) fn screen(
 	actions: Vec<SyncAction>,
-	scan_complete: bool,
-	tracked: usize,
+	state: ScreenState,
 	guard: DeleteGuard,
 ) -> GuardDecision {
 	let deletions = actions.iter().filter(|a| a.is_delete()).count();
@@ -87,10 +125,16 @@ pub(crate) fn screen(
 		};
 	}
 
-	let reason = if !scan_complete {
+	let reason = if !state.scan_complete {
 		Some(GuardReason::ScanIncomplete)
+	} else if state.first_sync {
+		Some(GuardReason::FirstSyncWithDeletions { deletions })
+	} else if !state.remote_converged {
+		Some(GuardReason::RemoteUnconverged { deletions })
+	} else if state.remote_emptied && deletions > 1 {
+		Some(GuardReason::RemoteEmptied { deletions })
 	} else {
-		let limit = guard.limit(tracked);
+		let limit = guard.limit(state.tracked);
 		if deletions > limit {
 			Some(GuardReason::ExceededThreshold { deletions, limit })
 		} else {
@@ -133,10 +177,22 @@ mod tests {
 		}
 	}
 
+	/// An established, converged, completed-scan state with `tracked` baseline items — the normal
+	/// steady-state in which the volume threshold is the only thing that can hold deletions.
+	fn established(tracked: usize) -> ScreenState {
+		ScreenState {
+			scan_complete: true,
+			remote_converged: true,
+			remote_emptied: false,
+			first_sync: false,
+			tracked,
+		}
+	}
+
 	#[test]
 	fn passes_everything_when_under_the_limit_and_scan_complete() {
 		let actions = vec![upload("a"), del("b")];
-		let decision = screen(actions, true, 100, DeleteGuard::default());
+		let decision = screen(actions, established(100), DeleteGuard::default());
 		assert_eq!(decision.safe.len(), 2);
 		assert!(decision.held.is_empty());
 		assert!(decision.reason.is_none());
@@ -147,10 +203,85 @@ mod tests {
 		// Even a single deletion is held if the scan could not be trusted — but non-destructive
 		// actions still pass.
 		let actions = vec![upload("keep"), del("a"), del("b")];
-		let decision = screen(actions, false, 10_000, DeleteGuard::default());
+		let state = ScreenState {
+			scan_complete: false,
+			..established(10_000)
+		};
+		let decision = screen(actions, state, DeleteGuard::default());
 		assert_eq!(decision.reason, Some(GuardReason::ScanIncomplete));
 		assert_eq!(decision.safe, vec![upload("keep")]);
 		assert_eq!(decision.held.len(), 2, "both deletions held");
+	}
+
+	#[test]
+	fn holds_deletions_on_first_sync_so_a_populated_destination_is_not_wiped() {
+		// Empty baseline (first sync): a "deletion" is a pre-existing destination item, not a
+		// propagated removal. Held + surfaced; the upload still proceeds.
+		let actions = vec![upload("mine"), del("theirs")];
+		let state = ScreenState {
+			first_sync: true,
+			tracked: 0,
+			..established(0)
+		};
+		let decision = screen(actions, state, DeleteGuard::default());
+		assert_eq!(
+			decision.reason,
+			Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+		);
+		assert_eq!(
+			decision.safe,
+			vec![upload("mine")],
+			"additive action still applies"
+		);
+		assert_eq!(decision.held.len(), 1);
+	}
+
+	#[test]
+	fn holds_deletions_when_the_remote_has_never_converged() {
+		// A non-first sync (baseline exists) but the cache snapshot has no watermark: its emptiness
+		// is untrustworthy, so deletions are held until it converges.
+		let actions = vec![del("maybe_gone")];
+		let state = ScreenState {
+			remote_converged: false,
+			..established(5)
+		};
+		let decision = screen(actions, state, DeleteGuard::default());
+		assert_eq!(
+			decision.reason,
+			Some(GuardReason::RemoteUnconverged { deletions: 1 })
+		);
+		assert_eq!(decision.held.len(), 1);
+	}
+
+	#[test]
+	fn holds_deletions_when_the_whole_remote_view_came_back_empty() {
+		// A converged snapshot with zero items while the baseline still tracks remote ones: a
+		// small pair's wipe (2 deletions) is under the volume floor, so only this reason stops it.
+		let actions = vec![del("a"), del("b")];
+		let state = ScreenState {
+			remote_emptied: true,
+			..established(2)
+		};
+		let decision = screen(actions, state, DeleteGuard::default());
+		assert_eq!(
+			decision.reason,
+			Some(GuardReason::RemoteEmptied { deletions: 2 })
+		);
+		assert_eq!(decision.held.len(), 2, "the whole pair is held");
+	}
+
+	#[test]
+	fn an_emptied_remote_still_releases_a_single_deletion() {
+		// Deleting the last item legitimately empties the remote, and that emptiness is permanent:
+		// holding it would never release and the local copy would survive the deletion forever.
+		let actions = vec![del("only")];
+		let state = ScreenState {
+			remote_emptied: true,
+			..established(1)
+		};
+		let decision = screen(actions, state, DeleteGuard::default());
+		assert!(decision.reason.is_none(), "{:?}", decision.reason);
+		assert_eq!(decision.safe.len(), 1);
 	}
 
 	#[test]
@@ -158,7 +289,7 @@ mod tests {
 		// 30 deletions against 20 tracked exceeds max(floor=10, 0.5*20=10) = 10.
 		let mut actions: Vec<_> = (0..30).map(|i| del(&format!("d{i}"))).collect();
 		actions.push(upload("safe"));
-		let decision = screen(actions, true, 20, DeleteGuard::default());
+		let decision = screen(actions, established(20), DeleteGuard::default());
 		assert_eq!(
 			decision.reason,
 			Some(GuardReason::ExceededThreshold {
@@ -175,7 +306,7 @@ mod tests {
 		// The regression the old floor=100 missed: deleting ALL 20 files of a 20-item sync must
 		// trip the guard (max(10, 0.5*20=10) = 10; 20 > 10), not silently trash everything.
 		let actions: Vec<_> = (0..20).map(|i| del(&format!("f{i}"))).collect();
-		let decision = screen(actions, true, 20, DeleteGuard::default());
+		let decision = screen(actions, established(20), DeleteGuard::default());
 		assert_eq!(
 			decision.reason,
 			Some(GuardReason::ExceededThreshold {
@@ -190,7 +321,7 @@ mod tests {
 	fn allows_a_small_routine_deletion() {
 		// Deleting a handful (<= floor) never prompts, even if it is a high fraction of a tiny tree.
 		let actions = vec![del("a"), del("b"), upload("c")];
-		let decision = screen(actions, true, 3, DeleteGuard::default());
+		let decision = screen(actions, established(3), DeleteGuard::default());
 		assert!(decision.reason.is_none(), "2 deletions is below the floor");
 		assert_eq!(decision.safe.len(), 3);
 	}
@@ -199,7 +330,7 @@ mod tests {
 	fn ratio_raises_the_limit_for_large_trees() {
 		// 200 deletions against 1000 tracked items: limit = max(10, 0.5*1000) = 500 -> allowed.
 		let actions: Vec<_> = (0..200).map(|i| del(&format!("d{i}"))).collect();
-		let decision = screen(actions, true, 1000, DeleteGuard::default());
+		let decision = screen(actions, established(1000), DeleteGuard::default());
 		assert!(decision.reason.is_none(), "within the ratio limit");
 		assert_eq!(decision.safe.len(), 200);
 	}
@@ -208,14 +339,18 @@ mod tests {
 	fn unlimited_guard_never_trips_on_volume_but_still_honors_an_incomplete_scan() {
 		let actions: Vec<_> = (0..10_000).map(|i| del(&format!("d{i}"))).collect();
 		assert!(
-			screen(actions, true, 1, DeleteGuard::unlimited())
+			screen(actions, established(1), DeleteGuard::unlimited())
 				.reason
 				.is_none()
 		);
 
 		let actions = vec![del("a")];
+		let state = ScreenState {
+			scan_complete: false,
+			..established(1)
+		};
 		assert_eq!(
-			screen(actions, false, 1, DeleteGuard::unlimited()).reason,
+			screen(actions, state, DeleteGuard::unlimited()).reason,
 			Some(GuardReason::ScanIncomplete),
 			"unlimited still refuses deletions from an incomplete scan"
 		);
