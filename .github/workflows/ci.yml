@@ -53,7 +53,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run clippy all features
-        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run clippy single-threaded
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
       - name: Run clippy
@@ -75,7 +75,7 @@ jobs:
       - name: Run sqlfluff
         run: sqlfluff lint .
       - name: Run unit tests
-        run: cargo test --lib -F cache --no-fail-fast
+        run: cargo test --lib -F cache,sync-engine --no-fail-fast
         env:
           TEST_EMAIL: 'test@filen.io'
           TEST_PASSWORD: 'testpassword'
@@ -116,7 +116,7 @@ jobs:
           choco install nasm --no-progress
           echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - name: Run clippy all features
-        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run clippy single-threaded
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
       - name: Run clippy
@@ -126,7 +126,7 @@ jobs:
       - name: Run clippy on tests with cache
         run: cargo clippy --tests -F cache -- -D warnings
       - name: Run unit tests
-        run: cargo test --lib -F cache --no-fail-fast
+        run: cargo test --lib -F cache,sync-engine --no-fail-fast
         env:
           TEST_EMAIL: 'test@filen.io'
           TEST_PASSWORD: 'testpassword'
@@ -181,7 +181,7 @@ jobs:
         # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked.
         run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy all features
-        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
+        run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run clippy single-threaded
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
       - name: Run clippy
@@ -196,7 +196,7 @@ jobs:
         # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked.
         run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache -- -D warnings
       - name: Run unit tests
-        run: cargo test --lib -F cache --no-fail-fast
+        run: cargo test --lib -F cache,sync-engine --no-fail-fast
         env:
           TEST_EMAIL: 'test@filen.io'
           TEST_PASSWORD: 'testpassword'
