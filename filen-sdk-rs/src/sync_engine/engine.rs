@@ -1,11 +1,8 @@
-//! The engine orchestration: register pairs and compute a guarded sync plan for one.
+//! The engine orchestration: register pairs, plan a pass (read-only), and run one (plan + apply).
 //!
-//! `plan_pair` runs the whole read-only half of a sync pass — load the baseline, scan the local
-//! tree (with the fast-path), enumerate the remote subtree from the cache, build the remote view,
-//! reconcile, and screen the result through the mass-delete guard — and returns the ordered,
-//! safe-to-apply actions plus anything held back (deletions over the guard, surfaced conflicts) or
-//! a refusal (a name collision that makes a 1:1 mapping impossible). Executing the plan against the
-//! network is the apply layer, layered on top of this.
+//! `prepare` runs the read-only half — load the baseline, scan the local tree (fast-path),
+//! enumerate the remote subtree from the cache, build the remote view — shared by `plan_pair` (a
+//! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
@@ -14,12 +11,15 @@ use uuid::Uuid;
 
 use super::{
 	SyncMode,
-	baseline::{BaselineEntry, BaselineStore, PairId},
+	apply::{self, ApplyContext, SyncReport},
+	baseline::{BaselineEntry, BaselineStore, PairId, PairRecord},
 	guard::{self, DeleteGuard, GuardReason},
-	plan::{self, SyncAction},
-	scan::{self, ScanError},
+	plan::{self, RemoteView, SyncAction},
+	scan::{self, LocalScan, ScanError},
 };
-use crate::{Error, ErrorKind, auth::Client};
+use crate::{
+	Error, ErrorKind, auth::Client, fs::dir::cache::CacheableDir, fs::file::cache::CacheableFile,
+};
 
 /// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus the
 /// per-pair baseline store.
@@ -28,38 +28,39 @@ pub struct SyncEngine {
 	store: Mutex<BaselineStore>,
 }
 
-/// Why the engine refused to plan a pass (rather than producing a partial plan).
+/// Why the engine refused to act on a pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefuseReason {
-	/// Two remote items resolve to the same case-insensitive path — a 1:1 local mapping is
-	/// impossible; the user must rename one.
+	/// Two remote items resolve to the same case-insensitive path.
 	RemoteCollision,
 	/// Two local items normalize to the same path.
 	LocalCollision,
 }
 
-/// The outcome of planning one pass.
-#[derive(Debug)]
-pub(crate) enum PlanOutcome {
-	/// A name collision blocks reconciliation until the user resolves it.
-	Refused(RefuseReason),
-	/// The reconciled, guard-screened plan.
-	Planned(SyncPlan),
+/// The read-only inputs to a pass, shared by planning and applying.
+struct Prepared {
+	record: PairRecord,
+	baseline: Arc<HashMap<String, BaselineEntry>>,
+	local_scan: LocalScan,
+	remote_view: RemoteView,
+	/// Whether the cache's remote view has converged at least once (the snapshot carried a
+	/// watermark). When false, the snapshot's emptiness is untrustworthy and remote-driven
+	/// deletions are held by the guard.
+	remote_converged: bool,
+	dirs: Vec<CacheableDir<'static>>,
+	files: Vec<CacheableFile<'static>>,
 }
 
-/// The result of reconciling + screening one pass.
+/// The outcome of `plan_pair` (a dry run).
 #[derive(Debug)]
-pub(crate) struct SyncPlan {
-	/// Ordered actions safe to apply now (creates/transfers, plus deletions within the guard).
-	pub(crate) actions: Vec<SyncAction>,
-	/// Deletions the guard held back (with [`guard_reason`](Self::guard_reason) set).
-	pub(crate) held_deletions: Vec<SyncAction>,
-	/// Relative paths surfaced as two-way conflicts (left untouched for the caller to resolve).
-	pub(crate) conflicts: Vec<String>,
-	/// Set when the guard held deletions.
-	pub(crate) guard_reason: Option<GuardReason>,
-	/// The remote watermark at the snapshot instant, for aligning a future live event stream.
-	pub(crate) watermark: Option<u64>,
+pub(crate) enum PlanOutcome {
+	Refused(RefuseReason),
+	Planned {
+		actions: Vec<SyncAction>,
+		held_deletions: Vec<SyncAction>,
+		conflicts: Vec<String>,
+		guard_reason: Option<GuardReason>,
+	},
 }
 
 impl SyncEngine {
@@ -71,13 +72,7 @@ impl SyncEngine {
 			.map_err(|e| {
 				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
 			})?
-			.map_err(|e| {
-				Error::custom_with_source(
-					ErrorKind::Internal,
-					e,
-					Some("opening the sync baseline DB".to_string()),
-				)
-			})?;
+			.map_err(|e| db_error(e, "opening the sync baseline DB"))?;
 		Ok(Self {
 			client,
 			store: Mutex::new(store),
@@ -85,39 +80,54 @@ impl SyncEngine {
 	}
 
 	/// Register a sync pair (idempotent for the same `(local_root, remote_root)`), returning its id.
-	/// The `remote_root` must be a sync root the cache covers (the engine reads its subtree from the
-	/// cache).
+	/// `remote_root` must be a sync-rooted SUBFOLDER the cache covers (not the account root).
+	///
+	/// `local_root` must already EXIST and be a directory; it is canonicalized before being stored,
+	/// so the pair's identity (and the write-confinement anchor) is symlink-stable. A missing or
+	/// non-directory root is rejected here rather than surfacing a pass later as an
+	/// incomplete-scan guard hold with every deletion withheld.
 	pub async fn add_pair(
 		&self,
 		local_root: PathBuf,
 		remote_root: Uuid,
 		mode: SyncMode,
 	) -> Result<PairId, Error> {
+		let local_root = std::fs::canonicalize(&local_root).map_err(|error| {
+			Error::custom_with_source(
+				ErrorKind::IO,
+				error,
+				Some(format!(
+					"sync pair local root {local_root:?} cannot be resolved"
+				)),
+			)
+		})?;
+		if !local_root.is_dir() {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!("sync pair local root {local_root:?} is not a directory"),
+			));
+		}
 		let local = local_root.to_string_lossy().into_owned();
 		self.store
 			.lock()
 			.await
 			.create_pair(&local, remote_root, mode)
-			.map_err(|e| {
-				Error::custom_with_source(
-					ErrorKind::Internal,
-					e,
-					Some("registering a sync pair".to_string()),
-				)
-			})
+			.map_err(|e| db_error(e, "registering a sync pair"))
 	}
 
-	/// Compute the guarded plan for one pass over `pair` — the read-only half of a sync.
-	pub(crate) async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let store = self.store.lock().await;
-		let record = store
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
-		let baseline_entries = store
-			.entries(pair)
-			.map_err(|e| db_error(e, "loading the baseline"))?;
-		drop(store);
+	/// Run the read-only half: load the baseline, scan, enumerate the remote, build the view.
+	async fn prepare(&self, pair: PairId) -> Result<Prepared, Error> {
+		let (record, baseline_entries) = {
+			let store = self.store.lock().await;
+			let record = store
+				.pair(pair)
+				.map_err(|e| db_error(e, "loading the sync pair"))?
+				.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+			let entries = store
+				.entries(pair)
+				.map_err(|e| db_error(e, "loading the baseline"))?;
+			(record, entries)
+		};
 
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(
 			baseline_entries
@@ -126,7 +136,6 @@ impl SyncEngine {
 				.collect(),
 		);
 
-		// Local scan (blocking FS + hashing) off the async runtime.
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
 		let local_scan =
@@ -136,55 +145,127 @@ impl SyncEngine {
 					Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}"))
 				})?;
 
-		if local_scan
-			.errors
-			.iter()
-			.any(|e| matches!(e, ScanError::DuplicateName { .. }))
-		{
-			return Ok(PlanOutcome::Refused(RefuseReason::LocalCollision));
-		}
-
-		// Remote view from the cache snapshot of this root's subtree.
 		let snapshot = self
 			.client
 			.enumerate_sync_root_snapshot(record.remote_root)
 			.await?;
 		let remote_view =
 			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
-		if remote_view.has_collisions {
-			return Ok(PlanOutcome::Refused(RefuseReason::RemoteCollision));
+
+		Ok(Prepared {
+			record,
+			baseline,
+			local_scan,
+			remote_view,
+			remote_converged: snapshot.watermark.is_some(),
+			dirs: snapshot.dirs,
+			files: snapshot.files,
+		})
+	}
+
+	/// Reconcile + guard-screen a pass without applying it (a dry run).
+	pub(crate) async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
+		let prep = self.prepare(pair).await?;
+		if let Some(refusal) = refusal(&prep) {
+			return Ok(PlanOutcome::Refused(refusal));
 		}
-
-		let all_actions = plan::reconcile(
-			record.mode,
-			&baseline,
-			&local_scan.nodes,
-			&remote_view.nodes,
-		);
-
-		// Conflicts are reported, not executed; everything else goes through the guard.
-		let (conflict_actions, executable): (Vec<_>, Vec<_>) = all_actions
-			.into_iter()
-			.partition(|a| matches!(a, SyncAction::Conflict { .. }));
-		let conflicts = conflict_actions
-			.into_iter()
-			.map(|a| a.rel_path().to_string())
-			.collect();
-
-		let decision = guard::screen(
-			executable,
-			local_scan.complete,
-			baseline.len(),
-			DeleteGuard::default(),
-		);
-
-		Ok(PlanOutcome::Planned(SyncPlan {
+		let (conflicts, decision) = reconcile_and_screen(&prep);
+		Ok(PlanOutcome::Planned {
 			actions: decision.safe,
 			held_deletions: decision.held,
 			conflicts,
 			guard_reason: decision.reason,
-			watermark: snapshot.watermark,
-		}))
+		})
+	}
+
+	/// Run one full sync pass: plan, screen, and apply against the remote and local tree.
+	pub async fn sync_once(&self, pair: PairId) -> Result<SyncReport, Error> {
+		let prep = self.prepare(pair).await?;
+		let mut report = SyncReport::default();
+
+		if let Some(refusal) = refusal(&prep) {
+			report.errors.push(format!(
+				"refused: name collision ({refusal:?}); resolve it and retry"
+			));
+			return Ok(report);
+		}
+
+		let (conflicts, decision) = reconcile_and_screen(&prep);
+		report.conflicts = conflicts;
+		report.held_deletions = decision.held.len();
+		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
+
+		if decision.safe.is_empty() {
+			return Ok(report);
+		}
+
+		// Resolve the sync root to a remote directory (every top-level parent). Errors if the root
+		// is not a reachable subfolder.
+		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
+
+		let local_root = PathBuf::from(&prep.record.local_root);
+		let ctx = ApplyContext {
+			client: &self.client,
+			local_root: &local_root,
+			pair,
+			store: &self.store,
+			local: &prep.local_scan.nodes,
+			remote: &prep.remote_view.nodes,
+			root_remote,
+			dirs: &prep.dirs,
+			files: &prep.files,
+		};
+		apply::apply(ctx, decision.safe, &mut report).await;
+		Ok(report)
+	}
+}
+
+/// A name collision (local or remote) makes a 1:1 mapping impossible — refuse the pass.
+fn refusal(prep: &Prepared) -> Option<RefuseReason> {
+	if prep
+		.local_scan
+		.errors
+		.iter()
+		.any(|e| matches!(e, ScanError::DuplicateName { .. }))
+	{
+		return Some(RefuseReason::LocalCollision);
+	}
+	if prep.remote_view.has_collisions {
+		return Some(RefuseReason::RemoteCollision);
+	}
+	None
+}
+
+/// Reconcile the prepared inputs and screen deletions through the guard, splitting out conflicts.
+fn reconcile_and_screen(prep: &Prepared) -> (Vec<String>, guard::GuardDecision) {
+	let all_actions = plan::reconcile(
+		prep.record.mode,
+		&prep.baseline,
+		&prep.local_scan.nodes,
+		&prep.remote_view.nodes,
+	);
+	let (conflict_actions, executable): (Vec<_>, Vec<_>) = all_actions
+		.into_iter()
+		.partition(|a| matches!(a, SyncAction::Conflict { .. }));
+	let conflicts = conflict_actions
+		.into_iter()
+		.map(|a| a.rel_path().to_string())
+		.collect();
+	let decision = guard::screen(executable, screen_state(prep), DeleteGuard::default());
+	(conflicts, decision)
+}
+
+/// How trustworthy this pass's inputs are, for the guard.
+fn screen_state(prep: &Prepared) -> guard::ScreenState {
+	guard::ScreenState {
+		scan_complete: prep.local_scan.complete,
+		remote_converged: prep.remote_converged,
+		// A wholly empty remote view while the baseline still tracks remote items: what a
+		// transient backend/cache fault looks like, and it would otherwise delete the whole pair.
+		remote_emptied: prep.remote_view.nodes.is_empty()
+			&& prep.baseline.values().any(|e| e.remote_uuid.is_some()),
+		first_sync: prep.baseline.is_empty(),
+		tracked: prep.baseline.len(),
 	}
 }
 
