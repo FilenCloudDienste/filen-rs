@@ -13,6 +13,7 @@ use filen_sdk_rs::{
 		HasName, HasUUID,
 		categories::{DirType, Normal},
 		dir::RemoteDirectory,
+		file::meta::FileMetaChanges,
 	},
 	sync_engine::{SyncEngine, SyncMode},
 };
@@ -357,6 +358,148 @@ async fn two_way_merges_both_sides_in_one_pass() {
 	assert!(
 		files.contains(&"from_remote.txt".to_string()),
 		"files: {files:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// A local rename is propagated as a remote MOVE (same uuid, no content re-upload), not a
+/// trash + re-upload.
+#[shared_test_runtime]
+async fn local_rename_moves_the_remote_file_in_place() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	assert!(
+		wait_for_converged_resync(
+			&cache.messages,
+			resources.dir.uuid().into(),
+			0,
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await
+	);
+
+	let local = temp_local_dir();
+	std::fs::write(local.join("orig.txt"), b"move me without re-uploading").unwrap();
+
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(
+			local.clone(),
+			resources.dir.uuid().into(),
+			SyncMode::LocalToRemote,
+		)
+		.await
+		.unwrap();
+	assert_eq!(engine.sync_once(pair).await.unwrap().uploaded, 1);
+
+	// Identify the uploaded file's uuid and wait for the cache to observe it.
+	let (_, original_files) = cache
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap();
+	let original = original_files
+		.into_iter()
+		.find(|f| f.name().unwrap() == "orig.txt")
+		.expect("orig.txt uploaded");
+	let original_uuid: Uuid = original.uuid().into();
+	assert!(poll_for_item(cache.db_path(), original_uuid, CACHE_CONVERGE_TIMEOUT).await);
+
+	// Rename it locally, then sync again.
+	std::fs::rename(local.join("orig.txt"), local.join("renamed.txt")).unwrap();
+	let report = engine.sync_once(pair).await.unwrap();
+	assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+	assert_eq!(report.moved_remote, 1, "a local rename is a remote move");
+	assert_eq!(report.uploaded, 0, "content is NOT re-uploaded");
+
+	// The remote shows exactly one file, now renamed.txt, with the SAME uuid (moved in place).
+	let (_, renamed_files) = cache
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap();
+	assert_eq!(renamed_files.len(), 1, "still one file, not a duplicate");
+	assert_eq!(renamed_files[0].name().unwrap(), "renamed.txt");
+	assert_eq!(
+		Uuid::from(renamed_files[0].uuid()),
+		original_uuid,
+		"same uuid — the file was moved, not re-created"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// A remote rename is propagated as a local MOVE (rename on disk), not a delete + re-download.
+#[shared_test_runtime]
+async fn remote_rename_moves_the_local_file_in_place() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+
+	let builder = cache
+		.client
+		.make_file_builder("r_orig.txt", resources.dir.uuid())
+		.unwrap();
+	let mut remote_file = cache
+		.client
+		.upload_file(builder, b"remote move me")
+		.await
+		.unwrap();
+	let uuid: Uuid = remote_file.uuid().into();
+	assert!(poll_for_item(cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await);
+
+	let local = temp_local_dir();
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(
+			local.clone(),
+			resources.dir.uuid().into(),
+			SyncMode::RemoteToLocal,
+		)
+		.await
+		.unwrap();
+	assert_eq!(engine.sync_once(pair).await.unwrap().downloaded, 1);
+	assert!(local.join("r_orig.txt").exists());
+
+	// Rename the file on the remote and wait for the cache to reflect the new name.
+	cache
+		.client
+		.update_file_metadata(
+			&mut remote_file,
+			FileMetaChanges::default().name("r_renamed.txt").unwrap(),
+		)
+		.await
+		.unwrap();
+	assert!(
+		poll_for_file_name(
+			cache.db_path(),
+			uuid,
+			"r_renamed.txt",
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await,
+		"cache should observe the remote rename"
+	);
+
+	let report = engine.sync_once(pair).await.unwrap();
+	assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+	assert_eq!(report.moved_local, 1, "a remote rename is a local move");
+	assert_eq!(report.downloaded, 0, "content is NOT re-downloaded");
+	assert!(!local.join("r_orig.txt").exists(), "old name gone");
+	assert_eq!(
+		std::fs::read(local.join("r_renamed.txt")).unwrap(),
+		b"remote move me",
+		"renamed on disk, content intact"
 	);
 
 	std::fs::remove_dir_all(&local).ok();

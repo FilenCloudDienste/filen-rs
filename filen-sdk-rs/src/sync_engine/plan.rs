@@ -6,7 +6,7 @@
 //! source (`make dst match src`, gated by whether deletions propagate); two-way uses the baseline
 //! to tell which side changed and surfaces a genuine both-sides-changed divergence as a conflict.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use filen_types::crypto::Blake3Hash;
 use unicode_normalization::UnicodeNormalization;
@@ -64,9 +64,23 @@ pub(crate) enum SyncAction {
 	Conflict {
 		rel_path: String,
 	},
+	/// A file moved/renamed on the local side -> re-parent + rename the remote item (uuid kept)
+	/// instead of re-uploading its content.
+	MoveRemote {
+		from_path: String,
+		to_path: String,
+		remote_uuid: Uuid,
+	},
+	/// A file moved/renamed on the remote side -> rename the local file instead of re-downloading.
+	MoveLocal {
+		from_path: String,
+		to_path: String,
+	},
 }
 
 impl SyncAction {
+	/// The path that determines apply ORDER (the destination for a move). Parents sort before
+	/// children, so a create of the destination's parent dir precedes a move into it.
 	pub(super) fn rel_path(&self) -> &str {
 		match self {
 			Self::CreateLocalDir { rel_path }
@@ -76,6 +90,7 @@ impl SyncAction {
 			| Self::UploadFile { rel_path }
 			| Self::TrashRemote { rel_path, .. }
 			| Self::Conflict { rel_path } => rel_path,
+			Self::MoveRemote { to_path, .. } | Self::MoveLocal { to_path, .. } => to_path,
 		}
 	}
 
@@ -452,6 +467,101 @@ fn reconcile_two_way(
 	}
 }
 
+/// Detect file moves/renames so they apply as a single metadata op instead of a re-transfer, and
+/// return the set of paths they consume (excluded from the per-path reconcile). Files only.
+///
+/// - Remote moves are matched by UUID (a server-side move keeps the file's uuid): a baseline file
+///   whose uuid now sits at a different remote path, still unchanged locally, becomes a `MoveLocal`.
+/// - Local moves are matched by content hash: a baseline file gone locally whose content reappears
+///   at a new local path (uniquely — ambiguous content is left to delete+create), with the remote
+///   still holding the original, becomes a `MoveRemote`.
+fn detect_moves(
+	mode: super::SyncMode,
+	baseline: &HashMap<String, BaselineEntry>,
+	local: &HashMap<String, LocalNode>,
+	remote: &HashMap<String, RemoteNode>,
+	actions: &mut Vec<SyncAction>,
+	consumed: &mut HashSet<String>,
+) {
+	if mode.pulls() {
+		let remote_path_of_uuid: HashMap<Uuid, &str> = remote
+			.iter()
+			.filter(|(_, node)| node.kind == NodeKind::File)
+			.map(|(path, node)| (node.remote_uuid, path.as_str()))
+			.collect();
+		for (from, base) in baseline {
+			if base.kind != NodeKind::File || consumed.contains(from) {
+				continue;
+			}
+			let Some(uuid) = base.remote_uuid else {
+				continue;
+			};
+			if let Some(&to) = remote_path_of_uuid.get(&uuid)
+				&& to != from
+				&& !baseline.contains_key(to)
+				&& local.contains_key(from)
+				&& !local.contains_key(to)
+				&& !consumed.contains(to)
+			{
+				actions.push(SyncAction::MoveLocal {
+					from_path: from.clone(),
+					to_path: to.to_string(),
+				});
+				consumed.insert(from.clone());
+				consumed.insert(to.to_string());
+			}
+		}
+	}
+
+	if mode.pushes() {
+		// Content hash -> the new local paths carrying it (not in baseline, not on the remote).
+		// Keyed by the raw bytes since `Blake3Hash` is not `std::hash::Hash`.
+		let mut created_by_hash: HashMap<[u8; 32], Vec<&str>> = HashMap::new();
+		for (path, node) in local {
+			if node.kind == NodeKind::File
+				&& !baseline.contains_key(path)
+				&& !remote.contains_key(path)
+				&& let Some(hash) = node.content_hash
+			{
+				created_by_hash
+					.entry(*hash.as_ref())
+					.or_default()
+					.push(path.as_str());
+			}
+		}
+		for (from, base) in baseline {
+			if base.kind != NodeKind::File || consumed.contains(from) || local.contains_key(from) {
+				continue;
+			}
+			let (Some(hash), Some(uuid)) = (base.content_hash, base.remote_uuid) else {
+				continue;
+			};
+			// The remote must still hold the original file at `from` for there to be one to move.
+			if remote.get(from).map(|n| n.remote_uuid) != Some(uuid) {
+				continue;
+			}
+			let Some(candidates) = created_by_hash.get(hash.as_ref()) else {
+				continue;
+			};
+			let fresh: Vec<&str> = candidates
+				.iter()
+				.copied()
+				.filter(|to| !consumed.contains(*to) && !remote.contains_key(*to))
+				.collect();
+			// Only an UNAMBIGUOUS match is a move; otherwise fall back to delete + create.
+			if let [to] = fresh[..] {
+				actions.push(SyncAction::MoveRemote {
+					from_path: from.clone(),
+					to_path: to.to_string(),
+					remote_uuid: uuid,
+				});
+				consumed.insert(from.clone());
+				consumed.insert(to.to_string());
+			}
+		}
+	}
+}
+
 /// Reconcile a pair's three inputs into an ordered action plan. `baseline`/`local`/`remote` are all
 /// keyed by the same NFC-normalized relative path.
 pub(crate) fn reconcile(
@@ -461,6 +571,10 @@ pub(crate) fn reconcile(
 	remote: &HashMap<String, RemoteNode>,
 ) -> Vec<SyncAction> {
 	let mut actions = Vec::new();
+	let mut consumed = HashSet::new();
+	// Resolve moves first; their endpoints are then excluded from the per-path reconcile so a move
+	// is never also emitted as a delete + create.
+	detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
 
 	let keys: BTreeSet<&str> = baseline
 		.keys()
@@ -470,6 +584,9 @@ pub(crate) fn reconcile(
 		.collect();
 
 	for key in keys {
+		if consumed.contains(key) {
+			continue;
+		}
 		let base = baseline.get(key);
 		// A surfaced conflict is held until the caller resolves it — never re-acted on.
 		if base.is_some_and(|b| b.state == BaselineState::Conflicted) {
@@ -501,15 +618,44 @@ pub(crate) fn reconcile(
 	actions
 }
 
-/// Order the plan so it applies safely: deletions first, child-before-parent (descending path),
-/// then creates/transfers, parent-before-child (ascending path). A type-flip at one path emits a
-/// trash (delete phase) before its create (create phase), which this ordering preserves.
+/// The apply phase of an action. Lower phases run first. Deletions run LAST so a directory
+/// delete (which cascades server-side / quarantines the whole local subtree) can never destroy a
+/// path that an earlier move/transfer still needs — the move/delete-ordering bug where a directory
+/// rename (move children out + delete the old dir) lost its children because the delete ran first.
+fn action_phase(action: &SyncAction) -> u8 {
+	match action {
+		// Directories that may host a move/transfer destination — created first, parent-before-child.
+		SyncAction::CreateLocalDir { .. } | SyncAction::CreateRemoteDir { .. } => 0,
+		// Re-parent/rename in place: sources still exist (deletes run later), destinations now exist.
+		SyncAction::MoveLocal { .. } | SyncAction::MoveRemote { .. } => 1,
+		// Content transfers into already-created parents.
+		SyncAction::UploadFile { .. } | SyncAction::DownloadFile { .. } => 2,
+		// Destructive last, child-before-parent (see `order_actions`).
+		SyncAction::DeleteLocal { .. } | SyncAction::TrashRemote { .. } => 3,
+		// Conflicts are never executed (the engine splits them out); order is irrelevant.
+		SyncAction::Conflict { .. } => 4,
+	}
+}
+
+/// Order the plan so it applies safely: creates (parent-before-child) → moves → transfers →
+/// deletions (child-before-parent). Deletions run last so a cascading directory delete never
+/// removes a path an earlier move/transfer depends on; within the delete phase, child-before-parent
+/// keeps a server-side cascade or a local subtree quarantine from racing its own children.
+///
+/// (A rare file<->directory type-flip at one path still needs two passes — the create and the
+/// delete of that path land in different phases — but it self-heals and never loses data.)
 fn order_actions(actions: &mut [SyncAction]) {
-	actions.sort_by(|a, b| match (a.is_delete(), b.is_delete()) {
-		(true, false) => std::cmp::Ordering::Less,
-		(false, true) => std::cmp::Ordering::Greater,
-		(true, true) => b.rel_path().cmp(a.rel_path()),
-		(false, false) => a.rel_path().cmp(b.rel_path()),
+	actions.sort_by(|a, b| {
+		let (pa, pb) = (action_phase(a), action_phase(b));
+		if pa != pb {
+			pa.cmp(&pb)
+		} else if pa == 3 {
+			// Deletes: child-before-parent (descending path).
+			b.rel_path().cmp(a.rel_path())
+		} else {
+			// Everything else: parent-before-child (ascending path).
+			a.rel_path().cmp(b.rel_path())
+		}
 	});
 }
 
@@ -570,6 +716,66 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn a_local_rename_becomes_a_remote_move_not_a_re_upload() {
+		let uuid = Uuid::new_v4();
+		// Baseline + remote still have the file at a.txt; locally it now lives at b.txt (same hash).
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
+		let local = map(vec![("b.txt", local_file("b.txt", [5; 32]))]);
+		assert_eq!(
+			reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote),
+			vec![SyncAction::MoveRemote {
+				from_path: "a.txt".to_string(),
+				to_path: "b.txt".to_string(),
+				remote_uuid: uuid,
+			}],
+			"a local move re-parents the remote item, not trash + re-upload"
+		);
+	}
+
+	#[test]
+	fn a_remote_rename_becomes_a_local_move_not_a_re_download() {
+		let uuid = Uuid::new_v4();
+		// Baseline + local have it at a.txt; the remote now carries the SAME uuid at b.txt.
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [5; 32]))]);
+		let remote = map(vec![("b.txt", remote_file("b.txt", uuid, [5; 32]))]);
+		assert_eq!(
+			reconcile(SyncMode::RemoteToLocal, &baseline, &local, &remote),
+			vec![SyncAction::MoveLocal {
+				from_path: "a.txt".to_string(),
+				to_path: "b.txt".to_string(),
+			}],
+			"a remote move renames the local file, not delete + re-download"
+		);
+	}
+
+	#[test]
+	fn ambiguous_content_falls_back_to_delete_plus_create() {
+		let uuid = Uuid::new_v4();
+		// a.txt vanished locally, but TWO new local files share its content — no unambiguous move.
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
+		let local = map(vec![
+			("b.txt", local_file("b.txt", [5; 32])),
+			("c.txt", local_file("c.txt", [5; 32])),
+		]);
+		let actions = reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(
+			!actions
+				.iter()
+				.any(|a| matches!(a, SyncAction::MoveRemote { .. })),
+			"ambiguous content must NOT be guessed as a move: {actions:?}"
+		);
+		assert!(
+			actions
+				.iter()
+				.any(|a| matches!(a, SyncAction::TrashRemote { .. })),
+			"a.txt is instead trashed + the new files uploaded"
+		);
+	}
+
 	fn map<T>(items: Vec<(&str, T)>) -> HashMap<String, T> {
 		items.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 	}
@@ -583,16 +789,16 @@ mod tests {
 		assert_eq!(
 			actions,
 			vec![
+				SyncAction::UploadFile {
+					rel_path: "a.txt".to_string(),
+				},
 				SyncAction::TrashRemote {
 					rel_path: "old.txt".to_string(),
 					kind: NodeKind::File,
 					remote_uuid: stale,
 				},
-				SyncAction::UploadFile {
-					rel_path: "a.txt".to_string(),
-				},
 			],
-			"deletes (trash) ordered before creates (upload)"
+			"transfers ordered before deletes (deletes run last)"
 		);
 	}
 
@@ -622,15 +828,16 @@ mod tests {
 		assert_eq!(
 			actions,
 			vec![
-				SyncAction::DeleteLocal {
-					rel_path: "extra.txt".to_string(),
-					kind: NodeKind::File,
-				},
 				SyncAction::DownloadFile {
 					rel_path: "r.txt".to_string(),
 					remote_uuid: uuid,
 				},
-			]
+				SyncAction::DeleteLocal {
+					rel_path: "extra.txt".to_string(),
+					kind: NodeKind::File,
+				},
+			],
+			"transfers ordered before deletes (deletes run last)"
 		);
 	}
 
@@ -668,6 +875,68 @@ mod tests {
 		);
 		let paths: Vec<_> = actions.iter().map(|a| a.rel_path()).collect();
 		assert_eq!(paths, vec!["dir", "dir/sub", "dir/sub/c.txt"]);
+	}
+
+	#[test]
+	fn dir_rename_moves_children_before_trashing_the_old_dir() {
+		// Local rename of `old/` -> `new/` (with child `x.txt`). The child is a hash-matched move;
+		// the old dir is trashed. The move MUST be ordered before the old-dir trash, otherwise the
+		// cascading dir delete destroys the move source (the headline ordering bug).
+		let dir_uuid = Uuid::new_v4();
+		let file_uuid = Uuid::new_v4();
+		let base_dir = BaselineEntry {
+			rel_path: "old".to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: Some(dir_uuid),
+			content_hash: None,
+			size: None,
+			local_mtime: None,
+			remote_modified: None,
+			state: BaselineState::Synced,
+		};
+		let baseline = map(vec![
+			("old", base_dir),
+			("old/x.txt", base_file("old/x.txt", file_uuid, [7; 32])),
+		]);
+		// Remote still holds the pre-rename tree.
+		let remote_dir = RemoteNode {
+			rel_path: "old".to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: dir_uuid,
+			content_hash: None,
+			size: 0,
+			modified_millis: 0,
+		};
+		let remote = map(vec![
+			("old", remote_dir),
+			("old/x.txt", remote_file("old/x.txt", file_uuid, [7; 32])),
+		]);
+		// Locally the dir and its child have been renamed to `new/`.
+		let local = map(vec![
+			("new", local_dir("new")),
+			("new/x.txt", local_file("new/x.txt", [7; 32])),
+		]);
+
+		let actions = reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert_eq!(
+			actions,
+			vec![
+				SyncAction::CreateRemoteDir {
+					rel_path: "new".to_string(),
+				},
+				SyncAction::MoveRemote {
+					from_path: "old/x.txt".to_string(),
+					to_path: "new/x.txt".to_string(),
+					remote_uuid: file_uuid,
+				},
+				SyncAction::TrashRemote {
+					rel_path: "old".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: dir_uuid,
+				},
+			],
+			"create new dir, MOVE the child out, THEN trash the old dir — never trash first"
+		);
 	}
 
 	#[test]
