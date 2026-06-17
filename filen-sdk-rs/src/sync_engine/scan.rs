@@ -1,0 +1,372 @@
+//! The local-side scan: walk a pair's local root into a `rel_path -> LocalNode` map, applying the
+//! mtime+size fast-path so an unchanged file is never re-hashed.
+//!
+//! Paths are NFC-normalized (macOS hands back NFD) and `/`-joined so they key 1:1 against the
+//! NFC-normalized remote snapshot and the baseline. Two entries that normalize to the same key are
+//! a collision (the engine refuses to reconcile a pair with one — a 1:1 local mapping is
+//! required). The scan reports whether it completed: a partial scan (an unreadable subtree, a
+//! missing root) must never let the mass-delete guard propagate deletions.
+//!
+//! Symlinks are followed and their targets read as regular files (Filen has no symlink concept and
+//! the engine never writes one); `walkdir`'s loop detection guards against cycles.
+
+use std::{
+	collections::HashMap,
+	ffi::OsStr,
+	path::{Component, Path},
+};
+
+use filen_types::crypto::Blake3Hash;
+use unicode_normalization::UnicodeNormalization;
+
+use super::baseline::{BaselineEntry, NodeKind};
+use crate::io::FilenMetaExt;
+
+/// The per-pair local quarantine directory (where remote-propagated deletions are moved instead of
+/// being destroyed). Always excluded from the scan so it is never itself synced back up.
+pub(crate) const QUARANTINE_DIR: &str = ".filen-sync-trash";
+
+/// One item observed under the local root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalNode {
+	/// NFC-normalized, `/`-joined path relative to the local root.
+	pub(crate) rel_path: String,
+	pub(crate) kind: NodeKind,
+	/// Size in bytes (0 for directories).
+	pub(crate) size: u64,
+	/// Modification time in epoch millis.
+	pub(crate) mtime_millis: i64,
+	/// BLAKE3 of the content (files only): reused from the baseline when `(size, mtime)` matched
+	/// (the fast-path), otherwise freshly computed.
+	pub(crate) content_hash: Option<Blake3Hash>,
+}
+
+/// What went wrong for one entry during a scan. Non-fatal individually (collected), but any error
+/// marks the whole scan [`incomplete`](LocalScan::complete).
+#[derive(Debug)]
+pub(crate) enum ScanError {
+	/// An entry could not be read (permission, vanished mid-walk, hash failure, a symlink loop).
+	Io {
+		rel_path: String,
+		source: std::io::Error,
+	},
+	/// An entry whose name is not valid UTF-8 — Filen names are UTF-8, so it cannot be synced.
+	NonUtf8Name { lossy_path: String },
+	/// Two entries normalize to the same key — the pair cannot be reconciled until the user
+	/// resolves it (a single local path cannot hold both).
+	DuplicateName { rel_path: String },
+}
+
+/// The result of scanning a local root.
+#[derive(Debug)]
+pub(crate) struct LocalScan {
+	pub(crate) nodes: HashMap<String, LocalNode>,
+	/// `false` if the node set may be INCOMPLETE — a missing/unreadable root, an unreadable
+	/// subtree, a non-UTF-8 name, or a normalized-name collision. The mass-delete guard refuses to
+	/// propagate deletions from an incomplete scan (an empty/half-read source must not nuke the
+	/// destination).
+	pub(crate) complete: bool,
+	pub(crate) errors: Vec<ScanError>,
+}
+
+/// NFC-normalize a relative path's components (case preserved) and `/`-join them. `None` if any
+/// component is non-UTF-8 or not a plain name (a walked subtree only yields `Normal` components).
+fn normalize_rel_path(rel: &Path) -> Option<String> {
+	let mut parts = Vec::new();
+	for component in rel.components() {
+		match component {
+			Component::Normal(os) => parts.push(os.to_str()?.nfc().collect::<String>()),
+			_ => return None,
+		}
+	}
+	Some(parts.join("/"))
+}
+
+/// The case-insensitive collision key for a (already NFC-normalized) relative path. Filen treats
+/// names case-insensitively, so two paths differing only in case collide.
+fn collision_key(rel_path: &str) -> String {
+	rel_path.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// BLAKE3 of the file at `path`, streamed (no full read into memory).
+fn hash_file(path: &Path) -> std::io::Result<Blake3Hash> {
+	let file = std::fs::File::open(path)?;
+	let mut hasher = blake3::Hasher::new();
+	hasher.update_reader(&file)?;
+	Ok(hasher.finalize().into())
+}
+
+/// The fast-path: reuse the baseline's content hash when the file's `(size, mtime)` are unchanged,
+/// so an untouched file is never re-hashed. `None` means "diverged or unknown — must hash".
+fn fast_path_hash(baseline: Option<&BaselineEntry>, size: u64, mtime: i64) -> Option<Blake3Hash> {
+	let entry = baseline?;
+	if entry.kind == NodeKind::File && entry.size == Some(size) && entry.local_mtime == Some(mtime)
+	{
+		entry.content_hash
+	} else {
+		None
+	}
+}
+
+/// Walk `root` into a `rel_path -> LocalNode` map. `baseline` (keyed by rel_path) drives the
+/// fast-path. Blocking work — the engine calls this on a blocking thread.
+pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>) -> LocalScan {
+	let mut nodes = HashMap::new();
+	let mut errors = Vec::new();
+	let mut complete = true;
+	// collision key -> the rel_path that claimed it, to detect a second entry normalizing the same.
+	let mut claimed: HashMap<String, String> = HashMap::new();
+
+	let walker = walkdir::WalkDir::new(root)
+		.follow_links(true)
+		.into_iter()
+		// Never descend into our own quarantine dir (it holds locally-deleted items).
+		.filter_entry(|e| e.depth() != 1 || e.file_name() != OsStr::new(QUARANTINE_DIR));
+
+	for entry in walker {
+		let entry = match entry {
+			Ok(entry) => entry,
+			Err(err) => {
+				// A walk error (unreadable dir, symlink loop) — the tree is partial.
+				complete = false;
+				let rel_path = err
+					.path()
+					.and_then(|p| p.strip_prefix(root).ok())
+					.and_then(normalize_rel_path)
+					.unwrap_or_default();
+				errors.push(ScanError::Io {
+					rel_path,
+					source: err
+						.into_io_error()
+						.unwrap_or_else(|| std::io::Error::other("directory walk error")),
+				});
+				continue;
+			}
+		};
+
+		// The root itself is the pair's anchor, not a synced item.
+		if entry.depth() == 0 {
+			continue;
+		}
+
+		let Ok(rel) = entry.path().strip_prefix(root) else {
+			continue;
+		};
+		let Some(rel_path) = normalize_rel_path(rel) else {
+			complete = false;
+			errors.push(ScanError::NonUtf8Name {
+				lossy_path: rel.to_string_lossy().into_owned(),
+			});
+			continue;
+		};
+
+		// `metadata()` follows symlinks (the walker has follow_links set), so a symlinked dir/file
+		// is classified by its target.
+		let metadata = match entry.metadata() {
+			Ok(metadata) => metadata,
+			Err(err) => {
+				complete = false;
+				errors.push(ScanError::Io {
+					rel_path,
+					source: err
+						.into_io_error()
+						.unwrap_or_else(|| std::io::Error::other("metadata error")),
+				});
+				continue;
+			}
+		};
+
+		let kind = if metadata.is_dir() {
+			NodeKind::Dir
+		} else if metadata.is_file() {
+			NodeKind::File
+		} else {
+			// Sockets, FIFOs, devices, broken symlinks: not syncable, skip silently.
+			continue;
+		};
+
+		if let Some(previous) = claimed.insert(collision_key(&rel_path), rel_path.clone()) {
+			complete = false;
+			errors.push(ScanError::DuplicateName {
+				rel_path: format!("{previous} / {rel_path}"),
+			});
+			continue;
+		}
+
+		let node = match kind {
+			NodeKind::Dir => LocalNode {
+				rel_path: rel_path.clone(),
+				kind,
+				size: 0,
+				mtime_millis: FilenMetaExt::modified(&metadata).timestamp_millis(),
+				content_hash: None,
+			},
+			NodeKind::File => {
+				let size = metadata.len();
+				let mtime = FilenMetaExt::modified(&metadata).timestamp_millis();
+				let content_hash = match fast_path_hash(baseline.get(&rel_path), size, mtime) {
+					Some(hash) => Some(hash),
+					None => match hash_file(entry.path()) {
+						Ok(hash) => Some(hash),
+						Err(source) => {
+							complete = false;
+							errors.push(ScanError::Io { rel_path, source });
+							continue;
+						}
+					},
+				};
+				LocalNode {
+					rel_path: rel_path.clone(),
+					kind,
+					size,
+					mtime_millis: mtime,
+					content_hash,
+				}
+			}
+		};
+		nodes.insert(rel_path, node);
+	}
+
+	LocalScan {
+		nodes,
+		complete,
+		errors,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+
+	use uuid::Uuid;
+
+	use super::*;
+	use crate::sync_engine::baseline::BaselineState;
+
+	fn temp_root() -> std::path::PathBuf {
+		let dir = std::env::temp_dir().join(format!("filen_scan_test_{}", Uuid::new_v4()));
+		fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	#[test]
+	fn collision_key_folds_case() {
+		assert_eq!(collision_key("A/B.txt"), "a/b.txt");
+		assert_eq!(collision_key("already/low.txt"), "already/low.txt");
+	}
+
+	#[test]
+	fn scans_a_tree_into_normalized_nodes() {
+		let root = temp_root();
+		fs::write(root.join("a.txt"), b"hello").unwrap();
+		fs::create_dir(root.join("sub")).unwrap();
+		fs::write(root.join("sub").join("b.txt"), b"world").unwrap();
+
+		let scan = scan_local(&root, &HashMap::new());
+		assert!(
+			scan.complete,
+			"a clean tree scans completely: {:?}",
+			scan.errors
+		);
+
+		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		paths.sort();
+		assert_eq!(paths, vec!["a.txt", "sub", "sub/b.txt"]);
+
+		let a = &scan.nodes["a.txt"];
+		assert_eq!(a.kind, NodeKind::File);
+		assert_eq!(a.size, 5);
+		assert!(
+			a.content_hash.is_some(),
+			"files are hashed without a baseline"
+		);
+		assert_eq!(scan.nodes["sub"].kind, NodeKind::Dir);
+		assert!(
+			scan.nodes["sub"].content_hash.is_none(),
+			"dirs have no hash"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn fast_path_reuses_baseline_hash_when_size_and_mtime_match() {
+		let root = temp_root();
+		let file = root.join("a.txt");
+		fs::write(&file, b"hello").unwrap();
+		let meta = fs::metadata(&file).unwrap();
+		let mtime = FilenMetaExt::modified(&meta).timestamp_millis();
+
+		// A baseline whose (size, mtime) match the file but carries a SENTINEL hash that is NOT the
+		// real content hash. The fast-path must hand back the sentinel without re-hashing.
+		let sentinel = Blake3Hash::from([0xAB; 32]);
+		let baseline = HashMap::from([(
+			"a.txt".to_string(),
+			BaselineEntry {
+				rel_path: "a.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: None,
+				content_hash: Some(sentinel),
+				size: Some(5),
+				local_mtime: Some(mtime),
+				remote_modified: None,
+				state: BaselineState::Synced,
+			},
+		)]);
+
+		let scan = scan_local(&root, &baseline);
+		assert_eq!(
+			scan.nodes["a.txt"].content_hash,
+			Some(sentinel),
+			"unchanged (size, mtime) reuses the baseline hash — no re-hash"
+		);
+
+		// A baseline with a stale size forces a real re-hash (sentinel must NOT survive).
+		let stale = HashMap::from([(
+			"a.txt".to_string(),
+			BaselineEntry {
+				size: Some(999),
+				..baseline["a.txt"].clone()
+			},
+		)]);
+		let rescan = scan_local(&root, &stale);
+		assert_ne!(
+			rescan.nodes["a.txt"].content_hash,
+			Some(sentinel),
+			"a diverged size triggers a fresh hash"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn missing_root_is_reported_incomplete() {
+		let root = std::env::temp_dir().join(format!("filen_scan_absent_{}", Uuid::new_v4()));
+		let scan = scan_local(&root, &HashMap::new());
+		assert!(
+			!scan.complete,
+			"a missing root scans incomplete (guards mass-delete)"
+		);
+		assert!(scan.nodes.is_empty());
+		assert!(!scan.errors.is_empty());
+	}
+
+	#[test]
+	fn quarantine_dir_is_excluded() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		let quarantine = root.join(QUARANTINE_DIR);
+		fs::create_dir(&quarantine).unwrap();
+		fs::write(quarantine.join("trashed.txt"), b"old").unwrap();
+
+		let scan = scan_local(&root, &HashMap::new());
+		let paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		assert_eq!(
+			paths,
+			vec!["keep.txt"],
+			"the quarantine subtree is not scanned"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+}

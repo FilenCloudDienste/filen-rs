@@ -24,5 +24,6 @@
 
 mod baseline;
 mod mode;
+mod scan;
 
 pub use mode::SyncMode;
