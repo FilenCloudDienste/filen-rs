@@ -67,7 +67,7 @@ pub(crate) enum SyncAction {
 }
 
 impl SyncAction {
-	fn rel_path(&self) -> &str {
+	pub(super) fn rel_path(&self) -> &str {
 		match self {
 			Self::CreateLocalDir { rel_path }
 			| Self::DownloadFile { rel_path, .. }
@@ -79,7 +79,7 @@ impl SyncAction {
 		}
 	}
 
-	fn is_delete(&self) -> bool {
+	pub(super) fn is_delete(&self) -> bool {
 		matches!(self, Self::DeleteLocal { .. } | Self::TrashRemote { .. })
 	}
 }
