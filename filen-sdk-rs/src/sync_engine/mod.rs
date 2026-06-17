@@ -14,7 +14,7 @@
 //! [`SyncMode`] collapses to two knobs — direction and whether source-side deletions propagate.
 //! "Backup" modes are mirrors that never delete on the destination.
 //!
-//! Native-only: it owns local files, a private read connection to the cache DB, and (later) an FS
+//! Native-only: it owns local files, a private read connection to the cache DB, and a `notify` FS
 //! watcher, none of which the wasm single-connection VFS supports.
 
 // WIP: the engine is built incrementally across commits. Until the public `SyncEngine` handle
@@ -29,7 +29,9 @@ mod guard;
 mod mode;
 mod plan;
 mod scan;
+mod watch;
 
 pub use apply::SyncReport;
 pub use engine::SyncEngine;
 pub use mode::SyncMode;
+pub use watch::WatchHandle;
