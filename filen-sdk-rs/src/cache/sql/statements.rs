@@ -48,6 +48,10 @@ pub(crate) const DIFF_CREATES: &str = include_str!("raw/diff_creates.sql");
 pub(crate) const DIFF_MOVES: &str = include_str!("raw/diff_moves.sql");
 pub(crate) const DIFF_CONTENT_CHANGES: &str = include_str!("raw/diff_content_changes.sql");
 
+// Whole-subtree enumeration for the sync engine's remote snapshot (read via `cache::enumerate`).
+// Its column order MUST match `search::hydrate::row_to_result` (indices 0-21), the shared hydration.
+pub(crate) const ENUMERATE_SUBTREE: &str = include_str!("raw/enumerate_subtree.sql");
+
 /// Key for the contiguous-prefix watermark stored in `cache_meta`.
 pub(crate) const WATERMARK_KEY: &str = "last_drive_message_id";
 /// Key for the durable "a resync is needed" flag in `cache_meta` (set when an event is lost — a hole,
