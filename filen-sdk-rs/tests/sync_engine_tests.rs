@@ -4,7 +4,7 @@
 //! stay account-size independent. Run with: `cargo test -p filen-sdk-rs --features sync-engine
 //! --test sync_engine_tests` (needs `.env` with TEST_EMAIL / TEST_PASSWORD).
 
-use std::{borrow::Cow, path::PathBuf};
+use std::{borrow::Cow, path::PathBuf, sync::Arc, time::Duration};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
@@ -502,5 +502,59 @@ async fn remote_rename_moves_the_local_file_in_place() {
 		"renamed on disk, content intact"
 	);
 
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// The continuous engine: with a watch active, a file created locally is pushed to the remote on
+/// its own (FS watcher -> debounce -> sync pass), no manual sync_once call.
+#[shared_test_runtime]
+async fn watch_pushes_a_new_local_file_automatically() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	assert!(
+		wait_for_converged_resync(
+			&cache.messages,
+			resources.dir.uuid().into(),
+			0,
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await
+	);
+
+	let local = temp_local_dir();
+	let engine = Arc::new(
+		SyncEngine::open(cache.client.clone(), temp_cache_path())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(
+			local.clone(),
+			resources.dir.uuid().into(),
+			SyncMode::LocalToRemote,
+		)
+		.await
+		.unwrap();
+	let watch = engine.watch(pair).await.unwrap();
+
+	// Create a file AFTER the watch is live; the engine should push it on its own.
+	std::fs::write(local.join("watched.txt"), b"pushed by the watcher").unwrap();
+
+	let deadline = tokio::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
+	let mut appeared = false;
+	while tokio::time::Instant::now() < deadline {
+		let (_, files) = remote_listing(&cache.client, &resources.dir).await;
+		if files.contains(&"watched.txt".to_string()) {
+			appeared = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(500)).await;
+	}
+	assert!(
+		appeared,
+		"the watcher should have pushed the new local file to the remote on its own"
+	);
+
+	drop(watch);
 	std::fs::remove_dir_all(&local).ok();
 }
