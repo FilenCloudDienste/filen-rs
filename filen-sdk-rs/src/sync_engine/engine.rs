@@ -24,8 +24,8 @@ use crate::{
 /// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus the
 /// per-pair baseline store.
 pub struct SyncEngine {
-	client: Arc<Client>,
-	store: Mutex<BaselineStore>,
+	pub(super) client: Arc<Client>,
+	pub(super) store: Mutex<BaselineStore>,
 }
 
 /// Why the engine refused to act on a pass.
