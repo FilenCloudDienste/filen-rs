@@ -633,7 +633,7 @@ mod tests {
 	fn server_message_and_code_are_none_for_non_server_errors() {
 		let err = Error::custom_with_source(
 			ErrorKind::IO,
-			io::Error::new(io::ErrorKind::Other, "boom"),
+			io::Error::other("boom"),
 			None::<&'static str>,
 		);
 		assert!(err.server_message().is_none());
@@ -644,7 +644,7 @@ mod tests {
 	fn inner_message_returns_underlying_message_without_wrapper() {
 		let err = Error::custom_with_source(
 			ErrorKind::IO,
-			io::Error::new(io::ErrorKind::Other, "boom"),
+			io::Error::other("boom"),
 			None::<&'static str>,
 		);
 		assert_eq!(err.inner_message().as_deref(), Some("boom"));
