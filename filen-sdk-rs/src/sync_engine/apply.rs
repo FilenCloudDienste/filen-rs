@@ -27,7 +27,7 @@ use crate::{
 		HasUUID,
 		categories::{DirType, Normal},
 		dir::cache::CacheableDir,
-		file::cache::CacheableFile,
+		file::{cache::CacheableFile, meta::FileMetaChanges},
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 };
@@ -42,6 +42,10 @@ pub struct SyncReport {
 	pub remote_dirs_created: usize,
 	pub locally_deleted: usize,
 	pub remotely_trashed: usize,
+	/// Files re-parented/renamed on the remote in place of a re-upload.
+	pub moved_remote: usize,
+	/// Files renamed locally in place of a re-download.
+	pub moved_local: usize,
 	/// Relative paths surfaced as two-way conflicts (left untouched).
 	pub conflicts: Vec<String>,
 	/// How many deletions the mass-delete guard held back this pass.
@@ -272,6 +276,68 @@ async fn apply_one(
 			}
 			delete_baseline(ctx, rel_path).await?;
 			report.remotely_trashed += 1;
+		}
+		SyncAction::MoveRemote {
+			from_path,
+			to_path,
+			remote_uuid,
+		} => {
+			let cacheable = file_by_uuid
+				.get(remote_uuid)
+				.ok_or_else(|| internal("move-source file missing from the snapshot"))?;
+			let mut remote_file = RemoteFile::from((*cacheable).clone());
+			let (from_parent, from_name) = parent_and_name(from_path);
+			let (to_parent, to_name) = parent_and_name(to_path);
+			if to_parent != from_parent {
+				let parent = dir_by_path
+					.get(to_parent)
+					.ok_or_else(|| internal("move-target parent dir is missing"))?
+					.clone();
+				let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
+				ctx.client.move_file(&mut remote_file, &parent_type).await?;
+			}
+			if to_name != from_name {
+				let changes = FileMetaChanges::default()
+					.name(to_name)
+					.map_err(crate::Error::from)?;
+				ctx.client
+					.update_file_metadata(&mut remote_file, changes)
+					.await?;
+			}
+			let local = ctx.local.get(to_path);
+			delete_baseline(ctx, from_path).await?;
+			upsert_file_baseline(
+				ctx,
+				to_path,
+				Some(*remote_uuid),
+				local.and_then(|n| n.content_hash),
+				local.map(|n| n.size).unwrap_or(0),
+				local.map(|n| n.mtime_millis),
+				Some(remote_file.timestamp.timestamp_millis()),
+			)
+			.await?;
+			report.moved_remote += 1;
+		}
+		SyncAction::MoveLocal { from_path, to_path } => {
+			let from = local_path(ctx.local_root, from_path);
+			let to = confined_local_target(ctx.local_root, to_path)?;
+			if let Some(parent) = to.parent() {
+				std::fs::create_dir_all(parent).map_err(io_err)?;
+			}
+			std::fs::rename(&from, &to).map_err(io_err)?;
+			let remote = ctx.remote.get(to_path);
+			delete_baseline(ctx, from_path).await?;
+			upsert_file_baseline(
+				ctx,
+				to_path,
+				remote.map(|n| n.remote_uuid),
+				remote.and_then(|n| n.content_hash),
+				remote.map(|n| n.size).unwrap_or(0),
+				local_mtime_of(&to),
+				remote.map(|n| n.modified_millis),
+			)
+			.await?;
+			report.moved_local += 1;
 		}
 		SyncAction::Conflict { .. } => {
 			// Conflicts are reported by the engine, never applied here.
