@@ -203,3 +203,161 @@ async fn same_name_upload_versions_rather_than_duplicates() {
 		"a same-name upload versions the file; the remote shows exactly one 'versioned.txt', not a duplicate (got {files:?})"
 	);
 }
+
+/// A second pass with nothing changed is a no-op — the baseline + mtime/size fast-path recognize
+/// the already-synced state and transfer nothing.
+#[shared_test_runtime]
+async fn second_pass_with_no_changes_is_a_noop() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+
+	let builder = cache
+		.client
+		.make_file_builder("stable.txt", resources.dir.uuid())
+		.unwrap();
+	let remote_file = cache.client.upload_file(builder, b"stable").await.unwrap();
+	assert!(
+		poll_for_item(
+			cache.db_path(),
+			remote_file.uuid().into(),
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await
+	);
+
+	let local = temp_local_dir();
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(
+			local.clone(),
+			resources.dir.uuid().into(),
+			SyncMode::RemoteToLocal,
+		)
+		.await
+		.unwrap();
+
+	let first = engine.sync_once(pair).await.unwrap();
+	assert_eq!(first.downloaded, 1, "first pass downloads the file");
+
+	let second = engine.sync_once(pair).await.unwrap();
+	assert_eq!(second.downloaded, 0, "nothing to download the second time");
+	assert_eq!(second.uploaded, 0);
+	assert_eq!(second.locally_deleted, 0);
+	assert_eq!(second.remotely_trashed, 0);
+	assert!(second.errors.is_empty(), "no errors: {:?}", second.errors);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// RemoteToLocal mirror: a remote deletion propagates to the local tree, with the local copy moved
+/// to the recoverable quarantine dir rather than destroyed.
+#[shared_test_runtime]
+async fn remote_deletion_quarantines_the_local_copy() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+
+	let builder = cache
+		.client
+		.make_file_builder("doomed.txt", resources.dir.uuid())
+		.unwrap();
+	let mut remote_file = cache.client.upload_file(builder, b"doomed").await.unwrap();
+	let file_uuid: Uuid = remote_file.uuid().into();
+	assert!(poll_for_item(cache.db_path(), file_uuid, CACHE_CONVERGE_TIMEOUT).await);
+
+	let local = temp_local_dir();
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(
+			local.clone(),
+			resources.dir.uuid().into(),
+			SyncMode::RemoteToLocal,
+		)
+		.await
+		.unwrap();
+	assert_eq!(engine.sync_once(pair).await.unwrap().downloaded, 1);
+	assert!(local.join("doomed.txt").exists(), "downloaded first");
+
+	// Trash it remotely and wait for the cache to drop it.
+	cache.client.trash_file(&mut remote_file).await.unwrap();
+	assert!(
+		poll_for_item_absent(cache.db_path(), file_uuid, CACHE_CONVERGE_TIMEOUT).await,
+		"cache should observe the remote deletion"
+	);
+
+	let report = engine.sync_once(pair).await.unwrap();
+	assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+	assert_eq!(report.locally_deleted, 1, "the deletion propagated locally");
+	assert!(!local.join("doomed.txt").exists(), "removed from the tree");
+	assert!(
+		local.join(".filen-sync-trash").join("doomed.txt").exists(),
+		"moved to the recoverable quarantine, not destroyed"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// TwoWay: a local-only file is pushed up and a remote-only file is pulled down in a single pass;
+/// both sides end up holding both files.
+#[shared_test_runtime]
+async fn two_way_merges_both_sides_in_one_pass() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+
+	let builder = cache
+		.client
+		.make_file_builder("from_remote.txt", resources.dir.uuid())
+		.unwrap();
+	let remote_file = cache
+		.client
+		.upload_file(builder, b"from remote")
+		.await
+		.unwrap();
+	assert!(
+		poll_for_item(
+			cache.db_path(),
+			remote_file.uuid().into(),
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await
+	);
+
+	let local = temp_local_dir();
+	std::fs::write(local.join("from_local.txt"), b"from local").unwrap();
+
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), resources.dir.uuid().into(), SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	let report = engine.sync_once(pair).await.unwrap();
+	assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+	assert_eq!(report.uploaded, 1, "the local-only file went up");
+	assert_eq!(report.downloaded, 1, "the remote-only file came down");
+	assert!(report.conflicts.is_empty(), "distinct paths never conflict");
+
+	// Local now has both.
+	assert!(local.join("from_local.txt").exists());
+	assert_eq!(
+		std::fs::read(local.join("from_remote.txt")).unwrap(),
+		b"from remote"
+	);
+	// Remote now has both.
+	let (_, files) = remote_listing(&cache.client, &resources.dir).await;
+	assert!(
+		files.contains(&"from_local.txt".to_string()),
+		"files: {files:?}"
+	);
+	assert!(
+		files.contains(&"from_remote.txt".to_string()),
+		"files: {files:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
