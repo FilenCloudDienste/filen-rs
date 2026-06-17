@@ -179,7 +179,7 @@ impl NameMatchers {
 /// worker. On wasm the engine never opens this — the wasm VFS supports neither WAL nor a second
 /// connection, so reads route to the worker instead (see [`ReadConn`]).
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> {
+pub(in crate::cache) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> {
 	let conn = Connection::open_with_flags(
 		path,
 		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -376,8 +376,9 @@ fn timestamp_millis(row: &Row<'_>, column: &str, millis: i64) -> rusqlite::Resul
 ///
 /// Every column is read by NAME, so this is independent of the `SELECT` order — which the three
 /// window queries do NOT agree on (`search_window_children.sql` emits `parent_path` before
-/// `total`, the account/subtree windows after).
-fn row_to_result(row: &Row<'_>) -> rusqlite::Result<SearchResult> {
+/// `total`, the account/subtree windows after). Shared with `cache::enumerate` (the sync engine's
+/// whole-subtree snapshot projects the SAME columns under the same names).
+pub(in crate::cache) fn row_to_result(row: &Row<'_>) -> rusqlite::Result<SearchResult> {
 	let uuid: Uuid = row.get(ITEMS_UUID)?;
 	let parent: Uuid = row.get(ITEMS_PARENT)?;
 	let item_type: i64 = row.get(ITEMS_TYPE)?;

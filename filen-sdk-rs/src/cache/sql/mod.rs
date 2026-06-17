@@ -25,7 +25,9 @@ pub(crate) use event::PersistedEvent;
 mod item;
 mod membership;
 mod root;
-mod statements;
+// `pub(in crate::cache)` so `cache::enumerate` can reuse the watermark + enumeration SQL constants
+// (the rest of the cache reaches them via `super::statements`).
+pub(in crate::cache) mod statements;
 
 // Per-transaction row budget (the commit / WAL-fsync granularity for bulk applies). Benchmarked:
 // raising this from 10k to 50k cut a 166k-item populate's apply by ~19% (fewer commits); past 50k
