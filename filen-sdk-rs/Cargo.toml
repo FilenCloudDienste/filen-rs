@@ -35,6 +35,10 @@ service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
 http-provider = ["dep:axum", "dep:axum-extra"]
 cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
+# The folder<->folder sync engine (local <-> remote). Native-only (the module is cfg'd off on
+# wasm); builds on the cache's remote mirror plus the io/ transfer and fs-tree primitives. The FS
+# watcher dependency (`notify`) is added with this feature when the continuous engine lands.
+sync-engine = ["cache"]
 # Exposes the otherwise-`pub(crate)` cache apply path (`cache::bench_support`) for the criterion
 # insertion benchmark only. Never enable in production builds.
 bench-internals = ["cache"]
