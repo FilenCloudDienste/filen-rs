@@ -41,6 +41,14 @@ pub(crate) mod serde;
 ))]
 pub mod socket;
 pub mod sync;
+// Folder<->folder sync engine. Native-only: it owns local files, a private read connection to the
+// cache, and (later) an FS watcher — none of which the wasm single-connection VFS supports. Builds
+// on the `cache` feature (the remote-state mirror it reconciles against).
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub mod sync_engine;
 pub mod thumbnail;
 pub mod user;
 pub mod util;
