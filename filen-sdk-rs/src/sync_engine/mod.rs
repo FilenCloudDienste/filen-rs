@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 mod baseline;
+mod guard;
 mod mode;
 mod plan;
 mod scan;
