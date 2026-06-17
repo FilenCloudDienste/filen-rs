@@ -95,9 +95,13 @@ mod hydrate;
 pub(crate) use hydrate::ReadTask;
 pub(in crate::cache) use hydrate::register_name_matches;
 // Reused by `cache::enumerate` (the sync engine's whole-subtree snapshot): the same read-only
-// connection opener and 22-column hydration the search windows use. Native only — `enumerate`
-// opens its own connection, which the wasm single-connection VFS does not support.
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+// connection opener and 22-column hydration the search windows use. Gated exactly like
+// `enumerate` — `sync-engine` and native only, since `enumerate` opens its own connection, which
+// the wasm single-connection VFS does not support.
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
 pub(in crate::cache) use hydrate::{open_read_connection, row_to_result};
 // FFI bindings: UniFFI on native, wasm_bindgen on wasm — gated together because both targets
 // need the public search API exposed to callers outside Rust.

@@ -7,9 +7,13 @@
 pub mod bench_support;
 mod error;
 // The sync engine's cache read side: a consistent whole-subtree snapshot of a sync root + its
-// watermark. Native only — it opens its own read-only connection (like search), which the wasm
+// watermark. Gated on `sync-engine` (its only reader — otherwise the whole module is dead code)
+// and native only: it opens its own read-only connection, like search, which the wasm
 // single-connection VFS does not support, and the sync engine is native-only anyway.
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
 mod enumerate;
 mod handle;
 // UniFFI exports on mobile, wasm-bindgen twins on web. The twins share method names, which is
