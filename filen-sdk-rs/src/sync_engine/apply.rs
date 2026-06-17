@@ -1,0 +1,498 @@
+//! The apply layer: execute a screened [`SyncAction`] plan against the remote (via `Client`) and
+//! the local filesystem, advancing the baseline after each action so an interrupted pass simply
+//! re-reconciles to the same plan.
+//!
+//! Each action is best-effort: a failure is recorded in the [`SyncReport`] and the pass continues,
+//! since the actions are independent and the next pass re-plans from truth. Local deletions move
+//! to the pair's quarantine dir (recoverable); remote deletions go to Filen trash. The local mtime
+//! written to the baseline after a download is read back from disk (not the value we asked for) so
+//! the scanner's fast-path stays stable.
+
+use std::{
+	collections::HashMap,
+	path::{Path, PathBuf},
+};
+
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+
+use super::{
+	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
+	plan::{RemoteNode, SyncAction},
+	scan::{LocalNode, QUARANTINE_DIR},
+};
+use crate::{
+	auth::Client,
+	fs::{
+		HasUUID,
+		categories::{DirType, Normal},
+		dir::cache::CacheableDir,
+		file::cache::CacheableFile,
+	},
+	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
+};
+use tokio::sync::Mutex;
+
+/// Outcome of one apply pass.
+#[derive(Debug, Default)]
+pub struct SyncReport {
+	pub downloaded: usize,
+	pub uploaded: usize,
+	pub local_dirs_created: usize,
+	pub remote_dirs_created: usize,
+	pub locally_deleted: usize,
+	pub remotely_trashed: usize,
+	/// Relative paths surfaced as two-way conflicts (left untouched).
+	pub conflicts: Vec<String>,
+	/// How many deletions the mass-delete guard held back this pass.
+	pub held_deletions: usize,
+	/// Set when the guard held deletions; a human-readable reason.
+	pub guard_message: Option<String>,
+	/// Per-action failures (the pass continues past them).
+	pub errors: Vec<String>,
+}
+
+/// Everything the apply pass needs besides the actions: the resolved remote-side objects and the
+/// scan/view maps.
+pub(super) struct ApplyContext<'a> {
+	pub(super) client: &'a Client,
+	pub(super) local_root: &'a Path,
+	pub(super) pair: PairId,
+	pub(super) store: &'a Mutex<BaselineStore>,
+	pub(super) local: &'a HashMap<String, LocalNode>,
+	pub(super) remote: &'a HashMap<String, RemoteNode>,
+	/// The sync root resolved to a remote directory (every top-level parent).
+	pub(super) root_remote: RemoteDirectory,
+	pub(super) dirs: &'a [CacheableDir<'static>],
+	pub(super) files: &'a [CacheableFile<'static>],
+}
+
+fn local_path(root: &Path, rel_path: &str) -> PathBuf {
+	rel_path
+		.split('/')
+		.fold(root.to_path_buf(), |p, c| p.join(c))
+}
+
+/// Resolve a local WRITE target under `root`, confined to the sync root. Rejects a `rel_path` with
+/// a `.`/`..`/empty component (lexical traversal) and — to defeat a symlink in the tree that points
+/// outside — canonicalizes the deepest existing ancestor and verifies it stays under the
+/// canonicalized root. Without this, downloading `link/x` where `link` is a symlink to `/etc` would
+/// write outside the sync folder. Reads/quarantine moves are unaffected; only writes are confined.
+fn confined_local_target(root: &Path, rel_path: &str) -> Result<PathBuf, crate::Error> {
+	if rel_path
+		.split('/')
+		.any(|c| c.is_empty() || c == "." || c == "..")
+	{
+		return Err(internal_owned(format!(
+			"refusing an unsafe relative path: {rel_path:?}"
+		)));
+	}
+	let target = local_path(root, rel_path);
+	let root_canon = std::fs::canonicalize(root).map_err(io_err)?;
+	// The target itself may not exist yet; canonicalize the deepest existing ancestor (which
+	// resolves any symlink in the chain) and require it to stay under the root.
+	let mut ancestor: &Path = &target;
+	let existing = loop {
+		if ancestor.exists() {
+			break ancestor;
+		}
+		match ancestor.parent() {
+			Some(parent) => ancestor = parent,
+			None => break ancestor,
+		}
+	};
+	let existing_canon = std::fs::canonicalize(existing).map_err(io_err)?;
+	if !existing_canon.starts_with(&root_canon) {
+		return Err(internal_owned(format!(
+			"refusing to write outside the sync root via {rel_path:?}"
+		)));
+	}
+	Ok(target)
+}
+
+fn parent_and_name(rel_path: &str) -> (&str, &str) {
+	match rel_path.rsplit_once('/') {
+		Some((parent, name)) => (parent, name),
+		None => ("", rel_path),
+	}
+}
+
+fn millis_to_dt(millis: i64) -> DateTime<Utc> {
+	DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
+}
+
+/// Execute `actions` (already ordered + guard-screened) against the remote and local tree.
+pub(super) async fn apply(
+	ctx: ApplyContext<'_>,
+	actions: Vec<SyncAction>,
+	report: &mut SyncReport,
+) {
+	let file_by_uuid: HashMap<Uuid, &CacheableFile<'static>> =
+		ctx.files.iter().map(|f| (f.uuid, f)).collect();
+	let dir_by_uuid: HashMap<Uuid, &CacheableDir<'static>> =
+		ctx.dirs.iter().map(|d| (d.uuid, d)).collect();
+
+	// path -> remote directory, for resolving the parent of an item. Seeded with the root at "" and
+	// every existing remote dir; new dirs are added as they are created.
+	let mut dir_by_path: HashMap<String, RemoteDirectory> = HashMap::new();
+	dir_by_path.insert(String::new(), ctx.root_remote.clone());
+	for (path, node) in ctx.remote {
+		if node.kind == NodeKind::Dir
+			&& let Some(cacheable) = dir_by_uuid.get(&node.remote_uuid)
+		{
+			dir_by_path.insert(path.clone(), RemoteDirectory::from((*cacheable).clone()));
+		}
+	}
+
+	for action in actions {
+		if let Err(error) = apply_one(&ctx, &action, &file_by_uuid, &mut dir_by_path, report).await
+		{
+			report
+				.errors
+				.push(format!("{}: {error}", action.rel_path()));
+		}
+	}
+}
+
+async fn apply_one(
+	ctx: &ApplyContext<'_>,
+	action: &SyncAction,
+	file_by_uuid: &HashMap<Uuid, &CacheableFile<'static>>,
+	dir_by_path: &mut HashMap<String, RemoteDirectory>,
+	report: &mut SyncReport,
+) -> Result<(), crate::Error> {
+	match action {
+		SyncAction::CreateLocalDir { rel_path } => {
+			let path = confined_local_target(ctx.local_root, rel_path)?;
+			std::fs::create_dir_all(&path).map_err(io_err)?;
+			let remote_uuid = ctx.remote.get(rel_path).map(|n| n.remote_uuid);
+			upsert_dir_baseline(ctx, rel_path, remote_uuid, local_mtime_of(&path)).await?;
+			report.local_dirs_created += 1;
+		}
+		SyncAction::DownloadFile {
+			rel_path,
+			remote_uuid,
+		} => {
+			let cacheable = file_by_uuid
+				.get(remote_uuid)
+				.ok_or_else(|| internal("download target missing from the snapshot"))?;
+			let remote_file = RemoteFile::from((*cacheable).clone());
+			let path = confined_local_target(ctx.local_root, rel_path)?;
+			if let Some(parent) = path.parent() {
+				std::fs::create_dir_all(parent).map_err(io_err)?;
+			}
+			ctx.client
+				.download_file_to_path(&remote_file, &path, None)
+				.await?;
+			let remote = ctx.remote.get(rel_path);
+			upsert_file_baseline(
+				ctx,
+				rel_path,
+				Some(*remote_uuid),
+				remote.and_then(|n| n.content_hash),
+				remote.map(|n| n.size).unwrap_or(0),
+				local_mtime_of(&path),
+				remote.map(|n| n.modified_millis),
+			)
+			.await?;
+			report.downloaded += 1;
+		}
+		SyncAction::DeleteLocal { rel_path, .. } => {
+			quarantine_local(ctx.local_root, rel_path)?;
+			delete_baseline(ctx, rel_path).await?;
+			report.locally_deleted += 1;
+		}
+		SyncAction::CreateRemoteDir { rel_path } => {
+			let (parent_path, name) = parent_and_name(rel_path);
+			let parent = dir_by_path
+				.get(parent_path)
+				.ok_or_else(|| internal("remote parent dir not yet created"))?
+				.clone();
+			let created = ctx
+				.local
+				.get(rel_path)
+				.map(|n| millis_to_dt(n.mtime_millis))
+				.unwrap_or_else(Utc::now);
+			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
+			let new_dir = ctx
+				.client
+				.create_dir_with_created(&parent_type, name, created)
+				.await?;
+			let new_uuid: Uuid = (new_dir.uuid()).into();
+			dir_by_path.insert(rel_path.clone(), new_dir);
+			upsert_dir_baseline(ctx, rel_path, Some(new_uuid), None).await?;
+			report.remote_dirs_created += 1;
+		}
+		SyncAction::UploadFile { rel_path } => {
+			let (parent_path, _) = parent_and_name(rel_path);
+			let parent = dir_by_path
+				.get(parent_path)
+				.ok_or_else(|| internal("remote parent dir for upload is missing"))?
+				.clone();
+			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
+			let path = local_path(ctx.local_root, rel_path);
+			let (uploaded, _file) = ctx
+				.client
+				.upload_file_from_path(&parent_type, path, None)
+				.await?;
+			let local = ctx.local.get(rel_path);
+			let new_uuid: Uuid = (uploaded.uuid()).into();
+			upsert_file_baseline(
+				ctx,
+				rel_path,
+				Some(new_uuid),
+				local.and_then(|n| n.content_hash),
+				local.map(|n| n.size).unwrap_or(0),
+				local.map(|n| n.mtime_millis),
+				Some(uploaded.timestamp.timestamp_millis()),
+			)
+			.await?;
+			report.uploaded += 1;
+		}
+		SyncAction::TrashRemote {
+			rel_path,
+			kind,
+			remote_uuid,
+		} => {
+			match kind {
+				NodeKind::File => {
+					let cacheable = file_by_uuid
+						.get(remote_uuid)
+						.ok_or_else(|| internal("trash target file missing from the snapshot"))?;
+					let mut remote_file = RemoteFile::from((*cacheable).clone());
+					ctx.client.trash_file(&mut remote_file).await?;
+				}
+				NodeKind::Dir => {
+					let mut remote_dir = dir_by_path
+						.get(rel_path)
+						.cloned()
+						.ok_or_else(|| internal("trash target dir missing from the snapshot"))?;
+					ctx.client.trash_dir(&mut remote_dir).await?;
+				}
+			}
+			delete_baseline(ctx, rel_path).await?;
+			report.remotely_trashed += 1;
+		}
+		SyncAction::Conflict { .. } => {
+			// Conflicts are reported by the engine, never applied here.
+		}
+	}
+	Ok(())
+}
+
+fn local_mtime_of(path: &Path) -> Option<i64> {
+	use crate::io::FilenMetaExt;
+	std::fs::metadata(path)
+		.ok()
+		.map(|m| FilenMetaExt::modified(&m).timestamp_millis())
+}
+
+async fn upsert_dir_baseline(
+	ctx: &ApplyContext<'_>,
+	rel_path: &str,
+	remote_uuid: Option<Uuid>,
+	local_mtime: Option<i64>,
+) -> Result<(), crate::Error> {
+	let entry = BaselineEntry {
+		rel_path: rel_path.to_string(),
+		kind: NodeKind::Dir,
+		remote_uuid,
+		content_hash: None,
+		size: None,
+		local_mtime,
+		remote_modified: None,
+		state: BaselineState::Synced,
+	};
+	ctx.store
+		.lock()
+		.await
+		.upsert_entry(ctx.pair, &entry)
+		.map_err(db_err)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_file_baseline(
+	ctx: &ApplyContext<'_>,
+	rel_path: &str,
+	remote_uuid: Option<Uuid>,
+	content_hash: Option<filen_types::crypto::Blake3Hash>,
+	size: u64,
+	local_mtime: Option<i64>,
+	remote_modified: Option<i64>,
+) -> Result<(), crate::Error> {
+	let entry = BaselineEntry {
+		rel_path: rel_path.to_string(),
+		kind: NodeKind::File,
+		remote_uuid,
+		content_hash,
+		size: Some(size),
+		local_mtime,
+		remote_modified,
+		state: BaselineState::Synced,
+	};
+	ctx.store
+		.lock()
+		.await
+		.upsert_entry(ctx.pair, &entry)
+		.map_err(db_err)
+}
+
+async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), crate::Error> {
+	ctx.store
+		.lock()
+		.await
+		.delete_entry(ctx.pair, rel_path)
+		.map_err(db_err)
+}
+
+/// Move a locally-deleted item into the pair's quarantine dir (recoverable) rather than destroying
+/// it. The original tree position is preserved under the quarantine root. The destination is made
+/// UNIQUE on collision (` (N)` suffix): two deletions at the same path over time must not overwrite
+/// each other (data loss), and renaming a directory onto an existing non-empty quarantine entry
+/// would otherwise fail and wedge the pass forever (a re-failing, never-advancing deletion).
+fn quarantine_local(root: &Path, rel_path: &str) -> Result<(), crate::Error> {
+	let source = local_path(root, rel_path);
+	// A missing source is a no-op — e.g. it already moved as part of an ancestor's quarantine.
+	if source.symlink_metadata().is_err() {
+		return Ok(());
+	}
+	let dest = unique_quarantine_dest(local_path(&root.join(QUARANTINE_DIR), rel_path));
+	if let Some(parent) = dest.parent() {
+		std::fs::create_dir_all(parent).map_err(io_err)?;
+	}
+	std::fs::rename(&source, &dest).map_err(io_err)
+}
+
+/// A quarantine destination that does not already exist: `base`, else `base (1)`, `base (2)`, ...
+/// (the suffix is appended to the whole file name, which is fine for a recovery bin).
+fn unique_quarantine_dest(base: PathBuf) -> PathBuf {
+	if base.symlink_metadata().is_err() {
+		return base;
+	}
+	let parent = base
+		.parent()
+		.map(Path::to_path_buf)
+		.unwrap_or_else(|| PathBuf::from("."));
+	let name = base
+		.file_name()
+		.and_then(|n| n.to_str())
+		.unwrap_or("quarantined");
+	for n in 1..100_000 {
+		let candidate = parent.join(format!("{name} ({n})"));
+		if candidate.symlink_metadata().is_err() {
+			return candidate;
+		}
+	}
+	base
+}
+
+fn io_err(error: std::io::Error) -> crate::Error {
+	crate::Error::custom_with_source(crate::ErrorKind::IO, error, None::<String>)
+}
+
+fn db_err(error: rusqlite::Error) -> crate::Error {
+	crate::Error::custom_with_source(
+		crate::ErrorKind::Internal,
+		error,
+		Some("baseline".to_string()),
+	)
+}
+
+fn internal(message: &'static str) -> crate::Error {
+	crate::Error::custom(crate::ErrorKind::Internal, message)
+}
+
+fn internal_owned(message: String) -> crate::Error {
+	crate::Error::custom(crate::ErrorKind::Internal, message)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use uuid::Uuid;
+
+	fn temp_dir() -> PathBuf {
+		let dir = std::env::temp_dir().join(format!("filen_confine_test_{}", Uuid::new_v4()));
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	#[test]
+	fn confine_allows_paths_under_the_root() {
+		let root = temp_dir();
+		let target = confined_local_target(&root, "sub/file.txt").expect("in-root path allowed");
+		assert!(target.starts_with(&root));
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn confine_rejects_lexical_traversal() {
+		let root = temp_dir();
+		assert!(
+			confined_local_target(&root, "../escape.txt").is_err(),
+			".. component must be refused"
+		);
+		assert!(confined_local_target(&root, "a/../../b").is_err());
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn confine_rejects_writing_through_a_symlink_escaping_the_root() {
+		let root = temp_dir();
+		let outside = temp_dir(); // a sibling dir, NOT under root
+		// `root/link` -> `outside`. Writing `root/link/x` would land in `outside` without confinement.
+		std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+		let result = confined_local_target(&root, "link/x.txt");
+		assert!(
+			result.is_err(),
+			"writing through a symlink that escapes the root must be refused, got {result:?}"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
+		std::fs::remove_dir_all(&outside).ok();
+	}
+
+	#[test]
+	fn confine_allows_a_symlink_that_stays_within_the_root() {
+		let root = temp_dir();
+		std::fs::create_dir_all(root.join("real")).unwrap();
+		std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+		// `root/link` -> `root/real` (inside) — writing through it stays confined.
+		assert!(confined_local_target(&root, "link/x.txt").is_ok());
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn quarantine_makes_a_unique_dest_on_collision_never_overwriting() {
+		let root = temp_dir();
+		let trash = root.join(QUARANTINE_DIR);
+
+		std::fs::write(root.join("x.txt"), b"first").unwrap();
+		quarantine_local(&root, "x.txt").unwrap();
+		assert_eq!(std::fs::read(trash.join("x.txt")).unwrap(), b"first");
+
+		// A second deletion at the same rel path must NOT clobber the first quarantined copy.
+		std::fs::write(root.join("x.txt"), b"second").unwrap();
+		quarantine_local(&root, "x.txt").unwrap();
+		assert_eq!(
+			std::fs::read(trash.join("x.txt")).unwrap(),
+			b"first",
+			"first copy preserved"
+		);
+		assert_eq!(
+			std::fs::read(trash.join("x.txt (1)")).unwrap(),
+			b"second",
+			"second copy under a unique name"
+		);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn quarantine_of_a_missing_source_is_a_noop() {
+		let root = temp_dir();
+		// e.g. the item already moved as part of an ancestor's quarantine.
+		quarantine_local(&root, "already/gone.txt").expect("missing source is a no-op");
+		std::fs::remove_dir_all(&root).ok();
+	}
+}

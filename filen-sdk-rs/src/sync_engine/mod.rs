@@ -22,6 +22,7 @@
 // yet; this allow is removed once the engine is fully wired.
 #![allow(dead_code)]
 
+mod apply;
 mod baseline;
 mod engine;
 mod guard;
@@ -29,5 +30,6 @@ mod mode;
 mod plan;
 mod scan;
 
+pub use apply::SyncReport;
 pub use engine::SyncEngine;
 pub use mode::SyncMode;
