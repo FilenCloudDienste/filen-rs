@@ -23,9 +23,11 @@
 #![allow(dead_code)]
 
 mod baseline;
+mod engine;
 mod guard;
 mod mode;
 mod plan;
 mod scan;
 
+pub use engine::SyncEngine;
 pub use mode::SyncMode;
