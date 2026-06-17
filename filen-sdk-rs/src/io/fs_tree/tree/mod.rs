@@ -617,6 +617,25 @@ where
 	}
 }
 
+/// The key two sibling entries collide under: trimmed, NFC-normalized, and lowercased.
+///
+/// NFC matters because macOS hands back filenames in NFD while Filen (and every other platform)
+/// stores NFC — without it, "café" written on macOS would not collide with the same name from a
+/// remote listing, so a folder download would try to materialize both to one path (the latent bug
+/// this normalization fixes). Lowercasing reflects Filen moving to case-insensitive names. A
+/// pure-ASCII, already-lowercase name is by definition already NFC and folded, so the common case
+/// borrows without allocating; only names with uppercase or non-ASCII bytes pay the normalization.
+fn normalize_collision_key(name: &str) -> Cow<'_, str> {
+	use unicode_normalization::UnicodeNormalization;
+
+	let trimmed = name.trim();
+	if trimmed.is_ascii() && !trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+		Cow::Borrowed(trimmed)
+	} else {
+		Cow::Owned(trimmed.nfc().flat_map(char::to_lowercase).collect())
+	}
+}
+
 fn filter_children<DirExtra, FileExtra, C: CompareStrategy<DirExtra, FileExtra>>(
 	ancestor_stack: &AncestorStack<DirExtra, FileExtra>,
 	parent_name: Option<&str>,
@@ -636,11 +655,7 @@ where
 		};
 
 		let name = interner.resolve(name).unwrap();
-		let name = if name.chars().any(|c| c.is_uppercase()) {
-			Cow::Owned(name.trim().to_lowercase())
-		} else {
-			Cow::Borrowed(name.trim())
-		};
+		let name = normalize_collision_key(name);
 
 		match by_name.entry(name) {
 			hash_map::Entry::Occupied(mut o) => {
@@ -766,6 +781,60 @@ mod tests {
 				Ok(EntryType::File(SecondPassFileEntry::new(name, (), 1)))
 			}
 		}
+	}
+
+	struct KeepFirst;
+
+	impl CompareStrategy<(), ()> for KeepFirst {
+		fn should_replace(_existing: &Entry<(), ()>, _new: &Entry<(), ()>) -> bool {
+			false
+		}
+	}
+
+	#[test]
+	fn normalize_collision_key_trims_folds_case_and_nfc() {
+		// Pure ASCII-lowercase borrows (the common case), trimmed.
+		let key = normalize_collision_key("  report.txt  ");
+		assert_eq!(key, "report.txt");
+		assert!(matches!(key, Cow::Borrowed(_)), "ASCII-lowercase borrows");
+
+		// Case is folded.
+		assert_eq!(normalize_collision_key("Report.TXT"), "report.txt");
+
+		// NFD and NFC spellings of "café" normalize to the SAME key — the macOS folder-download
+		// fix (macOS hands back NFD, the remote listing is NFC).
+		let nfc = "caf\u{e9}"; // é as one precomposed codepoint
+		let nfd = "cafe\u{301}"; // e + combining acute
+		assert_ne!(nfc, nfd, "the two spellings are distinct byte sequences");
+		assert_eq!(normalize_collision_key(nfc), normalize_collision_key(nfd));
+
+		// Uppercase NFD folds onto lowercase NFC too.
+		assert_eq!(
+			normalize_collision_key("CAFE\u{301}"),
+			normalize_collision_key(nfc)
+		);
+	}
+
+	#[test]
+	fn filter_children_collapses_nfc_nfd_duplicates_and_reports_the_collision() {
+		let mut interner = StringInterner::<DefaultBackend>::default();
+		let nfc = interner.get_or_intern("caf\u{e9}.txt");
+		let nfd = interner.get_or_intern("cafe\u{301}.txt");
+		let children = vec![
+			Entry::File(FileEntry::new(nfc, (), 1)),
+			Entry::File(FileEntry::new(nfd, (), 2)),
+		];
+		let stack: AncestorStack<(), ()> = AncestorStack::new();
+
+		let (survivors, errors) =
+			filter_children::<(), (), KeepFirst>(&stack, Some("parent"), children, &interner);
+
+		assert_eq!(
+			survivors.len(),
+			1,
+			"the NFD/NFC pair collapses to a single entry"
+		);
+		assert_eq!(errors.len(), 1, "the collision is reported exactly once");
 	}
 
 	#[test]
