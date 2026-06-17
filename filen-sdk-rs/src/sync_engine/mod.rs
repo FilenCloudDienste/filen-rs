@@ -17,11 +17,6 @@
 //! Native-only: it owns local files, a private read connection to the cache DB, and a `notify` FS
 //! watcher, none of which the wasm single-connection VFS supports.
 
-// WIP: the engine is built incrementally across commits. Until the public `SyncEngine` handle
-// wires the baseline/scan/plan/apply pieces together, some building blocks have no non-test caller
-// yet; this allow is removed once the engine is fully wired.
-#![allow(dead_code)]
-
 mod apply;
 mod baseline;
 mod engine;

@@ -90,6 +90,13 @@ if have cargo; then
 		cargo clippy -p filen-sdk-rs -F uniffi,http-provider --all-targets -- -D warnings
 fi
 
+# Sync-engine clippy (a native-only feature not covered by the default or wasm runs);
+# --all-targets also type-checks the live e2e test binary (which CI does not run).
+if have cargo; then
+	run "cargo clippy -p filen-sdk-rs -F sync-engine -- -D warnings" \
+		cargo clippy -p filen-sdk-rs -F sync-engine --all-targets -- -D warnings
+fi
+
 # WASM clippy: the two configurations wasm-pack.sh ships (the service-worker one
 # with default features OFF and its RUSTFLAGS), run from the filen-sdk-rs
 # sub-workspace like the ci-wasm job does — minus `heif-decoder`.
