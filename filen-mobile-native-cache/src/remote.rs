@@ -266,7 +266,7 @@ impl AuthCacheState {
 			.client
 			.list_recents(None::<&fn(u64, Option<u64>)>)
 			.await?;
-		println!("Updating recents with {dirs:?} dirs and {files:?} files");
+		debug!("Updating recents with {dirs:?} dirs and {files:?} files");
 		sql::update_recents(&mut self.conn(), dirs, files)?;
 		self.last_recents_update
 			.write()
@@ -280,7 +280,7 @@ impl AuthCacheState {
 			.client
 			.list_trash(None::<&fn(u64, Option<u64>)>)
 			.await?;
-		println!("Updating recents with {dirs:?} dirs and {files:?} files");
+		debug!("Updating trash with {dirs:?} dirs and {files:?} files");
 		sql::update_items_with_parent(&mut self.conn(), dirs, files, ParentUuid::Trash)?;
 		self.last_trash_update
 			.write()
@@ -350,7 +350,8 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		debug!("Downloading file with UUID: {uuid}");
-		let uuid = UuidStr::from_str(&uuid).unwrap();
+		let uuid = UuidStr::from_str(&uuid)
+			.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?;
 		let file = DBFile::select(&self.conn(), uuid)
 			.optional()?
 			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {uuid}")))?;
