@@ -171,6 +171,46 @@ impl FilenSdkError {
 	pub fn message(&self) -> String {
 		format!("{}", self)
 	}
+
+	/// The server-provided, human-readable message for server/API errors, if present.
+	///
+	/// Returns `Some` only when the underlying error is a `ResponseError::ApiError` carrying a
+	/// message (i.e. the error kinds that originate from a server response). Prefer this over
+	/// `message()` when surfacing a server error to a user — `message()` wraps everything in a
+	/// developer-oriented `Error of kind ...` string.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen
+	)]
+	pub fn server_message(&self) -> Option<String> {
+		let filen_types::error::ResponseError::ApiError { message, .. } =
+			self.downcast_ref::<filen_types::error::ResponseError>()?;
+
+		message.clone()
+	}
+
+	/// The server-provided error code for server/API errors (e.g. `max_storage_reached`), if present.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen
+	)]
+	pub fn server_code(&self) -> Option<String> {
+		let filen_types::error::ResponseError::ApiError { code, .. } =
+			self.downcast_ref::<filen_types::error::ResponseError>()?;
+
+		code.clone()
+	}
+
+	/// The wrapped (inner) error's message, WITHOUT the `Error of kind ...` wrapper that
+	/// `message()` adds. Returns `None` when there is no inner error. Prefer this over `message()`
+	/// when surfacing a non-server error to a user.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen
+	)]
+	pub fn inner_message(&self) -> Option<String> {
+		self.inner.as_ref().map(|inner| inner.to_string())
+	}
 }
 
 #[cfg_attr(
@@ -576,5 +616,45 @@ mod tests {
 		};
 		let err: Error = response_err.into();
 		assert_eq!(err.kind(), ErrorKind::Server);
+	}
+
+	#[test]
+	fn server_message_and_code_expose_the_api_error() {
+		let response_err = filen_types::error::ResponseError::ApiError {
+			message: Some("Invalid API key".into()),
+			code: Some("api_key_not_found".into()),
+		};
+		let err: Error = response_err.into();
+		assert_eq!(err.server_message().as_deref(), Some("Invalid API key"));
+		assert_eq!(err.server_code().as_deref(), Some("api_key_not_found"));
+	}
+
+	#[test]
+	fn server_message_and_code_are_none_for_non_server_errors() {
+		let err = Error::custom_with_source(
+			ErrorKind::IO,
+			io::Error::new(io::ErrorKind::Other, "boom"),
+			None::<&'static str>,
+		);
+		assert!(err.server_message().is_none());
+		assert!(err.server_code().is_none());
+	}
+
+	#[test]
+	fn inner_message_returns_underlying_message_without_wrapper() {
+		let err = Error::custom_with_source(
+			ErrorKind::IO,
+			io::Error::new(io::ErrorKind::Other, "boom"),
+			None::<&'static str>,
+		);
+		assert_eq!(err.inner_message().as_deref(), Some("boom"));
+		// Distinct from the developer-oriented `message()` which wraps the kind.
+		assert!(err.message().starts_with("Error of kind"));
+	}
+
+	#[test]
+	fn inner_message_is_none_when_there_is_no_inner() {
+		let err = Error::custom(ErrorKind::Server, "no inner here");
+		assert!(err.inner_message().is_none());
 	}
 }
