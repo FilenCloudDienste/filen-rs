@@ -48,6 +48,9 @@ pub enum SyncEvent {
 	MovingLocal { from: String, to: String },
 	/// An individual action failed; the pass continues past it (the failure is also in the report).
 	ActionFailed { rel_path: String, error: String },
+	/// A path that is already identical on both sides was adopted into the baseline (no transfer) —
+	/// so a later one-sided change at that path is classified correctly rather than misread.
+	AdoptedBaseline { rel_path: String },
 	/// The pass finished; carries the full [`SyncReport`].
 	PassCompleted { report: SyncReport },
 }

@@ -828,11 +828,6 @@ async fn delete_18_baselined_full_delete_is_mirrored() {
 // DELETE-19 — watch mode: a single delete propagates once, no resync loop
 // ============================================================================
 
-#[ignore = "flaky/timing: watch-mode delete propagation. The `gone` poll waits for the debounced \
-watcher + periodic safety-net pass to propagate a single remote delete, which is timing-sensitive \
-live (debounce window vs. cache-convergence cadence) and does not reliably land inside the poll \
-budget. Needs an adaptive/longer poll or the single-step watch control-plane to be deterministic. \
-TODO"]
 #[shared_test_runtime]
 async fn delete_19_watch_single_delete_propagates_once_no_loop() {
 	use std::sync::Arc;
@@ -850,8 +845,15 @@ async fn delete_19_watch_single_delete_propagates_once_no_loop() {
 		.add_pair(sc.local.clone(), sc.remote, SyncMode::LocalToRemote)
 		.await
 		.unwrap();
-	// Adopt the already-synced state into this engine's baseline (no-op first pass).
-	let _ = engine.sync_once(pair).await.unwrap();
+	// Adopt the already-synced state into this engine's baseline: the pass transfers nothing but
+	// records w.txt, so the later delete is screened as a tracked deletion rather than held as a
+	// first sync against a non-empty destination.
+	let r_adopt = engine.sync_once(pair).await.unwrap();
+	assert!(r_adopt.errors.is_empty(), "{r_adopt:?}");
+	assert_eq!(
+		r_adopt.uploaded, 0,
+		"adoption transfers nothing: {r_adopt:?}"
+	);
 	let handle = engine.clone().watch(pair).await.unwrap();
 
 	// Delete locally; the watcher should mirror it to the remote exactly once.
