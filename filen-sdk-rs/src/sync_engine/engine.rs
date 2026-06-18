@@ -183,7 +183,17 @@ impl SyncEngine {
 		let prep = self.prepare(pair).await?;
 		let mut report = SyncReport::default();
 
+		tracing::debug!(
+			"sync_once[pair {pair}]: mode {:?} — local scan {} node(s) (complete={}), remote view {} node(s) (converged={})",
+			prep.record.mode,
+			prep.local_scan.nodes.len(),
+			prep.local_scan.complete,
+			prep.remote_view.nodes.len(),
+			prep.remote_converged,
+		);
+
 		if let Some(refusal) = refusal(&prep) {
+			tracing::debug!("sync_once[pair {pair}]: refused — {refusal:?}");
 			report.errors.push(format!(
 				"refused: name collision ({refusal:?}); resolve it and retry"
 			));
@@ -196,6 +206,11 @@ impl SyncEngine {
 		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
 
 		if decision.safe.is_empty() {
+			tracing::debug!(
+				"sync_once[pair {pair}]: nothing to apply ({} deletion(s) held, {} conflict(s))",
+				report.held_deletions,
+				report.conflicts.len(),
+			);
 			return Ok(report);
 		}
 
@@ -216,6 +231,20 @@ impl SyncEngine {
 			files: &prep.files,
 		};
 		apply::apply(ctx, decision.safe, &mut report).await;
+		tracing::debug!(
+			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} error(s)",
+			report.uploaded,
+			report.downloaded,
+			report.remote_dirs_created,
+			report.local_dirs_created,
+			report.remotely_trashed,
+			report.locally_deleted,
+			report.moved_remote,
+			report.moved_local,
+			report.conflicts.len(),
+			report.held_deletions,
+			report.errors.len(),
+		);
 		Ok(report)
 	}
 }

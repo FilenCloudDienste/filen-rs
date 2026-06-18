@@ -149,8 +149,10 @@ pub(super) async fn apply(
 	}
 
 	for action in actions {
+		tracing::debug!("apply: {}", action.describe());
 		if let Err(error) = apply_one(&ctx, &action, &file_by_uuid, &mut dir_by_path, report).await
 		{
+			tracing::debug!("apply: {} FAILED — {error}", action.describe());
 			report
 				.errors
 				.push(format!("{}: {error}", action.rel_path()));
