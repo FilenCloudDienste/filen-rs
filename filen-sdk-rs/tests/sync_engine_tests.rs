@@ -15,7 +15,7 @@ use filen_sdk_rs::{
 		dir::RemoteDirectory,
 		file::meta::FileMetaChanges,
 	},
-	sync_engine::{SyncEngine, SyncMode},
+	sync_engine::{SyncEngine, SyncEvent, SyncMode},
 };
 use uuid::Uuid;
 
@@ -44,6 +44,97 @@ async fn remote_listing(client: &Client, dir: &RemoteDirectory) -> (Vec<String>,
 		.map(|f| f.name().unwrap().to_string())
 		.collect();
 	(dir_names, file_names)
+}
+
+/// `sync_once_observed` reports live per-action progress events to the caller's observer, in
+/// happen-before order (PassStarted → Planned → per-action → PassCompleted).
+#[shared_test_runtime]
+async fn sync_once_observed_reports_per_action_events() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	assert!(
+		wait_for_converged_resync(
+			&cache.messages,
+			resources.dir.uuid().into(),
+			0,
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await,
+		"initial resync of the empty root should converge"
+	);
+
+	let local = temp_local_dir();
+	std::fs::write(local.join("a.txt"), b"alpha").unwrap();
+	std::fs::create_dir(local.join("sub")).unwrap();
+	std::fs::write(local.join("sub").join("b.txt"), b"bravo").unwrap();
+
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(
+			local.clone(),
+			resources.dir.uuid().into(),
+			SyncMode::LocalToRemote,
+		)
+		.await
+		.unwrap();
+
+	let events = Arc::new(std::sync::Mutex::new(Vec::<SyncEvent>::new()));
+	let sink = Arc::clone(&events);
+	let report = engine
+		.sync_once_observed(pair, &mut move |event| sink.lock().unwrap().push(event))
+		.await
+		.unwrap();
+	assert!(
+		report.errors.is_empty(),
+		"apply errors: {:?}",
+		report.errors
+	);
+
+	// The observer closure is dropped at the end of the call above, so we hold the only ref now.
+	let events = Arc::try_unwrap(events).unwrap().into_inner().unwrap();
+
+	assert!(
+		matches!(
+			events.first(),
+			Some(SyncEvent::PassStarted {
+				mode: SyncMode::LocalToRemote
+			})
+		),
+		"first event must be PassStarted: {events:?}"
+	);
+	assert!(
+		matches!(events.last(), Some(SyncEvent::PassCompleted { report }) if report.uploaded == 2),
+		"last event must be PassCompleted with the final report: {events:?}"
+	);
+	// 2 uploads + 1 dir create = 3 planned actions.
+	assert!(
+		events
+			.iter()
+			.any(|e| matches!(e, SyncEvent::Planned { actions: 3 })),
+		"a Planned event must announce the 3 actions: {events:?}"
+	);
+
+	let uploaded: Vec<&str> = events
+		.iter()
+		.filter_map(|e| match e {
+			SyncEvent::Uploading { rel_path } => Some(rel_path.as_str()),
+			_ => None,
+		})
+		.collect();
+	assert!(
+		uploaded.contains(&"a.txt") && uploaded.contains(&"sub/b.txt"),
+		"both files must emit an Uploading event: {uploaded:?}"
+	);
+	assert!(
+		events
+			.iter()
+			.any(|e| matches!(e, SyncEvent::CreatingRemoteDir { rel_path } if rel_path == "sub")),
+		"the dir must emit a CreatingRemoteDir event: {events:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 /// LocalToRemote: a local tree (a file + a nested dir/file) is created on an empty remote root.

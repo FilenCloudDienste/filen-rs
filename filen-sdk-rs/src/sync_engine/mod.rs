@@ -20,6 +20,7 @@
 mod apply;
 mod baseline;
 mod engine;
+mod events;
 mod guard;
 mod mode;
 mod plan;
@@ -28,5 +29,6 @@ mod watch;
 
 pub use apply::SyncReport;
 pub use engine::SyncEngine;
+pub use events::{SyncEvent, SyncObserver};
 pub use mode::SyncMode;
 pub use watch::WatchHandle;
