@@ -97,6 +97,30 @@ pub fn trees_equal(a: &Path, b: &Path) -> bool {
 	walk_tree(a) == walk_tree(b)
 }
 
+/// Recursively scan `root` — INCLUDING the engine's quarantine bin — for any regular file whose bytes
+/// equal `needle`. Use this (rather than a path-specific [`read_eq`]) to assert that data is
+/// recoverable SOMEWHERE in the tree: e.g. when a remote delete races a local move, the relocated
+/// copy is preserved under the quarantine bin rather than at its destination path.
+pub fn bytes_recoverable_anywhere(root: &Path, needle: &[u8]) -> bool {
+	let mut stack = vec![root.to_path_buf()];
+	while let Some(dir) = stack.pop() {
+		let Ok(rd) = std::fs::read_dir(&dir) else {
+			continue;
+		};
+		for entry in rd.flatten() {
+			let Ok(ft) = entry.file_type() else {
+				continue;
+			};
+			if ft.is_dir() {
+				stack.push(entry.path());
+			} else if ft.is_file() && std::fs::read(entry.path()).is_ok_and(|b| b == needle) {
+				return true;
+			}
+		}
+	}
+	false
+}
+
 /// Assert two local trees are identical, naming the first divergence.
 pub fn assert_trees_identical(a: &Path, b: &Path, label_a: &str, label_b: &str) {
 	let ta = walk_tree(a);
