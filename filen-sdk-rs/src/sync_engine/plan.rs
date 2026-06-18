@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
+	events::SyncEvent,
 	scan::{LocalNode, QUARANTINE_DIR},
 };
 use crate::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
@@ -118,6 +119,44 @@ impl SyncAction {
 			Self::MoveLocal { from_path, to_path } => {
 				format!("move local {from_path:?} -> {to_path:?}")
 			}
+		}
+	}
+
+	/// The "in progress" [`SyncEvent`] for this action, emitted by the apply layer just before it
+	/// executes the action.
+	pub(super) fn to_event(&self) -> SyncEvent {
+		match self {
+			Self::UploadFile { rel_path } => SyncEvent::Uploading {
+				rel_path: rel_path.clone(),
+			},
+			Self::DownloadFile { rel_path, .. } => SyncEvent::Downloading {
+				rel_path: rel_path.clone(),
+			},
+			Self::CreateRemoteDir { rel_path } => SyncEvent::CreatingRemoteDir {
+				rel_path: rel_path.clone(),
+			},
+			Self::CreateLocalDir { rel_path } => SyncEvent::CreatingLocalDir {
+				rel_path: rel_path.clone(),
+			},
+			Self::TrashRemote { rel_path, .. } => SyncEvent::TrashingRemote {
+				rel_path: rel_path.clone(),
+			},
+			Self::DeleteLocal { rel_path, .. } => SyncEvent::DeletingLocal {
+				rel_path: rel_path.clone(),
+			},
+			Self::MoveRemote {
+				from_path, to_path, ..
+			} => SyncEvent::MovingRemote {
+				from: from_path.clone(),
+				to: to_path.clone(),
+			},
+			Self::MoveLocal { from_path, to_path } => SyncEvent::MovingLocal {
+				from: from_path.clone(),
+				to: to_path.clone(),
+			},
+			Self::Conflict { rel_path } => SyncEvent::Conflict {
+				rel_path: rel_path.clone(),
+			},
 		}
 	}
 }
@@ -1064,6 +1103,52 @@ mod tests {
 		assert!(
 			view.nodes.is_empty(),
 			"a remote folder named like the quarantine dir must be excluded from the view"
+		);
+	}
+
+	#[test]
+	fn to_event_maps_each_action_to_its_in_progress_event() {
+		assert_eq!(
+			SyncAction::UploadFile {
+				rel_path: "a.txt".into()
+			}
+			.to_event(),
+			SyncEvent::Uploading {
+				rel_path: "a.txt".into()
+			}
+		);
+		assert_eq!(
+			SyncAction::DownloadFile {
+				rel_path: "b.txt".into(),
+				remote_uuid: Uuid::nil(),
+			}
+			.to_event(),
+			SyncEvent::Downloading {
+				rel_path: "b.txt".into()
+			}
+		);
+		assert_eq!(
+			SyncAction::TrashRemote {
+				rel_path: "gone".into(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::nil(),
+			}
+			.to_event(),
+			SyncEvent::TrashingRemote {
+				rel_path: "gone".into()
+			}
+		);
+		assert_eq!(
+			SyncAction::MoveRemote {
+				from_path: "x".into(),
+				to_path: "y".into(),
+				remote_uuid: Uuid::nil(),
+			}
+			.to_event(),
+			SyncEvent::MovingRemote {
+				from: "x".into(),
+				to: "y".into(),
+			}
 		);
 	}
 

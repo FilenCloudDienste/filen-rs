@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
+	events::SyncEvent,
 	plan::{RemoteNode, SyncAction},
 	scan::{LocalNode, QUARANTINE_DIR},
 };
@@ -34,7 +35,7 @@ use crate::{
 use tokio::sync::Mutex;
 
 /// Outcome of one apply pass.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncReport {
 	pub downloaded: usize,
 	pub uploaded: usize,
@@ -125,11 +126,14 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 	DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
 }
 
-/// Execute `actions` (already ordered + guard-screened) against the remote and local tree.
+/// Execute `actions` (already ordered + guard-screened) against the remote and local tree. Each
+/// action emits an in-progress [`SyncEvent`] to `observer` just before it runs (and an
+/// [`ActionFailed`](SyncEvent::ActionFailed) if it errors).
 pub(super) async fn apply(
 	ctx: ApplyContext<'_>,
 	actions: Vec<SyncAction>,
 	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
 	let file_by_uuid: HashMap<Uuid, &CacheableFile<'static>> =
 		ctx.files.iter().map(|f| (f.uuid, f)).collect();
@@ -149,10 +153,15 @@ pub(super) async fn apply(
 	}
 
 	for action in actions {
+		observer(action.to_event());
 		tracing::debug!("apply: {}", action.describe());
 		if let Err(error) = apply_one(&ctx, &action, &file_by_uuid, &mut dir_by_path, report).await
 		{
 			tracing::debug!("apply: {} FAILED — {error}", action.describe());
+			observer(SyncEvent::ActionFailed {
+				rel_path: action.rel_path().to_string(),
+				error: error.to_string(),
+			});
 			report
 				.errors
 				.push(format!("{}: {error}", action.rel_path()));

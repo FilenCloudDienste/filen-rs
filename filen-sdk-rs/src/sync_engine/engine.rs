@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-	SyncMode,
+	SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
 	baseline::{BaselineEntry, BaselineStore, PairId, PairRecord},
 	guard::{self, DeleteGuard, GuardReason},
@@ -180,6 +180,17 @@ impl SyncEngine {
 
 	/// Run one full sync pass: plan, screen, and apply against the remote and local tree.
 	pub async fn sync_once(&self, pair: PairId) -> Result<SyncReport, Error> {
+		self.sync_once_observed(pair, &mut |_| {}).await
+	}
+
+	/// Like [`sync_once`](Self::sync_once), but reports live progress: `observer` is invoked with
+	/// each [`SyncEvent`] as the pass plans and applies its actions (see [`SyncEvent`] for the
+	/// event order). The observer is called synchronously between async steps, so keep it quick.
+	pub async fn sync_once_observed(
+		&self,
+		pair: PairId,
+		observer: &mut (dyn FnMut(SyncEvent) + Send),
+	) -> Result<SyncReport, Error> {
 		let prep = self.prepare(pair).await?;
 		let mut report = SyncReport::default();
 
@@ -191,12 +202,22 @@ impl SyncEngine {
 			prep.remote_view.nodes.len(),
 			prep.remote_converged,
 		);
+		observer(SyncEvent::PassStarted {
+			mode: prep.record.mode,
+		});
 
 		if let Some(refusal) = refusal(&prep) {
 			tracing::debug!("sync_once[pair {pair}]: refused — {refusal:?}");
-			report.errors.push(format!(
-				"refused: name collision ({refusal:?}); resolve it and retry"
-			));
+			let reason = format!("name collision ({refusal:?})");
+			observer(SyncEvent::Refused {
+				reason: reason.clone(),
+			});
+			report
+				.errors
+				.push(format!("refused: {reason}; resolve it and retry"));
+			observer(SyncEvent::PassCompleted {
+				report: report.clone(),
+			});
 			return Ok(report);
 		}
 
@@ -205,12 +226,30 @@ impl SyncEngine {
 		report.held_deletions = decision.held.len();
 		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
 
+		for rel_path in &report.conflicts {
+			observer(SyncEvent::Conflict {
+				rel_path: rel_path.clone(),
+			});
+		}
+		if report.held_deletions > 0 {
+			observer(SyncEvent::DeletionsHeld {
+				count: report.held_deletions,
+				reason: report.guard_message.clone().unwrap_or_default(),
+			});
+		}
+		observer(SyncEvent::Planned {
+			actions: decision.safe.len(),
+		});
+
 		if decision.safe.is_empty() {
 			tracing::debug!(
 				"sync_once[pair {pair}]: nothing to apply ({} deletion(s) held, {} conflict(s))",
 				report.held_deletions,
 				report.conflicts.len(),
 			);
+			observer(SyncEvent::PassCompleted {
+				report: report.clone(),
+			});
 			return Ok(report);
 		}
 
@@ -230,7 +269,7 @@ impl SyncEngine {
 			dirs: &prep.dirs,
 			files: &prep.files,
 		};
-		apply::apply(ctx, decision.safe, &mut report).await;
+		apply::apply(ctx, decision.safe, &mut report, observer).await;
 		tracing::debug!(
 			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} error(s)",
 			report.uploaded,
@@ -245,6 +284,9 @@ impl SyncEngine {
 			report.held_deletions,
 			report.errors.len(),
 		);
+		observer(SyncEvent::PassCompleted {
+			report: report.clone(),
+		});
 		Ok(report)
 	}
 }
