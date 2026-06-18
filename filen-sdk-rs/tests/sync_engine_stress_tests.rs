@@ -6,7 +6,7 @@
 //!   - `SYNC_STRESS_CONTENTION_N`  (Test 2, default 200):    total disjoint-file count.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	path::{Path, PathBuf},
 	time::Duration,
 };
@@ -14,7 +14,7 @@ use std::{
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	fs::HasUUID,
-	sync_engine::{SyncEngine, SyncMode},
+	sync_engine::{SyncEngine, SyncMode, SyncReport},
 };
 use uuid::Uuid;
 
@@ -53,6 +53,13 @@ fn walk_into(root: &Path, dir: &Path, map: &mut TreeMap) {
 			.unwrap()
 			.to_string_lossy()
 			.replace('\\', "/");
+		// Skip the engine's local quarantine bin (`.filen-sync-trash`, top-level under the sync
+		// root): it holds recovery copies of items a propagated delete removed on THIS side only, so
+		// it is engine-internal state — not synced content — and the engine itself excludes it from
+		// scanning. Including it would make two genuinely-converged trees compare unequal.
+		if rel == ".filen-sync-trash" {
+			continue;
+		}
 		let ft = entry.file_type().unwrap();
 		if ft.is_dir() {
 			map.insert(rel, (true, 0, Vec::new()));
@@ -538,4 +545,469 @@ fn has_conflict_named_survivor(root: &Path) -> bool {
 		}
 	}
 	false
+}
+
+// ===========================================================================
+// Two-client NON-COLLIDING convergence — changes propagate both ways, in any sync order.
+// ===========================================================================
+
+/// The order in which the two clients' sync passes run within one round.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+	AFirst,
+	BFirst,
+	Concurrent,
+}
+
+/// Write a file (creating parent dirs) under `root`.
+fn write_file(root: &Path, rel: &str, bytes: &[u8]) {
+	let path = root.join(rel);
+	std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+	std::fs::write(&path, bytes).unwrap();
+}
+
+/// True if the file at `rel` under `root` exists and its bytes equal `expected`.
+fn read_eq(root: &Path, rel: &str, expected: &[u8]) -> bool {
+	std::fs::read(root.join(rel)).is_ok_and(|b| b == expected)
+}
+
+/// Rename/move `from` -> `to` under `root` (creating the destination's parent dirs).
+fn move_file(root: &Path, from: &str, to: &str) {
+	let dst = root.join(to);
+	std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+	std::fs::rename(root.join(from), dst).unwrap();
+}
+
+/// True once the two local trees are byte-for-byte identical.
+fn trees_equal(a: &Path, b: &Path) -> bool {
+	walk_tree(a) == walk_tree(b)
+}
+
+/// Run one sync round — one pass per client, in the given order — returning both reports.
+async fn sync_round(
+	ea: &SyncEngine,
+	pa: i64,
+	eb: &SyncEngine,
+	pb: i64,
+	order: Order,
+) -> (SyncReport, SyncReport) {
+	match order {
+		Order::AFirst => {
+			let ra = ea.sync_once(pa).await.expect("engine A sync_once");
+			let rb = eb.sync_once(pb).await.expect("engine B sync_once");
+			(ra, rb)
+		}
+		Order::BFirst => {
+			let rb = eb.sync_once(pb).await.expect("engine B sync_once");
+			let ra = ea.sync_once(pa).await.expect("engine A sync_once");
+			(ra, rb)
+		}
+		Order::Concurrent => {
+			let (ra, rb) = tokio::join!(ea.sync_once(pa), eb.sync_once(pb));
+			(
+				ra.expect("engine A sync_once"),
+				rb.expect("engine B sync_once"),
+			)
+		}
+	}
+}
+
+/// Run sync rounds in `order` until `done` holds, panicking after a bound. Every pass must be
+/// error-free; any surfaced conflict is recorded into `conflicts` (a NON-colliding scenario must
+/// surface none — the caller asserts that). A short settle between rounds lets each client's cache
+/// observe the other's just-committed remote writes before the next pass.
+#[allow(clippy::too_many_arguments)]
+async fn converge(
+	ea: &SyncEngine,
+	pa: i64,
+	eb: &SyncEngine,
+	pb: i64,
+	order: Order,
+	conflicts: &mut BTreeSet<String>,
+	label: &str,
+	done: impl Fn() -> bool,
+) {
+	const MAX_ROUNDS: usize = 20;
+	for _ in 0..MAX_ROUNDS {
+		let (ra, rb) = sync_round(ea, pa, eb, pb, order).await;
+		assert!(
+			ra.errors.is_empty(),
+			"{label}: engine A reported errors {:?}",
+			ra.errors
+		);
+		assert!(
+			rb.errors.is_empty(),
+			"{label}: engine B reported errors {:?}",
+			rb.errors
+		);
+		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
+			conflicts.insert(c.clone());
+		}
+		if done() {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(1500)).await;
+	}
+	panic!("{label}: did not converge within {MAX_ROUNDS} rounds (order {order:?})");
+}
+
+/// A bunch of NON-COLLIDING changes (at most one client touches any given path between syncs)
+/// applied across two clients two-way-syncing the same remote dir. Each change must propagate to
+/// the other client and leave both local trees byte-for-byte identical — and the sync order is
+/// rotated (A-first / B-first / concurrent) per scenario to show it does not matter. No scenario
+/// here is a genuine conflict, so the engine must surface ZERO conflicts across the whole run.
+#[ignore = "reason: heavy/live — two clients, many non-colliding edits, must converge both ways"]
+#[shared_test_runtime]
+async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid().into();
+	let cache_a = TestCache::new(&resources.client, remote).await;
+	let cache_b = TestCache::new(&resources.client, remote).await;
+	let local_a = fresh_local_dir("nca");
+	let local_b = fresh_local_dir("ncb");
+
+	// Seed the shared baseline on A only; converging makes B pull it so BOTH baselines record it
+	// (so later one-sided deletes/edits are recognized, not held by the first-sync guard).
+	for rel in [
+		"base/s0.txt",
+		"base/s1.txt",
+		"base/s2.txt",
+		"top.txt",
+		"keep/k0.txt",
+	] {
+		write_file(&local_a, rel, content_for(rel).as_slice());
+	}
+
+	let engine_a = SyncEngine::open(cache_a.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let engine_b = SyncEngine::open(cache_b.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pa = engine_a
+		.add_pair(local_a.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let pb = engine_b
+		.add_pair(local_b.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	let mut conflicts = BTreeSet::new();
+
+	// Establish the shared baseline.
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::AFirst,
+		&mut conflicts,
+		"baseline",
+		|| {
+			trees_equal(&local_a, &local_b)
+				&& local_b.join("top.txt").is_file()
+				&& local_b.join("base/s2.txt").is_file()
+		},
+	)
+	.await;
+
+	// S1 — A creates a new file. [A-first]
+	write_file(&local_a, "a/new1.txt", b"new-one");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::AFirst,
+		&mut conflicts,
+		"S1 A-creates",
+		|| trees_equal(&local_a, &local_b) && read_eq(&local_b, "a/new1.txt", b"new-one"),
+	)
+	.await;
+
+	// S2 — B creates a new nested file (+ dirs). [B-first]
+	write_file(&local_b, "b/deep/new2.txt", b"new-two");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::BFirst,
+		&mut conflicts,
+		"S2 B-creates-nested",
+		|| trees_equal(&local_a, &local_b) && read_eq(&local_a, "b/deep/new2.txt", b"new-two"),
+	)
+	.await;
+
+	// S3 — A modifies an existing file. [concurrent]
+	write_file(&local_a, "top.txt", b"top-modified");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::Concurrent,
+		&mut conflicts,
+		"S3 A-modifies",
+		|| trees_equal(&local_a, &local_b) && read_eq(&local_b, "top.txt", b"top-modified"),
+	)
+	.await;
+
+	// S4 — B renames a file in place (unique content -> uuid move). [A-first]
+	move_file(&local_b, "base/s0.txt", "base/renamed0.txt");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::AFirst,
+		&mut conflicts,
+		"S4 B-renames",
+		|| {
+			trees_equal(&local_a, &local_b)
+				&& local_a.join("base/renamed0.txt").is_file()
+				&& !local_a.join("base/s0.txt").exists()
+		},
+	)
+	.await;
+
+	// S5 — A moves a file across directories. [B-first]
+	move_file(&local_a, "base/s1.txt", "moved/s1.txt");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::BFirst,
+		&mut conflicts,
+		"S5 A-moves",
+		|| {
+			trees_equal(&local_a, &local_b)
+				&& local_b.join("moved/s1.txt").is_file()
+				&& !local_b.join("base/s1.txt").exists()
+		},
+	)
+	.await;
+
+	// S6 — A deletes a file (one-sided delete propagates). [concurrent]
+	std::fs::remove_file(local_a.join("base/s2.txt")).unwrap();
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::Concurrent,
+		&mut conflicts,
+		"S6 A-deletes",
+		|| trees_equal(&local_a, &local_b) && !local_b.join("base/s2.txt").exists(),
+	)
+	.await;
+
+	// S7 — B creates an empty directory. [A-first]
+	std::fs::create_dir_all(local_b.join("emptydir")).unwrap();
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::AFirst,
+		&mut conflicts,
+		"S7 B-empty-dir",
+		|| trees_equal(&local_a, &local_b) && local_a.join("emptydir").is_dir(),
+	)
+	.await;
+
+	// S8 — B deletes the (now-converged) empty directory. [B-first]
+	std::fs::remove_dir(local_b.join("emptydir")).unwrap();
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::BFirst,
+		&mut conflicts,
+		"S8 B-deletes-empty-dir",
+		|| trees_equal(&local_a, &local_b) && !local_a.join("emptydir").exists(),
+	)
+	.await;
+
+	// S9 — both sides create DIFFERENT files in the same round (disjoint). [concurrent]
+	write_file(&local_a, "a/x.txt", b"x");
+	write_file(&local_b, "b/y.txt", b"y");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::Concurrent,
+		&mut conflicts,
+		"S9 disjoint-creates",
+		|| {
+			trees_equal(&local_a, &local_b)
+				&& local_b.join("a/x.txt").is_file()
+				&& local_a.join("b/y.txt").is_file()
+		},
+	)
+	.await;
+
+	// S10 — both sides edit DIFFERENT existing files in the same round (disjoint). [concurrent]
+	write_file(&local_a, "a/new1.txt", b"new-one-edited");
+	write_file(&local_b, "top.txt", b"top-modified-again");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::Concurrent,
+		&mut conflicts,
+		"S10 disjoint-edits",
+		|| {
+			trees_equal(&local_a, &local_b)
+				&& read_eq(&local_b, "a/new1.txt", b"new-one-edited")
+				&& read_eq(&local_a, "top.txt", b"top-modified-again")
+		},
+	)
+	.await;
+
+	// S11 — both sides create the SAME new path with IDENTICAL content (the adopt/no-op branch:
+	// both changed but agree, so it is NOT a conflict). [concurrent]
+	write_file(&local_a, "shared/same.txt", b"identical");
+	write_file(&local_b, "shared/same.txt", b"identical");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::Concurrent,
+		&mut conflicts,
+		"S11 identical-both-create",
+		|| {
+			trees_equal(&local_a, &local_b)
+				&& read_eq(&local_a, "shared/same.txt", b"identical")
+				&& read_eq(&local_b, "shared/same.txt", b"identical")
+		},
+	)
+	.await;
+
+	// S12 — A creates a zero-byte file. [A-first]
+	write_file(&local_a, "a/empty.txt", b"");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::AFirst,
+		&mut conflicts,
+		"S12 zero-byte",
+		|| trees_equal(&local_a, &local_b) && read_eq(&local_b, "a/empty.txt", b""),
+	)
+	.await;
+
+	assert!(
+		conflicts.is_empty(),
+		"non-colliding scenarios must never surface a conflict, but saw: {conflicts:?}"
+	);
+
+	std::fs::remove_dir_all(&local_a).ok();
+	std::fs::remove_dir_all(&local_b).ok();
+}
+
+/// The SAME disjoint change-set must converge to the SAME final tree no matter the sync order.
+/// Runs it under each of the three orders in independent fixtures and asserts identical results.
+#[ignore = "reason: heavy/live — same change-set converges identically under every sync order"]
+#[shared_test_runtime]
+async fn twoway_disjoint_changes_converge_identically_regardless_of_order() {
+	let a = converge_disjoint_under(Order::AFirst).await;
+	let b = converge_disjoint_under(Order::BFirst).await;
+	let c = converge_disjoint_under(Order::Concurrent).await;
+
+	assert!(
+		a == b && b == c,
+		"the same change-set converged to DIFFERENT trees by sync order \
+		 (A-first: {} entries, B-first: {}, concurrent: {})",
+		a.len(),
+		b.len(),
+		c.len()
+	);
+	// Sanity: the expected union really is present.
+	assert!(
+		a.contains_key("seed.txt") && a.contains_key("from_a.txt") && a.contains_key("from_b.txt"),
+		"converged tree missing an expected path: {:?}",
+		a.keys().collect::<Vec<_>>()
+	);
+}
+
+/// A fresh two-client fixture: seed + converge a baseline, then stage the SAME disjoint changes
+/// (A creates `from_a.txt` and edits `seed.txt`; B creates `from_b.txt`), converge under `order`,
+/// assert both local trees agree, and return that converged tree.
+async fn converge_disjoint_under(order: Order) -> TreeMap {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid().into();
+	let cache_a = TestCache::new(&resources.client, remote).await;
+	let cache_b = TestCache::new(&resources.client, remote).await;
+	let local_a = fresh_local_dir("oia");
+	let local_b = fresh_local_dir("oib");
+
+	write_file(&local_a, "seed.txt", b"seed-v1");
+
+	let engine_a = SyncEngine::open(cache_a.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let engine_b = SyncEngine::open(cache_b.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pa = engine_a
+		.add_pair(local_a.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let pb = engine_b
+		.add_pair(local_b.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	let mut conflicts = BTreeSet::new();
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		Order::AFirst,
+		&mut conflicts,
+		"oi-baseline",
+		|| trees_equal(&local_a, &local_b) && local_b.join("seed.txt").is_file(),
+	)
+	.await;
+
+	// Stage the disjoint changes: A adds a file and edits the seed; B adds a different file.
+	write_file(&local_a, "from_a.txt", b"a");
+	write_file(&local_a, "seed.txt", b"seed-v2");
+	write_file(&local_b, "from_b.txt", b"b");
+	converge(
+		&engine_a,
+		pa,
+		&engine_b,
+		pb,
+		order,
+		&mut conflicts,
+		"oi-converge",
+		|| {
+			trees_equal(&local_a, &local_b)
+				&& local_a.join("from_b.txt").is_file()
+				&& local_b.join("from_a.txt").is_file()
+				&& read_eq(&local_b, "seed.txt", b"seed-v2")
+		},
+	)
+	.await;
+
+	assert!(
+		conflicts.is_empty(),
+		"order-independence run ({order:?}) surfaced conflicts: {conflicts:?}"
+	);
+	let tree = walk_tree(&local_a);
+	assert_trees_identical(&tree, &walk_tree(&local_b), "local_a", "local_b");
+
+	std::fs::remove_dir_all(&local_a).ok();
+	std::fs::remove_dir_all(&local_b).ok();
+	tree
 }
