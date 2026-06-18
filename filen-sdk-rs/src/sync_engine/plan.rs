@@ -97,6 +97,29 @@ impl SyncAction {
 	pub(super) fn is_delete(&self) -> bool {
 		matches!(self, Self::DeleteLocal { .. } | Self::TrashRemote { .. })
 	}
+
+	/// A short human-readable description of the action, for `tracing::debug!` tracing of a pass.
+	pub(super) fn describe(&self) -> String {
+		match self {
+			Self::CreateLocalDir { rel_path } => format!("create local dir {rel_path:?}"),
+			Self::DownloadFile { rel_path, .. } => format!("download file {rel_path:?}"),
+			Self::DeleteLocal { rel_path, kind } => {
+				format!("delete local {kind:?} {rel_path:?} (to quarantine)")
+			}
+			Self::CreateRemoteDir { rel_path } => format!("create remote dir {rel_path:?}"),
+			Self::UploadFile { rel_path } => format!("upload file {rel_path:?}"),
+			Self::TrashRemote { rel_path, kind, .. } => {
+				format!("trash remote {kind:?} {rel_path:?}")
+			}
+			Self::Conflict { rel_path } => format!("conflict {rel_path:?}"),
+			Self::MoveRemote {
+				from_path, to_path, ..
+			} => format!("move remote {from_path:?} -> {to_path:?}"),
+			Self::MoveLocal { from_path, to_path } => {
+				format!("move local {from_path:?} -> {to_path:?}")
+			}
+		}
+	}
 }
 
 /// Whether a remote item name is safe to use as a single local path component. Rejects empty,
@@ -353,27 +376,43 @@ fn push_to_remote(
 	actions: &mut Vec<SyncAction>,
 ) {
 	match (local, remote) {
-		(Some(local), None) => actions.push(create_remote(rel_path, local.kind)),
+		(Some(local), None) => {
+			let action = create_remote(rel_path, local.kind);
+			tracing::debug!(
+				"plan: {} — new locally, absent on remote",
+				action.describe()
+			);
+			actions.push(action);
+		}
 		(Some(local), Some(remote)) => {
 			if !remote_matches_local(local, remote, base) {
 				if local.kind != remote.kind {
 					// Type flip: trash the stale remote node, then create the new kind.
-					actions.push(SyncAction::TrashRemote {
+					let trash = SyncAction::TrashRemote {
 						rel_path: rel_path.to_string(),
 						kind: remote.kind,
 						remote_uuid: remote.remote_uuid,
-					});
+					};
+					tracing::debug!("plan: {} — local/remote kind differs", trash.describe());
+					actions.push(trash);
 				}
-				actions.push(create_remote(rel_path, local.kind));
+				let action = create_remote(rel_path, local.kind);
+				tracing::debug!(
+					"plan: {} — local content differs from remote",
+					action.describe()
+				);
+				actions.push(action);
 			}
 		}
 		(None, Some(remote)) => {
 			if delete_ok {
-				actions.push(SyncAction::TrashRemote {
+				let trash = SyncAction::TrashRemote {
 					rel_path: rel_path.to_string(),
 					kind: remote.kind,
 					remote_uuid: remote.remote_uuid,
-				});
+				};
+				tracing::debug!("plan: {} — gone locally (deletion)", trash.describe());
+				actions.push(trash);
 			}
 		}
 		(None, None) => {}
@@ -403,24 +442,40 @@ fn pull_to_local(
 	actions: &mut Vec<SyncAction>,
 ) {
 	match (remote, local) {
-		(Some(remote), None) => actions.push(create_local(rel_path, remote)),
+		(Some(remote), None) => {
+			let action = create_local(rel_path, remote);
+			tracing::debug!(
+				"plan: {} — new on remote, absent locally",
+				action.describe()
+			);
+			actions.push(action);
+		}
 		(Some(remote), Some(local)) => {
 			if !remote_matches_local(local, remote, base) {
 				if local.kind != remote.kind {
-					actions.push(SyncAction::DeleteLocal {
+					let del = SyncAction::DeleteLocal {
 						rel_path: rel_path.to_string(),
 						kind: local.kind,
-					});
+					};
+					tracing::debug!("plan: {} — local/remote kind differs", del.describe());
+					actions.push(del);
 				}
-				actions.push(create_local(rel_path, remote));
+				let action = create_local(rel_path, remote);
+				tracing::debug!(
+					"plan: {} — remote content differs from local",
+					action.describe()
+				);
+				actions.push(action);
 			}
 		}
 		(None, Some(local)) => {
 			if delete_ok {
-				actions.push(SyncAction::DeleteLocal {
+				let del = SyncAction::DeleteLocal {
 					rel_path: rel_path.to_string(),
 					kind: local.kind,
-				});
+				};
+				tracing::debug!("plan: {} — gone on remote (deletion)", del.describe());
+				actions.push(del);
 			}
 		}
 		(None, None) => {}
@@ -459,9 +514,18 @@ fn reconcile_two_way(
 		// genuinely diverged (a conflict the caller resolves; modify-vs-delete is refined later).
 		(true, true) => {
 			if !nodes_agree(local, remote) {
-				actions.push(SyncAction::Conflict {
+				let action = SyncAction::Conflict {
 					rel_path: rel_path.to_string(),
-				});
+				};
+				tracing::debug!(
+					"plan: {} — both sides changed and diverged (local {local_side:?}, remote {remote_side:?})",
+					action.describe()
+				);
+				actions.push(action);
+			} else {
+				tracing::debug!(
+					"plan: {rel_path:?} — both sides changed but converged on the same content; no action"
+				);
 			}
 		}
 	}
@@ -503,10 +567,15 @@ fn detect_moves(
 				&& !local.contains_key(to)
 				&& !consumed.contains(to)
 			{
-				actions.push(SyncAction::MoveLocal {
+				let action = SyncAction::MoveLocal {
 					from_path: from.clone(),
 					to_path: to.to_string(),
-				});
+				};
+				tracing::debug!(
+					"plan: {} — remote item moved (matched by uuid); renaming locally instead of re-downloading",
+					action.describe()
+				);
+				actions.push(action);
 				consumed.insert(from.clone());
 				consumed.insert(to.to_string());
 			}
@@ -550,11 +619,16 @@ fn detect_moves(
 				.collect();
 			// Only an UNAMBIGUOUS match is a move; otherwise fall back to delete + create.
 			if let [to] = fresh[..] {
-				actions.push(SyncAction::MoveRemote {
+				let action = SyncAction::MoveRemote {
 					from_path: from.clone(),
 					to_path: to.to_string(),
 					remote_uuid: uuid,
-				});
+				};
+				tracing::debug!(
+					"plan: {} — local file moved (matched by content hash); re-parenting/renaming on the remote instead of re-uploading",
+					action.describe()
+				);
+				actions.push(action);
 				consumed.insert(from.clone());
 				consumed.insert(to.to_string());
 			}
@@ -572,6 +646,12 @@ pub(crate) fn reconcile(
 ) -> Vec<SyncAction> {
 	let mut actions = Vec::new();
 	let mut consumed = HashSet::new();
+	tracing::debug!(
+		"reconcile: mode {mode:?} — {} baseline / {} local / {} remote entries",
+		baseline.len(),
+		local.len(),
+		remote.len()
+	);
 	// Resolve moves first; their endpoints are then excluded from the per-path reconcile so a move
 	// is never also emitted as a delete + create.
 	detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
@@ -615,6 +695,7 @@ pub(crate) fn reconcile(
 	}
 
 	order_actions(&mut actions);
+	tracing::debug!("reconcile: planned {} action(s)", actions.len());
 	actions
 }
 

@@ -149,7 +149,12 @@ pub(crate) fn screen(
 			reason: None,
 		},
 		Some(reason) => {
-			let (held, safe) = actions.into_iter().partition(SyncAction::is_delete);
+			let (held, safe): (Vec<_>, Vec<_>) =
+				actions.into_iter().partition(SyncAction::is_delete);
+			tracing::debug!(
+				"guard: holding {} deletion(s) back this pass — {reason:?}",
+				held.len()
+			);
 			GuardDecision {
 				safe,
 				held,
