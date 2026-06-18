@@ -65,6 +65,15 @@ pub(crate) enum SyncAction {
 	Conflict {
 		rel_path: String,
 	},
+	/// A path already identical on both sides (or already gone from both) but lacking a correct
+	/// baseline row -> record the converged state into the baseline with NO network/FS transfer, so
+	/// a later one-sided change at this path is classified correctly (a delete reads as a delete, an
+	/// edit as an edit) rather than misread against an empty baseline. Emitted in every mode: a
+	/// one-way pair opened on an already-synced tree transfers nothing, so this is the only thing
+	/// that seeds its baseline — and until it has one, the guard treats every pass as a first sync.
+	AdoptBaseline {
+		rel_path: String,
+	},
 	/// A file moved/renamed on the local side -> re-parent + rename the remote item (uuid kept)
 	/// instead of re-uploading its content.
 	MoveRemote {
@@ -90,13 +99,29 @@ impl SyncAction {
 			| Self::CreateRemoteDir { rel_path }
 			| Self::UploadFile { rel_path }
 			| Self::TrashRemote { rel_path, .. }
-			| Self::Conflict { rel_path } => rel_path,
+			| Self::Conflict { rel_path }
+			| Self::AdoptBaseline { rel_path } => rel_path,
 			Self::MoveRemote { to_path, .. } | Self::MoveLocal { to_path, .. } => to_path,
 		}
 	}
 
 	pub(super) fn is_delete(&self) -> bool {
 		matches!(self, Self::DeleteLocal { .. } | Self::TrashRemote { .. })
+	}
+
+	/// Whether this action MATERIALIZES an item at its path (a directory create or a content
+	/// transfer). A delete whose path matches one of these in the SAME pass is a "replace" (a type
+	/// flip — old item removed, new-kind item created at the same path), and the delete must run
+	/// BEFORE the create or the server rejects it (the old same-name item still exists). See
+	/// [`order_actions`] and the apply layer.
+	pub(super) fn is_create(&self) -> bool {
+		matches!(
+			self,
+			Self::CreateLocalDir { .. }
+				| Self::CreateRemoteDir { .. }
+				| Self::UploadFile { .. }
+				| Self::DownloadFile { .. }
+		)
 	}
 
 	/// A short human-readable description of the action, for `tracing::debug!` tracing of a pass.
@@ -113,6 +138,7 @@ impl SyncAction {
 				format!("trash remote {kind:?} {rel_path:?}")
 			}
 			Self::Conflict { rel_path } => format!("conflict {rel_path:?}"),
+			Self::AdoptBaseline { rel_path } => format!("adopt baseline {rel_path:?}"),
 			Self::MoveRemote {
 				from_path, to_path, ..
 			} => format!("move remote {from_path:?} -> {to_path:?}"),
@@ -155,6 +181,9 @@ impl SyncAction {
 				to: to_path.clone(),
 			},
 			Self::Conflict { rel_path } => SyncEvent::Conflict {
+				rel_path: rel_path.clone(),
+			},
+			Self::AdoptBaseline { rel_path } => SyncEvent::AdoptedBaseline {
 				rel_path: rel_path.clone(),
 			},
 		}
@@ -404,6 +433,53 @@ fn nodes_agree(local: Option<&LocalNode>, remote: Option<&RemoteNode>) -> bool {
 	}
 }
 
+/// Whether the baseline already records exactly what both sides currently hold at a path, so there
+/// is nothing to adopt. `(None, None)` agrees only when there is no row at all.
+fn baseline_is_current(
+	local: Option<&LocalNode>,
+	remote: Option<&RemoteNode>,
+	base: Option<&BaselineEntry>,
+) -> bool {
+	match (local, remote, base) {
+		(None, None, base) => base.is_none(),
+		(Some(local), Some(remote), Some(base)) => {
+			base.kind == local.kind
+				&& base.remote_uuid == Some(remote.remote_uuid)
+				&& match local.kind {
+					NodeKind::Dir => true,
+					NodeKind::File => base.content_hash == local.content_hash,
+				}
+		}
+		_ => false,
+	}
+}
+
+/// Record an already-converged path into the baseline when the baseline does not (yet) say so.
+///
+/// The one-way paths transfer nothing when the two sides already agree, so without this a pair
+/// opened on an already-synced tree would never seed a baseline at all: every later pass would
+/// still see an empty baseline, read as a first sync, and have all its deletions held by the guard.
+/// It is also what retires a stale row for a path both sides have since dropped.
+fn adopt_if_baseline_stale(
+	rel_path: &str,
+	local: Option<&LocalNode>,
+	remote: Option<&RemoteNode>,
+	base: Option<&BaselineEntry>,
+	actions: &mut Vec<SyncAction>,
+) {
+	if baseline_is_current(local, remote, base) {
+		return;
+	}
+	let action = SyncAction::AdoptBaseline {
+		rel_path: rel_path.to_string(),
+	};
+	tracing::debug!(
+		"plan: {} — the two sides already agree; recording the baseline",
+		action.describe()
+	);
+	actions.push(action);
+}
+
 /// Make the remote match the local at one path (push). `delete_ok` gates deletions (off for backup
 /// modes, which never delete on their destination).
 fn push_to_remote(
@@ -441,6 +517,8 @@ fn push_to_remote(
 					action.describe()
 				);
 				actions.push(action);
+			} else {
+				adopt_if_baseline_stale(rel_path, Some(local), Some(remote), base, actions);
 			}
 		}
 		(None, Some(remote)) => {
@@ -454,7 +532,7 @@ fn push_to_remote(
 				actions.push(trash);
 			}
 		}
-		(None, None) => {}
+		(None, None) => adopt_if_baseline_stale(rel_path, None, None, base, actions),
 	}
 }
 
@@ -505,6 +583,8 @@ fn pull_to_local(
 					action.describe()
 				);
 				actions.push(action);
+			} else {
+				adopt_if_baseline_stale(rel_path, Some(local), Some(remote), base, actions);
 			}
 		}
 		(None, Some(local)) => {
@@ -517,7 +597,7 @@ fn pull_to_local(
 				actions.push(del);
 			}
 		}
-		(None, None) => {}
+		(None, None) => adopt_if_baseline_stale(rel_path, None, None, base, actions),
 	}
 }
 
@@ -562,9 +642,18 @@ fn reconcile_two_way(
 				);
 				actions.push(action);
 			} else {
+				// Both sides changed but hold identical content — there is nothing to transfer, but
+				// the baseline is missing or stale here (otherwise this would be the (false,false)
+				// branch). Record the converged state so a LATER one-sided change at this path is
+				// classified correctly instead of being misread against an absent baseline.
+				let action = SyncAction::AdoptBaseline {
+					rel_path: rel_path.to_string(),
+				};
 				tracing::debug!(
-					"plan: {rel_path:?} — both sides changed but converged on the same content; no action"
+					"plan: {} — both sides converged on identical content; recording the baseline",
+					action.describe()
 				);
+				actions.push(action);
 			}
 		}
 	}
@@ -692,8 +781,13 @@ pub(crate) fn reconcile(
 		remote.len()
 	);
 	// Resolve moves first; their endpoints are then excluded from the per-path reconcile so a move
-	// is never also emitted as a delete + create.
-	detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
+	// is never also emitted as a delete + create. Skip this in additive backup modes: a move's
+	// other half is a deletion of the old name, and a backup mode must NEVER delete on its
+	// destination — so a moved item is handled as an additive create of the new name with the old
+	// name retained, not laundered into a move (which would remove the old name).
+	if mode.propagates_deletes() {
+		detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
+	}
 
 	let keys: BTreeSet<&str> = baseline
 		.keys()
@@ -738,39 +832,84 @@ pub(crate) fn reconcile(
 	actions
 }
 
-/// The apply phase of an action. Lower phases run first. Deletions run LAST so a directory
-/// delete (which cascades server-side / quarantines the whole local subtree) can never destroy a
-/// path that an earlier move/transfer still needs — the move/delete-ordering bug where a directory
-/// rename (move children out + delete the old dir) lost its children because the delete ran first.
-fn action_phase(action: &SyncAction) -> u8 {
+/// Apply phases, lowest first. A "replace-delete" (a delete whose path is also created this pass —
+/// a file<->dir type flip) has to precede the create at that path, but a DIRECTORY delete is
+/// recursive (the server trashes a dir's whole subtree; a local delete quarantines it), so it must
+/// still wait until everything moving OUT of that directory has moved.
+const PHASE_FILE_REPLACE_DELETE: u8 = 0;
+const PHASE_CREATE: u8 = 1;
+const PHASE_MOVE: u8 = 2;
+const PHASE_DIR_REPLACE_DELETE: u8 = 3;
+const PHASE_TRANSFER: u8 = 4;
+const PHASE_DELETE: u8 = 5;
+const PHASE_CONFLICT: u8 = 6;
+
+/// The apply phase of an action given the set of paths the pass materializes (`create_targets`).
+/// See the `PHASE_*` constants; other deletes run LAST (child-before-parent) so a directory delete
+/// cannot strand an item an earlier move/transfer still needs.
+fn action_phase(action: &SyncAction, create_targets: &std::collections::HashSet<String>) -> u8 {
 	match action {
-		// Directories that may host a move/transfer destination — created first, parent-before-child.
-		SyncAction::CreateLocalDir { .. } | SyncAction::CreateRemoteDir { .. } => 0,
+		// Replace-delete of a FILE: removing it strands nothing, so it goes first — the create at
+		// that path would otherwise hit the still-present old item.
+		SyncAction::DeleteLocal {
+			kind: NodeKind::File,
+			..
+		}
+		| SyncAction::TrashRemote {
+			kind: NodeKind::File,
+			..
+		} if create_targets.contains(action.rel_path()) => PHASE_FILE_REPLACE_DELETE,
+		// Baseline bookkeeping, no transfer/dependency — order is irrelevant; runs in `pre`.
+		SyncAction::AdoptBaseline { .. } => PHASE_CREATE,
+		// Directories that may host a move/transfer destination — created early, parent-before-child.
+		SyncAction::CreateLocalDir { .. } | SyncAction::CreateRemoteDir { .. } => PHASE_CREATE,
 		// Re-parent/rename in place: sources still exist (deletes run later), destinations now exist.
-		SyncAction::MoveLocal { .. } | SyncAction::MoveRemote { .. } => 1,
+		SyncAction::MoveLocal { .. } | SyncAction::MoveRemote { .. } => PHASE_MOVE,
+		// Replace-delete of a DIRECTORY: recursive, so it runs only after the moves that carry
+		// items out of it — but still before the transfer that recreates the path as a file.
+		SyncAction::DeleteLocal { .. } | SyncAction::TrashRemote { .. }
+			if create_targets.contains(action.rel_path()) =>
+		{
+			PHASE_DIR_REPLACE_DELETE
+		}
 		// Content transfers into already-created parents.
-		SyncAction::UploadFile { .. } | SyncAction::DownloadFile { .. } => 2,
+		SyncAction::UploadFile { .. } | SyncAction::DownloadFile { .. } => PHASE_TRANSFER,
 		// Destructive last, child-before-parent (see `order_actions`).
-		SyncAction::DeleteLocal { .. } | SyncAction::TrashRemote { .. } => 3,
+		SyncAction::DeleteLocal { .. } | SyncAction::TrashRemote { .. } => PHASE_DELETE,
 		// Conflicts are never executed (the engine splits them out); order is irrelevant.
-		SyncAction::Conflict { .. } => 4,
+		SyncAction::Conflict { .. } => PHASE_CONFLICT,
 	}
 }
 
-/// Order the plan so it applies safely: creates (parent-before-child) → moves → transfers →
-/// deletions (child-before-parent). Deletions run last so a cascading directory delete never
-/// removes a path an earlier move/transfer depends on; within the delete phase, child-before-parent
-/// keeps a server-side cascade or a local subtree quarantine from racing its own children.
+/// Paths that a create/transfer materializes this pass (see [`SyncAction::is_create`]).
+pub(super) fn create_target_paths(actions: &[SyncAction]) -> std::collections::HashSet<String> {
+	actions
+		.iter()
+		.filter(|a| a.is_create())
+		.map(|a| a.rel_path().to_string())
+		.collect()
+}
+
+/// Order the plan so it applies safely: file replace-deletes → creates (parent-before-child) →
+/// moves → directory replace-deletes → transfers → the remaining deletions (child-before-parent).
+/// Deletions run last so a cascading directory delete never removes a path an earlier move/transfer
+/// depends on; within a delete phase, child-before-parent keeps a server-side cascade or a local
+/// subtree quarantine from racing its own children.
 ///
-/// (A rare file<->directory type-flip at one path still needs two passes — the create and the
-/// delete of that path land in different phases — but it self-heals and never loses data.)
+/// A file<->directory type flip at one path resolves in a SINGLE pass: the replace-delete phases
+/// put the old item's removal ahead of the create at that path, with the directory case held back
+/// until after the moves because trashing a directory takes its whole subtree with it.
 fn order_actions(actions: &mut [SyncAction]) {
+	let create_targets = create_target_paths(actions);
 	actions.sort_by(|a, b| {
-		let (pa, pb) = (action_phase(a), action_phase(b));
+		let (pa, pb) = (
+			action_phase(a, &create_targets),
+			action_phase(b, &create_targets),
+		);
 		if pa != pb {
 			pa.cmp(&pb)
-		} else if pa == 3 {
-			// Deletes: child-before-parent (descending path).
+		} else if pa == PHASE_DIR_REPLACE_DELETE || pa == PHASE_DELETE {
+			// Deletes that cascade: child-before-parent (descending path).
 			b.rel_path().cmp(a.rel_path())
 		} else {
 			// Everything else: parent-before-child (ascending path).
@@ -820,6 +959,30 @@ mod tests {
 			content_hash: Some(Blake3Hash::from(hash)),
 			size: 10,
 			modified_millis: 1,
+		}
+	}
+
+	fn remote_dir_node(rel: &str, uuid: Uuid) -> RemoteNode {
+		RemoteNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: uuid,
+			content_hash: None,
+			size: 0,
+			modified_millis: 0,
+		}
+	}
+
+	fn base_dir(rel: &str, uuid: Uuid) -> BaselineEntry {
+		BaselineEntry {
+			rel_path: rel.to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: Some(uuid),
+			content_hash: None,
+			size: None,
+			local_mtime: None,
+			remote_modified: None,
+			state: BaselineState::Synced,
 		}
 	}
 
@@ -961,23 +1124,75 @@ mod tests {
 		);
 	}
 
+	const ALL_MODES: [SyncMode; 5] = [
+		SyncMode::LocalToRemote,
+		SyncMode::RemoteToLocal,
+		SyncMode::LocalBackup,
+		SyncMode::RemoteBackup,
+		SyncMode::TwoWay,
+	];
+
 	#[test]
-	fn identical_content_produces_no_action() {
+	fn identical_content_adopts_the_baseline_in_every_mode() {
 		let uuid = Uuid::new_v4();
 		let local = map(vec![("a.txt", local_file("a.txt", [7; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [7; 32]))]);
-		// Same hash on both sides, every mode: nothing to do.
-		for mode in [
-			SyncMode::LocalToRemote,
-			SyncMode::RemoteToLocal,
-			SyncMode::TwoWay,
-			SyncMode::LocalBackup,
-		] {
-			assert!(
-				reconcile(mode, &HashMap::new(), &local, &remote).is_empty(),
-				"{mode:?} should be a no-op for identical content"
+		// An already-converged path with no baseline row is adopted (no transfer) in EVERY mode:
+		// without it a pair opened on an already-synced tree never seeds a baseline, so every later
+		// pass still looks like a first sync and the guard holds all deletions forever.
+		for mode in ALL_MODES {
+			assert_eq!(
+				reconcile(mode, &HashMap::new(), &local, &remote),
+				vec![SyncAction::AdoptBaseline {
+					rel_path: "a.txt".to_string()
+				}],
+				"{mode:?} must adopt the converged path"
 			);
 		}
+		// Once the baseline records it, the pass is a clean no-op — adopting must not re-trigger.
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [7; 32]))]);
+		for mode in ALL_MODES {
+			assert!(
+				reconcile(mode, &baseline, &local, &remote).is_empty(),
+				"{mode:?} must be a no-op once the baseline is current"
+			);
+		}
+	}
+
+	#[test]
+	fn a_baseline_row_for_a_path_gone_from_both_sides_is_adopted_away() {
+		let uuid = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [7; 32]))]);
+		for mode in ALL_MODES {
+			assert_eq!(
+				reconcile(mode, &baseline, &HashMap::new(), &HashMap::new()),
+				vec![SyncAction::AdoptBaseline {
+					rel_path: "a.txt".to_string()
+				}],
+				"{mode:?} must drop the stale baseline row for a convergently-deleted path"
+			);
+		}
+	}
+
+	#[test]
+	fn one_way_modes_adopt_a_matching_dir_so_the_pair_stops_looking_like_a_first_sync() {
+		let uuid = Uuid::new_v4();
+		let remote_dir = RemoteNode {
+			rel_path: "d".to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: uuid,
+			content_hash: None,
+			size: 0,
+			modified_millis: 0,
+		};
+		let local = map(vec![("d", local_dir("d"))]);
+		let remote = map(vec![("d", remote_dir)]);
+		assert_eq!(
+			reconcile(SyncMode::LocalToRemote, &HashMap::new(), &local, &remote),
+			vec![SyncAction::AdoptBaseline {
+				rel_path: "d".to_string()
+			}]
+		);
 	}
 
 	#[test]
@@ -1056,6 +1271,71 @@ mod tests {
 				},
 			],
 			"create new dir, MOVE the child out, THEN trash the old dir — never trash first"
+		);
+	}
+
+	#[test]
+	fn a_directory_replace_delete_runs_after_the_moves_out_of_that_directory() {
+		// The file `item` and the directory `box/` (holding inner.txt) swap names: `item` becomes a
+		// directory holding inner.txt, `box` becomes the file. Trashing a directory is RECURSIVE, so
+		// the trash of `box` must not run before the move that carries `box/inner.txt` out of it —
+		// the server would then reject the move with `cannot_move_this_file`.
+		let item_uuid = Uuid::new_v4();
+		let box_uuid = Uuid::new_v4();
+		let inner_uuid = Uuid::new_v4();
+		let baseline = map(vec![
+			("item", base_file("item", item_uuid, [1; 32])),
+			("box", base_dir("box", box_uuid)),
+			(
+				"box/inner.txt",
+				base_file("box/inner.txt", inner_uuid, [2; 32]),
+			),
+		]);
+		let remote = map(vec![
+			("item", remote_file("item", item_uuid, [1; 32])),
+			("box", remote_dir_node("box", box_uuid)),
+			(
+				"box/inner.txt",
+				remote_file("box/inner.txt", inner_uuid, [2; 32]),
+			),
+		]);
+		let local = map(vec![
+			("item", local_dir("item")),
+			("item/inner.txt", local_file("item/inner.txt", [2; 32])),
+			("box", local_file("box", [1; 32])),
+		]);
+
+		let actions = reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert_eq!(
+			actions,
+			vec![
+				// The old FILE at `item` goes first — nothing hangs off it and the dir create needs
+				// the name free.
+				SyncAction::TrashRemote {
+					rel_path: "item".to_string(),
+					kind: NodeKind::File,
+					remote_uuid: item_uuid,
+				},
+				SyncAction::CreateRemoteDir {
+					rel_path: "item".to_string(),
+				},
+				SyncAction::MoveRemote {
+					from_path: "box/inner.txt".to_string(),
+					to_path: "item/inner.txt".to_string(),
+					remote_uuid: inner_uuid,
+				},
+				// Only now may the old DIRECTORY be trashed; the upload of the new file `box`
+				// follows it.
+				SyncAction::TrashRemote {
+					rel_path: "box".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: box_uuid,
+				},
+				SyncAction::UploadFile {
+					rel_path: "box".to_string(),
+				},
+			],
+			"a recursive dir trash must follow the moves out of it, and precede the create at its path"
 		);
 	}
 
@@ -1196,12 +1476,16 @@ mod tests {
 			}]
 		);
 
-		// Both edited to the SAME content -> converged, no action.
+		// Both edited to the SAME content -> converged (no conflict, no transfer); the now-stale
+		// baseline is refreshed to the converged state via AdoptBaseline.
 		let local = map(vec![("a.txt", local_file("a.txt", [9; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", new_uuid, [9; 32]))]);
-		assert!(
-			reconcile(SyncMode::TwoWay, &baseline, &local, &remote).is_empty(),
-			"identical concurrent edits converge without a conflict"
+		assert_eq!(
+			reconcile(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::AdoptBaseline {
+				rel_path: "a.txt".to_string(),
+			}],
+			"identical concurrent edits converge without a conflict and re-baseline"
 		);
 	}
 

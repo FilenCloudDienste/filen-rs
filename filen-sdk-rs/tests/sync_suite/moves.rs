@@ -372,11 +372,6 @@ async fn move07_swap_two_file_names() {
 // MOVE-08 — Swap a file name with a directory name.
 // ============================================================================
 
-#[ignore = "blocked: a cyclic file<->dir NAME SWAP (item->box while box->item) needs temp-name \
-staging to break the rename cycle — every target name is occupied by the other item, so the engine's \
-create->move->delete phase ordering cannot resolve it and the server rejects the colliding move with \
-`cannot_move_this_file`. Correct handling requires detecting the cycle and routing one leg through a \
-temporary name; unimplemented. TODO: add cycle-breaking to order_actions/apply"]
 #[shared_test_runtime]
 async fn move08_swap_file_and_directory_names() {
 	let sc = single_client(SyncMode::LocalToRemote).await;
