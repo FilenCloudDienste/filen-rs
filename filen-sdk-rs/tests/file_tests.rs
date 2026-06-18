@@ -1,6 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
-use chrono::{SubsecRound, Utc};
+use chrono::{SubsecRound, TimeZone, Utc};
 use filen_macros::shared_test_runtime;
 
 use filen_sdk_rs::{
@@ -18,7 +18,7 @@ use filen_sdk_rs::{
 		},
 		name::{EntryNameError, EntryNameErrorKind},
 	},
-	io::client_impl::IoSharedClientExt,
+	io::{FilenMetaExt, client_impl::IoSharedClientExt},
 	util::MaybeSendCallback,
 };
 use filen_types::fs::Uuid;
@@ -1724,6 +1724,46 @@ async fn download_file_to_path_creates_nonexistent_file() {
 	assert_eq!(downloaded, contents, "downloaded contents do not match");
 
 	cleanup().await;
+}
+
+/// Downloading over an existing local file whose mtime differs from the remote file's must replace
+/// it. The "modified during download" guard compares the destination's mtime before and after the
+/// download; it used to re-stat the temp file instead, whose mtime had just been set to the
+/// remote's, so this case always failed with `FileChangedDuringSync`.
+#[shared_test_runtime]
+async fn download_file_to_path_overwrites_existing_changed_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let remote_contents = b"the new remote content, different length";
+	// Pinned far from the local copy's mtime (written just before the download), so the two
+	// always differ.
+	let remote_mtime = Utc.with_ymd_and_hms(2015, 1, 1, 0, 0, 0).unwrap();
+	let file = client
+		.make_file_builder("overwrite_changed.txt", test_dir.uuid())
+		.unwrap()
+		.modified(remote_mtime);
+	let file = client.upload_file(file, remote_contents).await.unwrap();
+
+	let download_dir = tempfile::tempdir().unwrap();
+	let download_path = download_dir.path().join("overwrite_changed.txt");
+	tokio::fs::write(&download_path, b"stale local content")
+		.await
+		.unwrap();
+
+	client
+		.download_file_to_path(&file, &download_path, None)
+		.await
+		.unwrap_or_else(|e| panic!("re-download over an existing changed file failed: {e}"));
+
+	let downloaded = tokio::fs::read(&download_path).await.unwrap();
+	assert_eq!(
+		downloaded, remote_contents,
+		"the existing local file should be overwritten with the remote content"
+	);
+	let local_mtime = FilenMetaExt::modified(&tokio::fs::metadata(&download_path).await.unwrap());
+	assert_eq!(local_mtime, remote_mtime);
 }
 
 #[shared_test_runtime]

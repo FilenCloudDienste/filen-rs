@@ -422,7 +422,9 @@ where
 	// which are not widely supported across platforms
 	// This at least covers the common case where the file is modified while we are downloading
 	if let Some(mod_time) = mod_time {
-		let current_meta = tokio::fs::metadata(&tmp_path).await?;
+		// Re-stat the destination, not the temp file (whose mtime was just set to the remote's), to
+		// detect whether something else modified the destination while we downloaded.
+		let current_meta = tokio::fs::metadata(path).await?;
 		let current_mod_time = FilenMetaExt::modified(&current_meta);
 		if current_mod_time != mod_time {
 			return Err(Error::custom(
