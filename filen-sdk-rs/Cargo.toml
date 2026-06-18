@@ -56,6 +56,11 @@ required-features = ["sync-engine"]
 name = "sync_engine_stress_tests"
 required-features = ["sync-engine"]
 
+# Grouped black-box sync suite: ONE binary, one module per category (tests/sync_suite/).
+[[test]]
+name = "sync_suite"
+required-features = ["sync-engine"]
+
 [[bench]]
 name = "cache_insertion"
 harness = false
