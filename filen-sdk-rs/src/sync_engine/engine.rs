@@ -169,7 +169,7 @@ impl SyncEngine {
 		if let Some(refusal) = refusal(&prep) {
 			return Ok(PlanOutcome::Refused(refusal));
 		}
-		let (conflicts, decision) = reconcile_and_screen(&prep);
+		let (conflicts, decision) = reconcile_and_screen(&prep, screen_state(&prep));
 		Ok(PlanOutcome::Planned {
 			actions: decision.safe,
 			held_deletions: decision.held,
@@ -221,9 +221,11 @@ impl SyncEngine {
 			return Ok(report);
 		}
 
-		let (conflicts, decision) = reconcile_and_screen(&prep);
+		let state = screen_state(&prep);
+		let (conflicts, decision) = reconcile_and_screen(&prep, state);
 		report.conflicts = conflicts;
-		report.held_deletions = decision.held.len();
+		// `held` can also carry the create half of a held type flip; the report counts deletions.
+		report.held_deletions = decision.held.iter().filter(|a| a.is_delete()).count();
 		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
 
 		for rel_path in &report.conflicts {
@@ -266,6 +268,7 @@ impl SyncEngine {
 			local: &prep.local_scan.nodes,
 			remote: &prep.remote_view.nodes,
 			root_remote,
+			absence_trusted: state.absence_trusted(),
 			dirs: &prep.dirs,
 			files: &prep.files,
 		};
@@ -308,7 +311,10 @@ fn refusal(prep: &Prepared) -> Option<RefuseReason> {
 }
 
 /// Reconcile the prepared inputs and screen deletions through the guard, splitting out conflicts.
-fn reconcile_and_screen(prep: &Prepared) -> (Vec<String>, guard::GuardDecision) {
+fn reconcile_and_screen(
+	prep: &Prepared,
+	state: guard::ScreenState,
+) -> (Vec<String>, guard::GuardDecision) {
 	let all_actions = plan::reconcile(
 		prep.record.mode,
 		&prep.baseline,
@@ -322,7 +328,7 @@ fn reconcile_and_screen(prep: &Prepared) -> (Vec<String>, guard::GuardDecision) 
 		.into_iter()
 		.map(|a| a.rel_path().to_string())
 		.collect();
-	let decision = guard::screen(executable, screen_state(prep), DeleteGuard::default());
+	let decision = guard::screen(executable, state, DeleteGuard::default());
 	(conflicts, decision)
 }
 
