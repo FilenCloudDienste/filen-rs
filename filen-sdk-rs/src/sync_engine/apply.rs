@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::{
 	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
 	events::SyncEvent,
-	plan::{RemoteNode, SyncAction},
+	plan::{RemoteNode, SyncAction, create_target_paths},
 	scan::{LocalNode, QUARANTINE_DIR},
 };
 use crate::{
@@ -69,6 +69,10 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) remote: &'a HashMap<String, RemoteNode>,
 	/// The sync root resolved to a remote directory (every top-level parent).
 	pub(super) root_remote: RemoteDirectory,
+	/// Whether this pass's absence evidence is trustworthy (see
+	/// [`ScreenState::absence_trusted`](super::guard::ScreenState::absence_trusted)) — gates
+	/// dropping a baseline row because both sides look gone.
+	pub(super) absence_trusted: bool,
 	pub(super) dirs: &'a [CacheableDir<'static>],
 	pub(super) files: &'a [CacheableFile<'static>],
 }
@@ -182,11 +186,17 @@ pub(super) async fn apply(
 
 	// Split the phase-ordered plan: creates+moves first (serial — they fill `dir_by_path` and are
 	// parent-before-child), then transfers (concurrent), then deletes (serial — descendant-first).
+	// A "replace-delete" (a delete whose path is (re)created this pass — a file<->dir type flip) is
+	// routed into `pre` so it runs BEFORE the create at that path (the actions are already ordered
+	// so it sorts ahead of the create); otherwise the server rejects the create (old item exists).
+	let create_targets = create_target_paths(&actions);
 	let mut pre = Vec::new();
 	let mut transfers = Vec::new();
 	let mut post = Vec::new();
 	for action in actions {
-		if is_transfer(&action) {
+		if action.is_delete() && create_targets.contains(action.rel_path()) {
+			pre.push(action);
+		} else if is_transfer(&action) {
 			transfers.push(action);
 		} else if action.is_delete() {
 			post.push(action);
@@ -509,8 +519,80 @@ async fn apply_one(
 		SyncAction::Conflict { .. } => {
 			// Conflicts are reported by the engine, never applied here.
 		}
+		SyncAction::AdoptBaseline { rel_path } => {
+			// Record the converged state into the baseline with no transfer, so a later one-sided
+			// change at this path is classified correctly. Both sides agree here (the reconciler
+			// only emits this when they do).
+			match adopt_outcome(
+				rel_path,
+				ctx.local.get(rel_path),
+				ctx.remote.get(rel_path),
+				ctx.absence_trusted,
+			) {
+				AdoptOutcome::Record(entry) => upsert_baseline(ctx, &entry).await?,
+				AdoptOutcome::DropRow => delete_baseline(ctx, rel_path).await?,
+				AdoptOutcome::Keep => {}
+			}
+		}
 	}
 	Ok(())
+}
+
+/// What an [`SyncAction::AdoptBaseline`] writes for one path. Decided purely (no I/O) so the
+/// policy is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum AdoptOutcome {
+	/// Both sides hold the item and agree — record the converged state.
+	Record(BaselineEntry),
+	/// Both sides agree the item is GONE (a convergent delete) — drop the stale baseline row.
+	DropRow,
+	/// Both sides LOOK gone, but this pass's absence evidence is untrustworthy — leave the row for
+	/// a healthy pass to decide.
+	Keep,
+}
+
+/// Decide what adopting `rel_path` writes to the baseline.
+///
+/// The local mtime recorded is the SCAN-time one — the same read the scan-time content hash
+/// belongs to. Re-stat'ing here would pair a fresh mtime with the scan's hash, and a same-size
+/// local edit landing between the scan and the apply (a pass can wait minutes on the drive lock)
+/// would then satisfy the scanner's `(size, mtime)` fast-path forever: the edit never seen, and
+/// pull-overwritten by the next remote change.
+fn adopt_outcome(
+	rel_path: &str,
+	local: Option<&LocalNode>,
+	remote: Option<&RemoteNode>,
+	absence_trusted: bool,
+) -> AdoptOutcome {
+	match (local, remote) {
+		(Some(local), Some(remote)) => AdoptOutcome::Record(BaselineEntry {
+			rel_path: rel_path.to_string(),
+			kind: remote.kind,
+			remote_uuid: Some(remote.remote_uuid),
+			content_hash: match remote.kind {
+				NodeKind::Dir => None,
+				NodeKind::File => remote.content_hash,
+			},
+			size: match remote.kind {
+				NodeKind::Dir => None,
+				NodeKind::File => Some(remote.size),
+			},
+			local_mtime: Some(local.mtime_millis),
+			remote_modified: match remote.kind {
+				NodeKind::Dir => None,
+				NodeKind::File => Some(remote.modified_millis),
+			},
+			state: BaselineState::Synced,
+		}),
+		// A convergent delete drops the row — but only when the pass can trust that both sides are
+		// really gone. Under an incomplete scan or an un-converged/empty remote view the row is the
+		// only record that the item was ever synced; dropping it makes the next healthy pass read
+		// the surviving side as newly Created and resurrect the item instead of propagating the
+		// deletion. The guard holds deletions for exactly this reason; this bookkeeping is not
+		// screened by it, so it checks the same condition itself.
+		_ if absence_trusted => AdoptOutcome::DropRow,
+		_ => AdoptOutcome::Keep,
+	}
 }
 
 fn local_mtime_of(path: &Path) -> Option<i64> {
@@ -536,11 +618,7 @@ async fn upsert_dir_baseline(
 		remote_modified: None,
 		state: BaselineState::Synced,
 	};
-	ctx.store
-		.lock()
-		.await
-		.upsert_entry(ctx.pair, &entry)
-		.map_err(db_err)
+	upsert_baseline(ctx, &entry).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -563,10 +641,17 @@ async fn upsert_file_baseline(
 		remote_modified,
 		state: BaselineState::Synced,
 	};
+	upsert_baseline(ctx, &entry).await
+}
+
+async fn upsert_baseline(
+	ctx: &ApplyContext<'_>,
+	entry: &BaselineEntry,
+) -> Result<(), crate::Error> {
 	ctx.store
 		.lock()
 		.await
-		.upsert_entry(ctx.pair, &entry)
+		.upsert_entry(ctx.pair, entry)
 		.map_err(db_err)
 }
 
@@ -641,8 +726,10 @@ fn internal_owned(message: String) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use filen_types::crypto::Blake3Hash;
 	use uuid::Uuid;
+
+	use super::*;
 
 	fn temp_dir() -> PathBuf {
 		let dir = std::env::temp_dir().join(format!("filen_confine_test_{}", Uuid::new_v4()));
@@ -719,6 +806,63 @@ mod tests {
 			"second copy under a unique name"
 		);
 		std::fs::remove_dir_all(&root).ok();
+	}
+
+	fn local_node(rel: &str, mtime: i64, hash: Option<Blake3Hash>) -> LocalNode {
+		LocalNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::File,
+			size: 3,
+			mtime_millis: mtime,
+			content_hash: hash,
+		}
+	}
+
+	fn remote_node(rel: &str, hash: Option<Blake3Hash>) -> RemoteNode {
+		RemoteNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Uuid::new_v4(),
+			content_hash: hash,
+			size: 3,
+			modified_millis: 900,
+		}
+	}
+
+	#[test]
+	fn adopt_records_the_scan_time_mtime_not_a_fresh_stat() {
+		// The scan hashed the file at mtime 4242. Pairing that hash with any LATER mtime would
+		// make a same-size edit made after the scan invisible to the fast-path forever.
+		let hash = Blake3Hash::from([7; 32]);
+		let local = local_node("a.txt", 4242, Some(hash));
+		let remote = remote_node("a.txt", Some(hash));
+		let AdoptOutcome::Record(entry) = adopt_outcome("a.txt", Some(&local), Some(&remote), true)
+		else {
+			panic!("both sides present must record a row");
+		};
+		assert_eq!(entry.local_mtime, Some(4242), "scan-time mtime recorded");
+		assert_eq!(entry.content_hash, Some(hash));
+		assert_eq!(entry.remote_uuid, Some(remote.remote_uuid));
+		assert_eq!(entry.remote_modified, Some(900));
+	}
+
+	#[test]
+	fn adopt_of_a_convergent_delete_drops_the_row() {
+		assert_eq!(
+			adopt_outcome("gone.txt", None, None, true),
+			AdoptOutcome::DropRow
+		);
+	}
+
+	#[test]
+	fn adopt_keeps_the_row_when_the_absence_evidence_is_untrusted() {
+		// Incomplete scan / un-converged or empty remote view: both sides only LOOK gone. Dropping
+		// the row here makes the next healthy pass see the surviving side as Created and resurrect
+		// the item instead of propagating the deletion.
+		assert_eq!(
+			adopt_outcome("gone.txt", None, None, false),
+			AdoptOutcome::Keep
+		);
 	}
 
 	#[test]
