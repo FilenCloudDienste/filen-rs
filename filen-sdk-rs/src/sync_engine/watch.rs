@@ -15,7 +15,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::Notify;
 
-use super::{baseline::PairId, engine::SyncEngine};
+use super::{SyncEvent, SyncObserver, baseline::PairId, engine::SyncEngine};
 use crate::{
 	Error, ErrorKind,
 	cache::{SyncRootCallback, SyncRootHandle},
@@ -41,6 +41,18 @@ impl SyncEngine {
 	/// or remote change, plus a periodic safety-net pass. Returns a [`WatchHandle`] that stops
 	/// everything when dropped. Requires a multi-threaded runtime (it spawns a background task).
 	pub async fn watch(self: Arc<Self>, pair: PairId) -> Result<WatchHandle, Error> {
+		self.watch_observed(pair, Box::new(|_| {})).await
+	}
+
+	/// Like [`watch`](Self::watch), but `observer` receives a [`SyncEvent`] for everything every
+	/// pass does (see [`SyncEvent`] for the order) — the only way to observe a continuous sync,
+	/// which otherwise discards each pass's report. The observer is moved into the background task
+	/// and called synchronously between async steps, so keep it quick (offload to a channel).
+	pub async fn watch_observed(
+		self: Arc<Self>,
+		pair: PairId,
+		observer: SyncObserver,
+	) -> Result<WatchHandle, Error> {
 		let record = {
 			let store = self.store.lock().await;
 			store
@@ -83,7 +95,7 @@ impl SyncEngine {
 
 		let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 		let engine = Arc::clone(&self);
-		tokio::spawn(run_loop(engine, pair, dirty, shutdown_rx));
+		tokio::spawn(run_loop(engine, pair, dirty, shutdown_rx, observer));
 
 		Ok(WatchHandle {
 			_shutdown: shutdown_tx,
@@ -100,8 +112,9 @@ async fn run_loop(
 	pair: PairId,
 	dirty: Arc<Notify>,
 	mut shutdown: tokio::sync::oneshot::Receiver<()>,
+	mut observer: SyncObserver,
 ) {
-	run_pass(&engine, pair).await;
+	run_pass(&engine, pair, observer.as_mut()).await;
 
 	let mut safety_net = tokio::time::interval(SAFETY_NET);
 	safety_net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -111,7 +124,7 @@ async fn run_loop(
 		tokio::select! {
 			biased;
 			_ = &mut shutdown => break,
-			_ = safety_net.tick() => run_pass(&engine, pair).await,
+			_ = safety_net.tick() => run_pass(&engine, pair, observer.as_mut()).await,
 			_ = dirty.notified() => {
 				// Coalesce the burst: wait for DEBOUNCE of quiet (each new event restarts it).
 				loop {
@@ -122,16 +135,16 @@ async fn run_loop(
 						_ = tokio::time::sleep(DEBOUNCE) => break,
 					}
 				}
-				run_pass(&engine, pair).await;
+				run_pass(&engine, pair, observer.as_mut()).await;
 			}
 		}
 	}
 }
 
 /// Run one pass, logging (not propagating) any failure — the loop is best-effort and the next
-/// trigger or the periodic tick retries.
-async fn run_pass(engine: &SyncEngine, pair: PairId) {
-	match engine.sync_once(pair).await {
+/// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s.
+async fn run_pass(engine: &SyncEngine, pair: PairId, observer: &mut (dyn FnMut(SyncEvent) + Send)) {
+	match engine.sync_once_observed(pair, observer).await {
 		Ok(report) => {
 			if !report.errors.is_empty() {
 				tracing::warn!("sync pair {pair}: {} action error(s)", report.errors.len());
