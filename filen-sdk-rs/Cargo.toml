@@ -45,6 +45,11 @@ required-features = ["cache"]
 name = "sync_engine_tests"
 required-features = ["sync-engine"]
 
+# Black-box e2e tests authored against the documented public API only (no internals).
+[[test]]
+name = "sync_engine_blackbox_tests"
+required-features = ["sync-engine"]
+
 [[bench]]
 name = "cache_insertion"
 harness = false
