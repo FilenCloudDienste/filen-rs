@@ -136,6 +136,52 @@ impl Client {
 		Ok(response.uuid)
 	}
 
+	/// Create a directory whose server-side dedup hash deliberately does NOT match its name.
+	///
+	/// The server dedups same-parent items case-insensitively via `name_hashed` (which a conforming
+	/// client derives from the lowercased name). A client that supplies a mismatched hash bypasses
+	/// that dedup, so two directories whose decrypted names differ only in case (e.g. `Note` and
+	/// `note`) can coexist under one parent. This is the only way to reach that state — used to
+	/// verify that consumers (e.g. the sync engine) detect and refuse such a collision. Test-only.
+	#[cfg(feature = "malformed")]
+	pub async fn create_dir_with_name_hash(
+		&self,
+		parent: &DirType<'_, Normal>,
+		name: &str,
+		name_hashed: &str,
+	) -> Result<RemoteDirectory, Error> {
+		let _lock = self.lock_drive().await?;
+		let (uuid, meta) = RemoteDirectory::make_parts(name, Utc::now())?;
+
+		let response = api::v3::dir::create::post(
+			self.client(),
+			&api::v3::dir::create::Request {
+				uuid,
+				parent: parent.uuid(),
+				name_hashed: Cow::Borrowed(name_hashed),
+				meta: self.crypter().encrypt_meta(&meta.to_json_string()).await,
+			},
+		)
+		.await?;
+
+		// The mismatched hash is the whole point: the server cannot dedup against the
+		// same-cased sibling, so it must hand back the uuid we minted.
+		if uuid != response.uuid {
+			return self.get_dir(response.uuid).await;
+		}
+
+		let dir = RemoteDirectory::new_from_parts(
+			uuid,
+			meta,
+			(parent.uuid()).into(),
+			response.timestamp,
+		);
+
+		self.update_item_with_maybe_connected_parent((&dir).into())
+			.await?;
+		Ok(dir)
+	}
+
 	pub async fn get_dir(&self, uuid: Uuid) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
