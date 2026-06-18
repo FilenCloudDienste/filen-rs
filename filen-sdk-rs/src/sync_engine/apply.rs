@@ -14,6 +14,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use uuid::Uuid;
 
 use super::{
@@ -126,9 +127,20 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 	DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
 }
 
-/// Execute `actions` (already ordered + guard-screened) against the remote and local tree. Each
-/// action emits an in-progress [`SyncEvent`] to `observer` just before it runs (and an
-/// [`ActionFailed`](SyncEvent::ActionFailed) if it errors).
+/// Execute `actions` (already ordered + guard-screened) against the remote and local tree.
+///
+/// The drive-write lock is taken ONCE for the whole pass (when anything mutates the remote) so the
+/// per-op `lock_drive` calls inside upload/create become free clones of the held lock instead of
+/// each doing an acquire+release server round-trip — the dominant per-file cost at scale.
+///
+/// File transfers (uploads/downloads) — the bulk of the work and independent of one another — run
+/// CONCURRENTLY, bounded by the client's configured concurrency ([`ClientConfig::with_concurrency`],
+/// default 16) and the global request rate limiter. Directory creates/moves (which populate the
+/// parent map and have parent-before-child ordering) and deletes (descendant-first for cascade
+/// safety) stay serial.
+///
+/// Each action emits its [`SyncEvent`] to `observer` (and an [`ActionFailed`](SyncEvent::ActionFailed)
+/// if it errors): serial actions when they start, concurrent transfers as each completes.
 pub(super) async fn apply(
 	ctx: ApplyContext<'_>,
 	actions: Vec<SyncAction>,
@@ -152,38 +164,154 @@ pub(super) async fn apply(
 		}
 	}
 
-	for action in actions {
-		observer(action.to_event());
-		tracing::debug!("apply: {}", action.describe());
-		if let Err(error) = apply_one(&ctx, &action, &file_by_uuid, &mut dir_by_path, report).await
-		{
-			tracing::debug!("apply: {} FAILED — {error}", action.describe());
-			observer(SyncEvent::ActionFailed {
-				rel_path: action.rel_path().to_string(),
-				error: error.to_string(),
-			});
-			report
-				.errors
-				.push(format!("{}: {error}", action.rel_path()));
+	// Hold the drive-write lock for the whole pass when it mutates the remote (a pure pull touches
+	// only local files and needs no lock). Inner `lock_drive` calls then return a clone of this.
+	let _drive_lock = if actions.iter().any(mutates_remote) {
+		match ctx.client.lock_drive().await {
+			Ok(lock) => Some(lock),
+			Err(error) => {
+				report
+					.errors
+					.push(format!("failed to acquire the drive lock: {error}"));
+				return;
+			}
 		}
+	} else {
+		None
+	};
+
+	// Split the phase-ordered plan: creates+moves first (serial — they fill `dir_by_path` and are
+	// parent-before-child), then transfers (concurrent), then deletes (serial — descendant-first).
+	let mut pre = Vec::new();
+	let mut transfers = Vec::new();
+	let mut post = Vec::new();
+	for action in actions {
+		if is_transfer(&action) {
+			transfers.push(action);
+		} else if action.is_delete() {
+			post.push(action);
+		} else {
+			pre.push(action);
+		}
+	}
+
+	for action in &pre {
+		apply_serial(
+			&ctx,
+			action,
+			&file_by_uuid,
+			&mut dir_by_path,
+			report,
+			observer,
+		)
+		.await;
+	}
+
+	if !transfers.is_empty() {
+		let concurrency = ctx.client.unauthed().state().max_concurrency().max(1);
+		let ctx_ref = &ctx;
+		let dir_ref = &dir_by_path;
+		let files_ref = &file_by_uuid;
+		let mut stream = std::pin::pin!(
+			futures::stream::iter(transfers.iter())
+				.map(|action| async move {
+					(
+						action,
+						apply_transfer(ctx_ref, action, files_ref, dir_ref).await,
+					)
+				})
+				.buffer_unordered(concurrency)
+		);
+		while let Some((action, result)) = stream.next().await {
+			match result {
+				Ok(()) => {
+					tracing::debug!("apply: {} done", action.describe());
+					observer(action.to_event());
+					match action {
+						SyncAction::UploadFile { .. } => report.uploaded += 1,
+						SyncAction::DownloadFile { .. } => report.downloaded += 1,
+						_ => {}
+					}
+				}
+				Err(error) => {
+					tracing::debug!("apply: {} FAILED — {error}", action.describe());
+					observer(SyncEvent::ActionFailed {
+						rel_path: action.rel_path().to_string(),
+						error: error.to_string(),
+					});
+					report
+						.errors
+						.push(format!("{}: {error}", action.rel_path()));
+				}
+			}
+		}
+	}
+
+	for action in &post {
+		apply_serial(
+			&ctx,
+			action,
+			&file_by_uuid,
+			&mut dir_by_path,
+			report,
+			observer,
+		)
+		.await;
 	}
 }
 
-async fn apply_one(
+/// Whether an action writes to the remote (so the pass must hold the drive-write lock).
+fn mutates_remote(action: &SyncAction) -> bool {
+	matches!(
+		action,
+		SyncAction::UploadFile { .. }
+			| SyncAction::CreateRemoteDir { .. }
+			| SyncAction::TrashRemote { .. }
+			| SyncAction::MoveRemote { .. }
+	)
+}
+
+/// Whether an action is a file transfer (the concurrently-applied bulk).
+fn is_transfer(action: &SyncAction) -> bool {
+	matches!(
+		action,
+		SyncAction::UploadFile { .. } | SyncAction::DownloadFile { .. }
+	)
+}
+
+/// Apply one action serially: emit its in-progress event, run it, and record success/failure.
+async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
 	file_by_uuid: &HashMap<Uuid, &CacheableFile<'static>>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) {
+	observer(action.to_event());
+	tracing::debug!("apply: {}", action.describe());
+	if let Err(error) = apply_one(ctx, action, file_by_uuid, dir_by_path, report).await {
+		tracing::debug!("apply: {} FAILED — {error}", action.describe());
+		observer(SyncEvent::ActionFailed {
+			rel_path: action.rel_path().to_string(),
+			error: error.to_string(),
+		});
+		report
+			.errors
+			.push(format!("{}: {error}", action.rel_path()));
+	}
+}
+
+/// Perform a transfer (download or upload): the network op + baseline write only. It touches no
+/// shared mutable state — it READS `dir_by_path` and the baseline store is internally locked — so
+/// transfers run concurrently; the caller does the report/event accounting as each completes.
+async fn apply_transfer(
+	ctx: &ApplyContext<'_>,
+	action: &SyncAction,
+	file_by_uuid: &HashMap<Uuid, &CacheableFile<'static>>,
+	dir_by_path: &HashMap<String, RemoteDirectory>,
 ) -> Result<(), crate::Error> {
 	match action {
-		SyncAction::CreateLocalDir { rel_path } => {
-			let path = confined_local_target(ctx.local_root, rel_path)?;
-			std::fs::create_dir_all(&path).map_err(io_err)?;
-			let remote_uuid = ctx.remote.get(rel_path).map(|n| n.remote_uuid);
-			upsert_dir_baseline(ctx, rel_path, remote_uuid, local_mtime_of(&path)).await?;
-			report.local_dirs_created += 1;
-		}
 		SyncAction::DownloadFile {
 			rel_path,
 			remote_uuid,
@@ -210,6 +338,56 @@ async fn apply_one(
 				remote.map(|n| n.modified_millis),
 			)
 			.await?;
+		}
+		SyncAction::UploadFile { rel_path } => {
+			let (parent_path, _) = parent_and_name(rel_path);
+			let parent = dir_by_path
+				.get(parent_path)
+				.ok_or_else(|| internal("remote parent dir for upload is missing"))?
+				.clone();
+			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
+			let path = local_path(ctx.local_root, rel_path);
+			let (uploaded, _file) = ctx
+				.client
+				.upload_file_from_path(&parent_type, path, None)
+				.await?;
+			let local = ctx.local.get(rel_path);
+			let new_uuid: Uuid = (uploaded.uuid()).into();
+			upsert_file_baseline(
+				ctx,
+				rel_path,
+				Some(new_uuid),
+				local.and_then(|n| n.content_hash),
+				local.map(|n| n.size).unwrap_or(0),
+				local.map(|n| n.mtime_millis),
+				Some(uploaded.timestamp.timestamp_millis()),
+			)
+			.await?;
+		}
+		_ => return Err(internal("apply_transfer called with a non-transfer action")),
+	}
+	Ok(())
+}
+
+async fn apply_one(
+	ctx: &ApplyContext<'_>,
+	action: &SyncAction,
+	file_by_uuid: &HashMap<Uuid, &CacheableFile<'static>>,
+	dir_by_path: &mut HashMap<String, RemoteDirectory>,
+	report: &mut SyncReport,
+) -> Result<(), crate::Error> {
+	match action {
+		SyncAction::CreateLocalDir { rel_path } => {
+			let path = confined_local_target(ctx.local_root, rel_path)?;
+			std::fs::create_dir_all(&path).map_err(io_err)?;
+			let remote_uuid = ctx.remote.get(rel_path).map(|n| n.remote_uuid);
+			upsert_dir_baseline(ctx, rel_path, remote_uuid, local_mtime_of(&path)).await?;
+			report.local_dirs_created += 1;
+		}
+		// Transfers normally run via the concurrent path in `apply`; these arms keep `apply_one`
+		// total and correct if a transfer is ever applied serially.
+		SyncAction::DownloadFile { .. } => {
+			apply_transfer(ctx, action, file_by_uuid, dir_by_path).await?;
 			report.downloaded += 1;
 		}
 		SyncAction::DeleteLocal { rel_path, .. } => {
@@ -238,30 +416,8 @@ async fn apply_one(
 			upsert_dir_baseline(ctx, rel_path, Some(new_uuid), None).await?;
 			report.remote_dirs_created += 1;
 		}
-		SyncAction::UploadFile { rel_path } => {
-			let (parent_path, _) = parent_and_name(rel_path);
-			let parent = dir_by_path
-				.get(parent_path)
-				.ok_or_else(|| internal("remote parent dir for upload is missing"))?
-				.clone();
-			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
-			let path = local_path(ctx.local_root, rel_path);
-			let (uploaded, _file) = ctx
-				.client
-				.upload_file_from_path(&parent_type, path, None)
-				.await?;
-			let local = ctx.local.get(rel_path);
-			let new_uuid: Uuid = (uploaded.uuid()).into();
-			upsert_file_baseline(
-				ctx,
-				rel_path,
-				Some(new_uuid),
-				local.and_then(|n| n.content_hash),
-				local.map(|n| n.size).unwrap_or(0),
-				local.map(|n| n.mtime_millis),
-				Some(uploaded.timestamp.timestamp_millis()),
-			)
-			.await?;
+		SyncAction::UploadFile { .. } => {
+			apply_transfer(ctx, action, file_by_uuid, dir_by_path).await?;
 			report.uploaded += 1;
 		}
 		SyncAction::TrashRemote {
