@@ -1726,6 +1726,57 @@ async fn download_file_to_path_creates_nonexistent_file() {
 	cleanup().await;
 }
 
+/// Re-downloading changed content over an EXISTING local file must overwrite it, not error. The
+/// "changed during download" guard re-checks the DESTINATION (did the user touch it mid-download?),
+/// so a remote file whose mtime differs from the stale local copy must still download cleanly.
+/// Regression test for the guard mistakenly comparing the temp file (mtime set to the remote's)
+/// against the destination's pre-download mtime.
+#[shared_test_runtime]
+async fn download_file_to_path_overwrites_existing_changed_file() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let remote_contents = b"the new remote content, different length";
+	let file = client
+		.make_file_builder("overwrite_changed.txt", test_dir.uuid())
+		.unwrap();
+	let file = client.upload_file(file, remote_contents).await.unwrap();
+
+	let download_dir = std::env::temp_dir().join(format!(
+		"test_download_overwrite_{}_{}",
+		std::process::id(),
+		uuid::Uuid::new_v4()
+	));
+	tokio::fs::create_dir_all(&download_dir).await.unwrap();
+	let download_path = download_dir.join("overwrite_changed.txt");
+	// Pre-existing local copy with DIFFERENT content (and thus a different mtime than the remote).
+	tokio::fs::write(&download_path, b"stale local content")
+		.await
+		.unwrap();
+
+	let result = client
+		.download_file_to_path(&file, &download_path, None)
+		.await;
+
+	let cleanup = async || {
+		let _ = tokio::fs::remove_dir_all(&download_dir).await;
+	};
+
+	if let Err(e) = result {
+		cleanup().await;
+		panic!("re-download over an existing changed file failed: {e}");
+	}
+
+	let downloaded = tokio::fs::read(&download_path).await.unwrap();
+	assert_eq!(
+		downloaded, remote_contents,
+		"the existing local file should be overwritten with the remote content"
+	);
+
+	cleanup().await;
+}
+
 #[shared_test_runtime]
 async fn download_file_to_path_fails_when_parent_missing() {
 	let resources = test_utils::RESOURCES.get_resources().await;
