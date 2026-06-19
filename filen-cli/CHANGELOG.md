@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `view-html-docs` command to view the in-app docs locally in a browser rendered as HTML
 
+### Fixed
+
+- bug where prompt login with 2FA enabled failed with error message instead of displaying a prompt for the 2FA code
+
 ## 0.2.6 - 2026-06-04
 
 ### Changed

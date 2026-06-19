@@ -21,7 +21,6 @@ use filen_sdk_rs::{
 	ErrorKind,
 	auth::{Client, http::ClientConfig, unauth::UnauthClient},
 };
-use filen_types::error::ResponseError;
 
 use crate::{CliConfig, ui::UI, util::LongKeyringEntry};
 
@@ -140,19 +139,18 @@ async fn login_and_optionally_prompt_two_factor_code(
 		.await
 	{
 		Ok(client) => Ok(client),
-		Err(e) if e.kind() == ErrorKind::Server => match e.downcast::<ResponseError>() {
-			Ok((ResponseError::ApiError { code, .. }, _)) => Err(anyhow::anyhow!(
-				"Failed to log in (code {})",
-				code.as_deref().unwrap_or("")
-			)),
-			Err(e) => Err(anyhow!(e)).context("Failed to log in"),
-		},
 		Err(e) if e.kind() == ErrorKind::Enter2fa => {
 			let two_factor_code = ui.prompt("Two-factor authentication code: ")?;
-			unauth_client
+			match unauth_client
 				.login(email, password, two_factor_code.trim())
 				.await
-				.context("Failed to log in (with 2fa code)")
+			{
+				Ok(client) => Ok(client),
+				Err(e) if e.kind() == ErrorKind::Wrong2fa => {
+					Err(UI::failure("Two-factor authentication code wrong"))
+				}
+				Err(e) => Err(anyhow!(e)).context("Failed to log in (with 2fa)"),
+			}
 		}
 		Err(e) if e.kind() == ErrorKind::EmailOrPasswordWrong => {
 			Err(UI::failure("Email or password wrong"))
