@@ -331,7 +331,7 @@ where
 						break;
 					}
 				};
-				log::info!("Received WebSocket message: {}", message.as_ref());
+				log::debug!("Received WebSocket message: {}", message.as_ref());
 
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
@@ -343,7 +343,7 @@ where
 								match DecryptedSocketEvent::try_from_encrypted(crypter, private_key, config.user_id, event_yoke).await {
 									Ok(v) => Some(v),
 									Err(e) => {
-										log::error!(
+										log::warn!(
 											"Error decrypting WebSocket event: {}, skipping event",
 											e
 										);
@@ -356,7 +356,7 @@ where
 					// ignore non-event messages
 					Ok(None) => {},
 					Err(e) => {
-						log::error!(
+						log::warn!(
 							"Error parsing WebSocket message: {}, continuing...",
 							e
 						);
@@ -414,7 +414,7 @@ where
 						return None;
 					}
 					Err(e) => {
-						log::error!("Error initializing WebSocket connection: {}, retrying...", e);
+						log::warn!("Error initializing WebSocket connection: {}, retrying...", e);
 						sleep(config.reconnect_delay).await;
 					}
 				}
@@ -516,13 +516,13 @@ where
 	<RV::Output as Deref>::Target: AsRef<str>,
 	PT: PingTask<S>,
 {
-	log::info!("Connecting to WebSocket server...");
+	log::debug!("Connecting to WebSocket server...");
 	let request = W::build_request().await?;
 
-	log::info!("WebSocket request built, connecting...");
+	log::debug!("WebSocket request built, connecting...");
 
 	let unauthed_ws = W::connect(request).await?;
-	log::info!("WebSocket connected, performing handshake...");
+	log::debug!("WebSocket connected, performing handshake...");
 
 	perform_handshake(unauthed_ws, listeners, api_key).await
 }

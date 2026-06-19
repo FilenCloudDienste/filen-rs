@@ -148,7 +148,7 @@ impl<Cat: Category + ?Sized> super::CompareStrategy<Cat::Dir, Cat::File>
 			}
 		};
 
-		log::info!(
+		log::debug!(
 			"Conflict detected between entries. Existing: {:?}, New: {:?}. Resolved by choosing new: {}",
 			existing,
 			new,

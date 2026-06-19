@@ -1,6 +1,6 @@
 use std::{io::Write, mem::ManuallyDrop, num::NonZeroU32};
 
-use log::debug;
+use log::trace;
 use tokio::sync::SemaphorePermit;
 
 use crate::{auth::http::SharedClientState, consts::FILE_CHUNK_SIZE_EXTRA_USIZE};
@@ -35,7 +35,7 @@ impl<'a> Chunk<'a> {
 			.try_acquire_many(chunk_size.get())
 			.ok()
 			.map(|permits| {
-				debug!(
+				trace!(
 					"try_acquire: Acquired chunk with {} permits",
 					permits.num_permits()
 				);
@@ -55,7 +55,7 @@ impl<'a> Chunk<'a> {
 			.acquire_many(chunk_size.get())
 			.await
 			.unwrap();
-		debug!(
+		trace!(
 			"acquire: Acquired chunk with {} permits",
 			permits.num_permits()
 		);
@@ -121,7 +121,7 @@ impl Drop for Chunk<'_> {
 	fn drop(&mut self) {
 		// note, this not getting printed doesn't mean the permits aren't released
 		// they might have been dropped after being moved out with into_parts
-		debug!(
+		trace!(
 			"Releasing chunk with {} permits",
 			self.permits.num_permits()
 		);

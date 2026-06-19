@@ -161,7 +161,7 @@ pub(crate) mod helpers {
 
 	use async_zip::{ZipEntryBuilder, base::write::ZipFileWriter};
 	use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
-	use log::warn;
+	use log::debug;
 	use tokio::sync::Mutex;
 
 	use crate::{
@@ -191,7 +191,7 @@ pub(crate) mod helpers {
 		let file_name = match file.name() {
 			Some(name) => name,
 			None => {
-				warn!("Skipping file with undecryptable metadata: {}", file.uuid());
+				debug!("Skipping file with undecryptable metadata: {}", file.uuid());
 				// still update progress so counters stay consistent
 				let state_clone = {
 					let mut state = state.lock().unwrap();

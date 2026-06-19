@@ -212,7 +212,7 @@ impl
 
 		let on_open_closure = wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::Event)>::new(
 			move |_e: web_sys::Event| {
-				log::info!("WebSocket connection opened");
+				log::debug!("WebSocket connection opened");
 				if let Some(f) = fn_once.take() {
 					f();
 				} else {
@@ -232,7 +232,7 @@ impl
 					)
 				});
 				if let Err(TrySendError::Full(msg)) = msg_sender.try_send(result) {
-					log::error!(
+					log::warn!(
 						"WebSocket message channel full, dropping message '{:?}'",
 						msg
 					);
@@ -248,7 +248,7 @@ impl
 
 		let on_close_closure = wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::CloseEvent)>::new(
 			move |_e: web_sys::CloseEvent| {
-				log::info!("WebSocket connection closed");
+				log::debug!("WebSocket connection closed");
 				if let Some(f) = fn_once.take() {
 					f();
 				} else {

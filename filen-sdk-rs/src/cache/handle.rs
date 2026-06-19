@@ -454,7 +454,7 @@ async fn spawn_cache_worker(
 					// The spawning future was dropped (e.g. cancelled) before it received the
 					// init result, so nobody is waiting. Exit the worker cleanly instead of
 					// panicking.
-					log::warn!(
+					log::debug!(
 						"cache init result receiver dropped before init completed; worker exiting"
 					);
 					return;
@@ -463,7 +463,7 @@ async fn spawn_cache_worker(
 			}
 			Err(e) => {
 				if res_sender.send(Err(e)).is_err() {
-					log::warn!(
+					log::debug!(
 						"cache init result receiver dropped before init failed; worker exiting"
 					);
 				}

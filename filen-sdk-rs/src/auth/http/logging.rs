@@ -69,7 +69,7 @@ where
 
 	fn call(&mut self, req: Req) -> Self::Future {
 		if self.level_filter >= log::LevelFilter::Trace {
-			log::debug!("calling {} with ", self.endpoint);
+			log::trace!("calling {} with ", self.endpoint);
 		}
 		LoggedFuture {
 			inner: self.inner.call(req),
@@ -110,8 +110,8 @@ where
 				}
 				Err(e) => {
 					let e = e.with_context(this.endpoint.clone());
-					if *this.filter >= log::LevelFilter::Error {
-						log::error!("call to {} error: {}", this.endpoint, e);
+					if *this.filter >= log::LevelFilter::Warn {
+						log::warn!("call to {} error: {}", this.endpoint, e);
 					}
 					Poll::Ready(Err(e))
 				}

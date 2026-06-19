@@ -58,7 +58,7 @@ impl PingTask<NativeSender> for NativePingTask {
 						break;
 					}
 					Err(e) => {
-						log::error!("Failed to send WebSocket ping: {e}");
+						log::warn!("Failed to send WebSocket ping: {e}");
 						continue;
 					}
 				}

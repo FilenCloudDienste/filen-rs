@@ -541,7 +541,7 @@ impl CacheState {
 						None => true,
 					};
 					if shutdown {
-						log::info!("Cache shutting down; draining buffered events first...");
+						log::debug!("Cache shutting down; draining buffered events first...");
 						self.drain_pending(None);
 						return;
 					}
@@ -551,7 +551,7 @@ impl CacheState {
 				},
 				event = self.event_receiver.recv() => {
 					let Some(event) = event else {
-						log::warn!("Event channel closed, draining and shutting down cache...");
+						log::debug!("Event channel closed, draining and shutting down cache...");
 						self.drain_pending(None); // don't drop buffered events on disconnect
 						return;
 					};
@@ -1254,7 +1254,7 @@ impl CacheState {
 			// in an existing root and clear `needs_resync`, masking it. Redundant listings of
 			// already-current roots are accepted in v1; a per-root-bookmark skip is a future
 			// optimization.
-			log::info!("sync root(s) added; resyncing to populate");
+			log::debug!("sync root(s) added; resyncing to populate");
 			self.run_resync_surfacing_errors().await;
 		}
 		false
@@ -1301,7 +1301,7 @@ impl CacheState {
 		if uuid != self.root_uuid
 			&& matches!(self.in_any_sync_root(uuid, &self.sync_roots), Ok(true))
 		{
-			log::info!("AddSyncRoot {uuid}: covered by an active sync root; registering directly");
+			log::debug!("AddSyncRoot {uuid}: covered by an active sync root; registering directly");
 			self.sync_roots
 				.insert(uuid, vec![(registration_id, callback)]);
 			let _ = ack.send(Ok(()));
@@ -1375,13 +1375,13 @@ impl CacheState {
 		evict: bool,
 	) -> Result<bool, Box<CacheError>> {
 		let Some(registrations) = self.sync_roots.get_mut(&uuid) else {
-			log::warn!("RemoveRegistration: {uuid} is not an active sync root; ignoring");
+			log::debug!("RemoveRegistration: {uuid} is not an active sync root; ignoring");
 			return Ok(false);
 		};
 		let before = registrations.len();
 		registrations.retain(|(id, _)| *id != registration_id);
 		if registrations.len() == before {
-			log::warn!(
+			log::debug!(
 				"RemoveRegistration: registration {registration_id} not found for sync root {uuid}; ignoring"
 			);
 			return Ok(false);
@@ -1606,7 +1606,7 @@ impl CacheState {
 	async fn maybe_run_resync(&mut self) {
 		match self.needs_resync() {
 			Ok(true) => {
-				log::info!("resync pending (hole flagged during live operation); resyncing");
+				log::debug!("resync pending (hole flagged during live operation); resyncing");
 				self.run_resync_surfacing_errors().await;
 			}
 			Ok(false) => {}
@@ -1650,7 +1650,7 @@ impl CacheState {
 		};
 		match self.startup_should_resync(remote) {
 			Ok(true) => {
-				log::info!(
+				log::debug!(
 					"startup resync: remote drive id {remote} is ahead of watermark {:?} (or a hole \
 					 was flagged); catching up",
 					self.watermark().ok().flatten()
@@ -1738,7 +1738,7 @@ impl CacheState {
 					// Couldn't reach the server to read the snapshot id — leave the watermark be
 					// (the gap-check re-fires on the next event) and arm the retry timer for a
 					// quiet account.
-					log::info!("resync: no sync roots; deferring watermark advance ({e})");
+					log::debug!("resync: no sync roots; deferring watermark advance ({e})");
 					self.mark_needs_resync_surfacing_errors();
 					false
 				}
@@ -1808,7 +1808,7 @@ impl CacheState {
 			Ok(lock) => lock,
 			Err(e) => {
 				if matches!(e.kind(), ErrorKind::RetryFailed) {
-					log::info!(
+					log::debug!(
 						"resync: drive lock still contended after a patient wait; retrying in {RESYNC_RETRY_INTERVAL:?}"
 					);
 				} else {
@@ -1859,7 +1859,7 @@ impl CacheState {
 						Err(e) => {
 							// Transient: skip and retry on a later resync (a single unreachable root must
 							// not stall the others). The lock + snapshot-id calls above stay fatal.
-							log::warn!("resync: skipping sync root {root} (get_dir failed: {e})");
+							log::debug!("resync: skipping sync root {root} (get_dir failed: {e})");
 							any_transient = true;
 							continue;
 						}
@@ -1905,7 +1905,7 @@ impl CacheState {
 						deleted_roots.push(*root);
 					}
 					Err(e) => {
-						log::warn!("resync: skipping sync root {root} (listing failed: {e})");
+						log::debug!("resync: skipping sync root {root} (listing failed: {e})");
 						any_transient = true;
 					}
 				}
@@ -1944,7 +1944,7 @@ impl CacheState {
 				// nothing is committed. Durably mark the flag rather than relying on the trigger
 				// having set it (the startup gap-check resyncs on a watermark lag WITHOUT
 				// marking), then arm the retry timer so even a quiet account re-attempts.
-				log::warn!("resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}");
+				log::debug!("resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}");
 				self.abort_resync_unconverged(true);
 				return Ok(());
 			}
@@ -2020,7 +2020,7 @@ impl CacheState {
 
 		// An all-transient resync must not advance the watermark / clear the flag.
 		if per_root_raw.is_empty() && any_transient {
-			log::warn!(
+			log::debug!(
 				"resync: every sync root failed to list transiently; leaving needs_resync set for retry"
 			);
 			return Ok(());

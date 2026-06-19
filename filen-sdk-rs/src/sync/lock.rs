@@ -52,11 +52,11 @@ async fn actually_drop(client: &AuthClient, uuid: UuidStr, resource: &str) {
 		Ok(response) => {
 			debug!("Released lock {resource}: {uuid}");
 			if !response.released {
-				eprintln!("Failed to release lock {resource}");
+				log::warn!("Failed to release lock {resource}");
 			}
 		}
 		Err(e) => {
-			eprintln!("Failed to release lock {resource}: {e}");
+			log::warn!("Failed to release lock {resource}: {e}");
 		}
 	}
 }
@@ -92,7 +92,7 @@ const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn keep_lock_alive(lock: Weak<ResourceLock>) {
-	use log::error;
+	use log::warn;
 	use std::time::Instant;
 
 	let initial_update = Instant::now();
@@ -115,7 +115,7 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 				};
 
 				if !good_response {
-					error!("Failed to refresh lock: {}", lock.resource);
+					warn!("Failed to refresh lock: {}", lock.resource);
 					return;
 				} else {
 					debug!("Refreshed lock: {}", lock.resource);
@@ -152,7 +152,7 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 				};
 
 				if !good_response {
-					log::error!("Failed to refresh lock: {}", lock.resource);
+					log::warn!("Failed to refresh lock: {}", lock.resource);
 					return;
 				} else {
 					debug!("Refreshed lock: {}", lock.resource);

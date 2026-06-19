@@ -291,7 +291,7 @@ impl Engine {
 				// `build_error` here would brick the search on a one-off slow reply. Keep the
 				// connection; `total` stays 0 until the first ping/getRange re-queries. (A
 				// connection that cannot OPEN is the terminal case, handled above.)
-				log::error!("search engine failed its initial count (will retry on use): {e}");
+				log::warn!("search engine failed its initial count (will retry on use): {e}");
 			}
 		}
 		self.conn = Some(conn);
@@ -418,7 +418,7 @@ impl Engine {
 		let (total, window_results) = match batch {
 			Ok(batch) => batch,
 			Err(e) => {
-				log::error!("search refresh failed: {e}");
+				log::warn!("search refresh failed: {e}");
 				self.last_refresh = refresh_started.elapsed();
 				return;
 			}
@@ -429,7 +429,7 @@ impl Engine {
 			let results = match results {
 				Ok(results) => results,
 				Err(e) => {
-					log::error!("search refresh failed querying window {id}: {e}");
+					log::warn!("search refresh failed querying window {id}: {e}");
 					continue;
 				}
 			};
