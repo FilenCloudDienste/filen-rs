@@ -346,13 +346,51 @@ async fn execute_request(
 		.await
 		.and_then(|resp| resp.error_for_status())
 		.map_err(|e| {
-			// A pooled connection whose hyper dispatch task was dropped (`DispatchGone`) fails
-			// BEFORE the request is written, so it never reached the server — safe to retry even
-			// for non-idempotent endpoints. Every other builder/request error may have been
-			// partially sent, so it stays non-retryable.
-			let retryable = is_dispatch_gone(&e) || !(e.is_builder() || e.is_request());
+			let retryable = is_attempt_retryable(
+				e.status(),
+				e.is_builder(),
+				e.is_request(),
+				is_dispatch_gone(&e),
+			);
 			retry::RetryError::from_retryable(retryable, Error::from(e))
 		})
+}
+
+/// Decide whether a failed HTTP attempt should be retried.
+///
+/// `status` is `Some` only when the failure is an HTTP error *response* surfaced by
+/// [`error_for_status`](reqwest::Response::error_for_status). In that case retry only transient
+/// statuses — any 5xx, plus 408 (Request Timeout) and 429 (Too Many Requests). A permanent 4xx
+/// such as 404 must NOT be retried: the egest/ingest file servers answer a genuinely-missing
+/// object with a real `404 Not Found`, and retrying it spins against the retry budget's `reserve`
+/// floor — which throttles but never *exhausts* for a single forever-failing request — so above a
+/// modest round-trip time the retries never outpace the floor and the call hangs indefinitely.
+/// (This is exactly what hung the nightly test job: `download_file_chunk_by_uuid` for a random UUID
+/// 404s, was retried forever at the runners' egest RTT, and the binary never finished. Gateway API
+/// errors instead arrive as HTTP 200 + `{status:false}` JSON, so they never reach this branch.)
+///
+/// When `status` is `None` the failure is a transport/connection error with no HTTP response:
+/// `dispatch_gone` (a pooled connection whose hyper dispatch task was dropped fails BEFORE the
+/// request is written, so it never reached the server — safe to retry even for non-idempotent
+/// endpoints) is retryable, as is anything that is neither a builder nor a request error. A
+/// builder or request error may have been partially sent, so it stays non-retryable.
+fn is_attempt_retryable(
+	status: Option<reqwest::StatusCode>,
+	is_builder: bool,
+	is_request: bool,
+	dispatch_gone: bool,
+) -> bool {
+	if dispatch_gone {
+		return true;
+	}
+	match status {
+		Some(status) => {
+			status.is_server_error()
+				|| status == reqwest::StatusCode::REQUEST_TIMEOUT
+				|| status == reqwest::StatusCode::TOO_MANY_REQUESTS
+		}
+		None => !(is_builder || is_request),
+	}
 }
 
 /// Walks `err` and its [`source`](std::error::Error::source) chain, returning true if any link's
@@ -387,7 +425,61 @@ fn is_dispatch_gone(err: &reqwest::Error) -> bool {
 
 #[cfg(test)]
 mod retry_classification_tests {
-	use super::error_chain_mentions;
+	use reqwest::StatusCode;
+
+	use super::{error_chain_mentions, is_attempt_retryable};
+
+	/// A permanent 4xx (the egest `404 Not Found` for a missing chunk) must NOT be retried — this
+	/// is the regression that hung the nightly test job forever.
+	#[test]
+	fn permanent_4xx_status_is_not_retried() {
+		for status in [
+			StatusCode::NOT_FOUND,
+			StatusCode::FORBIDDEN,
+			StatusCode::BAD_REQUEST,
+			StatusCode::UNAUTHORIZED,
+			StatusCode::GONE,
+		] {
+			assert!(
+				!is_attempt_retryable(Some(status), false, false, false),
+				"{status} should not be retried"
+			);
+		}
+	}
+
+	/// Transient statuses stay retryable.
+	#[test]
+	fn transient_statuses_are_retried() {
+		for status in [
+			StatusCode::INTERNAL_SERVER_ERROR,
+			StatusCode::BAD_GATEWAY,
+			StatusCode::SERVICE_UNAVAILABLE,
+			StatusCode::GATEWAY_TIMEOUT,
+			StatusCode::REQUEST_TIMEOUT,
+			StatusCode::TOO_MANY_REQUESTS,
+		] {
+			assert!(
+				is_attempt_retryable(Some(status), false, false, false),
+				"{status} should be retried"
+			);
+		}
+	}
+
+	/// Transport errors (no HTTP status) keep the prior behavior: a builder or request error may
+	/// have been partially sent and is not retryable; any other transport error is.
+	#[test]
+	fn transport_errors_without_status_keep_prior_behavior() {
+		assert!(!is_attempt_retryable(None, true, false, false)); // builder error
+		assert!(!is_attempt_retryable(None, false, true, false)); // request error (maybe sent)
+		assert!(is_attempt_retryable(None, false, false, false)); // connect/decode error
+	}
+
+	/// A dead pooled connection (`DispatchGone`) failed before the request was written, so it is
+	/// retryable even though it surfaces as a request error.
+	#[test]
+	fn dispatch_gone_is_always_retryable() {
+		assert!(is_attempt_retryable(None, false, true, true));
+	}
 
 	#[derive(Debug)]
 	struct Layered {
