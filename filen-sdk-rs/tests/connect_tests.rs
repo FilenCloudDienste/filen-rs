@@ -173,6 +173,105 @@ async fn dir_public_link() {
 }
 
 #[shared_test_runtime]
+async fn dir_public_link_remove() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let unauth_client = client.get_unauthed();
+
+	// A small tree: a file at the link root and a sub_dir holding another file, so removal has to
+	// tear down a recursively-linked structure rather than a single entry.
+	let dir = client
+		.create_dir(&test_dir.into(), "link_remove_dir")
+		.await
+		.unwrap();
+	let sub_dir = client.create_dir(&(&dir).into(), "sub_dir").await.unwrap();
+
+	let dir_file = client.make_file_builder("a.txt", *dir.uuid()).unwrap();
+	let dir_file = client
+		.upload_file(dir_file, b"Hello, world!")
+		.await
+		.unwrap();
+
+	let sub_file = client.make_file_builder("b.txt", *sub_dir.uuid()).unwrap();
+	let sub_file = client.upload_file(sub_file, b"").await.unwrap();
+
+	// No link exists before we create one.
+	assert_eq!(client.get_dir_link_rw(&dir).await.unwrap(), None);
+
+	// Create the public link over the whole tree.
+	let link_rw = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.await
+		.unwrap();
+
+	// The owner can read the link back and it matches what we just created.
+	let found_link = client.get_dir_link_rw(&dir).await.unwrap().unwrap();
+	assert_eq!(
+		link_rw, found_link,
+		"get_dir_link_rw didn't match the created link"
+	);
+
+	// Capture the public-resolution coordinates now; after removal there is no link left to read
+	// them from, but we still want to confirm the old coordinates stop resolving.
+	let link_uuid = link_rw.uuid();
+	let key_string = link_rw
+		.key_string()
+		.expect("created link has a decrypted key");
+
+	// The link resolves without authentication and exposes the linked tree.
+	let info = unauth_client
+		.get_dir_public_link_info(link_uuid, &key_string)
+		.await
+		.unwrap();
+	let (dirs, files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!(files, vec![dir_file.clone()]);
+	let linked_sub_dir = dirs
+		.iter()
+		.find(|d| d.inner() == &sub_dir)
+		.expect("sub_dir should be present in the linked tree");
+	let (sub_dirs, sub_files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!(sub_dirs.len(), 0);
+	assert!(sub_files.contains(&sub_file));
+
+	// Remove the link. The link is identified for removal by the directory it links, so the link
+	// object we created earlier (`link_rw`) is no longer needed here.
+	client.remove_dir_link(&dir).await.unwrap();
+
+	// The owner no longer sees a link...
+	assert_eq!(
+		client.get_dir_link_rw(&dir).await.unwrap(),
+		None,
+		"link still present after removal"
+	);
+
+	// ...and it no longer resolves publicly.
+	let resolved = unauth_client
+		.get_dir_public_link_info(link_uuid, &key_string)
+		.await;
+	assert!(
+		resolved.is_err(),
+		"removed link should not resolve publicly anymore"
+	);
+
+	// Removal leaves the directory in a clean state: it can be re-linked and re-removed.
+	client
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.await
+		.unwrap();
+	assert!(client.get_dir_link_rw(&dir).await.unwrap().is_some());
+	client.remove_dir_link(&dir).await.unwrap();
+	assert_eq!(client.get_dir_link_rw(&dir).await.unwrap(), None);
+}
+
+#[shared_test_runtime]
 async fn file_public_link() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let share_resources = test_utils::SHARE_RESOURCES.get_resources().await;

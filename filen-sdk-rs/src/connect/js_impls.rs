@@ -452,12 +452,10 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "removeDirLink")
 	)]
-	pub async fn remove_dir_link(&self, link: DirPublicLinkRW) -> Result<(), Error> {
+	pub async fn remove_dir_link(&self, dir: Dir) -> Result<(), Error> {
 		let this = self.inner();
-		runtime::do_on_commander(
-			move || async move { this.remove_dir_link(link.try_into()?).await },
-		)
-		.await
+		runtime::do_on_commander(move || async move { this.remove_dir_link(&dir.into()).await })
+			.await
 	}
 
 	#[cfg_attr(

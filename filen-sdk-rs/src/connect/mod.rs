@@ -755,12 +755,14 @@ impl Client {
 		}))
 	}
 
-	pub async fn remove_dir_link(&self, link: DirPublicLinkRW) -> Result<(), Error> {
+	/// Removes the public link from `dir`.
+	///
+	/// The `v3/dir/link/remove` endpoint identifies the link to remove by the linked directory's
+	/// uuid (matching `dir/link/{edit,status}`), not by the link's own uuid.
+	pub async fn remove_dir_link(&self, dir: &RemoteDirectory) -> Result<(), Error> {
 		api::v3::dir::link::remove::post(
 			self.client(),
-			&api::v3::dir::link::remove::Request {
-				uuid: link.link_uuid,
-			},
+			&api::v3::dir::link::remove::Request { uuid: *dir.uuid() },
 		)
 		.await?;
 		Ok(())
