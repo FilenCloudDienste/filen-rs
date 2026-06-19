@@ -102,6 +102,7 @@ pub struct FilenSDKConfig {
 	pub auth_version: AuthVersion,
 	#[serde(rename = "baseFolderUUID")]
 	pub base_folder_uuid: String,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub metadata_cache: bool,
 	pub tmp_path: String,

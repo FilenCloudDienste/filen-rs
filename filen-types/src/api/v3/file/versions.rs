@@ -17,6 +17,7 @@ pub struct Request {
 #[serde(rename_all = "camelCase")]
 pub struct FileVersion<'a> {
 	pub bucket: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
 	pub metadata: EncryptedString<'a>,
 	pub region: Cow<'a, str>,
@@ -24,6 +25,7 @@ pub struct FileVersion<'a> {
 	pub timestamp: DateTime<Utc>,
 	pub uuid: UuidStr,
 	pub version: FileEncryptionVersion,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 }
 

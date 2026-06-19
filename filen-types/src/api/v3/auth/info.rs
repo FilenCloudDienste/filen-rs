@@ -18,6 +18,6 @@ pub struct Response<'a> {
 	pub email: Cow<'a, str>,
 	pub auth_version: AuthVersion,
 	pub salt: Cow<'a, str>, // this is not base64 or hex encoded, so probably bad practice, we should take a look at this
-	#[serde(rename = "id")]
+	#[serde(rename = "id", with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 }

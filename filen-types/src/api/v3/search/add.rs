@@ -15,7 +15,9 @@ pub struct Request {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	added: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	skipped: u64,
 }
 

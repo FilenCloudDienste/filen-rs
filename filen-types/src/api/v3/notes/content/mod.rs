@@ -20,6 +20,7 @@ pub struct Response<'a> {
 	pub content: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub edited_timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub editor_id: u64,
 	#[serde(rename = "type")]
 	pub note_type: NoteType,

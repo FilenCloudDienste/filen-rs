@@ -7,6 +7,7 @@ pub const ENDPOINT: &str = "v3/user/account";
 #[serde(rename_all = "camelCase")]
 pub struct Response {
 	pub aff_balance: f64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub aff_count: u64,
 	pub aff_earnings: f64,
 	pub aff_id: String,
@@ -18,14 +19,20 @@ pub struct Response {
 	// pub invoices: Vec<()>,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub is_premium: bool,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub max_storage: u64,
 	pub personal: Personal,
 	pub plans: Vec<UserAccountPlan>,
 	pub ref_id: String,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub ref_limit: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub ref_storage: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub refer_count: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub refer_storage: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub storage: u64,
 	#[serde(with = "crate::serde::option::str_empty_is_none_owned")]
 	pub nick_name: Option<String>,
@@ -68,6 +75,7 @@ pub struct UserAccountPlan {
 		),
 		tsify(type = "bigint")
 	)]
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub id: u64,
 	pub length_type: String,
 	pub name: String,
@@ -79,6 +87,7 @@ pub struct UserAccountPlan {
 		),
 		tsify(type = "bigint")
 	)]
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub storage: u64,
 }
 
@@ -126,6 +135,7 @@ pub struct UserAccountSubs {
 		),
 		tsify(type = "bigint")
 	)]
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub plan_id: u64,
 	pub plan_name: String,
 	pub plan_cost: f64,
@@ -138,6 +148,7 @@ pub struct UserAccountSubs {
 		),
 		tsify(type = "bigint")
 	)]
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub storage: u64,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub activated: bool,

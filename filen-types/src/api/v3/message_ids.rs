@@ -13,9 +13,14 @@ pub const ENDPOINT: &str = "v3/messageIds";
 	wasm_target = not(feature = "service-worker")
 )]
 pub struct Response {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub general: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chat: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub contact: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub note: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub drive: u64,
 }

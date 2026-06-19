@@ -18,6 +18,7 @@ pub struct Response(pub Vec<OnlineStatus>);
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct OnlineStatus {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub last_active: DateTime<Utc>,

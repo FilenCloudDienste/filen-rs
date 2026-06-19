@@ -56,6 +56,7 @@ pub struct NoteTag<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteParticipant<'a> {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub is_owner: bool,
 	pub email: Cow<'a, str>,
@@ -71,7 +72,9 @@ pub struct NoteParticipant<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct Note<'a> {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub owner_id: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub editor_id: u64,
 	pub is_owner: bool,
 	pub favorite: bool,

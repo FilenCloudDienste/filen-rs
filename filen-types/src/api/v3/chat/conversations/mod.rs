@@ -30,6 +30,7 @@ pub struct Response<'a>(pub Vec<ChatConversation<'a>>);
 pub struct ChatConversation<'a> {
 	pub uuid: UuidStr,
 	pub last_message_full: Option<ChatMessageEncrypted<'a>>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub owner_id: u64,
 	pub owner_metadata: Option<EncryptedString<'a>>,
 	pub name: Option<EncryptedString<'a>>,
@@ -44,6 +45,7 @@ pub struct ChatConversation<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatConversationParticipant<'a> {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,

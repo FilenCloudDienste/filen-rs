@@ -83,6 +83,7 @@ where
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct UserEvent<'a> {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub id: u64,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
@@ -230,6 +231,7 @@ pub struct EmailChangeAttemptInfo<'a> {
 pub struct RemovedSharedInItemsInfo<'a> {
 	pub ip: Cow<'a, str>,
 	pub user_agent: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub count: u64,
 	pub sharer_email: Cow<'a, str>,
 }
@@ -239,6 +241,7 @@ pub struct RemovedSharedInItemsInfo<'a> {
 pub struct RemovedSharedOutItemsInfo<'a> {
 	pub ip: Cow<'a, str>,
 	pub user_agent: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub count: u64,
 	pub receiver_email: Cow<'a, str>,
 }

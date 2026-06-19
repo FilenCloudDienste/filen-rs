@@ -1,6 +1,7 @@
 #![feature(min_specialization)]
 pub mod api;
 pub mod auth;
+pub mod conversions;
 pub mod crypto;
 pub mod error;
 pub mod fs;

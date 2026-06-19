@@ -33,7 +33,9 @@ pub struct SharedFileIn<'a> {
 	pub metadata: RSAEncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	pub version: FileEncryptionVersion,
 	// pub sharer_email: Cow<'a, str>,

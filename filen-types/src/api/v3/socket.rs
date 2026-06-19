@@ -89,7 +89,9 @@ pub struct HandShake<'a> {
 	pub sid: Cow<'a, str>,
 	#[serde(borrow)]
 	pub upgrades: Vec<Cow<'a, str>>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub ping_interval: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub ping_timeout: u64,
 }
 
@@ -216,7 +218,7 @@ macro_rules! extract_id {
 	($raw:expr, $field:literal) => {{
 		#[derive(Deserialize)]
 		struct ExtractId {
-			#[serde(rename = $field)]
+			#[serde(rename = $field, with = "crate::serde::number::permissive_u64")]
 			id: u64,
 		}
 		serde_json::from_str::<ExtractId>($raw.get()).map(|h| h.id)
@@ -649,7 +651,9 @@ pub struct FileArchiveRestored<'a> {
 	// rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
@@ -671,7 +675,9 @@ pub struct FileNew<'a> {
 	// rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
@@ -693,7 +699,9 @@ pub struct FileRestore<'a> {
 	// rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
@@ -715,7 +723,9 @@ pub struct FileMove<'a> {
 	// pub rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	#[serde(borrow)]
 	pub bucket: Cow<'a, str>,
@@ -884,6 +894,7 @@ pub struct ChatTyping<'a> {
 	pub sender_email: Cow<'a, str>,
 	#[serde(borrow)]
 	pub sender_nick_name: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub sender_id: u64,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	#[cfg_attr(
@@ -907,6 +918,7 @@ pub struct ChatConversationsNew<'a> {
 	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub added_timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub owner_id: u64,
 	#[serde(borrow)]
 	pub participants: Vec<ChatConversationParticipant<'a>>,
@@ -936,6 +948,7 @@ pub struct NoteContentEdited<'a> {
 	pub content: EncryptedString<'a>,
 	#[serde(rename = "type")]
 	pub note_type: NoteType,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub editor_id: u64,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub edited_timestamp: DateTime<Utc>,
@@ -999,6 +1012,7 @@ pub struct NoteTitleEdited<'a> {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteParticipantPermissions {
 	pub note: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub permissions_write: bool,
 }
@@ -1033,6 +1047,7 @@ pub struct NoteRestored {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteParticipantRemoved {
 	pub note: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 }
 
@@ -1082,6 +1097,7 @@ pub struct ChatMessageEmbedDisabled {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatConversationParticipantLeft {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 }
 
@@ -1128,6 +1144,7 @@ pub struct ChatConversationNameEdited<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct ContactRequestReceived<'a> {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub sender_id: u64,
 	#[serde(borrow)]
 	pub sender_email: Cow<'a, str>,
@@ -1156,7 +1173,9 @@ pub struct ItemFavorite<'a> {
 	pub region: Option<Cow<'a, str>>,
 	#[serde(borrow)]
 	pub bucket: Option<Cow<'a, str>>,
+	#[serde(default, with = "crate::serde::number::permissive_u64_opt")]
 	pub size: Option<u64>,
+	#[serde(default, with = "crate::serde::number::permissive_u64_opt")]
 	pub chunks: Option<u64>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
@@ -1170,6 +1189,7 @@ pub struct ItemFavorite<'a> {
 pub struct ChatConversationParticipantNew<'a> {
 	#[serde(rename = "conversation")]
 	pub chat: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	#[serde(borrow)]
 	pub email: Cow<'a, str>,

@@ -12,6 +12,10 @@ pub enum ConversionError {
 	InvalidEnumValue(u8, &'static str, u8, u8),
 	#[error("Invalid length: `{0}`, expected `{1}`")]
 	InvalidLength(usize, usize),
+	#[error("Failed to convert f64 to u64: `{0}`")]
+	F64ToU64ConversionError(#[from] crate::conversions::F64ToU64Error),
+	#[error("Failed to convert str to u64: `{0}`")]
+	StrToU64ConversionError(#[from] crate::conversions::StrToU64Error),
 }
 
 #[derive(Debug, Error)]

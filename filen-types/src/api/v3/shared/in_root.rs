@@ -40,10 +40,13 @@ pub struct SharedRootFileIn<'a> {
 	pub metadata: RSAEncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	pub version: FileEncryptionVersion,
 	pub sharer_email: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub sharer_id: u64,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub write_access: bool,
@@ -57,6 +60,7 @@ pub struct SharedRootDirIn<'a> {
 	pub uuid: UuidStr,
 	pub metadata: RSAEncryptedString<'a>,
 	pub sharer_email: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub sharer_id: u64,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub write_access: bool,

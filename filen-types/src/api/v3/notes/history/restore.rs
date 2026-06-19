@@ -8,5 +8,6 @@ pub const ENDPOINT: &str = "v3/notes/history/restore";
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub id: u64,
 }

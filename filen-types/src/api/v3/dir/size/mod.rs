@@ -21,8 +21,10 @@ pub struct Request {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub files: u64,
-	#[serde(rename = "folders")]
+	#[serde(rename = "folders", with = "crate::serde::number::permissive_u64")]
 	pub dirs: u64,
 }

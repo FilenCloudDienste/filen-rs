@@ -19,6 +19,7 @@ pub struct Response<'a>(pub Vec<Contact<'a>>);
 #[serde(rename_all = "camelCase")]
 pub struct Contact<'a> {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,

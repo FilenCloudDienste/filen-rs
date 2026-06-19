@@ -8,5 +8,6 @@ pub const ENDPOINT: &str = "v3/item/shared/out/remove";
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub receiver_id: u64,
 }

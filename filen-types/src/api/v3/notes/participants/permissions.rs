@@ -8,6 +8,7 @@ pub const ENDPOINT: &str = "v3/notes/participants/permissions";
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub permissions_write: bool,
 }

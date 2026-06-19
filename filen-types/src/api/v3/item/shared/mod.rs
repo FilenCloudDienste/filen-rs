@@ -27,6 +27,7 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedUser<'a> {
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub id: u64,
 	pub email: Cow<'a, str>,
 	#[serde(with = "crate::serde::rsa::public_key_der")]

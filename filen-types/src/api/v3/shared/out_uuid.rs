@@ -14,6 +14,7 @@ pub const ENDPOINT: &str = "v3/shared/out";
 #[serde(rename_all = "camelCase")]
 pub struct Request {
 	pub uuid: UuidStr,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub receiver_id: u64,
 }
 
@@ -34,7 +35,9 @@ pub struct SharedFileOut<'a> {
 	pub metadata: EncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	pub version: FileEncryptionVersion,
 	#[serde(with = "crate::serde::boolean::number")]

@@ -27,6 +27,7 @@ pub struct Response<'a> {
 	pub password: Option<LinkHashedPassword<'a>>,
 
 	pub size: EncryptedString<'a>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
 
 	pub region: Cow<'a, str>,

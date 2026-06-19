@@ -9,6 +9,7 @@ pub const ENDPOINT: &str = "v3/upload/done";
 pub struct Request<'a> {
 	#[serde(flatten)]
 	pub empty_request: super::empty::Request<'a>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
 	pub rm: Cow<'a, str>,
 	pub upload_key: Cow<'a, str>,

@@ -27,6 +27,7 @@ pub struct Response<'a> {
 	pub metadata: EncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
 	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]

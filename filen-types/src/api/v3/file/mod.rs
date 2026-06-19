@@ -40,6 +40,7 @@ pub struct Response<'a> {
 	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
+	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
 	pub parent: ParentUuid,
 	pub versioned: bool,
