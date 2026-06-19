@@ -54,9 +54,10 @@ pub struct UnauthClient {
 
 impl UnauthClient {
 	pub fn from_config(client_config: ClientConfig) -> Result<Self, Error> {
+		let reqwest_client = client_config.build_reqwest_client()?;
 		let state = SharedClientState::new(client_config)?;
 		Ok(Self {
-			reqwest_client: reqwest::Client::new(),
+			reqwest_client,
 			state,
 			#[cfg(feature = "http-provider")]
 			http_provider: Arc::new(Mutex::new(Weak::new())),

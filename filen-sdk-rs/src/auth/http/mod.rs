@@ -3,6 +3,7 @@ use std::{
 	fmt::Debug,
 	num::NonZeroU32,
 	sync::{Arc, RwLock},
+	time::Duration,
 };
 
 use bytes::Bytes;
@@ -55,6 +56,19 @@ impl Client {
 	}
 }
 
+/// Default cap on the TCP/TLS connect phase. Connecting should be fast, so this mainly bounds a
+/// host that accepts no connection (SYN black-hole) instead of letting it hang.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default read timeout. reqwest applies this as a deadline for the response to *start* (time to
+/// first byte) and then as an idle (inter-chunk) timeout once the body is streaming. It must
+/// therefore exceed the slowest legitimate time-to-first-byte: a directory listing over a very
+/// large folder can take a couple of minutes to begin responding (though it streams quickly once
+/// it starts), so this is generous on purpose. Without it a connected-but-silent host hangs a
+/// request forever (a non-responding egest host has no HTTP status to classify). Tune via
+/// [`ClientConfig::with_read_timeout`] (or `None` to disable) if your largest listings are slower.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub struct ClientConfig {
 	concurrency: usize,
 	retry_budget: TpsBudget,
@@ -63,6 +77,10 @@ pub struct ClientConfig {
 	upload_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
 	download_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
 	log_level: log::LevelFilter,
+	/// Timeout for the connect phase only. `None` disables it.
+	connect_timeout: Option<Duration>,
+	/// Idle/time-to-first-byte read timeout (see [`DEFAULT_READ_TIMEOUT`]). `None` disables it.
+	read_timeout: Option<Duration>,
 }
 
 impl ClientConfig {
@@ -103,6 +121,39 @@ impl ClientConfig {
 		self.file_io_memory_budget = file_io_memory_budget;
 		self
 	}
+
+	pub fn with_connect_timeout(mut self, connect_timeout: Option<Duration>) -> Self {
+		self.connect_timeout = connect_timeout;
+		self
+	}
+
+	pub fn with_read_timeout(mut self, read_timeout: Option<Duration>) -> Self {
+		self.read_timeout = read_timeout;
+		self
+	}
+
+	/// Build the [`reqwest::Client`] backing every request, applying the connect/read timeouts.
+	///
+	/// On wasm the timeouts are ignored — reqwest's fetch-based client exposes no
+	/// connect/read-timeout knobs; the browser governs those instead.
+	pub(crate) fn build_reqwest_client(&self) -> Result<reqwest::Client, Error> {
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			let mut builder = reqwest::Client::builder();
+			if let Some(connect_timeout) = self.connect_timeout {
+				builder = builder.connect_timeout(connect_timeout);
+			}
+			if let Some(read_timeout) = self.read_timeout {
+				builder = builder.read_timeout(read_timeout);
+			}
+			builder.build().map_err(Error::from)
+		}
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			let _ = (self.connect_timeout, self.read_timeout);
+			Ok(reqwest::Client::new())
+		}
+	}
 }
 
 impl Default for ClientConfig {
@@ -114,6 +165,8 @@ impl Default for ClientConfig {
 			upload_bandwidth_kilobytes_per_sec: None,
 			download_bandwidth_kilobytes_per_sec: None,
 			log_level: log::max_level(),
+			connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+			read_timeout: Some(DEFAULT_READ_TIMEOUT),
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
 				{
@@ -373,7 +426,9 @@ async fn execute_request(
 /// `dispatch_gone` (a pooled connection whose hyper dispatch task was dropped fails BEFORE the
 /// request is written, so it never reached the server — safe to retry even for non-idempotent
 /// endpoints) is retryable, as is anything that is neither a builder nor a request error. A
-/// builder or request error may have been partially sent, so it stays non-retryable.
+/// builder or request error may have been partially sent, so it stays non-retryable. A connect or
+/// read timeout surfaces as a `Kind::Request` error (`is_request`), so timeouts fall here and are
+/// NOT retried — fail fast rather than spend another full timeout on a stalled host.
 fn is_attempt_retryable(
 	status: Option<reqwest::StatusCode>,
 	is_builder: bool,
@@ -1030,5 +1085,110 @@ fn post_request(
 impl From<Request<Bytes, reqwest::Url>> for RequestBuilder {
 	fn from(req: Request<Bytes, reqwest::Url>) -> Self {
 		req.into_builder_map_body(|body| body)
+	}
+}
+
+// Native-only: the timeouts are applied via reqwest's native builder, and these tests drive a real
+// local TCP server.
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod client_timeout_tests {
+	use std::time::{Duration, Instant};
+
+	use tokio::{
+		io::{AsyncReadExt, AsyncWriteExt},
+		net::TcpListener,
+	};
+
+	use super::{ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT};
+
+	#[test]
+	fn default_config_enables_both_timeouts_and_builds() {
+		let config = ClientConfig::default();
+		assert_eq!(config.connect_timeout, Some(DEFAULT_CONNECT_TIMEOUT));
+		assert_eq!(config.read_timeout, Some(DEFAULT_READ_TIMEOUT));
+		config
+			.build_reqwest_client()
+			.expect("the default-configured client must build");
+	}
+
+	/// A connected-but-silent host — the residual hang the 404/retry fixes could not cover, since
+	/// there is no HTTP status to classify — is aborted by the read timeout instead of hanging.
+	#[tokio::test]
+	async fn read_timeout_aborts_a_silent_server() {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			// Accept the connection, then never send a single byte.
+			let (_socket, _) = listener.accept().await.unwrap();
+			tokio::time::sleep(Duration::from_secs(30)).await;
+		});
+
+		let client = ClientConfig::default()
+			.with_read_timeout(Some(Duration::from_millis(300)))
+			.build_reqwest_client()
+			.unwrap();
+
+		let started = Instant::now();
+		let err = client
+			.get(format!("http://{addr}/"))
+			.send()
+			.await
+			.unwrap_err();
+
+		assert!(err.is_timeout(), "expected a timeout error, got {err:?}");
+		assert!(
+			started.elapsed() < Duration::from_secs(5),
+			"should have timed out promptly, took {:?}",
+			started.elapsed()
+		);
+
+		// The read timeout surfaces as a request-kind error, and the production classifier treats
+		// it as non-retryable: a stalled host fails fast rather than burning another full timeout.
+		assert!(
+			err.is_request(),
+			"a read timeout should be a request-kind error"
+		);
+		assert!(
+			!super::is_attempt_retryable(
+				err.status(),
+				err.is_builder(),
+				err.is_request(),
+				super::is_dispatch_gone(&err),
+			),
+			"a read timeout must be classified non-retryable"
+		);
+	}
+
+	/// The dir-listing constraint: a server that is slow to START responding (high time-to-first-
+	/// byte) but is alive must NOT be killed, as long as it responds within the read timeout. Here
+	/// it stalls 400ms before sending a 200, well under the 2s read timeout.
+	#[tokio::test]
+	async fn slow_time_to_first_byte_within_read_timeout_succeeds() {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			// Drain the request so the client's write completes, then simulate slow server-side
+			// work before the first response byte.
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).await;
+			tokio::time::sleep(Duration::from_millis(400)).await;
+			let body = "ok";
+			let response = format!(
+				"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+				body.len()
+			);
+			socket.write_all(response.as_bytes()).await.unwrap();
+			socket.flush().await.unwrap();
+		});
+
+		let client = ClientConfig::default()
+			.with_read_timeout(Some(Duration::from_millis(2000)))
+			.build_reqwest_client()
+			.unwrap();
+
+		let response = client.get(format!("http://{addr}/")).send().await.unwrap();
+		assert!(response.status().is_success());
+		assert_eq!(response.text().await.unwrap(), "ok");
 	}
 }
