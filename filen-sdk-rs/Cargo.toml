@@ -218,7 +218,9 @@ futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
 [target.'cfg(not(all(target_family="wasm", target_os= "unknown")))'.dev-dependencies]
 multer = "3.1.0"
 dotenv = "0.15.0"
-tokio = { version = "1.47.1", features = ["full"] }
+# `test-util` (paused clock for deterministic time-dependent tests) is intentionally NOT part of
+# tokio's `full`, so it must be listed explicitly.
+tokio = { version = "1.47.1", features = ["full", "test-util"] }
 tokio-util = { version = "0.7.16", default-features = false, features = [
 	"compat",
 ] }
