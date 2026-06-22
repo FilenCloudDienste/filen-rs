@@ -20,7 +20,6 @@ pub(super) const PING_MESSAGE: &str = match str::from_utf8(&[PacketType::Ping as
 };
 
 pub(super) const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-pub(super) const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 pub(super) const PING_INTERVAL: Duration = Duration::from_secs(15);
 
 pub(super) const WEBSOCKET_URL_CORE: &str =

@@ -567,22 +567,6 @@ pub struct FileRename<'a> {
 	pub metadata: FileMeta<'a>,
 }
 
-impl<'a> FileRename<'a> {
-	fn blocking_from_encrypted(
-		crypter: &impl MetaCrypter,
-		event: filen_types::api::v3::socket::FileRename<'a>,
-	) -> Self {
-		Self {
-			uuid: event.uuid,
-			metadata: FileMeta::blocking_from_encrypted(
-				event.metadata,
-				crypter,
-				FileEncryptionVersion::V2,
-			),
-		}
-	}
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileArchiveRestored {
 	pub current_uuid: UuidStr,

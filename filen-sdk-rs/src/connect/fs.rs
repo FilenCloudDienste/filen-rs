@@ -55,12 +55,6 @@ impl SharingRole {
 			SharingRole::Sharer(info) | SharingRole::Receiver(info) => &info.email,
 		}
 	}
-
-	pub(crate) fn id(&self) -> u64 {
-		match self {
-			SharingRole::Sharer(info) | SharingRole::Receiver(info) => info.id,
-		}
-	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -360,17 +354,6 @@ impl HasMeta for SharedRootFile {
 }
 
 impl File for SharedRootFile {}
-
-struct FileInfo<'a> {
-	uuid: UuidStr,
-	parent: UuidStr,
-	size: u64,
-	chunks: u64,
-	region: Cow<'a, str>,
-	bucket: Cow<'a, str>,
-	timestamp: DateTime<Utc>,
-	metadata: FileMeta<'a>,
-}
 
 impl SharedRootFile {
 	pub(crate) fn blocking_from_shared_in(

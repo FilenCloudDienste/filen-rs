@@ -289,8 +289,3 @@ pub(crate) trait CompareStrategy<D, F> {
 	/// Returns `true` if `new` should replace `existing`.
 	fn should_replace(existing: &Entry<D, F>, new: &Entry<D, F>) -> bool;
 }
-
-pub(super) enum UnfinalizedEntry<DirExtra, FileExtra> {
-	Dir(UnfinalizedDirEntry<DirExtra>),
-	File(FileEntry<FileExtra>),
-}

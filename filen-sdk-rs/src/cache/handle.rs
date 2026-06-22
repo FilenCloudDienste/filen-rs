@@ -128,6 +128,9 @@ impl CacheSlot {
 	/// The configured cache DB path, if [`Client::configure_cache`] has run. Stable while a
 	/// worker is live (reconfiguration is rejected then) — the search engine opens its own
 	/// READ-ONLY connection on it.
+	// Native-only: the wasm cache routes searches through the worker (`ReadConn::Worker`), not a
+	// second connection opened on this path.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub(crate) fn db_path(&self) -> Option<PathBuf> {
 		self.config.as_ref().map(|config| config.path.clone())
 	}

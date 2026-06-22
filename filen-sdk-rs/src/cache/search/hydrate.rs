@@ -11,13 +11,18 @@
 //! until the v4 re-encode normalizes the whole drive. The NEEDLE is always NFC-normalized in
 //! Rust (user input is untrusted either way).
 
-use std::{borrow::Cow, ops::Range, path::Path, sync::Arc, time::Duration};
+use std::{borrow::Cow, ops::Range, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::Blake3Hash};
 use regex::bytes::Regex;
-use rusqlite::{Connection, OpenFlags, Row, functions::FunctionFlags, params, types::ValueRef};
+use rusqlite::{Connection, Row, functions::FunctionFlags, params, types::ValueRef};
 use uuid::Uuid;
+
+// Native-only: the engine opens its own read connection here (wasm routes reads through the
+// worker), so these are unused on the wasm cache build.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use {rusqlite::OpenFlags, std::path::Path};
 
 use crate::{
 	crypto::file::FileKey,
@@ -29,16 +34,16 @@ use super::{
 	result::{SearchHit, SearchResult},
 };
 
-// Bounds the worker round-trip in `ReadConn::run` (native `Direct` reads are synchronous).
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use tokio::time::timeout as reply_timeout;
+// Bounds the worker round-trip in `ReadConn::run`; wasm-only (native reads are synchronous, so
+// the worker read path does not exist there).
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasmtimer::tokio::timeout as reply_timeout;
 
-/// How long a [`ReadConn::Worker`] query waits for its reply. The worker serves reads with
+/// How long a [`ReadConn`] query waits for its reply. The worker serves reads with
 /// priority (including during a resync's network waits), so the residual queue time is one
 /// in-flight unit of worker work — e.g. applying one drained event burst. A timeout surfaces as
 /// a query error: the engine logs it and keeps the window's last snapshot; the next ping retries.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 const READ_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SEARCH_WINDOW_ACCOUNT: &str = include_str!("raw/search_window_account.sql");
@@ -61,55 +66,59 @@ pub(super) enum Scope {
 }
 
 /// A read query shipped to the cache worker, run against ITS connection between drains (the
-/// wasm read path — see [`ReadConn::Worker`]).
+/// wasm read path — see [`ReadConn`]).
 pub(crate) type ReadTask = Box<dyn FnOnce(&Connection) + Send + 'static>;
 
-/// Where the engine's queries run. Native uses [`Direct`](Self::Direct): a dedicated READ-ONLY
-/// connection reading concurrently with the worker's writer via WAL. The wasm VFS supports
-/// neither WAL nor a second connection to the same DB, so wasm uses [`Worker`](Self::Worker):
-/// each query is boxed up and run on the cache worker's single connection between drains —
-/// which serializes snapshots behind in-flight worker work (a bounded resync attempt at worst),
-/// instead of reading in parallel.
-pub(super) enum ReadConn {
-	Direct(Connection),
-	Worker(tokio::sync::mpsc::UnboundedSender<ReadTask>),
-}
+// Where the engine's queries run — a separate newtype per target (the choice is fixed at compile
+// time), not an enum. Native holds a dedicated READ-ONLY connection reading concurrently with the
+// worker's writer via WAL. The wasm VFS supports neither WAL nor a second connection to the same
+// DB, so wasm holds a sender that boxes each query up and runs it on the cache worker's single
+// connection between drains — which serializes snapshots behind in-flight worker work (a bounded
+// resync attempt at worst), instead of reading in parallel.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(super) struct ReadConn(pub(super) Connection);
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(super) struct ReadConn(pub(super) tokio::sync::mpsc::UnboundedSender<ReadTask>);
 
 impl ReadConn {
-	/// Run `query` against the cache DB: synchronously on a [`Direct`](Self::Direct) connection,
-	/// or round-tripped through the worker for [`Worker`](Self::Worker). A worker that shut down
-	/// surfaces as an error (the search is terminal by then anyway).
+	/// Run `query` against the cache DB: synchronously on the native connection, or round-tripped
+	/// through the worker on wasm. A worker that shut down surfaces as an error (the search is
+	/// terminal by then anyway).
 	pub(super) async fn run<T, F>(&self, query: F) -> rusqlite::Result<T>
 	where
 		T: Send + 'static,
 		F: FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
 	{
-		match self {
-			Self::Direct(conn) => query(conn),
-			Self::Worker(sender) => {
-				let (reply_sender, reply_receiver) = tokio::sync::oneshot::channel();
-				sender
-					.send(Box::new(move |conn| {
-						let _ = reply_sender.send(query(conn));
-					}))
-					.map_err(|_| worker_gone())?;
-				match reply_timeout(READ_REPLY_TIMEOUT, reply_receiver).await {
-					Ok(reply) => reply.map_err(|_| worker_gone())?,
-					// A worker alive-but-wedged is indistinguishable from dead from here; erroring
-					// beats hanging the search forever (the caller keeps its last snapshot).
-					Err(_) => Err(read_timed_out())?,
-				}
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			query(&self.0)
+		}
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			let (reply_sender, reply_receiver) = tokio::sync::oneshot::channel();
+			self.0
+				.send(Box::new(move |conn| {
+					let _ = reply_sender.send(query(conn));
+				}))
+				.map_err(|_| worker_gone())?;
+			match reply_timeout(READ_REPLY_TIMEOUT, reply_receiver).await {
+				Ok(reply) => reply.map_err(|_| worker_gone())?,
+				// A worker alive-but-wedged is indistinguishable from dead from here; erroring
+				// beats hanging the search forever (the caller keeps its last snapshot).
+				Err(_) => Err(read_timed_out())?,
 			}
 		}
 	}
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn read_timed_out() -> rusqlite::Error {
 	rusqlite::Error::UserFunctionError(
 		"cache worker did not answer a search query in time (wedged or overloaded)".into(),
 	)
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn worker_gone() -> rusqlite::Error {
 	rusqlite::Error::UserFunctionError(
 		"cache worker shut down before answering a search query".into(),
@@ -162,7 +171,8 @@ impl NameMatchers {
 /// lets it read concurrently with the worker's writer). `NO_MUTEX` is safe because the
 /// connection never leaves the engine task; the busy timeout rides out WAL checkpoints by the
 /// worker. On wasm the engine never opens this — the wasm VFS supports neither WAL nor a second
-/// connection, so reads route to the worker instead (see [`ReadConn::Worker`]).
+/// connection, so reads route to the worker instead (see [`ReadConn`]).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> {
 	let conn = Connection::open_with_flags(
 		path,
@@ -178,7 +188,7 @@ pub(super) fn open_read_connection(path: &Path) -> rusqlite::Result<Connection> 
 
 /// Register the `filen_name_matches` scalar function on `conn` (re-registering replaces, so this
 /// is idempotent). Needed on every connection search queries run against: the engine's own read
-/// connection on native, and the WORKER's single connection (which serves [`ReadConn::Worker`]
+/// connection on native, and the WORKER's single connection (which serves [`ReadConn`]
 /// queries) on wasm.
 pub(in crate::cache) fn register_name_matches(conn: &Connection) -> rusqlite::Result<()> {
 	conn.create_scalar_function(

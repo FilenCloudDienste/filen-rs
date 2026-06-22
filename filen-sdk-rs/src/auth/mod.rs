@@ -131,6 +131,7 @@ impl MetaKey {
 		Self::from_str_and_version(key, key_version)
 	}
 
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 	pub(crate) fn version(&self) -> MetaEncryptionVersion {
 		match self {
 			MetaKey::V1(_) => MetaEncryptionVersion::V1,
@@ -180,14 +181,6 @@ impl AuthInfo {
 				dek: v3::MetaKey::from_str(s)?,
 			})),
 			_ => unimplemented!("Unsupported auth version: {}", version),
-		}
-	}
-
-	pub fn version(&self) -> AuthVersion {
-		match self {
-			AuthInfo::V1(_) => AuthVersion::V1,
-			AuthInfo::V2(_) => AuthVersion::V2,
-			AuthInfo::V3(_) => AuthVersion::V3,
 		}
 	}
 }
@@ -263,7 +256,6 @@ pub struct Client {
 	pub(crate) chats_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 	pub(crate) auth_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 
-	pub(crate) max_parallel_requests: usize,
 	pub open_file_semaphore: tokio::sync::Semaphore,
 
 	#[cfg(any(
@@ -359,6 +351,10 @@ impl Client {
 		self.http_client.clone()
 	}
 
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
 	pub(crate) fn arc_client_ref(&self) -> &Arc<AuthClient> {
 		&self.http_client
 	}

@@ -59,13 +59,6 @@ pub(crate) trait DataCrypter: Send + Sync {
 	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
 
-	fn encrypt_data<'a>(
-		&'a self,
-		data: &'a mut Vec<u8>,
-	) -> impl Future<Output = Result<(), ConversionError>> + Send + 'a {
-		runtime::do_cpu_intensive(|| self.blocking_encrypt_data(data))
-	}
-
 	fn decrypt_data<'a>(
 		&'a self,
 		data: &'a mut Vec<u8>,

@@ -73,16 +73,6 @@ mod imp {
 	use super::{ExifMediaKind, ExifTimes, resolve_final_times};
 	use chrono::SubsecRound;
 
-	// Cross-target spawn handle for the parser task. On native tokio, we use
-	// tokio::spawn (multi-threaded runtime, Send required). On wasm32 there's
-	// no tokio::spawn — wasm_bindgen_futures::spawn_local + a oneshot channel
-	// stands in. Both end up implementing Future<Output = Result<ExifTimes, _>>
-	// so the poll_finalize logic is identical.
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	type ParseHandle = tokio::task::JoinHandle<ExifTimes>;
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	type ParseHandle = tokio::sync::oneshot::Receiver<ExifTimes>;
-
 	pub(crate) struct ExifChannelReader {
 		rx: mpsc::Receiver<Bytes>,
 		leftover: Bytes,

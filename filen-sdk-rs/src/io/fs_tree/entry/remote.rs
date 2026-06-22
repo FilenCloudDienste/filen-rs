@@ -24,18 +24,6 @@ impl<'a, Cat: Category + ?Sized> RemoteFSObjectEntry<'a, Cat> {
 	pub(crate) fn new(obj: NonRootItemType<'a, Cat>, depth: usize) -> Self {
 		Self { obj, depth }
 	}
-
-	pub(crate) fn depth(&self) -> usize {
-		self.depth
-	}
-
-	pub(crate) fn obj(&self) -> &NonRootItemType<'a, Cat> {
-		&self.obj
-	}
-
-	pub(crate) fn into_obj(self) -> NonRootItemType<'a, Cat> {
-		self.obj
-	}
 }
 
 impl<Cat: Category + ?Sized> super::DFSWalkerEntry for RemoteFSObjectEntry<'_, Cat>

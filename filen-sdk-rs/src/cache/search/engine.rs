@@ -10,7 +10,8 @@
 //! `tokio::time` drives the debounce and the engine's blocking SQLite reads are fine: nothing
 //! else runs there); wasm runs the loop on the CALLING thread's local executor via
 //! [`runtime::spawn_local`](crate::runtime::spawn_local) — the wasm engine never blocks (reads
-//! round-trip through [`ReadConn::Worker`], wasmtimer drives the debounce), so a dedicated
+//! round-trip through the worker connection ([`ReadConn`] on wasm), wasmtimer drives the
+//! debounce), so a dedicated
 //! per-search worker would be needless weight. FFI entry points call `create_search` on the
 //! commander, so that is where the engine lives in practice.
 //!
@@ -23,7 +24,6 @@
 
 use std::{
 	ops::Range,
-	path::PathBuf,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -31,13 +31,21 @@ use std::{
 	time::Duration,
 };
 
+// Native-only: only the native `ReadSource` carries a path (wasm carries a `ReadTask` sender).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::path::PathBuf;
+
 use uuid::Uuid;
 
 use super::{
 	config::{CompiledFilter, SearchConfig},
-	hydrate::{self, ReadConn, ReadTask, Scope},
+	hydrate::{self, ReadConn, Scope},
 	result::SearchSnapshot,
 };
+
+// Only the gated wasm `ReadSource`/`ReadConn` newtypes carry a `ReadTask` sender.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use hydrate::ReadTask;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use tokio::time::{Instant as TimerInstant, sleep_until as timer_sleep_until};
@@ -110,13 +118,15 @@ impl Drop for LiveGuard {
 	}
 }
 
-/// How the engine reads the cache DB — resolved by `create_search` per platform: native opens a
-/// dedicated READ-ONLY connection on the given path (WAL concurrent reads), wasm ships query
-/// closures to the cache worker's single connection (see [`ReadConn`]).
-pub(super) enum ReadSource {
-	Path(PathBuf),
-	Worker(tokio::sync::mpsc::UnboundedSender<ReadTask>),
-}
+// How the engine reads the cache DB, resolved by `create_search` per platform. A separate newtype
+// per target rather than an enum, since the read path is fixed at compile time: native opens its
+// own dedicated READ-ONLY connection on the `PathBuf` (WAL concurrent reads); wasm ships query
+// closures to the cache worker's single connection via the `ReadTask` sender (the wasm VFS
+// supports neither WAL nor a second connection — see `ReadConn`).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(super) struct ReadSource(pub(super) PathBuf);
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(super) struct ReadSource(pub(super) tokio::sync::mpsc::UnboundedSender<ReadTask>);
 
 pub(super) struct EngineInit {
 	pub(super) root: Uuid,
@@ -265,17 +275,17 @@ impl Engine {
 	/// always read the CURRENT committed DB, so batches committed before this point are covered
 	/// by the queries themselves and later ones arrive as refresh pings.
 	async fn build(&mut self, read_source: ReadSource) {
-		let conn = match read_source {
-			ReadSource::Path(path) => match hydrate::open_read_connection(&path) {
-				Ok(conn) => ReadConn::Direct(conn),
-				Err(e) => {
-					log::error!("search engine failed to open its read connection: {e}");
-					self.build_error = Some(e.to_string());
-					return;
-				}
-			},
-			ReadSource::Worker(sender) => ReadConn::Worker(sender),
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		let conn = match hydrate::open_read_connection(&read_source.0) {
+			Ok(conn) => ReadConn(conn),
+			Err(e) => {
+				log::error!("search engine failed to open its read connection: {e}");
+				self.build_error = Some(e.to_string());
+				return;
+			}
 		};
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		let conn = ReadConn(read_source.0);
 		let scope = self.scope();
 		let filter = self.filter.clone();
 		match conn
@@ -545,7 +555,7 @@ mod tests {
 				root,
 				is_account_root: true,
 				config: SearchConfig::new(),
-				read_source: ReadSource::Path(db_path),
+				read_source: ReadSource(db_path),
 				pings: ping_receiver,
 				commands: command_receiver,
 				shared: shared.clone(),

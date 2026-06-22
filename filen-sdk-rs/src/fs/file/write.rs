@@ -554,18 +554,21 @@ impl<'a> FileWriterCompletingState<'a> {
 
 		FileWriterFinalizingState {
 			file,
-			client: self.client,
 			futures,
-			drive_lock: self.drive_lock,
+			// Held (not read) to keep the server-side drive lock alive until the
+			// finalizing API calls above complete; dropping it early would release
+			// the lock mid-finalize. See `ResourceLock`'s `Drop` impl.
+			_drive_lock: self.drive_lock,
 		}
 	}
 }
 
 struct FileWriterFinalizingState<'a> {
-	drive_lock: Arc<ResourceLock>,
+	// Held (not read) to keep the server-side drive lock alive for the lifetime of
+	// this state, until the finalizing API calls complete. See `ResourceLock`'s `Drop`.
+	_drive_lock: Arc<ResourceLock>,
 	file: Arc<RemoteFile>,
 	futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<(), Error>>>,
-	client: &'a Client,
 }
 
 impl<'a> FileWriterFinalizingState<'a> {

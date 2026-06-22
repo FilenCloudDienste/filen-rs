@@ -159,14 +159,6 @@ impl DBDir {
 		Ok(res)
 	}
 
-	#[allow(dead_code)]
-	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
-		match DBObject::select(conn, uuid)? {
-			DBObject::Dir(dir) => Ok(dir),
-			obj => Err(SQLError::UnexpectedType(obj.item_type(), ItemType::Dir)),
-		}
-	}
-
 	pub(crate) fn upsert_from_remote_stmts(
 		remote_dir: RemoteDirectory,
 		upsert_item_stmt: &mut CachedStatement<'_>,
@@ -286,6 +278,7 @@ impl DBDirTrait for DBDir {
 		self.uuid
 	}
 
+	#[cfg(target_os = "ios")]
 	fn name(&self) -> Option<&str> {
 		if let DBDirMeta::Decoded(decoded) = &self.meta {
 			Some(&decoded.name)
@@ -300,10 +293,6 @@ impl DBDirTrait for DBDir {
 }
 
 impl item::DBItemTrait for DBDir {
-	fn id(&self) -> i64 {
-		self.id
-	}
-
 	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
@@ -318,10 +307,6 @@ impl item::DBItemTrait for DBDir {
 		} else {
 			None
 		}
-	}
-
-	fn item_type(&self) -> ItemType {
-		ItemType::Dir
 	}
 }
 
@@ -444,16 +429,13 @@ impl DBDirTrait for DBRoot {
 		self.uuid
 	}
 
+	#[cfg(target_os = "ios")]
 	fn name(&self) -> Option<&str> {
 		Some("")
 	}
 }
 
 impl DBItemTrait for DBRoot {
-	fn id(&self) -> i64 {
-		self.id
-	}
-
 	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
@@ -464,10 +446,6 @@ impl DBItemTrait for DBRoot {
 
 	fn name(&self) -> Option<&str> {
 		Some("")
-	}
-
-	fn item_type(&self) -> ItemType {
-		ItemType::Root
 	}
 }
 
@@ -555,6 +533,7 @@ impl DBDirTrait for DBDirObject {
 		}
 	}
 
+	#[cfg(target_os = "ios")]
 	fn name(&self) -> Option<&str> {
 		match self {
 			DBDirObject::Dir(dir) => DBDirTrait::name(dir),
@@ -563,10 +542,12 @@ impl DBDirTrait for DBDirObject {
 	}
 }
 
-#[allow(dead_code)]
 pub(crate) trait DBDirTrait: Sync + Send {
 	fn id(&self) -> i64;
 	fn uuid(&self) -> UuidStr;
+	// Only the iOS local path needs a directory's name (to mirror the folder on disk); off-iOS
+	// nothing calls it, so it would warn as dead.
+	#[cfg(target_os = "ios")]
 	fn name(&self) -> Option<&str>;
 	fn set_last_listed(&mut self, value: i64);
 }

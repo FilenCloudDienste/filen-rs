@@ -82,6 +82,8 @@ pub const FILE_CHUNK_SIZE: NonZeroU32 = NonZeroU32::new(1024 * 1024).unwrap(); /
 pub const FILE_CHUNK_SIZE_EXTRA: NonZeroU32 = NonZeroU32::new(28).unwrap(); // auth tag (16) + nonce (12)
 pub const FILE_CHUNK_SIZE_EXTRA_USIZE: usize = FILE_CHUNK_SIZE_EXTRA.get() as usize;
 
+// Only used by the native-only `io::dir_upload` path.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) const MAX_SMALL_PARALLEL_REQUESTS: usize = 64;
 pub(crate) const MAX_OPEN_FILES: usize = 64;
 

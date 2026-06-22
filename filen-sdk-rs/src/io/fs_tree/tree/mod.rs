@@ -6,7 +6,9 @@ use std::{
 
 use string_interner::{DefaultBackend, StringInterner};
 
-use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL, io::CanonicalPath};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use crate::io::CanonicalPath;
+use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL};
 
 use super::{WalkError, entry::*};
 
@@ -21,10 +23,8 @@ pub(crate) struct FSTree<DirExtra, FileExtra> {
 }
 
 impl<DirExtra, FileExtra> FSTree<DirExtra, FileExtra> {
-	pub(crate) fn count_entries(&self) -> usize {
-		self.entries.len()
-	}
-
+	// Only called from the native-only `io::dir_upload` path.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub(crate) fn list_children(&self, info: DirChildrenInfo) -> &[Entry<DirExtra, FileExtra>] {
 		&self.entries[info.as_range()]
 	}
@@ -94,6 +94,7 @@ impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra>
 		}
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub(crate) fn canonicalize(
 		self,
 	) -> Result<FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra>, std::io::Error> {
@@ -121,6 +122,7 @@ impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
 			.collect()
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	fn build_path_canonical(&self, root: &CanonicalPath, current_name: &str) -> CanonicalPath {
 		root.create_descendant_path(self.descendants(current_name))
 	}
@@ -159,11 +161,13 @@ impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIteratorWithPath<'a, DirExtr
 	}
 }
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) struct FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra> {
 	inner: FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra>,
 	root: CanonicalPath,
 }
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra> {
 	fn new(
 		inner: FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra>,
@@ -175,6 +179,7 @@ impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtr
 	}
 }
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 impl<'a, DirExtra, FileExtra> Iterator
 	for FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra>
 {

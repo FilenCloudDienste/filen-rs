@@ -79,6 +79,8 @@ impl FilenMetaExt for std::fs::Metadata {
 
 pub(crate) trait FileTimesExt {
 	fn get_file_times(&self) -> FileTimes;
+	// Unused for now: the write-side counterpart to `get_file_times`, kept for future use.
+	#[allow(dead_code)]
 	fn set_file_times(&self, file: &Path) -> Result<(), std::io::Error> {
 		let times = self.get_file_times();
 		std::fs::OpenOptions::new()

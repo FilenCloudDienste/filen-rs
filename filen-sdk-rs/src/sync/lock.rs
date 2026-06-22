@@ -165,9 +165,6 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 	});
 }
 
-pub(crate) const DEFAULT_NUM_RETRIES: usize = 7;
-pub(crate) const DEFAULT_MAX_RETRY_TIME: Duration = Duration::from_secs(30);
-
 fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
 	std::iter::successors(
 		Some((

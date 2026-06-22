@@ -6,7 +6,6 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use filen_macros::rkyv_self;
-use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
 use filen_types::crypto::{DerivedPassword, EncryptedString};
 use filen_types::serde::str::{SizedHexString, SizedStr};
 use md2::{Digest, Md2};
@@ -145,10 +144,6 @@ impl V2Key {
 	) -> Result<String, (ConversionError, Vec<u8>)> {
 		decrypt_meta(self.as_ref().as_bytes(), meta, out)
 	}
-
-	pub(crate) fn decrypt_data_v1(&self, data: &mut Vec<u8>) -> Result<(), ConversionError> {
-		decrypt_data(self.as_ref().as_bytes(), data)
-	}
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,11 +231,6 @@ pub fn derive_password_and_mk(
 		MasterKey::from_str(&master_key_str)?,
 		hash_password(password),
 	))
-}
-
-pub(crate) fn make_link_salt() -> LinkPasswordSalt {
-	// link salt in v1 is unused and always empty
-	LinkPasswordSalt::None
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use walkdir::DirEntry;
 
 use crate::io::fs_tree::WalkError;
 
-pub(crate) struct LocalDirEntry(DirEntry);
+pub(crate) struct LocalDirEntry;
 
 pub(crate) struct LocalFileEntry(DirEntry);
 
@@ -22,7 +22,7 @@ impl super::DFSWalkerEntry for DirEntry {
 
 	fn into_entry_type(self) -> super::EntryType<LocalDirEntry, LocalFileEntry> {
 		if self.file_type().is_dir() {
-			super::EntryType::Dir(LocalDirEntry(self))
+			super::EntryType::Dir(LocalDirEntry)
 		} else if self.file_type().is_file() {
 			super::EntryType::File(LocalFileEntry(self))
 		} else {

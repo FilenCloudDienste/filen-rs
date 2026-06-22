@@ -120,14 +120,6 @@ impl PartialEq<DBObject> for RemoteDirectory {
 }
 
 impl DBItemTrait for DBObject {
-	fn id(&self) -> i64 {
-		match self {
-			DBObject::File(file) => file.id,
-			DBObject::Dir(dir) => dir.id,
-			DBObject::Root(root) => root.id,
-		}
-	}
-
 	fn uuid(&self) -> UuidStr {
 		match self {
 			DBObject::File(file) => file.uuid,
@@ -151,10 +143,6 @@ impl DBItemTrait for DBObject {
 			// Root has no name, but this is different than having a not decrypted name
 			DBObject::Root(_) => Some(""),
 		}
-	}
-
-	fn item_type(&self) -> ItemType {
-		self.item_type()
 	}
 }
 
@@ -219,13 +207,6 @@ impl DBNonRootObject {
 }
 
 impl DBItemTrait for DBNonRootObject {
-	fn id(&self) -> i64 {
-		match self {
-			DBNonRootObject::Dir(dir) => DBItemTrait::id(dir),
-			DBNonRootObject::File(file) => DBItemTrait::id(file),
-		}
-	}
-
 	fn uuid(&self) -> UuidStr {
 		match self {
 			DBNonRootObject::Dir(dir) => DBItemTrait::uuid(dir),
@@ -244,13 +225,6 @@ impl DBItemTrait for DBNonRootObject {
 		match self {
 			DBNonRootObject::Dir(dir) => DBItemTrait::name(dir),
 			DBNonRootObject::File(file) => DBItemTrait::name(file),
-		}
-	}
-
-	fn item_type(&self) -> ItemType {
-		match self {
-			DBNonRootObject::Dir(_) => ItemType::Dir,
-			DBNonRootObject::File(_) => ItemType::File,
 		}
 	}
 }

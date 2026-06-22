@@ -829,6 +829,7 @@ where
 	Ok(LinkedDirsAndFiles { dirs, files })
 }
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 async fn list_linked_dir_recursive_inner_generic<F, T>(
 	client: Arc<T>,
 	dir: AnyLinkedDir,

@@ -60,6 +60,7 @@ impl Client {
 	/// [`ErrorKind::RetryFailed`](crate::ErrorKind::RetryFailed) after `attempts` polls instead
 	/// of waiting out the multi-hour default schedule. Used by the cache worker's resync, which
 	/// must yield back to draining events when the lock is contended rather than parking on it.
+	#[cfg(feature = "cache")]
 	pub(crate) async fn lock_drive_bounded(
 		&self,
 		max_sleep_time: Duration,

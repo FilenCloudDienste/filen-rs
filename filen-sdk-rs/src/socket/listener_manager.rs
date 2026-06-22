@@ -107,10 +107,6 @@ impl<T> ListenerManagerExtInner for T where T: ListenerManager {}
 // don't want it to be implemented outside of this module
 #[allow(private_bounds)]
 pub(crate) trait ListenerManagerExt: ListenerManager {
-	fn is_empty(&self) -> bool {
-		self.callbacks().is_empty()
-	}
-
 	fn add_listener<'a>(
 		&mut self,
 		callback: EventListenerCallback,

@@ -9,10 +9,7 @@ use crate::{
 	auth::shared_client::SharedClient,
 	consts::CALLBACK_INTERVAL,
 	error::{ErrorExt, ResultExt},
-	fs::{
-		categories::{Category, DirType, NonRootItemType, fs::CategoryFSExt},
-		file::RemoteFile,
-	},
+	fs::categories::{Category, DirType, NonRootItemType, fs::CategoryFSExt},
 	io::{
 		CanonicalPath, client_impl::inner_download_to_path_with_hash_check,
 		fs_tree::build_fs_tree_from_remote_iterator, meta_ext::DirTimesExt,
@@ -50,8 +47,6 @@ where
 	/// Called when errors occur during the download process
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Cat>)>);
 }
-
-struct FileDownloadResult(Result<RemoteFile, (Error, String)>);
 
 pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 	fn download_file_to_path_in_dir_download(

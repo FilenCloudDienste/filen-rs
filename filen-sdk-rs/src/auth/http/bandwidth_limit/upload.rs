@@ -13,7 +13,6 @@ use super::{
 };
 
 const BANDWIDTH_CHUNK_SIZE_KB: NonZeroU32 = NonZeroU32::new(16).unwrap();
-const BANDWIDTH_CHUNK_USIZE_KB: usize = BANDWIDTH_CHUNK_SIZE_KB.get() as usize;
 
 pub(crate) fn new_upload_bandwidth_limiter(kbps: NonZeroU32) -> Result<RateLimiter, Error> {
 	if kbps < BANDWIDTH_CHUNK_SIZE_KB {

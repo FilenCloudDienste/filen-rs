@@ -8,9 +8,8 @@ use aes_gcm::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_macros::rkyv_self;
 use filen_types::{
-	api::v3::dir::link::info::LinkPasswordSalt,
 	crypto::{DerivedPassword, EncryptedMasterKeys, EncryptedString},
-	serde::str::{SizedHexString, SizedStr, SizedStrBase64Chars},
+	serde::str::{SizedHexString, SizedStr},
 };
 use pbkdf2::{hmac::Hmac, pbkdf2};
 use rand::distr::Distribution;
@@ -393,9 +392,4 @@ pub(crate) fn derive_password_and_mk(
 	let derived_password = DerivedPassword(Cow::Owned(hex::encode(hasher.finalize())));
 
 	Ok((master_key, derived_password))
-}
-
-pub(crate) fn make_link_salt() -> LinkPasswordSalt {
-	let mut rng = rand::rng();
-	LinkPasswordSalt::V2(Box::new(SizedStrBase64Chars::new_random(&mut rng)))
 }

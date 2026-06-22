@@ -537,8 +537,12 @@ pub(super) mod empty_hash_is_none {
 	use std::borrow::Cow;
 
 	use filen_types::crypto::Blake3Hash;
-	use serde::{Deserialize, Serialize, Serializer, de::IntoDeserializer};
+	use serde::{Deserialize, de::IntoDeserializer};
+	#[cfg(feature = "http-provider")]
+	use serde::{Serialize, Serializer};
 
+	// Only reachable through the http-provider-gated `serde_stateless::DecodedSerHelper`.
+	#[cfg(feature = "http-provider")]
 	pub(crate) fn serialize<S>(value: &Option<Blake3Hash>, serializer: S) -> Result<S::Ok, S::Error>
 	where
 		S: Serializer,

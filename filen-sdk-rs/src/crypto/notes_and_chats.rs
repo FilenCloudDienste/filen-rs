@@ -130,7 +130,6 @@ where
 	T::Owned: Default,
 {
 	type WithLifetime<'de>: Serialize + Deserialize<'de>;
-	const NAME: &'static str;
 	fn into_inner<'a>(item: Self::WithLifetime<'a>) -> T::Owned;
 	fn from_inner<'a>(s: &'a T) -> Self::WithLifetime<'a>;
 }
@@ -178,8 +177,6 @@ macro_rules! impl_note_or_chat_carrier_crypto {
 			for $struct_name<'_>
 		{
 			type WithLifetime<'a> = $struct_name<'a>;
-
-			const NAME: &'static str = $debug_name;
 
 			fn into_inner<'a>(
 				item: Self::WithLifetime<'a>,

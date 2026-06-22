@@ -14,18 +14,8 @@ use crate::{
 		categories::{DirType, RootItemType, Shared},
 		file::RemoteRootFile,
 	},
-	js::{
-		File, FileMeta,
-		categories::{CategoryJSExt, common::dir::RootDirWithMeta},
-	},
+	js::{FileMeta, categories::common::dir::RootDirWithMeta},
 };
-
-impl CategoryJSExt for Shared {
-	type RootJS = SharedRootDir;
-	type DirJS = SharedDir;
-	type FileJS = File;
-	type RootFileJS = SharedFile;
-}
 
 #[js_type(export, wasm_all)]
 pub struct SharedRootDir {

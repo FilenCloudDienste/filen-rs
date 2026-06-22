@@ -580,16 +580,24 @@ mod client_impl {
 	all(target_family = "wasm", target_os = "unknown")
 ))]
 pub(crate) mod js_impl {
+	use filen_macros::js_type;
+
+	use crate::js::{AnyDirWithContext, AnyFile};
+
+	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use std::{
 		borrow::Cow,
 		sync::{Arc, Mutex as StdMutex},
 	};
 
+	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use async_zip::base::write::ZipFileWriter;
-	use filen_macros::js_type;
+	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use futures::{AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
+	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use tokio::sync::Mutex;
 
+	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use crate::{
 		Error,
 		auth::Client,
@@ -601,7 +609,7 @@ pub(crate) mod js_impl {
 				helpers::{download_dir_to_zip, download_file_to_zip},
 			},
 		},
-		js::{AnyDirWithContext, AnyFile, DirByCategoryWithContext},
+		js::DirByCategoryWithContext,
 		util::{MaybeSendBoxFuture, MaybeSendSync},
 	};
 
@@ -613,6 +621,7 @@ pub(crate) mod js_impl {
 
 	/// Dispatches a directory zip download based on its runtime category.
 	/// Handles Normal, Shared, and Linked directories uniformly.
+	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	#[allow(private_bounds)]
 	async fn download_dir_by_category_to_zip<T>(
 		client: &Client,
@@ -666,6 +675,7 @@ pub(crate) mod js_impl {
 	}
 
 	/// Downloads a list of mixed-category items to a zip writer.
+	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	#[allow(private_bounds)]
 	pub(crate) async fn download_zip_items<T>(
 		client: &Client,
@@ -919,14 +929,16 @@ mod service_worker_impl {
 mod unauth_js_client_impl {
 	use std::borrow::Cow;
 
+	#[cfg(feature = "uniffi")]
+	use crate::runtime::do_on_commander;
 	use crate::{
 		Error,
 		auth::js_impls::UnauthJsClient,
 		fs::categories::{DirType, Linked, NonRootFileType},
 		js::AnyLinkedDirWithContext,
-		runtime::do_on_commander,
 	};
 
+	#[cfg(feature = "uniffi")]
 	impl UnauthJsClient {
 		async fn inner_download_linked_dir_to_zip<F>(
 			&self,

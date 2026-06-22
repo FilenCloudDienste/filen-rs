@@ -12,15 +12,8 @@ use crate::{
 		dir::RootDirectory,
 	},
 	io::RemoteDirectory,
-	js::{DirColor, DirMeta, File, categories::CategoryJSExt},
+	js::{DirColor, DirMeta, File},
 };
-
-impl CategoryJSExt for Normal {
-	type RootJS = Root;
-	type DirJS = Dir;
-	type FileJS = File;
-	type RootFileJS = File;
-}
 
 #[js_type(export, wasm_all)]
 pub struct Root {

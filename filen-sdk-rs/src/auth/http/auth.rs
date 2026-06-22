@@ -4,8 +4,6 @@ use filen_types::auth::APIKey;
 use reqwest::RequestBuilder;
 use tower::{Layer, Service};
 
-trait AuthedRequest {}
-
 #[derive(Clone, Debug)]
 pub(crate) struct AuthService<'a, S> {
 	inner: S,

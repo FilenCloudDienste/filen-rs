@@ -86,13 +86,6 @@ pub(crate) async fn encrypt_private_key(
 	Ok(EncryptedPrivateKey(encrypted))
 }
 
-pub(crate) fn encrypt_with_public_key<'a>(
-	public_key: &'a RsaPublicKey,
-	data: &'a [u8],
-) -> impl Future<Output = Result<RSAEncryptedString<'static>, rsa::Error>> + Send + 'a {
-	runtime::do_cpu_intensive(|| blocking_encrypt_with_public_key(public_key, data))
-}
-
 pub(crate) fn blocking_encrypt_with_public_key(
 	public_key: &RsaPublicKey,
 	data: &[u8],

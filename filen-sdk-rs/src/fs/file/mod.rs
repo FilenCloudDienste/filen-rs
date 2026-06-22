@@ -34,6 +34,7 @@ pub(crate) mod exif;
 pub mod js_impl;
 pub mod meta;
 pub mod read;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) mod service_worker;
 pub mod traits;
 pub mod write;

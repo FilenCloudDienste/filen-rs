@@ -1,4 +1,6 @@
-use std::{borrow::Cow, path::PathBuf};
+use std::borrow::Cow;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::path::PathBuf;
 
 use uuid::Uuid;
 
@@ -22,10 +24,13 @@ use crate::ErrorKind;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WalkError {
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[error("detected a symlink loop at path {0:?}")]
 	Loop(PathBuf),
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[error("IO error at path {0:?}: {1}")]
 	IO(Option<PathBuf>, std::io::Error),
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[error("invalid file name at path {0:?}")]
 	InvalidName(PathBuf),
 	#[error("encrypted metadata could not be read for UUID {0}")]

@@ -5,76 +5,87 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 use crate::util::MaybeSend;
 
 mod async_scoped_task {
-	use std::mem::ManuallyDrop;
+	// The mt-crypto-only scoped-task machinery, gated once at the module rather than per item.
+	#[cfg(feature = "multi-threaded-crypto")]
+	mod multi_threaded {
+		use std::mem::ManuallyDrop;
 
-	struct AsyncTaskHandle<T> {
-		async_receiver: ManuallyDrop<tokio::sync::oneshot::Receiver<T>>,
-	}
+		pub(super) struct AsyncTaskHandle<T> {
+			async_receiver: ManuallyDrop<tokio::sync::oneshot::Receiver<T>>,
+		}
 
-	impl<T> Drop for AsyncTaskHandle<T> {
-		fn drop(&mut self) {
-			// SAFETY: we are taking the receiver out of the ManuallyDrop
-			// we do this exactly once, in the drop impl, so it's safe
-			let mut async_receiver = unsafe { ManuallyDrop::take(&mut self.async_receiver) };
+		impl<T> AsyncTaskHandle<T> {
+			pub(super) fn new(receiver: tokio::sync::oneshot::Receiver<T>) -> Self {
+				Self {
+					async_receiver: ManuallyDrop::new(receiver),
+				}
+			}
+		}
 
-			match async_receiver.try_recv() {
-				Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
-				Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-					log::debug!(
-						"AsyncTaskHandle being dropped before completion, blocking current thread to avoid UB"
-					);
-					#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-					{
-						tokio::task::block_in_place(|| {
+		impl<T> Drop for AsyncTaskHandle<T> {
+			fn drop(&mut self) {
+				// SAFETY: we are taking the receiver out of the ManuallyDrop
+				// we do this exactly once, in the drop impl, so it's safe
+				let mut async_receiver = unsafe { ManuallyDrop::take(&mut self.async_receiver) };
+
+				match async_receiver.try_recv() {
+					Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+					Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+						log::debug!(
+							"AsyncTaskHandle being dropped before completion, blocking current thread to avoid UB"
+						);
+						#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+						{
+							tokio::task::block_in_place(|| {
+								let _ = async_receiver.blocking_recv();
+							})
+						}
+						#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+						{
 							let _ = async_receiver.blocking_recv();
-						})
-					}
-					#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-					{
-						let _ = async_receiver.blocking_recv();
+						}
 					}
 				}
 			}
 		}
-	}
 
-	impl<T> Future for AsyncTaskHandle<T> {
-		type Output = T;
+		impl<T> Future for AsyncTaskHandle<T> {
+			type Output = T;
 
-		fn poll(
-			self: std::pin::Pin<&mut Self>,
-			cx: &mut std::task::Context<'_>,
-		) -> std::task::Poll<Self::Output> {
-			let this = self.get_mut();
-			std::pin::Pin::new(&mut *this.async_receiver)
-				.poll(cx)
-				.map(|res| res.expect("Thread panicked"))
+			fn poll(
+				self: std::pin::Pin<&mut Self>,
+				cx: &mut std::task::Context<'_>,
+			) -> std::task::Poll<Self::Output> {
+				let this = self.get_mut();
+				std::pin::Pin::new(&mut *this.async_receiver)
+					.poll(cx)
+					.map(|res| res.expect("Thread panicked"))
+			}
 		}
-	}
 
-	/// Spawns a closure on the rayon threadpool without requiring 'static lifetime.
-	///
-	/// # Safety
-	/// The caller must guarantee that the closure does not outlive any references it captures.
-	#[cfg(feature = "multi-threaded-crypto")]
-	unsafe fn spawn_unchecked<F>(f: F)
-	where
-		F: FnOnce() + Send,
-	{
-		let f = Box::into_raw(Box::new(f));
-		struct SendPtr(*mut ());
+		/// Spawns a closure on the rayon threadpool without requiring 'static lifetime.
+		///
+		/// # Safety
+		/// The caller must guarantee that the closure does not outlive any references it captures.
+		pub(super) unsafe fn spawn_unchecked<F>(f: F)
+		where
+			F: FnOnce() + Send,
+		{
+			let f = Box::into_raw(Box::new(f));
+			struct SendPtr(*mut ());
 
-		unsafe impl Send for SendPtr {}
-		let ptr = SendPtr(f as *mut ());
+			unsafe impl Send for SendPtr {}
+			let ptr = SendPtr(f as *mut ());
 
-		rayon::spawn(move || {
-			let ptr = ptr;
-			// SAFETY: we are doing this to bypass the 'static requirement of rayon::spawn
-			// this function is unsafe because the caller must guarantee that the closure
-			// does not outlive any references it captures
-			let f = unsafe { Box::from_raw(ptr.0 as *mut F) };
-			f();
-		});
+			rayon::spawn(move || {
+				let ptr = ptr;
+				// SAFETY: we are doing this to bypass the 'static requirement of rayon::spawn
+				// this function is unsafe because the caller must guarantee that the closure
+				// does not outlive any references it captures
+				let f = unsafe { Box::from_raw(ptr.0 as *mut F) };
+				f();
+			});
+		}
 	}
 
 	/// Runs a CPU intensive intensive function on the rayon threadpool, returning a future that resolves to the result.
@@ -106,11 +117,11 @@ mod async_scoped_task {
 	{
 		#[cfg(feature = "multi-threaded-crypto")]
 		{
+			use multi_threaded::{AsyncTaskHandle, spawn_unchecked};
+
 			let (async_sender, async_receiver) = tokio::sync::oneshot::channel::<R>();
 
-			let handle = AsyncTaskHandle {
-				async_receiver: ManuallyDrop::new(async_receiver),
-			};
+			let handle = AsyncTaskHandle::new(async_receiver);
 			unsafe {
 				spawn_unchecked(move || {
 					let res = f();
@@ -163,11 +174,7 @@ mod worker_handle {
 	}
 }
 
-#[cfg(not(all(
-	target_family = "wasm",
-	target_os = "unknown",
-	not(feature = "wasm-full")
-)))]
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 mod commander_thread {
 	use std::{mem::ManuallyDrop, pin::Pin, sync::OnceLock};
 
@@ -180,10 +187,12 @@ mod commander_thread {
 	// Sender for commander worker tasks
 	static COMMANDER_RUNTIME_HANDLE: OnceLock<RuntimeHandle> = OnceLock::new();
 
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	trait FnOnceBox: Send + 'static {
 		fn call_box(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + 'static>>;
 	}
 
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	impl<F, Fut> FnOnceBox for F
 	where
 		F: FnOnce() -> Fut + Send + 'static,
@@ -199,11 +208,11 @@ mod commander_thread {
 		sender: tokio::sync::mpsc::UnboundedSender<Box<dyn FnOnceBox>>,
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		tokio_handle: tokio::runtime::Handle,
+		// Held only for its Drop: closing this oneshot signals the commander runtime
+		// thread to stop (`close_receiver.await` resolves), shutting down the runtime.
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		close_sender: tokio::sync::oneshot::Sender<()>,
+		_close_sender: tokio::sync::oneshot::Sender<()>,
 	}
-
-	struct JoinHandle {}
 
 	impl RuntimeHandle {
 		fn new() -> Self {
@@ -268,7 +277,7 @@ mod commander_thread {
 
 				Self {
 					tokio_handle: handle,
-					close_sender,
+					_close_sender: close_sender,
 				}
 			}
 		}
@@ -302,6 +311,9 @@ mod commander_thread {
 	}
 
 	pin_project! {
+		// `paused`/`pause_signal` back the unused-for-now pause/resume/is_paused API below; kept
+		// for potential future use.
+		#[allow(dead_code)]
 		pub(crate) struct CommanderFutHandle<T> {
 			paused: bool,
 			pause_signal: tokio::sync::watch::Sender<bool>,
@@ -321,6 +333,8 @@ mod commander_thread {
 		}
 	}
 
+	// Unused for now: a task-pause API kept for potential future use.
+	#[allow(dead_code)]
 	impl<T> CommanderFutHandle<T> {
 		pub(crate) fn pause(&mut self) {
 			if !self.paused {

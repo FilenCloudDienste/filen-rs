@@ -33,7 +33,6 @@ use crate::{
 		error::ConversionError,
 		rsa::HMACKey,
 		v2::{MasterKey, MasterKeys},
-		v3::EncryptionKey,
 	},
 	fs::dir::RootDirectory,
 };
@@ -83,11 +82,6 @@ impl UnauthClient {
 		)
 		.map_err(ConversionError::from)?;
 
-		let max_parallel_requests = stringified
-			.max_parallel_requests
-			.map(|v| usize::try_from(v).unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS))
-			.unwrap_or(crate::consts::MAX_SMALL_PARALLEL_REQUESTS);
-
 		let http_client = Arc::new(AuthClient::from_unauthed(
 			self.clone(),
 			Arc::new(RwLock::new(APIKey(Cow::Owned(stringified.api_key)))),
@@ -110,7 +104,6 @@ impl UnauthClient {
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
 			auth_lock: tokio::sync::RwLock::new(None),
-			max_parallel_requests,
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
 			#[cfg(any(
 				not(all(target_family = "wasm", target_os = "unknown")),
@@ -291,7 +284,6 @@ async fn finish_login(
 			notes_lock: tokio::sync::RwLock::new(None),
 			chats_lock: tokio::sync::RwLock::new(None),
 			auth_lock: tokio::sync::RwLock::new(None),
-			max_parallel_requests: crate::consts::MAX_SMALL_PARALLEL_REQUESTS,
 			open_file_semaphore: tokio::sync::Semaphore::new(crate::consts::MAX_OPEN_FILES),
 			#[cfg(any(
 				not(all(target_family = "wasm", target_os = "unknown")),
@@ -361,20 +353,20 @@ impl UnauthClient {
 		password: &str,
 		ref_id: Option<&str>,
 		aff_id: Option<&str>,
-	) -> Result<RegisteredInfo, Error> {
-		let (derived_pwd, salt, auth_info) = match NEW_ACCOUNT_AUTH_VERSION {
+	) -> Result<(), Error> {
+		let (derived_pwd, salt, auth_version) = match NEW_ACCOUNT_AUTH_VERSION {
 			AuthVersion::V1 => unreachable!("V1 is not supported for new accounts"),
 			AuthVersion::V2 => {
 				let salt: [u8; 128] = rand::random();
 				let salt = hex::encode(salt);
-				let (mk, pwd) =
+				let (_mk, pwd) =
 					crypto::v2::derive_password_and_mk(password.as_bytes(), salt.as_bytes())?;
-				(pwd, salt, RegisteredAuthInfo::V2(mk))
+				(pwd, salt, AuthVersion::V2)
 			}
 			AuthVersion::V3 => {
 				let salt = SizedHexString::from(rand::random::<[u8; 256]>());
-				let (kek, pwd) = crypto::v3::derive_password_and_kek(password.as_bytes(), &salt)?;
-				(pwd, salt.to_string(), RegisteredAuthInfo::V3(kek))
+				let (_kek, pwd) = crypto::v3::derive_password_and_kek(password.as_bytes(), &salt)?;
+				(pwd, salt.to_string(), AuthVersion::V3)
 			}
 		};
 
@@ -383,19 +375,13 @@ impl UnauthClient {
 			&api::v3::register::Request {
 				email: Cow::Borrowed(&email),
 				salt: Cow::Borrowed(&salt),
-				auth_version: auth_info.version(),
+				auth_version,
 				password: derived_pwd.as_borrowed_cow(),
 				ref_id: ref_id.map(Cow::Borrowed),
 				aff_id: aff_id.map(Cow::Borrowed),
 			},
 		)
-		.await?;
-
-		Ok(RegisteredInfo {
-			email,
-			salt,
-			auth_info,
-		})
+		.await
 	}
 
 	pub async fn start_password_reset(&self, email: &str) -> Result<(), Error> {
@@ -417,26 +403,6 @@ impl UnauthClient {
 		)
 		.await
 	}
-}
-
-enum RegisteredAuthInfo {
-	V2(MasterKey),
-	V3(EncryptionKey), // kek
-}
-
-impl RegisteredAuthInfo {
-	fn version(&self) -> AuthVersion {
-		match self {
-			RegisteredAuthInfo::V2(_) => AuthVersion::V2,
-			RegisteredAuthInfo::V3(_) => AuthVersion::V3,
-		}
-	}
-}
-
-pub struct RegisteredInfo {
-	email: String,
-	salt: String,
-	auth_info: RegisteredAuthInfo,
 }
 
 fn master_keys_from_exportable(recovery_key: &str, user_id: u64) -> Result<Vec<MasterKey>, Error> {

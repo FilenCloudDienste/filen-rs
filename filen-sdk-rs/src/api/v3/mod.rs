@@ -7,6 +7,12 @@ pub(crate) mod file;
 pub(crate) mod health;
 pub(crate) mod item;
 pub(crate) mod login;
+// Only used by the `socket` module (which has the same cfg); never on the bare wasm
+// service-worker build.
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
 pub(crate) mod message_ids;
 pub(crate) mod notes;
 pub(crate) mod register;

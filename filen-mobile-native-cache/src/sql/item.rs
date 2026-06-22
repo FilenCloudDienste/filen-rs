@@ -133,11 +133,8 @@ impl From<RawDBItem> for InnerDBItem {
 	}
 }
 
-#[allow(dead_code)]
 pub(crate) trait DBItemTrait: Sync + Send {
-	fn id(&self) -> i64;
 	fn uuid(&self) -> UuidStr;
 	fn parent(&self) -> Option<ParentUuid>;
 	fn name(&self) -> Option<&str>;
-	fn item_type(&self) -> ItemType;
 }

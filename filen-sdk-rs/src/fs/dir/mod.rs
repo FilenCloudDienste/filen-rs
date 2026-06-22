@@ -215,10 +215,6 @@ impl RemoteDirectory {
 		}
 	}
 
-	pub(crate) fn set_uuid(&mut self, uuid: UuidStr) {
-		self.uuid = uuid;
-	}
-
 	pub(crate) fn set_parent(&mut self, parent: ParentUuid) {
 		self.parent = parent;
 	}

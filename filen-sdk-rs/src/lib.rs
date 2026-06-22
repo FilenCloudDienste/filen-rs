@@ -8,7 +8,6 @@
 	// stable in 1.95
 	cfg_select
 )]
-#![allow(dead_code)]
 #![allow(type_alias_bounds)]
 
 pub(crate) mod api;

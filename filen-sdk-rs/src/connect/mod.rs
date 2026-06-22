@@ -79,10 +79,6 @@ impl PasswordState {
 			PasswordState::Known(_) => true,
 		}
 	}
-
-	fn is_none(&self) -> bool {
-		matches!(self, PasswordState::None)
-	}
 }
 
 #[derive(Debug, Clone, Eq)]
@@ -262,10 +258,6 @@ impl DirPublicLinkRW {
 			enable_download: true,
 			salt: LinkPasswordSalt::None,
 		}
-	}
-
-	pub(crate) fn crypter(&self) -> Option<&impl MetaCrypter> {
-		self.link_key.as_ref()
 	}
 }
 

@@ -13,10 +13,7 @@ use crate::{
 };
 
 use super::{
-	consts::{
-		MAX_RECONNECT_DELAY, MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL,
-		RECONNECT_DELAY,
-	},
+	consts::{MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL, RECONNECT_DELAY},
 	events::DecryptedSocketEvent,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
 	traits::*,
@@ -222,7 +219,6 @@ impl Future for ListenerRegisterGuard {
 pub(super) struct WebSocketConfig {
 	pub(super) client: Arc<AuthClient>,
 	pub(super) reconnect_delay: Duration,
-	pub(super) max_reconnect_delay: Duration,
 	pub(super) ping_interval: Duration,
 	pub(super) user_id: u64,
 }
@@ -238,7 +234,6 @@ fn spawn_websocket_thread(
 	let config = WebSocketConfig {
 		client,
 		reconnect_delay: RECONNECT_DELAY,
-		max_reconnect_delay: MAX_RECONNECT_DELAY,
 		ping_interval: PING_INTERVAL,
 		user_id,
 	};

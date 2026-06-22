@@ -226,66 +226,6 @@ impl Client {
 	// }
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	async fn inner_download_file_to_path(
-		&self,
-		remote_file: &dyn File,
-		path: &Path,
-		callback: Option<MaybeSendCallback<'_, u64>>,
-	) -> Result<(), Error> {
-		let mod_time = match tokio::fs::metadata(path).await {
-			Ok(m) => Some(FilenMetaExt::modified(&m)),
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-			Err(e) => return Err(e.into()),
-		};
-
-		let parent = path.parent().ok_or_else(|| {
-			std::io::Error::new(
-				std::io::ErrorKind::InvalidInput,
-				"Provided path has no parent directory",
-			)
-		})?;
-		let tmp_path = parent
-			.join(remote_file.uuid().as_ref())
-			.with_extension("filendl");
-		let tmp_file = tokio::fs::OpenOptions::new()
-			.write(true)
-			.create(true)
-			.truncate(true)
-			.open(&tmp_path)
-			.await?;
-		let mut writer = tmp_file.compat_write();
-
-		self.download_file_to_writer(remote_file, &mut writer, callback)
-			.await?;
-
-		let file_times = FileTimesExt::get_file_times(remote_file);
-
-		let tmp_file = writer.into_inner().into_std().await;
-		tokio::task::spawn_blocking(move || tmp_file.set_times(file_times))
-			.await
-			.unwrap()?;
-
-		// Try and make sure we are not overwriting a file that has changed since we started downloading
-		// There's still an unavoidable race condition if the file changes between the metadata check and the rename
-		// but there is literally no way to avoid that without an OS-level exclusive file lock or atomic file swap
-		// which are not widely supported across platforms
-		// This at least covers the common case where the file is modified while we are downloading
-		if let Some(mod_time) = mod_time {
-			let current_meta = tokio::fs::metadata(&tmp_path).await?;
-			let current_mod_time = FilenMetaExt::modified(&current_meta);
-			if current_mod_time != mod_time {
-				return Err(Error::custom(
-					ErrorKind::FileChangedDuringSync,
-					format!("File at path {:?} was modified during download", path),
-				));
-			}
-		}
-
-		tokio::fs::rename(&tmp_path, path).await?;
-		Ok(())
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn upload_file_from_path(
 		&self,
 		parent: &DirType<'_, Normal>,

@@ -270,6 +270,7 @@ impl From<JsClientConfig> for ClientConfig {
 #[derive(Clone)]
 pub(crate) struct SharedClientState {
 	concurrency: GlobalConcurrencyLimitLayer,
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	max_concurrency: usize,
 	retry: retry::RetryMapLayer,
 	rate_limiter: limit::GlobalRateLimitLayer,
@@ -278,7 +279,6 @@ pub(crate) struct SharedClientState {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	download_limiter: DownloadBandwidthLimiterLayer,
 	log_level: log::LevelFilter,
-	zip_lock: Arc<tokio::sync::Mutex<()>>,
 	memory_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -303,6 +303,7 @@ impl SharedClientState {
 
 		Ok(Self {
 			concurrency: GlobalConcurrencyLimitLayer::new(config.concurrency),
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			max_concurrency: config.concurrency,
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
 			rate_limiter: limit::GlobalRateLimitLayer::new(config.rate_limit_per_sec),
@@ -311,41 +312,17 @@ impl SharedClientState {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			download_limiter,
 			log_level: config.log_level,
-			zip_lock: Arc::new(tokio::sync::Mutex::new(())),
 			memory_semaphore: Arc::new(tokio::sync::Semaphore::new(config.file_io_memory_budget)),
 		})
-	}
-
-	pub(crate) async fn zip_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-		self.zip_lock.lock().await
 	}
 
 	pub(crate) fn memory_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
 		&self.memory_semaphore
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub(crate) fn max_concurrency(&self) -> usize {
 		self.max_concurrency
-	}
-}
-
-trait RequestCallTrait {
-	fn call(&self) -> Result<bytes::Bytes, Error>;
-}
-
-impl<Req> RequestCallTrait for Req
-where
-	Req: serde::Serialize,
-{
-	default fn call(&self) -> Result<bytes::Bytes, Error> {
-		let body = serde_json::to_vec(self)?;
-		Ok(bytes::Bytes::from_owner(body))
-	}
-}
-
-impl RequestCallTrait for () {
-	fn call(&self) -> Result<bytes::Bytes, Error> {
-		Ok(bytes::Bytes::new())
 	}
 }
 
@@ -630,46 +607,6 @@ impl AuthClient {
 impl UnauthClient {
 	pub(crate) fn state(&self) -> &SharedClientState {
 		&self.state
-	}
-
-	pub(crate) async fn get<Res>(&self, endpoint: Cow<'static, str>) -> Result<Res, Error>
-	where
-		Res: DeserializeOwned + Debug,
-	{
-		let url = gateway_url(&endpoint);
-
-		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
-			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.state.concurrency.clone()) // optional
-			.layer(self.state.retry.clone()) // required to map RetryError to Error
-			.layer(self.state.rate_limiter.clone()) // optional
-			.layer(deserialize::DeserializeLayer::<Res>::new()) // required to convert AsRef<u8> to T
-			.layer(download_body::full::DownloadLayer::new()) // required to download full response body to bytes
-			.map_request(|request: Request<(), reqwest::Url>| {
-				request.into_builder_map_body(|()| bytes::Bytes::new())
-			}); // required to map Request to RequestBuilder
-
-		let builder = {
-			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-			{
-				builder.layer(self.state.download_limiter.clone()) // optional
-			}
-			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-			{
-				builder
-			}
-		};
-
-		builder
-			.service_fn(execute_request)
-			.oneshot(Request {
-				method: RequestMethod::Get,
-				response_type: ResponseType::Standard,
-				url,
-				client: self.reqwest_client.clone(),
-			})
-			.await
 	}
 
 	pub(crate) async fn post<Req, Res>(
@@ -1050,24 +987,6 @@ impl<Body> Request<Body, reqwest::Url> {
 		} else {
 			request
 		}
-	}
-}
-
-impl<Body, Url> Request<Body, Url> {
-	fn try_map_body<B, E>(
-		self,
-		map_body: impl FnOnce(Body) -> Result<B, E>,
-	) -> Result<Request<B, Url>, E> {
-		let body = match self.method {
-			RequestMethod::Get => RequestMethod::Get,
-			RequestMethod::Post(body) => RequestMethod::Post(map_body(body)?),
-		};
-		Ok(Request {
-			method: body,
-			response_type: self.response_type,
-			url: self.url,
-			client: self.client,
-		})
 	}
 }
 

@@ -338,10 +338,6 @@ impl DBFile {
 }
 
 impl DBItemTrait for DBFile {
-	fn id(&self) -> i64 {
-		self.id
-	}
-
 	fn uuid(&self) -> UuidStr {
 		self.uuid
 	}
@@ -356,10 +352,6 @@ impl DBItemTrait for DBFile {
 		} else {
 			None
 		}
-	}
-
-	fn item_type(&self) -> ItemType {
-		ItemType::File
 	}
 }
 

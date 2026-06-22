@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::{DateTime, SubsecRound, Utc};
 use filen_macros::js_type;
 use filen_types::{
@@ -60,27 +59,6 @@ impl<'a> DirectoryMeta<'a> {
 }
 
 impl<'a> DirectoryMeta<'a> {
-	pub(crate) fn blocking_encrypt(
-		&self,
-		encrypter: &impl MetaCrypter,
-	) -> Option<EncryptedString<'static>> {
-		match self {
-			Self::Decoded(meta) => {
-				let json = serde_json::to_string(meta).expect("Failed to serialize directory meta");
-
-				Some(encrypter.blocking_encrypt_meta(&json))
-			}
-			Self::DecryptedRaw(raw) => {
-				Some(encrypter.blocking_encrypt_meta(&BASE64_STANDARD.encode(raw)))
-			}
-			Self::DecryptedUTF8(utf8) => Some(encrypter.blocking_encrypt_meta(utf8)),
-			other => {
-				log::warn!("Cannot convert {other:?} to encrypted meta");
-				None
-			}
-		}
-	}
-
 	pub fn try_to_string(&'a self) -> Option<Cow<'a, str>> {
 		match self {
 			// SAFETY: serializing a DecryptedDirectoryMeta always succeeds

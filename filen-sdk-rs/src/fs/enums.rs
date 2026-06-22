@@ -9,13 +9,13 @@ use crate::{
 	fs::{
 		categories::{Category, NonRootItemType},
 		dir::LinkedDirectory,
-		file::{LinkedFile, enums::RemoteFileType},
+		file::LinkedFile,
 	},
 };
 
 use super::{
 	HasType,
-	dir::{DirectoryType, RemoteDirectory, RootDirectory, RootDirectoryWithMeta},
+	dir::{RemoteDirectory, RootDirectory, RootDirectoryWithMeta},
 	file::{RemoteFile, RemoteRootFile},
 };
 
@@ -39,24 +39,6 @@ impl<'a> From<&'a FSObject<'_>> for FSObject<'a> {
 		}
 	}
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, CowFrom, CowHelpers)]
-pub(crate) enum FsObjectIntoTypes<'a> {
-	Dir(DirectoryType<'a>),
-	File(RemoteFileType<'a>),
-}
-
-// impl<'a> From<FSObject<'a>> for FsObjectIntoTypes<'a> {
-// 	fn from(item: FSObject<'a>) -> Self {
-// 		match item {
-// 			FSObject::Dir(cow) => FsObjectIntoTypes::Dir(DirectoryType::Dir(cow)),
-// 			FSObject::Root(cow) => FsObjectIntoTypes::Dir(DirectoryType::Root(cow)),
-// 			FSObject::RootWithMeta(cow) => FsObjectIntoTypes::Dir(DirectoryType::LinkedRoot(cow)),
-// 			FSObject::File(cow) => FsObjectIntoTypes::File(RemoteFileType::File(cow)),
-// 			FSObject::SharedFile(cow) => FsObjectIntoTypes::File(RemoteFileType::Shared(cow)),
-// 		}
-// 	}
-// }
 
 impl<Cat: Category> HasType for NonRootItemType<'_, Cat> {
 	fn object_type(&self) -> ObjectType {

@@ -169,14 +169,14 @@ impl Client {
 		// neither WAL nor a second connection, so queries route to the worker's connection.
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		let read_source =
-			engine::ReadSource::Path(self.cache_slot.lock().await.db_path().ok_or_else(|| {
+			engine::ReadSource(self.cache_slot.lock().await.db_path().ok_or_else(|| {
 				Error::custom(
 					ErrorKind::InvalidState,
 					"cache is not configured; call configure_cache first",
 				)
 			})?);
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		let read_source = engine::ReadSource::Worker(sync_root_handle.read_task_sender());
+		let read_source = engine::ReadSource(sync_root_handle.read_task_sender());
 
 		let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
 		let shared = Arc::new(SearchShared {
@@ -197,7 +197,7 @@ impl Client {
 		};
 		// Native: a dedicated thread (current-thread tokio runtime) — the engine's direct SQLite
 		// reads may block. Wasm: the engine never blocks (queries round-trip through
-		// `ReadConn::Worker`, the debounce is wasmtimer), so it runs on the CALLING thread's
+		// the worker connection, the debounce is wasmtimer), so it runs on the CALLING thread's
 		// local executor instead of a dedicated web worker — a per-search worker is needless
 		// weight. (FFI calls arrive on the commander via `do_on_commander`, so that is where
 		// the engine lands; see the method docs for the hosting contract.)

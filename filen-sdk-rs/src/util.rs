@@ -99,23 +99,15 @@ pub type MaybeArcWeak<T> = std::sync::Weak<T>;
 #[cfg(target_family = "wasm")]
 pub type MaybeArcWeak<T> = std::rc::Weak<T>;
 
+// Used only by the JS glue (`commander_thread` in runtime.rs and `chats::js_impls`),
+// both compiled only under `uniffi`/`wasm-full`.
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 pub(crate) trait WasmResultExt<T> {
-	fn unwrap_or_throw(self) -> T;
 	fn expect_or_throw(self, msg: &str) -> T;
 }
 
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 impl<T, E: std::fmt::Debug> WasmResultExt<T> for Result<T, E> {
-	fn unwrap_or_throw(self) -> T {
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		{
-			use wasm_bindgen::UnwrapThrowExt;
-			self.unwrap_throw()
-		}
-		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		{
-			self.unwrap()
-		}
-	}
 	fn expect_or_throw(self, msg: &str) -> T {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
@@ -129,18 +121,8 @@ impl<T, E: std::fmt::Debug> WasmResultExt<T> for Result<T, E> {
 	}
 }
 
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 impl<T> WasmResultExt<T> for Option<T> {
-	fn unwrap_or_throw(self) -> T {
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		{
-			use wasm_bindgen::UnwrapThrowExt;
-			self.unwrap_throw()
-		}
-		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-		{
-			self.unwrap()
-		}
-	}
 	fn expect_or_throw(self, msg: &str) -> T {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
@@ -154,6 +136,7 @@ impl<T> WasmResultExt<T> for Option<T> {
 	}
 }
 
+#[cfg(feature = "uniffi")]
 type DateTime = chrono::DateTime<chrono::Utc>;
 #[cfg(feature = "uniffi")]
 uniffi::custom_type!(DateTime, i64, {

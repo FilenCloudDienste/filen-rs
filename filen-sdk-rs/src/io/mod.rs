@@ -10,6 +10,7 @@ mod js_impl;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod meta_ext;
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 mod canonical_path;
 
 pub use crate::fs::{
@@ -23,6 +24,7 @@ pub use dir_upload::DirUploadCallback;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use meta_ext::FilenMetaExt;
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use canonical_path::CanonicalPath;
 
 const WINDOWS_TICKS_PER_MILLI: u64 = 10_000;

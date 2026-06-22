@@ -20,17 +20,9 @@ use crate::{
 		dir::{LinkedDirectory, RootDirectoryWithMeta},
 		file::LinkedFile as LinkedFileRS,
 	},
-	js::{File, categories::CategoryJSExt},
 };
 
 use super::common::dir::RootDirWithMeta;
-
-impl CategoryJSExt for Linked {
-	type RootJS = LinkedRootDir;
-	type DirJS = LinkedDir;
-	type FileJS = File;
-	type RootFileJS = LinkedFile;
-}
 
 #[js_type(wasm_all, export)]
 pub struct LinkedFile {

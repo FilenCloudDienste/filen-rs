@@ -339,7 +339,6 @@ impl UnauthJsClient {
 				params.aff_id.as_deref(),
 			)
 			.await
-			.map(|_| ())
 		})
 		.await
 	}

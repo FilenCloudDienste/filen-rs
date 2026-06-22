@@ -27,6 +27,7 @@ impl RateLimiter {
 		}
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub(crate) async fn acquire_amount(
 		&self,
 		amount: NonZeroU32,
