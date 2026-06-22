@@ -35,14 +35,29 @@ pub(crate) struct WebSocketHandle {
 }
 
 impl WebSocketHandle {
+	/// Returns the cached request sender if the websocket thread is still usable,
+	/// otherwise `None` — in which case the caller must spawn a fresh thread.
+	///
+	/// `WeakSender::upgrade` succeeds as long as any strong `Sender` (a live
+	/// [`ListenerHandle`]) remains; it does not observe whether the receiver (the
+	/// websocket task) is still alive. The task can exit for a non-channel reason —
+	/// auth failure, a critical receive error, or a panic — and drop its receiver while
+	/// a `ListenerHandle` is still held. We therefore also check `is_closed`, so we
+	/// never hand out a sender whose next `send` would fail with "websocket thread has
+	/// been closed".
+	fn live_sender(&self) -> Option<tokio::sync::mpsc::Sender<SocketRequest>> {
+		self.request_sender
+			.as_ref()
+			.and_then(|weak| weak.upgrade())
+			.filter(|sender| !sender.is_closed())
+	}
+
 	pub(super) fn get_request_sender(
 		&mut self,
 		auth_client: &Arc<AuthClient>,
 		client: &Client,
 	) -> RequestSender {
-		if let Some(weak_sender) = &self.request_sender
-			&& let Some(sender) = weak_sender.upgrade()
-		{
+		if let Some(sender) = self.live_sender() {
 			return RequestSender(sender);
 		}
 
@@ -58,9 +73,7 @@ impl WebSocketHandle {
 
 	// todo rework this because it only shows connected status not authenticated status
 	pub(super) fn is_connected(&self) -> bool {
-		self.request_sender
-			.as_ref()
-			.is_some_and(|weak| weak.strong_count() > 0)
+		self.live_sender().is_some()
 	}
 }
 
@@ -661,4 +674,49 @@ where
 		W::from_unauthed_parts(write, read),
 		Duration::from_millis(handshake.ping_interval),
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Regression test for the "websocket thread has been closed" error.
+	//
+	// `WebSocketHandle` caches a `WeakSender` to the websocket task and decides whether
+	// the task is still alive via `WeakSender::upgrade`. But `upgrade` only checks the
+	// strong-sender count — not whether the receiver (the task) is still alive — so it
+	// succeeds as long as any strong `Sender` (a live `ListenerHandle`) remains. When
+	// the task exits for a non-channel reason (auth failure, critical receive error,
+	// panic) while a `ListenerHandle` is still held, the cached weak still upgrades and
+	// the next `add_event_listener` sends into a dropped receiver, failing with
+	// `InvalidState: websocket thread has been closed`.
+	//
+	// `live_sender` must therefore reject a channel whose receiver has been dropped, so
+	// `get_request_sender` re-spawns a fresh thread instead of handing out a dead one.
+	#[test]
+	fn live_sender_rejects_channel_whose_receiver_was_dropped() {
+		let (sender, receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
+		// A still-held `ListenerHandle` keeps the strong-sender count above zero.
+		let _zombie_handle = sender.clone();
+		let handle = WebSocketHandle {
+			request_sender: Some(sender.downgrade()),
+		};
+
+		// While the websocket task (the receiver) is alive, the cached sender is usable.
+		assert!(handle.live_sender().is_some());
+		assert!(handle.is_connected());
+
+		// The websocket task dies for a non-channel reason: its receiver is dropped
+		// while a strong sender (the `ListenerHandle`) is still alive.
+		drop(receiver);
+
+		assert!(
+			handle.live_sender().is_none(),
+			"a cached sender to a dropped-receiver channel must be treated as dead"
+		);
+		assert!(
+			!handle.is_connected(),
+			"a websocket thread whose receiver was dropped must not report connected"
+		);
+	}
 }
