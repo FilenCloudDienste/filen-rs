@@ -1160,4 +1160,145 @@ mod client_timeout_tests {
 		assert!(response.status().is_success());
 		assert_eq!(response.text().await.unwrap(), "ok");
 	}
+
+	/// Installs (and on drop removes) an `iptables` rule that black-holes every packet coming FROM
+	/// the given TCP source port — i.e. the test server → client direction. Inserted at the head of
+	/// the `INPUT` chain so it wins over the usual `-i lo -j ACCEPT` rule (loopback traffic still
+	/// traverses `INPUT`). Linux + root/`CAP_NET_ADMIN` only.
+	struct IptablesBlackhole {
+		port: u16,
+	}
+
+	impl IptablesBlackhole {
+		fn install(port: u16) -> Self {
+			let status = std::process::Command::new("iptables")
+				.args([
+					"-I",
+					"INPUT",
+					"1",
+					"-p",
+					"tcp",
+					"--sport",
+					&port.to_string(),
+					"-j",
+					"DROP",
+				])
+				.status()
+				.expect("failed to spawn iptables (is it installed and on PATH?)");
+			assert!(
+				status.success(),
+				"iptables -I failed — this test needs root/CAP_NET_ADMIN (run it with sudo)"
+			);
+			Self { port }
+		}
+	}
+
+	impl Drop for IptablesBlackhole {
+		fn drop(&mut self) {
+			let _ = std::process::Command::new("iptables")
+				.args([
+					"-D",
+					"INPUT",
+					"-p",
+					"tcp",
+					"--sport",
+					&self.port.to_string(),
+					"-j",
+					"DROP",
+				])
+				.status();
+		}
+	}
+
+	/// The reason the production read timeout is safe to keep long: a genuinely dead connection is
+	/// torn down by TCP keepalive, NOT by the read timeout. This reproduces the post-backgrounding
+	/// hang directly — a request is sent and acknowledged (so the socket is idle, awaiting the
+	/// response, which is the only state where keepalive rather than data-retransmission applies),
+	/// then the connection is turned into a silent black hole (packets dropped with no FIN/RST, as
+	/// the OS does to a backgrounded app's idle sockets). With the production keepalive settings the
+	/// request must fail in ~`keepalive + interval * retries` (~45s) instead of hanging until the
+	/// 300s read timeout.
+	///
+	/// This is `#[ignore]`d because it requires Linux + root/`CAP_NET_ADMIN` to install the iptables
+	/// black-hole rule, and it runs in real time for tens of seconds. On non-Linux it no-ops. The
+	/// test needs no env vars, so don't `sudo cargo` (cargo isn't on root's `secure_path`, and
+	/// `sudo -E` is rejected by many sudoers policies). Build as your user, then run the binary under
+	/// sudo so the child `iptables` process runs as root:
+	///   cargo test -p filen-sdk-rs --lib --no-run
+	///   sudo ./target/debug/deps/filen_sdk_rs-<hash> \
+	///     keepalive_tears_down_a_blackholed_connection_before_read_timeout --ignored --nocapture --exact
+	#[tokio::test]
+	#[ignore = "needs Linux + root/CAP_NET_ADMIN (installs an iptables black-hole rule) and runs ~45s in real time; build with --no-run, then run the test binary under sudo -- --ignored"]
+	async fn keepalive_tears_down_a_blackholed_connection_before_read_timeout() {
+		if !cfg!(target_os = "linux") {
+			eprintln!("skipping: black-hole test requires Linux iptables");
+			return;
+		}
+
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (got_request_tx, got_request_rx) = tokio::sync::oneshot::channel();
+		tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			// Read the whole request: by the time it has arrived the kernel has already ACKed it, so
+			// the client socket is idle (no unacked data) and awaiting the response — keepalive
+			// territory. Then hold the socket open forever without responding.
+			let mut seen = Vec::new();
+			let mut buf = [0u8; 1024];
+			loop {
+				let n = socket.read(&mut buf).await.unwrap();
+				if n == 0 {
+					break;
+				}
+				seen.extend_from_slice(&buf[..n]);
+				if seen.windows(4).any(|window| window == b"\r\n\r\n") {
+					break;
+				}
+			}
+			let _ = got_request_tx.send(());
+			std::future::pending::<()>().await;
+		});
+
+		// Production config: real keepalive (~45s detection) + the long 300s read timeout.
+		let client = ClientConfig::default().build_reqwest_client().unwrap();
+		let request =
+			tokio::spawn(
+				async move { client.get(format!("http://127.0.0.1:{port}/")).send().await },
+			);
+
+		// Wait until the request has reached the server (sent + acked) before black-holing, so we
+		// exercise keepalive on an idle socket rather than data-retransmission on unacked bytes.
+		tokio::time::timeout(Duration::from_secs(10), got_request_rx)
+			.await
+			.expect("server did not receive the request within 10s")
+			.expect("server task dropped the signal");
+
+		let _blackhole = IptablesBlackhole::install(port);
+
+		// Bound the wait below the 300s read timeout: if keepalive works the request fails well
+		// before this fires; if it has regressed, this timeout fires and the test fails loudly.
+		let started = Instant::now();
+		let outcome = tokio::time::timeout(Duration::from_secs(120), request).await;
+		let elapsed = started.elapsed();
+		eprintln!("black-holed request resolved after {elapsed:?}");
+
+		let join = outcome.unwrap_or_else(|_| {
+			panic!(
+				"the request did not fail within 120s of the connection being black-holed — keepalive \
+				 is not tearing down the dead socket, so it would otherwise hang until the \
+				 {DEFAULT_READ_TIMEOUT:?} read timeout"
+			)
+		});
+		let send_result = join.expect("request task panicked");
+		assert!(
+			send_result.is_err(),
+			"expected the request to fail on the black-holed connection, but it succeeded"
+		);
+		// A floor confirms the connection genuinely stayed established and was torn down by keepalive,
+		// not by an instant RST (which would mean the black hole never took effect).
+		assert!(
+			elapsed >= Duration::from_secs(10),
+			"failed suspiciously fast ({elapsed:?}) — the connection may not have been black-holed"
+		);
+	}
 }
