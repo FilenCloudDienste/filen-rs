@@ -69,6 +69,26 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`ClientConfig::with_read_timeout`] (or `None` to disable) if your largest listings are slower.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
+// TCP keepalive defaults. These are the mechanism that bounds a *dead* connection — not the read
+// timeout, which is deliberately long for slow large-folder listings (a live-but-slow server keeps
+// ACKing keepalive probes at the kernel level, so it survives the full read timeout). After Android
+// backgrounds the app the OS silently drops its idle TCP connections without a FIN/RST; reqwest then
+// reuses one of those dead pooled connections on resume and the request hangs until the read timeout
+// (up to `DEFAULT_READ_TIMEOUT`). With keepalive the dead socket is torn down after roughly
+// `keepalive + interval * retries` (~45s here) instead. Kept well under `DEFAULT_READ_TIMEOUT`.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const DEFAULT_TCP_KEEPALIVE: Duration = Duration::from_secs(15);
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const DEFAULT_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const DEFAULT_TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Idle timeout for pooled connections. Shorter than reqwest's 90s default so a connection idle
+/// across a background gap is dropped rather than reused stale on resume (keepalive then covers any
+/// that are reused before this fires).
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct ClientConfig {
 	concurrency: usize,
 	retry_budget: TpsBudget,
@@ -139,7 +159,13 @@ impl ClientConfig {
 	pub(crate) fn build_reqwest_client(&self) -> Result<reqwest::Client, Error> {
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
-			let mut builder = reqwest::Client::builder();
+			// Keepalive + a shorter pool idle timeout so a connection killed while the app was
+			// backgrounded is detected/dropped instead of being reused into a multi-minute hang.
+			let mut builder = reqwest::Client::builder()
+				.tcp_keepalive(DEFAULT_TCP_KEEPALIVE)
+				.tcp_keepalive_interval(DEFAULT_TCP_KEEPALIVE_INTERVAL)
+				.tcp_keepalive_retries(DEFAULT_TCP_KEEPALIVE_RETRIES)
+				.pool_idle_timeout(DEFAULT_POOL_IDLE_TIMEOUT);
 			if let Some(connect_timeout) = self.connect_timeout {
 				builder = builder.connect_timeout(connect_timeout);
 			}
@@ -1018,7 +1044,10 @@ mod client_timeout_tests {
 		net::TcpListener,
 	};
 
-	use super::{ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT};
+	use super::{
+		ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, DEFAULT_TCP_KEEPALIVE,
+		DEFAULT_TCP_KEEPALIVE_INTERVAL, DEFAULT_TCP_KEEPALIVE_RETRIES,
+	};
 
 	#[test]
 	fn default_config_enables_both_timeouts_and_builds() {
@@ -1028,6 +1057,27 @@ mod client_timeout_tests {
 		config
 			.build_reqwest_client()
 			.expect("the default-configured client must build");
+	}
+
+	/// A dead/black-holed connection — common after Android backgrounds the app and the OS silently
+	/// drops its idle TCP connections (no FIN/RST) — must be detected by TCP keepalive well before
+	/// the read timeout fires, otherwise a reused-but-dead pooled connection hangs a request for up
+	/// to the full `DEFAULT_READ_TIMEOUT`. The read timeout itself is intentionally long (a slow
+	/// large-folder listing legitimately takes minutes to its first byte, and a live-but-slow server
+	/// keeps ACKing keepalives so it survives), so it must NOT be the mechanism that catches a dead
+	/// socket. Keepalive death detection takes `keepalive + interval * retries`; guard that it stays
+	/// well under the read timeout, and that the default client still builds with keepalive applied.
+	#[test]
+	fn keepalive_detects_dead_connections_well_before_read_timeout() {
+		let detection_window =
+			DEFAULT_TCP_KEEPALIVE + DEFAULT_TCP_KEEPALIVE_INTERVAL * DEFAULT_TCP_KEEPALIVE_RETRIES;
+		assert!(
+			detection_window * 2 < DEFAULT_READ_TIMEOUT,
+			"keepalive detection window ({detection_window:?}) must stay well under the read timeout ({DEFAULT_READ_TIMEOUT:?})"
+		);
+		ClientConfig::default()
+			.build_reqwest_client()
+			.expect("the default-configured client must build with keepalive applied");
 	}
 
 	/// A connected-but-silent host — the residual hang the 404/retry fixes could not cover, since
