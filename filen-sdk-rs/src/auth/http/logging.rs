@@ -1,24 +1,28 @@
 use std::{
 	borrow::Cow,
 	pin::Pin,
+	sync::atomic::{AtomicU64, Ordering},
 	task::{Context, Poll},
+	time::Instant,
 };
 
 use tower::Service;
 
 use crate::Error;
 
+/// Monotonic per-request id, used to correlate the (possibly retried) log records of a single
+/// HTTP request as it crosses async boundaries and the retry/rate-limit layers.
+static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+
 // future improvement here would be using a Rc/'static str for endpoint to avoid allocations for Strings
 #[derive(Clone)]
 pub(crate) struct LogLayer {
-	level_filter: log::LevelFilter,
 	endpoint: Cow<'static, str>,
 }
 
 impl LogLayer {
-	pub fn new(level_filter: log::LevelFilter, endpoint: impl Into<Cow<'static, str>>) -> Self {
+	pub fn new(endpoint: impl Into<Cow<'static, str>>) -> Self {
 		Self {
-			level_filter,
 			endpoint: endpoint.into(),
 		}
 	}
@@ -30,7 +34,6 @@ impl<S> tower::Layer<S> for LogLayer {
 	fn layer(&self, inner: S) -> Self::Service {
 		LogService {
 			inner,
-			level_filter: self.level_filter,
 			endpoint: self.endpoint.clone(),
 		}
 	}
@@ -39,15 +42,12 @@ impl<S> tower::Layer<S> for LogLayer {
 #[derive(Clone)]
 pub(crate) struct LogService<S> {
 	inner: S,
-	level_filter: log::LevelFilter,
 	endpoint: Cow<'static, str>,
 }
 
 impl<S, Req> Service<Req> for LogService<S>
 where
 	S: Service<Req, Error = Error>,
-	S::Response: std::fmt::Debug,
-	Req: std::fmt::Debug,
 {
 	type Response = S::Response;
 	type Error = S::Error;
@@ -55,26 +55,29 @@ where
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		match self.inner.poll_ready(cx) {
-			Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
 			Poll::Ready(Err(e)) => {
 				let e = e.with_context(self.endpoint.clone());
-				if self.level_filter >= log::LevelFilter::Error {
-					log::error!("call to {} poll_ready error: {}", self.endpoint, e);
-				}
+				tracing::warn!(endpoint = %self.endpoint, error = %e, "poll_ready failed");
 				Poll::Ready(Err(e))
 			}
-			Poll::Pending => Poll::Pending,
+			other => other,
 		}
 	}
 
 	fn call(&mut self, req: Req) -> Self::Future {
-		if self.level_filter >= log::LevelFilter::Trace {
-			log::trace!("calling {} with ", self.endpoint);
-		}
+		// An info-level span so the in-flight watchdog tracks the request at the default level
+		// (this is the "still running after Ns" hang signal). The span emits nothing on its own:
+		// success latency is the fmt layer's busy/idle on close, failures are the warn! below.
+		let span = tracing::info_span!(
+			"http_request",
+			endpoint = %self.endpoint,
+			request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+		);
 		LoggedFuture {
 			inner: self.inner.call(req),
-			filter: self.level_filter,
+			span,
 			endpoint: self.endpoint.clone(),
+			started: Instant::now(),
 		}
 	}
 }
@@ -83,39 +86,33 @@ where
 pub struct LoggedFuture<F> {
 	#[pin]
 	inner: F,
-	filter: log::LevelFilter,
+	span: tracing::Span,
 	endpoint: Cow<'static, str>,
+	started: Instant,
 }
 
 impl<F, Res> Future for LoggedFuture<F>
 where
 	F: Future<Output = Result<Res, Error>>,
-	Res: std::fmt::Debug,
 {
 	type Output = F::Output;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = self.project();
+		// Make the request span current so events from the inner layers nest under it, and so the
+		// fmt layer accumulates busy (poll) vs idle (await) time for this request.
+		let _enter = this.span.enter();
 		match this.inner.poll(cx) {
-			Poll::Ready(output) => match output {
-				Ok(res) => {
-					if *this.filter >= log::LevelFilter::Trace {
-						log::trace!(
-							"call to {} succeeded with response: {:?}",
-							this.endpoint,
-							res
-						);
-					}
-					Poll::Ready(Ok(res))
-				}
-				Err(e) => {
-					let e = e.with_context(this.endpoint.clone());
-					if *this.filter >= log::LevelFilter::Warn {
-						log::warn!("call to {} error: {}", this.endpoint, e);
-					}
-					Poll::Ready(Err(e))
-				}
-			},
+			Poll::Ready(Ok(res)) => Poll::Ready(Ok(res)),
+			Poll::Ready(Err(e)) => {
+				let e = e.with_context(this.endpoint.clone());
+				tracing::warn!(
+					elapsed_ms = this.started.elapsed().as_millis() as u64,
+					error = %e,
+					"request failed",
+				);
+				Poll::Ready(Err(e))
+			}
 			Poll::Pending => Poll::Pending,
 		}
 	}

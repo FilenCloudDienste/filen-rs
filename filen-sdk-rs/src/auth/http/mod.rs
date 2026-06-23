@@ -76,7 +76,9 @@ pub struct ClientConfig {
 	rate_limit_per_sec: NonZeroU32,
 	upload_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
 	download_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
-	log_level: log::LevelFilter,
+	/// Seeds the global tracing filter when this client triggers logging init, and is applied
+	/// live via [`crate::obs::set_log_level`] when the client is built (see [`SharedClientState::new`]).
+	log_level: LogLevel,
 	/// Timeout for the connect phase only. `None` disables it.
 	connect_timeout: Option<Duration>,
 	/// Idle/time-to-first-byte read timeout (see [`DEFAULT_READ_TIMEOUT`]). `None` disables it.
@@ -112,7 +114,7 @@ impl ClientConfig {
 		self
 	}
 
-	pub fn with_log_level(mut self, log_level: log::LevelFilter) -> Self {
+	pub fn with_log_level(mut self, log_level: LogLevel) -> Self {
 		self.log_level = log_level;
 		self
 	}
@@ -164,7 +166,7 @@ impl Default for ClientConfig {
 			rate_limit_per_sec: NonZeroU32::new(64).unwrap(),
 			upload_bandwidth_kilobytes_per_sec: None,
 			download_bandwidth_kilobytes_per_sec: None,
-			log_level: log::max_level(),
+			log_level: LogLevel::default(),
 			connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
 			read_timeout: Some(DEFAULT_READ_TIMEOUT),
 			file_io_memory_budget: {
@@ -193,20 +195,6 @@ pub enum LogLevel {
 	Info,
 	Debug,
 	Trace,
-}
-
-#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
-impl From<LogLevel> for log::LevelFilter {
-	fn from(value: LogLevel) -> Self {
-		match value {
-			LogLevel::Off => log::LevelFilter::Off,
-			LogLevel::Error => log::LevelFilter::Error,
-			LogLevel::Warn => log::LevelFilter::Warn,
-			LogLevel::Info => log::LevelFilter::Info,
-			LogLevel::Debug => log::LevelFilter::Debug,
-			LogLevel::Trace => log::LevelFilter::Trace,
-		}
-	}
 }
 
 #[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
@@ -249,15 +237,7 @@ impl From<JsClientConfig> for ClientConfig {
 			config = config.with_download(Some(nz));
 		}
 		if let Some(log_level) = value.log_level {
-			let level = match log_level {
-				LogLevel::Off => log::LevelFilter::Off,
-				LogLevel::Error => log::LevelFilter::Error,
-				LogLevel::Warn => log::LevelFilter::Warn,
-				LogLevel::Info => log::LevelFilter::Info,
-				LogLevel::Debug => log::LevelFilter::Debug,
-				LogLevel::Trace => log::LevelFilter::Trace,
-			};
-			config = config.with_log_level(level);
+			config = config.with_log_level(log_level);
 		}
 		if let Some(file_io_memory_budget) = value.file_io_memory_budget {
 			config =
@@ -278,12 +258,15 @@ pub(crate) struct SharedClientState {
 	upload_limiter: limit::RateLimiter,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	download_limiter: DownloadBandwidthLimiterLayer,
-	log_level: log::LevelFilter,
 	memory_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl SharedClientState {
 	pub(crate) fn new(config: ClientConfig) -> Result<Self, Error> {
+		// Apply this client's configured level to the (host- or SDK-installed) global tracing
+		// filter. No-op if logging has not been initialised yet — init seeds the level instead.
+		crate::obs::set_log_level(config.log_level);
+
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		let upload_limiter = {
 			if let Some(upload_kbps) = config.upload_bandwidth_kilobytes_per_sec {
@@ -311,7 +294,6 @@ impl SharedClientState {
 			upload_limiter,
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			download_limiter,
-			log_level: config.log_level,
 			memory_semaphore: Arc::new(tokio::sync::Semaphore::new(config.file_io_memory_budget)),
 		})
 	}
@@ -621,7 +603,7 @@ impl UnauthClient {
 		let url = gateway_url(&endpoint);
 
 		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.state.concurrency.clone()) // optional
@@ -670,7 +652,7 @@ impl UnauthClient {
 		let url = gateway_url(&endpoint);
 
 		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.state.concurrency.clone()) // optional
@@ -710,7 +692,7 @@ impl UnauthClient {
 		endpoint: Cow<'static, str>,
 	) -> Result<Vec<u8>, Error> {
 		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(self.state.log_level, endpoint)) // optional logging
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.state.concurrency.clone()) // optional
 			.layer(self.state.retry.clone()) // required to map RetryError to Error
@@ -749,10 +731,7 @@ impl AuthClient {
 		let url = gateway_url(&endpoint);
 
 		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(
-				self.unauthed.state.log_level,
-				endpoint,
-			)) // optional logging
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.unauthed.state.concurrency.clone()) // optional
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
@@ -800,10 +779,7 @@ impl AuthClient {
 		// This could be improved, all the boxes should be removable with type_alias_impl_trait
 		// and using references instead of Arcs
 		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(
-				self.unauthed.state.log_level,
-				endpoint,
-			)) // optional logging
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.unauthed.state.concurrency.clone()) // optional
@@ -857,10 +833,7 @@ impl AuthClient {
 		// This could be improved, all the boxes should be removable with type_alias_impl_trait
 		// and using references instead of Arcs
 		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(
-				self.unauthed.state.log_level,
-				endpoint,
-			)) // optional logging
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(serialize::SerializeLayer::<Req>::new(body)) // required to serialize body
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.unauthed.state.concurrency.clone()) // optional
@@ -908,10 +881,7 @@ impl AuthClient {
 		Res: DeserializeOwned + Debug,
 	{
 		let builder = ServiceBuilder::new()
-			.layer(logging::LogLayer::new(
-				self.unauthed.state.log_level,
-				endpoint,
-			)) // optional logging
+			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
 			.layer(self.unauthed.state.concurrency.clone()) // optional
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
