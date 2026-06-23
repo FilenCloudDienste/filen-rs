@@ -535,6 +535,9 @@ where
 	perform_handshake(unauthed_ws, listeners, api_key).await
 }
 
+// `skip_all` is load-bearing here: `api_key` must never be recorded as a span field. `err`
+// logs handshake failures (which never contain the key) with the span attached.
+#[tracing::instrument(name = "websocket_handshake", skip_all, err)]
 async fn perform_handshake<UW, US, UR, RV, W, S, R, T, PT>(
 	unauthed_ws: UW,
 	disconnected_listeners: &mut DisconnectedListenerManager,
@@ -668,7 +671,7 @@ where
 	write
 		.send(Cow::Borrowed(MESSAGE_EVENT_PAYLOAD))
 		.await
-		.context("auth message")?;
+		.context("event subscribe message")?;
 
 	Ok((
 		W::from_unauthed_parts(write, read),

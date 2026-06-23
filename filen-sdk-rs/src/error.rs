@@ -335,7 +335,16 @@ impl std::fmt::Display for Error {
 	}
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		// Expose the wrapped error to standard tooling (tracing's `error`/`source` chain
+		// walking, anyhow, `{:?}` formatters). Without this the inner error is only reachable
+		// via the custom `downcast`, so the cause chain is invisible to everything else.
+		self.inner
+			.as_deref()
+			.map(|e| e as &(dyn std::error::Error + 'static))
+	}
+}
 
 pub trait ResultExt<T, E> {
 	/// Adds context to the error, which can be used to provide more information about the error
