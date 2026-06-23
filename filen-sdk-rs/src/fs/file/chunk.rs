@@ -1,7 +1,7 @@
 use std::{io::Write, mem::ManuallyDrop, num::NonZeroU32};
 
-use log::trace;
 use tokio::sync::SemaphorePermit;
+use tracing::trace;
 
 use crate::{auth::http::SharedClientState, consts::FILE_CHUNK_SIZE_EXTRA_USIZE};
 

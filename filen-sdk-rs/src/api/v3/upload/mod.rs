@@ -1,7 +1,7 @@
 use bytes::Bytes;
 pub use filen_types::api::v3::upload::{ENDPOINT, Response};
-use log::trace;
 use sha2::{Digest, Sha512};
+use tracing::trace;
 
 use crate::{auth::http::AuthClient, consts::random_ingest_url, error::Error, fs::file::BaseFile};
 

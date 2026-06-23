@@ -161,8 +161,8 @@ pub(crate) mod helpers {
 
 	use async_zip::{ZipEntryBuilder, base::write::ZipFileWriter};
 	use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
-	use log::debug;
 	use tokio::sync::Mutex;
+	use tracing::debug;
 
 	use crate::{
 		Error,

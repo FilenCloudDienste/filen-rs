@@ -18,8 +18,8 @@ use filen_types::{
 	fs::{ParentUuid, UuidStr},
 	traits::CowHelpers,
 };
-use log::trace;
 use rusqlite::{CachedStatement, Connection, Result};
+use tracing::trace;
 
 use crate::{
 	ffi::ItemType,

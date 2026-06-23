@@ -10,11 +10,11 @@ use filen_sdk_rs::{
 };
 use filen_types::fs::{ParentUuid, UuidStr};
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
-use log::{debug, trace};
 use rusqlite::{
 	Connection, OptionalExtension, ToSql,
 	types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
 };
+use tracing::{debug, trace};
 
 pub mod error;
 pub use error::SQLError;

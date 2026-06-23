@@ -26,9 +26,9 @@ use filen_sdk_rs::{
 };
 use filen_types::{crypto::Blake3Hash, fs::UuidStr};
 use futures::{StreamExt, stream::FuturesUnordered};
-use log::{debug, error, info, trace};
 use tokio::{fs::DirEntry, sync::mpsc::UnboundedReceiver};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+use tracing::{debug, error, info, trace};
 
 #[cfg(windows)]
 fn get_file_times(created: Option<SystemTime>, modified: Option<SystemTime>) -> FileTimes {
@@ -239,7 +239,7 @@ impl AuthCacheState {
 		if let Some(parent) = old_path.parent()
 			&& let Err(e) = tokio::fs::remove_dir_all(parent).await
 		{
-			log::warn!(
+			tracing::warn!(
 				"Failed to remove old parent directory {}: {}",
 				parent.display(),
 				e
@@ -280,7 +280,7 @@ impl AuthCacheState {
 				} else if meta.is_file() || meta.is_symlink() {
 					tokio::fs::remove_file(&path).await
 				} else {
-					log::warn!(
+					tracing::warn!(
 						"Path {} is neither file nor directory, cannot delete",
 						path.display()
 					);
@@ -308,7 +308,7 @@ async fn remove_dir_all_if_exists(path: &Path) {
 
 async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
 	let Ok(mut dir) = tokio::fs::read_dir(dir_path).await else {
-		log::warn!(
+		tracing::warn!(
 			"Tried to clean up directory {}, but it does not exist.",
 			dir_path.display()
 		);
@@ -430,7 +430,7 @@ async fn process_subdir(
 			.await?
 			.is_some()
 		{
-			log::warn!(
+			tracing::warn!(
 				"Multiple files found in cache subdirectory {}, removing all",
 				path.display()
 			);
@@ -615,7 +615,7 @@ impl AuthCacheState {
 		if let Err(e) =
 			update_saved_db_state_cache_cleanup_time(self.cache_state_file.as_ref(), now).await
 		{
-			log::error!("Failed to update cache cleanup time in saved db state: {e}");
+			tracing::error!("Failed to update cache cleanup time in saved db state: {e}");
 		}
 	}
 }

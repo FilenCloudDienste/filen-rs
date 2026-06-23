@@ -162,12 +162,12 @@ mod abortable {
 				Ok(AbortSignalFuture::Some {
 					fut: async move {
 						if signal.aborted() {
-							log::debug!("AbortSignal already aborted, returning AbortedError");
+							tracing::debug!("AbortSignal already aborted, returning AbortedError");
 							return AbortedError;
 						}
 						let _closure = closure; // keep the closure alive
 						let _ = receiver.await;
-						log::debug!("AbortSignal aborted, returning AbortedError");
+						tracing::debug!("AbortSignal aborted, returning AbortedError");
 						AbortedError
 					},
 				})

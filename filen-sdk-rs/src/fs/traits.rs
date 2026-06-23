@@ -91,7 +91,7 @@ where
 		match crate::crypto::rsa::blocking_encrypt_with_public_key(public_key, meta.as_bytes()) {
 			Ok(encrypted) => Some(encrypted),
 			Err(_) => {
-				log::error!(
+				tracing::error!(
 					"Failed to encrypt metadata with RSA public key metadata len: {}",
 					meta.len()
 				);

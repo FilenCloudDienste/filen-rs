@@ -45,7 +45,7 @@ impl PingTask<WasmSender> for WasmPingTask {
 				interval.tick().await;
 				match stop_receiver.try_recv() {
 					Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-						log::debug!("Stopping WebSocket ping task");
+						tracing::debug!("Stopping WebSocket ping task");
 						break;
 					}
 					Err(tokio::sync::oneshot::error::TryRecvError::Empty) => { /* continue */ }
@@ -57,7 +57,7 @@ impl PingTask<WasmSender> for WasmPingTask {
 					r#"42["authed", {}]"#,
 					chrono::Utc::now().timestamp_millis()
 				) {
-					log::error!("Failed to format WebSocket authed ping: {e}");
+					tracing::error!("Failed to format WebSocket authed ping: {e}");
 					break;
 				}
 
@@ -70,11 +70,11 @@ impl PingTask<WasmSender> for WasmPingTask {
 				{
 					Ok(Some(())) => {}
 					Ok(None) => {
-						log::debug!("WebSocket has been closed, stopping ping task");
+						tracing::debug!("WebSocket has been closed, stopping ping task");
 						break;
 					}
 					Err(e) => {
-						log::error!("Failed to send WebSocket ping: {e}");
+						tracing::error!("Failed to send WebSocket ping: {e}");
 						continue;
 					}
 				}
@@ -212,11 +212,11 @@ impl
 
 		let on_open_closure = wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::Event)>::new(
 			move |_e: web_sys::Event| {
-				log::debug!("WebSocket connection opened");
+				tracing::debug!("WebSocket connection opened");
 				if let Some(f) = fn_once.take() {
 					f();
 				} else {
-					log::error!("WebSocket onopen called multiple times");
+					tracing::error!("WebSocket onopen called multiple times");
 				}
 			},
 		);
@@ -232,7 +232,7 @@ impl
 					)
 				});
 				if let Err(TrySendError::Full(msg)) = msg_sender.try_send(result) {
-					log::warn!(
+					tracing::warn!(
 						"WebSocket message channel full, dropping message '{:?}'",
 						msg
 					);
@@ -248,11 +248,11 @@ impl
 
 		let on_close_closure = wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::CloseEvent)>::new(
 			move |_e: web_sys::CloseEvent| {
-				log::debug!("WebSocket connection closed");
+				tracing::debug!("WebSocket connection closed");
 				if let Some(f) = fn_once.take() {
 					f();
 				} else {
-					log::error!("WebSocket onclose called multiple times");
+					tracing::error!("WebSocket onclose called multiple times");
 				}
 			},
 		);

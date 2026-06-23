@@ -54,11 +54,11 @@ impl PingTask<NativeSender> for NativePingTask {
 				{
 					Ok(Some(())) => {}
 					Ok(None) => {
-						log::debug!("WebSocket has been closed, stopping ping task");
+						tracing::debug!("WebSocket has been closed, stopping ping task");
 						break;
 					}
 					Err(e) => {
-						log::warn!("Failed to send WebSocket ping: {e}");
+						tracing::warn!("Failed to send WebSocket ping: {e}");
 						continue;
 					}
 				}

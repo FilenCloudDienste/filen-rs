@@ -5,8 +5,8 @@ use filen_sdk_rs::fs::{
 	dir::RemoteDirectory,
 };
 use filen_types::fs::{ParentUuid, UuidStr};
-use log::trace;
 use rusqlite::{Connection, Result};
+use tracing::trace;
 
 use crate::{
 	ffi::ItemType,

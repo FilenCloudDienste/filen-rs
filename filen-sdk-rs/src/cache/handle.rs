@@ -167,7 +167,7 @@ impl Drop for SignalOnDrop {
 		// never see std's stderr panic message. (Irrelevant on wasm: panics abort, no unwind.)
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		if std::thread::panicking() {
-			log::error!("cache worker panicked; shutting down");
+			tracing::error!("cache worker panicked; shutting down");
 		}
 		let _ = self.0.send(true);
 	}
@@ -186,7 +186,7 @@ async fn wait_for_worker_exit(slot: &mut CacheSlot) {
 		// fires when the worker future was dropped un-run — e.g. the host thread failed to
 		// build its runtime, or an abandoned late starter exited at its entry check.
 		if finished.wait_for(|done| *done).await.is_err() {
-			log::error!("cache worker was torn down before it ever ran");
+			tracing::error!("cache worker was torn down before it ever ran");
 		}
 	}
 	slot.finished = None;
@@ -440,7 +440,9 @@ async fn spawn_cache_worker(
 		// BEFORE opening the DB: a worker the spawner has already abandoned must not init (see
 		// the flag's declaration). Its channel senders just drop, which nobody awaits anymore.
 		if abandoned_for_worker.load(Ordering::Acquire) {
-			log::warn!("cache worker started after its spawner gave up on it; exiting untouched");
+			tracing::warn!(
+				"cache worker started after its spawner gave up on it; exiting untouched"
+			);
 			return;
 		}
 		let state = match CacheState::new(&cache_path, root_uuid, msg_sender, worker_client) {
@@ -457,7 +459,7 @@ async fn spawn_cache_worker(
 					// The spawning future was dropped (e.g. cancelled) before it received the
 					// init result, so nobody is waiting. Exit the worker cleanly instead of
 					// panicking.
-					log::debug!(
+					tracing::debug!(
 						"cache init result receiver dropped before init completed; worker exiting"
 					);
 					return;
@@ -466,7 +468,7 @@ async fn spawn_cache_worker(
 			}
 			Err(e) => {
 				if res_sender.send(Err(e)).is_err() {
-					log::debug!(
+					tracing::debug!(
 						"cache init result receiver dropped before init failed; worker exiting"
 					);
 				}
@@ -513,7 +515,7 @@ async fn spawn_cache_worker(
 			));
 		}
 		Err(_) => {
-			log::error!(
+			tracing::error!(
 				"cache worker did not acknowledge initialization within {CACHE_INIT_ACK_TIMEOUT:?}; presuming it dead"
 			);
 			// Tell a late starter to exit at entry instead of initializing onto a DB a

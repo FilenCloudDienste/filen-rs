@@ -77,7 +77,7 @@ fn build_tokio_runtime() -> Runtime {
 
 pub(crate) fn get_runtime() -> &'static Runtime {
 	RUNTIME.get_or_init(|| {
-		log::info!("Creating Tokio runtime");
+		tracing::info!("Creating Tokio runtime");
 		build_tokio_runtime()
 	})
 }

@@ -31,7 +31,7 @@ mod async_scoped_task {
 				match async_receiver.try_recv() {
 					Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
 					Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-						log::debug!(
+						tracing::debug!(
 							"AsyncTaskHandle being dropped before completion, blocking current thread to avoid UB"
 						);
 						#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -239,7 +239,7 @@ mod commander_thread {
 										},
 										None => {
 											while (futures.next().await).is_some() {}
-											log::debug!("Commander worker shutting down");
+											tracing::debug!("Commander worker shutting down");
 											break;
 										},
 									}
@@ -271,7 +271,7 @@ mod commander_thread {
 				std::thread::spawn(move || {
 					runtime.block_on(async {
 						let _ = close_receiver.await;
-						log::debug!("Commander runtime shutting down");
+						tracing::debug!("Commander runtime shutting down");
 					});
 				});
 
@@ -624,7 +624,7 @@ mod wasm_threading {
 		// every channel sender it owns, so its consumers see SILENCE, not errors — this log is
 		// the only direct evidence of the death (it pairs with the cache's init-ack timeout).
 		let onerror = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(|e: web_sys::ErrorEvent| {
-			log::error!("worker startup/runtime error: {}", e.message());
+			tracing::error!("worker startup/runtime error: {}", e.message());
 		});
 		worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 		// The handler must outlive the worker; one small leaked closure per spawn is acceptable.

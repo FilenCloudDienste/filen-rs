@@ -218,7 +218,7 @@ impl<'a> CacheEventMaybeDecrypted<'a> {
 					// instead of dropping the event or raising a fatal error — the id must still
 					// advance the watermark so a non-cacheable event is not mistaken for a gap.
 					Err((e, uuid)) => {
-						log::debug!(
+						tracing::debug!(
 							"drive event {drive_message_id} for {uuid} is not cacheable, advancing frontier: {e}"
 						);
 						Self::FrontierAdvance {

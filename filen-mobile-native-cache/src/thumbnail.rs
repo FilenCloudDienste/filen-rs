@@ -9,8 +9,8 @@ use filen_sdk_rs::{
 };
 use futures::{StreamExt, stream::FuturesUnordered};
 use image::ImageError;
-use log::debug;
 use tokio::sync::OwnedRwLockReadGuard;
+use tracing::debug;
 
 use crate::{
 	CacheError,

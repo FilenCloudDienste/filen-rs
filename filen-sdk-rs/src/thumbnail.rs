@@ -137,7 +137,7 @@ mod js_impls {
 				{
 					Ok(image) => image,
 					Err(e) => {
-						log::debug!("failed to create thumbnail: {}", e);
+						tracing::debug!("failed to create thumbnail: {}", e);
 						return Ok(None);
 					}
 				};

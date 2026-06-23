@@ -145,7 +145,7 @@ impl CacheState {
 					event,
 				}),
 				Err(e) => {
-					log::error!(
+					tracing::error!(
 						"quarantining corrupt event row seq={seq} ({} bytes): {e}",
 						payload.len()
 					);

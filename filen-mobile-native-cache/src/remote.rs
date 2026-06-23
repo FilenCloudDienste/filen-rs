@@ -8,8 +8,8 @@ use filen_sdk_rs::fs::{
 	file::{FileBuilderOptionalName, RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 };
 use filen_types::fs::{ParentUuid, UuidStr};
-use log::debug;
 use rusqlite::OptionalExtension;
+use tracing::debug;
 
 use crate::{
 	CacheError,

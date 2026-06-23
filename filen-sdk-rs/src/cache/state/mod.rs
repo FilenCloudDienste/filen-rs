@@ -377,7 +377,7 @@ fn route_thread_event(
 		Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
 			// `event` intentionally dropped.
 			if !shed.swap(true, Ordering::AcqRel) {
-				log::warn!(
+				tracing::warn!(
 					"cache event channel reached its {EVENT_SHED_CAP}-event cap; shedding events under \
 					 sustained load — a resync will recover the gap"
 				);
@@ -401,7 +401,7 @@ async fn resync_retry_sleep(deadline: Option<TimerInstant>) {
 /// task's reply sender drops, surfacing as an error on the engine side.
 fn serve_read_task(task: ReadTask, db: &rusqlite::Connection) {
 	if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(db))).is_err() {
-		log::error!("a search read task panicked; the query errors on the engine side");
+		tracing::error!("a search read task panicked; the query errors on the engine side");
 	}
 }
 
@@ -541,7 +541,7 @@ impl CacheState {
 						None => true,
 					};
 					if shutdown {
-						log::debug!("Cache shutting down; draining buffered events first...");
+						tracing::debug!("Cache shutting down; draining buffered events first...");
 						self.drain_pending(None);
 						return;
 					}
@@ -551,7 +551,7 @@ impl CacheState {
 				},
 				event = self.event_receiver.recv() => {
 					let Some(event) = event else {
-						log::debug!("Event channel closed, draining and shutting down cache...");
+						tracing::debug!("Event channel closed, draining and shutting down cache...");
 						self.drain_pending(None); // don't drop buffered events on disconnect
 						return;
 					};
@@ -630,7 +630,7 @@ impl CacheState {
 		// in `run` (or the startup gap-check) re-lists and converges. Consume the latch once; any shed
 		// that happens after this re-sets it for the next cycle, so the signal is never lost.
 		if self.shed.swap(false, Ordering::AcqRel) {
-			log::warn!("cache shed events under load; recording a resync to recover them");
+			tracing::warn!("cache shed events under load; recording a resync to recover them");
 			if let Err(e) = self.mark_needs_resync() {
 				// The durable flag write failed — RE-ARM the shed latch so the next drain
 				// retries the mark instead of silently losing the resync signal. (The startup gap-check
@@ -945,7 +945,7 @@ impl CacheState {
 				})
 				.map_err(|e| db_err(e, "counting cached items for the empty-listing guard"))?;
 			if cached_non_root > 0 {
-				log::warn!(
+				tracing::warn!(
 					"resync: every sync root listed EMPTY but the cache holds {cached_non_root} \
 					 item(s); converging will delete them. Proceeding — expected only if the drive was \
 					 genuinely emptied."
@@ -985,7 +985,7 @@ impl CacheState {
 			.db
 			.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
 		{
-			log::debug!("post-resync wal_checkpoint failed (non-fatal): {e}");
+			tracing::debug!("post-resync wal_checkpoint failed (non-fatal): {e}");
 		}
 		Ok(())
 	}
@@ -1254,7 +1254,7 @@ impl CacheState {
 			// in an existing root and clear `needs_resync`, masking it. Redundant listings of
 			// already-current roots are accepted in v1; a per-root-bookmark skip is a future
 			// optimization.
-			log::debug!("sync root(s) added; resyncing to populate");
+			tracing::debug!("sync root(s) added; resyncing to populate");
 			self.run_resync_surfacing_errors().await;
 		}
 		false
@@ -1301,7 +1301,9 @@ impl CacheState {
 		if uuid != self.root_uuid
 			&& matches!(self.in_any_sync_root(uuid, &self.sync_roots), Ok(true))
 		{
-			log::debug!("AddSyncRoot {uuid}: covered by an active sync root; registering directly");
+			tracing::debug!(
+				"AddSyncRoot {uuid}: covered by an active sync root; registering directly"
+			);
 			self.sync_roots
 				.insert(uuid, vec![(registration_id, callback)]);
 			let _ = ack.send(Ok(()));
@@ -1315,7 +1317,7 @@ impl CacheState {
 				e.kind(),
 				ErrorKind::FolderNotFound | ErrorKind::FileNotFound
 			) {
-				log::warn!("AddSyncRoot {uuid}: directory no longer exists ({e}); rejecting");
+				tracing::warn!("AddSyncRoot {uuid}: directory no longer exists ({e}); rejecting");
 				// Definitively gone: wipe the stale cached subtree from any prior session
 				// (the cascade trigger recurses). The cascade also wipes any still-registered
 				// NESTED root, so snapshot + drop + notify those first, exactly like the socket
@@ -1330,7 +1332,9 @@ impl CacheState {
 				}
 				CacheError::invalid_sync_root(uuid, e.to_string())
 			} else {
-				log::warn!("AddSyncRoot {uuid}: validation failed transiently ({e}); rejecting");
+				tracing::warn!(
+					"AddSyncRoot {uuid}: validation failed transiently ({e}); rejecting"
+				);
 				CacheError::sync_root_unavailable(uuid, e.to_string())
 			};
 			let _ = ack.send(Err(Box::new(error)));
@@ -1375,13 +1379,13 @@ impl CacheState {
 		evict: bool,
 	) -> Result<bool, Box<CacheError>> {
 		let Some(registrations) = self.sync_roots.get_mut(&uuid) else {
-			log::debug!("RemoveRegistration: {uuid} is not an active sync root; ignoring");
+			tracing::debug!("RemoveRegistration: {uuid} is not an active sync root; ignoring");
 			return Ok(false);
 		};
 		let before = registrations.len();
 		registrations.retain(|(id, _)| *id != registration_id);
 		if registrations.len() == before {
-			log::debug!(
+			tracing::debug!(
 				"RemoveRegistration: registration {registration_id} not found for sync root {uuid}; ignoring"
 			);
 			return Ok(false);
@@ -1454,7 +1458,7 @@ impl CacheState {
 		}
 		for root in &deleted_roots {
 			self.sync_roots.remove(root);
-			log::warn!("sync root {root} was deleted server-side; dropped from the active set");
+			tracing::warn!("sync root {root} was deleted server-side; dropped from the active set");
 		}
 		// The app MUST learn these roots are gone (it has to re-issue `add_sync_root` to resume them —
 		// see `CacheMessage::SyncRootsDeleted`). If the status channel is full the notification is lost
@@ -1464,7 +1468,7 @@ impl CacheState {
 			.try_send(vec![CacheMessage::SyncRootsDeleted(deleted_roots.clone())])
 			.is_err()
 		{
-			log::error!(
+			tracing::error!(
 				"status channel full; dropped SyncRootsDeleted notification for {deleted_roots:?} \
 				 — app will not resume these roots until restart"
 			);
@@ -1587,7 +1591,7 @@ impl CacheState {
 				}));
 				if let Err(panic) = result {
 					let message = panic_message(&panic);
-					log::error!(
+					tracing::error!(
 						"sync-root {root} callback (registration {registration_id}) panicked: {message}"
 					);
 					let _ = self.msg_sender.try_send(vec![CacheMessage::Error(vec![
@@ -1606,7 +1610,7 @@ impl CacheState {
 	async fn maybe_run_resync(&mut self) {
 		match self.needs_resync() {
 			Ok(true) => {
-				log::debug!("resync pending (hole flagged during live operation); resyncing");
+				tracing::debug!("resync pending (hole flagged during live operation); resyncing");
 				self.run_resync_surfacing_errors().await;
 			}
 			Ok(false) => {}
@@ -1640,7 +1644,7 @@ impl CacheState {
 		let remote = match deps.client.get_last_event_ids().await {
 			Ok(ids) => ids.drive,
 			Err(e) => {
-				log::warn!(
+				tracing::warn!(
 					"startup gap-check: could not read the remote drive id ({e}); falling back to \
 					 the durable resync flag"
 				);
@@ -1650,20 +1654,22 @@ impl CacheState {
 		};
 		match self.startup_should_resync(remote) {
 			Ok(true) => {
-				log::debug!(
+				tracing::debug!(
 					"startup resync: remote drive id {remote} is ahead of watermark {:?} (or a hole \
 					 was flagged); catching up",
 					self.watermark().ok().flatten()
 				);
 				self.run_resync_surfacing_errors().await;
 			}
-			Ok(false) => log::debug!(
+			Ok(false) => tracing::debug!(
 				"startup: cache is up to date (remote drive id {remote} == watermark); no resync"
 			),
 			// FAIL OPEN: if the decision itself errors (a `cache_meta` read failed), resync
 			// rather than skip — a needless full listing is far cheaper than silently missing a gap.
 			Err(e) => {
-				log::warn!("startup gap-check failed to read cache state; resyncing to be safe");
+				tracing::warn!(
+					"startup gap-check failed to read cache state; resyncing to be safe"
+				);
 				self.surface_one(e);
 				self.run_resync_surfacing_errors().await;
 			}
@@ -1692,7 +1698,7 @@ impl CacheState {
 	/// footprint for very large trees); bounding this is deferred.
 	async fn run_resync(&mut self) -> Result<(), Box<CacheError>> {
 		let Some(deps) = self.resync.clone() else {
-			log::warn!(
+			tracing::warn!(
 				"resync requested but client/runtime deps are absent (test construction?); skipping"
 			);
 			return Ok(());
@@ -1738,7 +1744,7 @@ impl CacheState {
 					// Couldn't reach the server to read the snapshot id — leave the watermark be
 					// (the gap-check re-fires on the next event) and arm the retry timer for a
 					// quiet account.
-					log::debug!("resync: no sync roots; deferring watermark advance ({e})");
+					tracing::debug!("resync: no sync roots; deferring watermark advance ({e})");
 					self.mark_needs_resync_surfacing_errors();
 					false
 				}
@@ -1808,11 +1814,11 @@ impl CacheState {
 			Ok(lock) => lock,
 			Err(e) => {
 				if matches!(e.kind(), ErrorKind::RetryFailed) {
-					log::debug!(
+					tracing::debug!(
 						"resync: drive lock still contended after a patient wait; retrying in {RESYNC_RETRY_INTERVAL:?}"
 					);
 				} else {
-					log::warn!(
+					tracing::warn!(
 						"resync: drive lock acquisition failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
 					);
 				}
@@ -1850,7 +1856,7 @@ impl CacheState {
 						{
 							// Gone server-side (deleted while offline, or a cascade we missed). A not-found
 							// is definitive, so drop it rather than skip-and-retry.
-							log::warn!(
+							tracing::warn!(
 								"resync: sync root {root} no longer exists ({e}); dropping it"
 							);
 							deleted_roots.push(*root);
@@ -1859,7 +1865,9 @@ impl CacheState {
 						Err(e) => {
 							// Transient: skip and retry on a later resync (a single unreachable root must
 							// not stall the others). The lock + snapshot-id calls above stay fatal.
-							log::debug!("resync: skipping sync root {root} (get_dir failed: {e})");
+							tracing::debug!(
+								"resync: skipping sync root {root} (get_dir failed: {e})"
+							);
 							any_transient = true;
 							continue;
 						}
@@ -1899,13 +1907,13 @@ impl CacheState {
 								ErrorKind::FolderNotFound | ErrorKind::FileNotFound
 							) =>
 					{
-						log::warn!(
+						tracing::warn!(
 							"resync: sync root {root} vanished during listing ({e}); dropping it"
 						);
 						deleted_roots.push(*root);
 					}
 					Err(e) => {
-						log::debug!("resync: skipping sync root {root} (listing failed: {e})");
+						tracing::debug!("resync: skipping sync root {root} (listing failed: {e})");
 						any_transient = true;
 					}
 				}
@@ -1944,7 +1952,9 @@ impl CacheState {
 				// nothing is committed. Durably mark the flag rather than relying on the trigger
 				// having set it (the startup gap-check resyncs on a watermark lag WITHOUT
 				// marking), then arm the retry timer so even a quiet account re-attempts.
-				log::debug!("resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}");
+				tracing::debug!(
+					"resync listing failed ({e}); retrying in {RESYNC_RETRY_INTERVAL:?}"
+				);
 				self.abort_resync_unconverged(true);
 				return Ok(());
 			}
@@ -2020,7 +2030,7 @@ impl CacheState {
 
 		// An all-transient resync must not advance the watermark / clear the flag.
 		if per_root_raw.is_empty() && any_transient {
-			log::debug!(
+			tracing::debug!(
 				"resync: every sync root failed to list transiently; leaving needs_resync set for retry"
 			);
 			return Ok(());

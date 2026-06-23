@@ -331,7 +331,7 @@ where
 					}
 					Some(Ok(msg)) => msg,
 					Some(Err(e)) => {
-						log::error!(
+						tracing::error!(
 							"Critical error handling WebSocket message: {}, shutting down WebSocket task",
 							e
 						);
@@ -339,7 +339,7 @@ where
 						break;
 					}
 				};
-				log::debug!("Received WebSocket message: {}", message.as_ref());
+				tracing::debug!("Received WebSocket message: {}", message.as_ref());
 
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
@@ -351,7 +351,7 @@ where
 								match DecryptedSocketEvent::try_from_encrypted(crypter, private_key, config.user_id, event_yoke).await {
 									Ok(v) => Some(v),
 									Err(e) => {
-										log::warn!(
+										tracing::warn!(
 											"Error decrypting WebSocket event: {}, skipping event",
 											e
 										);
@@ -364,7 +364,7 @@ where
 					// ignore non-event messages
 					Ok(None) => {},
 					Err(e) => {
-						log::warn!(
+						tracing::warn!(
 							"Error parsing WebSocket message: {}, continuing...",
 							e
 						);
@@ -418,11 +418,11 @@ where
 						return Some(streams);
 					}
 					Err(e) if matches!(e.kind(), ErrorKind::Unauthenticated) => {
-						log::error!("WebSocket authentication failed: {}, not retrying", e);
+						tracing::error!("WebSocket authentication failed: {}, not retrying", e);
 						return None;
 					}
 					Err(e) => {
-						log::warn!("Error initializing WebSocket connection: {}, retrying...", e);
+						tracing::warn!("Error initializing WebSocket connection: {}, retrying...", e);
 						sleep(config.reconnect_delay).await;
 					}
 				}
@@ -524,13 +524,13 @@ where
 	<RV::Output as Deref>::Target: AsRef<str>,
 	PT: PingTask<S>,
 {
-	log::debug!("Connecting to WebSocket server...");
+	tracing::debug!("Connecting to WebSocket server...");
 	let request = W::build_request().await?;
 
-	log::debug!("WebSocket request built, connecting...");
+	tracing::debug!("WebSocket request built, connecting...");
 
 	let unauthed_ws = W::connect(request).await?;
-	log::debug!("WebSocket connected, performing handshake...");
+	tracing::debug!("WebSocket connected, performing handshake...");
 
 	perform_handshake(unauthed_ws, listeners, api_key).await
 }

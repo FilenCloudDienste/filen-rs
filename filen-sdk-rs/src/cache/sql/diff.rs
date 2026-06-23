@@ -41,7 +41,7 @@ fn build_removed_event(uuid: Uuid, item_type: i8) -> Option<CacheEvent<'static>>
 	} else {
 		// The SQL passes never return type 0 (the root is guarded out), so this is unreachable in
 		// practice; surface it loudly rather than silently dropping a deletion.
-		log::error!("resync: unexpected item type {item_type} for {uuid}; skipping deletion");
+		tracing::error!("resync: unexpected item type {item_type} for {uuid}; skipping deletion");
 		return None;
 	};
 	Some(CacheEvent { id: None, event })
@@ -74,7 +74,7 @@ fn build_upsert_event(
 	} else {
 		// Unreachable in practice (the SQL passes guard out type 0); log loudly so this is not
 		// confused with the missing-from-map `?` returns above, which the caller attributes differently.
-		log::error!("resync: unexpected item type {item_type} for {uuid}; skipping upsert");
+		tracing::error!("resync: unexpected item type {item_type} for {uuid}; skipping upsert");
 		return None;
 	};
 	Some(CacheEvent { id: None, event })
@@ -196,7 +196,7 @@ impl CacheState {
 				.query_map([], |row| Ok((row.get::<_, Uuid>(0)?, row.get::<_, i8>(1)?)))?;
 			for row in rows {
 				let (uuid, item_type) = row?;
-				log::warn!(
+				tracing::warn!(
 					"resync: sweeping orphaned cached item {uuid} (broken ancestry, absent from listing)"
 				);
 				if let Some(event) = build_removed_event(uuid, item_type) {
@@ -236,7 +236,7 @@ impl CacheState {
 			Some(event) => with_depth.push((depth_of(uuid, &parent_of, anchor), event)),
 			// Impossible by construction (diff_incoming is staged from these very maps); an error here
 			// means a created/moved item would be silently dropped → divergence.
-			None => log::error!(
+			None => tracing::error!(
 				"resync: listed item {uuid} missing from the conversion map; skipping upsert"
 			),
 		};
@@ -283,7 +283,7 @@ impl CacheState {
 			let (uuid, item_type) = row?;
 			match build_upsert_event(uuid, item_type, UpsertKind::Changed, dirs, files) {
 				Some(event) => events.push(event),
-				None => log::error!(
+				None => tracing::error!(
 					"resync: changed item {uuid} missing from the conversion map; skipping upsert"
 				),
 			}

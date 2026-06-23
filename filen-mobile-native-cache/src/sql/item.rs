@@ -1,11 +1,11 @@
 use std::fmt::Debug;
 
 use filen_types::fs::{ParentUuid, UuidStr};
-use log::trace;
 use rusqlite::{
 	CachedStatement, Connection, OptionalExtension, Result, ToSql,
 	types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
 };
+use tracing::trace;
 
 use crate::{
 	ffi::ItemType,

@@ -364,7 +364,7 @@ where
 						Err(e) => {
 							// we don't fail the whole upload if EXIF parsing fails, so just log the error and continue without the EXIF times
 							// In the future, ideally callback to something higher up to show the error to the user, but for now just log it
-							log::debug!("EXIF tee failed to finalize: {e}");
+							tracing::debug!("EXIF tee failed to finalize: {e}");
 						}
 					}
 				}

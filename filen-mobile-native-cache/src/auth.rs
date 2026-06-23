@@ -13,13 +13,13 @@ use filen_sdk_rs::{
 	fs::HasUUID,
 };
 use filen_types::{auth::FilenSDKConfig, crypto::Blake3Hash};
-use log::{debug, info, trace};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::{
 	io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 	sync::OwnedRwLockReadGuard,
 };
+use tracing::{debug, info, trace};
 
 use crate::{CacheError, sql};
 
@@ -133,16 +133,16 @@ pub(crate) async fn update_saved_db_state_cache_cleanup_time(
 fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheError> {
 	match std::fs::remove_file(db_path) {
 		Ok(()) => {
-			log::info!("Removed old database file: {}", db_path.display());
+			tracing::info!("Removed old database file: {}", db_path.display());
 		}
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-			log::info!(
+			tracing::info!(
 				"Database file not found, creating new one: {}",
 				db_path.display()
 			);
 		}
 		Err(e) => {
-			log::error!("Failed to remove old database file: {e}");
+			tracing::error!("Failed to remove old database file: {e}");
 			return Err(e.into());
 		}
 	}
@@ -165,7 +165,7 @@ fn db_from_files_dir(
 			return Ok((init_db(&db_path, cache_state_file)?, None));
 		}
 		Err(e) => {
-			log::error!("Failed to read db_state.json, error: {e}");
+			tracing::error!("Failed to read db_state.json, error: {e}");
 			return Err(e.into());
 		}
 	};
@@ -173,13 +173,13 @@ fn db_from_files_dir(
 	let parsed_saved_state = match serde_json::from_str::<SavedDBState>(&state_file) {
 		Ok(state) => Some(state),
 		Err(e) => {
-			log::error!("Failed to parse db_state.json, error: {e}");
+			tracing::error!("Failed to parse db_state.json, error: {e}");
 			None
 		}
 	};
 
 	let Some(saved_state) = parsed_saved_state else {
-		log::info!(
+		tracing::info!(
 			"Failed to parse saved DB state, reinitializing database: {}",
 			db_path.display()
 		);
@@ -187,26 +187,26 @@ fn db_from_files_dir(
 	};
 
 	if saved_state.db_hash != *sql::statements::DB_INIT_HASH {
-		log::info!(
+		tracing::info!(
 			"Database hash mismatch, reinitializing database. Expected: {:?}, Found: {:?}",
 			*sql::statements::DB_INIT_HASH,
 			saved_state.db_hash
 		);
 		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
 	} else if !db_path.exists() {
-		log::info!(
+		tracing::info!(
 			"Database file does not exist, creating new one: {}",
 			db_path.display()
 		);
 		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
 	} else if saved_state.version.is_none_or(|v| v < CACHE_VERSION) {
-		log::info!(
+		tracing::info!(
 			"Database version is outdated or missing, reinitializing database: {}",
 			db_path.display()
 		);
 		Ok((init_db(&db_path, cache_state_file)?, Some(saved_state)))
 	} else {
-		log::info!(
+		tracing::info!(
 			"Database hash matches, using existing database: {}",
 			db_path.display()
 		);
@@ -232,7 +232,7 @@ fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
 			match auth_file {
 				Ok(auth_file) => auth_file,
 				Err(e) => {
-					log::error!("Failed to parse auth file, error: {e}");
+					tracing::error!("Failed to parse auth file, error: {e}");
 					AuthFile::default()
 				}
 			}
@@ -242,7 +242,7 @@ fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
 			AuthFile::default()
 		}
 		Err(e) => {
-			log::error!("Failed to read auth file, error: {e}");
+			tracing::error!("Failed to read auth file, error: {e}");
 			AuthFile::default()
 		}
 	}
@@ -275,7 +275,7 @@ fn update_state(state: &mut CacheState, auth_file: AuthFile) {
 						state.status = AuthStatus::Authenticated(auth_state);
 					}
 					Err(e) => {
-						log::error!("Failed to create AuthCacheState: {e}");
+						tracing::error!("Failed to create AuthCacheState: {e}");
 						state.status = AuthStatus::Unauthenticated(UnauthCacheState {
 							reason: UnauthReason::Unauthenticated,
 						});
@@ -500,14 +500,14 @@ impl AuthCacheState {
 		let (db, state) = db_from_files_dir(files_dir, &cache_state_file)?;
 
 		if state.as_ref().is_none_or(|state| state.version.is_none()) {
-			log::info!(
+			tracing::info!(
 				"Database version is missing, removing cache directory to ensure compatibility"
 			);
 			let (cache_dir, _, _) = crate::io::get_paths(files_dir);
 			if let Err(e) = std::fs::remove_dir_all(cache_dir)
 				&& e.kind() != std::io::ErrorKind::NotFound
 			{
-				log::error!("Failed to remove cache directory during DB version upgrade: {e}");
+				tracing::error!("Failed to remove cache directory during DB version upgrade: {e}");
 				return Err(e.into());
 			}
 		}
@@ -575,7 +575,7 @@ impl AuthCacheState {
 			Ok(conn) => conn,
 			// continue if poisoned
 			Err(poisoned) => {
-				log::warn!(
+				tracing::warn!(
 					"Cache connection is poisoned, continuing with poisoned state: {poisoned:?}"
 				);
 				poisoned.into_inner()

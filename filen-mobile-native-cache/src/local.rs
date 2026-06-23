@@ -2,8 +2,8 @@ use std::{collections::HashMap, str::FromStr, time::Instant};
 
 use filen_sdk_rs::fs::HasUUID;
 use filen_types::fs::{ParentUuid, UuidStr};
-use log::debug;
 use rusqlite::OptionalExtension;
+use tracing::debug;
 
 use crate::{
 	CacheError,

@@ -5,7 +5,7 @@ use std::{borrow::Cow, sync::Arc, time};
 
 use bytes::Bytes;
 use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
-use log::debug;
+use tracing::debug;
 
 use crate::{
 	ErrorKind, api,
@@ -52,11 +52,11 @@ async fn actually_drop(client: &AuthClient, uuid: UuidStr, resource: &str) {
 		Ok(response) => {
 			debug!("Released lock {resource}: {uuid}");
 			if !response.released {
-				log::warn!("Failed to release lock {resource}");
+				tracing::warn!("Failed to release lock {resource}");
 			}
 		}
 		Err(e) => {
-			log::warn!("Failed to release lock {resource}: {e}");
+			tracing::warn!("Failed to release lock {resource}: {e}");
 		}
 	}
 }
@@ -92,8 +92,8 @@ const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn keep_lock_alive(lock: Weak<ResourceLock>) {
-	use log::warn;
 	use std::time::Instant;
+	use tracing::warn;
 
 	let initial_update = Instant::now();
 	tokio::spawn(async move {
@@ -152,7 +152,7 @@ fn keep_lock_alive(lock: Weak<ResourceLock>) {
 				};
 
 				if !good_response {
-					log::warn!("Failed to refresh lock: {}", lock.resource);
+					tracing::warn!("Failed to refresh lock: {}", lock.resource);
 					return;
 				} else {
 					debug!("Refreshed lock: {}", lock.resource);

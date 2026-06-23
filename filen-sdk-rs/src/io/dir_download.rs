@@ -116,7 +116,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 							continue;
 						}
 						if let Err(e) = dir.blocking_set_dir_times(path.as_ref()) {
-							log::warn!(
+							tracing::warn!(
 								"Failed to set dir times for downloaded dir {:?}: {}",
 								path,
 								e

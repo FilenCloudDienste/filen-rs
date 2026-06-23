@@ -45,7 +45,7 @@ impl Drop for HttpProviderHandle {
 					runtime_handle.spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                         if !task.is_finished() {
-                            log::error!("HTTPProviderCanceller was dropped but the task is still running after 10 seconds. Forcing abort.");
+                            tracing::error!("HTTPProviderCanceller was dropped but the task is still running after 10 seconds. Forcing abort.");
                             task.abort();
                         }
                     });
@@ -54,7 +54,7 @@ impl Drop for HttpProviderHandle {
 					std::thread::spawn(move || {
 						std::thread::sleep(std::time::Duration::from_secs(10));
 						if !task.is_finished() {
-							log::error!(
+							tracing::error!(
 								"HTTPProviderCanceller was dropped but the task is still running after 10 seconds. Forcing abort."
 							);
 							task.abort();

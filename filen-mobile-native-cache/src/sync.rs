@@ -14,8 +14,8 @@ use filen_sdk_rs::{
 };
 use filen_types::fs::ObjectType;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesOrdered};
-use log::debug;
 use rusqlite::Connection;
+use tracing::debug;
 
 use crate::{
 	CacheError,

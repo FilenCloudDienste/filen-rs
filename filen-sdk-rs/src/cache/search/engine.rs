@@ -279,7 +279,7 @@ impl Engine {
 		let conn = match hydrate::open_read_connection(&read_source.0) {
 			Ok(conn) => ReadConn(conn),
 			Err(e) => {
-				log::error!("search engine failed to open its read connection: {e}");
+				tracing::error!("search engine failed to open its read connection: {e}");
 				self.build_error = Some(e.to_string());
 				return;
 			}
@@ -301,7 +301,7 @@ impl Engine {
 				// `build_error` here would brick the search on a one-off slow reply. Keep the
 				// connection; `total` stays 0 until the first ping/getRange re-queries. (A
 				// connection that cannot OPEN is the terminal case, handled above.)
-				log::warn!("search engine failed its initial count (will retry on use): {e}");
+				tracing::warn!("search engine failed its initial count (will retry on use): {e}");
 			}
 		}
 		self.conn = Some(conn);
@@ -428,7 +428,7 @@ impl Engine {
 		let (total, window_results) = match batch {
 			Ok(batch) => batch,
 			Err(e) => {
-				log::warn!("search refresh failed: {e}");
+				tracing::warn!("search refresh failed: {e}");
 				self.last_refresh = refresh_started.elapsed();
 				return;
 			}
@@ -439,7 +439,7 @@ impl Engine {
 			let results = match results {
 				Ok(results) => results,
 				Err(e) => {
-					log::warn!("search refresh failed querying window {id}: {e}");
+					tracing::warn!("search refresh failed querying window {id}: {e}");
 					continue;
 				}
 			};
@@ -460,7 +460,7 @@ impl Engine {
 				(window.callback)(snapshot);
 			}));
 			if result.is_err() {
-				log::error!("search window {id} callback panicked; dropping the window");
+				tracing::error!("search window {id} callback panicked; dropping the window");
 				poisoned.push(id);
 			}
 		}
@@ -487,7 +487,7 @@ impl Engine {
 				(window.callback)(snapshot);
 			}));
 			if result.is_err() {
-				log::error!("search window {id} callback panicked; dropping the window");
+				tracing::error!("search window {id} callback panicked; dropping the window");
 				poisoned.push(*id);
 			}
 		}
