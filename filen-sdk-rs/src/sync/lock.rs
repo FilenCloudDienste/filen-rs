@@ -180,6 +180,11 @@ fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
 impl Client {
 	/// Attempts to acquire a lock on the specified resource.
 	/// If the lock is acquired, it returns a [`ResourceLock`] that releases the lock when dropped.
+	#[tracing::instrument(
+		name = "acquire_lock",
+		skip_all,
+		fields(resource = tracing::field::Empty, attempts),
+	)]
 	pub async fn acquire_lock(
 		&self,
 		resource: impl Into<String>,
@@ -187,6 +192,7 @@ impl Client {
 		attempts: usize,
 	) -> Result<Arc<ResourceLock>, Error> {
 		let resource = resource.into();
+		tracing::Span::current().record("resource", resource.as_str());
 		let uuid = UuidStr::new_v4();
 		let bytes = Bytes::from_owner(serde_json::to_vec(&api::v3::user::lock::Request {
 			uuid,

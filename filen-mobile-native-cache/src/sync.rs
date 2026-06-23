@@ -209,6 +209,11 @@ impl AuthCacheState {
 		}
 	}
 
+	#[tracing::instrument(
+		name = "update_items_in_path",
+		skip_all,
+		fields(path = %path_values.full_path, root = %path_values.root_uuid),
+	)]
 	pub(crate) async fn update_items_in_path<'a>(
 		&self,
 		path_values: &'a PathFfiId<'a>,
