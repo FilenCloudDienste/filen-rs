@@ -30,6 +30,7 @@ pub mod io;
 #[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js;
 pub mod notes;
+pub mod obs;
 pub mod runtime;
 pub mod search;
 pub(crate) mod serde;

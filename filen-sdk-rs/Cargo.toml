@@ -98,6 +98,15 @@ tokio-util = { version = "0.7.16", default-features = false, features = [
 ] }
 bytes = "1.10.1"
 log = "0.4.27"
+tracing = "0.1"
+# Registry + EnvFilter are needed on every target (incl. wasm). The `fmt` layer (span
+# busy/idle timing) is added per-target below — wasm uses wasm-tracing instead, since
+# fmt's FmtSpan timing calls Instant::now() which panics on wasm32-unknown-unknown.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+	"registry",
+	"env-filter",
+	"std",
+] }
 async_zip = { git = "https://github.com/Enduriel/rs-async-zip.git", rev = "6ad27fd1010b35de2a96143884c1bce95e939e5e", default-features = false, features = [
 	"chrono",
 ] }
@@ -146,14 +155,24 @@ itertools = { version = "0.14.0", optional = true }
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
 oslog = "0.2.0"
+# tracing -> Apple unified logging (os_log) sink
+tracing-oslog = "0.3"
 
 # android dependencies
 [target.'cfg(target_os="android")'.dependencies]
 android_logger = "0.15.0"
+# NOTE: the tracing -> logcat sink is a custom MakeWriter in src/obs/ over the NDK
+# `__android_log_write` (linked via `#[link(name = "log")]`), so no crate is needed here.
 
 # native (not wasm) only dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 hyper-util = { version = "0.1.16", features = ["client-legacy"] }
+# fmt layer (span busy/idle timing) is native-only; LogTracer captures `log` records
+# emitted by deps (reqwest, tokio-tungstenite) into the tracing pipeline.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+	"fmt",
+] }
+tracing-log = "0.2"
 heif-decoder = { path = "../heif-decoder", optional = true }
 tokio-tungstenite = { version = "0.28.0", features = [
 	"rustls",
@@ -205,6 +224,8 @@ web-sys = { version = "0.3.22", default-features = false, features = [
 	"DedicatedWorkerGlobalScope",
 ] }
 wasm-logger = "0.2.0"
+# tracing Layer for wasm: console + Performance API (avoids fmt's Instant::now() panic)
+wasm-tracing = "2"
 console_error_panic_hook = "0.1.5"
 wasm-streams = "0.4.2"
 # we don't need this directly, but wasmtimer uses it and doesn't enable the nightly feature
