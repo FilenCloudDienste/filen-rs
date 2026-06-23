@@ -131,11 +131,18 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 pub fn rt() -> &'static tokio::runtime::Runtime {
 	RUNTIME.get_or_init(|| {
-		env_logger::Builder::from_default_env()
-			.filter_module("reqwest", log::LevelFilter::Info)
-			.filter_module("html5ever", log::LevelFilter::Info)
-			.filter_module("selectors", log::LevelFilter::Info)
-			.init();
+		let filter = tracing_subscriber::EnvFilter::builder()
+			.with_default_directive(tracing_subscriber::filter::LevelFilter::DEBUG.into())
+			.from_env_lossy()
+			.add_directive("reqwest=info".parse().expect("valid directive"))
+			.add_directive("html5ever=info".parse().expect("valid directive"))
+			.add_directive("selectors=info".parse().expect("valid directive"));
+		// `try_init` so this coexists with any subscriber the SDK installs; `with_test_writer`
+		// routes output through cargo test's capture.
+		let _ = tracing_subscriber::fmt()
+			.with_env_filter(filter)
+			.with_test_writer()
+			.try_init();
 		tokio::runtime::Builder::new_multi_thread()
 			.enable_all()
 			.build()

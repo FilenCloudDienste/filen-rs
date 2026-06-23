@@ -8,8 +8,8 @@ use wasm_bindgen::JsValue;
 pub fn main_js() -> Result<(), JsValue> {
 	console_error_panic_hook::set_once();
 	#[cfg(debug_assertions)]
-	wasm_logger::init(wasm_logger::Config::new(log::Level::Debug));
+	crate::obs::try_init(crate::auth::http::LogLevel::Debug);
 	#[cfg(not(debug_assertions))]
-	wasm_logger::init(wasm_logger::Config::new(log::Level::Info));
+	crate::obs::try_init(crate::auth::http::LogLevel::Info);
 	Ok(())
 }

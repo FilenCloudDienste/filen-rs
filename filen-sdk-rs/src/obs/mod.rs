@@ -79,9 +79,47 @@ pub fn try_init(default_level: LogLevel) -> bool {
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
 			let _ = tracing_log::LogTracer::init();
+			// Start the hang watchdog if we are already on a runtime; otherwise a runtime-setup
+			// site (e.g. the cache's get_runtime) calls spawn_inflight_watchdog itself.
+			spawn_inflight_watchdog();
 		}
 	}
 	installed
+}
+
+/// How often the watchdog scans for stalled operations, and how long an operation may run
+/// before it is reported.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const WATCHDOG_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const WATCHDOG_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+static WATCHDOG_SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Periodically report operations that have been in flight too long (the forward-looking
+/// "still running after Ns" hang signal). Runs forever; spawn it on a long-lived runtime via
+/// [`spawn_inflight_watchdog`].
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub async fn run_inflight_watchdog() {
+	loop {
+		tokio::time::sleep(WATCHDOG_CHECK_INTERVAL).await;
+		warn_stale_operations(WATCHDOG_WARN_AFTER);
+	}
+}
+
+/// Spawn [`run_inflight_watchdog`] on the current tokio runtime, at most once per process. A
+/// no-op (leaving it for a later call) when invoked outside a runtime, so it is safe to call
+/// from both [`try_init`] and runtime-setup code.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub fn spawn_inflight_watchdog() {
+	use std::sync::atomic::Ordering;
+	if tokio::runtime::Handle::try_current().is_err() {
+		return;
+	}
+	if !WATCHDOG_SPAWNED.swap(true, Ordering::Relaxed) {
+		tokio::spawn(run_inflight_watchdog());
+	}
 }
 
 /// Adjust the global log level at runtime. Returns `false` if [`try_init`] never installed

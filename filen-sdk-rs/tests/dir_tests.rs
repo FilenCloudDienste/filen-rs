@@ -177,7 +177,7 @@ async fn check_remote_matches_local(
 			let entry = match entry {
 				Ok(e) => e,
 				Err(e) => {
-					log::error!("Failed to read directory entry: {:?}", e);
+					tracing::error!("Failed to read directory entry: {:?}", e);
 					return None;
 				}
 			};

@@ -85,7 +85,7 @@ async fn enable_2fa_for_client(client: &Client, secret: &TwoFASecret) -> String 
 			.await;
 		match result {
 			Err(e) => {
-				log::warn!("Failed to enable 2FA: {}, retrying...", e);
+				tracing::warn!("Failed to enable 2FA: {}, retrying...", e);
 				tokio::time::sleep(Duration::from_secs(5)).await;
 				continue;
 			}
@@ -225,12 +225,12 @@ fn await_email(
 		subject, to
 	);
 
-	log::trace!("Waiting for email with query: {}", query);
+	tracing::trace!("Waiting for email with query: {}", query);
 
 	for _ in 0..retry_count {
 		if let Ok(msgs) = imap_session.session.uid_search(&query) {
 			// deletes all received messages on drop
-			log::trace!("Found {} emails", msgs.len());
+			tracing::trace!("Found {} emails", msgs.len());
 			let msgs = MsgsResponse {
 				ids: msgs,
 				session: imap_session,
@@ -241,7 +241,7 @@ fn await_email(
 				if iter.next().is_some() {
 					panic!("More than one email received from noreply@notifications.filen.io");
 				}
-				log::debug!("Found email with id {}", msg);
+				tracing::debug!("Found email with id {}", msg);
 				let msg = msgs
 					.session
 					.session
@@ -252,13 +252,13 @@ fn await_email(
 					let body = std::str::from_utf8(body).expect("Email body is not valid UTF-8");
 					return body.to_string();
 				} else {
-					log::warn!("Email disappeared");
+					tracing::warn!("Email disappeared");
 				}
 			} else {
-				log::trace!("No email received, retrying...");
+				tracing::trace!("No email received, retrying...");
 			}
 		} else {
-			log::trace!("Failed to search emails, retrying...");
+			tracing::trace!("Failed to search emails, retrying...");
 		}
 		std::thread::sleep(retry_delay);
 	}

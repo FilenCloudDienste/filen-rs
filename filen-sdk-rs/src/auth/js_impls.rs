@@ -50,23 +50,20 @@ pub struct ChangePasswordParams {
 #[cfg(feature = "uniffi")]
 #[uniffi::export]
 pub fn init() {
-	#[cfg(target_os = "android")]
-	{
-		android_logger::init_once(
-			android_logger::Config::default()
-				.with_max_level(log::LevelFilter::Info)
-				.with_tag("filen-sdk-rs"),
-		);
-	}
-	#[cfg(target_os = "ios")]
-	{
-		if let Err(e) = oslog::OsLogger::new("io.filen.filen-sdk-rs")
-			.level_filter(log::LevelFilter::Info)
-			.init()
-		{
-			eprintln!("Failed to initialize oslog logger: {}", e);
-		}
-	}
+	// Idempotent: installs the per-target tracing subscriber (logcat on Android, os_log on
+	// iOS) unless a host already installed one. Safe to call alongside the cache's init.
+	crate::obs::try_init(crate::auth::http::LogLevel::Info);
+}
+
+/// Set the SDK's global log level at runtime (e.g. a "verbose logging" toggle on a device).
+/// No-op until the subscriber has been installed via [`init`] or the cache's init.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	wasm_bindgen::prelude::wasm_bindgen
+)]
+pub fn set_log_level(level: crate::auth::http::LogLevel) {
+	crate::obs::set_log_level(level);
 }
 
 #[cfg_attr(

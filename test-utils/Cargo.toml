@@ -9,10 +9,9 @@ license = "AGPL-3.0"
 [dependencies]
 base64 = "0.22.1"
 dotenv = "0.15.0"
-env_logger = "0.11.8"
 filen-sdk-rs = { path = "../filen-sdk-rs" }
 futures = "0.3.31"
-log = "0.4.28"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 rand = "0.9.2"
 tokio = { version = "1.47.1", features = ["full"] }
 filen-cli = { path = "../filen-cli", optional = true }

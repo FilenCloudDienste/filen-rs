@@ -186,7 +186,7 @@ impl Default for ClientConfig {
 }
 
 #[derive(Default)]
-#[js_type(wasm_all)]
+#[js_type(import, wasm_all)]
 pub enum LogLevel {
 	Off,
 	Error,

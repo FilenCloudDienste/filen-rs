@@ -3,23 +3,11 @@ use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-pub(crate) static INIT_LOGGER: OnceLock<()> = OnceLock::new();
 
-#[cfg(target_os = "android")]
+/// Idempotent; installs the per-target tracing subscriber (logcat on Android, os_log on iOS,
+/// fmt on desktop) unless a host already installed one.
 pub(crate) fn init_logger() {
-	INIT_LOGGER.get_or_init(|| {
-		android_log::init("filen-sdk-rs").unwrap();
-	});
-}
-
-#[cfg(target_os = "ios")]
-pub(crate) fn init_logger() {
-	INIT_LOGGER.get_or_init(|| {
-		oslog::OsLogger::new("io.filen.app.FilenFileProvider")
-			.level_filter(log::LevelFilter::Debug)
-			.init()
-			.unwrap();
-	});
+	filen_sdk_rs::obs::try_init(filen_sdk_rs::auth::http::LogLevel::Debug);
 }
 
 #[cfg(target_os = "android")]
@@ -30,17 +18,6 @@ static VM: OnceLock<jni::JavaVM> = OnceLock::new();
 pub extern "system" fn java_init(env: jni::JNIEnv, _class: jni::objects::JClass) {
 	let vm = env.get_java_vm().unwrap();
 	_ = VM.set(vm);
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub(crate) fn init_logger() {
-	println!("Initializing logger");
-	INIT_LOGGER.get_or_init(|| {
-		println!("Initializing env_logger");
-		let _ =
-			env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-				.try_init();
-	});
 }
 
 #[cfg(target_os = "ios")]
@@ -78,6 +55,11 @@ fn build_tokio_runtime() -> Runtime {
 pub(crate) fn get_runtime() -> &'static Runtime {
 	RUNTIME.get_or_init(|| {
 		tracing::info!("Creating Tokio runtime");
-		build_tokio_runtime()
+		let rt = build_tokio_runtime();
+		// Start the hang watchdog on the runtime we just built (enter it so the spawn sees a
+		// current handle). Runs at most once per process.
+		let _guard = rt.enter();
+		filen_sdk_rs::obs::spawn_inflight_watchdog();
+		rt
 	})
 }
