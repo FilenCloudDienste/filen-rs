@@ -1,4 +1,12 @@
-use std::{ops::Bound, sync::Arc};
+use std::{
+	future::Future,
+	io,
+	ops::Bound,
+	pin::Pin,
+	sync::Arc,
+	task::{Context, Poll},
+	time::Duration,
+};
 
 use axum::{
 	extract::{Query, State},
@@ -14,13 +22,158 @@ use http::{
 	response,
 };
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
 	Error,
 	auth::unauth::UnauthClient,
+	consts::CHUNK_SIZE_U64,
 	fs::file::{enums::RemoteFileType, read::FileReaderBuilder},
 	io::HasFileInfo,
 };
+
+/// Default streaming read-ahead window (8 MiB) used when the URL omits `?buffer=`.
+///
+/// This bounds how much a single stream prefetches and therefore how much of the shared
+/// per-client memory budget it can pin. A small window keeps an abandoned/paused stream
+/// cheap (like a normal file server's small copy buffer) instead of letting it greedily
+/// acquire the entire budget and starve concurrent downloads.
+const DEFAULT_READ_AHEAD_BYTES: u64 = 8 * 1024 * 1024;
+/// Lower bound for the read-ahead window: at least one chunk so the reader always progresses.
+const MIN_READ_AHEAD_BYTES: u64 = CHUNK_SIZE_U64;
+/// Upper bound for the read-ahead window: keep one stream from pinning the whole budget.
+const MAX_READ_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
+/// A connection that cannot make write progress for this long (the peer stopped reading and
+/// the socket buffers are full) is dropped, which tears down the streaming reader behind it
+/// and frees its budget. Mirrors nginx's `send_timeout`.
+const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolves the effective read-ahead window from the optional `?buffer=` query value,
+/// applying the default and clamping to `[MIN, MAX]`.
+fn effective_read_ahead(requested: Option<u64>) -> u64 {
+	requested
+		.unwrap_or(DEFAULT_READ_AHEAD_BYTES)
+		.clamp(MIN_READ_AHEAD_BYTES, MAX_READ_AHEAD_BYTES)
+}
+
+fn write_idle_timeout_error() -> io::Error {
+	io::Error::new(
+		io::ErrorKind::TimedOut,
+		"http provider: write idle timeout (peer stopped reading)",
+	)
+}
+
+/// Wraps a connection's IO with a write **idle** timeout.
+///
+/// When the peer stops reading, the socket send buffer fills and `poll_write` returns
+/// `Pending` indefinitely — hyper parks the response body (and the streaming reader it owns)
+/// without ever dropping it. This wrapper arms a timer on the first stalled write and fails
+/// the IO with [`io::ErrorKind::TimedOut`] once `timeout` elapses with no progress, which
+/// tears the connection down so the reader is dropped and its budget reclaimed. The timer is
+/// reset on every successful write, so a slow-but-progressing client is never penalised.
+struct WriteIdleTimeout<S> {
+	inner: S,
+	timeout: Duration,
+	idle: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteIdleTimeout<S> {
+	fn new(inner: S, timeout: Duration) -> Self {
+		Self {
+			inner,
+			timeout,
+			idle: None,
+		}
+	}
+
+	/// Arms the idle timer if needed and polls it. `Ready` means the deadline elapsed.
+	fn poll_idle_elapsed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+		let timeout = self.timeout;
+		self.idle
+			.get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)))
+			.as_mut()
+			.poll(cx)
+	}
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteIdleTimeout<S> {
+	fn poll_write(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &[u8],
+	) -> Poll<io::Result<usize>> {
+		let this = self.get_mut();
+		match Pin::new(&mut this.inner).poll_write(cx, buf) {
+			Poll::Ready(res) => {
+				this.idle = None;
+				Poll::Ready(res)
+			}
+			Poll::Pending => match this.poll_idle_elapsed(cx) {
+				Poll::Ready(()) => Poll::Ready(Err(write_idle_timeout_error())),
+				Poll::Pending => Poll::Pending,
+			},
+		}
+	}
+
+	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		let this = self.get_mut();
+		match Pin::new(&mut this.inner).poll_flush(cx) {
+			Poll::Ready(res) => {
+				this.idle = None;
+				Poll::Ready(res)
+			}
+			Poll::Pending => match this.poll_idle_elapsed(cx) {
+				Poll::Ready(()) => Poll::Ready(Err(write_idle_timeout_error())),
+				Poll::Pending => Poll::Pending,
+			},
+		}
+	}
+
+	fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+	}
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteIdleTimeout<S> {
+	fn poll_read(
+		self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &mut ReadBuf<'_>,
+	) -> Poll<io::Result<()>> {
+		Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+	}
+}
+
+/// An [`axum::serve::Listener`] that wraps every accepted connection in a [`WriteIdleTimeout`],
+/// so abandoned streaming connections are dropped instead of pinning a reader forever.
+struct TimeoutListener {
+	inner: tokio::net::TcpListener,
+	write_idle_timeout: Duration,
+}
+
+impl axum::serve::Listener for TimeoutListener {
+	type Io = WriteIdleTimeout<tokio::net::TcpStream>;
+	type Addr = std::net::SocketAddr;
+
+	async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+		loop {
+			match self.inner.accept().await {
+				Ok((stream, addr)) => {
+					return (WriteIdleTimeout::new(stream, self.write_idle_timeout), addr);
+				}
+				// Mirror axum's own accept loop: log and retry rather than propagate.
+				Err(e) => {
+					tracing::debug!("http provider accept error: {e}");
+					tokio::time::sleep(Duration::from_millis(1)).await;
+				}
+			}
+		}
+	}
+
+	fn local_addr(&self) -> io::Result<Self::Addr> {
+		self.inner.local_addr()
+	}
+}
 
 pub mod client_impl;
 #[cfg(feature = "uniffi")]
@@ -89,6 +242,10 @@ impl HttpProviderHandle {
 					};
 
 				let _ = port_sender.send(listener.local_addr().map(|addr| addr.port()));
+				let listener = TimeoutListener {
+					inner: listener,
+					write_idle_timeout: WRITE_IDLE_TIMEOUT,
+				};
 				axum::serve(listener, router)
 					.with_graceful_shutdown(async {
 						let _ = cancel_receiver.await;
@@ -125,6 +282,18 @@ impl HttpProviderHandle {
 
 		format!("http://127.0.0.1:{}/file?file={}", self.port, encoded)
 	}
+
+	/// Like [`get_file_url`](Self::get_file_url) but pins this stream's read-ahead window
+	/// (in bytes) via the `buffer` query parameter. The server clamps it to a sane range
+	/// (`[1 chunk, 64 MiB]`). Use a small value for latency-sensitive previews/thumbnails
+	/// and a larger one for sustained playback; the default when omitted is 8 MiB.
+	pub fn get_file_url_with_buffer_size(
+		&self,
+		file: &RemoteFileType<'_>,
+		buffer_bytes: u64,
+	) -> String {
+		format!("{}&buffer={}", self.get_file_url(file), buffer_bytes)
+	}
 }
 
 #[cfg(feature = "uniffi")]
@@ -133,6 +302,15 @@ impl HttpProviderHandle {
 	#[uniffi::method(name = "getFileUrl")]
 	pub fn get_file_url_uniffi(&self, file: crate::js::AnyFile) -> Result<String, Error> {
 		Ok(self.get_file_url(&file.try_into()?))
+	}
+
+	#[uniffi::method(name = "getFileUrlWithBufferSize")]
+	pub fn get_file_url_with_buffer_size_uniffi(
+		&self,
+		file: crate::js::AnyFile,
+		buffer_bytes: u64,
+	) -> Result<String, Error> {
+		Ok(self.get_file_url_with_buffer_size(&file.try_into()?, buffer_bytes))
 	}
 }
 
@@ -163,6 +341,10 @@ mod custom_serde {
 struct FileQuery {
 	#[serde(deserialize_with = "custom_serde::deserialize")]
 	file: RemoteFileType<'static>,
+	/// Optional read-ahead window in bytes (`?buffer=`); bounds how much this stream
+	/// prefetches and therefore how much of the shared memory budget it can pin.
+	#[serde(default)]
+	buffer: Option<u64>,
 }
 
 fn get_real_bounds(file: &RemoteFileType, (start, end): (Bound<u64>, Bound<u64>)) -> (u64, u64) {
@@ -183,6 +365,7 @@ fn get_real_bounds(file: &RemoteFileType, (start, end): (Bound<u64>, Bound<u64>)
 fn single_range_response_builder(
 	file: RemoteFileType<'static>,
 	(start, end): (u64, u64),
+	read_ahead: u64,
 	client: Arc<UnauthClient>,
 	mut builder: response::Builder,
 ) -> Result<Response, http::Error> {
@@ -206,6 +389,7 @@ fn single_range_response_builder(
 		let mut reader = FileReaderBuilder::new(&client, &file)
 			.with_start(start)
 			.with_end(end)
+			.with_max_buffer_size(read_ahead)
 			.build();
 		let mut buf = vec![0; 8192];
 		loop {
@@ -229,6 +413,7 @@ fn single_range_response_builder(
 fn multiple_range_response_builder(
 	file: RemoteFileType<'static>,
 	ranges: Vec<(u64, u64)>,
+	read_ahead: u64,
 	client: Arc<UnauthClient>,
 	mut builder: response::Builder,
 ) -> Result<Response, http::Error> {
@@ -255,6 +440,7 @@ fn multiple_range_response_builder(
 			let mut reader = FileReaderBuilder::new(&client, &file)
 				.with_start(start)
 				.with_end(end)
+				.with_max_buffer_size(read_ahead)
 				.build();
 			let mut buf = vec![0; 8192];
 			loop {
@@ -295,12 +481,14 @@ async fn file_handler(
 		vec![(0, params.file.size())]
 	};
 
+	let read_ahead = effective_read_ahead(params.buffer);
 	let response_builder = http::Response::builder().header(http::header::ACCEPT_RANGES, "bytes");
 
 	match ranges {
 		ranges if let [range] = *ranges => single_range_response_builder(
 			params.file,
 			range,
+			read_ahead,
 			state.client.clone(),
 			response_builder,
 		),
@@ -315,6 +503,7 @@ async fn file_handler(
 		ranges => multiple_range_response_builder(
 			params.file,
 			ranges,
+			read_ahead,
 			state.client.clone(),
 			response_builder,
 		),
@@ -440,5 +629,183 @@ mod tests {
 			"after all handles dropped and 1s elapsed, the server should no longer \
 			 accept connections on port {port}"
 		);
+	}
+
+	// ─── read-ahead window ────────────────────────────────────────────────────
+
+	#[test]
+	fn read_ahead_window_applies_default_and_clamps() {
+		assert_eq!(
+			super::effective_read_ahead(None),
+			super::DEFAULT_READ_AHEAD_BYTES,
+			"absent `buffer` should use the 8 MiB default"
+		);
+		assert_eq!(
+			super::effective_read_ahead(Some(0)),
+			super::MIN_READ_AHEAD_BYTES,
+			"a zero/too-small window must be clamped up to one chunk"
+		);
+		assert_eq!(
+			super::effective_read_ahead(Some(u64::MAX)),
+			super::MAX_READ_AHEAD_BYTES,
+			"an oversized window must be clamped down to the cap"
+		);
+		let in_range = 4 * 1024 * 1024;
+		assert_eq!(
+			super::effective_read_ahead(Some(in_range)),
+			in_range,
+			"an in-range window must pass through unchanged"
+		);
+	}
+
+	// ─── write idle timeout ───────────────────────────────────────────────────
+
+	/// A peer that stopped reading is modelled by a writer whose `poll_write` never
+	/// completes. The wrapper must surface a `TimedOut` error once the idle window elapses.
+	#[tokio::test(start_paused = true)]
+	async fn write_idle_timeout_fires_when_writes_stall() {
+		use std::pin::Pin;
+		use std::task::{Context, Poll};
+		use tokio::io::{AsyncWrite, AsyncWriteExt as _};
+
+		struct StalledWriter;
+		impl AsyncWrite for StalledWriter {
+			fn poll_write(
+				self: Pin<&mut Self>,
+				_: &mut Context<'_>,
+				_: &[u8],
+			) -> Poll<std::io::Result<usize>> {
+				Poll::Pending
+			}
+			fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+			fn poll_shutdown(
+				self: Pin<&mut Self>,
+				_: &mut Context<'_>,
+			) -> Poll<std::io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+		}
+
+		let mut writer =
+			super::WriteIdleTimeout::new(StalledWriter, std::time::Duration::from_secs(30));
+		// With paused time the runtime auto-advances to the armed deadline, so this resolves
+		// without any real waiting.
+		let err = writer
+			.write(b"hello")
+			.await
+			.expect_err("a stalled write must time out");
+		assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+	}
+
+	/// A writer that always accepts data must never trip the idle timeout.
+	#[tokio::test]
+	async fn write_idle_timeout_does_not_fire_while_progressing() {
+		use std::pin::Pin;
+		use std::task::{Context, Poll};
+		use tokio::io::{AsyncWrite, AsyncWriteExt as _};
+
+		struct ReadyWriter;
+		impl AsyncWrite for ReadyWriter {
+			fn poll_write(
+				self: Pin<&mut Self>,
+				_: &mut Context<'_>,
+				buf: &[u8],
+			) -> Poll<std::io::Result<usize>> {
+				Poll::Ready(Ok(buf.len()))
+			}
+			fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+			fn poll_shutdown(
+				self: Pin<&mut Self>,
+				_: &mut Context<'_>,
+			) -> Poll<std::io::Result<()>> {
+				Poll::Ready(Ok(()))
+			}
+		}
+
+		let mut writer =
+			super::WriteIdleTimeout::new(ReadyWriter, std::time::Duration::from_millis(1));
+		for _ in 0..1000 {
+			let n = writer
+				.write(b"chunk")
+				.await
+				.expect("progressing write must succeed");
+			assert_eq!(n, 5);
+		}
+	}
+
+	/// End-to-end: an abandoned streaming connection (client stops reading but keeps the
+	/// socket open) is closed by the server's write-idle timeout, dropping the reader behind
+	/// it. Uses the real hyper/axum stack via [`super::TimeoutListener`].
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn timeout_listener_closes_abandoned_stream() {
+		use std::time::Duration;
+		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+		// Infinite body: the server keeps trying to write, so it backpressures the moment
+		// the client stops reading.
+		async fn infinite() -> axum::response::Response {
+			let stream = async_stream::stream! {
+				loop {
+					yield Ok::<_, std::io::Error>(vec![0u8; 256 * 1024]);
+				}
+			};
+			axum::response::Response::new(axum::body::Body::from_stream(stream))
+		}
+
+		let router = axum::Router::new().route("/", axum::routing::get(infinite));
+		let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+			.await
+			.unwrap();
+		let port = tcp.local_addr().unwrap().port();
+		let listener = super::TimeoutListener {
+			inner: tcp,
+			write_idle_timeout: Duration::from_millis(500),
+		};
+		let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+		let server = tokio::spawn(async move {
+			axum::serve(listener, router)
+				.with_graceful_shutdown(async {
+					let _ = cancel_rx.await;
+				})
+				.await
+				.unwrap();
+		});
+
+		let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		sock.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+			.await
+			.unwrap();
+		// Kick the response off, then stop reading: the server's writes stall and, after the
+		// 500 ms write-idle timeout, the connection is dropped.
+		let mut head = [0u8; 1024];
+		let _ = sock.read(&mut head).await.unwrap();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+
+		// Draining must reach EOF/reset because the server closed the connection.
+		let closed = tokio::time::timeout(Duration::from_secs(5), async {
+			let mut sink = vec![0u8; 256 * 1024];
+			loop {
+				match sock.read(&mut sink).await {
+					Ok(0) => return true,
+					Ok(_) => continue,
+					Err(_) => return true,
+				}
+			}
+		})
+		.await
+		.unwrap_or(false);
+		assert!(
+			closed,
+			"server must close an abandoned (non-reading) connection via the write-idle timeout"
+		);
+
+		let _ = cancel_tx.send(());
+		let _ = server.await;
 	}
 }

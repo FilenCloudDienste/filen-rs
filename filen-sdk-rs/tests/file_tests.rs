@@ -1251,6 +1251,73 @@ mod http_provider_tests {
 		);
 		assert_eq!(&parts[1].1[..], b"rt");
 	}
+
+	// ─── read-ahead window (`?buffer=`) ──────────────────────────────────────
+
+	/// A small read-ahead window (set via `get_file_url_with_buffer_size`) must still serve
+	/// the full file correctly — the cap bounds memory, it must not truncate or corrupt the
+	/// stream even when the file is many times larger than the window.
+	#[shared_test_runtime]
+	async fn http_provider_small_buffer_serves_full_file() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+
+		// ~5 MiB: several chunks, far larger than the 1 MiB window below.
+		let content: Vec<u8> = (0..1024 * 1024 * 5 + 123)
+			.map(|i| (i % 251) as u8)
+			.collect();
+		let file =
+			upload_test_file(client, test_dir, "http_provider_small_buffer.bin", &content).await;
+
+		let handle = client.start_http_provider(None).await.unwrap();
+		let url = handle.get_file_url_with_buffer_size(&(&file).into(), 1024 * 1024);
+
+		let response = reqwest::get(&url).await.unwrap();
+		assert_eq!(response.status(), 200);
+		let body = response.bytes().await.unwrap();
+		assert_eq!(
+			body.len(),
+			content.len(),
+			"a capped stream must still serve the whole file"
+		);
+		assert_eq!(&body[..], &content[..], "capped stream content must match");
+	}
+
+	/// A capped stream must also honour Range requests (including ones that cross a chunk
+	/// boundary) correctly.
+	#[shared_test_runtime]
+	async fn http_provider_small_buffer_range_request() {
+		let resources = test_utils::RESOURCES.get_resources().await;
+		let client = &resources.client;
+		let test_dir = &resources.dir;
+
+		let content: Vec<u8> = (0..1024 * 1024 * 3).map(|i| (i % 251) as u8).collect();
+		let file = upload_test_file(
+			client,
+			test_dir,
+			"http_provider_small_buffer_range.bin",
+			&content,
+		)
+		.await;
+
+		let handle = client.start_http_provider(None).await.unwrap();
+		let url = handle.get_file_url_with_buffer_size(&(&file).into(), 1024 * 1024);
+
+		// A range that straddles a chunk boundary, with a window smaller than the range.
+		let start: usize = 1024 * 1024 - 10;
+		let end: usize = 1024 * 1024 + 2048;
+		let response = reqwest::Client::new()
+			.get(&url)
+			.header(http::header::RANGE, format!("bytes={start}-{}", end - 1))
+			.send()
+			.await
+			.unwrap();
+		assert_eq!(response.status(), 206);
+		let body = response.bytes().await.unwrap();
+		assert_eq!(body.len(), end - start);
+		assert_eq!(&body[..], &content[start..end]);
+	}
 }
 
 #[cfg(feature = "malformed")]
