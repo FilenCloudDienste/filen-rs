@@ -3,8 +3,12 @@ use std::{
 	pin::Pin,
 	sync::atomic::{AtomicU64, Ordering},
 	task::{Context, Poll},
-	time::Instant,
 };
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::time::Instant;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasmtimer::std::Instant;
 
 use tower::Service;
 

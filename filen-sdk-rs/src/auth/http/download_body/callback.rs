@@ -117,7 +117,13 @@ mod boxed {
 						))
 					})?;
 
-				let mut collected = Vec::with_capacity(content_length);
+				let mut collected = Vec::try_with_capacity(content_length).map_err(|e| {
+					RetryError::NoRetry(Error::custom_with_source(
+						ErrorKind::InsufficientMemory,
+						e,
+						Some("failed to allocate memory for response body"),
+					))
+				})?;
 				let mut stream = resp.bytes_stream();
 				let mut last_update_time = Instant::now();
 				while let Some(chunk_res) = stream.next().await {
@@ -229,10 +235,18 @@ mod native {
 									))
 								})?;
 							let (_, body) = http::Response::from(response).into_parts();
+							let collected =
+								Vec::try_with_capacity(content_length).map_err(|e| {
+									RetryError::NoRetry(Error::custom_with_source(
+										ErrorKind::InsufficientMemory,
+										e,
+										Some("failed to allocate memory for response body"),
+									))
+								})?;
 							this.state
 								.set(DownloadWithCallbackFutureState::ReadingBody {
 									body,
-									collected: Vec::with_capacity(content_length),
+									collected,
 									last_update_time: Instant::now(),
 									real_content_length,
 								});

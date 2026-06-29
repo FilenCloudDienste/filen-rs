@@ -76,9 +76,10 @@ pub struct ClientConfig {
 	rate_limit_per_sec: NonZeroU32,
 	upload_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
 	download_bandwidth_kilobytes_per_sec: Option<NonZeroU32>,
-	/// Seeds the global tracing filter when this client triggers logging init, and is applied
-	/// live via [`crate::obs::set_log_level`] when the client is built (see [`SharedClientState::new`]).
-	log_level: LogLevel,
+	/// When `Some`, applied live to the global tracing filter via [`crate::obs::set_log_level`]
+	/// when the client is built (see [`SharedClientState::new`]). `None` (the default) leaves the
+	/// host- or cache-configured verbosity untouched, so a default-config client never reverts it.
+	log_level: Option<LogLevel>,
 	/// Timeout for the connect phase only. `None` disables it.
 	connect_timeout: Option<Duration>,
 	/// Idle/time-to-first-byte read timeout (see [`DEFAULT_READ_TIMEOUT`]). `None` disables it.
@@ -115,7 +116,7 @@ impl ClientConfig {
 	}
 
 	pub fn with_log_level(mut self, log_level: LogLevel) -> Self {
-		self.log_level = log_level;
+		self.log_level = Some(log_level);
 		self
 	}
 
@@ -166,7 +167,7 @@ impl Default for ClientConfig {
 			rate_limit_per_sec: NonZeroU32::new(64).unwrap(),
 			upload_bandwidth_kilobytes_per_sec: None,
 			download_bandwidth_kilobytes_per_sec: None,
-			log_level: LogLevel::default(),
+			log_level: None,
 			connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
 			read_timeout: Some(DEFAULT_READ_TIMEOUT),
 			file_io_memory_budget: {
@@ -263,9 +264,13 @@ pub(crate) struct SharedClientState {
 
 impl SharedClientState {
 	pub(crate) fn new(config: ClientConfig) -> Result<Self, Error> {
-		// Apply this client's configured level to the (host- or SDK-installed) global tracing
-		// filter. No-op if logging has not been initialised yet — init seeds the level instead.
-		crate::obs::set_log_level(config.log_level);
+		// Apply this client's level to the (host- or SDK-installed) global tracing filter only if
+		// one was explicitly set. A default-config client leaves this `None` so routine client
+		// construction never reverts the host's or cache's configured verbosity (or a runtime
+		// `set_log_level`). No-op anyway if logging has not been initialised yet.
+		if let Some(log_level) = config.log_level {
+			crate::obs::set_log_level(log_level);
+		}
 
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		let upload_limiter = {
