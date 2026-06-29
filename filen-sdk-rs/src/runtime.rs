@@ -266,6 +266,17 @@ mod commander_thread {
 					.expect_or_throw("Failed to create commander runtime");
 				let handle = runtime.handle().clone();
 
+				// Drive the in-flight hang watchdog on this runtime too. The standalone SDK
+				// artifact (uniffi/wasm-full: the Notes/Chats/transfers path) installs the
+				// InflightLayer but, unlike the cache, had no runtime spawning the watchdog that
+				// consumes it — so its per-span bookkeeping was dead weight and the "still running
+				// after Ns" hang signal never fired. `spawn_inflight_watchdog` is idempotent via a
+				// process-wide guard, so this is a no-op if the cache runtime already claimed it.
+				{
+					let _guard = handle.enter();
+					crate::obs::spawn_inflight_watchdog();
+				}
+
 				let (close_sender, close_receiver) = tokio::sync::oneshot::channel::<()>();
 
 				std::thread::spawn(move || {
