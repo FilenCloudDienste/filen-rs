@@ -173,13 +173,13 @@ impl Default for ClientConfig {
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
 				{
-					// 4 full Chunks
-					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 4
+					// 16 full Chunks
+					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 16
 				}
 				#[cfg(target_os = "ios")]
 				{
-					// 2 full Chunks
-					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 2
+					// 8 full Chunks (lower than other targets for the tighter iOS memory limits)
+					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 8
 				}
 			},
 		}
