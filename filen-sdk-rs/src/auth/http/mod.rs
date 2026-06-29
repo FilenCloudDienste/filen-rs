@@ -21,7 +21,7 @@ use crate::{
 	Error,
 	auth::{Client, http::auth::AuthLayer, unauth::UnauthClient},
 	consts::gateway_url,
-	util::MaybeSend,
+	util::{MaybeSend, MaybeSendSync},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use bandwidth_limit::{
@@ -686,11 +686,20 @@ impl UnauthClient {
 		})
 	}
 
-	pub(crate) async fn get_raw_bytes(
+	/// Streams a GET response body to bytes, invoking `callback(bytes_so_far, content_length)` as
+	/// data arrives (throttled to one call per [`CALLBACK_INTERVAL`](crate::consts::CALLBACK_INTERVAL)).
+	/// Lets callers report download progress *while a chunk arrives* rather than only once it is
+	/// fully buffered — important for heavily-parallel downloads, where every in-flight chunk shares
+	/// bandwidth and none completes (so none would report) for the first several seconds.
+	pub(crate) async fn get_raw_bytes_with_callback<F>(
 		&self,
 		url: &str,
 		endpoint: Cow<'static, str>,
-	) -> Result<Vec<u8>, Error> {
+		callback: Option<&F>,
+	) -> Result<Vec<u8>, Error>
+	where
+		F: Fn(u64, Option<u64>) + MaybeSendSync,
+	{
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
@@ -700,7 +709,9 @@ impl UnauthClient {
 			.map_request(|request: Request<(), reqwest::Url>| {
 				request.into_builder_map_body(|()| bytes::Bytes::new())
 			}) // required to map Request to RequestBuilder
-			.layer(download_body::full::DownloadLayer::new()); // required to download full response body to bytes
+			.layer(download_body::callback::DownloadWithCallbackLayer::new(
+				callback,
+			)); // stream the body to bytes, reporting progress as it arrives
 		let builder = {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{

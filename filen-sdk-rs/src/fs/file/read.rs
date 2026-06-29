@@ -11,7 +11,7 @@ use crate::{
 	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
 	error::{Error, MetadataWasNotDecryptedError},
-	util::MaybeSendBoxFuture,
+	util::{MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 use super::{chunk::Chunk, traits::File};
@@ -26,6 +26,10 @@ pub struct FileReader<'a> {
 	futures: FuturesOrdered<MaybeSendBoxFuture<'a, Result<Cursor<Chunk<'a>>, Error>>>,
 	allocate_chunk_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
 	max_buffer_size: u64,
+	// Reports downloaded bytes as each chunk STREAMS in (delta-converted), not at read-out: chunks
+	// download concurrently, and the ordered reader would otherwise hold completed chunks behind a
+	// slow head-of-line chunk and release them in a burst. See `push_fetch_next_chunk`.
+	progress: Option<MaybeSendCallback<'a, u64>>,
 }
 
 pub struct FileReaderBuilder<'a> {
@@ -34,6 +38,7 @@ pub struct FileReaderBuilder<'a> {
 	start: Option<u64>,
 	end: Option<u64>,
 	max_buffer_size: Option<u64>,
+	progress: Option<MaybeSendCallback<'a, u64>>,
 }
 
 impl<'a> FileReaderBuilder<'a> {
@@ -44,7 +49,14 @@ impl<'a> FileReaderBuilder<'a> {
 			start: None,
 			end: None,
 			max_buffer_size: None,
+			progress: None,
 		}
+	}
+
+	/// Sets a callback fired with each chunk's plaintext byte count as it finishes downloading.
+	pub fn with_progress_callback(mut self, progress: Option<MaybeSendCallback<'a, u64>>) -> Self {
+		self.progress = progress;
+		self
 	}
 
 	pub fn with_start(mut self, start: u64) -> Self {
@@ -76,6 +88,7 @@ impl<'a> FileReaderBuilder<'a> {
 			next_chunk_idx: index / CHUNK_SIZE_U64,
 			allocate_chunk_future: None,
 			max_buffer_size: self.max_buffer_size.unwrap_or(size),
+			progress: self.progress,
 		};
 
 		// allocate memory and prefetch chunks
@@ -155,9 +168,30 @@ impl<'a> FileReader<'a> {
 		let index = self.index;
 		let client = self.client;
 		let file = self.file;
+		let progress = self.progress.clone();
+		// Plaintext size of this chunk; reported bytes are clamped to it so the encrypted body's
+		// per-chunk overhead never over-counts past the (plaintext) file size.
+		let plaintext_len = file
+			.size()
+			.saturating_sub(chunk_idx * CHUNK_SIZE_U64)
+			.min(CHUNK_SIZE_U64);
 		self.futures.push_back(Box::pin(async move {
 			let (_, permits) = out_data.into_parts();
-			let data = api::download::download_file_chunk(client, file, chunk_idx).await?;
+			// Report bytes as the chunk streams in (clamped, converted to deltas) instead of only
+			// at completion — otherwise a heavily-parallel download shows nothing for seconds while
+			// every in-flight chunk fills together, then jumps.
+			let reported = std::sync::atomic::AtomicU64::new(0);
+			let on_bytes = |bytes_so_far: u64, _content_length: Option<u64>| {
+				if let Some(progress) = &progress {
+					let clamped = bytes_so_far.min(plaintext_len);
+					let prev = reported.swap(clamped, std::sync::atomic::Ordering::Relaxed);
+					if clamped > prev {
+						progress(clamped - prev);
+					}
+				}
+			};
+			let data = api::download::download_file_chunk(client, file, chunk_idx, Some(&on_bytes))
+				.await?;
 			let mut chunk = Chunk::from_parts(data, permits);
 			file.key()
 				.ok_or(MetadataWasNotDecryptedError)?

@@ -21,7 +21,8 @@ use crate::{
 		traits::File,
 		write::{DummyFuture, FileWriter},
 	},
-	util::{MaybeSend, MaybeSendCallback},
+	progress::ThrottledProgress,
+	util::{MaybeArc, MaybeSend, MaybeSendCallback},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::{
@@ -522,7 +523,15 @@ where
 	where
 		T: 'b + AsyncWrite + Unpin,
 	{
-		let mut reader = self.get_file_reader_for_range(file, start, end);
+		let progress = ThrottledProgress::new(callback);
+		// Drive the throttle from chunk-download completion inside the reader (smooth, concurrent)
+		// rather than from read-out (bursty: the ordered reader releases head-of-line-blocked chunks
+		// together). The throttle still rate-limits the actual callback to one per CALLBACK_INTERVAL.
+		let reader_callback = progress
+			.clone()
+			.map(|p| MaybeArc::new(move |bytes| p.report(bytes)) as MaybeSendCallback<u64>);
+		let mut reader =
+			self.get_file_reader_for_range_with_callback(file, start, end, reader_callback);
 		let buffer_size = std::cmp::min(end.saturating_sub(start), CHUNK_SIZE_U64) as usize;
 		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
 		// https://github.com/rust-lang/rust/issues/117693
@@ -533,9 +542,9 @@ where
 				break;
 			}
 			writer.write_all(&buffer[..bytes_read]).await?;
-			if let Some(callback) = &callback {
-				callback(bytes_read as u64);
-			}
+		}
+		if let Some(progress) = &progress {
+			progress.flush();
 		}
 		writer.close().await?;
 		Ok(())

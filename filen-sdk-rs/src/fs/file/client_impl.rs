@@ -32,7 +32,7 @@ use crate::{
 use super::exif::{ExifTeeState, mime_to_exif_kind};
 use super::{
 	BaseFile, FileBuilder, RemoteFile,
-	read::FileReader,
+	read::{FileReader, FileReaderBuilder},
 	traits::{File, UpdateFileMeta},
 	write::FileWriter,
 };
@@ -361,8 +361,15 @@ impl Client {
 		uuid: UuidStr,
 		chunk_idx: u64,
 	) -> Result<Vec<u8>, Error> {
-		api::download::download_file_chunk_by_uuid(self.unauthed(), region, bucket, uuid, chunk_idx)
-			.await
+		api::download::download_file_chunk_by_uuid::<fn(u64, Option<u64>)>(
+			self.unauthed(),
+			region,
+			bucket,
+			uuid,
+			chunk_idx,
+			None,
+		)
+		.await
 	}
 }
 
@@ -379,6 +386,23 @@ pub trait FileReaderSharedClientExt<'a>: SharedClient {
 		end: u64,
 	) -> FileReader<'a> {
 		FileReader::new_for_range(file, self.get_unauth_client(), start, end)
+	}
+
+	/// Like [`get_file_reader_for_range`](Self::get_file_reader_for_range) but reports each chunk's
+	/// plaintext length to `callback` as it finishes downloading (not at read-out), so progress is
+	/// smooth instead of bursting when the ordered reader releases head-of-line-blocked chunks.
+	fn get_file_reader_for_range_with_callback(
+		&'a self,
+		file: &'a dyn File,
+		start: u64,
+		end: u64,
+		callback: Option<MaybeSendCallback<'a, u64>>,
+	) -> FileReader<'a> {
+		FileReaderBuilder::new(self.get_unauth_client(), file)
+			.with_start(start)
+			.with_end(end)
+			.with_progress_callback(callback)
+			.build()
 	}
 }
 
