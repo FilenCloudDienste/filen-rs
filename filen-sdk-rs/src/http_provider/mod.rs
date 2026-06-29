@@ -50,12 +50,16 @@ const MAX_READ_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
 /// and frees its budget. Mirrors nginx's `send_timeout`.
 const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Resolves the effective read-ahead window from the optional `?buffer=` query value,
-/// applying the default and clamping to `[MIN, MAX]`.
-fn effective_read_ahead(requested: Option<u64>) -> u64 {
+/// Resolves the effective read-ahead window from the optional `?buffer=` query value: applies the
+/// default, clamps to `[MIN, MAX]`, then caps at half the shared memory `budget` so a single stream
+/// can never pin more than half the budget — always leaving room for a concurrent download.
+/// [`SharedClientState::new`](crate::auth::Client) rejects a budget whose half is below one chunk,
+/// so the budget cap never pushes the window below [`MIN_READ_AHEAD_BYTES`].
+fn effective_read_ahead(requested: Option<u64>, budget: usize) -> u64 {
 	requested
 		.unwrap_or(DEFAULT_READ_AHEAD_BYTES)
 		.clamp(MIN_READ_AHEAD_BYTES, MAX_READ_AHEAD_BYTES)
+		.min((budget / 2) as u64)
 }
 
 fn write_idle_timeout_error() -> io::Error {
@@ -499,7 +503,7 @@ async fn file_handler(
 		vec![(0, params.file.size())]
 	};
 
-	let read_ahead = effective_read_ahead(params.buffer);
+	let read_ahead = effective_read_ahead(params.buffer, state.client.state().memory_budget());
 	let response_builder = http::Response::builder().header(http::header::ACCEPT_RANGES, "bytes");
 
 	match ranges {
@@ -653,26 +657,57 @@ mod tests {
 
 	#[test]
 	fn read_ahead_window_applies_default_and_clamps() {
+		// A practically-unbounded budget, so the half-budget cap never binds and this exercises
+		// only the default and the `[MIN, MAX]` clamp.
+		let big = usize::MAX;
 		assert_eq!(
-			super::effective_read_ahead(None),
+			super::effective_read_ahead(None, big),
 			super::DEFAULT_READ_AHEAD_BYTES,
 			"absent `buffer` should use the 8 MiB default"
 		);
 		assert_eq!(
-			super::effective_read_ahead(Some(0)),
+			super::effective_read_ahead(Some(0), big),
 			super::MIN_READ_AHEAD_BYTES,
 			"a zero/too-small window must be clamped up to one chunk"
 		);
 		assert_eq!(
-			super::effective_read_ahead(Some(u64::MAX)),
+			super::effective_read_ahead(Some(u64::MAX), big),
 			super::MAX_READ_AHEAD_BYTES,
 			"an oversized window must be clamped down to the cap"
 		);
 		let in_range = 4 * 1024 * 1024;
 		assert_eq!(
-			super::effective_read_ahead(Some(in_range)),
+			super::effective_read_ahead(Some(in_range), big),
 			in_range,
 			"an in-range window must pass through unchanged"
+		);
+	}
+
+	/// The window is capped at half the shared memory budget, so a single stream can never pin more
+	/// than half the budget and starve a concurrent download.
+	#[test]
+	fn read_ahead_capped_at_half_budget() {
+		let one_chunk = super::CHUNK_SIZE_U64 + u64::from(super::FILE_CHUNK_SIZE_EXTRA.get());
+
+		// A 4-chunk budget: half is 2 chunks, which caps the otherwise-8-MiB default window.
+		let four_chunks = (one_chunk * 4) as usize;
+		assert_eq!(
+			super::effective_read_ahead(None, four_chunks),
+			one_chunk * 2,
+			"the default window must be capped to half the budget (2 of 4 chunks)"
+		);
+		assert_eq!(
+			super::effective_read_ahead(Some(u64::MAX), four_chunks),
+			one_chunk * 2,
+			"a huge requested window is still capped to half the budget"
+		);
+
+		// A 2-chunk budget (the iOS default): half is exactly one chunk, the minimum window.
+		let two_chunks = (one_chunk * 2) as usize;
+		assert_eq!(
+			super::effective_read_ahead(None, two_chunks),
+			super::MIN_READ_AHEAD_BYTES,
+			"on a 2-chunk budget the window is exactly one chunk (half the budget)"
 		);
 	}
 

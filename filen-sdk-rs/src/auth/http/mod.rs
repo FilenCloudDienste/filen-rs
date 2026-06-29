@@ -260,10 +260,31 @@ pub(crate) struct SharedClientState {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	download_limiter: DownloadBandwidthLimiterLayer,
 	memory_semaphore: Arc<tokio::sync::Semaphore>,
+	/// The semaphore's initial permit count (bytes). Stored so the HTTP provider can cap a
+	/// stream's read-ahead at half the total budget, which `available_permits()` cannot give.
+	#[cfg(feature = "http-provider")]
+	file_io_memory_budget: usize,
 }
 
 impl SharedClientState {
 	pub(crate) fn new(config: ClientConfig) -> Result<Self, Error> {
+		// The local HTTP provider caps a single stream's read-ahead window at half the shared
+		// memory budget, so one stream can never pin the whole budget and starve a concurrent
+		// download. That cap is meaningless if half the budget cannot hold even one chunk, so
+		// reject such a configuration at construction rather than silently degrade.
+		#[cfg(feature = "http-provider")]
+		if config.file_io_memory_budget / 2 < CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE {
+			return Err(Error::custom(
+				crate::ErrorKind::InvalidState,
+				format!(
+					"file_io_memory_budget ({}) is too small: half of it must hold at least one \
+					 chunk ({} bytes)",
+					config.file_io_memory_budget,
+					CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE
+				),
+			));
+		}
+
 		// Apply this client's level to the (host- or SDK-installed) global tracing filter only if
 		// one was explicitly set. A default-config client leaves this `None` so routine client
 		// construction never reverts the host's or cache's configured verbosity (or a runtime
@@ -300,11 +321,20 @@ impl SharedClientState {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			download_limiter,
 			memory_semaphore: Arc::new(tokio::sync::Semaphore::new(config.file_io_memory_budget)),
+			#[cfg(feature = "http-provider")]
+			file_io_memory_budget: config.file_io_memory_budget,
 		})
 	}
 
 	pub(crate) fn memory_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
 		&self.memory_semaphore
+	}
+
+	/// Total file-IO memory budget in bytes (the semaphore's initial permit count). Used by the
+	/// HTTP provider to cap a stream's read-ahead window at half the budget.
+	#[cfg(feature = "http-provider")]
+	pub(crate) fn memory_budget(&self) -> usize {
+		self.file_io_memory_budget
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1143,5 +1173,30 @@ mod client_timeout_tests {
 				 but was NoRetry: {e}"
 			),
 		}
+	}
+}
+
+#[cfg(all(test, feature = "http-provider"))]
+mod memory_budget_validation_tests {
+	use super::{CHUNK_SIZE, ClientConfig, FILE_CHUNK_SIZE_EXTRA_USIZE, SharedClientState};
+
+	/// `SharedClientState::new` rejects a memory budget whose half cannot hold one chunk, because
+	/// the HTTP provider caps a stream's read-ahead window at half the budget.
+	#[tokio::test]
+	async fn rejects_budget_whose_half_cannot_hold_one_chunk() {
+		let one_chunk = CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE;
+
+		// budget == 1 chunk -> half is half a chunk -> rejected.
+		assert!(
+			SharedClientState::new(ClientConfig::default().with_memory_budget(one_chunk)).is_err(),
+			"a 1-chunk budget (half < one chunk) must be rejected at construction"
+		);
+
+		// budget == 2 chunks -> half is exactly one chunk -> accepted (the iOS default boundary).
+		SharedClientState::new(ClientConfig::default().with_memory_budget(2 * one_chunk))
+			.expect("a 2-chunk budget (half == one chunk) must be valid");
+
+		// the platform defaults must remain valid.
+		SharedClientState::new(ClientConfig::default()).expect("the default budget must be valid");
 	}
 }
