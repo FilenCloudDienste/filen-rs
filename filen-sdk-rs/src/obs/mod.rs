@@ -52,18 +52,35 @@ fn level_filter(level: LogLevel) -> LevelFilter {
 }
 
 fn build_filter(level: LogLevel) -> EnvFilter {
-	// Scope the requested level to first-party crates and keep everything else (reqwest, hyper,
-	// tokio-tungstenite, ...) at a quiet WARN floor. Raising SDK verbosity to Debug/Trace must not
-	// escalate third-party HTTP-stack logs — whose request URLs/headers can carry the auth bearer
-	// token — into the device log sink. RUST_LOG still overrides everything where an env exists
-	// (native dev); `parse_lossy` never panics on a malformed directive or a target without an env.
-	let lvl = level_filter(level);
-	let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| {
-		format!("warn,filen_sdk_rs={lvl},filen_mobile_native_cache={lvl},filen_types={lvl}")
-	});
+	let (floor, default_directives) = first_party_directives(level);
+	// RUST_LOG overrides everything where an env exists (native dev); otherwise use the scoped
+	// default. `parse_lossy` never panics on a malformed directive or a target without an env.
+	let directives = std::env::var("RUST_LOG").unwrap_or(default_directives);
 	EnvFilter::builder()
-		.with_default_directive(LevelFilter::WARN.into())
+		.with_default_directive(floor.into())
 		.parse_lossy(directives)
+}
+
+/// First-party crates track `level`; non-first-party crates (reqwest, hyper, tokio-tungstenite, ...)
+/// are floored at the *lesser* of WARN and `level`. Raising SDK verbosity to Info/Debug/Trace must
+/// not escalate third-party HTTP-stack logs — whose request URLs/headers can carry the auth bearer
+/// token — into the device sink, so their floor stays at WARN. But *lowering* verbosity must quiet
+/// everything: `Off`/`Error` drop the floor with the first-party level, so `set_log_level(Off)` is
+/// truly silent rather than leaving third-party crates chattering at WARN. Returns
+/// `(global_floor, default_directives)` (the latter used only when `RUST_LOG` is unset).
+fn first_party_directives(level: LogLevel) -> (LevelFilter, String) {
+	let lvl = level_filter(level);
+	let floor = if lvl == LevelFilter::OFF {
+		LevelFilter::OFF
+	} else if lvl == LevelFilter::ERROR {
+		LevelFilter::ERROR
+	} else {
+		LevelFilter::WARN
+	};
+	(
+		floor,
+		format!("{floor},filen_sdk_rs={lvl},filen_mobile_native_cache={lvl},filen_types={lvl}"),
+	)
 }
 
 /// Install the SDK's default `tracing` subscriber for this process.
@@ -369,5 +386,45 @@ mod android {
 				prio: priority(meta.level()),
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Regression: `set_log_level(Off)` must silence *everything*, not leave third-party crates
+	/// chattering at the WARN floor (which would break the `Off = silent` contract).
+	#[test]
+	fn off_lowers_the_floor_so_everything_is_silent() {
+		let (floor, directives) = first_party_directives(LogLevel::Off);
+		assert_eq!(
+			floor,
+			LevelFilter::OFF,
+			"Off must floor third-party at OFF, not WARN"
+		);
+		assert!(directives.starts_with("off,"), "got: {directives}");
+	}
+
+	#[test]
+	fn error_lowers_the_floor_to_error() {
+		assert_eq!(
+			first_party_directives(LogLevel::Error).0,
+			LevelFilter::ERROR
+		);
+	}
+
+	/// Raising SDK verbosity keeps third-party crates pinned at the WARN floor (the bearer-token
+	/// scoping), while first-party crates track the requested level.
+	#[test]
+	fn raising_verbosity_keeps_third_party_at_a_warn_floor() {
+		assert_eq!(first_party_directives(LogLevel::Info).0, LevelFilter::WARN);
+		assert_eq!(first_party_directives(LogLevel::Debug).0, LevelFilter::WARN);
+		assert_eq!(first_party_directives(LogLevel::Trace).0, LevelFilter::WARN);
+		let (_, directives) = first_party_directives(LogLevel::Debug);
+		assert!(
+			directives.starts_with("warn,") && directives.contains("filen_sdk_rs=debug"),
+			"got: {directives}"
+		);
 	}
 }
