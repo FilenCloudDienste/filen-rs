@@ -72,24 +72,24 @@ fn idle_timeout_error() -> io::Error {
 
 /// Wraps a connection's IO with an **idle** timeout covering both directions.
 ///
-/// It shares one timer across reads and writes: it arms on the first stalled poll and fails the IO
-/// with [`io::ErrorKind::TimedOut`] once `timeout` elapses with no progress in *either* direction,
-/// tearing the connection down so the streaming reader (and the memory budget) it owns is dropped.
-/// Any successful read or write resets the timer, so a slow-but-progressing client is never
-/// penalised — and a long download (writes progressing while the read side is legitimately idle)
-/// keeps the timer reset via its writes.
+/// It shares one timer across reads and writes: it arms when an IO poll parks `Pending` and fails
+/// the IO with [`io::ErrorKind::TimedOut`] once `timeout` elapses with no progress, tearing the
+/// connection down so the streaming reader (and the memory budget) it owns is dropped. Any
+/// successful read or write resets the timer.
 ///
-/// Reliably reaped: a peer that stops reading, so the send buffer fills and `poll_write` parks
-/// `Pending` forever (the budget-leak path this was built for); a peer that connects and sends
-/// nothing, since the pre-dispatch protocol sniff polls only `poll_read`; and a connection that
-/// finishes a request then idles in keep-alive (its read side parks with nothing else polled).
+/// The timer engages on real IO back-pressure, which reaps the cases that matter:
+/// - a peer that stops reading — the send buffer fills, `poll_write` parks `Pending`, and the
+///   connection (with its pinned reader/budget) is dropped. This is the budget-leak path the timer
+///   was built for; see `timeout_listener_closes_abandoned_stream`.
+/// - a peer that connects and never sends a request — the protocol-sniff `poll_read` parks
+///   `Pending`; see `timeout_listener_closes_a_silent_client`.
 ///
-/// NOT reaped — a peer that sends a *partial* request then stalls mid-headers: once hyper's h1
-/// dispatcher is active it polls `poll_flush` every loop, and an empty-buffer flush succeeds
-/// (`Ready`) and resets the shared timer, so the read side never accumulates idle time (hyper has no
-/// header-read timer installed here to cover it either). Acceptable: such a connection pins no
-/// reader or budget (the handler has not run) and the provider is localhost-only. Do not "fix" this
-/// by dropping the empty-flush reset — that same reset is what keeps a long-TTFB download alive.
+/// It does NOT reap a connection that is merely *slow to produce* a response body while the client
+/// keeps reading: that does not back the IO up (the send buffer drains), so the timer never engages
+/// and a legitimately slow download completes (`timeout_listener_keeps_a_slow_download_alive`). A
+/// peer that trickles a *partial* request then stalls mid-headers may likewise escape this timer
+/// (hyper has no header-read timer installed here); acceptable, since it pins no reader/budget — the
+/// handler has not run — and the provider is localhost-only.
 struct IdleTimeout<S> {
 	inner: S,
 	timeout: Duration,
@@ -920,6 +920,88 @@ mod tests {
 		assert!(
 			closed,
 			"server must close a silent (never-sending) client via the read-idle timeout"
+		);
+
+		let _ = cancel_tx.send(());
+		let _ = server.await;
+	}
+
+	/// End-to-end: a slow download — the response body stalls (no writes) for longer than
+	/// `idle_timeout` while the client keeps reading — must NOT be reaped. The idle timer only
+	/// engages on real IO back-pressure (a `poll_write` that parks because the client stopped
+	/// reading, or a `poll_read` that parks awaiting the request); a server-side body-produce stall
+	/// is neither (the send buffer drains as the client reads), so the connection survives. Guards
+	/// against a future change that reaps a legitimately slow download from the egest server.
+	/// (Empirically this passes with or without the `poll_flush` empty-buffer reset, so that reset
+	/// is not the load-bearing mechanism here.)
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn timeout_listener_keeps_a_slow_download_alive() {
+		use std::time::Duration;
+		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+		// Two body frames with a pause LONGER than the idle timeout between them, modelling a slow
+		// upstream chunk fetch while the client reads steadily.
+		async fn slow_body() -> axum::response::Response {
+			let stream = async_stream::stream! {
+				yield Ok::<_, std::io::Error>(b"<<FIRST>>".to_vec());
+				tokio::time::sleep(Duration::from_millis(600)).await;
+				yield Ok::<_, std::io::Error>(b"<<SECOND>>".to_vec());
+			};
+			axum::response::Response::new(axum::body::Body::from_stream(stream))
+		}
+
+		let router = axum::Router::new().route("/", axum::routing::get(slow_body));
+		let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+			.await
+			.unwrap();
+		let port = tcp.local_addr().unwrap().port();
+		let listener = super::TimeoutListener {
+			inner: tcp,
+			idle_timeout: Duration::from_millis(200), // < the 600 ms inter-frame stall
+		};
+		let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+		let server = tokio::spawn(async move {
+			axum::serve(listener, router)
+				.with_graceful_shutdown(async {
+					let _ = cancel_rx.await;
+				})
+				.await
+				.unwrap();
+		});
+
+		let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		sock.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+			.await
+			.unwrap();
+
+		// The client reads steadily across the >idle_timeout stall; the second frame arriving proves
+		// the connection survived (chunked body, so the frame bytes appear verbatim in the stream).
+		let got_second_frame = tokio::time::timeout(Duration::from_secs(5), async {
+			let mut all = Vec::new();
+			let mut buf = [0u8; 1024];
+			loop {
+				match sock.read(&mut buf).await {
+					Ok(0) => break,
+					Ok(n) => {
+						all.extend_from_slice(&buf[..n]);
+						if all.windows(10).any(|w| w == b"<<SECOND>>") {
+							return true;
+						}
+					}
+					Err(_) => break,
+				}
+			}
+			false
+		})
+		.await
+		.unwrap_or(false);
+
+		assert!(
+			got_second_frame,
+			"a slow download (stall > idle_timeout while the client keeps reading) must complete, \
+			 not be reaped by the idle timer"
 		);
 
 		let _ = cancel_tx.send(());
