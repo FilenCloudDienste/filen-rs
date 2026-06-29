@@ -535,9 +535,11 @@ where
 	perform_handshake(unauthed_ws, listeners, api_key).await
 }
 
-// `skip_all` is load-bearing here: `api_key` must never be recorded as a span field. `err`
-// logs handshake failures (which never contain the key) with the span attached.
-#[tracing::instrument(name = "websocket_handshake", skip_all, err)]
+// `skip_all` is load-bearing here: `api_key` must never be recorded as a span field. `err` logs
+// handshake failures (which never contain the key) with the span attached; at `debug` level so
+// transient reconnects — which the caller's retry loop already reports at WARN — don't double-log
+// benign network churn at ERROR.
+#[tracing::instrument(name = "websocket_handshake", skip_all, err(level = "debug"))]
 async fn perform_handshake<UW, US, UR, RV, W, S, R, T, PT>(
 	unauthed_ws: UW,
 	disconnected_listeners: &mut DisconnectedListenerManager,

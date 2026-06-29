@@ -27,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::{
 	Error,
 	auth::unauth::UnauthClient,
-	consts::CHUNK_SIZE_U64,
+	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA},
 	fs::file::{enums::RemoteFileType, read::FileReaderBuilder},
 	io::HasFileInfo,
 };
@@ -39,8 +39,10 @@ use crate::{
 /// cheap (like a normal file server's small copy buffer) instead of letting it greedily
 /// acquire the entire budget and starve concurrent downloads.
 const DEFAULT_READ_AHEAD_BYTES: u64 = 8 * 1024 * 1024;
-/// Lower bound for the read-ahead window: at least one chunk so the reader always progresses.
-const MIN_READ_AHEAD_BYTES: u64 = CHUNK_SIZE_U64;
+/// Lower bound for the read-ahead window: one full *encrypted* chunk (plaintext + the 28-byte
+/// auth-tag/nonce overhead) so the reader can always eagerly prefetch at least one chunk. Using
+/// the bare plaintext size would leave the minimum window one chunk short and prefetch nothing.
+const MIN_READ_AHEAD_BYTES: u64 = CHUNK_SIZE_U64 + FILE_CHUNK_SIZE_EXTRA.get() as u64;
 /// Upper bound for the read-ahead window: keep one stream from pinning the whole budget.
 const MAX_READ_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
 /// A connection that cannot make write progress for this long (the peer stopped reading and
@@ -144,6 +146,18 @@ impl<S: AsyncRead + Unpin> AsyncRead for WriteIdleTimeout<S> {
 	}
 }
 
+/// Per-connection accept errors that are safe to retry immediately — the listener itself is still
+/// healthy (the peer just went away between the kernel accept and ours). Matches axum's own
+/// `is_connection_error`; anything else (e.g. fd exhaustion) is treated as persistent.
+fn is_connection_error(e: &io::Error) -> bool {
+	matches!(
+		e.kind(),
+		io::ErrorKind::ConnectionRefused
+			| io::ErrorKind::ConnectionAborted
+			| io::ErrorKind::ConnectionReset
+	)
+}
+
 /// An [`axum::serve::Listener`] that wraps every accepted connection in a [`WriteIdleTimeout`],
 /// so abandoned streaming connections are dropped instead of pinning a reader forever.
 struct TimeoutListener {
@@ -161,10 +175,14 @@ impl axum::serve::Listener for TimeoutListener {
 				Ok((stream, addr)) => {
 					return (WriteIdleTimeout::new(stream, self.write_idle_timeout), addr);
 				}
-				// Mirror axum's own accept loop: log and retry rather than propagate.
+				// A per-connection error is transient and the listener stays healthy, so retry
+				// immediately (matching axum). Anything else is likely persistent (e.g. fd
+				// exhaustion): surface it and back off a full second so we don't hot-loop
+				// accept+log at ~1 kHz, burning CPU/battery with the fault invisible at debug.
+				Err(e) if is_connection_error(&e) => continue,
 				Err(e) => {
-					tracing::debug!("http provider accept error: {e}");
-					tokio::time::sleep(Duration::from_millis(1)).await;
+					tracing::error!("http provider accept error: {e}");
+					tokio::time::sleep(Duration::from_secs(1)).await;
 				}
 			}
 		}

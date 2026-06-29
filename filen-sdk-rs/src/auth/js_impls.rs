@@ -60,7 +60,7 @@ pub fn init() {
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
-	wasm_bindgen::prelude::wasm_bindgen
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "setLogLevel")
 )]
 pub fn set_log_level(level: crate::auth::http::LogLevel) {
 	crate::obs::set_log_level(level);

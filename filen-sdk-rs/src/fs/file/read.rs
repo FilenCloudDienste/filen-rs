@@ -180,11 +180,15 @@ impl<'a> FileReader<'a> {
 			// Report bytes as the chunk streams in (clamped, converted to deltas) instead of only
 			// at completion — otherwise a heavily-parallel download shows nothing for seconds while
 			// every in-flight chunk fills together, then jumps.
+			// High-water mark of bytes already reported for this chunk. A mid-body retry restarts
+			// `bytes_so_far` at 0, so we keep the max (not the latest) — `fetch_max` never lowers
+			// it — and only forward genuine forward progress, otherwise a retried chunk would
+			// re-report the bytes of every failed attempt.
 			let reported = std::sync::atomic::AtomicU64::new(0);
 			let on_bytes = |bytes_so_far: u64, _content_length: Option<u64>| {
 				if let Some(progress) = &progress {
 					let clamped = bytes_so_far.min(plaintext_len);
-					let prev = reported.swap(clamped, std::sync::atomic::Ordering::Relaxed);
+					let prev = reported.fetch_max(clamped, std::sync::atomic::Ordering::Relaxed);
 					if clamped > prev {
 						progress(clamped - prev);
 					}

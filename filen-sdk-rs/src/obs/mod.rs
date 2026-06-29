@@ -52,11 +52,18 @@ fn level_filter(level: LogLevel) -> LevelFilter {
 }
 
 fn build_filter(level: LogLevel) -> EnvFilter {
-	// `from_env_lossy` honours RUST_LOG when an env exists (native dev) and otherwise falls
-	// back to the requested level — it never panics on targets without an environment.
+	// Scope the requested level to first-party crates and keep everything else (reqwest, hyper,
+	// tokio-tungstenite, ...) at a quiet WARN floor. Raising SDK verbosity to Debug/Trace must not
+	// escalate third-party HTTP-stack logs — whose request URLs/headers can carry the auth bearer
+	// token — into the device log sink. RUST_LOG still overrides everything where an env exists
+	// (native dev); `parse_lossy` never panics on a malformed directive or a target without an env.
+	let lvl = level_filter(level);
+	let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+		format!("warn,filen_sdk_rs={lvl},filen_mobile_native_cache={lvl},filen_types={lvl}")
+	});
 	EnvFilter::builder()
-		.with_default_directive(level_filter(level).into())
-		.from_env_lossy()
+		.with_default_directive(LevelFilter::WARN.into())
+		.parse_lossy(directives)
 }
 
 /// Install the SDK's default `tracing` subscriber for this process.
@@ -227,7 +234,11 @@ mod inflight {
 
 	impl Visit for FieldVisitor {
 		fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-			if self.0.len() < 200 {
+			// Soft cap: once over the budget we stop accepting new fields, but the field that
+			// crosses it is written in full, so the buffer can exceed FIELD_BUDGET by one field's
+			// length. Approximate by design — a hard truncate could split a UTF-8 boundary.
+			const FIELD_BUDGET: usize = 200;
+			if self.0.len() < FIELD_BUDGET {
 				let _ = write!(self.0, "{}={:?} ", field.name(), value);
 			}
 		}
