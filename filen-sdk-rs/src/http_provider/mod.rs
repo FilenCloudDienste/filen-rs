@@ -45,10 +45,11 @@ const DEFAULT_READ_AHEAD_BYTES: u64 = 8 * 1024 * 1024;
 const MIN_READ_AHEAD_BYTES: u64 = CHUNK_SIZE_U64 + FILE_CHUNK_SIZE_EXTRA.get() as u64;
 /// Upper bound for the read-ahead window: keep one stream from pinning the whole budget.
 const MAX_READ_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
-/// A connection that cannot make write progress for this long (the peer stopped reading and
-/// the socket buffers are full) is dropped, which tears down the streaming reader behind it
-/// and frees its budget. Mirrors nginx's `send_timeout`.
-const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A connection that makes no read *or* write progress for this long is dropped, which tears down
+/// the streaming reader behind it and frees its budget. Covers both a peer that stopped reading
+/// (writes back up against a full socket buffer) and a peer that connected but never sent a
+/// complete request (no inbound bytes). Mirrors nginx's `send_timeout` + `client_header_timeout`.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolves the effective read-ahead window from the optional `?buffer=` query value: applies the
 /// default, clamps to `[MIN, MAX]`, then caps at half the shared memory `budget` so a single stream
@@ -62,28 +63,31 @@ fn effective_read_ahead(requested: Option<u64>, budget: usize) -> u64 {
 		.min((budget / 2) as u64)
 }
 
-fn write_idle_timeout_error() -> io::Error {
+fn idle_timeout_error() -> io::Error {
 	io::Error::new(
 		io::ErrorKind::TimedOut,
-		"http provider: write idle timeout (peer stopped reading)",
+		"http provider: connection idle timeout (no read or write progress)",
 	)
 }
 
-/// Wraps a connection's IO with a write **idle** timeout.
+/// Wraps a connection's IO with an **idle** timeout covering both directions.
 ///
-/// When the peer stops reading, the socket send buffer fills and `poll_write` returns
-/// `Pending` indefinitely — hyper parks the response body (and the streaming reader it owns)
-/// without ever dropping it. This wrapper arms a timer on the first stalled write and fails
-/// the IO with [`io::ErrorKind::TimedOut`] once `timeout` elapses with no progress, which
-/// tears the connection down so the reader is dropped and its budget reclaimed. The timer is
-/// reset on every successful write, so a slow-but-progressing client is never penalised.
-struct WriteIdleTimeout<S> {
+/// Two ways a connection can hang and leak the streaming reader (and the memory budget) it owns:
+/// the peer stops reading, so the send buffer fills and `poll_write` parks `Pending` forever; or
+/// the peer connects but never sends a complete request, so `poll_read` parks `Pending` forever.
+/// hyper drops neither on its own. This wrapper shares one timer across reads and writes: it arms
+/// on the first stalled poll and fails the IO with [`io::ErrorKind::TimedOut`] once `timeout`
+/// elapses with no progress in *either* direction, tearing the connection down so the reader is
+/// dropped and its budget reclaimed. Any successful read or write resets the timer, so a
+/// slow-but-progressing client is never penalised — and a long download (writes progressing while
+/// the read side is legitimately idle) keeps the timer reset via its writes.
+struct IdleTimeout<S> {
 	inner: S,
 	timeout: Duration,
 	idle: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
-impl<S> WriteIdleTimeout<S> {
+impl<S> IdleTimeout<S> {
 	fn new(inner: S, timeout: Duration) -> Self {
 		Self {
 			inner,
@@ -102,7 +106,7 @@ impl<S> WriteIdleTimeout<S> {
 	}
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for WriteIdleTimeout<S> {
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeout<S> {
 	fn poll_write(
 		self: Pin<&mut Self>,
 		cx: &mut Context<'_>,
@@ -115,7 +119,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteIdleTimeout<S> {
 				Poll::Ready(res)
 			}
 			Poll::Pending => match this.poll_idle_elapsed(cx) {
-				Poll::Ready(()) => Poll::Ready(Err(write_idle_timeout_error())),
+				Poll::Ready(()) => Poll::Ready(Err(idle_timeout_error())),
 				Poll::Pending => Poll::Pending,
 			},
 		}
@@ -129,7 +133,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteIdleTimeout<S> {
 				Poll::Ready(res)
 			}
 			Poll::Pending => match this.poll_idle_elapsed(cx) {
-				Poll::Ready(()) => Poll::Ready(Err(write_idle_timeout_error())),
+				Poll::Ready(()) => Poll::Ready(Err(idle_timeout_error())),
 				Poll::Pending => Poll::Pending,
 			},
 		}
@@ -140,13 +144,27 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteIdleTimeout<S> {
 	}
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for WriteIdleTimeout<S> {
+impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeout<S> {
 	fn poll_read(
 		self: Pin<&mut Self>,
 		cx: &mut Context<'_>,
 		buf: &mut ReadBuf<'_>,
 	) -> Poll<io::Result<()>> {
-		Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+		let this = self.get_mut();
+		match Pin::new(&mut this.inner).poll_read(cx, buf) {
+			// Any read result (data, EOF, or error) is progress on the read side — reset the
+			// shared timer. Crucially, while a response streams out the read side sits `Pending`
+			// here, but the concurrent writes keep the timer reset, so a long download is never
+			// reaped; only a connection idle in *both* directions trips the timeout.
+			Poll::Ready(res) => {
+				this.idle = None;
+				Poll::Ready(res)
+			}
+			Poll::Pending => match this.poll_idle_elapsed(cx) {
+				Poll::Ready(()) => Poll::Ready(Err(idle_timeout_error())),
+				Poll::Pending => Poll::Pending,
+			},
+		}
 	}
 }
 
@@ -162,22 +180,22 @@ fn is_connection_error(e: &io::Error) -> bool {
 	)
 }
 
-/// An [`axum::serve::Listener`] that wraps every accepted connection in a [`WriteIdleTimeout`],
+/// An [`axum::serve::Listener`] that wraps every accepted connection in an [`IdleTimeout`],
 /// so abandoned streaming connections are dropped instead of pinning a reader forever.
 struct TimeoutListener {
 	inner: tokio::net::TcpListener,
-	write_idle_timeout: Duration,
+	idle_timeout: Duration,
 }
 
 impl axum::serve::Listener for TimeoutListener {
-	type Io = WriteIdleTimeout<tokio::net::TcpStream>;
+	type Io = IdleTimeout<tokio::net::TcpStream>;
 	type Addr = std::net::SocketAddr;
 
 	async fn accept(&mut self) -> (Self::Io, Self::Addr) {
 		loop {
 			match self.inner.accept().await {
 				Ok((stream, addr)) => {
-					return (WriteIdleTimeout::new(stream, self.write_idle_timeout), addr);
+					return (IdleTimeout::new(stream, self.idle_timeout), addr);
 				}
 				// A per-connection error is transient and the listener stays healthy, so retry
 				// immediately (matching axum). Anything else is likely persistent (e.g. fd
@@ -266,7 +284,7 @@ impl HttpProviderHandle {
 				let _ = port_sender.send(listener.local_addr().map(|addr| addr.port()));
 				let listener = TimeoutListener {
 					inner: listener,
-					write_idle_timeout: WRITE_IDLE_TIMEOUT,
+					idle_timeout: IDLE_TIMEOUT,
 				};
 				axum::serve(listener, router)
 					.with_graceful_shutdown(async {
@@ -716,7 +734,7 @@ mod tests {
 	/// A peer that stopped reading is modelled by a writer whose `poll_write` never
 	/// completes. The wrapper must surface a `TimedOut` error once the idle window elapses.
 	#[tokio::test(start_paused = true)]
-	async fn write_idle_timeout_fires_when_writes_stall() {
+	async fn idle_timeout_fires_when_writes_stall() {
 		use std::pin::Pin;
 		use std::task::{Context, Poll};
 		use tokio::io::{AsyncWrite, AsyncWriteExt as _};
@@ -741,8 +759,7 @@ mod tests {
 			}
 		}
 
-		let mut writer =
-			super::WriteIdleTimeout::new(StalledWriter, std::time::Duration::from_secs(30));
+		let mut writer = super::IdleTimeout::new(StalledWriter, std::time::Duration::from_secs(30));
 		// With paused time the runtime auto-advances to the armed deadline, so this resolves
 		// without any real waiting.
 		let err = writer
@@ -754,7 +771,7 @@ mod tests {
 
 	/// A writer that always accepts data must never trip the idle timeout.
 	#[tokio::test]
-	async fn write_idle_timeout_does_not_fire_while_progressing() {
+	async fn idle_timeout_does_not_fire_while_progressing() {
 		use std::pin::Pin;
 		use std::task::{Context, Poll};
 		use tokio::io::{AsyncWrite, AsyncWriteExt as _};
@@ -779,8 +796,7 @@ mod tests {
 			}
 		}
 
-		let mut writer =
-			super::WriteIdleTimeout::new(ReadyWriter, std::time::Duration::from_millis(1));
+		let mut writer = super::IdleTimeout::new(ReadyWriter, std::time::Duration::from_millis(1));
 		for _ in 0..1000 {
 			let n = writer
 				.write(b"chunk")
@@ -788,6 +804,117 @@ mod tests {
 				.expect("progressing write must succeed");
 			assert_eq!(n, 5);
 		}
+	}
+
+	/// A reader whose `poll_read` never completes (a peer that connected but sends nothing) must
+	/// trip the same idle timeout — the read-side mirror of the write-stall case.
+	#[tokio::test(start_paused = true)]
+	async fn idle_timeout_fires_when_reads_stall() {
+		use std::pin::Pin;
+		use std::task::{Context, Poll};
+		use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
+
+		struct StalledReader;
+		impl AsyncRead for StalledReader {
+			fn poll_read(
+				self: Pin<&mut Self>,
+				_: &mut Context<'_>,
+				_: &mut ReadBuf<'_>,
+			) -> Poll<std::io::Result<()>> {
+				Poll::Pending
+			}
+		}
+
+		let mut reader = super::IdleTimeout::new(StalledReader, std::time::Duration::from_secs(30));
+		let err = reader
+			.read(&mut [0u8; 8])
+			.await
+			.expect_err("a stalled read must time out");
+		assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+	}
+
+	/// A reader that always yields data must never trip the idle timeout.
+	#[tokio::test]
+	async fn idle_timeout_does_not_fire_while_reads_progress() {
+		use std::pin::Pin;
+		use std::task::{Context, Poll};
+		use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
+
+		struct ReadyReader;
+		impl AsyncRead for ReadyReader {
+			fn poll_read(
+				self: Pin<&mut Self>,
+				_: &mut Context<'_>,
+				buf: &mut ReadBuf<'_>,
+			) -> Poll<std::io::Result<()>> {
+				buf.put_slice(&[0u8; 8]);
+				Poll::Ready(Ok(()))
+			}
+		}
+
+		let mut reader = super::IdleTimeout::new(ReadyReader, std::time::Duration::from_millis(1));
+		for _ in 0..1000 {
+			let n = reader
+				.read(&mut [0u8; 8])
+				.await
+				.expect("progressing read must succeed");
+			assert_eq!(n, 8);
+		}
+	}
+
+	/// End-to-end (read side): a client that connects but never sends a request is closed by the
+	/// server's idle timeout — the read-side mirror of `timeout_listener_closes_abandoned_stream`.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn timeout_listener_closes_a_silent_client() {
+		use std::time::Duration;
+		use tokio::io::AsyncReadExt as _;
+
+		async fn hello() -> &'static str {
+			"ok"
+		}
+		let router = axum::Router::new().route("/", axum::routing::get(hello));
+		let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+			.await
+			.unwrap();
+		let port = tcp.local_addr().unwrap().port();
+		let listener = super::TimeoutListener {
+			inner: tcp,
+			idle_timeout: Duration::from_millis(500),
+		};
+		let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+		let server = tokio::spawn(async move {
+			axum::serve(listener, router)
+				.with_graceful_shutdown(async {
+					let _ = cancel_rx.await;
+				})
+				.await
+				.unwrap();
+		});
+
+		// Connect but send nothing: the server's request read stalls and, after the 500 ms idle
+		// timeout, the connection is dropped.
+		let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		let closed = tokio::time::timeout(Duration::from_secs(5), async {
+			let mut sink = [0u8; 1024];
+			loop {
+				match sock.read(&mut sink).await {
+					Ok(0) => return true,
+					Ok(_) => continue,
+					Err(_) => return true,
+				}
+			}
+		})
+		.await
+		.unwrap_or(false);
+		assert!(
+			closed,
+			"server must close a silent (never-sending) client via the read-idle timeout"
+		);
+
+		let _ = cancel_tx.send(());
+		let _ = server.await;
 	}
 
 	/// End-to-end: an abandoned streaming connection (client stops reading but keeps the
@@ -816,7 +943,7 @@ mod tests {
 		let port = tcp.local_addr().unwrap().port();
 		let listener = super::TimeoutListener {
 			inner: tcp,
-			write_idle_timeout: Duration::from_millis(500),
+			idle_timeout: Duration::from_millis(500),
 		};
 		let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 		let server = tokio::spawn(async move {
@@ -872,7 +999,7 @@ mod tests {
 	/// body holds; the test asserts the write-idle timeout reclaims it. Without the timeout firing
 	/// the permit would stay pinned forever — which is exactly the leak this fix closes.
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn write_idle_timeout_reclaims_the_budget_held_by_an_abandoned_stream() {
+	async fn idle_timeout_reclaims_the_budget_held_by_an_abandoned_stream() {
 		use std::sync::Arc;
 		use std::time::Duration;
 		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -906,7 +1033,7 @@ mod tests {
 		let port = tcp.local_addr().unwrap().port();
 		let listener = super::TimeoutListener {
 			inner: tcp,
-			write_idle_timeout: Duration::from_millis(500),
+			idle_timeout: Duration::from_millis(500),
 		};
 		let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
 		let server = tokio::spawn(async move {
