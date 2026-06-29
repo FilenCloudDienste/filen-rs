@@ -105,7 +105,10 @@ async fn main() {
 					CacheMessage::ResyncProgress(ResyncProgress::Listing {
 						bytes_downloaded, ..
 					}) => {
-						log::info!("cache resync listing progress: {} bytes downloaded", bytes_downloaded);
+						tracing::info!(
+							"cache resync listing progress: {} bytes downloaded",
+							bytes_downloaded
+						);
 						log.first_listing.get_or_insert(now);
 						log.last_listing = Some(now);
 						log.bytes_downloaded = bytes_downloaded;
