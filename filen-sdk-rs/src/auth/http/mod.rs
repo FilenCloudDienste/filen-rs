@@ -367,7 +367,7 @@ async fn execute_request(
 				e.status(),
 				e.is_builder(),
 				e.is_request(),
-				is_dispatch_gone(&e),
+				is_dispatch_gone(&e) || is_incomplete_message(&e),
 			);
 			retry::RetryError::from_retryable(retryable, Error::from(e))
 		})
@@ -386,13 +386,16 @@ async fn execute_request(
 /// 404s, was retried forever at the runners' egest RTT, and the binary never finished. Gateway API
 /// errors instead arrive as HTTP 200 + `{status:false}` JSON, so they never reach this branch.)
 ///
-/// When `status` is `None` the failure is a transport/connection error with no HTTP response:
-/// `dispatch_gone` (a pooled connection whose hyper dispatch task was dropped fails BEFORE the
-/// request is written, so it never reached the server — safe to retry even for non-idempotent
-/// endpoints) is retryable, as is anything that is neither a builder nor a request error. A
-/// builder or request error may have been partially sent, so it stays non-retryable. A connect or
-/// read timeout surfaces as a `Kind::Request` error (`is_request`), so timeouts fall here and are
-/// NOT retried — fail fast rather than spend another full timeout on a stalled host.
+/// When `status` is `None` the failure is a transport/connection error with no HTTP response.
+/// `dispatch_gone` flags a *dead pooled connection* — hyper `DispatchGone` (its dispatch task was
+/// dropped before the request was written) or `IncompleteMessage` (the server closed an idle
+/// keep-alive the SDK then reused): the connection died at the request boundary, so retrying is safe
+/// (the request never reached the server, or is replayable for this SDK's idempotent-by-construction
+/// endpoints). It is retryable, as is anything that is neither a builder nor a request error. A
+/// builder or request error may have been partially sent, so it stays non-retryable — EXCEPT when
+/// `dispatch_gone` already marked it a dead-pool failure. A connect or read timeout also surfaces as
+/// a `Kind::Request` error (`is_request`) but is not a dead-pool failure, so timeouts fall here and
+/// are NOT retried — fail fast rather than spend another full timeout on a stalled host.
 fn is_attempt_retryable(
 	status: Option<reqwest::StatusCode>,
 	is_builder: bool,
@@ -440,6 +443,17 @@ fn is_dispatch_gone(err: &reqwest::Error) -> bool {
 		err,
 		&["dispatch task is gone", "runtime dropped the dispatch task"],
 	)
+}
+
+/// True for hyper's `IncompleteMessage` (Display "connection closed before message completed"): the
+/// server closed an idle pooled keep-alive connection that the SDK then reused for the next request
+/// — the classic stale-pool race. Like [`is_dispatch_gone`] this surfaces as a request-kind error,
+/// but the connection died at the request boundary, so retrying is safe for this SDK's
+/// idempotent-by-construction endpoints (client-generated uuid + server-side name-hash dedup;
+/// content-addressed chunk uploads; idempotent GETs). reqwest does not re-export hyper's
+/// `Error::is_incomplete_message()`, so — like [`is_dispatch_gone`] — we match the stable `Display`.
+fn is_incomplete_message(err: &reqwest::Error) -> bool {
+	error_chain_mentions(err, &["connection closed before message completed"])
 }
 
 #[cfg(test)]
@@ -1095,5 +1109,39 @@ mod client_timeout_tests {
 		let response = client.get(format!("http://{addr}/")).send().await.unwrap();
 		assert!(response.status().is_success());
 		assert_eq!(response.text().await.unwrap(), "ok");
+	}
+
+	/// A pooled keep-alive connection the server has closed surfaces, on reuse, as hyper's
+	/// `IncompleteMessage` ("connection closed before message completed") — reqwest models it as a
+	/// request-kind error (`status()==None`, `is_request()==true`). It is the classic stale-pool race
+	/// and must be RETRYABLE: the request is idempotent-by-construction for this SDK's endpoints
+	/// (client-generated uuid + server name-hash dedup), so a transient connection close must not
+	/// fail the call on the first attempt. Modelled by a server that reads the request then closes
+	/// without responding, which makes the client's response read hit the same IncompleteMessage.
+	#[tokio::test]
+	async fn incomplete_message_is_retryable() {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			// Let the client finish writing the request, then close without any response so the
+			// response read hits EOF -> "connection closed before message completed".
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).await;
+			drop(socket);
+		});
+
+		let client = ClientConfig::default().build_reqwest_client().unwrap();
+		let err = super::execute_request(client.get(format!("http://{addr}/")))
+			.await
+			.expect_err("a connection closed before responding must error");
+
+		match err {
+			super::retry::RetryError::Retry(_) => {}
+			super::retry::RetryError::NoRetry(e) => panic!(
+				"IncompleteMessage (stale-pool connection close) must be classified retryable, \
+				 but was NoRetry: {e}"
+			),
+		}
 	}
 }
