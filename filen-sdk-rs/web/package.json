@@ -8,6 +8,8 @@
 		"test": "npm run build && vitest run --browser.name=chromium && vitest run --browser.name=firefox",
 		"ubrn:ios": "ubrn build ios --and-generate",
 		"ubrn:android": "ubrn build android --and-generate",
+		"ubrn:android:arm": "ubrn build android --and-generate -t arm64-v8a",
+		"ubrn:android:x86": "ubrn build android --and-generate -t x86_64",
 		"ubrn:checkout": "ubrn checkout",
 		"ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release --and-generate"
 	},
