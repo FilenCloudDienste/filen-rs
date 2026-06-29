@@ -111,6 +111,7 @@ impl Client {
 		Ok(writer.into_remote_file().unwrap())
 	}
 
+	#[tracing::instrument(level = "debug", name = "upload_file", skip_all)]
 	pub async fn upload_file_from_reader<'a, T>(
 		&'a self,
 		builder: FileBuilder,
@@ -143,6 +144,7 @@ impl Client {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tracing::instrument(name = "upload_dir_recursively", skip_all, fields(dir_path = %dir_path.display()))]
 	pub async fn upload_dir_recursively<C>(
 		self: Arc<Self>,
 		dir_path: PathBuf,
@@ -398,6 +400,7 @@ where
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[tracing::instrument(level = "debug", name = "download_file", skip_all)]
 pub(crate) async fn inner_download_to_path_with_hash_check<SC>(
 	unauth_client: &SC,
 	remote_file: &dyn File,

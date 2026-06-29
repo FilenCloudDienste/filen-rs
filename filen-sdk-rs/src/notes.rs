@@ -409,6 +409,7 @@ impl Client {
 		}
 	}
 
+	#[tracing::instrument(name = "list_notes", skip_all)]
 	pub async fn list_notes(&self) -> Result<Vec<Note>, Error> {
 		let notes = crate::api::v3::notes::get(self.client()).await?;
 
@@ -596,6 +597,7 @@ impl Client {
 		Ok(new)
 	}
 
+	#[tracing::instrument(name = "get_note_content", skip_all, fields(note_uuid = %note.uuid()))]
 	pub async fn get_note_content(&self, note: &mut Note) -> Result<Option<String>, Error> {
 		let response = api::v3::notes::content::post(
 			self.client(),
@@ -828,6 +830,7 @@ impl Client {
 	}
 
 	/// Get the edit history of a note, sorted by edited timestamp (oldest first).
+	#[tracing::instrument(name = "get_note_history", skip_all, fields(note_uuid = %note.uuid()))]
 	pub async fn get_note_history(&self, note: &Note) -> Result<Vec<NoteHistory>, Error> {
 		let note_key = note
 			.encryption_key
@@ -913,6 +916,7 @@ impl Client {
 		Ok(())
 	}
 
+	#[tracing::instrument(name = "list_note_tags", skip_all)]
 	pub async fn list_note_tags(&self) -> Result<Vec<NoteTag>, Error> {
 		let response = api::v3::notes::tags::post(self.client()).await?;
 		let crypter = self.crypter();

@@ -163,6 +163,7 @@ impl Client {
 		api::v3::search::add::post(self.client(), &api::v3::search::add::Request { items }).await
 	}
 
+	#[tracing::instrument(name = "server_search", skip_all)]
 	pub async fn find_item_matches_for_name(
 		&self,
 		name: &str,

@@ -312,6 +312,9 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 	where
 		C: DirDownloadCallback<Self> + ?Sized,
 	{
+		use tracing::Instrument as _;
+
+		let span = tracing::info_span!("download_dir_recursively", dir_path = %dir_path);
 		async move {
 			use filen_types::traits::CowHelpers;
 
@@ -355,6 +358,7 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 			)
 			.await
 		}
+		.instrument(span)
 	}
 }
 

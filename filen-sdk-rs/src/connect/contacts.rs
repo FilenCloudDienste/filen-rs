@@ -10,6 +10,7 @@ use filen_types::{
 use crate::{api, auth::Client, error::Error};
 
 impl Client {
+	#[tracing::instrument(name = "get_contacts", skip_all)]
 	pub async fn get_contacts(&self) -> Result<Vec<Contact<'static>>, Error> {
 		api::v3::contacts::get(self.client()).await.map(|r| r.0)
 	}

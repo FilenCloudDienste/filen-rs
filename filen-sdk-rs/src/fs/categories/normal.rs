@@ -88,6 +88,7 @@ impl CategoryFS for Normal {
 	}
 }
 
+#[tracing::instrument(name = "list_dir_recursive", skip_all, fields(parent_uuid = %parent_uuid))]
 pub(crate) async fn list_recursive_parent_uuid<F>(
 	client: &Client,
 	parent_uuid: UuidStr,
@@ -153,6 +154,7 @@ where
 	.await
 }
 
+#[tracing::instrument(name = "list_dir_contents", skip_all, fields(parent = %parent_uuid))]
 pub(crate) async fn list_parent_uuid<F>(
 	client: &Client,
 	parent_uuid: ParentUuid,

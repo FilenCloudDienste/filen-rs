@@ -430,6 +430,7 @@ impl Client {
 			.await
 	}
 
+	#[tracing::instrument(name = "list_messages", skip_all, fields(chat_uuid = %chat.uuid()))]
 	pub async fn list_messages_before(
 		&self,
 		chat: &Chat,
@@ -482,6 +483,7 @@ impl Client {
 		Ok(messages)
 	}
 
+	#[tracing::instrument(name = "list_chats", skip_all)]
 	pub async fn list_chats(&self) -> Result<Vec<Chat>, Error> {
 		let resp = api::v3::chat::conversations::get(self.client()).await?;
 
