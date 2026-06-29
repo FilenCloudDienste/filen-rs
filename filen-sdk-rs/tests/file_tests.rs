@@ -763,14 +763,25 @@ mod http_provider_tests {
 		let port = handle.port();
 		drop(handle);
 
-		// Give the graceful-shutdown a moment to complete.
-		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-		let result = reqwest::get(format!("http://127.0.0.1:{port}/file?file=x")).await;
+		// Graceful shutdown is not instantaneous, and under load it can take well over any fixed
+		// sleep, so poll for the actual condition — the port refusing connections — rather than
+		// asserting after a single deadline (which made this test flaky under heavy load).
+		let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+			loop {
+				if reqwest::get(format!("http://127.0.0.1:{port}/file?file=x"))
+					.await
+					.is_err()
+				{
+					return true;
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			}
+		})
+		.await
+		.unwrap_or(false);
 		assert!(
-			result.is_err(),
-			"connection to stopped provider should fail, got: {:?}",
-			result
+			stopped,
+			"provider must refuse new connections after its last handle is dropped"
 		);
 	}
 

@@ -478,9 +478,14 @@ fn is_dispatch_gone(err: &reqwest::Error) -> bool {
 /// True for hyper's `IncompleteMessage` (Display "connection closed before message completed"): the
 /// server closed an idle pooled keep-alive connection that the SDK then reused for the next request
 /// — the classic stale-pool race. Like [`is_dispatch_gone`] this surfaces as a request-kind error,
-/// but the connection died at the request boundary, so retrying is safe for this SDK's
-/// idempotent-by-construction endpoints (client-generated uuid + server-side name-hash dedup;
-/// content-addressed chunk uploads; idempotent GETs). reqwest does not re-export hyper's
+/// but UNLIKE `DispatchGone` (which fails provably *before* the request is written) `IncompleteMessage`
+/// surfaces when the *response* read hits EOF, so the server may already have received and processed
+/// the request — receipt is genuinely ambiguous (hyperium/hyper#2136). Retrying is nonetheless safe
+/// because every endpoint reached through [`execute_request`] is idempotent-by-construction: the
+/// serialize layer sits *outside* the retry layer, so a retry replays byte-identical bytes
+/// (client-generated uuid + server-side name-hash dedup; content-addressed chunk uploads; idempotent
+/// GETs). A future endpoint whose identical-byte replay is not a no-op must carry a client
+/// idempotency key before relying on this. reqwest does not re-export hyper's
 /// `Error::is_incomplete_message()`, so — like [`is_dispatch_gone`] — we match the stable `Display`.
 fn is_incomplete_message(err: &reqwest::Error) -> bool {
 	error_chain_mentions(err, &["connection closed before message completed"])
@@ -1154,10 +1159,24 @@ mod client_timeout_tests {
 		let addr = listener.local_addr().unwrap();
 		tokio::spawn(async move {
 			let (mut socket, _) = listener.accept().await.unwrap();
-			// Let the client finish writing the request, then close without any response so the
-			// response read hits EOF -> "connection closed before message completed".
-			let mut buf = [0u8; 1024];
-			let _ = socket.read(&mut buf).await;
+			// Read the FULL request (until the header terminator) so the client has finished writing
+			// before we close — otherwise a request split across TCP segments could fail on the
+			// write side (a reset, not IncompleteMessage) and flake. Then close without responding so
+			// the response read hits EOF -> "connection closed before message completed".
+			let mut buf = Vec::new();
+			let mut chunk = [0u8; 256];
+			loop {
+				match socket.read(&mut chunk).await {
+					Ok(0) => break,
+					Ok(n) => {
+						buf.extend_from_slice(&chunk[..n]);
+						if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+							break;
+						}
+					}
+					Err(_) => break,
+				}
+			}
 			drop(socket);
 		});
 

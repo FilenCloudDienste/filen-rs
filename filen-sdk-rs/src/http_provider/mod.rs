@@ -72,15 +72,24 @@ fn idle_timeout_error() -> io::Error {
 
 /// Wraps a connection's IO with an **idle** timeout covering both directions.
 ///
-/// Two ways a connection can hang and leak the streaming reader (and the memory budget) it owns:
-/// the peer stops reading, so the send buffer fills and `poll_write` parks `Pending` forever; or
-/// the peer connects but never sends a complete request, so `poll_read` parks `Pending` forever.
-/// hyper drops neither on its own. This wrapper shares one timer across reads and writes: it arms
-/// on the first stalled poll and fails the IO with [`io::ErrorKind::TimedOut`] once `timeout`
-/// elapses with no progress in *either* direction, tearing the connection down so the reader is
-/// dropped and its budget reclaimed. Any successful read or write resets the timer, so a
-/// slow-but-progressing client is never penalised — and a long download (writes progressing while
-/// the read side is legitimately idle) keeps the timer reset via its writes.
+/// It shares one timer across reads and writes: it arms on the first stalled poll and fails the IO
+/// with [`io::ErrorKind::TimedOut`] once `timeout` elapses with no progress in *either* direction,
+/// tearing the connection down so the streaming reader (and the memory budget) it owns is dropped.
+/// Any successful read or write resets the timer, so a slow-but-progressing client is never
+/// penalised — and a long download (writes progressing while the read side is legitimately idle)
+/// keeps the timer reset via its writes.
+///
+/// Reliably reaped: a peer that stops reading, so the send buffer fills and `poll_write` parks
+/// `Pending` forever (the budget-leak path this was built for); a peer that connects and sends
+/// nothing, since the pre-dispatch protocol sniff polls only `poll_read`; and a connection that
+/// finishes a request then idles in keep-alive (its read side parks with nothing else polled).
+///
+/// NOT reaped — a peer that sends a *partial* request then stalls mid-headers: once hyper's h1
+/// dispatcher is active it polls `poll_flush` every loop, and an empty-buffer flush succeeds
+/// (`Ready`) and resets the shared timer, so the read side never accumulates idle time (hyper has no
+/// header-read timer installed here to cover it either). Acceptable: such a connection pins no
+/// reader or budget (the handler has not run) and the provider is localhost-only. Do not "fix" this
+/// by dropping the empty-flush reset — that same reset is what keeps a long-TTFB download alive.
 struct IdleTimeout<S> {
 	inner: S,
 	timeout: Duration,
