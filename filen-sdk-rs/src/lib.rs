@@ -31,6 +31,7 @@ pub mod io;
 pub mod js;
 pub mod notes;
 pub mod obs;
+pub(crate) mod progress;
 pub mod runtime;
 pub mod search;
 pub(crate) mod serde;

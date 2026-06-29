@@ -22,9 +22,10 @@ use crate::{
 	},
 	error::Error,
 	fs::{categories::NonRootItemType, file::chunk::Chunk},
+	progress::ThrottledProgress,
 	runtime::{blocking_join, do_cpu_intensive},
 	sync::lock::ResourceLock,
-	util::{MaybeSend, MaybeSendBoxFuture, MaybeSendCallback},
+	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendCallback},
 };
 
 use super::{BaseFile, RemoteFile, meta::DecryptedFileMeta};
@@ -62,7 +63,7 @@ where
 	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
 {
 	file: Arc<BaseFile>,
-	callback: Option<MaybeSendCallback<'a, u64>>,
+	progress: Option<MaybeArc<ThrottledProgress<'a>>>,
 	futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<Chunk<'a>, Error>>>,
 	alloc_future: Option<MaybeSendBoxFuture<'a, Chunk<'a>>>,
 	confirm_upload_callback: Option<F>,
@@ -151,7 +152,7 @@ where
 		let client = self.client;
 		let file = self.file.clone();
 		let upload_key = self.upload_key.clone();
-		let callback = self.callback.clone();
+		let progress = self.progress.clone();
 		self.hasher.update_rayon(out_data.as_ref());
 		let remote_file_info = self.remote_file_info.clone();
 		self.futures.push(Box::pin(async move {
@@ -161,7 +162,10 @@ where
 				len <= CHUNK_SIZE_U64,
 				"Chunk size exceeded {CHUNK_SIZE_U64}: {len}"
 			);
-			file.key().blocking_encrypt_data(out_data.as_mut())?;
+			{
+				let _span = tracing::debug_span!("upload_encrypt_chunk", chunk_idx, len).entered();
+				file.key().blocking_encrypt_data(out_data.as_mut())?;
+			}
 
 			// upload the data
 			let (chunk_bytes, permit) = out_data.into_parts();
@@ -175,8 +179,8 @@ where
 				chunk_bytes.clone(),
 			)
 			.await?;
-			if let Some(callback) = callback {
-				callback(len);
+			if let Some(progress) = progress {
+				progress.report(len);
 			}
 			// don't care if this errors because that means another thread set it
 			let _ = remote_file_info.set(RemoteFileInfo {
@@ -348,6 +352,12 @@ where
 					return std::task::Poll::Pending;
 				}
 			}
+		}
+
+		// All chunks are uploaded — deliver any bytes the throttle was still holding back so the
+		// final progress update isn't dropped. Idempotent, so a re-poll after this point is safe.
+		if let Some(progress) = &self.progress {
+			progress.flush();
 		}
 
 		// Then finalize EXIF (if active) so its result is applied to final_times
@@ -632,7 +642,7 @@ where
 	) -> Self {
 		FileWriterState::Uploading(FileWriterUploadingState {
 			file,
-			callback,
+			progress: ThrottledProgress::new(callback),
 			futures: FuturesUnordered::new(),
 			curr_chunk: None,
 			next_chunk_idx: 0,
