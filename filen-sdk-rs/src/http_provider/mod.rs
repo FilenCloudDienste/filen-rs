@@ -826,4 +826,107 @@ mod tests {
 		let _ = cancel_tx.send(());
 		let _ = server.await;
 	}
+
+	/// The reclaim guarantee at the heart of the fix: closing an abandoned stream must DROP the
+	/// response body — and with it whatever budget the streaming reader was holding. A
+	/// [`FileReader`](crate::fs::file::read::FileReader) serving a range holds `Chunk::acquire`
+	/// permits from the shared `memory_semaphore` for its whole lifetime; the original bug was that
+	/// an abandoned connection never dropped that reader, so the permits (the ~96 MiB budget) were
+	/// never returned and every later download blocked forever on `Chunk::acquire`. Here the budget
+	/// is modelled by a [`tokio::sync::Semaphore`] (the same primitive) whose permit the response
+	/// body holds; the test asserts the write-idle timeout reclaims it. Without the timeout firing
+	/// the permit would stay pinned forever — which is exactly the leak this fix closes.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn write_idle_timeout_reclaims_the_budget_held_by_an_abandoned_stream() {
+		use std::sync::Arc;
+		use std::time::Duration;
+		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+		use tokio::sync::Semaphore;
+
+		// The shared per-client memory budget, modelled with a single permit.
+		let budget = Arc::new(Semaphore::new(1));
+
+		let handler_budget = budget.clone();
+		// Each response acquires the budget permit and moves it into its (infinite) body stream,
+		// so the permit lives exactly as long as the body — like a FileReader holding Chunk
+		// permits while it serves a range — and is released only when the body is dropped.
+		let handler = move || {
+			let budget = handler_budget.clone();
+			async move {
+				let permit = budget.acquire_owned().await.unwrap();
+				let stream = async_stream::stream! {
+					let _permit = permit;
+					loop {
+						yield Ok::<_, std::io::Error>(vec![0u8; 256 * 1024]);
+					}
+				};
+				axum::response::Response::new(axum::body::Body::from_stream(stream))
+			}
+		};
+
+		let router = axum::Router::new().route("/", axum::routing::get(handler));
+		let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+			.await
+			.unwrap();
+		let port = tcp.local_addr().unwrap().port();
+		let listener = super::TimeoutListener {
+			inner: tcp,
+			write_idle_timeout: Duration::from_millis(500),
+		};
+		let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+		let server = tokio::spawn(async move {
+			axum::serve(listener, router)
+				.with_graceful_shutdown(async {
+					let _ = cancel_rx.await;
+				})
+				.await
+				.unwrap();
+		});
+
+		let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		sock.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+			.await
+			.unwrap();
+		// Read just the head so the handler runs and the body takes the budget permit, then stop
+		// reading: the server's writes stall against the full socket buffer.
+		let mut head = [0u8; 1024];
+		let _ = sock.read(&mut head).await.unwrap();
+
+		let acquired = tokio::time::timeout(Duration::from_secs(2), async {
+			loop {
+				if budget.available_permits() == 0 {
+					return true;
+				}
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.unwrap_or(false);
+		assert!(
+			acquired,
+			"the streaming body must hold the budget permit while it is serving"
+		);
+
+		// After the 500 ms write-idle timeout fires, the connection — and the body it owns — is
+		// dropped, releasing the permit. The original leak would leave it pinned at 0 forever.
+		let reclaimed = tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				if budget.available_permits() == 1 {
+					return true;
+				}
+				tokio::time::sleep(Duration::from_millis(25)).await;
+			}
+		})
+		.await
+		.unwrap_or(false);
+		assert!(
+			reclaimed,
+			"write-idle timeout must drop the abandoned stream's body and reclaim its budget"
+		);
+
+		let _ = cancel_tx.send(());
+		let _ = server.await;
+	}
 }
