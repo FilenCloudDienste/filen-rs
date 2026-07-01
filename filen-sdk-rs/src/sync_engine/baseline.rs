@@ -197,6 +197,9 @@ impl BaselineStore {
 			.optional()
 	}
 
+	// Pair-management API completed by the store and exercised by its unit tests; not yet called by
+	// the engine, which currently registers pairs but never lists/removes them.
+	#[allow(dead_code)]
 	pub(crate) fn list_pairs(&self) -> rusqlite::Result<Vec<PairRecord>> {
 		self.conn
 			.prepare("SELECT id, local_root, remote_root, mode FROM sync_pairs ORDER BY id")?
@@ -204,6 +207,7 @@ impl BaselineStore {
 			.collect()
 	}
 
+	#[allow(dead_code)]
 	pub(crate) fn delete_pair(&self, id: PairId) -> rusqlite::Result<()> {
 		// The `ON DELETE CASCADE` (with `foreign_keys = ON`) drops the pair's baseline rows.
 		self.conn
@@ -243,6 +247,9 @@ impl BaselineStore {
 		Ok(())
 	}
 
+	// Single-row lookup; the engine reads whole-pair snapshots via `entries`, but the point lookup
+	// is part of the store's query surface and is exercised by the unit tests.
+	#[allow(dead_code)]
 	pub(crate) fn entry(
 		&self,
 		pair: PairId,

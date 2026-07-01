@@ -48,6 +48,8 @@ impl SyncMode {
 	}
 
 	/// Whether a true both-sides-changed conflict can arise (only bidirectional sync).
+	// Companion predicate to `pushes`/`pulls`/`propagates_deletes`; exercised by the mode unit tests.
+	#[allow(dead_code)]
 	pub(crate) fn can_conflict(self) -> bool {
 		matches!(self, Self::TwoWay)
 	}
