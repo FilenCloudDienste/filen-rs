@@ -42,6 +42,8 @@ impl Default for DeleteGuard {
 impl DeleteGuard {
 	/// A guard that never trips on volume (a power-user opt-out); the scan-incomplete precondition
 	/// still applies.
+	// Exercised by the guard unit tests; retained as the "disable the volume floor" API surface.
+	#[allow(dead_code)]
 	pub(crate) fn unlimited() -> Self {
 		Self {
 			floor: usize::MAX,
