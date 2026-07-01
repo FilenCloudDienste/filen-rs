@@ -43,6 +43,9 @@ pub(crate) struct LocalNode {
 
 /// What went wrong for one entry during a scan. Non-fatal individually (collected), but any error
 /// marks the whole scan [`incomplete`](LocalScan::complete).
+// Variant fields are diagnostic context surfaced through `Debug` (the errors are collected and
+// logged), not read directly — kept for observability rather than deleted.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum ScanError {
 	/// An entry could not be read (permission, vanished mid-walk, hash failure, a symlink loop).

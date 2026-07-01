@@ -52,6 +52,9 @@ struct Prepared {
 }
 
 /// The outcome of `plan_pair` (a dry run).
+// Constructed by the (currently unwired) `plan_pair` preview API; its fields are surfaced via
+// `Debug` for a caller that consumes the preview, not read internally.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum PlanOutcome {
 	Refused(RefuseReason),
@@ -164,6 +167,9 @@ impl SyncEngine {
 	}
 
 	/// Reconcile + guard-screen a pass without applying it (a dry run).
+	// Dry-run preview API (returns the plan/refusal without touching either side); not yet wired to
+	// a caller but kept as the intended preview surface. `PlanOutcome` is constructed here.
+	#[allow(dead_code)]
 	pub(crate) async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
 		let prep = self.prepare(pair).await?;
 		if let Some(refusal) = refusal(&prep) {
