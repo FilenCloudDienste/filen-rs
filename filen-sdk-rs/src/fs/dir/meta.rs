@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	crypto::{self, shared::MetaCrypter},
 	error::{Error, MetadataWasNotDecryptedError},
-	fs::name::{EntryNameError, ValidatedName},
+	fs::{
+		meta_recovery,
+		name::{EntryNameError, ValidatedName},
+	},
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, CowHelpers)]
@@ -51,7 +54,13 @@ impl<'a> DirectoryMeta<'a> {
 		let Ok(meta) = serde_json::from_slice::<DecryptedDirectoryMeta>(decrypted.as_ref()) else {
 			match String::from_utf8(decrypted) {
 				Ok(decrypted) => return Self::DecryptedUTF8(Cow::Owned(decrypted)),
-				Err(err) => return Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
+				Err(err) => {
+					let latin1 = meta_recovery::latin1_to_string(err.as_bytes());
+					return match serde_json::from_str::<DecryptedDirectoryMeta>(&latin1) {
+						Ok(meta) => Self::Decoded(meta.into_owned_cow()),
+						Err(_) => Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
+					};
+				}
 			}
 		};
 		Self::Decoded(meta.into_owned_cow())
@@ -225,5 +234,33 @@ impl DirectoryMetaChanges {
 	pub fn created(mut self, created: Option<DateTime<Utc>>) -> Self {
 		self.created = Some(created.map(|t| t.round_subsecs(3)));
 		self
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::fs::meta_recovery::test_support::{TEST_RSA_KEY, latin1_bytes, rsa_encrypt};
+
+	#[test]
+	fn rsa_metadata_valid_utf8_decodes() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(r#"{"name":"Résumé"}"#.as_bytes()),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some("Résumé"));
+	}
+
+	// The TS SDK's react-native sharer path RSA-encrypts metadata without
+	// UTF-8-encoding it first, so names containing U+0080..=U+00FF arrive as
+	// Latin-1. The original name must be recovered, not discarded.
+	#[test]
+	fn rsa_metadata_latin1_recovers_original_name() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(&latin1_bytes(r#"{"name":"Résumé"}"#)),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some("Résumé"));
+		assert_eq!(meta.created(), None);
 	}
 }

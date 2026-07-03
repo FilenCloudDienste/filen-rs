@@ -24,6 +24,7 @@ use crate::{
 	error::{Error, InvalidNameError, MetadataWasNotDecryptedError},
 	fs::{
 		file::make_mime,
+		meta_recovery,
 		name::{EntryNameError, ValidatedName},
 	},
 };
@@ -144,7 +145,15 @@ impl<'a> FileMeta<'a> {
 		else {
 			match String::from_utf8(decrypted) {
 				Ok(decrypted) => return Self::DecryptedUTF8(Cow::Owned(decrypted)),
-				Err(err) => return Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
+				Err(err) => {
+					let latin1 = meta_recovery::latin1_to_string(err.as_bytes());
+					let seed = FileMetaSeed(file_encryption_version);
+					return match seed.deserialize(&mut serde_json::Deserializer::from_str(&latin1))
+					{
+						Ok(meta) => Self::Decoded(meta.into_owned_cow()),
+						Err(_) => Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
+					};
+				}
 			}
 		};
 		Self::Decoded(meta.into_owned_cow())
@@ -192,6 +201,37 @@ impl<'a> FileMeta<'a> {
 	get_value_from_decrypted!(key, &FileKey);
 	get_value_from_decrypted_optional!(created, Option<DateTime<Utc>>);
 	get_value_from_decrypted_optional!(hash, Option<Blake3Hash>);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::fs::meta_recovery::test_support::{TEST_RSA_KEY, latin1_bytes, rsa_encrypt};
+
+	const FILE_META_JSON: &str = r#"{"name":"Résumé.txt","size":3,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1719000000000}"#;
+
+	#[test]
+	fn rsa_file_metadata_valid_utf8_decodes() {
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(FILE_META_JSON.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), Some("Résumé.txt"));
+	}
+
+	// Same TS react-native sharer bug as the directory twin: the plaintext
+	// arrives Latin-1-encoded instead of UTF-8.
+	#[test]
+	fn rsa_file_metadata_latin1_recovers_original_name() {
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(&latin1_bytes(FILE_META_JSON)),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), Some("Résumé.txt"));
+		assert_eq!(meta.mime(), Some("text/plain"));
+	}
 }
 
 #[derive(
