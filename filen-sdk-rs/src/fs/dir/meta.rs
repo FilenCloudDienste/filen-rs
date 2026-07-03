@@ -38,6 +38,9 @@ impl<'a> DirectoryMeta<'a> {
 			return Self::Encrypted(encrypted);
 		};
 		let Ok(meta) = serde_json::from_str::<DecryptedDirectoryMeta>(&decrypted) else {
+			if let Some(meta) = Self::retry_with_sanitized_surrogates(&decrypted) {
+				return meta;
+			}
 			return Self::DecryptedUTF8(Cow::Owned(decrypted));
 		};
 		Self::Decoded(meta.into_owned_cow())
@@ -53,17 +56,32 @@ impl<'a> DirectoryMeta<'a> {
 		};
 		let Ok(meta) = serde_json::from_slice::<DecryptedDirectoryMeta>(decrypted.as_ref()) else {
 			match String::from_utf8(decrypted) {
-				Ok(decrypted) => return Self::DecryptedUTF8(Cow::Owned(decrypted)),
+				Ok(decrypted) => {
+					if let Some(meta) = Self::retry_with_sanitized_surrogates(&decrypted) {
+						return meta;
+					}
+					return Self::DecryptedUTF8(Cow::Owned(decrypted));
+				}
 				Err(err) => {
 					let latin1 = meta_recovery::latin1_to_string(err.as_bytes());
 					return match serde_json::from_str::<DecryptedDirectoryMeta>(&latin1) {
 						Ok(meta) => Self::Decoded(meta.into_owned_cow()),
-						Err(_) => Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
+						Err(_) => Self::retry_with_sanitized_surrogates(&latin1)
+							.unwrap_or_else(|| Self::DecryptedRaw(Cow::Owned(err.into_bytes()))),
 					};
 				}
 			}
 		};
 		Self::Decoded(meta.into_owned_cow())
+	}
+
+	/// Retries a failed metadata JSON parse after replacing unpaired UTF-16
+	/// surrogate escapes, which JS clients emit for malformed names and
+	/// serde_json rejects.
+	fn retry_with_sanitized_surrogates(json: &str) -> Option<DirectoryMeta<'static>> {
+		let sanitized = meta_recovery::replace_unpaired_surrogate_escapes(json)?;
+		let meta = serde_json::from_str::<DecryptedDirectoryMeta>(&sanitized).ok()?;
+		Some(DirectoryMeta::Decoded(meta.into_owned_cow()))
 	}
 }
 
@@ -262,5 +280,54 @@ mod tests {
 		);
 		assert_eq!(meta.name(), Some("Résumé"));
 		assert_eq!(meta.created(), None);
+	}
+
+	#[test]
+	fn rsa_metadata_multibyte_name_decodes() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(r#"{"name":"😀"}"#.as_bytes()),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some("😀"));
+	}
+
+	#[test]
+	fn rsa_metadata_paired_surrogate_escape_decodes() {
+		let json = format!(r#"{{"name":"{}"}}"#, "\\ud83d\\ude00");
+		let meta =
+			DirectoryMeta::blocking_from_rsa_encrypted(rsa_encrypt(json.as_bytes()), &TEST_RSA_KEY);
+		assert_eq!(meta.name(), Some("😀"));
+	}
+
+	// JS clients JSON.stringify names containing unpaired UTF-16 surrogates
+	// (legal in Windows filenames) as \udXXX escapes, which JSON.parse accepts
+	// but serde_json rejects. TS recipients effectively render U+FFFD, so the
+	// name must survive with a replacement char instead of being discarded.
+	#[test]
+	fn rsa_metadata_lone_surrogate_escape_decodes_with_replacement() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(br#"{"name":"a\ud800b"}"#),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some("a\u{FFFD}b"));
+	}
+
+	// A literal backslash-u sequence in the name (escaped backslash in JSON)
+	// is not a surrogate escape and must be preserved verbatim.
+	#[test]
+	fn rsa_metadata_escaped_backslash_u_sequence_is_preserved() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(br#"{"name":"a\\ud800b"}"#),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some(r"a\ud800b"));
+	}
+
+	#[test]
+	fn aes_metadata_lone_surrogate_escape_decodes_with_replacement() {
+		let key = crate::crypto::v3::EncryptionKey::new([0x77u8; 32]);
+		let encrypted = key.blocking_encrypt_meta(r#"{"name":"a\ud800b"}"#);
+		let meta = DirectoryMeta::blocking_from_encrypted(encrypted, &key);
+		assert_eq!(meta.name(), Some("a\u{FFFD}b"));
 	}
 }

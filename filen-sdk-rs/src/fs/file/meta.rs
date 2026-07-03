@@ -126,6 +126,11 @@ impl<'a> FileMeta<'a> {
 		};
 		let seed = FileMetaSeed(file_encryption_version);
 		let Ok(meta) = seed.deserialize(&mut serde_json::Deserializer::from_str(&decrypted)) else {
+			if let Some(meta) =
+				Self::retry_with_sanitized_surrogates(&decrypted, file_encryption_version)
+			{
+				return meta;
+			}
 			return Self::DecryptedUTF8(Cow::Owned(decrypted));
 		};
 		Self::Decoded(meta.into_owned_cow())
@@ -144,19 +149,43 @@ impl<'a> FileMeta<'a> {
 		let Ok(meta) = seed.deserialize(&mut serde_json::Deserializer::from_slice(&decrypted))
 		else {
 			match String::from_utf8(decrypted) {
-				Ok(decrypted) => return Self::DecryptedUTF8(Cow::Owned(decrypted)),
+				Ok(decrypted) => {
+					if let Some(meta) =
+						Self::retry_with_sanitized_surrogates(&decrypted, file_encryption_version)
+					{
+						return meta;
+					}
+					return Self::DecryptedUTF8(Cow::Owned(decrypted));
+				}
 				Err(err) => {
 					let latin1 = meta_recovery::latin1_to_string(err.as_bytes());
 					let seed = FileMetaSeed(file_encryption_version);
 					return match seed.deserialize(&mut serde_json::Deserializer::from_str(&latin1))
 					{
 						Ok(meta) => Self::Decoded(meta.into_owned_cow()),
-						Err(_) => Self::DecryptedRaw(Cow::Owned(err.into_bytes())),
+						Err(_) => {
+							Self::retry_with_sanitized_surrogates(&latin1, file_encryption_version)
+								.unwrap_or_else(|| Self::DecryptedRaw(Cow::Owned(err.into_bytes())))
+						}
 					};
 				}
 			}
 		};
 		Self::Decoded(meta.into_owned_cow())
+	}
+
+	/// Retries a failed metadata JSON parse after replacing unpaired UTF-16
+	/// surrogate escapes, which JS clients emit for malformed names and
+	/// serde_json rejects.
+	fn retry_with_sanitized_surrogates(
+		json: &str,
+		file_encryption_version: FileEncryptionVersion,
+	) -> Option<FileMeta<'static>> {
+		let sanitized = meta_recovery::replace_unpaired_surrogate_escapes(json)?;
+		let meta = FileMetaSeed(file_encryption_version)
+			.deserialize(&mut serde_json::Deserializer::from_str(&sanitized))
+			.ok()?;
+		Some(FileMeta::Decoded(meta.into_owned_cow()))
 	}
 }
 
@@ -231,6 +260,20 @@ mod tests {
 		);
 		assert_eq!(meta.name(), Some("Résumé.txt"));
 		assert_eq!(meta.mime(), Some("text/plain"));
+	}
+
+	// Same JS lone-surrogate JSON.stringify output as the directory twin:
+	// serde_json rejects the \udXXX escape, so it must be replaced with
+	// U+FFFD rather than discarding the whole metadata.
+	#[test]
+	fn rsa_file_metadata_lone_surrogate_escape_decodes_with_replacement() {
+		let json = r#"{"name":"a\ud800b.txt","size":3,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1719000000000}"#;
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(json.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), Some("a\u{FFFD}b.txt"));
 	}
 }
 
