@@ -151,10 +151,11 @@ pub(crate) mod test_support {
 
 	use crate::crypto::rsa::blocking_encrypt_with_public_key;
 
-	/// Shared across test modules because RSA key generation is slow in debug
-	/// builds; OAEP-SHA512 needs at least a 2048-bit modulus.
+	/// Shared across test modules because RSA key generation is slow.
+	/// 4096 bits matches production Filen account keys and gives OAEP-SHA512
+	/// a 382-byte plaintext budget for realistic metadata payloads.
 	pub(crate) static TEST_RSA_KEY: LazyLock<RsaPrivateKey> = LazyLock::new(|| {
-		RsaPrivateKey::new(&mut old_rng::thread_rng(), 2048)
+		RsaPrivateKey::new(&mut old_rng::thread_rng(), 4096)
 			.expect("failed to generate test RSA key")
 	});
 

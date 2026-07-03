@@ -89,7 +89,8 @@ impl<'a> DirectoryMeta<'a> {
 	pub fn try_to_string(&'a self) -> Option<Cow<'a, str>> {
 		match self {
 			// SAFETY: serializing a DecryptedDirectoryMeta always succeeds
-			// - filen_types::serde::time::optional::serialize cannot fail
+			// - filen_types::serde::time::truncating_seconds_or_millis_opt::serialize
+			//   (which delegates to time::optional::serialize) cannot fail
 			// - serializing a String cannot fail
 			// - serde_json::to_string always suceeds if we have string keys and serialization cannot fail
 			Self::Decoded(meta) => Some(Cow::Owned(meta.to_json_string())),
@@ -176,7 +177,7 @@ pub struct DecryptedDirectoryMeta<'a> {
 	#[rkyv(with = AsOwned)]
 	pub name: Cow<'a, str>,
 	#[serde(
-		with = "filen_types::serde::time::optional",
+		with = "filen_types::serde::time::truncating_seconds_or_millis_opt",
 		rename = "creation",
 		default
 	)]
@@ -215,7 +216,8 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 
 	pub(crate) fn to_json_string(&self) -> String {
 		// SAFETY: serializing a DecryptedDirectoryMeta always succeeds
-		// - filen_types::serde::time::optional::serialize cannot fail
+		// - filen_types::serde::time::truncating_seconds_or_millis_opt::serialize
+		//   (which delegates to time::optional::serialize) cannot fail
 		// - serializing a String cannot fail
 		// - serde_json::to_string always suceeds if we have string keys and serialization cannot fail
 		serde_json::to_string(self)
@@ -329,5 +331,59 @@ mod tests {
 		let encrypted = key.blocking_encrypt_meta(r#"{"name":"a\ud800b"}"#);
 		let meta = DirectoryMeta::blocking_from_encrypted(encrypted, &key);
 		assert_eq!(meta.name(), Some("a\u{FFFD}b"));
+	}
+
+	// A creation timestamp written as a float or numeric string by another
+	// client must not destroy the folder name; TS never even reads creation
+	// for folders.
+	#[test]
+	fn rsa_metadata_float_creation_decodes() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(br#"{"name":"d","creation":1718999999999.4321}"#),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some("d"));
+		assert_eq!(
+			meta.created(),
+			DateTime::<Utc>::from_timestamp_millis(1718999999999)
+		);
+	}
+
+	// Only floats (cast) and numeric strings (converted) are tolerated; a
+	// non-numeric creation keeps failing the parse so bad data is not
+	// silently accepted as valid.
+	#[test]
+	fn rsa_metadata_non_numeric_creation_fails_to_decode() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(br#"{"name":"d","creation":"soon"}"#),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), None);
+		assert!(matches!(meta, DirectoryMeta::DecryptedUTF8(_)));
+	}
+
+	#[test]
+	fn rsa_metadata_numeric_string_creation_decodes() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(br#"{"name":"d","creation":"1718999999999"}"#),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some("d"));
+		assert_eq!(
+			meta.created(),
+			DateTime::<Utc>::from_timestamp_millis(1718999999999)
+		);
+	}
+
+	// null for an OPTIONAL timestamp is a legitimate "no value", matching the
+	// strict time::optional semantics — not a lossy fallback.
+	#[test]
+	fn rsa_metadata_null_creation_decodes_as_none() {
+		let meta = DirectoryMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(br#"{"name":"d","creation":null}"#),
+			&TEST_RSA_KEY,
+		);
+		assert_eq!(meta.name(), Some("d"));
+		assert_eq!(meta.created(), None);
 	}
 }

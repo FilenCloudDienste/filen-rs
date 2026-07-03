@@ -36,6 +36,153 @@ pub mod optional {
 	}
 }
 
+/// `serde(default)` helper for timestamps in decrypted metadata.
+pub fn unix_epoch() -> chrono::DateTime<chrono::Utc> {
+	chrono::DateTime::UNIX_EPOCH
+}
+
+/// Timestamp deserialization for DECRYPTED metadata, where other clients
+/// write floats (e.g. a raw JS `mtimeMs`) or numeric strings. Floats are the
+/// only lossy case: they are cast to millis (truncating, saturating at the
+/// i64 bounds). Numeric strings convert to an integer or float first and then
+/// follow the same rules. Every other type (null, bool, non-numeric string,
+/// object, array) fails like the strict [`seconds_or_millis`], which wire API
+/// types must keep using. Serialization stays strict integer millis.
+pub mod truncating_seconds_or_millis {
+	use chrono::{DateTime, Utc};
+	use serde::{Deserializer, Serializer, de::Error};
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		super::truncating_visitor::deserialize_opt(deserializer)?
+			.ok_or_else(|| D::Error::custom("timestamp out of representable range"))
+	}
+
+	pub fn serialize<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		super::seconds_or_millis::serialize(value, serializer)
+	}
+}
+
+/// Optional twin of [`truncating_seconds_or_millis`]. Like the strict
+/// [`optional`], null means `None` and an unrepresentable numeric timestamp
+/// degrades to `None`; wrong types still fail.
+pub mod truncating_seconds_or_millis_opt {
+	use chrono::{DateTime, Utc};
+	use serde::{Deserializer, de::Visitor};
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		struct OptionalVisitor;
+
+		impl<'de> Visitor<'de> for OptionalVisitor {
+			type Value = Option<DateTime<Utc>>;
+
+			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+				formatter
+					.write_str("a unix timestamp as an integer, float or numeric string, or null")
+			}
+
+			fn visit_none<E>(self) -> Result<Self::Value, E> {
+				Ok(None)
+			}
+
+			fn visit_unit<E>(self) -> Result<Self::Value, E> {
+				Ok(None)
+			}
+
+			fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+			where
+				D: Deserializer<'de>,
+			{
+				super::truncating_visitor::deserialize_opt(deserializer)
+			}
+		}
+
+		deserializer.deserialize_option(OptionalVisitor)
+	}
+
+	pub fn serialize<S>(value: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		super::optional::serialize(value, serializer)
+	}
+}
+
+mod truncating_visitor {
+	use chrono::{DateTime, Utc};
+	use serde::{
+		Deserializer,
+		de::{Error, Visitor},
+	};
+
+	use super::seconds_or_millis::from_seconds_or_millis;
+
+	/// `Ok(None)` means a valid numeric input whose timestamp is not
+	/// representable (mirroring how the strict [`super::optional`] flattens
+	/// those to `None`); wrong types are errors.
+	pub(super) fn deserialize_opt<'de, D>(
+		deserializer: D,
+	) -> Result<Option<DateTime<Utc>>, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		struct TruncatingTimestampVisitor;
+
+		impl<'de> Visitor<'de> for TruncatingTimestampVisitor {
+			type Value = Option<DateTime<Utc>>;
+
+			fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+				formatter.write_str(
+					"a unix timestamp in seconds or milliseconds as an integer, float or numeric string",
+				)
+			}
+
+			fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+				Ok(from_seconds_or_millis(v))
+			}
+
+			fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+			where
+				E: Error,
+			{
+				i64::try_from(v)
+					.map_err(|_| E::custom(format!("timestamp {v} does not fit in an i64")))
+					.map(from_seconds_or_millis)
+			}
+
+			// the only lossy case: cast, truncating and saturating at the
+			// i64 bounds
+			fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+				Ok(from_seconds_or_millis(v as i64))
+			}
+
+			fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+			where
+				E: Error,
+			{
+				let v = v.trim();
+				if let Ok(i) = v.parse::<i64>() {
+					return self.visit_i64(i);
+				}
+				if let Ok(f) = v.parse::<f64>() {
+					return self.visit_f64(f);
+				}
+				Err(E::custom(format!("non-numeric timestamp string: {v:?}")))
+			}
+		}
+
+		deserializer.deserialize_any(TruncatingTimestampVisitor)
+	}
+}
+
 pub mod seconds_or_millis {
 	use chrono::{DateTime, Utc};
 	use serde::{Deserialize, Deserializer, Serializer};

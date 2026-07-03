@@ -36,14 +36,18 @@ pub(crate) struct FileMetaSeed(pub(crate) FileEncryptionVersion);
 struct RawFileMeta<'a> {
 	#[serde(borrow)]
 	pub(super) name: Cow<'a, str>,
+	#[serde(with = "filen_types::serde::number::truncating_u64", default)]
 	pub(super) size: u64,
 	#[serde(borrow)]
 	pub(super) mime: Cow<'a, str>,
 	#[serde(borrow)]
 	pub(super) key: Cow<'a, str>,
-	#[serde(with = "filen_types::serde::time::seconds_or_millis")]
+	#[serde(
+		with = "filen_types::serde::time::truncating_seconds_or_millis",
+		default = "filen_types::serde::time::unix_epoch"
+	)]
 	pub(super) last_modified: DateTime<Utc>,
-	#[serde(with = "filen_types::serde::time::optional")]
+	#[serde(with = "filen_types::serde::time::truncating_seconds_or_millis_opt")]
 	#[serde(rename = "creation")]
 	#[serde(default)]
 	pub(super) created: Option<DateTime<Utc>>,
@@ -274,6 +278,100 @@ mod tests {
 			FileEncryptionVersion::V2,
 		);
 		assert_eq!(meta.name(), Some("a\u{FFFD}b.txt"));
+	}
+
+	// Callers of the TS SDK's uploadLocalFileStream can pass raw fs mtimeMs
+	// (a float), which ChunkedUploadWriter stringifies verbatim; TS recipients
+	// parseInt it. A float timestamp must not destroy the whole metadata.
+	#[test]
+	fn rsa_file_metadata_float_timestamps_decode() {
+		let json = r#"{"name":"a.txt","size":3,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1718999999999.4321,"creation":1718999999999.4321}"#;
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(json.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), Some("a.txt"));
+		assert_eq!(
+			meta.last_modified(),
+			DateTime::<Utc>::from_timestamp_millis(1718999999999)
+		);
+		assert_eq!(
+			meta.created(),
+			DateTime::<Utc>::from_timestamp_millis(1718999999999)
+		);
+	}
+
+	// Only floats (cast) and numeric strings (converted) are tolerated; every
+	// other type — null, bools, non-numeric strings — keeps failing the parse
+	// so bad data is not silently accepted as valid.
+	#[test]
+	fn rsa_file_metadata_null_size_fails_to_decode() {
+		let json = r#"{"name":"a.txt","size":null,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1719000000000}"#;
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(json.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), None);
+		assert!(matches!(meta, FileMeta::DecryptedUTF8(_)));
+	}
+
+	#[test]
+	fn rsa_file_metadata_bool_size_fails_to_decode() {
+		let json = r#"{"name":"a.txt","size":true,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1719000000000}"#;
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(json.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), None);
+		assert!(matches!(meta, FileMeta::DecryptedUTF8(_)));
+	}
+
+	#[test]
+	fn rsa_file_metadata_string_size_and_missing_last_modified_decode() {
+		let json = r#"{"name":"a.txt","size":"321","mime":"text/plain","key":"12345678901234567890123456789012"}"#;
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(json.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), Some("a.txt"));
+		let FileMeta::Decoded(decoded) = &meta else {
+			panic!("expected Decoded metadata, got {meta:?}");
+		};
+		assert_eq!(decoded.size, 321);
+		assert_eq!(
+			meta.last_modified(),
+			DateTime::<Utc>::from_timestamp_millis(0)
+		);
+	}
+
+	#[test]
+	fn rsa_file_metadata_non_numeric_creation_fails_to_decode() {
+		let json = r#"{"name":"a.txt","size":3,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1719000000000,"creation":"not-a-date"}"#;
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(json.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), None);
+		assert!(matches!(meta, FileMeta::DecryptedUTF8(_)));
+	}
+
+	// null for an OPTIONAL timestamp is a legitimate "no value", matching the
+	// strict time::optional semantics — not a lossy fallback.
+	#[test]
+	fn rsa_file_metadata_null_creation_decodes_as_none() {
+		let json = r#"{"name":"a.txt","size":3,"mime":"text/plain","key":"12345678901234567890123456789012","lastModified":1719000000000,"creation":null}"#;
+		let meta = FileMeta::blocking_from_rsa_encrypted(
+			rsa_encrypt(json.as_bytes()),
+			&TEST_RSA_KEY,
+			FileEncryptionVersion::V2,
+		);
+		assert_eq!(meta.name(), Some("a.txt"));
+		assert_eq!(meta.created(), None);
 	}
 }
 

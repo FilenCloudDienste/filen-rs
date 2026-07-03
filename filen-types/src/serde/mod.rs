@@ -1,6 +1,6 @@
 pub(crate) mod boolean;
 pub mod cow;
-pub(crate) mod number;
+pub mod number;
 pub(crate) mod option;
 pub(crate) mod parent_uuid;
 pub mod rsa;
