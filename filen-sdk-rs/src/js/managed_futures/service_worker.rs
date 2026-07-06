@@ -79,7 +79,7 @@ mod pausable {
 					js_sys::Reflect::get(&value, v.get_or_init(|| JsValue::from_str("__wbg_ptr")))
 				})
 			}?;
-			let ptr = ptr.as_f64().unwrap() as u32;
+			let ptr = ptr.as_f64().map_or(0, |ptr| ptr as u32);
 			if ptr == 0 {
 				wasm_bindgen::__rt::core::result::Result::Err(value)
 			} else {
