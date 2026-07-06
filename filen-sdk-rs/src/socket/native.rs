@@ -5,8 +5,7 @@ use futures::{
 	stream::{SplitSink, SplitStream},
 };
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
-use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Message, Utf8Bytes};
 
 use crate::{Error, ErrorKind};
@@ -70,7 +69,7 @@ impl PingTask<NativeSender> for NativePingTask {
 }
 
 pub(super) struct UnauthedNativeSender {
-	write: SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>,
+	write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
 }
 
 impl Sender for UnauthedNativeSender {
@@ -143,7 +142,7 @@ impl Sender for NativeSender {
 }
 
 pub(super) struct UnauthedNativeReceiver {
-	read: SplitStream<WebSocketStream<TlsStream<TcpStream>>>,
+	read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 }
 
 impl Receiver<Utf8Bytes> for UnauthedNativeReceiver {
@@ -178,7 +177,7 @@ impl Receiver<Utf8Bytes> for NativeReceiver {
 }
 
 pub(super) struct UnauthedNativeSocket {
-	stream: WebSocketStream<TlsStream<TcpStream>>,
+	stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
 impl UnauthedSocket<UnauthedNativeSender, UnauthedNativeReceiver, Utf8Bytes>
@@ -194,8 +193,8 @@ impl UnauthedSocket<UnauthedNativeSender, UnauthedNativeReceiver, Utf8Bytes>
 }
 
 pub(super) struct NativeSocket {
-	write: SplitSink<WebSocketStream<TlsStream<TcpStream>>, Message>,
-	read: SplitStream<WebSocketStream<TlsStream<TcpStream>>>,
+	write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+	read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 }
 
 impl
@@ -228,27 +227,27 @@ impl
 				)
 			})?;
 
-		// make sure we have a TLS stream
-		let inner_stream = ws_stream.into_inner();
-		let tls_stream = match inner_stream {
-			tokio_tungstenite::MaybeTlsStream::Plain(_) => {
+		// Enforce TLS without unwrapping the stream: into_inner()/re-wrap would
+		// discard tungstenite's read buffer, so a server first frame coalesced
+		// with the 101 upgrade response would be lost and the handshake would
+		// wait for a message that never arrives.
+		match ws_stream.get_ref() {
+			MaybeTlsStream::Rustls(_) => {}
+			MaybeTlsStream::Plain(_) => {
 				return Err(Error::custom(
 					ErrorKind::InvalidState,
 					"expected TLS stream, got plain stream",
 				));
 			}
-			tokio_tungstenite::MaybeTlsStream::Rustls(tls_stream) => tls_stream,
 			other => {
 				return Err(Error::custom(
 					ErrorKind::InvalidState,
 					format!("expected Rustls TLS stream, got {:?}", other),
 				));
 			}
-		};
+		}
 
-		Ok(UnauthedNativeSocket {
-			stream: WebSocketStream::from_raw_socket(tls_stream, Role::Client, None).await,
-		})
+		Ok(UnauthedNativeSocket { stream: ws_stream })
 	}
 
 	fn from_unauthed_parts(
