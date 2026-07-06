@@ -122,17 +122,12 @@ async fn actually_drop(client: &AuthClient, uuid: UuidStr, resource: &str) {
 	}
 }
 
+// The release is attempted even for a lock marked invalid: if the loss was a false
+// positive (the server still holds our lease), releasing frees the resource for
+// everyone immediately instead of stalling it out to the TTL, and if the lease is
+// truly gone the Release is a harmless no-op keyed to our uuid.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 fn drop(lock: &mut ResourceLock) {
-	if !lock.is_valid() {
-		// The keep-alive already declared the lease lost; the server has released
-		// (or is about to release) it on its own, so a Release would be a no-op.
-		debug!(
-			"Lock {} already lost server-side, skipping release",
-			lock.resource
-		);
-		return;
-	}
 	// Prefer the ambient runtime: it is alive by definition, while the captured handle's
 	// runtime may have shut down since acquisition (spawning there would silently cancel
 	// the release).
@@ -156,15 +151,6 @@ fn drop(lock: &mut ResourceLock) {
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn drop(lock: &mut ResourceLock) {
-	if !lock.is_valid() {
-		// The keep-alive already declared the lease lost; the server has released
-		// (or is about to release) it on its own, so a Release would be a no-op.
-		debug!(
-			"Lock {} already lost server-side, skipping release",
-			lock.resource
-		);
-		return;
-	}
 	let client = lock.client.clone();
 	let uuid = lock.uuid;
 	let resource = lock.resource.clone();
@@ -231,15 +217,26 @@ where
 	// request, never earlier than its send, so this measurement only ever
 	// overestimates the lease age — erring toward declaring loss early, not late.
 	let mut last_confirmed = acquired_at;
+	let mut attempted = false;
 	sleep(refresh_delay_after(acquired_at.elapsed())).await;
 	loop {
-		let remaining = LOCK_LOSS_BUDGET.saturating_sub(last_confirmed.elapsed());
+		let mut remaining = LOCK_LOSS_BUDGET.saturating_sub(last_confirmed.elapsed());
 		if remaining.is_zero() {
-			return LoopExit::Lost;
+			if attempted {
+				return LoopExit::Lost;
+			}
+			// The acquire anchor can already be stale before any refresh was ever
+			// attempted (its response may arrive long after the send under the
+			// shared retry/rate-limit HTTP stack). Give the server one bounded
+			// chance to confirm instead of declaring a fresh lock lost unheard:
+			// budget + this floor never exceeds LOCK_SERVER_TTL, so trust still
+			// ends no later than the lease possibly can.
+			remaining = LOCK_SERVER_TTL - LOCK_LOSS_BUDGET;
 		}
 		let Some(fut) = refresh() else {
 			return LoopExit::Dropped;
 		};
+		attempted = true;
 		let attempt_started = Instant::now();
 		match timeout(remaining, fut).await {
 			Ok(Ok(true)) => {
@@ -533,7 +530,7 @@ mod tests {
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[test]
-	fn drop_of_lost_lock_skips_release() {
+	fn drop_of_lost_lock_still_attempts_release() {
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
 			.build()
@@ -543,8 +540,9 @@ mod tests {
 		let _guard = rt.enter();
 		assert_eq!(rt.metrics().num_alive_tasks(), 0);
 		std::mem::drop(lock);
-		// A lost lock was already released server-side: no release task may spawn.
-		assert_eq!(rt.metrics().num_alive_tasks(), 0);
+		// A false-positive loss must not strand the resource until the TTL: the
+		// release is attempted anyway (harmless no-op if the lease is truly gone).
+		assert_eq!(rt.metrics().num_alive_tasks(), 1);
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -665,6 +663,43 @@ mod tests {
 		assert_eq!(exit, LoopExit::Lost);
 		// declared lost strictly before the 30s server TTL despite the hang
 		assert_eq!(begin.elapsed(), LOCK_LOSS_BUDGET);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn stale_acquire_anchor_gets_one_bounded_refresh_attempt() {
+		// The acquire response can arrive long after its send (retry/rate-limit
+		// stack), leaving the anchor past the loss budget before the keep-alive
+		// ever ran. One confirming refresh must rescue the lock, not lose it unheard.
+		let begin = Instant::now();
+		tokio::time::advance(Duration::from_secs(26)).await;
+		let exit = refresh_loop(scripted_refresh(&[Step::Confirm, Step::Drop]), begin).await;
+		assert_eq!(exit, LoopExit::Dropped);
+		// floored attempt confirms at 26s, drop observed at the 41s refresh
+		assert_eq!(begin.elapsed(), Duration::from_secs(41));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn stale_acquire_anchor_failed_attempt_is_lost() {
+		let begin = Instant::now();
+		tokio::time::advance(Duration::from_secs(26)).await;
+		let exit = refresh_loop(scripted_refresh(&[Step::TransportErr]), begin).await;
+		assert_eq!(exit, LoopExit::Lost);
+		// the single floored attempt fails at 26s; after the 1s retry pause the
+		// exhausted budget declares the loss — no unbounded extension of trust
+		assert_eq!(begin.elapsed(), Duration::from_secs(27));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn stale_acquire_anchor_hung_attempt_is_cut_off_at_the_floor() {
+		let begin = Instant::now();
+		tokio::time::advance(Duration::from_secs(26)).await;
+		let exit = refresh_loop(scripted_refresh(&[Step::Hang]), begin).await;
+		assert_eq!(exit, LoopExit::Lost);
+		// the floored attempt gets exactly LOCK_SERVER_TTL - LOCK_LOSS_BUDGET
+		assert_eq!(begin.elapsed(), Duration::from_secs(31));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
