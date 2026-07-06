@@ -146,6 +146,12 @@ impl<'a> FileReader<'a> {
 		if self.file.chunks() == 0 {
 			return None;
 		}
+		// Once the read position reaches the range limit no further bytes are ever
+		// wanted — without this an empty range (start == end mid-chunk) still fetches
+		// the chunk containing that position.
+		if self.index >= self.limit {
+			return None;
+		}
 		// A chunk starting at or past the range limit contains no wanted bytes. Every
 		// fetch decision funnels through here, so without this bound a ranged reader
 		// keeps downloading (and decrypting) chunks to EOF after the range is exhausted.
@@ -571,6 +577,22 @@ mod tests {
 			.build();
 		assert_eq!(reader.next_chunk_idx, 9);
 		assert_eq!(reader.futures.len(), 1);
+	}
+
+	#[test]
+	fn empty_range_fetches_nothing() {
+		let client = test_client();
+		let file = FakeFile::new(10 * CHUNK_SIZE_U64, 10);
+		// start == end mid-chunk: zero bytes wanted, so not even the chunk
+		// containing that position may be fetched
+		let mut reader = FileReaderBuilder::new(&client, &file)
+			.with_start(CHUNK_SIZE_U64 / 2)
+			.with_end(CHUNK_SIZE_U64 / 2)
+			.build();
+		assert_eq!(reader.futures.len(), 0);
+		assert!(reader.allocate_chunk_future.is_none());
+		let mut buf = [0u8; 8];
+		assert_eq!(block_on(reader.read(&mut buf)).unwrap(), 0);
 	}
 
 	#[test]
