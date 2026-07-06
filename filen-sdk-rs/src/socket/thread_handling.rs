@@ -403,15 +403,18 @@ where
 	UW: UnauthedSocket<US, UR, RV>,
 	PT: PingTask<S>,
 {
-	let api_key = config
-		.client
-		.api_key()
-		.read()
-		.unwrap_or_else(|poisoned| poisoned.into_inner())
-		.0
-		.to_string();
-
 	loop {
+		// Re-read the key on every attempt: a password change rotates it in
+		// place, and a pre-loop snapshot would keep authenticating with the
+		// stale key until authFailed permanently killed the task.
+		let api_key = config
+			.client
+			.api_key()
+			.read()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.0
+			.to_string();
+
 		tokio::select! {
 			biased;
 			request = request_receiver.recv() => {
@@ -828,6 +831,10 @@ mod tests {
 			STATE.with(|s| s.borrow().connect_count)
 		}
 
+		fn sent_messages() -> Vec<String> {
+			STATE.with(|s| s.borrow().sent.clone())
+		}
+
 		pub(super) struct FakeMsg(String);
 
 		impl AsRef<str> for FakeMsg {
@@ -1098,6 +1105,41 @@ mod tests {
 					"authSuccess"
 				]
 			);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn api_key_is_reread_on_each_connect_attempt() {
+			let mut config = test_config();
+			let client = Arc::clone(&config.client);
+
+			// conn1 dies during the handshake (retryable, before auth is sent);
+			// the key rotates while the retry loop runs, so attempt 2 must
+			// authenticate with the NEW key, not a pre-loop snapshot
+			prime(vec![
+				FakeConnection::new(vec![ServerAction::Close]).with_on_connect(move || {
+					*client
+						.api_key()
+						.write()
+						.unwrap_or_else(|poisoned| poisoned.into_inner()) = APIKey(Cow::Borrowed("rotated-key"));
+				}),
+				FakeConnection::new(handshake_then(vec![])),
+			]);
+
+			let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
+			let mut listeners = DisconnectedListenerManager::new();
+			let socket = initialize_websocket::<FakeSocket, _, _, _, _, _, _, _, _>(
+				&mut config,
+				&mut request_receiver,
+				&mut listeners,
+			)
+			.await;
+			assert!(socket.is_some(), "second attempt should connect");
+
+			let auth_messages: Vec<String> = sent_messages()
+				.into_iter()
+				.filter(|m| m.contains("apiKey"))
+				.collect();
+			assert_eq!(auth_messages, [r#"42["auth",{"apiKey":"rotated-key"}]"#]);
 		}
 	}
 
