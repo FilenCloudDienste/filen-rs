@@ -180,7 +180,10 @@ impl AuthInfo {
 			3 => Ok(AuthInfo::V3(v3::AuthInfo {
 				dek: v3::MetaKey::from_str(s)?,
 			})),
-			_ => unimplemented!("Unsupported auth version: {}", version),
+			_ => Err(ConversionError::InvalidVersion(
+				version.to_string(),
+				vec!["1".to_string(), "2".to_string(), "3".to_string()],
+			)),
 		}
 	}
 }
@@ -228,7 +231,12 @@ impl AuthInfo {
 			AuthInfo::V1(info) | AuthInfo::V2(info) => {
 				make_master_key_string_from_keys(user_id, &info.master_keys.0)?
 			}
-			AuthInfo::V3(_) => panic!("Exporting V3 accounts is not supported"),
+			AuthInfo::V3(_) => {
+				return Err(Error::custom(
+					crate::ErrorKind::InvalidState,
+					"Exporting master keys is not supported for V3 accounts",
+				));
+			}
 		};
 		let encoded = BASE64_STANDARD.encode(exported_keys_string);
 		Ok(encoded)
@@ -899,5 +907,45 @@ impl std::fmt::Debug for Client {
 			)
 			.field("hmac_key", &self.hmac_key)
 			.finish()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn auth_info_from_unknown_version_errs() {
+		for version in [0u8, 4, 200, u8::MAX] {
+			assert!(matches!(
+				AuthInfo::from_string_and_version("irrelevant", version),
+				Err(ConversionError::InvalidVersion(..))
+			));
+		}
+	}
+
+	#[test]
+	fn from_stringified_with_unknown_auth_version_errs() {
+		let unauth = UnauthClient::from_config(http::ClientConfig::default()).unwrap();
+		let stringified = StringifiedClient {
+			email: "test@example.com".to_string(),
+			user_id: 1,
+			root_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+			auth_info: "irrelevant".to_string(),
+			private_key: String::new(),
+			api_key: String::new(),
+			auth_version: 200,
+			max_parallel_requests: None,
+			max_io_memory_usage: None,
+		};
+		assert!(unauth.from_stringified(stringified).is_err());
+	}
+
+	#[test]
+	fn v3_auth_info_is_not_exportable() {
+		let auth_info = AuthInfo::V3(v3::AuthInfo {
+			dek: v3::MetaKey::generate(),
+		});
+		assert!(auth_info.convert_into_exportable(1).is_err());
 	}
 }
