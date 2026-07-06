@@ -16,10 +16,6 @@ struct HeicContext<'a> {
 	_lifetime: PhantomData<&'a [u8]>,
 }
 
-// Safety: This is a read only error type pointing to a string literal, so it is safe to send across threads.
-unsafe impl Send for heif_error {}
-unsafe impl Sync for heif_error {}
-
 impl HeicContext<'_> {
 	fn from_slice(data: &[u8]) -> Result<Self, HeifError> {
 		let context = unsafe { heif_context_alloc() };
@@ -32,7 +28,7 @@ impl HeicContext<'_> {
 			)
 		};
 		if result.code != heif_error_code_heif_error_Ok {
-			return Err(HeifError { inner: result });
+			return Err(HeifError::from_raw(result));
 		}
 
 		Ok(HeicContext {
@@ -42,12 +38,13 @@ impl HeicContext<'_> {
 	}
 
 	fn from_file(path: &str) -> Result<HeicContext<'static>, HeifError> {
+		let file_name = CString::new(path)
+			.map_err(|_| HeifError::invalid_input("file path contains an interior NUL byte"))?;
 		let context = unsafe { heif_context_alloc() };
-		let file_name: CString = CString::new(path).unwrap();
 		let result =
 			unsafe { heif_context_read_from_file(context, file_name.as_ptr(), std::ptr::null()) };
 		if result.code != heif_error_code_heif_error_Ok {
-			return Err(HeifError { inner: result });
+			return Err(HeifError::from_raw(result));
 		}
 
 		Ok(HeicContext {
@@ -67,7 +64,7 @@ impl HeicContext<'_> {
 			)
 		};
 		if result.code != heif_error_code_heif_error_Ok {
-			return Err(HeifError { inner: result });
+			return Err(HeifError::from_raw(result));
 		}
 
 		Ok(HeicContext {
@@ -93,7 +90,8 @@ impl ImageHandle<'_> {
 		let mut handle = std::ptr::null_mut();
 		let result = unsafe { heif_context_get_primary_image_handle(ctx.inner, &mut handle) };
 		if result.code != heif_error_code_heif_error_Ok {
-			return Err(HeifError { inner: result });
+			// copy the message while `ctx`, which owns the buffer it points into, is alive
+			return Err(HeifError::from_raw(result));
 		}
 
 		Ok(ImageHandle {
@@ -128,7 +126,8 @@ impl OutImage<'_> {
 		};
 
 		if result.code != heif_error_code_heif_error_Ok {
-			return Err(HeifError { inner: result });
+			// copy the message while `handle`, which owns the buffer it points into, is alive
+			return Err(HeifError::from_raw(result));
 		}
 
 		Ok(OutImage {
@@ -137,7 +136,7 @@ impl OutImage<'_> {
 		})
 	}
 
-	fn make_rgba(&self) -> Option<RgbaImage> {
+	fn make_rgba(&self) -> Result<RgbaImage, HeifError> {
 		let mut stride = 0usize;
 		let plane_data = unsafe {
 			heif_image_get_plane_readonly2(
@@ -152,16 +151,23 @@ impl OutImage<'_> {
 		let height =
 			unsafe { heif_image_get_height(self.inner, heif_channel_heif_channel_interleaved) };
 
-		let mut rgba_data = Vec::with_capacity((width * height * 4) as usize);
+		if plane_data.is_null() {
+			return Err(HeifError::invalid_decoded_image());
+		}
+		let layout = validate_rgba_layout(width, height, stride)
+			.ok_or_else(HeifError::invalid_decoded_image)?;
 
-		for y in 0..height {
-			let row_start = (y as usize) * stride;
+		let mut rgba_data = Vec::with_capacity(layout.capacity);
+
+		for y in 0..layout.height {
+			let row_start = y * stride;
 			rgba_data.extend_from_slice(unsafe {
-				std::slice::from_raw_parts(plane_data.add(row_start), width as usize * 4)
+				std::slice::from_raw_parts(plane_data.add(row_start), layout.row_bytes)
 			});
 		}
 
 		image::RgbaImage::from_vec(width as u32, height as u32, rgba_data)
+			.ok_or_else(HeifError::invalid_decoded_image)
 	}
 }
 
@@ -171,18 +177,48 @@ impl Drop for OutImage<'_> {
 	}
 }
 
+struct RgbaLayout {
+	height: usize,
+	row_bytes: usize,
+	capacity: usize,
+}
+
+fn validate_rgba_layout(width: c_int, height: c_int, stride: usize) -> Option<RgbaLayout> {
+	if width <= 0 || height <= 0 {
+		return None;
+	}
+	let width = width as usize;
+	let height = height as usize;
+	let row_bytes = width.checked_mul(4)?;
+	if stride < row_bytes {
+		return None;
+	}
+	let capacity = row_bytes.checked_mul(height)?;
+	// the end of the last row must be addressable without overflowing usize
+	let last_row_end = (height - 1).checked_mul(stride)?.checked_add(row_bytes)?;
+	// Vec allocations and raw-pointer offsets are limited to isize::MAX bytes
+	if capacity > isize::MAX as usize || last_row_end > isize::MAX as usize {
+		return None;
+	}
+	Some(RgbaLayout {
+		height,
+		row_bytes,
+		capacity,
+	})
+}
+
 pub fn try_get_rgba_image_from_slice(data: &[u8]) -> Result<RgbaImage, HeifError> {
 	let context = HeicContext::from_slice(data)?;
 	let image_handle = ImageHandle::new(&context)?;
 	let out_image = OutImage::new(&image_handle)?;
-	Ok(out_image.make_rgba().unwrap())
+	out_image.make_rgba()
 }
 
 pub fn try_get_rgba_image_from_file(path: &str) -> Result<RgbaImage, HeifError> {
 	let context = HeicContext::from_file(path)?;
 	let image_handle = ImageHandle::new(&context)?;
 	let out_image = OutImage::new(&image_handle)?;
-	Ok(out_image.make_rgba().unwrap())
+	out_image.make_rgba()
 }
 
 pub fn try_get_rgba_image_from_reader<T: Read + Seek>(
@@ -193,7 +229,7 @@ pub fn try_get_rgba_image_from_reader<T: Read + Seek>(
 	let context = HeicContext::from_reader(&mut heif_reader)?;
 	let image_handle = ImageHandle::new(&context)?;
 	let out_image = OutImage::new(&image_handle)?;
-	Ok(out_image.make_rgba().unwrap())
+	out_image.make_rgba()
 }
 
 struct HeifReader<T>
@@ -258,6 +294,11 @@ unsafe extern "C" fn read_impl<T: Read + Seek>(
 	size: usize,
 	userdata: *mut c_void,
 ) -> c_int {
+	// from_raw_parts_mut requires a non-null pointer even for size == 0;
+	// libheif treats any non-zero return as a read failure
+	if data.is_null() {
+		return -1;
+	}
 	let reader = unsafe { &mut *(userdata as *mut HeifReader<T>) };
 	let buffer = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, size) };
 
@@ -291,7 +332,42 @@ unsafe extern "C" fn wait_for_file_size_impl<T: Read + Seek>(
 
 #[derive(Debug)]
 pub struct HeifError {
-	inner: heif_error,
+	code: heif_error_code,
+	#[allow(dead_code)] // diagnostic detail, surfaced via the Debug impl
+	subcode: heif_suberror_code,
+	message: String,
+}
+
+impl HeifError {
+	/// Copies the message eagerly: libheif error messages point into a buffer
+	/// owned by the producing context/handle, so the pointer dangles once that
+	/// object is freed. Call this while the producing object is still alive.
+	fn from_raw(error: heif_error) -> Self {
+		let message = if error.message.is_null() {
+			String::from("unknown error")
+		} else {
+			unsafe { CStr::from_ptr(error.message) }
+				.to_string_lossy()
+				.into_owned()
+		};
+		HeifError {
+			code: error.code,
+			subcode: error.subcode,
+			message,
+		}
+	}
+
+	fn invalid_input(message: &str) -> Self {
+		HeifError {
+			code: heif_error_code_heif_error_Invalid_input,
+			subcode: heif_suberror_code_heif_suberror_Unspecified,
+			message: String::from(message),
+		}
+	}
+
+	fn invalid_decoded_image() -> Self {
+		Self::invalid_input("decoded image has invalid plane, dimensions, or stride")
+	}
 }
 
 impl std::fmt::Display for HeifError {
@@ -299,10 +375,7 @@ impl std::fmt::Display for HeifError {
 		write!(
 			f,
 			"heif error: code: {}, message: {}",
-			self.inner.code,
-			unsafe { CStr::from_ptr(self.inner.message) }
-				.to_str()
-				.unwrap_or("unknown error")
+			self.code, self.message
 		)
 	}
 }
@@ -342,3 +415,86 @@ impl std::error::Error for HeifError {}
 // 		image.write_to(&mut file, image::ImageFormat::Png).unwrap();
 // 	}
 // }
+
+#[cfg(test)]
+mod layout_tests {
+	use super::validate_rgba_layout;
+
+	#[test]
+	fn rejects_non_positive_dimensions() {
+		assert!(validate_rgba_layout(0, 10, 40).is_none());
+		assert!(validate_rgba_layout(10, 0, 40).is_none());
+		assert!(validate_rgba_layout(-1, 10, 40).is_none());
+		assert!(validate_rgba_layout(10, -1, 40).is_none());
+		assert!(validate_rgba_layout(i32::MIN, i32::MIN, usize::MAX).is_none());
+	}
+
+	#[test]
+	fn rejects_stride_smaller_than_row() {
+		assert!(validate_rgba_layout(10, 10, 39).is_none());
+		assert!(validate_rgba_layout(10, 10, 0).is_none());
+	}
+
+	#[test]
+	fn rejects_row_offset_overflow() {
+		assert!(validate_rgba_layout(2, 2, usize::MAX).is_none());
+		assert!(validate_rgba_layout(i32::MAX, i32::MAX, usize::MAX).is_none());
+	}
+
+	#[test]
+	fn accepts_dimensions_whose_byte_size_overflows_i32() {
+		let side = 23_171_i32;
+		let layout = validate_rgba_layout(side, side, side as usize * 4).unwrap();
+		assert_eq!(layout.height, side as usize);
+		assert_eq!(layout.row_bytes, side as usize * 4);
+		assert_eq!(layout.capacity, side as usize * side as usize * 4);
+	}
+
+	#[test]
+	fn accepts_padded_stride() {
+		let layout = validate_rgba_layout(3, 2, 16).unwrap();
+		assert_eq!(layout.height, 2);
+		assert_eq!(layout.row_bytes, 12);
+		assert_eq!(layout.capacity, 24);
+	}
+
+	#[test]
+	fn rejects_capacity_exceeding_isize_max() {
+		// width == height == i32::MAX with an unpadded stride: the byte counts
+		// still fit in usize (so the checked_mul overflow guards above don't
+		// trigger), but the resulting capacity exceeds isize::MAX, which
+		// Vec::with_capacity cannot allocate.
+		let side = i32::MAX;
+		let row_bytes = side as usize * 4;
+		assert!((row_bytes * side as usize) > isize::MAX as usize);
+		assert!(validate_rgba_layout(side, side, row_bytes).is_none());
+	}
+}
+
+#[cfg(test)]
+mod api_tests {
+	use std::io::Cursor;
+
+	use super::*;
+
+	#[test]
+	fn from_file_rejects_path_with_interior_nul() {
+		let path = "does/not/exist\0evil.heic";
+		let err = try_get_rgba_image_from_file(path).unwrap_err();
+		// must fail before any filesystem access is attempted
+		assert!(err.to_string().contains("interior NUL byte"));
+	}
+
+	#[test]
+	fn read_impl_rejects_null_data_pointer() {
+		let mut reader = HeifReader::new(Cursor::new(Vec::<u8>::new()), 0);
+		let result = unsafe {
+			read_impl::<Cursor<Vec<u8>>>(
+				std::ptr::null_mut(),
+				4,
+				&mut reader as *mut _ as *mut c_void,
+			)
+		};
+		assert_eq!(result, -1);
+	}
+}
