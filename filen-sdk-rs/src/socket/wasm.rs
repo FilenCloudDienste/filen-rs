@@ -12,8 +12,8 @@ use super::{
 
 pub(super) struct WasmSocket {
 	socket: web_sys::WebSocket,
-	msg_receiver: tokio::sync::mpsc::Receiver<Result<String, Error>>,
-	close_receiver: tokio::sync::oneshot::Receiver<()>,
+	msg_receiver: tokio::sync::mpsc::Receiver<String>,
+	close_receiver: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl IntoStableDeref for String {
@@ -110,7 +110,7 @@ impl Receiver<String> for WasmReceiver {
 
 pub(super) struct UnauthedWasmSocket {
 	socket: web_sys::WebSocket,
-	msg_receiver: tokio::sync::mpsc::Receiver<Result<String, Error>>,
+	msg_receiver: tokio::sync::mpsc::Receiver<String>,
 	close_receiver: tokio::sync::oneshot::Receiver<()>,
 }
 
@@ -121,7 +121,7 @@ impl UnauthedSocket<UnauthedWasmSender, UnauthedWasmReceiver, String> for Unauth
 		};
 		let receiver = UnauthedWasmReceiver {
 			msg_receiver: self.msg_receiver,
-			close_receiver: self.close_receiver,
+			close_receiver: Some(self.close_receiver),
 		};
 		(sender, receiver)
 	}
@@ -163,19 +163,30 @@ impl Sender for UnauthedWasmSender {
 }
 
 pub(super) struct UnauthedWasmReceiver {
-	msg_receiver: tokio::sync::mpsc::Receiver<Result<String, Error>>,
-	close_receiver: tokio::sync::oneshot::Receiver<()>,
+	msg_receiver: tokio::sync::mpsc::Receiver<String>,
+	close_receiver: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl Receiver<String> for UnauthedWasmReceiver {
 	async fn receive(&mut self) -> Option<Result<String, Error>> {
-		match self.close_receiver.try_recv() {
-			Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-				// socket closed
-				None
+		if let Some(close_receiver) = &mut self.close_receiver {
+			// The old try_recv-at-entry-then-plain-await never woke for a close
+			// that fired mid-await: a dead socket went undetected until unrelated
+			// request traffic happened to re-enter this function. Racing the two
+			// (message-first, so frames that arrived before the close are still
+			// drained in order) keeps this cancellation-safe: nothing is consumed
+			// unless an arm actually completes.
+			tokio::select! {
+				biased;
+				msg = self.msg_receiver.recv() => return msg.map(Ok),
+				_ = close_receiver => {}
 			}
-			Err(tokio::sync::oneshot::error::TryRecvError::Empty) => self.msg_receiver.recv().await,
+			// the close fired: never poll the finished oneshot again
+			self.close_receiver = None;
 		}
+		// closed: no new frames can arrive — deliver anything still buffered,
+		// then report end-of-stream
+		self.msg_receiver.try_recv().ok().map(Ok)
 	}
 }
 
@@ -221,17 +232,20 @@ impl
 			},
 		);
 
-		// onmessage
-		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel::<Result<String, Error>>(16);
+		// onmessage. The JS callback cannot be backpressured (unlike native's
+		// lazily-pulled stream), so the channel bound is the only buffer between
+		// an event burst and a consumer busy decrypting — keep it roomy; overflow
+		// still only drops the excess with a warning.
+		let (msg_sender, msg_receiver) = tokio::sync::mpsc::channel::<String>(64);
 		let on_msg_closure = wasm_bindgen::prelude::Closure::<dyn Fn(web_sys::MessageEvent)>::new(
 			move |e: web_sys::MessageEvent| {
-				let result = e.data().as_string().ok_or_else(|| {
-					Error::custom(
-						ErrorKind::Server,
-						"expected text message while handling websocket message, received non-string",
-					)
-				});
-				if let Err(TrySendError::Full(msg)) = msg_sender.try_send(result) {
+				// skip non-text frames (Blob/ArrayBuffer) like native does —
+				// erroring here used to permanently kill the websocket task
+				let Some(text) = e.data().as_string() else {
+					tracing::warn!("received non-text WebSocket message, ignoring");
+					return;
+				};
+				if let Err(TrySendError::Full(msg)) = msg_sender.try_send(text) {
 					tracing::warn!(
 						"WebSocket message channel full, dropping message '{:?}'",
 						msg
@@ -241,7 +255,7 @@ impl
 		);
 
 		// onclose
-		let (close_sender, close_receiver) = tokio::sync::oneshot::channel();
+		let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel();
 		let fn_once = Cell::new(Some(move || {
 			let _ = close_sender.send(());
 		}));
@@ -272,12 +286,26 @@ impl
 		ws.set_onmessage(Some(on_msg_closure.into_js_value().unchecked_ref()));
 		ws.set_onclose(Some(on_close_closure.into_js_value().unchecked_ref()));
 
-		open_receiver.await.map_err(|e| {
-			Error::custom(
-				ErrorKind::Server,
-				format!("failed to receive WebSocket open event: {}", e),
-			)
-		})?;
+		// A failed connection attempt fires error/close, never open — awaiting
+		// only onopen hung forever on an unreachable server (the leaked closure
+		// keeps the open sender alive, so not even a channel error arrives).
+		tokio::select! {
+			biased;
+			result = open_receiver => {
+				result.map_err(|e| {
+					Error::custom(
+						ErrorKind::Server,
+						format!("failed to receive WebSocket open event: {}", e),
+					)
+				})?;
+			}
+			_ = &mut close_receiver => {
+				return Err(Error::custom(
+					ErrorKind::Server,
+					"WebSocket closed before opening",
+				));
+			}
+		}
 
 		Ok(UnauthedWasmSocket {
 			socket: ws,
