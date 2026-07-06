@@ -404,6 +404,15 @@ where
 			},
 		}
 	}
+	// Events that already arrived must survive the teardown: broadcast anything
+	// still decrypting instead of dropping it with the queue — reconnects are
+	// routine (transport errors, liveness) and must not silently lose events.
+	while let Some(decrypted) = decryption_futures.next().await {
+		let decrypted: Option<Yoke<_, <RV as IntoStableDeref>::Output>> = decrypted;
+		if let Some(decrypted) = decrypted {
+			listeners.broadcast_event(decrypted.get());
+		}
+	}
 	ping_task.abort();
 	should_retry
 }
@@ -728,10 +737,13 @@ where
 /// The handshake's `pingInterval` is server-controlled and in milliseconds. On a
 /// zero period, `tokio::time::interval` panics, while `wasmtimer::tokio::interval`
 /// yields a permanently-past deadline that resolves on every poll — a busy-loop
-/// ping flood. Floor the value to something sane instead of trusting it.
+/// ping flood. A huge value is just as hostile in the other direction: it stops
+/// our pings and stretches the liveness deadline toward infinity, resurrecting
+/// the undetectable black-holed connection. Clamp instead of trusting it.
 fn ping_interval_from_millis(millis: u64) -> Duration {
 	const MIN_PING_INTERVAL: Duration = Duration::from_secs(1);
-	Duration::from_millis(millis).max(MIN_PING_INTERVAL)
+	const MAX_PING_INTERVAL: Duration = Duration::from_secs(60);
+	Duration::from_millis(millis).clamp(MIN_PING_INTERVAL, MAX_PING_INTERVAL)
 }
 
 /// How long without ANY inbound frame before the connection is declared dead and
@@ -1159,6 +1171,54 @@ mod tests {
 		}
 
 		#[tokio::test(start_paused = true)]
+		async fn events_received_before_a_transport_error_are_not_lost() {
+			let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+
+			// a decrypt-free drive event arrives, then the transport dies: the
+			// event may still be sitting in the decryption queue at break time
+			// and must be broadcast before the reconnect demotes the listeners
+			let final_sender = request_sender.clone();
+			prime(vec![
+				FakeConnection::new(handshake_then(vec![
+					ServerAction::Msg(
+						r#"42["file-trash",{"uuid":"00000000-0000-0000-0000-000000000000","driveMessageId":1}]"#
+							.to_string(),
+					),
+					ServerAction::Err("connection reset"),
+				])),
+				FakeConnection::new(handshake_then(vec![ServerAction::Hang]))
+					.with_on_connect(move || drop(final_sender)),
+			]);
+
+			let (callback, events) = recording_listener();
+			let (id_sender, _id_receiver) = tokio::sync::oneshot::channel();
+			let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+			request_sender
+				.send(SocketRequest::AddListener {
+					id_sender,
+					cancel_receiver,
+					callback,
+					event_types: None,
+				})
+				.await
+				.unwrap();
+			drop(request_sender);
+
+			run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+				test_config(),
+				request_receiver,
+				Arc::new(NoopCrypter),
+				test_private_key(),
+			)
+			.await;
+
+			assert_eq!(
+				events.lock().unwrap().as_slice(),
+				["authSuccess", "fileTrash", "reconnecting", "authSuccess"]
+			);
+		}
+
+		#[tokio::test(start_paused = true)]
 		async fn api_key_is_reread_on_each_connect_attempt() {
 			let mut config = test_config();
 			let client = Arc::clone(&config.client);
@@ -1324,5 +1384,16 @@ mod tests {
 			ping_interval_from_millis(25_000),
 			Duration::from_millis(25_000)
 		);
+	}
+
+	// A huge server-sent pingInterval would stop our pings and inflate the
+	// liveness deadline toward infinity — the black-hole wedge by other means.
+	#[test]
+	fn ping_interval_from_millis_caps_huge_values() {
+		assert_eq!(
+			ping_interval_from_millis(25_000_000_000),
+			Duration::from_secs(60)
+		);
+		assert_eq!(ping_interval_from_millis(u64::MAX), Duration::from_secs(60));
 	}
 }
