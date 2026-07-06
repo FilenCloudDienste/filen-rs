@@ -10,7 +10,7 @@ use crate::{
 	auth::unauth::UnauthClient,
 	consts::{CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::shared::DataCrypter,
-	error::{Error, MetadataWasNotDecryptedError},
+	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
 	util::{MaybeSendBoxFuture, MaybeSendCallback},
 };
 
@@ -30,6 +30,9 @@ pub struct FileReader<'a> {
 	// download concurrently, and the ordered reader would otherwise hold completed chunks behind a
 	// slow head-of-line chunk and release them in a burst. See `push_fetch_next_chunk`.
 	progress: Option<MaybeSendCallback<'a, u64>>,
+	// Set at build time. When false, the advertised size/chunk count cannot describe a real
+	// file and every read yields an error instead of attempting the chunk-size math.
+	chunks_consistent: bool,
 }
 
 pub struct FileReaderBuilder<'a> {
@@ -74,10 +77,13 @@ impl<'a> FileReaderBuilder<'a> {
 		self
 	}
 
+	/// Builds the reader. If the file's advertised chunk count cannot describe its advertised
+	/// size, the returned reader yields an error on read instead of attempting the download.
 	pub fn build(self) -> FileReader<'a> {
 		let size = self.file.size();
 		let limit = self.end.unwrap_or(size).min(size);
 		let index = self.start.unwrap_or(0).min(limit);
+		let chunks_consistent = chunks_consistent_with_size(self.file.chunks(), size);
 		let mut new = FileReader {
 			file: self.file,
 			client: self.client,
@@ -89,15 +95,33 @@ impl<'a> FileReaderBuilder<'a> {
 			allocate_chunk_future: None,
 			max_buffer_size: self.max_buffer_size.unwrap_or(size),
 			progress: self.progress,
+			chunks_consistent,
 		};
 
-		// allocate memory and prefetch chunks
-		while let Some(chunk) = new.try_allocate_next_chunk() {
-			new.push_fetch_next_chunk(chunk);
+		if chunks_consistent {
+			// allocate memory and prefetch chunks
+			while let Some(chunk) = new.try_allocate_next_chunk() {
+				new.push_fetch_next_chunk(chunk);
+			}
+			new.allocate_chunk_future = new.allocate_next_chunk();
 		}
-		new.allocate_chunk_future = new.allocate_next_chunk();
 
 		new
+	}
+}
+
+/// Whether a file's advertised chunk count can be produced from its advertised size: the last
+/// chunk must not start past the end of the file and its plaintext must fit within one chunk.
+/// Remote metadata violating this would drive the chunk-size math out of range, so such
+/// readers refuse to read. A chunk count of zero is only consistent with a zero size (legacy
+/// empty files); with a nonzero size it would silently read as truncated-to-empty.
+fn chunks_consistent_with_size(chunks: u64, size: u64) -> bool {
+	match chunks.checked_sub(1) {
+		None => size == 0,
+		Some(last_chunk_idx) => last_chunk_idx
+			.checked_mul(CHUNK_SIZE_U64)
+			.and_then(|last_chunk_start| size.checked_sub(last_chunk_start))
+			.is_some_and(|last_chunk_len| last_chunk_len <= CHUNK_SIZE_U64),
 	}
 }
 
@@ -125,10 +149,12 @@ impl<'a> FileReader<'a> {
 		if self.next_chunk_idx < self.file.chunks() - 1 {
 			Some(FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()))
 		} else if self.next_chunk_idx == self.file.chunks() - 1 {
-			let size: u64 = self.file.size()
-				- (self.next_chunk_idx * u64::from(FILE_CHUNK_SIZE.get()))
-				+ u64::from(FILE_CHUNK_SIZE_EXTRA.get());
-			let size: u32 = size.try_into().unwrap();
+			let size: u64 = self
+				.next_chunk_idx
+				.checked_mul(u64::from(FILE_CHUNK_SIZE.get()))
+				.and_then(|chunk_start| self.file.size().checked_sub(chunk_start))?
+				.saturating_add(u64::from(FILE_CHUNK_SIZE_EXTRA.get()));
+			let size: u32 = size.try_into().ok()?;
 			NonZeroU32::new(size)
 		} else {
 			None
@@ -249,6 +275,17 @@ impl futures::io::AsyncRead for FileReader<'_> {
 		cx: &mut std::task::Context<'_>,
 		buf: &mut [u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
+		if !self.chunks_consistent {
+			return std::task::Poll::Ready(Err(std::io::Error::other(Error::custom(
+				ErrorKind::Response,
+				format!(
+					"file chunk count ({}) is inconsistent with file size ({})",
+					self.file.chunks(),
+					self.file.size()
+				),
+			))));
+		}
+
 		// first try to queue more chunks
 		while let Some(chunk) = self.try_allocate_next_chunk() {
 			self.push_fetch_next_chunk(chunk);
@@ -314,5 +351,188 @@ impl futures::io::AsyncRead for FileReader<'_> {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::borrow::Cow;
+
+	use chrono::{DateTime, Utc};
+	use filen_types::{crypto::Blake3Hash, fs::UuidStr};
+	use futures::{executor::block_on, io::AsyncReadExt};
+
+	use super::*;
+	use crate::{
+		auth::http::ClientConfig,
+		crypto::file::FileKey,
+		fs::{
+			HasMeta, HasName, HasRemoteInfo, HasUUID,
+			file::traits::{HasFileInfo, HasRemoteFileInfo},
+		},
+	};
+
+	struct FakeFile {
+		uuid: UuidStr,
+		size: u64,
+		chunks: u64,
+	}
+
+	impl FakeFile {
+		fn new(size: u64, chunks: u64) -> Self {
+			Self {
+				uuid: UuidStr::default(),
+				size,
+				chunks,
+			}
+		}
+	}
+
+	impl HasUUID for FakeFile {
+		fn uuid(&self) -> &UuidStr {
+			&self.uuid
+		}
+	}
+
+	impl HasName for FakeFile {
+		fn name(&self) -> Option<&str> {
+			Some("fake")
+		}
+	}
+
+	impl HasMeta for FakeFile {
+		fn get_meta_string(&self) -> Option<Cow<'_, str>> {
+			None
+		}
+	}
+
+	impl HasRemoteInfo for FakeFile {
+		fn favorited(&self) -> bool {
+			false
+		}
+
+		fn timestamp(&self) -> DateTime<Utc> {
+			DateTime::<Utc>::UNIX_EPOCH
+		}
+	}
+
+	impl HasFileInfo for FakeFile {
+		fn mime(&self) -> Option<&str> {
+			None
+		}
+
+		fn created(&self) -> Option<DateTime<Utc>> {
+			None
+		}
+
+		fn last_modified(&self) -> Option<DateTime<Utc>> {
+			None
+		}
+
+		fn size(&self) -> u64 {
+			self.size
+		}
+
+		fn chunks(&self) -> u64 {
+			self.chunks
+		}
+
+		fn key(&self) -> Option<&FileKey> {
+			None
+		}
+	}
+
+	impl HasRemoteFileInfo for FakeFile {
+		fn region(&self) -> &str {
+			""
+		}
+
+		fn bucket(&self) -> &str {
+			""
+		}
+
+		fn hash(&self) -> Option<Blake3Hash> {
+			None
+		}
+	}
+
+	impl File for FakeFile {}
+
+	fn test_client() -> UnauthClient {
+		UnauthClient::from_config(ClientConfig::default()).unwrap()
+	}
+
+	fn read_error_kind(file: &FakeFile) -> ErrorKind {
+		let client = test_client();
+		let mut reader = FileReaderBuilder::new(&client, file).build();
+		let mut buf = [0u8; 16];
+		let err = block_on(reader.read(&mut buf)).expect_err("read should fail");
+		err.get_ref()
+			.and_then(|inner| inner.downcast_ref::<Error>())
+			.map(|e| e.kind())
+			.expect("expected an sdk error")
+	}
+
+	#[test]
+	fn too_many_chunks_for_size_errors_instead_of_panicking() {
+		let file = FakeFile::new(CHUNK_SIZE_U64, 3);
+		assert_eq!(read_error_kind(&file), ErrorKind::Response);
+	}
+
+	#[test]
+	fn oversized_single_chunk_errors_instead_of_panicking() {
+		let file = FakeFile::new(5 * 1024 * CHUNK_SIZE_U64, 1);
+		assert_eq!(read_error_kind(&file), ErrorKind::Response);
+	}
+
+	#[test]
+	fn zero_chunks_with_nonzero_size_errors_instead_of_truncating() {
+		let file = FakeFile::new(10 * 1024 * 1024 * 1024, 0);
+		assert_eq!(read_error_kind(&file), ErrorKind::Response);
+	}
+
+	#[test]
+	fn empty_file_reads_eof() {
+		let client = test_client();
+		let file = FakeFile::new(0, 0);
+		let mut reader = FileReaderBuilder::new(&client, &file).build();
+		let mut buf = [0u8; 8];
+		assert_eq!(block_on(reader.read(&mut buf)).unwrap(), 0);
+	}
+
+	#[test]
+	fn wellformed_file_computes_chunk_sizes() {
+		let client = test_client();
+		let file = FakeFile::new(2 * CHUNK_SIZE_U64 + 512 * 1024, 3);
+		let mut reader = FileReaderBuilder::new(&client, &file)
+			.with_max_buffer_size(0)
+			.build();
+
+		let full = FILE_CHUNK_SIZE.get() + FILE_CHUNK_SIZE_EXTRA.get();
+		assert_eq!(reader.next_chunk_size().map(NonZeroU32::get), Some(full));
+		reader.next_chunk_idx = 1;
+		assert_eq!(reader.next_chunk_size().map(NonZeroU32::get), Some(full));
+		reader.next_chunk_idx = 2;
+		assert_eq!(
+			reader.next_chunk_size().map(NonZeroU32::get),
+			Some(512 * 1024 + FILE_CHUNK_SIZE_EXTRA.get())
+		);
+		reader.next_chunk_idx = 3;
+		assert_eq!(reader.next_chunk_size(), None);
+	}
+
+	#[test]
+	fn chunk_consistency_boundaries() {
+		assert!(chunks_consistent_with_size(0, 0));
+		assert!(!chunks_consistent_with_size(0, 1));
+		assert!(!chunks_consistent_with_size(0, CHUNK_SIZE_U64));
+		assert!(chunks_consistent_with_size(1, 0));
+		assert!(chunks_consistent_with_size(1, 1));
+		assert!(chunks_consistent_with_size(1, CHUNK_SIZE_U64));
+		assert!(chunks_consistent_with_size(2, CHUNK_SIZE_U64 + 1));
+		assert!(chunks_consistent_with_size(2, 2 * CHUNK_SIZE_U64));
+		assert!(!chunks_consistent_with_size(1, CHUNK_SIZE_U64 + 1));
+		assert!(!chunks_consistent_with_size(3, CHUNK_SIZE_U64));
+		assert!(!chunks_consistent_with_size(u64::MAX, u64::MAX));
 	}
 }
