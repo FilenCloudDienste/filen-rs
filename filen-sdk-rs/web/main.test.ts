@@ -319,10 +319,9 @@ test("abort", async () => {
 	}
 })
 
-test("aborted download aborts the WritableStream instead of closing it", async () => {
-	// large enough that the download is still mid-stream when the abort lands:
-	// the internal frame channel buffers at most ~10 x 64 KiB before the producer blocks
-	const remoteFile = await state.uploadFile(new Uint8Array(4 * 1024 * 1024), {
+test("aborted download never closes the stream with truncated data", async () => {
+	const size = 4 * 1024 * 1024
+	const remoteFile = await state.uploadFile(new Uint8Array(size), {
 		name: "abort stream.bin",
 		parent: testDir
 	})
@@ -330,10 +329,16 @@ test("aborted download aborts the WritableStream instead of closing it", async (
 	const abortController = new AbortController()
 	let closed = false
 	let aborted = false
+	let received = 0
 	const writer = new WritableStream<Uint8Array>({
-		write() {
-			// abort as soon as the first flushed chunk arrives, mid-stream
+		write(chunk: Uint8Array) {
+			received += chunk.length
+			// abort on the first flushed chunk, then stall the sink: the download
+			// promise only settles once the buffered write task drains its frames
+			// through the sink, so the stall keeps it pending until the abort
+			// signal crosses to the commander worker and cancels it
 			abortController.abort()
+			return new Promise(resolve => setTimeout(resolve, 100))
 		},
 		close() {
 			closed = true
@@ -359,16 +364,26 @@ test("aborted download aborts the WritableStream instead of closing it", async (
 	expect((error as FilenSdkError).kind).toBe("Cancelled")
 
 	// the promise settles as soon as the abort fires, while the background write
-	// task still drains its buffered frames before sealing the stream — wait for
-	// the stream to reach its terminal state
-	await vi.waitFor(() => {
-		expect(aborted || closed).toBe(true)
-	})
+	// task still drains its buffered frames (each paying the sink stall) before
+	// sealing the stream — give the terminal state ample time
+	await vi.waitFor(
+		() => {
+			expect(aborted || closed).toBe(true)
+		},
+		{ timeout: 15_000 }
+	)
 
-	// a producer that died mid-stream must abort() the stream; a clean close()
-	// makes the browser treat the truncated download as complete
-	expect(aborted).toBe(true)
-	expect(closed).toBe(false)
+	// The invariant under test: a producer that died mid-stream must abort()
+	// the stream. If the abort instead raced past a download that had already
+	// fully completed (its Done sentinel sent), a clean close is legitimate —
+	// but a clean close with TRUNCATED data is exactly the
+	// truncated-file-reported-as-complete bug this pins.
+	if (closed) {
+		expect(received).toBe(size)
+		expect(aborted).toBe(false)
+	} else {
+		expect(aborted).toBe(true)
+	}
 })
 
 test("pause", async () => {
