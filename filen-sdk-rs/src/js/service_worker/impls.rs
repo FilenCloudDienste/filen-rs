@@ -3,7 +3,11 @@ use std::rc::Rc;
 use crate::{
 	Error, ErrorKind,
 	auth::{Client, StringifiedClient},
-	fs::file::{enums::RemoteFileType, service_worker::StreamWriter, traits::HasFileInfo},
+	fs::file::{
+		enums::RemoteFileType,
+		service_worker::{StreamWriter, WriteFrame},
+		traits::HasFileInfo,
+	},
 	io::client_impl::IoSharedClientExt,
 };
 
@@ -34,7 +38,7 @@ impl ServiceWorkerClient {
 		&self,
 		params: DownloadFileStreamParams,
 	) -> Result<(), Error> {
-		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
 
 		let writer = wasm_streams::WritableStream::from_raw(params.writer)
 			.try_into_async_write()

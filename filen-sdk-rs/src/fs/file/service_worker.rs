@@ -1,17 +1,30 @@
 use futures::{AsyncWrite, future::BoxFuture};
+
+/// A frame sent from a [`StreamWriter`] to the buffered write task
+/// ([`crate::js::spawn_buffered_write_future`]). The explicit [`WriteFrame::Done`]
+/// sentinel lets the task distinguish a stream that completed (close the JS
+/// `WritableStream`) from a sender dropped mid-stream by an error or abort (abort
+/// the stream) — a bare channel close cannot tell the two apart.
+pub(crate) enum WriteFrame {
+	Data(Vec<u8>),
+	Done,
+}
+
 pub(crate) struct StreamWriter {
-	sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+	sender: Option<tokio::sync::mpsc::Sender<WriteFrame>>,
 	// change to stack based future once https://github.com/rust-lang/rust/issues/63063 is stabilized
 	flush_fut: Option<BoxFuture<'static, std::io::Result<()>>>,
+	close_fut: Option<BoxFuture<'static, std::io::Result<()>>>,
 	current_chunk: Option<Vec<u8>>,
 }
 
 impl StreamWriter {
-	pub fn new(sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+	pub fn new(sender: tokio::sync::mpsc::Sender<WriteFrame>) -> Self {
 		Self {
 			sender: Some(sender),
 			current_chunk: None,
 			flush_fut: None,
+			close_fut: None,
 		}
 	}
 }
@@ -19,10 +32,20 @@ impl StreamWriter {
 pub(crate) const MAX_BUFFER_SIZE_BEFORE_FLUSH: usize = 64 * 1024; // 64 KB
 
 async fn make_flush_fut(
-	sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+	sender: tokio::sync::mpsc::Sender<WriteFrame>,
 	chunk: Vec<u8>,
 ) -> std::io::Result<()> {
-	sender.send(chunk).await.map_err(std::io::Error::other)
+	sender
+		.send(WriteFrame::Data(chunk))
+		.await
+		.map_err(std::io::Error::other)
+}
+
+async fn make_done_fut(sender: tokio::sync::mpsc::Sender<WriteFrame>) -> std::io::Result<()> {
+	sender
+		.send(WriteFrame::Done)
+		.await
+		.map_err(std::io::Error::other)
 }
 
 impl StreamWriter {
@@ -122,29 +145,41 @@ impl AsyncWrite for StreamWriter {
 	) -> std::task::Poll<std::io::Result<()>> {
 		let this = self.get_mut();
 
-		let maybe_flush_fut = match this.get_or_make_flush_fut() {
-			Ok(maybe_fut) => maybe_fut,
-			Err(e) => return std::task::Poll::Ready(Err(e)),
-		};
-		if let Some(flush_fut) = maybe_flush_fut {
-			match flush_fut.as_mut().poll(cx) {
-				std::task::Poll::Ready(res) => {
-					this.flush_fut.take();
-					res?;
-				}
-				std::task::Poll::Pending => {
-					return std::task::Poll::Pending;
+		if this.close_fut.is_none() {
+			let maybe_flush_fut = match this.get_or_make_flush_fut() {
+				Ok(maybe_fut) => maybe_fut,
+				Err(e) => return std::task::Poll::Ready(Err(e)),
+			};
+			if let Some(flush_fut) = maybe_flush_fut {
+				match flush_fut.as_mut().poll(cx) {
+					std::task::Poll::Ready(res) => {
+						this.flush_fut.take();
+						res?;
+					}
+					std::task::Poll::Pending => {
+						return std::task::Poll::Pending;
+					}
 				}
 			}
+
+			let Some(sender) = this.sender.take() else {
+				return std::task::Poll::Ready(Err(std::io::Error::new(
+					std::io::ErrorKind::BrokenPipe,
+					"stream already closed when trying to close",
+				)));
+			};
+			// All data is flushed: send the completion sentinel (dropping the sender
+			// with it) so the write task closes the JS stream instead of aborting it.
+			this.close_fut = Some(Box::pin(make_done_fut(sender)));
 		}
 
-		if this.sender.take().is_some() {
-			std::task::Poll::Ready(Ok(()))
-		} else {
-			std::task::Poll::Ready(Err(std::io::Error::new(
-				std::io::ErrorKind::BrokenPipe,
-				"stream already closed when trying to close",
-			)))
+		let close_fut = this.close_fut.as_mut().unwrap();
+		match close_fut.as_mut().poll(cx) {
+			std::task::Poll::Ready(res) => {
+				this.close_fut.take();
+				std::task::Poll::Ready(res)
+			}
+			std::task::Poll::Pending => std::task::Poll::Pending,
 		}
 	}
 }

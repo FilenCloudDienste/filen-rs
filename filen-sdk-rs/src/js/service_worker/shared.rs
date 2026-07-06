@@ -1,9 +1,13 @@
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::js::{AnyFile, ManagedFuture};
-use crate::{Error, ErrorKind, fs::file::service_worker::MAX_BUFFER_SIZE_BEFORE_FLUSH};
+use crate::{
+	Error, ErrorKind,
+	fs::file::service_worker::{MAX_BUFFER_SIZE_BEFORE_FLUSH, WriteFrame},
+};
 
 use filen_macros::js_type;
 use futures::AsyncWriteExt;
+use wasm_bindgen::JsValue;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[js_type(import, wasm_all, no_ser, no_default)]
@@ -111,7 +115,7 @@ pub struct DownloadFileStreamParams {
 // }
 
 pub(crate) fn spawn_buffered_write_future(
-	mut data_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+	mut data_receiver: tokio::sync::mpsc::Receiver<WriteFrame>,
 	mut writer: wasm_streams::writable::IntoAsyncWrite<'static>,
 	progress_callback: Option<impl Fn(u64) + 'static>,
 	result_sender: tokio::sync::oneshot::Sender<Result<(), Error>>,
@@ -119,8 +123,16 @@ pub(crate) fn spawn_buffered_write_future(
 	wasm_bindgen_futures::spawn_local(async move {
 		let mut local_cache = Vec::with_capacity(1024);
 		let mut read = 0u64;
+		let mut completed = false;
 
-		while let Some(data) = data_receiver.recv().await {
+		while let Some(frame) = data_receiver.recv().await {
+			let data = match frame {
+				WriteFrame::Data(data) => data,
+				WriteFrame::Done => {
+					completed = true;
+					break;
+				}
+			};
 			local_cache.extend_from_slice(&data);
 
 			if local_cache.len() < MAX_BUFFER_SIZE_BEFORE_FLUSH {
@@ -138,6 +150,21 @@ pub(crate) fn spawn_buffered_write_future(
 				callback(read);
 			}
 			local_cache.clear();
+		}
+
+		if !completed {
+			// The sender was dropped without a Done frame: the producing download
+			// errored or was aborted mid-stream. Abort the stream so the JS side
+			// discards the partial data instead of saving a truncated file as
+			// complete.
+			let _ = writer
+				.abort_with_reason(&JsValue::from_str("download did not complete"))
+				.await;
+			let _ = result_sender.send(Err(Error::custom(
+				ErrorKind::Cancelled,
+				"stream producer dropped before completing",
+			)));
+			return;
 		}
 
 		if !local_cache.is_empty() {

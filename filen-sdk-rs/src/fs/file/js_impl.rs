@@ -25,7 +25,7 @@ use futures::{AsyncRead, AsyncReadExt};
 use wasm_bindgen::prelude::JsValue;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub(crate) use super::service_worker::StreamWriter;
+pub(crate) use super::service_worker::{StreamWriter, WriteFrame};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 struct StreamReader {
@@ -372,7 +372,7 @@ async fn download_file_to_writer_generic<T>(
 where
 	T: SharedClient + Send + Sync + 'static,
 {
-	let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+	let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
 
 	let writer = wasm_streams::WritableStream::from_raw(params.writer)
 		.try_into_async_write()

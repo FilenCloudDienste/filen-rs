@@ -18,7 +18,7 @@ import init, {
 	type CacheStatusMessage,
 	type CacheSearchSnapshot
 } from "./sdk-rs.js"
-import { expect, beforeAll, test, afterAll, afterEach } from "vitest"
+import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
 
 console.log("Initializing WASM...")
@@ -317,6 +317,58 @@ test("abort", async () => {
 		expect(meta?.name).not.toBe("abort a.txt")
 		expect(meta?.name).not.toBe("abort c.txt")
 	}
+})
+
+test("aborted download aborts the WritableStream instead of closing it", async () => {
+	// large enough that the download is still mid-stream when the abort lands:
+	// the internal frame channel buffers at most ~10 x 64 KiB before the producer blocks
+	const remoteFile = await state.uploadFile(new Uint8Array(4 * 1024 * 1024), {
+		name: "abort stream.bin",
+		parent: testDir
+	})
+
+	const abortController = new AbortController()
+	let closed = false
+	let aborted = false
+	const writer = new WritableStream<Uint8Array>({
+		write() {
+			// abort as soon as the first flushed chunk arrives, mid-stream
+			abortController.abort()
+		},
+		close() {
+			closed = true
+		},
+		abort() {
+			aborted = true
+		}
+	})
+
+	let error: unknown
+	try {
+		await state.downloadFileToWriter({
+			file: remoteFile,
+			writer,
+			managedFuture: {
+				abortSignal: abortController.signal
+			}
+		})
+	} catch (e) {
+		error = e
+	}
+	expect(error).toBeInstanceOf(FilenSdkError)
+	expect((error as FilenSdkError).kind).toBe("Cancelled")
+
+	// the promise settles as soon as the abort fires, while the background write
+	// task still drains its buffered frames before sealing the stream — wait for
+	// the stream to reach its terminal state
+	await vi.waitFor(() => {
+		expect(aborted || closed).toBe(true)
+	})
+
+	// a producer that died mid-stream must abort() the stream; a clean close()
+	// makes the browser treat the truncated download as complete
+	expect(aborted).toBe(true)
+	expect(closed).toBe(false)
 })
 
 test("pause", async () => {

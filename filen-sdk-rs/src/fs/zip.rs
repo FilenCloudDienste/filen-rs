@@ -764,7 +764,7 @@ mod js_client_impl {
 		Error, ErrorKind,
 		auth::JsClient,
 		fs::{
-			file::service_worker::StreamWriter,
+			file::service_worker::{StreamWriter, WriteFrame},
 			zip::js_impl::{ZipItem, download_zip_items},
 		},
 		js::{ManagedFuture, spawn_buffered_write_future},
@@ -784,7 +784,7 @@ mod js_client_impl {
 			progress: web_sys::js_sys::Function,
 			managed_future: ManagedFuture,
 		) -> Result<(), Error> {
-			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
 
 			let writer = wasm_streams::WritableStream::from_raw(writable_stream)
 				.try_into_async_write()
@@ -848,7 +848,7 @@ mod service_worker_impl {
 	use crate::{
 		Error, ErrorKind,
 		fs::{
-			file::service_worker::StreamWriter,
+			file::service_worker::{StreamWriter, WriteFrame},
 			zip::js_impl::{ZipItem, download_zip_items},
 		},
 		js::{ManagedFuture, ServiceWorkerClient, spawn_buffered_write_future},
@@ -870,7 +870,7 @@ mod service_worker_impl {
 		) -> Result<(), Error> {
 			use wasm_bindgen::JsValue;
 
-			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
 
 			let writer = wasm_streams::WritableStream::from_raw(writable_stream)
 				.try_into_async_write()
@@ -1016,10 +1016,12 @@ mod unauth_js_client_impl {
 			managed_future: crate::js::ManagedFuture,
 		) -> Result<(), Error> {
 			use crate::{
-				ErrorKind, fs::file::service_worker::StreamWriter, js::spawn_buffered_write_future,
+				ErrorKind,
+				fs::file::service_worker::{StreamWriter, WriteFrame},
+				js::spawn_buffered_write_future,
 			};
 
-			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(10);
+			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
 
 			let writer = wasm_streams::WritableStream::from_raw(writable_stream)
 				.try_into_async_write()
