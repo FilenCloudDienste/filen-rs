@@ -56,6 +56,7 @@ pub(crate) fn resolve_final_times(
 }
 
 mod imp {
+	use std::panic::AssertUnwindSafe;
 	use std::pin::Pin;
 	use std::task::{Context, Poll};
 
@@ -68,6 +69,7 @@ mod imp {
 	use tokio_util::sync::PollSender;
 
 	use crate::runtime::SpawnTaskHandle;
+	use crate::util::MaybeSend;
 	use crate::{Error, ErrorKind};
 
 	use super::{ExifMediaKind, ExifTimes, resolve_final_times};
@@ -150,7 +152,7 @@ mod imp {
 			fallback_time: DateTime<Utc>,
 		) -> Self {
 			let (tx, rx) = mpsc::channel::<Bytes>(4);
-			let parse_handle = crate::runtime::spawn_task_maybe_send(parse_exif_stream(rx, kind));
+			let parse_handle = spawn_parse_task(parse_exif_stream(rx, kind));
 			Self {
 				tx: PollSender::new(tx),
 				parse_handle,
@@ -267,6 +269,45 @@ mod imp {
 		}
 	}
 
+	/// The single spawn seam for the EXIF parse task: both production
+	/// (`ExifTeeState::new`) and the panic-containment test go through here, so
+	/// the `catch_parse_panic` wrapper cannot be dropped from one without
+	/// breaking the other. The returned handle is what `poll_finalize` polls.
+	pub(crate) fn spawn_parse_task(
+		fut: impl Future<Output = Result<ExifTimes, Error>> + MaybeSend + 'static,
+	) -> SpawnTaskHandle<Result<ExifTimes, Error>> {
+		crate::runtime::spawn_task_maybe_send(catch_parse_panic(fut))
+	}
+
+	/// nom_exif parses attacker-controlled media, so a panic inside it must
+	/// surface as a parse failure for this one file — the spawned task's handle
+	/// re-raises task panics on poll, which would tear down the whole process.
+	/// This mapping only holds where unwinding exists (native/uniffi); on
+	/// wasm32-unknown-unknown a parser panic traps the instance before
+	/// `catch_unwind` can run.
+	/// Unwind safety: on panic the parser future and everything it owns is
+	/// dropped without being observed again; the byte channel's sender side
+	/// just sees the channel close.
+	async fn catch_parse_panic(
+		fut: impl Future<Output = Result<ExifTimes, Error>>,
+	) -> Result<ExifTimes, Error> {
+		match AssertUnwindSafe(fut).catch_unwind().await {
+			Ok(res) => res,
+			Err(panic) => {
+				let msg = panic
+					.downcast_ref::<&str>()
+					.copied()
+					.map(str::to_owned)
+					.or_else(|| panic.downcast_ref::<String>().cloned())
+					.unwrap_or_else(|| "opaque panic payload".to_owned());
+				Err(Error::custom(
+					ErrorKind::Internal,
+					format!("EXIF parser panicked: {msg}"),
+				))
+			}
+		}
+	}
+
 	pub(crate) async fn parse_exif_stream(
 		rx: mpsc::Receiver<Bytes>,
 		kind: ExifMediaKind,
@@ -361,6 +402,37 @@ mod tests {
 		imp::parse_exif_stream(rx, ExifMediaKind::Image)
 			.await
 			.unwrap_err();
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn panicking_parse() -> Result<ExifTimes, crate::Error> {
+		panic!("boom")
+	}
+
+	// Formatted panics carry a String payload instead of &'static str.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn panicking_parse_string_payload() -> Result<ExifTimes, crate::Error> {
+		let detail = "formatted";
+		panic!("boom {detail}")
+	}
+
+	// Drives the same spawn seam `ExifTeeState::new` uses; awaiting the handle
+	// polls the same future `poll_finalize` polls, so an uncaught panic would
+	// re-raise here exactly as it would in production.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn spawned_parse_panic_surfaces_as_error_not_panic() {
+		let err = imp::spawn_parse_task(panicking_parse()).await.unwrap_err();
+		assert!(err.to_string().contains("boom"));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn spawned_parse_panic_preserves_string_payload_message() {
+		let err = imp::spawn_parse_task(panicking_parse_string_payload())
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("boom formatted"));
 	}
 
 	#[test]
