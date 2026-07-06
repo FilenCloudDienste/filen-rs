@@ -32,9 +32,13 @@ impl Client {
 		max_sleep_time: Duration,
 		attempts: usize,
 	) -> Result<Arc<ResourceLock>, Error> {
+		// A cached lock whose keep-alive lost the server-side lease must not be
+		// handed out again: fall through and acquire a fresh one, replacing the
+		// stale cache entry (the dead Arc stays alive for its existing holders).
 		let read_lock = lock.read().await;
 		if let Some(weak) = read_lock.as_ref()
 			&& let Some(arc) = weak.upgrade()
+			&& arc.is_valid()
 		{
 			return Ok(arc);
 		}
@@ -42,6 +46,7 @@ impl Client {
 		let mut write_lock = lock.write().await;
 		if let Some(weak) = write_lock.as_ref()
 			&& let Some(arc) = weak.upgrade()
+			&& arc.is_valid()
 		{
 			return Ok(arc);
 		}
@@ -124,6 +129,18 @@ mod js_impl {
 		)]
 		pub fn resource(&self) -> String {
 			self.0.resource().to_string()
+		}
+
+		/// Whether the lock still holds its server-side lease. `false` means the
+		/// keep-alive lost it (refused refresh or none confirmed in time) and
+		/// another client may already hold the resource — re-acquire before
+		/// relying on it.
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "isValid")
+		)]
+		pub fn is_valid(&self) -> bool {
+			self.0.is_valid()
 		}
 	}
 
