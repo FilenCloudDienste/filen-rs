@@ -164,6 +164,9 @@ impl JsClient {
 		Ok(())
 	}
 
+	/// Upload limits below 16 KB/s are clamped up to 16 KB/s, the upload chunking granularity.
+	/// Note the asymmetry with construction: `upload_bandwidth_kilobytes_per_sec` values in
+	/// 1..16 are rejected as an error there, while this runtime setter silently clamps them.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn set_bandwidth_limits(&self, upload_kbps: u32, download_kbps: u32) {
 		let upload_kbps = NonZeroU32::new(upload_kbps);

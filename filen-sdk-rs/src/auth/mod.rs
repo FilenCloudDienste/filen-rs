@@ -575,6 +575,7 @@ impl Client {
 			.await;
 	}
 
+	/// Upload limits below 16 KB/s are clamped up to 16 KB/s, the upload chunking granularity.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	pub async fn set_bandwidth_limits(
 		&self,

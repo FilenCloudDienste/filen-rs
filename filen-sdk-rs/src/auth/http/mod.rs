@@ -26,7 +26,7 @@ use crate::{
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use bandwidth_limit::{
 	DownloadBandwidthLimiterLayer, UploadBandwidthLimiterLayer, new_download_bandwidth_limiter,
-	new_upload_bandwidth_limiter,
+	new_upload_bandwidth_limiter, set_upload_bandwidth_limit,
 };
 
 mod auth;
@@ -627,10 +627,7 @@ impl AuthClient {
 		download_kbps: Option<NonZeroU32>,
 	) {
 		futures::join!(
-			self.unauthed
-				.state
-				.upload_limiter
-				.change_rate_per_sec(upload_kbps),
+			set_upload_bandwidth_limit(&self.unauthed.state.upload_limiter, upload_kbps),
 			self.unauthed
 				.state
 				.download_limiter

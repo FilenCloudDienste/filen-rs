@@ -108,8 +108,8 @@ where
 								break;
 							},
 							Err(capacity_err) => {
-								limiter.acquire_amount(NonZeroU32::new(capacity_err.0).expect("minimum allowed capacity should be non-zero")).await.expect("cannot be more than the error capacity");
-								let bytes_capacity = (capacity_err.0 as usize) * BYTES_PER_KILOBYTE_USIZE;
+								let acquired = acquire_reported_capacity(&limiter, capacity_err).await;
+								let bytes_capacity = (acquired.get() as usize) * BYTES_PER_KILOBYTE_USIZE;
 								let bytes = bytes.split_to(bytes_capacity);
 								yield Ok(bytes);
 							},
@@ -120,5 +120,70 @@ where
 				Err(e) => yield Err(e),
 			}
 		}
+	}
+}
+
+// A concurrent rate change can swap in a governor with a smaller burst between the
+// failed acquisition that produced `err` and the follow-up acquisition here, so the
+// reported capacity cannot be assumed to still fit; retry with each newly reported
+// capacity instead of panicking. Every reported capacity is at least 1 and strictly
+// below the amount that was just requested, so the retries terminate.
+// Returns the amount of kilobytes actually acquired.
+async fn acquire_reported_capacity(
+	limiter: &RateLimiter,
+	mut err: governor::InsufficientCapacity,
+) -> NonZeroU32 {
+	loop {
+		let amount = NonZeroU32::new(err.0).expect("minimum allowed capacity should be non-zero");
+		match limiter.acquire_amount(amount).await {
+			Ok(()) => return amount,
+			Err(new_err) => err = new_err,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn reported_capacity_acquired_without_rate_change() {
+		let limiter = RateLimiter::default();
+		limiter.change_rate_per_sec(NonZeroU32::new(10)).await;
+		let err = limiter
+			.acquire_amount(NonZeroU32::new(1000).unwrap())
+			.await
+			.expect_err("request should exceed burst capacity");
+		let acquired = acquire_reported_capacity(&limiter, err).await;
+		assert_eq!(acquired.get(), err.0);
+	}
+
+	#[tokio::test]
+	async fn retry_acquires_shrunken_capacity_after_rate_change() {
+		let limiter = RateLimiter::default();
+		limiter.change_rate_per_sec(NonZeroU32::new(10)).await;
+		let err = limiter
+			.acquire_amount(NonZeroU32::new(1000).unwrap())
+			.await
+			.expect_err("request should exceed burst capacity");
+		// mimic a concurrent set_bandwidth_limits lowering the rate between the
+		// failed acquisition and the follow-up one
+		limiter.change_rate_per_sec(NonZeroU32::new(2)).await;
+		let acquired = acquire_reported_capacity(&limiter, err).await;
+		assert!(acquired.get() < err.0);
+		assert_eq!(acquired.get(), 2);
+	}
+
+	#[tokio::test]
+	async fn retry_succeeds_when_limit_removed_after_failed_acquisition() {
+		let limiter = RateLimiter::default();
+		limiter.change_rate_per_sec(NonZeroU32::new(10)).await;
+		let err = limiter
+			.acquire_amount(NonZeroU32::new(1000).unwrap())
+			.await
+			.expect_err("request should exceed burst capacity");
+		limiter.change_rate_per_sec(None).await;
+		let acquired = acquire_reported_capacity(&limiter, err).await;
+		assert_eq!(acquired.get(), err.0);
 	}
 }
