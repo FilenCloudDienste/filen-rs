@@ -82,9 +82,9 @@ impl V2Key {
 		meta: &EncryptedString,
 		mut out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
-		let meta = &meta.0;
-		let nonce = &meta[3..NONCE_SIZE + 3];
-		let nonce = Nonce::from_slice(nonce.as_bytes());
+		// slice as bytes: fixed offsets may not be char boundaries in hostile input
+		let meta = meta.0.as_bytes();
+		let nonce = Nonce::from_slice(&meta[3..NONCE_SIZE + 3]);
 		out.clear();
 		if let Err(e) = BASE64_STANDARD.decode_vec(&meta[NONCE_SIZE + 3..], &mut out) {
 			return Err((e.into(), out));
@@ -140,17 +140,21 @@ impl MetaCrypter for V2Key {
 			));
 		}
 
-		let v1_tag = &meta.0[0..8];
-		if v1_tag == "U2FsdGVk" {
+		// compare as bytes: fixed offsets may not be char boundaries in hostile input
+		let meta_bytes = meta.0.as_bytes();
+		if &meta_bytes[0..8] == b"U2FsdGVk" {
 			return self.decrypt_meta_into_v1(meta, out);
 		}
 
-		let tag = &meta.0[0..3];
-		if tag == "002" {
+		let tag = &meta_bytes[0..3];
+		if tag == b"002" {
 			return self.decrypt_meta_into_v2(meta, out);
 		}
 		Err((
-			ConversionError::InvalidVersion(tag.to_string(), vec!["002".to_string()]),
+			ConversionError::InvalidVersion(
+				String::from_utf8_lossy(tag).into_owned(),
+				vec!["002".to_string()],
+			),
 			out,
 		))
 	}
@@ -392,4 +396,36 @@ pub(crate) fn derive_password_and_mk(
 	let derived_password = DerivedPassword(Cow::Owned(hex::encode(hasher.finalize())));
 
 	Ok((master_key, derived_password))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn decrypt(meta: &str) -> Result<String, ConversionError> {
+		let key = MasterKey::from_str(&"a".repeat(32)).expect("valid 32-char key");
+		key.blocking_decrypt_meta(&EncryptedString(Cow::Borrowed(meta)))
+	}
+
+	#[test]
+	fn decrypt_meta_rejects_multibyte_char_spanning_v1_tag_offset() {
+		let meta = format!("aaaaaaa\u{e9}{}", "a".repeat(6));
+		assert_eq!(meta.len(), NONCE_SIZE + 3);
+		assert!(decrypt(&meta).is_err());
+	}
+
+	#[test]
+	fn decrypt_meta_rejects_multibyte_char_spanning_version_tag_offset() {
+		let meta = format!("aa\u{e9}{}", "a".repeat(11));
+		assert!(matches!(
+			decrypt(&meta),
+			Err(ConversionError::InvalidVersion(..))
+		));
+	}
+
+	#[test]
+	fn decrypt_meta_rejects_multibyte_char_spanning_nonce_end_offset() {
+		let meta = format!("002{}\u{e9}aaaa", "a".repeat(11));
+		assert!(decrypt(&meta).is_err());
+	}
 }

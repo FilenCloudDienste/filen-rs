@@ -125,7 +125,8 @@ impl MetaCrypter for EncryptionKey {
 		meta: &EncryptedString<'_>,
 		mut out: Vec<u8>,
 	) -> Result<String, (ConversionError, Vec<u8>)> {
-		let meta = &meta.0;
+		// slice as bytes: fixed offsets may not be char boundaries in hostile input
+		let meta = meta.0.as_bytes();
 		if meta.len() < NONCE_SIZE * 2 + 3 {
 			// hex encoded NONCE_SIZE + 3 for version tag
 			return Err((
@@ -134,17 +135,17 @@ impl MetaCrypter for EncryptionKey {
 			));
 		}
 		let tag = &meta[0..3];
-		if tag != "003" {
+		if tag != b"003" {
 			return Err((
-				ConversionError::InvalidVersion(tag.to_string(), vec!["003".to_string()]),
+				ConversionError::InvalidVersion(
+					String::from_utf8_lossy(tag).into_owned(),
+					vec!["003".to_string()],
+				),
 				out,
 			));
 		}
 		let mut nonce = [0u8; NONCE_SIZE];
-		if let Err(e) = hex::decode_to_slice(
-			&meta.as_bytes()[3..3 + NONCE_SIZE * 2],
-			nonce.as_mut_slice(),
-		) {
+		if let Err(e) = hex::decode_to_slice(&meta[3..3 + NONCE_SIZE * 2], nonce.as_mut_slice()) {
 			return Err((e.into(), out));
 		}
 		let nonce = Nonce::from(nonce);
@@ -207,4 +208,32 @@ pub(crate) fn make_link_salt() -> LinkPasswordSalt {
 	LinkPasswordSalt::V3(Box::new(SizedHexString::<U256>::from(rand::random::<
 		[u8; 256],
 	>())))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn decrypt(meta: &str) -> Result<String, ConversionError> {
+		EncryptionKey::new([0u8; 32]).blocking_decrypt_meta(&EncryptedString(Cow::Borrowed(meta)))
+	}
+
+	#[test]
+	fn decrypt_meta_rejects_multibyte_char_spanning_version_tag_offset() {
+		let meta = format!("00\u{e9}{}", "a".repeat(24));
+		assert!(matches!(
+			decrypt(&meta),
+			Err(ConversionError::InvalidVersion(..))
+		));
+	}
+
+	// Pins the invalid-hex error path: the multibyte char lands inside the hex
+	// nonce region (bytes 3..27), so hex decoding fails. This is NOT a former
+	// panic site — byte 27 cannot be a non-boundary after a successful hex
+	// decode of bytes 3..27.
+	#[test]
+	fn decrypt_meta_rejects_multibyte_char_in_nonce_region() {
+		let meta = format!("003{}\u{e9}aa", "a".repeat(23));
+		assert!(decrypt(&meta).is_err());
+	}
 }
