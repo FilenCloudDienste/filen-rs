@@ -13,16 +13,22 @@ use crate::{
 };
 
 use super::{
-	consts::{MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL, RECONNECT_DELAY},
+	consts::{
+		CONNECT_TIMEOUT, MESSAGE_CONNECT_PAYLOAD, MESSAGE_EVENT_PAYLOAD, PING_INTERVAL,
+		RECONNECT_DELAY,
+	},
 	events::DecryptedSocketEvent,
 	listener_manager::{ConnectedListenerManager, DisconnectedListenerManager, ListenerManagerExt},
 	traits::*,
 };
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use wasmtimer::tokio::sleep;
+use wasmtimer::{
+	std::Instant,
+	tokio::{sleep, timeout},
+};
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use super::native;
@@ -303,6 +309,13 @@ where
 
 	let mut decryption_futures = FuturesOrdered::new();
 
+	// A black-holed connection (NAT rebind, dead path) delivers neither an error
+	// nor a close frame — receive() would pend forever while is_connected() stays
+	// true. Any inbound frame resets this deadline; if it fires, the connection is
+	// declared dead and the reconnect loop takes over.
+	let liveness_timeout = liveness_timeout_from(config.ping_interval);
+	let mut liveness = std::pin::pin!(sleep(liveness_timeout));
+
 	loop {
 		tokio::select! {
 			biased;
@@ -324,6 +337,7 @@ where
 				}
 			},
 			message_result = receiver.receive() => {
+				liveness.as_mut().reset(Instant::now() + liveness_timeout);
 				let message = match message_result {
 					None => {
 						// websocket closed
@@ -380,6 +394,13 @@ where
 						);
 					}
 				}
+			},
+			_ = liveness.as_mut() => {
+				tracing::warn!(
+					"No WebSocket traffic within {:?}, reconnecting",
+					liveness_timeout
+				);
+				break;
 			},
 		}
 	}
@@ -537,15 +558,25 @@ where
 	<RV::Output as Deref>::Target: AsRef<str>,
 	PT: PingTask<S>,
 {
-	tracing::debug!("Connecting to WebSocket server...");
-	let request = W::build_request().await?;
+	// One deadline over the whole setup: connect_async and every handshake read
+	// are otherwise unbounded, so a dead peer would park the task forever.
+	let setup = async {
+		tracing::debug!("Connecting to WebSocket server...");
+		let request = W::build_request().await?;
 
-	tracing::debug!("WebSocket request built, connecting...");
+		tracing::debug!("WebSocket request built, connecting...");
 
-	let unauthed_ws = W::connect(request).await?;
-	tracing::debug!("WebSocket connected, performing handshake...");
+		let unauthed_ws = W::connect(request).await?;
+		tracing::debug!("WebSocket connected, performing handshake...");
 
-	perform_handshake(unauthed_ws, listeners, api_key).await
+		perform_handshake(unauthed_ws, listeners, api_key).await
+	};
+	timeout(CONNECT_TIMEOUT, setup).await.map_err(|_| {
+		Error::custom(
+			ErrorKind::Server,
+			"timed out establishing websocket connection",
+		)
+	})?
 }
 
 // `skip_all` is load-bearing here: `api_key` must never be recorded as a span field. `err` logs
@@ -703,6 +734,17 @@ fn ping_interval_from_millis(millis: u64) -> Duration {
 	Duration::from_millis(millis).max(MIN_PING_INTERVAL)
 }
 
+/// How long without ANY inbound frame before the connection is declared dead and
+/// reconnected. The server acknowledges each client ping within its ping window,
+/// so a healthy connection receives something at least every `ping_interval`; two
+/// missed windows plus grace means the path is gone (NAT rebind, black hole) even
+/// though the socket never errored or closed.
+fn liveness_timeout_from(ping_interval: Duration) -> Duration {
+	ping_interval
+		.saturating_mul(2)
+		.saturating_add(Duration::from_secs(5))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -778,6 +820,11 @@ mod tests {
 		pub(super) enum ServerAction {
 			/// deliver this frame to the client
 			Msg(String),
+			/// deliver this frame after the delay elapses (the paused clock
+			/// auto-advances to it); NOTE: the item is consumed when `receive`
+			/// is first polled, so a script must not rely on redelivery if
+			/// another select arm wins during the delay
+			Delayed(Duration, String),
 			/// surface a transport-level receive error
 			Err(&'static str),
 			/// clean close (receive yields None)
@@ -882,6 +929,10 @@ mod tests {
 			async fn receive(&mut self) -> Option<Result<FakeMsg, Error>> {
 				match self.script.pop_front() {
 					Some(ServerAction::Msg(s)) => Some(Ok(FakeMsg(s))),
+					Some(ServerAction::Delayed(delay, s)) => {
+						tokio::time::sleep(delay).await;
+						Some(Ok(FakeMsg(s)))
+					}
 					Some(ServerAction::Err(s)) => Some(Err(Error::custom(ErrorKind::Server, s))),
 					Some(ServerAction::Close) => None,
 					// an exhausted script behaves like a black-holed connection
@@ -1140,6 +1191,123 @@ mod tests {
 				.filter(|m| m.contains("apiKey"))
 				.collect();
 			assert_eq!(auth_messages, [r#"42["auth",{"apiKey":"rotated-key"}]"#]);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn black_holed_connection_triggers_reconnect_via_liveness_deadline() {
+			let begin = tokio::time::Instant::now();
+			let config = test_config();
+
+			// a NAT rebind / network black hole: the connection stops delivering
+			// anything, without an error or a close frame
+			let socket = FakeSocket::from_unauthed_parts(
+				FakeSender,
+				FakeReceiver {
+					script: vec![ServerAction::Hang].into(),
+				},
+			);
+
+			let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
+			let mut listeners = DisconnectedListenerManager::new().into_connected();
+
+			let should_retry = tokio::time::timeout(
+				Duration::from_secs(3600),
+				handle_initialized_websocket(
+					&config,
+					socket,
+					&mut request_receiver,
+					&mut listeners,
+					&NoopCrypter,
+					&test_private_key(),
+				),
+			)
+			.await
+			.expect("a silent connection must be torn down by the liveness deadline");
+
+			assert!(
+				should_retry,
+				"a dead connection reconnects, it does not kill the task"
+			);
+			assert_eq!(begin.elapsed(), liveness_timeout_from(config.ping_interval));
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn inbound_traffic_resets_the_liveness_deadline() {
+			let begin = tokio::time::Instant::now();
+			let config = test_config();
+			let liveness = liveness_timeout_from(config.ping_interval);
+
+			// one (ignored, non-event) frame arrives shortly before the deadline
+			// would fire; the deadline must restart from that frame
+			let socket = FakeSocket::from_unauthed_parts(
+				FakeSender,
+				FakeReceiver {
+					script: vec![
+						ServerAction::Delayed(liveness - Duration::from_secs(1), "3".to_string()),
+						ServerAction::Hang,
+					]
+					.into(),
+				},
+			);
+
+			let (_request_sender, mut request_receiver) = tokio::sync::mpsc::channel(16);
+			let mut listeners = DisconnectedListenerManager::new().into_connected();
+
+			let should_retry = tokio::time::timeout(
+				Duration::from_secs(3600),
+				handle_initialized_websocket(
+					&config,
+					socket,
+					&mut request_receiver,
+					&mut listeners,
+					&NoopCrypter,
+					&test_private_key(),
+				),
+			)
+			.await
+			.expect("a silent connection must be torn down by the liveness deadline");
+
+			assert!(should_retry);
+			assert_eq!(
+				begin.elapsed(),
+				(liveness - Duration::from_secs(1)) + liveness
+			);
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn hung_handshake_times_out_and_stays_retryable() {
+			let begin = tokio::time::Instant::now();
+
+			// server accepts the connection but never sends the handshake packet
+			prime(vec![FakeConnection::new(vec![ServerAction::Hang])]);
+
+			let mut listeners = DisconnectedListenerManager::new();
+			let result = tokio::time::timeout(
+				Duration::from_secs(3600),
+				connect_and_build_socket::<
+					FakeUnauthedSocket,
+					FakeSender,
+					FakeReceiver,
+					FakeMsg,
+					FakeSocket,
+					FakeSender,
+					FakeReceiver,
+					(),
+					FakeNoopPingTask,
+				>("key", &mut listeners),
+			)
+			.await
+			.expect("a hung handshake must time out on its own");
+
+			let err = match result {
+				Ok(_) => panic!("the hung handshake must fail"),
+				Err(e) => e,
+			};
+			assert!(
+				!matches!(err.kind(), ErrorKind::Unauthenticated),
+				"a handshake timeout must stay retryable, got: {err}"
+			);
+			assert_eq!(begin.elapsed(), CONNECT_TIMEOUT);
 		}
 	}
 

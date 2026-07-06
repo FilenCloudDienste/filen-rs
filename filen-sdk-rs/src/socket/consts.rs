@@ -21,6 +21,10 @@ pub(super) const PING_MESSAGE: &str = match str::from_utf8(&[PacketType::Ping as
 
 pub(super) const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 pub(super) const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Ceiling for one full connection setup (websocket connect + socket.io
+/// handshake + auth). Without it, a black-holed TCP connect or a handshake
+/// read against a dead peer parks the websocket task forever with no retry.
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) const WEBSOCKET_URL_CORE: &str =
 	"wss://socket.filen.io/socket.io/?EIO=3&transport=websocket&t=";
