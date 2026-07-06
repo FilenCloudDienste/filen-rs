@@ -146,6 +146,16 @@ impl<'a> FileReader<'a> {
 		if self.file.chunks() == 0 {
 			return None;
 		}
+		// A chunk starting at or past the range limit contains no wanted bytes. Every
+		// fetch decision funnels through here, so without this bound a ranged reader
+		// keeps downloading (and decrypting) chunks to EOF after the range is exhausted.
+		if self
+			.next_chunk_idx
+			.checked_mul(CHUNK_SIZE_U64)
+			.is_none_or(|chunk_start| chunk_start >= self.limit)
+		{
+			return None;
+		}
 		if self.next_chunk_idx < self.file.chunks() - 1 {
 			Some(FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()))
 		} else if self.next_chunk_idx == self.file.chunks() - 1 {
@@ -184,7 +194,10 @@ impl<'a> FileReader<'a> {
 	///
 	/// Requires that `out_data` have the necessary capacity to store the entire chunk returned from the server
 	fn push_fetch_next_chunk(&mut self, out_data: Chunk<'a>) {
-		if self.file.chunks() <= self.next_chunk_idx {
+		// Funnel through next_chunk_size so the range-limit bound applies here too:
+		// read_next_chunk recycles the previous chunk's buffer into this call without
+		// consulting chunk sizing first.
+		if self.next_chunk_size().is_none() {
 			return;
 		}
 		let chunk_idx = self.next_chunk_idx;
@@ -519,6 +532,72 @@ mod tests {
 		);
 		reader.next_chunk_idx = 3;
 		assert_eq!(reader.next_chunk_size(), None);
+	}
+
+	#[test]
+	fn ranged_reader_does_not_prefetch_past_limit() {
+		let client = test_client();
+		let file = FakeFile::new(10 * CHUNK_SIZE_U64, 10);
+		// range [0, 1.5 MiB): only chunks 0 and 1 contain wanted bytes
+		let reader = FileReaderBuilder::new(&client, &file)
+			.with_end(CHUNK_SIZE_U64 + CHUNK_SIZE_U64 / 2)
+			.build();
+		assert_eq!(reader.next_chunk_idx, 2);
+		assert_eq!(reader.futures.len(), 2);
+		assert!(reader.allocate_chunk_future.is_none());
+	}
+
+	#[test]
+	fn ranged_reader_prefetch_stops_at_exact_chunk_boundary() {
+		let client = test_client();
+		let file = FakeFile::new(4 * CHUNK_SIZE_U64, 4);
+		// end lands exactly on the chunk 2 boundary: chunk 2 starts at the limit
+		// and contains no wanted bytes, while chunk 1 (holding byte limit-1) does
+		let reader = FileReaderBuilder::new(&client, &file)
+			.with_end(2 * CHUNK_SIZE_U64)
+			.build();
+		assert_eq!(reader.next_chunk_idx, 2);
+		assert_eq!(reader.futures.len(), 2);
+	}
+
+	#[test]
+	fn ranged_reader_prefetches_only_chunks_within_range() {
+		let client = test_client();
+		let file = FakeFile::new(10 * CHUNK_SIZE_U64, 10);
+		// range [8.5 MiB, 9 MiB) lies entirely within chunk 8
+		let reader = FileReaderBuilder::new(&client, &file)
+			.with_start(8 * CHUNK_SIZE_U64 + CHUNK_SIZE_U64 / 2)
+			.with_end(9 * CHUNK_SIZE_U64)
+			.build();
+		assert_eq!(reader.next_chunk_idx, 9);
+		assert_eq!(reader.futures.len(), 1);
+	}
+
+	#[test]
+	fn ranged_reader_does_not_cascade_fetches_after_limit_reached() {
+		let client = test_client();
+		let file = FakeFile::new(10 * CHUNK_SIZE_U64, 10);
+		let mut reader = FileReaderBuilder::new(&client, &file)
+			.with_end(CHUNK_SIZE_U64 / 2)
+			.with_max_buffer_size(0)
+			.build();
+		// simulate the state right after the range was exhausted mid-chunk:
+		// chunk 0 is current with unread bytes left, and index sits at the limit
+		reader.index = reader.limit;
+		reader.next_chunk_idx = 1;
+		let chunk = Chunk::try_acquire(
+			FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()),
+			client.state(),
+		)
+		.unwrap();
+		reader.curr_chunk = Some(Cursor::new(chunk));
+		let mut buf = [0u8; 16];
+		assert_eq!(reader.read_next_chunk(&mut buf).unwrap(), 0);
+		assert_eq!(
+			reader.futures.len(),
+			0,
+			"reaching the range limit must not enqueue further chunk fetches"
+		);
 	}
 
 	#[test]
