@@ -411,6 +411,31 @@ impl DecryptedGeneralEvent<'_> {
 	}
 }
 
+/// The `event_type()` string this wire event will present as AFTER decryption.
+///
+/// Mirrors the fold performed by [`DecryptedSocketEvent::try_from_encrypted`]:
+/// the rename wire events are absorbed into `*MetadataChanged` (they have no
+/// dispatch-side variant of their own); every other variant's name is identical
+/// across the wire/dispatch boundary. The pre-decryption listener gate must key
+/// on THIS name — the only one the exported listener API advertises — or
+/// type-filtered listeners never see folded events: the wire name fails their
+/// filter before decryption, and the dispatch name is only produced after it.
+/// Any future many-to-one fold added to `try_from_encrypted` needs a matching
+/// arm here.
+pub(crate) fn dispatch_event_type(event: &SocketEvent<'_>) -> &'static str {
+	match event {
+		SocketEvent::Drive {
+			inner: DriveEventType::FileRename(_),
+			..
+		} => "fileMetadataChanged",
+		SocketEvent::Drive {
+			inner: DriveEventType::FolderRename(_),
+			..
+		} => "folderMetadataChanged",
+		other => other.event_type(),
+	}
+}
+
 impl DecryptedSocketEvent<'_> {
 	pub(crate) async fn try_from_encrypted<T>(
 		crypter: &impl MetaCrypter,

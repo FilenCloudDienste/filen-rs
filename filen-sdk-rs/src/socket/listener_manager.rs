@@ -313,8 +313,13 @@ impl ConnectedListenerManager {
 	}
 
 	pub(crate) fn should_decrypt_event(&self, event: &SocketEvent<'_>) -> bool {
+		// Key on the POST-decryption name (renames fold into *MetadataChanged):
+		// filters are registered against the names dispatch will use, so gating
+		// on the raw wire name silently drops folded events before decryption.
 		!self.global_callbacks().is_empty()
-			|| self.callbacks_for_event().contains_key(event.event_type())
+			|| self
+				.callbacks_for_event()
+				.contains_key(crate::socket::events::dispatch_event_type(event))
 	}
 }
 
@@ -344,5 +349,92 @@ impl ListenerManagerExt for ConnectedListenerManager {
 		if let Some(callback) = callback {
 			callback(&DecryptedSocketEvent::Unsubscribed);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::borrow::Cow;
+
+	use filen_types::{
+		api::v3::socket::{DriveEventType, FileRename, FolderRename},
+		crypto::EncryptedString,
+		fs::UuidStr,
+	};
+
+	use super::*;
+
+	fn manager_filtered_on(event_type: &'static str) -> ConnectedListenerManager {
+		let mut manager = DisconnectedListenerManager::new();
+		let (id_sender, id_receiver) = tokio::sync::oneshot::channel();
+		let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+		ListenerManagerExt::add_listener(
+			&mut manager,
+			Box::new(|_| {}),
+			cancel_receiver,
+			id_sender,
+			Some(std::iter::once(Cow::Borrowed(event_type))),
+		);
+		// keep the registration alive through promotion: a dropped id receiver
+		// makes into_connected discard the listener
+		std::mem::forget(id_receiver);
+		manager.into_connected()
+	}
+
+	// Renames are folded into *MetadataChanged during decryption, so the
+	// pre-decryption gate must key on the POST-decryption name — the only one
+	// the exported listener API advertises. Gating on the wire name silently
+	// dropped every rename for type-filtered listeners.
+	#[test]
+	fn wire_renames_pass_the_gate_for_metadata_changed_filters() {
+		let manager = manager_filtered_on("fileMetadataChanged");
+		let event = SocketEvent::Drive {
+			inner: DriveEventType::FileRename(FileRename {
+				uuid: UuidStr::default(),
+				metadata: EncryptedString(Cow::Borrowed("encrypted")),
+			}),
+			drive_message_id: 1,
+		};
+		assert!(
+			manager.should_decrypt_event(&event),
+			"a fileRename decrypts into fileMetadataChanged and must reach that filter"
+		);
+
+		let manager = manager_filtered_on("folderMetadataChanged");
+		let event = SocketEvent::Drive {
+			inner: DriveEventType::FolderRename(FolderRename {
+				uuid: UuidStr::default(),
+				name: EncryptedString(Cow::Borrowed("encrypted")),
+			}),
+			drive_message_id: 2,
+		};
+		assert!(
+			manager.should_decrypt_event(&event),
+			"a folderRename decrypts into folderMetadataChanged and must reach that filter"
+		);
+	}
+
+	#[test]
+	fn unfolded_events_still_gate_on_their_own_name() {
+		let manager = manager_filtered_on("fileMetadataChanged");
+		let event = SocketEvent::Drive {
+			inner: DriveEventType::FileTrash(filen_types::api::v3::socket::FileTrash {
+				uuid: UuidStr::default(),
+			}),
+			drive_message_id: 3,
+		};
+		assert!(
+			!manager.should_decrypt_event(&event),
+			"a fileTrash is not folded and must not match a fileMetadataChanged filter"
+		);
+
+		let manager = manager_filtered_on("fileTrash");
+		let event = SocketEvent::Drive {
+			inner: DriveEventType::FileTrash(filen_types::api::v3::socket::FileTrash {
+				uuid: UuidStr::default(),
+			}),
+			drive_message_id: 4,
+		};
+		assert!(manager.should_decrypt_event(&event));
 	}
 }
