@@ -188,14 +188,16 @@ pub mod seconds_or_millis {
 	use serde::{Deserialize, Deserializer, Serializer};
 
 	pub(crate) fn from_seconds_or_millis(value: i64) -> Option<DateTime<Utc>> {
-		let now = Utc::now().timestamp_millis();
-		DateTime::<Utc>::from_timestamp_millis(
-			if (now - value).abs() < (now - value * 1000).abs() {
-				value
-			} else {
-				value * 1000
-			},
-		)
+		// i128 arithmetic: `value * 1000` and `now - value` overflow i64 for
+		// values near its bounds
+		let now = i128::from(Utc::now().timestamp_millis());
+		let value = i128::from(value);
+		let millis = if (now - value).abs() < (now - value * 1000).abs() {
+			value
+		} else {
+			value * 1000
+		};
+		DateTime::<Utc>::from_timestamp_millis(i64::try_from(millis).ok()?)
 	}
 
 	pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
@@ -213,5 +215,83 @@ pub mod seconds_or_millis {
 		S: Serializer,
 	{
 		serializer.serialize_i64(value.timestamp_millis())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use chrono::{DateTime, Utc};
+	use serde::Deserialize;
+
+	use super::seconds_or_millis::from_seconds_or_millis;
+
+	#[derive(Deserialize)]
+	struct Strict {
+		#[serde(with = "super::seconds_or_millis")]
+		t: DateTime<Utc>,
+	}
+
+	#[derive(Deserialize)]
+	struct Optional {
+		#[serde(with = "super::optional")]
+		t: Option<DateTime<Utc>>,
+	}
+
+	#[derive(Deserialize)]
+	struct TruncatingOpt {
+		#[serde(with = "super::truncating_seconds_or_millis_opt")]
+		t: Option<DateTime<Utc>>,
+	}
+
+	#[test]
+	fn seconds_scale_is_interpreted_as_seconds() {
+		let secs = Utc::now().timestamp();
+		let parsed = from_seconds_or_millis(secs).unwrap();
+		assert_eq!(parsed.timestamp_millis(), secs * 1000);
+	}
+
+	#[test]
+	fn millis_scale_is_interpreted_as_millis() {
+		let millis = Utc::now().timestamp_millis();
+		let parsed = from_seconds_or_millis(millis).unwrap();
+		assert_eq!(parsed.timestamp_millis(), millis);
+	}
+
+	#[test]
+	fn extreme_timestamps_yield_none_without_panicking() {
+		for value in [
+			9_200_000_000_000_000_000,
+			i64::MAX,
+			i64::MIN,
+			i64::MIN + 1,
+			i64::MAX / 1000 + 1,
+		] {
+			assert_eq!(from_seconds_or_millis(value), None, "value: {value}");
+		}
+	}
+
+	#[test]
+	fn strict_deserializer_rejects_out_of_range_timestamps() {
+		assert!(serde_json::from_str::<Strict>(r#"{"t":9200000000000000000}"#).is_err());
+		assert!(serde_json::from_str::<Strict>(r#"{"t":-9223372036854775808}"#).is_err());
+	}
+
+	#[test]
+	fn strict_deserializer_accepts_current_millis() {
+		let now = Utc::now().timestamp_millis();
+		let parsed: Strict = serde_json::from_str(&format!(r#"{{"t":{now}}}"#)).unwrap();
+		assert_eq!(parsed.t.timestamp_millis(), now);
+	}
+
+	#[test]
+	fn optional_deserializer_flattens_out_of_range_to_none() {
+		let parsed: Optional = serde_json::from_str(r#"{"t":9200000000000000000}"#).unwrap();
+		assert_eq!(parsed.t, None);
+	}
+
+	#[test]
+	fn truncating_optional_degrades_out_of_range_float_to_none() {
+		let parsed: TruncatingOpt = serde_json::from_str(r#"{"t":"9.2e21"}"#).unwrap();
+		assert_eq!(parsed.t, None);
 	}
 }
