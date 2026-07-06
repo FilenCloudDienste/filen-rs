@@ -15,7 +15,9 @@ pub(super) trait DFSWalkerEntry {
 		>;
 	fn depth(&self) -> usize;
 	fn name(&self) -> Result<&str, WalkError>;
-	fn into_entry_type(self) -> EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry>;
+	fn into_entry_type(
+		self,
+	) -> Result<EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry>, WalkError>;
 }
 
 pub(super) trait DFSWalkerFileEntry {
@@ -200,10 +202,12 @@ where
 		}
 	}
 
-	fn into_entry_type(self) -> EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry> {
+	fn into_entry_type(
+		self,
+	) -> Result<EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry>, WalkError> {
 		match self.inner {
-			SecondPassEntryInner::Dir(d) => EntryType::Dir(d),
-			SecondPassEntryInner::File(f) => EntryType::File(f),
+			SecondPassEntryInner::Dir(d) => Ok(EntryType::Dir(d)),
+			SecondPassEntryInner::File(f) => Ok(EntryType::File(f)),
 		}
 	}
 }

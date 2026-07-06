@@ -33,6 +33,9 @@ pub(crate) enum WalkError {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[error("invalid file name at path {0:?}")]
 	InvalidName(PathBuf),
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[error("unsupported file type (not a regular file or directory) at path {0:?}")]
+	UnsupportedFileType(PathBuf),
 	#[error("encrypted metadata could not be read for UUID {0}")]
 	EncryptedMeta(Uuid),
 	#[error("Multiple entries with the same path {0} were detected, these entries were skipped")]

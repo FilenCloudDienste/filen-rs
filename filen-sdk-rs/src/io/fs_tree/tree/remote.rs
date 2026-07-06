@@ -65,20 +65,20 @@ where
 	type Item = Result<RemoteFSObjectEntry<'static, Cat>, WalkError>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		let current_parent = self.stack.last()?;
-		let current_children = match self.map.get_mut(current_parent) {
-			None => {
-				self.stack.pop();
-				return self.next();
+		// iterative rather than recursive so that stack usage stays constant
+		// regardless of tree depth
+		let obj = loop {
+			let current_parent = self.stack.last()?;
+			match self
+				.map
+				.get_mut(current_parent)
+				.and_then(|children| children.pop())
+			{
+				Some(obj) => break obj,
+				None => {
+					self.stack.pop();
+				}
 			}
-			Some(children) => children,
-		};
-		let obj = match current_children.pop() {
-			None => {
-				self.stack.pop();
-				return self.next();
-			}
-			Some(obj) => obj,
 		};
 
 		let depth = self.stack.len();
@@ -113,4 +113,49 @@ where
 	let iter = WalkDirFromHashMap::<Cat>::new(root_uuid, dirs, files)?;
 
 	super::build_fs_tree(iter, error_callback, progress_callback, should_cancel)
+}
+
+#[cfg(test)]
+mod tests {
+	use chrono::Utc;
+	use filen_types::fs::UuidStr;
+
+	use super::*;
+	use crate::fs::{categories::Normal, dir::RemoteDirectory};
+
+	#[test]
+	fn deep_remote_tree_walk_uses_constant_stack() {
+		const DEPTH: usize = 10_000;
+
+		std::thread::Builder::new()
+			.stack_size(256 * 1024)
+			.spawn(|| {
+				let now = Utc::now();
+				let root = UuidStr::new_v4();
+				let mut parent = root;
+				let mut dirs = Vec::with_capacity(DEPTH);
+				for _ in 0..DEPTH {
+					let (uuid, meta) =
+						RemoteDirectory::make_parts("d", now).expect("valid dir name");
+					dirs.push(RemoteDirectory::new_from_parts(
+						uuid,
+						meta,
+						parent.into(),
+						now,
+					));
+					parent = uuid;
+				}
+
+				let walker = WalkDirFromHashMap::<Normal>::new(Uuid::from(&root), dirs, Vec::new())
+					.expect("walker should build");
+
+				let entries = walker
+					.collect::<Result<Vec<_>, _>>()
+					.expect("walk should not error");
+				assert_eq!(entries.len(), DEPTH);
+			})
+			.expect("failed to spawn test thread")
+			.join()
+			.expect("deep remote tree walk should not overflow the stack");
+	}
 }

@@ -43,10 +43,10 @@ where
 		HasName::name(&self.obj).ok_or_else(|| WalkError::EncryptedMeta(self.obj.uuid().into()))
 	}
 
-	fn into_entry_type(self) -> super::EntryType<Cat::Dir, Cat::File> {
+	fn into_entry_type(self) -> Result<super::EntryType<Cat::Dir, Cat::File>, WalkError> {
 		match self.obj {
-			NonRootItemType::<Cat>::Dir(dir) => super::EntryType::Dir(dir.into_owned()),
-			NonRootItemType::<Cat>::File(file) => super::EntryType::File(file.into_owned()),
+			NonRootItemType::<Cat>::Dir(dir) => Ok(super::EntryType::Dir(dir.into_owned())),
+			NonRootItemType::<Cat>::File(file) => Ok(super::EntryType::File(file.into_owned())),
 		}
 	}
 }

@@ -7,6 +7,11 @@ use std::{
 use string_interner::{DefaultBackend, StringInterner};
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::time::Instant;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasmtimer::std::Instant;
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::io::CanonicalPath;
 use crate::{Error, ErrorKind, consts::CALLBACK_INTERVAL};
 
@@ -134,10 +139,15 @@ impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'a, DirExtra, FileExtra>
 		root: &Ref,
 		path_builder: &impl Fn(&Self, &Ref, &str) -> Own,
 	) -> Option<(&'a Entry<DirExtra, FileExtra>, Own)> {
-		let Some(next_index) = self.stack.last_mut()?.next_index() else {
-			self.stack.pop();
-			// switch to become in the future (tail call)
-			return self.inner_next(root, path_builder);
+		// iterative rather than recursive so that stack usage stays constant
+		// regardless of tree depth
+		let next_index = loop {
+			match self.stack.last_mut()?.next_index() {
+				Some(index) => break index,
+				None => {
+					self.stack.pop();
+				}
+			}
 		};
 
 		let entry = &self.tree.entries[next_index];
@@ -202,10 +212,15 @@ impl<'a, DirExtra, FileExtra> Iterator for FSTreeDFSIterator<'a, DirExtra, FileE
 	type Item = (&'a Entry<DirExtra, FileExtra>, usize); // entry and depth
 
 	fn next(&mut self) -> Option<Self::Item> {
-		let Some(next_index) = self.stack.last_mut()?.next_index() else {
-			self.stack.pop();
-			// switch to become in the future (tail call)
-			return self.next();
+		// iterative rather than recursive so that stack usage stays constant
+		// regardless of tree depth
+		let next_index = loop {
+			match self.stack.last_mut()?.next_index() {
+				Some(index) => break index,
+				None => {
+					self.stack.pop();
+				}
+			}
 		};
 
 		let entry = &self.tree.entries[next_index];
@@ -325,7 +340,13 @@ pub(super) struct FSTreeBuilder<DirExtra, FileExtra> {
 	final_entries: Vec<Entry<DirExtra, FileExtra>>,
 	errors: Vec<Error>,
 	stats: FSStats,
-	last_callback: std::time::Instant,
+	last_callback: Instant,
+	// Depth of the most recently rejected entry, if any. A walker may still
+	// descend into a rejected directory (e.g. one with a non-UTF-8 name), so
+	// while this is set, deeper entries are descendants of the rejected entry
+	// and must be dropped to keep the ancestor stack aligned with walker
+	// depths.
+	rejected_entry_depth: Option<usize>,
 }
 
 impl<DirExtra, FileExtra> FSTreeBuilder<DirExtra, FileExtra>
@@ -340,7 +361,8 @@ where
 			final_entries: Vec::new(),
 			errors: Vec::new(),
 			stats: FSStats::new(),
-			last_callback: std::time::Instant::now(),
+			last_callback: Instant::now(),
+			rejected_entry_depth: None,
 		}
 	}
 
@@ -362,7 +384,20 @@ where
 			}
 		};
 
-		let (res, errors) = self.adjust_stack_until_depth::<DFSE::CompareStrategy>(entry.depth());
+		let depth = entry.depth();
+
+		if let Some(rejected_depth) = self.rejected_entry_depth {
+			if depth > rejected_depth {
+				// DFS ordering means this is a descendant of a rejected
+				// entry. Drop it silently: the rejection already recorded an
+				// error for the subtree root, and adjusting the ancestor
+				// stack to this depth would fail.
+				return Ok(false);
+			}
+			self.rejected_entry_depth = None;
+		}
+
+		let (res, errors) = self.adjust_stack_until_depth::<DFSE::CompareStrategy>(depth);
 		self.errors.extend(errors);
 		res?;
 
@@ -370,13 +405,34 @@ where
 			Ok(n) => n,
 			Err(err) => {
 				self.errors.push(err.into());
+				self.rejected_entry_depth = Some(depth);
 				return Ok(false);
 			}
 		};
 
+		// interning must happen before into_entry_type because `name` borrows
+		// `entry`, which into_entry_type consumes; a rejected entry therefore
+		// leaves its name in the interner (harmless)
 		let name_symbol = self.interner.get_or_intern(name);
 
-		match entry.into_entry_type() {
+		let entry_type = match entry.into_entry_type() {
+			Ok(entry_type) => entry_type,
+			Err(err) => {
+				self.errors.push(err.into());
+				// Setting the marker here is a no-op safety net, not a real
+				// requirement: the only rejection `into_entry_type` can
+				// produce is for special files (sockets, fifos, ...), and
+				// those are always walkdir leaves, never internal nodes.
+				// Walkdir decides whether to descend from the same cached
+				// `file_type().is_dir()` this match also reads, so a
+				// non-dir/non-file entry can have no children to desync
+				// against.
+				self.rejected_entry_depth = Some(depth);
+				return Ok(false);
+			}
+		};
+
+		match entry_type {
 			EntryType::File(file) => {
 				let size = match file.size() {
 					Ok(s) => s,
@@ -405,12 +461,12 @@ where
 		}
 
 		// Check if it's time for callbacks
-		Ok(std::time::Instant::now().duration_since(self.last_callback) >= CALLBACK_INTERVAL)
+		Ok(Instant::now().duration_since(self.last_callback) >= CALLBACK_INTERVAL)
 	}
 
 	pub(super) fn should_invoke_callbacks(&mut self) -> bool {
-		if std::time::Instant::now().duration_since(self.last_callback) >= CALLBACK_INTERVAL {
-			self.last_callback = std::time::Instant::now();
+		if Instant::now().duration_since(self.last_callback) >= CALLBACK_INTERVAL {
+			self.last_callback = Instant::now();
 			true
 		} else {
 			false
@@ -629,5 +685,127 @@ impl FSStats {
 
 	pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
 		(self.dirs, self.files, self.bytes)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use uuid::Uuid;
+
+	use super::*;
+
+	const DEPTH: usize = 8_000;
+
+	fn deep_chain_entries()
+	-> impl Iterator<Item = Result<SecondPassEntry<'static, (), ()>, WalkError>> {
+		(1..=DEPTH)
+			.map(|depth| {
+				Ok(SecondPassEntry::dir(
+					SecondPassDirEntry::new("d", ()),
+					depth,
+				))
+			})
+			.chain(std::iter::once(Ok(SecondPassEntry::file(
+				SecondPassFileEntry::new("f", (), 1),
+				DEPTH + 1,
+			))))
+	}
+
+	struct RejectableEntry {
+		name: Result<&'static str, Uuid>,
+		depth: usize,
+		dir: bool,
+	}
+
+	impl DFSWalkerEntry for RejectableEntry {
+		type WalkerDirEntry = SecondPassDirEntry<'static, ()>;
+		type WalkerFileEntry = SecondPassFileEntry<'static, ()>;
+		type CompareStrategy = PanicCompareStrategy<(), ()>;
+
+		fn depth(&self) -> usize {
+			self.depth
+		}
+
+		fn name(&self) -> Result<&str, WalkError> {
+			self.name.map_err(WalkError::EncryptedMeta)
+		}
+
+		fn into_entry_type(
+			self,
+		) -> Result<EntryType<Self::WalkerDirEntry, Self::WalkerFileEntry>, WalkError> {
+			let name = self.name.unwrap_or("");
+			if self.dir {
+				Ok(EntryType::Dir(SecondPassDirEntry::new(name, ())))
+			} else {
+				Ok(EntryType::File(SecondPassFileEntry::new(name, (), 1)))
+			}
+		}
+	}
+
+	#[test]
+	fn rejected_dir_subtree_is_skipped_without_desyncing_the_walk() {
+		let bad_uuid = Uuid::from_u128(1);
+		let entries = vec![
+			Ok(RejectableEntry {
+				name: Err(bad_uuid),
+				depth: 1,
+				dir: true,
+			}),
+			// walkers still descend into a directory whose entry was rejected
+			Ok(RejectableEntry {
+				name: Ok("child"),
+				depth: 2,
+				dir: false,
+			}),
+			Ok(RejectableEntry {
+				name: Ok("sibling"),
+				depth: 1,
+				dir: false,
+			}),
+		];
+
+		let mut errors = Vec::new();
+		let (tree, stats) = build_fs_tree(
+			entries.into_iter(),
+			&mut |errs| errors.extend(errs),
+			&mut |_, _, _| {},
+			&AtomicBool::new(false),
+		)
+		.expect("walk should continue past a rejected directory");
+
+		assert_eq!(stats.snapshot(), (0, 1, 1));
+		let names = tree
+			.dfs_iter()
+			.map(|(entry, _)| tree.get_name(entry).to_owned())
+			.collect::<Vec<_>>();
+		assert_eq!(names, ["sibling"]);
+
+		assert_eq!(errors.len(), 1);
+		assert!(matches!(
+			errors[0].downcast_ref::<WalkError>(),
+			Some(WalkError::EncryptedMeta(uuid)) if uuid == &bad_uuid
+		));
+	}
+
+	#[test]
+	fn deep_tree_build_and_traversal_use_constant_stack() {
+		std::thread::Builder::new()
+			.stack_size(256 * 1024)
+			.spawn(|| {
+				let (tree, stats) = build_fs_tree(
+					deep_chain_entries(),
+					&mut |_| {},
+					&mut |_, _, _| {},
+					&AtomicBool::new(false),
+				)
+				.expect("deep tree should build");
+
+				assert_eq!(stats.snapshot(), (DEPTH as u64, 1, 1));
+				assert_eq!(tree.dfs_iter().count(), DEPTH + 1);
+				assert_eq!(tree.dfs_iter_with_path("root").count(), DEPTH + 1);
+			})
+			.expect("failed to spawn test thread")
+			.join()
+			.expect("deep tree traversal should not overflow the stack");
 	}
 }
