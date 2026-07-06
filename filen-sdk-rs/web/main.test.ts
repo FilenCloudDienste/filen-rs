@@ -1327,8 +1327,10 @@ test("cache search", async () => {
 	expect(initial).toBeDefined()
 	expect(initial?.total).toBe(2n)
 	expect(initial?.live).toBe(true)
-	const names = initial?.results.map(result => (result.type === "file" ? getFileMeta(result.file.meta)?.name : null))
+	const names = initial?.results.map(hit => (hit.result.type === "file" ? getFileMeta(hit.result.file.meta)?.name : null))
 	expect(names).toStrictEqual(["alpha.txt", "Beta.txt"])
+	// Both files are direct children of the search root.
+	expect(initial?.results.map(hit => hit.parentPath)).toStrictEqual(["", ""])
 	// Consumed on first read.
 	expect(window.initialSnapshot()).toBeUndefined()
 
