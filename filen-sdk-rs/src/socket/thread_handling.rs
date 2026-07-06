@@ -677,8 +677,17 @@ where
 
 	Ok((
 		W::from_unauthed_parts(write, read),
-		Duration::from_millis(handshake.ping_interval),
+		ping_interval_from_millis(handshake.ping_interval),
 	))
+}
+
+/// The handshake's `pingInterval` is server-controlled and in milliseconds. On a
+/// zero period, `tokio::time::interval` panics, while `wasmtimer::tokio::interval`
+/// yields a permanently-past deadline that resolves on every poll — a busy-loop
+/// ping flood. Floor the value to something sane instead of trusting it.
+fn ping_interval_from_millis(millis: u64) -> Duration {
+	const MIN_PING_INTERVAL: Duration = Duration::from_secs(1);
+	Duration::from_millis(millis).max(MIN_PING_INTERVAL)
 }
 
 #[cfg(test)]
@@ -722,6 +731,26 @@ mod tests {
 		assert!(
 			!handle.is_connected(),
 			"a websocket thread whose receiver was dropped must not report connected"
+		);
+	}
+
+	#[test]
+	fn ping_interval_from_millis_floors_zero() {
+		assert_eq!(ping_interval_from_millis(0), Duration::from_secs(1));
+	}
+
+	#[test]
+	fn ping_interval_from_millis_floors_tiny_values() {
+		assert_eq!(ping_interval_from_millis(5), Duration::from_secs(1));
+		assert_eq!(ping_interval_from_millis(999), Duration::from_secs(1));
+	}
+
+	#[test]
+	fn ping_interval_from_millis_passes_through_sane_values() {
+		assert_eq!(ping_interval_from_millis(1000), Duration::from_secs(1));
+		assert_eq!(
+			ping_interval_from_millis(25_000),
+			Duration::from_millis(25_000)
 		);
 	}
 }
