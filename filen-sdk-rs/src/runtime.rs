@@ -34,11 +34,19 @@ mod async_scoped_task {
 						tracing::debug!(
 							"AsyncTaskHandle being dropped before completion, blocking current thread to avoid UB"
 						);
+						// This wait is mandatory for soundness: the rayon task may still be
+						// using data borrowed from the caller's stack. Panicking here would
+						// skip the wait and free those borrows early. Every ready-made
+						// blocking primitive can panic in some host context —
+						// `block_in_place` outside a blocking-allowed multi-threaded-runtime
+						// thread (including inside a current-thread `block_on`, whatever
+						// handle is entered), `blocking_recv` on any runtime-driving thread,
+						// `futures::executor::block_on` inside another futures executor (its
+						// `enter()` re-entrancy guard) — so this parks the thread manually
+						// instead, consulting no executor thread-locals at all.
 						#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 						{
-							tokio::task::block_in_place(|| {
-								let _ = async_receiver.blocking_recv();
-							})
+							let _ = park_until_received(async_receiver);
 						}
 						#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 						{
@@ -60,6 +68,50 @@ mod async_scoped_task {
 				std::pin::Pin::new(&mut *this.async_receiver)
 					.poll(cx)
 					.map(|res| res.expect("Thread panicked"))
+			}
+		}
+
+		/// Blocks the current thread until the receiver resolves by polling it with a
+		/// `thread::park`-based waker. The oneshot's waker is fired directly by the rayon-side
+		/// `send`/sender-drop, cross-thread, so completion needs no runtime; polling a tokio
+		/// oneshot consults no executor state. This cannot panic in any host context (unlike
+		/// `block_in_place`, `blocking_recv`, or `futures::executor::block_on`), which the
+		/// soundness of [`AsyncTaskHandle`]'s drop depends on. Parking a runtime worker here is
+		/// acceptable: the wait is bounded by the rayon task's pure-CPU duration and only happens
+		/// on the rare drop-before-completion path.
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		fn park_until_received<T>(
+			mut receiver: tokio::sync::oneshot::Receiver<T>,
+		) -> Result<T, tokio::sync::oneshot::error::RecvError> {
+			use std::{
+				pin::Pin,
+				sync::Arc,
+				task::{Context, Poll, Wake, Waker},
+				thread,
+			};
+
+			struct ThreadUnparker(thread::Thread);
+
+			impl Wake for ThreadUnparker {
+				fn wake(self: Arc<Self>) {
+					self.0.unpark();
+				}
+
+				fn wake_by_ref(self: &Arc<Self>) {
+					self.0.unpark();
+				}
+			}
+
+			let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
+			let mut cx = Context::from_waker(&waker);
+			loop {
+				match Pin::new(&mut receiver).poll(&mut cx) {
+					Poll::Ready(res) => return res,
+					// A lost unpark token cannot deadlock: `unpark` called between our poll
+					// and `park` makes `park` return immediately, and spurious wakeups just
+					// re-poll.
+					Poll::Pending => thread::park(),
+				}
 			}
 		}
 
@@ -837,3 +889,95 @@ macro_rules! blocking_join {
 }
 
 pub(crate) use blocking_join;
+
+#[cfg(all(
+	test,
+	feature = "multi-threaded-crypto",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+mod tests {
+	use std::{
+		sync::atomic::{AtomicBool, Ordering},
+		time::Duration,
+	};
+
+	use super::do_cpu_intensive;
+
+	// The dropped handle must block until the rayon task is done with the
+	// caller-stack data it borrows (`data`/`finished`) — on every runtime flavor
+	// and outside any runtime.
+	fn assert_drop_in_flight_blocks_until_task_finishes() {
+		let started = AtomicBool::new(false);
+		let finished = AtomicBool::new(false);
+		let data = vec![1u8, 2, 3];
+		let data_ref = &data;
+		let (started_ref, finished_ref) = (&started, &finished);
+		let handle = do_cpu_intensive(move || {
+			started_ref.store(true, Ordering::SeqCst);
+			std::thread::sleep(Duration::from_millis(200));
+			let sum: u32 = data_ref.iter().map(|&b| u32::from(b)).sum();
+			finished_ref.store(true, Ordering::SeqCst);
+			sum
+		});
+		while !started.load(Ordering::SeqCst) {
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		drop(handle);
+		assert!(finished.load(Ordering::SeqCst));
+	}
+
+	#[test]
+	fn drop_in_flight_on_current_thread_runtime_waits_without_panic() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			assert_drop_in_flight_blocks_until_task_finishes();
+		});
+	}
+
+	#[test]
+	fn drop_in_flight_on_multi_thread_runtime_waits_without_panic() {
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			assert_drop_in_flight_blocks_until_task_finishes();
+		});
+	}
+
+	#[test]
+	fn drop_in_flight_outside_runtime_waits_without_panic() {
+		assert_drop_in_flight_blocks_until_task_finishes();
+	}
+
+	// A host application may drive SDK futures with `futures::executor::block_on`; a drop
+	// mid-poll then runs while that executor's thread-local re-entrancy guard is set, where a
+	// nested `futures::executor::block_on` would panic and skip the mandatory wait.
+	#[test]
+	fn drop_in_flight_inside_futures_executor_waits_without_panic() {
+		futures::executor::block_on(async {
+			assert_drop_in_flight_blocks_until_task_finishes();
+		});
+	}
+
+	// A multi-thread handle entered on a current-thread `block_on` thread: the innermost
+	// registered handle reports `MultiThread`, but blocking via `block_in_place` still panics
+	// in this context — the drop wait must not rely on the registered handle's flavor.
+	#[test]
+	fn drop_in_flight_with_foreign_multi_thread_handle_entered_waits_without_panic() {
+		let multi_thread_runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.build()
+			.unwrap();
+		let multi_thread_handle = multi_thread_runtime.handle().clone();
+		let current_thread_runtime = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap();
+		current_thread_runtime.block_on(async {
+			let _guard = multi_thread_handle.enter();
+			assert_drop_in_flight_blocks_until_task_finishes();
+		});
+	}
+}
