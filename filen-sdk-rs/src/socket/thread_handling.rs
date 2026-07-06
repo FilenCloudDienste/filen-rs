@@ -331,11 +331,16 @@ where
 					}
 					Some(Ok(msg)) => msg,
 					Some(Err(e)) => {
-						tracing::error!(
-							"Critical error handling WebSocket message: {}, shutting down WebSocket task",
+						// Post-handshake receive errors are transport-level (a reset
+						// without a close frame, a protocol hiccup) — never auth: the
+						// reconnect path re-runs the handshake, where genuine auth
+						// failures are classified and terminate the task. Killing the
+						// task here turned one WiFi blip into a permanent, silent loss
+						// of all socket events.
+						tracing::warn!(
+							"Error receiving WebSocket message: {}, reconnecting",
 							e
 						);
-						should_retry = false;
 						break;
 					}
 				};
@@ -742,6 +747,358 @@ mod tests {
 	#[test]
 	fn ping_interval_from_millis_floors_zero() {
 		assert_eq!(ping_interval_from_millis(0), Duration::from_secs(1));
+	}
+
+	/// Hermetic tests of the full websocket pipeline (connect → handshake → event
+	/// loop → reconnect). Everything under [`run_async_websocket_task`] is generic
+	/// over the transport traits, so a scripted in-memory fake exercises the REAL
+	/// production control flow — reconnect classification, retry policy, listener
+	/// broadcasts — with no network and a paused clock.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	mod pipeline {
+		use std::{
+			cell::RefCell,
+			collections::VecDeque,
+			sync::{Arc, Mutex, OnceLock, RwLock},
+		};
+
+		use filen_types::{auth::APIKey, crypto::EncryptedString};
+
+		use super::*;
+		use crate::{
+			auth::{http::ClientConfig, unauth::UnauthClient},
+			crypto::error::ConversionError,
+		};
+
+		// ----- scripted fake transport -----
+
+		pub(super) enum ServerAction {
+			/// deliver this frame to the client
+			Msg(String),
+			/// surface a transport-level receive error
+			Err(&'static str),
+			/// clean close (receive yields None)
+			Close,
+			/// never respond (black-holed connection)
+			Hang,
+		}
+
+		pub(super) struct FakeConnection {
+			script: VecDeque<ServerAction>,
+			/// runs when the connection is established — e.g. rotate the api key
+			/// or drop the request sender to end the task
+			on_connect: Option<Box<dyn FnOnce()>>,
+		}
+
+		impl FakeConnection {
+			fn new(script: Vec<ServerAction>) -> Self {
+				Self {
+					script: script.into(),
+					on_connect: None,
+				}
+			}
+
+			fn with_on_connect(mut self, f: impl FnOnce() + 'static) -> Self {
+				self.on_connect = Some(Box::new(f));
+				self
+			}
+		}
+
+		#[derive(Default)]
+		struct FakeState {
+			connections: VecDeque<FakeConnection>,
+			connect_count: usize,
+			sent: Vec<String>,
+		}
+
+		thread_local! {
+			static STATE: RefCell<FakeState> = RefCell::default();
+		}
+
+		fn prime(connections: Vec<FakeConnection>) {
+			STATE.with(|s| {
+				*s.borrow_mut() = FakeState {
+					connections: connections.into(),
+					..Default::default()
+				}
+			});
+		}
+
+		fn connect_count() -> usize {
+			STATE.with(|s| s.borrow().connect_count)
+		}
+
+		pub(super) struct FakeMsg(String);
+
+		impl AsRef<str> for FakeMsg {
+			fn as_ref(&self) -> &str {
+				&self.0
+			}
+		}
+
+		impl IntoStableDeref for FakeMsg {
+			type Output = String;
+
+			fn into_stable_deref(self) -> String {
+				self.0
+			}
+		}
+
+		pub(super) struct FakeSender;
+
+		impl Sender for FakeSender {
+			async fn send(&mut self, msg: Cow<'_, str>) -> Result<Option<()>, Error> {
+				STATE.with(|s| s.borrow_mut().sent.push(msg.into_owned()));
+				Ok(Some(()))
+			}
+
+			async fn send_multiple(
+				&mut self,
+				msgs: impl IntoIterator<Item = Cow<'_, str>>,
+			) -> Result<Option<()>, Error> {
+				for msg in msgs {
+					self.send(msg).await?;
+				}
+				Ok(Some(()))
+			}
+		}
+
+		impl UnauthedSender for FakeSender {
+			type AuthedType = FakeSender;
+		}
+
+		pub(super) struct FakeReceiver {
+			script: VecDeque<ServerAction>,
+		}
+
+		impl Receiver<FakeMsg> for FakeReceiver {
+			async fn receive(&mut self) -> Option<Result<FakeMsg, Error>> {
+				match self.script.pop_front() {
+					Some(ServerAction::Msg(s)) => Some(Ok(FakeMsg(s))),
+					Some(ServerAction::Err(s)) => Some(Err(Error::custom(ErrorKind::Server, s))),
+					Some(ServerAction::Close) => None,
+					// an exhausted script behaves like a black-holed connection
+					Some(ServerAction::Hang) | None => std::future::pending().await,
+				}
+			}
+		}
+
+		impl UnauthedReceiver<FakeMsg> for FakeReceiver {
+			type AuthedType = FakeReceiver;
+		}
+
+		pub(super) struct FakeUnauthedSocket {
+			script: VecDeque<ServerAction>,
+		}
+
+		impl UnauthedSocket<FakeSender, FakeReceiver, FakeMsg> for FakeUnauthedSocket {
+			fn split(self) -> (FakeSender, FakeReceiver) {
+				(
+					FakeSender,
+					FakeReceiver {
+						script: self.script,
+					},
+				)
+			}
+		}
+
+		pub(super) struct FakeNoopPingTask;
+
+		impl PingTask<FakeSender> for FakeNoopPingTask {
+			fn new(_: FakeSender, _: Duration) -> Self {
+				Self
+			}
+
+			fn abort(self) {}
+		}
+
+		pub(super) struct FakeSocket {
+			script: VecDeque<ServerAction>,
+		}
+
+		impl
+			Socket<
+				(),
+				FakeUnauthedSocket,
+				FakeSender,
+				FakeReceiver,
+				FakeMsg,
+				FakeSender,
+				FakeReceiver,
+				FakeNoopPingTask,
+			> for FakeSocket
+		{
+			async fn build_request() -> Result<(), Error> {
+				Ok(())
+			}
+
+			async fn connect(_request: ()) -> Result<FakeUnauthedSocket, Error> {
+				let conn = STATE.with(|s| {
+					let mut s = s.borrow_mut();
+					s.connect_count += 1;
+					s.connections.pop_front()
+				});
+				match conn {
+					Some(conn) => {
+						if let Some(f) = conn.on_connect {
+							f();
+						}
+						Ok(FakeUnauthedSocket {
+							script: conn.script,
+						})
+					}
+					None => Err(Error::custom(
+						ErrorKind::Server,
+						"no more scripted connections",
+					)),
+				}
+			}
+
+			fn from_unauthed_parts(_: FakeSender, receiver: FakeReceiver) -> Self {
+				Self {
+					script: receiver.script,
+				}
+			}
+
+			fn split_into_receiver_and_ping_task(
+				self,
+				_ping_interval: Duration,
+			) -> (FakeReceiver, FakeNoopPingTask) {
+				(
+					FakeReceiver {
+						script: self.script,
+					},
+					FakeNoopPingTask,
+				)
+			}
+		}
+
+		// ----- helpers -----
+
+		struct NoopCrypter;
+
+		impl MetaCrypter for NoopCrypter {
+			fn blocking_encrypt_meta_into(
+				&self,
+				_meta: &str,
+				_out: String,
+			) -> EncryptedString<'static> {
+				unreachable!("pipeline tests never encrypt metadata")
+			}
+
+			fn blocking_decrypt_meta_into(
+				&self,
+				_meta: &EncryptedString,
+				_out: Vec<u8>,
+			) -> Result<String, (ConversionError, Vec<u8>)> {
+				unreachable!("pipeline tests never decrypt metadata")
+			}
+		}
+
+		fn test_private_key() -> Arc<RsaPrivateKey> {
+			static KEY: OnceLock<Arc<RsaPrivateKey>> = OnceLock::new();
+			Arc::clone(KEY.get_or_init(|| {
+				// tiny key: never used for real crypto, only to satisfy the signature
+				Arc::new(RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).unwrap())
+			}))
+		}
+
+		fn test_config() -> WebSocketConfig {
+			let unauthed = UnauthClient::from_config(ClientConfig::default()).unwrap();
+			WebSocketConfig {
+				client: Arc::new(AuthClient::from_unauthed(
+					unauthed,
+					Arc::new(RwLock::new(APIKey(Cow::Borrowed("test-api-key")))),
+				)),
+				reconnect_delay: RECONNECT_DELAY,
+				ping_interval: PING_INTERVAL,
+				user_id: 0,
+			}
+		}
+
+		/// The scripted handshake exchange, followed by `then` as the in-session script.
+		fn handshake_then(then: Vec<ServerAction>) -> Vec<ServerAction> {
+			let mut script = vec![
+				ServerAction::Msg(format!(
+					"0{}",
+					r#"{"sid":"fake","upgrades":[],"pingInterval":25000,"pingTimeout":20000}"#
+				)),
+				ServerAction::Msg(MESSAGE_CONNECT_PAYLOAD.to_string()),
+				ServerAction::Msg(r#"42["authed",false]"#.to_string()),
+				ServerAction::Msg(r#"42["authSuccess"]"#.to_string()),
+			];
+			script.extend(then);
+			script
+		}
+
+		fn recording_listener() -> (EventListenerCallback, Arc<Mutex<Vec<String>>>) {
+			let events = Arc::new(Mutex::new(Vec::new()));
+			let events_clone = Arc::clone(&events);
+			let callback: EventListenerCallback = Box::new(move |event| {
+				events_clone
+					.lock()
+					.unwrap()
+					.push(event.event_type().to_string());
+			});
+			(callback, events)
+		}
+
+		// ----- tests -----
+
+		#[tokio::test(start_paused = true)]
+		async fn transport_error_triggers_reconnect_with_broadcasts() {
+			let (request_sender, request_receiver) = tokio::sync::mpsc::channel(16);
+
+			// conn1 dies with a transport error mid-session (WiFi drop), conn2
+			// closes cleanly, conn3 stays healthy and shuts the task down by
+			// dropping the final request sender
+			let final_sender = request_sender.clone();
+			prime(vec![
+				FakeConnection::new(handshake_then(vec![ServerAction::Err(
+					"connection reset without closing handshake",
+				)])),
+				FakeConnection::new(handshake_then(vec![ServerAction::Close])),
+				FakeConnection::new(handshake_then(vec![ServerAction::Hang]))
+					.with_on_connect(move || drop(final_sender)),
+			]);
+
+			let (callback, events) = recording_listener();
+			let (id_sender, _id_receiver) = tokio::sync::oneshot::channel();
+			let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+			request_sender
+				.send(SocketRequest::AddListener {
+					id_sender,
+					cancel_receiver,
+					callback,
+					event_types: None,
+				})
+				.await
+				.unwrap();
+			// the clones inside the script now hold the only remaining senders
+			drop(request_sender);
+
+			run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
+				test_config(),
+				request_receiver,
+				Arc::new(NoopCrypter),
+				test_private_key(),
+			)
+			.await;
+
+			// a transport error must demote (broadcasting `reconnecting`) and
+			// reconnect — not kill the task
+			assert_eq!(connect_count(), 3);
+			assert_eq!(
+				events.lock().unwrap().as_slice(),
+				[
+					"authSuccess",
+					"reconnecting",
+					"authSuccess",
+					"reconnecting",
+					"authSuccess"
+				]
+			);
+		}
 	}
 
 	#[test]
