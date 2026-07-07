@@ -1,9 +1,10 @@
 use std::{
+	collections::HashMap,
 	future::Future,
 	io,
 	ops::Bound,
 	pin::Pin,
-	sync::Arc,
+	sync::{Arc, Mutex},
 	task::{Context, Poll},
 	time::Duration,
 };
@@ -23,6 +24,8 @@ use http::{
 };
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use filen_types::traits::CowHelpers;
 
 use crate::{
 	Error,
@@ -228,11 +231,17 @@ pub mod client_impl;
 #[cfg(feature = "uniffi")]
 mod js_impl;
 
+/// Maps an opaque per-request token to the file it serves. The file metadata
+/// (including its decryption key) lives here in-process instead of in the URL,
+/// so no key material reaches media-framework/OS request logs.
+type TokenMap = Arc<Mutex<HashMap<String, RemoteFileType<'static>>>>;
+
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct HttpProviderHandle {
 	task: Option<tokio::task::JoinHandle<()>>,
 	cancel_sender: Option<tokio::sync::oneshot::Sender<()>>,
 	port: u16,
+	tokens: TokenMap,
 }
 
 impl Drop for HttpProviderHandle {
@@ -270,9 +279,13 @@ impl Drop for HttpProviderHandle {
 
 impl HttpProviderHandle {
 	pub(crate) async fn new(port: Option<u16>, client: Arc<UnauthClient>) -> Result<Self, Error> {
+		let tokens: TokenMap = Arc::new(Mutex::new(HashMap::new()));
 		let router = axum::Router::new()
 			.route("/file", get(file_handler))
-			.with_state(ProviderState { client });
+			.with_state(ProviderState {
+				client,
+				tokens: tokens.clone(),
+			});
 
 		let (port_sender, port_receiver) = tokio::sync::oneshot::channel();
 		let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
@@ -308,6 +321,7 @@ impl HttpProviderHandle {
 			task: Some(task),
 			cancel_sender: Some(cancel_sender),
 			port,
+			tokens,
 		})
 	}
 }
@@ -322,14 +336,17 @@ impl HttpProviderHandle {
 impl HttpProviderHandle {
 	/// Returns the local HTTP URL that serves the given file through this provider.
 	///
-	/// The URL encodes the file metadata as a msgpack+base64url query parameter so
-	/// that the server can reconstruct the file reader without any additional RPC.
+	/// The URL carries only an opaque random token; the file metadata (including
+	/// its decryption key) is stored in this provider's in-process map and looked
+	/// up by the handler, so no key material rides in the URL where a media
+	/// framework or the OS could log it.
 	pub fn get_file_url(&self, file: &RemoteFileType<'_>) -> String {
-		let msgpack = rmp_serde::to_vec(&file)
-			.expect("RemoteFile serialization to msgpack should never fail");
-		let encoded = BASE64_URL_SAFE_NO_PAD.encode(&msgpack);
-
-		format!("http://127.0.0.1:{}/file?file={}", self.port, encoded)
+		let token = BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+		self.tokens
+			.lock()
+			.expect("http-provider token map lock poisoned")
+			.insert(token.clone(), file.clone().into_owned_cow());
+		format!("http://127.0.0.1:{}/file?token={}", self.port, token)
 	}
 
 	/// Like [`get_file_url`](Self::get_file_url) but pins this stream's read-ahead window
@@ -366,30 +383,14 @@ impl HttpProviderHandle {
 #[derive(Clone)]
 struct ProviderState {
 	client: Arc<UnauthClient>,
-}
-
-mod custom_serde {
-	use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
-	use serde::Deserializer;
-
-	use crate::fs::file::enums::RemoteFileType;
-
-	pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<RemoteFileType<'static>, D::Error>
-	where
-		D: Deserializer<'de>,
-	{
-		let string = filen_types::serde::cow::deserialize(deserializer)?;
-		let bytes = BASE64_URL_SAFE_NO_PAD
-			.decode(string.as_ref())
-			.map_err(serde::de::Error::custom)?;
-		rmp_serde::from_slice::<RemoteFileType<'static>>(&bytes).map_err(serde::de::Error::custom)
-	}
+	tokens: TokenMap,
 }
 
 #[derive(Deserialize)]
 struct FileQuery {
-	#[serde(deserialize_with = "custom_serde::deserialize")]
-	file: RemoteFileType<'static>,
+	/// Opaque token minted by [`get_file_url`](HttpProviderHandle::get_file_url);
+	/// resolves to the file (and its key) in the provider's in-process map.
+	token: String,
 	/// Optional read-ahead window in bytes (`?buffer=`); bounds how much this stream
 	/// prefetches and therefore how much of the shared memory budget it can pin.
 	#[serde(default)]
@@ -514,11 +515,27 @@ async fn file_handler(
 	State(state): State<ProviderState>,
 	range: Option<TypedHeader<Range>>,
 ) -> impl IntoResponse {
+	// Resolve the opaque token to the file (and its key) held in-process. Clone it
+	// out so the entry survives for the media player's later range requests over
+	// the same playback session (the token is reusable, not single-use).
+	let Some(file) = state
+		.tokens
+		.lock()
+		.expect("http-provider token map lock poisoned")
+		.get(&params.token)
+		.cloned()
+	else {
+		return http::Response::builder()
+			.status(StatusCode::NOT_FOUND)
+			.body(axum::body::Body::empty())
+			.expect("should always be able to build a response");
+	};
+
 	let ranges = if let Some(TypedHeader(range)) = range {
 		range
-			.satisfiable_ranges(params.file.size())
+			.satisfiable_ranges(file.size())
 			.filter_map(|r| {
-				let (start, end) = get_real_bounds(&params.file, r);
+				let (start, end) = get_real_bounds(&file, r);
 				if start < end {
 					Some((start, end))
 				} else {
@@ -527,7 +544,7 @@ async fn file_handler(
 			})
 			.collect::<Vec<_>>()
 	} else {
-		vec![(0, params.file.size())]
+		vec![(0, file.size())]
 	};
 
 	let read_ahead = effective_read_ahead(params.buffer, state.client.state().memory_budget());
@@ -535,7 +552,7 @@ async fn file_handler(
 
 	match ranges {
 		ranges if let [range] = *ranges => single_range_response_builder(
-			params.file,
+			file,
 			range,
 			read_ahead,
 			state.client.clone(),
@@ -545,12 +562,12 @@ async fn file_handler(
 			.status(StatusCode::RANGE_NOT_SATISFIABLE)
 			.header(
 				http::header::CONTENT_RANGE,
-				format!("bytes */{}", params.file.size()),
+				format!("bytes */{}", file.size()),
 			)
 			.body(axum::body::Body::empty()),
 
 		ranges => multiple_range_response_builder(
-			params.file,
+			file,
 			ranges,
 			read_ahead,
 			state.client.clone(),
