@@ -20,6 +20,26 @@ use super::{FSStats, FSTree};
 pub(crate) struct WalkDirFromHashMap<Cat: Category + ?Sized> {
 	map: HashMap<Uuid, Vec<NonRootItemType<'static, Cat>>>,
 	stack: Vec<Uuid>,
+	reported_unreachable: bool,
+}
+
+impl<Cat: Category + ?Sized> WalkDirFromHashMap<Cat> {
+	/// Once the DFS from the root has drained the stack, any entries still left
+	/// in `map` had a parent uuid that was never reached from the root — an
+	/// orphaned or cyclic parent from a malformed/hostile listing. Emit one
+	/// error the first time so the walk surfaces the incompleteness instead of
+	/// silently omitting them; every later call returns `None` to
+	/// end the iterator.
+	fn take_unreachable_error(
+		&mut self,
+	) -> Option<Result<RemoteFSObjectEntry<'static, Cat>, WalkError>> {
+		if self.reported_unreachable {
+			return None;
+		}
+		self.reported_unreachable = true;
+		let count: usize = self.map.values().map(Vec::len).sum();
+		(count > 0).then_some(Err(WalkError::UnreachableEntries { count }))
+	}
 }
 
 impl<Cat: Category + ?Sized> WalkDirFromHashMap<Cat> {
@@ -54,7 +74,11 @@ impl<Cat: Category + ?Sized> WalkDirFromHashMap<Cat> {
 				.push(NonRootItemType::<Cat>::File(Cow::Owned(file)));
 		}
 		let stack = vec![root_uuid];
-		Ok(Self { map, stack })
+		Ok(Self {
+			map,
+			stack,
+			reported_unreachable: false,
+		})
 	}
 }
 
@@ -68,7 +92,11 @@ where
 		// iterative rather than recursive so that stack usage stays constant
 		// regardless of tree depth
 		let obj = loop {
-			let current_parent = self.stack.last()?;
+			let Some(current_parent) = self.stack.last() else {
+				// DFS complete: surface any entries whose parent was never
+				// reached from the root instead of dropping them silently.
+				return self.take_unreachable_error();
+			};
 			match self
 				.map
 				.get_mut(current_parent)
@@ -157,5 +185,41 @@ mod tests {
 			.expect("failed to spawn test thread")
 			.join()
 			.expect("deep remote tree walk should not overflow the stack");
+	}
+
+	#[test]
+	fn unreachable_parent_entries_surface_an_error() {
+		let now = Utc::now();
+		let root = UuidStr::new_v4();
+
+		// One dir legitimately under root.
+		let (child_uuid, child_meta) =
+			RemoteDirectory::make_parts("child", now).expect("valid dir name");
+		let child = RemoteDirectory::new_from_parts(child_uuid, child_meta, root.into(), now);
+
+		// One dir whose parent is neither root nor any returned dir — orphaned
+		// by a malformed/hostile listing.
+		let orphan_parent = UuidStr::new_v4();
+		let (orphan_uuid, orphan_meta) =
+			RemoteDirectory::make_parts("orphan", now).expect("valid dir name");
+		let orphan =
+			RemoteDirectory::new_from_parts(orphan_uuid, orphan_meta, orphan_parent.into(), now);
+
+		let walker =
+			WalkDirFromHashMap::<Normal>::new(Uuid::from(&root), vec![child, orphan], Vec::new())
+				.expect("walker should build");
+		let results = walker.collect::<Vec<_>>();
+
+		let oks = results.iter().filter(|r| r.is_ok()).count();
+		let errs = results
+			.iter()
+			.filter_map(|r| r.as_ref().err())
+			.collect::<Vec<_>>();
+		assert_eq!(oks, 1, "only the reachable child should be emitted");
+		assert_eq!(errs.len(), 1, "the orphan must surface exactly one error");
+		assert!(matches!(
+			errs[0],
+			WalkError::UnreachableEntries { count: 1 }
+		));
 	}
 }

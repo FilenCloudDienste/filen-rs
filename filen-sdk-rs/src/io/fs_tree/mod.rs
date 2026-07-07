@@ -40,6 +40,10 @@ pub(crate) enum WalkError {
 	EncryptedMeta(Uuid),
 	#[error("Multiple entries with the same path {0} were detected, these entries were skipped")]
 	DuplicateName(String),
+	#[error(
+		"{count} remote entries had a parent not reachable from the requested root (malformed listing or cyclic parent) and were omitted from the tree"
+	)]
+	UnreachableEntries { count: usize },
 }
 
 impl From<WalkError> for crate::Error {
