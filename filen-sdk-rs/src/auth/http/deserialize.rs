@@ -123,8 +123,8 @@ where
 										ErrorKind::Response,
 										e,
 										Some(format!(
-											"Failed to deserialize msgpack response: {}",
-											String::from_utf8_lossy(res.as_ref())
+											"Failed to deserialize msgpack response ({} bytes)",
+											res.as_ref().len()
 										)),
 									),
 								)));
@@ -139,8 +139,8 @@ where
 										ErrorKind::Response,
 										e,
 										Some(format!(
-											"Failed to deserialize json response: {}",
-											String::from_utf8_lossy(res.as_ref())
+											"Failed to deserialize json response ({} bytes)",
+											res.as_ref().len()
 										)),
 									),
 								)));

@@ -339,7 +339,12 @@ where
 						break;
 					}
 				};
-				tracing::debug!("Received WebSocket message: {}", message.as_ref());
+				// Do not log the raw payload: it carries plaintext PII (sender emails)
+			// and encrypted metadata blobs even at debug level.
+			tracing::debug!(
+				"Received WebSocket message ({} bytes)",
+				message.as_ref().len()
+			);
 
 				match super::events::try_parse_message_from_str(message.into_stable_deref()) {
 					Ok(Some(event_yoke)) => {
