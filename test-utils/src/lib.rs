@@ -391,7 +391,9 @@ pub mod cli {
 		I: IntoIterator<Item = S>,
 		S: AsRef<std::ffi::OsStr>,
 	{
-		let auth_config_file = prepare_cli_auth_config().await;
+		// Keep _temp_dir alive until after .assert() runs the CLI (which reads the
+		// file); dropping it deletes the temp dir and its credentials.
+		let (_temp_dir, auth_config_file) = prepare_cli_auth_config().await;
 		bin.args([
 			"--auth-config-path",
 			auth_config_file.to_str().unwrap(),
@@ -401,15 +403,19 @@ pub mod cli {
 		.assert()
 	}
 
-	pub async fn prepare_cli_auth_config() -> assert_fs::fixture::ChildPath {
+	// Returns the TempDir guard alongside the child path: dropping the guard
+	// earlier deletes the dir, but assert_fs then silently recreates it on write
+	// and no owner remains to clean it up, leaving plaintext account credentials
+	// (api_key, private_key) on disk forever. The caller must hold
+	// the guard until the CLI has read the file.
+	pub async fn prepare_cli_auth_config() -> (assert_fs::TempDir, assert_fs::fixture::ChildPath) {
 		let client = RESOURCES.client().await;
-		let auth_config_file = assert_fs::TempDir::new()
-			.unwrap()
-			.child("filen-cli-auth-config");
+		let temp_dir = assert_fs::TempDir::new().unwrap();
+		let auth_config_file = temp_dir.child("filen-cli-auth-config");
 		auth_config_file
 			.write_str(&filen_cli::serialize_auth_config(&client).unwrap())
 			.unwrap();
-		auth_config_file
+		(temp_dir, auth_config_file)
 	}
 
 	#[macro_export]
