@@ -14,7 +14,7 @@ use md5::Md5;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
-use typenum::U32;
+use typenum::{U32, U64};
 
 use crate::crypto::error::ConversionError;
 use crate::crypto::shared::{DataCrypter, MetaCrypter};
@@ -150,11 +150,25 @@ impl V2Key {
 	}
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 #[rkyv_self]
 pub struct FileKey {
 	key: SizedStr<U32>,
+}
+
+// Redacting Debug: the raw key must never reach logs. Mirrors
+// V2Key's hashed Debug rather than the derived one that prints SizedStr's bytes.
+impl std::fmt::Debug for FileKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let hashed = SizedHexString::<U64>::from(<[u8; 64]>::from(sha2::Sha512::digest(
+			self.key.as_bytes(),
+		)))
+		.to_str();
+		f.debug_struct("FileKey")
+			.field("key (hashed)", &hashed)
+			.finish()
+	}
 }
 
 impl AsRef<str> for FileKey {

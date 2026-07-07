@@ -324,11 +324,25 @@ impl TryFrom<String> for MasterKey {
 	}
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 #[rkyv_self]
 pub struct FileKey {
 	encryption_key: SizedStr<U32>,
+}
+
+// Redacting Debug: the raw key must never reach logs. Mirrors
+// V2Key's hashed Debug rather than the derived one that prints SizedStr's bytes.
+impl std::fmt::Debug for FileKey {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let hashed = SizedHexString::<U64>::from(<[u8; 64]>::from(sha2::Sha512::digest(
+			self.encryption_key.as_bytes(),
+		)))
+		.to_str();
+		f.debug_struct("FileKey")
+			.field("key (hashed)", &hashed)
+			.finish()
+	}
 }
 
 impl core::fmt::Display for FileKey {
