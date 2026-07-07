@@ -39,6 +39,22 @@ fn frontier_advance_advances_watermark_without_mutating_items() {
 	);
 }
 
+/// A malformed drive event (unknown kind or undecryptable payload upstream) carries only its id;
+/// the cache must map it to a `FrontierAdvance` marker so the watermark passes it without a gap.
+#[test]
+fn drive_malformed_event_maps_to_frontier_advance() {
+	use crate::socket::DecryptedSocketEvent;
+
+	let socket_event = DecryptedSocketEvent::DriveMalformed {
+		drive_message_id: 99,
+	};
+
+	match CacheEventMaybeDecrypted::from_decrypted_event(&socket_event) {
+		Some(CacheEventMaybeDecrypted::FrontierAdvance { id: 99 }) => {}
+		other => panic!("expected a FrontierAdvance {{ id: 99 }}, got {other:?}"),
+	}
+}
+
 /// a `FileMove` whose new parent is a non-navigable virtual container (here `Links`)
 /// takes the file out of the synced tree, so it must convert to `FileEvent::Removed` rather than
 /// failing conversion (which would make it a frontier-advance-only event and leave a stale row).

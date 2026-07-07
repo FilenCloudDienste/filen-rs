@@ -229,6 +229,13 @@ impl<'a> CacheEventMaybeDecrypted<'a> {
 
 				Some(event)
 			}
+			// The event's payload was unknown/undecryptable upstream but its id was
+			// recovered; advance the watermark so it is not mistaken for a gap.
+			DecryptedSocketEvent::DriveMalformed { drive_message_id } => {
+				Some(Self::FrontierAdvance {
+					id: *drive_message_id,
+				})
+			}
 			_ => None,
 		}
 	}

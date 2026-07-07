@@ -147,6 +147,14 @@ pub enum DecryptedSocketEvent<'a> {
 		inner: DecryptedDriveEvent<'a>,
 		drive_message_id: u64,
 	},
+	/// A drive event that was received (its id is known) but whose kind is
+	/// unknown or whose payload could not be parsed/decrypted. Carries only the
+	/// id so the cache watermark advances past it instead of forcing a resync,
+	/// and is delivered to app listeners so they can advance their own drive
+	/// counters past it.
+	DriveMalformed {
+		drive_message_id: u64,
+	},
 	Chat {
 		inner: DecryptedChatEvent<'a>,
 		chat_message_id: u64,
@@ -173,6 +181,7 @@ impl DecryptedSocketEvent<'_> {
 			Self::Reconnecting => "reconnecting",
 			Self::Unsubscribed => "unsubscribed",
 			Self::Drive { inner, .. } => inner.event_type(),
+			Self::DriveMalformed { .. } => "driveMalformed",
 			Self::Chat { inner, .. } => inner.event_type(),
 			Self::Note { inner, .. } => inner.event_type(),
 			Self::Contact { inner, .. } => inner.event_type(),
@@ -186,6 +195,7 @@ impl DecryptedSocketEvent<'_> {
 			Self::Drive {
 				drive_message_id, ..
 			} => Some(*drive_message_id),
+			Self::DriveMalformed { drive_message_id } => Some(*drive_message_id),
 			Self::Chat {
 				chat_message_id, ..
 			} => Some(*chat_message_id),
@@ -223,6 +233,68 @@ pub enum DecryptedDriveEvent<'a> {
 	FileMetadataChanged(FileMetadataChanged<'a>),
 	DeleteAll,
 	DeleteVersioned,
+}
+
+impl<'a> DecryptedDriveEvent<'a> {
+	/// Decrypt/convert one wire drive event. Only `ItemFavorite` is fallible (it
+	/// requires server-supplied size/version/region/bucket/chunks/metadata);
+	/// every other arm degrades gracefully. Extracted from `try_from_encrypted`
+	/// so a failure here can be turned into a `DriveMalformed` event instead of
+	/// losing the whole message and forcing a resync.
+	fn try_blocking_from_encrypted(
+		crypter: &impl MetaCrypter,
+		inner: DriveEventType<'a>,
+	) -> Result<Self, Error> {
+		Ok(match inner {
+			DriveEventType::FileRename(e) => DecryptedDriveEvent::FileMetadataChanged(
+				FileMetadataChanged::blocking_from_encrypted(crypter, e.uuid, e.metadata),
+			),
+			DriveEventType::FileArchiveRestored(e) => DecryptedDriveEvent::FileArchiveRestored(
+				FileArchiveRestored::blocking_from_encrypted(crypter, e),
+			),
+			DriveEventType::FileNew(e) => {
+				DecryptedDriveEvent::FileNew(FileNew::blocking_from_encrypted(crypter, e))
+			}
+			DriveEventType::FileRestore(e) => {
+				DecryptedDriveEvent::FileRestore(FileRestore::blocking_from_encrypted(crypter, e))
+			}
+			DriveEventType::FileMove(e) => {
+				DecryptedDriveEvent::FileMove(FileMove::blocking_from_encrypted(crypter, e))
+			}
+			DriveEventType::FileTrash(e) => DecryptedDriveEvent::FileTrash(e),
+			DriveEventType::FileArchived(e) => DecryptedDriveEvent::FileArchived(e),
+			DriveEventType::FolderRename(e) => DecryptedDriveEvent::FolderMetadataChanged(
+				FolderMetadataChanged::blocking_from_encrypted(crypter, e.uuid, e.name),
+			),
+			DriveEventType::FolderTrash(e) => DecryptedDriveEvent::FolderTrash(e),
+			DriveEventType::FolderMove(e) => {
+				DecryptedDriveEvent::FolderMove(FolderMove::blocking_from_encrypted(crypter, e))
+			}
+			DriveEventType::FolderSubCreated(e) => DecryptedDriveEvent::FolderSubCreated(
+				FolderSubCreated::blocking_from_encrypted(crypter, e),
+			),
+			DriveEventType::FolderRestore(e) => DecryptedDriveEvent::FolderRestore(
+				FolderRestore::blocking_from_encrypted(crypter, e),
+			),
+			DriveEventType::FolderColorChanged(e) => DecryptedDriveEvent::FolderColorChanged(e),
+			DriveEventType::FolderMetadataChanged(e) => DecryptedDriveEvent::FolderMetadataChanged(
+				FolderMetadataChanged::blocking_from_encrypted(crypter, e.uuid, e.meta),
+			),
+			DriveEventType::FolderDeletedPermanent(e) => {
+				DecryptedDriveEvent::FolderDeletedPermanent(e)
+			}
+			DriveEventType::FileDeletedPermanent(e) => DecryptedDriveEvent::FileDeletedPermanent(e),
+			DriveEventType::FileMetadataChanged(e) => DecryptedDriveEvent::FileMetadataChanged(
+				FileMetadataChanged::blocking_from_encrypted(crypter, e.uuid, e.metadata),
+			),
+			DriveEventType::ItemFavorite(e) => DecryptedDriveEvent::ItemFavorite(
+				ItemFavorite::try_blocking_from_encrypted(crypter, e)?,
+			),
+			DriveEventType::TrashEmpty => DecryptedDriveEvent::TrashEmpty,
+			DriveEventType::DeleteAll => DecryptedDriveEvent::DeleteAll,
+			DriveEventType::DeleteVersioned => DecryptedDriveEvent::DeleteVersioned,
+		})
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
@@ -356,84 +428,24 @@ impl DecryptedSocketEvent<'_> {
 					SocketEvent::Drive {
 						inner,
 						drive_message_id,
-					} => {
-						let inner = match inner {
-							DriveEventType::FileRename(e) => {
-								DecryptedDriveEvent::FileMetadataChanged(
-									FileMetadataChanged::blocking_from_encrypted(
-										crypter, e.uuid, e.metadata,
-									),
-								)
-							}
-							DriveEventType::FileArchiveRestored(e) => {
-								DecryptedDriveEvent::FileArchiveRestored(
-									FileArchiveRestored::blocking_from_encrypted(crypter, e),
-								)
-							}
-							DriveEventType::FileNew(e) => DecryptedDriveEvent::FileNew(
-								FileNew::blocking_from_encrypted(crypter, e),
-							),
-							DriveEventType::FileRestore(e) => DecryptedDriveEvent::FileRestore(
-								FileRestore::blocking_from_encrypted(crypter, e),
-							),
-							DriveEventType::FileMove(e) => DecryptedDriveEvent::FileMove(
-								FileMove::blocking_from_encrypted(crypter, e),
-							),
-							DriveEventType::FileTrash(e) => DecryptedDriveEvent::FileTrash(e),
-							DriveEventType::FileArchived(e) => DecryptedDriveEvent::FileArchived(e),
-							DriveEventType::FolderRename(e) => {
-								DecryptedDriveEvent::FolderMetadataChanged(
-									FolderMetadataChanged::blocking_from_encrypted(
-										crypter, e.uuid, e.name,
-									),
-								)
-							}
-							DriveEventType::FolderTrash(e) => DecryptedDriveEvent::FolderTrash(e),
-							DriveEventType::FolderMove(e) => DecryptedDriveEvent::FolderMove(
-								FolderMove::blocking_from_encrypted(crypter, e),
-							),
-							DriveEventType::FolderSubCreated(e) => {
-								DecryptedDriveEvent::FolderSubCreated(
-									FolderSubCreated::blocking_from_encrypted(crypter, e),
-								)
-							}
-							DriveEventType::FolderRestore(e) => DecryptedDriveEvent::FolderRestore(
-								FolderRestore::blocking_from_encrypted(crypter, e),
-							),
-							DriveEventType::FolderColorChanged(e) => {
-								DecryptedDriveEvent::FolderColorChanged(e)
-							}
-							DriveEventType::FolderMetadataChanged(e) => {
-								DecryptedDriveEvent::FolderMetadataChanged(
-									FolderMetadataChanged::blocking_from_encrypted(
-										crypter, e.uuid, e.meta,
-									),
-								)
-							}
-							DriveEventType::FolderDeletedPermanent(e) => {
-								DecryptedDriveEvent::FolderDeletedPermanent(e)
-							}
-							DriveEventType::FileDeletedPermanent(e) => {
-								DecryptedDriveEvent::FileDeletedPermanent(e)
-							}
-							DriveEventType::FileMetadataChanged(e) => {
-								DecryptedDriveEvent::FileMetadataChanged(
-									FileMetadataChanged::blocking_from_encrypted(
-										crypter, e.uuid, e.metadata,
-									),
-								)
-							}
-							DriveEventType::ItemFavorite(e) => DecryptedDriveEvent::ItemFavorite(
-								ItemFavorite::try_blocking_from_encrypted(crypter, e)?,
-							),
-							DriveEventType::TrashEmpty => DecryptedDriveEvent::TrashEmpty,
-							DriveEventType::DeleteAll => DecryptedDriveEvent::DeleteAll,
-							DriveEventType::DeleteVersioned => DecryptedDriveEvent::DeleteVersioned,
-						};
-						DecryptedSocketEvent::Drive {
+					} => match DecryptedDriveEvent::try_blocking_from_encrypted(crypter, inner) {
+						Ok(inner) => DecryptedSocketEvent::Drive {
 							inner,
 							drive_message_id,
+						},
+						// The event happened; its payload just couldn't be decrypted
+						// (e.g. an item-favorite missing server-supplied fields). Surface
+						// it with its id instead of dropping the whole message and
+						// forcing a resync.
+						Err(e) => {
+							tracing::debug!(
+								"drive event {drive_message_id} could not be decrypted, surfacing as malformed: {e}"
+							);
+							DecryptedSocketEvent::DriveMalformed { drive_message_id }
 						}
+					},
+					SocketEvent::DriveMalformed { drive_message_id } => {
+						DecryptedSocketEvent::DriveMalformed { drive_message_id }
 					}
 					SocketEvent::Chat {
 						inner,
@@ -1050,5 +1062,64 @@ impl<'a> FileMetadataChanged<'a> {
 			FileMeta::blocking_from_encrypted(new_meta, crypter, FileEncryptionVersion::V2);
 
 		Self { uuid, metadata }
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::str::FromStr;
+
+	use super::*;
+	use crate::{crypto::v2::MasterKey, fs::meta_recovery::test_support::TEST_RSA_KEY};
+
+	async fn decrypt_wire_message(msg: &str) -> Yoke<DecryptedSocketEvent<'static>, String> {
+		let yoked = try_parse_message_from_str(msg.to_string())
+			.expect("wire message should parse")
+			.expect("wire message should contain an event");
+		let key = MasterKey::from_str(&"a".repeat(32)).expect("valid 32-char key");
+		DecryptedSocketEvent::try_from_encrypted(&key, &TEST_RSA_KEY, 1, yoked)
+			.await
+			.expect("decryption should not hard-fail")
+	}
+
+	/// An unknown drive event kind arrives as the wire `DriveMalformed` and must
+	/// survive the decrypt step as `DecryptedSocketEvent::DriveMalformed` with its id.
+	#[tokio::test]
+	async fn unknown_drive_kind_decrypts_to_drive_malformed() {
+		let decrypted =
+			decrypt_wire_message(r#"42["file-brand-new-kind",{"driveMessageId":99}]"#).await;
+		assert!(matches!(
+			decrypted.get(),
+			DecryptedSocketEvent::DriveMalformed {
+				drive_message_id: 99
+			}
+		));
+	}
+
+	/// A well-formed wire event whose payload fails to decrypt/convert (an item-favorite
+	/// missing the server-supplied file fields) must degrade to `DriveMalformed` with its
+	/// id instead of erroring out and losing the message.
+	#[tokio::test]
+	async fn undecryptable_item_favorite_decrypts_to_drive_malformed() {
+		let event_json = r#"["item-favorite",{"driveMessageId":77,"uuid":"11111111-1111-1111-1111-111111111111","type":"file","value":1,"parent":"22222222-2222-2222-2222-222222222222","timestamp":1000,"color":null}]"#;
+
+		// Guard: the wire layer must parse this as a real ItemFavorite drive event —
+		// otherwise this test would pass through the wire DriveMalformed path instead
+		// of the decrypt-failure demotion it is meant to exercise.
+		assert!(matches!(
+			serde_json::from_str::<SocketEvent>(event_json).expect("wire event should parse"),
+			SocketEvent::Drive {
+				inner: DriveEventType::ItemFavorite(_),
+				drive_message_id: 77,
+			}
+		));
+
+		let decrypted = decrypt_wire_message(&format!("42{event_json}")).await;
+		assert!(matches!(
+			decrypted.get(),
+			DecryptedSocketEvent::DriveMalformed {
+				drive_message_id: 77
+			}
+		));
 	}
 }

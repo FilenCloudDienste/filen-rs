@@ -402,6 +402,10 @@ pub enum SocketEvent<'a> {
 		inner: DriveEventType<'a>,
 		drive_message_id: u64,
 	},
+	/// A drive event whose id was recovered but whose kind is unknown or whose
+	/// payload failed to parse. Carries only the id so the cache watermark can
+	/// still advance past it instead of seeing a gap and forcing a full resync.
+	DriveMalformed { drive_message_id: u64 },
 	Chat {
 		inner: ChatEventType<'a>,
 		chat_message_id: u64,
@@ -445,13 +449,22 @@ impl<'de> Deserialize<'de> for SocketEvent<'de> {
 					.next_element()?
 					.ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
 
-				let (category, variant) =
-					classify_event(event_name.0.as_ref()).ok_or_else(|| {
-						serde::de::Error::custom(format!(
+				let Some((category, variant)) = classify_event(event_name.0.as_ref()) else {
+					// Unknown event kind. If it still carries a driveMessageId it is
+					// a drive event of a kind this client doesn't understand yet;
+					// surface it as DriveMalformed so the watermark advances past it
+					// instead of leaving a gap that forces a resync. Non-drive
+					// unknown events (disjoint id field names) remain a hard error.
+					return match extract_id!(raw, "driveMessageId") {
+						Ok(drive_message_id) => {
+							Ok(SocketEvent::DriveMalformed { drive_message_id })
+						}
+						Err(_) => Err(serde::de::Error::custom(format!(
 							"unknown socket event type: {}",
 							event_name.0
-						))
-					})?;
+						))),
+					};
+				};
 				let inject = InjectTagDeserializer {
 					variant: Cow::Borrowed(variant),
 					data: raw,
@@ -459,13 +472,17 @@ impl<'de> Deserialize<'de> for SocketEvent<'de> {
 
 				let event = match category {
 					EventCategory::Drive => {
-						let inner = DriveEventType::deserialize(inject)
-							.map_err(serde::de::Error::custom)?;
+						// Extract the id BEFORE parsing the payload so a changed/added
+						// field on a known drive event still yields the id — the whole
+						// message is no longer lost to a resync-forcing gap.
 						let drive_message_id =
 							extract_id!(raw, "driveMessageId").map_err(serde::de::Error::custom)?;
-						SocketEvent::Drive {
-							inner,
-							drive_message_id,
+						match DriveEventType::deserialize(inject) {
+							Ok(inner) => SocketEvent::Drive {
+								inner,
+								drive_message_id,
+							},
+							Err(_) => SocketEvent::DriveMalformed { drive_message_id },
 						}
 					}
 					EventCategory::Chat => {
@@ -600,6 +617,7 @@ impl SocketEvent<'_> {
 	pub fn event_type(&self) -> &'static str {
 		match self {
 			Self::Drive { inner, .. } => inner.event_type(),
+			Self::DriveMalformed { .. } => "driveMalformed",
 			Self::Chat { inner, .. } => inner.event_type(),
 			Self::Note { inner, .. } => inner.event_type(),
 			Self::Contact { inner, .. } => inner.event_type(),
@@ -1328,6 +1346,43 @@ mod tests {
 	#[test]
 	fn deserialize_unknown_event_fails() {
 		let json = r#"["unknown-event",{"messageId":1}]"#;
+		assert!(serde_json::from_str::<SocketEvent>(json).is_err());
+	}
+
+	#[test]
+	fn deserialize_unknown_drive_kind_recovers_id_as_malformed() {
+		// A drive event kind this client doesn't recognize, but it carries a
+		// driveMessageId — recover the id so the watermark advances.
+		let json = r#"["file-brand-new-kind",{"driveMessageId":99,"uuid":"11111111-1111-1111-1111-111111111111"}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		assert!(matches!(
+			event,
+			SocketEvent::DriveMalformed {
+				drive_message_id: 99
+			}
+		));
+	}
+
+	#[test]
+	fn deserialize_malformed_known_drive_event_recovers_id_as_malformed() {
+		// Known kind whose payload is missing required fields (a server format
+		// change). The id is still recovered rather than lost to a resync-forcing
+		// gap.
+		let json = r#"["file-new",{"driveMessageId":77}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		assert!(matches!(
+			event,
+			SocketEvent::DriveMalformed {
+				drive_message_id: 77
+			}
+		));
+	}
+
+	#[test]
+	fn deserialize_unknown_non_drive_event_still_fails() {
+		// No driveMessageId → genuinely unhandleable, must still error (not a drive
+		// event, so no watermark consequence).
+		let json = r#"["unknown-event",{"chatMessageId":1}]"#;
 		assert!(serde_json::from_str::<SocketEvent>(json).is_err());
 	}
 }

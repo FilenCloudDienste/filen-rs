@@ -35,6 +35,7 @@ pub enum SocketEvent {
 	Reconnecting,
 	Unsubscribed,
 	Drive(DriveSocketEvent),
+	DriveMalformed(DriveMalformedSocketEvent),
 	Chat(ChatSocketEvent),
 	Note(NoteSocketEvent),
 	Contact(ContactSocketEvent),
@@ -44,6 +45,15 @@ pub enum SocketEvent {
 #[js_type(export, no_deser)]
 pub struct DriveSocketEvent {
 	pub inner: DriveEvent,
+	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
+	pub drive_message_id: u64,
+}
+
+/// A drive event that was received (its id is known) but whose kind is unknown
+/// or whose payload could not be parsed/decrypted. Carries only the id so apps
+/// tracking drive message ids can advance their own counters past it.
+#[js_type(export, no_deser)]
+pub struct DriveMalformedSocketEvent {
 	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
 	pub drive_message_id: u64,
 }
@@ -185,6 +195,11 @@ impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
 					DecryptedDriveEvent::DeleteVersioned => DriveEvent::DeleteVersioned,
 				},
 			}),
+			DecryptedSocketEvent::DriveMalformed { drive_message_id } => {
+				SocketEvent::DriveMalformed(DriveMalformedSocketEvent {
+					drive_message_id: *drive_message_id,
+				})
+			}
 			DecryptedSocketEvent::Chat {
 				inner,
 				chat_message_id,
@@ -621,5 +636,26 @@ impl From<&crate::socket::events::FileMetadataChanged<'_>> for FileMetadataChang
 			uuid: event.uuid,
 			metadata: event.metadata.as_borrowed_cow().into(),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The malformed marker must reach app listeners (not be filtered out) so apps
+	/// tracking drive message ids can advance their own counters past it.
+	#[test]
+	fn drive_malformed_passes_through_to_the_js_event() {
+		let decrypted = DecryptedSocketEvent::DriveMalformed {
+			drive_message_id: 42,
+		};
+		let js: SocketEvent = (&decrypted).into();
+		assert!(matches!(
+			js,
+			SocketEvent::DriveMalformed(DriveMalformedSocketEvent {
+				drive_message_id: 42
+			})
+		));
 	}
 }
