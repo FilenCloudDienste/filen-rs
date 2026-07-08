@@ -155,7 +155,7 @@ impl FileBuilderParams {
 #[js_type(import, no_ser, no_default)]
 pub struct UploadFileStreamParams {
 	#[serde(flatten)]
-	pub file_params: UploadFileParams,
+	pub file_builder_params: FileBuilderParams,
 	#[tsify(type = "ReadableStream<Uint8Array>")]
 	#[serde(with = "serde_wasm_bindgen::preserve")]
 	pub reader: web_sys::ReadableStream,
@@ -163,6 +163,11 @@ pub struct UploadFileStreamParams {
 	#[tsify(type = "(bytes: bigint) => void", optional)]
 	#[serde(with = "serde_wasm_bindgen::preserve")]
 	pub progress: js_sys::Function,
+	// Direct (non-flattened) field so serde_wasm_bindgen::preserve keeps the abort/pause
+	// signals as live JS references. Flattening buffers the params into a serde map, which
+	// strips the preserved values — the download stream params keep it direct for the same reason.
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	pub managed_future: ManagedFuture,
 }
 
 #[js_type(import)]

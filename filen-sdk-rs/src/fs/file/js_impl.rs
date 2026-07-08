@@ -152,7 +152,6 @@ impl JsClient {
 		let this = self.inner();
 
 		let file = params
-			.file_params
 			.managed_future
 			.into_js_managed_commander_future(move || async move {
 				let mut reader = StreamReader {
@@ -160,10 +159,7 @@ impl JsClient {
 					current_chunk: None,
 				};
 
-				let builder = params
-					.file_params
-					.file_builder_params
-					.into_file_builder(&this)?;
+				let builder = params.file_builder_params.into_file_builder(&this)?;
 				let file = this
 					.upload_file_from_reader(builder, &mut reader, None, params.known_size)
 					.await?;
