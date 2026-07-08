@@ -62,8 +62,16 @@ pub(crate) trait MakePasswordSaltAndHash {
 	}
 }
 
-#[derive(Default)]
-#[js_type(tagged, wasm_all)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown"),
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	// internally tagged enums cannot (de)serialize newtype variants wrapping a
+	// non-struct (e.g. `Known(String)`), so an explicit content key is required:
+	// https://github.com/serde-rs/serde/issues/1307
+	serde(tag = "type", content = "data", rename_all = "camelCase"),
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PasswordState {
 	Known(String),
 	Hashed(LinkHashedPasswordStatic),
