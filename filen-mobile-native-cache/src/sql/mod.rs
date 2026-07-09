@@ -1,7 +1,6 @@
 use filen_sdk_rs::{
 	fs::{
 		HasUUID,
-		categories::{NonRootItemType, Normal},
 		dir::{RemoteDirectory, meta::DirectoryMeta},
 		file::{RemoteFile, meta::FileMeta},
 	},
@@ -27,7 +26,7 @@ use statements::*;
 
 use crate::{
 	CacheError,
-	ffi::{ItemType, ParsedFfiId, PathFfiId, SearchQueryArgs},
+	ffi::{ItemType, ParsedFfiId, PathFfiId},
 	sql::{
 		dir::DBDir,
 		file::DBFile,
@@ -263,64 +262,6 @@ pub(crate) fn update_recents(
 	Ok(())
 }
 
-pub(crate) fn update_search_items<'a, I>(
-	conn: &'a mut Connection,
-	items: I,
-) -> Result<Vec<DBNonRootObject>, rusqlite::Error>
-where
-	I: IntoIterator<Item = (NonRootItemType<'a, Normal>, String)>,
-{
-	let tx = conn.transaction()?;
-	let items = {
-		// This should remove any orphaned items that were previously around because they were searched for
-		let mut clear_search = tx.prepare_cached(CLEAR_ORPHANED_SEARCH_ITEMS)?;
-		clear_search.execute([])?;
-
-		// This should removed the search path from all items that were previously searched for
-		let mut clear_search = tx.prepare_cached(CLEAR_SEARCH_FROM_ITEMS)?;
-		clear_search.execute([])?;
-
-		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
-		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
-		let mut upsert_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
-		let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
-		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
-		let mut update_search_path = tx.prepare_cached(UPDATE_SEARCH_PATH)?;
-		let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
-		let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
-
-		items
-			.into_iter()
-			.map(|(item, path)| match item {
-				NonRootItemType::Dir(cow) => {
-					let dir = DBDir::upsert_from_remote_stmts(
-						cow.into_owned(),
-						&mut upsert_item_stmt,
-						&mut upsert_dir,
-						&mut upsert_dir_meta,
-						&mut delete_dir_meta,
-					)?;
-					update_search_path.execute((path, dir.id))?;
-					Ok(DBNonRootObject::Dir(dir))
-				}
-				NonRootItemType::File(cow) => {
-					let file = DBFile::upsert_from_remote_stmts(
-						cow.into_owned(),
-						&mut upsert_item_stmt,
-						&mut upsert_file,
-						&mut upsert_file_meta,
-						&mut delete_file_meta,
-					)?;
-					update_search_path.execute((path, file.id))?;
-					Ok(DBNonRootObject::File(file))
-				}
-			})
-			.collect::<Result<Vec<_>, rusqlite::Error>>()?
-	};
-	tx.commit()?;
-	Ok(items)
-}
-
 pub(crate) fn update_items_with_parent<I, I1>(
 	conn: &mut Connection,
 	dirs: I,
@@ -389,72 +330,6 @@ pub(crate) fn select_recents(
 	let mut stmt = conn.prepare(&statements::select_recents(order_by))?;
 	stmt.query_and_then([], DBNonRootObject::from_row)?
 		.collect::<SQLResult<Vec<_>>>()
-}
-
-pub(crate) fn select_search(
-	conn: &Connection,
-	args: &SearchQueryArgs,
-	root: UuidStr,
-) -> SQLResult<Vec<(DBNonRootObject, String)>> {
-	let mut stmt = conn.prepare_cached(SELECT_SEARCH)?;
-
-	let mime_json_array_string = if args.mime_types.is_empty() {
-		None
-	} else {
-		let mime_json_string_capacity =
-			args.mime_types.iter().fold(2 /* for [] */, |acc, mime| {
-				acc + mime.len() + 3 // 3 for the surrounding quotes and commas
-			}) - 1; // -1 for the last comma
-
-		let mut mime_json_string = String::with_capacity(mime_json_string_capacity);
-		mime_json_string.push('[');
-		for (i, mime) in args.mime_types.iter().enumerate() {
-			if i > 0 {
-				mime_json_string.push(',');
-			}
-			mime_json_string.push('"');
-			mime_json_string.push_str(mime);
-			mime_json_string.push('"');
-		}
-		mime_json_string.push(']');
-		// SAFETY: We are mutating the string to replace '*' with '%'
-		// which is safe as this is just replacing a single valid byte with another valid byte.
-		unsafe {
-			let bytes = mime_json_string.as_bytes_mut();
-			for byte in bytes.iter_mut() {
-				if *byte == b'*' {
-					*byte = b'%'; // Replace '*' with '%'
-				}
-			}
-		}
-		Some(mime_json_string)
-	};
-
-	stmt.query_and_then(
-		(
-			args.name.as_ref().map(|n| n.trim().to_lowercase()),
-			mime_json_array_string,
-			args.file_size_min,
-			args.last_modified_min,
-			args.item_type,
-		),
-		|r| {
-			Ok((
-				DBNonRootObject::from_row(r)?,
-				format!(
-					"{}{}",
-					root.as_ref(),
-					r.get_ref(
-						ITEM_COLUMN_COUNT_NO_EXTRA
-							+ FILES_COLUMN_COUNT + FILES_META_COLUMN_COUNT
-							+ DIRS_COLUMN_COUNT + DIRS_META_COLUMN_COUNT
-					)?
-					.as_str()?
-				),
-			))
-		},
-	)?
-	.collect::<SQLResult<Vec<_>>>()
 }
 
 /// Accepts an iterator over UUIDs

@@ -11,7 +11,6 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	Error, ErrorKind,
 	connect::{DirPublicLink, PublicLinkSharedClientExt},
-	crypto::shared::generate_random_base64_values,
 	error::ResultExt,
 	fs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID,
@@ -530,62 +529,6 @@ async fn size() {
 	assert_eq!(size.size, 0);
 	assert_eq!(size.files, 0);
 	assert_eq!(size.dirs, 2);
-}
-
-#[shared_test_runtime]
-#[ignore = "search backend changes pending"]
-async fn dir_search() {
-	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
-	let test_dir = &resources.dir;
-
-	let _lock = client.lock_drive().await.unwrap();
-
-	let second_dir = client
-		.create_dir(&test_dir.into(), "second_dir")
-		.await
-		.unwrap();
-
-	let rng = &mut rand::rng();
-	let dir_random_part_long = generate_random_base64_values(8, rng);
-	let dir_random_part_short = generate_random_base64_values(2, rng);
-
-	let dir_name = format!("{dir_random_part_long}{dir_random_part_short}");
-
-	let dir = client
-		.create_dir(&(&second_dir).into(), &dir_name)
-		.await
-		.unwrap();
-
-	let found_items = client
-		.find_item_matches_for_name(&dir_random_part_long)
-		.await
-		.unwrap();
-
-	assert_eq!(
-		found_items,
-		vec![(
-			NonRootItemType::Dir(Cow::Owned(dir.clone())),
-			format!(
-				"/{}/{}",
-				test_dir.name().unwrap(),
-				second_dir.name().unwrap()
-			)
-		)]
-	);
-
-	let found_items = client
-		.find_item_matches_for_name(&dir_random_part_short)
-		.await
-		.unwrap();
-
-	assert!(found_items.iter().any(|(item, _)| {
-		if let NonRootItemType::Dir(found_dir) = item {
-			*found_dir.clone() == dir
-		} else {
-			false
-		}
-	}));
 }
 
 #[shared_test_runtime]

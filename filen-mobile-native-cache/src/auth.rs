@@ -42,13 +42,18 @@ pub struct AuthCacheState {
 	pub(crate) tmp_dir: PathBuf,
 	pub(crate) cache_dir: PathBuf,
 	pub(crate) thumbnail_dir: PathBuf,
-	pub(crate) client: filen_sdk_rs::auth::Client,
+	pub(crate) client: Arc<filen_sdk_rs::auth::Client>,
 	pub(crate) last_recents_update: RwLock<Option<Instant>>,
 	pub(crate) last_trash_update: RwLock<Option<Instant>>,
 	pub(crate) thumbnail_file_budget: u64,
 	pub(crate) cache_file_budget: u64,
 	pub(crate) last_cleanup: tokio::sync::RwLock<Option<DateTime<Utc>>>,
 	pub(crate) last_cleanup_sem: tokio::sync::Semaphore,
+	/// Path of the SDK cache DB backing live search (see [`crate::search`]). Separate from the
+	/// hand-rolled `native_cache.db`; opened lazily on the first search.
+	pub(crate) sdk_cache_path: PathBuf,
+	/// The one live `cache::search` on the drive root, reused across queries via `set_config`.
+	pub(crate) search: tokio::sync::Mutex<Option<crate::search::ActiveSearch>>,
 }
 
 enum UnauthReason {
@@ -514,13 +519,16 @@ impl AuthCacheState {
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir)?;
 
+		// Keep the SDK search DB at the files-dir root, NOT under cache_dir (which the cache
+		// cleanup scans/wipes expecting only per-file uuid subdirectories).
+		let sdk_cache_path = files_dir.join(crate::search::SDK_CACHE_DB_NAME);
 		let new = Self {
 			conn: Mutex::new(db),
 			cache_state_file,
 			tmp_dir,
 			cache_dir,
 			thumbnail_dir,
-			client,
+			client: Arc::new(client),
 			last_recents_update: RwLock::new(None),
 			last_trash_update: RwLock::new(None),
 			thumbnail_file_budget: max_thumbnail_files_budget,
@@ -529,6 +537,8 @@ impl AuthCacheState {
 				state.as_ref().and_then(|s| s.last_cache_cleanup),
 			),
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
+			sdk_cache_path,
+			search: tokio::sync::Mutex::new(None),
 		};
 		new.add_root(new.client.root().uuid().as_ref())?;
 		Ok(new)
@@ -552,8 +562,10 @@ impl AuthCacheState {
 		let db = Connection::open_in_memory()?;
 		db.execute_batch(sql::statements::INIT)?;
 
+		let sdk_cache_path =
+			std::convert::AsRef::<Path>::as_ref(files_dir).join(crate::search::SDK_CACHE_DB_NAME);
 		let new = Self {
-			client,
+			client: Arc::new(client),
 			conn: Mutex::new(db),
 			cache_state_file,
 			cache_dir,
@@ -565,6 +577,8 @@ impl AuthCacheState {
 			cache_file_budget: DEFAULT_MAX_CACHE_FILES_BUDGET,
 			last_cleanup: tokio::sync::RwLock::new(None),
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
+			sdk_cache_path,
+			search: tokio::sync::Mutex::new(None),
 		};
 		new.add_root(new.client.root().uuid().as_ref())?;
 		Ok(new)

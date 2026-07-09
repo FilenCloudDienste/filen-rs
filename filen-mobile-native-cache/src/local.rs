@@ -8,10 +8,7 @@ use tracing::debug;
 use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
-	ffi::{
-		FfiId, FfiNonRootObject, FfiObject, FfiRoot, QueryChildrenResponse,
-		QueryNonDirChildrenResponse, SearchQueryArgs, SearchQueryResponseEntry,
-	},
+	ffi::{FfiId, FfiObject, FfiRoot, QueryChildrenResponse, QueryNonDirChildrenResponse},
 	sql::{
 		self, DBDirExt, DBDirObject, DBItemTrait, DBRoot,
 		error::OptionalExtensionSQL,
@@ -87,13 +84,6 @@ impl FilenMobileCacheState {
 
 	pub fn root_uuid(&self) -> Result<String, CacheError> {
 		self.sync_execute_authed(|auth_state| Ok(auth_state.root_uuid()))
-	}
-
-	pub fn query_search(
-		&self,
-		args: SearchQueryArgs,
-	) -> Result<Vec<SearchQueryResponseEntry>, CacheError> {
-		self.sync_execute_authed(|auth_state| auth_state.query_search(args))
 	}
 }
 
@@ -295,20 +285,5 @@ impl AuthCacheState {
 
 	pub(crate) fn root_uuid(&self) -> String {
 		self.client.root().uuid().to_string()
-	}
-
-	pub(crate) fn query_search(
-		&self,
-		args: SearchQueryArgs,
-	) -> Result<Vec<SearchQueryResponseEntry>, CacheError> {
-		Ok(
-			sql::select_search(&self.conn(), &args, *self.client.root().uuid())?
-				.into_iter()
-				.map(|(o, path)| SearchQueryResponseEntry {
-					object: FfiNonRootObject::from(o),
-					path,
-				})
-				.collect(),
-		)
 	}
 }

@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
 use filen_types::traits::CowHelpers;
-use futures::TryFutureExt;
 
 use crate::{
 	api,
@@ -70,11 +69,8 @@ impl Client {
 			response.timestamp,
 		);
 
-		futures::try_join!(
-			self.update_search_hashes_for_item(&dir)
-				.map_err(Error::from),
-			self.update_item_with_maybe_connected_parent((&dir).into()),
-		)?;
+		self.update_item_with_maybe_connected_parent((&dir).into())
+			.await?;
 		Ok(dir)
 	}
 

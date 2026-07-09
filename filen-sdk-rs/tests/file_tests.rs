@@ -6,11 +6,10 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
-	crypto::shared::generate_random_base64_values,
 	error::ResultExt,
 	fs::{
 		HasName, HasRemoteInfo, HasUUID,
-		categories::{NonRootFileType, NonRootItemType},
+		categories::NonRootFileType,
 		dir::RemoteDirectory,
 		file::{
 			client_impl::FileReaderSharedClientExt,
@@ -73,60 +72,6 @@ async fn file_upload_download() {
 	assert_file_upload_download_equal("big_not_chunk_aligned_under.exe", 1024 * 1024 * 8 - 1).await;
 	assert_file_upload_download_equal("empty.json", 0).await;
 	assert_file_upload_download_equal("one_chunk", 1024 * 1024).await;
-}
-
-#[shared_test_runtime]
-#[ignore = "search backend changes pending"]
-async fn file_search() {
-	let resources = test_utils::RESOURCES.get_resources().await;
-	let client = &resources.client;
-	let test_dir = &resources.dir;
-
-	let second_dir = client
-		.create_dir(&test_dir.into(), "second_dir")
-		.await
-		.unwrap();
-
-	let rng = &mut rand::rng();
-	let file_random_part_long = generate_random_base64_values(8, rng);
-	let file_random_part_short = generate_random_base64_values(2, rng);
-
-	let file_name = format!("{file_random_part_long}{file_random_part_short}.txt");
-
-	let file = client
-		.make_file_builder(&file_name, *second_dir.uuid())
-		.unwrap();
-	let file = client.upload_file(file, &[]).await.unwrap();
-
-	let found_items = client
-		.find_item_matches_for_name(&file_random_part_long)
-		.await
-		.unwrap();
-
-	assert_eq!(
-		found_items,
-		vec![(
-			NonRootItemType::File(Cow::Owned(file.clone())),
-			format!(
-				"/{}/{}",
-				test_dir.name().unwrap(),
-				second_dir.name().unwrap()
-			)
-		)]
-	);
-
-	let found_items = client
-		.find_item_matches_for_name(&file_random_part_short)
-		.await
-		.unwrap();
-
-	assert!(found_items.iter().any(|(item, _)| {
-		if let NonRootItemType::File(found_file) = item {
-			*found_file.clone() == file
-		} else {
-			false
-		}
-	}));
 }
 
 #[shared_test_runtime]

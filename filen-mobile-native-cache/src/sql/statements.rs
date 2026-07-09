@@ -35,14 +35,8 @@ pub(crate) fn select_recents(order_by: Option<&str>) -> String {
 	format!("{} {}", SELECT_RECENTS, convert_order_by(order_by))
 }
 
-// Item/Search
-pub(crate) const CLEAR_ORPHANED_SEARCH_ITEMS: &str =
-	include_str!("../../sql/clear_orphaned_search_items.sql");
-pub(crate) const CLEAR_SEARCH_FROM_ITEMS: &str =
-	include_str!("../../sql/clear_search_from_items.sql");
-pub(crate) const SELECT_SEARCH: &str = include_str!("../../sql/select_search.sql");
+// Item
 pub(crate) const SELECT_ITEM_BY_UUID: &str = include_str!("../../sql/select_item.sql");
-pub(crate) const UPDATE_SEARCH_PATH: &str = include_str!("../../sql/update_search_path.sql");
 
 // File
 pub(crate) const SELECT_FILE: &str = include_str!("../../sql/select_file.sql");
@@ -109,7 +103,7 @@ fn convert_order_by(order_by: Option<&str>) -> &'static str {
 }
 
 // Constants
-/// Does not include is_stale, is_recent and parent_path
+/// Does not include is_stale and is_recent
 pub(crate) const ITEM_COLUMN_COUNT_NO_EXTRA: usize = 5;
 // does not include the `id` column for the below
 pub(crate) const DIRS_COLUMN_COUNT: usize = 6;

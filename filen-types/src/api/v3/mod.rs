@@ -10,7 +10,6 @@ pub mod login;
 pub mod message_ids;
 pub mod notes;
 pub mod register;
-pub mod search;
 pub mod shared;
 pub mod socket;
 pub mod trash;

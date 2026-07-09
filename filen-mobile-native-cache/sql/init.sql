@@ -9,21 +9,12 @@ CREATE TABLE items (
 	type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
 	is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
 	local_data TEXT,
-	is_recent BOOLEAN NOT NULL CHECK (is_recent IN (FALSE, TRUE)) DEFAULT FALSE,
-	-- This is used if the item has been added by search
-	-- In that case the parent might not be in the database yet
-	-- so we have no way of resolving the item's path
-	-- the /search/find endpoint does return the encrypted path
-	-- so we store it here to avoid having to query the server again
-	-- This is also used to identify items that have been recently searched for
-	-- and a search should always clear previous
-	parent_path TEXT
+	is_recent BOOLEAN NOT NULL CHECK (is_recent IN (FALSE, TRUE)) DEFAULT FALSE
 );
 
 CREATE INDEX idx_items_uuid ON items (uuid);
 CREATE INDEX idx_items_parent ON items (parent);
 CREATE INDEX idx_items_is_recent ON items (is_recent);
-CREATE INDEX idx_items_has_search ON items (parent_path IS NOT NULL);
 
 CREATE TABLE roots (
 	id BIGINT PRIMARY KEY NOT NULL,
@@ -108,7 +99,7 @@ FOR EACH ROW
 WHEN old.uuid != new.uuid AND old.type != 2 -- Ensure it's not a file
 BEGIN
 	DELETE FROM items
-	WHERE parent = old.uuid AND parent_path IS NULL;
+	WHERE parent = old.uuid;
 END;
 
 CREATE TRIGGER cascade_on_delete_delete_children
@@ -117,5 +108,5 @@ FOR EACH ROW
 WHEN old.type != 2 -- Ensure it's not a file
 BEGIN
 	DELETE FROM items
-	WHERE parent = old.uuid AND parent_path IS NULL;
+	WHERE parent = old.uuid;
 END;

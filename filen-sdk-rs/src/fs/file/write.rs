@@ -554,14 +554,6 @@ impl<'a> FileWriterCompletingState<'a> {
 				.await?;
 			Ok(())
 		}) as MaybeSendBoxFuture<'a, Result<(), Error>>);
-		let temp_file = file.clone();
-		futures.push(Box::pin(async move {
-			self.client
-				.update_search_hashes_for_item(temp_file.as_ref())
-				.await?;
-			Ok(())
-		}) as MaybeSendBoxFuture<'a, Result<(), Error>>);
-
 		FileWriterFinalizingState {
 			file,
 			futures,

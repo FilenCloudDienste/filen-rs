@@ -59,51 +59,6 @@ fn get_compat_test_file(
 	(file, test_str)
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
-struct NameSplitterFile {
-	name1: String,
-	split1: Vec<String>,
-	name2: String,
-	split2: Vec<String>,
-	name3: String,
-	split3: Vec<String>,
-	name4: String,
-	split4: Vec<String>,
-}
-
-fn get_name_splitter_test_value() -> NameSplitterFile {
-	NameSplitterFile {
-		name1: "General_Invitation_-_the_ECSO_Award_Finals_2024.docx".to_string(),
-		split1: filen_sdk_rs::search::split_name(
-			"General_Invitation_-_the_ECSO_Award_Finals_2024.docx",
-			2,
-			16,
-		)
-		.iter()
-		.map(|s| s.to_string())
-		.collect(),
-		name2: "Screenshot 2023-05-16 201840.png".to_string(),
-		split2: filen_sdk_rs::search::split_name("Screenshot 2023-05-16 201840.png", 2, 16)
-			.iter()
-			.map(|s| s.to_string())
-			.collect(),
-		name3: "!service-invoice-657c56116e4f6947a80001cc.pdf".to_string(),
-		split3: filen_sdk_rs::search::split_name(
-			"!service-invoice-657c56116e4f6947a80001cc.pdf",
-			2,
-			16,
-		)
-		.iter()
-		.map(|s| s.to_string())
-		.collect(),
-		name4: "файл.txt".to_string(),
-		split4: filen_sdk_rs::search::split_name("файл.txt", 2, 16)
-			.iter()
-			.map(|s| s.to_string())
-			.collect(),
-	}
-}
-
 async fn get_contact(
 	client: &Client,
 ) -> (
@@ -203,19 +158,6 @@ async fn make_rs_compat_dir() {
 
 	let (file, test_str) = get_compat_test_file(client, *compat_dir.uuid());
 	client.upload_file(file, test_str.as_bytes()).await.unwrap();
-
-	let file = client
-		.make_file_builder("nameSplitter.json", *compat_dir.uuid())
-		.unwrap();
-	client
-		.upload_file(
-			file,
-			serde_json::to_string(&get_name_splitter_test_value())
-				.unwrap()
-				.as_bytes(),
-		)
-		.await
-		.unwrap();
 }
 
 async fn prep_shared_compat_tests(client: &Client, language: &str, shortened: &str) {
@@ -332,23 +274,6 @@ async fn run_compat_tests(
 		}
 		_ => panic!("small.txt not found in compat-{shortened} directory"),
 	}
-
-	match find("nameSplitter.json").await {
-		Some(NonRootItemType::File(file)) => {
-			let buf = client.download_file(file.as_ref()).await.unwrap();
-			let mut name_splitter = serde_json::from_slice::<NameSplitterFile>(&buf).unwrap();
-			name_splitter.split1.sort_unstable();
-			name_splitter.split2.sort_unstable();
-			name_splitter.split3.sort_unstable();
-			name_splitter.split4.sort_unstable();
-			assert_eq!(
-				name_splitter,
-				get_name_splitter_test_value(),
-				"nameSplitter.json contents mismatch"
-			);
-		}
-		_ => panic!("nameSplitter.json not found in compat-{shortened} directory"),
-	};
 
 	if client.auth_version() == AuthVersion::V1 {
 		// we weren't able to upload files larger than 1MiB to the V1 account

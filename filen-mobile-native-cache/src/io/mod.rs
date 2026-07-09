@@ -632,6 +632,7 @@ impl CacheState {
 				debug!("Not authenticated, removing all cache directories and database file");
 				let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(&self.files_dir);
 				let db_file = self.files_dir.join(DB_FILE_NAME);
+				let sdk_cache = self.files_dir.join(crate::search::SDK_CACHE_DB_NAME);
 				futures::join!(
 					remove_dir_all_if_exists(&cache_dir),
 					remove_dir_all_if_exists(&tmp_dir),
@@ -653,6 +654,26 @@ impl CacheState {
 									db_file.display(),
 									e
 								);
+							}
+						}
+					},
+					async {
+						// The SDK search cache lives at the files-dir ROOT (outside cache_dir), so
+						// wipe it and its WAL sidecars here — otherwise it survives logout and, on
+						// files-dir reuse across accounts, leaks the previous account's cached
+						// names/keys.
+						for suffix in ["", "-wal", "-shm"] {
+							let mut os = sdk_cache.clone().into_os_string();
+							os.push(suffix);
+							let path = std::path::PathBuf::from(os);
+							match tokio::fs::remove_file(&path).await {
+								Ok(_) => info!("Removed SDK search cache file: {}", path.display()),
+								Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+								Err(e) => error!(
+									"Failed to remove SDK search cache file {}: {}",
+									path.display(),
+									e
+								),
 							}
 						}
 					}

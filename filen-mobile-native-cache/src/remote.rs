@@ -17,7 +17,7 @@ use crate::{
 	ffi::{
 		CreateFileResponse, DirWithPathResponse, FfiId, FileWithPathResponse,
 		ObjectWithPathResponse, ParsedFfiId, PathFfiId, QueryChildrenResponse,
-		QueryNonDirChildrenResponse, UploadFileInfo,
+		QueryNonDirChildrenResponse, SearchQueryArgs, SearchQueryResponseEntry, UploadFileInfo,
 	},
 	sql::{
 		self, DBDirExt, DBDirObject, DBDirTrait, DBFileMeta, DBItemTrait,
@@ -27,7 +27,7 @@ use crate::{
 		object::{DBNonRootObject, DBObject},
 	},
 	sync::UpdateItemsInPath,
-	traits::ProgressCallback,
+	traits::{ProgressCallback, SearchUpdateCallback},
 };
 
 // yes this should be done with macros
@@ -56,6 +56,21 @@ impl FilenMobileCacheState {
 			.await
 	}
 
+	/// Search the subtree rooted at `root_id` (the documents-provider root id, i.e. the drive-root
+	/// uuid) via the live cache-search engine. Returns the current page immediately; `on_update`
+	/// fires as the on-demand resync converges so the caller can re-query.
+	pub async fn query_search(
+		&self,
+		root_id: String,
+		args: SearchQueryArgs,
+		on_update: Arc<dyn SearchUpdateCallback>,
+	) -> Result<Vec<SearchQueryResponseEntry>, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.query_search(root_id, args, on_update).await
+		})
+		.await
+	}
+
 	pub async fn update_and_query_dir_children(
 		&self,
 		path: FfiId,
@@ -75,13 +90,6 @@ impl FilenMobileCacheState {
 	) -> Result<QueryNonDirChildrenResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.update_and_query_recents(order_by).await
-		})
-		.await
-	}
-
-	pub async fn update_search(&self, name: &str) -> Result<(), CacheError> {
-		self.async_execute_authed_owned(async move |auth_state| {
-			auth_state.update_search(name).await
 		})
 		.await
 	}
@@ -286,12 +294,6 @@ impl AuthCacheState {
 			.write()
 			.unwrap()
 			.replace(Instant::now());
-		Ok(())
-	}
-
-	pub(crate) async fn update_search(&self, name: &str) -> Result<(), CacheError> {
-		let results = self.client.find_item_matches_for_name(name).await?;
-		sql::update_search_items(&mut self.conn(), results)?;
 		Ok(())
 	}
 

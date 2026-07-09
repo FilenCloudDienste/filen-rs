@@ -881,19 +881,6 @@ test("chats", async () => {
 	expect(chatEvent.inner.msg).toEqual(fetchedChat?.lastMessage)
 })
 
-test.skip("search", async () => {
-	const dir = await state.createDir(testDir, "search-dir-124asdfas;dlkfj")
-	const file = await state.uploadFile(new TextEncoder().encode("search file content"), {
-		parent: dir,
-		name: "search-file-124asdfas;dlkfj.txt"
-	})
-
-	const results = await state.findItemMatchesForName("124asdfa")
-	// Narrow to NormalDir/File before accessing uuid (SharedDir/LinkedDir variants have no direct uuid)
-	expect(results.find(i => (i.item.type === "normalDir" || i.item.type === "file") && i.item.uuid === dir.uuid)).toBeDefined()
-	expect(results.find(i => (i.item.type === "normalDir" || i.item.type === "file") && i.item.uuid === file.uuid)).toBeDefined()
-})
-
 test("authError", async () => {
 	const badStringified = await state.toStringified()
 	badStringified.apiKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"

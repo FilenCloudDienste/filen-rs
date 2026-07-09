@@ -360,7 +360,10 @@ pub enum ItemType {
 	File,
 }
 
-#[derive(uniffi::Record, Debug)]
+/// Query for [`FilenMobileCacheState::query_search`](crate::auth::FilenMobileCacheState). `name`
+/// and `item_type` are pushed into the live search engine; `mime_types`/`file_size_min`/
+/// `last_modified_min` are post-filtered on the results (the engine matches by name + type only).
+#[derive(uniffi::Record, Debug, Clone)]
 pub struct SearchQueryArgs {
 	pub name: Option<String>,
 	pub item_type: Option<ItemType>,
@@ -370,6 +373,8 @@ pub struct SearchQueryArgs {
 	pub last_modified_min: Option<u64>,
 }
 
+/// One search result: the matched item plus its path relative to the search root (the drive
+/// root), so it renders in the documents provider exactly like a browsed child.
 #[derive(uniffi::Record, Debug)]
 pub struct SearchQueryResponseEntry {
 	pub object: FfiNonRootObject,

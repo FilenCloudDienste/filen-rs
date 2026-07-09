@@ -4,6 +4,7 @@ pub mod env;
 mod error;
 pub mod ffi;
 pub mod io;
+pub(crate) mod search;
 pub(crate) mod sql;
 pub(crate) mod sync;
 pub use error::CacheError;
