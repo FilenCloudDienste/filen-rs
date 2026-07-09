@@ -90,6 +90,12 @@ pub(crate) fn decrypt_meta(
 	Ok(out)
 }
 
+// V1 data comes in three layouts, distinguished by sniffing (the stored version number
+// cannot tell them apart):
+//   - raw OpenSSL EVP: "Salted__" + 8-byte salt + AES-256-CBC body, key+IV via EVP_BytesToKey
+//   - the same EVP layout as base64 text (starts with "U2FsdGVk"), decoded first
+//   - "normal CBC" (no marker): AES-256-CBC over the whole buffer, key used directly,
+//     IV = key[0..16], no header to strip
 fn decrypt_data(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
 	let first_16 = &data[..16.min(data.len())];
 	let as_str = String::from_utf8_lossy(first_16);
@@ -97,7 +103,7 @@ fn decrypt_data(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
 
 	let needs_convert = !as_str.starts_with("Salted_") && !as_b64.starts_with("Salted_");
 	let is_normal_cbc =
-		!needs_convert && !as_str.starts_with("U2FsdGVk") && !as_b64.starts_with("U2FsdGVk");
+		needs_convert && !as_str.starts_with("U2FsdGVk") && !as_b64.starts_with("U2FsdGVk");
 
 	if needs_convert && !is_normal_cbc {
 		*data = BASE64_STANDARD.decode(std::str::from_utf8(data)?)?
@@ -107,8 +113,6 @@ fn decrypt_data(key: &[u8], data: &mut Vec<u8>) -> Result<(), ConversionError> {
 		decrypt(key, data)?;
 	} else {
 		let cipher = cbc::Decryptor::<aes::Aes256>::new_from_slices(key, &key[..IV_LEN])?;
-		data.copy_within(16.., 0);
-		data.truncate(data.len() - 16);
 		cipher.decrypt_padded_mut::<Pkcs7>(data)?;
 		let padding_len = data.last().copied().unwrap_or(0) as usize;
 		data.truncate(data.len() - padding_len);
@@ -236,6 +240,47 @@ pub fn derive_password_and_mk(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	const LEGACY_KEY: &str = "0123456789abcdefghijklmnopqrstuv";
+	const LEGACY_PLAINTEXT: &[u8] =
+		b"Filen v1 legacy data decryption compat test vector 0123456789";
+
+	fn decrypt_legacy(mut data: Vec<u8>) -> Result<Vec<u8>, ConversionError> {
+		FileKey::from_str(LEGACY_KEY)
+			.unwrap()
+			.blocking_decrypt_data(&mut data)?;
+		Ok(data)
+	}
+
+	// Raw binary AES-256-CBC with the file key used directly as key and IV = key[0..16],
+	// no marker. The "v1.5" upload scheme; stored as version 1 (integer version column).
+	#[test]
+	fn test_decrypt_data_normal_cbc() {
+		let data = hex::decode(
+			"e7c2d9faf2f03f148a5d47721e90e9ae61cc933a47bb9ef856e48a52664146be12abb5495b649e22637f39a7b1af4b3a4a157252091eea2c47e0a770d437b7da",
+		)
+		.unwrap();
+		assert_eq!(decrypt_legacy(data).unwrap(), LEGACY_PLAINTEXT);
+	}
+
+	// OpenSSL EVP layout: "Salted__" + 8-byte salt + AES-256-CBC body,
+	// key+IV derived via EVP_BytesToKey (MD5, one iteration).
+	#[test]
+	fn test_decrypt_data_openssl_salted() {
+		let data = hex::decode(
+			"53616c7465645f5f010203040506070828c247abdf130c4127c95d6c2d23d23e177aa05b0b8382e3c9775f5a579fe993f9e24b0f2226e2b4c934f1a0d2522edfa371dfb993376771447f2c29db23290b",
+		)
+		.unwrap();
+		assert_eq!(decrypt_legacy(data).unwrap(), LEGACY_PLAINTEXT);
+	}
+
+	// The same OpenSSL EVP layout uploaded as base64 text (CryptoJS .toString() output).
+	#[test]
+	fn test_decrypt_data_openssl_salted_base64() {
+		let data =
+			b"U2FsdGVkX18BAgMEBQYHCCjCR6vfEwxBJ8ldbC0j0j4XeqBbC4OC48l3X1pXn+mT+eJLDyIm4rTJNPGg0lIu36Nx37mTN2dxRH8sKdsjKQs=".to_vec();
+		assert_eq!(decrypt_legacy(data).unwrap(), LEGACY_PLAINTEXT);
+	}
 
 	#[test]
 	fn test_hash_password() {
