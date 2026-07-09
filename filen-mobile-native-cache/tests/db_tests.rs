@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_macros::shared_test_runtime;
 use filen_mobile_native_cache::{
 	auth::{AuthFile, DB_FILE_NAME, FilenMobileCacheState},
-	ffi::{FfiId, FfiNonRootObject, FfiObject},
-	traits::ProgressCallback,
+	ffi::{
+		FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs, SearchQueryResponseEntry,
+	},
+	traits::{ProgressCallback, SearchUpdateCallback},
 };
 use filen_sdk_rs::fs::{HasName, HasUUID, file::traits::HasFileInfo};
 use filen_types::fs::UuidStr;
@@ -4304,4 +4307,187 @@ pub async fn test_malformed() {
 		.unwrap();
 	assert!(malformed_file.meta.is_none());
 	assert_eq!(malformed_file.uuid, file.uuid().as_ref());
+}
+
+struct NoopSearchUpdate;
+impl SearchUpdateCallback for NoopSearchUpdate {
+	fn on_update(&self) {}
+}
+
+fn noop_update() -> Arc<dyn SearchUpdateCallback> {
+	Arc::new(NoopSearchUpdate)
+}
+
+fn base_search_args(name: &str) -> SearchQueryArgs {
+	SearchQueryArgs {
+		name: Some(name.to_string()),
+		item_type: None,
+		exclude_media_on_device: false,
+		mime_types: Vec::new(),
+		file_size_min: None,
+		last_modified_min: None,
+	}
+}
+
+fn entry_file_uuid_is(entry: &SearchQueryResponseEntry, uuid: &str) -> bool {
+	matches!(&entry.object, FfiNonRootObject::File(f) if f.uuid == uuid)
+}
+
+fn entry_dir_uuid_is(entry: &SearchQueryResponseEntry, uuid: &str) -> bool {
+	matches!(&entry.object, FfiNonRootObject::Dir(d) if d.uuid == uuid)
+}
+
+/// Poll the live search until it converges to at least `want` results (the on-demand resync fills
+/// the cache asynchronously), or fail after 60s.
+async fn poll_search(
+	db: &FilenMobileCacheState,
+	root_id: &str,
+	args: SearchQueryArgs,
+	want: usize,
+) -> Vec<SearchQueryResponseEntry> {
+	for _ in 0..60 {
+		let resp = db
+			.query_search(root_id.to_string(), args.clone(), noop_update())
+			.await
+			.unwrap();
+		if resp.len() >= want {
+			return resp;
+		}
+		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+	}
+	panic!("search did not converge to {want} results within 60s");
+}
+
+/// Live cache-search integration test for the documents provider's `query_search`: creates an
+/// isolated subtree on the server, then searches it via the new engine and asserts the resync
+/// surfaces the matches, honouring the name / mime / item-type filters. Scoped to a fresh dir so
+/// the subtree resync is small and isolated from other tests.
+#[shared_test_runtime]
+pub async fn test_search() {
+	let (db, rss) = get_db_resources().await;
+
+	let name = BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 10]>());
+
+	// Isolated search root under the shared test dir, so create_search resyncs only this subtree.
+	let search_root = rss
+		.client
+		.create_dir(&(&rss.dir).into(), &format!("search-{name}"))
+		.await
+		.unwrap();
+	let a = rss
+		.client
+		.create_dir(&(&search_root).into(), "a")
+		.await
+		.unwrap();
+	let b = rss.client.create_dir(&(&a).into(), "b").await.unwrap();
+
+	// An image nested at a/b/<name>.png and a text file directly under the search root.
+	let img = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder(&format!("{name}.png"), *b.uuid())
+				.unwrap()
+				.mime("image/png".to_string()),
+			b"image",
+		)
+		.await
+		.unwrap();
+	let txt = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder(&format!("other_{name}.txt"), *search_root.uuid())
+				.unwrap()
+				.mime("text/plain".to_string()),
+			b"text",
+		)
+		.await
+		.unwrap();
+	// A directory whose name carries the needle — a POSITIVE item_type=Dir match target.
+	let match_dir = rss
+		.client
+		.create_dir(&(&search_root).into(), &format!("dir_{name}"))
+		.await
+		.unwrap();
+
+	let root_id = search_root.uuid().to_string();
+
+	// The engine resyncs the subtree asynchronously, so poll until all three matches surface.
+	let resp = poll_search(&db, &root_id, base_search_args(&name), 3).await;
+	assert_eq!(
+		resp.len(),
+		3,
+		"both name-matching files and the matching directory should be found"
+	);
+	assert!(
+		resp.iter()
+			.any(|e| entry_file_uuid_is(e, img.uuid().as_ref())),
+		"the nested image should be in the results",
+	);
+	assert!(
+		resp.iter()
+			.any(|e| entry_file_uuid_is(e, txt.uuid().as_ref())),
+		"the text file should be in the results",
+	);
+	assert!(
+		resp.iter()
+			.any(|e| entry_dir_uuid_is(e, match_dir.uuid().as_ref())),
+		"the matching directory should be in the results",
+	);
+	// Path is `<search root>/<relative path>`; the nested image climbs a/b.
+	let img_entry = resp
+		.iter()
+		.find(|e| entry_file_uuid_is(e, img.uuid().as_ref()))
+		.unwrap();
+	assert_eq!(img_entry.path, format!("{root_id}/a/b/{name}.png"));
+
+	// mime filter narrows to just the image.
+	let resp = db
+		.query_search(
+			root_id.clone(),
+			SearchQueryArgs {
+				mime_types: vec!["image/*".to_string()],
+				item_type: Some(ItemType::File),
+				..base_search_args(&name)
+			},
+			noop_update(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(resp.len(), 1, "mime filter should keep only the image");
+	assert!(entry_file_uuid_is(&resp[0], img.uuid().as_ref()));
+
+	// item_type=Dir keeps ONLY the matching directory (positive coverage of the Dir filter — a
+	// broken Dir mapping that returned nothing would fail here, not silently pass).
+	let resp = db
+		.query_search(
+			root_id.clone(),
+			SearchQueryArgs {
+				item_type: Some(ItemType::Dir),
+				..base_search_args(&name)
+			},
+			noop_update(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(resp.len(), 1, "only the matching directory should remain");
+	assert!(
+		entry_dir_uuid_is(&resp[0], match_dir.uuid().as_ref()),
+		"the Dir filter should return the matching directory",
+	);
+
+	// A non-matching needle returns nothing.
+	let resp = db
+		.query_search(
+			root_id.clone(),
+			SearchQueryArgs {
+				name: Some("zzz-definitely-no-match-zzz".to_string()),
+				..base_search_args(&name)
+			},
+			noop_update(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(resp.len(), 0, "a non-matching needle finds nothing");
 }
