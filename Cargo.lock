@@ -1870,7 +1870,6 @@ dependencies = [
 name = "filen-mobile-native-cache"
 version = "0.2.0"
 dependencies = [
- "aes-gcm",
  "base64",
  "blake3",
  "chrono",

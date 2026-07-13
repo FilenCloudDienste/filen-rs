@@ -42,8 +42,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 lazy_static = "1.5.0"
 tokio-stream = { version = "0.1.17", features = ["fs"] }
 blake3 = { version = "1.8.3", features = ["rayon", "mmap"] }
-# AES-256-GCM decryption of the app-written auth.json blob (see auth.rs::decrypt_auth_bytes).
-aes-gcm = { version = "0.10.3", features = ["std"] }
 
 [target.'cfg(target_os="android")'.dependencies]
 jni = "0.21.1"
@@ -56,4 +54,3 @@ tokio = { version = "1.47.1", features = ["full"] }
 test-utils = { path = "../test-utils" }
 rand = "0.9.2"
 base64 = "0.22.1"
-aes-gcm = { version = "0.10.3", features = ["std"] }

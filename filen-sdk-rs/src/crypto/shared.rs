@@ -55,7 +55,7 @@ pub trait MetaCrypter: Send + Sync {
 	}
 }
 
-pub(crate) trait DataCrypter: Send + Sync {
+pub trait DataCrypter: Send + Sync {
 	fn blocking_encrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
 	fn blocking_decrypt_data(&self, data: &mut Vec<u8>) -> Result<(), ConversionError>;
 
