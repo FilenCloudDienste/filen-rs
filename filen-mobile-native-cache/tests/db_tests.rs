@@ -15,6 +15,24 @@ use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rand::TryRngCore;
 use test_utils::TestResources;
 
+// Mirrors the app-side auth.json encryption (fileProvider.ts) so the file-init test exercises the
+// real decrypt path in FilenMobileCacheState::new: version(0x01) ++ nonce(12) ++ ciphertext ++ tag(16).
+fn encrypt_auth_json(plaintext: &[u8], dek: &[u8]) -> Vec<u8> {
+	use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+
+	let cipher = Aes256Gcm::new_from_slice(dek).unwrap();
+	let nonce_bytes = [0u8; 12]; // deterministic nonce is fine for a single-use test blob
+	let ciphertext = cipher
+		.encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+		.unwrap();
+
+	let mut out = Vec::with_capacity(1 + nonce_bytes.len() + ciphertext.len());
+	out.push(0x01);
+	out.extend_from_slice(&nonce_bytes);
+	out.extend_from_slice(&ciphertext);
+	out
+}
+
 pub struct NoOpProgressCallback;
 impl ProgressCallback for NoOpProgressCallback {
 	fn set_total(&self, _size: u64) {}
@@ -4136,8 +4154,11 @@ pub async fn test_init_from_file() {
 		.unwrap();
 
 	let tmp_dir = std::env::temp_dir();
+	let dek: Vec<u8> = vec![0x42u8; 32];
 	let auth_file = tmp_dir.join("auth.json").to_string_lossy().into_owned();
-	tokio::fs::write(&auth_file, json_config).await.unwrap();
+	tokio::fs::write(&auth_file, encrypt_auth_json(json_config.as_bytes(), &dek))
+		.await
+		.unwrap();
 	let files_path = tmp_dir.join("files").to_string_lossy().into_owned();
 	tokio::fs::remove_file(&format!("{files_path}/{DB_FILE_NAME}"))
 		.await
@@ -4148,7 +4169,7 @@ pub async fn test_init_from_file() {
 		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
 
 	// sync
-	let new = FilenMobileCacheState::new(files_path.clone(), auth_file.clone());
+	let new = FilenMobileCacheState::new(files_path.clone(), auth_file.clone(), dek.clone());
 	assert_eq!(new.root_uuid().unwrap(), db.root_uuid().unwrap());
 	// make sure it still works after authentication
 	assert_eq!(new.root_uuid().unwrap(), db.root_uuid().unwrap());
@@ -4167,7 +4188,7 @@ pub async fn test_init_from_file() {
 	);
 
 	// async
-	let new = FilenMobileCacheState::new(files_path.clone(), auth_file.clone());
+	let new = FilenMobileCacheState::new(files_path.clone(), auth_file.clone(), dek.clone());
 	assert_eq!(
 		new.update_and_query_dir_children(test_dir_path.clone(), None)
 			.await
@@ -4197,7 +4218,7 @@ pub async fn test_init_from_file() {
 	assert_eq!(new.root_uuid().unwrap(), db.root_uuid().unwrap());
 
 	// async overload
-	let new = FilenMobileCacheState::new(files_path, auth_file);
+	let new = FilenMobileCacheState::new(files_path, auth_file, dek);
 
 	let mut futures = FuturesUnordered::new();
 

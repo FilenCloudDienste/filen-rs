@@ -7,6 +7,7 @@ use std::{
 	time::Instant,
 };
 
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use chrono::{DateTime, Utc};
 use filen_sdk_rs::{
 	auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
@@ -77,6 +78,10 @@ pub(crate) enum AuthStatus {
 pub(crate) struct CacheState {
 	pub(crate) status: AuthStatus,
 	auth_file: Arc<PathBuf>, // to allow async access without cloning
+	// 32-byte AES-256-GCM key used to decrypt auth_file on each read; supplied at construction
+	// from the platform Keychain/Keystore. Empty when the extension couldn't obtain it, which
+	// makes decryption fail -> AuthFile::default() -> unauthenticated (fail-closed).
+	dek: Vec<u8>,
 	pub(crate) files_dir: PathBuf,
 	last_update: std::sync::RwLock<Option<Instant>>,
 }
@@ -253,12 +258,46 @@ fn parse_auth_file(result: Result<String, std::io::Error>) -> AuthFile {
 	}
 }
 
-fn sync_get_auth_file(path: &Path) -> AuthFile {
-	parse_auth_file(std::fs::read_to_string(path))
+/// Decrypts the on-disk auth.json blob written by the app (fileProvider.ts).
+/// Format: version(1 byte, 0x01) ++ nonce(12) ++ ciphertext ++ tag(16), AES-256-GCM, no AAD.
+/// Any format/version/key/decrypt failure returns an InvalidData error so parse_auth_file falls
+/// through to AuthFile::default() (unauthenticated / fail-closed).
+fn decrypt_auth_bytes(bytes: &[u8], dek: &[u8]) -> Result<String, std::io::Error> {
+	const AUTH_FILE_VERSION: u8 = 0x01;
+	if bytes.len() < 1 + 12 + 16 || bytes[0] != AUTH_FILE_VERSION {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"unrecognized auth file format",
+		));
+	}
+	let cipher = Aes256Gcm::new_from_slice(dek).map_err(|_| {
+		std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid auth key length")
+	})?;
+	let nonce = Nonce::from_slice(&bytes[1..13]);
+	let plaintext = cipher.decrypt(nonce, &bytes[13..]).map_err(|_| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"auth file decryption failed",
+		)
+	})?;
+	String::from_utf8(plaintext).map_err(|_| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"auth file plaintext not utf-8",
+		)
+	})
 }
 
-async fn async_get_auth_file(path: &Path) -> AuthFile {
-	parse_auth_file(tokio::fs::read_to_string(path).await)
+fn sync_get_auth_file(path: &Path, dek: &[u8]) -> AuthFile {
+	parse_auth_file(std::fs::read(path).and_then(|bytes| decrypt_auth_bytes(&bytes, dek)))
+}
+
+async fn async_get_auth_file(path: &Path, dek: &[u8]) -> AuthFile {
+	parse_auth_file(
+		tokio::fs::read(path)
+			.await
+			.and_then(|bytes| decrypt_auth_bytes(&bytes, dek)),
+	)
 }
 
 fn update_state(state: &mut CacheState, auth_file: AuthFile) {
@@ -322,11 +361,12 @@ impl FilenMobileCacheState {
 					std::mem::drop(last_update);
 
 					let auth_file_path = state.auth_file.clone();
+					let dek = state.dek.clone();
 					let state_arc = self.state.clone();
 
 					// run the update but do it async
 					crate::env::get_runtime().spawn(async move {
-						let auth_file = async_get_auth_file(&auth_file_path).await;
+						let auth_file = async_get_auth_file(&auth_file_path, &dek).await;
 						if !auth_file.provider_enabled || auth_file.sdk_config.is_none() {
 							update_state(&mut *state_arc.write().await, auth_file);
 						}
@@ -369,7 +409,7 @@ impl FilenMobileCacheState {
 		let mut write_state = self.state.write().await;
 
 		// actually perform the update
-		let auth_file = async_get_auth_file(&write_state.auth_file).await;
+		let auth_file = async_get_auth_file(&write_state.auth_file, &write_state.dek).await;
 
 		update_state(&mut write_state, auth_file);
 
@@ -392,7 +432,7 @@ impl FilenMobileCacheState {
 		let _coordinator_guard = self.state_write_coordinator.try_lock().ok()?;
 		let mut write_state = self.state.try_write().ok()?;
 
-		let file = sync_get_auth_file(&write_state.auth_file);
+		let file = sync_get_auth_file(&write_state.auth_file, &write_state.dek);
 		update_state(&mut write_state, file);
 
 		Some(write_state.downgrade())
@@ -442,7 +482,7 @@ impl FilenMobileCacheState {
 		let mut write_state = self.state.clone().write_owned().await;
 
 		// actually perform the update
-		let auth_file = async_get_auth_file(&write_state.auth_file).await;
+		let auth_file = async_get_auth_file(&write_state.auth_file, &write_state.dek).await;
 
 		update_state(&mut write_state, auth_file);
 
@@ -465,7 +505,7 @@ impl FilenMobileCacheState {
 		let _coordinator_guard = self.state_write_coordinator.try_lock().ok()?;
 		let mut write_state = self.state.clone().try_write_owned().ok()?;
 
-		let file = sync_get_auth_file(&write_state.auth_file);
+		let file = sync_get_auth_file(&write_state.auth_file, &write_state.dek);
 		update_state(&mut write_state, file);
 
 		Some(write_state.downgrade())
@@ -692,7 +732,7 @@ impl FilenMobileCacheState {
 #[uniffi::export]
 impl FilenMobileCacheState {
 	#[uniffi::constructor(name = "new")]
-	pub fn new(files_dir: String, auth_file: String) -> Self {
+	pub fn new(files_dir: String, auth_file: String, dek: Vec<u8>) -> Self {
 		crate::env::init_logger();
 		debug!(
 			"Initializing FilenMobileCacheState with files_dir: {files_dir} and auth_dir: {auth_file}"
@@ -703,6 +743,7 @@ impl FilenMobileCacheState {
 					reason: UnauthReason::Disabled,
 				}),
 				auth_file: Arc::new(PathBuf::from(auth_file)),
+				dek,
 				files_dir: PathBuf::from(files_dir),
 				last_update: std::sync::RwLock::new(None),
 			})),
@@ -726,11 +767,66 @@ impl FilenMobileCacheState {
 					client, files_dir,
 				)?),
 				auth_file: Arc::new(PathBuf::from(files_dir).join("auth.json")),
+				// In-memory auth never reads the file (allow_auth_disable = false), so no key needed.
+				dek: Vec::new(),
 				files_dir: PathBuf::from(files_dir),
 				last_update: std::sync::RwLock::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
 			allow_auth_disable: false,
 		})
+	}
+}
+
+#[cfg(test)]
+mod auth_file_crypto_tests {
+	use super::decrypt_auth_bytes;
+	use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+
+	// Mirrors the app-side seal (fileProvider.ts): version(0x01) ++ nonce(12) ++ ciphertext ++ tag(16).
+	fn seal(plaintext: &[u8], dek: &[u8], nonce: [u8; 12]) -> Vec<u8> {
+		let cipher = Aes256Gcm::new_from_slice(dek).unwrap();
+		let ciphertext = cipher
+			.encrypt(Nonce::from_slice(&nonce), plaintext)
+			.unwrap();
+		let mut out = vec![0x01];
+		out.extend_from_slice(&nonce);
+		out.extend_from_slice(&ciphertext);
+		out
+	}
+
+	#[test]
+	fn roundtrips_a_valid_blob() {
+		let dek = [7u8; 32];
+		let plaintext = br#"{"providerEnabled":true,"sdkConfig":null}"#;
+		let blob = seal(plaintext, &dek, [9u8; 12]);
+		let decrypted = decrypt_auth_bytes(&blob, &dek).expect("valid blob should decrypt");
+		assert_eq!(decrypted.as_bytes(), plaintext);
+	}
+
+	#[test]
+	fn rejects_unknown_version_byte() {
+		let dek = [7u8; 32];
+		let mut blob = seal(b"hello", &dek, [1u8; 12]);
+		blob[0] = 0x02;
+		assert!(decrypt_auth_bytes(&blob, &dek).is_err());
+	}
+
+	#[test]
+	fn rejects_wrong_key() {
+		let blob = seal(b"hello", &[7u8; 32], [1u8; 12]);
+		assert!(decrypt_auth_bytes(&blob, &[8u8; 32]).is_err());
+	}
+
+	#[test]
+	fn rejects_bad_key_length() {
+		let blob = seal(b"hello", &[7u8; 32], [1u8; 12]);
+		assert!(decrypt_auth_bytes(&blob, &[8u8; 16]).is_err());
+	}
+
+	#[test]
+	fn rejects_truncated_or_empty_blob() {
+		assert!(decrypt_auth_bytes(&[0x01, 0x00], &[7u8; 32]).is_err());
+		assert!(decrypt_auth_bytes(&[], &[7u8; 32]).is_err());
 	}
 }
