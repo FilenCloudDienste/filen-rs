@@ -1113,6 +1113,31 @@ mod tests {
 			(callback, events)
 		}
 
+		/// Registers a global recording listener and returns the recorded event
+		/// names. Keep the id receiver alive — dropping it removes the listener;
+		/// the canceller removes it only via an explicit send(()).
+		async fn add_recording_listener(
+			request_sender: &tokio::sync::mpsc::Sender<SocketRequest>,
+		) -> (
+			Arc<Mutex<Vec<String>>>,
+			tokio::sync::oneshot::Receiver<Result<u64, Error>>,
+			tokio::sync::oneshot::Sender<()>,
+		) {
+			let (callback, events) = recording_listener();
+			let (id_sender, id_receiver) = tokio::sync::oneshot::channel();
+			let (canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+			request_sender
+				.send(SocketRequest::AddListener {
+					id_sender,
+					cancel_receiver,
+					callback,
+					event_types: None,
+				})
+				.await
+				.unwrap();
+			(events, id_receiver, canceller)
+		}
+
 		// ----- tests -----
 
 		#[tokio::test(start_paused = true)]
@@ -1132,18 +1157,7 @@ mod tests {
 					.with_on_connect(move || drop(final_sender)),
 			]);
 
-			let (callback, events) = recording_listener();
-			let (id_sender, _id_receiver) = tokio::sync::oneshot::channel();
-			let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
-			request_sender
-				.send(SocketRequest::AddListener {
-					id_sender,
-					cancel_receiver,
-					callback,
-					event_types: None,
-				})
-				.await
-				.unwrap();
+			let (events, _id_receiver, _canceller) = add_recording_listener(&request_sender).await;
 			// the clones inside the script now hold the only remaining senders
 			drop(request_sender);
 
@@ -1190,18 +1204,7 @@ mod tests {
 					.with_on_connect(move || drop(final_sender)),
 			]);
 
-			let (callback, events) = recording_listener();
-			let (id_sender, _id_receiver) = tokio::sync::oneshot::channel();
-			let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
-			request_sender
-				.send(SocketRequest::AddListener {
-					id_sender,
-					cancel_receiver,
-					callback,
-					event_types: None,
-				})
-				.await
-				.unwrap();
+			let (events, _id_receiver, _canceller) = add_recording_listener(&request_sender).await;
 			drop(request_sender);
 
 			run_async_websocket_task::<FakeSocket, _, _, _, _, _, _, _, _>(
