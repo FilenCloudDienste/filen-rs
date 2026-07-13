@@ -424,6 +424,11 @@ impl DecryptedGeneralEvent<'_> {
 /// variant fails to compile here, forcing a decision about its fold; changing
 /// the fold of an EXISTING variant in `try_blocking_from_encrypted` still
 /// needs a matching edit below.
+///
+/// One fold is invisible here by construction: any drive event whose payload
+/// FAILS to decrypt folds into `driveMalformed` at runtime, which cannot be
+/// predicted from the wire variant. `should_decrypt_event` compensates by
+/// passing every drive event through for `driveMalformed` filters.
 pub(crate) fn dispatch_event_type(event: &SocketEvent<'_>) -> &'static str {
 	match event {
 		SocketEvent::Drive { inner, .. } => match inner {

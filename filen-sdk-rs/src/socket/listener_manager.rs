@@ -323,6 +323,13 @@ impl ConnectedListenerManager {
 			|| self
 				.callbacks_for_event()
 				.contains_key(dispatch_event_type(event))
+			// Any drive event whose payload fails to decrypt folds into
+			// driveMalformed (today only itemFavorite is fallible) — a fold
+			// unknowable before decryption, so a driveMalformed filter must see
+			// every drive event or it misses exactly the events it exists to
+			// advance watermarks past.
+			|| (matches!(event, SocketEvent::Drive { .. })
+				&& self.callbacks_for_event().contains_key("driveMalformed"))
 	}
 }
 
@@ -360,9 +367,9 @@ mod tests {
 	use std::borrow::Cow;
 
 	use filen_types::{
-		api::v3::socket::{DriveEventType, FileRename, FolderRename},
+		api::v3::socket::{DriveEventType, FileRename, FolderRename, ItemFavorite},
 		crypto::EncryptedString,
-		fs::UuidStr,
+		fs::{ObjectType, ParentUuid, UuidStr},
 	};
 
 	use super::*;
@@ -414,6 +421,46 @@ mod tests {
 		assert!(
 			manager.should_decrypt_event(&event),
 			"a folderRename decrypts into folderMetadataChanged and must reach that filter"
+		);
+	}
+
+	// An itemFavorite whose payload is missing server-supplied fields folds into
+	// driveMalformed during decryption — a fold unknowable before decrypting, so
+	// a driveMalformed filter must see every drive event or it silently misses
+	// exactly the events it exists to advance watermarks past.
+	#[test]
+	fn fallible_drive_events_pass_the_gate_for_drive_malformed_filters() {
+		let event = SocketEvent::Drive {
+			inner: DriveEventType::ItemFavorite(ItemFavorite {
+				uuid: UuidStr::default(),
+				item_type: ObjectType::File,
+				value: true,
+				parent: ParentUuid::Uuid(UuidStr::default()),
+				metadata: None,
+				name_encrypted: None,
+				region: None,
+				bucket: None,
+				size: None,
+				chunks: None,
+				timestamp: chrono::DateTime::<chrono::Utc>::default(),
+				color: filen_types::api::v3::dir::color::DirColor::default(),
+				version: None,
+			}),
+			drive_message_id: 5,
+		};
+
+		let manager = manager_filtered_on("driveMalformed");
+		assert!(
+			manager.should_decrypt_event(&event),
+			"an itemFavorite can decrypt into driveMalformed and must reach that filter"
+		);
+
+		// the widening is scoped to driveMalformed filters: an unrelated drive
+		// filter still rejects it on its wire name
+		let manager = manager_filtered_on("fileTrash");
+		assert!(
+			!manager.should_decrypt_event(&event),
+			"an itemFavorite must not match an unrelated fileTrash filter"
 		);
 	}
 
