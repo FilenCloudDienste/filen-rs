@@ -143,7 +143,11 @@ jobs:
           add-rust-environment-hash-key: 'false'
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install LLVM clang (wasm32 C objects for the cache's bundled SQLite)
-        run: brew install llvm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+          echo "CC_wasm32_unknown_unknown=$(command -v clang)" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$(command -v llvm-ar)" >> "$GITHUB_ENV"
       - uses: taiki-e/cache-cargo-install-action@v2
         with:
           # waiting on a new release that includes
