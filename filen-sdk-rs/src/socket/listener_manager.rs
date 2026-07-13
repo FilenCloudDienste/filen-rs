@@ -6,7 +6,10 @@ use std::{
 
 use filen_types::api::v3::socket::SocketEvent;
 
-use crate::{Error, socket::events::DecryptedSocketEvent};
+use crate::{
+	Error,
+	socket::events::{DecryptedSocketEvent, dispatch_event_type},
+};
 
 use super::traits::EventListenerCallback;
 
@@ -319,7 +322,7 @@ impl ConnectedListenerManager {
 		!self.global_callbacks().is_empty()
 			|| self
 				.callbacks_for_event()
-				.contains_key(crate::socket::events::dispatch_event_type(event))
+				.contains_key(dispatch_event_type(event))
 	}
 }
 

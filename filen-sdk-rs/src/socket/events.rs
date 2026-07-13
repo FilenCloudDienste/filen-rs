@@ -420,18 +420,35 @@ impl DecryptedGeneralEvent<'_> {
 /// on THIS name — the only one the exported listener API advertises — or
 /// type-filtered listeners never see folded events: the wire name fails their
 /// filter before decryption, and the dispatch name is only produced after it.
-/// Any future many-to-one fold added to `try_from_encrypted` needs a matching
-/// arm here.
+/// The drive match is deliberately exhaustive (no wildcard) so adding a wire
+/// variant fails to compile here, forcing a decision about its fold; changing
+/// the fold of an EXISTING variant in `try_blocking_from_encrypted` still
+/// needs a matching edit below.
 pub(crate) fn dispatch_event_type(event: &SocketEvent<'_>) -> &'static str {
 	match event {
-		SocketEvent::Drive {
-			inner: DriveEventType::FileRename(_),
-			..
-		} => "fileMetadataChanged",
-		SocketEvent::Drive {
-			inner: DriveEventType::FolderRename(_),
-			..
-		} => "folderMetadataChanged",
+		SocketEvent::Drive { inner, .. } => match inner {
+			DriveEventType::FileRename(_) => "fileMetadataChanged",
+			DriveEventType::FolderRename(_) => "folderMetadataChanged",
+			DriveEventType::FileArchived(_)
+			| DriveEventType::FileArchiveRestored(_)
+			| DriveEventType::FileDeletedPermanent(_)
+			| DriveEventType::FileMetadataChanged(_)
+			| DriveEventType::FileMove(_)
+			| DriveEventType::FileNew(_)
+			| DriveEventType::FileRestore(_)
+			| DriveEventType::FileTrash(_)
+			| DriveEventType::FolderTrash(_)
+			| DriveEventType::FolderMove(_)
+			| DriveEventType::FolderSubCreated(_)
+			| DriveEventType::FolderRestore(_)
+			| DriveEventType::FolderColorChanged(_)
+			| DriveEventType::FolderMetadataChanged(_)
+			| DriveEventType::FolderDeletedPermanent(_)
+			| DriveEventType::ItemFavorite(_)
+			| DriveEventType::TrashEmpty
+			| DriveEventType::DeleteAll
+			| DriveEventType::DeleteVersioned => inner.event_type(),
+		},
 		other => other.event_type(),
 	}
 }
