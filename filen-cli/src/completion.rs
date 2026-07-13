@@ -181,6 +181,7 @@ pub(crate) fn completer(
 		.map(|str| str.into())
 		.collect::<Vec<OsString>>();
 	if args.is_empty() {
+		// might happen if the quoting is invalid on the input
 		return Ok(Vec::new());
 	}
 	let args_index = args.len();
@@ -200,6 +201,11 @@ pub(crate) fn completer(
 			.into_iter()
 			.filter_map(|candidate| {
 				let completion = candidate.get_value().to_string_lossy().to_string();
+				let completion = if completion.contains(" ") {
+					format!("\"{}\"", completion)
+				} else {
+					completion
+				};
 				let replace_word = args.last().unwrap();
 				input
 					.strip_suffix(replace_word.to_str().unwrap())
@@ -250,6 +256,8 @@ mod tests {
 				"dir2/",
 				"some_file.txt",
 				"some_dir/",
+				"a dir with spaces/",
+				"a dir with spaces/file_in_dir_with_spaces.txt",
 			],
 		)
 		.await
@@ -283,5 +291,10 @@ mod tests {
 		test_completer("ls non_existing", &[]);
 		// empty input
 		test_completer("ls ", &[]);
+
+		// completions that have spaces in them
+		test_completer("ls a", &["ls \"a dir with spaces/\""]);
+		// todo should also be able to do this:
+		//test_completer("cat \"a dir with spaces/file\"", &["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""]);
 	}
 }
