@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cell::Cell, fmt::Write, time::Duration};
+use std::{borrow::Cow, cell::Cell, fmt::Write, ops::Deref, time::Duration};
 
 use tokio::sync::mpsc::error::TrySendError;
 use wasm_bindgen::JsCast;
@@ -10,8 +10,35 @@ use super::{
 	traits::*,
 };
 
+/// Owns the browser socket and closes it when the last wrapper is dropped.
+///
+/// Dropping the raw `web_sys::WebSocket` only releases Rust's handle to the JS
+/// object: with live event listeners the browser keeps the underlying
+/// connection open, so every abandoned attempt (connect timeout, liveness
+/// deadline) would leak a real connection until the per-origin limit blocks
+/// all reconnects.
+struct WebSocketGuard(web_sys::WebSocket);
+
+impl Drop for WebSocketGuard {
+	fn drop(&mut self) {
+		// a bare close() (no close code) cannot throw, and closing an already
+		// CLOSING/CLOSED socket is a no-op
+		if let Err(e) = self.0.close() {
+			tracing::error!("Failed to close WebSocket: {:?}", e.as_string());
+		}
+	}
+}
+
+impl Deref for WebSocketGuard {
+	type Target = web_sys::WebSocket;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
 pub(super) struct WasmSocket {
-	socket: web_sys::WebSocket,
+	socket: WebSocketGuard,
 	msg_receiver: tokio::sync::mpsc::Receiver<String>,
 	close_receiver: Option<tokio::sync::oneshot::Receiver<()>>,
 }
@@ -42,13 +69,17 @@ impl PingTask<WasmSender> for WasmPingTask {
 
 		wasm_bindgen_futures::spawn_local(async move {
 			loop {
-				interval.tick().await;
-				match stop_receiver.try_recv() {
-					Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+				// Bail promptly on abort (send or sender drop): this sender owns
+				// the WebSocketGuard, so the browser socket only closes once this
+				// task exits — waiting out the next tick would keep the old
+				// connection open into the next reconnect attempt.
+				tokio::select! {
+					biased;
+					_ = &mut stop_receiver => {
 						tracing::debug!("Stopping WebSocket ping task");
 						break;
 					}
-					Err(tokio::sync::oneshot::error::TryRecvError::Empty) => { /* continue */ }
+					_ = interval.tick() => {}
 				}
 
 				timestamp_string.clear();
@@ -109,7 +140,7 @@ impl Receiver<String> for WasmReceiver {
 }
 
 pub(super) struct UnauthedWasmSocket {
-	socket: web_sys::WebSocket,
+	socket: WebSocketGuard,
 	msg_receiver: tokio::sync::mpsc::Receiver<String>,
 	close_receiver: tokio::sync::oneshot::Receiver<()>,
 }
@@ -128,7 +159,7 @@ impl UnauthedSocket<UnauthedWasmSender, UnauthedWasmReceiver, String> for Unauth
 }
 
 pub(super) struct UnauthedWasmSender {
-	socket: web_sys::WebSocket,
+	socket: WebSocketGuard,
 }
 
 impl UnauthedSender for UnauthedWasmSender {
@@ -271,9 +302,11 @@ impl
 			},
 		);
 
-		// websocket creation
+		// websocket creation — wrap in the guard before the first await so a
+		// cancelled connect (CONNECT_TIMEOUT dropping this future) still closes
+		// the browser socket
 		let ws = match web_sys::WebSocket::new(&request) {
-			Ok(ws) => ws,
+			Ok(ws) => WebSocketGuard(ws),
 			Err(e) => {
 				return Err(Error::custom(
 					ErrorKind::Server,
