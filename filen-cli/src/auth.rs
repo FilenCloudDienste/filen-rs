@@ -273,11 +273,35 @@ async fn authenticate_from_prompt(config: &CliConfig, ui: &mut UI) -> Result<Cli
 
 const AUTH_CONFIG_FILENAME: &str = "filen-cli-auth-config.txt"; // (!) referenced in module docs
 
+/// Write `contents` to `path`, creating or truncating it with owner-only permissions
+/// (mode `0o600` on Unix). The auth config holds the master keys, private key and API key,
+/// so it must never be left group- or world-readable for other users on the machine.
+fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+	use std::io::Write;
+
+	let mut options = std::fs::OpenOptions::new();
+	options.write(true).create(true).truncate(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.mode(0o600);
+	}
+	let mut file = options.open(path)?;
+	// A pre-existing file keeps its previous mode through create+truncate, so tighten it
+	// explicitly while it is still empty, before any secret bytes are written.
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+	}
+	file.write_all(contents.as_bytes())
+}
+
 /// Export an auth config to `{parent_dir}/filen-cli-auth-config.txt`.
 pub(crate) fn export_auth_config(client: &Client, parent_dir: &Path) -> Result<PathBuf> {
 	let path = parent_dir.join(AUTH_CONFIG_FILENAME);
 	let sdk_config = serialize_auth_config(client)?;
-	std::fs::write(&path, sdk_config).context(format!(
+	write_private_file(&path, &sdk_config).context(format!(
 		"Failed to write auth config to file {}",
 		path.display()
 	))?;
@@ -319,5 +343,47 @@ pub(crate) fn logout(config: &CliConfig, ui: &mut UI) -> Result<bool> {
 	} else {
 		ui.print_muted("No credentials found in system keyring or auth config default locations");
 		Ok(false)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn write_private_file_writes_contents() {
+		let dir = assert_fs::TempDir::new().unwrap();
+		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		write_private_file(&path, "secret-config").unwrap();
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret-config");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn write_private_file_creates_owner_only() {
+		use std::os::unix::fs::PermissionsExt;
+		let dir = assert_fs::TempDir::new().unwrap();
+		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		write_private_file(&path, "secret-config").unwrap();
+		let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+		assert_eq!(
+			mode, 0o600,
+			"auth config must not be group- or world-readable"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn write_private_file_tightens_existing_lax_file() {
+		use std::os::unix::fs::PermissionsExt;
+		let dir = assert_fs::TempDir::new().unwrap();
+		let path = dir.path().join(AUTH_CONFIG_FILENAME);
+		// Simulate a config left behind by an older CLI version with lax permissions.
+		std::fs::write(&path, "old").unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+		write_private_file(&path, "new-secret").unwrap();
+		let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+		assert_eq!(mode, 0o600);
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-secret");
 	}
 }
