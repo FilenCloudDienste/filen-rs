@@ -1,5 +1,5 @@
 use std::{
-	collections::HashMap,
+	collections::{HashMap, VecDeque},
 	future::Future,
 	io,
 	ops::Bound,
@@ -231,17 +231,95 @@ pub mod client_impl;
 #[cfg(feature = "uniffi")]
 mod js_impl;
 
-/// Maps an opaque per-request token to the file it serves. The file metadata
-/// (including its decryption key) lives here in-process instead of in the URL,
-/// so no key material reaches media-framework/OS request logs.
-type TokenMap = Arc<Mutex<HashMap<String, RemoteFileType<'static>>>>;
+/// Upper bound on live URL tokens. With deduplication this is only reachable by
+/// browsing that many *distinct* files in one provider lifetime; at a few hundred
+/// bytes per entry the store tops out well under 1 MiB. Eviction is LRU and
+/// [`TokenStore::resolve`] counts as use, so an actively streaming URL stays warm.
+const MAX_URL_TOKENS: usize = 1024;
+
+/// The raw random token minted per served file; rides in the URL base64url-encoded.
+type UrlToken = [u8; 32];
+
+/// Maps opaque URL tokens to the files they serve. The file metadata (including
+/// its decryption key) lives here in-process instead of in the URL, so no key
+/// material reaches media-framework/OS request logs.
+///
+/// The store is bounded: minting a URL for a file that already has a live token
+/// reuses it (the app re-derives URLs on every preview mount, so this is the hot
+/// path), and once [`MAX_URL_TOKENS`] distinct files are live the least recently
+/// used entry is evicted. Long term this should move to a file-backed store in an
+/// app-provided private directory — that removes the eviction bound entirely and
+/// lets tokens survive a provider restart — but it needs a writable-directory
+/// handoff from the host apps first, and today they treat every URL as scoped to
+/// one foreground session anyway.
+struct TokenStore {
+	entries: HashMap<UrlToken, RemoteFileType<'static>>,
+	/// LRU order over `entries`' keys; front is the eviction candidate.
+	order: VecDeque<UrlToken>,
+}
+
+impl TokenStore {
+	fn new() -> Self {
+		Self {
+			entries: HashMap::new(),
+			order: VecDeque::new(),
+		}
+	}
+
+	/// Returns the live token for `file`, minting (and if needed evicting) one if
+	/// no equal file is currently served. Takes `file` by value so an already-owned
+	/// file is stored as-is instead of cloned.
+	fn token_for(&mut self, file: RemoteFileType<'_>) -> UrlToken {
+		let existing = self
+			.entries
+			.iter()
+			.find_map(|(token, stored)| (stored == &file).then_some(*token));
+		if let Some(token) = existing {
+			self.mark_used(token);
+			return token;
+		}
+
+		if self.entries.len() >= MAX_URL_TOKENS
+			&& let Some(oldest) = self.order.pop_front()
+		{
+			self.entries.remove(&oldest);
+		}
+
+		let token: UrlToken = rand::random();
+		self.entries.insert(token, file.into_owned_cow());
+		self.order.push_back(token);
+		token
+	}
+
+	/// Resolves a URL's `?token=` value to the file it serves, refreshing its LRU
+	/// slot. Malformed, wrong-length, and unknown tokens are all `None` (a 404).
+	fn resolve(&mut self, token_param: &str) -> Option<RemoteFileType<'static>> {
+		let token: UrlToken = BASE64_URL_SAFE_NO_PAD
+			.decode(token_param)
+			.ok()?
+			.try_into()
+			.ok()?;
+		let file = self.entries.get(&token)?.clone();
+		self.mark_used(token);
+		Some(file)
+	}
+
+	fn mark_used(&mut self, token: UrlToken) {
+		if let Some(pos) = self.order.iter().position(|t| *t == token) {
+			self.order.remove(pos);
+			self.order.push_back(token);
+		}
+	}
+}
+
+type SharedTokenStore = Arc<Mutex<TokenStore>>;
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct HttpProviderHandle {
 	task: Option<tokio::task::JoinHandle<()>>,
 	cancel_sender: Option<tokio::sync::oneshot::Sender<()>>,
 	port: u16,
-	tokens: TokenMap,
+	tokens: SharedTokenStore,
 }
 
 impl Drop for HttpProviderHandle {
@@ -279,7 +357,7 @@ impl Drop for HttpProviderHandle {
 
 impl HttpProviderHandle {
 	pub(crate) async fn new(port: Option<u16>, client: Arc<UnauthClient>) -> Result<Self, Error> {
-		let tokens: TokenMap = Arc::new(Mutex::new(HashMap::new()));
+		let tokens: SharedTokenStore = Arc::new(Mutex::new(TokenStore::new()));
 		let router = axum::Router::new()
 			.route("/file", get(file_handler))
 			.with_state(ProviderState {
@@ -337,16 +415,20 @@ impl HttpProviderHandle {
 	/// Returns the local HTTP URL that serves the given file through this provider.
 	///
 	/// The URL carries only an opaque random token; the file metadata (including
-	/// its decryption key) is stored in this provider's in-process map and looked
+	/// its decryption key) is stored in this provider's in-process store and looked
 	/// up by the handler, so no key material rides in the URL where a media
 	/// framework or the OS could log it.
-	pub fn get_file_url(&self, file: &RemoteFileType<'_>) -> String {
-		let token = BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-		self.tokens
+	pub fn get_file_url(&self, file: RemoteFileType<'_>) -> String {
+		let token = self
+			.tokens
 			.lock()
-			.expect("http-provider token map lock poisoned")
-			.insert(token.clone(), file.clone().into_owned_cow());
-		format!("http://127.0.0.1:{}/file?token={}", self.port, token)
+			.expect("http-provider token store lock poisoned")
+			.token_for(file);
+		format!(
+			"http://127.0.0.1:{}/file?token={}",
+			self.port,
+			BASE64_URL_SAFE_NO_PAD.encode(token)
+		)
 	}
 
 	/// Like [`get_file_url`](Self::get_file_url) but pins this stream's read-ahead window
@@ -355,7 +437,7 @@ impl HttpProviderHandle {
 	/// and a larger one for sustained playback; the default when omitted is 8 MiB.
 	pub fn get_file_url_with_buffer_size(
 		&self,
-		file: &RemoteFileType<'_>,
+		file: RemoteFileType<'_>,
 		buffer_bytes: u64,
 	) -> String {
 		format!("{}&buffer={}", self.get_file_url(file), buffer_bytes)
@@ -367,7 +449,7 @@ impl HttpProviderHandle {
 impl HttpProviderHandle {
 	#[uniffi::method(name = "getFileUrl")]
 	pub fn get_file_url_uniffi(&self, file: crate::js::AnyFile) -> Result<String, Error> {
-		Ok(self.get_file_url(&file.try_into()?))
+		Ok(self.get_file_url(file.try_into()?))
 	}
 
 	#[uniffi::method(name = "getFileUrlWithBufferSize")]
@@ -376,20 +458,20 @@ impl HttpProviderHandle {
 		file: crate::js::AnyFile,
 		buffer_bytes: u64,
 	) -> Result<String, Error> {
-		Ok(self.get_file_url_with_buffer_size(&file.try_into()?, buffer_bytes))
+		Ok(self.get_file_url_with_buffer_size(file.try_into()?, buffer_bytes))
 	}
 }
 
 #[derive(Clone)]
 struct ProviderState {
 	client: Arc<UnauthClient>,
-	tokens: TokenMap,
+	tokens: SharedTokenStore,
 }
 
 #[derive(Deserialize)]
 struct FileQuery {
 	/// Opaque token minted by [`get_file_url`](HttpProviderHandle::get_file_url);
-	/// resolves to the file (and its key) in the provider's in-process map.
+	/// resolves to the file (and its key) in the provider's in-process store.
 	token: String,
 	/// Optional read-ahead window in bytes (`?buffer=`); bounds how much this stream
 	/// prefetches and therefore how much of the shared memory budget it can pin.
@@ -515,15 +597,15 @@ async fn file_handler(
 	State(state): State<ProviderState>,
 	range: Option<TypedHeader<Range>>,
 ) -> impl IntoResponse {
-	// Resolve the opaque token to the file (and its key) held in-process. Clone it
-	// out so the entry survives for the media player's later range requests over
-	// the same playback session (the token is reusable, not single-use).
+	// Resolve the opaque token to the file (and its key) held in-process. The entry
+	// stays in the store (the token is reusable, not single-use) and resolving
+	// refreshes its LRU slot, so the media player's later range requests over the
+	// same playback session keep working.
 	let Some(file) = state
 		.tokens
 		.lock()
-		.expect("http-provider token map lock poisoned")
-		.get(&params.token)
-		.cloned()
+		.expect("http-provider token store lock poisoned")
+		.resolve(&params.token)
 	else {
 		return http::Response::builder()
 			.status(StatusCode::NOT_FOUND)
@@ -694,6 +776,152 @@ mod tests {
 			dead_result.is_err(),
 			"after all handles dropped and 1s elapsed, the server should no longer \
 			 accept connections on port {port}"
+		);
+	}
+
+	// ─── token store ──────────────────────────────────────────────────────────
+
+	/// Builds a distinct decoded file per `name`; equal inputs do NOT produce equal
+	/// files (uuid and timestamps are fresh), so tests that need "the same file"
+	/// must reuse one instance.
+	fn token_store_test_file(name: &str) -> crate::fs::file::enums::RemoteFileType<'static> {
+		use std::borrow::Cow;
+
+		use chrono::Utc;
+		use filen_types::{
+			auth::FileEncryptionVersion,
+			fs::{ParentUuid, UuidStr},
+		};
+
+		use crate::{
+			crypto::file::FileKey,
+			fs::file::{
+				RemoteFile,
+				enums::RemoteFileType,
+				meta::{DecryptedFileMeta, FileMeta},
+			},
+		};
+
+		RemoteFileType::File(Cow::Owned(RemoteFile {
+			uuid: UuidStr::new_v4(),
+			parent: ParentUuid::Links,
+			size: 10,
+			favorited: false,
+			region: "de-1".to_string(),
+			bucket: "bucket-a".to_string(),
+			timestamp: Utc::now(),
+			chunks: 1,
+			meta: FileMeta::Decoded(DecryptedFileMeta {
+				name: Cow::Owned(name.to_string()),
+				size: 10,
+				mime: Cow::Borrowed("text/plain"),
+				key: FileKey::from_str_with_version(&"a".repeat(64), FileEncryptionVersion::V3)
+					.unwrap(),
+				last_modified: Utc::now(),
+				created: None,
+				hash: None,
+			}),
+		}))
+	}
+
+	fn encode_token(token: super::UrlToken) -> String {
+		use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+		BASE64_URL_SAFE_NO_PAD.encode(token)
+	}
+
+	/// The app re-derives a file's URL on every preview mount, so minting must be
+	/// idempotent per file: the same file reuses its live token instead of growing
+	/// the store.
+	#[test]
+	fn token_store_reuses_the_token_of_an_equal_file() {
+		let mut store = super::TokenStore::new();
+		let file = token_store_test_file("a.txt");
+
+		let first = store.token_for(file.clone());
+		let second = store.token_for(file);
+
+		assert_eq!(first, second, "an equal file must reuse its live token");
+		assert_eq!(
+			store.entries.len(),
+			1,
+			"deduplication must not grow the store"
+		);
+	}
+
+	#[test]
+	fn token_store_gives_distinct_files_distinct_tokens() {
+		let mut store = super::TokenStore::new();
+
+		let a = store.token_for(token_store_test_file("a.txt"));
+		let b = store.token_for(token_store_test_file("b.txt"));
+
+		assert_ne!(a, b, "distinct files must not share a token");
+		assert_eq!(store.entries.len(), 2);
+	}
+
+	/// The bound that fixes the unbounded-growth leak: past [`super::MAX_URL_TOKENS`]
+	/// distinct files, the least recently used entry is evicted and its URL dies.
+	#[test]
+	fn token_store_caps_at_max_and_evicts_the_least_recently_used() {
+		let mut store = super::TokenStore::new();
+		let first = store.token_for(token_store_test_file("first.txt"));
+
+		for i in 0..super::MAX_URL_TOKENS {
+			store.token_for(token_store_test_file(&format!("{i}.txt")));
+		}
+
+		assert_eq!(
+			store.entries.len(),
+			super::MAX_URL_TOKENS,
+			"the store must never exceed its cap"
+		);
+		assert!(
+			store.resolve(&encode_token(first)).is_none(),
+			"the oldest untouched entry must have been evicted"
+		);
+	}
+
+	/// Resolving counts as use: an actively streamed URL (the player hits it with
+	/// range requests) must survive eviction pressure from newly minted URLs.
+	#[test]
+	fn token_store_resolve_keeps_an_entry_warm_across_eviction() {
+		let mut store = super::TokenStore::new();
+		let streaming = store.token_for(token_store_test_file("streaming.mp4"));
+
+		// Fill the store to its cap, leaving `streaming` the LRU candidate...
+		for i in 0..super::MAX_URL_TOKENS - 1 {
+			store.token_for(token_store_test_file(&format!("{i}.txt")));
+		}
+		// ...then touch it the way a playing media player does.
+		assert!(store.resolve(&encode_token(streaming)).is_some());
+
+		store.token_for(token_store_test_file("overflow.txt"));
+
+		assert!(
+			store.resolve(&encode_token(streaming)).is_some(),
+			"a recently resolved entry must not be the one evicted"
+		);
+		assert_eq!(store.entries.len(), super::MAX_URL_TOKENS);
+	}
+
+	/// Malformed, wrong-length, and unknown tokens must all resolve to `None` (the
+	/// handler's 404), never panic.
+	#[test]
+	fn token_store_rejects_malformed_and_unknown_tokens() {
+		let mut store = super::TokenStore::new();
+		store.token_for(token_store_test_file("a.txt"));
+
+		assert!(
+			store.resolve("not base64 !!!").is_none(),
+			"malformed base64"
+		);
+		assert!(
+			store.resolve("c2hvcnQ").is_none(),
+			"valid base64, wrong length"
+		);
+		assert!(
+			store.resolve(&encode_token(rand::random())).is_none(),
+			"well-formed but unknown token"
 		);
 	}
 

@@ -644,7 +644,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_full.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::get(&url).await.unwrap();
 		assert_eq!(response.status(), 200);
@@ -745,7 +745,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_range.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::Client::new()
 			.get(&url)
@@ -791,7 +791,7 @@ mod http_provider_tests {
 			upload_test_file(client, test_dir, "http_provider_range_full.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let len = content.len() as u64;
 		let response = reqwest::Client::new()
@@ -819,7 +819,7 @@ mod http_provider_tests {
 			upload_test_file(client, test_dir, "http_provider_range_start.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		// bytes 0-4 inclusive → "Hello"
 		let response = reqwest::Client::new()
@@ -847,7 +847,7 @@ mod http_provider_tests {
 			upload_test_file(client, test_dir, "http_provider_open_ended.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::Client::new()
 			.get(&url)
@@ -881,7 +881,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_suffix.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::Client::new()
 			.get(&url)
@@ -908,7 +908,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_large.bin", &content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::get(&url).await.unwrap();
 		assert_eq!(response.status(), 200);
@@ -926,7 +926,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_empty.txt", b"").await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::get(&url).await.unwrap();
 		assert_eq!(response.status(), 200);
@@ -955,7 +955,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_unsat.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::Client::new()
 			.get(&url)
@@ -996,7 +996,7 @@ mod http_provider_tests {
 		let file = upload_test_file(client, test_dir, "http_provider_multipart.txt", content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::Client::new()
 			.get(&url)
@@ -1077,7 +1077,7 @@ mod http_provider_tests {
 		.await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::Client::new()
 			.get(&url)
@@ -1155,7 +1155,7 @@ mod http_provider_tests {
 		.await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url(&(&file).into());
+		let url = handle.get_file_url((&file).into());
 
 		let response = reqwest::Client::new()
 			.get(&url)
@@ -1227,7 +1227,7 @@ mod http_provider_tests {
 			upload_test_file(client, test_dir, "http_provider_small_buffer.bin", &content).await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url_with_buffer_size(&(&file).into(), 1024 * 1024);
+		let url = handle.get_file_url_with_buffer_size((&file).into(), 1024 * 1024);
 
 		let response = reqwest::get(&url).await.unwrap();
 		assert_eq!(response.status(), 200);
@@ -1258,7 +1258,7 @@ mod http_provider_tests {
 		.await;
 
 		let handle = client.start_http_provider(None).await.unwrap();
-		let url = handle.get_file_url_with_buffer_size(&(&file).into(), 1024 * 1024);
+		let url = handle.get_file_url_with_buffer_size((&file).into(), 1024 * 1024);
 
 		// A range that straddles a chunk boundary, with a window smaller than the range.
 		let start: usize = 1024 * 1024 - 10;
