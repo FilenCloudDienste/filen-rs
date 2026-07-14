@@ -8,7 +8,7 @@ use filen_sdk_rs::{
 	fs::categories::{DirType, NonRootFileType, Normal},
 };
 
-use crate::{CliArgs, util::RemotePath};
+use crate::{CliArgs, docs::get_help_topics, util::RemotePath};
 
 #[derive(PartialEq, strum::EnumString, strum::Display)]
 enum FilenArgType {
@@ -18,6 +18,8 @@ enum FilenArgType {
 	Directory,
 	#[strum(serialize = "file_or_directory")]
 	FileOrDirectory,
+	#[strum(serialize = "help_topic")]
+	HelpTopic,
 }
 
 impl FilenArgType {
@@ -38,6 +40,7 @@ impl FilenArgType {
 /// Since the completer needs access to a Client and the current working directory, which are not available at the time of argument definition,
 /// uninitialized completers are created first, and then later replaced by calling `initialize_completers_in_command`
 /// when the readline is initialized and everything is available. (This seems to be the best way to do this with clap's API).
+/// Also handles completing help topics.
 pub(crate) struct FilenCompleter(FilenArgType, Option<CompleterContext>);
 
 #[derive(Clone)]
@@ -57,6 +60,10 @@ impl FilenCompleter {
 
 	pub(crate) fn file_or_directory() -> ArgValueCompleter {
 		ArgValueCompleter::new(Self(FilenArgType::FileOrDirectory, None))
+	}
+
+	pub(crate) fn help_topic() -> ArgValueCompleter {
+		ArgValueCompleter::new(Self(FilenArgType::HelpTopic, None))
 	}
 
 	pub(crate) fn initialize_completers_in_command(
@@ -165,6 +172,11 @@ impl FilenCompleter {
 					.collect())
 				// todo: think really hard about all the stripping etc. happening here (does it handle ".." correctly?)
 			}
+			FilenArgType::HelpTopic => Ok(get_help_topics()
+				.context("Failed to get help topics")?
+				.into_iter()
+				.filter(|topic| topic.starts_with(input))
+				.collect()),
 		}
 	}
 }

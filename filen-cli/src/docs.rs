@@ -327,6 +327,27 @@ fn format_markdown_command_help(cmd: &mut clap::Command) -> String {
 
 // in-app docs
 
+pub(crate) fn get_help_topics() -> Result<Vec<String>> {
+	let parsed_doc_outline = PARSED_DOC_OUTLINE
+		.as_ref()
+		.map_err(|e| anyhow::anyhow!("Failed to parse CLI doc outline: {}", e))?;
+	Ok(parsed_doc_outline
+		.iter()
+		.map(|section| section.id.clone())
+		.chain(
+			get_cli_doc_fragments()
+				.iter()
+				.map(|fragment| fragment.id.clone()),
+		)
+		.chain(
+			CliArgs::command()
+				.get_subcommands()
+				.flat_map(|c| c.get_name_and_visible_aliases())
+				.map(|s| s.to_string()),
+		)
+		.collect::<Vec<String>>())
+}
+
 pub(crate) fn print_in_app_docs(
 	ui: &mut UI,
 	section_or_command_or_topic: Option<String>,
