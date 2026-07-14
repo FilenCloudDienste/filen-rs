@@ -169,20 +169,18 @@ impl FilenCompleter {
 	}
 }
 
-// for DialoguerCompleter
+// for InquireCompleter
 pub(crate) fn completer(
 	input: &str,
 	client: Arc<Client>,
 	working_path: &RemotePath,
-) -> Result<Vec<String>> {
-	let args = shlex::split(input)
-		.context("Invalid quoting")?
-		.iter()
-		.map(|str| str.into())
-		.collect::<Vec<OsString>>();
+) -> Vec<String> {
+	let Some(args) = shlex::split(input) else {
+		return Vec::new();
+	};
+	let args = args.iter().map(|str| str.into()).collect::<Vec<OsString>>();
 	if args.is_empty() {
-		// might happen if the quoting is invalid on the input
-		return Ok(Vec::new());
+		return Vec::new();
 	}
 	let args_index = args.len();
 	let mut cli = CliArgs::command();
@@ -197,7 +195,7 @@ pub(crate) fn completer(
 		args_index,
 		std::env::current_dir().ok().as_deref(),
 	) {
-		Ok(candidates) => Ok(candidates
+		Ok(candidates) => candidates
 			.into_iter()
 			.filter_map(|candidate| {
 				let completion = candidate.get_value().to_string_lossy().to_string();
@@ -211,8 +209,8 @@ pub(crate) fn completer(
 					.strip_suffix(replace_word.to_str().unwrap())
 					.map(|prefix| format!("{}{}", prefix, completion))
 			})
-			.collect::<Vec<_>>()),
-		Err(_) => Ok(Vec::new()),
+			.collect::<Vec<_>>(),
+		Err(_) => Vec::new(),
 	}
 }
 
@@ -232,18 +230,13 @@ mod tests {
 		let test_completer = |input: &str, expected: &[&str]| {
 			let mut expected = Vec::from(expected);
 			expected.sort();
-			match super::completer(input, client.clone(), &root_path) {
-				Ok(completions) => {
-					let mut completions = completions;
-					completions.sort(); // ignore order
-					assert_eq!(
-						completions, expected,
-						"Unexpected completions for input '{}'",
-						input
-					)
-				}
-				Err(e) => panic!("Error during completion: {}", e),
-			}
+			let mut completions = super::completer(input, client.clone(), &root_path);
+			completions.sort(); // ignore order
+			assert_eq!(
+				completions, expected,
+				"Unexpected completions for input '{}'",
+				input
+			)
 		};
 
 		test_utils::create_remote_file_structure_outline(

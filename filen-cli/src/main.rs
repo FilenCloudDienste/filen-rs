@@ -238,11 +238,12 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 
 		loop {
 			let line = ui.prompt_repl(client.get_arc().unwrap(), &working_path)?;
-			let line = line.trim();
-			if line.is_empty() {
-				continue;
-			}
-			let mut args = shlex::split(line).context("Invalid quoting")?;
+			let line = match line {
+				None => continue,
+				Some(line) if line.is_empty() => continue,
+				Some(line) => line,
+			};
+			let mut args = shlex::split(line.trim()).context("Invalid quoting")?;
 			args.insert(0, String::from("filen"));
 			let cli_args = match CliArgs::try_parse_from(args) {
 				Ok(cli) => cli,

@@ -1,9 +1,13 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
-use dialoguer::console::{self, style};
+use console::{self, style};
 use filen_sdk_rs::auth::Client;
+use inquire::{
+	Autocomplete,
+	ui::{RenderConfig, Styled},
+};
 use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
@@ -51,9 +55,7 @@ const FAILED_TO_READ_INPUT_PROMPT: &str = "Failed to read input prompt";
 
 pub(crate) struct UI {
 	quiet: bool,
-	theme: dialoguer::theme::ColorfulTheme,
-	repl_input_theme: dialoguer::theme::ColorfulTheme,
-	history: dialoguer::BasicHistory,
+	history: HashSet<String>,
 	override_terminal_width: Option<usize>,
 	output: Vec<String>,
 
@@ -65,14 +67,7 @@ impl UI {
 	pub(crate) fn new() -> Self {
 		UI {
 			quiet: false,
-			theme: dialoguer::theme::ColorfulTheme {
-				prompt_prefix: style("›".to_string()).cyan().bold(),
-				prompt_suffix: style("›".to_string()).dim().bold(),
-				success_prefix: style("›".to_string()).dim().bold(),
-				..Default::default()
-			},
-			repl_input_theme: Self::repl_input_theme_for_user(None),
-			history: dialoguer::BasicHistory::new().no_duplicates(true),
+			history: HashSet::new(),
 			override_terminal_width: None,
 			output: Vec::new(),
 			json: false,
@@ -88,25 +83,6 @@ impl UI {
 		self.quiet = quiet;
 		self.json = json;
 		self.override_terminal_width = override_terminal_width;
-	}
-
-	pub(crate) fn set_user(&mut self, user: Option<&str>) {
-		self.repl_input_theme = Self::repl_input_theme_for_user(user);
-	}
-	fn repl_input_theme_for_user(user: Option<&str>) -> dialoguer::theme::ColorfulTheme {
-		let prefix = if let Some(user) = user {
-			style(format!("({})", user)).cyan().bold()
-		} else {
-			style("(...)".to_string()).dim().bold()
-		};
-		let suffix = style("›".to_string()).dim();
-		dialoguer::theme::ColorfulTheme {
-			prompt_prefix: prefix.clone(),
-			success_prefix: prefix,
-			prompt_suffix: suffix.clone(),
-			success_suffix: suffix,
-			..Default::default()
-		}
 	}
 
 	fn get_terminal_width(&self) -> Option<usize> {
@@ -284,18 +260,30 @@ impl UI {
 		&mut self,
 		client: Arc<Client>,
 		working_path: &RemotePath,
-	) -> Result<String> {
+	) -> Result<Option<String>> {
 		info!("[PROMPT] prompt_repl with path: {}", working_path);
-		let answer = dialoguer::Input::with_theme(&self.repl_input_theme)
-			.history_with(&mut self.history)
-			.completion_with(&DialoguerCompleter {
+		let prompt_prefix = format!("({})", client.email());
+		let render_config = RenderConfig::default()
+			.with_prompt_prefix(
+				Styled::new(prompt_prefix.as_str()).with_fg(inquire::ui::Color::LightCyan),
+			)
+			.with_answered_prompt_prefix(
+				Styled::new(prompt_prefix.as_str()).with_fg(inquire::ui::Color::LightCyan),
+			);
+		let answer = inquire::Text::new(&working_path.to_string())
+			.with_render_config(render_config)
+			.with_autocomplete(InquireCompleter {
 				client,
-				working_path,
+				working_path: working_path.clone(),
 			})
-			.with_prompt(working_path.to_string())
-			.interact_text()
+			.prompt_skippable()
 			.context(FAILED_TO_READ_INPUT_PROMPT)?;
-		info!("[PROMPT] answer: {}", answer);
+		if let Some(ref answer) = answer {
+			info!("[PROMPT] answer: {}", answer);
+			self.history.insert(answer.clone());
+		} else {
+			info!("[PROMPT] skipped");
+		}
 		Ok(answer)
 		// todo: terminal has weird graphical glitches when using the completer
 	}
@@ -303,10 +291,8 @@ impl UI {
 	/// Prompt the user for text input
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt with message: {}", msg);
-		let answer = dialoguer::Input::with_theme(&self.theme)
-			.history_with(&mut self.history)
-			.with_prompt(msg.trim())
-			.interact_text()
+		let answer = inquire::Text::new(msg.trim())
+			.prompt()
 			.context(FAILED_TO_READ_INPUT_PROMPT)?;
 		info!("[PROMPT] answer: {}", answer);
 		Ok(answer)
@@ -315,9 +301,10 @@ impl UI {
 	/// Prompt the user for a password (no echo)
 	pub(crate) fn prompt_password(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt_password with message: {}", msg);
-		let answer = dialoguer::Password::with_theme(&self.theme)
-			.with_prompt(msg.trim())
-			.interact()
+		let answer = inquire::Password::new(msg.trim())
+			.with_display_mode(inquire::PasswordDisplayMode::Masked)
+			.without_confirmation()
+			.prompt()
 			.context(FAILED_TO_READ_INPUT_PROMPT)?;
 		info!("[PROMPT] answer not displayed in logs");
 		Ok(answer)
@@ -326,11 +313,9 @@ impl UI {
 	/// Prompt the user for a yes/no input
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
 		info!("[PROMPT] prompt_confirm with message: {}", msg);
-		let answer = dialoguer::Confirm::with_theme(&self.theme)
-			.with_prompt(msg.trim())
-			.default(default)
-			.report(true)
-			.interact()
+		let answer = inquire::Confirm::new(msg.trim())
+			.with_default(default)
+			.prompt()
 			.context(FAILED_TO_READ_INPUT_PROMPT)?;
 		info!("[PROMPT] answer: {}", answer);
 		Ok(answer)
@@ -426,17 +411,43 @@ pub(crate) fn format_size(size: u64) -> String {
 	humansize::format_size(size, humansize::BINARY)
 }
 
-struct DialoguerCompleter<'a> {
+#[derive(Clone)]
+struct InquireCompleter {
 	client: Arc<Client>,
-	working_path: &'a RemotePath,
+	working_path: RemotePath,
 }
 
-impl dialoguer::Completion for DialoguerCompleter<'_> {
-	fn get(&self, input: &str) -> Option<String> {
-		crate::completion::completer(input, self.client.clone(), self.working_path)
-			.ok()
-			.and_then(|completions| completions.first().cloned())
-	}
+impl Autocomplete for InquireCompleter {
+	fn get_completion(
+		&mut self,
+		input: &str,
+		highlighted_suggestion: Option<String>,
+	) -> Result<inquire::autocompletion::Replacement, inquire::CustomUserError> {
+		let completions =
+			crate::completion::completer(input, self.client.clone(), &self.working_path);
+		if let Some(highlighted) = highlighted_suggestion {
+			if completions.contains(&highlighted) {
+				Ok(inquire::autocompletion::Replacement::Some(highlighted))
+			} else {
+				Ok(inquire::autocompletion::Replacement::None)
+			}
+		} else {
+			Ok(completions
+				.first()
+				.cloned()
+				.map(inquire::autocompletion::Replacement::Some)
+				.unwrap_or(inquire::autocompletion::Replacement::None))
+		}
+	} // todo: AI ^
+
+	fn get_suggestions(
+		&mut self,
+		input: &str,
+	) -> std::prelude::v1::Result<Vec<String>, inquire::CustomUserError> {
+		let completions =
+			crate::completion::completer(input, self.client.clone(), &self.working_path);
+		Ok(completions)
+	} // todo: AI ^
 }
 
 #[cfg(test)]

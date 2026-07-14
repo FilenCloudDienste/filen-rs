@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-- /
+### Added
+
+- autocompletion in interactive mode, including remote paths
 
 ## 0.2.7 - 2026-06-19
 

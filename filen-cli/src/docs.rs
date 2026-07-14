@@ -10,7 +10,6 @@ use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
-use dialoguer::console;
 use filen_macros::extract_cli_doc_fragments;
 use tiny_http::{Header, Response};
 
@@ -366,9 +365,9 @@ pub(crate) fn print_in_app_docs(
 						if section.id != MAIN_SECTION {
 							Some(format!(
 								"{}  {} {}",
-								dialoguer::console::style(&section.title).underlined(),
-								dialoguer::console::style("→").dim(),
-								dialoguer::console::style(format!("help {}", section.id)).green()
+								console::style(&section.title).underlined(),
+								console::style("→").dim(),
+								console::style(format!("help {}", section.id)).green()
 							))
 						} else {
 							None

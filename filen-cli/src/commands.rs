@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use dialoguer::console::style;
+use console::style;
 use filen_rclone_wrapper::serve::BasicServerOptions;
 use filen_sdk_rs::{
 	auth::Client,
@@ -27,6 +27,7 @@ pub(crate) enum Commands {
 	/// Print help about a command or topic (default: general help)
 	Help {
 		/// Command or topic to show help about
+		#[arg(add = FilenCompleter::help_topic())]
 		command_or_topic: Option<String>,
 	},
 	/// Change the working directory (in REPL)

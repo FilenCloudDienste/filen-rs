@@ -78,7 +78,6 @@ impl LazyClient {
 					auth_config_path_arg.as_deref(),
 				)
 				.await?;
-				ui.set_user(Some(client.email()));
 				*self = Self::Authenticated {
 					client: Arc::new(client),
 				};

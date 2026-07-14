@@ -35,11 +35,6 @@ keyring = { version = "3", features = [
 serde = "1.0.219"
 serde_json = "1.0.142"
 base64 = "0.22.1"
-dialoguer = { version = "0.12.0", features = [
-	"history",
-	"password",
-	"completion",
-] }
 tiny-gradient = "0.1.0"
 termsize = "0.1.9"
 humansize = "2.1.3"
@@ -64,6 +59,11 @@ port_check = "0.3.0"
 open = "5.3.5"
 clap_complete = { version = "4.5.65", features = ["unstable-dynamic"] }
 strum = { version = "0.28.0", features = ["derive"] }
+# not anymore, since it misses some important features: We're using this branch of inquire, which is already a PR to add history support, but not yet merged.
+# might make our own fork in the meantime
+# inquire = { git = "https://github.com/mikecvet/inquire.git", branch = "history" }
+inquire = { version = "0.9.4" }
+console = "0.16.4"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }
