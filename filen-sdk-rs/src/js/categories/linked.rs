@@ -244,12 +244,71 @@ impl TryFrom<DirPublicLinkRW> for crate::connect::DirPublicLinkRW {
 					)
 					.context("DirPublicLinkRW from JS")?,
 				),
-				_ => None,
+				// A key supplied without its version cannot be reconstructed; erroring here
+				// matches the non-RW DirPublicLink conversion instead of silently dropping it.
+				(Some(_), None) => {
+					return Err(Error::custom(
+						crate::ErrorKind::Conversion,
+						"DirPublicLinkRW from JS: link key provided without link key version",
+					));
+				}
+				(None, _) => None,
 			},
 			password: value.password,
 			expiration: value.expiration,
 			enable_download: value.enable_download,
 			salt: value.salt,
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn js_link(link_key: Option<String>, link_key_version: Option<u8>) -> DirPublicLinkRW {
+		DirPublicLinkRW {
+			link_uuid: Uuid::new_v4(),
+			link_key,
+			link_key_version,
+			password: PasswordState::None,
+			expiration: PublicLinkExpiration::Never,
+			enable_download: true,
+			salt: LinkPasswordSalt::None,
+		}
+	}
+
+	// A link key supplied without its version must be rejected: silently dropping it would
+	// hand the link back to JS with linkKey null, losing the key string with no error.
+	#[test]
+	fn dir_public_link_rw_from_js_errors_when_key_present_without_version() {
+		let js = js_link(Some("0123456789abcdefghijklmnopqrstuv".to_string()), None);
+		let result = crate::connect::DirPublicLinkRW::try_from(js);
+		assert!(
+			result.is_err(),
+			"a link key without a version must be rejected, not silently dropped"
+		);
+	}
+
+	#[test]
+	fn dir_public_link_rw_from_js_keeps_key_when_version_present() {
+		let js = js_link(
+			Some("0123456789abcdefghijklmnopqrstuv".to_string()),
+			Some(2),
+		);
+		let converted =
+			crate::connect::DirPublicLinkRW::try_from(js).expect("valid key + version converts");
+		assert!(
+			converted.link_key.is_some(),
+			"key must be preserved when the version is supplied"
+		);
+	}
+
+	#[test]
+	fn dir_public_link_rw_from_js_allows_no_key() {
+		let js = js_link(None, None);
+		let converted =
+			crate::connect::DirPublicLinkRW::try_from(js).expect("no key converts to None");
+		assert!(converted.link_key.is_none());
 	}
 }
