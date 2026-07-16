@@ -98,6 +98,21 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			let iter = tree.dfs_iter_with_path(&root_path);
 
 			for (entry, path) in iter.canonicalize()? {
+				// A remote name that is not a safe single path component (`..`,
+				// absolute, separator-bearing) is rejected while building the
+				// path, so it cannot escape the download root. Skip the entry;
+				// every descendant of an unsafe directory shares the rejected
+				// component and is skipped the same way, quarantining the whole
+				// subtree.
+				let path = match path {
+					Ok(path) => path,
+					Err(e) => {
+						tracing::warn!(
+							"skipping remote entry with unsafe path during dir download: {e}"
+						);
+						continue;
+					}
+				};
 				match entry {
 					Entry::Dir(dir_entry) => {
 						let dir = dir_entry.extra_data().clone();

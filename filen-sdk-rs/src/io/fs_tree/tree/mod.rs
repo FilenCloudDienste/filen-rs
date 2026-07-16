@@ -128,7 +128,11 @@ impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	fn build_path_canonical(&self, root: &CanonicalPath, current_name: &str) -> CanonicalPath {
+	fn build_path_canonical(
+		&self,
+		root: &CanonicalPath,
+		current_name: &str,
+	) -> Result<CanonicalPath, std::io::Error> {
 		root.create_descendant_path(self.descendants(current_name))
 	}
 }
@@ -193,7 +197,13 @@ impl<'a, DirExtra, FileExtra> FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtr
 impl<'a, DirExtra, FileExtra> Iterator
 	for FSTreeDFSIteratorWithPathCanonicalized<'a, DirExtra, FileExtra>
 {
-	type Item = (&'a Entry<DirExtra, FileExtra>, CanonicalPath);
+	// The canonical path is fallible per entry: a server-supplied name that is
+	// not a safe single component (`..`, absolute, separator-bearing) is
+	// rejected here so it can never escape the download root.
+	type Item = (
+		&'a Entry<DirExtra, FileExtra>,
+		Result<CanonicalPath, std::io::Error>,
+	);
 
 	fn next(&mut self) -> Option<Self::Item> {
 		self.inner.inner_next(
