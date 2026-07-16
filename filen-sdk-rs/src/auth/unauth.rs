@@ -406,9 +406,10 @@ impl UnauthClient {
 }
 
 fn master_keys_from_exportable(recovery_key: &str, user_id: u64) -> Result<Vec<MasterKey>, Error> {
-	let regex =
-		regex::Regex::new(r"_VALID_FILEN_MASTERKEY_([A-Fa-f0-9]{64})@(\d+)_VALID_FILEN_MASTERKEY_")
-			.expect("Failed to compile recovery key regex");
+	let regex = regex::Regex::new(
+		r"_VALID_FILEN_MASTERKEY_([A-Fa-f0-9]{40,64})@(\d+)_VALID_FILEN_MASTERKEY_",
+	)
+	.expect("Failed to compile recovery key regex");
 
 	let mut key = Cow::Borrowed(recovery_key);
 
@@ -513,6 +514,22 @@ mod tests {
 			"_VALID_FILEN_MASTERKEY_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@123456_VALID_FILEN_MASTERKEY_|_VALID_FILEN_MASTERKEY_fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210@123456_VALID_FILEN_MASTERKEY_"
 		);
 		let master_keys_vec = master_keys_from_exportable(&not_base_64_exported, 123456).unwrap();
+		assert_eq!(master_keys_vec, keys);
+	}
+
+	#[test]
+	fn master_keys_from_exportable_accepts_v1_and_v2_keys() {
+		// v1 master keys are 40 hex chars (sha1-based); v2 keys are 64 hex chars.
+		// convert_into_exportable emits both widths, and upgraded accounts export a
+		// chain containing both, so import must accept 40-hex keys or the v1 key is
+		// silently dropped (losing access to v1-encrypted items).
+		let keys = vec![
+			MasterKey::from_str("0123456789abcdef0123456789abcdef01234567").unwrap(),
+			MasterKey::from_str("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
+				.unwrap(),
+		];
+		let exported = crate::auth::make_master_key_string_from_keys(123456, &keys).unwrap();
+		let master_keys_vec = master_keys_from_exportable(&exported, 123456).unwrap();
 		assert_eq!(master_keys_vec, keys);
 	}
 }
