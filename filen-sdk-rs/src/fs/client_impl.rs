@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use filen_types::fs::{ObjectType, ParentUuid};
+use filen_types::fs::{ObjectType, ParentUuid, Uuid};
 
 use crate::{
 	ErrorKind, api,
@@ -59,6 +59,11 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		let mut current_item = Cow::Borrowed(item);
 		let mut ancestors: Vec<RemoteDirectory> = Vec::new();
+		// Guard against a cyclic parent chain (e.g. a corrupt or hostile server response
+		// whose parents loop). Without it the walk issues get_dir calls forever while
+		// holding the drive lock. Seeded with the item itself so a direct self-parent is
+		// caught too; the chain length is bounded by tree depth, so linear scans are fine.
+		let mut visited: Vec<Uuid> = vec![item.uuid()];
 		loop {
 			let parent_uuid = match current_item.parent() {
 				ParentUuid::Uuid(uuid) => *uuid,
@@ -104,6 +109,17 @@ impl Client {
 			if parent_uuid == self.root().uuid() {
 				break;
 			}
+
+			if visited.contains(&parent_uuid) {
+				return Err(Error::custom(
+					ErrorKind::InvalidState,
+					format!(
+						"Cycle detected in parent chain of item {} at {parent_uuid}",
+						item.uuid()
+					),
+				));
+			}
+			visited.push(parent_uuid);
 
 			let parent = self.get_dir(parent_uuid).await?;
 			ancestors.push(parent);
