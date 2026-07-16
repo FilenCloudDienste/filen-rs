@@ -66,6 +66,11 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install dav1d pkg-config
+      - name: Install Wild linker
+        if: runner.os == 'Linux'
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
       - name: Run tests
         run: cargo test -F malformed,heif-decoder,avif-decoder --no-fail-fast
         env:
@@ -110,6 +115,10 @@ jobs:
           prefix-key: ''
           add-rust-environment-hash-key: 'false'
           save-if: false
+      - name: Install Wild linker
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
       - name: Run the isolated 2FA test (#[ignore]'d out of the matrix)
         run: cargo test -p filen-sdk-rs --test client_tests --no-fail-fast -- --ignored
         env:

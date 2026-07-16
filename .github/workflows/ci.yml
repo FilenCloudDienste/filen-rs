@@ -58,6 +58,10 @@ jobs:
           taplo fmt --check
       - name: Run sqlfluff
         run: sqlfluff lint .
+      - name: Install Wild linker
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
       - name: Run unit tests
         run: cargo test --lib -F cache --no-fail-fast
         env:

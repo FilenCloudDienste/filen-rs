@@ -38,6 +38,11 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           choco install winfsp
+      - name: Install Wild linker
+        if: runner.os == 'Linux'
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
       - name: Run tests
         run: cargo test
         working-directory: ./filen-network-drive

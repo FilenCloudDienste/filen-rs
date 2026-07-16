@@ -121,6 +121,18 @@ jobs:
       - name: Run build
         run: ${{ matrix.command }} build --release --verbose --locked --target $target
         working-directory: ./filen-cli
+        env:
+          # The repo's .cargo/config.toml sets clang+Wild as the linker for native
+          # x86_64/aarch64-unknown-linux-gnu builds (for fast local/CI dev builds), but the
+          # `cross` Docker images used for these release targets don't have Wild or clang
+          # installed. Env vars take precedence over .cargo/config.toml, so use them to restore
+          # each target's normal GNU cross-linker for this release build. No-ops for the other
+          # matrix targets (musl/macOS/Windows), since cargo only reads the vars matching the
+          # triple actually being built.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: List target
         run: find ./target
       - name: Prepare artifact
