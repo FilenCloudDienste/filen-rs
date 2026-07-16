@@ -48,6 +48,39 @@ pub trait DirUploadCallback: Send + Sync {
 	fn on_upload_errors(&self, errors: Vec<(PathBuf, Error)>);
 }
 
+/// Aborts the wrapped task on drop unless it was [`join`](Self::join)ed first.
+///
+/// A bare `tokio::spawn` task is detached: dropping the future that holds its
+/// `JoinHandle` does not stop it. Wrapping the handle here re-ties the task to
+/// the owner's lifetime, so cancelling the owning future aborts the task.
+struct AbortOnDropHandle {
+	handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AbortOnDropHandle {
+	fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+		Self {
+			handle: Some(handle),
+		}
+	}
+
+	/// Await the task's normal completion, disarming the abort-on-drop.
+	async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+		match self.handle.take() {
+			Some(handle) => handle.await,
+			None => Ok(()),
+		}
+	}
+}
+
+impl Drop for AbortOnDropHandle {
+	fn drop(&mut self) {
+		if let Some(handle) = &self.handle {
+			handle.abort();
+		}
+	}
+}
+
 // todo, accept &impl HasUuidContents instead of RemoteDirectory for target_folder
 impl Client {
 	// this could definitely be optimized further, but for now it works
@@ -94,12 +127,17 @@ impl Client {
 			.expect("dir_upload_task_sender.send panicked");
 		let mut in_flight = 1; // root dir upload
 
-		let task = self.spawn_upload_task_manager(
+		// Tie the detached manager task to this future's lifetime: if the caller
+		// cancels (drops this future), the guard aborts the manager, and the
+		// manager's `JoinSet` — dropped as its task unwinds — aborts every
+		// queued and in-flight upload it spawned. Without this, up to 64 buffered
+		// files would keep uploading after the user cancelled.
+		let task = AbortOnDropHandle::new(self.spawn_upload_task_manager(
 			dir_upload_result_sender,
 			file_upload_result_sender,
 			entry_to_upload_receiver,
 			uploaded_bytes.clone(),
-		);
+		));
 
 		loop {
 			tokio::select! {
@@ -172,7 +210,7 @@ impl Client {
 			}
 		}
 		std::mem::drop(entry_to_upload_sender);
-		task.await.expect("upload task manager panicked");
+		task.join().await.expect("upload task manager panicked");
 		send_callbacks(
 			&mut uploaded_dirs,
 			&mut uploaded_files,
@@ -362,4 +400,62 @@ struct EntryToUploadInfo {
 enum EntryToUpload {
 	File(PathBuf),
 	Dir(PathBuf, DirChildrenInfo),
+}
+
+#[cfg(test)]
+mod abort_on_drop_handle_tests {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	};
+
+	use super::AbortOnDropHandle;
+
+	/// Sets a flag when its future is dropped — a spawned task's future is
+	/// dropped when the task is aborted, so this observes the abort.
+	struct SetOnDrop(Arc<AtomicBool>);
+	impl Drop for SetOnDrop {
+		fn drop(&mut self) {
+			self.0.store(true, Ordering::SeqCst);
+		}
+	}
+
+	#[tokio::test]
+	async fn dropping_guard_aborts_the_task() {
+		let aborted = Arc::new(AtomicBool::new(false));
+		let marker = aborted.clone();
+		let guard = AbortOnDropHandle::new(tokio::spawn(async move {
+			let _marker = SetOnDrop(marker);
+			// Never completes on its own; only an abort ends it.
+			std::future::pending::<()>().await;
+		}));
+		// Let the task start and park.
+		tokio::task::yield_now().await;
+		drop(guard);
+		// The abort drops the task's future, running SetOnDrop.
+		for _ in 0..1000 {
+			if aborted.load(Ordering::SeqCst) {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		assert!(
+			aborted.load(Ordering::SeqCst),
+			"dropping the guard must abort the task"
+		);
+	}
+
+	#[tokio::test]
+	async fn joining_guard_runs_task_to_completion() {
+		let done = Arc::new(AtomicBool::new(false));
+		let marker = done.clone();
+		let guard = AbortOnDropHandle::new(tokio::spawn(async move {
+			marker.store(true, Ordering::SeqCst);
+		}));
+		guard.join().await.unwrap();
+		assert!(
+			done.load(Ordering::SeqCst),
+			"joined task must run to completion, not be aborted"
+		);
+	}
 }
