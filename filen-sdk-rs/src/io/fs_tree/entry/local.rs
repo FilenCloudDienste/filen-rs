@@ -72,10 +72,56 @@ impl super::CompareStrategy<ExtraLocalDirData, ExtraLocalFileData> for LocalComp
 		existing: &super::Entry<ExtraLocalDirData, ExtraLocalFileData>,
 		new: &super::Entry<ExtraLocalDirData, ExtraLocalFileData>,
 	) -> bool {
+		// On a dir-vs-file name collision (same normalized key) prefer the
+		// directory, matching `RemoteCompareStrategy`. Keeping the file instead
+		// would drop the entire colliding directory subtree from the transfer —
+		// the maximal-loss choice — and an upload/download round trip would flip
+		// which entry survives.
 		matches!(
 			(existing, new),
-			(super::Entry::Dir(_), super::Entry::File(_))
+			(super::Entry::File(_), super::Entry::Dir(_))
 		)
+	}
+}
+
+#[cfg(test)]
+mod compare_strategy_tests {
+	use string_interner::{DefaultBackend, StringInterner};
+
+	use super::{ExtraLocalDirData, ExtraLocalFileData, LocalCompareStrategy};
+	use crate::io::fs_tree::entry::{
+		CompareStrategy, DirChildrenInfo, DirEntry, Entry, FileEntry, UnfinalizedDirEntry,
+	};
+
+	fn dir_and_file() -> (
+		Entry<ExtraLocalDirData, ExtraLocalFileData>,
+		Entry<ExtraLocalDirData, ExtraLocalFileData>,
+	) {
+		let mut interner = StringInterner::<DefaultBackend>::default();
+		// Same interned name: a real dir-vs-file collision key.
+		let name = interner.get_or_intern("collision");
+		let dir = Entry::Dir(DirEntry::from_unfinalized(
+			UnfinalizedDirEntry::new(name, ExtraLocalDirData),
+			DirChildrenInfo::new(0, 0),
+		));
+		let file = Entry::File(FileEntry::new(name, ExtraLocalFileData, 0));
+		(dir, file)
+	}
+
+	#[test]
+	fn prefers_dir_over_file_like_remote() {
+		let (dir, file) = dir_and_file();
+		// existing File, new Dir -> replace so the Dir (and its subtree) wins.
+		assert!(LocalCompareStrategy::should_replace(&file, &dir));
+		// existing Dir, new File -> keep the Dir.
+		assert!(!LocalCompareStrategy::should_replace(&dir, &file));
+	}
+
+	#[test]
+	fn same_type_collisions_keep_existing() {
+		let (dir, file) = dir_and_file();
+		assert!(!LocalCompareStrategy::should_replace(&dir, &dir));
+		assert!(!LocalCompareStrategy::should_replace(&file, &file));
 	}
 }
 
