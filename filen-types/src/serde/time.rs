@@ -10,7 +10,9 @@ pub mod optional {
 	{
 		let value = Option::<i64>::deserialize(deserializer)?;
 		Ok(match value {
-			None => None,
+			// Mirror the serialize sentinel below: the backend encodes an unset
+			// timestamp as 0, so map it back to None instead of 1970-01-01.
+			None | Some(0) => None,
 			Some(timestamp) => seconds_or_millis::from_seconds_or_millis(timestamp),
 		})
 	}
@@ -281,6 +283,21 @@ mod tests {
 		let now = Utc::now().timestamp_millis();
 		let parsed: Strict = serde_json::from_str(&format!(r#"{{"t":{now}}}"#)).unwrap();
 		assert_eq!(parsed.t.timestamp_millis(), now);
+	}
+
+	#[test]
+	fn optional_deserializer_maps_zero_sentinel_to_none() {
+		// The backend encodes an unset timestamp as 0; it must round-trip to
+		// None, not the 1970-01-01 epoch.
+		let parsed: Optional = serde_json::from_str(r#"{"t":0}"#).unwrap();
+		assert_eq!(parsed.t, None);
+	}
+
+	#[test]
+	fn optional_deserializer_still_reads_real_timestamps() {
+		let now = Utc::now().timestamp_millis();
+		let parsed: Optional = serde_json::from_str(&format!(r#"{{"t":{now}}}"#)).unwrap();
+		assert_eq!(parsed.t.map(|t| t.timestamp_millis()), Some(now));
 	}
 
 	#[test]
