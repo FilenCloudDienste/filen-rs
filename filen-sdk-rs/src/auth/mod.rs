@@ -718,6 +718,21 @@ impl Client {
 			.write()
 			.unwrap_or_else(|e| e.into_inner()) = resp.new_api_key;
 
+		// The password change already replaced the master-key chain server-side, so update the
+		// local auth_info to match BEFORE the key_pair step. If key_pair::update then fails, this
+		// session keeps the new master keys instead of a stale chain that could not decrypt items
+		// other clients now encrypt with the new key (and that a persisted snapshot would capture).
+		let new_auth_info = match auth_version {
+			AuthVersion::V1 => AuthInfo::V1(v2::AuthInfo { master_keys }),
+			AuthVersion::V2 => AuthInfo::V2(v2::AuthInfo { master_keys }),
+			AuthVersion::V3 => unreachable!("checked above"),
+		};
+		{
+			let mut write_lock = self.auth_info.write().unwrap_or_else(|e| e.into_inner());
+			*write_lock = Arc::new(new_auth_info);
+			self.auth_info.clear_poison();
+		}
+
 		api::v3::user::key_pair::update::post(
 			self.client(),
 			&api::v3::user::key_pair::update::Request {
@@ -726,17 +741,6 @@ impl Client {
 			},
 		)
 		.await?;
-
-		let new_auth_info = match auth_version {
-			AuthVersion::V1 => AuthInfo::V1(v2::AuthInfo { master_keys }),
-			AuthVersion::V2 => AuthInfo::V2(v2::AuthInfo { master_keys }),
-			AuthVersion::V3 => unreachable!("checked above"),
-		};
-
-		let mut write_lock = self.auth_info.write().unwrap_or_else(|e| e.into_inner());
-		*write_lock = Arc::new(new_auth_info);
-		self.auth_info.clear_poison();
-		std::mem::drop(write_lock);
 
 		Ok(())
 	}
