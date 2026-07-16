@@ -612,13 +612,27 @@ impl Client {
 			})
 			.collect::<FuturesUnordered<_>>();
 
+		let mut participant_error = None;
 		while let Some(res) = participant_futures.next().await {
-			match res {
-				Ok(()) => {}
-				Err(e) => return Err(e.with_context("add chat participant")),
+			if let Err(e) = res {
+				participant_error = Some(e.with_context("add chat participant"));
+				break;
 			}
 		}
 		std::mem::drop(participant_futures);
+
+		if let Some(e) = participant_error {
+			// The conversation was already created server-side but is only partially
+			// populated. Best-effort delete it so a caller retry doesn't leak a
+			// half-built conversation (which otherwise accumulates against the
+			// server-side create rate limit).
+			let _ = api::v3::chat::conversations::delete::post(
+				self.client(),
+				&api::v3::chat::conversations::delete::Request { uuid: resp.uuid },
+			)
+			.await;
+			return Err(e);
+		}
 
 		let participants = match Arc::try_unwrap(participants) {
 			Ok(mutex) => Mutex::into_inner(mutex).unwrap_or_else(|e| e.into_inner()),
