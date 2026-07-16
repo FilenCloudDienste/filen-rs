@@ -34,7 +34,7 @@ pub struct Directory<'a> {
 	pub uuid: Uuid,
 	pub parent: Uuid,
 	pub metadata: EncryptedString<'a>,
-	#[serde(with = "chrono::serde::ts_seconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub color: DirColor<'a>,
 }
@@ -45,7 +45,7 @@ pub struct File<'a> {
 	pub uuid: Uuid,
 	pub parent: Uuid,
 	pub metadata: EncryptedString<'a>,
-	#[serde(with = "chrono::serde::ts_seconds")]
+	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,
@@ -54,4 +54,48 @@ pub struct File<'a> {
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
 	pub version: FileEncryptionVersion,
+}
+
+#[cfg(test)]
+mod tests {
+	use chrono::Datelike;
+
+	use super::*;
+
+	// 1_700_000_000_000 ms is 2023-11-14. Parsed as *seconds* (the old
+	// `ts_seconds` behaviour) the same integer lands in the far future
+	// (year ~55893), which is exactly the silent corruption this endpoint hit.
+	const MILLIS: i64 = 1_700_000_000_000;
+
+	#[test]
+	fn directory_reads_millisecond_timestamp_as_recent_date() {
+		let json = r#"{
+			"uuid":"00000000-0000-0000-0000-000000000000",
+			"parent":"11111111-1111-1111-1111-111111111111",
+			"metadata":"encrypted-meta",
+			"timestamp":1700000000000,
+			"color":"default"
+		}"#;
+		let dir: Directory = serde_json::from_str(json).unwrap();
+		assert_eq!(dir.timestamp.timestamp_millis(), MILLIS);
+		assert_eq!(dir.timestamp.year(), 2023);
+	}
+
+	#[test]
+	fn file_reads_millisecond_timestamp_as_recent_date() {
+		let json = r#"{
+			"uuid":"00000000-0000-0000-0000-000000000000",
+			"parent":"11111111-1111-1111-1111-111111111111",
+			"metadata":"encrypted-meta",
+			"timestamp":1700000000000,
+			"size":1024,
+			"chunks":2,
+			"bucket":"bucket-1",
+			"region":"us-east-1",
+			"version":1
+		}"#;
+		let file: File = serde_json::from_str(json).unwrap();
+		assert_eq!(file.timestamp.timestamp_millis(), MILLIS);
+		assert_eq!(file.timestamp.year(), 2023);
+	}
 }
