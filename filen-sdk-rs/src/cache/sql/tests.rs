@@ -972,6 +972,60 @@ fn test_update_dir_color_nonexistent_is_noop() {
 		.unwrap();
 }
 
+// A `FolderMove` / `FolderRestore` / `FolderSubCreated` socket event carries no color,
+// so its builder fabricates `DirColor::Default`. Re-upserting such an event over an
+// existing row must not clobber the stored color (it is owned by the dedicated color
+// path); the other fields of the event must still apply.
+#[test]
+fn test_dir_upsert_preserves_color_on_conflict() {
+	let mut state = test_cache_state();
+	let uuid = Uuid::new_v4();
+	let now = Utc::now();
+
+	// Initial row with a real color, as a full listing reports it.
+	let colored = CacheableDir {
+		uuid,
+		parent: state.root_uuid,
+		color: DirColor::Red,
+		favorited: false,
+		timestamp: now,
+		name: Cow::Owned("folder".to_string()),
+		created: Some(now),
+	};
+	state.upsert_dirs(once(&colored)).unwrap();
+
+	// A color-less move/restore: DirColor::Default plus a genuinely-updated field
+	// (favorite) to prove the conflict-update path actually ran.
+	let moved = CacheableDir {
+		uuid,
+		parent: state.root_uuid,
+		color: DirColor::Default,
+		favorited: true,
+		timestamp: now,
+		name: Cow::Owned("folder".to_string()),
+		created: Some(now),
+	};
+	state.upsert_dirs(once(&moved)).unwrap();
+
+	let (favorite, color): (bool, Option<String>) = state
+		.db
+		.query_row(
+			"SELECT d.favorite, d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+			params![uuid],
+			|row| Ok((row.get(0)?, row.get(1)?)),
+		)
+		.unwrap();
+	assert!(
+		favorite,
+		"the conflict-update must still apply other fields"
+	);
+	assert_eq!(
+		color.as_deref(),
+		Some("red"),
+		"a color-less move/restore upsert must not reset the stored color"
+	);
+}
+
 #[test]
 fn test_delete_all_non_root() {
 	let mut state = test_cache_state();

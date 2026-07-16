@@ -114,8 +114,13 @@ fn dirs_upsert_sql(rows: usize) -> String {
 	let mut sql = String::with_capacity(rows * 32 + 320);
 	sql.push_str("INSERT INTO dirs (id, favorite, color, timestamp, name, created) VALUES ");
 	push_values_rows(&mut sql, rows, DIR_PARAMS_PER_ROW);
+	// `color` is intentionally omitted from the conflict update: the `FolderMove` /
+	// `FolderRestore` / `FolderSubCreated` socket events carry no color and fabricate
+	// `DirColor::Default`, so overwriting on conflict would reset a user's folder color.
+	// Color is owned by the dedicated `FolderColorChanged` path (`DIR_UPDATE_COLOR`); the
+	// initial INSERT above still seeds it for genuinely new rows.
 	sql.push_str(
-		" ON CONFLICT (id) DO UPDATE SET favorite = excluded.favorite, color = excluded.color, \
+		" ON CONFLICT (id) DO UPDATE SET favorite = excluded.favorite, \
 		 timestamp = excluded.timestamp, name = excluded.name, created = excluded.created",
 	);
 	sql
