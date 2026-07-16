@@ -122,6 +122,19 @@ pub(crate) trait ListenerManagerExt: ListenerManager {
 		event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
 	);
 
+	/// Like [`add_listener`](Self::add_listener), but the id is sent back IMMEDIATELY on
+	/// insertion instead of being deferred to the next connect. The callback is live in the
+	/// routing table on return (it receives every event the manager subsequently broadcasts),
+	/// and the caller gets its handle without waiting for a connect ack — the property the
+	/// offline cache-worker registration relies on to avoid wedging while disconnected.
+	fn add_listener_sync<'a>(
+		&mut self,
+		callback: EventListenerCallback,
+		cancel_receiver: tokio::sync::oneshot::Receiver<()>,
+		id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
+		event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
+	);
+
 	fn remove_listener(&mut self, id: u64);
 }
 
@@ -250,6 +263,26 @@ impl ListenerManagerExt for DisconnectedListenerManager {
 		});
 	}
 
+	fn add_listener_sync<'a>(
+		&mut self,
+		callback: EventListenerCallback,
+		mut cancel_receiver: tokio::sync::oneshot::Receiver<()>,
+		id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
+		event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
+	) {
+		// Insert the callback and ack immediately — do NOT push onto `new_ids` (which would
+		// defer the id until `into_connected`). The callback is now live in the routing table
+		// and is carried into the connected manager on promotion, so it receives every event;
+		// the caller gets its handle without a connect ack. Mirrors the connected path's
+		// send-then-cancel handling: a dropped receiver / a cancel means unregister.
+		let id = ListenerManagerExtInner::add_listener(self, callback, event_types);
+		if id_sender.send(Ok(id)).is_err() {
+			ListenerManagerExtInner::remove_listener(self, id);
+		} else if let Ok(()) = cancel_receiver.try_recv() {
+			ListenerManagerExtInner::remove_listener(self, id);
+		}
+	}
+
 	fn remove_listener(&mut self, id: u64) {
 		let callback = ListenerManagerExtInner::remove_listener(self, id);
 		if let Some(callback) = callback {
@@ -356,6 +389,18 @@ impl ListenerManagerExt for ConnectedListenerManager {
 			// so it doesn't have to special-case whether it was added before or after auth.
 			cb(&DecryptedSocketEvent::AuthSuccess);
 		}
+	}
+
+	fn add_listener_sync<'a>(
+		&mut self,
+		callback: EventListenerCallback,
+		cancel_receiver: tokio::sync::oneshot::Receiver<()>,
+		id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
+		event_types: Option<impl Iterator<Item = Cow<'a, str>>>,
+	) {
+		// Already connected: the normal add is inherently synchronous — it inserts and acks
+		// immediately (and replays authSuccess), which is exactly the sync contract.
+		ListenerManagerExt::add_listener(self, callback, cancel_receiver, id_sender, event_types);
 	}
 
 	fn remove_listener(&mut self, id: u64) {
@@ -522,6 +567,81 @@ mod tests {
 			calls.load(Ordering::SeqCst),
 			1,
 			"a callback registered with a duplicated event type must fire once per event"
+		);
+	}
+
+	// Offline-wedge regression: `add_listener_sync` sends the id back synchronously on insertion,
+	// so a caller (the cache worker) gets its handle without a connect ack and never hangs while
+	// disconnected. The deferred `add_listener` holds the id until `into_connected`, and this test
+	// pins the contrast — it would fail against the old detached-task design, which never inserted
+	// synchronously at all.
+	#[test]
+	fn sync_registration_acks_immediately_unlike_deferred() {
+		let mut deferred = DisconnectedListenerManager::new();
+		let (id_sender, mut id_receiver) = tokio::sync::oneshot::channel();
+		let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+		ListenerManagerExt::add_listener(
+			&mut deferred,
+			Box::new(|_| {}),
+			cancel_receiver,
+			id_sender,
+			None::<std::iter::Empty<Cow<'static, str>>>,
+		);
+		assert!(
+			matches!(
+				id_receiver.try_recv(),
+				Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+			),
+			"the deferred path must NOT ack before the socket connects"
+		);
+
+		let mut sync = DisconnectedListenerManager::new();
+		let (id_sender, mut id_receiver) = tokio::sync::oneshot::channel();
+		let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+		ListenerManagerExt::add_listener_sync(
+			&mut sync,
+			Box::new(|_| {}),
+			cancel_receiver,
+			id_sender,
+			None::<std::iter::Empty<Cow<'static, str>>>,
+		);
+		assert!(
+			matches!(id_receiver.try_recv(), Ok(Ok(_))),
+			"the sync path must ack immediately, without a connect ack"
+		);
+	}
+
+	// Delivery guarantee: a listener registered via the sync path is live in the routing table
+	// immediately, so an event broadcast through the manager reaches its callback even though no
+	// connect ack ever happened.
+	#[test]
+	fn sync_registered_listener_receives_events_without_connect() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		};
+
+		let mut manager = DisconnectedListenerManager::new();
+		let (id_sender, _id_receiver) = tokio::sync::oneshot::channel();
+		let (_canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+		let calls = Arc::new(AtomicUsize::new(0));
+		let calls_in_cb = calls.clone();
+		ListenerManagerExt::add_listener_sync(
+			&mut manager,
+			Box::new(move |_| {
+				calls_in_cb.fetch_add(1, Ordering::SeqCst);
+			}),
+			cancel_receiver,
+			id_sender,
+			Some(std::iter::once(Cow::Borrowed("authSuccess"))),
+		);
+
+		ListenerManagerExtInner::broadcast_event(&manager, &DecryptedSocketEvent::AuthSuccess);
+
+		assert_eq!(
+			calls.load(Ordering::SeqCst),
+			1,
+			"a sync-registered listener must receive events with no connect ack"
 		);
 	}
 }

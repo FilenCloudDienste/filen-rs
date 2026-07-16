@@ -539,8 +539,15 @@ async fn spawn_cache_worker(
 		}
 	};
 
-	// need to track all event types to make sure we don't miss any so we can increment global_message_id correctly
-	match client.add_event_listener(callback, None).await {
+	// Register the socket listener inline via `add_event_listener_sync`, which inserts the callback
+	// into the routing table and returns its handle WITHOUT awaiting a connect ack. `add_event_listener`
+	// (the ack-awaiting variant) only resolves once the socket connects or auth fails, so awaiting it
+	// here — under the cache-slot lock the caller holds — wedges every cache/sync API when the app
+	// starts offline. The sync path avoids that wedge while KEEPING the delivery guarantee: on return
+	// the callback is live in the table, so every event the socket subsequently receives is delivered
+	// to the worker (we subscribe to ALL event types with `None` so it advances its watermark
+	// correctly). A registration error still surfaces synchronously and aborts the spawn.
+	match client.add_event_listener_sync(callback, None).await {
 		Ok(listener_handle) => Ok(Arc::new(CacheWorkerShared {
 			control_sender,
 			manual_event_sender,

@@ -116,10 +116,54 @@ impl RequestSender {
 			})?;
 		guard.await
 	}
+
+	/// Register `callback` and resolve as soon as it is inserted into the routing table, WITHOUT
+	/// waiting for the socket to connect. The socket thread processes the request in its
+	/// connect-retry loop too, so this resolves promptly even while offline — the caller gets a
+	/// handle immediately instead of wedging on a connect ack, and a send failure (closed thread)
+	/// still surfaces synchronously.
+	pub(super) async fn add_event_listener_sync(
+		self,
+		callback: EventListenerCallback,
+		event_types: Option<Vec<Cow<'static, str>>>,
+	) -> Result<ListenerHandle, Error> {
+		let (id_sender, id_receiver) = tokio::sync::oneshot::channel();
+		let (canceller, cancel_receiver) = tokio::sync::oneshot::channel();
+		let request = SocketRequest::AddListenerSync {
+			callback,
+			event_types,
+			id_sender,
+			cancel_receiver,
+		};
+
+		let guard = ListenerRegisterGuard {
+			receiver: id_receiver,
+			request_sender: Some(self.0),
+			canceller: Some(canceller),
+		};
+		guard
+			.request_sender
+			.as_ref()
+			.expect("we set this above")
+			.send(request)
+			.await
+			.map_err(|_| {
+				Error::custom(ErrorKind::InvalidState, "websocket thread has been closed")
+			})?;
+		guard.await
+	}
 }
 
 pub(super) enum SocketRequest {
 	AddListener {
+		id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
+		cancel_receiver: tokio::sync::oneshot::Receiver<()>,
+		callback: EventListenerCallback,
+		event_types: Option<Vec<Cow<'static, str>>>,
+	},
+	/// Like [`AddListener`](Self::AddListener) but the id is acked on insertion instead of on the
+	/// next connect, so the caller's registration future resolves even while disconnected.
+	AddListenerSync {
 		id_sender: tokio::sync::oneshot::Sender<Result<u64, Error>>,
 		cancel_receiver: tokio::sync::oneshot::Receiver<()>,
 		callback: EventListenerCallback,
@@ -540,6 +584,19 @@ fn handle_request(request: SocketRequest, listeners: &mut impl ListenerManagerEx
 			event_types,
 		} => {
 			listeners.add_listener(
+				callback,
+				cancel_receiver,
+				id_sender,
+				event_types.map(|v| v.into_iter()),
+			);
+		}
+		SocketRequest::AddListenerSync {
+			id_sender,
+			callback,
+			cancel_receiver,
+			event_types,
+		} => {
+			listeners.add_listener_sync(
 				callback,
 				cancel_receiver,
 				id_sender,
