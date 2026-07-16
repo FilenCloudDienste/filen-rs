@@ -167,10 +167,11 @@ mod native {
 								}
 							}
 							Poll::Ready(Some(Err(e))) => {
-								return Poll::Ready(Err(RetryError::from_retryable(
-									e.is_timeout(),
-									Error::from(e),
-								)));
+								// A mid-body read timeout must fail fast, not retry: the request
+								// timeout classification (see execute_request) treats timeouts as
+								// non-retryable, and retrying a stalled stream would burn another
+								// full read timeout per attempt.
+								return Poll::Ready(Err(RetryError::NoRetry(Error::from(e))));
 							}
 							Poll::Ready(None) => {
 								return Poll::Ready(Ok(std::mem::take(collected)));
@@ -188,3 +189,53 @@ mod native {
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use native::*;
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod tests {
+	use std::time::Duration;
+
+	use tokio::{
+		io::{AsyncReadExt, AsyncWriteExt},
+		net::TcpListener,
+	};
+
+	use super::native::DownloadBodyFuture;
+	use crate::auth::http::{ClientConfig, retry::RetryError};
+
+	/// A host that streams part of a body then stalls trips the read timeout mid-body. The
+	/// documented HTTP policy is to fail fast on timeouts, so this must be classified NoRetry —
+	/// not retried for another full read timeout (which, over MAX_RETRIES at 300s spacing, would
+	/// let a single stalled chunk hang for ~55 minutes on mobile).
+	#[tokio::test]
+	async fn mid_body_read_timeout_is_not_retryable() {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			let (mut socket, _) = listener.accept().await.unwrap();
+			let mut buf = [0u8; 1024];
+			let _ = socket.read(&mut buf).await;
+			// Promise 100 bytes, send only a few, then stall forever so the client's body read
+			// (not the time-to-first-byte) is what trips the read timeout.
+			let head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npart";
+			socket.write_all(head.as_bytes()).await.unwrap();
+			socket.flush().await.unwrap();
+			tokio::time::sleep(Duration::from_secs(30)).await;
+		});
+
+		let client = ClientConfig::default()
+			.with_read_timeout(Some(Duration::from_millis(300)))
+			.build_reqwest_client()
+			.unwrap();
+		let response = client.get(format!("http://{addr}/")).send().await.unwrap();
+
+		let fut =
+			DownloadBodyFuture::new(async move { Ok::<_, RetryError<crate::Error>>(response) });
+		match fut.await {
+			Err(RetryError::NoRetry(_)) => {}
+			Err(RetryError::Retry(e)) => {
+				panic!("a mid-body read timeout must be NoRetry (fail-fast), but was Retry: {e}")
+			}
+			Ok(_) => panic!("the body read must not complete while the server stalls mid-body"),
+		}
+	}
+}

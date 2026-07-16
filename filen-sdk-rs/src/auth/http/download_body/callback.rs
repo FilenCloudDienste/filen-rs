@@ -315,9 +315,10 @@ mod native {
 								}
 							}
 							Poll::Ready(Some(Err(e))) => {
-								if e.is_timeout() {
-									return Poll::Ready(Err(RetryError::Retry(Error::from(e))));
-								}
+								// A mid-body read timeout must fail fast, not retry: the request
+								// timeout classification (see execute_request) treats timeouts as
+								// non-retryable, and retrying a stalled stream would burn another
+								// full read timeout per attempt.
 								return Poll::Ready(Err(RetryError::NoRetry(Error::from(e))));
 							}
 							Poll::Ready(None) => {
