@@ -590,7 +590,11 @@ impl Client {
 	pub async fn generate_2fa_secret(&self) -> Result<TwoFASecret, Error> {
 		let resp = api::v3::user::settings::get(self.client()).await?;
 
-		if resp.two_factor_key.is_empty() {
+		// Guard on the authoritative enabled flag, not on key emptiness: get_user_info masks the
+		// same twoFactorKey via two_factor_enabled, so if the server ever returns a non-empty key
+		// while 2FA is enabled, keying on emptiness would hand back the LIVE TOTP secret as a fresh
+		// setup secret.
+		if resp.two_factor_enabled {
 			return Err(Error::custom(
 				crate::ErrorKind::InvalidState,
 				"2FA is already enabled for this account, cannot generate new secret",
