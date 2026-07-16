@@ -644,7 +644,7 @@ impl Client {
 				uuid: dir.uuid(),
 				expiration: link.expiration,
 				password: link.password().is_known(),
-				password_hashed: link.get_password_hash()?,
+				password_hashed: do_cpu_intensive(|| link.get_password_hash()).await?,
 				salt: link.salt(),
 				download_btn: link.enable_download,
 			},
