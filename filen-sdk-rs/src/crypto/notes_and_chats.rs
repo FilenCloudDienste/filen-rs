@@ -265,6 +265,17 @@ impl NoteOrChatKeyStruct<'_> {
 		let key_string = serde_json::to_string(&key_struct).expect("Failed to serialize note key");
 		crypter.blocking_encrypt_meta(&key_string)
 	}
+
+	pub(crate) fn blocking_try_decrypt_symmetric(
+		crypter: &impl MetaCrypter,
+		encrypted_key: &EncryptedString<'_>,
+	) -> Result<NoteOrChatKey, Error> {
+		let key_string = crypter.blocking_decrypt_meta(encrypted_key).map_err(|e| {
+			Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note key"))
+		})?;
+		let key_struct: NoteOrChatKeyStruct = serde_json::from_str(&key_string)?;
+		Ok(key_struct.key.into_owned())
+	}
 }
 
 #[cfg(test)]

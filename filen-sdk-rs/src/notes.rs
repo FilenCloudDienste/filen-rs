@@ -12,7 +12,7 @@ use filen_types::{
 };
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
-use rsa::RsaPublicKey;
+use rsa::{RsaPrivateKey, RsaPublicKey};
 
 use crate::{
 	Error, ErrorKind, api,
@@ -330,6 +330,29 @@ pub(crate) mod crypto {
 	impl_note_or_chat_carrier_crypto!(NoteContent, content, "note content", str);
 }
 
+/// Resolve the note's symmetric key for `user_id`. Prefer the user's own participant entry
+/// (RSA-wrapped). If the user owns the note but has no participant entry — an interrupted
+/// `create_note` can persist the note before the Owner participant is added — fall back to the
+/// owner's symmetric copy stored in `note.metadata`, so the note stays decryptable instead of
+/// being permanently unreadable (title/content lost forever).
+fn blocking_decrypt_note_key_for_user(
+	user_id: u64,
+	private_key: &RsaPrivateKey,
+	crypter: &impl MetaCrypter,
+	note: &filen_types::api::v3::notes::Note<'_>,
+) -> Result<NoteOrChatKey, Error> {
+	if let Some(participant) = note.participants.iter().find(|p| p.user_id == user_id) {
+		return NoteOrChatKeyStruct::blocking_try_decrypt_rsa(private_key, &participant.metadata);
+	}
+	if note.owner_id == user_id {
+		return NoteOrChatKeyStruct::blocking_try_decrypt_symmetric(crypter, &note.metadata);
+	}
+	Err(Error::custom(
+		ErrorKind::Response,
+		"User is not a participant in the note",
+	))
+}
+
 impl Client {
 	pub async fn is_shared(
 		&self,
@@ -342,15 +365,7 @@ impl Client {
 		&self,
 		note: &filen_types::api::v3::notes::Note<'_>,
 	) -> Result<NoteOrChatKey, Error> {
-		let participant = note
-			.participants
-			.iter()
-			.find(|p| p.user_id == self.user_id)
-			.ok_or_else(|| {
-				Error::custom(ErrorKind::Response, "User is not a participant in the note")
-			})?;
-
-		NoteOrChatKeyStruct::blocking_try_decrypt_rsa(self.private_key(), &participant.metadata)
+		blocking_decrypt_note_key_for_user(self.user_id, self.private_key(), &*self.crypter(), note)
 	}
 
 	fn blocking_decrypt_note(
@@ -1412,5 +1427,65 @@ pub mod js_impls {
 			let this = self.inner();
 			do_on_commander(move || async move { this.delete_note_tag(tag).await }).await
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{borrow::Cow, str::FromStr};
+
+	use filen_types::api::v3::notes::{Note, NoteType};
+
+	use super::*;
+	use crate::{crypto::v2::MasterKey, fs::meta_recovery::test_support::TEST_RSA_KEY};
+
+	fn wire_note(owner_id: u64, metadata: EncryptedString<'static>) -> Note<'static> {
+		Note {
+			uuid: Uuid::new_v4(),
+			owner_id,
+			editor_id: owner_id,
+			is_owner: true,
+			favorite: false,
+			pinned: false,
+			tags: Vec::new(),
+			note_type: NoteType::Text,
+			metadata,
+			title: EncryptedString(Cow::Borrowed("")),
+			preview: EncryptedString(Cow::Borrowed("")),
+			trash: false,
+			archive: false,
+			created_timestamp: DateTime::<Utc>::default(),
+			edited_timestamp: DateTime::<Utc>::default(),
+			participants: Vec::new(),
+		}
+	}
+
+	// An interrupted create_note can persist an owner note before its Owner participant
+	// entry is added. The owner must still recover the key from the symmetric copy stored
+	// in note.metadata, instead of the note becoming permanently undecryptable.
+	#[test]
+	fn owner_without_participant_decrypts_key_from_symmetric_metadata() {
+		let master_key = MasterKey::from_str(&"a".repeat(32)).unwrap();
+		let key = NoteOrChatKey::generate();
+		let metadata = NoteOrChatKeyStruct::blocking_encrypt_symmetric(&master_key, &key);
+
+		let note = wire_note(42, metadata);
+
+		let decrypted =
+			blocking_decrypt_note_key_for_user(42, &TEST_RSA_KEY, &master_key, &note).unwrap();
+		assert_eq!(decrypted, key);
+	}
+
+	// A non-owner with no participant entry genuinely cannot decrypt the note, and must
+	// still error rather than fall through to the owner symmetric path.
+	#[test]
+	fn non_owner_without_participant_errors() {
+		let master_key = MasterKey::from_str(&"a".repeat(32)).unwrap();
+		let key = NoteOrChatKey::generate();
+		let metadata = NoteOrChatKeyStruct::blocking_encrypt_symmetric(&master_key, &key);
+
+		let note = wire_note(42, metadata);
+
+		assert!(blocking_decrypt_note_key_for_user(99, &TEST_RSA_KEY, &master_key, &note).is_err());
 	}
 }
