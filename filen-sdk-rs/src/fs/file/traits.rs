@@ -24,7 +24,7 @@ pub trait HasFileInfo {
 	fn last_modified(&self) -> Option<DateTime<Utc>>;
 	fn size(&self) -> u64;
 	fn chunks(&self) -> u64 {
-		self.size() / CHUNK_SIZE_U64
+		self.size().div_ceil(CHUNK_SIZE_U64)
 	}
 	fn key(&self) -> Option<&FileKey>;
 }
@@ -40,4 +40,48 @@ pub(crate) trait UpdateFileMeta {
 pub trait File:
 	HasRemoteFileInfo + HasMeta + HasFileInfo + HasRemoteInfo + HasName + HasUUID + Sync
 {
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A minimal type that relies on the default `HasFileInfo::chunks()` implementation (it does
+	/// not override it), used to exercise that default in isolation.
+	struct DefaultChunks(u64);
+
+	impl HasFileInfo for DefaultChunks {
+		fn mime(&self) -> Option<&str> {
+			None
+		}
+
+		fn created(&self) -> Option<DateTime<Utc>> {
+			None
+		}
+
+		fn last_modified(&self) -> Option<DateTime<Utc>> {
+			None
+		}
+
+		fn size(&self) -> u64 {
+			self.0
+		}
+
+		fn key(&self) -> Option<&FileKey> {
+			None
+		}
+	}
+
+	/// The default `chunks()` must round up: a sub-chunk file still occupies one chunk. Floor
+	/// division returned 0 for any file under 1 MiB, which makes `FileReader` yield an empty
+	/// download with no error for an external implementor relying on the default.
+	#[test]
+	fn default_chunks_rounds_up() {
+		assert_eq!(DefaultChunks(0).chunks(), 0);
+		assert_eq!(DefaultChunks(1).chunks(), 1);
+		assert_eq!(DefaultChunks(CHUNK_SIZE_U64 - 1).chunks(), 1);
+		assert_eq!(DefaultChunks(CHUNK_SIZE_U64).chunks(), 1);
+		assert_eq!(DefaultChunks(CHUNK_SIZE_U64 + 1).chunks(), 2);
+		assert_eq!(DefaultChunks(3 * CHUNK_SIZE_U64).chunks(), 3);
+	}
 }
