@@ -239,11 +239,25 @@ where
 
 #[cfg_attr(feature = "uniffi", uniffi::export(with_foreign))]
 pub trait JsFileDownloadCallback: Send + Sync {
+	/// `downloaded_bytes` is a **delta** — the number of plaintext bytes downloaded *since the
+	/// previous call*, not a running total. Accumulate the values to obtain overall progress
+	/// (`sum == file size` once the transfer completes).
+	///
+	/// This differs from the wasm/service-worker stream download callbacks, which report the
+	/// **cumulative** total transferred so far. Treating this delta as a cumulative total leaves
+	/// progress stuck near zero.
 	fn on_update(&self, downloaded_bytes: u64);
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export(with_foreign))]
 pub trait JsFileUploadCallback: Send + Sync {
+	/// `uploaded_bytes` is a **delta** — the number of plaintext bytes uploaded *since the
+	/// previous call*, not a running total. Accumulate the values to obtain overall progress
+	/// (`sum == file size` once the transfer completes).
+	///
+	/// This differs from the wasm/service-worker stream upload callbacks, which report the
+	/// **cumulative** total transferred so far. Treating this delta as a cumulative total leaves
+	/// progress stuck near zero.
 	fn on_update(&self, uploaded_bytes: u64);
 }
 
