@@ -335,6 +335,39 @@ impl Client {
 	}
 }
 
+/// Removes a partially-written `.filendl` temp file on drop unless the download
+/// committed it with a rename. Without this, any early return mid-download
+/// (network error, `FileChangedDuringSync`, task cancellation) would leave
+/// `<uuid>.filendl` inside the sync tree, where the next scan pass — which only
+/// filters the quarantine dir — would treat it as a new local file and upload
+/// the partial garbage.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+struct TmpFileGuard {
+	path: Option<PathBuf>,
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl TmpFileGuard {
+	fn new(path: PathBuf) -> Self {
+		Self { path: Some(path) }
+	}
+
+	/// Call once the temp file has been committed (renamed into place) so drop
+	/// does not remove the now-final file.
+	fn disarm(&mut self) {
+		self.path = None;
+	}
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl Drop for TmpFileGuard {
+	fn drop(&mut self) {
+		if let Some(path) = self.path.take() {
+			let _ = std::fs::remove_file(path);
+		}
+	}
+}
+
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 async fn inner_download_file_to_path<SC>(
 	unauth_client: &SC,
@@ -366,6 +399,10 @@ where
 		.truncate(true)
 		.open(&tmp_path)
 		.await?;
+	// Arm cleanup now that the temp file exists: every path out of this function
+	// before the final rename must unlink it rather than leak it into the sync
+	// tree.
+	let mut tmp_guard = TmpFileGuard::new(tmp_path.clone());
 	let mut writer = tmp_file.compat_write();
 
 	unauth_client
@@ -396,6 +433,9 @@ where
 	}
 
 	tokio::fs::rename(&tmp_path, path).await?;
+	// Committed: the temp file no longer exists under its old name, so disarm
+	// cleanup to avoid removing the file we just placed.
+	tmp_guard.disarm();
 	Ok(())
 }
 
@@ -581,5 +621,37 @@ where
 		)
 		.await;
 		res
+	}
+}
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod tmp_file_guard_tests {
+	use super::TmpFileGuard;
+
+	#[test]
+	fn armed_guard_removes_temp_file_on_drop() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("abc.filendl");
+		std::fs::write(&path, b"partial download").unwrap();
+		assert!(path.exists());
+		{
+			// Dropping the still-armed guard simulates an early return
+			// mid-download; the leaked temp file must be unlinked.
+			let _guard = TmpFileGuard::new(path.clone());
+		}
+		assert!(!path.exists(), "leaked temp file must be removed on drop");
+	}
+
+	#[test]
+	fn disarmed_guard_keeps_committed_file() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("abc.filendl");
+		std::fs::write(&path, b"committed").unwrap();
+		{
+			let mut guard = TmpFileGuard::new(path.clone());
+			// Committing (rename) disarms the guard; the final file must survive.
+			guard.disarm();
+		}
+		assert!(path.exists(), "committed file must survive after disarm");
 	}
 }
