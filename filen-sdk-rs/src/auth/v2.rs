@@ -57,8 +57,10 @@ pub(super) async fn login(
 	),
 	Error,
 > {
-	let (master_key, pwd) =
-		crypto::v2::derive_password_and_mk(pwd.as_bytes(), info.salt.as_bytes())?;
+	let (master_key, pwd) = crate::runtime::do_cpu_intensive(|| {
+		crypto::v2::derive_password_and_mk(pwd.as_bytes(), info.salt.as_bytes())
+	})
+	.await?;
 
 	let response = api::v3::login::post(
 		client,
@@ -106,8 +108,10 @@ pub(super) async fn auth_info_with_api_key(
 	info: &api::v3::auth::info::Response<'_>,
 	auth_client: &super::http::AuthClient,
 ) -> Result<super::AuthInfo, Error> {
-	let (master_key, _pwd) =
-		crypto::v2::derive_password_and_mk(pwd.as_bytes(), info.salt.as_bytes())?;
+	let (master_key, _pwd) = crate::runtime::do_cpu_intensive(|| {
+		crypto::v2::derive_password_and_mk(pwd.as_bytes(), info.salt.as_bytes())
+	})
+	.await?;
 	let encrypted = MasterKeys::new_from_key(master_key.clone())
 		.to_encrypted()
 		.await;

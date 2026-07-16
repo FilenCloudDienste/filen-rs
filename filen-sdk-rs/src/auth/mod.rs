@@ -670,17 +670,27 @@ impl Client {
 					)
 				}
 				AuthInfo::V2(info) => {
-					let (new_master_key, new_derive) = crypto::v2::derive_password_and_mk(
-						new_password.as_bytes(),
-						(*new_salt.to_str()).as_bytes(),
-					)?;
-					(
-						info.master_keys,
+					// Run the PBKDF2 derivations off the async runtime, matching change_email: on
+					// wasm the single commander thread would otherwise freeze every concurrent SDK
+					// task (sockets, transfers) for the duration of the derive.
+					let (new_master_key, new_derive) = do_cpu_intensive(|| {
+						crypto::v2::derive_password_and_mk(
+							new_password.as_bytes(),
+							(*new_salt.to_str()).as_bytes(),
+						)
+					})
+					.await?;
+					let current_derived = do_cpu_intensive(|| {
 						crypto::v2::derive_password_and_mk(
 							current_password.as_bytes(),
 							auth_info_resp.salt.as_bytes(),
-						)?
-						.1,
+						)
+					})
+					.await?
+					.1;
+					(
+						info.master_keys,
+						current_derived,
 						new_master_key,
 						new_derive,
 						AuthVersion::V2,
