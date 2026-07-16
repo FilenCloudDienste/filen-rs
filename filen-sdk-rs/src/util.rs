@@ -21,18 +21,32 @@ impl<'a> Iterator for PathIterator<'a> {
 	type Item = (&'a str, &'a str);
 
 	fn next(&mut self) -> Option<Self::Item> {
-		match self.split.next() {
-			None if self.last_idx == self.path.len() => None,
-			None => {
-				let slice = &self.path[self.last_idx..];
-				self.last_idx = self.path.len();
-				Some((slice, ""))
+		loop {
+			if self.last_idx >= self.path.len() {
+				return None;
 			}
-			Some((idx, _)) => {
-				let slice = &self.path[self.last_idx..idx];
-				let rest = &self.path[idx + 1..];
-				self.last_idx = idx + 1;
-				Some((slice, rest))
+			match self.split.next() {
+				Some((idx, _)) => {
+					let slice = &self.path[self.last_idx..idx];
+					// Skip empty components produced by consecutive '/', so
+					// "a//b" behaves like "a/b" — consistent with the
+					// leading-slash trim in `new` and with POSIX path semantics.
+					if slice.is_empty() {
+						self.last_idx = idx + 1;
+						continue;
+					}
+					// Trim leading separators off the remainder so it never
+					// starts with '/' (interior duplicates deeper in the path
+					// collapse as iteration continues).
+					let rest = self.path[idx + 1..].trim_start_matches('/');
+					self.last_idx = idx + 1;
+					return Some((slice, rest));
+				}
+				None => {
+					let slice = &self.path[self.last_idx..];
+					self.last_idx = self.path.len();
+					return Some((slice, ""));
+				}
 			}
 		}
 	}
@@ -271,6 +285,27 @@ mod tests {
 		assert_eq!("root".path_iter().collect::<Vec<_>>(), vec![("root", "")]);
 		assert_eq!("/".path_iter().collect::<Vec<_>>(), vec![]);
 		assert_eq!("".path_iter().collect::<Vec<_>>(), vec![]);
+	}
+
+	#[test]
+	fn path_iterator_collapses_consecutive_slashes() {
+		// An interior double slash must not yield an empty component; "a//b"
+		// behaves exactly like "a/b".
+		assert_eq!(
+			"a//b".path_iter().collect::<Vec<_>>(),
+			vec![("a", "b"), ("b", "")]
+		);
+		assert_eq!(
+			"a///b".path_iter().collect::<Vec<_>>(),
+			vec![("a", "b"), ("b", "")]
+		);
+		// Trailing duplicate slashes collapse just like a single trailing slash.
+		assert_eq!("a//".path_iter().collect::<Vec<_>>(), vec![("a", "")]);
+		// Leading duplicate slashes are trimmed like a single leading slash.
+		assert_eq!("//a".path_iter().collect::<Vec<_>>(), vec![("a", "")]);
+		// No component is ever empty, even with several interior duplicates.
+		let components: Vec<&str> = "a//b//c".path_iter().map(|(c, _)| c).collect();
+		assert_eq!(components, vec!["a", "b", "c"]);
 	}
 }
 
