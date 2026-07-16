@@ -489,6 +489,46 @@ async fn dir_exists_normalizes_nfc() {
 	);
 }
 
+// On a dedup hit (a directory with the same case-insensitive name hash already
+// exists), create_dir must adopt the existing directory's real metadata rather
+// than fabricating meta from the caller's casing and created=now.
+#[shared_test_runtime]
+async fn create_dir_dedup_adopts_existing_meta() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let original_created = Utc::now().round_subsecs(3) - chrono::Duration::days(3);
+	let original = client
+		.create_dir_with_created(&test_dir.into(), "Docs", original_created)
+		.await
+		.unwrap();
+	assert_eq!(original.name(), Some("Docs"));
+
+	// hash_name lowercases, so "docs" hashes identically to "Docs" and the server
+	// dedups, returning the pre-existing directory.
+	let deduped = client
+		.create_dir_with_created(&test_dir.into(), "docs", Utc::now())
+		.await
+		.unwrap();
+
+	assert_eq!(
+		deduped.uuid(),
+		original.uuid(),
+		"dedup must return the existing directory's uuid"
+	);
+	assert_eq!(
+		deduped.name(),
+		Some("Docs"),
+		"dedup must keep the existing casing, not the caller's"
+	);
+	assert_eq!(
+		deduped.created(),
+		original.created(),
+		"dedup must keep the existing created time, not created=now"
+	);
+}
+
 #[shared_test_runtime]
 async fn dir_move() {
 	let resources = test_utils::RESOURCES.get_resources().await;

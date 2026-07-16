@@ -47,7 +47,7 @@ impl Client {
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
 		let _lock = self.lock_drive().await?;
-		let (mut uuid, meta) = RemoteDirectory::make_parts(name, created)?;
+		let (uuid, meta) = RemoteDirectory::make_parts(name, created)?;
 
 		let response = api::v3::dir::create::post(
 			self.client(),
@@ -60,7 +60,14 @@ impl Client {
 		)
 		.await?;
 
-		uuid = response.uuid;
+		if uuid != response.uuid {
+			// The server deduplicated against a pre-existing directory with the same
+			// (case-insensitive) name hash and returned its uuid. Our locally built meta
+			// carries the caller's casing and created=now, which do not match the existing
+			// directory; adopt its real metadata instead of pushing fabricated meta into
+			// the share/link mirrors.
+			return self.get_dir(response.uuid).await;
+		}
 
 		let dir: RemoteDirectory =
 			RemoteDirectory::new_from_parts(uuid, meta, (parent.uuid()).into(), response.timestamp);
