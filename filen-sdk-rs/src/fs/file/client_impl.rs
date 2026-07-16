@@ -23,7 +23,7 @@ use crate::{
 			traits::HasFileMeta,
 			write::FileWriterDefault,
 		},
-		name::EntryNameError,
+		name::{EntryNameError, ValidatedName},
 	},
 	runtime::{self, blocking_join, do_cpu_intensive},
 	util::{IntoMaybeParallelIterator, MaybeSend, MaybeSendCallback},
@@ -213,10 +213,13 @@ impl Client {
 		name: &str,
 		parent: &DirType<'_, Normal>,
 	) -> Result<Option<Uuid>, Error> {
+		// Hash the NFC-normalized name (as the upload path does via ValidatedName) so an
+		// NFD-decomposed query still matches a file stored under its NFC form.
+		let name = ValidatedName::try_from(name)?;
 		api::v3::file::exists::post(
 			self.client(),
 			&api::v3::file::exists::Request {
-				name_hashed: self.hash_name(name),
+				name_hashed: self.hash_name(name.as_ref()),
 				parent: (parent.uuid()).into(),
 			},
 		)

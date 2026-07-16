@@ -454,6 +454,30 @@ async fn file_exists() {
 	);
 }
 
+// The upload path stores the NFC-normalized name, so file_exists must also
+// normalize before hashing; otherwise an NFD-decomposed query hashes to a
+// different value and wrongly reports the file as absent.
+#[shared_test_runtime]
+async fn file_exists_normalizes_nfc() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// "café": composed é (U+00E9) vs decomposed e + combining acute (U+0301).
+	let nfc = "caf\u{00E9}.txt";
+	let nfd = "cafe\u{0301}.txt";
+	assert_ne!(nfc, nfd, "NFC and NFD forms must differ byte-wise");
+
+	let file = client.make_file_builder(nfc, test_dir.uuid()).unwrap();
+	let file = client.upload_file(file, b"hello").await.unwrap();
+
+	// Querying with the NFD form must still find the NFC-stored file.
+	assert_eq!(
+		client.file_exists(nfd, &test_dir.into()).await.unwrap(),
+		Some(file.uuid())
+	);
+}
+
 #[shared_test_runtime]
 async fn file_trash_empty() {
 	let resources = test_utils::RESOURCES.get_resources().await;

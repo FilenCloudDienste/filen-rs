@@ -466,6 +466,29 @@ async fn exists() {
 	);
 }
 
+// create_dir stores the NFC-normalized name, so dir_exists must also normalize
+// before hashing; otherwise an NFD-decomposed query hashes to a different value
+// and wrongly reports the directory as absent.
+#[shared_test_runtime]
+async fn dir_exists_normalizes_nfc() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// "café": composed é (U+00E9) vs decomposed e + combining acute (U+0301).
+	let nfc = "caf\u{00E9}";
+	let nfd = "cafe\u{0301}";
+	assert_ne!(nfc, nfd, "NFC and NFD forms must differ byte-wise");
+
+	let dir = client.create_dir(&test_dir.into(), nfc).await.unwrap();
+
+	// Querying with the NFD form must still find the NFC-stored directory.
+	assert_eq!(
+		client.dir_exists(&test_dir.into(), nfd).await.unwrap(),
+		Some(dir.uuid())
+	);
+}
+
 #[shared_test_runtime]
 async fn dir_move() {
 	let resources = test_utils::RESOURCES.get_resources().await;

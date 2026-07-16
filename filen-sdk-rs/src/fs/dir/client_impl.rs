@@ -22,6 +22,7 @@ use crate::{
 			traits::HasDirMeta,
 		},
 		file::RemoteFile,
+		name::ValidatedName,
 	},
 	runtime::do_cpu_intensive,
 	util::PathIteratorExt,
@@ -133,6 +134,9 @@ impl Client {
 		parent: &DirType<'_, Normal>,
 		name: &str,
 	) -> Result<Option<Uuid>, Error> {
+		// Hash the NFC-normalized name (as create_dir does via ValidatedName) so an
+		// NFD-decomposed query still matches a directory stored under its NFC form.
+		let name = ValidatedName::try_from(name)?;
 		api::v3::dir::exists::post(
 			self.client(),
 			&api::v3::dir::exists::Request {
