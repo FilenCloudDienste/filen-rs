@@ -19,6 +19,12 @@ struct HeicContext<'a> {
 impl HeicContext<'_> {
 	fn from_slice(data: &[u8]) -> Result<Self, HeifError> {
 		let context = unsafe { heif_context_alloc() };
+		// Own the context immediately so it is freed by `Drop` on every early
+		// return; otherwise a failed read below leaks it (and its buffers).
+		let ctx = HeicContext {
+			inner: context,
+			_lifetime: PhantomData,
+		};
 		let result = unsafe {
 			heif_context_read_from_memory_without_copy(
 				context,
@@ -31,30 +37,36 @@ impl HeicContext<'_> {
 			return Err(HeifError::from_raw(result));
 		}
 
-		Ok(HeicContext {
-			inner: context,
-			_lifetime: PhantomData,
-		})
+		Ok(ctx)
 	}
 
 	fn from_file(path: &str) -> Result<HeicContext<'static>, HeifError> {
 		let file_name = CString::new(path)
 			.map_err(|_| HeifError::invalid_input("file path contains an interior NUL byte"))?;
 		let context = unsafe { heif_context_alloc() };
+		// Own the context immediately so it is freed by `Drop` on every early
+		// return; otherwise a failed read below leaks it (and its buffers).
+		let ctx = HeicContext {
+			inner: context,
+			_lifetime: PhantomData,
+		};
 		let result =
 			unsafe { heif_context_read_from_file(context, file_name.as_ptr(), std::ptr::null()) };
 		if result.code != heif_error_code_heif_error_Ok {
 			return Err(HeifError::from_raw(result));
 		}
 
-		Ok(HeicContext {
-			inner: context,
-			_lifetime: PhantomData,
-		})
+		Ok(ctx)
 	}
 
 	fn from_reader<T: Read + Seek>(reader: &mut HeifReader<T>) -> Result<Self, HeifError> {
 		let context = unsafe { heif_context_alloc() };
+		// Own the context immediately so it is freed by `Drop` on every early
+		// return; otherwise a failed read below leaks it (and its buffers).
+		let ctx = HeicContext {
+			inner: context,
+			_lifetime: PhantomData,
+		};
 		let result = unsafe {
 			heif_context_read_from_reader(
 				context,
@@ -67,10 +79,7 @@ impl HeicContext<'_> {
 			return Err(HeifError::from_raw(result));
 		}
 
-		Ok(HeicContext {
-			inner: context,
-			_lifetime: PhantomData,
-		})
+		Ok(ctx)
 	}
 }
 
