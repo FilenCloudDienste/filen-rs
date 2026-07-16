@@ -486,7 +486,11 @@ fn get_real_bounds(size: u64, (start, end): (Bound<u64>, Bound<u64>)) -> (u64, u
 		Bound::Unbounded => 0,
 	};
 	let end = match end {
-		Bound::Included(end) => end + 1,
+		// Clamp before incrementing: `bytes=0-18446744073709551615` yields `Included(u64::MAX)`,
+		// and `end + 1` would overflow (panic under overflow-checks, wrap to 0 otherwise). Per RFC
+		// an end at/past the size means the remainder of the representation, so saturating here
+		// clamps to `size` below rather than mis-serving a 416.
+		Bound::Included(end) => end.saturating_add(1),
 		Bound::Excluded(end) => end,
 		Bound::Unbounded => u64::MAX,
 	}
@@ -778,6 +782,28 @@ mod tests {
 		assert!(!super::has_oversized_suffix("bytes=0-1023", 10 * 1024));
 		assert!(!super::has_oversized_suffix("bytes=-1024", 1024));
 		assert!(super::has_oversized_suffix("bytes=-1025", 1024));
+	}
+
+	/// An inclusive range end of `u64::MAX` (`bytes=0-18446744073709551615`) must not overflow when
+	/// converted to an exclusive bound. Per RFC it means "remainder of the representation", so it
+	/// clamps to the file size rather than panicking (overflow-checks) or wrapping to 0 (which would
+	/// wrongly yield 416).
+	#[test]
+	fn included_end_at_u64_max_clamps_to_size_without_overflow() {
+		use std::ops::Bound;
+
+		let size = 10 * 1024;
+		assert_eq!(
+			super::get_real_bounds(size, (Bound::Included(0), Bound::Included(u64::MAX))),
+			(0, size)
+		);
+		// The same through the full range resolution from the raw header.
+		let raw = "bytes=0-18446744073709551615";
+		let range = range_header(raw);
+		assert_eq!(
+			super::resolve_ranges(&range, Some(raw), size),
+			vec![(0, size)]
+		);
 	}
 
 	/// When `start_http_provider` is called a second time while an existing provider is
