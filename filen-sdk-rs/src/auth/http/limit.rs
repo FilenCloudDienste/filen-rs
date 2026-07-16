@@ -48,7 +48,11 @@ impl RateLimiter {
 		let mut lock = self.0.write().await;
 		if let Some(per_second) = per_second {
 			let quota = governor::Quota::per_second(per_second);
-			*lock = Some(Arc::new(governor::DefaultDirectRateLimiter::direct(quota)));
+			let limiter = governor::DefaultDirectRateLimiter::direct(quota);
+			// Drain the initial burst like `new` does, so a fresh mid-run limiter cannot admit a
+			// full extra burst on top of traffic already sent this second.
+			let _ = limiter.check_n(per_second);
+			*lock = Some(Arc::new(limiter));
 		} else {
 			*lock = None;
 		}
@@ -204,6 +208,28 @@ mod tests {
 			elapsed < Duration::from_millis(500),
 			"changing the rate blocked behind an in-flight acquire ({elapsed:?}); the read guard \
 			 is held across the limiter await"
+		);
+	}
+
+	/// A freshly installed limiter must start empty like `new` does, or the next instant admits a
+	/// full extra burst on top of traffic already sent this second.
+	#[tokio::test]
+	async fn set_rate_drains_initial_burst() {
+		let limiter = RateLimiter::default();
+		limiter
+			.change_rate_per_sec(Some(NonZeroU32::new(1).unwrap()))
+			.await;
+
+		// With the burst drained the first acquire must wait ~1s for a cell; without the drain the
+		// fresh bucket admits immediately.
+		let acquired_immediately =
+			tokio::time::timeout(Duration::from_millis(100), limiter.acquire())
+				.await
+				.is_ok();
+		assert!(
+			!acquired_immediately,
+			"the first acquire after set_rate returned immediately — the initial burst was not \
+			 drained"
 		);
 	}
 }
