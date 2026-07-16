@@ -829,17 +829,21 @@ impl Client {
 
 	pub async fn duplicate_note(&self, note: &mut Note) -> Result<Note, Error> {
 		let _lock = self.lock_notes().await?;
-		let content = self.get_note_content(note).await?;
+		// `get_note_content` returns `None` only when the source content fails to decrypt
+		// (genuinely empty content is `Some("")`). Substituting "" here would silently create
+		// an empty "duplicate" and report success, so surface the failure instead.
+		let content = self.get_note_content(note).await?.ok_or_else(|| {
+			Error::custom(
+				ErrorKind::Conversion,
+				"cannot duplicate note: source content could not be decrypted",
+			)
+		})?;
 
 		let mut new = self.create_note(note.title.clone()).await?;
-		self.set_note_content(
-			&mut new,
-			content.as_deref().unwrap_or(""),
-			note.preview.clone().unwrap_or_default(),
-		)
-		.await?;
+		self.set_note_content(&mut new, &content, note.preview.clone().unwrap_or_default())
+			.await?;
 
-		self.set_note_type(&mut new, note.note_type, content.as_deref())
+		self.set_note_type(&mut new, note.note_type, Some(content.as_str()))
 			.await?;
 		Ok(new)
 	}
