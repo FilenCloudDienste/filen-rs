@@ -193,7 +193,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 pub struct DirPublicLink {
 	pub(crate) link_uuid: Uuid,
 	pub(crate) link_key: MetaKey,
-	pub(crate) password: Option<String>,
+	pub(crate) password: PasswordState,
 	pub(crate) enable_download: bool,
 	pub(crate) salt: LinkPasswordSalt,
 }
@@ -212,13 +212,19 @@ impl DirPublicLink {
 	}
 
 	pub fn set_password(&mut self, password: String) {
-		self.password = Some(password);
+		self.password = PasswordState::Known(password);
 	}
 
 	pub(crate) fn get_password_hash(&self) -> Result<LinkHashedPassword<'_>, Error> {
+		let password = match &self.password {
+			PasswordState::None => None,
+			PasswordState::Known(password) => Some(password.as_str()),
+			PasswordState::Hashed(password_hash) => {
+				return Ok(password_hash.as_borrowed_cow());
+			}
+		};
 		Ok(crate::crypto::connect::derive_password_for_link(
-			self.password.as_deref(),
-			&self.salt,
+			password, &self.salt,
 		)?)
 	}
 }
@@ -245,11 +251,7 @@ impl TryFrom<DirPublicLinkRW> for DirPublicLink {
 					"Cannot convert DirPublicLinkRW without decrypted link key to DirPublicLink",
 				)
 			})?,
-			password: match value.password {
-				PasswordState::Known(password) => Some(password),
-				PasswordState::Hashed(_) => None,
-				PasswordState::None => None,
-			},
+			password: value.password,
 			enable_download: value.enable_download,
 			salt: value.salt,
 		})
@@ -1018,7 +1020,7 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 		let link = DirPublicLink {
 			link_uuid,
 			link_key: key,
-			password: None,
+			password: PasswordState::None,
 			enable_download: resp.download_btn,
 			salt: resp.salt.unwrap_or_default(),
 		};
@@ -1038,3 +1040,45 @@ pub struct DirPublicInfo {
 }
 
 impl<T> PublicLinkSharedClientExt for T where T: SharedClient {}
+
+#[cfg(test)]
+mod tests {
+	use std::borrow::Cow;
+
+	use filen_types::{auth::MetaEncryptionVersion, crypto::LinkHashedPassword};
+
+	use super::*;
+
+	fn test_meta_key() -> MetaKey {
+		MetaKey::from_str_and_version(
+			"0123456789abcdefghijklmnopqrstuv",
+			MetaEncryptionVersion::V2,
+		)
+		.unwrap()
+	}
+
+	// An owner reading a password-protected dir link back from the server holds the accepted
+	// password only as a `Hashed` credential. Converting the read-write link into the listing
+	// link must keep that hash so `get_password_hash` sends it instead of "empty" (which the
+	// server rejects with WrongPassword).
+	#[test]
+	fn dir_public_link_rw_to_dir_public_link_preserves_hashed_password() {
+		let hashed = LinkHashedPassword(Cow::Owned("deadbeefhash".to_string()));
+		let rw = DirPublicLinkRW {
+			link_uuid: Uuid::new_v4(),
+			link_key: Some(test_meta_key()),
+			password: PasswordState::Hashed(hashed),
+			expiration: PublicLinkExpiration::Never,
+			enable_download: true,
+			salt: LinkPasswordSalt::None,
+		};
+
+		let link = DirPublicLink::try_from(rw).expect("conversion should succeed");
+
+		assert_eq!(
+			link.get_password_hash().unwrap().0,
+			Cow::Borrowed("deadbeefhash"),
+			"hashed credential must survive the conversion instead of deriving to \"empty\""
+		);
+	}
+}

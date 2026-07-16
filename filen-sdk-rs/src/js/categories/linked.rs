@@ -165,7 +165,7 @@ pub struct DirPublicLink {
 	link_uuid: Uuid,
 	link_key: String,
 	link_key_version: u8,
-	password: Option<String>,
+	password: PasswordState,
 	enable_download: bool,
 	salt: LinkPasswordSalt,
 }
