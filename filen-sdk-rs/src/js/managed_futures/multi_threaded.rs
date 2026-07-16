@@ -137,6 +137,25 @@ mod abortable {
 	#[derive(Deserialize, Default)]
 	#[serde(transparent)]
 	pub struct AbortSignal(#[serde(with = "serde_wasm_bindgen::preserve")] JsValue);
+
+	/// Removes the registered `abort` listener when the operation's future ends (whether it
+	/// completed, was cancelled, or the abort fired). Removing the listener before the `Closure`
+	/// backing it is freed prevents a later `abort()` from invoking a dropped closure, and keeps
+	/// a shared signal usable by other concurrent operations.
+	struct AbortListenerGuard {
+		signal: WasmAbortSignal,
+		closure: Closure<dyn FnMut()>,
+	}
+
+	impl Drop for AbortListenerGuard {
+		fn drop(&mut self) {
+			let _ = self.signal.remove_event_listener_with_callback(
+				"abort",
+				self.closure.as_ref().unchecked_ref(),
+			);
+		}
+	}
+
 	impl AbortSignal {
 		pub(super) fn into_future(
 			self,
@@ -155,17 +174,35 @@ mod abortable {
 				})?;
 
 				let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
-				let closure = Closure::once(move || {
-					let _ = sender.send(());
+				let mut sender = Some(sender);
+				// Register via `add_event_listener` rather than `set_onabort`: `set_onabort`
+				// replaces any existing handler, so fanning one AbortSignal out to two concurrent
+				// SDK operations (or a user-set `signal.onabort`) would clobber the others and
+				// leave them uncancellable. The guard removes this exact listener when the
+				// operation ends, so a late `abort()` can never call into a freed closure.
+				let closure = Closure::<dyn FnMut()>::new(move || {
+					if let Some(sender) = sender.take() {
+						let _ = sender.send(());
+					}
 				});
-				signal.set_onabort(Some(closure.as_ref().unchecked_ref()));
+				signal
+					.add_event_listener_with_callback("abort", closure.as_ref().unchecked_ref())
+					.map_err(|e| {
+						Error::custom(
+							ErrorKind::Conversion,
+							format!("failed to register AbortSignal listener: {e:?}"),
+						)
+					})?;
+				let guard = AbortListenerGuard { signal, closure };
 				Ok(AbortSignalFuture::Some {
 					fut: async move {
-						if signal.aborted() {
+						if guard.signal.aborted() {
 							tracing::debug!("AbortSignal already aborted, returning AbortedError");
 							return AbortedError;
 						}
-						let _closure = closure; // keep the closure alive
+						// Hold the guard for the operation's lifetime so the listener stays live
+						// and is then cleanly removed on drop.
+						let _guard = guard;
 						let _ = receiver.await;
 						tracing::debug!("AbortSignal aborted, returning AbortedError");
 						AbortedError
@@ -198,6 +235,112 @@ mod abortable {
 				AbortSignalFutureProj::None => Poll::Pending,
 				AbortSignalFutureProj::Some { fut: pinned } => pinned.poll(cx),
 			}
+		}
+	}
+
+	// Runs under `wasm-bindgen-test` on wasm32 (e.g. `wasm-pack test --node`), against the real
+	// browser/Node `AbortController`/`AbortSignal`.
+	#[cfg(all(test, target_family = "wasm", target_os = "unknown"))]
+	mod tests {
+		use std::{future::Future, time::Duration};
+
+		use futures::future::{Either, select};
+		use wasm_bindgen::JsValue;
+		use wasm_bindgen_test::wasm_bindgen_test;
+
+		use super::AbortSignal;
+		use crate::error::AbortedError;
+
+		/// Yields control once, so futures polled alongside this one reach their first `.await`
+		/// point before the next statement runs.
+		async fn yield_once() {
+			let mut yielded = false;
+			std::future::poll_fn(move |cx| {
+				if yielded {
+					std::task::Poll::Ready(())
+				} else {
+					yielded = true;
+					cx.waker().wake_by_ref();
+					std::task::Poll::Pending
+				}
+			})
+			.await
+		}
+
+		/// `true` if `fut` resolves within `ms`, `false` if it is still pending. The bound turns a
+		/// handler that never fires into a deterministic failure instead of an infinite hang.
+		async fn aborts_within<F: Future<Output = AbortedError>>(fut: F, ms: u64) -> bool {
+			let fut = std::pin::pin!(fut);
+			let timeout = std::pin::pin!(futures_timer::Delay::new(Duration::from_millis(ms)));
+			matches!(select(fut, timeout).await, Either::Left(_))
+		}
+
+		// Two operations sharing ONE AbortSignal must BOTH observe `abort()`. The old `set_onabort`
+		// design let the second registration replace the first handler, so the first operation was
+		// left uncancellable. Both futures are driven to their `receiver.await` point BEFORE
+		// `abort()` fires, so this exercises event delivery — not the synchronous `aborted()`
+		// fast path, which would mask the clobbering.
+		#[wasm_bindgen_test]
+		async fn both_operations_sharing_a_signal_are_aborted() {
+			let controller = web_sys::AbortController::new().unwrap();
+			let signal = controller.signal();
+			let first = AbortSignal(JsValue::from(signal.clone()))
+				.into_future()
+				.unwrap();
+			let second = AbortSignal(JsValue::from(signal)).into_future().unwrap();
+
+			let aborter = async {
+				yield_once().await;
+				controller.abort();
+			};
+			let (first_aborted, second_aborted, ()) = futures::join!(
+				aborts_within(first, 2000),
+				aborts_within(second, 2000),
+				aborter
+			);
+
+			assert!(
+				first_aborted,
+				"first operation was not aborted — its handler was clobbered by the second"
+			);
+			assert!(second_aborted, "second operation was not aborted");
+		}
+
+		// When an operation ends before any abort, its future (and the Drop guard) is dropped. The
+		// fix registers via `add_event_listener` and removes that listener on drop, so it NEVER
+		// touches `onabort`. The old `set_onabort` design left `onabort` pointing at the operation's
+		// now-freed `Closure::once`, so a late `abort()` invoked a freed closure.
+		#[wasm_bindgen_test]
+		async fn ending_an_operation_leaves_onabort_untouched_and_the_signal_usable() {
+			let controller = web_sys::AbortController::new().unwrap();
+			let signal = controller.signal();
+			assert!(
+				signal.onabort().is_none(),
+				"precondition: a fresh signal has no onabort handler"
+			);
+
+			// The operation registers, then ends (future + guard dropped).
+			drop(
+				AbortSignal(JsValue::from(signal.clone()))
+					.into_future()
+					.unwrap(),
+			);
+
+			// The fix never sets `onabort`; the old design would leave it referencing the freed
+			// closure here.
+			assert!(
+				signal.onabort().is_none(),
+				"onabort must stay unset — the fix registers via add_event_listener, not set_onabort"
+			);
+
+			// A late abort is a safe no-op and leaves the signal usable: a fresh operation
+			// registered afterwards still resolves (via the already-aborted fast path).
+			controller.abort();
+			let late = AbortSignal(JsValue::from(signal)).into_future().unwrap();
+			assert!(
+				aborts_within(late, 2000).await,
+				"signal was left unusable after the guarded drop + late abort"
+			);
 		}
 	}
 }
