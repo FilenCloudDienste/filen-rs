@@ -578,6 +578,7 @@ pub struct ContactRequestReceived {
 	pub sender_nick_name: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		serde(with = "chrono::serde::ts_milliseconds"),
 		tsify(type = "bigint")
 	)]
 	pub sent_timestamp: DateTime<Utc>,
