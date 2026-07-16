@@ -220,7 +220,9 @@ impl From<JsClientConfig> for ClientConfig {
 	fn from(value: JsClientConfig) -> Self {
 		let mut config = ClientConfig::default();
 		if let Some(concurrency) = value.concurrency {
-			config = config.with_concurrency(concurrency as usize);
+			// A zero-permit concurrency limiter makes every request await its permit forever; treat
+			// 0 (a natural "unlimited" assumption from FFI callers) as a floor of 1.
+			config = config.with_concurrency((concurrency as usize).max(1));
 		}
 		if let Some(rate_limit_per_sec) = value.rate_limit_per_sec
 			&& let Some(nz) = NonZeroU32::new(rate_limit_per_sec)
@@ -241,8 +243,12 @@ impl From<JsClientConfig> for ClientConfig {
 			config = config.with_log_level(log_level);
 		}
 		if let Some(file_io_memory_budget) = value.file_io_memory_budget {
-			config =
-				config.with_memory_budget(file_io_memory_budget.try_into().unwrap_or(usize::MAX));
+			// tokio's Semaphore panics above MAX_PERMITS (usize::MAX >> 3), so clamp the budget to
+			// that ceiling instead of overflowing into a construction-time panic.
+			let budget = usize::try_from(file_io_memory_budget)
+				.unwrap_or(usize::MAX)
+				.min(tokio::sync::Semaphore::MAX_PERMITS);
+			config = config.with_memory_budget(budget);
 		}
 		config
 	}
@@ -1268,5 +1274,50 @@ mod memory_budget_validation_tests {
 
 		// the platform defaults must remain valid.
 		SharedClientState::new(ClientConfig::default()).expect("the default budget must be valid");
+	}
+}
+
+#[cfg(all(test, feature = "uniffi"))]
+mod js_client_config_tests {
+	use super::{ClientConfig, JsClientConfig};
+
+	fn base() -> JsClientConfig {
+		JsClientConfig {
+			concurrency: None,
+			rate_limit_per_sec: None,
+			upload_bandwidth_kilobytes_per_sec: None,
+			download_bandwidth_kilobytes_per_sec: None,
+			log_level: None,
+			file_io_memory_budget: None,
+		}
+	}
+
+	/// concurrency 0 (a natural "unlimited" assumption from FFI callers) must not become a
+	/// zero-permit limiter that makes every request await its permit forever.
+	#[test]
+	fn zero_concurrency_is_clamped_to_one() {
+		let config = ClientConfig::from(JsClientConfig {
+			concurrency: Some(0),
+			..base()
+		});
+		assert_eq!(
+			config.concurrency, 1,
+			"concurrency 0 must be clamped to 1, not left as a zero-permit (hang-forever) limiter"
+		);
+	}
+
+	/// An oversized memory budget must be clamped instead of panicking tokio's Semaphore::new,
+	/// which rejects any permit count above MAX_PERMITS (usize::MAX >> 3).
+	#[test]
+	fn huge_memory_budget_is_clamped_to_semaphore_max() {
+		let config = ClientConfig::from(JsClientConfig {
+			file_io_memory_budget: Some(u64::MAX),
+			..base()
+		});
+		assert_eq!(
+			config.file_io_memory_budget,
+			tokio::sync::Semaphore::MAX_PERMITS,
+			"an oversized budget must be clamped to Semaphore::MAX_PERMITS to avoid a panic"
+		);
 	}
 }
