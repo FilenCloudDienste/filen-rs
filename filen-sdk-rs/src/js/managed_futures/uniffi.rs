@@ -117,8 +117,14 @@ mod abortable {
 							return AbortedError;
 						}
 						if receiver.changed().await.is_err() {
-							// sender dropped, treat as not aborted
-							return AbortedError;
+							// The controller (sender) was dropped without an explicit abort. Treat
+							// this as "not aborted": a dropped controller means no further abort
+							// signals can arrive, NOT that the in-flight operation should be
+							// cancelled. Returning AbortedError here would spuriously cancel an
+							// upload/download whenever the app failed to retain the controller
+							// (GC/ARC finalization mid-transfer). Never resolve instead, so this
+							// branch cannot cancel the operation.
+							return std::future::pending::<AbortedError>().await;
 						}
 					}
 				},
@@ -149,6 +155,25 @@ mod abortable {
 				AbortSignalFutureProj::None => Poll::Pending,
 				AbortSignalFutureProj::Some { fut: pinned } => pinned.poll(cx),
 			}
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn dropped_controller_does_not_abort() {
+			futures::executor::block_on(async {
+				let controller = ManagedAbortController::new();
+				let mut fut = std::pin::pin!(controller.signal().into_future());
+				// Drop the controller (the only watch sender) without an explicit abort.
+				drop(controller);
+				// The sender is gone, so `changed()` resolves to Err on the first poll. The
+				// future must stay Pending rather than resolve to AbortedError: a dropped
+				// controller must never cancel the in-flight operation.
+				assert!(futures::poll!(fut.as_mut()).is_pending());
+			});
 		}
 	}
 }
