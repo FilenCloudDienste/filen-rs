@@ -34,7 +34,10 @@ pub struct DecryptedFileMeta {
 	pub modified: DateTime<Utc>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		tsify(type = "Uint8Array"),
+		// `Blake3Hash` (de)serializes as a hex string, not raw bytes, so the TS type must be
+		// `string` — declaring `Uint8Array` breaks both export (consumers treating it as bytes)
+		// and import (`SizedHexString` rejects a `Uint8Array` on `from_wasm_abi`).
+		tsify(type = "string"),
 		serde(skip_serializing_if = "Option::is_none", default)
 	)]
 	pub hash: Option<Blake3Hash>,
