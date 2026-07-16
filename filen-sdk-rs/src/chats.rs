@@ -531,6 +531,7 @@ impl Client {
 			)),
 			self.lock_chats()
 		);
+		let _lock = _lock?;
 		let resp = api::v3::chat::conversations::participants::add::post(
 			self.client(),
 			&api::v3::chat::conversations::participants::add::Request {
@@ -567,6 +568,7 @@ impl Client {
 			)),
 			self.lock_chats()
 		);
+		let _lock = _lock?;
 
 		let req = api::v3::chat::conversations::create::Request {
 			uuid,
