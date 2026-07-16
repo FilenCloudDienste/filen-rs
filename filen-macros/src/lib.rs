@@ -144,11 +144,15 @@ where
 	let mut args: Vec<proc_macro2::TokenStream> = Vec::new();
 	for (og_param, new_param) in item.inputs().iter().zip(new_item.mut_inputs().iter_mut()) {
 		if let FnArg::Receiver(receiver) = og_param {
+			// Any receiver — `&self`, `self: Arc<Self>`, or by-value `self` — is a
+			// method, not a static fn, so it must carry the `uniffi::method` rename
+			// (otherwise the wrapper is exported under its mangled `uniffi_` name).
+			fn_prefix = SelfPrefix::Method;
 			if receiver.reference.is_none() {
-				args.push(quote!(self));
+				// `self`/`Arc<Self>` is already the receiver: leave it in place and
+				// let the body call through `self.`; don't pass it as an argument.
 				continue;
 			}
-			fn_prefix = SelfPrefix::Method;
 			*new_param = syn::parse_quote!(self: std::sync::Arc<Self>);
 		} else if let (FnArg::Typed(pat_type), FnArg::Typed(new_pat_type)) = (og_param, new_param) {
 			let arg_name = &new_pat_type.pat;
@@ -1689,4 +1693,69 @@ struct JsTypeState {
 	tagged: bool,
 	untagged: bool,
 	wasm_condition: TokenStream2,
+}
+
+#[cfg(test)]
+mod uniffi_wrapper_tests {
+	use super::*;
+
+	/// Whitespace-insensitive token comparison helper.
+	fn compact(item: &syn::ImplItemFn) -> String {
+		quote!(#item)
+			.to_string()
+			.chars()
+			.filter(|c| !c.is_whitespace())
+			.collect()
+	}
+
+	#[test]
+	fn arc_self_method_keeps_ffi_name_and_calls_through_self() {
+		let mut method: syn::ImplItemFn = syn::parse_quote! {
+			async fn get_thumbnail(self: std::sync::Arc<Self>, size: u32) -> Vec<u8> {
+				Vec::new()
+			}
+		};
+		let wrapper = get_wrapper_fn(&mut method).unwrap();
+		let tokens = compact(&wrapper);
+
+		// The wrapper must be renamed back to the original FFI name...
+		assert!(
+			tokens.contains(r#"uniffi::method(name="get_thumbnail")"#),
+			"missing method rename attribute: {tokens}"
+		);
+		// ...defined under the mangled internal name...
+		assert!(tokens.contains("uniffi_get_thumbnail"), "tokens: {tokens}");
+		// ...and its body must call the original method through `self.`, passing
+		// only the real argument. A double-self bug would emit
+		// `self.get_thumbnail(self,size)`, of which `self.get_thumbnail(size)` is
+		// not a substring; the old code emitted `Self::get_thumbnail(self,size)`.
+		assert!(
+			tokens.contains("self.get_thumbnail(size)"),
+			"body should call self.get_thumbnail(size): {tokens}"
+		);
+		assert!(
+			!tokens.contains("Self::get_thumbnail"),
+			"Arc<Self> receiver should not be called as a static fn: {tokens}"
+		);
+	}
+
+	#[test]
+	fn ref_self_method_still_renamed() {
+		let mut method: syn::ImplItemFn = syn::parse_quote! {
+			async fn refresh(&self, force: bool) -> bool {
+				force
+			}
+		};
+		let wrapper = get_wrapper_fn(&mut method).unwrap();
+		let tokens = compact(&wrapper);
+
+		assert!(
+			tokens.contains(r#"uniffi::method(name="refresh")"#),
+			"missing method rename attribute: {tokens}"
+		);
+		assert!(
+			tokens.contains("self.refresh(force)"),
+			"body should call self.refresh(force): {tokens}"
+		);
+	}
 }
