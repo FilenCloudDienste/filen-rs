@@ -192,6 +192,12 @@ pub(crate) enum CacheEventMaybeDecrypted<'a> {
 	FrontierAdvance {
 		id: u64,
 	},
+	/// A socket reconnect (`DecryptedSocketEvent::Reconnecting`). It carries no applied state and
+	/// is never persisted; it cues the worker to gap-check the disconnect window, because the
+	/// socket does not redeliver drive events that landed while it was down. Without this, a hole
+	/// opened during the reconnect window only heals on the next unrelated drive event or the next
+	/// worker boot.
+	ResyncSignal,
 }
 
 impl<'a> CacheEventMaybeDecrypted<'a> {
@@ -228,6 +234,11 @@ impl<'a> CacheEventMaybeDecrypted<'a> {
 					id: *drive_message_id,
 				})
 			}
+			// A reconnect: the socket won't redeliver drive events missed during the
+			// disconnect window, so signal the worker to gap-check proactively. (The initial
+			// connect fires AuthSuccess, not Reconnecting, and is already covered by the
+			// startup gap-check, so only Reconnecting is routed here.)
+			DecryptedSocketEvent::Reconnecting => Some(Self::ResyncSignal),
 			_ => None,
 		}
 	}

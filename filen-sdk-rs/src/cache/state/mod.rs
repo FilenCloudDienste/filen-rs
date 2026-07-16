@@ -517,7 +517,7 @@ impl CacheState {
 		// 2. Catch up on changes that landed while the cache was entirely offline (a durably-flagged
 		//    hole, or the remote drive id having advanced past our watermark).
 		self.drain_pending(None);
-		self.maybe_run_startup_resync().await;
+		self.run_gap_check().await;
 		loop {
 			// `biased` checks arms top-down: control (shutdown) first, then search read tasks
 			// (quick SELECTs — prioritized over events so a sustained event flood can never
@@ -555,9 +555,17 @@ impl CacheState {
 						self.drain_pending(None); // don't drop buffered events on disconnect
 						return;
 					};
-					self.drain_pending(Some(event));
-					// A drain that observed a hole/corrupt row/failed apply set needs_resync; heal it now.
-					self.maybe_run_resync().await;
+					let reconnected = self.drain_pending(Some(event));
+					if reconnected {
+						// A reconnect is a SUSPICION of a gap, not an observed hole: cheaply gap-check
+						// (remote drive id vs watermark) and re-list ONLY if the drive actually
+						// advanced — never force a resync on every reconnect. The gate also folds in
+						// `needs_resync`, so any hole the drain itself observed is healed here too.
+						self.run_gap_check().await;
+					} else {
+						// A drain that observed a hole/corrupt row/failed apply set needs_resync; heal it now.
+						self.maybe_run_resync().await;
+					}
 				},
 				_ = resync_retry_sleep(self.resync_retry), if self.resync_retry.is_some() => {
 					// A previous resync attempt did not converge (drive-lock contention or a
@@ -579,6 +587,7 @@ impl CacheState {
 		event: CacheThreadEvent,
 		to_persist: &mut Vec<CacheEvent<'static>>,
 		deferred: &mut Vec<ManualEvent>,
+		reconnected: &mut bool,
 	) {
 		match event {
 			CacheThreadEvent::Socket(CacheEventMaybeDecrypted::Decrypted(cache_event)) => {
@@ -590,6 +599,12 @@ impl CacheState {
 					event: CacheEventType::NoOp,
 				});
 			}
+			// A reconnect: nothing to persist. The disconnect window may have hidden drive events
+			// the socket won't redeliver, so flag it — the caller runs a cheap gap-check. Setting a
+			// bool (not a counter) collapses a reconnect storm into one check per drain.
+			CacheThreadEvent::Socket(CacheEventMaybeDecrypted::ResyncSignal) => {
+				*reconnected = true;
+			}
 			CacheThreadEvent::Manual(manual_event) => deferred.push(manual_event),
 		}
 	}
@@ -597,14 +612,19 @@ impl CacheState {
 	/// Persist the buffered channel into `events`, apply the durable store in order, then apply any
 	/// deferred Manual (legacy `list_dir`) events. `first` is the event that woke the select loop
 	/// (already removed from the channel), or `None` when draining on shutdown/disconnect.
-	fn drain_pending(&mut self, first: Option<CacheThreadEvent>) {
+	/// Returns `true` iff a socket reconnect (`ResyncSignal`) was seen in this burst — the caller then
+	/// runs the cheap [`run_gap_check`](Self::run_gap_check). Multiple reconnects in one drain collapse
+	/// into a single `true` (one check per drain, not per event). A reconnect is NOT recorded durably:
+	/// it is a suspicion, not an observed hole, so it never touches `needs_resync`.
+	fn drain_pending(&mut self, first: Option<CacheThreadEvent>) -> bool {
 		let mut deferred = Vec::new();
 		let mut to_persist: Vec<CacheEvent<'static>> = Vec::new();
+		let mut reconnected = false;
 		if let Some(event) = first {
-			Self::classify_thread_event(event, &mut to_persist, &mut deferred);
+			Self::classify_thread_event(event, &mut to_persist, &mut deferred, &mut reconnected);
 		}
 		while let Ok(event) = self.event_receiver.try_recv() {
-			Self::classify_thread_event(event, &mut to_persist, &mut deferred);
+			Self::classify_thread_event(event, &mut to_persist, &mut deferred, &mut reconnected);
 		}
 
 		// Persist the WHOLE drained burst in ONE transaction (a single WAL commit/fsync instead of one
@@ -645,6 +665,12 @@ impl CacheState {
 				self.surface_errors(errors);
 			}
 		}
+
+		// A socket reconnect is only a SUSPICION of a disconnect-window gap — the caller runs the
+		// cheap gap-check (remote drive id vs watermark) and re-lists only if the drive advanced.
+		// It is deliberately NOT recorded in the durable `needs_resync` flag (reserved for observed
+		// holes); a crash before the check is covered by the next boot's gap-check.
+		reconnected
 	}
 
 	// TODO: distinguish a Full status channel (keep running) from a Closed one (main thread gone →
@@ -1618,25 +1644,28 @@ impl CacheState {
 		}
 	}
 
-	/// Whether a STARTUP resync is warranted, given the latest remote drive message id.
+	/// Whether the gap-check should resync, given the latest remote drive message id.
 	///
 	/// Resync iff EITHER a hole was durably flagged in a prior session (`needs_resync`), OR the remote
 	/// drive counter has advanced past our watermark — i.e. events landed on the drive while this cache
-	/// was offline (app closed / socket down) and the socket will never redeliver them. When the remote
-	/// id EQUALS the watermark, the cache is fully caught up, so we skip: this is the "do not resync if
-	/// the drive id has not increased" gate. `get_last_event_ids().drive` is the same strictly-monotonic
-	/// counter as the watermark's `drive_message_id`. A `None` watermark (nothing applied yet) compares
-	/// as `0`, so a fresh cache against a non-empty drive resyncs to populate.
-	fn startup_should_resync(&self, remote_drive_id: u64) -> Result<bool, Box<CacheError>> {
+	/// was offline (app closed / socket down / a disconnect window) and the socket will never redeliver
+	/// them. When the remote id EQUALS the watermark, the cache is fully caught up, so we skip: this is
+	/// the "do not resync if the drive id has not increased" gate. `get_last_event_ids().drive` is the
+	/// same strictly-monotonic counter as the watermark's `drive_message_id`. A `None` watermark
+	/// (nothing applied yet) compares as `0`, so a fresh cache against a non-empty drive resyncs to
+	/// populate.
+	fn should_resync_for_remote(&self, remote_drive_id: u64) -> Result<bool, Box<CacheError>> {
 		Ok(self.needs_resync()? || remote_drive_id > self.watermark()?.unwrap_or(0))
 	}
 
-	/// Startup / app-resume check (called once when the worker boots). Reads the remote drive id and
-	/// resyncs only if [`startup_should_resync`](Self::startup_should_resync) says so — catching up any
-	/// changes that landed while the cache was offline, while skipping a needless full listing when
-	/// nothing changed. Falls back to the durable-flag-only check if there is no client (unit tests) or
-	/// the remote read fails (the live socket will still surface any later hole).
-	async fn maybe_run_startup_resync(&mut self) {
+	/// Cheap gap-check: read the remote drive id and resync ONLY if it advanced past the watermark
+	/// (or a hole is durably flagged), per [`should_resync_for_remote`](Self::should_resync_for_remote).
+	/// Run both at worker boot and on every socket reconnect — a reconnect is a *suspicion* of a gap,
+	/// not a certain hole, so it must never force a resync when nothing changed (that is the difference
+	/// from `needs_resync`, which is reserved for observed holes). Falls back to the durable-flag-only
+	/// check if there is no client (unit tests) or the remote read fails (the live socket will still
+	/// surface any later hole, and the next boot's gap-check is the backstop).
+	async fn run_gap_check(&mut self) {
 		let Some(deps) = self.resync.clone() else {
 			self.maybe_run_resync().await;
 			return;
@@ -1645,31 +1674,29 @@ impl CacheState {
 			Ok(ids) => ids.drive,
 			Err(e) => {
 				tracing::warn!(
-					"startup gap-check: could not read the remote drive id ({e}); falling back to \
-					 the durable resync flag"
+					"gap-check: could not read the remote drive id ({e}); falling back to the \
+					 durable resync flag"
 				);
 				self.maybe_run_resync().await;
 				return;
 			}
 		};
-		match self.startup_should_resync(remote) {
+		match self.should_resync_for_remote(remote) {
 			Ok(true) => {
 				tracing::debug!(
-					"startup resync: remote drive id {remote} is ahead of watermark {:?} (or a hole \
-					 was flagged); catching up",
+					"gap-check: remote drive id {remote} is ahead of watermark {:?} (or a hole was \
+					 flagged); catching up",
 					self.watermark().ok().flatten()
 				);
 				self.run_resync_surfacing_errors().await;
 			}
 			Ok(false) => tracing::debug!(
-				"startup: cache is up to date (remote drive id {remote} == watermark); no resync"
+				"gap-check: cache is up to date (remote drive id {remote} == watermark); no resync"
 			),
 			// FAIL OPEN: if the decision itself errors (a `cache_meta` read failed), resync
 			// rather than skip — a needless full listing is far cheaper than silently missing a gap.
 			Err(e) => {
-				tracing::warn!(
-					"startup gap-check failed to read cache state; resyncing to be safe"
-				);
+				tracing::warn!("gap-check failed to read cache state; resyncing to be safe");
 				self.surface_one(e);
 				self.run_resync_surfacing_errors().await;
 			}
@@ -1777,8 +1804,12 @@ impl CacheState {
 					acquired = &mut acquire => break acquired,
 					event = self.event_receiver.recv() => match event {
 						// `drain_pending` also drains the rest of the channel and handles its own
-						// errors, so one recv keeps the whole backlog applied during the wait.
-						Some(event) => self.drain_pending(Some(event)),
+						// errors, so one recv keeps the whole backlog applied during the wait. A
+						// reconnect seen here is subsumed by the resync already in progress, so its
+						// gap-check signal is discarded.
+						Some(event) => {
+							self.drain_pending(Some(event));
+						}
 						// Channel closed = all event senders gone = the worker is shutting down.
 						// Abandon the resync (don't wait out the lock). Mark `needs_resync` so next
 						// session re-runs it — consistent with every other non-converged exit here;

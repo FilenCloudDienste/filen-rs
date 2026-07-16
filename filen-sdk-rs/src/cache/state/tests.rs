@@ -55,6 +55,88 @@ fn drive_malformed_event_maps_to_frontier_advance() {
 	}
 }
 
+/// A socket reconnect must NOT be dropped: it maps to a resync signal so the disconnect-window
+/// gap is closed. The initial-connect meta-events (AuthSuccess/AuthFailed) are covered by the
+/// startup path and stay unmapped, so they do not force a spurious resync on every connect.
+#[test]
+fn reconnecting_maps_to_resync_signal_others_dropped() {
+	use crate::socket::DecryptedSocketEvent;
+
+	assert!(matches!(
+		CacheEventMaybeDecrypted::from_decrypted_event(&DecryptedSocketEvent::Reconnecting),
+		Some(CacheEventMaybeDecrypted::ResyncSignal)
+	));
+	assert!(
+		CacheEventMaybeDecrypted::from_decrypted_event(&DecryptedSocketEvent::AuthSuccess)
+			.is_none()
+	);
+	assert!(
+		CacheEventMaybeDecrypted::from_decrypted_event(&DecryptedSocketEvent::AuthFailed).is_none()
+	);
+}
+
+/// Draining a reconnect signal REQUESTS the cheap gap-check (drain returns `true`) but does NOT
+/// touch the durable `needs_resync` flag — a reconnect is a suspicion, not an observed hole, so it
+/// must not force a resync. (Pins the redesign: the old code marked `needs_resync` here.)
+#[test]
+fn reconnect_signal_requests_gap_check_without_durable_flag() {
+	let mut state = CacheState::new_in_memory();
+	assert!(!state.needs_resync().unwrap(), "starts clear");
+
+	let reconnected = state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::ResyncSignal,
+	)));
+
+	assert!(
+		reconnected,
+		"draining a reconnect must request a gap-check (drain returns true)"
+	);
+	assert!(
+		!state.needs_resync().unwrap(),
+		"a reconnect is a suspicion, not an observed hole — it must NOT set the durable flag"
+	);
+}
+
+/// A reconnect storm (several `ResyncSignal`s in one drain) collapses into a SINGLE gap-check
+/// request — one check per drain, not one per event — and still never flags the durable resync.
+#[test]
+fn reconnect_burst_collapses_to_one_gap_check() {
+	let (mut state, producer) = CacheState::new_in_memory_with_producer();
+	for _ in 0..3 {
+		producer
+			.events
+			.try_send(CacheThreadEvent::Socket(
+				CacheEventMaybeDecrypted::ResyncSignal,
+			))
+			.unwrap();
+	}
+
+	// One drain consumes the whole burst and reports a single gap-check request.
+	let reconnected = state.drain_pending(None);
+
+	assert!(
+		reconnected,
+		"a reconnect burst requests exactly one gap-check"
+	);
+	assert!(
+		!state.needs_resync().unwrap(),
+		"a reconnect burst must not set the durable resync flag"
+	);
+}
+
+/// A drain with NO reconnect signal does not request a gap-check.
+#[test]
+fn drain_without_reconnect_requests_no_gap_check() {
+	let mut state = CacheState::new_in_memory();
+	let reconnected = state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::FrontierAdvance { id: 7 },
+	)));
+	assert!(
+		!reconnected,
+		"a non-reconnect drain must not request a gap-check"
+	);
+}
+
 /// a `FileMove` whose new parent is a non-navigable virtual container (here `Links`)
 /// takes the file out of the synced tree, so it must convert to `FileEvent::Removed` rather than
 /// failing conversion (which would make it a frontier-advance-only event and leave a stale row).
@@ -342,40 +424,45 @@ fn resync_move_out_of_deleted_parent_preserves_subtree() {
 	assert_eq!(item_parent(&state, f.uuid), Some(m.uuid), "F stays under M");
 }
 
-/// The startup gap-check: resync iff a hole is flagged OR the remote drive id advanced past the
-/// watermark. Crucially, an UNCHANGED drive id (remote == watermark) must NOT resync.
+/// The gap-check gate shared by the startup check AND the reconnect check: resync iff a hole is
+/// flagged OR the remote drive id advanced past the watermark. Crucially, an UNCHANGED drive id
+/// (remote == watermark) must NOT resync — this is what makes a reconnect on a quiet account (or a
+/// reconnect storm) cheap: the gap-check reads the remote id and skips the re-list.
 #[test]
-fn startup_should_resync_gates_on_drive_id_advance() {
+fn should_resync_for_remote_gates_on_drive_id_advance() {
 	let state = CacheState::new_in_memory();
 
 	// Fresh cache (watermark None): a non-empty drive resyncs to populate; an empty drive does not.
 	assert!(
-		state.startup_should_resync(5000).unwrap(),
+		state.should_resync_for_remote(5000).unwrap(),
 		"fresh cache + non-empty drive → resync"
 	);
 	assert!(
-		!state.startup_should_resync(0).unwrap(),
+		!state.should_resync_for_remote(0).unwrap(),
 		"fresh cache + empty drive → nothing to populate"
 	);
 
 	state.set_watermark(100).unwrap();
+	// The reconnect case the owner cares about: reconnect on an unchanged drive → NO resync.
 	assert!(
-		!state.startup_should_resync(100).unwrap(),
-		"remote == watermark → NO resync (nothing changed while offline)"
+		!state.should_resync_for_remote(100).unwrap(),
+		"remote == watermark → NO resync (nothing changed during the disconnect window)"
+	);
+	// The reconnect case that DOES need a resync: the drive advanced while we were disconnected.
+	assert!(
+		state.should_resync_for_remote(101).unwrap(),
+		"remote > watermark → resync (changes landed while offline)"
 	);
 	assert!(
-		state.startup_should_resync(101).unwrap(),
-		"remote > watermark → resync (offline changes)"
-	);
-	assert!(
-		!state.startup_should_resync(99).unwrap(),
+		!state.should_resync_for_remote(99).unwrap(),
 		"remote < watermark (anomalous) → no resync"
 	);
 
-	// A durably-flagged hole forces a resync even when the drive id did not advance.
+	// A durably-flagged hole (observed elsewhere) forces a resync even when the drive id did not
+	// advance — the gate folds `needs_resync` in for both the startup and reconnect paths.
 	state.mark_needs_resync().unwrap();
 	assert!(
-		state.startup_should_resync(100).unwrap(),
+		state.should_resync_for_remote(100).unwrap(),
 		"a flagged hole overrides the equal-id skip"
 	);
 }
