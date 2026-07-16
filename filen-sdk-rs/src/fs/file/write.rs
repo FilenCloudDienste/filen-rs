@@ -126,6 +126,14 @@ where
 	}
 }
 
+/// Whether accepting another non-empty `buf` would carry the total written bytes past a declared
+/// `known_size`. A reader that yields more than its declared size (e.g. the file was appended to
+/// between the stat and the read) would otherwise stall on a zero-capacity final chunk and surface
+/// an opaque [`std::io::ErrorKind::WriteZero`]; detecting the overflow lets us report it clearly.
+fn would_exceed_known_size(known_size: Option<u64>, written: u64, buf_len: usize) -> bool {
+	known_size.is_some_and(|size| written >= size) && buf_len > 0
+}
+
 impl<'a, F, Fut> FileWriterUploadingState<'a, F, Fut>
 where
 	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
@@ -194,6 +202,18 @@ where
 	}
 
 	pub fn write_next_chunk(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+		// A reader that yields more than the caller's declared size would otherwise stall on a
+		// zero-capacity final chunk and fail with an opaque WriteZero, orphaning the already
+		// uploaded chunks. Surface the size mismatch with a descriptive error instead.
+		if would_exceed_known_size(self.size, self.written, buf.len()) {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"reader produced more bytes than the declared size of {} bytes",
+					self.size.unwrap_or_default()
+				),
+			));
+		}
 		// take the chunk out of curr_chunk
 		let mut chunk = match self.curr_chunk.take() {
 			Some(cursor) => cursor,
@@ -831,5 +851,34 @@ where
 				unreachable!("Should be handled by the first part of this function")
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::would_exceed_known_size;
+
+	#[test]
+	fn unbounded_size_never_overflows() {
+		assert!(!would_exceed_known_size(None, 0, 4096));
+		assert!(!would_exceed_known_size(None, u64::MAX, 1));
+	}
+
+	#[test]
+	fn within_declared_size_is_not_overflow() {
+		// Room remains before the declared size.
+		assert!(!would_exceed_known_size(Some(100), 40, 60));
+		// Exactly reached the declared size with nothing more to write (final flush/close).
+		assert!(!would_exceed_known_size(Some(100), 100, 0));
+	}
+
+	#[test]
+	fn bytes_past_declared_size_overflow() {
+		// The declared size is reached but the reader still has bytes.
+		assert!(would_exceed_known_size(Some(100), 100, 1));
+		// Already past the declared size (defensive).
+		assert!(would_exceed_known_size(Some(100), 101, 1));
+		// A zero declared size with any incoming byte is an overflow.
+		assert!(would_exceed_known_size(Some(0), 0, 1));
 	}
 }
