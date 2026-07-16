@@ -119,7 +119,10 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 						if let Err(e) = std::fs::create_dir(&path)
 							&& e.kind() != std::io::ErrorKind::AlreadyExists
 						{
-							entry_complete_sender
+							// A send error means the receiver was dropped — the
+							// caller cancelled the download. Stop gracefully
+							// rather than panicking this detached blocking thread.
+							if entry_complete_sender
 								.blocking_send((
 									Err(e.with_context(
 										"couldn't create directory during dir download",
@@ -127,7 +130,10 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 									path.into_string(),
 									NonRootItemType::<Self>::Dir(Cow::Owned(dir)),
 								))
-								.unwrap();
+								.is_err()
+							{
+								return Ok(());
+							}
 							continue;
 						}
 						if let Err(e) = dir.blocking_set_dir_times(path.as_ref()) {
@@ -136,7 +142,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 								path,
 								e
 							);
-							entry_complete_sender
+							if entry_complete_sender
 								.blocking_send((
 									Err(e.with_context(
 										"couldn't set directory times during dir download",
@@ -144,22 +150,31 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 									path.into_string(),
 									NonRootItemType::<Self>::Dir(Cow::Owned(dir)),
 								))
-								.unwrap();
+								.is_err()
+							{
+								return Ok(());
+							}
 							continue;
 						}
-						entry_complete_sender
+						if entry_complete_sender
 							.blocking_send((
 								Ok(()),
 								path.into_string(),
 								NonRootItemType::<Self>::Dir(Cow::Owned(dir)),
 							))
-							.unwrap();
+							.is_err()
+						{
+							return Ok(());
+						}
 					}
 					Entry::File(file_entry) => {
 						let file = file_entry.extra_data().clone();
-						file_download_request_sender
+						if file_download_request_sender
 							.blocking_send((file, path))
-							.unwrap();
+							.is_err()
+						{
+							return Ok(());
+						}
 					}
 				}
 			}
