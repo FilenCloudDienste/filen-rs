@@ -276,18 +276,19 @@ impl CacheSearch {
 		end: u64,
 		listener: Arc<dyn CacheSearchWindowListener>,
 	) -> Result<CacheSearchWindow, Error> {
+		// Ordered dispatch: snapshots reach the foreign listener in the engine's emission order.
+		// Per-snapshot spawn_blocking could deliver a stale snapshot last, showing outdated
+		// results as final.
+		let sender =
+			crate::cache::js_impl::spawn_ordered_dispatch(move |snapshot: CacheSearchSnapshot| {
+				listener.on_snapshot(snapshot);
+			});
 		let (snapshot, handle) = self
 			.get_range_inner(
 				start,
 				end,
 				Box::new(move |snapshot| {
-					let listener = Arc::clone(&listener);
-					let snapshot = CacheSearchSnapshot::from(snapshot);
-					// House callback discipline: the foreign call runs on a blocking thread,
-					// never on the engine task delivering the snapshot.
-					tokio::task::spawn_blocking(move || {
-						listener.on_snapshot(snapshot);
-					});
+					let _ = sender.send(CacheSearchSnapshot::from(snapshot));
 				}),
 			)
 			.await?;
