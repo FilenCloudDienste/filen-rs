@@ -150,6 +150,43 @@ pub trait ZipProgressCallback: Fn(u64, u64, u64, u64) + Send + Sync {}
 
 impl<T> ZipProgressCallback for T where T: Fn(u64, u64, u64, u64) + Send + Sync {}
 
+/// True if `name` is safe to use as a single component in a portable zip entry
+/// path (Zip Slip). Zip entry names come from decrypted remote metadata and the
+/// archive may be extracted on any OS, so this rejects — on every platform — an
+/// empty name, `.`/`..`, either path separator, and a Windows drive-relative
+/// prefix (`C:evil`, which resets the extraction destination on Windows).
+/// Legitimate names never contain these, so callers fall back to the item UUID
+/// (always a safe component) rather than dropping the entry.
+fn is_safe_zip_component(name: &str) -> bool {
+	fn starts_with_drive_letter(name: &str) -> bool {
+		let bytes = name.as_bytes();
+		bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+	}
+	!name.is_empty()
+		&& name != "."
+		&& name != ".."
+		&& !name.contains(['/', '\\'])
+		&& !starts_with_drive_letter(name)
+}
+
+/// Joins `name` onto `parent_path` as a zip entry path, first confining `name`
+/// to a safe single component — falling back to `uuid` (always safe) on a
+/// Zip-Slip-unsafe name so the entry is still archived, just under a
+/// non-traversing path. `parent_path` is already composed of confined
+/// components and carries no trailing slash.
+fn zip_entry_path(parent_path: &str, name: &str, uuid: &str) -> String {
+	let component = if is_safe_zip_component(name) {
+		name
+	} else {
+		uuid
+	};
+	if parent_path.is_empty() {
+		component.to_string()
+	} else {
+		format!("{parent_path}/{component}")
+	}
+}
+
 /// Standalone zip helper functions that work with any `SharedClient` implementor
 /// (both `Client` and `UnauthClient`), enabling cross-category zip downloads.
 pub(crate) mod helpers {
@@ -173,7 +210,7 @@ pub(crate) mod helpers {
 			file::{
 				client_impl::FileReaderSharedClientExt, enums::RemoteFileType, traits::HasFileInfo,
 			},
-			zip::{ZipProgressCallback, ZipState, add_dir_times, add_file_times},
+			zip::{ZipProgressCallback, ZipState, add_dir_times, add_file_times, zip_entry_path},
 		},
 		util::{MaybeSendBoxFuture, MaybeSendSync},
 	};
@@ -210,11 +247,12 @@ pub(crate) mod helpers {
 				return Ok(());
 			}
 		};
-		let name = if parent_path.is_empty() {
-			file_name.to_string()
-		} else {
-			format!("{}/{}", parent_path, file_name)
-		};
+		// Confine a hostile decrypted name (Zip Slip): a name like "../../evil"
+		// or one containing a separator would traverse out of the target
+		// directory when the archive is extracted. Fall back to the uuid (always
+		// a safe component) rather than dropping the file.
+		let uuid = file.uuid().to_string();
+		let name = zip_entry_path(parent_path, file_name, &uuid);
 		let mut builder = ZipEntryBuilder::new(name.into(), async_zip::Compression::Stored)
 			.uncompressed_size(file.size());
 
@@ -325,17 +363,17 @@ pub(crate) mod helpers {
 	{
 		let dir_path = match dir {
 			DirType::Root(_) => Cow::Borrowed(parent_path),
-			DirType::Dir(dir) if parent_path.is_empty() => match dir.name() {
-				Some(n) => Cow::Borrowed(n),
-				None => Cow::Owned(dir.uuid().to_string()),
-			},
-			DirType::Dir(dir) => Cow::Owned(format!(
-				"{}/{}",
-				parent_path,
-				dir.name()
-					.map(|s| s.to_string())
-					.unwrap_or_else(|| dir.uuid().to_string())
-			)),
+			// Same Zip-Slip confinement as files: an unsafe (or absent) dir name
+			// falls back to the uuid so the whole subtree is still archived, just
+			// under a non-traversing path component.
+			DirType::Dir(dir) => {
+				let uuid = dir.uuid().to_string();
+				Cow::Owned(zip_entry_path(
+					parent_path,
+					dir.name().unwrap_or(&uuid),
+					&uuid,
+				))
+			}
 		};
 
 		let (dirs, files) =
@@ -1087,5 +1125,63 @@ mod unauth_js_client_impl {
 				})?
 				.await
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{is_safe_zip_component, zip_entry_path};
+
+	#[test]
+	fn zip_component_rejects_traversal_and_separators() {
+		for bad in [
+			"..",
+			".",
+			"",
+			"../evil",
+			"../../../evil",
+			"a/b",
+			"a\\b",
+			"..\\..\\evil",
+			"/etc/passwd",
+			"C:evil",
+			"c:evil",
+		] {
+			assert!(!is_safe_zip_component(bad), "{bad:?} should be unsafe");
+		}
+	}
+
+	#[test]
+	fn zip_component_accepts_legitimate_names() {
+		for good in [
+			"file.txt",
+			"..evil",
+			"...",
+			"a..b",
+			"photo (1).jpg",
+			"résumé.pdf",
+			"file:stream",
+		] {
+			assert!(is_safe_zip_component(good), "{good:?} should be safe");
+		}
+	}
+
+	#[test]
+	fn zip_entry_path_falls_back_to_uuid_for_unsafe_names() {
+		assert_eq!(
+			zip_entry_path("parent", "../../evil", "uuid-1"),
+			"parent/uuid-1"
+		);
+		assert_eq!(zip_entry_path("", "../../evil", "uuid-1"), "uuid-1");
+		assert_eq!(zip_entry_path("a/b", "c/d", "uuid-2"), "a/b/uuid-2");
+	}
+
+	#[test]
+	fn zip_entry_path_keeps_safe_names() {
+		assert_eq!(
+			zip_entry_path("parent", "file.txt", "uuid"),
+			"parent/file.txt"
+		);
+		assert_eq!(zip_entry_path("", "file.txt", "uuid"), "file.txt");
 	}
 }
