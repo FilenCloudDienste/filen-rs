@@ -174,6 +174,13 @@ mod boxed {
 						last_update_time = Instant::now();
 					}
 				}
+				// Fire a final callback with the full collected length, mirroring the native
+				// path's `Poll::Ready(None)` branch. Without this, a chunk that arrives within
+				// CALLBACK_INTERVAL reports no progress, so fast wasm downloads sit at 0% until
+				// completion.
+				if let Some(callback) = &callback {
+					callback(collected.len() as u64, real_content_length);
+				}
 				Ok(collected)
 			});
 			DownloadWithCallbackFuture { fut }
