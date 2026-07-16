@@ -319,7 +319,7 @@ impl JsClient {
 	) -> Result<DirPublicLinkRW, Error> {
 		use crate::runtime;
 		use wasm_bindgen::JsValue;
-		let callback = if callback.is_undefined() {
+		let callback = if callback.is_undefined() || callback.is_null() {
 			None
 		} else {
 			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -364,7 +364,7 @@ impl JsClient {
 		use crate::runtime;
 		use wasm_bindgen::JsValue;
 
-		let callback = if callback.is_undefined() {
+		let callback = if callback.is_undefined() || callback.is_null() {
 			None
 		} else {
 			let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -984,7 +984,7 @@ where
 	use crate::runtime;
 	use wasm_bindgen::JsValue;
 
-	let callback = if callback.is_undefined() {
+	let callback = if callback.is_undefined() || callback.is_null() {
 		None
 	} else {
 		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1022,7 +1022,7 @@ where
 	use crate::runtime;
 	use wasm_bindgen::JsValue;
 
-	let callback = if callback.is_undefined() {
+	let callback = if callback.is_undefined() || callback.is_null() {
 		None
 	} else {
 		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
