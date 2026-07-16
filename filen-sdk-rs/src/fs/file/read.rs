@@ -177,13 +177,20 @@ impl<'a> FileReader<'a> {
 		}
 	}
 
-	fn try_allocate_next_chunk(&self) -> Option<Chunk<'a>> {
-		let chunk_size = self.next_chunk_size()?;
-
+	/// Whether reserving one more `chunk_size`-byte chunk keeps the in-flight pipeline (already
+	/// queued fetches plus any pending blocking acquire) within `max_buffer_size`. Gates both the
+	/// eager non-blocking fill and the blocking acquire, so a single stream's read-ahead can never
+	/// grow past its budget and pin the whole shared memory budget.
+	fn within_buffer_budget(&self, chunk_size: NonZeroU32) -> bool {
 		let current_allocated = (self.allocate_chunk_future.is_some() as u64
 			+ self.futures.len() as u64)
 			* CHUNK_SIZE_U64;
-		if current_allocated + u64::from(chunk_size.get()) > self.max_buffer_size {
+		current_allocated + u64::from(chunk_size.get()) <= self.max_buffer_size
+	}
+
+	fn try_allocate_next_chunk(&self) -> Option<Chunk<'a>> {
+		let chunk_size = self.next_chunk_size()?;
+		if !self.within_buffer_budget(chunk_size) {
 			return None;
 		}
 
@@ -192,6 +199,17 @@ impl<'a> FileReader<'a> {
 
 	fn allocate_next_chunk(&self) -> Option<MaybeSendBoxFuture<'a, Chunk<'a>>> {
 		let chunk_size = self.next_chunk_size()?;
+		// Re-arm the blocking acquire while the pipeline stays within the read-ahead budget, so a
+		// single stream's pipeline never grows to the whole shared memory budget. Always keep at
+		// least one chunk in flight, though: a reader whose entire budget is below one *encrypted*
+		// chunk (the default budget for a sub-1-MiB file is the file size, one AES tag+nonce short
+		// of a full chunk) would otherwise prime nothing and return a premature EOF. The blocking
+		// acquire draws from the global memory semaphore, not `max_buffer_size`, so priming one
+		// chunk here is always satisfiable.
+		let pipeline_empty = self.futures.is_empty() && self.allocate_chunk_future.is_none();
+		if !pipeline_empty && !self.within_buffer_budget(chunk_size) {
+			return None;
+		}
 		Some(Box::pin(Chunk::acquire(chunk_size, self.client.state()))
 			as MaybeSendBoxFuture<'a, Chunk<'a>>)
 	}
@@ -620,6 +638,45 @@ mod tests {
 			0,
 			"reaching the range limit must not enqueue further chunk fetches"
 		);
+	}
+
+	#[test]
+	fn allocate_future_respects_read_ahead_budget() {
+		let client = test_client();
+		// 16-chunk file, but a read-ahead budget of only 2 encrypted chunks.
+		let file = FakeFile::new(16 * CHUNK_SIZE_U64, 16);
+		let two_chunks = 2 * (CHUNK_SIZE_U64 + u64::from(FILE_CHUNK_SIZE_EXTRA.get()));
+		let reader = FileReaderBuilder::new(&client, &file)
+			.with_max_buffer_size(two_chunks)
+			.build();
+		// The pipeline (queued fetches plus any pending blocking acquire) must stay within the
+		// 2-chunk read-ahead budget. Before the fix the blocking acquire was re-armed one past the
+		// budget, so `reserved` was 3 and, left unchecked, grew to the full shared memory budget.
+		let reserved = reader.futures.len() + reader.allocate_chunk_future.is_some() as usize;
+		assert!(
+			reserved <= 2,
+			"pipeline reserved {reserved} chunks, exceeding the 2-chunk read-ahead budget"
+		);
+		assert!(
+			reader.allocate_chunk_future.is_none(),
+			"blocking acquire must not be armed once the eager fill already fills the budget"
+		);
+	}
+
+	#[test]
+	fn single_chunk_reader_primes_a_fetch_within_a_sub_chunk_budget() {
+		let client = test_client();
+		// A sub-1-MiB file is a single chunk, and the default read-ahead budget is the file size:
+		// one AES tag+nonce short of a full *encrypted* chunk. The blocking acquire must still be
+		// primed (it draws from the global memory semaphore, not the read-ahead budget) so the
+		// reader makes progress instead of returning a premature EOF.
+		let file = FakeFile::new(10 * 1024, 1);
+		let reader = FileReaderBuilder::new(&client, &file).build();
+		assert!(
+			reader.allocate_chunk_future.is_some(),
+			"a single-chunk reader whose budget is below one encrypted chunk must still prime a fetch"
+		);
+		assert!(reader.futures.is_empty());
 	}
 
 	#[test]
