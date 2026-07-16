@@ -70,8 +70,12 @@ trait ListenerManagerExtInner: ListenerManager {
 		if let Some(event_types) = event_types {
 			for event_type in event_types {
 				if let Some(value) = self.callbacks_for_event_mut().get_mut(event_type.as_ref()) {
-					// event type is already present
-					value.push(this_id);
+					// event type is already present; guard against a duplicate entry in
+					// this same registration's event_types re-adding this id, which would
+					// make broadcast_event invoke the callback twice per matching event.
+					if !value.contains(&this_id) {
+						value.push(this_id);
+					}
 					continue;
 				} else {
 					// new event type
@@ -486,5 +490,38 @@ mod tests {
 			drive_message_id: 4,
 		};
 		assert!(manager.should_decrypt_event(&event));
+	}
+
+	// The exported bindings accept an unvalidated list of event types that can
+	// contain the same type twice. A duplicated entry must not register the
+	// listener id twice, or broadcast_event delivers the same event to the
+	// callback more than once.
+	#[test]
+	fn duplicate_event_types_register_callback_once() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		};
+
+		let mut manager = DisconnectedListenerManager::new();
+		let calls = Arc::new(AtomicUsize::new(0));
+		let calls_in_cb = calls.clone();
+
+		let event_types = [Cow::Borrowed("authSuccess"), Cow::Borrowed("authSuccess")];
+		ListenerManagerExtInner::add_listener(
+			&mut manager,
+			Box::new(move |_| {
+				calls_in_cb.fetch_add(1, Ordering::SeqCst);
+			}),
+			Some(event_types.into_iter()),
+		);
+
+		ListenerManagerExtInner::broadcast_event(&manager, &DecryptedSocketEvent::AuthSuccess);
+
+		assert_eq!(
+			calls.load(Ordering::SeqCst),
+			1,
+			"a callback registered with a duplicated event type must fire once per event"
+		);
 	}
 }
