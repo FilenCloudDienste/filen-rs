@@ -19,6 +19,10 @@ use crate::{
 		name::{EntryNameError, ValidatedName},
 	},
 };
+// Reuse the file-side CreatedTime so the two twins share one uniffi enum (a second
+// enum of the same name would collide in the flattened uniffi namespace).
+#[cfg(feature = "uniffi")]
+use crate::fs::file::meta::CreatedTime;
 
 #[derive(Debug, PartialEq, Eq, Clone, CowHelpers)]
 pub enum DirectoryMeta<'a> {
@@ -127,12 +131,20 @@ impl<'a> DirectoryMeta<'a> {
 			| Self::Encrypted(_)
 			| Self::RSAEncrypted(_) => {
 				// if all the metadata is being applied, we can convert to Decoded
+				#[cfg(not(feature = "uniffi"))]
+				let created = changes.created.ok_or(MetadataWasNotDecryptedError)?;
+				#[cfg(feature = "uniffi")]
+				let created = match changes.created {
+					CreatedTime::Keep => return Err(MetadataWasNotDecryptedError.into()),
+					CreatedTime::Unset => None,
+					CreatedTime::Set(t) => Some(t),
+				};
 				*self = Self::Decoded(DecryptedDirectoryMeta {
 					name: changes
 						.name
 						.map(|v| Cow::Owned(v.into()))
 						.ok_or(MetadataWasNotDecryptedError)?,
-					created: changes.created.ok_or(MetadataWasNotDecryptedError)?,
+					created,
 				})
 			}
 		}
@@ -148,14 +160,22 @@ impl<'a> DirectoryMeta<'a> {
 			Self::DecryptedRaw(_)
 			| Self::DecryptedUTF8(_)
 			| Self::Encrypted(_)
-			| Self::RSAEncrypted(_) => Self::Decoded(DecryptedDirectoryMeta {
-				name: if let Some(name) = &changes.name {
+			| Self::RSAEncrypted(_) => {
+				let name = if let Some(name) = &changes.name {
 					Cow::Borrowed(name.as_ref())
 				} else {
 					return Err(MetadataWasNotDecryptedError.into());
-				},
-				created: changes.created.ok_or(MetadataWasNotDecryptedError)?,
-			}),
+				};
+				#[cfg(not(feature = "uniffi"))]
+				let created = changes.created.ok_or(MetadataWasNotDecryptedError)?;
+				#[cfg(feature = "uniffi")]
+				let created = match &changes.created {
+					CreatedTime::Keep => return Err(MetadataWasNotDecryptedError.into()),
+					CreatedTime::Unset => None,
+					CreatedTime::Set(t) => Some(*t),
+				};
+				Self::Decoded(DecryptedDirectoryMeta { name, created })
+			}
 		})
 	}
 }
@@ -198,19 +218,44 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 		if let Some(name) = changes.name {
 			self.name = Cow::Owned(name.into());
 		}
-		if let Some(created) = changes.created {
-			self.created = created;
+		#[cfg(not(feature = "uniffi"))]
+		{
+			if let Some(created) = changes.created {
+				self.created = created;
+			}
+		}
+		#[cfg(feature = "uniffi")]
+		{
+			self.created = match changes.created {
+				CreatedTime::Keep => self.created,
+				CreatedTime::Unset => None,
+				CreatedTime::Set(t) => Some(t),
+			};
 		}
 	}
 
 	pub fn borrowed_with_changes(&'a self, changes: &'a DirectoryMetaChanges) -> Self {
+		let created = {
+			#[cfg(feature = "uniffi")]
+			{
+				match &changes.created {
+					CreatedTime::Keep => self.created,
+					CreatedTime::Unset => None,
+					CreatedTime::Set(t) => Some(*t),
+				}
+			}
+			#[cfg(not(feature = "uniffi"))]
+			{
+				changes.created.unwrap_or(self.created)
+			}
+		};
 		Self {
 			name: if let Some(name) = &changes.name {
 				Cow::Borrowed(name.as_ref())
 			} else {
 				Cow::Borrowed(&self.name)
 			},
-			created: changes.created.unwrap_or(self.created),
+			created,
 		}
 	}
 
@@ -231,8 +276,10 @@ pub struct DirectoryMetaChanges {
 	#[cfg_attr(feature = "wasm-full", tsify(type = "string"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	name: Option<ValidatedName>,
-	// double option because we need to distinguish between
-	// "not set" and "set to None"
+	// double option because we need to distinguish between "not set" and "set to
+	// None". uniffi collapses nested nullability (T?? == T?), so it uses the
+	// CreatedTime enum instead — matching the FileMetaChanges twin.
+	#[cfg(not(feature = "uniffi"))]
 	#[cfg_attr(
 		feature = "wasm-full",
 		tsify(type = "bigint | null"),
@@ -241,8 +288,9 @@ pub struct DirectoryMetaChanges {
 			deserialize_with = "crate::serde::deserialize_double_option_timestamp"
 		)
 	)]
-	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	created: Option<Option<DateTime<Utc>>>,
+	#[cfg(feature = "uniffi")]
+	created: CreatedTime,
 }
 
 impl DirectoryMetaChanges {
@@ -252,7 +300,17 @@ impl DirectoryMetaChanges {
 	}
 
 	pub fn created(mut self, created: Option<DateTime<Utc>>) -> Self {
-		self.created = Some(created.map(|t| t.round_subsecs(3)));
+		#[cfg(feature = "uniffi")]
+		{
+			self.created = match created {
+				Some(t) => CreatedTime::Set(t.round_subsecs(3)),
+				None => CreatedTime::Unset,
+			};
+		}
+		#[cfg(not(feature = "uniffi"))]
+		{
+			self.created = Some(created.map(|t| t.round_subsecs(3)));
+		}
 		self
 	}
 }
