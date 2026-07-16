@@ -535,6 +535,11 @@ impl Client {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
+		// Hold the drive lock across the recursive listing and every link post, matching the
+		// other mutating flows. Otherwise a concurrent upload between the listing and the posts
+		// is neither seen by the lister nor covered by its own connected-parent propagation
+		// (the link root row does not exist yet), so it is silently absent from the link.
+		let _lock = self.lock_drive().await?;
 		let public_link = DirPublicLinkRW::new(self.make_meta_key());
 		let (dirs, files) = self
 			.list_dir_recursive::<Normal, _>(
@@ -828,6 +833,11 @@ impl Client {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
+		// Hold the drive lock across the recursive listing and every share post, matching the
+		// other mutating flows. Otherwise a concurrent upload between the listing and the posts
+		// is neither seen by the lister nor covered by its own connected-parent propagation
+		// (the share root row does not exist yet), so it is silently absent from the share.
+		let _lock = self.lock_drive().await?;
 		let (dirs, files) =
 			Normal::list_dir_recursive(self, &dir.into(), progress_callback, ()).await?;
 
