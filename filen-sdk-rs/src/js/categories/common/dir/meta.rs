@@ -10,7 +10,7 @@ use crate::fs::dir::{DecryptedDirectoryMeta as DecryptedDirectoryMetaRS, meta::D
 pub struct DecryptedDirMeta {
 	pub name: String,
 	#[cfg_attr(
-		feature = "wasm-full",
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint"),
 		serde(
 			with = "filen_types::serde::time::optional",

@@ -38,7 +38,7 @@ pub struct Dir {
 	pub parent: ParentUuid,
 	pub color: DirColor,
 	#[cfg_attr(
-		feature = "wasm-full",
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint"),
 		serde(with = "chrono::serde::ts_milliseconds")
 	)]

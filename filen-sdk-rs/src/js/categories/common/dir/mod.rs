@@ -12,7 +12,7 @@ pub struct RootDirWithMeta {
 	pub uuid: Uuid,
 	pub color: color::DirColor,
 	#[cfg_attr(
-		feature = "wasm-full",
+		all(target_family = "wasm", target_os = "unknown"),
 		tsify(type = "bigint"),
 		serde(with = "chrono::serde::ts_milliseconds")
 	)]
