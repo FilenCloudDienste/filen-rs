@@ -135,8 +135,13 @@ impl From<LinkedRootDir> for RootDirectoryWithMeta {
 
 #[js_type(import, export, wasm_all)]
 pub enum AnyLinkedDir {
-	Root(LinkedRootDir),
+	// `Dir` must precede `Root`: the wasm deserializer is `untagged`, so it tries variants in
+	// order. `LinkedDir`'s inner is a field-superset of `LinkedRootDir`'s inner, so a `Root`
+	// payload cannot match `Dir` (it lacks parent/favorited), but a `Dir` payload WOULD match
+	// `Root` (its extra fields are ignored). Listing the superset variant first prevents a
+	// linked subdirectory from being misparsed as a root. Mirrors `AnyNormalDir`.
 	Dir(LinkedDir),
+	Root(LinkedRootDir),
 }
 
 impl From<AnyLinkedDir> for DirType<'static, Linked> {
