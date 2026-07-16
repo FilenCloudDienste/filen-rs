@@ -359,6 +359,16 @@ mod js_impl {
 
 	use super::*;
 
+	/// Parses the pagination cursor passed to `getUserEvents`.
+	///
+	/// The event `timestamp` emitted to JS is serialized as milliseconds (`ts_milliseconds`),
+	/// so a caller paginating by feeding back `events[last].timestamp` supplies milliseconds.
+	/// It must be interpreted with the same unit, otherwise the cursor lands ~57000 years in
+	/// the future, gets discarded, and the newest page is returned again in a loop.
+	fn parse_events_cursor(timestamp: Option<i64>) -> Option<DateTime<Utc>> {
+		timestamp.and_then(DateTime::<Utc>::from_timestamp_millis)
+	}
+
 	#[cfg_attr(
 		feature = "wasm-full",
 		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
@@ -478,7 +488,7 @@ mod js_impl {
 		) -> Result<Vec<crate::user::js::events::UserEventResult>, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
-				let timestamp = timestamp.and_then(|t| DateTime::<Utc>::from_timestamp(t, 0));
+				let timestamp = parse_events_cursor(timestamp);
 				let events = this.get_user_events(filter.as_deref(), timestamp).await?;
 				Ok(events.into_iter().map(Into::into).collect())
 			})
@@ -499,6 +509,33 @@ mod js_impl {
 				Ok(event.into())
 			})
 			.await
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn cursor_is_interpreted_as_milliseconds() {
+			// A JS caller paginates by feeding back an event's millisecond timestamp. It must
+			// resolve to the same instant as the second-based construction of that instant,
+			// not be treated as seconds (which lands ~57000 years out and gets discarded).
+			let millis = 1_750_000_000_000;
+			assert_eq!(
+				parse_events_cursor(Some(millis)),
+				DateTime::<Utc>::from_timestamp(1_750_000_000, 0)
+			);
+		}
+
+		#[test]
+		fn cursor_absent_stays_absent() {
+			assert_eq!(parse_events_cursor(None), None);
+		}
+
+		#[test]
+		fn cursor_out_of_range_is_none() {
+			assert_eq!(parse_events_cursor(Some(i64::MAX)), None);
 		}
 	}
 }
