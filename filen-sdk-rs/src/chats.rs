@@ -402,6 +402,13 @@ impl ChatMessage {
 	}
 }
 
+/// Picks the newest message out of a list returned by `list_messages`, which is
+/// sorted ascending by `sent_timestamp`. The newest message is therefore the
+/// last element, not the first.
+fn newest_message(messages: Vec<ChatMessage>) -> Option<ChatMessage> {
+	messages.into_iter().next_back()
+}
+
 pub(crate) mod crypto {
 	use std::borrow::Cow;
 
@@ -772,7 +779,7 @@ impl Client {
 			&& last_message.inner.uuid == message.inner.uuid
 		{
 			let messages = self.list_messages(chat).await?;
-			chat.last_message = messages.into_iter().next();
+			chat.last_message = newest_message(messages);
 		}
 
 		Ok(())
@@ -1245,5 +1252,48 @@ pub mod js_impls {
 			})
 			.await
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn message_at(secs: i64) -> ChatMessage {
+		ChatMessage {
+			chat: Uuid::new_v4(),
+			inner: ChatMessagePartial {
+				uuid: Uuid::new_v4(),
+				sender_id: 1,
+				sender_email: "sender@example.com".to_string(),
+				sender_avatar: None,
+				sender_nick_name: None,
+				message: None,
+			},
+			reply_to: None,
+			embed_disabled: false,
+			edited: false,
+			edited_timestamp: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+			sent_timestamp: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+		}
+	}
+
+	#[test]
+	fn newest_message_returns_last_of_ascending_list() {
+		// list_messages returns messages sorted ascending by sent_timestamp,
+		// so the newest message is the last element.
+		let oldest = message_at(100);
+		let middle = message_at(200);
+		let newest = message_at(300);
+		let expected_uuid = newest.inner.uuid;
+
+		let picked = newest_message(vec![oldest, middle, newest]).unwrap();
+
+		assert_eq!(picked.inner.uuid, expected_uuid);
+	}
+
+	#[test]
+	fn newest_message_of_empty_list_is_none() {
+		assert!(newest_message(Vec::new()).is_none());
 	}
 }
