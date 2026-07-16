@@ -763,11 +763,17 @@ impl UnauthClient {
 		&self,
 		url: &str,
 		endpoint: Cow<'static, str>,
+		max_body_len: Option<usize>,
 		callback: Option<&F>,
 	) -> Result<Vec<u8>, Error>
 	where
 		F: Fn(u64, Option<u64>) + MaybeSendSync,
 	{
+		let callback_layer = download_body::callback::DownloadWithCallbackLayer::new(callback);
+		let callback_layer = match max_body_len {
+			Some(max_body_len) => callback_layer.with_max_body_len(max_body_len),
+			None => callback_layer,
+		};
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
@@ -777,9 +783,7 @@ impl UnauthClient {
 			.map_request(|request: Request<(), reqwest::Url>| {
 				request.into_builder_map_body(|()| bytes::Bytes::new())
 			}) // required to map Request to RequestBuilder
-			.layer(download_body::callback::DownloadWithCallbackLayer::new(
-				callback,
-			)); // stream the body to bytes, reporting progress as it arrives
+			.layer(callback_layer); // stream the body to bytes (capped for chunk downloads)
 		let builder = {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{

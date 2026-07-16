@@ -6,12 +6,14 @@ use super::super::retry::RetryError;
 
 pub(crate) struct DownloadWithCallbackLayer<'a, F> {
 	callback: Option<&'a F>,
+	max_body_len: Option<usize>,
 }
 
 impl<F> Clone for DownloadWithCallbackLayer<'_, F> {
 	fn clone(&self) -> Self {
 		Self {
 			callback: self.callback,
+			max_body_len: self.max_body_len,
 		}
 	}
 }
@@ -21,7 +23,20 @@ where
 	F: Fn(u64, Option<u64>),
 {
 	pub(crate) fn new(callback: Option<&'a F>) -> Self {
-		Self { callback }
+		Self {
+			callback,
+			max_body_len: None,
+		}
+	}
+
+	/// Caps the collected response body at `max_body_len` bytes, failing the request if the
+	/// streamed body grows past it. Used for file-chunk downloads to bound a single chunk's buffer:
+	/// without the cap a misbehaving/compromised egest node could stream a multi-GiB body for one
+	/// chunk and bypass the file-IO memory budget, OOMing the client. The caller picks a bound that
+	/// clears the largest legitimate chunk body across encryption versions.
+	pub(crate) fn with_max_body_len(mut self, max_body_len: usize) -> Self {
+		self.max_body_len = Some(max_body_len);
+		self
 	}
 }
 
@@ -32,6 +47,7 @@ impl<'a, S, F> Layer<S> for DownloadWithCallbackLayer<'a, F> {
 		DownloadWithCallbackService {
 			inner,
 			callback: self.callback,
+			max_body_len: self.max_body_len,
 		}
 	}
 }
@@ -39,6 +55,7 @@ impl<'a, S, F> Layer<S> for DownloadWithCallbackLayer<'a, F> {
 pub(crate) struct DownloadWithCallbackService<'a, S, F> {
 	inner: S,
 	callback: Option<&'a F>,
+	max_body_len: Option<usize>,
 }
 
 impl<'a, S, F> Clone for DownloadWithCallbackService<'a, S, F>
@@ -49,6 +66,7 @@ where
 		Self {
 			inner: self.inner.clone(),
 			callback: self.callback,
+			max_body_len: self.max_body_len,
 		}
 	}
 }
@@ -73,7 +91,7 @@ where
 	fn call(&mut self, req: Req) -> Self::Future {
 		let fut = self.inner.call(req);
 
-		DownloadWithCallbackFuture::new(fut, self.callback)
+		DownloadWithCallbackFuture::new(fut, self.callback, self.max_body_len)
 	}
 }
 
@@ -94,7 +112,11 @@ mod boxed {
 	}
 
 	impl<'a> DownloadWithCallbackFuture<'a> {
-		pub(super) fn new<SFut, F>(inner: SFut, callback: Option<&'a F>) -> Self
+		pub(super) fn new<SFut, F>(
+			inner: SFut,
+			callback: Option<&'a F>,
+			max_body_len: Option<usize>,
+		) -> Self
 		where
 			SFut: Future<Output = Result<reqwest::Response, RetryError<Error>>> + 'a,
 			F: Fn(u64, Option<u64>) + 'a,
@@ -137,6 +159,14 @@ mod boxed {
 						}
 					};
 					collected.extend_from_slice(&chunk);
+					if let Some(max_body_len) = max_body_len
+						&& collected.len() > max_body_len
+					{
+						return Err(RetryError::NoRetry(Error::custom(
+							ErrorKind::Response,
+							"download body exceeded the maximum expected chunk size",
+						)));
+					}
 					if last_update_time.elapsed() >= CALLBACK_INTERVAL
 						&& let Some(callback) = &callback
 					{
@@ -190,6 +220,7 @@ mod native {
 	#[pin_project::pin_project(project = DownloadWithCallbackFutureProj)]
 	pub(crate) struct DownloadWithCallbackFuture<'a, S, F> {
 		callback: Option<&'a F>,
+		max_body_len: Option<usize>,
 		#[pin]
 		state: DownloadWithCallbackFutureState<S>,
 	}
@@ -199,9 +230,10 @@ mod native {
 		S: Future<Output = Result<reqwest::Response, RetryError<Error>>>,
 		F: Fn(u64, Option<u64>),
 	{
-		pub(crate) fn new(inner: S, callback: Option<&'a F>) -> Self {
+		pub(crate) fn new(inner: S, callback: Option<&'a F>, max_body_len: Option<usize>) -> Self {
 			Self {
 				callback,
+				max_body_len,
 				state: DownloadWithCallbackFutureState::AwaitingInner(inner),
 			}
 		}
@@ -264,6 +296,16 @@ mod native {
 							Poll::Ready(Some(Ok(frame))) => {
 								if let Some(chunk) = frame.data_ref() {
 									collected.extend_from_slice(chunk);
+									if let Some(max_body_len) = *this.max_body_len
+										&& collected.len() > max_body_len
+									{
+										return Poll::Ready(Err(RetryError::NoRetry(
+											Error::custom(
+												ErrorKind::Response,
+												"download body exceeded the maximum expected chunk size",
+											),
+										)));
+									}
 								}
 								if last_update_time.elapsed() >= CALLBACK_INTERVAL
 									&& let Some(callback) = &this.callback
@@ -295,3 +337,63 @@ mod native {
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use native::*;
 use tower::{Layer, Service};
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod tests {
+	use futures::executor::block_on;
+
+	use super::DownloadWithCallbackFuture;
+	use crate::{Error, auth::http::retry::RetryError};
+
+	// A concrete callback type so `None` can be typed without a live callback.
+	type NoCallback = fn(u64, Option<u64>);
+
+	fn response_with_body(body: Vec<u8>, x_content_length: &str) -> reqwest::Response {
+		let http_resp = http::Response::builder()
+			.header("X-Cl", x_content_length)
+			.body(body)
+			.expect("valid response");
+		reqwest::Response::from(http_resp)
+	}
+
+	fn run(response: reqwest::Response, max_body_len: Option<usize>) -> Result<Vec<u8>, Error> {
+		let fut = DownloadWithCallbackFuture::new(
+			std::future::ready(Ok::<_, RetryError<Error>>(response)),
+			None::<&NoCallback>,
+			max_body_len,
+		);
+		block_on(fut).map_err(|e| match e {
+			RetryError::Retry(e) | RetryError::NoRetry(e) => e,
+		})
+	}
+
+	/// A streamed body larger than the cap must fail instead of being buffered unbounded — this is
+	/// the memory-budget bypass a misbehaving egest node could otherwise exploit (X-Cl is
+	/// server-controlled, here understating the real body).
+	#[test]
+	fn body_exceeding_cap_errors() {
+		let cap = 100;
+		let response = response_with_body(vec![7u8; cap + 50], "20");
+		assert!(
+			run(response, Some(cap)).is_err(),
+			"a body over the cap must error"
+		);
+	}
+
+	/// A body within the cap is collected normally.
+	#[test]
+	fn body_within_cap_succeeds() {
+		let cap = 1000;
+		let response = response_with_body(vec![7u8; 200], "200");
+		let body = run(response, Some(cap)).expect("a body within the cap must succeed");
+		assert_eq!(body.len(), 200);
+	}
+
+	/// With no cap the full body is collected, preserving the behavior of the non-chunk callers.
+	#[test]
+	fn uncapped_collects_full_body() {
+		let response = response_with_body(vec![7u8; 5000], "5000");
+		let body = run(response, None).expect("an uncapped download must succeed");
+		assert_eq!(body.len(), 5000);
+	}
+}
