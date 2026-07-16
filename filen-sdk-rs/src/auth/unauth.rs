@@ -305,6 +305,7 @@ impl UnauthClient {
 		email: String,
 		new_password: &str,
 		recovery_key: Option<&str>,
+		two_factor_code: Option<&str>,
 	) -> Result<Client, Error> {
 		let auth_info_resp = api::v3::auth::info::post(
 			self,
@@ -344,7 +345,10 @@ impl UnauthClient {
 		// I could try and log in here without using a login call
 		// but it's annoying with the state management
 		// we can do it properly with v4
-		self.login(email, new_password, "XXXXXX").await
+		// Thread the caller's 2FA code through: for a 2FA-enabled account a hardcoded placeholder
+		// would fail the post-reset login even though the reset itself already succeeded.
+		self.login(email, new_password, two_factor_code.unwrap_or("XXXXXX"))
+			.await
 	}
 
 	pub async fn register(

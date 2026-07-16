@@ -217,6 +217,13 @@ pub struct CompletePasswordResetParams {
 	)]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub recover_key: Option<String>,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		tsify(type = "string"),
+		serde(default)
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub two_factor_code: Option<String>,
 }
 
 #[js_type(import)]
@@ -318,6 +325,7 @@ impl UnauthJsClient {
 				params.email,
 				&params.new_password,
 				params.recover_key.as_deref(),
+				params.two_factor_code.as_deref(),
 			)
 			.await
 		})

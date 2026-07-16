@@ -488,6 +488,7 @@ fn register_and_reset_password_no_export() {
 				register_data.email.clone(),
 				&new_password,
 				None,
+				None,
 			)
 			.await
 			.unwrap();
@@ -624,6 +625,7 @@ fn register_change_and_reset_password_with_export() {
 				register_data.email.clone(),
 				&new_password,
 				Some(&recovery_key),
+				None,
 			)
 			.await
 			.unwrap();
