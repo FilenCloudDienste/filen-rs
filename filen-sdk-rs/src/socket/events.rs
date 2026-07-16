@@ -1099,14 +1099,30 @@ pub struct FileMetadataChanged<'a> {
 	pub metadata: FileMeta<'a>,
 }
 
+/// Infers the file encryption version from the ciphertext prefix of an encrypted
+/// metadata blob, mirroring `FileKey::from_string_and_meta`: V1 metadata is the
+/// base64 OpenSSL EVP format ("U2FsdGVk"), V2 is prefixed "002", V3 is prefixed
+/// "003". File-rename / file-metadata-changed wire events carry no version field,
+/// so it must be recovered from the blob itself rather than assumed to be V2.
+/// Unknown prefixes fall back to V2, the historical default for these events.
+fn file_encryption_version_from_meta(meta: &EncryptedString<'_>) -> FileEncryptionVersion {
+	if meta.0.starts_with("U2FsdGVk") {
+		FileEncryptionVersion::V1
+	} else if meta.0.starts_with("003") {
+		FileEncryptionVersion::V3
+	} else {
+		FileEncryptionVersion::V2
+	}
+}
+
 impl<'a> FileMetadataChanged<'a> {
 	fn blocking_from_encrypted(
 		crypter: &impl MetaCrypter,
 		uuid: Uuid,
 		new_meta: EncryptedString<'a>,
 	) -> Self {
-		let metadata =
-			FileMeta::blocking_from_encrypted(new_meta, crypter, FileEncryptionVersion::V2);
+		let version = file_encryption_version_from_meta(&new_meta);
+		let metadata = FileMeta::blocking_from_encrypted(new_meta, crypter, version);
 
 		Self { uuid, metadata }
 	}
@@ -1168,5 +1184,36 @@ mod tests {
 				drive_message_id: 77
 			}
 		));
+	}
+
+	/// File-rename / file-metadata-changed wire events carry no key version, so the
+	/// version has to be inferred from the encrypted metadata prefix. A V1 blob must
+	/// resolve to V1 (previously hardcoded to V2, which mis-parsed V1 file keys and
+	/// corrupted later downloads); V2/V3 and unknown prefixes must resolve correctly.
+	#[test]
+	fn file_version_is_inferred_from_meta_prefix() {
+		use std::borrow::Cow;
+
+		let v1 = EncryptedString(Cow::Borrowed("U2FsdGVkX1+deadbeef"));
+		let v2 = EncryptedString(Cow::Borrowed("002deadbeef"));
+		let v3 = EncryptedString(Cow::Borrowed("003deadbeef"));
+		let unknown = EncryptedString(Cow::Borrowed("zzznotaversion"));
+
+		assert_eq!(
+			file_encryption_version_from_meta(&v1),
+			FileEncryptionVersion::V1
+		);
+		assert_eq!(
+			file_encryption_version_from_meta(&v2),
+			FileEncryptionVersion::V2
+		);
+		assert_eq!(
+			file_encryption_version_from_meta(&v3),
+			FileEncryptionVersion::V3
+		);
+		assert_eq!(
+			file_encryption_version_from_meta(&unknown),
+			FileEncryptionVersion::V2
+		);
 	}
 }
