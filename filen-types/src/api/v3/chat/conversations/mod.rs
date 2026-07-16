@@ -38,7 +38,7 @@ pub struct ChatConversation<'a> {
 	pub muted: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub created_timestamp: DateTime<Utc>,
-	#[serde(with = "crate::serde::time::optional")]
+	#[serde(with = "crate::serde::time::optional", default)]
 	pub last_focus: Option<DateTime<Utc>>,
 }
 
@@ -49,7 +49,7 @@ pub struct ChatConversationParticipant<'a> {
 	pub user_id: u64,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,
-	#[serde(with = "crate::serde::option::str_empty_is_none_owned")]
+	#[serde(with = "crate::serde::option::str_empty_is_none_owned", default)]
 	pub nick_name: Option<String>,
 	pub metadata: RSAEncryptedString<'a>,
 	#[serde(with = "crate::serde::boolean::number")]
@@ -59,4 +59,39 @@ pub struct ChatConversationParticipant<'a> {
 	pub appear_offline: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub last_active: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn conversation_deserializes_when_last_focus_absent() {
+		// A server omitting `lastFocus` for a single item must not fail the whole
+		// list_chats response.
+		let json = r#"{
+			"uuid":"00000000-0000-0000-0000-000000000000",
+			"ownerId":1,
+			"participants":[],
+			"muted":false,
+			"createdTimestamp":1700000000000
+		}"#;
+		let conv: ChatConversation = serde_json::from_str(json).unwrap();
+		assert_eq!(conv.last_focus, None);
+	}
+
+	#[test]
+	fn participant_deserializes_when_nick_name_absent() {
+		let json = r#"{
+			"userId":1,
+			"email":"a@b.c",
+			"metadata":"enc",
+			"permissionsAdd":0,
+			"addedTimestamp":1700000000000,
+			"appearOffline":false,
+			"lastActive":1700000000000
+		}"#;
+		let participant: ChatConversationParticipant = serde_json::from_str(json).unwrap();
+		assert_eq!(participant.nick_name, None);
+	}
 }

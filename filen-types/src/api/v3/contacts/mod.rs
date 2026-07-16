@@ -23,7 +23,7 @@ pub struct Contact<'a> {
 	pub user_id: u64,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,
-	#[serde(with = "crate::serde::option::str_empty_is_none_owned")]
+	#[serde(with = "crate::serde::option::str_empty_is_none_owned", default)]
 	pub nick_name: Option<String>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub last_active: DateTime<Utc>,
