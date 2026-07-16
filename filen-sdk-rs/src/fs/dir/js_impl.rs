@@ -499,12 +499,12 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "dirExists")
 	)]
-	pub async fn dir_exists(&self, parent: AnyNormalDir, name: String) -> Result<(), Error> {
+	pub async fn dir_exists(&self, parent: AnyNormalDir, name: String) -> Result<bool, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
 			this.dir_exists(&DirType::<'static, Normal>::from(parent), &name)
 				.await
-				.map(|_| ())
+				.map(|o| o.is_some())
 		})
 		.await
 	}
