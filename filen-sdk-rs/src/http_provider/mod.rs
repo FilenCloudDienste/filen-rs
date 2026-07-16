@@ -18,7 +18,7 @@ use axum_extra::{TypedHeader, headers::Range};
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use futures::AsyncReadExt;
 use http::{
-	StatusCode,
+	HeaderMap, StatusCode,
 	header::{CONTENT_LENGTH, CONTENT_TYPE},
 	response,
 };
@@ -479,7 +479,7 @@ struct FileQuery {
 	buffer: Option<u64>,
 }
 
-fn get_real_bounds(file: &RemoteFileType, (start, end): (Bound<u64>, Bound<u64>)) -> (u64, u64) {
+fn get_real_bounds(size: u64, (start, end): (Bound<u64>, Bound<u64>)) -> (u64, u64) {
 	let start = match start {
 		Bound::Included(start) => start,
 		Bound::Excluded(start) => start + 1,
@@ -490,8 +490,48 @@ fn get_real_bounds(file: &RemoteFileType, (start, end): (Bound<u64>, Bound<u64>)
 		Bound::Excluded(end) => end,
 		Bound::Unbounded => u64::MAX,
 	}
-	.min(file.size());
+	.min(size);
 	(start, end)
+}
+
+/// Resolves a `Range` header against the file `size` into concrete `[start, end)` byte ranges.
+///
+/// [`Range::satisfiable_ranges`] drops a suffix range (`bytes=-N`) whose length exceeds the file
+/// instead of clamping it. RFC 9110 §14.1.2 requires such a suffix to select the entire
+/// representation, so when it would otherwise leave us with no satisfiable range we recover the
+/// whole-file range from the raw header rather than returning `416 Range Not Satisfiable`.
+fn resolve_ranges(range: &Range, raw_range: Option<&str>, size: u64) -> Vec<(u64, u64)> {
+	let mut ranges = range
+		.satisfiable_ranges(size)
+		.filter_map(|r| {
+			let (start, end) = get_real_bounds(size, r);
+			if start < end {
+				Some((start, end))
+			} else {
+				None
+			}
+		})
+		.collect::<Vec<_>>();
+	if ranges.is_empty() && raw_range.is_some_and(|raw| has_oversized_suffix(raw, size)) {
+		ranges.push((0, size));
+	}
+	ranges
+}
+
+/// Whether the raw `Range` header requests a suffix (`bytes=-N`) longer than `size`, which per RFC
+/// 9110 §14.1.2 means the entire representation. `satisfiable_ranges` silently drops these, so we
+/// detect them here to serve the whole file instead of `416`.
+fn has_oversized_suffix(raw_range: &str, size: u64) -> bool {
+	raw_range
+		.strip_prefix("bytes=")
+		.into_iter()
+		.flat_map(|set| set.split(','))
+		.any(|spec| {
+			spec.trim()
+				.strip_prefix('-')
+				.and_then(|n| n.parse::<u64>().ok())
+				.is_some_and(|n| n > size)
+		})
 }
 
 fn single_range_response_builder(
@@ -595,6 +635,7 @@ fn multiple_range_response_builder(
 async fn file_handler(
 	Query(params): Query<FileQuery>,
 	State(state): State<ProviderState>,
+	headers: HeaderMap,
 	range: Option<TypedHeader<Range>>,
 ) -> impl IntoResponse {
 	// Resolve the opaque token to the file (and its key) held in-process. The entry
@@ -614,17 +655,10 @@ async fn file_handler(
 	};
 
 	let ranges = if let Some(TypedHeader(range)) = range {
-		range
-			.satisfiable_ranges(file.size())
-			.filter_map(|r| {
-				let (start, end) = get_real_bounds(&file, r);
-				if start < end {
-					Some((start, end))
-				} else {
-					None
-				}
-			})
-			.collect::<Vec<_>>()
+		let raw_range = headers
+			.get(http::header::RANGE)
+			.and_then(|value| value.to_str().ok());
+		resolve_ranges(&range, raw_range, file.size())
 	} else {
 		vec![(0, file.size())]
 	};
@@ -672,10 +706,79 @@ async fn file_handler(
 /// They document and guard behavioral contracts of the provider lifecycle.
 #[cfg(all(test, feature = "http-provider"))]
 mod tests {
+	use axum_extra::headers::{Header, Range};
+
 	use crate::{
 		auth::{http::ClientConfig, unauth::UnauthClient},
 		http_provider::client_impl::HttpProviderSharedClientExt,
 	};
+
+	fn range_header(value: &str) -> Range {
+		let value = http::HeaderValue::from_str(value).expect("valid header value");
+		Range::decode(&mut std::iter::once(&value)).expect("valid range header")
+	}
+
+	/// A suffix range longer than the file (e.g. a blind MP4 tail fetch) must serve the whole
+	/// representation per RFC 9110 §14.1.2, not `416`. `satisfiable_ranges` drops the suffix, so
+	/// `resolve_ranges` has to recover the whole-file range itself.
+	#[test]
+	fn suffix_longer_than_file_serves_whole_representation() {
+		let size = 10 * 1024;
+		let raw = "bytes=-65536";
+		let range = range_header(raw);
+		// The header crate drops the oversized suffix, leaving nothing satisfiable...
+		assert_eq!(range.satisfiable_ranges(size).count(), 0);
+		// ...but we recover the entire representation instead of returning 416.
+		assert_eq!(
+			super::resolve_ranges(&range, Some(raw), size),
+			vec![(0, size)]
+		);
+	}
+
+	/// A suffix that fits inside the file is served as a normal partial range.
+	#[test]
+	fn suffix_within_file_is_served_as_partial() {
+		let size = 10 * 1024;
+		let raw = "bytes=-4096";
+		let range = range_header(raw);
+		assert_eq!(
+			super::resolve_ranges(&range, Some(raw), size),
+			vec![(size - 4096, size)]
+		);
+	}
+
+	/// An ordinary `start-end` range is unaffected by the suffix handling.
+	#[test]
+	fn normal_range_is_resolved_to_half_open_bounds() {
+		let size = 10 * 1024;
+		let raw = "bytes=0-1023";
+		let range = range_header(raw);
+		assert_eq!(
+			super::resolve_ranges(&range, Some(raw), size),
+			vec![(0, 1024)]
+		);
+	}
+
+	/// A genuinely unsatisfiable range (start past EOF, not a suffix) is still a 416, not a
+	/// whole-file fallback.
+	#[test]
+	fn out_of_range_non_suffix_stays_unsatisfiable() {
+		let size = 10 * 1024;
+		let raw = "bytes=20000-30000";
+		let range = range_header(raw);
+		assert!(super::resolve_ranges(&range, Some(raw), size).is_empty());
+	}
+
+	/// `has_oversized_suffix` fires only for a suffix strictly longer than the file — a suffix
+	/// equal to the size is satisfiable (the whole file) and non-suffix specs never match.
+	#[test]
+	fn has_oversized_suffix_detects_only_too_long_suffixes() {
+		assert!(super::has_oversized_suffix("bytes=-65536", 10 * 1024));
+		assert!(!super::has_oversized_suffix("bytes=-4096", 10 * 1024));
+		assert!(!super::has_oversized_suffix("bytes=0-1023", 10 * 1024));
+		assert!(!super::has_oversized_suffix("bytes=-1024", 1024));
+		assert!(super::has_oversized_suffix("bytes=-1025", 1024));
+	}
 
 	/// When `start_http_provider` is called a second time while an existing provider is
 	/// still live (its `Arc` has not been dropped), the second call silently discards
