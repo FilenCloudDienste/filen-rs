@@ -296,7 +296,7 @@ impl Client {
 			return Err(MetadataWasNotDecryptedError.into());
 		};
 
-		let (_lock, encrypted_meta) = futures::join!(
+		let (lock_result, encrypted_meta) = futures::join!(
 			self.lock_drive(),
 			do_cpu_intensive(|| {
 				Ok::<_, Error>(
@@ -305,6 +305,9 @@ impl Client {
 				)
 			})
 		);
+		// Propagate a failed drive lock instead of proceeding unlocked, matching the
+		// `let _lock = self.lock_drive().await?` guard every other dir/file op uses.
+		let _lock = lock_result?;
 
 		api::v3::dir::metadata::post(
 			self.client(),
