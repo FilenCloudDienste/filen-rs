@@ -309,6 +309,25 @@ impl MakePasswordSaltAndHash for DirPublicLinkRW {
 	}
 }
 
+/// Drives every future to completion, collecting the errors from any that fail instead of
+/// aborting on the first one.
+///
+/// Used when propagating a metadata update to all connected links and shared receivers: the
+/// primary operation (create/upload/rename) has already been committed server-side, so a
+/// failure to update one connected copy must not cancel the updates to the others, nor make
+/// the already-succeeded primary operation report failure to the caller.
+async fn drain_collecting_errors(
+	mut futures: FuturesUnordered<MaybeSendBoxFuture<'_, Result<(), Error>>>,
+) -> Vec<Error> {
+	let mut errors = Vec::new();
+	while let Some(result) = futures.next().await {
+		if let Err(e) = result {
+			errors.push(e);
+		}
+	}
+	errors
+}
+
 impl Client {
 	async fn update_shared_item_meta<I>(&self, item: &I, user: &SharedUser<'_>) -> Result<(), Error>
 	where
@@ -372,7 +391,7 @@ impl Client {
 			},
 		)?;
 
-		let mut futures = FuturesUnordered::new();
+		let futures = FuturesUnordered::new();
 		for link in linked.links {
 			futures.push(Box::pin(async move {
 				let crypter = self
@@ -390,11 +409,11 @@ impl Client {
 			);
 		}
 
-		while let Some(result) = futures.next().await {
-			match result {
-				Ok(_) => continue,
-				Err(e) => return Err(e),
-			}
+		let errors = drain_collecting_errors(futures).await;
+		for error in &errors {
+			tracing::warn!(
+				"failed to propagate metadata update to a connected link or shared user: {error}"
+			);
 		}
 		Ok(())
 	}
@@ -436,15 +455,22 @@ impl Client {
 			}
 		)?;
 
-		let mut futures = FuturesUnordered::new();
+		let futures = FuturesUnordered::new();
 
 		for link in linked.links {
+			// An undecryptable (corrupt/legacy) link key must not abort propagation to the
+			// remaining links and shared users: skip this link and keep going.
+			let crypter = match self.decrypt_meta_key(&link.link_key).await {
+				Ok(crypter) => Arc::new(crypter),
+				Err(error) => {
+					tracing::warn!(
+						"failed to decrypt link key for connected link {}, skipping: {error}",
+						link.link_uuid
+					);
+					continue;
+				}
+			};
 			let link = Arc::new(link);
-			let crypter = Arc::new(
-				self.decrypt_meta_key(&link.link_key)
-					.await
-					.map_err(|_| MetadataWasNotDecryptedError)?,
-			);
 			for item in &items_to_process {
 				let link = link.clone();
 				let crypter = crypter.clone();
@@ -465,11 +491,11 @@ impl Client {
 			}
 		}
 
-		while let Some(result) = futures.next().await {
-			match result {
-				Ok(_) => continue,
-				Err(e) => return Err(e),
-			}
+		let errors = drain_collecting_errors(futures).await;
+		for error in &errors {
+			tracing::warn!(
+				"failed to propagate a connected-parent update to a link or shared user: {error}"
+			);
 		}
 		Ok(())
 	}
@@ -1079,6 +1105,32 @@ mod tests {
 			link.get_password_hash().unwrap().0,
 			Cow::Borrowed("deadbeefhash"),
 			"hashed credential must survive the conversion instead of deriving to \"empty\""
+		);
+	}
+
+	// A single failing propagation (e.g. one undecryptable link key) must not abort the
+	// updates to the remaining links/receivers: every future is awaited and all errors are
+	// collected rather than returning on the first one.
+	#[tokio::test]
+	async fn drain_collecting_errors_awaits_all_and_aggregates_failures() {
+		let futures: FuturesUnordered<MaybeSendBoxFuture<'_, Result<(), Error>>> =
+			FuturesUnordered::new();
+		futures.push(Box::pin(async { Ok(()) }) as MaybeSendBoxFuture<'_, Result<(), Error>>);
+		futures.push(
+			Box::pin(async { Err(Error::custom(ErrorKind::Conversion, "first")) })
+				as MaybeSendBoxFuture<'_, Result<(), Error>>,
+		);
+		futures.push(
+			Box::pin(async { Err(Error::custom(ErrorKind::Conversion, "second")) })
+				as MaybeSendBoxFuture<'_, Result<(), Error>>,
+		);
+
+		let errors = drain_collecting_errors(futures).await;
+
+		assert_eq!(
+			errors.len(),
+			2,
+			"both failures must be collected — draining must not abort on the first error"
 		);
 	}
 }
