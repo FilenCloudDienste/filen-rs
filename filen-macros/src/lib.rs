@@ -1398,6 +1398,29 @@ fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream 
 	expanded.into()
 }
 
+/// Returns true if every variant of the enum is a fieldless (unit) variant.
+fn is_fieldless_enum(item_enum: &ItemEnum) -> bool {
+	!item_enum.variants.is_empty()
+		&& item_enum
+			.variants
+			.iter()
+			.all(|v| matches!(v.fields, Fields::Unit))
+}
+
+/// serde representation for an enum that is neither exported, tagged, nor
+/// untagged (e.g. an `import`-only enum). `serde(untagged)` makes every
+/// fieldless variant match only `null`/`undefined`, so a unit-only enum becomes
+/// impossible to deserialize from JS by value. Such enums use the default
+/// externally-tagged (string) representation instead; enums that carry data keep
+/// `serde(untagged)`.
+fn default_enum_serde_repr(item_enum: &ItemEnum) -> proc_macro2::TokenStream {
+	if is_fieldless_enum(item_enum) {
+		quote! { serde(rename_all = "camelCase") }
+	} else {
+		quote! { serde(untagged) }
+	}
+}
+
 fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
 	let name = &item_enum.ident;
 	let vis = &item_enum.vis;
@@ -1564,7 +1587,7 @@ fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
 			},
 		)
 	} else {
-		(quote! {}, quote! {serde(untagged)})
+		(quote! {}, default_enum_serde_repr(&item_enum))
 	};
 
 	let from_abi = add_comma_if_needed(state.from_abi);
@@ -1757,5 +1780,64 @@ mod uniffi_wrapper_tests {
 			tokens.contains("self.refresh(force)"),
 			"body should call self.refresh(force): {tokens}"
 		);
+	}
+}
+
+#[cfg(test)]
+mod js_type_enum_tests {
+	use super::*;
+
+	fn compact(tokens: proc_macro2::TokenStream) -> String {
+		tokens
+			.to_string()
+			.chars()
+			.filter(|c| !c.is_whitespace())
+			.collect()
+	}
+
+	#[test]
+	fn fieldless_import_enum_uses_string_repr_not_untagged() {
+		// e.g. the `LogLevel` enum: unit-only, must stay deserializable from JS.
+		let item: ItemEnum = syn::parse_quote! {
+			enum LogLevel {
+				Off,
+				Error,
+				Warn,
+				Info,
+				Debug,
+				Trace,
+			}
+		};
+		assert!(is_fieldless_enum(&item));
+		let repr = compact(default_enum_serde_repr(&item));
+		assert_eq!(repr, r#"serde(rename_all="camelCase")"#);
+		assert!(
+			!repr.contains("untagged"),
+			"fieldless enums must not be untagged: {repr}"
+		);
+	}
+
+	#[test]
+	fn data_carrying_enum_keeps_untagged() {
+		let item: ItemEnum = syn::parse_quote! {
+			enum Value {
+				Text(String),
+				Number(u64),
+			}
+		};
+		assert!(!is_fieldless_enum(&item));
+		assert_eq!(compact(default_enum_serde_repr(&item)), "serde(untagged)");
+	}
+
+	#[test]
+	fn enum_mixing_unit_and_data_variants_is_not_fieldless() {
+		let item: ItemEnum = syn::parse_quote! {
+			enum Mixed {
+				Unit,
+				Data(u8),
+			}
+		};
+		assert!(!is_fieldless_enum(&item));
+		assert_eq!(compact(default_enum_serde_repr(&item)), "serde(untagged)");
 	}
 }
