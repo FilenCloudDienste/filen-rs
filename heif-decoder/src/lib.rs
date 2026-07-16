@@ -272,9 +272,13 @@ impl<T: Read + Seek> HeifReader<T> {
 		self.inner.stream_position()
 	}
 
-	// Helper method to read data
-	fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
-		self.inner.read(buffer)
+	// Reads exactly `buffer.len()` bytes, looping over short reads (which a
+	// generic `Read` may return mid-file) and treating a premature EOF as an
+	// error. libheif only calls the read callback after `wait_for_file_size`
+	// confirmed the bytes are available, so a short read is a genuine failure,
+	// not a partial success to zero-fill.
+	fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), std::io::Error> {
+		self.inner.read_exact(buffer)
 	}
 
 	// Helper method to seek
@@ -311,15 +315,9 @@ unsafe extern "C" fn read_impl<T: Read + Seek>(
 	let reader = unsafe { &mut *(userdata as *mut HeifReader<T>) };
 	let buffer = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, size) };
 
-	match reader.read(buffer) {
-		Ok(bytes_read) => {
-			// Fill remaining buffer with zeros if we read less than requested
-			if bytes_read < size {
-				buffer[bytes_read..].fill(0);
-			}
-			0 // Success
-		}
-		Err(_) => -1, // Error
+	match reader.read_exact(buffer) {
+		Ok(()) => 0,  // Success — the whole buffer was filled
+		Err(_) => -1, // Error, or a genuine short read / premature EOF
 	}
 }
 
@@ -501,6 +499,22 @@ mod api_tests {
 			read_impl::<Cursor<Vec<u8>>>(
 				std::ptr::null_mut(),
 				4,
+				&mut reader as *mut _ as *mut c_void,
+			)
+		};
+		assert_eq!(result, -1);
+	}
+
+	#[test]
+	fn read_impl_reports_short_read_as_failure() {
+		// The reader holds only 2 bytes but libheif asks for 4. A short read must
+		// be reported as a failure (-1), not zero-filled and reported as success.
+		let mut reader = HeifReader::new(Cursor::new(vec![1u8, 2]), 2);
+		let mut buf = [0xEEu8; 4];
+		let result = unsafe {
+			read_impl::<Cursor<Vec<u8>>>(
+				buf.as_mut_ptr() as *mut c_void,
+				buf.len(),
 				&mut reader as *mut _ as *mut c_void,
 			)
 		};
