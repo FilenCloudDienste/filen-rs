@@ -622,7 +622,11 @@ impl AuthCacheState {
 
 impl CacheState {
 	pub(crate) async fn cleanup_cache_if_necessary(&self) {
-		debug!("Cleaning up cache at {}", self.files_dir.display());
+		debug!(
+			"Cleaning up cache (files_dir {}, db_dir {})",
+			self.files_dir.display(),
+			self.db_dir.display()
+		);
 		match self.status {
 			AuthStatus::Authenticated(ref auth_state) => {
 				debug!("Authenticated, cleaning up old files in cache directories");
@@ -631,8 +635,11 @@ impl CacheState {
 			_ => {
 				debug!("Not authenticated, removing all cache directories and database file");
 				let (cache_dir, tmp_dir, thumbnail_dir) = get_paths(&self.files_dir);
-				let db_file = self.files_dir.join(DB_FILE_NAME);
-				let sdk_cache = self.files_dir.join(crate::search::SDK_CACHE_DB_NAME);
+				// The DBs live at db_dir (== files_dir unless the platform relocated them, see
+				// CacheState::db_dir). Remove the WAL sidecars along with each DB — a leftover
+				// -wal carries the most recent decrypted names and must not survive logout.
+				let db_file = self.db_dir.join(DB_FILE_NAME);
+				let sdk_cache = self.db_dir.join(crate::search::SDK_CACHE_DB_NAME);
 				futures::join!(
 					remove_dir_all_if_exists(&cache_dir),
 					remove_dir_all_if_exists(&tmp_dir),
@@ -640,27 +647,25 @@ impl CacheState {
 					async {
 						// we can delete the db here because we are not authenticated
 						// so we know there is no database connection open
-						match tokio::fs::remove_file(&db_file).await {
-							Ok(_) => info!("Removed database file: {}", db_file.display()),
-							Err(e) if e.kind() == io::ErrorKind::NotFound => {
-								info!(
-									"Database file not found, nothing to remove: {}",
-									db_file.display()
-								);
-							}
-							Err(e) => {
-								error!(
+						for suffix in ["", "-wal", "-shm"] {
+							let mut os = db_file.clone().into_os_string();
+							os.push(suffix);
+							let path = std::path::PathBuf::from(os);
+							match tokio::fs::remove_file(&path).await {
+								Ok(_) => info!("Removed database file: {}", path.display()),
+								Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+								Err(e) => error!(
 									"Failed to remove database file {}: {}",
-									db_file.display(),
+									path.display(),
 									e
-								);
+								),
 							}
 						}
 					},
 					async {
-						// The SDK search cache lives at the files-dir ROOT (outside cache_dir), so
+						// The SDK search cache lives next to native_cache.db (outside cache_dir), so
 						// wipe it and its WAL sidecars here — otherwise it survives logout and, on
-						// files-dir reuse across accounts, leaks the previous account's cached
+						// directory reuse across accounts, leaks the previous account's cached
 						// names/keys.
 						for suffix in ["", "-wal", "-shm"] {
 							let mut os = sdk_cache.clone().into_os_string();

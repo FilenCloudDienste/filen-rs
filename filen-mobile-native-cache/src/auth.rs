@@ -83,6 +83,12 @@ pub(crate) struct CacheState {
 	// length), which makes decryption fail -> AuthFile::default() -> unauthenticated (fail-closed).
 	dek: Option<EncryptionKey>,
 	pub(crate) files_dir: PathBuf,
+	// Where the SQLite files live (native_cache.db, db_state.json, the SDK search DB). Defaults
+	// to files_dir; iOS passes the extension's private container instead — both DBs are WAL (a
+	// connection holds a shared lock even while idle) and iOS kills a process suspended while
+	// holding a lock on a shared-container file (0xdead10cc), which files_dir (the provider's
+	// document storage inside the app group) is.
+	pub(crate) db_dir: PathBuf,
 	last_update: std::sync::RwLock<Option<Instant>>,
 }
 
@@ -141,19 +147,22 @@ pub(crate) async fn update_saved_db_state_cache_cleanup_time(
 }
 
 fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheError> {
-	match std::fs::remove_file(db_path) {
-		Ok(()) => {
-			tracing::info!("Removed old database file: {}", db_path.display());
-		}
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-			tracing::info!(
-				"Database file not found, creating new one: {}",
-				db_path.display()
-			);
-		}
-		Err(e) => {
-			tracing::error!("Failed to remove old database file: {e}");
-			return Err(e.into());
+	// Remove the DB together with its WAL sidecars: a stale -wal surviving next to a recreated
+	// DB can be replayed into it on open (sqlite.org/howtocorrupt.html §4.4). Covers every
+	// reinit path (hash mismatch, version bump, wipe interrupted between unlinks).
+	for suffix in ["", "-wal", "-shm"] {
+		let mut os = db_path.as_os_str().to_os_string();
+		os.push(suffix);
+		let path = std::path::PathBuf::from(os);
+		match std::fs::remove_file(&path) {
+			Ok(()) => {
+				tracing::info!("Removed old database file: {}", path.display());
+			}
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+			Err(e) => {
+				tracing::error!("Failed to remove old database file {}: {e}", path.display());
+				return Err(e.into());
+			}
 		}
 	}
 	let db = Connection::open(db_path)?;
@@ -164,11 +173,15 @@ fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheE
 	Ok(db)
 }
 
-fn db_from_files_dir(
-	files_dir: &Path,
+fn db_from_dir(
+	db_dir: &Path,
 	cache_state_file: &Path,
 ) -> Result<(Connection, Option<SavedDBState>), CacheError> {
-	let db_path = files_dir.join(DB_FILE_NAME);
+	// Unlike files_dir (system-provided document storage), a relocated db_dir is OURS to
+	// create — don't rely on the platform caller having done it (the Swift side's
+	// createDirectory failure is deliberately non-fatal there).
+	std::fs::create_dir_all(db_dir)?;
+	let db_path = db_dir.join(DB_FILE_NAME);
 	let state_file = match std::fs::read_to_string(cache_state_file) {
 		Ok(contents) => contents,
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -308,6 +321,7 @@ fn update_state(state: &mut CacheState, auth_file: AuthFile) {
 				match AuthCacheState::from_sdk_config(
 					config,
 					&state.files_dir,
+					&state.db_dir,
 					auth_file
 						.max_thumbnail_files_budget
 						.unwrap_or(DEFAULT_MAX_THUMBNAIL_FILES_BUDGET),
@@ -535,15 +549,16 @@ impl AuthCacheState {
 	fn from_sdk_config(
 		config: FilenSDKConfig,
 		files_dir: &Path,
+		db_dir: &Path,
 		max_thumbnail_files_budget: u64,
 		max_cache_files_budget: u64,
 	) -> Result<Self, CacheError> {
 		let unauth_client = UnauthClient::from_config(ClientConfig::default())?;
 		let client = unauth_client.from_stringified(config.into())?;
 
-		let cache_state_file = files_dir.join("db_state.json");
+		let cache_state_file = db_dir.join("db_state.json");
 
-		let (db, state) = db_from_files_dir(files_dir, &cache_state_file)?;
+		let (db, state) = db_from_dir(db_dir, &cache_state_file)?;
 
 		if state.as_ref().is_none_or(|state| state.version.is_none()) {
 			tracing::info!(
@@ -560,9 +575,9 @@ impl AuthCacheState {
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir)?;
 
-		// Keep the SDK search DB at the files-dir root, NOT under cache_dir (which the cache
+		// Keep the SDK search DB next to native_cache.db, NOT under cache_dir (which the cache
 		// cleanup scans/wipes expecting only per-file uuid subdirectories).
-		let sdk_cache_path = files_dir.join(crate::search::SDK_CACHE_DB_NAME);
+		let sdk_cache_path = db_dir.join(crate::search::SDK_CACHE_DB_NAME);
 		let new = Self {
 			conn: Mutex::new(db),
 			cache_state_file,
@@ -734,9 +749,34 @@ impl FilenMobileCacheState {
 impl FilenMobileCacheState {
 	#[uniffi::constructor(name = "new")]
 	pub fn new(files_dir: String, auth_file: String, dek: Vec<u8>) -> Self {
+		let db_dir = files_dir.clone();
+		Self::new_internal(files_dir, db_dir, auth_file, dek)
+	}
+
+	/// Like [`new`](Self::new), but with the SQLite files (`native_cache.db`, `db_state.json`,
+	/// the SDK search DB) rooted at `db_dir` instead of `files_dir`. iOS passes the extension's
+	/// private container here: both DBs are WAL (a connection holds a shared lock even while
+	/// idle) and iOS kills a process that is suspended while holding a lock on a file in the
+	/// shared app-group container (0xdead10cc) — which is where `files_dir` (the provider's
+	/// document storage) lives. Deliberately NO migration or cleanup of DB files an earlier
+	/// build left at `files_dir` — nothing reads those paths again, and a fresh `db_dir` simply
+	/// reinitializes and re-syncs the cache (one-time re-download of materialized content).
+	#[uniffi::constructor(name = "new_with_db_dir")]
+	pub fn new_with_db_dir(
+		files_dir: String,
+		db_dir: String,
+		auth_file: String,
+		dek: Vec<u8>,
+	) -> Self {
+		Self::new_internal(files_dir, db_dir, auth_file, dek)
+	}
+}
+
+impl FilenMobileCacheState {
+	fn new_internal(files_dir: String, db_dir: String, auth_file: String, dek: Vec<u8>) -> Self {
 		crate::env::init_logger();
 		debug!(
-			"Initializing FilenMobileCacheState with files_dir: {files_dir} and auth_dir: {auth_file}"
+			"Initializing FilenMobileCacheState with files_dir: {files_dir}, db_dir: {db_dir} and auth_dir: {auth_file}"
 		);
 		// A key of the wrong length (including the empty "couldn't obtain it" marker) becomes
 		// None, which fails auth file decryption -> unauthenticated (fail-closed).
@@ -749,6 +789,7 @@ impl FilenMobileCacheState {
 				auth_file: Arc::new(PathBuf::from(auth_file)),
 				dek,
 				files_dir: PathBuf::from(files_dir),
+				db_dir: PathBuf::from(db_dir),
 				last_update: std::sync::RwLock::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
@@ -774,6 +815,7 @@ impl FilenMobileCacheState {
 				// In-memory auth never reads the file (allow_auth_disable = false), so no key needed.
 				dek: None,
 				files_dir: PathBuf::from(files_dir),
+				db_dir: PathBuf::from(files_dir),
 				last_update: std::sync::RwLock::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
