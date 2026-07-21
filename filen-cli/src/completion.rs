@@ -130,27 +130,36 @@ impl FilenCompleter {
 	) -> Result<Vec<String>> {
 		match arg_type {
 			FilenArgType::File | FilenArgType::Directory | FilenArgType::FileOrDirectory => {
-				let path = working_path.navigate(input);
-				let parent: DirType<'_, Normal> = match client // todo: can we infer Normal?
-					.find_item_at_path(&path.parent().0)
-					.await
-					.context("Failed to find parent dir")?
-				{
-					Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-					Some(NonRootFileType::Root(root)) => DirType::Root(root),
-					Some(_) => return Err(anyhow!("Parent is not a directory")),
-					None => return Err(anyhow!("Parent directory not found")),
-				};
+				let basename_input = input
+					.rsplit_once('/')
+					.map(|(_, name)| name)
+					.unwrap_or(input);
+				let input_before_basename = input.strip_suffix(basename_input).unwrap_or("");
+				if basename_input == "." || basename_input == ".." {
+					return Ok(vec![]);
+				}
+				let path_before_basename = working_path.navigate(input_before_basename);
+
+				let parent: DirType<'_, Normal> =
+					match client // todo: can we infer Normal?
+						.find_item_at_path(&path_before_basename.0)
+						.await
+						.context("Failed to find parent dir")?
+					{
+						Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
+						Some(NonRootFileType::Root(root)) => DirType::Root(root),
+						Some(_) => return Err(anyhow!("Parent is not a directory")),
+						None => return Err(anyhow!("Parent directory not found")),
+					};
 				let (dirs, files) = client
 					.list_dir(&parent, None::<&fn(u64, Option<u64>)>) // todo: ?
 					.await
 					.context("Failed to list parent directory")?;
 				let mut candidates = Vec::new();
-				let basename_input = path.basename().unwrap_or("");
 				for dir in dirs {
 					let name = dir.meta.name().unwrap_or("");
 					if name.starts_with(basename_input) {
-						candidates.push(format!("{}/", name));
+						candidates.push(name.to_string());
 					}
 				}
 				if arg_type == &FilenArgType::File || arg_type == &FilenArgType::FileOrDirectory {
@@ -170,7 +179,6 @@ impl FilenCompleter {
 							.to_string() + c
 					})
 					.collect())
-				// todo: think really hard about all the stripping etc. happening here (does it handle ".." correctly?)
 			}
 			FilenArgType::HelpTopic => Ok(get_help_topics()
 				.context("Failed to get help topics")?
@@ -272,34 +280,46 @@ mod tests {
 		test_completer("c", &["cat", "cd", "cp"]);
 
 		// basic completion of files and directories
-		test_completer("ls d", &["ls dir1/", "ls dir2/"]);
-		test_completer("ls dir1/", &["ls dir1/"]);
+		test_completer("ls d", &["ls dir1", "ls dir2"]);
+		test_completer("ls dir1", &["ls dir1"]);
 
 		// complete second arguments
-		test_completer("cp some_file.txt some_d", &["cp some_file.txt some_dir/"]);
+		test_completer("cp some_file.txt some_d", &["cp some_file.txt some_dir"]);
 
 		// differentiate between files and directories
-		test_completer("cat some", &["cat some_file.txt", "cat some_dir/"]); // directories should also be suggested for cat, because they might contain files that the user wants to cat
-		test_completer("ls some", &["ls some_dir/"]); // ls only accepts directories
+		test_completer("cat some", &["cat some_file.txt", "cat some_dir"]); // directories should also be suggested for cat, because they might contain files that the user wants to cat
+		test_completer("ls some", &["ls some_dir"]); // ls only accepts directories
 
 		// completion in subdirectories
 		test_completer("cat dir1/f", &["cat dir1/file_in_dir1.txt"]);
-		test_completer("cat dir1/s", &["cat dir1/subdir1/"]);
+		test_completer("cat dir1/s", &["cat dir1/subdir1"]);
 		test_completer(
 			"cat dir1/subdir1/f",
 			&["cat dir1/subdir1/file_in_subdir1.txt"],
 		);
 
 		// completion edge cases
-		test_completer("ls dir1", &["ls dir1/"]);
+		test_completer("ls dir1", &["ls dir1"]);
 		// non-existing path
 		test_completer("ls non_existing", &[]);
 		// empty input
 		test_completer("ls ", &[]);
 
 		// completions that have spaces in them
-		test_completer("ls a", &["ls \"a dir with spaces/\""]);
-		// todo should also be able to do this:
+		test_completer("ls a", &["ls \"a dir with spaces\""]);
+		// todo: should also be able to do this:
 		//test_completer("cat \"a dir with spaces/file\"", &["cat \"a dir with spaces/file_in_dir_with_spaces.txt\""]);
+
+		// handle relative path parts like "." and ".."
+		test_completer("ls .", &[]);
+		test_completer(
+			"ls ./",
+			&[
+				"ls ./dir1",
+				"ls ./dir2",
+				"ls ./some_dir",
+				"ls \"./a dir with spaces\"",
+			],
+		);
 	}
 }
