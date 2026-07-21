@@ -36,6 +36,18 @@ jobs:
           sudo apt-get install -y libdav1d-dev pkg-config
       - name: Install sqlfluff
         run: pip install sqlfluff
+      - name: Install Wild linker
+        # Must run before the first cargo invocation: .cargo/config.toml routes every native
+        # linux-gnu link through Wild, and even clippy links build scripts.
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
+        env:
+          # On a cache miss the action cargo-installs from the repo checkout, where the same
+          # config applies — building Wild would need Wild. Env vars beat config.toml, so
+          # restore the stock linker just for this bootstrap build.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run clippy all features
         run: cargo clippy -F heif-decoder,avif-decoder,malformed,multi-threaded-crypto,cache -- -D warnings
       - name: Run clippy single-threaded
@@ -58,10 +70,6 @@ jobs:
           taplo fmt --check
       - name: Run sqlfluff
         run: sqlfluff lint .
-      - name: Install Wild linker
-        uses: taiki-e/cache-cargo-install-action@v2
-        with:
-          tool: wild-linker@0.9.0
       - name: Run unit tests
         run: cargo test --lib -F cache --no-fail-fast
         env:

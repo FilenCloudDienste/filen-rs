@@ -71,6 +71,11 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: wild-linker@0.9.0
+        env:
+          # Env beats .cargo/config.toml: a cache-miss cargo install runs in the repo
+          # checkout, which would otherwise need Wild to build Wild.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run tests
         run: cargo test -F malformed,heif-decoder,avif-decoder --no-fail-fast
         env:
@@ -119,6 +124,11 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: wild-linker@0.9.0
+        env:
+          # Env beats .cargo/config.toml: a cache-miss cargo install runs in the repo
+          # checkout, which would otherwise need Wild to build Wild.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run the isolated 2FA test (#[ignore]'d out of the matrix)
         run: cargo test -p filen-sdk-rs --test client_tests --no-fail-fast -- --ignored
         env:
@@ -164,6 +174,11 @@ jobs:
           tool: wasm-pack
           git: https://github.com/wasm-bindgen/wasm-pack
           rev: cd1718aa7babb656796b8aae3c177ddacce28028
+        env:
+          # Env beats .cargo/config.toml: a cache-miss cargo install runs in the repo
+          # checkout, where the config demands Wild — and this job never installs Wild.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:

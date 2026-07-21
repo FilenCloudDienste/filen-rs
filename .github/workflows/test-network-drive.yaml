@@ -43,6 +43,11 @@ jobs:
         uses: taiki-e/cache-cargo-install-action@v2
         with:
           tool: wild-linker@0.9.0
+        env:
+          # Env beats .cargo/config.toml: a cache-miss cargo install runs in the repo
+          # checkout, which would otherwise need Wild to build Wild.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
       - name: Run tests
         run: cargo test
         working-directory: ./filen-network-drive
