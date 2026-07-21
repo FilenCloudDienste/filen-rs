@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
@@ -6,6 +6,7 @@ use console::{self, style};
 use filen_sdk_rs::auth::Client;
 use inquire::{
 	Autocomplete, InquireError,
+	history::SimpleHistory,
 	ui::{RenderConfig, Styled},
 };
 use log::{error, info, warn};
@@ -55,7 +56,7 @@ const FAILED_TO_READ_INPUT_PROMPT: &str = "Failed to read input prompt";
 
 pub(crate) struct UI {
 	quiet: bool,
-	history: HashSet<String>,
+	history: Vec<String>,
 	override_terminal_width: Option<usize>,
 	output: Vec<String>,
 
@@ -67,7 +68,7 @@ impl UI {
 	pub(crate) fn new() -> Self {
 		UI {
 			quiet: false,
-			history: HashSet::new(),
+			history: Vec::new(),
 			override_terminal_width: None,
 			output: Vec::new(),
 			json: false,
@@ -276,11 +277,15 @@ impl UI {
 				client,
 				working_path: working_path.clone(),
 			})
+			.with_history(SimpleHistory::new(self.history.clone()))
 			.prompt_skippable()
 		{
 			Ok(Some(answer)) => {
 				info!("[PROMPT] answer: {}", answer);
-				self.history.insert(answer.clone());
+				if self.history.first().map(|s| s != &answer).unwrap_or(true) {
+					// avoid duplicate entries in history
+					self.history.insert(0, answer.clone());
+				}
 				Ok(ReplPromptResult {
 					input: Some(answer),
 					exit: false,

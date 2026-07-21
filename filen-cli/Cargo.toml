@@ -59,10 +59,9 @@ port_check = "0.3.0"
 open = "5.3.5"
 clap_complete = { version = "4.5.65", features = ["unstable-dynamic"] }
 strum = { version = "0.28.0", features = ["derive"] }
-# not anymore, since it misses some important features: We're using this branch of inquire, which is already a PR to add history support, but not yet merged.
-# might make our own fork in the meantime
-# inquire = { git = "https://github.com/mikecvet/inquire.git", branch = "history" }
-inquire = { version = "0.9.4" }
+# we're using this fork of inquire, which contains history functionality (copied from an unmerged PR to upstream https://github.com/mikaelmello/inquire/pull/229) as well as more input action
+# todo: might merge this upstream in the future
+inquire = { git = "https://github.com/JupiterPi/inquire.git", branch = "more-actions" }
 console = "0.16.4"
 
 [dev-dependencies]

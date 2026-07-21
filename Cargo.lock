@@ -3071,8 +3071,7 @@ dependencies = [
 [[package]]
 name = "inquire"
 version = "0.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6654738b8024300cf062d04a1c13c10c8e2cea598ec1c47dc9b6641159429756"
+source = "git+https://github.com/JupiterPi/inquire.git?branch=more-actions#0e595b4f2cefaebb996f3a1d84fd3f9eeccb0405"
 dependencies = [
  "bitflags",
  "crossterm",
