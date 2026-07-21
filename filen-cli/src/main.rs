@@ -17,7 +17,7 @@ use log::{LevelFilter, info};
 use crate::{
 	commands::{Commands, execute_command},
 	docs::{generate_markdown_docs, print_in_app_docs},
-	ui::CustomLogger,
+	ui::{CustomLogger, ReplPromptResult},
 	updater::check_for_updates,
 	util::RemotePath,
 };
@@ -237,11 +237,22 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		// .. without authentication when called directly (no REPL)
 
 		loop {
-			let line = ui.prompt_repl(client.get_arc().unwrap(), &working_path)?;
-			let line = match line {
-				None => continue,
-				Some(line) if line.is_empty() => continue,
-				Some(line) => line,
+			let repl_result = ui.prompt_repl(client.get_arc().unwrap(), &working_path)?;
+			let line = match repl_result {
+				ReplPromptResult {
+					input: Some(line), ..
+				} if line.is_empty() => continue,
+				ReplPromptResult {
+					input: Some(line), ..
+				} => line,
+				ReplPromptResult {
+					input: None,
+					exit: true,
+				} => break,
+				ReplPromptResult {
+					input: None,
+					exit: false,
+				} => continue,
 			};
 			let mut args = shlex::split(line.trim()).context("Invalid quoting")?;
 			args.insert(0, String::from("filen"));

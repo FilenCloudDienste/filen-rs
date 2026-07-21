@@ -5,7 +5,7 @@ use clap::{CommandFactory, builder::Styles};
 use console::{self, style};
 use filen_sdk_rs::auth::Client;
 use inquire::{
-	Autocomplete,
+	Autocomplete, InquireError,
 	ui::{RenderConfig, Styled},
 };
 use log::{error, info, warn};
@@ -260,7 +260,7 @@ impl UI {
 		&mut self,
 		client: Arc<Client>,
 		working_path: &RemotePath,
-	) -> Result<Option<String>> {
+	) -> Result<ReplPromptResult> {
 		info!("[PROMPT] prompt_repl with path: {}", working_path);
 		let prompt_prefix = format!("({})", client.email());
 		let render_config = RenderConfig::default()
@@ -270,55 +270,123 @@ impl UI {
 			.with_answered_prompt_prefix(
 				Styled::new(prompt_prefix.as_str()).with_fg(inquire::ui::Color::LightCyan),
 			);
-		let answer = inquire::Text::new(&working_path.to_string())
+		match inquire::Text::new(&working_path.to_string())
 			.with_render_config(render_config)
 			.with_autocomplete(InquireCompleter {
 				client,
 				working_path: working_path.clone(),
 			})
 			.prompt_skippable()
-			.context(FAILED_TO_READ_INPUT_PROMPT)?;
-		if let Some(ref answer) = answer {
-			info!("[PROMPT] answer: {}", answer);
-			self.history.insert(answer.clone());
-		} else {
-			info!("[PROMPT] skipped");
+		{
+			Ok(Some(answer)) => {
+				info!("[PROMPT] answer: {}", answer);
+				self.history.insert(answer.clone());
+				Ok(ReplPromptResult {
+					input: Some(answer),
+					exit: false,
+				})
+			}
+			Ok(None) => {
+				info!("[PROMPT] skipped");
+				Ok(ReplPromptResult {
+					input: None,
+					exit: false,
+				})
+			}
+			Err(InquireError::OperationCanceled) => {
+				info!("[PROMPT] canceled");
+				Ok(ReplPromptResult {
+					input: None,
+					exit: false,
+				})
+			}
+			Err(InquireError::OperationInterrupted) => {
+				info!("[PROMPT] interrupted");
+				Ok(ReplPromptResult {
+					input: None,
+					exit: true,
+				})
+			}
+			Err(e) => {
+				error!("[PROMPT] failed to read input");
+				Err(anyhow::anyhow!("{}: {}", FAILED_TO_READ_INPUT_PROMPT, e))
+			}
 		}
-		Ok(answer)
-		// todo: terminal has weird graphical glitches when using the completer
 	}
 
-	/// Prompt the user for text input
+	/// Prompt the user for text input.
+	/// Returns None if the user cancels the prompt (Ctrl+C or Esc)
 	pub(crate) fn prompt(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt with message: {}", msg);
-		let answer = inquire::Text::new(msg.trim())
-			.prompt()
-			.context(FAILED_TO_READ_INPUT_PROMPT)?;
-		info!("[PROMPT] answer: {}", answer);
-		Ok(answer)
+		match Self::handle_prompt_result(inquire::Text::new(msg.trim()).prompt(), true) {
+			Ok(Some(answer)) => Ok(answer),
+			Ok(None) => Err(UI::failure("Canceled")),
+			Err(e) => Err(e)?,
+		}
 	}
 
-	/// Prompt the user for a password (no echo)
+	/// Prompt the user for a password (hidden).
+	/// Returns None if the user cancels the prompt (Ctrl+C or Esc)
 	pub(crate) fn prompt_password(&mut self, msg: &str) -> Result<String> {
 		info!("[PROMPT] prompt_password with message: {}", msg);
-		let answer = inquire::Password::new(msg.trim())
-			.with_display_mode(inquire::PasswordDisplayMode::Masked)
-			.without_confirmation()
-			.prompt()
-			.context(FAILED_TO_READ_INPUT_PROMPT)?;
-		info!("[PROMPT] answer not displayed in logs");
-		Ok(answer)
+		match Self::handle_prompt_result(
+			inquire::Password::new(msg.trim())
+				.with_display_mode(inquire::PasswordDisplayMode::Masked)
+				.without_confirmation()
+				.prompt(),
+			false,
+		) {
+			Ok(Some(answer)) => Ok(answer),
+			Ok(None) => Err(UI::failure("Canceled")),
+			Err(e) => Err(e)?,
+		}
+	}
+
+	fn handle_prompt_result(
+		result: Result<String, InquireError>,
+		log_answer: bool,
+	) -> Result<Option<String>> {
+		match result {
+			Ok(answer) => {
+				if log_answer {
+					info!("[PROMPT] answer: {}", answer);
+				} else {
+					info!("[PROMPT] answer not displayed in logs");
+				}
+				Ok(Some(answer))
+			}
+			Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+				info!("[PROMPT] canceled");
+				Ok(None)
+			}
+			Err(InquireError::IO(e)) => Err(anyhow::anyhow!("IO error: {}", e)),
+			/* Err(InquireError::IO(_)) | Err(InquireError::NotTTY) => {
+				Err(anyhow::anyhow!("{}", FAILED_TO_READ_INPUT_PROMPT))
+			} */
+			Err(e) => Err(anyhow::anyhow!("Failed to read input prompt: {}", e)),
+		}
 	}
 
 	/// Prompt the user for a yes/no input
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
 		info!("[PROMPT] prompt_confirm with message: {}", msg);
-		let answer = inquire::Confirm::new(msg.trim())
+		let result = inquire::Confirm::new(msg.trim())
 			.with_default(default)
-			.prompt()
-			.context(FAILED_TO_READ_INPUT_PROMPT)?;
-		info!("[PROMPT] answer: {}", answer);
-		Ok(answer)
+			.prompt();
+		match result {
+			Ok(answer) => {
+				info!("[PROMPT] answer: {}", answer);
+				Ok(answer)
+			}
+			Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+				info!("[PROMPT] canceled");
+				Err(UI::failure("Canceled"))
+			}
+			Err(InquireError::IO(_)) | Err(InquireError::NotTTY) => {
+				Err(anyhow::anyhow!("{}", FAILED_TO_READ_INPUT_PROMPT))
+			}
+			Err(e) => Err(anyhow::anyhow!("Failed to read input prompt: {}", e)),
+		}
 	}
 
 	// format help text
@@ -401,6 +469,11 @@ impl UI {
 	pub(crate) fn format_text_heading(text: &str) -> String {
 		style(text).bold().underlined().to_string()
 	}
+}
+
+pub(crate) struct ReplPromptResult {
+	pub(crate) input: Option<String>,
+	pub(crate) exit: bool,
 }
 
 pub(crate) fn format_date(date: &chrono::DateTime<chrono::Utc>) -> String {
