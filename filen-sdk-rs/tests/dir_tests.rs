@@ -63,7 +63,7 @@ async fn create_list_trash() {
 		.into_iter()
 		.find(|d| d.uuid() == dir.uuid())
 		.unwrap();
-	assert_eq!(*found.parent(), ParentUuid::Uuid(test_dir.uuid()));
+	assert_eq!(*found.parent(), ParentUuid::Trash(test_dir.uuid()));
 
 	let found_dir = client.get_dir(dir.uuid()).await.unwrap();
 	assert_eq!(dir, found_dir);
