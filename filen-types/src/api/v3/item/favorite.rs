@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::fs::{ObjectType, UuidStr};
+use crate::fs::{ObjectType, Uuid};
 
 pub const ENDPOINT: &str = "v3/item/favorite";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub r#type: ObjectType,
 	#[serde(with = "crate::serde::boolean::number")]
 	pub value: bool,

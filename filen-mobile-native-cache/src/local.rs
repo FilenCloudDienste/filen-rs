@@ -1,7 +1,7 @@
 use std::{collections::HashMap, str::FromStr, time::Instant};
 
 use filen_sdk_rs::fs::HasUUID;
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::Uuid;
 use rusqlite::OptionalExtension;
 use tracing::debug;
 
@@ -94,14 +94,14 @@ impl AuthCacheState {
 	) -> Result<Option<FfiRoot>, CacheError> {
 		debug!("Querying root info for UUID: {root_uuid_str}");
 		let conn = self.conn();
-		Ok(DBRoot::select(&conn, UuidStr::from_str(&root_uuid_str)?)
+		Ok(DBRoot::select(&conn, Uuid::from_str(&root_uuid_str)?)
 			.optional()?
 			.map(Into::into))
 	}
 
 	pub(crate) fn add_root(&self, root: &str) -> Result<(), CacheError> {
 		debug!("Adding root with UUID: {root}");
-		let root_uuid = UuidStr::from_str(root)?;
+		let root_uuid = Uuid::from_str(root)?;
 		let mut conn = self.conn();
 		sql::insert_root(&mut conn, root_uuid)?;
 		Ok(())
@@ -148,7 +148,7 @@ impl AuthCacheState {
 		order_by: Option<String>,
 	) -> Result<QueryNonDirChildrenResponse, CacheError> {
 		debug!("Querying trash with order by: {order_by:?}");
-		let children = sql::select_children(&self.conn(), order_by.as_deref(), ParentUuid::Trash)?;
+		let children = sql::select_trash(&self.conn(), order_by.as_deref())?;
 		let last_update = *self.last_trash_update.read().unwrap();
 		let now = Instant::now();
 		Ok(QueryNonDirChildrenResponse {
@@ -176,7 +176,7 @@ impl AuthCacheState {
 				DBDirObject::Dir(dbdir) => sql::dir::DBDirTrait::name(dbdir),
 				DBDirObject::Root(_) => Some("root"),
 			};
-			let path = self.get_cached_file_path_from_name(dir_obj.uuid().as_ref(), name);
+			let path = self.get_cached_file_path_from_name(&dir_obj.uuid().to_string(), name);
 			if let Err(e) = std::fs::create_dir_all(path)
 				&& e.kind() != std::io::ErrorKind::AlreadyExists
 			{
@@ -191,7 +191,7 @@ impl AuthCacheState {
 
 	pub(crate) fn query_item_by_uuid(&self, uuid: &str) -> Result<Option<FfiObject>, CacheError> {
 		debug!("Querying item by UUID: {uuid}");
-		let uuid = UuidStr::from_str(uuid)?;
+		let uuid = Uuid::from_str(uuid)?;
 		Ok(DBObject::select(&self.conn(), uuid)
 			.optional()?
 			.map(Into::into))
@@ -199,10 +199,10 @@ impl AuthCacheState {
 
 	pub(crate) fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiId>, CacheError> {
 		debug!("Querying path for UUID: {uuid}");
-		if uuid == self.client.root().uuid().as_ref() {
+		if uuid == self.client.root().uuid().to_string() {
 			return Ok(Some(uuid.into()));
 		}
-		let uuid = UuidStr::from_str(&uuid)?;
+		let uuid = Uuid::from_str(&uuid)?;
 		let conn = self.conn();
 		let path = sql::recursive_select_path_from_uuid(&conn, uuid)?;
 
@@ -228,7 +228,7 @@ impl AuthCacheState {
 		local_data: HashMap<String, String>,
 	) -> Result<(), CacheError> {
 		debug!("Setting local data for UUID: {uuid} to {local_data:?}");
-		let uuid = UuidStr::from_str(uuid)?;
+		let uuid = Uuid::from_str(uuid)?;
 		let mut conn = self.conn();
 		sql::update_local_data(&mut conn, uuid, Some(&JsonObject::new(local_data)))?;
 		Ok(())

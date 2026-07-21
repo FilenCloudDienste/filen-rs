@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::UuidStr,
+	fs::Uuid,
 	traits::CowHelpers,
 };
 
@@ -44,7 +44,7 @@ pub enum NoteType {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteTag<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub name: EncryptedString<'a>,
 	pub favorite: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -71,7 +71,7 @@ pub struct NoteParticipant<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Note<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub owner_id: u64,
 	#[serde(with = "crate::serde::number::permissive_u64")]

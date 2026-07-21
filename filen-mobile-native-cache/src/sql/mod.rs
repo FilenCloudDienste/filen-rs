@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	user::UserInfo,
 	util::PathIteratorExt,
 };
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::{Uuid, UuidStr};
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use rusqlite::{
 	Connection, OptionalExtension, ToSql,
@@ -111,7 +111,7 @@ pub(crate) fn select_object_at_parsed_id<'a>(
 	}
 }
 
-pub(crate) fn insert_root(conn: &mut Connection, root: UuidStr) -> Result<(), rusqlite::Error> {
+pub(crate) fn insert_root(conn: &mut Connection, root: Uuid) -> Result<(), rusqlite::Error> {
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{
 		let mut stmt = tx.prepare_cached(INSERT_ROOT_INTO_ITEMS)?;
@@ -140,7 +140,7 @@ pub(crate) fn insert_root(conn: &mut Connection, root: UuidStr) -> Result<(), ru
 
 pub(crate) fn update_root(
 	conn: &Connection,
-	root_uuid: UuidStr,
+	root_uuid: Uuid,
 	response: &UserInfo,
 ) -> Result<(), rusqlite::Error> {
 	let id: i64 = conn.query_one(SELECT_ID_BY_UUID, [root_uuid], |row| row.get(0))?;
@@ -150,21 +150,21 @@ pub(crate) fn update_root(
 	Ok(())
 }
 
-pub(crate) fn delete_item(conn: &Connection, item_uuid: UuidStr) -> Result<(), rusqlite::Error> {
+pub(crate) fn delete_item(conn: &Connection, item_uuid: Uuid) -> Result<(), rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(DELETE_BY_UUID)?;
 	stmt.execute([item_uuid])?;
 	Ok(())
 }
 
 fn get_all_descendant_paths_with_stmt(
-	uuid: UuidStr,
+	uuid: Uuid,
 	current_path: &str,
 	stmt: &mut rusqlite::CachedStatement<'_>,
 	paths: &mut Vec<String>,
 ) -> Result<(), rusqlite::Error> {
 	let items = stmt
 		.query_and_then([uuid], |f| -> Result<_, rusqlite::Error> {
-			let uuid = f.get::<_, UuidStr>(0)?;
+			let uuid = f.get::<_, Uuid>(0)?;
 			let item_type = f.get::<_, ItemType>(1)?;
 			let name_or_uuid = f.get::<_, String>(2)?;
 			Ok((uuid, name_or_uuid, item_type))
@@ -182,7 +182,7 @@ fn get_all_descendant_paths_with_stmt(
 
 pub(crate) fn get_all_descendant_paths(
 	conn: &Connection,
-	uuid: UuidStr,
+	uuid: Uuid,
 	current_path: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(SELECT_UUID_TYPE_NAME_BY_PARENT)?;
@@ -193,7 +193,7 @@ pub(crate) fn get_all_descendant_paths(
 
 pub(crate) fn recursive_select_path_from_uuid(
 	conn: &Connection,
-	uuid: UuidStr,
+	uuid: Uuid,
 ) -> Result<Option<String>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(RECURSIVE_SELECT_PATH_FROM_UUID)?;
 	stmt.query_row([uuid], |row| row.get(0)).optional()
@@ -201,7 +201,7 @@ pub(crate) fn recursive_select_path_from_uuid(
 
 pub(crate) fn update_local_data(
 	conn: &mut Connection,
-	uuid: UuidStr,
+	uuid: Uuid,
 	local_data: Option<&JsonObject>,
 ) -> Result<(), rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(UPDATE_LOCAL_DATA_BY_UUID)?;
@@ -262,11 +262,14 @@ pub(crate) fn update_recents(
 	Ok(())
 }
 
+/// Refreshes the cached children of a single directory: everything currently under `parent`
+/// (excluding trashed items) is marked stale, the fresh listing is upserted, and whatever stayed
+/// stale is deleted.
 pub(crate) fn update_items_with_parent<I, I1>(
 	conn: &mut Connection,
 	dirs: I,
 	files: I1,
-	parent: ParentUuid,
+	parent: Uuid,
 ) -> Result<(), rusqlite::Error>
 where
 	I: IntoIterator<Item = RemoteDirectory>,
@@ -277,34 +280,7 @@ where
 		let mut stmt = tx.prepare_cached(MARK_STALE_WITH_PARENT)?;
 		stmt.execute([parent])?;
 
-		let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
-		let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
-		let mut upsert_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
-		let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
-
-		for dir in dirs {
-			DBDir::upsert_from_remote_stmts(
-				dir,
-				&mut upsert_item_stmt,
-				&mut upsert_dir,
-				&mut upsert_dir_meta,
-				&mut delete_dir_meta,
-			)?;
-		}
-
-		let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
-		let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
-		let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
-
-		for file in files {
-			DBFile::upsert_from_remote_stmts(
-				file,
-				&mut upsert_item_stmt,
-				&mut upsert_file,
-				&mut upsert_file_meta,
-				&mut delete_file_meta,
-			)?;
-		}
+		upsert_dirs_and_files(&tx, dirs, files)?;
 
 		let mut stmt = tx.prepare_cached(DELETE_STALE_WITH_PARENT)?;
 		stmt.execute([parent])?;
@@ -313,13 +289,89 @@ where
 	Ok(())
 }
 
+/// Refreshes the cached trash listing. Trashed items keep their original `parent`, so the sweep
+/// is scoped by the `trashed` flag rather than by a parent uuid. Each item's own parent is
+/// `ParentUuid::Trash`, which the upsert decomposes back into `(original parent, trashed = 1)`.
+pub(crate) fn update_trashed_items<I, I1>(
+	conn: &mut Connection,
+	dirs: I,
+	files: I1,
+) -> Result<(), rusqlite::Error>
+where
+	I: IntoIterator<Item = RemoteDirectory>,
+	I1: IntoIterator<Item = RemoteFile>,
+{
+	let tx = conn.transaction()?;
+	{
+		let mut stmt = tx.prepare_cached(MARK_STALE_TRASHED)?;
+		stmt.execute([])?;
+
+		upsert_dirs_and_files(&tx, dirs, files)?;
+
+		let mut stmt = tx.prepare_cached(DELETE_STALE_TRASHED)?;
+		stmt.execute([])?;
+	}
+	tx.commit()?;
+	Ok(())
+}
+
+fn upsert_dirs_and_files<I, I1>(
+	tx: &rusqlite::Transaction<'_>,
+	dirs: I,
+	files: I1,
+) -> Result<(), rusqlite::Error>
+where
+	I: IntoIterator<Item = RemoteDirectory>,
+	I1: IntoIterator<Item = RemoteFile>,
+{
+	let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
+	let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
+	let mut upsert_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
+	let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
+
+	for dir in dirs {
+		DBDir::upsert_from_remote_stmts(
+			dir,
+			&mut upsert_item_stmt,
+			&mut upsert_dir,
+			&mut upsert_dir_meta,
+			&mut delete_dir_meta,
+		)?;
+	}
+
+	let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
+	let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
+	let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
+
+	for file in files {
+		DBFile::upsert_from_remote_stmts(
+			file,
+			&mut upsert_item_stmt,
+			&mut upsert_file,
+			&mut upsert_file_meta,
+			&mut delete_file_meta,
+		)?;
+	}
+	Ok(())
+}
+
 pub(crate) fn select_children(
 	conn: &Connection,
 	order_by: Option<&str>,
-	parent: ParentUuid,
+	parent: Uuid,
 ) -> SQLResult<Vec<DBNonRootObject>> {
 	let mut stmt = conn.prepare(&select_dir_children(order_by))?;
 	stmt.query_and_then([parent], DBNonRootObject::from_row)?
+		.collect::<SQLResult<Vec<_>>>()
+}
+
+/// Selects the cached trashed items (the trash listing).
+pub(crate) fn select_trash(
+	conn: &Connection,
+	order_by: Option<&str>,
+) -> SQLResult<Vec<DBNonRootObject>> {
+	let mut stmt = conn.prepare(&statements::select_trash_children(order_by))?;
+	stmt.query_and_then([], DBNonRootObject::from_row)?
 		.collect::<SQLResult<Vec<_>>>()
 }
 

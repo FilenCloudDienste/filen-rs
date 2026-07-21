@@ -7,7 +7,7 @@ use std::{
 use base64::{Engine, prelude::BASE64_STANDARD};
 use filen_types::{
 	auth::{APIKey, AuthVersion, FileEncryptionVersion, MetaEncryptionVersion},
-	fs::UuidStr,
+	fs::Uuid,
 	serde::{rsa::RsaDerPublicKey, str::SizedHexString},
 	traits::CowHelpers,
 };
@@ -91,7 +91,7 @@ impl UnauthClient {
 			email: stringified.email,
 			user_id: stringified.user_id,
 			root_dir: RootDirectory::new(
-				UuidStr::from_str(&stringified.root_uuid).map_err(ConversionError::from)?,
+				Uuid::from_str(&stringified.root_uuid).map_err(ConversionError::from)?,
 			),
 			auth_info: std::sync::RwLock::new(Arc::new(auth_info)),
 			file_encryption_version,

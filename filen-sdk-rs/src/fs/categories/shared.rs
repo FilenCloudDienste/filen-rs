@@ -57,7 +57,7 @@ impl CategoryFS for Shared {
 				let response = api::v3::shared::in_uuid::post_large(
 					client.client(),
 					&api::v3::shared::in_uuid::Request {
-						uuid: *parent.uuid(),
+						uuid: parent.uuid(),
 					},
 					progress,
 				)
@@ -100,7 +100,7 @@ impl CategoryFS for Shared {
 				let response = api::v3::shared::out_uuid::post_large(
 					client.client(),
 					&api::v3::shared::out_uuid::Request {
-						uuid: *parent.uuid(),
+						uuid: parent.uuid(),
 						receiver_id: match context {
 							SharingRole::Sharer(share_info) => share_info.id,
 							SharingRole::Receiver(share_info) => share_info.id,
@@ -156,7 +156,7 @@ impl CategoryFS for Shared {
 	{
 		if let SharingRole::Receiver(_) = context {
 			let (dirs, files) =
-				super::normal::list_recursive_parent_uuid(client, *parent.uuid(), progress).await?;
+				super::normal::list_recursive_parent_uuid(client, parent.uuid(), progress).await?;
 			return Ok((
 				dirs.into_iter()
 					.map(|d| SharedDirectory { inner: d })
@@ -168,7 +168,7 @@ impl CategoryFS for Shared {
 		let response = api::v3::dir::download::shared::post_large(
 			client.client(),
 			&api::v3::dir::download::shared::Request {
-				uuid: *parent.uuid(),
+				uuid: parent.uuid(),
 				skip_cache: true,
 			},
 			progress,
@@ -230,7 +230,7 @@ impl CategoryFS for Shared {
 		context: Self::ListDirContext<'_>,
 	) -> Result<super::fs::DirSizeInfo, Error> {
 		let request = api::v3::dir::size::Request {
-			uuid: *dir.uuid(),
+			uuid: dir.uuid(),
 			sharer_id: if let SharingRole::Sharer(ShareInfo { id, .. }) = context {
 				Some(*id)
 			} else {

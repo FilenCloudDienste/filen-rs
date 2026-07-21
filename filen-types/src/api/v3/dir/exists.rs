@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::fs::Uuid;
 
 pub const ENDPOINT: &str = "v3/dir/exists";
 
@@ -10,7 +10,7 @@ pub const ENDPOINT: &str = "v3/dir/exists";
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
 	pub name_hashed: Cow<'a, str>,
-	pub parent: UuidStr,
+	pub parent: Uuid,
 }
 
 pub use crate::api::v3::file::exists::Response;

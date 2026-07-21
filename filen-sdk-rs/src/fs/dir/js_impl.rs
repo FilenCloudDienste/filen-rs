@@ -357,7 +357,7 @@ impl JsClient {
 	)]
 	pub async fn get_dir(&self, uuid: UuidStr) -> Result<Dir, Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.get_dir(uuid).await.map(Dir::from) }).await
+		do_on_commander(move || async move { this.get_dir(uuid.into()).await.map(Dir::from) }).await
 	}
 
 	#[cfg_attr(

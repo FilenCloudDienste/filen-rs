@@ -46,9 +46,9 @@ impl CategoryFS for Linked {
 		let response = api::v3::dir::link::content::post_large(
 			client,
 			&api::v3::dir::link::content::Request {
-				uuid: *context.uuid(),
+				uuid: (*context.uuid()),
 				password: context.get_password_hash()?,
-				parent: *parent.uuid(),
+				parent: parent.uuid(),
 			},
 			progress,
 		)
@@ -109,9 +109,9 @@ impl CategoryFS for Linked {
 		let response = api::v3::dir::download::link::post_large(
 			client,
 			&api::v3::dir::download::link::Request {
-				uuid: *context.uuid(),
+				uuid: (*context.uuid()),
 				password: context.get_password_hash()?,
-				parent: *parent.uuid(),
+				parent: parent.uuid(),
 				skip_cache: false,
 			},
 			progress,
@@ -172,8 +172,8 @@ impl CategoryFS for Linked {
 		context: Self::ListDirContext<'_>,
 	) -> Result<super::fs::DirSizeInfo, Error> {
 		let request = api::v3::dir::size::link::Request {
-			uuid: *parent.uuid(),
-			link_uuid: *context.uuid(),
+			uuid: parent.uuid(),
+			link_uuid: (*context.uuid()),
 		};
 		api::v3::dir::size::link::post(client, &request)
 			.await

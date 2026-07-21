@@ -1,15 +1,15 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::fs::Uuid;
 
 pub const ENDPOINT: &str = "v3/notes/tag";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
-	pub tag: UuidStr,
+	pub uuid: Uuid,
+	pub tag: Uuid,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

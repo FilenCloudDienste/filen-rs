@@ -62,13 +62,15 @@ impl Client {
 		loop {
 			let parent_uuid = match current_item.parent() {
 				ParentUuid::Uuid(uuid) => *uuid,
+				// A trashed item resolves via its remembered original parent (its pre-trash path).
+				ParentUuid::Trash(original) if !original.is_nil() => *original,
 				_ => {
 					// If the parent UUID is not a real UUID,
 					// we try to refetch the item to see if we can get a valid parent UUID.
 					// If not, we return an error.
 					let parent_uuid = match current_item.as_ref() {
 						NonRootItemType::Dir(dir) => {
-							let dir = self.get_dir(*dir.uuid()).await?;
+							let dir = self.get_dir(dir.uuid()).await?;
 							let parent_uuid = *dir.parent();
 							if let Some(last) = ancestors.last_mut()
 								&& last.uuid() == dir.uuid()
@@ -78,19 +80,20 @@ impl Client {
 							parent_uuid
 						}
 						NonRootItemType::File(file) => {
-							let file = self.get_file(*file.uuid()).await?;
+							let file = self.get_file(file.uuid()).await?;
 							*file.parent()
 						}
 					};
 					match parent_uuid {
 						ParentUuid::Uuid(uuid) => uuid,
+						ParentUuid::Trash(original) if !original.is_nil() => original,
 						_ => {
 							return Err(Error::custom(
 								ErrorKind::MetadataWasNotDecrypted,
 								format!(
 									"Item {} does not have a valid parent: {}",
 									item.uuid(),
-									parent_uuid.as_ref()
+									parent_uuid.to_str().as_ref()
 								),
 							));
 						}
@@ -98,7 +101,7 @@ impl Client {
 				}
 			};
 
-			if &parent_uuid == self.root().uuid() {
+			if parent_uuid == self.root().uuid() {
 				break;
 			}
 
@@ -160,7 +163,7 @@ impl Client {
 		let resp = api::v3::item::favorite::post(
 			self.client(),
 			&api::v3::item::favorite::Request {
-				uuid: *dir.uuid(),
+				uuid: dir.uuid(),
 				r#type: ObjectType::Dir,
 				value,
 			},
@@ -174,7 +177,7 @@ impl Client {
 		let resp = api::v3::item::favorite::post(
 			self.client(),
 			&api::v3::item::favorite::Request {
-				uuid: *file.uuid(),
+				uuid: file.uuid(),
 				r#type: ObjectType::File,
 				value,
 			},

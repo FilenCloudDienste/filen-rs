@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 
 use crate::{crypto::error::ConversionError, js::FileMeta};
 
@@ -19,7 +19,7 @@ pub struct FileVersion {
 		serde(with = "chrono::serde::ts_milliseconds")
 	)]
 	pub timestamp: DateTime<Utc>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 impl From<crate::fs::file::FileVersion> for FileVersion {

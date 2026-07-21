@@ -22,19 +22,19 @@ pub const ENDPOINT: &str = "v3/dir";
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 use crate::{
 	api::v3::dir::color::DirColor,
 	crypto::EncryptedString,
-	fs::{ParentUuid, UuidStr},
+	fs::{ParentUuid, Uuid},
 };
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "nameEncrypted")]
 	pub metadata: EncryptedString<'a>,
 	pub name_hashed: Cow<'a, str>,

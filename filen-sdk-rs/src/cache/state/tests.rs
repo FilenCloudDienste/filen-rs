@@ -69,12 +69,11 @@ fn file_move_to_virtual_parent_becomes_removed() {
 		socket::{DecryptedDriveEvent, DecryptedSocketEvent, FileMove},
 	};
 	use chrono::Utc;
-	use filen_types::{auth::FileEncryptionVersion, fs::ParentUuid, fs::UuidStr};
+	use filen_types::{auth::FileEncryptionVersion, fs::ParentUuid};
 
-	let uuid = UuidStr::new_v4();
-	let expected: Uuid = (&uuid).into();
+	let expected = Uuid::new_v4();
 	let file = RemoteFile {
-		uuid,
+		uuid: expected,
 		parent: ParentUuid::Links,
 		size: 10,
 		favorited: false,
@@ -120,12 +119,11 @@ fn folder_move_to_virtual_parent_becomes_removed() {
 		socket::{DecryptedDriveEvent, DecryptedSocketEvent, FolderMove},
 	};
 	use chrono::Utc;
-	use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid, fs::UuidStr};
+	use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid};
 
-	let uuid = UuidStr::new_v4();
-	let expected: Uuid = (&uuid).into();
+	let expected = Uuid::new_v4();
 	let dir = RemoteDirectory::from_meta(
-		uuid,
+		expected,
 		ParentUuid::Links, // moved into a virtual container
 		DirColor::Default,
 		false,

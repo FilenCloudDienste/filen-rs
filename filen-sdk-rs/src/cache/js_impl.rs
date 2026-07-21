@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use filen_macros::js_type;
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen::JsValue;
 
@@ -35,7 +35,7 @@ pub enum CacheStatusMessage {
 	Errors { errors: Vec<String> },
 	/// Mirror of [`CacheMessage::SyncRootsDeleted`]: these roots were deleted server-side and
 	/// dropped from the active set — re-add them to resume syncing.
-	SyncRootsDeleted { roots: Vec<UuidStr> },
+	SyncRootsDeleted { roots: Vec<Uuid> },
 	/// Mirror of [`CacheMessage::ResyncProgress`].
 	ResyncProgress { progress: ResyncProgressMessage },
 }
@@ -45,10 +45,10 @@ pub enum CacheStatusMessage {
 #[js_type(export, no_deser, tagged)]
 pub enum ResyncProgressMessage {
 	Started {
-		roots: Vec<UuidStr>,
+		roots: Vec<Uuid>,
 	},
 	Listing {
-		root: UuidStr,
+		root: Uuid,
 		root_index: u64,
 		root_count: u64,
 		bytes_downloaded: u64,
@@ -66,9 +66,7 @@ impl From<CacheMessage> for CacheStatusMessage {
 			CacheMessage::Error(errors) => Self::Errors {
 				errors: errors.iter().map(ToString::to_string).collect(),
 			},
-			CacheMessage::SyncRootsDeleted(roots) => Self::SyncRootsDeleted {
-				roots: roots.iter().map(UuidStr::from).collect(),
-			},
+			CacheMessage::SyncRootsDeleted(roots) => Self::SyncRootsDeleted { roots },
 			CacheMessage::ResyncProgress(progress) => Self::ResyncProgress {
 				progress: progress.into(),
 			},
@@ -79,9 +77,7 @@ impl From<CacheMessage> for CacheStatusMessage {
 impl From<ResyncProgress> for ResyncProgressMessage {
 	fn from(progress: ResyncProgress) -> Self {
 		match progress {
-			ResyncProgress::Started { roots } => Self::Started {
-				roots: roots.iter().map(UuidStr::from).collect(),
-			},
+			ResyncProgress::Started { roots } => Self::Started { roots },
 			ResyncProgress::Listing {
 				root,
 				root_index,
@@ -89,7 +85,7 @@ impl From<ResyncProgress> for ResyncProgressMessage {
 				bytes_downloaded,
 				total_bytes,
 			} => Self::Listing {
-				root: UuidStr::from(&root),
+				root,
 				root_index: root_index as u64,
 				root_count: root_count as u64,
 				bytes_downloaded,
@@ -211,7 +207,7 @@ mod tests {
 		let CacheStatusMessage::SyncRootsDeleted { roots } = deleted else {
 			panic!("expected SyncRootsDeleted, got {deleted:?}");
 		};
-		assert_eq!(roots, vec![UuidStr::from(&uuid)]);
+		assert_eq!(roots, vec![uuid]);
 	}
 
 	#[test]
@@ -220,7 +216,7 @@ mod tests {
 
 		let started = ResyncProgressMessage::from(ResyncProgress::Started { roots: vec![uuid] });
 		assert!(
-			matches!(started, ResyncProgressMessage::Started { ref roots } if *roots == vec![UuidStr::from(&uuid)])
+			matches!(started, ResyncProgressMessage::Started { ref roots } if *roots == vec![uuid])
 		);
 
 		let listing = ResyncProgressMessage::from(ResyncProgress::Listing {
@@ -240,7 +236,7 @@ mod tests {
 		else {
 			panic!("expected Listing, got {listing:?}");
 		};
-		assert_eq!(root, UuidStr::from(&uuid));
+		assert_eq!(root, uuid);
 		assert_eq!(root_index, 3);
 		assert_eq!(root_count, 7);
 		assert_eq!(bytes_downloaded, 42);

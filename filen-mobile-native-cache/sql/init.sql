@@ -4,8 +4,12 @@ PRAGMA temp_store = MEMORY;
 
 CREATE TABLE items (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-	uuid TEXT NOT NULL UNIQUE,
-	parent TEXT,
+	uuid BLOB NOT NULL UNIQUE,
+	-- The item's real parent UUID. For a trashed item this stays the *original*
+	-- parent (where it will be restored to); `trashed` distinguishes the two.
+	-- NULL for the root.
+	parent BLOB,
+	trashed BOOLEAN NOT NULL CHECK (trashed IN (FALSE, TRUE)) DEFAULT FALSE,
 	type SMALLINT NOT NULL CHECK (type IN (0, 1, 2)),
 	is_stale BOOLEAN NOT NULL CHECK (is_stale IN (FALSE, TRUE)) DEFAULT FALSE,
 	local_data TEXT,
@@ -15,6 +19,8 @@ CREATE TABLE items (
 CREATE INDEX idx_items_uuid ON items (uuid);
 CREATE INDEX idx_items_parent ON items (parent);
 CREATE INDEX idx_items_is_recent ON items (is_recent);
+CREATE INDEX idx_items_trashed ON items (trashed)
+WHERE trashed = TRUE;
 
 CREATE TABLE roots (
 	id BIGINT PRIMARY KEY NOT NULL,
@@ -87,19 +93,16 @@ CREATE TABLE dirs_meta (
 	FOREIGN KEY (id) REFERENCES dirs (id) ON DELETE CASCADE
 );
 
-INSERT INTO items (uuid, parent, type) VALUES ('trash', NULL, 1);
-INSERT INTO dirs (id, timestamp, metadata_state) VALUES (
-	last_insert_rowid(), 0, 0
-);
-INSERT INTO dirs_meta (id, name) VALUES (last_insert_rowid(), 'Trash');
-
 CREATE TRIGGER cascade_on_update_uuid_delete_children
 AFTER UPDATE OF uuid ON items
 FOR EACH ROW
 WHEN old.uuid != new.uuid AND old.type != 2 -- Ensure it's not a file
 BEGIN
+	-- Trashed items are keyed off their original parent; they must survive the
+	-- parent's churn (they live in the trash listing, not under the parent) so
+	-- exclude them here.
 	DELETE FROM items
-	WHERE parent = old.uuid;
+	WHERE parent = old.uuid AND trashed = FALSE;
 END;
 
 CREATE TRIGGER cascade_on_delete_delete_children
@@ -108,5 +111,5 @@ FOR EACH ROW
 WHEN old.type != 2 -- Ensure it's not a file
 BEGIN
 	DELETE FROM items
-	WHERE parent = old.uuid;
+	WHERE parent = old.uuid AND trashed = FALSE;
 END;

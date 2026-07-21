@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::fs::Uuid;
 
 pub const ENDPOINT: &str = "v3/chat/mute";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub mute: bool,
 }

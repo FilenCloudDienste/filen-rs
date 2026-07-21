@@ -14,7 +14,7 @@ use filen_sdk_rs::{
 	},
 	user::events::{DecryptedUserEvent, DecryptedUserEventKind},
 };
-use filen_types::{api::v3::dir::color::DirColor, fs::UuidStr};
+use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
 use rand::Rng;
 
 fn file_meta_name<'a>(meta: &'a FileMeta<'_>) -> Option<&'a str> {
@@ -133,13 +133,13 @@ async fn versioning_creates_versions_on_duplicate_upload() {
 	};
 
 	let first = client
-		.make_file_builder("versioning-test.txt", *test_dir.uuid())
+		.make_file_builder("versioning-test.txt", test_dir.uuid())
 		.unwrap();
 	let first = client.upload_file(first, b"first content").await.unwrap();
 	tokio::time::sleep(Duration::from_secs(2)).await;
 
 	let second = client
-		.make_file_builder("versioning-test.txt", *test_dir.uuid())
+		.make_file_builder("versioning-test.txt", test_dir.uuid())
 		.unwrap();
 	let second = client.upload_file(second, b"second content").await.unwrap();
 
@@ -162,7 +162,7 @@ async fn versioning_creates_versions_on_duplicate_upload() {
 	tokio::time::sleep(Duration::from_secs(2)).await;
 
 	let third = client
-		.make_file_builder("versioning-test.txt", *test_dir.uuid())
+		.make_file_builder("versioning-test.txt", test_dir.uuid())
 		.unwrap();
 	let third = client.upload_file(third, b"third content").await.unwrap();
 
@@ -302,7 +302,7 @@ async fn events_file_upload_trash_restore_delete() {
 	let since = chrono::Utc::now();
 
 	let file_name = unique_name("lifecycle");
-	let file = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
+	let file = client.make_file_builder(&file_name, dir.uuid()).unwrap();
 	let mut file = client
 		.upload_file(file, b"lifecycle file contents")
 		.await
@@ -389,7 +389,7 @@ async fn events_file_metadata_changed_and_move() {
 
 	let original_name = unique_name("rename");
 	let file = client
-		.make_file_builder(&original_name, *dir.uuid())
+		.make_file_builder(&original_name, dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"to be renamed").await.unwrap();
 
@@ -466,11 +466,11 @@ async fn events_file_versioned_on_duplicate_upload() {
 
 	let file_name = unique_name("versioned");
 
-	let first = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
+	let first = client.make_file_builder(&file_name, dir.uuid()).unwrap();
 	let _first = client.upload_file(first, b"v1").await.unwrap();
 	tokio::time::sleep(Duration::from_secs(2)).await;
 
-	let second = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
+	let second = client.make_file_builder(&file_name, dir.uuid()).unwrap();
 	let _second = client.upload_file(second, b"v2").await.unwrap();
 
 	// fileVersioned event for our filename should appear after the second upload
@@ -670,7 +670,7 @@ async fn events_item_favorite() {
 	let since = chrono::Utc::now();
 
 	let file_name = unique_name("favorite");
-	let file = client.make_file_builder(&file_name, *dir.uuid()).unwrap();
+	let file = client.make_file_builder(&file_name, dir.uuid()).unwrap();
 	let mut file = client
 		.upload_file(file, b"will be favorited")
 		.await
@@ -732,19 +732,18 @@ async fn events_all_decryptable() {
 	);
 	let events: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
 
-	let mut undecryptable: Vec<(UuidStr, &'static str, String)> = Vec::new();
+	let mut undecryptable: Vec<(Uuid, &'static str, String)> = Vec::new();
 
-	let check_file = |uuid: UuidStr, kind: &'static str, meta: &FileMeta<'_>, out: &mut Vec<_>| {
+	let check_file = |uuid: Uuid, kind: &'static str, meta: &FileMeta<'_>, out: &mut Vec<_>| {
 		if !matches!(meta, FileMeta::Decoded(_)) {
 			out.push((uuid, kind, format!("{meta:?}")));
 		}
 	};
-	let check_dir =
-		|uuid: UuidStr, kind: &'static str, meta: &DirectoryMeta<'_>, out: &mut Vec<_>| {
-			if !matches!(meta, DirectoryMeta::Decoded(_)) {
-				out.push((uuid, kind, format!("{meta:?}")));
-			}
-		};
+	let check_dir = |uuid: Uuid, kind: &'static str, meta: &DirectoryMeta<'_>, out: &mut Vec<_>| {
+		if !matches!(meta, DirectoryMeta::Decoded(_)) {
+			out.push((uuid, kind, format!("{meta:?}")));
+		}
+	};
 
 	for event in &events {
 		let uuid = event.uuid;

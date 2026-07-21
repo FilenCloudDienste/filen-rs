@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::fs::Uuid;
 
 pub const ENDPOINT: &str = "v3/contacts/blocked/add";
 
@@ -13,5 +13,5 @@ pub struct Request {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }

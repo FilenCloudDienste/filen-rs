@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::{ParentUuid, Uuid};
 
 use crate::{
 	crypto::error::ConversionError,
@@ -17,12 +17,12 @@ use crate::{
 
 #[js_type(export, wasm_all)]
 pub struct Root {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 impl From<RootDirectory> for Root {
 	fn from(dir: RootDirectory) -> Self {
-		Root { uuid: *dir.uuid() }
+		Root { uuid: dir.uuid() }
 	}
 }
 
@@ -34,7 +34,7 @@ impl From<Root> for RootDirectory {
 
 #[js_type(import, export, wasm_all)]
 pub struct Dir {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub parent: ParentUuid,
 	pub color: DirColor,
 	#[cfg_attr(

@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::{api::v3::dir::link::info::LinkPasswordSalt, fs::UuidStr};
+use filen_types::{
+	api::v3::dir::link::info::LinkPasswordSalt,
+	fs::{Uuid, UuidStr},
+};
 use rsa::RsaPublicKey;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -25,7 +28,7 @@ use crate::{auth::js_impls::UnauthJsClient, fs::dir::js_impl::DirContentDownload
 
 #[js_type(import, export)]
 pub struct Contact {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub user_id: u64,
 	pub email: String,
 	#[cfg_attr(
@@ -88,7 +91,7 @@ impl From<Contact> for filen_types::api::v3::contacts::Contact<'static> {
 
 #[js_type(import, export)]
 pub struct BlockedContact {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub user_id: u64,
 	pub email: String,
 	#[cfg_attr(
@@ -122,7 +125,7 @@ impl From<filen_types::api::v3::contacts::blocked::BlockedContact<'_>> for Block
 
 #[js_type(export)]
 pub struct ContactRequestIn {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub user_id: u64,
 	pub email: String,
 	#[cfg_attr(
@@ -165,7 +168,7 @@ impl<'a> From<&'a ContactRequestIn>
 
 #[js_type(export)]
 pub struct ContactRequestOut {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub email: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -569,7 +572,10 @@ impl JsClient {
 	)]
 	pub async fn send_contact_request(&self, email: String) -> Result<UuidStr, Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.send_contact_request(&email).await }).await
+		do_on_commander(move || async move {
+			this.send_contact_request(&email).await.map(UuidStr::from)
+		})
+		.await
 	}
 
 	#[cfg_attr(
@@ -578,8 +584,10 @@ impl JsClient {
 	)]
 	pub async fn cancel_contact_request(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.cancel_contact_request(contact_uuid).await })
-			.await
+		do_on_commander(
+			move || async move { this.cancel_contact_request(contact_uuid.into()).await },
+		)
+		.await
 	}
 
 	#[cfg_attr(
@@ -588,8 +596,12 @@ impl JsClient {
 	)]
 	pub async fn accept_contact_request(&self, contact_uuid: UuidStr) -> Result<UuidStr, Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.accept_contact_request(contact_uuid).await })
-			.await
+		do_on_commander(move || async move {
+			this.accept_contact_request(contact_uuid.into())
+				.await
+				.map(UuidStr::from)
+		})
+		.await
 	}
 
 	#[cfg_attr(
@@ -598,7 +610,8 @@ impl JsClient {
 	)]
 	pub async fn deny_contact_request(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.deny_contact_request(contact_uuid).await }).await
+		do_on_commander(move || async move { this.deny_contact_request(contact_uuid.into()).await })
+			.await
 	}
 
 	#[cfg_attr(
@@ -607,7 +620,7 @@ impl JsClient {
 	)]
 	pub async fn delete_contact(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.delete_contact(contact_uuid).await }).await
+		do_on_commander(move || async move { this.delete_contact(contact_uuid.into()).await }).await
 	}
 
 	#[cfg_attr(
@@ -670,7 +683,8 @@ impl JsClient {
 	)]
 	pub async fn block_contact(&self, email: String) -> Result<UuidStr, Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.block_contact(&email).await }).await
+		do_on_commander(move || async move { this.block_contact(&email).await.map(UuidStr::from) })
+			.await
 	}
 
 	#[cfg_attr(
@@ -679,7 +693,8 @@ impl JsClient {
 	)]
 	pub async fn unblock_contact(&self, contact_uuid: UuidStr) -> Result<(), Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.unblock_contact(contact_uuid).await }).await
+		do_on_commander(move || async move { this.unblock_contact(contact_uuid.into()).await })
+			.await
 	}
 
 	// Sharing
@@ -783,7 +798,7 @@ impl JsClient {
 
 async fn get_linked_file<T>(
 	client: Arc<T>,
-	link_uuid: UuidStr,
+	link_uuid: Uuid,
 	file_key: String,
 	link_password: Option<String>,
 ) -> Result<LinkedFile, Error>
@@ -1126,7 +1141,7 @@ impl JsClient {
 	) -> Result<DirPublicInfo, Error> {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
-			this.get_dir_public_link_info(link_uuid, &link_key)
+			this.get_dir_public_link_info(link_uuid.into(), &link_key)
 				.await
 				.map(DirPublicInfo::from)
 		})
@@ -1143,7 +1158,7 @@ impl JsClient {
 		file_key: String,
 		link_password: Option<String>,
 	) -> Result<LinkedFile, Error> {
-		get_linked_file(self.inner(), link_uuid, file_key, link_password).await
+		get_linked_file(self.inner(), link_uuid.into(), file_key, link_password).await
 	}
 }
 
@@ -1164,7 +1179,7 @@ impl UnauthJsClient {
 	) -> Result<DirPublicInfo, Error> {
 		let this = self.inner();
 		runtime::do_on_commander(move || async move {
-			this.get_dir_public_link_info(link_uuid, &link_key)
+			this.get_dir_public_link_info(link_uuid.into(), &link_key)
 				.await
 				.map(DirPublicInfo::from)
 		})
@@ -1181,6 +1196,6 @@ impl UnauthJsClient {
 		file_key: String,
 		link_password: Option<String>,
 	) -> Result<LinkedFile, Error> {
-		get_linked_file(self.inner(), link_uuid, file_key, link_password).await
+		get_linked_file(self.inner(), link_uuid.into(), file_key, link_password).await
 	}
 }

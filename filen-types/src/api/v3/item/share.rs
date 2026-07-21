@@ -4,16 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	crypto::rsa::RSAEncryptedString,
-	fs::{ObjectType, UuidStr},
+	fs::{ObjectType, Uuid},
 };
 
 pub const ENDPOINT: &str = "v3/item/share";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(with = "crate::serde::uuid::none")]
-	pub parent: Option<UuidStr>,
+	pub parent: Option<Uuid>,
 	pub email: Cow<'a, str>,
 	pub r#type: ObjectType,
 	pub metadata: RSAEncryptedString<'a>,

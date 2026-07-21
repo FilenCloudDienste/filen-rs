@@ -369,7 +369,7 @@ mod tests {
 	use filen_types::{
 		api::v3::socket::{DriveEventType, FileRename, FolderRename, ItemFavorite},
 		crypto::EncryptedString,
-		fs::{ObjectType, ParentUuid, UuidStr},
+		fs::{ObjectType, ParentUuid, Uuid},
 	};
 
 	use super::*;
@@ -400,7 +400,7 @@ mod tests {
 		let manager = manager_filtered_on("fileMetadataChanged");
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::FileRename(FileRename {
-				uuid: UuidStr::default(),
+				uuid: Uuid::default(),
 				metadata: EncryptedString(Cow::Borrowed("encrypted")),
 			}),
 			drive_message_id: 1,
@@ -413,7 +413,7 @@ mod tests {
 		let manager = manager_filtered_on("folderMetadataChanged");
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::FolderRename(FolderRename {
-				uuid: UuidStr::default(),
+				uuid: Uuid::default(),
 				name: EncryptedString(Cow::Borrowed("encrypted")),
 			}),
 			drive_message_id: 2,
@@ -432,10 +432,10 @@ mod tests {
 	fn fallible_drive_events_pass_the_gate_for_drive_malformed_filters() {
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::ItemFavorite(ItemFavorite {
-				uuid: UuidStr::default(),
+				uuid: Uuid::default(),
 				item_type: ObjectType::File,
 				value: true,
-				parent: ParentUuid::Uuid(UuidStr::default()),
+				parent: ParentUuid::Uuid(Uuid::default()),
 				metadata: None,
 				name_encrypted: None,
 				region: None,
@@ -469,7 +469,7 @@ mod tests {
 		let manager = manager_filtered_on("fileMetadataChanged");
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::FileTrash(filen_types::api::v3::socket::FileTrash {
-				uuid: UuidStr::default(),
+				uuid: Uuid::default(),
 			}),
 			drive_message_id: 3,
 		};
@@ -481,7 +481,7 @@ mod tests {
 		let manager = manager_filtered_on("fileTrash");
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::FileTrash(filen_types::api::v3::socket::FileTrash {
-				uuid: UuidStr::default(),
+				uuid: Uuid::default(),
 			}),
 			drive_message_id: 4,
 		};

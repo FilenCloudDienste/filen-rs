@@ -1,7 +1,5 @@
 use std::cmp::Ordering;
 
-use uuid::Uuid;
-
 use crate::{
 	fs::{
 		HasName, HasRemoteInfo, HasUUID,
@@ -40,7 +38,7 @@ where
 	}
 
 	fn name(&self) -> Result<&str, WalkError> {
-		HasName::name(&self.obj).ok_or_else(|| WalkError::EncryptedMeta(self.obj.uuid().into()))
+		HasName::name(&self.obj).ok_or_else(|| WalkError::EncryptedMeta(self.obj.uuid()))
 	}
 
 	fn into_entry_type(self) -> Result<super::EntryType<Cat::Dir, Cat::File>, WalkError> {
@@ -110,7 +108,7 @@ impl<Cat: Category + ?Sized> super::CompareStrategy<Cat::Dir, Cat::File>
 					match existing.timestamp().cmp(&new.timestamp()) {
 						Ordering::Less => true,
 						Ordering::Greater => false,
-						Ordering::Equal => Uuid::from(existing.uuid()) < Uuid::from(new.uuid()),
+						Ordering::Equal => existing.uuid() < new.uuid(),
 					}
 				}
 				(super::Entry::Dir(existing), super::Entry::Dir(new)) => {
@@ -130,7 +128,7 @@ impl<Cat: Category + ?Sized> super::CompareStrategy<Cat::Dir, Cat::File>
 					match existing.timestamp().cmp(&new.timestamp()) {
 						Ordering::Less => true,
 						Ordering::Greater => false,
-						Ordering::Equal => Uuid::from(existing.uuid()) < Uuid::from(new.uuid()),
+						Ordering::Equal => existing.uuid() < new.uuid(),
 					}
 				}
 			}

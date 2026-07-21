@@ -460,12 +460,20 @@ fn print_items_after_list(
 ) -> Result<()> {
 	let mut directories = dirs
 		.iter()
-		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()))
-		.collect::<Vec<&str>>();
+		.map(|f| {
+			f.name()
+				.map(str::to_string)
+				.unwrap_or_else(|| f.uuid().to_string())
+		})
+		.collect::<Vec<String>>();
 	directories.sort();
 	let mut file_names = files
 		.iter()
-		.map(|f| f.name().unwrap_or_else(|| f.uuid().as_ref()).to_string())
+		.map(|f| {
+			f.name()
+				.map(str::to_string)
+				.unwrap_or_else(|| f.uuid().to_string())
+		})
 		.collect::<Vec<String>>();
 	file_names.sort();
 	if ui.json {
@@ -576,7 +584,7 @@ async fn print_file_or_directory_info(
 		NonRootFileType::File(file) => {
 			if ui.json {
 				ui.print_json(json!({
-					"name": file.name().unwrap_or_else(|| file.uuid().as_ref()),
+					"name": file.name().map(str::to_string).unwrap_or_else(|| file.uuid().to_string()),
 					"type": "file",
 					"size": file.size(),
 					"modified": file.last_modified(),
@@ -584,8 +592,13 @@ async fn print_file_or_directory_info(
 					"uuid": file.uuid(),
 				}))?;
 			} else {
+				let file_uuid = file.uuid().to_string();
+				let file_name = file
+					.name()
+					.map(str::to_string)
+					.unwrap_or_else(|| file_uuid.clone());
 				ui.print_key_value_table(&[
-					("Name", file.name().unwrap_or_else(|| file.uuid().as_ref())),
+					("Name", &file_name),
 					("Type", "File"),
 					(
 						"Size",
@@ -605,21 +618,26 @@ async fn print_file_or_directory_info(
 							.map(|d| ui::format_date(&d))
 							.unwrap_or("-".to_string()),
 					),
-					("UUID", file.uuid().as_ref()),
+					("UUID", &file_uuid),
 				]);
 			}
 		}
 		NonRootFileType::Dir(dir) => {
 			if ui.json {
 				ui.print_json(json!({
-					"name": dir.name().unwrap_or_else(|| dir.uuid().as_ref()),
+					"name": dir.name().map(str::to_string).unwrap_or_else(|| dir.uuid().to_string()),
 					"type": "directory",
 					"created": dir.created(),
 					"uuid": dir.uuid(),
 				}))?;
 			} else {
+				let dir_uuid = dir.uuid().to_string();
+				let dir_name = dir
+					.name()
+					.map(str::to_string)
+					.unwrap_or_else(|| dir_uuid.clone());
 				ui.print_key_value_table(&[
-					("Name", dir.name().unwrap_or_else(|| dir.uuid().as_ref())),
+					("Name", &dir_name),
 					("Type", "Directory"),
 					(
 						"Created",
@@ -627,7 +645,7 @@ async fn print_file_or_directory_info(
 							.map(|d| ui::format_date(&d))
 							.unwrap_or("-".to_string()),
 					),
-					("UUID", dir.uuid().as_ref()),
+					("UUID", &dir_uuid),
 					// todo: aggregate directory size, file count, ...?
 				]);
 			}

@@ -7,7 +7,7 @@ use crate::{
 	api::v3::dir::color::DirColor,
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
-	fs::{ParentUuid, UuidStr},
+	fs::{ParentUuid, Uuid},
 };
 
 pub mod link;
@@ -33,7 +33,7 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Directory<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "name")]
 	pub meta: EncryptedString<'a>,
 	#[serde(with = "crate::serde::parent_uuid::base")]
@@ -48,7 +48,7 @@ pub struct Directory<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,

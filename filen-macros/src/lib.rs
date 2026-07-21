@@ -914,7 +914,7 @@ pub fn derive_has_uuid(input: TokenStream) -> TokenStream {
 		input,
 		quote!(crate::fs::traits::HasUUID),
 		&[quote!(
-			fn uuid(&self) -> &filen_types::fs::UuidStr;
+			fn uuid(&self) -> ::uuid::Uuid;
 		)],
 	)
 }

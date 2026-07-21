@@ -69,7 +69,7 @@ where
 	for dir in dirs {
 		if dir.name().is_some_and(|n| n == name_or_uuid) {
 			return Some(ObjectMatch::Name(dir));
-		} else if dir.uuid().as_ref() == name_or_uuid {
+		} else if dir.uuid().to_string() == name_or_uuid {
 			uuid_match = Some(ObjectMatch::Uuid(dir));
 		}
 	}
@@ -88,7 +88,7 @@ where
 	for file in files {
 		if file.name().is_some_and(|n| n == name_or_uuid) {
 			return Some(ObjectMatch::Name(file));
-		} else if file.uuid().as_ref() == name_or_uuid {
+		} else if file.uuid().to_string() == name_or_uuid {
 			uuid_match = Some(ObjectMatch::Uuid(file));
 		}
 	}

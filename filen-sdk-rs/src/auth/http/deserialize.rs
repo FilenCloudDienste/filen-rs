@@ -7,12 +7,23 @@ use filen_types::{
 	api::response::{FilenResponse, ResponseIntoData},
 	error::ResponseError,
 };
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use tower::Service;
 
 use crate::{Error, ErrorKind, auth::http::ResponseType};
 
 use super::{Request, retry::RetryError};
+
+/// The gateway msgpack-encodes the same string-keyed structures as its JSON responses (uuids as
+/// hyphenated strings, not 16-byte arrays), so format-sensitive types like [`uuid::Uuid`] must be
+/// decoded in human-readable mode.
+fn from_msgpack_slice<'de, T>(bytes: &'de [u8]) -> Result<T, rmp_serde::decode::Error>
+where
+	T: Deserialize<'de>,
+{
+	let mut deserializer = rmp_serde::Deserializer::from_read_ref(bytes).with_human_readable();
+	T::deserialize(&mut deserializer)
+}
 
 pub(crate) struct DeserializeLayer<Res> {
 	_phantom: std::marker::PhantomData<Res>,
@@ -115,7 +126,7 @@ where
 				Poll::Ready(Ok(res)) => {
 					let response: FilenResponse<Res> = if *this.response_type == ResponseType::Large
 					{
-						match rmp_serde::from_slice(res.as_ref()) {
+						match from_msgpack_slice(res.as_ref()) {
 							Ok(resp) => resp,
 							Err(e) => {
 								return Poll::Ready(Err(RetryError::NoRetry(
@@ -166,5 +177,37 @@ where
 		} else {
 			panic!("future already completed")
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use filen_types::{api::response::FilenResponse, fs::Uuid};
+	use serde::Deserialize;
+
+	#[derive(Deserialize, Debug)]
+	struct UuidHolder {
+		uuid: Uuid,
+	}
+
+	/// The live gateway sends uuids as hyphenated strings inside msgpack responses; decoding them
+	/// as [`Uuid`] requires the human-readable deserializer (the default binary mode expects
+	/// 16-byte arrays and rejects every real response).
+	#[test]
+	fn msgpack_response_decodes_string_uuids() {
+		let uuid = Uuid::new_v4();
+		let bytes = rmp_serde::to_vec(&serde_json::json!({
+			"status": true,
+			"message": "ok",
+			"code": "ok",
+			"data": { "uuid": uuid.to_string() },
+		}))
+		.unwrap();
+
+		let response: FilenResponse<UuidHolder> = super::from_msgpack_slice(&bytes).unwrap();
+		assert_eq!(response.into_data().unwrap().uuid, uuid);
+
+		rmp_serde::from_slice::<FilenResponse<UuidHolder>>(&bytes)
+			.expect_err("binary-mode decode should reject string uuids; if this now passes, the human-readable workaround may be removable");
 	}
 }

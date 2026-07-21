@@ -4,7 +4,7 @@ use filen_sdk_rs::fs::{
 	categories::{NonRootFileType, Normal},
 	dir::RemoteDirectory,
 };
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::{ParentUuid, Uuid};
 use rusqlite::{Connection, Result};
 use tracing::trace;
 
@@ -31,7 +31,7 @@ pub enum DBObject {
 }
 
 impl DBObject {
-	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> Result<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> Result<Self> {
 		let mut stmt = conn.prepare_cached(SELECT_OBJECT_BY_UUID)?;
 		stmt.query_one([uuid], |row| {
 			let item = RawDBItem::from_row(row)?;
@@ -67,7 +67,7 @@ impl DBObject {
 		}
 	}
 
-	pub(crate) fn uuid(&self) -> UuidStr {
+	pub(crate) fn uuid(&self) -> Uuid {
 		match self {
 			DBObject::File(file) => file.uuid,
 			DBObject::Dir(dir) => dir.uuid,
@@ -120,7 +120,7 @@ impl PartialEq<DBObject> for RemoteDirectory {
 }
 
 impl DBItemTrait for DBObject {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		match self {
 			DBObject::File(file) => file.uuid,
 			DBObject::Dir(dir) => dir.uuid,
@@ -153,7 +153,7 @@ pub enum DBNonRootObject {
 }
 
 impl DBNonRootObject {
-	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
 		Ok(match DBObject::select(conn, uuid)? {
 			DBObject::Dir(dir) => DBNonRootObject::Dir(dir),
 			DBObject::File(file) => DBNonRootObject::File(file),
@@ -207,7 +207,7 @@ impl DBNonRootObject {
 }
 
 impl DBItemTrait for DBNonRootObject {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		match self {
 			DBNonRootObject::Dir(dir) => DBItemTrait::uuid(dir),
 			DBNonRootObject::File(file) => DBItemTrait::uuid(file),

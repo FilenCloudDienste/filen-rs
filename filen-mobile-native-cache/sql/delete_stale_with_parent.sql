@@ -1,2 +1,2 @@
 DELETE FROM items
-WHERE parent = ? AND is_stale = TRUE;
+WHERE parent = ? AND is_stale = TRUE AND trashed = FALSE;

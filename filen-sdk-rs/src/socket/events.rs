@@ -14,7 +14,7 @@ use filen_types::{
 	},
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, MaybeEncrypted},
-	fs::UuidStr,
+	fs::Uuid,
 	traits::CowHelpers,
 };
 use rsa::RsaPrivateKey;
@@ -622,13 +622,13 @@ impl DecryptedSocketEvent<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct FileRename<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub metadata: FileMeta<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileArchiveRestored {
-	pub current_uuid: UuidStr,
+	pub current_uuid: Uuid,
 	pub file: RemoteFile,
 }
 
@@ -833,7 +833,7 @@ impl<'a> ChatConversationsNew {
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct NoteContentEdited<'a> {
-	pub note: UuidStr,
+	pub note: Uuid,
 	pub content: MaybeEncrypted<'a, str>,
 	pub note_type: NoteType,
 	pub editor_id: u64,
@@ -864,7 +864,7 @@ impl<'a> NoteContentEdited<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct NoteTitleEdited<'a> {
-	pub note: UuidStr,
+	pub note: Uuid,
 	pub new_title: MaybeEncrypted<'a, str>,
 }
 
@@ -890,7 +890,7 @@ impl<'a> NoteTitleEdited<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteParticipantNew {
-	pub note: UuidStr,
+	pub note: Uuid,
 	pub participant: NoteParticipant,
 }
 
@@ -905,7 +905,7 @@ impl From<filen_types::api::v3::socket::NoteParticipantNew<'_>> for NoteParticip
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteNew {
-	pub note: UuidStr,
+	pub note: Uuid,
 }
 impl From<filen_types::api::v3::socket::NoteNew<'_>> for NoteNew {
 	fn from(value: filen_types::api::v3::socket::NoteNew<'_>) -> Self {
@@ -915,8 +915,8 @@ impl From<filen_types::api::v3::socket::NoteNew<'_>> for NoteNew {
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct ChatMessageEdited<'a> {
-	pub chat: UuidStr,
-	pub uuid: UuidStr,
+	pub chat: Uuid,
+	pub uuid: Uuid,
 	pub edited_timestamp: DateTime<Utc>,
 	pub new_content: MaybeEncrypted<'a, str>,
 }
@@ -943,7 +943,7 @@ impl<'a> ChatMessageEdited<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct ChatConversationNameEdited<'a> {
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	pub new_name: MaybeEncrypted<'a, str>,
 }
 
@@ -1050,7 +1050,7 @@ impl<'a> ItemFavorite {
 
 #[js_type]
 pub struct ChatConversationParticipantNew {
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	pub participant: ChatParticipant,
 }
 
@@ -1076,14 +1076,14 @@ impl<'a> From<filen_types::api::v3::socket::ChatConversationParticipantNew<'a>>
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct FolderMetadataChanged<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub meta: DirectoryMeta<'a>,
 }
 
 impl<'a> FolderMetadataChanged<'a> {
 	fn blocking_from_encrypted(
 		crypter: &impl MetaCrypter,
-		uuid: UuidStr,
+		uuid: Uuid,
 		encrypted_string: EncryptedString<'a>,
 	) -> Self {
 		Self {
@@ -1095,14 +1095,14 @@ impl<'a> FolderMetadataChanged<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct FileMetadataChanged<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub metadata: FileMeta<'a>,
 }
 
 impl<'a> FileMetadataChanged<'a> {
 	fn blocking_from_encrypted(
 		crypter: &impl MetaCrypter,
-		uuid: UuidStr,
+		uuid: Uuid,
 		new_meta: EncryptedString<'a>,
 	) -> Self {
 		let metadata =

@@ -13,8 +13,8 @@ use filen_sdk_rs::{
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::HasUUID,
 };
-use filen_types::{auth::FilenSDKConfig, crypto::Blake3Hash};
-use rusqlite::Connection;
+use filen_types::{auth::FilenSDKConfig, crypto::Blake3Hash, fs::UuidStr};
+use rusqlite::{Connection, ToSql, types::ToSqlOutput};
 use serde::{Deserialize, Serialize};
 use tokio::{
 	io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -35,7 +35,9 @@ const DEFAULT_MAX_CACHE_FILES_BUDGET: u64 = 768 * 1024 * 1024; // 768 MiB
 pub const DB_FILE_NAME: &str = "native_cache.db";
 
 // 1 - initial version, changed how files as stored in cache from flat to per-file directories
-const CACHE_VERSION: u64 = 1;
+// 2 - store uuid/parent as BLOB, add `trashed` flag (trashed items keep their original parent);
+//     dropped the synthetic 'trash' row
+const CACHE_VERSION: u64 = 2;
 
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,
@@ -146,6 +148,34 @@ pub(crate) async fn update_saved_db_state_cache_cleanup_time(
 	Ok(())
 }
 
+/// Registers the connection-local `uuid_text(blob)` SQL function, which renders a 16-byte BLOB
+/// uuid as its canonical lowercase-hyphenated text. Used by queries that need a uuid as a string
+/// (path-component fallback when metadata isn't decoded, and uuid-based path navigation) now that
+/// `items.uuid` is stored as a BLOB. Must be called on every connection before those queries run.
+fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
+	use rusqlite::functions::FunctionFlags;
+	conn.create_scalar_function(
+		"uuid_text",
+		1,
+		FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+		|ctx| {
+			let blob = ctx.get_raw(0).as_blob()?;
+			let uuid = filen_types::fs::Uuid::from_slice(blob)
+				.map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+			Ok(UuidText(uuid.into()))
+		},
+	)
+}
+
+struct UuidText(UuidStr);
+impl ToSql for UuidText {
+	fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+		Ok(ToSqlOutput::Borrowed(rusqlite::types::ValueRef::Text(
+			self.0.as_ref().as_bytes(),
+		)))
+	}
+}
+
 fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheError> {
 	// Remove the DB together with its WAL sidecars: a stale -wal surviving next to a recreated
 	// DB can be replayed into it on open (sqlite.org/howtocorrupt.html §4.4). Covers every
@@ -166,6 +196,7 @@ fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheE
 		}
 	}
 	let db = Connection::open(db_path)?;
+	configure_conn(&db)?;
 	db.execute_batch(sql::statements::INIT)?;
 	let contents = serde_json::to_string(&SavedDBState::default())
 		.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
@@ -233,7 +264,9 @@ fn db_from_dir(
 			"Database hash matches, using existing database: {}",
 			db_path.display()
 		);
-		Ok((Connection::open(db_path)?, Some(saved_state)))
+		let conn = Connection::open(db_path)?;
+		configure_conn(&conn)?;
+		Ok((conn, Some(saved_state)))
 	}
 }
 
@@ -596,7 +629,7 @@ impl AuthCacheState {
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
 		};
-		new.add_root(new.client.root().uuid().as_ref())?;
+		new.add_root(&new.client.root().uuid().to_string())?;
 		Ok(new)
 	}
 
@@ -616,6 +649,7 @@ impl AuthCacheState {
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir.as_ref())?;
 		let db = Connection::open_in_memory()?;
+		configure_conn(&db)?;
 		db.execute_batch(sql::statements::INIT)?;
 
 		let sdk_cache_path =
@@ -636,7 +670,7 @@ impl AuthCacheState {
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
 		};
-		new.add_root(new.client.root().uuid().as_ref())?;
+		new.add_root(&new.client.root().uuid().to_string())?;
 		Ok(new)
 	}
 

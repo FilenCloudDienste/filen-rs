@@ -23,6 +23,8 @@ pub(crate) const MARK_STALE_WITH_PARENT: &str =
 	include_str!("../../sql/mark_stale_with_parent.sql");
 pub(crate) const DELETE_STALE_WITH_PARENT: &str =
 	include_str!("../../sql/delete_stale_with_parent.sql");
+pub(crate) const MARK_STALE_TRASHED: &str = include_str!("../../sql/mark_stale_trashed.sql");
+pub(crate) const DELETE_STALE_TRASHED: &str = include_str!("../../sql/delete_stale_trashed.sql");
 pub(crate) const SELECT_POS_NOT_IN_UUIDS: &str =
 	include_str!("../../sql/select_pos_not_in_uuids.sql");
 
@@ -61,6 +63,11 @@ pub(crate) fn select_dir_children(order_by: Option<&str>) -> String {
 	format!("{} {}", SELECT_DIR_CHILDREN, convert_order_by(order_by))
 }
 
+const SELECT_TRASH_CHILDREN: &str = include_str!("../../sql/select_trash_children.sql");
+pub(crate) fn select_trash_children(order_by: Option<&str>) -> String {
+	format!("{} {}", SELECT_TRASH_CHILDREN, convert_order_by(order_by))
+}
+
 // Root
 pub(crate) const SELECT_ROOT: &str = include_str!("../../sql/select_root.sql");
 pub(crate) const UPSERT_ROOT_EMPTY: &str = include_str!("../../sql/upsert_root_empty.sql");
@@ -81,9 +88,9 @@ fn convert_order_by(order_by: Option<&str>) -> &'static str {
 	if let Some(order_by) = order_by {
 		if order_by.contains("display_name") {
 			if order_by.contains("ASC") {
-				return "ORDER BY coalesce(files_meta.name, dirs_meta.name, items.uuid) ASC";
+				return "ORDER BY coalesce(files_meta.name, dirs_meta.name, uuid_text(items.uuid)) ASC";
 			} else if order_by.contains("DESC") {
-				return "ORDER BY coalesce(files_meta.name, dirs_meta.name, items.uuid) DESC";
+				return "ORDER BY coalesce(files_meta.name, dirs_meta.name, uuid_text(items.uuid)) DESC";
 			}
 		} else if order_by.contains("last_modified") {
 			if order_by.contains("ASC") {
@@ -99,12 +106,13 @@ fn convert_order_by(order_by: Option<&str>) -> &'static str {
 			}
 		}
 	}
-	"ORDER BY coalesce(files_meta.name, dirs_meta.name, items.uuid) ASC"
+	"ORDER BY coalesce(files_meta.name, dirs_meta.name, uuid_text(items.uuid)) ASC"
 }
 
 // Constants
-/// Does not include is_stale and is_recent
-pub(crate) const ITEM_COLUMN_COUNT_NO_EXTRA: usize = 5;
+/// Number of leading `items` columns selected by the wide-join queries
+/// (`id, uuid, parent, trashed, local_data, type`). Does not include is_stale and is_recent.
+pub(crate) const ITEM_COLUMN_COUNT_NO_EXTRA: usize = 6;
 // does not include the `id` column for the below
 pub(crate) const DIRS_COLUMN_COUNT: usize = 6;
 pub(crate) const DIRS_META_COLUMN_COUNT: usize = 2;

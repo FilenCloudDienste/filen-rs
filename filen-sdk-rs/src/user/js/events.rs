@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::{api::v3::user::events::UserEventDeserializeError, fs::UuidStr};
+use filen_types::{api::v3::user::events::UserEventDeserializeError, fs::Uuid};
 
 use crate::{
 	js::{DirMeta, FileMeta},
@@ -53,7 +53,7 @@ pub struct UserEvent {
 		tsify(type = "bigint")
 	)]
 	pub timestamp: DateTime<Utc>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub kind: UserEventKind,
 }
 
@@ -200,7 +200,7 @@ pub struct UserEventRemovedSharedOutItemsInfo {
 pub struct UserEventFolderLinkEditedInfo {
 	pub ip: String,
 	pub user_agent: String,
-	pub link_uuid: UuidStr,
+	pub link_uuid: Uuid,
 }
 
 #[js_type(export, no_deser)]

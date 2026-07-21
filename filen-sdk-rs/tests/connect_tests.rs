@@ -22,15 +22,15 @@ async fn dir_public_link() {
 	let mut sub_dir = client.create_dir(&(&dir).into(), "sub_dir").await.unwrap();
 
 	let dir_file = client
-		.make_file_builder("empty_dir.txt", *dir.uuid())
+		.make_file_builder("empty_dir.txt", dir.uuid())
 		.unwrap();
 	let dir_file = client.upload_file(dir_file, b"").await.unwrap();
 
-	let file = client.make_file_builder("a.txt", *sub_dir.uuid()).unwrap();
+	let file = client.make_file_builder("a.txt", sub_dir.uuid()).unwrap();
 	let file = client.upload_file(file, b"Hello, world!").await.unwrap();
 
 	let empty_file = client
-		.make_file_builder("empty.txt", *sub_dir.uuid())
+		.make_file_builder("empty.txt", sub_dir.uuid())
 		.unwrap();
 	let empty_file = client.upload_file(empty_file, b"").await.unwrap();
 
@@ -95,7 +95,7 @@ async fn dir_public_link() {
 		.await
 		.unwrap();
 	let sub_sub_file = client
-		.make_file_builder("sub_sub_file.txt", *sub_dir.uuid())
+		.make_file_builder("sub_sub_file.txt", sub_dir.uuid())
 		.unwrap();
 	let mut sub_sub_file = client
 		.upload_file(sub_sub_file, b"Hello, world!")
@@ -188,13 +188,13 @@ async fn dir_public_link_remove() {
 		.unwrap();
 	let sub_dir = client.create_dir(&(&dir).into(), "sub_dir").await.unwrap();
 
-	let dir_file = client.make_file_builder("a.txt", *dir.uuid()).unwrap();
+	let dir_file = client.make_file_builder("a.txt", dir.uuid()).unwrap();
 	let dir_file = client
 		.upload_file(dir_file, b"Hello, world!")
 		.await
 		.unwrap();
 
-	let sub_file = client.make_file_builder("b.txt", *sub_dir.uuid()).unwrap();
+	let sub_file = client.make_file_builder("b.txt", sub_dir.uuid()).unwrap();
 	let sub_file = client.upload_file(sub_file, b"").await.unwrap();
 
 	// No link exists before we create one.
@@ -281,7 +281,7 @@ async fn file_public_link() {
 	let share_client = &share_resources.client;
 	let unauth_client = share_client.get_unauthed();
 
-	let file = client.make_file_builder("a.txt", *test_dir.uuid()).unwrap();
+	let file = client.make_file_builder("a.txt", test_dir.uuid()).unwrap();
 	let mut file = client.upload_file(file, b"Hello, world!").await.unwrap();
 
 	let no_link = client.get_file_link_status(&file).await.unwrap();
@@ -555,12 +555,12 @@ async fn share_dir() {
 
 	let mut dir = client.create_dir(&test_dir.into(), "dir").await.unwrap();
 	let sub_dir = client.create_dir(&(&dir).into(), "sub_dir").await.unwrap();
-	let dir_file = client.make_file_builder("a.txt", *dir.uuid()).unwrap();
+	let dir_file = client.make_file_builder("a.txt", dir.uuid()).unwrap();
 	let mut dir_file = client
 		.upload_file(dir_file, b"Hello, world!")
 		.await
 		.unwrap();
-	let file = client.make_file_builder("a.txt", *sub_dir.uuid()).unwrap();
+	let file = client.make_file_builder("a.txt", sub_dir.uuid()).unwrap();
 	let sub_file = client.upload_file(file, b"").await.unwrap();
 
 	let (_lock1, _lock2, num_shared_out, num_shared_in) =

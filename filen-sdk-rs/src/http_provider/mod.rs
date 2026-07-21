@@ -790,7 +790,7 @@ mod tests {
 		use chrono::Utc;
 		use filen_types::{
 			auth::FileEncryptionVersion,
-			fs::{ParentUuid, UuidStr},
+			fs::{ParentUuid, Uuid},
 		};
 
 		use crate::{
@@ -803,7 +803,7 @@ mod tests {
 		};
 
 		RemoteFileType::File(Cow::Owned(RemoteFile {
-			uuid: UuidStr::new_v4(),
+			uuid: Uuid::new_v4(),
 			parent: ParentUuid::Links,
 			size: 10,
 			favorited: false,

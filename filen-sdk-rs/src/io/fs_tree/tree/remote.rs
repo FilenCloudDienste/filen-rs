@@ -55,7 +55,7 @@ impl<Cat: Category + ?Sized> WalkDirFromHashMap<Cat> {
 					),
 				));
 			};
-			map.entry(Uuid::from(parent_uuid))
+			map.entry(*parent_uuid)
 				.or_default()
 				.push(NonRootItemType::<Cat>::Dir(Cow::Owned(dir)));
 		}
@@ -69,7 +69,7 @@ impl<Cat: Category + ?Sized> WalkDirFromHashMap<Cat> {
 					),
 				));
 			};
-			map.entry(Uuid::from(parent_uuid))
+			map.entry(*parent_uuid)
 				.or_default()
 				.push(NonRootItemType::<Cat>::File(Cow::Owned(file)));
 		}
@@ -112,7 +112,7 @@ where
 		let depth = self.stack.len();
 
 		if let NonRootItemType::<Cat>::Dir(dir) = &obj {
-			self.stack.push(Uuid::from(dir.uuid()));
+			self.stack.push(dir.uuid());
 		}
 
 		Some(Ok(RemoteFSObjectEntry::new(obj, depth)))
@@ -135,7 +135,7 @@ where
 	Cat::File: DFSWalkerFileEntry<Extra = Cat::File>,
 	Cat::Dir: DFSWalkerDirEntry<Extra = Cat::Dir>,
 {
-	let root_uuid = dir.uuid().into();
+	let root_uuid = dir.uuid();
 	let (dirs, files) =
 		Cat::list_dir_recursive(client, &dir, list_dir_progress_callback, context).await?;
 	let iter = WalkDirFromHashMap::<Cat>::new(root_uuid, dirs, files)?;
@@ -146,7 +146,6 @@ where
 #[cfg(test)]
 mod tests {
 	use chrono::Utc;
-	use filen_types::fs::UuidStr;
 
 	use super::*;
 	use crate::fs::{categories::Normal, dir::RemoteDirectory};
@@ -159,7 +158,7 @@ mod tests {
 			.stack_size(256 * 1024)
 			.spawn(|| {
 				let now = Utc::now();
-				let root = UuidStr::new_v4();
+				let root = Uuid::new_v4();
 				let mut parent = root;
 				let mut dirs = Vec::with_capacity(DEPTH);
 				for _ in 0..DEPTH {
@@ -174,7 +173,7 @@ mod tests {
 					parent = uuid;
 				}
 
-				let walker = WalkDirFromHashMap::<Normal>::new(Uuid::from(&root), dirs, Vec::new())
+				let walker = WalkDirFromHashMap::<Normal>::new(root, dirs, Vec::new())
 					.expect("walker should build");
 
 				let entries = walker
@@ -190,7 +189,7 @@ mod tests {
 	#[test]
 	fn unreachable_parent_entries_surface_an_error() {
 		let now = Utc::now();
-		let root = UuidStr::new_v4();
+		let root = Uuid::new_v4();
 
 		// One dir legitimately under root.
 		let (child_uuid, child_meta) =
@@ -199,15 +198,14 @@ mod tests {
 
 		// One dir whose parent is neither root nor any returned dir — orphaned
 		// by a malformed/hostile listing.
-		let orphan_parent = UuidStr::new_v4();
+		let orphan_parent = Uuid::new_v4();
 		let (orphan_uuid, orphan_meta) =
 			RemoteDirectory::make_parts("orphan", now).expect("valid dir name");
 		let orphan =
 			RemoteDirectory::new_from_parts(orphan_uuid, orphan_meta, orphan_parent.into(), now);
 
-		let walker =
-			WalkDirFromHashMap::<Normal>::new(Uuid::from(&root), vec![child, orphan], Vec::new())
-				.expect("walker should build");
+		let walker = WalkDirFromHashMap::<Normal>::new(root, vec![child, orphan], Vec::new())
+			.expect("walker should build");
 		let results = walker.collect::<Vec<_>>();
 
 		let oks = results.iter().filter(|r| r.is_ok()).count();

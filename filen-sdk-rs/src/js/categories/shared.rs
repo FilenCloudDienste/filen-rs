@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 
 use crate::{
 	connect::fs::{
@@ -71,7 +71,7 @@ impl From<SharedDir> for SharedDirectory {
 
 #[js_type(export, wasm_all)]
 pub struct SharedFile {
-	uuid: UuidStr,
+	uuid: Uuid,
 	size: u64,
 	region: String,
 	bucket: String,

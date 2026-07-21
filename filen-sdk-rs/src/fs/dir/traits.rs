@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 pub use filen_macros::{HasContents, HasDirInfo, HasDirMeta, HasRemoteDirInfo};
 use filen_types::{
 	api::v3::dir::color::DirColor,
-	fs::{ParentUuid, UuidStr},
+	fs::{ParentUuid, Uuid},
 };
 
 use crate::{
@@ -17,7 +17,7 @@ pub trait HasContents: Send + Sync {
 	fn uuid_as_parent(&self) -> ParentUuid;
 }
 
-impl HasContents for UuidStr {
+impl HasContents for Uuid {
 	fn uuid_as_parent(&self) -> ParentUuid {
 		ParentUuid::from(*self)
 	}

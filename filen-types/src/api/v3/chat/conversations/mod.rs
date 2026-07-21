@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	api::v3::chat::messages::ChatMessageEncrypted,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::UuidStr,
+	fs::Uuid,
 	traits::CowHelpers,
 };
 
@@ -28,7 +28,7 @@ pub struct Response<'a>(pub Vec<ChatConversation<'a>>);
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatConversation<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub last_message_full: Option<ChatMessageEncrypted<'a>>,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub owner_id: u64,

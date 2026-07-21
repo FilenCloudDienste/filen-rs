@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::{ParentUuid, Uuid};
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
@@ -40,7 +40,7 @@ impl CategoryFS for Normal {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		list_parent_uuid(client, ParentUuid::Uuid(*parent.uuid()), progress).await
+		list_parent_uuid(client, ParentUuid::Uuid(parent.uuid()), progress).await
 	}
 
 	async fn list_dir_recursive<F>(
@@ -52,7 +52,7 @@ impl CategoryFS for Normal {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		list_recursive_parent_uuid(client, *parent.uuid(), progress).await
+		list_recursive_parent_uuid(client, parent.uuid(), progress).await
 	}
 
 	async fn dir_size(
@@ -62,20 +62,16 @@ impl CategoryFS for Normal {
 	) -> Result<super::fs::DirSizeInfo, Error> {
 		let request = match dir {
 			DirType::Root(r) => api::v3::dir::size::Request {
-				uuid: *r.uuid(),
+				uuid: r.uuid(),
 				sharer_id: None,
 				receiver_id: None,
 				trash: false,
 			},
 			DirType::Dir(d) => api::v3::dir::size::Request {
-				uuid: *d.uuid(),
+				uuid: d.uuid(),
 				sharer_id: None,
 				receiver_id: None,
-				// todo fix ParentUuid::Trash not being listed as the parent for items listed from trash
-				// the old parent is listed instead.
-				//
-				// need to refactor ParentUuid::Trash to be able to represent the old parent for trashed items to fix this properly
-				trash: *d.parent() == ParentUuid::Trash,
+				trash: d.parent().is_trash(),
 			},
 		};
 		api::v3::dir::size::post(client.client(), &request)
@@ -91,7 +87,7 @@ impl CategoryFS for Normal {
 #[tracing::instrument(name = "list_dir_recursive", skip_all, fields(parent_uuid = %parent_uuid))]
 pub(crate) async fn list_recursive_parent_uuid<F>(
 	client: &Client,
-	parent_uuid: UuidStr,
+	parent_uuid: Uuid,
 	progress: Option<&F>,
 ) -> Result<(Vec<RemoteDirectory>, Vec<RemoteFile>), Error>
 where
@@ -154,6 +150,16 @@ where
 	.await
 }
 
+/// When listing the trash, the backend returns each item's *original* parent as a plain uuid.
+/// Rewrap it as `Trash(original)` so a trashed item uniformly carries both facts, matching what
+/// `get_file`/`get_dir` produce for a single trashed item.
+fn wrap_trash_parent(parent: ParentUuid, is_trash: bool) -> ParentUuid {
+	match (is_trash, parent) {
+		(true, ParentUuid::Uuid(original)) => ParentUuid::Trash(original),
+		_ => parent,
+	}
+}
+
 #[tracing::instrument(name = "list_dir_contents", skip_all, fields(parent = %parent_uuid))]
 pub(crate) async fn list_parent_uuid<F>(
 	client: &Client,
@@ -163,6 +169,7 @@ pub(crate) async fn list_parent_uuid<F>(
 where
 	F: Fn(u64, Option<u64>) + Send + Sync,
 {
+	let is_trash = parent_uuid.is_trash();
 	let (files, dirs) = api::v3::dir::content::post_large(
 		client.client(),
 		&api::v3::dir::content::Request { uuid: parent_uuid },
@@ -180,7 +187,7 @@ where
 				.map(|d| {
 					RemoteDirectory::blocking_from_encrypted(
 						d.uuid,
-						d.parent,
+						wrap_trash_parent(d.parent, is_trash),
 						d.color,
 						d.favorited.unwrap_or(false),
 						d.timestamp,
@@ -195,7 +202,7 @@ where
 					let meta = FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
 					Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 						f.uuid,
-						f.parent,
+						wrap_trash_parent(f.parent, is_trash),
 						f.size,
 						f.chunks,
 						f.region,

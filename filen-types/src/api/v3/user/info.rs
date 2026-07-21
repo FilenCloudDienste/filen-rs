@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::fs::Uuid;
 
 pub const ENDPOINT: &str = "v3/user/info";
 
@@ -24,5 +24,5 @@ pub struct Response<'a> {
 	)]
 	pub avatar_url: Option<String>,
 	#[serde(rename = "baseFolderUUID")]
-	pub root_dir_uuid: UuidStr,
+	pub root_dir_uuid: Uuid,
 }

@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use filen_types::{
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::{ObjectType, ParentUuid, UuidStr},
+	fs::{ObjectType, ParentUuid, Uuid},
 };
 use rsa::RsaPublicKey;
 
@@ -25,12 +25,12 @@ pub trait SetRemoteInfo {
 }
 
 pub trait HasUUID: Send + Sync {
-	fn uuid(&self) -> &UuidStr;
+	fn uuid(&self) -> Uuid;
 }
 
-impl HasUUID for UuidStr {
-	fn uuid(&self) -> &UuidStr {
-		self
+impl HasUUID for Uuid {
+	fn uuid(&self) -> Uuid {
+		*self
 	}
 }
 

@@ -378,7 +378,7 @@ mod tests {
 	use std::borrow::Cow;
 
 	use chrono::{DateTime, Utc};
-	use filen_types::{crypto::Blake3Hash, fs::UuidStr};
+	use filen_types::{crypto::Blake3Hash, fs::Uuid};
 	use futures::{executor::block_on, io::AsyncReadExt};
 
 	use super::*;
@@ -392,7 +392,7 @@ mod tests {
 	};
 
 	struct FakeFile {
-		uuid: UuidStr,
+		uuid: Uuid,
 		size: u64,
 		chunks: u64,
 	}
@@ -400,7 +400,7 @@ mod tests {
 	impl FakeFile {
 		fn new(size: u64, chunks: u64) -> Self {
 			Self {
-				uuid: UuidStr::default(),
+				uuid: Uuid::default(),
 				size,
 				chunks,
 			}
@@ -408,8 +408,8 @@ mod tests {
 	}
 
 	impl HasUUID for FakeFile {
-		fn uuid(&self) -> &UuidStr {
-			&self.uuid
+		fn uuid(&self) -> Uuid {
+			self.uuid
 		}
 	}
 

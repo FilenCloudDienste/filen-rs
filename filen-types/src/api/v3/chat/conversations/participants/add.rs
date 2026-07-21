@@ -1,16 +1,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::rsa::RSAEncryptedString, fs::UuidStr};
+use crate::{crypto::rsa::RSAEncryptedString, fs::Uuid};
 
 pub const ENDPOINT: &str = "v3/chat/conversations/participants/add";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "contactUUID")]
-	pub contact_uuid: UuidStr,
+	pub contact_uuid: Uuid,
 	pub metadata: RSAEncryptedString<'a>,
 }
 

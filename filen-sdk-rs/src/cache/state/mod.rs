@@ -1311,7 +1311,7 @@ impl CacheState {
 		}
 		if uuid != self.root_uuid
 			&& let Some(deps) = self.resync.clone()
-			&& let Err(e) = deps.client.get_dir((&uuid).into()).await
+			&& let Err(e) = deps.client.get_dir(uuid).await
 		{
 			let error = if matches!(
 				e.kind(),
@@ -1846,7 +1846,7 @@ impl CacheState {
 					// The account root always exists and resyncs via `client.root()`, not `get_dir`.
 					None
 				} else {
-					match deps.client.get_dir(root.into()).await {
+					match deps.client.get_dir(*root).await {
 						Ok(node) => Some(node),
 						Err(e)
 							if matches!(

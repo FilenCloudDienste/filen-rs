@@ -13,7 +13,7 @@ use filen_sdk_rs::{
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::{HasName, HasUUID, file::traits::HasFileInfo},
 };
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rand::TryRngCore;
 use test_utils::TestResources;
@@ -118,7 +118,7 @@ pub async fn test_query_root_initial_state() {
 pub async fn test_query_root_nonexistent() {
 	let (db, _rss) = get_db_resources().await;
 
-	let fake_uuid = UuidStr::new_v4().to_string();
+	let fake_uuid = Uuid::new_v4().to_string();
 	let result = db.query_roots_info(fake_uuid).unwrap();
 	assert!(result.is_none());
 }
@@ -168,7 +168,7 @@ pub async fn test_query_children_with_files_and_dirs() {
 
 	let file = rss
 		.client
-		.make_file_builder("test_file.txt", *rss.dir.uuid())
+		.make_file_builder("test_file.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss
 		.client
@@ -208,7 +208,7 @@ pub async fn test_query_children_sorting_by_size() {
 	// Create files with different sizes
 	let large_file = rss
 		.client
-		.make_file_builder("large.txt", *rss.dir.uuid())
+		.make_file_builder("large.txt", rss.dir.uuid())
 		.unwrap();
 	let large_file = rss
 		.client
@@ -218,13 +218,13 @@ pub async fn test_query_children_sorting_by_size() {
 
 	let small_file = rss
 		.client
-		.make_file_builder("small.txt", *rss.dir.uuid())
+		.make_file_builder("small.txt", rss.dir.uuid())
 		.unwrap();
 	rss.client.upload_file(small_file, b"small").await.unwrap();
 
 	let empty_file = rss
 		.client
-		.make_file_builder("empty.txt", *rss.dir.uuid())
+		.make_file_builder("empty.txt", rss.dir.uuid())
 		.unwrap();
 	let empty_file = rss.client.upload_file(empty_file, b"").await.unwrap();
 
@@ -274,13 +274,13 @@ pub async fn test_query_children_sorting_by_name() {
 
 	let alpha_file = rss
 		.client
-		.make_file_builder("alpha.txt", *rss.dir.uuid())
+		.make_file_builder("alpha.txt", rss.dir.uuid())
 		.unwrap();
 	rss.client.upload_file(alpha_file, b"").await.unwrap();
 
 	let beta_file = rss
 		.client
-		.make_file_builder("beta.txt", *rss.dir.uuid())
+		.make_file_builder("beta.txt", rss.dir.uuid())
 		.unwrap();
 	rss.client.upload_file(beta_file, b"").await.unwrap();
 
@@ -322,7 +322,7 @@ pub async fn test_query_children_after_deletion() {
 
 	let file = rss
 		.client
-		.make_file_builder("persistent.txt", *rss.dir.uuid())
+		.make_file_builder("persistent.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"").await.unwrap();
 
@@ -366,7 +366,7 @@ pub async fn test_query_item_file() {
 
 	let file = rss
 		.client
-		.make_file_builder("query_test.txt", *rss.dir.uuid())
+		.make_file_builder("query_test.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Test content").await.unwrap();
 
@@ -474,7 +474,7 @@ pub async fn test_query_item_deeply_nested() {
 
 	let deep_file = rss
 		.client
-		.make_file_builder("deep_file.txt", *level2.uuid())
+		.make_file_builder("deep_file.txt", level2.uuid())
 		.unwrap();
 	let deep_file = rss
 		.client
@@ -534,7 +534,7 @@ pub async fn test_download_file() {
 	let test_content = b"Hello, world! This is test content for download.";
 	let file = rss
 		.client
-		.make_file_builder("test_download.txt", *rss.dir.uuid())
+		.make_file_builder("test_download.txt", rss.dir.uuid())
 		.unwrap();
 	let remote_file = rss.client.upload_file(file, test_content).await.unwrap();
 
@@ -820,7 +820,7 @@ pub async fn test_trash_item_file_restore() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("restore_me.txt", *rss.dir.uuid())
+		.make_file_builder("restore_me.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss
 		.client
@@ -872,7 +872,9 @@ pub async fn test_trash_item_file_restore() {
 	}
 
 	// Restore the file
-	db.restore_item(file.uuid().as_ref(), None).await.unwrap();
+	db.restore_item(&file.uuid().to_string(), None)
+		.await
+		.unwrap();
 
 	// Verify the file is back in the database
 	let restored_result = db.query_item(&file_path).unwrap();
@@ -906,7 +908,7 @@ pub async fn test_trash_item_file_success() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("trash_me.txt", *rss.dir.uuid())
+		.make_file_builder("trash_me.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss
 		.client
@@ -1014,7 +1016,7 @@ pub async fn test_trash_item_directory_with_contents() {
 	// Add a file to the parent directory
 	let file_in_parent = rss
 		.client
-		.make_file_builder("file_in_parent.txt", *parent_dir.uuid())
+		.make_file_builder("file_in_parent.txt", parent_dir.uuid())
 		.unwrap();
 	rss.client
 		.upload_file(file_in_parent, b"Content in parent")
@@ -1024,7 +1026,7 @@ pub async fn test_trash_item_directory_with_contents() {
 	// Add a file to the subdirectory
 	let file_in_sub = rss
 		.client
-		.make_file_builder("file_in_sub.txt", *sub_dir.uuid())
+		.make_file_builder("file_in_sub.txt", sub_dir.uuid())
 		.unwrap();
 	rss.client
 		.upload_file(file_in_sub, b"Content in subdirectory")
@@ -1166,7 +1168,7 @@ pub async fn test_trash_item_file_then_query_parent() {
 	// Create multiple files in the same directory
 	let file1 = rss
 		.client
-		.make_file_builder("keep_me.txt", *rss.dir.uuid())
+		.make_file_builder("keep_me.txt", rss.dir.uuid())
 		.unwrap();
 	let file1 = rss
 		.client
@@ -1176,7 +1178,7 @@ pub async fn test_trash_item_file_then_query_parent() {
 
 	let file2 = rss
 		.client
-		.make_file_builder("trash_me.txt", *rss.dir.uuid())
+		.make_file_builder("trash_me.txt", rss.dir.uuid())
 		.unwrap();
 	let file2 = rss
 		.client
@@ -1262,7 +1264,7 @@ pub async fn test_trash_item_already_trashed_file() {
 	// Create and trash a file using the SDK directly first
 	let file = rss
 		.client
-		.make_file_builder("already_trashed.txt", *rss.dir.uuid())
+		.make_file_builder("already_trashed.txt", rss.dir.uuid())
 		.unwrap();
 	let mut file = rss
 		.client
@@ -1308,7 +1310,7 @@ pub async fn test_move_item_file_success() {
 	// Create a file in the source directory
 	let file = rss
 		.client
-		.make_file_builder("move_me.txt", *source_dir.uuid())
+		.make_file_builder("move_me.txt", source_dir.uuid())
 		.unwrap();
 	let file = rss
 		.client
@@ -1399,7 +1401,7 @@ pub async fn test_move_item_directory_success() {
 	// Add some content to the directory being moved
 	let file_in_move_dir = rss
 		.client
-		.make_file_builder("content.txt", *move_dir.uuid())
+		.make_file_builder("content.txt", move_dir.uuid())
 		.unwrap();
 	rss.client
 		.upload_file(file_in_move_dir, b"Content in moved dir")
@@ -1492,7 +1494,7 @@ pub async fn test_move_item_nonexistent_destination() {
 	// Create a file to move
 	let file = rss
 		.client
-		.make_file_builder("move_me.txt", *rss.dir.uuid())
+		.make_file_builder("move_me.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Content").await.unwrap();
 
@@ -1518,7 +1520,7 @@ pub async fn test_move_item_destination_is_file() {
 	// Create a file to move
 	let move_file = rss
 		.client
-		.make_file_builder("move_me.txt", *rss.dir.uuid())
+		.make_file_builder("move_me.txt", rss.dir.uuid())
 		.unwrap();
 	let move_file = rss
 		.client
@@ -1529,7 +1531,7 @@ pub async fn test_move_item_destination_is_file() {
 	// Create a file that will be used as invalid destination
 	let dest_file = rss
 		.client
-		.make_file_builder("dest_file.txt", *rss.dir.uuid())
+		.make_file_builder("dest_file.txt", rss.dir.uuid())
 		.unwrap();
 	let dest_file = rss
 		.client
@@ -1585,7 +1587,7 @@ pub async fn test_move_item_same_directory() {
 	// Create a file
 	let file = rss
 		.client
-		.make_file_builder("stay_here.txt", *rss.dir.uuid())
+		.make_file_builder("stay_here.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Content").await.unwrap();
 
@@ -1635,7 +1637,7 @@ pub async fn test_move_item_nested_directory_structure() {
 
 	let file = rss
 		.client
-		.make_file_builder("nested_file.txt", *level2.uuid())
+		.make_file_builder("nested_file.txt", level2.uuid())
 		.unwrap();
 	let file = rss
 		.client
@@ -1723,7 +1725,7 @@ pub async fn test_move_item_directory_with_contents() {
 
 	let file_in_source = rss
 		.client
-		.make_file_builder("file_in_source.txt", *source_dir.uuid())
+		.make_file_builder("file_in_source.txt", source_dir.uuid())
 		.unwrap();
 	let file_in_source = rss
 		.client
@@ -1733,7 +1735,7 @@ pub async fn test_move_item_directory_with_contents() {
 
 	let file_in_sub = rss
 		.client
-		.make_file_builder("file_in_sub.txt", *sub_dir.uuid())
+		.make_file_builder("file_in_sub.txt", sub_dir.uuid())
 		.unwrap();
 	rss.client
 		.upload_file(file_in_sub, b"Sub content")
@@ -1838,7 +1840,7 @@ pub async fn test_move_item_partial_path_resolution() {
 
 	let file = rss
 		.client
-		.make_file_builder("deep_file.txt", *level2.uuid())
+		.make_file_builder("deep_file.txt", level2.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Deep content").await.unwrap();
 
@@ -1885,7 +1887,7 @@ pub async fn test_move_item_name_collision_handling() {
 
 	let file_to_move = rss
 		.client
-		.make_file_builder("duplicate_name.txt", *source_dir.uuid())
+		.make_file_builder("duplicate_name.txt", source_dir.uuid())
 		.unwrap();
 	let file_to_move = rss
 		.client
@@ -1902,7 +1904,7 @@ pub async fn test_move_item_name_collision_handling() {
 
 	let existing_file = rss
 		.client
-		.make_file_builder("duplicate_name.txt", *dest_dir.uuid())
+		.make_file_builder("duplicate_name.txt", dest_dir.uuid())
 		.unwrap();
 	rss.client
 		.upload_file(existing_file, b"Existing content")
@@ -1952,13 +1954,13 @@ pub async fn test_move_item_multiple_files_same_operation() {
 
 	let file1 = rss
 		.client
-		.make_file_builder("file1.txt", *source_dir.uuid())
+		.make_file_builder("file1.txt", source_dir.uuid())
 		.unwrap();
 	let file1 = rss.client.upload_file(file1, b"Content 1").await.unwrap();
 
 	let file2 = rss
 		.client
-		.make_file_builder("file2.txt", *source_dir.uuid())
+		.make_file_builder("file2.txt", source_dir.uuid())
 		.unwrap();
 	let file2 = rss.client.upload_file(file2, b"Content 2").await.unwrap();
 
@@ -2029,7 +2031,7 @@ pub async fn test_rename_item_file_success() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("old_name.txt", *rss.dir.uuid())
+		.make_file_builder("old_name.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss
 		.client
@@ -2105,7 +2107,7 @@ pub async fn test_rename_item_directory_success() {
 	// Add a file to the directory to verify contents are preserved
 	let file_in_dir = rss
 		.client
-		.make_file_builder("content.txt", *dir.uuid())
+		.make_file_builder("content.txt", dir.uuid())
 		.unwrap();
 	let file_in_dir = rss
 		.client
@@ -2190,7 +2192,7 @@ pub async fn test_rename_item_file_extension_change() {
 	// Create a text file
 	let file = rss
 		.client
-		.make_file_builder("document.txt", *rss.dir.uuid())
+		.make_file_builder("document.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Text content").await.unwrap();
 
@@ -2233,7 +2235,7 @@ pub async fn test_rename_item_same_name() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("same_name.txt", *rss.dir.uuid())
+		.make_file_builder("same_name.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Content").await.unwrap();
 
@@ -2332,7 +2334,7 @@ pub async fn test_rename_item_empty_name() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("test_file.txt", *rss.dir.uuid())
+		.make_file_builder("test_file.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Content").await.unwrap();
 
@@ -2362,7 +2364,7 @@ pub async fn test_rename_item_special_characters() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("normal_name.txt", *rss.dir.uuid())
+		.make_file_builder("normal_name.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Content").await.unwrap();
 
@@ -2431,13 +2433,13 @@ pub async fn test_rename_item_name_collision() {
 	// Create two files in the same directory
 	let file1 = rss
 		.client
-		.make_file_builder("file1.txt", *rss.dir.uuid())
+		.make_file_builder("file1.txt", rss.dir.uuid())
 		.unwrap();
 	let file1 = rss.client.upload_file(file1, b"Content 1").await.unwrap();
 
 	let file2 = rss
 		.client
-		.make_file_builder("file2.txt", *rss.dir.uuid())
+		.make_file_builder("file2.txt", rss.dir.uuid())
 		.unwrap();
 	let file2 = rss.client.upload_file(file2, b"Content 2").await.unwrap();
 
@@ -2486,7 +2488,7 @@ pub async fn test_rename_item_nested_file() {
 
 	let nested_file = rss
 		.client
-		.make_file_builder("nested_file.txt", *level2.uuid())
+		.make_file_builder("nested_file.txt", level2.uuid())
 		.unwrap();
 	let nested_file = rss
 		.client
@@ -2540,7 +2542,7 @@ pub async fn test_rename_item_long_name() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("short.txt", *rss.dir.uuid())
+		.make_file_builder("short.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Content").await.unwrap();
 
@@ -2581,7 +2583,7 @@ pub async fn test_rename_item_multiple_renames() {
 	// Create a test file
 	let file = rss
 		.client
-		.make_file_builder("original.txt", *rss.dir.uuid())
+		.make_file_builder("original.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Content").await.unwrap();
 
@@ -2684,19 +2686,19 @@ pub async fn test_get_all_descendant_paths_files_only() {
 	// Create several files
 	let file1 = rss
 		.client
-		.make_file_builder("file1.txt", *test_dir.uuid())
+		.make_file_builder("file1.txt", test_dir.uuid())
 		.unwrap();
 	let file1 = rss.client.upload_file(file1, b"Content 1").await.unwrap();
 
 	let file2 = rss
 		.client
-		.make_file_builder("file2.txt", *test_dir.uuid())
+		.make_file_builder("file2.txt", test_dir.uuid())
 		.unwrap();
 	let file2 = rss.client.upload_file(file2, b"Content 2").await.unwrap();
 
 	let file3 = rss
 		.client
-		.make_file_builder("file3.md", *test_dir.uuid())
+		.make_file_builder("file3.md", test_dir.uuid())
 		.unwrap();
 	let file3 = rss
 		.client
@@ -2815,7 +2817,7 @@ pub async fn test_get_all_descendant_paths_mixed_content() {
 	// Create files
 	let file1 = rss
 		.client
-		.make_file_builder("readme.txt", *test_dir.uuid())
+		.make_file_builder("readme.txt", test_dir.uuid())
 		.unwrap();
 	let file1 = rss
 		.client
@@ -2833,7 +2835,7 @@ pub async fn test_get_all_descendant_paths_mixed_content() {
 	// Create another file
 	let file2 = rss
 		.client
-		.make_file_builder("config.json", *test_dir.uuid())
+		.make_file_builder("config.json", test_dir.uuid())
 		.unwrap();
 	let file2 = rss.client.upload_file(file2, b"{}").await.unwrap();
 
@@ -2897,7 +2899,7 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 	// Add files at different levels
 	let file_l1 = rss
 		.client
-		.make_file_builder("file_level1.txt", *level1.uuid())
+		.make_file_builder("file_level1.txt", level1.uuid())
 		.unwrap();
 	let file_l1 = rss
 		.client
@@ -2907,7 +2909,7 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 
 	let file_l2 = rss
 		.client
-		.make_file_builder("file_level2.txt", *level2.uuid())
+		.make_file_builder("file_level2.txt", level2.uuid())
 		.unwrap();
 	let file_l2 = rss
 		.client
@@ -2917,7 +2919,7 @@ pub async fn test_get_all_descendant_paths_nested_structure() {
 
 	let file_l3 = rss
 		.client
-		.make_file_builder("file_level3.txt", *level3.uuid())
+		.make_file_builder("file_level3.txt", level3.uuid())
 		.unwrap();
 	let file_l3 = rss
 		.client
@@ -3000,7 +3002,7 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 
 	let doc_file = rss
 		.client
-		.make_file_builder("readme.md", *docs_dir.uuid())
+		.make_file_builder("readme.md", docs_dir.uuid())
 		.unwrap();
 	let doc_file = rss
 		.client
@@ -3023,7 +3025,7 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 
 	let thumb_file = rss
 		.client
-		.make_file_builder("thumb1.jpg", *thumbnails_dir.uuid())
+		.make_file_builder("thumb1.jpg", thumbnails_dir.uuid())
 		.unwrap();
 	let thumb_file = rss
 		.client
@@ -3033,7 +3035,7 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 
 	let full_image = rss
 		.client
-		.make_file_builder("photo.png", *images_dir.uuid())
+		.make_file_builder("photo.png", images_dir.uuid())
 		.unwrap();
 	let full_image = rss
 		.client
@@ -3044,7 +3046,7 @@ pub async fn test_get_all_descendant_paths_complex_nested_structure() {
 	// Branch 3: config file at root level
 	let config_file = rss
 		.client
-		.make_file_builder("config.json", *root_dir.uuid())
+		.make_file_builder("config.json", root_dir.uuid())
 		.unwrap();
 	let config_file = rss.client.upload_file(config_file, b"{}").await.unwrap();
 
@@ -3149,7 +3151,7 @@ pub async fn test_get_all_descendant_paths_file_path() {
 	// Create a file
 	let file = rss
 		.client
-		.make_file_builder("test_file.txt", *rss.dir.uuid())
+		.make_file_builder("test_file.txt", rss.dir.uuid())
 		.unwrap();
 	let file = rss.client.upload_file(file, b"Test content").await.unwrap();
 
@@ -3180,7 +3182,7 @@ pub async fn test_get_all_descendant_paths_root_directory() {
 	// Create some content in the test root directory
 	let file_in_root = rss
 		.client
-		.make_file_builder("root_file.txt", *rss.dir.uuid())
+		.make_file_builder("root_file.txt", rss.dir.uuid())
 		.unwrap();
 	let file_in_root = rss
 		.client
@@ -3244,7 +3246,7 @@ pub async fn test_get_all_descendant_paths_partial_database_state() {
 
 	let file_l2 = rss
 		.client
-		.make_file_builder("file_level2.txt", *level2.uuid())
+		.make_file_builder("file_level2.txt", level2.uuid())
 		.unwrap();
 	rss.client
 		.upload_file(file_l2, b"Level 2 content")
@@ -3283,7 +3285,7 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 
 	let special_file1 = rss
 		.client
-		.make_file_builder("file-with-dashes.txt", *special_dir.uuid())
+		.make_file_builder("file-with-dashes.txt", special_dir.uuid())
 		.unwrap();
 	let special_file1 = rss
 		.client
@@ -3293,7 +3295,7 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 
 	let special_file2 = rss
 		.client
-		.make_file_builder("file_with_underscores.txt", *special_dir.uuid())
+		.make_file_builder("file_with_underscores.txt", special_dir.uuid())
 		.unwrap();
 	let special_file2 = rss
 		.client
@@ -3303,7 +3305,7 @@ pub async fn test_get_all_descendant_paths_special_characters_in_names() {
 
 	let unicode_file = rss
 		.client
-		.make_file_builder("файл.txt", *special_dir.uuid())
+		.make_file_builder("файл.txt", special_dir.uuid())
 		.unwrap();
 	let unicode_file = rss
 		.client
@@ -3359,7 +3361,7 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 	// Create items in a specific order to see how paths are returned
 	let b_file = rss
 		.client
-		.make_file_builder("b_file.txt", *test_dir.uuid())
+		.make_file_builder("b_file.txt", test_dir.uuid())
 		.unwrap();
 	let b_file = rss.client.upload_file(b_file, b"B content").await.unwrap();
 
@@ -3371,14 +3373,14 @@ pub async fn test_get_all_descendant_paths_path_ordering() {
 
 	let c_file = rss
 		.client
-		.make_file_builder("c_file.txt", *test_dir.uuid())
+		.make_file_builder("c_file.txt", test_dir.uuid())
 		.unwrap();
 	let c_file = rss.client.upload_file(c_file, b"C content").await.unwrap();
 
 	// Add file to subdirectory
 	let nested_file = rss
 		.client
-		.make_file_builder("nested.txt", *a_dir.uuid())
+		.make_file_builder("nested.txt", a_dir.uuid())
 		.unwrap();
 	let nested_file = rss
 		.client
@@ -3456,7 +3458,7 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 	for i in 0..20 {
 		let file = rss
 			.client
-			.make_file_builder(&format!("file_{i:02}.txt"), *large_dir.uuid())
+			.make_file_builder(&format!("file_{i:02}.txt"), large_dir.uuid())
 			.unwrap();
 		let file = rss
 			.client
@@ -3482,7 +3484,7 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 	// Add files to subdirectories
 	let nested_file1 = rss
 		.client
-		.make_file_builder("nested_1.txt", *subdir1.uuid())
+		.make_file_builder("nested_1.txt", subdir1.uuid())
 		.unwrap();
 	let nested_file1 = rss
 		.client
@@ -3492,7 +3494,7 @@ pub async fn test_get_all_descendant_paths_large_directory() {
 
 	let nested_file2 = rss
 		.client
-		.make_file_builder("nested_2.txt", *subdir2.uuid())
+		.make_file_builder("nested_2.txt", subdir2.uuid())
 		.unwrap();
 	let nested_file2 = rss
 		.client
@@ -3569,7 +3571,7 @@ pub async fn test_get_all_descendant_paths_empty_names() {
 	// Try to create files with edge case names
 	let normal_file = rss
 		.client
-		.make_file_builder("normal.txt", *test_dir.uuid())
+		.make_file_builder("normal.txt", test_dir.uuid())
 		.unwrap();
 	let normal_file = rss
 		.client
@@ -3580,7 +3582,7 @@ pub async fn test_get_all_descendant_paths_empty_names() {
 	// Test with just extension
 	let dot_file = rss
 		.client
-		.make_file_builder(".hidden", *test_dir.uuid())
+		.make_file_builder(".hidden", test_dir.uuid())
 		.unwrap();
 	let dot_file = rss
 		.client
@@ -3634,7 +3636,7 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 
 	let initial_file = rss
 		.client
-		.make_file_builder("initial.txt", *test_dir.uuid())
+		.make_file_builder("initial.txt", test_dir.uuid())
 		.unwrap();
 	let initial_file = rss
 		.client
@@ -3663,7 +3665,7 @@ pub async fn test_get_all_descendant_paths_concurrent_modifications() {
 	// Add more files after initial query
 	let additional_file = rss
 		.client
-		.make_file_builder("additional.txt", *test_dir.uuid())
+		.make_file_builder("additional.txt", test_dir.uuid())
 		.unwrap();
 	let additional_file = rss
 		.client
@@ -3712,7 +3714,7 @@ pub async fn test_get_all_descendant_paths_path_format_consistency() {
 
 	let file_in_sub = rss
 		.client
-		.make_file_builder("file.txt", *sub_dir.uuid())
+		.make_file_builder("file.txt", sub_dir.uuid())
 		.unwrap();
 	let file_in_sub = rss
 		.client
@@ -3873,7 +3875,7 @@ pub async fn test_update_local_data() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("file", *rss.dir.uuid())
+				.make_file_builder("file", rss.dir.uuid())
 				.unwrap(),
 			b"",
 		)
@@ -3892,7 +3894,7 @@ pub async fn test_update_local_data() {
 
 	let mut local_data = ffi_file.local_data.unwrap_or_default();
 	local_data.insert("k".to_string(), "v".to_string());
-	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+	db.update_local_data(&file.uuid().to_string(), local_data.clone())
 		.unwrap();
 	ffi_file.local_data = Some(local_data.clone());
 	let updated_file = match db.query_item(&file_path).unwrap().unwrap() {
@@ -3917,7 +3919,7 @@ pub async fn test_update_local_data_move() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("file", *rss.dir.uuid())
+				.make_file_builder("file", rss.dir.uuid())
 				.unwrap(),
 			b"",
 		)
@@ -3943,7 +3945,7 @@ pub async fn test_update_local_data_move() {
 
 	let mut local_data = ffi_file.local_data.unwrap_or_default();
 	local_data.insert("k".to_string(), "v".to_string());
-	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+	db.update_local_data(&file.uuid().to_string(), local_data.clone())
 		.unwrap();
 	ffi_file.local_data = Some(local_data);
 
@@ -3964,7 +3966,7 @@ pub async fn test_update_local_data_remote_move() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("file", *rss.dir.uuid())
+				.make_file_builder("file", rss.dir.uuid())
 				.unwrap(),
 			b"",
 		)
@@ -3991,7 +3993,7 @@ pub async fn test_update_local_data_remote_move() {
 
 	let mut local_data = ffi_file.local_data.unwrap_or_default();
 	local_data.insert("k".to_string(), "v".to_string());
-	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+	db.update_local_data(&file.uuid().to_string(), local_data.clone())
 		.unwrap();
 	ffi_file.local_data = Some(local_data);
 
@@ -4019,7 +4021,7 @@ pub async fn test_update_local_data_remote_update() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("file", *rss.dir.uuid())
+				.make_file_builder("file", rss.dir.uuid())
 				.unwrap(),
 			b"",
 		)
@@ -4039,14 +4041,14 @@ pub async fn test_update_local_data_remote_update() {
 
 	let mut local_data = ffi_file.local_data.unwrap_or_default();
 	local_data.insert("k".to_string(), "v".to_string());
-	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+	db.update_local_data(&file.uuid().to_string(), local_data.clone())
 		.unwrap();
 
 	let _ = rss
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder(file.name().unwrap(), *rss.dir.uuid())
+				.make_file_builder(file.name().unwrap(), rss.dir.uuid())
 				.unwrap(),
 			b"1",
 		)
@@ -4069,7 +4071,7 @@ pub async fn test_update_local_data_move_name_collision() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("file", *rss.dir.uuid())
+				.make_file_builder("file", rss.dir.uuid())
 				.unwrap(),
 			b"",
 		)
@@ -4086,7 +4088,7 @@ pub async fn test_update_local_data_move_name_collision() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("file", *new_parent.uuid())
+				.make_file_builder("file", new_parent.uuid())
 				.unwrap(),
 			b"",
 		)
@@ -4111,7 +4113,7 @@ pub async fn test_update_local_data_move_name_collision() {
 
 	let mut local_data = ffi_file.local_data.unwrap_or_default();
 	local_data.insert("k".to_string(), "v".to_string());
-	db.update_local_data(file.uuid().as_ref(), local_data.clone())
+	db.update_local_data(&file.uuid().to_string(), local_data.clone())
 		.unwrap();
 
 	let resp = db
@@ -4261,7 +4263,7 @@ pub async fn test_recents() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder("recent_file.txt", *rss.dir.uuid())
+				.make_file_builder("recent_file.txt", rss.dir.uuid())
 				.unwrap(),
 			b"Recent content",
 		)
@@ -4272,7 +4274,7 @@ pub async fn test_recents() {
 
 	assert!(recents.objects.iter().any(|o| {
 		match o {
-			FfiNonRootObject::File(f) => f.uuid == file.uuid().as_ref(),
+			FfiNonRootObject::File(f) => f.uuid == file.uuid().to_string(),
 			_ => false,
 		}
 	}))
@@ -4300,7 +4302,7 @@ pub async fn test_malformed() {
 		panic!("Expected a directory object");
 	};
 	assert!(malformed_dir.meta.is_none());
-	assert_eq!(malformed_dir.uuid, dir.uuid().as_ref());
+	assert_eq!(malformed_dir.uuid, &dir.uuid().to_string());
 
 	let file = rss
 		.client
@@ -4322,10 +4324,10 @@ pub async fn test_malformed() {
 				None
 			}
 		})
-		.find(|f| f.uuid == file.uuid().as_ref())
+		.find(|f| f.uuid == file.uuid().to_string())
 		.unwrap();
 	assert!(malformed_file.meta.is_none());
-	assert_eq!(malformed_file.uuid, file.uuid().as_ref());
+	assert_eq!(malformed_file.uuid, &file.uuid().to_string());
 }
 
 struct NoopSearchUpdate;
@@ -4405,7 +4407,7 @@ pub async fn test_search() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder(&format!("{name}.png"), *b.uuid())
+				.make_file_builder(&format!("{name}.png"), b.uuid())
 				.unwrap()
 				.mime("image/png".to_string()),
 			b"image",
@@ -4416,7 +4418,7 @@ pub async fn test_search() {
 		.client
 		.upload_file(
 			rss.client
-				.make_file_builder(&format!("other_{name}.txt"), *search_root.uuid())
+				.make_file_builder(&format!("other_{name}.txt"), search_root.uuid())
 				.unwrap()
 				.mime("text/plain".to_string()),
 			b"text",
@@ -4441,23 +4443,23 @@ pub async fn test_search() {
 	);
 	assert!(
 		resp.iter()
-			.any(|e| entry_file_uuid_is(e, img.uuid().as_ref())),
+			.any(|e| entry_file_uuid_is(e, &img.uuid().to_string())),
 		"the nested image should be in the results",
 	);
 	assert!(
 		resp.iter()
-			.any(|e| entry_file_uuid_is(e, txt.uuid().as_ref())),
+			.any(|e| entry_file_uuid_is(e, &txt.uuid().to_string())),
 		"the text file should be in the results",
 	);
 	assert!(
 		resp.iter()
-			.any(|e| entry_dir_uuid_is(e, match_dir.uuid().as_ref())),
+			.any(|e| entry_dir_uuid_is(e, &match_dir.uuid().to_string())),
 		"the matching directory should be in the results",
 	);
 	// Path is `<search root>/<relative path>`; the nested image climbs a/b.
 	let img_entry = resp
 		.iter()
-		.find(|e| entry_file_uuid_is(e, img.uuid().as_ref()))
+		.find(|e| entry_file_uuid_is(e, &img.uuid().to_string()))
 		.unwrap();
 	assert_eq!(img_entry.path, format!("{root_id}/a/b/{name}.png"));
 
@@ -4475,7 +4477,7 @@ pub async fn test_search() {
 		.await
 		.unwrap();
 	assert_eq!(resp.len(), 1, "mime filter should keep only the image");
-	assert!(entry_file_uuid_is(&resp[0], img.uuid().as_ref()));
+	assert!(entry_file_uuid_is(&resp[0], &img.uuid().to_string()));
 
 	// item_type=Dir keeps ONLY the matching directory (positive coverage of the Dir filter — a
 	// broken Dir mapping that returned nothing would fail here, not silently pass).
@@ -4492,7 +4494,7 @@ pub async fn test_search() {
 		.unwrap();
 	assert_eq!(resp.len(), 1, "only the matching directory should remain");
 	assert!(
-		entry_dir_uuid_is(&resp[0], match_dir.uuid().as_ref()),
+		entry_dir_uuid_is(&resp[0], &match_dir.uuid().to_string()),
 		"the Dir filter should return the matching directory",
 	);
 

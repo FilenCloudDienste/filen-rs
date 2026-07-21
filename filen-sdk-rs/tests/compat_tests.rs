@@ -22,7 +22,7 @@ use rand::TryRngCore;
 
 fn get_compat_test_file(
 	client: &Client,
-	parent_uuid: filen_types::fs::UuidStr,
+	parent_uuid: filen_types::fs::Uuid,
 ) -> (FileBuilder, String) {
 	let file_key_str = match client.file_encryption_version() {
 		FileEncryptionVersion::V1 => "0123456789abcdefghijklmnopqrstuv",
@@ -122,7 +122,7 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 
 	let empty_file = client
-		.make_file_builder("empty.txt", *compat_dir.uuid())
+		.make_file_builder("empty.txt", compat_dir.uuid())
 		.unwrap();
 	client.upload_file(empty_file, b"").await.unwrap();
 
@@ -133,7 +133,7 @@ async fn make_rs_compat_dir() {
 		.unwrap();
 
 	let small_file = client
-		.make_file_builder("small.txt", *compat_dir.uuid())
+		.make_file_builder("small.txt", compat_dir.uuid())
 		.unwrap();
 	client
 		.upload_file(small_file, b"Hello World from Rust!")
@@ -149,14 +149,14 @@ async fn make_rs_compat_dir() {
 	// fill with random bytes
 	rand::rng().try_fill_bytes(&mut big_random_bytes).unwrap();
 	let big_file = client
-		.make_file_builder("big.txt", *compat_dir.uuid())
+		.make_file_builder("big.txt", compat_dir.uuid())
 		.unwrap();
 	client
 		.upload_file(big_file, hex::encode(&big_random_bytes).as_bytes())
 		.await
 		.unwrap();
 
-	let (file, test_str) = get_compat_test_file(client, *compat_dir.uuid());
+	let (file, test_str) = get_compat_test_file(client, compat_dir.uuid());
 	client.upload_file(file, test_str.as_bytes()).await.unwrap();
 }
 
@@ -290,11 +290,11 @@ async fn run_compat_tests(
 		_ => panic!("big.txt not found in compat-{shortened} directory"),
 	}
 
-	let (compat_test_file, test_str) = get_compat_test_file(client, *compat_dir.uuid());
+	let (compat_test_file, test_str) = get_compat_test_file(client, compat_dir.uuid());
 
 	match find("large_sample-20mb.txt").await {
 		Some(NonRootItemType::File(file)) => {
-			let compat_test_file = compat_test_file.uuid(*file.uuid()).build();
+			let compat_test_file = compat_test_file.uuid(file.uuid()).build();
 			assert_eq!(*file, compat_test_file, "file inner_file mismatch");
 
 			let buf = client.download_file(file.as_ref()).await.unwrap();

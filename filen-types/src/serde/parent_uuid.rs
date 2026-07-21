@@ -5,7 +5,7 @@ macro_rules! parent_uuid_option_module {
 
 			use serde::Serialize;
 
-			use crate::fs::UuidStr;
+			use crate::fs::Uuid;
 
 			pub fn deserialize<'de, D>(
 				deserializer: D,
@@ -17,7 +17,7 @@ macro_rules! parent_uuid_option_module {
 				Ok(match value.as_ref() {
 					$none_value => None,
 					string => Some(
-						UuidStr::from_str(string)
+						Uuid::from_str(string)
 							.map_err(serde::de::Error::custom)?
 							.into(),
 					),

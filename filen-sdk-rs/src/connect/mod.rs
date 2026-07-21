@@ -12,7 +12,7 @@ use filen_types::{
 		item::{linked::ListedPublicLink, shared::SharedUser},
 	},
 	crypto::{LinkHashedPassword, LinkHashedPasswordStatic},
-	fs::{ObjectType, UuidStr},
+	fs::{ObjectType, Uuid},
 	traits::CowHelpers,
 };
 use fs::{SharedDirectory, SharedRootFile};
@@ -92,7 +92,7 @@ impl PasswordState {
 #[derive(Debug, Clone, Eq)]
 #[js_type(import, export, no_default)]
 pub struct FilePublicLink {
-	link_uuid: UuidStr,
+	link_uuid: Uuid,
 	password: PasswordState,
 	expiration: PublicLinkExpiration,
 	downloadable: bool,
@@ -132,7 +132,7 @@ impl FilePublicLink {
 		&self.password
 	}
 
-	pub fn uuid(&self) -> UuidStr {
+	pub fn uuid(&self) -> Uuid {
 		self.link_uuid
 	}
 
@@ -170,7 +170,7 @@ impl FilePublicLink {
 impl FilePublicLink {
 	pub(crate) fn new() -> Self {
 		Self {
-			link_uuid: UuidStr::new_v4(),
+			link_uuid: Uuid::new_v4(),
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
 			downloadable: true,
@@ -191,7 +191,7 @@ impl MakePasswordSaltAndHash for FilePublicLink {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirPublicLink {
-	pub(crate) link_uuid: UuidStr,
+	pub(crate) link_uuid: Uuid,
 	pub(crate) link_key: MetaKey,
 	pub(crate) password: Option<String>,
 	pub(crate) enable_download: bool,
@@ -203,7 +203,7 @@ impl DirPublicLink {
 		&self.link_key
 	}
 
-	pub fn uuid(&self) -> &UuidStr {
+	pub fn uuid(&self) -> &Uuid {
 		&self.link_uuid
 	}
 
@@ -225,7 +225,7 @@ impl DirPublicLink {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct DirPublicLinkRW {
-	pub(crate) link_uuid: UuidStr,
+	pub(crate) link_uuid: Uuid,
 	pub(crate) link_key: Option<MetaKey>,
 	pub(crate) password: PasswordState,
 	pub(crate) expiration: PublicLinkExpiration,
@@ -259,7 +259,7 @@ impl TryFrom<DirPublicLinkRW> for DirPublicLink {
 impl DirPublicLinkRW {
 	pub(crate) fn new(link_key: MetaKey) -> Self {
 		Self {
-			link_uuid: UuidStr::new_v4(),
+			link_uuid: Uuid::new_v4(),
 			link_key: Some(link_key),
 			password: PasswordState::None,
 			expiration: PublicLinkExpiration::Never,
@@ -270,7 +270,7 @@ impl DirPublicLinkRW {
 }
 
 impl DirPublicLinkRW {
-	pub fn uuid(&self) -> UuidStr {
+	pub fn uuid(&self) -> Uuid {
 		self.link_uuid
 	}
 
@@ -315,7 +315,7 @@ impl Client {
 		api::v3::item::shared::rename::post(
 			self.client(),
 			&api::v3::item::shared::rename::Request {
-				uuid: *item.uuid(),
+				uuid: item.uuid(),
 				receiver_id: user.id,
 				metadata: item
 					.get_rsa_encrypted_meta(&user.public_key)
@@ -329,7 +329,7 @@ impl Client {
 	async fn update_linked_item_meta<I>(
 		&self,
 		item: &I,
-		link_uuid: UuidStr,
+		link_uuid: Uuid,
 		crypter: &impl MetaCrypter,
 	) -> Result<(), Error>
 	where
@@ -338,7 +338,7 @@ impl Client {
 		api::v3::item::linked::rename::post(
 			self.client(),
 			&api::v3::item::linked::rename::Request {
-				uuid: *item.uuid(),
+				uuid: item.uuid(),
 				link_uuid,
 				metadata: item
 					.get_encrypted_meta(crypter)
@@ -357,14 +357,14 @@ impl Client {
 			async {
 				api::v3::item::linked::post(
 					self.client(),
-					&api::v3::item::linked::Request { uuid: *item.uuid() },
+					&api::v3::item::linked::Request { uuid: item.uuid() },
 				)
 				.await
 			},
 			async {
 				api::v3::item::shared::post(
 					self.client(),
-					&api::v3::item::shared::Request { uuid: *item.uuid() },
+					&api::v3::item::shared::Request { uuid: item.uuid() },
 				)
 				.await
 			},
@@ -486,7 +486,7 @@ impl Client {
 		api::v3::dir::link::add::post(
 			self.client(),
 			&api::v3::dir::link::add::Request {
-				uuid: *item.uuid(),
+				uuid: item.uuid(),
 				parent: Some((*item.parent()).try_into()?),
 				link_uuid: link.link_uuid,
 				r#type: item.object_type(),
@@ -537,7 +537,7 @@ impl Client {
 			api::v3::dir::link::add::post(
 				self.client(),
 				&api::v3::dir::link::add::Request {
-					uuid: *dir.uuid(),
+					uuid: dir.uuid(),
 					parent: None,
 					link_uuid: public_link.link_uuid,
 					r#type: ObjectType::Dir,
@@ -591,7 +591,7 @@ impl Client {
 			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: file_link.link_uuid,
-				file_uuid: *file.uuid(),
+				file_uuid: file.uuid(),
 				expiration: PublicLinkExpiration::Never,
 				password: false,
 				password_hashed,
@@ -613,7 +613,7 @@ impl Client {
 		api::v3::dir::link::edit::post(
 			self.client(),
 			&api::v3::dir::link::edit::Request {
-				uuid: *dir.uuid(),
+				uuid: dir.uuid(),
 				expiration: link.expiration,
 				password: link.password().is_known(),
 				password_hashed: link.get_password_hash()?,
@@ -635,7 +635,7 @@ impl Client {
 			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: link.link_uuid,
-				file_uuid: *file.uuid(),
+				file_uuid: file.uuid(),
 				expiration: link.expiration,
 				password: link.password().is_known(),
 				password_hashed: do_cpu_intensive(|| link.get_password_hash()).await?,
@@ -657,7 +657,7 @@ impl Client {
 			self.client(),
 			&api::v3::file::link::edit::Request {
 				uuid: link.link_uuid,
-				file_uuid: *file.uuid(),
+				file_uuid: file.uuid(),
 				expiration: PublicLinkExpiration::Never,
 				password: false,
 				password_hashed: crate::crypto::connect::empty_hash(),
@@ -675,7 +675,7 @@ impl Client {
 	) -> Result<Option<FilePublicLink>, Error> {
 		let response = api::v3::file::link::status::post(
 			self.client(),
-			&api::v3::file::link::status::Request { uuid: *file.uuid() },
+			&api::v3::file::link::status::Request { uuid: file.uuid() },
 		)
 		.await?;
 
@@ -716,7 +716,7 @@ impl Client {
 	) -> Result<Option<DirPublicLinkRW>, Error> {
 		let response = api::v3::dir::link::status::post(
 			self.client(),
-			&api::v3::dir::link::status::Request { uuid: *dir.uuid() },
+			&api::v3::dir::link::status::Request { uuid: dir.uuid() },
 		)
 		.await?;
 
@@ -762,7 +762,7 @@ impl Client {
 	pub async fn remove_dir_link(&self, dir: &RemoteDirectory) -> Result<(), Error> {
 		api::v3::dir::link::remove::post(
 			self.client(),
-			&api::v3::dir::link::remove::Request { uuid: *dir.uuid() },
+			&api::v3::dir::link::remove::Request { uuid: dir.uuid() },
 		)
 		.await?;
 		Ok(())
@@ -780,7 +780,7 @@ impl Client {
 		api::v3::item::share::post(
 			self.client(),
 			&api::v3::item::share::Request {
-				uuid: *item.uuid(),
+				uuid: item.uuid(),
 				parent: Some((*item.parent()).try_into()?),
 				email: user.email.as_borrowed_cow(),
 				r#type: item.object_type(),
@@ -812,7 +812,7 @@ impl Client {
 			api::v3::item::share::post(
 				self.client(),
 				&api::v3::item::share::Request {
-					uuid: *dir.uuid(),
+					uuid: dir.uuid(),
 					parent: None,
 					email: client.email.as_borrowed_cow(),
 					r#type: ObjectType::Dir,
@@ -850,7 +850,7 @@ impl Client {
 		api::v3::item::share::post(
 			self.client(),
 			&api::v3::item::share::Request {
-				uuid: *file.uuid(),
+				uuid: file.uuid(),
 				parent: None,
 				email: contact.email.as_borrowed_cow(),
 				r#type: ObjectType::File,
@@ -917,7 +917,7 @@ impl Client {
 			fs::SharingRole::Sharer(_) => {
 				api::v3::item::shared::r#in::remove::post(
 					self.client(),
-					&api::v3::item::shared::r#in::remove::Request { uuid: *item.uuid() },
+					&api::v3::item::shared::r#in::remove::Request { uuid: item.uuid() },
 				)
 				.await
 			}
@@ -925,7 +925,7 @@ impl Client {
 				api::v3::item::shared::out::remove::post(
 					self.client(),
 					&api::v3::item::shared::out::remove::Request {
-						uuid: *item.uuid(),
+						uuid: item.uuid(),
 						receiver_id: share_info.id,
 					},
 				)
@@ -939,7 +939,7 @@ impl Client {
 pub trait PublicLinkSharedClientExt: SharedClient {
 	async fn get_linked_file(
 		&self,
-		link_uuid: UuidStr,
+		link_uuid: Uuid,
 		file_key: &str,
 		password: Option<&str>,
 	) -> Result<LinkedFile, Error> {
@@ -999,7 +999,7 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 
 	async fn get_dir_public_link_info(
 		&self,
-		link_uuid: UuidStr,
+		link_uuid: Uuid,
 		link_key: &str,
 	) -> Result<DirPublicInfo, Error> {
 		let resp = api::v3::dir::link::info::post(

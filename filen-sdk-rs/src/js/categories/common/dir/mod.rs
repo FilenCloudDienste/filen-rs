@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 
 use crate::fs::dir::RootDirectoryWithMeta;
 
@@ -9,7 +9,7 @@ pub(crate) mod meta;
 
 #[js_type(wasm_all)]
 pub struct RootDirWithMeta {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub color: color::DirColor,
 	#[cfg_attr(
 		feature = "wasm-full",

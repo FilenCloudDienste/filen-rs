@@ -3,14 +3,14 @@ use std::{borrow::Cow, str::FromStr};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::rsa::RSAEncryptedString, fs::UuidStr};
+use crate::{crypto::rsa::RSAEncryptedString, fs::Uuid};
 
 pub const ENDPOINT: &str = "v3/notes/participants/add";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "contactUUID")]
 	pub contact_uuid: ContactUuid,
 	pub metadata: RSAEncryptedString<'a>,
@@ -28,17 +28,8 @@ pub struct Response<'a> {
 
 #[derive(Debug, Clone)]
 pub enum ContactUuid {
-	Uuid(UuidStr),
+	Uuid(Uuid),
 	Owner,
-}
-
-impl AsRef<str> for ContactUuid {
-	fn as_ref(&self) -> &str {
-		match self {
-			Self::Uuid(uuid) => uuid.as_ref(),
-			Self::Owner => "owner",
-		}
-	}
 }
 
 impl FromStr for ContactUuid {
@@ -48,7 +39,7 @@ impl FromStr for ContactUuid {
 		if s == "owner" {
 			Ok(Self::Owner)
 		} else {
-			Ok(Self::Uuid(UuidStr::from_str(s)?))
+			Ok(Self::Uuid(Uuid::from_str(s)?))
 		}
 	}
 }
@@ -58,7 +49,10 @@ impl Serialize for ContactUuid {
 	where
 		S: serde::Serializer,
 	{
-		serializer.serialize_str(self.as_ref())
+		match self {
+			Self::Uuid(uuid) => uuid.serialize(serializer),
+			Self::Owner => serializer.serialize_str("owner"),
+		}
 	}
 }
 

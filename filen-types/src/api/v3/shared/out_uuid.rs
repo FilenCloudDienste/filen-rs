@@ -4,8 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
-	fs::UuidStr,
+	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString, fs::Uuid,
 };
 
 pub const ENDPOINT: &str = "v3/shared/out";
@@ -13,7 +12,7 @@ pub const ENDPOINT: &str = "v3/shared/out";
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub receiver_id: u64,
 }
@@ -30,8 +29,8 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedFileOut<'a> {
-	pub uuid: UuidStr,
-	pub parent: UuidStr,
+	pub uuid: Uuid,
+	pub parent: Uuid,
 	pub metadata: EncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
@@ -49,8 +48,8 @@ pub struct SharedFileOut<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedDirOut<'a> {
-	pub uuid: UuidStr,
-	pub parent: UuidStr,
+	pub uuid: Uuid,
+	pub parent: Uuid,
 	pub metadata: EncryptedString<'a>,
 	// pub receiver_email: Cow<'a, str>,
 	// pub receiver_id: u64,

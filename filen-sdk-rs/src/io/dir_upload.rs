@@ -8,7 +8,7 @@ use std::{
 	},
 };
 
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 
 use crate::{
 	Error, ErrorKind,
@@ -137,7 +137,7 @@ impl Client {
 					match result {
 						DirUploadResult(Ok((dir, children_info)), path) => {
 							let new_children = tree.list_children(children_info);
-							let parent_uuid = *dir.uuid();
+							let parent_uuid = dir.uuid();
 							uploaded_dirs.push(dir);
 							for child in new_children {
 								let entry_info = EntryToUploadInfo {
@@ -246,7 +246,7 @@ impl Client {
 	async fn upload_child_file_from_path(
 		&self,
 		path: &Path,
-		parent: &UuidStr,
+		parent: &Uuid,
 		uploaded_bytes: Arc<AtomicU64>,
 	) -> Result<RemoteFile, Error> {
 		self.upload_file_from_path_with_builder(
@@ -264,7 +264,7 @@ impl Client {
 	async fn upload_child_dir_from_path(
 		&self,
 		path: &Path,
-		parent: &UuidStr,
+		parent: &Uuid,
 	) -> Result<RemoteDirectory, Error> {
 		let metadata = tokio::fs::metadata(path).await.map_err(|e| {
 			Error::custom_with_source(
@@ -357,7 +357,7 @@ struct FileUploadResult(Result<RemoteFile, (Error, PathBuf)>);
 
 struct EntryToUploadInfo {
 	entry: EntryToUpload,
-	parent: UuidStr,
+	parent: Uuid,
 }
 enum EntryToUpload {
 	File(PathBuf),

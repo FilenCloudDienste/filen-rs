@@ -535,7 +535,7 @@ fn register_change_and_reset_password_with_export() {
 			.await
 			.unwrap();
 		let first_file = client
-			.make_file_builder("first.txt", *client.root().uuid())
+			.make_file_builder("first.txt", client.root().uuid())
 			.unwrap();
 
 		let first_file = client
@@ -552,7 +552,7 @@ fn register_change_and_reset_password_with_export() {
 			.unwrap();
 
 		let second_file = client
-			.make_file_builder("second", *client.root().uuid())
+			.make_file_builder("second", client.root().uuid())
 			.unwrap();
 		let second_file = client
 			.upload_file(second_file, b"Hello, world!")
@@ -565,7 +565,7 @@ fn register_change_and_reset_password_with_export() {
 			.unwrap();
 
 		let third_file = relogin_client
-			.make_file_builder("third", *client.root().uuid())
+			.make_file_builder("third", client.root().uuid())
 			.unwrap();
 
 		let third_file = relogin_client

@@ -176,7 +176,7 @@ impl TryFrom<&str> for ValidatedName {
 #[cfg(feature = "uniffi")]
 uniffi::custom_type!(ValidatedName, String, {
 	remote,
-	lower: |uuid: &UuidStr| uuid.as_ref().to_string(),
+	lower: |uuid: &Uuid| uuid.as_ref().to_string(),
 	try_lift: |s: String| {
 		ValidatedName::try_from(s.as_ref()).map_err(|_| uniffi::deps::anyhow::anyhow!("invalid NormalizedName string: {}", s))
 	},

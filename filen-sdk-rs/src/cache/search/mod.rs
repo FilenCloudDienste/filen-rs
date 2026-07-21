@@ -184,7 +184,7 @@ impl Client {
 			live: AtomicBool::new(true),
 		});
 		let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
-		let account_root: Uuid = self.root().uuid().into();
+		let account_root: Uuid = self.root().uuid();
 		let init = EngineInit {
 			root: uuid,
 			is_account_root: uuid == account_root,

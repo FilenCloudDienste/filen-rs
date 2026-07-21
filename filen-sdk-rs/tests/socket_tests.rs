@@ -145,7 +145,7 @@ async fn test_websocket_file_events() {
 		.await
 		.unwrap();
 
-	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).unwrap();
+	let file_a = client.make_file_builder("file_a.txt", dir.uuid()).unwrap();
 	let mut file_a = client
 		.upload_file(file_a, b"file a contents")
 		.await
@@ -158,7 +158,7 @@ async fn test_websocket_file_events() {
 				inner: DecryptedDriveEvent::FileNew(data),
 				..
 			} => {
-				if data.0.uuid == *file_a.uuid() {
+				if data.0.uuid == file_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -180,7 +180,7 @@ async fn test_websocket_file_events() {
 			DecryptedSocketEvent::Drive {
 				inner: DecryptedDriveEvent::FileTrash(data),
 				..
-			} => data.uuid == *file_a.uuid(),
+			} => data.uuid == file_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -197,7 +197,7 @@ async fn test_websocket_file_events() {
 				inner: DecryptedDriveEvent::FileRestore(data),
 				..
 			} => {
-				if data.0.uuid == *file_a.uuid() {
+				if data.0.uuid == file_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -214,7 +214,7 @@ async fn test_websocket_file_events() {
 
 	let old_file_a = file_a;
 
-	let file_a = client.make_file_builder("file_a.txt", *dir.uuid()).unwrap();
+	let file_a = client.make_file_builder("file_a.txt", dir.uuid()).unwrap();
 	let mut file_a = client
 		.upload_file(file_a, b"file b contents")
 		.await
@@ -226,7 +226,7 @@ async fn test_websocket_file_events() {
 			DecryptedSocketEvent::Drive {
 				inner: DecryptedDriveEvent::FileArchived(file),
 				..
-			} => file.uuid == *old_file_a.uuid(),
+			} => file.uuid == old_file_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -302,7 +302,7 @@ async fn test_websocket_file_events() {
 			DecryptedSocketEvent::Drive {
 				inner: DecryptedDriveEvent::FileMetadataChanged(data),
 				..
-			} => data.uuid == *file_a.uuid(),
+			} => data.uuid == file_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -327,7 +327,7 @@ async fn test_websocket_file_events() {
 				inner: DecryptedDriveEvent::FileMetadataChanged(data),
 				..
 			} => {
-				if data.uuid == *file_a.uuid() {
+				if data.uuid == file_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -356,7 +356,7 @@ async fn test_websocket_file_events() {
 				inner: DecryptedDriveEvent::FileMove(data),
 				..
 			} => {
-				if data.0.uuid == *file_a.uuid() {
+				if data.0.uuid == file_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -371,7 +371,7 @@ async fn test_websocket_file_events() {
 
 	assert_eq!(event.0, file_a);
 
-	let uuid = *file_a.uuid();
+	let uuid = file_a.uuid();
 
 	client.delete_file_permanently(file_a).await.unwrap();
 	await_event(
@@ -409,7 +409,7 @@ async fn test_get_last_event_ids() {
 	let before = client.get_last_event_ids().await.unwrap();
 
 	let file = client
-		.make_file_builder("event_ids_test.txt", *dir.uuid())
+		.make_file_builder("event_ids_test.txt", dir.uuid())
 		.unwrap();
 	let file = client.upload_file(file, b"event ids test").await.unwrap();
 
@@ -419,7 +419,7 @@ async fn test_get_last_event_ids() {
 			DecryptedSocketEvent::Drive {
 				inner: DecryptedDriveEvent::FileNew(data),
 				drive_message_id,
-			} if data.0.uuid == *file.uuid() => Some(drive_message_id),
+			} if data.0.uuid == file.uuid() => Some(drive_message_id),
 			_ => None,
 		},
 		Duration::from_secs(20),
@@ -478,7 +478,7 @@ async fn test_websocket_folder_events() {
 				inner: DecryptedDriveEvent::FolderSubCreated(data),
 				..
 			} => {
-				if data.0.uuid == *dir_a.uuid() {
+				if data.0.uuid == dir_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -499,7 +499,7 @@ async fn test_websocket_folder_events() {
 			DecryptedSocketEvent::Drive {
 				inner: DecryptedDriveEvent::FolderTrash(data),
 				..
-			} => data.uuid == *dir_a.uuid(),
+			} => data.uuid == dir_a.uuid(),
 			_ => false,
 		},
 		Duration::from_secs(20),
@@ -515,7 +515,7 @@ async fn test_websocket_folder_events() {
 				inner: DecryptedDriveEvent::FolderRestore(data),
 				..
 			} => {
-				if data.0.uuid == *dir_a.uuid() {
+				if data.0.uuid == dir_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -565,7 +565,7 @@ async fn test_websocket_folder_events() {
 				inner: DecryptedDriveEvent::FolderMetadataChanged(data),
 				..
 			} => {
-				if data.uuid == *dir_a.uuid() {
+				if data.uuid == dir_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -592,7 +592,7 @@ async fn test_websocket_folder_events() {
 				inner: DecryptedDriveEvent::FolderMove(data),
 				..
 			} => {
-				if data.0.uuid == *dir_a.uuid() {
+				if data.0.uuid == dir_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -619,7 +619,7 @@ async fn test_websocket_folder_events() {
 				inner: DecryptedDriveEvent::FolderColorChanged(data),
 				..
 			} => {
-				if data.uuid == *dir_a.uuid() {
+				if data.uuid == dir_a.uuid() {
 					Some(data)
 				} else {
 					None
@@ -634,7 +634,7 @@ async fn test_websocket_folder_events() {
 
 	assert_eq!(event.color, DirColor::Blue);
 
-	let uuid = *dir_a.uuid();
+	let uuid = dir_a.uuid();
 	client.delete_dir_permanently(dir_a).await.unwrap();
 
 	await_event(

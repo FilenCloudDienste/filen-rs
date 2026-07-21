@@ -36,7 +36,7 @@ impl AuthCacheState {
 			return Ok(None);
 		}
 		let file_path = self.get_cached_file_path(file);
-		let file_thumbnails_path = self.thumbnail_dir.join(file.uuid().as_ref());
+		let file_thumbnails_path = self.thumbnail_dir.join(file.uuid().to_string());
 		tokio::fs::create_dir_all(&file_thumbnails_path).await?;
 		let thumbnail_path =
 			file_thumbnails_path.join(format!("{target_width}x{target_height}.webp"));

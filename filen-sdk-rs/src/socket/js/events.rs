@@ -12,7 +12,7 @@ use filen_types::{
 		},
 	},
 	crypto::MaybeEncrypted,
-	fs::UuidStr,
+	fs::Uuid,
 	traits::{CowHelpers, CowHelpersExt},
 };
 
@@ -278,7 +278,7 @@ impl From<&DecryptedSocketEvent<'_>> for SocketEvent {
 
 #[js_type]
 pub struct NewEvent {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub event_type: String,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -302,7 +302,7 @@ impl From<&crate::socket::events::NewEvent<'_>> for NewEvent {
 
 #[js_type]
 pub struct FileArchiveRestored {
-	pub current_uuid: UuidStr,
+	pub current_uuid: Uuid,
 	pub file: File,
 }
 
@@ -395,7 +395,7 @@ impl From<&crate::socket::events::FolderRestore> for FolderRestore {
 
 #[js_type]
 pub struct FolderColorChanged {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub color: DirColor,
 }
 
@@ -423,7 +423,7 @@ impl From<&crate::socket::events::ChatMessageNew> for ChatMessageNew {
 
 #[js_type]
 pub struct ChatTyping {
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	pub sender_avatar: Option<String>,
 	pub sender_email: String,
 	pub sender_nick_name: String,
@@ -466,7 +466,7 @@ impl From<&crate::socket::events::ChatConversationsNew> for ChatConversationsNew
 
 #[js_type]
 pub struct NoteContentEdited {
-	pub note: UuidStr,
+	pub note: Uuid,
 	pub content: MaybeEncrypted<'static, str>,
 	pub note_type: NoteType,
 	pub editor_id: u64,
@@ -492,7 +492,7 @@ impl From<&crate::socket::events::NoteContentEdited<'_>> for NoteContentEdited {
 
 #[js_type]
 pub struct NoteTitleEdited {
-	pub note: UuidStr,
+	pub note: Uuid,
 	pub new_title: MaybeEncrypted<'static, str>,
 }
 
@@ -507,7 +507,7 @@ impl From<&crate::socket::events::NoteTitleEdited<'_>> for NoteTitleEdited {
 
 #[js_type]
 pub struct NoteParticipantNew {
-	pub note: UuidStr,
+	pub note: Uuid,
 	pub participant: NoteParticipant,
 }
 
@@ -522,7 +522,7 @@ impl From<&crate::socket::events::NoteParticipantNew> for NoteParticipantNew {
 
 #[js_type]
 pub struct NoteNew {
-	pub note: UuidStr,
+	pub note: Uuid,
 }
 impl From<&crate::socket::events::NoteNew> for NoteNew {
 	fn from(value: &crate::socket::events::NoteNew) -> Self {
@@ -532,8 +532,8 @@ impl From<&crate::socket::events::NoteNew> for NoteNew {
 
 #[js_type]
 pub struct ChatMessageEdited {
-	pub chat: UuidStr,
-	pub uuid: UuidStr,
+	pub chat: Uuid,
+	pub uuid: Uuid,
 	pub new_content: MaybeEncrypted<'static, str>,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
@@ -556,7 +556,7 @@ impl From<&crate::socket::events::ChatMessageEdited<'_>> for ChatMessageEdited {
 
 #[js_type]
 pub struct ChatConversationNameEdited {
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	pub new_name: MaybeEncrypted<'static, str>,
 }
 
@@ -571,7 +571,7 @@ impl From<&crate::socket::events::ChatConversationNameEdited<'_>> for ChatConver
 
 #[js_type]
 pub struct ContactRequestReceived {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub sender_id: u64,
 	pub sender_email: String,
 	pub sender_avatar: Option<String>,
@@ -611,7 +611,7 @@ impl From<&crate::socket::events::ItemFavorite> for ItemFavorite {
 
 #[js_type]
 pub struct FolderMetadataChanged {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub meta: DirMeta,
 }
 
@@ -626,7 +626,7 @@ impl From<&crate::socket::events::FolderMetadataChanged<'_>> for FolderMetadataC
 
 #[js_type]
 pub struct FileMetadataChanged {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub metadata: FileMeta,
 }
 

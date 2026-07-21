@@ -77,7 +77,7 @@ async fn upload_text(
 ) -> filen_sdk_rs::io::RemoteFile {
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 	loop {
-		let builder = client.make_file_builder(name, *dir.uuid()).unwrap();
+		let builder = client.make_file_builder(name, dir.uuid()).unwrap();
 		match client.upload_file(builder, b"x").await {
 			Ok(file) => return file,
 			Err(e) if tokio::time::Instant::now() < deadline => {
@@ -124,7 +124,7 @@ async fn test_search_initial_results_sorted_dirs_first() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(
@@ -154,7 +154,7 @@ async fn test_search_live_upload_fires_window_snapshot() {
 	let scratch = scratch_dir(&client, &resources, "live").await;
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	let (log, callback) = snapshot_log();
@@ -182,7 +182,7 @@ async fn test_search_rename_reorders_results() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 2).await);
@@ -215,7 +215,7 @@ async fn test_search_favorite_toggle_fires_content_refresh() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
@@ -250,7 +250,7 @@ async fn test_search_move_out_removes_result() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
@@ -273,7 +273,7 @@ async fn test_search_move_in_of_populated_dir_indexes_descendants() {
 	let scratch = scratch_dir(&client, &resources, "movein").await;
 
 	// A populated dir OUTSIDE the search root, cached via a whole-account registration.
-	let account_root: Uuid = client.root().uuid().into();
+	let account_root: Uuid = client.root().uuid();
 	let _account_registration = client
 		.clone()
 		.add_sync_root(account_root, noop_sync_root_callback())
@@ -292,7 +292,7 @@ async fn test_search_move_in_of_populated_dir_indexes_descendants() {
 	// instantly (no validation round-trip, no resync) — its contents are already queryable.
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert_eq!(search.total(), 0);
@@ -319,10 +319,7 @@ async fn test_search_name_filter_applies_to_live_events() {
 	let scratch = scratch_dir(&client, &resources, "filter").await;
 	let search = client
 		.clone()
-		.create_search(
-			scratch.uuid().into(),
-			SearchConfig::new().with_name("Report"),
-		)
+		.create_search(scratch.uuid(), SearchConfig::new().with_name("Report"))
 		.await
 		.unwrap();
 
@@ -346,7 +343,7 @@ async fn test_search_set_config_refilters_without_reregistration() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 2).await);
@@ -372,10 +369,7 @@ async fn test_search_case_sensitive_toggle() {
 
 	let search = client
 		.clone()
-		.create_search(
-			scratch.uuid().into(),
-			SearchConfig::new().with_name("mixed"),
-		)
+		.create_search(scratch.uuid(), SearchConfig::new().with_name("mixed"))
 		.await
 		.unwrap();
 	assert!(
@@ -415,7 +409,7 @@ async fn test_search_out_of_window_insert_updates_delivered_total() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
@@ -447,7 +441,7 @@ async fn test_search_root_deleted_goes_terminal_with_frozen_get_range() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
@@ -492,7 +486,7 @@ async fn test_search_flush_cache_goes_terminal() {
 
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.total() == 1).await);
@@ -514,7 +508,7 @@ async fn test_search_flush_cache_goes_terminal() {
 async fn test_search_unknown_uuid_is_rejected() {
 	let client = search_client().await;
 	// The slot must be live for the validation to run on a worker — register the account root.
-	let account_root: Uuid = client.root().uuid().into();
+	let account_root: Uuid = client.root().uuid();
 	let _registration = client
 		.clone()
 		.add_sync_root(account_root, noop_sync_root_callback())
@@ -542,7 +536,7 @@ async fn test_search_close_returns_with_live_window_handle() {
 	let scratch = scratch_dir(&client, &resources, "close").await;
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	let (_log, callback) = snapshot_log();
@@ -562,7 +556,7 @@ async fn test_search_drop_releases_the_sync_root() {
 	let scratch = scratch_dir(&client, &resources, "droprel").await;
 	let search = client
 		.clone()
-		.create_search(scratch.uuid().into(), SearchConfig::new())
+		.create_search(scratch.uuid(), SearchConfig::new())
 		.await
 		.unwrap();
 	assert!(poll_until(CACHE_CONVERGE_TIMEOUT, || search.is_live()).await);

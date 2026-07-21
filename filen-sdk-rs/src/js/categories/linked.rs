@@ -6,7 +6,7 @@ use filen_types::{
 	api::v3::dir::link::{PublicLinkExpiration, info::LinkPasswordSalt},
 	auth::{FileEncryptionVersion, MetaEncryptionVersion},
 	crypto::MaybeEncrypted,
-	fs::UuidStr,
+	fs::Uuid,
 };
 
 use crate::{
@@ -26,7 +26,7 @@ use super::common::dir::RootDirWithMeta;
 
 #[js_type(wasm_all, export)]
 pub struct LinkedFile {
-	uuid: UuidStr,
+	uuid: Uuid,
 	name: MaybeEncrypted<'static, str>,
 	mime: MaybeEncrypted<'static, str>,
 	size: u64,
@@ -162,7 +162,7 @@ impl From<DirType<'static, Linked>> for AnyLinkedDir {
 /// if all fields are compatible
 /// but converting from a DirPublicLink to a DirPublicLinkRW is not allowed
 pub struct DirPublicLink {
-	link_uuid: UuidStr,
+	link_uuid: Uuid,
 	link_key: String,
 	link_key_version: u8,
 	password: Option<String>,
@@ -207,7 +207,7 @@ impl TryFrom<DirPublicLink> for crate::connect::DirPublicLink {
 /// if all fields are compatible
 /// but converting from a DirPublicLink to a DirPublicLinkRW is not allowed
 pub struct DirPublicLinkRW {
-	link_uuid: UuidStr,
+	link_uuid: Uuid,
 	link_key: Option<String>,
 	link_key_version: Option<u8>,
 	password: PasswordState,

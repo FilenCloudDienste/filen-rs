@@ -2,6 +2,7 @@ SELECT
 	items.id,
 	items.uuid,
 	items.parent,
+	items.trashed,
 	items.local_data,
 	items.type,
 	dirs.favorite_rank AS dir_favorite_rank,

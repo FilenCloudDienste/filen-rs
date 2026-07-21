@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 use crate::{
 	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::rsa::RSAEncryptedString,
-	fs::UuidStr,
+	fs::Uuid,
 };
 
 pub const ENDPOINT: &str = "v3/shared/in";
@@ -36,7 +36,7 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedRootFileIn<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub metadata: RSAEncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
@@ -57,7 +57,7 @@ pub struct SharedRootFileIn<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SharedRootDirIn<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub metadata: RSAEncryptedString<'a>,
 	pub sharer_email: Cow<'a, str>,
 	#[serde(with = "crate::serde::number::permissive_u64")]

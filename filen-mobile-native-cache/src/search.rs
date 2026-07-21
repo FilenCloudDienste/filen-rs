@@ -289,6 +289,8 @@ fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 	FfiFile {
 		uuid: file.uuid.to_string(),
 		parent: file.parent.to_string(),
+		// Search only indexes live items, never trashed ones, so there is no original parent.
+		original_parent: None,
 		meta: Some(FfiFileMeta {
 			name: file.name.into_owned(),
 			mime: file.mime.into_owned(),
@@ -310,6 +312,8 @@ fn ffi_dir(dir: CacheableDir<'_>) -> FfiDir {
 	FfiDir {
 		uuid: dir.uuid.to_string(),
 		parent: dir.parent.to_string(),
+		// Search only indexes live items, never trashed ones, so there is no original parent.
+		original_parent: None,
 		meta: Some(FfiDirMeta {
 			name: dir.name.into_owned(),
 			created: dir.created.map(|c| c.timestamp_millis()),

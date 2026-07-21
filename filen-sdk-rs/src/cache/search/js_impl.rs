@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use filen_macros::js_type;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use filen_types::fs::UuidStr;
 use uuid::Uuid;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -182,7 +183,7 @@ pub struct CacheSearchWindow {
 	wasm_bindgen::prelude::wasm_bindgen
 )]
 pub struct CacheSearch {
-	root: UuidStr,
+	root: Uuid,
 	/// `Some` until [`close`](Self::close) takes it — the core close consumes the [`Search`],
 	/// which a shared FFI handle can only express by interior take.
 	inner: tokio::sync::Mutex<Option<Search>>,
@@ -249,7 +250,7 @@ pub trait CacheSearchWindowListener: Send + Sync {
 impl CacheSearch {
 	/// The searched directory's uuid — correlate with the `ResyncProgress` /
 	/// `SyncRootsDeleted` messages on the cache status listener.
-	pub fn root_uuid(&self) -> UuidStr {
+	pub fn root_uuid(&self) -> Uuid {
 		self.root
 	}
 
@@ -318,7 +319,7 @@ impl CacheSearch {
 	/// `SyncRootsDeleted` messages on the cache status listener.
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "rootUuid")]
 	pub fn root_uuid(&self) -> UuidStr {
-		self.root
+		UuidStr::from(&self.root)
 	}
 
 	/// Total matches currently in the result set. Advisory — each snapshot carries its own
@@ -438,12 +439,12 @@ impl JsClient {
 	/// filters with [`CacheSearch::set_config`], not by recreating the search.
 	pub async fn create_search(
 		&self,
-		uuid: UuidStr,
+		uuid: Uuid,
 		config: CacheSearchConfig,
 	) -> Result<CacheSearch, Error> {
 		let this = self.inner();
 		do_on_commander(move || async move {
-			let search = this.create_search(Uuid::from(&uuid), config.into()).await?;
+			let search = this.create_search(uuid, config.into()).await?;
 			Ok(CacheSearch {
 				root: uuid,
 				inner: tokio::sync::Mutex::new(Some(search)),
@@ -471,7 +472,7 @@ impl JsClient {
 		do_on_commander(move || async move {
 			let search = this.create_search(Uuid::from(&uuid), config.into()).await?;
 			Ok(CacheSearch {
-				root: uuid,
+				root: Uuid::from(&uuid),
 				inner: tokio::sync::Mutex::new(Some(search)),
 			})
 		})

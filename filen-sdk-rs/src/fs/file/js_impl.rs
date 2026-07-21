@@ -189,7 +189,8 @@ impl JsClient {
 	)]
 	pub async fn get_file(&self, uuid: UuidStr) -> Result<File, Error> {
 		let this = self.inner();
-		do_on_commander(move || async move { this.get_file(uuid).await.map(File::from) }).await
+		do_on_commander(move || async move { this.get_file(uuid.into()).await.map(File::from) })
+			.await
 	}
 
 	#[cfg_attr(

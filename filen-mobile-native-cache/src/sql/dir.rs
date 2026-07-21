@@ -14,7 +14,7 @@ use filen_sdk_rs::fs::{
 use filen_types::{
 	api::v3::dir::color::DirColor,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::{ParentUuid, UuidStr},
+	fs::{ParentUuid, Uuid},
 	traits::CowHelpers,
 };
 use rusqlite::{CachedStatement, Connection, Result};
@@ -118,7 +118,7 @@ impl From<DBDirMeta> for DirectoryMeta<'static> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DBDir {
 	pub(crate) id: i64,
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 	pub(crate) parent: ParentUuid,
 	pub(crate) favorite_rank: i64,
 	pub(crate) color: DirColor<'static>,
@@ -167,7 +167,7 @@ impl DBDir {
 		delete_dir_meta: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		let (id, local_data) = item::upsert_item_with_stmts(
-			*remote_dir.uuid(),
+			remote_dir.uuid(),
 			Some(*remote_dir.parent()),
 			remote_dir.name(),
 			None,
@@ -274,7 +274,7 @@ impl DBDirTrait for DBDir {
 		self.id
 	}
 
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -293,7 +293,7 @@ impl DBDirTrait for DBDir {
 }
 
 impl item::DBItemTrait for DBDir {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -325,7 +325,7 @@ impl From<DBDir> for RemoteDirectory {
 
 impl PartialEq<RemoteDirectory> for DBDir {
 	fn eq(&self, other: &RemoteDirectory) -> bool {
-		self.uuid == *other.uuid()
+		self.uuid == other.uuid()
 			&& self.parent == *other.parent()
 			&& DBItemTrait::name(self) == other.name()
 			&& self.color == other.color()
@@ -337,7 +337,7 @@ impl PartialEq<RemoteDirectory> for DBDir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DBRoot {
 	pub(crate) id: i64,
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 	pub(crate) storage_used: i64,
 	pub(crate) max_storage: i64,
 	pub(crate) last_updated: i64,
@@ -365,7 +365,7 @@ impl DBRoot {
 		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))
 	}
 
-	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
 		match DBObject::select(conn, uuid)? {
 			DBObject::Root(root) => Ok(root),
 			obj => Err(SQLError::UnexpectedType(obj.item_type(), ItemType::Root)),
@@ -380,7 +380,7 @@ impl DBRoot {
 		let tx = conn.transaction()?;
 		let (id, _) = item::upsert_item(
 			&tx,
-			*remote_root.uuid(),
+			remote_root.uuid(),
 			None, // root has no parent
 			None, // root has no name
 			None,
@@ -407,7 +407,7 @@ impl DBRoot {
 		trace!("Upserted remote root with id: {id}");
 		Ok(Self {
 			id,
-			uuid: *remote_root.uuid(),
+			uuid: remote_root.uuid(),
 			storage_used,
 			max_storage,
 			last_updated,
@@ -425,7 +425,7 @@ impl DBDirTrait for DBRoot {
 		self.id
 	}
 
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -436,7 +436,7 @@ impl DBDirTrait for DBRoot {
 }
 
 impl DBItemTrait for DBRoot {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -526,7 +526,7 @@ impl DBDirTrait for DBDirObject {
 		}
 	}
 
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		match self {
 			DBDirObject::Dir(dir) => DBDirTrait::uuid(dir),
 			DBDirObject::Root(root) => DBDirTrait::uuid(root),
@@ -544,7 +544,7 @@ impl DBDirTrait for DBDirObject {
 
 pub(crate) trait DBDirTrait: Sync + Send {
 	fn id(&self) -> i64;
-	fn uuid(&self) -> UuidStr;
+	fn uuid(&self) -> Uuid;
 	// Only the iOS local path needs a directory's name (to mirror the folder on disk); off-iOS
 	// nothing calls it, so it would warn as dead.
 	#[cfg(target_os = "ios")]
@@ -583,7 +583,7 @@ where
 		I: IntoIterator<Item = RemoteDirectory>,
 		I1: IntoIterator<Item = RemoteFile>,
 	{
-		crate::sql::update_items_with_parent(conn, dirs, files, ParentUuid::Uuid(self.uuid()))
+		crate::sql::update_items_with_parent(conn, dirs, files, self.uuid())
 	}
 
 	fn select_children(
@@ -591,6 +591,6 @@ where
 		conn: &Connection,
 		order_by: Option<&str>,
 	) -> SQLResult<Vec<DBNonRootObject>> {
-		crate::sql::select_children(conn, order_by, ParentUuid::Uuid(self.uuid()))
+		crate::sql::select_children(conn, order_by, self.uuid())
 	}
 }

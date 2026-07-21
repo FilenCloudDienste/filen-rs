@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::fs::UuidStr;
+use crate::fs::Uuid;
 
 pub mod add;
 pub mod delete;
@@ -16,7 +16,7 @@ pub struct Response<'a>(pub Vec<BlockedContact<'a>>);
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockedContact<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub email: Cow<'a, str>,

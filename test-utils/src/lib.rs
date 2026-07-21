@@ -449,7 +449,7 @@ pub async fn create_remote_file_structure_outline(
 				.find_or_create_dir_starting_at(root.clone().into(), parent)
 				.await?;
 			let file = client
-				.make_file_builder(filename, *parent_dir.uuid())
+				.make_file_builder(filename, parent_dir.uuid())
 				.context("Failed to create file builder")?;
 			let content = "This is just a placeholder file created by test_utils::create_remote_file_structure_outline";
 			client

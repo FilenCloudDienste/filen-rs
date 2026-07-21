@@ -3,13 +3,13 @@ use std::borrow::Cow;
 use rkyv::with::AsOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::{fs::UuidStr, traits::CowHelpers};
+use crate::{fs::Uuid, traits::CowHelpers};
 
 pub const ENDPOINT: &str = "v3/dir/color";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub color: DirColor<'a>,
 }
 

@@ -6,7 +6,7 @@ use serde::{
 
 use crate::{
 	crypto::{EncryptedMetaKey, LinkHashedPassword},
-	fs::UuidStr,
+	fs::Uuid,
 };
 
 use super::PublicLinkExpiration;
@@ -16,7 +16,7 @@ pub const ENDPOINT: &str = "v3/dir/link/status";
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -24,7 +24,7 @@ pub struct Response<'a>(pub Option<LinkStatus<'a>>);
 
 #[derive(Debug, Clone)]
 pub struct LinkStatus<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub key: EncryptedMetaKey<'a>,
 	pub expiration: DateTime<Utc>,
 	pub expiration_text: PublicLinkExpiration,
@@ -37,7 +37,7 @@ pub struct LinkStatus<'a> {
 struct RawResponse<'a> {
 	exists: bool,
 	#[serde(default)]
-	uuid: Option<UuidStr>,
+	uuid: Option<Uuid>,
 	#[serde(default)]
 	key: Option<EncryptedMetaKey<'a>>,
 	#[serde(with = "crate::serde::time::optional", default)]

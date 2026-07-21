@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use filen_types::{api::v3::user::lock::LockType, fs::UuidStr};
+use filen_types::{api::v3::user::lock::LockType, fs::Uuid};
 use tracing::debug;
 
 // The keep-alive schedule must use the same clock as the async timers so that the
@@ -52,7 +52,7 @@ pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 /// its own after ~30 seconds.
 #[derive(Debug, Clone)]
 pub struct ResourceLock {
-	uuid: UuidStr,
+	uuid: Uuid,
 	client: Arc<AuthClient>,
 	resource: String,
 	// Flipped to false (never back) by the keep-alive task once the server-side
@@ -99,7 +99,7 @@ impl ResourceLock {
 	}
 }
 
-async fn actually_drop(client: &AuthClient, uuid: UuidStr, resource: &str) {
+async fn actually_drop(client: &AuthClient, uuid: Uuid, resource: &str) {
 	match api::v3::user::lock::post(
 		client,
 		&api::v3::user::lock::Request {
@@ -337,7 +337,7 @@ impl Client {
 	) -> Result<Arc<ResourceLock>, Error> {
 		let resource = resource.into();
 		tracing::Span::current().record("resource", resource.as_str());
-		let uuid = UuidStr::new_v4();
+		let uuid = Uuid::new_v4();
 		let bytes = Bytes::from_owner(serde_json::to_vec(&api::v3::user::lock::Request {
 			uuid,
 			r#type: LockType::Acquire,
@@ -434,7 +434,7 @@ mod tests {
 
 		let unauthed = UnauthClient::from_config(ClientConfig::default()).unwrap();
 		ResourceLock {
-			uuid: UuidStr::new_v4(),
+			uuid: Uuid::new_v4(),
 			client: Arc::new(AuthClient::from_unauthed(
 				unauthed,
 				Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),

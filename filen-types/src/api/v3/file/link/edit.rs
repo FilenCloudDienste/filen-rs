@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	api::v3::dir::link::{PublicLinkExpiration, info::LinkPasswordSalt},
 	crypto::LinkHashedPassword,
-	fs::UuidStr,
+	fs::Uuid,
 };
 
 pub const ENDPOINT: &str = "v3/file/link/edit";
@@ -11,9 +11,9 @@ pub const ENDPOINT: &str = "v3/file/link/edit";
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "fileUUID")]
-	pub file_uuid: UuidStr,
+	pub file_uuid: Uuid,
 	pub expiration: PublicLinkExpiration,
 	#[serde(with = "crate::serde::boolean::empty_notempty")]
 	pub password: bool,

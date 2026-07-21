@@ -325,13 +325,16 @@ pub(crate) mod helpers {
 	{
 		let dir_path = match dir {
 			DirType::Root(_) => Cow::Borrowed(parent_path),
-			DirType::Dir(dir) if parent_path.is_empty() => {
-				Cow::Borrowed(dir.name().unwrap_or_else(|| dir.uuid().as_ref()))
-			}
+			DirType::Dir(dir) if parent_path.is_empty() => match dir.name() {
+				Some(n) => Cow::Borrowed(n),
+				None => Cow::Owned(dir.uuid().to_string()),
+			},
 			DirType::Dir(dir) => Cow::Owned(format!(
 				"{}/{}",
 				parent_path,
-				dir.name().unwrap_or_else(|| dir.uuid().as_ref())
+				dir.name()
+					.map(|s| s.to_string())
+					.unwrap_or_else(|| dir.uuid().to_string())
 			)),
 		};
 

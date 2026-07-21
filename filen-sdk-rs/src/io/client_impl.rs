@@ -238,7 +238,7 @@ impl Client {
 		use crate::fs::HasUUID;
 
 		self.upload_file_from_path_with_builder(
-			FileBuilderOptionalName::new(*parent.uuid()),
+			FileBuilderOptionalName::new(parent.uuid()),
 			path,
 			callback,
 		)
@@ -358,7 +358,7 @@ where
 		)
 	})?;
 	let tmp_path = parent
-		.join(remote_file.uuid().as_ref())
+		.join(remote_file.uuid().to_string())
 		.with_extension("filendl");
 	let tmp_file = tokio::fs::OpenOptions::new()
 		.write(true)

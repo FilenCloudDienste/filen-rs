@@ -38,7 +38,7 @@ impl TryFrom<RemoteDirectory> for CacheableDir<'static> {
 
 	fn try_from(mut value: RemoteDirectory) -> Result<Self, Self::Error> {
 		let parent = match value.parent {
-			ParentUuid::Uuid(uuid) => (&uuid).into(),
+			ParentUuid::Uuid(uuid) => uuid,
 			other => {
 				return Err((value, CacheableConversionError::ParentNotUuid(other)));
 			}
@@ -54,7 +54,7 @@ impl TryFrom<RemoteDirectory> for CacheableDir<'static> {
 		};
 
 		Ok(Self {
-			uuid: (&value.uuid).into(),
+			uuid: value.uuid,
 			parent,
 			color: value.color,
 			favorited: value.favorited,
@@ -81,9 +81,9 @@ impl<'a> TryFrom<&'a RemoteDirectory> for CacheableDir<'a> {
 		};
 
 		Ok(Self {
-			uuid: (&value.uuid).into(),
+			uuid: value.uuid,
 			parent: match value.parent {
-				ParentUuid::Uuid(uuid) => (&uuid).into(),
+				ParentUuid::Uuid(uuid) => uuid,
 				other => {
 					return Err(CacheableConversionError::ParentNotUuid(other));
 				}
@@ -103,8 +103,8 @@ impl<'a> TryFrom<&'a RemoteDirectory> for CacheableDir<'a> {
 impl From<CacheableDir<'static>> for RemoteDirectory {
 	fn from(value: CacheableDir<'static>) -> Self {
 		Self::from_meta(
-			(&value.uuid).into(),
-			ParentUuid::Uuid((&value.parent).into()),
+			value.uuid,
+			ParentUuid::Uuid(value.parent),
 			value.color,
 			value.favorited,
 			value.timestamp,

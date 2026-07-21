@@ -3,7 +3,7 @@ use std::{borrow::Cow, sync::Arc};
 use chrono::Utc;
 use filen_types::{
 	crypto::Blake3Hash,
-	fs::{ParentUuid, UuidStr},
+	fs::{ParentUuid, Uuid},
 };
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
@@ -75,10 +75,11 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::trash::post(
 			self.client(),
-			&api::v3::file::trash::Request { uuid: *file.uuid() },
+			&api::v3::file::trash::Request { uuid: file.uuid() },
 		)
 		.await?;
-		file.parent = ParentUuid::Trash;
+		// Remember the original parent so the trashed file knows where it came from.
+		file.parent = ParentUuid::Trash(Uuid::try_from(file.parent).unwrap_or_default());
 		Ok(())
 	}
 
@@ -86,15 +87,13 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::restore::post(
 			self.client(),
-			&api::v3::file::restore::Request { uuid: *file.uuid() },
+			&api::v3::file::restore::Request { uuid: file.uuid() },
 		)
 		.await?;
 		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
-		let resp = api::v3::file::post(
-			self.client(),
-			&api::v3::file::Request { uuid: *file.uuid() },
-		)
-		.await?;
+		let resp =
+			api::v3::file::post(self.client(), &api::v3::file::Request { uuid: file.uuid() })
+				.await?;
 
 		file.parent = resp.parent;
 		Ok(())
@@ -104,7 +103,7 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::file::delete::permanent::post(
 			self.client(),
-			&api::v3::file::delete::permanent::Request { uuid: *file.uuid() },
+			&api::v3::file::delete::permanent::Request { uuid: file.uuid() },
 		)
 		.await
 	}
@@ -118,12 +117,12 @@ impl Client {
 		api::v3::file::r#move::post(
 			self.client(),
 			&api::v3::file::r#move::Request {
-				uuid: *file.uuid(),
-				new_parent: *new_parent.uuid(),
+				uuid: file.uuid(),
+				new_parent: new_parent.uuid(),
 			},
 		)
 		.await?;
-		file.parent = (*new_parent.uuid()).into();
+		file.parent = (new_parent.uuid()).into();
 		Ok(())
 	}
 
@@ -160,7 +159,7 @@ impl Client {
 		api::v3::file::metadata::post(
 			self.client(),
 			&api::v3::file::metadata::Request {
-				uuid: *file.uuid(),
+				uuid: file.uuid(),
 				name: name?,
 				name_hashed: Cow::Owned(self.hash_name(temp_meta.name())),
 				metadata: metadata?,
@@ -174,7 +173,7 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn get_file(&self, uuid: UuidStr) -> Result<RemoteFile, Error> {
+	pub async fn get_file(&self, uuid: Uuid) -> Result<RemoteFile, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
 		let meta = runtime::do_cpu_intensive(|| {
 			FileMeta::blocking_from_encrypted(response.metadata, &*self.crypter(), response.version)
@@ -182,9 +181,10 @@ impl Client {
 		.await;
 		Ok(RemoteFile::from_meta(
 			uuid,
-			// v3 api returns the original parent as the parent if the file is in the trash
+			// v3 api returns the original parent as the parent if the file is in the trash;
+			// keep it as the remembered original parent instead of discarding it.
 			if response.trash {
-				ParentUuid::Trash
+				ParentUuid::Trash(Uuid::try_from(response.parent).unwrap_or_default())
 			} else {
 				response.parent
 			},
@@ -202,12 +202,12 @@ impl Client {
 		&self,
 		name: &str,
 		parent: &DirType<'_, Normal>,
-	) -> Result<Option<UuidStr>, Error> {
+	) -> Result<Option<Uuid>, Error> {
 		api::v3::file::exists::post(
 			self.client(),
 			&api::v3::file::exists::Request {
 				name_hashed: self.hash_name(name),
-				parent: (*parent.uuid()).into(),
+				parent: (parent.uuid()).into(),
 			},
 		)
 		.await
@@ -217,7 +217,7 @@ impl Client {
 	pub fn make_file_builder(
 		&self,
 		name: &str,
-		parent_uuid: UuidStr,
+		parent_uuid: Uuid,
 	) -> Result<FileBuilder, EntryNameError> {
 		FileBuilder::new(name, parent_uuid, self)
 	}
@@ -264,7 +264,7 @@ impl Client {
 	pub async fn list_file_versions(&self, file: &RemoteFile) -> Result<Vec<FileVersion>, Error> {
 		let response = api::v3::file::versions::post(
 			self.client(),
-			&api::v3::file::versions::Request { uuid: *file.uuid() },
+			&api::v3::file::versions::Request { uuid: file.uuid() },
 		)
 		.await?;
 		let crypter = self.crypter();
@@ -291,7 +291,7 @@ impl Client {
 		api::v3::file::version::restore::post(
 			self.client(),
 			&api::v3::file::version::restore::Request {
-				current: *file.uuid(),
+				current: file.uuid(),
 				uuid: version.uuid,
 			},
 		)
@@ -327,15 +327,15 @@ impl Client {
 		meta: &str,
 		mime: &str,
 		size: &str,
-	) -> Result<UuidStr, Error> {
+	) -> Result<Uuid, Error> {
 		use filen_types::crypto::EncryptedString;
-		let uuid = UuidStr::new_v4();
+		let uuid = Uuid::new_v4();
 		api::v3::upload::empty::post(
 			self.client(),
 			&api::v3::upload::empty::Request {
 				name_hashed: Cow::Owned(self.hash_name(name)),
 				uuid,
-				parent: *parent.uuid(),
+				parent: parent.uuid(),
 				metadata: EncryptedString(Cow::Borrowed(meta)),
 				name: EncryptedString(Cow::Borrowed(name)),
 				size: EncryptedString(Cow::Borrowed(size)),
@@ -358,7 +358,7 @@ impl Client {
 		&self,
 		region: &str,
 		bucket: &str,
-		uuid: UuidStr,
+		uuid: Uuid,
 		chunk_idx: u64,
 	) -> Result<Vec<u8>, Error> {
 		api::download::download_file_chunk_by_uuid::<fn(u64, Option<u64>)>(

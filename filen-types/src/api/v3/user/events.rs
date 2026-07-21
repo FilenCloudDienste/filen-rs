@@ -7,7 +7,7 @@ use serde::{
 };
 use serde_json::value::RawValue;
 
-use crate::{crypto::EncryptedString, fs::UuidStr, traits::CowHelpers};
+use crate::{crypto::EncryptedString, fs::Uuid, traits::CowHelpers};
 
 pub const ENDPOINT: &str = "v3/user/events";
 
@@ -87,7 +87,7 @@ pub struct UserEvent<'a> {
 	pub id: u64,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(flatten)]
 	pub kind: UserEventKind<'a>,
 }
@@ -252,7 +252,7 @@ pub struct FolderLinkEditedInfo<'a> {
 	pub ip: Cow<'a, str>,
 	pub user_agent: Cow<'a, str>,
 	#[serde(rename = "linkUUID")]
-	pub link_uuid: UuidStr,
+	pub link_uuid: Uuid,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, CowHelpers)]

@@ -4,7 +4,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{Blake3Hash, MaybeEncrypted},
-	fs::{ObjectType, ParentUuid, UuidStr},
+	fs::{ObjectType, ParentUuid, Uuid},
 	traits::CowHelpers,
 };
 use meta::DecryptedFileMeta;
@@ -40,11 +40,11 @@ pub mod traits;
 pub mod write;
 
 pub struct FileBuilder {
-	uuid: UuidStr,
+	uuid: Uuid,
 	key: FileKey,
 
 	name: ValidatedName,
-	parent: UuidStr,
+	parent: Uuid,
 
 	mime: Option<String>,
 	created: Option<DateTime<Utc>>,
@@ -59,23 +59,18 @@ pub struct FileBuilder {
 impl FileBuilder {
 	pub(crate) fn new(
 		name: &str,
-		parent_uuid: UuidStr,
+		parent_uuid: Uuid,
 		client: &Client,
 	) -> Result<Self, EntryNameError> {
 		Ok(Self::new_valid_name(
 			ValidatedName::try_from(name)?,
-			UuidStr::new_v4(),
+			Uuid::new_v4(),
 			parent_uuid,
 			client,
 		))
 	}
 
-	fn new_valid_name(
-		name: ValidatedName,
-		uuid: UuidStr,
-		parent_uuid: UuidStr,
-		client: &Client,
-	) -> Self {
+	fn new_valid_name(name: ValidatedName, uuid: Uuid, parent_uuid: Uuid, client: &Client) -> Self {
 		Self {
 			uuid,
 			name,
@@ -111,7 +106,7 @@ impl FileBuilder {
 	}
 
 	/// Should not be used outside of testing
-	pub fn uuid(mut self, uuid: UuidStr) -> Self {
+	pub fn uuid(mut self, uuid: Uuid) -> Self {
 		self.uuid = uuid;
 		self
 	}
@@ -129,7 +124,7 @@ impl FileBuilder {
 		self
 	}
 
-	pub fn get_uuid(&self) -> UuidStr {
+	pub fn get_uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -174,8 +169,8 @@ impl FileBuilder {
 
 pub struct FileBuilderOptionalName {
 	name: Option<ValidatedName>,
-	uuid: UuidStr,
-	parent: UuidStr,
+	uuid: Uuid,
+	parent: Uuid,
 
 	mime: Option<String>,
 	created: Option<DateTime<Utc>>,
@@ -186,10 +181,10 @@ pub struct FileBuilderOptionalName {
 }
 
 impl FileBuilderOptionalName {
-	pub fn new(parent_uuid: UuidStr) -> Self {
+	pub fn new(parent_uuid: Uuid) -> Self {
 		Self {
 			name: None,
-			uuid: UuidStr::new_v4(),
+			uuid: Uuid::new_v4(),
 			parent: parent_uuid,
 			mime: None,
 			created: None,
@@ -261,14 +256,14 @@ impl FileBuilderOptionalName {
 		self.name.as_ref().map(|n| n.as_ref())
 	}
 
-	pub fn get_uuid(&self) -> UuidStr {
+	pub fn get_uuid(&self) -> Uuid {
 		self.uuid
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootFile {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub name: ValidatedName,
 	pub mime: String,
 	pub key: FileKey,
@@ -277,7 +272,7 @@ pub struct RootFile {
 }
 
 impl RootFile {
-	pub fn uuid(&self) -> UuidStr {
+	pub fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -305,11 +300,11 @@ impl RootFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseFile {
 	pub root: RootFile,
-	pub parent: UuidStr,
+	pub parent: Uuid,
 }
 
 impl BaseFile {
-	pub fn uuid(&self) -> UuidStr {
+	pub fn uuid(&self) -> Uuid {
 		self.root.uuid()
 	}
 
@@ -337,7 +332,7 @@ impl BaseFile {
 		self.root.modified = Utc::now().round_subsecs(3);
 	}
 
-	pub fn parent(&self) -> UuidStr {
+	pub fn parent(&self) -> Uuid {
 		self.parent
 	}
 }
@@ -349,7 +344,7 @@ impl BaseFile {
 )]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[cfg_attr(feature = "http-provider", serde(with = "meta::serde_stateless"))]
 	pub meta: FileMeta<'static>,
 
@@ -377,7 +372,7 @@ impl PartialEq<BaseFile> for RemoteFile {
 impl RemoteFile {
 	#[allow(clippy::too_many_arguments)]
 	pub fn from_meta(
-		uuid: UuidStr,
+		uuid: impl Into<Uuid>,
 		parent: ParentUuid,
 		fallback_size: u64,
 		chunks: u64,
@@ -387,6 +382,7 @@ impl RemoteFile {
 		favorited: bool,
 		meta: FileMeta<'static>,
 	) -> Self {
+		let uuid = uuid.into();
 		let size = match &meta {
 			FileMeta::Decoded(decrypted) => decrypted.size,
 			_ => fallback_size,
@@ -406,7 +402,7 @@ impl RemoteFile {
 }
 
 pub struct FlatRemoteFile {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub parent: ParentUuid,
 	pub name: String,
 	pub mime: String,
@@ -447,8 +443,8 @@ impl From<FlatRemoteFile> for RemoteFile {
 }
 
 impl HasUUID for RemoteFile {
-	fn uuid(&self) -> &UuidStr {
-		&self.uuid
+	fn uuid(&self) -> Uuid {
+		self.uuid
 	}
 }
 
@@ -564,7 +560,7 @@ impl File for RemoteFile {}
 	serde(rename_all = "camelCase")
 )]
 pub struct RemoteRootFile {
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 	pub(crate) size: u64,
 	pub(crate) region: String,
 	pub(crate) bucket: String,
@@ -576,7 +572,7 @@ pub struct RemoteRootFile {
 
 impl RemoteRootFile {
 	pub fn from_meta(
-		uuid: UuidStr,
+		uuid: Uuid,
 		size: u64,
 		chunks: u64,
 		region: impl Into<String>,
@@ -597,8 +593,8 @@ impl RemoteRootFile {
 }
 
 impl HasUUID for RemoteRootFile {
-	fn uuid(&self) -> &UuidStr {
-		&self.uuid
+	fn uuid(&self) -> Uuid {
+		self.uuid
 	}
 }
 
@@ -713,7 +709,7 @@ pub struct FileVersion {
 	pub(crate) size: u64,
 	pub(crate) metadata: FileMeta<'static>,
 	pub(crate) timestamp: DateTime<Utc>,
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 }
 
 impl FileVersion {
@@ -757,7 +753,7 @@ impl FileVersion {
 	serde(rename_all = "camelCase")
 )]
 pub struct LinkedFile {
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 	pub(crate) name: MaybeEncrypted<'static, str>,
 	pub(crate) mime: MaybeEncrypted<'static, str>,
 	pub(crate) size: u64,
@@ -781,7 +777,7 @@ impl<'de> serde::Deserialize<'de> for LinkedFile {
 	{
 		#[derive(serde::Deserialize)]
 		struct LinkedFileHelper<'a> {
-			uuid: UuidStr,
+			uuid: Uuid,
 			name: MaybeEncrypted<'static, str>,
 			mime: MaybeEncrypted<'static, str>,
 			size: u64,
@@ -886,8 +882,8 @@ impl HasFileInfo for LinkedFile {
 }
 
 impl HasUUID for LinkedFile {
-	fn uuid(&self) -> &UuidStr {
-		&self.uuid
+	fn uuid(&self) -> Uuid {
+		self.uuid
 	}
 }
 
@@ -955,7 +951,7 @@ impl PartialEq<RemoteFile> for LinkedFile {
 // 		all(target_family = "wasm", target_os = "unknown"),
 // 		wasm_bindgen::prelude::wasm_bindgen(getter, js_name = "uuid")
 // 	)]
-// 	fn inner_uuid(&self) -> UuidStr {
+// 	fn inner_uuid(&self) -> Uuid {
 // 		self.uuid
 // 	}
 

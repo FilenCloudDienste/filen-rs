@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::{api::v3::contacts::Contact, fs::UuidStr, traits::CowHelpers};
+use crate::{api::v3::contacts::Contact, fs::Uuid, traits::CowHelpers};
 
 pub mod r#in;
 pub mod out;
@@ -14,7 +14,7 @@ pub const ENDPOINT: &str = "v3/item/shared";
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

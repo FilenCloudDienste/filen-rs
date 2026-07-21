@@ -17,7 +17,7 @@ use helpers::*;
 #[shared_test_runtime]
 async fn test_cache_init_creates_schema() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let conn = open_read_db(cache.db_path()).unwrap();
 
@@ -58,10 +58,10 @@ async fn test_cache_init_creates_schema() {
 #[shared_test_runtime]
 async fn test_cache_init_inserts_root() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	// The ACCOUNT root's row is written by init_db itself, independent of the sync scope.
-	let root_uuid: Uuid = resources.client.root().uuid().into();
+	let root_uuid: Uuid = resources.client.root().uuid();
 
 	let item_type = query_item_type(cache.db_path(), root_uuid);
 	assert_eq!(item_type, Some(0), "root should be type 0 (Root)");
@@ -82,16 +82,16 @@ async fn test_cache_file_new_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_new.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_new.txt", test_dir.uuid())
 		.unwrap();
 	let file = client
 		.upload_file(file, b"cache test content")
 		.await
 		.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -113,13 +113,13 @@ async fn test_cache_file_trash_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_trash.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_trash.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"to be trashed").await.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -139,16 +139,16 @@ async fn test_cache_multiple_file_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let mut file_uuids = Vec::new();
 
 	for i in 0..3 {
 		let name = format!("cache_multi_{i}.txt");
 		let content = format!("content {i}");
-		let spec = client.make_file_builder(&name, *test_dir.uuid()).unwrap();
+		let spec = client.make_file_builder(&name, test_dir.uuid()).unwrap();
 		let file = client.upload_file(spec, content.as_bytes()).await.unwrap();
-		file_uuids.push(Uuid::from(file.uuid()));
+		file_uuids.push(file.uuid());
 	}
 
 	for (i, uuid) in file_uuids.iter().enumerate() {
@@ -169,13 +169,13 @@ async fn test_cache_dir_new_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let dir = client
 		.create_dir(&test_dir.into(), "cache_dir_new")
 		.await
 		.unwrap();
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
@@ -195,13 +195,13 @@ async fn test_cache_dir_trash_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_trash")
 		.await
 		.unwrap();
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
@@ -221,13 +221,13 @@ async fn test_cache_file_move_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_move.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_move.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"moveable content").await.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -238,7 +238,7 @@ async fn test_cache_file_move_via_socket() {
 		.create_dir(&test_dir.into(), "cache_move_target")
 		.await
 		.unwrap();
-	let target_dir_uuid: Uuid = target_dir.uuid().into();
+	let target_dir_uuid: Uuid = target_dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), target_dir_uuid, Duration::from_secs(30)).await,
@@ -265,19 +265,19 @@ async fn test_cache_dir_move_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let mut move_dir = client
 		.create_dir(&test_dir.into(), "cache_dir_to_move")
 		.await
 		.unwrap();
-	let move_dir_uuid: Uuid = move_dir.uuid().into();
+	let move_dir_uuid: Uuid = move_dir.uuid();
 
 	let target_dir = client
 		.create_dir(&test_dir.into(), "cache_dir_move_target")
 		.await
 		.unwrap();
-	let target_dir_uuid: Uuid = target_dir.uuid().into();
+	let target_dir_uuid: Uuid = target_dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), move_dir_uuid, Duration::from_secs(30)).await,
@@ -306,7 +306,7 @@ async fn test_cache_dir_move_via_socket() {
 #[shared_test_runtime]
 async fn test_cache_list_dir_recursive() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let dirs: Vec<RemoteDirectory> = (0..3)
@@ -316,8 +316,8 @@ async fn test_cache_list_dir_recursive() {
 		.map(|i| make_test_remote_file(&format!("ldr_file_{i}.txt"), test_dir_uuid))
 		.collect();
 
-	let dir_uuids: Vec<Uuid> = dirs.iter().map(|d| d.uuid().into()).collect();
-	let file_uuids: Vec<Uuid> = files.iter().map(|f| f.uuid().into()).collect();
+	let dir_uuids: Vec<Uuid> = dirs.iter().map(|d| d.uuid()).collect();
+	let file_uuids: Vec<Uuid> = files.iter().map(|f| f.uuid()).collect();
 
 	cache
 		.handle
@@ -350,7 +350,7 @@ async fn test_cache_list_dir_recursive() {
 #[shared_test_runtime]
 async fn test_cache_list_dir_recursive_large_batch() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let dirs: Vec<RemoteDirectory> = (0..50)
@@ -360,8 +360,8 @@ async fn test_cache_list_dir_recursive_large_batch() {
 		.map(|i| make_test_remote_file(&format!("ldr_batch_file_{i}.txt"), test_dir_uuid))
 		.collect();
 
-	let last_dir_uuid: Uuid = dirs.last().unwrap().uuid().into();
-	let last_file_uuid: Uuid = files.last().unwrap().uuid().into();
+	let last_dir_uuid: Uuid = dirs.last().unwrap().uuid();
+	let last_file_uuid: Uuid = files.last().unwrap().uuid();
 
 	cache
 		.handle
@@ -393,7 +393,7 @@ async fn test_cache_shutdown_on_drop() {
 	{
 		let _handle = client
 			.clone()
-			.add_sync_root(resources.dir.uuid().into(), noop_sync_root_callback())
+			.add_sync_root(resources.dir.uuid(), noop_sync_root_callback())
 			.await
 			.unwrap();
 	}
@@ -404,7 +404,7 @@ async fn test_cache_shutdown_on_drop() {
 	assert!(path.exists(), "DB file should persist after cache drop");
 
 	let conn = open_read_db(&path).unwrap();
-	let root_uuid: Uuid = client.root().uuid().into();
+	let root_uuid: Uuid = client.root().uuid();
 	let root_exists: bool = conn
 		.query_row(
 			"SELECT COUNT(*) > 0 FROM items WHERE uuid = ? AND type = 0",
@@ -430,7 +430,7 @@ async fn test_cache_reopen_preserves_data() {
 	{
 		let _handle = client
 			.clone()
-			.add_sync_root(test_dir_uuid.into(), noop_sync_root_callback())
+			.add_sync_root(test_dir_uuid, noop_sync_root_callback())
 			.await
 			.unwrap();
 		ensure_socket_ready(&client).await;
@@ -443,7 +443,7 @@ async fn test_cache_reopen_preserves_data() {
 			.create_dir(&(&resources.dir).into(), "reopen_test_dir")
 			.await
 			.unwrap();
-		dir_uuid = dir.uuid().into();
+		dir_uuid = dir.uuid();
 		assert!(
 			poll_for_item(&path, dir_uuid, Duration::from_secs(60)).await,
 			"the FolderSubCreated event should cache the child"
@@ -473,7 +473,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = derive_client(resources.client.as_ref());
 	let test_dir = &resources.dir;
-	let test_dir_uuid: Uuid = test_dir.uuid().into();
+	let test_dir_uuid: Uuid = test_dir.uuid();
 	let path = temp_cache_path();
 	let (messages, status_cb) = capturing_status_callback();
 	client
@@ -510,7 +510,7 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 		.create_dir(&test_dir.into(), "cache_restart_resync")
 		.await
 		.unwrap();
-	let offline_uuid: Uuid = offline_dir.uuid().into();
+	let offline_uuid: Uuid = offline_dir.uuid();
 
 	// Session 2: re-adding a sync root respawns the worker on the same DB. The startup gap-check sees
 	// the advanced drive id and resyncs, so the dir created while we were offline appears — with no
@@ -563,12 +563,12 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 		.create_dir(&test_dir.into(), "cache_resync_deleted_root")
 		.await
 		.unwrap();
-	let root_uuid: Uuid = root_dir.uuid().into();
+	let root_uuid: Uuid = root_dir.uuid();
 	let child = client
 		.create_dir(&(&root_dir).into(), "child")
 		.await
 		.unwrap();
-	let child_uuid: Uuid = child.uuid().into();
+	let child_uuid: Uuid = child.uuid();
 
 	// Session 1: selective sync of ONLY `root_dir`; populate via the convergence resync, then flush.
 	let since = messages_len(&messages);
@@ -602,7 +602,7 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 	// the validating `get_dir` deterministically sees the not-found.
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 	loop {
-		match client.get_dir((&root_uuid).into()).await {
+		match client.get_dir(root_uuid).await {
 			Err(e) if e.kind() == ErrorKind::FolderNotFound => break,
 			_ => {
 				assert!(
@@ -648,11 +648,11 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 #[shared_test_runtime]
 async fn test_cache_ignores_irrelevant_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let dir = make_test_remote_dir("irrelevant_test_dir", test_dir_uuid);
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 	cache
 		.handle
 		.update_list_dir_recursive(vec![dir], vec![])
@@ -679,23 +679,23 @@ async fn test_cache_full_file_lifecycle() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_lifecycle_dir")
 		.await
 		.unwrap();
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 	assert!(
 		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
 		"lifecycle dir should appear"
 	);
 
 	let file = client
-		.make_file_builder("cache_lifecycle_file.txt", *test_dir.uuid())
+		.make_file_builder("cache_lifecycle_file.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"lifecycle").await.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
 		"lifecycle file should appear"
@@ -719,16 +719,16 @@ async fn test_cache_mixed_socket_and_manual_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_mixed_socket.txt", *test_dir.uuid())
+		.make_file_builder("cache_mixed_socket.txt", test_dir.uuid())
 		.unwrap();
 	let file = client.upload_file(file, b"socket").await.unwrap();
-	let socket_file_uuid: Uuid = file.uuid().into();
+	let socket_file_uuid: Uuid = file.uuid();
 
 	let manual_file = make_test_remote_file("cache_mixed_manual.txt", test_dir.uuid());
-	let manual_file_uuid: Uuid = manual_file.uuid().into();
+	let manual_file_uuid: Uuid = manual_file.uuid();
 	cache
 		.handle
 		.update_list_dir_recursive(vec![], vec![manual_file])
@@ -750,13 +750,13 @@ async fn test_cache_file_restore_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_restore.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_restore.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"restore me").await.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -786,13 +786,13 @@ async fn test_cache_file_metadata_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_rename_old.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_rename_old.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"rename me").await.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -824,16 +824,16 @@ async fn test_cache_file_deleted_permanently_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_perm_delete.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_perm_delete.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client
 		.upload_file(file, b"delete me forever")
 		.await
 		.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -862,13 +862,13 @@ async fn test_cache_dir_restore_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_restore")
 		.await
 		.unwrap();
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
@@ -898,13 +898,13 @@ async fn test_cache_dir_metadata_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_rename_old")
 		.await
 		.unwrap();
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
@@ -933,13 +933,13 @@ async fn test_cache_dir_color_changed_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_color")
 		.await
 		.unwrap();
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
@@ -962,13 +962,13 @@ async fn test_cache_dir_deleted_permanently_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let mut dir = client
 		.create_dir(&test_dir.into(), "cache_dir_perm_delete")
 		.await
 		.unwrap();
-	let dir_uuid: Uuid = dir.uuid().into();
+	let dir_uuid: Uuid = dir.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), dir_uuid, Duration::from_secs(30)).await,
@@ -996,13 +996,13 @@ async fn test_cache_item_favorite_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_favorite.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_favorite.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"favorite me").await.unwrap();
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), file_uuid, Duration::from_secs(30)).await,
@@ -1022,13 +1022,13 @@ async fn test_cache_file_archived_via_socket() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
-	let cache = TestCache::new(client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(client, resources.dir.uuid()).await;
 
 	let file = client
-		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_archive.txt", test_dir.uuid())
 		.unwrap();
 	let _original = client.upload_file(file, b"original content").await.unwrap();
-	let original_uuid: Uuid = _original.uuid().into();
+	let original_uuid: Uuid = _original.uuid();
 
 	assert!(
 		poll_for_item(cache.db_path(), original_uuid, Duration::from_secs(30)).await,
@@ -1037,13 +1037,13 @@ async fn test_cache_file_archived_via_socket() {
 
 	// Upload a new file with the same name — this archives the old one
 	let replacement = client
-		.make_file_builder("cache_file_archive.txt", *test_dir.uuid())
+		.make_file_builder("cache_file_archive.txt", test_dir.uuid())
 		.unwrap();
 	let replacement = client
 		.upload_file(replacement, b"replacement content")
 		.await
 		.unwrap();
-	let replacement_uuid: Uuid = replacement.uuid().into();
+	let replacement_uuid: Uuid = replacement.uuid();
 
 	// Original should be removed (archived) from cache
 	assert!(
@@ -1060,11 +1060,11 @@ async fn test_cache_file_archived_via_socket() {
 #[shared_test_runtime]
 async fn test_cache_error_on_file_with_encrypted_meta() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let bad_file = make_test_remote_file_encrypted_meta(test_dir_uuid);
-	let bad_file_uuid: Uuid = bad_file.uuid().into();
+	let bad_file_uuid: Uuid = bad_file.uuid();
 
 	cache
 		.handle
@@ -1077,7 +1077,7 @@ async fn test_cache_error_on_file_with_encrypted_meta() {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::FileCacheableConversion(failed)
-						if Uuid::from(failed.file.uuid()) == bad_file_uuid)
+						if failed.file.uuid() == bad_file_uuid)
 				})
 			})
 		})
@@ -1097,11 +1097,11 @@ async fn test_cache_error_on_file_with_encrypted_meta() {
 #[shared_test_runtime]
 async fn test_cache_error_on_dir_with_encrypted_meta() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	let bad_dir = make_test_remote_dir_encrypted_meta(test_dir_uuid);
-	let bad_dir_uuid: Uuid = bad_dir.uuid().into();
+	let bad_dir_uuid: Uuid = bad_dir.uuid();
 
 	cache
 		.handle
@@ -1114,7 +1114,7 @@ async fn test_cache_error_on_dir_with_encrypted_meta() {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::DirCacheableConversion(failed)
-						if Uuid::from(failed.dir.uuid()) == bad_dir_uuid)
+						if failed.dir.uuid() == bad_dir_uuid)
 				})
 			})
 		})
@@ -1134,10 +1134,10 @@ async fn test_cache_error_on_dir_with_encrypted_meta() {
 #[shared_test_runtime]
 async fn test_cache_error_on_file_with_non_uuid_parent() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let bad_file = make_test_remote_file_bad_parent("trashed_file.txt");
-	let bad_file_uuid: Uuid = bad_file.uuid().into();
+	let bad_file_uuid: Uuid = bad_file.uuid();
 
 	cache
 		.handle
@@ -1150,7 +1150,7 @@ async fn test_cache_error_on_file_with_non_uuid_parent() {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::FileCacheableConversion(failed)
-						if Uuid::from(failed.file.uuid()) == bad_file_uuid)
+						if failed.file.uuid() == bad_file_uuid)
 				})
 			})
 		})
@@ -1165,10 +1165,10 @@ async fn test_cache_error_on_file_with_non_uuid_parent() {
 #[shared_test_runtime]
 async fn test_cache_error_on_dir_with_non_uuid_parent() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let bad_dir = make_test_remote_dir_bad_parent("trashed_dir");
-	let bad_dir_uuid: Uuid = bad_dir.uuid().into();
+	let bad_dir_uuid: Uuid = bad_dir.uuid();
 
 	cache
 		.handle
@@ -1181,7 +1181,7 @@ async fn test_cache_error_on_dir_with_non_uuid_parent() {
 			msgs.iter().any(|msg| {
 				message_errors(msg).iter().any(|e| {
 					matches!(e, CacheError::DirCacheableConversion(failed)
-						if Uuid::from(failed.dir.uuid()) == bad_dir_uuid)
+						if failed.dir.uuid() == bad_dir_uuid)
 				})
 			})
 		})
@@ -1196,14 +1196,14 @@ async fn test_cache_error_on_dir_with_non_uuid_parent() {
 #[shared_test_runtime]
 async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
 	// Two good dirs, two bad dirs (one encrypted, one bad parent)
 	let good_dirs: Vec<RemoteDirectory> = (0..2)
 		.map(|i| make_test_remote_dir(&format!("partial_dir_{i}"), test_dir_uuid))
 		.collect();
-	let good_dir_uuids: Vec<Uuid> = good_dirs.iter().map(|d| d.uuid().into()).collect();
+	let good_dir_uuids: Vec<Uuid> = good_dirs.iter().map(|d| d.uuid()).collect();
 	let bad_dir_encrypted = make_test_remote_dir_encrypted_meta(test_dir_uuid);
 	let bad_dir_parent = make_test_remote_dir_bad_parent("partial_bad_parent_dir");
 
@@ -1211,7 +1211,7 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 	let good_files: Vec<RemoteFile> = (0..3)
 		.map(|i| make_test_remote_file(&format!("partial_file_{i}.txt"), test_dir_uuid))
 		.collect();
-	let good_file_uuids: Vec<Uuid> = good_files.iter().map(|f| f.uuid().into()).collect();
+	let good_file_uuids: Vec<Uuid> = good_files.iter().map(|f| f.uuid()).collect();
 	let bad_file_encrypted = make_test_remote_file_encrypted_meta(test_dir_uuid);
 	let bad_file_parent = make_test_remote_file_bad_parent("partial_bad_parent_file.txt");
 
@@ -1274,7 +1274,7 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 #[shared_test_runtime]
 async fn test_add_sync_root_rejects_invalid_uuid() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	// A random uuid that does not correspond to any directory on the account.
 	let bogus = Uuid::new_v4();
@@ -1317,7 +1317,7 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 		.create_dir(&(&resources.dir).into(), "lock_contended_root")
 		.await
 		.unwrap();
-	let sub_uuid: Uuid = sub.uuid().into();
+	let sub_uuid: Uuid = sub.uuid();
 
 	// A derived cache scoped to `sub` ONLY (no whole-account root), so the add below cannot
 	// take the covered fast path and must run a lock-needing convergence resync.
@@ -1361,7 +1361,7 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 	// key, so its direct children pass the membership gate without any cached ancestry.)
 	let upload_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 	let file = loop {
-		let builder = client.make_file_builder("alive.txt", *sub.uuid()).unwrap();
+		let builder = client.make_file_builder("alive.txt", sub.uuid()).unwrap();
 		match client.upload_file(builder, b"x").await {
 			Ok(file) => break file,
 			Err(e) if tokio::time::Instant::now() < upload_deadline => {
@@ -1371,7 +1371,7 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 			Err(e) => panic!("upload kept failing: {e:?}"),
 		}
 	};
-	let file_uuid: Uuid = file.uuid().into();
+	let file_uuid: Uuid = file.uuid();
 	assert!(
 		poll_for_item(&path2, file_uuid, Duration::from_secs(45)).await,
 		"socket events must keep applying while the drive lock is contended"
@@ -1401,7 +1401,7 @@ async fn test_cache_resync_reports_progress() {
 		.create_dir(&(&resources.dir).into(), "progress_seed")
 		.await
 		.unwrap();
-	let root: Uuid = resources.dir.uuid().into();
+	let root: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
 
 	// `TestCache::new` registered the test dir as a NEW sync root, which triggers exactly

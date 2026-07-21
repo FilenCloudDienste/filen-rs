@@ -60,7 +60,7 @@ async fn main() {
 
 	let t = Instant::now();
 	let dir_uuid = if remote_path == "/" || remote_path.is_empty() {
-		uuid::Uuid::from(client.root().uuid())
+		client.root().uuid()
 	} else {
 		let item = client
 			.find_item_at_path(remote_path)
@@ -68,8 +68,8 @@ async fn main() {
 			.expect("path resolution failed")
 			.unwrap_or_else(|| panic!("nothing found at {remote_path}"));
 		match item {
-			NonRootFileType::Dir(dir) => uuid::Uuid::from(dir.uuid()),
-			NonRootFileType::Root(root) => uuid::Uuid::from(root.uuid()),
+			NonRootFileType::Dir(dir) => dir.uuid(),
+			NonRootFileType::Root(root) => root.uuid(),
 			NonRootFileType::File(_) => {
 				panic!("{remote_path} is a file; the search root must be a directory")
 			}

@@ -6,21 +6,21 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, LinkHashedPassword},
-	fs::UuidStr,
+	fs::Uuid,
 };
 
 pub const ENDPOINT: &str = "v3/file/link/info";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub password: LinkHashedPassword<'a>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub name: EncryptedString<'a>,
 	pub mime: EncryptedString<'a>,
 	#[serde(default)]

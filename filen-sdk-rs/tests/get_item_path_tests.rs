@@ -2,12 +2,9 @@ use std::borrow::Cow;
 
 use filen_macros::shared_test_runtime;
 
-use filen_sdk_rs::{
-	ErrorKind,
-	fs::{
-		HasName, HasParent, HasUUID,
-		categories::{NonRootItemType, Normal},
-	},
+use filen_sdk_rs::fs::{
+	HasName, HasParent, HasUUID,
+	categories::{NonRootItemType, Normal},
 };
 use filen_types::fs::ParentUuid;
 
@@ -18,7 +15,7 @@ async fn get_item_path_file_at_root() {
 
 	// Create a file directly under root
 	let file = client
-		.make_file_builder("root_file.txt", *client.root().uuid())
+		.make_file_builder("root_file.txt", client.root().uuid())
 		.unwrap();
 	let file = client.upload_file(file, b"hello").await.unwrap();
 
@@ -61,7 +58,7 @@ async fn get_item_path_file_vs_dir_same_parent() {
 		.unwrap();
 
 	let file = client
-		.make_file_builder("sibling_file", *test_dir.uuid())
+		.make_file_builder("sibling_file", test_dir.uuid())
 		.unwrap();
 	let file = client.upload_file(file, b"data").await.unwrap();
 
@@ -93,7 +90,7 @@ async fn get_item_path_nested() {
 		.unwrap();
 
 	let file = client
-		.make_file_builder("nested_file.txt", *deep_dir.uuid())
+		.make_file_builder("nested_file.txt", deep_dir.uuid())
 		.unwrap();
 	let file = client.upload_file(file, b"deep").await.unwrap();
 
@@ -140,7 +137,7 @@ async fn get_item_path_favorited_file() {
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("fav_file.txt", *test_dir.uuid())
+		.make_file_builder("fav_file.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"fav").await.unwrap();
 
@@ -206,7 +203,7 @@ async fn get_item_path_recent_file() {
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("recent_file.txt", *test_dir.uuid())
+		.make_file_builder("recent_file.txt", test_dir.uuid())
 		.unwrap();
 	let file = client.upload_file(file, b"recent").await.unwrap();
 
@@ -239,14 +236,14 @@ async fn get_item_path_trashed_file_from_list_trash() {
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("trash_file.txt", *test_dir.uuid())
+		.make_file_builder("trash_file.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"trash").await.unwrap();
 
 	client.trash_file(&mut file).await.unwrap();
-	assert_eq!(*file.parent(), ParentUuid::Trash);
+	assert!(matches!(*file.parent(), ParentUuid::Trash(orig) if orig == test_dir.uuid()));
 
-	// Items from list_trash retain their real parent UUIDs
+	// list_trash rewraps each item's parent as Trash(original), consistent with trash_file/get_file.
 	let (_, trash_files) = client
 		.list_trash(None::<&fn(u64, Option<u64>)>)
 		.await
@@ -256,8 +253,7 @@ async fn get_item_path_trashed_file_from_list_trash() {
 		.find(|f| f.uuid == file.uuid)
 		.expect("File not found in trash");
 
-	// The list_trash API returns real parent, so get_item_path should succeed
-	assert!(matches!(*trash_file.parent(), ParentUuid::Uuid(_)));
+	assert!(matches!(*trash_file.parent(), ParentUuid::Trash(orig) if orig == test_dir.uuid()));
 
 	let item = NonRootItemType::<Normal>::File(Cow::Owned(trash_file));
 	let (path, ancestors) = client.get_item_path(&item).await.unwrap();
@@ -269,28 +265,30 @@ async fn get_item_path_trashed_file_from_list_trash() {
 }
 
 #[shared_test_runtime]
-async fn get_item_path_trashed_file_with_trash_parent_errors() {
+async fn get_item_path_trashed_file_resolves_pre_trash_path() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("trash_err.txt", *test_dir.uuid())
+		.make_file_builder("trash_err.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"trash").await.unwrap();
 
 	client.trash_file(&mut file).await.unwrap();
-	assert_eq!(*file.parent(), ParentUuid::Trash);
+	assert!(matches!(*file.parent(), ParentUuid::Trash(orig) if orig == test_dir.uuid()));
 
-	// After trash_file, the local file object has ParentUuid::Trash.
-	// get_item_path refetches via get_file, which also returns ParentUuid::Trash → error.
+	// trash_file/get_file now remember the original parent, so get_item_path resolves the
+	// item's pre-trash path via that remembered parent instead of erroring.
 	let item = NonRootItemType::<Normal>::File(Cow::Owned(file));
-	let err = client.get_item_path(&item).await.unwrap_err();
-	assert_eq!(err.kind(), ErrorKind::MetadataWasNotDecrypted);
+	let (path, ancestors) = client.get_item_path(&item).await.unwrap();
+	assert_eq!(path, format!("{}/trash_err.txt", test_dir.name().unwrap()));
+	assert_eq!(ancestors.len(), 1);
+	assert_eq!(ancestors[0].uuid(), test_dir.uuid());
 }
 
 #[shared_test_runtime]
-async fn get_item_path_trashed_dir_with_trash_parent_errors() {
+async fn get_item_path_trashed_dir_resolves_pre_trash_path() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
@@ -301,13 +299,14 @@ async fn get_item_path_trashed_dir_with_trash_parent_errors() {
 		.unwrap();
 
 	client.trash_dir(&mut dir).await.unwrap();
-	assert_eq!(*dir.parent(), ParentUuid::Trash);
+	assert!(matches!(*dir.parent(), ParentUuid::Trash(orig) if orig == test_dir.uuid()));
 
-	// After trash_dir, the local dir has ParentUuid::Trash.
-	// get_item_path refetches via get_dir, which also returns ParentUuid::Trash → error.
+	// get_item_path resolves the dir's pre-trash path via its remembered original parent.
 	let item = NonRootItemType::<Normal>::Dir(Cow::Owned(dir));
-	let err = client.get_item_path(&item).await.unwrap_err();
-	assert_eq!(err.kind(), ErrorKind::MetadataWasNotDecrypted);
+	let (path, ancestors) = client.get_item_path(&item).await.unwrap();
+	assert_eq!(path, format!("{}/trash_dir/", test_dir.name().unwrap()));
+	assert_eq!(ancestors.len(), 1);
+	assert_eq!(ancestors[0].uuid(), test_dir.uuid());
 }
 
 #[shared_test_runtime]
@@ -333,7 +332,7 @@ async fn get_item_path_trashed_dir_from_list_trash() {
 		.find(|d| d.uuid == dir.uuid)
 		.expect("Dir not found in trash");
 
-	assert!(matches!(*trash_dir.parent(), ParentUuid::Uuid(_)));
+	assert!(matches!(*trash_dir.parent(), ParentUuid::Trash(orig) if orig == test_dir.uuid()));
 
 	let item = NonRootItemType::<Normal>::Dir(Cow::Owned(trash_dir));
 	let (path, ancestors) = client.get_item_path(&item).await.unwrap();
@@ -356,7 +355,7 @@ async fn get_item_path_nested_favorited() {
 	let sub_dir = client.create_dir(&test_dir.into(), "sub").await.unwrap();
 
 	let file = client
-		.make_file_builder("nested_fav.txt", *sub_dir.uuid())
+		.make_file_builder("nested_fav.txt", sub_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"nfav").await.unwrap();
 

@@ -1,23 +1,26 @@
 pub(crate) mod optional {
-	use std::str::FromStr;
+	use std::{fmt::Display, str::FromStr};
 
 	use serde::{Deserialize, Serialize};
 
-	use crate::{fs::UuidStr, serde::cow::CowStrWrapper};
+	use crate::serde::cow::CowStrWrapper;
 
-	pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Option<UuidStr>, D::Error>
+	pub(crate) fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
 	where
+		T: FromStr,
+		T::Err: Display,
 		D: serde::Deserializer<'de>,
 	{
 		let value = Option::<CowStrWrapper>::deserialize(deserializer)?.map(|v| v.0);
 		Ok(match value.as_deref() {
 			Some("") | None => None,
-			Some(string) => Some(UuidStr::from_str(string).map_err(serde::de::Error::custom)?),
+			Some(string) => Some(T::from_str(string).map_err(serde::de::Error::custom)?),
 		})
 	}
 
-	pub(crate) fn serialize<S>(value: &Option<UuidStr>, serializer: S) -> Result<S::Ok, S::Error>
+	pub(crate) fn serialize<T, S>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
 	where
+		T: Serialize,
 		S: serde::Serializer,
 	{
 		match value {
@@ -26,11 +29,12 @@ pub(crate) mod optional {
 		}
 	}
 
-	pub(crate) fn serialize_as_str<S>(
-		value: &Option<UuidStr>,
+	pub(crate) fn serialize_as_str<T, S>(
+		value: &Option<T>,
 		serializer: S,
 	) -> Result<S::Ok, S::Error>
 	where
+		T: Serialize,
 		S: serde::Serializer,
 	{
 		match value {
@@ -43,25 +47,26 @@ pub(crate) mod optional {
 macro_rules! uuid_option_module {
 	($mod_name:ident, $none_value:expr) => {
 		pub mod $mod_name {
-			use std::str::FromStr;
+			use std::{fmt::Display, str::FromStr};
 
 			use serde::Serialize;
 
-			use crate::fs::UuidStr;
-
-			pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<UuidStr>, D::Error>
+			pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
 			where
+				T: FromStr,
+				T::Err: Display,
 				D: serde::Deserializer<'de>,
 			{
 				let value = crate::serde::cow::deserialize(deserializer)?;
 				Ok(match value.as_ref() {
 					$none_value => None,
-					string => Some(UuidStr::from_str(string).map_err(serde::de::Error::custom)?),
+					string => Some(T::from_str(string).map_err(serde::de::Error::custom)?),
 				})
 			}
 
-			pub fn serialize<S>(value: &Option<UuidStr>, serializer: S) -> Result<S::Ok, S::Error>
+			pub fn serialize<T, S>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
 			where
+				T: Serialize,
 				S: serde::Serializer,
 			{
 				match value {

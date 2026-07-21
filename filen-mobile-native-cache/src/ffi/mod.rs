@@ -1,7 +1,7 @@
 use std::{collections::HashMap, str::FromStr};
 
 use filen_sdk_rs::util::PathIteratorExt;
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 
 use crate::{
 	CacheError,
@@ -27,6 +27,8 @@ pub struct FfiFile {
 	// item
 	pub uuid: String,
 	pub parent: String,
+	/// For a trashed item, the UUID of the parent it will be restored to. `None` otherwise.
+	pub original_parent: Option<String>,
 
 	// file
 	pub meta: Option<FfiFileMeta>,
@@ -41,6 +43,7 @@ impl From<DBFile> for FfiFile {
 		FfiFile {
 			uuid: file.uuid.to_string(),
 			parent: file.parent.to_string(),
+			original_parent: file.parent.original_parent().map(|u| u.to_string()),
 			size: file.size,
 			favorite_rank: file.favorite_rank,
 			local_data: file.local_data.map(|o| o.to_map()),
@@ -69,6 +72,8 @@ pub struct FfiDir {
 	// item
 	pub uuid: String,
 	pub parent: String,
+	/// For a trashed item, the UUID of the parent it will be restored to. `None` otherwise.
+	pub original_parent: Option<String>,
 
 	// dir
 	pub meta: Option<FfiDirMeta>,
@@ -86,6 +91,7 @@ impl From<DBDir> for FfiDir {
 		FfiDir {
 			uuid: dir.uuid.to_string(),
 			parent: dir.parent.to_string(),
+			original_parent: dir.parent.original_parent().map(|u| u.to_string()),
 			color: dir.color.into(),
 			favorite_rank: dir.favorite_rank,
 			last_listed: dir.last_listed,
@@ -109,6 +115,7 @@ impl From<DBDirObject> for FfiDir {
 			DBDirObject::Root(root) => FfiDir {
 				uuid: root.uuid.to_string(),
 				parent: String::new(),
+				original_parent: None,
 				color: None,
 				favorite_rank: 0,
 				last_listed: root.last_listed,
@@ -218,13 +225,13 @@ impl std::fmt::Display for FfiId {
 #[derive(Debug)]
 pub struct UuidFfiId<'a> {
 	pub full_path: &'a str,
-	pub uuid: Option<UuidStr>,
+	pub uuid: Option<Uuid>,
 }
 
 #[derive(Debug)]
 pub struct PathFfiId<'a> {
 	pub full_path: &'a str,
-	pub root_uuid: UuidStr,
+	pub root_uuid: Uuid,
 	pub inner_path: &'a str,
 	pub name_or_uuid: &'a str,
 }
@@ -255,15 +262,15 @@ impl FfiId {
 		match root {
 			"trash" => Ok(ParsedFfiId::Trash(UuidFfiId {
 				full_path: self.0.as_str(),
-				uuid: iter.last().map(|(s, _)| UuidStr::from_str(s)).transpose()?,
+				uuid: iter.last().map(|(s, _)| Uuid::from_str(s)).transpose()?,
 			})),
 			"recents" => Ok(ParsedFfiId::Recents(UuidFfiId {
 				full_path: self.0.as_str(),
-				uuid: iter.last().map(|(s, _)| UuidStr::from_str(s)).transpose()?,
+				uuid: iter.last().map(|(s, _)| Uuid::from_str(s)).transpose()?,
 			})),
 			_ => Ok(ParsedFfiId::Path(PathFfiId {
 				full_path: self.0.as_str(),
-				root_uuid: UuidStr::from_str(root).map_err(|e| {
+				root_uuid: Uuid::from_str(root).map_err(|e| {
 					CacheError::conversion(format!("Invalid root UUID: {root} error: {e} "))
 				})?,
 				inner_path: remaining,

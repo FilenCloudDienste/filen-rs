@@ -4,7 +4,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	api::v3::dir::color::DirColor,
 	crypto::EncryptedString,
-	fs::{ObjectType, ParentUuid, UuidStr},
+	fs::{ObjectType, ParentUuid, Uuid},
 	traits::CowHelpers,
 };
 use traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo, UpdateDirMeta};
@@ -37,18 +37,18 @@ pub use traits::{HasContents, HasUUIDContents};
 #[derive(Clone, Debug, PartialEq, Eq)]
 
 pub struct RootDirectory {
-	uuid: UuidStr,
+	uuid: Uuid,
 }
 
 impl RootDirectory {
-	pub fn new(uuid: UuidStr) -> Self {
-		Self { uuid }
+	pub fn new(uuid: impl Into<Uuid>) -> Self {
+		Self { uuid: uuid.into() }
 	}
 }
 
 impl HasUUID for RootDirectory {
-	fn uuid(&self) -> &UuidStr {
-		&self.uuid
+	fn uuid(&self) -> Uuid {
+		self.uuid
 	}
 }
 impl HasContents for RootDirectory {
@@ -59,7 +59,7 @@ impl HasContents for RootDirectory {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RootDirectoryWithMeta {
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 
 	pub(crate) color: DirColor<'static>,
 	pub(crate) timestamp: DateTime<Utc>,
@@ -69,7 +69,7 @@ pub struct RootDirectoryWithMeta {
 
 impl RootDirectoryWithMeta {
 	pub fn from_meta(
-		uuid: UuidStr,
+		uuid: Uuid,
 		color: DirColor<'static>,
 		timestamp: DateTime<Utc>,
 		meta: DirectoryMeta<'static>,
@@ -84,8 +84,8 @@ impl RootDirectoryWithMeta {
 }
 
 impl HasUUID for RootDirectoryWithMeta {
-	fn uuid(&self) -> &UuidStr {
-		&self.uuid
+	fn uuid(&self) -> Uuid {
+		self.uuid
 	}
 }
 
@@ -137,7 +137,7 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteDirectory {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub parent: ParentUuid,
 
 	pub color: DirColor<'static>,
@@ -149,7 +149,7 @@ pub struct RemoteDirectory {
 
 impl RemoteDirectory {
 	pub fn blocking_from_encrypted(
-		uuid: UuidStr,
+		uuid: impl Into<Uuid>,
 		parent: ParentUuid,
 		color: DirColor<'static>,
 		favorited: bool,
@@ -157,6 +157,7 @@ impl RemoteDirectory {
 		meta: EncryptedString<'_>,
 		decrypter: &impl MetaCrypter,
 	) -> Self {
+		let uuid = uuid.into();
 		let meta = DirectoryMeta::blocking_from_encrypted(meta, decrypter).into_owned_cow();
 		Self {
 			uuid,
@@ -169,7 +170,7 @@ impl RemoteDirectory {
 	}
 
 	pub fn from_meta(
-		uuid: UuidStr,
+		uuid: Uuid,
 		parent: ParentUuid,
 		color: DirColor<'static>,
 		favorited: bool,
@@ -189,9 +190,9 @@ impl RemoteDirectory {
 	pub fn make_parts(
 		name: &str,
 		created: DateTime<Utc>,
-	) -> Result<(UuidStr, DecryptedDirectoryMeta<'static>), EntryNameError> {
+	) -> Result<(Uuid, DecryptedDirectoryMeta<'static>), EntryNameError> {
 		Ok((
-			UuidStr::new_v4(),
+			Uuid::new_v4(),
 			DecryptedDirectoryMeta {
 				name: Cow::Owned(ValidatedName::try_from(name)?.into()),
 				created: Some(created.round_subsecs(3)),
@@ -200,7 +201,7 @@ impl RemoteDirectory {
 	}
 
 	pub fn new_from_parts(
-		uuid: UuidStr,
+		uuid: Uuid,
 		meta: DecryptedDirectoryMeta<'static>,
 		parent: ParentUuid,
 		timestamp: DateTime<Utc>,
@@ -225,8 +226,8 @@ impl RemoteDirectory {
 }
 
 impl HasUUID for RemoteDirectory {
-	fn uuid(&self) -> &UuidStr {
-		&self.uuid
+	fn uuid(&self) -> Uuid {
+		self.uuid
 	}
 }
 impl HasContents for RemoteDirectory {

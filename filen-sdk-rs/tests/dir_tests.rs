@@ -28,7 +28,7 @@ use filen_sdk_rs::{
 	},
 	io::{CategoryDirDownloadExtPub, DirDownloadCallback, DirUploadCallback, FilenMetaExt},
 };
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::{ParentUuid, Uuid};
 use futures::StreamExt;
 use tokio::time;
 
@@ -63,9 +63,9 @@ async fn create_list_trash() {
 		.into_iter()
 		.find(|d| d.uuid() == dir.uuid())
 		.unwrap();
-	assert_eq!(*found.parent(), ParentUuid::Uuid(*test_dir.uuid()));
+	assert_eq!(*found.parent(), ParentUuid::Uuid(test_dir.uuid()));
 
-	let found_dir = client.get_dir(*dir.uuid()).await.unwrap();
+	let found_dir = client.get_dir(dir.uuid()).await.unwrap();
 	assert_eq!(dir, found_dir);
 }
 
@@ -453,11 +453,7 @@ async fn exists() {
 
 	assert_eq!(
 		Some(dir_a.uuid()),
-		client
-			.dir_exists(&test_dir.into(), "a")
-			.await
-			.unwrap()
-			.as_ref()
+		client.dir_exists(&test_dir.into(), "a").await.unwrap()
 	);
 
 	client.trash_dir(&mut dir_a).await.unwrap();
@@ -579,7 +575,7 @@ async fn dir_update_meta() {
 		.unwrap();
 	assert_eq!(dir.created(), Some(created.round_subsecs(3)));
 
-	let found_dir = client.get_dir(*dir.uuid()).await.unwrap();
+	let found_dir = client.get_dir(dir.uuid()).await.unwrap();
 	assert_eq!(found_dir.created(), Some(created.round_subsecs(3)));
 	assert_eq!(found_dir, dir);
 }
@@ -622,7 +618,7 @@ async fn dir_malformed_meta() {
 		.await
 		.unwrap()
 		.0;
-	assert!(dirs.iter().any(|d| *d.uuid() == uuid));
+	assert!(dirs.iter().any(|d| d.uuid() == uuid));
 	assert!(matches!(dirs[0].get_meta(), DirectoryMeta::Encrypted(_)));
 
 	let dir = client.get_dir(uuid).await.unwrap();
@@ -646,24 +642,18 @@ async fn download_to_zip() {
 	let _dir_c = client.create_dir(&test_dir.into(), "c").await.unwrap();
 
 	let file = client
-		.make_file_builder("file.txt", *test_dir.uuid())
+		.make_file_builder("file.txt", test_dir.uuid())
 		.unwrap();
 	let file = client
 		.upload_file(file, b"root file content")
 		.await
 		.unwrap();
 
-	let file_1 = client
-		.make_file_builder("file1.txt", *dir_a.uuid())
-		.unwrap();
+	let file_1 = client.make_file_builder("file1.txt", dir_a.uuid()).unwrap();
 	let file_1 = client.upload_file(file_1, b"file 1 content").await.unwrap();
-	let file_2 = client
-		.make_file_builder("file2.txt", *dir_b.uuid())
-		.unwrap();
+	let file_2 = client.make_file_builder("file2.txt", dir_b.uuid()).unwrap();
 	let file_2 = client.upload_file(file_2, b"file 2 content").await.unwrap();
-	let file_3 = client
-		.make_file_builder("file3.txt", *dir_b.uuid())
-		.unwrap();
+	let file_3 = client.make_file_builder("file3.txt", dir_b.uuid()).unwrap();
 	let file_3 = client.upload_file(file_3, b"file 3 content").await.unwrap();
 
 	let tmp = std::env::temp_dir();
@@ -786,11 +776,11 @@ async fn download_linked_dir_to_zip() {
 		.unwrap();
 
 	let file_1 = client
-		.make_file_builder("link_file1.txt", *dir_a.uuid())
+		.make_file_builder("link_file1.txt", dir_a.uuid())
 		.unwrap();
 	let _file_1 = client.upload_file(file_1, b"linked file 1").await.unwrap();
 	let file_2 = client
-		.make_file_builder("link_file2.txt", *dir_b.uuid())
+		.make_file_builder("link_file2.txt", dir_b.uuid())
 		.unwrap();
 	let _file_2 = client.upload_file(file_2, b"linked file 2").await.unwrap();
 
@@ -895,7 +885,7 @@ async fn not_found_error() {
 async fn get_dir_for_random_uuid_returns_folder_not_found_kind() {
 	let client = test_utils::RESOURCES.client().await;
 
-	let err = client.get_dir(UuidStr::new_v4()).await.unwrap_err();
+	let err = client.get_dir(Uuid::new_v4()).await.unwrap_err();
 	assert_eq!(
 		err.kind(),
 		ErrorKind::FolderNotFound,
@@ -907,7 +897,7 @@ async fn get_dir_for_random_uuid_returns_folder_not_found_kind() {
 async fn get_dir_optional_returns_none_for_random_uuid() {
 	let client = test_utils::RESOURCES.client().await;
 
-	let result = client.get_dir(UuidStr::new_v4()).await.optional().unwrap();
+	let result = client.get_dir(Uuid::new_v4()).await.optional().unwrap();
 	assert!(result.is_none(), "expected None for random uuid");
 }
 
@@ -922,7 +912,7 @@ async fn get_dir_optional_returns_some_for_existing_dir() {
 		.await
 		.unwrap();
 
-	let got = client.get_dir(*dir.uuid()).await.optional().unwrap();
+	let got = client.get_dir(dir.uuid()).await.optional().unwrap();
 	let got = got.expect("expected Some for an existing dir");
 	assert_eq!(got, dir);
 }

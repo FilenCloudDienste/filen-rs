@@ -1,14 +1,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{api::v3::notes::NoteType, crypto::EncryptedString, fs::UuidStr};
+use crate::{api::v3::notes::NoteType, crypto::EncryptedString, fs::Uuid};
 
 pub const ENDPOINT: &str = "v3/notes/type/change";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub preview: EncryptedString<'a>,
 	pub content: EncryptedString<'a>,
 	#[serde(rename = "type")]
@@ -18,7 +18,7 @@ pub struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "type")]
 	pub note_type: NoteType,
 	#[serde(with = "crate::serde::number::permissive_u64")]

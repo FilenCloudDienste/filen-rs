@@ -6,7 +6,7 @@ use typenum::{U32, U256};
 
 use crate::{
 	crypto::EncryptedString,
-	fs::UuidStr,
+	fs::Uuid,
 	serde::str::{SizedHexString, SizedStrBase64Chars},
 };
 
@@ -14,13 +14,13 @@ pub const ENDPOINT: &str = "v3/dir/link/info";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
-	pub parent: UuidStr,
+	pub parent: Uuid,
 	pub metadata: EncryptedString<'a>,
 	pub has_password: bool,
 	pub salt: Option<LinkPasswordSalt>,

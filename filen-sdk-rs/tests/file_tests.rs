@@ -21,7 +21,7 @@ use filen_sdk_rs::{
 	io::client_impl::IoSharedClientExt,
 	util::MaybeSendCallback,
 };
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 use futures::AsyncReadExt;
 use rand::TryRngCore;
 
@@ -34,7 +34,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder(name, *test_dir.uuid()).unwrap();
+	let file = client.make_file_builder(name, test_dir.uuid()).unwrap();
 	let file = client.upload_file(file, contents).await.unwrap();
 
 	let found_file = match client
@@ -55,7 +55,7 @@ async fn assert_file_upload_download_equal(name: &str, contents_len: usize) {
 	assert_eq!(buf.len(), contents.len(), "File size mismatch for {name}");
 	assert_eq!(&buf, contents, "File contents mismatch for {name}");
 
-	let got_file = client.get_file(*file.uuid()).await.unwrap();
+	let got_file = client.get_file(file.uuid()).await.unwrap();
 	assert_eq!(file, got_file, "File metadata mismatch for {name}");
 }
 
@@ -82,7 +82,7 @@ async fn file_trash() {
 
 	let file_name = "file.txt";
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(file_name, test_dir.uuid())
 		.unwrap();
 	let mut file = client
 		.upload_file(file, b"Hello World from Rust!")
@@ -129,7 +129,7 @@ async fn file_delete_permanently() {
 
 	let file_name = "file.txt";
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(file_name, test_dir.uuid())
 		.unwrap();
 	let mut file = client
 		.upload_file(file, b"Hello World from Rust!")
@@ -156,7 +156,7 @@ async fn file_delete_permanently() {
 
 	assert!(client.restore_file(&mut file).await.is_err());
 
-	assert!(client.get_file(*file.uuid()).await.is_err());
+	assert!(client.get_file(file.uuid()).await.is_err());
 
 	// Uncomment this when the API immediately permanently deletes the file
 	// let mut reader = file.into_reader(client.clone());
@@ -172,7 +172,7 @@ async fn file_link() {
 
 	let file_name = "file.txt";
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(file_name, test_dir.uuid())
 		.unwrap();
 	let file = client
 		.upload_file(file, b"Hello World from Rust!")
@@ -205,7 +205,7 @@ async fn file_move() {
 
 	let file_name = "file.txt";
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(file_name, test_dir.uuid())
 		.unwrap();
 	let mut file = client
 		.upload_file(file, b"Hello World from Rust!")
@@ -259,7 +259,7 @@ async fn file_update_meta() {
 
 	let file_name = "file.txt";
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(file_name, test_dir.uuid())
 		.unwrap();
 	let mut file = client
 		.upload_file(file, b"Hello World from Rust!")
@@ -313,7 +313,7 @@ async fn file_update_meta() {
 	assert_eq!(file.created().unwrap(), created.round_subsecs(3));
 	assert_eq!(file.last_modified().unwrap(), modified.round_subsecs(3));
 
-	let found_file = client.get_file(*file.uuid()).await.unwrap();
+	let found_file = client.get_file(file.uuid()).await.unwrap();
 	assert_eq!(found_file.mime().unwrap(), new_mime);
 	assert_eq!(found_file.created().unwrap(), created.round_subsecs(3));
 	assert_eq!(
@@ -340,7 +340,7 @@ async fn file_exists() {
 	);
 
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(file_name, test_dir.uuid())
 		.unwrap();
 	let mut file = client
 		.upload_file(file, b"Hello World from Rust!")
@@ -352,7 +352,7 @@ async fn file_exists() {
 			.file_exists(file.name().unwrap(), &test_dir.into())
 			.await
 			.unwrap(),
-		Some(*file.uuid())
+		Some(file.uuid())
 	);
 
 	let new_name = "new_name.json";
@@ -369,7 +369,7 @@ async fn file_exists() {
 			.file_exists(new_name, &test_dir.into())
 			.await
 			.unwrap(),
-		Some(*file.uuid())
+		Some(file.uuid())
 	);
 
 	assert!(
@@ -389,7 +389,7 @@ async fn file_trash_empty() {
 
 	let file_name = "file.txt";
 	let file = client
-		.make_file_builder(file_name, *test_dir.uuid())
+		.make_file_builder(file_name, test_dir.uuid())
 		.unwrap();
 	let mut file = client
 		.upload_file(file, b"Hello World from Rust!")
@@ -416,11 +416,11 @@ async fn file_trash_empty() {
 			.is_none()
 	);
 
-	assert_eq!(&client.get_file(*file.uuid()).await.unwrap(), &file);
+	assert_eq!(&client.get_file(file.uuid()).await.unwrap(), &file);
 	client.empty_trash().await.unwrap();
 	// emptying trash is asynchronous, so we need to wait a bit
 	tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-	assert!(client.get_file(*file.uuid()).await.is_err());
+	assert!(client.get_file(file.uuid()).await.is_err());
 }
 
 async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, contents_len: usize) {
@@ -428,7 +428,7 @@ async fn test_callback_sums(client: &Client, test_dir: &RemoteDirectory, content
 	rand::rng().try_fill_bytes(&mut contents).unwrap();
 	let file_name = format!("file_{contents_len}.txt");
 	let file = client
-		.make_file_builder(&file_name, *test_dir.uuid())
+		.make_file_builder(&file_name, test_dir.uuid())
 		.unwrap();
 	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
 	client
@@ -470,7 +470,7 @@ async fn file_favorite() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder("test", *test_dir.uuid()).unwrap();
+	let file = client.make_file_builder("test", test_dir.uuid()).unwrap();
 	let mut file = client.upload_file(file, b"").await.unwrap();
 
 	assert!(!file.favorited());
@@ -488,7 +488,7 @@ async fn file_read_range() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 
-	let file = client.make_file_builder("test", *test_dir.uuid()).unwrap();
+	let file = client.make_file_builder("test", test_dir.uuid()).unwrap();
 	let file = client.upload_file(file, b"Hello, Filen!").await.unwrap();
 
 	let mut reader = client.get_file_reader_for_range(&file, 6, 1000000);
@@ -500,7 +500,7 @@ async fn file_read_range() {
 	reader.read_to_end(&mut buf).await.unwrap();
 	assert_eq!(str::from_utf8(&buf).unwrap(), "Hello");
 
-	let file = client.make_file_builder("test2", *test_dir.uuid()).unwrap();
+	let file = client.make_file_builder("test2", test_dir.uuid()).unwrap();
 
 	let border_contents = b"Hello, Filen";
 	let mut big_contents = vec![0u8; 1024 * 1024 * 3 + border_contents.len() / 2];
@@ -535,7 +535,7 @@ async fn file_versions() {
 	let mut versions = Vec::new();
 	// TODO: when backend supports size in version info, use different lengths for these strings
 	for content in ["Version 1", "Version a 2", "Version as 3", "Version asd 4"] {
-		let base_file = client.make_file_builder("test", *test_dir.uuid()).unwrap();
+		let base_file = client.make_file_builder("test", test_dir.uuid()).unwrap();
 		let file = client
 			.upload_file(base_file, content.as_bytes())
 			.await
@@ -604,7 +604,7 @@ mod http_provider_tests {
 		name: &str,
 		contents: &[u8],
 	) -> filen_sdk_rs::fs::file::RemoteFile {
-		let file = client.make_file_builder(name, *test_dir.uuid()).unwrap();
+		let file = client.make_file_builder(name, test_dir.uuid()).unwrap();
 		client.upload_file(file, contents).await.unwrap()
 	}
 
@@ -1284,7 +1284,7 @@ async fn download_chunk_for_random_uuid_returns_file_chunk_not_found_kind() {
 	// Pick the same defaults that the SDK uses when a file is created locally —
 	// the egest endpoint will respond with 404 for a UUID it has never seen.
 	let err = client
-		.download_file_chunk_by_uuid("de-1", "filen-empty", UuidStr::new_v4(), 0)
+		.download_file_chunk_by_uuid("de-1", "filen-empty", Uuid::new_v4(), 0)
 		.await
 		.unwrap_err();
 	assert_eq!(
@@ -1322,7 +1322,7 @@ async fn file_malformed_meta() {
 		.await
 		.unwrap()
 		.1;
-	assert!(files.iter().any(|f| *f.uuid() == uuid));
+	assert!(files.iter().any(|f| f.uuid() == uuid));
 	assert_eq!(files.len(), 1);
 }
 
@@ -1454,19 +1454,19 @@ async fn make_file_builder_rejects_invalid_names() {
 	let test_dir = &resources.dir;
 
 	assert!(matches!(
-		client.make_file_builder("", *test_dir.uuid()),
+		client.make_file_builder("", test_dir.uuid()),
 		Err(EntryNameError::Empty)
 	));
 	assert!(matches!(
-		client.make_file_builder("CON", *test_dir.uuid()),
+		client.make_file_builder("CON", test_dir.uuid()),
 		Err(EntryNameError::ReservedName)
 	));
 	assert!(matches!(
-		client.make_file_builder("foo/bar", *test_dir.uuid()),
+		client.make_file_builder("foo/bar", test_dir.uuid()),
 		Err(EntryNameError::ForbiddenChar { ch: '/', .. })
 	));
 	assert!(matches!(
-		client.make_file_builder("trail.", *test_dir.uuid()),
+		client.make_file_builder("trail.", test_dir.uuid()),
 		Err(EntryNameError::TrailingDotOrSpace)
 	));
 }
@@ -1481,9 +1481,7 @@ async fn make_file_builder_normalizes_nfc() {
 	let nfd_name = "caf\u{0065}\u{0301}.txt";
 	let nfc_name = "caf\u{00E9}.txt";
 
-	let builder = client
-		.make_file_builder(nfd_name, *test_dir.uuid())
-		.unwrap();
+	let builder = client.make_file_builder(nfd_name, test_dir.uuid()).unwrap();
 	assert_eq!(builder.get_name(), nfc_name);
 }
 
@@ -1496,9 +1494,7 @@ async fn file_upload_normalizes_nfc() {
 	let nfd_name = "caf\u{0065}\u{0301}.txt";
 	let nfc_name = "caf\u{00E9}.txt";
 
-	let file = client
-		.make_file_builder(nfd_name, *test_dir.uuid())
-		.unwrap();
+	let file = client.make_file_builder(nfd_name, test_dir.uuid()).unwrap();
 	let file = client.upload_file(file, b"nfc test").await.unwrap();
 	assert_eq!(file.name().unwrap(), nfc_name);
 
@@ -1519,7 +1515,7 @@ async fn update_file_meta_rejects_invalid_name() {
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("valid.txt", *test_dir.uuid())
+		.make_file_builder("valid.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"content").await.unwrap();
 
@@ -1545,7 +1541,7 @@ async fn update_file_meta_normalizes_nfc() {
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("nfc_test.txt", *test_dir.uuid())
+		.make_file_builder("nfc_test.txt", test_dir.uuid())
 		.unwrap();
 	let mut file = client.upload_file(file, b"content").await.unwrap();
 
@@ -1568,7 +1564,7 @@ async fn update_file_meta_normalizes_nfc() {
 async fn get_file_for_random_uuid_returns_file_not_found_kind() {
 	let client = test_utils::RESOURCES.client().await;
 
-	let err = client.get_file(UuidStr::new_v4()).await.unwrap_err();
+	let err = client.get_file(Uuid::new_v4()).await.unwrap_err();
 	assert_eq!(
 		err.kind(),
 		ErrorKind::FileNotFound,
@@ -1580,7 +1576,7 @@ async fn get_file_for_random_uuid_returns_file_not_found_kind() {
 async fn get_file_optional_returns_none_for_random_uuid() {
 	let client = test_utils::RESOURCES.client().await;
 
-	let result = client.get_file(UuidStr::new_v4()).await.optional().unwrap();
+	let result = client.get_file(Uuid::new_v4()).await.optional().unwrap();
 	assert!(result.is_none(), "expected None for random uuid");
 }
 
@@ -1591,14 +1587,14 @@ async fn get_file_optional_returns_some_for_existing_file() {
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("optional_get.txt", *test_dir.uuid())
+		.make_file_builder("optional_get.txt", test_dir.uuid())
 		.unwrap();
 	let file = client
 		.upload_file(file, b"optional get contents")
 		.await
 		.unwrap();
 
-	let got = client.get_file(*file.uuid()).await.optional().unwrap();
+	let got = client.get_file(file.uuid()).await.optional().unwrap();
 	let got = got.expect("expected Some for an existing file");
 	assert_eq!(got, file);
 }
@@ -1611,7 +1607,7 @@ async fn download_file_to_path_creates_nonexistent_file() {
 
 	let contents = b"download_file_to_path test contents";
 	let file = client
-		.make_file_builder("download_to_path.txt", *test_dir.uuid())
+		.make_file_builder("download_to_path.txt", test_dir.uuid())
 		.unwrap();
 	let file = client.upload_file(file, contents).await.unwrap();
 
@@ -1653,7 +1649,7 @@ async fn download_file_to_path_fails_when_parent_missing() {
 	let test_dir = &resources.dir;
 
 	let file = client
-		.make_file_builder("download_missing_parent.txt", *test_dir.uuid())
+		.make_file_builder("download_missing_parent.txt", test_dir.uuid())
 		.unwrap();
 	let file = client
 		.upload_file(file, b"parent missing test")

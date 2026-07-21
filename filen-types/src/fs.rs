@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ConversionError;
 
-pub use uuid::{UUID_STR_NIL, UuidStr};
+pub use uuid::UuidStr;
+
+pub use ::uuid::Uuid;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -44,31 +46,99 @@ impl From<ObjectType> for ObjectType2 {
 #[rkyv_self]
 #[repr(u8)]
 pub enum ParentUuid {
-	Uuid(UuidStr),
-	Trash,
+	Uuid(Uuid),
+	/// A trashed item's parent. Carries the item's *original* parent so a trashed file/dir
+	/// remembers where it came from. By convention this is always a real uuid for an actual
+	/// item; the sole exception is the transient list-trash request target, which uses
+	/// [`Uuid::nil`] as a placeholder (the payload is dropped by every string/wire encoding —
+	/// [`ParentUuid::to_str`] renders `"trash"` regardless).
+	Trash(Uuid),
 	Recents,
 	Favorites,
 	Links,
+}
+
+/// A stack-allocated string view of a [`ParentUuid`], returned by [`ParentUuid::to_str`].
+///
+/// `ParentUuid` stores a binary [`Uuid`], so it cannot lend out a `&str` directly; this owns the
+/// formatted form (a hyphenated uuid or a `&'static` sentinel word) so callers can `.as_ref()` it.
+pub enum ParentUuidStr {
+	Uuid(UuidStr),
+	Sentinel(&'static str),
+}
+
+impl AsRef<str> for ParentUuidStr {
+	fn as_ref(&self) -> &str {
+		match self {
+			ParentUuidStr::Uuid(uuid) => uuid.as_ref(),
+			ParentUuidStr::Sentinel(s) => s,
+		}
+	}
+}
+
+impl std::fmt::Display for ParentUuidStr {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_ref())
+	}
+}
+
+impl ParentUuid {
+	/// Whether this parent is the trash (ignoring any remembered original-parent payload).
+	pub fn is_trash(&self) -> bool {
+		matches!(self, ParentUuid::Trash(_))
+	}
+
+	/// A trashed item's remembered original parent, if known (`None` for non-trash parents and for
+	/// the nil placeholder used by the list-trash request target).
+	pub fn original_parent(&self) -> Option<Uuid> {
+		match self {
+			ParentUuid::Trash(original) if !original.is_nil() => Some(*original),
+			_ => None,
+		}
+	}
+
+	pub fn to_str(&self) -> ParentUuidStr {
+		match self {
+			ParentUuid::Uuid(uuid) => ParentUuidStr::Uuid(uuid.into()),
+			ParentUuid::Trash(_) => ParentUuidStr::Sentinel("trash"),
+			ParentUuid::Recents => ParentUuidStr::Sentinel("recents"),
+			ParentUuid::Favorites => ParentUuidStr::Sentinel("favorites"),
+			ParentUuid::Links => ParentUuidStr::Sentinel("links"),
+		}
+	}
 }
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_PARENT_UUID: &'static str =
 	r#"export type ParentUuid = UuidStr | "trash" | "recents" | "favorites" | "links";"#;
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const TS_UUID: &'static str = r#"export type Uuid = UuidStr;"#;
+
+#[cfg(feature = "uniffi")]
+uniffi::custom_type!(Uuid, String, {
+	remote,
+	lower: |uuid: &Uuid| uuid.to_string(),
+	try_lift: |s: String| {
+		Uuid::from_str(&s).map_err(|_| uniffi::deps::anyhow::anyhow!("invalid UUID string: {}", s))
+	},
+});
+
 impl Default for ParentUuid {
 	fn default() -> Self {
-		ParentUuid::Uuid(UuidStr::nil())
+		ParentUuid::Uuid(Uuid::nil())
 	}
 }
 
-impl From<UuidStr> for ParentUuid {
-	fn from(uuid: UuidStr) -> Self {
+impl From<Uuid> for ParentUuid {
+	fn from(uuid: Uuid) -> Self {
 		ParentUuid::Uuid(uuid)
 	}
 }
 
-impl PartialEq<UuidStr> for ParentUuid {
-	fn eq(&self, other: &UuidStr) -> bool {
+impl PartialEq<Uuid> for ParentUuid {
+	fn eq(&self, other: &Uuid) -> bool {
 		match self {
 			ParentUuid::Uuid(uuid) => uuid == other,
 			_ => false,
@@ -76,7 +146,7 @@ impl PartialEq<UuidStr> for ParentUuid {
 	}
 }
 
-impl TryFrom<ParentUuid> for UuidStr {
+impl TryFrom<ParentUuid> for Uuid {
 	type Error = ConversionError;
 
 	fn try_from(value: ParentUuid) -> Result<Self, Self::Error> {
@@ -87,21 +157,9 @@ impl TryFrom<ParentUuid> for UuidStr {
 	}
 }
 
-impl AsRef<str> for ParentUuid {
-	fn as_ref(&self) -> &str {
-		match self {
-			ParentUuid::Uuid(uuid) => uuid.as_ref(),
-			ParentUuid::Trash => "trash",
-			ParentUuid::Recents => "recents",
-			ParentUuid::Favorites => "favorites",
-			ParentUuid::Links => "links",
-		}
-	}
-}
-
 impl std::fmt::Display for ParentUuid {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str(self.as_ref())
+		f.write_str(self.to_str().as_ref())
 	}
 }
 
@@ -110,12 +168,12 @@ impl FromStr for ParentUuid {
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		match s {
-			"trash" => Ok(ParentUuid::Trash),
+			"trash" => Ok(ParentUuid::Trash(Uuid::nil())),
 			"recents" => Ok(ParentUuid::Recents),
 			"favorites" => Ok(ParentUuid::Favorites),
 			"links" => Ok(ParentUuid::Links),
 			_ => {
-				Ok(ParentUuid::Uuid(UuidStr::from_str(s).map_err(|_| {
+				Ok(ParentUuid::Uuid(Uuid::from_str(s).map_err(|_| {
 					ConversionError::ParentUuidError(s.to_string())
 				})?))
 			}
@@ -128,7 +186,7 @@ impl Serialize for ParentUuid {
 	where
 		S: serde::Serializer,
 	{
-		serializer.serialize_str(self.as_ref())
+		serializer.serialize_str(self.to_str().as_ref())
 	}
 }
 
@@ -158,8 +216,6 @@ mod uuid {
 	#[derive(Clone, Copy, PartialEq, Eq)]
 	#[rkyv_self]
 	pub struct UuidStr([u8; Hyphenated::LENGTH]);
-
-	pub static UUID_STR_NIL: UuidStr = UuidStr([0u8; Hyphenated::LENGTH]);
 
 	#[cfg(feature = "uniffi")]
 	uniffi::custom_type!(UuidStr, String, {
@@ -226,16 +282,20 @@ mod uuid {
 		}
 	}
 
+	impl From<Uuid> for UuidStr {
+		fn from(uuid: Uuid) -> Self {
+			(&uuid).into()
+		}
+	}
+
+	impl From<UuidStr> for Uuid {
+		fn from(uuid: UuidStr) -> Self {
+			(&uuid).into()
+		}
+	}
+
 	impl UuidStr {
 		pub const LENGTH: usize = Hyphenated::LENGTH;
-
-		pub fn new_v4() -> Self {
-			(&Uuid::new_v4()).into()
-		}
-
-		pub fn nil() -> Self {
-			(&Uuid::nil()).into()
-		}
 	}
 
 	impl FromStr for UuidStr {
@@ -298,99 +358,9 @@ mod uuid {
 		}
 	}
 
-	impl Default for UuidStr {
-		fn default() -> Self {
-			UuidStr::nil()
-		}
-	}
-
 	impl std::fmt::Debug for UuidStr {
 		fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 			f.write_str(self.as_ref())
-		}
-	}
-
-	#[cfg(feature = "rusqlite")]
-	mod sqlite {
-		use rusqlite::{
-			Error, ToSql,
-			types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
-		};
-
-		use super::*;
-
-		impl ToSql for UuidStr {
-			fn to_sql(&self) -> Result<ToSqlOutput<'_>, Error> {
-				Ok(ToSqlOutput::Borrowed(ValueRef::Text(
-					self.as_ref().as_bytes(),
-				)))
-			}
-		}
-
-		impl FromSql for UuidStr {
-			fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-				match value {
-					ValueRef::Text(s) => UuidStr::from_str(
-						std::str::from_utf8(s).map_err(|_| FromSqlError::InvalidType)?,
-					)
-					.map_err(|e| FromSqlError::Other(Box::new(e))),
-					_ => Err(FromSqlError::InvalidType),
-				}
-			}
-		}
-	}
-
-	#[cfg(target_family = "wasm")]
-	mod wasm {
-		use wasm_bindgen::JsValue;
-
-		use super::*;
-
-		impl From<UuidStr> for JsValue {
-			fn from(uuid: UuidStr) -> Self {
-				JsValue::from(uuid.as_ref())
-			}
-		}
-	}
-}
-
-#[cfg(feature = "rusqlite")]
-mod sqlite {
-	use std::str::FromStr;
-
-	use crate::fs::UuidStr;
-
-	use super::ParentUuid;
-	use rusqlite::{
-		Error, ToSql,
-		types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
-	};
-	use uuid::fmt::Hyphenated;
-
-	impl ToSql for ParentUuid {
-		fn to_sql(&self) -> Result<ToSqlOutput<'_>, Error> {
-			Ok(ToSqlOutput::Borrowed(self.as_ref().into()))
-		}
-	}
-
-	impl FromSql for ParentUuid {
-		fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-			match value {
-				ValueRef::Text(s) => {
-					if s.len() == Hyphenated::LENGTH {
-						// If the string is exactly 36 characters, it is likely a UUID
-						UuidStr::column_result(ValueRef::Text(s)).map(ParentUuid::Uuid)
-					} else {
-						// Otherwise, treat it as a special parent type
-						match std::str::from_utf8(s) {
-							Ok(s) => ParentUuid::from_str(s)
-								.map_err(|e| FromSqlError::Other(Box::new(e))),
-							Err(e) => Err(FromSqlError::Other(Box::new(e))),
-						}
-					}
-				}
-				_ => Err(FromSqlError::InvalidType),
-			}
 		}
 	}
 }
@@ -403,7 +373,13 @@ mod wasm {
 
 	impl From<ParentUuid> for JsValue {
 		fn from(parent: ParentUuid) -> Self {
-			JsValue::from(parent.as_ref())
+			JsValue::from(parent.to_str().as_ref())
+		}
+	}
+
+	impl From<UuidStr> for JsValue {
+		fn from(uuid: UuidStr) -> Self {
+			JsValue::from(uuid.as_ref())
 		}
 	}
 }
@@ -414,11 +390,11 @@ mod tests {
 
 	#[test]
 	fn test_parent_uuid_stringification() {
-		let uuid = UuidStr::new_v4();
+		let uuid = Uuid::new_v4();
 		let parent_uuid = ParentUuid::Uuid(uuid);
 		assert_eq!(parent_uuid.to_string(), uuid.to_string());
 		assert_eq!(
-			ParentUuid::from_str(parent_uuid.as_ref()).unwrap(),
+			ParentUuid::from_str(parent_uuid.to_str().as_ref()).unwrap(),
 			parent_uuid
 		);
 	}

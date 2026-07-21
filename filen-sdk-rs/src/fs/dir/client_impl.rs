@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
-use filen_types::fs::{ObjectType, ParentUuid, UuidStr};
+use filen_types::fs::{ObjectType, ParentUuid, Uuid};
 use filen_types::traits::CowHelpers;
 
 use crate::{
@@ -40,7 +40,7 @@ impl Client {
 
 	pub(crate) async fn inner_create_dir_with_created(
 		&self,
-		parent: UuidStr,
+		parent: Uuid,
 		name: &str,
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
@@ -51,23 +51,17 @@ impl Client {
 			self.client(),
 			&api::v3::dir::create::Request {
 				uuid,
-				parent: *parent.uuid(),
+				parent: parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(&meta.name)),
 				meta: self.crypter().encrypt_meta(&meta.to_json_string()).await,
 			},
 		)
 		.await?;
 
-		if uuid != response.uuid {
-			uuid = response.uuid;
-		}
+		uuid = response.uuid;
 
-		let dir: RemoteDirectory = RemoteDirectory::new_from_parts(
-			uuid,
-			meta,
-			(*parent.uuid()).into(),
-			response.timestamp,
-		);
+		let dir: RemoteDirectory =
+			RemoteDirectory::new_from_parts(uuid, meta, (parent.uuid()).into(), response.timestamp);
 
 		self.update_item_with_maybe_connected_parent((&dir).into())
 			.await?;
@@ -80,7 +74,7 @@ impl Client {
 		name: &str,
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
-		self.inner_create_dir_with_created(*parent.uuid(), name, created)
+		self.inner_create_dir_with_created(parent.uuid(), name, created)
 			.await
 	}
 
@@ -90,16 +84,16 @@ impl Client {
 		parent: &DirType<'_, Normal>,
 		name: &str,
 		contents: &str,
-	) -> Result<UuidStr, Error> {
+	) -> Result<Uuid, Error> {
 		use filen_types::crypto::EncryptedString;
 		let _lock = self.lock_drive().await?;
 
-		let uuid = UuidStr::new_v4();
+		let uuid = Uuid::new_v4();
 		let response = api::v3::dir::create::post(
 			self.client(),
 			&api::v3::dir::create::Request {
 				uuid,
-				parent: *parent.uuid(),
+				parent: parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(name)),
 				meta: EncryptedString(Cow::Borrowed(contents)),
 			},
@@ -108,15 +102,16 @@ impl Client {
 		Ok(response.uuid)
 	}
 
-	pub async fn get_dir(&self, uuid: UuidStr) -> Result<RemoteDirectory, Error> {
+	pub async fn get_dir(&self, uuid: Uuid) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
 		Ok(do_cpu_intensive(|| {
 			RemoteDirectory::blocking_from_encrypted(
 				uuid,
-				// v3 api returns the original parent as the parent if the file is in the trash
+				// v3 api returns the original parent as the parent if the file is in the trash;
+				// keep it as the remembered original parent instead of discarding it.
 				if response.trash {
-					ParentUuid::Trash
+					ParentUuid::Trash(Uuid::try_from(response.parent).unwrap_or_default())
 				} else {
 					response.parent
 				},
@@ -134,11 +129,11 @@ impl Client {
 		&self,
 		parent: &DirType<'_, Normal>,
 		name: &str,
-	) -> Result<Option<UuidStr>, Error> {
+	) -> Result<Option<Uuid>, Error> {
 		api::v3::dir::exists::post(
 			self.client(),
 			&api::v3::dir::exists::Request {
-				parent: *parent.uuid(),
+				parent: parent.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(name.as_ref())),
 			},
 		)
@@ -200,8 +195,14 @@ impl Client {
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
-		// todo check if returned parent is ParentUuid::Trash or not
-		crate::fs::categories::normal::list_parent_uuid(self, ParentUuid::Trash, progress).await
+		// list_parent_uuid rewraps each returned item's parent into Trash(original) since the
+		// target is trash. The nil payload here is a placeholder (dropped on serialize to "trash").
+		crate::fs::categories::normal::list_parent_uuid(
+			self,
+			ParentUuid::Trash(Uuid::nil()),
+			progress,
+		)
+		.await
 	}
 
 	/// Recursively lists all directories and files inside the given directory.
@@ -230,10 +231,11 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::trash::post(
 			self.client(),
-			&api::v3::dir::trash::Request { uuid: *dir.uuid() },
+			&api::v3::dir::trash::Request { uuid: dir.uuid() },
 		)
 		.await?;
-		dir.parent = ParentUuid::Trash;
+		// Remember the original parent so the trashed dir knows where it came from.
+		dir.parent = ParentUuid::Trash(Uuid::try_from(dir.parent).unwrap_or_default());
 		Ok(())
 	}
 
@@ -241,13 +243,13 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::restore::post(
 			self.client(),
-			&api::v3::dir::restore::Request { uuid: *dir.uuid() },
+			&api::v3::dir::restore::Request { uuid: dir.uuid() },
 		)
 		.await?;
 
 		// api v3 doesn't return the parentUUID we returned to, so we query it separately for now
 		let resp =
-			api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid: *dir.uuid() }).await?;
+			api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid: dir.uuid() }).await?;
 		dir.parent = resp.parent;
 		Ok(())
 	}
@@ -256,7 +258,7 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::delete::permanent::post(
 			self.client(),
-			&api::v3::dir::delete::permanent::Request { uuid: *dir.uuid() },
+			&api::v3::dir::delete::permanent::Request { uuid: dir.uuid() },
 		)
 		.await?;
 		Ok(())
@@ -286,7 +288,7 @@ impl Client {
 		api::v3::dir::metadata::post(
 			self.client(),
 			&api::v3::dir::metadata::Request {
-				uuid: *dir.uuid(),
+				uuid: dir.uuid(),
 				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
 				metadata: encrypted_meta?,
 			},
@@ -363,12 +365,12 @@ impl Client {
 		api::v3::dir::r#move::post(
 			self.client(),
 			&api::v3::dir::r#move::Request {
-				uuid: *dir.uuid(),
-				to: *new_parent.uuid(),
+				uuid: dir.uuid(),
+				to: new_parent.uuid(),
 			},
 		)
 		.await?;
-		dir.set_parent((*new_parent.uuid()).into());
+		dir.set_parent((new_parent.uuid()).into());
 		Ok(())
 	}
 
@@ -381,7 +383,7 @@ impl Client {
 		api::v3::dir::color::post(
 			self.client(),
 			&api::v3::dir::color::Request {
-				uuid: *dir.uuid(),
+				uuid: dir.uuid(),
 				color: color.as_borrowed_cow(),
 			},
 		)

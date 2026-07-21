@@ -64,7 +64,7 @@ async fn exif_default_overrides_created() {
 	let dir = &resources.dir;
 
 	let builder = client
-		.make_file_builder("exif_override.jpg", *dir.uuid())
+		.make_file_builder("exif_override.jpg", dir.uuid())
 		.unwrap();
 	let file = client.upload_file(builder, EXIF_SAMPLE_JPEG).await.unwrap();
 	assert_eq!(
@@ -81,7 +81,7 @@ async fn exif_no_exif_flag_skips_parsing() {
 	let dir = &resources.dir;
 
 	let builder = client
-		.make_file_builder("exif_skipped.jpg", *dir.uuid())
+		.make_file_builder("exif_skipped.jpg", dir.uuid())
 		.unwrap()
 		.no_exif();
 	let file = client.upload_file(builder, EXIF_SAMPLE_JPEG).await.unwrap();
@@ -100,7 +100,7 @@ async fn exif_no_override_preserves_user_set_time() {
 	let dir = &resources.dir;
 
 	let builder = client
-		.make_file_builder("exif_no_override.jpg", *dir.uuid())
+		.make_file_builder("exif_no_override.jpg", dir.uuid())
 		.unwrap()
 		.created(user_t)
 		.modified(user_t)
@@ -121,7 +121,7 @@ async fn exif_overrides_user_set_time_by_default() {
 	let dir = &resources.dir;
 
 	let builder = client
-		.make_file_builder("exif_overrides_user.jpg", *dir.uuid())
+		.make_file_builder("exif_overrides_user.jpg", dir.uuid())
 		.unwrap()
 		.created(user_t)
 		.modified(user_t);
@@ -142,7 +142,7 @@ async fn non_image_mime_ignores_exif_payload() {
 	let dir = &resources.dir;
 
 	let builder = client
-		.make_file_builder("exif_disguised.bin", *dir.uuid())
+		.make_file_builder("exif_disguised.bin", dir.uuid())
 		.unwrap()
 		.mime("application/octet-stream".to_string());
 	let file = client.upload_file(builder, EXIF_SAMPLE_JPEG).await.unwrap();

@@ -7,6 +7,9 @@ use rsa::RsaPublicKey;
 uniffi::use_remote_type!(filen_types::filen_types::fs::UuidStr);
 
 #[cfg(feature = "uniffi")]
+uniffi::use_remote_type!(filen_types::uuid::Uuid);
+
+#[cfg(feature = "uniffi")]
 uniffi::custom_type!(RsaPublicKey, String, {
 	remote,
 	lower: |key: &RsaPublicKey| RsaDerPublicKey(Cow::Borrowed(&key)).to_string(),

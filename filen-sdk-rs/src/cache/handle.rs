@@ -420,7 +420,7 @@ async fn spawn_cache_worker(
 	let (msg_sender, mut msg_receiver) = tokio::sync::mpsc::channel(100);
 	let (finished_sender, finished_receiver) = tokio::sync::watch::channel(false);
 
-	let root_uuid = client.root().uuid().into();
+	let root_uuid = client.root().uuid();
 	let cache_path = config.path.clone();
 	// Set when the spawner gives up on this worker (init-ack timeout): a LATE-starting worker
 	// (slow worker-script fetch on wasm; a thread unfrozen after a long stall on native) checks

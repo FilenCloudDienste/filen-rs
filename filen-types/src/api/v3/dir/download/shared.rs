@@ -5,12 +5,12 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{auth::FileEncryptionVersion, crypto::rsa::RSAEncryptedString, fs::UuidStr};
+use crate::{auth::FileEncryptionVersion, crypto::rsa::RSAEncryptedString, fs::Uuid};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub skip_cache: bool,
 }
 
@@ -25,11 +25,11 @@ pub struct Response<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Directory<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "name")]
 	pub meta: RSAEncryptedString<'a>,
 	#[serde(with = "crate::serde::uuid::base")]
-	pub parent: Option<UuidStr>,
+	pub parent: Option<Uuid>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 }
@@ -37,7 +37,7 @@ pub struct Directory<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub metadata: RSAEncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
@@ -47,6 +47,6 @@ pub struct File<'a> {
 	pub chunks_size: u64,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,
-	pub parent: UuidStr,
+	pub parent: Uuid,
 	pub version: FileEncryptionVersion,
 }

@@ -3,14 +3,14 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{crypto::EncryptedString, fs::UuidStr, traits::CowHelpers};
+use crate::{crypto::EncryptedString, fs::Uuid, traits::CowHelpers};
 
 pub const ENDPOINT: &str = "v3/chat/messages";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub conversation: UuidStr,
+	pub conversation: Uuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 }
@@ -23,7 +23,7 @@ pub struct Response<'a>(pub Vec<ChatMessageEncrypted<'a>>);
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessageEncrypted<'a> {
 	#[serde(rename = "conversation")]
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	#[serde(flatten)]
 	pub inner: ChatMessagePartialEncrypted<'a>,
 	#[serde(deserialize_with = "crate::serde::option::result_to_option::deserialize")]
@@ -48,7 +48,7 @@ pub struct ChatMessageEncrypted<'a> {
 	tsify(large_number_types_as_bigints)
 )]
 pub struct ChatMessagePartialEncrypted<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub sender_id: u64,
 	pub sender_email: Cow<'a, str>,

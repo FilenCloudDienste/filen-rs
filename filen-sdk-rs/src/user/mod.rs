@@ -11,7 +11,7 @@ use filen_types::{
 		account::{Personal, UserAccountPlan, UserAccountSubs, UserAccountSubsInvoices},
 		events::UserEventDeserializeError,
 	},
-	fs::UuidStr,
+	fs::Uuid,
 	serde::str::Base64EncodedBytes,
 };
 #[cfg(feature = "multi-threaded-crypto")]
@@ -216,7 +216,7 @@ impl Client {
 		.await)
 	}
 
-	pub async fn get_user_event(&self, uuid: UuidStr) -> Result<DecryptedUserEvent, Error> {
+	pub async fn get_user_event(&self, uuid: Uuid) -> Result<DecryptedUserEvent, Error> {
 		let event =
 			api::v3::user::event::post(self.client(), &api::v3::user::event::Request { uuid })
 				.await?;
@@ -240,7 +240,7 @@ pub struct UserInfo {
 	#[cfg_attr(feature = "wasm-full", tsify(type = "bigint"))]
 	pub max_storage: u64,
 	pub avatar_url: Option<String>,
-	pub root_dir_uuid: UuidStr,
+	pub root_dir_uuid: Uuid,
 
 	// user/settings
 	pub two_factor_enabled: bool,
@@ -353,6 +353,8 @@ pub struct UserPersonalUpdateInfo {
 
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 mod js_impl {
+	use filen_types::fs::UuidStr;
+
 	use crate::{auth::JsClient, runtime::do_on_commander};
 
 	use super::*;
@@ -493,7 +495,7 @@ mod js_impl {
 		) -> Result<crate::user::js::events::UserEvent, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
-				let event = this.get_user_event(uuid).await?;
+				let event = this.get_user_event(uuid.into()).await?;
 				Ok(event.into())
 			})
 			.await

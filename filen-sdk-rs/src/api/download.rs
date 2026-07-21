@@ -1,4 +1,4 @@
-use filen_types::fs::UuidStr;
+use filen_types::fs::Uuid;
 
 use crate::{
 	ErrorKind, auth::unauth::UnauthClient, consts::random_egest_url, error::Error,
@@ -36,7 +36,7 @@ where
 		client,
 		file.region(),
 		file.bucket(),
-		*file.uuid(),
+		file.uuid(),
 		chunk_idx,
 		callback,
 	)
@@ -47,7 +47,7 @@ pub(crate) async fn download_file_chunk_by_uuid<F>(
 	client: &UnauthClient,
 	region: &str,
 	bucket: &str,
-	uuid: UuidStr,
+	uuid: Uuid,
 	chunk_idx: u64,
 	callback: Option<&F>,
 ) -> Result<Vec<u8>, Error>

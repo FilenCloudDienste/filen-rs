@@ -2,7 +2,7 @@ WITH RECURSIVE
 path (uuid, name, parent, level) AS (
 	SELECT
 		i.uuid,
-		COALESCE(f.name, d.name, i.uuid) AS name,
+		COALESCE(f.name, d.name, UUID_TEXT(i.uuid)) AS name,
 		i.parent,
 		0
 	FROM items AS i
@@ -12,7 +12,7 @@ path (uuid, name, parent, level) AS (
 	UNION ALL
 	SELECT
 		i.uuid,
-		COALESCE(f.name, d.name, i.uuid) AS name,
+		COALESCE(f.name, d.name, UUID_TEXT(i.uuid)) AS name,
 		i.parent,
 		p.level + 1
 	FROM items AS i

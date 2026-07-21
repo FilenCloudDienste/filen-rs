@@ -3,14 +3,14 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::UuidStr};
+use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::Uuid};
 
 pub const ENDPOINT: &str = "v3/file/versions";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -23,7 +23,7 @@ pub struct FileVersion<'a> {
 	pub region: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub version: FileEncryptionVersion,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub size: u64,

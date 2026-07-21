@@ -26,7 +26,13 @@ uuid = { version = "1.18.0", default-features = false }
 chrono = { version = "0.4.41", features = ["serde"] }
 filen-macros = { path = "../filen-macros" }
 # `fallible_uint` restores the u64/usize ToSql/FromSql impls that rusqlite 0.38 made opt-in.
-rusqlite = { version = "0.39", features = ["bundled", "fallible_uint"] }
+# `functions` registers the `uuid_text` scalar (renders a BLOB uuid as canonical text for
+# path fallbacks / uuid-based path navigation now that uuids are stored as BLOBs).
+rusqlite = { version = "0.39", features = [
+	"bundled",
+	"fallible_uint",
+	"functions",
+] }
 filen-types = { path = "../filen-types", features = ["rusqlite"] }
 image = { version = "0.25.6", default-features = false } # only need the error type here
 

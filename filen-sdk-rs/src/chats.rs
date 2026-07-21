@@ -12,7 +12,7 @@ use filen_types::{
 		contacts::Contact,
 	},
 	crypto::EncryptedString,
-	fs::UuidStr,
+	fs::Uuid,
 	traits::CowHelpers,
 };
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -81,7 +81,7 @@ impl ChatParticipant {
 
 #[js_type(import, export)]
 pub struct Chat {
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 	#[cfg_attr(
 		feature = "wasm-full",
 		serde(default, skip_serializing_if = "Option::is_none")
@@ -119,7 +119,7 @@ pub struct Chat {
 }
 
 impl Chat {
-	pub fn uuid(&self) -> UuidStr {
+	pub fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -294,7 +294,7 @@ fn blocking_decrypt_chat_key(
 
 #[js_type(import)]
 pub struct ChatMessagePartial {
-	uuid: UuidStr,
+	uuid: Uuid,
 	sender_id: u64,
 	sender_email: String,
 	#[cfg_attr(
@@ -336,7 +336,7 @@ impl ChatMessagePartial {
 
 #[js_type(import, export)]
 pub struct ChatMessage {
-	chat: UuidStr,
+	chat: Uuid,
 	#[cfg_attr(feature = "wasm-full", serde(flatten))]
 	inner: ChatMessagePartial,
 	#[cfg_attr(
@@ -389,7 +389,7 @@ impl ChatMessage {
 		self.inner.message.as_deref()
 	}
 
-	pub fn uuid(&self) -> &UuidStr {
+	pub fn uuid(&self) -> &Uuid {
 		&self.inner.uuid
 	}
 
@@ -471,7 +471,7 @@ impl Client {
 			resp.sort_by(|a, b| {
 				let order = a.sent_timestamp.cmp(&b.sent_timestamp);
 				if order == std::cmp::Ordering::Equal {
-					a.inner.uuid.as_ref().cmp(b.inner.uuid.as_ref())
+					a.inner.uuid.cmp(&b.inner.uuid)
 				} else {
 					order
 				}
@@ -506,7 +506,7 @@ impl Client {
 		.await)
 	}
 
-	pub async fn get_chat(&self, uuid: UuidStr) -> Result<Option<Chat>, Error> {
+	pub async fn get_chat(&self, uuid: Uuid) -> Result<Option<Chat>, Error> {
 		let chats = self.list_chats().await?;
 		Ok(chats.into_iter().find(|c| c.uuid == uuid))
 	}
@@ -514,7 +514,7 @@ impl Client {
 	async fn inner_add_chat_participant(
 		&self,
 		key: &NoteOrChatKey,
-		chat_uuid: UuidStr,
+		chat_uuid: Uuid,
 		contact: &Contact<'_>,
 	) -> Result<ChatParticipant, Error> {
 		let (metadata, _lock) = futures::join!(
@@ -547,7 +547,7 @@ impl Client {
 	}
 
 	pub async fn create_chat(&self, contacts: &[Contact<'_>]) -> Result<Chat, Error> {
-		let uuid = UuidStr::new_v4();
+		let uuid = Uuid::new_v4();
 		let key = NoteOrChatKey::generate();
 
 		let crypter = self.crypter();
@@ -678,7 +678,7 @@ impl Client {
 			.as_ref()
 			.ok_or(MetadataWasNotDecryptedError)
 			.context("send_chat_message")?;
-		let uuid = UuidStr::new_v4();
+		let uuid = Uuid::new_v4();
 
 		let encrypted_message =
 			do_cpu_intensive(|| crypto::ChatMessage::blocking_encrypt(key, &message)).await;
@@ -1008,7 +1008,7 @@ pub mod js_impls {
 		)]
 		pub async fn get_chat(&self, uuid: UuidStr) -> Result<Option<Chat>, Error> {
 			let this = self.inner();
-			do_on_commander(move || async move { this.get_chat(uuid).await }).await
+			do_on_commander(move || async move { this.get_chat(uuid.into()).await }).await
 		}
 
 		#[cfg_attr(

@@ -76,10 +76,10 @@ impl<'a> CacheEventType<'a> {
 		Ok(match event {
 			DecryptedDriveEvent::FileArchiveRestored(FileArchiveRestored { file, .. })
 			| DecryptedDriveEvent::FileRestore(FileRestore(file)) => CacheEventType::File(
-				FileEvent::Changed(file.try_into().map_err(|e| (e, file.uuid().into()))?),
+				FileEvent::Changed(file.try_into().map_err(|e| (e, file.uuid()))?),
 			),
 			DecryptedDriveEvent::FileNew(FileNew(file)) => CacheEventType::File(FileEvent::New(
-				(file).try_into().map_err(|e| (e, file.uuid().into()))?,
+				(file).try_into().map_err(|e| (e, file.uuid()))?,
 			)),
 			DecryptedDriveEvent::FileMove(FileMove(file)) => match file.try_into() {
 				Ok(cacheable) => CacheEventType::File(FileEvent::Move(cacheable)),
@@ -87,59 +87,51 @@ impl<'a> CacheEventType<'a> {
 				// (trash/recents/favorites/links) takes the item out of the synced tree —
 				// treat it as a removal rather than a non-cacheable frontier-advance event.
 				Err(CacheableConversionError::ParentNotUuid(_)) => {
-					CacheEventType::File(FileEvent::Removed(file.uuid().into()))
+					CacheEventType::File(FileEvent::Removed(file.uuid()))
 				}
-				Err(e) => return Err((e, file.uuid().into())),
+				Err(e) => return Err((e, file.uuid())),
 			},
 			DecryptedDriveEvent::FileTrash(FileTrash { uuid })
 			| DecryptedDriveEvent::FileDeletedPermanent(FileDeletedPermanent { uuid }) => {
-				CacheEventType::File(FileEvent::Removed(uuid.into()))
+				CacheEventType::File(FileEvent::Removed(*uuid))
 			}
 			DecryptedDriveEvent::FileArchived(FileArchived { uuid }) => {
-				CacheEventType::File(FileEvent::Archived(uuid.into()))
+				CacheEventType::File(FileEvent::Archived(*uuid))
 			}
 			DecryptedDriveEvent::FolderTrash(FolderTrash { uuid, .. })
 			| DecryptedDriveEvent::FolderDeletedPermanent(FolderDeletedPermanent { uuid }) => {
-				CacheEventType::Dir(DirEvent::Removed(uuid.into()))
+				CacheEventType::Dir(DirEvent::Removed(*uuid))
 			}
 			DecryptedDriveEvent::FolderMove(FolderMove(dir)) => match dir.try_into() {
 				Ok(cacheable) => CacheEventType::Dir(DirEvent::Move(cacheable)),
 				// a folder move into a virtual container leaves the synced tree → removal.
 				Err(CacheableConversionError::ParentNotUuid(_)) => {
-					CacheEventType::Dir(DirEvent::Removed(dir.uuid().into()))
+					CacheEventType::Dir(DirEvent::Removed(dir.uuid()))
 				}
-				Err(e) => return Err((e, dir.uuid().into())),
+				Err(e) => return Err((e, dir.uuid())),
 			},
 			DecryptedDriveEvent::FolderSubCreated(FolderSubCreated(dir))
-			| DecryptedDriveEvent::FolderRestore(FolderRestore(dir)) => CacheEventType::Dir(DirEvent::New(
-				dir.try_into().map_err(|e| (e, dir.uuid().into()))?,
-			)),
+			| DecryptedDriveEvent::FolderRestore(FolderRestore(dir)) => {
+				CacheEventType::Dir(DirEvent::New(dir.try_into().map_err(|e| (e, dir.uuid()))?))
+			}
 			DecryptedDriveEvent::FolderColorChanged(FolderColorChanged { uuid, color }) => {
 				CacheEventType::Dir(DirEvent::ColorChanged {
-					uuid: uuid.into(),
+					uuid: *uuid,
 					color: color.as_borrowed_cow(),
 				})
 			}
 			DecryptedDriveEvent::TrashEmpty => CacheEventType::Global(GlobalEvent::TrashEmpty),
 			DecryptedDriveEvent::ItemFavorite(ItemFavorite(item)) => match item {
-				crate::fs::categories::NonRootItemType::File(file) => {
-					CacheEventType::File(FileEvent::Changed(
-						file.as_ref()
-							.try_into()
-							.map_err(|e| (e, file.uuid().into()))?,
-					))
-				}
-				crate::fs::categories::NonRootItemType::Dir(dir) => {
-					CacheEventType::Dir(DirEvent::Changed(
-						dir.as_ref()
-							.try_into()
-							.map_err(|e| (e, dir.uuid().into()))?,
-					))
-				}
+				crate::fs::categories::NonRootItemType::File(file) => CacheEventType::File(
+					FileEvent::Changed(file.as_ref().try_into().map_err(|e| (e, file.uuid()))?),
+				),
+				crate::fs::categories::NonRootItemType::Dir(dir) => CacheEventType::Dir(
+					DirEvent::Changed(dir.as_ref().try_into().map_err(|e| (e, dir.uuid()))?),
+				),
 			},
 			DecryptedDriveEvent::FolderMetadataChanged(FolderMetadataChanged { uuid, meta }) => {
 				CacheEventType::Dir(DirEvent::MetadataChanged {
-					uuid: uuid.into(),
+					uuid: *uuid,
 					meta: match meta {
 						crate::fs::dir::meta::DirectoryMeta::Decoded(decoded) => {
 							decoded.as_borrowed_cow()
@@ -150,7 +142,7 @@ impl<'a> CacheEventType<'a> {
 									"{:?}",
 									other
 								)),
-								uuid.into(),
+								*uuid,
 							));
 						}
 					},
@@ -158,7 +150,7 @@ impl<'a> CacheEventType<'a> {
 			}
 			DecryptedDriveEvent::FileMetadataChanged(FileMetadataChanged { uuid, metadata }) => {
 				CacheEventType::File(FileEvent::MetadataChanged {
-					uuid: uuid.into(),
+					uuid: *uuid,
 					meta: match metadata {
 						crate::fs::file::meta::FileMeta::Decoded(decoded) => {
 							decoded.as_borrowed_cow()
@@ -169,7 +161,7 @@ impl<'a> CacheEventType<'a> {
 									"{:?}",
 									other
 								)),
-								uuid.into(),
+								*uuid,
 							));
 						}
 					},

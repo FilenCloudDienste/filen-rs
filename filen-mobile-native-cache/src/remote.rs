@@ -7,7 +7,7 @@ use filen_sdk_rs::fs::{
 	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 	file::{FileBuilderOptionalName, RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 };
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::Uuid;
 use rusqlite::OptionalExtension;
 use tracing::debug;
 
@@ -249,7 +249,7 @@ impl AuthCacheState {
 		);
 		let resp = self.client.get_user_info().await?;
 		let conn = self.conn();
-		sql::update_root(&conn, *self.client.root().uuid(), &resp)?;
+		sql::update_root(&conn, self.client.root().uuid(), &resp)?;
 		Ok(())
 	}
 
@@ -289,7 +289,7 @@ impl AuthCacheState {
 			.list_trash(None::<&fn(u64, Option<u64>)>)
 			.await?;
 		debug!("Updating trash with {dirs:?} dirs and {files:?} files");
-		sql::update_items_with_parent(&mut self.conn(), dirs, files, ParentUuid::Trash)?;
+		sql::update_trashed_items(&mut self.conn(), dirs, files)?;
 		self.last_trash_update
 			.write()
 			.unwrap()
@@ -352,7 +352,7 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		debug!("Downloading file with UUID: {uuid}");
-		let uuid = UuidStr::from_str(&uuid)
+		let uuid = Uuid::from_str(&uuid)
 			.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?;
 		let file = DBFile::select(&self.conn(), uuid)
 			.optional()?
@@ -378,14 +378,14 @@ impl AuthCacheState {
 					)));
 				};
 				if let Some(hash) = meta.hash {
-					let local_hash = self.hash_local_file(&file.uuid, Some(&meta.name)).await?;
+					let local_hash = self.hash_local_file(file.uuid, Some(&meta.name)).await?;
 					if local_hash == Some(hash.into()) {
 						return Ok(false);
 					}
 				}
 
 				self.io_upload_updated_file(
-					file.uuid.as_ref(),
+					&file.uuid.to_string(),
 					meta.name,
 					file.parent.try_into().map_err(|e| {
 						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
@@ -627,7 +627,7 @@ impl AuthCacheState {
 		to: Option<FfiId>,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Untrashing item with UUID: {uuid} to parent: {to:?}");
-		let uuid = UuidStr::from_str(uuid)
+		let uuid = Uuid::from_str(uuid)
 			.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?;
 		let object = {
 			let conn = self.conn();
@@ -662,7 +662,7 @@ impl AuthCacheState {
 			None => None,
 		};
 
-		if !object.parent().is_some_and(|p| p == ParentUuid::Trash) {
+		if !object.parent().is_some_and(|p| p.is_trash()) {
 			return Err(CacheError::remote(format!(
 				"Object with UUID {uuid} is not in the trash"
 			)));
@@ -672,7 +672,7 @@ impl AuthCacheState {
 			DBNonRootObject::File(file) => {
 				let mut remote_file = file.try_into()?;
 				self.client.restore_file(&mut remote_file).await?;
-				let remote_file = self.client.get_file(*remote_file.uuid()).await?;
+				let remote_file = self.client.get_file(remote_file.uuid()).await?;
 				let mut conn = self.conn();
 				let file = DBFile::upsert_from_remote(&mut conn, remote_file)?;
 				DBNonRootObject::File(file)
@@ -680,7 +680,7 @@ impl AuthCacheState {
 			DBNonRootObject::Dir(dir) => {
 				let mut remote_dir: RemoteDirectory = dir.into();
 				self.client.restore_dir(&mut remote_dir).await?;
-				let remote_dir = self.client.get_dir(*remote_dir.uuid()).await?;
+				let remote_dir = self.client.get_dir(remote_dir.uuid()).await?;
 				let mut conn = self.conn();
 				let dir = DBDir::upsert_from_remote(&mut conn, remote_dir)?;
 				DBNonRootObject::Dir(dir)
@@ -690,7 +690,7 @@ impl AuthCacheState {
 		if let Some((parent, parent_path)) = parent
 			&& object.certain_parent() != parent.uuid()
 		{
-			let new_path = parent_path.join(object.uuid().as_ref());
+			let new_path = parent_path.join(&object.uuid().to_string());
 			let item = self.inner_move_item(object, parent).await?;
 			return Ok(ObjectWithPathResponse {
 				object: DBObject::from(item).into(),
@@ -826,7 +826,7 @@ impl AuthCacheState {
 			Some(obj) => obj,
 			None => return Ok(()),
 		};
-		self.io_delete_local(&obj.uuid()).await?;
+		self.io_delete_local(obj.uuid()).await?;
 		Ok(())
 	}
 
@@ -834,7 +834,7 @@ impl AuthCacheState {
 		debug!("Clearing local cache for item with uuid: {uuid}");
 		let obj = match DBObject::select(
 			&self.conn(),
-			UuidStr::from_str(uuid)
+			Uuid::from_str(uuid)
 				.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?,
 		)
 		.optional()?
@@ -842,7 +842,7 @@ impl AuthCacheState {
 			Some(obj) => obj,
 			None => return Ok(()),
 		};
-		self.io_delete_local(&obj.uuid()).await?;
+		self.io_delete_local(obj.uuid()).await?;
 		Ok(())
 	}
 
@@ -880,16 +880,16 @@ impl AuthCacheState {
 				return Err(CacheError::remote("Cannot delete root directory"));
 			}
 			DBObject::Dir(dir) => {
-				self.io_delete_local(&dir.uuid).await?;
+				self.io_delete_local(dir.uuid).await?;
 				let remote_dir: RemoteDirectory = dir.into();
-				let uuid = *remote_dir.uuid();
+				let uuid = remote_dir.uuid();
 				self.client.delete_dir_permanently(remote_dir).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}
 			DBObject::File(file) => {
-				self.io_delete_local(&file.uuid).await?;
+				self.io_delete_local(file.uuid).await?;
 				let remote_file: RemoteFile = file.try_into()?;
-				let uuid = *remote_file.uuid();
+				let uuid = remote_file.uuid();
 				self.client.delete_file_permanently(remote_file).await?;
 				sql::delete_item(&self.conn(), uuid)?;
 			}

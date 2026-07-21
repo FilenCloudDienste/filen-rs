@@ -1,4 +1,4 @@
-INSERT INTO items (id, uuid, parent, local_data, type, is_recent)
+INSERT INTO items (id, uuid, parent, trashed, local_data, type, is_recent)
 VALUES (
 	-- Get existing id if item exists at target location
 	COALESCE(
@@ -13,12 +13,14 @@ VALUES (
 			LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 			WHERE
 				items.parent = ?2
+				AND items.trashed = FALSE
 				AND
 				(files_meta.name = ?3 OR dirs_meta.name = ?3)
 		)
 	),
 	?1, -- uuid
 	?2, -- parent
+	?6, -- trashed
 	COALESCE(
 		?4,
 		(
@@ -32,6 +34,7 @@ VALUES (
 			LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 			WHERE
 				items.parent = ?2
+				AND items.trashed = FALSE
 				AND
 				(files_meta.name = ?3 OR dirs_meta.name = ?3)
 		)
@@ -49,6 +52,7 @@ VALUES (
 			LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 			WHERE
 				items.parent = ?2
+				AND items.trashed = FALSE
 				AND
 				(files_meta.name = ?3 OR dirs_meta.name = ?3)
 		),
@@ -58,6 +62,7 @@ VALUES (
 ON CONFLICT (id) DO UPDATE SET
 	uuid = excluded.uuid,
 	parent = excluded.parent,
+	trashed = excluded.trashed,
 	local_data = excluded.local_data,
 	type = excluded.type,
 	is_recent = excluded.is_recent,

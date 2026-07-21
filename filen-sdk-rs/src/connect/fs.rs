@@ -10,7 +10,7 @@ use filen_types::{
 			out_root::{SharedRootDirOut, SharedRootFileOut},
 		},
 	},
-	fs::UuidStr,
+	fs::Uuid,
 	traits::CowHelpers,
 };
 use rsa::RsaPrivateKey;
@@ -69,7 +69,7 @@ pub struct SharedDirectory {
 }
 
 impl HasUUID for SharedDirectory {
-	fn uuid(&self) -> &UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.inner.uuid()
 	}
 }
@@ -115,8 +115,8 @@ impl HasParent for SharedDirectory {
 }
 
 pub(crate) struct DirInfo {
-	pub(crate) uuid: UuidStr,
-	pub(crate) parent: UuidStr,
+	pub(crate) uuid: Uuid,
+	pub(crate) parent: Uuid,
 	pub(crate) color: DirColor<'static>,
 	pub(crate) timestamp: DateTime<Utc>,
 	pub(crate) metadata: DirectoryMeta<'static>,
@@ -142,7 +142,7 @@ impl SharedDirectory {
 }
 
 struct RootDirInfo {
-	uuid: UuidStr,
+	uuid: Uuid,
 	color: DirColor<'static>,
 	timestamp: DateTime<Utc>,
 	metadata: DirectoryMeta<'static>,
@@ -235,7 +235,7 @@ impl SharedRootDirectory {
 }
 
 impl HasUUID for SharedRootDirectory {
-	fn uuid(&self) -> &UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.dir.uuid()
 	}
 }
@@ -286,7 +286,7 @@ pub struct SharedRootFile {
 }
 
 impl HasUUID for SharedRootFile {
-	fn uuid(&self) -> &UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.file.uuid()
 	}
 }

@@ -15,7 +15,7 @@ use filen_sdk_rs::{
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::{ParentUuid, UuidStr},
+	fs::{ParentUuid, Uuid},
 	traits::CowHelpers,
 };
 use rusqlite::{CachedStatement, Connection, Result};
@@ -160,7 +160,7 @@ impl From<FileMeta<'_>> for DBFileMeta {
 #[derive(Clone, PartialEq, Eq)]
 pub struct DBFile {
 	pub(crate) id: i64,
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 	pub(crate) parent: ParentUuid,
 	pub(crate) size: i64,
 	pub(crate) chunks: i64,
@@ -215,7 +215,7 @@ impl DBFile {
 		})
 	}
 
-	pub(crate) fn select(conn: &Connection, uuid: UuidStr) -> SQLResult<Self> {
+	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
 		match DBObject::select(conn, uuid)? {
 			DBObject::File(file) => Ok(file),
 			obj => Err(SQLError::UnexpectedType(obj.item_type(), ItemType::File)),
@@ -236,7 +236,7 @@ impl DBFile {
 	) -> Result<Self> {
 		trace!("Upserting remote file: {remote_file:?}");
 		let (id, local_data) = item::upsert_item_with_stmts(
-			*remote_file.uuid(),
+			remote_file.uuid(),
 			Some(*remote_file.parent()),
 			remote_file.name(),
 			None,
@@ -338,7 +338,7 @@ impl DBFile {
 }
 
 impl DBItemTrait for DBFile {
-	fn uuid(&self) -> UuidStr {
+	fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 
@@ -395,7 +395,7 @@ impl TryFrom<DBFile> for RemoteFile {
 
 impl PartialEq<RemoteFile> for DBFile {
 	fn eq(&self, other: &RemoteFile) -> bool {
-		self.uuid == *other.uuid()
+		self.uuid == other.uuid()
 			&& self.parent == *other.parent()
 			&& self.size as u64 == other.size()
 			&& self.chunks as u64 == other.chunks()

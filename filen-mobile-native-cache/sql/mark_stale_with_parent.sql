@@ -1,3 +1,3 @@
 UPDATE items
 SET is_stale = TRUE
-WHERE parent = ?;
+WHERE parent = ? AND trashed = FALSE;

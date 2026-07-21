@@ -5,7 +5,7 @@ use filen_types::{
 		FolderNamePairInfo, FolderSharedInfo, ItemFavoriteInfo, UserEvent, UserEventKind,
 	},
 	auth::FileEncryptionVersion,
-	fs::UuidStr,
+	fs::Uuid,
 	traits::CowHelpers,
 };
 
@@ -22,7 +22,7 @@ const DEFAULT_FILE_ENCRYPTION_VERSION: FileEncryptionVersion = FileEncryptionVer
 pub struct DecryptedUserEvent {
 	pub id: u64,
 	pub timestamp: DateTime<Utc>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub kind: DecryptedUserEventKind,
 }
 
@@ -486,7 +486,7 @@ pub struct UserEventRemovedSharedOutItemsInfo {
 pub struct UserEventFolderLinkEditedInfo {
 	pub ip: String,
 	pub user_agent: String,
-	pub link_uuid: UuidStr,
+	pub link_uuid: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

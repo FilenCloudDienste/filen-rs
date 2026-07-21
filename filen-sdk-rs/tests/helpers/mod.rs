@@ -24,11 +24,8 @@ use filen_sdk_rs::{
 	socket::DecryptedSocketEvent,
 };
 use filen_types::{
-	api::v3::dir::color::DirColor,
-	auth::FileEncryptionVersion,
-	crypto::EncryptedString,
-	fs::{ParentUuid, UuidStr},
-	traits::CowHelpersExt,
+	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
+	fs::ParentUuid, traits::CowHelpersExt,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
@@ -243,14 +240,14 @@ pub fn count_items(db_path: &Path) -> usize {
 }
 
 /// Build a synthetic RemoteFile with decoded metadata for testing ListDirRecursive.
-pub fn make_test_remote_file(name: &str, parent: &UuidStr) -> RemoteFile {
+pub fn make_test_remote_file(name: &str, parent: Uuid) -> RemoteFile {
 	let key_hex = "a".repeat(64);
 	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
 	let now = Utc::now();
 
 	RemoteFile::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
+		Uuid::new_v4(),
+		ParentUuid::Uuid(parent),
 		1024,
 		1,
 		"us-east-1",
@@ -271,11 +268,11 @@ pub fn make_test_remote_file(name: &str, parent: &UuidStr) -> RemoteFile {
 
 /// Build a synthetic RemoteFile with encrypted (un-decryptable) metadata. The conversion
 /// to `CacheableFile` should fail because the meta is not in the `Decoded` variant.
-pub fn make_test_remote_file_encrypted_meta(parent: &UuidStr) -> RemoteFile {
+pub fn make_test_remote_file_encrypted_meta(parent: Uuid) -> RemoteFile {
 	let now = Utc::now();
 	RemoteFile::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
+		Uuid::new_v4(),
+		ParentUuid::Uuid(parent),
 		1024,
 		1,
 		"us-east-1",
@@ -293,8 +290,8 @@ pub fn make_test_remote_file_bad_parent(name: &str) -> RemoteFile {
 	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
 	let now = Utc::now();
 	RemoteFile::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Trash,
+		Uuid::new_v4(),
+		ParentUuid::Trash(Uuid::nil()),
 		1024,
 		1,
 		"us-east-1",
@@ -314,11 +311,11 @@ pub fn make_test_remote_file_bad_parent(name: &str) -> RemoteFile {
 }
 
 /// Build a synthetic RemoteDirectory with encrypted (un-decryptable) metadata.
-pub fn make_test_remote_dir_encrypted_meta(parent: &UuidStr) -> RemoteDirectory {
+pub fn make_test_remote_dir_encrypted_meta(parent: Uuid) -> RemoteDirectory {
 	let now = Utc::now();
 	RemoteDirectory::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
+		Uuid::new_v4(),
+		ParentUuid::Uuid(parent),
 		DirColor::Default,
 		false,
 		now,
@@ -330,8 +327,8 @@ pub fn make_test_remote_dir_encrypted_meta(parent: &UuidStr) -> RemoteDirectory 
 pub fn make_test_remote_dir_bad_parent(name: &str) -> RemoteDirectory {
 	let now = Utc::now();
 	RemoteDirectory::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Trash,
+		Uuid::new_v4(),
+		ParentUuid::Trash(Uuid::nil()),
 		DirColor::Default,
 		false,
 		now,
@@ -343,12 +340,12 @@ pub fn make_test_remote_dir_bad_parent(name: &str) -> RemoteDirectory {
 }
 
 /// Build a synthetic RemoteDirectory with decoded metadata for testing ListDirRecursive.
-pub fn make_test_remote_dir(name: &str, parent: &UuidStr) -> RemoteDirectory {
+pub fn make_test_remote_dir(name: &str, parent: Uuid) -> RemoteDirectory {
 	let now = Utc::now();
 
 	RemoteDirectory::from_meta(
-		UuidStr::new_v4(),
-		ParentUuid::Uuid(*parent),
+		Uuid::new_v4(),
+		ParentUuid::Uuid(parent),
 		DirColor::Default,
 		false,
 		now,

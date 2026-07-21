@@ -24,7 +24,10 @@ use filen_sdk_rs::{
 	},
 	io::{FilenMetaExt, client_impl::IoSharedClientExt},
 };
-use filen_types::{crypto::Blake3Hash, fs::UuidStr};
+use filen_types::{
+	crypto::Blake3Hash,
+	fs::{Uuid, UuidStr},
+};
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{fs::DirEntry, sync::mpsc::UnboundedReceiver};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -123,7 +126,7 @@ impl AuthCacheState {
 	}
 
 	pub(crate) fn get_cached_file_path(&self, file: &RemoteFile) -> PathBuf {
-		self.get_cached_file_path_from_name(file.uuid().as_ref(), file.name())
+		self.get_cached_file_path_from_name(&file.uuid().to_string(), file.name())
 	}
 
 	pub async fn download_file_io(
@@ -131,7 +134,7 @@ impl AuthCacheState {
 		file: &RemoteFile,
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<PathBuf, io::Error> {
-		let src = self.tmp_dir.join(file.uuid().as_ref());
+		let src = self.tmp_dir.join(file.uuid().to_string());
 		let mut os_file = tokio::fs::File::create(&src).await?.compat_write();
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u64>();
 		let file_size = file.size();
@@ -171,10 +174,10 @@ impl AuthCacheState {
 
 	pub async fn hash_local_file(
 		&self,
-		file_uuid: &UuidStr,
+		file_uuid: Uuid,
 		file_name: Option<&str>,
 	) -> Result<Option<Blake3Hash>, io::Error> {
-		let path = self.get_cached_file_path_from_name(file_uuid.as_ref(), file_name);
+		let path = self.get_cached_file_path_from_name(&file_uuid.to_string(), file_name);
 		tokio::task::spawn_blocking(move || {
 			let mut hasher = blake3::Hasher::new();
 			match hasher.update_mmap_rayon(&path) {
@@ -218,7 +221,7 @@ impl AuthCacheState {
 		&self,
 		old_uuid: &str,
 		name: String,
-		parent_uuid: UuidStr,
+		parent_uuid: Uuid,
 		mime: String,
 		callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<RemoteFile, FilenSdkError> {
@@ -252,8 +255,8 @@ impl AuthCacheState {
 		&self,
 		builder: FileBuilderOptionalName,
 	) -> Result<(RemoteFile, PathBuf), FilenSdkError> {
-		let target_path =
-			self.get_cached_file_path_from_name(builder.get_uuid().as_ref(), builder.get_name());
+		let target_path = self
+			.get_cached_file_path_from_name(&builder.get_uuid().to_string(), builder.get_name());
 		let parent_path = target_path
 			.parent()
 			.expect("cached file path should always have a parent");
@@ -271,8 +274,8 @@ impl AuthCacheState {
 		Ok((file, target_path))
 	}
 
-	pub(crate) async fn io_delete_local(&self, uuid: &UuidStr) -> Result<(), io::Error> {
-		let path = self.cache_dir.join(uuid.as_ref());
+	pub(crate) async fn io_delete_local(&self, uuid: Uuid) -> Result<(), io::Error> {
+		let path = self.cache_dir.join(uuid.to_string());
 		if let Err(e) = match tokio::fs::metadata(&path).await {
 			Ok(meta) => {
 				if meta.is_dir() {

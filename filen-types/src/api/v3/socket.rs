@@ -19,7 +19,7 @@ use crate::{
 	},
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::{ObjectType, ParentUuid, UuidStr},
+	fs::{ObjectType, ParentUuid, Uuid},
 	serde::cow::CowStrWrapper,
 	traits::CowHelpers,
 };
@@ -638,7 +638,7 @@ const TS_SOCKET_EVENT_TYPE: &str =
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct NewEvent<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "type")]
 	#[serde(borrow)]
 	pub event_type: Cow<'a, str>,
@@ -651,7 +651,7 @@ pub struct NewEvent<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FileRename<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 }
@@ -660,9 +660,9 @@ pub struct FileRename<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct FileArchiveRestored<'a> {
 	#[serde(rename = "currentUUID")]
-	pub current_uuid: UuidStr,
+	pub current_uuid: Uuid,
 	pub parent: ParentUuid,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	// #[serde(borrow)]
@@ -686,7 +686,7 @@ pub struct FileArchiveRestored<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct FileNew<'a> {
 	pub parent: ParentUuid,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	// #[serde(borrow)]
@@ -710,7 +710,7 @@ pub struct FileNew<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct FileRestore<'a> {
 	pub parent: ParentUuid,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	// #[serde(borrow)]
@@ -734,7 +734,7 @@ pub struct FileRestore<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct FileMove<'a> {
 	pub parent: ParentUuid,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	// #[serde(borrow)]
@@ -767,7 +767,7 @@ pub struct FileMove<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileTrash {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -783,7 +783,7 @@ pub struct FileTrash {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileArchived {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
@@ -791,7 +791,7 @@ pub struct FileArchived {
 pub struct FolderRename<'a> {
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -807,8 +807,8 @@ pub struct FolderRename<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FolderTrash {
-	pub parent: UuidStr,
-	pub uuid: UuidStr,
+	pub parent: Uuid,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
@@ -816,7 +816,7 @@ pub struct FolderTrash {
 pub struct FolderMove<'a> {
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
@@ -829,7 +829,7 @@ pub struct FolderMove<'a> {
 pub struct FolderSubCreated<'a> {
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
@@ -842,7 +842,7 @@ pub struct FolderSubCreated<'a> {
 pub struct FolderRestore<'a> {
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	pub parent: ParentUuid,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
@@ -853,7 +853,7 @@ pub struct FolderRestore<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderColorChanged<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub color: DirColor<'a>,
 }
@@ -862,7 +862,7 @@ pub struct FolderColorChanged<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessageNew<'a> {
 	#[serde(rename = "conversation")]
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	#[serde(flatten, borrow)]
 	pub inner: ChatMessagePartialEncrypted<'a>,
 	#[serde(
@@ -905,7 +905,7 @@ impl<'a> From<ChatMessageNew<'a>> for ChatMessageEncrypted<'a> {
 )]
 pub struct ChatTyping<'a> {
 	#[serde(rename = "conversation")]
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	#[serde(borrow)]
 	pub sender_avatar: Option<Cow<'a, str>>,
 	#[serde(borrow)]
@@ -931,7 +931,7 @@ pub struct ChatTyping<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatConversationsNew<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -955,13 +955,13 @@ pub struct ChatConversationsNew<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatMessageDelete {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteContentEdited<'a> {
-	pub note: UuidStr,
+	pub note: Uuid,
 	#[serde(borrow)]
 	pub content: EncryptedString<'a>,
 	#[serde(rename = "type")]
@@ -987,7 +987,7 @@ pub struct NoteContentEdited<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteArchived {
-	pub note: UuidStr,
+	pub note: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -1003,13 +1003,13 @@ pub struct NoteArchived {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteDeleted {
-	pub note: UuidStr,
+	pub note: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteTitleEdited<'a> {
-	pub note: UuidStr,
+	pub note: Uuid,
 	#[serde(borrow)]
 	pub title: EncryptedString<'a>,
 	#[serde(borrow)]
@@ -1029,7 +1029,7 @@ pub struct NoteTitleEdited<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteParticipantPermissions {
-	pub note: UuidStr,
+	pub note: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	pub permissions_write: bool,
@@ -1048,7 +1048,7 @@ pub struct NoteParticipantPermissions {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteRestored {
-	pub note: UuidStr,
+	pub note: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -1064,7 +1064,7 @@ pub struct NoteRestored {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct NoteParticipantRemoved {
-	pub note: UuidStr,
+	pub note: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 }
@@ -1072,7 +1072,7 @@ pub struct NoteParticipantRemoved {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteParticipantNew<'a> {
-	pub note: UuidStr,
+	pub note: Uuid,
 	#[serde(flatten, borrow)]
 	pub participant: NoteParticipant<'a>,
 }
@@ -1080,7 +1080,7 @@ pub struct NoteParticipantNew<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteNew<'a> {
-	pub note: UuidStr,
+	pub note: Uuid,
 	#[serde(borrow)]
 	pub title: EncryptedString<'a>,
 }
@@ -1098,7 +1098,7 @@ pub struct NoteNew<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatMessageEmbedDisabled {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -1114,7 +1114,7 @@ pub struct ChatMessageEmbedDisabled {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatConversationParticipantLeft {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 }
@@ -1132,15 +1132,15 @@ pub struct ChatConversationParticipantLeft {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ChatConversationDeleted {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessageEdited<'a> {
 	#[serde(rename = "conversation")]
-	pub chat: UuidStr,
-	pub uuid: UuidStr,
+	pub chat: Uuid,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub message: EncryptedString<'a>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -1151,7 +1151,7 @@ pub struct ChatMessageEdited<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatConversationNameEdited<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
 	#[serde(borrow)]
@@ -1161,7 +1161,7 @@ pub struct ChatConversationNameEdited<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactRequestReceived<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub sender_id: u64,
 	#[serde(borrow)]
@@ -1177,7 +1177,7 @@ pub struct ContactRequestReceived<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemFavorite<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(rename = "type")]
 	pub item_type: ObjectType,
 	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
@@ -1206,7 +1206,7 @@ pub struct ItemFavorite<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct ChatConversationParticipantNew<'a> {
 	#[serde(rename = "conversation")]
-	pub chat: UuidStr,
+	pub chat: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub user_id: u64,
 	#[serde(borrow)]
@@ -1236,13 +1236,13 @@ pub struct ChatConversationParticipantNew<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileDeletedPermanent {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderMetadataChanged<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow, rename = "name")]
 	pub meta: EncryptedString<'a>,
 }
@@ -1250,7 +1250,7 @@ pub struct FolderMetadataChanged<'a> {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadataChanged<'a> {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
 	#[serde(borrow)]
@@ -1272,7 +1272,7 @@ pub struct FileMetadataChanged<'a> {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FolderDeletedPermanent {
-	pub uuid: UuidStr,
+	pub uuid: Uuid,
 }
 
 #[cfg(test)]

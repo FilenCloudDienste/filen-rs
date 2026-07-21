@@ -143,7 +143,7 @@ impl TryFrom<RemoteFile> for CacheableFile<'static> {
 
 	fn try_from(mut value: RemoteFile) -> Result<Self, Self::Error> {
 		let parent = match value.parent {
-			ParentUuid::Uuid(uuid) => (&uuid).into(),
+			ParentUuid::Uuid(uuid) => uuid,
 			other => {
 				return Err((value, CacheableConversionError::ParentNotUuid(other)));
 			}
@@ -159,7 +159,7 @@ impl TryFrom<RemoteFile> for CacheableFile<'static> {
 		};
 
 		Ok(Self {
-			uuid: (&value.uuid).into(),
+			uuid: value.uuid,
 			parent,
 			chunks_size: value.size,
 			chunks: value.chunks,
@@ -193,9 +193,9 @@ impl<'a> TryFrom<&'a RemoteFile> for CacheableFile<'a> {
 		};
 
 		Ok(Self {
-			uuid: (&value.uuid).into(),
+			uuid: value.uuid,
 			parent: match value.parent {
-				ParentUuid::Uuid(uuid) => (&uuid).into(),
+				ParentUuid::Uuid(uuid) => uuid,
 				other => {
 					return Err(CacheableConversionError::ParentNotUuid(other));
 				}
@@ -220,8 +220,8 @@ impl<'a> TryFrom<&'a RemoteFile> for CacheableFile<'a> {
 impl From<CacheableFile<'static>> for RemoteFile {
 	fn from(value: CacheableFile<'static>) -> Self {
 		Self {
-			uuid: (&value.uuid).into(),
-			parent: ParentUuid::Uuid((&value.parent).into()),
+			uuid: value.uuid,
+			parent: ParentUuid::Uuid(value.parent),
 			chunks: value.chunks,
 			size: value.chunks_size,
 			favorited: value.favorited,
@@ -277,7 +277,7 @@ impl<'a> TryFrom<&'a FileVersion> for CacheableFileVersion<'a> {
 		};
 
 		Ok(Self {
-			uuid: (&value.uuid).into(),
+			uuid: value.uuid,
 			chunks_size: value.size,
 			chunks: value.chunks,
 			region: Cow::Borrowed(&value.region),
@@ -297,7 +297,7 @@ impl<'a> TryFrom<&'a FileVersion> for CacheableFileVersion<'a> {
 impl From<CacheableFileVersion<'static>> for FileVersion {
 	fn from(value: CacheableFileVersion<'static>) -> Self {
 		Self {
-			uuid: (&value.uuid).into(),
+			uuid: value.uuid,
 			chunks: value.chunks,
 			size: value.chunks_size,
 			region: value.region.into_owned(),

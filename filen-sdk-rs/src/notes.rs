@@ -8,7 +8,7 @@ use filen_types::{
 		notes::{NoteType, participants::add::ContactUuid},
 	},
 	crypto::EncryptedString,
-	fs::UuidStr,
+	fs::Uuid,
 };
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
@@ -30,7 +30,7 @@ use crypto::*;
 
 #[js_type(import, export)]
 pub struct NoteTag {
-	uuid: UuidStr,
+	uuid: Uuid,
 	// none if decryption fails
 	#[cfg_attr(
 		feature = "wasm-full",
@@ -134,7 +134,7 @@ impl NoteParticipant {
 
 #[js_type(import, export)]
 pub struct Note {
-	uuid: UuidStr,
+	uuid: Uuid,
 	owner_id: u64,
 	last_editor_id: u64,
 	favorite: bool,
@@ -180,7 +180,7 @@ pub struct Note {
 }
 
 impl Note {
-	pub fn uuid(&self) -> &UuidStr {
+	pub fn uuid(&self) -> &Uuid {
 		&self.uuid
 	}
 
@@ -333,7 +333,7 @@ pub(crate) mod crypto {
 impl Client {
 	pub async fn is_shared(
 		&self,
-		uuid: UuidStr,
+		uuid: Uuid,
 	) -> Result<api::v3::item::shared::Response<'static>, Error> {
 		api::v3::item::shared::post(self.client(), &api::v3::item::shared::Request { uuid }).await
 	}
@@ -511,7 +511,7 @@ impl Client {
 
 	pub async fn set_note_participant_permission(
 		&self,
-		note_uuid: UuidStr,
+		note_uuid: Uuid,
 		participant: &mut NoteParticipant,
 		write: bool,
 	) -> Result<(), Error> {
@@ -530,7 +530,7 @@ impl Client {
 		Ok(())
 	}
 
-	pub async fn get_note(&self, uuid: UuidStr) -> Result<Option<Note>, Error> {
+	pub async fn get_note(&self, uuid: Uuid) -> Result<Option<Note>, Error> {
 		// I hate this
 		self.list_notes()
 			.await
@@ -538,7 +538,7 @@ impl Client {
 	}
 
 	pub async fn create_note(&self, title: Option<String>) -> Result<Note, Error> {
-		let uuid = UuidStr::new_v4();
+		let uuid = Uuid::new_v4();
 		let title = title.unwrap_or_else(|| Utc::now().format("%a %b %d %Y %X").to_string());
 		let key = NoteOrChatKey::generate();
 
@@ -1106,7 +1106,7 @@ pub mod js_impls {
 		) -> Result<NoteParticipant, Error> {
 			let this = self.inner();
 			do_on_commander(move || async move {
-				this.set_note_participant_permission(note_uuid, &mut participant, write)
+				this.set_note_participant_permission(note_uuid.into(), &mut participant, write)
 					.await?;
 				Ok(participant)
 			})
@@ -1119,7 +1119,7 @@ pub mod js_impls {
 		)]
 		pub async fn get_note(&self, note_uuid: UuidStr) -> Result<Option<Note>, Error> {
 			let this = self.inner();
-			do_on_commander(move || async move { this.get_note(note_uuid).await }).await
+			do_on_commander(move || async move { this.get_note(note_uuid.into()).await }).await
 		}
 
 		#[cfg_attr(

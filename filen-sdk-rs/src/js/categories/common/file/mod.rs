@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::fs::{ParentUuid, UuidStr};
+use filen_types::fs::{ParentUuid, Uuid};
 
 pub(crate) mod meta;
 pub(crate) mod version;
@@ -13,7 +13,7 @@ use crate::{
 
 #[js_type(import, export, wasm_all)]
 pub struct File {
-	pub(crate) uuid: UuidStr,
+	pub(crate) uuid: Uuid,
 	pub(crate) meta: FileMeta,
 
 	parent: ParentUuid,

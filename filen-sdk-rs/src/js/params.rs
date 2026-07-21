@@ -89,7 +89,7 @@ impl TryFrom<FileBuilderParamsOptionalName> for FileBuilderOptionalName {
 	fn try_from(params: FileBuilderParamsOptionalName) -> Result<Self, Self::Error> {
 		let dir = DirType::<Normal>::from(params.parent);
 
-		let mut builder = FileBuilderOptionalName::new(*dir.uuid());
+		let mut builder = FileBuilderOptionalName::new(dir.uuid());
 		if let Some(name) = params.name {
 			builder.name(&name)?;
 		}
@@ -126,7 +126,7 @@ impl FileBuilderParams {
 	pub(crate) fn into_file_builder(self, client: &Client) -> Result<FileBuilder, Error> {
 		let mut file_builder = client.make_file_builder(
 			&self.name,
-			*DirType::<'static, Normal>::from(self.parent).uuid(),
+			DirType::<'static, Normal>::from(self.parent).uuid(),
 		)?;
 		if let Some(mime) = self.mime {
 			file_builder = file_builder.mime(mime);
