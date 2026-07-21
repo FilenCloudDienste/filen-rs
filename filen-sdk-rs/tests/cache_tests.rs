@@ -309,6 +309,13 @@ async fn test_cache_list_dir_recursive() {
 	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
+	// Injected synthetic items are absent-from-server fiction: wait for the initial populate
+	// resync to converge FIRST, or its convergence diff correctly wipes them mid-test.
+	assert!(
+		wait_for_converged_resync(&cache.messages, test_dir_uuid, 0, CACHE_CONVERGE_TIMEOUT).await,
+		"the initial populate resync should converge before synthetic injection"
+	);
+
 	let dirs: Vec<RemoteDirectory> = (0..3)
 		.map(|i| make_test_remote_dir(&format!("ldr_dir_{i}"), test_dir_uuid))
 		.collect();
@@ -352,6 +359,12 @@ async fn test_cache_list_dir_recursive_large_batch() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
+
+	// See test_cache_list_dir_recursive: converge the populate resync before injecting fiction.
+	assert!(
+		wait_for_converged_resync(&cache.messages, test_dir_uuid, 0, CACHE_CONVERGE_TIMEOUT).await,
+		"the initial populate resync should converge before synthetic injection"
+	);
 
 	let dirs: Vec<RemoteDirectory> = (0..50)
 		.map(|i| make_test_remote_dir(&format!("ldr_batch_dir_{i}"), test_dir_uuid))
@@ -651,6 +664,12 @@ async fn test_cache_ignores_irrelevant_events() {
 	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
 
+	// See test_cache_list_dir_recursive: converge the populate resync before injecting fiction.
+	assert!(
+		wait_for_converged_resync(&cache.messages, test_dir_uuid, 0, CACHE_CONVERGE_TIMEOUT).await,
+		"the initial populate resync should converge before synthetic injection"
+	);
+
 	let dir = make_test_remote_dir("irrelevant_test_dir", test_dir_uuid);
 	let dir_uuid: Uuid = dir.uuid();
 	cache
@@ -720,6 +739,13 @@ async fn test_cache_mixed_socket_and_manual_events() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
+
+	// See test_cache_list_dir_recursive: converge the populate resync before injecting fiction.
+	assert!(
+		wait_for_converged_resync(&cache.messages, test_dir.uuid(), 0, CACHE_CONVERGE_TIMEOUT)
+			.await,
+		"the initial populate resync should converge before synthetic injection"
+	);
 
 	let file = client
 		.make_file_builder("cache_mixed_socket.txt", test_dir.uuid())
@@ -1198,6 +1224,13 @@ async fn test_cache_partial_success_with_mixed_good_and_bad_items() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	let test_dir_uuid = resources.dir.uuid();
+
+	// Injected synthetic items are absent-from-server fiction: wait for the initial populate
+	// resync to converge FIRST, or its convergence diff correctly wipes them mid-test.
+	assert!(
+		wait_for_converged_resync(&cache.messages, test_dir_uuid, 0, CACHE_CONVERGE_TIMEOUT).await,
+		"the initial populate resync should converge before synthetic injection"
+	);
 
 	// Two good dirs, two bad dirs (one encrypted, one bad parent)
 	let good_dirs: Vec<RemoteDirectory> = (0..2)
