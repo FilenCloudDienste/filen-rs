@@ -603,10 +603,17 @@ pub async fn test_download_file_after_remote_replace() {
 
 	// The very next open must serve the new bytes — no parent listing in between.
 	let downloaded_path = db
-		.download_file_if_changed_by_path(file_path, None)
+		.download_file_if_changed_by_path(file_path.clone(), None)
 		.await
 		.unwrap();
 	assert_eq!(std::fs::read(&downloaded_path).unwrap(), new_content);
+
+	// The recovery must also self-heal the cached row to the new uuid, so later opens take
+	// the clean SameFile path instead of re-running the NotFound fallback every time.
+	match db.query_item(&file_path).unwrap() {
+		Some(FfiObject::File(f)) => assert_eq!(f.uuid, new_file.uuid().to_string()),
+		other => panic!("expected cached file row after replace recovery, got {other:?}"),
+	}
 
 	std::fs::remove_file(&downloaded_path).ok();
 }

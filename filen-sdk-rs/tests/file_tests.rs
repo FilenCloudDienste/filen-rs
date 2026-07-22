@@ -329,6 +329,13 @@ async fn get_trashed_file() {
 	let client = &resouces.client;
 	let test_dir = &resouces.dir;
 
+	// guard against a concurrent file_trash_empty: empty_trash() is account-global and would
+	// permanently delete this file between the trash and the asserts below
+	let _lock = client
+		.acquire_lock_with_default("test:rs:trash")
+		.await
+		.unwrap();
+
 	let file = client
 		.make_file_builder("file.txt", test_dir.uuid())
 		.unwrap();
@@ -354,6 +361,14 @@ async fn get_replaced_file() {
 	let resouces = test_utils::RESOURCES.get_resources().await;
 	let client = &resouces.client;
 	let test_dir = &resouces.dir;
+
+	// replace-archives-a-version semantics require account-wide versioning to be ON; don't
+	// rely on ambient state (user_tests pins the versioning-off behavior)
+	let _version_lock = client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	client.set_versioning_enabled(true).await.unwrap();
 
 	let file = client
 		.make_file_builder("replaced.txt", test_dir.uuid())
