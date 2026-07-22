@@ -11,6 +11,7 @@ use crate::{
 		v2::{MasterKey, V2Key},
 		v3::EncryptionKey,
 	},
+	fs::meta_recovery,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,13 +148,36 @@ where
 			return Ok(T::Owned::default());
 		}
 
-		let decrypted = crypter.blocking_decrypt_meta(encrypted).map_err(|e| {
-			Error::custom_with_source(ErrorKind::Response, e, Some("decrypt note title"))
-		})?;
+		let decrypted = match crypter.blocking_decrypt_meta_into(encrypted, Vec::new()) {
+			Ok(decrypted) => decrypted,
+			// non-UTF-8 plaintext is Latin-1 from clients that skip UTF-8
+			// encoding; the mapping is lossless (see fs::meta_recovery)
+			Err((super::error::ConversionError::ToStrError(_), bytes)) => {
+				meta_recovery::latin1_to_string(&bytes)
+			}
+			Err((e, _)) => {
+				return Err(Error::custom_with_source(
+					ErrorKind::Response,
+					e,
+					Some("decrypt note title"),
+				));
+			}
+		};
 
-		let carrier: Self::WithLifetime<'_> = serde_json::from_str(&decrypted)?;
-		let out_string = Self::into_inner(carrier);
-		Ok(out_string)
+		match serde_json::from_str::<Self::WithLifetime<'_>>(&decrypted) {
+			Ok(carrier) => Ok(Self::into_inner(carrier)),
+			Err(e) => {
+				// JS clients JSON.stringify unpaired surrogates as lone \udXXX
+				// escapes, which JSON.parse accepts but serde_json rejects
+				if let Some(sanitized) =
+					meta_recovery::replace_unpaired_surrogate_escapes(&decrypted)
+					&& let Ok(carrier) = serde_json::from_str::<Self::WithLifetime<'_>>(&sanitized)
+				{
+					return Ok(Self::into_inner(carrier));
+				}
+				Err(e.into())
+			}
+		}
 	}
 
 	fn blocking_encrypt(crypter: &impl MetaCrypter, inner: &T) -> EncryptedString<'static> {
@@ -240,5 +264,99 @@ impl NoteOrChatKeyStruct<'_> {
 		};
 		let key_string = serde_json::to_string(&key_struct).expect("Failed to serialize note key");
 		crypter.blocking_encrypt_meta(&key_string)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+	use base64::{Engine, prelude::BASE64_STANDARD};
+	use hmac::Hmac;
+	use sha2::Sha512;
+
+	use super::*;
+	use crate::{
+		chats::crypto::ChatMessage,
+		notes::crypto::{NoteContent, NotePreview, NoteTitle},
+	};
+
+	const V2_KEY: &str = "abcdefghijklmnopqrstuvwxyzABCDEF";
+
+	fn v2_key() -> NoteOrChatKey {
+		NoteOrChatKey::from_cow_str(Cow::Borrowed(V2_KEY)).unwrap()
+	}
+
+	#[test]
+	fn lone_surrogate_note_preview_recovers_to_replacement_char() {
+		let key = v2_key();
+		let encrypted = key.blocking_encrypt_meta(r#"{"preview":"a\ud83d"}"#);
+		assert_eq!(
+			NotePreview::blocking_try_decrypt(&key, &encrypted).unwrap(),
+			"a\u{FFFD}"
+		);
+	}
+
+	#[test]
+	fn paired_surrogate_note_preview_decrypts_losslessly() {
+		let key = v2_key();
+		let encrypted = key.blocking_encrypt_meta(r#"{"preview":"a😀"}"#);
+		assert_eq!(
+			NotePreview::blocking_try_decrypt(&key, &encrypted).unwrap(),
+			"a😀"
+		);
+	}
+
+	#[test]
+	fn lone_surrogate_chat_message_recovers_to_replacement_char() {
+		let key = v2_key();
+		let encrypted = key.blocking_encrypt_meta(r#"{"message":"hi \udc00"}"#);
+		assert_eq!(
+			ChatMessage::blocking_try_decrypt(&key, &encrypted).unwrap(),
+			"hi \u{FFFD}"
+		);
+	}
+
+	#[test]
+	fn lone_surrogate_note_title_recovers_with_v3_key() {
+		let key = NoteOrChatKey::from_cow_str(Cow::Borrowed(
+			"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+		))
+		.unwrap();
+		let encrypted = key.blocking_encrypt_meta(r#"{"title":"\ud800"}"#);
+		assert_eq!(
+			NoteTitle::blocking_try_decrypt(&key, &encrypted).unwrap(),
+			"\u{FFFD}"
+		);
+	}
+
+	#[test]
+	fn latin1_note_content_recovers_original_text() {
+		// encrypts `{"content":"café"}` truncated to one byte per code point,
+		// the way clients that skip UTF-8 encoding produce it
+		let mut derived_key = [0u8; 32];
+		pbkdf2::pbkdf2::<Hmac<Sha512>>(V2_KEY.as_bytes(), V2_KEY.as_bytes(), 1, &mut derived_key)
+			.unwrap();
+		let nonce = b"012345678901";
+		let plaintext = b"{\"content\":\"caf\xe9\"}";
+		let ciphertext = Aes256Gcm::new_from_slice(&derived_key)
+			.unwrap()
+			.encrypt(Nonce::from_slice(nonce), plaintext.as_slice())
+			.unwrap();
+		let meta = EncryptedString(Cow::Owned(format!(
+			"002{}{}",
+			std::str::from_utf8(nonce).unwrap(),
+			BASE64_STANDARD.encode(&ciphertext)
+		)));
+		assert_eq!(
+			NoteContent::blocking_try_decrypt(&v2_key(), &meta).unwrap(),
+			"café"
+		);
+	}
+
+	#[test]
+	fn invalid_json_still_errors() {
+		let key = v2_key();
+		let encrypted = key.blocking_encrypt_meta("not json");
+		assert!(NotePreview::blocking_try_decrypt(&key, &encrypted).is_err());
 	}
 }
