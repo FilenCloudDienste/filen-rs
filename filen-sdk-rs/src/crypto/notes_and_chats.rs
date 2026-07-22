@@ -359,4 +359,37 @@ mod tests {
 		let encrypted = key.blocking_encrypt_meta("not json");
 		assert!(NotePreview::blocking_try_decrypt(&key, &encrypted).is_err());
 	}
+
+	#[test]
+	fn escaped_surrogate_pair_decrypts_losslessly() {
+		let key = v2_key();
+		let encrypted = key.blocking_encrypt_meta(r#"{"preview":"a\ud83d\ude00"}"#);
+		assert_eq!(
+			NotePreview::blocking_try_decrypt(&key, &encrypted).unwrap(),
+			"a😀"
+		);
+	}
+
+	#[test]
+	fn empty_ciphertext_decrypts_to_default() {
+		assert_eq!(
+			NotePreview::blocking_try_decrypt(&v2_key(), &EncryptedString(Cow::Borrowed("")))
+				.unwrap(),
+			""
+		);
+	}
+
+	#[test]
+	fn tampered_ciphertext_errors_instead_of_recovering() {
+		let key = v2_key();
+		let encrypted = key.blocking_encrypt_meta(r#"{"preview":"a"}"#);
+		let mut tampered = encrypted.0.into_owned();
+		let flipped = if tampered.ends_with('A') { 'B' } else { 'A' };
+		tampered.pop();
+		tampered.push(flipped);
+		assert!(
+			NotePreview::blocking_try_decrypt(&key, &EncryptedString(Cow::Owned(tampered)))
+				.is_err()
+		);
+	}
 }
