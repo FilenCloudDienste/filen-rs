@@ -5,6 +5,7 @@ use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, Uuid};
 use filen_types::traits::CowHelpers;
 
+use crate::error::ResultExt;
 use crate::{
 	api,
 	auth::Client,
@@ -105,13 +106,15 @@ impl Client {
 	pub async fn get_dir(&self, uuid: Uuid) -> Result<RemoteDirectory, Error> {
 		let response = api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid }).await?;
 
-		Ok(do_cpu_intensive(|| {
-			RemoteDirectory::blocking_from_encrypted(
+		do_cpu_intensive(|| {
+			Ok(RemoteDirectory::blocking_from_encrypted(
 				uuid,
 				// v3 api returns the original parent as the parent if the file is in the trash;
 				// keep it as the remembered original parent instead of discarding it.
 				if response.trash {
-					ParentUuid::Trash(Uuid::try_from(response.parent).unwrap_or_default())
+					ParentUuid::Trash(
+						Uuid::try_from(response.parent).context("getting trashed dir")?,
+					)
 				} else {
 					response.parent
 				},
@@ -120,9 +123,9 @@ impl Client {
 				response.timestamp,
 				response.metadata,
 				&*self.crypter(),
-			)
+			))
 		})
-		.await)
+		.await
 	}
 
 	pub async fn dir_exists(
@@ -235,7 +238,9 @@ impl Client {
 		)
 		.await?;
 		// Remember the original parent so the trashed dir knows where it came from.
-		dir.parent = ParentUuid::Trash(Uuid::try_from(dir.parent).unwrap_or_default());
+		dir.parent = ParentUuid::Trash(
+			Uuid::try_from(dir.parent).context("setting parent when trashing dir")?,
+		);
 		Ok(())
 	}
 

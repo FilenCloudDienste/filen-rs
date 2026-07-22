@@ -13,7 +13,7 @@ use crate::{
 	auth::{Client, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	crypto::{error::ConversionError, shared::MetaCrypter},
-	error::{Error, MetadataWasNotDecryptedError},
+	error::{Error, MetadataWasNotDecryptedError, ResultExt},
 	fs::{
 		HasUUID,
 		categories::{DirType, Normal},
@@ -79,7 +79,9 @@ impl Client {
 		)
 		.await?;
 		// Remember the original parent so the trashed file knows where it came from.
-		file.parent = ParentUuid::Trash(Uuid::try_from(file.parent).unwrap_or_default());
+		file.parent = ParentUuid::Trash(
+			Uuid::try_from(file.parent).context("setting parent when trashing file")?,
+		);
 		Ok(())
 	}
 
@@ -188,7 +190,7 @@ impl Client {
 			// v3 api returns the original parent as the parent if the file is in the trash;
 			// keep it as the remembered original parent instead of discarding it.
 			if response.trash {
-				ParentUuid::Trash(Uuid::try_from(response.parent).unwrap_or_default())
+				ParentUuid::Trash(Uuid::try_from(response.parent).context("getting trashed file")?)
 			} else {
 				response.parent
 			},
