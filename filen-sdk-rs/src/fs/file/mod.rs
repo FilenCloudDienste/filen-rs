@@ -701,6 +701,17 @@ pub(crate) fn make_mime(name: &str, mime: Option<String>) -> String {
 	)
 }
 
+/// A [`RemoteFile`] plus the extra state flags v3/file reports about it.
+///
+/// `versioned` is the only way to tell that a resolvable uuid has been superseded by a
+/// same-name re-upload: the archived object keeps resolving byte-identical (parent
+/// unchanged, not trashed), so nothing on [`RemoteFile`] itself can express it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWithInfo {
+	pub file: RemoteFile,
+	pub versioned: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileVersion {
 	pub(crate) bucket: String,

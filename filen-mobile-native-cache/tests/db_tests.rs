@@ -561,6 +561,56 @@ pub async fn test_download_file() {
 	std::fs::remove_file(&downloaded_path).ok();
 }
 
+// The stale-read regression (KeePassDX reload): a remote same-name re-upload retires the cached
+// uuid, but the retired uuid keeps resolving byte-identical as an archived version, so a
+// uuid-keyed freshness check alone serves the stale cached bytes until an unrelated parent
+// re-list. The v3/file `versioned` flag must force name-based re-resolution and a fresh
+// download on the very next open.
+#[shared_test_runtime]
+pub async fn test_download_file_after_remote_replace() {
+	let (db, rss) = get_db_resources().await;
+
+	let old_content = b"old kdbx bytes";
+	let file = rss
+		.client
+		.make_file_builder("replaced_download.txt", rss.dir.uuid())
+		.unwrap();
+	let old_file = rss.client.upload_file(file, old_content).await.unwrap();
+
+	let file_path: FfiId = format!(
+		"{}/{}/{}",
+		db.root_uuid().unwrap(),
+		rss.dir.name().unwrap(),
+		old_file.name().unwrap()
+	)
+	.into();
+
+	// Prime the cache: first open serves + caches the original bytes.
+	let downloaded_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&downloaded_path).unwrap(), old_content);
+
+	// Replace remotely (same name+parent, new uuid; old uuid archived as a version).
+	let new_content = b"new kdbx bytes!";
+	let file = rss
+		.client
+		.make_file_builder("replaced_download.txt", rss.dir.uuid())
+		.unwrap();
+	let new_file = rss.client.upload_file(file, new_content).await.unwrap();
+	assert_ne!(old_file.uuid(), new_file.uuid());
+
+	// The very next open must serve the new bytes — no parent listing in between.
+	let downloaded_path = db
+		.download_file_if_changed_by_path(file_path, None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&downloaded_path).unwrap(), new_content);
+
+	std::fs::remove_file(&downloaded_path).ok();
+}
+
 #[shared_test_runtime]
 pub async fn test_download_file_nonexistent() {
 	let (db, rss) = get_db_resources().await;

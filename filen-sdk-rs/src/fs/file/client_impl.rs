@@ -18,7 +18,7 @@ use crate::{
 		HasUUID,
 		categories::{DirType, Normal},
 		file::{
-			FileVersion,
+			FileVersion, FileWithInfo,
 			meta::{FileMeta, FileMetaChanges},
 			traits::HasFileMeta,
 			write::FileWriterDefault,
@@ -174,12 +174,16 @@ impl Client {
 	}
 
 	pub async fn get_file(&self, uuid: Uuid) -> Result<RemoteFile, Error> {
+		Ok(self.get_file_with_info(uuid).await?.file)
+	}
+
+	pub async fn get_file_with_info(&self, uuid: Uuid) -> Result<FileWithInfo, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
 		let meta = runtime::do_cpu_intensive(|| {
 			FileMeta::blocking_from_encrypted(response.metadata, &*self.crypter(), response.version)
 		})
 		.await;
-		Ok(RemoteFile::from_meta(
+		let file = RemoteFile::from_meta(
 			uuid,
 			// v3 api returns the original parent as the parent if the file is in the trash;
 			// keep it as the remembered original parent instead of discarding it.
@@ -195,7 +199,11 @@ impl Client {
 			response.timestamp,
 			response.favorited,
 			meta,
-		))
+		);
+		Ok(FileWithInfo {
+			file,
+			versioned: response.versioned,
+		})
 	}
 
 	pub async fn file_exists(

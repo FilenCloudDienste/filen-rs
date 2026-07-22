@@ -324,6 +324,64 @@ async fn file_update_meta() {
 }
 
 #[shared_test_runtime]
+async fn get_trashed_file() {
+	let resouces = test_utils::RESOURCES.get_resources().await;
+	let client = &resouces.client;
+	let test_dir = &resouces.dir;
+
+	let file = client
+		.make_file_builder("file.txt", test_dir.uuid())
+		.unwrap();
+	let mut file = client.upload_file(file, b"asdf").await.unwrap();
+	let got_file = client.get_file(file.uuid()).await.unwrap();
+	assert_eq!(got_file, file);
+	client.trash_file(&mut file).await.unwrap();
+	assert_ne!(got_file, file);
+	let got_trashed_file = client.get_file(file.uuid()).await.unwrap();
+	assert_eq!(got_trashed_file, file);
+
+	// trash is signaled via ParentUuid::Trash, not the `versioned` flag
+	let trashed_info = client.get_file_with_info(file.uuid()).await.unwrap();
+	assert!(!trashed_info.versioned);
+}
+
+// Pins the backend semantics a cached-file freshness check must design around: replacing a
+// file (same name+parent re-upload) archives the old uuid as a *version* — it keeps resolving
+// via v3/file, byte-identical, parent unchanged (NOT trashed). A uuid-keyed revalidation of a
+// cached file therefore cannot detect a remote replace; only a name-based parent re-list can.
+#[shared_test_runtime]
+async fn get_replaced_file() {
+	let resouces = test_utils::RESOURCES.get_resources().await;
+	let client = &resouces.client;
+	let test_dir = &resouces.dir;
+
+	let file = client
+		.make_file_builder("replaced.txt", test_dir.uuid())
+		.unwrap();
+	let old_file = client.upload_file(file, b"old contents").await.unwrap();
+
+	let file = client
+		.make_file_builder("replaced.txt", test_dir.uuid())
+		.unwrap();
+	let new_file = client.upload_file(file, b"new contents").await.unwrap();
+	assert_ne!(old_file.uuid(), new_file.uuid());
+
+	let versions = client.list_file_versions(&new_file).await.unwrap();
+	assert_eq!(versions.len(), 2);
+
+	let got_old = client.get_file(old_file.uuid()).await.unwrap();
+	assert_eq!(got_old, old_file);
+
+	// `versioned` is the discriminator the RemoteFile alone cannot carry.
+	let old_info = client.get_file_with_info(old_file.uuid()).await.unwrap();
+	assert!(old_info.versioned);
+	assert_eq!(old_info.file, old_file);
+	let new_info = client.get_file_with_info(new_file.uuid()).await.unwrap();
+	assert!(!new_info.versioned);
+	assert_eq!(new_info.file, new_file);
+}
+
+#[shared_test_runtime]
 async fn file_exists() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

@@ -74,12 +74,16 @@ async fn check_local_item_matches_remote(
 			}
 			Err(_) => LocalRemoteComparison::NotFound(DBObject::Dir(dir)),
 		},
-		DBObject::File(file) => match client.get_file(file.uuid).await {
-			Ok(remote_file) => {
-				if file == remote_file {
-					LocalRemoteComparison::SameFile(file, remote_file)
+		DBObject::File(file) => match client.get_file_with_info(file.uuid).await {
+			// A versioned uuid still resolves byte-identical (parent unchanged, not trashed)
+			// but has been superseded by a same-name re-upload; treat it as gone so the caller
+			// re-resolves the path by name and picks up the replacement.
+			Ok(info) if info.versioned => LocalRemoteComparison::NotFound(DBObject::File(file)),
+			Ok(info) => {
+				if file == info.file {
+					LocalRemoteComparison::SameFile(file, info.file)
 				} else {
-					LocalRemoteComparison::DifferentFile(file, remote_file)
+					LocalRemoteComparison::DifferentFile(file, info.file)
 				}
 			}
 			Err(_) => LocalRemoteComparison::NotFound(DBObject::File(file)),
