@@ -6,6 +6,7 @@ use filen_mobile_native_cache::{
 	auth::{AuthFile, DB_FILE_NAME, FilenMobileCacheState},
 	ffi::{
 		FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs, SearchQueryResponseEntry,
+		UploadFileInfo,
 	},
 	traits::{ProgressCallback, SearchUpdateCallback},
 };
@@ -614,6 +615,68 @@ pub async fn test_download_file_after_remote_replace() {
 		Some(FfiObject::File(f)) => assert_eq!(f.uuid, new_file.uuid().to_string()),
 		other => panic!("expected cached file row after replace recovery, got {other:?}"),
 	}
+
+	std::fs::remove_file(&downloaded_path).ok();
+}
+
+// The by-uuid twin of test_download_file_after_remote_replace: the File Provider looks items
+// up by uuid (item(for:), fetchContents), so a retired-but-versioned uuid must recover the
+// re-minted row via the stable-identity parent re-list — and the download door must serve the
+// new bytes, not the archived version the retired uuid still resolves to.
+#[shared_test_runtime]
+pub async fn test_by_uuid_lookup_and_download_after_remote_replace() {
+	let (db, rss) = get_db_resources().await;
+
+	let old_content = b"old by-uuid bytes";
+	let file = rss
+		.client
+		.make_file_builder("replaced_by_uuid.txt", rss.dir.uuid())
+		.unwrap();
+	let old_file = rss.client.upload_file(file, old_content).await.unwrap();
+
+	// Prime by path so the ancestor chain is cached (as FP enumeration would) — the
+	// stable-identity recovery re-lists the parent BY UUID and needs its row present.
+	let file_path: FfiId = format!(
+		"{}/{}/{}",
+		db.root_uuid().unwrap(),
+		rss.dir.name().unwrap(),
+		old_file.name().unwrap()
+	)
+	.into();
+	let primed_path = db
+		.download_file_if_changed_by_path(file_path, None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&primed_path).unwrap(), old_content);
+
+	// Replace remotely (same name+parent, new uuid; old uuid archived as a version).
+	let new_content = b"new by-uuid bytes!";
+	let file = rss
+		.client
+		.make_file_builder("replaced_by_uuid.txt", rss.dir.uuid())
+		.unwrap();
+	let new_file = rss.client.upload_file(file, new_content).await.unwrap();
+	assert_ne!(old_file.uuid(), new_file.uuid());
+
+	// Looking up the retired uuid must recover the re-minted row, not the archive.
+	match db
+		.update_and_query_item_by_uuid(old_file.uuid().to_string())
+		.await
+		.unwrap()
+	{
+		Some(FfiObject::File(f)) => {
+			assert_eq!(f.uuid, new_file.uuid().to_string());
+			assert_eq!(f.stable_uuid, old_file.uuid().to_string());
+		}
+		other => panic!("expected recovered file row, got {other:?}"),
+	}
+
+	// The by-uuid download door must serve the new bytes too.
+	let downloaded_path = db
+		.download_file_if_changed_by_uuid(old_file.uuid().to_string(), None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&downloaded_path).unwrap(), new_content);
 
 	std::fs::remove_file(&downloaded_path).ok();
 }
@@ -4568,4 +4631,171 @@ pub async fn test_search() {
 		.await
 		.unwrap();
 	assert_eq!(resp.len(), 0, "a non-matching needle finds nothing");
+}
+
+// --- Phase 2/3 by-uuid + content-modify FFI ---
+
+#[shared_test_runtime]
+pub async fn test_update_and_query_item_by_uuid() {
+	let (db, rss) = get_db_resources().await;
+
+	// The drive-root uuid resolves locally to the root object.
+	let root = db
+		.update_and_query_item_by_uuid(db.root_uuid().unwrap())
+		.await
+		.unwrap();
+	assert!(matches!(root, Some(FfiObject::Root(_))));
+
+	// The "trash" sentinel resolves to the synthetic local trash dir.
+	match db
+		.update_and_query_item_by_uuid("trash".to_string())
+		.await
+		.unwrap()
+	{
+		Some(FfiObject::Dir(d)) => {
+			assert_eq!(d.uuid, "trash");
+			assert_eq!(d.stable_uuid, "trash");
+		}
+		other => panic!("expected trash dir, got {other:?}"),
+	}
+
+	// A well-formed but unknown uuid (no local row, no remote item) => None (remote-deleted).
+	let unknown = db
+		.update_and_query_item_by_uuid(Uuid::new_v4().to_string())
+		.await
+		.unwrap();
+	assert!(unknown.is_none());
+
+	// A dir created remotely is fetched, upserted, and returned with stable_uuid == uuid.
+	let dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "uuid_query_dir")
+		.await
+		.unwrap();
+	match db
+		.update_and_query_item_by_uuid(dir.uuid().to_string())
+		.await
+		.unwrap()
+	{
+		Some(FfiObject::Dir(d)) => {
+			assert_eq!(d.uuid, dir.uuid().to_string());
+			assert_eq!(d.stable_uuid, dir.uuid().to_string());
+		}
+		other => panic!("expected dir, got {other:?}"),
+	}
+}
+
+#[shared_test_runtime]
+pub async fn test_download_file_to_path_by_uuid() {
+	let (db, rss) = get_db_resources().await;
+
+	let content = b"download-to-path-by-uuid content";
+	let builder = rss
+		.client
+		.make_file_builder("dl_by_uuid.txt", rss.dir.uuid())
+		.unwrap();
+	let remote_file = rss.client.upload_file(builder, content).await.unwrap();
+
+	// Pull the file into the cache DB (download_file_to_path_by_uuid requires the local row).
+	db.update_and_query_item_by_uuid(remote_file.uuid().to_string())
+		.await
+		.unwrap()
+		.unwrap();
+
+	let target = std::env::temp_dir().join(format!("dl_by_uuid_{}.bin", Uuid::new_v4()));
+	let file = db
+		.download_file_to_path_by_uuid(
+			remote_file.uuid().to_string(),
+			target.to_string_lossy().to_string(),
+			None,
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(file.uuid, remote_file.uuid().to_string());
+	assert!(target.exists());
+	assert_eq!(std::fs::read(&target).unwrap(), content);
+	std::fs::remove_file(&target).ok();
+}
+
+#[shared_test_runtime]
+pub async fn test_modify_file_content() {
+	let (db, rss) = get_db_resources().await;
+
+	let parent_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+
+	// Create the initial file through the cache (populates the DB + parent chain).
+	let src = std::env::temp_dir().join(format!("modify_src_{}.bin", Uuid::new_v4()));
+	std::fs::write(&src, b"original content").unwrap();
+	let created = db
+		.upload_new_file(
+			src.to_string_lossy().to_string(),
+			parent_path.clone(),
+			UploadFileInfo {
+				name: "modify_me.txt".to_string(),
+				creation: None,
+				modification: None,
+				mime: None,
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	let orig_uuid = created.file.uuid.clone();
+	let orig_stable = created.file.stable_uuid.clone();
+	assert_eq!(
+		orig_stable, orig_uuid,
+		"a fresh file has stable_uuid == uuid"
+	);
+
+	// Replace the content with new EXTERNAL bytes, addressing the file by its stable uuid.
+	let new_content = b"replacement content that differs from the original";
+	let ext = std::env::temp_dir().join(format!("modify_new_{}.bin", Uuid::new_v4()));
+	std::fs::write(&ext, new_content).unwrap();
+	let item_id: FfiId = format!("uuid/{orig_stable}").into();
+	let resp = db
+		.modify_file_content(item_id, ext.to_string_lossy().to_string(), None, None)
+		.await
+		.unwrap();
+
+	// The stable identity is preserved; the real uuid is re-minted.
+	assert_eq!(
+		resp.file.stable_uuid, orig_stable,
+		"stable id preserved across a content edit"
+	);
+	assert_ne!(
+		resp.file.uuid, orig_uuid,
+		"a content edit re-mints the real uuid"
+	);
+
+	// The file is still addressable by its unchanged stable uuid and now maps to the new uuid.
+	match db
+		.update_and_query_item_by_uuid(orig_stable.clone())
+		.await
+		.unwrap()
+	{
+		Some(FfiObject::File(f)) => {
+			assert_eq!(f.stable_uuid, orig_stable);
+			assert_eq!(f.uuid, resp.file.uuid);
+		}
+		other => panic!("expected file, got {other:?}"),
+	}
+
+	// The new content is what downloads now.
+	let target = std::env::temp_dir().join(format!("modify_dst_{}.bin", Uuid::new_v4()));
+	let dl = db
+		.download_file_to_path_by_uuid(
+			orig_stable.clone(),
+			target.to_string_lossy().to_string(),
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(dl.stable_uuid, orig_stable);
+	assert_eq!(std::fs::read(&target).unwrap(), new_content);
+
+	std::fs::remove_file(&src).ok();
+	std::fs::remove_file(&ext).ok();
+	std::fs::remove_file(&target).ok();
 }

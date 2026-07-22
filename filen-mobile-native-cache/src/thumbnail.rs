@@ -108,6 +108,10 @@ impl AuthCacheState {
 		requested_width: u32,
 		requested_height: u32,
 	) -> ThumbnailResult {
+		let path = match self.canonicalize_ffi_id(path) {
+			Ok(path) => path,
+			Err(e) => return ThumbnailResult::Err(e),
+		};
 		let pvs = match path.as_parsed() {
 			Ok(pvs) => pvs,
 			Err(e) => return ThumbnailResult::Err(e),

@@ -7,7 +7,13 @@ lazy_static! {
 	pub static ref DB_INIT_HASH: Blake3Hash = blake3::hash(INIT.as_bytes()).into();
 }
 pub(crate) const SELECT_ID_BY_UUID: &str = "SELECT id FROM items WHERE uuid = ?;";
+/// Resolves a stable uuid to the row's current real uuid. Returns nothing when the argument is not
+/// any row's `stable_uuid` (e.g. it is already a real uuid, or unknown).
+pub(crate) const SELECT_UUID_BY_STABLE_UUID: &str = "SELECT uuid FROM items WHERE stable_uuid = ?;";
 pub(crate) const DELETE_BY_UUID: &str = "DELETE FROM items WHERE uuid = ?;";
+/// Reassigns a row's stable_uuid by row id. Used to carry the original stable identity onto the row
+/// that ends up holding a re-minted content uuid when the upsert did not land on the original row.
+pub(crate) const UPDATE_ITEM_STABLE_UUID: &str = "UPDATE items SET stable_uuid = ? WHERE id = ?;";
 pub(crate) const RECURSIVE_SELECT_PATH_FROM_UUID: &str =
 	include_str!("../../sql/recursive_select_path_from_uuid.sql");
 
@@ -57,10 +63,20 @@ pub(crate) const UPDATE_DIR_FAVORITE_RANK: &str =
 	include_str!("../../sql/update_dir_favorite_rank.sql");
 pub(crate) const UPDATE_DIR_LAST_LISTED: &str =
 	include_str!("../../sql/update_dir_last_listed.sql");
+/// uuids of every dir we've listed (`last_listed > 0`) — the dirs whose child listing we mirror
+/// locally. Drives the socket reconnect catch-up so remote changes to deep folders surface.
+/// `items.type = 1` = Dir only: excludes the drive root (re-listed separately on reconnect, so this
+/// avoids a double root re-list) and the synthetic `'trash'` sentinel row.
+pub(crate) const SELECT_MATERIALIZED_DIR_UUIDS: &str = "SELECT items.uuid FROM dirs JOIN items ON items.id = dirs.id WHERE dirs.last_listed > 0 AND items.type = 1;";
 
 const SELECT_DIR_CHILDREN: &str = include_str!("../../sql/select_dir_children.sql");
 pub(crate) fn select_dir_children(order_by: Option<&str>) -> String {
 	format!("{} {}", SELECT_DIR_CHILDREN, convert_order_by(order_by))
+}
+/// Paginated variant: appends `LIMIT ?2 OFFSET ?3` (parent is `?1`). For the File Provider
+/// enumeration, which hands the system one page at a time via an offset cursor.
+pub(crate) fn select_dir_children_page(order_by: Option<&str>) -> String {
+	format!("{} LIMIT ? OFFSET ?", select_dir_children(order_by))
 }
 
 const SELECT_TRASH_CHILDREN: &str = include_str!("../../sql/select_trash_children.sql");
@@ -72,7 +88,7 @@ pub(crate) fn select_trash_children(order_by: Option<&str>) -> String {
 pub(crate) const SELECT_ROOT: &str = include_str!("../../sql/select_root.sql");
 pub(crate) const UPSERT_ROOT_EMPTY: &str = include_str!("../../sql/upsert_root_empty.sql");
 pub(crate) const INSERT_ROOT_INTO_ITEMS: &str =
-	"INSERT INTO items (uuid, parent, type) VALUES (?, NULL, ?) RETURNING id;";
+	"INSERT INTO items (uuid, stable_uuid, parent, type) VALUES (?1, ?1, NULL, ?2) RETURNING id;";
 pub(crate) const INSERT_ROOT_INTO_ROOTS: &str = "INSERT INTO roots (id) VALUES (?);";
 pub(crate) const INSERT_ROOT_INTO_DIRS: &str =
 	"INSERT INTO dirs (id, metadata_state, timestamp, raw_metadata) VALUES (?, 1, 0, '');";
@@ -81,6 +97,33 @@ pub(crate) const UPDATE_ROOT: &str =
 
 // Object
 pub(crate) const SELECT_OBJECT_BY_UUID: &str = include_str!("../../sql/select_object.sql");
+
+// Change tracking (workstream A / Phase 4)
+/// `(epoch, seq)` of the single sync_state row. Read to build the current anchor and to detect a
+/// stale anchor epoch (a rebuilt DB re-randomizes `epoch`).
+pub(crate) const SELECT_SYNC_STATE: &str = "SELECT epoch, seq FROM sync_state WHERE id = 1;";
+/// Wide-join live (non-trashed) children of one container changed since a `seq` (?1 = parent BLOB,
+/// ?2 = from_seq).
+pub(crate) const SELECT_CHANGED_CHILDREN: &str =
+	include_str!("../../sql/select_changed_children.sql");
+/// Wide-join trashed items changed since a `seq` (?1 = from_seq) — the trash container's delta feed.
+/// Trash is addressed by `trashed = TRUE`, not a parent uuid (trashed rows keep their original
+/// `parent`).
+pub(crate) const SELECT_CHANGED_TRASH: &str = include_str!("../../sql/select_changed_trash.sql");
+/// Wide-join non-root items changed anywhere since a `seq` (?1 = from_seq) — the working-set feed.
+pub(crate) const SELECT_CHANGED_WORKINGSET: &str =
+	include_str!("../../sql/select_changed_workingset.sql");
+/// Wide-join current working set: favorited (file or dir), recent, or trashed non-root items.
+pub(crate) const SELECT_WORKING_SET: &str = include_str!("../../sql/select_working_set.sql");
+/// Tombstoned stable_uuids (rendered as text) for one container since a `seq` (?1 = parent BLOB,
+/// ?2 = from_seq). `stable_uuid` is stored as a BLOB; `uuid_text` renders it as the canonical string
+/// the File Provider expects.
+pub(crate) const SELECT_DELETIONS_BY_PARENT: &str =
+	"SELECT uuid_text(stable_uuid) FROM deletions WHERE parent = ?1 AND seq > ?2;";
+/// Tombstoned stable_uuids (rendered as text) anywhere since a `seq` (?1 = from_seq) — the working-set
+/// and trash delta.
+pub(crate) const SELECT_DELETIONS_ALL: &str =
+	"SELECT uuid_text(stable_uuid) FROM deletions WHERE seq > ?1;";
 
 // Helpers
 // todo improve significantly
@@ -111,8 +154,9 @@ fn convert_order_by(order_by: Option<&str>) -> &'static str {
 
 // Constants
 /// Number of leading `items` columns selected by the wide-join queries
-/// (`id, uuid, parent, trashed, local_data, type`). Does not include is_stale and is_recent.
-pub(crate) const ITEM_COLUMN_COUNT_NO_EXTRA: usize = 6;
+/// (`id, uuid, stable_uuid, parent, trashed, local_data, type`). Does not include is_stale and
+/// is_recent.
+pub(crate) const ITEM_COLUMN_COUNT_NO_EXTRA: usize = 7;
 // does not include the `id` column for the below
 pub(crate) const DIRS_COLUMN_COUNT: usize = 6;
 pub(crate) const DIRS_META_COLUMN_COUNT: usize = 2;

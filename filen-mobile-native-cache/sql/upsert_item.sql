@@ -1,4 +1,5 @@
-INSERT INTO items (id, uuid, parent, trashed, local_data, type, is_recent)
+INSERT INTO items
+(id, uuid, stable_uuid, parent, trashed, local_data, type, is_recent)
 VALUES (
 	-- Get existing id if item exists at target location
 	COALESCE(
@@ -19,6 +20,27 @@ VALUES (
 		)
 	),
 	?1, -- uuid
+	-- stable_uuid: preserve the existing row's stable_uuid across a uuid
+	-- re-mint (content edits swap uuid in place on the same (parent, name)
+	-- row); default to uuid for a brand new row.
+	COALESCE(
+		(
+			SELECT stable_uuid FROM items
+			WHERE uuid = ?1
+		),
+		(
+			SELECT items.stable_uuid
+			FROM items
+			LEFT JOIN files_meta ON items.id = files_meta.id
+			LEFT JOIN dirs_meta ON items.id = dirs_meta.id
+			WHERE
+				items.parent = ?2
+				AND items.trashed = FALSE
+				AND
+				(files_meta.name = ?3 OR dirs_meta.name = ?3)
+		),
+		?1
+	), -- stable_uuid
 	?2, -- parent
 	?6, -- trashed
 	COALESCE(
@@ -67,4 +89,6 @@ ON CONFLICT (id) DO UPDATE SET
 	type = excluded.type,
 	is_recent = excluded.is_recent,
 	is_stale = FALSE
-RETURNING id, local_data;
+-- stable_uuid intentionally omitted so it is preserved across a uuid
+-- re-mint on the same row.
+RETURNING id, local_data, stable_uuid;

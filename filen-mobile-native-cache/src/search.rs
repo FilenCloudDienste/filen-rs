@@ -288,6 +288,9 @@ fn ffi_object(result: SearchResult) -> FfiNonRootObject {
 fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 	FfiFile {
 		uuid: file.uuid.to_string(),
+		// Search results come from the SDK search cache, which has no re-mint history, so the stable
+		// id is trivially the current uuid, and there is no server timestamp to surface here.
+		stable_uuid: file.uuid.to_string(),
 		parent: file.parent.to_string(),
 		// Search only indexes live items, never trashed ones, so there is no original parent.
 		original_parent: None,
@@ -303,6 +306,7 @@ fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 		}),
 		size: file.size as i64,
 		favorite_rank: i64::from(file.favorited),
+		timestamp: 0,
 		// Search results carry no per-device local data; the browsing cache owns that.
 		local_data: None,
 	}
@@ -311,6 +315,7 @@ fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 fn ffi_dir(dir: CacheableDir<'_>) -> FfiDir {
 	FfiDir {
 		uuid: dir.uuid.to_string(),
+		stable_uuid: dir.uuid.to_string(),
 		parent: dir.parent.to_string(),
 		// Search only indexes live items, never trashed ones, so there is no original parent.
 		original_parent: None,
@@ -320,6 +325,7 @@ fn ffi_dir(dir: CacheableDir<'_>) -> FfiDir {
 		}),
 		color: dir.color.into(),
 		favorite_rank: i64::from(dir.favorited),
+		timestamp: 0,
 		last_listed: 0,
 		local_data: None,
 	}

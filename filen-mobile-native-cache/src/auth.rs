@@ -35,8 +35,10 @@ const DEFAULT_MAX_CACHE_FILES_BUDGET: u64 = 768 * 1024 * 1024; // 768 MiB
 pub const DB_FILE_NAME: &str = "native_cache.db";
 
 // 1 - initial version, changed how files as stored in cache from flat to per-file directories
-// 2 - store uuid/parent as BLOB, add `trashed` flag (trashed items keep their original parent);
-//     dropped the synthetic 'trash' row
+// 2 - store uuid/parent/stable_uuid as BLOB, add `trashed` flag (trashed items keep their original
+//     parent, dropped the synthetic 'trash' row) + replicated File Provider change-tracking schema
+//     (seq/stable_uuid/tombstones). Existing installs rebuild the cache DB on next launch (init_db
+//     removes + reinitializes native_cache.db, including the -wal/-shm sidecars).
 const CACHE_VERSION: u64 = 2;
 
 pub struct AuthCacheState {
@@ -57,6 +59,10 @@ pub struct AuthCacheState {
 	pub(crate) sdk_cache_path: PathBuf,
 	/// The one live `cache::search` on the drive root, reused across queries via `set_config`.
 	pub(crate) search: tokio::sync::Mutex<Option<crate::search::ActiveSearch>>,
+	/// The File Provider's dedicated socket listener (see [`crate::socket`]); pokes the extension
+	/// via `signalEnumerator` on remote drive changes. Held here so it unsubscribes automatically
+	/// when this `AuthCacheState` is dropped on re-auth / logout.
+	pub(crate) socket_listener: tokio::sync::Mutex<Option<filen_sdk_rs::socket::ListenerHandle>>,
 }
 
 enum UnauthReason {
@@ -148,11 +154,20 @@ pub(crate) async fn update_saved_db_state_cache_cleanup_time(
 	Ok(())
 }
 
-/// Registers the connection-local `uuid_text(blob)` SQL function, which renders a 16-byte BLOB
-/// uuid as its canonical lowercase-hyphenated text. Used by queries that need a uuid as a string
-/// (path-component fallback when metadata isn't decoded, and uuid-based path navigation) now that
-/// `items.uuid` is stored as a BLOB. Must be called on every connection before those queries run.
-fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
+/// Configures a freshly opened connection: registers the connection-local `uuid_text(blob)` SQL
+/// function AND re-applies the per-connection PRAGMAs SQLite resets on every new connection.
+///
+/// `uuid_text` renders a 16-byte BLOB uuid as its canonical lowercase-hyphenated text; queries need
+/// a uuid as a string (path-component fallback when metadata isn't decoded, uuid-based path
+/// navigation) now that `items.uuid` is stored as a BLOB.
+///
+/// `recursive_triggers` and `temp_store` are declared in `init.sql`, but a PRAGMA only takes effect
+/// for the connection that runs it, and `foreign_keys` defaults to OFF — so unless these are
+/// re-applied after EVERY `Connection::open` (create, reopen, in-memory) the cascade triggers stop
+/// recursing on a reopened DB (ghost rows / missing tombstones) and the `ON DELETE CASCADE` foreign
+/// keys go inert (orphaned files/dirs rows). `journal_mode = WAL` is deliberately omitted: it persists
+/// in the DB file and errors on an in-memory connection.
+pub(crate) fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
 	use rusqlite::functions::FunctionFlags;
 	conn.create_scalar_function(
 		"uuid_text",
@@ -164,6 +179,11 @@ fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 				.map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
 			Ok(UuidText(uuid.into()))
 		},
+	)?;
+	conn.execute_batch(
+		"PRAGMA recursive_triggers = TRUE;
+		PRAGMA temp_store = MEMORY;
+		PRAGMA foreign_keys = ON;",
 	)
 }
 
@@ -195,8 +215,21 @@ fn init_db(db_path: &Path, cache_state_file: &Path) -> Result<Connection, CacheE
 			}
 		}
 	}
+	// Also drop any leftover WAL/SHM sidecars. The DB runs in WAL mode, so if a prior install died
+	// with a hot WAL, reopening the same path + re-declaring WAL could recover stale frames from the
+	// old -wal into the freshly-created DB (SQLite's "mispaired database/hot journal" corruption).
+	for sidecar in [
+		format!("{}-wal", db_path.display()),
+		format!("{}-shm", db_path.display()),
+	] {
+		if let Err(e) = std::fs::remove_file(&sidecar)
+			&& e.kind() != std::io::ErrorKind::NotFound
+		{
+			tracing::warn!("Failed to remove {sidecar}: {e}");
+		}
+	}
 	let db = Connection::open(db_path)?;
-	configure_conn(&db)?;
+	configure_connection(&db)?;
 	db.execute_batch(sql::statements::INIT)?;
 	let contents = serde_json::to_string(&SavedDBState::default())
 		.map_err(|e| CacheError::conversion(format!("Failed to serialize db_state.json: {e}")))?;
@@ -265,7 +298,7 @@ fn db_from_dir(
 			db_path.display()
 		);
 		let conn = Connection::open(db_path)?;
-		configure_conn(&conn)?;
+		configure_connection(&conn)?;
 		Ok((conn, Some(saved_state)))
 	}
 }
@@ -628,6 +661,7 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
+			socket_listener: tokio::sync::Mutex::new(None),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
 		Ok(new)
@@ -649,7 +683,7 @@ impl AuthCacheState {
 
 		let (cache_dir, tmp_dir, thumbnail_dir) = crate::io::init(files_dir.as_ref())?;
 		let db = Connection::open_in_memory()?;
-		configure_conn(&db)?;
+		configure_connection(&db)?;
 		db.execute_batch(sql::statements::INIT)?;
 
 		let sdk_cache_path =
@@ -669,6 +703,7 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
+			socket_listener: tokio::sync::Mutex::new(None),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
 		Ok(new)
@@ -906,5 +941,123 @@ mod auth_file_crypto_tests {
 		let dek = EncryptionKey::new([7u8; 32]);
 		assert!(decrypt_auth_bytes(&[0x01, 0x00], Some(&dek)).is_err());
 		assert!(decrypt_auth_bytes(&[], Some(&dek)).is_err());
+	}
+}
+
+#[cfg(test)]
+mod reopen_pragma_tests {
+	use filen_types::fs::{ParentUuid, Uuid};
+	use rusqlite::Connection;
+
+	use super::configure_connection;
+	use crate::{
+		ffi::ItemType,
+		sql::{item, statements::INIT},
+	};
+
+	fn item_exists(conn: &Connection, uuid: Uuid) -> bool {
+		conn.query_row(
+			"SELECT EXISTS(SELECT 1 FROM items WHERE uuid = ?1)",
+			[uuid],
+			|r| r.get(0),
+		)
+		.unwrap()
+	}
+
+	fn tombstone_exists(conn: &Connection, stable_uuid: Uuid) -> bool {
+		conn.query_row(
+			"SELECT EXISTS(SELECT 1 FROM deletions WHERE stable_uuid = ?1)",
+			[stable_uuid],
+			|r| r.get(0),
+		)
+		.unwrap()
+	}
+
+	// A DB reopened via the schema-hash-match path (a plain `Connection::open`) must re-apply the
+	// per-connection PRAGMAs, or `recursive_triggers` reverts to OFF and a cascade delete stops
+	// recursing: the direct child is removed but the grandchild survives and no descendant past the
+	// first level is tombstoned. This mirrors auth.rs's reopen path; without `configure_connection` on
+	// reopen the assertions below fail (the grandchild file survives).
+	#[test]
+	fn cascade_delete_recurses_and_tombstones_after_reopen() {
+		let db_path = std::env::temp_dir().join(format!(
+			"filen_reopen_pragma_{}_{}.db",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+
+		// Create the DB on disk exactly as init_db does, then drop the connection.
+		{
+			let db = Connection::open(&db_path).unwrap();
+			configure_connection(&db).unwrap();
+			db.execute_batch(INIT).unwrap();
+		}
+
+		// Reopen mirroring the schema-hash-match branch: plain open + configure_connection.
+		let conn = Connection::open(&db_path).unwrap();
+		configure_connection(&conn).unwrap();
+
+		// D (dir) / S (dir) / F (file) — a three-level subtree under a synthetic parent.
+		let d = Uuid::new_v4();
+		let s = Uuid::new_v4();
+		let f = Uuid::new_v4();
+		item::upsert_item(
+			&conn,
+			d,
+			Some(ParentUuid::Uuid(Uuid::new_v4())),
+			Some("D"),
+			None,
+			ItemType::Dir,
+		)
+		.unwrap();
+		item::upsert_item(
+			&conn,
+			s,
+			Some(ParentUuid::Uuid(d)),
+			Some("S"),
+			None,
+			ItemType::Dir,
+		)
+		.unwrap();
+		item::upsert_item(
+			&conn,
+			f,
+			Some(ParentUuid::Uuid(s)),
+			Some("F"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+
+		conn.execute("DELETE FROM items WHERE uuid = ?1", [d])
+			.unwrap();
+
+		// Snapshot before cleanup so the temp file is always removed, even if an assertion fails.
+		let results: Vec<(Uuid, bool, bool)> = [d, s, f]
+			.into_iter()
+			.map(|uuid| {
+				(
+					uuid,
+					item_exists(&conn, uuid),
+					tombstone_exists(&conn, uuid),
+				)
+			})
+			.collect();
+
+		drop(conn);
+		let _ = std::fs::remove_file(&db_path);
+		let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+		let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+
+		for (uuid, exists, tombstoned) in results {
+			assert!(!exists, "descendant {uuid} must be deleted after reopen");
+			assert!(
+				tombstoned,
+				"descendant {uuid} must be tombstoned after reopen"
+			);
+		}
 	}
 }

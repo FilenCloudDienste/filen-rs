@@ -11,5 +11,6 @@ pub use error::CacheError;
 pub mod auth;
 pub mod local;
 pub mod remote;
+pub mod socket;
 pub mod thumbnail;
 pub mod traits;

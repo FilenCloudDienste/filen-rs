@@ -26,6 +26,7 @@ pub struct FfiFileMeta {
 pub struct FfiFile {
 	// item
 	pub uuid: String,
+	pub stable_uuid: String,
 	pub parent: String,
 	/// For a trashed item, the UUID of the parent it will be restored to. `None` otherwise.
 	pub original_parent: Option<String>,
@@ -34,6 +35,7 @@ pub struct FfiFile {
 	pub meta: Option<FfiFileMeta>,
 	pub size: i64,
 	pub favorite_rank: i64,
+	pub timestamp: i64,
 
 	pub local_data: Option<HashMap<String, String>>,
 }
@@ -42,10 +44,12 @@ impl From<DBFile> for FfiFile {
 	fn from(file: DBFile) -> Self {
 		FfiFile {
 			uuid: file.uuid.to_string(),
+			stable_uuid: file.stable_uuid.to_string(),
 			parent: file.parent.to_string(),
 			original_parent: file.parent.original_parent().map(|u| u.to_string()),
 			size: file.size,
 			favorite_rank: file.favorite_rank,
+			timestamp: file.timestamp,
 			local_data: file.local_data.map(|o| o.to_map()),
 			meta: match file.meta {
 				DBFileMeta::Decoded(meta) => Some(FfiFileMeta {
@@ -71,6 +75,7 @@ pub struct FfiDirMeta {
 pub struct FfiDir {
 	// item
 	pub uuid: String,
+	pub stable_uuid: String,
 	pub parent: String,
 	/// For a trashed item, the UUID of the parent it will be restored to. `None` otherwise.
 	pub original_parent: Option<String>,
@@ -79,6 +84,7 @@ pub struct FfiDir {
 	pub meta: Option<FfiDirMeta>,
 	pub color: Option<String>,
 	pub favorite_rank: i64,
+	pub timestamp: i64,
 
 	// cache info
 	pub last_listed: i64,
@@ -90,10 +96,12 @@ impl From<DBDir> for FfiDir {
 	fn from(dir: DBDir) -> Self {
 		FfiDir {
 			uuid: dir.uuid.to_string(),
+			stable_uuid: dir.stable_uuid.to_string(),
 			parent: dir.parent.to_string(),
 			original_parent: dir.parent.original_parent().map(|u| u.to_string()),
 			color: dir.color.into(),
 			favorite_rank: dir.favorite_rank,
+			timestamp: dir.timestamp,
 			last_listed: dir.last_listed,
 			local_data: dir.local_data.map(|o| o.to_map()),
 			meta: if let DBDirMeta::Decoded(meta) = dir.meta {
@@ -112,12 +120,16 @@ impl From<DBDirObject> for FfiDir {
 	fn from(dir: DBDirObject) -> Self {
 		match dir {
 			DBDirObject::Dir(dir) => dir.into(),
+			// The root has no re-mint concept, so its stable id is trivially its uuid; it has no
+			// meaningful directory timestamp.
 			DBDirObject::Root(root) => FfiDir {
 				uuid: root.uuid.to_string(),
+				stable_uuid: root.uuid.to_string(),
 				parent: String::new(),
 				original_parent: None,
 				color: None,
 				favorite_rank: 0,
+				timestamp: 0,
 				last_listed: root.last_listed,
 				local_data: None,
 				meta: None,
@@ -241,14 +253,17 @@ pub enum ParsedFfiId<'a> {
 	Trash(UuidFfiId<'a>),
 	Path(PathFfiId<'a>),
 	Recents(UuidFfiId<'a>),
+	/// A `uuid/<uuid>` id, where `<uuid>` may be a stable OR real uuid. Resolved to a canonical
+	/// path/trash/root id by [`AuthCacheState::canonicalize_ffi_id`](crate::auth::AuthCacheState).
+	Uuid(UuidFfiId<'a>),
 }
 
 impl FfiId {
 	pub fn as_path(&self) -> Result<PathFfiId<'_>, CacheError> {
 		match self.as_parsed()? {
-			ParsedFfiId::Trash(_) | ParsedFfiId::Recents(_) => Err(CacheError::conversion(
-				format!("Expected PathFfiId, got: {}", self.0),
-			)),
+			ParsedFfiId::Trash(_) | ParsedFfiId::Recents(_) | ParsedFfiId::Uuid(_) => Err(
+				CacheError::conversion(format!("Expected PathFfiId, got: {}", self.0)),
+			),
 			ParsedFfiId::Path(path_ffi_id) => Ok(path_ffi_id),
 		}
 	}
@@ -265,6 +280,10 @@ impl FfiId {
 				uuid: iter.last().map(|(s, _)| Uuid::from_str(s)).transpose()?,
 			})),
 			"recents" => Ok(ParsedFfiId::Recents(UuidFfiId {
+				full_path: self.0.as_str(),
+				uuid: iter.last().map(|(s, _)| Uuid::from_str(s)).transpose()?,
+			})),
+			"uuid" => Ok(ParsedFfiId::Uuid(UuidFfiId {
 				full_path: self.0.as_str(),
 				uuid: iter.last().map(|(s, _)| Uuid::from_str(s)).transpose()?,
 			})),
@@ -339,6 +358,19 @@ pub struct FileWithPathResponse {
 	pub id: FfiId,
 }
 
+/// The delta feed for one enumerator container (dir/root, trash, or the working set). `updated`
+/// carries the wide-join items changed since the caller's anchor; `deleted_stable_uuids` are the
+/// stable ids tombstoned since then. `new_anchor` is read after the refresh + queries so no change
+/// window is missed. `anchor_expired` is set when the incoming anchor is malformed or from a prior
+/// DB generation, telling the extension to re-enumerate from scratch (both lists are then empty).
+#[derive(uniffi::Record, Debug)]
+pub struct FfiChangesResponse {
+	pub updated: Vec<FfiNonRootObject>,
+	pub deleted_stable_uuids: Vec<String>,
+	pub new_anchor: Vec<u8>,
+	pub anchor_expired: bool,
+}
+
 #[derive(uniffi::Record, Debug)]
 pub struct DirWithPathResponse {
 	pub dir: FfiDir,
@@ -386,4 +418,66 @@ pub struct SearchQueryArgs {
 pub struct SearchQueryResponseEntry {
 	pub object: FfiNonRootObject,
 	pub path: String,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+	const ROOT: &str = "11111111-1111-4111-8111-111111111111";
+
+	#[test]
+	fn parses_uuid_arm() {
+		let id = FfiId(format!("uuid/{UUID}"));
+		match id.as_parsed().unwrap() {
+			ParsedFfiId::Uuid(uuid_id) => {
+				assert_eq!(uuid_id.full_path, id.0);
+				assert_eq!(uuid_id.uuid, Some(Uuid::from_str(UUID).unwrap()));
+			}
+			other => panic!("Expected Uuid arm, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn parses_uuid_arm_without_trailing_uuid() {
+		let id = FfiId("uuid".to_string());
+		match id.as_parsed().unwrap() {
+			ParsedFfiId::Uuid(uuid_id) => assert_eq!(uuid_id.uuid, None),
+			other => panic!("Expected Uuid arm, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn uuid_arm_rejects_invalid_trailing_uuid() {
+		let id = FfiId("uuid/not-a-uuid".to_string());
+		assert!(id.as_parsed().is_err());
+	}
+
+	#[test]
+	fn uuid_arm_is_not_a_path() {
+		let id = FfiId(format!("uuid/{UUID}"));
+		assert!(id.as_path().is_err());
+	}
+
+	#[test]
+	fn non_uuid_forms_still_parse() {
+		// A plain root-uuid-prefixed id remains a path.
+		match FfiId(format!("{ROOT}/sub/name")).as_parsed().unwrap() {
+			ParsedFfiId::Path(path) => {
+				assert_eq!(path.root_uuid, Uuid::from_str(ROOT).unwrap());
+				assert_eq!(path.name_or_uuid, "name");
+			}
+			other => panic!("Expected Path arm, got {other:?}"),
+		}
+		// The literal `trash`/`recents` roots are unaffected by the new arm.
+		assert!(matches!(
+			FfiId(format!("trash/{UUID}")).as_parsed().unwrap(),
+			ParsedFfiId::Trash(_)
+		));
+		assert!(matches!(
+			FfiId(format!("recents/{UUID}")).as_parsed().unwrap(),
+			ParsedFfiId::Recents(_)
+		));
+	}
 }

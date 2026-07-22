@@ -161,6 +161,7 @@ impl From<FileMeta<'_>> for DBFileMeta {
 pub struct DBFile {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
+	pub(crate) stable_uuid: Uuid,
 	pub(crate) parent: ParentUuid,
 	pub(crate) size: i64,
 	pub(crate) chunks: i64,
@@ -177,6 +178,7 @@ impl std::fmt::Debug for DBFile {
 		f.debug_struct("DBFile")
 			.field("id", &self.id)
 			.field("uuid", &self.uuid)
+			.field("stable_uuid", &self.stable_uuid)
 			.field("parent", &self.parent)
 			.field("size", &self.size)
 			.field("chunks", &self.chunks)
@@ -197,6 +199,7 @@ impl DBFile {
 		Ok(Self {
 			id: item.id,
 			uuid: item.uuid,
+			stable_uuid: item.stable_uuid,
 			parent: item.parent.ok_or_else(|| {
 				rusqlite::Error::FromSqlConversionFailure(
 					0,
@@ -235,7 +238,7 @@ impl DBFile {
 		delete_file_meta: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		trace!("Upserting remote file: {remote_file:?}");
-		let (id, local_data) = item::upsert_item_with_stmts(
+		let (id, local_data, stable_uuid) = item::upsert_item_with_stmts(
 			remote_file.uuid(),
 			Some(*remote_file.parent()),
 			remote_file.name(),
@@ -283,6 +286,7 @@ impl DBFile {
 		Ok(Self {
 			id,
 			uuid: remote_file.uuid,
+			stable_uuid,
 			parent: remote_file.parent,
 			size: remote_file.size as i64,
 			chunks: remote_file.chunks as i64,
@@ -313,6 +317,54 @@ impl DBFile {
 				&mut delete_file_meta,
 			)?
 		};
+		tx.commit()?;
+		Ok(new)
+	}
+
+	/// Upserts a content re-upload's new [`RemoteFile`] while GUARANTEEING the stable-identity carry.
+	///
+	/// A content re-upload mints a brand-new `uuid` for the same logical file. The DB-level upsert
+	/// (`upsert_item.sql`) normally reuses the original row by matching `(parent, name)`, swaps the
+	/// `uuid` in place and preserves `stable_uuid` — in that case this is a no-op wrapper. But when
+	/// the upsert does NOT land on the original row (e.g. a concurrent rename changed `(parent,
+	/// name)`, so the upsert matched neither the uuid nor `(parent, name)` and inserted a fresh
+	/// row), this transfers `original_stable_uuid` onto the row now holding the new uuid and deletes
+	/// the stale original row — atomically, in one transaction.
+	pub(crate) fn upsert_remint_preserving_stable(
+		conn: &mut Connection,
+		remote_file: RemoteFile,
+		original_id: i64,
+		original_uuid: Uuid,
+		original_stable_uuid: Uuid,
+	) -> Result<Self> {
+		let tx = conn.transaction()?;
+		let mut new = {
+			let mut upsert_item_stmt = tx.prepare_cached(UPSERT_ITEM)?;
+			let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
+			let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
+			let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
+			Self::upsert_from_remote_stmts(
+				remote_file,
+				&mut upsert_item_stmt,
+				&mut upsert_file,
+				&mut upsert_file_meta,
+				&mut delete_file_meta,
+			)?
+		};
+		if new.id != original_id {
+			// The upsert landed on a different/new row. Delete the stale original row FIRST to free
+			// the UNIQUE(stable_uuid) slot, then adopt the original stable id onto the new row.
+			tx.prepare_cached(DELETE_BY_UUID)?
+				.execute([original_uuid])?;
+			tx.prepare_cached(UPDATE_ITEM_STABLE_UUID)?
+				.execute((original_stable_uuid, new.id))?;
+			new.stable_uuid = original_stable_uuid;
+		} else if new.stable_uuid != original_stable_uuid {
+			// Defensive: landed on the original row but the stable id somehow diverged; re-assert it.
+			tx.prepare_cached(UPDATE_ITEM_STABLE_UUID)?
+				.execute((original_stable_uuid, new.id))?;
+			new.stable_uuid = original_stable_uuid;
+		}
 		tx.commit()?;
 		Ok(new)
 	}

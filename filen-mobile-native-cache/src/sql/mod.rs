@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	user::UserInfo,
 	util::PathIteratorExt,
 };
-use filen_types::fs::{Uuid, UuidStr};
+use filen_types::fs::{ParentUuid, Uuid, UuidStr};
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use rusqlite::{
 	Connection, OptionalExtension, ToSql,
@@ -17,6 +17,7 @@ use tracing::{debug, trace};
 
 pub mod error;
 pub use error::SQLError;
+pub mod changes;
 pub mod dir;
 pub mod file;
 pub mod item;
@@ -98,7 +99,11 @@ pub(crate) fn select_object_at_parsed_id<'a>(
 	parsed_id: &ParsedFfiId<'a>,
 ) -> Result<Option<DBObject>, CacheError> {
 	match parsed_id {
-		ParsedFfiId::Trash(uuid_id) | ParsedFfiId::Recents(uuid_id) => Ok(DBObject::select(
+		// Uuid-form ids are normally canonicalized before reaching here; resolving by the trailing
+		// uuid keeps real-uuid ids working as a fallback.
+		ParsedFfiId::Trash(uuid_id)
+		| ParsedFfiId::Recents(uuid_id)
+		| ParsedFfiId::Uuid(uuid_id) => Ok(DBObject::select(
 			conn,
 			uuid_id.uuid.ok_or_else(|| {
 				CacheError::DoesNotExist(
@@ -197,6 +202,69 @@ pub(crate) fn recursive_select_path_from_uuid(
 ) -> Result<Option<String>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(RECURSIVE_SELECT_PATH_FROM_UUID)?;
 	stmt.query_row([uuid], |row| row.get(0)).optional()
+}
+
+/// The container an item ultimately lives in, determined by climbing `items.parent`.
+#[derive(Debug)]
+pub(crate) enum ItemContainer {
+	/// The ancestor chain terminates at the drive root — the item is addressed by its full path id.
+	Root,
+	/// The ancestor chain terminates in trash (at any nesting depth) — addressed by `trash/<uuid>`.
+	Trash,
+}
+
+/// Walks `items.parent` upward from `uuid` to find the container it belongs to.
+///
+/// Unlike string-matching the first segment of a recursively-built path, this distinguishes a genuine
+/// trash item from one whose ancestor chain is simply broken/uncached (normal for `update_recents`,
+/// which inserts items whose parent rows were never cached): a parent reference with no matching
+/// `items` row — or an over-long chain (cycle guard) — yields [`CacheError::DoesNotExist`] naming the
+/// broken ancestor, rather than being misclassified as trash-parented.
+pub(crate) fn classify_item_container(
+	conn: &Connection,
+	uuid: Uuid,
+	root_uuid: Uuid,
+) -> Result<ItemContainer, CacheError> {
+	const MAX_ANCESTOR_DEPTH: usize = 256;
+	if uuid == root_uuid {
+		return Ok(ItemContainer::Root);
+	}
+	let mut current = uuid;
+	for _ in 0..MAX_ANCESTOR_DEPTH {
+		let item = RawDBItem::select(conn, current)?.ok_or_else(|| {
+			CacheError::DoesNotExist(
+				format!("broken ancestor chain: no cached item for {current}").into(),
+			)
+		})?;
+		match item.parent {
+			Some(ParentUuid::Trash(_)) => return Ok(ItemContainer::Trash),
+			Some(ParentUuid::Uuid(parent)) if parent == root_uuid => {
+				return Ok(ItemContainer::Root);
+			}
+			Some(ParentUuid::Uuid(parent)) => current = parent,
+			// A NULL parent (non-root/non-trash row) or a recents/favorites/links sentinel has no
+			// addressable drive/trash container.
+			other => {
+				return Err(CacheError::DoesNotExist(
+					format!("item {current} has no drive/trash container (parent: {other:?})")
+						.into(),
+				));
+			}
+		}
+	}
+	Err(CacheError::DoesNotExist(
+		format!("ancestor chain for {uuid} exceeds depth {MAX_ANCESTOR_DEPTH}").into(),
+	))
+}
+
+/// Resolves a stable uuid to the current real uuid of the row it identifies. Returns `None` when the
+/// argument is not any row's `stable_uuid` (i.e. it is already a real uuid, or is unknown).
+pub(crate) fn select_uuid_by_stable_uuid(
+	conn: &Connection,
+	stable_uuid: Uuid,
+) -> Result<Option<Uuid>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(SELECT_UUID_BY_STABLE_UUID)?;
+	stmt.query_row([stable_uuid], |row| row.get(0)).optional()
 }
 
 pub(crate) fn update_local_data(
@@ -365,6 +433,19 @@ pub(crate) fn select_children(
 		.collect::<SQLResult<Vec<_>>>()
 }
 
+/// One page of `parent`'s children: rows `[offset, offset + limit)` in `order_by` order.
+pub(crate) fn select_children_page(
+	conn: &Connection,
+	order_by: Option<&str>,
+	parent: Uuid,
+	limit: u32,
+	offset: u32,
+) -> SQLResult<Vec<DBNonRootObject>> {
+	let mut stmt = conn.prepare(&select_dir_children_page(order_by))?;
+	stmt.query_and_then((parent, limit, offset), DBNonRootObject::from_row)?
+		.collect::<SQLResult<Vec<_>>>()
+}
+
 /// Selects the cached trashed items (the trash listing).
 pub(crate) fn select_trash(
 	conn: &Connection,
@@ -487,5 +568,303 @@ impl ToSql for RawMeta<'_> {
 				s.as_bytes(),
 			))),
 		}
+	}
+}
+
+#[cfg(test)]
+mod stable_uuid_tests {
+	use filen_types::fs::{ParentUuid, Uuid};
+	use rusqlite::Connection;
+
+	use crate::{ffi::ItemType, sql::item, sql::statements::INIT};
+
+	fn setup() -> Connection {
+		let conn = Connection::open_in_memory().unwrap();
+		conn.execute_batch(INIT).unwrap();
+		conn
+	}
+
+	fn add_file_meta(conn: &Connection, id: i64, name: &str) {
+		conn.execute(
+			"INSERT INTO files (id, size, chunks, region, bucket, timestamp, metadata_state) VALUES (?1, 0, 0, 'r', 'b', 0, 0)",
+			[id],
+		)
+		.unwrap();
+		conn.execute(
+			"INSERT INTO files_meta (id, name, mime, file_key, file_key_version, modified) VALUES (?1, ?2, 'text/plain', 'k', 3, 0)",
+			rusqlite::params![id, name],
+		)
+		.unwrap();
+	}
+
+	// A fresh insert sets stable_uuid = uuid; a content re-mint (new uuid, same parent+name) reuses
+	// the same row, swaps `uuid` in place, and PRESERVES the original stable_uuid.
+	#[test]
+	fn stable_uuid_defaults_to_uuid_then_survives_remint() {
+		let conn = setup();
+		let parent = ParentUuid::Uuid(Uuid::new_v4());
+
+		let uuid_a = Uuid::new_v4();
+		let (id_a, _, stable_a) = item::upsert_item(
+			&conn,
+			uuid_a,
+			Some(parent),
+			Some("f.txt"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+		assert_eq!(stable_a, uuid_a, "fresh insert sets stable_uuid = uuid");
+		add_file_meta(&conn, id_a, "f.txt");
+
+		let uuid_b = Uuid::new_v4();
+		let (id_b, _, stable_b) = item::upsert_item(
+			&conn,
+			uuid_b,
+			Some(parent),
+			Some("f.txt"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+		assert_eq!(id_b, id_a, "re-mint reuses the same row");
+		assert_eq!(
+			stable_b, uuid_a,
+			"stable_uuid is preserved across a uuid re-mint"
+		);
+
+		let (row_uuid, row_stable): (Uuid, Uuid) = conn
+			.query_row(
+				"SELECT uuid, stable_uuid FROM items WHERE id = ?1",
+				[id_a],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)
+			.unwrap();
+		assert_eq!(row_uuid, uuid_b, "uuid was swapped in place");
+		assert_eq!(row_stable, uuid_a, "stored stable_uuid unchanged");
+	}
+
+	// The `modify_file_content` fallback: when a content re-mint lands on a DIFFERENT row (e.g. a
+	// concurrent rename changed (parent, name), so the upsert matched neither the uuid nor
+	// (parent, name) and inserted a fresh row), the original stable_uuid must be transferred to the
+	// new row and the stale original row deleted — without tripping UNIQUE(stable_uuid). This locks
+	// in the delete-first ordering and the statements used by
+	// `DBFile::upsert_remint_preserving_stable`.
+	#[test]
+	fn remint_fallback_transfers_stable_uuid_and_deletes_old_row() {
+		use crate::sql::statements::{DELETE_BY_UUID, UPDATE_ITEM_STABLE_UUID};
+		let conn = setup();
+		let parent = ParentUuid::Uuid(Uuid::new_v4());
+
+		// Original file row.
+		let uuid_a = Uuid::new_v4();
+		let (id_a, _, stable_a) = item::upsert_item(
+			&conn,
+			uuid_a,
+			Some(parent),
+			Some("a.txt"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+		add_file_meta(&conn, id_a, "a.txt");
+		assert_eq!(stable_a, uuid_a);
+
+		// A re-mint whose (parent, name) no longer matches the original row -> a NEW row is inserted
+		// with stable_uuid defaulting to its own uuid.
+		let uuid_b = Uuid::new_v4();
+		let (id_b, _, stable_b) = item::upsert_item(
+			&conn,
+			uuid_b,
+			Some(parent),
+			Some("b.txt"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+		add_file_meta(&conn, id_b, "b.txt");
+		assert_ne!(id_b, id_a, "a different (parent,name) yields a new row");
+		assert_eq!(stable_b, uuid_b);
+
+		// Fallback: delete the stale row FIRST (frees the UNIQUE slot), then adopt the original stable.
+		conn.prepare_cached(DELETE_BY_UUID)
+			.unwrap()
+			.execute([uuid_a])
+			.unwrap();
+		conn.prepare_cached(UPDATE_ITEM_STABLE_UUID)
+			.unwrap()
+			.execute((stable_a, id_b))
+			.unwrap();
+
+		// The old row is gone; the new row now carries the original stable identity.
+		let old_exists: bool = conn
+			.query_row(
+				"SELECT EXISTS(SELECT 1 FROM items WHERE uuid = ?1)",
+				[uuid_a],
+				|r| r.get(0),
+			)
+			.unwrap();
+		assert!(!old_exists, "the stale original row is deleted");
+		let (row_uuid, row_stable): (Uuid, Uuid) = conn
+			.query_row(
+				"SELECT uuid, stable_uuid FROM items WHERE id = ?1",
+				[id_b],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)
+			.unwrap();
+		assert_eq!(row_uuid, uuid_b);
+		assert_eq!(
+			row_stable, uuid_a,
+			"the original stable id is carried onto the re-minted row"
+		);
+	}
+
+	// Re-upserting the SAME uuid (an ordinary metadata refresh) keeps stable_uuid == uuid.
+	#[test]
+	fn stable_uuid_unchanged_on_same_uuid_upsert() {
+		let conn = setup();
+		let parent = ParentUuid::Uuid(Uuid::new_v4());
+		let uuid = Uuid::new_v4();
+		let (id, _, _) = item::upsert_item(
+			&conn,
+			uuid,
+			Some(parent),
+			Some("g.txt"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+		add_file_meta(&conn, id, "g.txt");
+		let (_, _, stable) = item::upsert_item(
+			&conn,
+			uuid,
+			Some(parent),
+			Some("g.txt"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+		assert_eq!(stable, uuid);
+	}
+}
+
+#[cfg(test)]
+mod container_tests {
+	use filen_types::fs::{ParentUuid, Uuid};
+	use rusqlite::Connection;
+
+	use super::{
+		ItemContainer, classify_item_container, insert_root, recursive_select_path_from_uuid,
+	};
+	use crate::{
+		CacheError, auth::configure_connection, ffi::ItemType, sql::item, sql::statements::INIT,
+	};
+
+	fn setup() -> Connection {
+		let conn = Connection::open_in_memory().unwrap();
+		// Register the `uuid_text` SQL function (and PRAGMAs) exactly as a real connection does, so the
+		// recursive path query — which renders BLOB uuids via `uuid_text` — resolves.
+		configure_connection(&conn).unwrap();
+		conn.execute_batch(INIT).unwrap();
+		conn
+	}
+
+	// (b) A root-reachable item classifies to Root and canonicalizes to its full path id, which
+	// includes the drive root uuid.
+	#[test]
+	fn root_reachable_item_classifies_to_root_full_path() {
+		let mut conn = setup();
+		let root = Uuid::new_v4();
+		insert_root(&mut conn, root).unwrap();
+		let dir = Uuid::new_v4();
+		item::upsert_item(
+			&conn,
+			dir,
+			Some(ParentUuid::Uuid(root)),
+			Some("d"),
+			None,
+			ItemType::Dir,
+		)
+		.unwrap();
+		let file = Uuid::new_v4();
+		item::upsert_item(
+			&conn,
+			file,
+			Some(ParentUuid::Uuid(dir)),
+			Some("f"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+
+		assert!(matches!(
+			classify_item_container(&conn, file, root).unwrap(),
+			ItemContainer::Root
+		));
+		// Full path is "<root>/<dir>/<file>" (names fall back to uuids without cached metadata).
+		assert_eq!(
+			recursive_select_path_from_uuid(&conn, file).unwrap(),
+			Some(format!("{root}/{dir}/{file}"))
+		);
+	}
+
+	// (a) A trash-NESTED item (a dir under trash, a file under that dir) classifies to Trash, so it
+	// canonicalizes to the `trash/<uuid>` form regardless of nesting depth.
+	#[test]
+	fn trash_nested_item_classifies_to_trash() {
+		let conn = setup();
+		let root = Uuid::new_v4();
+		let dir = Uuid::new_v4();
+		// Trashed items keep their ORIGINAL parent in `parent`; the payload here (its former parent,
+		// the root) is what `decompose_parent` stores alongside `trashed = TRUE`.
+		item::upsert_item(
+			&conn,
+			dir,
+			Some(ParentUuid::Trash(root)),
+			Some("d"),
+			None,
+			ItemType::Dir,
+		)
+		.unwrap();
+		let file = Uuid::new_v4();
+		item::upsert_item(
+			&conn,
+			file,
+			Some(ParentUuid::Uuid(dir)),
+			Some("f"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+
+		assert!(matches!(
+			classify_item_container(&conn, file, root).unwrap(),
+			ItemContainer::Trash
+		));
+	}
+
+	// (c) An orphan (its parent row was never cached, as happens for `update_recents` inserts) is a
+	// DoesNotExist error — NOT silently misclassified as trash-parented.
+	#[test]
+	fn orphaned_item_is_does_not_exist_not_trash() {
+		let conn = setup();
+		let root = Uuid::new_v4();
+		let missing_parent = Uuid::new_v4();
+		let file = Uuid::new_v4();
+		item::upsert_item(
+			&conn,
+			file,
+			Some(ParentUuid::Uuid(missing_parent)),
+			Some("f"),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+
+		let err = classify_item_container(&conn, file, root).unwrap_err();
+		assert!(
+			matches!(err, CacheError::DoesNotExist(_)),
+			"an orphan chain must be DoesNotExist, got {err:?}"
+		);
 	}
 }

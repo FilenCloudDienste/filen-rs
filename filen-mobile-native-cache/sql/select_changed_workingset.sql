@@ -34,4 +34,4 @@ LEFT JOIN dirs ON items.id = dirs.id
 LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 LEFT JOIN files ON items.id = files.id
 LEFT JOIN files_meta ON items.id = files_meta.id
-WHERE items.parent = ? AND items.trashed = FALSE
+WHERE items.seq > ?1 AND items.type != 0

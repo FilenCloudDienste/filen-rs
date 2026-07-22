@@ -1,14 +1,17 @@
 use std::{collections::HashMap, str::FromStr, time::Instant};
 
 use filen_sdk_rs::fs::HasUUID;
-use filen_types::fs::Uuid;
-use rusqlite::OptionalExtension;
+use filen_types::fs::{Uuid, UuidStr};
+use rusqlite::{Connection, OptionalExtension};
 use tracing::debug;
 
 use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
-	ffi::{FfiId, FfiObject, FfiRoot, QueryChildrenResponse, QueryNonDirChildrenResponse},
+	ffi::{
+		FfiId, FfiNonRootObject, FfiObject, FfiRoot, ParsedFfiId, QueryChildrenResponse,
+		QueryNonDirChildrenResponse,
+	},
 	sql::{
 		self, DBDirExt, DBDirObject, DBItemTrait, DBRoot,
 		error::OptionalExtensionSQL,
@@ -85,6 +88,33 @@ impl FilenMobileCacheState {
 	pub fn root_uuid(&self) -> Result<String, CacheError> {
 		self.sync_execute_authed(|auth_state| Ok(auth_state.root_uuid()))
 	}
+
+	/// The current opaque sync anchor (epoch‖seq). The extension stores it and passes it back to
+	/// [`Self::enumerate_changes`](crate::auth::FilenMobileCacheState::enumerate_changes).
+	pub fn current_sync_anchor(&self) -> Result<Vec<u8>, CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.current_sync_anchor())
+	}
+
+	/// The FULL working-set enumeration: favorited (file or dir), recent, or trashed items (see
+	/// `select_working_set.sql`). Local-only (no server refresh); pair with
+	/// `update_recents`/`update_trash` before calling for freshness.
+	///
+	/// Materialized items are deliberately NOT enumerated here: the system tracks its own materialized
+	/// set and merges it into the working set, and any materialized item we pull a change into surfaces
+	/// through the working-set CHANGE delta (`select_changed_workingset` returns every row with
+	/// `seq > anchor`, regardless of favorite/recent status — see `enumerate_changes`). So
+	/// favorited + recent (+ trash) is the correct proactive-refresh surface; enumerating materialized
+	/// items would additionally require tracking materialization in the cache, which we don't do.
+	pub fn query_working_set_items(&self) -> Result<Vec<FfiNonRootObject>, CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.query_working_set_items())
+	}
+
+	/// uuids of every materialized (already-listed) dir. The reconnect handler re-lists these so a
+	/// remote change to a deep folder made during a socket-down window surfaces, not just root-level
+	/// ones. See [`crate::socket`] / the Swift `SocketNotifier.onReconnect`.
+	pub fn query_materialized_dir_uuids(&self) -> Result<Vec<String>, CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.query_materialized_dir_uuids())
+	}
 }
 
 impl AuthCacheState {
@@ -112,6 +142,7 @@ impl AuthCacheState {
 		path: &FfiId,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>, CacheError> {
+		let path = self.canonicalize_ffi_id(path)?;
 		let path_id = path.as_path()?;
 		debug!("Querying directory children at path: {}", path.0);
 
@@ -122,6 +153,30 @@ impl AuthCacheState {
 
 		let conn = self.conn();
 		let children = dir.select_children(&conn, order_by.as_deref())?;
+		Ok(Some(QueryChildrenResponse {
+			parent: dir.into(),
+			objects: children.into_iter().map(Into::into).collect(),
+		}))
+	}
+
+	/// One page of a directory's children, rows `[offset, offset + limit)` in `order_by` order.
+	/// Local only (no server refresh) — the File Provider enumerator refreshes on the first page via
+	/// [`AuthCacheState::update_and_query_dir_children_page`] and pages the rest from cache.
+	pub(crate) fn query_dir_children_page(
+		&self,
+		path: &FfiId,
+		order_by: Option<String>,
+		offset: u32,
+		limit: u32,
+	) -> Result<Option<QueryChildrenResponse>, CacheError> {
+		let path = self.canonicalize_ffi_id(path)?;
+		let path_id = path.as_path()?;
+		let dir: DBDirObject = match sql::select_object_at_path(&self.conn(), &path_id)? {
+			Some(obj) => obj.try_into()?,
+			None => return Ok(None),
+		};
+		let conn = self.conn();
+		let children = dir.select_children_page(&conn, order_by.as_deref(), limit, offset)?;
 		Ok(Some(QueryChildrenResponse {
 			parent: dir.into(),
 			objects: children.into_iter().map(Into::into).collect(),
@@ -159,6 +214,7 @@ impl AuthCacheState {
 	}
 
 	pub(crate) fn query_item(&self, path: &FfiId) -> Result<Option<FfiObject>, CacheError> {
+		let path = self.canonicalize_ffi_id(path)?;
 		debug!("Querying item at path: {}", path.0);
 		let path_values = path.as_parsed()?;
 		let obj = sql::select_object_at_parsed_id(&self.conn(), &path_values)?;
@@ -191,10 +247,10 @@ impl AuthCacheState {
 
 	pub(crate) fn query_item_by_uuid(&self, uuid: &str) -> Result<Option<FfiObject>, CacheError> {
 		debug!("Querying item by UUID: {uuid}");
-		let uuid = Uuid::from_str(uuid)?;
-		Ok(DBObject::select(&self.conn(), uuid)
-			.optional()?
-			.map(Into::into))
+		let uuid = UuidStr::from_str(uuid)?;
+		let conn = self.conn();
+		let uuid = self.resolve_uuid(&conn, uuid.into())?;
+		Ok(DBObject::select(&conn, uuid).optional()?.map(Into::into))
 	}
 
 	pub(crate) fn query_path_for_uuid(&self, uuid: String) -> Result<Option<FfiId>, CacheError> {
@@ -204,12 +260,14 @@ impl AuthCacheState {
 		}
 		let uuid = Uuid::from_str(&uuid)?;
 		let conn = self.conn();
+		let uuid = self.resolve_uuid(&conn, uuid)?;
 		let path = sql::recursive_select_path_from_uuid(&conn, uuid)?;
 
 		Ok(path.map(Into::into))
 	}
 
 	pub(crate) fn get_all_descendant_paths(&self, path: &FfiId) -> Result<Vec<FfiId>, CacheError> {
+		let path = self.canonicalize_ffi_id(path)?;
 		debug!("Getting all descendant paths for: {}", path.0);
 		let path_values = path.as_path()?;
 		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
@@ -240,6 +298,7 @@ impl AuthCacheState {
 		key: String,
 		value: Option<String>,
 	) -> Result<FfiObject, CacheError> {
+		let path = self.canonicalize_ffi_id(&path)?;
 		debug!(
 			"Setting {key} to {value:?} for local data for path: {}",
 			path.0
@@ -285,5 +344,78 @@ impl AuthCacheState {
 
 	pub(crate) fn root_uuid(&self) -> String {
 		self.client.root().uuid().to_string()
+	}
+
+	pub(crate) fn current_sync_anchor(&self) -> Result<Vec<u8>, CacheError> {
+		debug!("Reading current sync anchor");
+		let conn = self.conn();
+		Ok(sql::changes::current_anchor(&conn)?.to_bytes())
+	}
+
+	pub(crate) fn query_working_set_items(&self) -> Result<Vec<FfiNonRootObject>, CacheError> {
+		debug!("Querying working set items");
+		let conn = self.conn();
+		Ok(sql::changes::select_working_set(&conn)?
+			.into_iter()
+			.map(Into::into)
+			.collect())
+	}
+
+	pub(crate) fn query_materialized_dir_uuids(&self) -> Result<Vec<String>, CacheError> {
+		debug!("Querying materialized dir uuids");
+		let conn = self.conn();
+		Ok(sql::select_materialized_dir_uuids(&conn)?
+			.into_iter()
+			.map(|uuid| uuid.to_string())
+			.collect())
+	}
+
+	/// Resolves a stable-or-real uuid to the real uuid of the row it identifies. Returns the input
+	/// unchanged when it is not any row's `stable_uuid` (i.e. it is already a real uuid, or unknown).
+	pub(crate) fn resolve_uuid(&self, conn: &Connection, uuid: Uuid) -> Result<Uuid, CacheError> {
+		Ok(sql::select_uuid_by_stable_uuid(conn, uuid)?.unwrap_or(uuid))
+	}
+
+	/// Canonicalizes an [`FfiId`] for the exported methods that accept path-like ids.
+	///
+	/// Non-`uuid/<uuid>` ids pass through untouched. A `uuid/<uuid>` id (where `<uuid>` may be a
+	/// stable or real uuid) is resolved to its canonical form: the drive root uuid becomes a bare
+	/// root id, a trash-parented item becomes `trash/<real-uuid>`, and any other item becomes its
+	/// full path id. An unknown uuid yields [`CacheError::DoesNotExist`].
+	pub(crate) fn canonicalize_ffi_id(&self, id: &FfiId) -> Result<FfiId, CacheError> {
+		let stable_or_real = match id.as_parsed()? {
+			ParsedFfiId::Uuid(uuid_id) => uuid_id.uuid.ok_or_else(|| {
+				CacheError::DoesNotExist(format!("uuid id is missing a uuid: {}", id.0).into())
+			})?,
+			ParsedFfiId::Trash(_) | ParsedFfiId::Recents(_) | ParsedFfiId::Path(_) => {
+				return Ok(id.clone());
+			}
+		};
+
+		let conn = self.conn();
+		let real_uuid = self.resolve_uuid(&conn, stable_or_real)?;
+		let root_uuid = self.client.root().uuid();
+		if real_uuid == root_uuid {
+			return Ok(FfiId(root_uuid.to_string()));
+		}
+
+		// Determine the container by climbing `items.parent`, not by string-matching the first segment
+		// of a recursively-built path: an item with a broken/uncached ancestor chain (normal for
+		// `update_recents` inserts) is a genuine error, never a trash-parented item.
+		match sql::classify_item_container(&conn, real_uuid, root_uuid)? {
+			// A trash-parented item addresses by `trash/<real-uuid>` regardless of nesting depth.
+			sql::ItemContainer::Trash => Ok(FfiId(format!("trash/{real_uuid}"))),
+			// A root-reachable item addresses by its full path INCLUDING the root uuid
+			// (e.g. "<root>/dir/file").
+			sql::ItemContainer::Root => {
+				let path =
+					sql::recursive_select_path_from_uuid(&conn, real_uuid)?.ok_or_else(|| {
+						CacheError::DoesNotExist(
+							format!("no item found for uuid id: {}", id.0).into(),
+						)
+					})?;
+				Ok(FfiId(path))
+			}
+		}
 	}
 }

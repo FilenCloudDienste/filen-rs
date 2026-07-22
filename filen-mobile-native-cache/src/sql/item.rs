@@ -69,6 +69,7 @@ pub(crate) fn combine_parent(parent: Option<Uuid>, trashed: bool) -> Option<Pare
 pub struct RawDBItem {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
+	pub(crate) stable_uuid: Uuid, // identity preserved across uuid re-mints; == uuid for dirs/roots
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) local_data: Option<JsonObject>, // local data is optional, used for storing additional metadata
 	pub(crate) type_: ItemType,
@@ -81,15 +82,15 @@ pub(crate) fn upsert_item_with_stmts(
 	local_data: Option<JsonObject>,
 	type_: ItemType,
 	upsert_item_stmt: &mut CachedStatement<'_>,
-) -> Result<(i64, Option<JsonObject>)> {
+) -> Result<(i64, Option<JsonObject>, Uuid)> {
 	trace!("Upserting item: uuid = {uuid}, parent = {parent:?}, name = {name:?}, type = {type_:?}");
 	let (parent_uuid, trashed) = decompose_parent(parent);
-	let (id, local_data) = upsert_item_stmt.query_row(
+	let (id, local_data, stable_uuid) = upsert_item_stmt.query_row(
 		(uuid, parent_uuid, name, local_data, type_, trashed),
-		|row| Ok((row.get(0)?, row.get(1)?)),
+		|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
 	)?;
 	trace!("Upserted item with id: {id}");
-	Ok((id, local_data))
+	Ok((id, local_data, stable_uuid))
 }
 
 pub(crate) fn upsert_item(
@@ -99,21 +100,22 @@ pub(crate) fn upsert_item(
 	name: Option<&str>,
 	local_data: Option<JsonObject>,
 	type_: ItemType,
-) -> Result<(i64, Option<JsonObject>)> {
+) -> Result<(i64, Option<JsonObject>, Uuid)> {
 	let mut upsert_item_stmt = conn.prepare_cached(UPSERT_ITEM)?;
 	upsert_item_with_stmts(uuid, parent, name, local_data, type_, &mut upsert_item_stmt)
 }
 
 impl RawDBItem {
 	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-		let parent: Option<Uuid> = row.get(2)?;
-		let trashed: bool = row.get(3)?;
+		let parent: Option<Uuid> = row.get(3)?;
+		let trashed: bool = row.get(4)?;
 		Ok(Self {
 			id: row.get(0)?,
 			uuid: row.get(1)?,
+			stable_uuid: row.get(2)?,
 			parent: combine_parent(parent, trashed),
-			local_data: row.get(4).unwrap(),
-			type_: row.get(5)?,
+			local_data: row.get(5).unwrap(),
+			type_: row.get(6)?,
 		})
 	}
 
@@ -135,19 +137,21 @@ impl RawDBItem {
 pub struct InnerDBItem {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
+	pub(crate) stable_uuid: Uuid, // identity preserved across uuid re-mints; == uuid for dirs/roots
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) local_data: Option<JsonObject>, // local data is optional, used for storing additional metadata
 }
 
 impl InnerDBItem {
 	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-		let parent: Option<Uuid> = row.get(2)?;
-		let trashed: bool = row.get(3)?;
+		let parent: Option<Uuid> = row.get(3)?;
+		let trashed: bool = row.get(4)?;
 		Ok(Self {
 			id: row.get(0)?,
 			uuid: row.get(1)?,
+			stable_uuid: row.get(2)?,
 			parent: combine_parent(parent, trashed),
-			local_data: row.get(4).unwrap(),
+			local_data: row.get(5).unwrap(),
 		})
 	}
 }
@@ -157,6 +161,7 @@ impl From<RawDBItem> for InnerDBItem {
 		Self {
 			id: raw.id,
 			uuid: raw.uuid,
+			stable_uuid: raw.stable_uuid,
 			parent: raw.parent,
 			local_data: raw.local_data,
 		}

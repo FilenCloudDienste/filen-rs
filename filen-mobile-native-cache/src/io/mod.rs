@@ -251,6 +251,43 @@ impl AuthCacheState {
 		Ok(file)
 	}
 
+	/// Refreshes the local cache copy after a content re-upload that re-minted the file uuid.
+	///
+	/// Copies the freshly uploaded EXTERNAL bytes into the new `cache/<new-uuid>/<name>` location
+	/// and best-effort removes the stale `cache/<old-uuid>/` directory. Mirrors the tail of
+	/// [`Self::io_upload_updated_file`], but takes the bytes from an external path rather than the
+	/// old cache copy (which may not exist and is not the source of truth for `modify_file_content`).
+	pub(crate) async fn io_refresh_cache_from_external(
+		&self,
+		external_path: &Path,
+		new_file: &RemoteFile,
+		old_uuid: Uuid,
+	) -> Result<PathBuf, io::Error> {
+		let new_path = self.get_cached_file_path(new_file);
+		let parent = new_path
+			.parent()
+			.expect("cached file path parent should always exist");
+		tokio::fs::create_dir_all(parent).await?;
+		// std::fs::copy (wrapped by tokio::fs::copy) uses APFS clonefile on iOS/macOS, so this is
+		// cheap; overwrites any existing cache copy.
+		tokio::fs::copy(external_path, &new_path).await?;
+		// Best-effort removal of the stale cache dir for the old uuid. The re-mint always yields a
+		// new uuid (new dir != old dir), but guard anyway so we never delete the fresh copy.
+		if new_file.uuid() != old_uuid {
+			let old_dir = self.cache_dir.join(old_uuid.to_string());
+			if let Err(e) = tokio::fs::remove_dir_all(&old_dir).await
+				&& e.kind() != io::ErrorKind::NotFound
+			{
+				tracing::warn!(
+					"Failed to remove old cache directory {}: {}",
+					old_dir.display(),
+					e
+				);
+			}
+		}
+		Ok(new_path)
+	}
+
 	pub(crate) async fn io_upload_new_file(
 		&self,
 		builder: FileBuilderOptionalName,

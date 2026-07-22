@@ -119,6 +119,7 @@ impl From<DBDirMeta> for DirectoryMeta<'static> {
 pub struct DBDir {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
+	pub(crate) stable_uuid: Uuid,
 	pub(crate) parent: ParentUuid,
 	pub(crate) favorite_rank: i64,
 	pub(crate) color: DirColor<'static>,
@@ -137,6 +138,7 @@ impl DBDir {
 		Ok(Self {
 			id: item.id,
 			uuid: item.uuid,
+			stable_uuid: item.stable_uuid,
 			parent: item.parent.ok_or_else(|| {
 				rusqlite::Error::FromSqlConversionFailure(
 					0,
@@ -166,7 +168,7 @@ impl DBDir {
 		upsert_dir_meta: &mut CachedStatement<'_>,
 		delete_dir_meta: &mut CachedStatement<'_>,
 	) -> Result<Self> {
-		let (id, local_data) = item::upsert_item_with_stmts(
+		let (id, local_data, stable_uuid) = item::upsert_item_with_stmts(
 			remote_dir.uuid(),
 			Some(*remote_dir.parent()),
 			remote_dir.name(),
@@ -213,6 +215,7 @@ impl DBDir {
 		Ok(Self {
 			id,
 			uuid: remote_dir.uuid,
+			stable_uuid,
 			parent: remote_dir.parent,
 			favorite_rank,
 			color: remote_dir.color,
@@ -378,7 +381,7 @@ impl DBRoot {
 	) -> Result<Self> {
 		trace!("Upserting remote root: {remote_root:?}");
 		let tx = conn.transaction()?;
-		let (id, _) = item::upsert_item(
+		let (id, _, _) = item::upsert_item(
 			&tx,
 			remote_root.uuid(),
 			None, // root has no parent
@@ -454,6 +457,14 @@ impl From<DBRoot> for RootDirectory {
 		RootDirectory::new(value.uuid)
 	}
 }
+/// uuids of every dir we've listed (`last_listed > 0`) — the folders whose child listing we mirror
+/// locally, i.e. the "materialized" dirs. Used by the socket reconnect handler to re-list them so a
+/// remote change to a deep folder made during a socket-down window surfaces, not just root-level ones.
+pub(crate) fn select_materialized_dir_uuids(conn: &Connection) -> Result<Vec<Uuid>> {
+	let mut stmt = conn.prepare_cached(SELECT_MATERIALIZED_DIR_UUIDS)?;
+	stmt.query_map([], |row| row.get(0))?.collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DBDirObject {
 	Dir(DBDir),
@@ -563,6 +574,13 @@ pub(crate) trait DBDirExt {
 		conn: &Connection,
 		order_by: Option<&str>,
 	) -> SQLResult<Vec<DBNonRootObject>>;
+	fn select_children_page(
+		&self,
+		conn: &Connection,
+		order_by: Option<&str>,
+		limit: u32,
+		offset: u32,
+	) -> SQLResult<Vec<DBNonRootObject>>;
 }
 
 impl<T> DBDirExt for T
@@ -592,5 +610,15 @@ where
 		order_by: Option<&str>,
 	) -> SQLResult<Vec<DBNonRootObject>> {
 		crate::sql::select_children(conn, order_by, self.uuid())
+	}
+
+	fn select_children_page(
+		&self,
+		conn: &Connection,
+		order_by: Option<&str>,
+		limit: u32,
+		offset: u32,
+	) -> SQLResult<Vec<DBNonRootObject>> {
+		crate::sql::select_children_page(conn, order_by, self.uuid(), limit, offset)
 	}
 }
