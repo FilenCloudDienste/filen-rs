@@ -260,6 +260,11 @@ impl Client {
 		let resp =
 			api::v3::dir::post(self.client(), &api::v3::dir::Request { uuid: dir.uuid() }).await?;
 		dir.parent = resp.parent;
+		// Mirror the restored subtree's metadata into the (now current) parent's
+		// shares/links (as create/upload do); otherwise recipients of a connected
+		// parent cannot see or decrypt the restored items.
+		self.update_item_with_maybe_connected_parent((&*dir).into())
+			.await?;
 		Ok(())
 	}
 
@@ -380,6 +385,11 @@ impl Client {
 		)
 		.await?;
 		dir.set_parent((new_parent.uuid()).into());
+		// Mirror the moved subtree's metadata into the new parent's shares/links (as
+		// create/upload do); otherwise recipients of a shared or publicly-linked
+		// destination cannot see or decrypt the moved-in items.
+		self.update_item_with_maybe_connected_parent((&*dir).into())
+			.await?;
 		Ok(())
 	}
 

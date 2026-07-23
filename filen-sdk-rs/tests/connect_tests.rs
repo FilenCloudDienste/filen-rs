@@ -172,6 +172,71 @@ async fn dir_public_link() {
 	assert!(!sub_files.contains(&sub_sub_file));
 }
 
+// Moving a subtree into a publicly-linked parent must mirror the moved items'
+// metadata into that link (as create/upload do); otherwise link recipients
+// cannot see or decrypt the moved-in directory or its files. Exercises the
+// move_dir propagation site (F055); move_file/restore_dir/restore_file share the
+// identical `update_item_with_maybe_connected_parent` call.
+#[shared_test_runtime]
+async fn move_into_linked_dir_propagates() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let unauth_client = client.get_unauthed();
+
+	// Destination parent with a public link.
+	let parent = client
+		.create_dir(&test_dir.into(), "linked_parent")
+		.await
+		.unwrap();
+	client
+		.public_link_dir::<fn(u64, Option<u64>)>(&parent, None)
+		.await
+		.unwrap();
+
+	// Source subtree (with a nested file) created OUTSIDE the link.
+	let mut moved = client.create_dir(&test_dir.into(), "moved").await.unwrap();
+	let child = client.make_file_builder("child.txt", moved.uuid()).unwrap();
+	let child = client.upload_file(child, b"hi").await.unwrap();
+
+	// Move the subtree into the linked parent.
+	client
+		.move_dir(&mut moved, &(&parent).into())
+		.await
+		.unwrap();
+
+	// The link must now expose the moved directory...
+	let link: DirPublicLink = client
+		.get_dir_link_rw(&parent)
+		.await
+		.unwrap()
+		.unwrap()
+		.try_into()
+		.unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
+	let (dirs, _files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	let linked_moved = dirs
+		.iter()
+		.find(|d| d.inner().uuid() == moved.uuid())
+		.expect("moved dir must be visible in the destination link");
+
+	// ...and its nested file.
+	let (_sub_dirs, sub_files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_moved.into(), &info.link, None)
+		.await
+		.unwrap();
+	assert!(
+		sub_files.iter().any(|f| f.uuid() == child.uuid()),
+		"moved dir's nested file must be visible in the destination link"
+	);
+}
+
 #[shared_test_runtime]
 async fn dir_public_link_remove() {
 	let resources = test_utils::RESOURCES.get_resources().await;

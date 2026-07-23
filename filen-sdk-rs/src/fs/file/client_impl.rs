@@ -98,6 +98,11 @@ impl Client {
 				.await?;
 
 		file.parent = resp.parent;
+		// Mirror the restored file's metadata into the (now current) parent's
+		// shares/links (as upload does); otherwise recipients of a connected parent
+		// cannot see or decrypt the restored file.
+		self.update_item_with_maybe_connected_parent((&*file).into())
+			.await?;
 		Ok(())
 	}
 
@@ -125,6 +130,11 @@ impl Client {
 		)
 		.await?;
 		file.parent = (new_parent.uuid()).into();
+		// Mirror the moved file's metadata into the new parent's shares/links (as
+		// upload does); otherwise recipients of a shared or publicly-linked
+		// destination cannot see or decrypt the moved-in file.
+		self.update_item_with_maybe_connected_parent((&*file).into())
+			.await?;
 		Ok(())
 	}
 
