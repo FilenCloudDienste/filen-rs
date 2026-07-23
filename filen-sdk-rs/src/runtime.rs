@@ -647,6 +647,36 @@ mod wasm_threading {
 		)]
 		memory: JsValue,
 		closure_ptr: usize,
+		main_time_origin: f64,
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	/// The `performance.timeOrigin` of the spawning PAGE, in epoch milliseconds. Every worker this
+	/// SDK spawns rebases its `performance.now()` onto this origin (see
+	/// `filen-sdk-worker-thread.js`): raw `performance.now()` is relative to each context's OWN
+	/// creation time, but timer and rate-limiter state (`wasmtimer`'s global wheel, `governor`'s
+	/// limiter) lives in shared wasm memory and is read from every thread — mixing per-context
+	/// clock domains there skews readings by the page-to-worker startup gap and stalls timers and
+	/// rate limits for exactly that long.
+	fn reference_time_origin() -> f64 {
+		use web_sys::js_sys;
+
+		let global = js_sys::global();
+		// A worker we spawned earlier stored the page's origin at boot; hand the SAME reference
+		// down so nested spawns keep normalizing to one domain.
+		if let Ok(value) =
+			js_sys::Reflect::get(&global, &JsValue::from_str("__filenMainTimeOrigin"))
+			&& let Some(value) = value.as_f64()
+		{
+			return value;
+		}
+		js_sys::Reflect::get(&global, &JsValue::from_str("performance"))
+			.ok()
+			.and_then(|performance| {
+				js_sys::Reflect::get(&performance, &JsValue::from_str("timeOrigin")).ok()
+			})
+			.and_then(|value| value.as_f64())
+			.unwrap_or(0.0)
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -678,6 +708,7 @@ mod wasm_threading {
 		let event = WorkerInitEvent {
 			memory: wasm_bindgen::memory(),
 			closure_ptr: ptr as usize,
+			main_time_origin: reference_time_origin(),
 		};
 
 		let event = serde_wasm_bindgen::to_value(&event)?;
