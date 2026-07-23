@@ -10,7 +10,6 @@ use syn::{
 };
 use syn::{Item, WherePredicate};
 
-mod anchored_ref;
 mod rkyv_self;
 mod sdk_type_derives;
 
@@ -349,16 +348,6 @@ pub fn rkyv_self(attr: TokenStream, item: TokenStream) -> TokenStream {
 		}
 	}
 	rkyv_self::rkyv_self(item, no_check_bytes)
-}
-
-/// Derive macro for TransmuteLifetime trait
-///
-/// Generates different implementations based on whether the struct has lifetime parameters:
-/// - For types with lifetimes: implements for 'static version with transmute
-/// - For types without lifetimes: implements identity operations
-#[proc_macro_derive(AnchorableRef)]
-pub fn derive_transmute_lifetime(input: TokenStream) -> TokenStream {
-	anchored_ref::derive_transmute_lifetime(input)
 }
 
 #[proc_macro_derive(CowHelpers)]

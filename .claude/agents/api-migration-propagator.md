@@ -17,7 +17,7 @@ This is a Rust workspace (nightly-2026-02-20) with these crates and their depend
 - **filen-cli** — CLI tool; depends on filen-sdk-rs
 - **filen-rclone-wrapper** — rclone integration; depends on filen-sdk-rs
 - **filen-macros** — proc-macros; depended on broadly
-- **anchored-ref**, **heif-decoder**, **test-utils**, **uniffi-bindgen** — peripheral crates
+- **heif-decoder**, **test-utils**, **uniffi-bindgen** — peripheral crates
 
 ## Your Workflow
 

@@ -45,7 +45,6 @@ Uses **nightly** Rust (`nightly-2026-02-20`) via `rust-toolchain.toml`. The nigh
 | `filen-types` | Shared type definitions and serde utilities for all API types |
 | `filen-macros` | Proc-macros: `#[shared_test_runtime]`, `#[js_type]`, derive macros (`HasUUID`, `HasName`, `HasParent`, etc.) |
 | `filen-mobile-native-cache` | UniFFI bindings for iOS/Android; SQLite cache; sync between local and remote |
-| `anchored-ref` | Utility crate for self-referential / anchored reference types |
 | `heif-decoder` | HEIF/HEIC decoder built from `libheif`/`libde265` C++ sources (git submodules in `deps/`) |
 | `test-utils` | Shared integration test infrastructure (accounts, cleanup, async runtime) |
 | `uniffi-bindgen` / `uniffi-bindgen-swift` | Thin wrappers to drive UniFFI codegen for Kotlin and Swift |

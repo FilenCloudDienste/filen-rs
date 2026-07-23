@@ -15,7 +15,6 @@ You are working in a Cargo workspace with these crates:
 - `filen-types` — Shared type definitions and serde utilities
 - `filen-macros` — Proc-macros and derive macros
 - `filen-mobile-native-cache` — UniFFI bindings for iOS/Android
-- `anchored-ref` — Self-referential/anchored reference types
 - `heif-decoder` — HEIF/HEIC decoder (C++ sources, broken incremental builds)
 - `test-utils` — Shared integration test infrastructure
 - `filen-cli` — CLI tool
