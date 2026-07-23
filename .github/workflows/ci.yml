@@ -159,6 +159,13 @@ jobs:
       - name: Install dependencies for avif-decoder
         run: |
           brew install dav1d pkg-config
+          # Homebrew's dav1d.pc resolves to the versioned Cellar path, which rust-cache bakes
+          # into dav1d-sys's cached build-script output — it dangles on every bottle bump.
+          # Clippy never links so this job survives today, but the poisoned cache would break
+          # any future linking step. Bypass pkg-config, link via the version-stable opt symlink.
+          echo "SYSTEM_DEPS_DAV1D_NO_PKG_CONFIG=1" >> "$GITHUB_ENV"
+          echo "SYSTEM_DEPS_DAV1D_LIB=dav1d" >> "$GITHUB_ENV"
+          echo "SYSTEM_DEPS_DAV1D_SEARCH_NATIVE=$(brew --prefix dav1d)/lib" >> "$GITHUB_ENV"
       - name: Run clippy Android
         run: cargo ndk --target aarch64-linux-android clippy -F malformed,heif-decoder,cache -- -D warnings
       - name: Run clippy Android uniffi

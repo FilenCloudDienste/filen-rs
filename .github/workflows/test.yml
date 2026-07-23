@@ -66,6 +66,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install dav1d pkg-config
+          # Homebrew's dav1d.pc resolves to the versioned Cellar path, which rust-cache bakes
+          # into dav1d-sys's cached build-script output — it dangles on every bottle bump
+          # ("ld: library 'dav1d' not found"). Bypass pkg-config and link via the
+          # version-stable opt symlink instead.
+          echo "SYSTEM_DEPS_DAV1D_NO_PKG_CONFIG=1" >> "$GITHUB_ENV"
+          echo "SYSTEM_DEPS_DAV1D_LIB=dav1d" >> "$GITHUB_ENV"
+          echo "SYSTEM_DEPS_DAV1D_SEARCH_NATIVE=$(brew --prefix dav1d)/lib" >> "$GITHUB_ENV"
       - name: Install Wild linker
         if: runner.os == 'Linux'
         uses: taiki-e/cache-cargo-install-action@v2
