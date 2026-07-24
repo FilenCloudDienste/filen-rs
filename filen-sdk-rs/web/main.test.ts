@@ -13,6 +13,8 @@ import init, {
 	type DirMeta,
 	UnauthClient,
 	parseName,
+	encodeName,
+	decodeName,
 	EntryNameErrorJS,
 	type AnyLinkedDirWithContext,
 	type CacheStatusMessage,
@@ -1307,6 +1309,73 @@ test("name validation", () => {
 
 	// Already-NFC input stays unchanged
 	expect(parseName("café")).toBe("café")
+})
+
+test("name encoding", () => {
+	// Helper: encoding must produce the expected valid name and decode back
+	function expectRoundTrip(name: string, expectedEncoded: string) {
+		const encoded = encodeName(name)
+		expect(encoded).toBe(expectedEncoded)
+		expect(parseName(encoded)).toBe(encoded)
+		expect(decodeName(encoded)).toBe(name)
+	}
+
+	// ── Forbidden characters become fullwidth variants ──
+	expectRoundTrip("a/b", "a／b")
+	expectRoundTrip("a\\b", "a＼b")
+	expectRoundTrip("a:b", "a：b")
+	expectRoundTrip("a*b", "a＊b")
+	expectRoundTrip("a?b", "a？b")
+	expectRoundTrip('a"b', "a＂b")
+	expectRoundTrip("a<b", "a＜b")
+	expectRoundTrip("a>b", "a＞b")
+	expectRoundTrip("a|b", "a｜b")
+
+	// ── Control characters become Control Pictures symbols ──
+	expectRoundTrip("a\x00b", "a␀b")
+	expectRoundTrip("a\x1fb", "a␟b")
+	expectRoundTrip("a\x7fb", "a␡b")
+
+	// ── Leading/trailing spaces and trailing dots ──
+	expectRoundTrip(" a", "␠a")
+	expectRoundTrip("a ", "a␠")
+	expectRoundTrip("a.", "a．")
+	expectRoundTrip(" ", "␠")
+	expectRoundTrip(".", "．")
+	expectRoundTrip("..", "．．")
+
+	// ── Reserved Windows device names ──
+	expectRoundTrip("CON", "ＣON")
+	expectRoundTrip("com1", "ｃom1")
+
+	// ── Literal replacement characters get quoted ──
+	expectRoundTrip("＊", "‛＊")
+	expectRoundTrip("‛", "‛‛")
+	expectRoundTrip("ＣON", "‛ＣON")
+
+	// ── Valid names pass through untouched ──
+	for (const name of ["hello.txt", ".hidden", "日本語.txt", "café", "CON.txt", "a b"]) {
+		expectRoundTrip(name, name)
+	}
+
+	// ── decodeName round-trips the NFC form of non-NFC input ──
+	const nfdColon = "e\u0301:x" // NFD: e + combining acute accent
+	expect(decodeName(encodeName(nfdColon))).toBe(nfdColon.normalize("NFC"))
+
+	// ── Errors carry the kind and offending name ──
+	for (const [name, kind] of [
+		["", "Empty"],
+		[":".repeat(86), "TooLong"]
+	]) {
+		try {
+			encodeName(name)
+			expect.fail(`Expected encodeName(${JSON.stringify(name)}) to throw`)
+		} catch (e: unknown) {
+			const err = e as EntryNameErrorJS
+			expect(err.kind()).toBe(kind)
+			expect(err.name()).toBe(name)
+		}
+	}
 })
 
 test("getItemPath", async () => {
