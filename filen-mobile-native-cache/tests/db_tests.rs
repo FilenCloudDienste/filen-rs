@@ -4359,7 +4359,7 @@ pub async fn test_malformed() {
 		panic!("Expected a directory object");
 	};
 	assert!(malformed_dir.meta.is_none());
-	assert_eq!(malformed_dir.uuid, &dir.uuid().to_string());
+	assert_eq!(malformed_dir.uuid, dir.uuid().to_string());
 
 	let file = rss
 		.client
@@ -4384,7 +4384,7 @@ pub async fn test_malformed() {
 		.find(|f| f.uuid == file.uuid().to_string())
 		.unwrap();
 	assert!(malformed_file.meta.is_none());
-	assert_eq!(malformed_file.uuid, &file.uuid().to_string());
+	assert_eq!(malformed_file.uuid, file.uuid().to_string());
 }
 
 struct NoopSearchUpdate;
