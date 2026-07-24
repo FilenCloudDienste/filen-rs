@@ -98,7 +98,7 @@ impl EntryNameErrorJS {
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 impl std::fmt::Display for EntryNameErrorJS {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{:?}", self.message)
+		write!(f, "{}", self.message)
 	}
 }
 
@@ -723,6 +723,16 @@ mod tests {
 				EntryNameErrorKind::ForbiddenChar { ch: '*', pos: 3 }
 			)
 		);
+	}
+
+	#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+	#[test]
+	fn entry_name_error_js_display_is_plain() {
+		// Display must render the message as-is, not debug-quoted — this is
+		// what uniffi surfaces as the exception message on mobile.
+		let err = EntryNameErrorJS::from(parse_name("").unwrap_err());
+		assert_eq!(err.to_string(), r#"invalid filename "": filename is empty"#);
+		assert_eq!(err.to_string(), err.message());
 	}
 
 	#[test]
