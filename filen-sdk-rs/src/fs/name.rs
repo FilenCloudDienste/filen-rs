@@ -25,8 +25,15 @@ const FORBIDDEN: [bool; 128] = {
 const MAX_BYTES: usize = 255;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
-// todo expose
-pub enum EntryNameError {
+#[error("invalid filename {name:?}: {kind}")]
+pub struct EntryNameError {
+	/// The name as passed by the caller (before NFC normalization).
+	pub name: String,
+	pub kind: EntryNameErrorKind,
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum EntryNameErrorKind {
 	#[error("filename is empty")]
 	Empty,
 	#[error("filename is too long: {bytes} bytes (max {MAX_BYTES})")]
@@ -67,6 +74,7 @@ pub enum EntryNameErrorKindJS {
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 pub struct EntryNameErrorJS {
 	kind: EntryNameErrorKindJS,
+	name: String,
 	message: String,
 }
 
@@ -76,6 +84,10 @@ pub struct EntryNameErrorJS {
 impl EntryNameErrorJS {
 	pub fn kind(&self) -> EntryNameErrorKindJS {
 		self.kind
+	}
+
+	pub fn name(&self) -> String {
+		self.name.clone()
 	}
 
 	pub fn message(&self) -> String {
@@ -96,18 +108,19 @@ impl std::error::Error for EntryNameErrorJS {}
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 impl From<EntryNameError> for EntryNameErrorJS {
 	fn from(err: EntryNameError) -> Self {
-		let kind = match err {
-			EntryNameError::Empty => EntryNameErrorKindJS::Empty,
-			EntryNameError::TooLong { .. } => EntryNameErrorKindJS::TooLong,
-			EntryNameError::ForbiddenChar { .. } => EntryNameErrorKindJS::ForbiddenChar,
-			EntryNameError::ReservedName => EntryNameErrorKindJS::ReservedName,
-			EntryNameError::TrailingDotOrSpace => EntryNameErrorKindJS::TrailingDotOrSpace,
-			EntryNameError::LeadingSpace => EntryNameErrorKindJS::LeadingSpace,
-			EntryNameError::DotEntry => EntryNameErrorKindJS::DotEntry,
+		let kind = match err.kind {
+			EntryNameErrorKind::Empty => EntryNameErrorKindJS::Empty,
+			EntryNameErrorKind::TooLong { .. } => EntryNameErrorKindJS::TooLong,
+			EntryNameErrorKind::ForbiddenChar { .. } => EntryNameErrorKindJS::ForbiddenChar,
+			EntryNameErrorKind::ReservedName => EntryNameErrorKindJS::ReservedName,
+			EntryNameErrorKind::TrailingDotOrSpace => EntryNameErrorKindJS::TrailingDotOrSpace,
+			EntryNameErrorKind::LeadingSpace => EntryNameErrorKindJS::LeadingSpace,
+			EntryNameErrorKind::DotEntry => EntryNameErrorKindJS::DotEntry,
 		};
 		Self {
 			kind,
 			message: err.to_string(),
+			name: err.name,
 		}
 	}
 }
@@ -178,39 +191,47 @@ uniffi::custom_type!(ValidatedName, String, {
 	remote,
 	lower: |uuid: &Uuid| uuid.as_ref().to_string(),
 	try_lift: |s: String| {
-		ValidatedName::try_from(s.as_ref()).map_err(|_| uniffi::deps::anyhow::anyhow!("invalid NormalizedName string: {}", s))
+		ValidatedName::try_from(s.as_ref()).map_err(|e| uniffi::deps::anyhow::anyhow!("{e}"))
 	},
 });
 
 /// Validate a filename according to unix + windows rules.
-/// Returns the normalized name if valid, or an error describing the first violation found.
+/// Returns the normalized name if valid, or an error describing the first violation found,
+/// carrying the name exactly as the caller passed it.
 fn parse_name(name: &str) -> Result<ValidatedName, EntryNameError> {
+	parse_name_kind(name).map_err(|kind| EntryNameError {
+		name: name.to_string(),
+		kind,
+	})
+}
+
+fn parse_name_kind(name: &str) -> Result<ValidatedName, EntryNameErrorKind> {
 	// 1. NFC normalize
 	let name: String = name.nfc().collect();
 
 	// 2. Empty check
 	if name.is_empty() {
-		return Err(EntryNameError::Empty);
+		return Err(EntryNameErrorKind::Empty);
 	}
 
 	// 3. Dot entries
 	if name == "." || name == ".." {
-		return Err(EntryNameError::DotEntry);
+		return Err(EntryNameErrorKind::DotEntry);
 	}
 
 	// 4. Byte length
 	if name.len() > MAX_BYTES {
-		return Err(EntryNameError::TooLong { bytes: name.len() });
+		return Err(EntryNameErrorKind::TooLong { bytes: name.len() });
 	}
 
 	// 5. Leading space
 	if name.starts_with(' ') {
-		return Err(EntryNameError::LeadingSpace);
+		return Err(EntryNameErrorKind::LeadingSpace);
 	}
 
 	// 6. Trailing dot or space
 	if name.ends_with('.') || name.ends_with(' ') {
-		return Err(EntryNameError::TrailingDotOrSpace);
+		return Err(EntryNameErrorKind::TrailingDotOrSpace);
 	}
 
 	// 7. Forbidden characters
@@ -221,14 +242,14 @@ fn parse_name(name: &str) -> Result<ValidatedName, EntryNameError> {
 				.copied()
 				.unwrap_or(false)
 		{
-			return Err(EntryNameError::ForbiddenChar { ch, pos });
+			return Err(EntryNameErrorKind::ForbiddenChar { ch, pos });
 		}
 		// Non-ASCII UTF-8 is fine — no filesystem forbids it
 	}
 
 	// 8. Reserved names
 	if is_reserved_name_on_windows(&name) {
-		return Err(EntryNameError::ReservedName);
+		return Err(EntryNameErrorKind::ReservedName);
 	}
 
 	Ok(ValidatedName(name))
@@ -247,6 +268,14 @@ pub fn parse_name_uniffi(name: String) -> Result<ValidatedName, EntryNameErrorJS
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Build the error `parse_name(name)` is expected to return.
+	fn name_err(name: &str, kind: EntryNameErrorKind) -> Result<ValidatedName, EntryNameError> {
+		Err(EntryNameError {
+			name: name.to_string(),
+			kind,
+		})
+	}
 
 	/// Generate all 2^n case combinations for an ASCII string.
 	fn all_case_combinations(s: &str) -> Vec<String> {
@@ -309,15 +338,18 @@ mod tests {
 
 	#[test]
 	fn empty_name() {
-		assert_eq!(parse_name(""), Err(EntryNameError::Empty));
+		assert_eq!(parse_name(""), name_err("", EntryNameErrorKind::Empty));
 	}
 
 	// ── Dot entries ─────────────────────────────────────────────
 
 	#[test]
 	fn dot_entries() {
-		assert_eq!(parse_name("."), Err(EntryNameError::DotEntry));
-		assert_eq!(parse_name(".."), Err(EntryNameError::DotEntry));
+		assert_eq!(parse_name("."), name_err(".", EntryNameErrorKind::DotEntry));
+		assert_eq!(
+			parse_name(".."),
+			name_err("..", EntryNameErrorKind::DotEntry)
+		);
 	}
 
 	// ── Too long ────────────────────────────────────────────────
@@ -327,9 +359,12 @@ mod tests {
 		let name = "a".repeat(MAX_BYTES + 1);
 		assert_eq!(
 			parse_name(&name),
-			Err(EntryNameError::TooLong {
-				bytes: MAX_BYTES + 1
-			})
+			name_err(
+				&name,
+				EntryNameErrorKind::TooLong {
+					bytes: MAX_BYTES + 1
+				}
+			)
 		);
 	}
 
@@ -339,7 +374,7 @@ mod tests {
 		let name = "🎉".repeat(64);
 		assert_eq!(
 			parse_name(&name),
-			Err(EntryNameError::TooLong { bytes: 256 })
+			name_err(&name, EntryNameErrorKind::TooLong { bytes: 256 })
 		);
 	}
 
@@ -347,23 +382,44 @@ mod tests {
 
 	#[test]
 	fn leading_space() {
-		assert_eq!(parse_name(" foo"), Err(EntryNameError::LeadingSpace));
-		assert_eq!(parse_name("  bar"), Err(EntryNameError::LeadingSpace));
-		assert_eq!(parse_name(" "), Err(EntryNameError::LeadingSpace));
+		assert_eq!(
+			parse_name(" foo"),
+			name_err(" foo", EntryNameErrorKind::LeadingSpace)
+		);
+		assert_eq!(
+			parse_name("  bar"),
+			name_err("  bar", EntryNameErrorKind::LeadingSpace)
+		);
+		assert_eq!(
+			parse_name(" "),
+			name_err(" ", EntryNameErrorKind::LeadingSpace)
+		);
 	}
 
 	// ── Trailing dot or space ───────────────────────────────────
 
 	#[test]
 	fn trailing_dot() {
-		assert_eq!(parse_name("foo."), Err(EntryNameError::TrailingDotOrSpace));
-		assert_eq!(parse_name("foo.."), Err(EntryNameError::TrailingDotOrSpace));
+		assert_eq!(
+			parse_name("foo."),
+			name_err("foo.", EntryNameErrorKind::TrailingDotOrSpace)
+		);
+		assert_eq!(
+			parse_name("foo.."),
+			name_err("foo..", EntryNameErrorKind::TrailingDotOrSpace)
+		);
 	}
 
 	#[test]
 	fn trailing_space() {
-		assert_eq!(parse_name("foo "), Err(EntryNameError::TrailingDotOrSpace));
-		assert_eq!(parse_name("foo  "), Err(EntryNameError::TrailingDotOrSpace));
+		assert_eq!(
+			parse_name("foo "),
+			name_err("foo ", EntryNameErrorKind::TrailingDotOrSpace)
+		);
+		assert_eq!(
+			parse_name("foo  "),
+			name_err("foo  ", EntryNameErrorKind::TrailingDotOrSpace)
+		);
 	}
 
 	// ── Forbidden characters ────────────────────────────────────
@@ -374,7 +430,13 @@ mod tests {
 			let name = format!("file{ch}name");
 			let result = parse_name(&name);
 			assert!(
-				matches!(result, Err(EntryNameError::ForbiddenChar { .. })),
+				matches!(
+					result,
+					Err(EntryNameError {
+						kind: EntryNameErrorKind::ForbiddenChar { .. },
+						..
+					})
+				),
 				"expected {name:?} to be rejected for forbidden char, got {result:?}"
 			);
 		}
@@ -387,7 +449,13 @@ mod tests {
 			let ch = byte as char;
 			let name = format!("file{ch}name");
 			assert!(
-				matches!(parse_name(&name), Err(EntryNameError::ForbiddenChar { .. })),
+				matches!(
+					parse_name(&name),
+					Err(EntryNameError {
+						kind: EntryNameErrorKind::ForbiddenChar { .. },
+						..
+					})
+				),
 				"expected control char 0x{byte:02X} to be rejected"
 			);
 		}
@@ -398,7 +466,10 @@ mod tests {
 		let name = "file\x7Fname";
 		assert!(matches!(
 			parse_name(name),
-			Err(EntryNameError::ForbiddenChar { .. })
+			Err(EntryNameError {
+				kind: EntryNameErrorKind::ForbiddenChar { .. },
+				..
+			})
 		));
 	}
 
@@ -406,8 +477,24 @@ mod tests {
 	fn forbidden_char_reports_correct_position() {
 		assert_eq!(
 			parse_name("abc*def"),
-			Err(EntryNameError::ForbiddenChar { ch: '*', pos: 3 })
+			name_err(
+				"abc*def",
+				EntryNameErrorKind::ForbiddenChar { ch: '*', pos: 3 }
+			)
 		);
+	}
+
+	#[test]
+	fn error_reports_original_input_name() {
+		// NFD input: the error should echo the caller's exact string, not the
+		// NFC-normalized form that validation ran on.
+		let nfd = "e\u{0301}/x";
+		let err = parse_name(nfd).unwrap_err();
+		assert_eq!(err.name, nfd);
+		assert!(matches!(
+			err.kind,
+			EntryNameErrorKind::ForbiddenChar { ch: '/', .. }
+		));
 	}
 
 	// ── Reserved names — all case combinations ──────────────────
@@ -418,7 +505,7 @@ mod tests {
 			for variant in all_case_combinations(base) {
 				assert_eq!(
 					parse_name(&variant),
-					Err(EntryNameError::ReservedName),
+					name_err(&variant, EntryNameErrorKind::ReservedName),
 					"expected {variant:?} to be reserved"
 				);
 			}
@@ -432,7 +519,7 @@ mod tests {
 			for variant in all_case_combinations(&base) {
 				assert_eq!(
 					parse_name(&variant),
-					Err(EntryNameError::ReservedName),
+					name_err(&variant, EntryNameErrorKind::ReservedName),
 					"expected {variant:?} to be reserved"
 				);
 			}
@@ -446,7 +533,7 @@ mod tests {
 			for variant in all_case_combinations(&base) {
 				assert_eq!(
 					parse_name(&variant),
-					Err(EntryNameError::ReservedName),
+					name_err(&variant, EntryNameErrorKind::ReservedName),
 					"expected {variant:?} to be reserved"
 				);
 			}

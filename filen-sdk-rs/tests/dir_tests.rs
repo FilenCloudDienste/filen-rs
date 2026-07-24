@@ -24,7 +24,7 @@ use filen_sdk_rs::{
 			traits::HasDirMeta,
 		},
 		file::{RemoteFile, meta::FileMeta, traits::HasFileMeta},
-		name::EntryNameError,
+		name::{EntryNameError, EntryNameErrorKind},
 	},
 	io::{CategoryDirDownloadExtPub, DirDownloadCallback, DirUploadCallback, FilenMetaExt},
 };
@@ -1089,103 +1089,38 @@ async fn download_dir_with_long_names() {
 
 #[test]
 fn dir_meta_changes_rejects_invalid_names() {
-	assert_eq!(
-		DirectoryMetaChanges::default().name("").unwrap_err(),
-		EntryNameError::Empty
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name(".").unwrap_err(),
-		EntryNameError::DotEntry
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name("..").unwrap_err(),
-		EntryNameError::DotEntry
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default()
-			.name(" leading")
-			.unwrap_err(),
-		EntryNameError::LeadingSpace
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default()
-			.name("trailing.")
-			.unwrap_err(),
-		EntryNameError::TrailingDotOrSpace
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default()
-			.name("trailing ")
-			.unwrap_err(),
-		EntryNameError::TrailingDotOrSpace
-	);
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a/b"),
-		Err(EntryNameError::ForbiddenChar { ch: '/', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a\\b"),
-		Err(EntryNameError::ForbiddenChar { ch: '\\', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a:b"),
-		Err(EntryNameError::ForbiddenChar { ch: ':', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a*b"),
-		Err(EntryNameError::ForbiddenChar { ch: '*', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a?b"),
-		Err(EntryNameError::ForbiddenChar { ch: '?', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a\"b"),
-		Err(EntryNameError::ForbiddenChar { ch: '"', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a<b"),
-		Err(EntryNameError::ForbiddenChar { ch: '<', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a>b"),
-		Err(EntryNameError::ForbiddenChar { ch: '>', .. })
-	));
-	assert!(matches!(
-		DirectoryMetaChanges::default().name("a|b"),
-		Err(EntryNameError::ForbiddenChar { ch: '|', .. })
-	));
-	assert_eq!(
-		DirectoryMetaChanges::default().name("CON").unwrap_err(),
-		EntryNameError::ReservedName
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name("con").unwrap_err(),
-		EntryNameError::ReservedName
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name("PRN").unwrap_err(),
-		EntryNameError::ReservedName
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name("AUX").unwrap_err(),
-		EntryNameError::ReservedName
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name("NUL").unwrap_err(),
-		EntryNameError::ReservedName
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name("COM1").unwrap_err(),
-		EntryNameError::ReservedName
-	);
-	assert_eq!(
-		DirectoryMetaChanges::default().name("LPT9").unwrap_err(),
-		EntryNameError::ReservedName
-	);
+	// Helper: the error DirectoryMetaChanges::name is expected to return
+	fn expect_kind(name: &str, kind: EntryNameErrorKind) {
+		assert_eq!(
+			DirectoryMetaChanges::default().name(name).unwrap_err(),
+			EntryNameError {
+				name: name.to_string(),
+				kind,
+			}
+		);
+	}
+
+	expect_kind("", EntryNameErrorKind::Empty);
+	expect_kind(".", EntryNameErrorKind::DotEntry);
+	expect_kind("..", EntryNameErrorKind::DotEntry);
+	expect_kind(" leading", EntryNameErrorKind::LeadingSpace);
+	expect_kind("trailing.", EntryNameErrorKind::TrailingDotOrSpace);
+	expect_kind("trailing ", EntryNameErrorKind::TrailingDotOrSpace);
+	for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
+		expect_kind(
+			&format!("a{ch}b"),
+			EntryNameErrorKind::ForbiddenChar { ch, pos: 1 },
+		);
+	}
+	for name in ["CON", "con", "PRN", "AUX", "NUL", "COM1", "LPT9"] {
+		expect_kind(name, EntryNameErrorKind::ReservedName);
+	}
 	assert!(matches!(
 		DirectoryMetaChanges::default().name(&"x".repeat(256)),
-		Err(EntryNameError::TooLong { .. })
+		Err(EntryNameError {
+			kind: EntryNameErrorKind::TooLong { .. },
+			..
+		})
 	));
 }
 

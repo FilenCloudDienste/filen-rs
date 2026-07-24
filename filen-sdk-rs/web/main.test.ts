@@ -1166,6 +1166,7 @@ test("name validation", () => {
 		} catch (e: unknown) {
 			const err = e as EntryNameErrorJS
 			expect(err.kind()).toBe(expectedKind)
+			expect(err.name()).toBe(name)
 			expect(err.message()).toBeTruthy()
 		}
 	}
