@@ -325,8 +325,19 @@ async fn cmd_list_trash_empty_trash() {
 		.success()
 		.stdout(predicates::str::contains("Emptied trash"));
 
-	// verify trash is listed as empty
-	authenticated_cli_with_args!("list-trash")
-		.success()
-		.stdout(predicates::str::contains("Trash is empty"));
+	// Verify our own file eventually leaves the trash listing. Asserting a globally
+	// empty trash is impossible on the shared account (concurrent test binaries keep
+	// trashing items), and server-side emptying is async and can lag by minutes.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+	loop {
+		let assert = authenticated_cli_with_args!("list-trash").success();
+		let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+		if !stdout.contains("testfile_from_cli_test_list_trash.txt") {
+			break;
+		}
+		if std::time::Instant::now() >= deadline {
+			panic!("file still listed in trash 300s after empty-trash:\n{stdout}");
+		}
+		tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+	}
 }
