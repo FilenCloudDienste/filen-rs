@@ -189,7 +189,9 @@ impl TryFrom<&str> for ValidatedName {
 #[cfg(feature = "uniffi")]
 uniffi::custom_type!(ValidatedName, String, {
 	remote,
-	lower: |uuid: &Uuid| uuid.as_ref().to_string(),
+	// The macro only keeps the closure's parameter name and body; the
+	// parameter is a by-value ValidatedName, so move the inner String out.
+	lower: |name| String::from(name),
 	try_lift: |s: String| {
 		ValidatedName::try_from(s.as_ref()).map_err(|e| uniffi::deps::anyhow::anyhow!("{e}"))
 	},
