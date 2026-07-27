@@ -56,6 +56,10 @@ impl AuthCacheState {
 					"Thumbnail file not found, downloading: {}",
 					file_path.display()
 				);
+				// Same serialisation the regular download path takes: without it a concurrent
+				// clear can evict what this download just wrote, and two downloads of one file
+				// interleave their writes into the same tmp path.
+				let _local_file_guard = self.lock_local_file(file.uuid()).await;
 				let path = self.download_file_io(file, None).await?;
 				tokio::fs::File::open(&path).await?
 			}
@@ -108,6 +112,10 @@ impl AuthCacheState {
 		requested_width: u32,
 		requested_height: u32,
 	) -> ThumbnailResult {
+		let path = match self.canonicalize_id(path) {
+			Ok(path) => path,
+			Err(e) => return ThumbnailResult::Err(e),
+		};
 		let pvs = match path.as_parsed() {
 			Ok(pvs) => pvs,
 			Err(e) => return ThumbnailResult::Err(e),

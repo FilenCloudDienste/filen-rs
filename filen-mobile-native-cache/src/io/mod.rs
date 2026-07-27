@@ -217,15 +217,25 @@ impl AuthCacheState {
 			.await
 	}
 
+	/// Uploads the edited local copy and moves it under the uuid the server minted for it.
+	///
+	/// The returned guard covers the *new* uuid and must be held until that uuid reaches the
+	/// database: the rename below puts a directory on disk that nothing knows about yet, and the
+	/// cache sweep deletes exactly those. Dropping it before the row is written reopens that
+	/// window.
+	///
+	/// It is `None` when the server handed back the uuid we already had. The caller holds that
+	/// uuid's lock for the duration of the edit, and these locks are not reentrant, so taking it
+	/// again here would hang the task forever.
 	pub(crate) async fn io_upload_updated_file(
 		&self,
-		old_uuid: &str,
+		old_uuid: Uuid,
 		name: String,
 		parent_uuid: Uuid,
 		mime: String,
 		callback: Option<Arc<dyn ProgressCallback>>,
-	) -> Result<RemoteFile, FilenSdkError> {
-		let old_path = self.get_cached_file_path_from_name(old_uuid, Some(&name));
+	) -> Result<(RemoteFile, Option<tokio::sync::OwnedMutexGuard<()>>), FilenSdkError> {
+		let old_path = self.get_cached_file_path_from_name(&old_uuid.to_string(), Some(&name));
 
 		let mut file_builder = FileBuilderOptionalName::new(parent_uuid);
 		file_builder.name(&name)?;
@@ -233,6 +243,11 @@ impl AuthCacheState {
 		let (file, _) = self
 			.io_upload_file(old_path.clone(), file_builder, callback)
 			.await?;
+		let new_uuid_guard = if file.uuid() == old_uuid {
+			None
+		} else {
+			Some(self.lock_local_file(file.uuid()).await)
+		};
 		let new_path = self.get_cached_file_path(&file);
 		let parent = new_path
 			.parent()
@@ -248,13 +263,23 @@ impl AuthCacheState {
 				e
 			)
 		};
-		Ok(file)
+		Ok((file, new_uuid_guard))
 	}
 
+	/// Uploads a brand-new file from its cache slot.
+	///
+	/// The returned guard covers the slot this creates on disk and must be held until that uuid
+	/// reaches the database. It is taken BEFORE the slot exists rather than after the upload: the
+	/// directory is on disk for the whole upload with no row to justify it, which is exactly what
+	/// the cache sweep deletes.
 	pub(crate) async fn io_upload_new_file(
 		&self,
 		builder: FileBuilderOptionalName,
-	) -> Result<(RemoteFile, PathBuf), FilenSdkError> {
+	) -> Result<(RemoteFile, PathBuf, tokio::sync::OwnedMutexGuard<()>), FilenSdkError> {
+		// Keyed on the builder's uuid, which is the one the slot below is named after. The upload
+		// response names the file's current version; should the two ever diverge, the slot here is
+		// genuinely orphaned and the sweep is right to take it.
+		let uuid_guard = self.lock_local_file(builder.get_uuid()).await;
 		let target_path = self
 			.get_cached_file_path_from_name(&builder.get_uuid().to_string(), builder.get_name());
 		let parent_path = target_path
@@ -271,10 +296,14 @@ impl AuthCacheState {
 		let (file, _) = self
 			.io_upload_file(target_path.clone(), builder, None)
 			.await?;
-		Ok((file, target_path))
+		Ok((file, target_path, uuid_guard))
 	}
 
 	pub(crate) async fn io_delete_local(&self, uuid: Uuid) -> Result<(), io::Error> {
+		// Serialised against a concurrent download of the same item: otherwise a clear issued just
+		// before a re-request can land after the fresh download and evict it. Taken here rather
+		// than at each of the callers so every deletion path is covered at one choke point.
+		let _local_file_guard = self.lock_local_file(uuid).await;
 		let path = self.cache_dir.join(uuid.to_string());
 		if let Err(e) = match tokio::fs::metadata(&path).await {
 			Ok(meta) => {

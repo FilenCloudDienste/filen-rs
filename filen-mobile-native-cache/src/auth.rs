@@ -13,7 +13,11 @@ use filen_sdk_rs::{
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::HasUUID,
 };
-use filen_types::{auth::FilenSDKConfig, crypto::Blake3Hash, fs::UuidStr};
+use filen_types::{
+	auth::FilenSDKConfig,
+	crypto::Blake3Hash,
+	fs::{Uuid, UuidStr},
+};
 use rusqlite::{Connection, ToSql, types::ToSqlOutput};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -37,8 +41,9 @@ pub const DB_FILE_NAME: &str = "native_cache.db";
 // 1 - initial version, changed how files as stored in cache from flat to per-file directories
 // 2 - store uuid/parent as BLOB, add `trashed` flag (trashed items keep their original parent);
 //     dropped the synthetic 'trash' row
-// 3 - add `items.stable_uuid` (server-minted whole-life file id; stable ≡ uuid for dirs/roots).
-//     The wipe-and-resync reinit repopulates it from directory listings.
+// 3 - add `items.stable_uuid` (server-minted whole-life file id; FILES ONLY, NULL for dirs/roots,
+//     whose own uuid is already their whole-life id). The wipe-and-resync reinit repopulates it
+//     from directory listings.
 const CACHE_VERSION: u64 = 3;
 
 pub struct AuthCacheState {
@@ -59,6 +64,8 @@ pub struct AuthCacheState {
 	pub(crate) sdk_cache_path: PathBuf,
 	/// The one live `cache::search` on the drive root, reused across queries via `set_config`.
 	pub(crate) search: tokio::sync::Mutex<Option<crate::search::ActiveSearch>>,
+	/// Serialises mutations of a single item's local cache file; see [`crate::file_locks`].
+	pub(crate) file_locks: crate::file_locks::FileLocks,
 }
 
 enum UnauthReason {
@@ -154,7 +161,7 @@ pub(crate) async fn update_saved_db_state_cache_cleanup_time(
 /// uuid as its canonical lowercase-hyphenated text. Used by queries that need a uuid as a string
 /// (path-component fallback when metadata isn't decoded, and uuid-based path navigation) now that
 /// `items.uuid` is stored as a BLOB. Must be called on every connection before those queries run.
-fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
+pub(crate) fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 	use rusqlite::functions::FunctionFlags;
 	conn.create_scalar_function(
 		"uuid_text",
@@ -581,6 +588,12 @@ impl FilenMobileCacheState {
 }
 
 impl AuthCacheState {
+	/// Takes the lock serialising local-cache mutations for a single item, held across the
+	/// download or the delete so the two cannot interleave.
+	pub(crate) async fn lock_local_file(&self, uuid: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+		self.file_locks.lock(uuid).await
+	}
+
 	fn from_sdk_config(
 		config: FilenSDKConfig,
 		files_dir: &Path,
@@ -630,6 +643,7 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
+			file_locks: crate::file_locks::FileLocks::default(),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
 		Ok(new)
@@ -671,6 +685,7 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
+			file_locks: crate::file_locks::FileLocks::default(),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
 		Ok(new)

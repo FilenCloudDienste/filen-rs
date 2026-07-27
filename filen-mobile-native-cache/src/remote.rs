@@ -370,7 +370,10 @@ impl AuthCacheState {
 		debug!("Uploading file at path: {}", path.0);
 		let path = self.canonicalize_id(&path)?;
 		let path_values = path.as_path()?;
-		let remote_file = match self.update_items_in_path(&path_values).await? {
+		// The guard the upload hands back covers the uuid the file now lives under on disk, which
+		// nothing knows about until the upsert below writes its row; the sweep deletes exactly
+		// those, so it has to outlive that write.
+		let (remote_file, _new_uuid_guard) = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => {
 				let DBFileMeta::Decoded(meta) = file.meta else {
 					return Err(CacheError::remote(format!(
@@ -378,6 +381,10 @@ impl AuthCacheState {
 						path_values.full_path
 					)));
 				};
+				// Held across the whole check-then-upload: io_upload_updated_file reads the
+				// cached copy and then renames it away under the newly minted uuid, so without
+				// this a concurrent clear or download of the same item interleaves with it.
+				let _local_file_guard = self.lock_local_file(file.uuid).await;
 				if let Some(hash) = meta.hash {
 					let local_hash = self.hash_local_file(file.uuid, Some(&meta.name)).await?;
 					if local_hash == Some(hash.into()) {
@@ -386,7 +393,7 @@ impl AuthCacheState {
 				}
 
 				self.io_upload_updated_file(
-					&file.uuid.to_string(),
+					file.uuid,
 					meta.name,
 					file.parent.try_into().map_err(|e| {
 						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
@@ -407,7 +414,8 @@ impl AuthCacheState {
 			{
 				let mut builder = FileBuilderOptionalName::new(parent.uuid());
 				builder.name(path_values.name_or_uuid)?;
-				self.io_upload_new_file(builder).await?.0
+				let (file, _, uuid_guard) = self.io_upload_new_file(builder).await?;
+				(file, Some(uuid_guard))
 			}
 			UpdateItemsInPath::Partial(remaining, _) => {
 				return Err(CacheError::remote(format!(
@@ -518,7 +526,8 @@ impl AuthCacheState {
 		if let Some(mime) = mime {
 			builder.mime(mime);
 		}
-		let (file, os_path) = self.io_upload_new_file(builder).await?;
+		// Held until the row exists, so the sweep cannot mistake the new slot on disk for garbage.
+		let (file, os_path, _uuid_guard) = self.io_upload_new_file(builder).await?;
 		let mut conn = self.conn();
 		let file = DBFile::upsert_from_remote(&mut conn, file)?;
 		Ok(CreateFileResponse {
@@ -984,6 +993,9 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		let file: RemoteFile = file.try_into()?;
+		// Held for the whole check-then-download: without it a concurrent clear can delete the
+		// file between the freshness check and the write, or evict what we just downloaded.
+		let _local_file_guard = self.lock_local_file(file.uuid()).await;
 		match (
 			file.hash(),
 			self.hash_local_file(file.uuid(), file.name()).await,

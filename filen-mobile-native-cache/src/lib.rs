@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 pub mod env;
 mod error;
 pub mod ffi;
+pub(crate) mod file_locks;
 pub mod io;
 pub(crate) mod search;
 pub(crate) mod sql;
