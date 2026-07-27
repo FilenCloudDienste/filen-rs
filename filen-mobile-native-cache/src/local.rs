@@ -64,6 +64,11 @@ impl FilenMobileCacheState {
 		self.sync_execute_authed(|auth_state| auth_state.get_all_descendant_paths(path))
 	}
 
+	/// Replaces the item's local data with `local_data`.
+	///
+	/// The column is the app's alone: the cache stores nothing of its own in it, so a write here
+	/// can only ever lose keys the app itself put there. An outstanding local edit is tracked on
+	/// [`crate::ffi::FfiFile::pending_upload_at`], out of reach of this.
 	pub fn update_local_data(
 		&self,
 		uuid: &str,
@@ -83,9 +88,32 @@ impl FilenMobileCacheState {
 		})
 	}
 
+	/// How many local edits have not reached the server yet.
+	///
+	/// Non-zero means at least one file was edited locally and its upload has not succeeded; those
+	/// are retried by [`FilenMobileCacheState::retry_pending_uploads`].
+	pub fn pending_upload_count(&self) -> Result<u32, CacheError> {
+		self.sync_execute_authed(|auth_state| auth_state.pending_upload_count())
+	}
+
 	pub fn root_uuid(&self) -> Result<String, CacheError> {
 		self.sync_execute_authed(|auth_state| Ok(auth_state.root_uuid()))
 	}
+}
+
+/// The namespace an id uses to name a row outright, where every other id form describes a
+/// location.
+const STABLE_PREFIX: &str = "stable/";
+
+/// The stable id an [`FfiId`] addresses, if it is in the stable namespace.
+///
+/// Callers that can CREATE something at a path need to know the difference: an id that named a
+/// row is a promise the row exists, and [`AuthCacheState::canonicalize_id`] hands back a
+/// display-name path built from that row — a snapshot which goes stale the moment the item is
+/// renamed or moved remotely. Creating something for such an id would put a new item at the old
+/// name and call it the one the caller meant.
+pub(crate) fn addressed_stable_uuid(id: &FfiId) -> Option<Uuid> {
+	Uuid::from_str(id.0.strip_prefix(STABLE_PREFIX)?).ok()
 }
 
 impl AuthCacheState {
@@ -163,11 +191,13 @@ impl AuthCacheState {
 	/// Resolves the `stable/<id>` namespace to the canonical id form the rest
 	/// of the cache understands (a display-name path, `trash/<uuid>`, or the
 	/// bare root uuid); every other id form passes through unchanged. The
-	/// value after `stable/` is matched against `stable_uuid` first and falls
-	/// back to a current-version `uuid` match, so ids persisted before the
-	/// stable-id migration keep resolving while the cache knows the row.
+	/// value after `stable/` is matched against `stable_uuid` first — only a
+	/// file can match, that column being files-only — and falls back to a
+	/// `uuid` match, which is what addresses dirs and roots (their uuid is
+	/// their whole-life id) as well as file uuids persisted before the
+	/// stable-id migration, while the cache still knows the row.
 	pub(crate) fn canonicalize_id<'a>(&self, id: &'a FfiId) -> Result<Cow<'a, FfiId>, CacheError> {
-		let Some(rest) = id.0.strip_prefix("stable/") else {
+		let Some(rest) = id.0.strip_prefix(STABLE_PREFIX) else {
 			return Ok(Cow::Borrowed(id));
 		};
 		let stable_uuid = Uuid::from_str(rest)
@@ -193,8 +223,8 @@ impl AuthCacheState {
 	}
 
 	/// Resolves an FFI-provided uuid string to the row's CURRENT uuid: an
-	/// exact uuid match wins, otherwise the value is treated as a stable id.
-	/// Falls through to the parsed value when no row matches, letting the
+	/// exact uuid match wins, otherwise the value is treated as a file's stable
+	/// id. Falls through to the parsed value when no row matches, letting the
 	/// caller produce its own not-found handling.
 	pub(crate) fn resolve_uuid_or_stable(&self, s: &str) -> Result<Uuid, CacheError> {
 		let uuid = Uuid::from_str(s)?;
@@ -322,16 +352,13 @@ impl AuthCacheState {
 		};
 		let local_data = JsonObject::new(local_data);
 
-		sql::update_local_data(
-			&mut self.conn(),
-			obj.uuid(),
-			if local_data.is_empty() {
-				None
-			} else {
-				Some(&local_data)
-			},
-		)?;
-		obj.set_local_data(Some(local_data));
+		let stored = if local_data.is_empty() {
+			None
+		} else {
+			Some(local_data)
+		};
+		sql::update_local_data(&mut self.conn(), obj.uuid(), stored.as_ref())?;
+		obj.set_local_data(stored);
 
 		Ok(FfiObject::from(DBObject::from(obj)))
 	}

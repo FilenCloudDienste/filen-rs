@@ -7,6 +7,8 @@ lazy_static! {
 	pub static ref DB_INIT_HASH: Blake3Hash = blake3::hash(INIT.as_bytes()).into();
 }
 pub(crate) const SELECT_ID_BY_UUID: &str = "SELECT id FROM items WHERE uuid = ?;";
+pub(crate) const SELECT_STABLE_BY_UUID: &str =
+	"SELECT stable_uuid FROM items WHERE uuid = ?1 AND type = ?2;";
 pub(crate) const DELETE_BY_UUID: &str = "DELETE FROM items WHERE uuid = ?;";
 pub(crate) const RECURSIVE_SELECT_PATH_FROM_UUID: &str =
 	include_str!("../../sql/recursive_select_path_from_uuid.sql");
@@ -17,8 +19,7 @@ pub(crate) const SELECT_ITEM_BY_PARENT_NAME: &str =
 	include_str!("../../sql/select_item_by_parent_name.sql");
 pub(crate) const SELECT_UUID_TYPE_NAME_BY_PARENT: &str =
 	include_str!("../../sql/select_uuid_type_name_by_parent.sql");
-pub(crate) const UPDATE_LOCAL_DATA_BY_UUID: &str =
-	"UPDATE items SET local_data = ? WHERE uuid = ?;";
+pub(crate) const UPDATE_LOCAL_DATA_BY_UUID: &str = include_str!("../../sql/update_local_data.sql");
 pub(crate) const MARK_STALE_WITH_PARENT: &str =
 	include_str!("../../sql/mark_stale_with_parent.sql");
 pub(crate) const DELETE_STALE_WITH_PARENT: &str =
@@ -27,6 +28,12 @@ pub(crate) const MARK_STALE_TRASHED: &str = include_str!("../../sql/mark_stale_t
 pub(crate) const DELETE_STALE_TRASHED: &str = include_str!("../../sql/delete_stale_trashed.sql");
 pub(crate) const SELECT_POS_NOT_IN_UUIDS: &str =
 	include_str!("../../sql/select_pos_not_in_uuids.sql");
+pub(crate) const MARK_PENDING_UPLOAD: &str = include_str!("../../sql/mark_pending_upload.sql");
+pub(crate) const CLEAR_PENDING_UPLOAD: &str = include_str!("../../sql/clear_pending_upload.sql");
+pub(crate) const SELECT_PENDING_UPLOADS: &str =
+	include_str!("../../sql/select_pending_uploads.sql");
+pub(crate) const SELECT_PENDING_UPLOAD_AT: &str =
+	include_str!("../../sql/select_pending_upload_at.sql");
 
 // Item/Recents
 pub(crate) const UPDATE_ITEM_SET_RECENT: &str =
@@ -74,7 +81,7 @@ pub(crate) fn select_trash_children(order_by: Option<&str>) -> String {
 pub(crate) const SELECT_ROOT: &str = include_str!("../../sql/select_root.sql");
 pub(crate) const UPSERT_ROOT_EMPTY: &str = include_str!("../../sql/upsert_root_empty.sql");
 pub(crate) const INSERT_ROOT_INTO_ITEMS: &str =
-	"INSERT INTO items (uuid, stable_uuid, parent, type) VALUES (?1, ?1, NULL, ?2) RETURNING id;";
+	"INSERT INTO items (uuid, parent, type) VALUES (?1, NULL, ?2) RETURNING id;";
 pub(crate) const INSERT_ROOT_INTO_ROOTS: &str = "INSERT INTO roots (id) VALUES (?);";
 pub(crate) const INSERT_ROOT_INTO_DIRS: &str =
 	"INSERT INTO dirs (id, metadata_state, timestamp, raw_metadata) VALUES (?, 1, 0, '');";

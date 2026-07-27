@@ -7,6 +7,7 @@ use filen_sdk_rs::fs::{
 	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 	file::{FileBuilderOptionalName, RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 };
+use filen_types::fs::{ParentUuid, StableUuid, Uuid};
 use rusqlite::OptionalExtension;
 use tracing::debug;
 
@@ -18,11 +19,13 @@ use crate::{
 		ObjectWithPathResponse, ParsedFfiId, PathFfiId, QueryChildrenResponse,
 		QueryNonDirChildrenResponse, SearchQueryArgs, SearchQueryResponseEntry, UploadFileInfo,
 	},
+	local::addressed_stable_uuid,
 	sql::{
 		self, DBDirExt, DBDirObject, DBDirTrait, DBFileMeta, DBItemTrait,
 		dir::DBDir,
 		error::OptionalExtensionSQL,
 		file::DBFile,
+		item::RawDBItem,
 		object::{DBNonRootObject, DBObject},
 	},
 	sync::UpdateItemsInPath,
@@ -115,6 +118,18 @@ impl FilenMobileCacheState {
 			auth_state
 				.download_file_if_changed_by_uuid(uuid, progress_callback)
 				.await
+		})
+		.await
+	}
+
+	/// Retries every local edit that has not reached the server yet.
+	///
+	/// A failed upload leaves the edit marked in the cache, so it survives the extension being
+	/// torn down. Nothing drains those markers on its own — call this when the provider or the app
+	/// starts up, and after regaining connectivity. Returns how many uploads succeeded.
+	pub async fn retry_pending_uploads(&self) -> Result<u32, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.retry_pending_uploads().await
 		})
 		.await
 	}
@@ -362,52 +377,111 @@ impl AuthCacheState {
 			.await
 	}
 
+	/// Sends a cached file's local bytes to the server as a new version of itself.
+	///
+	/// `None` means there was nothing to send — the server already holds these bytes — and any
+	/// marker left by an earlier failed attempt has been dropped. The guard that comes back covers
+	/// the uuid the file now lives under on disk, which nothing knows about until the caller
+	/// writes its row; the sweep deletes exactly those, so it has to outlive that write.
+	async fn upload_edited_file(
+		&self,
+		file: DBFile,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+	) -> Result<Option<(RemoteFile, Option<tokio::sync::OwnedMutexGuard<()>>)>, CacheError> {
+		let DBFileMeta::Decoded(meta) = file.meta else {
+			return Err(CacheError::remote(format!(
+				"File {} does not have decoded metadata",
+				file.uuid
+			)));
+		};
+		// Held across the whole check-then-upload: io_upload_updated_file reads the cached copy
+		// and then renames it away under the newly minted uuid, so without this a concurrent
+		// clear or download of the same item interleaves with it.
+		let _local_file_guard = self.lock_local_file(file.uuid).await;
+		if let Some(hash) = meta.hash {
+			let local_hash = self.hash_local_file(file.uuid, Some(&meta.name)).await?;
+			if local_hash == Some(hash.into()) {
+				// Already on the server: clear any marker a previous failed attempt left, so a
+				// drain does not keep retrying an edit that has since landed.
+				sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+				return Ok(None);
+			}
+		}
+
+		// Marked BEFORE the attempt, so an upload interrupted by the process dying is still known
+		// to be outstanding. Cleared only once the bytes are on the server.
+		sql::mark_pending_upload(
+			&self.conn(),
+			file.stable_uuid,
+			chrono::Utc::now().timestamp_millis(),
+		)?;
+
+		let uploaded = self
+			.io_upload_updated_file(
+				file.uuid,
+				meta.name,
+				file.parent.try_into().map_err(|e| {
+					CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
+				})?,
+				meta.mime,
+				progress_callback,
+			)
+			.await?;
+		sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+		Ok(Some(uploaded))
+	}
+
+	/// The file a stable id names, as the cache currently holds it.
+	fn select_file_by_stable(&self, stable_uuid: Uuid) -> Result<DBFile, CacheError> {
+		let conn = self.conn();
+		let item = RawDBItem::select_by_stable(&conn, stable_uuid)?.ok_or_else(|| {
+			CacheError::DoesNotExist(format!("No item for stable id: {stable_uuid}").into())
+		})?;
+		DBFile::select(&conn, item.uuid).optional()?.ok_or_else(|| {
+			CacheError::DoesNotExist(format!("No file for stable id: {stable_uuid}").into())
+		})
+	}
+
 	pub(crate) async fn upload_file_if_changed(
 		&self,
 		path: FfiId,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<bool, CacheError> {
 		debug!("Uploading file at path: {}", path.0);
+		// Read before canonicalization, which turns a stable id into a path and loses the fact
+		// that the caller named a row rather than a location.
+		let addressed_stable = addressed_stable_uuid(&path);
 		let path = self.canonicalize_id(&path)?;
 		let path_values = path.as_path()?;
-		// The guard the upload hands back covers the uuid the file now lives under on disk, which
-		// nothing knows about until the upsert below writes its row; the sweep deletes exactly
-		// those, so it has to outlive that write.
 		let (remote_file, _new_uuid_guard) = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => {
-				let DBFileMeta::Decoded(meta) = file.meta else {
-					return Err(CacheError::remote(format!(
-						"Path {} does not point to a file with decoded metadata",
-						path_values.full_path
-					)));
-				};
-				// Held across the whole check-then-upload: io_upload_updated_file reads the
-				// cached copy and then renames it away under the newly minted uuid, so without
-				// this a concurrent clear or download of the same item interleaves with it.
-				let _local_file_guard = self.lock_local_file(file.uuid).await;
-				if let Some(hash) = meta.hash {
-					let local_hash = self.hash_local_file(file.uuid, Some(&meta.name)).await?;
-					if local_hash == Some(hash.into()) {
-						return Ok(false);
-					}
+				match self.upload_edited_file(file, progress_callback).await? {
+					Some(uploaded) => uploaded,
+					None => return Ok(false),
 				}
-
-				self.io_upload_updated_file(
-					file.uuid,
-					meta.name,
-					file.parent.try_into().map_err(|e| {
-						CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
-					})?,
-					meta.mime,
-					progress_callback,
-				)
-				.await?
 			}
 			UpdateItemsInPath::Complete(_) => {
 				return Err(CacheError::remote(format!(
 					"Path {} does not point to a file",
 					path_values.full_path
 				)));
+			}
+			// A stable id names an existing row, so there is nothing here to create: the path just
+			// failed to resolve, because the name it was built from is a snapshot of a row the
+			// server has since renamed, moved or dropped. Creating a file for it would upload the
+			// EMPTY slot io_upload_new_file makes under that stale name, and the upsert's
+			// `(parent, name)` tier would then merge that empty file onto the very row whose
+			// unuploaded edit we were sent here to deliver — clearing its marker and reporting
+			// success for bytes that were thrown away. Send the row's own bytes instead.
+			UpdateItemsInPath::Partial(remaining, _)
+				if remaining == path_values.name_or_uuid
+					&& let Some(stable_uuid) = addressed_stable =>
+			{
+				let file = self.select_file_by_stable(stable_uuid)?;
+				match self.upload_edited_file(file, progress_callback).await? {
+					Some(uploaded) => uploaded,
+					None => return Ok(false),
+				}
 			}
 			UpdateItemsInPath::Partial(remaining, parent)
 				if remaining == path_values.name_or_uuid =>
@@ -626,6 +700,9 @@ impl AuthCacheState {
 				self.client.trash_file(&mut remote_file).await?;
 				self.io_delete_local(remote_file.uuid()).await?;
 				let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
+				// The local bytes are gone, so there is nothing left to upload — and the drain
+				// skips trashed rows, so a marker left here would never be retried nor cleared.
+				sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
 				DBObject::File(file)
 			}
 		};
@@ -848,6 +925,99 @@ impl AuthCacheState {
 		Ok(())
 	}
 
+	/// Retries every file still marked as having unuploaded local changes.
+	///
+	/// Best effort and independent per file: one that still fails keeps its marker for the next
+	/// drain rather than aborting the rest. Returns how many reached the server.
+	pub(crate) async fn retry_pending_uploads(&self) -> Result<u32, CacheError> {
+		let pending = sql::select_pending_uploads(&self.conn())?;
+		if pending.is_empty() {
+			return Ok(0);
+		}
+		debug!("Retrying {} pending upload(s)", pending.len());
+
+		let mut uploaded = 0;
+		for stable_uuid in pending {
+			// A marked file whose local copy is gone has nothing left to upload — the cache was
+			// cleared, or the item was evicted. Without this it would take the "content differs"
+			// branch below and fail forever trying to read a file that is not there, keeping its
+			// marker and its log noise for good.
+			if !self.has_local_copy(stable_uuid).await? {
+				debug!(
+					"Pending upload for {stable_uuid} has no local file left, dropping the marker"
+				);
+				sql::clear_pending_upload(&self.conn(), stable_uuid)?;
+				continue;
+			}
+
+			// Addressed through the stable namespace: the file may have been renamed or moved
+			// since the edit, and a name path would no longer find it.
+			let id = FfiId(format!("stable/{stable_uuid}"));
+			match self.upload_file_if_changed(id, None).await {
+				Ok(_) => uploaded += 1,
+				Err(e) => {
+					// Trashing clears the marker and deletes the local bytes, so an item trashed
+					// between the check above and here fails the upload for a reason that is the
+					// system working. Warning about it would report an edit at risk that is not.
+					if self.was_trashed(stable_uuid) {
+						debug!(
+							"Pending upload for {stable_uuid} was trashed mid-drain, not retrying"
+						);
+					} else {
+						tracing::warn!(
+							"Pending upload for {stable_uuid} failed again, still marked: {e}"
+						);
+					}
+				}
+			}
+		}
+		Ok(uploaded)
+	}
+
+	/// Whether the file behind a stable id still has an edit that has not reached the server.
+	///
+	/// Queried rather than read off a cached row: callers act on this under the per-item lock, and
+	/// a row read before that lock was taken cannot see a marker written while it was held.
+	fn has_pending_upload(&self, stable_uuid: StableUuid) -> Result<bool, CacheError> {
+		Ok(sql::select_pending_upload_at(&self.conn(), stable_uuid)?.is_some())
+	}
+
+	/// Whether the item behind a stable id has since been trashed. Best effort: a lookup failure
+	/// reports `false`, which only means the caller keeps its louder message.
+	fn was_trashed(&self, stable_uuid: StableUuid) -> bool {
+		RawDBItem::select_by_stable(&self.conn(), stable_uuid.into())
+			.ok()
+			.flatten()
+			.is_some_and(|item| matches!(item.parent, Some(ParentUuid::Trash(_))))
+	}
+
+	/// Whether a cached copy of the file is still on disk.
+	///
+	/// Keyed on the stable id, because that is what the pending markers are keyed on — while the
+	/// cached copy lives under the file's CURRENT uuid, which an edit re-mints. Looking the row up
+	/// by the stable id first is what keeps the two in step.
+	async fn has_local_copy(&self, stable_uuid: StableUuid) -> Result<bool, CacheError> {
+		let Some(item) = RawDBItem::select_by_stable(&self.conn(), stable_uuid.into())? else {
+			return Ok(false);
+		};
+		let Some(file) = DBFile::select(&self.conn(), item.uuid).optional()? else {
+			return Ok(false);
+		};
+		let name = match &file.meta {
+			DBFileMeta::Decoded(meta) => Some(meta.name.clone()),
+			_ => None,
+		};
+		Ok(self
+			.hash_local_file(file.uuid, name.as_deref())
+			.await?
+			.is_some())
+	}
+
+	/// How many files have local changes that have not reached the server.
+	pub(crate) fn pending_upload_count(&self) -> Result<u32, CacheError> {
+		Ok(sql::select_pending_uploads(&self.conn())?.len() as u32)
+	}
+
 	pub(crate) async fn clear_local_cache_by_uuid(&self, uuid: &str) -> Result<(), CacheError> {
 		debug!("Clearing local cache for item with uuid: {uuid}");
 		let obj =
@@ -996,13 +1166,23 @@ impl AuthCacheState {
 		// Held for the whole check-then-download: without it a concurrent clear can delete the
 		// file between the freshness check and the write, or evict what we just downloaded.
 		let _local_file_guard = self.lock_local_file(file.uuid()).await;
+		// An edit that has not reached the server yet is indistinguishable, to the freshness
+		// check below, from a stale cache entry: the bytes simply differ. Overwriting it would
+		// destroy the edit, and the drain would then find local and server agreeing and clear the
+		// marker as though it had uploaded. Serve what is on disk instead and leave the
+		// divergence to retry_pending_uploads, which is what exists to resolve it.
+		//
+		// Read under the lock rather than from the row we were handed: an upload marks the file
+		// while holding this same lock, so a snapshot taken before it says "no marker" for
+		// precisely the edit worth protecting — the one whose upload just failed.
+		let has_pending_upload = self.has_pending_upload(file.stable_uuid())?;
 		match (
 			file.hash(),
 			self.hash_local_file(file.uuid(), file.name()).await,
 		) {
 			(Some(remote_hash), Ok(Some(local_hash))) => {
 				// Remote file has a hash and local file exists
-				if remote_hash == local_hash {
+				if remote_hash == local_hash || has_pending_upload {
 					return self
 						.get_cached_file_path(&file)
 						.into_os_string()
@@ -1016,9 +1196,7 @@ impl AuthCacheState {
 			}
 			(None, Ok(Some(_))) => {
 				// Remote file does not have a hash but local file exists
-				if let Some(old_file) = old_file
-					&& old_file == file
-				{
+				if has_pending_upload || old_file.is_some_and(|old_file| old_file == file) {
 					return self
 						.get_cached_file_path(&file)
 						.into_os_string()
@@ -1031,7 +1209,12 @@ impl AuthCacheState {
 				}
 			}
 			(_, Ok(None)) => {
-				// Local file does not exist
+				// Local file does not exist. Anything the marker described went with it — a cache
+				// clear, or the size-budget sweep — so drop it rather than leave the freshness
+				// bypass above armed over bytes that are gone. Same rule the drain applies.
+				if has_pending_upload {
+					sql::clear_pending_upload(&self.conn(), file.stable_uuid())?;
+				}
 			}
 			(_, Err(e)) => {
 				return Err(e.into());

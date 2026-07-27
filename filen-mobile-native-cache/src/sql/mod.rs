@@ -201,17 +201,63 @@ pub(crate) fn recursive_select_path_from_uuid(
 	stmt.query_row([uuid], |row| row.get(PATH)).optional()
 }
 
+/// Writes `local_data`, returning what was actually stored.
+///
+/// The statement preserves the internal pending-upload marker, so the stored value is not
+/// necessarily the one passed in — callers that hand the result back to the app must report what
+/// landed. `None` means the row did not exist, or its local data is now empty.
 pub(crate) fn update_local_data(
 	conn: &mut Connection,
 	uuid: Uuid,
 	local_data: Option<&JsonObject>,
-) -> Result<(), rusqlite::Error> {
+) -> Result<Option<JsonObject>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(UPDATE_LOCAL_DATA_BY_UUID)?;
 	let local_data = local_data
 		.map(|d| if d.is_empty() { None } else { Some(d) })
 		.unwrap_or(None);
-	stmt.execute((local_data, uuid))?;
+	stmt.query_row((local_data, uuid), |row| row.get(0))
+		.optional()
+		.map(Option::flatten)
+}
+
+/// The `local_data` key the pending-upload marker lives under. The SQL statements spell it out
+/// literally (`$.pendingUpload`) because they cannot share a Rust constant, so keep them in step.
+pub(crate) const PENDING_UPLOAD_KEY: &str = "pendingUpload";
+
+/// Marks a file as having local changes that are not on the server yet.
+///
+/// Written before the upload is attempted, not after it fails: if the process dies mid-upload the
+/// marker survives and the edit is retried, whereas marking only on failure would lose exactly the
+/// edits interrupted at the worst moment.
+pub(crate) fn mark_pending_upload(
+	conn: &Connection,
+	stable_uuid: Uuid,
+	marked_at_millis: i64,
+) -> Result<(), rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(MARK_PENDING_UPLOAD)?;
+	// Stored as text so the JSON object stays a map of strings, matching `local_data`'s shape
+	// everywhere else (it is surfaced over FFI as HashMap<String, String>).
+	stmt.execute((stable_uuid, marked_at_millis.to_string()))?;
 	Ok(())
+}
+
+/// Drops the pending-upload marker once the local changes have reached the server.
+pub(crate) fn clear_pending_upload(
+	conn: &Connection,
+	stable_uuid: Uuid,
+) -> Result<(), rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(CLEAR_PENDING_UPLOAD)?;
+	stmt.execute((stable_uuid,))?;
+	Ok(())
+}
+
+/// Every file still marked as having unuploaded local changes, oldest first.
+pub(crate) fn select_pending_uploads(conn: &Connection) -> Result<Vec<Uuid>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(SELECT_PENDING_UPLOADS)?;
+	let uuids = stmt
+		.query_map([], |row| row.get(0))?
+		.collect::<Result<Vec<Uuid>, _>>()?;
+	Ok(uuids)
 }
 
 pub(crate) fn update_recents(
@@ -489,5 +535,95 @@ impl ToSql for RawMeta<'_> {
 				s.as_bytes(),
 			))),
 		}
+	}
+}
+
+#[cfg(test)]
+mod pending_upload_tests {
+	use std::collections::HashMap;
+
+	use super::*;
+	use crate::sql::item::{self, combine_parent};
+
+	const MARKED_AT: i64 = 1_700_000_000_000;
+
+	fn db() -> Connection {
+		let conn = Connection::open_in_memory().unwrap();
+		conn.execute_batch(INIT).unwrap();
+		conn
+	}
+
+	fn uuid(byte: u8) -> Uuid {
+		Uuid::from_bytes([byte; 16])
+	}
+
+	/// Upserts a file row the way a remote listing would, and gives it the `files_meta` name row
+	/// the `(parent, name)` fallback in `upsert_item` joins against.
+	fn add_file(conn: &Connection, uuid_: Uuid, stable: Uuid, parent: Uuid, name: &str) -> i64 {
+		let (id, _) = item::upsert_item(
+			conn,
+			uuid_,
+			stable,
+			combine_parent(Some(parent), false),
+			Some(name),
+			None,
+			ItemType::File,
+		)
+		.unwrap();
+		conn.execute(
+			"INSERT INTO files (id, size, chunks, region, bucket, timestamp, metadata_state)
+			VALUES (?1, 0, 0, '', '', 0, 0);",
+			[id],
+		)
+		.unwrap();
+		conn.execute(
+			"INSERT INTO files_meta (id, name, mime, file_key, file_key_version, modified)
+			VALUES (?1, ?2, '', '', 3, 0);",
+			rusqlite::params![id, name],
+		)
+		.unwrap();
+		id
+	}
+
+	fn local_data_of(conn: &Connection, uuid_: Uuid) -> Option<HashMap<String, String>> {
+		conn.query_row(
+			"SELECT local_data FROM items WHERE uuid = ?1;",
+			[uuid_],
+			|r| r.get::<_, Option<JsonObject>>(0),
+		)
+		.unwrap()
+		.map(|d| d.to_map())
+	}
+
+	/// The provider writes its own keys into `local_data` through the FFI. That column is also
+	/// where the pending-upload marker lives, and the app has no way to know an internal-only key
+	/// is in there — so a tag write must not take an outstanding local edit down with it.
+	#[test]
+	fn update_local_data_must_not_wipe_a_pending_upload_marker() {
+		let mut conn = db();
+		add_file(&conn, uuid(1), uuid(2), uuid(9), "edited.txt");
+		mark_pending_upload(&conn, uuid(2), MARKED_AT).unwrap();
+		assert_eq!(select_pending_uploads(&conn).unwrap(), vec![uuid(2)]);
+
+		let mut tags = HashMap::new();
+		tags.insert("TagData".to_string(), "keep me".to_string());
+		update_local_data(&mut conn, uuid(1), Some(&JsonObject::new(tags))).unwrap();
+
+		let data = local_data_of(&conn, uuid(1)).expect("the tag write must leave local_data set");
+		assert_eq!(
+			data.get("TagData").map(String::as_str),
+			Some("keep me"),
+			"the caller's own key must be written"
+		);
+		assert_eq!(
+			data.get("pendingUpload").map(String::as_str),
+			Some(MARKED_AT.to_string().as_str()),
+			"an unrelated tag write must not drop the pending-upload marker"
+		);
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![uuid(2)],
+			"the edit must still be drainable after the tag write"
+		);
 	}
 }

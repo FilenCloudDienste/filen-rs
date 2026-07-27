@@ -4862,9 +4862,10 @@ pub async fn test_stable_id_namespace_addresses_files_across_edits() {
 	std::fs::remove_file(&downloaded).ok();
 }
 
-// Directories carry no stable id on the wire (stable == uuid, by design), so the
-// `stable/<uuid>` namespace must address them by uuid — the providers now use it as
-// the document id for dirs too, since name-path ids retire on every rename/move.
+// Directories have no stable id at all — the server never re-mints a dir's uuid, so the
+// uuid already is its whole-life id — and the `stable/<uuid>` namespace must therefore
+// address them by uuid. The providers use it as the document id for dirs too, since
+// name-path ids retire on every rename/move.
 #[shared_test_runtime]
 pub async fn test_stable_id_namespace_addresses_dirs_across_renames() {
 	let (db, rss) = get_db_resources().await;
@@ -4898,6 +4899,440 @@ pub async fn test_stable_id_namespace_addresses_dirs_across_renames() {
 	assert_eq!(renamed.uuid, dir.uuid().to_string());
 	assert_eq!(renamed.meta.unwrap().name, "stable_ns_dir_b");
 }
+
+// A local edit that fails to upload must not be silently lost. The cache marks the file before
+// attempting the upload and clears the marker only once the bytes are on the server, so an edit
+// interrupted at any point — a dead process, a dropped connection — is still known to be
+// outstanding and can be drained later.
+//
+// These assert on the SPECIFIC file's marker rather than the global pending count: the live tests
+// share one cache and run in parallel, so a global count would see other tests' markers and be
+// flaky.
+fn pending_marker(db: &FilenMobileCacheState, path: &FfiId) -> Option<i64> {
+	match db.query_item(path).unwrap().unwrap() {
+		FfiObject::File(f) => f.pending_upload_at,
+		other => panic!("expected a file, got {other:?}"),
+	}
+}
+
+// Nothing writes the marker from outside — the cache marks a file itself, just before it tries to
+// upload it — so tests provoke the real thing instead of seeding a column: an upload attempt with
+// no local bytes to send marks the file and then fails on the missing copy, which is exactly the
+// state a dropped connection leaves behind.
+async fn mark_pending_upload(db: &FilenMobileCacheState, path: &FfiId) {
+	assert!(
+		db.upload_file_if_changed(path.clone(), None).await.is_err(),
+		"an upload with no local bytes to send must fail"
+	);
+	assert!(
+		pending_marker(db, path).is_some(),
+		"the failed attempt must leave the edit marked"
+	);
+}
+
+// The same marker with `bytes` sitting behind it: a real edit that never reached the server. The
+// copy is taken away only for the duration of the attempt, which is what makes the attempt fail.
+async fn mark_pending_upload_over(db: &FilenMobileCacheState, path: &FfiId, bytes: &[u8]) {
+	let local_path = db
+		.download_file_if_changed_by_path(path.clone(), None)
+		.await
+		.unwrap();
+	tokio::fs::remove_file(&local_path).await.unwrap();
+	mark_pending_upload(db, path).await;
+	// The cache slot is a directory of its own, and the failed attempt is free to have tidied it.
+	tokio::fs::create_dir_all(std::path::Path::new(&local_path).parent().unwrap())
+		.await
+		.unwrap();
+	tokio::fs::write(&local_path, bytes).await.unwrap();
+}
+
+#[shared_test_runtime]
+pub async fn test_a_successful_upload_leaves_nothing_pending() {
+	let (db, rss) = get_db_resources().await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_ok.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_ok.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// Materialise it, then edit the local copy so the upload has something to do.
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	tokio::fs::write(&local_path, b"v2 edited locally")
+		.await
+		.unwrap();
+
+	assert!(
+		db.upload_file_if_changed(file_path.clone(), None)
+			.await
+			.unwrap(),
+		"the locally edited file should upload"
+	);
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		None,
+		"a successful upload must leave no marker behind"
+	);
+
+	// A second call has nothing to send and must not resurrect a marker.
+	assert!(
+		!db.upload_file_if_changed(file_path.clone(), None)
+			.await
+			.unwrap(),
+		"an unchanged file should report no upload"
+	);
+	assert_eq!(pending_marker(&db, &file_path), None);
+}
+
+// The marker is a column `upsert_item` never names, so nothing a directory refresh does — not the
+// identity reconciliation, not the stale sweep — can write it. If a refresh dropped it, an edit
+// that failed while the user was browsing would stop being retried and would be lost for good.
+#[shared_test_runtime]
+pub async fn test_a_pending_marker_survives_a_directory_refresh() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_refresh.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_refresh.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// The app's own local data goes in alongside, since the refresh has to leave both intact.
+	let mut local_data = std::collections::HashMap::new();
+	local_data.insert("TagData".to_string(), "keep me".to_string());
+	db.update_local_data(&file.uuid().to_string(), local_data.clone())
+		.unwrap();
+	mark_pending_upload(&db, &file_path).await;
+	let marked_at = pending_marker(&db, &file_path);
+
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		marked_at,
+		"a directory refresh must not drop the pending marker"
+	);
+	match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(f) => assert_eq!(
+			f.local_data,
+			Some(local_data),
+			"nor the app's own local data"
+		),
+		other => panic!("expected a file, got {other:?}"),
+	}
+}
+
+// Draining must not strand a marker forever. A marked file whose local copy is gone — the cache was
+// cleared, or the item evicted — has nothing left to upload, so the drain drops its marker instead
+// of failing on it on every future attempt.
+#[shared_test_runtime]
+pub async fn test_draining_drops_markers_for_files_with_no_local_copy() {
+	let (db, rss) = get_isolated_db_resources("drain_gone").await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_gone.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_gone.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// Marked, but never materialised locally.
+	mark_pending_upload(&db, &file_path).await;
+
+	db.retry_pending_uploads().await.unwrap();
+
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		None,
+		"an unusable marker must be dropped, not retried forever"
+	);
+}
+
+// A cache of its very own, for tests that call `retry_pending_uploads`.
+//
+// The drain is global by design — it services every outstanding edit in the cache. The rest of the
+// suite shares one cache and runs in parallel, so a drain running there picks up other tests' live
+// markers and uploads their files underneath them: two uploads race the same `cache_dir/<uuid>`
+// rename (ENOENT), and the drain re-marks a file the owning test has just cleared. Isolating the
+// cache is what makes the drain's own behaviour observable without perturbing anything else.
+async fn get_isolated_db_resources(tag: &str) -> (Arc<FilenMobileCacheState>, TestResources) {
+	let files_path = std::env::temp_dir().join(format!("test_files_{tag}"));
+	std::fs::create_dir_all(&files_path).unwrap();
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.to_stringified();
+	let state = Arc::new(
+		FilenMobileCacheState::from_stringified_in_memory(
+			client,
+			files_path.to_string_lossy().as_ref(),
+		)
+		.unwrap(),
+	);
+	(state, resources)
+}
+
+// Returns the cached file's (uuid, stable_uuid) pair. The two diverge as soon as the server
+// re-mints the uuid on a content edit, which is the precondition every test below depends on.
+fn file_ids(db: &FilenMobileCacheState, path: &FfiId) -> (String, String) {
+	match db.query_item(path).unwrap().unwrap() {
+		FfiObject::File(f) => (f.uuid, f.stable_uuid),
+		other => panic!("expected a file, got {other:?}"),
+	}
+}
+
+// An upload that fails must leave the edit marked, or the local changes are lost with nothing left
+// to reconcile them. The marker is written before the attempt precisely so an upload interrupted at
+// the worst moment — a dead process, a dropped connection — is still known to be outstanding.
+//
+// The failure is provoked by removing the cached copy after the freshness check has been primed:
+// the upload then reaches `io_upload_file`, whose `metadata()` call fails NotFound, so the attempt
+// returns Err without ever clearing the marker.
+#[shared_test_runtime]
+pub async fn test_a_failed_upload_leaves_a_pending_marker_on_a_re_minted_file() {
+	let (db, rss) = get_db_resources().await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_remint.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_remint.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// A first edit that succeeds: this is what makes the server re-mint the uuid, leaving the row
+	// with uuid != stable_uuid for every subsequent edit.
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	tokio::fs::write(&local_path, b"v2 edited locally")
+		.await
+		.unwrap();
+	assert!(
+		db.upload_file_if_changed(file_path.clone(), None)
+			.await
+			.unwrap()
+	);
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let (uuid, stable_uuid) = file_ids(&db, &file_path);
+	assert_ne!(
+		uuid, stable_uuid,
+		"the edit must have re-minted the uuid, or this test proves nothing"
+	);
+
+	// Materialise it, then take the local copy away so the upload attempt fails.
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	tokio::fs::remove_file(&local_path).await.unwrap();
+
+	assert!(
+		db.upload_file_if_changed(file_path.clone(), None)
+			.await
+			.is_err(),
+		"an upload with no local bytes to send must fail"
+	);
+	assert!(
+		pending_marker(&db, &file_path).is_some(),
+		"a failed upload must leave the edit marked as outstanding"
+	);
+}
+
+// The drain must actually retry a marked edit. A file whose uuid the server has re-minted is the
+// normal case for anything edited more than once, and it is exactly the case whose bytes are worth
+// the most — dropping its marker discards an edit that exists only on the device.
+#[shared_test_runtime]
+pub async fn test_the_drain_retries_a_file_whose_uuid_was_re_minted() {
+	let (db, rss) = get_isolated_db_resources("drain_remint").await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_drain.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_drain.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// A successful edit first, so the server re-mints the uuid.
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	tokio::fs::write(&local_path, b"v2 edited locally")
+		.await
+		.unwrap();
+	assert!(
+		db.upload_file_if_changed(file_path.clone(), None)
+			.await
+			.unwrap()
+	);
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let (uuid, stable_uuid) = file_ids(&db, &file_path);
+	assert_ne!(
+		uuid, stable_uuid,
+		"the edit must have re-minted the uuid, or this test proves nothing"
+	);
+
+	// A second edit whose upload never happened: local bytes present, marker outstanding.
+	const DRAINED: &[u8] = b"v3 waiting to be drained";
+	mark_pending_upload_over(&db, &file_path, DRAINED).await;
+
+	assert_eq!(
+		db.retry_pending_uploads().await.unwrap(),
+		1,
+		"the drain must retry the marked edit, not discard it"
+	);
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		None,
+		"a drained edit must leave no marker behind"
+	);
+
+	db.update_dir_children(test_dir_path).await.unwrap();
+	match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(f) => assert_eq!(
+			f.size as usize,
+			DRAINED.len(),
+			"the drained bytes must be the ones now on the server"
+		),
+		other => panic!("expected a file, got {other:?}"),
+	}
+}
+
+// The drain addresses a marked file through the stable namespace, and that id canonicalises to a
+// display-name path built from the cached row. When the server no longer has anything at that path
+// the walk comes back Partial — the arm that creates a file at the requested name. Creating one
+// there uploads the EMPTY slot `io_upload_new_file` makes, and the upsert's `(parent, name)` tier
+// merges that empty file onto the marked row: the edit is discarded, its marker cleared, and the
+// drain counts it as delivered. Whatever the drain does with a stale path, the bytes it was sent to
+// deliver have to reach the server.
+#[shared_test_runtime]
+pub async fn test_the_drain_never_replaces_a_marked_edit_with_an_empty_file() {
+	let (db, rss) = get_isolated_db_resources("drain_stale_path").await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_stale_path.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_stale_path.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// The state a failed upload leaves behind: local bytes ahead of the server, edit marked.
+	const EDITED: &[u8] = b"v2 edited locally, never uploaded";
+	mark_pending_upload_over(&db, &file_path, EDITED).await;
+
+	// Taken off the server behind the cache's back, so the path the stable id canonicalises to
+	// resolves to nothing and the drain reaches the create-a-file arm.
+	rss.client.delete_file_permanently(file).await.unwrap();
+
+	db.retry_pending_uploads().await.unwrap();
+
+	db.update_dir_children(test_dir_path).await.unwrap();
+	match db.query_item(&file_path).unwrap() {
+		Some(FfiObject::File(f)) => assert_eq!(
+			f.size as usize,
+			EDITED.len(),
+			"the drain must send the edited bytes, not create an empty file over them"
+		),
+		other => panic!("the drained edit must be on the server, got {other:?}"),
+	}
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		None,
+		"a marker may only be cleared once the bytes it stood for have landed"
+	);
+}
+
+// Trashing a file with an outstanding edit must not strand its marker. The drain skips trashed
+// rows, so a marker left behind here is never retried and never cleared — it just sits on the row
+// for the life of the cache, and any count of outstanding edits built from it lies.
+#[shared_test_runtime]
+pub async fn test_trashing_a_marked_file_does_not_strand_its_marker() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("pending_trash.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("pending_trash.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	mark_pending_upload(&db, &file_path).await;
+
+	db.trash_item(file_path).await.unwrap();
+
+	let trashed_path: FfiId = format!("trash/{}", file.uuid()).into();
+	assert_eq!(
+		pending_marker(&db, &trashed_path),
+		None,
+		"trashing must not leave a marker the drain can never reach"
+	);
+}
+
 // An app that persisted a file's `uuid` before the stable-id migration must keep resolving it after
 // the server re-mints that uuid. `resolve_uuid_or_stable` covers this by falling back to a
 // stable-id match once the exact uuid match misses — the branch every uuid-string entry point
@@ -5000,5 +5435,90 @@ pub async fn test_the_stable_namespace_addresses_a_trashed_item() {
 		db.set_favorite_rank(stable_id, 0).await.unwrap().id.0,
 		format!("trash/{}", file.uuid()),
 		"a trashed item's stable id must canonicalise to the trash form, not a bare uuid"
+	);
+}
+
+// An edit that has not reached the server yet must survive a download of that same file. The
+// freshness check sees the local bytes differ from the server's, which is exactly what an
+// outstanding edit looks like, so without a guard a routine refresh — a preview, a thumbnail, any
+// re-open — overwrites the edit with the copy it was supposed to replace. The drain would then see
+// local and server agreeing and clear the marker, reporting success for work it destroyed.
+#[shared_test_runtime]
+pub async fn test_a_download_does_not_clobber_an_unuploaded_edit() {
+	let (db, rss) = get_db_resources().await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("download_clobber.txt", rss.dir.uuid())
+				.unwrap(),
+			b"server copy",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("download_clobber.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// The state a failed upload leaves behind: local bytes ahead of the server, edit marked.
+	const EDITED: &[u8] = b"edited locally, never uploaded";
+	mark_pending_upload_over(&db, &file_path, EDITED).await;
+
+	let served = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		tokio::fs::read(&served).await.unwrap(),
+		EDITED,
+		"a download must not overwrite an edit that is still waiting to be uploaded"
+	);
+	assert!(
+		pending_marker(&db, &file_path).is_some(),
+		"the marker must survive, so the drain still knows to retry"
+	);
+}
+
+// The marker arms a bypass of the freshness check, so it must not outlive the bytes it describes.
+// A cache clear and the size-budget sweep both delete the local copy without touching the row, and
+// neither the drain nor an upload runs afterwards to tidy up — so the download path drops the
+// marker itself once it finds nothing on disk, rather than leaving the bypass armed forever.
+#[shared_test_runtime]
+pub async fn test_a_download_drops_a_marker_whose_local_copy_is_gone() {
+	let (db, rss) = get_db_resources().await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("marker_no_copy.txt", rss.dir.uuid())
+				.unwrap(),
+			b"server copy",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("marker_no_copy.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// Marked, but the local copy was never materialised — the state a cache clear leaves behind.
+	mark_pending_upload(&db, &file_path).await;
+
+	let served = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		tokio::fs::read(&served).await.unwrap(),
+		b"server copy",
+		"with no local copy to protect the download must proceed normally"
+	);
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		None,
+		"a marker with no bytes behind it must be dropped, not left arming the bypass"
 	);
 }
