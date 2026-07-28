@@ -183,6 +183,8 @@ impl FilenCompleter {
 			FilenArgType::HelpTopic => Ok(get_help_topics()
 				.context("Failed to get help topics")?
 				.into_iter()
+				.collect::<std::collections::HashSet<_>>()
+				.into_iter()
 				.filter(|topic| topic.starts_with(input))
 				.collect()),
 		}

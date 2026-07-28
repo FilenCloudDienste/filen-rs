@@ -24,7 +24,7 @@ curl -sL https://raw.githubusercontent.com/FilenCloudDienste/filen-rs/refs/heads
 
 💻 **Windows**: Download the latest binaries from the [release page](https://github.com/FilenCloudDienste/filen-cli-releases/releases/latest). 
 
-🐋 Docker images are also available as [`filen/cli`](https://hub.docker.com/repository/docker/filen/cli) (you need to specify a version instead of using `:latest`).
+🐋 Docker images are also available as [`filen/cli`](https://hub.docker.com/r/filen/cli/tags) (you need to specify a version instead of using `:latest`).
 
 The CLI includes an automatic updater.
 

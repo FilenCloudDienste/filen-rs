@@ -63,6 +63,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 # todo: might merge this upstream in the future
 inquire = { git = "https://github.com/JupiterPi/inquire.git", branch = "more-actions" }
 console = "0.16.4"
+ctrlc = "3.5.2"
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }

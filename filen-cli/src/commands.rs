@@ -964,6 +964,7 @@ mod rclone {
 		rclone_installation::{RcloneInstallation, RcloneInstallationConfig},
 		serve::BasicServerOptions,
 	};
+	use tokio::select;
 
 	use crate::{CliConfig, auth::LazyClient, ui::UI};
 
@@ -996,16 +997,21 @@ mod rclone {
 			.await
 			.context("Failed to mount network drive (use --verbose for more info)")?;
 		ui.print_success("Mounted network drive (kill the CLI to unmount and exit)");
-		let code = network_drive
-			.process
-			.wait()
-			.await
-			.context("Failed to wait for mount process")?;
-		if !code.success() {
-			return Err(anyhow::anyhow!(match code.code() {
-				Some(c) => format!("Mount process exited with code: {}", c),
-				None => "Mount process exited with unknown code".to_string(),
-			}));
+		let mut stop_rx = crate::CTRLC_TX.subscribe();
+		select! {
+			_ = stop_rx.recv() => {
+				ui.print_muted("Unmounting network drive...");
+				network_drive.process.kill().await.context("Failed to kill mount process")?;
+			}
+			result = network_drive.process.wait() => {
+				let status = result.context("Failed to wait for mount process")?;
+				if !status.success() {
+					return Err(anyhow::anyhow!(match status.code() {
+						Some(c) => format!("Mount process exited with code: {}", c),
+						None => "Mount process exited with unknown code".to_string(),
+					}));
+				}
+			}
 		}
 		Ok(())
 	}
@@ -1056,20 +1062,31 @@ mod rclone {
 				"without authentication".to_string()
 			}
 		));
-		let code = server.process.wait().await.with_context(|| {
-			format!("Failed to wait for {} server process", display_server_type)
-		})?;
-		if !code.success() {
-			return Err(anyhow::anyhow!(match code.code() {
-				Some(c) => format!(
-					"{} server process exited with code: {} (use --verbose for more info)",
-					display_server_type, c
-				),
-				None => format!(
-					"{} server process exited with unknown code",
-					display_server_type
-				),
-			}));
+		let mut stop_rx = crate::CTRLC_TX.subscribe();
+		select! {
+			_ = stop_rx.recv() => {
+				ui.print_muted(&format!("Stopping {} server...", display_server_type));
+				server.process.kill().await.with_context(|| {
+					format!("Failed to kill {} server process", display_server_type)
+				})?;
+			}
+			result = server.process.wait() => {
+				let status = result.with_context(|| {
+					format!("Failed to wait for {} server process", display_server_type)
+				})?;
+				if !status.success() {
+					return Err(anyhow::anyhow!(match status.code() {
+						Some(c) => format!(
+							"{} server process exited with code: {} (use --verbose for more info)",
+							display_server_type, c
+						),
+						None => format!(
+							"{} server process exited with unknown code",
+							display_server_type
+						),
+					}));
+				}
+			}
 		}
 		Ok(())
 	}

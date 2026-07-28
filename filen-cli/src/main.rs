@@ -105,6 +105,18 @@ pub(crate) fn construct_exit_code_error(code: i32) -> anyhow::Error {
 	anyhow::anyhow!("{}{}", EXIT_CODE_ERROR_PREFIX, code)
 }
 
+pub(crate) static CTRLC_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<()>> =
+	std::sync::LazyLock::new(|| {
+		let (tx, _) = tokio::sync::broadcast::channel(1);
+		let tx_clone = tx.clone();
+		ctrlc::set_handler(move || {
+			let _ = tx_clone.send(());
+		})
+		.expect("Error setting Ctrl-C handler");
+		tx
+	});
+// todo: might we also be able to use this for general cancellability? (e.g. for long-running commands like upload/download)
+
 #[tokio::main]
 async fn main() {
 	let mut ui = ui::UI::new();
