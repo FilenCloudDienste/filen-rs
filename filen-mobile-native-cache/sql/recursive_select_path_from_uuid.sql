@@ -30,5 +30,5 @@ ordered_path AS (
 SELECT CASE
 	WHEN GROUP_CONCAT(name, '/') IS NULL THEN NULL
 	ELSE GROUP_CONCAT(name, '/')
-END FROM ordered_path
+END AS path FROM ordered_path
 HAVING COUNT(*) > 0;

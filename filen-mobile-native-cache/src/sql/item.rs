@@ -10,6 +10,9 @@ use tracing::trace;
 use crate::{
 	ffi::ItemType,
 	sql::{
+		columns::{
+			ITEMS_ID, ITEMS_LOCAL_DATA, ITEMS_PARENT, ITEMS_TRASHED, ITEMS_TYPE, ITEMS_UUID,
+		},
 		dir::{DBDir, DBRoot},
 		file::DBFile,
 		object::{DBObject, JsonObject},
@@ -86,7 +89,7 @@ pub(crate) fn upsert_item_with_stmts(
 	let (parent_uuid, trashed) = decompose_parent(parent);
 	let (id, local_data) = upsert_item_stmt.query_row(
 		(uuid, parent_uuid, name, local_data, type_, trashed),
-		|row| Ok((row.get(0)?, row.get(1)?)),
+		|row| Ok((row.get(ITEMS_ID)?, row.get(ITEMS_LOCAL_DATA)?)),
 	)?;
 	trace!("Upserted item with id: {id}");
 	Ok((id, local_data))
@@ -106,14 +109,14 @@ pub(crate) fn upsert_item(
 
 impl RawDBItem {
 	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-		let parent: Option<Uuid> = row.get(2)?;
-		let trashed: bool = row.get(3)?;
+		let parent: Option<Uuid> = row.get(ITEMS_PARENT)?;
+		let trashed: bool = row.get(ITEMS_TRASHED)?;
 		Ok(Self {
-			id: row.get(0)?,
-			uuid: row.get(1)?,
+			id: row.get(ITEMS_ID)?,
+			uuid: row.get(ITEMS_UUID)?,
 			parent: combine_parent(parent, trashed),
-			local_data: row.get(4).unwrap(),
-			type_: row.get(5)?,
+			local_data: row.get(ITEMS_LOCAL_DATA).unwrap(),
+			type_: row.get(ITEMS_TYPE)?,
 		})
 	}
 
@@ -141,13 +144,13 @@ pub struct InnerDBItem {
 
 impl InnerDBItem {
 	pub(crate) fn from_row(row: &rusqlite::Row) -> Result<Self> {
-		let parent: Option<Uuid> = row.get(2)?;
-		let trashed: bool = row.get(3)?;
+		let parent: Option<Uuid> = row.get(ITEMS_PARENT)?;
+		let trashed: bool = row.get(ITEMS_TRASHED)?;
 		Ok(Self {
-			id: row.get(0)?,
-			uuid: row.get(1)?,
+			id: row.get(ITEMS_ID)?,
+			uuid: row.get(ITEMS_UUID)?,
 			parent: combine_parent(parent, trashed),
-			local_data: row.get(4).unwrap(),
+			local_data: row.get(ITEMS_LOCAL_DATA).unwrap(),
 		})
 	}
 }

@@ -26,4 +26,4 @@ INSERT INTO dirs (
 	timestamp = excluded.timestamp,
 	metadata_state = excluded.metadata_state,
 	raw_metadata = excluded.raw_metadata
-RETURNING last_listed, favorite_rank;
+RETURNING last_listed, favorite_rank AS dir_favorite_rank;

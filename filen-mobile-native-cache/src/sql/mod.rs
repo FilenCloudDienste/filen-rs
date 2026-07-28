@@ -17,6 +17,7 @@ use tracing::{debug, trace};
 
 pub mod error;
 pub use error::SQLError;
+pub(crate) mod columns;
 pub mod dir;
 pub mod file;
 pub mod item;
@@ -28,6 +29,7 @@ use crate::{
 	CacheError,
 	ffi::{ItemType, ParsedFfiId, PathFfiId},
 	sql::{
+		columns::{DISPLAY_NAME, ITEMS_ID, ITEMS_TYPE, ITEMS_UUID, PATH, POSITION},
 		dir::DBDir,
 		file::DBFile,
 		item::RawDBItem,
@@ -115,7 +117,7 @@ pub(crate) fn insert_root(conn: &mut Connection, root: Uuid) -> Result<(), rusql
 	let tx: rusqlite::Transaction<'_> = conn.transaction()?;
 	{
 		let mut stmt = tx.prepare_cached(INSERT_ROOT_INTO_ITEMS)?;
-		let id: i64 = match stmt.query_one((root, ItemType::Root as i8), |row| row.get(0)) {
+		let id: i64 = match stmt.query_one((root, ItemType::Root as i8), |row| row.get(ITEMS_ID)) {
 			Ok(id) => id,
 			Err(rusqlite::Error::SqliteFailure(
 				libsqlite3_sys::Error {
@@ -143,7 +145,7 @@ pub(crate) fn update_root(
 	root_uuid: Uuid,
 	response: &UserInfo,
 ) -> Result<(), rusqlite::Error> {
-	let id: i64 = conn.query_one(SELECT_ID_BY_UUID, [root_uuid], |row| row.get(0))?;
+	let id: i64 = conn.query_one(SELECT_ID_BY_UUID, [root_uuid], |row| row.get(ITEMS_ID))?;
 	let mut stmt = conn.prepare(UPDATE_ROOT)?;
 	let now = chrono::Utc::now().timestamp_millis();
 	stmt.execute((response.storage_used, response.max_storage, now, id))?;
@@ -164,9 +166,9 @@ fn get_all_descendant_paths_with_stmt(
 ) -> Result<(), rusqlite::Error> {
 	let items = stmt
 		.query_and_then([uuid], |f| -> Result<_, rusqlite::Error> {
-			let uuid = f.get::<_, Uuid>(0)?;
-			let item_type = f.get::<_, ItemType>(1)?;
-			let name_or_uuid = f.get::<_, String>(2)?;
+			let uuid = f.get::<_, Uuid>(ITEMS_UUID)?;
+			let item_type = f.get::<_, ItemType>(ITEMS_TYPE)?;
+			let name_or_uuid = f.get::<_, String>(DISPLAY_NAME)?;
 			Ok((uuid, name_or_uuid, item_type))
 		})?
 		.collect::<Result<Vec<_>, rusqlite::Error>>()?;
@@ -196,7 +198,7 @@ pub(crate) fn recursive_select_path_from_uuid(
 	uuid: Uuid,
 ) -> Result<Option<String>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(RECURSIVE_SELECT_PATH_FROM_UUID)?;
-	stmt.query_row([uuid], |row| row.get(0)).optional()
+	stmt.query_row([uuid], |row| row.get(PATH)).optional()
 }
 
 pub(crate) fn update_local_data(
@@ -406,7 +408,7 @@ where
 		uuids_json_string.push('"');
 	}
 	uuids_json_string.push(']');
-	stmt.query_and_then([uuids_json_string], |row| Ok(row.get(0)?))?
+	stmt.query_and_then([uuids_json_string], |row| Ok(row.get(POSITION)?))?
 		.collect::<SQLResult<Vec<_>>>()
 }
 

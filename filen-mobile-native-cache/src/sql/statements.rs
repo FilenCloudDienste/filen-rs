@@ -108,13 +108,3 @@ fn convert_order_by(order_by: Option<&str>) -> &'static str {
 	}
 	"ORDER BY coalesce(files_meta.name, dirs_meta.name, uuid_text(items.uuid)) ASC"
 }
-
-// Constants
-/// Number of leading `items` columns selected by the wide-join queries
-/// (`id, uuid, parent, trashed, local_data, type`). Does not include is_stale and is_recent.
-pub(crate) const ITEM_COLUMN_COUNT_NO_EXTRA: usize = 6;
-// does not include the `id` column for the below
-pub(crate) const DIRS_COLUMN_COUNT: usize = 6;
-pub(crate) const DIRS_META_COLUMN_COUNT: usize = 2;
-pub(crate) const FILES_COLUMN_COUNT: usize = 8;
-pub(crate) const FILES_META_COLUMN_COUNT: usize = 7;

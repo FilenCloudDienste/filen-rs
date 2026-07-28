@@ -1,7 +1,8 @@
 SELECT
 	items.uuid,
 	items.type,
-	coalesce(files_meta.name, dirs_meta.name, uuid_text(items.uuid)) AS name
+	coalesce(files_meta.name, dirs_meta.name, uuid_text(items.uuid))
+		AS display_name
 FROM items
 LEFT JOIN files_meta ON items.id = files_meta.id
 LEFT JOIN dirs_meta ON items.id = dirs_meta.id

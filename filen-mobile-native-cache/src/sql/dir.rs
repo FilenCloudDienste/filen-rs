@@ -24,6 +24,11 @@ use crate::{
 	ffi::ItemType,
 	sql::{
 		MetaState, SQLError,
+		columns::{
+			DIR_CREATED, DIR_FAVORITE_RANK, DIR_METADATA_STATE, DIR_NAME, DIR_RAW_METADATA,
+			DIR_TIMESTAMP, DIRS_COLOR, DIRS_LAST_LISTED, ROOT_LAST_LISTED, ROOTS_LAST_UPDATED,
+			ROOTS_MAX_STORAGE, ROOTS_STORAGE_USED,
+		},
 		item::{self, DBItemTrait, InnerDBItem},
 		object::{DBNonRootObject, DBObject, JsonObject},
 		raw_meta_and_state_from_dir_meta,
@@ -40,10 +45,10 @@ pub(crate) struct DBDecryptedDirMeta {
 }
 
 impl DBDecryptedDirMeta {
-	fn from_row(row: &rusqlite::Row, idx: usize) -> Result<Self> {
+	fn from_row(row: &rusqlite::Row) -> Result<Self> {
 		Ok(Self {
-			name: row.get(idx)?,
-			created: row.get(idx + 1)?,
+			name: row.get(DIR_NAME)?,
+			created: row.get(DIR_CREATED)?,
 		})
 	}
 }
@@ -67,19 +72,21 @@ pub(crate) enum DBDirMeta {
 }
 
 impl DBDirMeta {
-	fn from_row(row: &rusqlite::Row, idx: usize) -> Result<Self> {
-		let metadata_state: MetaState = row.get(idx)?;
+	fn from_row(row: &rusqlite::Row) -> Result<Self> {
+		let metadata_state: MetaState = row.get(DIR_METADATA_STATE)?;
 
 		match metadata_state {
-			MetaState::Decrypted => match String::from_utf8(row.get(idx + 1)?) {
+			MetaState::Decrypted => match String::from_utf8(row.get(DIR_RAW_METADATA)?) {
 				Ok(utf8) => Ok(Self::DecryptedUTF8(utf8)),
 				Err(e) => Ok(Self::DecryptedRaw(e.into_bytes())),
 			},
-			MetaState::Encrypted => Ok(Self::Encrypted(EncryptedString(row.get(idx + 1)?))),
-			MetaState::RSAEncrypted => {
-				Ok(Self::RSAEncrypted(RSAEncryptedString(row.get(idx + 1)?)))
+			MetaState::Encrypted => {
+				Ok(Self::Encrypted(EncryptedString(row.get(DIR_RAW_METADATA)?)))
 			}
-			MetaState::Decoded => Ok(Self::Decoded(DBDecryptedDirMeta::from_row(row, idx + 2)?)),
+			MetaState::RSAEncrypted => Ok(Self::RSAEncrypted(RSAEncryptedString(
+				row.get(DIR_RAW_METADATA)?,
+			))),
+			MetaState::Decoded => Ok(Self::Decoded(DBDecryptedDirMeta::from_row(row)?)),
 		}
 	}
 }
@@ -129,11 +136,7 @@ pub struct DBDir {
 }
 
 impl DBDir {
-	pub(crate) fn from_inner_and_row(
-		item: InnerDBItem,
-		row: &rusqlite::Row,
-		idx: usize,
-	) -> Result<Self> {
+	pub(crate) fn from_inner_and_row(item: InnerDBItem, row: &rusqlite::Row) -> Result<Self> {
 		Ok(Self {
 			id: item.id,
 			uuid: item.uuid,
@@ -145,17 +148,17 @@ impl DBDir {
 				)
 			})?,
 			local_data: item.local_data,
-			favorite_rank: row.get(idx)?,
-			color: row.get(idx + 1)?,
-			timestamp: row.get(idx + 2)?,
-			last_listed: row.get(idx + 3)?,
-			meta: DBDirMeta::from_row(row, idx + 4)?,
+			favorite_rank: row.get(DIR_FAVORITE_RANK)?,
+			color: row.get(DIRS_COLOR)?,
+			timestamp: row.get(DIR_TIMESTAMP)?,
+			last_listed: row.get(DIRS_LAST_LISTED)?,
+			meta: DBDirMeta::from_row(row)?,
 		})
 	}
 
 	pub(crate) fn from_item(item: InnerDBItem, conn: &Connection) -> Result<Self> {
 		let mut stmt = conn.prepare_cached(SELECT_DIR)?;
-		let res = stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))?;
+		let res = stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row))?;
 		Ok(res)
 	}
 
@@ -192,8 +195,8 @@ impl DBDir {
 				meta,
 			),
 			|r| {
-				let last_listed: i64 = r.get(0)?;
-				let favorite_rank: i64 = r.get(1)?;
+				let last_listed: i64 = r.get(DIRS_LAST_LISTED)?;
+				let favorite_rank: i64 = r.get(DIR_FAVORITE_RANK)?;
 				Ok((last_listed, favorite_rank))
 			},
 		)?;
@@ -345,24 +348,20 @@ pub struct DBRoot {
 }
 
 impl DBRoot {
-	pub(crate) fn from_inner_and_row(
-		inner: InnerDBItem,
-		row: &rusqlite::Row,
-		idx: usize,
-	) -> Result<Self> {
+	pub(crate) fn from_inner_and_row(inner: InnerDBItem, row: &rusqlite::Row) -> Result<Self> {
 		Ok(Self {
 			id: inner.id,
 			uuid: inner.uuid,
-			storage_used: row.get(idx)?,
-			max_storage: row.get(idx + 1)?,
-			last_updated: row.get(idx + 2)?,
-			last_listed: row.get(idx + 3)?,
+			storage_used: row.get(ROOTS_STORAGE_USED)?,
+			max_storage: row.get(ROOTS_MAX_STORAGE)?,
+			last_updated: row.get(ROOTS_LAST_UPDATED)?,
+			last_listed: row.get(ROOT_LAST_LISTED)?,
 		})
 	}
 
 	pub(crate) fn from_item(item: InnerDBItem, conn: &Connection) -> Result<Self> {
 		let mut stmt = conn.prepare_cached(SELECT_ROOT)?;
-		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))
+		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row))
 	}
 
 	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> SQLResult<Self> {
@@ -388,9 +387,9 @@ impl DBRoot {
 		)?;
 		let mut stmt = tx.prepare_cached(UPSERT_ROOT_EMPTY)?;
 		let (storage_used, max_storage, last_updated) = stmt.query_one([id], |f| {
-			let storage_used: i64 = f.get(0)?;
-			let max_storage: i64 = f.get(1)?;
-			let last_updated: i64 = f.get(2)?;
+			let storage_used: i64 = f.get(ROOTS_STORAGE_USED)?;
+			let max_storage: i64 = f.get(ROOTS_MAX_STORAGE)?;
+			let last_updated: i64 = f.get(ROOTS_LAST_UPDATED)?;
 			Ok((storage_used, max_storage, last_updated))
 		})?;
 		std::mem::drop(stmt);
@@ -398,7 +397,7 @@ impl DBRoot {
 		let last_listed = stmt.query_one(
 			(id, 0, Option::<String>::None, 0, MetaState::Decrypted, ""),
 			|r| {
-				let last_listed: i64 = r.get(0)?;
+				let last_listed: i64 = r.get(DIRS_LAST_LISTED)?;
 				Ok(last_listed)
 			},
 		)?;

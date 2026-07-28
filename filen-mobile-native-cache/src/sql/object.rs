@@ -12,6 +12,7 @@ use crate::{
 	ffi::ItemType,
 	sql::{
 		SQLResult,
+		columns::ITEMS_TYPE,
 		dir::{DBDir, DBRoot},
 		file::DBFile,
 		item::{DBItemTrait, InnerDBItem, RawDBItem},
@@ -36,25 +37,9 @@ impl DBObject {
 		stmt.query_one([uuid], |row| {
 			let item = RawDBItem::from_row(row)?;
 			Ok(match item.type_ {
-				ItemType::Dir => Self::Dir(DBDir::from_inner_and_row(
-					item.into(),
-					row,
-					ITEM_COLUMN_COUNT_NO_EXTRA,
-				)?),
-				ItemType::File => Self::File(DBFile::from_inner_and_row(
-					item.into(),
-					row,
-					ITEM_COLUMN_COUNT_NO_EXTRA + DIRS_COLUMN_COUNT + DIRS_META_COLUMN_COUNT,
-				)?),
-				ItemType::Root => {
-					Self::Root(DBRoot::from_inner_and_row(
-						item.into(),
-						row,
-						ITEM_COLUMN_COUNT_NO_EXTRA
-							+ DIRS_COLUMN_COUNT + DIRS_META_COLUMN_COUNT
-							+ FILES_COLUMN_COUNT + FILES_META_COLUMN_COUNT,
-					)?)
-				}
+				ItemType::Dir => Self::Dir(DBDir::from_inner_and_row(item.into(), row)?),
+				ItemType::File => Self::File(DBFile::from_inner_and_row(item.into(), row)?),
+				ItemType::Root => Self::Root(DBRoot::from_inner_and_row(item.into(), row)?),
 			})
 		})
 	}
@@ -165,19 +150,11 @@ impl DBNonRootObject {
 
 	pub(crate) fn from_row(row: &rusqlite::Row) -> SQLResult<Self> {
 		let item = InnerDBItem::from_row(row)?;
-		let type_: ItemType = row.get(ITEM_COLUMN_COUNT_NO_EXTRA - 1)?;
+		let type_: ItemType = row.get(ITEMS_TYPE)?;
 		trace!("Creating DBNonRootObject from row, item: {item:?}");
 		let obj = match type_ {
-			ItemType::Dir => DBNonRootObject::Dir(DBDir::from_inner_and_row(
-				item,
-				row,
-				ITEM_COLUMN_COUNT_NO_EXTRA,
-			)?),
-			ItemType::File => DBNonRootObject::File(DBFile::from_inner_and_row(
-				item,
-				row,
-				ITEM_COLUMN_COUNT_NO_EXTRA + DIRS_COLUMN_COUNT + DIRS_META_COLUMN_COUNT,
-			)?),
+			ItemType::Dir => DBNonRootObject::Dir(DBDir::from_inner_and_row(item, row)?),
+			ItemType::File => DBNonRootObject::File(DBFile::from_inner_and_row(item, row)?),
 			_ => return Err(SQLError::UnexpectedType(type_, ItemType::Dir)),
 		};
 		trace!("Created DBNonRootObject: {obj:?}");

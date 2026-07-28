@@ -25,6 +25,11 @@ use crate::{
 	ffi::ItemType,
 	sql::{
 		MetaState, SQLError,
+		columns::{
+			FILE_CREATED, FILE_FAVORITE_RANK, FILE_METADATA_STATE, FILE_NAME, FILE_RAW_METADATA,
+			FILE_TIMESTAMP, FILES_BUCKET, FILES_CHUNKS, FILES_HASH, FILES_KEY, FILES_KEY_VERSION,
+			FILES_MIME, FILES_MODIFIED, FILES_REGION, FILES_SIZE,
+		},
 		item::{self, DBItemTrait, InnerDBItem},
 		object::{DBObject, JsonObject},
 		raw_meta_and_state_from_file_meta,
@@ -63,15 +68,15 @@ impl Debug for DBDecryptedFileMeta {
 }
 
 impl DBDecryptedFileMeta {
-	fn from_row(row: &rusqlite::Row, idx: usize) -> Result<Self> {
+	fn from_row(row: &rusqlite::Row) -> Result<Self> {
 		Ok(Self {
-			name: row.get(idx)?,
-			mime: row.get(idx + 1)?,
-			key: row.get(idx + 2)?,
-			key_version: row.get(idx + 3)?,
-			created: row.get(idx + 4)?,
-			modified: row.get(idx + 5)?,
-			hash: row.get(idx + 6)?,
+			name: row.get(FILE_NAME)?,
+			mime: row.get(FILES_MIME)?,
+			key: row.get(FILES_KEY)?,
+			key_version: row.get(FILES_KEY_VERSION)?,
+			created: row.get(FILE_CREATED)?,
+			modified: row.get(FILES_MODIFIED)?,
+			hash: row.get(FILES_HASH)?,
 		})
 	}
 }
@@ -111,19 +116,21 @@ pub(crate) enum DBFileMeta {
 }
 
 impl DBFileMeta {
-	fn from_row(row: &rusqlite::Row, idx: usize) -> Result<Self> {
-		let metadata_state: MetaState = row.get(idx)?;
+	fn from_row(row: &rusqlite::Row) -> Result<Self> {
+		let metadata_state: MetaState = row.get(FILE_METADATA_STATE)?;
 
 		match metadata_state {
-			MetaState::Decrypted => match String::from_utf8(row.get(idx + 1)?) {
+			MetaState::Decrypted => match String::from_utf8(row.get(FILE_RAW_METADATA)?) {
 				Ok(utf8) => Ok(Self::DecryptedUTF8(utf8)),
 				Err(e) => Ok(Self::DecryptedRaw(e.into_bytes())),
 			},
-			MetaState::Encrypted => Ok(Self::Encrypted(EncryptedString(row.get(idx + 1)?))),
-			MetaState::RSAEncrypted => {
-				Ok(Self::RSAEncrypted(RSAEncryptedString(row.get(idx + 1)?)))
-			}
-			MetaState::Decoded => Ok(Self::Decoded(DBDecryptedFileMeta::from_row(row, idx + 2)?)),
+			MetaState::Encrypted => Ok(Self::Encrypted(EncryptedString(
+				row.get(FILE_RAW_METADATA)?,
+			))),
+			MetaState::RSAEncrypted => Ok(Self::RSAEncrypted(RSAEncryptedString(
+				row.get(FILE_RAW_METADATA)?,
+			))),
+			MetaState::Decoded => Ok(Self::Decoded(DBDecryptedFileMeta::from_row(row)?)),
 		}
 	}
 }
@@ -189,11 +196,7 @@ impl std::fmt::Debug for DBFile {
 }
 
 impl DBFile {
-	pub(crate) fn from_inner_and_row(
-		item: InnerDBItem,
-		row: &rusqlite::Row,
-		idx: usize,
-	) -> Result<Self> {
+	pub(crate) fn from_inner_and_row(item: InnerDBItem, row: &rusqlite::Row) -> Result<Self> {
 		Ok(Self {
 			id: item.id,
 			uuid: item.uuid,
@@ -205,13 +208,13 @@ impl DBFile {
 				)
 			})?,
 			local_data: item.local_data,
-			size: row.get(idx)?,
-			chunks: row.get(idx + 1)?,
-			favorite_rank: row.get(idx + 2)?,
-			region: row.get(idx + 3)?,
-			bucket: row.get(idx + 4)?,
-			timestamp: row.get(idx + 5)?,
-			meta: DBFileMeta::from_row(row, idx + 6).unwrap(),
+			size: row.get(FILES_SIZE)?,
+			chunks: row.get(FILES_CHUNKS)?,
+			favorite_rank: row.get(FILE_FAVORITE_RANK)?,
+			region: row.get(FILES_REGION)?,
+			bucket: row.get(FILES_BUCKET)?,
+			timestamp: row.get(FILE_TIMESTAMP)?,
+			meta: DBFileMeta::from_row(row).unwrap(),
 		})
 	}
 
@@ -224,7 +227,7 @@ impl DBFile {
 
 	pub(crate) fn from_item(item: InnerDBItem, conn: &Connection) -> Result<Self> {
 		let mut stmt = conn.prepare_cached(SELECT_FILE)?;
-		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row, 0))
+		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row))
 	}
 
 	pub(crate) fn upsert_from_remote_stmts(
@@ -262,7 +265,7 @@ impl DBFile {
 				meta_state,
 				meta,
 			),
-			|r| r.get(0),
+			|r| r.get(FILE_FAVORITE_RANK),
 		)?;
 
 		if let FileMeta::Decoded(decrypted_meta) = remote_file.get_meta() {

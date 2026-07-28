@@ -35,4 +35,4 @@ INSERT INTO files (
 	timestamp = excluded.timestamp,
 	metadata_state = excluded.metadata_state,
 	raw_metadata = excluded.raw_metadata
-RETURNING favorite_rank;
+RETURNING favorite_rank AS file_favorite_rank;

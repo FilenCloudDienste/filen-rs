@@ -7,7 +7,7 @@ SELECT
 	items.type,
 	dirs.favorite_rank AS dir_favorite_rank,
 	dirs.color,
-	dirs.timestamp,
+	dirs.timestamp AS dir_timestamp,
 	dirs.last_listed,
 	dirs.metadata_state AS dir_metadata_state,
 	dirs.raw_metadata AS dir_raw_metadata,
