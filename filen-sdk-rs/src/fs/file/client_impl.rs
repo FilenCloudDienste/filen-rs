@@ -13,7 +13,7 @@ use crate::{
 	auth::{Client, shared_client::SharedClient},
 	consts::CHUNK_SIZE_U64,
 	crypto::{error::ConversionError, shared::MetaCrypter},
-	error::{Error, MetadataWasNotDecryptedError, ResultExt},
+	error::{Error, ErrorKind, MetadataWasNotDecryptedError, ResultExt},
 	fs::{
 		HasUUID,
 		categories::{DirType, Normal},
@@ -98,6 +98,10 @@ impl Client {
 				.await?;
 
 		file.parent = resp.parent;
+		// The caller's `file` came over the FFI, so its stable id is not
+		// trustworthy — heal it from the server's response like
+		// `get_file_with_info` and `restore_file_version` do.
+		file.stable_uuid = resp.stable_uuid;
 		// Mirror the restored file's metadata into the (now current) parent's
 		// shares/links (as upload does); otherwise recipients of a connected parent
 		// cannot see or decrypt the restored file.
@@ -197,6 +201,10 @@ impl Client {
 		.await;
 		let file = RemoteFile::from_meta(
 			uuid,
+			// For a superseded (archived) uuid this is the lineage's stable id
+			// resolved from the live head — a single call recovers the file's
+			// identity after a remote edit.
+			response.stable_uuid,
 			// v3 api returns the original parent as the parent if the file is in the trash;
 			// keep it as the remembered original parent instead of discarding it.
 			if response.trash {
@@ -311,22 +319,70 @@ impl Client {
 		version: FileVersion,
 	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
-		api::v3::file::version::restore::post(
+		let response = match api::v3::file::version::restore::post(
 			self.client(),
 			&api::v3::file::version::restore::Request {
 				current: file.uuid(),
 				uuid: version.uuid,
 			},
 		)
-		.await?;
-
+		.await
+		{
+			Ok(response) => response,
+			// The server accepts a stale `current` only for the recognized
+			// lost-response retry pattern (and restoring the already-current
+			// version is a success no-op). Any other stale `current` is
+			// rejected with invalid_params: our view of the file raced a newer
+			// edit — refresh the file and its versions, then retry.
+			//
+			// invalid_params is this endpoint's generic validation bucket
+			// though, and a `uuid` the server no longer accepts as a version of
+			// this file lands in it too. Only the raced case is worth retrying,
+			// so the message has to say it was `current` that was rejected — a
+			// caller that retries on StaleState alone would otherwise spin
+			// forever on a restore that can never succeed.
+			//
+			// The wording ("Invalid current UUID.") is the only discriminator
+			// the endpoint offers; there is no head-by-lineage query to confirm
+			// it against, and v3/file/versions answers for the exact uuid it is
+			// given, so it cannot tell us the head moved. If the server ever
+			// rewords this, the mapping stops firing and the raw server error
+			// surfaces — the safe direction to fail in.
+			Err(e) if e.server_code().as_deref() == Some("invalid_params") => {
+				let stale_current = e
+					.server_message()
+					.is_some_and(|m| m.to_ascii_lowercase().contains("current"));
+				return Err(if stale_current {
+					Error::custom_with_source(
+						ErrorKind::StaleState,
+						e,
+						Some(
+							"file version restore raced a newer change, refresh the file and retry",
+						),
+					)
+				} else {
+					e
+				});
+			}
+			Err(e) => return Err(e),
+		};
+		// `response.uuid` echoes the restored version, which is the live head
+		// after the call — including the no-op resolutions (restoring the
+		// already-current version, retrying a lost restore), where the server
+		// reports the head it settled on. The response's storage fields
+		// describe the DISPLACED head, not the restored version (observed
+		// live: downloading the restored uuid from the response's bucket
+		// 404s), so the data location and metadata come from the version row
+		// we were handed; the response contributes the settled head uuid and
+		// the lineage's stable id.
+		file.uuid = response.uuid;
+		file.stable_uuid = response.stable_uuid;
 		file.bucket = version.bucket;
 		file.region = version.region;
 		file.size = version.size;
 		file.chunks = version.chunks;
 		file.timestamp = version.timestamp;
 		file.meta = version.metadata;
-		file.uuid = version.uuid;
 		// need to do this or the old sync engine doesn't work properly because it relies purely on modtime.
 		self.update_file_metadata(file, FileMetaChanges::default().last_modified(Utc::now()))
 			.await?;

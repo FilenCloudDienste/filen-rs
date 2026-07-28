@@ -35,9 +35,9 @@ pub fn is_supported_thumbnail_mime(mime: &str) -> bool {
 }
 
 impl Client {
-	pub async fn make_thumbnail_in_memory(
+	pub async fn make_thumbnail_in_memory<Id: Send + Sync>(
 		&self,
-		file: &RemoteFile,
+		file: &RemoteFile<Id>,
 		max_width: u32,
 		max_height: u32,
 	) -> Result<DynamicImage, Error> {
@@ -88,7 +88,7 @@ mod js_impls {
 	use crate::{
 		Error,
 		auth::JsClient,
-		fs::file::RemoteFile,
+		fs::file::AnonymousRemoteFile,
 		js::File,
 		runtime::{self, do_on_commander},
 	};
@@ -129,7 +129,9 @@ mod js_impls {
 			do_on_commander(move || async move {
 				let image = match this
 					.make_thumbnail_in_memory(
-						&RemoteFile::try_from(params.file)?,
+						// Thumbnailing only reads the file, so a file from a link
+						// or shared-in listing (which reports no stable id) is fine.
+						&AnonymousRemoteFile::try_from(params.file)?,
 						params.max_width,
 						params.max_height,
 					)

@@ -35,6 +35,9 @@ CREATE TABLE roots (
 
 CREATE TABLE files (
 	id BIGINT PRIMARY KEY NOT NULL,
+	-- Server-minted whole-life file id (survives content edits and version
+	-- restores, unlike items.uuid). Kept under all circumstances.
+	stable_uuid BLOB NOT NULL,
 	chunks_size BIGINT NOT NULL,
 	chunks BIGINT NOT NULL,
 	favorite BOOLEAN NOT NULL CHECK (favorite IN (FALSE, TRUE)) DEFAULT FALSE,
@@ -140,4 +143,5 @@ INSERT INTO cache_meta (meta_key, value) VALUES ('last_drive_message_id', NULL);
 -- change is caught at READ time instead — a stale-layout row fails the
 -- checked rkyv decode and is quarantined as corrupt (forcing a resync),
 -- rather than proactively cleared.
-INSERT INTO cache_meta (meta_key, value) VALUES ('event_format_version', 1);
+-- 2: CacheableFile gained stable_uuid.
+INSERT INTO cache_meta (meta_key, value) VALUES ('event_format_version', 2);

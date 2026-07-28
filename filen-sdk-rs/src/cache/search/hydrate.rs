@@ -37,7 +37,7 @@ use crate::cache::sql::columns::{
 	COUNT, DIR_CREATED, DIR_FAVORITE, DIR_NAME, DIR_TIMESTAMP, DIRS_COLOR, FILE_CREATED,
 	FILE_FAVORITE, FILE_NAME, FILE_TIMESTAMP, FILES_BUCKET, FILES_CHUNKS, FILES_CHUNKS_SIZE,
 	FILES_HASH, FILES_KEY, FILES_KEY_VERSION, FILES_MIME, FILES_MODIFIED, FILES_REGION, FILES_SIZE,
-	ITEMS_PARENT, ITEMS_TYPE, ITEMS_UUID, SEARCH_PARENT_PATH, SEARCH_TOTAL,
+	FILES_STABLE_UUID, ITEMS_PARENT, ITEMS_TYPE, ITEMS_UUID, SEARCH_PARENT_PATH, SEARCH_TOTAL,
 };
 
 // Bounds the worker round-trip in `ReadConn::run`; wasm-only (native reads are synchronous, so
@@ -401,6 +401,7 @@ fn row_to_result(row: &Row<'_>) -> rusqlite::Result<SearchResult> {
 			Ok(SearchResult::File(CacheableFile {
 				uuid,
 				parent,
+				stable_uuid: row.get(FILES_STABLE_UUID)?,
 				chunks_size: row.get(FILES_CHUNKS_SIZE)?,
 				chunks: row.get(FILES_CHUNKS)?,
 				favorited: row.get(FILE_FAVORITE)?,
@@ -446,7 +447,7 @@ mod tests {
 	use std::borrow::Cow;
 
 	use chrono::DateTime;
-	use filen_types::crypto::Blake3Hash;
+	use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 	use uuid::Uuid;
 
 	use crate::cache::CacheState;
@@ -523,6 +524,7 @@ mod tests {
 	fn test_file(uuid: Uuid, parent: Uuid, name: &str) -> CacheableFile<'static> {
 		CacheableFile {
 			uuid,
+			stable_uuid: StableUuid::new_for_test(uuid),
 			parent,
 			chunks_size: 7,
 			chunks: 2,

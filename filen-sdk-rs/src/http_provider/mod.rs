@@ -931,8 +931,12 @@ mod tests {
 			},
 		};
 
+		let uuid = Uuid::new_v4();
+		// The url token store keeps no file identity, so the fixture builds the
+		// same shape the read path does.
 		RemoteFileType::File(Cow::Owned(RemoteFile {
-			uuid: Uuid::new_v4(),
+			uuid,
+			stable_uuid: (),
 			parent: ParentUuid::Links,
 			size: 10,
 			favorited: false,

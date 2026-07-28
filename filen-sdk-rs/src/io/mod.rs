@@ -15,7 +15,7 @@ mod canonical_path;
 
 pub use crate::fs::{
 	dir::RemoteDirectory,
-	file::{RemoteFile, traits::HasFileInfo},
+	file::{AnonymousRemoteFile, RemoteFile, traits::HasFileInfo},
 };
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub use dir_download::{CategoryDirDownloadExtPub, DirDownloadCallback};

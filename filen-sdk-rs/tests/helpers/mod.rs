@@ -24,8 +24,11 @@ use filen_sdk_rs::{
 	socket::DecryptedSocketEvent,
 };
 use filen_types::{
-	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::EncryptedString,
-	fs::ParentUuid, traits::CowHelpersExt,
+	api::v3::dir::color::DirColor,
+	auth::FileEncryptionVersion,
+	crypto::EncryptedString,
+	fs::{ParentUuid, StableUuid},
+	traits::CowHelpersExt,
 };
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
@@ -291,8 +294,10 @@ pub fn make_test_remote_file(name: &str, parent: Uuid) -> RemoteFile {
 	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
 	let now = Utc::now();
 
+	let uuid = Uuid::new_v4();
 	RemoteFile::from_meta(
-		Uuid::new_v4(),
+		uuid,
+		StableUuid::new_for_test(uuid),
 		ParentUuid::Uuid(parent),
 		1024,
 		1,
@@ -316,8 +321,10 @@ pub fn make_test_remote_file(name: &str, parent: Uuid) -> RemoteFile {
 /// to `CacheableFile` should fail because the meta is not in the `Decoded` variant.
 pub fn make_test_remote_file_encrypted_meta(parent: Uuid) -> RemoteFile {
 	let now = Utc::now();
+	let uuid = Uuid::new_v4();
 	RemoteFile::from_meta(
-		Uuid::new_v4(),
+		uuid,
+		StableUuid::new_for_test(uuid),
 		ParentUuid::Uuid(parent),
 		1024,
 		1,
@@ -335,8 +342,10 @@ pub fn make_test_remote_file_bad_parent(name: &str) -> RemoteFile {
 	let key_hex = "a".repeat(64);
 	let file_key = FileKey::from_str_with_version(&key_hex, FileEncryptionVersion::V3).unwrap();
 	let now = Utc::now();
+	let uuid = Uuid::new_v4();
 	RemoteFile::from_meta(
-		Uuid::new_v4(),
+		uuid,
+		StableUuid::new_for_test(uuid),
 		ParentUuid::Trash(Uuid::nil()),
 		1024,
 		1,

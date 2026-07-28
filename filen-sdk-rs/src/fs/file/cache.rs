@@ -2,8 +2,11 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::{
-	auth::FileEncryptionVersion, crypto::Blake3Hash, fs::ParentUuid,
-	rkyv::date_time::DateTimeUtcDef, traits::CowHelpers,
+	auth::FileEncryptionVersion,
+	crypto::Blake3Hash,
+	fs::{ParentUuid, StableUuid},
+	rkyv::date_time::DateTimeUtcDef,
+	traits::CowHelpers,
 };
 use rkyv::with::{AsOwned, Map};
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,9 @@ use crate::{
 )]
 pub struct CacheableFile<'a> {
 	pub uuid: Uuid,
+	/// Server-minted whole-life file id — survives content edits and version
+	/// restores, unlike `uuid`. Persisted; never dropped on any conversion.
+	pub stable_uuid: StableUuid,
 	pub parent: Uuid,
 
 	pub chunks_size: u64,
@@ -57,6 +63,7 @@ pub struct CacheableFile<'a> {
 #[derive(Serialize, Deserialize)]
 struct SerializedCacheableFile<'a> {
 	uuid: Uuid,
+	stable_uuid: StableUuid,
 	parent: Uuid,
 
 	chunks_size: u64,
@@ -91,6 +98,7 @@ impl<'de> Deserialize<'de> for CacheableFile<'de> {
 		let raw = SerializedCacheableFile::deserialize(deserializer)?;
 		Ok(Self {
 			uuid: raw.uuid,
+			stable_uuid: raw.stable_uuid,
 			parent: raw.parent,
 			chunks_size: raw.chunks_size,
 			chunks: raw.chunks,
@@ -118,6 +126,7 @@ impl Serialize for CacheableFile<'_> {
 		let key_str = self.key.to_str();
 		SerializedCacheableFile {
 			uuid: self.uuid,
+			stable_uuid: self.stable_uuid,
 			parent: self.parent,
 			chunks_size: self.chunks_size,
 			chunks: self.chunks,
@@ -160,6 +169,7 @@ impl TryFrom<RemoteFile> for CacheableFile<'static> {
 
 		Ok(Self {
 			uuid: value.uuid,
+			stable_uuid: value.stable_uuid,
 			parent,
 			chunks_size: value.size,
 			chunks: value.chunks,
@@ -194,6 +204,7 @@ impl<'a> TryFrom<&'a RemoteFile> for CacheableFile<'a> {
 
 		Ok(Self {
 			uuid: value.uuid,
+			stable_uuid: value.stable_uuid,
 			parent: match value.parent {
 				ParentUuid::Uuid(uuid) => uuid,
 				other => {
@@ -221,6 +232,7 @@ impl From<CacheableFile<'static>> for RemoteFile {
 	fn from(value: CacheableFile<'static>) -> Self {
 		Self {
 			uuid: value.uuid,
+			stable_uuid: value.stable_uuid,
 			parent: ParentUuid::Uuid(value.parent),
 			chunks: value.chunks,
 			size: value.chunks_size,
@@ -244,6 +256,9 @@ impl From<CacheableFile<'static>> for RemoteFile {
 #[derive(Clone, Debug, PartialEq, Eq, CowHelpers)]
 pub struct CacheableFileVersion<'a> {
 	pub uuid: Uuid,
+	/// The whole-life id of the file this version belongs to — identical for
+	/// every version of the same file. Persisted; never dropped.
+	pub stable_uuid: StableUuid,
 
 	pub chunks_size: u64,
 	pub chunks: u64,
@@ -278,6 +293,7 @@ impl<'a> TryFrom<&'a FileVersion> for CacheableFileVersion<'a> {
 
 		Ok(Self {
 			uuid: value.uuid,
+			stable_uuid: value.stable_uuid,
 			chunks_size: value.size,
 			chunks: value.chunks,
 			region: Cow::Borrowed(&value.region),
@@ -298,6 +314,7 @@ impl From<CacheableFileVersion<'static>> for FileVersion {
 	fn from(value: CacheableFileVersion<'static>) -> Self {
 		Self {
 			uuid: value.uuid,
+			stable_uuid: value.stable_uuid,
 			chunks: value.chunks,
 			size: value.chunks_size,
 			region: value.region.into_owned(),
@@ -335,6 +352,7 @@ impl CacheableFile<'_> {
 
 		let mut hasher = blake3::Hasher::new();
 		hasher.update(self.uuid.as_bytes());
+		hasher.update(Uuid::from(self.stable_uuid).as_bytes());
 		hasher.update(self.parent.as_bytes());
 		hasher.update(self.name.as_bytes());
 		hasher.update(&self.size.to_le_bytes());
@@ -370,6 +388,9 @@ mod fingerprint_tests {
 	fn base() -> CacheableFile<'static> {
 		CacheableFile {
 			uuid: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+			stable_uuid: StableUuid::new_for_test(Uuid::from_u128(
+				0x3333_3333_3333_3333_3333_3333_3333_3333,
+			)),
 			parent: Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222),
 			chunks_size: 4096,
 			chunks: 1,
@@ -419,6 +440,10 @@ mod fingerprint_tests {
 		};
 
 		assert_ne!(baseline, fp(|c| c.uuid = Uuid::from_u128(9)));
+		assert_ne!(
+			baseline,
+			fp(|c| c.stable_uuid = StableUuid::new_for_test(Uuid::from_u128(9)))
+		);
 		assert_ne!(baseline, fp(|c| c.parent = Uuid::from_u128(9)));
 		assert_ne!(baseline, fp(|c| c.name = Cow::Borrowed("renamed.txt")));
 		assert_ne!(baseline, fp(|c| c.size = 1));

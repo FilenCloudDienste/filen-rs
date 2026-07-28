@@ -4,7 +4,7 @@ use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{Blake3Hash, MaybeEncrypted},
-	fs::{ObjectType, ParentUuid, Uuid},
+	fs::{ObjectType, ParentUuid, StableUuid, Uuid},
 	traits::CowHelpers,
 };
 use meta::DecryptedFileMeta;
@@ -337,15 +337,21 @@ impl BaseFile {
 	}
 }
 
-#[cfg_attr(
-	feature = "http-provider",
-	derive(serde::Serialize, serde::Deserialize),
-	serde(rename_all = "camelCase")
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteFile {
+pub struct RemoteFile<Id = StableUuid> {
 	pub uuid: Uuid,
-	#[cfg_attr(feature = "http-provider", serde(with = "meta::serde_stateless"))]
+	/// The file's identity, as reported by the surface it was listed from.
+	///
+	/// For the normal drive (`Id = StableUuid`) this is the server-minted
+	/// whole-life id: unlike `uuid`, it survives content edits and version
+	/// restores. For a file just returned by an upload, `stable_uuid == uuid`
+	/// means the upload created a new file, while `stable_uuid != uuid` means
+	/// it edited an existing one (and this is that file's lifetime id).
+	///
+	/// Public-link and shared-in listings never carry the field on the wire, so
+	/// files from those surfaces are [`AnonymousRemoteFile`] and this slot is
+	/// `()` — there is no identity to report, and nothing stands in for one.
+	pub stable_uuid: Id,
 	pub meta: FileMeta<'static>,
 
 	pub parent: ParentUuid,
@@ -357,7 +363,14 @@ pub struct RemoteFile {
 	pub chunks: u64,
 }
 
-impl PartialEq<BaseFile> for RemoteFile {
+/// A file listed from a surface whose wire payload has no `stableUUID` field:
+/// public-link directory listings and shared-in listings. The `()` in the
+/// stable-id slot is the type stating that the surface reports no whole-life
+/// identity for this file — it is not a placeholder for one, and no `uuid` may
+/// be substituted.
+pub type AnonymousRemoteFile = RemoteFile<()>;
+
+impl<Id: Send + Sync> PartialEq<BaseFile> for RemoteFile<Id> {
 	fn eq(&self, other: &BaseFile) -> bool {
 		self.uuid == other.uuid()
 			&& self.parent == other.parent
@@ -369,10 +382,11 @@ impl PartialEq<BaseFile> for RemoteFile {
 	}
 }
 
-impl RemoteFile {
+impl<Id> RemoteFile<Id> {
 	#[allow(clippy::too_many_arguments)]
 	pub fn from_meta(
 		uuid: impl Into<Uuid>,
+		stable_uuid: Id,
 		parent: ParentUuid,
 		fallback_size: u64,
 		chunks: u64,
@@ -389,6 +403,7 @@ impl RemoteFile {
 		};
 		Self {
 			uuid,
+			stable_uuid,
 			meta,
 			parent,
 			size,
@@ -399,10 +414,37 @@ impl RemoteFile {
 			chunks,
 		}
 	}
+
+	/// Drops the stable-id slot, yielding the same file as it would have been
+	/// listed from a surface that reports no identity. Used where a listing of
+	/// identity-carrying files feeds a category that has none.
+	pub fn into_anonymous(self) -> AnonymousRemoteFile {
+		RemoteFile {
+			uuid: self.uuid,
+			stable_uuid: (),
+			meta: self.meta,
+			parent: self.parent,
+			size: self.size,
+			favorited: self.favorited,
+			region: self.region,
+			bucket: self.bucket,
+			timestamp: self.timestamp,
+			chunks: self.chunks,
+		}
+	}
+}
+
+impl RemoteFile<StableUuid> {
+	/// The server-minted whole-life id for this file. See the field docs on
+	/// [`RemoteFile::stable_uuid`] for its semantics.
+	pub fn stable_uuid(&self) -> StableUuid {
+		self.stable_uuid
+	}
 }
 
 pub struct FlatRemoteFile {
 	pub uuid: Uuid,
+	pub stable_uuid: StableUuid,
 	pub parent: ParentUuid,
 	pub name: String,
 	pub mime: String,
@@ -422,6 +464,7 @@ impl From<FlatRemoteFile> for RemoteFile {
 	fn from(file: FlatRemoteFile) -> Self {
 		Self {
 			uuid: file.uuid,
+			stable_uuid: file.stable_uuid,
 			parent: file.parent,
 			size: file.size,
 			favorited: file.favorited,
@@ -442,49 +485,49 @@ impl From<FlatRemoteFile> for RemoteFile {
 	}
 }
 
-impl HasUUID for RemoteFile {
+impl<Id: Send + Sync> HasUUID for RemoteFile<Id> {
 	fn uuid(&self) -> Uuid {
 		self.uuid
 	}
 }
 
-impl HasParent for RemoteFile {
+impl<Id: Send + Sync> HasParent for RemoteFile<Id> {
 	fn parent(&self) -> &ParentUuid {
 		&self.parent
 	}
 }
 
-impl HasName for RemoteFile {
+impl<Id: Send + Sync> HasName for RemoteFile<Id> {
 	fn name(&self) -> Option<&str> {
 		self.meta.name()
 	}
 }
 
-impl HasFileMeta for RemoteFile {
+impl<Id> HasFileMeta for RemoteFile<Id> {
 	fn get_meta(&self) -> &FileMeta<'_> {
 		&self.meta
 	}
 }
 
-impl UpdateFileMeta for RemoteFile {
+impl<Id> UpdateFileMeta for RemoteFile<Id> {
 	fn update_meta(&mut self, changes: FileMetaChanges) -> Result<(), Error> {
 		self.meta.apply_changes(changes)
 	}
 }
 
-impl HasMeta for RemoteFile {
+impl<Id: Send + Sync> HasMeta for RemoteFile<Id> {
 	fn get_meta_string(&self) -> Option<Cow<'_, str>> {
 		self.meta.try_to_string()
 	}
 }
 
-impl HasType for RemoteFile {
+impl<Id: Send + Sync> HasType for RemoteFile<Id> {
 	fn object_type(&self) -> ObjectType {
 		ObjectType::File
 	}
 }
 
-impl HasFileInfo for RemoteFile {
+impl<Id> HasFileInfo for RemoteFile<Id> {
 	fn mime(&self) -> Option<&str> {
 		self.meta.mime()
 	}
@@ -510,7 +553,7 @@ impl HasFileInfo for RemoteFile {
 	}
 }
 
-impl HasRemoteInfo for RemoteFile {
+impl<Id: Send + Sync> HasRemoteInfo for RemoteFile<Id> {
 	fn favorited(&self) -> bool {
 		self.favorited
 	}
@@ -520,13 +563,13 @@ impl HasRemoteInfo for RemoteFile {
 	}
 }
 
-impl SetRemoteInfo for RemoteFile {
+impl<Id: Send + Sync> SetRemoteInfo for RemoteFile<Id> {
 	fn set_favorited(&mut self, value: bool) {
 		self.favorited = value;
 	}
 }
 
-impl HasRemoteFileInfo for RemoteFile {
+impl<Id: Send + Sync> HasRemoteFileInfo for RemoteFile<Id> {
 	fn region(&self) -> &str {
 		&self.region
 	}
@@ -540,7 +583,7 @@ impl HasRemoteFileInfo for RemoteFile {
 	}
 }
 
-impl PartialEq<RemoteRootFile> for RemoteFile {
+impl<Id> PartialEq<RemoteRootFile> for RemoteFile<Id> {
 	fn eq(&self, other: &RemoteRootFile) -> bool {
 		self.meta == other.meta
 			&& self.uuid == other.uuid
@@ -551,14 +594,9 @@ impl PartialEq<RemoteRootFile> for RemoteFile {
 	}
 }
 
-impl File for RemoteFile {}
+impl<Id: Send + Sync> File for RemoteFile<Id> {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "http-provider",
-	derive(serde::Serialize, serde::Deserialize),
-	serde(rename_all = "camelCase")
-)]
 pub struct RemoteRootFile {
 	pub(crate) uuid: Uuid,
 	pub(crate) size: u64,
@@ -566,7 +604,6 @@ pub struct RemoteRootFile {
 	pub(crate) bucket: String,
 	pub(crate) chunks: u64,
 	pub(crate) timestamp: DateTime<Utc>,
-	#[cfg_attr(feature = "http-provider", serde(with = "meta::serde_stateless"))]
 	pub(crate) meta: FileMeta<'static>,
 }
 
@@ -680,8 +717,8 @@ impl HasRemoteFileInfo for RemoteRootFile {
 	}
 }
 
-impl PartialEq<RemoteFile> for RemoteRootFile {
-	fn eq(&self, other: &RemoteFile) -> bool {
+impl<Id> PartialEq<RemoteFile<Id>> for RemoteRootFile {
+	fn eq(&self, other: &RemoteFile<Id>) -> bool {
 		self.meta == other.meta
 			&& self.uuid == other.uuid
 			&& self.size == other.size
@@ -721,6 +758,7 @@ pub struct FileVersion {
 	pub(crate) metadata: FileMeta<'static>,
 	pub(crate) timestamp: DateTime<Utc>,
 	pub(crate) uuid: Uuid,
+	pub(crate) stable_uuid: StableUuid,
 }
 
 impl FileVersion {
@@ -734,6 +772,19 @@ impl FileVersion {
 
 	pub fn metadata(&self) -> &FileMeta<'_> {
 		&self.metadata
+	}
+
+	/// The uuid of this specific version. Matches the file's current `uuid`
+	/// for the live head; never use it as the file's identity — that is
+	/// [`FileVersion::stable_uuid`].
+	pub fn uuid(&self) -> Uuid {
+		self.uuid
+	}
+
+	/// The whole-life id of the file this version belongs to — identical for
+	/// every version of the same file.
+	pub fn stable_uuid(&self) -> StableUuid {
+		self.stable_uuid
 	}
 
 	pub(crate) fn blocking_from_response(
@@ -753,16 +804,12 @@ impl FileVersion {
 			.into_owned_cow(),
 			timestamp: response.timestamp,
 			uuid: response.uuid,
+			stable_uuid: response.stable_uuid,
 		}
 	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "http-provider",
-	derive(serde::Serialize),
-	serde(rename_all = "camelCase")
-)]
 pub struct LinkedFile {
 	pub(crate) uuid: Uuid,
 	pub(crate) name: MaybeEncrypted<'static, str>,
@@ -772,53 +819,8 @@ pub struct LinkedFile {
 	pub(crate) region: String,
 	pub(crate) bucket: String,
 	pub(crate) version: FileEncryptionVersion,
-	#[cfg_attr(
-		feature = "http-provider",
-		serde(with = "chrono::serde::ts_milliseconds")
-	)]
 	pub(crate) timestamp: DateTime<Utc>,
 	pub(crate) file_key: FileKey,
-}
-
-#[cfg(feature = "http-provider")]
-impl<'de> serde::Deserialize<'de> for LinkedFile {
-	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-	where
-		D: serde::Deserializer<'de>,
-	{
-		#[derive(serde::Deserialize)]
-		struct LinkedFileHelper<'a> {
-			uuid: Uuid,
-			name: MaybeEncrypted<'static, str>,
-			mime: MaybeEncrypted<'static, str>,
-			size: u64,
-			chunks: u64,
-			region: String,
-			bucket: String,
-			version: FileEncryptionVersion,
-			#[serde(with = "chrono::serde::ts_milliseconds")]
-			timestamp: DateTime<Utc>,
-			#[serde(borrow)]
-			file_key: Cow<'a, str>,
-		}
-
-		let helper = LinkedFileHelper::deserialize(deserializer)?;
-		let file_key = FileKey::from_str_with_version(&helper.file_key, helper.version)
-			.map_err(serde::de::Error::custom)?;
-
-		Ok(Self {
-			uuid: helper.uuid,
-			name: helper.name,
-			mime: helper.mime,
-			size: helper.size,
-			chunks: helper.chunks,
-			region: helper.region,
-			bucket: helper.bucket,
-			version: helper.version,
-			timestamp: helper.timestamp,
-			file_key,
-		})
-	}
 }
 
 impl LinkedFile {

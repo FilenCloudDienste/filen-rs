@@ -418,7 +418,7 @@ mod tests {
 	use filen_types::{
 		api::v3::socket::{DriveEventType, FileRename, FolderRename, ItemFavorite},
 		crypto::EncryptedString,
-		fs::{ObjectType, ParentUuid, Uuid},
+		fs::{ObjectType, ParentUuid, StableUuid, Uuid},
 	};
 
 	use super::*;
@@ -450,6 +450,7 @@ mod tests {
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::FileRename(FileRename {
 				uuid: Uuid::default(),
+				stable_uuid: StableUuid::new_for_test(Uuid::default()),
 				metadata: EncryptedString(Cow::Borrowed("encrypted")),
 			}),
 			drive_message_id: 1,
@@ -482,6 +483,7 @@ mod tests {
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::ItemFavorite(ItemFavorite {
 				uuid: Uuid::default(),
+				stable_uuid: None,
 				item_type: ObjectType::File,
 				value: true,
 				parent: ParentUuid::Uuid(Uuid::default()),
@@ -519,6 +521,8 @@ mod tests {
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::FileTrash(filen_types::api::v3::socket::FileTrash {
 				uuid: Uuid::default(),
+				stable_uuid: StableUuid::new_for_test(Uuid::default()),
+				new_uuid: None,
 			}),
 			drive_message_id: 3,
 		};
@@ -531,6 +535,8 @@ mod tests {
 		let event = SocketEvent::Drive {
 			inner: DriveEventType::FileTrash(filen_types::api::v3::socket::FileTrash {
 				uuid: Uuid::default(),
+				stable_uuid: StableUuid::new_for_test(Uuid::default()),
+				new_uuid: None,
 			}),
 			drive_message_id: 4,
 		};

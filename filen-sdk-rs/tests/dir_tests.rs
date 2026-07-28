@@ -567,6 +567,10 @@ async fn dir_move() {
 }
 
 #[shared_test_runtime]
+// The backend recomputes dir sizes on a heavily throttled schedule, forcing two
+// 40-minute sleeps here — that single test dominates the whole suite's wall
+// clock. Run it explicitly with `--ignored` when the size endpoint changes.
+#[ignore = "takes ~80 minutes of deliberate ddos-protection sleeps"]
 async fn size() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;

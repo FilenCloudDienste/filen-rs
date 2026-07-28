@@ -8,7 +8,8 @@ macro_rules! def_sql_user_version {
 // Bumped whenever the schema changes. `init_db` reacts to a mismatch with a destructive wipe + rebuild
 // (the cache is fully reconstructible from the server, so this is safe). A non-destructive migration is
 // only worth building once the DB holds non-reconstructible local state (conflicts, local trash, etc.).
-def_sql_user_version!(2);
+// 3: files gained stable_uuid (and the CacheEvent rkyv payload layout changed with it).
+def_sql_user_version!(3);
 
 pub(crate) const VACUUM: &str = "VACUUM;";
 pub(crate) const GET_USER_VERSION: &str = "PRAGMA user_version;";

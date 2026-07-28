@@ -5,7 +5,7 @@ use crate::{
 	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
 };
 use chrono::Utc;
-use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
+use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion, fs::StableUuid};
 use rusqlite::params;
 use uuid::Uuid;
 
@@ -28,8 +28,10 @@ fn make_file_key() -> FileKey {
 
 fn make_cacheable_file(parent: Uuid) -> CacheableFile<'static> {
 	let now = Utc::now();
+	let uuid = Uuid::new_v4();
 	CacheableFile {
-		uuid: Uuid::new_v4(),
+		uuid,
+		stable_uuid: StableUuid::new_for_test(uuid),
 		parent,
 		chunks_size: 1024,
 		chunks: 1,
@@ -1309,11 +1311,11 @@ fn init_seeds_cache_meta() {
 			|row| row.get(CACHE_META_VALUE),
 		)
 		.unwrap();
-	assert_eq!(format_version, 1);
+	assert_eq!(format_version, 2);
 }
 
 #[test]
-fn init_bumps_user_version_to_2() {
+fn init_bumps_user_version_to_current() {
 	let state = test_cache_state();
 	let version: i64 = state
 		.db
@@ -1321,5 +1323,5 @@ fn init_bumps_user_version_to_2() {
 			row.get(PRAGMA_USER_VERSION)
 		})
 		.unwrap();
-	assert_eq!(version, 2);
+	assert_eq!(version, statements::SQL_USER_VERSION);
 }

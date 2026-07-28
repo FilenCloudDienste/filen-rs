@@ -157,11 +157,15 @@ fn file_move_to_virtual_parent_becomes_removed() {
 		socket::{DecryptedDriveEvent, DecryptedSocketEvent, FileMove},
 	};
 	use chrono::Utc;
-	use filen_types::{auth::FileEncryptionVersion, fs::ParentUuid};
+	use filen_types::{
+		auth::FileEncryptionVersion,
+		fs::{ParentUuid, StableUuid},
+	};
 
 	let expected = Uuid::new_v4();
 	let file = RemoteFile {
 		uuid: expected,
+		stable_uuid: StableUuid::new_for_test(expected),
 		parent: ParentUuid::Links,
 		size: 10,
 		favorited: false,
@@ -279,10 +283,11 @@ fn cache_file(uuid: u128, parent: Uuid, size: u64) -> CacheableFile<'static> {
 
 	use crate::crypto::file::FileKey;
 	use chrono::Utc;
-	use filen_types::auth::FileEncryptionVersion;
+	use filen_types::{auth::FileEncryptionVersion, fs::StableUuid};
 
 	CacheableFile {
 		uuid: Uuid::from_u128(uuid),
+		stable_uuid: StableUuid::new_for_test(Uuid::from_u128(uuid)),
 		parent,
 		chunks_size: size,
 		chunks: 1,

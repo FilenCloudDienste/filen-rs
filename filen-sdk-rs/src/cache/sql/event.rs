@@ -357,7 +357,7 @@ mod tests {
 		},
 	};
 	use chrono::{DateTime, Utc};
-	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
+	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion, fs::StableUuid};
 	use uuid::Uuid;
 
 	use super::*;
@@ -378,6 +378,7 @@ mod tests {
 	fn cacheable_file() -> CacheableFile<'static> {
 		CacheableFile {
 			uuid: Uuid::from_u128(1),
+			stable_uuid: StableUuid::new_for_test(Uuid::from_u128(1)),
 			parent: Uuid::from_u128(2),
 			chunks_size: 1024,
 			chunks: 1,

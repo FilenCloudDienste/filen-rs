@@ -40,11 +40,11 @@ use super::{
 
 // Distinct bind parameters per VALUES row.
 const ITEM_PARAMS_PER_ROW: usize = 5; // uuid, parent, type, root_id, content_hash
-const FILE_PARAMS_PER_ROW: usize = 15; // id + 14 metadata columns
+const FILE_PARAMS_PER_ROW: usize = 16; // id + 15 metadata columns
 const DIR_PARAMS_PER_ROW: usize = 6; // id + 5 metadata columns
 
-/// Rows per multi-row statement. Sized so the widest table (`files`, 15 params/row) stays under
-/// `SQLITE_MAX_VARIABLE_NUMBER` (32766 in the bundled SQLite): 2000 × 15 = 30000. Divides
+/// Rows per multi-row statement. Sized so the widest table (`files`, 16 params/row) stays under
+/// `SQLITE_MAX_VARIABLE_NUMBER` (32766 in the bundled SQLite): 2000 × 16 = 32000. Divides
 /// `CHUNK_SIZE` evenly so every sub-batch within a transaction is full-size (max held-statement
 /// reuse); only the dataset's final sub-batch is partial. Benchmarked sweet spot (≈1024–2048).
 pub(super) const MULTI_ROW_CHUNK: usize = 2_000;
@@ -93,12 +93,12 @@ fn items_upsert_sql(rows: usize) -> String {
 
 /// Multi-row `INSERT INTO files (id, ...) VALUES <rows> ON CONFLICT(id) DO UPDATE ...`. Per row k the
 /// params are `[id, chunks_size, chunks, favorite, region, bucket, timestamp, size, name, mime,
-/// file_key, file_key_version, created, modified, hash]` at base `k * 15`.
+/// file_key, file_key_version, created, modified, hash, stable_uuid]` at base `k * 16`.
 fn files_upsert_sql(rows: usize) -> String {
-	let mut sql = String::with_capacity(rows * 64 + 640);
+	let mut sql = String::with_capacity(rows * 64 + 704);
 	sql.push_str(
 		"INSERT INTO files (id, chunks_size, chunks, favorite, region, bucket, timestamp, size, \
-		 name, mime, file_key, file_key_version, created, modified, hash) VALUES ",
+		 name, mime, file_key, file_key_version, created, modified, hash, stable_uuid) VALUES ",
 	);
 	push_values_rows(&mut sql, rows, FILE_PARAMS_PER_ROW);
 	sql.push_str(
@@ -107,7 +107,8 @@ fn files_upsert_sql(rows: usize) -> String {
 		 bucket = excluded.bucket, timestamp = excluded.timestamp, size = excluded.size, \
 		 name = excluded.name, mime = excluded.mime, file_key = excluded.file_key, \
 		 file_key_version = excluded.file_key_version, created = excluded.created, \
-		 modified = excluded.modified, hash = excluded.hash",
+		 modified = excluded.modified, hash = excluded.hash, \
+		 stable_uuid = excluded.stable_uuid",
 	);
 	sql
 }
@@ -225,6 +226,7 @@ fn file_rows_exec<'a>(
 		stmt.raw_bind_parameter(idx + 12, file.created.map(|c| c.timestamp_millis()))?;
 		stmt.raw_bind_parameter(idx + 13, file.last_modified.timestamp_millis())?;
 		stmt.raw_bind_parameter(idx + 14, hash_str.as_deref())?;
+		stmt.raw_bind_parameter(idx + 15, file.stable_uuid)?;
 		idx += FILE_PARAMS_PER_ROW;
 	}
 	stmt.raw_execute()?;
@@ -380,10 +382,10 @@ mod tests {
 				.contains("VALUES (?1, ?2, ?3, ?4, ?5),(?6, ?7, ?8, ?9, ?10) ON CONFLICT (uuid)")
 		);
 		assert!(dirs_upsert_sql(1).contains("VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (id)"));
-		// files has 15 columns, so row 2 starts at param 16.
+		// files has 16 columns, so row 2 starts at param 17.
 		assert!(files_upsert_sql(2).contains(
-			"(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15),(?16, ?17, ?18, \
-			 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)"
+			"(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16),(?17, ?18, \
+			 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)"
 		));
 	}
 }

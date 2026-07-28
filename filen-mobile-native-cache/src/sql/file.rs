@@ -363,6 +363,9 @@ impl TryFrom<DBFile> for RemoteFile {
 	fn try_from(value: DBFile) -> Result<Self, Self::Error> {
 		Ok(RemoteFile {
 			uuid: value.uuid,
+			// TODO(stable-uuid): read from the stable_uuid column once the
+			// cache schema stores it; until then keep uuid-as-identity.
+			stable_uuid: value.uuid,
 			parent: value.parent,
 			size: value.size as u64,
 			chunks: value.chunks as u64,

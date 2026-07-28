@@ -485,7 +485,7 @@ impl JsClient {
 mod tests {
 	use std::borrow::Cow;
 
-	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
+	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion, fs::StableUuid};
 
 	use super::*;
 	use crate::{
@@ -530,8 +530,10 @@ mod tests {
 			name: Cow::Borrowed("docs"),
 			created: Some(ms(1_700_000_000_001)),
 		};
+		let file_uuid = Uuid::new_v4();
 		let file = CacheableFile {
-			uuid: Uuid::new_v4(),
+			uuid: file_uuid,
+			stable_uuid: StableUuid::new_for_test(file_uuid),
 			parent: dir.uuid,
 			chunks_size: 1,
 			chunks: 1,

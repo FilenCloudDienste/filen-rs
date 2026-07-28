@@ -343,7 +343,7 @@ mod tests {
 
 	use crate::{crypto::file::FileKey, fs::dir::cache::CacheableDir};
 	use chrono::Utc;
-	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
+	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion, fs::StableUuid};
 
 	use super::*;
 	use crate::cache::sql::columns::{COUNT, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_PARENT};
@@ -365,6 +365,7 @@ mod tests {
 		let now = Utc::now();
 		CacheableFile {
 			uuid: Uuid::from_u128(uuid),
+			stable_uuid: StableUuid::new_for_test(Uuid::from_u128(uuid)),
 			parent,
 			chunks_size: 1024,
 			chunks: 1,

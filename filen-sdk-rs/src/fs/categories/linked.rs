@@ -14,7 +14,7 @@ use crate::{
 		dir::{LinkedDirectory, RootDirectoryWithMeta},
 		file::{LinkedFile, meta::FileMeta},
 	},
-	io::{RemoteDirectory, RemoteFile},
+	io::{AnonymousRemoteFile, RemoteDirectory, RemoteFile},
 	runtime::{blocking_join, do_cpu_intensive},
 	util::IntoMaybeParallelIterator,
 };
@@ -27,7 +27,7 @@ impl Category for Linked {
 	type Root = RootDirectoryWithMeta;
 	type Dir = LinkedDirectory;
 	type RootFile = LinkedFile;
-	type File = RemoteFile;
+	type File = AnonymousRemoteFile;
 }
 
 impl CategoryFS for Linked {
@@ -77,8 +77,10 @@ impl CategoryFS for Linked {
 					.map(|f| {
 						let meta =
 							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+						Ok::<AnonymousRemoteFile, Error>(RemoteFile::from_meta(
 							f.uuid,
+							// link surfaces never carry a stable id on the wire
+							(),
 							f.parent.into(),
 							f.size,
 							f.chunks,
@@ -147,8 +149,10 @@ impl CategoryFS for Linked {
 					.map(|f| {
 						let meta =
 							FileMeta::blocking_from_encrypted(f.metadata, crypter, f.version);
-						Ok::<RemoteFile, Error>(RemoteFile::from_meta(
+						Ok::<AnonymousRemoteFile, Error>(RemoteFile::from_meta(
 							f.uuid,
+							// link surfaces never carry a stable id on the wire
+							(),
 							f.parent,
 							f.chunks_size,
 							f.chunks,

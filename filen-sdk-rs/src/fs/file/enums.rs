@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-	RemoteFile,
+	AnonymousRemoteFile, RemoteFile,
 	traits::{HasFileInfo, HasRemoteFileInfo},
 };
 
@@ -31,15 +31,29 @@ use super::{
 	HasRemoteFileInfo,
 	File,
 )]
-#[cfg_attr(
-	feature = "http-provider",
-	derive(serde::Serialize, serde::Deserialize),
-	serde(tag = "type")
-)]
 pub enum RemoteFileType<'a> {
-	File(Cow<'a, RemoteFile>),
+	/// A file being read, whatever surface it was listed from. Reading needs
+	/// no identity, so the stable-id slot is dropped on the way in — see
+	/// [`AnonymousRemoteFile`].
+	File(Cow<'a, AnonymousRemoteFile>),
 	Shared(Cow<'a, SharedRootFile>),
 	Linked(Cow<'a, LinkedFile>),
+}
+
+impl From<RemoteFile> for RemoteFileType<'static> {
+	fn from(value: RemoteFile) -> Self {
+		Self::File(Cow::Owned(value.into_anonymous()))
+	}
+}
+
+// Unlike the anonymous instantiation (which the `CowFrom` derive borrows), a
+// drive file has to be rebuilt to shed its stable id, so this clones. Reading
+// is I/O-bound and the alternative is threading the id through a type that has
+// no use for it.
+impl<'a> From<&'a RemoteFile> for RemoteFileType<'a> {
+	fn from(value: &'a RemoteFile) -> Self {
+		Self::File(Cow::Owned(value.clone().into_anonymous()))
+	}
 }
 
 impl HasType for RemoteFileType<'_> {

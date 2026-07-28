@@ -32,6 +32,8 @@ pub(in crate::cache) const ITEMS_CONTENT_HASH: &str = "content_hash";
 
 // -- `files` -----------------------------------------------------------------------------------
 
+/// The server-minted whole-life file id, constant across the content edits that re-mint `uuid`.
+pub(in crate::cache) const FILES_STABLE_UUID: &str = "stable_uuid";
 pub(in crate::cache) const FILES_CHUNKS_SIZE: &str = "chunks_size";
 pub(in crate::cache) const FILES_CHUNKS: &str = "chunks";
 pub(in crate::cache) const FILES_REGION: &str = "region";

@@ -501,7 +501,7 @@ impl Engine {
 mod tests {
 	use std::{borrow::Cow, path::PathBuf, sync::Mutex, time::Instant};
 
-	use filen_types::auth::FileEncryptionVersion;
+	use filen_types::{auth::FileEncryptionVersion, fs::StableUuid};
 
 	use crate::{cache::CacheState, crypto::file::FileKey, fs::file::cache::CacheableFile};
 
@@ -513,8 +513,10 @@ mod tests {
 	}
 
 	fn test_file(parent: Uuid, name: &str) -> CacheableFile<'static> {
+		let uuid = Uuid::new_v4();
 		CacheableFile {
-			uuid: Uuid::new_v4(),
+			uuid,
+			stable_uuid: StableUuid::new_for_test(uuid),
 			parent,
 			chunks_size: 1,
 			chunks: 1,

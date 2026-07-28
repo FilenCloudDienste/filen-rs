@@ -544,7 +544,10 @@ impl<'a> FileWriterCompletingState<'a> {
 		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
 		let (final_created, final_modified) = self.final_times;
 		let file = Arc::new(RemoteFile {
-			uuid: file.root.uuid,
+			uuid: response.uuid,
+			// The edit-vs-new signal: equal to `uuid` when this upload created
+			// a new file, the existing lineage's id when it edited one.
+			stable_uuid: response.stable_uuid,
 			parent: file.parent.into(),
 			size: response.size,
 			favorited: false,

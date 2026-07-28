@@ -91,11 +91,11 @@ impl<'a> CacheEventType<'a> {
 				}
 				Err(e) => return Err((e, file.uuid())),
 			},
-			DecryptedDriveEvent::FileTrash(FileTrash { uuid })
-			| DecryptedDriveEvent::FileDeletedPermanent(FileDeletedPermanent { uuid }) => {
+			DecryptedDriveEvent::FileTrash(FileTrash { uuid, .. })
+			| DecryptedDriveEvent::FileDeletedPermanent(FileDeletedPermanent { uuid, .. }) => {
 				CacheEventType::File(FileEvent::Removed(*uuid))
 			}
-			DecryptedDriveEvent::FileArchived(FileArchived { uuid }) => {
+			DecryptedDriveEvent::FileArchived(FileArchived { uuid, .. }) => {
 				CacheEventType::File(FileEvent::Archived(*uuid))
 			}
 			DecryptedDriveEvent::FolderTrash(FolderTrash { uuid, .. })
@@ -148,25 +148,22 @@ impl<'a> CacheEventType<'a> {
 					},
 				})
 			}
-			DecryptedDriveEvent::FileMetadataChanged(FileMetadataChanged { uuid, metadata }) => {
-				CacheEventType::File(FileEvent::MetadataChanged {
-					uuid: *uuid,
-					meta: match metadata {
-						crate::fs::file::meta::FileMeta::Decoded(decoded) => {
-							decoded.as_borrowed_cow()
-						}
-						other => {
-							return Err((
-								CacheableConversionError::MetadataNotDecrypted(format!(
-									"{:?}",
-									other
-								)),
-								*uuid,
-							));
-						}
-					},
-				})
-			}
+			DecryptedDriveEvent::FileMetadataChanged(FileMetadataChanged {
+				uuid,
+				metadata,
+				..
+			}) => CacheEventType::File(FileEvent::MetadataChanged {
+				uuid: *uuid,
+				meta: match metadata {
+					crate::fs::file::meta::FileMeta::Decoded(decoded) => decoded.as_borrowed_cow(),
+					other => {
+						return Err((
+							CacheableConversionError::MetadataNotDecrypted(format!("{:?}", other)),
+							*uuid,
+						));
+					}
+				},
+			}),
 			DecryptedDriveEvent::DeleteAll => CacheEventType::Global(GlobalEvent::DeleteAll),
 			DecryptedDriveEvent::DeleteVersioned => {
 				CacheEventType::Global(GlobalEvent::DeleteVersioned)

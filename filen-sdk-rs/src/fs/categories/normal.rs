@@ -133,6 +133,7 @@ where
 					let meta = FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
 					Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 						f.uuid,
+						f.stable_uuid,
 						f.parent,
 						f.chunks_size,
 						f.chunks,
@@ -202,6 +203,7 @@ where
 					let meta = FileMeta::blocking_from_encrypted(f.metadata, &*crypter, f.version);
 					Ok::<RemoteFile, Error>(RemoteFile::from_meta(
 						f.uuid,
+						f.stable_uuid,
 						wrap_trash_parent(f.parent, is_trash),
 						f.size,
 						f.chunks,

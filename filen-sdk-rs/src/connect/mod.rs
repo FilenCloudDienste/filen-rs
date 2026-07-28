@@ -32,7 +32,7 @@ use crate::{
 			shared::{list_all_in_shared, list_all_out_shared},
 		},
 		dir::{LinkedDirectory, RemoteDirectory, RootDirectoryWithMeta, meta::DirectoryMeta},
-		file::{LinkedFile, RemoteFile},
+		file::{AnonymousRemoteFile, LinkedFile, RemoteFile},
 	},
 	runtime::do_cpu_intensive,
 	util::MaybeSendBoxFuture,
@@ -917,7 +917,7 @@ impl Client {
 		dir: &DirType<'_, Shared>,
 		sharer_info: &SharingRole,
 		callback: Option<&F>,
-	) -> Result<(Vec<SharedDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<SharedDirectory>, Vec<AnonymousRemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
@@ -929,7 +929,7 @@ impl Client {
 		dir: &DirType<'_, Shared>,
 		sharer_info: &SharingRole,
 		callback: Option<&F>,
-	) -> Result<(Vec<SharedDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<SharedDirectory>, Vec<AnonymousRemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
@@ -1013,7 +1013,7 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 		dir: &DirType<'_, Linked>,
 		link: &DirPublicLink,
 		callback: Option<&F>,
-	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<LinkedDirectory>, Vec<AnonymousRemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{
@@ -1027,7 +1027,7 @@ pub trait PublicLinkSharedClientExt: SharedClient {
 		dir: &DirType<'_, Linked>,
 		link: &DirPublicLink,
 		callback: Option<&F>,
-	) -> Result<(Vec<LinkedDirectory>, Vec<RemoteFile>), Error>
+	) -> Result<(Vec<LinkedDirectory>, Vec<AnonymousRemoteFile>), Error>
 	where
 		F: Fn(u64, Option<u64>) + Send + Sync,
 	{

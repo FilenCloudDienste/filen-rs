@@ -234,6 +234,12 @@ wasm-bindgen-rayon = { version = "1.3.0", optional = true }
 futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
 
 # dev-dependencies
+# `test-seams` exposes `StableUuid::new_for_test`, which fixtures need to stand in for a value
+# that normally only arrives by deserializing a server response. Dev-dependencies are not built
+# for `cargo build`, so production builds still cannot mint one.
+[dev-dependencies]
+filen-types = { path = "../filen-types", features = ["test-seams"] }
+
 # native (not wasm) only dev-dependencies
 [target.'cfg(not(all(target_family="wasm", target_os= "unknown")))'.dev-dependencies]
 multer = "3.1.0"

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
-use filen_types::fs::Uuid;
+use filen_types::fs::{StableUuid, Uuid};
 
 use crate::{crypto::error::ConversionError, js::FileMeta};
 
@@ -20,6 +20,10 @@ pub struct FileVersion {
 	)]
 	pub timestamp: DateTime<Utc>,
 	pub uuid: Uuid,
+	/// The whole-life id of the file this version belongs to — identical for
+	/// every version of the same file.
+	#[cfg_attr(feature = "wasm-full", serde(rename = "stableUUID"))]
+	pub stable_uuid: StableUuid,
 }
 
 impl From<crate::fs::file::FileVersion> for FileVersion {
@@ -32,6 +36,7 @@ impl From<crate::fs::file::FileVersion> for FileVersion {
 			metadata: version.metadata.into(),
 			timestamp: version.timestamp,
 			uuid: version.uuid,
+			stable_uuid: version.stable_uuid,
 		}
 	}
 }
@@ -47,6 +52,7 @@ impl TryFrom<FileVersion> for crate::fs::file::FileVersion {
 			metadata: version.metadata.try_into()?,
 			timestamp: version.timestamp,
 			uuid: version.uuid,
+			stable_uuid: version.stable_uuid,
 		})
 	}
 }

@@ -14,7 +14,7 @@ use filen_types::{
 	},
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, MaybeEncrypted},
-	fs::Uuid,
+	fs::{StableUuid, Uuid},
 	traits::CowHelpers,
 };
 use rsa::RsaPrivateKey;
@@ -247,7 +247,12 @@ impl<'a> DecryptedDriveEvent<'a> {
 	) -> Result<Self, Error> {
 		Ok(match inner {
 			DriveEventType::FileRename(e) => DecryptedDriveEvent::FileMetadataChanged(
-				FileMetadataChanged::blocking_from_encrypted(crypter, e.uuid, e.metadata),
+				FileMetadataChanged::blocking_from_encrypted(
+					crypter,
+					e.uuid,
+					e.stable_uuid,
+					e.metadata,
+				),
 			),
 			DriveEventType::FileArchiveRestored(e) => DecryptedDriveEvent::FileArchiveRestored(
 				FileArchiveRestored::blocking_from_encrypted(crypter, e),
@@ -285,7 +290,12 @@ impl<'a> DecryptedDriveEvent<'a> {
 			}
 			DriveEventType::FileDeletedPermanent(e) => DecryptedDriveEvent::FileDeletedPermanent(e),
 			DriveEventType::FileMetadataChanged(e) => DecryptedDriveEvent::FileMetadataChanged(
-				FileMetadataChanged::blocking_from_encrypted(crypter, e.uuid, e.metadata),
+				FileMetadataChanged::blocking_from_encrypted(
+					crypter,
+					e.uuid,
+					e.stable_uuid,
+					e.metadata,
+				),
 			),
 			DriveEventType::ItemFavorite(e) => DecryptedDriveEvent::ItemFavorite(
 				ItemFavorite::try_blocking_from_encrypted(crypter, e)?,
@@ -641,6 +651,7 @@ impl<'a> FileArchiveRestored {
 			current_uuid: event.current_uuid,
 			file: RemoteFile {
 				uuid: event.uuid,
+				stable_uuid: event.stable_uuid,
 				meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 					.into_owned_cow(),
 				parent: event.parent,
@@ -665,6 +676,7 @@ impl<'a> FileNew {
 	) -> Self {
 		Self(RemoteFile {
 			uuid: event.uuid,
+			stable_uuid: event.stable_uuid,
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 				.into_owned_cow(),
 			parent: event.parent,
@@ -688,6 +700,7 @@ impl<'a> FileRestore {
 	) -> Self {
 		Self(RemoteFile {
 			uuid: event.uuid,
+			stable_uuid: event.stable_uuid,
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 				.into_owned_cow(),
 			parent: event.parent,
@@ -710,6 +723,7 @@ impl<'a> FileMove {
 	) -> Self {
 		Self(RemoteFile {
 			uuid: event.uuid,
+			stable_uuid: event.stable_uuid,
 			meta: FileMeta::blocking_from_encrypted(event.metadata, crypter, event.version)
 				.into_owned_cow(),
 			parent: event.parent,
@@ -981,6 +995,12 @@ impl<'a> ItemFavorite {
 				})?;
 				NonRootItemType::File(Cow::Owned(RemoteFile {
 					uuid: event.uuid,
+					stable_uuid: event.stable_uuid.ok_or_else(|| {
+						Error::custom(
+							ErrorKind::Response,
+							"missing stableUUID for file favorite event",
+						)
+					})?,
 					meta: FileMeta::blocking_from_encrypted(
 						event.metadata.ok_or_else(|| {
 							Error::custom(
@@ -1096,6 +1116,7 @@ impl<'a> FolderMetadataChanged<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, CowHelpers)]
 pub struct FileMetadataChanged<'a> {
 	pub uuid: Uuid,
+	pub stable_uuid: StableUuid,
 	pub metadata: FileMeta<'a>,
 }
 
@@ -1119,12 +1140,17 @@ impl<'a> FileMetadataChanged<'a> {
 	fn blocking_from_encrypted(
 		crypter: &impl MetaCrypter,
 		uuid: Uuid,
+		stable_uuid: StableUuid,
 		new_meta: EncryptedString<'a>,
 	) -> Self {
 		let version = file_encryption_version_from_meta(&new_meta);
 		let metadata = FileMeta::blocking_from_encrypted(new_meta, crypter, version);
 
-		Self { uuid, metadata }
+		Self {
+			uuid,
+			stable_uuid,
+			metadata,
+		}
 	}
 }
 

@@ -47,7 +47,24 @@ impl From<filen_types::error::ResponseError> for Error {
 }
 
 impl_from!(reqwest::Error, ErrorKind::Reqwest);
-impl_from!(crate::crypto::error::ConversionError, ErrorKind::Conversion);
+// `MissingStableUuid` is the one foreseeable, actionable conversion failure —
+// a link- or shared-listed file fed to a drive operation — so it gets its own
+// kind callers can switch on instead of the blanket `Conversion` bucket.
+impl From<crate::crypto::error::ConversionError> for Error {
+	fn from(e: crate::crypto::error::ConversionError) -> Self {
+		let kind = match &e {
+			crate::crypto::error::ConversionError::MissingStableUuid => {
+				ErrorKind::MissingStableUuid
+			}
+			_ => ErrorKind::Conversion,
+		};
+		Error {
+			kind,
+			inner: Some(Box::new(e)),
+			context: None,
+		}
+	}
+}
 impl From<filen_types::error::ConversionError> for Error {
 	fn from(e: filen_types::error::ConversionError) -> Self {
 		crate::crypto::error::ConversionError::from(e).into()
@@ -129,6 +146,13 @@ pub enum ErrorKind {
 	Enter2fa,
 	/// Two-factor authentication code provided was invalid
 	Wrong2fa,
+	/// The client's view of the item was stale for this operation — refresh
+	/// the item from the server and retry
+	StaleState,
+	/// The file has no whole-life stable id, so it cannot be the target of a
+	/// drive operation. Files listed from a public link or a shared-in folder
+	/// never carry one — only read operations accept them.
+	MissingStableUuid,
 }
 
 /// Custom error type for the SDK
@@ -470,6 +494,19 @@ mod tests {
 
 	fn make_io_error() -> io::Error {
 		io::Error::other("leaf io error")
+	}
+
+	/// The one foreseeable conversion failure — an anonymous file fed to a
+	/// drive op — must surface with its own switchable kind, not the blanket
+	/// `Conversion` bucket (same rule that gave `StaleState` its kind).
+	#[test]
+	fn missing_stable_uuid_gets_its_own_kind() {
+		let err = Error::from(crate::crypto::error::ConversionError::MissingStableUuid);
+		assert_eq!(err.kind(), ErrorKind::MissingStableUuid);
+		let other = Error::from(crate::crypto::error::ConversionError::from(
+			filen_types::error::ConversionError::ParentUuidError(String::new()),
+		));
+		assert_eq!(other.kind(), ErrorKind::Conversion);
 	}
 
 	#[test]

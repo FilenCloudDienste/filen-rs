@@ -1252,7 +1252,7 @@ mod tests {
 			prime(vec![
 				FakeConnection::new(handshake_then(vec![
 					ServerAction::Msg(
-						r#"42["file-trash",{"uuid":"00000000-0000-0000-0000-000000000000","driveMessageId":1}]"#
+						r#"42["file-trash",{"uuid":"00000000-0000-0000-0000-000000000000","stableUUID":"00000000-0000-0000-0000-000000000000","driveMessageId":1}]"#
 							.to_string(),
 					),
 					ServerAction::Err("connection reset"),

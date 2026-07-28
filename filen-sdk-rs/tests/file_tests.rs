@@ -381,8 +381,19 @@ async fn get_replaced_file() {
 	let new_file = client.upload_file(file, b"new contents").await.unwrap();
 	assert_ne!(old_file.uuid(), new_file.uuid());
 
+	// Stable identity across the replace: the first upload minted the lineage
+	// id (stable == uuid), and the replacing upload reports that it edited the
+	// existing lineage (stable == the original's id, != its own fresh uuid).
+	assert_eq!(old_file.stable_uuid(), old_file.uuid());
+	assert_eq!(new_file.stable_uuid(), old_file.uuid());
+	assert_ne!(new_file.stable_uuid(), new_file.uuid());
+
 	let versions = client.list_file_versions(&new_file).await.unwrap();
 	assert_eq!(versions.len(), 2);
+	// every version row carries the single lineage stable id
+	for version in &versions {
+		assert_eq!(version.stable_uuid(), old_file.stable_uuid());
+	}
 
 	let got_old = client.get_file(old_file.uuid()).await.unwrap();
 	assert_eq!(got_old, old_file);
@@ -391,6 +402,9 @@ async fn get_replaced_file() {
 	let old_info = client.get_file_with_info(old_file.uuid()).await.unwrap();
 	assert!(old_info.versioned);
 	assert_eq!(old_info.file, old_file);
+	// a superseded uuid still resolves the lineage's stable id — this is how a
+	// cache can recover a file's identity after a remote edit
+	assert_eq!(old_info.file.stable_uuid(), old_file.stable_uuid());
 	let new_info = client.get_file_with_info(new_file.uuid()).await.unwrap();
 	assert!(!new_info.versioned);
 	assert_eq!(new_info.file, new_file);
@@ -683,6 +697,26 @@ async fn file_versions() {
 			}
 		}
 	}
+
+	// restoring the already-current version is a success no-op that leaves the
+	// file's identity untouched (the newest-first sort is by ORIGINAL upload
+	// timestamp, so after the restores above the head is not element 0 — pick
+	// it by uuid)
+	let head = client
+		.list_file_versions(&current)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|v| v.uuid() == current.uuid())
+		.expect("the live head must appear in its own version list");
+	let before_uuid = current.uuid();
+	let before_stable = current.stable_uuid();
+	client
+		.restore_file_version(&mut current, head)
+		.await
+		.unwrap();
+	assert_eq!(current.uuid(), before_uuid);
+	assert_eq!(current.stable_uuid(), before_stable);
 }
 
 /// HTTP provider tests.
@@ -1728,5 +1762,120 @@ async fn download_file_to_path_fails_when_parent_missing() {
 	assert!(
 		!download_path.exists(),
 		"target file should not have been created when parent is missing"
+	);
+}
+
+// A restore whose `current` lost a race must come back as StaleState, so the caller knows to
+// refresh and try again rather than treating it as a permanent failure. The server rejects a stale
+// `current` with invalid_params, which is also its generic validation bucket — the mapping is only
+// allowed to claim a race when the head really did move.
+#[shared_test_runtime]
+async fn restore_file_version_reports_a_raced_head_as_stale() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let _version_lock = client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	client.set_versioning_enabled(true).await.unwrap();
+
+	let mut uploaded = Vec::new();
+	for content in ["v1", "vv2", "vvv3"] {
+		let builder = client
+			.make_file_builder("stale_restore", test_dir.uuid())
+			.unwrap();
+		uploaded.push(
+			client
+				.upload_file(builder, content.as_bytes())
+				.await
+				.unwrap(),
+		);
+		// backend timestamps have a resolution of one second
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	}
+	let head = uploaded.pop().unwrap();
+	let superseded = uploaded.pop().unwrap();
+	let oldest = uploaded.pop().unwrap();
+	assert_ne!(superseded.uuid(), head.uuid());
+
+	let versions = client.list_file_versions(&head).await.unwrap();
+	let oldest_version = versions
+		.into_iter()
+		.find(|v| v.uuid() == oldest.uuid())
+		.expect("the first upload must still be listed as a version");
+
+	// The caller is still holding a head that has since been superseded.
+	let mut stale = superseded;
+	let err = client
+		.restore_file_version(&mut stale, oldest_version)
+		.await
+		.expect_err("restoring against a superseded head must fail");
+	assert_eq!(
+		err.kind(),
+		ErrorKind::StaleState,
+		"a raced restore must be reported as stale, got: {err:?}"
+	);
+}
+
+// A restore that fails for a reason other than a lost race must not be reported as retryable —
+// telling the caller to refresh and retry a request that can never succeed is an infinite loop.
+//
+// Note what this does and does not pin. The server answers a deleted version with code
+// `file_not_found`, not `invalid_params`, so this never reaches the invalid_params branch and would
+// pass under the old blanket mapping too (verified by mutation). It guards the outcome — a missing
+// version stays FileNotFound — rather than the message check that narrows invalid_params. That
+// check is deliberately untested: every invalid_params this endpoint could be made to produce
+// mentions `current`, so the branch it guards could not be reached from the outside.
+#[shared_test_runtime]
+async fn restore_file_version_does_not_report_a_deleted_version_as_stale() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let _version_lock = client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	client.set_versioning_enabled(true).await.unwrap();
+
+	let first = client
+		.upload_file(
+			client
+				.make_file_builder("stale_restore_deleted", test_dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+	// backend timestamps have a resolution of one second
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	let mut head = client
+		.upload_file(
+			client
+				.make_file_builder("stale_restore_deleted", test_dir.uuid())
+				.unwrap(),
+			b"vv2",
+		)
+		.await
+		.unwrap();
+
+	let older = client
+		.list_file_versions(&head)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|v| v.uuid() == first.uuid())
+		.expect("the first upload must be listed as a version");
+	client.delete_file_version(older.clone()).await.unwrap();
+
+	// `current` is the live head, so nothing here is stale — the version is simply gone.
+	let err = client
+		.restore_file_version(&mut head, older)
+		.await
+		.expect_err("restoring a deleted version must fail");
+	assert_ne!(
+		err.kind(),
+		ErrorKind::StaleState,
+		"a deleted version is not a race and must not be reported as retryable, got: {err:?}"
 	);
 }

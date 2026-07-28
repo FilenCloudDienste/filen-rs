@@ -24,6 +24,7 @@ SELECT
 	f.created AS file_created,
 	f.modified,
 	f.hash,
+	f.stable_uuid,
 	d.favorite AS dir_favorite,
 	d.color,
 	d.timestamp AS dir_timestamp,

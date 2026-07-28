@@ -24,7 +24,7 @@ use crate::{
 		dir::meta::DirectoryMeta,
 		file::meta::FileMeta,
 	},
-	io::RemoteFile,
+	io::{AnonymousRemoteFile, RemoteFile},
 	runtime::{blocking_join, do_cpu_intensive},
 	util::IntoMaybeParallelIterator,
 };
@@ -32,12 +32,17 @@ use crate::{
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Shared;
 
+/// A file row in a shared-dir listing. Shared browsing does not model
+/// whole-life file identity by design: the shared wire types carry no
+/// `stableUUID`, so the category's file type has no id to hold.
+pub type SharedListedFile = AnonymousRemoteFile;
+
 impl Category for Shared {
 	type Client = Client;
 	type Root = SharedRootDirectory;
 	type Dir = SharedDirectory;
 	type RootFile = SharedRootFile;
-	type File = RemoteFile;
+	type File = SharedListedFile;
 }
 
 impl CategoryFS for Shared {
@@ -161,7 +166,9 @@ impl CategoryFS for Shared {
 				dirs.into_iter()
 					.map(|d| SharedDirectory { inner: d })
 					.collect(),
-				files,
+				// The normal listing reports stable ids, but shared browsing does
+				// not model lifetime identity; see `SharedListedFile`.
+				files.into_iter().map(RemoteFile::into_anonymous).collect(),
 			));
 		}
 
@@ -206,6 +213,8 @@ impl CategoryFS for Shared {
 
 							RemoteFile::from_meta(
 								f.uuid,
+								// shared-in surfaces never carry a stable id on the wire
+								(),
 								f.parent.into(),
 								f.chunks_size,
 								f.chunks,
@@ -256,13 +265,15 @@ impl CategoryFS for Shared {
 fn blocking_remote_file_from_shared_out(
 	shared_file: SharedFileOut<'_>,
 	crypter: &impl MetaCrypter,
-) -> Result<RemoteFile, Error> {
+) -> Result<SharedListedFile, Error> {
 	let meta =
 		FileMeta::blocking_from_encrypted(shared_file.metadata, crypter, shared_file.version)
 			.into_owned_cow();
 
 	Ok(RemoteFile::from_meta(
 		shared_file.uuid,
+		// shared listings do not model lifetime identity; see `SharedListedFile`
+		(),
 		shared_file.parent.into(),
 		shared_file.size,
 		shared_file.chunks,
@@ -277,7 +288,7 @@ fn blocking_remote_file_from_shared_out(
 fn blocking_remote_file_from_shared_in(
 	shared_file: SharedFileIn<'_>,
 	private_key: &RsaPrivateKey,
-) -> Result<RemoteFile, Error> {
+) -> Result<AnonymousRemoteFile, Error> {
 	let meta = FileMeta::blocking_from_rsa_encrypted(
 		shared_file.metadata,
 		private_key,
@@ -287,6 +298,8 @@ fn blocking_remote_file_from_shared_in(
 
 	Ok(RemoteFile::from_meta(
 		shared_file.uuid,
+		// shared-in surfaces never carry a stable id on the wire
+		(),
 		shared_file.parent.into(),
 		shared_file.size,
 		shared_file.chunks,

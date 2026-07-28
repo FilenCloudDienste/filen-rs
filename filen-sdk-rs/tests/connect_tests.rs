@@ -60,7 +60,7 @@ async fn dir_public_link() {
 		.unwrap();
 	let linked_sub_dir = dirs.iter().find(|d| d.inner() == &sub_dir).unwrap();
 
-	assert_eq!(&files, &vec![dir_file.clone()]);
+	assert_eq!(&files, &vec![dir_file.clone().into_anonymous()]);
 
 	let (sub_dirs, sub_files) = unauth_client
 		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &info.link, None)
@@ -68,15 +68,15 @@ async fn dir_public_link() {
 		.unwrap();
 	assert_eq!(sub_dirs.len(), 0);
 	assert_eq!(sub_files.len(), 2);
-	assert!(sub_files.contains(&file));
-	assert!(sub_files.contains(&empty_file));
+	assert!(sub_files.contains(&file.clone().into_anonymous()));
+	assert!(sub_files.contains(&empty_file.clone().into_anonymous()));
 
 	let (dirs, files) = unauth_client
 		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
 		.await
 		.unwrap();
 	let linked_sub_dir = dirs.iter().find(|d| d.inner() == &sub_dir).unwrap();
-	assert_eq!(&files, &vec![dir_file.clone()]);
+	assert_eq!(&files, &vec![dir_file.clone().into_anonymous()]);
 
 	let password = "some_password";
 	link_rw.set_password(password.to_string());
@@ -122,7 +122,7 @@ async fn dir_public_link() {
 		.unwrap();
 	assert_eq!(sub_dirs.len(), 1);
 	assert_eq!(sub_dirs[0].inner(), &sub_sub_dir);
-	assert!(sub_files.contains(&sub_sub_file));
+	assert!(sub_files.contains(&sub_sub_file.clone().into_anonymous()));
 	assert_eq!(sub_files.len(), 3);
 
 	client
@@ -169,7 +169,7 @@ async fn dir_public_link() {
 		.unwrap();
 	assert_eq!(sub_dirs.len(), 0);
 	assert_eq!(sub_files.len(), 2);
-	assert!(!sub_files.contains(&sub_sub_file));
+	assert!(!sub_files.contains(&sub_sub_file.clone().into_anonymous()));
 }
 
 // Moving a subtree into a publicly-linked parent must mirror the moved items'
@@ -294,7 +294,7 @@ async fn dir_public_link_remove() {
 		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
 		.await
 		.unwrap();
-	assert_eq!(files, vec![dir_file.clone()]);
+	assert_eq!(files, vec![dir_file.clone().into_anonymous()]);
 	let linked_sub_dir = dirs
 		.iter()
 		.find(|d| d.inner() == &sub_dir)
@@ -304,7 +304,7 @@ async fn dir_public_link_remove() {
 		.await
 		.unwrap();
 	assert_eq!(sub_dirs.len(), 0);
-	assert!(sub_files.contains(&sub_file));
+	assert!(sub_files.contains(&sub_file.clone().into_anonymous()));
 
 	// Remove the link. The link is identified for removal by the directory it links, so the link
 	// object we created earlier (`link_rw`) is no longer needed here.
@@ -703,12 +703,12 @@ async fn share_dir() {
 			.unwrap(),
 		b"Hello, world!"
 	);
-	assert_eq!(&shared_files_in[0], &dir_file);
+	assert_eq!(&shared_files_in[0], &dir_file.clone().into_anonymous());
 	assert_eq!(
 		client.download_file(&shared_files_out[0]).await.unwrap(),
 		b"Hello, world!"
 	);
-	assert_eq!(&shared_files_out[0], &dir_file);
+	assert_eq!(&shared_files_out[0], &dir_file.clone().into_anonymous());
 
 	let (dirs, files) = client
 		.list_dir_recursive::<Shared, fn(u64, Option<u64>)>(
@@ -721,8 +721,8 @@ async fn share_dir() {
 	assert_eq!(dirs.len(), 1);
 	assert_eq!(files.len(), 2);
 	assert_eq!(dirs[0].get_dir(), &sub_dir);
-	assert!(files.contains(&dir_file));
-	assert!(files.contains(&sub_file));
+	assert!(files.contains(&dir_file.clone().into_anonymous()));
+	assert!(files.contains(&sub_file.clone().into_anonymous()));
 
 	let (dirs, files) = share_client
 		.list_dir_recursive::<Shared, fn(u64, Option<u64>)>(
@@ -736,7 +736,7 @@ async fn share_dir() {
 	assert_eq!(files.len(), 2);
 	assert_eq!(dirs[0].get_dir().uuid(), sub_dir.uuid());
 	assert_eq!(dirs[0].get_dir().name(), sub_dir.name());
-	assert!(files.contains(&dir_file));
+	assert!(files.contains(&dir_file.clone().into_anonymous()));
 
 	// change metadata
 	client
@@ -780,7 +780,7 @@ async fn share_dir() {
 	assert_eq!(shared_files_in.len(), 1);
 	assert_eq!(shared_files_in[0].name().unwrap(), "new_file_name.txt");
 
-	assert!(files.contains(&sub_file));
+	assert!(files.contains(&sub_file.clone().into_anonymous()));
 }
 
 // #[shared_test_runtime]

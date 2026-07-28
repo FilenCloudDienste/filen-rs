@@ -38,6 +38,10 @@ pub enum ConversionError {
 	RSAError(#[from] rsa::errors::Error),
 	#[error("Failed to parse UUID: `{0}`")]
 	UUIDError(#[from] uuid::Error),
+	#[error(
+		"File has no stable UUID: it was listed from a public link or a shared-in folder, which do not report one, so it cannot be the target of a drive operation"
+	)]
+	MissingStableUuid,
 	#[error("Unpad error")]
 	UnpadError(cbc::cipher::block_padding::UnpadError),
 }
