@@ -1,7 +1,7 @@
 -- Total match count for an account-root-scoped search; the WHERE clause
 -- mirrors search_window_account.sql exactly. ?1 = type filter (0/1/2),
 -- ?2 = needle, ?3 = case-insensitive flag.
-SELECT count(*)
+SELECT count(*) AS count
 FROM items AS i
 LEFT JOIN files AS f ON i.id = f.id
 LEFT JOIN dirs AS d ON i.id = d.id

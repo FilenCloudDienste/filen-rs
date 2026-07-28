@@ -37,7 +37,10 @@ use crate::cache::{
 	CacheError,
 	handle::{CacheMessage, ResyncProgress},
 	search::ReadTask,
-	sql::PersistedEvent,
+	sql::{
+		PersistedEvent,
+		columns::{COUNT, ITEMS_PARENT},
+	},
 };
 const BATCH_SIZE: usize = 256;
 
@@ -966,9 +969,11 @@ impl CacheState {
 			// reusable sql-layer surface.
 			let cached_non_root: i64 = self
 				.db
-				.query_row("SELECT COUNT(*) FROM items WHERE type != 0", [], |row| {
-					row.get(0)
-				})
+				.query_row(
+					"SELECT COUNT(*) AS count FROM items WHERE type != 0",
+					[],
+					|row| row.get(COUNT),
+				)
 				.map_err(|e| db_err(e, "counting cached items for the empty-listing guard"))?;
 			if cached_non_root > 0 {
 				tracing::warn!(
@@ -1509,7 +1514,7 @@ impl CacheState {
 		let parent: rusqlite::Result<Option<Uuid>> = self.db.query_row(
 			"SELECT parent FROM items WHERE uuid = ?1",
 			rusqlite::params![target],
-			|row| row.get(0),
+			|row| row.get(ITEMS_PARENT),
 		);
 		parent.ok().flatten()
 	}

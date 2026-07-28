@@ -33,6 +33,12 @@ use super::{
 	config::CompiledFilter,
 	result::{SearchHit, SearchResult},
 };
+use crate::cache::sql::columns::{
+	COUNT, DIR_CREATED, DIR_FAVORITE, DIR_NAME, DIR_TIMESTAMP, DIRS_COLOR, FILE_CREATED,
+	FILE_FAVORITE, FILE_NAME, FILE_TIMESTAMP, FILES_BUCKET, FILES_CHUNKS, FILES_CHUNKS_SIZE,
+	FILES_HASH, FILES_KEY, FILES_KEY_VERSION, FILES_MIME, FILES_MODIFIED, FILES_REGION, FILES_SIZE,
+	ITEMS_PARENT, ITEMS_TYPE, ITEMS_UUID, SEARCH_PARENT_PATH, SEARCH_TOTAL,
+};
 
 // Bounds the worker round-trip in `ReadConn::run`; wasm-only (native reads are synchronous, so
 // the worker read path does not exist there).
@@ -257,14 +263,12 @@ pub(super) fn window_and_count(
 	let needle = filter.needle.as_deref().unwrap_or("");
 	let type_filter = type_filter_param(filter);
 	let case_insensitive = !filter.case_sensitive;
-	// `parent_path` and `total` are read by NAME (robust to their column position); the payload
-	// columns are positional (see `row_to_result`).
 	let map_row = |row: &Row<'_>| {
 		let hit = SearchHit {
 			result: row_to_result(row)?,
-			parent_path: row.get::<_, String>("parent_path")?.into(),
+			parent_path: row.get::<_, String>(SEARCH_PARENT_PATH)?.into(),
 		};
-		Ok((hit, row.get::<_, i64>("total")?))
+		Ok((hit, row.get::<_, i64>(SEARCH_TOTAL)?))
 	};
 	let rows: rusqlite::Result<Vec<(SearchHit, i64)>> = match scope {
 		Scope::Account(root) => conn
@@ -323,31 +327,44 @@ pub(super) fn count_results(
 		Scope::Account(_) => conn
 			.prepare_cached(SEARCH_COUNT_ACCOUNT)?
 			.query_row(params![type_filter, needle, case_insensitive], |row| {
-				row.get(0)
+				row.get(COUNT)
 			})?,
 		Scope::Subtree(anchor) => conn.prepare_cached(SEARCH_COUNT_SUBTREE)?.query_row(
 			params![anchor, type_filter, needle, case_insensitive],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)?,
 		Scope::Children(parent) => conn.prepare_cached(SEARCH_COUNT_CHILDREN)?.query_row(
 			params![parent, type_filter, needle, case_insensitive],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)?,
 	};
 	Ok(count.max(0) as usize)
 }
 
-fn conversion_error(
-	index: usize,
-	error: impl std::error::Error + Send + Sync + 'static,
-) -> rusqlite::Error {
-	rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(error))
+/// The position of `column` in `row`'s result set, for the `FromSqlConversionFailure` payload
+/// (which is index-based). Only ever called on an error path, so the name lookup is free in
+/// practice; an unresolvable name degrades to 0 rather than masking the real error.
+fn column_index(row: &Row<'_>, column: &str) -> usize {
+	let stmt: &rusqlite::Statement<'_> = row.as_ref();
+	stmt.column_index(column).unwrap_or(0)
 }
 
-fn timestamp_millis(index: usize, millis: i64) -> rusqlite::Result<DateTime<Utc>> {
+fn conversion_error(
+	row: &Row<'_>,
+	column: &str,
+	error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+	rusqlite::Error::FromSqlConversionFailure(
+		column_index(row, column),
+		rusqlite::types::Type::Text,
+		Box::new(error),
+	)
+}
+
+fn timestamp_millis(row: &Row<'_>, column: &str, millis: i64) -> rusqlite::Result<DateTime<Utc>> {
 	DateTime::from_timestamp_millis(millis).ok_or_else(|| {
 		rusqlite::Error::FromSqlConversionFailure(
-			index,
+			column_index(row, column),
 			rusqlite::types::Type::Integer,
 			Box::new(rusqlite::types::FromSqlError::OutOfRange(millis)),
 		)
@@ -356,64 +373,68 @@ fn timestamp_millis(index: usize, millis: i64) -> rusqlite::Result<DateTime<Utc>
 
 /// One window-query row → the full result payload, mirroring the column encodings written by
 /// `sql/file.rs` / `sql/dir.rs`.
+///
+/// Every column is read by NAME, so this is independent of the `SELECT` order — which the three
+/// window queries do NOT agree on (`search_window_children.sql` emits `parent_path` before
+/// `total`, the account/subtree windows after).
 fn row_to_result(row: &Row<'_>) -> rusqlite::Result<SearchResult> {
-	let uuid: Uuid = row.get(0)?;
-	let parent: Uuid = row.get(1)?;
-	let item_type: i64 = row.get(2)?;
+	let uuid: Uuid = row.get(ITEMS_UUID)?;
+	let parent: Uuid = row.get(ITEMS_PARENT)?;
+	let item_type: i64 = row.get(ITEMS_TYPE)?;
 	match item_type {
 		2 => {
-			let key_str: String = row.get(12)?;
-			let key_version: u8 = row.get(13)?;
+			let key_str: String = row.get(FILES_KEY)?;
+			let key_version: u8 = row.get(FILES_KEY_VERSION)?;
 			let key_version = FileEncryptionVersion::try_from(key_version)
-				.map_err(|e| conversion_error(13, e))?;
+				.map_err(|e| conversion_error(row, FILES_KEY_VERSION, e))?;
 			let key = FileKey::from_str_with_version(&key_str, key_version)
-				.map_err(|e| conversion_error(12, e))?;
+				.map_err(|e| conversion_error(row, FILES_KEY, e))?;
 			let hash = row
-				.get::<_, Option<String>>(16)?
+				.get::<_, Option<String>>(FILES_HASH)?
 				.map(|hex_str| {
 					let mut bytes = [0u8; 32];
 					hex::decode_to_slice(hex_str, &mut bytes)
-						.map_err(|e| conversion_error(16, e))?;
+						.map_err(|e| conversion_error(row, FILES_HASH, e))?;
 					Ok::<_, rusqlite::Error>(Blake3Hash::from(bytes))
 				})
 				.transpose()?;
 			Ok(SearchResult::File(CacheableFile {
 				uuid,
 				parent,
-				chunks_size: row.get(3)?,
-				chunks: row.get(4)?,
-				favorited: row.get(5)?,
-				region: Cow::Owned(row.get::<_, String>(6)?),
-				bucket: Cow::Owned(row.get::<_, String>(7)?),
-				timestamp: timestamp_millis(8, row.get(8)?)?,
-				size: row.get(9)?,
-				name: Cow::Owned(row.get::<_, String>(10)?),
-				mime: Cow::Owned(row.get::<_, String>(11)?),
+				chunks_size: row.get(FILES_CHUNKS_SIZE)?,
+				chunks: row.get(FILES_CHUNKS)?,
+				favorited: row.get(FILE_FAVORITE)?,
+				region: Cow::Owned(row.get::<_, String>(FILES_REGION)?),
+				bucket: Cow::Owned(row.get::<_, String>(FILES_BUCKET)?),
+				timestamp: timestamp_millis(row, FILE_TIMESTAMP, row.get(FILE_TIMESTAMP)?)?,
+				size: row.get(FILES_SIZE)?,
+				name: Cow::Owned(row.get::<_, String>(FILE_NAME)?),
+				mime: Cow::Owned(row.get::<_, String>(FILES_MIME)?),
 				key,
 				created: row
-					.get::<_, Option<i64>>(14)?
-					.map(|millis| timestamp_millis(14, millis))
+					.get::<_, Option<i64>>(FILE_CREATED)?
+					.map(|millis| timestamp_millis(row, FILE_CREATED, millis))
 					.transpose()?,
-				last_modified: timestamp_millis(15, row.get(15)?)?,
+				last_modified: timestamp_millis(row, FILES_MODIFIED, row.get(FILES_MODIFIED)?)?,
 				hash,
 			}))
 		}
 		1 => Ok(SearchResult::Dir(CacheableDir {
 			uuid,
 			parent,
-			favorited: row.get(17)?,
+			favorited: row.get(DIR_FAVORITE)?,
 			color: row
-				.get::<_, Option<DirColor<'static>>>(18)?
+				.get::<_, Option<DirColor<'static>>>(DIRS_COLOR)?
 				.unwrap_or_default(),
-			timestamp: timestamp_millis(19, row.get(19)?)?,
-			name: Cow::Owned(row.get::<_, String>(20)?),
+			timestamp: timestamp_millis(row, DIR_TIMESTAMP, row.get(DIR_TIMESTAMP)?)?,
+			name: Cow::Owned(row.get::<_, String>(DIR_NAME)?),
 			created: row
-				.get::<_, Option<i64>>(21)?
-				.map(|millis| timestamp_millis(21, millis))
+				.get::<_, Option<i64>>(DIR_CREATED)?
+				.map(|millis| timestamp_millis(row, DIR_CREATED, millis))
 				.transpose()?,
 		})),
 		other => Err(rusqlite::Error::FromSqlConversionFailure(
-			2,
+			column_index(row, ITEMS_TYPE),
 			rusqlite::types::Type::Integer,
 			Box::new(rusqlite::types::FromSqlError::OutOfRange(other)),
 		)),

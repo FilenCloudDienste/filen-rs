@@ -10,7 +10,7 @@ WITH RECURSIVE subtree (uuid) AS (
 	INNER JOIN subtree AS s ON i.parent = s.uuid
 )
 
-SELECT count(*)
+SELECT count(*) AS count
 FROM items AS i
 INNER JOIN subtree AS s ON i.uuid = s.uuid
 LEFT JOIN files AS f ON i.id = f.id

@@ -10,6 +10,12 @@ use rusqlite::params;
 use uuid::Uuid;
 
 use super::*;
+use crate::cache::sql::columns::{
+	CACHE_META_VALUE, COUNT, DIR_FAVORITE, DIR_NAME, DIRS_COLOR, FILE_FAVORITE, FILE_NAME,
+	FILES_BUCKET, FILES_CHUNKS, FILES_KEY, FILES_KEY_VERSION, FILES_MIME, FILES_REGION, FILES_SIZE,
+	ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, ITEMS_PARENT, ITEMS_TYPE, ITEMS_UUID,
+	PRAGMA_USER_VERSION, SQLITE_MASTER_NAME,
+};
 
 fn test_cache_state() -> CacheState {
 	CacheState::new_in_memory()
@@ -61,7 +67,7 @@ fn test_init_db_creates_all_tables() {
 		.db
 		.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
 		.unwrap()
-		.query_map([], |row| row.get(0))
+		.query_map([], |row| row.get(SQLITE_MASTER_NAME))
 		.unwrap()
 		.collect::<Result<_, _>>()
 		.unwrap();
@@ -79,9 +85,9 @@ fn test_init_db_inserts_root() {
 	let root_exists: bool = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) > 0 FROM items WHERE uuid = ? AND type = 0",
+			"SELECT COUNT(*) > 0 AS item_exists FROM items WHERE uuid = ? AND type = 0",
 			params![state.root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEM_EXISTS),
 		)
 		.unwrap();
 	assert!(root_exists, "root item should exist");
@@ -89,9 +95,10 @@ fn test_init_db_inserts_root() {
 	let root_in_roots: bool = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) > 0 FROM roots r JOIN items i ON i.id = r.id WHERE i.uuid = ?",
+			"SELECT COUNT(*) > 0 AS item_exists FROM roots r JOIN items i ON i.id = r.id \
+			 WHERE i.uuid = ?",
 			params![state.root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEM_EXISTS),
 		)
 		.unwrap();
 	assert!(root_in_roots, "root should be in roots table");
@@ -110,9 +117,9 @@ fn test_init_db_is_idempotent() {
 	let exists: bool = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) > 0 FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) > 0 AS item_exists FROM items WHERE uuid = ?",
 			params![dir.uuid],
-			|row| row.get(0),
+			|row| row.get(ITEM_EXISTS),
 		)
 		.unwrap();
 	assert!(exists, "data should survive idempotent init");
@@ -127,7 +134,7 @@ fn test_root_has_null_parent() {
 		.query_row(
 			"SELECT parent FROM items WHERE uuid = ?",
 			params![state.root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEMS_PARENT),
 		)
 		.unwrap();
 	assert!(parent.is_none(), "root should have NULL parent");
@@ -143,9 +150,9 @@ fn test_upsert_single_dir() {
 	let (name,): (String,) = state
 		.db
 		.query_row(
-			"SELECT d.name FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+			"SELECT d.name AS dir_name FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
 			params![dir.uuid],
-			|row| Ok((row.get(0)?,)),
+			|row| Ok((row.get(DIR_NAME)?,)),
 		)
 		.unwrap();
 	assert_eq!(name, "test_dir");
@@ -162,7 +169,9 @@ fn test_upsert_multiple_dirs() {
 
 	let count: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM dirs", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM dirs", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(count, 10);
 }
@@ -179,7 +188,7 @@ fn test_upsert_dir_stores_correct_type() {
 		.query_row(
 			"SELECT type FROM items WHERE uuid = ?",
 			params![dir.uuid],
-			|row| row.get(0),
+			|row| row.get(ITEMS_TYPE),
 		)
 		.unwrap();
 	assert_eq!(item_type, 1, "dir should have type 1");
@@ -204,9 +213,16 @@ fn test_upsert_dir_stores_metadata() {
 	let (name, favorite, color): (String, bool, Option<String>) = state
 		.db
 		.query_row(
-			"SELECT d.name, d.favorite, d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+			"SELECT d.name AS dir_name, d.favorite AS dir_favorite, d.color \
+			 FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
 			params![dir.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			|row| {
+				Ok((
+					row.get(DIR_NAME)?,
+					row.get(DIR_FAVORITE)?,
+					row.get(DIRS_COLOR)?,
+				))
+			},
 		)
 		.unwrap();
 	assert_eq!(name, "colored_dir");
@@ -224,9 +240,16 @@ fn test_upsert_single_file() {
 	let (name, size, mime): (String, i64, String) = state
 		.db
 		.query_row(
-			"SELECT f.name, f.size, f.mime FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			"SELECT f.name AS file_name, f.size, f.mime \
+			 FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
 			params![file.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			|row| {
+				Ok((
+					row.get(FILE_NAME)?,
+					row.get(FILES_SIZE)?,
+					row.get(FILES_MIME)?,
+				))
+			},
 		)
 		.unwrap();
 	assert_eq!(name, "test_file.txt");
@@ -245,7 +268,9 @@ fn test_upsert_multiple_files() {
 
 	let count: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM files", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(count, 10);
 }
@@ -262,7 +287,7 @@ fn test_upsert_file_stores_correct_type() {
 		.query_row(
 			"SELECT type FROM items WHERE uuid = ?",
 			params![file.uuid],
-			|row| row.get(0),
+			|row| row.get(ITEMS_TYPE),
 		)
 		.unwrap();
 	assert_eq!(item_type, 2, "file should have type 2");
@@ -278,9 +303,10 @@ fn test_upsert_file_stores_key_and_version() {
 	let (key, version): (String, i8) = state
 		.db
 		.query_row(
-			"SELECT f.file_key, f.file_key_version FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			"SELECT f.file_key, f.file_key_version \
+			 FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
 			params![file.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?)),
+			|row| Ok((row.get(FILES_KEY)?, row.get(FILES_KEY_VERSION)?)),
 		)
 		.unwrap();
 	assert!(!key.is_empty());
@@ -298,9 +324,10 @@ fn test_upsert_file_with_favorite() {
 	let favorite: bool = state
 		.db
 		.query_row(
-			"SELECT f.favorite FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			"SELECT f.favorite AS file_favorite \
+			 FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
 			params![file.uuid],
-			|row| row.get(0),
+			|row| row.get(FILE_FAVORITE),
 		)
 		.unwrap();
 	assert!(favorite);
@@ -312,7 +339,7 @@ fn item_content_hash(state: &CacheState, uuid: Uuid) -> Option<Vec<u8>> {
 		.query_row(
 			"SELECT content_hash FROM items WHERE uuid = ?",
 			params![uuid],
-			|row| row.get(0),
+			|row| row.get(ITEMS_CONTENT_HASH),
 		)
 		.unwrap()
 }
@@ -418,22 +445,24 @@ fn test_type_change_cleans_up_stale_type_specific_row() {
 		.query_row(
 			"SELECT id, type FROM items WHERE uuid = ?",
 			params![uuid],
-			|row| Ok((row.get(0)?, row.get(1)?)),
+			|row| Ok((row.get(ITEMS_ID)?, row.get(ITEMS_TYPE)?)),
 		)
 		.unwrap();
 	assert_eq!(item_type, 2, "type flipped to File");
 	let dirs_rows: i64 = state
 		.db
-		.query_row("SELECT COUNT(*) FROM dirs WHERE id = ?", params![id], |r| {
-			r.get(0)
-		})
+		.query_row(
+			"SELECT COUNT(*) AS count FROM dirs WHERE id = ?",
+			params![id],
+			|r| r.get(COUNT),
+		)
 		.unwrap();
 	let files_rows: i64 = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM files WHERE id = ?",
+			"SELECT COUNT(*) AS count FROM files WHERE id = ?",
 			params![id],
-			|r| r.get(0),
+			|r| r.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(dirs_rows, 0, "stale dirs row removed on type change");
@@ -449,9 +478,9 @@ fn test_delete_file() {
 	let count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![file.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(count, 1);
@@ -461,9 +490,9 @@ fn test_delete_file() {
 	let count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![file.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(count, 0);
@@ -471,7 +500,9 @@ fn test_delete_file() {
 	// Verify cascade: file metadata also gone
 	let file_count: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM files", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(file_count, 0, "file row should be cascade-deleted");
 }
@@ -487,16 +518,18 @@ fn test_delete_dir() {
 	let count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![dir.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(count, 0);
 
 	let dir_count: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM dirs", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM dirs", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(dir_count, 0, "dir row should be cascade-deleted");
 }
@@ -526,7 +559,7 @@ fn test_cascade_delete_dir_removes_children() {
 		.query_row(
 			"SELECT id FROM items WHERE uuid = ?",
 			params![state.root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEMS_ID),
 		)
 		.unwrap();
 
@@ -548,9 +581,9 @@ fn test_cascade_delete_dir_removes_children() {
 	let count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE parent = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE parent = ?",
 			params![parent_dir.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(count, 2, "should have 2 child items");
@@ -561,9 +594,9 @@ fn test_cascade_delete_dir_removes_children() {
 	let count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE parent = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE parent = ?",
 			params![parent_dir.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(count, 0, "children should be cascade-deleted");
@@ -572,17 +605,17 @@ fn test_cascade_delete_dir_removes_children() {
 	let c1: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![child_uuid_1],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	let c2: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![child_uuid_2],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(c1, 0, "child 1 should be gone");
@@ -602,7 +635,7 @@ fn test_cascade_delete_is_recursive() {
 		.query_row(
 			"SELECT id FROM items WHERE uuid = ?",
 			params![state.root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEMS_ID),
 		)
 		.unwrap();
 
@@ -633,9 +666,9 @@ fn test_cascade_delete_is_recursive() {
 		.db
 		.query_row(
 			// Only root should remain
-			"SELECT COUNT(*) FROM items",
+			"SELECT COUNT(*) AS count FROM items",
 			[],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(
@@ -658,17 +691,17 @@ fn test_cascade_delete_does_not_affect_siblings() {
 	let a_count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![dir_a.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	let b_count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![dir_b.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(a_count, 0, "deleted dir should be gone");
@@ -693,9 +726,9 @@ fn test_upsert_file_update_preserves_uuid() {
 	let count: usize = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) FROM items WHERE uuid = ?",
+			"SELECT COUNT(*) AS count FROM items WHERE uuid = ?",
 			params![file.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(count, 1, "upsert should not create duplicate");
@@ -703,9 +736,10 @@ fn test_upsert_file_update_preserves_uuid() {
 	let (name, size): (String, i64) = state
 		.db
 		.query_row(
-			"SELECT f.name, f.size FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			"SELECT f.name AS file_name, f.size \
+			 FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
 			params![file.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?)),
+			|row| Ok((row.get(FILE_NAME)?, row.get(FILES_SIZE)?)),
 		)
 		.unwrap();
 	assert_eq!(name, "renamed_file.txt");
@@ -730,7 +764,7 @@ fn test_interleaved_insert_and_delete() {
 		.db
 		.prepare("SELECT uuid FROM items WHERE type != 0")
 		.unwrap()
-		.query_map([], |row| row.get(0))
+		.query_map([], |row| row.get(ITEMS_UUID))
 		.unwrap()
 		.collect::<Result<_, _>>()
 		.unwrap();
@@ -752,7 +786,9 @@ fn test_delete_multiple_items_in_one_call() {
 
 	let remaining: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM files", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(remaining, 2, "should have 2 files left after deleting 3");
 }
@@ -781,9 +817,16 @@ fn test_update_file_meta() {
 	let (name, size, mime): (String, i64, String) = state
 		.db
 		.query_row(
-			"SELECT f.name, f.size, f.mime FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			"SELECT f.name AS file_name, f.size, f.mime \
+			 FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
 			params![file.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			|row| {
+				Ok((
+					row.get(FILE_NAME)?,
+					row.get(FILES_SIZE)?,
+					row.get(FILES_MIME)?,
+				))
+			},
 		)
 		.unwrap();
 	assert_eq!(name, "renamed.txt");
@@ -813,9 +856,17 @@ fn test_update_file_meta_preserves_non_meta_fields() {
 	let (region, bucket, favorite, chunks): (String, String, bool, i64) = state
 		.db
 		.query_row(
-			"SELECT f.region, f.bucket, f.favorite, f.chunks FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+			"SELECT f.region, f.bucket, f.favorite AS file_favorite, f.chunks \
+			 FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
 			params![file.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+			|row| {
+				Ok((
+					row.get(FILES_REGION)?,
+					row.get(FILES_BUCKET)?,
+					row.get(FILE_FAVORITE)?,
+					row.get(FILES_CHUNKS)?,
+				))
+			},
 		)
 		.unwrap();
 	assert_eq!(region, "us-east-1");
@@ -857,9 +908,9 @@ fn test_update_dir_name() {
 	let name: String = state
 		.db
 		.query_row(
-			"SELECT d.name FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+			"SELECT d.name AS dir_name FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
 			params![dir.uuid],
-			|row| row.get(0),
+			|row| row.get(DIR_NAME),
 		)
 		.unwrap();
 	assert_eq!(name, "renamed_dir");
@@ -889,9 +940,16 @@ fn test_update_dir_name_preserves_other_fields() {
 	let (name, favorite, color): (String, bool, Option<String>) = state
 		.db
 		.query_row(
-			"SELECT d.name, d.favorite, d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+			"SELECT d.name AS dir_name, d.favorite AS dir_favorite, d.color \
+			 FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
 			params![dir.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			|row| {
+				Ok((
+					row.get(DIR_NAME)?,
+					row.get(DIR_FAVORITE)?,
+					row.get(DIRS_COLOR)?,
+				))
+			},
 		)
 		.unwrap();
 	assert_eq!(name, "updated");
@@ -929,7 +987,7 @@ fn test_update_dir_color() {
 		.query_row(
 			"SELECT d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
 			params![dir.uuid],
-			|row| row.get(0),
+			|row| row.get(DIRS_COLOR),
 		)
 		.unwrap();
 	assert_eq!(color.as_deref(), Some("red"));
@@ -954,9 +1012,16 @@ fn test_update_dir_color_preserves_other_fields() {
 	let (name, favorite, color): (String, bool, Option<String>) = state
 		.db
 		.query_row(
-			"SELECT d.name, d.favorite, d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+			"SELECT d.name AS dir_name, d.favorite AS dir_favorite, d.color \
+			 FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
 			params![dir.uuid],
-			|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+			|row| {
+				Ok((
+					row.get(DIR_NAME)?,
+					row.get(DIR_FAVORITE)?,
+					row.get(DIRS_COLOR)?,
+				))
+			},
 		)
 		.unwrap();
 	assert_eq!(name, "my_dir", "name should be preserved");
@@ -1010,9 +1075,10 @@ fn test_dir_upsert_preserves_color_on_conflict() {
 	let (favorite, color): (bool, Option<String>) = state
 		.db
 		.query_row(
-			"SELECT d.favorite, d.color FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
+			"SELECT d.favorite AS dir_favorite, d.color \
+			 FROM items i JOIN dirs d ON d.id = i.id WHERE i.uuid = ?",
 			params![uuid],
-			|row| Ok((row.get(0)?, row.get(1)?)),
+			|row| Ok((row.get(DIR_FAVORITE)?, row.get(DIRS_COLOR)?)),
 		)
 		.unwrap();
 	assert!(
@@ -1041,7 +1107,9 @@ fn test_delete_all_non_root() {
 
 	let total: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM items", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(total, 11, "should have 1 root + 5 dirs + 5 files");
 
@@ -1049,16 +1117,18 @@ fn test_delete_all_non_root() {
 
 	let total: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM items", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(total, 1, "only root should remain");
 
 	let root_exists: bool = state
 		.db
 		.query_row(
-			"SELECT COUNT(*) > 0 FROM items WHERE uuid = ? AND type = 0",
+			"SELECT COUNT(*) > 0 AS item_exists FROM items WHERE uuid = ? AND type = 0",
 			params![state.root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEM_EXISTS),
 		)
 		.unwrap();
 	assert!(root_exists, "root should still exist");
@@ -1079,11 +1149,15 @@ fn test_delete_all_non_root_cascades_metadata() {
 
 	let file_count: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM files", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	let dir_count: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM dirs", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM dirs", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(file_count, 0, "files table should be empty");
 	assert_eq!(dir_count, 0, "dirs table should be empty");
@@ -1097,7 +1171,9 @@ fn test_delete_all_non_root_on_empty_db() {
 
 	let total: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM items", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(total, 1, "root should still exist");
 }
@@ -1125,7 +1201,9 @@ fn test_bulk_insert_many_items() {
 
 	let total: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM items", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	// 1 root + 500 dirs + 1000 files = 1501
 	assert_eq!(total, 1501);
@@ -1138,7 +1216,7 @@ fn test_bulk_insert_many_items() {
 			.query_row(
 				"SELECT fi.size FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
 				[f.uuid],
-				|row| row.get(0),
+				|row| row.get(FILES_SIZE),
 			)
 			.unwrap();
 		assert_eq!(
@@ -1155,7 +1233,7 @@ fn test_bulk_insert_many_items() {
 	let id_before: i64 = state
 		.db
 		.query_row("SELECT id FROM items WHERE uuid = ?", [sample], |row| {
-			row.get(0)
+			row.get(ITEMS_ID)
 		})
 		.unwrap();
 
@@ -1164,7 +1242,9 @@ fn test_bulk_insert_many_items() {
 
 	let total_after: usize = state
 		.db
-		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM items", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap();
 	assert_eq!(
 		total_after, 1501,
@@ -1173,7 +1253,7 @@ fn test_bulk_insert_many_items() {
 	let id_after: i64 = state
 		.db
 		.query_row("SELECT id FROM items WHERE uuid = ?", [sample], |row| {
-			row.get(0)
+			row.get(ITEMS_ID)
 		})
 		.unwrap();
 	assert_eq!(
@@ -1190,7 +1270,7 @@ fn init_creates_events_and_cache_meta_tables() {
 		.db
 		.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
 		.unwrap()
-		.query_map([], |row| row.get(0))
+		.query_map([], |row| row.get(SQLITE_MASTER_NAME))
 		.unwrap()
 		.collect::<Result<_, _>>()
 		.unwrap();
@@ -1215,7 +1295,7 @@ fn init_seeds_cache_meta() {
 		.query_row(
 			"SELECT value FROM cache_meta WHERE meta_key = 'last_drive_message_id'",
 			[],
-			|row| row.get(0),
+			|row| row.get(CACHE_META_VALUE),
 		)
 		.unwrap();
 	assert_eq!(watermark, None, "watermark should start NULL");
@@ -1226,7 +1306,7 @@ fn init_seeds_cache_meta() {
 		.query_row(
 			"SELECT value FROM cache_meta WHERE meta_key = 'event_format_version'",
 			[],
-			|row| row.get(0),
+			|row| row.get(CACHE_META_VALUE),
 		)
 		.unwrap();
 	assert_eq!(format_version, 1);
@@ -1237,7 +1317,9 @@ fn init_bumps_user_version_to_2() {
 	let state = test_cache_state();
 	let version: i64 = state
 		.db
-		.query_row(statements::GET_USER_VERSION, [], |row| row.get(0))
+		.query_row(statements::GET_USER_VERSION, [], |row| {
+			row.get(PRAGMA_USER_VERSION)
+		})
 		.unwrap();
 	assert_eq!(version, 2);
 }

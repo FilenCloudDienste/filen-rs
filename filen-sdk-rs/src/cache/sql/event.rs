@@ -5,7 +5,11 @@
 use rkyv::rancor::Error;
 use rusqlite::{OptionalExtension, params};
 
-use crate::cache::{CacheError, CacheState, state::CacheEvent};
+use crate::cache::{
+	CacheError, CacheState,
+	sql::columns::{CACHE_META_VALUE, EVENTS_DRIVE_MESSAGE_ID, EVENTS_PAYLOAD, EVENTS_SEQ},
+	state::CacheEvent,
+};
 
 /// Serialize a [`CacheEvent`] into the rkyv byte blob persisted in `events.payload`.
 fn serialize(event: &CacheEvent<'_>) -> Result<Vec<u8>, Error> {
@@ -128,7 +132,11 @@ impl CacheState {
 			.map_err(|e| db_err(e, "preparing event load"))?;
 		let raw: Vec<(i64, Option<i64>, Vec<u8>)> = stmt
 			.query_map(params![limit as i64], |row| {
-				Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+				Ok((
+					row.get(EVENTS_SEQ)?,
+					row.get(EVENTS_DRIVE_MESSAGE_ID)?,
+					row.get(EVENTS_PAYLOAD)?,
+				))
 			})
 			.map_err(|e| db_err(e, "querying events"))?
 			.collect::<rusqlite::Result<_>>()
@@ -178,7 +186,7 @@ impl CacheState {
 			.prepare_cached(super::statements::CACHE_META_GET)
 			.and_then(|mut stmt| {
 				stmt.query_row(params![super::statements::NEEDS_RESYNC_KEY], |row| {
-					row.get::<_, Option<i64>>(0)
+					row.get::<_, Option<i64>>(CACHE_META_VALUE)
 				})
 				.optional()
 			})
@@ -206,7 +214,7 @@ impl CacheState {
 			.prepare_cached(super::statements::CACHE_META_GET)
 			.and_then(|mut stmt| {
 				stmt.query_row(params![super::statements::WATERMARK_KEY], |row| {
-					row.get::<_, Option<i64>>(0)
+					row.get::<_, Option<i64>>(CACHE_META_VALUE)
 				})
 				.optional()
 			})
@@ -353,7 +361,10 @@ mod tests {
 	use uuid::Uuid;
 
 	use super::*;
-	use crate::cache::state::{CacheEventType, DirEvent, FileEvent, GlobalEvent};
+	use crate::cache::{
+		sql::columns::{COUNT, EVENTS_SYNTHETIC},
+		state::{CacheEventType, DirEvent, FileEvent, GlobalEvent},
+	};
 
 	fn dt(ms: i64) -> DateTime<Utc> {
 		DateTime::from_timestamp_millis(ms).expect("valid timestamp")
@@ -544,7 +555,9 @@ mod tests {
 		// One row dropped by the unique-id index → 3 rows, not 4.
 		let count: i64 = state
 			.db
-			.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+			.query_row("SELECT COUNT(*) AS count FROM events", [], |row| {
+				row.get(COUNT)
+			})
 			.unwrap();
 		assert_eq!(count, 3, "redelivered drive_message_id must be IGNOREd");
 
@@ -556,7 +569,13 @@ mod tests {
 				 ORDER BY synthetic DESC, drive_message_id ASC, seq ASC",
 			)
 			.unwrap()
-			.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+			.query_map([], |row| {
+				Ok((
+					row.get(EVENTS_DRIVE_MESSAGE_ID)?,
+					row.get(EVENTS_SYNTHETIC)?,
+					row.get(EVENTS_PAYLOAD)?,
+				))
+			})
 			.unwrap()
 			.collect::<Result<_, _>>()
 			.unwrap();
@@ -586,7 +605,9 @@ mod tests {
 		state.insert_events_batch(&[]).unwrap();
 		let count0: i64 = state
 			.db
-			.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+			.query_row("SELECT COUNT(*) AS count FROM events", [], |row| {
+				row.get(COUNT)
+			})
 			.unwrap();
 		assert_eq!(count0, 0, "an empty batch inserts nothing");
 
@@ -605,7 +626,9 @@ mod tests {
 		// The in-batch redelivery of id=1 is IGNOREd → 3 rows, not 4.
 		let count: i64 = state
 			.db
-			.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+			.query_row("SELECT COUNT(*) AS count FROM events", [], |row| {
+				row.get(COUNT)
+			})
 			.unwrap();
 		assert_eq!(
 			count, 3,
@@ -651,7 +674,9 @@ mod tests {
 		assert!(!state.needs_resync().unwrap());
 		let events_rows: i64 = state
 			.db
-			.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+			.query_row("SELECT COUNT(*) AS count FROM events", [], |row| {
+				row.get(COUNT)
+			})
 			.unwrap();
 		assert_eq!(events_rows, 0, "the commit never touches the events store");
 	}

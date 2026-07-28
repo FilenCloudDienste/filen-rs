@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use rusqlite::params;
 use uuid::Uuid;
 
-use crate::cache::CacheState;
+use crate::cache::{CacheState, sql::columns::ITEMS_UUID};
 
 impl CacheState {
 	/// The upward ancestor chain of `uuid` — the seed itself plus every ancestor up to (and including)
@@ -22,7 +22,7 @@ impl CacheState {
 		let mut stmt = self
 			.db
 			.prepare_cached(super::statements::ANCESTRY_OF_UUID)?;
-		let rows = stmt.query_map(params![uuid], |row| row.get::<_, Uuid>(0))?;
+		let rows = stmt.query_map(params![uuid], |row| row.get::<_, Uuid>(ITEMS_UUID))?;
 		rows.collect()
 	}
 
@@ -44,7 +44,7 @@ impl CacheState {
 			.prepare_cached(super::statements::ANCESTRY_OF_UUID)?;
 		let mut rows = stmt.query(params![uuid])?;
 		while let Some(row) = rows.next()? {
-			let ancestor: Uuid = row.get(0)?;
+			let ancestor: Uuid = row.get(ITEMS_UUID)?;
 			if sync_roots.contains_key(&ancestor) {
 				return Ok(true);
 			}

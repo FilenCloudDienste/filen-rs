@@ -9,9 +9,16 @@ use itertools::Itertools;
 use rusqlite::config::DbConfig;
 use uuid::Uuid;
 
-use crate::cache::{CacheState, sql::statements::VACUUM};
+use crate::cache::{
+	CacheState,
+	sql::{
+		columns::{ITEMS_ID, PRAGMA_USER_VERSION},
+		statements::VACUUM,
+	},
+};
 
 mod bulk;
+pub(in crate::cache) mod columns;
 mod diff;
 mod event;
 pub(crate) use event::PersistedEvent;
@@ -183,9 +190,9 @@ impl CacheState {
 			 PRAGMA synchronous = NORMAL; PRAGMA cache_size = -32768; PRAGMA mmap_size = 268435456;",
 		)?;
 
-		let version: i64 = self
-			.db
-			.query_one(statements::GET_USER_VERSION, (), |row| row.get(0))?;
+		let version: i64 = self.db.query_one(statements::GET_USER_VERSION, (), |row| {
+			row.get(PRAGMA_USER_VERSION)
+		})?;
 
 		if version != statements::SQL_USER_VERSION {
 			self.db
@@ -210,7 +217,7 @@ impl CacheState {
 		// version-matching reopen already has it.
 		self.root_id = self
 			.db
-			.query_one(statements::SELECT_ROOT_ID, (), |row| row.get(0))?;
+			.query_one(statements::SELECT_ROOT_ID, (), |row| row.get(ITEMS_ID))?;
 		Ok(())
 	}
 }

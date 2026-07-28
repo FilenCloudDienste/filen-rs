@@ -1,4 +1,8 @@
 use super::*;
+use crate::cache::sql::columns::{
+	FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE,
+	PRAGMA_SYNCHRONOUS,
+};
 
 /// Unit constructors have no resync deps, so these futures never touch the network — a minimal
 /// current-thread runtime suffices.
@@ -12,7 +16,9 @@ fn drive<F: Future>(fut: F) -> F::Output {
 fn item_count(state: &CacheState) -> i64 {
 	state
 		.db
-		.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+		.query_row("SELECT COUNT(*) AS count FROM items", [], |row| {
+			row.get(COUNT)
+		})
 		.unwrap()
 }
 
@@ -298,9 +304,9 @@ fn item_exists(state: &CacheState, uuid: Uuid) -> bool {
 	state
 		.db
 		.query_row(
-			"SELECT EXISTS (SELECT 1 FROM items WHERE uuid = ?)",
+			"SELECT EXISTS (SELECT 1 FROM items WHERE uuid = ?) AS item_exists",
 			[uuid],
-			|row| row.get(0),
+			|row| row.get(ITEM_EXISTS),
 		)
 		.unwrap()
 }
@@ -309,7 +315,7 @@ fn item_parent(state: &CacheState, uuid: Uuid) -> Option<Uuid> {
 	state
 		.db
 		.query_row("SELECT parent FROM items WHERE uuid = ?", [uuid], |row| {
-			row.get::<_, Option<Uuid>>(0)
+			row.get::<_, Option<Uuid>>(ITEMS_PARENT)
 		})
 		.unwrap()
 }
@@ -320,7 +326,7 @@ fn item_content_hash(state: &CacheState, uuid: Uuid) -> Option<Vec<u8>> {
 		.query_row(
 			"SELECT content_hash FROM items WHERE uuid = ?",
 			[uuid],
-			|row| row.get(0),
+			|row| row.get(ITEMS_CONTENT_HASH),
 		)
 		.unwrap()
 }
@@ -1794,17 +1800,17 @@ fn init_db_applies_per_connection_pragmas_on_reopen() {
 
 	let synchronous: i64 = state
 		.db
-		.query_row("PRAGMA synchronous", [], |row| row.get(0))
+		.query_row("PRAGMA synchronous", [], |row| row.get(PRAGMA_SYNCHRONOUS))
 		.unwrap();
 	assert_eq!(synchronous, 1, "synchronous = NORMAL on every open");
 	let cache_size: i64 = state
 		.db
-		.query_row("PRAGMA cache_size", [], |row| row.get(0))
+		.query_row("PRAGMA cache_size", [], |row| row.get(PRAGMA_CACHE_SIZE))
 		.unwrap();
 	assert_eq!(cache_size, -32768, "page-cache budget on every open");
 	let mmap_size: i64 = state
 		.db
-		.query_row("PRAGMA mmap_size", [], |row| row.get(0))
+		.query_row("PRAGMA mmap_size", [], |row| row.get(PRAGMA_MMAP_SIZE))
 		.unwrap();
 	assert_eq!(mmap_size, 268_435_456, "mmap budget on every open");
 
@@ -1870,9 +1876,9 @@ fn drain_falls_back_to_per_event_when_a_bulk_apply_fails() {
 	let dir_applied: i64 = state
 		.db
 		.query_row(
-			"SELECT count(*) FROM items WHERE uuid = ?1",
+			"SELECT count(*) AS count FROM items WHERE uuid = ?1",
 			[good_dir.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(
@@ -1882,9 +1888,9 @@ fn drain_falls_back_to_per_event_when_a_bulk_apply_fails() {
 	let torn_file_row: i64 = state
 		.db
 		.query_row(
-			"SELECT count(*) FROM items WHERE uuid = ?1",
+			"SELECT count(*) AS count FROM items WHERE uuid = ?1",
 			[poison_file.uuid],
-			|row| row.get(0),
+			|row| row.get(COUNT),
 		)
 		.unwrap();
 	assert_eq!(
@@ -2397,9 +2403,9 @@ fn apply_synthetics_batches_creates_with_stable_fk() {
 		let linked: i64 = state
 			.db
 			.query_row(
-				"SELECT COUNT(*) FROM dirs d JOIN items i ON i.id = d.id WHERE i.uuid = ?",
+				"SELECT COUNT(*) AS count FROM dirs d JOIN items i ON i.id = d.id WHERE i.uuid = ?",
 				[dir.uuid],
-				|r| r.get(0),
+				|r| r.get(COUNT),
 			)
 			.unwrap();
 		assert_eq!(linked, 1, "dir {} FK-linked to its items row", dir.uuid);
@@ -2408,9 +2414,10 @@ fn apply_synthetics_batches_creates_with_stable_fk() {
 		let linked: i64 = state
 			.db
 			.query_row(
-				"SELECT COUNT(*) FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
+				"SELECT COUNT(*) AS count FROM files fi JOIN items i ON i.id = fi.id \
+				 WHERE i.uuid = ?",
 				[file.uuid],
-				|r| r.get(0),
+				|r| r.get(COUNT),
 			)
 			.unwrap();
 		assert_eq!(linked, 1, "file {} FK-linked to its items row", file.uuid);
@@ -2420,7 +2427,7 @@ fn apply_synthetics_batches_creates_with_stable_fk() {
 		.query_row(
 			"SELECT size FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
 			[f1.uuid],
-			|r| r.get(0),
+			|r| r.get(FILES_SIZE),
 		)
 		.unwrap();
 	assert_eq!(
@@ -2432,7 +2439,7 @@ fn apply_synthetics_batches_creates_with_stable_fk() {
 	let id_before: i64 = state
 		.db
 		.query_row("SELECT id FROM items WHERE uuid = ?", [f1.uuid], |r| {
-			r.get(0)
+			r.get(ITEMS_ID)
 		})
 		.unwrap();
 	let mut changed = f1.clone();
@@ -2450,7 +2457,7 @@ fn apply_synthetics_batches_creates_with_stable_fk() {
 	let id_after: i64 = state
 		.db
 		.query_row("SELECT id FROM items WHERE uuid = ?", [f1.uuid], |r| {
-			r.get(0)
+			r.get(ITEMS_ID)
 		})
 		.unwrap();
 	assert_eq!(
@@ -2462,7 +2469,7 @@ fn apply_synthetics_batches_creates_with_stable_fk() {
 		.query_row(
 			"SELECT size FROM files fi JOIN items i ON i.id = fi.id WHERE i.uuid = ?",
 			[f1.uuid],
-			|r| r.get(0),
+			|r| r.get(FILES_SIZE),
 		)
 		.unwrap();
 	assert_eq!(

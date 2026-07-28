@@ -15,7 +15,10 @@ use crate::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
 use rusqlite::{CachedStatement, params};
 use uuid::Uuid;
 
-use super::item::ItemType;
+use super::{
+	columns::{ITEMS_TYPE, ITEMS_UUID},
+	item::ItemType,
+};
 use crate::cache::{
 	CacheState,
 	state::{CacheEvent, CacheEventType, DirEvent, FileEvent},
@@ -172,7 +175,10 @@ impl CacheState {
 			.db
 			.prepare_cached(super::statements::DIFF_SUBTREE_ABSENT)?;
 		let rows = subtree_stmt.query_map(params![anchor], |row| {
-			Ok((row.get::<_, Uuid>(0)?, row.get::<_, i8>(1)?))
+			Ok((
+				row.get::<_, Uuid>(ITEMS_UUID)?,
+				row.get::<_, i8>(ITEMS_TYPE)?,
+			))
 		})?;
 		for row in rows {
 			let (uuid, item_type) = row?;
@@ -192,8 +198,12 @@ impl CacheState {
 			let mut orphan_stmt = self
 				.db
 				.prepare_cached(super::statements::DIFF_ORPHANS_ABSENT)?;
-			let rows = orphan_stmt
-				.query_map([], |row| Ok((row.get::<_, Uuid>(0)?, row.get::<_, i8>(1)?)))?;
+			let rows = orphan_stmt.query_map([], |row| {
+				Ok((
+					row.get::<_, Uuid>(ITEMS_UUID)?,
+					row.get::<_, i8>(ITEMS_TYPE)?,
+				))
+			})?;
 			for row in rows {
 				let (uuid, item_type) = row?;
 				tracing::warn!(
@@ -242,8 +252,12 @@ impl CacheState {
 		};
 
 		let mut creates_stmt = self.db.prepare_cached(super::statements::DIFF_CREATES)?;
-		let rows =
-			creates_stmt.query_map([], |row| Ok((row.get::<_, Uuid>(0)?, row.get::<_, i8>(1)?)))?;
+		let rows = creates_stmt.query_map([], |row| {
+			Ok((
+				row.get::<_, Uuid>(ITEMS_UUID)?,
+				row.get::<_, i8>(ITEMS_TYPE)?,
+			))
+		})?;
 		for row in rows {
 			let (uuid, item_type) = row?;
 			push(uuid, item_type, UpsertKind::New);
@@ -252,7 +266,10 @@ impl CacheState {
 
 		let mut moves_stmt = self.db.prepare_cached(super::statements::DIFF_MOVES)?;
 		let rows = moves_stmt.query_map(params![anchor], |row| {
-			Ok((row.get::<_, Uuid>(0)?, row.get::<_, i8>(1)?))
+			Ok((
+				row.get::<_, Uuid>(ITEMS_UUID)?,
+				row.get::<_, i8>(ITEMS_TYPE)?,
+			))
 		})?;
 		for row in rows {
 			let (uuid, item_type) = row?;
@@ -277,7 +294,10 @@ impl CacheState {
 			.db
 			.prepare_cached(super::statements::DIFF_CONTENT_CHANGES)?;
 		let rows = stmt.query_map(params![anchor], |row| {
-			Ok((row.get::<_, Uuid>(0)?, row.get::<_, i8>(1)?))
+			Ok((
+				row.get::<_, Uuid>(ITEMS_UUID)?,
+				row.get::<_, i8>(ITEMS_TYPE)?,
+			))
 		})?;
 		for row in rows {
 			let (uuid, item_type) = row?;
@@ -326,6 +346,7 @@ mod tests {
 	use filen_types::{api::v3::dir::color::DirColor, auth::FileEncryptionVersion};
 
 	use super::*;
+	use crate::cache::sql::columns::{COUNT, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_PARENT};
 
 	fn make_dir(uuid: u128, parent: Uuid) -> CacheableDir<'static> {
 		let now = Utc::now();
@@ -365,7 +386,9 @@ mod tests {
 	fn diff_count(state: &CacheState) -> i64 {
 		state
 			.db
-			.query_row("SELECT COUNT(*) FROM diff_incoming", [], |r| r.get(0))
+			.query_row("SELECT COUNT(*) AS count FROM diff_incoming", [], |r| {
+				r.get(COUNT)
+			})
 			.unwrap()
 	}
 
@@ -398,7 +421,13 @@ mod tests {
 			.query_row(
 				"SELECT parent, type, content_hash FROM diff_incoming WHERE uuid = ?",
 				params![file.uuid],
-				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+				|r| {
+					Ok((
+						r.get(ITEMS_PARENT)?,
+						r.get(ITEMS_TYPE)?,
+						r.get(ITEMS_CONTENT_HASH)?,
+					))
+				},
 			)
 			.unwrap();
 		assert_eq!(parent.as_slice(), dir.uuid.as_bytes());
@@ -410,7 +439,7 @@ mod tests {
 			.query_row(
 				"SELECT type, content_hash FROM diff_incoming WHERE uuid = ?",
 				params![dir.uuid],
-				|r| Ok((r.get(0)?, r.get(1)?)),
+				|r| Ok((r.get(ITEMS_TYPE)?, r.get(ITEMS_CONTENT_HASH)?)),
 			)
 			.unwrap();
 		assert_eq!(ty, ItemType::Dir as i8);
@@ -436,9 +465,9 @@ mod tests {
 		let survivor: bool = state
 			.db
 			.query_row(
-				"SELECT EXISTS (SELECT 1 FROM diff_incoming WHERE uuid = ?)",
+				"SELECT EXISTS (SELECT 1 FROM diff_incoming WHERE uuid = ?) AS item_exists",
 				params![Uuid::from_u128(9)],
-				|r| r.get(0),
+				|r| r.get(ITEM_EXISTS),
 			)
 			.unwrap();
 		assert!(survivor, "only the second snapshot's row remains");
@@ -644,7 +673,7 @@ mod tests {
 			.db
 			.prepare(super::super::statements::DIFF_MOVES)
 			.unwrap()
-			.query_map(params![root], |r| r.get::<_, Uuid>(0))
+			.query_map(params![root], |r| r.get::<_, Uuid>(ITEMS_UUID))
 			.unwrap()
 			.collect::<Result<_, _>>()
 			.unwrap();

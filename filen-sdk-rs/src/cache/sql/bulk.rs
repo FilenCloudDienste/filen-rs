@@ -32,7 +32,11 @@ use uuid::Uuid;
 
 use crate::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
 
-use super::{CHUNK_SIZE, item::ItemType};
+use super::{
+	CHUNK_SIZE,
+	columns::{ITEMS_ID, ITEMS_UUID},
+	item::ItemType,
+};
 
 // Distinct bind parameters per VALUES row.
 const ITEM_PARAMS_PER_ROW: usize = 5; // uuid, parent, type, root_id, content_hash
@@ -156,7 +160,10 @@ fn file_items_into_map<'a>(
 	let mut map = HashMap::with_capacity(files.len());
 	let mut rows = stmt.raw_query();
 	while let Some(row) = rows.next()? {
-		map.insert(row.get::<_, Uuid>(1)?, row.get::<_, i64>(0)?);
+		map.insert(
+			row.get::<_, Uuid>(ITEMS_UUID)?,
+			row.get::<_, i64>(ITEMS_ID)?,
+		);
 	}
 	Ok(map)
 }
@@ -181,7 +188,10 @@ fn dir_items_into_map<'a>(
 	let mut map = HashMap::with_capacity(dirs.len());
 	let mut rows = stmt.raw_query();
 	while let Some(row) = rows.next()? {
-		map.insert(row.get::<_, Uuid>(1)?, row.get::<_, i64>(0)?);
+		map.insert(
+			row.get::<_, Uuid>(ITEMS_UUID)?,
+			row.get::<_, i64>(ITEMS_ID)?,
+		);
 	}
 	Ok(map)
 }

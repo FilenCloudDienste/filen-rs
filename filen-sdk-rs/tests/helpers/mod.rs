@@ -30,6 +30,38 @@ use filen_types::{
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
 
+/// Result-column names for the ad-hoc SQL these helpers run against the cache DB.
+///
+/// The crate's own `cache::sql::columns` is private, so the integration tests keep their own copy.
+/// Same invariants: every value here is unique, every result set the tests query has unique column
+/// names, and every aggregate/expression column is spelled out with `AS` (SQLite would otherwise
+/// name it after the expression text).
+pub mod columns {
+	pub const ITEMS_PARENT: &str = "parent";
+	pub const ITEMS_TYPE: &str = "type";
+
+	pub const FILES_SIZE: &str = "size";
+	pub const FILES_MIME: &str = "mime";
+
+	pub const DIRS_COLOR: &str = "color";
+
+	// `name`/`favorite` exist on both `files` and `dirs`, so both are always read through an alias.
+	pub const FILE_NAME: &str = "file_name";
+	pub const FILE_FAVORITE: &str = "file_favorite";
+	pub const DIR_NAME: &str = "dir_name";
+
+	pub const SQLITE_MASTER_NAME: &str = "name";
+
+	/// `SELECT COUNT(*) AS count ...`
+	pub const COUNT: &str = "count";
+	/// `SELECT COUNT(*) > 0 AS item_exists ...` — `exists` itself is a SQL keyword.
+	pub const ITEM_EXISTS: &str = "item_exists";
+	/// `SELECT COUNT(*) = 0 AS item_absent ...`
+	pub const ITEM_ABSENT: &str = "item_absent";
+}
+
+pub use columns::*;
+
 /// The cache's worst-case convergence bound under heavy drive-lock contention — a self-heal
 /// resync may need a full patient lock acquisition (~111s) plus a retry cycle before it commits.
 /// NOT the expected duration: the happy path settles in well under a second and a state poll exits
@@ -101,9 +133,9 @@ pub async fn poll_for_item(db_path: &Path, uuid: Uuid, timeout: Duration) -> boo
 		open_read_db(db_path)
 			.and_then(|conn| {
 				conn.query_row(
-					"SELECT COUNT(*) > 0 FROM items WHERE uuid = ?",
+					"SELECT COUNT(*) > 0 AS item_exists FROM items WHERE uuid = ?",
 					params![uuid],
-					|row| row.get(0),
+					|row| row.get(ITEM_EXISTS),
 				)
 			})
 			.unwrap_or(false)
@@ -117,9 +149,9 @@ pub async fn poll_for_item_absent(db_path: &Path, uuid: Uuid, timeout: Duration)
 		open_read_db(db_path)
 			.and_then(|conn| {
 				conn.query_row(
-					"SELECT COUNT(*) = 0 FROM items WHERE uuid = ?",
+					"SELECT COUNT(*) = 0 AS item_absent FROM items WHERE uuid = ?",
 					params![uuid],
-					|row| row.get(0),
+					|row| row.get(ITEM_ABSENT),
 				)
 			})
 			.unwrap_or(false)
@@ -132,11 +164,18 @@ pub async fn poll_for_item_absent(db_path: &Path, uuid: Uuid, timeout: Duration)
 pub fn query_cached_file(db_path: &Path, uuid: Uuid) -> Option<(String, i64, String, Vec<u8>)> {
 	let conn = open_read_db(db_path).ok()?;
 	conn.query_row(
-		"SELECT f.name, f.size, f.mime, i.parent
+		"SELECT f.name AS file_name, f.size, f.mime, i.parent
 		 FROM items i JOIN files f ON f.id = i.id
 		 WHERE i.uuid = ?",
 		params![uuid],
-		|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+		|row| {
+			Ok((
+				row.get(FILE_NAME)?,
+				row.get(FILES_SIZE)?,
+				row.get(FILES_MIME)?,
+				row.get(ITEMS_PARENT)?,
+			))
+		},
 	)
 	.ok()
 }
@@ -145,9 +184,10 @@ pub fn query_cached_file(db_path: &Path, uuid: Uuid) -> Option<(String, i64, Str
 pub fn query_cached_file_favorite(db_path: &Path, uuid: Uuid) -> Option<bool> {
 	let conn = open_read_db(db_path).ok()?;
 	conn.query_row(
-		"SELECT f.favorite FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+		"SELECT f.favorite AS file_favorite FROM items i JOIN files f ON f.id = i.id \
+		 WHERE i.uuid = ?",
 		params![uuid],
-		|row| row.get(0),
+		|row| row.get(FILE_FAVORITE),
 	)
 	.ok()
 }
@@ -157,11 +197,17 @@ pub fn query_cached_file_favorite(db_path: &Path, uuid: Uuid) -> Option<bool> {
 pub fn query_cached_dir(db_path: &Path, uuid: Uuid) -> Option<(String, Option<String>, Vec<u8>)> {
 	let conn = open_read_db(db_path).ok()?;
 	conn.query_row(
-		"SELECT d.name, d.color, i.parent
+		"SELECT d.name AS dir_name, d.color, i.parent
 		 FROM items i JOIN dirs d ON d.id = i.id
 		 WHERE i.uuid = ?",
 		params![uuid],
-		|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+		|row| {
+			Ok((
+				row.get(DIR_NAME)?,
+				row.get(DIRS_COLOR)?,
+				row.get(ITEMS_PARENT)?,
+			))
+		},
 	)
 	.ok()
 }
@@ -225,7 +271,7 @@ pub fn query_item_type(db_path: &Path, uuid: Uuid) -> Option<i8> {
 	conn.query_row(
 		"SELECT type FROM items WHERE uuid = ?",
 		params![uuid],
-		|row| row.get(0),
+		|row| row.get(ITEMS_TYPE),
 	)
 	.ok()
 }
@@ -233,8 +279,8 @@ pub fn query_item_type(db_path: &Path, uuid: Uuid) -> Option<i8> {
 /// Count all items in the cache (including root).
 pub fn count_items(db_path: &Path) -> usize {
 	let conn = open_read_db(db_path).unwrap();
-	conn.query_row("SELECT COUNT(*) FROM items", [], |row| {
-		row.get::<_, usize>(0)
+	conn.query_row("SELECT COUNT(*) AS count FROM items", [], |row| {
+		row.get::<_, usize>(COUNT)
 	})
 	.unwrap()
 }

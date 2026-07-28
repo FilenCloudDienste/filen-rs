@@ -24,7 +24,7 @@ async fn test_cache_init_creates_schema() {
 	let tables: Vec<String> = conn
 		.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
 		.unwrap()
-		.query_map([], |row| row.get(0))
+		.query_map([], |row| row.get(SQLITE_MASTER_NAME))
 		.unwrap()
 		.collect::<Result<_, _>>()
 		.unwrap();
@@ -69,9 +69,10 @@ async fn test_cache_init_inserts_root() {
 	let conn = open_read_db(cache.db_path()).unwrap();
 	let root_exists: bool = conn
 		.query_row(
-			"SELECT COUNT(*) > 0 FROM roots r JOIN items i ON i.id = r.id WHERE i.uuid = ?",
+			"SELECT COUNT(*) > 0 AS item_exists FROM roots r JOIN items i ON i.id = r.id \
+			 WHERE i.uuid = ?",
 			params![root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEM_EXISTS),
 		)
 		.unwrap();
 	assert!(root_exists, "root should exist in roots table");
@@ -420,9 +421,9 @@ async fn test_cache_shutdown_on_drop() {
 	let root_uuid: Uuid = client.root().uuid();
 	let root_exists: bool = conn
 		.query_row(
-			"SELECT COUNT(*) > 0 FROM items WHERE uuid = ? AND type = 0",
+			"SELECT COUNT(*) > 0 AS item_exists FROM items WHERE uuid = ? AND type = 0",
 			params![root_uuid],
-			|row| row.get(0),
+			|row| row.get(ITEM_EXISTS),
 		)
 		.unwrap();
 	assert!(
