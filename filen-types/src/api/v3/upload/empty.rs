@@ -3,7 +3,11 @@ use std::borrow::Cow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{auth::FileEncryptionVersion, crypto::EncryptedString, fs::Uuid};
+use crate::{
+	auth::FileEncryptionVersion,
+	crypto::EncryptedString,
+	fs::{StableUuid, Uuid},
+};
 
 pub const ENDPOINT: &str = "v3/upload/empty";
 
@@ -23,6 +27,11 @@ pub struct Request<'a> {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
+	pub uuid: Uuid,
+	/// Whole-life file id, server-minted. Equal to `uuid` when the upload
+	/// created a new file; different when the upload edited an existing one.
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]
 	pub chunks: u64,
 	#[serde(with = "crate::serde::number::permissive_u64")]

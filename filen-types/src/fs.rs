@@ -9,6 +9,8 @@ pub use uuid::UuidStr;
 
 pub use ::uuid::Uuid;
 
+pub use crate::stable_uuid::StableUuid;
+
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(

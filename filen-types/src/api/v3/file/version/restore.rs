@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
-	fs::{ParentUuid, Uuid},
+	fs::{ParentUuid, StableUuid, Uuid},
 };
 
 pub const ENDPOINT: &str = "v3/file/version/restore";
@@ -24,6 +24,8 @@ pub struct Response<'a> {
 	pub uuid: Uuid,
 	#[serde(rename = "currentUUID")]
 	pub current_uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	pub metadata: EncryptedString<'a>,
 	pub bucket: Cow<'a, str>,
 	pub region: Cow<'a, str>,

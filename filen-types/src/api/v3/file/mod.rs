@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
-	fs::{ParentUuid, Uuid},
+	fs::{ParentUuid, StableUuid, Uuid},
 };
 
 pub const ENDPOINT: &str = "v3/file";
@@ -31,6 +31,10 @@ pub struct Request {
 #[serde(rename_all = "camelCase")]
 pub struct Response<'a> {
 	pub uuid: Uuid,
+	/// Whole-life file id. For a superseded (archived) `uuid`, this is the
+	/// lineage's stable id resolved from the live head.
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	pub region: Cow<'a, str>,
 	pub bucket: Cow<'a, str>,
 	pub name_encrypted: EncryptedString<'a>,

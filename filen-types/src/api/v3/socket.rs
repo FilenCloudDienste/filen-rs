@@ -19,7 +19,7 @@ use crate::{
 	},
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::{ObjectType, ParentUuid, Uuid},
+	fs::{ObjectType, ParentUuid, StableUuid, Uuid},
 	serde::cow::CowStrWrapper,
 	traits::CowHelpers,
 };
@@ -652,6 +652,8 @@ pub struct NewEvent<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct FileRename<'a> {
 	pub uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 }
@@ -661,6 +663,8 @@ pub struct FileRename<'a> {
 pub struct FileArchiveRestored<'a> {
 	#[serde(rename = "currentUUID")]
 	pub current_uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	pub parent: ParentUuid,
 	pub uuid: Uuid,
 	#[serde(borrow)]
@@ -687,6 +691,8 @@ pub struct FileArchiveRestored<'a> {
 pub struct FileNew<'a> {
 	pub parent: ParentUuid,
 	pub uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	// #[serde(borrow)]
@@ -711,6 +717,10 @@ pub struct FileNew<'a> {
 pub struct FileRestore<'a> {
 	pub parent: ParentUuid,
 	pub uuid: Uuid,
+	/// Freshly minted when the restored row was an archived version (raw-API
+	/// edge case) — treat that as a brand-new file.
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	// #[serde(borrow)]
@@ -735,6 +745,8 @@ pub struct FileRestore<'a> {
 pub struct FileMove<'a> {
 	pub parent: ParentUuid,
 	pub uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	#[serde(borrow)]
 	pub metadata: EncryptedString<'a>,
 	// #[serde(borrow)]
@@ -768,6 +780,13 @@ pub struct FileMove<'a> {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileTrash {
 	pub uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
+	/// Present iff `uuid` was trashed AND superseded by `new_uuid` — an edit on
+	/// a versioning-disabled account, NOT a user trash action. Never mark the
+	/// file trashed when this is set.
+	#[serde(rename = "newUUID")]
+	pub new_uuid: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -784,6 +803,14 @@ pub struct FileTrash {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileArchived {
 	pub uuid: Uuid,
+	/// The lineage's stable id on a normal edit; on move-with-replace this is
+	/// the REPLACED file's retired stable id (and `new_uuid` is absent) — the
+	/// only signal that lineage is gone forever.
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
+	/// Present iff `uuid` was superseded by `new_uuid` (a normal content edit).
+	#[serde(rename = "newUUID")]
+	pub new_uuid: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
@@ -1178,6 +1205,9 @@ pub struct ContactRequestReceived<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct ItemFavorite<'a> {
 	pub uuid: Uuid,
+	/// File payloads only — directories never carry a stable id on the wire.
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: Option<StableUuid>,
 	#[serde(rename = "type")]
 	pub item_type: ObjectType,
 	#[serde(deserialize_with = "crate::serde::boolean::number::deserialize")]
@@ -1237,6 +1267,10 @@ pub struct ChatConversationParticipantNew<'a> {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct FileDeletedPermanent {
 	pub uuid: Uuid,
+	/// Present only when the whole file (live head + history) died. Absent for
+	/// archived-version-only deletes — never treat the file as gone then.
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: Option<StableUuid>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, CowHelpers)]
@@ -1251,6 +1285,8 @@ pub struct FolderMetadataChanged<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadataChanged<'a> {
 	pub uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	#[serde(borrow)]
 	pub name: EncryptedString<'a>,
 	#[serde(borrow)]
@@ -1306,7 +1342,7 @@ mod tests {
 
 	#[test]
 	fn deserialize_drive_event() {
-		let json = r#"["file-new",{"driveMessageId":42,"parent":"00000000-0000-0000-0000-000000000000","uuid":"11111111-1111-1111-1111-111111111111","metadata":"encrypted","timestamp":1700000,"chunks":1,"size":100,"bucket":"b","region":"r","version":2,"favorited":0}]"#;
+		let json = r#"["file-new",{"driveMessageId":42,"parent":"00000000-0000-0000-0000-000000000000","uuid":"11111111-1111-1111-1111-111111111111","stableUUID":"11111111-1111-1111-1111-111111111111","metadata":"encrypted","timestamp":1700000,"chunks":1,"size":100,"bucket":"b","region":"r","version":2,"favorited":0}]"#;
 		let event: SocketEvent = serde_json::from_str(json).unwrap();
 		assert!(matches!(
 			event,
@@ -1315,6 +1351,91 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[test]
+	fn deserialize_file_versioned_edit_carries_stable_and_new_uuid() {
+		// Normal content edit: stableUUID identifies the lineage, newUUID the
+		// re-minted current version.
+		let json = r#"["file-versioned",{"driveMessageId":43,"uuid":"11111111-1111-1111-1111-111111111111","stableUUID":"22222222-2222-2222-2222-222222222222","newUUID":"33333333-3333-3333-3333-333333333333"}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		let SocketEvent::Drive {
+			inner: DriveEventType::FileArchived(archived),
+			..
+		} = event
+		else {
+			panic!("expected FileArchived event, got {event:?}");
+		};
+		assert_eq!(
+			archived.stable_uuid,
+			Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()
+		);
+		assert_eq!(
+			archived.new_uuid,
+			Some(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap())
+		);
+	}
+
+	#[test]
+	fn deserialize_file_versioned_replace_has_no_new_uuid() {
+		// Move-with-replace: the replaced file's retired stable, no newUUID —
+		// the only signal that lineage is gone forever.
+		let json = r#"["file-versioned",{"driveMessageId":44,"uuid":"11111111-1111-1111-1111-111111111111","stableUUID":"22222222-2222-2222-2222-222222222222"}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		let SocketEvent::Drive {
+			inner: DriveEventType::FileArchived(archived),
+			..
+		} = event
+		else {
+			panic!("expected FileArchived event, got {event:?}");
+		};
+		assert_eq!(archived.new_uuid, None);
+	}
+
+	#[test]
+	fn deserialize_file_trash_with_new_uuid_is_an_edit() {
+		// Versioning-disabled edit: old uuid trashed AND superseded — not a
+		// user trash action.
+		let json = r#"["file-trash",{"driveMessageId":45,"uuid":"11111111-1111-1111-1111-111111111111","stableUUID":"22222222-2222-2222-2222-222222222222","newUUID":"33333333-3333-3333-3333-333333333333"}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		let SocketEvent::Drive {
+			inner: DriveEventType::FileTrash(trash),
+			..
+		} = event
+		else {
+			panic!("expected FileTrash event, got {event:?}");
+		};
+		assert!(trash.new_uuid.is_some());
+	}
+
+	#[test]
+	fn deserialize_file_deleted_permanent_without_stable_is_version_only() {
+		// Archived-version-only delete: no stableUUID — the file itself lives.
+		let json = r#"["file-deleted-permanent",{"driveMessageId":46,"uuid":"11111111-1111-1111-1111-111111111111"}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		let SocketEvent::Drive {
+			inner: DriveEventType::FileDeletedPermanent(deleted),
+			..
+		} = event
+		else {
+			panic!("expected FileDeletedPermanent event, got {event:?}");
+		};
+		assert_eq!(deleted.stable_uuid, None);
+	}
+
+	#[test]
+	fn deserialize_item_favorite_folder_has_no_stable_uuid() {
+		// Directories never carry a stable id on the wire.
+		let json = r#"["item-favorite",{"driveMessageId":47,"uuid":"11111111-1111-1111-1111-111111111111","type":"folder","value":1,"parent":"00000000-0000-0000-0000-000000000000","metadata":null,"nameEncrypted":null,"region":null,"bucket":null,"timestamp":1700000,"color":null,"version":null}]"#;
+		let event: SocketEvent = serde_json::from_str(json).unwrap();
+		let SocketEvent::Drive {
+			inner: DriveEventType::ItemFavorite(favorite),
+			..
+		} = event
+		else {
+			panic!("expected ItemFavorite event, got {event:?}");
+		};
+		assert_eq!(favorite.stable_uuid, None);
 	}
 
 	#[test]

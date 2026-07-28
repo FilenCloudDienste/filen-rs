@@ -7,7 +7,7 @@ use crate::{
 	api::v3::dir::color::DirColor,
 	auth::FileEncryptionVersion,
 	crypto::EncryptedString,
-	fs::{ParentUuid, Uuid},
+	fs::{ParentUuid, StableUuid, Uuid},
 };
 
 pub const ENDPOINT: &str = "v3/dir/content";
@@ -31,6 +31,8 @@ pub struct Response<'a> {
 #[serde(rename_all = "camelCase")]
 pub struct File<'a> {
 	pub uuid: Uuid,
+	#[serde(rename = "stableUUID")]
+	pub stable_uuid: StableUuid,
 	pub metadata: EncryptedString<'a>,
 	pub rm: Cow<'a, str>,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]

@@ -7,6 +7,7 @@ pub mod error;
 pub mod fs;
 pub mod rkyv;
 pub mod serde;
+mod stable_uuid;
 pub mod traits;
 #[cfg(feature = "uniffi")]
 pub mod uniffi_impls;
