@@ -39,6 +39,8 @@ pub(crate) fn select_recents(order_by: Option<&str>) -> String {
 
 // Item
 pub(crate) const SELECT_ITEM_BY_UUID: &str = include_str!("../../sql/select_item.sql");
+pub(crate) const SELECT_ITEM_BY_STABLE_UUID: &str =
+	include_str!("../../sql/select_item_by_stable_uuid.sql");
 
 // File
 pub(crate) const SELECT_FILE: &str = include_str!("../../sql/select_file.sql");
@@ -72,7 +74,7 @@ pub(crate) fn select_trash_children(order_by: Option<&str>) -> String {
 pub(crate) const SELECT_ROOT: &str = include_str!("../../sql/select_root.sql");
 pub(crate) const UPSERT_ROOT_EMPTY: &str = include_str!("../../sql/upsert_root_empty.sql");
 pub(crate) const INSERT_ROOT_INTO_ITEMS: &str =
-	"INSERT INTO items (uuid, parent, type) VALUES (?, NULL, ?) RETURNING id;";
+	"INSERT INTO items (uuid, stable_uuid, parent, type) VALUES (?1, ?1, NULL, ?2) RETURNING id;";
 pub(crate) const INSERT_ROOT_INTO_ROOTS: &str = "INSERT INTO roots (id) VALUES (?);";
 pub(crate) const INSERT_ROOT_INTO_DIRS: &str =
 	"INSERT INTO dirs (id, metadata_state, timestamp, raw_metadata) VALUES (?, 1, 0, '');";

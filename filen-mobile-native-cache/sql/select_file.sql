@@ -2,6 +2,8 @@
 -- `DBFile::from_inner_and_row` reads the same names whichever query produced
 -- the row.
 SELECT
+	items.stable_uuid,
+	items.pending_upload_at,
 	files.size,
 	files.chunks,
 	files.favorite_rank AS file_favorite_rank,
@@ -17,5 +19,7 @@ SELECT
 	files_meta.created AS file_created,
 	files_meta.modified,
 	files_meta.hash
-FROM files LEFT JOIN files_meta ON files.id = files_meta.id
+FROM files
+INNER JOIN items ON files.id = items.id
+LEFT JOIN files_meta ON files.id = files_meta.id
 WHERE files.id = ?;

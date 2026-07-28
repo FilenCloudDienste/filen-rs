@@ -37,7 +37,9 @@ pub const DB_FILE_NAME: &str = "native_cache.db";
 // 1 - initial version, changed how files as stored in cache from flat to per-file directories
 // 2 - store uuid/parent as BLOB, add `trashed` flag (trashed items keep their original parent);
 //     dropped the synthetic 'trash' row
-const CACHE_VERSION: u64 = 2;
+// 3 - add `items.stable_uuid` (server-minted whole-life file id; stable ≡ uuid for dirs/roots).
+//     The wipe-and-resync reinit repopulates it from directory listings.
+const CACHE_VERSION: u64 = 3;
 
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,

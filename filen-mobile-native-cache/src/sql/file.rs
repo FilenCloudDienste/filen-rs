@@ -15,7 +15,7 @@ use filen_sdk_rs::{
 use filen_types::{
 	auth::FileEncryptionVersion,
 	crypto::{EncryptedString, rsa::RSAEncryptedString},
-	fs::{ParentUuid, Uuid},
+	fs::{ParentUuid, StableUuid, Uuid},
 	traits::CowHelpers,
 };
 use rusqlite::{CachedStatement, Connection, Result};
@@ -28,7 +28,8 @@ use crate::{
 		columns::{
 			FILE_CREATED, FILE_FAVORITE_RANK, FILE_METADATA_STATE, FILE_NAME, FILE_RAW_METADATA,
 			FILE_TIMESTAMP, FILES_BUCKET, FILES_CHUNKS, FILES_HASH, FILES_KEY, FILES_KEY_VERSION,
-			FILES_MIME, FILES_MODIFIED, FILES_REGION, FILES_SIZE,
+			FILES_MIME, FILES_MODIFIED, FILES_REGION, FILES_SIZE, ITEMS_PENDING_UPLOAD_AT,
+			ITEMS_STABLE_UUID,
 		},
 		item::{self, DBItemTrait, InnerDBItem},
 		object::{DBObject, JsonObject},
@@ -168,6 +169,11 @@ impl From<FileMeta<'_>> for DBFileMeta {
 pub struct DBFile {
 	pub(crate) id: i64,
 	pub(crate) uuid: Uuid,
+	/// Server-minted whole-life id — survives content edits and version
+	/// restores, unlike `uuid`. This is the identity exposed over FFI. Every
+	/// query that builds a `DBFile` selects `items.stable_uuid`, which the
+	/// `items` CHECK guarantees is non-NULL for a file row.
+	pub(crate) stable_uuid: StableUuid,
 	pub(crate) parent: ParentUuid,
 	pub(crate) size: i64,
 	pub(crate) chunks: i64,
@@ -176,6 +182,9 @@ pub struct DBFile {
 	pub(crate) bucket: String,
 	pub(crate) timestamp: i64,
 	pub(crate) local_data: Option<JsonObject>,
+	/// Millis at which a local edit was marked as not yet on the server, or
+	/// `None` when nothing is outstanding.
+	pub(crate) pending_upload_at: Option<i64>,
 	pub(crate) meta: DBFileMeta,
 }
 
@@ -184,6 +193,7 @@ impl std::fmt::Debug for DBFile {
 		f.debug_struct("DBFile")
 			.field("id", &self.id)
 			.field("uuid", &self.uuid)
+			.field("stable_uuid", &self.stable_uuid)
 			.field("parent", &self.parent)
 			.field("size", &self.size)
 			.field("chunks", &self.chunks)
@@ -200,6 +210,7 @@ impl DBFile {
 		Ok(Self {
 			id: item.id,
 			uuid: item.uuid,
+			stable_uuid: row.get(ITEMS_STABLE_UUID)?,
 			parent: item.parent.ok_or_else(|| {
 				rusqlite::Error::FromSqlConversionFailure(
 					0,
@@ -208,6 +219,7 @@ impl DBFile {
 				)
 			})?,
 			local_data: item.local_data,
+			pending_upload_at: row.get(ITEMS_PENDING_UPLOAD_AT)?,
 			size: row.get(FILES_SIZE)?,
 			chunks: row.get(FILES_CHUNKS)?,
 			favorite_rank: row.get(FILE_FAVORITE_RANK)?,
@@ -238,12 +250,12 @@ impl DBFile {
 		delete_file_meta: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		trace!("Upserting remote file: {remote_file:?}");
-		let (id, local_data) = item::upsert_item_with_stmts(
+		let (id, local_data, pending_upload_at) = item::upsert_file_item_with_stmts(
 			remote_file.uuid(),
+			remote_file.stable_uuid(),
 			Some(*remote_file.parent()),
 			remote_file.name(),
 			None,
-			ItemType::File,
 			upsert_item_stmt,
 		)?;
 		trace!(
@@ -286,6 +298,7 @@ impl DBFile {
 		Ok(Self {
 			id,
 			uuid: remote_file.uuid,
+			stable_uuid: remote_file.stable_uuid,
 			parent: remote_file.parent,
 			size: remote_file.size as i64,
 			chunks: remote_file.chunks as i64,
@@ -294,6 +307,7 @@ impl DBFile {
 			bucket: remote_file.bucket,
 			timestamp: remote_file.timestamp.timestamp_millis(),
 			local_data,
+			pending_upload_at,
 			meta: remote_file.meta.into(),
 		})
 	}
@@ -363,9 +377,7 @@ impl TryFrom<DBFile> for RemoteFile {
 	fn try_from(value: DBFile) -> Result<Self, Self::Error> {
 		Ok(RemoteFile {
 			uuid: value.uuid,
-			// TODO(stable-uuid): read from the stable_uuid column once the
-			// cache schema stores it; until then keep uuid-as-identity.
-			stable_uuid: value.uuid,
+			stable_uuid: value.stable_uuid,
 			parent: value.parent,
 			size: value.size as u64,
 			chunks: value.chunks as u64,
@@ -402,6 +414,7 @@ impl TryFrom<DBFile> for RemoteFile {
 impl PartialEq<RemoteFile> for DBFile {
 	fn eq(&self, other: &RemoteFile) -> bool {
 		self.uuid == other.uuid()
+			&& self.stable_uuid == other.stable_uuid()
 			&& self.parent == *other.parent()
 			&& self.size as u64 == other.size()
 			&& self.chunks as u64 == other.chunks()

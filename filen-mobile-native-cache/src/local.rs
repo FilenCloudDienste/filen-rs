@@ -1,7 +1,7 @@
-use std::{collections::HashMap, str::FromStr, time::Instant};
+use std::{borrow::Cow, collections::HashMap, str::FromStr, time::Instant};
 
 use filen_sdk_rs::fs::HasUUID;
-use filen_types::fs::Uuid;
+use filen_types::fs::{ParentUuid, Uuid};
 use rusqlite::OptionalExtension;
 use tracing::debug;
 
@@ -12,6 +12,7 @@ use crate::{
 	sql::{
 		self, DBDirExt, DBDirObject, DBItemTrait, DBRoot,
 		error::OptionalExtensionSQL,
+		item::RawDBItem,
 		json_object::JsonObject,
 		object::{DBNonRootObject, DBObject},
 	},
@@ -112,6 +113,7 @@ impl AuthCacheState {
 		path: &FfiId,
 		order_by: Option<String>,
 	) -> Result<Option<QueryChildrenResponse>, CacheError> {
+		let path = self.canonicalize_id(path)?;
 		let path_id = path.as_path()?;
 		debug!("Querying directory children at path: {}", path.0);
 
@@ -158,8 +160,57 @@ impl AuthCacheState {
 		})
 	}
 
+	/// Resolves the `stable/<id>` namespace to the canonical id form the rest
+	/// of the cache understands (a display-name path, `trash/<uuid>`, or the
+	/// bare root uuid); every other id form passes through unchanged. The
+	/// value after `stable/` is matched against `stable_uuid` first and falls
+	/// back to a current-version `uuid` match, so ids persisted before the
+	/// stable-id migration keep resolving while the cache knows the row.
+	pub(crate) fn canonicalize_id<'a>(&self, id: &'a FfiId) -> Result<Cow<'a, FfiId>, CacheError> {
+		let Some(rest) = id.0.strip_prefix("stable/") else {
+			return Ok(Cow::Borrowed(id));
+		};
+		let stable_uuid = Uuid::from_str(rest)
+			.map_err(|e| CacheError::conversion(format!("Invalid stable id {rest}: {e}")))?;
+		let conn = self.conn();
+		let item = match RawDBItem::select_by_stable(&conn, stable_uuid)? {
+			Some(item) => item,
+			None => RawDBItem::select(&conn, stable_uuid)?.ok_or_else(|| {
+				CacheError::DoesNotExist(format!("No item for stable id: {rest}").into())
+			})?,
+		};
+		match item.parent {
+			None => Ok(Cow::Owned(FfiId(item.uuid.to_string()))),
+			Some(ParentUuid::Trash(_)) => Ok(Cow::Owned(FfiId(format!("trash/{}", item.uuid)))),
+			Some(_) => {
+				let path =
+					sql::recursive_select_path_from_uuid(&conn, item.uuid)?.ok_or_else(|| {
+						CacheError::DoesNotExist(format!("No path for stable id: {rest}").into())
+					})?;
+				Ok(Cow::Owned(FfiId(path)))
+			}
+		}
+	}
+
+	/// Resolves an FFI-provided uuid string to the row's CURRENT uuid: an
+	/// exact uuid match wins, otherwise the value is treated as a stable id.
+	/// Falls through to the parsed value when no row matches, letting the
+	/// caller produce its own not-found handling.
+	pub(crate) fn resolve_uuid_or_stable(&self, s: &str) -> Result<Uuid, CacheError> {
+		let uuid = Uuid::from_str(s)?;
+		let conn = self.conn();
+		if RawDBItem::select(&conn, uuid)?.is_some() {
+			return Ok(uuid);
+		}
+		if let Some(item) = RawDBItem::select_by_stable(&conn, uuid)? {
+			return Ok(item.uuid);
+		}
+		Ok(uuid)
+	}
+
 	pub(crate) fn query_item(&self, path: &FfiId) -> Result<Option<FfiObject>, CacheError> {
 		debug!("Querying item at path: {}", path.0);
+		let path = self.canonicalize_id(path)?;
 		let path_values = path.as_parsed()?;
 		let obj = sql::select_object_at_parsed_id(&self.conn(), &path_values)?;
 
@@ -191,7 +242,7 @@ impl AuthCacheState {
 
 	pub(crate) fn query_item_by_uuid(&self, uuid: &str) -> Result<Option<FfiObject>, CacheError> {
 		debug!("Querying item by UUID: {uuid}");
-		let uuid = Uuid::from_str(uuid)?;
+		let uuid = self.resolve_uuid_or_stable(uuid)?;
 		Ok(DBObject::select(&self.conn(), uuid)
 			.optional()?
 			.map(Into::into))
@@ -202,7 +253,7 @@ impl AuthCacheState {
 		if uuid == self.client.root().uuid().to_string() {
 			return Ok(Some(uuid.into()));
 		}
-		let uuid = Uuid::from_str(&uuid)?;
+		let uuid = self.resolve_uuid_or_stable(&uuid)?;
 		let conn = self.conn();
 		let path = sql::recursive_select_path_from_uuid(&conn, uuid)?;
 
@@ -211,6 +262,7 @@ impl AuthCacheState {
 
 	pub(crate) fn get_all_descendant_paths(&self, path: &FfiId) -> Result<Vec<FfiId>, CacheError> {
 		debug!("Getting all descendant paths for: {}", path.0);
+		let path = self.canonicalize_id(path)?;
 		let path_values = path.as_path()?;
 		let obj = sql::select_object_at_path(&self.conn(), &path_values)?;
 		Ok(match obj {
@@ -228,7 +280,7 @@ impl AuthCacheState {
 		local_data: HashMap<String, String>,
 	) -> Result<(), CacheError> {
 		debug!("Setting local data for UUID: {uuid} to {local_data:?}");
-		let uuid = Uuid::from_str(uuid)?;
+		let uuid = self.resolve_uuid_or_stable(uuid)?;
 		let mut conn = self.conn();
 		sql::update_local_data(&mut conn, uuid, Some(&JsonObject::new(local_data)))?;
 		Ok(())
@@ -245,6 +297,7 @@ impl AuthCacheState {
 			path.0
 		);
 
+		let path = self.canonicalize_id(&path)?;
 		let path_values = path.as_path()?;
 		let mut obj = match sql::select_object_at_path(&self.conn(), &path_values)? {
 			Some(DBObject::Dir(dir)) => DBNonRootObject::Dir(dir),

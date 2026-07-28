@@ -25,7 +25,15 @@ pub struct FfiFileMeta {
 #[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
 pub struct FfiFile {
 	// item
+	/// Identifies the file's CURRENT VERSION. The server re-mints it on every
+	/// content edit and version restore — never persist it as the file's
+	/// identity; persist [`FfiFile::stable_uuid`] instead.
 	pub uuid: String,
+	/// Server-minted whole-life file id: survives content edits, version
+	/// restores, moves, renames and trash round-trips. THIS is the identity
+	/// for providers to persist. Any file operation accepts it via the
+	/// `stable/<stable_uuid>` id form (see [`FfiId`]).
+	pub stable_uuid: String,
 	pub parent: String,
 	/// For a trashed item, the UUID of the parent it will be restored to. `None` otherwise.
 	pub original_parent: Option<String>,
@@ -36,17 +44,25 @@ pub struct FfiFile {
 	pub favorite_rank: i64,
 
 	pub local_data: Option<HashMap<String, String>>,
+	/// Millis at which a local edit of this file was marked as not yet on the
+	/// server, or `None` when nothing is outstanding. Written and cleared by
+	/// the cache alone — [`FfiFile::local_data`] is the app's, this is not in
+	/// it. Non-`None` means the bytes on the device are ahead of the server's
+	/// and are waiting on a drain.
+	pub pending_upload_at: Option<i64>,
 }
 
 impl From<DBFile> for FfiFile {
 	fn from(file: DBFile) -> Self {
 		FfiFile {
 			uuid: file.uuid.to_string(),
+			stable_uuid: file.stable_uuid.to_string(),
 			parent: file.parent.to_string(),
 			original_parent: file.parent.original_parent().map(|u| u.to_string()),
 			size: file.size,
 			favorite_rank: file.favorite_rank,
 			local_data: file.local_data.map(|o| o.to_map()),
+			pending_upload_at: file.pending_upload_at,
 			meta: match file.meta {
 				DBFileMeta::Decoded(meta) => Some(FfiFileMeta {
 					name: meta.name.to_string(),
@@ -179,6 +195,16 @@ impl From<DBNonRootObject> for FfiNonRootObject {
 	}
 }
 
+/// An item id as passed over the FFI. Four namespaces:
+/// - `<root-uuid>/<name>/.../<name>` — a display-name path from the root down
+/// - `trash/<uuid>` — a trashed item
+/// - `recents/<uuid>` — an item in the recents listing
+/// - `stable/<id>` — an item addressed by its persistent identity. For a file
+///   that is [`FfiFile::stable_uuid`]; only files have one. A dir or root has
+///   no stable id because the server never re-mints its `uuid`, so its `uuid`
+///   already is its whole-life identity and is what goes here. A file `uuid`
+///   persisted before the stable-id migration also still resolves, as long as
+///   the cache knows the row. Resolved internally to the item's current row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FfiId(pub String);
 

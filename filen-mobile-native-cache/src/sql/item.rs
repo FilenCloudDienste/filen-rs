@@ -1,9 +1,9 @@
 use std::fmt::Debug;
 
-use filen_types::fs::{ParentUuid, Uuid};
+use filen_types::fs::{ParentUuid, StableUuid, Uuid};
 use rusqlite::{
 	CachedStatement, Connection, OptionalExtension, Result, ToSql,
-	types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
+	types::{FromSql, FromSqlError, FromSqlResult, Null, ValueRef},
 };
 use tracing::trace;
 
@@ -11,7 +11,8 @@ use crate::{
 	ffi::ItemType,
 	sql::{
 		columns::{
-			ITEMS_ID, ITEMS_LOCAL_DATA, ITEMS_PARENT, ITEMS_TRASHED, ITEMS_TYPE, ITEMS_UUID,
+			ITEMS_ID, ITEMS_LOCAL_DATA, ITEMS_PARENT, ITEMS_PENDING_UPLOAD_AT, ITEMS_TRASHED,
+			ITEMS_TYPE, ITEMS_UUID,
 		},
 		dir::{DBDir, DBRoot},
 		file::DBFile,
@@ -77,34 +78,96 @@ pub struct RawDBItem {
 	pub(crate) type_: ItemType,
 }
 
-pub(crate) fn upsert_item_with_stmts(
+/// Binds the shared `items` upsert.
+///
+/// `stable` is a file's server-minted whole-life id, or SQL [`Null`] for a dir
+/// or root — the server never re-mints those, so their `uuid` already is their
+/// whole-life id. The `items` CHECK enforces exactly that split, and this
+/// parameter is private so the column can only be written through the
+/// type-specific wrappers below.
+///
+/// Returns the resolved row's id, the `local_data` it ended up holding, and the
+/// pending-upload marker it was already carrying — the statement never writes
+/// that column, so this is a read-back of what the upsert left alone.
+#[allow(clippy::too_many_arguments)]
+fn upsert_item_with_stmts(
 	uuid: Uuid,
+	stable: impl ToSql,
 	parent: Option<ParentUuid>,
 	name: Option<&str>,
 	local_data: Option<JsonObject>,
 	type_: ItemType,
 	upsert_item_stmt: &mut CachedStatement<'_>,
-) -> Result<(i64, Option<JsonObject>)> {
+) -> Result<(i64, Option<JsonObject>, Option<i64>)> {
 	trace!("Upserting item: uuid = {uuid}, parent = {parent:?}, name = {name:?}, type = {type_:?}");
 	let (parent_uuid, trashed) = decompose_parent(parent);
-	let (id, local_data) = upsert_item_stmt.query_row(
-		(uuid, parent_uuid, name, local_data, type_, trashed),
-		|row| Ok((row.get(ITEMS_ID)?, row.get(ITEMS_LOCAL_DATA)?)),
+	let (id, local_data, pending_upload_at) = upsert_item_stmt.query_row(
+		(uuid, parent_uuid, name, local_data, type_, trashed, stable),
+		|row| {
+			Ok((
+				row.get(ITEMS_ID)?,
+				row.get(ITEMS_LOCAL_DATA)?,
+				row.get(ITEMS_PENDING_UPLOAD_AT)?,
+			))
+		},
 	)?;
 	trace!("Upserted item with id: {id}");
-	Ok((id, local_data))
+	Ok((id, local_data, pending_upload_at))
 }
 
-pub(crate) fn upsert_item(
-	conn: &Connection,
+pub(crate) fn upsert_file_item_with_stmts(
+	uuid: Uuid,
+	stable_uuid: StableUuid,
+	parent: Option<ParentUuid>,
+	name: Option<&str>,
+	local_data: Option<JsonObject>,
+	upsert_item_stmt: &mut CachedStatement<'_>,
+) -> Result<(i64, Option<JsonObject>, Option<i64>)> {
+	upsert_item_with_stmts(
+		uuid,
+		stable_uuid,
+		parent,
+		name,
+		local_data,
+		ItemType::File,
+		upsert_item_stmt,
+	)
+}
+
+/// Dirs never carry a pending-upload marker (the `items` CHECK says so), so the
+/// third element is dropped here rather than handed to callers that cannot use it.
+pub(crate) fn upsert_dir_item_with_stmts(
 	uuid: Uuid,
 	parent: Option<ParentUuid>,
 	name: Option<&str>,
 	local_data: Option<JsonObject>,
-	type_: ItemType,
+	upsert_item_stmt: &mut CachedStatement<'_>,
 ) -> Result<(i64, Option<JsonObject>)> {
+	upsert_item_with_stmts(
+		uuid,
+		Null,
+		parent,
+		name,
+		local_data,
+		ItemType::Dir,
+		upsert_item_stmt,
+	)
+	.map(|(id, local_data, _)| (id, local_data))
+}
+
+/// The root has no parent, no name, no local data and no stable id.
+pub(crate) fn upsert_root_item(conn: &Connection, uuid: Uuid) -> Result<i64> {
 	let mut upsert_item_stmt = conn.prepare_cached(UPSERT_ITEM)?;
-	upsert_item_with_stmts(uuid, parent, name, local_data, type_, &mut upsert_item_stmt)
+	upsert_item_with_stmts(
+		uuid,
+		Null,
+		None,
+		None,
+		None,
+		ItemType::Root,
+		&mut upsert_item_stmt,
+	)
+	.map(|(id, _, _)| id)
 }
 
 impl RawDBItem {
@@ -123,6 +186,14 @@ impl RawDBItem {
 	pub(crate) fn select(conn: &Connection, uuid: Uuid) -> Result<Option<Self>> {
 		let mut stmt = conn.prepare_cached(SELECT_ITEM_BY_UUID)?;
 		stmt.query_one([uuid], Self::from_row).optional()
+	}
+
+	/// Select by the server-minted whole-life id. Only files carry one, so this
+	/// can only ever match a file row. Prefers the untrashed row when duplicate
+	/// stables exist (reachable only via same-account uuid-reuse abuse).
+	pub(crate) fn select_by_stable(conn: &Connection, stable_uuid: Uuid) -> Result<Option<Self>> {
+		let mut stmt = conn.prepare_cached(SELECT_ITEM_BY_STABLE_UUID)?;
+		stmt.query_one([stable_uuid], Self::from_row).optional()
 	}
 
 	pub(crate) fn into_db_object(self, conn: &Connection) -> Result<DBObject> {

@@ -23,10 +23,14 @@
 
 pub(crate) const ITEMS_ID: &str = "id";
 pub(crate) const ITEMS_UUID: &str = "uuid";
+/// Server-minted whole-life id, constant across the content edits that re-mint `uuid`.
+pub(crate) const ITEMS_STABLE_UUID: &str = "stable_uuid";
 pub(crate) const ITEMS_PARENT: &str = "parent";
 pub(crate) const ITEMS_TRASHED: &str = "trashed";
 pub(crate) const ITEMS_LOCAL_DATA: &str = "local_data";
 pub(crate) const ITEMS_TYPE: &str = "type";
+/// Millis a local edit was marked as not yet on the server; NULL when nothing is outstanding.
+pub(crate) const ITEMS_PENDING_UPLOAD_AT: &str = "pending_upload_at";
 
 // -- `dirs` / `dirs_meta` ------------------------------------------------------------------------
 //

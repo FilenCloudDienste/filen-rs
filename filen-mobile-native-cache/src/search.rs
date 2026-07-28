@@ -288,6 +288,7 @@ fn ffi_object(result: SearchResult) -> FfiNonRootObject {
 fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 	FfiFile {
 		uuid: file.uuid.to_string(),
+		stable_uuid: file.stable_uuid.to_string(),
 		parent: file.parent.to_string(),
 		// Search only indexes live items, never trashed ones, so there is no original parent.
 		original_parent: None,
@@ -305,6 +306,8 @@ fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 		favorite_rank: i64::from(file.favorited),
 		// Search results carry no per-device local data; the browsing cache owns that.
 		local_data: None,
+		// Same: outstanding local edits are the browsing cache's business.
+		pending_upload_at: None,
 	}
 }
 

@@ -169,12 +169,11 @@ impl DBDir {
 		upsert_dir_meta: &mut CachedStatement<'_>,
 		delete_dir_meta: &mut CachedStatement<'_>,
 	) -> Result<Self> {
-		let (id, local_data) = item::upsert_item_with_stmts(
+		let (id, local_data) = item::upsert_dir_item_with_stmts(
 			remote_dir.uuid(),
 			Some(*remote_dir.parent()),
 			remote_dir.name(),
 			None,
-			ItemType::Dir,
 			upsert_item_stmt,
 		)?;
 		trace!("Upserting remote dir: {remote_dir:?}");
@@ -377,14 +376,7 @@ impl DBRoot {
 	) -> Result<Self> {
 		trace!("Upserting remote root: {remote_root:?}");
 		let tx = conn.transaction()?;
-		let (id, _) = item::upsert_item(
-			&tx,
-			remote_root.uuid(),
-			None, // root has no parent
-			None, // root has no name
-			None,
-			ItemType::Root,
-		)?;
+		let id = item::upsert_root_item(&tx, remote_root.uuid())?;
 		let mut stmt = tx.prepare_cached(UPSERT_ROOT_EMPTY)?;
 		let (storage_used, max_storage, last_updated) = stmt.query_one([id], |f| {
 			let storage_used: i64 = f.get(ROOTS_STORAGE_USED)?;

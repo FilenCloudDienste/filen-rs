@@ -4,6 +4,7 @@ use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	fs::{
+		HasParent,
 		categories::{
 			DirType, NonRootFileType, Normal,
 			fs::{CategoryFSExt, ObjectOrRemainingPath},
@@ -76,9 +77,21 @@ async fn check_local_item_matches_remote(
 		},
 		DBObject::File(file) => match client.get_file_with_info(file.uuid).await {
 			// A versioned uuid still resolves byte-identical (parent unchanged, not trashed)
-			// but has been superseded by a same-name re-upload; treat it as gone so the caller
-			// re-resolves the path by name and picks up the replacement.
+			// but has been superseded by a re-upload; treat it as gone so the caller
+			// re-resolves the path and picks up the replacement. The replacement arrives
+			// carrying our stable id, so the upsert updates this row in place — the item
+			// survives the remote edit instead of being dropped and re-created.
 			Ok(info) if info.versioned => LocalRemoteComparison::NotFound(DBObject::File(file)),
+			// A trashed result whose stable id is not ours is the short-lived ghost of a
+			// versioning-disabled edit: the retired row stays readable for ~60s re-stamped
+			// with a fresh stable id that belongs to no lineage. The uuid is dead — never
+			// adopt the unknown stable id onto our row; fall through to NotFound so the
+			// caller re-lists and finds the live head (which still carries our stable id).
+			Ok(info)
+				if info.file.parent().is_trash() && info.file.stable_uuid() != file.stable_uuid =>
+			{
+				LocalRemoteComparison::NotFound(DBObject::File(file))
+			}
 			Ok(info) => {
 				if file == info.file {
 					LocalRemoteComparison::SameFile(file, info.file)

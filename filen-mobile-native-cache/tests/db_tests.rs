@@ -11,7 +11,10 @@ use filen_mobile_native_cache::{
 };
 use filen_sdk_rs::{
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
-	fs::{HasName, HasUUID, file::traits::HasFileInfo},
+	fs::{
+		HasName, HasUUID,
+		file::{meta::FileMetaChanges, traits::HasFileInfo},
+	},
 };
 use filen_types::fs::Uuid;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -615,6 +618,143 @@ pub async fn test_download_file_after_remote_replace() {
 		other => panic!("expected cached file row after replace recovery, got {other:?}"),
 	}
 
+	std::fs::remove_file(&downloaded_path).ok();
+}
+
+// A remote rename + content edit re-mints the uuid AND changes the name, so neither of the
+// legacy row-resolution keys (uuid, (parent, name)) can locate the cached row — only the
+// server-minted stable id can. The row must be updated in place, surviving with its
+// local_data, instead of being dropped and re-created as a new identity.
+#[shared_test_runtime]
+pub async fn test_remote_rename_and_edit_preserves_row_identity() {
+	let (db, rss) = get_db_resources().await;
+
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stable_identity_a.txt", rss.dir.uuid())
+				.unwrap(),
+			b"original bytes",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let old_path: FfiId = test_dir_path.join("stable_identity_a.txt");
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let mut local_data = std::collections::HashMap::new();
+	local_data.insert("pinned".to_string(), "true".to_string());
+	db.update_local_data(&file.uuid().to_string(), local_data.clone())
+		.unwrap();
+
+	// rename + edit remotely, with no cache sync in between
+	rss.client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name("stable_identity_b.txt")
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let edited = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stable_identity_b.txt", rss.dir.uuid())
+				.unwrap(),
+			b"edited bytes",
+		)
+		.await
+		.unwrap();
+	assert_ne!(edited.uuid(), file.uuid());
+	assert_eq!(edited.stable_uuid(), file.stable_uuid());
+
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let new_path: FfiId = test_dir_path.join("stable_identity_b.txt");
+	let updated = match db.query_item(&new_path).unwrap() {
+		Some(FfiObject::File(f)) => f,
+		other => panic!("expected the edited file under its new name, got {other:?}"),
+	};
+	assert_eq!(updated.uuid, edited.uuid().to_string());
+	// the row survived the re-mint: provider-side state is still attached
+	assert_eq!(updated.local_data, Some(local_data));
+	// and the old name no longer resolves to anything
+	assert!(db.query_item(&old_path).unwrap().is_none());
+}
+
+// Editing a file on a versioning-disabled account replaces it in place: the old uuid is
+// trashed AND superseded, and for ~60s it stays readable, re-stamped with a fresh stable id
+// that belongs to no lineage. That ghost must never be adopted onto the cached row (it would
+// falsely trash the row or corrupt its identity) — the next open must re-resolve the path
+// and serve the new head, which still carries the original stable id.
+#[shared_test_runtime]
+pub async fn test_versioning_disabled_edit_ghost_is_not_adopted() {
+	let (db, rss) = get_db_resources().await;
+
+	let _version_lock = rss
+		.client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	rss.client.set_versioning_enabled(false).await.unwrap();
+
+	let old_content = b"versioning off v1";
+	let old_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("versioning_off_ghost.txt", rss.dir.uuid())
+				.unwrap(),
+			old_content,
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("versioning_off_ghost.txt");
+
+	// prime the cache with the original row
+	let downloaded_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&downloaded_path).unwrap(), old_content);
+
+	// edit remotely: in-place replace; the old uuid becomes the short-lived trashed ghost
+	let new_content = b"versioning off v2";
+	let new_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("versioning_off_ghost.txt", rss.dir.uuid())
+				.unwrap(),
+			new_content,
+		)
+		.await
+		.unwrap();
+	assert_ne!(new_file.uuid(), old_file.uuid());
+	assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
+
+	// the very next open revalidates the dead uuid against the ghost and must recover
+	let downloaded_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&downloaded_path).unwrap(), new_content);
+
+	// the cached row self-healed to the new head and was never marked trashed
+	match db.query_item(&file_path).unwrap() {
+		Some(FfiObject::File(f)) => assert_eq!(f.uuid, new_file.uuid().to_string()),
+		other => panic!("expected the healed file row, got {other:?}"),
+	}
+
+	rss.client.set_versioning_enabled(true).await.unwrap();
 	std::fs::remove_file(&downloaded_path).ok();
 }
 
@@ -4575,4 +4715,290 @@ pub async fn test_search() {
 		.await
 		.unwrap();
 	assert_eq!(resp.len(), 0, "a non-matching needle finds nothing");
+}
+
+// Schema changes ship as a CACHE_VERSION bump: an on-disk cache written by an older version
+// must be wiped and rebuilt on open (there is deliberately no ALTER-based migration), after
+// which the cache re-syncs from the server and works normally on the new schema.
+#[shared_test_runtime]
+pub async fn test_cache_version_bump_reinitializes_db() {
+	let (db, rss) = get_db_resources().await;
+	let config = rss.client.to_sdk_config();
+	let json_config = serde_json::to_string(&AuthFile {
+		sdk_config: Some(config),
+		provider_enabled: true,
+		max_thumbnail_files_budget: None,
+		max_cache_files_budget: None,
+	})
+	.unwrap();
+
+	let tmp_dir = std::env::temp_dir().join("stable_uuid_reinit_test");
+	let files_path = tmp_dir.join("files");
+	std::fs::remove_dir_all(&files_path).ok();
+	std::fs::create_dir_all(&files_path).unwrap();
+	let dek_bytes = [0x43u8; 32];
+	let dek = EncryptionKey::new(dek_bytes);
+	let auth_file = tmp_dir.join("auth.json").to_string_lossy().into_owned();
+	tokio::fs::write(&auth_file, encrypt_auth_json(json_config.as_bytes(), &dek))
+		.await
+		.unwrap();
+	let files_path_str = files_path.to_string_lossy().into_owned();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+
+	// first open: fresh cache on the current schema, primed with a listing
+	let state = FilenMobileCacheState::new(
+		files_path_str.clone(),
+		auth_file.clone(),
+		dek_bytes.to_vec(),
+	);
+	state
+		.update_dir_children(test_dir_path.clone())
+		.await
+		.unwrap();
+	assert!(state.query_item(&test_dir_path).unwrap().is_some());
+	drop(state);
+
+	// tamper: pretend the DB was written by the previous cache version
+	let state_file = files_path.join("db_state.json");
+	let mut saved: serde_json::Value =
+		serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+	saved["version"] = serde_json::Value::from(2u64);
+	std::fs::write(&state_file, serde_json::to_string(&saved).unwrap()).unwrap();
+
+	// reopen: the outdated cache must be wiped...
+	let state = FilenMobileCacheState::new(files_path_str, auth_file, dek_bytes.to_vec());
+	assert!(
+		state.query_item(&test_dir_path).unwrap().is_none(),
+		"an outdated on-disk cache must be reinitialized, not reused"
+	);
+	// ...and the rebuilt cache repopulates and serves normally
+	state
+		.update_dir_children(test_dir_path.clone())
+		.await
+		.unwrap();
+	assert!(state.query_item(&test_dir_path).unwrap().is_some());
+}
+
+// The `stable/<id>` FFI namespace is the identity the providers persist. It must address a
+// file across a remote content edit (which re-mints the uuid), and — for app-migration
+// compat — a stale current-version uuid passed through the same namespace must keep
+// resolving to the row for as long as the cache knows it.
+#[shared_test_runtime]
+pub async fn test_stable_id_namespace_addresses_files_across_edits() {
+	let (db, rss) = get_db_resources().await;
+
+	let old_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stable_ns.txt", rss.dir.uuid())
+				.unwrap(),
+			b"stable ns v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("stable_ns.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let ffi_file = match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(f) => f,
+		other => panic!("expected a file, got {other:?}"),
+	};
+	assert_eq!(ffi_file.stable_uuid, old_file.stable_uuid().to_string());
+
+	let stable_id: FfiId = format!("stable/{}", ffi_file.stable_uuid).into();
+
+	// the stable id resolves to the same item as the path
+	let by_stable = match db.query_item(&stable_id).unwrap().unwrap() {
+		FfiObject::File(f) => f,
+		other => panic!("expected a file, got {other:?}"),
+	};
+	assert_eq!(by_stable, ffi_file);
+
+	// remote content edit: uuid re-mints, stable id stays
+	let edited = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stable_ns.txt", rss.dir.uuid())
+				.unwrap(),
+			b"stable ns v2",
+		)
+		.await
+		.unwrap();
+	assert_ne!(edited.uuid(), old_file.uuid());
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// same stable id still addresses the file, now at its new current uuid...
+	let by_stable = match db.query_item(&stable_id).unwrap().unwrap() {
+		FfiObject::File(f) => f,
+		other => panic!("expected a file, got {other:?}"),
+	};
+	assert_eq!(by_stable.uuid, edited.uuid().to_string());
+	assert_eq!(by_stable.stable_uuid, ffi_file.stable_uuid);
+
+	// ...and mutations through the stable namespace work end to end
+	let downloaded = db
+		.download_file_if_changed_by_path(stable_id.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&downloaded).unwrap(), b"stable ns v2");
+
+	// app-migration compat: the retired current-version uuid still resolves
+	// through the stable namespace while the cache knows the lineage
+	let stale_id: FfiId = format!("stable/{}", old_file.uuid()).into();
+	let by_stale = match db.query_item(&stale_id).unwrap().unwrap() {
+		FfiObject::File(f) => f,
+		other => panic!("expected a file, got {other:?}"),
+	};
+	// (here the stale uuid IS the lineage id, since the first upload minted it)
+	assert_eq!(by_stale.uuid, edited.uuid().to_string());
+
+	std::fs::remove_file(&downloaded).ok();
+}
+
+// Directories carry no stable id on the wire (stable == uuid, by design), so the
+// `stable/<uuid>` namespace must address them by uuid — the providers now use it as
+// the document id for dirs too, since name-path ids retire on every rename/move.
+#[shared_test_runtime]
+pub async fn test_stable_id_namespace_addresses_dirs_across_renames() {
+	let (db, rss) = get_db_resources().await;
+
+	let dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "stable_ns_dir_a")
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let stable_id: FfiId = format!("stable/{}", dir.uuid()).into();
+	let by_stable = match db.query_item(&stable_id).unwrap().unwrap() {
+		FfiObject::Dir(d) => d,
+		other => panic!("expected a dir, got {other:?}"),
+	};
+	assert_eq!(by_stable.uuid, dir.uuid().to_string());
+
+	// mutations through the namespace work, and the id survives the rename
+	// that retires the dir's name-path form
+	db.rename_item(stable_id.clone(), "stable_ns_dir_b".to_string())
+		.await
+		.unwrap();
+	let renamed = match db.query_item(&stable_id).unwrap().unwrap() {
+		FfiObject::Dir(d) => d,
+		other => panic!("expected a dir, got {other:?}"),
+	};
+	assert_eq!(renamed.uuid, dir.uuid().to_string());
+	assert_eq!(renamed.meta.unwrap().name, "stable_ns_dir_b");
+}
+// An app that persisted a file's `uuid` before the stable-id migration must keep resolving it after
+// the server re-mints that uuid. `resolve_uuid_or_stable` covers this by falling back to a
+// stable-id match once the exact uuid match misses — the branch every uuid-string entry point
+// depends on, and the one a plain `Uuid::from_str` would have skipped.
+#[shared_test_runtime]
+pub async fn test_a_pre_edit_uuid_still_resolves_after_the_server_re_mints_it() {
+	let (db, rss) = get_db_resources().await;
+
+	let original = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stale_uuid.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("stale_uuid.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// The id the app would have persisted before this branch existed.
+	let persisted_uuid = original.uuid().to_string();
+
+	let edited = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stale_uuid.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v2",
+		)
+		.await
+		.unwrap();
+	assert_ne!(edited.uuid(), original.uuid());
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// The persisted value is nobody's `uuid` any more — only the stable fallback can find it.
+	let found = match db.query_item_by_uuid(&persisted_uuid).unwrap() {
+		Some(FfiObject::File(f)) => f,
+		other => panic!("a pre-edit uuid must still resolve, got {other:?}"),
+	};
+	assert_eq!(found.uuid, edited.uuid().to_string());
+	assert_eq!(found.stable_uuid, original.stable_uuid().to_string());
+
+	// The same fallback backs the path lookup the provider uses to locate an item.
+	assert_eq!(
+		db.query_path_for_uuid(persisted_uuid)
+			.unwrap()
+			.map(|id| id.0),
+		Some(file_path.0.clone()),
+	);
+}
+
+// A trashed item is addressed as `trash/<uuid>`, not by a display-name path. `canonicalize_id` has
+// to notice that and produce the trash form, otherwise every stable id would collapse to a path
+// lookup that cannot find a trashed row.
+#[shared_test_runtime]
+pub async fn test_the_stable_namespace_addresses_a_trashed_item() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stable_trash.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("stable_trash.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let stable_id: FfiId = format!("stable/{}", file.stable_uuid()).into();
+	db.trash_item(file_path).await.unwrap();
+
+	let by_stable = match db.query_item(&stable_id).unwrap() {
+		Some(FfiObject::File(f)) => f,
+		other => panic!("a trashed item must resolve through its stable id, got {other:?}"),
+	};
+	assert_eq!(by_stable.uuid, file.uuid().to_string());
+	// `original_parent` is Some only for a trashed item (it is where a restore would put it back).
+	assert_eq!(
+		by_stable.original_parent,
+		Some(rss.dir.uuid().to_string()),
+		"the item must come back as trashed, not as a live child"
+	);
+
+	// Resolving is not enough: a bare uuid also finds the row, so it would not tell us which form
+	// canonicalize_id produced. The echoed id does. Re-asserting the rank the item already has
+	// short-circuits before any server call, so this observes the id and changes nothing.
+	assert_eq!(
+		db.set_favorite_rank(stable_id, 0).await.unwrap().id.0,
+		format!("trash/{}", file.uuid()),
+		"a trashed item's stable id must canonicalise to the trash form, not a bare uuid"
+	);
 }

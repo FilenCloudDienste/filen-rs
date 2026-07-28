@@ -1,6 +1,8 @@
 SELECT
 	items.id,
 	items.uuid,
+	items.stable_uuid,
+	items.pending_upload_at,
 	items.parent,
 	items.trashed,
 	items.local_data,

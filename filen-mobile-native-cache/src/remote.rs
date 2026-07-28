@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr, sync::Arc, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use chrono::DateTime;
 use filen_sdk_rs::fs::{
@@ -7,7 +7,6 @@ use filen_sdk_rs::fs::{
 	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 	file::{FileBuilderOptionalName, RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
 };
-use filen_types::fs::Uuid;
 use rusqlite::OptionalExtension;
 use tracing::debug;
 
@@ -255,6 +254,7 @@ impl AuthCacheState {
 
 	pub(crate) async fn update_dir_children(&self, path: &FfiId) -> Result<(), CacheError> {
 		debug!("Updating directory children for path: {}", path.0);
+		let path = self.canonicalize_id(path)?;
 		let path_id = path.as_path()?;
 		let mut dir: DBDirObject = match self.update_items_in_path(&path_id).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject.try_into()?,
@@ -325,6 +325,7 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		debug!("Downloading file to path: {}", file_path.0);
+		let file_path = self.canonicalize_id(&file_path)?;
 		let path_values = file_path.as_path()?;
 		let old_file = match sql::select_object_at_path(&self.conn(), &path_values)? {
 			Some(DBObject::File(file)) => Some(file),
@@ -352,8 +353,7 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<String, CacheError> {
 		debug!("Downloading file with UUID: {uuid}");
-		let uuid = Uuid::from_str(&uuid)
-			.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?;
+		let uuid = self.resolve_uuid_or_stable(&uuid)?;
 		let file = DBFile::select(&self.conn(), uuid)
 			.optional()?
 			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {uuid}")))?;
@@ -368,6 +368,7 @@ impl AuthCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<bool, CacheError> {
 		debug!("Uploading file at path: {}", path.0);
+		let path = self.canonicalize_id(&path)?;
 		let path_values = path.as_path()?;
 		let remote_file = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(DBObject::File(file)) => {
@@ -430,6 +431,7 @@ impl AuthCacheState {
 	) -> Result<FileWithPathResponse, CacheError> {
 		let os_path = PathBuf::from(os_path);
 		let name = info.name;
+		let parent_path = self.canonicalize_id(&parent_path)?.into_owned();
 		let out_path = parent_path.join(&name);
 		debug!(
 			"Creating file at path: {}, importing from {}",
@@ -492,6 +494,7 @@ impl AuthCacheState {
 		name: String,
 		mime: Option<String>,
 	) -> Result<CreateFileResponse, CacheError> {
+		let parent_path = self.canonicalize_id(&parent_path)?.into_owned();
 		let file_path = parent_path.join(&name);
 		debug!("Creating empty file at path: {}", file_path.0);
 		let parent_pvs = parent_path.as_path()?;
@@ -533,6 +536,7 @@ impl AuthCacheState {
 		name: String,
 		created: Option<i64>,
 	) -> Result<DirWithPathResponse, CacheError> {
+		let parent_path = self.canonicalize_id(&parent_path)?.into_owned();
 		let dir_path = parent_path.join(&name);
 		debug!("Creating directory at path: {}", dir_path.0);
 		let path_values = parent_path.as_path()?;
@@ -582,6 +586,7 @@ impl AuthCacheState {
 		path: FfiId,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Trashing item at path: {}", path.0);
+		let path = self.canonicalize_id(&path)?;
 		let path_values: PathFfiId<'_> = path.as_path()?;
 		let obj = match self.update_items_in_path(&path_values).await? {
 			UpdateItemsInPath::Complete(dbobject) => dbobject,
@@ -627,8 +632,7 @@ impl AuthCacheState {
 		to: Option<FfiId>,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Untrashing item with UUID: {uuid} to parent: {to:?}");
-		let uuid = Uuid::from_str(uuid)
-			.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?;
+		let uuid = self.resolve_uuid_or_stable(uuid)?;
 		let object = {
 			let conn = self.conn();
 			DBNonRootObject::select(&conn, uuid)?
@@ -637,6 +641,7 @@ impl AuthCacheState {
 		// we do this first to make sure we have a valid restore target
 		let parent = match to {
 			Some(to_path) => {
+				let to_path = self.canonicalize_id(&to_path)?.into_owned();
 				let to_pvs: PathFfiId<'_> = to_path.as_path()?;
 				match self.update_items_in_path(&to_pvs).await? {
 					UpdateItemsInPath::Complete(DBObject::Dir(dir)) => {
@@ -714,6 +719,8 @@ impl AuthCacheState {
 		new_parent: FfiId,
 	) -> Result<ObjectWithPathResponse, CacheError> {
 		debug!("Moving item {} to new parent {}", item.0, new_parent.0);
+		let item = self.canonicalize_id(&item)?;
+		let new_parent = self.canonicalize_id(&new_parent)?.into_owned();
 		let item_pvs: PathFfiId<'_> = item.as_path()?;
 		let new_parent_pvs: PathFfiId<'_> = new_parent.as_path()?;
 
@@ -768,6 +775,7 @@ impl AuthCacheState {
 		new_name: String,
 	) -> Result<Option<ObjectWithPathResponse>, CacheError> {
 		debug!("Renaming item {} to {}", item.0, new_name);
+		let item = self.canonicalize_id(&item)?.into_owned();
 		let item_pvs: PathFfiId<'_> = item.as_path()?;
 		if item_pvs.name_or_uuid.is_empty() {
 			return Err(CacheError::remote(format!(
@@ -820,6 +828,7 @@ impl AuthCacheState {
 	}
 
 	pub(crate) async fn clear_local_cache(&self, item: FfiId) -> Result<(), CacheError> {
+		let item = self.canonicalize_id(&item)?;
 		let pvs = item.as_path()?;
 		debug!("Clearing local cache for item: {}", pvs.full_path);
 		let obj = match sql::select_object_at_path(&self.conn(), &pvs)? {
@@ -832,22 +841,18 @@ impl AuthCacheState {
 
 	pub(crate) async fn clear_local_cache_by_uuid(&self, uuid: &str) -> Result<(), CacheError> {
 		debug!("Clearing local cache for item with uuid: {uuid}");
-		let obj = match DBObject::select(
-			&self.conn(),
-			Uuid::from_str(uuid)
-				.map_err(|e| CacheError::conversion(format!("Invalid UUID {uuid}, err: {e}")))?,
-		)
-		.optional()?
-		{
-			Some(obj) => obj,
-			None => return Ok(()),
-		};
+		let obj =
+			match DBObject::select(&self.conn(), self.resolve_uuid_or_stable(uuid)?).optional()? {
+				Some(obj) => obj,
+				None => return Ok(()),
+			};
 		self.io_delete_local(obj.uuid()).await?;
 		Ok(())
 	}
 
 	pub(crate) async fn delete_item(&self, item: FfiId) -> Result<(), CacheError> {
 		debug!("Deleting object at path: {}", item.0);
+		let item = self.canonicalize_id(&item)?;
 		let pvs = item.as_parsed()?;
 		let obj = match pvs {
 			ParsedFfiId::Trash(uuid_id) | ParsedFfiId::Recents(uuid_id) => DBObject::select(
@@ -903,6 +908,7 @@ impl AuthCacheState {
 		item: FfiId,
 		favorite_rank: i64,
 	) -> Result<ObjectWithPathResponse, CacheError> {
+		let item = self.canonicalize_id(&item)?;
 		let pvs = item.as_parsed()?;
 		debug!(
 			"Setting favorite rank for item: {}, rank: {}",
@@ -967,7 +973,7 @@ impl AuthCacheState {
 		};
 		Ok(ObjectWithPathResponse {
 			object: obj.into(),
-			id: item,
+			id: item.into_owned(),
 		})
 	}
 
