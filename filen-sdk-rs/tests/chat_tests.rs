@@ -105,8 +105,10 @@ async fn lock_chat(client: &Client) -> Arc<ResourceLock> {
 async fn clear_chats(client: &Client) {
 	if let Ok(chats) = client.list_chats().await {
 		for chat in chats {
+			// Delete first: leaving a conversation you are the only participant in used to leave it
+			// dangling server-side. Fixed server-side, but still best avoided.
+			let _ = client.delete_chat(chat.clone()).await;
 			let _ = client.leave_chat(&chat).await;
-			let _ = client.delete_chat(chat).await;
 		}
 	}
 }
