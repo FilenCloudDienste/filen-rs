@@ -1,13 +1,13 @@
 use filen_sdk_rs::{
 	fs::{
-		HasUUID,
+		HasName, HasParent, HasUUID,
 		dir::{RemoteDirectory, meta::DirectoryMeta},
 		file::{RemoteFile, meta::FileMeta},
 	},
 	user::UserInfo,
 	util::PathIteratorExt,
 };
-use filen_types::fs::{Uuid, UuidStr};
+use filen_types::fs::{ParentUuid, StableUuid, Uuid, UuidStr};
 use libsqlite3_sys::SQLITE_CONSTRAINT_UNIQUE;
 use rusqlite::{
 	Connection, OptionalExtension, ToSql,
@@ -201,50 +201,51 @@ pub(crate) fn recursive_select_path_from_uuid(
 	stmt.query_row([uuid], |row| row.get(PATH)).optional()
 }
 
-/// Writes `local_data`, returning what was actually stored.
+/// Replaces `local_data` outright. An empty map stores NULL rather than an empty JSON object.
 ///
-/// The statement preserves the internal pending-upload marker, so the stored value is not
-/// necessarily the one passed in — callers that hand the result back to the app must report what
-/// landed. `None` means the row did not exist, or its local data is now empty.
+/// The column is the app's alone — the pending-upload marker that used to share it has its own
+/// column — so what lands is always what was passed in, and there is nothing to report back.
 pub(crate) fn update_local_data(
 	conn: &mut Connection,
 	uuid: Uuid,
 	local_data: Option<&JsonObject>,
-) -> Result<Option<JsonObject>, rusqlite::Error> {
+) -> Result<(), rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(UPDATE_LOCAL_DATA_BY_UUID)?;
-	let local_data = local_data
-		.map(|d| if d.is_empty() { None } else { Some(d) })
-		.unwrap_or(None);
-	stmt.query_row((local_data, uuid), |row| row.get(0))
-		.optional()
-		.map(Option::flatten)
+	let local_data = local_data.filter(|d| !d.is_empty());
+	stmt.execute((local_data, uuid))?;
+	Ok(())
 }
 
-/// The `local_data` key the pending-upload marker lives under. The SQL statements spell it out
-/// literally (`$.pendingUpload`) because they cannot share a Rust constant, so keep them in step.
-pub(crate) const PENDING_UPLOAD_KEY: &str = "pendingUpload";
-
-/// Marks a file as having local changes that are not on the server yet.
+/// Marks a file as having local changes that are not on the server yet, as of `marked_at_millis`.
 ///
 /// Written before the upload is attempted, not after it fails: if the process dies mid-upload the
 /// marker survives and the edit is retried, whereas marking only on failure would lose exactly the
 /// edits interrupted at the worst moment.
 pub(crate) fn mark_pending_upload(
 	conn: &Connection,
-	stable_uuid: Uuid,
+	stable_uuid: StableUuid,
 	marked_at_millis: i64,
 ) -> Result<(), rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(MARK_PENDING_UPLOAD)?;
-	// Stored as text so the JSON object stays a map of strings, matching `local_data`'s shape
-	// everywhere else (it is surfaced over FFI as HashMap<String, String>).
-	stmt.execute((stable_uuid, marked_at_millis.to_string()))?;
+	stmt.execute((stable_uuid, marked_at_millis))?;
 	Ok(())
+}
+
+/// When the file a stable id names was marked, or `None` if it has nothing outstanding.
+pub(crate) fn select_pending_upload_at(
+	conn: &Connection,
+	stable_uuid: StableUuid,
+) -> Result<Option<i64>, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(SELECT_PENDING_UPLOAD_AT)?;
+	stmt.query_row((stable_uuid,), |row| row.get(0))
+		.optional()
+		.map(Option::flatten)
 }
 
 /// Drops the pending-upload marker once the local changes have reached the server.
 pub(crate) fn clear_pending_upload(
 	conn: &Connection,
-	stable_uuid: Uuid,
+	stable_uuid: StableUuid,
 ) -> Result<(), rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(CLEAR_PENDING_UPLOAD)?;
 	stmt.execute((stable_uuid,))?;
@@ -252,11 +253,13 @@ pub(crate) fn clear_pending_upload(
 }
 
 /// Every file still marked as having unuploaded local changes, oldest first.
-pub(crate) fn select_pending_uploads(conn: &Connection) -> Result<Vec<Uuid>, rusqlite::Error> {
+pub(crate) fn select_pending_uploads(
+	conn: &Connection,
+) -> Result<Vec<StableUuid>, rusqlite::Error> {
 	let mut stmt = conn.prepare_cached(SELECT_PENDING_UPLOADS)?;
 	let uuids = stmt
 		.query_map([], |row| row.get(0))?
-		.collect::<Result<Vec<Uuid>, _>>()?;
+		.collect::<Result<Vec<StableUuid>, _>>()?;
 	Ok(uuids)
 }
 
@@ -363,6 +366,82 @@ where
 	Ok(())
 }
 
+/// Whether an incoming trashed record would land on a row that is not it.
+///
+/// `upsert_item` resolves identity by uuid, then stable id, then `(parent, name)` — and neither
+/// of the last two tiers knows anything about `trashed`. So a trashed record whose uuid the cache
+/// does not hold adopts whatever LIVE row occupies its name slot and drags that row into the
+/// trash, where the pending-upload drain (untrashed rows only) can no longer reach it and the
+/// stale sweep eventually deletes it outright. The ghost of a versioning-disabled edit is exactly
+/// that shape: the retired uuid stays listed as trashed for ~60s, re-stamped with a stable id
+/// belonging to no lineage, while the live head holding the user's edit sits in the name slot.
+///
+/// This is the bulk listing's copy of the rule [`crate::sync::check_local_item_matches_remote`]
+/// applies when revalidating a single item. A record refused here simply does not appear in the
+/// cached trash listing — a gap that closes as soon as the collision does, and one the sweep
+/// cannot turn into a deletion, because it only reaps rows that are already trashed.
+fn trashed_record_targets_another_row(
+	conn: &Connection,
+	uuid: Uuid,
+	stable: Option<StableUuid>,
+	parent: &ParentUuid,
+	name: Option<&str>,
+	type_: ItemType,
+) -> Result<bool, rusqlite::Error> {
+	if !parent.is_trash() {
+		// A live record is resolved against live rows, which is what the tiers are for.
+		return Ok(false);
+	}
+
+	// The uuid tier. For a dir a match settles it — the server never re-mints a dir's uuid, so
+	// the row is the same object. For a file the stable id has to agree as well, or the uuid is
+	// a corpse the server re-stamped and the row is the lineage that outlived it.
+	let mut stmt = conn.prepare_cached(SELECT_STABLE_BY_UUID)?;
+	if let Some(row_stable) = stmt
+		.query_one((uuid, type_), |row| row.get::<_, Option<StableUuid>>(0))
+		.optional()?
+	{
+		return Ok(row_stable != stable);
+	}
+
+	// The stable tier: a file whose uuid the server re-minted still resolves here, and that row
+	// IS this record — trashing it is the update the listing came to deliver.
+	if let Some(stable) = stable
+		&& RawDBItem::select_by_stable(conn, stable.into())?.is_some()
+	{
+		return Ok(false);
+	}
+
+	// Nothing here is this record, so the `(parent, name)` tier is all that is left — and
+	// whatever holds that name is live, and is somebody else.
+	let (Some(parent), Some(name)) = (parent.original_parent(), name) else {
+		return Ok(false);
+	};
+	let mut stmt = conn.prepare_cached(SELECT_ITEM_BY_PARENT_NAME)?;
+	Ok(stmt
+		.query_one((parent, name), RawDBItem::from_row)
+		.optional()?
+		.is_some_and(|item| item.type_ == type_))
+}
+
+/// Whether a listing record already owns a row via one of the identity tiers
+/// (uuid or stable id, type-scoped like the upsert). Name-tier-only records
+/// return false — they must wait for the second pass.
+fn resolves_by_identity(
+	conn: &Connection,
+	uuid: Uuid,
+	stable_uuid: Option<StableUuid>,
+	type_: ItemType,
+) -> Result<bool, rusqlite::Error> {
+	let mut stmt = conn.prepare_cached(
+		"SELECT 1 FROM items
+		WHERE (items.uuid = ?1 OR (?2 IS NOT NULL AND items.stable_uuid = ?2))
+		AND items.type = ?3
+		LIMIT 1;",
+	)?;
+	stmt.exists((uuid, stable_uuid, type_))
+}
+
 fn upsert_dirs_and_files<I, I1>(
 	tx: &rusqlite::Transaction<'_>,
 	dirs: I,
@@ -377,7 +456,33 @@ where
 	let mut upsert_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
 	let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
 
-	for dir in dirs {
+	// Applied in two passes per kind: records that resolve to an existing row
+	// by uuid or stable id first, everything else (name-tier matches and fresh
+	// inserts) after. A single pass in listing order lets a new item that took
+	// over a renamed sibling's old name reach the `(parent, name)` tier before
+	// the sibling's own record has moved its row along — stealing the row and
+	// its local_data (pending-upload marker included). Once every
+	// identity-resolving record has been applied, the name tier can no longer
+	// see a row that a later record in the same batch owns.
+	let (dirs_by_identity, dirs_by_name): (Vec<_>, Vec<_>) = dirs
+		.into_iter()
+		.partition(|d| resolves_by_identity(tx, d.uuid(), None, ItemType::Dir).unwrap_or(false));
+
+	for dir in dirs_by_identity.into_iter().chain(dirs_by_name) {
+		if trashed_record_targets_another_row(
+			tx,
+			dir.uuid(),
+			None,
+			dir.parent(),
+			dir.name(),
+			ItemType::Dir,
+		)? {
+			debug!(
+				"Skipping trashed directory {}: it is not the row it resolves onto",
+				dir.uuid()
+			);
+			continue;
+		}
 		DBDir::upsert_from_remote_stmts(
 			dir,
 			&mut upsert_item_stmt,
@@ -391,7 +496,26 @@ where
 	let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
 	let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
 
-	for file in files {
+	// Same two-pass rule as the dirs above.
+	let (files_by_identity, files_by_name): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| {
+		resolves_by_identity(tx, f.uuid(), Some(f.stable_uuid()), ItemType::File).unwrap_or(false)
+	});
+
+	for file in files_by_identity.into_iter().chain(files_by_name) {
+		if trashed_record_targets_another_row(
+			tx,
+			file.uuid(),
+			Some(file.stable_uuid()),
+			file.parent(),
+			file.name(),
+			ItemType::File,
+		)? {
+			debug!(
+				"Skipping trashed file {}: it is not the row it resolves onto",
+				file.uuid()
+			);
+			continue;
+		}
 		DBFile::upsert_from_remote_stmts(
 			file,
 			&mut upsert_item_stmt,
@@ -557,19 +681,30 @@ mod pending_upload_tests {
 		Uuid::from_bytes([byte; 16])
 	}
 
+	fn stable(byte: u8) -> StableUuid {
+		StableUuid::new_for_test(uuid(byte))
+	}
+
 	/// Upserts a file row the way a remote listing would, and gives it the `files_meta` name row
 	/// the `(parent, name)` fallback in `upsert_item` joins against.
-	fn add_file(conn: &Connection, uuid_: Uuid, stable: Uuid, parent: Uuid, name: &str) -> i64 {
-		let (id, _) = item::upsert_item(
-			conn,
+	fn add_file(
+		conn: &Connection,
+		uuid_: Uuid,
+		stable: StableUuid,
+		parent: Uuid,
+		name: &str,
+	) -> i64 {
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		let (id, _, _) = item::upsert_file_item_with_stmts(
 			uuid_,
 			stable,
 			combine_parent(Some(parent), false),
 			Some(name),
 			None,
-			ItemType::File,
+			&mut stmt,
 		)
 		.unwrap();
+		drop(stmt);
 		conn.execute(
 			"INSERT INTO files (id, size, chunks, region, bucket, timestamp, metadata_state)
 			VALUES (?1, 0, 0, '', '', 0, 0);",
@@ -595,35 +730,570 @@ mod pending_upload_tests {
 		.map(|d| d.to_map())
 	}
 
-	/// The provider writes its own keys into `local_data` through the FFI. That column is also
-	/// where the pending-upload marker lives, and the app has no way to know an internal-only key
-	/// is in there — so a tag write must not take an outstanding local edit down with it.
+	fn pending_upload_at_of(conn: &Connection, uuid_: Uuid) -> Option<i64> {
+		conn.query_row(
+			"SELECT pending_upload_at FROM items WHERE uuid = ?1;",
+			[uuid_],
+			|r| r.get(0),
+		)
+		.unwrap()
+	}
+
+	/// `local_data` is the app's alone, so a write through the FFI replaces it outright — no key
+	/// of ours to merge back in. The pending-upload marker sits in its own column precisely so
+	/// that plain replace cannot reach an outstanding local edit.
 	#[test]
-	fn update_local_data_must_not_wipe_a_pending_upload_marker() {
+	fn a_local_data_write_replaces_it_and_leaves_the_marker_alone() {
 		let mut conn = db();
-		add_file(&conn, uuid(1), uuid(2), uuid(9), "edited.txt");
-		mark_pending_upload(&conn, uuid(2), MARKED_AT).unwrap();
-		assert_eq!(select_pending_uploads(&conn).unwrap(), vec![uuid(2)]);
+		add_file(&conn, uuid(1), stable(2), uuid(9), "edited.txt");
+		let mut old = HashMap::new();
+		old.insert("Stale".to_string(), "overwrite me".to_string());
+		update_local_data(&mut conn, uuid(1), Some(&JsonObject::new(old))).unwrap();
+		mark_pending_upload(&conn, stable(2), MARKED_AT).unwrap();
 
 		let mut tags = HashMap::new();
 		tags.insert("TagData".to_string(), "keep me".to_string());
-		update_local_data(&mut conn, uuid(1), Some(&JsonObject::new(tags))).unwrap();
+		update_local_data(&mut conn, uuid(1), Some(&JsonObject::new(tags.clone()))).unwrap();
 
-		let data = local_data_of(&conn, uuid(1)).expect("the tag write must leave local_data set");
 		assert_eq!(
-			data.get("TagData").map(String::as_str),
-			Some("keep me"),
-			"the caller's own key must be written"
+			local_data_of(&conn, uuid(1)),
+			Some(tags),
+			"the write must land exactly as sent, dropping the keys it replaced"
 		);
 		assert_eq!(
-			data.get("pendingUpload").map(String::as_str),
-			Some(MARKED_AT.to_string().as_str()),
-			"an unrelated tag write must not drop the pending-upload marker"
+			pending_upload_at_of(&conn, uuid(1)),
+			Some(MARKED_AT),
+			"a local_data write must not reach the pending-upload marker"
 		);
 		assert_eq!(
 			select_pending_uploads(&conn).unwrap(),
-			vec![uuid(2)],
+			vec![stable(2)],
 			"the edit must still be drainable after the tag write"
+		);
+	}
+
+	/// An outstanding upload is a files-only concept for the same reason a stable id is: the
+	/// CHECK is what makes that true of the storage, not just of the code that writes it.
+	#[test]
+	fn a_dir_row_may_not_carry_a_pending_upload_marker() {
+		let conn = db();
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		item::upsert_dir_item_with_stmts(
+			uuid(1),
+			combine_parent(Some(uuid(9)), false),
+			Some("d"),
+			None,
+			&mut stmt,
+		)
+		.unwrap();
+		drop(stmt);
+
+		assert!(
+			conn.execute(
+				"UPDATE items SET pending_upload_at = 100 WHERE uuid = ?1;",
+				[uuid(1)],
+			)
+			.is_err(),
+			"a dir with bytes waiting to be uploaded is not a thing that exists"
+		);
+	}
+
+	/// The server re-mints a file's uuid on every content edit, and the upsert reconciles the new
+	/// head onto the existing row through the stable tier. The marker has to ride along — it is
+	/// the record of an edit that has NOT reached the server, so dropping it here drops the edit.
+	/// `upsert_item` never names the column, which is exactly what makes this hold.
+	#[test]
+	fn a_marker_survives_the_uuid_re_mint_that_reconciles_a_file() {
+		let conn = db();
+		let parent = uuid(9);
+		add_file(&conn, uuid(1), stable(2), parent, "edited.txt");
+		mark_pending_upload(&conn, stable(2), MARKED_AT).unwrap();
+
+		// The same file back from a listing under a freshly minted uuid.
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		let (_, _, carried) = item::upsert_file_item_with_stmts(
+			uuid(3),
+			stable(2),
+			combine_parent(Some(parent), false),
+			Some("edited.txt"),
+			None,
+			&mut stmt,
+		)
+		.unwrap();
+		drop(stmt);
+
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(3)),
+			Some(MARKED_AT),
+			"the re-minted head must still carry the outstanding edit"
+		);
+		assert_eq!(
+			carried,
+			Some(MARKED_AT),
+			"and the upsert must report it, or the DBFile it builds says there is none"
+		);
+		assert_eq!(select_pending_uploads(&conn).unwrap(), vec![stable(2)]);
+	}
+
+	/// Oldest first, so a drain retries edits in roughly the order they were made. The ordering
+	/// key is not in the select list, which is why this groups instead of using DISTINCT.
+	#[test]
+	fn the_drain_lists_the_oldest_marker_first() {
+		let conn = db();
+		let parent = uuid(9);
+		add_file(&conn, uuid(1), stable(1), parent, "newer.txt");
+		add_file(&conn, uuid(2), stable(2), parent, "older.txt");
+		mark_pending_upload(&conn, stable(1), MARKED_AT + 1_000).unwrap();
+		mark_pending_upload(&conn, stable(2), MARKED_AT).unwrap();
+
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![stable(2), stable(1)],
+			"the older edit must be drained first"
+		);
+	}
+
+	fn stable_uuid_of(conn: &Connection, uuid_: Uuid) -> Option<Uuid> {
+		conn.query_row(
+			"SELECT stable_uuid FROM items WHERE uuid = ?1;",
+			[uuid_],
+			|r| r.get(0),
+		)
+		.unwrap()
+	}
+
+	/// Stable ids are a files-only concept, and the `items` CHECK is what makes that true of the
+	/// storage rather than only of the code: it is why `DBFile::stable_uuid` can be a plain
+	/// `StableUuid` while the column itself is nullable.
+	#[test]
+	fn only_files_carry_a_stable_id() {
+		let conn = db();
+		let parent = uuid(9);
+
+		add_file(&conn, uuid(1), stable(2), parent, "a.txt");
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		item::upsert_dir_item_with_stmts(
+			uuid(3),
+			combine_parent(Some(parent), false),
+			Some("d"),
+			None,
+			&mut stmt,
+		)
+		.unwrap();
+		drop(stmt);
+		item::upsert_root_item(&conn, uuid(4)).unwrap();
+
+		assert_eq!(
+			stable_uuid_of(&conn, uuid(1)),
+			Some(uuid(2)),
+			"a file keeps its stable id"
+		);
+		assert_eq!(
+			stable_uuid_of(&conn, uuid(3)),
+			None,
+			"a dir must not carry one"
+		);
+		assert_eq!(
+			stable_uuid_of(&conn, uuid(4)),
+			None,
+			"a root must not carry one"
+		);
+
+		assert!(
+			conn.execute(
+				"INSERT INTO items (uuid, stable_uuid, type) VALUES (?1, ?2, 1);",
+				rusqlite::params![uuid(5), uuid(6)],
+			)
+			.is_err(),
+			"a dir row with a stable id must be rejected"
+		);
+		assert!(
+			conn.execute("INSERT INTO items (uuid, type) VALUES (?1, 2);", [uuid(7)])
+				.is_err(),
+			"a file row without a stable id must be rejected"
+		);
+	}
+
+	/// A uuid arriving with a different type means the server reassigned it to a
+	/// new object (uuid-reuse abuse). The old row must be retired — not adopted
+	/// with a flipped type — so its stable id, per-type rows and local_data die
+	/// with it instead of leaking onto an unrelated object.
+	#[test]
+	fn a_cross_type_uuid_reuse_retires_the_old_row() {
+		let conn = db();
+		let file_id = add_file(&conn, uuid(1), stable(1), uuid(0), "victim.txt");
+		mark_pending_upload(&conn, stable(1), 100).unwrap();
+		conn.execute(
+			r#"UPDATE items SET local_data = '{"Tag":"mine"}' WHERE uuid = ?1;"#,
+			[uuid(1)],
+		)
+		.unwrap();
+
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		let (dir_id, carried_local_data) = item::upsert_dir_item_with_stmts(
+			uuid(1),
+			combine_parent(Some(uuid(0)), false),
+			Some("victim.txt"),
+			None,
+			&mut stmt,
+		)
+		.unwrap();
+		drop(stmt);
+
+		assert_ne!(dir_id, file_id, "the file row must be retired, not adopted");
+		assert_eq!(
+			carried_local_data, None,
+			"the retired file's local_data must not leak onto the new object"
+		);
+		let (type_, stable_col): (i64, Option<StableUuid>) = conn
+			.query_row(
+				"SELECT type, stable_uuid FROM items WHERE uuid = ?1;",
+				[uuid(1)],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)
+			.unwrap();
+		assert_eq!(type_, 1, "the uuid now denotes a dir");
+		assert_eq!(stable_col, None, "no stable id survives the retirement");
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(1)),
+			None,
+			"nor does the retired file's pending-upload marker"
+		);
+		let orphaned_file_rows: i64 = conn
+			.query_row(
+				"SELECT COUNT(*) FROM files WHERE id = ?1;",
+				[file_id],
+				|r| r.get(0),
+			)
+			.unwrap();
+		assert_eq!(orphaned_file_rows, 0, "the files row must cascade away");
+	}
+
+	/// Duplicate stable ids are reachable via same-account uuid reuse, and every
+	/// read path resolves them with the same trashed/id tie-break. Marking and
+	/// clearing must hit exactly that row — a bare stable match would strip a
+	/// sibling's genuine marker.
+	#[test]
+	fn marking_and_clearing_scope_to_the_preferred_duplicate() {
+		let conn = db();
+		let first = add_file(&conn, uuid(1), stable(9), uuid(0), "a.txt");
+		// The upsert would reconcile a duplicate stable onto the first row (by
+		// design), so seed the abuse-shaped sibling with a raw insert.
+		conn.execute(
+			"INSERT INTO items (uuid, stable_uuid, parent, type) VALUES (?1, ?2, ?3, 2);",
+			rusqlite::params![uuid(2), stable(9), uuid(0)],
+		)
+		.unwrap();
+		let second: i64 = conn
+			.query_row("SELECT id FROM items WHERE uuid = ?1;", [uuid(2)], |r| {
+				r.get(0)
+			})
+			.unwrap();
+		assert_ne!(first, second);
+
+		mark_pending_upload(&conn, stable(9), 100).unwrap();
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(1)),
+			Some(100),
+			"the tie-broken row must carry the marker"
+		);
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(2)),
+			None,
+			"the sibling must not be marked"
+		);
+
+		// Give the sibling its own genuine marker, then clear: only the
+		// tie-broken row may lose one.
+		conn.execute(
+			"UPDATE items SET pending_upload_at = 50 WHERE uuid = ?1;",
+			[uuid(2)],
+		)
+		.unwrap();
+		clear_pending_upload(&conn, stable(9)).unwrap();
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(1)),
+			None,
+			"the tie-broken row's marker is cleared"
+		);
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(2)),
+			Some(50),
+			"the sibling's marker must survive the clear"
+		);
+	}
+
+	/// `upsert_item` resolves the target row by uuid, then stable id, then `(parent, name)`. The
+	/// `local_data` COALESCE chain re-runs those three tiers independently, and COALESCE also skips
+	/// a tier whose matched row simply has a NULL `local_data` — so a row matched by stable id can
+	/// fall through to the name tier and adopt a *different* file's `local_data`.
+	#[test]
+	fn an_upsert_matched_by_stable_id_must_not_inherit_another_rows_local_data() {
+		let conn = db();
+		let parent = uuid(9);
+
+		// The row that currently holds the name "taken.txt", carrying an outstanding local edit.
+		add_file(&conn, uuid(1), stable(2), parent, "taken.txt");
+		mark_pending_upload(&conn, stable(2), MARKED_AT).unwrap();
+
+		// An unrelated file with no local_data of its own.
+		add_file(&conn, uuid(3), stable(4), parent, "other.txt");
+
+		// It is renamed onto "taken.txt" and its content edited, so the server re-mints its uuid
+		// while the stable id stays put. Identity resolves via the stable tier onto uuid(3)'s row.
+		let mut stmt = conn.prepare_cached(UPSERT_ITEM).unwrap();
+		item::upsert_file_item_with_stmts(
+			uuid(5),
+			stable(4),
+			combine_parent(Some(parent), false),
+			Some("taken.txt"),
+			None,
+			&mut stmt,
+		)
+		.unwrap();
+		drop(stmt);
+
+		assert_eq!(
+			local_data_of(&conn, uuid(5)),
+			None,
+			"a row matched by stable id must keep its own (absent) local_data, not adopt the \
+			 name-slot row's"
+		);
+		assert_eq!(
+			pending_upload_at_of(&conn, uuid(1)),
+			Some(MARKED_AT),
+			"the marker must stay on the file that actually has the outstanding edit"
+		);
+	}
+}
+
+#[cfg(test)]
+mod trashed_listing_tests {
+	use std::borrow::Cow;
+
+	use chrono::Utc;
+	use filen_sdk_rs::{crypto::file::FileKey, fs::file::meta::DecryptedFileMeta};
+	use filen_types::{auth::FileEncryptionVersion, fs::ParentUuid};
+
+	use super::*;
+
+	const MARKED_AT: i64 = 1_700_000_000_000;
+
+	/// Configured the way every real connection is, so the name-slot lookup the guard performs
+	/// has the `uuid_text` function those statements are written against.
+	fn db() -> Connection {
+		let conn = Connection::open_in_memory().unwrap();
+		crate::auth::configure_conn(&conn).unwrap();
+		conn.execute_batch(INIT).unwrap();
+		conn
+	}
+
+	fn uuid(byte: u8) -> Uuid {
+		Uuid::from_bytes([byte; 16])
+	}
+
+	fn stable(byte: u8) -> StableUuid {
+		StableUuid::new_for_test(uuid(byte))
+	}
+
+	/// A file the way a listing hands it over.
+	fn remote_file(uuid_: Uuid, stable: StableUuid, parent: ParentUuid, name: &str) -> RemoteFile {
+		let now = Utc::now();
+		RemoteFile::from_meta(
+			uuid_,
+			stable,
+			parent,
+			0,
+			0,
+			"us-east-1",
+			"test-bucket",
+			now,
+			false,
+			FileMeta::Decoded(DecryptedFileMeta {
+				name: Cow::Owned(name.to_string()),
+				size: 0,
+				mime: Cow::Owned("text/plain".to_string()),
+				key: FileKey::from_str_with_version(&"a".repeat(64), FileEncryptionVersion::V3)
+					.unwrap(),
+				last_modified: now,
+				created: Some(now),
+				hash: None,
+			}),
+		)
+	}
+
+	/// The live head of a file with an edit that has not reached the server yet, seeded through
+	/// the same bulk ingest a directory listing uses.
+	fn seed_live_file(conn: &mut Connection, uuid_: Uuid, stable: StableUuid, parent: Uuid) {
+		update_items_with_parent(
+			conn,
+			[],
+			[remote_file(
+				uuid_,
+				stable,
+				ParentUuid::Uuid(parent),
+				"edited.txt",
+			)],
+			parent,
+		)
+		.unwrap();
+		mark_pending_upload(conn, stable, MARKED_AT).unwrap();
+	}
+
+	/// A versioning-disabled edit leaves the retired uuid listed as trashed for ~60s, re-stamped
+	/// with a stable id that belongs to no lineage. Our own upload has already moved the row to
+	/// the new uuid, so that ghost matches nothing by uuid or stable id and falls through to the
+	/// `(parent, name)` tier — where the live head is sitting, holding the user's edit.
+	#[test]
+	fn a_trash_listing_must_not_adopt_a_live_row_by_name() {
+		let mut conn = db();
+		let parent = uuid(9);
+		seed_live_file(&mut conn, uuid(2), stable(1), parent);
+
+		update_trashed_items(
+			&mut conn,
+			[],
+			[remote_file(
+				uuid(3),
+				stable(4),
+				ParentUuid::Trash(parent),
+				"edited.txt",
+			)],
+		)
+		.unwrap();
+
+		let row = RawDBItem::select(&conn, uuid(2))
+			.unwrap()
+			.expect("the live row must survive the trash refresh");
+		assert_eq!(
+			row.parent,
+			Some(ParentUuid::Uuid(parent)),
+			"a ghost must not drag the live head into the trash"
+		);
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![stable(1)],
+			"the outstanding edit must stay drainable"
+		);
+	}
+
+	/// The same ghost, seen before the cache learned about the new uuid: it still carries the
+	/// retired uuid, so it matches our row outright — but its stable id is not ours, and adopting
+	/// it would overwrite the lineage id the live head is about to arrive with.
+	#[test]
+	fn a_trash_listing_must_not_adopt_a_re_stamped_stable_id() {
+		let mut conn = db();
+		let parent = uuid(9);
+		seed_live_file(&mut conn, uuid(1), stable(2), parent);
+
+		update_trashed_items(
+			&mut conn,
+			[],
+			[remote_file(
+				uuid(1),
+				stable(5),
+				ParentUuid::Trash(parent),
+				"edited.txt",
+			)],
+		)
+		.unwrap();
+
+		let row = RawDBItem::select(&conn, uuid(1))
+			.unwrap()
+			.expect("the live row must survive the trash refresh");
+		assert_eq!(
+			row.parent,
+			Some(ParentUuid::Uuid(parent)),
+			"a re-stamped corpse must not trash the row it was minted from"
+		);
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![stable(2)],
+			"the row must keep its own stable id, and its edit"
+		);
+	}
+
+	/// The guard must only refuse records that are not what they claim to be: an item genuinely
+	/// trashed elsewhere arrives with both ids intact and has to land, or the trash listing stops
+	/// converging.
+	#[test]
+	fn a_genuinely_trashed_file_still_lands() {
+		let mut conn = db();
+		let parent = uuid(9);
+		seed_live_file(&mut conn, uuid(1), stable(2), parent);
+
+		update_trashed_items(
+			&mut conn,
+			[],
+			[remote_file(
+				uuid(1),
+				stable(2),
+				ParentUuid::Trash(parent),
+				"edited.txt",
+			)],
+		)
+		.unwrap();
+
+		let row = RawDBItem::select(&conn, uuid(1)).unwrap().unwrap();
+		assert_eq!(
+			row.parent,
+			Some(ParentUuid::Trash(parent)),
+			"a real trashing must still be applied"
+		);
+	}
+
+	/// One listing, hostile order: a new file that took over a renamed
+	/// sibling's old name is enumerated before the sibling's own record. The
+	/// newcomer must not reach the `(parent, name)` tier while the sibling's
+	/// row still sits at the old name — that would steal the row, its stable
+	/// id and its pending-upload marker.
+	#[test]
+	fn a_batch_newcomer_must_not_steal_a_renamed_siblings_row() {
+		let mut conn = db();
+		let parent = uuid(9);
+		// A lives at "report.txt" with an outstanding edit marker.
+		update_items_with_parent(
+			&mut conn,
+			[],
+			[remote_file(
+				uuid(1),
+				stable(1),
+				ParentUuid::Uuid(parent),
+				"report.txt",
+			)],
+			parent,
+		)
+		.unwrap();
+		mark_pending_upload(&conn, stable(1), MARKED_AT).unwrap();
+
+		// The server listing: newcomer C now owns "report.txt", A moved to
+		// "renamed.txt" — and C is enumerated first.
+		update_items_with_parent(
+			&mut conn,
+			[],
+			[
+				remote_file(uuid(2), stable(2), ParentUuid::Uuid(parent), "report.txt"),
+				remote_file(uuid(1), stable(1), ParentUuid::Uuid(parent), "renamed.txt"),
+			],
+			parent,
+		)
+		.unwrap();
+
+		let a = RawDBItem::select(&conn, uuid(1))
+			.unwrap()
+			.expect("the renamed sibling keeps its row");
+		assert_eq!(
+			select_pending_uploads(&conn).unwrap(),
+			vec![stable(1)],
+			"the sibling's pending-upload marker must survive the batch, and only its own"
+		);
+		let c = RawDBItem::select(&conn, uuid(2))
+			.unwrap()
+			.expect("the newcomer gets its own fresh row");
+		assert_ne!(a.id, c.id, "two files, two rows");
+		assert_eq!(
+			c.local_data, None,
+			"the newcomer must not inherit the sibling's local_data"
 		);
 	}
 }
