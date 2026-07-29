@@ -12,7 +12,7 @@ use crate::{
 		AUTH_CLEANUP_INTERVAL, AuthCacheState, AuthStatus, CacheState, DB_FILE_NAME,
 		FilenMobileCacheState, update_saved_db_state_cache_cleanup_time,
 	},
-	sql,
+	sql::{self, item::RawDBItem},
 	traits::ProgressCallback,
 };
 use chrono::{DateTime, Utc};
@@ -167,6 +167,13 @@ impl AuthCacheState {
 		let parent = dst
 			.parent()
 			.expect("cached file path parent should always exist");
+		// Known, accepted window: these are `spawn_blocking` underneath and a started blocking
+		// task cannot be aborted, so a cancelled download (UniFFI drops the whole future) releases
+		// the caller's per-item guard while the rename is still in flight. A clear that takes the
+		// freed lock can then be undone by the rename landing after it, leaving a cache entry for
+		// a file that was just cleared. It self-heals: the next open hash-checks the cached copy
+		// before serving it. Closing it properly means moving this tail into a spawned task that
+		// owns the guard and awaiting its handle, which is why it has not been done inline here.
 		tokio::fs::create_dir_all(parent).await?;
 		tokio::fs::rename(&src, &dst).await?;
 		Ok(dst)
@@ -377,9 +384,27 @@ async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
 	let mut futures = FuturesUnordered::new();
 
 	for i in removed_uuid_positions {
-		let entry = &uuids[i].1;
+		let (uuid, entry) = &uuids[i];
 		futures.push(async move {
 			let path = entry.path();
+			// The listing above and the query that decided this uuid is unknown both happened
+			// before now, so an item materialised in between would be deleted while live. Re-check
+			// under the item's own lock, which is what every other deletion path holds.
+			let _local_file_guard = auth_state.lock_local_file(Uuid::from(*uuid)).await;
+			match RawDBItem::select(&auth_state.conn(), Uuid::from(*uuid)) {
+				Ok(Some(_)) => {
+					trace!("{} became known while sweeping, keeping it", path.display());
+					return;
+				}
+				Ok(None) => {}
+				Err(e) => {
+					error!(
+						"Failed to re-check {} before removing it: {e}",
+						path.display()
+					);
+					return;
+				}
+			}
 			match entry.metadata().await {
 				Ok(meta) if meta.is_file() => match tokio::fs::remove_file(&path).await {
 					Ok(_) => {
