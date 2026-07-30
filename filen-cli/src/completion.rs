@@ -10,7 +10,7 @@ use filen_sdk_rs::{
 
 use crate::{CliArgs, docs::get_help_topics, util::RemotePath};
 
-#[derive(PartialEq, strum::EnumString, strum::Display)]
+#[derive(PartialEq, strum::EnumString, strum::Display, Clone)]
 enum FilenArgType {
 	#[strum(serialize = "file")]
 	File,
@@ -47,6 +47,9 @@ pub(crate) struct FilenCompleter(FilenArgType, Option<CompleterContext>);
 struct CompleterContext {
 	client: Arc<Client>,
 	working_path: RemotePath,
+	/// Whether to block and wait for the result of the async completion task.
+	/// Normally, use async autocomplete.
+	await_result: bool,
 }
 
 impl FilenCompleter {
@@ -70,10 +73,12 @@ impl FilenCompleter {
 		command: clap::Command,
 		client: Arc<Client>,
 		working_path: &RemotePath,
+		await_result: bool,
 	) -> clap::Command {
 		let context = CompleterContext {
 			client,
 			working_path: working_path.clone(),
+			await_result,
 		};
 		command.mut_subcommands(|subcommand| {
 			subcommand.mut_args(|arg| {
@@ -97,33 +102,139 @@ impl FilenCompleter {
 }
 
 impl ValueCompleter for FilenCompleter {
-	fn complete(&self, _input: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
+	/// The obscure way async data fetching is handled here is because clap's and inquire's APIs are not designed for async completions.
+	/// Our fork of inquire contains a workaround that still requires handling it like this on the call site.
+	/// Basically, when a completion is needed, an empty result is returned first, and a task to fetch the data is started in the background.
+	/// inquire then continually queries the completer if new results are available, and when the data fetching future has completed,
+	/// its results are saved in the dict and picked up by the next time the completer is called.
+	/// By doing this, typing is not blocked by completions, but they are still available soon after.
+	fn complete(&self, input: &std::ffi::OsStr) -> Vec<clap_complete::CompletionCandidate> {
 		match self.1 {
 			None => vec![self.0.get_uninitialized_completion_output().into()],
 			Some(ref context) => tokio::task::block_in_place(|| {
-				match tokio::runtime::Handle::current().block_on(Self::complete(
-					&self.0,
-					&context.client,
-					&context.working_path,
-					_input.to_str().unwrap_or(""),
-				)) {
-					Ok(candidates) => candidates
-						.into_iter()
-						.map(CompletionCandidate::new)
-						.collect(),
-					Err(e) => {
-						eprintln!("Error during completion: {}", e); // todo
-						vec![]
+				let runtime = tokio::runtime::Handle::current();
+				runtime.block_on(async {
+					let completion_key = CompletionKey {
+						working_path: context.working_path.clone(),
+						input: input.to_string_lossy().to_string(),
+					};
+					let mut async_completions = ASYNC_COMPLETIONS.lock().await;
+					async_completions
+						.pending_completion_tasks
+						.retain(|key, _| key == &completion_key);
+					if let Some(completions) =
+						async_completions.fetched_completions.get(&completion_key)
+					{
+						completions.iter().map(CompletionCandidate::new).collect()
+					} else {
+						if let Some(handle) = async_completions
+							.pending_completion_tasks
+							.get(&completion_key)
+						{
+							if handle.is_finished() || context.await_result {
+								let handle = async_completions
+									.pending_completion_tasks
+									.remove(&completion_key)
+									.unwrap();
+								match handle.await {
+									Ok(Ok(completions)) => completions
+										.into_iter()
+										.map(CompletionCandidate::new)
+										.collect(),
+									Ok(Err(e)) => {
+										log::error!("Error in completion task: {:?}", e);
+										vec![]
+									}
+									Err(e) => {
+										log::error!(
+											"Error in completion task while joining: {:?}",
+											e
+										);
+										vec![]
+									}
+								}
+							} else {
+								vec![]
+							}
+						} else {
+							let arg_type = self.0.clone();
+							let context = context.clone();
+							let input = input.to_os_string();
+							let handle = runtime.spawn(async move {
+								Self::complete(
+									arg_type,
+									&context.client,
+									&context.working_path,
+									input.to_str().unwrap_or(""),
+								)
+								.await
+							});
+							if context.await_result {
+								match handle.await {
+									Ok(Ok(completions)) => completions
+										.into_iter()
+										.map(CompletionCandidate::new)
+										.collect(),
+									Ok(Err(e)) => {
+										log::error!("Error in completion task: {:?}", e);
+										vec![]
+									}
+									Err(e) => {
+										log::error!(
+											"Error in completion task while joining: {:?}",
+											e
+										);
+										vec![]
+									}
+								}
+							} else {
+								async_completions
+									.pending_completion_tasks
+									.insert(completion_key.clone(), handle);
+								vec![]
+							}
+						}
 					}
-				}
+				})
 			}),
 		}
 	}
 }
 
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+struct CompletionKey {
+	working_path: RemotePath,
+	input: String,
+}
+struct AsyncCompletions {
+	pending_completion_tasks:
+		std::collections::HashMap<CompletionKey, tokio::task::JoinHandle<Result<Vec<String>>>>,
+	fetched_completions: std::collections::HashMap<CompletionKey, Vec<String>>,
+}
+static ASYNC_COMPLETIONS: std::sync::LazyLock<tokio::sync::Mutex<AsyncCompletions>> =
+	std::sync::LazyLock::new(|| {
+		tokio::sync::Mutex::new(AsyncCompletions {
+			pending_completion_tasks: std::collections::HashMap::new(),
+			fetched_completions: std::collections::HashMap::new(),
+		})
+	});
+
+pub(crate) fn async_completions_available() -> bool {
+	tokio::task::block_in_place(|| {
+		tokio::runtime::Handle::current().block_on(async {
+			let async_completions = ASYNC_COMPLETIONS.lock().await;
+
+			async_completions
+				.pending_completion_tasks
+				.values()
+				.any(|handle| handle.is_finished())
+		})
+	})
+}
+
 impl FilenCompleter {
 	async fn complete(
-		arg_type: &FilenArgType,
+		arg_type: FilenArgType,
 		client: &Client,
 		working_path: &RemotePath,
 		input: &str,
@@ -162,7 +273,7 @@ impl FilenCompleter {
 						candidates.push(name.to_string());
 					}
 				}
-				if arg_type == &FilenArgType::File || arg_type == &FilenArgType::FileOrDirectory {
+				if arg_type == FilenArgType::File || arg_type == FilenArgType::FileOrDirectory {
 					for file in files {
 						let name = file.meta.name().unwrap_or("");
 						if name.starts_with(basename_input) {
@@ -196,6 +307,7 @@ pub(crate) fn completer(
 	input: &str,
 	client: Arc<Client>,
 	working_path: &RemotePath,
+	await_result: bool,
 ) -> Vec<String> {
 	let Some(args) = shlex::split(input) else {
 		return Vec::new();
@@ -206,7 +318,7 @@ pub(crate) fn completer(
 	}
 	let args_index = args.len();
 	let mut cli = CliArgs::command();
-	cli = FilenCompleter::initialize_completers_in_command(cli, client, working_path);
+	cli = FilenCompleter::initialize_completers_in_command(cli, client, working_path, await_result);
 	match clap_complete::engine::complete(
 		&mut cli,
 		vec!["filen"]
@@ -252,7 +364,7 @@ mod tests {
 		let test_completer = |input: &str, expected: &[&str]| {
 			let mut expected = Vec::from(expected);
 			expected.sort();
-			let mut completions = super::completer(input, client.clone(), &root_path);
+			let mut completions = super::completer(input, client.clone(), &root_path, true);
 			completions.sort(); // ignore order
 			assert_eq!(
 				completions, expected,

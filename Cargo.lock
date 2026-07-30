@@ -3094,7 +3094,7 @@ dependencies = [
 [[package]]
 name = "inquire"
 version = "0.9.4"
-source = "git+https://github.com/JupiterPi/inquire.git?branch=more-actions#0e595b4f2cefaebb996f3a1d84fd3f9eeccb0405"
+source = "git+https://github.com/JupiterPi/inquire.git?branch=async-autocomplete#d8810e58076f7726fc7a30249f6ee0debe7ad4ce"
 dependencies = [
  "bitflags",
  "crossterm",

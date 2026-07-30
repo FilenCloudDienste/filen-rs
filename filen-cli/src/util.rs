@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use std::fmt::Display;
 
 /// Represents a path to a remote file or directory.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub(crate) struct RemotePath(pub(crate) String);
 
 impl RemotePath {

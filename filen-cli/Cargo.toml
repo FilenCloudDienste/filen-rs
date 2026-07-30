@@ -59,9 +59,10 @@ port_check = "0.3.0"
 open = "5.3.5"
 clap_complete = { version = "4.5.65", features = ["unstable-dynamic"] }
 strum = { version = "0.28.0", features = ["derive"] }
-# we're using this fork of inquire, which contains history functionality (copied from an unmerged PR to upstream https://github.com/mikaelmello/inquire/pull/229) as well as more input action
+# we're using this fork of inquire, which contains history functionality (copied from an unmerged PR to upstream https://github.com/mikaelmello/inquire/pull/229)
+# as well as more input actions and async autocompletion (which is implemented quite hackily)
 # todo: might merge this upstream in the future
-inquire = { git = "https://github.com/JupiterPi/inquire.git", branch = "more-actions" }
+inquire = { git = "https://github.com/JupiterPi/inquire.git", branch = "async-autocomplete" }
 console = "0.16.4"
 ctrlc = "3.5.2"
 

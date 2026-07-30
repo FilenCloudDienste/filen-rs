@@ -13,7 +13,9 @@ use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
 use unicode_width::UnicodeWidthStr;
 
-use crate::{CliArgs, EXIT_CODE_ERROR_PREFIX, util::RemotePath};
+use crate::{
+	CliArgs, EXIT_CODE_ERROR_PREFIX, completion::async_completions_available, util::RemotePath,
+};
 
 const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -500,32 +502,28 @@ impl Autocomplete for InquireCompleter {
 		&mut self,
 		input: &str,
 		highlighted_suggestion: Option<String>,
-	) -> Result<inquire::autocompletion::Replacement, inquire::CustomUserError> {
-		let completions =
-			crate::completion::completer(input, self.client.clone(), &self.working_path);
-		if let Some(highlighted) = highlighted_suggestion {
-			if completions.contains(&highlighted) {
-				Ok(inquire::autocompletion::Replacement::Some(highlighted))
-			} else {
-				Ok(inquire::autocompletion::Replacement::None)
-			}
+	) -> std::prelude::v1::Result<inquire::autocompletion::Replacement, inquire::CustomUserError> {
+		if highlighted_suggestion.is_some() {
+			Ok(highlighted_suggestion)
 		} else {
-			Ok(completions
-				.first()
-				.cloned()
-				.map(inquire::autocompletion::Replacement::Some)
-				.unwrap_or(inquire::autocompletion::Replacement::None))
+			let completions =
+				crate::completion::completer(input, self.client.clone(), &self.working_path, true);
+			Ok(completions.first().cloned())
 		}
-	} // todo: AI ^
+	}
 
 	fn get_suggestions(
 		&mut self,
 		input: &str,
 	) -> std::prelude::v1::Result<Vec<String>, inquire::CustomUserError> {
 		let completions =
-			crate::completion::completer(input, self.client.clone(), &self.working_path);
+			crate::completion::completer(input, self.client.clone(), &self.working_path, false);
 		Ok(completions)
-	} // todo: AI ^
+	}
+
+	fn updated_suggestions_available(&mut self, _input: &str) -> bool {
+		async_completions_available() // could depend on input, but it's okay to overestimate here
+	}
 }
 
 #[cfg(test)]
