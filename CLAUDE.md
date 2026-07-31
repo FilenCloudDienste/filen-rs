@@ -18,6 +18,13 @@ cargo test -p filen-mobile-native-cache
 # Run a specific test
 cargo test -p filen-sdk-rs --test file_tests test_name
 
+# Unit tests only (no network, no test account needed)
+cargo test --lib
+
+# Cache engine: unit tests / live integration tests
+cargo test -p filen-sdk-rs --lib -F cache
+cargo test -p filen-sdk-rs --test cache_tests -F cache
+
 # Lint
 cargo clippy
 
@@ -32,6 +39,58 @@ TEST_PASSWORD="password"
 TEST_SHARE_EMAIL="share@example.com"  # for sharing tests
 TEST_SHARE_PASSWORD="password"
 ```
+
+Test notes:
+
+- Every test in a run shares the single account from your `.env`, and the server grants the
+  named `drive-write` resource lock (`Client::lock_drive`) to one holder at a time, so
+  drive-mutating tests (notably `cache_tests`) serialize on it. Expect long wall-clock times
+  and avoid running several test binaries in one parallel pool — contention starves the
+  convergence polls and tests start failing.
+- `dir_tests::size` sleeps ~80 minutes waiting out the backend's throttled size
+  recomputation, and on `main` it is a normal test — exclude it from sweeps with
+  `--skip size` unless you specifically mean to exercise the size endpoint. (Some branches
+  carry an `#[ignore]` for it; there, run it with `--ignored` instead.)
+- `filen-mobile-native-cache` is a UniFFI crate; build/test it with
+  `cargo build -p filen-mobile-native-cache`.
+
+## Feature Flags
+
+`filen-sdk-rs` (most flags are additive and off by default; `default = ["multi-threaded-crypto"]`):
+
+| Feature | What it enables |
+|---------|-----------------|
+| `cache` | SQLite metadata cache (`src/cache/`, `rusqlite`); gates the `cache_tests` / `cache_search_tests` test targets |
+| `uniffi` | UniFFI scaffolding for the mobile bindings |
+| `http-provider` | Local `axum` server handing out `http://127.0.0.1` URLs for remote files (range requests), so platform media players can stream them |
+| `wasm-full` | Browser WASM build (with threads) |
+| `service-worker` | WASM service-worker build |
+| `multi-threaded-crypto` | `rayon` / `wasm-bindgen-rayon` parallel crypto |
+| `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata) — never enable in production |
+| `heif-decoder` / `avif-decoder` | Thumbnail decoding for HEIF/HEIC and AVIF |
+| `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark only |
+
+The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
+`filen-sdk-rs/web/ubrn.config.yaml`).
+
+## Git Hooks
+
+Hooks live in `scripts/git-hooks/` and are opt-in per clone/worktree:
+`./scripts/git-hooks/install.sh` (sets `core.hooksPath`).
+
+- **pre-commit** — `cargo fmt --all --check`, `cargo fmt` inside `filen-sdk-rs`, `taplo
+  lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then four clippy passes: workspace
+  (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`, and
+  wasm32 `-F wasm-full` + `-F service-worker` (both run from the `filen-sdk-rs` directory).
+  **On a cold cargo cache this takes several minutes** — warm the cache by running those
+  clippy invocations first, or the commit may be killed by a tool/CI timeout mid-hook.
+  Missing `taplo` / `sqlfluff` / the wasm32 target are skipped with a warning.
+- **pre-push** — heavier: feature-combination clippy, `clippy --tests`, full `sqlfluff
+  lint .`, and `cargo test --lib --no-fail-fast` (`SKIP_TESTS=1` to skip).
+
+The auto-formatter some editors/agents run on save does **not** match this repo's nightly
+`cargo fmt` output and will fail the pre-commit gate. Run `cargo fmt -p <crate>` before
+staging.
 
 ## Toolchain
 
@@ -106,6 +165,24 @@ The `Client` dispatches to the correct version at runtime via `AuthInfo` enum.
 - **UniFFI** (`feature = "uniffi"`) — generates FFI scaffolding for mobile; used by `filen-mobile-native-cache`
 
 The `filen-sdk-rs/web/` directory contains a Node/Yarn project for WASM testing (see `wasm-test.sh`).
+
+### Mobile Consumers
+
+The mobile app repo (`filen-ts`) consumes this repo **twice**, in two different ways:
+
+- `packages/filen-mobile/filen-rs` is a real **git submodule** (declared in `.gitmodules`,
+  pointing at this repo's GitHub URL) — a separate checkout, normally detached at the
+  recorded commit. Both mobile platforms build `filen-mobile-native-cache` (the Drive cache)
+  from *that* checkout, via the expo prebuild plugins `plugins/withAndroidRustBuild.ts` and
+  `plugins/withFileProvider.ts`, which run cargo in `<projectRoot>/filen-rs` (release,
+  `-F heif-decoder`). Testing a branch on device means getting the branch into the submodule;
+  landing it means a submodule pointer bump.
+- `@filen/sdk-rs` — the `ubrn` (uniffi-bindgen-react-native) build of `filen-sdk-rs` that
+  powers Notes/Chats and transfers — is consumed as an ordinary **published npm dependency**
+  pinned in `packages/filen-mobile/package.json`. Rebuilding `filen-sdk-rs/web` locally does
+  **not** affect the app unless you deliberately override that install (link/symlink it).
+
+See the `mobile-build` skill in `.claude/skills/` for the build commands and gotchas.
 
 ### Incremental Build Note
 
