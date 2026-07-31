@@ -68,3 +68,22 @@ pub(super) async fn login(
 			.into_owned(),
 	))
 }
+
+/// Recover the v1 [`AuthInfo`] with an existing API key instead of a `/v3/login` call, so no 2FA
+/// code is needed.
+///
+/// The v1 master key derives from the password alone — no salt, no server data — so the same
+/// [`super::v2::fetch_master_keys`] call as v2 rebuilds the chain. The blob it posts is in v2
+/// metadata format, since this SDK cannot encrypt v1 metadata at all; that matches how it already
+/// treats v1 accounts, whose item metadata, name hashes and file bodies it writes with the v2
+/// scheme. Reading is unaffected either way — the v2 decrypter falls back to the v1 layout on the
+/// `U2FsdGVk` marker.
+pub(super) async fn auth_info_with_api_key(
+	pwd: &str,
+	auth_client: &AuthClient,
+) -> Result<super::AuthInfo, Error> {
+	let (master_key, _pwd) = crypto::v1::derive_password_and_mk(pwd.as_bytes())?;
+	Ok(super::AuthInfo::V1(super::v2::AuthInfo {
+		master_keys: super::v2::fetch_master_keys(master_key, auth_client).await?,
+	}))
+}

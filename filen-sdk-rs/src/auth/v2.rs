@@ -17,7 +17,7 @@ use crate::{
 		self,
 		error::ConversionError,
 		shared::{CreateRandom, MetaCrypter},
-		v2::{MasterKeys, hash},
+		v2::{MasterKey, MasterKeys, hash},
 	},
 };
 
@@ -100,30 +100,46 @@ pub(super) async fn login(
 	))
 }
 
-/// Recover the v2 [`AuthInfo`] with an existing API key instead of a `/v3/login` call (so no
-/// 2FA code is needed): `/v3/user/masterKeys` is an EXCHANGE — posting the password-derived key
-/// (encrypted with itself) returns the account's full master-key chain.
+/// Fetch the account's master-key chain using the password-derived key alone, for logins that
+/// skip `/v3/login` (and therefore never see its `masterKeys` field). `/v3/user/masterKeys` is a
+/// POST, but it reads: the derived key goes up encrypted with itself, and the account's chain
+/// comes back.
+///
+/// The single-key post is the normal path, not a shortcut — `filen-sdk-ts` does the same thing
+/// on every login (`_updateKeys`, called with just the freshly derived key), and password
+/// changes write the full chain through `/v3/user/settings/password/change` instead.
+///
+/// Shared by v1 and v2, which differ only in how the key is derived.
+pub(super) async fn fetch_master_keys(
+	master_key: MasterKey,
+	auth_client: &AuthClient,
+) -> Result<MasterKeys, Error> {
+	let response = api::v3::user::master_keys::post(
+		auth_client,
+		&api::v3::user::master_keys::Request {
+			master_keys: MasterKeys::new_from_key(master_key.clone())
+				.to_encrypted()
+				.await,
+		},
+	)
+	.await?;
+	Ok(MasterKeys::new(response.keys, master_key).await?)
+}
+
+/// Recover the v2 [`AuthInfo`] with an existing API key instead of a `/v3/login` call, so no 2FA
+/// code is needed.
 pub(super) async fn auth_info_with_api_key(
 	pwd: &str,
 	info: &api::v3::auth::info::Response<'_>,
-	auth_client: &super::http::AuthClient,
+	auth_client: &AuthClient,
 ) -> Result<super::AuthInfo, Error> {
 	let (master_key, _pwd) = crate::runtime::do_cpu_intensive(|| {
 		crypto::v2::derive_password_and_mk(pwd.as_bytes(), info.salt.as_bytes())
 	})
 	.await?;
-	let encrypted = MasterKeys::new_from_key(master_key.clone())
-		.to_encrypted()
-		.await;
-	let response = api::v3::user::master_keys::post(
-		auth_client,
-		&api::v3::user::master_keys::Request {
-			master_keys: encrypted,
-		},
-	)
-	.await?;
-	let master_keys = crypto::v2::MasterKeys::new(response.keys, master_key).await?;
-	Ok(super::AuthInfo::V2(AuthInfo { master_keys }))
+	Ok(super::AuthInfo::V2(AuthInfo {
+		master_keys: fetch_master_keys(master_key, auth_client).await?,
+	}))
 }
 
 pub(crate) fn hash_name(name: &str) -> SizedHexString<U20> {

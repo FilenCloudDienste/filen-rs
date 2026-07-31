@@ -211,12 +211,7 @@ impl UnauthClient {
 		);
 
 		let auth_info = match info_response.auth_version {
-			AuthVersion::V1 => {
-				return Err(Error::custom(
-					crate::ErrorKind::Conversion,
-					"api-key login is not supported for v1 accounts",
-				));
-			}
+			AuthVersion::V1 => v1::auth_info_with_api_key(pwd, &client).await?,
 			AuthVersion::V2 => v2::auth_info_with_api_key(pwd, &info_response, &client).await?,
 			AuthVersion::V3 => v3::auth_info_with_api_key(pwd, &info_response, &client).await?,
 		};
