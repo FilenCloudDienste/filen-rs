@@ -195,7 +195,7 @@ async fn cmd_rm() {
 }
 
 #[shared_test_runtime]
-async fn cmd_mv_cp() {
+async fn cmd_mv() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = &resources.client;
 	let test_dir = &resources.dir;
@@ -234,6 +234,84 @@ async fn cmd_mv_cp() {
 		.await
 		.unwrap();
 	assert!(new_file.is_some());
+}
+
+#[shared_test_runtime]
+async fn cmd_cp() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// create a file and directory to copy
+	let copy_file = client
+		.make_file_builder("copy_file.txt", test_dir.uuid)
+		.unwrap();
+	client
+		.upload_file(copy_file, b"copied content")
+		.await
+		.unwrap();
+	let copy_dir = client
+		.create_dir(&test_dir.into(), "copy_source")
+		.await
+		.unwrap();
+	let nested_file = client
+		.make_file_builder("nested.txt", copy_dir.uuid)
+		.unwrap();
+	client
+		.upload_file(nested_file, b"nested content")
+		.await
+		.unwrap();
+
+	let copy_target_dir = format!("{}/cp_target", test_dir.name().unwrap());
+	client
+		.create_dir(&test_dir.into(), "cp_target")
+		.await
+		.unwrap();
+
+	// cp file
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{}/copy_file.txt", test_dir.name().unwrap()),
+		&copy_target_dir
+	)
+	.success()
+	.stdout(predicates::str::contains("Copied"));
+	assert!(
+		client
+			.find_item_at_path(&format!("{}/copy_file.txt", test_dir.name().unwrap()))
+			.await
+			.unwrap()
+			.is_some()
+	);
+	assert!(
+		client
+			.find_item_at_path(&format!(
+				"{}/cp_target/copy_file.txt",
+				test_dir.name().unwrap()
+			))
+			.await
+			.unwrap()
+			.is_some()
+	);
+
+	// cp directory
+	authenticated_cli_with_args!(
+		"cp",
+		&format!("{}/copy_source", test_dir.name().unwrap()),
+		&copy_target_dir
+	)
+	.success()
+	.stdout(predicates::str::contains("Copied"));
+	assert!(
+		client
+			.find_item_at_path(&format!(
+				"{}/cp_target/copy_source/nested.txt",
+				test_dir.name().unwrap()
+			))
+			.await
+			.unwrap()
+			.is_some()
+	);
 }
 
 #[shared_test_runtime]

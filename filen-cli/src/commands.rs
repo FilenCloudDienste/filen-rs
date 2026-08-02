@@ -864,11 +864,11 @@ async fn move_or_copy_file_or_directory(
 			}
 		},
 		MoveOrCopy::Copy => match source_file_or_directory {
-			NonRootFileType::File(_) => {
-				todo!("Implement file copy"); // filen-sdk-rs does not support file copy yet
+			NonRootFileType::File(file) => {
+				copy_file(client, file.as_ref(), &destination_dir).await?;
 			}
-			NonRootFileType::Dir(_) => {
-				todo!("Implement directory copy"); // filen-sdk-rs does not support directory copy yet
+			NonRootFileType::Dir(dir) => {
+				copy_dir_recursive(client, dir.as_ref(), &destination_dir).await?;
 			}
 			NonRootFileType::Root(_) => {
 				return Err(UI::failure("Cannot copy root directory"));
@@ -885,6 +885,73 @@ async fn move_or_copy_file_or_directory(
 		destination_str.0
 	));
 	Ok(())
+}
+
+async fn copy_file(
+	client: &Client,
+	file: &RemoteFile,
+	destination_dir: &DirType<'_, Normal>,
+) -> Result<RemoteFile> {
+	let name = file.name().context("Failed to decrypt file name")?;
+	let mut builder = client
+		.make_file_builder(name, destination_dir.uuid())
+		.context("Failed to prepare file copy")?;
+	if let Some(mime) = file.mime() {
+		builder = builder.mime(mime.to_string());
+	}
+	if let Some(created) = file.created() {
+		builder = builder.created(created);
+	}
+	if let Some(modified) = file.last_modified() {
+		builder = builder.modified(modified);
+	}
+	let data = client
+		.download_file(file)
+		.await
+		.context("Failed to download file for copying")?;
+	// todo: does this consume too much memory for large files? maybe we should stream the data
+	client
+		.upload_file(builder, &data)
+		.await
+		.context("Failed to upload copied file")
+}
+
+async fn copy_dir_recursive(
+	client: &Client,
+	source_dir: &RemoteDirectory,
+	destination_parent: &DirType<'_, Normal>,
+) -> Result<RemoteDirectory> {
+	let name = source_dir
+		.name()
+		.context("Failed to decrypt directory name")?;
+	let new_dir = client
+		.create_dir(destination_parent, name)
+		.await
+		.context("Failed to create destination directory for copying")?;
+	let (subdirs, files) = client
+		.list_dir::<_, Normal>(
+			&DirType::Dir(std::borrow::Cow::Borrowed(source_dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.context("Failed to list source directory for copying")?;
+	for file in &files {
+		copy_file(
+			client,
+			file,
+			&DirType::Dir(std::borrow::Cow::Borrowed(&new_dir)),
+		)
+		.await?;
+	}
+	for subdir in &subdirs {
+		Box::pin(copy_dir_recursive(
+			client,
+			subdir,
+			&DirType::Dir(std::borrow::Cow::Borrowed(&new_dir)),
+		))
+		.await?;
+	}
+	Ok(new_dir)
 }
 
 async fn set_file_or_directory_favorite(
