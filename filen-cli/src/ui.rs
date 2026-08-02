@@ -61,9 +61,9 @@ pub(crate) struct UI {
 	history: Vec<String>,
 	override_terminal_width: Option<usize>,
 	output: Vec<String>,
-
 	/// Whether to output machine-readable JSON where applicable
 	pub(crate) json: bool,
+	disable_suggestions: bool,
 }
 
 impl UI {
@@ -74,6 +74,7 @@ impl UI {
 			override_terminal_width: None,
 			output: Vec::new(),
 			json: false,
+			disable_suggestions: false,
 		}
 	}
 
@@ -82,10 +83,12 @@ impl UI {
 		quiet: bool,
 		json: bool,
 		override_terminal_width: Option<usize>,
+		disable_suggestions: bool,
 	) {
 		self.quiet = quiet;
 		self.json = json;
 		self.override_terminal_width = override_terminal_width;
+		self.disable_suggestions = disable_suggestions;
 	}
 
 	fn get_terminal_width(&self) -> Option<usize> {
@@ -278,6 +281,7 @@ impl UI {
 			.with_autocomplete(InquireCompleter {
 				client,
 				working_path: working_path.clone(),
+				disable_suggestions: self.disable_suggestions,
 			})
 			.with_history(SimpleHistory::new(self.history.clone()))
 			.prompt_skippable()
@@ -495,6 +499,7 @@ pub(crate) fn format_size(size: u64) -> String {
 struct InquireCompleter {
 	client: Arc<Client>,
 	working_path: RemotePath,
+	disable_suggestions: bool,
 }
 
 impl Autocomplete for InquireCompleter {
@@ -516,6 +521,9 @@ impl Autocomplete for InquireCompleter {
 		&mut self,
 		input: &str,
 	) -> std::prelude::v1::Result<Vec<String>, inquire::CustomUserError> {
+		if self.disable_suggestions {
+			return Ok(Vec::new());
+		}
 		let completions =
 			crate::completion::completer(input, self.client.clone(), &self.working_path, false);
 		Ok(completions)
@@ -556,18 +564,18 @@ mod tests {
 
 		// different terminal sizes
 		let mut small_ui = UI::new();
-		small_ui.initialize(false, false, Some(30));
+		small_ui.initialize(false, false, Some(30), true);
 		test(&mut small_ui);
 		insta::assert_snapshot!(small_ui.output.join("\n"));
 		let mut large_ui = UI::new();
-		large_ui.initialize(false, false, Some(100));
+		large_ui.initialize(false, false, Some(100), true);
 		test(&mut large_ui);
 		insta::assert_snapshot!(large_ui.output.join("\n"));
 
 		// no color
 		console::set_colors_enabled(false);
 		let mut no_color_ui = UI::new();
-		no_color_ui.initialize(false, false, Some(100));
+		no_color_ui.initialize(false, false, Some(100), true);
 		test(&mut no_color_ui);
 		insta::assert_snapshot!(no_color_ui.output.join("\n"));
 	}

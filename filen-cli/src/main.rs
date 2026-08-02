@@ -83,6 +83,10 @@ pub(crate) struct CliArgs {
 	#[arg(long)]
 	always_update: bool,
 
+	/// Sets autocomplete to be less eager, only completing remote paths after pressing tab
+	#[arg(long)]
+	reluctant_autocomplete: bool,
+
 	/// Format command output as machine-readable JSON (where applicable)
 	#[arg(long)]
 	json: bool,
@@ -195,7 +199,12 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 
 	info!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
 
-	ui.initialize(cli_args.quiet, cli_args.json, None);
+	ui.initialize(
+		cli_args.quiet,
+		cli_args.json,
+		None,
+		cli_args.reluctant_autocomplete,
+	);
 
 	// --export-markdown-docs
 	if cli_args.export_markdown_docs {
