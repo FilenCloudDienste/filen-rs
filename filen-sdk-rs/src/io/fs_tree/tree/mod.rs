@@ -119,11 +119,15 @@ impl<DirExtra, FileExtra> FSTreeDFSIteratorWithPath<'_, DirExtra, FileExtra> {
 			.chain(std::iter::once(current_name))
 	}
 
+	// These are virtual remote paths (the plain iterator's only consumer is
+	// `list_dir_recursive_with_paths`), so they must stay `/`-joined on every OS to match
+	// `PathIterator`'s contract — local on-disk paths go through the canonicalized iterator
+	// below instead. `MAIN_SEPARATOR_STR` here leaked `\` into remote paths on Windows.
 	fn build_path_str(&self, root: &str, current_name: &str) -> String {
 		std::iter::once(root)
 			.skip_while(|s| s.is_empty())
 			.chain(self.descendants(current_name))
-			.intersperse(std::path::MAIN_SEPARATOR_STR)
+			.intersperse("/")
 			.collect()
 	}
 
