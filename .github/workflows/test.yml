@@ -28,10 +28,18 @@ jobs:
       contains(github.event.pull_request.title, '[test]') ||
       contains(github.event.pull_request.body, '[test]')
     strategy:
+      # One dead or failing leg must not cancel the others: fail-fast wiped the whole
+      # nightly signal whenever a single runner was lost, and kept cancelling the slow
+      # Windows legs before they could report their own (Windows-only) failures.
+      fail-fast: false
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
         version: [V1, V2] # This remains to define which version of the secrets to use
     runs-on: ${{ matrix.os }}
+    # Healthy legs finish in ~3h25m; a runner that is still going at 4.5h is wedged.
+    # Fail it with a clear timeout instead of waiting for GitHub's opaque 6h kill
+    # ("runner lost communication").
+    timeout-minutes: 270
     steps:
       - uses: actions/checkout@v4
         with:
