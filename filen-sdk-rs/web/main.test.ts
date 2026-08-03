@@ -874,28 +874,40 @@ test("notes", async () => {
 })
 
 test("chats", async () => {
+	// Hold the same account-wide `test:chats` server lock the native chat tests take
+	// (chat_tests.rs `lock_chat`): this suite shares the V2 account with the native matrix
+	// legs, and unserialized conversation churn is what exhausts the server's
+	// time-windowed create budget (`rate_limited` on v3/chat/conversations/create).
+	// Released via `Symbol.dispose` at scope exit — after the deleteChat cleanup below.
+	using _lock = await state.acquireLock({ resource: "test:chats" })
 	let chat = await state.createChat([])
 	expect(chat).toBeDefined()
-	chat = await state.renameChat(chat, "Test Chat")
-	expect(chat.name).toBe("Test Chat")
+	try {
+		chat = await state.renameChat(chat, "Test Chat")
+		expect(chat.name).toBe("Test Chat")
 
-	chat = await state.sendChatMessage(chat, "This is a test message")
-	expect(chat.lastMessage?.message).toEqual("This is a test message")
-	const fetchedChat = await state.getChat(chat.uuid)
-	expect(fetchedChat).toEqual(chat)
+		chat = await state.sendChatMessage(chat, "This is a test message")
+		expect(chat.lastMessage?.message).toEqual("This is a test message")
+		const fetchedChat = await state.getChat(chat.uuid)
+		expect(fetchedChat).toEqual(chat)
 
-	// sleep for 5s
-	await new Promise(resolve => setTimeout(resolve, 5000))
+		// sleep for 5s
+		await new Promise(resolve => setTimeout(resolve, 5000))
 
-	const chatEvent = allEvents.find(e => e.type === "chat" && e.inner.type === "messageNew" && e.inner.msg.chat === chat.uuid)
+		const chatEvent = allEvents.find(e => e.type === "chat" && e.inner.type === "messageNew" && e.inner.msg.chat === chat.uuid)
 
-	expect(chatEvent).toBeDefined()
+		expect(chatEvent).toBeDefined()
 
-	if (chatEvent?.type !== "chat" || chatEvent.inner.type !== "messageNew") {
-		throw new Error("Expected chatMessageNew event")
+		if (chatEvent?.type !== "chat" || chatEvent.inner.type !== "messageNew") {
+			throw new Error("Expected chatMessageNew event")
+		}
+
+		expect(chatEvent.inner.msg).toEqual(fetchedChat?.lastMessage)
+	} finally {
+		// Delete the conversation even on failure — leaked chats are what exhaust the
+		// create budget for later runs.
+		await state.deleteChat(chat)
 	}
-
-	expect(chatEvent.inner.msg).toEqual(fetchedChat?.lastMessage)
 })
 
 test("authError", async () => {
