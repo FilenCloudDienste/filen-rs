@@ -138,6 +138,13 @@ pub enum ErrorKind {
 	wasm_bindgen::prelude::wasm_bindgen
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+// UniFFI has no getter concept, so the react-native surface can't mirror the wasm `message`
+// getter. Exporting the traits gets the same outcome by another route: ubrn wraps thrown
+// objects in `UniffiThrownObject extends Error`, whose message is built from the object's
+// `toDebugString()` (from `Debug`; its own-property check skips the prototype `toString`, so
+// `Display` alone would not feed it) — without these exports that message is just the bare
+// type name. `Display` additionally gives Kotlin/Swift/TS a real `toString()`.
+#[cfg_attr(feature = "uniffi", uniffi::export(Debug, Display))]
 pub struct FilenSdkError {
 	kind: ErrorKind,
 	inner: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -164,9 +171,14 @@ impl FilenSdkError {
 		self.kind
 	}
 
+	// On wasm this is a GETTER (like `kind`), not a method: tooling that renders a thrown
+	// value — vitest's browser-mode serializer, DevTools, generic `error.message` readers —
+	// reads `.message` as a property. As a method, that read yields a function and vitest
+	// printed every uncaught SDK error as "Unknown Error: Function<message>". UniFFI keeps
+	// the plain `message()` method — the attribute is wasm-only.
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
-		wasm_bindgen::prelude::wasm_bindgen
+		wasm_bindgen::prelude::wasm_bindgen(getter)
 	)]
 	pub fn message(&self) -> String {
 		format!("{}", self)
@@ -222,6 +234,14 @@ impl FilenSdkError {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "toString")]
 	pub fn js_to_string(&self) -> String {
 		format!("{}", self)
+	}
+
+	/// Error-shaped `name` property, so generic renderers (`${error.name}: ${error.message}`)
+	/// identify the class instead of falling back to "Unknown Error".
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(getter)]
+	pub fn name(&self) -> String {
+		"FilenSdkError".to_string()
 	}
 }
 

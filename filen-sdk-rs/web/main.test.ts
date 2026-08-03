@@ -921,6 +921,12 @@ test("authError", async () => {
 		expect(e).toBeInstanceOf(FilenSdkError)
 		expect((e as FilenSdkError).kind).toEqual("Unauthenticated")
 		expect((e as FilenSdkError).toString()).toContain("v3/dir/content")
+		// `message`/`name` are Error-shaped string PROPERTIES (wasm getters) so generic
+		// renderers print "FilenSdkError: <message>" — a method here regresses uncaught
+		// SDK errors back to "Unknown Error: Function<message>" in vitest.
+		expect(typeof (e as FilenSdkError).message).toBe("string")
+		expect((e as FilenSdkError).message).toContain("Unauthenticated")
+		expect((e as FilenSdkError).name).toBe("FilenSdkError")
 	}
 
 	let gotAuthFailedEvent = false
