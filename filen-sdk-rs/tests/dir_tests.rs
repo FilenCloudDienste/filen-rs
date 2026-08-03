@@ -186,9 +186,17 @@ async fn check_remote_matches_local(
 			Some((path, relative_path, meta))
 		})
 		.map(|(path, relative_path, meta)| async move {
+			// `PathIterator` splits remote paths on `/` only, so the OS-native relative path
+			// must be re-joined portably — `to_str()` on Windows yields `a\b`, which the remote
+			// lookup would treat as a single component.
+			let remote_relative_path = relative_path
+				.components()
+				.map(|c| c.as_os_str().to_str().unwrap())
+				.collect::<Vec<_>>()
+				.join("/");
 			let (_, item) = <Normal as CategoryFSExt>::get_items_in_path_starting_at(
 				client,
-				relative_path.to_str().unwrap(),
+				&remote_relative_path,
 				DirType::Dir(Cow::Borrowed(remote_dir)),
 				(),
 			)
