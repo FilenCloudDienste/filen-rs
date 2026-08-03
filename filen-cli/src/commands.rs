@@ -108,6 +108,8 @@ pub(crate) enum Commands {
 		#[arg(add = FilenCompleter::directory())]
 		destination: String,
 	},
+	/// Search for a file or directory interactively
+	Search,
 	/// Favorite a file or directory
 	Favorite {
 		/// File or directory to favorite
@@ -271,6 +273,7 @@ pub(crate) async fn execute_command(
 			.await?;
 			None
 		}
+		Commands::Search => crate::search_cmd::search_cmd(ui, client, working_path).await?,
 		Commands::Favorite { file_or_directory } => {
 			set_file_or_directory_favorite(ui, client, working_path, &file_or_directory, true)
 				.await?;

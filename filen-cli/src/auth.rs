@@ -59,7 +59,7 @@ impl LazyClient {
 		}
 	}
 
-	pub(crate) async fn get(&mut self, ui: &mut UI) -> Result<&Client> {
+	pub(crate) async fn get(&mut self, ui: &mut UI) -> Result<&Arc<Client>> {
 		match self {
 			Self::Authenticated { client } => Ok(client),
 			Self::Unauthenticated {
@@ -78,6 +78,10 @@ impl LazyClient {
 					auth_config_path_arg.as_deref(),
 				)
 				.await?;
+				client
+					.configure_cache(config.config_dir.join("filen-sdk-rs-cache"), |_| {})
+					.await
+					.context("Failed to configure cache")?;
 				*self = Self::Authenticated {
 					client: Arc::new(client),
 				};

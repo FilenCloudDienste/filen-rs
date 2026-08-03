@@ -26,6 +26,7 @@ mod auth;
 mod commands;
 mod completion;
 mod docs;
+mod search_cmd;
 mod ui;
 mod updater;
 mod util;

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - autocompletion in interactive mode, including remote paths
+- interactive `search` command to globally search for files and directories in the drive
 
 ## 0.2.7 - 2026-06-19
 

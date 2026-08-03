@@ -43,6 +43,20 @@ impl RemotePath {
 			None
 		}
 	}
+
+	/// Returns the parent path, or itself if this is the root path
+	pub(crate) fn parent(&self) -> RemotePath {
+		if self.0 == "/" {
+			self.clone()
+		} else {
+			let (parent, _) = self.0.rsplit_once('/').unwrap_or(("/", ""));
+			RemotePath::new(parent)
+		}
+	}
+
+	pub(crate) fn is_root(&self) -> bool {
+		self.0 == "/"
+	}
 }
 
 impl Display for RemotePath {
@@ -139,5 +153,14 @@ mod tests {
 		assert_eq!(path.basename(), Some("dir"));
 		assert_eq!(RemotePath::new("/").basename(), None);
 		assert_eq!(RemotePath::new("/").navigate(".").0, "/");
+		assert_eq!(RemotePath::new("/").parent(), RemotePath::new("/"));
+		assert_eq!(
+			RemotePath::new("/dir/subdir").parent(),
+			RemotePath::new("/dir")
+		);
+		assert_eq!(
+			RemotePath::new("/dir/file.txt").parent(),
+			RemotePath::new("/dir")
+		);
 	}
 }
