@@ -1362,7 +1362,6 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 		.configure_cache(path2.clone(), status_cb2)
 		.await
 		.unwrap();
-	ensure_socket_ready(&client2).await;
 
 	// The TEST monopolizes the drive lock (auto-refreshed while held; released on drop).
 	let lock = client.lock_drive().await.unwrap();
@@ -1389,6 +1388,17 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 			Err(e) => panic!("add_sync_root kept failing: {e:?}"),
 		}
 	};
+
+	// Wait for the WORKER's socket to authenticate before emitting the event it must catch.
+	// `configure_cache` only stores config — the worker and its socket listener spawn on the
+	// FIRST `add_sync_root`, so the socket's connect+auth window opens here. Calling this any
+	// earlier both guarantees nothing about that socket AND spins up a throwaway socket task
+	// (the helper's temp listener is the only strong request-channel sender, so its drop tears
+	// the task down again). An upload racing the connect window loses its FileNew for good —
+	// the socket never redelivers, and the only recovery is the resync this test deliberately
+	// blocks. Here the helper's listener joins the worker's live task (connected-manager adds
+	// replay authSuccess immediately if auth already happened).
+	ensure_socket_ready(&client2).await;
 
 	// LIVENESS: the worker's resync attempts keep failing on the contended lock, but the
 	// FileNew socket event must apply in a drain window between attempts. (`sub` is a sync-root
