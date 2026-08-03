@@ -119,10 +119,14 @@ impl NetworkDrive {
 
 		args.extend(rclone_args.iter().map(String::as_str));
 
-		let (process, api) = rclone
+		let (mut process, api) = rclone
 			.execute_in_background(&args)
 			.await
 			.context("Failed to run Rclone mount process")?;
+		// execute_in_background pipes stdout/stderr but nothing drains them: without this,
+		// a mount that exits immediately (e.g. missing WinFsp) reports only its exit code
+		// and rclone's actual error is lost.
+		RcloneInstallation::pipe_output_to_logs(&mut process);
 
 		Ok(NetworkDrive {
 			mount_point: mount_point.to_string(),
