@@ -62,6 +62,9 @@ jobs:
           choco install pkgconfiglite
           vcpkg install dav1d:x64-windows
           echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
+      - name: Install WinFsp (rclone mount backend for network-drive tests)
+        if: runner.os == 'Windows'
+        run: choco install winfsp -y
       - name: Install dependencies for avif-decoder (macos)
         if: runner.os == 'macOS'
         run: |
