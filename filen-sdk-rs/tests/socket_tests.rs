@@ -389,6 +389,131 @@ async fn test_websocket_file_events() {
 	.await;
 }
 
+/// An edit on a versioning-disabled account trashes the old uuid and re-mints the
+/// lineage at a new one. The server announces this as `fileTrash` with `newUUID`
+/// set — never a user trash action — and must also announce the successor with a
+/// `fileNew`, since `fileTrash` carries no metadata to construct it from.
+#[shared_test_runtime]
+async fn test_websocket_file_edit_versioning_disabled() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let dir = &resources.dir;
+
+	// Same order as user_tests::versioning_creates_versions_on_duplicate_upload:
+	// version-chain lock first, then the account-wide versioning-flag lock.
+	let _version_lock = client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	let _versioning_lock = client
+		.acquire_lock_with_default("test:user-versioning")
+		.await
+		.unwrap();
+
+	client.set_versioning_enabled(false).await.unwrap();
+
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let _handle = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = sender.send(event.to_owned_cow());
+			}),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let file = client
+		.make_file_builder("vd_edit_test.txt", dir.uuid())
+		.unwrap();
+	let first = client.upload_file(file, b"first contents").await.unwrap();
+	assert_eq!(
+		first.uuid(),
+		first.stable_uuid(),
+		"a fresh upload starts its lineage: stable_uuid == uuid"
+	);
+
+	await_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileNew(data),
+				..
+			} => data.0.uuid == first.uuid(),
+			_ => false,
+		},
+		Duration::from_secs(20),
+		"fileNew (first upload)",
+	)
+	.await;
+
+	let file = client
+		.make_file_builder("vd_edit_test.txt", dir.uuid())
+		.unwrap();
+	let second = client.upload_file(file, b"second contents").await.unwrap();
+
+	assert_ne!(second.uuid(), first.uuid(), "an edit re-mints the uuid");
+	assert_eq!(
+		second.stable_uuid(),
+		first.stable_uuid(),
+		"an edit keeps the lineage's stable id"
+	);
+
+	// fileNew(second) and fileTrash(first) arrive in no guaranteed order, and the
+	// await helpers discard non-matching events — record the fileNew while waiting
+	// for the trash so neither ordering loses it.
+	let mut saw_successor_file_new = false;
+	let trash = await_map_event(
+		&mut receiver,
+		|event| match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileNew(data),
+				..
+			} if data.0.uuid == second.uuid() => {
+				saw_successor_file_new = true;
+				None
+			}
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileTrash(data),
+				..
+			} if data.uuid == first.uuid() => Some(data),
+			_ => None,
+		},
+		Duration::from_secs(20),
+		"fileTrash (versioning-disabled edit)",
+	)
+	.await;
+
+	assert_eq!(
+		trash.stable_uuid,
+		first.stable_uuid(),
+		"fileTrash must carry the lineage's stable id"
+	);
+	assert_eq!(
+		trash.new_uuid,
+		Some(second.uuid()),
+		"fileTrash from an edit must point at its successor via newUUID"
+	);
+
+	if !saw_successor_file_new {
+		await_event(
+			&mut receiver,
+			|event| match event {
+				DecryptedSocketEvent::Drive {
+					inner: DecryptedDriveEvent::FileNew(data),
+					..
+				} => data.0.uuid == second.uuid(),
+				_ => false,
+			},
+			Duration::from_secs(20),
+			"fileNew (successor of a versioning-disabled edit)",
+		)
+		.await;
+	}
+
+	client.set_versioning_enabled(true).await.unwrap();
+}
+
 #[shared_test_runtime]
 async fn test_get_last_event_ids() {
 	let resources = test_utils::RESOURCES.get_resources().await;
