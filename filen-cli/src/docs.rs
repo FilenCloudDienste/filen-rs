@@ -84,6 +84,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::CommandHelp("head"),
 				DocElement::CommandHelp("tail"),
 				DocElement::CommandHelp("stat"),
+				DocElement::CommandHelp("search"),
 				DocElement::CommandHelp("mkdir"),
 				DocElement::CommandHelp("rm"),
 				DocElement::CommandHelp("mv"),
