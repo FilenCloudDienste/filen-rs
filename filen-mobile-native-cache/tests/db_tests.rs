@@ -4416,14 +4416,20 @@ fn entry_dir_uuid_is(entry: &SearchQueryResponseEntry, uuid: &str) -> bool {
 }
 
 /// Poll the live search until it converges to at least `want` results (the on-demand resync fills
-/// the cache asynchronously), or fail after 60s.
+/// the cache asynchronously), or fail after the convergence window. 240s mirrors the sdk cache
+/// tests' CACHE_CONVERGE_TIMEOUT: the backing resync serializes on the account-wide drive lock,
+/// whose patient acquisition alone can take ~110s under contention, so a shorter fixed window
+/// sits inside a guaranteed-miss band (a 60s window expired twice on nightly macOS legs). The
+/// happy path still exits in a few seconds. The panic reports the last observed count so a
+/// timeout distinguishes zero-progress (events/resync never arrived) from slow-progress.
 async fn poll_search(
 	db: &FilenMobileCacheState,
 	root_id: &str,
 	args: SearchQueryArgs,
 	want: usize,
 ) -> Vec<SearchQueryResponseEntry> {
-	for _ in 0..60 {
+	let mut last_len = 0;
+	for _ in 0..240 {
 		let resp = db
 			.query_search(root_id.to_string(), args.clone(), noop_update())
 			.await
@@ -4431,9 +4437,10 @@ async fn poll_search(
 		if resp.len() >= want {
 			return resp;
 		}
+		last_len = resp.len();
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 	}
-	panic!("search did not converge to {want} results within 60s");
+	panic!("search did not converge to {want} results within 240s (last poll saw {last_len})");
 }
 
 /// Live cache-search integration test for the documents provider's `query_search`: creates an
