@@ -3,9 +3,11 @@ use std::sync::Arc;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_macros::shared_test_runtime;
 use filen_mobile_native_cache::{
+	CacheError,
 	auth::{AuthFile, DB_FILE_NAME, FilenMobileCacheState},
 	ffi::{
-		FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs, SearchQueryResponseEntry,
+		FfiChanges, FfiDir, FfiFile, FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs,
+		SearchQueryResponseEntry,
 	},
 	traits::{ProgressCallback, SearchUpdateCallback},
 };
@@ -13,6 +15,7 @@ use filen_sdk_rs::{
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
 	fs::{
 		HasName, HasUUID,
+		dir::meta::DirectoryMetaChanges,
 		file::{meta::FileMetaChanges, traits::HasFileInfo},
 	},
 };
@@ -4332,6 +4335,19 @@ pub async fn test_update_local_data_move_name_collision() {
 	assert_eq!(moved_file.local_data, Some(local_data));
 }
 
+// `change_seq` is a per-database-incarnation watermark (stamped from that
+// database's own `change_meta` counter), so two caches that agree on content
+// still legitimately disagree on it — comparisons across instances mask it.
+fn ignoring_change_seq(mut objects: Vec<FfiNonRootObject>) -> Vec<FfiNonRootObject> {
+	for object in &mut objects {
+		match object {
+			FfiNonRootObject::File(file) => file.change_seq = 0,
+			FfiNonRootObject::Dir(dir) => dir.change_seq = 0,
+		}
+	}
+	objects
+}
+
 #[shared_test_runtime]
 pub async fn test_init_from_file() {
 	let (db, rss) = get_db_resources().await;
@@ -4372,44 +4388,56 @@ pub async fn test_init_from_file() {
 	assert_eq!(new.root_uuid().unwrap(), db.root_uuid().unwrap());
 	// into async
 	assert_eq!(
-		new.update_and_query_dir_children(test_dir_path.clone(), None)
-			.await
-			.unwrap()
-			.unwrap()
-			.objects,
-		db.update_and_query_dir_children(test_dir_path.clone(), None)
-			.await
-			.unwrap()
-			.unwrap()
-			.objects
+		ignoring_change_seq(
+			new.update_and_query_dir_children(test_dir_path.clone(), None)
+				.await
+				.unwrap()
+				.unwrap()
+				.objects
+		),
+		ignoring_change_seq(
+			db.update_and_query_dir_children(test_dir_path.clone(), None)
+				.await
+				.unwrap()
+				.unwrap()
+				.objects
+		)
 	);
 
 	// async
 	let new = FilenMobileCacheState::new(files_path.clone(), auth_file.clone(), dek_bytes.to_vec());
 	assert_eq!(
-		new.update_and_query_dir_children(test_dir_path.clone(), None)
-			.await
-			.unwrap()
-			.unwrap()
-			.objects,
-		db.update_and_query_dir_children(test_dir_path.clone(), None)
-			.await
-			.unwrap()
-			.unwrap()
-			.objects
+		ignoring_change_seq(
+			new.update_and_query_dir_children(test_dir_path.clone(), None)
+				.await
+				.unwrap()
+				.unwrap()
+				.objects
+		),
+		ignoring_change_seq(
+			db.update_and_query_dir_children(test_dir_path.clone(), None)
+				.await
+				.unwrap()
+				.unwrap()
+				.objects
+		)
 	);
 	// make sure it still works after authentication
 	assert_eq!(
-		new.update_and_query_dir_children(test_dir_path.clone(), None)
-			.await
-			.unwrap()
-			.unwrap()
-			.objects,
-		db.update_and_query_dir_children(test_dir_path.clone(), None)
-			.await
-			.unwrap()
-			.unwrap()
-			.objects
+		ignoring_change_seq(
+			new.update_and_query_dir_children(test_dir_path.clone(), None)
+				.await
+				.unwrap()
+				.unwrap()
+				.objects
+		),
+		ignoring_change_seq(
+			db.update_and_query_dir_children(test_dir_path.clone(), None)
+				.await
+				.unwrap()
+				.unwrap()
+				.objects
+		)
 	);
 	// into sync
 	assert_eq!(new.root_uuid().unwrap(), db.root_uuid().unwrap());
@@ -4431,16 +4459,20 @@ pub async fn test_init_from_file() {
 
 	futures.push(Box::pin(async {
 		assert_eq!(
-			new.update_and_query_dir_children(test_dir_path.clone(), None)
-				.await
-				.unwrap()
-				.unwrap()
-				.objects,
-			db.update_and_query_dir_children(test_dir_path.clone(), None)
-				.await
-				.unwrap()
-				.unwrap()
-				.objects
+			ignoring_change_seq(
+				new.update_and_query_dir_children(test_dir_path.clone(), None)
+					.await
+					.unwrap()
+					.unwrap()
+					.objects
+			),
+			ignoring_change_seq(
+				db.update_and_query_dir_children(test_dir_path.clone(), None)
+					.await
+					.unwrap()
+					.unwrap()
+					.objects
+			)
 		)
 	}));
 
@@ -5521,4 +5553,738 @@ pub async fn test_a_download_drops_a_marker_whose_local_copy_is_gone() {
 		None,
 		"a marker with no bytes behind it must be dropped, not left arming the bypass"
 	);
+}
+
+// The replicated-provider substrate: the change feed a replica diffs against, the working set it
+// keeps current, and the item-level FFI it drives.
+//
+// The whole live suite shares one cache and one account, so the feed — which is domain-global by
+// design — carries whatever else is running alongside. Every assertion below is therefore about
+// ONE item, located by its own id; a count is only ever taken over a single item's own entries.
+
+/// Every file the feed carries under this stable id. A file's `stable_uuid` is what a replica
+/// persists, so it is what identifies the file across the content edits that re-mint its `uuid`.
+fn feed_files<'a>(changes: &'a FfiChanges, stable_uuid: &str) -> Vec<&'a FfiFile> {
+	changes
+		.updated
+		.iter()
+		.filter_map(|obj| match obj {
+			FfiObject::File(f) if f.stable_uuid == stable_uuid => Some(f),
+			_ => None,
+		})
+		.collect()
+}
+
+/// Every dir the feed carries under this uuid — a dir's uuid is its whole-life id.
+fn feed_dirs<'a>(changes: &'a FfiChanges, uuid: &str) -> Vec<&'a FfiDir> {
+	changes
+		.updated
+		.iter()
+		.filter_map(|obj| match obj {
+			FfiObject::Dir(d) if d.uuid == uuid => Some(d),
+			_ => None,
+		})
+		.collect()
+}
+
+fn one_feed_file<'a>(changes: &'a FfiChanges, stable_uuid: &str, what: &str) -> &'a FfiFile {
+	let found = feed_files(changes, stable_uuid);
+	assert_eq!(
+		found.len(),
+		1,
+		"{what}: expected exactly one feed entry for {stable_uuid}, got {found:#?}"
+	);
+	found[0]
+}
+
+fn one_feed_dir<'a>(changes: &'a FfiChanges, uuid: &str, what: &str) -> &'a FfiDir {
+	let found = feed_dirs(changes, uuid);
+	assert_eq!(
+		found.len(),
+		1,
+		"{what}: expected exactly one feed entry for {uuid}, got {found:#?}"
+	);
+	found[0]
+}
+
+/// Whether the feed retires this id. Both kinds ride in the one `stable/<id>` namespace.
+fn feed_retires(changes: &FfiChanges, id: &str) -> bool {
+	changes
+		.deleted_ids
+		.iter()
+		.any(|d| d == &format!("stable/{id}"))
+}
+
+/// Everything a replica renders about one item, through its whole life on the server: it appears,
+/// it is renamed, it goes to the trash, and it is destroyed. Each step is a real server mutation
+/// learned the way the app learns one, and each is diffed from the anchor the previous step handed
+/// back — which is exactly the sequence a replica walks.
+#[shared_test_runtime]
+pub async fn test_the_change_feed_follows_an_item_from_creation_to_deletion() {
+	let (db, rss) = get_db_resources().await;
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	// The parent has to be in the cache before the anchor is taken, or inserting it lands in the
+	// first diff as a change of its own.
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let anchor = db.current_sync_anchor().unwrap();
+
+	let dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "feed_subdir")
+		.await
+		.unwrap();
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("feed_file.txt", rss.dir.uuid())
+				.unwrap(),
+			b"feed v1",
+		)
+		.await
+		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let stable = file.stable_uuid().to_string();
+	let dir_uuid = dir.uuid().to_string();
+
+	let changes = db.enumerate_changes(Some(anchor)).unwrap();
+	let created_file = one_feed_file(&changes, &stable, "creation").clone();
+	assert_eq!(created_file.uuid, file.uuid().to_string());
+	assert_eq!(created_file.meta.as_ref().unwrap().name, "feed_file.txt");
+	assert_eq!(created_file.parent, rss.dir.uuid().to_string());
+	let created_dir = one_feed_dir(&changes, &dir_uuid, "creation").clone();
+	assert_eq!(created_dir.meta.as_ref().unwrap().name, "feed_subdir");
+	assert!(
+		!feed_retires(&changes, &stable) && !feed_retires(&changes, &dir_uuid),
+		"nothing was retired, so nothing may be reported as deleted"
+	);
+
+	// Renamed on the server, learned the way the app learns it: by listing the directory again.
+	let anchor = changes.anchor;
+	rss.client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name("feed_file_renamed.txt")
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let changes = db.enumerate_changes(Some(anchor)).unwrap();
+	let renamed = one_feed_file(&changes, &stable, "remote rename").clone();
+	assert_eq!(renamed.meta.as_ref().unwrap().name, "feed_file_renamed.txt");
+	assert!(
+		renamed.change_seq > created_file.change_seq,
+		"a rename must move the item's metadata version"
+	);
+	assert!(
+		feed_dirs(&changes, &dir_uuid).is_empty(),
+		"a sibling nothing happened to must not be restamped by the relisting"
+	);
+	assert!(!feed_retires(&changes, &stable));
+
+	// Trashed: a move into another container, not a disappearance.
+	let anchor = changes.anchor;
+	let trashed = db
+		.trash_item(test_dir_path.join("feed_file_renamed.txt"))
+		.await
+		.unwrap();
+
+	let changes = db.enumerate_changes(Some(anchor)).unwrap();
+	let in_trash = one_feed_file(&changes, &stable, "trash").clone();
+	assert_eq!(
+		in_trash.original_parent,
+		Some(rss.dir.uuid().to_string()),
+		"a trashed item must arrive as an update, carrying where it came from"
+	);
+	assert!(in_trash.change_seq > renamed.change_seq);
+	assert!(
+		!feed_retires(&changes, &stable),
+		"trashing is a move, not a deletion"
+	);
+
+	// Destroyed: now, and only now, the id is retired.
+	let anchor = changes.anchor;
+	db.delete_item(trashed.id).await.unwrap();
+
+	let changes = db.enumerate_changes(Some(anchor)).unwrap();
+	assert!(
+		feed_files(&changes, &stable).is_empty(),
+		"a destroyed item has nothing left to render"
+	);
+	assert!(
+		feed_retires(&changes, &stable),
+		"a permanent delete must retire the file's stable id"
+	);
+
+	// A replica starting from nothing is told what exists, never what does not.
+	let from_scratch = db.enumerate_changes(None).unwrap();
+	assert!(
+		from_scratch.deleted_ids.is_empty(),
+		"there is nothing to drop for a replica that holds nothing"
+	);
+	assert!(feed_files(&from_scratch, &stable).is_empty());
+	assert_eq!(
+		one_feed_dir(&from_scratch, &dir_uuid, "full enumeration")
+			.meta
+			.as_ref()
+			.unwrap()
+			.name,
+		"feed_subdir"
+	);
+}
+
+// An edit on a versioning-disabled account replaces the file in place: the server mints a new uuid
+// and keeps the stable id, and the old uuid lives on briefly as a trashed ghost. That is the same
+// provider identity with new content, so a replica must be handed one update and no deletion —
+// retiring the id here would make it evict a file the user still has.
+#[shared_test_runtime]
+pub async fn test_a_versioning_disabled_edit_is_one_update_and_no_retirement() {
+	let (db, rss) = get_db_resources().await;
+
+	let _version_lock = rss
+		.client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	rss.client.set_versioning_enabled(false).await.unwrap();
+
+	let old_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("feed_versioning_off.txt", rss.dir.uuid())
+				.unwrap(),
+			b"versioning off v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	let anchor = db.current_sync_anchor().unwrap();
+
+	let new_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("feed_versioning_off.txt", rss.dir.uuid())
+				.unwrap(),
+			b"versioning off v2",
+		)
+		.await
+		.unwrap();
+	assert_ne!(new_file.uuid(), old_file.uuid());
+	assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let changes = db.enumerate_changes(Some(anchor)).unwrap();
+	let stable = old_file.stable_uuid().to_string();
+	let edited = one_feed_file(&changes, &stable, "versioning-disabled edit");
+	assert_eq!(
+		edited.uuid,
+		new_file.uuid().to_string(),
+		"the feed must carry the new head, not the ghost the edit left behind"
+	);
+	assert!(
+		!feed_retires(&changes, &stable),
+		"the file's identity survived the edit; retiring it would evict the file"
+	);
+	assert!(
+		!feed_retires(&changes, &old_file.uuid().to_string()),
+		"a re-minted uuid is not an identity any replica was ever given"
+	);
+
+	rss.client.set_versioning_enabled(true).await.unwrap();
+}
+
+// An anchor names a sequence in one incarnation of the database. A wipe reinitialises the schema
+// and mints a new instance id, so an anchor from before it names a history that no longer exists —
+// honouring it would silently under-report everything the wipe destroyed. It has to come back as
+// its own error, because the answer to it is to enumerate from scratch rather than to fail.
+#[shared_test_runtime]
+pub async fn test_an_anchor_from_a_previous_database_incarnation_expires() {
+	let (db, _rss) = get_db_resources().await;
+	let before_the_wipe = db.current_sync_anchor().unwrap();
+
+	// A cache built from nothing is exactly what a wipe leaves behind: fresh schema, fresh
+	// instance id, no history.
+	let (wiped, _rss) = get_isolated_db_resources("anchor_expiry").await;
+
+	match wiped.enumerate_changes(Some(before_the_wipe)) {
+		Err(CacheError::SyncAnchorExpired(_)) => {}
+		other => panic!("an anchor from another incarnation must expire, got {other:?}"),
+	}
+	// Garbage in the same position answers the same way, because the remedy is the same.
+	match wiped.enumerate_changes(Some(vec![0u8; 4])) {
+		Err(CacheError::SyncAnchorExpired(_)) => {}
+		other => panic!("a malformed anchor must expire, got {other:?}"),
+	}
+	// Its own anchors still work, so what expired was the anchor and not the feed.
+	wiped
+		.enumerate_changes(Some(wiped.current_sync_anchor().unwrap()))
+		.unwrap();
+}
+
+// `modify_file_content` is the provider's save: the new bytes arrive as a file the caller owns,
+// outside this cache entirely, which is the one thing `upload_file_if_changed` cannot take. It has
+// to land them as a new version of an existing file, hand back what that file became, and not
+// re-upload bytes the server already holds.
+#[shared_test_runtime]
+pub async fn test_modify_file_content_lands_external_bytes_as_a_new_version() {
+	let (db, rss) = get_db_resources().await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("modify_content.txt", rss.dir.uuid())
+				.unwrap(),
+			b"server v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("modify_content.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+	let (uuid_before, stable) = file_ids(&db, &file_path);
+
+	const EDITED: &[u8] = b"external bytes, edited elsewhere";
+	let external = std::env::temp_dir().join("modify_content_external.txt");
+	tokio::fs::write(&external, EDITED).await.unwrap();
+	let external_str = external.to_string_lossy().into_owned();
+
+	let modified = db
+		.modify_file_content(file_path.clone(), external_str.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		modified.file.stable_uuid, stable,
+		"an edit keeps the file's identity"
+	);
+	assert_ne!(
+		modified.file.uuid, uuid_before,
+		"...and takes a freshly minted version id"
+	);
+	assert_eq!(modified.file.size as usize, EDITED.len());
+	assert_eq!(
+		modified.file.pending_upload_at, None,
+		"the edit reached the server, so nothing is left outstanding"
+	);
+	assert_eq!(
+		db.query_item(&modified.id).unwrap(),
+		Some(FfiObject::File(modified.file.clone())),
+		"the item handed back must be the item the cache now holds"
+	);
+	assert_eq!(
+		tokio::fs::read(
+			&db.download_file_if_changed_by_path(modified.id.clone(), None)
+				.await
+				.unwrap()
+		)
+		.await
+		.unwrap(),
+		EDITED,
+		"the bytes handed in must be the file's content"
+	);
+
+	// The same bytes again: a provider saves on close whether the user typed anything or not.
+	let unchanged = db
+		.modify_file_content(file_path.clone(), external_str.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		unchanged.file.uuid, modified.file.uuid,
+		"bytes the server already holds must not make a new version"
+	);
+	assert_eq!(
+		unchanged.file.change_seq, modified.file.change_seq,
+		"nor restamp the item"
+	);
+	assert_eq!(unchanged.file.pending_upload_at, None);
+
+	// Renamed, then addressed by the id a provider actually persists — the display path it was
+	// created under does not name it any more.
+	db.rename_item(file_path.clone(), "modify_content_renamed.txt".to_string())
+		.await
+		.unwrap()
+		.unwrap();
+	const AGAIN: &[u8] = b"external bytes, a second edit";
+	tokio::fs::write(&external, AGAIN).await.unwrap();
+
+	let by_stable = db
+		.modify_file_content(format!("stable/{stable}").into(), external_str, None)
+		.await
+		.unwrap();
+	assert_eq!(by_stable.file.stable_uuid, stable);
+	assert_ne!(by_stable.file.uuid, modified.file.uuid);
+	assert_eq!(
+		by_stable.file.meta.as_ref().unwrap().name,
+		"modify_content_renamed.txt",
+		"the stable id must have reached the file under its current name"
+	);
+	assert_eq!(by_stable.file.size as usize, AGAIN.len());
+
+	tokio::fs::remove_file(&external).await.ok();
+}
+
+// `update_and_query_item` is the provider's `item(for:)`: what this id is right now, asked of the
+// server. Only the server saying it does not have it may read as a deletion — and when it does,
+// the row goes with it, which is what retires the id for every replica.
+#[shared_test_runtime]
+pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
+	let (db, rss) = get_db_resources().await;
+
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("refresh_item.txt", rss.dir.uuid())
+				.unwrap(),
+			b"refresh v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("refresh_item.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let stable = file.stable_uuid().to_string();
+	let stable_id: FfiId = format!("stable/{stable}").into();
+
+	// Nothing happened: the same item comes back, and the refresh restamps nothing.
+	let cached = db.query_item(&file_path).unwrap().unwrap();
+	assert_eq!(
+		db.update_and_query_item(stable_id.clone()).await.unwrap(),
+		Some(cached),
+		"a refresh that finds nothing new must change nothing"
+	);
+
+	// Renamed behind the cache's back, with no listing in between.
+	rss.client
+		.update_file_metadata(
+			&mut file,
+			FileMetaChanges::default()
+				.name("refresh_item_renamed.txt")
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+	let refreshed = match db.update_and_query_item(stable_id.clone()).await.unwrap() {
+		Some(FfiObject::File(f)) => f,
+		other => panic!("expected the renamed file, got {other:?}"),
+	};
+	assert_eq!(
+		refreshed.meta.as_ref().unwrap().name,
+		"refresh_item_renamed.txt"
+	);
+
+	// Trashed behind its back: still an item, and still this item.
+	rss.client.trash_file(&mut file).await.unwrap();
+	let trashed = match db.update_and_query_item(stable_id.clone()).await.unwrap() {
+		Some(FfiObject::File(f)) => f,
+		other => panic!("a trashed file is still an item, got {other:?}"),
+	};
+	assert_eq!(
+		trashed.original_parent,
+		Some(rss.dir.uuid().to_string()),
+		"it must come back as trashed, carrying where a restore would put it"
+	);
+
+	// Gone from the server: gone here too, and every replica is told.
+	let anchor = db.current_sync_anchor().unwrap();
+	rss.client.delete_file_permanently(file).await.unwrap();
+	assert_eq!(
+		db.update_and_query_item(stable_id).await.unwrap(),
+		None,
+		"only a not-found from the server may read as a deletion"
+	);
+	assert_eq!(
+		db.query_item_by_uuid(&stable).unwrap(),
+		None,
+		"the row must be gone, not merely unreported"
+	);
+	assert!(
+		feed_retires(&db.enumerate_changes(Some(anchor)).unwrap(), &stable),
+		"dropping the row must retire its id for every replica"
+	);
+}
+
+// The same call over a directory, and over ids that name nothing. An id no row answers to is not
+// something the server can be asked about — `stable/<id>` is a namespace only this cache hands
+// out — so it answers `None` without going near the network.
+#[shared_test_runtime]
+pub async fn test_update_and_query_item_refreshes_a_dir_and_knows_nothing_of_unknown_ids() {
+	let (db, rss) = get_db_resources().await;
+
+	let mut dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "refresh_dir")
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// A dir has no stable id of its own; the same namespace resolves it by its uuid, which is its
+	// whole-life id anyway.
+	let dir_id: FfiId = format!("stable/{}", dir.uuid()).into();
+	rss.client
+		.update_dir_metadata(
+			&mut dir,
+			DirectoryMetaChanges::default()
+				.name("refresh_dir_renamed")
+				.unwrap(),
+		)
+		.await
+		.unwrap();
+
+	let refreshed = match db.update_and_query_item(dir_id).await.unwrap() {
+		Some(FfiObject::Dir(d)) => d,
+		other => panic!("expected the renamed directory, got {other:?}"),
+	};
+	assert_eq!(refreshed.uuid, dir.uuid().to_string());
+	assert_eq!(refreshed.meta.as_ref().unwrap().name, "refresh_dir_renamed");
+
+	let unknown = Uuid::new_v4();
+	assert_eq!(
+		db.update_and_query_item(unknown.to_string().into())
+			.await
+			.unwrap(),
+		None,
+		"an id that resolves to no row of ours is one we retired"
+	);
+	assert_eq!(
+		db.update_and_query_item(format!("stable/{unknown}").into())
+			.await
+			.unwrap(),
+		None,
+		"and the same in the namespace the provider persists"
+	);
+}
+
+// A replica asks for a file's bytes and its metadata together; re-querying the item after the
+// download would race the download itself. The freshness check is unchanged by that: a second ask
+// for a file nothing has touched is served from the cache, with nothing pulled over the network.
+#[shared_test_runtime]
+pub async fn test_download_file_if_changed_with_item_serves_bytes_and_item_together() {
+	let (db, rss) = get_db_resources().await;
+
+	const CONTENT: &[u8] = b"downloaded with its item";
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("download_with_item.txt", rss.dir.uuid())
+				.unwrap(),
+			CONTENT,
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("download_with_item.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let progress = Arc::new(SumProgressCallback::default());
+	let fresh = db
+		.download_file_if_changed_with_item(file_path.clone(), Some(progress.clone()))
+		.await
+		.unwrap();
+	assert_eq!(tokio::fs::read(&fresh.path).await.unwrap(), CONTENT);
+	assert_eq!(fresh.file.uuid, file.uuid().to_string());
+	assert_eq!(fresh.file.stable_uuid, file.stable_uuid().to_string());
+	assert_eq!(fresh.file.size as usize, CONTENT.len());
+	assert_eq!(fresh.file.pending_upload_at, None);
+	assert_eq!(
+		progress.max.load(std::sync::atomic::Ordering::Relaxed),
+		CONTENT.len() as u64,
+		"the first ask has to actually fetch the bytes"
+	);
+
+	let progress = Arc::new(SumProgressCallback::default());
+	let cached = db
+		.download_file_if_changed_with_item(file_path.clone(), Some(progress.clone()))
+		.await
+		.unwrap();
+	assert_eq!(cached.path, fresh.path);
+	assert_eq!(cached.file, fresh.file);
+	assert_eq!(
+		progress.max.load(std::sync::atomic::Ordering::Relaxed),
+		0,
+		"an unchanged file must be served from the cache, not fetched again"
+	);
+
+	// The path-only call the app has always used answers for the same file, unchanged.
+	assert_eq!(
+		db.download_file_if_changed_by_path(file_path, None)
+			.await
+			.unwrap(),
+		fresh.path
+	);
+
+	std::fs::remove_file(&fresh.path).ok();
+}
+
+// The working set is what this device has a stake in, and so the only thing kept current
+// incrementally: bytes on the device, an edit that has not gone out, or a favourite. Membership
+// has to follow those, not a listing — an item drops out the moment the stake does.
+#[shared_test_runtime]
+pub async fn test_the_working_set_follows_cached_bytes_and_favourites() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("working_set_file.txt", rss.dir.uuid())
+				.unwrap(),
+			b"working set bytes",
+		)
+		.await
+		.unwrap();
+	let dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "working_set_dir")
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("working_set_file.txt");
+	let dir_path: FfiId = test_dir_path.join("working_set_dir");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let stable = file.stable_uuid().to_string();
+	let dir_uuid = dir.uuid().to_string();
+	// The set is global to the cache, which the whole suite shares, so membership is only ever
+	// asked about one item at a time.
+	let holds_file = |db: &FilenMobileCacheState| {
+		db.query_working_set()
+			.unwrap()
+			.iter()
+			.any(|obj| matches!(obj, FfiObject::File(f) if f.stable_uuid == stable))
+	};
+	let holds_dir = |db: &FilenMobileCacheState| {
+		db.query_working_set()
+			.unwrap()
+			.iter()
+			.any(|obj| matches!(obj, FfiObject::Dir(d) if d.uuid == dir_uuid))
+	};
+
+	assert!(
+		!holds_file(&db) && !holds_dir(&db),
+		"merely being listed is not a stake in anything"
+	);
+
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	assert!(
+		holds_file(&db),
+		"bytes on the device are a stake, so the file joins the working set"
+	);
+	assert!(!holds_dir(&db));
+
+	db.set_favorite_rank(dir_path.clone(), 1).await.unwrap();
+	assert!(
+		holds_dir(&db),
+		"a favourite is a stake even with nothing cached"
+	);
+
+	db.clear_local_cache(file_path).await.unwrap();
+	assert!(
+		!holds_file(&db),
+		"with the bytes gone and nothing else claiming it, the file drops out"
+	);
+	assert!(holds_dir(&db), "which says nothing about the favourite");
+
+	db.set_favorite_rank(dir_path, 0).await.unwrap();
+	assert!(
+		!holds_dir(&db),
+		"and the favourite drops out when it stops being one"
+	);
+
+	std::fs::remove_file(&local_path).ok();
+}
+
+// A provider persists `stable/<id>` and nothing else, so every entry point has to take one —
+// including the two that were only ever handed a raw uuid string. The file here has had its uuid
+// re-minted by an edit, which is precisely when the persisted id and the current uuid differ.
+#[shared_test_runtime]
+pub async fn test_the_stable_namespace_reaches_restore_and_download_after_an_edit() {
+	let (db, rss) = get_db_resources().await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("stable_reach.txt", rss.dir.uuid())
+				.unwrap(),
+			b"v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("stable_reach.txt");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+
+	// An edit, so the server re-mints the uuid and the two ids part ways.
+	const EDITED: &[u8] = b"v2 edited locally";
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	tokio::fs::write(&local_path, EDITED).await.unwrap();
+	assert!(
+		db.upload_file_if_changed(file_path.clone(), None)
+			.await
+			.unwrap()
+	);
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let (uuid, stable) = file_ids(&db, &file_path);
+	assert_ne!(
+		uuid, stable,
+		"the edit must have re-minted the uuid, or this test proves nothing"
+	);
+	let stable_id = format!("stable/{stable}");
+
+	db.trash_item(file_path).await.unwrap();
+	let restored = db.restore_item(&stable_id, None).await.unwrap();
+	match restored.object {
+		FfiObject::File(f) => {
+			assert_eq!(f.stable_uuid, stable);
+			assert_eq!(f.uuid, uuid, "a restore is not an edit");
+			assert_eq!(
+				f.original_parent, None,
+				"it must be out of the trash, not merely reported"
+			);
+			assert_eq!(f.parent, rss.dir.uuid().to_string());
+		}
+		other => panic!("expected the restored file, got {other:?}"),
+	}
+
+	let served = db
+		.download_file_if_changed_by_uuid(stable_id, None)
+		.await
+		.unwrap();
+	assert_eq!(tokio::fs::read(&served).await.unwrap(), EDITED);
+
+	std::fs::remove_file(&served).ok();
 }
