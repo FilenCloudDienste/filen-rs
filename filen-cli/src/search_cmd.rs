@@ -57,7 +57,7 @@ pub(crate) async fn search_cmd(
 		} else {
 			format!("Search in {}:", working_path)
 		};
-		tokio::spawn(async move {
+		tokio::task::spawn_blocking(move || {
 			inquire::Text::new(&prompt_text)
 				.with_placeholder("(your query)")
 				.with_help_message(
