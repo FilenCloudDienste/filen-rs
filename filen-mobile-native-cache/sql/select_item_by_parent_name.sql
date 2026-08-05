@@ -4,7 +4,8 @@ SELECT
 	items.parent,
 	items.trashed,
 	items.local_data,
-	items.type
+	items.type,
+	items.change_seq
 FROM items
 LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 LEFT JOIN files_meta ON items.id = files_meta.id

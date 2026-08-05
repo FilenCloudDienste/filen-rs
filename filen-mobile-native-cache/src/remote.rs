@@ -1,11 +1,20 @@
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::Instant,
+};
 
 use chrono::DateTime;
-use filen_sdk_rs::fs::{
-	HasName, HasUUID,
-	categories::{DirType, Normal},
-	dir::{RemoteDirectory, meta::DirectoryMetaChanges},
-	file::{FileBuilderOptionalName, RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo},
+use filen_sdk_rs::{
+	ErrorKind,
+	fs::{
+		HasName, HasParent, HasUUID,
+		categories::{DirType, Normal},
+		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
+		file::{
+			FileBuilderOptionalName, RemoteFile, meta::FileMetaChanges, traits::HasRemoteFileInfo,
+		},
+	},
 };
 use filen_types::fs::{ParentUuid, StableUuid, Uuid};
 use rusqlite::OptionalExtension;
@@ -15,13 +24,14 @@ use crate::{
 	CacheError,
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
-		CreateFileResponse, DirWithPathResponse, FfiId, FileWithPathResponse,
-		ObjectWithPathResponse, ParsedFfiId, PathFfiId, QueryChildrenResponse,
-		QueryNonDirChildrenResponse, SearchQueryArgs, SearchQueryResponseEntry, UploadFileInfo,
+		CreateFileResponse, DirWithPathResponse, DownloadResponse, FfiId, FfiObject,
+		FileWithPathResponse, ObjectWithPathResponse, ParsedFfiId, PathFfiId,
+		QueryChildrenResponse, QueryNonDirChildrenResponse, SearchQueryArgs,
+		SearchQueryResponseEntry, UploadFileInfo,
 	},
-	local::addressed_stable_uuid,
+	local::{STABLE_PREFIX, addressed_stable_uuid, resolve_uuid_or_stable},
 	sql::{
-		self, DBDirExt, DBDirObject, DBDirTrait, DBFileMeta, DBItemTrait,
+		self, DBDecryptedFileMeta, DBDirExt, DBDirObject, DBDirTrait, DBFileMeta, DBItemTrait,
 		dir::DBDir,
 		error::OptionalExtensionSQL,
 		file::DBFile,
@@ -118,6 +128,68 @@ impl FilenMobileCacheState {
 			auth_state
 				.download_file_if_changed_by_uuid(uuid, progress_callback)
 				.await
+		})
+		.await
+	}
+
+	/// Downloads the file if the cached copy is not the server's, and hands back both the local
+	/// path and the item it belongs to.
+	///
+	/// Same work as [`FilenMobileCacheState::download_file_if_changed_by_path`], which returns the
+	/// path alone; a replicated provider has to answer with the item as well, and re-querying it
+	/// separately would race the download it just did.
+	pub async fn download_file_if_changed_with_item(
+		&self,
+		id: FfiId,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+	) -> Result<DownloadResponse, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state
+				.download_file_if_changed_with_item(id, progress_callback)
+				.await
+		})
+		.await
+	}
+
+	/// Replaces a file's content with the bytes at `os_path`, and hands back what it became.
+	///
+	/// The provider's `modifyItem(contents:)`: the new bytes arrive as a file the caller owns
+	/// rather than as something already in this cache, which is the one thing
+	/// [`FilenMobileCacheState::upload_file_if_changed`] cannot take. Bytes identical to the
+	/// server's are not re-uploaded, but the item still comes back — the question asked was what
+	/// the file now is.
+	///
+	/// A failed upload leaves the bytes in the cache and the edit marked, for
+	/// [`FilenMobileCacheState::retry_pending_uploads`] to deliver later.
+	pub async fn modify_file_content(
+		&self,
+		id: FfiId,
+		os_path: String,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+	) -> Result<FileWithPathResponse, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state
+				.modify_file_content(id, os_path, progress_callback)
+				.await
+		})
+		.await
+	}
+
+	/// The item an id names, refreshed from the server first.
+	///
+	/// `None` means it is gone — the server does not have it and neither do we any more, which is
+	/// the provider's `.noSuchItem`. Only a not-found from the server means that: every other
+	/// failure is reported as itself, so a connectivity problem never reads as a deletion.
+	///
+	/// The identifiers are provider-oriented, and so is that answer: an id that resolves to no row
+	/// of ours returns `Ok(None)` without going near the network. There is nothing to ask the
+	/// server about — `stable/<id>` is a namespace only this cache hands out, and the row that
+	/// would translate it into something the server knows is exactly what is missing. A path-form
+	/// id against a cold cache lands the same way: the walk stops at the first name it has never
+	/// listed.
+	pub async fn update_and_query_item(&self, id: FfiId) -> Result<Option<FfiObject>, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state.update_and_query_item(id).await
 		})
 		.await
 	}
@@ -334,13 +406,13 @@ impl AuthCacheState {
 		self.query_recents(order_by)
 	}
 
-	pub(crate) async fn download_file_if_changed_by_path(
+	/// The file an id names, as the cache held it before this call and as the server has it now —
+	/// the shared front half of the download calls.
+	async fn resolve_file_to_download(
 		&self,
-		file_path: FfiId,
-		progress_callback: Option<Arc<dyn ProgressCallback>>,
-	) -> Result<String, CacheError> {
-		debug!("Downloading file to path: {}", file_path.0);
-		let file_path = self.canonicalize_id(&file_path)?;
+		id: &FfiId,
+	) -> Result<(Option<DBFile>, DBFile), CacheError> {
+		let file_path = self.canonicalize_id(id)?;
 		let path_values = file_path.as_path()?;
 		let old_file = match sql::select_object_at_path(&self.conn(), &path_values)? {
 			Some(DBObject::File(file)) => Some(file),
@@ -348,18 +420,53 @@ impl AuthCacheState {
 			None => None,
 		};
 
-		let file = match self.update_items_in_path(&path_values).await? {
-			UpdateItemsInPath::Complete(DBObject::File(file)) => file,
+		match self.update_items_in_path(&path_values).await? {
+			UpdateItemsInPath::Complete(DBObject::File(file)) => Ok((old_file, file)),
 			UpdateItemsInPath::Partial(_, _) | UpdateItemsInPath::Complete(_) => {
-				return Err(CacheError::remote(format!(
+				Err(CacheError::remote(format!(
 					"Path {} does not point to a file",
 					path_values.full_path
-				)));
+				)))
 			}
-		};
+		}
+	}
 
+	pub(crate) async fn download_file_if_changed_by_path(
+		&self,
+		file_path: FfiId,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+	) -> Result<String, CacheError> {
+		debug!("Downloading file to path: {}", file_path.0);
+		let (old_file, file) = self.resolve_file_to_download(&file_path).await?;
 		self.inner_download_file_if_changed(old_file, file, progress_callback)
 			.await
+	}
+
+	pub(crate) async fn download_file_if_changed_with_item(
+		&self,
+		id: FfiId,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+	) -> Result<DownloadResponse, CacheError> {
+		debug!("Downloading file with item at: {}", id.0);
+		let (old_file, file) = self.resolve_file_to_download(&id).await?;
+		let uuid = file.uuid;
+		let path = self
+			.inner_download_file_if_changed(old_file, file, progress_callback)
+			.await?;
+		// Re-read rather than answer from the row we walked in with: a download that finds the
+		// local bytes gone drops the pending-upload marker, and the item handed back must not
+		// still claim an edit that is no longer outstanding.
+		let file = DBFile::select(&self.conn(), uuid)
+			.optional()?
+			.ok_or_else(|| {
+				CacheError::DoesNotExist(
+					format!("No file with UUID {uuid} after downloading it").into(),
+				)
+			})?;
+		Ok(DownloadResponse {
+			path,
+			file: file.into(),
+		})
 	}
 
 	pub(crate) async fn download_file_if_changed_by_uuid(
@@ -388,7 +495,7 @@ impl AuthCacheState {
 		file: DBFile,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 	) -> Result<Option<(RemoteFile, Option<tokio::sync::OwnedMutexGuard<()>>)>, CacheError> {
-		let DBFileMeta::Decoded(meta) = file.meta else {
+		let DBFileMeta::Decoded(meta) = &file.meta else {
 			return Err(CacheError::remote(format!(
 				"File {} does not have decoded metadata",
 				file.uuid
@@ -397,7 +504,7 @@ impl AuthCacheState {
 		// Held across the whole check-then-upload: io_upload_updated_file reads the cached copy
 		// and then renames it away under the newly minted uuid, so without this a concurrent
 		// clear or download of the same item interleaves with it.
-		let _local_file_guard = self.lock_local_file(file.uuid).await;
+		let local_file_guard = self.lock_local_file(file.uuid).await;
 		if let Some(hash) = meta.hash {
 			let local_hash = self.hash_local_file(file.uuid, Some(&meta.name)).await?;
 			if local_hash == Some(hash.into()) {
@@ -417,18 +524,38 @@ impl AuthCacheState {
 		)?;
 
 		let uploaded = self
-			.io_upload_updated_file(
-				file.uuid,
-				meta.name,
-				file.parent.try_into().map_err(|e| {
-					CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
-				})?,
-				meta.mime,
-				progress_callback,
-			)
+			.upload_marked_edit(&file, meta, &local_file_guard, progress_callback)
 			.await?;
 		sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
 		Ok(Some(uploaded))
+	}
+
+	/// Sends the bytes sitting in a file's cache slot to the server as a new version of it.
+	///
+	/// The tail both edit paths share, and it takes the guard because the caller must already
+	/// hold it: these locks are not reentrant, and the path that copies external bytes in has to
+	/// hold one lock across copy, hash check and upload alike. The file's pending marker must
+	/// already be set for the same reason — from the moment the slot holds bytes the server does
+	/// not have, that marker is the only record of them. Clearing it belongs to the caller, once
+	/// the row it upserts says where those bytes now live.
+	async fn upload_marked_edit(
+		&self,
+		file: &DBFile,
+		meta: &DBDecryptedFileMeta,
+		_local_file_guard: &tokio::sync::OwnedMutexGuard<()>,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+	) -> Result<(RemoteFile, Option<tokio::sync::OwnedMutexGuard<()>>), CacheError> {
+		Ok(self
+			.io_upload_updated_file(
+				file.uuid,
+				meta.name.clone(),
+				file.parent.try_into().map_err(|e| {
+					CacheError::conversion(format!("Failed to convert parent UUID: {e}"))
+				})?,
+				meta.mime.clone(),
+				progress_callback,
+			)
+			.await?)
 	}
 
 	/// The file a stable id names, as the cache currently holds it.
@@ -440,6 +567,232 @@ impl AuthCacheState {
 		DBFile::select(&conn, item.uuid).optional()?.ok_or_else(|| {
 			CacheError::DoesNotExist(format!("No file for stable id: {stable_uuid}").into())
 		})
+	}
+
+	/// The item an FFI id names, as the cache currently holds it — no server round-trip.
+	///
+	/// A `stable/<id>` is resolved straight to its row, rather than through the display path
+	/// [`AuthCacheState::canonicalize_id`] would build from it: that id names one row, while a
+	/// path names a place, and same-named siblings share a place. Every other id form describes a
+	/// location and is walked as one.
+	fn select_object_by_id(&self, id: &FfiId) -> Result<Option<DBObject>, CacheError> {
+		let conn = self.conn();
+		if id.0.starts_with(STABLE_PREFIX) {
+			let uuid = resolve_uuid_or_stable(&conn, &id.0)?;
+			return Ok(DBObject::select(&conn, uuid).optional()?);
+		}
+		sql::select_object_at_parsed_id(&conn, &id.as_parsed()?)
+	}
+
+	/// Replaces a file's content with the bytes at `os_path` (see
+	/// [`FilenMobileCacheState::modify_file_content`]).
+	///
+	/// The order below is the crash-safety contract, not a preference:
+	/// take the item's lock once, mark the edit, only then let the bytes into the slot, and clear
+	/// the marker only once a row records where they went. Between the marker and the upload, the
+	/// bytes in the cache are the only copy of the user's edit, and the marker is what makes a
+	/// drain retry them instead of a later cache probe silently concluding there was nothing to
+	/// send.
+	pub(crate) async fn modify_file_content(
+		&self,
+		id: FfiId,
+		os_path: String,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+	) -> Result<FileWithPathResponse, CacheError> {
+		debug!("Modifying content of {} with the bytes at {os_path}", id.0);
+		let mut file = match self.select_object_by_id(&id)? {
+			Some(DBObject::File(file)) => file,
+			Some(_) => {
+				return Err(CacheError::Unsupported(
+					format!("Id {id} does not point to a file").into(),
+				));
+			}
+			None => {
+				return Err(CacheError::DoesNotExist(
+					format!("No item found for id: {id}").into(),
+				));
+			}
+		};
+		let DBFileMeta::Decoded(meta) = &file.meta else {
+			return Err(CacheError::remote(format!(
+				"File {} does not have decoded metadata",
+				file.uuid
+			)));
+		};
+
+		// One guard for the whole edit. The copy, the hash check and the upload that renames the
+		// slot away under a freshly minted uuid all touch this item's cache slot, and these locks
+		// are not reentrant — which is why the upload is handed this guard instead of taking one.
+		let local_file_guard = self.lock_local_file(file.uuid).await;
+
+		// Read under the lock, before the marker moves: an import that fails has to leave behind
+		// exactly what it found, and what it found may be an edit an earlier attempt marked and
+		// could not deliver.
+		let was_pending = self.has_pending_upload(file.stable_uuid)?;
+		// Marked BEFORE the bytes land, and this is the whole reason this cannot be a copy
+		// followed by upload_file_if_changed: in between, the only copy of the edit would sit in a
+		// directory the size sweep evicts without taking any lock, with nothing recording that the
+		// server is missing it — a later drain would find no local file and drop the edit as
+		// though it had been dealt with.
+		sql::mark_pending_upload(
+			&self.conn(),
+			file.stable_uuid,
+			chrono::Utc::now().timestamp_millis(),
+		)?;
+
+		if let Err(e) = self
+			.io_import_cached_file(file.uuid, Some(&meta.name), Path::new(&os_path))
+			.await
+		{
+			// The slot never took the new bytes, so this call left nothing outstanding. A marker
+			// standing over content the server already has costs a drain a pointless upload of a
+			// byte-identical file — hash-less legacy files cannot short-circuit it. The crash
+			// window the marker exists for is untouched: a crash never reaches this line, which is
+			// exactly why the marker goes on first.
+			if !was_pending {
+				sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+			}
+			return Err(e.into());
+		}
+
+		// The caller may well be handing back bytes it never changed — a provider saves on close,
+		// edited or not. Files stored before the server recorded hashes have nothing to compare
+		// against, so they always upload: a spared upload is worth less than a delivered edit.
+		let unchanged = match meta.hash {
+			Some(hash) => {
+				self.hash_local_file(file.uuid, Some(&meta.name)).await? == Some(hash.into())
+			}
+			None => false,
+		};
+		if unchanged {
+			// Nothing to send, so nothing is outstanding. The item still comes back whole: the
+			// question asked was what the file now is, and "unchanged" is an answer about bytes.
+			sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+			// Carried into the row we hand back, which was read before the marker moved — the
+			// caller must not be told an edit is outstanding when the database says otherwise.
+			file.pending_upload_at = None;
+			return Ok(FileWithPathResponse {
+				file: file.into(),
+				id,
+			});
+		}
+
+		let (remote_file, _new_uuid_guard) = self
+			.upload_marked_edit(&file, meta, &local_file_guard, progress_callback)
+			.await?;
+		// A failed upload returns above with the marker still set and the bytes still in the slot:
+		// that pair IS the record of an edit the server has not got, and the drain is what
+		// resolves it.
+		let mut file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
+		// The upload renamed the slot under the uuid the server minted for this version, so the
+		// bytes belong to the row as it now stands.
+		self.record_materialised(file.uuid);
+		sql::clear_pending_upload(&self.conn(), file.stable_uuid)?;
+		// The upsert read the row while it was still marked — this edit HAS reached the server.
+		file.pending_upload_at = None;
+		Ok(FileWithPathResponse {
+			file: file.into(),
+			// The id the caller named it by still names it: a content edit re-mints the file's
+			// uuid but moves nothing and renames nothing.
+			id,
+		})
+	}
+
+	/// The item an id names, refreshed from the server (see
+	/// [`FilenMobileCacheState::update_and_query_item`]).
+	pub(crate) async fn update_and_query_item(
+		&self,
+		id: FfiId,
+	) -> Result<Option<FfiObject>, CacheError> {
+		debug!("Updating and querying item: {}", id.0);
+		// An id that resolves to no row of ours is one we retired: the providers only ever ask
+		// about identifiers they learned from this cache, so it named an item that has since been
+		// deleted (or it is garbage, which answers the same way). There is nothing to refresh
+		// either — an id is not something the server can be asked about, only a uuid is, and the
+		// row that would say which one is exactly what is missing.
+		let Some(obj) = self.select_object_by_id(&id)? else {
+			return Ok(None);
+		};
+		match obj {
+			DBObject::File(file) => self.refresh_file(file).await,
+			DBObject::Dir(dir) => self.refresh_dir(dir).await,
+			// A root is not something the server retires or moves; keeping its usage figures
+			// current is update_roots_info's job.
+			DBObject::Root(root) => Ok(Some(DBObject::Root(root).into())),
+		}
+	}
+
+	async fn refresh_file(&self, file: DBFile) -> Result<Option<FfiObject>, CacheError> {
+		let info = match self.client.get_file_with_info(file.uuid).await {
+			Ok(info) => info,
+			Err(e) if e.kind() == ErrorKind::FileNotFound => {
+				return self.forget_item(DBObject::File(file)).await;
+			}
+			Err(e) => return Err(e.into()),
+		};
+		// Our uuid names a version the server has retired — a content edit made elsewhere — or the
+		// short-lived trashed ghost such an edit leaves behind, re-stamped with a stable id that
+		// belongs to no lineage. Either way what came back is not this file's live head, and
+		// upserting it would write a dead version, or a foreign identity, onto the row. The head
+		// arrives with the next listing carrying our stable id, which lands on this very row;
+		// until then, report what we hold. What we must NOT do is call it deleted.
+		if info.versioned
+			|| (info.file.parent().is_trash() && info.file.stable_uuid() != file.stable_uuid)
+		{
+			debug!(
+				"File {} is superseded on the server, reporting the cached row",
+				file.uuid
+			);
+			return Ok(Some(DBObject::File(file).into()));
+		}
+		let file = DBFile::upsert_from_remote(&mut self.conn(), info.file)?;
+		Ok(Some(DBObject::File(file).into()))
+	}
+
+	async fn refresh_dir(&self, dir: DBDir) -> Result<Option<FfiObject>, CacheError> {
+		let remote_dir = match self.client.get_dir(dir.uuid).await {
+			Ok(remote_dir) => remote_dir,
+			Err(e) if e.kind() == ErrorKind::FolderNotFound => {
+				return self.forget_item(DBObject::Dir(dir)).await;
+			}
+			Err(e) => return Err(e.into()),
+		};
+		let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
+		Ok(Some(DBObject::Dir(dir).into()))
+	}
+
+	/// Drops an item the server says it no longer has, bytes first.
+	///
+	/// Same order as the tail of [`AuthCacheState::delete_item`], and for the same reason: the
+	/// bytes go first, then the row. Those bytes are a copy of the server's own content, so
+	/// dropping them along with the item is the point — the row delete that follows is what
+	/// retires the id for every replica, and a slot left behind would be a cached copy of
+	/// something nothing names any more.
+	async fn forget_item(&self, obj: DBObject) -> Result<Option<FfiObject>, CacheError> {
+		// An edit that has not reached the server outranks the server's answer: those bytes exist
+		// nowhere else, and a drain can still land them. Deleting the row here would take the only
+		// copy with it. The item stays until the drain resolves it, one way or the other.
+		let holds_unsent_bytes = match &obj {
+			DBObject::File(file) => self.has_pending_upload(file.stable_uuid)?,
+			// A directory has no bytes of its own, but its row cannot go alone: the delete cascades
+			// to everything under it, markers included, so an unsent edit anywhere below it is just
+			// as much a reason to keep the directory as its own would be.
+			DBObject::Dir(dir) => sql::has_descendant_pending_upload(&self.conn(), dir.uuid)?,
+			// Unreachable — the root is never refreshed through here — and it is not something the
+			// server retires anyway.
+			DBObject::Root(_) => false,
+		};
+		if holds_unsent_bytes {
+			tracing::warn!(
+				"Item {} is gone from the server but still holds an unuploaded edit, keeping it",
+				obj.uuid()
+			);
+			return Ok(Some(obj.into()));
+		}
+		debug!("Item {} is gone from the server, dropping it", obj.uuid());
+		self.io_delete_local(obj.uuid()).await?;
+		sql::delete_item(&self.conn(), obj.uuid())?;
+		Ok(None)
 	}
 
 	pub(crate) async fn upload_file_if_changed(
@@ -499,8 +852,11 @@ impl AuthCacheState {
 			}
 		};
 
-		let mut conn = self.conn();
-		DBFile::upsert_from_remote(&mut conn, remote_file)?;
+		let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
+		// Whichever branch got here left the bytes in this file's own cache slot: a new file's is
+		// where `io_upload_new_file` created it, an edited one's is where the rename moved it under
+		// the freshly minted uuid.
+		self.record_materialised(file.uuid);
 		Ok(true)
 	}
 
@@ -602,8 +958,10 @@ impl AuthCacheState {
 		}
 		// Held until the row exists, so the sweep cannot mistake the new slot on disk for garbage.
 		let (file, os_path, _uuid_guard) = self.io_upload_new_file(builder).await?;
-		let mut conn = self.conn();
-		let file = DBFile::upsert_from_remote(&mut conn, file)?;
+		let file = DBFile::upsert_from_remote(&mut self.conn(), file)?;
+		// The slot is the empty file the caller is about to write into, and it is in the cache
+		// directory like any downloaded copy.
+		self.record_materialised(file.uuid);
 		Ok(CreateFileResponse {
 			id: file_path,
 			file: file.into(),
@@ -1176,10 +1534,17 @@ impl AuthCacheState {
 		// while holding this same lock, so a snapshot taken before it says "no marker" for
 		// precisely the edit worth protecting — the one whose upload just failed.
 		let has_pending_upload = self.has_pending_upload(file.stable_uuid())?;
-		match (
-			file.hash(),
-			self.hash_local_file(file.uuid(), file.name()).await,
-		) {
+		let local_hash = self.hash_local_file(file.uuid(), file.name()).await;
+		// This probe is the authoritative answer to whether the file's bytes are in the cache
+		// directory, which is exactly what the materialisation marker records — so record it here,
+		// where it is known, rather than in each of the branches below. It is also the one place
+		// that notices bytes disappearing without any of our own deletion paths having run.
+		match &local_hash {
+			Ok(Some(_)) => self.record_materialised(file.uuid()),
+			Ok(None) => self.drop_materialised(file.uuid()),
+			Err(_) => {}
+		}
+		match (file.hash(), local_hash) {
 			(Some(remote_hash), Ok(Some(local_hash))) => {
 				// Remote file has a hash and local file exists
 				if remote_hash == local_hash || has_pending_upload {

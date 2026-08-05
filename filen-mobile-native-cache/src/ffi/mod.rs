@@ -50,6 +50,13 @@ pub struct FfiFile {
 	/// it. Non-`None` means the bytes on the device are ahead of the server's
 	/// and are waiting on a drain.
 	pub pending_upload_at: Option<i64>,
+	/// The file's metadata version: a number that rises whenever anything a
+	/// replica renders about it changes, and stands still otherwise. Only
+	/// comparable against another value of this field from the same database —
+	/// it is a local sequence, not a server-side one, and a cache wipe restarts
+	/// it. Purely local state (a cached copy, an outstanding edit) does not move
+	/// it.
+	pub change_seq: i64,
 }
 
 impl From<DBFile> for FfiFile {
@@ -63,6 +70,7 @@ impl From<DBFile> for FfiFile {
 			favorite_rank: file.favorite_rank,
 			local_data: file.local_data.map(|o| o.to_map()),
 			pending_upload_at: file.pending_upload_at,
+			change_seq: file.change_seq,
 			meta: match file.meta {
 				DBFileMeta::Decoded(meta) => Some(FfiFileMeta {
 					name: meta.name.to_string(),
@@ -100,6 +108,9 @@ pub struct FfiDir {
 	pub last_listed: i64,
 
 	pub local_data: Option<HashMap<String, String>>,
+	/// The directory's metadata version; see [`FfiFile::change_seq`]. A root is
+	/// never part of a replica's world, so it reports 0 and never moves.
+	pub change_seq: i64,
 }
 
 impl From<DBDir> for FfiDir {
@@ -112,6 +123,7 @@ impl From<DBDir> for FfiDir {
 			favorite_rank: dir.favorite_rank,
 			last_listed: dir.last_listed,
 			local_data: dir.local_data.map(|o| o.to_map()),
+			change_seq: dir.change_seq,
 			meta: if let DBDirMeta::Decoded(meta) = dir.meta {
 				Some(FfiDirMeta {
 					name: meta.name,
@@ -136,6 +148,7 @@ impl From<DBDirObject> for FfiDir {
 				favorite_rank: 0,
 				last_listed: root.last_listed,
 				local_data: None,
+				change_seq: 0,
 				meta: None,
 			},
 		}
@@ -344,6 +357,25 @@ pub struct QueryChildrenResponse {
 pub struct QueryNonDirChildrenResponse {
 	pub objects: Vec<FfiNonRootObject>,
 	pub millis_since_updated: Option<u64>,
+}
+
+/// What a replica missed since the anchor it handed in, from
+/// [`FilenMobileCacheState::enumerate_changes`](crate::auth::FilenMobileCacheState).
+#[derive(uniffi::Record, PartialEq, Eq, Debug, Clone)]
+pub struct FfiChanges {
+	/// Items to (re)render. Includes trashed ones: they moved into the trash
+	/// container, which is a change like any other.
+	pub updated: Vec<FfiObject>,
+	/// Items to drop, as `stable/<id>` — a file under its stable id, a dir under
+	/// its uuid, both in the one namespace [`FfiId`] resolves.
+	pub deleted_ids: Vec<String>,
+	/// The anchor to hand back next time. Opaque bytes: it names both the
+	/// sequence reached and the incarnation of the database that issued it.
+	pub anchor: Vec<u8>,
+	/// Whether another page follows this one. Always `false` today — a diff is
+	/// served whole — and here so that adding paging later does not change the
+	/// shape of the call.
+	pub more: bool,
 }
 
 #[derive(uniffi::Record)]

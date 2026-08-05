@@ -34,6 +34,26 @@ pub(crate) const SELECT_PENDING_UPLOADS: &str =
 	include_str!("../../sql/select_pending_uploads.sql");
 pub(crate) const SELECT_PENDING_UPLOAD_AT: &str =
 	include_str!("../../sql/select_pending_upload_at.sql");
+pub(crate) const SELECT_DESCENDANT_PENDING_UPLOAD: &str =
+	include_str!("../../sql/select_descendant_pending_upload.sql");
+pub(crate) const MARK_MATERIALISED: &str = include_str!("../../sql/mark_materialised.sql");
+pub(crate) const CLEAR_MATERIALISED: &str = include_str!("../../sql/clear_materialised.sql");
+pub(crate) const CLEAR_MATERIALISED_NOT_IN_CACHE: &str =
+	include_str!("../../sql/clear_materialised_not_in_cache.sql");
+
+// Item/Change feed
+pub(crate) const SELECT_CHANGE_META: &str = "SELECT db_instance, counter FROM change_meta;";
+/// The stamp a row carries now. Read back rather than RETURNED by the upserts: a RETURNING clause
+/// is evaluated before the AFTER triggers that do the stamping, and the per-type tables bump the
+/// item again after the `items` row itself is written.
+pub(crate) const SELECT_CHANGE_SEQ: &str = "SELECT change_seq FROM items WHERE id = ?;";
+/// The provider ids retired above a sequence. `kind` is not selected: it is what keeps the
+/// tombstone lookups off a full scan (see `init.sql`), but both kinds render into the same
+/// `stable/<id>` namespace, so the id alone is the whole answer.
+pub(crate) const SELECT_RETIRED_IDS: &str =
+	"SELECT item_id FROM tombstones WHERE seq > ?1 ORDER BY seq ASC;";
+pub(crate) const SELECT_CHANGED_ITEMS: &str = include_str!("../../sql/select_changed_items.sql");
+pub(crate) const SELECT_WORKING_SET: &str = include_str!("../../sql/select_working_set.sql");
 
 // Item/Recents
 pub(crate) const UPDATE_ITEM_SET_RECENT: &str =

@@ -30,15 +30,28 @@ SELECT
 	files_meta.file_key_version,
 	files_meta.created AS file_created,
 	files_meta.modified,
-	files_meta.hash,
-	roots.storage_used,
-	roots.max_storage,
-	roots.last_updated,
-	dirs.last_listed AS root_last_listed
+	files_meta.hash
 FROM items
 LEFT JOIN dirs ON items.id = dirs.id
 LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 LEFT JOIN files ON items.id = files.id
 LEFT JOIN files_meta ON items.id = files_meta.id
-LEFT JOIN roots ON items.id = roots.id
-WHERE items.uuid = ?;
+-- The working set: the items this device has a stake in, and so the only ones
+-- kept up to date incrementally. Everything else is reconciled when it is
+-- presented. Trashed rows stay in: a file that was materialised or
+-- favourited is still the user's business once it is in the trash.
+WHERE
+	-- Same two exclusions as the change feed: no roots, and no half-written row.
+	items.type != 0
+	AND COALESCE(files.id, dirs.id) IS NOT NULL
+	AND (
+		-- Its bytes are on the device...
+		items.materialised_at IS NOT NULL
+		-- ...or an edit of them has not reached the server...
+		OR items.pending_upload_at IS NOT NULL
+		-- ...or the user asked for it by name. `favorite_rank` lives on the
+		-- per-type table, so a file can only ever satisfy the first of these two
+		-- and a dir only the second.
+		OR files.favorite_rank > 0
+		OR dirs.favorite_rank > 0
+	);

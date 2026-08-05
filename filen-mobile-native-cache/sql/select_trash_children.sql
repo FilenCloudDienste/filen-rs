@@ -3,6 +3,7 @@ SELECT
 	items.uuid,
 	items.stable_uuid,
 	items.pending_upload_at,
+	items.change_seq,
 	items.parent,
 	items.trashed,
 	items.local_data,

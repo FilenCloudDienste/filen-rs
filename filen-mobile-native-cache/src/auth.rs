@@ -44,7 +44,10 @@ pub const DB_FILE_NAME: &str = "native_cache.db";
 // 3 - add `items.stable_uuid` (server-minted whole-life file id; FILES ONLY, NULL for dirs/roots,
 //     whose own uuid is already their whole-life id). The wipe-and-resync reinit repopulates it
 //     from directory listings.
-const CACHE_VERSION: u64 = 3;
+// 4 - add the change-tracking substrate: `items.change_seq` + `items.materialised_at`, the
+//     `tombstones` and `change_meta` tables, and the triggers that maintain them. A replica
+//     syncing against a pre-4 database would see an empty history, so start everyone fresh.
+const CACHE_VERSION: u64 = 4;
 
 pub struct AuthCacheState {
 	conn: Mutex<Connection>,

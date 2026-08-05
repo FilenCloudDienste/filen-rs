@@ -65,6 +65,12 @@ pub enum CacheError {
 	NotADirectory(ErrorContext),
 	FailedToDecrypt(ErrorContext),
 	InvalidName(ErrorContext),
+	/// The sync anchor handed in does not name a sequence in THIS database — it is
+	/// malformed, or it was issued by an incarnation a wipe has since replaced. Its
+	/// own variant because the file providers have to tell it apart from every other
+	/// failure: it is the one they answer by re-enumerating from scratch
+	/// (`NSFileProviderErrorSyncAnchorExpired`), not by reporting an error.
+	SyncAnchorExpired(ErrorContext),
 }
 
 impl CacheError {
@@ -121,6 +127,9 @@ impl CacheError {
 			CacheError::InvalidName(err) => CacheError::InvalidName(ErrorContext(
 				format!("{}: {}", context.into(), err.0).into(),
 			)),
+			CacheError::SyncAnchorExpired(err) => CacheError::SyncAnchorExpired(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
 		}
 	}
 }
@@ -152,6 +161,7 @@ impl std::fmt::Display for CacheError {
 			CacheError::NotADirectory(err) => err.fmt(f),
 			CacheError::FailedToDecrypt(err) => err.fmt(f),
 			CacheError::InvalidName(err) => err.fmt(f),
+			CacheError::SyncAnchorExpired(err) => err.fmt(f),
 		}
 	}
 }

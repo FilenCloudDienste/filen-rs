@@ -30,15 +30,22 @@ SELECT
 	files_meta.file_key_version,
 	files_meta.created AS file_created,
 	files_meta.modified,
-	files_meta.hash,
-	roots.storage_used,
-	roots.max_storage,
-	roots.last_updated,
-	dirs.last_listed AS root_last_listed
+	files_meta.hash
 FROM items
 LEFT JOIN dirs ON items.id = dirs.id
 LEFT JOIN dirs_meta ON items.id = dirs_meta.id
 LEFT JOIN files ON items.id = files.id
 LEFT JOIN files_meta ON items.id = files_meta.id
-LEFT JOIN roots ON items.id = roots.id
-WHERE items.uuid = ?;
+-- Everything a replica holding sequence ?1 has not been shown yet. Trashed rows
+-- are deliberately in: they moved into the trash container, which is a change
+-- like any other, and they keep their original `parent` for the restore.
+WHERE
+	items.change_seq > ?1
+	-- Roots are local scaffolding; no replica ever sees one.
+	AND items.type != 0
+	-- A row whose per-type half has not landed yet cannot be rendered: the
+	-- `items` row is stamped the moment it is inserted, the `files`/`dirs` row
+	-- that carries the rest of it a statement later. Skipping is safe — landing
+	-- it stamps the item again, so it arrives with the next diff.
+	AND COALESCE(files.id, dirs.id) IS NOT NULL
+ORDER BY items.change_seq ASC;

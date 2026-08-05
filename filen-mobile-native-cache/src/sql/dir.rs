@@ -133,6 +133,9 @@ pub struct DBDir {
 	pub(crate) local_data: Option<JsonObject>,
 	pub(crate) meta: DBDirMeta,
 	pub(crate) timestamp: i64,
+	/// The change sequence this row was carrying when it was read — the directory's metadata
+	/// version as far as an external replica is concerned.
+	pub(crate) change_seq: i64,
 }
 
 impl DBDir {
@@ -148,6 +151,7 @@ impl DBDir {
 				)
 			})?,
 			local_data: item.local_data,
+			change_seq: item.change_seq,
 			favorite_rank: row.get(DIR_FAVORITE_RANK)?,
 			color: row.get(DIRS_COLOR)?,
 			timestamp: row.get(DIR_TIMESTAMP)?,
@@ -162,12 +166,15 @@ impl DBDir {
 		Ok(res)
 	}
 
+	/// `select_change_seq` is read AFTER every write above, because that is the only way to learn
+	/// the stamp: the triggers do it, and a RETURNING clause is evaluated before they run.
 	pub(crate) fn upsert_from_remote_stmts(
 		remote_dir: RemoteDirectory,
 		upsert_item_stmt: &mut CachedStatement<'_>,
 		upsert_dir: &mut CachedStatement<'_>,
 		upsert_dir_meta: &mut CachedStatement<'_>,
 		delete_dir_meta: &mut CachedStatement<'_>,
+		select_change_seq: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		let (id, local_data) = item::upsert_dir_item_with_stmts(
 			remote_dir.uuid(),
@@ -221,6 +228,7 @@ impl DBDir {
 			timestamp,
 			last_listed,
 			local_data,
+			change_seq: select_change_seq.query_one([id], |row| row.get(0))?,
 			meta: DBDirMeta::from(remote_dir.meta),
 		})
 	}
@@ -235,12 +243,14 @@ impl DBDir {
 			let mut upsert_dir = tx.prepare_cached(UPSERT_DIR)?;
 			let mut upsert_dir_meta = tx.prepare_cached(UPSERT_DIR_META)?;
 			let mut delete_dir_meta = tx.prepare_cached(DELETE_DIR_META)?;
+			let mut select_change_seq = tx.prepare_cached(SELECT_CHANGE_SEQ)?;
 			Self::upsert_from_remote_stmts(
 				remote_dir,
 				&mut upsert_item_stmt,
 				&mut upsert_dir,
 				&mut upsert_dir_meta,
 				&mut delete_dir_meta,
+				&mut select_change_seq,
 			)?
 		};
 		tx.commit()?;

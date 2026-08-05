@@ -11,8 +11,8 @@ use crate::{
 	ffi::ItemType,
 	sql::{
 		columns::{
-			ITEMS_ID, ITEMS_LOCAL_DATA, ITEMS_PARENT, ITEMS_PENDING_UPLOAD_AT, ITEMS_TRASHED,
-			ITEMS_TYPE, ITEMS_UUID,
+			ITEMS_CHANGE_SEQ, ITEMS_ID, ITEMS_LOCAL_DATA, ITEMS_PARENT, ITEMS_PENDING_UPLOAD_AT,
+			ITEMS_TRASHED, ITEMS_TYPE, ITEMS_UUID,
 		},
 		dir::{DBDir, DBRoot},
 		file::DBFile,
@@ -76,6 +76,8 @@ pub struct RawDBItem {
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) local_data: Option<JsonObject>, // local data is optional, used for storing additional metadata
 	pub(crate) type_: ItemType,
+	/// The change sequence the row was carrying when it was read; see [`InnerDBItem::change_seq`].
+	pub(crate) change_seq: i64,
 }
 
 /// Binds the shared `items` upsert.
@@ -180,6 +182,7 @@ impl RawDBItem {
 			parent: combine_parent(parent, trashed),
 			local_data: row.get(ITEMS_LOCAL_DATA).unwrap(),
 			type_: row.get(ITEMS_TYPE)?,
+			change_seq: row.get(ITEMS_CHANGE_SEQ)?,
 		})
 	}
 
@@ -211,6 +214,10 @@ pub struct InnerDBItem {
 	pub(crate) uuid: Uuid,
 	pub(crate) parent: Option<ParentUuid>, // parent can be None for root items
 	pub(crate) local_data: Option<JsonObject>, // local data is optional, used for storing additional metadata
+	/// The change sequence the row was carrying when it was read — the version an external
+	/// replica compares its own copy against. Stamped by the triggers in `init.sql`, so it is
+	/// only ever as fresh as the read that produced this struct.
+	pub(crate) change_seq: i64,
 }
 
 impl InnerDBItem {
@@ -222,6 +229,7 @@ impl InnerDBItem {
 			uuid: row.get(ITEMS_UUID)?,
 			parent: combine_parent(parent, trashed),
 			local_data: row.get(ITEMS_LOCAL_DATA).unwrap(),
+			change_seq: row.get(ITEMS_CHANGE_SEQ)?,
 		})
 	}
 }
@@ -233,6 +241,7 @@ impl From<RawDBItem> for InnerDBItem {
 			uuid: raw.uuid,
 			parent: raw.parent,
 			local_data: raw.local_data,
+			change_seq: raw.change_seq,
 		}
 	}
 }

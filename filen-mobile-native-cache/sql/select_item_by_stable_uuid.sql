@@ -4,7 +4,8 @@ SELECT
 	parent,
 	trashed,
 	local_data,
-	type
+	type,
+	change_seq
 FROM items
 WHERE stable_uuid = ?
 -- duplicate stables are reachable via same-account uuid-reuse abuse; prefer

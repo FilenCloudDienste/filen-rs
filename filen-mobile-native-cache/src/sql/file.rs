@@ -185,6 +185,9 @@ pub struct DBFile {
 	/// Millis at which a local edit was marked as not yet on the server, or
 	/// `None` when nothing is outstanding.
 	pub(crate) pending_upload_at: Option<i64>,
+	/// The change sequence this row was carrying when it was read — the file's
+	/// metadata version as far as an external replica is concerned.
+	pub(crate) change_seq: i64,
 	pub(crate) meta: DBFileMeta,
 }
 
@@ -220,6 +223,7 @@ impl DBFile {
 			})?,
 			local_data: item.local_data,
 			pending_upload_at: row.get(ITEMS_PENDING_UPLOAD_AT)?,
+			change_seq: item.change_seq,
 			size: row.get(FILES_SIZE)?,
 			chunks: row.get(FILES_CHUNKS)?,
 			favorite_rank: row.get(FILE_FAVORITE_RANK)?,
@@ -242,12 +246,15 @@ impl DBFile {
 		stmt.query_one([item.id], |row| Self::from_inner_and_row(item, row))
 	}
 
+	/// `select_change_seq` is read AFTER every write above, because that is the only way to learn
+	/// the stamp: the triggers do it, and a RETURNING clause is evaluated before they run.
 	pub(crate) fn upsert_from_remote_stmts(
 		remote_file: RemoteFile,
 		upsert_item_stmt: &mut CachedStatement<'_>,
 		upsert_file: &mut CachedStatement<'_>,
 		upsert_file_meta: &mut CachedStatement<'_>,
 		delete_file_meta: &mut CachedStatement<'_>,
+		select_change_seq: &mut CachedStatement<'_>,
 	) -> Result<Self> {
 		trace!("Upserting remote file: {remote_file:?}");
 		let (id, local_data, pending_upload_at) = item::upsert_file_item_with_stmts(
@@ -308,6 +315,7 @@ impl DBFile {
 			timestamp: remote_file.timestamp.timestamp_millis(),
 			local_data,
 			pending_upload_at,
+			change_seq: select_change_seq.query_one([id], |row| row.get(0))?,
 			meta: remote_file.meta.into(),
 		})
 	}
@@ -322,12 +330,14 @@ impl DBFile {
 			let mut upsert_file = tx.prepare_cached(UPSERT_FILE)?;
 			let mut upsert_file_meta = tx.prepare_cached(UPSERT_FILE_META)?;
 			let mut delete_file_meta = tx.prepare_cached(DELETE_FILE_META)?;
+			let mut select_change_seq = tx.prepare_cached(SELECT_CHANGE_SEQ)?;
 			Self::upsert_from_remote_stmts(
 				remote_file,
 				&mut upsert_item_stmt,
 				&mut upsert_file,
 				&mut upsert_file_meta,
 				&mut delete_file_meta,
+				&mut select_change_seq,
 			)?
 		};
 		tx.commit()?;

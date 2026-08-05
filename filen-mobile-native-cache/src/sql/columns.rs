@@ -31,6 +31,9 @@ pub(crate) const ITEMS_LOCAL_DATA: &str = "local_data";
 pub(crate) const ITEMS_TYPE: &str = "type";
 /// Millis a local edit was marked as not yet on the server; NULL when nothing is outstanding.
 pub(crate) const ITEMS_PENDING_UPLOAD_AT: &str = "pending_upload_at";
+/// The `change_meta.counter` value the row was stamped with the last time it changed in a way an
+/// external replica can see. Maintained by the triggers in `init.sql`, never by a statement.
+pub(crate) const ITEMS_CHANGE_SEQ: &str = "change_seq";
 
 // -- `dirs` / `dirs_meta` ------------------------------------------------------------------------
 //

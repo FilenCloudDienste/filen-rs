@@ -308,6 +308,9 @@ fn ffi_file(file: CacheableFile<'_>) -> FfiFile {
 		local_data: None,
 		// Same: outstanding local edits are the browsing cache's business.
 		pending_upload_at: None,
+		// A hit comes out of the search engine's own database, which keeps no change sequence —
+		// only the browsing cache's rows carry a version a replica can compare against.
+		change_seq: 0,
 	}
 }
 
@@ -325,6 +328,8 @@ fn ffi_dir(dir: CacheableDir<'_>) -> FfiDir {
 		favorite_rank: i64::from(dir.favorited),
 		last_listed: 0,
 		local_data: None,
+		// Same as the file above: the search engine's database keeps no change sequence.
+		change_seq: 0,
 	}
 }
 

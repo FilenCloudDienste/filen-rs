@@ -4,6 +4,7 @@ SELECT
 	parent,
 	trashed,
 	local_data,
-	type
+	type,
+	change_seq
 FROM items
 WHERE uuid = ?;

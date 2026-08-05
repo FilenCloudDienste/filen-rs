@@ -176,7 +176,64 @@ impl AuthCacheState {
 		// owns the guard and awaiting its handle, which is why it has not been done inline here.
 		tokio::fs::create_dir_all(parent).await?;
 		tokio::fs::rename(&src, &dst).await?;
+		// The bytes are in the cache directory now. Recorded here rather than at the callers so
+		// that every download covers itself — the thumbnail path materialises a file too.
+		self.record_materialised(file.uuid());
 		Ok(dst)
+	}
+
+	/// Puts bytes from outside the cache into a file's slot, replacing whatever is there.
+	///
+	/// The item's lock must already be held: this is the same slot a download writes and a clear
+	/// removes. Staged through the tmp directory and renamed in, exactly like a download — in the
+	/// slot, a copy interrupted halfway IS the item's content, and the caller marks the edit as
+	/// outstanding before calling this, so a truncated file is what the drain would then send to
+	/// the server on top of a version that was fine.
+	pub(crate) async fn io_import_cached_file(
+		&self,
+		uuid: Uuid,
+		name: Option<&str>,
+		src: &Path,
+	) -> Result<(), io::Error> {
+		let staged = self.tmp_dir.join(uuid.to_string());
+		tokio::fs::copy(src, &staged).await?;
+		let dst = self.get_cached_file_path_from_name(&uuid.to_string(), name);
+		let parent = dst
+			.parent()
+			.expect("cached file path parent should always exist");
+		tokio::fs::create_dir_all(parent).await?;
+		if let Err(e) = tokio::fs::rename(&staged, &dst).await {
+			// Nothing owns the staged copy once the rename has refused it: the tmp sweep only
+			// reaps uuids the database does not know, and this one it does.
+			if let Err(e) = tokio::fs::remove_file(&staged).await {
+				tracing::warn!("Failed to remove staged copy {}: {}", staged.display(), e);
+			}
+			return Err(e);
+		}
+		self.record_materialised(uuid);
+		Ok(())
+	}
+
+	/// Records that this file's bytes are in the cache directory, as of now.
+	///
+	/// Deliberately infallible: the caller has already written the bytes, and a database error
+	/// must not turn a download that succeeded into a failure. The marker is device-local state,
+	/// and [`AuthCacheState::reconcile_materialised`] rebuilds it from the directory itself on the
+	/// next cleanup.
+	pub(crate) fn record_materialised(&self, uuid: Uuid) {
+		if let Err(e) =
+			sql::mark_materialised(&self.conn(), uuid, chrono::Utc::now().timestamp_millis())
+		{
+			error!("Failed to record the cached copy of {uuid}: {e}");
+		}
+	}
+
+	/// Drops the record once the bytes are gone. Infallible for the same reason: the bytes are
+	/// already deleted, and the reconciliation pass is the backstop.
+	pub(crate) fn drop_materialised(&self, uuid: Uuid) {
+		if let Err(e) = sql::clear_materialised(&self.conn(), uuid) {
+			error!("Failed to drop the cached-copy record of {uuid}: {e}");
+		}
 	}
 
 	pub async fn hash_local_file(
@@ -331,6 +388,9 @@ impl AuthCacheState {
 		{
 			return Err(e);
 		}
+		// The slot is gone, so the row must stop claiming a local copy: the working set is built on
+		// that claim, and a stale marker keeps an item this device no longer holds inside it.
+		self.drop_materialised(uuid);
 		Ok(())
 	}
 }
@@ -723,6 +783,52 @@ impl AuthCacheState {
 			.is_none_or(|t| t + AUTH_CLEANUP_INTERVAL <= chrono::Utc::now())
 	}
 
+	/// Drops the materialisation marker of every file whose cache slot the sweeps just took.
+	///
+	/// The sweeps delete slots by path — [`remove_old_files`] by age, [`cleanup_uuid_dir`] by
+	/// identity, [`process_subdir`] by malformed shape — and none of them is in a position to
+	/// write to the database. Reconciling once, after they have all run, keeps the column in step
+	/// with the directory whatever removed the bytes, at the cost of one listing of a directory
+	/// the budget already bounds.
+	async fn reconcile_materialised(&self) {
+		// Taken BEFORE the listing: a file materialised while it runs is missing from the snapshot
+		// only because it did not exist yet, and the statement spares exactly those.
+		let listed_at = chrono::Utc::now().timestamp_millis();
+		let Ok(mut dir) = tokio::fs::read_dir(&self.cache_dir).await else {
+			tracing::warn!(
+				"Tried to reconcile the cached-copy records, but {} does not exist.",
+				self.cache_dir.display()
+			);
+			return;
+		};
+
+		let mut uuids: Vec<UuidStr> = Vec::new();
+		loop {
+			match dir.next_entry().await {
+				Ok(Some(entry)) => {
+					if let Ok(uuid) = UuidStr::from_str(&entry.file_name().to_string_lossy()) {
+						uuids.push(uuid);
+					}
+				}
+				Ok(None) => break,
+				Err(e) => {
+					error!(
+						"Failed to read directory {}: {}",
+						self.cache_dir.display(),
+						e
+					);
+					return;
+				}
+			}
+		}
+
+		if let Err(e) =
+			sql::clear_materialised_not_in_cache(&self.conn(), uuids.into_iter(), listed_at)
+		{
+			error!("Failed to reconcile the cached-copy records: {e}");
+		}
+	}
+
 	pub(crate) async fn cleanup_cache(&self) {
 		if !self.should_cleanup().await {
 			return;
@@ -745,6 +851,7 @@ impl AuthCacheState {
 			remove_old_thumbnails(&self.thumbnail_dir, self.thumbnail_file_budget,),
 			cleanup_uuid_dir(self, &self.thumbnail_dir)
 		);
+		self.reconcile_materialised().await;
 
 		let mut lock = self.last_cleanup.write().await;
 		let now = chrono::Utc::now();
