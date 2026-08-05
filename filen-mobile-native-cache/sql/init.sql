@@ -1,7 +1,3 @@
-PRAGMA recursive_triggers = TRUE;
-PRAGMA journal_mode = WAL;
-PRAGMA temp_store = MEMORY;
-
 CREATE TABLE items (
 	id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
 	uuid BLOB NOT NULL UNIQUE,

@@ -673,6 +673,7 @@ mod pending_upload_tests {
 
 	fn db() -> Connection {
 		let conn = Connection::open_in_memory().unwrap();
+		crate::auth::configure_conn(&conn).unwrap();
 		conn.execute_batch(INIT).unwrap();
 		conn
 	}

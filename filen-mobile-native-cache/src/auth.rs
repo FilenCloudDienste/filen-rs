@@ -157,12 +157,25 @@ pub(crate) async fn update_saved_db_state_cache_cleanup_time(
 	Ok(())
 }
 
-/// Registers the connection-local `uuid_text(blob)` SQL function, which renders a 16-byte BLOB
-/// uuid as its canonical lowercase-hyphenated text. Used by queries that need a uuid as a string
-/// (path-component fallback when metadata isn't decoded, and uuid-based path navigation) now that
-/// `items.uuid` is stored as a BLOB. Must be called on every connection before those queries run.
+/// Puts a connection into the configuration the schema is written against. Must be called on
+/// every connection before anything else runs — the pragmas are per-connection state (only
+/// `journal_mode` persists in the DB file), so setting them at `init_db` time alone would leave
+/// every later open running with SQLite's defaults: `recursive_triggers` OFF caps
+/// `cascade_on_delete_delete_children` at one level and orphans grandchildren, and
+/// `foreign_keys` ON is otherwise only a compile-time default of the bundled SQLite.
+///
+/// Also registers the connection-local `uuid_text(blob)` SQL function, which renders a 16-byte
+/// BLOB uuid as its canonical lowercase-hyphenated text. Used by queries that need a uuid as a
+/// string (path-component fallback when metadata isn't decoded, and uuid-based path navigation)
+/// now that `items.uuid` is stored as a BLOB.
 pub(crate) fn configure_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 	use rusqlite::functions::FunctionFlags;
+	conn.execute_batch(
+		"PRAGMA recursive_triggers = TRUE;
+		PRAGMA journal_mode = WAL;
+		PRAGMA temp_store = MEMORY;
+		PRAGMA foreign_keys = ON;",
+	)?;
 	conn.create_scalar_function(
 		"uuid_text",
 		1,
@@ -923,5 +936,74 @@ mod auth_file_crypto_tests {
 		let dek = EncryptionKey::new([7u8; 32]);
 		assert!(decrypt_auth_bytes(&[0x01, 0x00], Some(&dek)).is_err());
 		assert!(decrypt_auth_bytes(&[], Some(&dek)).is_err());
+	}
+}
+
+#[cfg(test)]
+mod connection_pragma_tests {
+	use rusqlite::Connection;
+
+	use super::configure_conn;
+	use crate::sql;
+
+	/// Removes the DB directory when dropped so a failing assertion doesn't leak temp files.
+	struct TempDbDir(std::path::PathBuf);
+
+	impl Drop for TempDbDir {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+
+	// The pragmas are per-connection state, so they must arrive via `configure_conn` (which every
+	// open path calls), not via `init.sql` (which only the creation path executes). Pin that on a
+	// REOPENED connection — the shape of `db_from_dir`'s reuse branch — a delete still cascades to
+	// grandchildren: with `recursive_triggers` at SQLite's default OFF,
+	// `cascade_on_delete_delete_children` cannot re-enter and the grandchild survives.
+	#[test]
+	fn reopened_connection_cascades_past_the_first_generation() {
+		let dir = TempDbDir(
+			std::env::temp_dir().join(format!("filen-cache-pragma-test-{}", rand::random::<u64>())),
+		);
+		std::fs::create_dir_all(&dir.0).unwrap();
+		let db_path = dir.0.join("native_cache.db");
+
+		{
+			let conn = Connection::open(&db_path).unwrap();
+			configure_conn(&conn).unwrap();
+			conn.execute_batch(sql::statements::INIT).unwrap();
+		}
+
+		let conn = Connection::open(&db_path).unwrap();
+		configure_conn(&conn).unwrap();
+
+		// root dir (A) -> child dir (B) -> grandchild file (C)
+		conn.execute_batch(
+			"INSERT INTO items (uuid, stable_uuid, parent, type)
+			VALUES
+			(x'AA000000000000000000000000000000', NULL, NULL, 1),
+			(x'BB000000000000000000000000000000', NULL, x'AA000000000000000000000000000000', 1),
+			(
+				x'CC000000000000000000000000000000',
+				x'DD000000000000000000000000000000',
+				x'BB000000000000000000000000000000',
+				2
+			);",
+		)
+		.unwrap();
+
+		conn.execute(
+			"DELETE FROM items WHERE uuid = x'AA000000000000000000000000000000'",
+			[],
+		)
+		.unwrap();
+
+		let remaining: i64 = conn
+			.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(
+			remaining, 0,
+			"cascade stopped early: a reopened connection is missing PRAGMA recursive_triggers"
+		);
 	}
 }
