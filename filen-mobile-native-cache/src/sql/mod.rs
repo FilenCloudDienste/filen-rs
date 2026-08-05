@@ -645,6 +645,21 @@ pub(crate) fn select_children(
 		.collect::<SQLResult<Vec<_>>>()
 }
 
+pub(crate) fn select_children_page(
+	conn: &Connection,
+	order_by: Option<&str>,
+	parent: Uuid,
+	limit: u32,
+	offset: u32,
+) -> SQLResult<Vec<DBNonRootObject>> {
+	let mut stmt = conn.prepare(&statements::select_dir_children_page(order_by))?;
+	stmt.query_and_then(
+		rusqlite::params![parent, limit, offset],
+		DBNonRootObject::from_row,
+	)?
+	.collect::<SQLResult<Vec<_>>>()
+}
+
 /// Selects the cached trashed items (the trash listing).
 pub(crate) fn select_trash(
 	conn: &Connection,
@@ -2494,6 +2509,42 @@ mod change_tracking_tests {
 			anchor(&conn),
 			served,
 			"and none of this is a change a replica is ever shown"
+		);
+	}
+
+	#[test]
+	fn a_page_is_a_window_into_the_same_ordered_listing() {
+		let conn = db();
+		let parent = uuid(0xA0);
+		// Insertion order is deliberately not name order — the pages must follow the
+		// listing's ordering, not the rowids'.
+		add_file(&conn, uuid(3), stable(3), parent, "c.txt");
+		add_file(&conn, uuid(1), stable(1), parent, "a.txt");
+		add_dir(&conn, uuid(5), parent, "e");
+		add_file(&conn, uuid(4), stable(4), parent, "d.txt");
+		add_file(&conn, uuid(2), stable(2), parent, "b.txt");
+
+		let all: Vec<crate::ffi::FfiNonRootObject> = select_children(&conn, None, parent)
+			.unwrap()
+			.into_iter()
+			.map(Into::into)
+			.collect();
+		assert_eq!(all.len(), 5);
+
+		let page = |offset: u32, limit: u32| -> Vec<crate::ffi::FfiNonRootObject> {
+			select_children_page(&conn, None, parent, limit, offset)
+				.unwrap()
+				.into_iter()
+				.map(Into::into)
+				.collect()
+		};
+		assert_eq!(page(0, 2), all[0..2]);
+		assert_eq!(page(2, 2), all[2..4]);
+		assert_eq!(page(4, 2), all[4..5], "the short page ends the listing");
+		assert_eq!(
+			page(5, 2),
+			[],
+			"an offset past the end is empty, not an error"
 		);
 	}
 }

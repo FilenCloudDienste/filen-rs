@@ -318,6 +318,33 @@ impl AuthCacheState {
 		}))
 	}
 
+	pub(crate) fn query_dir_children_page(
+		&self,
+		path: &FfiId,
+		order_by: Option<String>,
+		offset: u32,
+		limit: u32,
+	) -> Result<Option<QueryChildrenResponse>, CacheError> {
+		let path = self.canonicalize_id(path)?;
+		let path_id = path.as_path()?;
+		debug!(
+			"Querying directory children page at path: {} (offset {offset}, limit {limit})",
+			path.0
+		);
+
+		let dir: DBDirObject = match sql::select_object_at_path(&self.conn(), &path_id)? {
+			Some(obj) => obj.try_into()?,
+			None => return Ok(None),
+		};
+
+		let conn = self.conn();
+		let children = dir.select_children_page(&conn, order_by.as_deref(), limit, offset)?;
+		Ok(Some(QueryChildrenResponse {
+			parent: dir.into(),
+			objects: children.into_iter().map(Into::into).collect(),
+		}))
+	}
+
 	pub(crate) fn query_recents(
 		&self,
 		order_by: Option<String>,

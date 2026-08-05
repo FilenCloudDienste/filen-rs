@@ -564,6 +564,13 @@ pub(crate) trait DBDirExt {
 		conn: &Connection,
 		order_by: Option<&str>,
 	) -> SQLResult<Vec<DBNonRootObject>>;
+	fn select_children_page(
+		&self,
+		conn: &Connection,
+		order_by: Option<&str>,
+		limit: u32,
+		offset: u32,
+	) -> SQLResult<Vec<DBNonRootObject>>;
 }
 
 impl<T> DBDirExt for T
@@ -593,5 +600,15 @@ where
 		order_by: Option<&str>,
 	) -> SQLResult<Vec<DBNonRootObject>> {
 		crate::sql::select_children(conn, order_by, self.uuid())
+	}
+
+	fn select_children_page(
+		&self,
+		conn: &Connection,
+		order_by: Option<&str>,
+		limit: u32,
+		offset: u32,
+	) -> SQLResult<Vec<DBNonRootObject>> {
+		crate::sql::select_children_page(conn, order_by, self.uuid(), limit, offset)
 	}
 }

@@ -96,6 +96,22 @@ impl FilenMobileCacheState {
 		.await
 	}
 
+	pub async fn update_and_query_dir_children_page(
+		&self,
+		path: FfiId,
+		order_by: Option<String>,
+		offset: u32,
+		limit: u32,
+		refresh: bool,
+	) -> Result<Option<QueryChildrenResponse>, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state
+				.update_and_query_dir_children_page(path, order_by, offset, limit, refresh)
+				.await
+		})
+		.await
+	}
+
 	pub async fn update_and_query_recents(
 		&self,
 		order_by: Option<String>,
@@ -395,6 +411,27 @@ impl AuthCacheState {
 		);
 		self.update_dir_children(&path).await?;
 		self.query_dir_children(&path, order_by)
+	}
+
+	/// One page of a directory's children. `refresh` gates the server relist — Filen's dir
+	/// listing has no server-side cursor, so a paging enumerator relists once on its first
+	/// page and serves the rest from the cache the relist just wrote.
+	pub(crate) async fn update_and_query_dir_children_page(
+		&self,
+		path: FfiId,
+		order_by: Option<String>,
+		offset: u32,
+		limit: u32,
+		refresh: bool,
+	) -> Result<Option<QueryChildrenResponse>, CacheError> {
+		debug!(
+			"Updating and querying directory children page for path: {} (offset {offset}, limit {limit}, refresh {refresh})",
+			path.0
+		);
+		if refresh {
+			self.update_dir_children(&path).await?;
+		}
+		self.query_dir_children_page(&path, order_by, offset, limit)
 	}
 
 	pub(crate) async fn update_and_query_recents(

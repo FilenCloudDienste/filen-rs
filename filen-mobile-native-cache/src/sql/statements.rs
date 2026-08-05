@@ -92,6 +92,14 @@ pub(crate) fn select_dir_children(order_by: Option<&str>) -> String {
 	format!("{} {}", SELECT_DIR_CHILDREN, convert_order_by(order_by))
 }
 
+pub(crate) fn select_dir_children_page(order_by: Option<&str>) -> String {
+	format!(
+		"{} {} LIMIT ? OFFSET ?",
+		SELECT_DIR_CHILDREN,
+		convert_order_by(order_by)
+	)
+}
+
 const SELECT_TRASH_CHILDREN: &str = include_str!("../../sql/select_trash_children.sql");
 pub(crate) fn select_trash_children(order_by: Option<&str>) -> String {
 	format!("{} {}", SELECT_TRASH_CHILDREN, convert_order_by(order_by))
