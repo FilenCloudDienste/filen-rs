@@ -94,6 +94,10 @@ fn items_upsert_sql(rows: usize) -> String {
 /// Multi-row `INSERT INTO files (id, ...) VALUES <rows> ON CONFLICT(id) DO UPDATE ...`. Per row k the
 /// params are `[id, chunks_size, chunks, favorite, region, bucket, timestamp, size, name, mime,
 /// file_key, file_key_version, created, modified, hash, stable_uuid]` at base `k * 16`.
+///
+/// `superseded` is bound by neither half: a fresh row DEFAULTs it to FALSE and the conflict update
+/// forces it back to FALSE — which is exactly right, since a record arriving here IS the content
+/// the mid-supersede marker was waiting for.
 fn files_upsert_sql(rows: usize) -> String {
 	let mut sql = String::with_capacity(rows * 64 + 704);
 	sql.push_str(
@@ -108,7 +112,7 @@ fn files_upsert_sql(rows: usize) -> String {
 		 name = excluded.name, mime = excluded.mime, file_key = excluded.file_key, \
 		 file_key_version = excluded.file_key_version, created = excluded.created, \
 		 modified = excluded.modified, hash = excluded.hash, \
-		 stable_uuid = excluded.stable_uuid",
+		 stable_uuid = excluded.stable_uuid, superseded = FALSE",
 	);
 	sql
 }

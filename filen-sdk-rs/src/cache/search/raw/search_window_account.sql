@@ -52,6 +52,11 @@ page AS (
 		i.type != 0
 		AND (?2 = 0 OR i.type = ?2)
 		AND filen_name_matches(coalesce(f.name, d.name), ?3, ?4)
+		-- A row mid-supersede carries the PREDECESSOR's content under the
+		-- successor's uuid, so handing it out would hand out an undownloadable
+		-- file (see files.superseded). Dirs have no such row, hence the LEFT
+		-- JOIN's NULL passing.
+		AND coalesce(f.superseded, FALSE) = FALSE
 	-- lower() = the same ASCII case-fold ordering as COLLATE NOCASE
 	-- (which sqlfluff cannot parse here); non-ASCII names order by their
 	-- (NFC-assumed) bytes.

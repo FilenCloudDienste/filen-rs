@@ -635,6 +635,58 @@ mod tests {
 		);
 	}
 
+	/// Between an edit's `fileTrash`/`fileArchived` and the paired `fileNew`, a tracked row sits
+	/// under the SUCCESSOR uuid still carrying the PREDECESSOR's chunks/size/key. Handing that out
+	/// hands out a file that cannot be downloaded — the successor's bytes under the old key — so
+	/// every scope must refuse it, and take it back the moment the successor's own record lands.
+	#[test]
+	fn a_row_mid_supersede_is_refused_until_the_successor_lands() {
+		let path = temp_db_path();
+		let root = Uuid::new_v4();
+		let mut state = CacheState::new_on_path(&path, root);
+		let original = test_file(Uuid::new_v4(), root, "edited.txt");
+		state.upsert_files(std::iter::once(&original)).unwrap();
+
+		let successor_uuid = Uuid::new_v4();
+		state
+			.supersede_file_uuid(original.uuid, successor_uuid)
+			.unwrap();
+
+		let conn = open_read_connection(&path).unwrap();
+		let filter = filter(&SearchConfig::new());
+		let scopes = [
+			Scope::Account(root),
+			Scope::Subtree(root),
+			Scope::Children(root),
+		];
+		for scope in scopes {
+			assert!(
+				window_results(&conn, scope, &filter, &(0..10))
+					.unwrap()
+					.is_empty(),
+				"a mid-supersede row must not be readable ({scope:?})"
+			);
+			assert_eq!(
+				count_results(&conn, scope, &filter).unwrap(),
+				0,
+				"and must not be counted either ({scope:?})"
+			);
+		}
+
+		// The paired `fileNew`: the successor's own record, which is exactly what the marker was
+		// waiting for.
+		let mut successor = original.clone();
+		successor.uuid = successor_uuid;
+		state.upsert_files(std::iter::once(&successor)).unwrap();
+		for scope in scopes {
+			assert_eq!(
+				result_names(&window_results(&conn, scope, &filter, &(0..10)).unwrap()),
+				vec!["edited.txt"],
+				"the successor's record clears the marker ({scope:?})"
+			);
+		}
+	}
+
 	#[test]
 	fn needle_and_type_filters_apply_in_sql() {
 		let fixture = fixture();

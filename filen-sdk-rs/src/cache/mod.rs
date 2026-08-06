@@ -27,5 +27,7 @@ pub use {
 		Search, SearchConfig, SearchHit, SearchItemType, SearchResult, SearchSnapshot,
 		SearchWindowCallback, SearchWindowHandle,
 	},
-	state::{CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, SyncRootCallback},
+	state::{
+		CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, RootKey, SyncRootCallback,
+	},
 };

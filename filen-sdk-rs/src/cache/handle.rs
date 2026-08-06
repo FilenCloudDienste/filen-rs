@@ -20,11 +20,12 @@ use crate::{
 	io::{RemoteDirectory, RemoteFile},
 	socket::ListenerHandle,
 };
+use filen_types::fs::StableUuid;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 use crate::cache::{
-	CacheControlMessage, CacheError, CacheState, SyncRootCallback,
+	CacheControlMessage, CacheError, CacheState, RootKey, SyncRootCallback,
 	search::ReadTask,
 	state::{CacheThreadEvent, ManualEvent},
 };
@@ -272,7 +273,7 @@ async fn wait_for_worker_exit(slot: &mut CacheSlot) {
 /// uuid — each holds its own registration and the uuid stops being synced only when the last one
 /// goes. Dropping the last handle overall shuts the cache worker down.
 pub struct SyncRootHandle {
-	uuid: Uuid,
+	key: RootKey,
 	registration_id: u64,
 	/// Set when the registration was already consumed (`evict`) or never became live (a rejected
 	/// add), so `Drop` does not send a removal.
@@ -339,6 +340,33 @@ impl Client {
 		uuid: Uuid,
 		callback: SyncRootCallback,
 	) -> Result<SyncRootHandle, Error> {
+		self.add_root(RootKey::Dir(uuid), callback).await
+	}
+
+	/// Register a FILE as a sync root, keyed by its whole-life [`StableUuid`] — the file analog of
+	/// [`add_sync_root`](Client::add_sync_root), with identical handle/registration semantics.
+	///
+	/// Files must be keyed by the stable id because a content edit RE-MINTS a file's uuid: the
+	/// engine follows the lineage across that re-mint (a `fileTrash` carrying a successor uuid is
+	/// an identity update, never a removal), so the registration survives edits.
+	///
+	/// Unlike a directory, the lineage is NOT pre-validated: its existence check is the same
+	/// `v3/file/stable` fetch the convergence resync issues, so registration always succeeds and a
+	/// dead (or, until the endpoint ships, unreachable) lineage simply stays uncached — its live
+	/// socket events still apply.
+	pub async fn add_file_sync_root(
+		self: Arc<Self>,
+		stable_uuid: StableUuid,
+		callback: SyncRootCallback,
+	) -> Result<SyncRootHandle, Error> {
+		self.add_root(RootKey::File(stable_uuid), callback).await
+	}
+
+	async fn add_root(
+		self: Arc<Self>,
+		key: RootKey,
+		callback: SyncRootCallback,
+	) -> Result<SyncRootHandle, Error> {
 		let mut callback = callback;
 		// One respawn retry: the worker can exit between the slot's weak upgrade and the send
 		// (e.g. a concurrent `flush_cache`, or it panicked while other handles kept it upgradable).
@@ -351,7 +379,7 @@ impl Client {
 			// still removes the registration: the handle's Drop queues a `RemoveRegistration` on
 			// the same FIFO control channel, guaranteed to be processed after the `AddSyncRoot`.
 			let mut handle = SyncRootHandle {
-				uuid,
+				key,
 				registration_id,
 				disarmed: false,
 				shared: shared.clone(),
@@ -359,7 +387,7 @@ impl Client {
 			match shared
 				.control_sender
 				.send(CacheControlMessage::AddSyncRoot {
-					uuid,
+					key,
 					registration_id,
 					callback,
 					ack: ack_sender,
@@ -385,7 +413,7 @@ impl Client {
 					Err(Error::custom_with_source(
 						ErrorKind::InvalidState,
 						*e,
-						Some(format!("registering sync root {uuid}")),
+						Some(format!("registering sync root {key:?}")),
 					))
 				}
 				Err(_) => {
@@ -661,16 +689,25 @@ async fn spawn_cache_worker(
 impl std::fmt::Debug for SyncRootHandle {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("SyncRootHandle")
-			.field("uuid", &self.uuid)
+			.field("key", &self.key)
 			.field("registration_id", &self.registration_id)
 			.finish_non_exhaustive()
 	}
 }
 
 impl SyncRootHandle {
-	/// The sync root this handle registers.
-	pub fn uuid(&self) -> Uuid {
-		self.uuid
+	/// The sync root this handle registers — a directory uuid or a file's whole-life id.
+	pub fn key(&self) -> RootKey {
+		self.key
+	}
+
+	/// The directory this handle registers, or `None` when it registers a FILE root (which is
+	/// keyed by a stable id, not a uuid).
+	pub fn uuid(&self) -> Option<Uuid> {
+		match self.key {
+			RootKey::Dir(uuid) => Some(uuid),
+			RootKey::File(_) => None,
+		}
 	}
 
 	/// A sender for search read queries served by the worker's connection — the wasm read path
@@ -694,7 +731,7 @@ impl SyncRootHandle {
 		self.shared
 			.control_sender
 			.send(CacheControlMessage::RemoveRegistration {
-				uuid: self.uuid,
+				key: self.key,
 				registration_id: self.registration_id,
 				evict: true,
 				ack: Some(ack_sender),
@@ -710,7 +747,7 @@ impl SyncRootHandle {
 			Ok(Err(e)) => Err(Error::custom_with_source(
 				ErrorKind::Internal,
 				*e,
-				Some(format!("evicting sync root {}", self.uuid)),
+				Some(format!("evicting sync root {:?}", self.key)),
 			)),
 			Err(_) => Err(Error::custom(
 				ErrorKind::Internal,
@@ -767,7 +804,7 @@ impl Drop for SyncRootHandle {
 			.shared
 			.control_sender
 			.send(CacheControlMessage::RemoveRegistration {
-				uuid: self.uuid,
+				key: self.key,
 				registration_id: self.registration_id,
 				evict: false,
 				ack: None,

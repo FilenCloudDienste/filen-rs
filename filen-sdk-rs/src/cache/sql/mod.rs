@@ -4,15 +4,15 @@ use crate::fs::{
 	dir::{DecryptedDirectoryMeta, cache::CacheableDir},
 	file::{cache::CacheableFile, meta::DecryptedFileMeta},
 };
-use filen_types::api::v3::dir::color::DirColor;
+use filen_types::{api::v3::dir::color::DirColor, fs::StableUuid};
 use itertools::Itertools;
-use rusqlite::config::DbConfig;
+use rusqlite::{OptionalExtension, config::DbConfig};
 use uuid::Uuid;
 
 use crate::cache::{
 	CacheState,
 	sql::{
-		columns::{ITEMS_ID, PRAGMA_USER_VERSION},
+		columns::{FILES_STABLE_UUID, ITEMS_ID, ITEMS_UUID, PRAGMA_USER_VERSION},
 		statements::VACUUM,
 	},
 };
@@ -97,6 +97,62 @@ impl CacheState {
 			}
 			Ok(())
 		})
+	}
+
+	/// The cached uuid(s) currently filed under a file lineage's whole-life id. Normally one row;
+	/// two while a versioning-disabled edit's `fileTrash`/`fileNew` pair is half-applied. Empty when
+	/// the lineage is not cached at all.
+	pub(crate) fn uuids_of_stable(&self, stable_uuid: StableUuid) -> rusqlite::Result<Vec<Uuid>> {
+		let mut stmt = self.db.prepare_cached(statements::FILE_UUIDS_OF_STABLE)?;
+		let rows = stmt.query_map(rusqlite::params![stable_uuid], |row| row.get(ITEMS_UUID))?;
+		rows.collect()
+	}
+
+	/// The whole-life id of the cached file `uuid`, or `None` when it is not cached (or is a dir).
+	/// The reverse of [`uuids_of_stable`](Self::uuids_of_stable) — the uuid-only events
+	/// (`Removed`/`Archived`/`MetadataChanged`) carry no stable id, so this is how they resolve to a
+	/// file sync root.
+	pub(crate) fn stable_of_uuid(&self, uuid: Uuid) -> rusqlite::Result<Option<StableUuid>> {
+		self.db
+			.query_row(
+				statements::FILE_STABLE_OF_UUID,
+				rusqlite::params![uuid],
+				|row| row.get(FILES_STABLE_UUID),
+			)
+			.optional()
+	}
+
+	/// Apply an edit's identity change to a cached file: `old` is superseded by `new`, same file.
+	/// The successor's own record arrives as a SEPARATE `fileNew` whose order against the
+	/// `fileTrash`/`fileArchived` is not guaranteed, so both orders are handled here:
+	///
+	/// - successor not cached yet (trash first) → re-file the existing row under `new` IN PLACE, so
+	///   the tracked identity survives without a delete + re-create. The row's CONTENT is still the
+	///   predecessor's, so it is marked `superseded` until the paired `fileNew` (or any other
+	///   upsert) replaces it — see `files.superseded` in `raw/init.sql`;
+	/// - successor already cached (`fileNew` first) → the fresh row is the identity; drop the
+	///   superseded one (`items.uuid` is UNIQUE, so an in-place rename would collide anyway).
+	///
+	/// Idempotent either way: a replayed event finds `old` already gone and updates/deletes nothing.
+	pub(crate) fn supersede_file_uuid(&mut self, old: Uuid, new: Uuid) -> rusqlite::Result<()> {
+		let successor_cached = self
+			.db
+			.query_row(
+				statements::FILE_STABLE_OF_UUID,
+				rusqlite::params![new],
+				|_| Ok(()),
+			)
+			.optional()?
+			.is_some();
+		if successor_cached {
+			self.delete_items(std::iter::once(old))
+		} else {
+			self.db
+				.execute(statements::ITEM_UPDATE_UUID, rusqlite::params![old, new])?;
+			self.db
+				.execute(statements::FILE_MARK_SUPERSEDED, rusqlite::params![new])?;
+			Ok(())
+		}
 	}
 
 	/// Wipe every non-root item (cascading to `dirs`/`files` via FK + trigger). The account-root item,

@@ -21,7 +21,7 @@ use crate::{
 	socket::DecryptedSocketEvent,
 	util::PeekableReceiver,
 };
-use filen_types::traits::CowHelpers;
+use filen_types::{fs::StableUuid, traits::CowHelpers};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ use crate::cache::{
 	search::ReadTask,
 	sql::{
 		PersistedEvent,
-		columns::{COUNT, ITEMS_PARENT},
+		columns::{COUNT, FILES_STABLE_UUID, ITEMS_PARENT},
 	},
 };
 const BATCH_SIZE: usize = 256;
@@ -57,9 +57,30 @@ enum EventTrust {
 	TrustedSynthetic,
 }
 
+/// Which sync root a registration, a control message, or a dispatch refers to.
+///
+/// Dirs are keyed by `uuid` — the server never re-mints a directory's. Files MUST be keyed by
+/// their whole-life [`StableUuid`]: a content edit re-mints a file's uuid, so a uuid-keyed file
+/// root would silently stop tracking its file on the first edit. The two id spaces stay apart by
+/// TYPE — a stable id never sits in a uuid slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RootKey {
+	Dir(Uuid),
+	File(StableUuid),
+}
+
 /// One post-commit dispatch unit: an applied event (shared via `Arc` so fan-out to multiple owning
 /// roots reuses one allocation) paired with the sync roots that should receive it.
-type DispatchEntry = (Arc<CacheEvent<'static>>, Vec<Uuid>);
+type DispatchEntry = (Arc<CacheEvent<'static>>, Vec<RootKey>);
+
+/// The pre-apply identity of a delete/move target, read BEFORE the apply erases or rewrites it:
+/// the enclosing `parent` (which dir root the event left) and, for a file, its whole-life id
+/// (which file root it was). Both `None` when the target is not cached.
+#[derive(Clone, Copy, Default)]
+struct PreSnapshot {
+	parent: Option<Uuid>,
+	stable: Option<StableUuid>,
+}
 
 /// The drain's cross-batch state: the gap-free frontier (and whether it broke), plus the sticky
 /// resync flag — threaded through [`CacheState::apply_drain_batch`] by value so an aborted bulk
@@ -114,12 +135,26 @@ type RootListing = (
 struct ResyncListing {
 	/// Per-root listings to apply.
 	per_root_raw: Vec<RootListing>,
+	/// The freshly-fetched head of each tracked FILE root (one `get_file_by_stable_uuid` each).
+	/// A lineage that failed to fetch is simply absent — see the fetch loop for why that never
+	/// blocks convergence.
+	file_root_heads: Vec<RemoteFile>,
+	/// Lineages the server reported definitively gone — `finalize_resync` reaps their rows.
+	deleted_file_roots: Vec<StableUuid>,
 	/// Roots the server reported definitively gone — `finalize_resync` evicts their subtrees.
 	deleted_roots: Vec<Uuid>,
 	/// At least one root failed with a transient (non-not-found) error this pass.
 	any_transient: bool,
 	/// The drive snapshot id read under the lock; the watermark advances to it on a clean apply.
 	remote_under_lock: u64,
+}
+
+/// The outcome of one pass of per-lineage head fetches: the heads that resolved, and the lineages
+/// the server reported definitively gone. Everything else was skipped (see
+/// [`fetch_file_root_heads`](CacheState::fetch_file_root_heads)).
+struct FileRootHeads {
+	heads: Vec<RemoteFile>,
+	deleted: Vec<StableUuid>,
 }
 
 pub(crate) struct CacheState {
@@ -147,6 +182,13 @@ pub(crate) struct CacheState {
 	/// [`CacheControlMessage::AddSyncRoot`], and a uuid stops being a sync root when its LAST
 	/// registration is removed.
 	sync_roots: HashMap<Uuid, RootRegistrations>,
+	/// Configured FILE sync roots → their live registrations, keyed by the lineage's whole-life
+	/// id. A tracked file's row is cached (and kept fresh) regardless of where it sits, so these
+	/// bypass the ancestry-based membership gate; everything else — multiple registrations, the
+	/// post-commit dispatch, eviction on the last removal — matches [`sync_roots`](Self::sync_roots).
+	/// The stable → current-uuid mapping is NOT duplicated here: `files.stable_uuid` already
+	/// carries it (see `uuids_of_stable` / `stable_of_uuid`).
+	file_roots: HashMap<StableUuid, RootRegistrations>,
 	/// Client + runtime handle for the write-locked resync island. `None` in unit tests.
 	resync: Option<ResyncDeps>,
 	/// Deadline of the one-shot retry timer armed by a NON-converged resync attempt (lock
@@ -200,6 +242,7 @@ impl CacheState {
 			// Placeholder; `init_db` (called below) replaces it with the real account-root rowid.
 			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
+			file_roots: HashMap::new(),
 			resync: None,
 			resync_retry: None,
 			read_tasks: None,
@@ -235,6 +278,7 @@ impl CacheState {
 			// Placeholder; `init_db` (called below) replaces it with the real account-root rowid.
 			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
+			file_roots: HashMap::new(),
 			resync: None,
 			resync_retry: None,
 			read_tasks: None,
@@ -268,6 +312,7 @@ impl CacheState {
 			// Placeholder; `init_db` (called below) replaces it with the real account-root rowid.
 			root_id: 0,
 			sync_roots: whole_account_sync_roots(root_uuid),
+			file_roots: HashMap::new(),
 			resync: None,
 			resync_retry: None,
 			read_tasks: None,
@@ -287,6 +332,13 @@ impl CacheState {
 		self.sync_roots = map
 			.into_iter()
 			.map(|(uuid, callback)| (uuid, vec![(0, callback)]))
+			.collect();
+	}
+
+	pub(crate) fn set_test_file_roots(&mut self, map: HashMap<StableUuid, SyncRootCallback>) {
+		self.file_roots = map
+			.into_iter()
+			.map(|(stable, callback)| (stable, vec![(0, callback)]))
 			.collect();
 	}
 }
@@ -347,21 +399,21 @@ pub(crate) type RemoveRegistrationAck = tokio::sync::oneshot::Sender<Result<bool
 /// reconfiguration that must be serialized against the drain. Distinct from the data-plane
 /// [`CacheThreadEvent`] channel, which carries the events to apply.
 pub(crate) enum CacheControlMessage {
-	/// Register a `(registration_id, callback)` pair for `uuid`. A NEW uuid is validated
-	/// (`get_dir`) and converged; an additional registration on an already-active uuid skips both.
+	/// Register a `(registration_id, callback)` pair for `key`. A NEW dir root is validated
+	/// (`get_dir`) and converged; an additional registration on an already-active key skips both.
 	/// The ack fires after validation + insert, BEFORE the convergence resync.
 	AddSyncRoot {
-		uuid: Uuid,
+		key: RootKey,
 		registration_id: u64,
 		callback: SyncRootCallback,
 		ack: AddSyncRootAck,
 	},
-	/// Remove one registration. When it was the last one for `uuid`, the uuid stops being a sync
-	/// root, and if `evict` its cached subtree is deleted — protecting any still-active nested root.
-	/// `ack` is `None` for the fire-and-forget [`SyncRootHandle`](crate::cache::SyncRootHandle) Drop
-	/// path.
+	/// Remove one registration. When it was the last one for `key`, the key stops being a sync
+	/// root, and if `evict` its cached subtree (dir) or row (file) is deleted — protecting any
+	/// still-active nested root. `ack` is `None` for the fire-and-forget
+	/// [`SyncRootHandle`](crate::cache::SyncRootHandle) Drop path.
 	RemoveRegistration {
-		uuid: Uuid,
+		key: RootKey,
 		registration_id: u64,
 		evict: bool,
 		ack: Option<RemoveRegistrationAck>,
@@ -496,6 +548,7 @@ impl CacheState {
 			root_id: 0,
 			// Starts EMPTY (nothing cached); registrations arrive via `AddSyncRoot` control messages.
 			sync_roots: HashMap::new(),
+			file_roots: HashMap::new(),
 			resync: Some(ResyncDeps { client }),
 			resync_retry: None,
 			read_tasks: Some(read_task_receiver),
@@ -867,9 +920,9 @@ impl CacheState {
 
 		for pe in batch {
 			to_delete.push(pe.seq);
-			// snapshot the pre-delete/pre-move parent BEFORE applying, and keep a clone of the
+			// snapshot the pre-delete/pre-move identity BEFORE applying, and keep a clone of the
 			// event for the post-commit callback (the original's payload is moved into `apply_event`).
-			let pre_parent = self.pre_parent_snapshot(&pe.event.event);
+			let pre = self.pre_snapshot(&pe.event.event);
 			let event_for_dispatch = Arc::new(pe.event.clone());
 			let apply_result = match pe.id {
 				// id = None: a synthetic diff event. Resyncs now apply synthetics directly
@@ -916,7 +969,7 @@ impl CacheState {
 				Ok(()) => {
 					// Applied OK → resolve which sync roots this event touches and queue it for the
 					// post-commit dispatch (using the post-apply state + the pre-snapshot parent).
-					let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre_parent);
+					let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre);
 					if !owners.is_empty() {
 						dispatch_buffer.push((event_for_dispatch, owners));
 					}
@@ -986,6 +1039,7 @@ impl CacheState {
 			Vec<CacheableDir<'static>>,
 			Vec<CacheableFile<'static>>,
 		)>,
+		file_root_heads: Vec<RemoteFile>,
 		remote_under_lock: u64,
 		mark_resync: bool,
 	) -> Result<(), Box<CacheError>> {
@@ -1063,6 +1117,7 @@ impl CacheState {
 		for (anchor, synthetics) in per_root_synthetics {
 			self.apply_synthetics_direct(anchor, synthetics, all_roots_listed)?;
 		}
+		self.apply_file_root_heads(file_root_heads)?;
 		// The watermark jump + flag write commit LAST — strictly after every synthetic landed —
 		// so a crash anywhere above leaves the old watermark and a detectable gap (the durable
 		// flag for triggered resyncs; the startup gap-check otherwise), forcing a fresh listing.
@@ -1171,7 +1226,7 @@ impl CacheState {
 	fn apply_synthetic_chunk(
 		&mut self,
 		events: &mut std::iter::Peekable<std::vec::IntoIter<CacheEvent<'static>>>,
-		anchor_owners: &[Uuid],
+		anchor_owners: &[RootKey],
 		all_roots_listed: bool,
 	) -> Result<Vec<DispatchEntry>, Vec<CacheError>> {
 		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
@@ -1185,20 +1240,31 @@ impl CacheState {
 				|| matches!(
 					&event.event,
 					CacheEventType::File(
-						FileEvent::Move(_) | FileEvent::Removed(_) | FileEvent::Archived(_)
+						FileEvent::Move(_)
+							| FileEvent::Removed(_)
+							| FileEvent::Archived { .. }
+							| FileEvent::Trashed { .. }
 					) | CacheEventType::Dir(DirEvent::Move(_) | DirEvent::Removed(_))
 				);
-			// Fast path: a simple upsert whose dispatch owners are exactly the anchor's. It needs no
-			// pre-apply parent snapshot or post-apply owner walk, so it can be deferred into a
-			// multi-row batch without changing what (or in what order) gets dispatched.
+			// Fast path: a simple upsert whose dispatch owners are the anchor's, plus — for a file —
+			// its own file root, which the payload's stable id resolves with a hash lookup (no
+			// ancestry walk, so the fast path survives having file roots registered). It needs no
+			// pre-apply snapshot either, so it can be deferred into a multi-row batch without
+			// changing what (or in what order) gets dispatched.
 			if !needs_exact_owners
 				&& matches!(
 					&event.event,
 					CacheEventType::File(FileEvent::New(_) | FileEvent::Changed(_))
 						| CacheEventType::Dir(DirEvent::New(_) | DirEvent::Changed(_))
 				) {
-				if !anchor_owners.is_empty() {
-					dispatch_buffer.push((Arc::new(event.clone()), anchor_owners.to_vec()));
+				let mut owners = anchor_owners.to_vec();
+				if let CacheEventType::File(FileEvent::New(file) | FileEvent::Changed(file)) =
+					&event.event
+				{
+					self.extend_owning_file_root(Some(file.stable_uuid), &mut owners);
+				}
+				if !owners.is_empty() {
+					dispatch_buffer.push((Arc::new(event.clone()), owners));
 				}
 				match event.event {
 					CacheEventType::File(FileEvent::New(file) | FileEvent::Changed(file)) => {
@@ -1216,15 +1282,15 @@ impl CacheState {
 			// before this event (the diff orders deletes after the creates/moves they may cascade),
 			// then apply it one event at a time with the exact owner resolution the old path used.
 			self.flush_synthetic_batches(&mut file_batch, &mut dir_batch)?;
-			let pre_parent = if needs_exact_owners {
-				self.pre_parent_snapshot(&event.event)
+			let pre = if needs_exact_owners {
+				self.pre_snapshot(&event.event)
 			} else {
-				None
+				PreSnapshot::default()
 			};
 			let event_for_dispatch = Arc::new(event.clone());
 			self.apply_event(event.event, EventTrust::TrustedSynthetic)?;
 			let owners = if needs_exact_owners {
-				self.resolve_dispatch_owners(&event_for_dispatch, pre_parent)
+				self.resolve_dispatch_owners(&event_for_dispatch, pre)
 			} else {
 				anchor_owners.to_vec()
 			};
@@ -1255,6 +1321,132 @@ impl CacheState {
 				.map_err(|e| vec![CacheError::db(e, "bulk upsert synthetic files".to_string())])?;
 		}
 		Ok(())
+	}
+
+	/// Apply the freshly-fetched heads of the tracked file roots, in one transaction, dispatching
+	/// post-commit like every other apply. A head is applied as a `Changed` — unconditionally, with
+	/// no fingerprint comparison: a resync is rare and re-notifying a handful of tracked files is
+	/// far cheaper than a diff pass for each. `TrustedSynthetic`, because the fetch resolved the
+	/// lineage the root is registered for, so membership holds by construction.
+	fn apply_file_root_heads(&mut self, heads: Vec<RemoteFile>) -> Result<(), Box<CacheError>> {
+		if heads.is_empty() {
+			return Ok(());
+		}
+		let db_err = |e: rusqlite::Error, what: &str| Box::new(CacheError::db(e, what.to_string()));
+		let mut errors = Vec::new();
+		let (_, files) = convert_listing(Vec::new(), heads, &mut errors);
+		if !errors.is_empty() {
+			self.surface_errors(errors);
+		}
+		if files.is_empty() {
+			return Ok(());
+		}
+		self.db
+			.execute_batch("BEGIN")
+			.map_err(|e| db_err(e, "begin file-root refresh"))?;
+		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
+		for file in files {
+			let event = CacheEvent {
+				id: None,
+				event: CacheEventType::File(FileEvent::Changed(file)),
+			};
+			let event_for_dispatch = Arc::new(event.clone());
+			if let Err(errors) = self.apply_event(event.event, EventTrust::TrustedSynthetic) {
+				let _ = self.db.execute_batch("ROLLBACK");
+				self.surface_errors(errors);
+				self.mark_needs_resync_surfacing_errors();
+				return Ok(());
+			}
+			let owners = self.resolve_dispatch_owners(&event_for_dispatch, PreSnapshot::default());
+			if !owners.is_empty() {
+				dispatch_buffer.push((event_for_dispatch, owners));
+			}
+		}
+		self.db.execute_batch("COMMIT").map_err(|e| {
+			let _ = self.db.execute_batch("ROLLBACK");
+			db_err(e, "commit file-root refresh")
+		})?;
+		self.dispatch_batch(dispatch_buffer);
+		Ok(())
+	}
+
+	/// One `get_file_by_stable_uuid` per tracked lineage — a file root has no subtree to list, its
+	/// whole state IS the head record. Three outcomes:
+	///
+	/// - `Ok` → the head, applied by [`apply_file_root_heads`](Self::apply_file_root_heads);
+	/// - a definitive NOT-FOUND (`file_not_found`; verified live against `v3/file/stable` for both
+	///   a permanently-deleted lineage and one that never existed) → the lineage is gone for good,
+	///   so it is reaped, mirroring what `deleted_roots` does for a dir root. A TRASHED lineage is
+	///   NOT this case: the endpoint still returns its head;
+	/// - anything else → logged and SKIPPED, not counted transient: file roots are kept fresh by
+	///   socket events, and letting one unreachable lineage hold back the watermark would wedge the
+	///   engine in a permanent resync-retry loop.
+	async fn fetch_file_root_heads(
+		client: &Arc<Client>,
+		file_roots: &[StableUuid],
+	) -> FileRootHeads {
+		let mut fetched = FileRootHeads {
+			heads: Vec::with_capacity(file_roots.len()),
+			deleted: Vec::new(),
+		};
+		for stable in file_roots {
+			match client.get_file_by_stable_uuid(*stable).await {
+				Ok(file) => fetched.heads.push(file),
+				Err(e) if matches!(e.kind(), ErrorKind::FileNotFound) => {
+					tracing::warn!("resync: file root {stable} no longer exists ({e}); reaping it");
+					fetched.deleted.push(*stable);
+				}
+				Err(e) => {
+					tracing::debug!("resync: skipping file root {stable} (fetch failed: {e})");
+				}
+			}
+		}
+		fetched
+	}
+
+	/// Reap the lineages the server reported definitively GONE: delete their cached rows and
+	/// dispatch a `Removed` for each, so a registration's owner learns the file is not coming back
+	/// (on the mobile bridge that is the forget path, which fires the replica's tombstone).
+	///
+	/// The REGISTRATION is deliberately left in place — it belongs to whoever holds the handle, and
+	/// dropping it here would race their own bookkeeping; they retire it once the removal lands.
+	/// Re-reaping is therefore possible and harmless: with the rows already gone there is nothing
+	/// left to delete or dispatch.
+	fn reap_deleted_file_roots(&mut self, gone: Vec<StableUuid>) {
+		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
+		for stable in gone {
+			let cached = match self.uuids_of_stable(stable) {
+				Ok(cached) => cached,
+				Err(e) => {
+					self.surface_errors(db_err_vec(
+						e,
+						format!("resolving deleted file root {stable}"),
+					));
+					continue;
+				}
+			};
+			for uuid in cached {
+				let event = Arc::new(CacheEvent {
+					id: None,
+					event: CacheEventType::File(FileEvent::Removed(uuid)),
+				});
+				// The lineage id the dispatch resolves the file root by lives on the row, so the
+				// snapshot has to be taken before the delete — exactly as the drain does.
+				let pre = self.pre_snapshot(&event.event);
+				if let Err(e) = self.delete_items(once(uuid)) {
+					self.surface_errors(db_err_vec(
+						e,
+						format!("reaping deleted file root {stable}"),
+					));
+					continue;
+				}
+				let owners = self.resolve_dispatch_owners(&event, pre);
+				if !owners.is_empty() {
+					dispatch_buffer.push((event, owners));
+				}
+			}
+		}
+		self.dispatch_batch(dispatch_buffer);
 	}
 
 	/// Run the write-locked resync, surfacing any error to the main thread.
@@ -1319,22 +1511,28 @@ impl CacheState {
 			match msg {
 				CacheControlMessage::Shutdown => return true,
 				CacheControlMessage::AddSyncRoot {
-					uuid,
+					key,
 					registration_id,
 					callback,
 					ack,
 				} => {
-					added_new_root |= self
-						.handle_add_sync_root(uuid, registration_id, callback, ack)
-						.await;
+					added_new_root |= match key {
+						RootKey::Dir(uuid) => {
+							self.handle_add_sync_root(uuid, registration_id, callback, ack)
+								.await
+						}
+						RootKey::File(stable) => {
+							self.handle_add_file_sync_root(stable, registration_id, callback, ack)
+						}
+					};
 				}
 				CacheControlMessage::RemoveRegistration {
-					uuid,
+					key,
 					registration_id,
 					evict,
 					ack,
 				} => {
-					self.handle_remove_registration(uuid, registration_id, evict, ack)
+					self.handle_remove_registration(key, registration_id, evict, ack)
 						.await;
 				}
 			}
@@ -1444,17 +1642,50 @@ impl CacheState {
 		true
 	}
 
-	/// Handle `RemoveRegistration`: drop one `(uuid, registration_id)` registration and, when the
+	/// Handle `AddSyncRoot` for a FILE root: register `(registration_id, callback)` for the
+	/// lineage's whole-life id. Returns whether the lineage is NEWLY tracked (the caller runs the
+	/// convergence resync once per control burst).
+	///
+	/// NO separate validation round trip, unlike the dir path: the only existence check for a
+	/// stable id IS `get_file_by_stable_uuid`, which the convergence resync issues anyway — so a
+	/// dead lineage surfaces there (logged, the row left uncached) instead of costing every
+	/// registration an extra request. Registration therefore always acks `Ok`.
+	fn handle_add_file_sync_root(
+		&mut self,
+		stable_uuid: StableUuid,
+		registration_id: u64,
+		callback: SyncRootCallback,
+		ack: AddSyncRootAck,
+	) -> bool {
+		let newly_tracked = match self.file_roots.get_mut(&stable_uuid) {
+			Some(registrations) => {
+				registrations.push((registration_id, callback));
+				false
+			}
+			None => {
+				self.file_roots
+					.insert(stable_uuid, vec![(registration_id, callback)]);
+				true
+			}
+		};
+		let _ = ack.send(Ok(()));
+		newly_tracked
+	}
+
+	/// Handle `RemoveRegistration`: drop one `(key, registration_id)` registration and, when the
 	/// ack is absent (the fire-and-forget Drop path), surface any eviction error to the status
 	/// callback instead.
 	async fn handle_remove_registration(
 		&mut self,
-		uuid: Uuid,
+		key: RootKey,
 		registration_id: u64,
 		evict: bool,
 		ack: Option<RemoveRegistrationAck>,
 	) {
-		let result = self.remove_registration(uuid, registration_id, evict).await;
+		let result = match key {
+			RootKey::Dir(uuid) => self.remove_registration(uuid, registration_id, evict).await,
+			RootKey::File(stable) => self.remove_file_registration(stable, registration_id, evict),
+		};
 		match (ack, result) {
 			(Some(ack), result) => {
 				let _ = ack.send(result);
@@ -1499,6 +1730,70 @@ impl CacheState {
 		Ok(true)
 	}
 
+	/// Drop one `(stable_uuid, registration_id)` FILE-root registration. Mirrors
+	/// [`remove_registration`](Self::remove_registration): the lineage stays tracked while other
+	/// registrations remain (and `evict` is then skipped), and an unknown key is a harmless no-op.
+	/// Returns `Ok(true)` iff the cached row was evicted.
+	///
+	/// Eviction is SKIPPED when the file also sits inside an active dir root — deleting it would
+	/// punch a hole in that root's cached subtree, which its own membership gate expects to be
+	/// complete.
+	fn remove_file_registration(
+		&mut self,
+		stable_uuid: StableUuid,
+		registration_id: u64,
+		evict: bool,
+	) -> Result<bool, Box<CacheError>> {
+		let Some(registrations) = self.file_roots.get_mut(&stable_uuid) else {
+			tracing::debug!(
+				"RemoveRegistration: {stable_uuid} is not an active file root; ignoring"
+			);
+			return Ok(false);
+		};
+		let before = registrations.len();
+		registrations.retain(|(id, _)| *id != registration_id);
+		if registrations.len() == before {
+			tracing::debug!(
+				"RemoveRegistration: registration {registration_id} not found for file root \
+				 {stable_uuid}; ignoring"
+			);
+			return Ok(false);
+		}
+		if !registrations.is_empty() {
+			return Ok(false);
+		}
+		self.file_roots.remove(&stable_uuid);
+		if !evict {
+			return Ok(false);
+		}
+		let db_err =
+			|e: rusqlite::Error, context: &str| Box::new(CacheError::db(e, context.to_string()));
+		let cached = self.uuids_of_stable(stable_uuid).map_err(|e| {
+			db_err(
+				e,
+				&format!("resolving file root {stable_uuid} for eviction"),
+			)
+		})?;
+		// A coverage lookup that FAILS must refuse the eviction, never wave it through: reading an
+		// `Err` as "no dir root covers it" would delete a row a dir root's membership gate expects
+		// to be there, on nothing but a transient DB error.
+		let mut victims: Vec<Uuid> = Vec::new();
+		for uuid in cached {
+			let covered = self
+				.in_any_sync_root(uuid, &self.sync_roots)
+				.map_err(|e| db_err(e, &format!("checking dir-root coverage of {uuid}")))?;
+			if !covered {
+				victims.push(uuid);
+			}
+		}
+		if victims.is_empty() {
+			return Ok(false);
+		}
+		self.delete_items(victims.into_iter())
+			.map_err(|e| db_err(e, &format!("evicting file root {stable_uuid}")))?;
+		Ok(true)
+	}
+
 	/// Delete the cached subtree of a JUST-removed sync root (`uuid` must already be out of
 	/// `sync_roots`), protecting any still-active nested root.
 	async fn evict_removed_root(&mut self, uuid: Uuid) -> Result<(), Box<CacheError>> {
@@ -1515,7 +1810,9 @@ impl CacheState {
 			// can't resolve them). Mark durably FIRST — exactly like the `DeleteAll` arm, whose wipe
 			// creates the same ancestry-less state — so a transiently-failing re-convergence is
 			// retried by a later drain instead of stranding the survivors empty; then re-converge.
-			if !self.sync_roots.is_empty() {
+			// Tracked FILE roots lose their rows to the same flat wipe, and a file root's row is
+			// re-fetched only by a resync — so they count towards re-converging just as dir roots do.
+			if !self.sync_roots.is_empty() || !self.file_roots.is_empty() {
 				self.mark_needs_resync()?;
 				self.run_resync_surfacing_errors().await;
 			}
@@ -1573,22 +1870,38 @@ impl CacheState {
 		}
 	}
 
-	/// The PRE-apply parent of a delete/move target. A `Removed`/`Archived` erases the item and
-	/// a `Move` rewrites its parent, so the dispatcher must read the parent BEFORE applying to resolve
-	/// which sync root the event left. `None` if the target is not (or no longer) cached.
-	fn pre_parent_snapshot(&self, event: &CacheEventType<'_>) -> Option<Uuid> {
-		let target = dispatch_presnapshot_target(event)?;
-		let parent: rusqlite::Result<Option<Uuid>> = self.db.query_row(
-			"SELECT parent FROM items WHERE uuid = ?1",
+	/// The PRE-apply identity of a delete/move target. A `Removed`/`Archived`/`Trashed` erases the
+	/// item and a `Move` rewrites its parent, so the dispatcher must read both the parent (which
+	/// dir root the event left) and the file's whole-life id (which file root it was) BEFORE
+	/// applying. Empty if the target is not (or no longer) cached.
+	fn pre_snapshot(&self, event: &CacheEventType<'_>) -> PreSnapshot {
+		let Some(target) = dispatch_presnapshot_target(event) else {
+			return PreSnapshot::default();
+		};
+		let row: rusqlite::Result<(Option<Uuid>, Option<StableUuid>)> = self.db.query_row(
+			"SELECT i.parent, f.stable_uuid FROM items AS i \
+			 LEFT JOIN files AS f ON f.id = i.id WHERE i.uuid = ?1",
 			rusqlite::params![target],
-			|row| row.get(ITEMS_PARENT),
+			|row| Ok((row.get(ITEMS_PARENT)?, row.get(FILES_STABLE_UUID)?)),
 		);
-		parent.ok().flatten()
+		match row {
+			Ok((parent, stable)) => PreSnapshot { parent, stable },
+			Err(_) => PreSnapshot::default(),
+		}
 	}
 
-	fn extend_owning_roots(&self, uuid: Uuid, owners: &mut Vec<Uuid>) {
+	fn extend_owning_roots(&self, uuid: Uuid, owners: &mut Vec<RootKey>) {
 		if let Ok(roots) = self.owning_sync_roots(uuid, &self.sync_roots) {
-			owners.extend(roots);
+			owners.extend(roots.into_iter().map(RootKey::Dir));
+		}
+	}
+
+	/// Add the file root owning `stable_uuid`, if that lineage is tracked.
+	fn extend_owning_file_root(&self, stable_uuid: Option<StableUuid>, owners: &mut Vec<RootKey>) {
+		if let Some(stable) = stable_uuid
+			&& self.file_roots.contains_key(&stable)
+		{
+			owners.push(RootKey::File(stable));
 		}
 	}
 
@@ -1596,33 +1909,47 @@ impl CacheState {
 	/// resolved from the target's post-apply position; a `Move` notifies BOTH the old (pre-move) and new
 	/// enclosing roots; a delete notifies the old enclosing root (from the pre-snapshot) plus the target
 	/// itself if it was a sync root; `DeleteAll` notifies every root (account-global).
-	fn resolve_dispatch_owners(
-		&self,
-		event: &CacheEvent<'_>,
-		pre_parent: Option<Uuid>,
-	) -> Vec<Uuid> {
+	fn resolve_dispatch_owners(&self, event: &CacheEvent<'_>, pre: PreSnapshot) -> Vec<RootKey> {
 		let mut owners = Vec::new();
 		match &event.event {
 			CacheEventType::File(file_event) => match file_event {
 				FileEvent::New(f) | FileEvent::Changed(f) => {
-					self.extend_owning_roots(f.uuid, &mut owners)
+					self.extend_owning_roots(f.uuid, &mut owners);
+					self.extend_owning_file_root(Some(f.stable_uuid), &mut owners);
 				}
 				FileEvent::Move(f) => {
 					self.extend_owning_roots(f.uuid, &mut owners);
-					if let Some(parent) = pre_parent {
+					self.extend_owning_file_root(Some(f.stable_uuid), &mut owners);
+					if let Some(parent) = pre.parent {
 						self.extend_owning_roots(parent, &mut owners);
 					}
 				}
-				FileEvent::Removed(uuid) | FileEvent::Archived(uuid) => {
-					if self.sync_roots.contains_key(uuid) {
-						owners.push(*uuid);
+				// A trash/archive carries the lineage's id itself; the pre-snapshot is only needed
+				// for the dir root it sat in.
+				FileEvent::Trashed { stable_uuid, .. }
+				| FileEvent::Archived { stable_uuid, .. } => {
+					self.extend_owning_file_root(Some(*stable_uuid), &mut owners);
+					if let Some(parent) = pre.parent {
+						self.extend_owning_roots(parent, &mut owners);
 					}
-					if let Some(parent) = pre_parent {
+				}
+				FileEvent::Removed(uuid) => {
+					if self.sync_roots.contains_key(uuid) {
+						owners.push(RootKey::Dir(*uuid));
+					}
+					// uuid-only: the lineage id comes from the pre-apply row.
+					self.extend_owning_file_root(pre.stable, &mut owners);
+					if let Some(parent) = pre.parent {
 						self.extend_owning_roots(parent, &mut owners);
 					}
 				}
 				FileEvent::MetadataChanged { uuid, .. } => {
-					self.extend_owning_roots(*uuid, &mut owners)
+					self.extend_owning_roots(*uuid, &mut owners);
+					// uuid-only, but the row SURVIVES a metadata patch, so it is still readable.
+					self.extend_owning_file_root(
+						self.stable_of_uuid(*uuid).ok().flatten(),
+						&mut owners,
+					);
 				}
 			},
 			CacheEventType::Dir(dir_event) => match dir_event {
@@ -1631,15 +1958,15 @@ impl CacheState {
 				}
 				DirEvent::Move(d) => {
 					self.extend_owning_roots(d.uuid, &mut owners);
-					if let Some(parent) = pre_parent {
+					if let Some(parent) = pre.parent {
 						self.extend_owning_roots(parent, &mut owners);
 					}
 				}
 				DirEvent::Removed(uuid) => {
 					if self.sync_roots.contains_key(uuid) {
-						owners.push(*uuid);
+						owners.push(RootKey::Dir(*uuid));
 					}
-					if let Some(parent) = pre_parent {
+					if let Some(parent) = pre.parent {
 						self.extend_owning_roots(parent, &mut owners);
 					}
 				}
@@ -1649,7 +1976,8 @@ impl CacheState {
 			},
 			// Account-global wipe → every sync root is affected.
 			CacheEventType::Global(GlobalEvent::DeleteAll) => {
-				owners.extend(self.sync_roots.keys().copied());
+				owners.extend(self.sync_roots.keys().copied().map(RootKey::Dir));
+				owners.extend(self.file_roots.keys().copied().map(RootKey::File));
 			}
 			// Cache no-ops (trash/version) and frontier markers notify nobody.
 			CacheEventType::Global(_) | CacheEventType::NoOp => {}
@@ -1667,7 +1995,7 @@ impl CacheState {
 		if dispatch.is_empty() {
 			return;
 		}
-		let mut per_root: HashMap<Uuid, Vec<Arc<CacheEvent<'static>>>> = HashMap::new();
+		let mut per_root: HashMap<RootKey, Vec<Arc<CacheEvent<'static>>>> = HashMap::new();
 		for (event, owners) in dispatch {
 			for owner in owners {
 				// Cheap `Arc` clone (refcount bump), not a deep payload clone.
@@ -1678,7 +2006,11 @@ impl CacheState {
 			// A root deleted during this same drain has already been removed from `sync_roots` by
 			// `handle_deleted_sync_roots` (which notified the app via `SyncRootsDeleted`). Skipping its
 			// now-absent callbacks here is correct — those events belonged to a root the app knows is gone.
-			let Some(registrations) = self.sync_roots.get(&root) else {
+			let registrations = match root {
+				RootKey::Dir(uuid) => self.sync_roots.get(&uuid),
+				RootKey::File(stable) => self.file_roots.get(&stable),
+			};
+			let Some(registrations) = registrations else {
 				continue;
 			};
 			// Every registration on the root gets the full batch, each under its own `catch_unwind`,
@@ -1690,11 +2022,11 @@ impl CacheState {
 				if let Err(panic) = result {
 					let message = panic_message(&panic);
 					tracing::error!(
-						"sync-root {root} callback (registration {registration_id}) panicked: {message}"
+						"sync-root {root:?} callback (registration {registration_id}) panicked: {message}"
 					);
 					let _ = self.msg_sender.try_send(vec![CacheMessage::Error(vec![
 						CacheError::sync_root_callback_panic(format!(
-							"sync root {root}: {message}"
+							"sync root {root:?}: {message}"
 						)),
 					])]);
 				}
@@ -1807,6 +2139,7 @@ impl CacheState {
 
 		let account_root = self.root_uuid;
 		let sync_roots: Vec<Uuid> = self.sync_roots.keys().copied().collect();
+		let file_roots: Vec<StableUuid> = self.file_roots.keys().copied().collect();
 
 		// Progress brackets: `Started` fires BEFORE the drive-lock wait (another device can hold
 		// the lock for a while), and every exit path past this point fires `Finished`, so a
@@ -1818,34 +2151,47 @@ impl CacheState {
 			},
 		);
 
-		// FAST PATH — no sync roots: there is nothing to list, so nothing needs the drive lock
+		// FAST PATH — no DIR sync roots: there is nothing to list, so nothing needs the drive lock
 		// OR a consistent snapshot (the lock only ever made the listing consistent with the
 		// snapshot id). Read the remote drive id WITHOUT the lock and advance the watermark to it,
 		// so the startup gap-check stops re-firing. This is the common fresh-worker-boot case (a
 		// worker whose roots are still empty when a check fires) and every integration test's
 		// worker startup — taking the account-wide WRITE lock there is pure waste and serializes
-		// the whole suite. SAFE: with zero roots the cache mirrors nothing, so jumping the
-		// watermark cannot skip an event that affects it, and a later add's convergence resync
+		// the whole suite. SAFE: with zero dir roots the cache mirrors no SUBTREE, so jumping the
+		// watermark cannot skip an event that affects one, and a later add's convergence resync
 		// re-reads a fresh snapshot UNDER the lock to populate its root consistently.
+		//
+		// FILE roots do not change that: each one's whole state is a single head record fetched by
+		// its lineage id, which needs no consistent snapshot with anything (there is no listing to
+		// be consistent WITH). Their heads are fetched here, outside the lock — the snapshot id is
+		// read FIRST so a head newer than it is simply re-delivered by the live drain, never
+		// skipped. Only dir listings put us on the locked path below.
 		if sync_roots.is_empty() {
 			Self::send_resync_progress(&self.msg_sender, ResyncProgress::Applying);
 			let converged = match deps.client.get_last_event_ids().await {
-				Ok(ids) => match self.commit_resync_watermark(ids.drive, false) {
-					Ok(()) => true,
-					Err(e) => {
-						// The watermark write failed; keep the durable flag set (best-effort —
-						// it is the same DB) so the armed retry actually re-fires this session,
-						// matching the listing-failure arm below.
-						self.surface_one(e);
-						self.mark_needs_resync_surfacing_errors();
-						false
+				Ok(ids) => {
+					let heads = Self::fetch_file_root_heads(&deps.client, &file_roots).await;
+					self.reap_deleted_file_roots(heads.deleted);
+					match self
+						.apply_file_root_heads(heads.heads)
+						.and_then(|()| self.commit_resync_watermark(ids.drive, false))
+					{
+						Ok(()) => true,
+						Err(e) => {
+							// The head apply or the watermark write failed; keep the durable flag
+							// set (best-effort — it is the same DB) so the armed retry actually
+							// re-fires this session, matching the listing-failure arm below.
+							self.surface_one(e);
+							self.mark_needs_resync_surfacing_errors();
+							false
+						}
 					}
-				},
+				}
 				Err(e) => {
 					// Couldn't reach the server to read the snapshot id — leave the watermark be
 					// (the gap-check re-fires on the next event) and arm the retry timer for a
 					// quiet account.
-					tracing::debug!("resync: no sync roots; deferring watermark advance ({e})");
+					tracing::debug!("resync: no dir sync roots; deferring watermark advance ({e})");
 					self.mark_needs_resync_surfacing_errors();
 					false
 				}
@@ -2023,8 +2369,11 @@ impl CacheState {
 					}
 				}
 			}
+			let file_heads = Self::fetch_file_root_heads(&deps.client, &file_roots).await;
 			Ok(ResyncListing {
 				per_root_raw,
+				file_root_heads: file_heads.heads,
+				deleted_file_roots: file_heads.deleted,
 				deleted_roots,
 				any_transient,
 				remote_under_lock,
@@ -2107,10 +2456,15 @@ impl CacheState {
 	fn finalize_resync(&mut self, listing: ResyncListing) -> Result<(), Box<CacheError>> {
 		let ResyncListing {
 			per_root_raw,
+			file_root_heads,
+			deleted_file_roots,
 			deleted_roots,
 			any_transient,
 			remote_under_lock,
 		} = listing;
+		// Same rule as `deleted_roots`, for lineages: a not-found is definitive, so reap
+		// unconditionally and before the commit decision below.
+		self.reap_deleted_file_roots(deleted_file_roots);
 		// Remove the deleted roots' cached subtrees (the cascade trigger recurses) so we don't leak items
 		// under a root that no longer gates membership, then drop them from the active set + notify. The
 		// account root is never in `deleted_roots` (it is never `get_dir`'d and cannot be deleted).
@@ -2134,7 +2488,7 @@ impl CacheState {
 		}
 
 		// An all-transient resync must not advance the watermark / clear the flag.
-		if per_root_raw.is_empty() && any_transient {
+		if per_root_raw.is_empty() && file_root_heads.is_empty() && any_transient {
 			tracing::debug!(
 				"resync: every sync root failed to list transiently; leaving needs_resync set for retry"
 			);
@@ -2178,7 +2532,7 @@ impl CacheState {
 		// progress but keeps `needs_resync` SET in the same transaction, so the skipped roots are
 		// durably retried by a later drain instead of stranded stale (or, for a freshly added
 		// root, stranded empty) until the next unrelated gap.
-		self.apply_resync(per_root, remote_under_lock, any_transient)
+		self.apply_resync(per_root, file_root_heads, remote_under_lock, any_transient)
 	}
 
 	/// Membership gate: is the upsert target's `parent` inside any configured sync root? An
@@ -2217,7 +2571,11 @@ impl CacheState {
 			FileEvent::New(file) | FileEvent::Changed(file) => {
 				// skip the upsert for an out-of-root file, but still advance the watermark. (A
 				// New/Changed has no prior in-root row to leave stale, unlike a Move — see below.)
-				if trust == EventTrust::Checked && !self.parent_in_sync_root(file.parent)? {
+				// A tracked FILE root is cached wherever it lives, so it bypasses the parent gate.
+				if trust == EventTrust::Checked
+					&& !self.file_roots.contains_key(&file.stable_uuid)
+					&& !self.parent_in_sync_root(file.parent)?
+				{
 					return Ok(());
 				}
 				self.upsert_files(once(&file)).map_err(|e| {
@@ -2232,7 +2590,13 @@ impl CacheState {
 				// OLD parent, where a later cascade-delete of that parent would wrongly remove a still-live
 				// item. delete-of-missing is a no-op if it was never cached; dispatch still notifies the
 				// old root via the pre-move parent snapshot.
-				if trust == EventTrust::TrustedSynthetic || self.parent_in_sync_root(file.parent)? {
+				//
+				// EXCEPTION, as for a dir that IS a sync root: a tracked FILE root follows its file
+				// wherever it moves, so it is upserted, never deleted.
+				if trust == EventTrust::TrustedSynthetic
+					|| self.file_roots.contains_key(&file.stable_uuid)
+					|| self.parent_in_sync_root(file.parent)?
+				{
 					self.upsert_files(once(&file)).map_err(|e| {
 						// uuid only — the file payload carries the FileKey (never log key material).
 						db_err_vec(e, format!("failed to upsert moved file: {}", file.uuid))
@@ -2243,9 +2607,33 @@ impl CacheState {
 					})
 				}
 			}
-			FileEvent::Archived(uuid) | FileEvent::Removed(uuid) => self
+			FileEvent::Removed(uuid) => self
 				.delete_items(once(uuid))
 				.map_err(|e| db_err_vec(e, format!("failed to delete file with uuid: {}", uuid))),
+			// An EDIT of a TRACKED lineage — `fileTrash` with a successor on a versioning-disabled
+			// account, `fileArchived` with one otherwise — is an identity update, not a removal:
+			// the row is re-filed under the successor uuid (or, if the paired `fileNew` already
+			// landed, the superseded row is dropped in favour of the fresh one). The file root
+			// itself is never dropped here — a genuine trash (`new_uuid: None`) can be undone by a
+			// restore, and the registration's owner learns of it through the dispatch. Everything
+			// untracked keeps the historical behaviour: both events delete the row.
+			FileEvent::Trashed {
+				uuid,
+				stable_uuid,
+				new_uuid,
+			}
+			| FileEvent::Archived {
+				uuid,
+				stable_uuid,
+				new_uuid,
+			} => match new_uuid {
+				Some(new_uuid) if self.file_roots.contains_key(&stable_uuid) => self
+					.supersede_file_uuid(uuid, new_uuid)
+					.map_err(|e| db_err_vec(e, format!("superseding tracked file {uuid}"))),
+				_ => self
+					.delete_items(once(uuid))
+					.map_err(|e| db_err_vec(e, format!("failed to trash file with uuid: {uuid}"))),
+			},
 			FileEvent::MetadataChanged { uuid, meta } => {
 				self.update_file_meta(uuid, &meta).map_err(|e| {
 					// uuid only — `meta` holds the FileKey; never serialize it into an error/log.
@@ -2417,7 +2805,11 @@ fn db_err_vec(error: rusqlite::Error, context: String) -> Vec<CacheError> {
 fn dispatch_presnapshot_target(event: &CacheEventType<'_>) -> Option<Uuid> {
 	match event {
 		CacheEventType::File(FileEvent::Move(f)) => Some(f.uuid),
-		CacheEventType::File(FileEvent::Removed(uuid) | FileEvent::Archived(uuid)) => Some(*uuid),
+		CacheEventType::File(
+			FileEvent::Removed(uuid)
+			| FileEvent::Archived { uuid, .. }
+			| FileEvent::Trashed { uuid, .. },
+		) => Some(*uuid),
 		CacheEventType::Dir(DirEvent::Move(d)) => Some(d.uuid),
 		CacheEventType::Dir(DirEvent::Removed(uuid)) => Some(*uuid),
 		_ => None,

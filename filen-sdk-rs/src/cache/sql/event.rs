@@ -455,11 +455,23 @@ mod tests {
 		));
 		assert_roundtrip(ev(
 			Some(4),
-			CacheEventType::File(FileEvent::Archived(Uuid::from_u128(1))),
+			CacheEventType::File(FileEvent::Archived {
+				uuid: Uuid::from_u128(1),
+				stable_uuid: cacheable_file().stable_uuid,
+				new_uuid: Some(Uuid::from_u128(2)),
+			}),
 		));
 		assert_roundtrip(ev(
 			Some(5),
 			CacheEventType::File(FileEvent::Removed(Uuid::from_u128(1))),
+		));
+		assert_roundtrip(ev(
+			Some(7),
+			CacheEventType::File(FileEvent::Trashed {
+				uuid: Uuid::from_u128(1),
+				stable_uuid: cacheable_file().stable_uuid,
+				new_uuid: None,
+			}),
 		));
 		assert_roundtrip(ev(
 			Some(6),

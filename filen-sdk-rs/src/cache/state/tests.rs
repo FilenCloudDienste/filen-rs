@@ -469,7 +469,12 @@ fn resync_self_heals_cache_to_listing_and_is_idempotent() {
 	let files = vec![f1_new.clone(), f_new.clone()];
 
 	state
-		.apply_resync(vec![(root, dirs.clone(), files.clone())], 100, false)
+		.apply_resync(
+			vec![(root, dirs.clone(), files.clone())],
+			Vec::new(),
+			100,
+			false,
+		)
 		.unwrap();
 
 	// Converged: vanished file removed; new items created; changed file's hash refreshed.
@@ -530,7 +535,12 @@ fn resync_move_out_of_deleted_parent_preserves_subtree() {
 	// Listing: M moved to root (D_old gone); F still under M, unchanged (so F itself emits nothing).
 	let m_moved = cache_dir(2, root);
 	state
-		.apply_resync(vec![(root, vec![m_moved], vec![f.clone()])], 100, false)
+		.apply_resync(
+			vec![(root, vec![m_moved], vec![f.clone()])],
+			Vec::new(),
+			100,
+			false,
+		)
 		.unwrap();
 
 	assert!(!item_exists(&state, d_old.uuid), "deleted parent removed");
@@ -776,7 +786,9 @@ fn apply_resync_converges_each_sync_root_independently() {
 		(a.uuid, vec![], vec![fa1.clone(), fa3.clone()]),
 		(b.uuid, vec![], vec![fb1.clone(), fb2.clone()]),
 	];
-	state.apply_resync(per_root, 500, false).unwrap();
+	state
+		.apply_resync(per_root, Vec::new(), 500, false)
+		.unwrap();
 
 	// A converged.
 	assert!(item_exists(&state, fa1.uuid));
@@ -816,7 +828,7 @@ fn apply_resync_with_no_listings_advances_and_clears_without_deleting() {
 	state.mark_needs_resync().unwrap();
 
 	// Every configured root was skipped (e.g. all unreachable) → nothing listed.
-	state.apply_resync(vec![], 777, false).unwrap();
+	state.apply_resync(vec![], Vec::new(), 777, false).unwrap();
 
 	assert!(
 		item_exists(&state, a.uuid),
@@ -859,7 +871,7 @@ fn remove_sync_root_eviction_protects_nested_root() {
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
 	state.set_test_sync_roots(sync_roots);
 
-	drive(state.handle_remove_registration(a.uuid, 0, true, None));
+	drive(state.handle_remove_registration(RootKey::Dir(a.uuid), 0, true, None));
 
 	assert!(
 		!state.sync_roots.contains_key(&a.uuid),
@@ -899,7 +911,7 @@ fn remove_sync_root_eviction_leaves_siblings_alone() {
 	sync_roots.insert(b.uuid, Box::new(|_| {}));
 	state.set_test_sync_roots(sync_roots);
 
-	drive(state.handle_remove_registration(a.uuid, 0, true, None));
+	drive(state.handle_remove_registration(RootKey::Dir(a.uuid), 0, true, None));
 
 	assert!(!item_exists(&state, fa.uuid), "A's file evicted");
 	assert!(
@@ -922,7 +934,7 @@ fn remove_sync_root_without_evict_keeps_items() {
 	sync_roots.insert(a.uuid, Box::new(|_| {}));
 	state.set_test_sync_roots(sync_roots);
 
-	drive(state.handle_remove_registration(a.uuid, 0, false, None));
+	drive(state.handle_remove_registration(RootKey::Dir(a.uuid), 0, false, None));
 
 	assert!(!state.sync_roots.contains_key(&a.uuid));
 	assert!(item_exists(&state, fa.uuid), "no eviction → items remain");
@@ -1099,6 +1111,8 @@ fn finalize_resync_drops_a_server_deleted_root() {
 	state
 		.finalize_resync(ResyncListing {
 			per_root_raw: Vec::new(),
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
 			deleted_roots: vec![b.uuid],
 			any_transient: false,
 			remote_under_lock: 100,
@@ -1147,6 +1161,8 @@ fn finalize_resync_all_transient_failure_preserves_watermark_and_flag() {
 	state
 		.finalize_resync(ResyncListing {
 			per_root_raw: Vec::new(),
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
 			deleted_roots: Vec::new(),
 			any_transient: true,
 			remote_under_lock: 100,
@@ -1219,7 +1235,12 @@ fn apply_resync_dispatches_synthetics_through_both_owner_paths() {
 	state.upsert_files(once(&stale)).unwrap();
 	let new_dir = cache_dir(2, root);
 	state
-		.apply_resync(vec![(root, vec![new_dir.clone()], vec![])], 50, false)
+		.apply_resync(
+			vec![(root, vec![new_dir.clone()], vec![])],
+			Vec::new(),
+			50,
+			false,
+		)
 		.unwrap();
 
 	let got = received.lock().unwrap();
@@ -2204,7 +2225,7 @@ fn remove_registration_with_survivors_skips_eviction() {
 	drive(state.handle_add_sync_root(a.uuid, 1, Box::new(|_| {}), add_ack));
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	drive(state.handle_remove_registration(a.uuid, 0, true, Some(ack)));
+	drive(state.handle_remove_registration(RootKey::Dir(a.uuid), 0, true, Some(ack)));
 
 	assert!(
 		matches!(ack_rx.try_recv(), Ok(Ok(false))),
@@ -2229,7 +2250,7 @@ fn remove_last_registration_evicts_and_acks_true() {
 	state.set_test_sync_roots(sync_roots);
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	drive(state.handle_remove_registration(a.uuid, 0, true, Some(ack)));
+	drive(state.handle_remove_registration(RootKey::Dir(a.uuid), 0, true, Some(ack)));
 
 	assert!(matches!(ack_rx.try_recv(), Ok(Ok(true))), "subtree evicted");
 	assert!(!state.sync_roots.contains_key(&a.uuid), "root inactive");
@@ -2259,7 +2280,7 @@ fn remove_registration_after_server_side_deletion_is_noop() {
 	assert!(!state.sync_roots.contains_key(&b.uuid));
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	drive(state.handle_remove_registration(b.uuid, 0, true, Some(ack)));
+	drive(state.handle_remove_registration(RootKey::Dir(b.uuid), 0, true, Some(ack)));
 
 	assert!(
 		matches!(ack_rx.try_recv(), Ok(Ok(false))),
@@ -2331,7 +2352,7 @@ fn control_burst_processes_queued_messages_and_shutdown_wins() {
 	producer
 		.control
 		.send(CacheControlMessage::AddSyncRoot {
-			uuid: b.uuid,
+			key: RootKey::Dir(b.uuid),
 			registration_id: 1,
 			callback: Box::new(|_| {}),
 			ack: b_ack,
@@ -2340,7 +2361,7 @@ fn control_burst_processes_queued_messages_and_shutdown_wins() {
 	let (a_ack, mut a_ack_rx) = tokio::sync::oneshot::channel();
 	let shutdown = drive(
 		state.process_control_burst(CacheControlMessage::AddSyncRoot {
-			uuid: a.uuid,
+			key: RootKey::Dir(a.uuid),
 			registration_id: 0,
 			callback: Box::new(|_| {}),
 			ack: a_ack,
@@ -2380,7 +2401,7 @@ fn account_root_evict_with_survivors_marks_needs_resync() {
 	state.set_test_sync_roots(sync_roots);
 
 	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-	drive(state.handle_remove_registration(account_root, 0, true, Some(ack)));
+	drive(state.handle_remove_registration(RootKey::Dir(account_root), 0, true, Some(ack)));
 
 	assert!(
 		matches!(ack_rx.try_recv(), Ok(Ok(true))),
@@ -2627,4 +2648,462 @@ fn apply_synthetics_flushes_pending_creates_before_a_delete() {
 		!item_exists(&state, f.uuid),
 		"its child cascaded away, proving it existed when the delete ran"
 	);
+}
+
+// -- file sync roots ------------------------------------------------------------------------
+
+/// The successor record a versioning-disabled edit produces: a NEW uuid carrying the SAME
+/// whole-life id, with different content so the refreshed row is visible.
+fn successor_of(original: &CacheableFile<'static>, uuid: u128) -> CacheableFile<'static> {
+	let mut successor = original.clone();
+	successor.uuid = Uuid::from_u128(uuid);
+	successor.size = original.size + 7;
+	successor
+}
+
+fn trashed(file: &CacheableFile<'_>, new_uuid: Option<Uuid>) -> CacheEventType<'static> {
+	CacheEventType::File(FileEvent::Trashed {
+		uuid: file.uuid,
+		stable_uuid: file.stable_uuid,
+		new_uuid,
+	})
+}
+
+fn archived(file: &CacheableFile<'_>, new_uuid: Option<Uuid>) -> CacheEventType<'static> {
+	CacheEventType::File(FileEvent::Archived {
+		uuid: file.uuid,
+		stable_uuid: file.stable_uuid,
+		new_uuid,
+	})
+}
+
+/// Push one socket event through the durable store + drain, exactly as the worker does — so the
+/// dispatch these tests assert on is the real post-commit one.
+fn drain_socket_event(state: &mut CacheState, id: u64, event: CacheEventType<'static>) {
+	state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::Decrypted(CacheEvent {
+			id: Some(id),
+			event,
+		}),
+	)));
+}
+
+/// A callback recording the `Debug` form of every event it is handed.
+fn recording_callback() -> (Arc<std::sync::Mutex<Vec<String>>>, SyncRootCallback) {
+	let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let seen_cb = seen.clone();
+	let callback: SyncRootCallback = Box::new(move |events| {
+		seen_cb
+			.lock()
+			.unwrap()
+			.extend(events.map(|event| format!("{:?}", event.event)));
+	});
+	(seen, callback)
+}
+
+fn file_size(state: &CacheState, uuid: Uuid) -> i64 {
+	state
+		.db
+		.query_row(
+			"SELECT size FROM files AS fi JOIN items AS i ON i.id = fi.id WHERE i.uuid = ?",
+			[uuid],
+			|row| row.get(FILES_SIZE),
+		)
+		.unwrap()
+}
+
+/// A file root that is registered twice stays tracked until the LAST registration goes; only that
+/// removal evicts the cached row.
+#[test]
+fn file_root_registrations_stack_and_only_the_last_removal_evicts() {
+	let mut state = CacheState::new_in_memory();
+	// No dir roots: the file root must stand on its own (and eviction must not be skipped as
+	// "still covered by a dir root").
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	assert!(
+		state.handle_add_file_sync_root(file.stable_uuid, 1, Box::new(|_| {}), ack),
+		"a newly tracked lineage must request the convergence resync"
+	);
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "acked Ok");
+
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	assert!(
+		!state.handle_add_file_sync_root(file.stable_uuid, 2, Box::new(|_| {}), ack),
+		"a second registration on an already-tracked lineage needs no resync"
+	);
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))));
+	assert_eq!(state.file_roots.get(&file.stable_uuid).unwrap().len(), 2);
+
+	assert!(
+		!state
+			.remove_file_registration(file.stable_uuid, 1, true)
+			.unwrap(),
+		"eviction is skipped while a registration survives"
+	);
+	assert!(state.file_roots.contains_key(&file.stable_uuid));
+	assert!(item_exists(&state, file.uuid));
+
+	assert!(
+		state
+			.remove_file_registration(file.stable_uuid, 2, true)
+			.unwrap(),
+		"the last removal evicts the cached row"
+	);
+	assert!(!state.file_roots.contains_key(&file.stable_uuid));
+	assert!(!item_exists(&state, file.uuid));
+
+	assert!(
+		!state
+			.remove_file_registration(file.stable_uuid, 99, true)
+			.unwrap(),
+		"removing an unknown registration is a harmless no-op"
+	);
+}
+
+/// Evicting a file root must NOT punch a hole in a dir root that still covers the file — that
+/// root's membership gate expects its cached subtree to be complete.
+#[test]
+fn file_root_eviction_skips_a_file_a_dir_root_still_covers() {
+	let mut state = CacheState::new_in_memory();
+	let a = cache_dir(1, state.root_uuid);
+	let file = cache_file(10, a.uuid, 100);
+	state.upsert_dirs(once(&a)).unwrap();
+	state.upsert_files(once(&file)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(a.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+	let (ack, _ack_rx) = tokio::sync::oneshot::channel();
+	state.handle_add_file_sync_root(file.stable_uuid, 1, Box::new(|_| {}), ack);
+
+	assert!(
+		!state
+			.remove_file_registration(file.stable_uuid, 1, true)
+			.unwrap(),
+		"nothing was evicted"
+	);
+	assert!(
+		item_exists(&state, file.uuid),
+		"the dir root still needs the row"
+	);
+}
+
+/// A `fileTrash` carrying a successor uuid for a TRACKED lineage is an identity update: the row is
+/// re-filed under the new uuid in place, and the root is notified once — never with a removal.
+#[test]
+fn tracked_file_trash_with_successor_updates_the_identity_in_place() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	let successor = successor_of(&file, 11);
+	drain_socket_event(&mut state, 1, trashed(&file, Some(successor.uuid)));
+
+	assert!(!item_exists(&state, file.uuid), "the old uuid is retired");
+	assert!(
+		item_exists(&state, successor.uuid),
+		"the tracked row was re-filed under the successor, not deleted"
+	);
+	assert_eq!(
+		state.stable_of_uuid(successor.uuid).unwrap(),
+		Some(file.stable_uuid),
+		"the lineage id is unchanged"
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(seen.len(), 1, "exactly one notification: {seen:?}");
+	assert!(
+		seen[0].contains("Trashed") && !seen[0].contains("Removed"),
+		"the tracked root sees an identity update, never a removal: {seen:?}"
+	);
+}
+
+/// The server sends `fileTrash` and the successor's `fileNew` as an UNORDERED pair. Either order
+/// must converge on exactly one cached row — the successor — with no observable delete + create of
+/// the tracked identity.
+#[test]
+fn file_trash_pair_converges_in_either_order() {
+	for new_first in [false, true] {
+		let mut state = CacheState::new_in_memory();
+		state.set_test_sync_roots(HashMap::new());
+		let file = cache_file(10, state.root_uuid, 100);
+		state.upsert_files(once(&file)).unwrap();
+		let (seen, callback) = recording_callback();
+		state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+		let successor = successor_of(&file, 11);
+		let trash = trashed(&file, Some(successor.uuid));
+		let created = CacheEventType::File(FileEvent::New(successor.clone()));
+		if new_first {
+			drain_socket_event(&mut state, 1, created);
+			drain_socket_event(&mut state, 2, trash);
+		} else {
+			drain_socket_event(&mut state, 1, trash);
+			drain_socket_event(&mut state, 2, created);
+		}
+
+		assert_eq!(
+			state.uuids_of_stable(file.stable_uuid).unwrap(),
+			vec![successor.uuid],
+			"exactly one row survives, under the successor uuid (new_first={new_first})"
+		);
+		assert_eq!(
+			file_size(&state, successor.uuid),
+			successor.size as i64,
+			"the surviving row carries the edit's content (new_first={new_first})"
+		);
+		let seen = seen.lock().unwrap();
+		assert!(
+			seen.iter().all(|event| !event.contains("Removed")),
+			"no removal is ever dispatched for the tracked lineage: {seen:?}"
+		);
+		assert_eq!(seen.len(), 2, "both events reach the root: {seen:?}");
+	}
+}
+
+/// A `fileTrash` WITHOUT a successor is a genuine trash: the row goes. The registration stays —
+/// a trashed file can be restored, and its owner learns of the trash through the dispatch.
+#[test]
+fn tracked_file_trash_without_successor_removes_the_row() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	drain_socket_event(&mut state, 1, trashed(&file, None));
+
+	assert!(
+		!item_exists(&state, file.uuid),
+		"a genuine trash removes it"
+	);
+	assert!(
+		state.file_roots.contains_key(&file.stable_uuid),
+		"the registration survives — a restore can bring the lineage back"
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(seen.len(), 1, "the trash is dispatched once: {seen:?}");
+}
+
+/// An UNTRACKED file keeps the historical behaviour exactly: a `fileTrash` deletes its row,
+/// successor or not, and no file root is involved.
+#[test]
+fn untracked_file_trash_still_deletes_the_row() {
+	let mut state = CacheState::new_in_memory();
+	let a = cache_dir(1, state.root_uuid);
+	let file = cache_file(10, a.uuid, 100);
+	state.upsert_dirs(once(&a)).unwrap();
+	state.upsert_files(once(&file)).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(a.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	drain_socket_event(&mut state, 1, trashed(&file, Some(Uuid::from_u128(11))));
+
+	assert!(
+		!item_exists(&state, file.uuid),
+		"an untracked trash deletes, exactly as before"
+	);
+	assert!(
+		!item_exists(&state, Uuid::from_u128(11)),
+		"and nothing is created for the successor it never tracked"
+	);
+}
+
+/// A `fileArchived` carrying a successor is the versioning-ENABLED account's edit, and must be
+/// handled exactly like the trash: an identity update in place, never a removal.
+#[test]
+fn tracked_file_archive_with_successor_updates_the_identity_in_place() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	let successor = successor_of(&file, 11);
+	drain_socket_event(&mut state, 1, archived(&file, Some(successor.uuid)));
+
+	assert!(!item_exists(&state, file.uuid), "the old uuid is retired");
+	assert!(
+		item_exists(&state, successor.uuid),
+		"the tracked row was re-filed under the successor, not deleted"
+	);
+	assert_eq!(
+		state.stable_of_uuid(successor.uuid).unwrap(),
+		Some(file.stable_uuid),
+		"the lineage id is unchanged"
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(seen.len(), 1, "exactly one notification: {seen:?}");
+	assert!(
+		seen[0].contains("Archived") && !seen[0].contains("Removed"),
+		"the tracked root sees an identity update, never a removal: {seen:?}"
+	);
+}
+
+/// The `fileArchived`/`fileNew` pair is as unordered as the trash one, and converges the same way.
+#[test]
+fn file_archive_pair_converges_in_either_order() {
+	for new_first in [false, true] {
+		let mut state = CacheState::new_in_memory();
+		state.set_test_sync_roots(HashMap::new());
+		let file = cache_file(10, state.root_uuid, 100);
+		state.upsert_files(once(&file)).unwrap();
+		let (seen, callback) = recording_callback();
+		state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+		let successor = successor_of(&file, 11);
+		let archive = archived(&file, Some(successor.uuid));
+		let created = CacheEventType::File(FileEvent::New(successor.clone()));
+		if new_first {
+			drain_socket_event(&mut state, 1, created);
+			drain_socket_event(&mut state, 2, archive);
+		} else {
+			drain_socket_event(&mut state, 1, archive);
+			drain_socket_event(&mut state, 2, created);
+		}
+
+		assert_eq!(
+			state.uuids_of_stable(file.stable_uuid).unwrap(),
+			vec![successor.uuid],
+			"exactly one row survives, under the successor uuid (new_first={new_first})"
+		);
+		assert_eq!(
+			file_size(&state, successor.uuid),
+			successor.size as i64,
+			"the surviving row carries the edit's content (new_first={new_first})"
+		);
+		let seen = seen.lock().unwrap();
+		assert!(
+			seen.iter().all(|event| !event.contains("Removed")),
+			"no removal is ever dispatched for the tracked lineage: {seen:?}"
+		);
+		assert_eq!(seen.len(), 2, "both events reach the root: {seen:?}");
+	}
+}
+
+/// A `fileArchived` WITHOUT a successor is move-with-replace: `stable_uuid` is the REPLACED
+/// lineage's retired id, so that lineage is gone for good and the row goes with it.
+#[test]
+fn tracked_file_archive_without_successor_removes_the_row() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	drain_socket_event(&mut state, 1, archived(&file, None));
+
+	assert!(
+		!item_exists(&state, file.uuid),
+		"a replaced lineage is not coming back"
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(seen.len(), 1, "the archive is dispatched once: {seen:?}");
+}
+
+/// A lineage the server reports GONE at resync is reaped: the row is deleted and the root is told
+/// with a removal (which is what makes the bridge retire its own row and fire the tombstone). The
+/// REGISTRATION stays — its owner retires it once the removal lands.
+#[test]
+fn a_deleted_file_root_is_reaped_with_a_removal() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	state.reap_deleted_file_roots(vec![file.stable_uuid]);
+
+	assert!(!item_exists(&state, file.uuid), "the cached row is gone");
+	assert!(
+		state.file_roots.contains_key(&file.stable_uuid),
+		"the registration is the handle owner's to retire"
+	);
+	{
+		let seen = seen.lock().unwrap();
+		assert_eq!(seen.len(), 1, "one removal: {seen:?}");
+		assert!(seen[0].contains("Removed"), "and it IS a removal: {seen:?}");
+	}
+
+	// Re-reaping the same lineage (the next resync fetches it again) has nothing left to do.
+	state.reap_deleted_file_roots(vec![file.stable_uuid]);
+	assert_eq!(seen.lock().unwrap().len(), 1, "no second removal");
+}
+
+/// The file root's callback runs POST-COMMIT: a SECOND connection already sees the applied row
+/// while the callback is executing.
+#[test]
+fn file_root_callback_fires_after_the_commit() {
+	let path = std::env::temp_dir().join(format!("filen-cache-file-root-{}.db", Uuid::new_v4()));
+	let root = Uuid::new_v4();
+	let mut state = CacheState::new_on_path(&path, root);
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, root, 100);
+	state.upsert_files(once(&file)).unwrap();
+
+	let successor = successor_of(&file, 11);
+	let successor_uuid = successor.uuid;
+	let reader = rusqlite::Connection::open(&path).unwrap();
+	let observed: Arc<std::sync::Mutex<Option<i64>>> = Arc::new(std::sync::Mutex::new(None));
+	let observed_cb = observed.clone();
+	let callback: SyncRootCallback = Box::new(move |_events| {
+		let visible: i64 = reader
+			.query_row(
+				"SELECT COUNT(*) AS count FROM items WHERE uuid = ?1",
+				rusqlite::params![successor_uuid],
+				|row| row.get(COUNT),
+			)
+			.unwrap();
+		*observed_cb.lock().unwrap() = Some(visible);
+	});
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	drain_socket_event(&mut state, 1, trashed(&file, Some(successor_uuid)));
+
+	assert_eq!(
+		*observed.lock().unwrap(),
+		Some(1),
+		"the identity update was already committed when the callback ran"
+	);
+}
+
+/// A resync synthetic for a tracked file reaches its FILE root as well as the dir anchor — the
+/// per-anchor fast path resolves the file owner from the payload's stable id (no ancestry walk,
+/// so registering file roots does not cost a CTE per created item).
+#[test]
+fn resync_synthetics_dispatch_to_the_owning_file_root() {
+	let mut state = CacheState::new_in_memory();
+	let root = state.root_uuid;
+	let file = cache_file(10, root, 100);
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	state
+		.apply_synthetics_direct(
+			root,
+			vec![CacheEvent {
+				id: None,
+				event: CacheEventType::File(FileEvent::New(file.clone())),
+			}],
+			true,
+		)
+		.unwrap();
+
+	let seen = seen.lock().unwrap();
+	assert_eq!(
+		seen.len(),
+		1,
+		"the file root is notified of its own refreshed record: {seen:?}"
+	);
+	assert!(item_exists(&state, file.uuid));
 }

@@ -9,7 +9,9 @@ macro_rules! def_sql_user_version {
 // (the cache is fully reconstructible from the server, so this is safe). A non-destructive migration is
 // only worth building once the DB holds non-reconstructible local state (conflicts, local trash, etc.).
 // 3: files gained stable_uuid (and the CacheEvent rkyv payload layout changed with it).
-def_sql_user_version!(3);
+// 4: file sync roots — idx_files_stable_uuid and files.superseded, plus the `FileEvent::Trashed`
+//    variant (and the reshaped `Archived`), which again change the CacheEvent rkyv payload layout.
+def_sql_user_version!(4);
 
 pub(crate) const VACUUM: &str = "VACUUM;";
 pub(crate) const GET_USER_VERSION: &str = "PRAGMA user_version;";
@@ -69,6 +71,21 @@ pub(crate) const ITEM_UPDATE_OWN_ROOT_ID: &str = include_str!("raw/item_update_o
 // The single account-root rowid (the lone `roots` row), cached on `CacheState` at open so the bulk
 // upsert binds it directly instead of re-deriving it per row.
 pub(crate) const SELECT_ROOT_ID: &str = "SELECT id FROM roots ORDER BY id LIMIT 1";
+
+// File sync roots. Three trivial single clauses, inlined here like the evict-protection ones
+// above rather than each given a `raw/*.sql` file. Both lookups ride `idx_files_stable_uuid` /
+// `items.uuid`'s unique index.
+pub(crate) const FILE_UUIDS_OF_STABLE: &str =
+	"SELECT i.uuid FROM items AS i INNER JOIN files AS f ON f.id = i.id WHERE f.stable_uuid = ?1";
+pub(crate) const FILE_STABLE_OF_UUID: &str =
+	"SELECT f.stable_uuid FROM items AS i INNER JOIN files AS f ON f.id = i.id WHERE i.uuid = ?1";
+/// Re-file a tracked file row under its successor uuid — the edit's identity update, in place, so
+/// the tracked row is never deleted and re-created.
+pub(crate) const ITEM_UPDATE_UUID: &str = "UPDATE items SET uuid = ?2 WHERE uuid = ?1";
+/// Mark the just-re-filed row as carrying the PREDECESSOR's content until the paired `fileNew`
+/// lands. See `files.superseded` in `raw/init.sql` for why a reader must refuse it.
+pub(crate) const FILE_MARK_SUPERSEDED: &str =
+	"UPDATE files SET superseded = TRUE WHERE id = (SELECT id FROM items WHERE uuid = ?1)";
 
 pub(crate) const ROOT_INSERT: &str = include_str!("raw/root_insert.sql");
 pub(crate) const ROOT_ITEM_INSERT: &str = include_str!("raw/root_item_insert.sql");

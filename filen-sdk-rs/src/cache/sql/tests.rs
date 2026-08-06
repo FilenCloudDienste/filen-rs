@@ -1311,7 +1311,7 @@ fn init_seeds_cache_meta() {
 			|row| row.get(CACHE_META_VALUE),
 		)
 		.unwrap();
-	assert_eq!(format_version, 2);
+	assert_eq!(format_version, 3);
 }
 
 #[test]

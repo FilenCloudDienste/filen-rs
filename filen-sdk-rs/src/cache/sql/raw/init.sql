@@ -56,8 +56,23 @@ CREATE TABLE files (
 	modified BIGINT NOT NULL,
 	hash BLOB,
 
+	-- TRUE while this row is mid-supersede: an edit's fileTrash/fileArchived
+	-- re-filed a tracked lineage under its successor uuid, but the paired
+	-- fileNew carrying the successor's CONTENT has not landed yet, so
+	-- chunks/size/key/hash still describe the PREDECESSOR. Such a row must not
+	-- be handed to a reader — downloading it would decrypt the successor's
+	-- chunks with the old key — so the search paths skip it. Any upsert clears
+	-- it: the paired fileNew, a listing, or the resync's head fetch.
+	superseded BOOLEAN NOT NULL CHECK (superseded IN (FALSE, TRUE)) DEFAULT FALSE,
+
 	FOREIGN KEY (id) REFERENCES items (id) ON DELETE CASCADE
 );
+
+-- A file sync root is keyed by the whole-life id, so its cached row is
+-- looked up (and evicted) by stable_uuid. Deliberately NOT unique: while a
+-- versioning-disabled edit's fileTrash/fileNew pair is only half-applied,
+-- the superseded row and its successor both carry the lineage's id.
+CREATE INDEX idx_files_stable_uuid ON files (stable_uuid);
 
 CREATE TABLE dirs (
 	id BIGINT PRIMARY KEY NOT NULL,
@@ -144,4 +159,6 @@ INSERT INTO cache_meta (meta_key, value) VALUES ('last_drive_message_id', NULL);
 -- checked rkyv decode and is quarantined as corrupt (forcing a resync),
 -- rather than proactively cleared.
 -- 2: CacheableFile gained stable_uuid.
-INSERT INTO cache_meta (meta_key, value) VALUES ('event_format_version', 2);
+-- 3: FileEvent gained the Trashed variant, and Archived grew to match it
+--    (both now carry the lineage's stable id + the successor uuid).
+INSERT INTO cache_meta (meta_key, value) VALUES ('event_format_version', 3);

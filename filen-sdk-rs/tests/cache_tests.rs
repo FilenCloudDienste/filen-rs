@@ -1496,3 +1496,55 @@ async fn test_cache_resync_reports_progress() {
 		);
 	}
 }
+
+/// A FILE sync root follows its lineage across a content edit. Registered ALONE — no dir root
+/// covers the file — so its row can only be populated by the by-stable fetch, and after an edit
+/// the cached row must be the SUCCESSOR uuid (the `fileTrash`+`fileNew` pair is an identity
+/// update, not a delete + create).
+#[shared_test_runtime]
+async fn test_cache_file_sync_root_follows_an_edit() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
+	let test_dir = &resources.dir;
+	let path = temp_cache_path();
+	client.configure_cache(path.clone(), |_| {}).await.unwrap();
+
+	let file = client
+		.make_file_builder("file_root_edit.txt", test_dir.uuid())
+		.unwrap();
+	let file = client.upload_file(file, b"v1").await.unwrap();
+
+	let _handle = client
+		.clone()
+		.add_file_sync_root(file.stable_uuid(), noop_sync_root_callback())
+		.await
+		.unwrap();
+	ensure_socket_ready(&client).await;
+
+	assert!(
+		poll_for_item(&path, file.uuid(), Duration::from_secs(30)).await,
+		"the convergence fetch populates the tracked file (nothing else can)"
+	);
+
+	// backend timestamps have a resolution of one second
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	let edited = client
+		.upload_file(
+			client
+				.make_file_builder("file_root_edit.txt", test_dir.uuid())
+				.unwrap(),
+			b"v2 contents",
+		)
+		.await
+		.unwrap();
+	assert_ne!(edited.uuid(), file.uuid(), "an edit re-mints the uuid");
+
+	assert!(
+		poll_for_item(&path, edited.uuid(), Duration::from_secs(30)).await,
+		"the tracked row is re-filed under the successor uuid"
+	);
+	assert!(
+		poll_for_item_absent(&path, file.uuid(), Duration::from_secs(30)).await,
+		"the superseded uuid is retired"
+	);
+}

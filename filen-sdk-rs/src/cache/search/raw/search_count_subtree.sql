@@ -17,4 +17,9 @@ LEFT JOIN files AS f ON i.id = f.id
 LEFT JOIN dirs AS d ON i.id = d.id
 WHERE
 	(?2 = 0 OR i.type = ?2)
-	AND filen_name_matches(coalesce(f.name, d.name), ?3, ?4);
+	AND filen_name_matches(coalesce(f.name, d.name), ?3, ?4)
+	-- A row mid-supersede carries the PREDECESSOR's content under the
+	-- successor's uuid, so handing it out would hand out an undownloadable
+	-- file (see files.superseded). Dirs have no such row, hence the LEFT
+	-- JOIN's NULL passing.
+	AND coalesce(f.superseded, FALSE) = FALSE;
