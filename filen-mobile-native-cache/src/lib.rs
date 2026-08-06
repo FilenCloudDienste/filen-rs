@@ -15,3 +15,4 @@ pub mod local;
 pub mod remote;
 pub mod thumbnail;
 pub mod traits;
+pub(crate) mod working_set;

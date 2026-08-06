@@ -125,7 +125,14 @@ impl FilenMobileCacheState {
 	/// or miss one made after it was read. Consumers must treat those two fields as a hint and ask
 	/// for the item itself when the answer matters.
 	pub fn enumerate_changes(&self, anchor: Option<Vec<u8>>) -> Result<FfiChanges, CacheError> {
-		self.sync_execute_authed(|auth_state| changes_since(&auth_state.conn(), anchor.as_deref()))
+		let changes = self
+			.sync_execute_authed(|auth_state| changes_since(&auth_state.conn(), anchor.as_deref()));
+		// The replica has just been told where things stand, which is the natural moment to bring
+		// tracking in line with the working set — never before serving the diff, which this must
+		// not hold up. It is also the backstop for every membership change that has no refresh of
+		// its own (a trash, an eviction by the cache sweep): the enumerator asks often.
+		crate::working_set::schedule_refresh(&self.state);
+		changes
 	}
 
 	/// The items this device has a stake in: bytes in the local cache, an edit that has not

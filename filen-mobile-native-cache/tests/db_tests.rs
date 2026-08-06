@@ -10,7 +10,7 @@ use filen_mobile_native_cache::{
 		FfiChanges, FfiDir, FfiFile, FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs,
 		SearchQueryResponseEntry, UploadFileInfo,
 	},
-	traits::{ProgressCallback, SearchUpdateCallback},
+	traits::{ProgressCallback, SearchUpdateCallback, WorkingSetUpdateListener},
 };
 use filen_sdk_rs::{
 	crypto::{shared::DataCrypter, v3::EncryptionKey},
@@ -6646,4 +6646,245 @@ pub async fn test_a_pre_aborted_signal_stops_before_anything_happens() {
 	}
 
 	tokio::fs::remove_file(&external).await.ok();
+}
+
+/// Counts the "something in your working set moved" signals the cache raises.
+#[derive(Default)]
+struct CountingWorkingSetListener(std::sync::atomic::AtomicU64);
+
+impl WorkingSetUpdateListener for CountingWorkingSetListener {
+	fn working_set_changed(&self) {
+		self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	}
+}
+
+impl CountingWorkingSetListener {
+	fn count(&self) -> u64 {
+		self.0.load(std::sync::atomic::Ordering::Relaxed)
+	}
+}
+
+/// Waits until tracking is actually carrying events, by driving changes we do not care about
+/// until one comes back.
+///
+/// The engine's socket connects ASYNCHRONOUSLY behind the registration — the ack fires before the
+/// convergence resync, let alone the socket — and an event that lands before it is up is never
+/// redelivered. A test that mutates the moment the registration returns is racing that window; one
+/// that waits for a signal first is not. Each pass is a real drive change, so the first one after
+/// the socket is up is delivered.
+async fn wait_until_tracking_is_live(
+	db: &Arc<FilenMobileCacheState>,
+	item: &FfiId,
+	listener: &CountingWorkingSetListener,
+) {
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	let mut rank = 0;
+	while listener.count() == 0 {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"tracking never carried a change; the socket loop is not live"
+		);
+		rank = 1 - rank;
+		db.set_favorite_rank(item.clone(), rank).await.unwrap();
+		let settle = std::time::Instant::now() + std::time::Duration::from_secs(6);
+		while listener.count() == 0 && std::time::Instant::now() < settle {
+			tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+		}
+	}
+}
+
+// The whole point of tracking: a file this device has a stake in is edited SOMEWHERE ELSE, and the
+// change reaches the cache — and through it the replica — without anybody asking for the item.
+// Nothing here calls a refreshing API for the file: the only path from the edit to the assertion
+// is the engine's socket consumer, the file sync root registered for the lineage, and the bridge
+// that lands the record in `native_cache.db`.
+#[shared_test_runtime]
+pub async fn test_tracking_delivers_a_remote_edit_without_being_asked() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("tracked_file.txt", rss.dir.uuid())
+				.unwrap(),
+			b"before the edit",
+		)
+		.await
+		.unwrap();
+	let stable = file.stable_uuid().to_string();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("tracked_file.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	let listener = Arc::new(CountingWorkingSetListener::default());
+	db.set_working_set_listener(Some(listener.clone()));
+
+	// Bytes on the device are the stake that puts it in the working set, and so under tracking.
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	db.refresh_working_set_tracking().await.unwrap();
+	wait_until_tracking_is_live(&db, &file_path, &listener).await;
+	let signals_before = listener.count();
+
+	// The edit, made the way another device would make it: same name, new content — the server
+	// re-mints the uuid and announces it, which is precisely what a uuid-keyed cache cannot follow.
+	let anchor = db.current_sync_anchor().unwrap();
+	let edited = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("tracked_file.txt", rss.dir.uuid())
+				.unwrap(),
+			b"after the edit, which is longer",
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		edited.stable_uuid().to_string(),
+		stable,
+		"an edit keeps the lineage; without that there is nothing to track"
+	);
+
+	// No refreshing call in this loop — only the feed, which is local. Every poll's retirements are
+	// kept: the diff is since-anchor, so a tombstone raised mid-wait shows up in exactly one page.
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	let mut retired: Vec<String> = Vec::new();
+	let delivered = loop {
+		let changes = db.enumerate_changes(Some(anchor.clone())).unwrap();
+		retired.extend(changes.deleted_ids.iter().cloned());
+		if let Some(file) = feed_files(&changes, &stable)
+			.into_iter()
+			.find(|f| f.uuid == edited.uuid().to_string())
+		{
+			break file.clone();
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the edit never reached the cache through tracking"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	};
+
+	assert_eq!(
+		delivered.stable_uuid, stable,
+		"the row must be the same identity, re-filed under the new uuid in place"
+	);
+	assert_eq!(delivered.size, edited.size() as i64);
+	assert!(
+		listener.count() > signals_before,
+		"the replica has to be told, or it will never come and ask"
+	);
+	// On a versioning-enabled account the edit arrives as `fileArchived` + `fileNew`, which is the
+	// same unordered supersede pair a `fileTrash` makes on a versioning-disabled one. Treating
+	// either as a removal would retire the id the replica persists — an authoritative delete for a
+	// file that is very much still there.
+	assert!(
+		!retired.iter().any(|id| id.contains(&stable)),
+		"the lineage must never be retired by its own edit: {retired:?}"
+	);
+	// And the local slot survives it. The bytes under the predecessor's uuid are stale, which is
+	// fine (the content version moved, so the system re-fetches); evicting them here would be the
+	// forget path, which is what a supersede must not take.
+	assert!(
+		std::fs::metadata(&local_path).is_ok(),
+		"the edit must not evict the device's copy"
+	);
+
+	db.set_working_set_listener(None);
+	db.stop_working_set_tracking();
+	std::fs::remove_file(&local_path).ok();
+}
+
+/// A remote TRASH is not a delete. The row has to follow the file into the trash — kept, marked,
+/// with its original parent and its local bytes — because the user can put it back, and a
+/// retirement would have told every replica the file is gone for good.
+#[shared_test_runtime]
+pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
+	let (db, rss) = get_db_resources().await;
+
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("tracked_trash.txt", rss.dir.uuid())
+				.unwrap(),
+			b"trash me",
+		)
+		.await
+		.unwrap();
+	let stable = file.stable_uuid().to_string();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("tracked_trash.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// The stake, and with it the tracking.
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	let listener = Arc::new(CountingWorkingSetListener::default());
+	db.set_working_set_listener(Some(listener.clone()));
+	db.refresh_working_set_tracking().await.unwrap();
+	wait_until_tracking_is_live(&db, &file_path, &listener).await;
+
+	let anchor = db.current_sync_anchor().unwrap();
+	rss.client.trash_file(&mut file).await.unwrap();
+
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	let mut retired: Vec<String> = Vec::new();
+	loop {
+		let changes = db.enumerate_changes(Some(anchor.clone())).unwrap();
+		retired.extend(changes.deleted_ids.iter().cloned());
+		if feed_files(&changes, &stable)
+			.into_iter()
+			.any(|f| f.original_parent.is_some())
+		{
+			break;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the trash never reached the cache through tracking (retired: {retired:?})"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+
+	assert!(
+		!retired.iter().any(|id| id.contains(&stable)),
+		"a trash is an update, never a retirement: {retired:?}"
+	);
+	assert!(
+		std::fs::metadata(&local_path).is_ok(),
+		"a trashed file keeps its bytes — a restore must not have to re-download them"
+	);
+
+	// And back out again: a restore follows the same way, with the original parent restored.
+	let anchor = db.current_sync_anchor().unwrap();
+	rss.client.restore_file(&mut file).await.unwrap();
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	loop {
+		let changes = db.enumerate_changes(Some(anchor.clone())).unwrap();
+		if feed_files(&changes, &stable)
+			.into_iter()
+			.any(|f| f.original_parent.is_none() && f.parent == rss.dir.uuid().to_string())
+		{
+			break;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the restore never reached the cache through tracking"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+
+	db.set_working_set_listener(None);
+	db.stop_working_set_tracking();
+	std::fs::remove_file(&local_path).ok();
+	rss.client.delete_file_permanently(file).await.unwrap();
 }

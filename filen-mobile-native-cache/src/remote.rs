@@ -161,12 +161,16 @@ impl FilenMobileCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<DownloadResponse, CacheError> {
-		self.async_execute_authed_owned(async move |auth_state| {
-			auth_state
-				.download_file_if_changed_with_item(id, progress_callback, abort)
-				.await
-		})
-		.await
+		let response = self
+			.async_execute_authed_owned(async move |auth_state| {
+				auth_state
+					.download_file_if_changed_with_item(id, progress_callback, abort)
+					.await
+			})
+			.await;
+		// Bytes on the device are a stake, so the file just joined the working set.
+		crate::working_set::schedule_refresh(&self.state);
+		response
 	}
 
 	/// Replaces a file's content with the bytes at `os_path`, and hands back what it became.
@@ -191,12 +195,16 @@ impl FilenMobileCacheState {
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
 		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<FileWithPathResponse, CacheError> {
-		self.async_execute_authed_owned(async move |auth_state| {
-			auth_state
-				.modify_file_content(id, os_path, progress_callback, abort)
-				.await
-		})
-		.await
+		let response = self
+			.async_execute_authed_owned(async move |auth_state| {
+				auth_state
+					.modify_file_content(id, os_path, progress_callback, abort)
+					.await
+			})
+			.await;
+		// Edited bytes are a stake whether or not they reached the server.
+		crate::working_set::schedule_refresh(&self.state);
+		response
 	}
 
 	/// The item an id names, refreshed from the server first.
@@ -366,10 +374,14 @@ impl FilenMobileCacheState {
 		item: FfiId,
 		favorite_rank: i64,
 	) -> Result<ObjectWithPathResponse, CacheError> {
-		self.async_execute_authed_owned(async move |auth_state| {
-			auth_state.set_favorite_rank(item, favorite_rank).await
-		})
-		.await
+		let response = self
+			.async_execute_authed_owned(async move |auth_state| {
+				auth_state.set_favorite_rank(item, favorite_rank).await
+			})
+			.await;
+		// A favourite is a stake in itself, and stops being one the moment it is cleared.
+		crate::working_set::schedule_refresh(&self.state);
+		response
 	}
 }
 
@@ -804,6 +816,10 @@ impl AuthCacheState {
 		}
 	}
 
+	/// TODO: switch the file branch to `get_file_by_stable_uuid` once `v3/file/stable` deploys —
+	/// removes the versioned-response blindspot below (asking by uuid, the only question the
+	/// server takes today, cannot see past a content edit made elsewhere, so the refresh reports
+	/// the cached row and waits for a listing to carry the head).
 	async fn refresh_file(&self, file: DBFile) -> Result<Option<FfiObject>, CacheError> {
 		let info = match self.client.get_file_with_info(file.uuid).await {
 			Ok(info) => info,
@@ -850,7 +866,7 @@ impl AuthCacheState {
 	/// dropping them along with the item is the point — the row delete that follows is what
 	/// retires the id for every replica, and a slot left behind would be a cached copy of
 	/// something nothing names any more.
-	async fn forget_item(&self, obj: DBObject) -> Result<Option<FfiObject>, CacheError> {
+	pub(crate) async fn forget_item(&self, obj: DBObject) -> Result<Option<FfiObject>, CacheError> {
 		// An edit that has not reached the server outranks the server's answer: those bytes exist
 		// nowhere else, and a drain can still land them. Deleting the row here would take the only
 		// copy with it. The item stays until the drain resolves it, one way or the other.

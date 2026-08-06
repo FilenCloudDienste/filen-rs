@@ -67,6 +67,10 @@ pub struct AuthCacheState {
 	pub(crate) sdk_cache_path: PathBuf,
 	/// The one live `cache::search` on the drive root, reused across queries via `set_config`.
 	pub(crate) search: tokio::sync::Mutex<Option<crate::search::ActiveSearch>>,
+	/// The working set's files, registered as file sync roots on the same engine (see
+	/// [`crate::working_set`]). Dropping this state — which is what deauth does — unregisters
+	/// every one of them.
+	pub(crate) tracked_files: crate::working_set::TrackedFiles,
 	/// Serialises mutations of a single item's local cache file; see [`crate::file_locks`].
 	pub(crate) file_locks: crate::file_locks::FileLocks,
 }
@@ -104,6 +108,10 @@ pub(crate) struct CacheState {
 	// document storage inside the app group) is.
 	pub(crate) db_dir: PathBuf,
 	last_update: std::sync::RwLock<Option<Instant>>,
+	/// Who to tell when working-set tracking changed something. Lives out here rather than on the
+	/// authenticated state so it survives a re-auth, which replaces `status` wholesale.
+	pub(crate) working_set_listener:
+		Mutex<Option<Arc<dyn crate::traits::WorkingSetUpdateListener>>>,
 }
 
 #[derive(uniffi::Object)]
@@ -511,7 +519,9 @@ impl FilenMobileCacheState {
 		Some(write_state.downgrade())
 	}
 
-	fn sync_get_cache_state_borrowed(&self) -> tokio::sync::RwLockReadGuard<'_, CacheState> {
+	pub(crate) fn sync_get_cache_state_borrowed(
+		&self,
+	) -> tokio::sync::RwLockReadGuard<'_, CacheState> {
 		if let Some(state) = self.sync_get_cache_state_borrowed_inner() {
 			return state;
 		}
@@ -659,6 +669,7 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
+			tracked_files: Default::default(),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
@@ -701,6 +712,7 @@ impl AuthCacheState {
 			last_cleanup_sem: tokio::sync::Semaphore::new(1),
 			sdk_cache_path,
 			search: tokio::sync::Mutex::new(None),
+			tracked_files: Default::default(),
 			file_locks: crate::file_locks::FileLocks::default(),
 		};
 		new.add_root(&new.client.root().uuid().to_string())?;
@@ -858,6 +870,7 @@ impl FilenMobileCacheState {
 				files_dir: PathBuf::from(files_dir),
 				db_dir: PathBuf::from(db_dir),
 				last_update: std::sync::RwLock::new(None),
+				working_set_listener: Mutex::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
 			allow_auth_disable: true,
@@ -884,6 +897,7 @@ impl FilenMobileCacheState {
 				files_dir: PathBuf::from(files_dir),
 				db_dir: PathBuf::from(files_dir),
 				last_update: std::sync::RwLock::new(None),
+				working_set_listener: Mutex::new(None),
 			})),
 			state_write_coordinator: tokio::sync::Mutex::new(()),
 			allow_auth_disable: false,
