@@ -1,5 +1,6 @@
 uniffi::setup_scaffolding!();
 
+pub mod abort;
 pub mod env;
 mod error;
 pub mod ffi;

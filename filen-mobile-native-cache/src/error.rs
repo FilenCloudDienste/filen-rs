@@ -71,6 +71,11 @@ pub enum CacheError {
 	/// failure: it is the one they answer by re-enumerating from scratch
 	/// (`NSFileProviderErrorSyncAnchorExpired`), not by reporting an error.
 	SyncAnchorExpired(ErrorContext),
+	/// The caller aborted the call through the [`FfiAbortSignal`](crate::abort::FfiAbortSignal)
+	/// it handed in. Its own variant because it is the one failure that is not a failure: the
+	/// caller asked for it, so a provider reports it as a cancellation rather than surfacing it
+	/// to the user as an error.
+	Aborted(ErrorContext),
 }
 
 impl CacheError {
@@ -130,6 +135,9 @@ impl CacheError {
 			CacheError::SyncAnchorExpired(err) => CacheError::SyncAnchorExpired(ErrorContext(
 				format!("{}: {}", context.into(), err.0).into(),
 			)),
+			CacheError::Aborted(err) => CacheError::Aborted(ErrorContext(
+				format!("{}: {}", context.into(), err.0).into(),
+			)),
 		}
 	}
 }
@@ -162,6 +170,7 @@ impl std::fmt::Display for CacheError {
 			CacheError::FailedToDecrypt(err) => err.fmt(f),
 			CacheError::InvalidName(err) => err.fmt(f),
 			CacheError::SyncAnchorExpired(err) => err.fmt(f),
+			CacheError::Aborted(err) => err.fmt(f),
 		}
 	}
 }

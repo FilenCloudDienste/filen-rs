@@ -4,10 +4,11 @@ use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use filen_macros::shared_test_runtime;
 use filen_mobile_native_cache::{
 	CacheError,
+	abort::FfiAbortController,
 	auth::{AuthFile, DB_FILE_NAME, FilenMobileCacheState},
 	ffi::{
 		FfiChanges, FfiDir, FfiFile, FfiId, FfiNonRootObject, FfiObject, ItemType, SearchQueryArgs,
-		SearchQueryResponseEntry,
+		SearchQueryResponseEntry, UploadFileInfo,
 	},
 	traits::{ProgressCallback, SearchUpdateCallback},
 };
@@ -5864,7 +5865,7 @@ pub async fn test_modify_file_content_lands_external_bytes_as_a_new_version() {
 	let external_str = external.to_string_lossy().into_owned();
 
 	let modified = db
-		.modify_file_content(file_path.clone(), external_str.clone(), None)
+		.modify_file_content(file_path.clone(), external_str.clone(), None, None)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -5899,7 +5900,7 @@ pub async fn test_modify_file_content_lands_external_bytes_as_a_new_version() {
 
 	// The same bytes again: a provider saves on close whether the user typed anything or not.
 	let unchanged = db
-		.modify_file_content(file_path.clone(), external_str.clone(), None)
+		.modify_file_content(file_path.clone(), external_str.clone(), None, None)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -5922,7 +5923,7 @@ pub async fn test_modify_file_content_lands_external_bytes_as_a_new_version() {
 	tokio::fs::write(&external, AGAIN).await.unwrap();
 
 	let by_stable = db
-		.modify_file_content(format!("stable/{stable}").into(), external_str, None)
+		.modify_file_content(format!("stable/{stable}").into(), external_str, None, None)
 		.await
 		.unwrap();
 	assert_eq!(by_stable.file.stable_uuid, stable);
@@ -6101,7 +6102,7 @@ pub async fn test_download_file_if_changed_with_item_serves_bytes_and_item_toget
 
 	let progress = Arc::new(SumProgressCallback::default());
 	let fresh = db
-		.download_file_if_changed_with_item(file_path.clone(), Some(progress.clone()))
+		.download_file_if_changed_with_item(file_path.clone(), Some(progress.clone()), None)
 		.await
 		.unwrap();
 	assert_eq!(tokio::fs::read(&fresh.path).await.unwrap(), CONTENT);
@@ -6117,7 +6118,7 @@ pub async fn test_download_file_if_changed_with_item_serves_bytes_and_item_toget
 
 	let progress = Arc::new(SumProgressCallback::default());
 	let cached = db
-		.download_file_if_changed_with_item(file_path.clone(), Some(progress.clone()))
+		.download_file_if_changed_with_item(file_path.clone(), Some(progress.clone()), None)
 		.await
 		.unwrap();
 	assert_eq!(cached.path, fresh.path);
@@ -6287,4 +6288,362 @@ pub async fn test_the_stable_namespace_reaches_restore_and_download_after_an_edi
 	assert_eq!(tokio::fs::read(&served).await.unwrap(), EDITED);
 
 	std::fs::remove_file(&served).ok();
+}
+
+// Cancellation for the calls that move bytes. uniffi cannot cancel a Rust future from Swift, so it
+// travels in-band: the caller keeps an `FfiAbortController` and hands its signal to the call. What
+// matters is not that the call stops — it is what it leaves behind when it does, which the tests
+// below pin per op.
+
+/// Trips the abort from inside the transfer, on the first thing it reports — `set_total`, which the
+/// progress task emits as the transfer starts, or the first `on_progress`. That is the deterministic
+/// mid-flight hook: the callback only fires because the network work is under way, and the payloads
+/// below are large enough that it has nowhere near finished.
+struct AbortOnProgress {
+	controller: Arc<FfiAbortController>,
+	calls: std::sync::atomic::AtomicUsize,
+}
+
+impl AbortOnProgress {
+	fn new(controller: Arc<FfiAbortController>) -> Self {
+		Self {
+			controller,
+			calls: std::sync::atomic::AtomicUsize::new(0),
+		}
+	}
+
+	fn trip(&self) {
+		self.calls
+			.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		self.controller.abort();
+	}
+
+	/// Whether the transfer ever reported anything — i.e. whether the abort really was raised
+	/// mid-flight rather than before the op got going.
+	fn tripped(&self) -> bool {
+		self.calls.load(std::sync::atomic::Ordering::Relaxed) > 0
+	}
+}
+
+impl ProgressCallback for AbortOnProgress {
+	fn set_total(&self, _size: u64) {
+		self.trip();
+	}
+
+	fn on_progress(&self, _bytes_processed: u64) {
+		self.trip();
+	}
+}
+
+fn random_bytes(len: usize) -> Vec<u8> {
+	let mut bytes = vec![0u8; len];
+	rand::rng().try_fill_bytes(&mut bytes).unwrap();
+	bytes
+}
+
+/// Big enough that the transfer is unmistakably still in flight when the callback trips the abort.
+const ABORT_PAYLOAD: usize = 8 * 1024 * 1024;
+
+// Aborting a save means "stop working now", never "undo the edit": the bytes are already in the
+// slot and the edit already marked by the time the upload starts, and that pair is the only record
+// of the user's change. So an abort has to leave exactly what a dropped connection leaves — and the
+// drain has to still deliver it.
+#[shared_test_runtime]
+pub async fn test_an_aborted_modify_leaves_the_edit_for_the_drain() {
+	let (db, rss) = get_isolated_db_resources("abort_modify").await;
+
+	rss.client
+		.upload_file(
+			rss.client
+				.make_file_builder("abort_modify.bin", rss.dir.uuid())
+				.unwrap(),
+			b"server v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("abort_modify.bin");
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let (uuid_before, stable) = file_ids(&db, &file_path);
+
+	let edited = random_bytes(ABORT_PAYLOAD);
+	let external = std::env::temp_dir().join("abort_modify_external.bin");
+	tokio::fs::write(&external, &edited).await.unwrap();
+	let external_str = external.to_string_lossy().into_owned();
+
+	let controller = Arc::new(FfiAbortController::new());
+	let callback = Arc::new(AbortOnProgress::new(controller.clone()));
+	let err = db
+		.modify_file_content(
+			file_path.clone(),
+			external_str,
+			Some(callback.clone()),
+			Some(controller.signal()),
+		)
+		.await
+		.expect_err("an aborted save must not report success");
+	assert!(
+		callback.tripped(),
+		"the abort must have been raised from inside the transfer, not before it"
+	);
+	assert!(matches!(err, CacheError::Aborted(_)), "got {err:?}");
+
+	assert!(
+		pending_marker(&db, &file_path).is_some(),
+		"an aborted upload must leave the edit marked as outstanding"
+	);
+	assert_eq!(
+		file_ids(&db, &file_path).0,
+		uuid_before,
+		"nothing reached the server, so no version was minted"
+	);
+	// Served straight from the slot — the marker is what makes a download hand back local bytes
+	// instead of overwriting them — so this is the staged edit itself.
+	let slot = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		tokio::fs::read(&slot).await.unwrap(),
+		edited,
+		"the bytes handed in must still be in the slot"
+	);
+
+	assert_eq!(
+		db.retry_pending_uploads().await.unwrap(),
+		1,
+		"the drain must deliver the edit the abort interrupted"
+	);
+	assert_eq!(
+		pending_marker(&db, &file_path),
+		None,
+		"and leave nothing outstanding once it has"
+	);
+	db.update_dir_children(test_dir_path).await.unwrap();
+	match db.query_item(&file_path).unwrap().unwrap() {
+		FfiObject::File(f) => {
+			assert_eq!(
+				f.size as usize,
+				edited.len(),
+				"the drained bytes must be the ones now on the server"
+			);
+			assert_eq!(f.stable_uuid, stable, "and still the same file");
+		}
+		other => panic!("expected a file, got {other:?}"),
+	}
+
+	tokio::fs::remove_file(&external).await.ok();
+}
+
+// A download writes to the tmp directory and only renames into the cache slot once it has all the
+// bytes, so giving up mid-flight has to leave no cached copy at all — not a truncated one, and not a
+// marker claiming the device holds the file. The retry is what proves it: a half-written slot would
+// be served as-is.
+#[shared_test_runtime]
+pub async fn test_an_aborted_download_leaves_no_cached_copy() {
+	let (db, rss) = get_db_resources().await;
+
+	let contents = random_bytes(ABORT_PAYLOAD);
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("abort_download.bin", rss.dir.uuid())
+				.unwrap(),
+			&contents,
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("abort_download.bin");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// Bytes on the device are a stake, so the working set is where the materialisation marker
+	// shows. The set is global to the cache the suite shares, so it is only ever asked about this
+	// one file.
+	let stable = file.stable_uuid().to_string();
+	let is_cached = |db: &FilenMobileCacheState| {
+		db.query_working_set()
+			.unwrap()
+			.iter()
+			.any(|obj| matches!(obj, FfiObject::File(f) if f.stable_uuid == stable))
+	};
+	assert!(!is_cached(&db), "nothing of it is on the device yet");
+
+	let controller = Arc::new(FfiAbortController::new());
+	let callback = Arc::new(AbortOnProgress::new(controller.clone()));
+	let err = db
+		.download_file_if_changed_with_item(
+			file_path.clone(),
+			Some(callback.clone()),
+			Some(controller.signal()),
+		)
+		.await
+		.expect_err("an aborted download must not report success");
+	assert!(
+		callback.tripped(),
+		"the abort must have been raised from inside the transfer, not before it"
+	);
+	assert!(matches!(err, CacheError::Aborted(_)), "got {err:?}");
+	assert!(
+		!is_cached(&db),
+		"an aborted download must not claim the device holds the file"
+	);
+
+	let served = db
+		.download_file_if_changed_with_item(file_path, Some(Arc::new(NoOpProgressCallback)), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		tokio::fs::read(&served.path).await.unwrap(),
+		contents,
+		"the retry must fetch the whole file, not finish someone else's half"
+	);
+	assert!(is_cached(&db));
+
+	std::fs::remove_file(&served.path).ok();
+}
+
+// A new file is nothing here until the upload produces one: the row is written from what the upload
+// returned. Aborting may leave chunks on the server that belong to no file — the server collects
+// those — but it must never leave a row for a file that never came into being, which every replica
+// would then be told about.
+#[shared_test_runtime]
+pub async fn test_an_aborted_new_upload_leaves_no_row() {
+	let (db, rss) = get_db_resources().await;
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path.clone()).await.unwrap();
+	let file_path: FfiId = test_dir_path.join("abort_new.bin");
+
+	let contents = random_bytes(ABORT_PAYLOAD);
+	let external = std::env::temp_dir().join("abort_new_external.bin");
+	tokio::fs::write(&external, &contents).await.unwrap();
+	let external_str = external.to_string_lossy().into_owned();
+	let info = || UploadFileInfo {
+		name: "abort_new.bin".to_string(),
+		creation: None,
+		modification: None,
+		mime: None,
+	};
+
+	let controller = Arc::new(FfiAbortController::new());
+	let callback = Arc::new(AbortOnProgress::new(controller.clone()));
+	let err = db
+		.upload_new_file_abortable(
+			external_str.clone(),
+			test_dir_path.clone(),
+			info(),
+			Some(callback.clone()),
+			Some(controller.signal()),
+		)
+		.await
+		.expect_err("an aborted upload must not report success");
+	assert!(
+		callback.tripped(),
+		"the abort must have been raised from inside the transfer, not before it"
+	);
+	assert!(matches!(err, CacheError::Aborted(_)), "got {err:?}");
+	assert_eq!(
+		db.query_item(&file_path).unwrap(),
+		None,
+		"a file that never landed must not have a row"
+	);
+
+	let uploaded = db
+		.upload_new_file_abortable(external_str, test_dir_path, info(), None, None)
+		.await
+		.unwrap();
+	assert_eq!(uploaded.id, file_path);
+	assert_eq!(uploaded.file.size as usize, contents.len());
+	assert_eq!(
+		db.query_item(&file_path).unwrap(),
+		Some(FfiObject::File(uploaded.file)),
+		"the un-aborted retry lands the file the abort refused"
+	);
+
+	tokio::fs::remove_file(&external).await.ok();
+}
+
+// A signal that is already aborted means the call was cancelled before it began, and nothing of it
+// may happen — no marker, no bytes into the slot, nothing asked of the server. The check sits ahead
+// of all three, which is the only reason that holds.
+#[shared_test_runtime]
+pub async fn test_a_pre_aborted_signal_stops_before_anything_happens() {
+	let (db, rss) = get_db_resources().await;
+
+	let file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("abort_early.bin", rss.dir.uuid())
+				.unwrap(),
+			b"server v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("abort_early.bin");
+	db.update_dir_children(test_dir_path).await.unwrap();
+	let (uuid_before, stable) = file_ids(&db, &file_path);
+
+	let external = std::env::temp_dir().join("abort_early_external.bin");
+	tokio::fs::write(&external, b"external bytes that must not be imported")
+		.await
+		.unwrap();
+
+	let controller = Arc::new(FfiAbortController::new());
+	controller.abort();
+	assert!(controller.is_aborted() && controller.signal().is_aborted());
+	let progress = Arc::new(SumProgressCallback::default());
+	let err = db
+		.modify_file_content(
+			file_path.clone(),
+			external.to_string_lossy().into_owned(),
+			Some(progress.clone()),
+			Some(controller.signal()),
+		)
+		.await
+		.expect_err("a pre-aborted call must not report success");
+	assert!(matches!(err, CacheError::Aborted(_)), "got {err:?}");
+	assert_eq!(
+		progress.max.load(std::sync::atomic::Ordering::Relaxed),
+		0,
+		"no transfer may have started"
+	);
+
+	// Neither the marker nor the imported bytes exist, and either one would put the file in the
+	// working set.
+	assert!(
+		!db.query_working_set()
+			.unwrap()
+			.iter()
+			.any(|obj| matches!(obj, FfiObject::File(f) if f.stable_uuid == stable)),
+		"a call that never started may leave neither a marker nor bytes behind"
+	);
+	assert_eq!(pending_marker(&db, &file_path), None);
+	match db
+		.update_and_query_item(format!("stable/{stable}").into())
+		.await
+		.unwrap()
+		.unwrap()
+	{
+		FfiObject::File(f) => {
+			assert_eq!(
+				f.uuid, uuid_before,
+				"the server minted no new version, so the file is the one it was"
+			);
+			assert_eq!(f.size, file.size() as i64);
+		}
+		other => panic!("expected a file, got {other:?}"),
+	}
+
+	tokio::fs::remove_file(&external).await.ok();
 }

@@ -22,6 +22,7 @@ use tracing::debug;
 
 use crate::{
 	CacheError,
+	abort::{FfiAbortSignal, check_not_aborted, with_abort},
 	auth::{AuthCacheState, FilenMobileCacheState},
 	ffi::{
 		CreateFileResponse, DirWithPathResponse, DownloadResponse, FfiId, FfiObject,
@@ -158,10 +159,11 @@ impl FilenMobileCacheState {
 		&self,
 		id: FfiId,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
+		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<DownloadResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state
-				.download_file_if_changed_with_item(id, progress_callback)
+				.download_file_if_changed_with_item(id, progress_callback, abort)
 				.await
 		})
 		.await
@@ -177,15 +179,21 @@ impl FilenMobileCacheState {
 	///
 	/// A failed upload leaves the bytes in the cache and the edit marked, for
 	/// [`FilenMobileCacheState::retry_pending_uploads`] to deliver later.
+	///
+	/// `abort` cancels the upload, and only the upload: the bytes are already in the slot and the
+	/// edit already marked by then, and cancelling means "stop working now", never "undo the
+	/// edit". So an aborted call leaves exactly what a dropped connection leaves — marker set,
+	/// bytes in the slot, [`CacheError::Aborted`] — and the drain delivers it later.
 	pub async fn modify_file_content(
 		&self,
 		id: FfiId,
 		os_path: String,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
+		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<FileWithPathResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state
-				.modify_file_content(id, os_path, progress_callback)
+				.modify_file_content(id, os_path, progress_callback, abort)
 				.await
 		})
 		.await
@@ -244,7 +252,29 @@ impl FilenMobileCacheState {
 	) -> Result<FileWithPathResponse, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state
-				.upload_new_file(os_path, parent_path, info, progress_callback)
+				.upload_new_file(os_path, parent_path, info, progress_callback, None)
+				.await
+		})
+		.await
+	}
+
+	/// [`FilenMobileCacheState::upload_new_file`], cancellable.
+	///
+	/// A sibling rather than a parameter on the original, whose signature the shipped Android
+	/// bindings call. Aborting gives up on the upload, which may leave chunks on the server that
+	/// belong to no file — those the server collects — and never leaves a row here: nothing is
+	/// written until the upload has actually produced a file.
+	pub async fn upload_new_file_abortable(
+		&self,
+		os_path: String,
+		parent_path: FfiId,
+		info: UploadFileInfo,
+		progress_callback: Option<Arc<dyn ProgressCallback>>,
+		abort: Option<Arc<FfiAbortSignal>>,
+	) -> Result<FileWithPathResponse, CacheError> {
+		self.async_execute_authed_owned(async move |auth_state| {
+			auth_state
+				.upload_new_file(os_path, parent_path, info, progress_callback, abort)
 				.await
 		})
 		.await
@@ -475,7 +505,7 @@ impl AuthCacheState {
 	) -> Result<String, CacheError> {
 		debug!("Downloading file to path: {}", file_path.0);
 		let (old_file, file) = self.resolve_file_to_download(&file_path).await?;
-		self.inner_download_file_if_changed(old_file, file, progress_callback)
+		self.inner_download_file_if_changed(old_file, file, progress_callback, None)
 			.await
 	}
 
@@ -483,12 +513,16 @@ impl AuthCacheState {
 		&self,
 		id: FfiId,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
+		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<DownloadResponse, CacheError> {
 		debug!("Downloading file with item at: {}", id.0);
+		// Before the refresh below, which is already a server round trip: a call cancelled before
+		// it started must not go near the network at all.
+		check_not_aborted(abort.as_ref())?;
 		let (old_file, file) = self.resolve_file_to_download(&id).await?;
 		let uuid = file.uuid;
 		let path = self
-			.inner_download_file_if_changed(old_file, file, progress_callback)
+			.inner_download_file_if_changed(old_file, file, progress_callback, abort)
 			.await?;
 		// Re-read rather than answer from the row we walked in with: a download that finds the
 		// local bytes gone drops the pending-upload marker, and the item handed back must not
@@ -517,7 +551,7 @@ impl AuthCacheState {
 			.optional()?
 			.ok_or_else(|| CacheError::remote(format!("No file found with UUID: {uuid}")))?;
 		// unnecesssary clone but better than redownloading
-		self.inner_download_file_if_changed(Some(file.clone()), file, progress_callback)
+		self.inner_download_file_if_changed(Some(file.clone()), file, progress_callback, None)
 			.await
 	}
 
@@ -630,13 +664,22 @@ impl AuthCacheState {
 	/// bytes in the cache are the only copy of the user's edit, and the marker is what makes a
 	/// drain retry them instead of a later cache probe silently concluding there was nothing to
 	/// send.
+	///
+	/// Only the upload is abortable, and an abort there leaves the marker set and the new bytes in
+	/// the slot — the same state a crash leaves, and the state the drain exists to resolve. The
+	/// prefix that marks the edit and copies the bytes in is local and fast, and is not
+	/// interruptible: cancelling a save must never mean reverting one.
 	pub(crate) async fn modify_file_content(
 		&self,
 		id: FfiId,
 		os_path: String,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
+		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<FileWithPathResponse, CacheError> {
 		debug!("Modifying content of {} with the bytes at {os_path}", id.0);
+		// Ahead of the marker and the copy, so a call cancelled before it started leaves nothing
+		// of itself behind at all.
+		check_not_aborted(abort.as_ref())?;
 		let mut file = match self.select_object_by_id(&id)? {
 			Some(DBObject::File(file)) => file,
 			Some(_) => {
@@ -714,12 +757,14 @@ impl AuthCacheState {
 			});
 		}
 
-		let (remote_file, _new_uuid_guard) = self
-			.upload_marked_edit(&file, meta, &local_file_guard, progress_callback)
-			.await?;
-		// A failed upload returns above with the marker still set and the bytes still in the slot:
-		// that pair IS the record of an edit the server has not got, and the drain is what
-		// resolves it.
+		let (remote_file, _new_uuid_guard) = with_abort(
+			abort.as_ref(),
+			self.upload_marked_edit(&file, meta, &local_file_guard, progress_callback),
+		)
+		.await?;
+		// An upload that failed or was aborted returns above with the marker still set and the
+		// bytes still in the slot: that pair IS the record of an edit the server has not got, and
+		// the drain is what resolves it.
 		let mut file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 		// The upload renamed the slot under the uuid the server minted for this version, so the
 		// bytes belong to the row as it now stands.
@@ -903,7 +948,9 @@ impl AuthCacheState {
 		parent_path: FfiId,
 		info: UploadFileInfo,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
+		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<FileWithPathResponse, CacheError> {
+		check_not_aborted(abort.as_ref())?;
 		let os_path = PathBuf::from(os_path);
 		let name = info.name;
 		let parent_path = self.canonicalize_id(&parent_path)?.into_owned();
@@ -951,9 +998,15 @@ impl AuthCacheState {
 			builder.mime(mime);
 		}
 
-		let (remote_file, _) = self
-			.io_upload_file(os_path, builder, progress_callback)
-			.await?;
+		// The row below is the first and only trace this call leaves, and it is written from what
+		// the upload returned — so giving up on the upload cannot leave a row for a file that
+		// never came into being. The bytes are the caller's own file, not a cache slot, so there
+		// is nothing on disk here to leave half-done either.
+		let (remote_file, _) = with_abort(
+			abort.as_ref(),
+			self.io_upload_file(os_path, builder, progress_callback),
+		)
+		.await?;
 
 		let file = DBFile::upsert_from_remote(&mut self.conn(), remote_file)?;
 
@@ -1556,6 +1609,7 @@ impl AuthCacheState {
 		old_file: Option<DBFile>,
 		file: DBFile,
 		progress_callback: Option<Arc<dyn ProgressCallback>>,
+		abort: Option<Arc<FfiAbortSignal>>,
 	) -> Result<String, CacheError> {
 		let file: RemoteFile = file.try_into()?;
 		// Held for the whole check-then-download: without it a concurrent clear can delete the
@@ -1623,11 +1677,18 @@ impl AuthCacheState {
 			}
 		}
 
-		self.download_file_io(&file, progress_callback)
-			.await?
-			.into_os_string()
-			.into_string()
-			.map_err(|e| CacheError::conversion(format!("Failed to convert path to string: {e:?}")))
+		// Only the fetch is abortable, and it is drop-safe: the bytes land in the tmp directory and
+		// are renamed into the cache slot as the last thing a download does, so giving up leaves
+		// the slot exactly as it was — and the materialisation marker, written after that rename,
+		// unwritten.
+		with_abort(
+			abort.as_ref(),
+			self.download_file_io(&file, progress_callback),
+		)
+		.await?
+		.into_os_string()
+		.into_string()
+		.map_err(|e| CacheError::conversion(format!("Failed to convert path to string: {e:?}")))
 	}
 
 	async fn inner_move_item(

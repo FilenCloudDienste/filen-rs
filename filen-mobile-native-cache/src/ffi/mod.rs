@@ -378,7 +378,7 @@ pub struct FfiChanges {
 	pub more: bool,
 }
 
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Debug)]
 pub struct DownloadResponse {
 	pub path: String,
 	pub file: FfiFile,
