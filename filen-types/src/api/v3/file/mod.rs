@@ -4,6 +4,7 @@ pub mod link;
 pub mod metadata;
 pub mod r#move;
 pub mod restore;
+pub mod stable;
 pub mod trash;
 pub mod version;
 pub mod versions;

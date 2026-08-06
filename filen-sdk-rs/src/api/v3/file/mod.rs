@@ -4,6 +4,7 @@ pub(crate) mod link;
 pub(crate) mod metadata;
 pub(crate) mod r#move;
 pub(crate) mod restore;
+pub(crate) mod stable;
 pub(crate) mod trash;
 pub(crate) mod version;
 pub(crate) mod versions;

@@ -3,7 +3,7 @@ use std::{borrow::Cow, sync::Arc};
 use chrono::Utc;
 use filen_types::{
 	crypto::Blake3Hash,
-	fs::{ParentUuid, Uuid},
+	fs::{ParentUuid, StableUuid, Uuid},
 };
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
@@ -195,11 +195,44 @@ impl Client {
 
 	pub async fn get_file_with_info(&self, uuid: Uuid) -> Result<FileWithInfo, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
+		let versioned = response.versioned;
+		// The requested uuid, not `response.uuid`: for a superseded (archived) uuid the
+		// caller asked about THAT row, and the response's stable id is the lineage's.
+		let file = self.decrypt_file_response(uuid, response).await?;
+		Ok(FileWithInfo { file, versioned })
+	}
+
+	/// Fetch the CURRENT head of a file's lineage by its whole-life id. A file's `uuid` is
+	/// re-minted on every content edit, so this is the only way to follow a file across edits;
+	/// the returned file carries the head's (possibly new) uuid.
+	///
+	/// The `v3/file/stable` endpoint is not deployed yet — expect a server error until it is.
+	pub async fn get_file_by_stable_uuid(
+		&self,
+		stable_uuid: StableUuid,
+	) -> Result<RemoteFile, Error> {
+		let response = api::v3::file::stable::post(
+			self.client(),
+			&api::v3::file::stable::Request { stable_uuid },
+		)
+		.await?;
+		// The head's own uuid — the whole point of the by-stable fetch.
+		let uuid = response.uuid;
+		self.decrypt_file_response(uuid, response).await
+	}
+
+	/// Decrypt one single-file API response into a [`RemoteFile`] under `uuid`. Shared by the
+	/// by-uuid and by-stable-id fetches, which differ only in which uuid the row is filed under.
+	async fn decrypt_file_response(
+		&self,
+		uuid: Uuid,
+		response: api::v3::file::Response<'static>,
+	) -> Result<RemoteFile, Error> {
 		let meta = runtime::do_cpu_intensive(|| {
 			FileMeta::blocking_from_encrypted(response.metadata, &*self.crypter(), response.version)
 		})
 		.await;
-		let file = RemoteFile::from_meta(
+		Ok(RemoteFile::from_meta(
 			uuid,
 			// For a superseded (archived) uuid this is the lineage's stable id
 			// resolved from the live head — a single call recovers the file's
@@ -219,11 +252,7 @@ impl Client {
 			response.timestamp,
 			response.favorited,
 			meta,
-		);
-		Ok(FileWithInfo {
-			file,
-			versioned: response.versioned,
-		})
+		))
 	}
 
 	pub async fn file_exists(
