@@ -34,6 +34,9 @@ fn dir_meta_name<'a>(meta: &'a DirectoryMeta<'_>) -> Option<&'a str> {
 #[shared_test_runtime]
 async fn upload_avatar() {
 	let client = test_utils::RESOURCES.client().await;
+	// Held across before-fetch → upload → after-fetch: sibling CI legs share this account,
+	// so an unserialized concurrent avatar rotation breaks both asserts below.
+	let _lock = client.acquire_lock_with_default(LOCK_AVATAR).await.unwrap();
 	let before = client.get_user_info().await.unwrap();
 
 	let mut rng = rand::rng();
@@ -66,6 +69,8 @@ async fn upload_avatar() {
 const LOCK_VERSIONING: &str = "test:user-versioning";
 const LOCK_LOGIN_ALERTS: &str = "test:user-login-alerts";
 const LOCK_PERSONAL_INFO: &str = "test:user-personal-info";
+// Also held by socket_tests::chat around its contact-request avatar assertion.
+const LOCK_AVATAR: &str = "test:user-avatar";
 
 #[shared_test_runtime]
 async fn versioning_toggle_round_trip() {
