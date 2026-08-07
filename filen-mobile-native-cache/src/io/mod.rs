@@ -435,6 +435,85 @@ async fn cleanup_uuid_dir(auth_state: &AuthCacheState, dir_path: &Path) {
 	while (futures.next().await).is_some() {}
 }
 
+/// How long a staging file has to sit untouched before the sweep calls it wreckage.
+///
+/// Both writers of `tmp_dir/<uuid>` — [`AuthCacheState::download_file_io`] and
+/// [`AuthCacheState::io_import_cached_file`] — write into it for as long as they run, so its
+/// modification time tracks a live transfer. A day of no writes is far beyond anything the
+/// transfer itself can survive (the SDK gives up on a request that goes 300 s without bytes) and
+/// far beyond the ten-minute cleanup cadence, which is what keeps an in-flight download out of
+/// reach of this sweep with room to spare.
+const STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Removes staging files left behind by downloads and imports that died.
+///
+/// [`cleanup_uuid_dir`] cannot do this, and runs over the same directory: it deletes only the
+/// uuids the database does not know, while a download interrupted halfway staged its bytes under
+/// a uuid whose row is perfectly alive — so until now nothing reaped those short of a logout. Age
+/// is the only signal available here and it is enough, see [`STAGING_MAX_AGE`]. The two sweeps
+/// racing for one entry is fine: whichever loses sees `NotFound`.
+///
+/// No per-item lock, unlike the deleters: [`AuthCacheState::lock_local_file`] serialises writers
+/// of an item's *cache slot*, and a staging path is not one — it belongs to a single transfer for
+/// as long as that transfer runs, and the age bound is what excludes it.
+async fn remove_stale_staging(tmp_dir: &Path, max_age: Duration) {
+	let Ok(mut dir) = tokio::fs::read_dir(tmp_dir).await else {
+		tracing::warn!(
+			"Tried to sweep stale staging files in {}, but it does not exist.",
+			tmp_dir.display()
+		);
+		return;
+	};
+
+	let now = SystemTime::now();
+	loop {
+		let entry = match dir.next_entry().await {
+			Ok(Some(entry)) => entry,
+			Ok(None) => break,
+			Err(e) => {
+				error!("Failed to read directory {}: {}", tmp_dir.display(), e);
+				return;
+			}
+		};
+		let path = entry.path();
+		let meta = match entry.metadata().await {
+			Ok(meta) => meta,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+			Err(e) => {
+				error!("Failed to get metadata for {}: {}", path.display(), e);
+				continue;
+			}
+		};
+		// A timestamp that cannot be read, or one in the future, counts as young: leaving
+		// wreckage behind costs a file until the next pass, taking a live staging copy costs a
+		// transfer.
+		let too_old = meta
+			.modified()
+			.ok()
+			.and_then(|modified| now.duration_since(modified).ok())
+			.is_some_and(|age| age >= max_age);
+		if !too_old {
+			continue;
+		}
+		// Only files are ever staged here; anything else is wreckage of a different kind, and
+		// removing it as a file would fail on every pass forever.
+		let removed = if meta.is_dir() {
+			tokio::fs::remove_dir_all(&path).await
+		} else {
+			tokio::fs::remove_file(&path).await
+		};
+		match removed {
+			Ok(_) => trace!("Removed stale staging entry: {}", path.display()),
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+			Err(e) => error!(
+				"Failed to remove stale staging entry {}: {}",
+				path.display(),
+				e
+			),
+		}
+	}
+}
+
 async fn next_entry_filter_icloud_files(
 	dir: &mut tokio::fs::ReadDir,
 ) -> io::Result<Option<tokio::fs::DirEntry>> {
@@ -661,6 +740,7 @@ impl AuthCacheState {
 		futures::join!(
 			cleanup_uuid_dir(self, &self.cache_dir),
 			cleanup_uuid_dir(self, &self.tmp_dir),
+			remove_stale_staging(&self.tmp_dir, STAGING_MAX_AGE),
 			remove_old_cache_files(&self.cache_dir, self.cache_file_budget,),
 			remove_old_thumbnails(&self.thumbnail_dir, self.thumbnail_file_budget,),
 			cleanup_uuid_dir(self, &self.thumbnail_dir)
@@ -759,5 +839,55 @@ impl FilenMobileCacheState {
 		crate::env::get_runtime().spawn(async move {
 			cache.cleanup_cache_if_necessary().await;
 		});
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A staging file whose last write was `age` ago. Backdating the timestamp is what makes this
+	/// deterministic — the alternative is waiting out the threshold on the real clock.
+	fn stage(dir: &Path, name: &str, age: Duration) -> PathBuf {
+		let path = dir.join(name);
+		let file = std::fs::File::create(&path).unwrap();
+		file.set_times(FileTimes::new().set_modified(SystemTime::now() - age))
+			.unwrap();
+		path
+	}
+
+	/// The hole this closes: a download that died left `tmp/<uuid>` behind, and the only sweep
+	/// over that directory removes uuids the database does NOT know — so a staging file belonging
+	/// to a perfectly live row was reaped by nothing at all. Both names below are exactly that
+	/// case, which is why the sweep never asks the database: age decides, and age alone is what
+	/// keeps a transfer in flight out of it.
+	#[tokio::test]
+	async fn a_stale_staging_file_goes_and_one_still_being_written_stays() {
+		let dir = std::env::temp_dir().join(format!("filen-staging-sweep-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let abandoned = stage(
+			&dir,
+			"00000000-0000-0000-0000-000000000001",
+			STAGING_MAX_AGE + Duration::from_secs(60),
+		);
+		let in_flight = stage(
+			&dir,
+			"00000000-0000-0000-0000-000000000002",
+			Duration::from_secs(30),
+		);
+
+		remove_stale_staging(&dir, STAGING_MAX_AGE).await;
+
+		assert!(
+			!abandoned.exists(),
+			"a staging file nothing has touched in a day is wreckage, row or no row"
+		);
+		assert!(
+			in_flight.exists(),
+			"a download writing right now must survive the sweep"
+		);
+
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }
