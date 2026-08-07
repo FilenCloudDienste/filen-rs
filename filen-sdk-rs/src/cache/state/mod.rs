@@ -1324,40 +1324,65 @@ impl CacheState {
 	}
 
 	/// Apply the freshly-fetched heads of the tracked file roots, in one transaction, dispatching
-	/// post-commit like every other apply. A head is applied as a `Changed` — unconditionally, with
-	/// no fingerprint comparison: a resync is rare and re-notifying a handful of tracked files is
-	/// far cheaper than a diff pass for each. `TrustedSynthetic`, because the fetch resolved the
-	/// lineage the root is registered for, so membership holds by construction.
+	/// post-commit like every other apply. A LIVE head is applied as a `Changed` — unconditionally,
+	/// with no fingerprint comparison: a resync is rare and re-notifying a handful of tracked files
+	/// is far cheaper than a diff pass for each. A TRASHED head is applied as the `Trashed` the
+	/// socket path would have delivered had we been listening. `TrustedSynthetic`, because the
+	/// fetch resolved the lineage the root is registered for, so membership holds by construction.
 	fn apply_file_root_heads(&mut self, heads: Vec<RemoteFile>) -> Result<(), Box<CacheError>> {
 		if heads.is_empty() {
 			return Ok(());
 		}
 		let db_err = |e: rusqlite::Error, what: &str| Box::new(CacheError::db(e, what.to_string()));
+		// A TRASHED head is the removal a `fileTrash` already is — the trash just happened while we
+		// were not listening. Its parent is the trash, so `CacheableFile::try_from` would reject it
+		// (`ParentNotUuid`) and the head would be DROPPED into the error bucket, leaving the engine
+		// (and search) serving the live pre-trash row until someone browses its parent. Feed the
+		// socket path's own event instead — `new_uuid: None`, because the head IS the lineage's
+		// current state, not a superseding edit — and let the shared apply/dispatch do the rest:
+		// the rows go, the registration stays (a trash is restorable, and a later restored head
+		// comes back through the `Changed` arm below), the root's owners are told.
+		let (trashed, live): (Vec<RemoteFile>, Vec<RemoteFile>) =
+			heads.into_iter().partition(|head| head.parent.is_trash());
 		let mut errors = Vec::new();
-		let (_, files) = convert_listing(Vec::new(), heads, &mut errors);
+		let (_, files) = convert_listing(Vec::new(), live, &mut errors);
 		if !errors.is_empty() {
 			self.surface_errors(errors);
 		}
-		if files.is_empty() {
+		if files.is_empty() && trashed.is_empty() {
 			return Ok(());
 		}
 		self.db
 			.execute_batch("BEGIN")
 			.map_err(|e| db_err(e, "begin file-root refresh"))?;
 		let mut dispatch_buffer: Vec<DispatchEntry> = Vec::new();
-		for file in files {
-			let event = CacheEvent {
-				id: None,
-				event: CacheEventType::File(FileEvent::Changed(file)),
-			};
+		let events = trashed
+			.into_iter()
+			.map(|head| {
+				CacheEventType::File(FileEvent::Trashed {
+					uuid: head.uuid,
+					stable_uuid: head.stable_uuid,
+					new_uuid: None,
+				})
+			})
+			.chain(
+				files
+					.into_iter()
+					.map(|file| CacheEventType::File(FileEvent::Changed(file))),
+			);
+		for event in events {
+			let event = CacheEvent { id: None, event };
 			let event_for_dispatch = Arc::new(event.clone());
+			// Cheap for the `Changed` heads (no pre-snapshot target → no query); the `Trashed` ones
+			// need it to reach the dir root the file is being removed from.
+			let pre = self.pre_snapshot(&event.event);
 			if let Err(errors) = self.apply_event(event.event, EventTrust::TrustedSynthetic) {
 				let _ = self.db.execute_batch("ROLLBACK");
 				self.surface_errors(errors);
 				self.mark_needs_resync_surfacing_errors();
 				return Ok(());
 			}
-			let owners = self.resolve_dispatch_owners(&event_for_dispatch, PreSnapshot::default());
+			let owners = self.resolve_dispatch_owners(&event_for_dispatch, pre);
 			if !owners.is_empty() {
 				dispatch_buffer.push((event_for_dispatch, owners));
 			}

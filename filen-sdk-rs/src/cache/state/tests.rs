@@ -3,6 +3,7 @@ use crate::cache::sql::columns::{
 	FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE,
 	PRAGMA_SYNCHRONOUS,
 };
+use filen_types::fs::ParentUuid;
 
 /// Unit constructors have no resync deps, so these futures never touch the network — a minimal
 /// current-thread runtime suffices.
@@ -3106,4 +3107,140 @@ fn resync_synthetics_dispatch_to_the_owning_file_root() {
 		"the file root is notified of its own refreshed record: {seen:?}"
 	);
 	assert!(item_exists(&state, file.uuid));
+}
+
+/// The head `get_file_by_stable_uuid` returns for `file`, filed under `parent`. A TRASHED lineage's
+/// head carries `ParentUuid::Trash` — that is how `decrypt_file_response` renders the response's
+/// `trash` flag.
+fn head_of(file: &CacheableFile<'_>, parent: ParentUuid) -> RemoteFile {
+	use std::borrow::Cow;
+
+	use crate::fs::file::meta::{DecryptedFileMeta, FileMeta};
+
+	RemoteFile {
+		uuid: file.uuid,
+		stable_uuid: file.stable_uuid,
+		parent,
+		size: file.size,
+		favorited: file.favorited,
+		region: file.region.to_string(),
+		bucket: file.bucket.to_string(),
+		timestamp: file.timestamp,
+		chunks: file.chunks,
+		meta: FileMeta::Decoded(DecryptedFileMeta {
+			name: Cow::Owned(file.name.to_string()),
+			size: file.size,
+			mime: Cow::Owned(file.mime.to_string()),
+			key: file.key,
+			last_modified: file.last_modified,
+			created: file.created,
+			hash: file.hash,
+		}),
+	}
+}
+
+/// A file trashed while the engine was down comes back from the resync's head fetch with its parent
+/// set to the TRASH — which is not a cacheable parent. It must be applied as the removal it is
+/// (exactly what the socket path's `fileTrash` does), not dropped as a conversion error: dropping it
+/// leaves the pre-trash row live, so search keeps handing out a file that is in the trash.
+#[test]
+fn a_trashed_file_root_head_removes_the_lineage() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	state
+		.apply_file_root_heads(vec![head_of(&file, ParentUuid::Trash(state.root_uuid))])
+		.unwrap();
+
+	assert!(
+		!item_exists(&state, file.uuid),
+		"the trashed lineage's row is gone, so search cannot return it"
+	);
+	assert!(
+		state.file_roots.contains_key(&file.stable_uuid),
+		"a trash is restorable — the registration is the handle owner's to retire"
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(seen.len(), 1, "the root is told exactly once: {seen:?}");
+	assert!(
+		seen[0].contains("Trashed"),
+		"and it is the socket path's own trash event: {seen:?}"
+	);
+}
+
+/// Regression for the above: a LIVE head still applies as a `Changed`, refreshing the cached row.
+/// And a head that comes back live AFTER a trash restores the lineage, through that same arm.
+#[test]
+fn a_live_file_root_head_still_applies_as_a_change() {
+	let mut state = CacheState::new_in_memory();
+	state.set_test_sync_roots(HashMap::new());
+	let file = cache_file(10, state.root_uuid, 100);
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_file_roots(HashMap::from([(file.stable_uuid, callback)]));
+
+	// Trash it, then hand back the same head live again — a restore.
+	state
+		.apply_file_root_heads(vec![head_of(&file, ParentUuid::Trash(state.root_uuid))])
+		.unwrap();
+	assert!(!item_exists(&state, file.uuid));
+
+	let mut edited = file.clone();
+	edited.size += 7;
+	state
+		.apply_file_root_heads(vec![head_of(&edited, ParentUuid::Uuid(state.root_uuid))])
+		.unwrap();
+
+	assert!(
+		item_exists(&state, file.uuid),
+		"the restored lineage is cached again"
+	);
+	assert_eq!(
+		file_size(&state, file.uuid),
+		edited.size as i64,
+		"with the head's content"
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(seen.len(), 2, "one event per head: {seen:?}");
+	assert!(
+		seen[1].contains("Changed"),
+		"the live head is a change, not a trash: {seen:?}"
+	);
+}
+
+/// Pins what a trashed head does for a lineage that is NOT a tracked file root — which the head
+/// fetch never produces (it only fetches registered lineages), but the apply must still be sane
+/// about: the stale row is deleted and the DIR root that held the file hears about it, resolved from
+/// the pre-apply parent snapshot. No file-root registration is invented.
+#[test]
+fn a_trashed_head_for_an_untracked_lineage_still_removes_the_stale_row() {
+	let mut state = CacheState::new_in_memory();
+	let dir = cache_dir(1, state.root_uuid);
+	let file = cache_file(10, dir.uuid, 100);
+	state.upsert_dirs(once(&dir)).unwrap();
+	state.upsert_files(once(&file)).unwrap();
+	let (seen, callback) = recording_callback();
+	state.set_test_sync_roots(HashMap::from([(dir.uuid, callback)]));
+	state.set_test_file_roots(HashMap::new());
+
+	state
+		.apply_file_root_heads(vec![head_of(&file, ParentUuid::Trash(dir.uuid))])
+		.unwrap();
+
+	assert!(!item_exists(&state, file.uuid), "the stale row is gone");
+	assert!(
+		state.file_roots.is_empty(),
+		"no registration is invented for an untracked lineage"
+	);
+	let seen = seen.lock().unwrap();
+	assert_eq!(
+		seen.len(),
+		1,
+		"the dir root that held the file is told once: {seen:?}"
+	);
+	assert!(seen[0].contains("Trashed"), "{seen:?}");
 }

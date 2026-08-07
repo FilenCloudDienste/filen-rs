@@ -1548,3 +1548,61 @@ async fn test_cache_file_sync_root_follows_an_edit() {
 		"the superseded uuid is retired"
 	);
 }
+/// A tracked file TRASHED while the cache was closed. No socket event for it will ever be
+/// delivered, so the reopen's by-stable head fetch is the only thing that can notice — and what it
+/// gets back is a head parented to the TRASH. That head is the removal a `fileTrash` would have
+/// been had we been listening: the cached row has to go, or the engine (and search, which reads
+/// those same rows) keeps handing out a file that is in the trash until somebody browses its
+/// parent. Registered ALONE — no dir root covers the file — so nothing but the head can populate
+/// the row in session 1, and nothing but the head can remove it in session 2.
+#[shared_test_runtime]
+async fn test_cache_file_root_trashed_while_offline_is_removed_on_reopen() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
+	let test_dir = &resources.dir;
+	let path = temp_cache_path();
+	client.configure_cache(path.clone(), |_| {}).await.unwrap();
+
+	let mut file = client
+		.upload_file(
+			client
+				.make_file_builder("file_root_offline_trash.txt", test_dir.uuid())
+				.unwrap(),
+			b"trash me while nobody is listening",
+		)
+		.await
+		.unwrap();
+
+	// Session 1: the convergence fetch populates the tracked lineage.
+	{
+		let _handle = client
+			.clone()
+			.add_file_sync_root(file.stable_uuid(), noop_sync_root_callback())
+			.await
+			.unwrap();
+		assert!(
+			poll_for_item(&path, file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+			"the convergence fetch populates the tracked file (nothing else can)"
+		);
+	}
+	client.flush_cache().await; // clean flush + join before reopening the same DB file
+
+	// Trashed with nobody listening.
+	client.trash_file(&mut file).await.unwrap();
+
+	// Session 2: same DB, same lineage. Re-adding the file root respawns the worker and converges.
+	{
+		let _handle = client
+			.clone()
+			.add_file_sync_root(file.stable_uuid(), noop_sync_root_callback())
+			.await
+			.unwrap();
+		assert!(
+			poll_for_item_absent(&path, file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+			"a trashed head must resync as the removal it is, not be dropped as a bad parent"
+		);
+	}
+	client.flush_cache().await;
+
+	client.delete_file_permanently(file).await.unwrap();
+}
