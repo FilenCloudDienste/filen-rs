@@ -22,6 +22,7 @@ use crate::{
 	util::PeekableReceiver,
 };
 use filen_types::{fs::StableUuid, traits::CowHelpers};
+use futures::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
@@ -1410,16 +1411,26 @@ impl CacheState {
 		client: &Arc<Client>,
 		file_roots: &[StableUuid],
 	) -> FileRootHeads {
+		// The fetches are independent single-record requests and nothing here touches state, so
+		// they run concurrently — serially, a large working set would pay one full round trip per
+		// lineage (and at the locked call site, hold the drive lock for all of them). The cap is
+		// the same one the other small-metadata fan-out uses (`dir_upload`); completion order is
+		// irrelevant, the heads are applied as a batch afterwards.
 		let mut fetched = FileRootHeads {
 			heads: Vec::with_capacity(file_roots.len()),
 			deleted: Vec::new(),
 		};
-		for stable in file_roots {
-			match client.get_file_by_stable_uuid(*stable).await {
+		let mut results =
+			futures::stream::iter(file_roots.iter().map(|stable| async move {
+				(*stable, client.get_file_by_stable_uuid(*stable).await)
+			}))
+			.buffer_unordered(crate::consts::MAX_SMALL_PARALLEL_REQUESTS);
+		while let Some((stable, result)) = results.next().await {
+			match result {
 				Ok(file) => fetched.heads.push(file),
 				Err(e) if matches!(e.kind(), ErrorKind::FileNotFound) => {
 					tracing::warn!("resync: file root {stable} no longer exists ({e}); reaping it");
-					fetched.deleted.push(*stable);
+					fetched.deleted.push(stable);
 				}
 				Err(e) => {
 					tracing::debug!("resync: skipping file root {stable} (fetch failed: {e})");
