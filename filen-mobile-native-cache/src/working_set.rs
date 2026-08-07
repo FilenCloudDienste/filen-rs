@@ -178,8 +178,15 @@ async fn register_planned(
 	// itself, so no configuration is needed. Best-effort — the engine skips the eviction when a
 	// dir root still covers the file or another registration keeps the lineage live, and a
 	// failure just leaves the row the way every departure left it before evictions existed.
-	for (stable, handle) in plan.to_evict {
-		match handle.evict().await {
+	// Concurrent for the same reason the adds below are: one control burst, not one per ack.
+	for (stable, result) in futures::future::join_all(
+		plan.to_evict
+			.into_iter()
+			.map(|(stable, handle)| async move { (stable, handle.evict().await) }),
+	)
+	.await
+	{
+		match result {
 			Ok(evicted) => {
 				tracing::debug!(
 					?stable,
@@ -203,21 +210,28 @@ async fn register_planned(
 			tracing::debug!(?messages, "sdk cache status");
 		})
 		.await;
-	let mut registered = Vec::with_capacity(plan.to_add.len());
+	// Registered CONCURRENTLY, and deliberately uncapped: these are in-process control-channel
+	// sends plus oneshot acks, not HTTP — the network fan-out they trigger is already capped
+	// downstream (`fetch_file_root_heads`). Concurrency here is not about latency: the worker
+	// acks each add inside the handler and runs AT MOST ONE resync per control BURST, and each
+	// resync fetches the head of EVERY registered file root. Awaiting each ack lands every add
+	// in its own burst — a cold start's N registrations then cost N resyncs and O(N²) head
+	// fetches. Sent together they drain as one burst and converge in a single pass (two at
+	// worst: a straggler aborts an in-flight resync's lock wait and joins the next).
+	let results = futures::future::join_all(plan.to_add.into_iter().map(|stable| {
+		let client = plan.client.clone();
+		let callback = tracked_file_callback(plan.sender.clone());
+		async move { (stable, client.add_file_sync_root(stable, callback).await) }
+	}))
+	.await;
+	let mut registered = Vec::with_capacity(results.len());
 	let mut failure = None;
-	for stable in plan.to_add {
-		match plan
-			.client
-			.clone()
-			.add_file_sync_root(stable, tracked_file_callback(plan.sender.clone()))
-			.await
-		{
+	for (stable, result) in results {
+		match result {
 			Ok(handle) => registered.push((stable, handle)),
-			Err(e) => {
-				// Install what did register before reporting: the rest is the next refresh's job.
-				failure = Some(e);
-				break;
-			}
+			// Install everything that registered before reporting the first failure: the
+			// missing ones are the next refresh's job.
+			Err(e) => failure = failure.or(Some(e)),
 		}
 	}
 	{
