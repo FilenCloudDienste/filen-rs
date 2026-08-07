@@ -13,7 +13,9 @@ fn get_testing_credentials() -> (String, String) {
 async fn test_serialize_deserialize_auth_config() {
 	let original_client = test_utils::RESOURCES.client().await;
 	let serialized = filen_cli::serialize_auth_config(&original_client).unwrap();
-	let deserialized_client = filen_cli::deserialize_auth_config(&serialized).unwrap();
+	let deserialized_client =
+		filen_cli::deserialize_auth_config(&serialized, &filen_cli::ClientConfigArgs::default())
+			.unwrap();
 	assert_eq!(original_client.email(), deserialized_client.email());
 }
 

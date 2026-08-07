@@ -19,10 +19,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use filen_cli::{deserialize_auth_config, serialize_auth_config};
+use filen_cli::{ClientConfigArgs, deserialize_auth_config, serialize_auth_config};
 use filen_sdk_rs::{
 	ErrorKind,
-	auth::{Client, http::ClientConfig, unauth::UnauthClient},
+	auth::{Client, unauth::UnauthClient},
 };
 
 use crate::{CliConfig, ui::UI, util::LongKeyringEntry};
@@ -36,6 +36,7 @@ pub(crate) enum LazyClient {
 		password_arg: Option<String>,
 		auth_config_path_arg: Option<String>,
 		two_factor_code_arg: Option<String>,
+		client_config_args: ClientConfigArgs,
 	},
 	Authenticated {
 		client: Arc<Client>,
@@ -49,6 +50,7 @@ impl LazyClient {
 		password_arg: Option<String>,
 		two_factor_code_arg: Option<String>,
 		auth_config_path_arg: Option<String>,
+		client_config_args: ClientConfigArgs,
 	) -> Self {
 		Self::Unauthenticated {
 			config,
@@ -56,6 +58,7 @@ impl LazyClient {
 			password_arg,
 			two_factor_code_arg,
 			auth_config_path_arg,
+			client_config_args,
 		}
 	}
 
@@ -68,6 +71,7 @@ impl LazyClient {
 				password_arg,
 				auth_config_path_arg,
 				two_factor_code_arg,
+				client_config_args,
 			} => {
 				let client = authenticate_and_get_password(
 					config,
@@ -76,6 +80,7 @@ impl LazyClient {
 					password_arg.as_deref(),
 					two_factor_code_arg.as_deref(),
 					auth_config_path_arg.as_deref(),
+					client_config_args,
 				)
 				.await?;
 				client
@@ -110,14 +115,21 @@ pub(crate) async fn authenticate_and_get_password(
 	password_arg: Option<&str>,
 	two_factor_code_arg: Option<&str>,
 	auth_config_path_arg: Option<&str>,
+	client_config_args: &ClientConfigArgs,
 ) -> Result<Client> {
-	if let Some(client) =
-		authenticate_from_cli_args(ui, email_arg, password_arg, two_factor_code_arg).await?
+	if let Some(client) = authenticate_from_cli_args(
+		ui,
+		email_arg,
+		password_arg,
+		two_factor_code_arg,
+		client_config_args,
+	)
+	.await?
 	{
 		log::info!("Authenticated from CLI arguments");
 		Ok(client)
 	} else if let Some((client, export_path)) =
-		authenticate_from_auth_config(config, auth_config_path_arg)?
+		authenticate_from_auth_config(config, auth_config_path_arg, client_config_args)?
 	{
 		log::info!(
 			"Authenticated from auth config file {}",
@@ -125,15 +137,15 @@ pub(crate) async fn authenticate_and_get_password(
 		);
 		Ok(client)
 	} else {
-		match authenticate_from_keyring().await {
+		match authenticate_from_keyring(client_config_args).await {
 			Ok(Some(client)) => {
 				log::info!("Authenticated from keyring");
 				Ok(client)
 			}
-			Ok(None) => authenticate_from_prompt(config, ui).await,
+			Ok(None) => authenticate_from_prompt(config, ui, client_config_args).await,
 			Err(e) => {
 				log::warn!("Failed to authenticate from keyring: {:?}", e);
-				authenticate_from_prompt(config, ui).await
+				authenticate_from_prompt(config, ui, client_config_args).await
 			}
 		}
 	}
@@ -144,8 +156,10 @@ async fn login_and_optionally_prompt_two_factor_code(
 	email: String,
 	password: &str,
 	two_factor_code: Option<&str>,
+	client_config_args: &ClientConfigArgs,
 ) -> Result<Client> {
-	let unauth_client = UnauthClient::from_config(ClientConfig::default())?;
+	let unauth_client =
+		UnauthClient::from_config(filen_cli::build_client_config(client_config_args))?;
 
 	match unauth_client
 		.login(email.clone(), password, two_factor_code.unwrap_or("XXXXXX"))
@@ -178,6 +192,7 @@ async fn authenticate_from_cli_args(
 	email_arg: Option<String>,
 	password_arg: Option<&str>,
 	two_factor_code_arg: Option<&str>,
+	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<Client>> {
 	if email_arg.is_none() && password_arg.is_none() && two_factor_code_arg.is_none() {
 		return Ok(None);
@@ -187,6 +202,7 @@ async fn authenticate_from_cli_args(
 		email_arg.context("Email is required")?,
 		password_arg.context("Password is required")?,
 		two_factor_code_arg,
+		client_config_args,
 	)
 	.await?;
 	Ok(Some(client))
@@ -199,6 +215,7 @@ async fn authenticate_from_cli_args(
 fn authenticate_from_auth_config(
 	config: &CliConfig,
 	path_arg: Option<&str>,
+	client_config_args: &ClientConfigArgs,
 ) -> Result<Option<(Client, PathBuf)>> {
 	let auth_config_paths = if let Some(path) = path_arg {
 		vec![PathBuf::from(path)]
@@ -210,7 +227,10 @@ fn authenticate_from_auth_config(
 			let sdk_config = std::fs::read_to_string(&path).with_context(|| {
 				format!("Failed to read auth config file from {}", path.display())
 			})?;
-			return Ok(Some((deserialize_auth_config(&sdk_config)?, path)));
+			return Ok(Some((
+				deserialize_auth_config(&sdk_config, client_config_args)?,
+				path,
+			)));
 		}
 	}
 	Ok(None)
@@ -233,7 +253,9 @@ pub(crate) fn get_auth_config_default_locations(config: &CliConfig) -> Vec<PathB
 const KEYRING_SDK_CONFIG_NAME: &str = "sdk-config";
 
 /// Authenticate using SDK config stored in the keyring.
-async fn authenticate_from_keyring() -> Result<Option<Client>> {
+async fn authenticate_from_keyring(
+	client_config_args: &ClientConfigArgs,
+) -> Result<Option<Client>> {
 	if std::env::var("FILEN_CLI_TESTING_DISABLE_KEYRING") == Ok("1".to_string()) {
 		return Ok(None);
 	}
@@ -243,11 +265,18 @@ async fn authenticate_from_keyring() -> Result<Option<Client>> {
 	let Some(sdk_config) = sdk_config else {
 		return Ok(None);
 	};
-	Ok(Some(deserialize_auth_config(&sdk_config)?))
+	Ok(Some(deserialize_auth_config(
+		&sdk_config,
+		client_config_args,
+	)?))
 }
 
 /// Authenticate using credentials provided interactively.
-async fn authenticate_from_prompt(config: &CliConfig, ui: &mut UI) -> Result<Client> {
+async fn authenticate_from_prompt(
+	config: &CliConfig,
+	ui: &mut UI,
+	client_config_args: &ClientConfigArgs,
+) -> Result<Client> {
 	let email = ui.prompt("Email:")?;
 	let password = ui.prompt_password("Password: ")?;
 	let client = login_and_optionally_prompt_two_factor_code(
@@ -255,6 +284,7 @@ async fn authenticate_from_prompt(config: &CliConfig, ui: &mut UI) -> Result<Cli
 		email.trim().to_string(),
 		password.trim(),
 		None,
+		client_config_args,
 	)
 	.await?;
 

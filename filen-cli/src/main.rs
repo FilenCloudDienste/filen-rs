@@ -7,7 +7,7 @@
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
 
-use std::{fs, path::PathBuf};
+use std::{fs, num::NonZeroU32, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -70,6 +70,30 @@ pub(crate) struct CliArgs {
 	/// Path to auth config file (exported via `filen export-auth-config`)
 	#[arg(long)]
 	auth_config_path: Option<String>,
+
+	/// Limit concurrent API connections
+	#[arg(long)]
+	concurrency: Option<usize>,
+
+	/// Maximum number of API requests per second
+	#[arg(long)]
+	requests_per_sec: Option<NonZeroU32>,
+
+	/// Cap upload bandwidth, in kilobytes per second
+	#[arg(long)]
+	upload_bandwidth_kbps: Option<NonZeroU32>,
+
+	/// Cap download bandwidth, in kilobytes per second
+	#[arg(long)]
+	download_bandwidth_kbps: Option<NonZeroU32>,
+
+	/// Memory budget for file I/O, in bytes
+	#[arg(long)]
+	memory_budget_bytes: Option<usize>,
+
+	/// Connection timeout
+	#[arg(long)]
+	connect_timeout: Option<u64>,
 
 	/// Skip checking for updates
 	#[arg(long)]
@@ -236,12 +260,22 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		.await?;
 	}
 
+	let client_config_args = filen_cli::ClientConfigArgs {
+		concurrency: cli_args.concurrency,
+		requests_per_sec: cli_args.requests_per_sec,
+		upload_bandwidth_kbps: cli_args.upload_bandwidth_kbps,
+		download_bandwidth_kbps: cli_args.download_bandwidth_kbps,
+		memory_budget_bytes: cli_args.memory_budget_bytes,
+		connect_timeout_secs: cli_args.connect_timeout,
+	};
+
 	let mut client = auth::LazyClient::new(
 		config.clone(),
 		cli_args.email,
 		cli_args.password,
 		cli_args.two_factor_code,
 		cli_args.auth_config_path,
+		client_config_args,
 	);
 
 	let mut working_path = RemotePath::new("");
