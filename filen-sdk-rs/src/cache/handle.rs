@@ -1,7 +1,8 @@
 use std::{
-	path::PathBuf,
+	collections::HashMap,
+	path::{Path, PathBuf},
 	sync::{
-		Arc, Weak,
+		Arc, LazyLock, Weak,
 		atomic::{AtomicU64, Ordering},
 	},
 	time::Duration,
@@ -141,6 +142,8 @@ impl CacheSlot {
 /// loop treats as a clean shutdown (drain, close the DB, exit); dropping `listener_handle` then
 /// unregisters the socket listener.
 pub(crate) struct CacheWorkerShared {
+	/// This worker's key in [`LIVE_WORKERS`] — the canonicalized path of the SQLite DB it owns.
+	db_path: PathBuf,
 	control_sender: UnboundedSender<CacheControlMessage>,
 	manual_event_sender: tokio::sync::mpsc::Sender<CacheThreadEvent>,
 	/// Ships search read queries to the worker's connection — the WASM read path (no WAL, no
@@ -151,6 +154,76 @@ pub(crate) struct CacheWorkerShared {
 	/// takes it — inert handles outliving a flush must not keep the websocket subscribed (and
 	/// decrypting every drive event) for a dead worker.
 	listener_handle: std::sync::Mutex<Option<ListenerHandle>>,
+}
+
+/// Every live cache worker in this PROCESS, keyed by the DB it owns. Weak on purpose: the registry
+/// must never extend a worker's life — the [`SyncRootHandle`]s stay its only owners.
+///
+/// Each [`Client`] has its own [`CacheSlot`], so without this two `Client`s configured on the SAME
+/// database (two file-provider instances overlapping across a replacement, or several domains
+/// hosted in one process) would each spawn a worker: two socket consumers and two writers on one
+/// `events` table, each advancing the one drive watermark past events the other never applied.
+/// Acquisition JOINs instead — the engine already holds many `(registration_id, callback)` pairs
+/// per root, so sharing costs the joiner nothing.
+///
+/// A joined worker keeps its FIRST creator's `Client`. Fine today: every instance authenticates
+/// the same account from one shared auth file — revisit if per-instance auth can ever diverge.
+/// Multi-account is a per-domain `db_dir` away, and needs nothing here: distinct paths key distinct
+/// entries, so distinct domains get distinct workers for free.
+///
+/// Lock discipline: a LEAF lock, never held across an await or a call into a worker.
+static LIVE_WORKERS: LazyLock<std::sync::Mutex<HashMap<PathBuf, Weak<CacheWorkerShared>>>> =
+	LazyLock::new(Default::default);
+
+fn live_workers() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Weak<CacheWorkerShared>>> {
+	LIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The registry key for a configured cache path: the DB's file name under its CANONICALIZED PARENT.
+/// Canonicalizing the parent rather than the file itself is what makes the key stable before the DB
+/// exists — the first spawn runs on a path with no file yet, and its key must equal the one a later
+/// joiner computes. An unresolvable parent falls back to the path as given (such spellings then
+/// simply don't join, i.e. today's behavior).
+fn registry_key(path: &Path) -> PathBuf {
+	// wasm has no filesystem: the path names the wasm VFS's store, already canonical.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+		&& let Ok(dir) = std::fs::canonicalize(parent)
+	{
+		return dir.join(name);
+	}
+	path.to_path_buf()
+}
+
+/// The live worker on `key`, if there is one. A dead entry is REMOVED on the way, never handed
+/// back — the caller spawns a fresh worker and registers it.
+fn join_live_worker(key: &Path) -> Option<Arc<CacheWorkerShared>> {
+	let mut workers = live_workers();
+	match workers.get(key).and_then(Weak::upgrade) {
+		Some(shared) => Some(shared),
+		None => {
+			workers.remove(key);
+			None
+		}
+	}
+}
+
+fn register_worker(shared: &Arc<CacheWorkerShared>) {
+	live_workers().insert(shared.db_path.clone(), Arc::downgrade(shared));
+}
+
+/// Forget a worker that has been told to stop ([`Client::flush_cache`]) or found dead
+/// ([`Client::mark_worker_stale`]) so no other `Client` can join it: inert handles may still hold
+/// strong references, which would keep its `Weak` looking alive. A NEWER entry for the same path (a
+/// concurrent respawn) is left intact.
+fn unregister_worker(shared: &Arc<CacheWorkerShared>) {
+	let mut workers = live_workers();
+	if workers
+		.get(&shared.db_path)
+		.is_some_and(|worker| worker.ptr_eq(&Arc::downgrade(shared)))
+	{
+		workers.remove(&shared.db_path);
+	}
 }
 
 /// Sends `true` on the paired watch channel when dropped — the worker's exit signal, guaranteed
@@ -363,6 +436,9 @@ impl Client {
 					.unwrap_or_else(|e| e.into_inner())
 					.take(),
 			);
+			// And take it out of the process registry: no other `Client` may join a worker we just
+			// told to stop, even while inert handles still hold strong references to it.
+			unregister_worker(&shared);
 		}
 		slot.worker = Weak::new();
 		// Cancel-safe deterministic wait under the slot lock: a concurrent `add_sync_root` cannot
@@ -385,12 +461,24 @@ impl Client {
 		if let Some(shared) = slot.worker.upgrade() {
 			return Ok(shared);
 		}
+		// Another `Client` in this process may already run a worker on this DB — join it rather
+		// than spawn a second one onto the same database (see [`LIVE_WORKERS`]).
+		let key = registry_key(&config.path);
+		if let Some(shared) = join_live_worker(&key) {
+			slot.worker = Arc::downgrade(&shared);
+			return Ok(shared);
+		}
 		// The previous worker (if any) is gone or on its way out — its senders are dropped or
 		// stale. Wait for it to fully exit and reap it, so the SQLite file is guaranteed closed
-		// before the new worker reopens it.
+		// before the new worker reopens it. (Only THIS `Client`'s previous worker is waited out:
+		// another `Client`'s worker that just lost its last handle drops out of the registry
+		// before it has finished closing the DB, so a spawn racing that teardown can still
+		// briefly overlap it — the same window a single `Client` closed for itself with the slot's
+		// exit signal.)
 		wait_for_worker_exit(&mut slot).await;
-		let shared = spawn_cache_worker(client.clone(), &config, &mut slot).await?;
+		let shared = spawn_cache_worker(client.clone(), &config, key, &mut slot).await?;
 		slot.worker = Arc::downgrade(&shared);
+		register_worker(&shared);
 		Ok(shared)
 	}
 
@@ -398,6 +486,8 @@ impl Client {
 	/// [`add_sync_root`](Client::add_sync_root) respawns instead of re-targeting a dead worker.
 	/// The pointer comparison keeps a NEWER worker (spawned by a concurrent caller) intact.
 	async fn mark_worker_stale(&self, shared: &Arc<CacheWorkerShared>) {
+		// Registry first, so a dead worker stops being joinable by other `Client`s too.
+		unregister_worker(shared);
 		let mut slot = self.cache_slot.lock().await;
 		if slot.worker.ptr_eq(&Arc::downgrade(shared)) {
 			slot.worker = Weak::new();
@@ -414,6 +504,7 @@ impl Client {
 async fn spawn_cache_worker(
 	client: Arc<Client>,
 	config: &CacheConfig,
+	db_path: PathBuf,
 	slot: &mut CacheSlot,
 ) -> Result<Arc<CacheWorkerShared>, Error> {
 	let (res_sender, res_receiver) = tokio::sync::oneshot::channel();
@@ -549,6 +640,7 @@ async fn spawn_cache_worker(
 	// correctly). A registration error still surfaces synchronously and aborts the spawn.
 	match client.add_event_listener_sync(callback, None).await {
 		Ok(listener_handle) => Ok(Arc::new(CacheWorkerShared {
+			db_path,
 			control_sender,
 			manual_event_sender,
 			read_task_sender,
@@ -680,5 +772,100 @@ impl Drop for SyncRootHandle {
 				evict: false,
 				ack: None,
 			});
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	impl CacheWorkerShared {
+		/// A worker handle with disconnected channels: the registry only ever stores and compares
+		/// IDENTITY, so nothing here needs a real worker behind it.
+		fn fake(db_path: PathBuf) -> Arc<Self> {
+			let (control_sender, _) = tokio::sync::mpsc::unbounded_channel();
+			let (manual_event_sender, _) = tokio::sync::mpsc::channel(1);
+			let (read_task_sender, _) = tokio::sync::mpsc::unbounded_channel();
+			Arc::new(Self {
+				db_path,
+				control_sender,
+				manual_event_sender,
+				read_task_sender,
+				next_registration_id: AtomicU64::new(0),
+				listener_handle: std::sync::Mutex::new(None),
+			})
+		}
+	}
+
+	/// A unique DB path under the temp dir — these tests share the one process-global registry, so
+	/// they must not collide with each other.
+	fn temp_db_path(tag: &str) -> PathBuf {
+		registry_key(
+			&std::env::temp_dir().join(format!("filen-cache-registry-{tag}-{}.db", Uuid::new_v4())),
+		)
+	}
+
+	#[test]
+	fn a_second_client_joins_the_worker_already_on_the_path() {
+		let key = temp_db_path("join");
+		let first = CacheWorkerShared::fake(key.clone());
+		register_worker(&first);
+		let joined = join_live_worker(&key).expect("a live worker on this path is joinable");
+		assert!(Arc::ptr_eq(&first, &joined));
+	}
+
+	#[test]
+	fn distinct_paths_get_distinct_workers() {
+		let (a, b) = (temp_db_path("distinct-a"), temp_db_path("distinct-b"));
+		let (first, second) = (
+			CacheWorkerShared::fake(a.clone()),
+			CacheWorkerShared::fake(b.clone()),
+		);
+		register_worker(&first);
+		register_worker(&second);
+		assert!(Arc::ptr_eq(&first, &join_live_worker(&a).unwrap()));
+		assert!(Arc::ptr_eq(&second, &join_live_worker(&b).unwrap()));
+		assert!(!Arc::ptr_eq(&first, &second));
+	}
+
+	#[test]
+	fn dropping_the_last_user_frees_the_path_and_a_reacquisition_is_fresh() {
+		let key = temp_db_path("respawn");
+		let first = CacheWorkerShared::fake(key.clone());
+		register_worker(&first);
+		let dead = Arc::downgrade(&first);
+		// The last `SyncRootHandle` going away: the worker shuts down.
+		drop(first);
+		assert!(dead.upgrade().is_none());
+		// The dead entry is dropped on the way, not handed back.
+		assert!(join_live_worker(&key).is_none());
+		assert!(!live_workers().contains_key(&key));
+		let second = CacheWorkerShared::fake(key.clone());
+		register_worker(&second);
+		assert!(Arc::ptr_eq(&second, &join_live_worker(&key).unwrap()));
+	}
+
+	#[test]
+	fn unregistering_a_stale_worker_keeps_its_replacement() {
+		let key = temp_db_path("stale");
+		let stale = CacheWorkerShared::fake(key.clone());
+		register_worker(&stale);
+		// A concurrent caller respawned onto the same path.
+		let replacement = CacheWorkerShared::fake(key.clone());
+		register_worker(&replacement);
+		unregister_worker(&stale);
+		assert!(Arc::ptr_eq(&replacement, &join_live_worker(&key).unwrap()));
+		unregister_worker(&replacement);
+		assert!(join_live_worker(&key).is_none());
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[test]
+	fn two_spellings_of_one_database_share_a_key() {
+		let dir = std::env::temp_dir();
+		assert_eq!(
+			registry_key(&dir.join("cache.db")),
+			registry_key(&dir.join(".").join("cache.db"))
+		);
 	}
 }
