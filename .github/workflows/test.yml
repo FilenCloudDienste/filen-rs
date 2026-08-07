@@ -70,6 +70,16 @@ jobs:
           choco install pkgconfiglite
           vcpkg install dav1d:x64-windows
           echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig;$env:PKG_CONFIG_PATH" >> $env:GITHUB_ENV
+      - name: Remove the broken fusermount3 shadow (actions/runner-images#14516)
+        if: runner.os == 'Linux'
+        run: |
+          # Image ubuntu24/20260804.265 ships a stray non-setuid, world-writable
+          # /usr/local/bin/fusermount3 that shadows the real setuid helper via PATH and
+          # breaks unprivileged FUSE mounts (rclone: "fusermount3: mount failed:
+          # Operation not permitted"). Harmless no-op once the image is fixed.
+          if [ -e /usr/local/bin/fusermount3 ]; then
+            sudo rm /usr/local/bin/fusermount3
+          fi
       - name: Install WinFsp (rclone mount backend for network-drive tests)
         if: runner.os == 'Windows'
         run: choco install winfsp -y
