@@ -195,6 +195,16 @@ pub(crate) enum CacheEventMaybeDecrypted<'a> {
 	/// opened during the reconnect window only heals on the next unrelated drive event or the next
 	/// worker boot.
 	ResyncSignal,
+	/// The socket's subscription is LIVE (`DecryptedSocketEvent::AuthSuccess`): from here on, every
+	/// drive event the server emits is delivered to this listener. Carries no state and is never
+	/// persisted; it releases the worker's deferred startup gap-check (see
+	/// [`StartupGapCheck`](super::StartupGapCheck)), which must read the remote drive id strictly
+	/// AFTER the subscription exists or it races the first connect.
+	///
+	/// The socket broadcasts it on connect-promotion, and REPLAYS it to a listener added while
+	/// already connected — so a listener sees it exactly when it is live in a connected manager's
+	/// routing table, which is the property the deferred check needs.
+	Connected,
 }
 
 impl<'a> CacheEventMaybeDecrypted<'a> {
@@ -232,10 +242,12 @@ impl<'a> CacheEventMaybeDecrypted<'a> {
 				})
 			}
 			// A reconnect: the socket won't redeliver drive events missed during the
-			// disconnect window, so signal the worker to gap-check proactively. (The initial
-			// connect fires AuthSuccess, not Reconnecting, and is already covered by the
-			// startup gap-check, so only Reconnecting is routed here.)
+			// disconnect window, so signal the worker to gap-check proactively. Only a
+			// DISCONNECT of a connected manager fires this, so it never covers the FIRST
+			// connect — that is `Connected`'s job below.
 			DecryptedSocketEvent::Reconnecting => Some(Self::ResyncSignal),
+			// The subscription is live: releases the deferred startup gap-check.
+			DecryptedSocketEvent::AuthSuccess => Some(Self::Connected),
 			_ => None,
 		}
 	}

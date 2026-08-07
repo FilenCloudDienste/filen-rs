@@ -62,10 +62,11 @@ fn drive_malformed_event_maps_to_frontier_advance() {
 }
 
 /// A socket reconnect must NOT be dropped: it maps to a resync signal so the disconnect-window
-/// gap is closed. The initial-connect meta-events (AuthSuccess/AuthFailed) are covered by the
-/// startup path and stay unmapped, so they do not force a spurious resync on every connect.
+/// gap is closed. `AuthSuccess` must not be dropped either — it is the subscription-established
+/// signal the DEFERRED startup gap-check waits on. A failed auth establishes nothing, so it stays
+/// unmapped.
 #[test]
-fn reconnecting_maps_to_resync_signal_others_dropped() {
+fn reconnecting_maps_to_resync_signal_auth_success_to_connected() {
 	use crate::socket::DecryptedSocketEvent;
 
 	assert!(matches!(
@@ -73,8 +74,12 @@ fn reconnecting_maps_to_resync_signal_others_dropped() {
 		Some(CacheEventMaybeDecrypted::ResyncSignal)
 	));
 	assert!(
-		CacheEventMaybeDecrypted::from_decrypted_event(&DecryptedSocketEvent::AuthSuccess)
-			.is_none()
+		matches!(
+			CacheEventMaybeDecrypted::from_decrypted_event(&DecryptedSocketEvent::AuthSuccess),
+			Some(CacheEventMaybeDecrypted::Connected)
+		),
+		"AuthSuccess is the signal the deferred startup gap-check waits on; dropping it strands \
+		 the check forever"
 	);
 	assert!(
 		CacheEventMaybeDecrypted::from_decrypted_event(&DecryptedSocketEvent::AuthFailed).is_none()
@@ -140,6 +145,108 @@ fn drain_without_reconnect_requests_no_gap_check() {
 	assert!(
 		!reconnected,
 		"a non-reconnect drain must not request a gap-check"
+	);
+}
+
+/// The startup gap-check is DEFERRED, not run at boot: draining the persisted backlog the way
+/// `run` does must leave it `AwaitingSubscription`, so the run loop's top-of-loop check does not
+/// fire. Reading the remote drive id before the socket subscribes is exactly the race the deferral
+/// exists to remove — a change landing between that read and the first subscription would be in
+/// neither the check nor the live stream.
+#[test]
+fn startup_drain_leaves_the_gap_check_awaiting_the_subscription() {
+	let (mut state, producer) = CacheState::new_in_memory_with_producer();
+	assert_eq!(
+		state.startup_gap_check,
+		StartupGapCheck::AwaitingSubscription,
+		"a fresh worker owes a gap-check but must not run it yet"
+	);
+
+	// Everything a boot drain might see EXCEPT a subscription: a persisted-backlog event and a
+	// reconnect. Neither means "the socket is subscribed", so neither may release the check.
+	producer
+		.events
+		.try_send(CacheThreadEvent::Socket(
+			CacheEventMaybeDecrypted::FrontierAdvance { id: 7 },
+		))
+		.unwrap();
+	producer
+		.events
+		.try_send(CacheThreadEvent::Socket(
+			CacheEventMaybeDecrypted::ResyncSignal,
+		))
+		.unwrap();
+
+	let reconnected = state.drain_pending(None);
+
+	assert!(
+		reconnected,
+		"a reconnect still requests its own gap-check, exactly as before"
+	);
+	assert_eq!(
+		state.startup_gap_check,
+		StartupGapCheck::AwaitingSubscription,
+		"only a live subscription may release the startup check — a reconnect signal is a \
+		 different trigger and must not stand in for one"
+	);
+}
+
+/// The first `Connected` releases the deferred check: the run loop then owes exactly ONE
+/// gap-check, taken with the subscription already live.
+#[test]
+fn first_connected_signal_arms_exactly_one_startup_gap_check() {
+	let (mut state, producer) = CacheState::new_in_memory_with_producer();
+
+	// A burst of connects in one drain (a replayed authSuccess racing a promotion) still owes one.
+	for _ in 0..3 {
+		producer
+			.events
+			.try_send(CacheThreadEvent::Socket(
+				CacheEventMaybeDecrypted::Connected,
+			))
+			.unwrap();
+	}
+
+	let reconnected = state.drain_pending(None);
+
+	assert!(
+		!reconnected,
+		"a connect is not a reconnect: it must not take the ResyncSignal path"
+	);
+	assert_eq!(
+		state.startup_gap_check,
+		StartupGapCheck::Due,
+		"the first subscription arms the deferred startup gap-check"
+	);
+	assert!(
+		!state.needs_resync().unwrap(),
+		"arming the check is a suspicion at most — it must not set the durable resync flag"
+	);
+}
+
+/// A LATER `Connected` (a reconnect's re-auth) is a no-op for the startup check: it ran once and
+/// stays `Done`. Reconnect healing is `ResyncSignal`'s job, and re-arming here would run a second,
+/// redundant startup check on every reconnect.
+#[test]
+fn second_connected_signal_does_not_rearm_the_startup_gap_check() {
+	let mut state = CacheState::new_in_memory();
+
+	state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::Connected,
+	)));
+	assert_eq!(state.startup_gap_check, StartupGapCheck::Due);
+
+	// What the run loop does when it takes the deferred check.
+	state.startup_gap_check = StartupGapCheck::Done;
+
+	state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::Connected,
+	)));
+
+	assert_eq!(
+		state.startup_gap_check,
+		StartupGapCheck::Done,
+		"a second subscription must not re-arm the startup check"
 	);
 }
 
