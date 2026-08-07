@@ -34,9 +34,18 @@ fn dir_meta_name<'a>(meta: &'a DirectoryMeta<'_>) -> Option<&'a str> {
 #[shared_test_runtime]
 async fn upload_avatar() {
 	let client = test_utils::RESOURCES.client().await;
-	// Held across before-fetch → upload → after-fetch: sibling CI legs share this account,
-	// so an unserialized concurrent avatar rotation breaks both asserts below.
-	let _lock = client.acquire_lock_with_default(LOCK_AVATAR).await.unwrap();
+	// `test:chats` is the avatar exclusion lock. The avatar is embedded in every
+	// chat-message snapshot (`sender_avatar`) and surfaced by contact-request events, so
+	// rotating it mid-flight breaks any avatar-bearing equality assert running on a
+	// sibling CI leg (chat_tests::chat_msgs and socket_tests::chat both raced exactly
+	// this on the 2026-08-06/07 nightlies). Every such observer — and any concurrent
+	// upload_avatar, which this test's own before/after asserts race — already holds
+	// `test:chats` for its window, so one hold here serializes them all; a dedicated
+	// avatar lock would add nothing. Held across before-fetch → upload → after-fetch.
+	let _lock = client
+		.acquire_lock_with_default("test:chats")
+		.await
+		.unwrap();
 	let before = client.get_user_info().await.unwrap();
 
 	let mut rng = rand::rng();
@@ -69,8 +78,6 @@ async fn upload_avatar() {
 const LOCK_VERSIONING: &str = "test:user-versioning";
 const LOCK_LOGIN_ALERTS: &str = "test:user-login-alerts";
 const LOCK_PERSONAL_INFO: &str = "test:user-personal-info";
-// Also held by socket_tests::chat around its contact-request avatar assertion.
-const LOCK_AVATAR: &str = "test:user-avatar";
 
 #[shared_test_runtime]
 async fn versioning_toggle_round_trip() {

@@ -821,15 +821,10 @@ async fn chat() {
 
 	// The contact-request event snapshots the sender's avatar at emission, and
 	// `user_tests::upload_avatar` on a sibling CI leg rotates this shared account's avatar
-	// (all legs of one auth version run concurrently). Hold the same `test:user-avatar`
-	// lock across emission → get_user_info so the equality assert below compares one
-	// avatar, not two (raced on the 2026-08-06 nightly). Dropped right after — the rest of
-	// the test doesn't touch avatars.
-	let avatar_lock = client
-		.acquire_lock_with_default("test:user-avatar")
-		.await
-		.unwrap();
-
+	// (all legs of one auth version run concurrently; raced the assert below on the
+	// 2026-08-06 nightly). No extra lock needed: `_chat_lock` above is held for the whole
+	// test and `upload_avatar` holds `test:chats` while rotating, so the avatar cannot
+	// change between emission and the get_user_info fetch.
 	let _locks = test_utils::set_up_contact(&client, &share_client).await;
 
 	let event = await_map_event(
@@ -856,7 +851,6 @@ async fn chat() {
 	let info = client.get_user_info().await.unwrap();
 	assert_eq!(event.sender_id, info.id);
 	assert_eq!(event.sender_avatar.as_deref(), info.avatar_url.as_deref());
-	drop(avatar_lock);
 
 	let share_contact = client
 		.get_contacts()
