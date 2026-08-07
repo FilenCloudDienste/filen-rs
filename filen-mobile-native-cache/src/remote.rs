@@ -213,12 +213,14 @@ impl FilenMobileCacheState {
 	/// the provider's `.noSuchItem`. Only a not-found from the server means that: every other
 	/// failure is reported as itself, so a connectivity problem never reads as a deletion.
 	///
-	/// The identifiers are provider-oriented, and so is that answer: an id that resolves to no row
-	/// of ours returns `Ok(None)` without going near the network. There is nothing to ask the
-	/// server about — `stable/<id>` is a namespace only this cache hands out, and the row that
-	/// would translate it into something the server knows is exactly what is missing. A path-form
-	/// id against a cold cache lands the same way: the walk stops at the first name it has never
-	/// listed.
+	/// The identifiers are provider-oriented, and so is that answer — with one exception, a BARE
+	/// uuid. That form names a directory, and a uuid is the one question the server takes, so an
+	/// unknown one is asked about once before it may read as a deletion: a directory this cache has
+	/// never listed is not a directory that does not exist. Every other unknown id returns
+	/// `Ok(None)` without going near the network. There is nothing to ask the server about —
+	/// `stable/<id>` is a namespace only this cache hands out, and the row that would translate it
+	/// into something the server knows is exactly what is missing. A path-form id against a cold
+	/// cache lands the same way: the walk stops at the first name it has never listed.
 	pub async fn update_and_query_item(&self, id: FfiId) -> Result<Option<FfiObject>, CacheError> {
 		self.async_execute_authed_owned(async move |auth_state| {
 			auth_state.update_and_query_item(id).await
@@ -799,13 +801,21 @@ impl AuthCacheState {
 		id: FfiId,
 	) -> Result<Option<FfiObject>, CacheError> {
 		debug!("Updating and querying item: {}", id.0);
-		// An id that resolves to no row of ours is one we retired: the providers only ever ask
-		// about identifiers they learned from this cache, so it named an item that has since been
-		// deleted (or it is garbage, which answers the same way). There is nothing to refresh
+		// An id that resolves to no row of ours is usually one we retired: the providers only ever
+		// ask about identifiers they learned from this cache, so it named an item that has since
+		// been deleted (or it is garbage, which answers the same way). There is nothing to refresh
 		// either — an id is not something the server can be asked about, only a uuid is, and the
 		// row that would say which one is exactly what is missing.
-		let Some(obj) = self.select_object_by_id(&id)? else {
-			return Ok(None);
+		//
+		// A BARE uuid is the exception, because it IS a uuid: the providers use that form for
+		// directories, and a directory can be one we have never listed rather than one we retired.
+		// A tracked file moved remotely into a fresh directory lands a row whose parent has none,
+		// and the replica then asks about that parent by uuid — answering `None` there would
+		// report a directory that plainly exists as deleted. So ask the server, once, and let only
+		// its not-found stand as the deletion.
+		let obj = match self.select_object_by_id(&id)? {
+			Some(obj) => obj,
+			None => return self.resolve_unknown_dir_uuid(&id).await,
 		};
 		match obj {
 			DBObject::File(file) => self.refresh_file(file).await,
@@ -814,6 +824,29 @@ impl AuthCacheState {
 			// current is update_roots_info's job.
 			DBObject::Root(root) => Ok(Some(DBObject::Root(root).into())),
 		}
+	}
+
+	/// The directory a bare-uuid id names, learned from the server (see
+	/// [`AuthCacheState::update_and_query_item`], the only caller).
+	///
+	/// Nothing else is probed: `stable/<id>` and the path forms describe locations only this cache
+	/// can translate, so an unknown one stays unknown. The directory lands through the same upsert
+	/// a refresh uses, which leaves it exactly as a listing would have — including a parent we may
+	/// still know nothing about, and which the next query resolves the same way, one level per ask.
+	async fn resolve_unknown_dir_uuid(&self, id: &FfiId) -> Result<Option<FfiObject>, CacheError> {
+		let Ok(uuid) = id.0.parse::<Uuid>() else {
+			return Ok(None);
+		};
+		let remote_dir = match self.client.get_dir(uuid).await {
+			Ok(remote_dir) => remote_dir,
+			// The one answer that means gone. Every other failure is reported as itself: a
+			// connectivity problem must never read as a deletion.
+			Err(e) if e.kind() == ErrorKind::FolderNotFound => return Ok(None),
+			Err(e) => return Err(e.into()),
+		};
+		debug!("Learned unlisted dir {uuid} from the server");
+		let dir = DBDir::upsert_from_remote(&mut self.conn(), remote_dir)?;
+		Ok(Some(DBObject::Dir(dir).into()))
 	}
 
 	/// TODO: switch the file branch to `get_file_by_stable_uuid` once `v3/file/stable` deploys —

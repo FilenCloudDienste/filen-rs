@@ -6022,9 +6022,10 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 	);
 }
 
-// The same call over a directory, and over ids that name nothing. An id no row answers to is not
-// something the server can be asked about — `stable/<id>` is a namespace only this cache hands
-// out — so it answers `None` without going near the network.
+// The same call over a directory, and over ids that name nothing. Both forms below still answer
+// `None`, by different routes: the bare uuid earns it from the server (see the unlisted-dir test
+// beneath), while `stable/<id>` is a namespace only this cache hands out, so there is nothing to
+// ask about at all and no network is touched.
 #[shared_test_runtime]
 pub async fn test_update_and_query_item_refreshes_a_dir_and_knows_nothing_of_unknown_ids() {
 	let (db, rss) = get_db_resources().await;
@@ -6073,6 +6074,50 @@ pub async fn test_update_and_query_item_refreshes_a_dir_and_knows_nothing_of_unk
 			.unwrap(),
 		None,
 		"and the same in the namespace the provider persists"
+	);
+}
+
+// A bare uuid is the one id form the server can be asked about, and it is the form the providers
+// use for directories — including directories this cache has never listed, which is what a remote
+// move into a fresh one leaves a replica holding. Such an id must be asked about, not declared
+// deleted.
+#[shared_test_runtime]
+pub async fn test_update_and_query_item_learns_an_unlisted_dir_from_the_server() {
+	let (db, rss) = get_db_resources().await;
+
+	// Made on the server and never listed here — nothing below puts it in the cache but the query
+	// under test.
+	let dir = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "unlisted_dir")
+		.await
+		.unwrap();
+	let uuid = dir.uuid().to_string();
+	assert_eq!(
+		db.query_item_by_uuid(&uuid).unwrap(),
+		None,
+		"the fixture only means anything while the cache has never heard of this directory"
+	);
+
+	let learned = match db.update_and_query_item(uuid.clone().into()).await.unwrap() {
+		Some(FfiObject::Dir(d)) => d,
+		other => panic!("expected the unlisted directory, got {other:?}"),
+	};
+	assert_eq!(learned.uuid, uuid);
+	assert_eq!(learned.meta.as_ref().unwrap().name, "unlisted_dir");
+	match db.query_item_by_uuid(&uuid).unwrap() {
+		Some(FfiObject::Dir(d)) => assert_eq!(d.uuid, uuid),
+		other => panic!("the probe must land the row, not merely answer with it: {other:?}"),
+	}
+
+	// And a uuid nothing ever had still answers `None` — now earned from the server rather than
+	// assumed.
+	assert_eq!(
+		db.update_and_query_item(Uuid::new_v4().to_string().into())
+			.await
+			.unwrap(),
+		None,
+		"only a not-found from the server may read as a deletion"
 	);
 }
 
@@ -6881,6 +6926,92 @@ pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
 			"the restore never reached the cache through tracking"
 		);
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+
+	db.set_working_set_listener(None);
+	db.stop_working_set_tracking();
+	std::fs::remove_file(&local_path).ok();
+	rss.client.delete_file_permanently(file).await.unwrap();
+}
+
+/// Tracking delivers a moved file wherever it went, including into a directory this cache has
+/// never listed — so the row lands naming a parent no row of ours answers to. The replica renders
+/// that parent and then asks about it by uuid, and the answer has to be the directory: it plainly
+/// exists, and reporting it deleted would tear the item out from under the OS.
+#[shared_test_runtime]
+pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent() {
+	let (db, rss) = get_db_resources().await;
+
+	let mut file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("tracked_move.txt", rss.dir.uuid())
+				.unwrap(),
+			b"move me",
+		)
+		.await
+		.unwrap();
+	let stable = file.stable_uuid().to_string();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	let file_path: FfiId = test_dir_path.join("tracked_move.txt");
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	// The stake, and with it the tracking.
+	let local_path = db
+		.download_file_if_changed_by_path(file_path.clone(), None)
+		.await
+		.unwrap();
+	let listener = Arc::new(CountingWorkingSetListener::default());
+	db.set_working_set_listener(Some(listener.clone()));
+	db.refresh_working_set_tracking().await.unwrap();
+	wait_until_tracking_is_live(&db, &file_path, &listener).await;
+
+	// The destination is made on the server and never listed: the only thing that will ever name
+	// it here is the moved file's own row.
+	let destination = rss
+		.client
+		.create_dir(&(&rss.dir).into(), "unlisted_move_target")
+		.await
+		.unwrap();
+	let destination_uuid = destination.uuid().to_string();
+
+	let anchor = db.current_sync_anchor().unwrap();
+	rss.client
+		.move_file(&mut file, &(&destination).into())
+		.await
+		.unwrap();
+
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+	loop {
+		let changes = db.enumerate_changes(Some(anchor.clone())).unwrap();
+		if feed_files(&changes, &stable)
+			.into_iter()
+			.any(|f| f.parent == destination_uuid)
+		{
+			break;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the move never reached the cache through tracking"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+
+	assert_eq!(
+		db.query_item_by_uuid(&destination_uuid).unwrap(),
+		None,
+		"the delivery names the destination without listing it — that dangling parent IS the case"
+	);
+	match db
+		.update_and_query_item(destination_uuid.clone().into())
+		.await
+		.unwrap()
+	{
+		Some(FfiObject::Dir(d)) => assert_eq!(d.uuid, destination_uuid),
+		other => panic!("the parent the replica asks about must resolve, got {other:?}"),
 	}
 
 	db.set_working_set_listener(None);
