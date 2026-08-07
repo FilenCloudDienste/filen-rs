@@ -911,7 +911,7 @@ impl AuthCacheState {
 		}
 		debug!("Item {} is gone from the server, dropping it", obj.uuid());
 		self.io_delete_local(obj.uuid()).await?;
-		sql::delete_item(&self.conn(), obj.uuid())?;
+		sql::delete_item(&mut self.conn(), obj.uuid())?;
 		Ok(None)
 	}
 
@@ -1554,14 +1554,14 @@ impl AuthCacheState {
 				let remote_dir: RemoteDirectory = dir.into();
 				let uuid = remote_dir.uuid();
 				self.client.delete_dir_permanently(remote_dir).await?;
-				sql::delete_item(&self.conn(), uuid)?;
+				sql::delete_item(&mut self.conn(), uuid)?;
 			}
 			DBObject::File(file) => {
 				self.io_delete_local(file.uuid).await?;
 				let remote_file: RemoteFile = file.try_into()?;
 				let uuid = remote_file.uuid();
 				self.client.delete_file_permanently(remote_file).await?;
-				sql::delete_item(&self.conn(), uuid)?;
+				sql::delete_item(&mut self.conn(), uuid)?;
 			}
 		}
 		debug!("Successfully deleted item at path: {}", item.0);

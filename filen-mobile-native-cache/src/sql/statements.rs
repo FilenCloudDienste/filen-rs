@@ -30,6 +30,8 @@ pub(crate) const SELECT_POS_NOT_IN_UUIDS: &str =
 	include_str!("../../sql/select_pos_not_in_uuids.sql");
 pub(crate) const MARK_PENDING_UPLOAD: &str = include_str!("../../sql/mark_pending_upload.sql");
 pub(crate) const CLEAR_PENDING_UPLOAD: &str = include_str!("../../sql/clear_pending_upload.sql");
+pub(crate) const CLEAR_PENDING_UPLOAD_SUBTREE: &str =
+	include_str!("../../sql/clear_pending_upload_subtree.sql");
 pub(crate) const SELECT_PENDING_UPLOADS: &str =
 	include_str!("../../sql/select_pending_uploads.sql");
 pub(crate) const SELECT_PENDING_UPLOAD_AT: &str =

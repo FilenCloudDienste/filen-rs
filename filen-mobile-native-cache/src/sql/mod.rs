@@ -152,10 +152,32 @@ pub(crate) fn update_root(
 	Ok(())
 }
 
-pub(crate) fn delete_item(conn: &Connection, item_uuid: Uuid) -> Result<(), rusqlite::Error> {
-	let mut stmt = conn.prepare_cached(DELETE_BY_UUID)?;
-	stmt.execute([item_uuid])?;
-	Ok(())
+/// Deletes an item's row, and with it — through `cascade_on_delete_delete_children` — every
+/// non-trashed row below it.
+///
+/// The pending-upload markers of everything that delete reaches are dropped as part of it, in the
+/// same transaction, because `tombstone_on_delete` reads `pending_upload_at` off each row as it
+/// goes: a row that still claims an unsent edit dies without a tombstone, and every replica keeps
+/// the phantom forever. Folded in here rather than left to the callers precisely so the ordering
+/// cannot be reversed by a later edit — the clear has to be visible to the trigger, which means
+/// before the DELETE, and the transaction is what stops a crash in between from leaving a live row
+/// whose outstanding edit nothing records any more.
+///
+/// This is the one delete for which dropping the markers is right: it runs after the server has
+/// permanently deleted the item, so there is nothing left to upload them to. The positional stale
+/// sweeps go through no helper at all and must keep the suppression — a listing that stopped
+/// mentioning an item is not proof the bytes are safe anywhere else — and `forget_item` checks for
+/// them itself and keeps the whole row instead.
+///
+/// `materialised_at` is deliberately untouched: it is not part of the trigger's guard, because
+/// those bytes are a copy of what the server holds and evicting them along with the item is the
+/// point.
+pub(crate) fn delete_item(conn: &mut Connection, item_uuid: Uuid) -> Result<(), rusqlite::Error> {
+	let tx = conn.transaction()?;
+	tx.prepare_cached(CLEAR_PENDING_UPLOAD_SUBTREE)?
+		.execute([item_uuid])?;
+	tx.prepare_cached(DELETE_BY_UUID)?.execute([item_uuid])?;
+	tx.commit()
 }
 
 fn get_all_descendant_paths_with_stmt(
@@ -2075,6 +2097,50 @@ mod change_tracking_tests {
 			served,
 			"and nothing was recorded, so no sequence may have been spent — the meta rows dying \
 			 with their item are not a change to anything"
+		);
+	}
+
+	/// The suppression above protects bytes the server has never seen — and a permanent delete has
+	/// already taken them, on the server and on disk both, by the time the row goes. Leaving the
+	/// marker standing there would suppress the tombstone of an item nothing can bring back: the
+	/// marker dies with its row either way, so no drain would ever resolve it and every replica
+	/// would keep the phantom for good. `delete_item` clears the markers of exactly what its
+	/// cascade reaches, in the same transaction, which is what puts the ordering out of a future
+	/// caller's hands.
+	#[test]
+	fn a_permanent_delete_retires_a_subtree_that_still_held_an_unsent_edit() {
+		let mut conn = db();
+		let parent = uuid(9);
+		add_dir(&conn, uuid(1), parent, "sub");
+		add_file(&conn, uuid(2), stable(3), uuid(1), "unsent.txt");
+		mark_pending_upload(&conn, stable(3), 1).unwrap();
+		// Trashed rows stay keyed off their original parent and the cascade spares them, so this
+		// one outlives the delete — and its marker has to outlive it too.
+		conn.execute(
+			"INSERT INTO items (uuid, stable_uuid, parent, type, trashed, pending_upload_at)
+			VALUES (?1, ?2, ?3, 2, TRUE, 1);",
+			rusqlite::params![uuid(4), stable(5), uuid(1)],
+		)
+		.unwrap();
+		let served = anchor(&conn);
+
+		delete_item(&mut conn, uuid(1)).unwrap();
+
+		let mut got = retired(&conn);
+		got.sort();
+		assert_eq!(
+			got,
+			vec![(1, uuid(1)), (2, uuid(3))],
+			"the dir and the file under it are both gone for good, so both are retired"
+		);
+		assert!(
+			anchor(&conn) > served,
+			"and a replica holding {served} must be told about it"
+		);
+		assert_eq!(
+			select_pending_upload_at(&conn, stable(5)).unwrap(),
+			Some(1),
+			"the trashed row the cascade spares keeps its marker"
 		);
 	}
 
