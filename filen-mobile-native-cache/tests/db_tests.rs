@@ -5991,6 +5991,45 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 		"refresh_item_renamed.txt"
 	);
 
+	// Edited behind its back. The server re-mints the uuid on a content edit, so the id the cache
+	// holds names a version that is no longer the file — the one thing a by-uuid refresh cannot see
+	// past. Asked by the lineage's id, the answer is the new head.
+	const EDITED: &[u8] = b"refresh v2, edited elsewhere";
+	let pre_edit_uuid = file.uuid();
+	let edited = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("refresh_item_renamed.txt", rss.dir.uuid())
+				.unwrap(),
+			EDITED,
+		)
+		.await
+		.unwrap();
+	assert_ne!(edited.uuid(), pre_edit_uuid);
+	assert_eq!(
+		edited.stable_uuid(),
+		file.stable_uuid(),
+		"the edit must keep the lineage, or this test proves nothing"
+	);
+	let head = match db.update_and_query_item(stable_id.clone()).await.unwrap() {
+		Some(FfiObject::File(f)) => f,
+		other => panic!("expected the edited head, got {other:?}"),
+	};
+	assert_eq!(
+		head.uuid,
+		edited.uuid().to_string(),
+		"the refresh must follow the file across the edit, not report the version it held"
+	);
+	assert_eq!(head.stable_uuid, stable, "and it is still the same file");
+	assert_eq!(head.size as usize, EDITED.len());
+	assert_eq!(
+		db.query_item_by_uuid(&stable).unwrap(),
+		Some(FfiObject::File(head)),
+		"the head must land on the row, not merely be reported"
+	);
+	let archived = std::mem::replace(&mut file, edited);
+
 	// Trashed behind its back: still an item, and still this item.
 	rss.client.trash_file(&mut file).await.unwrap();
 	let trashed = match db.update_and_query_item(stable_id.clone()).await.unwrap() {
@@ -6003,9 +6042,12 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 		"it must come back as trashed, carrying where a restore would put it"
 	);
 
-	// Gone from the server: gone here too, and every replica is told.
+	// Gone from the server: gone here too, and every replica is told. The whole lineage has to go —
+	// the version the edit archived answers a by-stable ask just as the head does, so a file is only
+	// "not found" once nothing of it is left.
 	let anchor = db.current_sync_anchor().unwrap();
 	rss.client.delete_file_permanently(file).await.unwrap();
+	rss.client.delete_file_permanently(archived).await.unwrap();
 	assert_eq!(
 		db.update_and_query_item(stable_id).await.unwrap(),
 		None,
@@ -6020,6 +6062,69 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 		feed_retires(&db.enumerate_changes(Some(anchor)).unwrap(), &stable),
 		"dropping the row must retire its id for every replica"
 	);
+}
+
+// The same edit on a versioning-disabled account, where the server replaces the file in place: the
+// uuid the cache holds lives on for ~60s as a trashed ghost, re-stamped with a stable id of its
+// own. That ghost is what a by-uuid refresh gets — an answer that is neither this file nor a
+// deletion. By the lineage's id there is only the head, and it is not trashed.
+#[shared_test_runtime]
+pub async fn test_update_and_query_item_follows_a_versioning_disabled_edit() {
+	let (db, rss) = get_db_resources().await;
+
+	let _version_lock = rss
+		.client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	rss.client.set_versioning_enabled(false).await.unwrap();
+
+	let old_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("refresh_versioning_off.txt", rss.dir.uuid())
+				.unwrap(),
+			b"versioning off v1",
+		)
+		.await
+		.unwrap();
+
+	let test_dir_path: FfiId =
+		format!("{}/{}", db.root_uuid().unwrap(), rss.dir.name().unwrap()).into();
+	db.update_dir_children(test_dir_path).await.unwrap();
+
+	const EDITED: &[u8] = b"versioning off v2";
+	let new_file = rss
+		.client
+		.upload_file(
+			rss.client
+				.make_file_builder("refresh_versioning_off.txt", rss.dir.uuid())
+				.unwrap(),
+			EDITED,
+		)
+		.await
+		.unwrap();
+	assert_ne!(new_file.uuid(), old_file.uuid());
+	assert_eq!(new_file.stable_uuid(), old_file.stable_uuid());
+
+	let stable = old_file.stable_uuid().to_string();
+	let head = match db
+		.update_and_query_item(format!("stable/{stable}").into())
+		.await
+		.unwrap()
+	{
+		Some(FfiObject::File(f)) => f,
+		other => panic!("expected the replaced file's head, got {other:?}"),
+	};
+	assert_eq!(head.uuid, new_file.uuid().to_string());
+	assert_eq!(head.size as usize, EDITED.len());
+	assert_eq!(
+		head.original_parent, None,
+		"the ghost the edit left behind is trashed; the head is not"
+	);
+
+	rss.client.set_versioning_enabled(true).await.unwrap();
 }
 
 // The same call over a directory, and over ids that name nothing. Both forms below still answer

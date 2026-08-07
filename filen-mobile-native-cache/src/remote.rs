@@ -8,7 +8,7 @@ use chrono::DateTime;
 use filen_sdk_rs::{
 	ErrorKind,
 	fs::{
-		HasName, HasParent, HasUUID,
+		HasName, HasUUID,
 		categories::{DirType, Normal},
 		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 		file::{
@@ -849,34 +849,23 @@ impl AuthCacheState {
 		Ok(Some(DBObject::Dir(dir).into()))
 	}
 
-	/// TODO: switch the file branch to `get_file_by_stable_uuid` once `v3/file/stable` deploys —
-	/// removes the versioned-response blindspot below (asking by uuid, the only question the
-	/// server takes today, cannot see past a content edit made elsewhere, so the refresh reports
-	/// the cached row and waits for a listing to carry the head).
+	/// The file behind a row, refreshed to its live head.
+	///
+	/// Asked by the stable id, not the uuid: a content edit made elsewhere re-mints the uuid, and
+	/// a by-uuid question can only answer with the version this cache already holds (or with the
+	/// short-lived trashed ghost a versioning-disabled edit leaves behind). By the whole-life id
+	/// there is only ever one answer, and it is the head — so it is upserted unconditionally, and
+	/// the stable tier lands it on this very row. A trashed head is still this item and comes back
+	/// as one, carrying the parent a restore would put it back in.
 	async fn refresh_file(&self, file: DBFile) -> Result<Option<FfiObject>, CacheError> {
-		let info = match self.client.get_file_with_info(file.uuid).await {
-			Ok(info) => info,
+		let head = match self.client.get_file_by_stable_uuid(file.stable_uuid).await {
+			Ok(head) => head,
 			Err(e) if e.kind() == ErrorKind::FileNotFound => {
 				return self.forget_item(DBObject::File(file)).await;
 			}
 			Err(e) => return Err(e.into()),
 		};
-		// Our uuid names a version the server has retired — a content edit made elsewhere — or the
-		// short-lived trashed ghost such an edit leaves behind, re-stamped with a stable id that
-		// belongs to no lineage. Either way what came back is not this file's live head, and
-		// upserting it would write a dead version, or a foreign identity, onto the row. The head
-		// arrives with the next listing carrying our stable id, which lands on this very row;
-		// until then, report what we hold. What we must NOT do is call it deleted.
-		if info.versioned
-			|| (info.file.parent().is_trash() && info.file.stable_uuid() != file.stable_uuid)
-		{
-			debug!(
-				"File {} is superseded on the server, reporting the cached row",
-				file.uuid
-			);
-			return Ok(Some(DBObject::File(file).into()));
-		}
-		let file = DBFile::upsert_from_remote(&mut self.conn(), info.file)?;
+		let file = DBFile::upsert_from_remote(&mut self.conn(), head)?;
 		Ok(Some(DBObject::File(file).into()))
 	}
 
