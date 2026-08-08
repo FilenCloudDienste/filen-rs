@@ -6798,6 +6798,16 @@ pub async fn test_a_pre_aborted_signal_stops_before_anything_happens() {
 	tokio::fs::remove_file(&external).await.ok();
 }
 
+/// Serializes the tracking tests within this process. The cache state is a process-wide
+/// singleton, and both pieces of tracking state these tests exercise are global to it: the ONE
+/// `working_set_listener` slot (a sibling test's `set_working_set_listener` silently replaces
+/// ours, after which our listener counts nothing and `wait_until_tracking_is_live` panics with
+/// "the socket loop is not live" — the 2026-08-08 nightly's macOS failures), and the ONE
+/// handle-map + drainer that `stop_working_set_tracking` tears down for everybody. An
+/// in-process mutex is the right scope: sibling CI legs run separate processes on separate
+/// cache DBs and do not share this state.
+static TRACKING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Counts the "something in your working set moved" signals the cache raises.
 #[derive(Default)]
 struct CountingWorkingSetListener(std::sync::atomic::AtomicU64);
@@ -6850,6 +6860,7 @@ async fn wait_until_tracking_is_live(
 // that lands the record in `native_cache.db`.
 #[shared_test_runtime]
 pub async fn test_tracking_delivers_a_remote_edit_without_being_asked() {
+	let _tracking = TRACKING_TEST_LOCK.lock().await;
 	let (db, rss) = get_db_resources().await;
 
 	let file = rss
@@ -6955,6 +6966,7 @@ pub async fn test_tracking_delivers_a_remote_edit_without_being_asked() {
 /// retirement would have told every replica the file is gone for good.
 #[shared_test_runtime]
 pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
+	let _tracking = TRACKING_TEST_LOCK.lock().await;
 	let (db, rss) = get_db_resources().await;
 
 	let mut file = rss
@@ -7045,6 +7057,7 @@ pub async fn test_a_remote_trash_of_a_tracked_file_trashes_the_row() {
 /// exists, and reporting it deleted would tear the item out from under the OS.
 #[shared_test_runtime]
 pub async fn test_a_remote_move_into_an_unlisted_dir_leaves_a_resolvable_parent() {
+	let _tracking = TRACKING_TEST_LOCK.lock().await;
 	let (db, rss) = get_db_resources().await;
 
 	let mut file = rss
