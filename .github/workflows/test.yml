@@ -113,6 +113,10 @@ jobs:
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
           IMAP_EMAIL_USER: ${{ secrets['IMAP_EMAIL_USER'] }}
           IMAP_EMAIL_PASSWORD: ${{ secrets['IMAP_EMAIL_PASSWORD'] }}
+          # Authenticates the updater tests' api.github.com calls: the unauthenticated
+          # 60 req/hr/IP budget is shared across every tenant of a runner IP and its
+          # exhaustion failed test_updater on 07-31 and 08-08.
+          GITHUB_TOKEN: ${{ github.token }}
           RUST_LOG: debug
   test-2fa:
     # `test_2fa` is #[ignore]'d out of the matrix above because it ENABLES 2FA on the shared

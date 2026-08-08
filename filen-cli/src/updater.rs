@@ -252,15 +252,48 @@ impl GitHubApiClient {
 		}
 	}
 
-	async fn get_latest_release(&self) -> Result<GitHubRelease> {
-		self.client
+	async fn send_releases_request(&self, token: Option<&str>) -> Result<reqwest::Response> {
+		let mut request = self
+			.client
 			.get(
 				"https://api.github.com/repos/FilenCloudDienste/filen-cli-releases/releases/latest",
 			)
-			.header("User-Agent", "filen-cli")
+			.header("User-Agent", "filen-cli");
+		if let Some(token) = token {
+			request = request.bearer_auth(token);
+		}
+		request
 			.send()
 			.await
-			.context("Failed to send request to GitHub API for releases")?
+			.context("Failed to send request to GitHub API for releases")
+	}
+
+	async fn get_latest_release(&self) -> Result<GitHubRelease> {
+		// Unauthenticated api.github.com allows 60 requests/hour per IP, which shared CI
+		// runner IPs exhaust; the resulting rate-limit JSON used to surface as an opaque
+		// body-decode failure below. A token (CI passes the workflow's GITHUB_TOKEN)
+		// lifts the limit. Scoped to this api.github.com request on purpose — the
+		// announcements fetch goes to a different host and needs no auth.
+		let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+		let mut response = self.send_releases_request(token.as_deref()).await?;
+		// A token must never fail harder than no token: GITHUB_TOKEN is an installation
+		// token scoped to the calling repository, and reads of ANOTHER (public) repo's
+		// releases are expected to work but can be rejected as "Resource not accessible
+		// by integration". On an auth-shaped rejection, retry unauthenticated — worst
+		// case that retry hits the plain IP rate limit and we report that instead.
+		if token.is_some() && matches!(response.status().as_u16(), 401 | 403) {
+			response = self.send_releases_request(None).await?;
+		}
+		let status = response.status();
+		if !status.is_success() {
+			// Read the body for the error: GitHub explains itself there (rate limits
+			// most importantly), and decoding a non-2xx body as a release produced
+			// undiagnosable "error decoding response body" failures.
+			let body = response.text().await.unwrap_or_default();
+			let body = body.chars().take(300).collect::<String>();
+			anyhow::bail!("GitHub API returned {status} for releases: {body}");
+		}
+		response
 			.json::<GitHubRelease>()
 			.await
 			.map_err(|e| anyhow::anyhow!("Failed to parse GitHub releases response: {}", e))
