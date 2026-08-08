@@ -85,8 +85,19 @@ fi
 # WASM clippy (matches ci.yml ci-wasm job; run from filen-sdk-rs sub-workspace).
 if have cargo && [ -f filen-sdk-rs/Cargo.toml ]; then
 	if rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
-		run "cargo clippy --target wasm32-unknown-unknown -F wasm-full (filen-sdk-rs)" \
-			bash -c 'cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F wasm-full -- -D warnings'
+		# The cache feature compiles bundled SQLite C for wasm32, which Apple
+		# clang cannot target — use brew llvm like CI does.
+		wasm_full_feats="wasm-full,cache"
+		if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then
+			export CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang
+			export AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar
+		elif [ "$(uname -s)" = "Darwin" ]; then
+			printf '%sbrew llvm not found, dropping the cache feature from WASM clippy (install: brew install llvm)%s\n' \
+				"$yellow" "$reset"
+			wasm_full_feats="wasm-full"
+		fi
+		run "cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats (filen-sdk-rs)" \
+			bash -c "cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F $wasm_full_feats -- -D warnings"
 		run "cargo clippy --target wasm32-unknown-unknown -F service-worker (filen-sdk-rs)" \
 			bash -c 'cd filen-sdk-rs && cargo clippy --target wasm32-unknown-unknown -F service-worker -- -D warnings'
 	else
