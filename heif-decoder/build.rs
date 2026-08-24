@@ -10,7 +10,7 @@ fn main() {
 	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "android" {
 		// if we don't bundle libc++ this causes problems on android
 		println!("cargo:rustc-link-lib=static:-bundle=c++");
-	} else if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
+	} else if env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos" {
 		println!("cargo:rustc-link-lib=c++");
 	}
 
@@ -105,15 +105,16 @@ fn config_cmake_for_ios(config: &mut Config) {
 }
 
 fn config_cmake_for_libcxx(config: &mut Config) {
-	// Force CMake to use libc++ instead of libstdc++
-	config.define("CMAKE_CXX_FLAGS", "-stdlib=libc++");
-	config.define("CMAKE_EXE_LINKER_FLAGS", "-stdlib=libc++");
-	config.define("CMAKE_SHARED_LINKER_FLAGS", "-stdlib=libc++");
+	if env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos" {
+		// Force CMake to use libc++ instead of libstdc++
+		config.define("CMAKE_CXX_FLAGS", "-stdlib=libc++");
+		config.define("CMAKE_EXE_LINKER_FLAGS", "-stdlib=libc++");
+		config.define("CMAKE_SHARED_LINKER_FLAGS", "-stdlib=libc++");
 
-	// Ensure we're using clang++ for consistency
-	config.define("CMAKE_CXX_COMPILER", "clang++");
-	config.define("CMAKE_C_COMPILER", "clang");
-
+		// Ensure we're using clang++ for consistency
+		config.define("CMAKE_CXX_COMPILER", "clang++");
+		config.define("CMAKE_C_COMPILER", "clang");
+	}
 	// This was causing issues on the windows runner and we don't care about documentation
 	config.define("CMAKE_DISABLE_FIND_PACKAGE_Doxygen", "TRUE");
 }
