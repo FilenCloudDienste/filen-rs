@@ -1,0 +1,272 @@
+# Manuel recording file
+
+# (manuel) set-remote-cwd                                                                    #
+# (manuel) create-basic-local-file asdf.txt                                                  #
+# (manuel) filen --quiet                                                                     #
+# ==================================== Filen CLI v0.2.7 ==================================== #
+# ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} mkdir .                                    #
+# ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} upload asdf.txt .                          #
+# ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} cat asdf.txt                               #
+# This is a basic local file for testing.                                                    #
+#                                                                                            #
+# ({{ $MANUEL_EMAIL }}) /{{ $MANUEL_REMOTE_CWD }} exit                                       #
+# (manuel)                                                                                   #
+#                                                                                            #
+
+terminal_width: 91
+recording_items:
+- !Output "\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 115
+- !Input
+  - 101
+- !Input
+  - 116
+- !Input
+  - 45
+- !Input
+  - 114
+- !Input
+  - 101
+- !Input
+  - 109
+- !Input
+  - 111
+- !Input
+  - 116
+- !Input
+  - 101
+- !Input
+  - 45
+- !Input
+  - 99
+- !Input
+  - 119
+- !Input
+  - 100
+- !Input
+  - 2
+- !Output "set-remote-cwd\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 99
+- !Input
+  - 114
+- !Input
+  - 101
+- !Input
+  - 97
+- !Input
+  - 116
+- !Input
+  - 101
+- !Input
+  - 45
+- !Input
+  - 98
+- !Input
+  - 97
+- !Input
+  - 115
+- !Input
+  - 105
+- !Input
+  - 99
+- !Input
+  - 45
+- !Input
+  - 108
+- !Input
+  - 111
+- !Input
+  - 99
+- !Input
+  - 97
+- !Input
+  - 108
+- !Input
+  - 45
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 32
+- !Input
+  - 97
+- !Input
+  - 115
+- !Input
+  - 100
+- !Input
+  - 102
+- !Input
+  - 46
+- !Input
+  - 116
+- !Input
+  - 120
+- !Input
+  - 116
+- !Input
+  - 2
+- !Output "create-basic-local-file asdf.txt\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 110
+- !Input
+  - 32
+- !Input
+  - 45
+- !Input
+  - 45
+- !Input
+  - 113
+- !Input
+  - 117
+- !Input
+  - 105
+- !Input
+  - 101
+- !Input
+  - 116
+- !Input
+  - 2
+- !Output "filen --quiet\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[38;2;29;87;185m=\e[1m\e[38;2;37;87;185m=\e[1m\e[38;2;45;87;186m=\e[1m\e[38;2;51;88;186m=\e[1m\e[38;2;56;88;186m=\e[1m\e[38;2;61;88;187m=\e[1m\e[38;2;65;88;187m=\e[1m\e[38;2;69;89;187m=\e[1m\e[38;2;73;89;187m=\e[1m\e[38;2;76;89;188m=\e[1m\e[38;2;80;90;188m=\e[1m\e[38;2;83;90;189m=\e[1m\e[38;2;86;90;189m=\e[1m\e[38;2;89;91;189m=\e[1m\e[38;2;92;91;191m=\e[1m\e[38;2;95;91;191m=\e[1m\e[38;2;97;92;191m=\e[1m\e[38;2;100;92;191m=\e[1m\e[38;2;102;92;191m=\e[1m\e[38;2;105;93;192m=\e[1m\e[38;2;107;93;192m=\e[1m\e[38;2;110;93;193m=\e[1m\e[38;2;112;94;193m=\e[1m\e[38;2;114;94;194m=\e[1m\e[38;2;116;94;194m=\e[1m\e[38;2;118;95;194m=\e[1m\e[38;2;120;95;195m=\e[1m\e[38;2;122;95;195m=\e[1m\e[38;2;124;96;196m=\e[1m\e[38;2;126;96;196m=\e[1m\e[38;2;128;97;197m=\e[1m\e[38;2;130;97;197m=\e[1m\e[38;2;132;97;198m=\e[1m\e[38;2;134;98;198m=\e[1m\e[38;2;136;98;199m=\e[1m\e[38;2;138;98;199m=\e[1m\e[38;2;139;99;201m \e[1m\e[38;2;141;99;201mF\e[1m\e[38;2;143;100;201mi\e[1m\e[38;2;145;100;202ml\e[1m\e[38;2;146;100;202me\e[1m\e[38;2;148;101;203mn\e[1m\e[38;2;150;101;203m \e[1m\e[38;2;151;102;204mC\e[1m\e[38;2;153;102;204mL\e[1m\e[38;2;152;105;203mI\e[1m\e[38;2;151;109;201m \e[1m\e[38;2;150;112;201mv\e[1m\e[38;2;148;115;199m0\e[1m\e[38;2;147;118;197m.\e[1m\e[38;2;146;121;196m2\e[1m\e[38;2;145;124;194m.\e[1m\e[38;2;143;127;193m7\e[1m\e[38;2;142;130;191m \e[1m\e[38;2;141;132;189m=\e[1m\e[38;2;139;135;188m=\e[1m\e[38;2;138;137;186m=\e[1m\e[38;2;137;140;185m=\e[1m\e[38;2;135;142;183m=\e[1m\e[38;2;134;144;182m=\e[1m\e[38;2;133;147;181m=\e[1m\e[38;2;131;149;178m=\e[1m\e[38;2;130;151;177m=\e[1m\e[38;2;128;153;175m=\e[1m\e[38;2;127;155;173m=\e[1m\e[38;2;125;158;171m=\e[1m\e[38;2;124;160;171m=\e[1m\e[38;2;122;162;168m=\e[1m\e[38;2;121;164;166m=\e[1m\e[38;2;119;166;164m=\e[1m\e[38;2;118;168;162m=\e[1m\e[38;2;116;169;161m=\e[1m\e[38;2;114;171;159m=\e[1m\e[38;2;113;173;157m=\e[1m\e[38;2;111;175;155m=\e[1m\e[38;2;109;177;153m=\e[1m\e[38;2;107;179;151m=\e[1m\e[38;2;106;180;148m=\e[1m\e[38;2;104;182;146m=\e[1m\e[38;2;102;184;144m=\e[1m\e[38;2;100;186;142m=\e[1m\e[38;2;98;187;141m=\e[1m\e[38;2;96;189;138m=\e[1m\e[38;2;94;191;135m=\e[1m\e[38;2;92;192;133m=\e[1m\e[38;2;89;194;131m=\e[1m\e[38;2;87;196;128m=\e[1m\e[38;2;85;197;125m=\e[1m\e[38;2;82;199;123m=\e[1m\e[38;2;80;200;121m=\e[1m\e[0m\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Input
+  - 109
+- !Input
+  - 107
+- !Input
+  - 100
+- !Input
+  - 105
+- !Input
+  - 114
+- !Input
+  - 32
+- !Input
+  - 2
+- !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m m \e[K\r\e[49C\e[?25h\e[?25l\e[49D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mk \e[K\r\e[50C\e[?25h\e[?25l\e[50D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mkd \e[K\r\e[51C\e[?25h\e[?25l\e[51D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mkdi \e[K\r\e[52C\e[?25h\e[?25l\e[52D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mkdir \e[K\r\e[53C\e[?25h\e[?25l\e[53D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mkdir  \e[K\r\e[54C\e[?25h\e[?25l\e[54D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mkdir b \e[K\r\e[55C\e[?25h"
+- !Input
+  - 127
+- !Output "\e[?25l\e[55D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mkdir  \e[K\r\e[54C\e[?25h"
+- !Input
+  - 46
+- !Output "\e[?25l\e[54D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m mkdir . \e[K\r\e[55C\e[?25h"
+- !Input
+  - 13
+- !Output "\e[?25l\e[55D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mmkdir .\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Input
+  - 117
+- !Input
+  - 112
+- !Input
+  - 108
+- !Input
+  - 111
+- !Input
+  - 97
+- !Input
+  - 100
+- !Input
+  - 32
+- !Input
+  - 97
+- !Input
+  - 115
+- !Input
+  - 100
+- !Input
+  - 102
+- !Input
+  - 46
+- !Input
+  - 116
+- !Input
+  - 120
+- !Input
+  - 116
+- !Input
+  - 32
+- !Input
+  - 46
+- !Input
+  - 2
+- !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m u \e[K\r\e[49C\e[?25h\e[?25l\e[49D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m up \e[K\r\e[50C\e[?25h\e[?25l\e[50D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upl \e[K\r\e[51C\e[?25h\e[?25l\e[51D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m uplo \e[K\r\e[52C\e[?25h\e[?25l\e[52D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m uploa \e[K\r\e[53C\e[?25h\e[?25l\e[53D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload \e[K\r\e[54C\e[?25h\e[?25l\e[54D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload  \e[K\r\e[55C\e[?25h\e[?25l\e[55D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload a \e[K\r\e[56C\e[?25h\e[?25l\e[56D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload as \e[K\r\e[57C\e[?25h\e[?25l\e[57D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asd \e[K\r\e[58C\e[?25h\e[?25l\e[58D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf \e[K\r\e[59C\e[?25h\e[?25l\e[59D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf. \e[K\r\e[60C\e[?25h\e[?25l\e[60D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf.t \e[K\r\e[61C\e[?25h\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf.tx \e[K\r\e[62C\e[?25h\e[?25l\e[62D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf.txt \e[K\r\e[63C\e[?25h\e[?25l\e[63D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf.txt  \e[K\r\e[64C\e[?25h\e[?25l\e[64D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf.txt . \e[K\r\e[65C\e[?25h\e[?25l\e[65D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf.txt .b \e[K\r\e[66C\e[?25h"
+- !Input
+  - 127
+- !Output "\e[?25l\e[66D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m upload asdf.txt . \e[K\r\e[65C\e[?25h"
+- !Input
+  - 13
+- !Output "\e[?25l\e[65D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mupload asdf.txt .\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Input
+  - 99
+- !Input
+  - 97
+- !Input
+  - 116
+- !Input
+  - 32
+- !Input
+  - 97
+- !Input
+  - 115
+- !Input
+  - 100
+- !Input
+  - 102
+- !Input
+  - 46
+- !Input
+  - 116
+- !Input
+  - 120
+- !Input
+  - 116
+- !Input
+  - 2
+- !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m c \e[K\r\e[49C\e[?25h\e[?25l\e[49D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m ca \e[K\r\e[50C\e[?25h\e[?25l\e[50D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat \e[K\r\e[51C\e[?25h\e[?25l\e[51D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat  \e[K\r\e[52C\e[?25h\e[?25l\e[52D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat a \e[K\r\e[53C\e[?25h\e[?25l\e[53D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat as \e[K\r\e[54C\e[?25h\e[?25l\e[54D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asd \e[K\r\e[55C\e[?25h\e[?25l\e[55D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf \e[K\r\e[56C\e[?25h\e[?25l\e[56D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf. \e[K\r\e[57C\e[?25h\e[?25l\e[57D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf.t \e[K\r\e[58C\e[?25h\e[?25l\e[58D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf.tx \e[K\r\e[59C\e[?25h\e[?25l\e[59D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf.txt \e[K\r\e[60C\e[?25h\e[?25l\e[60D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf.txtb \e[K\r\e[61C\e[?25h"
+- !Input
+  - 127
+- !Output "\e[?25l\e[61D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m cat asdf.txt \e[K\r\e[60C\e[?25h"
+- !Input
+  - 13
+- !Output "\e[?25l\e[60D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mcat asdf.txt\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004lThis is a basic local file for testing.\r\n\r\n\e[?2004h\e[?25l\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m  \r\e[48C\e[?25h"
+- !Input
+  - 101
+- !Input
+  - 120
+- !Input
+  - 105
+- !Input
+  - 116
+- !Input
+  - 2
+- !Output "\e[?25l\e[48D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m e \e[K\r\e[49C\e[?25h\e[?25l\e[49D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m ex \e[K\r\e[50C\e[?25h\e[?25l\e[50D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m exi \e[K\r\e[51C\e[?25h\e[?25l\e[51D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m exit \e[K\r\e[52C\e[?25h\e[?25l\e[52D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m exitb \e[K\r\e[53C\e[?25h"
+- !Input
+  - 127
+- !Output "\e[?25l\e[53D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m exit \e[K\r\e[52C\e[?25h"
+- !Input
+  - 13
+- !Output "\e[?25l\e[52D\e[38;5;14m(\e[33m\e[1m{{ $MANUEL_EMAIL }}\e[0m)\e[39m /\e[33m\e[1m{{ $MANUEL_REMOTE_CWD }}\e[0m \e[38;5;14mexit\e[39m\e[K\r\n\e[?25h\e[?25h\e[?2004l\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+final_output_formatted: "\e[34;1m(manuel)\e[m set-remote-cwd\e[m\n\e[34;1m(manuel)\e[m create-basic-local-file asdf.txt\e[m\n\e[34;1m(manuel)\e[m filen --quiet\e[m\n\e[38;2;29;87;185m=\e[38;2;37;87;185;1m=\e[38;2;45;87;186m=\e[38;2;51;88;186m=\e[38;2;56;88;186m=\e[38;2;61;88;187m=\e[38;2;65;88;187m=\e[38;2;69;89;187m=\e[38;2;73;89;187m=\e[38;2;76;89;188m=\e[38;2;80;90;188m=\e[38;2;83;90;189m=\e[38;2;86;90;189m=\e[38;2;89;91;189m=\e[38;2;92;91;191m=\e[38;2;95;91;191m=\e[38;2;97;92;191m=\e[38;2;100;92;191m=\e[38;2;102;92;191m=\e[38;2;105;93;192m=\e[38;2;107;93;192m=\e[38;2;110;93;193m=\e[38;2;112;94;193m=\e[38;2;114;94;194m=\e[38;2;116;94;194m=\e[38;2;118;95;194m=\e[38;2;120;95;195m=\e[38;2;122;95;195m=\e[38;2;124;96;196m=\e[38;2;126;96;196m=\e[38;2;128;97;197m=\e[38;2;130;97;197m=\e[38;2;132;97;198m=\e[38;2;134;98;198m=\e[38;2;136;98;199m=\e[38;2;138;98;199m=\e[38;2;139;99;201m \e[38;2;141;99;201mF\e[38;2;143;100;201mi\e[38;2;145;100;202ml\e[38;2;146;100;202me\e[38;2;148;101;203mn\e[38;2;150;101;203m \e[38;2;151;102;204mC\e[38;2;153;102;204mL\e[38;2;152;105;203mI\e[38;2;151;109;201m \e[38;2;150;112;201mv\e[38;2;148;115;199m0\e[38;2;147;118;197m.\e[38;2;146;121;196m2\e[38;2;145;124;194m.\e[38;2;143;127;193m7\e[38;2;142;130;191m \e[38;2;141;132;189m=\e[38;2;139;135;188m=\e[38;2;138;137;186m=\e[38;2;137;140;185m=\e[38;2;135;142;183m=\e[38;2;134;144;182m=\e[38;2;133;147;181m=\e[38;2;131;149;178m=\e[38;2;130;151;177m=\e[38;2;128;153;175m=\e[38;2;127;155;173m=\e[38;2;125;158;171m=\e[38;2;124;160;171m=\e[38;2;122;162;168m=\e[38;2;121;164;166m=\e[38;2;119;166;164m=\e[38;2;118;168;162m=\e[38;2;116;169;161m=\e[38;2;114;171;159m=\e[38;2;113;173;157m=\e[38;2;111;175;155m=\e[38;2;109;177;153m=\e[38;2;107;179;151m=\e[38;2;106;180;148m=\e[38;2;104;182;146m=\e[38;2;102;184;144m=\e[38;2;100;186;142m=\e[38;2;98;187;141m=\e[38;2;96;189;138m=\e[38;2;94;191;135m=\e[38;2;92;192;133m=\e[38;2;89;194;131m=\e[38;2;87;196;128m=\e[38;2;85;197;125m=\e[38;2;82;199;123m=\e[38;2;80;200;121m=\e[m\n\e[96m(\e[33;1m{{ $MANUEL_EMAIL }}\e[m) /\e[33;1m{{ $MANUEL_REMOTE_CWD }}\e[m \e[96mmkdir .\e[m\n\e[96m(\e[33;1m{{ $MANUEL_EMAIL }}\e[m) /\e[33;1m{{ $MANUEL_REMOTE_CWD }}\e[m \e[96mupload asdf.txt .\e[m\n\e[96m(\e[33;1m{{ $MANUEL_EMAIL }}\e[m) /\e[33;1m{{ $MANUEL_REMOTE_CWD }}\e[m \e[96mcat asdf.txt\e[m\nThis is a basic local file for testing.\e[m\n\e[m\n\e[96m(\e[33;1m{{ $MANUEL_EMAIL }}\e[m) /\e[33;1m{{ $MANUEL_REMOTE_CWD }}\e[m \e[96mexit\e[m\n\e[34;1m(manuel)\e[m \e[m\n"

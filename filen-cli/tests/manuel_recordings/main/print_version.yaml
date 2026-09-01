@@ -1,0 +1,58 @@
+# Manuel recording file
+
+# (manuel) filen --version                                                                         #
+# Filen CLI 0.2.7                                                                                  #
+# (manuel)                                                                                         #
+#                                                                                                  #
+
+terminal_width: 97
+recording_items:
+- !Output "\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 102
+- !Output f
+- !Input
+  - 105
+- !Input
+  - 108
+- !Output il
+- !Input
+  - 101
+- !Output e
+- !Input
+  - 110
+- !Output n
+- !Input
+  - 32
+- !Output ' '
+- !Input
+  - 45
+- !Output '-'
+- !Input
+  - 45
+- !Output '-'
+- !Input
+  - 118
+- !Output v
+- !Input
+  - 101
+- !Output e
+- !Input
+  - 114
+- !Output r
+- !Input
+  - 115
+- !Output s
+- !Input
+  - 105
+- !Output i
+- !Input
+  - 111
+- !Output o
+- !Input
+  - 110
+- !Output n
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\rFilen CLI 0.2.7\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+final_output_formatted: "\e[34;1m(manuel)\e[m filen --version\e[m\nFilen CLI 0.2.7\e[m\n\e[34;1m(manuel)\e[m \e[m\n"

@@ -1,0 +1,55 @@
+# Manuel recording file
+
+# (manuel) filen help cd                                                                           #
+# cd <DIRECTORY>                                                                                   #
+# Change the working directory (in REPL)                                                           #
+# → <DIRECTORY>  Directory to navigate into (supports "..")                                        #
+# (manuel)                                                                                         #
+#                                                                                                  #
+
+terminal_width: 97
+recording_items:
+- !Output "\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 102
+- !Output f
+- !Input
+  - 105
+- !Output i
+- !Input
+  - 108
+- !Output l
+- !Input
+  - 101
+- !Output e
+- !Input
+  - 110
+- !Output n
+- !Input
+  - 32
+- !Output ' '
+- !Input
+  - 104
+- !Output h
+- !Input
+  - 101
+- !Output e
+- !Input
+  - 108
+- !Output l
+- !Input
+  - 112
+- !Output p
+- !Input
+  - 32
+- !Output ' '
+- !Input
+  - 99
+- !Output c
+- !Input
+  - 100
+- !Output d
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[4m\e[32mcd\e[0m <DIRECTORY>\r\nChange the working directory (in REPL)\r\n\e[2m→\e[0m \e[32m<DIRECTORY>\e[0m  Directory to navigate into (supports \"..\")\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+final_output_formatted: "\e[34;1m(manuel)\e[m filen help cd\e[m\n\e[32;4mcd\e[m <DIRECTORY>\e[m\nChange the working directory (in REPL)\e[m\n\e[2m→\e[m \e[32m<DIRECTORY>\e[m  Directory to navigate into (supports \"..\")\e[m\n\e[34;1m(manuel)\e[m \e[m\n"

@@ -21,6 +21,8 @@ const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) struct CustomLogger {
 	pub(crate) config: ftail::Config,
+	/// Whether to redact things that depend on the runtime environment, like: paths, ...
+	pub(crate) make_output_environment_agnostic_for_replay_testing: bool,
 }
 
 impl log::Log for CustomLogger {
@@ -33,7 +35,11 @@ impl log::Log for CustomLogger {
 			return;
 		}
 		let now = chrono::Local::now().format(&self.config.datetime_format);
-		let formatted_timestamp = style(format!("[{}]", now)).dim();
+		let formatted_timestamp = if !self.make_output_environment_agnostic_for_replay_testing {
+			style(format!("[{}]", now)).dim()
+		} else {
+			style("[omit]".to_string()).dim()
+		};
 		let formatted_level = match record.level() {
 			log::Level::Error => style("[ERROR]").red(),
 			log::Level::Warn => style("[WARN] ").yellow(),
@@ -43,6 +49,11 @@ impl log::Log for CustomLogger {
 		};
 		let formatted_target = style(format!("({})", record.target())).dim();
 		let msg = record.args().to_string();
+		let msg = if self.make_output_environment_agnostic_for_replay_testing {
+			make_output_environment_agnostic_for_replay_testing(msg)
+		} else {
+			msg
+		};
 		if !msg.starts_with("[PRINT]") {
 			println!(
 				"{} {} {} {}",
@@ -64,6 +75,8 @@ pub(crate) struct UI {
 	/// Whether to output machine-readable JSON where applicable
 	pub(crate) json: bool,
 	disable_suggestions: bool,
+	/// Whether to redact things that depend on the runtime environment, like: paths, ...
+	make_output_environment_agnostic_for_replay_testing: bool,
 }
 
 impl UI {
@@ -75,6 +88,7 @@ impl UI {
 			output: Vec::new(),
 			json: false,
 			disable_suggestions: false,
+			make_output_environment_agnostic_for_replay_testing: false,
 		}
 	}
 
@@ -84,11 +98,14 @@ impl UI {
 		json: bool,
 		override_terminal_width: Option<usize>,
 		disable_suggestions: bool,
+		make_output_environment_agnostic_for_replay_testing: bool,
 	) {
 		self.quiet = quiet;
 		self.json = json;
 		self.override_terminal_width = override_terminal_width;
 		self.disable_suggestions = disable_suggestions;
+		self.make_output_environment_agnostic_for_replay_testing =
+			make_output_environment_agnostic_for_replay_testing;
 	}
 
 	pub(crate) fn is_quiet(&self) -> bool {
@@ -131,9 +148,10 @@ impl UI {
 	}
 
 	pub(crate) fn print(&mut self, msg: &str) {
+		let msg = self.redact_for_replay_testing(msg.to_string());
 		println!("{}", msg);
-		self.output.push(msg.to_string());
 		info!("[PRINT] {}", msg);
+		self.output.push(msg);
 	}
 	pub(crate) fn print_hidden(&self, msg: &str) {
 		info!("[PRINT] {}", msg);
@@ -272,7 +290,7 @@ impl UI {
 		working_path: &RemotePath,
 	) -> Result<ReplPromptResult> {
 		info!("[PROMPT] prompt_repl with path: {}", working_path);
-		let prompt_prefix = format!("({})", client.email());
+		let prompt_prefix = self.redact_for_replay_testing(format!("({})", client.email()));
 		let render_config = RenderConfig::default()
 			.with_prompt_prefix(
 				Styled::new(prompt_prefix.as_str()).with_fg(inquire::ui::Color::LightCyan),
@@ -280,7 +298,8 @@ impl UI {
 			.with_answered_prompt_prefix(
 				Styled::new(prompt_prefix.as_str()).with_fg(inquire::ui::Color::LightCyan),
 			);
-		match inquire::Text::new(&working_path.to_string())
+		let working_path_str = self.redact_for_replay_testing(format!("{}", working_path));
+		match inquire::Text::new(&working_path_str)
 			.with_render_config(render_config)
 			.with_autocomplete(InquireCompleter {
 				client,
@@ -385,7 +404,7 @@ impl UI {
 	/// Prompt the user for a yes/no input
 	pub(crate) fn prompt_confirm(&mut self, msg: &str, default: bool) -> Result<bool> {
 		info!("[PROMPT] prompt_confirm with message: {}", msg);
-		let result = inquire::Confirm::new(msg.trim())
+		let result = inquire::Confirm::new(&self.redact_for_replay_testing(msg.trim().to_string()))
 			.with_default(default)
 			.prompt();
 		match result {
@@ -538,6 +557,33 @@ impl Autocomplete for InquireCompleter {
 	}
 }
 
+/// Redact output that depends on the runtime environment, so it can be matched in Manuel replay testing:
+/// - Environment variables: $HOME, $MANUEL_TMP, $MANUEL_REMOTE_CWD, $MANUEL_EMAIL
+fn make_output_environment_agnostic_for_replay_testing(mut output: String) -> String {
+	for environment_variable in ["HOME", "MANUEL_TMP", "MANUEL_REMOTE_CWD", "MANUEL_EMAIL"] {
+		if let Ok(home_path) = std::env::var(environment_variable) {
+			output = output.replace(
+				&home_path,
+				&style(format!("{} ${} {}", "{{", environment_variable, "}}"))
+					.yellow()
+					.bold()
+					.to_string(),
+			);
+		}
+	}
+	output
+}
+
+impl UI {
+	fn redact_for_replay_testing(&self, output: String) -> String {
+		if self.make_output_environment_agnostic_for_replay_testing {
+			make_output_environment_agnostic_for_replay_testing(output)
+		} else {
+			output
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -568,18 +614,18 @@ mod tests {
 
 		// different terminal sizes
 		let mut small_ui = UI::new();
-		small_ui.initialize(false, false, Some(30), true);
+		small_ui.initialize(false, false, Some(30), true, false);
 		test(&mut small_ui);
 		insta::assert_snapshot!(small_ui.output.join("\n"));
 		let mut large_ui = UI::new();
-		large_ui.initialize(false, false, Some(100), true);
+		large_ui.initialize(false, false, Some(100), true, false);
 		test(&mut large_ui);
 		insta::assert_snapshot!(large_ui.output.join("\n"));
 
 		// no color
 		console::set_colors_enabled(false);
 		let mut no_color_ui = UI::new();
-		no_color_ui.initialize(false, false, Some(100), true);
+		no_color_ui.initialize(false, false, Some(100), true, false);
 		test(&mut no_color_ui);
 		insta::assert_snapshot!(no_color_ui.output.join("\n"));
 	}

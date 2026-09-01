@@ -122,6 +122,12 @@ pub(crate) struct CliArgs {
 
 	#[arg(long, hide = true)]
 	export_markdown_docs: bool,
+
+	#[arg(long, hide = true)]
+	make_output_environment_agnostic_for_replay_testing: bool,
+
+	#[arg(long, hide = true)]
+	working_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -211,7 +217,13 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 	let log_file = config.config_dir.join("logs").join("latest.log");
 	Ftail::new()
 		.custom(
-			|config| Box::new(CustomLogger { config }) as Box<dyn log::Log + Send + Sync>,
+			move |config| {
+				Box::new(CustomLogger {
+					config,
+					make_output_environment_agnostic_for_replay_testing: cli_args
+						.make_output_environment_agnostic_for_replay_testing,
+				}) as Box<dyn log::Log + Send + Sync>
+			},
 			logging_level,
 		)
 		.single_file(&log_file, false, LevelFilter::Debug)
@@ -230,6 +242,7 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		cli_args.json,
 		None,
 		cli_args.reluctant_autocomplete,
+		cli_args.make_output_environment_agnostic_for_replay_testing,
 	);
 
 	// --export-markdown-docs
@@ -279,7 +292,7 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		client_config_args,
 	);
 
-	let mut working_path = RemotePath::new("");
+	let mut working_path = RemotePath::new(&cli_args.working_path.unwrap_or_default());
 
 	if let Some(command) = cli_args.command {
 		let _ = execute_command(&config, ui, &mut client, &working_path, command).await?;
