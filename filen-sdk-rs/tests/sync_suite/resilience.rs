@@ -131,8 +131,8 @@ async fn resil_12_first_run_populated_destination_local_to_remote_mirrors_source
 	// Pre-populate the remote (a "populated destination" before any baseline exists).
 	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
 	let common = upload_root(&sc, "common.txt", b"shared").await;
-	wait_cache_has(&sc, q1.uuid().into()).await;
-	wait_cache_has(&sc, common.uuid().into()).await;
+	wait_cache_has(&sc, q1.uuid()).await;
+	wait_cache_has(&sc, common.uuid()).await;
 
 	// Local-only files + the identical common file.
 	write_file(&sc.local, "p1.txt", b"local-p1");
@@ -199,8 +199,8 @@ async fn resil_12_first_run_populated_destination_remote_to_local_mirrors_source
 
 	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
 	let q2 = upload_root(&sc, "q2.txt", b"remote-q2").await;
-	wait_cache_has(&sc, q1.uuid().into()).await;
-	wait_cache_has(&sc, q2.uuid().into()).await;
+	wait_cache_has(&sc, q1.uuid()).await;
+	wait_cache_has(&sc, q2.uuid()).await;
 
 	// A pre-existing local-only file: in remote-authoritative mode this is mirrored away (correct),
 	// but its bytes must end up recoverable in the local quarantine bin (never destroyed outright).
@@ -262,8 +262,8 @@ async fn resil_12_first_run_populated_destination_two_way_union_no_conflict() {
 
 	let q1 = upload_root(&sc, "q1.txt", b"remote-q1").await;
 	let common = upload_root(&sc, "common.txt", b"shared").await;
-	wait_cache_has(&sc, q1.uuid().into()).await;
-	wait_cache_has(&sc, common.uuid().into()).await;
+	wait_cache_has(&sc, q1.uuid()).await;
+	wait_cache_has(&sc, common.uuid()).await;
 
 	write_file(&sc.local, "p1.txt", b"local-p1");
 	write_file(&sc.local, "common.txt", b"shared");
@@ -395,7 +395,7 @@ async fn resil_17_mass_delete_hold_not_bypassed_by_rerun() {
 #[shared_test_runtime]
 async fn resil_21_baseline_reused_on_reopen_no_churn() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("resil21");

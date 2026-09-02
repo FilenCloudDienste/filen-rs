@@ -127,7 +127,7 @@ async fn observ_02_download_count_equals_new_remote_files() {
 			.await
 			.unwrap();
 		assert!(
-			poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+			poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 			"cache never observed {name}"
 		);
 	}
@@ -663,7 +663,7 @@ async fn observ_15_noop_pass_zero_counts_and_events() {
 
 	// Wait for the cache (the engine's remote view) to observe the just-uploaded file, so the
 	// second pass reconciles against converged truth (a genuine no-op, not a re-upload/lag artifact).
-	let uploaded_uuid: Uuid = list_remote_files(&sc).await[0].uuid().into();
+	let uploaded_uuid = list_remote_files(&sc).await[0].uuid();
 	assert!(
 		poll_for_item(sc.cache.db_path(), uploaded_uuid, CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the uploaded settled.txt"
@@ -770,7 +770,7 @@ async fn observ_18_first_sync_populated_destination_no_wipe() {
 			.await
 			.unwrap();
 		assert!(
-			poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+			poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 			"cache never saw {name}"
 		);
 	}
@@ -815,7 +815,7 @@ async fn observ_19_quarantine_counted_not_data_loss() {
 	let b = client.make_file_builder("q.txt", sc.remote).unwrap();
 	let mut rf = client.upload_file(b, payload).await.unwrap();
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never saw q.txt"
 	);
 
@@ -826,7 +826,7 @@ async fn observ_19_quarantine_counted_not_data_loss() {
 	// Trash on remote; wait for the cache to drop it.
 	client.trash_file(&mut rf).await.unwrap();
 	assert!(
-		poll_for_item_absent(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item_absent(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped trashed q.txt"
 	);
 
@@ -883,7 +883,7 @@ async fn observ_20_watch_self_writes_no_phantom_counts() {
 	use std::time::Duration;
 
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("obs20");

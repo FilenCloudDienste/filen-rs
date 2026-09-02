@@ -109,7 +109,7 @@ async fn path_10_remote_case_only_rename_updates_local() {
 	let content = b"case-only-rename payload";
 	let mut rf = upload_root(&sc, "Report.txt", content).await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed Report.txt"
 	);
 
@@ -130,7 +130,7 @@ async fn path_10_remote_case_only_rename_updates_local() {
 	assert!(
 		poll_for_file_name(
 			sc.cache.db_path(),
-			rf.uuid().into(),
+			rf.uuid(),
 			"REPORT.TXT",
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -182,7 +182,7 @@ async fn path_12_nfc_nfd_normalization_equivalence() {
 	let content = b"unicode normalization payload";
 	let rf = upload_root(&sc, nfc_name, content).await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the accented file"
 	);
 
@@ -268,7 +268,7 @@ async fn path_15_dotfiles_synced_as_content() {
 	// A new remote dotfile pulls down just like any file.
 	let rf = upload_root(&sc, ".remote-only", b"R").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed .remote-only"
 	);
 	let r2 = sc.sync().await;
@@ -303,7 +303,7 @@ async fn path_16_quarantine_bin_not_synced() {
 	let content = b"to-be-quarantined";
 	let mut rf = upload_root(&sc, "doomed.txt", content).await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed doomed.txt"
 	);
 	let r1 = sc.sync().await;
@@ -314,7 +314,7 @@ async fn path_16_quarantine_bin_not_synced() {
 	// Trash on remote; wait for the cache to drop it, then mirror the deletion locally.
 	sc.cache.client.trash_file(&mut rf).await.unwrap();
 	assert!(
-		poll_for_item_absent(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item_absent(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped the trashed file"
 	);
 	let r2 = sc.sync().await;
@@ -496,7 +496,7 @@ async fn path_22_nfc_remote_vs_nfd_local_conflict() {
 	let base = b"shared-baseline";
 	let rf = upload_root(&sc, nfc, base).await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the baseline file"
 	);
 	let r1 = sc.sync().await;
@@ -507,12 +507,7 @@ async fn path_22_nfc_remote_vs_nfd_local_conflict() {
 	write_file(&sc.local, nfd, b"LOCAL-via-NFD");
 	let new_rf = upload_root(&sc, nfc, b"REMOTE-via-NFC-different").await;
 	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			new_rf.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item(sc.cache.db_path(), new_rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the diverged remote version"
 	);
 

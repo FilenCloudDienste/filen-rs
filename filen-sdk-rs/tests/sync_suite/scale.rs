@@ -277,7 +277,7 @@ async fn scale_a_tiny_remote_incremental_after_baseline() {
 	}
 	for f in &seeded {
 		assert!(
-			poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+			poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 			"cache never saw seeded file"
 		);
 	}
@@ -291,19 +291,14 @@ async fn scale_a_tiny_remote_incremental_after_baseline() {
 	assert!(
 		poll_for_item(
 			sc.cache.db_path(),
-			new_modified.uuid().into(),
+			new_modified.uuid(),
 			CACHE_CONVERGE_TIMEOUT
 		)
 		.await,
 		"cache never saw the re-versioned file"
 	);
 	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			brand_new.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item(sc.cache.db_path(), brand_new.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never saw the new remote file"
 	);
 
@@ -387,16 +382,9 @@ async fn scale_04_wide_remote_dir_download_then_incremental() {
 		seeded.push(f);
 	}
 	// Wait until the cache holds the dir + all files.
-	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			dir.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(sc.cache.db_path(), dir.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	for f in &seeded {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 
 	let r1 = sc.sync().await;
@@ -429,7 +417,7 @@ async fn scale_04_wide_remote_dir_download_then_incremental() {
 		more.push(f);
 	}
 	for f in &more {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 
 	let r2 = sc.sync().await;
@@ -606,16 +594,9 @@ async fn scale_b_remote_move_batch_is_local_moves_not_redownload() {
 		.await;
 		seeded.push(f);
 	}
-	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			dir_a.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(sc.cache.db_path(), dir_a.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	for f in &seeded {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -636,9 +617,9 @@ async fn scale_b_remote_move_batch_is_local_moves_not_redownload() {
 	}
 	let _ = &mut dir_a;
 	// Wait for the cache to reflect the new parent for every moved file.
-	let b_uuid: Uuid = dir_b.uuid().into();
+	let b_uuid: Uuid = dir_b.uuid();
 	for f in &seeded {
-		let fu: Uuid = f.uuid().into();
+		let fu: Uuid = f.uuid();
 		let db = sc.cache.db_path().to_path_buf();
 		assert!(
 			poll_until(CACHE_CONVERGE_TIMEOUT, || {
@@ -764,7 +745,7 @@ async fn scale_12_remote_delete_batch_quarantined_recoverable() {
 		);
 	}
 	for f in keep.iter().chain(drop.iter()) {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -775,9 +756,7 @@ async fn scale_12_remote_delete_batch_quarantined_recoverable() {
 		sc.resources.client.trash_file(f).await.unwrap();
 	}
 	for f in &drop {
-		assert!(
-			poll_for_item_absent(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await
-		);
+		assert!(poll_for_item_absent(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 
 	let r2 = sc.sync().await;
@@ -841,16 +820,9 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 		);
 	}
 	let outside = upload_root(&sc, "outside.txt", b"survivor").await;
-	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			doomed.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(sc.cache.db_path(), doomed.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	for f in inside.iter().chain(std::iter::once(&outside)) {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -859,9 +831,7 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 	// Trash the whole subtree on the remote.
 	sc.resources.client.trash_dir(&mut doomed).await.unwrap();
 	for f in &inside {
-		assert!(
-			poll_for_item_absent(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await
-		);
+		assert!(poll_for_item_absent(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 
 	let r2 = sc.sync().await;
@@ -1155,7 +1125,7 @@ async fn scale_19_first_sync_into_populated_remote_no_wipe() {
 		);
 	}
 	for f in &remote_files {
-		assert!(poll_for_item(sc.cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+		assert!(poll_for_item(sc.cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	}
 
 	let r1 = sc.sync().await;
@@ -1286,7 +1256,7 @@ async fn scale_20_local_backup_delete_not_mirrored() {
 async fn scale_21_baseline_persists_across_restart() {
 	// Build the fixture manually so we can reuse one fixed baseline DB path across two `open`s.
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("scale21");

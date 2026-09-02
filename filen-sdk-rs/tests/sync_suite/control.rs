@@ -38,7 +38,7 @@ async fn raw_setup(
 	std::path::PathBuf,
 ) {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir(tag);
@@ -92,7 +92,7 @@ fn has_file(files: &[filen_sdk_rs::fs::file::RemoteFile], name: &str) -> bool {
 async fn control_04_add_second_pair_disjoint_both_converge() {
 	// P1: localA -> remoteA (push). P2: localB <- remoteB (pull). Disjoint roots, one engine.
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote_a: Uuid = resources.dir.uuid().into();
+	let remote_a: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote_a).await;
 	wait_for_converged_resync(&cache.messages, remote_a, 0, CACHE_CONVERGE_TIMEOUT).await;
 
@@ -105,7 +105,7 @@ async fn control_04_add_second_pair_disjoint_both_converge() {
 		)
 		.await
 		.unwrap();
-	let remote_b: Uuid = sub_b.uuid().into();
+	let remote_b: Uuid = sub_b.uuid();
 	// Seed a pending remote file for P2.
 	let b_builder = cache
 		.client
@@ -117,12 +117,7 @@ async fn control_04_add_second_pair_disjoint_both_converge() {
 		.await
 		.unwrap();
 	assert!(
-		poll_for_item(
-			cache.db_path(),
-			b_file.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item(cache.db_path(), b_file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed P2's remote file"
 	);
 
@@ -187,7 +182,7 @@ async fn control_04_add_second_pair_disjoint_both_converge() {
 #[shared_test_runtime]
 async fn control_07_three_disjoint_pairs_no_cross_contamination() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let root: Uuid = resources.dir.uuid().into();
+	let root: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
 	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
 
@@ -199,7 +194,7 @@ async fn control_07_three_disjoint_pairs_no_cross_contamination() {
 	// P2 gets a pending remote create (it's the pull pair).
 	let p2b = cache.client.make_file_builder("r2.txt", r2.uuid()).unwrap();
 	let p2f = cache.client.upload_file(p2b, b"p2 remote").await.unwrap();
-	assert!(poll_for_item(cache.db_path(), p2f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(cache.db_path(), p2f.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let local1 = fresh_local_dir("c07p1"); // local create
 	let local2 = fresh_local_dir("c07p2"); // remote create -> pull
@@ -210,15 +205,15 @@ async fn control_07_three_disjoint_pairs_no_cross_contamination() {
 		.await
 		.unwrap();
 	let pair1 = engine
-		.add_pair(local1.clone(), r1.uuid().into(), SyncMode::LocalToRemote)
+		.add_pair(local1.clone(), r1.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 	let pair2 = engine
-		.add_pair(local2.clone(), r2.uuid().into(), SyncMode::RemoteToLocal)
+		.add_pair(local2.clone(), r2.uuid(), SyncMode::RemoteToLocal)
 		.await
 		.unwrap();
 	let pair3 = engine
-		.add_pair(local3.clone(), r3.uuid().into(), SyncMode::TwoWay)
+		.add_pair(local3.clone(), r3.uuid(), SyncMode::TwoWay)
 		.await
 		.unwrap();
 
@@ -398,7 +393,7 @@ async fn control_12_offline_changes_detected_after_reopen() {
 		.unwrap();
 	let rf = cache.client.upload_file(rb, b"new remote").await.unwrap();
 	assert!(
-		poll_for_item(cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the offline remote add"
 	);
 
@@ -541,7 +536,7 @@ async fn control_20_watch_self_writes_do_not_loop() {
 #[shared_test_runtime]
 async fn control_22_bad_root_isolated_from_healthy_pair() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote_p1: Uuid = resources.dir.uuid().into();
+	let remote_p1: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote_p1).await;
 	wait_for_converged_resync(&cache.messages, remote_p1, 0, CACHE_CONVERGE_TIMEOUT).await;
 
@@ -606,7 +601,7 @@ async fn control_22_bad_root_isolated_from_healthy_pair() {
 #[shared_test_runtime]
 async fn control_add_during_watch_live_pickup() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let root: Uuid = resources.dir.uuid().into();
+	let root: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, root).await;
 	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
 
@@ -623,14 +618,14 @@ async fn control_add_during_watch_live_pickup() {
 			.unwrap(),
 	);
 	let pair1 = engine
-		.add_pair(local1.clone(), r1.uuid().into(), SyncMode::LocalToRemote)
+		.add_pair(local1.clone(), r1.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 	let h1 = engine.clone().watch(pair1).await.unwrap();
 
 	// While P1's watcher is live, add P2 and start watching it too.
 	let pair2 = engine
-		.add_pair(local2.clone(), r2.uuid().into(), SyncMode::LocalToRemote)
+		.add_pair(local2.clone(), r2.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 	let h2 = engine.clone().watch(pair2).await.unwrap();

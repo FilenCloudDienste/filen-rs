@@ -147,7 +147,7 @@ async fn upload_remote(client: &Client, parent: Uuid, name: &str, data: &[u8]) -
 async fn sec01_baseline_has_no_credentials_or_key_material() {
 	// Build the engine on a KNOWN baseline-db path so we can read its raw bytes afterwards.
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: uuid::Uuid = resources.dir.uuid().into();
+	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("sec01");
@@ -171,7 +171,7 @@ async fn sec01_baseline_has_no_credentials_or_key_material() {
 	)
 	.await;
 	assert!(
-		poll_for_item(cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the remote seed file"
 	);
 
@@ -204,7 +204,7 @@ async fn sec01_baseline_has_no_credentials_or_key_material() {
 #[shared_test_runtime]
 async fn sec02_baseline_has_no_decrypted_content() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: uuid::Uuid = resources.dir.uuid().into();
+	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	let local = fresh_local_dir("sec02");
 	let baseline_db = temp_cache_path();
@@ -225,7 +225,7 @@ async fn sec02_baseline_has_no_decrypted_content() {
 	)
 	.await;
 	assert!(
-		poll_for_item(cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the secret file"
 	);
 
@@ -244,7 +244,7 @@ async fn sec02_baseline_has_no_decrypted_content() {
 	let mut modified = SECRET_MARKER.to_vec();
 	modified.push(b'X');
 	let rf2 = upload_remote(&cache.client, resources.dir.uuid(), "secret.bin", &modified).await;
-	assert!(poll_for_item(cache.db_path(), rf2.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(cache.db_path(), rf2.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	let db = baseline_db.clone();
 	let _ = db;
 	let mut r2 = engine.sync_once(pair).await.unwrap();
@@ -278,7 +278,7 @@ async fn sec02_baseline_has_no_decrypted_content() {
 async fn sec03_quarantine_has_only_recoverable_user_data() {
 	// RemoteToLocal: a remote delete propagates a LOCAL delete, which the engine quarantines.
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: uuid::Uuid = resources.dir.uuid().into();
+	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	let local = fresh_local_dir("sec03");
 	let baseline_db = temp_cache_path();
@@ -304,15 +304,8 @@ async fn sec03_quarantine_has_only_recoverable_user_data() {
 		SECRET_MARKER,
 	)
 	.await;
-	assert!(poll_for_item(cache.db_path(), keep.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
-	assert!(
-		poll_for_item(
-			cache.db_path(),
-			doomed.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(cache.db_path(), doomed.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let r1 = engine.sync_once(pair).await.unwrap();
 	assert_eq!(r1.downloaded, 2, "{r1:?}");
@@ -320,12 +313,7 @@ async fn sec03_quarantine_has_only_recoverable_user_data() {
 	// Trash doomed.txt on the remote; the engine should quarantine its local copy.
 	cache.client.trash_file(&mut doomed).await.unwrap();
 	assert!(
-		poll_for_item_absent(
-			cache.db_path(),
-			doomed.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item_absent(cache.db_path(), doomed.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped the trashed file"
 	);
 	let r2 = engine.sync_once(pair).await.unwrap();
@@ -380,7 +368,7 @@ async fn sec03_quarantine_has_only_recoverable_user_data() {
 #[shared_test_runtime]
 async fn sec04_decrypted_content_confined_to_destination() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: uuid::Uuid = resources.dir.uuid().into();
+	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	let local = fresh_local_dir("sec04");
 	let baseline_db = temp_cache_path();
@@ -400,7 +388,7 @@ async fn sec04_decrypted_content_confined_to_destination() {
 		content.push(b'-');
 		content.push(b'0' + i);
 		let rf = upload_remote(&cache.client, resources.dir.uuid(), &name, &content).await;
-		assert!(poll_for_item(cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+		assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 		markers.push((name, content));
 	}
 
@@ -459,7 +447,7 @@ async fn sec09_created_files_use_restrictive_permissions() {
 	use filen_sdk_rs::fs::categories::{DirType, Normal};
 
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: uuid::Uuid = resources.dir.uuid().into();
+	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	let local = fresh_local_dir("sec09");
 	let baseline_db = temp_cache_path();
@@ -481,7 +469,7 @@ async fn sec09_created_files_use_restrictive_permissions() {
 		.await
 		.unwrap();
 	let rf = upload_remote(&cache.client, sub.uuid(), "key.pem", SECRET_MARKER).await;
-	assert!(poll_for_item(cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let report = engine.sync_once(pair).await.unwrap();
 	assert!(report.errors.is_empty(), "{report:?}");
@@ -539,7 +527,7 @@ fn current_uid() -> u32 {
 #[shared_test_runtime]
 async fn sec10_event_stream_and_report_omit_secrets() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: uuid::Uuid = resources.dir.uuid().into();
+	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("sec10");
@@ -626,7 +614,7 @@ async fn sec15_watch_self_write_does_not_leak_or_reupload() {
 	use std::time::Duration;
 
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: uuid::Uuid = resources.dir.uuid().into();
+	let remote: uuid::Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	let local = fresh_local_dir("sec15");
 	let baseline_db = temp_cache_path();
@@ -650,7 +638,7 @@ async fn sec15_watch_self_write_does_not_leak_or_reupload() {
 		SECRET_MARKER,
 	)
 	.await;
-	assert!(poll_for_item(cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let handle = engine.clone().watch(pair).await.unwrap();
 
