@@ -450,6 +450,7 @@ async fn apply_transfer(
 			// someone ELSE having written there since (a third uuid).
 			ctx.pending.record_create(
 				ctx.observed,
+				ctx.pair,
 				new_uuid,
 				rel_path,
 				ctx.remote.get(rel_path).map(|node| node.remote_uuid),
@@ -515,6 +516,7 @@ async fn apply_one(
 			let new_uuid: Uuid = new_dir.uuid();
 			ctx.pending.record_create(
 				ctx.observed,
+				ctx.pair,
 				new_uuid,
 				rel_path,
 				ctx.remote.get(rel_path).map(|node| node.remote_uuid),
@@ -551,7 +553,8 @@ async fn apply_one(
 			// The row is about to go, so a snapshot that has not applied the trash yet reads this
 			// item as an untracked remote file with nothing local — a deletion to make all over
 			// again. Record the trash so the next pass suppresses that.
-			ctx.pending.record_trash(ctx.observed, *remote_uuid);
+			ctx.pending
+				.record_trash(ctx.observed, ctx.pair, *remote_uuid);
 			delete_baseline(ctx, rel_path).await?;
 			report.remotely_trashed += 1;
 		}
@@ -584,7 +587,7 @@ async fn apply_one(
 			}
 			let local = ctx.local.get(to_path);
 			ctx.pending
-				.record_move(ctx.observed, *remote_uuid, from_path);
+				.record_move(ctx.observed, ctx.pair, *remote_uuid, from_path);
 			delete_baseline(ctx, from_path).await?;
 			upsert_file_baseline(
 				ctx,
