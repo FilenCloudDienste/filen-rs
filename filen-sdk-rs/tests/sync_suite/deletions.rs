@@ -301,11 +301,64 @@ async fn delete_04_mass_delete_guard_holds_large_fraction() {
 // no `confirm`/`approve`/`resume` entrypoint on `SyncEngine`).
 // ============================================================================
 
-#[ignore = "blocked: no public mass-delete confirmation/grant entrypoint on SyncEngine — see TODO"]
 #[shared_test_runtime]
 async fn delete_05_mass_delete_guard_applies_after_confirmation() {
-	// plan: sync 100 up; delete 90; pass holds; GRANT confirmation; re-run; assert 90 absent,
-	// 10 survivors byte-exact, baseline references only the 10, report counts 90 deletions.
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	const TOTAL: usize = 100;
+	const DELETE: usize = 90;
+	for i in 0..TOTAL {
+		write_file(
+			&sc.local,
+			&format!("file{i:03}.txt"),
+			format!("c{i}").as_bytes(),
+		);
+	}
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, TOTAL, "{r1:?}");
+
+	for i in 0..DELETE {
+		std::fs::remove_file(sc.local.join(format!("file{i:03}.txt"))).unwrap();
+	}
+
+	// Pass 1 holds the whole batch and names it with a token.
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.held_deletions, DELETE, "the whole batch is held: {r2:?}");
+	assert_eq!(r2.remotely_trashed, 0, "nothing deleted unapproved: {r2:?}");
+	let token = r2
+		.deletion_token
+		.clone()
+		.expect("a held batch must carry a token");
+
+	// GRANT the confirmation; the next pass applies exactly that batch.
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(
+		r3.remotely_trashed, DELETE,
+		"approved batch applied: {r3:?}"
+	);
+	assert_eq!(r3.held_deletions, 0, "nothing still held: {r3:?}");
+
+	// Exactly the 10 survivors remain, byte-exact.
+	let (_d, files) = list_root(&sc).await;
+	assert_eq!(files.len(), TOTAL - DELETE, "wrong survivor count");
+	for i in DELETE..TOTAL {
+		let f = find_file(&files, &format!("file{i:03}.txt")).expect("survivor vanished");
+		assert_eq!(f.size, format!("c{i}").len() as u64, "{f:?}");
+	}
+
+	// The approval was ONE-SHOT: the pass after it is a clean no-op, and the baseline now tracks
+	// only the survivors (a further deletion of one of them applies straight away, under the floor).
+	let r4 = sc.sync().await;
+	assert_eq!(r4.remotely_trashed, 0, "{r4:?}");
+	assert_eq!(r4.held_deletions, 0, "{r4:?}");
+	std::fs::remove_file(sc.local.join(format!("file{:03}.txt", TOTAL - 1))).unwrap();
+	let r5 = sc.sync().await;
+	assert_eq!(r5.remotely_trashed, 1, "small follow-up delete: {r5:?}");
+	assert_eq!(r5.held_deletions, 0, "{r5:?}");
+
+	sc.cleanup();
 }
 
 // ============================================================================

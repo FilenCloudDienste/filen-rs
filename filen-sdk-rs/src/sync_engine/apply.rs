@@ -55,6 +55,10 @@ pub struct SyncReport {
 	pub held_deletions: usize,
 	/// Set when the guard held deletions; a human-readable reason.
 	pub guard_message: Option<String>,
+	/// Set when the guard held deletions: the token identifying THIS held batch, to hand back to
+	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions). It changes if the
+	/// batch changes, so an approval can never leak onto a different set of deletions.
+	pub deletion_token: Option<String>,
 	/// Per-action failures (the pass continues past them).
 	pub errors: Vec<String>,
 }
