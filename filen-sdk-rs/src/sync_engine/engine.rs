@@ -363,6 +363,7 @@ impl SyncEngine {
 			pair,
 			store: &self.store,
 			local: &prep.local_scan.nodes,
+			baseline: &prep.baseline,
 			remote: &prep.remote_view.nodes,
 			root_remote,
 			absence_trusted: state.absence_trusted(),
