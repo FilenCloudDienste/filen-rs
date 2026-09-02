@@ -860,22 +860,35 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 	});
 }
 
+/// What a pass must NOT act on, beyond what the three inputs themselves say.
+#[derive(Debug, Default)]
+pub(crate) struct PassHolds {
+	/// Remote uuids this engine wrote so recently that the cache — which learns of our own writes
+	/// only through socket events and resyncs — demonstrably still shows the pre-write state.
+	/// Their paths are left completely alone, so a just-uploaded file is neither re-uploaded nor
+	/// read as a remote-side deletion, and a just-moved one is not moved back. The engine decides
+	/// which uuids qualify (see `PendingWrites`).
+	pub(crate) pending: HashSet<Uuid>,
+}
+
+/// One reconciled pass.
+pub(crate) struct Plan {
+	pub(crate) actions: Vec<SyncAction>,
+	/// How many paths the pass deliberately left alone. A pass that skips everything it would
+	/// otherwise have done is not the same as a pass with nothing to do, and the report has to be
+	/// able to tell them apart.
+	pub(crate) deferred_paths: usize,
+}
+
 /// Reconcile a pair's three inputs into an ordered action plan. `baseline`/`local`/`remote` are all
-/// keyed by the same NFC-normalized relative path.
-///
-/// `pending` holds remote uuids this engine wrote so recently that the cache — which learns of our
-/// own writes only through socket events and resyncs — demonstrably still shows the pre-write
-/// state. Their paths are left completely alone this pass, so a just-uploaded file is neither
-/// re-uploaded nor read as a remote-side deletion, and a just-moved one is not moved back. The
-/// engine decides which uuids qualify (see `PendingWrites`) and how long the window lasts (see
-/// `PENDING_CREATE_GRACE`).
+/// keyed by the same NFC-normalized relative path; `holds` is what the pass must leave alone.
 pub(crate) fn reconcile(
 	mode: super::SyncMode,
 	baseline: &HashMap<String, BaselineEntry>,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
-	pending: &HashSet<Uuid>,
-) -> Vec<SyncAction> {
+	holds: &PassHolds,
+) -> Plan {
 	let mut actions = Vec::new();
 	let mut consumed = HashSet::new();
 	tracing::debug!(
@@ -893,7 +906,8 @@ pub(crate) fn reconcile(
 
 	// Consume the paths the snapshot is behind on before anything else looks at them, so neither
 	// move detection nor the per-path reconcile can act on a cache that has not caught up.
-	let stale = stale_pending_paths(baseline, remote, pending);
+	let stale = stale_pending_paths(baseline, remote, &holds.pending);
+	let mut deferred_paths = 0;
 	if !stale.is_empty() {
 		for key in &keys {
 			if is_under_stale_path(key, &stale) {
@@ -901,6 +915,7 @@ pub(crate) fn reconcile(
 					"reconcile: skipping {key:?} — a just-written remote item there is not yet visible in the cache"
 				);
 				consumed.insert((*key).to_string());
+				deferred_paths += 1;
 			}
 		}
 	}
@@ -952,8 +967,14 @@ pub(crate) fn reconcile(
 
 	suppress_conflicted_subtrees(&mut actions);
 	order_actions(&mut actions);
-	tracing::debug!("reconcile: planned {} action(s)", actions.len());
-	actions
+	tracing::debug!(
+		"reconcile: planned {} action(s), {deferred_paths} path(s) deferred",
+		actions.len()
+	);
+	Plan {
+		actions,
+		deferred_paths,
+	}
 }
 
 /// Apply phases, lowest first. A "replace-delete" (a delete whose path is also created this pass —
@@ -1058,7 +1079,18 @@ mod tests {
 		local: &HashMap<String, LocalNode>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		reconcile(mode, baseline, local, remote, &HashSet::new())
+		reconcile(mode, baseline, local, remote, &PassHolds::default()).actions
+	}
+
+	/// Reconcile with `pending` remote uuids the cache has not caught up to.
+	fn plan_pending(
+		mode: SyncMode,
+		baseline: &HashMap<String, BaselineEntry>,
+		local: &HashMap<String, LocalNode>,
+		remote: &HashMap<String, RemoteNode>,
+		pending: HashSet<Uuid>,
+	) -> Vec<SyncAction> {
+		reconcile(mode, baseline, local, remote, &PassHolds { pending }).actions
 	}
 
 	fn ms(millis: i64) -> DateTime<Utc> {
@@ -1495,7 +1527,7 @@ mod tests {
 		let pending = HashSet::from([uuid]);
 		for mode in ALL_MODES {
 			assert!(
-				reconcile(mode, &baseline, &local, &remote, &pending).is_empty(),
+				plan_pending(mode, &baseline, &local, &remote, pending.clone()).is_empty(),
 				"{mode:?} must neither re-transfer nor delete a write the cache has not seen"
 			);
 		}
@@ -1525,12 +1557,12 @@ mod tests {
 		// Neither the new dir nor its child has reached the cache yet.
 		let pending = HashSet::from([dir_uuid, file_uuid]);
 		assert!(
-			reconcile(
+			plan_pending(
 				SyncMode::LocalToRemote,
 				&baseline,
 				&local,
 				&HashMap::new(),
-				&pending
+				pending
 			)
 			.is_empty(),
 			"a pending dir must not be re-created, and its children must not be uploaded into a \
@@ -1539,12 +1571,12 @@ mod tests {
 		// A child whose OWN uuid has settled is still shielded by the invisible parent.
 		let pending = HashSet::from([dir_uuid]);
 		assert!(
-			reconcile(
+			plan_pending(
 				SyncMode::LocalToRemote,
 				&baseline,
 				&local,
 				&HashMap::new(),
-				&pending
+				pending
 			)
 			.is_empty()
 		);
@@ -1561,7 +1593,7 @@ mod tests {
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
 		for mode in ALL_MODES {
 			assert!(
-				reconcile(mode, &baseline, &local, &remote, &HashSet::from([uuid])).is_empty(),
+				plan_pending(mode, &baseline, &local, &remote, HashSet::from([uuid])).is_empty(),
 				"{mode:?} must leave both ends of an unapplied move alone"
 			);
 		}
