@@ -326,6 +326,20 @@ impl SyncEngine {
 		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
 
 		for rel_path in &report.conflicts {
+			// HOLD the conflict in the baseline: the path (and its subtree) is excluded from
+			// planning until `resolve_conflict` picks a winner, instead of being re-surfaced,
+			// unresolvable, on every pass.
+			if let Err(error) = apply::record_conflict(
+				&self.store,
+				pair,
+				rel_path,
+				prep.local_scan.nodes.get(rel_path),
+				prep.remote_view.nodes.get(rel_path),
+			)
+			.await
+			{
+				report.errors.push(format!("{rel_path}: {error}"));
+			}
 			observer(SyncEvent::Conflict {
 				rel_path: rel_path.clone(),
 			});
