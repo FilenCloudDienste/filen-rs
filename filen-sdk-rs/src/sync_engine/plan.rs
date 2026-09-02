@@ -1106,6 +1106,10 @@ mod tests {
 			local_mtime: None,
 			remote_modified: None,
 			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
 		}
 	}
 
@@ -1119,6 +1123,10 @@ mod tests {
 			local_mtime: Some(1),
 			remote_modified: Some(1),
 			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
 		}
 	}
 
@@ -1351,6 +1359,10 @@ mod tests {
 			local_mtime: None,
 			remote_modified: None,
 			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
 		};
 		let baseline = map(vec![
 			("old", base_dir),

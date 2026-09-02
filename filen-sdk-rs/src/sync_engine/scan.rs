@@ -322,6 +322,10 @@ mod tests {
 				local_mtime: Some(mtime),
 				remote_modified: None,
 				state: BaselineState::Synced,
+				local_kind: None,
+				remote_kind: None,
+				remote_hash: None,
+				remote_size: None,
 			},
 		)]);
 
