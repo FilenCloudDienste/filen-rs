@@ -15,7 +15,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
+use filen_sdk_rs::sync_engine::{ConflictResolution, SyncEngine, SyncMode};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -664,12 +664,6 @@ async fn conflict_07_rename_vs_rename_file() {
 // ===========================================================================
 // CONFLICT-08 — file edited locally, replaced by directory on the remote
 // ===========================================================================
-#[ignore = "blocked: descendant suppression under a conflicted path (deferred review finding). A \
-two-way file<->dir type flip (A edits the file `thing`; B replaces it with a dir `thing/child.txt`) \
-IS correctly surfaced as a conflict on `thing`, and no data is lost — but B's pass still tries to \
-upload the descendant `thing/child.txt` and errors with `remote parent dir for upload is missing`, \
-because the dir `thing` cannot be created while the conflicting file `thing` holds the path. The \
-engine must skip actions on descendants of a path it is holding in conflict. TODO"]
 #[shared_test_runtime]
 async fn conflict_08_file_edit_vs_remote_type_flip_to_dir() {
 	let tc = two_clients(SyncMode::TwoWay).await;
@@ -1838,6 +1832,41 @@ async fn upload_remote_single(sc: &SingleClient, name: &str, data: &[u8]) -> Rem
 	sc.resources.client.upload_file(b, data).await.unwrap()
 }
 
+/// Wait until the engine's cache has observed `uuid` (its remote view is fed by the cache, not by
+/// the server directly), so the next pass reconciles against fresh truth.
+async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
+	assert!(
+		poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed item {uuid}"
+	);
+}
+
+/// Wait until the cache has observed the CURRENT remote version of `name` — i.e. the version the
+/// engine itself just pushed — so a follow-up pass is not reconciled against a stale snapshot.
+async fn wait_cache_current(sc: &SingleClient, name: &str) {
+	let uuid = remote_file_uuid(sc, name)
+		.await
+		.unwrap_or_else(|| panic!("remote file {name} does not exist"));
+	wait_cache_has(sc, uuid).await;
+}
+
+/// The uuid of the CURRENT remote version of `name` under the SingleClient's root (ground truth).
+async fn remote_file_uuid(sc: &SingleClient, name: &str) -> Option<Uuid> {
+	let (_d, files) = sc
+		.resources
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap();
+	files
+		.into_iter()
+		.find(|f| f.name() == Some(name))
+		.map(|f| f.uuid())
+}
+
 /// The current `size` of remote file `name` under the SingleClient's root (ground truth via a
 /// fresh listing). Returns None if absent. We assert on size — not raw bytes — because the public
 /// native download path is not exposed as a simple `Client` method here; pick distinct-length
@@ -1893,22 +1922,276 @@ async fn conflict_12_sanitization_collision_onto_one_local_path() {
 	// assert both preserved (one disambiguated) or collision held; deterministic re-run.
 }
 
-#[ignore = "blocked: needs a conflict-RESOLUTION API (instruct the engine to keep local/remote and \
-advance the baseline). The public surface (SyncEngine: open/add_pair/sync_once/watch) exposes no \
-resolve entry point, so a caller cannot drive resolution. TODO: add a resolve_conflict(pair, path, \
-choice) public method (or document the file-system convention) before implementing."]
+/// CONFLICT-16 — resolving a held conflict KEEP-LOCAL pushes the local copy on the next pass.
+///
+/// (The original plan also wanted the losing remote version "preserved recoverably". Under the
+/// engine's resolution model that is what `KeepBoth` is for — see `conflict_19` — while `KeepLocal`
+/// deliberately makes the local copy win outright.)
 #[shared_test_runtime]
 async fn conflict_16_resolve_keep_local() {
-	// plan: reach a two-way conflict on conf.txt (L/R); resolve keep-LOCAL; sync; assert both sides
-	// hold L, conflict gone on subsequent passes, R preserved recoverably, baseline clean.
+	let sc = single_client(SyncMode::TwoWay).await;
+
+	// Converge a shared baseline, then diverge BOTH sides (distinct lengths name the winner).
+	write_file(&sc.local, "conf.txt", b"BASE");
+	assert_eq!(sc.sync().await.uploaded, 1);
+	write_file(&sc.local, "conf.txt", b"LLLLLLLLLL");
+	let remote_version = upload_remote_single(&sc, "conf.txt", b"RRR").await;
+	wait_cache_has(&sc, remote_version.uuid()).await;
+
+	// The divergence is surfaced and HELD: no transfer, and it does not silently resolve itself.
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert!(
+		r2.conflicts.iter().any(|c| c == "conf.txt"),
+		"divergence must surface: {r2:?}"
+	);
+	assert_eq!(
+		r2.uploaded + r2.downloaded,
+		0,
+		"a held conflict moves nothing: {r2:?}"
+	);
+	let r3 = sc.sync().await;
+	assert!(
+		r3.conflicts.iter().any(|c| c == "conf.txt"),
+		"the conflict must stay held until resolved: {r3:?}"
+	);
+	assert_eq!(r3.uploaded + r3.downloaded, 0, "{r3:?}");
+
+	// Resolve keep-LOCAL; the next pass pushes the local copy and clears the hold.
+	sc.engine
+		.resolve_conflict(sc.pair, "conf.txt", ConflictResolution::KeepLocal)
+		.await
+		.expect("resolve keep-local");
+	let r4 = sc.sync().await;
+	assert!(r4.errors.is_empty(), "{r4:?}");
+	assert!(r4.conflicts.is_empty(), "conflict not cleared: {r4:?}");
+	assert_eq!(
+		r4.uploaded, 1,
+		"keep-local must push the local copy: {r4:?}"
+	);
+	assert_eq!(r4.downloaded, 0, "keep-local must not pull: {r4:?}");
+
+	// Both sides now hold the local-wins bytes.
+	assert!(read_eq(&sc.local, "conf.txt", b"LLLLLLLLLL"));
+	assert_eq!(
+		remote_file_size(&sc, "conf.txt").await,
+		Some(10),
+		"remote must hold the local-wins content"
+	);
+
+	// Settled: the resolved conflict never returns and the winner is never clobbered.
+	wait_cache_current(&sc, "conf.txt").await;
+	let r5 = sc.sync().await;
+	assert!(r5.conflicts.is_empty(), "the conflict came back: {r5:?}");
+	assert_eq!(
+		r5.uploaded + r5.downloaded,
+		0,
+		"re-run must be a no-op: {r5:?}"
+	);
+	assert!(
+		read_eq(&sc.local, "conf.txt", b"LLLLLLLLLL"),
+		"the keep-local winner was clobbered"
+	);
+
+	sc.cleanup();
 }
 
-#[ignore = "blocked: needs a conflict-RESOLUTION API (keep-remote). Same gap as conflict_16. TODO: \
-add resolve_conflict(pair, path, KeepRemote)."]
+/// CONFLICT-17 — resolving a held conflict KEEP-REMOTE pulls the remote copy on the next pass.
+///
+/// (As with `conflict_16`, keeping the LOSING side recoverable is `KeepBoth`'s job — `KeepRemote`
+/// deliberately lets the remote copy win outright.)
 #[shared_test_runtime]
 async fn conflict_17_resolve_keep_remote() {
-	// plan: reach a two-way conflict on conf2.txt (L/R); resolve keep-REMOTE; sync; assert both sides
-	// hold R, conflict gone, L preserved recoverably, baseline clean.
+	let sc = single_client(SyncMode::TwoWay).await;
+
+	write_file(&sc.local, "conf2.txt", b"BASE");
+	assert_eq!(sc.sync().await.uploaded, 1);
+	write_file(&sc.local, "conf2.txt", b"LLLLLLLLLL");
+	let remote_version = upload_remote_single(&sc, "conf2.txt", b"RRR").await;
+	wait_cache_has(&sc, remote_version.uuid()).await;
+
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert!(
+		r2.conflicts.iter().any(|c| c == "conf2.txt"),
+		"divergence must surface: {r2:?}"
+	);
+
+	sc.engine
+		.resolve_conflict(sc.pair, "conf2.txt", ConflictResolution::KeepRemote)
+		.await
+		.expect("resolve keep-remote");
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert!(r3.conflicts.is_empty(), "conflict not cleared: {r3:?}");
+	assert_eq!(
+		r3.downloaded, 1,
+		"keep-remote must pull the remote copy: {r3:?}"
+	);
+	assert_eq!(r3.uploaded, 0, "keep-remote must not push: {r3:?}");
+
+	// Both sides now hold the remote-wins bytes.
+	assert!(read_eq(&sc.local, "conf2.txt", b"RRR"));
+	assert_eq!(remote_file_size(&sc, "conf2.txt").await, Some(3));
+
+	let r4 = sc.sync().await;
+	assert!(r4.conflicts.is_empty(), "the conflict came back: {r4:?}");
+	assert_eq!(
+		r4.uploaded + r4.downloaded,
+		0,
+		"re-run must be a no-op: {r4:?}"
+	);
+	assert!(read_eq(&sc.local, "conf2.txt", b"RRR"));
+
+	sc.cleanup();
+}
+
+/// CONFLICT-19 — two sequential conflicts on ONE path, each resolved KEEP-BOTH, produce distinctly
+/// named preserved copies: `a.old.txt` then `a.old.1.txt`, never a collision or a re-ingest loop.
+#[shared_test_runtime]
+async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
+	let sc = single_client(SyncMode::TwoWay).await;
+
+	write_file(&sc.local, "a.txt", b"BASE");
+	assert_eq!(sc.sync().await.uploaded, 1);
+
+	// --- first conflict, resolved keep-both -> a.old.txt ---
+	write_file(&sc.local, "a.txt", b"LOCAL-1");
+	let v1 = upload_remote_single(&sc, "a.txt", b"REMOTE-1").await;
+	wait_cache_has(&sc, v1.uuid()).await;
+	assert!(
+		sc.sync().await.conflicts.iter().any(|c| c == "a.txt"),
+		"first conflict must surface"
+	);
+	sc.engine
+		.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
+		.await
+		.expect("first keep-both");
+	assert!(
+		read_eq(&sc.local, "a.old.txt", b"LOCAL-1"),
+		"keep-both must preserve the local copy as a.old.txt"
+	);
+	let r = sc.sync().await;
+	assert!(r.errors.is_empty(), "{r:?}");
+	assert!(r.conflicts.is_empty(), "first conflict not cleared: {r:?}");
+	assert!(
+		read_eq(&sc.local, "a.txt", b"REMOTE-1"),
+		"remote copy not pulled"
+	);
+	assert_eq!(
+		r.uploaded, 1,
+		"the preserved copy uploads as a new file: {r:?}"
+	);
+	wait_cache_current(&sc, "a.txt").await;
+	wait_cache_current(&sc, "a.old.txt").await;
+
+	// --- second, independent conflict on the SAME path, resolved keep-both -> a.old.1.txt ---
+	write_file(&sc.local, "a.txt", b"LOCAL-2");
+	let v2 = upload_remote_single(&sc, "a.txt", b"REMOTE-2").await;
+	wait_cache_has(&sc, v2.uuid()).await;
+	assert!(
+		sc.sync().await.conflicts.iter().any(|c| c == "a.txt"),
+		"second conflict must surface"
+	);
+	sc.engine
+		.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
+		.await
+		.expect("second keep-both");
+
+	// A DISTINCT name: the first preserved copy is untouched, the second gets its own.
+	assert!(
+		read_eq(&sc.local, "a.old.txt", b"LOCAL-1"),
+		"the first preserved copy was overwritten — data loss"
+	);
+	assert!(
+		read_eq(&sc.local, "a.old.1.txt", b"LOCAL-2"),
+		"the second preserved copy must get a distinct name"
+	);
+
+	let r = sc.sync().await;
+	assert!(r.errors.is_empty(), "{r:?}");
+	assert!(r.conflicts.is_empty(), "second conflict not cleared: {r:?}");
+	assert!(read_eq(&sc.local, "a.txt", b"REMOTE-2"));
+
+	// Exactly the three files exist — no runaway copies, no `.old.old.` recursion.
+	wait_cache_current(&sc, "a.txt").await;
+	wait_cache_current(&sc, "a.old.1.txt").await;
+	let r = sc.sync().await;
+	assert!(r.conflicts.is_empty(), "{r:?}");
+	assert_eq!(
+		count_files_named_containing(&sc.local, ".old"),
+		2,
+		"exactly two preserved copies: {:?}",
+		walk_tree(&sc.local).keys().collect::<Vec<_>>()
+	);
+	assert_eq!(total_files(&sc.local), 3, "unexpected extra files");
+
+	sc.cleanup();
+}
+
+/// (review-add) — the copy a KEEP-BOTH resolution leaves behind round-trips as an ORDINARY file:
+/// it uploads exactly once, is retained across further passes, does not re-surface the original
+/// conflict, and does not multiply.
+#[shared_test_runtime]
+async fn conflict_add_resolved_copy_round_trips() {
+	let sc = single_client(SyncMode::TwoWay).await;
+
+	write_file(&sc.local, "c.txt", b"BASE");
+	assert_eq!(sc.sync().await.uploaded, 1);
+	write_file(&sc.local, "c.txt", b"LOCAL-EDIT");
+	let version = upload_remote_single(&sc, "c.txt", b"REMOTE-EDIT").await;
+	wait_cache_has(&sc, version.uuid()).await;
+	assert!(
+		sc.sync().await.conflicts.iter().any(|c| c == "c.txt"),
+		"conflict must surface"
+	);
+
+	sc.engine
+		.resolve_conflict(sc.pair, "c.txt", ConflictResolution::KeepBoth)
+		.await
+		.expect("keep-both");
+
+	// Pass 1 after the resolution: the copy uploads once, the remote copy is pulled.
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert!(r1.conflicts.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 1, "the leftover copy uploads once: {r1:?}");
+	assert_eq!(r1.downloaded, 1, "the remote winner is pulled: {r1:?}");
+	assert!(read_eq(&sc.local, "c.old.txt", b"LOCAL-EDIT"));
+	assert!(read_eq(&sc.local, "c.txt", b"REMOTE-EDIT"));
+
+	// Pass 2 and 3: no re-upload, no returning conflict, no copy growth.
+	wait_cache_current(&sc, "c.txt").await;
+	wait_cache_current(&sc, "c.old.txt").await;
+	let footprint = total_files(&sc.local);
+	for pass in 0..2 {
+		let r = sc.sync().await;
+		assert!(r.errors.is_empty(), "pass {pass}: {r:?}");
+		assert!(
+			r.conflicts.is_empty(),
+			"conflict returned on pass {pass}: {r:?}"
+		);
+		assert_eq!(
+			r.uploaded + r.downloaded,
+			0,
+			"pass {pass} must be a no-op: {r:?}"
+		);
+		assert_eq!(
+			total_files(&sc.local),
+			footprint,
+			"copies multiplied on pass {pass}"
+		);
+	}
+	assert!(
+		read_eq(&sc.local, "c.old.txt", b"LOCAL-EDIT"),
+		"the copy was lost"
+	);
+	assert!(
+		remote_file_size(&sc, "c.old.txt").await == Some(b"LOCAL-EDIT".len() as u64),
+		"the copy never reached the remote"
+	);
+
+	sc.cleanup();
 }
 
 #[ignore = "blocked: needs control over the engine's persisted baseline DB path to simulate a true \
@@ -1921,26 +2204,4 @@ async fn conflict_18_conflict_persists_across_restart() {
 	// plan: reach a conflict on persist.txt; drop the engine; reopen on the SAME baseline DB +
 	// re-add the same pair; sync; assert the conflict is still reported, both versions intact, no
 	// silent auto-resolution, no duplicate copies.
-}
-
-#[ignore = "blocked: needs a conflict-RESOLUTION API to force the FIRST conflict to be resolved (so a \
-clean SECOND independent conflict can be produced on the same base path) AND deterministic control \
-over conflict-copy naming. Without resolution we cannot stage two sequential independent conflicts on \
-one path. Partially covered by conflict_02 (no per-pass copy growth) and conflict_24 (copy bytes \
-exact). TODO: resolution API + conflict-copy naming inspection."]
-#[shared_test_runtime]
-async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
-	// plan: force a conflict on a.txt -> copy; resolve; force a SECOND conflict on a.txt; assert the
-	// second copy gets a distinct non-colliding name, no infinite re-ingest, counts match genuine
-	// conflicts.
-}
-
-#[ignore = "blocked: needs a conflict-RESOLUTION API. The whole test is about the LIFECYCLE of the \
-leftover preserved copy AFTER a keep-local resolution round-trips through sync — which requires \
-driving resolution first (same gap as conflict_16/17). TODO: resolution API."]
-#[shared_test_runtime]
-async fn conflict_add_resolved_copy_round_trips() {
-	// plan: reach conflict on c.txt -> conflict-copy; resolve keep-local; sync twice; assert the
-	// leftover copy is treated as an ordinary file (uploads once / retained), the original conflict
-	// does not reappear, no unbounded copy growth, third pass is a no-op.
 }
