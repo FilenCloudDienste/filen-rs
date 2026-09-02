@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS baseline (
 	local_mtime INTEGER,
 	remote_modified INTEGER,
 	state INTEGER NOT NULL,
+	local_kind INTEGER,
+	remote_kind INTEGER,
+	remote_hash BLOB,
+	remote_size INTEGER,
 	PRIMARY KEY (pair_id, rel_path)
 );
 ";
@@ -113,18 +117,32 @@ pub(crate) struct BaselineEntry {
 	/// Remote `last_modified` in epoch millis at last sync.
 	pub(crate) remote_modified: Option<i64>,
 	pub(crate) state: BaselineState,
+	/// CONFLICTED ROWS ONLY (`None` on a `Synced` row, where both sides agree and the fields above
+	/// describe both): what each side looked like when the conflict was surfaced, so a later
+	/// [`resolve_conflict`](super::SyncEngine::resolve_conflict) can re-anchor the row to the
+	/// winner and leave the loser reading as stale. `local_kind` / `remote_kind` are `None` when
+	/// that side was ABSENT (a delete-vs-modify divergence). The local half is carried by
+	/// `content_hash` / `size` / `local_mtime`; the remote half by the three fields here plus
+	/// `remote_uuid` / `remote_modified`.
+	pub(crate) local_kind: Option<NodeKind>,
+	pub(crate) remote_kind: Option<NodeKind>,
+	pub(crate) remote_hash: Option<Blake3Hash>,
+	pub(crate) remote_size: Option<u64>,
 }
 
-/// A registered sync pair.
+/// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PairRecord {
-	pub(crate) id: PairId,
-	pub(crate) local_root: String,
-	pub(crate) remote_root: Uuid,
-	pub(crate) mode: SyncMode,
+pub struct PairRecord {
+	pub id: PairId,
+	/// The canonicalized local root the pair syncs.
+	pub local_root: String,
+	/// The remote folder the pair syncs against.
+	pub remote_root: Uuid,
+	pub mode: SyncMode,
 }
 
-pub(crate) type PairId = i64;
+/// A registered pair's id, handed back by [`SyncEngine::add_pair`](super::SyncEngine::add_pair).
+pub type PairId = i64;
 
 /// The baseline DB handle (sole owner / single writer).
 pub(crate) struct BaselineStore {
@@ -230,8 +248,8 @@ impl BaselineStore {
 		self.conn.execute(
 			"INSERT OR REPLACE INTO baseline
 			 (pair_id, rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-			  remote_modified, state)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+			  remote_modified, state, local_kind, remote_kind, remote_hash, remote_size)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
 			params![
 				pair,
 				entry.rel_path,
@@ -242,6 +260,10 @@ impl BaselineStore {
 				entry.local_mtime,
 				entry.remote_modified,
 				entry.state.as_i64(),
+				entry.local_kind.map(NodeKind::as_i64),
+				entry.remote_kind.map(NodeKind::as_i64),
+				entry.remote_hash.as_ref().map(|h| h.as_ref().as_slice()),
+				entry.remote_size.map(|s| s as i64),
 			],
 		)?;
 		Ok(())
@@ -258,7 +280,7 @@ impl BaselineStore {
 		self.conn
 			.query_row(
 				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-				        remote_modified, state
+				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size
 				 FROM baseline WHERE pair_id = ?1 AND rel_path = ?2",
 				params![pair, rel_path],
 				Self::row_to_entry,
@@ -271,7 +293,7 @@ impl BaselineStore {
 		self.conn
 			.prepare(
 				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-				        remote_modified, state
+				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size
 				 FROM baseline WHERE pair_id = ?1 ORDER BY rel_path",
 			)?
 			.query_map(params![pair], Self::row_to_entry)?
@@ -293,6 +315,16 @@ impl BaselineStore {
 			.get::<_, Option<Vec<u8>>>("content_hash")?
 			.map(hash_from_blob)
 			.transpose()?;
+		let remote_hash = row
+			.get::<_, Option<Vec<u8>>>("remote_hash")?
+			.map(hash_from_blob)
+			.transpose()?;
+		let side_kind = |raw: Option<i64>| match raw {
+			None => Ok(None),
+			Some(raw) => NodeKind::from_i64(raw)
+				.map(Some)
+				.ok_or_else(|| corrupt("kind", raw)),
+		};
 		Ok(BaselineEntry {
 			rel_path: row.get("rel_path")?,
 			kind: NodeKind::from_i64(kind_raw).ok_or_else(|| corrupt("kind", kind_raw))?,
@@ -302,6 +334,10 @@ impl BaselineStore {
 			local_mtime: row.get("local_mtime")?,
 			remote_modified: row.get("remote_modified")?,
 			state: BaselineState::from_i64(state_raw).ok_or_else(|| corrupt("state", state_raw))?,
+			local_kind: side_kind(row.get("local_kind")?)?,
+			remote_kind: side_kind(row.get("remote_kind")?)?,
+			remote_hash,
+			remote_size: row.get::<_, Option<i64>>("remote_size")?.map(|s| s as u64),
 		})
 	}
 }
@@ -320,6 +356,10 @@ mod tests {
 			local_mtime: Some(1_700_000_000_123),
 			remote_modified: Some(1_700_000_000_456),
 			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
 		}
 	}
 
@@ -333,6 +373,10 @@ mod tests {
 			local_mtime: None,
 			remote_modified: None,
 			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
 		}
 	}
 
