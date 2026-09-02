@@ -18,7 +18,7 @@ use super::{
 	SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
 	baseline::{BaselineEntry, BaselineState, BaselineStore, PairId, PairRecord},
-	guard::{self, DeleteGuard, GuardReason},
+	guard::{self, DeleteGuard},
 	plan::{self, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
 };
@@ -220,18 +220,26 @@ fn resolution_entry(
 	}
 }
 
-/// The outcome of `plan_pair` (a dry run).
-// Constructed by the (currently unwired) `plan_pair` preview API; its fields are surfaced via
-// `Debug` for a caller that consumes the preview, not read internally.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum PlanOutcome {
-	Refused(RefuseReason),
+/// What a pass WOULD do, from [`SyncEngine::plan_pair`] — a dry run that touches neither side.
+/// Actions are rendered as human-readable one-liners rather than the engine's internal action
+/// type, which is deliberately not public API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanOutcome {
+	/// The pass would refuse to run — a local or remote name collision makes a 1:1 mapping
+	/// impossible — and would apply nothing.
+	Refused { reason: String },
 	Planned {
-		actions: Vec<SyncAction>,
-		held_deletions: Vec<SyncAction>,
+		/// One line per action the pass would apply, in apply order.
+		actions: Vec<String>,
+		/// Deletions the mass-delete guard would hold back (not in `actions`).
+		held_deletions: Vec<String>,
+		/// Paths that would be reported as two-way conflicts — held, never applied.
 		conflicts: Vec<String>,
-		guard_reason: Option<GuardReason>,
+		/// Why the guard would hold deletions, when it would.
+		guard_message: Option<String>,
+		/// Set alongside `held_deletions`: the token identifying that batch, for
+		/// [`SyncEngine::approve_deletions`].
+		pass_token: Option<String>,
 	},
 }
 
@@ -399,22 +407,48 @@ impl SyncEngine {
 		})
 	}
 
-	/// Reconcile + guard-screen a pass without applying it (a dry run).
-	// Dry-run preview API (returns the plan/refusal without touching either side); not yet wired to
-	// a caller but kept as the intended preview surface. `PlanOutcome` is constructed here.
-	#[allow(dead_code)]
-	pub(crate) async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
+	/// Reconcile + guard-screen a pass WITHOUT applying it: a dry run that reads both sides and
+	/// reports what a [`sync_once`](Self::sync_once) would do, mutating neither tree nor the
+	/// baseline. A pending deletion approval is neither consumed nor honoured here.
+	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
 		let prep = self.prepare(pair).await?;
 		if let Some(refusal) = refusal(&prep) {
-			return Ok(PlanOutcome::Refused(refusal));
+			return Ok(PlanOutcome::Refused {
+				reason: format!("name collision ({refusal:?})"),
+			});
 		}
 		let screened = reconcile_and_screen(&prep, screen_state(&prep));
 		Ok(PlanOutcome::Planned {
-			actions: screened.decision.safe,
-			held_deletions: screened.decision.held,
+			actions: screened.decision.safe.iter().map(describe).collect(),
+			held_deletions: screened.decision.held.iter().map(describe).collect(),
 			conflicts: screened.conflicts,
-			guard_reason: screened.decision.reason,
+			guard_message: screened.decision.reason.map(|reason| format!("{reason:?}")),
+			pass_token: screened.pass_token,
 		})
+	}
+
+	/// Every sync pair this engine has registered, in registration order.
+	pub async fn list_pairs(&self) -> Result<Vec<PairRecord>, Error> {
+		self.store
+			.lock()
+			.await
+			.list_pairs()
+			.map_err(|e| db_error(e, "listing sync pairs"))
+	}
+
+	/// Forget `pair` and every baseline row under it.
+	///
+	/// This is a REGISTRY operation only: NO file is touched on either side. The local tree and the
+	/// remote folder are left exactly as they are — a removed pair simply stops syncing. Adding the
+	/// same roots again later starts from an empty baseline, i.e. with first-sync semantics.
+	/// Removing an unknown pair is a no-op.
+	pub async fn remove_pair(&self, pair: PairId) -> Result<(), Error> {
+		self.approvals.lock().await.remove(&pair);
+		self.store
+			.lock()
+			.await
+			.delete_pair(pair)
+			.map_err(|e| db_error(e, "removing a sync pair"))
 	}
 
 	/// Approve the mass-delete batch the guard is currently holding for `pair`, naming it by the

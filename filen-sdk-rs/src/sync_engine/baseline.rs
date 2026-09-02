@@ -135,16 +135,19 @@ pub(crate) struct BaselineEntry {
 	pub(crate) remote_size: Option<u64>,
 }
 
-/// A registered sync pair.
+/// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PairRecord {
-	pub(crate) id: PairId,
-	pub(crate) local_root: String,
-	pub(crate) remote_root: Uuid,
-	pub(crate) mode: SyncMode,
+pub struct PairRecord {
+	pub id: PairId,
+	/// The canonicalized local root the pair syncs.
+	pub local_root: String,
+	/// The remote folder the pair syncs against.
+	pub remote_root: Uuid,
+	pub mode: SyncMode,
 }
 
-pub(crate) type PairId = i64;
+/// A registered pair's id, handed back by [`SyncEngine::add_pair`](super::SyncEngine::add_pair).
+pub type PairId = i64;
 
 /// The baseline DB handle (sole owner / single writer).
 pub(crate) struct BaselineStore {
@@ -269,9 +272,6 @@ impl BaselineStore {
 			.optional()
 	}
 
-	// Pair-management API completed by the store and exercised by its unit tests; not yet called by
-	// the engine, which currently registers pairs but never lists/removes them.
-	#[allow(dead_code)]
 	pub(crate) fn list_pairs(&self) -> rusqlite::Result<Vec<PairRecord>> {
 		self.conn
 			.prepare("SELECT id, local_root, remote_root, mode FROM sync_pairs ORDER BY id")?
@@ -279,7 +279,6 @@ impl BaselineStore {
 			.collect()
 	}
 
-	#[allow(dead_code)]
 	pub(crate) fn delete_pair(&self, id: PairId) -> rusqlite::Result<()> {
 		// The `ON DELETE CASCADE` (with `foreign_keys = ON`) drops the pair's baseline rows.
 		self.conn
@@ -323,9 +322,7 @@ impl BaselineStore {
 		Ok(())
 	}
 
-	// Single-row lookup; the engine reads whole-pair snapshots via `entries`, but the point lookup
-	// is part of the store's query surface and is exercised by the unit tests.
-	#[allow(dead_code)]
+	/// One baseline row by path (whole-pair snapshots go through [`Self::entries`]).
 	pub(crate) fn entry(
 		&self,
 		pair: PairId,
