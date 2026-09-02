@@ -238,7 +238,7 @@ async fn watch_02_remote_change_auto_pulls() {
 
 	// Out-of-band remote create -> a remote-change notification should reach the watcher.
 	let rf = upload_remote(&sc, "bar.txt", b"world").await;
-	wait_cache_sees(&sc, rf.uuid().into()).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
 
 	assert!(
 		wait_until(WATCH_SETTLE, || log.downloaded() >= 1).await,
@@ -332,7 +332,7 @@ async fn watch_05_no_self_trigger_loop() {
 	// A local create (engine uploads it) and a remote create (engine downloads it).
 	write_file(&sc.local, "selfwrite.txt", b"local-origin");
 	let rf = upload_remote(&sc, "remote_only.txt", b"remote-origin").await;
-	wait_cache_sees(&sc, rf.uuid().into()).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
 
 	// Wait for both to converge on both sides.
 	assert!(
@@ -703,7 +703,7 @@ async fn watch_18_two_way_conflict_surfaced() {
 	// Diverge BOTH sides within the same window.
 	write_file(&sc.local, "doc.txt", b"local-edit");
 	let rf = upload_remote(&sc, "doc.txt", b"remote-edit-different").await;
-	wait_cache_sees(&sc, rf.uuid().into()).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
 
 	// The watch must eventually surface a conflict for doc.txt, non-destructively.
 	assert!(
@@ -798,7 +798,7 @@ async fn watch_19_mass_delete_held() {
 async fn watch_20_remote_delete_quarantines_local() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let mut keep = upload_remote(&sc, "keep.txt", b"precious-bytes").await;
-	wait_cache_sees(&sc, keep.uuid().into()).await;
+	wait_cache_sees(&sc, keep.uuid()).await;
 	let (engine, pair) = watch_engine(&sc, SyncMode::RemoteToLocal).await;
 	let r0 = engine.sync_once(pair).await.unwrap();
 	assert_eq!(r0.downloaded, 1, "seed pull: {r0:?}");
@@ -814,12 +814,7 @@ async fn watch_20_remote_delete_quarantines_local() {
 	// Trash on the remote -> notification fires -> mirror the deletion locally.
 	sc.cache.client.trash_file(&mut keep).await.unwrap();
 	assert!(
-		poll_for_item_absent(
-			sc.cache.db_path(),
-			keep.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item_absent(sc.cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped the trashed file"
 	);
 
@@ -871,7 +866,7 @@ async fn watch_21_first_start_no_wipe() {
 	// Both sides already populated with distinct files BEFORE any baseline exists.
 	write_file(&sc.local, "L1.txt", b"local-side");
 	let rf = upload_remote(&sc, "R1.txt", b"remote-side").await;
-	wait_cache_sees(&sc, rf.uuid().into()).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
 
 	let (engine, pair) = watch_engine(&sc, SyncMode::TwoWay).await;
 	let log = Arc::new(WatchLog::default());
@@ -984,7 +979,7 @@ async fn watch_23_local_backup_keeps_remote_on_delete() {
 async fn watch_24_remote_backup_keeps_local_on_delete() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let mut cloud = upload_remote(&sc, "cloud.txt", b"cloud-data").await;
-	wait_cache_sees(&sc, cloud.uuid().into()).await;
+	wait_cache_sees(&sc, cloud.uuid()).await;
 	let (engine, pair) = watch_engine(&sc, SyncMode::RemoteBackup).await;
 	let r0 = engine.sync_once(pair).await.unwrap();
 	assert_eq!(r0.downloaded, 1, "seed pull: {r0:?}");
@@ -1000,18 +995,13 @@ async fn watch_24_remote_backup_keeps_local_on_delete() {
 	// Delete on the remote -> notification fires. RemoteBackup must NOT mirror it locally.
 	sc.cache.client.trash_file(&mut cloud).await.unwrap();
 	assert!(
-		poll_for_item_absent(
-			sc.cache.db_path(),
-			cloud.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item_absent(sc.cache.db_path(), cloud.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped the trashed remote file"
 	);
 
 	// Prove the watcher saw the remote change by pushing a NEW remote file the backup should pull.
 	let rf2 = upload_remote(&sc, "fresh.txt", b"fresh-remote").await;
-	wait_cache_sees(&sc, rf2.uuid().into()).await;
+	wait_cache_sees(&sc, rf2.uuid()).await;
 	assert!(
 		wait_until(WATCH_SETTLE, || read_eq(
 			&sc.local,

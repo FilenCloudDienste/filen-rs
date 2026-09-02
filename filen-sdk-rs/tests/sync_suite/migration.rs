@@ -106,7 +106,7 @@ fn assert_noop(r: &SyncReport) {
 #[shared_test_runtime]
 async fn migrate_01_reopened_baseline_first_pass_is_noop() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate01");
@@ -170,7 +170,7 @@ async fn migrate_01_reopened_baseline_first_pass_is_noop() {
 #[shared_test_runtime]
 async fn migrate_02_move_and_rename_detected_after_reopen() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate02");
@@ -242,7 +242,7 @@ async fn migrate_02_move_and_rename_detected_after_reopen() {
 #[shared_test_runtime]
 async fn migrate_03_present_baseline_is_incremental_not_first_sync() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate03");
@@ -326,7 +326,7 @@ async fn migrate_03_present_baseline_is_incremental_not_first_sync() {
 #[shared_test_runtime]
 async fn migrate_06_reopen_passes_are_idempotent() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate06");
@@ -365,7 +365,7 @@ async fn migrate_06_reopen_passes_are_idempotent() {
 #[shared_test_runtime]
 async fn migrate_07_real_change_after_reopen_is_applied() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate07");
@@ -386,7 +386,7 @@ async fn migrate_07_real_change_after_reopen_is_applied() {
 	// One genuine local edit + one genuine remote add, both before the post-reopen pass.
 	write_file(&local, "edit_me.txt", b"v2 is meaningfully longer");
 	let added = upload_to(&cache, remote, "remote_add.txt", b"from the remote side").await;
-	wait_cache_has(&cache, added.uuid().into()).await;
+	wait_cache_has(&cache, added.uuid()).await;
 
 	let engine2 = SyncEngine::open(cache.client.clone(), db_path)
 		.await
@@ -427,7 +427,7 @@ async fn migrate_07_real_change_after_reopen_is_applied() {
 #[shared_test_runtime]
 async fn migrate_10_baseline_durable_across_repeated_cold_starts() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("migrate10");

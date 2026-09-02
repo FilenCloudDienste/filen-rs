@@ -208,7 +208,7 @@ async fn move03_cross_directory_move() {
 async fn move04_remote_rename_pulled_down() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let mut rf = upload_root(&sc, "report.pdf", b"PDF-bytes-C1").await;
-	wait_cache_has(&sc, rf.uuid().into()).await;
+	wait_cache_has(&sc, rf.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -226,7 +226,7 @@ async fn move04_remote_rename_pulled_down() {
 	assert!(
 		poll_for_file_name(
 			sc.cache.db_path(),
-			rf.uuid().into(),
+			rf.uuid(),
 			"final.pdf",
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -760,7 +760,7 @@ async fn move16_local_backup_does_not_mirror_move_delete() {
 async fn move16_remote_backup_does_not_mirror_move_delete() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let mut rf = upload_root(&sc, "mv.txt", b"backup-C1").await;
-	wait_cache_has(&sc, rf.uuid().into()).await;
+	wait_cache_has(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -778,7 +778,7 @@ async fn move16_remote_backup_does_not_mirror_move_delete() {
 	assert!(
 		poll_for_file_name(
 			sc.cache.db_path(),
-			rf.uuid().into(),
+			rf.uuid(),
 			"moved.txt",
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -1133,19 +1133,19 @@ async fn move24_cross_pair_move() {
 		.create_dir(&root_dirtype(&sc), "R2")
 		.await
 		.unwrap();
-	wait_cache_has(&sc, r1_dir.uuid().into()).await;
-	wait_cache_has(&sc, r2_dir.uuid().into()).await;
+	wait_cache_has(&sc, r1_dir.uuid()).await;
+	wait_cache_has(&sc, r2_dir.uuid()).await;
 
 	let l1 = fresh_local_dir("p1");
 	let l2 = fresh_local_dir("p2");
 	let p1 = sc
 		.engine
-		.add_pair(l1.clone(), r1_dir.uuid().into(), SyncMode::LocalToRemote)
+		.add_pair(l1.clone(), r1_dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 	let p2 = sc
 		.engine
-		.add_pair(l2.clone(), r2_dir.uuid().into(), SyncMode::LocalToRemote)
+		.add_pair(l2.clone(), r2_dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 
@@ -1269,9 +1269,9 @@ async fn move_a1_remote_directory_rename_pulled_down() {
 		.make_file_builder("f3.txt", sub.uuid())
 		.unwrap();
 	let f3 = sc.resources.client.upload_file(f3b, b"C3").await.unwrap();
-	wait_cache_has(&sc, f1.uuid().into()).await;
-	wait_cache_has(&sc, f2.uuid().into()).await;
-	wait_cache_has(&sc, f3.uuid().into()).await;
+	wait_cache_has(&sc, f1.uuid()).await;
+	wait_cache_has(&sc, f2.uuid()).await;
+	wait_cache_has(&sc, f3.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -1291,7 +1291,7 @@ async fn move_a1_remote_directory_rename_pulled_down() {
 	assert!(
 		poll_for_dir_name(
 			sc.cache.db_path(),
-			docs.uuid().into(),
+			docs.uuid(),
 			"documents",
 			CACHE_CONVERGE_TIMEOUT
 		)

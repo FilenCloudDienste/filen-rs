@@ -127,7 +127,7 @@ async fn basic_01_single_small_file_pull() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let content = b"hello world";
 	let rf = upload_remote(&sc, "foo.txt", content).await;
-	wait_cache_sees(&sc, rf.uuid().into()).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
 	assert_eq!(report.downloaded, 1, "{report:?}");
@@ -164,7 +164,7 @@ async fn basic_02_empty_file_push() {
 async fn basic_02_empty_file_pull() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = upload_remote(&sc, "empty.dat", b"").await;
-	wait_cache_sees(&sc, rf.uuid().into()).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
 	assert_eq!(report.downloaded, 1, "{report:?}");
@@ -377,8 +377,8 @@ async fn basic_08_nonempty_destination_not_wiped_push() {
 		.create_dir(&sc_root(&sc), "keep")
 		.await
 		.unwrap();
-	wait_cache_sees(&sc, pre.uuid().into()).await;
-	wait_cache_sees(&sc, keep.uuid().into()).await;
+	wait_cache_sees(&sc, pre.uuid()).await;
+	wait_cache_sees(&sc, keep.uuid()).await;
 
 	// Source-side files.
 	write_file(&sc.local, "A.txt", b"aaa");
@@ -421,8 +421,8 @@ async fn basic_08_nonempty_destination_not_wiped_pull() {
 	// Source-side remote files.
 	let a = upload_remote(&sc, "A.txt", b"aaa").await;
 	let b = upload_remote(&sc, "B.txt", b"bbb").await;
-	wait_cache_sees(&sc, a.uuid().into()).await;
-	wait_cache_sees(&sc, b.uuid().into()).await;
+	wait_cache_sees(&sc, a.uuid()).await;
+	wait_cache_sees(&sc, b.uuid()).await;
 
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
@@ -487,7 +487,7 @@ async fn basic_09_mixed_batch_push() {
 async fn basic_10_assorted_sizes_roundtrip() {
 	// Push from local A, then pull on a separate remote->local pair and compare byte-exact.
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 
 	let sizes: &[usize] = &[
 		1,
@@ -564,7 +564,7 @@ async fn basic_10_assorted_sizes_roundtrip() {
 #[shared_test_runtime]
 async fn basic_11_ordinary_names_roundtrip() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 
 	let names: &[&str] = &[
 		"my file.txt",
@@ -728,7 +728,7 @@ async fn basic_14_grow_empty_file_push() {
 #[shared_test_runtime]
 async fn basic_15_baseline_persists_across_restart() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 
@@ -954,7 +954,7 @@ async fn basic_20_fanout_many_files_push() {
 #[shared_test_runtime]
 async fn basic_21_binary_nulls_high_bytes_roundtrip() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 
 	// All 256 byte values repeated to ~64 KiB.
 	let mut blob = Vec::with_capacity(64 * 1024);
@@ -1159,7 +1159,7 @@ async fn basic_24_report_matches_destination_push() {
 #[shared_test_runtime]
 async fn basic_25_watch_no_self_resync_loop() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 
@@ -1321,7 +1321,7 @@ async fn basic_add_empty_dir_delete_propagates_push() {
 #[shared_test_runtime]
 async fn basic_add_full_roundtrip_integrity() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 
 	// Mixed tree: varied sizes + a binary blob.
 	let local_a = fresh_local_dir("rt_a");
@@ -1386,8 +1386,8 @@ async fn basic_add_remote_origin_pull_byte_exact() {
 	let blob = (0u8..=255).collect::<Vec<u8>>();
 	let f1 = upload_remote(&sc, "foo.txt", txt).await;
 	let f2 = upload_remote(&sc, "blob.bin", &blob).await;
-	wait_cache_sees(&sc, f1.uuid().into()).await;
-	wait_cache_sees(&sc, f2.uuid().into()).await;
+	wait_cache_sees(&sc, f1.uuid()).await;
+	wait_cache_sees(&sc, f2.uuid()).await;
 
 	let report = sc.sync().await;
 	assert!(report.errors.is_empty(), "errors: {report:?}");
@@ -1421,7 +1421,7 @@ async fn basic_add_remote_update_pulls_down_two_way() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let v1 = b"version one";
 	let rf = upload_remote(&sc, "foo.txt", v1).await;
-	wait_cache_sees(&sc, rf.uuid().into()).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
@@ -1430,7 +1430,7 @@ async fn basic_add_remote_update_pulls_down_two_way() {
 	// Modify on the REMOTE only (re-upload same name -> server versions to a new uuid).
 	let v2 = b"version two is noticeably longer";
 	let new_rf = upload_remote(&sc, "foo.txt", v2).await;
-	let new_uuid: Uuid = new_rf.uuid().into();
+	let new_uuid: Uuid = new_rf.uuid();
 	wait_cache_sees(&sc, new_uuid).await;
 	let db = sc.cache.db_path().to_path_buf();
 	poll_until(CACHE_CONVERGE_TIMEOUT, || {

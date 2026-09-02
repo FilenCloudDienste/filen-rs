@@ -172,7 +172,7 @@ impl SingleClient {
 /// Build a single-client setup in `mode`, with the (empty) remote converged into the cache.
 pub async fn single_client(mode: SyncMode) -> SingleClient {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("sc");
@@ -215,7 +215,7 @@ impl TwoClients {
 /// Build two clients on one shared remote dir, both in `mode`.
 pub async fn two_clients(mode: SyncMode) -> TwoClients {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache_a = TestCache::new(&resources.client, remote).await;
 	let cache_b = TestCache::new(&resources.client, remote).await;
 	let local_a = fresh_local_dir("a");

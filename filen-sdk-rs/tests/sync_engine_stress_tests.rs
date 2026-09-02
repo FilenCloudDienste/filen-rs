@@ -175,7 +175,7 @@ async fn roundtrip_large_tree_local_to_remote_then_remote_to_local() {
 		.unwrap_or(10_000);
 
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 
 	// --- build the source tree ---
 	let local_a = fresh_local_dir("a");
@@ -321,7 +321,7 @@ async fn twoway_two_clients_contend_and_converge() {
 		.unwrap_or(200);
 
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 
 	// Two independent client+cache+engine stacks on the SAME remote dir.
 	let cache_a = TestCache::new(&resources.client, remote).await;
@@ -660,7 +660,7 @@ async fn converge(
 #[shared_test_runtime]
 async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache_a = TestCache::new(&resources.client, remote).await;
 	let cache_b = TestCache::new(&resources.client, remote).await;
 	let local_a = fresh_local_dir("nca");
@@ -943,7 +943,7 @@ async fn twoway_disjoint_changes_converge_identically_regardless_of_order() {
 /// assert both local trees agree, and return that converged tree.
 async fn converge_disjoint_under(order: Order) -> TreeMap {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache_a = TestCache::new(&resources.client, remote).await;
 	let cache_b = TestCache::new(&resources.client, remote).await;
 	let local_a = fresh_local_dir("oia");

@@ -213,7 +213,7 @@ async fn race_add_remote_fast_path_same_size_change_detected() {
 	let root_uuid = sc.resources.dir.uuid();
 	let rf = upload_root(&sc, "rfast.txt", b"AAAA").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed rfast.txt"
 	);
 	let r1 = sc.sync().await;
@@ -233,7 +233,7 @@ async fn race_add_remote_fast_path_same_size_change_detected() {
 		.upload_file(builder2, b"BBBB")
 		.await
 		.unwrap();
-	let new_uuid: Uuid = new_rf.uuid().into();
+	let new_uuid: Uuid = new_rf.uuid();
 	let db = sc.cache.db_path().to_path_buf();
 	assert!(
 		poll_until(CACHE_CONVERGE_TIMEOUT, || {
@@ -415,7 +415,7 @@ async fn race_14_undeliverable_download_does_not_crash_pair() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = upload_root(&sc, "readonly.txt", b"A-payload").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed the remote file"
 	);
 
@@ -666,7 +666,7 @@ async fn race_24_first_sync_into_populated_destination_no_wipe() {
 	// Pre-existing remote-only file (placed before this pair's baseline exists).
 	let rf = upload_root(&sc, "pre.txt", b"P-remote").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed pre.txt"
 	);
 	// Pre-existing local-only file.
@@ -952,7 +952,7 @@ async fn race_17_self_write_does_not_loop() {
 	// Seed a remote file the engine will download (its own local write).
 	let rf = upload_root(&sc, "pulled.txt", b"A-pulled").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed pulled.txt"
 	);
 

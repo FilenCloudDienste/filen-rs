@@ -854,7 +854,7 @@ async fn conflict_14_remote_backup_delete_not_mirrored() {
 		sc.resources.client.upload_file(b, b"A").await.unwrap()
 	};
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never saw the seeded remote file"
 	);
 	let r1 = sc.sync().await;
@@ -865,7 +865,7 @@ async fn conflict_14_remote_backup_delete_not_mirrored() {
 	// Delete on remote; wait for the cache to drop it.
 	sc.resources.client.trash_file(&mut rf).await.unwrap();
 	assert!(
-		poll_for_item_absent(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item_absent(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped the trashed file"
 	);
 
@@ -956,12 +956,7 @@ async fn conflict_15b_remote_to_local_remote_wins_no_conflict() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let _base = upload_remote_single(&sc, "pin.txt", b"BASE").await;
 	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			_base.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item(sc.cache.db_path(), _base.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never saw base"
 	);
 	let r1 = sc.sync().await;
@@ -970,7 +965,7 @@ async fn conflict_15b_remote_to_local_remote_wins_no_conflict() {
 	// Diverge: local edited to LOC; remote re-uploaded to REM.
 	write_file(&sc.local, "pin.txt", b"LOC");
 	let rem = upload_remote_single(&sc, "pin.txt", b"REM").await;
-	let new_uuid: Uuid = rem.uuid().into();
+	let new_uuid: Uuid = rem.uuid();
 	let db = sc.cache.db_path().to_path_buf();
 	assert!(
 		poll_until(CACHE_CONVERGE_TIMEOUT, || {
@@ -1084,7 +1079,7 @@ async fn conflict_21_mass_delete_gate_with_modify_vs_delete() {
 		uuids.push(rf);
 	}
 	// Wait for the cache to hold the full set.
-	let last: Uuid = uuids.last().unwrap().uuid().into();
+	let last = uuids.last().unwrap().uuid();
 	assert!(
 		poll_for_item(sc.cache.db_path(), last, CACHE_CONVERGE_TIMEOUT).await,
 		"cache never converged the 50 files"
@@ -1691,7 +1686,7 @@ async fn conflict_25_watch_mode_conflict_does_not_loop() {
 	// Built inline (not via `two_clients`) because `watch` consumes `Arc<SyncEngine>` and the engines
 	// must therefore be owned as `Arc`s — the harness fixture owns them by value.
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache_a = TestCache::new(&resources.client, remote).await;
 	let cache_b = TestCache::new(&resources.client, remote).await;
 	let local_a = fresh_local_dir("c25a");
