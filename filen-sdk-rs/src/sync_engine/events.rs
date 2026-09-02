@@ -28,8 +28,14 @@ pub enum SyncEvent {
 	/// A two-way path where both sides diverged; left untouched for the caller to resolve.
 	Conflict { rel_path: String },
 	/// The guard held some deletions back this pass (mass-delete volume, first sync, or an
-	/// un-converged remote). `reason` is the guard's `Debug` rendering.
-	DeletionsHeld { count: usize, reason: String },
+	/// un-converged remote). `reason` is the guard's `Debug` rendering; `pass_token` identifies
+	/// this exact batch for
+	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions).
+	DeletionsHeld {
+		count: usize,
+		reason: String,
+		pass_token: String,
+	},
 	/// Uploading a local file to the remote.
 	Uploading { rel_path: String },
 	/// Downloading a remote file into the local tree.
