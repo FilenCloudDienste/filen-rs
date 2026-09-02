@@ -764,13 +764,62 @@ fn detect_moves(
 	}
 }
 
+/// The paths this pass must not act on, given the uuids whose place in the snapshot the engine
+/// knows to be stale (`pending`): the baseline path the uuid is recorded at, and — for a move the
+/// cache has not applied yet — the path the snapshot still shows it at. Acting on either would
+/// re-transfer, duplicate, or delete the engine's own write.
+fn stale_pending_paths<'a>(
+	baseline: &'a HashMap<String, BaselineEntry>,
+	remote: &'a HashMap<String, RemoteNode>,
+	pending: &HashSet<Uuid>,
+) -> HashSet<&'a str> {
+	let mut stale = HashSet::new();
+	if pending.is_empty() {
+		return stale;
+	}
+	let snapshot_path: HashMap<Uuid, &str> = remote
+		.iter()
+		.map(|(path, node)| (node.remote_uuid, path.as_str()))
+		.collect();
+	for (path, entry) in baseline {
+		let Some(uuid) = entry.remote_uuid else {
+			continue;
+		};
+		if !pending.contains(&uuid) {
+			continue;
+		}
+		stale.insert(path.as_str());
+		if let Some(seen) = snapshot_path.get(&uuid) {
+			stale.insert(seen);
+		}
+	}
+	stale
+}
+
+/// Whether `key` is one of `stale` or lives under one. A directory the cache has not caught up to
+/// is invisible, and so is everything the snapshot would otherwise resolve beneath it.
+fn is_under_stale_path(key: &str, stale: &HashSet<&str>) -> bool {
+	stale.contains(key)
+		|| stale
+			.iter()
+			.any(|p| key.len() > p.len() && key.starts_with(p) && key.as_bytes()[p.len()] == b'/')
+}
+
 /// Reconcile a pair's three inputs into an ordered action plan. `baseline`/`local`/`remote` are all
 /// keyed by the same NFC-normalized relative path.
+///
+/// `pending` holds remote uuids this engine wrote so recently that the cache — which learns of our
+/// own writes only through socket events and resyncs — demonstrably still shows the pre-write
+/// state. Their paths are left completely alone this pass, so a just-uploaded file is neither
+/// re-uploaded nor read as a remote-side deletion, and a just-moved one is not moved back. The
+/// engine decides which uuids qualify (see `PendingWrites`) and how long the window lasts (see
+/// `PENDING_CREATE_GRACE`).
 pub(crate) fn reconcile(
 	mode: super::SyncMode,
 	baseline: &HashMap<String, BaselineEntry>,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
+	pending: &HashSet<Uuid>,
 ) -> Vec<SyncAction> {
 	let mut actions = Vec::new();
 	let mut consumed = HashSet::new();
@@ -780,7 +829,28 @@ pub(crate) fn reconcile(
 		local.len(),
 		remote.len()
 	);
-	// Resolve moves first; their endpoints are then excluded from the per-path reconcile so a move
+	let keys: BTreeSet<&str> = baseline
+		.keys()
+		.chain(local.keys())
+		.chain(remote.keys())
+		.map(String::as_str)
+		.collect();
+
+	// Consume the paths the snapshot is behind on before anything else looks at them, so neither
+	// move detection nor the per-path reconcile can act on a cache that has not caught up.
+	let stale = stale_pending_paths(baseline, remote, pending);
+	if !stale.is_empty() {
+		for key in &keys {
+			if is_under_stale_path(key, &stale) {
+				tracing::debug!(
+					"reconcile: skipping {key:?} — a just-written remote item there is not yet visible in the cache"
+				);
+				consumed.insert((*key).to_string());
+			}
+		}
+	}
+
+	// Resolve moves next; their endpoints are then excluded from the per-path reconcile so a move
 	// is never also emitted as a delete + create. Skip this in additive backup modes: a move's
 	// other half is a deletion of the old name, and a backup mode must NEVER delete on its
 	// destination — so a moved item is handled as an additive create of the new name with the old
@@ -788,13 +858,6 @@ pub(crate) fn reconcile(
 	if mode.propagates_deletes() {
 		detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
 	}
-
-	let keys: BTreeSet<&str> = baseline
-		.keys()
-		.chain(local.keys())
-		.chain(remote.keys())
-		.map(String::as_str)
-		.collect();
 
 	for key in keys {
 		if consumed.contains(key) {
@@ -927,6 +990,16 @@ mod tests {
 	use super::*;
 	use crate::sync_engine::SyncMode;
 
+	/// Reconcile with no pending writes — the ordinary case; the cache-lag window has its own tests.
+	fn plan(
+		mode: SyncMode,
+		baseline: &HashMap<String, BaselineEntry>,
+		local: &HashMap<String, LocalNode>,
+		remote: &HashMap<String, RemoteNode>,
+	) -> Vec<SyncAction> {
+		reconcile(mode, baseline, local, remote, &HashSet::new())
+	}
+
 	fn ms(millis: i64) -> DateTime<Utc> {
 		DateTime::from_timestamp_millis(millis).unwrap()
 	}
@@ -1007,7 +1080,7 @@ mod tests {
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
 		let local = map(vec![("b.txt", local_file("b.txt", [5; 32]))]);
 		assert_eq!(
-			reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote),
+			plan(SyncMode::LocalToRemote, &baseline, &local, &remote),
 			vec![SyncAction::MoveRemote {
 				from_path: "a.txt".to_string(),
 				to_path: "b.txt".to_string(),
@@ -1025,7 +1098,7 @@ mod tests {
 		let local = map(vec![("a.txt", local_file("a.txt", [5; 32]))]);
 		let remote = map(vec![("b.txt", remote_file("b.txt", uuid, [5; 32]))]);
 		assert_eq!(
-			reconcile(SyncMode::RemoteToLocal, &baseline, &local, &remote),
+			plan(SyncMode::RemoteToLocal, &baseline, &local, &remote),
 			vec![SyncAction::MoveLocal {
 				from_path: "a.txt".to_string(),
 				to_path: "b.txt".to_string(),
@@ -1044,7 +1117,7 @@ mod tests {
 			("b.txt", local_file("b.txt", [5; 32])),
 			("c.txt", local_file("c.txt", [5; 32])),
 		]);
-		let actions = reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		let actions = plan(SyncMode::LocalToRemote, &baseline, &local, &remote);
 		assert!(
 			!actions
 				.iter()
@@ -1068,7 +1141,7 @@ mod tests {
 		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
 		let stale = Uuid::new_v4();
 		let remote = map(vec![("old.txt", remote_file("old.txt", stale, [2; 32]))]);
-		let actions = reconcile(SyncMode::LocalToRemote, &HashMap::new(), &local, &remote);
+		let actions = plan(SyncMode::LocalToRemote, &HashMap::new(), &local, &remote);
 		assert_eq!(
 			actions,
 			vec![
@@ -1092,7 +1165,7 @@ mod tests {
 			"old.txt",
 			remote_file("old.txt", Uuid::new_v4(), [2; 32]),
 		)]);
-		let actions = reconcile(SyncMode::LocalBackup, &HashMap::new(), &local, &remote);
+		let actions = plan(SyncMode::LocalBackup, &HashMap::new(), &local, &remote);
 		assert_eq!(
 			actions,
 			vec![SyncAction::UploadFile {
@@ -1107,7 +1180,7 @@ mod tests {
 		let uuid = Uuid::new_v4();
 		let remote = map(vec![("r.txt", remote_file("r.txt", uuid, [3; 32]))]);
 		let local = map(vec![("extra.txt", local_file("extra.txt", [4; 32]))]);
-		let actions = reconcile(SyncMode::RemoteToLocal, &HashMap::new(), &local, &remote);
+		let actions = plan(SyncMode::RemoteToLocal, &HashMap::new(), &local, &remote);
 		assert_eq!(
 			actions,
 			vec![
@@ -1142,7 +1215,7 @@ mod tests {
 		// pass still looks like a first sync and the guard holds all deletions forever.
 		for mode in ALL_MODES {
 			assert_eq!(
-				reconcile(mode, &HashMap::new(), &local, &remote),
+				plan(mode, &HashMap::new(), &local, &remote),
 				vec![SyncAction::AdoptBaseline {
 					rel_path: "a.txt".to_string()
 				}],
@@ -1153,7 +1226,7 @@ mod tests {
 		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [7; 32]))]);
 		for mode in ALL_MODES {
 			assert!(
-				reconcile(mode, &baseline, &local, &remote).is_empty(),
+				plan(mode, &baseline, &local, &remote).is_empty(),
 				"{mode:?} must be a no-op once the baseline is current"
 			);
 		}
@@ -1165,7 +1238,7 @@ mod tests {
 		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [7; 32]))]);
 		for mode in ALL_MODES {
 			assert_eq!(
-				reconcile(mode, &baseline, &HashMap::new(), &HashMap::new()),
+				plan(mode, &baseline, &HashMap::new(), &HashMap::new()),
 				vec![SyncAction::AdoptBaseline {
 					rel_path: "a.txt".to_string()
 				}],
@@ -1188,7 +1261,7 @@ mod tests {
 		let local = map(vec![("d", local_dir("d"))]);
 		let remote = map(vec![("d", remote_dir)]);
 		assert_eq!(
-			reconcile(SyncMode::LocalToRemote, &HashMap::new(), &local, &remote),
+			plan(SyncMode::LocalToRemote, &HashMap::new(), &local, &remote),
 			vec![SyncAction::AdoptBaseline {
 				rel_path: "d".to_string()
 			}]
@@ -1202,7 +1275,7 @@ mod tests {
 			("dir", local_dir("dir")),
 			("dir/sub", local_dir("dir/sub")),
 		]);
-		let actions = reconcile(
+		let actions = plan(
 			SyncMode::LocalToRemote,
 			&HashMap::new(),
 			&local,
@@ -1252,7 +1325,7 @@ mod tests {
 			("new/x.txt", local_file("new/x.txt", [7; 32])),
 		]);
 
-		let actions = reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		let actions = plan(SyncMode::LocalToRemote, &baseline, &local, &remote);
 		assert_eq!(
 			actions,
 			vec![
@@ -1305,7 +1378,7 @@ mod tests {
 			("box", local_file("box", [1; 32])),
 		]);
 
-		let actions = reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		let actions = plan(SyncMode::LocalToRemote, &baseline, &local, &remote);
 		assert_eq!(
 			actions,
 			vec![
@@ -1336,6 +1409,98 @@ mod tests {
 				},
 			],
 			"a recursive dir trash must follow the moves out of it, and precede the create at its path"
+		);
+	}
+
+	#[test]
+	fn a_just_written_remote_item_the_cache_has_not_caught_up_to_is_left_alone() {
+		let uuid = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [5; 32]))]);
+		// The snapshot is behind: the uuid the pass just recorded is not in it yet.
+		let remote = HashMap::new();
+		let pending = HashSet::from([uuid]);
+		for mode in ALL_MODES {
+			assert!(
+				reconcile(mode, &baseline, &local, &remote, &pending).is_empty(),
+				"{mode:?} must neither re-transfer nor delete a write the cache has not seen"
+			);
+		}
+		// Once the uuid is no longer pending (the grace window elapsed), the snapshot is believed
+		// again: the file reads as a remote-side deletion and is re-pushed.
+		assert_eq!(
+			plan(SyncMode::LocalToRemote, &baseline, &local, &remote),
+			vec![SyncAction::UploadFile {
+				rel_path: "a.txt".to_string(),
+			}],
+			"past the grace window the old behaviour returns"
+		);
+	}
+
+	#[test]
+	fn a_pending_directory_shields_its_children_from_a_duplicate_create() {
+		let dir_uuid = Uuid::new_v4();
+		let file_uuid = Uuid::new_v4();
+		let baseline = map(vec![
+			("d", base_dir("d", dir_uuid)),
+			("d/x.txt", base_file("d/x.txt", file_uuid, [1; 32])),
+		]);
+		let local = map(vec![
+			("d", local_dir("d")),
+			("d/x.txt", local_file("d/x.txt", [1; 32])),
+		]);
+		// Neither the new dir nor its child has reached the cache yet.
+		let pending = HashSet::from([dir_uuid, file_uuid]);
+		assert!(
+			reconcile(
+				SyncMode::LocalToRemote,
+				&baseline,
+				&local,
+				&HashMap::new(),
+				&pending
+			)
+			.is_empty(),
+			"a pending dir must not be re-created, and its children must not be uploaded into a \
+			 parent that is not in the snapshot"
+		);
+		// A child whose OWN uuid has settled is still shielded by the invisible parent.
+		let pending = HashSet::from([dir_uuid]);
+		assert!(
+			reconcile(
+				SyncMode::LocalToRemote,
+				&baseline,
+				&local,
+				&HashMap::new(),
+				&pending
+			)
+			.is_empty()
+		);
+	}
+
+	#[test]
+	fn an_unapplied_move_is_not_undone_by_a_snapshot_still_showing_the_old_path() {
+		let uuid = Uuid::new_v4();
+		// The pass moved a.txt -> b.txt and advanced its baseline; the cache still lists the uuid at
+		// a.txt. Acting on that would trash a.txt (the very item that was moved) and re-upload
+		// b.txt — in two-way, even quarantine the local file first.
+		let baseline = map(vec![("b.txt", base_file("b.txt", uuid, [5; 32]))]);
+		let local = map(vec![("b.txt", local_file("b.txt", [5; 32]))]);
+		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
+		for mode in ALL_MODES {
+			assert!(
+				reconcile(mode, &baseline, &local, &remote, &HashSet::from([uuid])).is_empty(),
+				"{mode:?} must leave both ends of an unapplied move alone"
+			);
+		}
+		// The engine only marks the uuid pending while the snapshot still shows the PRE-move state;
+		// once it does not, the path is acted on again (another client moving the item after us
+		// must reconverge immediately, not wait out the grace window).
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::MoveLocal {
+				from_path: "b.txt".to_string(),
+				to_path: "a.txt".to_string(),
+			}]
 		);
 	}
 
@@ -1440,7 +1605,7 @@ mod tests {
 		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [0; 32]))]);
 		assert_eq!(
-			reconcile(SyncMode::TwoWay, &baseline, &local, &remote),
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
 			vec![SyncAction::UploadFile {
 				rel_path: "a.txt".to_string(),
 			}]
@@ -1452,7 +1617,7 @@ mod tests {
 		let local = map(vec![("a.txt", local_file("a.txt", [0; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", new_uuid, [1; 32]))]);
 		assert_eq!(
-			reconcile(SyncMode::TwoWay, &baseline, &local, &remote),
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
 			vec![SyncAction::DownloadFile {
 				rel_path: "a.txt".to_string(),
 				remote_uuid: new_uuid,
@@ -1470,7 +1635,7 @@ mod tests {
 		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", new_uuid, [2; 32]))]);
 		assert_eq!(
-			reconcile(SyncMode::TwoWay, &baseline, &local, &remote),
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
 			vec![SyncAction::Conflict {
 				rel_path: "a.txt".to_string(),
 			}]
@@ -1481,7 +1646,7 @@ mod tests {
 		let local = map(vec![("a.txt", local_file("a.txt", [9; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", new_uuid, [9; 32]))]);
 		assert_eq!(
-			reconcile(SyncMode::TwoWay, &baseline, &local, &remote),
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
 			vec![SyncAction::AdoptBaseline {
 				rel_path: "a.txt".to_string(),
 			}],
@@ -1495,7 +1660,7 @@ mod tests {
 		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [0; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [0; 32]))]);
 		// Local deleted (absent), remote unchanged -> trash remote.
-		let actions = reconcile(SyncMode::TwoWay, &baseline, &HashMap::new(), &remote);
+		let actions = plan(SyncMode::TwoWay, &baseline, &HashMap::new(), &remote);
 		assert_eq!(
 			actions,
 			vec![SyncAction::TrashRemote {
@@ -1515,7 +1680,7 @@ mod tests {
 		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [0; 32]))]);
 		assert!(
-			reconcile(SyncMode::TwoWay, &baseline, &local, &remote).is_empty(),
+			plan(SyncMode::TwoWay, &baseline, &local, &remote).is_empty(),
 			"a conflicted path is held, not re-acted on"
 		);
 	}
