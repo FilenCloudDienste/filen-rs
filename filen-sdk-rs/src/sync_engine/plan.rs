@@ -243,10 +243,15 @@ fn collision_key(rel_path: &str) -> String {
 #[derive(Debug)]
 pub(crate) struct RemoteView {
 	pub(crate) nodes: HashMap<String, RemoteNode>,
-	/// `true` if two distinct remote items resolved to the same case-insensitive path. The engine
-	/// refuses to reconcile such a pair (a 1:1 local mapping is impossible) until the user cleans
-	/// it up.
+	/// `true` if two distinct remote items resolved to the same case-insensitive path but NOT the
+	/// same byte-identical one. The engine refuses to reconcile such a pair (a 1:1 local mapping is
+	/// impossible) until the user cleans it up.
 	pub(crate) has_collisions: bool,
+	/// Paths two byte-identically named remote items resolved to. The server never allows that —
+	/// its dedup is on the lowercased name hash — so it can only be a cache mid-transition: a
+	/// re-upload whose successor has been applied while the predecessor's trash has not. Only that
+	/// one path is held back; the pass runs.
+	pub(crate) held_paths: HashSet<String>,
 }
 
 /// Build the remote view from a cache subtree snapshot rooted at `root`. Names are NFC-normalized
@@ -262,8 +267,11 @@ pub(crate) fn build_remote_view(
 		.collect();
 
 	let mut nodes = HashMap::new();
-	let mut claimed: HashMap<String, ()> = HashMap::new();
+	// collision key -> the raw path that claimed it, so a byte-identical duplicate is told apart
+	// from a case-only one.
+	let mut claimed: HashMap<String, String> = HashMap::new();
 	let mut has_collisions = false;
+	let mut held_paths: HashSet<String> = HashSet::new();
 
 	let mut insert = |rel_path: String, node: RemoteNode| {
 		// The local quarantine dir is excluded from the local scan; exclude it from the remote view
@@ -272,11 +280,24 @@ pub(crate) fn build_remote_view(
 		if rel_path == QUARANTINE_DIR || rel_path.starts_with(&format!("{QUARANTINE_DIR}/")) {
 			return;
 		}
-		if claimed.insert(collision_key(&rel_path), ()).is_some() {
-			has_collisions = true;
-			return;
+		match claimed.get(&collision_key(&rel_path)) {
+			None => {
+				claimed.insert(collision_key(&rel_path), rel_path.clone());
+				nodes.insert(rel_path, node);
+			}
+			// Byte-identical names under one parent cannot exist on the server, so this is the
+			// cache showing both halves of a re-upload at once. Withhold the path for this pass
+			// rather than refusing the whole one; the next snapshot has one of them.
+			Some(previous) if *previous == rel_path => {
+				tracing::debug!(
+					"remote view: holding {rel_path:?} — the cache is mid-transition, listing two items under that exact name"
+				);
+				nodes.remove(&rel_path);
+				held_paths.insert(rel_path);
+			}
+			// A genuine case-only collision: no 1:1 local mapping exists, so the pass is refused.
+			Some(_) => has_collisions = true,
 		}
-		nodes.insert(rel_path, node);
 	};
 
 	for dir in dirs {
@@ -318,6 +339,7 @@ pub(crate) fn build_remote_view(
 	RemoteView {
 		nodes,
 		has_collisions,
+		held_paths,
 	}
 }
 
@@ -869,6 +891,8 @@ pub(crate) struct PassHolds {
 	/// read as a remote-side deletion, and a just-moved one is not moved back. The engine decides
 	/// which uuids qualify (see `PendingWrites`).
 	pub(crate) pending: HashSet<Uuid>,
+	/// Remote paths the cache is showing mid-transition (see [`RemoteView::held_paths`]).
+	pub(crate) held_remote: HashSet<String>,
 }
 
 /// One reconciled pass.
@@ -906,8 +930,15 @@ pub(crate) fn reconcile(
 
 	// Consume the paths the snapshot is behind on before anything else looks at them, so neither
 	// move detection nor the per-path reconcile can act on a cache that has not caught up.
-	let stale = stale_pending_paths(baseline, remote, &holds.pending);
-	let mut deferred_paths = 0;
+	let mut stale = stale_pending_paths(baseline, remote, &holds.pending);
+	stale.extend(holds.held_remote.iter().map(String::as_str));
+	// A held path with nothing on either side is skipped by nobody below, but it IS being withheld
+	// and the report has to say so.
+	let mut deferred_paths = holds
+		.held_remote
+		.iter()
+		.filter(|path| !keys.contains(path.as_str()))
+		.count();
 	if !stale.is_empty() {
 		for key in &keys {
 			if is_under_stale_path(key, &stale) {
@@ -1090,11 +1121,48 @@ mod tests {
 		remote: &HashMap<String, RemoteNode>,
 		pending: HashSet<Uuid>,
 	) -> Vec<SyncAction> {
-		reconcile(mode, baseline, local, remote, &PassHolds { pending }).actions
+		reconcile(
+			mode,
+			baseline,
+			local,
+			remote,
+			&PassHolds {
+				pending,
+				..Default::default()
+			},
+		)
+		.actions
 	}
 
 	fn ms(millis: i64) -> DateTime<Utc> {
 		DateTime::from_timestamp_millis(millis).unwrap()
+	}
+
+	/// A cacheable file with a fresh uuid, named `name` under `parent`.
+	fn cacheable_file(parent: Uuid, name: &'static str) -> CacheableFile<'static> {
+		let uuid = Uuid::new_v4();
+		CacheableFile {
+			uuid,
+			stable_uuid: filen_types::fs::StableUuid::new_for_test(uuid),
+			parent,
+			chunks_size: 1,
+			chunks: 1,
+			favorited: false,
+			region: Cow::Borrowed("r"),
+			bucket: Cow::Borrowed("b"),
+			timestamp: ms(1),
+			name: Cow::Borrowed(name),
+			size: 5,
+			mime: Cow::Borrowed("text/plain"),
+			key: crate::crypto::file::FileKey::from_str_with_version(
+				&"a".repeat(64),
+				filen_types::auth::FileEncryptionVersion::V3,
+			)
+			.unwrap(),
+			last_modified: ms(7),
+			created: Some(ms(1)),
+			hash: Some(Blake3Hash::from([5; 32])),
+		}
 	}
 
 	fn local_file(rel: &str, hash: [u8; 32]) -> LocalNode {
@@ -1929,6 +1997,57 @@ mod tests {
 			],
 			"only the held path is withheld; a mere name-prefix sibling still syncs"
 		);
+	}
+
+	/// The cache can list a re-upload's successor and its not-yet-trashed predecessor at once, under
+	/// the exact same name. Refusing the whole pass for that made every pass a no-op until the
+	/// cache caught up; only the one path is withheld.
+	#[test]
+	fn a_byte_identical_duplicate_remote_name_holds_only_that_path() {
+		let root = Uuid::new_v4();
+		let predecessor = cacheable_file(root, "note.txt");
+		let successor = CacheableFile {
+			uuid: Uuid::new_v4(),
+			..predecessor.clone()
+		};
+		let sibling = cacheable_file(root, "other.txt");
+
+		let view = build_remote_view(root, &[], &[predecessor, successor, sibling.clone()]);
+
+		assert!(
+			!view.has_collisions,
+			"a cache in transition must not refuse the pass"
+		);
+		assert_eq!(view.held_paths, HashSet::from(["note.txt".to_string()]));
+		assert!(
+			!view.nodes.contains_key("note.txt"),
+			"neither half of the transition may be reconciled against"
+		);
+		assert_eq!(
+			view.nodes["other.txt"].remote_uuid, sibling.uuid,
+			"every other path still syncs"
+		);
+	}
+
+	/// A case-only collision is a real one — the server does allow both names, and no 1:1 local
+	/// mapping exists — so the whole-pass refusal stays.
+	#[test]
+	fn a_case_only_remote_collision_still_refuses_the_pass() {
+		let root = Uuid::new_v4();
+		let lower = cacheable_file(root, "note.txt");
+		let upper = CacheableFile {
+			uuid: Uuid::new_v4(),
+			name: Cow::Borrowed("Note.txt"),
+			..lower.clone()
+		};
+
+		let view = build_remote_view(root, &[], &[lower, upper]);
+
+		assert!(
+			view.has_collisions,
+			"a case-only collision is not a transition"
+		);
+		assert!(view.held_paths.is_empty());
 	}
 
 	#[test]
