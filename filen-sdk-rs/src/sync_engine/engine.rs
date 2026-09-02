@@ -598,6 +598,7 @@ impl SyncEngine {
 
 		let holds = plan::PassHolds {
 			pending: self.pending.settle(&observed, &remote_view.nodes),
+			held_remote: remote_view.held_paths.clone(),
 		};
 		self.observed.prune_before(self.pending.oldest_stamp());
 
