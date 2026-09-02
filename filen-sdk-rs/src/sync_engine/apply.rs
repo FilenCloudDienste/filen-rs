@@ -126,6 +126,50 @@ fn confined_local_target(root: &Path, rel_path: &str) -> Result<PathBuf, crate::
 	Ok(target)
 }
 
+/// Rename the local file at `rel_path` aside to `<stem>.old.<ext>` (`<stem>.old.N.<ext>` when that
+/// name is taken), returning the new relative path. This is how a keep-BOTH conflict resolution
+/// preserves the losing local copy: under its new name it has no baseline row, so the next pass
+/// treats it as an ordinary new file and uploads it. Source and destination are both confined to
+/// the sync root.
+///
+/// `None` if there is nothing at `rel_path` any more — the copy the caller meant to keep was
+/// deleted since the conflict was recorded, so there is nothing to move and nothing to fail over.
+pub(super) fn rename_aside(root: &Path, rel_path: &str) -> Result<Option<String>, crate::Error> {
+	let source = confined_local_target(root, rel_path)?;
+	if source.symlink_metadata().is_err() {
+		return Ok(None);
+	}
+	let (parent, name) = parent_and_name(rel_path);
+	let (stem, ext) = match name.rsplit_once('.') {
+		Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+		_ => (name, None),
+	};
+	for n in 0..100_000u32 {
+		let ordinal = if n == 0 {
+			String::new()
+		} else {
+			format!(".{n}")
+		};
+		let candidate = match ext {
+			Some(ext) => format!("{stem}.old{ordinal}.{ext}"),
+			None => format!("{stem}.old{ordinal}"),
+		};
+		let rel = if parent.is_empty() {
+			candidate
+		} else {
+			format!("{parent}/{candidate}")
+		};
+		let dest = confined_local_target(root, &rel)?;
+		if dest.symlink_metadata().is_err() {
+			std::fs::rename(&source, &dest).map_err(io_err)?;
+			return Ok(Some(rel));
+		}
+	}
+	Err(internal_owned(format!(
+		"no free `.old` name is available to keep the local copy of {rel_path:?} aside"
+	)))
+}
+
 fn parent_and_name(rel_path: &str) -> (&str, &str) {
 	match rel_path.rsplit_once('/') {
 		Some((parent, name)) => (parent, name),
