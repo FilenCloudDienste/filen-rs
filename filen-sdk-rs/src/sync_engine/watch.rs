@@ -8,17 +8,25 @@
 //!
 //! Self-induced changes (the engine's own writes/uploads) re-trigger the watcher and the cache
 //! subscription; that costs at most one extra pass, which the baseline recognizes as already
-//! synced and no-ops. (A tighter in-flight suppression is a future optimization.)
+//! synced and no-ops. The engine's own *staging* writes — download temp files and the quarantine
+//! bin — are filtered out instead (see [`triggers_pass`]): they are never content the next pass
+//! would act on, so a pass for them is pure waste.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+	ffi::OsStr,
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::Duration,
+};
 
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::Notify;
 
-use super::{SyncEvent, SyncObserver, baseline::PairId, engine::SyncEngine};
+use super::{SyncEvent, SyncObserver, baseline::PairId, engine::SyncEngine, scan::QUARANTINE_DIR};
 use crate::{
 	Error, ErrorKind,
 	cache::{SyncRootCallback, SyncRootHandle},
+	io::DOWNLOAD_TMP_EXT,
 };
 
 /// Quiet window a burst of change events is coalesced over before a sync pass runs.
@@ -81,10 +89,14 @@ impl SyncEngine {
 			.add_sync_root(record.remote_root, callback)
 			.await?;
 
-		// Local-change trigger: a recursive filesystem watcher on the local root.
+		// Local-change trigger: a recursive filesystem watcher on the local root. The watcher
+		// reports canonicalized paths, so the root it filters against must be canonical too.
 		let local_dirty = Arc::clone(&dirty);
+		let watch_root = std::fs::canonicalize(&local_root).unwrap_or_else(|_| local_root.clone());
 		let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-			if res.is_ok() {
+			if let Ok(event) = &res
+				&& triggers_pass(&watch_root, event)
+			{
 				local_dirty.notify_one();
 			}
 		})
@@ -154,6 +166,101 @@ async fn run_pass(engine: &SyncEngine, pair: PairId, observer: &mut (dyn FnMut(S
 	}
 }
 
+/// Whether a filesystem event under `root` is worth waking the loop for.
+///
+/// Everything is, except the engine's own staging writes: the `<uuid>.filendl` temp file a
+/// download writes before renaming it into place (the rename is itself an event), and the
+/// quarantine bin, which the scan never descends into. A user file that happens to end in
+/// `.filendl` is not lost, only delayed to the next safety-net pass. A pathless event (a watcher
+/// rescan notice) always counts.
+fn triggers_pass(root: &Path, event: &notify::Event) -> bool {
+	event.paths.is_empty()
+		|| event
+			.paths
+			.iter()
+			.any(|path| !is_engine_staging(root, path))
+}
+
+/// Whether `path` is one of the engine's own staging locations under `root` (see [`triggers_pass`]).
+fn is_engine_staging(root: &Path, path: &Path) -> bool {
+	let Ok(rel) = path.strip_prefix(root) else {
+		return false;
+	};
+	rel.extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT))
+		|| rel.components().next().map(|c| c.as_os_str()) == Some(OsStr::new(QUARANTINE_DIR))
+}
+
 fn watch_error(error: notify::Error) -> Error {
 	Error::custom_with_source(ErrorKind::IO, error, Some("filesystem watcher".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::{Path, PathBuf};
+
+	use notify::{
+		EventKind,
+		event::{CreateKind, ModifyKind, RenameMode},
+	};
+
+	use super::triggers_pass;
+
+	fn event(kind: EventKind, paths: &[&str]) -> notify::Event {
+		notify::Event {
+			kind,
+			paths: paths.iter().map(PathBuf::from).collect(),
+			attrs: Default::default(),
+		}
+	}
+
+	#[test]
+	fn only_the_engines_own_staging_writes_are_filtered_out() {
+		let root = Path::new("/sync/root");
+		// Real changes wake the loop.
+		assert!(triggers_pass(
+			root,
+			&event(EventKind::Create(CreateKind::File), &["/sync/root/a.txt"])
+		));
+		// The rename that commits a download does too — it is the real file appearing.
+		assert!(triggers_pass(
+			root,
+			&event(
+				EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+				&["/sync/root/a.txt"]
+			)
+		));
+		// A pathless rescan notice always counts.
+		assert!(triggers_pass(root, &event(EventKind::Other, &[])));
+		// A path outside the root is not ours to classify.
+		assert!(triggers_pass(
+			root,
+			&event(
+				EventKind::Create(CreateKind::File),
+				&["/elsewhere/x.filendl"]
+			)
+		));
+		// The engine's own staging writes do not.
+		assert!(!triggers_pass(
+			root,
+			&event(
+				EventKind::Create(CreateKind::File),
+				&["/sync/root/sub/dee76e0e-0000-0000-0000-000000000000.filendl"]
+			)
+		));
+		assert!(!triggers_pass(
+			root,
+			&event(
+				EventKind::Create(CreateKind::File),
+				&["/sync/root/.filen-sync-trash/gone.txt"]
+			)
+		));
+		// A batch that mentions both still wakes the loop, for the real path.
+		assert!(triggers_pass(
+			root,
+			&event(
+				EventKind::Create(CreateKind::File),
+				&["/sync/root/.filen-sync-trash/gone.txt", "/sync/root/a.txt"]
+			)
+		));
+	}
 }

@@ -20,7 +20,7 @@ use filen_types::crypto::Blake3Hash;
 use unicode_normalization::UnicodeNormalization;
 
 use super::baseline::{BaselineEntry, NodeKind};
-use crate::io::FilenMetaExt;
+use crate::io::{DOWNLOAD_TMP_EXT, FilenMetaExt};
 
 /// The per-pair local quarantine directory (where remote-propagated deletions are moved instead of
 /// being destroyed). Always excluded from the scan so it is never itself synced back up.
@@ -188,6 +188,14 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 			continue;
 		};
 
+		// A `<uuid>.filendl` FILE is the temp file a download in flight is writing into this very
+		// tree (see `Client::download_file_to_path`): partial bytes that must never be read as a
+		// local item to upload. A directory with that suffix is a legitimate user item.
+		if kind == NodeKind::File && entry.path().extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT))
+		{
+			continue;
+		}
+
 		if let Some(previous) = claimed.insert(collision_key(&rel_path), rel_path.clone()) {
 			complete = false;
 			errors.push(ScanError::DuplicateName {
@@ -352,6 +360,35 @@ mod tests {
 		);
 		assert!(scan.nodes.is_empty());
 		assert!(!scan.errors.is_empty());
+	}
+
+	#[test]
+	fn in_flight_download_temp_files_are_excluded() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		// What `download_file_to_path` writes into the tree while a transfer is in flight.
+		fs::write(
+			root.join("dee76e0e-0000-0000-0000-000000000000.filendl"),
+			b"half",
+		)
+		.unwrap();
+		// A DIRECTORY with that suffix is a legitimate user item and stays.
+		fs::create_dir(root.join("notes.filendl")).unwrap();
+
+		let scan = scan_local(&root, &HashMap::new());
+		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		paths.sort();
+		assert_eq!(
+			paths,
+			vec!["keep.txt", "notes.filendl"],
+			"a partial download must never be seen as a local file to upload"
+		);
+		assert!(
+			scan.complete,
+			"skipping our own staging file is not an error"
+		);
+
+		fs::remove_dir_all(&root).ok();
 	}
 
 	#[test]

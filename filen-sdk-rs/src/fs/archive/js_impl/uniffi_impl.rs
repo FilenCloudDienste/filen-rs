@@ -9,7 +9,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::{
 	Error,
 	auth::{Client, JsClient},
-	io::client_impl::TmpFileGuard,
+	io::{DOWNLOAD_TMP_EXT, client_impl::TmpFileGuard},
 	job::report::JobFailed,
 	js::{AnyFile, AnyItemWithContext, AnyNormalDir, File, ManagedFuture},
 };
@@ -233,7 +233,8 @@ where
 {
 	// a name of its own, for downloads of the same entry beside each other
 	let (guard, file) =
-		TmpFileGuard::create_beside(path, &format!("{}.filendl", Uuid::new_v4())).await?;
+		TmpFileGuard::create_beside(path, &format!("{}.{DOWNLOAD_TMP_EXT}", Uuid::new_v4()))
+			.await?;
 	let report = match download(file.compat_write()).await {
 		Ok(report) => report,
 		failed => return Ok(failed),

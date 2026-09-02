@@ -410,9 +410,11 @@ where
 
 	// Every path out of this function before the commit unlinks the temp file
 	// rather than leak it into the sync tree.
-	let (tmp_guard, tmp_file) =
-		TmpFileGuard::create_beside(path.as_ref(), &format!("{}.filendl", remote_file.uuid()))
-			.await?;
+	let (tmp_guard, tmp_file) = TmpFileGuard::create_beside(
+		path.as_ref(),
+		&format!("{}.{}", remote_file.uuid(), super::DOWNLOAD_TMP_EXT),
+	)
+	.await?;
 	let mut writer = tmp_file.compat_write();
 
 	unauth_client
