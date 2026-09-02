@@ -42,6 +42,9 @@ const PENDING_CREATE_GRACE: Duration = Duration::from_secs(180);
 #[derive(Debug)]
 struct PendingWrite {
 	at: Instant,
+	/// The pair whose pass made the write. Only that pair's remote snapshot covers the item, so
+	/// only that pair's pass may read a snapshot as evidence about it.
+	pair: PairId,
 	/// The observation counter as of the moment this write was recorded. Only a cache event seen
 	/// AFTER that proves the cache caught up to THIS write: a move's uuid was necessarily
 	/// announced earlier, when the item was first created.
@@ -173,12 +176,14 @@ impl PendingWrites {
 	pub(super) fn record_create(
 		&self,
 		observations: &Observations,
+		pair: PairId,
 		uuid: Uuid,
 		path: &str,
 		replaced: Option<Uuid>,
 	) {
 		self.record(
 			observations,
+			pair,
 			uuid,
 			PendingKind::Created {
 				path: path.to_string(),
@@ -188,14 +193,21 @@ impl PendingWrites {
 	}
 
 	/// Record a remote item this pass sent to the trash.
-	pub(super) fn record_trash(&self, observations: &Observations, uuid: Uuid) {
-		self.record(observations, uuid, PendingKind::Trashed);
+	pub(super) fn record_trash(&self, observations: &Observations, pair: PairId, uuid: Uuid) {
+		self.record(observations, pair, uuid, PendingKind::Trashed);
 	}
 
 	/// Record a remote item this pass moved out of `from`.
-	pub(super) fn record_move(&self, observations: &Observations, uuid: Uuid, from: &str) {
+	pub(super) fn record_move(
+		&self,
+		observations: &Observations,
+		pair: PairId,
+		uuid: Uuid,
+		from: &str,
+	) {
 		self.record(
 			observations,
+			pair,
 			uuid,
 			PendingKind::Moved {
 				from: from.to_string(),
@@ -203,11 +215,12 @@ impl PendingWrites {
 		);
 	}
 
-	fn record(&self, observations: &Observations, uuid: Uuid, kind: PendingKind) {
+	fn record(&self, observations: &Observations, pair: PairId, uuid: Uuid, kind: PendingKind) {
 		self.map().insert(
 			uuid,
 			PendingWrite {
 				at: Instant::now(),
+				pair,
 				seq: observations.stamp(),
 				kind,
 			},
@@ -224,9 +237,11 @@ impl PendingWrites {
 	/// pre-write state — split by what the reconciler has to do about each.
 	///
 	/// `observed` must have been copied BEFORE `remote` was read, so a cache batch committed after
-	/// the snapshot cannot retire a record whose item that snapshot still predates.
+	/// the snapshot cannot retire a record whose item that snapshot still predates. `remote` is
+	/// `pair`'s subtree alone, so it is only evidence about `pair`'s own writes.
 	fn settle(
 		&self,
+		pair: PairId,
 		observed: &HashMap<Uuid, u64>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> plan::PassHolds {
@@ -244,6 +259,12 @@ impl PendingWrites {
 			}
 			if now.duration_since(write.at) >= PENDING_CREATE_GRACE {
 				return false;
+			}
+			// Another pair's write: this snapshot covers a different remote subtree and says
+			// nothing about it, least of all that it is gone. (The two rules above are about the
+			// uuid alone, so they hold whichever pair's pass applies them.)
+			if write.pair != pair {
+				return true;
 			}
 			match &write.kind {
 				PendingKind::Created { path, replaced } => {
@@ -265,6 +286,7 @@ impl PendingWrites {
 		});
 		let (trashed, pending) = map
 			.iter()
+			.filter(|(_, write)| write.pair == pair)
 			.map(|(uuid, write)| (*uuid, matches!(write.kind, PendingKind::Trashed)))
 			.partition::<Vec<_>, _>(|(_, is_trash)| *is_trash);
 		let uuids =
@@ -616,7 +638,7 @@ impl SyncEngine {
 		let remote_view =
 			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
 
-		let mut holds = self.pending.settle(&observed, &remote_view.nodes);
+		let mut holds = self.pending.settle(pair, &observed, &remote_view.nodes);
 		holds.held_remote = remote_view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
@@ -977,6 +999,9 @@ mod tests {
 	use super::*;
 	use crate::sync_engine::{baseline::NodeKind, plan::RemoteNode, scan::LocalNode};
 
+	/// The pair whose writes the pending-write tests record.
+	const PAIR: PairId = 1;
+
 	fn hash(byte: u8) -> Blake3Hash {
 		Blake3Hash::from([byte; 32])
 	}
@@ -1120,14 +1145,14 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, uuid, "a.txt", None);
+		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
 
 		observations.note([uuid]);
 		let observed = observations.snapshot();
 
 		assert!(
 			pending
-				.settle(&observed, &HashMap::new())
+				.settle(PAIR, &observed, &HashMap::new())
 				.pending
 				.is_empty(),
 			"an announced uuid retires the write even with nothing left at the path"
@@ -1142,14 +1167,14 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, uuid, "a.txt", None);
+		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
 
 		// The pass copies the observations, THEN reads the snapshot; the event lands in between.
 		let observed = observations.snapshot();
 		observations.note([uuid]);
 
 		assert_eq!(
-			pending.settle(&observed, &HashMap::new()).pending,
+			pending.settle(PAIR, &observed, &HashMap::new()).pending,
 			HashSet::from([uuid]),
 			"only what was known before the snapshot may retire a write against it"
 		);
@@ -1164,11 +1189,13 @@ mod tests {
 		let uuid = Uuid::new_v4();
 
 		observations.note([uuid]);
-		pending.record_move(&observations, uuid, "a.txt");
+		pending.record_move(&observations, PAIR, uuid, "a.txt");
 
 		let remote = node_at("a.txt", uuid);
 		assert_eq!(
-			pending.settle(&observations.snapshot(), &remote).pending,
+			pending
+				.settle(PAIR, &observations.snapshot(), &remote)
+				.pending,
 			HashSet::from([uuid]),
 			"the snapshot still shows the pre-move path and nothing new has been announced"
 		);
@@ -1176,7 +1203,7 @@ mod tests {
 		observations.note([uuid]);
 		assert!(
 			pending
-				.settle(&observations.snapshot(), &remote)
+				.settle(PAIR, &observations.snapshot(), &remote)
 				.pending
 				.is_empty(),
 			"an announcement made after the move retires it"
@@ -1190,11 +1217,11 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record_create(&observations, new, "a.txt", Some(old));
+		pending.record_create(&observations, PAIR, new, "a.txt", Some(old));
 
 		assert_eq!(
 			pending
-				.settle(&observations.snapshot(), &node_at("a.txt", old))
+				.settle(PAIR, &observations.snapshot(), &node_at("a.txt", old))
 				.pending,
 			HashSet::from([new]),
 			"the pre-write occupant is what a lagging cache shows"
@@ -1208,14 +1235,55 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record_create(&observations, new, "a.txt", Some(old));
+		pending.record_create(&observations, PAIR, new, "a.txt", Some(old));
 
 		assert!(
 			pending
-				.settle(&observations.snapshot(), &node_at("a.txt", Uuid::new_v4()))
+				.settle(
+					PAIR,
+					&observations.snapshot(),
+					&node_at("a.txt", Uuid::new_v4())
+				)
 				.pending
 				.is_empty(),
 			"a uuid that is neither ours nor the one we replaced is a foreign write"
+		);
+	}
+
+	/// Each pair enumerates its OWN remote subtree, so another pair's snapshot is silent about a
+	/// write it never covers. Reading that silence as evidence retired the record — and a retired
+	/// trash is trashed a second time by the owning pair's next pass.
+	#[test]
+	fn another_pairs_pass_leaves_a_write_it_cannot_see_alone() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (trashed, created) = (Uuid::new_v4(), Uuid::new_v4());
+		pending.record_trash(&observations, PAIR, trashed);
+		pending.record_create(&observations, PAIR, created, "note.txt", None);
+		// The other pair happens to hold a path of the same name — its own file, under its own
+		// root — and never lists the trashed uuid at all.
+		let foreign = node_at("note.txt", Uuid::new_v4());
+
+		let holds = pending.settle(PAIR + 1, &observations.snapshot(), &foreign);
+		assert!(
+			holds.trashed.is_empty() && holds.pending.is_empty(),
+			"a pass holds nothing on behalf of another pair"
+		);
+
+		let holds = pending.settle(
+			PAIR,
+			&observations.snapshot(),
+			&node_at("gone.txt", trashed),
+		);
+		assert_eq!(
+			holds.trashed,
+			HashSet::from([trashed]),
+			"the owning pair's snapshot still shows the item untrashed"
+		);
+		assert_eq!(
+			holds.pending,
+			HashSet::from([created]),
+			"and still has not caught up to the create"
 		);
 	}
 
@@ -1228,7 +1296,7 @@ mod tests {
 		observations.note([Uuid::new_v4(), Uuid::new_v4()]);
 
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, uuid, "a.txt", None);
+		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
 		observations.prune_before(pending.oldest_stamp());
 		assert!(
 			observations.snapshot().is_empty(),
@@ -1238,7 +1306,7 @@ mod tests {
 		observations.note([uuid]);
 		assert!(
 			pending
-				.settle(&observations.snapshot(), &HashMap::new())
+				.settle(PAIR, &observations.snapshot(), &HashMap::new())
 				.pending
 				.is_empty()
 		);
