@@ -79,6 +79,18 @@ async fn list_dir(
 		.unwrap()
 }
 
+/// Upload `data` as `name` directly under `parent` and wait until `cache` observes it, so a pass
+/// run afterwards reconciles against a remote view that already contains it.
+async fn seed_remote_file(cache: &TestCache, parent: Uuid, name: &str, data: &[u8]) -> Uuid {
+	let builder = cache.client.make_file_builder(name, parent).unwrap();
+	let file = cache.client.upload_file(builder, data).await.unwrap();
+	assert!(
+		poll_for_item(cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed the seeded remote file {name}"
+	);
+	file.uuid()
+}
+
 fn has_file(files: &[filen_sdk_rs::fs::file::RemoteFile], name: &str) -> bool {
 	files.iter().any(|f| f.name() == Some(name))
 }
@@ -705,20 +717,143 @@ async fn control_03_resume_no_redundant_retransfer() {
 	// zero uploads/downloads, all 10 byte-identical both sides.
 }
 
-#[ignore = "blocked: no public remove_pair — a removed pair must stop syncing and leave BOTH sides intact"]
+/// CONTROL-05 — a removed pair stops syncing and leaves BOTH sides exactly as they were: removal
+/// is a registry operation, never a destructive one.
 #[shared_test_runtime]
 async fn control_05_remove_pair_leaves_both_sides_intact() {
-	// plan: two-way pair, 5 files baseline; remove; local modify+delete, remote add; wait;
-	// assert no actions, remote unchanged (deleted file NOT trashed), local unchanged (remote add
-	// NOT pulled), no quarantine entries.
+	let (resources, cache, remote, local) = raw_setup("c05").await;
+	for i in 0..5 {
+		write_file(&local, &format!("f{i}.txt"), format!("v{i}").as_bytes());
+	}
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let r1 = engine.sync_once(pair).await.unwrap();
+	assert_eq!(r1.uploaded, 5, "{r1:?}");
+	let (_d0, before) = list_remote(&resources).await;
+	assert_eq!(before.len(), 5, "precondition: 5 remote files");
+	let local_before = walk_tree(&local);
+
+	// Remove the pair — and prove it is gone from the registry.
+	engine.remove_pair(pair).await.unwrap();
+	assert!(
+		engine
+			.list_pairs()
+			.await
+			.unwrap()
+			.iter()
+			.all(|p| p.id != pair),
+		"the removed pair is still registered"
+	);
+
+	// Stage a change on each side that a LIVE pair would propagate.
+	std::fs::remove_file(local.join("f0.txt")).unwrap();
+	write_file(&local, "f1.txt", b"locally edited after removal");
+	seed_remote_file(&cache, remote, "added_after_removal.txt", b"remote add").await;
+
+	// The removed pair cannot be synced at all.
+	assert!(
+		engine.sync_once(pair).await.is_err(),
+		"a removed pair must not sync"
+	);
+
+	// Remote: the local delete was NOT mirrored, the local edit was NOT pushed.
+	let (_d1, after) = list_remote(&resources).await;
+	assert!(
+		has_file(&after, "f0.txt"),
+		"removing a pair trashed a remote file"
+	);
+	let f1 = after
+		.iter()
+		.find(|f| f.name() == Some("f1.txt"))
+		.expect("f1.txt lost");
+	assert_eq!(f1.size, 2, "the post-removal local edit was pushed anyway");
+
+	// Local: the remote add was NOT pulled and nothing was quarantined.
+	assert!(
+		!local.join("added_after_removal.txt").exists(),
+		"the post-removal remote add was pulled anyway"
+	);
+	assert!(
+		!local.join(".filen-sync-trash").exists(),
+		"removing a pair quarantined something"
+	);
+	// The only local difference is the change the test itself made.
+	let mut expected = local_before;
+	expected.remove("f0.txt");
+	expected.insert(
+		"f1.txt".to_string(),
+		(false, 28, b"locally edited after removal".to_vec()),
+	);
+	assert_eq!(walk_tree(&local), expected, "the local tree was touched");
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
-#[ignore = "blocked: no public remove_pair — remove-then-readd must behave like first-sync-against-populated"]
+/// CONTROL-06 — remove-then-re-add on the same roots starts from an EMPTY baseline, i.e. with
+/// first-sync semantics: the populated destination is not wiped, identical files reconcile with
+/// zero transfer, and a genuinely divergent file is surfaced as a conflict instead of one side
+/// silently winning.
 #[shared_test_runtime]
 async fn control_06_remove_then_readd_first_sync_semantics() {
-	// plan: two-way pair to baseline; remove; add fresh pair same roots (baseline gone); pass =>
-	// populated dest not wiped, identical files reconciled with zero transfer, divergent files
-	// surfaced as conflicts, no data loss.
+	let (resources, cache, remote, local) = raw_setup("c06").await;
+	write_file(&local, "same1.txt", b"identical one");
+	write_file(&local, "same2.txt", b"identical two");
+	write_file(&local, "diverge.txt", b"BASE");
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	assert_eq!(engine.sync_once(pair).await.unwrap().uploaded, 3);
+
+	engine.remove_pair(pair).await.unwrap();
+
+	// Diverge one path on BOTH sides while no pair owns them.
+	write_file(&local, "diverge.txt", b"LOCAL-SIDE");
+	seed_remote_file(&cache, remote, "diverge.txt", b"REMOTE-SIDE").await;
+
+	// Re-add the SAME roots: a new pair with no baseline at all.
+	let readded = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let r = engine.sync_once(readded).await.unwrap();
+	assert!(r.errors.is_empty(), "{r:?}");
+
+	// Nothing destroyed on either side...
+	assert_eq!(r.remotely_trashed, 0, "first sync trashed remote: {r:?}");
+	assert_eq!(r.locally_deleted, 0, "first sync deleted local: {r:?}");
+	// ...identical files cost no transfer...
+	assert_eq!(r.uploaded, 0, "identical files re-uploaded: {r:?}");
+	assert_eq!(r.downloaded, 0, "identical files re-downloaded: {r:?}");
+	// ...and the genuine divergence is surfaced, not silently resolved.
+	assert!(
+		r.conflicts.iter().any(|c| c == "diverge.txt"),
+		"divergence must surface on a first sync: {r:?}"
+	);
+
+	// Both versions still exist.
+	assert!(
+		read_eq(&local, "diverge.txt", b"LOCAL-SIDE"),
+		"local side lost"
+	);
+	assert!(read_eq(&local, "same1.txt", b"identical one"));
+	let (_d, files) = list_remote(&resources).await;
+	assert!(has_file(&files, "same1.txt") && has_file(&files, "same2.txt"));
+	let remote_diverge = files
+		.iter()
+		.find(|f| f.name() == Some("diverge.txt"))
+		.expect("remote side lost");
+	assert_eq!(remote_diverge.size, b"REMOTE-SIDE".len() as u64);
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 #[ignore = "blocked: no public baseline corruption/inspection seam — needs a fault-injection harness"]
@@ -767,11 +902,114 @@ async fn control_18_pause_mid_pass_coherent() {
 	// atomic/rolled back, resume converges byte-exact, baseline only reflects completed actions.
 }
 
-#[ignore = "blocked: no public remove_pair — removing one of several must not affect the others"]
+/// CONTROL-19 — removing ONE of several pairs affects only that pair: the others keep converging,
+/// the removed pair's roots are untouched on both sides, and its baseline rows are gone.
 #[shared_test_runtime]
 async fn control_19_remove_one_among_several() {
-	// plan: 3 disjoint pairs to baseline; remove P2; stage changes in P1/P3 and P2's roots; run all
-	// => P1/P3 apply + advance, P2 roots untouched both sides, no P2 actions, P2 baseline cleaned up.
+	let (resources, cache, _root, local_1) = raw_setup("c19a").await;
+	// Three disjoint remote roots inside the same converged cache subtree. Each pair gets its OWN
+	// subfolder: a pair rooted at the shared root would see its siblings' folders as remote-only
+	// items and mirror their absence.
+	let mut remotes = Vec::new();
+	for name in ["c19_p1", "c19_p2", "c19_p3"] {
+		let dir = cache
+			.client
+			.create_dir(
+				&DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir)),
+				name,
+			)
+			.await
+			.unwrap();
+		remotes.push(dir);
+	}
+	let (remote_1, remote_2, remote_3) = (remotes[0].uuid(), remotes[1].uuid(), remotes[2].uuid());
+	let local_2 = fresh_local_dir("c19b");
+	let local_3 = fresh_local_dir("c19c");
+
+	write_file(&local_1, "p1.txt", b"one");
+	write_file(&local_2, "p2.txt", b"two");
+	write_file(&local_3, "p3.txt", b"three");
+
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair_1 = engine
+		.add_pair(local_1.clone(), remote_1, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	let pair_2 = engine
+		.add_pair(local_2.clone(), remote_2, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	let pair_3 = engine
+		.add_pair(local_3.clone(), remote_3, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	for pair in [pair_1, pair_2, pair_3] {
+		assert_eq!(engine.sync_once(pair).await.unwrap().uploaded, 1);
+	}
+	assert_eq!(engine.list_pairs().await.unwrap().len(), 3);
+
+	// Remove ONLY P2.
+	engine.remove_pair(pair_2).await.unwrap();
+	let remaining: Vec<i64> = engine
+		.list_pairs()
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|p| p.id)
+		.collect();
+	assert_eq!(
+		remaining,
+		vec![pair_1, pair_3],
+		"wrong registry after removal"
+	);
+
+	// Stage a change in every root, including the removed pair's.
+	write_file(&local_1, "p1_new.txt", b"one more");
+	write_file(&local_2, "p2_new.txt", b"must not sync");
+	write_file(&local_3, "p3_new.txt", b"three more");
+
+	assert_eq!(engine.sync_once(pair_1).await.unwrap().uploaded, 1);
+	assert_eq!(engine.sync_once(pair_3).await.unwrap().uploaded, 1);
+	assert!(
+		engine.sync_once(pair_2).await.is_err(),
+		"the removed pair must not sync"
+	);
+
+	// P1/P3 advanced; P2's roots are untouched on both sides.
+	let (_d1, files_1) = list_dir(&cache.client, &remotes[0]).await;
+	assert!(has_file(&files_1, "p1_new.txt"), "P1 did not advance");
+	let (_d3, files_3) = list_dir(&cache.client, &remotes[2]).await;
+	assert!(has_file(&files_3, "p3_new.txt"), "P3 did not advance");
+	let (_d2, files_2) = list_dir(&cache.client, &remotes[1]).await;
+	assert!(
+		has_file(&files_2, "p2.txt"),
+		"P2's already-synced file was removed"
+	);
+	assert!(
+		!has_file(&files_2, "p2_new.txt"),
+		"the removed pair uploaded anyway"
+	);
+	assert!(
+		read_eq(&local_2, "p2.txt", b"two"),
+		"P2's local root was touched"
+	);
+	assert!(!local_2.join(".filen-sync-trash").exists());
+
+	// Re-adding P2 starts over from an empty baseline (its rows were cascaded away): the file
+	// created while it was removed is a fresh create, uploaded on the next pass.
+	let readded = engine
+		.add_pair(local_2.clone(), remote_2, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	let r = engine.sync_once(readded).await.unwrap();
+	assert!(r.errors.is_empty(), "{r:?}");
+	assert_eq!(r.uploaded, 1, "only the new file needs pushing: {r:?}");
+
+	for dir in [&local_1, &local_2, &local_3] {
+		std::fs::remove_dir_all(dir).ok();
+	}
 }
 
 #[ignore = "blocked: no public pause control — a long-pause backlog must converge in one (or few) resumed passes"]
