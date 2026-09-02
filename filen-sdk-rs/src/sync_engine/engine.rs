@@ -105,6 +105,9 @@ pub struct SyncEngine {
 	pub(super) store: Mutex<BaselineStore>,
 	/// Remote writes this engine made that the cache may not reflect yet (see [`PendingWrites`]).
 	pub(super) pending: PendingWrites,
+	/// One-shot mass-delete approvals: pair -> the batch token the caller approved. The next pass
+	/// whose held batch hashes to that token executes it; any other batch is held again.
+	approvals: Mutex<HashMap<PairId, String>>,
 }
 
 /// Why the engine refused to act on a pass.
@@ -245,6 +248,7 @@ impl SyncEngine {
 			client,
 			store: Mutex::new(store),
 			pending: PendingWrites::default(),
+			approvals: Mutex::new(HashMap::new()),
 		})
 	}
 
@@ -404,13 +408,39 @@ impl SyncEngine {
 		if let Some(refusal) = refusal(&prep) {
 			return Ok(PlanOutcome::Refused(refusal));
 		}
-		let (conflicts, decision) = reconcile_and_screen(&prep, screen_state(&prep));
+		let screened = reconcile_and_screen(&prep, screen_state(&prep));
 		Ok(PlanOutcome::Planned {
-			actions: decision.safe,
-			held_deletions: decision.held,
-			conflicts,
-			guard_reason: decision.reason,
+			actions: screened.decision.safe,
+			held_deletions: screened.decision.held,
+			conflicts: screened.conflicts,
+			guard_reason: screened.decision.reason,
 		})
+	}
+
+	/// Approve the mass-delete batch the guard is currently holding for `pair`, naming it by the
+	/// `pass_token` the hold reported ([`SyncReport::deletion_token`] or
+	/// [`SyncEvent::DeletionsHeld`]).
+	///
+	/// The approval is ONE-SHOT and batch-specific: the next pass whose held deletions hash to the
+	/// same token applies them; any other batch — different paths, or a different reason to hold —
+	/// is held again under a fresh token, so an approval can never leak onto deletions the caller
+	/// never saw.
+	pub async fn approve_deletions(&self, pair: PairId, pass_token: &str) {
+		self.approvals
+			.lock()
+			.await
+			.insert(pair, pass_token.to_string());
+	}
+
+	/// Consume a pending approval for `pair` if it names exactly this batch.
+	async fn take_approval(&self, pair: PairId, pass_token: &str) -> bool {
+		let mut approvals = self.approvals.lock().await;
+		if approvals.get(&pair).is_some_and(|held| held == pass_token) {
+			approvals.remove(&pair);
+			true
+		} else {
+			false
+		}
 	}
 
 	/// Run one full sync pass: plan, screen, and apply against the remote and local tree.
@@ -457,11 +487,28 @@ impl SyncEngine {
 		}
 
 		let state = screen_state(&prep);
-		let (conflicts, decision) = reconcile_and_screen(&prep, state);
-		report.conflicts = conflicts;
+		let mut screened = reconcile_and_screen(&prep, state);
+		// A one-shot approval releases the held batch it names — and only that batch.
+		if let Some(token) = screened.pass_token.clone()
+			&& self.take_approval(pair, &token).await
+		{
+			tracing::debug!(
+				"sync_once[pair {pair}]: approval {token} matched — applying {} held deletion(s)",
+				screened.decision.held.len(),
+			);
+			screened.decision = guard::GuardDecision {
+				safe: std::mem::take(&mut screened.all),
+				held: Vec::new(),
+				reason: None,
+			};
+			screened.pass_token = None;
+		}
+		let decision = screened.decision;
+		report.conflicts = screened.conflicts;
 		// `held` can also carry the create half of a held type flip; the report counts deletions.
 		report.held_deletions = decision.held.iter().filter(|a| a.is_delete()).count();
 		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
+		report.deletion_token = screened.pass_token;
 
 		for rel_path in &report.conflicts {
 			// HOLD the conflict in the baseline: the path (and its subtree) is excluded from
@@ -486,6 +533,7 @@ impl SyncEngine {
 			observer(SyncEvent::DeletionsHeld {
 				count: report.held_deletions,
 				reason: report.guard_message.clone().unwrap_or_default(),
+				pass_token: report.deletion_token.clone().unwrap_or_default(),
 			});
 		}
 		observer(SyncEvent::Planned {
@@ -561,11 +609,19 @@ fn refusal(prep: &Prepared) -> Option<RefuseReason> {
 	None
 }
 
+/// A reconciled, guard-screened pass.
+struct Screened {
+	/// Paths surfaced as two-way conflicts (held, never applied).
+	conflicts: Vec<String>,
+	/// Every executable action in apply order — what an APPROVED pass runs, held deletions and all.
+	all: Vec<SyncAction>,
+	decision: guard::GuardDecision,
+	/// Identifies the held batch, when the guard held one.
+	pass_token: Option<String>,
+}
+
 /// Reconcile the prepared inputs and screen deletions through the guard, splitting out conflicts.
-fn reconcile_and_screen(
-	prep: &Prepared,
-	state: guard::ScreenState,
-) -> (Vec<String>, guard::GuardDecision) {
+fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened {
 	let all_actions = plan::reconcile(
 		prep.record.mode,
 		&prep.baseline,
@@ -580,8 +636,43 @@ fn reconcile_and_screen(
 		.into_iter()
 		.map(|a| a.rel_path().to_string())
 		.collect();
+	// The unscreened list is only needed to release an approved batch, which cannot happen unless
+	// the pass plans a deletion at all — so a pure-transfer pass (a first sync, say) never pays for
+	// the copy.
+	let all = if executable.iter().any(SyncAction::is_delete) {
+		executable.clone()
+	} else {
+		Vec::new()
+	};
 	let decision = guard::screen(executable, state, DeleteGuard::default());
-	(conflicts, decision)
+	let pass_token = (!decision.held.is_empty()).then(|| deletion_batch_token(&decision.held));
+	Screened {
+		conflicts,
+		all,
+		decision,
+		pass_token,
+	}
+}
+
+/// A stable identifier for one held deletion batch: the sorted `(side, path)` lines hashed. The
+/// same set of held deletions always yields the same token, and adding, dropping or re-siding a
+/// single deletion yields a different one — which is what makes an approval batch-specific.
+fn deletion_batch_token(held: &[SyncAction]) -> String {
+	let mut lines: Vec<String> = held
+		.iter()
+		.map(|action| match action {
+			SyncAction::DeleteLocal { rel_path, .. } => format!("local\t{rel_path}"),
+			SyncAction::TrashRemote { rel_path, .. } => format!("remote\t{rel_path}"),
+			other => format!("other\t{}", other.rel_path()),
+		})
+		.collect();
+	lines.sort_unstable();
+	let mut hasher = blake3::Hasher::new();
+	for line in &lines {
+		hasher.update(line.as_bytes());
+		hasher.update(b"\n");
+	}
+	hasher.finalize().to_hex()[..16].to_string()
 }
 
 /// How trustworthy this pass's inputs are, for the guard.

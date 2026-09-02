@@ -1221,13 +1221,92 @@ async fn observ_22_byte_size_accounting_matches_transferred() {
 	// public SyncEvent variants carry only rel_path — no size/bytes/progress fields exist.
 }
 
-#[ignore = "blocked: no mass-delete confirmation API in the public surface — see OBSERV-23 TODO"]
+/// OBSERV-23 — a held mass delete reports as HELD with zero deletion events, and once approved by
+/// its token the next pass reports exactly those deletions, one event each, with nothing still held.
 #[shared_test_runtime]
 async fn observ_23_held_then_confirmed_reported_as_deletes() {
-	// plan: trip a mass-delete hold (held == H, deleted == 0), provide confirmation to proceed, run
-	// the next pass; assert deleted == H, held == 0, each deletion fires exactly one event in the
-	// second pass and none in the first, destination reflects exactly H removals. There is no public
-	// API to confirm/approve a held deletion (the guard re-holds every pass), so this is unverifiable.
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	const TOTAL: usize = 40;
+	const DELETE: usize = 30;
+	for i in 0..TOTAL {
+		write_file(
+			&sc.local,
+			&format!("f{i:03}.txt"),
+			format!("v{i}").as_bytes(),
+		);
+	}
+	assert_eq!(sc.sync().await.uploaded, TOTAL);
+	for i in 0..DELETE {
+		std::fs::remove_file(sc.local.join(format!("f{i:03}.txt"))).unwrap();
+	}
+
+	// Pass 1: held, and NOT ONE deletion event fires.
+	let mut events = Vec::new();
+	let held_report = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut |e| events.push(e))
+		.await
+		.unwrap();
+	assert!(held_report.errors.is_empty(), "{held_report:?}");
+	assert_eq!(held_report.held_deletions, DELETE, "{held_report:?}");
+	assert_eq!(held_report.remotely_trashed, 0, "{held_report:?}");
+	assert_eq!(
+		events
+			.iter()
+			.filter(|e| matches!(e, SyncEvent::TrashingRemote { .. }))
+			.count(),
+		0,
+		"a held batch must fire no deletion events: {events:?}"
+	);
+	let token = events
+		.iter()
+		.find_map(|e| match e {
+			SyncEvent::DeletionsHeld {
+				count, pass_token, ..
+			} => {
+				assert_eq!(*count, DELETE, "held event count disagrees with the report");
+				Some(pass_token.clone())
+			}
+			_ => None,
+		})
+		.expect("a DeletionsHeld event must carry the batch token");
+	assert_eq!(
+		Some(token.clone()),
+		held_report.deletion_token,
+		"the event and the report must name the same batch"
+	);
+
+	// Approve exactly that batch; pass 2 applies it, one event per deletion, nothing left held.
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let mut events = Vec::new();
+	let applied = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut |e| events.push(e))
+		.await
+		.unwrap();
+	assert!(applied.errors.is_empty(), "{applied:?}");
+	assert_eq!(applied.remotely_trashed, DELETE, "{applied:?}");
+	assert_eq!(applied.held_deletions, 0, "{applied:?}");
+	assert!(applied.deletion_token.is_none(), "{applied:?}");
+	assert_eq!(
+		events
+			.iter()
+			.filter(|e| matches!(e, SyncEvent::TrashingRemote { .. }))
+			.count(),
+		DELETE,
+		"one deletion event per applied deletion"
+	);
+	assert!(
+		!events
+			.iter()
+			.any(|e| matches!(e, SyncEvent::DeletionsHeld { .. })),
+		"nothing may still be held: {events:?}"
+	);
+
+	// The destination reflects exactly DELETE removals.
+	assert_eq!(list_remote_files(&sc).await.len(), TOTAL - DELETE);
+
+	sc.cleanup();
 }
 
 #[ignore = "blocked: needs a per-item transfer-failure injector — see OBSERV-24 TODO"]
