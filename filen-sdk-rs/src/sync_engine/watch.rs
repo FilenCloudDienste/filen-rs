@@ -33,15 +33,57 @@ use crate::{
 const DEBOUNCE: Duration = Duration::from_millis(800);
 /// Periodic full pass — the backstop for anything the watchers miss or coalesce.
 const SAFETY_NET: Duration = Duration::from_secs(300);
+/// Delay after the first failed pass; doubles per consecutive failure up to [`MAX_BACKOFF`].
+const BASE_BACKOFF: Duration = Duration::from_secs(2);
+/// Ceiling on that backoff, so a persistent failure still retries about as often as the safety net.
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 /// An active continuous sync. Dropping it stops the background loop, the FS watcher, and the
-/// cache subscription.
+/// cache subscription; [`stop`](Self::stop) does the same but waits for the loop to finish.
 pub struct WatchHandle {
 	// Dropping the sender closes the channel, which breaks the loop's shutdown select arm.
-	_shutdown: tokio::sync::oneshot::Sender<()>,
+	shutdown: tokio::sync::oneshot::Sender<()>,
+	// Resolves when the background loop has returned; `stop` awaits it.
+	loop_done: tokio::task::JoinHandle<()>,
+	status: tokio::sync::watch::Receiver<WatchStatus>,
 	// Holds the FS watcher and the cache registration alive for the watch's lifetime.
 	_watcher: notify::RecommendedWatcher,
 	_sync_root: SyncRootHandle,
+}
+
+impl WatchHandle {
+	/// Stop the watch and wait for the background loop to finish (up to one in-flight pass), so a
+	/// caller can be sure nothing is still touching either side when this returns. Dropping the
+	/// handle stops the loop too, but does not wait for it.
+	pub async fn stop(self) {
+		let Self {
+			shutdown,
+			loop_done,
+			status: _status,
+			_watcher,
+			_sync_root,
+		} = self;
+		drop(shutdown);
+		// The loop only fails to join if it panicked; nothing left to wait for either way.
+		let _ = loop_done.await;
+	}
+
+	/// Watch the loop's health: every completed pass publishes a [`WatchStatus`], so a caller can
+	/// react to a watch that is failing (its passes error out) instead of only seeing it go quiet.
+	pub fn status(&self) -> tokio::sync::watch::Receiver<WatchStatus> {
+		self.status.clone()
+	}
+}
+
+/// The health of a running watch, published after every pass. A pass failing outright (as opposed
+/// to a single action inside it, which surfaces as [`SyncEvent::ActionFailed`]) is otherwise
+/// invisible: the loop logs it and retries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchStatus {
+	/// Passes that failed back to back; reset to zero by the next successful pass.
+	pub consecutive_failures: u32,
+	/// Why the last pass failed, or `None` while the watch is healthy.
+	pub last_error: Option<String>,
 }
 
 impl SyncEngine {
@@ -106,11 +148,21 @@ impl SyncEngine {
 			.map_err(watch_error)?;
 
 		let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+		let (status_tx, status_rx) = tokio::sync::watch::channel(WatchStatus::default());
 		let engine = Arc::clone(&self);
-		tokio::spawn(run_loop(engine, pair, dirty, shutdown_rx, observer));
+		let loop_done = tokio::spawn(run_loop(
+			engine,
+			pair,
+			dirty,
+			shutdown_rx,
+			observer,
+			status_tx,
+		));
 
 		Ok(WatchHandle {
-			_shutdown: shutdown_tx,
+			shutdown: shutdown_tx,
+			loop_done,
+			status: status_rx,
 			_watcher: watcher,
 			_sync_root: sync_root,
 		})
@@ -118,51 +170,113 @@ impl SyncEngine {
 }
 
 /// The background loop: an initial pass, then debounced passes on `dirty`, plus a periodic pass,
-/// until `shutdown` fires (its sender dropped).
+/// until `shutdown` fires (its sender dropped). A pass that fails outright backs the loop off (see
+/// [`backoff`]) so a persistent error does not hot-loop at the debounce cadence; that backoff is
+/// also the retry timer, since an outage over a quiescent tree produces no trigger of its own.
 async fn run_loop(
 	engine: Arc<SyncEngine>,
 	pair: PairId,
 	dirty: Arc<Notify>,
 	mut shutdown: tokio::sync::oneshot::Receiver<()>,
 	mut observer: SyncObserver,
+	status: tokio::sync::watch::Sender<WatchStatus>,
 ) {
-	run_pass(&engine, pair, observer.as_mut()).await;
+	let mut failures: u32 = 0;
 
 	let mut safety_net = tokio::time::interval(SAFETY_NET);
 	safety_net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-	safety_net.tick().await; // consume the immediate first tick (the initial pass covered it)
+	safety_net.tick().await; // consume the immediate first tick (the initial pass below covers it)
 
 	loop {
-		tokio::select! {
-			biased;
-			_ = &mut shutdown => break,
-			_ = safety_net.tick() => run_pass(&engine, pair, observer.as_mut()).await,
-			_ = dirty.notified() => {
-				// Coalesce the burst: wait for DEBOUNCE of quiet (each new event restarts it).
-				loop {
-					tokio::select! {
-						biased;
-						_ = &mut shutdown => return,
-						_ = dirty.notified() => continue,
-						_ = tokio::time::sleep(DEBOUNCE) => break,
-					}
-				}
-				run_pass(&engine, pair, observer.as_mut()).await;
-			}
+		let error = run_pass(&engine, pair, observer.as_mut()).await;
+		if error.is_none() {
+			failures = 0;
+		} else {
+			failures = failures.saturating_add(1);
+		}
+		// A closed channel just means nobody is watching the health any more.
+		let _ = status.send(WatchStatus {
+			consecutive_failures: failures,
+			last_error: error,
+		});
+		let delay = backoff(failures);
+		if let Some(delay) = delay {
+			tracing::warn!(
+				"sync pair {pair}: {failures} consecutive failure(s); waiting {delay:?} before the next pass"
+			);
+		}
+
+		if !wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, delay).await {
+			return;
 		}
 	}
 }
 
+/// Wait for the next pass to be due. Returns `false` if the watch was stopped instead.
+///
+/// After a failed pass that `backoff` delay *is* the whole wait: it is the retry timer, so a
+/// persistent failure retries on the backoff schedule rather than falling through to whatever the
+/// safety net or a change event happens to offer next. While healthy the wait ends on the periodic
+/// safety-net tick, or on a change event once the burst behind it has gone quiet for [`DEBOUNCE`].
+async fn wait_for_next_pass(
+	shutdown: &mut tokio::sync::oneshot::Receiver<()>,
+	dirty: &Notify,
+	safety_net: &mut tokio::time::Interval,
+	backoff: Option<Duration>,
+) -> bool {
+	if let Some(delay) = backoff {
+		return tokio::select! {
+			biased;
+			_ = &mut *shutdown => false,
+			_ = tokio::time::sleep(delay) => true,
+		};
+	}
+
+	tokio::select! {
+		biased;
+		_ = &mut *shutdown => return false,
+		_ = safety_net.tick() => {}
+		_ = dirty.notified() => {
+			// Coalesce the burst: wait for DEBOUNCE of quiet (each new event restarts it).
+			loop {
+				tokio::select! {
+					biased;
+					_ = &mut *shutdown => return false,
+					_ = dirty.notified() => continue,
+					_ = tokio::time::sleep(DEBOUNCE) => break,
+				}
+			}
+		}
+	}
+	true
+}
+
+/// How long to wait before the next pass after `failures` consecutive failed ones: nothing while
+/// healthy, then [`BASE_BACKOFF`] doubling per failure, capped at [`MAX_BACKOFF`].
+fn backoff(failures: u32) -> Option<Duration> {
+	let doublings = failures.checked_sub(1)?.min(31);
+	Some((BASE_BACKOFF * 2u32.pow(doublings)).min(MAX_BACKOFF))
+}
+
 /// Run one pass, logging (not propagating) any failure — the loop is best-effort and the next
-/// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s.
-async fn run_pass(engine: &SyncEngine, pair: PairId, observer: &mut (dyn FnMut(SyncEvent) + Send)) {
+/// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s. Returns
+/// the pass's own error, if any (per-action errors inside a completed pass do not count).
+async fn run_pass(
+	engine: &SyncEngine,
+	pair: PairId,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> Option<String> {
 	match engine.sync_once_observed(pair, observer).await {
 		Ok(report) => {
 			if !report.errors.is_empty() {
 				tracing::warn!("sync pair {pair}: {} action error(s)", report.errors.len());
 			}
+			None
 		}
-		Err(e) => tracing::warn!("sync pair {pair} failed: {e}"),
+		Err(e) => {
+			tracing::warn!("sync pair {pair} failed: {e}");
+			Some(e.to_string())
+		}
 	}
 }
 
@@ -196,14 +310,29 @@ fn watch_error(error: notify::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::path::{Path, PathBuf};
+	use std::{
+		path::{Path, PathBuf},
+		time::Duration,
+	};
 
 	use notify::{
 		EventKind,
 		event::{CreateKind, ModifyKind, RenameMode},
 	};
+	use tokio::sync::Notify;
 
-	use super::triggers_pass;
+	use super::{
+		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, backoff, triggers_pass, wait_for_next_pass,
+	};
+
+	/// A safety-net interval as `run_loop` sets one up: the immediate first tick consumed, so the
+	/// next one is a full [`SAFETY_NET`] away.
+	async fn safety_net() -> tokio::time::Interval {
+		let mut interval = tokio::time::interval(SAFETY_NET);
+		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		interval.tick().await;
+		interval
+	}
 
 	fn event(kind: EventKind, paths: &[&str]) -> notify::Event {
 		notify::Event {
@@ -262,5 +391,75 @@ mod tests {
 				&["/sync/root/.filen-sync-trash/gone.txt", "/sync/root/a.txt"]
 			)
 		));
+	}
+
+	/// The retry after a failed pass must be governed by the backoff alone. Nothing wakes the loop
+	/// during an outage that leaves the tree quiescent — no local writes, no remote batches — so if
+	/// the backoff is only a *prefix* to the usual wait, the retry lands on the safety-net cadence
+	/// and the backoff schedule is decoration.
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_pass_retries_on_the_backoff_schedule() {
+		let (_shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, Some(BASE_BACKOFF)).await,
+			"a backoff that elapsed means retry, not stop"
+		);
+		assert_eq!(
+			start.elapsed(),
+			BASE_BACKOFF,
+			"the backoff is the whole wait before the retry"
+		);
+	}
+
+	/// A healthy wait is unchanged: a change event, coalesced over [`DEBOUNCE`], or the safety net.
+	#[tokio::test(start_paused = true)]
+	async fn a_healthy_wait_ends_on_a_debounced_change_or_the_safety_net() {
+		let (_shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+
+		dirty.notify_one();
+		let start = tokio::time::Instant::now();
+		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, None).await);
+		assert_eq!(start.elapsed(), DEBOUNCE, "a change waits out the debounce");
+
+		let start = tokio::time::Instant::now();
+		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, None).await);
+		assert_eq!(
+			start.elapsed(),
+			SAFETY_NET - DEBOUNCE,
+			"with nothing happening, the safety net is what ends the wait"
+		);
+	}
+
+	/// Stopping the watch is never delayed by a backoff.
+	#[tokio::test(start_paused = true)]
+	async fn a_stop_interrupts_the_backoff() {
+		let (shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+
+		drop(shutdown_tx);
+		let start = tokio::time::Instant::now();
+		assert!(
+			!wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, Some(MAX_BACKOFF)).await,
+			"a stopped watch must not wait out the backoff"
+		);
+		assert_eq!(start.elapsed(), Duration::ZERO);
+	}
+
+	#[test]
+	fn backoff_grows_then_caps_and_resets() {
+		assert_eq!(backoff(0), None, "a healthy loop must not wait");
+		assert_eq!(backoff(1), Some(BASE_BACKOFF));
+		assert_eq!(backoff(2), Some(BASE_BACKOFF * 2));
+		assert_eq!(backoff(3), Some(BASE_BACKOFF * 4));
+		// Capped, and never panicking on an absurd failure count.
+		assert_eq!(backoff(40), Some(MAX_BACKOFF));
+		assert_eq!(backoff(u32::MAX), Some(MAX_BACKOFF));
 	}
 }
