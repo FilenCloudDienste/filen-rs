@@ -667,6 +667,10 @@ fn reconcile_two_way(
 /// - Local moves are matched by content hash: a baseline file gone locally whose content reappears
 ///   at a new local path (uniquely — ambiguous content is left to delete+create), with the remote
 ///   still holding the original, becomes a `MoveRemote`.
+///
+/// A path held in conflict is never a move endpoint: consuming it here would skip the per-path
+/// conflict hold, rewrite its baseline as `Synced` against one side's content and lose the
+/// divergence for good. Held paths must fall through to the reconcile loop and be re-reported.
 fn detect_moves(
 	mode: super::SyncMode,
 	baseline: &HashMap<String, BaselineEntry>,
@@ -682,7 +686,10 @@ fn detect_moves(
 			.map(|(path, node)| (node.remote_uuid, path.as_str()))
 			.collect();
 		for (from, base) in baseline {
-			if base.kind != NodeKind::File || consumed.contains(from) {
+			if base.kind != NodeKind::File
+				|| base.state == BaselineState::Conflicted
+				|| consumed.contains(from)
+			{
 				continue;
 			}
 			let Some(uuid) = base.remote_uuid else {
@@ -727,7 +734,11 @@ fn detect_moves(
 			}
 		}
 		for (from, base) in baseline {
-			if base.kind != NodeKind::File || consumed.contains(from) || local.contains_key(from) {
+			if base.kind != NodeKind::File
+				|| base.state == BaselineState::Conflicted
+				|| consumed.contains(from)
+				|| local.contains_key(from)
+			{
 				continue;
 			}
 			let (Some(hash), Some(uuid)) = (base.content_hash, base.remote_uuid) else {
@@ -1770,6 +1781,65 @@ mod tests {
 				rel_path: "thing".to_string()
 			}],
 			"nothing under a held conflict may be planned"
+		);
+	}
+
+	#[test]
+	fn a_held_conflict_is_never_laundered_into_a_remote_move() {
+		// The conflicting remote item is renamed server-side while the conflict is still held. Move
+		// detection matches by uuid and must NOT consume the held path: doing so would rename the
+		// local copy, drop the Conflicted row and re-anchor the baseline to the remote's content,
+		// after which the next pass reads the untouched local bytes as a one-sided edit and pushes
+		// them over the remote's — silently destroying one side of an unresolved conflict.
+		let uuid = Uuid::new_v4();
+		let mut held = base_file("thing", uuid, [1; 32]);
+		held.state = BaselineState::Conflicted;
+		let baseline = map(vec![("thing", held)]);
+		let local = map(vec![("thing", local_file("thing", [1; 32]))]);
+		let remote = map(vec![(
+			"thing_renamed",
+			remote_file("thing_renamed", uuid, [2; 32]),
+		)]);
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			actions.contains(&SyncAction::Conflict {
+				rel_path: "thing".to_string()
+			}),
+			"the held conflict must still be reported: {actions:?}"
+		);
+		assert!(
+			!actions.iter().any(|a| matches!(
+				a,
+				SyncAction::MoveLocal { .. } | SyncAction::MoveRemote { .. }
+			)),
+			"a held conflict must never be consumed as a move: {actions:?}"
+		);
+	}
+
+	#[test]
+	fn a_held_conflict_is_never_laundered_into_a_local_move() {
+		// Mirror direction: the local half of a held conflict is deleted and its bytes reappear at a
+		// new local path. Content-hash move detection must not re-parent the still-divergent remote
+		// file onto that name and mark the row Synced, which would mask the conflict for good.
+		let uuid = Uuid::new_v4();
+		let mut held = base_file("thing", uuid, [1; 32]);
+		held.state = BaselineState::Conflicted;
+		let baseline = map(vec![("thing", held)]);
+		let local = map(vec![("moved.txt", local_file("moved.txt", [1; 32]))]);
+		let remote = map(vec![("thing", remote_file("thing", uuid, [2; 32]))]);
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			actions.contains(&SyncAction::Conflict {
+				rel_path: "thing".to_string()
+			}),
+			"the held conflict must still be reported: {actions:?}"
+		);
+		assert!(
+			!actions.iter().any(|a| matches!(
+				a,
+				SyncAction::MoveLocal { .. } | SyncAction::MoveRemote { .. }
+			)),
+			"a held conflict must never be consumed as a move: {actions:?}"
 		);
 	}
 
