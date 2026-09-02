@@ -392,7 +392,7 @@ where
 	})?;
 	let tmp_path = parent
 		.join(remote_file.uuid().to_string())
-		.with_extension("filendl");
+		.with_extension(super::DOWNLOAD_TMP_EXT);
 	let tmp_file = tokio::fs::OpenOptions::new()
 		.write(true)
 		.create(true)

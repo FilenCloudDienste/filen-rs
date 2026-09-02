@@ -27,6 +27,11 @@ pub use meta_ext::FilenMetaExt;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use canonical_path::CanonicalPath;
 
+/// Extension of the temp file a download writes before renaming it into place. Anything watching
+/// a sync tree (the sync engine's FS watcher) has to know to ignore it.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) const DOWNLOAD_TMP_EXT: &str = "filendl";
+
 const WINDOWS_TICKS_PER_MILLI: u64 = 10_000;
 const MILLIS_TO_UNIX_EPOCH: u64 = 11_644_473_600_000; // 11644473600000 milliseconds from 1601-01-01 to 1970-01-01
 
