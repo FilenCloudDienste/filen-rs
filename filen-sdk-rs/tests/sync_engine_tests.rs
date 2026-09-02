@@ -51,11 +51,11 @@ async fn remote_listing(client: &Client, dir: &RemoteDirectory) -> (Vec<String>,
 #[shared_test_runtime]
 async fn sync_once_observed_reports_per_action_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	assert!(
 		wait_for_converged_resync(
 			&cache.messages,
-			resources.dir.uuid().into(),
+			resources.dir.uuid(),
 			0,
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -72,11 +72,7 @@ async fn sync_once_observed_reports_per_action_events() {
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::LocalToRemote,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 
@@ -141,12 +137,12 @@ async fn sync_once_observed_reports_per_action_events() {
 #[shared_test_runtime]
 async fn local_to_remote_uploads_the_local_tree() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	// Converge the (empty) remote into the cache so the engine reconciles against truth.
 	assert!(
 		wait_for_converged_resync(
 			&cache.messages,
-			resources.dir.uuid().into(),
+			resources.dir.uuid(),
 			0,
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -163,11 +159,7 @@ async fn local_to_remote_uploads_the_local_tree() {
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::LocalToRemote,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 
@@ -210,7 +202,7 @@ async fn local_to_remote_uploads_the_local_tree() {
 #[shared_test_runtime]
 async fn remote_to_local_downloads_the_remote_file() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	// Create a remote file under the sync root and wait for the cache to see it.
 	let builder = cache
@@ -223,12 +215,7 @@ async fn remote_to_local_downloads_the_remote_file() {
 		.await
 		.unwrap();
 	assert!(
-		poll_for_item(
-			cache.db_path(),
-			remote_file.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item(cache.db_path(), remote_file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"the cache should observe the uploaded remote file"
 	);
 
@@ -237,11 +224,7 @@ async fn remote_to_local_downloads_the_remote_file() {
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::RemoteToLocal,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::RemoteToLocal)
 		.await
 		.unwrap();
 
@@ -282,11 +265,7 @@ async fn same_name_upload_versions_rather_than_duplicates() {
 		.unwrap();
 
 	// A fresh uuid is minted each upload (the client never reuses one).
-	assert_ne!(
-		Uuid::from(first.uuid()),
-		Uuid::from(second.uuid()),
-		"each upload mints a new uuid"
-	);
+	assert_ne!(first.uuid(), second.uuid(), "each upload mints a new uuid");
 
 	let (_, files) = remote_listing(client, &resources.dir).await;
 	let versioned_count = files.iter().filter(|n| *n == "versioned.txt").count();
@@ -301,32 +280,21 @@ async fn same_name_upload_versions_rather_than_duplicates() {
 #[shared_test_runtime]
 async fn second_pass_with_no_changes_is_a_noop() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let builder = cache
 		.client
 		.make_file_builder("stable.txt", resources.dir.uuid())
 		.unwrap();
 	let remote_file = cache.client.upload_file(builder, b"stable").await.unwrap();
-	assert!(
-		poll_for_item(
-			cache.db_path(),
-			remote_file.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(cache.db_path(), remote_file.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let local = temp_local_dir();
 	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::RemoteToLocal,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::RemoteToLocal)
 		.await
 		.unwrap();
 
@@ -348,14 +316,14 @@ async fn second_pass_with_no_changes_is_a_noop() {
 #[shared_test_runtime]
 async fn remote_deletion_quarantines_the_local_copy() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let builder = cache
 		.client
 		.make_file_builder("doomed.txt", resources.dir.uuid())
 		.unwrap();
 	let mut remote_file = cache.client.upload_file(builder, b"doomed").await.unwrap();
-	let file_uuid: Uuid = remote_file.uuid().into();
+	let file_uuid: Uuid = remote_file.uuid();
 	assert!(poll_for_item(cache.db_path(), file_uuid, CACHE_CONVERGE_TIMEOUT).await);
 
 	let local = temp_local_dir();
@@ -363,11 +331,7 @@ async fn remote_deletion_quarantines_the_local_copy() {
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::RemoteToLocal,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::RemoteToLocal)
 		.await
 		.unwrap();
 	assert_eq!(engine.sync_once(pair).await.unwrap().downloaded, 1);
@@ -397,7 +361,7 @@ async fn remote_deletion_quarantines_the_local_copy() {
 #[shared_test_runtime]
 async fn two_way_merges_both_sides_in_one_pass() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let builder = cache
 		.client
@@ -408,14 +372,7 @@ async fn two_way_merges_both_sides_in_one_pass() {
 		.upload_file(builder, b"from remote")
 		.await
 		.unwrap();
-	assert!(
-		poll_for_item(
-			cache.db_path(),
-			remote_file.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(cache.db_path(), remote_file.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let local = temp_local_dir();
 	std::fs::write(local.join("from_local.txt"), b"from local").unwrap();
@@ -424,7 +381,7 @@ async fn two_way_merges_both_sides_in_one_pass() {
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(local.clone(), resources.dir.uuid().into(), SyncMode::TwoWay)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::TwoWay)
 		.await
 		.unwrap();
 
@@ -459,11 +416,11 @@ async fn two_way_merges_both_sides_in_one_pass() {
 #[shared_test_runtime]
 async fn local_rename_moves_the_remote_file_in_place() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	assert!(
 		wait_for_converged_resync(
 			&cache.messages,
-			resources.dir.uuid().into(),
+			resources.dir.uuid(),
 			0,
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -477,11 +434,7 @@ async fn local_rename_moves_the_remote_file_in_place() {
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::LocalToRemote,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 	assert_eq!(engine.sync_once(pair).await.unwrap().uploaded, 1);
@@ -499,7 +452,7 @@ async fn local_rename_moves_the_remote_file_in_place() {
 		.into_iter()
 		.find(|f| f.name().unwrap() == "orig.txt")
 		.expect("orig.txt uploaded");
-	let original_uuid: Uuid = original.uuid().into();
+	let original_uuid: Uuid = original.uuid();
 	assert!(poll_for_item(cache.db_path(), original_uuid, CACHE_CONVERGE_TIMEOUT).await);
 
 	// Rename it locally, then sync again.
@@ -521,7 +474,7 @@ async fn local_rename_moves_the_remote_file_in_place() {
 	assert_eq!(renamed_files.len(), 1, "still one file, not a duplicate");
 	assert_eq!(renamed_files[0].name().unwrap(), "renamed.txt");
 	assert_eq!(
-		Uuid::from(renamed_files[0].uuid()),
+		renamed_files[0].uuid(),
 		original_uuid,
 		"same uuid — the file was moved, not re-created"
 	);
@@ -533,7 +486,7 @@ async fn local_rename_moves_the_remote_file_in_place() {
 #[shared_test_runtime]
 async fn remote_rename_moves_the_local_file_in_place() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 
 	let builder = cache
 		.client
@@ -544,7 +497,7 @@ async fn remote_rename_moves_the_local_file_in_place() {
 		.upload_file(builder, b"remote move me")
 		.await
 		.unwrap();
-	let uuid: Uuid = remote_file.uuid().into();
+	let uuid: Uuid = remote_file.uuid();
 	assert!(poll_for_item(cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await);
 
 	let local = temp_local_dir();
@@ -552,11 +505,7 @@ async fn remote_rename_moves_the_local_file_in_place() {
 		.await
 		.unwrap();
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::RemoteToLocal,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::RemoteToLocal)
 		.await
 		.unwrap();
 	assert_eq!(engine.sync_once(pair).await.unwrap().downloaded, 1);
@@ -601,11 +550,11 @@ async fn remote_rename_moves_the_local_file_in_place() {
 #[shared_test_runtime]
 async fn watch_pushes_a_new_local_file_automatically() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let cache = TestCache::new(&resources.client, resources.dir.uuid().into()).await;
+	let cache = TestCache::new(&resources.client, resources.dir.uuid()).await;
 	assert!(
 		wait_for_converged_resync(
 			&cache.messages,
-			resources.dir.uuid().into(),
+			resources.dir.uuid(),
 			0,
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -619,11 +568,7 @@ async fn watch_pushes_a_new_local_file_automatically() {
 			.unwrap(),
 	);
 	let pair = engine
-		.add_pair(
-			local.clone(),
-			resources.dir.uuid().into(),
-			SyncMode::LocalToRemote,
-		)
+		.add_pair(local.clone(), resources.dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 	let watch = engine.watch(pair).await.unwrap();

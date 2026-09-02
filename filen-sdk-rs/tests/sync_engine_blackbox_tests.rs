@@ -43,7 +43,7 @@ struct Fixture {
 impl Fixture {
 	async fn new() -> Self {
 		let resources = test_utils::RESOURCES.get_resources().await;
-		let remote_uuid: Uuid = resources.dir.uuid().into();
+		let remote_uuid: Uuid = resources.dir.uuid();
 		let cache = TestCache::new(&resources.client, remote_uuid).await;
 		let local = std::env::temp_dir().join(format!("e2e_{}", Uuid::new_v4()));
 		std::fs::create_dir_all(&local).unwrap();
@@ -387,7 +387,7 @@ async fn r2l_download_byte_exact() {
 	let fx = Fixture::new().await;
 	let payload: Vec<u8> = (0u8..=255).collect();
 	let rf = upload_remote(&fx, "blob.bin", &payload).await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -427,8 +427,8 @@ async fn r2l_nested_and_empty_file() {
 	let zero_builder = fx.client.make_file_builder("zero.bin", sub.uuid()).unwrap();
 	let zero = fx.client.upload_file(zero_builder, b"").await.unwrap();
 
-	wait_cache_file_in_root(&fx, inner.uuid().into()).await;
-	wait_cache_file_in_root(&fx, zero.uuid().into()).await;
+	wait_cache_file_in_root(&fx, inner.uuid()).await;
+	wait_cache_file_in_root(&fx, zero.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -464,7 +464,7 @@ async fn r2l_nested_and_empty_file() {
 async fn r2l_remote_modification_redownloads() {
 	let fx = Fixture::new().await;
 	let rf = upload_remote(&fx, "m.txt", b"first").await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -480,8 +480,8 @@ async fn r2l_remote_modification_redownloads() {
 	let new_rf = upload_remote(&fx, "m.txt", new_content).await;
 	// Wait until the cache reflects the NEW uuid AND its new size, so the engine reconciles
 	// against the fully-committed new version (not a transient mid-versioning state).
-	wait_cache_file_in_root(&fx, new_rf.uuid().into()).await;
-	let new_uuid: Uuid = new_rf.uuid().into();
+	wait_cache_file_in_root(&fx, new_rf.uuid()).await;
+	let new_uuid: Uuid = new_rf.uuid();
 	let db = fx.db_path().to_path_buf();
 	assert!(
 		poll_until(CACHE_CONVERGE_TIMEOUT, || {
@@ -519,8 +519,8 @@ async fn r2l_remote_delete_removes_local() {
 	let fx = Fixture::new().await;
 	let keep = upload_remote(&fx, "keep.txt", b"keep").await;
 	let mut gone = upload_remote(&fx, "gone.txt", b"gone").await;
-	wait_cache_file_in_root(&fx, keep.uuid().into()).await;
-	wait_cache_file_in_root(&fx, gone.uuid().into()).await;
+	wait_cache_file_in_root(&fx, keep.uuid()).await;
+	wait_cache_file_in_root(&fx, gone.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -534,7 +534,7 @@ async fn r2l_remote_delete_removes_local() {
 	// Trash on remote; wait for the cache to drop it.
 	fx.client.trash_file(&mut gone).await.unwrap();
 	assert!(
-		poll_for_item_absent(fx.db_path(), gone.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item_absent(fx.db_path(), gone.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped trashed file"
 	);
 
@@ -578,8 +578,8 @@ async fn r2l_deep_tree() {
 		.make_file_builder("bottom.txt", d3.uuid())
 		.unwrap();
 	let bottom = fx.client.upload_file(bot_b, b"bottom value").await.unwrap();
-	wait_cache_file_in_root(&fx, mid.uuid().into()).await;
-	wait_cache_file_in_root(&fx, bottom.uuid().into()).await;
+	wait_cache_file_in_root(&fx, mid.uuid()).await;
+	wait_cache_file_in_root(&fx, bottom.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -608,7 +608,7 @@ async fn r2l_deep_tree() {
 async fn twoway_merge_both_sides_in_one_pass() {
 	let fx = Fixture::new().await;
 	let rf = upload_remote(&fx, "remote_only.txt", b"from remote").await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 
 	write_local(&fx.local, "local_only.txt", b"from local");
 
@@ -640,7 +640,7 @@ async fn twoway_same_content_both_sides_no_conflict() {
 	let fx = Fixture::new().await;
 	let same = b"identical bytes on both";
 	let rf = upload_remote(&fx, "same.txt", same).await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 	write_local(&fx.local, "same.txt", same);
 
 	let engine = fx.open_engine().await;
@@ -673,7 +673,7 @@ async fn twoway_divergent_modification_conflicts_nondestructively() {
 	let fx = Fixture::new().await;
 	let base = b"base content";
 	let rf = upload_remote(&fx, "fight.txt", base).await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 	write_local(&fx.local, "fight.txt", base);
 
 	let engine = fx.open_engine().await;
@@ -692,7 +692,7 @@ async fn twoway_divergent_modification_conflicts_nondestructively() {
 	// Now diverge BOTH sides.
 	write_local(&fx.local, "fight.txt", b"LOCAL EDIT wins?");
 	let new_rf = upload_remote(&fx, "fight.txt", b"REMOTE EDIT different bytes").await;
-	wait_cache_file_in_root(&fx, new_rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, new_rf.uuid()).await;
 
 	let r2 = engine.sync_once(pair).await.unwrap();
 	assert!(
@@ -717,7 +717,7 @@ async fn twoway_divergent_modification_conflicts_nondestructively() {
 async fn twoway_local_delete_propagates() {
 	let fx = Fixture::new().await;
 	let rf = upload_remote(&fx, "doomed.txt", b"x").await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -750,7 +750,7 @@ async fn twoway_local_delete_propagates() {
 async fn twoway_idempotent_second_pass() {
 	let fx = Fixture::new().await;
 	let rf = upload_remote(&fx, "r.txt", b"remote").await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 	write_local(&fx.local, "l.txt", b"local");
 
 	let engine = fx.open_engine().await;
@@ -788,7 +788,7 @@ async fn local_backup_pushes_but_never_trashes_remote_only() {
 	let fx = Fixture::new().await;
 	// A remote-only file that must survive.
 	let survivor = upload_remote(&fx, "survivor.txt", b"keep me").await;
-	wait_cache_file_in_root(&fx, survivor.uuid().into()).await;
+	wait_cache_file_in_root(&fx, survivor.uuid()).await;
 	// A local-only file that should be pushed up.
 	write_local(&fx.local, "pushed.txt", b"new local");
 
@@ -826,7 +826,7 @@ async fn local_backup_pushes_but_never_trashes_remote_only() {
 async fn remote_backup_pulls_but_never_deletes_local_only() {
 	let fx = Fixture::new().await;
 	let pulled = upload_remote(&fx, "pulled.txt", b"from remote").await;
-	wait_cache_file_in_root(&fx, pulled.uuid().into()).await;
+	wait_cache_file_in_root(&fx, pulled.uuid()).await;
 	// A local-only file that must survive.
 	write_local(&fx.local, "local_survivor.txt", b"do not delete");
 
@@ -904,7 +904,7 @@ async fn local_rename_moves_remote_in_place() {
 async fn remote_rename_moves_local_in_place() {
 	let fx = Fixture::new().await;
 	let mut rf = upload_remote(&fx, "old_name.txt", b"intact content here").await;
-	wait_cache_file_in_root(&fx, rf.uuid().into()).await;
+	wait_cache_file_in_root(&fx, rf.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -929,7 +929,7 @@ async fn remote_rename_moves_local_in_place() {
 	assert!(
 		poll_for_file_name(
 			fx.db_path(),
-			rf.uuid().into(),
+			rf.uuid(),
 			"new_name.txt",
 			CACHE_CONVERGE_TIMEOUT
 		)
@@ -1024,7 +1024,7 @@ async fn remote_move_across_directories() {
 		.upload_file(fb, b"cross dir remote move")
 		.await
 		.unwrap();
-	wait_cache_file_in_root(&fx, mover.uuid().into()).await;
+	wait_cache_file_in_root(&fx, mover.uuid()).await;
 
 	let engine = fx.open_engine().await;
 	let pair = engine
@@ -1044,8 +1044,8 @@ async fn remote_move_across_directories() {
 		.await
 		.unwrap();
 	// Wait for the cache to reflect the new parent: poll the cached parent_uuid.
-	let to_uuid: Uuid = to.uuid().into();
-	let mover_uuid: Uuid = mover.uuid().into();
+	let to_uuid: Uuid = to.uuid();
+	let mover_uuid: Uuid = mover.uuid();
 	let db = fx.db_path().to_path_buf();
 	assert!(
 		poll_until(CACHE_CONVERGE_TIMEOUT, || {
@@ -1159,8 +1159,8 @@ async fn remote_case_collision_refused() {
 		.create_dir_with_name_hash(&parent, "note", &mismatched)
 		.await
 		.unwrap();
-	let upper_uuid: Uuid = upper.uuid().into();
-	let lower_uuid: Uuid = lower.uuid().into();
+	let upper_uuid: Uuid = upper.uuid();
+	let lower_uuid: Uuid = lower.uuid();
 
 	// Wait (bounded) for the cache (the engine's remote view) to hold BOTH.
 	let db = fx.db_path().to_path_buf();

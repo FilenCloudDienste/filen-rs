@@ -362,7 +362,7 @@ async fn apply_transfer(
 				.upload_file_from_path(&parent_type, path, None)
 				.await?;
 			let local = ctx.local.get(rel_path);
-			let new_uuid: Uuid = (uploaded.uuid()).into();
+			let new_uuid: Uuid = uploaded.uuid();
 			upsert_file_baseline(
 				ctx,
 				rel_path,
@@ -421,7 +421,7 @@ async fn apply_one(
 				.client
 				.create_dir_with_created(&parent_type, name, created)
 				.await?;
-			let new_uuid: Uuid = (new_dir.uuid()).into();
+			let new_uuid: Uuid = new_dir.uuid();
 			dir_by_path.insert(rel_path.clone(), new_dir);
 			upsert_dir_baseline(ctx, rel_path, Some(new_uuid), None).await?;
 			report.remote_dirs_created += 1;

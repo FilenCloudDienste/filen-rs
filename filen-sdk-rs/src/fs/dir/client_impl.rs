@@ -170,12 +170,8 @@ impl Client {
 			return self.get_dir(response.uuid).await;
 		}
 
-		let dir = RemoteDirectory::new_from_parts(
-			uuid,
-			meta,
-			(parent.uuid()).into(),
-			response.timestamp,
-		);
+		let dir =
+			RemoteDirectory::new_from_parts(uuid, meta, (parent.uuid()).into(), response.timestamp);
 
 		self.update_item_with_maybe_connected_parent((&dir).into())
 			.await?;
