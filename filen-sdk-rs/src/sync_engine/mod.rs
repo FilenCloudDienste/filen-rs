@@ -31,4 +31,4 @@ pub use apply::SyncReport;
 pub use engine::SyncEngine;
 pub use events::{SyncEvent, SyncObserver};
 pub use mode::SyncMode;
-pub use watch::WatchHandle;
+pub use watch::{WatchHandle, WatchStatus};
