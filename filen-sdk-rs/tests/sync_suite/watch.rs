@@ -1087,6 +1087,59 @@ async fn watch_13_drop_handle_stops_activity() {
 }
 
 // ============================================================================
+// (add) — stop() waits for the loop, and a healthy watch reports healthy status
+// ============================================================================
+
+#[shared_test_runtime]
+async fn watch_stop_awaits_loop_and_reports_health() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::LocalToRemote).await;
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_observed(pair, observer_for(log.clone()))
+		.await
+		.unwrap();
+	let mut status = handle.status();
+
+	write_file(&sc.local, "stopme.txt", b"bye");
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() >= 1).await,
+		"watch never uploaded the new local file (passes={})",
+		log.passes()
+	);
+
+	// A watch whose passes are succeeding reports no failure.
+	let health = status.borrow_and_update().clone();
+	assert_eq!(
+		health.consecutive_failures, 0,
+		"healthy watch reported failures: {health:?}"
+	);
+	assert!(
+		health.last_error.is_none(),
+		"healthy watch reported an error: {health:?}"
+	);
+
+	// stop() awaits the loop, so NO pass may complete after it returns — no drain sleep needed.
+	handle.stop().await;
+	let passes_at_stop = log.passes();
+	write_file(&sc.local, "after_stop.txt", b"should-not-upload");
+	tokio::time::sleep(Duration::from_secs(12)).await;
+	assert_eq!(
+		log.passes(),
+		passes_at_stop,
+		"a pass ran after stop() returned"
+	);
+	let (_d, files) = list_remote_root(&sc).await;
+	assert!(
+		find_file(&files, "after_stop.txt").is_none(),
+		"post-stop file was uploaded"
+	);
+
+	sc.cleanup();
+}
+
+// ============================================================================
 // (add) — engine reaches and stays at idle when nothing changes after convergence
 // ============================================================================
 
