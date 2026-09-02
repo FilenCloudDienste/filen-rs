@@ -94,7 +94,7 @@ async fn converge_02_single_remote_create_propagates_down() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = upload_to(&sc.cache.client, sc.remote, "b.txt", b"world").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed b.txt"
 	);
 
@@ -152,7 +152,7 @@ async fn converge_03_one_sided_modification_propagates() {
 
 	// Modify the same name on the remote (server versions it to a new uuid).
 	let new_rf = upload_to(&sc2.cache.client, sc2.remote, "m.txt", b"v2-remote").await;
-	let new_uuid: Uuid = new_rf.uuid().into();
+	let new_uuid: Uuid = new_rf.uuid();
 	let db = sc2.cache.db_path().to_path_buf();
 	assert!(
 		poll_until(CACHE_CONVERGE_TIMEOUT, || {
@@ -198,7 +198,7 @@ async fn converge_04_disjoint_changes_union() {
 	write_file(&sc.local, "only-local.txt", b"L");
 	let rf = upload_to(&sc.cache.client, sc.remote, "only-remote.txt", b"R").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed only-remote.txt"
 	);
 
@@ -297,7 +297,7 @@ async fn converge_06_multi_pass_eventual_consistency() {
 	// Mid-flight: one new remote file and one new local file.
 	let rf = upload_to(&sc.cache.client, sc.remote, "p2.txt", b"2").await;
 	assert!(
-		poll_for_item(sc.cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item(sc.cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never observed p2.txt"
 	);
 	write_file(&sc.local, "p3.txt", b"3");
@@ -433,22 +433,8 @@ async fn converge_09_remote_delete_mirrors_to_local() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	let keep = upload_to(&sc.cache.client, sc.remote, "keep.txt", b"keep").await;
 	let mut del = upload_to(&sc.cache.client, sc.remote, "del.txt", b"del").await;
-	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			keep.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
-	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			del.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(sc.cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(sc.cache.db_path(), del.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let r0 = sc.sync().await;
 	assert_eq!(r0.downloaded, 2, "{r0:?}");
@@ -456,12 +442,7 @@ async fn converge_09_remote_delete_mirrors_to_local() {
 
 	sc.cache.client.trash_file(&mut del).await.unwrap();
 	assert!(
-		poll_for_item_absent(
-			sc.cache.db_path(),
-			del.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item_absent(sc.cache.db_path(), del.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped trashed del.txt"
 	);
 
@@ -522,14 +503,7 @@ async fn converge_10_local_backup_delete_not_mirrored() {
 async fn converge_10_remote_backup_delete_not_mirrored() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let mut keep = upload_to(&sc.cache.client, sc.remote, "keep2.txt", b"keep me too").await;
-	assert!(
-		poll_for_item(
-			sc.cache.db_path(),
-			keep.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await
-	);
+	assert!(poll_for_item(sc.cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let r0 = sc.sync().await;
 	assert_eq!(r0.downloaded, 1, "{r0:?}");
@@ -537,12 +511,7 @@ async fn converge_10_remote_backup_delete_not_mirrored() {
 
 	sc.cache.client.trash_file(&mut keep).await.unwrap();
 	assert!(
-		poll_for_item_absent(
-			sc.cache.db_path(),
-			keep.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item_absent(sc.cache.db_path(), keep.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped trashed remote keep2.txt"
 	);
 
@@ -619,7 +588,7 @@ async fn converge_11_two_clients_identical_trees() {
 #[shared_test_runtime]
 async fn converge_12_three_clients_union() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 
 	let cache_a = TestCache::new(&resources.client, remote).await;
 	let cache_b = TestCache::new(&resources.client, remote).await;
@@ -850,7 +819,7 @@ async fn converge_16_interrupted_pass_reruns_cleanly() {
 #[shared_test_runtime]
 async fn converge_17_baseline_persists_across_restart() {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir("c17");
@@ -1024,7 +993,7 @@ async fn converge_20_alternating_one_sided_edits() {
 
 	// Remote edit -> v2 (versioned to new uuid).
 	let v2 = upload_to(&sc.cache.client, sc.remote, "seq.txt", b"v2").await;
-	let v2_uuid: Uuid = v2.uuid().into();
+	let v2_uuid: Uuid = v2.uuid();
 	let db = sc.cache.db_path().to_path_buf();
 	assert!(
 		poll_until(CACHE_CONVERGE_TIMEOUT, || {
@@ -1180,7 +1149,7 @@ async fn converge_23_first_sync_populated_dest_unions() {
 	let sc = single_client(SyncMode::TwoWay).await;
 	// Pre-existing remote file BEFORE the first pass.
 	let rb = upload_to(&sc.cache.client, sc.remote, "rb.txt", b"r").await;
-	assert!(poll_for_item(sc.cache.db_path(), rb.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(sc.cache.db_path(), rb.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 	// Pre-existing local file.
 	write_file(&sc.local, "la.txt", b"l");
 
@@ -1231,9 +1200,9 @@ async fn converge_24_offline_gap_backlog_converges() {
 		)
 		.await
 		.unwrap();
-	let g4 = upload_to(&sc.cache.client, g3sub.uuid().into(), "g4.txt", b"g4").await;
-	assert!(poll_for_item(sc.cache.db_path(), g2.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
-	assert!(poll_for_item(sc.cache.db_path(), g4.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+	let g4 = upload_to(&sc.cache.client, g3sub.uuid(), "g4.txt", b"g4").await;
+	assert!(poll_for_item(sc.cache.db_path(), g2.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(sc.cache.db_path(), g4.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	// Resume: run passes until converged.
 	let mut passes = 0usize;
@@ -1564,7 +1533,7 @@ async fn converge_a5_mixed_disjoint_ops_single_pass() {
 	assert!(
 		poll_for_item_absent(
 			sc.cache.db_path(),
-			del_remote.uuid().into(),
+			del_remote.uuid(),
 			CACHE_CONVERGE_TIMEOUT
 		)
 		.await,
@@ -1620,7 +1589,7 @@ async fn converge_a6_local_backup_positive_convergence() {
 	write_file(&sc.local, "lbmod.txt", b"m1");
 	// Independent remote-only create (must NOT be pulled down).
 	let ro = upload_to(&sc.cache.client, sc.remote, "rb_only.txt", b"r").await;
-	assert!(poll_for_item(sc.cache.db_path(), ro.uuid().into(), CACHE_CONVERGE_TIMEOUT).await);
+	assert!(poll_for_item(sc.cache.db_path(), ro.uuid(), CACHE_CONVERGE_TIMEOUT).await);
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");

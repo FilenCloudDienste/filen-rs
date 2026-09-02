@@ -141,7 +141,7 @@ async fn matrix_01_self_write_loop_free_l2r() {
 async fn matrix_02_self_write_loop_free_r2l() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
 	let rf = upload_root(&sc, "bar.txt", b"self-write-r2l").await;
-	wait_cache_has(&sc, rf.uuid().into()).await;
+	wait_cache_has(&sc, rf.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -189,12 +189,7 @@ async fn matrix_03_self_write_loop_free_two_way() {
 		.await
 		.unwrap();
 	assert!(
-		poll_for_item(
-			tc.cache_a.db_path(),
-			rf_b.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item(tc.cache_a.db_path(), rf_b.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache A never observed B.txt"
 	);
 
@@ -270,7 +265,7 @@ async fn matrix_04_self_write_loop_free_backup_modes() {
 	// --- RemoteBackup: destination is the local tree; G pulled once. ---
 	let rb = single_client(SyncMode::RemoteBackup).await;
 	let g = upload_root(&rb, "G.txt", b"backup-pull").await;
-	wait_cache_has(&rb, g.uuid().into()).await;
+	wait_cache_has(&rb, g.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
 	assert_eq!(p1.downloaded, 1, "{p1:?}");
@@ -309,7 +304,7 @@ async fn matrix_05_first_sync_no_wipe_l2r() {
 		("R3.txt", b"r3"),
 	] {
 		let f = upload_root(&sc, name, body).await;
-		wait_cache_has(&sc, f.uuid().into()).await;
+		wait_cache_has(&sc, f.uuid()).await;
 	}
 
 	let r1 = sc.sync().await;
@@ -397,17 +392,13 @@ async fn matrix_07_first_sync_no_wipe_two_way() {
 			.unwrap()
 	};
 	assert!(
-		poll_for_item(
-			tc.cache_a.db_path(),
-			r_only.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await && poll_for_item(
-			tc.cache_a.db_path(),
-			r_overlap.uuid().into(),
-			CACHE_CONVERGE_TIMEOUT
-		)
-		.await,
+		poll_for_item(tc.cache_a.db_path(), r_only.uuid(), CACHE_CONVERGE_TIMEOUT).await
+			&& poll_for_item(
+				tc.cache_a.db_path(),
+				r_overlap.uuid(),
+				CACHE_CONVERGE_TIMEOUT
+			)
+			.await,
 		"cache A never observed the pre-populated remote files"
 	);
 
@@ -454,7 +445,7 @@ async fn matrix_08_first_sync_no_wipe_backup_modes() {
 	// --- LocalBackup: populated remote destination + a local source-only file. ---
 	let lb = single_client(SyncMode::LocalBackup).await;
 	let surv = upload_root(&lb, "survivor.txt", b"keep-me").await;
-	wait_cache_has(&lb, surv.uuid().into()).await;
+	wait_cache_has(&lb, surv.uuid()).await;
 	write_file(&lb.local, "added.txt", b"source-only");
 	let r1 = lb.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -478,7 +469,7 @@ async fn matrix_08_first_sync_no_wipe_backup_modes() {
 	let rb = single_client(SyncMode::RemoteBackup).await;
 	write_file(&rb.local, "local_keep.txt", b"do-not-delete");
 	let pulled = upload_root(&rb, "pulled.txt", b"remote-source").await;
-	wait_cache_has(&rb, pulled.uuid().into()).await;
+	wait_cache_has(&rb, pulled.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
 	assert_eq!(
@@ -517,7 +508,7 @@ async fn restart_fixture(
 	std::path::PathBuf,
 ) {
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote: Uuid = resources.dir.uuid().into();
+	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir(tag);
@@ -607,7 +598,7 @@ async fn matrix_10_baseline_persists_restart_r2l() {
 			.await
 			.unwrap();
 		assert!(
-			poll_for_item(cache.db_path(), f.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+			poll_for_item(cache.db_path(), f.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 			"cache never observed r{i}"
 		);
 	}
@@ -690,7 +681,7 @@ async fn matrix_11_baseline_persists_restart_two_way_and_backup() {
 			cache.client.upload_file(b, b"remote-body").await.unwrap()
 		};
 		assert!(
-			poll_for_item(cache.db_path(), rf.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+			poll_for_item(cache.db_path(), rf.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 			"cache never observed remote.txt for mode {mode:?}"
 		);
 
@@ -795,9 +786,9 @@ async fn matrix_14_remote_backup_source_delete_never_deletes_local() {
 	let mut g1 = upload_root(&sc, "G1.txt", b"body-G1.txt").await;
 	let g2 = upload_root(&sc, "G2.txt", b"body-G2.txt").await;
 	let g3 = upload_root(&sc, "G3.txt", b"body-G3.txt").await;
-	wait_cache_has(&sc, g1.uuid().into()).await;
-	wait_cache_has(&sc, g2.uuid().into()).await;
-	wait_cache_has(&sc, g3.uuid().into()).await;
+	wait_cache_has(&sc, g1.uuid()).await;
+	wait_cache_has(&sc, g2.uuid()).await;
+	wait_cache_has(&sc, g3.uuid()).await;
 
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
@@ -806,7 +797,7 @@ async fn matrix_14_remote_backup_source_delete_never_deletes_local() {
 	// Trash G1 remotely; wait for the cache to drop it.
 	sc.cache.client.trash_file(&mut g1).await.unwrap();
 	assert!(
-		poll_for_item_absent(sc.cache.db_path(), g1.uuid().into(), CACHE_CONVERGE_TIMEOUT).await,
+		poll_for_item_absent(sc.cache.db_path(), g1.uuid(), CACHE_CONVERGE_TIMEOUT).await,
 		"cache never dropped trashed G1"
 	);
 
@@ -865,7 +856,7 @@ async fn matrix_15_backup_move_not_laundered_into_delete() {
 	// --- RemoteBackup: rename H -> H2 on the remote source. ---
 	let rb = single_client(SyncMode::RemoteBackup).await;
 	let mut h = upload_root(&rb, "H.txt", b"H-body-stable").await;
-	wait_cache_has(&rb, h.uuid().into()).await;
+	wait_cache_has(&rb, h.uuid()).await;
 	let p1 = rb.sync().await;
 	assert!(p1.errors.is_empty(), "{p1:?}");
 	assert_eq!(p1.downloaded, 1, "{p1:?}");
@@ -879,7 +870,7 @@ async fn matrix_15_backup_move_not_laundered_into_delete() {
 	assert!(
 		poll_for_file_name(
 			rb.cache.db_path(),
-			h.uuid().into(),
+			h.uuid(),
 			"H2.txt",
 			CACHE_CONVERGE_TIMEOUT
 		)

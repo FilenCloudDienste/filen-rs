@@ -3,8 +3,9 @@
 -- window queries this has no needle/order/window/path — it returns the entire
 -- subtree so the engine can reconcile it against the local tree + baseline.
 --
--- COLUMN ORDER IS A CONTRACT: it must match `search::hydrate::row_to_result`
--- (indices 0-21), the same hydration the search windows use. The recursive
+-- COLUMN NAMES ARE A CONTRACT: `search::hydrate::row_to_result` reads them by
+-- name, so the `AS` aliases below must match the search windows' projection.
+-- The recursive
 -- `subtree` CTE mirrors diff_subtree_absent.sql / search_window_subtree.sql
 -- (UNION dedups, so a corrupt parent cycle terminates); the anchor itself is
 -- never returned (the engine syncs the root's CONTENTS, not the root node).
@@ -37,6 +38,7 @@ SELECT
 	f.created AS file_created,
 	f.modified,
 	f.hash,
+	f.stable_uuid,
 	d.favorite AS dir_favorite,
 	d.color,
 	d.timestamp AS dir_timestamp,
@@ -45,4 +47,8 @@ SELECT
 FROM items AS i
 INNER JOIN subtree AS s ON i.uuid = s.uuid
 LEFT JOIN files AS f ON i.id = f.id
-LEFT JOIN dirs AS d ON i.id = d.id;
+LEFT JOIN dirs AS d ON i.id = d.id
+-- A row mid-supersede carries the PREDECESSOR's content under the successor's
+-- uuid, so handing it to the engine would schedule an undownloadable pull (see
+-- files.superseded). Dirs have no such row, hence the LEFT JOIN's NULL passing.
+WHERE coalesce(f.superseded, FALSE) = FALSE;
