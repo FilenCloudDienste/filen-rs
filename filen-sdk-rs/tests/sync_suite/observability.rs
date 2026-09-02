@@ -17,7 +17,7 @@ use std::sync::Arc;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, SyncReport};
+use filen_sdk_rs::sync_engine::{PlanOutcome, SyncEngine, SyncEvent, SyncMode, SyncReport};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -1185,13 +1185,97 @@ async fn observ_12_events_under_concurrency_complete_unique_wellformed() {
 	// in happen-before order (no parallel-apply or torn-event scenario is reachable black-box).
 }
 
-#[ignore = "blocked: needs a dry-run / plan-only mode in the public API — see OBSERV-14 TODO"]
+/// OBSERV-14 — `plan_pair` is a true dry run: it reports every intended action with its path,
+/// mutates neither tree, the quarantine area nor the persisted baseline, and the real pass that
+/// follows applies exactly what was predicted.
 #[shared_test_runtime]
 async fn observ_14_dry_run_reports_intent_mutates_nothing() {
-	// plan: run a pass in plan-only mode over a mixed changeset; assert the plan lists every intended
-	// action+path with an intended-count breakdown; neither tree, the quarantine area, nor the
-	// persisted baseline is mutated; and a subsequent real pass applies exactly the predicted actions.
-	// SyncEngine exposes only sync_once/sync_once_observed (both apply); no dry-run mode exists.
+	let sc = single_client(SyncMode::TwoWay).await;
+
+	// A mixed changeset: two new files in a new directory, plus one already-synced file.
+	write_file(&sc.local, "kept.txt", b"already synced");
+	assert_eq!(sc.sync().await.uploaded, 1);
+	write_file(&sc.local, "sub/one.txt", b"first");
+	write_file(&sc.local, "sub/two.txt", b"second");
+
+	let before_local = walk_tree(&sc.local);
+	let before_remote: Vec<String> = list_remote_files(&sc)
+		.await
+		.iter()
+		.filter_map(|f| f.name().map(str::to_string))
+		.collect();
+
+	let PlanOutcome::Planned {
+		actions,
+		held_deletions,
+		conflicts,
+		guard_message,
+		pass_token,
+	} = sc.engine.plan_pair(sc.pair).await.unwrap()
+	else {
+		panic!("the dry run must not refuse this pair");
+	};
+	assert!(held_deletions.is_empty(), "{held_deletions:?}");
+	assert!(conflicts.is_empty(), "{conflicts:?}");
+	assert!(guard_message.is_none(), "{guard_message:?}");
+	assert!(pass_token.is_none(), "no held batch, so no token");
+
+	// Every intended action names its path, and the intended count is the breakdown.
+	assert_eq!(
+		actions.len(),
+		3,
+		"one dir create + two uploads: {actions:?}"
+	);
+	assert!(
+		actions.iter().any(|a| a.contains("\"sub\"")),
+		"the plan must name the new directory: {actions:?}"
+	);
+	for name in ["sub/one.txt", "sub/two.txt"] {
+		assert!(
+			actions.iter().any(|a| a.contains(name)),
+			"the plan must name {name}: {actions:?}"
+		);
+	}
+	assert!(
+		!actions.iter().any(|a| a.contains("kept.txt")),
+		"an already-synced file must not be planned: {actions:?}"
+	);
+
+	// NOTHING moved: local tree, remote listing and the quarantine area are all unchanged.
+	assert_eq!(
+		walk_tree(&sc.local),
+		before_local,
+		"the dry run wrote locally"
+	);
+	let after_remote: Vec<String> = list_remote_files(&sc)
+		.await
+		.iter()
+		.filter_map(|f| f.name().map(str::to_string))
+		.collect();
+	assert_eq!(
+		after_remote, before_remote,
+		"the dry run wrote to the remote"
+	);
+	assert!(
+		!sc.local.join(".filen-sync-trash").exists(),
+		"the dry run created a quarantine bin"
+	);
+
+	// The baseline is untouched too: re-planning yields exactly the same plan.
+	let PlanOutcome::Planned { actions: again, .. } = sc.engine.plan_pair(sc.pair).await.unwrap()
+	else {
+		panic!("second dry run refused");
+	};
+	assert_eq!(again, actions, "the dry run advanced the baseline");
+
+	// The real pass applies exactly what was predicted.
+	let report = sc.sync().await;
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(applied_total(&report), actions.len(), "{report:?}");
+	assert_eq!(report.uploaded, 2, "{report:?}");
+	assert_eq!(report.remote_dirs_created, 1, "{report:?}");
+
+	sc.cleanup();
 }
 
 #[ignore = "blocked: needs deterministic mid-pass interruption/abort — see OBSERV-16 TODO"]

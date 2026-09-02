@@ -28,7 +28,8 @@ mod scan;
 mod watch;
 
 pub use apply::SyncReport;
-pub use engine::{ConflictResolution, SyncEngine};
+pub use baseline::{PairId, PairRecord};
+pub use engine::{ConflictResolution, PlanOutcome, SyncEngine};
 pub use events::{SyncEvent, SyncObserver};
 pub use mode::SyncMode;
 pub use watch::{WatchHandle, WatchStatus};
