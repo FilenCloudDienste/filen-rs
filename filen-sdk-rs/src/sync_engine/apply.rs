@@ -67,6 +67,8 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) pair: PairId,
 	pub(super) store: &'a Mutex<BaselineStore>,
 	pub(super) local: &'a HashMap<String, LocalNode>,
+	/// The pair's baseline as of the start of the pass — what the local side is expected to hold.
+	pub(super) baseline: &'a HashMap<String, BaselineEntry>,
 	pub(super) remote: &'a HashMap<String, RemoteNode>,
 	/// The sync root resolved to a remote directory (every top-level parent).
 	pub(super) root_remote: RemoteDirectory,
@@ -338,6 +340,27 @@ async fn apply_transfer(
 			if let Some(parent) = path.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
+			// Remote-wins: stash a local file the baseline cannot vouch for before the download
+			// overwrites it, the same way a propagated deletion is quarantined rather than
+			// destroyed. An unmodified copy still matching its baseline row is just refreshed.
+			//
+			// `ctx.baseline` is the PASS-START snapshot, so it has no row for a path this same pass
+			// moved a file onto — a remote move that carried a content edit is a `MoveLocal` paired
+			// with this very download, and the move already wrote the moved file's row. Read that
+			// row back before deciding; without it the download would quarantine the copy the move
+			// just renamed into place. Only when something is actually sitting at the target: an
+			// ordinary download onto free space has nothing to lose and skips the read.
+			let base = match ctx.baseline.get(rel_path) {
+				Some(base) => Some(base.clone()),
+				None if path.exists() => ctx
+					.store
+					.lock()
+					.await
+					.entry(ctx.pair, rel_path)
+					.map_err(db_err)?,
+				None => None,
+			};
+			stash_local_target(ctx.local_root, rel_path, base.as_ref())?;
 			ctx.client
 				.download_file_to_path(&remote_file, &path, None)
 				.await?;
@@ -505,6 +528,11 @@ async fn apply_one(
 		SyncAction::MoveLocal { from_path, to_path } => {
 			let from = local_path(ctx.local_root, from_path);
 			let to = confined_local_target(ctx.local_root, to_path)?;
+			// The reconciler only plans a move onto a destination the SCAN saw free, but a pass
+			// waits on the drive lock in between and a file can land there meanwhile — and
+			// `rename` would destroy it without a trace. Same window, and same remedy, as the
+			// pre-download stash above.
+			stash_move_target(ctx.local_root, to_path, ctx.baseline.get(to_path))?;
 			if let Some(parent) = to.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
@@ -543,6 +571,47 @@ async fn apply_one(
 		}
 	}
 	Ok(())
+}
+
+/// Stash whatever sits at a local write target that the baseline cannot vouch for, before the
+/// write lands on top of it. Every local write that can OVERWRITE — a remote-wins download, and a
+/// move whose destination is occupied — goes through here, so a local edit is never destroyed
+/// silently; it lands in the quarantine bin the same way a propagated deletion does.
+fn stash_local_target(
+	local_root: &Path,
+	rel_path: &str,
+	base: Option<&BaselineEntry>,
+) -> Result<(), crate::Error> {
+	if local_holds_unsynced_content(&local_path(local_root, rel_path), base) {
+		quarantine_local(local_root, rel_path)?;
+	}
+	Ok(())
+}
+
+/// Whether the item at a pull's target path holds content the baseline cannot vouch for — a local
+/// edit, or a file the baseline never recorded. A remote-wins download would destroy it, so it is
+/// quarantined first. A file still matching its baseline row is an unmodified copy: nothing is
+/// lost by refreshing it in place.
+///
+/// Read from DISK rather than from the pass's scan snapshot: a pass waits on the drive lock
+/// between the scan and its transfers, and an edit landing in that window is exactly the one that
+/// must not be overwritten. The `(size, mtime)` comparison is the scanner's own fast-path test
+/// (`scan::fast_path_hash`), so an untouched file is not re-hashed here either.
+fn local_holds_unsynced_content(path: &Path, base: Option<&BaselineEntry>) -> bool {
+	use crate::io::FilenMetaExt;
+	let Ok(meta) = std::fs::metadata(path) else {
+		// Nothing readable on disk: there is nothing to lose.
+		return false;
+	};
+	// No baseline row, or one describing something else (a type flip): nothing on record says what
+	// is on disk was ever synced.
+	let Some(base) = base else {
+		return true;
+	};
+	base.kind != NodeKind::File
+		|| !meta.is_file()
+		|| base.size != Some(meta.len())
+		|| base.local_mtime != Some(FilenMetaExt::modified(&meta).timestamp_millis())
 }
 
 /// What an [`SyncAction::AdoptBaseline`] writes for one path. Decided purely (no I/O) so the
@@ -686,6 +755,40 @@ fn quarantine_local(root: &Path, rel_path: &str) -> Result<(), crate::Error> {
 		std::fs::create_dir_all(parent).map_err(io_err)?;
 	}
 	std::fs::rename(&source, &dest).map_err(io_err)
+}
+
+/// Stash whatever occupies a local move's destination, unless the destination is the SOURCE seen
+/// under another spelling: a case-insensitive filesystem resolves both ends of a case-only rename
+/// to one file, and stashing it would carry the file off and leave the rename with nothing to
+/// rename.
+///
+/// Which of the two it is cannot be settled by asking the filesystem for the path — `metadata`
+/// case-folds exactly as `rename` does, and so does `canonicalize` — nor by case-folding the two
+/// paths, which calls every case-only rename a self-move even where the filesystem keeps the two
+/// names apart. It is the parent directory that knows: the destination is a file of its own
+/// exactly when the directory lists that name literally. `from_path` comes from the scan, so it
+/// carries the source's on-disk spelling and cannot be the name found here.
+fn stash_move_target(
+	local_root: &Path,
+	to_path: &str,
+	base: Option<&BaselineEntry>,
+) -> Result<(), crate::Error> {
+	if has_own_directory_entry(&local_path(local_root, to_path)) {
+		stash_local_target(local_root, to_path, base)?;
+	}
+	Ok(())
+}
+
+/// Whether `path`'s parent directory lists `path`'s file name byte for byte.
+fn has_own_directory_entry(path: &Path) -> bool {
+	let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+		return false;
+	};
+	std::fs::read_dir(parent).is_ok_and(|entries| {
+		entries
+			.flatten()
+			.any(|entry| entry.file_name().as_os_str() == name)
+	})
 }
 
 /// A quarantine destination that does not already exist: `base`, else `base (1)`, `base (2)`, ...
@@ -836,6 +939,79 @@ mod tests {
 		}
 	}
 
+	fn baseline_file(rel: &str, hash: Option<Blake3Hash>) -> BaselineEntry {
+		BaselineEntry {
+			rel_path: rel.to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Some(Uuid::new_v4()),
+			content_hash: hash,
+			size: Some(3),
+			local_mtime: Some(10),
+			remote_modified: Some(10),
+			state: BaselineState::Synced,
+		}
+	}
+
+	/// A file on disk plus a baseline row that vouches for exactly it.
+	fn synced_file(root: &Path, bytes: &[u8]) -> (PathBuf, BaselineEntry) {
+		let path = root.join("a.txt");
+		std::fs::write(&path, bytes).unwrap();
+		let mut base = baseline_file("a.txt", Some(Blake3Hash::from([1; 32])));
+		base.size = Some(bytes.len() as u64);
+		base.local_mtime = local_mtime_of(&path);
+		(path, base)
+	}
+
+	#[test]
+	fn a_pull_over_an_unmodified_local_file_does_not_quarantine() {
+		let root = temp_dir();
+		let (path, base) = synced_file(&root, b"abc");
+		assert!(!local_holds_unsynced_content(&path, Some(&base)));
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn a_pull_over_a_file_edited_after_the_scan_quarantines_first() {
+		// The scan snapshot still says this file matches its baseline; the file on disk no longer
+		// does. A pass waits on the drive lock between the scan and the download, so the decision
+		// has to be read from disk.
+		let root = temp_dir();
+		let (path, base) = synced_file(&root, b"abc");
+		std::fs::write(&path, b"edited after the scan").unwrap();
+		assert!(
+			local_holds_unsynced_content(&path, Some(&base)),
+			"a file that no longer matches its baseline row must be stashed"
+		);
+		assert!(
+			local_holds_unsynced_content(&path, None),
+			"a file the baseline never recorded must be stashed"
+		);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn a_pull_over_a_local_dir_quarantines_first() {
+		let root = temp_dir();
+		let path = root.join("a.txt");
+		std::fs::create_dir(&path).unwrap();
+		let base = baseline_file("a.txt", Some(Blake3Hash::from([1; 32])));
+		assert!(
+			local_holds_unsynced_content(&path, Some(&base)),
+			"a directory where a file is being pulled must be stashed, not written over"
+		);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn a_pull_with_nothing_local_does_not_quarantine() {
+		let root = temp_dir();
+		assert!(!local_holds_unsynced_content(
+			&root.join("missing.txt"),
+			None
+		));
+		std::fs::remove_dir_all(&root).ok();
+	}
+
 	#[test]
 	fn adopt_records_the_scan_time_mtime_not_a_fresh_stat() {
 		// The scan hashed the file at mtime 4242. Pairing that hash with any LATER mtime would
@@ -870,6 +1046,85 @@ mod tests {
 			adopt_outcome("gone.txt", None, None, false),
 			AdoptOutcome::Keep
 		);
+	}
+
+	/// A local move whose destination is occupied by a file the baseline cannot vouch for must
+	/// stash that file first: `rename` would overwrite it and lose it for good.
+	#[test]
+	fn a_local_move_onto_an_unsynced_file_stashes_it_first() {
+		let root = temp_dir();
+		std::fs::write(root.join("dest.txt"), b"never synced").unwrap();
+
+		stash_local_target(&root, "dest.txt", None).unwrap();
+
+		assert!(
+			!root.join("dest.txt").exists(),
+			"the destination is cleared for the rename"
+		);
+		assert_eq!(
+			std::fs::read(root.join(QUARANTINE_DIR).join("dest.txt")).unwrap(),
+			b"never synced",
+			"and the file the baseline could not vouch for is recoverable"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// A case-only rename resolves both ends of the move to one file on a case-insensitive
+	/// filesystem: stashing "the destination" would carry the source away and leave the rename
+	/// with nothing to rename.
+	#[test]
+	fn a_case_only_rename_is_not_treated_as_an_occupied_destination() {
+		let root = temp_dir();
+		std::fs::write(root.join("report.txt"), b"the source").unwrap();
+
+		stash_move_target(&root, "REPORT.TXT", None).unwrap();
+
+		assert_eq!(
+			std::fs::read(root.join("report.txt")).unwrap(),
+			b"the source",
+			"the file the rename is about to move is left where it is"
+		);
+		assert!(
+			!root.join(QUARANTINE_DIR).exists(),
+			"nothing is quarantined"
+		);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// Where the filesystem DOES keep the two spellings apart, the destination is somebody else's
+	/// file and the rename would destroy it: case-folding the two paths would have waved it
+	/// through as a self-move.
+	#[test]
+	fn a_destination_that_only_looks_like_the_source_is_still_stashed() {
+		let root = temp_dir();
+		std::fs::write(root.join("REPORT.TXT"), b"never synced").unwrap();
+
+		stash_move_target(&root, "REPORT.TXT", None).unwrap();
+
+		assert_eq!(
+			std::fs::read(root.join(QUARANTINE_DIR).join("REPORT.TXT")).unwrap(),
+			b"never synced"
+		);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// The other side of it: a destination holding exactly what the baseline records is just an
+	/// unmodified copy, and moving over it stashes nothing.
+	#[test]
+	fn a_local_move_onto_a_synced_copy_stashes_nothing() {
+		let root = temp_dir();
+		let (path, base) = synced_file(&root, b"abc");
+
+		stash_local_target(&root, "a.txt", Some(&base)).unwrap();
+
+		assert!(path.exists(), "an unmodified copy is left where it is");
+		assert!(
+			!root.join(QUARANTINE_DIR).exists(),
+			"nothing is quarantined"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
 	}
 
 	#[test]

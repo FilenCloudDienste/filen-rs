@@ -52,6 +52,27 @@ fn bytes_recoverable_anywhere(root: &Path, needle: &[u8]) -> bool {
 	false
 }
 
+/// Count the regular files sitting in the engine's `.filen-sync-trash` quarantine bin under
+/// `root`. Zero proves a pass stashed nothing.
+fn quarantined_file_count(root: &Path) -> usize {
+	let mut count = 0usize;
+	let mut stack = vec![root.join(".filen-sync-trash")];
+	while let Some(dir) = stack.pop() {
+		let rd = match std::fs::read_dir(&dir) {
+			Ok(rd) => rd,
+			Err(_) => continue,
+		};
+		for entry in rd.flatten() {
+			match entry.file_type() {
+				Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+				Ok(ft) if ft.is_file() => count += 1,
+				_ => {}
+			}
+		}
+	}
+	count
+}
+
 /// Count regular files anywhere under `root` whose base name contains `frag` (case-sensitive),
 /// INCLUDING the quarantine bin. Used to bound conflict-copy proliferation across passes.
 fn count_files_named_containing(root: &Path, frag: &str) -> usize {
@@ -944,12 +965,6 @@ async fn conflict_15a_local_to_remote_local_wins_no_conflict() {
 	sc.cleanup();
 }
 
-#[ignore = "blocked: pull-overwrite quarantine (deferred review finding). In RemoteToLocal the \
-remote correctly wins a divergence (REM is downloaded, no conflict surfaced — right for a \
-one-directional mode), but the overwritten local edit (LOC) is HARD-overwritten by the download \
-rather than preserved. The delete path already quarantines a removed local file; the \
-content-overwrite path should likewise stash the pre-overwrite local bytes so a clobbered local edit \
-stays recoverable. TODO"]
 #[shared_test_runtime]
 async fn conflict_15b_remote_to_local_remote_wins_no_conflict() {
 	// RemoteToLocal: remote "REM" wins, no conflict surfaced.
@@ -996,6 +1011,53 @@ async fn conflict_15b_remote_to_local_remote_wins_no_conflict() {
 	assert!(
 		bytes_recoverable_anywhere(&sc.local, b"LOC"),
 		"overwritten local LOC content was hard-destroyed with no recovery copy"
+	);
+
+	sc.cleanup();
+}
+
+#[shared_test_runtime]
+async fn conflict_15c_unmodified_local_refresh_leaves_no_quarantine_copy() {
+	// The counterpart to 15b: the pull-overwrite stash must be surgical. A plain refresh of a local
+	// file that still matches its baseline destroys nothing, so it must NOT leave a recovery copy
+	// behind — otherwise every remote edit doubles the local disk usage.
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	let v1 = upload_remote_single(&sc, "fresh.txt", b"V1").await;
+	assert!(
+		poll_for_item(sc.cache.db_path(), v1.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never saw V1"
+	);
+	let r1 = sc.sync().await;
+	assert_eq!(r1.downloaded, 1, "{r1:?}");
+	assert!(read_eq(&sc.local, "fresh.txt", b"V1"), "V1 did not land");
+
+	// Remote-only edit; the local copy is untouched since that sync.
+	let v2 = upload_remote_single(&sc, "fresh.txt", b"V222").await;
+	let new_uuid: Uuid = v2.uuid();
+	let db = sc.cache.db_path().to_path_buf();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || {
+			query_cached_file(&db, new_uuid).map(|t| t.1) == Some(4)
+		})
+		.await,
+		"cache never reflected the new remote content"
+	);
+
+	let mut r2 = sc.sync().await;
+	let deadline = std::time::Instant::now() + Duration::from_secs(30);
+	while !read_eq(&sc.local, "fresh.txt", b"V222") && std::time::Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		r2 = sc.sync().await;
+	}
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert!(
+		read_eq(&sc.local, "fresh.txt", b"V222"),
+		"the refresh did not land"
+	);
+	assert_eq!(
+		quarantined_file_count(&sc.local),
+		0,
+		"an unmodified refresh must not stash a recovery copy"
 	);
 
 	sc.cleanup();

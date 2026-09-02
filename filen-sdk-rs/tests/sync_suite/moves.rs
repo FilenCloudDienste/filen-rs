@@ -72,6 +72,27 @@ fn tree_paths(root: &std::path::Path) -> Vec<String> {
 	walk_tree(root).into_keys().collect()
 }
 
+/// Count the regular files sitting in the engine's `.filen-sync-trash` quarantine bin under
+/// `root`. Zero proves a pass stashed nothing.
+fn quarantined_file_count(root: &std::path::Path) -> usize {
+	let mut count = 0usize;
+	let mut stack = vec![root.join(".filen-sync-trash")];
+	while let Some(dir) = stack.pop() {
+		let rd = match std::fs::read_dir(&dir) {
+			Ok(rd) => rd,
+			Err(_) => continue,
+		};
+		for entry in rd.flatten() {
+			match entry.file_type() {
+				Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+				Ok(ft) if ft.is_file() => count += 1,
+				_ => {}
+			}
+		}
+	}
+	count
+}
+
 /// Wait until the engine's cache view observes `uuid`.
 async fn wait_cache_has(sc: &SingleClient, uuid: Uuid) {
 	assert!(
@@ -1632,6 +1653,65 @@ async fn move_a6_move_into_simultaneously_renamed_dir() {
 	let r3 = sc.sync().await;
 	assert_eq!(r3.uploaded, 0, "{r3:?}");
 	assert_eq!(r3.moved_remote, 0, "{r3:?}");
+
+	sc.cleanup();
+}
+
+// ============================================================================
+// MOVE-A7 (review) — A remote rename that CARRIED an edit renames the local copy and pulls
+// the new version onto it, without stashing the copy it just renamed.
+// ============================================================================
+
+#[shared_test_runtime]
+async fn move_a7_remote_move_with_edit_leaves_no_quarantine_copy() {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	let mut rf = upload_root(&sc, "report.pdf", b"PDF-bytes-C1").await;
+	wait_cache_has(&sc, rf.uuid()).await;
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.downloaded, 1, "{r1:?}");
+	assert!(read_eq(&sc.local, "report.pdf", b"PDF-bytes-C1"));
+
+	// Remote-side rename AND edit inside one window: the same lineage under a new name, with a
+	// new uuid that supersedes the one the baseline recorded.
+	let superseded = rf.uuid();
+	sc.resources
+		.client
+		.update_file_metadata(
+			&mut rf,
+			FileMetaChanges::default().name("final.pdf").unwrap(),
+		)
+		.await
+		.unwrap();
+	let edited = upload_root(&sc, "final.pdf", b"PDF-bytes-C2-and-longer").await;
+	wait_cache_has(&sc, edited.uuid()).await;
+	assert!(
+		poll_for_item_absent(sc.cache.db_path(), superseded, CACHE_CONVERGE_TIMEOUT).await,
+		"cache never dropped the superseded version"
+	);
+
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.moved_local, 1, "the rename must be a local move: {r2:?}");
+	assert_eq!(r2.downloaded, 1, "the edit must be pulled onto it: {r2:?}");
+	assert!(
+		read_eq(&sc.local, "final.pdf", b"PDF-bytes-C2-and-longer"),
+		"the new version is not at the new name"
+	);
+	assert_eq!(
+		tree_paths(&sc.local),
+		vec!["final.pdf".to_string()],
+		"unexpected local tree"
+	);
+	assert_eq!(
+		quarantined_file_count(&sc.local),
+		0,
+		"the copy the move renamed into place was stashed instead of refreshed"
+	);
+
+	let r3 = sc.sync().await;
+	assert_eq!(r3.moved_local, 0, "{r3:?}");
+	assert_eq!(r3.downloaded, 0, "{r3:?}");
 
 	sc.cleanup();
 }
