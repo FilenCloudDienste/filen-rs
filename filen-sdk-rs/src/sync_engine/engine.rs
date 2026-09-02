@@ -6,7 +6,7 @@
 
 use std::{
 	collections::{HashMap, HashSet},
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::{
 	SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
-	baseline::{BaselineEntry, BaselineStore, PairId, PairRecord},
+	baseline::{BaselineEntry, BaselineState, BaselineStore, PairId, PairRecord},
 	guard::{self, DeleteGuard, GuardReason},
 	plan::{self, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
@@ -133,6 +133,90 @@ struct Prepared {
 	files: Vec<CacheableFile<'static>>,
 }
 
+/// Which side wins when a caller resolves a held two-way conflict via
+/// [`SyncEngine::resolve_conflict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictResolution {
+	/// The local copy wins: the next pass pushes it to the remote (or, if the conflict was a
+	/// local deletion, propagates that deletion).
+	KeepLocal,
+	/// The remote copy wins: the next pass pulls it over the local copy (or, if the conflict was a
+	/// remote deletion, propagates that deletion — quarantining the local file).
+	KeepRemote,
+	/// Keep both: the local copy is renamed aside to `<stem>.old.<ext>` (`<stem>.old.N.<ext>` on
+	/// collision) so it uploads as a new file, and the conflicting path itself then resolves as
+	/// [`KeepRemote`](Self::KeepRemote).
+	KeepBoth,
+}
+
+/// A `Synced` baseline row for `rel_path` with every side-specific field cleared — the base the
+/// resolution branches fill in with the winning side's anchor.
+fn synced_shell(rel_path: &str) -> BaselineEntry {
+	BaselineEntry {
+		rel_path: rel_path.to_string(),
+		kind: super::baseline::NodeKind::File,
+		remote_uuid: None,
+		content_hash: None,
+		size: None,
+		local_mtime: None,
+		remote_modified: None,
+		state: BaselineState::Synced,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
+	}
+}
+
+/// The baseline row that resolving a held conflict writes, or `None` when the winning side had
+/// nothing at the path (the row is dropped instead, so the other side reads as a fresh create).
+///
+/// Decided purely so the policy is unit-testable. `winner` is already normalized:
+/// [`KeepBoth`](ConflictResolution::KeepBoth) has moved the local copy aside and become
+/// [`KeepRemote`](ConflictResolution::KeepRemote).
+fn resolution_entry(
+	rel_path: &str,
+	held: &BaselineEntry,
+	winner: ConflictResolution,
+) -> Option<BaselineEntry> {
+	match winner {
+		// The local side wins: anchor the baseline to the REMOTE's recorded state, with no
+		// local evidence, so the next scan reads the local copy (or its absence) as the change
+		// and pushes it.
+		//
+		// Unless the two sides converged on identical content while the conflict was held: there
+		// is nothing left to push, so record the whole converged state at once instead of leaving
+		// a row a further pass has to adopt.
+		ConflictResolution::KeepLocal => held.remote_kind.map(|kind| {
+			let converged = kind == super::baseline::NodeKind::File
+				&& held.content_hash.is_some()
+				&& held.content_hash == held.remote_hash
+				&& held.size == held.remote_size;
+			BaselineEntry {
+				kind,
+				remote_uuid: held.remote_uuid,
+				remote_modified: held.remote_modified,
+				content_hash: converged.then_some(held.content_hash).flatten(),
+				size: converged.then_some(held.size).flatten(),
+				local_mtime: converged.then_some(held.local_mtime).flatten(),
+				..synced_shell(rel_path)
+			}
+		}),
+		// The remote side wins: anchor to the LOCAL's recorded state with no remote evidence,
+		// so the remote (or its absence) reads as the change and is pulled.
+		ConflictResolution::KeepRemote => held.local_kind.map(|kind| BaselineEntry {
+			kind,
+			content_hash: held.content_hash,
+			size: held.size,
+			local_mtime: held.local_mtime,
+			remote_uuid: None,
+			remote_modified: None,
+			..synced_shell(rel_path)
+		}),
+		ConflictResolution::KeepBoth => unreachable!("normalized to KeepRemote above"),
+	}
+}
+
 /// The outcome of `plan_pair` (a dry run).
 // Constructed by the (currently unwired) `plan_pair` preview API; its fields are surfaced via
 // `Debug` for a caller that consumes the preview, not read internally.
@@ -198,6 +282,61 @@ impl SyncEngine {
 			.await
 			.create_pair(&local, remote_root, mode)
 			.map_err(|e| db_error(e, "registering a sync pair"))
+	}
+
+	/// Resolve a two-way conflict the engine is holding at `rel_path` (one reported in
+	/// [`SyncReport::conflicts`]) by naming the winning side. The resolution takes effect on the
+	/// NEXT pass: the baseline is re-anchored so the winner reads as the changed side and is
+	/// propagated normally, and the path (with its subtree) stops being held.
+	///
+	/// [`KeepBoth`](ConflictResolution::KeepBoth) additionally renames the local copy aside to
+	/// `<stem>.old.<ext>` first, so that copy uploads as a new file instead of being overwritten.
+	///
+	/// Errors if the pair is unknown or no conflict is currently held at `rel_path`.
+	pub async fn resolve_conflict(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+		resolution: ConflictResolution,
+	) -> Result<(), Error> {
+		let store = self.store.lock().await;
+		let record = store
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+		let mut held = store
+			.entry(pair, rel_path)
+			.map_err(|e| db_error(e, "loading the held conflict"))?
+			.filter(|entry| entry.state == BaselineState::Conflicted)
+			.ok_or_else(|| {
+				Error::custom(
+					ErrorKind::InvalidState,
+					format!("no conflict is being held at {rel_path:?} for this pair"),
+				)
+			})?;
+
+		let mut winner = resolution;
+		if winner == ConflictResolution::KeepBoth {
+			// Move the losing local copy out of the way FIRST, then resolve the path itself to the
+			// remote: the moved-aside copy has no baseline row, so it uploads as a new file.
+			if held.local_kind.is_some() {
+				let moved = apply::rename_aside(Path::new(&record.local_root), rel_path)?;
+				tracing::debug!(
+					"resolve_conflict[pair {pair}]: kept the local copy of {rel_path:?} aside as {moved:?}"
+				);
+				held.local_kind = None;
+			}
+			// Either way the local side is now empty at this path, so the remote copy lands there.
+			winner = ConflictResolution::KeepRemote;
+		}
+
+		match resolution_entry(rel_path, &held, winner) {
+			Some(entry) => store.upsert_entry(pair, &entry),
+			// The winner's side had nothing at this path: drop the row entirely, so the other
+			// side reads as a fresh create (or as already-gone) rather than as a second conflict.
+			None => store.delete_entry(pair, rel_path),
+		}
+		.map_err(|e| db_error(e, "resolving a conflict"))
 	}
 
 	/// Run the read-only half: load the baseline, scan, enumerate the remote, build the view.
@@ -459,6 +598,136 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 	}
 }
 
+/// One human-readable line describing an action, for the dry-run preview.
+fn describe(action: &SyncAction) -> String {
+	action.describe()
+}
+
 fn db_error(error: rusqlite::Error, context: &str) -> Error {
 	Error::custom_with_source(ErrorKind::Internal, error, Some(context.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+	use filen_types::crypto::Blake3Hash;
+
+	use super::*;
+	use crate::sync_engine::{baseline::NodeKind, plan::RemoteNode, scan::LocalNode};
+
+	fn hash(byte: u8) -> Blake3Hash {
+		Blake3Hash::from([byte; 32])
+	}
+
+	/// A held conflict row for `a.txt` whose two sides carry the same content evidence — what
+	/// `record_conflict` writes once both sides have converged while the conflict was held.
+	fn converged_conflict(uuid: Uuid) -> BaselineEntry {
+		BaselineEntry {
+			rel_path: "a.txt".to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Some(uuid),
+			content_hash: Some(hash(3)),
+			size: Some(5),
+			local_mtime: Some(111),
+			remote_modified: Some(222),
+			state: BaselineState::Conflicted,
+			local_kind: Some(NodeKind::File),
+			remote_kind: Some(NodeKind::File),
+			remote_hash: Some(hash(3)),
+			remote_size: Some(5),
+		}
+	}
+
+	fn local_map(hash: Blake3Hash) -> HashMap<String, LocalNode> {
+		HashMap::from([(
+			"a.txt".to_string(),
+			LocalNode {
+				rel_path: "a.txt".to_string(),
+				kind: NodeKind::File,
+				size: 5,
+				mtime_millis: 111,
+				content_hash: Some(hash),
+			},
+		)])
+	}
+
+	fn remote_map(uuid: Uuid, hash: Blake3Hash) -> HashMap<String, RemoteNode> {
+		HashMap::from([(
+			"a.txt".to_string(),
+			RemoteNode {
+				rel_path: "a.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: uuid,
+				content_hash: Some(hash),
+				size: 5,
+				modified_millis: 222,
+			},
+		)])
+	}
+
+	/// Both sides converged while the conflict was held: keeping the local copy has nothing left
+	/// to push, so the resolution must record the whole synced state rather than a half row the
+	/// next pass reads as a local modification.
+	#[test]
+	fn keeping_local_on_a_converged_conflict_records_a_clean_synced_row() {
+		let uuid = Uuid::new_v4();
+		let entry = resolution_entry(
+			"a.txt",
+			&converged_conflict(uuid),
+			ConflictResolution::KeepLocal,
+		)
+		.expect("the remote side had a kind, so a row is written");
+
+		assert_eq!(entry.state, BaselineState::Synced);
+		assert_eq!(
+			entry.content_hash,
+			Some(hash(3)),
+			"the converged content is recorded"
+		);
+		assert_eq!(entry.size, Some(5));
+		assert_eq!(entry.local_mtime, Some(111));
+		assert_eq!(entry.remote_uuid, Some(uuid));
+
+		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
+		assert!(
+			plan::reconcile(
+				SyncMode::TwoWay,
+				&baseline,
+				&local_map(hash(3)),
+				&remote_map(uuid, hash(3)),
+				&HashSet::new(),
+			)
+			.is_empty(),
+			"the resolved path is settled: the next pass plans nothing at all"
+		);
+	}
+
+	/// The ordinary case is unchanged: the sides really do differ, so the row is anchored to the
+	/// remote alone and the local copy is pushed on the next pass.
+	#[test]
+	fn keeping_local_on_a_diverged_conflict_still_pushes_the_local_copy() {
+		let uuid = Uuid::new_v4();
+		let held = BaselineEntry {
+			remote_hash: Some(hash(9)),
+			..converged_conflict(uuid)
+		};
+		let entry = resolution_entry("a.txt", &held, ConflictResolution::KeepLocal)
+			.expect("the remote side had a kind, so a row is written");
+		assert_eq!(
+			entry.content_hash, None,
+			"a diverged local side must still read as changed"
+		);
+
+		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
+		let actions = plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local_map(hash(3)),
+			&remote_map(uuid, hash(9)),
+			&HashSet::new(),
+		);
+		assert_eq!(
+			actions.iter().map(describe).collect::<Vec<_>>(),
+			vec!["upload file \"a.txt\"".to_string()],
+		);
+	}
 }
