@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
-	engine::PendingWrites,
+	engine::{Observations, PendingWrites},
 	events::SyncEvent,
 	plan::{RemoteNode, SyncAction, create_target_paths},
 	scan::{LocalNode, QUARANTINE_DIR},
@@ -53,6 +53,10 @@ pub struct SyncReport {
 	pub conflicts: Vec<String>,
 	/// How many deletions the mass-delete guard held back this pass.
 	pub held_deletions: usize,
+	/// How many paths the pass deliberately left alone rather than acting on: a remote write this
+	/// engine made that the cache has not caught up to yet. Such a pass does nothing on purpose,
+	/// which is not the same as having nothing to do.
+	pub deferred_paths: usize,
 	/// Set when the guard held deletions; a human-readable reason.
 	pub guard_message: Option<String>,
 	/// Set when the guard held deletions: the token identifying THIS held batch, to hand back to
@@ -85,6 +89,9 @@ pub(super) struct ApplyContext<'a> {
 	/// Where each remote uuid this pass writes is recorded, so the NEXT pass does not mistake a
 	/// cache that has not caught up for a remote-side deletion.
 	pub(super) pending: &'a PendingWrites,
+	/// The uuids the cache has announced, stamped — read when a pending write is recorded so the
+	/// write only retires on an announcement that came AFTER it.
+	pub(super) observed: &'a Observations,
 }
 
 fn local_path(root: &Path, rel_path: &str) -> PathBuf {
@@ -438,7 +445,15 @@ async fn apply_transfer(
 				.await?;
 			let local = ctx.local.get(rel_path);
 			let new_uuid: Uuid = uploaded.uuid();
-			ctx.pending.record_create(new_uuid);
+			// A same-name upload versions whatever the path held: record that uuid, so the next
+			// pass can tell a cache that has not caught up (the old uuid still at the path) from
+			// someone ELSE having written there since (a third uuid).
+			ctx.pending.record_create(
+				ctx.observed,
+				new_uuid,
+				rel_path,
+				ctx.remote.get(rel_path).map(|node| node.remote_uuid),
+			);
 			upsert_file_baseline(
 				ctx,
 				rel_path,
@@ -498,7 +513,12 @@ async fn apply_one(
 				.create_dir_with_created(&parent_type, name, created)
 				.await?;
 			let new_uuid: Uuid = new_dir.uuid();
-			ctx.pending.record_create(new_uuid);
+			ctx.pending.record_create(
+				ctx.observed,
+				new_uuid,
+				rel_path,
+				ctx.remote.get(rel_path).map(|node| node.remote_uuid),
+			);
 			dir_by_path.insert(rel_path.clone(), new_dir);
 			upsert_dir_baseline(ctx, rel_path, Some(new_uuid), None).await?;
 			report.remote_dirs_created += 1;
@@ -559,7 +579,8 @@ async fn apply_one(
 					.await?;
 			}
 			let local = ctx.local.get(to_path);
-			ctx.pending.record_move(*remote_uuid, from_path);
+			ctx.pending
+				.record_move(ctx.observed, *remote_uuid, from_path);
 			delete_baseline(ctx, from_path).await?;
 			upsert_file_baseline(
 				ctx,

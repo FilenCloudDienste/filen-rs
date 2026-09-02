@@ -19,73 +19,239 @@ use super::{
 	apply::{self, ApplyContext, SyncReport},
 	baseline::{BaselineEntry, BaselineState, BaselineStore, PairId, PairRecord},
 	guard::{self, DeleteGuard},
-	plan::{self, RemoteView, SyncAction},
+	plan::{self, RemoteNode, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
 };
 use crate::{
-	Error, ErrorKind, auth::Client, fs::dir::cache::CacheableDir, fs::file::cache::CacheableFile,
+	Error, ErrorKind,
+	auth::Client,
+	cache::{CacheEvent, CacheEventType, DirEvent, FileEvent, SyncRootCallback, SyncRootHandle},
+	fs::dir::cache::CacheableDir,
+	fs::file::cache::CacheableFile,
 };
 
-/// How long a remote uuid this engine just wrote stays treated as "it exists; the cache has not
-/// caught up yet". The cache learns of our own writes only through socket events and resyncs, so a
-/// fresh uuid can be missing from the very next pass's snapshot — which would read as a remote-side
-/// deletion and re-upload the file, duplicate the directory, or (two-way) quarantine what was just
-/// uploaded. The window is the ceiling on that trust: past it the snapshot is believed again, so an
-/// item genuinely deleted elsewhere is picked up late, never ignored.
+/// The ceiling on how long a remote write this engine made stays trusted over the cache snapshot.
+///
+/// A write normally retires long before this: the cache announces the item (see [`Observations`])
+/// or the snapshot shows what happened at its path. The window is the last resort for the case
+/// where neither ever arrives — past it the snapshot is believed again, so an item genuinely
+/// deleted elsewhere is picked up late, never ignored.
 const PENDING_CREATE_GRACE: Duration = Duration::from_secs(180);
 
 /// One remote write this engine made, and how to tell whether the cache has caught up to it.
 #[derive(Debug)]
 struct PendingWrite {
 	at: Instant,
-	/// The path the item was moved OUT of, for a move; `None` for a create. It is what makes "the
-	/// cache has not applied our move yet" distinguishable from "someone else moved the item after
-	/// us" — the second must be reconciled at once, not waited out.
-	moved_from: Option<String>,
+	/// The observation counter as of the moment this write was recorded. Only a cache event seen
+	/// AFTER that proves the cache caught up to THIS write: a move's uuid was necessarily
+	/// announced earlier, when the item was first created.
+	seq: u64,
+	kind: PendingKind,
 }
 
-/// Remote writes this engine made recently. The apply layer records every item it creates or moves;
-/// [`settle`](PendingWrites::settle) drops the records the snapshot has caught up to and the ones
-/// past [`PENDING_CREATE_GRACE`], so the map only ever holds one grace window of writes.
+#[derive(Debug)]
+enum PendingKind {
+	/// An item created at `path`. `replaced` is the remote uuid that held the path immediately
+	/// before — a same-name upload versions the existing file, minting a new uuid — or `None` for
+	/// a path nothing occupied.
+	Created {
+		path: String,
+		replaced: Option<Uuid>,
+	},
+	/// An item moved out of `from`. That is what makes "the cache has not applied our move yet"
+	/// distinguishable from "someone else moved the item after us", which must be reconciled at
+	/// once rather than waited out.
+	Moved { from: String },
+}
+
+/// Uuids the cache has announced to this engine, each stamped with the observation counter at the
+/// time it arrived.
+///
+/// This is what retires a pending write in the ordinary case. Waiting for the written uuid to
+/// APPEAR in a snapshot only works while the item survives, and two everyday events destroy it:
+/// a re-upload (ours or another client's) versions the file under a fresh uuid, and a deletion
+/// removes it outright. Either way the cache announces the uuid — as a `New`, a `Trashed`, an
+/// `Archived` or a `Removed` — and that announcement alone proves the cache is no longer behind
+/// on our write.
+#[derive(Debug, Default)]
+pub(super) struct Observations(std::sync::Mutex<ObservationState>);
+
+#[derive(Debug, Default)]
+struct ObservationState {
+	seq: u64,
+	seen: HashMap<Uuid, u64>,
+}
+
+impl Observations {
+	/// Record every uuid a committed cache batch touched. Runs on the cache worker thread, so it
+	/// does nothing but take a lock and insert.
+	fn note(&self, uuids: impl IntoIterator<Item = Uuid>) {
+		let mut state = self.state();
+		for uuid in uuids {
+			state.seq += 1;
+			let seq = state.seq;
+			state.seen.insert(uuid, seq);
+		}
+	}
+
+	/// The current counter — the stamp a write recorded now must be beaten by to retire.
+	fn stamp(&self) -> u64 {
+		self.state().seq
+	}
+
+	/// A copy to settle against. Taken BEFORE the remote snapshot is read: an event committed
+	/// after the snapshot must not retire a write this pass, or the pass would go on to read the
+	/// just-written item as deleted.
+	fn snapshot(&self) -> HashMap<Uuid, u64> {
+		self.state().seen.clone()
+	}
+
+	/// Forget the observations no live pending write can ever consult — only one stamped LATER
+	/// than a write retires it, so everything up to the oldest live write's stamp is dead weight
+	/// (and with no write left, so is the whole map).
+	fn prune_before(&self, oldest: Option<u64>) {
+		let mut state = self.state();
+		match oldest {
+			Some(seq) => state.seen.retain(|_, stamp| *stamp > seq),
+			None => state.seen.clear(),
+		}
+	}
+
+	fn state(&self) -> std::sync::MutexGuard<'_, ObservationState> {
+		// Plain data behind the lock: a panic while holding it cannot leave the state inconsistent.
+		self.0
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+	}
+}
+
+/// The uuids one cache event touches: the item's own, plus the successor a trash or archive of an
+/// edited file carries (the same file re-minted under a new id).
+fn event_uuids(event: &CacheEvent<'_>) -> [Option<Uuid>; 2] {
+	match &event.event {
+		CacheEventType::File(file) => match file {
+			FileEvent::New(f) | FileEvent::Move(f) | FileEvent::Changed(f) => [Some(f.uuid), None],
+			FileEvent::Archived { uuid, new_uuid, .. }
+			| FileEvent::Trashed { uuid, new_uuid, .. } => [Some(*uuid), *new_uuid],
+			FileEvent::Removed(uuid) | FileEvent::MetadataChanged { uuid, .. } => {
+				[Some(*uuid), None]
+			}
+		},
+		CacheEventType::Dir(dir) => match dir {
+			DirEvent::New(d) | DirEvent::Move(d) | DirEvent::Changed(d) => [Some(d.uuid), None],
+			DirEvent::Removed(uuid)
+			| DirEvent::MetadataChanged { uuid, .. }
+			| DirEvent::ColorChanged { uuid, .. } => [Some(*uuid), None],
+		},
+		CacheEventType::Global(_) | CacheEventType::NoOp => [None, None],
+	}
+}
+
+/// The sync-root callback the engine registers per pair: it records the uuids of every committed
+/// cache batch and nothing else. It runs on the cache worker thread, so it never awaits and never
+/// touches the database.
+fn observation_callback(observations: Arc<Observations>) -> SyncRootCallback {
+	Box::new(move |events| {
+		observations.note(events.flat_map(event_uuids).flatten());
+	})
+}
+
+/// Remote writes this engine made recently. The apply layer records every item it creates or
+/// moves; [`settle`](PendingWrites::settle) drops the records the cache has demonstrably caught up
+/// to and the ones past [`PENDING_CREATE_GRACE`], so the map only ever holds one grace window of
+/// writes.
 #[derive(Debug, Default)]
 pub(super) struct PendingWrites(std::sync::Mutex<HashMap<Uuid, PendingWrite>>);
 
 impl PendingWrites {
-	/// Record a newly created remote item. The cache is behind on it while the snapshot lacks it.
-	pub(super) fn record_create(&self, uuid: Uuid) {
-		self.record(uuid, None);
-	}
-
-	/// Record a remote item this pass moved out of `from`. The cache is behind on it while the
-	/// snapshot still shows it there (or has lost track of it, e.g. because the destination
-	/// directory is itself a create the cache has not seen, which orphans it out of the view).
-	pub(super) fn record_move(&self, uuid: Uuid, from: &str) {
-		self.record(uuid, Some(from.to_string()));
-	}
-
-	fn record(&self, uuid: Uuid, moved_from: Option<String>) {
-		self.map().insert(
+	/// Record a newly created remote item at `path`, superseding `replaced` (the uuid the path
+	/// held before, if any).
+	pub(super) fn record_create(
+		&self,
+		observations: &Observations,
+		uuid: Uuid,
+		path: &str,
+		replaced: Option<Uuid>,
+	) {
+		self.record(
+			observations,
 			uuid,
-			PendingWrite {
-				at: Instant::now(),
-				moved_from,
+			PendingKind::Created {
+				path: path.to_string(),
+				replaced,
 			},
 		);
 	}
 
-	/// Drop the records the snapshot has caught up to and the ones past [`PENDING_CREATE_GRACE`],
-	/// and return the uuids that remain — the ones the snapshot demonstrably still shows in their
+	/// Record a remote item this pass moved out of `from`.
+	pub(super) fn record_move(&self, observations: &Observations, uuid: Uuid, from: &str) {
+		self.record(
+			observations,
+			uuid,
+			PendingKind::Moved {
+				from: from.to_string(),
+			},
+		);
+	}
+
+	fn record(&self, observations: &Observations, uuid: Uuid, kind: PendingKind) {
+		self.map().insert(
+			uuid,
+			PendingWrite {
+				at: Instant::now(),
+				seq: observations.stamp(),
+				kind,
+			},
+		);
+	}
+
+	/// The oldest live write's observation stamp, for pruning [`Observations`].
+	fn oldest_stamp(&self) -> Option<u64> {
+		self.map().values().map(|write| write.seq).min()
+	}
+
+	/// Drop the records the cache has caught up to and the ones past [`PENDING_CREATE_GRACE`], and
+	/// return the uuids that remain — the ones the snapshot demonstrably still shows in their
 	/// pre-write state.
-	fn settle(&self, snapshot_path: &HashMap<Uuid, &str>) -> HashSet<Uuid> {
+	///
+	/// `observed` must have been copied BEFORE `remote` was read, so a cache batch committed after
+	/// the snapshot cannot retire a record whose item that snapshot still predates.
+	fn settle(
+		&self,
+		observed: &HashMap<Uuid, u64>,
+		remote: &HashMap<String, RemoteNode>,
+	) -> HashSet<Uuid> {
 		let now = Instant::now();
+		let snapshot_path: HashMap<Uuid, &str> = remote
+			.iter()
+			.map(|(path, node)| (node.remote_uuid, path.as_str()))
+			.collect();
 		let mut map = self.map();
 		map.retain(|uuid, write| {
-			let seen = snapshot_path.get(uuid);
-			let behind = match &write.moved_from {
-				None => seen.is_none(),
-				Some(from) => seen.is_none_or(|path| *path == from.as_str()),
-			};
-			behind && now.duration_since(write.at) < PENDING_CREATE_GRACE
+			// The cache announced this uuid after we wrote it: it has caught up, whether the item
+			// still exists, was superseded by a re-upload, or has since been trashed.
+			if observed.get(uuid).is_some_and(|stamp| *stamp > write.seq) {
+				return false;
+			}
+			if now.duration_since(write.at) >= PENDING_CREATE_GRACE {
+				return false;
+			}
+			match &write.kind {
+				PendingKind::Created { path, replaced } => {
+					if snapshot_path.contains_key(uuid) {
+						return false;
+					}
+					// Someone else's item holds the path: the snapshot is not behind on our write,
+					// it is showing a foreign one — which the reconciler must act on at once.
+					match remote.get(path.as_str()).map(|node| node.remote_uuid) {
+						Some(occupant) => Some(occupant) == *replaced,
+						None => true,
+					}
+				}
+				PendingKind::Moved { from } => snapshot_path
+					.get(uuid)
+					.is_none_or(|path| *path == from.as_str()),
+			}
 		});
 		map.keys().copied().collect()
 	}
@@ -105,6 +271,12 @@ pub struct SyncEngine {
 	pub(super) store: Mutex<BaselineStore>,
 	/// Remote writes this engine made that the cache may not reflect yet (see [`PendingWrites`]).
 	pub(super) pending: PendingWrites,
+	/// Uuids the cache has announced, shared with the per-pair sync-root callbacks — the evidence
+	/// that retires a pending write (see [`Observations`]).
+	pub(super) observed: Arc<Observations>,
+	/// One cache sync-root registration per pair, kept alive for as long as the pair is
+	/// registered; dropping a handle unsubscribes it.
+	roots: Mutex<HashMap<PairId, SyncRootHandle>>,
 	/// One-shot mass-delete approvals: pair -> the batch token the caller approved. The next pass
 	/// whose held batch hashes to that token executes it; any other batch is held again.
 	approvals: Mutex<HashMap<PairId, String>>,
@@ -129,9 +301,8 @@ struct Prepared {
 	/// watermark). When false, the snapshot's emptiness is untrustworthy and remote-driven
 	/// deletions are held by the guard.
 	remote_converged: bool,
-	/// Remote uuids this engine wrote that the snapshot has not caught up to (see
-	/// [`PendingWrites`]); the reconciler leaves their paths alone.
-	pending: HashSet<Uuid>,
+	/// What this pass must not act on (see [`plan::PassHolds`]).
+	holds: plan::PassHolds,
 	dirs: Vec<CacheableDir<'static>>,
 	files: Vec<CacheableFile<'static>>,
 }
@@ -252,12 +423,43 @@ impl SyncEngine {
 			.map_err(|e| {
 				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
 			})??;
-		Ok(Self {
+		let engine = Self {
 			client,
 			store: Mutex::new(store),
 			pending: PendingWrites::default(),
+			observed: Arc::new(Observations::default()),
+			roots: Mutex::new(HashMap::new()),
 			approvals: Mutex::new(HashMap::new()),
-		})
+		};
+		// Pairs registered by an earlier session are live again from here on, so they need their
+		// cache subscription back too.
+		for record in engine.list_pairs().await? {
+			engine.observe_pair(record.id, record.remote_root).await;
+		}
+		Ok(engine)
+	}
+
+	/// Subscribe to the cache's notifications for a pair's remote root, so a write this engine
+	/// made retires as soon as the cache commits any event for it — including the trash and
+	/// supersede events a deletion or a re-upload produces, which never make the written uuid
+	/// appear in a snapshot at all.
+	///
+	/// Best-effort: a root the cache refuses (deleted, unreachable) leaves that pair on the
+	/// [`PENDING_CREATE_GRACE`] fallback rather than failing the whole engine. The watch loop
+	/// registers its own subscription for wakeups; the two are independent.
+	async fn observe_pair(&self, pair: PairId, remote_root: Uuid) {
+		let callback = observation_callback(Arc::clone(&self.observed));
+		match Arc::clone(&self.client)
+			.add_sync_root(remote_root, callback)
+			.await
+		{
+			Ok(handle) => {
+				self.roots.lock().await.insert(pair, handle);
+			}
+			Err(error) => tracing::warn!(
+				"sync pair {pair}: cache notifications are unavailable ({error}); its pending writes will retire on the grace window alone"
+			),
+		}
 	}
 
 	/// Register a sync pair (idempotent for the same `(local_root, remote_root)`), returning its id.
@@ -289,11 +491,14 @@ impl SyncEngine {
 			));
 		}
 		let local = local_root.to_string_lossy().into_owned();
-		self.store
+		let pair = self
+			.store
 			.lock()
 			.await
 			.create_pair(&local, remote_root, mode)
-			.map_err(|e| db_error(e, "registering a sync pair"))
+			.map_err(|e| db_error(e, "registering a sync pair"))?;
+		self.observe_pair(pair, remote_root).await;
+		Ok(pair)
 	}
 
 	/// Resolve a two-way conflict the engine is holding at `rel_path` (one reported in
@@ -381,6 +586,9 @@ impl SyncEngine {
 					Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}"))
 				})?;
 
+		// Copied BEFORE the snapshot is read: an event the cache commits afterwards describes a
+		// state this snapshot predates, so it must not retire a pending write this pass.
+		let observed = self.observed.snapshot();
 		let snapshot = self
 			.client
 			.enumerate_sync_root_snapshot(record.remote_root)
@@ -388,12 +596,10 @@ impl SyncEngine {
 		let remote_view =
 			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
 
-		let snapshot_path: HashMap<Uuid, &str> = remote_view
-			.nodes
-			.iter()
-			.map(|(path, node)| (node.remote_uuid, path.as_str()))
-			.collect();
-		let pending = self.pending.settle(&snapshot_path);
+		let holds = plan::PassHolds {
+			pending: self.pending.settle(&observed, &remote_view.nodes),
+		};
+		self.observed.prune_before(self.pending.oldest_stamp());
 
 		Ok(Prepared {
 			record,
@@ -401,7 +607,7 @@ impl SyncEngine {
 			local_scan,
 			remote_view,
 			remote_converged: snapshot.watermark.is_some(),
-			pending,
+			holds,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
 		})
@@ -444,6 +650,8 @@ impl SyncEngine {
 	/// Removing an unknown pair is a no-op.
 	pub async fn remove_pair(&self, pair: PairId) -> Result<(), Error> {
 		self.approvals.lock().await.remove(&pair);
+		// Dropping the handle unsubscribes the pair's cache notifications.
+		self.roots.lock().await.remove(&pair);
 		self.store
 			.lock()
 			.await
@@ -543,6 +751,7 @@ impl SyncEngine {
 		report.held_deletions = decision.held.iter().filter(|a| a.is_delete()).count();
 		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
 		report.deletion_token = screened.pass_token;
+		report.deferred_paths = screened.deferred_paths;
 
 		for rel_path in &report.conflicts {
 			// HOLD the conflict in the baseline: the path (and its subtree) is excluded from
@@ -576,9 +785,10 @@ impl SyncEngine {
 
 		if decision.safe.is_empty() {
 			tracing::debug!(
-				"sync_once[pair {pair}]: nothing to apply ({} deletion(s) held, {} conflict(s))",
+				"sync_once[pair {pair}]: nothing to apply ({} deletion(s) held, {} conflict(s), {} path(s) deferred)",
 				report.held_deletions,
 				report.conflicts.len(),
+				report.deferred_paths,
 			);
 			observer(SyncEvent::PassCompleted {
 				report: report.clone(),
@@ -604,10 +814,11 @@ impl SyncEngine {
 			dirs: &prep.dirs,
 			files: &prep.files,
 			pending: &self.pending,
+			observed: &self.observed,
 		};
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
 		tracing::debug!(
-			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} error(s)",
+			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} deferred, {} error(s)",
 			report.uploaded,
 			report.downloaded,
 			report.remote_dirs_created,
@@ -618,6 +829,7 @@ impl SyncEngine {
 			report.moved_local,
 			report.conflicts.len(),
 			report.held_deletions,
+			report.deferred_paths,
 			report.errors.len(),
 		);
 		observer(SyncEvent::PassCompleted {
@@ -652,18 +864,22 @@ struct Screened {
 	decision: guard::GuardDecision,
 	/// Identifies the held batch, when the guard held one.
 	pass_token: Option<String>,
+	/// Paths this pass deliberately left alone (see [`SyncReport::deferred_paths`]).
+	deferred_paths: usize,
 }
 
 /// Reconcile the prepared inputs and screen deletions through the guard, splitting out conflicts.
 fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened {
-	let all_actions = plan::reconcile(
+	let plan = plan::reconcile(
 		prep.record.mode,
 		&prep.baseline,
 		&prep.local_scan.nodes,
 		&prep.remote_view.nodes,
-		&prep.pending,
+		&prep.holds,
 	);
-	let (conflict_actions, executable): (Vec<_>, Vec<_>) = all_actions
+	let deferred_paths = plan.deferred_paths;
+	let (conflict_actions, executable): (Vec<_>, Vec<_>) = plan
+		.actions
 		.into_iter()
 		.partition(|a| matches!(a, SyncAction::Conflict { .. }));
 	let conflicts = conflict_actions
@@ -685,6 +901,7 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		all,
 		decision,
 		pass_token,
+		deferred_paths,
 	}
 }
 
@@ -819,8 +1036,9 @@ mod tests {
 				&baseline,
 				&local_map(hash(3)),
 				&remote_map(uuid, hash(3)),
-				&HashSet::new(),
+				&plan::PassHolds::default(),
 			)
+			.actions
 			.is_empty(),
 			"the resolved path is settled: the next pass plans nothing at all"
 		);
@@ -848,11 +1066,155 @@ mod tests {
 			&baseline,
 			&local_map(hash(3)),
 			&remote_map(uuid, hash(9)),
-			&HashSet::new(),
-		);
+			&plan::PassHolds::default(),
+		)
+		.actions;
 		assert_eq!(
 			actions.iter().map(describe).collect::<Vec<_>>(),
 			vec!["upload file \"a.txt\"".to_string()],
+		);
+	}
+	/// A remote node the snapshot holds at `path`.
+	fn node_at(path: &str, uuid: Uuid) -> HashMap<String, RemoteNode> {
+		HashMap::from([(
+			path.to_string(),
+			RemoteNode {
+				rel_path: path.to_string(),
+				kind: NodeKind::File,
+				remote_uuid: uuid,
+				content_hash: None,
+				size: 0,
+				modified_millis: 0,
+			},
+		)])
+	}
+
+	/// The everyday case the snapshot alone cannot settle: the file we uploaded is gone again —
+	/// trashed by the user, or superseded by another client's re-upload — so its uuid will NEVER
+	/// appear in a snapshot. Waiting for it to appear froze the path for the whole grace window
+	/// and every pass in between reported an all-zero no-op. The cache announcing the uuid is the
+	/// evidence that it has caught up.
+	#[test]
+	fn a_write_the_cache_has_announced_retires_even_though_the_item_is_gone() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let uuid = Uuid::new_v4();
+		pending.record_create(&observations, uuid, "a.txt", None);
+
+		observations.note([uuid]);
+		let observed = observations.snapshot();
+
+		assert!(
+			pending.settle(&observed, &HashMap::new()).is_empty(),
+			"an announced uuid retires the write even with nothing left at the path"
+		);
+	}
+
+	/// The race the pre-snapshot copy exists for: an event committed AFTER the snapshot was read
+	/// describes a state that snapshot predates. Retiring on it would let this very pass go on to
+	/// read the just-written item as a remote-side deletion.
+	#[test]
+	fn an_announcement_made_after_the_snapshot_was_read_does_not_retire_the_write() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let uuid = Uuid::new_v4();
+		pending.record_create(&observations, uuid, "a.txt", None);
+
+		// The pass copies the observations, THEN reads the snapshot; the event lands in between.
+		let observed = observations.snapshot();
+		observations.note([uuid]);
+
+		assert_eq!(
+			pending.settle(&observed, &HashMap::new()),
+			HashSet::from([uuid]),
+			"only what was known before the snapshot may retire a write against it"
+		);
+	}
+
+	/// A move's uuid was necessarily announced earlier, when the item was created. Only an
+	/// announcement made after the move itself proves the cache applied the move.
+	#[test]
+	fn an_announcement_predating_a_move_does_not_retire_it() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let uuid = Uuid::new_v4();
+
+		observations.note([uuid]);
+		pending.record_move(&observations, uuid, "a.txt");
+
+		let remote = node_at("a.txt", uuid);
+		assert_eq!(
+			pending.settle(&observations.snapshot(), &remote),
+			HashSet::from([uuid]),
+			"the snapshot still shows the pre-move path and nothing new has been announced"
+		);
+
+		observations.note([uuid]);
+		assert!(
+			pending.settle(&observations.snapshot(), &remote).is_empty(),
+			"an announcement made after the move retires it"
+		);
+	}
+
+	/// The upload replaced `old` at the path. While the snapshot still shows exactly `old`, the
+	/// cache is simply behind on us and the path stays frozen.
+	#[test]
+	fn the_replaced_uuid_still_at_the_path_keeps_the_write_pending() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+		pending.record_create(&observations, new, "a.txt", Some(old));
+
+		assert_eq!(
+			pending.settle(&observations.snapshot(), &node_at("a.txt", old)),
+			HashSet::from([new]),
+			"the pre-write occupant is what a lagging cache shows"
+		);
+	}
+
+	/// A third uuid at the path is not our write lagging: somebody else wrote there after us, and
+	/// the reconciler has to see that immediately rather than wait out the grace window.
+	#[test]
+	fn a_foreign_uuid_at_the_path_retires_the_write() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
+		pending.record_create(&observations, new, "a.txt", Some(old));
+
+		assert!(
+			pending
+				.settle(&observations.snapshot(), &node_at("a.txt", Uuid::new_v4()))
+				.is_empty(),
+			"a uuid that is neither ours nor the one we replaced is a foreign write"
+		);
+	}
+
+	/// The oldest surviving write's stamp bounds what still has to be remembered; with nothing
+	/// pending, nothing does.
+	#[test]
+	fn observations_are_pruned_to_the_oldest_live_write() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		observations.note([Uuid::new_v4(), Uuid::new_v4()]);
+
+		let uuid = Uuid::new_v4();
+		pending.record_create(&observations, uuid, "a.txt", None);
+		observations.prune_before(pending.oldest_stamp());
+		assert!(
+			observations.snapshot().is_empty(),
+			"observations older than every live write are unreachable"
+		);
+
+		observations.note([uuid]);
+		assert!(
+			pending
+				.settle(&observations.snapshot(), &HashMap::new())
+				.is_empty()
+		);
+		observations.prune_before(pending.oldest_stamp());
+		assert!(
+			observations.snapshot().is_empty(),
+			"with no pending write left there is nothing to remember at all"
 		);
 	}
 }
