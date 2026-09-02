@@ -4,7 +4,12 @@
 //! enumerate the remote subtree from the cache, build the remote view — shared by `plan_pair` (a
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+	collections::{HashMap, HashSet},
+	path::PathBuf,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -21,11 +26,85 @@ use crate::{
 	Error, ErrorKind, auth::Client, fs::dir::cache::CacheableDir, fs::file::cache::CacheableFile,
 };
 
+/// How long a remote uuid this engine just wrote stays treated as "it exists; the cache has not
+/// caught up yet". The cache learns of our own writes only through socket events and resyncs, so a
+/// fresh uuid can be missing from the very next pass's snapshot — which would read as a remote-side
+/// deletion and re-upload the file, duplicate the directory, or (two-way) quarantine what was just
+/// uploaded. The window is the ceiling on that trust: past it the snapshot is believed again, so an
+/// item genuinely deleted elsewhere is picked up late, never ignored.
+const PENDING_CREATE_GRACE: Duration = Duration::from_secs(180);
+
+/// One remote write this engine made, and how to tell whether the cache has caught up to it.
+#[derive(Debug)]
+struct PendingWrite {
+	at: Instant,
+	/// The path the item was moved OUT of, for a move; `None` for a create. It is what makes "the
+	/// cache has not applied our move yet" distinguishable from "someone else moved the item after
+	/// us" — the second must be reconciled at once, not waited out.
+	moved_from: Option<String>,
+}
+
+/// Remote writes this engine made recently. The apply layer records every item it creates or moves;
+/// [`settle`](PendingWrites::settle) drops the records the snapshot has caught up to and the ones
+/// past [`PENDING_CREATE_GRACE`], so the map only ever holds one grace window of writes.
+#[derive(Debug, Default)]
+pub(super) struct PendingWrites(std::sync::Mutex<HashMap<Uuid, PendingWrite>>);
+
+impl PendingWrites {
+	/// Record a newly created remote item. The cache is behind on it while the snapshot lacks it.
+	pub(super) fn record_create(&self, uuid: Uuid) {
+		self.record(uuid, None);
+	}
+
+	/// Record a remote item this pass moved out of `from`. The cache is behind on it while the
+	/// snapshot still shows it there (or has lost track of it, e.g. because the destination
+	/// directory is itself a create the cache has not seen, which orphans it out of the view).
+	pub(super) fn record_move(&self, uuid: Uuid, from: &str) {
+		self.record(uuid, Some(from.to_string()));
+	}
+
+	fn record(&self, uuid: Uuid, moved_from: Option<String>) {
+		self.map().insert(
+			uuid,
+			PendingWrite {
+				at: Instant::now(),
+				moved_from,
+			},
+		);
+	}
+
+	/// Drop the records the snapshot has caught up to and the ones past [`PENDING_CREATE_GRACE`],
+	/// and return the uuids that remain — the ones the snapshot demonstrably still shows in their
+	/// pre-write state.
+	fn settle(&self, snapshot_path: &HashMap<Uuid, &str>) -> HashSet<Uuid> {
+		let now = Instant::now();
+		let mut map = self.map();
+		map.retain(|uuid, write| {
+			let seen = snapshot_path.get(uuid);
+			let behind = match &write.moved_from {
+				None => seen.is_none(),
+				Some(from) => seen.is_none_or(|path| *path == from.as_str()),
+			};
+			behind && now.duration_since(write.at) < PENDING_CREATE_GRACE
+		});
+		map.keys().copied().collect()
+	}
+
+	fn map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, PendingWrite>> {
+		// Plain data behind the lock: a panic while holding it cannot leave the map inconsistent.
+		self.0
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+	}
+}
+
 /// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus the
 /// per-pair baseline store.
 pub struct SyncEngine {
 	pub(super) client: Arc<Client>,
 	pub(super) store: Mutex<BaselineStore>,
+	/// Remote writes this engine made that the cache may not reflect yet (see [`PendingWrites`]).
+	pub(super) pending: PendingWrites,
 }
 
 /// Why the engine refused to act on a pass.
@@ -47,6 +126,9 @@ struct Prepared {
 	/// watermark). When false, the snapshot's emptiness is untrustworthy and remote-driven
 	/// deletions are held by the guard.
 	remote_converged: bool,
+	/// Remote uuids this engine wrote that the snapshot has not caught up to (see
+	/// [`PendingWrites`]); the reconciler leaves their paths alone.
+	pending: HashSet<Uuid>,
 	dirs: Vec<CacheableDir<'static>>,
 	files: Vec<CacheableFile<'static>>,
 }
@@ -79,6 +161,7 @@ impl SyncEngine {
 		Ok(Self {
 			client,
 			store: Mutex::new(store),
+			pending: PendingWrites::default(),
 		})
 	}
 
@@ -155,12 +238,20 @@ impl SyncEngine {
 		let remote_view =
 			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
 
+		let snapshot_path: HashMap<Uuid, &str> = remote_view
+			.nodes
+			.iter()
+			.map(|(path, node)| (node.remote_uuid, path.as_str()))
+			.collect();
+		let pending = self.pending.settle(&snapshot_path);
+
 		Ok(Prepared {
 			record,
 			baseline,
 			local_scan,
 			remote_view,
 			remote_converged: snapshot.watermark.is_some(),
+			pending,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
 		})
@@ -277,6 +368,7 @@ impl SyncEngine {
 			absence_trusted: state.absence_trusted(),
 			dirs: &prep.dirs,
 			files: &prep.files,
+			pending: &self.pending,
 		};
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
 		tracing::debug!(
@@ -326,6 +418,7 @@ fn reconcile_and_screen(
 		&prep.baseline,
 		&prep.local_scan.nodes,
 		&prep.remote_view.nodes,
+		&prep.pending,
 	);
 	let (conflict_actions, executable): (Vec<_>, Vec<_>) = all_actions
 		.into_iter()
