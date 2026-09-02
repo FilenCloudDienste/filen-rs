@@ -551,8 +551,17 @@ async fn apply_one(
 			.await?;
 			report.moved_local += 1;
 		}
-		SyncAction::Conflict { .. } => {
-			// Conflicts are reported by the engine, never applied here.
+		SyncAction::Conflict { rel_path } => {
+			// The engine screens conflicts out of the applied plan and records them itself; this
+			// arm keeps `apply_one` total and correct if one is ever routed through here.
+			record_conflict(
+				ctx.store,
+				ctx.pair,
+				rel_path,
+				ctx.local.get(rel_path),
+				ctx.remote.get(rel_path),
+			)
+			.await?;
 		}
 		SyncAction::AdoptBaseline { rel_path } => {
 			// Record the converged state into the baseline with no transfer, so a later one-sided
@@ -659,6 +668,10 @@ fn adopt_outcome(
 				NodeKind::File => Some(remote.modified_millis),
 			},
 			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
 		}),
 		// A convergent delete drops the row — but only when the pass can trust that both sides are
 		// really gone. Under an incomplete scan or an un-converged/empty remote view the row is the
@@ -669,6 +682,43 @@ fn adopt_outcome(
 		_ if absence_trusted => AdoptOutcome::DropRow,
 		_ => AdoptOutcome::Keep,
 	}
+}
+
+/// Record a two-way conflict in the baseline: the path is HELD (excluded from planning, along with
+/// its subtree) until [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) picks a
+/// winner. The row keeps both sides' evidence as of this pass — the local kind/hash/size/mtime the
+/// scan saw and the remote kind/uuid/hash/size — so the resolution can re-anchor the row to the
+/// winner and leave the loser reading as stale on the next pass.
+pub(super) async fn record_conflict(
+	store: &Mutex<BaselineStore>,
+	pair: PairId,
+	rel_path: &str,
+	local: Option<&LocalNode>,
+	remote: Option<&RemoteNode>,
+) -> Result<(), crate::Error> {
+	let entry = BaselineEntry {
+		rel_path: rel_path.to_string(),
+		// `kind` is NOT NULL; the per-side kinds below are what resolution reads.
+		kind: local
+			.map(|l| l.kind)
+			.or_else(|| remote.map(|r| r.kind))
+			.unwrap_or(NodeKind::File),
+		remote_uuid: remote.map(|r| r.remote_uuid),
+		content_hash: local.and_then(|l| l.content_hash),
+		size: local.map(|l| l.size),
+		local_mtime: local.map(|l| l.mtime_millis),
+		remote_modified: remote.map(|r| r.modified_millis),
+		state: BaselineState::Conflicted,
+		local_kind: local.map(|l| l.kind),
+		remote_kind: remote.map(|r| r.kind),
+		remote_hash: remote.and_then(|r| r.content_hash),
+		remote_size: remote.map(|r| r.size),
+	};
+	store
+		.lock()
+		.await
+		.upsert_entry(pair, &entry)
+		.map_err(db_err)
 }
 
 fn local_mtime_of(path: &Path) -> Option<i64> {
@@ -693,6 +743,10 @@ async fn upsert_dir_baseline(
 		local_mtime,
 		remote_modified: None,
 		state: BaselineState::Synced,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
 	};
 	upsert_baseline(ctx, &entry).await
 }
@@ -716,6 +770,10 @@ async fn upsert_file_baseline(
 		local_mtime,
 		remote_modified,
 		state: BaselineState::Synced,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
 	};
 	upsert_baseline(ctx, &entry).await
 }
@@ -949,6 +1007,10 @@ mod tests {
 			local_mtime: Some(10),
 			remote_modified: Some(10),
 			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
 		}
 	}
 
