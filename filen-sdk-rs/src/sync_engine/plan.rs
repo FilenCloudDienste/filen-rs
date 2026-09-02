@@ -799,10 +799,54 @@ fn stale_pending_paths<'a>(
 /// Whether `key` is one of `stale` or lives under one. A directory the cache has not caught up to
 /// is invisible, and so is everything the snapshot would otherwise resolve beneath it.
 fn is_under_stale_path(key: &str, stale: &HashSet<&str>) -> bool {
-	stale.contains(key)
-		|| stale
+	stale.contains(key) || stale.iter().any(|p| is_under(key, p))
+}
+
+/// Whether `path` is a STRICT descendant of `prefix` (`prefix/...`).
+fn is_under(path: &str, prefix: &str) -> bool {
+	path.len() > prefix.len()
+		&& path.as_bytes()[prefix.len()] == b'/'
+		&& path.as_bytes()[..prefix.len()] == *prefix.as_bytes()
+}
+
+/// Drop every action that falls under a path this pass reports as a conflict — freshly surfaced or
+/// still held from an earlier pass. The conflicting path itself cannot be materialized until the
+/// caller resolves it, so an action on its subtree would fail (e.g. an upload into a remote dir
+/// that cannot be created while the conflicting file holds the name). The conflicts themselves are
+/// kept.
+fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
+	let conflicted: Vec<String> = actions
+		.iter()
+		.filter_map(|a| match a {
+			SyncAction::Conflict { rel_path } => Some(rel_path.clone()),
+			_ => None,
+		})
+		.collect();
+	if conflicted.is_empty() {
+		return;
+	}
+	actions.retain(|action| {
+		if matches!(action, SyncAction::Conflict { .. }) {
+			return true;
+		}
+		let (from, to) = match action {
+			SyncAction::MoveRemote {
+				from_path, to_path, ..
+			}
+			| SyncAction::MoveLocal { from_path, to_path } => (from_path.as_str(), to_path.as_str()),
+			other => (other.rel_path(), other.rel_path()),
+		};
+		let held = conflicted
 			.iter()
-			.any(|p| key.len() > p.len() && key.starts_with(p) && key.as_bytes()[p.len()] == b'/')
+			.any(|c| is_under(from, c) || is_under(to, c));
+		if held {
+			tracing::debug!(
+				"plan: dropping {} — it sits under a path held in conflict this pass",
+				action.describe()
+			);
+		}
+		!held
+	});
 }
 
 /// Reconcile a pair's three inputs into an ordered action plan. `baseline`/`local`/`remote` are all
@@ -864,8 +908,13 @@ pub(crate) fn reconcile(
 			continue;
 		}
 		let base = baseline.get(key);
-		// A surfaced conflict is held until the caller resolves it — never re-acted on.
+		// A held conflict is never acted on until the caller resolves it — but it IS re-reported
+		// every pass, so a caller watching the reports keeps seeing what is outstanding. Its
+		// subtree is suppressed below, along with any conflict surfaced by this pass.
 		if base.is_some_and(|b| b.state == BaselineState::Conflicted) {
+			actions.push(SyncAction::Conflict {
+				rel_path: key.to_string(),
+			});
 			continue;
 		}
 		let local_node = local.get(key);
@@ -890,6 +939,7 @@ pub(crate) fn reconcile(
 		}
 	}
 
+	suppress_conflicted_subtrees(&mut actions);
 	order_actions(&mut actions);
 	tracing::debug!("reconcile: planned {} action(s)", actions.len());
 	actions
@@ -1672,16 +1722,98 @@ mod tests {
 	}
 
 	#[test]
-	fn conflicted_baseline_rows_are_skipped() {
+	fn conflicted_baseline_rows_are_re_reported_but_never_acted_on() {
 		let uuid = Uuid::new_v4();
 		let mut entry = base_file("a.txt", uuid, [0; 32]);
 		entry.state = BaselineState::Conflicted;
 		let baseline = map(vec![("a.txt", entry)]);
 		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [0; 32]))]);
-		assert!(
-			plan(SyncMode::TwoWay, &baseline, &local, &remote).is_empty(),
-			"a conflicted path is held, not re-acted on"
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::Conflict {
+				rel_path: "a.txt".to_string()
+			}],
+			"a held conflict is re-reported, never re-acted on"
+		);
+	}
+
+	#[test]
+	fn a_conflicted_baseline_row_holds_its_whole_subtree() {
+		// `thing` is held in conflict as a FILE; locally it is now a directory with a child. The
+		// child must not be planned — the remote dir `thing` cannot exist while the held file does,
+		// so the upload would fail with a missing remote parent.
+		let uuid = Uuid::new_v4();
+		let mut held = base_file("thing", uuid, [0; 32]);
+		held.state = BaselineState::Conflicted;
+		let baseline = map(vec![("thing", held)]);
+		let local = map(vec![
+			("thing", local_dir("thing")),
+			("thing/child.txt", local_file("thing/child.txt", [1; 32])),
+		]);
+		let remote = map(vec![("thing", remote_file("thing", uuid, [0; 32]))]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::Conflict {
+				rel_path: "thing".to_string()
+			}],
+			"nothing under a held conflict may be planned"
+		);
+	}
+
+	#[test]
+	fn a_conflict_surfaced_this_pass_suppresses_its_descendants() {
+		// Same shape, but with NO persisted Conflicted row yet: the conflict on `thing` is surfaced
+		// by THIS pass, so its descendants must already be suppressed (they would otherwise error
+		// in apply before the row is ever written).
+		let uuid = Uuid::new_v4();
+		let baseline = map(vec![("thing", base_file("thing", uuid, [0; 32]))]);
+		let local = map(vec![
+			("thing", local_dir("thing")),
+			("thing/child.txt", local_file("thing/child.txt", [1; 32])),
+		]);
+		// Remote edited `thing` (new uuid) while local flipped it to a dir -> both sides changed.
+		let remote = map(vec![(
+			"thing",
+			remote_file("thing", Uuid::new_v4(), [2; 32]),
+		)]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::Conflict {
+				rel_path: "thing".to_string()
+			}],
+			"the conflict is reported, its subtree is not acted on"
+		);
+	}
+
+	#[test]
+	fn a_conflict_does_not_suppress_an_unrelated_sibling_prefix() {
+		// `thing` is held; `thing2/x.txt` merely shares a name PREFIX and must still be planned.
+		let uuid = Uuid::new_v4();
+		let mut held = base_file("thing", uuid, [0; 32]);
+		held.state = BaselineState::Conflicted;
+		let baseline = map(vec![("thing", held)]);
+		let local = map(vec![
+			("thing", local_file("thing", [1; 32])),
+			("thing2", local_dir("thing2")),
+			("thing2/x.txt", local_file("thing2/x.txt", [3; 32])),
+		]);
+		let remote = map(vec![("thing", remote_file("thing", uuid, [0; 32]))]);
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert_eq!(
+			actions,
+			vec![
+				SyncAction::CreateRemoteDir {
+					rel_path: "thing2".to_string()
+				},
+				SyncAction::UploadFile {
+					rel_path: "thing2/x.txt".to_string()
+				},
+				SyncAction::Conflict {
+					rel_path: "thing".to_string()
+				},
+			],
+			"only the held path is withheld; a mere name-prefix sibling still syncs"
 		);
 	}
 
