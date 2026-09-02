@@ -793,11 +793,6 @@ async fn basic_16_interrupted_pass_resumes() {
 // BASIC-17 — idempotency after a real change: pass N applies, N+1 is no-op
 // ============================================================================
 
-#[ignore = "blocked: create-idempotency under cache lag (deferred review finding #8). After the \
-engine uploads a file it advances its baseline, but the next pass rebuilds the remote snapshot from \
-the cache, which may not yet reflect the just-created item — so in a pushes()+propagates_deletes() \
-mode the file reads as a remote-side deletion and is re-uploaded. Needs the snapshot to fold in \
-just-applied creates (or wait for the cache to catch up) before the next pass. TODO"]
 #[shared_test_runtime]
 async fn basic_17_idempotent_after_real_change_push() {
 	let sc = single_client(SyncMode::LocalToRemote).await;

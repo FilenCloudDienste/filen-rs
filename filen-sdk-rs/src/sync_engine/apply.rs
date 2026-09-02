@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
+	engine::PendingWrites,
 	events::SyncEvent,
 	plan::{RemoteNode, SyncAction, create_target_paths},
 	scan::{LocalNode, QUARANTINE_DIR},
@@ -75,6 +76,9 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) absence_trusted: bool,
 	pub(super) dirs: &'a [CacheableDir<'static>],
 	pub(super) files: &'a [CacheableFile<'static>],
+	/// Where each remote uuid this pass writes is recorded, so the NEXT pass does not mistake a
+	/// cache that has not caught up for a remote-side deletion.
+	pub(super) pending: &'a PendingWrites,
 }
 
 fn local_path(root: &Path, rel_path: &str) -> PathBuf {
@@ -363,6 +367,7 @@ async fn apply_transfer(
 				.await?;
 			let local = ctx.local.get(rel_path);
 			let new_uuid: Uuid = uploaded.uuid();
+			ctx.pending.record_create(new_uuid);
 			upsert_file_baseline(
 				ctx,
 				rel_path,
@@ -422,6 +427,7 @@ async fn apply_one(
 				.create_dir_with_created(&parent_type, name, created)
 				.await?;
 			let new_uuid: Uuid = new_dir.uuid();
+			ctx.pending.record_create(new_uuid);
 			dir_by_path.insert(rel_path.clone(), new_dir);
 			upsert_dir_baseline(ctx, rel_path, Some(new_uuid), None).await?;
 			report.remote_dirs_created += 1;
@@ -482,6 +488,7 @@ async fn apply_one(
 					.await?;
 			}
 			let local = ctx.local.get(to_path);
+			ctx.pending.record_move(*remote_uuid, from_path);
 			delete_baseline(ctx, from_path).await?;
 			upsert_file_baseline(
 				ctx,
