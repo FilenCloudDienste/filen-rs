@@ -322,6 +322,24 @@ async fn conflict_03_local_modify_vs_remote_delete_preserves_local_edit() {
 		.expect("the baseline never reached the remote")
 		.uuid();
 
+	// Let A observe its OWN upload before anything diverges: a remote write this engine made is
+	// held over the cache snapshot until the cache accounts for it, and its path is skipped
+	// meanwhile. B's delete below leaves nothing at that path to account for it with, so the hold
+	// would stand for its whole grace window and swallow the divergence staged after it. One settle
+	// pass retires it — SCALE-D stages its mass divergence the same way.
+	assert!(
+		poll_for_item(tc.cache_a.db_path(), baseline_uuid, CACHE_CONVERGE_TIMEOUT).await,
+		"A's cache never observed its own upload"
+	);
+	let _ = sync_round(
+		&tc.engine_a,
+		tc.pair_a,
+		&tc.engine_b,
+		tc.pair_b,
+		Order::AFirst,
+	)
+	.await;
+
 	// A modifies; B deletes locally (mirrors to remote as a trash).
 	write_file(&tc.local_a, "report.doc", b"V2");
 	std::fs::remove_file(tc.local_b.join("report.doc")).unwrap();
@@ -404,6 +422,23 @@ async fn conflict_04_remote_modify_vs_local_delete_preserves_remote_edit() {
 	let baseline_uuid = find_file(&rfiles, "budget.csv")
 		.expect("the baseline never reached the remote")
 		.uuid();
+
+	// Let A observe its OWN upload before anything diverges, as CONFLICT-03 must: a remote write
+	// this engine made is held over the cache snapshot until the cache accounts for it. Here B's
+	// re-upload leaves a foreign uuid at the path, which accounts for it on its own — the settle
+	// pass makes the precondition explicit rather than incidental.
+	assert!(
+		poll_for_item(tc.cache_a.db_path(), baseline_uuid, CACHE_CONVERGE_TIMEOUT).await,
+		"A's cache never observed its own upload"
+	);
+	let _ = sync_round(
+		&tc.engine_a,
+		tc.pair_a,
+		&tc.engine_b,
+		tc.pair_b,
+		Order::AFirst,
+	)
+	.await;
 
 	// B modifies (becomes the "remote" edit once pushed); A deletes locally.
 	write_file(&tc.local_b, "budget.csv", b"V2");
@@ -1867,6 +1902,24 @@ async fn remote_file_uuid(sc: &SingleClient, name: &str) -> Option<Uuid> {
 		.map(|f| f.uuid())
 }
 
+/// The CURRENT remote version of file `name` directly under a test resources root (ground truth).
+async fn remote_file_in(resources: &test_utils::TestResources, name: &str) -> Option<RemoteFile> {
+	let (_d, files) = resources
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap();
+	files.into_iter().find(|f| f.name() == Some(name))
+}
+
+/// The current `size` of remote file `name` directly under a test resources root (ground truth).
+async fn remote_file_size_in(resources: &test_utils::TestResources, name: &str) -> Option<u64> {
+	remote_file_in(resources, name).await.map(|f| f.size)
+}
+
 /// The current `size` of remote file `name` under the SingleClient's root (ground truth via a
 /// fresh listing). Returns None if absent. We assert on size — not raw bytes — because the public
 /// native download path is not exposed as a simple `Client` method here; pick distinct-length
@@ -2194,14 +2247,131 @@ async fn conflict_add_resolved_copy_round_trips() {
 	sc.cleanup();
 }
 
-#[ignore = "blocked: needs control over the engine's persisted baseline DB path to simulate a true \
-process restart against the SAME baseline store. The harness builds engines with a private random \
-temp_cache_path() and exposes no accessor/reuse path, so re-opening the engine with the same baseline \
-(the whole point of the test) is impossible black-box. TODO: harness hook to reopen an engine on the \
-same baseline DB path."]
+/// CONFLICT-18 — a held conflict lives in the PERSISTED baseline, not in engine memory: a fresh
+/// engine opened on the same baseline DB (the process-restart analogue) still reports it, still
+/// moves nothing and duplicates nothing, and resolving it there propagates normally.
 #[shared_test_runtime]
 async fn conflict_18_conflict_persists_across_restart() {
-	// plan: reach a conflict on persist.txt; drop the engine; reopen on the SAME baseline DB +
-	// re-add the same pair; sync; assert the conflict is still reported, both versions intact, no
-	// silent auto-resolution, no duplicate copies.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, remote).await;
+	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	let local = fresh_local_dir("c18");
+	// A STABLE baseline path (unlike the harness's private random one) is what makes the restart
+	// real: the second engine must load exactly the store the first one wrote.
+	let db_path = temp_cache_path();
+
+	let engine1 = SyncEngine::open(cache.client.clone(), db_path.clone())
+		.await
+		.unwrap();
+	let pair1 = engine1
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	// Converge a baseline, then diverge both sides (distinct lengths name the winner).
+	write_file(&local, "persist.txt", b"BASE");
+	let r1 = engine1.sync_once(pair1).await.unwrap();
+	assert_eq!(r1.uploaded, 1, "{r1:?}");
+	// Let the cache announce the engine's own upload before the sideband edit replaces its uuid —
+	// the staging CONFLICT-03/04 use. The foreign uuid that edit leaves at the path would retire
+	// the held write on its own here; the settle pass makes the precondition explicit.
+	let base_uuid = remote_file_in(&resources, "persist.txt")
+		.await
+		.expect("the baseline never reached the remote")
+		.uuid();
+	assert!(
+		poll_for_item(cache.db_path(), base_uuid, CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never observed the engine's own upload"
+	);
+	let settle = engine1.sync_once(pair1).await.unwrap();
+	assert!(settle.errors.is_empty(), "{settle:?}");
+
+	write_file(&local, "persist.txt", b"LLLLLLLLLL");
+	let builder = resources
+		.client
+		.make_file_builder("persist.txt", remote)
+		.unwrap();
+	let remote_version = resources.client.upload_file(builder, b"RRR").await.unwrap();
+	assert!(
+		poll_for_item(
+			cache.db_path(),
+			remote_version.uuid(),
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await,
+		"the cache never observed the remote edit"
+	);
+
+	let r2 = engine1.sync_once(pair1).await.unwrap();
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert!(
+		r2.conflicts.iter().any(|c| c == "persist.txt"),
+		"divergence must surface: {r2:?}"
+	);
+	assert_eq!(
+		r2.uploaded + r2.downloaded,
+		0,
+		"a held conflict moves nothing: {r2:?}"
+	);
+	drop(engine1);
+
+	// Restart: a brand-new engine on the SAME baseline DB, same pair.
+	let engine2 = SyncEngine::open(cache.client.clone(), db_path)
+		.await
+		.unwrap();
+	let pair2 = engine2
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	assert_eq!(pair2, pair1, "re-registering the pair must reuse its id");
+
+	let r3 = engine2.sync_once(pair2).await.unwrap();
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert!(
+		r3.conflicts.iter().any(|c| c == "persist.txt"),
+		"the held conflict must survive the restart: {r3:?}"
+	);
+	assert_eq!(
+		r3.uploaded + r3.downloaded,
+		0,
+		"the restarted engine must not silently auto-resolve: {r3:?}"
+	);
+	assert!(
+		read_eq(&local, "persist.txt", b"LLLLLLLLLL"),
+		"the local version was clobbered across the restart"
+	);
+	assert_eq!(
+		remote_file_size_in(&resources, "persist.txt").await,
+		Some(3),
+		"the remote version was clobbered across the restart"
+	);
+	assert_eq!(
+		total_files(&local),
+		1,
+		"the restart duplicated copies: {:?}",
+		walk_tree(&local).keys().collect::<Vec<_>>()
+	);
+
+	// Resolving on the RESTARTED engine propagates exactly as it does before a restart.
+	engine2
+		.resolve_conflict(pair2, "persist.txt", ConflictResolution::KeepLocal)
+		.await
+		.expect("resolve keep-local after the restart");
+	let r4 = engine2.sync_once(pair2).await.unwrap();
+	assert!(r4.errors.is_empty(), "{r4:?}");
+	assert!(r4.conflicts.is_empty(), "conflict not cleared: {r4:?}");
+	assert_eq!(
+		r4.uploaded, 1,
+		"keep-local must push the local copy: {r4:?}"
+	);
+	assert_eq!(r4.downloaded, 0, "keep-local must not pull: {r4:?}");
+	assert!(read_eq(&local, "persist.txt", b"LLLLLLLLLL"));
+	assert_eq!(
+		remote_file_size_in(&resources, "persist.txt").await,
+		Some(10),
+		"the remote must hold the local-wins content"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
 }
