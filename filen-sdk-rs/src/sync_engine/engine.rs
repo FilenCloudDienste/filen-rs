@@ -5,7 +5,7 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::HashMap,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -62,6 +62,10 @@ enum PendingKind {
 	/// distinguishable from "someone else moved the item after us", which must be reconciled at
 	/// once rather than waited out.
 	Moved { from: String },
+	/// An item this engine sent to the remote trash. Its baseline row is gone, so a snapshot that
+	/// has not applied the trash yet reads as "present remotely, untracked, absent locally" — a
+	/// deletion to make, which would trash it a second time.
+	Trashed,
 }
 
 /// Uuids the cache has announced to this engine, each stamped with the observation counter at the
@@ -183,6 +187,11 @@ impl PendingWrites {
 		);
 	}
 
+	/// Record a remote item this pass sent to the trash.
+	pub(super) fn record_trash(&self, observations: &Observations, uuid: Uuid) {
+		self.record(observations, uuid, PendingKind::Trashed);
+	}
+
 	/// Record a remote item this pass moved out of `from`.
 	pub(super) fn record_move(&self, observations: &Observations, uuid: Uuid, from: &str) {
 		self.record(
@@ -212,7 +221,7 @@ impl PendingWrites {
 
 	/// Drop the records the cache has caught up to and the ones past [`PENDING_CREATE_GRACE`], and
 	/// return the uuids that remain — the ones the snapshot demonstrably still shows in their
-	/// pre-write state.
+	/// pre-write state — split by what the reconciler has to do about each.
 	///
 	/// `observed` must have been copied BEFORE `remote` was read, so a cache batch committed after
 	/// the snapshot cannot retire a record whose item that snapshot still predates.
@@ -220,7 +229,7 @@ impl PendingWrites {
 		&self,
 		observed: &HashMap<Uuid, u64>,
 		remote: &HashMap<String, RemoteNode>,
-	) -> HashSet<Uuid> {
+	) -> plan::PassHolds {
 		let now = Instant::now();
 		let snapshot_path: HashMap<Uuid, &str> = remote
 			.iter()
@@ -251,9 +260,20 @@ impl PendingWrites {
 				PendingKind::Moved { from } => snapshot_path
 					.get(uuid)
 					.is_none_or(|path| *path == from.as_str()),
+				PendingKind::Trashed => snapshot_path.contains_key(uuid),
 			}
 		});
-		map.keys().copied().collect()
+		let (trashed, pending) = map
+			.iter()
+			.map(|(uuid, write)| (*uuid, matches!(write.kind, PendingKind::Trashed)))
+			.partition::<Vec<_>, _>(|(_, is_trash)| *is_trash);
+		let uuids =
+			|records: Vec<(Uuid, bool)>| records.into_iter().map(|(uuid, _)| uuid).collect();
+		plan::PassHolds {
+			pending: uuids(pending),
+			trashed: uuids(trashed),
+			..Default::default()
+		}
 	}
 
 	fn map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, PendingWrite>> {
@@ -596,10 +616,8 @@ impl SyncEngine {
 		let remote_view =
 			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
 
-		let holds = plan::PassHolds {
-			pending: self.pending.settle(&observed, &remote_view.nodes),
-			held_remote: remote_view.held_paths.clone(),
-		};
+		let mut holds = self.pending.settle(&observed, &remote_view.nodes);
+		holds.held_remote = remote_view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
 		Ok(Prepared {
@@ -952,6 +970,8 @@ fn db_error(error: rusqlite::Error, context: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashSet;
+
 	use filen_types::crypto::Blake3Hash;
 
 	use super::*;
@@ -1106,7 +1126,10 @@ mod tests {
 		let observed = observations.snapshot();
 
 		assert!(
-			pending.settle(&observed, &HashMap::new()).is_empty(),
+			pending
+				.settle(&observed, &HashMap::new())
+				.pending
+				.is_empty(),
 			"an announced uuid retires the write even with nothing left at the path"
 		);
 	}
@@ -1126,7 +1149,7 @@ mod tests {
 		observations.note([uuid]);
 
 		assert_eq!(
-			pending.settle(&observed, &HashMap::new()),
+			pending.settle(&observed, &HashMap::new()).pending,
 			HashSet::from([uuid]),
 			"only what was known before the snapshot may retire a write against it"
 		);
@@ -1145,14 +1168,17 @@ mod tests {
 
 		let remote = node_at("a.txt", uuid);
 		assert_eq!(
-			pending.settle(&observations.snapshot(), &remote),
+			pending.settle(&observations.snapshot(), &remote).pending,
 			HashSet::from([uuid]),
 			"the snapshot still shows the pre-move path and nothing new has been announced"
 		);
 
 		observations.note([uuid]);
 		assert!(
-			pending.settle(&observations.snapshot(), &remote).is_empty(),
+			pending
+				.settle(&observations.snapshot(), &remote)
+				.pending
+				.is_empty(),
 			"an announcement made after the move retires it"
 		);
 	}
@@ -1167,7 +1193,9 @@ mod tests {
 		pending.record_create(&observations, new, "a.txt", Some(old));
 
 		assert_eq!(
-			pending.settle(&observations.snapshot(), &node_at("a.txt", old)),
+			pending
+				.settle(&observations.snapshot(), &node_at("a.txt", old))
+				.pending,
 			HashSet::from([new]),
 			"the pre-write occupant is what a lagging cache shows"
 		);
@@ -1185,6 +1213,7 @@ mod tests {
 		assert!(
 			pending
 				.settle(&observations.snapshot(), &node_at("a.txt", Uuid::new_v4()))
+				.pending
 				.is_empty(),
 			"a uuid that is neither ours nor the one we replaced is a foreign write"
 		);
@@ -1210,6 +1239,7 @@ mod tests {
 		assert!(
 			pending
 				.settle(&observations.snapshot(), &HashMap::new())
+				.pending
 				.is_empty()
 		);
 		observations.prune_before(pending.oldest_stamp());

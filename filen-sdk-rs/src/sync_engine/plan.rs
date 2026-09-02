@@ -891,6 +891,11 @@ pub(crate) struct PassHolds {
 	/// read as a remote-side deletion, and a just-moved one is not moved back. The engine decides
 	/// which uuids qualify (see `PendingWrites`).
 	pub(crate) pending: HashSet<Uuid>,
+	/// Remote uuids this engine already sent to the trash, whose removal the cache has not applied
+	/// yet. Only the DELETION of those uuids is suppressed, not their paths: a
+	/// delete-then-recreate uploads a new file at the very path that was just trashed, and
+	/// freezing it would stall that.
+	pub(crate) trashed: HashSet<Uuid>,
 	/// Remote paths the cache is showing mid-transition (see [`RemoteView::held_paths`]).
 	pub(crate) held_remote: HashSet<String>,
 }
@@ -994,6 +999,27 @@ pub(crate) fn reconcile(
 				reconcile_two_way(key, local_node, remote_node, base, &mut actions)
 			}
 		}
+	}
+
+	if !holds.trashed.is_empty() {
+		actions.retain(|action| {
+			let SyncAction::TrashRemote {
+				rel_path,
+				remote_uuid,
+				..
+			} = action
+			else {
+				return true;
+			};
+			if !holds.trashed.contains(remote_uuid) {
+				return true;
+			}
+			tracing::debug!(
+				"reconcile: skipping the remote deletion of {rel_path:?} — this engine already trashed it and the cache has not caught up"
+			);
+			deferred_paths += 1;
+			false
+		});
 	}
 
 	suppress_conflicted_subtrees(&mut actions);
@@ -1607,6 +1633,69 @@ mod tests {
 				rel_path: "a.txt".to_string(),
 			}],
 			"past the grace window the old behaviour returns"
+		);
+	}
+
+	/// Trashing an item drops its baseline row, so a snapshot that has not applied the trash yet
+	/// reads it as an untracked remote file with nothing local — a deletion to make all over
+	/// again. Only the deletion of that uuid is suppressed.
+	#[test]
+	fn a_remote_deletion_this_engine_already_made_is_not_repeated() {
+		let uuid = Uuid::new_v4();
+		let remote = map(vec![("note.txt", remote_file("note.txt", uuid, [5; 32]))]);
+		let (baseline, local) = (HashMap::new(), HashMap::new());
+
+		assert_eq!(
+			plan(SyncMode::LocalToRemote, &baseline, &local, &remote),
+			vec![SyncAction::TrashRemote {
+				rel_path: "note.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: uuid,
+			}],
+			"without the hold this is exactly the duplicate trash"
+		);
+		assert!(
+			reconcile(
+				SyncMode::LocalToRemote,
+				&baseline,
+				&local,
+				&remote,
+				&PassHolds {
+					trashed: HashSet::from([uuid]),
+					..Default::default()
+				},
+			)
+			.actions
+			.is_empty(),
+			"a trash this engine already applied must not be applied again"
+		);
+	}
+
+	/// The ACTION is suppressed, not the path: a delete-then-recreate uploads a new file at the
+	/// very path that was just trashed, and freezing the path would stall that upload.
+	#[test]
+	fn a_pending_trash_does_not_freeze_its_path_against_a_new_file() {
+		let uuid = Uuid::new_v4();
+		// The cache still lists the trashed file; a fresh local file now holds the same name.
+		let remote = map(vec![("note.txt", remote_file("note.txt", uuid, [5; 32]))]);
+		let local = map(vec![("note.txt", local_file("note.txt", [9; 32]))]);
+
+		assert_eq!(
+			reconcile(
+				SyncMode::LocalToRemote,
+				&HashMap::new(),
+				&local,
+				&remote,
+				&PassHolds {
+					trashed: HashSet::from([uuid]),
+					..Default::default()
+				},
+			)
+			.actions,
+			vec![SyncAction::UploadFile {
+				rel_path: "note.txt".to_string(),
+			}],
+			"the re-created file still uploads"
 		);
 	}
 
