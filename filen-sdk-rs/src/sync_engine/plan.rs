@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	events::SyncEvent,
-	scan::{LocalNode, QUARANTINE_DIR},
+	scan::{LocalNode, QUARANTINE_DIR, collision_key},
 };
 use crate::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
 
@@ -233,10 +233,6 @@ fn resolve_path(
 	}
 	parts.reverse();
 	Some(parts.join("/"))
-}
-
-fn collision_key(rel_path: &str) -> String {
-	rel_path.chars().flat_map(char::to_lowercase).collect()
 }
 
 /// The remote view of a sync root's subtree, plus whether it is safe to reconcile against.
