@@ -793,46 +793,14 @@ fn detect_moves(
 	}
 }
 
-/// The paths this pass must not act on, given the uuids whose place in the snapshot the engine
-/// knows to be stale (`pending`): the baseline path the uuid is recorded at, and — for a move the
-/// cache has not applied yet — the path the snapshot still shows it at. Acting on either would
-/// re-transfer, duplicate, or delete the engine's own write.
-fn stale_pending_paths<'a>(
-	baseline: &'a HashMap<String, BaselineEntry>,
-	remote: &'a HashMap<String, RemoteNode>,
-	pending: &HashSet<Uuid>,
-) -> HashSet<&'a str> {
-	let mut stale = HashSet::new();
-	if pending.is_empty() {
-		return stale;
-	}
-	let snapshot_path: HashMap<Uuid, &str> = remote
-		.iter()
-		.map(|(path, node)| (node.remote_uuid, path.as_str()))
-		.collect();
-	for (path, entry) in baseline {
-		let Some(uuid) = entry.remote_uuid else {
-			continue;
-		};
-		if !pending.contains(&uuid) {
-			continue;
-		}
-		stale.insert(path.as_str());
-		if let Some(seen) = snapshot_path.get(&uuid) {
-			stale.insert(seen);
-		}
-	}
-	stale
-}
-
-/// Whether `key` is one of `stale` or lives under one. A directory the cache has not caught up to
-/// is invisible, and so is everything the snapshot would otherwise resolve beneath it.
-fn is_under_stale_path(key: &str, stale: &HashSet<&str>) -> bool {
-	stale.contains(key) || stale.iter().any(|p| is_under(key, p))
+/// Whether `key` is one of `held` or lives under one. A path the view cannot resolve makes
+/// everything the snapshot would otherwise resolve beneath it unresolvable too.
+fn is_under_held_path(key: &str, held: &HashSet<String>) -> bool {
+	held.contains(key) || held.iter().any(|p| is_under(key, p))
 }
 
 /// Whether `path` is a STRICT descendant of `prefix` (`prefix/...`).
-fn is_under(path: &str, prefix: &str) -> bool {
+pub(super) fn is_under(path: &str, prefix: &str) -> bool {
 	path.len() > prefix.len()
 		&& path.as_bytes()[prefix.len()] == b'/'
 		&& path.as_bytes()[..prefix.len()] == *prefix.as_bytes()
@@ -881,12 +849,6 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// What a pass must NOT act on, beyond what the three inputs themselves say.
 #[derive(Debug, Default)]
 pub(crate) struct PassHolds {
-	/// Remote uuids this engine wrote so recently that the cache — which learns of our own writes
-	/// only through socket events and resyncs — demonstrably still shows the pre-write state.
-	/// Their paths are left completely alone, so a just-uploaded file is neither re-uploaded nor
-	/// read as a remote-side deletion, and a just-moved one is not moved back. The engine decides
-	/// which uuids qualify (see `PendingWrites`).
-	pub(crate) pending: HashSet<Uuid>,
 	/// Remote uuids this engine already sent to the trash, whose removal the cache has not applied
 	/// yet. Only the DELETION of those uuids is suppressed, not their paths: a
 	/// delete-then-recreate uploads a new file at the very path that was just trashed, and
@@ -899,9 +861,9 @@ pub(crate) struct PassHolds {
 /// One reconciled pass.
 pub(crate) struct Plan {
 	pub(crate) actions: Vec<SyncAction>,
-	/// How many paths the pass deliberately left alone. A pass that skips everything it would
-	/// otherwise have done is not the same as a pass with nothing to do, and the report has to be
-	/// able to tell them apart.
+	/// How many paths the pass deliberately left alone (an unresolvable name, or a deletion this
+	/// engine has already made). A pass that skips what it would otherwise have done is not the
+	/// same as a pass with nothing to do, and the report has to be able to tell them apart.
 	pub(crate) deferred_paths: usize,
 }
 
@@ -929,10 +891,11 @@ pub(crate) fn reconcile(
 		.map(String::as_str)
 		.collect();
 
-	// Consume the paths the snapshot is behind on before anything else looks at them, so neither
-	// move detection nor the per-path reconcile can act on a cache that has not caught up.
-	let mut stale = stale_pending_paths(baseline, remote, &holds.pending);
-	stale.extend(holds.held_remote.iter().map(String::as_str));
+	// Consume the paths the view could not resolve before anything else looks at them, so neither
+	// move detection nor the per-path reconcile acts on a name the cache is showing twice. (A path
+	// this engine has just written to needs no such hold: the engine folds its own unacknowledged
+	// writes into the view instead — see `PendingWrites::fold_into`.)
+	//
 	// A held path with nothing on either side is skipped by nobody below, but it IS being withheld
 	// and the report has to say so.
 	let mut deferred_paths = holds
@@ -940,11 +903,11 @@ pub(crate) fn reconcile(
 		.iter()
 		.filter(|path| !keys.contains(path.as_str()))
 		.count();
-	if !stale.is_empty() {
+	if !holds.held_remote.is_empty() {
 		for key in &keys {
-			if is_under_stale_path(key, &stale) {
+			if is_under_held_path(key, &holds.held_remote) {
 				tracing::debug!(
-					"reconcile: skipping {key:?} — a just-written remote item there is not yet visible in the cache"
+					"reconcile: skipping {key:?} — the cache is listing that name twice, so the view cannot resolve it"
 				);
 				consumed.insert((*key).to_string());
 				deferred_paths += 1;
@@ -1122,7 +1085,10 @@ mod tests {
 
 	use chrono::{DateTime, Utc};
 
-	use super::*;
+	use super::{
+		super::engine::{Observations, PendingWrites},
+		*,
+	};
 	use crate::sync_engine::SyncMode;
 
 	/// Reconcile with no pending writes — the ordinary case; the cache-lag window has its own tests.
@@ -1135,25 +1101,21 @@ mod tests {
 		reconcile(mode, baseline, local, remote, &PassHolds::default()).actions
 	}
 
-	/// Reconcile with `pending` remote uuids the cache has not caught up to.
-	fn plan_pending(
+	/// The pair the fold tests write as.
+	const PAIR: super::super::baseline::PairId = 1;
+
+	/// What a pass does: correct the snapshot with the engine's own unacknowledged writes, then
+	/// reconcile against the corrected view.
+	fn plan_folded(
 		mode: SyncMode,
 		baseline: &HashMap<String, BaselineEntry>,
 		local: &HashMap<String, LocalNode>,
 		remote: &HashMap<String, RemoteNode>,
-		pending: HashSet<Uuid>,
+		writes: &PendingWrites,
 	) -> Vec<SyncAction> {
-		reconcile(
-			mode,
-			baseline,
-			local,
-			remote,
-			&PassHolds {
-				pending,
-				..Default::default()
-			},
-		)
-		.actions
+		let mut remote = remote.clone();
+		writes.fold_into(PAIR, baseline, &mut remote);
+		reconcile(mode, baseline, local, &remote, &PassHolds::default()).actions
 	}
 
 	fn ms(millis: i64) -> DateTime<Utc> {
@@ -1608,16 +1570,18 @@ mod tests {
 	}
 
 	#[test]
-	fn a_just_written_remote_item_the_cache_has_not_caught_up_to_is_left_alone() {
+	fn a_just_written_remote_item_the_cache_has_not_caught_up_to_is_folded_in_not_acted_on() {
 		let uuid = Uuid::new_v4();
 		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
 		let local = map(vec![("a.txt", local_file("a.txt", [5; 32]))]);
 		// The snapshot is behind: the uuid the pass just recorded is not in it yet.
 		let remote = HashMap::new();
-		let pending = HashSet::from([uuid]);
+		let observations = Observations::default();
+		let writes = PendingWrites::default();
+		writes.record_create(&observations, PAIR, uuid, "a.txt", None);
 		for mode in ALL_MODES {
 			assert!(
-				plan_pending(mode, &baseline, &local, &remote, pending.clone()).is_empty(),
+				plan_folded(mode, &baseline, &local, &remote, &writes).is_empty(),
 				"{mode:?} must neither re-transfer nor delete a write the cache has not seen"
 			);
 		}
@@ -1696,7 +1660,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_pending_directory_shields_its_children_from_a_duplicate_create() {
+	fn a_directory_this_pass_created_is_not_created_a_second_time() {
 		let dir_uuid = Uuid::new_v4();
 		let file_uuid = Uuid::new_v4();
 		let baseline = map(vec![
@@ -1708,30 +1672,56 @@ mod tests {
 			("d/x.txt", local_file("d/x.txt", [1; 32])),
 		]);
 		// Neither the new dir nor its child has reached the cache yet.
-		let pending = HashSet::from([dir_uuid, file_uuid]);
+		let observations = Observations::default();
+		let writes = PendingWrites::default();
+		writes.record_create(&observations, PAIR, dir_uuid, "d", None);
+		writes.record_create(&observations, PAIR, file_uuid, "d/x.txt", None);
 		assert!(
-			plan_pending(
+			plan_folded(
 				SyncMode::LocalToRemote,
 				&baseline,
 				&local,
 				&HashMap::new(),
-				pending
+				&writes
 			)
 			.is_empty(),
-			"a pending dir must not be re-created, and its children must not be uploaded into a \
-			 parent that is not in the snapshot"
+			"a dir this pass created must not be re-created, and its unchanged child must not be \
+			 re-uploaded"
 		);
-		// A child whose OWN uuid has settled is still shielded by the invisible parent.
-		let pending = HashSet::from([dir_uuid]);
-		assert!(
-			plan_pending(
+	}
+
+	/// The same pass, one step later: the cache has announced the CHILD's upload but not the
+	/// directory's creation. The announcement retires the child's record — it is evidence the cache
+	/// has caught up, and a snapshot that still lists nothing there is evidence the file is gone
+	/// (trashed, or superseded by another client), so the pass must put it back. Folding the
+	/// directory in is what gives that upload a parent to land in; the directory itself is still not
+	/// created a second time.
+	#[test]
+	fn a_child_the_cache_has_announced_is_re_uploaded_into_the_folded_parent() {
+		let dir_uuid = Uuid::new_v4();
+		let file_uuid = Uuid::new_v4();
+		let baseline = map(vec![
+			("d", base_dir("d", dir_uuid)),
+			("d/x.txt", base_file("d/x.txt", file_uuid, [1; 32])),
+		]);
+		let local = map(vec![
+			("d", local_dir("d")),
+			("d/x.txt", local_file("d/x.txt", [1; 32])),
+		]);
+		let observations = Observations::default();
+		let writes = PendingWrites::default();
+		writes.record_create(&observations, PAIR, dir_uuid, "d", None);
+		assert_eq!(
+			plan_folded(
 				SyncMode::LocalToRemote,
 				&baseline,
 				&local,
 				&HashMap::new(),
-				pending
-			)
-			.is_empty()
+				&writes
+			),
+			vec![SyncAction::UploadFile {
+				rel_path: "d/x.txt".to_string(),
+			}]
 		);
 	}
 
@@ -1744,9 +1734,12 @@ mod tests {
 		let baseline = map(vec![("b.txt", base_file("b.txt", uuid, [5; 32]))]);
 		let local = map(vec![("b.txt", local_file("b.txt", [5; 32]))]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
+		let observations = Observations::default();
+		let writes = PendingWrites::default();
+		writes.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
 		for mode in ALL_MODES {
 			assert!(
-				plan_pending(mode, &baseline, &local, &remote, HashSet::from([uuid])).is_empty(),
+				plan_folded(mode, &baseline, &local, &remote, &writes).is_empty(),
 				"{mode:?} must leave both ends of an unapplied move alone"
 			);
 		}

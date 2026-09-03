@@ -9,7 +9,7 @@
 //! the scanner's fast-path stays stable.
 
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	path::{Path, PathBuf},
 };
 
@@ -53,9 +53,10 @@ pub struct SyncReport {
 	pub conflicts: Vec<String>,
 	/// How many deletions the mass-delete guard held back this pass.
 	pub held_deletions: usize,
-	/// How many paths the pass deliberately left alone rather than acting on: a remote write this
-	/// engine made that the cache has not caught up to yet. Such a pass does nothing on purpose,
-	/// which is not the same as having nothing to do.
+	/// How many paths the pass deliberately left alone rather than acting on: a name the cache is
+	/// listing twice (so the view cannot resolve it), or a remote deletion this engine has already
+	/// made. Such a pass does nothing there on purpose, which is not the same as having nothing
+	/// to do.
 	pub deferred_paths: usize,
 	/// Set when the guard held deletions; a human-readable reason.
 	pub guard_message: Option<String>,
@@ -212,8 +213,10 @@ pub(super) async fn apply(
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
-	let file_by_uuid: HashMap<Uuid, &CacheableFile<'static>> =
-		ctx.files.iter().map(|f| (f.uuid, f)).collect();
+	let mut files = RemoteFiles {
+		snapshot: ctx.files.iter().map(|f| (f.uuid, f)).collect(),
+		fetched: HashMap::new(),
+	};
 	let dir_by_uuid: HashMap<Uuid, &CacheableDir<'static>> =
 		ctx.dirs.iter().map(|d| (d.uuid, d)).collect();
 
@@ -228,6 +231,7 @@ pub(super) async fn apply(
 			dir_by_path.insert(path.clone(), RemoteDirectory::from((*cacheable).clone()));
 		}
 	}
+	resolve_folded_objects(&ctx, &actions, &mut files, &mut dir_by_path).await;
 
 	// Hold the drive-write lock for the whole pass when it mutates the remote (a pure pull touches
 	// only local files and needs no lock). Inner `lock_drive` calls then return a clone of this.
@@ -267,22 +271,14 @@ pub(super) async fn apply(
 	}
 
 	for action in &pre {
-		apply_serial(
-			&ctx,
-			action,
-			&file_by_uuid,
-			&mut dir_by_path,
-			report,
-			observer,
-		)
-		.await;
+		apply_serial(&ctx, action, &files, &mut dir_by_path, report, observer).await;
 	}
 
 	if !transfers.is_empty() {
 		let concurrency = ctx.client.unauthed().state().max_concurrency().max(1);
 		let ctx_ref = &ctx;
 		let dir_ref = &dir_by_path;
-		let files_ref = &file_by_uuid;
+		let files_ref = &files;
 		let mut stream = std::pin::pin!(
 			futures::stream::iter(transfers.iter())
 				.map(|action| async move {
@@ -319,15 +315,107 @@ pub(super) async fn apply(
 	}
 
 	for action in &post {
-		apply_serial(
-			&ctx,
-			action,
-			&file_by_uuid,
-			&mut dir_by_path,
-			report,
-			observer,
-		)
-		.await;
+		apply_serial(&ctx, action, &files, &mut dir_by_path, report, observer).await;
+	}
+}
+
+/// The remote file objects a pass can act on: the cache snapshot's, plus the ones fetched for
+/// items this engine wrote that the snapshot does not carry yet (see `PendingWrites::fold_into`).
+struct RemoteFiles<'a> {
+	snapshot: HashMap<Uuid, &'a CacheableFile<'static>>,
+	fetched: HashMap<Uuid, RemoteFile>,
+}
+
+impl RemoteFiles<'_> {
+	fn get(&self, uuid: &Uuid) -> Option<RemoteFile> {
+		self.snapshot
+			.get(uuid)
+			.map(|cacheable| RemoteFile::from((*cacheable).clone()))
+			.or_else(|| self.fetched.get(uuid).cloned())
+	}
+}
+
+/// Resolve the remote objects this plan acts on that the cache snapshot cannot supply.
+///
+/// The remote view carries the writes this engine made that the cache has not listed yet, so an
+/// action can name an item no snapshot entry describes. The server is authoritative about those
+/// (it minted them), and only the few the plan actually touches are fetched. One that cannot be
+/// fetched is left out: its own action then fails and the pass carries on, exactly as it did when
+/// the snapshot entry was missing.
+async fn resolve_folded_objects(
+	ctx: &ApplyContext<'_>,
+	actions: &[SyncAction],
+	files: &mut RemoteFiles<'_>,
+	dir_by_path: &mut HashMap<String, RemoteDirectory>,
+) {
+	let mut wanted_files: HashSet<Uuid> = HashSet::new();
+	let mut wanted_dirs: HashSet<&str> = HashSet::new();
+	for action in actions {
+		match action {
+			SyncAction::DownloadFile { remote_uuid, .. } => {
+				wanted_files.insert(*remote_uuid);
+			}
+			SyncAction::TrashRemote {
+				rel_path,
+				kind,
+				remote_uuid,
+			} => match kind {
+				NodeKind::File => {
+					wanted_files.insert(*remote_uuid);
+				}
+				NodeKind::Dir => {
+					wanted_dirs.insert(rel_path);
+				}
+			},
+			SyncAction::MoveRemote {
+				to_path,
+				remote_uuid,
+				..
+			} => {
+				wanted_files.insert(*remote_uuid);
+				wanted_dirs.insert(parent_and_name(to_path).0);
+			}
+			SyncAction::UploadFile { rel_path } | SyncAction::CreateRemoteDir { rel_path } => {
+				wanted_dirs.insert(parent_and_name(rel_path).0);
+			}
+			_ => {}
+		}
+	}
+
+	for uuid in wanted_files {
+		if files.snapshot.contains_key(&uuid) {
+			continue;
+		}
+		match ctx.client.get_file(uuid).await {
+			Ok(file) => {
+				files.fetched.insert(uuid, file);
+			}
+			Err(error) => tracing::debug!(
+				"apply: cannot resolve the file {uuid} this engine wrote ({error}); its action fails this pass"
+			),
+		}
+	}
+	for path in wanted_dirs {
+		// A directory this very pass creates is filled in as it goes, and one the snapshot has is
+		// already there; only a folded one is both in the view and missing here.
+		if dir_by_path.contains_key(path) {
+			continue;
+		}
+		let Some(node) = ctx
+			.remote
+			.get(path)
+			.filter(|node| node.kind == NodeKind::Dir)
+		else {
+			continue;
+		};
+		match ctx.client.get_dir(node.remote_uuid).await {
+			Ok(dir) => {
+				dir_by_path.insert(path.to_string(), dir);
+			}
+			Err(error) => tracing::debug!(
+				"apply: cannot resolve the remote dir {path:?} this engine created ({error}); its actions fail this pass"
+			),
+		}
 	}
 }
 
@@ -354,14 +442,14 @@ fn is_transfer(action: &SyncAction) -> bool {
 async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
-	file_by_uuid: &HashMap<Uuid, &CacheableFile<'static>>,
+	files: &RemoteFiles<'_>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
-	if let Err(error) = apply_one(ctx, action, file_by_uuid, dir_by_path, report).await {
+	if let Err(error) = apply_one(ctx, action, files, dir_by_path, report).await {
 		tracing::debug!("apply: {} FAILED — {error}", action.describe());
 		observer(SyncEvent::ActionFailed {
 			rel_path: action.rel_path().to_string(),
@@ -379,7 +467,7 @@ async fn apply_serial(
 async fn apply_transfer(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
-	file_by_uuid: &HashMap<Uuid, &CacheableFile<'static>>,
+	files: &RemoteFiles<'_>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
 ) -> Result<(), crate::Error> {
 	match action {
@@ -387,10 +475,9 @@ async fn apply_transfer(
 			rel_path,
 			remote_uuid,
 		} => {
-			let cacheable = file_by_uuid
+			let remote_file = files
 				.get(remote_uuid)
 				.ok_or_else(|| internal("download target missing from the snapshot"))?;
-			let remote_file = RemoteFile::from((*cacheable).clone());
 			let path = confined_local_target(ctx.local_root, rel_path)?;
 			if let Some(parent) = path.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -474,7 +561,7 @@ async fn apply_transfer(
 async fn apply_one(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
-	file_by_uuid: &HashMap<Uuid, &CacheableFile<'static>>,
+	files: &RemoteFiles<'_>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 	report: &mut SyncReport,
 ) -> Result<(), crate::Error> {
@@ -489,7 +576,7 @@ async fn apply_one(
 		// Transfers normally run via the concurrent path in `apply`; these arms keep `apply_one`
 		// total and correct if a transfer is ever applied serially.
 		SyncAction::DownloadFile { .. } => {
-			apply_transfer(ctx, action, file_by_uuid, dir_by_path).await?;
+			apply_transfer(ctx, action, files, dir_by_path).await?;
 			report.downloaded += 1;
 		}
 		SyncAction::DeleteLocal { rel_path, .. } => {
@@ -526,7 +613,7 @@ async fn apply_one(
 			report.remote_dirs_created += 1;
 		}
 		SyncAction::UploadFile { .. } => {
-			apply_transfer(ctx, action, file_by_uuid, dir_by_path).await?;
+			apply_transfer(ctx, action, files, dir_by_path).await?;
 			report.uploaded += 1;
 		}
 		SyncAction::TrashRemote {
@@ -536,10 +623,9 @@ async fn apply_one(
 		} => {
 			match kind {
 				NodeKind::File => {
-					let cacheable = file_by_uuid
+					let mut remote_file = files
 						.get(remote_uuid)
 						.ok_or_else(|| internal("trash target file missing from the snapshot"))?;
-					let mut remote_file = RemoteFile::from((*cacheable).clone());
 					ctx.client.trash_file(&mut remote_file).await?;
 				}
 				NodeKind::Dir => {
@@ -563,10 +649,9 @@ async fn apply_one(
 			to_path,
 			remote_uuid,
 		} => {
-			let cacheable = file_by_uuid
+			let mut remote_file = files
 				.get(remote_uuid)
 				.ok_or_else(|| internal("move-source file missing from the snapshot"))?;
-			let mut remote_file = RemoteFile::from((*cacheable).clone());
 			let (from_parent, from_name) = parent_and_name(from_path);
 			let (to_parent, to_name) = parent_and_name(to_path);
 			if to_parent != from_parent {
@@ -587,7 +672,7 @@ async fn apply_one(
 			}
 			let local = ctx.local.get(to_path);
 			ctx.pending
-				.record_move(ctx.observed, ctx.pair, *remote_uuid, from_path);
+				.record_move(ctx.observed, ctx.pair, *remote_uuid, from_path, to_path);
 			delete_baseline(ctx, from_path).await?;
 			upsert_file_baseline(
 				ctx,
