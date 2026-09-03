@@ -86,8 +86,9 @@ fn normalize_rel_path(rel: &Path) -> Option<String> {
 }
 
 /// The case-insensitive collision key for a (already NFC-normalized) relative path. Filen treats
-/// names case-insensitively, so two paths differing only in case collide.
-fn collision_key(rel_path: &str) -> String {
+/// names case-insensitively, so two paths differing only in case collide. Shared with the remote
+/// view, which has to fold case the same way for its own duplicate check to mean the same thing.
+pub(super) fn collision_key(rel_path: &str) -> String {
 	rel_path.chars().flat_map(char::to_lowercase).collect()
 }
 
