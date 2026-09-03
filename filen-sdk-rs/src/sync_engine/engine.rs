@@ -420,14 +420,24 @@ fn resolution_entry(
 		}),
 		// The remote side wins: anchor to the LOCAL's recorded state with no remote evidence,
 		// so the remote (or its absence) reads as the change and is pulled.
-		ConflictResolution::KeepRemote => held.local_kind.map(|kind| BaselineEntry {
-			kind,
-			content_hash: held.content_hash,
-			size: held.size,
-			local_mtime: held.local_mtime,
-			remote_uuid: None,
-			remote_modified: None,
-			..synced_shell(rel_path)
+		//
+		// With the same convergence exception, mirrored: identical content on both sides leaves
+		// nothing to pull, so the remote anchor is recorded too rather than left for a later
+		// adopt pass.
+		ConflictResolution::KeepRemote => held.local_kind.map(|kind| {
+			let converged = kind == super::baseline::NodeKind::File
+				&& held.content_hash.is_some()
+				&& held.content_hash == held.remote_hash
+				&& held.size == held.remote_size;
+			BaselineEntry {
+				kind,
+				content_hash: held.content_hash,
+				size: held.size,
+				local_mtime: held.local_mtime,
+				remote_uuid: converged.then_some(held.remote_uuid).flatten(),
+				remote_modified: converged.then_some(held.remote_modified).flatten(),
+				..synced_shell(rel_path)
+			}
 		}),
 		ConflictResolution::KeepBoth => unreachable!("normalized to KeepRemote above"),
 	}
@@ -1087,6 +1097,73 @@ mod tests {
 			.actions
 			.is_empty(),
 			"the resolved path is settled: the next pass plans nothing at all"
+		);
+	}
+
+	/// The mirror image: keeping the REMOTE copy of a converged conflict also has nothing left to
+	/// transfer, so it too must record the whole synced state instead of a half row.
+	#[test]
+	fn keeping_remote_on_a_converged_conflict_records_a_clean_synced_row() {
+		let uuid = Uuid::new_v4();
+		let entry = resolution_entry(
+			"a.txt",
+			&converged_conflict(uuid),
+			ConflictResolution::KeepRemote,
+		)
+		.expect("the local side had a kind, so a row is written");
+
+		assert_eq!(entry.state, BaselineState::Synced);
+		assert_eq!(
+			entry.remote_uuid,
+			Some(uuid),
+			"the converged remote version is recorded"
+		);
+		assert_eq!(entry.remote_modified, Some(222));
+		assert_eq!(entry.content_hash, Some(hash(3)));
+
+		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
+		assert!(
+			plan::reconcile(
+				SyncMode::TwoWay,
+				&baseline,
+				&local_map(hash(3)),
+				&remote_map(uuid, hash(3)),
+				&plan::PassHolds::default(),
+			)
+			.actions
+			.is_empty(),
+			"the resolved path is settled: the next pass plans nothing at all"
+		);
+	}
+
+	/// And the diverged case still pulls: with the sides genuinely different the row keeps no
+	/// remote anchor, so the remote copy reads as the change.
+	#[test]
+	fn keeping_remote_on_a_diverged_conflict_still_pulls_the_remote_copy() {
+		let uuid = Uuid::new_v4();
+		let held = BaselineEntry {
+			remote_hash: Some(hash(9)),
+			..converged_conflict(uuid)
+		};
+		let entry = resolution_entry("a.txt", &held, ConflictResolution::KeepRemote)
+			.expect("the local side had a kind, so a row is written");
+		assert_eq!(
+			entry.remote_uuid, None,
+			"a diverged remote side must still read as changed"
+		);
+
+		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
+		let actions = plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local_map(hash(3)),
+			&remote_map(uuid, hash(9)),
+			&plan::PassHolds::default(),
+		)
+		.actions;
+		assert_eq!(
+			actions.iter().map(describe).collect::<Vec<_>>(),
+			vec!["download file \"a.txt\"".to_string()],
 		);
 	}
 
