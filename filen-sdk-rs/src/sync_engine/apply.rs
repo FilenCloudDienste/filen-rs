@@ -18,8 +18,8 @@ use futures::StreamExt;
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
-	engine::{Observations, PendingWrites},
+	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
+	engine::{Observations, PendingKind, PendingWrites},
 	events::SyncEvent,
 	plan::{RemoteNode, SyncAction, create_target_paths},
 	scan::{LocalNode, QUARANTINE_DIR},
@@ -535,23 +535,19 @@ async fn apply_transfer(
 			// A same-name upload versions whatever the path held: record that uuid, so the next
 			// pass can tell a cache that has not caught up (the old uuid still at the path) from
 			// someone ELSE having written there since (a third uuid).
-			ctx.pending.record_create(
-				ctx.observed,
-				ctx.pair,
-				new_uuid,
-				rel_path,
-				ctx.remote.get(rel_path).map(|node| node.remote_uuid),
-			);
-			upsert_file_baseline(
-				ctx,
+			let kind = PendingKind::Created {
+				path: rel_path.clone(),
+				replaced: ctx.remote.get(rel_path).map(|node| node.remote_uuid),
+			};
+			let entry = file_entry(
 				rel_path,
 				Some(new_uuid),
 				local.and_then(|n| n.content_hash),
 				local.map(|n| n.size).unwrap_or(0),
 				local.map(|n| n.mtime_millis),
 				Some(uploaded.timestamp.timestamp_millis()),
-			)
-			.await?;
+			);
+			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
 		}
 		_ => return Err(internal("apply_transfer called with a non-transfer action")),
 	}
@@ -601,15 +597,13 @@ async fn apply_one(
 				.create_dir_with_created(&parent_type, name, created)
 				.await?;
 			let new_uuid: Uuid = new_dir.uuid();
-			ctx.pending.record_create(
-				ctx.observed,
-				ctx.pair,
-				new_uuid,
-				rel_path,
-				ctx.remote.get(rel_path).map(|node| node.remote_uuid),
-			);
+			let kind = PendingKind::Created {
+				path: rel_path.clone(),
+				replaced: ctx.remote.get(rel_path).map(|node| node.remote_uuid),
+			};
 			dir_by_path.insert(rel_path.clone(), new_dir);
-			upsert_dir_baseline(ctx, rel_path, Some(new_uuid), None).await?;
+			let entry = dir_entry(rel_path, Some(new_uuid), None);
+			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
 			report.remote_dirs_created += 1;
 		}
 		SyncAction::UploadFile { .. } => {
@@ -639,9 +633,13 @@ async fn apply_one(
 			// The row is about to go, so a snapshot that has not applied the trash yet reads this
 			// item as an untracked remote file with nothing local — a deletion to make all over
 			// again. Record the trash so the next pass suppresses that.
-			ctx.pending
-				.record_trash(ctx.observed, ctx.pair, *remote_uuid);
-			delete_baseline(ctx, rel_path).await?;
+			commit_remote_write(
+				ctx,
+				*remote_uuid,
+				PendingKind::Trashed,
+				&[BaselineChange::Delete(rel_path)],
+			)
+			.await?;
 			report.remotely_trashed += 1;
 		}
 		SyncAction::MoveRemote {
@@ -671,17 +669,26 @@ async fn apply_one(
 					.await?;
 			}
 			let local = ctx.local.get(to_path);
-			ctx.pending
-				.record_move(ctx.observed, ctx.pair, *remote_uuid, from_path, to_path);
-			delete_baseline(ctx, from_path).await?;
-			upsert_file_baseline(
-				ctx,
+			let kind = PendingKind::Moved {
+				from: from_path.clone(),
+				to: to_path.clone(),
+			};
+			let entry = file_entry(
 				to_path,
 				Some(*remote_uuid),
 				local.and_then(|n| n.content_hash),
 				local.map(|n| n.size).unwrap_or(0),
 				local.map(|n| n.mtime_millis),
 				Some(remote_file.timestamp.timestamp_millis()),
+			);
+			commit_remote_write(
+				ctx,
+				*remote_uuid,
+				kind,
+				&[
+					BaselineChange::Delete(from_path),
+					BaselineChange::Upsert(&entry),
+				],
 			)
 			.await?;
 			report.moved_remote += 1;
@@ -889,13 +896,9 @@ fn local_mtime_of(path: &Path) -> Option<i64> {
 		.map(|m| FilenMetaExt::modified(&m).timestamp_millis())
 }
 
-async fn upsert_dir_baseline(
-	ctx: &ApplyContext<'_>,
-	rel_path: &str,
-	remote_uuid: Option<Uuid>,
-	local_mtime: Option<i64>,
-) -> Result<(), crate::Error> {
-	let entry = BaselineEntry {
+/// The synced baseline row a directory write leaves behind.
+fn dir_entry(rel_path: &str, remote_uuid: Option<Uuid>, local_mtime: Option<i64>) -> BaselineEntry {
+	BaselineEntry {
 		rel_path: rel_path.to_string(),
 		kind: NodeKind::Dir,
 		remote_uuid,
@@ -908,21 +911,19 @@ async fn upsert_dir_baseline(
 		remote_kind: None,
 		remote_hash: None,
 		remote_size: None,
-	};
-	upsert_baseline(ctx, &entry).await
+	}
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn upsert_file_baseline(
-	ctx: &ApplyContext<'_>,
+/// The synced baseline row a file write leaves behind.
+fn file_entry(
 	rel_path: &str,
 	remote_uuid: Option<Uuid>,
 	content_hash: Option<filen_types::crypto::Blake3Hash>,
 	size: u64,
 	local_mtime: Option<i64>,
 	remote_modified: Option<i64>,
-) -> Result<(), crate::Error> {
-	let entry = BaselineEntry {
+) -> BaselineEntry {
+	BaselineEntry {
 		rel_path: rel_path.to_string(),
 		kind: NodeKind::File,
 		remote_uuid,
@@ -935,8 +936,64 @@ async fn upsert_file_baseline(
 		remote_kind: None,
 		remote_hash: None,
 		remote_size: None,
-	};
-	upsert_baseline(ctx, &entry).await
+	}
+}
+
+async fn upsert_dir_baseline(
+	ctx: &ApplyContext<'_>,
+	rel_path: &str,
+	remote_uuid: Option<Uuid>,
+	local_mtime: Option<i64>,
+) -> Result<(), crate::Error> {
+	upsert_baseline(ctx, &dir_entry(rel_path, remote_uuid, local_mtime)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_file_baseline(
+	ctx: &ApplyContext<'_>,
+	rel_path: &str,
+	remote_uuid: Option<Uuid>,
+	content_hash: Option<filen_types::crypto::Blake3Hash>,
+	size: u64,
+	local_mtime: Option<i64>,
+	remote_modified: Option<i64>,
+) -> Result<(), crate::Error> {
+	upsert_baseline(
+		ctx,
+		&file_entry(
+			rel_path,
+			remote_uuid,
+			content_hash,
+			size,
+			local_mtime,
+			remote_modified,
+		),
+	)
+	.await
+}
+
+/// Journal a remote write together with the baseline rows it produced — ONE transaction, so a
+/// crash cannot leave the write recorded without its state or the state without its record — and
+/// then publish the write to the in-memory journal the current process folds from.
+async fn commit_remote_write(
+	ctx: &ApplyContext<'_>,
+	uuid: Uuid,
+	kind: PendingKind,
+	changes: &[BaselineChange<'_>],
+) -> Result<(), crate::Error> {
+	ctx.store
+		.lock()
+		.await
+		.record_pending(
+			ctx.pair,
+			uuid,
+			&kind,
+			Utc::now().timestamp_millis(),
+			changes,
+		)
+		.map_err(db_err)?;
+	ctx.pending.record(ctx.observed, ctx.pair, uuid, kind);
+	Ok(())
 }
 
 async fn upsert_baseline(

@@ -11,13 +11,16 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use chrono::Utc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
 	SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
-	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord},
+	baseline::{
+		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PendingRow,
+	},
 	guard::{self, DeleteGuard},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
@@ -52,8 +55,8 @@ struct PendingWrite {
 	kind: PendingKind,
 }
 
-#[derive(Debug)]
-enum PendingKind {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PendingKind {
 	/// An item created at `path`. `replaced` is the remote uuid that held the path immediately
 	/// before — a same-name upload versions the existing file, minting a new uuid — or `None` for
 	/// a path nothing occupied.
@@ -172,62 +175,55 @@ fn observation_callback(observations: Arc<Observations>) -> SyncRootCallback {
 pub(super) struct PendingWrites(std::sync::Mutex<HashMap<Uuid, PendingWrite>>);
 
 impl PendingWrites {
-	/// Record a newly created remote item at `path`, superseding `replaced` (the uuid the path
-	/// held before, if any).
-	pub(super) fn record_create(
+	/// Record a remote write this pass just made. The apply layer persists the same write to the
+	/// baseline DB FIRST (see [`BaselineStore::record_pending`]), so a restart re-learns it.
+	pub(super) fn record(
 		&self,
 		observations: &Observations,
 		pair: PairId,
 		uuid: Uuid,
-		path: &str,
-		replaced: Option<Uuid>,
+		kind: PendingKind,
 	) {
-		self.record(
-			observations,
-			pair,
-			uuid,
-			PendingKind::Created {
-				path: path.to_string(),
-				replaced,
-			},
-		);
+		self.insert(pair, uuid, kind, observations.stamp(), Instant::now());
 	}
 
-	/// Record a remote item this pass sent to the trash.
-	pub(super) fn record_trash(&self, observations: &Observations, pair: PairId, uuid: Uuid) {
-		self.record(observations, pair, uuid, PendingKind::Trashed);
+	/// Take a write a PREVIOUS engine journalled back into memory, `age` after it was made.
+	///
+	/// Its stamp is 0: this process has observed nothing yet, so the first cache announcement of
+	/// the uuid — stamped 1 or later — retires it, exactly as it would have retired the original.
+	/// The announcements that arrived before the restart are gone with the process, so a write
+	/// whose item is no longer in a snapshot (superseded, trashed) now waits for a fresh
+	/// announcement, a foreign uuid at its path, or the grace ceiling — bounded, and never longer
+	/// than a write made right now.
+	pub(super) fn restore(&self, pair: PairId, uuid: Uuid, kind: PendingKind, age: Duration) {
+		// `checked_sub` only fails for an age older than this machine's uptime — a journal carried
+		// across a reboot — and its fallback is the conservative answer anyway: a full grace
+		// window from now.
+		let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+		self.insert(pair, uuid, kind, 0, at);
 	}
 
-	/// Record a remote item this pass moved from `from` to `to`.
-	pub(super) fn record_move(
-		&self,
-		observations: &Observations,
-		pair: PairId,
-		uuid: Uuid,
-		from: &str,
-		to: &str,
-	) {
-		self.record(
-			observations,
-			pair,
-			uuid,
-			PendingKind::Moved {
-				from: from.to_string(),
-				to: to.to_string(),
-			},
-		);
-	}
-
-	fn record(&self, observations: &Observations, pair: PairId, uuid: Uuid, kind: PendingKind) {
+	fn insert(&self, pair: PairId, uuid: Uuid, kind: PendingKind, seq: u64, at: Instant) {
 		self.map().insert(
 			uuid,
 			PendingWrite {
-				at: Instant::now(),
+				at,
 				pair,
-				seq: observations.stamp(),
+				seq,
 				kind,
 			},
 		);
+	}
+
+	/// The uuids currently journalled, for diffing what a [`settle`](Self::settle) retired.
+	fn uuids(&self) -> std::collections::HashSet<Uuid> {
+		self.map().keys().copied().collect()
+	}
+
+	/// Drop every record for `pair` — the pair is gone, so nothing may fold on its behalf (a
+	/// re-registration of the same roots gets the same id back).
+	fn forget_pair(&self, pair: PairId) {
+		self.map().retain(|_, write| write.pair != pair);
 	}
 
 	/// The oldest live write's observation stamp, for pruning [`Observations`].
@@ -354,6 +350,22 @@ impl PendingWrites {
 		self.0
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
+	}
+}
+
+/// [`PENDING_CREATE_GRACE`] as the journal stores it: wall-clock millis.
+fn grace_millis() -> i64 {
+	PENDING_CREATE_GRACE.as_millis() as i64
+}
+
+/// Take the journal a previous engine persisted back into memory, each row aged by the wall clock
+/// so it expires on the same ceiling as a write recorded in this process.
+/// [`BaselineStore::load_pending`] has already dropped the rows that ceiling ran out on; the clamp
+/// here only guards a clock that moved between the two.
+fn restore_journal(pending: &PendingWrites, rows: Vec<PendingRow>, now: i64) {
+	for row in rows {
+		let age = now.saturating_sub(row.recorded_at).clamp(0, grace_millis()) as u64;
+		pending.restore(row.pair, row.uuid, row.kind, Duration::from_millis(age));
 	}
 }
 
@@ -668,6 +680,22 @@ impl SyncEngine {
 		for record in engine.list_pairs().await? {
 			engine.observe_pair(record.id, record.remote_root).await;
 		}
+		// An engine that went down inside the cache-lag window left the writes it had made in the
+		// journal; folding them is what stops this one from making them a second time.
+		let now = Utc::now().timestamp_millis();
+		let rows = engine
+			.store
+			.lock()
+			.await
+			.load_pending(now, grace_millis())
+			.map_err(|e| db_error(e, "loading the pending-write journal"))?;
+		if !rows.is_empty() {
+			tracing::debug!(
+				"sync engine: restoring {} unacknowledged write(s)",
+				rows.len()
+			);
+		}
+		restore_journal(&engine.pending, rows, now);
 		Ok(engine)
 	}
 
@@ -830,7 +858,19 @@ impl SyncEngine {
 
 		let remote_emptied =
 			remote_view.nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some());
+		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
+		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
+		// pure in-memory operation.
+		let before = self.pending.uuids();
 		let mut holds = self.pending.settle(pair, &observed, &remote_view.nodes);
+		let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
+		if !retired.is_empty() {
+			self.store
+				.lock()
+				.await
+				.delete_pending(&retired)
+				.map_err(|e| db_error(e, "retiring pending writes"))?;
+		}
 		// Correct the view with what this engine wrote and the cache has not shown yet, BEFORE
 		// anything reconciles or detects moves against it.
 		let folded = self
@@ -896,6 +936,10 @@ impl SyncEngine {
 		self.approvals.lock().await.remove(&pair);
 		// Dropping the handle unsubscribes the pair's cache notifications.
 		self.roots.lock().await.remove(&pair);
+		// The pair's journal rows go with it (`ON DELETE CASCADE`); drop the in-memory copies too.
+		// Re-registering the same roots hands back the SAME pair id, and a stale `Trashed` record
+		// would then hide a remote item from the fresh pair's very first view.
+		self.pending.forget_pair(pair);
 		self.store
 			.lock()
 			.await
@@ -1196,13 +1240,61 @@ fn db_error(error: rusqlite::Error, context: &str) -> Error {
 mod tests {
 	use std::collections::HashSet;
 
+	use base64::{Engine as _, prelude::BASE64_STANDARD};
 	use filen_types::crypto::Blake3Hash;
+	use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
 
 	use super::*;
-	use crate::sync_engine::{baseline::NodeKind, plan::RemoteNode, scan::LocalNode};
+	use crate::{
+		auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+		sync_engine::{
+			baseline::{BaselineChange, NodeKind},
+			plan::RemoteNode,
+			scan::LocalNode,
+		},
+	};
 
 	/// The pair whose writes the pending-write tests record.
 	const PAIR: PairId = 1;
+
+	/// A client with no account and no network behind it. [`SyncEngine::open`] only hands it to
+	/// the cache to subscribe each pair's remote root, and a subscription the cache refuses leaves
+	/// that pair on the grace window instead of failing the open (see
+	/// [`SyncEngine::observe_pair`]) — which is exactly what an unconfigured cache answers.
+	fn offline_client() -> Arc<Client> {
+		let private_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).unwrap();
+		let unauthed = UnauthClient::from_config(ClientConfig::default()).unwrap();
+		Arc::new(
+			unauthed
+				.from_stringified(StringifiedClient {
+					email: "sync-engine@example.invalid".to_string(),
+					user_id: 1,
+					root_uuid: Uuid::nil().to_string(),
+					auth_info: "0".repeat(64),
+					private_key: BASE64_STANDARD
+						.encode(private_key.to_pkcs8_der().unwrap().as_bytes()),
+					api_key: String::new(),
+					auth_version: 2,
+					max_parallel_requests: None,
+					max_io_memory_usage: None,
+				})
+				.unwrap(),
+		)
+	}
+
+	fn created(path: &str, replaced: Option<Uuid>) -> PendingKind {
+		PendingKind::Created {
+			path: path.to_string(),
+			replaced,
+		}
+	}
+
+	fn moved(from: &str, to: &str) -> PendingKind {
+		PendingKind::Moved {
+			from: from.to_string(),
+			to: to.to_string(),
+		}
+	}
 
 	fn hash(byte: u8) -> Blake3Hash {
 		Blake3Hash::from([byte; 32])
@@ -1435,6 +1527,68 @@ mod tests {
 		)])
 	}
 
+	/// The restart this journal exists for: the engine that made the write is gone, and the one
+	/// that reopens its baseline DB seconds later has nothing in memory to fold. Loading the
+	/// persisted journal is what keeps it from reading the just-uploaded file as absent and
+	/// uploading it a second time.
+	#[tokio::test]
+	async fn a_create_a_previous_engine_journalled_is_folded_after_a_reopen() {
+		let path = std::env::temp_dir().join(format!("filen_sync_journal_{}.db", Uuid::new_v4()));
+		let uuid = Uuid::new_v4();
+		let baseline = written_row(uuid, hash(1));
+		let pair = {
+			let store = BaselineStore::open(&path).unwrap();
+			let pair = store
+				.create_pair("/root", Uuid::new_v4(), SyncMode::LocalToRemote)
+				.unwrap();
+			store
+				.record_pending(
+					pair,
+					uuid,
+					&created("a.txt", None),
+					Utc::now().timestamp_millis(),
+					&[BaselineChange::Upsert(&baseline["a.txt"])],
+				)
+				.unwrap();
+			pair
+			// The engine "exits" here, taking its in-memory journal with it.
+		};
+
+		// The restart itself: a real `open` on the same DB, so what is under test is the wiring
+		// the reopened engine actually runs — loading the journal and aging it — not a
+		// hand-assembled stand-in for it.
+		let engine = SyncEngine::open(offline_client(), path.clone())
+			.await
+			.unwrap();
+
+		// The cache is still behind: its snapshot has nothing at all under the root yet.
+		let mut remote = HashMap::new();
+		let holds = engine
+			.pending
+			.settle(pair, &engine.observed.snapshot(), &remote);
+		assert_eq!(
+			engine.pending.fold_into(pair, &baseline, &mut remote),
+			1,
+			"the reopened engine folds the write its predecessor made"
+		);
+
+		let actions = plan::reconcile(
+			SyncMode::LocalToRemote,
+			&baseline,
+			&local_map(hash(1)),
+			&remote,
+			&holds,
+		)
+		.actions;
+		assert!(
+			actions.is_empty(),
+			"the restart re-does the pass's writes: {:?}",
+			actions.iter().map(describe).collect::<Vec<_>>()
+		);
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
 	/// The everyday complaint: a second edit within a few seconds of the first. The cache has not
 	/// listed our upload yet, but the engine knows exactly what it wrote there — so the pass must
 	/// push the new content rather than leave the path alone until the cache agrees.
@@ -1443,7 +1597,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
+		pending.record(&observations, PAIR, uuid, created("a.txt", None));
 
 		let baseline = written_row(uuid, hash(1));
 		// The cache is behind: its snapshot has nothing at all under the root yet.
@@ -1476,7 +1630,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
+		pending.record(&observations, PAIR, uuid, created("a.txt", None));
 
 		observations.note([uuid]);
 		let observed = observations.snapshot();
@@ -1502,7 +1656,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
+		pending.record(&observations, PAIR, uuid, created("a.txt", None));
 
 		// The pass copies the observations, THEN reads the snapshot; the event lands in between.
 		let observed = observations.snapshot();
@@ -1527,7 +1681,7 @@ mod tests {
 		let uuid = Uuid::new_v4();
 
 		observations.note([uuid]);
-		pending.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
+		pending.record(&observations, PAIR, uuid, moved("a.txt", "b.txt"));
 
 		let baseline = HashMap::from([(
 			"b.txt".to_string(),
@@ -1558,7 +1712,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
-		pending.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
+		pending.record(&observations, PAIR, uuid, moved("a.txt", "b.txt"));
 
 		let baseline = HashMap::from([(
 			"b.txt".to_string(),
@@ -1600,7 +1754,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (uuid, foreign) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
+		pending.record(&observations, PAIR, uuid, moved("a.txt", "b.txt"));
 
 		let baseline = HashMap::from([(
 			"b.txt".to_string(),
@@ -1648,7 +1802,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (dir, child) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record_trash(&observations, PAIR, dir);
+		pending.record(&observations, PAIR, dir, PendingKind::Trashed);
 
 		let mut remote = HashMap::from([
 			(
@@ -1701,7 +1855,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record_create(&observations, PAIR, new, "a.txt", Some(old));
+		pending.record(&observations, PAIR, new, created("a.txt", Some(old)));
 
 		let baseline = written_row(new, hash(1));
 		let mut remote = node_at("a.txt", old);
@@ -1737,8 +1891,8 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (old, first, second) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-		pending.record_create(&observations, PAIR, first, "a.txt", Some(old));
-		pending.record_create(&observations, PAIR, second, "a.txt", Some(first));
+		pending.record(&observations, PAIR, first, created("a.txt", Some(old)));
+		pending.record(&observations, PAIR, second, created("a.txt", Some(first)));
 
 		let baseline = written_row(second, hash(2));
 		let mut remote = node_at("a.txt", old);
@@ -1769,7 +1923,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record_create(&observations, PAIR, new, "a.txt", Some(old));
+		pending.record(&observations, PAIR, new, created("a.txt", Some(old)));
 
 		let foreign = Uuid::new_v4();
 		let mut remote = node_at("a.txt", foreign);
@@ -1792,7 +1946,7 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, PAIR, uuid, "d", None);
+		pending.record(&observations, PAIR, uuid, created("d", None));
 
 		let baseline = HashMap::from([(
 			"d".to_string(),
@@ -1833,8 +1987,16 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (trashed, created) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record_trash(&observations, PAIR, trashed);
-		pending.record_create(&observations, PAIR, created, "note.txt", None);
+		pending.record(&observations, PAIR, trashed, PendingKind::Trashed);
+		pending.record(
+			&observations,
+			PAIR,
+			created,
+			PendingKind::Created {
+				path: "note.txt".to_string(),
+				replaced: None,
+			},
+		);
 		// The other pair happens to hold a path of the same name — its own file, under its own
 		// root — and never lists the trashed uuid at all.
 		let foreign = node_at("note.txt", Uuid::new_v4());
@@ -1879,7 +2041,7 @@ mod tests {
 		observations.note([Uuid::new_v4(), Uuid::new_v4()]);
 
 		let uuid = Uuid::new_v4();
-		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
+		pending.record(&observations, PAIR, uuid, created("a.txt", None));
 		observations.prune_before(pending.oldest_stamp());
 		assert!(
 			observations.snapshot().is_empty(),
