@@ -53,6 +53,22 @@ async fn list_remote_root(sc: &SingleClient) -> (Vec<RemoteDirectory>, Vec<Remot
 		.unwrap()
 }
 
+/// List the (dirs, files) directly under a remote dir, via a cache's client (ground truth) — for
+/// the tests that run their own engine rather than a [`SingleClient`].
+async fn list_dir_of(
+	cache: &TestCache,
+	dir: &RemoteDirectory,
+) -> (Vec<RemoteDirectory>, Vec<RemoteFile>) {
+	cache
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap()
+}
+
 /// List the (dirs, files) directly under a remote dir.
 async fn list_remote_dir(
 	sc: &SingleClient,
@@ -774,6 +790,83 @@ async fn basic_15_baseline_persists_across_restart() {
 		tree_before,
 		"local tree changed across restart"
 	);
+	std::fs::remove_dir_all(&local).ok();
+}
+
+// ============================================================================
+// BASIC-15B — a restart INSIDE the cache-lag window must not re-do the writes
+// ============================================================================
+
+/// The engine's remote view is the cache snapshot plus the writes it made that the cache has not
+/// announced yet, and the restart is what puts that journal at risk: reopened seconds after a pass,
+/// the engine must still fold what its predecessor wrote, or the just-uploaded file reads as absent
+/// (re-uploaded, minting a new server version) and the just-created directory is created a second
+/// time. The engine is dropped here WITHOUT waiting for the cache, but nothing black-box can hold
+/// the cache back on purpose, so whether the reopen really lands inside that window is up to the
+/// account's convergence speed: this is a regression NET against the real stack, and the fold
+/// itself is pinned deterministically by the unit test that reopens an engine over a seeded
+/// journal (`a_create_a_previous_engine_journalled_is_folded_after_a_reopen`).
+#[shared_test_runtime]
+async fn basic_15b_restart_before_the_cache_catches_up_does_not_redo_writes() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, remote).await;
+	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+
+	let local = fresh_local_dir("restart-lag");
+	write_file(&local, "sub/inner.txt", b"inner payload");
+	let baseline_db = temp_cache_path();
+
+	{
+		let engine = SyncEngine::open(cache.client.clone(), baseline_db.clone())
+			.await
+			.unwrap();
+		let pair = engine
+			.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+			.await
+			.unwrap();
+		let r1 = engine.sync_once(pair).await.unwrap();
+		assert!(r1.errors.is_empty(), "{r1:?}");
+		assert_eq!(r1.uploaded, 1, "{r1:?}");
+		assert_eq!(r1.remote_dirs_created, 1, "{r1:?}");
+		// Dropped with the cache still behind on both writes: no wait, no convergence poll.
+	}
+
+	let engine2 = SyncEngine::open(cache.client.clone(), baseline_db)
+		.await
+		.unwrap();
+	let pair2 = engine2
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	let r2 = engine2.sync_once(pair2).await.unwrap();
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.uploaded, 0, "the reopened engine re-uploaded: {r2:?}");
+	assert_eq!(
+		r2.remote_dirs_created, 0,
+		"the reopened engine re-created the directory: {r2:?}"
+	);
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
+
+	// Remote ground truth: one "sub", holding one "inner.txt" — no structural duplicate.
+	let (dirs, _files) = list_dir_of(&cache, &resources.dir).await;
+	let subs: Vec<&RemoteDirectory> = dirs.iter().filter(|d| d.name() == Some("sub")).collect();
+	assert_eq!(
+		subs.len(),
+		1,
+		"the restart left a duplicate remote directory"
+	);
+	let (_d, inner) = list_dir_of(&cache, subs[0]).await;
+	assert_eq!(
+		inner
+			.iter()
+			.filter(|f| f.name() == Some("inner.txt"))
+			.count(),
+		1,
+		"the restart left a duplicate remote file"
+	);
+
 	std::fs::remove_dir_all(&local).ok();
 }
 
