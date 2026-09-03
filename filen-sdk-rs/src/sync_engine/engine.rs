@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::{
 	SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
-	baseline::{BaselineEntry, BaselineState, BaselineStore, PairId, PairRecord},
+	baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord},
 	guard::{self, DeleteGuard},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
@@ -61,10 +61,11 @@ enum PendingKind {
 		path: String,
 		replaced: Option<Uuid>,
 	},
-	/// An item moved out of `from`. That is what makes "the cache has not applied our move yet"
-	/// distinguishable from "someone else moved the item after us", which must be reconciled at
-	/// once rather than waited out.
-	Moved { from: String },
+	/// An item moved from `from` to `to`. The source path is what makes "the cache has not applied
+	/// our move yet" distinguishable from "someone else moved the item after us", which must be
+	/// reconciled at once rather than waited out; the destination is where the view has to show it
+	/// in the meantime.
+	Moved { from: String, to: String },
 	/// An item this engine sent to the remote trash. Its baseline row is gone, so a snapshot that
 	/// has not applied the trash yet reads as "present remotely, untracked, absent locally" — a
 	/// deletion to make, which would trash it a second time.
@@ -197,13 +198,14 @@ impl PendingWrites {
 		self.record(observations, pair, uuid, PendingKind::Trashed);
 	}
 
-	/// Record a remote item this pass moved out of `from`.
+	/// Record a remote item this pass moved from `from` to `to`.
 	pub(super) fn record_move(
 		&self,
 		observations: &Observations,
 		pair: PairId,
 		uuid: Uuid,
 		from: &str,
+		to: &str,
 	) {
 		self.record(
 			observations,
@@ -211,6 +213,7 @@ impl PendingWrites {
 			uuid,
 			PendingKind::Moved {
 				from: from.to_string(),
+				to: to.to_string(),
 			},
 		);
 	}
@@ -278,24 +281,72 @@ impl PendingWrites {
 						None => true,
 					}
 				}
-				PendingKind::Moved { from } => snapshot_path
+				PendingKind::Moved { from, .. } => snapshot_path
 					.get(uuid)
 					.is_none_or(|path| *path == from.as_str()),
 				PendingKind::Trashed => snapshot_path.contains_key(uuid),
 			}
 		});
-		let (trashed, pending) = map
-			.iter()
-			.filter(|(_, write)| write.pair == pair)
-			.map(|(uuid, write)| (*uuid, matches!(write.kind, PendingKind::Trashed)))
-			.partition::<Vec<_>, _>(|(_, is_trash)| *is_trash);
-		let uuids =
-			|records: Vec<(Uuid, bool)>| records.into_iter().map(|(uuid, _)| uuid).collect();
 		plan::PassHolds {
-			pending: uuids(pending),
-			trashed: uuids(trashed),
+			trashed: map
+				.iter()
+				.filter(|(_, write)| {
+					write.pair == pair && matches!(write.kind, PendingKind::Trashed)
+				})
+				.map(|(uuid, _)| *uuid)
+				.collect(),
 			..Default::default()
 		}
+	}
+
+	/// Fold this pair's surviving records into `nodes` — the path-keyed remote view built from the
+	/// cache snapshot — and return how many were applied.
+	///
+	/// The cache learns of this engine's own writes only through socket events and resyncs, so a
+	/// pass run seconds after the previous one reads a remote that is missing what that pass just
+	/// wrote. The engine knows exactly what it wrote, so its remote view is the snapshot PLUS its
+	/// own unacknowledged writes: that is what lets the pass act on the path — push a second edit,
+	/// carry the file on — instead of leaving it alone until the cache agrees.
+	///
+	/// `baseline` supplies the written state: the apply layer writes each row immediately after
+	/// the write it describes, so the row IS the post-write truth. A record only survives
+	/// [`settle`](Self::settle) while the cache demonstrably still shows the pre-write state, so a
+	/// fold never paints over somebody else's write.
+	pub(super) fn fold_into(
+		&self,
+		pair: PairId,
+		baseline: &HashMap<String, BaselineEntry>,
+		nodes: &mut HashMap<String, RemoteNode>,
+	) -> usize {
+		let map = self.map();
+		let mut writes: Vec<(&Uuid, &PendingWrite)> =
+			map.iter().filter(|(_, write)| write.pair == pair).collect();
+		if writes.is_empty() {
+			return 0;
+		}
+		// Oldest first: two writes can name one path (a re-upload on the very next pass), and the
+		// later one has to land on top.
+		writes.sort_unstable_by_key(|(_, write)| write.at);
+		// uuid -> where the view holds it, kept current as the fold edits the view; a scan per
+		// record would be quadratic on a large tree right after a large pass.
+		let mut path_of: HashMap<Uuid, String> = nodes
+			.iter()
+			.map(|(path, node)| (node.remote_uuid, path.clone()))
+			.collect();
+		let mut folded = 0;
+		for (uuid, write) in writes {
+			let applied = match &write.kind {
+				PendingKind::Created { path, replaced } => {
+					fold_create(nodes, &mut path_of, baseline, *uuid, path, *replaced)
+				}
+				PendingKind::Moved { from, to } => {
+					fold_move(nodes, &mut path_of, baseline, *uuid, from, to)
+				}
+				PendingKind::Trashed => fold_trash(nodes, &mut path_of, *uuid),
+			};
+			folded += usize::from(applied);
+		}
+		folded
 	}
 
 	fn map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, PendingWrite>> {
@@ -304,6 +355,130 @@ impl PendingWrites {
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
 	}
+}
+
+/// The remote node a baseline row describes — the state the write it records left behind.
+fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> {
+	let entry = entry?;
+	Some(RemoteNode {
+		rel_path: entry.rel_path.clone(),
+		kind: entry.kind,
+		remote_uuid: entry.remote_uuid?,
+		content_hash: entry.content_hash,
+		size: entry.size.unwrap_or(0),
+		modified_millis: entry.remote_modified.unwrap_or(0),
+	})
+}
+
+/// Put `node` at `path`, keeping the uuid index in step with whatever it displaces.
+fn place_node(
+	nodes: &mut HashMap<String, RemoteNode>,
+	path_of: &mut HashMap<Uuid, String>,
+	path: String,
+	node: RemoteNode,
+) {
+	let uuid = node.remote_uuid;
+	if let Some(previous) = nodes.insert(path.clone(), node) {
+		path_of.remove(&previous.remote_uuid);
+	}
+	path_of.insert(uuid, path);
+}
+
+/// Show what we wrote at `path`, over the uuid it replaced there.
+///
+/// The node comes from the baseline row at `path` whatever uuid that row names, not from the
+/// record's own uuid: a second write to the same path inside the window supersedes the first, and
+/// its record is retired by the very snapshot lag this fold exists for (the path holds neither of
+/// our uuids, so it reads as foreign). The surviving record still proves the path is ours, and the
+/// row is where the latest write recorded itself.
+fn fold_create(
+	nodes: &mut HashMap<String, RemoteNode>,
+	path_of: &mut HashMap<Uuid, String>,
+	baseline: &HashMap<String, BaselineEntry>,
+	uuid: Uuid,
+	path: &str,
+	replaced: Option<Uuid>,
+) -> bool {
+	let Some(node) = written_node(baseline.get(path)) else {
+		return false;
+	};
+	match nodes.get(path).map(|node| node.remote_uuid) {
+		// The cache is showing what our baseline records: it has caught up.
+		Some(current) if current == node.remote_uuid => return false,
+		// Ours — the write itself, or the version it superseded — so the cache is behind on us.
+		Some(current) if current == uuid || Some(current) == replaced => {}
+		None => {}
+		// Somebody else's item: the pass has to reconcile against it, and `settle` retires such a
+		// record anyway.
+		Some(_) => return false,
+	}
+	place_node(nodes, path_of, path.to_string(), node);
+	true
+}
+
+/// Show the item we moved at its destination rather than where the cache still lists it. Only
+/// files are ever moved on the remote, so there is no subtree to carry along.
+fn fold_move(
+	nodes: &mut HashMap<String, RemoteNode>,
+	path_of: &mut HashMap<Uuid, String>,
+	baseline: &HashMap<String, BaselineEntry>,
+	uuid: Uuid,
+	from: &str,
+	to: &str,
+) -> bool {
+	let vacated = match path_of.get(&uuid).map(String::as_str) {
+		// Already where we moved it.
+		Some(at) if at == to => return false,
+		// The pre-move path the cache still shows: take the node off it, whatever the destination
+		// turns out to hold — the one thing this move makes certain is that the item is not here.
+		Some(at) if at == from => {
+			path_of.remove(&uuid);
+			nodes.remove(from)
+		}
+		// Somewhere else entirely — not our move lagging, so the snapshot stands.
+		Some(_) => return false,
+		None => None,
+	};
+	// Somebody else's item holds the destination: it superseded ours there while the move was in
+	// flight, so leave the path showing what really sits on it. Vacating the pre-move path was
+	// still right — without it the reconciler reads the item we moved as an untracked remote entry
+	// and trashes it.
+	if nodes.get(to).is_some_and(|node| node.remote_uuid != uuid) {
+		return vacated.is_some();
+	}
+	let node =
+		vacated.or_else(|| written_node(baseline.get(to)).filter(|node| node.remote_uuid == uuid));
+	let Some(mut node) = node else {
+		return false;
+	};
+	node.rel_path = to.to_string();
+	place_node(nodes, path_of, to.to_string(), node);
+	true
+}
+
+/// Take the item we trashed out of the view — and, for a directory, everything under it, which the
+/// server trashed with it.
+fn fold_trash(
+	nodes: &mut HashMap<String, RemoteNode>,
+	path_of: &mut HashMap<Uuid, String>,
+	uuid: Uuid,
+) -> bool {
+	let Some(path) = path_of.remove(&uuid) else {
+		return false;
+	};
+	let Some(node) = nodes.remove(&path) else {
+		return false;
+	};
+	if node.kind == NodeKind::Dir {
+		nodes.retain(|key, node| {
+			let keep = !plan::is_under(key, &path);
+			if !keep {
+				path_of.remove(&node.remote_uuid);
+			}
+			keep
+		});
+	}
+	true
 }
 
 /// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus the
@@ -343,6 +518,11 @@ struct Prepared {
 	/// watermark). When false, the snapshot's emptiness is untrustworthy and remote-driven
 	/// deletions are held by the guard.
 	remote_converged: bool,
+	/// Whether the cache SNAPSHOT — before this engine's own unacknowledged writes were folded
+	/// into it — was wholly empty while the baseline still tracks remote items: what a transient
+	/// backend/cache fault looks like. Read from the snapshot, never the folded view, so folding
+	/// our own writes back in cannot mask the fault and let the guard through.
+	remote_emptied: bool,
 	/// What this pass must not act on (see [`plan::PassHolds`]).
 	holds: plan::PassHolds,
 	dirs: Vec<CacheableDir<'static>>,
@@ -645,10 +825,22 @@ impl SyncEngine {
 			.client
 			.enumerate_sync_root_snapshot(record.remote_root)
 			.await?;
-		let remote_view =
+		let mut remote_view =
 			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
 
+		let remote_emptied =
+			remote_view.nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some());
 		let mut holds = self.pending.settle(pair, &observed, &remote_view.nodes);
+		// Correct the view with what this engine wrote and the cache has not shown yet, BEFORE
+		// anything reconciles or detects moves against it.
+		let folded = self
+			.pending
+			.fold_into(pair, &baseline, &mut remote_view.nodes);
+		if folded > 0 {
+			tracing::debug!(
+				"sync_once[pair {pair}]: folding {folded} unacknowledged write(s) into the remote view"
+			);
+		}
 		holds.held_remote = remote_view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
@@ -658,6 +850,7 @@ impl SyncEngine {
 			local_scan,
 			remote_view,
 			remote_converged: snapshot.watermark.is_some(),
+			remote_emptied,
 			holds,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
@@ -982,10 +1175,9 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 	guard::ScreenState {
 		scan_complete: prep.local_scan.complete,
 		remote_converged: prep.remote_converged,
-		// A wholly empty remote view while the baseline still tracks remote items: what a
+		// A wholly empty remote snapshot while the baseline still tracks remote items: what a
 		// transient backend/cache fault looks like, and it would otherwise delete the whole pair.
-		remote_emptied: prep.remote_view.nodes.is_empty()
-			&& prep.baseline.values().any(|e| e.remote_uuid.is_some()),
+		remote_emptied: prep.remote_emptied,
 		first_sync: prep.baseline.is_empty(),
 		tracked: prep.baseline.len(),
 	}
@@ -1212,6 +1404,68 @@ mod tests {
 		)])
 	}
 
+	/// A baseline row as the apply layer writes it straight after a remote write.
+	fn written_at(
+		path: &str,
+		uuid: Uuid,
+		kind: NodeKind,
+		hash: Option<Blake3Hash>,
+	) -> BaselineEntry {
+		BaselineEntry {
+			rel_path: path.to_string(),
+			kind,
+			remote_uuid: Some(uuid),
+			content_hash: hash,
+			size: Some(5),
+			local_mtime: Some(111),
+			remote_modified: Some(222),
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+		}
+	}
+
+	/// The baseline an upload of `a.txt` leaves behind.
+	fn written_row(uuid: Uuid, hash: Blake3Hash) -> HashMap<String, BaselineEntry> {
+		HashMap::from([(
+			"a.txt".to_string(),
+			written_at("a.txt", uuid, NodeKind::File, Some(hash)),
+		)])
+	}
+
+	/// The everyday complaint: a second edit within a few seconds of the first. The cache has not
+	/// listed our upload yet, but the engine knows exactly what it wrote there — so the pass must
+	/// push the new content rather than leave the path alone until the cache agrees.
+	#[test]
+	fn a_local_edit_at_a_path_whose_create_is_pending_is_pushed() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let uuid = Uuid::new_v4();
+		pending.record_create(&observations, PAIR, uuid, "a.txt", None);
+
+		let baseline = written_row(uuid, hash(1));
+		// The cache is behind: its snapshot has nothing at all under the root yet.
+		let mut remote = HashMap::new();
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		pending.fold_into(PAIR, &baseline, &mut remote);
+
+		let actions = plan::reconcile(
+			SyncMode::LocalToRemote,
+			&baseline,
+			&local_map(hash(2)),
+			&remote,
+			&holds,
+		)
+		.actions;
+		assert_eq!(
+			actions.iter().map(describe).collect::<Vec<_>>(),
+			vec!["upload file \"a.txt\"".to_string()],
+			"the edit is pushed against what we wrote, not deferred until the cache catches up"
+		);
+	}
+
 	/// The everyday case the snapshot alone cannot settle: the file we uploaded is gone again —
 	/// trashed by the user, or superseded by another client's re-upload — so its uuid will NEVER
 	/// appear in a snapshot. Waiting for it to appear froze the path for the whole grace window
@@ -1227,12 +1481,16 @@ mod tests {
 		observations.note([uuid]);
 		let observed = observations.snapshot();
 
-		assert!(
-			pending
-				.settle(PAIR, &observed, &HashMap::new())
-				.pending
-				.is_empty(),
+		let mut remote = HashMap::new();
+		pending.settle(PAIR, &observed, &remote);
+		assert_eq!(
+			pending.fold_into(PAIR, &written_row(uuid, hash(1)), &mut remote),
+			0,
 			"an announced uuid retires the write even with nothing left at the path"
+		);
+		assert!(
+			remote.is_empty(),
+			"and the snapshot is believed again: the item really is gone"
 		);
 	}
 
@@ -1250,11 +1508,14 @@ mod tests {
 		let observed = observations.snapshot();
 		observations.note([uuid]);
 
+		let mut remote = HashMap::new();
+		pending.settle(PAIR, &observed, &remote);
 		assert_eq!(
-			pending.settle(PAIR, &observed, &HashMap::new()).pending,
-			HashSet::from([uuid]),
+			pending.fold_into(PAIR, &written_row(uuid, hash(1)), &mut remote),
+			1,
 			"only what was known before the snapshot may retire a write against it"
 		);
+		assert_eq!(remote["a.txt"].remote_uuid, uuid);
 	}
 
 	/// A move's uuid was necessarily announced earlier, when the item was created. Only an
@@ -1266,42 +1527,238 @@ mod tests {
 		let uuid = Uuid::new_v4();
 
 		observations.note([uuid]);
-		pending.record_move(&observations, PAIR, uuid, "a.txt");
+		pending.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
 
-		let remote = node_at("a.txt", uuid);
+		let baseline = HashMap::from([(
+			"b.txt".to_string(),
+			written_at("b.txt", uuid, NodeKind::File, Some(hash(1))),
+		)]);
+		let mut remote = node_at("a.txt", uuid);
+		pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
-			pending
-				.settle(PAIR, &observations.snapshot(), &remote)
-				.pending,
-			HashSet::from([uuid]),
+			pending.fold_into(PAIR, &baseline, &mut remote),
+			1,
 			"the snapshot still shows the pre-move path and nothing new has been announced"
 		);
 
 		observations.note([uuid]);
-		assert!(
-			pending
-				.settle(PAIR, &observations.snapshot(), &remote)
-				.pending
-				.is_empty(),
+		let mut remote = node_at("a.txt", uuid);
+		pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(
+			pending.fold_into(PAIR, &baseline, &mut remote),
+			0,
 			"an announcement made after the move retires it"
 		);
 	}
 
-	/// The upload replaced `old` at the path. While the snapshot still shows exactly `old`, the
-	/// cache is simply behind on us and the path stays frozen.
+	/// The pass moved the file on; the cache still lists it where it was. The view has to show it
+	/// where we put it, or the pass reads the move as a remote-side delete plus a local create.
 	#[test]
-	fn the_replaced_uuid_still_at_the_path_keeps_the_write_pending() {
+	fn a_pending_move_is_folded_to_its_destination() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let uuid = Uuid::new_v4();
+		pending.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
+
+		let baseline = HashMap::from([(
+			"b.txt".to_string(),
+			written_at("b.txt", uuid, NodeKind::File, Some(hash(3))),
+		)]);
+		let mut remote = node_at("a.txt", uuid);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+
+		assert!(
+			!remote.contains_key("a.txt"),
+			"the pre-move path is vacated"
+		);
+		assert_eq!(remote["b.txt"].remote_uuid, uuid);
+		let local = HashMap::from([(
+			"b.txt".to_string(),
+			LocalNode {
+				rel_path: "b.txt".to_string(),
+				kind: NodeKind::File,
+				size: 5,
+				mtime_millis: 111,
+				content_hash: Some(hash(3)),
+			},
+		)]);
+		assert!(
+			plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds)
+				.actions
+				.is_empty(),
+			"both sides agree once the move is folded in: the pass has nothing to do"
+		);
+	}
+
+	/// The destination was taken while our move was in flight (another client uploaded over it,
+	/// and the cache learned of that before it learned of the move). We cannot claim `b.txt` — but
+	/// we know for certain the file is no longer at `a.txt`, and leaving it there hands the
+	/// reconciler an untracked remote item to trash: the very file we just moved.
+	#[test]
+	fn a_move_whose_destination_was_taken_still_vacates_the_pre_move_path() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (uuid, foreign) = (Uuid::new_v4(), Uuid::new_v4());
+		pending.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
+
+		let baseline = HashMap::from([(
+			"b.txt".to_string(),
+			written_at("b.txt", uuid, NodeKind::File, Some(hash(3))),
+		)]);
+		let mut remote = node_at("a.txt", uuid);
+		remote.extend(node_at("b.txt", foreign));
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+
+		assert!(
+			!remote.contains_key("a.txt"),
+			"the pre-move path is vacated even though the destination is somebody else's"
+		);
+		assert_eq!(
+			remote["b.txt"].remote_uuid, foreign,
+			"and the destination is left showing what really sits there"
+		);
+		let local = HashMap::from([(
+			"b.txt".to_string(),
+			LocalNode {
+				rel_path: "b.txt".to_string(),
+				kind: NodeKind::File,
+				size: 5,
+				mtime_millis: 111,
+				content_hash: Some(hash(3)),
+			},
+		)]);
+		let actions =
+			plan::reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote, &holds).actions;
+		assert!(
+			!actions
+				.iter()
+				.any(|action| describe(action).contains("\"a.txt\"")),
+			"the file we moved is not trashed at the path we moved it off: {:?}",
+			actions.iter().map(describe).collect::<Vec<_>>()
+		);
+	}
+
+	/// A trash the cache has not applied reads as an untracked remote item with nothing local —
+	/// a deletion to make all over again. Folding takes it out of the view instead, subtree and
+	/// all, since the server trashes a directory whole.
+	#[test]
+	fn a_pending_trash_takes_the_item_out_of_the_view() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (dir, child) = (Uuid::new_v4(), Uuid::new_v4());
+		pending.record_trash(&observations, PAIR, dir);
+
+		let mut remote = HashMap::from([
+			(
+				"d".to_string(),
+				RemoteNode {
+					rel_path: "d".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: dir,
+					content_hash: None,
+					size: 0,
+					modified_millis: 0,
+				},
+			),
+			(
+				"d/x.txt".to_string(),
+				RemoteNode {
+					rel_path: "d/x.txt".to_string(),
+					kind: NodeKind::File,
+					remote_uuid: child,
+					content_hash: Some(hash(4)),
+					size: 5,
+					modified_millis: 0,
+				},
+			),
+		]);
+		// Trashing dropped both baseline rows, and the local side is gone too.
+		let (baseline, local) = (HashMap::new(), HashMap::new());
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		assert!(
+			remote.is_empty(),
+			"the trashed directory takes its subtree with it"
+		);
+		assert!(
+			holds.trashed.contains(&dir),
+			"the deletion of that uuid is still suppressed, whatever a view shows"
+		);
+		assert!(
+			plan::reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote, &holds)
+				.actions
+				.is_empty(),
+			"nothing is trashed a second time"
+		);
+	}
+
+	/// The upload replaced `old` at the path: the cache is simply behind on us, so the view has to
+	/// show OUR item there — the one the next edit is measured against.
+	#[test]
+	fn a_pending_create_is_folded_over_the_uuid_it_replaced() {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
 		pending.record_create(&observations, PAIR, new, "a.txt", Some(old));
 
+		let baseline = written_row(new, hash(1));
+		let mut remote = node_at("a.txt", old);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
 		assert_eq!(
-			pending
-				.settle(PAIR, &observations.snapshot(), &node_at("a.txt", old))
-				.pending,
-			HashSet::from([new]),
-			"the pre-write occupant is what a lagging cache shows"
+			remote["a.txt"].remote_uuid, new,
+			"the pre-write occupant is what a lagging cache shows; ours supersedes it"
+		);
+		assert_eq!(remote.len(), 1, "and does not leave the old one behind");
+
+		// A further local edit is then pushed rather than left alone.
+		let actions = plan::reconcile(
+			SyncMode::LocalToRemote,
+			&baseline,
+			&local_map(hash(2)),
+			&remote,
+			&holds,
+		)
+		.actions;
+		assert_eq!(
+			actions.iter().map(describe).collect::<Vec<_>>(),
+			vec!["upload file \"a.txt\"".to_string()],
+		);
+	}
+
+	/// Two uploads to one path inside the window: the second's record is retired by the very lag
+	/// the fold exists for (the cache still shows the version the FIRST one replaced, which reads
+	/// as foreign to it), so the view has to be corrected from the surviving record. Left to the
+	/// snapshot, a two-way pass reads both sides as changed and raises a conflict nobody caused.
+	#[test]
+	fn two_writes_to_one_path_inside_the_window_show_the_latest() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (old, first, second) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+		pending.record_create(&observations, PAIR, first, "a.txt", Some(old));
+		pending.record_create(&observations, PAIR, second, "a.txt", Some(first));
+
+		let baseline = written_row(second, hash(2));
+		let mut remote = node_at("a.txt", old);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		assert_eq!(
+			remote["a.txt"].remote_uuid, second,
+			"the latest write is what the path holds"
+		);
+		assert!(
+			plan::reconcile(
+				SyncMode::TwoWay,
+				&baseline,
+				&local_map(hash(2)),
+				&remote,
+				&holds
+			)
+			.actions
+			.is_empty(),
+			"and both sides agree, so there is no conflict to raise"
 		);
 	}
 
@@ -1314,16 +1771,57 @@ mod tests {
 		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());
 		pending.record_create(&observations, PAIR, new, "a.txt", Some(old));
 
-		assert!(
-			pending
-				.settle(
-					PAIR,
-					&observations.snapshot(),
-					&node_at("a.txt", Uuid::new_v4())
-				)
-				.pending
-				.is_empty(),
+		let foreign = Uuid::new_v4();
+		let mut remote = node_at("a.txt", foreign);
+		pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(
+			pending.fold_into(PAIR, &written_row(new, hash(1)), &mut remote),
+			0,
 			"a uuid that is neither ours nor the one we replaced is a foreign write"
+		);
+		assert_eq!(
+			remote["a.txt"].remote_uuid, foreign,
+			"and it must stand, so the pass reconciles against it at once"
+		);
+	}
+
+	/// A path held in conflict is re-reported every pass until the caller resolves it, and its
+	/// subtree stays suppressed — including when this engine has just written there.
+	#[test]
+	fn a_conflicted_path_is_re_reported_even_with_a_write_folded_at_it() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let uuid = Uuid::new_v4();
+		pending.record_create(&observations, PAIR, uuid, "d", None);
+
+		let baseline = HashMap::from([(
+			"d".to_string(),
+			BaselineEntry {
+				state: BaselineState::Conflicted,
+				..written_at("d", uuid, NodeKind::Dir, None)
+			},
+		)]);
+		// A new local file under the held path: an upload the pass must not attempt while the
+		// name itself is unresolved.
+		let local = HashMap::from([(
+			"d/x.txt".to_string(),
+			LocalNode {
+				rel_path: "d/x.txt".to_string(),
+				kind: NodeKind::File,
+				size: 5,
+				mtime_millis: 111,
+				content_hash: Some(hash(2)),
+			},
+		)]);
+
+		let mut remote = HashMap::new();
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		let actions = plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds).actions;
+		assert_eq!(
+			actions.iter().map(describe).collect::<Vec<_>>(),
+			vec!["conflict \"d\"".to_string()],
+			"the held conflict is still reported, and nothing under it is acted on"
 		);
 	}
 
@@ -1343,25 +1841,33 @@ mod tests {
 
 		let holds = pending.settle(PAIR + 1, &observations.snapshot(), &foreign);
 		assert!(
-			holds.trashed.is_empty() && holds.pending.is_empty(),
+			holds.trashed.is_empty(),
 			"a pass holds nothing on behalf of another pair"
 		);
-
-		let holds = pending.settle(
-			PAIR,
-			&observations.snapshot(),
-			&node_at("gone.txt", trashed),
+		assert_eq!(
+			pending.fold_into(PAIR + 1, &HashMap::new(), &mut foreign.clone()),
+			0,
+			"nor does it fold another pair's writes into its own view"
 		);
+
+		let mut remote = node_at("gone.txt", trashed);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
 			holds.trashed,
 			HashSet::from([trashed]),
 			"the owning pair's snapshot still shows the item untrashed"
 		);
+		let baseline = HashMap::from([(
+			"note.txt".to_string(),
+			written_at("note.txt", created, NodeKind::File, Some(hash(1))),
+		)]);
 		assert_eq!(
-			holds.pending,
-			HashSet::from([created]),
-			"and still has not caught up to the create"
+			pending.fold_into(PAIR, &baseline, &mut remote),
+			2,
+			"and still has not caught up to either write"
 		);
+		assert!(!remote.contains_key("gone.txt"), "the trash is folded out");
+		assert_eq!(remote["note.txt"].remote_uuid, created);
 	}
 
 	/// The oldest surviving write's stamp bounds what still has to be remembered; with nothing
@@ -1381,12 +1887,7 @@ mod tests {
 		);
 
 		observations.note([uuid]);
-		assert!(
-			pending
-				.settle(PAIR, &observations.snapshot(), &HashMap::new())
-				.pending
-				.is_empty()
-		);
+		pending.settle(PAIR, &observations.snapshot(), &HashMap::new());
 		observations.prune_before(pending.oldest_stamp());
 		assert!(
 			observations.snapshot().is_empty(),
