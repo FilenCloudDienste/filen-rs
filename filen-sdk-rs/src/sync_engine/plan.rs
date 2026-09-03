@@ -1086,7 +1086,7 @@ mod tests {
 	use chrono::{DateTime, Utc};
 
 	use super::{
-		super::engine::{Observations, PendingWrites},
+		super::engine::{Observations, PendingKind, PendingWrites},
 		*,
 	};
 	use crate::sync_engine::SyncMode;
@@ -1578,7 +1578,15 @@ mod tests {
 		let remote = HashMap::new();
 		let observations = Observations::default();
 		let writes = PendingWrites::default();
-		writes.record_create(&observations, PAIR, uuid, "a.txt", None);
+		writes.record(
+			&observations,
+			PAIR,
+			uuid,
+			PendingKind::Created {
+				path: "a.txt".to_string(),
+				replaced: None,
+			},
+		);
 		for mode in ALL_MODES {
 			assert!(
 				plan_folded(mode, &baseline, &local, &remote, &writes).is_empty(),
@@ -1674,8 +1682,24 @@ mod tests {
 		// Neither the new dir nor its child has reached the cache yet.
 		let observations = Observations::default();
 		let writes = PendingWrites::default();
-		writes.record_create(&observations, PAIR, dir_uuid, "d", None);
-		writes.record_create(&observations, PAIR, file_uuid, "d/x.txt", None);
+		writes.record(
+			&observations,
+			PAIR,
+			dir_uuid,
+			PendingKind::Created {
+				path: "d".to_string(),
+				replaced: None,
+			},
+		);
+		writes.record(
+			&observations,
+			PAIR,
+			file_uuid,
+			PendingKind::Created {
+				path: "d/x.txt".to_string(),
+				replaced: None,
+			},
+		);
 		assert!(
 			plan_folded(
 				SyncMode::LocalToRemote,
@@ -1710,7 +1734,15 @@ mod tests {
 		]);
 		let observations = Observations::default();
 		let writes = PendingWrites::default();
-		writes.record_create(&observations, PAIR, dir_uuid, "d", None);
+		writes.record(
+			&observations,
+			PAIR,
+			dir_uuid,
+			PendingKind::Created {
+				path: "d".to_string(),
+				replaced: None,
+			},
+		);
 		assert_eq!(
 			plan_folded(
 				SyncMode::LocalToRemote,
@@ -1736,7 +1768,15 @@ mod tests {
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
 		let observations = Observations::default();
 		let writes = PendingWrites::default();
-		writes.record_move(&observations, PAIR, uuid, "a.txt", "b.txt");
+		writes.record(
+			&observations,
+			PAIR,
+			uuid,
+			PendingKind::Moved {
+				from: "a.txt".to_string(),
+				to: "b.txt".to_string(),
+			},
+		);
 		for mode in ALL_MODES {
 			assert!(
 				plan_folded(mode, &baseline, &local, &remote, &writes).is_empty(),

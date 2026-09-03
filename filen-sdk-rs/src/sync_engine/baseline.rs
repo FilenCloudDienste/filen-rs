@@ -15,12 +15,12 @@ use filen_types::crypto::Blake3Hash;
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
-use super::mode::SyncMode;
+use super::{engine::PendingKind, mode::SyncMode};
 
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`. A DB
 /// carrying a HIGHER version was written by a newer engine and is REFUSED (never read under the
 /// older rules, which would misread it into deletes); a LOWER one is migrated forward in place.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Schema for the baseline DB. `foreign_keys` is applied per-connection in [`BaselineStore::init`]
 /// (it resets to off on every open). No WAL: a single owner writes and reads this DB, so the
@@ -51,6 +51,27 @@ CREATE TABLE IF NOT EXISTS baseline (
 	PRIMARY KEY (pair_id, rel_path)
 );
 ";
+
+/// The v2 addition: the journal of remote writes this engine has made that the cache has not
+/// announced yet (see [`PendingWrites`](super::engine::PendingWrites)). Keyed by uuid, like the
+/// in-memory journal it mirrors, and cascaded with its pair.
+const PENDING_WRITES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS pending_writes (
+	uuid BLOB PRIMARY KEY,
+	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+	kind INTEGER NOT NULL,
+	path TEXT,
+	replaced BLOB,
+	from_path TEXT,
+	to_path TEXT,
+	recorded_at INTEGER NOT NULL
+);
+";
+
+/// `pending_writes.kind` discriminants — what the write did.
+const KIND_CREATED: i64 = 1;
+const KIND_MOVED: i64 = 2;
+const KIND_TRASHED: i64 = 3;
 
 /// Whether a baseline row describes a directory or a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +156,24 @@ pub(crate) struct BaselineEntry {
 	pub(crate) remote_size: Option<u64>,
 }
 
+/// One row of the persisted pending-write journal: a remote write this engine made, and when by
+/// the WALL clock (unix millis — the in-memory journal's `Instant` does not outlive its process).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRow {
+	pub(crate) pair: PairId,
+	pub(crate) uuid: Uuid,
+	pub(crate) kind: PendingKind,
+	pub(crate) recorded_at: i64,
+}
+
+/// A baseline edit a remote write produced, committed in the same transaction as that write's
+/// journal row.
+#[derive(Debug)]
+pub(crate) enum BaselineChange<'a> {
+	Upsert(&'a BaselineEntry),
+	Delete(&'a str),
+}
+
 /// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairRecord {
@@ -189,6 +228,18 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
 	rows.try_fold(false, |found, name| Ok(found || name? == column))
 }
 
+/// Bring a DB stamped at `from` up to [`SCHEMA_VERSION`], one version at a time. A fresh DB starts
+/// at 0 and runs every step, so each one is idempotent against the tables [`SCHEMA`] just created.
+fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
+	if from < 1 {
+		migrate_to_v1(conn)?;
+	}
+	if from < 2 {
+		migrate_to_v2(conn)?;
+	}
+	Ok(())
+}
+
 /// Bring a version-0 DB (written before `user_version` was stamped, so without the per-side
 /// conflict-evidence columns) up to v1. A DB freshly created from [`SCHEMA`] already has them, so
 /// this is a no-op there.
@@ -204,6 +255,12 @@ fn migrate_to_v1(conn: &Connection) -> rusqlite::Result<()> {
 		}
 	}
 	Ok(())
+}
+
+/// Bring a v1 DB up to v2: the pending-write journal. A v1 DB simply has none, so creating the
+/// table is the whole migration — no existing row is read or rewritten.
+fn migrate_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+	conn.execute_batch(PENDING_WRITES_SCHEMA)
 }
 
 impl BaselineStore {
@@ -233,10 +290,11 @@ impl BaselineStore {
 				),
 			));
 		}
-		// Idempotent: creates the v1 schema on a fresh DB, no-ops on an existing one.
+		// Idempotent: creates the base tables on a fresh DB, no-ops on an existing one; the
+		// migrations below add everything a later version introduced.
 		conn.execute_batch(SCHEMA).map_err(open_error)?;
 		if version < SCHEMA_VERSION {
-			migrate_to_v1(&conn).map_err(open_error)?;
+			migrate(&conn, version).map_err(open_error)?;
 			conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
 				.map_err(open_error)?;
 		}
@@ -359,6 +417,127 @@ impl BaselineStore {
 		Ok(())
 	}
 
+	/// Journal a remote write AND apply the baseline edits it produced, in ONE transaction.
+	///
+	/// The two have to land together: the journal row is what a reopened engine folds into its
+	/// remote view, and the baseline row is the written state it folds. A crash between them leaves
+	/// the next pass either re-doing the write or folding a row that describes nothing.
+	pub(crate) fn record_pending(
+		&self,
+		pair: PairId,
+		uuid: Uuid,
+		kind: &PendingKind,
+		recorded_at: i64,
+		changes: &[BaselineChange<'_>],
+	) -> rusqlite::Result<()> {
+		let tx = self.conn.unchecked_transaction()?;
+		let (kind_id, path, replaced, from_path, to_path) = match kind {
+			PendingKind::Created { path, replaced } => {
+				(KIND_CREATED, Some(path.as_str()), *replaced, None, None)
+			}
+			PendingKind::Moved { from, to } => (
+				KIND_MOVED,
+				None,
+				None,
+				Some(from.as_str()),
+				Some(to.as_str()),
+			),
+			PendingKind::Trashed => (KIND_TRASHED, None, None, None, None),
+		};
+		self.conn.execute(
+			"INSERT OR REPLACE INTO pending_writes
+			 (uuid, pair_id, kind, path, replaced, from_path, to_path, recorded_at)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+			params![
+				uuid,
+				pair,
+				kind_id,
+				path,
+				replaced,
+				from_path,
+				to_path,
+				recorded_at
+			],
+		)?;
+		for change in changes {
+			match change {
+				BaselineChange::Upsert(entry) => self.upsert_entry(pair, entry)?,
+				BaselineChange::Delete(rel_path) => self.delete_entry(pair, rel_path)?,
+			}
+		}
+		tx.commit()
+	}
+
+	/// Retire journal rows the in-memory journal has dropped (the cache caught up, or the grace
+	/// window ran out).
+	pub(crate) fn delete_pending(&self, uuids: &[Uuid]) -> rusqlite::Result<()> {
+		let mut stmt = self
+			.conn
+			.prepare("DELETE FROM pending_writes WHERE uuid = ?1")?;
+		for uuid in uuids {
+			stmt.execute(params![uuid])?;
+		}
+		Ok(())
+	}
+
+	/// The journal a previous engine left behind, minus the rows no engine may act on any more —
+	/// those older than `grace_millis` (the same ceiling the in-memory journal applies) and those
+	/// naming a pair that is gone. Both are DELETED here, so the journal cannot accumulate.
+	pub(crate) fn load_pending(
+		&self,
+		now: i64,
+		grace_millis: i64,
+	) -> rusqlite::Result<Vec<PendingRow>> {
+		self.conn.execute(
+			"DELETE FROM pending_writes WHERE pair_id NOT IN (SELECT id FROM sync_pairs)",
+			[],
+		)?;
+		self.conn.execute(
+			"DELETE FROM pending_writes WHERE recorded_at <= ?1",
+			params![now.saturating_sub(grace_millis)],
+		)?;
+		self.conn
+			.prepare(
+				"SELECT pair_id, uuid, kind, path, replaced, from_path, to_path, recorded_at
+				 FROM pending_writes",
+			)?
+			.query_map([], Self::row_to_pending)?
+			.collect()
+	}
+
+	fn row_to_pending(row: &Row<'_>) -> rusqlite::Result<PendingRow> {
+		let kind_raw: i64 = row.get("kind")?;
+		let missing = |what: &str| {
+			rusqlite::Error::FromSqlConversionFailure(
+				0,
+				Type::Null,
+				format!("pending_writes row of kind {kind_raw} has no {what}").into(),
+			)
+		};
+		let text = |column: &str| -> rusqlite::Result<String> {
+			row.get::<_, Option<String>>(column)?
+				.ok_or_else(|| missing(column))
+		};
+		let kind = match kind_raw {
+			KIND_CREATED => PendingKind::Created {
+				path: text("path")?,
+				replaced: row.get("replaced")?,
+			},
+			KIND_MOVED => PendingKind::Moved {
+				from: text("from_path")?,
+				to: text("to_path")?,
+			},
+			KIND_TRASHED => PendingKind::Trashed,
+			_ => return Err(corrupt("pending write kind", kind_raw)),
+		};
+		Ok(PendingRow {
+			pair: row.get("pair_id")?,
+			uuid: row.get("uuid")?,
+			kind,
+			recorded_at: row.get("recorded_at")?,
+		})
+	}
+
 	fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<BaselineEntry> {
 		let kind_raw: i64 = row.get("kind")?;
 		let state_raw: i64 = row.get("state")?;
@@ -428,6 +607,29 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+		}
+	}
+
+	/// A unique temp path for a store that has to be closed and reopened.
+	fn temp_db_path(tag: &str) -> std::path::PathBuf {
+		std::env::temp_dir().join(format!("filen_baseline_{tag}_{}.db", Uuid::new_v4()))
+	}
+
+	/// Wall-clock stamps for the journal tests, and the ceiling they are measured against.
+	const NOW: i64 = 1_800_000_000_000;
+	const GRACE: i64 = 180_000;
+
+	fn pending_count(store: &BaselineStore) -> i64 {
+		store
+			.conn
+			.query_row("SELECT COUNT(*) FROM pending_writes", [], |row| row.get(0))
+			.unwrap()
+	}
+
+	fn created(path: &str) -> PendingKind {
+		PendingKind::Created {
+			path: path.to_string(),
+			replaced: None,
 		}
 	}
 
@@ -605,5 +807,212 @@ mod tests {
 			store.entries(pair).unwrap().is_empty(),
 			"ON DELETE CASCADE dropped the baseline rows"
 		);
+	}
+
+	/// The whole point of persisting the journal: the engine that made the write is gone, and the
+	/// one that reopens the DB has to find both halves — the record AND the baseline row that says
+	/// what the write left behind, which is what a fold reads.
+	#[test]
+	fn a_pending_write_and_the_row_it_produced_survive_a_reopen() {
+		let path = temp_db_path("pending_reopen");
+		let entry = file_entry("a.txt", [7u8; 32], 5);
+		let uuid = Uuid::new_v4();
+		let pair = {
+			let store = BaselineStore::open(&path).unwrap();
+			let pair = store
+				.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+				.unwrap();
+			store
+				.record_pending(
+					pair,
+					uuid,
+					&created("a.txt"),
+					NOW,
+					&[BaselineChange::Upsert(&entry)],
+				)
+				.unwrap();
+			pair
+		};
+
+		let reopened = BaselineStore::open(&path).unwrap();
+		assert_eq!(
+			reopened.load_pending(NOW + 1_000, GRACE).unwrap(),
+			vec![PendingRow {
+				pair,
+				uuid,
+				kind: created("a.txt"),
+				recorded_at: NOW,
+			}]
+		);
+		assert_eq!(
+			reopened.entry(pair, "a.txt").unwrap().as_ref(),
+			Some(&entry),
+			"the row the write produced is there to be folded"
+		);
+
+		// Retiring it is what the next pass does once the cache has caught up.
+		reopened.delete_pending(&[uuid]).unwrap();
+		assert!(
+			reopened
+				.load_pending(NOW + 1_000, GRACE)
+				.unwrap()
+				.is_empty()
+		);
+		std::fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn every_write_kind_round_trips_through_the_journal() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let pair = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let replaced = Uuid::new_v4();
+		let kinds = [
+			PendingKind::Created {
+				path: "a.txt".to_string(),
+				replaced: Some(replaced),
+			},
+			PendingKind::Moved {
+				from: "a.txt".to_string(),
+				to: "b.txt".to_string(),
+			},
+			PendingKind::Trashed,
+		];
+		let uuids: Vec<Uuid> = kinds.iter().map(|_| Uuid::new_v4()).collect();
+		for (uuid, kind) in uuids.iter().zip(&kinds) {
+			store.record_pending(pair, *uuid, kind, NOW, &[]).unwrap();
+		}
+
+		let mut loaded = store.load_pending(NOW, GRACE).unwrap();
+		loaded.sort_by_key(|row| uuids.iter().position(|u| *u == row.uuid).unwrap());
+		assert_eq!(
+			loaded.into_iter().map(|row| row.kind).collect::<Vec<_>>(),
+			kinds.to_vec()
+		);
+	}
+
+	/// Past the grace ceiling the snapshot is believed again, so the row must not come back — and
+	/// it is DELETED rather than filtered, or the journal would grow without bound.
+	#[test]
+	fn a_write_past_the_grace_window_is_dropped_on_load() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let pair = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		store
+			.record_pending(
+				pair,
+				Uuid::new_v4(),
+				&created("old.txt"),
+				NOW - GRACE - 1,
+				&[],
+			)
+			.unwrap();
+		let fresh = Uuid::new_v4();
+		store
+			.record_pending(pair, fresh, &created("new.txt"), NOW - 1_000, &[])
+			.unwrap();
+
+		let loaded = store.load_pending(NOW, GRACE).unwrap();
+		assert_eq!(
+			loaded.iter().map(|row| row.uuid).collect::<Vec<_>>(),
+			vec![fresh],
+			"only the write still inside the window is handed back"
+		);
+		assert_eq!(pending_count(&store), 1, "the expired row was deleted");
+	}
+
+	#[test]
+	fn deleting_a_pair_takes_its_journal_rows_with_it() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let pair = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let other = store
+			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		store
+			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+			.unwrap();
+		let kept = Uuid::new_v4();
+		store
+			.record_pending(other, kept, &created("b.txt"), NOW, &[])
+			.unwrap();
+
+		store.delete_pair(pair).unwrap();
+		assert_eq!(
+			store
+				.load_pending(NOW, GRACE)
+				.unwrap()
+				.iter()
+				.map(|row| row.uuid)
+				.collect::<Vec<_>>(),
+			vec![kept],
+			"the removed pair's journal went with it, the other pair's stayed"
+		);
+	}
+
+	/// A pair removed while foreign keys were off (an older build, a repaired DB) leaves rows
+	/// behind that name nothing. Loading must drop them rather than hand the engine a write it
+	/// could only fold against a baseline that no longer exists.
+	#[test]
+	fn a_journal_row_whose_pair_is_gone_is_dropped_on_load() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let pair = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		store
+			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+			.unwrap();
+
+		store
+			.conn
+			.execute_batch("PRAGMA foreign_keys = OFF;")
+			.unwrap();
+		store.delete_pair(pair).unwrap();
+		store
+			.conn
+			.execute_batch("PRAGMA foreign_keys = ON;")
+			.unwrap();
+		assert_eq!(
+			pending_count(&store),
+			1,
+			"precondition: the row was orphaned"
+		);
+
+		assert!(store.load_pending(NOW, GRACE).unwrap().is_empty());
+		assert_eq!(pending_count(&store), 0, "the orphan was deleted");
+	}
+
+	/// The first real migration: a v1 DB (baseline rows, no journal) gains the table and keeps
+	/// everything it had.
+	#[test]
+	fn a_v1_db_is_migrated_to_v2_keeping_its_rows() {
+		let path = temp_db_path("v1");
+		{
+			let conn = Connection::open(&path).unwrap();
+			conn.execute_batch(SCHEMA).unwrap();
+			conn.execute_batch(
+				"INSERT INTO sync_pairs (id, local_root, remote_root, mode)
+					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
+				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
+					VALUES (1, 'kept.txt', 2, 7, 0);
+				PRAGMA user_version = 1;",
+			)
+			.unwrap();
+		}
+
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
+		assert_eq!(store.entry(1, "kept.txt").unwrap().unwrap().size, Some(7));
+		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
+		// The journal the migration added is usable at once.
+		store
+			.record_pending(1, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+			.unwrap();
+		assert_eq!(store.load_pending(NOW, GRACE).unwrap().len(), 1);
+		drop(store);
+		std::fs::remove_file(&path).ok();
 	}
 }
