@@ -823,11 +823,12 @@ async fn matrix_14_remote_backup_source_delete_never_deletes_local() {
 	sc.cleanup();
 }
 
-/// MATRIX-15 — (d) delete-suppression, move/rename not laundered into a destination delete. For both
-/// LocalBackup (rename on local source) and RemoteBackup (rename on remote source): the destination
-/// retains the ORIGINAL H AND additively gains H2 — the "delete" half of a move is suppressed.
+/// MATRIX-15 — (d) delete-suppression, a rename mirrored as a MOVE. For both LocalBackup (rename on
+/// the local source) and RemoteBackup (rename on the remote source): the destination follows the
+/// rename with a metadata-only move — H2 appears, H does not linger, and nothing is deleted or
+/// quarantined.
 #[shared_test_runtime]
-async fn matrix_15_backup_move_not_laundered_into_delete() {
+async fn matrix_15_backup_move_is_mirrored_as_a_move() {
 	// --- LocalBackup: rename H -> H2 on the local source. ---
 	let lb = single_client(SyncMode::LocalBackup).await;
 	write_file(&lb.local, "H.txt", b"H-body-stable");
@@ -839,18 +840,19 @@ async fn matrix_15_backup_move_not_laundered_into_delete() {
 	let r2 = lb.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(
+		r2.moved_remote, 1,
+		"a rename must reach a remote backup as a move: {r2:?}"
+	);
+	assert_eq!(
 		r2.remotely_trashed, 0,
-		"the delete-half of a move must be suppressed in LocalBackup: {r2:?}"
+		"a move must never delete on a backup destination: {r2:?}"
 	);
 	let (_d, lf) = list_root(&lb).await;
 	assert!(
-		find_file(&lf, "H.txt").is_some(),
-		"original H removed from remote backup: {lf:?}"
+		find_file(&lf, "H.txt").is_none(),
+		"the moved item must not linger under its old name: {lf:?}"
 	);
-	assert!(
-		find_file(&lf, "H2.txt").is_some(),
-		"H2 not additively created: {lf:?}"
-	);
+	assert!(find_file(&lf, "H2.txt").is_some(), "H2 missing: {lf:?}");
 	lb.cleanup();
 
 	// --- RemoteBackup: rename H -> H2 on the remote source. ---
@@ -881,17 +883,25 @@ async fn matrix_15_backup_move_not_laundered_into_delete() {
 	let p2 = rb.sync().await;
 	assert!(p2.errors.is_empty(), "{p2:?}");
 	assert_eq!(
+		p2.moved_local, 1,
+		"a rename must reach a local backup as a move: {p2:?}"
+	);
+	assert_eq!(
 		p2.locally_deleted, 0,
-		"the delete-half of a remote move must be suppressed in RemoteBackup: {p2:?}"
+		"a move must never delete on a backup destination: {p2:?}"
 	);
-	// Local destination keeps the original H AND gains H2 (both byte-exact).
-	assert!(
-		read_eq(&rb.local, "H.txt", b"H-body-stable"),
-		"original local H removed"
-	);
+	// The local destination follows the rename: H2 byte-exact, H gone, nothing quarantined.
 	assert!(
 		read_eq(&rb.local, "H2.txt", b"H-body-stable"),
-		"H2 not additively created locally"
+		"H2 missing locally"
+	);
+	assert!(
+		!rb.local.join("H.txt").exists(),
+		"the moved copy must not linger under its old name"
+	);
+	assert!(
+		!rb.local.join(".filen-sync-trash").join("H.txt").exists(),
+		"a move must not quarantine anything"
 	);
 	rb.cleanup();
 }
