@@ -389,6 +389,7 @@ fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> {
 		rel_path: entry.rel_path.clone(),
 		kind: entry.kind,
 		remote_uuid: entry.remote_uuid?,
+		stable_uuid: entry.remote_stable_uuid,
 		content_hash: entry.content_hash,
 		size: entry.size.unwrap_or(0),
 		modified_millis: entry.remote_modified.unwrap_or(0),
@@ -708,6 +709,7 @@ fn synced_shell(rel_path: &str) -> BaselineEntry {
 		remote_kind: None,
 		remote_hash: None,
 		remote_size: None,
+		remote_stable_uuid: None,
 	}
 }
 
@@ -738,6 +740,7 @@ fn resolution_entry(
 			BaselineEntry {
 				kind,
 				remote_uuid: held.remote_uuid,
+				remote_stable_uuid: held.remote_stable_uuid,
 				remote_modified: held.remote_modified,
 				content_hash: converged.then_some(held.content_hash).flatten(),
 				size: converged.then_some(held.size).flatten(),
@@ -762,6 +765,7 @@ fn resolution_entry(
 				size: held.size,
 				local_mtime: held.local_mtime,
 				remote_uuid: converged.then_some(held.remote_uuid).flatten(),
+				remote_stable_uuid: converged.then_some(held.remote_stable_uuid).flatten(),
 				remote_modified: converged.then_some(held.remote_modified).flatten(),
 				..synced_shell(rel_path)
 			}
@@ -1729,7 +1733,7 @@ mod tests {
 	use std::collections::HashSet;
 
 	use base64::{Engine as _, prelude::BASE64_STANDARD};
-	use filen_types::crypto::Blake3Hash;
+	use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 	use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
 
 	use super::*;
@@ -1811,6 +1815,7 @@ mod tests {
 			rel_path: rel.to_string(),
 			kind: NodeKind::File,
 			remote_uuid: uuid,
+			stable_uuid: Some(StableUuid::new_for_test(uuid)),
 			content_hash: Some(hash),
 			size,
 			modified_millis: 0,
@@ -1883,6 +1888,7 @@ mod tests {
 						rel_path: "docs".to_string(),
 						kind: NodeKind::Dir,
 						remote_uuid: dir_uuid,
+						stable_uuid: None,
 						content_hash: None,
 						size: 0,
 						modified_millis: 0,
@@ -2023,6 +2029,7 @@ mod tests {
 			remote_kind: Some(NodeKind::File),
 			remote_hash: Some(hash(3)),
 			remote_size: Some(5),
+			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
 		}
 	}
 
@@ -2046,6 +2053,7 @@ mod tests {
 				rel_path: "a.txt".to_string(),
 				kind: NodeKind::File,
 				remote_uuid: uuid,
+				stable_uuid: Some(StableUuid::new_for_test(uuid)),
 				content_hash: Some(hash),
 				size: 5,
 				modified_millis: 222,
@@ -2196,6 +2204,7 @@ mod tests {
 				rel_path: path.to_string(),
 				kind: NodeKind::File,
 				remote_uuid: uuid,
+				stable_uuid: Some(StableUuid::new_for_test(uuid)),
 				content_hash: None,
 				size: 0,
 				modified_millis: 0,
@@ -2223,6 +2232,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
 		}
 	}
 
@@ -2569,6 +2579,7 @@ mod tests {
 					rel_path: "d".to_string(),
 					kind: NodeKind::Dir,
 					remote_uuid: dir,
+					stable_uuid: None,
 					content_hash: None,
 					size: 0,
 					modified_millis: 0,
@@ -2580,6 +2591,7 @@ mod tests {
 					rel_path: "d/x.txt".to_string(),
 					kind: NodeKind::File,
 					remote_uuid: child,
+					stable_uuid: Some(StableUuid::new_for_test(child)),
 					content_hash: Some(hash(4)),
 					size: 5,
 					modified_millis: 0,

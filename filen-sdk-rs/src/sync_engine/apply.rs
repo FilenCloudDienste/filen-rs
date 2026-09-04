@@ -14,6 +14,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use filen_types::fs::StableUuid;
 use futures::StreamExt;
 use uuid::Uuid;
 
@@ -555,6 +556,7 @@ async fn apply_transfer(
 				ctx,
 				rel_path,
 				Some(*remote_uuid),
+				remote.and_then(|n| n.stable_uuid),
 				remote.and_then(|n| n.content_hash),
 				remote.map(|n| n.size).unwrap_or(0),
 				local_mtime_of(&path),
@@ -586,6 +588,9 @@ async fn apply_transfer(
 			let entry = file_entry(
 				rel_path,
 				Some(new_uuid),
+				// The upload reports the lineage it landed in: the same one when it versioned an
+				// existing file at this name, a brand-new one when it created a file.
+				Some(uploaded.stable_uuid()),
 				local.and_then(|n| n.content_hash),
 				local.map(|n| n.size).unwrap_or(0),
 				local.map(|n| n.mtime_millis),
@@ -720,6 +725,7 @@ async fn apply_one(
 			let entry = file_entry(
 				to_path,
 				Some(*remote_uuid),
+				Some(remote_file.stable_uuid()),
 				local.and_then(|n| n.content_hash),
 				local.map(|n| n.size).unwrap_or(0),
 				local.map(|n| n.mtime_millis),
@@ -749,14 +755,28 @@ async fn apply_one(
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
 			std::fs::rename(&from, &to).map_err(io_err)?;
+			// The row follows the LINEAGE — what the file held at its old path, now at its new
+			// one — not the destination's current remote state. Anchoring it to the latter would
+			// be a lie whenever the move carried a content edit: the renamed copy is still the
+			// PRE-edit one, and a row claiming the new version's hash and size is one the
+			// scanner's fast-path can never catch up with, so the stale bytes would eventually be
+			// pushed back over the remote's edit. The reconciler pairs such a move with a download
+			// that corrects the row; this is what keeps the row honest if that download fails.
+			let base = ctx.baseline.get(from_path);
 			let remote = ctx.remote.get(to_path);
 			delete_baseline(ctx, from_path).await?;
 			upsert_file_baseline(
 				ctx,
 				to_path,
-				remote.map(|n| n.remote_uuid),
-				remote.and_then(|n| n.content_hash),
-				remote.map(|n| n.size).unwrap_or(0),
+				base.and_then(|b| b.remote_uuid)
+					.or_else(|| remote.map(|n| n.remote_uuid)),
+				base.and_then(|b| b.remote_stable_uuid)
+					.or_else(|| remote.and_then(|n| n.stable_uuid)),
+				base.and_then(|b| b.content_hash)
+					.or_else(|| remote.and_then(|n| n.content_hash)),
+				base.and_then(|b| b.size)
+					.or_else(|| remote.map(|n| n.size))
+					.unwrap_or(0),
 				local_mtime_of(&to),
 				remote.map(|n| n.modified_millis),
 			)
@@ -884,6 +904,7 @@ fn adopt_outcome(
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: remote.stable_uuid,
 		}),
 		// A convergent delete drops the row — but only when the pass can trust that both sides are
 		// really gone. Under an incomplete scan or an un-converged/empty remote view the row is the
@@ -925,6 +946,7 @@ pub(super) async fn record_conflict(
 		remote_kind: remote.map(|r| r.kind),
 		remote_hash: remote.and_then(|r| r.content_hash),
 		remote_size: remote.map(|r| r.size),
+		remote_stable_uuid: remote.and_then(|r| r.stable_uuid),
 	};
 	store
 		.lock()
@@ -955,13 +977,17 @@ fn dir_entry(rel_path: &str, remote_uuid: Option<Uuid>, local_mtime: Option<i64>
 		remote_kind: None,
 		remote_hash: None,
 		remote_size: None,
+		// A directory has no whole-life id of its own: its uuid already survives its renames.
+		remote_stable_uuid: None,
 	}
 }
 
 /// The synced baseline row a file write leaves behind.
+#[allow(clippy::too_many_arguments)]
 fn file_entry(
 	rel_path: &str,
 	remote_uuid: Option<Uuid>,
+	remote_stable_uuid: Option<StableUuid>,
 	content_hash: Option<filen_types::crypto::Blake3Hash>,
 	size: u64,
 	local_mtime: Option<i64>,
@@ -980,6 +1006,7 @@ fn file_entry(
 		remote_kind: None,
 		remote_hash: None,
 		remote_size: None,
+		remote_stable_uuid,
 	}
 }
 
@@ -997,6 +1024,7 @@ async fn upsert_file_baseline(
 	ctx: &ApplyContext<'_>,
 	rel_path: &str,
 	remote_uuid: Option<Uuid>,
+	remote_stable_uuid: Option<StableUuid>,
 	content_hash: Option<filen_types::crypto::Blake3Hash>,
 	size: u64,
 	local_mtime: Option<i64>,
@@ -1007,6 +1035,7 @@ async fn upsert_file_baseline(
 		&file_entry(
 			rel_path,
 			remote_uuid,
+			remote_stable_uuid,
 			content_hash,
 			size,
 			local_mtime,
@@ -1249,10 +1278,12 @@ mod tests {
 	}
 
 	fn remote_node(rel: &str, hash: Option<Blake3Hash>) -> RemoteNode {
+		let uuid = Uuid::new_v4();
 		RemoteNode {
 			rel_path: rel.to_string(),
 			kind: NodeKind::File,
-			remote_uuid: Uuid::new_v4(),
+			remote_uuid: uuid,
+			stable_uuid: Some(StableUuid::new_for_test(uuid)),
 			content_hash: hash,
 			size: 3,
 			modified_millis: 900,
@@ -1273,6 +1304,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: None,
 		}
 	}
 

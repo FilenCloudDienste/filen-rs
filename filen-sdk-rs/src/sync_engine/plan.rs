@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use filen_types::crypto::Blake3Hash;
+use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
@@ -29,6 +29,10 @@ pub(crate) struct RemoteNode {
 	pub(crate) rel_path: String,
 	pub(crate) kind: NodeKind,
 	pub(crate) remote_uuid: Uuid,
+	/// The server-minted whole-life id of a FILE: `remote_uuid` is re-minted by every content edit
+	/// and version restore, this is not. `None` for a directory, which has no such id — a
+	/// directory's own uuid already survives its renames.
+	pub(crate) stable_uuid: Option<StableUuid>,
 	/// BLAKE3 of the content (files); `None` for dirs and for older files the server stored
 	/// without a hash.
 	pub(crate) content_hash: Option<Blake3Hash>,
@@ -307,6 +311,7 @@ pub(crate) fn build_remote_view(
 				rel_path,
 				kind: NodeKind::Dir,
 				remote_uuid: dir.uuid,
+				stable_uuid: None,
 				content_hash: None,
 				size: 0,
 				modified_millis: dir.created.map(|c| c.timestamp_millis()).unwrap_or(0),
@@ -325,6 +330,7 @@ pub(crate) fn build_remote_view(
 				rel_path,
 				kind: NodeKind::File,
 				remote_uuid: file.uuid,
+				stable_uuid: Some(file.stable_uuid),
 				content_hash: file.hash,
 				size: file.size,
 				modified_millis: file.last_modified.timestamp_millis(),
@@ -384,6 +390,16 @@ fn classify_local(node: Option<&LocalNode>, base: Option<&BaselineEntry>) -> Sid
 	}
 }
 
+/// Whether the remote item at a path is the SAME file the baseline row recorded there — the same
+/// server-minted lineage, whatever version id it currently wears. `false` whenever either side has
+/// no lineage id: an unknown lineage is not evidence of sameness.
+pub(super) fn same_file_lineage(base: &BaselineEntry, node: &RemoteNode) -> bool {
+	matches!(
+		(base.remote_stable_uuid, node.stable_uuid),
+		(Some(recorded), Some(current)) if recorded == current
+	)
+}
+
 fn classify_remote(node: Option<&RemoteNode>, base: Option<&BaselineEntry>) -> Side {
 	match (node, base) {
 		(None, None) => Side::Absent,
@@ -394,20 +410,39 @@ fn classify_remote(node: Option<&RemoteNode>, base: Option<&BaselineEntry>) -> S
 				Side::Modified
 			} else {
 				match node.kind {
-					// A file's current remote version IS its uuid: a content change mints a new
-					// uuid (the old becomes a prior version), so an unchanged uuid means unchanged
-					// content regardless of whether the server stored a hash.
-					NodeKind::File => {
-						if base.remote_uuid == Some(node.remote_uuid) {
-							Side::Unchanged
-						} else {
-							Side::Modified
-						}
-					}
+					NodeKind::File => classify_remote_file(node, base),
 					NodeKind::Dir => Side::Unchanged,
 				}
 			}
 		}
+	}
+}
+
+/// How a remote FILE compares to its baseline row. Three cases, told apart by the two ids the
+/// server gives a file:
+///
+/// - the SAME version uuid: nothing has happened to it;
+/// - a new version uuid of the SAME lineage: an EDIT — but only where the content actually moved. A
+///   re-upload of identical bytes (another client pushing what we already have, a restore of the
+///   version we are already on) re-mints the uuid without changing anything, and reading that as a
+///   remote edit turns a one-sided LOCAL edit into a conflict that has no second side;
+/// - a DIFFERENT lineage, or one neither side can name: a REPLACEMENT — another file has taken the
+///   path over. It reconciles exactly like an edit, since the destination has to converge on
+///   whatever holds the path either way. Where the distinction is load-bearing is
+///   [`PendingWrites::settle`](super::engine::PendingWrites): another client's edit of the file we
+///   just pushed is a two-way conflict, its replacement of it is not.
+fn classify_remote_file(node: &RemoteNode, base: &BaselineEntry) -> Side {
+	if base.remote_uuid == Some(node.remote_uuid) {
+		return Side::Unchanged;
+	}
+	let identical_content = matches!(
+		(base.content_hash, node.content_hash),
+		(Some(recorded), Some(current)) if recorded == current
+	);
+	if same_file_lineage(base, node) && identical_content {
+		Side::Unchanged
+	} else {
+		Side::Modified
 	}
 }
 
@@ -682,6 +717,22 @@ fn reconcile_two_way(
 ///
 /// - Remote moves are matched by UUID (a server-side move keeps the file's uuid): a baseline file
 ///   whose uuid now sits at a different remote path, still unchanged locally, becomes a `MoveLocal`.
+///   Failing that, by the file's server-minted LINEAGE id, which survives the content edit that
+///   re-mints the uuid — so a move and an edit landing inside one window stay one item rather than
+///   splitting into a local deletion and an unrelated download. Such a move is paired with a
+///   download of the new version onto the renamed copy.
+///
+///   "Still unchanged locally" is a REQUIREMENT of both matches, not a description of the usual
+///   case. A local edit at the move's source is a second change to the same item, and renaming the
+///   local copy would carry that edit to the destination for the pull to write over — silently,
+///   since a same-size edit satisfies the scanner's `(size, mtime)` fast path afterwards and is
+///   never looked at again. Such a path falls through to the per-path reconcile, which resolves it
+///   by mode: TwoWay surfaces the source as a conflict and downloads the moved version under its
+///   new name; RemoteToLocal lets the remote win, quarantining the local edit and downloading at
+///   the new name; RemoteBackup never deletes on its destination, so the edited file stays where it
+///   is and the moved version arrives beside it. The push-only modes never reach this block at all:
+///   `LocalToRemote` re-pushes the edit at the source path and trashes the remote's moved copy,
+///   `LocalBackup` re-pushes and leaves it.
 /// - Local moves are matched by content hash: a baseline file gone locally whose content reappears
 ///   at a new local path (uniquely — ambiguous content is left to delete+create), with the remote
 ///   still holding the original, becomes a `MoveRemote`.
@@ -703,6 +754,16 @@ fn detect_moves(
 			.filter(|(_, node)| node.kind == NodeKind::File)
 			.map(|(path, node)| (node.remote_uuid, path.as_str()))
 			.collect();
+		// A file's uuid is re-minted by every content edit, so a move that CARRIED an edit inside
+		// one window is invisible to the index above — the uuid the baseline recorded no longer
+		// names anything live. The server-minted lineage id is not re-minted, so it still finds the
+		// file at its new path and the pass carries the item across instead of quarantining the old
+		// path and downloading the new one from scratch.
+		let remote_path_of_lineage: HashMap<StableUuid, &str> = remote
+			.iter()
+			.filter(|(_, node)| node.kind == NodeKind::File)
+			.filter_map(|(path, node)| Some((node.stable_uuid?, path.as_str())))
+			.collect();
 		for (from, base) in baseline {
 			if base.kind != NodeKind::File
 				|| base.state == BaselineState::Conflicted
@@ -713,8 +774,26 @@ fn detect_moves(
 			let Some(uuid) = base.remote_uuid else {
 				continue;
 			};
-			if let Some(&to) = remote_path_of_uuid.get(&uuid)
-				&& to != from
+			// Only where the local side still matches the baseline — for EITHER match. With a local
+			// edit at `from` this is a genuine both-sides divergence, and consuming it as a move
+			// would rename the local copy and then write over it, laundering a conflict into a
+			// silent overwrite. The mode decides what it becomes instead; see the doc comment.
+			if classify_local(local.get(from), Some(base)) != Side::Unchanged {
+				continue;
+			}
+			// `carries_edit`: the lineage moved AND changed version, so the local copy this move
+			// renames is the pre-edit one and still has to be refreshed.
+			let (to, carries_edit) = match remote_path_of_uuid.get(&uuid) {
+				Some(&to) => (to, false),
+				None => match base
+					.remote_stable_uuid
+					.and_then(|lineage| remote_path_of_lineage.get(&lineage))
+				{
+					Some(&to) => (to, true),
+					None => continue,
+				},
+			};
+			if to != from
 				&& !baseline.contains_key(to)
 				&& local.contains_key(from)
 				&& !local.contains_key(to)
@@ -725,10 +804,26 @@ fn detect_moves(
 					to_path: to.to_string(),
 				};
 				tracing::debug!(
-					"plan: {} — remote item moved (matched by uuid); renaming locally instead of re-downloading",
-					action.describe()
+					"plan: {} — remote item moved (matched by {}); renaming locally instead of re-downloading",
+					action.describe(),
+					if carries_edit { "lineage" } else { "uuid" }
 				);
 				actions.push(action);
+				if carries_edit {
+					// The move brought a new version with it: pull it onto the renamed copy in this
+					// same pass. Without this the pass would leave the pre-edit bytes at the new
+					// path with a baseline row that has to describe them as stale, and the next
+					// pass would have to re-pull anyway.
+					let download = SyncAction::DownloadFile {
+						rel_path: to.to_string(),
+						remote_uuid: remote[to].remote_uuid,
+					};
+					tracing::debug!(
+						"plan: {} — the move carried a content edit",
+						download.describe()
+					);
+					actions.push(download);
+				}
 				consumed.insert(from.clone());
 				consumed.insert(to.to_string());
 			}
@@ -1166,14 +1261,25 @@ mod tests {
 		}
 	}
 
+	/// A remote file whose lineage id is its own uuid — the shape a file that has never been
+	/// re-uploaded has. [`remote_version`] models a later version of the same lineage.
 	fn remote_file(rel: &str, uuid: Uuid, hash: [u8; 32]) -> RemoteNode {
 		RemoteNode {
 			rel_path: rel.to_string(),
 			kind: NodeKind::File,
 			remote_uuid: uuid,
+			stable_uuid: Some(StableUuid::new_for_test(uuid)),
 			content_hash: Some(Blake3Hash::from(hash)),
 			size: 10,
 			modified_millis: 1,
+		}
+	}
+
+	/// A new VERSION of the file whose lineage is `lineage`: a fresh uuid, the same whole-life id.
+	fn remote_version(rel: &str, lineage: Uuid, uuid: Uuid, hash: [u8; 32]) -> RemoteNode {
+		RemoteNode {
+			stable_uuid: Some(StableUuid::new_for_test(lineage)),
+			..remote_file(rel, uuid, hash)
 		}
 	}
 
@@ -1182,6 +1288,7 @@ mod tests {
 			rel_path: rel.to_string(),
 			kind: NodeKind::Dir,
 			remote_uuid: uuid,
+			stable_uuid: None,
 			content_hash: None,
 			size: 0,
 			modified_millis: 0,
@@ -1202,6 +1309,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: None,
 		}
 	}
 
@@ -1219,6 +1327,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
 		}
 	}
 
@@ -1254,6 +1363,174 @@ mod tests {
 				to_path: "b.txt".to_string(),
 			}],
 			"a remote move renames the local file, not delete + re-download"
+		);
+	}
+
+	#[test]
+	fn a_re_upload_of_identical_bytes_is_not_read_as_a_remote_edit() {
+		// Another client (or a version restore) put the SAME content back under a new version uuid,
+		// while the local side genuinely edited the file. Reading the re-mint as a remote edit would
+		// invent a conflict with no second side; only the local edit actually happened, so it pushes.
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", lineage, [0; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"a.txt",
+			remote_version("a.txt", lineage, Uuid::new_v4(), [0; 32]),
+		)]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::UploadFile {
+				rel_path: "a.txt".to_string(),
+			}],
+			"a re-mint that changed no bytes is not a remote change"
+		);
+	}
+
+	#[test]
+	fn a_new_version_of_the_same_file_is_still_an_edit_and_a_different_file_is_still_a_change() {
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", lineage, [0; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [0; 32]))]);
+
+		// Same lineage, new version, DIFFERENT bytes: an edit — pulled.
+		let edited = map(vec![(
+			"a.txt",
+			remote_version("a.txt", lineage, Uuid::new_v4(), [2; 32]),
+		)]);
+		let new_uuid = edited["a.txt"].remote_uuid;
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &edited),
+			vec![SyncAction::DownloadFile {
+				rel_path: "a.txt".to_string(),
+				remote_uuid: new_uuid,
+			}]
+		);
+
+		// A DIFFERENT lineage at the same path: a replacement — converged on the same way.
+		let replaced = map(vec![(
+			"a.txt",
+			remote_file("a.txt", Uuid::new_v4(), [2; 32]),
+		)]);
+		let other_uuid = replaced["a.txt"].remote_uuid;
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &replaced),
+			vec![SyncAction::DownloadFile {
+				rel_path: "a.txt".to_string(),
+				remote_uuid: other_uuid,
+			}]
+		);
+	}
+
+	#[test]
+	fn a_remote_move_that_carried_an_edit_stays_one_item_and_pulls_the_new_version() {
+		// The other side renamed a.txt -> b.txt AND edited it before this pass ran, so the uuid the
+		// baseline recorded names nothing live. Matched on the lineage id, this is one file that
+		// moved and changed — a local rename plus a pull — not a local deletion and an unrelated
+		// download (which the mass-delete guard would hold, and a backup mode would refuse).
+		let lineage = Uuid::new_v4();
+		let new_uuid = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", lineage, [5; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [5; 32]))]);
+		let remote = map(vec![(
+			"b.txt",
+			remote_version("b.txt", lineage, new_uuid, [6; 32]),
+		)]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![
+				SyncAction::MoveLocal {
+					from_path: "a.txt".to_string(),
+					to_path: "b.txt".to_string(),
+				},
+				SyncAction::DownloadFile {
+					rel_path: "b.txt".to_string(),
+					remote_uuid: new_uuid,
+				},
+			],
+			"the move and the edit it carried are applied together"
+		);
+	}
+
+	/// The same guard on the UUID-matched branch: a remote move whose content did NOT change is
+	/// still not a move when the local copy at its source was edited. Consuming it would rename the
+	/// edited file to the destination and pull the remote's bytes over it — and a same-size edit
+	/// satisfies the scanner's (size, mtime) fast path afterwards, so the loss is never noticed.
+	#[test]
+	fn a_local_edit_at_a_uuid_matched_remote_moves_source_is_not_a_move() {
+		let uuid = Uuid::new_v4();
+		// The remote renamed a.txt -> b.txt (same uuid, same bytes); a.txt was edited locally.
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [9; 32]))]);
+		let remote = map(vec![("b.txt", remote_file("b.txt", uuid, [5; 32]))]);
+
+		// TwoWay: both sides changed the same item, so the source is held for the caller and the
+		// moved version still arrives under its new name.
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			!actions
+				.iter()
+				.any(|a| matches!(a, SyncAction::MoveLocal { .. })),
+			"an edited local copy must not be renamed out from under the edit: {actions:?}"
+		);
+		assert!(
+			actions.contains(&SyncAction::Conflict {
+				rel_path: "a.txt".to_string(),
+			}),
+			"the divergence must be surfaced: {actions:?}"
+		);
+		assert!(
+			actions.iter().any(|a| matches!(
+				a,
+				SyncAction::DownloadFile { rel_path, .. } if rel_path == "b.txt"
+			)),
+			"the moved version still arrives at its new name: {actions:?}"
+		);
+
+		// RemoteToLocal: the remote is authoritative, so the local edit is quarantined by the
+		// deletion of the source rather than carried to the destination and overwritten there.
+		assert_eq!(
+			plan(SyncMode::RemoteToLocal, &baseline, &local, &remote),
+			vec![
+				SyncAction::DownloadFile {
+					rel_path: "b.txt".to_string(),
+					remote_uuid: uuid,
+				},
+				SyncAction::DeleteLocal {
+					rel_path: "a.txt".to_string(),
+					kind: NodeKind::File,
+				},
+			]
+		);
+
+		// RemoteBackup never deletes on its destination, so the edited file simply stays put.
+		assert_eq!(
+			plan(SyncMode::RemoteBackup, &baseline, &local, &remote),
+			vec![SyncAction::DownloadFile {
+				rel_path: "b.txt".to_string(),
+				remote_uuid: uuid,
+			}]
+		);
+	}
+
+	#[test]
+	fn a_local_edit_stops_a_lineage_move_from_laundering_the_divergence() {
+		// Same remote move+edit, but the local copy diverged too. Consuming that as a move would
+		// rename the local file and pull straight over it — a both-sides conflict silently resolved
+		// in the remote's favour. It must fall through to the ordinary reconcile instead.
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", lineage, [5; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [9; 32]))]);
+		let remote = map(vec![(
+			"b.txt",
+			remote_version("b.txt", lineage, Uuid::new_v4(), [6; 32]),
+		)]);
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			!actions
+				.iter()
+				.any(|a| matches!(a, SyncAction::MoveLocal { .. })),
+			"a diverged local copy must not be consumed as a move: {actions:?}"
 		);
 	}
 
@@ -1453,6 +1730,7 @@ mod tests {
 			rel_path: "d".to_string(),
 			kind: NodeKind::Dir,
 			remote_uuid: uuid,
+			stable_uuid: None,
 			content_hash: None,
 			size: 0,
 			modified_millis: 0,
@@ -1504,6 +1782,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: None,
 		};
 		let baseline = map(vec![
 			("old", base_dir),
@@ -1514,6 +1793,7 @@ mod tests {
 			rel_path: "old".to_string(),
 			kind: NodeKind::Dir,
 			remote_uuid: dir_uuid,
+			stable_uuid: None,
 			content_hash: None,
 			size: 0,
 			modified_millis: 0,
