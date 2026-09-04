@@ -713,6 +713,63 @@ async fn path_add_remote_invalid_local_names_reported_once_not_retried() {
 	sc.cleanup();
 }
 
+/// (add) — renaming an ALREADY-SYNCED file, and an already-synced directory, into a name the remote
+/// would reject must never be read as a local deletion. The rename cannot be pushed, but the copies
+/// the remote already holds are the user's data: they stay put (a remote directory deletion is
+/// recursive, so the directory case would take a whole subtree), and renaming back resumes the sync.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn path_add_rename_into_an_invalid_name_never_trashes_the_remote_copy() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, "report.txt", b"R");
+	write_file(&sc.local, "docs/a.txt", b"A");
+
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 2, "{r1:?}");
+	assert_eq!(r1.remote_dirs_created, 1, "{r1:?}");
+
+	// `CON` is a reserved device name, `bad.` ends in a dot: neither can ever be pushed.
+	std::fs::rename(sc.local.join("report.txt"), sc.local.join("CON")).unwrap();
+	std::fs::rename(sc.local.join("docs"), sc.local.join("bad.")).unwrap();
+
+	let r2 = sc.sync().await;
+	assert!(
+		r2.errors.is_empty(),
+		"a rename that cannot be pushed is not a retryable error: {r2:?}"
+	);
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+	assert_eq!(r2.locally_deleted, 0, "{r2:?}");
+	let reported: Vec<&str> = r2.unsyncable.iter().map(|u| u.rel_path.as_str()).collect();
+	assert_eq!(reported, vec!["CON", "bad."], "{:?}", r2.unsyncable);
+
+	// The remote is exactly as it was: nothing renamed, nothing trashed, subtree intact.
+	let (dirs, files) = list_root(&sc).await;
+	assert!(
+		find_file(&files, "report.txt").is_some(),
+		"the remote copy of a locally-renamed file must survive: {files:?}"
+	);
+	let docs = find_dir(&dirs, "docs").expect("the remote directory was trashed");
+	assert!(
+		find_file(&list_dir(&sc, docs).await.1, "a.txt").is_some(),
+		"the remote subtree of a locally-renamed directory must survive"
+	);
+
+	// Renaming back leaves both sides converged again — nothing to re-transfer, nothing deleted.
+	std::fs::rename(sc.local.join("CON"), sc.local.join("report.txt")).unwrap();
+	std::fs::rename(sc.local.join("bad."), sc.local.join("docs")).unwrap();
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert!(r3.unsyncable.is_empty(), "{:?}", r3.unsyncable);
+	assert_eq!(r3.uploaded, 0, "{r3:?}");
+	assert_eq!(r3.remotely_trashed, 0, "{r3:?}");
+	assert_eq!(r3.locally_deleted, 0, "{r3:?}");
+	assert!(read_eq(&sc.local, "report.txt", b"R"));
+	assert!(read_eq(&sc.local, "docs/a.txt", b"A"));
+
+	sc.cleanup();
+}
+
 // ===========================================================================
 // BLOCKED — hostile-remote-name injection seam does not exist
 // ===========================================================================
