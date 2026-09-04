@@ -75,6 +75,12 @@ async fn wait_cache_has(cache: &TestCache, uuid: Uuid) {
 	);
 }
 
+/// A read/write connection onto a baseline DB the engine persisted — the only way, black-box, to
+/// plant a schema version the current build does not understand (MIGRATE-04).
+fn open_read_write_db(path: &std::path::Path) -> rusqlite::Connection {
+	rusqlite::Connection::open(path).unwrap()
+}
+
 /// Assert a `SyncReport` is a perfectly clean no-op (every counter zero, no conflicts/errors).
 fn assert_noop(r: &SyncReport) {
 	assert_eq!(r.uploaded, 0, "no-op expected, got upload: {r:?}");
@@ -485,17 +491,76 @@ async fn migrate_01_old_baseline_schema_version_bumped_in_place() {
 	// migrated entry count == pre-migration count.
 }
 
-/// MIGRATE-04 — a newer-than-supported baseline is refused or safely degraded, never silently
-/// mis-read into deletes/wipes; the newer baseline file is left intact when refused.
-#[ignore = "blocked: needs baseline-store mutation to plant a newer-than-supported version — see TODO"]
+/// MIGRATE-04 — a newer-than-supported baseline is refused, never silently mis-read into
+/// deletes/wipes; the newer baseline file is left intact when refused.
 #[shared_test_runtime]
 async fn migrate_04_newer_than_supported_baseline_fails_closed() {
-	// plan: persist a baseline whose schema version is HIGHER than the current engine supports
-	// (simulate a downgrade); run one pass. Verify the engine either (a) refuses with an explicit
-	// unsupported-version error in the report, or (b) degrades to fresh-baseline establishment under
-	// the conservative first-sync guards — never silently parsing the newer data under old rules to
-	// plan deletes/wipes. Negative: zero delete/wipe/quarantine on either side; the newer baseline
-	// file is left intact (not overwritten/downgraded) on refusal.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, remote).await;
+	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	let local = fresh_local_dir("migrate04");
+	let db_path = temp_cache_path();
+
+	// Converge a populated pair so BOTH sides hold real data the refusal must not touch.
+	write_file(&local, "keep1.txt", b"one");
+	write_file(&local, "keep2.txt", b"two");
+	let engine1 = SyncEngine::open(cache.client.clone(), db_path.clone())
+		.await
+		.unwrap();
+	let pair1 = engine1
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	assert_eq!(engine1.sync_once(pair1).await.unwrap().uploaded, 2);
+	let (_d0, files0) = list_dir(&cache, &resources.dir).await;
+	let pre_count = files0.len();
+	let pre_tree = walk_tree(&local);
+	drop(engine1);
+
+	// Simulate a DOWNGRADE: stamp the persisted baseline at a schema version this build does not
+	// understand (what a newer engine would have written).
+	let planted = {
+		let conn = open_read_write_db(&db_path);
+		conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+		conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+			.unwrap()
+	};
+	assert_eq!(planted, 99, "precondition: the newer version was planted");
+
+	// The engine must fail CLOSED — refuse to open at all rather than read the newer rows under
+	// older rules and plan deletes from them.
+	let message = match SyncEngine::open(cache.client.clone(), db_path.clone()).await {
+		Ok(_) => panic!("a newer-than-supported baseline must be refused"),
+		Err(error) => format!("{error}"),
+	};
+	assert!(
+		message.contains("schema version"),
+		"the refusal must name the version problem: {message}"
+	);
+
+	// Nothing was destroyed on either side, and the newer baseline file was NOT downgraded.
+	let (_d1, files1) = list_dir(&cache, &resources.dir).await;
+	assert_eq!(files1.len(), pre_count, "remote changed after the refusal");
+	assert!(
+		find_file(&files1, "keep1.txt").is_some(),
+		"remote file lost"
+	);
+	assert!(
+		find_file(&files1, "keep2.txt").is_some(),
+		"remote file lost"
+	);
+	assert_eq!(walk_tree(&local), pre_tree, "local tree changed");
+	assert!(
+		!local.join(".filen-sync-trash").exists(),
+		"a refused open must not quarantine anything"
+	);
+	let still: i64 = open_read_write_db(&db_path)
+		.query_row("PRAGMA user_version", [], |row| row.get(0))
+		.unwrap();
+	assert_eq!(still, 99, "the refused baseline was rewritten in place");
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 /// MIGRATE-05 — interrupted migration is atomic and resumable: after a kill mid-write of the migrated
