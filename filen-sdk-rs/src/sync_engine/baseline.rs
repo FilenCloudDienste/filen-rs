@@ -322,22 +322,41 @@ impl BaselineStore {
 		Ok(Self { conn })
 	}
 
-	/// Register a pair (or return the existing pair's id for the same `(local_root, remote_root)`).
+	/// Register a pair, or find the existing one with the same `(local_root, remote_root)`.
+	///
+	/// Returns the pair's id AND the mode actually stored, which is the caller's `mode` only when
+	/// the pair is new: an existing registration is left exactly as it is, so the caller can tell a
+	/// genuine re-registration from an attempt to change an established pair's direction
+	/// (see [`set_mode`](Self::set_mode)).
 	pub(crate) fn create_pair(
 		&self,
 		local_root: &str,
 		remote_root: Uuid,
 		mode: SyncMode,
-	) -> rusqlite::Result<PairId> {
+	) -> rusqlite::Result<(PairId, SyncMode)> {
 		self.conn.execute(
-			"INSERT INTO sync_pairs (local_root, remote_root, mode) VALUES (?1, ?2, ?3)
-			 ON CONFLICT (local_root, remote_root) DO UPDATE SET mode = excluded.mode",
+			"INSERT OR IGNORE INTO sync_pairs (local_root, remote_root, mode) VALUES (?1, ?2, ?3)",
 			params![local_root, remote_root, mode.as_i64()],
 		)?;
 		self.conn.query_row(
-			"SELECT id FROM sync_pairs WHERE local_root = ?1 AND remote_root = ?2",
+			"SELECT id, mode FROM sync_pairs WHERE local_root = ?1 AND remote_root = ?2",
 			params![local_root, remote_root],
-			|row| row.get(0),
+			|row| {
+				let raw: i64 = row.get("mode")?;
+				Ok((
+					row.get("id")?,
+					SyncMode::from_i64(raw).ok_or_else(|| corrupt("mode", raw))?,
+				))
+			},
+		)
+	}
+
+	/// Change a registered pair's mode, returning how many rows it touched (0 = unknown pair).
+	/// Only the `sync_pairs` row moves: the pair's baseline is deliberately left alone.
+	pub(crate) fn set_mode(&self, id: PairId, mode: SyncMode) -> rusqlite::Result<usize> {
+		self.conn.execute(
+			"UPDATE sync_pairs SET mode = ?2 WHERE id = ?1",
+			params![id, mode.as_i64()],
 		)
 	}
 
@@ -816,7 +835,7 @@ mod tests {
 		let remote = Uuid::new_v4();
 		let pair = {
 			let store = BaselineStore::open(&path).unwrap();
-			let pair = store
+			let (pair, _) = store
 				.create_pair("/root", remote, SyncMode::TwoWay)
 				.unwrap();
 			assert_eq!(
@@ -854,30 +873,45 @@ mod tests {
 	}
 
 	#[test]
-	fn create_pair_is_idempotent_and_round_trips() {
+	fn create_pair_is_idempotent_and_reports_the_stored_mode() {
 		let store = BaselineStore::open_in_memory().unwrap();
 		let remote = Uuid::new_v4();
-		let id = store
+		let (id, mode) = store
 			.create_pair("/home/u/sync", remote, SyncMode::TwoWay)
 			.unwrap();
+		assert_eq!(
+			mode,
+			SyncMode::TwoWay,
+			"a new pair takes the asked-for mode"
+		);
 
-		// Same (local_root, remote_root) returns the same id and updates the mode in place.
-		let again = store
+		// Re-registering the same roots returns the same id and the mode ALREADY stored — an
+		// existing pair is never silently re-pointed by a registration call.
+		let (again, stored) = store
 			.create_pair("/home/u/sync", remote, SyncMode::LocalToRemote)
 			.unwrap();
 		assert_eq!(id, again, "re-registering a pair returns the same id");
+		assert_eq!(
+			stored,
+			SyncMode::TwoWay,
+			"the stored mode is reported back, not overwritten"
+		);
+		assert_eq!(store.pair(id).unwrap().unwrap().mode, SyncMode::TwoWay);
 
-		let record = store.pair(id).unwrap().expect("pair exists");
-		assert_eq!(record.local_root, "/home/u/sync");
-		assert_eq!(record.remote_root, remote);
-		assert_eq!(record.mode, SyncMode::LocalToRemote, "mode was updated");
+		// Changing it is an explicit, separate operation.
+		assert_eq!(store.set_mode(id, SyncMode::LocalToRemote).unwrap(), 1);
+		assert_eq!(
+			store.pair(id).unwrap().unwrap().mode,
+			SyncMode::LocalToRemote
+		);
+		assert_eq!(store.set_mode(9999, SyncMode::TwoWay).unwrap(), 0);
 		assert_eq!(store.list_pairs().unwrap().len(), 1);
 	}
 
 	#[test]
 	fn entries_round_trip_with_full_fidelity() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let pair = store
+		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 
@@ -901,7 +935,7 @@ mod tests {
 	#[test]
 	fn upsert_replaces_and_delete_removes() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let pair = store
+		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::RemoteToLocal)
 			.unwrap();
 
@@ -920,7 +954,7 @@ mod tests {
 	#[test]
 	fn deleting_a_pair_cascades_to_its_baseline_rows() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let pair = store
+		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
@@ -946,7 +980,7 @@ mod tests {
 		let uuid = Uuid::new_v4();
 		let pair = {
 			let store = BaselineStore::open(&path).unwrap();
-			let pair = store
+			let (pair, _) = store
 				.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 				.unwrap();
 			store
@@ -991,7 +1025,7 @@ mod tests {
 	#[test]
 	fn every_write_kind_round_trips_through_the_journal() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let pair = store
+		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		let replaced = Uuid::new_v4();
@@ -1024,7 +1058,7 @@ mod tests {
 	#[test]
 	fn a_write_past_the_grace_window_is_dropped_on_load() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let pair = store
+		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
@@ -1053,10 +1087,10 @@ mod tests {
 	#[test]
 	fn deleting_a_pair_takes_its_journal_rows_with_it() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let pair = store
+		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
-		let other = store
+		let (other, _) = store
 			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
@@ -1086,7 +1120,7 @@ mod tests {
 	#[test]
 	fn a_journal_row_whose_pair_is_gone_is_dropped_on_load() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let pair = store
+		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
