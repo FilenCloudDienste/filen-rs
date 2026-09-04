@@ -23,8 +23,8 @@ use super::{
 	},
 	guard::{self, DeleteGuard, GuardReason},
 	outcome::{
-		PlanOutcome, PlannedAction, PlannedConflict, RefuseReason, UnsyncablePath, planned_action,
-		planned_conflict,
+		PlanOutcome, PlannedAction, PlannedConflict, RefuseReason, UnsyncablePath,
+		UnsyncableReason, planned_action, planned_conflict,
 	},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
@@ -616,7 +616,16 @@ impl Prepared {
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
 	/// the pass itself, so a caller sees the same list either way.
 	fn unsyncable(&self) -> Vec<UnsyncablePath> {
-		Vec::new()
+		self.local_scan
+			.invalid_names
+			.iter()
+			.map(|(rel_path, detail)| UnsyncablePath {
+				rel_path: rel_path.clone(),
+				reason: UnsyncableReason::InvalidName {
+					detail: detail.clone(),
+				},
+			})
+			.collect()
 	}
 }
 

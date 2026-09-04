@@ -11,7 +11,7 @@
 //! the engine never writes one); `walkdir`'s loop detection guards against cycles.
 
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, HashMap},
 	ffi::OsStr,
 	path::{Component, Path},
 };
@@ -20,7 +20,10 @@ use filen_types::crypto::Blake3Hash;
 use unicode_normalization::UnicodeNormalization;
 
 use super::baseline::{BaselineEntry, NodeKind};
-use crate::io::{DOWNLOAD_TMP_EXT, FilenMetaExt};
+use crate::{
+	fs::name::ValidatedName,
+	io::{DOWNLOAD_TMP_EXT, FilenMetaExt},
+};
 
 /// The per-pair local quarantine directory (where remote-propagated deletions are moved instead of
 /// being destroyed). Always excluded from the scan so it is never itself synced back up.
@@ -70,6 +73,37 @@ pub(crate) struct LocalScan {
 	/// destination).
 	pub(crate) complete: bool,
 	pub(crate) errors: Vec<ScanError>,
+	/// Paths whose NAME the remote would reject, mapped to the validator's own message. Neither
+	/// the path nor its subtree is in `nodes`, so nothing is planned for them.
+	///
+	/// Deliberately NOT an entry in `errors`: those mean the scan may have MISSED something, which
+	/// makes every apparent deletion untrustworthy. An unsyncable name is the opposite — a fully
+	/// observed item that simply cannot be pushed — so the guard must not be tripped by it.
+	pub(crate) invalid_names: BTreeMap<String, String>,
+}
+
+/// The reason the remote would reject `rel_path`'s own name, or `None` if it would accept it.
+///
+/// Uses the SDK's own validator — the very rule the upload and create-dir paths enforce — rather
+/// than a second copy of the rules, so the scan can never disagree with what an upload does. Only
+/// the LAST component is checked: every ancestor is itself a scanned entry that was checked when
+/// the walk reached it.
+fn name_rejection(rel_path: &str) -> Option<String> {
+	let name = rel_path.rsplit('/').next()?;
+	ValidatedName::try_from(name).err().map(|e| e.to_string())
+}
+
+/// Whether some ANCESTOR of `rel_path` was already rejected, in which case this entry is part of a
+/// subtree that is already reported and must be skipped silently.
+fn under_invalid_name(invalid: &BTreeMap<String, String>, rel_path: &str) -> bool {
+	let mut path = rel_path;
+	while let Some(cut) = path.rfind('/') {
+		path = &path[..cut];
+		if invalid.contains_key(path) {
+			return true;
+		}
+	}
+	false
 }
 
 /// NFC-normalize a relative path's components (case preserved) and `/`-join them. `None` if any
@@ -117,6 +151,7 @@ fn fast_path_hash(baseline: Option<&BaselineEntry>, size: u64, mtime: i64) -> Op
 pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>) -> LocalScan {
 	let mut nodes = HashMap::new();
 	let mut errors = Vec::new();
+	let mut invalid_names = BTreeMap::new();
 	let mut complete = true;
 	// collision key -> the rel_path that claimed it, to detect a second entry normalizing the same.
 	let mut claimed: HashMap<String, String> = HashMap::new();
@@ -197,6 +232,18 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 			continue;
 		}
 
+		// A name the remote would reject can never be pushed, so the whole subtree is left out of
+		// the plan and reported instead of failing an upload every pass. The scan still COMPLETED:
+		// this is a fully observed item that cannot be synced, not evidence the walk missed
+		// anything, so `complete` stays true and the delete guard is unaffected.
+		if under_invalid_name(&invalid_names, &rel_path) {
+			continue;
+		}
+		if let Some(reason) = name_rejection(&rel_path) {
+			invalid_names.insert(rel_path, reason);
+			continue;
+		}
+
 		if let Some(previous) = claimed.insert(collision_key(&rel_path), rel_path.clone()) {
 			complete = false;
 			errors.push(ScanError::DuplicateName {
@@ -243,6 +290,7 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 		nodes,
 		complete,
 		errors,
+		invalid_names,
 	}
 }
 
@@ -393,6 +441,63 @@ mod tests {
 			"skipping our own staging file is not an error"
 		);
 
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn a_name_the_remote_would_reject_is_excluded_with_its_whole_subtree() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		// `CON` is a reserved device name and `bad.` ends in a dot: both are creatable on unix and
+		// both are refused by the SDK's own name validator, so no upload of them can ever succeed.
+		fs::write(root.join("CON"), b"reserved").unwrap();
+		fs::create_dir(root.join("bad.")).unwrap();
+		fs::write(root.join("bad.").join("inner.txt"), b"child").unwrap();
+		fs::create_dir_all(root.join("bad.").join("deeper")).unwrap();
+		fs::write(root.join("bad.").join("deeper").join("x.txt"), b"deep").unwrap();
+
+		let scan = scan_local(&root, &HashMap::new());
+		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		paths.sort();
+		assert_eq!(
+			paths,
+			vec!["keep.txt"],
+			"a rejected name takes its whole subtree out of the plan"
+		);
+
+		let reported: Vec<_> = scan.invalid_names.keys().cloned().collect();
+		assert_eq!(
+			reported,
+			vec!["CON", "bad."],
+			"each rejected name is reported ONCE, not once per descendant"
+		);
+		assert!(
+			scan.invalid_names["bad."].contains("dot or space"),
+			"the report carries the validator's own reason: {:?}",
+			scan.invalid_names["bad."]
+		);
+
+		// Crucially the scan still COMPLETED: an unsyncable name is not missing evidence, so the
+		// delete guard must not start holding every deletion because of it.
+		assert!(scan.complete, "{:?}", scan.errors);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn a_valid_name_that_merely_contains_a_rejected_one_is_kept() {
+		let root = temp_root();
+		for name in ["CONSOLE", "console.txt", "CON.txt", "a.b", ".hidden"] {
+			fs::write(root.join(name), b"x").unwrap();
+		}
+		let scan = scan_local(&root, &HashMap::new());
+		assert!(
+			scan.invalid_names.is_empty(),
+			"none of these are rejected by the SDK validator: {:?}",
+			scan.invalid_names
+		);
+		assert_eq!(scan.nodes.len(), 5);
 		fs::remove_dir_all(&root).ok();
 	}
 
