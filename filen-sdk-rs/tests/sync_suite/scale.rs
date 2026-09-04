@@ -10,7 +10,16 @@
 //! resource bound (multi-GB memory ceiling, request-rate/429 instrumentation, deterministic
 //! crash/interrupt or transient-failure injection, debounce-window timing) require fault-injection
 //! / instrumentation harnesses that do not exist yet and are `#[ignore]`d with a plan stub.
-use std::{borrow::Cow, collections::BTreeSet, path::Path, time::Duration};
+use std::{
+	borrow::Cow,
+	collections::BTreeSet,
+	path::Path,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
+	time::Duration,
+};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::{
@@ -19,11 +28,14 @@ use filen_sdk_rs::fs::{
 	dir::RemoteDirectory,
 	file::RemoteFile,
 };
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode};
+use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, WatchConfig};
 use uuid::Uuid;
 
 use crate::harness::*;
 use crate::helpers::*;
+
+/// A generous settle window for a watch to react to one burst (debounce + a pass + cache observe).
+const WATCH_SETTLE: Duration = Duration::from_secs(180);
 
 // ----------------------------------------------------------------------------
 // Local remote-state helpers (public-API only; mirror the example test files).
@@ -1746,6 +1758,110 @@ async fn scale_23_progress_events_emitted_and_bounded() {
 	sc.cleanup();
 }
 
+/// SCALE-16 — watch mode debounces a burst of LOCAL events into exactly ONE coalesced pass.
+///
+/// Scaled down like the rest of this module (a few dozen files, not 5k); what is preserved is the
+/// claim — a burst written entirely inside one debounce window costs ONE pass, not one per file.
+/// The window is pinned with an explicit [`WatchConfig`] so that is a fact about the loop rather
+/// than a race against the production 800 ms default.
+#[shared_test_runtime]
+async fn scale_16_watch_debounces_local_event_burst() {
+	const BURST_DEBOUNCE: Duration = Duration::from_secs(15);
+	const N: usize = 60;
+
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	// watch() needs an `Arc<SyncEngine>`; the harness's own engine is left unused here.
+	let engine = Arc::new(
+		SyncEngine::open(sc.cache.client.clone(), temp_cache_path())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(sc.local.clone(), sc.remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+
+	let passes = Arc::new(AtomicUsize::new(0));
+	let uploaded = Arc::new(AtomicUsize::new(0));
+	let (pass_count, upload_count) = (passes.clone(), uploaded.clone());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: BURST_DEBOUNCE,
+				// Far enough out that no pass observed here can be a safety-net pass.
+				safety_net: Duration::from_secs(3600),
+			},
+			Box::new(move |event| {
+				if let SyncEvent::PassCompleted { report } = event {
+					pass_count.fetch_add(1, Ordering::SeqCst);
+					upload_count.fetch_add(report.uploaded, Ordering::SeqCst);
+				}
+			}),
+		)
+		.await
+		.unwrap();
+
+	// Settle the loop's immediate initial pass (and any trigger the registrations produced) before
+	// the burst, so the pass count it is measured against is stable.
+	assert!(
+		poll_until(WATCH_SETTLE, || passes.load(Ordering::SeqCst) >= 1).await,
+		"the watch never ran its initial pass"
+	);
+	tokio::time::sleep(BURST_DEBOUNCE + Duration::from_secs(5)).await;
+	let before = passes.load(Ordering::SeqCst);
+
+	// The whole burst lands well inside one debounce window.
+	for i in 0..N {
+		write_file(
+			&sc.local,
+			&format!("burst{i:03}.txt"),
+			format!("b{i}").as_bytes(),
+		);
+	}
+
+	assert!(
+		poll_until(WATCH_SETTLE, || uploaded.load(Ordering::SeqCst) >= N).await,
+		"the burst never uploaded (up={}, passes={})",
+		uploaded.load(Ordering::SeqCst),
+		passes.load(Ordering::SeqCst)
+	);
+	assert_eq!(
+		uploaded.load(Ordering::SeqCst),
+		N,
+		"files were uploaded more than once"
+	);
+	assert_eq!(
+		passes.load(Ordering::SeqCst),
+		before + 1,
+		"the burst was not coalesced into a single pass"
+	);
+
+	// Byte-exact on the remote...
+	let (_dirs, files) = list_root(&sc).await;
+	assert_eq!(files.len(), N, "remote file count mismatch");
+	for i in 0..N {
+		let name = format!("burst{i:03}.txt");
+		let f = files
+			.iter()
+			.find(|f| f.name() == Some(name.as_str()))
+			.unwrap_or_else(|| panic!("{name} missing on the remote"));
+		assert_eq!(f.size, format!("b{i}").len() as u64, "{name} size mismatch");
+	}
+
+	// ...and settled: the loop is not chasing its own writes, so a pass after it has nothing to do.
+	handle.stop().await;
+	let after = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		(after.uploaded, after.downloaded),
+		(0, 0),
+		"a settled burst re-transferred: {after:?}"
+	);
+
+	sc.cleanup();
+}
+
 // ============================================================================
 // Blocked: need fault-injection / instrumentation harnesses that do not exist yet
 // ============================================================================
@@ -1788,20 +1904,16 @@ async fn scale_09_bounded_memory_full_tree_scan() {}
 #[shared_test_runtime]
 async fn scale_14_interrupted_first_sync_resumes() {}
 
-/// SCALE-16 — watch mode debounces a burst of thousands of LOCAL events into bounded passes.
-/// plan: start watch on a baselined pair, create 5k files faster than the debounce window, wait to
-/// quiesce; assert all synced byte-exact, the burst coalesces into a small number of passes (NOT
-/// thousands), no self-write loop, a manual pass then reports 0 changes.
-#[ignore = "blocked: needs deterministic debounce-window / clock control to assert the pass-count bound (timing-flaky otherwise) — see TODO"]
-#[shared_test_runtime]
-async fn scale_16_watch_debounces_local_event_burst() {}
-
 /// SCALE-A2 (review-add) — watch mode coalesces a burst of thousands of REMOTE-change events into
 /// bounded passes.
+/// The debounce window is pinnable now (`WatchConfig`, see SCALE-16), but the remote half still is
+/// not: the cache delivers a bulk remote create as however many batches it happens to commit,
+/// spread over however long convergence takes, so "one coalesced pass" is a race against cache
+/// batching rather than a statement about the loop.
 /// plan: start watch on a baselined two-way/remote->local pair, burst-create/modify 5k remote
 /// files, wait to quiesce; assert all reflected locally byte-exact, the remote-event burst
 /// coalesces into few passes (not thousands), self-writes don't loop, manual pass then 0 changes.
-#[ignore = "blocked: needs deterministic debounce-window / clock control to assert the pass-count bound (timing-flaky otherwise) — see TODO"]
+#[ignore = "blocked: needs deterministic in-window delivery of the remote change notifications — see TODO"]
 #[shared_test_runtime]
 async fn scale_a2_watch_debounces_remote_event_burst() {}
 

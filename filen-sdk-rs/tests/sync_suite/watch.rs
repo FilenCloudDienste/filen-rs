@@ -23,7 +23,7 @@ use filen_sdk_rs::{
 		dir::RemoteDirectory,
 		file::RemoteFile,
 	},
-	sync_engine::{SyncEngine, SyncEvent, SyncMode},
+	sync_engine::{SyncEngine, SyncEvent, SyncMode, WatchConfig},
 };
 use uuid::Uuid;
 
@@ -1326,6 +1326,149 @@ async fn watch_add_pair_to_live_engine() {
 }
 
 // ============================================================================
+// (add) — the debounce is TRAILING-EDGE: every event restarts the quiet window
+// ============================================================================
+
+/// Events spaced INSIDE the debounce window must produce no pass at all until the stream stops: a
+/// fixed-window debounce would fire several times mid-stream, a trailing-edge one not once. Pinned
+/// with an explicit [`WatchConfig`], so the window is a known quantity rather than the production
+/// 800 ms nothing can be timed against.
+#[shared_test_runtime]
+async fn watch_add_trailing_edge_debounce() {
+	const DEBOUNCE: Duration = Duration::from_secs(10);
+	const N: usize = 6;
+
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::LocalToRemote).await;
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: DEBOUNCE,
+				// Far enough out that nothing observed here can be a safety-net pass.
+				safety_net: Duration::from_secs(3600),
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	// Settle first: the loop's immediate initial pass, plus any trigger the registrations
+	// themselves produced, must be spent before the stream's pass count means anything.
+	assert!(
+		wait_until(WATCH_SETTLE, || log.passes() >= 1).await,
+		"the watch never ran its initial pass"
+	);
+	tokio::time::sleep(DEBOUNCE + Duration::from_secs(5)).await;
+	let before = log.passes();
+
+	// Write at half the debounce apart, so every event lands inside its predecessor's window.
+	for i in 0..N {
+		write_file(&sc.local, &format!("t{i}.txt"), format!("v{i}").as_bytes());
+		tokio::time::sleep(DEBOUNCE / 2).await;
+	}
+
+	// Half a window past the last write: a fixed-window debounce would have fired N/2 times by now.
+	assert_eq!(
+		log.passes(),
+		before,
+		"a pass ran mid-stream: the debounce is not trailing-edge"
+	);
+	assert_eq!(
+		log.uploaded(),
+		0,
+		"files uploaded before the stream went quiet"
+	);
+
+	// Once quiet, one pass takes the whole stream — and takes it exactly once.
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() >= N).await,
+		"the coalesced pass never uploaded the stream (passes={}, up={})",
+		log.passes(),
+		log.uploaded()
+	);
+	assert_eq!(log.uploaded(), N, "the stream was uploaded more than once");
+	let (_dirs, files) = list_remote_root(&sc).await;
+	assert_eq!(files.len(), N, "remote file count mismatch");
+	for i in 0..N {
+		let name = format!("t{i}.txt");
+		let f = find_file(&files, &name).unwrap_or_else(|| panic!("{name} missing on the remote"));
+		assert_eq!(f.size, format!("v{i}").len() as u64, "{name} size mismatch");
+	}
+
+	drop(handle);
+	sc.cleanup();
+}
+
+// ============================================================================
+// (add) — the periodic safety-net pass never re-applies an event pass's work
+// ============================================================================
+
+/// With a safety net short enough that several ticks land on top of one just-applied change, that
+/// change must still be applied exactly once — and the net pass must actually be firing, which is
+/// what makes the "exactly once" meaningful. Both halves need a configured interval: the production
+/// 300 s one is unobservable inside a test.
+#[shared_test_runtime]
+async fn watch_add_net_vs_event_pass_no_double_apply() {
+	const NET: Duration = Duration::from_secs(3);
+
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::LocalToRemote).await;
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_secs(1),
+				safety_net: NET,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	write_file(&sc.local, "once.txt", b"exactly once");
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() >= 1).await,
+		"the watch never uploaded the change (passes={}, up={})",
+		log.passes(),
+		log.uploaded()
+	);
+
+	// Sit through several net ticks with nothing changing on either side.
+	let before = log.passes();
+	tokio::time::sleep(NET * 5).await;
+	assert!(
+		log.passes() >= before + 2,
+		"the configured safety net did not drive passes ({before} -> {})",
+		log.passes()
+	);
+	assert_eq!(
+		log.uploaded(),
+		1,
+		"the change was applied again by a safety-net pass"
+	);
+	assert_eq!(
+		log.downloaded(),
+		0,
+		"a safety-net pass pulled its own upload"
+	);
+	assert!(log.conflicts().is_empty(), "unexpected conflicts");
+	assert_eq!(log.remotely_trashed(), 0, "unexpected remote trash");
+
+	let (_dirs, files) = list_remote_root(&sc).await;
+	assert_eq!(files.len(), 1, "remote file count mismatch");
+	let f = find_file(&files, "once.txt").expect("once.txt missing on remote");
+	assert_eq!(f.size, b"exactly once".len() as u64, "remote size mismatch");
+
+	drop(handle);
+	sc.cleanup();
+}
+
+// ============================================================================
 // BLOCKED — need infrastructure the current public API / harness does not expose.
 // Each stub documents its plan so it can be implemented once the seam exists.
 // ============================================================================
@@ -1340,19 +1483,21 @@ async fn watch_add_pair_to_live_engine() {
 async fn watch_04_events_during_in_flight_pass() {}
 
 // WATCH-06 — periodic safety-net pass catches a local change the watcher missed/dropped.
-// Needs (a) a way to suppress/bypass the FS watcher for one change AND (b) a controllable/short net
-// interval to bound the wait deterministically. Neither the net interval nor watcher suppression is
-// exposed publicly. Plan: create a file the watcher does not see, wait one net interval, assert it
-// uploaded with no manual pass.
-#[ignore = "blocked: needs controllable net-pass interval + watcher suppression — see TODO"]
+// The net interval is now configurable (`WatchConfig`); what is still missing is a way to
+// suppress/bypass the FS watcher for one change. The only paths the watcher deliberately ignores
+// (`*.filendl`, the quarantine bin) are the same ones the SCAN ignores, so they cannot stand in for
+// a change the watcher missed. Plan: create a file the watcher does not see, wait one net interval,
+// assert it uploaded with no manual pass.
+#[ignore = "blocked: needs watcher suppression for one local change — see TODO"]
 #[shared_test_runtime]
 async fn watch_06_net_pass_catches_missed_local() {}
 
 // WATCH-07 — periodic safety-net pass catches a remote change with no notification delivered.
-// Same blocker as WATCH-06: needs a controllable net interval and a way to suppress the remote
-// notification. Plan: mutate remote out-of-band without a notification, wait one net interval,
-// assert local converged with no conflict.
-#[ignore = "blocked: needs controllable net-pass interval + notification suppression — see TODO"]
+// Same shape as WATCH-06: the net interval is configurable now, but there is no way to make a
+// remote change WITHOUT the cache subscription pinging the loop, so a pass caused by the net tick
+// cannot be told apart from one caused by the notification. Plan: mutate remote out-of-band without
+// a notification, wait one net interval, assert local converged with no conflict.
+#[ignore = "blocked: needs remote change-notification suppression — see TODO"]
 #[shared_test_runtime]
 async fn watch_07_net_pass_catches_missed_remote() {}
 
@@ -1428,27 +1573,12 @@ async fn watch_26_remove_pair_stops_events() {}
 #[shared_test_runtime]
 async fn watch_add_remote_burst_coalesces() {}
 
-// (add) — continuous trailing-edge debounce: timer resets on each event (not a fixed window).
-// Distinguishing trailing-edge from fixed-window debounce requires emitting events at a precise sub-
-// debounce cadence and asserting NO pass fires mid-stream — which needs knowledge of (or control
-// over) the exact debounce interval, not exposed publicly. Plan: emit an event every D/2 for 3*D,
-// assert zero passes until D of quiet after the final event, then exactly one.
-#[ignore = "blocked: needs known/controllable debounce interval — see TODO"]
-#[shared_test_runtime]
-async fn watch_add_trailing_edge_debounce() {}
-
-// (add) — periodic net pass interacts with event-triggered passes without double-applying.
-// Needs a controllable/short net interval to arrange the net tick to coincide with an event pass.
-// Not exposed. Plan: short net interval, land a change so its debounced pass overlaps the net tick,
-// assert the change applies exactly once and total passes stay bounded.
-#[ignore = "blocked: needs controllable net-pass interval — see TODO"]
-#[shared_test_runtime]
-async fn watch_add_net_vs_event_pass_no_double_apply() {}
-
 // (add) — net interval restarts after an event pass (not redundant right after) yet not starvable.
-// Same blocker: requires net-interval control and net-vs-event scheduling introspection. Plan: drive
-// event passes during the interval, assert no redundant net pass immediately after, but a net pass
-// still fires over a long idle stretch.
-#[ignore = "blocked: needs controllable net-pass interval + scheduling introspection — see TODO"]
+// The interval is configurable now, but the premise is not the loop's contract: the safety net is a
+// plain `tokio::time::Interval` that an event pass does NOT reset, so a net tick falling just after
+// an event pass fires anyway. Whether it SHOULD reset is an owner call; until then there is nothing
+// to assert. Plan (if it should): drive event passes during the interval, assert no redundant net
+// pass immediately after, but a net pass still fires over a long idle stretch.
+#[ignore = "blocked: needs an owner decision on whether an event pass resets the safety-net interval — see TODO"]
 #[shared_test_runtime]
 async fn watch_add_net_interval_resets_but_not_starved() {}

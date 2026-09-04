@@ -38,4 +38,4 @@ pub use outcome::{
 	PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, RefuseReason,
 	UnsyncablePath, UnsyncableReason,
 };
-pub use watch::{WatchHandle, WatchStatus};
+pub use watch::{WatchConfig, WatchHandle, WatchStatus};
