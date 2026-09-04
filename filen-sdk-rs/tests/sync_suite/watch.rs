@@ -4,8 +4,8 @@
 //! end-state convergence, byte-exactness, event coalescing (via the public `SyncEvent` stream),
 //! loop-freedom (idle quiescence), and prompt clean shutdown (dropping the `WatchHandle`). Black-box:
 //! PUBLIC API only. Where a test needs infrastructure the current public API/harness does not expose
-//! (fault injection, pause/resume, pair removal, a controllable clock for the periodic net pass, or
-//! baseline-store inspection) it is left as an `#[ignore]`d stub describing the plan.
+//! (fault injection, watcher/notification suppression, a real process restart, or scheduler
+//! introspection) it is left as an `#[ignore]`d stub describing the plan.
 use std::{
 	borrow::Cow,
 	sync::{
@@ -17,6 +17,7 @@ use std::{
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
+	cache::{CacheMessage, ResyncProgress},
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, Normal},
@@ -64,6 +65,21 @@ fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> 
 
 fn find_dir<'a>(dirs: &'a [RemoteDirectory], name: &str) -> Option<&'a RemoteDirectory> {
 	dirs.iter().find(|d| d.name() == Some(name))
+}
+
+/// How many cache convergence resyncs have STARTED so far. A resync relists a whole root under the
+/// drive lock, so this counter is the cost a control operation must not silently incur.
+fn resync_starts(log: &MessageLog) -> usize {
+	log.lock()
+		.unwrap()
+		.iter()
+		.filter(|m| {
+			matches!(
+				m,
+				CacheMessage::ResyncProgress(ResyncProgress::Started { .. })
+			)
+		})
+		.count()
 }
 
 /// Wait until the cache observes `uuid` (the engine's remote view is the cache).
@@ -1326,6 +1342,103 @@ async fn watch_add_pair_to_live_engine() {
 }
 
 // ============================================================================
+// WATCH-15 — pause suspends the loop's passes; resume takes the backlog in one go
+// ============================================================================
+
+/// While paused the loop runs nothing at all, and neither side moves. Resuming applies everything
+/// that piled up, exactly once each — and costs NO cache resync: the pair's sync-root registration
+/// is kept across the pause, so the root is never untracked and relisted under the drive lock.
+#[shared_test_runtime]
+async fn watch_15_pause_resume() {
+	const NET: Duration = Duration::from_secs(3);
+	const LOCAL: usize = 5;
+
+	let sc = single_client(SyncMode::TwoWay).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::TwoWay).await;
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_secs(1),
+				safety_net: NET,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	assert!(
+		wait_until(WATCH_SETTLE, || log.passes() >= 1).await,
+		"the watch never ran its initial pass"
+	);
+	engine.pause_pair(pair).await.unwrap();
+	// Let a pass that was already in flight when the pause landed finish.
+	tokio::time::sleep(NET).await;
+	let passes_at_pause = log.passes();
+	let resyncs_at_pause = resync_starts(&sc.cache.messages);
+
+	// Five local creates and two remote ones, all while paused.
+	for i in 0..LOCAL {
+		write_file(&sc.local, &format!("p{i}.txt"), format!("l{i}").as_bytes());
+	}
+	let r0 = upload_remote(&sc, "rp0.txt", b"r0").await;
+	let r1 = upload_remote(&sc, "rp1.txt", b"r1").await;
+	wait_cache_sees(&sc, r0.uuid()).await;
+	wait_cache_sees(&sc, r1.uuid()).await;
+	tokio::time::sleep(NET * 3).await;
+
+	assert_eq!(
+		log.passes(),
+		passes_at_pause,
+		"the paused watch ran a pass anyway"
+	);
+	assert_eq!(log.uploaded(), 0, "the paused watch uploaded");
+	assert_eq!(log.downloaded(), 0, "the paused watch downloaded");
+
+	engine.resume_pair(pair).await.unwrap();
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() >= LOCAL
+			&& log.downloaded() >= 2)
+		.await,
+		"the backlog did not sync after resume (up={}, down={}, passes={})",
+		log.uploaded(),
+		log.downloaded(),
+		log.passes()
+	);
+
+	// Nothing lost, nothing duplicated, both sides byte-exact.
+	assert_eq!(log.uploaded(), LOCAL, "duplicate uploads after resume");
+	assert_eq!(log.downloaded(), 2, "duplicate downloads after resume");
+	assert!(log.conflicts().is_empty(), "unexpected conflicts");
+	assert_eq!(log.remotely_trashed(), 0, "unexpected remote trash");
+	assert_eq!(log.locally_deleted(), 0, "unexpected local delete");
+	assert!(
+		read_eq(&sc.local, "rp0.txt", b"r0") && read_eq(&sc.local, "rp1.txt", b"r1"),
+		"the remote adds did not land locally"
+	);
+	let (_dirs, files) = list_remote_root(&sc).await;
+	for i in 0..LOCAL {
+		let name = format!("p{i}.txt");
+		assert!(
+			find_file(&files, &name).is_some(),
+			"{name} did not reach the remote"
+		);
+	}
+
+	// The load-bearing half: resuming did not cost a relist of the sync root.
+	assert_eq!(
+		resync_starts(&sc.cache.messages),
+		resyncs_at_pause,
+		"pausing/resuming triggered a cache resync of the sync root"
+	);
+
+	handle.stop().await;
+	sc.cleanup();
+}
+
+// ============================================================================
 // (add) — the debounce is TRAILING-EDGE: every event restarts the quiet window
 // ============================================================================
 
@@ -1526,14 +1639,6 @@ async fn watch_12_survives_subscription_error() {}
 #[shared_test_runtime]
 async fn watch_14_stop_mid_pass_restart_replans() {}
 
-// WATCH-15 — pause suspends passes; resume processes accumulated changes once.
-// There is no public pause/resume control on the watch (only start via watch/watch_observed and
-// stop via dropping the handle). Plan: pause, make 5 local + 2 remote changes, assert zero passes
-// while paused, resume, assert convergence in a bounded number of passes with no lost change.
-#[ignore = "blocked: no public pause/resume control on WatchHandle — see TODO"]
-#[shared_test_runtime]
-async fn watch_15_pause_resume() {}
-
 // WATCH-22 — baseline persists across process restart; watch resumes without re-uploading.
 // The current single-process test harness cannot terminate and relaunch a real OS process; faithful
 // verification of on-disk baseline persistence across a true restart needs a process-restart seam
@@ -1555,11 +1660,11 @@ async fn watch_22_baseline_persists_across_restart() {}
 async fn watch_25_sustained_load_bounded() {}
 
 // WATCH-26 — removing a pair while watching stops its events and leaves data intact.
-// There is no public "remove pair" on the engine/watch (the handle drop stops the WHOLE watch for a
-// pair, but there is no remove-registration API to assert teardown semantics distinct from stop).
-// Plan: remove pair A while watching, mutate localA/remoteA, assert A runs no passes and its data is
-// untouched while B keeps syncing.
-#[ignore = "blocked: no public remove-pair API distinct from stop — see TODO"]
+// `remove_pair` exists now, but what a running watch is supposed to do when its pair disappears is
+// undefined: the loop keeps ticking and every pass fails with "unknown sync pair", so it settles
+// into the failure backoff logging warnings forever rather than stopping. Asserting anything here
+// needs that contract decided first (stop the loop? make the pass a no-op like a pause?).
+#[ignore = "blocked: undefined contract for a watch whose pair was removed — see TODO"]
 #[shared_test_runtime]
 async fn watch_26_remove_pair_stops_events() {}
 

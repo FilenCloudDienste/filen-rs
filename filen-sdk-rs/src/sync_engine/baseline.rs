@@ -20,7 +20,7 @@ use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode};
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`. A DB
 /// carrying a HIGHER version was written by a newer engine and is REFUSED (never read under the
 /// older rules, which would misread it into deletes); a LOWER one is migrated forward in place.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Schema for the baseline DB. `foreign_keys` is applied per-connection in [`BaselineStore::init`]
 /// (it resets to off on every open). No WAL: a single owner writes and reads this DB, so the
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS sync_pairs (
 	mode INTEGER NOT NULL,
 	guard_floor INTEGER,
 	guard_ratio REAL,
+	paused INTEGER NOT NULL DEFAULT 0,
 	UNIQUE (local_root, remote_root)
 );
 
@@ -261,6 +262,9 @@ fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
 	if from < 4 {
 		migrate_to_v4(conn)?;
 	}
+	if from < 5 {
+		migrate_to_v5(conn)?;
+	}
 	Ok(())
 }
 
@@ -304,6 +308,15 @@ fn migrate_to_v3(conn: &Connection) -> rusqlite::Result<()> {
 /// successful pass would have left behind.
 fn migrate_to_v4(conn: &Connection) -> rusqlite::Result<()> {
 	conn.execute_batch(PATH_FAILURES_SCHEMA)
+}
+
+/// Bring a v4 DB up to v5: the per-pair paused flag. Every existing pair defaults to NOT paused,
+/// which is what it was; a DB freshly created from [`SCHEMA`] already carries the column.
+fn migrate_to_v5(conn: &Connection) -> rusqlite::Result<()> {
+	if !has_column(conn, "sync_pairs", "paused")? {
+		conn.execute_batch("ALTER TABLE sync_pairs ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;")?;
+	}
+	Ok(())
 }
 
 impl BaselineStore {
@@ -396,6 +409,24 @@ impl BaselineStore {
 		self.conn
 			.prepare("SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio FROM sync_pairs ORDER BY id")?
 			.query_map([], Self::row_to_pair)?
+			.collect()
+	}
+
+	/// Persist `pair`'s paused flag. Returns whether the pair exists — an unknown id updates
+	/// nothing, and the engine turns that into an error rather than a silent no-op.
+	pub(crate) fn set_paused(&self, id: PairId, paused: bool) -> rusqlite::Result<bool> {
+		let updated = self.conn.execute(
+			"UPDATE sync_pairs SET paused = ?1 WHERE id = ?2",
+			params![paused, id],
+		)?;
+		Ok(updated > 0)
+	}
+
+	/// Every pair currently paused. Read once when the engine opens, then tracked in memory.
+	pub(crate) fn paused_pairs(&self) -> rusqlite::Result<Vec<PairId>> {
+		self.conn
+			.prepare("SELECT id FROM sync_pairs WHERE paused != 0")?
+			.query_map([], |row| row.get(0))?
 			.collect()
 	}
 
@@ -1308,6 +1339,118 @@ mod tests {
 			.unwrap();
 		assert_eq!(store.load_pending(NOW, GRACE).unwrap().len(), 1);
 		drop(store);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A v4 DB (pairs + journal + failure counters, no paused flag) gains the column, and every pair
+	/// it already had comes back running — which is what it was.
+	#[test]
+	fn a_v4_db_is_migrated_to_v5_with_its_pairs_unpaused() {
+		let path = temp_db_path("v4");
+		{
+			let conn = Connection::open(&path).unwrap();
+			// The v4 shape of `sync_pairs`, spelled out rather than taken from SCHEMA: SCHEMA is
+			// the CURRENT shape and would already carry the column this migration adds.
+			conn.execute_batch(
+				"CREATE TABLE sync_pairs (
+					id INTEGER PRIMARY KEY,
+					local_root TEXT NOT NULL,
+					remote_root BLOB NOT NULL,
+					mode INTEGER NOT NULL,
+					guard_floor INTEGER,
+					guard_ratio REAL,
+					UNIQUE (local_root, remote_root)
+				);
+				CREATE TABLE baseline (
+					pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+					rel_path TEXT NOT NULL,
+					kind INTEGER NOT NULL,
+					remote_uuid BLOB,
+					content_hash BLOB,
+					size INTEGER,
+					local_mtime INTEGER,
+					remote_modified INTEGER,
+					state INTEGER NOT NULL,
+					local_kind INTEGER,
+					remote_kind INTEGER,
+					remote_hash BLOB,
+					remote_size INTEGER,
+					PRIMARY KEY (pair_id, rel_path)
+				);
+				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
+					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
+				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
+					VALUES (1, 'kept.txt', 2, 7, 0);
+				PRAGMA user_version = 4;",
+			)
+			.unwrap();
+			conn.execute_batch(PENDING_WRITES_SCHEMA).unwrap();
+			conn.execute_batch(PATH_FAILURES_SCHEMA).unwrap();
+		}
+
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
+		assert_eq!(store.entry(1, "kept.txt").unwrap().unwrap().size, Some(7));
+		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
+		assert!(
+			store.paused_pairs().unwrap().is_empty(),
+			"a migrated pair must come back running, not paused"
+		);
+		drop(store);
+
+		// Re-opening the migrated DB runs the step again as a no-op.
+		let again = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&again), SCHEMA_VERSION);
+		assert!(again.entry(1, "kept.txt").unwrap().is_some());
+		drop(again);
+		std::fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn the_paused_flag_round_trips_and_survives_a_reopen() {
+		let path = temp_db_path("paused");
+		let remote = Uuid::new_v4();
+		let (running, paused) = {
+			let store = BaselineStore::open(&path).unwrap();
+			let (running, _) = store
+				.create_pair("/home/u/running", Uuid::new_v4(), SyncMode::TwoWay)
+				.unwrap();
+			let (paused, _) = store
+				.create_pair("/home/u/paused", remote, SyncMode::TwoWay)
+				.unwrap();
+			assert!(store.paused_pairs().unwrap().is_empty(), "a new pair runs");
+
+			assert!(store.set_paused(paused, true).unwrap());
+			assert_eq!(store.paused_pairs().unwrap(), vec![paused]);
+			// Idempotent, and an unknown pair is reported as unknown rather than silently ignored.
+			assert!(store.set_paused(paused, true).unwrap());
+			assert!(!store.set_paused(paused + 9_999, true).unwrap());
+
+			// Re-adding the same roots must not un-pause the pair behind the caller's back.
+			assert_eq!(
+				store
+					.create_pair("/home/u/paused", remote, SyncMode::LocalToRemote)
+					.unwrap()
+					.0,
+				paused
+			);
+			assert_eq!(store.paused_pairs().unwrap(), vec![paused]);
+			(running, paused)
+		};
+
+		let reopened = BaselineStore::open(&path).unwrap();
+		assert_eq!(
+			reopened.paused_pairs().unwrap(),
+			vec![paused],
+			"the paused flag did not survive the reopen"
+		);
+		assert!(reopened.set_paused(paused, false).unwrap());
+		assert!(reopened.paused_pairs().unwrap().is_empty());
+		// Removing a pair takes its flag with it.
+		assert!(reopened.set_paused(running, true).unwrap());
+		reopened.delete_pair(running).unwrap();
+		assert!(reopened.paused_pairs().unwrap().is_empty());
+		drop(reopened);
 		std::fs::remove_file(&path).ok();
 	}
 }
