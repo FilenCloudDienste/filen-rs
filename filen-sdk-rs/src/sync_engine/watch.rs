@@ -29,14 +29,62 @@ use crate::{
 	io::DOWNLOAD_TMP_EXT,
 };
 
-/// Quiet window a burst of change events is coalesced over before a sync pass runs.
+/// Default quiet window a burst of change events is coalesced over before a sync pass runs.
 const DEBOUNCE: Duration = Duration::from_millis(800);
-/// Periodic full pass — the backstop for anything the watchers miss or coalesce.
+/// Default periodic full pass — the backstop for anything the watchers miss or coalesce.
 const SAFETY_NET: Duration = Duration::from_secs(300);
 /// Delay after the first failed pass; doubles per consecutive failure up to [`MAX_BACKOFF`].
 const BASE_BACKOFF: Duration = Duration::from_secs(2);
 /// Ceiling on that backoff, so a persistent failure still retries about as often as the safety net.
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The timings a continuous watch runs on. [`Default`] is what [`SyncEngine::watch`] and
+/// [`SyncEngine::watch_observed`] use; [`SyncEngine::watch_with`] takes an explicit one — mainly so
+/// a test can drive the loop faster than the production cadence, but also for a caller that wants a
+/// tighter safety net (a shared folder several devices write to) or a looser one (a metered link).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchConfig {
+	/// Quiet window a burst of change events is coalesced over before one pass runs. Every event
+	/// restarts it, so a continuous stream of writes syncs once it stops, not repeatedly during.
+	/// Must be non-zero: a zero debounce turns every filesystem event into its own pass.
+	pub debounce: Duration,
+	/// How often a pass runs regardless of any trigger — the backstop for what the FS watcher and
+	/// the cache subscription miss or coalesce. Must exceed [`debounce`](Self::debounce): a safety
+	/// net inside the coalescing window would keep firing before a burst could ever settle.
+	pub safety_net: Duration,
+}
+
+impl Default for WatchConfig {
+	fn default() -> Self {
+		Self {
+			debounce: DEBOUNCE,
+			safety_net: SAFETY_NET,
+		}
+	}
+}
+
+impl WatchConfig {
+	/// Reject a configuration the loop cannot honour, at `watch_with` time rather than as a
+	/// misbehaving background task nobody is watching.
+	fn validate(&self) -> Result<(), Error> {
+		if self.debounce.is_zero() {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				"watch debounce must be greater than zero",
+			));
+		}
+		if self.safety_net <= self.debounce {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!(
+					"watch safety net ({:?}) must be longer than the debounce ({:?})",
+					self.safety_net, self.debounce
+				),
+			));
+		}
+		Ok(())
+	}
+}
 
 /// An active continuous sync. Dropping it stops the background loop, the FS watcher, and the
 /// cache subscription; [`stop`](Self::stop) does the same but waits for the loop to finish.
@@ -103,6 +151,19 @@ impl SyncEngine {
 		pair: PairId,
 		observer: SyncObserver,
 	) -> Result<WatchHandle, Error> {
+		self.watch_with(pair, WatchConfig::default(), observer)
+			.await
+	}
+
+	/// Like [`watch_observed`](Self::watch_observed), but on `config`'s timings instead of the
+	/// defaults. Errors if the configuration is not one the loop can honour (see [`WatchConfig`]).
+	pub async fn watch_with(
+		self: Arc<Self>,
+		pair: PairId,
+		config: WatchConfig,
+		observer: SyncObserver,
+	) -> Result<WatchHandle, Error> {
+		config.validate()?;
 		let record = {
 			let store = self.store.lock().await;
 			store
@@ -153,6 +214,7 @@ impl SyncEngine {
 		let loop_done = tokio::spawn(run_loop(
 			engine,
 			pair,
+			config,
 			dirty,
 			shutdown_rx,
 			observer,
@@ -173,9 +235,11 @@ impl SyncEngine {
 /// until `shutdown` fires (its sender dropped). A pass that fails outright backs the loop off (see
 /// [`backoff`]) so a persistent error does not hot-loop at the debounce cadence; that backoff is
 /// also the retry timer, since an outage over a quiescent tree produces no trigger of its own.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
 	engine: Arc<SyncEngine>,
 	pair: PairId,
+	config: WatchConfig,
 	dirty: Arc<Notify>,
 	mut shutdown: tokio::sync::oneshot::Receiver<()>,
 	mut observer: SyncObserver,
@@ -183,7 +247,7 @@ async fn run_loop(
 ) {
 	let mut failures: u32 = 0;
 
-	let mut safety_net = tokio::time::interval(SAFETY_NET);
+	let mut safety_net = tokio::time::interval(config.safety_net);
 	safety_net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 	safety_net.tick().await; // consume the immediate first tick (the initial pass below covers it)
 
@@ -206,7 +270,15 @@ async fn run_loop(
 			);
 		}
 
-		if !wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, delay).await {
+		if !wait_for_next_pass(
+			&mut shutdown,
+			&dirty,
+			&mut safety_net,
+			config.debounce,
+			delay,
+		)
+		.await
+		{
 			return;
 		}
 	}
@@ -217,11 +289,12 @@ async fn run_loop(
 /// After a failed pass that `backoff` delay *is* the whole wait: it is the retry timer, so a
 /// persistent failure retries on the backoff schedule rather than falling through to whatever the
 /// safety net or a change event happens to offer next. While healthy the wait ends on the periodic
-/// safety-net tick, or on a change event once the burst behind it has gone quiet for [`DEBOUNCE`].
+/// safety-net tick, or on a change event once the burst behind it has gone quiet for `debounce`.
 async fn wait_for_next_pass(
 	shutdown: &mut tokio::sync::oneshot::Receiver<()>,
 	dirty: &Notify,
 	safety_net: &mut tokio::time::Interval,
+	debounce: Duration,
 	backoff: Option<Duration>,
 ) -> bool {
 	if let Some(delay) = backoff {
@@ -237,13 +310,13 @@ async fn wait_for_next_pass(
 		_ = &mut *shutdown => return false,
 		_ = safety_net.tick() => {}
 		_ = dirty.notified() => {
-			// Coalesce the burst: wait for DEBOUNCE of quiet (each new event restarts it).
+			// Coalesce the burst: wait for `debounce` of quiet (each new event restarts it).
 			loop {
 				tokio::select! {
 					biased;
 					_ = &mut *shutdown => return false,
 					_ = dirty.notified() => continue,
-					_ = tokio::time::sleep(DEBOUNCE) => break,
+					_ = tokio::time::sleep(debounce) => break,
 				}
 			}
 		}
@@ -322,7 +395,8 @@ mod tests {
 	use tokio::sync::Notify;
 
 	use super::{
-		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, backoff, triggers_pass, wait_for_next_pass,
+		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, WatchConfig, backoff, triggers_pass,
+		wait_for_next_pass,
 	};
 
 	/// A safety-net interval as `run_loop` sets one up: the immediate first tick consumed, so the
@@ -405,7 +479,14 @@ mod tests {
 
 		let start = tokio::time::Instant::now();
 		assert!(
-			wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, Some(BASE_BACKOFF)).await,
+			wait_for_next_pass(
+				&mut shutdown,
+				&dirty,
+				&mut safety_net,
+				DEBOUNCE,
+				Some(BASE_BACKOFF)
+			)
+			.await,
 			"a backoff that elapsed means retry, not stop"
 		);
 		assert_eq!(
@@ -424,11 +505,11 @@ mod tests {
 
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, None).await);
+		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, DEBOUNCE, None).await);
 		assert_eq!(start.elapsed(), DEBOUNCE, "a change waits out the debounce");
 
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, None).await);
+		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, DEBOUNCE, None).await);
 		assert_eq!(
 			start.elapsed(),
 			SAFETY_NET - DEBOUNCE,
@@ -446,10 +527,73 @@ mod tests {
 		drop(shutdown_tx);
 		let start = tokio::time::Instant::now();
 		assert!(
-			!wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, Some(MAX_BACKOFF)).await,
+			!wait_for_next_pass(
+				&mut shutdown,
+				&dirty,
+				&mut safety_net,
+				DEBOUNCE,
+				Some(MAX_BACKOFF)
+			)
+			.await,
 			"a stopped watch must not wait out the backoff"
 		);
 		assert_eq!(start.elapsed(), Duration::ZERO);
+	}
+
+	/// A configured debounce, not the default one, is what a burst is coalesced over.
+	#[tokio::test(start_paused = true)]
+	async fn the_configured_debounce_is_what_a_burst_waits_out() {
+		let (_shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+		let debounce = Duration::from_millis(50);
+
+		dirty.notify_one();
+		let start = tokio::time::Instant::now();
+		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, debounce, None).await);
+		assert_eq!(start.elapsed(), debounce);
+	}
+
+	#[test]
+	fn a_watch_config_the_loop_cannot_honour_is_refused() {
+		let default = WatchConfig::default();
+		assert_eq!(default.debounce, DEBOUNCE);
+		assert_eq!(default.safety_net, SAFETY_NET);
+		default.validate().expect("the defaults must be valid");
+
+		// A zero debounce turns every filesystem event into its own pass.
+		assert!(
+			WatchConfig {
+				debounce: Duration::ZERO,
+				..default
+			}
+			.validate()
+			.is_err()
+		);
+		// A safety net inside the coalescing window fires before a burst can ever settle — equal
+		// counts, since the tick would land exactly as the debounce expires.
+		assert!(
+			WatchConfig {
+				debounce: Duration::from_secs(10),
+				safety_net: Duration::from_secs(5),
+			}
+			.validate()
+			.is_err()
+		);
+		assert!(
+			WatchConfig {
+				debounce: Duration::from_secs(5),
+				safety_net: Duration::from_secs(5),
+			}
+			.validate()
+			.is_err()
+		);
+		WatchConfig {
+			debounce: Duration::from_millis(1),
+			safety_net: Duration::from_millis(2),
+		}
+		.validate()
+		.expect("a tight but ordered pair is fine");
 	}
 
 	#[test]
