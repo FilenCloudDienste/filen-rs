@@ -73,8 +73,13 @@ pub(crate) struct LocalScan {
 	/// destination).
 	pub(crate) complete: bool,
 	pub(crate) errors: Vec<ScanError>,
-	/// Paths whose NAME the remote would reject, mapped to the validator's own message. Neither
-	/// the path nor its subtree is in `nodes`, so nothing is planned for them.
+	/// Paths whose NAME the remote would reject, mapped to the validator's own message. Reported
+	/// once at the TOP of a rejected subtree; the engine screens every action for such a path and
+	/// its descendants out of the plan.
+	///
+	/// The nodes themselves stay in `nodes`: this map says "nothing can be pushed here", not "this
+	/// is not on disk". Omitting them would make a rename of a synced item into a rejected name
+	/// read downstream as a local DELETION and trash the remote copy.
 	///
 	/// Deliberately NOT an entry in `errors`: those mean the scan may have MISSED something, which
 	/// makes every apparent deletion untrustworthy. An unsyncable name is the opposite — a fully
@@ -232,16 +237,17 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 			continue;
 		}
 
-		// A name the remote would reject can never be pushed, so the whole subtree is left out of
-		// the plan and reported instead of failing an upload every pass. The scan still COMPLETED:
-		// this is a fully observed item that cannot be synced, not evidence the walk missed
-		// anything, so `complete` stays true and the delete guard is unaffected.
-		if under_invalid_name(&invalid_names, &rel_path) {
-			continue;
-		}
-		if let Some(reason) = name_rejection(&rel_path) {
-			invalid_names.insert(rel_path, reason);
-			continue;
+		// A name the remote would reject can never be pushed: report it once, at the top of the
+		// subtree, and let the engine screen the whole subtree out of the plan rather than failing
+		// an upload every pass. The node itself is still recorded — the scan reports what is on
+		// disk, and an entry that exists but is omitted here reads downstream as a local DELETION,
+		// so renaming a synced item into a rejected name would trash its remote copy. The scan also
+		// still COMPLETED: this is a fully observed item that cannot be synced, not evidence the
+		// walk missed anything, so `complete` stays true and the delete guard is unaffected.
+		if !under_invalid_name(&invalid_names, &rel_path)
+			&& let Some(reason) = name_rejection(&rel_path)
+		{
+			invalid_names.insert(rel_path.clone(), reason);
 		}
 
 		if let Some(previous) = claimed.insert(collision_key(&rel_path), rel_path.clone()) {
@@ -445,7 +451,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_name_the_remote_would_reject_is_excluded_with_its_whole_subtree() {
+	fn a_name_the_remote_would_reject_is_reported_once_but_still_observed() {
 		let root = temp_root();
 		fs::write(root.join("keep.txt"), b"x").unwrap();
 		// `CON` is a reserved device name and `bad.` ends in a dot: both are creatable on unix and
@@ -459,10 +465,23 @@ mod tests {
 		let scan = scan_local(&root, &HashMap::new());
 		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
 		paths.sort();
+		// The scan reports the disk as it is: a rejected name is unpushable, not invisible. Dropping
+		// it here would make a rename INTO such a name look like a local deletion one layer up.
 		assert_eq!(
 			paths,
-			vec!["keep.txt"],
-			"a rejected name takes its whole subtree out of the plan"
+			vec![
+				"CON",
+				"bad.",
+				"bad./deeper",
+				"bad./deeper/x.txt",
+				"bad./inner.txt",
+				"keep.txt"
+			]
+		);
+		assert!(
+			scan.nodes["CON"].content_hash.is_some(),
+			"a rejected name is hashed like any other file, so a rename of a synced file into one \
+			 is still recognized as that file"
 		);
 
 		let reported: Vec<_> = scan.invalid_names.keys().cloned().collect();
