@@ -75,7 +75,7 @@ fn assert_noop(r: &filen_sdk_rs::sync_engine::SyncReport) {
 	assert_eq!(r.moved_remote, 0, "{r:?}");
 	assert_eq!(r.moved_local, 0, "{r:?}");
 	assert_eq!(r.conflicts.len(), 0, "{r:?}");
-	assert_eq!(r.held_deletions, 0, "{r:?}");
+	assert_eq!(r.held_deletions(), 0, "{r:?}");
 	assert!(r.errors.is_empty(), "{r:?}");
 }
 
@@ -357,7 +357,7 @@ async fn resil_17_mass_delete_hold_not_bypassed_by_rerun() {
 	// First pass after the mass delete: the guard must hold it.
 	let r2 = sc.sync().await;
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"mass-delete guard should engage: {r2:?}"
 	);
 	assert_eq!(
@@ -368,7 +368,7 @@ async fn resil_17_mass_delete_hold_not_bypassed_by_rerun() {
 	// Re-run (models the resume after an interruption): the hold must be RE-RAISED, not bypassed.
 	let r3 = sc.sync().await;
 	assert!(
-		r3.held_deletions > 0 || r3.guard_message.is_some(),
+		r3.held_deletions() > 0 || r3.guard.is_some(),
 		"mass-delete hold must persist across a re-run, not be bypassed: {r3:?}"
 	);
 	assert_eq!(
@@ -560,13 +560,12 @@ async fn resil_25_two_way_conflict_persists_across_reruns_nondestructive() {
 		assert_eq!(ra.remotely_trashed, 0, "A trashed under conflict: {ra:?}");
 		assert_eq!(rb.remotely_trashed, 0, "B trashed under conflict: {rb:?}");
 		let any = ra
-			.conflicts
-			.iter()
-			.chain(rb.conflicts.iter())
+			.conflict_paths()
+			.chain(rb.conflict_paths())
 			.any(|c| c.contains("t.txt"));
 		surfaced_each_round.push(any);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 	}

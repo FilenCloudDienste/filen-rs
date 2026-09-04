@@ -380,8 +380,8 @@ async fn twoway_two_clients_contend_and_converge() {
 		let (ra, rb) = tokio::join!(engine_a.sync_once(pair_a), engine_b.sync_once(pair_b));
 		let ra = ra.expect("engine_a.sync_once (baseline) must not Err");
 		let rb = rb.expect("engine_b.sync_once (baseline) must not Err");
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			all_conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			all_conflicts.insert(c.to_string());
 		}
 		let _ = poll_until(observe_timeout, || {
 			disjoint_present(&local_a, &local_b, half)
@@ -409,11 +409,10 @@ async fn twoway_two_clients_contend_and_converge() {
 	let (ra, rb) = tokio::join!(engine_a.sync_once(pair_a), engine_b.sync_once(pair_b));
 	for c in ra
 		.expect("settle a")
-		.conflicts
-		.iter()
-		.chain(rb.expect("settle b").conflicts.iter())
+		.conflict_paths()
+		.chain(rb.expect("settle b").conflict_paths())
 	{
-		all_conflicts.insert(c.clone());
+		all_conflicts.insert(c.to_string());
 	}
 
 	// --- Phase 1: DIVERGE conflict.txt on both sides, then contend ---
@@ -431,8 +430,8 @@ async fn twoway_two_clients_contend_and_converge() {
 		let ra = ra.expect("engine_a.sync_once must not Err");
 		let rb = rb.expect("engine_b.sync_once must not Err");
 
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			all_conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			all_conflicts.insert(c.to_string());
 		}
 
 		// Sanity: nothing should indicate corruption. We tolerate per-pass guard/held messages,
@@ -640,8 +639,8 @@ async fn converge(
 			"{label}: engine B reported errors {:?}",
 			rb.errors
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		if done() {
 			return;

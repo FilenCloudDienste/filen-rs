@@ -413,7 +413,11 @@ async fn converge_09_local_delete_mirrors_to_remote() {
 		r1.remotely_trashed, 1,
 		"local delete should trash remote: {r1:?}"
 	);
-	assert_eq!(r1.held_deletions, 0, "1/2 must not trip the guard: {r1:?}");
+	assert_eq!(
+		r1.held_deletions(),
+		0,
+		"1/2 must not trip the guard: {r1:?}"
+	);
 
 	let (_d, files) = list_dir(&sc.cache.client, &sc.resources.dir).await;
 	assert!(

@@ -17,7 +17,9 @@ use std::sync::Arc;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{PlanOutcome, SyncEngine, SyncEvent, SyncMode, SyncReport};
+use filen_sdk_rs::sync_engine::{
+	PlannedActionKind, PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport,
+};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -105,7 +107,7 @@ async fn observ_01_upload_count_equals_new_files() {
 	assert_eq!(report.moved_remote, 0, "{report:?}");
 	assert_eq!(report.moved_local, 0, "{report:?}");
 	assert_eq!(report.conflicts.len(), 0, "{report:?}");
-	assert_eq!(report.held_deletions, 0, "{report:?}");
+	assert_eq!(report.held_deletions(), 0, "{report:?}");
 	// The whole pass's applied work is exactly the 5 uploads.
 	assert_eq!(applied_total(&report), 5, "{report:?}");
 
@@ -208,7 +210,7 @@ async fn observ_04_delete_count_mirrored_local_to_remote() {
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	// 2 of 3 deleted does not trip the mass-delete guard (floor 10).
 	assert_eq!(r2.remotely_trashed, 2, "{r2:?}");
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "{r2:?}");
 	assert_eq!(r2.downloaded, 0, "{r2:?}");
 
@@ -236,7 +238,7 @@ async fn observ_04_backup_mode_does_not_mirror_deletes() {
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	// Backup mode never mirrors a source-side deletion.
 	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert!(
 		!events
 			.iter()
@@ -399,18 +401,21 @@ async fn observ_07_held_count_mass_delete_hold() {
 		.await
 		.unwrap();
 	assert!(r2.errors.is_empty(), "a hold is not an error: {r2:?}");
-	assert!(r2.held_deletions > 0, "guard should hold deletions: {r2:?}");
+	assert!(
+		r2.held_deletions() > 0,
+		"guard should hold deletions: {r2:?}"
+	);
 	assert_eq!(
 		r2.remotely_trashed, 0,
 		"nothing destroyed this pass: {r2:?}"
 	);
-	assert!(r2.guard_message.is_some(), "{r2:?}");
+	assert!(r2.guard.is_some(), "{r2:?}");
 	// A DeletionsHeld event surfaced the hold with the same count.
 	let held_event = events.iter().find_map(|e| match e {
 		SyncEvent::DeletionsHeld { count, .. } => Some(*count),
 		_ => None,
 	});
-	assert_eq!(held_event, Some(r2.held_deletions), "events: {events:?}");
+	assert_eq!(held_event, Some(r2.held_deletions()), "events: {events:?}");
 	// No trash action event fired.
 	assert!(
 		!events
@@ -685,7 +690,7 @@ async fn observ_15_noop_pass_zero_counts_and_events() {
 	assert_eq!(r2.moved_remote, 0, "{r2:?}");
 	assert_eq!(r2.moved_local, 0, "{r2:?}");
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert!(r2.errors.is_empty(), "{r2:?}");
 
 	// Zero per-action events, but a PassStarted/PassCompleted bracket still fires.
@@ -1036,7 +1041,8 @@ async fn observ_add_backup_ignored_delete_not_miscounted() {
 		"backup must not mirror f2's delete: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"an ignored backup delete is not a held delete: {r2:?}"
 	);
 	// The ignored delete is NOT counted in any applied bucket, and emits no trash event.
@@ -1205,40 +1211,47 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 		.filter_map(|f| f.name().map(str::to_string))
 		.collect();
 
-	let PlanOutcome::Planned {
-		actions,
-		held_deletions,
-		conflicts,
-		guard_message,
-		pass_token,
-	} = sc.engine.plan_pair(sc.pair).await.unwrap()
-	else {
-		panic!("the dry run must not refuse this pair");
-	};
-	assert!(held_deletions.is_empty(), "{held_deletions:?}");
-	assert!(conflicts.is_empty(), "{conflicts:?}");
-	assert!(guard_message.is_none(), "{guard_message:?}");
-	assert!(pass_token.is_none(), "no held batch, so no token");
+	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert!(
+		plan.refused.is_none(),
+		"the dry run must not refuse this pair"
+	);
+	assert!(plan.held.is_empty(), "{:?}", plan.held);
+	assert!(plan.conflicts.is_empty(), "{:?}", plan.conflicts);
+	assert!(plan.held_reason.is_none(), "{:?}", plan.held_reason);
+	assert!(plan.unsyncable.is_empty(), "{:?}", plan.unsyncable);
+	assert!(plan.pass_token.is_none(), "no held batch, so no token");
 
-	// Every intended action names its path, and the intended count is the breakdown.
+	// Every intended action names its path, its kind and (for a transfer) its size.
+	let actions = plan.actions.clone();
 	assert_eq!(
 		actions.len(),
 		3,
 		"one dir create + two uploads: {actions:?}"
 	);
 	assert!(
-		actions.iter().any(|a| a.contains("\"sub\"")),
-		"the plan must name the new directory: {actions:?}"
+		actions.iter().any(|a| a.rel_path == "sub"
+			&& a.kind == PlannedActionKind::CreateRemoteDir
+			&& a.node == PlannedNodeKind::Dir
+			&& a.size.is_none()),
+		"the plan must name the new directory as a dir create: {actions:?}"
 	);
-	for name in ["sub/one.txt", "sub/two.txt"] {
+	for (name, bytes) in [("sub/one.txt", 5u64), ("sub/two.txt", 6u64)] {
 		assert!(
-			actions.iter().any(|a| a.contains(name)),
-			"the plan must name {name}: {actions:?}"
+			actions.iter().any(|a| a.rel_path == name
+				&& a.kind == PlannedActionKind::UploadFile
+				&& a.size == Some(bytes)),
+			"the plan must name {name} as an upload of {bytes} bytes: {actions:?}"
 		);
 	}
 	assert!(
-		!actions.iter().any(|a| a.contains("kept.txt")),
+		!actions.iter().any(|a| a.rel_path == "kept.txt"),
 		"an already-synced file must not be planned: {actions:?}"
+	);
+	// The same plan renders as the CLI-ish one-liners a caller can print directly.
+	assert!(
+		plan.to_string().contains("upload file \"sub/one.txt\""),
+		"Display must render each action: {plan}"
 	);
 
 	// NOTHING moved: local tree, remote listing and the quarantine area are all unchanged.
@@ -1262,11 +1275,9 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 	);
 
 	// The baseline is untouched too: re-planning yields exactly the same plan.
-	let PlanOutcome::Planned { actions: again, .. } = sc.engine.plan_pair(sc.pair).await.unwrap()
-	else {
-		panic!("second dry run refused");
-	};
-	assert_eq!(again, actions, "the dry run advanced the baseline");
+	let again = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert!(again.refused.is_none(), "second dry run refused");
+	assert_eq!(again.actions, actions, "the dry run advanced the baseline");
 
 	// The real pass applies exactly what was predicted.
 	let report = sc.sync().await;
@@ -1332,7 +1343,7 @@ async fn observ_23_held_then_confirmed_reported_as_deletes() {
 		.await
 		.unwrap();
 	assert!(held_report.errors.is_empty(), "{held_report:?}");
-	assert_eq!(held_report.held_deletions, DELETE, "{held_report:?}");
+	assert_eq!(held_report.held_deletions(), DELETE, "{held_report:?}");
 	assert_eq!(held_report.remotely_trashed, 0, "{held_report:?}");
 	assert_eq!(
 		events
@@ -1370,7 +1381,7 @@ async fn observ_23_held_then_confirmed_reported_as_deletes() {
 		.unwrap();
 	assert!(applied.errors.is_empty(), "{applied:?}");
 	assert_eq!(applied.remotely_trashed, DELETE, "{applied:?}");
-	assert_eq!(applied.held_deletions, 0, "{applied:?}");
+	assert_eq!(applied.held_deletions(), 0, "{applied:?}");
 	assert!(applied.deletion_token.is_none(), "{applied:?}");
 	assert_eq!(
 		events

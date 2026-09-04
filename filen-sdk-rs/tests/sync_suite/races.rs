@@ -513,8 +513,8 @@ async fn race_16_twoway_divergence_conflicts_without_loss() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1200)).await;
 	}
@@ -585,8 +585,8 @@ async fn race_25_same_content_rewrite_no_false_conflict() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1200)).await;
 	}
@@ -724,7 +724,7 @@ async fn race_23_mass_delete_guard_holds_bulk_vanish() {
 	std::fs::remove_dir_all(sc.local.join("bulk")).unwrap();
 	let r2 = sc.sync().await;
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"mass-delete guard must engage for the bulk vanish: {r2:?}"
 	);
 	assert_eq!(
