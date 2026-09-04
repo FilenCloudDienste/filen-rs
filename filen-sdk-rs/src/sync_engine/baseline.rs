@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use filen_types::crypto::Blake3Hash;
+use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode};
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`. A DB
 /// carrying a HIGHER version was written by a newer engine and is REFUSED (never read under the
 /// older rules, which would misread it into deletes); a LOWER one is migrated forward in place.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Schema for the baseline DB. `foreign_keys` is applied per-connection in [`BaselineStore::init`]
 /// (it resets to off on every open). No WAL: a single owner writes and reads this DB, so the
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS baseline (
 	remote_kind INTEGER,
 	remote_hash BLOB,
 	remote_size INTEGER,
+	remote_stable_uuid BLOB,
 	PRIMARY KEY (pair_id, rel_path)
 );
 ";
@@ -169,6 +170,14 @@ pub(crate) struct BaselineEntry {
 	pub(crate) remote_kind: Option<NodeKind>,
 	pub(crate) remote_hash: Option<Blake3Hash>,
 	pub(crate) remote_size: Option<u64>,
+	/// The server-minted whole-life id of the remote FILE this row last recorded — `None` for a
+	/// directory (which has none: its uuid survives renames) and for a row written before this
+	/// column existed.
+	///
+	/// `remote_uuid` is a VERSION id: every content edit and every version restore re-mints it. This
+	/// one does not, so it is what tells a new version of the SAME file apart from a DIFFERENT file
+	/// that has taken the path over.
+	pub(crate) remote_stable_uuid: Option<StableUuid>,
 }
 
 /// One row of the persisted pending-write journal: a remote write this engine made, and when by
@@ -265,6 +274,9 @@ fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
 	if from < 5 {
 		migrate_to_v5(conn)?;
 	}
+	if from < 6 {
+		migrate_to_v6(conn)?;
+	}
 	Ok(())
 }
 
@@ -315,6 +327,17 @@ fn migrate_to_v4(conn: &Connection) -> rusqlite::Result<()> {
 fn migrate_to_v5(conn: &Connection) -> rusqlite::Result<()> {
 	if !has_column(conn, "sync_pairs", "paused")? {
 		conn.execute_batch("ALTER TABLE sync_pairs ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;")?;
+	}
+	Ok(())
+}
+
+/// Bring a v5 DB up to v6: the file's server-minted whole-life id alongside its version uuid. A v5
+/// row simply has none, and a NULL there reads as "lineage unknown" — which every rule consulting
+/// it already treats as no evidence — so no existing row is read or rewritten; each path re-learns
+/// its id the next time the pair writes there.
+fn migrate_to_v6(conn: &Connection) -> rusqlite::Result<()> {
+	if !has_column(conn, "baseline", "remote_stable_uuid")? {
+		conn.execute_batch("ALTER TABLE baseline ADD COLUMN remote_stable_uuid BLOB;")?;
 	}
 	Ok(())
 }
@@ -481,8 +504,9 @@ impl BaselineStore {
 		self.conn.execute(
 			"INSERT OR REPLACE INTO baseline
 			 (pair_id, rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-			  remote_modified, state, local_kind, remote_kind, remote_hash, remote_size)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+			  remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
+			  remote_stable_uuid)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
 			params![
 				pair,
 				entry.rel_path,
@@ -497,6 +521,7 @@ impl BaselineStore {
 				entry.remote_kind.map(NodeKind::as_i64),
 				entry.remote_hash.as_ref().map(|h| h.as_ref().as_slice()),
 				entry.remote_size.map(|s| s as i64),
+				entry.remote_stable_uuid,
 			],
 		)?;
 		Ok(())
@@ -511,7 +536,8 @@ impl BaselineStore {
 		self.conn
 			.query_row(
 				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size
+				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
+				        remote_stable_uuid
 				 FROM baseline WHERE pair_id = ?1 AND rel_path = ?2",
 				params![pair, rel_path],
 				Self::row_to_entry,
@@ -524,7 +550,8 @@ impl BaselineStore {
 		self.conn
 			.prepare(
 				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size
+				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
+				        remote_stable_uuid
 				 FROM baseline WHERE pair_id = ?1 ORDER BY rel_path",
 			)?
 			.query_map(params![pair], Self::row_to_entry)?
@@ -734,6 +761,7 @@ impl BaselineStore {
 			remote_kind: side_kind(row.get("remote_kind")?)?,
 			remote_hash,
 			remote_size: row.get::<_, Option<i64>>("remote_size")?.map(|s| s as u64),
+			remote_stable_uuid: row.get("remote_stable_uuid")?,
 		})
 	}
 }
@@ -756,6 +784,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: None,
 		}
 	}
 
@@ -773,6 +802,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
+			remote_stable_uuid: None,
 		}
 	}
 
@@ -1309,6 +1339,70 @@ mod tests {
 
 		assert!(store.load_pending(NOW, GRACE).unwrap().is_empty());
 		assert_eq!(pending_count(&store), 0, "the orphan was deleted");
+	}
+
+	/// v5 -> v6: the file lineage column. A v5 row has none, and must survive reading `None` there
+	/// rather than failing the open or losing anything it did record.
+	#[test]
+	fn a_v5_db_is_migrated_to_v6_keeping_its_rows() {
+		let path = temp_db_path("v5");
+		{
+			let conn = Connection::open(&path).unwrap();
+			// The v5 schema: everything except `remote_stable_uuid`.
+			conn.execute_batch(
+				"CREATE TABLE sync_pairs (
+					id INTEGER PRIMARY KEY,
+					local_root TEXT NOT NULL,
+					remote_root BLOB NOT NULL,
+					mode INTEGER NOT NULL,
+					guard_floor INTEGER,
+					guard_ratio REAL,
+					paused INTEGER NOT NULL DEFAULT 0,
+					UNIQUE (local_root, remote_root)
+				);
+				CREATE TABLE baseline (
+					pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+					rel_path TEXT NOT NULL,
+					kind INTEGER NOT NULL,
+					remote_uuid BLOB,
+					content_hash BLOB,
+					size INTEGER,
+					local_mtime INTEGER,
+					remote_modified INTEGER,
+					state INTEGER NOT NULL,
+					local_kind INTEGER,
+					remote_kind INTEGER,
+					remote_hash BLOB,
+					remote_size INTEGER,
+					PRIMARY KEY (pair_id, rel_path)
+				);
+				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
+					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
+				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
+					VALUES (1, 'kept.txt', 2, 7, 0);
+				PRAGMA user_version = 5;",
+			)
+			.unwrap();
+			conn.execute_batch(PENDING_WRITES_SCHEMA).unwrap();
+			conn.execute_batch(PATH_FAILURES_SCHEMA).unwrap();
+		}
+
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
+		let entry = store.entry(1, "kept.txt").unwrap().expect("row survived");
+		assert_eq!(entry.size, Some(7));
+		assert_eq!(
+			entry.remote_stable_uuid, None,
+			"a pre-v6 row reads back with no lineage recorded"
+		);
+		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
+		// The new column is writable and round-trips from the very first write.
+		let mut updated = entry;
+		updated.remote_stable_uuid = Some(StableUuid::new_for_test(Uuid::new_v4()));
+		store.upsert_entry(1, &updated).unwrap();
+		assert_eq!(store.entry(1, "kept.txt").unwrap(), Some(updated));
+		drop(store);
+		std::fs::remove_file(&path).ok();
 	}
 
 	/// The first real migration: a v1 DB (baseline rows, no journal) gains the table and keeps
