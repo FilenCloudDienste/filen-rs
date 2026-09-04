@@ -15,12 +15,12 @@ use filen_types::crypto::Blake3Hash;
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
-use super::{engine::PendingKind, mode::SyncMode};
+use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode};
 
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`. A DB
 /// carrying a HIGHER version was written by a newer engine and is REFUSED (never read under the
 /// older rules, which would misread it into deletes); a LOWER one is migrated forward in place.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Schema for the baseline DB. `foreign_keys` is applied per-connection in [`BaselineStore::init`]
 /// (it resets to off on every open). No WAL: a single owner writes and reads this DB, so the
@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS sync_pairs (
 	local_root TEXT NOT NULL,
 	remote_root BLOB NOT NULL,
 	mode INTEGER NOT NULL,
+	guard_floor INTEGER,
+	guard_ratio REAL,
 	UNIQUE (local_root, remote_root)
 );
 
@@ -175,7 +177,7 @@ pub(crate) enum BaselineChange<'a> {
 }
 
 /// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PairRecord {
 	pub id: PairId,
 	/// The canonicalized local root the pair syncs.
@@ -183,6 +185,10 @@ pub struct PairRecord {
 	/// The remote folder the pair syncs against.
 	pub remote_root: Uuid,
 	pub mode: SyncMode,
+	/// The pair's mass-delete threshold, as set by
+	/// [`SyncEngine::set_delete_guard`](super::SyncEngine::set_delete_guard) (or the default it was
+	/// registered with).
+	pub delete_guard: DeleteGuard,
 }
 
 /// A registered pair's id, handed back by [`SyncEngine::add_pair`](super::SyncEngine::add_pair).
@@ -237,6 +243,9 @@ fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
 	if from < 2 {
 		migrate_to_v2(conn)?;
 	}
+	if from < 3 {
+		migrate_to_v3(conn)?;
+	}
 	Ok(())
 }
 
@@ -261,6 +270,18 @@ fn migrate_to_v1(conn: &Connection) -> rusqlite::Result<()> {
 /// table is the whole migration — no existing row is read or rewritten.
 fn migrate_to_v2(conn: &Connection) -> rusqlite::Result<()> {
 	conn.execute_batch(PENDING_WRITES_SCHEMA)
+}
+
+/// Bring a v2 DB up to v3: the per-pair delete-guard threshold. Both columns are NULLable and a
+/// NULL pair of them reads back as [`DeleteGuard::default`], so every existing pair keeps exactly
+/// the hardcoded policy it was already running under.
+fn migrate_to_v3(conn: &Connection) -> rusqlite::Result<()> {
+	for (column, ty) in [("guard_floor", "INTEGER"), ("guard_ratio", "REAL")] {
+		if !has_column(conn, "sync_pairs", column)? {
+			conn.execute_batch(&format!("ALTER TABLE sync_pairs ADD COLUMN {column} {ty};"))?;
+		}
+	}
+	Ok(())
 }
 
 impl BaselineStore {
@@ -323,7 +344,7 @@ impl BaselineStore {
 	pub(crate) fn pair(&self, id: PairId) -> rusqlite::Result<Option<PairRecord>> {
 		self.conn
 			.query_row(
-				"SELECT id, local_root, remote_root, mode FROM sync_pairs WHERE id = ?1",
+				"SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio FROM sync_pairs WHERE id = ?1",
 				params![id],
 				Self::row_to_pair,
 			)
@@ -332,7 +353,7 @@ impl BaselineStore {
 
 	pub(crate) fn list_pairs(&self) -> rusqlite::Result<Vec<PairRecord>> {
 		self.conn
-			.prepare("SELECT id, local_root, remote_root, mode FROM sync_pairs ORDER BY id")?
+			.prepare("SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio FROM sync_pairs ORDER BY id")?
 			.query_map([], Self::row_to_pair)?
 			.collect()
 	}
@@ -344,13 +365,42 @@ impl BaselineStore {
 		Ok(())
 	}
 
+	/// Persist a pair's mass-delete threshold; every later pass screens against it.
+	pub(crate) fn set_delete_guard(
+		&self,
+		id: PairId,
+		guard: DeleteGuard,
+	) -> rusqlite::Result<usize> {
+		self.conn.execute(
+			"UPDATE sync_pairs SET guard_floor = ?2, guard_ratio = ?3 WHERE id = ?1",
+			// `DeleteGuard::unlimited`'s floor is `usize::MAX`, which no SQLite integer holds; it
+			// saturates to `i64::MAX`, still far past any tracked-item count.
+			params![
+				id,
+				i64::try_from(guard.floor()).unwrap_or(i64::MAX),
+				guard.ratio()
+			],
+		)
+	}
+
 	fn row_to_pair(row: &Row<'_>) -> rusqlite::Result<PairRecord> {
 		let mode_raw: i64 = row.get("mode")?;
+		// Both NULL is the ordinary case (a pair registered before v3, or never reconfigured): the
+		// default policy, which is exactly what those pairs already ran under.
+		let delete_guard = match (
+			row.get::<_, Option<i64>>("guard_floor")?,
+			row.get::<_, Option<f64>>("guard_ratio")?,
+		) {
+			(Some(floor), Some(ratio)) => DeleteGuard::new(floor.max(0) as usize, ratio)
+				.map_err(|_| corrupt("guard ratio", ratio as i64))?,
+			_ => DeleteGuard::default(),
+		};
 		Ok(PairRecord {
 			id: row.get("id")?,
 			local_root: row.get("local_root")?,
 			remote_root: row.get("remote_root")?,
 			mode: SyncMode::from_i64(mode_raw).ok_or_else(|| corrupt("mode", mode_raw))?,
+			delete_guard,
 		})
 	}
 
@@ -723,6 +773,83 @@ mod tests {
 		assert_eq!(version_of(&again), SCHEMA_VERSION);
 		assert!(again.entry(1, "kept.txt").unwrap().is_some());
 		drop(again);
+		std::fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn a_v2_db_gains_the_delete_guard_columns_and_its_pairs_keep_the_default() {
+		let path = temp_db_path("v2_guard");
+		// A v2 DB: the schema before the per-pair threshold, carrying a pair that must come back
+		// running exactly the policy it ran under before the migration.
+		{
+			let conn = Connection::open(&path).unwrap();
+			conn.execute_batch(
+				"CREATE TABLE sync_pairs (
+					id INTEGER PRIMARY KEY,
+					local_root TEXT NOT NULL,
+					remote_root BLOB NOT NULL,
+					mode INTEGER NOT NULL,
+					UNIQUE (local_root, remote_root)
+				);
+				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
+					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
+				PRAGMA user_version = 2;",
+			)
+			.unwrap();
+		}
+
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION);
+		let record = store.pair(1).unwrap().expect("the pair survived");
+		assert_eq!(
+			record.delete_guard,
+			DeleteGuard::default(),
+			"a pre-v3 pair keeps the policy it was already running"
+		);
+		drop(store);
+		std::fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn a_configured_delete_guard_survives_a_reopen() {
+		let path = temp_db_path("guard_roundtrip");
+		let remote = Uuid::new_v4();
+		let pair = {
+			let store = BaselineStore::open(&path).unwrap();
+			let pair = store
+				.create_pair("/root", remote, SyncMode::TwoWay)
+				.unwrap();
+			assert_eq!(
+				store.pair(pair).unwrap().unwrap().delete_guard,
+				DeleteGuard::default(),
+				"a new pair starts on the default"
+			);
+			store
+				.set_delete_guard(pair, DeleteGuard::new(3, 0.25).unwrap())
+				.unwrap();
+			pair
+		};
+
+		let store = BaselineStore::open(&path).unwrap();
+		let guard = store.pair(pair).unwrap().unwrap().delete_guard;
+		assert_eq!(guard.floor(), 3);
+		assert_eq!(guard.ratio(), 0.25);
+		assert_eq!(
+			store.list_pairs().unwrap()[0].delete_guard,
+			guard,
+			"list_pairs reports it too"
+		);
+
+		// `unlimited`'s usize::MAX floor has no SQLite representation; it must still come back as a
+		// threshold nothing can exceed rather than silently wrapping to a strict one.
+		store
+			.set_delete_guard(pair, DeleteGuard::unlimited())
+			.unwrap();
+		assert!(
+			store.pair(pair).unwrap().unwrap().delete_guard.floor() > u32::MAX as usize,
+			"an unlimited floor must not wrap on the way through the DB"
+		);
+		drop(store);
 		std::fs::remove_file(&path).ok();
 	}
 

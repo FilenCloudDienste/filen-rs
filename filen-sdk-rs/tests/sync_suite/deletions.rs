@@ -8,7 +8,7 @@ use filen_sdk_rs::fs::{
 	dir::RemoteDirectory,
 	file::RemoteFile,
 };
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
+use filen_sdk_rs::sync_engine::{DeleteGuard, GuardReason, SyncEngine, SyncMode};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -361,6 +361,100 @@ async fn delete_05_mass_delete_guard_applies_after_confirmation() {
 	let r5 = sc.sync().await;
 	assert_eq!(r5.remotely_trashed, 1, "small follow-up delete: {r5:?}");
 	assert_eq!(r5.held_deletions(), 0, "{r5:?}");
+
+	sc.cleanup();
+}
+
+// ============================================================================
+// DELETE-05b — the volume threshold is per-pair configurable
+// ============================================================================
+
+/// The same deletion batch is held or applied purely according to the pair's configured
+/// [`DeleteGuard`]: a stricter threshold holds what the default waves through, and setting the
+/// default back releases it. The approval path is unchanged by the setting.
+#[shared_test_runtime]
+async fn delete_05b_configured_threshold_decides_the_same_batch() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	const TOTAL: usize = 8;
+	for i in 0..TOTAL {
+		write_file(&sc.local, &format!("f{i}.txt"), format!("c{i}").as_bytes());
+	}
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, TOTAL, "{r1:?}");
+	assert_eq!(
+		sc.engine.list_pairs().await.unwrap()[0].delete_guard,
+		DeleteGuard::default(),
+		"a pair starts on the default policy"
+	);
+
+	// Tighten the threshold to "at most 2 deletions, whatever the tracked count": the 3 below
+	// would sail under the default (limit max(10, 0.5 * 8) = 10).
+	sc.engine
+		.set_delete_guard(sc.pair, DeleteGuard::new(2, 0.0).unwrap())
+		.await
+		.unwrap();
+	assert_eq!(
+		sc.engine.list_pairs().await.unwrap()[0]
+			.delete_guard
+			.floor(),
+		2,
+		"the setting is readable back off the pair"
+	);
+
+	for i in 0..3 {
+		std::fs::remove_file(sc.local.join(format!("f{i}.txt"))).unwrap();
+	}
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(
+		r2.held_deletions(),
+		3,
+		"the configured threshold held a batch the default would apply: {r2:?}"
+	);
+	assert_eq!(r2.remotely_trashed, 0, "nothing deleted unapproved: {r2:?}");
+	assert!(
+		matches!(
+			r2.guard,
+			Some(GuardReason::ExceededThreshold {
+				deletions: 3,
+				limit: 2
+			})
+		),
+		"the hold must name the configured limit: {:?}",
+		r2.guard
+	);
+	// The dry run reports the same held batch, with the same reason.
+	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert_eq!(plan.held.len(), 3, "{plan:?}");
+	assert_eq!(plan.held_reason, r2.guard, "{plan:?}");
+
+	// Approval still releases exactly that batch under the configured threshold.
+	let token = r2.deletion_token.clone().expect("a held batch has a token");
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let r3 = sc.sync().await;
+	assert_eq!(r3.remotely_trashed, 3, "{r3:?}");
+	assert_eq!(r3.held_deletions(), 0, "{r3:?}");
+
+	// Restoring the default policy makes the next batch of the same size routine again — the
+	// threshold, not the batch, is what decided.
+	sc.engine
+		.set_delete_guard(sc.pair, DeleteGuard::default())
+		.await
+		.unwrap();
+	for i in 3..6 {
+		std::fs::remove_file(sc.local.join(format!("f{i}.txt"))).unwrap();
+	}
+	let r4 = sc.sync().await;
+	assert!(r4.errors.is_empty(), "{r4:?}");
+	assert_eq!(
+		r4.remotely_trashed, 3,
+		"the default threshold applies the same batch outright: {r4:?}"
+	);
+	assert_eq!(r4.held_deletions(), 0, "{r4:?}");
+	assert!(r4.guard.is_none(), "{r4:?}");
+
+	let (_d, files) = list_root(&sc).await;
+	assert_eq!(files.len(), TOTAL - 6, "{} survivors", files.len());
 
 	sc.cleanup();
 }
