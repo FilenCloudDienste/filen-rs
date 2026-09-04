@@ -382,6 +382,9 @@ mod tests {
 				rel_path: rel.to_string(),
 				kind: NodeKind::File,
 				remote_uuid: Uuid::nil(),
+				// These render-only fixtures never reach the lineage rules; an unrecorded
+				// lineage is the value those rules read as no evidence either way.
+				stable_uuid: None,
 				content_hash: None,
 				size,
 				modified_millis: 0,
