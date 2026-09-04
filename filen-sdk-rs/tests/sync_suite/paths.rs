@@ -522,8 +522,7 @@ async fn path_22_nfc_remote_vs_nfd_local_conflict() {
 	// either as a reported conflict on the normalization-equivalent path or as a versioned on-disk
 	// survivor. It must NOT have been treated as two independent converged files.
 	let surfaced = r2
-		.conflicts
-		.iter()
+		.conflict_paths()
 		.any(|c| c.contains("ber.txt") || c.contains("\u{00fc}") || c.contains("u\u{0308}"));
 	let local_local = std::fs::read(sc.local.join(nfd))
 		.or_else(|_| std::fs::read(sc.local.join(nfc)))

@@ -312,8 +312,8 @@ pub async fn converge(
 			"{label}: engine B errors {:?}",
 			rb.errors
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		if done() {
 			return;

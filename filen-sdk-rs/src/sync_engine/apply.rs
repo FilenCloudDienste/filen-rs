@@ -21,6 +21,8 @@ use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
 	engine::{Observations, PendingKind, PendingWrites},
 	events::SyncEvent,
+	guard::GuardReason,
+	outcome::{PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason, UnsyncablePath},
 	plan::{RemoteNode, SyncAction, create_target_paths},
 	scan::{LocalNode, QUARANTINE_DIR},
 };
@@ -49,23 +51,55 @@ pub struct SyncReport {
 	pub moved_remote: usize,
 	/// Files renamed locally in place of a re-download.
 	pub moved_local: usize,
-	/// Relative paths surfaced as two-way conflicts (left untouched).
-	pub conflicts: Vec<String>,
-	/// How many deletions the mass-delete guard held back this pass.
-	pub held_deletions: usize,
+	/// Paths surfaced as two-way conflicts (left untouched), with what each side held.
+	pub conflicts: Vec<PlannedConflict>,
+	/// What the mass-delete guard held back this pass — the deletions, plus the create half of a
+	/// held type flip (which is only meaningful together with its delete). Use
+	/// [`held_deletions`](Self::held_deletions) for the deletion count alone.
+	pub held: Vec<PlannedAction>,
+	/// Paths the engine will not act on at all, and why. Reported on every pass the condition
+	/// holds, so a caller always sees the current set rather than having to remember past ones.
+	pub unsyncable: Vec<UnsyncablePath>,
+	/// Set when the pass refused to run: nothing was applied.
+	pub refused: Option<RefuseReason>,
 	/// How many paths the pass deliberately left alone rather than acting on: a name the cache is
 	/// listing twice (so the view cannot resolve it), or a remote deletion this engine has already
 	/// made. Such a pass does nothing there on purpose, which is not the same as having nothing
 	/// to do.
 	pub deferred_paths: usize,
-	/// Set when the guard held deletions; a human-readable reason.
-	pub guard_message: Option<String>,
+	/// Set when the guard held deletions: why it did.
+	pub guard: Option<GuardReason>,
 	/// Set when the guard held deletions: the token identifying THIS held batch, to hand back to
 	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions). It changes if the
 	/// batch changes, so an approval can never leak onto a different set of deletions.
 	pub deletion_token: Option<String>,
 	/// Per-action failures (the pass continues past them).
 	pub errors: Vec<String>,
+	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
+	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
+	/// ones (a refusal, a lock that could not be taken) that belong to no path.
+	pub(super) failed_paths: Vec<(String, String)>,
+}
+
+impl SyncReport {
+	/// How many deletions the mass-delete guard held back this pass.
+	pub fn held_deletions(&self) -> usize {
+		self.held
+			.iter()
+			.filter(|action| {
+				matches!(
+					action.kind,
+					PlannedActionKind::TrashRemote | PlannedActionKind::DeleteLocal
+				)
+			})
+			.count()
+	}
+
+	/// Just the paths of [`conflicts`](Self::conflicts) — what
+	/// [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) takes.
+	pub fn conflict_paths(&self) -> impl Iterator<Item = &str> {
+		self.conflicts.iter().map(|c| c.rel_path.as_str())
+	}
 }
 
 /// Everything the apply pass needs besides the actions: the resolved remote-side objects and the
@@ -306,9 +340,7 @@ pub(super) async fn apply(
 						rel_path: action.rel_path().to_string(),
 						error: error.to_string(),
 					});
-					report
-						.errors
-						.push(format!("{}: {error}", action.rel_path()));
+					note_failure(report, action.rel_path(), &error);
 				}
 			}
 		}
@@ -455,10 +487,18 @@ async fn apply_serial(
 			rel_path: action.rel_path().to_string(),
 			error: error.to_string(),
 		});
-		report
-			.errors
-			.push(format!("{}: {error}", action.rel_path()));
+		note_failure(report, action.rel_path(), &error);
 	}
+}
+
+/// Record one action failure: the human-readable line AND the `(path, error)` pair the engine's
+/// per-path failure counter consumes, so a path that fails every pass is eventually reported as
+/// unsyncable instead of retried forever.
+fn note_failure(report: &mut SyncReport, rel_path: &str, error: &crate::Error) {
+	report.errors.push(format!("{rel_path}: {error}"));
+	report
+		.failed_paths
+		.push((rel_path.to_string(), error.to_string()));
 }
 
 /// Perform a transfer (download or upload): the network op + baseline write only. It touches no

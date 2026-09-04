@@ -156,7 +156,7 @@ async fn delete_01_single_local_file_deletion_propagates() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.remotely_trashed, 1, "exactly one delete applied: {r2:?}");
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "no re-upload of survivor: {r2:?}");
 
@@ -272,7 +272,7 @@ async fn delete_04_mass_delete_guard_holds_large_fraction() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"guard must engage for {DELETE}/{TOTAL}: {r2:?}"
 	);
 	assert_eq!(r2.remotely_trashed, 0, "no partial deletion: {r2:?}");
@@ -323,7 +323,11 @@ async fn delete_05_mass_delete_guard_applies_after_confirmation() {
 	// Pass 1 holds the whole batch and names it with a token.
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
-	assert_eq!(r2.held_deletions, DELETE, "the whole batch is held: {r2:?}");
+	assert_eq!(
+		r2.held_deletions(),
+		DELETE,
+		"the whole batch is held: {r2:?}"
+	);
 	assert_eq!(r2.remotely_trashed, 0, "nothing deleted unapproved: {r2:?}");
 	let token = r2
 		.deletion_token
@@ -338,7 +342,7 @@ async fn delete_05_mass_delete_guard_applies_after_confirmation() {
 		r3.remotely_trashed, DELETE,
 		"approved batch applied: {r3:?}"
 	);
-	assert_eq!(r3.held_deletions, 0, "nothing still held: {r3:?}");
+	assert_eq!(r3.held_deletions(), 0, "nothing still held: {r3:?}");
 
 	// Exactly the 10 survivors remain, byte-exact.
 	let (_d, files) = list_root(&sc).await;
@@ -352,11 +356,11 @@ async fn delete_05_mass_delete_guard_applies_after_confirmation() {
 	// only the survivors (a further deletion of one of them applies straight away, under the floor).
 	let r4 = sc.sync().await;
 	assert_eq!(r4.remotely_trashed, 0, "{r4:?}");
-	assert_eq!(r4.held_deletions, 0, "{r4:?}");
+	assert_eq!(r4.held_deletions(), 0, "{r4:?}");
 	std::fs::remove_file(sc.local.join(format!("file{:03}.txt", TOTAL - 1))).unwrap();
 	let r5 = sc.sync().await;
 	assert_eq!(r5.remotely_trashed, 1, "small follow-up delete: {r5:?}");
-	assert_eq!(r5.held_deletions, 0, "{r5:?}");
+	assert_eq!(r5.held_deletions(), 0, "{r5:?}");
 
 	sc.cleanup();
 }
@@ -388,8 +392,8 @@ async fn delete_06_small_fraction_applies_without_confirmation() {
 		r2.remotely_trashed, 3,
 		"3 deletes applied immediately: {r2:?}"
 	);
-	assert_eq!(r2.held_deletions, 0, "no confirmation held: {r2:?}");
-	assert!(r2.guard_message.is_none(), "no guard message: {r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "no confirmation held: {r2:?}");
+	assert!(r2.guard.is_none(), "no guard message: {r2:?}");
 
 	let (_d, files) = list_root(&sc).await;
 	assert_eq!(files.len(), TOTAL - 3, "97 should remain: {}", files.len());
@@ -435,7 +439,7 @@ async fn delete_07_first_sync_empty_local_does_not_wipe_remote() {
 	);
 	// The 4 would-be remote deletes (x, y, z/, z/w.txt) are HELD by the first-sync guard, not
 	// zero: holding them is exactly how the wipe is prevented (empty baseline + populated dest).
-	assert_eq!(r1.held_deletions, 4, "{r1:?}");
+	assert_eq!(r1.held_deletions(), 4, "{r1:?}");
 
 	// Remote still fully populated, byte-exact.
 	let (dirs, files) = list_root(&sc).await;
@@ -469,7 +473,7 @@ async fn delete_08_first_sync_empty_remote_does_not_wipe_local() {
 	);
 	// All 4 would-be local deletes (p, q, sub/, sub/r.txt) are HELD, not zero — that is the
 	// no-wipe mechanism on a first sync with an empty baseline.
-	assert_eq!(r1.held_deletions, 4, "{r1:?}");
+	assert_eq!(r1.held_deletions(), 4, "{r1:?}");
 
 	assert!(read_eq(&sc.local, "p.txt", b"P"), "p.txt wiped");
 	assert!(read_eq(&sc.local, "q.txt", b"Q"), "q.txt wiped");
@@ -615,7 +619,7 @@ async fn delete_12_local_backup_does_not_mirror_local_delete() {
 		r2.remotely_trashed, 0,
 		"backup must not mirror delete: {r2:?}"
 	);
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert_eq!(
 		r2.downloaded, 0,
 		"backup must not resurrect locally: {r2:?}"
@@ -656,7 +660,7 @@ async fn delete_13_remote_backup_does_not_mirror_remote_delete() {
 		r2.locally_deleted, 0,
 		"remote-backup must not delete local: {r2:?}"
 	);
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "must not re-upload the local copy: {r2:?}");
 	assert!(
 		read_eq(&sc.local, "snapshot.bin", content),
@@ -756,8 +760,8 @@ async fn delete_15_twoway_delete_vs_edit_conflict() {
 			Order::AFirst,
 		)
 		.await;
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -861,7 +865,8 @@ async fn delete_18_baselined_full_delete_is_mirrored() {
 		"a baselined full-delete (under the guard floor) must mirror: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"not the first-sync protected case: {r2:?}"
 	);
 
@@ -978,7 +983,7 @@ async fn delete_20_twoway_guard_fires_on_local_side_fraction() {
 	let ra = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
 	assert!(ra.errors.is_empty(), "{ra:?}");
 	assert!(
-		ra.held_deletions > 0 || ra.guard_message.is_some(),
+		ra.held_deletions() > 0 || ra.guard.is_some(),
 		"two-way guard must engage for {DELETE}/{TOTAL} local-side deletions: {ra:?}"
 	);
 	assert_eq!(ra.remotely_trashed, 0, "nothing applied while held: {ra:?}");
@@ -1132,7 +1137,7 @@ async fn delete_24_post_deletion_passes_are_stable_noops() {
 		);
 		assert_eq!(r.downloaded, 0, "{label}: {r:?}");
 		assert_eq!(r.conflicts.len(), 0, "{label}: {r:?}");
-		assert_eq!(r.held_deletions, 0, "{label}: {r:?}");
+		assert_eq!(r.held_deletions(), 0, "{label}: {r:?}");
 	}
 
 	let (_d, files) = list_root(&sc).await;
@@ -1166,10 +1171,11 @@ async fn delete_25_guard_does_not_block_mass_creations() {
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, N, "all creations must upload: {r1:?}");
 	assert_eq!(
-		r1.held_deletions, 0,
+		r1.held_deletions(),
+		0,
 		"creations must not trip the guard: {r1:?}"
 	);
-	assert!(r1.guard_message.is_none(), "{r1:?}");
+	assert!(r1.guard.is_none(), "{r1:?}");
 	assert_eq!(r1.remotely_trashed, 0, "{r1:?}");
 
 	let (_d, files) = list_root(&sc).await;
@@ -1333,7 +1339,7 @@ async fn delete_a3_twoway_guard_fires_on_remote_side_fraction() {
 	let ra = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
 	assert!(ra.errors.is_empty(), "{ra:?}");
 	assert!(
-		ra.held_deletions > 0 || ra.guard_message.is_some(),
+		ra.held_deletions() > 0 || ra.guard.is_some(),
 		"guard must engage for {DELETE}/{TOTAL} remote-side deletions: {ra:?}"
 	);
 	assert_eq!(ra.locally_deleted, 0, "nothing applied while held: {ra:?}");
@@ -1389,7 +1395,8 @@ async fn delete_a4_move_is_not_a_deletion() {
 		"a move must NOT count as a deletion: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"a move must not feed the guard: {r2:?}"
 	);
 	assert_eq!(r2.uploaded, 0, "a move must not re-upload bytes: {r2:?}");
@@ -1517,7 +1524,7 @@ async fn delete_a6_held_deletion_does_not_block_creations() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"deletions must be held: {r2:?}"
 	);
 	assert_eq!(r2.remotely_trashed, 0, "no deletions applied: {r2:?}");
@@ -1565,7 +1572,7 @@ async fn delete_a7_first_sync_two_populated_trees_no_wipe() {
 	// No-wipe: nothing deleted on either side from first reconciliation.
 	assert_eq!(r1.remotely_trashed, 0, "first sync trashed remote: {r1:?}");
 	assert_eq!(r1.locally_deleted, 0, "first sync deleted local: {r1:?}");
-	assert_eq!(r1.held_deletions, 0, "{r1:?}");
+	assert_eq!(r1.held_deletions(), 0, "{r1:?}");
 
 	// Both non-overlapping files survive on their origin side.
 	assert!(
@@ -1586,7 +1593,7 @@ async fn delete_a7_first_sync_two_populated_trees_no_wipe() {
 		"a divergent shared.txt must not be resolved by deleting either copy: {r1:?}"
 	);
 	assert!(
-		r1.conflicts.iter().any(|c| c.contains("shared.txt")),
+		r1.conflict_paths().any(|c| c.contains("shared.txt")),
 		"divergent shared.txt should surface as a conflict: {r1:?}"
 	);
 

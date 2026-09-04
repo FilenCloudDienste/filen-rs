@@ -835,7 +835,7 @@ async fn control_06_remove_then_readd_first_sync_semantics() {
 	assert_eq!(r.downloaded, 0, "identical files re-downloaded: {r:?}");
 	// ...and the genuine divergence is surfaced, not silently resolved.
 	assert!(
-		r.conflicts.iter().any(|c| c == "diverge.txt"),
+		r.conflict_paths().any(|c| c == "diverge.txt"),
 		"divergence must surface on a first sync: {r:?}"
 	);
 

@@ -181,8 +181,8 @@ async fn conflict_01_both_modify_surfaces_conflict_both_versions_preserved() {
 		.await;
 		assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -245,9 +245,8 @@ async fn conflict_02_persists_across_reruns_without_copy_growth() {
 			"{ra:?} {rb:?}"
 		);
 		saw_conflict |= ra
-			.conflicts
-			.iter()
-			.chain(rb.conflicts.iter())
+			.conflict_paths()
+			.chain(rb.conflict_paths())
 			.any(|c| c.contains("notes.txt"));
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -273,9 +272,8 @@ async fn conflict_02_persists_across_reruns_without_copy_growth() {
 			"{ra:?} {rb:?}"
 		);
 		let still = ra
-			.conflicts
-			.iter()
-			.chain(rb.conflicts.iter())
+			.conflict_paths()
+			.chain(rb.conflict_paths())
 			.any(|c| c.contains("notes.txt"));
 		assert!(still, "conflict was silently cleared on rerun pass {pass}");
 		assert_eq!(
@@ -378,8 +376,8 @@ async fn conflict_03_local_modify_vs_remote_delete_preserves_local_edit() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -479,8 +477,8 @@ async fn conflict_04_remote_modify_vs_local_delete_preserves_remote_edit() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -544,8 +542,8 @@ async fn conflict_05_create_vs_create_different_content() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -675,8 +673,8 @@ async fn conflict_07_rename_vs_rename_file() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -735,8 +733,8 @@ async fn conflict_08_file_edit_vs_remote_type_flip_to_dir() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -810,8 +808,8 @@ async fn conflict_09_double_type_flip_file_to_dir_both_sides() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1196,7 +1194,7 @@ async fn conflict_21_mass_delete_gate_with_modify_vs_delete() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"mass-delete guard must engage: {r2:?}"
 	);
 	// The 3 edited files keep their new local content; nothing was destroyed under the held batch.
@@ -1258,8 +1256,8 @@ async fn conflict_22_local_rename_vs_remote_modify() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1314,8 +1312,8 @@ async fn conflict_23_dir_delete_vs_new_child() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1376,8 +1374,8 @@ async fn conflict_24_conflict_copy_bytes_exact_binary() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1439,8 +1437,8 @@ async fn conflict_add_move_vs_modify() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1502,8 +1500,8 @@ async fn conflict_add_dir_rename_vs_rename() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1561,8 +1559,8 @@ async fn conflict_add_remote_rename_vs_local_modify() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1673,8 +1671,8 @@ async fn conflict_add_pair_isolation() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1748,8 +1746,8 @@ async fn conflict_add_subthreshold_dir_delete_vs_edited_child() {
 			ra.errors.is_empty() && rb.errors.is_empty(),
 			"{ra:?} {rb:?}"
 		);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -1995,7 +1993,7 @@ async fn conflict_16_resolve_keep_local() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.conflicts.iter().any(|c| c == "conf.txt"),
+		r2.conflict_paths().any(|c| c == "conf.txt"),
 		"divergence must surface: {r2:?}"
 	);
 	assert_eq!(
@@ -2005,7 +2003,7 @@ async fn conflict_16_resolve_keep_local() {
 	);
 	let r3 = sc.sync().await;
 	assert!(
-		r3.conflicts.iter().any(|c| c == "conf.txt"),
+		r3.conflict_paths().any(|c| c == "conf.txt"),
 		"the conflict must stay held until resolved: {r3:?}"
 	);
 	assert_eq!(r3.uploaded + r3.downloaded, 0, "{r3:?}");
@@ -2066,7 +2064,7 @@ async fn conflict_17_resolve_keep_remote() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.conflicts.iter().any(|c| c == "conf2.txt"),
+		r2.conflict_paths().any(|c| c == "conf2.txt"),
 		"divergence must surface: {r2:?}"
 	);
 
@@ -2113,7 +2111,7 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 	let v1 = upload_remote_single(&sc, "a.txt", b"REMOTE-1").await;
 	wait_cache_has(&sc, v1.uuid()).await;
 	assert!(
-		sc.sync().await.conflicts.iter().any(|c| c == "a.txt"),
+		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
 		"first conflict must surface"
 	);
 	sc.engine
@@ -2143,7 +2141,7 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 	let v2 = upload_remote_single(&sc, "a.txt", b"REMOTE-2").await;
 	wait_cache_has(&sc, v2.uuid()).await;
 	assert!(
-		sc.sync().await.conflicts.iter().any(|c| c == "a.txt"),
+		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
 		"second conflict must surface"
 	);
 	sc.engine
@@ -2195,7 +2193,7 @@ async fn conflict_add_resolved_copy_round_trips() {
 	let version = upload_remote_single(&sc, "c.txt", b"REMOTE-EDIT").await;
 	wait_cache_has(&sc, version.uuid()).await;
 	assert!(
-		sc.sync().await.conflicts.iter().any(|c| c == "c.txt"),
+		sc.sync().await.conflict_paths().any(|c| c == "c.txt"),
 		"conflict must surface"
 	);
 
@@ -2306,7 +2304,7 @@ async fn conflict_18_conflict_persists_across_restart() {
 	let r2 = engine1.sync_once(pair1).await.unwrap();
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.conflicts.iter().any(|c| c == "persist.txt"),
+		r2.conflict_paths().any(|c| c == "persist.txt"),
 		"divergence must surface: {r2:?}"
 	);
 	assert_eq!(
@@ -2329,7 +2327,7 @@ async fn conflict_18_conflict_persists_across_restart() {
 	let r3 = engine2.sync_once(pair2).await.unwrap();
 	assert!(r3.errors.is_empty(), "{r3:?}");
 	assert!(
-		r3.conflicts.iter().any(|c| c == "persist.txt"),
+		r3.conflict_paths().any(|c| c == "persist.txt"),
 		"the held conflict must survive the restart: {r3:?}"
 	);
 	assert_eq!(

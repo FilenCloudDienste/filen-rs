@@ -159,7 +159,7 @@ fn observer_for(log: Arc<WatchLog>) -> Box<dyn FnMut(SyncEvent) + Send + 'static
 			log.locally_deleted
 				.fetch_add(report.locally_deleted, Ordering::SeqCst);
 			log.held_deletions
-				.fetch_add(report.held_deletions, Ordering::SeqCst);
+				.fetch_add(report.held_deletions(), Ordering::SeqCst);
 		}
 		log.events.lock().unwrap().push(event);
 	})

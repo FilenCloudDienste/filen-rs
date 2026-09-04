@@ -658,8 +658,8 @@ async fn move14_twoway_divergent_move_conflicts() {
 		.await;
 		assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -723,8 +723,8 @@ async fn move15_twoway_move_vs_edit() {
 		.await;
 		assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
@@ -986,7 +986,7 @@ async fn move20_subtree_relocation_no_false_mass_delete_trip() {
 		assert!(r.errors.is_empty(), "{r:?}");
 		total_uploaded += r.uploaded;
 		total_trashed += r.remotely_trashed;
-		total_held += r.held_deletions;
+		total_held += r.held_deletions();
 		let (dirs, _) = list_dir(&sc.resources.client, &sc.resources.dir).await;
 		if find_dir(&dirs, "bulk").is_none() && find_dir(&dirs, "relocated").is_some() {
 			break;
@@ -1229,7 +1229,7 @@ async fn move25_mass_move_out_trips_guard() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"a genuine mass move-out (within-pair deletions) must trip the guard: {r2:?}"
 	);
 	assert_eq!(
@@ -1405,8 +1405,8 @@ async fn move_a2_twoway_move_vs_delete() {
 			ra.errors
 		);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		if settled() {
 			converged = true;
@@ -1506,8 +1506,8 @@ async fn move_a3_twoway_divergent_directory_rename() {
 		.await;
 		assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}

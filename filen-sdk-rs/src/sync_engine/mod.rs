@@ -23,13 +23,19 @@ mod engine;
 mod events;
 mod guard;
 mod mode;
+mod outcome;
 mod plan;
 mod scan;
 mod watch;
 
 pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
-pub use engine::{ConflictResolution, PlanOutcome, SyncEngine};
+pub use engine::{ConflictResolution, SyncEngine};
 pub use events::{SyncEvent, SyncObserver};
+pub use guard::GuardReason;
 pub use mode::SyncMode;
+pub use outcome::{
+	PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, RefuseReason,
+	UnsyncablePath, UnsyncableReason,
+};
 pub use watch::{WatchHandle, WatchStatus};
