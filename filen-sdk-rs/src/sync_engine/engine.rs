@@ -156,8 +156,7 @@ impl SyncEngine {
 			.await
 			.map_err(|e| {
 				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
-			})?
-			.map_err(|e| db_error(e, "opening the sync baseline DB"))?;
+			})??;
 		Ok(Self {
 			client,
 			store: Mutex::new(store),

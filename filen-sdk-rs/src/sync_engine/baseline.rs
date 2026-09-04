@@ -17,6 +17,11 @@ use uuid::Uuid;
 
 use super::mode::SyncMode;
 
+/// The schema version this build writes and understands, stamped into `PRAGMA user_version`. A DB
+/// carrying a HIGHER version was written by a newer engine and is REFUSED (never read under the
+/// older rules, which would misread it into deletes); a LOWER one is migrated forward in place.
+const SCHEMA_VERSION: i64 = 1;
+
 /// Schema for the baseline DB. `foreign_keys` is applied per-connection in [`BaselineStore::init`]
 /// (it resets to off on every open). No WAL: a single owner writes and reads this DB, so the
 /// default rollback journal is enough.
@@ -130,23 +135,28 @@ pub(crate) struct BaselineEntry {
 	pub(crate) remote_size: Option<u64>,
 }
 
-/// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
+/// A registered sync pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PairRecord {
-	pub id: PairId,
-	/// The canonicalized local root the pair syncs.
-	pub local_root: String,
-	/// The remote folder the pair syncs against.
-	pub remote_root: Uuid,
-	pub mode: SyncMode,
+pub(crate) struct PairRecord {
+	pub(crate) id: PairId,
+	pub(crate) local_root: String,
+	pub(crate) remote_root: Uuid,
+	pub(crate) mode: SyncMode,
 }
 
-/// A registered pair's id, handed back by [`SyncEngine::add_pair`](super::SyncEngine::add_pair).
-pub type PairId = i64;
+pub(crate) type PairId = i64;
 
 /// The baseline DB handle (sole owner / single writer).
 pub(crate) struct BaselineStore {
 	conn: Connection,
+}
+
+fn open_error(error: rusqlite::Error) -> crate::Error {
+	crate::Error::custom_with_source(
+		crate::ErrorKind::Internal,
+		error,
+		Some("opening the sync baseline DB".to_string()),
+	)
 }
 
 fn corrupt(what: &str, value: i64) -> rusqlite::Error {
@@ -169,20 +179,64 @@ fn hash_from_blob(bytes: Vec<u8>) -> rusqlite::Result<Blake3Hash> {
 		})
 }
 
+/// Whether `table` already has a column named `column`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+	let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+	let mut rows = stmt.query_map([], |row| row.get::<_, String>("name"))?;
+	rows.try_fold(false, |found, name| Ok(found || name? == column))
+}
+
+/// Bring a version-0 DB (written before `user_version` was stamped, so without the per-side
+/// conflict-evidence columns) up to v1. A DB freshly created from [`SCHEMA`] already has them, so
+/// this is a no-op there.
+fn migrate_to_v1(conn: &Connection) -> rusqlite::Result<()> {
+	for (column, ty) in [
+		("local_kind", "INTEGER"),
+		("remote_kind", "INTEGER"),
+		("remote_hash", "BLOB"),
+		("remote_size", "INTEGER"),
+	] {
+		if !has_column(conn, "baseline", column)? {
+			conn.execute_batch(&format!("ALTER TABLE baseline ADD COLUMN {column} {ty};"))?;
+		}
+	}
+	Ok(())
+}
+
 impl BaselineStore {
 	/// Open (creating if needed) the baseline DB at `path`.
-	pub(crate) fn open(path: &Path) -> rusqlite::Result<Self> {
-		Self::init(Connection::open(path)?)
+	pub(crate) fn open(path: &Path) -> Result<Self, crate::Error> {
+		Self::init(Connection::open(path).map_err(open_error)?)
 	}
 
 	#[cfg(test)]
-	pub(crate) fn open_in_memory() -> rusqlite::Result<Self> {
-		Self::init(Connection::open_in_memory()?)
+	pub(crate) fn open_in_memory() -> Result<Self, crate::Error> {
+		Self::init(Connection::open_in_memory().map_err(open_error)?)
 	}
 
-	fn init(conn: Connection) -> rusqlite::Result<Self> {
-		conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-		conn.execute_batch(SCHEMA)?;
+	fn init(conn: Connection) -> Result<Self, crate::Error> {
+		conn.execute_batch("PRAGMA foreign_keys = ON;")
+			.map_err(open_error)?;
+		let version: i64 = conn
+			.query_row("PRAGMA user_version", [], |row| row.get(0))
+			.map_err(open_error)?;
+		if version > SCHEMA_VERSION {
+			return Err(crate::Error::custom(
+				crate::ErrorKind::InvalidState,
+				format!(
+					"sync baseline DB is at schema version {version}, but this build understands \
+					 only up to {SCHEMA_VERSION}: refusing to open it (a newer engine wrote it; \
+					 upgrade, or remove the baseline DB to re-sync from scratch)"
+				),
+			));
+		}
+		// Idempotent: creates the v1 schema on a fresh DB, no-ops on an existing one.
+		conn.execute_batch(SCHEMA).map_err(open_error)?;
+		if version < SCHEMA_VERSION {
+			migrate_to_v1(&conn).map_err(open_error)?;
+			conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+				.map_err(open_error)?;
+		}
 		Ok(Self { conn })
 	}
 
@@ -378,6 +432,99 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 		}
+	}
+
+	/// The `PRAGMA user_version` a store's connection reports.
+	fn version_of(store: &BaselineStore) -> i64 {
+		store
+			.conn
+			.query_row("PRAGMA user_version", [], |row| row.get(0))
+			.unwrap()
+	}
+
+	#[test]
+	fn a_fresh_db_is_stamped_at_the_current_schema_version() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION);
+	}
+
+	#[test]
+	fn a_newer_than_supported_db_is_refused_not_degraded() {
+		let path = std::env::temp_dir().join(format!("filen_baseline_v2_{}.db", Uuid::new_v4()));
+		{
+			let store = BaselineStore::open(&path).unwrap();
+			store
+				.conn
+				.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+				.unwrap();
+		}
+		let message = match BaselineStore::open(&path) {
+			Ok(_) => panic!("a newer schema must be refused"),
+			Err(error) => error.to_string(),
+		};
+		assert!(
+			message.contains("schema version") && message.contains("refusing"),
+			"the refusal must name the version problem: {message}"
+		);
+		// Fails CLOSED: the newer DB is left exactly as it was, not downgraded in place.
+		let raw = Connection::open(&path).unwrap();
+		let still: i64 = raw
+			.query_row("PRAGMA user_version", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(still, SCHEMA_VERSION + 1, "the refused DB was rewritten");
+		drop(raw);
+		std::fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn a_pre_versioning_db_is_migrated_forward_in_place() {
+		let path = std::env::temp_dir().join(format!("filen_baseline_v0_{}.db", Uuid::new_v4()));
+		// A v0 DB: the pre-versioning schema (no per-side conflict-evidence columns, user_version 0)
+		// carrying one row that must survive the migration.
+		{
+			let conn = Connection::open(&path).unwrap();
+			conn.execute_batch(
+				"CREATE TABLE sync_pairs (
+					id INTEGER PRIMARY KEY,
+					local_root TEXT NOT NULL,
+					remote_root BLOB NOT NULL,
+					mode INTEGER NOT NULL,
+					UNIQUE (local_root, remote_root)
+				);
+				CREATE TABLE baseline (
+					pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+					rel_path TEXT NOT NULL,
+					kind INTEGER NOT NULL,
+					remote_uuid BLOB,
+					content_hash BLOB,
+					size INTEGER,
+					local_mtime INTEGER,
+					remote_modified INTEGER,
+					state INTEGER NOT NULL,
+					PRIMARY KEY (pair_id, rel_path)
+				);
+				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
+					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
+				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
+					VALUES (1, 'kept.txt', 2, 7, 0);",
+			)
+			.unwrap();
+		}
+
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
+		let entry = store.entry(1, "kept.txt").unwrap().expect("row survived");
+		assert_eq!(entry.size, Some(7));
+		assert_eq!(entry.local_kind, None, "the new columns read back as unset");
+		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
+		drop(store);
+
+		// Re-opening the migrated DB is a clean no-op (the migration runs exactly once).
+		let again = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&again), SCHEMA_VERSION);
+		assert!(again.entry(1, "kept.txt").unwrap().is_some());
+		drop(again);
+		std::fs::remove_file(&path).ok();
 	}
 
 	#[test]
