@@ -20,7 +20,7 @@ use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode};
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`. A DB
 /// carrying a HIGHER version was written by a newer engine and is REFUSED (never read under the
 /// older rules, which would misread it into deletes); a LOWER one is migrated forward in place.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Schema for the baseline DB. `foreign_keys` is applied per-connection in [`BaselineStore::init`]
 /// (it resets to off on every open). No WAL: a single owner writes and reads this DB, so the
@@ -67,6 +67,18 @@ CREATE TABLE IF NOT EXISTS pending_writes (
 	from_path TEXT,
 	to_path TEXT,
 	recorded_at INTEGER NOT NULL
+);
+";
+
+/// The v4 addition: how many times in a row applying one path has failed, and what the last
+/// failure said. Cascaded with its pair, like the journal.
+const PATH_FAILURES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS path_failures (
+	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+	rel_path TEXT NOT NULL,
+	attempts INTEGER NOT NULL,
+	last_error TEXT NOT NULL,
+	PRIMARY KEY (pair_id, rel_path)
 );
 ";
 
@@ -246,6 +258,9 @@ fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
 	if from < 3 {
 		migrate_to_v3(conn)?;
 	}
+	if from < 4 {
+		migrate_to_v4(conn)?;
+	}
 	Ok(())
 }
 
@@ -282,6 +297,13 @@ fn migrate_to_v3(conn: &Connection) -> rusqlite::Result<()> {
 		}
 	}
 	Ok(())
+}
+
+/// Bring a v3 DB up to v4: the per-path failure counters. A v3 DB simply has none, so creating the
+/// table is the whole migration — every path starts from a clean slate, which is also what a
+/// successful pass would have left behind.
+fn migrate_to_v4(conn: &Connection) -> rusqlite::Result<()> {
+	conn.execute_batch(PATH_FAILURES_SCHEMA)
 }
 
 impl BaselineStore {
@@ -535,6 +557,50 @@ impl BaselineStore {
 			}
 		}
 		tx.commit()
+	}
+
+	/// Count one failed attempt at `rel_path`, remembering what went wrong. Consecutive: a success
+	/// or a [`clear_failure`](Self::clear_failure) resets the count to nothing.
+	pub(crate) fn record_failure(
+		&self,
+		pair: PairId,
+		rel_path: &str,
+		error: &str,
+	) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"INSERT INTO path_failures (pair_id, rel_path, attempts, last_error)
+			 VALUES (?1, ?2, 1, ?3)
+			 ON CONFLICT (pair_id, rel_path)
+			 DO UPDATE SET attempts = attempts + 1, last_error = excluded.last_error",
+			params![pair, rel_path, error],
+		)?;
+		Ok(())
+	}
+
+	/// Forget `rel_path`'s failure streak — it succeeded, or the caller asked for a retry.
+	pub(crate) fn clear_failure(&self, pair: PairId, rel_path: &str) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"DELETE FROM path_failures WHERE pair_id = ?1 AND rel_path = ?2",
+			params![pair, rel_path],
+		)?;
+		Ok(())
+	}
+
+	/// Every path under `pair` with a live failure streak: `rel_path -> (attempts, last error)`.
+	pub(crate) fn failures(
+		&self,
+		pair: PairId,
+	) -> rusqlite::Result<std::collections::HashMap<String, (u32, String)>> {
+		self.conn
+			.prepare("SELECT rel_path, attempts, last_error FROM path_failures WHERE pair_id = ?1")?
+			.query_map(params![pair], |row| {
+				let attempts: i64 = row.get("attempts")?;
+				Ok((
+					row.get::<_, String>("rel_path")?,
+					(attempts.max(0) as u32, row.get::<_, String>("last_error")?),
+				))
+			})?
+			.collect()
 	}
 
 	/// Retire journal rows the in-memory journal has dropped (the cache caught up, or the grace
@@ -868,6 +934,74 @@ mod tests {
 			store.pair(pair).unwrap().unwrap().delete_guard.floor() > u32::MAX as usize,
 			"an unlimited floor must not wrap on the way through the DB"
 		);
+		drop(store);
+		std::fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn path_failures_count_consecutively_and_reset_on_a_clear() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		assert!(store.failures(pair).unwrap().is_empty());
+
+		store.record_failure(pair, "a.txt", "boom").unwrap();
+		store.record_failure(pair, "a.txt", "boom again").unwrap();
+		store.record_failure(pair, "b.txt", "other").unwrap();
+		let failures = store.failures(pair).unwrap();
+		assert_eq!(
+			failures["a.txt"],
+			(2, "boom again".to_string()),
+			"the streak counts up and keeps the LAST error"
+		);
+		assert_eq!(failures["b.txt"].0, 1);
+
+		// Clearing one path leaves the other alone, and a later failure starts from 1 again.
+		store.clear_failure(pair, "a.txt").unwrap();
+		assert!(!store.failures(pair).unwrap().contains_key("a.txt"));
+		store.record_failure(pair, "a.txt", "fresh").unwrap();
+		assert_eq!(store.failures(pair).unwrap()["a.txt"].0, 1);
+		assert_eq!(store.failures(pair).unwrap()["b.txt"].0, 1);
+
+		// Clearing a path with no streak is a no-op, not an error.
+		store.clear_failure(pair, "never-failed.txt").unwrap();
+
+		// The streak is pair-scoped state: removing the pair takes it with it.
+		store.delete_pair(pair).unwrap();
+		assert!(store.failures(pair).unwrap().is_empty());
+	}
+
+	#[test]
+	fn a_v3_db_gains_the_path_failure_table_with_every_path_clean() {
+		let path = temp_db_path("v3_failures");
+		{
+			let conn = Connection::open(&path).unwrap();
+			conn.execute_batch(
+				"CREATE TABLE sync_pairs (
+					id INTEGER PRIMARY KEY,
+					local_root TEXT NOT NULL,
+					remote_root BLOB NOT NULL,
+					mode INTEGER NOT NULL,
+					guard_floor INTEGER,
+					guard_ratio REAL,
+					UNIQUE (local_root, remote_root)
+				);
+				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
+					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
+				PRAGMA user_version = 3;",
+			)
+			.unwrap();
+		}
+
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION);
+		assert!(
+			store.failures(1).unwrap().is_empty(),
+			"a pre-v4 pair starts with no failure streaks"
+		);
+		store.record_failure(1, "x.txt", "e").unwrap();
+		assert_eq!(store.failures(1).unwrap()["x.txt"].0, 1);
 		drop(store);
 		std::fs::remove_file(&path).ok();
 	}

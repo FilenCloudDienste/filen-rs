@@ -5,7 +5,7 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
-	collections::HashMap,
+	collections::{BTreeSet, HashMap},
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -44,6 +44,15 @@ use crate::{
 /// where neither ever arrives — past it the snapshot is believed again, so an item genuinely
 /// deleted elsewhere is picked up late, never ignored.
 const PENDING_CREATE_GRACE: Duration = Duration::from_secs(180);
+
+/// How many CONSECUTIVE failures at one path the engine retries before it stops planning that path
+/// and reports it as [`UnsyncableReason::RepeatedFailure`].
+///
+/// Small on purpose: the point is to stop a permanently-broken path (a local file the OS will not
+/// let us read, a remote item the account may not write) from failing on every pass forever, while
+/// still riding out the transient failures a couple of retries cover. A path is unblocked by a
+/// success or by [`SyncEngine::retry_path`].
+const MAX_PATH_FAILURES: u32 = 3;
 
 /// One remote write this engine made, and how to tell whether the cache has caught up to it.
 #[derive(Debug)]
@@ -599,6 +608,8 @@ struct Prepared {
 	remote_emptied: bool,
 	/// What this pass must not act on (see [`plan::PassHolds`]).
 	holds: plan::PassHolds,
+	/// The pair's live per-path failure streaks: `rel_path -> (attempts, last error)`.
+	failures: HashMap<String, (u32, String)>,
 	dirs: Vec<CacheableDir<'static>>,
 	files: Vec<CacheableFile<'static>>,
 }
@@ -616,7 +627,8 @@ impl Prepared {
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
 	/// the pass itself, so a caller sees the same list either way.
 	fn unsyncable(&self) -> Vec<UnsyncablePath> {
-		self.local_scan
+		let names = self
+			.local_scan
 			.invalid_names
 			.iter()
 			.map(|(rel_path, detail)| UnsyncablePath {
@@ -624,7 +636,39 @@ impl Prepared {
 				reason: UnsyncableReason::InvalidName {
 					detail: detail.clone(),
 				},
-			})
+			});
+		let mut all: Vec<UnsyncablePath> = names
+			.chain(
+				self.exhausted_paths()
+					.into_iter()
+					.map(|rel_path| UnsyncablePath {
+						reason: UnsyncableReason::RepeatedFailure {
+							attempts: self.failures[&rel_path].0,
+							last_error: self.failures[&rel_path].1.clone(),
+						},
+						rel_path,
+					}),
+			)
+			.collect();
+		// One stable order, so a caller diffing consecutive reports sees only real changes.
+		all.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+		all
+	}
+
+	/// Every path this pass must not plan an action for: a name the remote would reject, and a path
+	/// whose failure streak ran out. Both are reported by [`unsyncable`](Self::unsyncable).
+	fn blocked_paths(&self) -> BTreeSet<String> {
+		let mut blocked = self.exhausted_paths();
+		blocked.extend(self.local_scan.invalid_names.keys().cloned());
+		blocked
+	}
+
+	/// The paths whose failure streak has reached [`MAX_PATH_FAILURES`] — no longer planned.
+	fn exhausted_paths(&self) -> BTreeSet<String> {
+		self.failures
+			.iter()
+			.filter(|(_, (attempts, _))| *attempts >= MAX_PATH_FAILURES)
+			.map(|(rel_path, _)| rel_path.clone())
 			.collect()
 	}
 }
@@ -1010,7 +1054,7 @@ impl SyncEngine {
 
 	/// Run the read-only half: load the baseline, scan, enumerate the remote, build the view.
 	async fn prepare(&self, pair: PairId) -> Result<Prepared, Error> {
-		let (record, baseline_entries) = {
+		let (record, baseline_entries, failures) = {
 			let store = self.store.lock().await;
 			let record = store
 				.pair(pair)
@@ -1019,7 +1063,10 @@ impl SyncEngine {
 			let entries = store
 				.entries(pair)
 				.map_err(|e| db_error(e, "loading the baseline"))?;
-			(record, entries)
+			let failures = store
+				.failures(pair)
+				.map_err(|e| db_error(e, "loading the per-path failure counts"))?;
+			(record, entries, failures)
 		};
 
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(
@@ -1084,6 +1131,7 @@ impl SyncEngine {
 			remote_converged: snapshot.watermark.is_some(),
 			remote_emptied,
 			holds,
+			failures,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
 		})
@@ -1187,6 +1235,62 @@ impl SyncEngine {
 		} else {
 			false
 		}
+	}
+
+	/// Record what this pass's attempted paths did: a failure extends that path's streak, a success
+	/// ends it. Once a streak reaches [`MAX_PATH_FAILURES`] the path stops being planned and is
+	/// reported as [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever.
+	async fn note_path_outcomes(
+		&self,
+		pair: PairId,
+		attempted: &[String],
+		report: &mut SyncReport,
+	) {
+		if attempted.is_empty() {
+			return;
+		}
+		let failed: HashMap<&str, &str> = report
+			.failed_paths
+			.iter()
+			.map(|(path, error)| (path.as_str(), error.as_str()))
+			.collect();
+		let store = self.store.lock().await;
+		let mut problems = Vec::new();
+		for (path, error) in &failed {
+			if let Err(e) = store.record_failure(pair, path, error) {
+				problems.push(format!("{path}: recording the failure count failed: {e}"));
+			}
+		}
+		for path in attempted
+			.iter()
+			.filter(|p| !failed.contains_key(p.as_str()))
+		{
+			if let Err(e) = store.clear_failure(pair, path) {
+				problems.push(format!("{path}: clearing the failure count failed: {e}"));
+			}
+		}
+		report.errors.extend(problems);
+	}
+
+	/// Plan `rel_path` again on the next pass, whatever its failure history: it clears the
+	/// consecutive-failure count the engine stopped planning it on (see
+	/// [`UnsyncableReason::RepeatedFailure`]).
+	///
+	/// Idempotent — a path with no failure streak is left alone rather than erroring, so a caller
+	/// can retry a whole reported list without checking each entry first. Errors only if the pair
+	/// is unknown.
+	pub async fn retry_path(&self, pair: PairId, rel_path: &str) -> Result<(), Error> {
+		let store = self.store.lock().await;
+		if store
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.is_none()
+		{
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		store
+			.clear_failure(pair, rel_path)
+			.map_err(|e| db_error(e, "clearing a path's failure count"))
 	}
 
 	/// Run one full sync pass: plan, screen, and apply against the remote and local tree.
@@ -1329,7 +1433,13 @@ impl SyncEngine {
 			pending: &self.pending,
 			observed: &self.observed,
 		};
+		let attempted: Vec<String> = decision
+			.safe
+			.iter()
+			.map(|action| action.rel_path().to_string())
+			.collect();
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
+		self.note_path_outcomes(pair, &attempted, &mut report).await;
 		tracing::debug!(
 			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} deferred, {} error(s)",
 			report.uploaded,
@@ -1391,8 +1501,8 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		&prep.holds,
 	);
 	let deferred_paths = plan.deferred_paths;
-	let (conflict_actions, executable): (Vec<_>, Vec<_>) = plan
-		.actions
+	let actions = drop_blocked(plan.actions, &prep.blocked_paths());
+	let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
 		.into_iter()
 		.partition(|a| matches!(a, SyncAction::Conflict { .. }));
 	let conflicts = conflict_actions
@@ -1422,6 +1532,69 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		pass_token,
 		deferred_paths,
 	}
+}
+
+/// Drop every action at a blocked path, and everything under it.
+///
+/// A path is blocked when the remote would reject its name, or when its failure streak ran out (and
+/// stays blocked until a [`retry_path`](SyncEngine::retry_path) or a rename clears it). The SUBTREE
+/// goes with it either way: a name the remote refuses can hold no remote children, and the failures
+/// that get this far are structural — a directory that cannot be created can hold no children, a
+/// local tree that cannot be written to cannot take a file — so planning the descendants would just
+/// start the same streak one level down.
+///
+/// Dropping the destination half of a MOVE takes the deletions that would strand its source with it
+/// (see below): an unrelocatable item must not be deleted from the side that still holds it.
+fn drop_blocked(actions: Vec<SyncAction>, blocked: &BTreeSet<String>) -> Vec<SyncAction> {
+	if blocked.is_empty() {
+		return actions;
+	}
+	// The sources of the moves this dropped: their content is staying exactly where it is.
+	let mut stranded: Vec<String> = Vec::new();
+	let kept: Vec<SyncAction> = actions
+		.into_iter()
+		.filter(|action| {
+			let path = action.rel_path();
+			if !blocked.contains(path) && !blocked.iter().any(|root| plan::is_under(path, root)) {
+				return true;
+			}
+			tracing::debug!(
+				"reconcile: skipping {} — its path is blocked (a name the remote rejects, or \
+				 {MAX_PATH_FAILURES} consecutive failures)",
+				action.describe()
+			);
+			if let SyncAction::MoveRemote { from_path, .. }
+			| SyncAction::MoveLocal { from_path, .. } = action
+			{
+				stranded.push(from_path.clone());
+			}
+			false
+		})
+		.collect();
+	if stranded.is_empty() {
+		return kept;
+	}
+	// A move the pass could not make leaves its source in place — and the source reads as "gone" on
+	// the other side, which is what planned the deletion in the first place. Deleting it now (or
+	// deleting the directory above it, which is recursive) would destroy the only copy of content
+	// this pass just refused to relocate. Renaming a synced item into a name the remote rejects is
+	// exactly that shape.
+	kept.into_iter()
+		.filter(|action| {
+			let path = action.rel_path();
+			let strands = action.is_delete()
+				&& stranded
+					.iter()
+					.any(|from| from == path || plan::is_under(from, path));
+			if strands {
+				tracing::debug!(
+					"reconcile: skipping {} — it still holds content a blocked move could not relocate",
+					action.describe()
+				);
+			}
+			!strands
+		})
+		.collect()
 }
 
 /// A stable identifier for one held deletion batch: the sorted `(side, path)` lines hashed. The
@@ -1490,6 +1663,197 @@ mod tests {
 
 	/// The pair whose writes the pending-write tests record.
 	const PAIR: PairId = 1;
+
+	fn upload(rel: &str) -> SyncAction {
+		SyncAction::UploadFile {
+			rel_path: rel.to_string(),
+		}
+	}
+
+	#[test]
+	fn a_blocked_path_takes_its_subtree_but_not_its_lookalikes_out_of_the_plan() {
+		let actions = vec![
+			upload("ok.txt"),
+			upload("bad"),
+			upload("bad/inner.txt"),
+			upload("bad/deep/x.txt"),
+			// A sibling whose name merely STARTS with the blocked one: a different path entirely.
+			upload("badly.txt"),
+			upload("badge/y.txt"),
+		];
+		let blocked = BTreeSet::from(["bad".to_string()]);
+		let kept: Vec<String> = drop_blocked(actions.clone(), &blocked)
+			.iter()
+			.map(|a| a.rel_path().to_string())
+			.collect();
+		assert_eq!(kept, vec!["ok.txt", "badly.txt", "badge/y.txt"]);
+
+		// Nothing blocked -> the plan is untouched.
+		assert_eq!(drop_blocked(actions.clone(), &BTreeSet::new()), actions);
+	}
+
+	fn scan_root(tag: &str) -> PathBuf {
+		let root = std::env::temp_dir().join(format!("filen_engine_{tag}_{}", Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		root
+	}
+
+	/// Reconcile a two-way pass over a real local scan, screened exactly as a pass screens it.
+	fn planned_over_scan(
+		root: &Path,
+		baseline: &HashMap<String, BaselineEntry>,
+		remote: &HashMap<String, RemoteNode>,
+	) -> Vec<SyncAction> {
+		let scan = scan::scan_local(root, &HashMap::new());
+		let plan = plan::reconcile(
+			SyncMode::TwoWay,
+			baseline,
+			&scan.nodes,
+			remote,
+			&plan::PassHolds::default(),
+		);
+		drop_blocked(plan.actions, &scan.invalid_names.keys().cloned().collect())
+	}
+
+	fn synced_file(rel: &str, uuid: Uuid, hash: Blake3Hash, size: u64) -> BaselineEntry {
+		BaselineEntry {
+			remote_uuid: Some(uuid),
+			content_hash: Some(hash),
+			size: Some(size),
+			local_mtime: Some(0),
+			..synced_shell(rel)
+		}
+	}
+
+	fn remote_file(rel: &str, uuid: Uuid, hash: Blake3Hash, size: u64) -> RemoteNode {
+		RemoteNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::File,
+			remote_uuid: uuid,
+			content_hash: Some(hash),
+			size,
+			modified_millis: 0,
+		}
+	}
+
+	/// Renaming an already-SYNCED file to a name the remote would reject must not read as a local
+	/// deletion. Nothing can be pushed under the new name — but the copy the remote already holds
+	/// is the user's data, and a rename is not a request to destroy it.
+	#[test]
+	fn renaming_a_synced_file_into_a_rejected_name_leaves_the_remote_copy_alone() {
+		let root = scan_root("rename_file");
+		// `report.txt` was synced; the user has just renamed it to the reserved device name `CON`.
+		std::fs::write(root.join("CON"), b"payload").unwrap();
+		let hash: Blake3Hash = blake3::hash(b"payload").into();
+		let uuid = Uuid::new_v4();
+
+		let actions = planned_over_scan(
+			&root,
+			&HashMap::from([(
+				"report.txt".to_string(),
+				synced_file("report.txt", uuid, hash, 7),
+			)]),
+			&HashMap::from([(
+				"report.txt".to_string(),
+				remote_file("report.txt", uuid, hash, 7),
+			)]),
+		);
+		assert!(
+			actions.is_empty(),
+			"a rename into a rejected name plans nothing at all — and above all no deletion of the \
+			 remote copy: {actions:?}"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// The same for a whole synced DIRECTORY: a remote directory deletion is recursive, so reading
+	/// the rename as a deletion would take the entire remote subtree with it.
+	#[test]
+	fn renaming_a_synced_dir_into_a_rejected_name_leaves_its_remote_subtree_alone() {
+		let root = scan_root("rename_dir");
+		// `docs/` was synced; the user has just renamed it to `bad.` (a trailing dot the remote
+		// rejects), carrying its contents along.
+		std::fs::create_dir_all(root.join("bad.")).unwrap();
+		std::fs::write(root.join("bad.").join("a.txt"), b"payload").unwrap();
+		let hash: Blake3Hash = blake3::hash(b"payload").into();
+		let (dir_uuid, file_uuid) = (Uuid::new_v4(), Uuid::new_v4());
+
+		let actions = planned_over_scan(
+			&root,
+			&HashMap::from([
+				(
+					"docs".to_string(),
+					BaselineEntry {
+						kind: NodeKind::Dir,
+						remote_uuid: Some(dir_uuid),
+						..synced_shell("docs")
+					},
+				),
+				(
+					"docs/a.txt".to_string(),
+					synced_file("docs/a.txt", file_uuid, hash, 7),
+				),
+			]),
+			&HashMap::from([
+				(
+					"docs".to_string(),
+					RemoteNode {
+						rel_path: "docs".to_string(),
+						kind: NodeKind::Dir,
+						remote_uuid: dir_uuid,
+						content_hash: None,
+						size: 0,
+						modified_millis: 0,
+					},
+				),
+				(
+					"docs/a.txt".to_string(),
+					remote_file("docs/a.txt", file_uuid, hash, 7),
+				),
+			]),
+		);
+		assert!(
+			!actions.iter().any(SyncAction::is_delete),
+			"the remote subtree of a locally-renamed directory must survive: {actions:?}"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// The streak only blocks once it reaches the threshold, and reports the attempts and the last
+	/// error it saw. Below the threshold the path is still planned, so a transient failure is
+	/// retried rather than parked.
+	#[test]
+	fn a_failure_streak_blocks_only_at_the_threshold() {
+		let mut failures = HashMap::new();
+		for attempts in 0..MAX_PATH_FAILURES {
+			failures.insert("flaky.txt".to_string(), (attempts, "boom".to_string()));
+			let blocked = blocked_from(&failures);
+			assert!(
+				blocked.is_empty(),
+				"{attempts} failure(s) is under the threshold, so the path is still planned"
+			);
+		}
+		failures.insert(
+			"flaky.txt".to_string(),
+			(MAX_PATH_FAILURES, "last words".to_string()),
+		);
+		assert_eq!(
+			blocked_from(&failures),
+			BTreeSet::from(["flaky.txt".to_string()])
+		);
+	}
+
+	/// `exhausted_paths`/`unsyncable` read the same map; this exercises the threshold rule without
+	/// building a whole `Prepared`.
+	fn blocked_from(failures: &HashMap<String, (u32, String)>) -> BTreeSet<String> {
+		failures
+			.iter()
+			.filter(|(_, (attempts, _))| *attempts >= MAX_PATH_FAILURES)
+			.map(|(rel_path, _)| rel_path.clone())
+			.collect()
+	}
 
 	#[test]
 	fn local_roots_overlap_only_when_one_actually_contains_the_other() {
