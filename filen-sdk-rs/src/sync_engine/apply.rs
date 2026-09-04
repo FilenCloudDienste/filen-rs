@@ -75,6 +75,10 @@ pub struct SyncReport {
 	pub deletion_token: Option<String>,
 	/// Per-action failures (the pass continues past them).
 	pub errors: Vec<String>,
+	/// The pair is PAUSED (see [`SyncEngine::pause_pair`](super::SyncEngine::pause_pair)): the pass
+	/// scanned nothing, planned nothing and applied nothing, so every field above is at its zero
+	/// value. Not the same as a pass that ran and found nothing to do.
+	pub paused: bool,
 	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
 	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
 	/// ones (a refusal, a lock that could not be taken) that belong to no path.

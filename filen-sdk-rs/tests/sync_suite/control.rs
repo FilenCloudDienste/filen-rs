@@ -6,18 +6,18 @@
 //!
 //! The PUBLIC engine surface is intentionally small: `open`, `add_pair` (idempotent for the same
 //! `(local, remote, mode)`, refused for overlapping roots), `remove_pair`, `reconfigure_pair`,
-//! `sync_once`, `sync_once_observed`, `watch`, `watch_observed`. There is no public
-//! `pause`/`resume`, root reconfigure, status query, clean-stop, or
+//! `sync_once`, `sync_once_observed`, `watch`, `watch_observed`, `watch_with`, and
+//! `pause_pair` / `resume_pair` / `is_paused`. There is no public root reconfigure, clean-stop, or
 //! baseline-corruption seam. Every plan item that depends on one of those — and every fault-
 //! injection item (mid-pass stop, crash, corrupted baseline) — is written as an `#[ignore]` stub
 //! that records its plan, because faking it would assert nothing real.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode};
+use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, WatchConfig};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -94,6 +94,22 @@ async fn seed_remote_file(cache: &TestCache, parent: Uuid, name: &str, data: &[u
 
 fn has_file(files: &[filen_sdk_rs::fs::file::RemoteFile], name: &str) -> bool {
 	files.iter().any(|f| f.name() == Some(name))
+}
+
+/// A watch observer that just records every event, plus the count of completed passes — enough to
+/// assert that a paused loop is idling rather than working.
+type EventLog = Arc<Mutex<Vec<SyncEvent>>>;
+
+fn recording_observer(log: EventLog) -> Box<dyn FnMut(SyncEvent) + Send + 'static> {
+	Box::new(move |event| log.lock().unwrap().push(event))
+}
+
+fn passes(log: &EventLog) -> usize {
+	log.lock()
+		.unwrap()
+		.iter()
+		.filter(|e| matches!(e, SyncEvent::PassCompleted { .. }))
+		.count()
 }
 
 // ===========================================================================
@@ -691,34 +707,233 @@ async fn control_add_during_watch_live_pickup() {
 // rather than faked, per the suite rules.
 //
 // Missing public surface (verified against the API reference + black-box use):
-//   * pause(pair) / resume(pair)         -> CONTROL-01, -02, -03, -18, -21, -24
-//   * remove_pair(pair)                  -> CONTROL-05, -06, -19, -25, remove-mid-pass
-//   * reconfigure ROOT                   -> CONTROL-17 (the MODE half is CONTROL-16, implemented)
-//   * pair status query / registry list  -> CONTROL-23, auto-load, idempotent-verbs
+//   * reconfigure ROOT                   -> CONTROL-17, -24 (the MODE half is CONTROL-16, implemented)
+//   * pair registry auto-load            -> auto-load, idempotent-verbs, CONTROL-25
 //   * clean stop / abrupt-kill harness   -> CONTROL-14, -15, -18, remove-mid-pass
 //   * baseline corruption/inspection     -> CONTROL-13, partially-corrupted-config
 //   * control-transition event stream    -> control-transition-events
 // ===========================================================================
 
-#[ignore = "blocked: no public pause/resume — needs control-plane API (pause halts new work, resume continues)"]
+/// CONTROL-01 — a paused pair does no work, and resuming it loses nothing: the change staged while
+/// it was paused is applied by the first pass afterwards.
 #[shared_test_runtime]
 async fn control_01_pause_halts_resume_continues() {
-	// plan: two-way pair, baseline; pause; local-create a.txt; wait past debounce; assert no
-	// remote a.txt & no upload events while paused; resume; assert one upload, byte-exact a.txt.
+	let (resources, cache, remote, local) = raw_setup("c01").await;
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	// A baseline first, so what follows is about the pause and not about first-sync semantics.
+	write_file(&local, "base.txt", b"baseline");
+	let r = engine.sync_once(pair).await.unwrap();
+	assert_eq!(r.uploaded, 1, "{r:?}");
+	assert!(!r.paused, "a running pair must not report paused: {r:?}");
+	assert!(
+		!engine.is_paused(pair).await,
+		"a fresh pair must not be paused"
+	);
+
+	engine.pause_pair(pair).await.unwrap();
+	assert!(engine.is_paused(pair).await, "pause_pair did not take");
+
+	write_file(&local, "a.txt", b"made while paused");
+	let held = engine.sync_once(pair).await.unwrap();
+	assert!(held.paused, "a paused pass must say so: {held:?}");
+	assert_eq!(
+		(
+			held.uploaded,
+			held.downloaded,
+			held.remotely_trashed,
+			held.locally_deleted
+		),
+		(0, 0, 0, 0),
+		"a paused pass must touch nothing: {held:?}"
+	);
+	assert!(held.errors.is_empty(), "{held:?}");
+	let (_d, files) = list_remote(&resources).await;
+	assert!(!has_file(&files, "a.txt"), "a paused pair uploaded anyway");
+
+	// The verbs are idempotent, and an id nobody registered is refused rather than silently taken.
+	engine.pause_pair(pair).await.unwrap();
+	assert!(
+		engine.pause_pair(pair + 9_999).await.is_err(),
+		"an unknown pair must not be pausable"
+	);
+
+	engine.resume_pair(pair).await.unwrap();
+	assert!(!engine.is_paused(pair).await, "resume_pair did not take");
+	let resumed = engine.sync_once(pair).await.unwrap();
+	assert!(!resumed.paused, "{resumed:?}");
+	assert!(resumed.errors.is_empty(), "{resumed:?}");
+	assert_eq!(
+		resumed.uploaded, 1,
+		"the first pass after resume must apply the staged change: {resumed:?}"
+	);
+	let (_d, files) = list_remote(&resources).await;
+	let a = files
+		.iter()
+		.find(|f| f.name() == Some("a.txt"))
+		.expect("a.txt missing after resume");
+	assert_eq!(
+		a.size,
+		b"made while paused".len() as u64,
+		"a.txt size mismatch"
+	);
+	assert!(
+		has_file(&files, "base.txt"),
+		"the baselined file was disturbed by the pause"
+	);
+	// Resuming twice is a no-op too.
+	engine.resume_pair(pair).await.unwrap();
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
-#[ignore = "blocked: no public pause/resume — needs durable pause across the periodic safety-net pass"]
+/// CONTROL-02 — a pause outlives the periodic safety-net pass: the watch loop keeps ticking and
+/// keeps doing nothing, for as long as the pair is paused, and picks the backlog up on resume.
 #[shared_test_runtime]
 async fn control_02_pause_durable_across_safety_net() {
-	// plan: remote->local pair, baseline; pause; remote-add r1/r2; wait >=2 safety-net intervals;
-	// assert neither downloaded, no per-action events, status==paused throughout.
+	const NET: Duration = Duration::from_secs(3);
+
+	let (_resources, cache, remote, local) = raw_setup("c02").await;
+	let engine = Arc::new(
+		SyncEngine::open(cache.client.clone(), temp_cache_path())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::RemoteToLocal)
+		.await
+		.unwrap();
+
+	let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_secs(1),
+				safety_net: NET,
+			},
+			recording_observer(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	// Let the loop prove it is alive (its initial pass), then pause it and let anything already in
+	// flight when the pause landed finish, so the count below is a stable floor.
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || passes(&log) >= 1).await,
+		"the watch never ran its initial pass"
+	);
+	engine.pause_pair(pair).await.unwrap();
+	tokio::time::sleep(NET).await;
+	let before = passes(&log);
+
+	// Two remote adds, then several safety-net intervals with the pair paused.
+	seed_remote_file(&cache, remote, "r1.txt", b"one").await;
+	seed_remote_file(&cache, remote, "r2.txt", b"two").await;
+	tokio::time::sleep(NET * 4).await;
+
+	assert_eq!(
+		passes(&log),
+		before,
+		"a paused pair ran a safety-net pass anyway"
+	);
+	assert!(
+		engine.is_paused(pair).await,
+		"the pause did not survive the safety net"
+	);
+	assert!(
+		!local.join("r1.txt").exists() && !local.join("r2.txt").exists(),
+		"a paused pair downloaded the remote adds"
+	);
+
+	// Resuming picks both up with no manual pass and no re-listing of anything.
+	engine.resume_pair(pair).await.unwrap();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || read_eq(&local, "r1.txt", b"one")
+			&& read_eq(&local, "r2.txt", b"two"))
+		.await,
+		"the backlog did not sync after resume (passes={})",
+		passes(&log)
+	);
+
+	handle.stop().await;
+	std::fs::remove_dir_all(&local).ok();
 }
 
-#[ignore = "blocked: no public pause/resume — pause/resume must not invalidate the baseline"]
+/// CONTROL-03 — pause/resume is a scheduling change, not a baseline invalidation: a pair paused and
+/// resumed with nothing changed re-transfers nothing.
 #[shared_test_runtime]
 async fn control_03_resume_no_redundant_retransfer() {
-	// plan: 10 matching files at baseline; pause then resume unchanged; one pass => all counts 0,
-	// zero uploads/downloads, all 10 byte-identical both sides.
+	const N: usize = 10;
+
+	let (resources, cache, remote, local) = raw_setup("c03").await;
+	for i in 0..N {
+		write_file(
+			&local,
+			&format!("f{i}.txt"),
+			format!("content {i}").as_bytes(),
+		);
+	}
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let r = engine.sync_once(pair).await.unwrap();
+	assert_eq!(r.uploaded, N, "{r:?}");
+	let before = walk_tree(&local);
+
+	engine.pause_pair(pair).await.unwrap();
+	engine.resume_pair(pair).await.unwrap();
+
+	let after = engine.sync_once(pair).await.unwrap();
+	assert!(after.errors.is_empty(), "{after:?}");
+	assert!(!after.paused, "{after:?}");
+	assert_eq!(
+		(
+			after.uploaded,
+			after.downloaded,
+			after.remotely_trashed,
+			after.locally_deleted,
+			after.moved_remote,
+			after.moved_local,
+		),
+		(0, 0, 0, 0, 0, 0),
+		"pause/resume invalidated the baseline: {after:?}"
+	);
+	assert!(after.conflicts.is_empty(), "{after:?}");
+	assert_eq!(
+		before,
+		walk_tree(&local),
+		"the local tree changed across pause/resume"
+	);
+
+	// All ten still present and byte-exact on both sides.
+	let (_d, files) = list_remote(&resources).await;
+	assert_eq!(files.len(), N, "remote file count changed");
+	for i in 0..N {
+		let name = format!("f{i}.txt");
+		let f = files
+			.iter()
+			.find(|f| f.name() == Some(name.as_str()))
+			.unwrap_or_else(|| panic!("{name} missing on the remote"));
+		assert_eq!(
+			f.size,
+			format!("content {i}").len() as u64,
+			"{name} size mismatch"
+		);
+		assert!(read_eq(&local, &name, format!("content {i}").as_bytes()));
+	}
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 /// CONTROL-05 — a removed pair stops syncing and leaves BOTH sides exactly as they were: removal
@@ -934,7 +1149,11 @@ async fn control_17_reconfigure_root_safe() {
 	// populated safety, no mass-delete, coherent new baseline.
 }
 
-#[ignore = "blocked: no public pause control — pause must stop an in-flight pass promptly and stay coherent"]
+// `pause_pair` deliberately does NOT interrupt a pass already running — it stops the NEXT one —
+// so this test's premise ("no NEW actions begin, in-flight action atomic/rolled back") is not the
+// contract; whether pause should also preempt is an owner call, and asserting it needs the same
+// mid-pass barrier CONTROL-14 wants.
+#[ignore = "blocked: pause does not preempt an in-flight pass by design; needs an owner decision plus a mid-pass barrier"]
 #[shared_test_runtime]
 async fn control_18_pause_mid_pass_coherent() {
 	// plan: start a many-action pass; pause mid-apply; assert no NEW actions begin, in-flight action
@@ -1051,23 +1270,223 @@ async fn control_19_remove_one_among_several() {
 	}
 }
 
-#[ignore = "blocked: no public pause control — a long-pause backlog must converge in one (or few) resumed passes"]
+/// CONTROL-21 — a backlog accumulated over a long pause converges in a few resumed passes, with
+/// every staged change applied exactly once: nothing dropped, nothing double-applied.
 #[shared_test_runtime]
 async fn control_21_resume_long_pause_backlog_converges() {
-	// plan: two-way pair, converge, pause; accumulate 30 local creates, 10 remote creates, 5 local
-	// deletes, 5 remote modifications; resume; passes => all creates land byte-exact, 5 deletes
-	// mirror via quarantine (none destroyed), 5 mods download byte-exact, no drop/double-apply,
-	// trees identical, report counts equal the staged batch.
+	const BASE: usize = 15;
+	const NEW_LOCAL: usize = 30;
+	const NEW_REMOTE: usize = 10;
+	const DELETED: usize = 5;
+	const MODIFIED: usize = 5;
+
+	let (resources, cache, remote, local) = raw_setup("c21").await;
+	for i in 0..BASE {
+		write_file(&local, &format!("b{i:02}.txt"), format!("v{i}").as_bytes());
+	}
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let first = engine.sync_once(pair).await.unwrap();
+	assert_eq!(first.uploaded, BASE, "{first:?}");
+
+	engine.pause_pair(pair).await.unwrap();
+
+	// Stage the whole backlog while paused: creates on both sides, local deletions, and remote
+	// edits of already-baselined files.
+	for i in 0..NEW_LOCAL {
+		write_file(&local, &format!("n{i:02}.txt"), format!("n{i}").as_bytes());
+	}
+	for i in 0..NEW_REMOTE {
+		seed_remote_file(
+			&cache,
+			remote,
+			&format!("r{i}.txt"),
+			format!("r{i}").as_bytes(),
+		)
+		.await;
+	}
+	for i in 0..DELETED {
+		std::fs::remove_file(local.join(format!("b{i:02}.txt"))).unwrap();
+	}
+	// A same-name re-upload is how the server versions a file; the cache announces the new uuid.
+	for i in DELETED..DELETED + MODIFIED {
+		seed_remote_file(
+			&cache,
+			remote,
+			&format!("b{i:02}.txt"),
+			format!("edited {i}").as_bytes(),
+		)
+		.await;
+	}
+
+	// Nothing moved while paused.
+	let paused_pass = engine.sync_once(pair).await.unwrap();
+	assert!(paused_pass.paused, "{paused_pass:?}");
+	let (_d, during) = list_remote(&resources).await;
+	assert!(
+		!has_file(&during, "n00.txt"),
+		"a paused pair uploaded its backlog"
+	);
+	assert!(
+		has_file(&during, "b00.txt"),
+		"a paused pair propagated a local deletion"
+	);
+
+	engine.resume_pair(pair).await.unwrap();
+
+	// Converge, accumulating the counts so a change applied twice is visible as an excess.
+	let (mut uploaded, mut downloaded, mut trashed) = (0usize, 0usize, 0usize);
+	let mut converged = false;
+	for _ in 0..8 {
+		let r = engine.sync_once(pair).await.unwrap();
+		assert!(r.errors.is_empty(), "{r:?}");
+		assert!(r.conflicts.is_empty(), "unexpected conflict: {r:?}");
+		assert_eq!(r.held_deletions(), 0, "the guard held the backlog: {r:?}");
+		uploaded += r.uploaded;
+		downloaded += r.downloaded;
+		trashed += r.remotely_trashed;
+		if uploaded >= NEW_LOCAL && downloaded >= NEW_REMOTE + MODIFIED && trashed >= DELETED {
+			converged = true;
+			break;
+		}
+		tokio::time::sleep(Duration::from_millis(1500)).await;
+	}
+	assert!(
+		converged,
+		"the backlog did not converge (up={uploaded}, down={downloaded}, trashed={trashed})"
+	);
+	assert_eq!(uploaded, NEW_LOCAL, "local creates applied more than once");
+	assert_eq!(
+		downloaded,
+		NEW_REMOTE + MODIFIED,
+		"remote creates/edits applied more than once"
+	);
+	assert_eq!(trashed, DELETED, "local deletes applied more than once");
+
+	// Both sides byte-exact afterwards.
+	for i in 0..NEW_LOCAL {
+		assert!(read_eq(
+			&local,
+			&format!("n{i:02}.txt"),
+			format!("n{i}").as_bytes()
+		));
+	}
+	for i in 0..NEW_REMOTE {
+		assert!(
+			read_eq(&local, &format!("r{i}.txt"), format!("r{i}").as_bytes()),
+			"r{i}.txt did not land locally"
+		);
+	}
+	for i in DELETED..DELETED + MODIFIED {
+		assert!(
+			read_eq(
+				&local,
+				&format!("b{i:02}.txt"),
+				format!("edited {i}").as_bytes()
+			),
+			"the remote edit of b{i:02}.txt did not land locally"
+		);
+	}
+	let (_d, after) = list_remote(&resources).await;
+	for i in 0..DELETED {
+		assert!(
+			!has_file(&after, &format!("b{i:02}.txt")),
+			"the local deletion of b{i:02}.txt was not mirrored"
+		);
+	}
+	for i in 0..NEW_LOCAL {
+		assert!(
+			has_file(&after, &format!("n{i:02}.txt")),
+			"n{i:02}.txt did not reach the remote"
+		);
+	}
+
+	// Settled: another pass has nothing left to do.
+	let settled = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		(
+			settled.uploaded,
+			settled.downloaded,
+			settled.remotely_trashed
+		),
+		(0, 0, 0),
+		"the resumed backlog did not settle: {settled:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
-#[ignore = "blocked: no public pause/status — paused state must persist across restart"]
+/// CONTROL-23 — the paused flag is persisted with the pair: an engine reopened on the same baseline
+/// DB comes back paused, and stays paused until an explicit resume. The resume persists too.
 #[shared_test_runtime]
 async fn control_23_pause_status_survives_restart() {
-	// plan: add pair, pause; status==paused; restart; status still paused (no auto-resume); no sync
-	// between restart and explicit resume; after resume pending changes apply.
+	let (resources, cache, remote, local) = raw_setup("c23").await;
+	write_file(&local, "before.txt", b"baselined");
+	let db = temp_cache_path();
+
+	// --- session 1: baseline, then pause ---
+	let pair = {
+		let engine = SyncEngine::open(cache.client.clone(), db.clone())
+			.await
+			.unwrap();
+		let pair = engine
+			.add_pair(local.clone(), remote, SyncMode::TwoWay)
+			.await
+			.unwrap();
+		assert_eq!(engine.sync_once(pair).await.unwrap().uploaded, 1);
+		engine.pause_pair(pair).await.unwrap();
+		pair
+	}; // engine dropped — "process shutdown"
+
+	// A change staged while nothing at all is running.
+	write_file(&local, "while_down.txt", b"staged");
+
+	// --- session 2: re-open on the SAME db ---
+	let engine2 = SyncEngine::open(cache.client.clone(), db.clone())
+		.await
+		.unwrap();
+	assert!(
+		engine2.is_paused(pair).await,
+		"the pause did not survive the restart"
+	);
+	let report = engine2.sync_once(pair).await.unwrap();
+	assert!(
+		report.paused,
+		"a reopened paused pair must still refuse to sync: {report:?}"
+	);
+	let (_d, files) = list_remote(&resources).await;
+	assert!(
+		!has_file(&files, "while_down.txt"),
+		"a reopened paused pair synced anyway"
+	);
+
+	engine2.resume_pair(pair).await.unwrap();
+	let resumed = engine2.sync_once(pair).await.unwrap();
+	assert!(resumed.errors.is_empty(), "{resumed:?}");
+	assert_eq!(
+		resumed.uploaded, 1,
+		"the change staged while down did not sync after resume: {resumed:?}"
+	);
+	let (_d, files) = list_remote(&resources).await;
+	assert!(has_file(&files, "while_down.txt"));
+	drop(engine2);
+
+	// --- session 3: the resume is persisted too, so a restart does not re-pause ---
+	let engine3 = SyncEngine::open(cache.client.clone(), db).await.unwrap();
+	assert!(
+		!engine3.is_paused(pair).await,
+		"the resume did not survive a restart"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
-#[ignore = "blocked: no public pause/reconfigure — reconfigure-while-paused must defer all effect until resume"]
+#[ignore = "blocked: no public reconfigure — reconfigure-while-paused must defer all effect until resume"]
 #[shared_test_runtime]
 async fn control_24_reconfigure_while_paused_deferred() {
 	// plan: pair to baseline, pause; reconfigure mode (local-backup -> two-way) while paused; stage
@@ -1075,7 +1494,7 @@ async fn control_24_reconfigure_while_paused_deferred() {
 	// delete (mirrored), no old-mode action, baseline consistent with new mode.
 }
 
-#[ignore = "blocked: no public add/remove/pause control plane — needs concurrent control-op serialization"]
+#[ignore = "blocked: needs a concurrent control-op serialization harness (the verbs themselves now exist)"]
 #[shared_test_runtime]
 async fn control_25_concurrent_control_ops_serialized() {
 	// plan: P1/P2 active; near-simultaneous remove(P1), pause(P2), add(P3); run all + stage changes
@@ -1099,7 +1518,9 @@ async fn control_add_remove_pair_mid_pass() {
 	// both sides coherent, a later re-add behaves as first-sync-against-populated.
 }
 
-#[ignore = "blocked: no public remove/pause/status — needs idempotent invalid-order control verbs (double-remove, pause-already-paused, ...)"]
+// The pause/resume half of this is now covered by CONTROL-01 (pause-already-paused,
+// resume-already-running, an unknown id refused); what is left is the remove/re-add ordering.
+#[ignore = "blocked: needs the remove/re-add half of the invalid-order verb matrix (double-remove, remove-then-sync, ...)"]
 #[shared_test_runtime]
 async fn control_add_invalid_order_control_verbs_idempotent() {
 	// plan: add+converge a pair; remove() twice; pause() an already-paused pair; resume() a never-

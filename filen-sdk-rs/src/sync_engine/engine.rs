@@ -5,7 +5,7 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
-	collections::{BTreeSet, HashMap},
+	collections::{BTreeSet, HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -526,6 +526,9 @@ pub struct SyncEngine {
 	/// inserts into it, with an `await` in between, so two concurrent registrations would otherwise
 	/// both find the roots free and both commit — the exact overlap the check exists to refuse.
 	registrations: Mutex<()>,
+	/// The pairs currently paused (see [`SyncEngine::pause_pair`]). Mirrors the `paused` column,
+	/// which is the source of truth across restarts; this copy is what every pass consults.
+	paused: Mutex<HashSet<PairId>>,
 }
 
 /// Why [`SyncEngine::add_pair`] refused to register a pair: its roots overlap one already
@@ -776,6 +779,13 @@ impl SyncEngine {
 			.map_err(|e| {
 				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
 			})??;
+		// A pair paused by an earlier session stays paused: read the flags before the store moves
+		// into the engine, so no pass can run against an empty set in the meantime.
+		let paused = store
+			.paused_pairs()
+			.map_err(|e| db_error(e, "loading paused sync pairs"))?
+			.into_iter()
+			.collect();
 		let engine = Self {
 			client,
 			store: Mutex::new(store),
@@ -784,6 +794,7 @@ impl SyncEngine {
 			roots: Mutex::new(HashMap::new()),
 			approvals: Mutex::new(HashMap::new()),
 			registrations: Mutex::new(()),
+			paused: Mutex::new(paused),
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
@@ -1204,11 +1215,68 @@ impl SyncEngine {
 		// Re-registering the same roots hands back the SAME pair id, and a stale `Trashed` record
 		// would then hide a remote item from the fresh pair's very first view.
 		self.pending.forget_pair(pair);
-		self.store
-			.lock()
-			.await
+		let store = self.store.lock().await;
+		store
 			.delete_pair(pair)
-			.map_err(|e| db_error(e, "removing a sync pair"))
+			.map_err(|e| db_error(e, "removing a sync pair"))?;
+		// Under the same lock as the delete, and as `set_paused`'s own write: a pause that landed
+		// in between would leave the set holding an id whose row is gone, and sqlite hands a
+		// deleted `INTEGER PRIMARY KEY` back to the next pair created here — which would then read
+		// as paused while its own row says it is running.
+		self.paused.lock().await.remove(&pair);
+		Ok(())
+	}
+
+	/// Pause `pair`: its watch loop stops running passes, and [`sync_once`](Self::sync_once)
+	/// returns a report marked [`paused`](SyncReport::paused) without scanning, planning or
+	/// touching either side. Changes made meanwhile are not lost — the watch loop leaves its
+	/// change signal pending, so the first pass after [`resume_pair`](Self::resume_pair) catches
+	/// up on everything at once.
+	///
+	/// A pause does NOT tear the pair down: its filesystem watcher and its cache sync-root
+	/// subscription stay registered. Dropping the subscription would untrack the root in the cache,
+	/// and re-registering it would then relist the whole root under the drive lock — a resync
+	/// nobody asked for as the price of resuming.
+	///
+	/// The flag is persisted with the pair, so an engine reopened on the same baseline DB comes
+	/// back paused. Pausing an already-paused pair is a no-op; an unknown pair is an error.
+	pub async fn pause_pair(&self, pair: PairId) -> Result<(), Error> {
+		self.set_paused(pair, true).await
+	}
+
+	/// Resume a [`paused`](Self::pause_pair) pair. Nothing is re-listed and no baseline is
+	/// invalidated: whatever changed on either side while the pair was paused is reconciled by the
+	/// next pass exactly as if it had changed a moment ago. Resuming a running pair is a no-op; an
+	/// unknown pair is an error.
+	pub async fn resume_pair(&self, pair: PairId) -> Result<(), Error> {
+		self.set_paused(pair, false).await
+	}
+
+	/// Whether `pair` is currently [`paused`](Self::pause_pair). An unknown pair reads as not
+	/// paused (it has no state to be paused in).
+	pub async fn is_paused(&self, pair: PairId) -> bool {
+		self.paused.lock().await.contains(&pair)
+	}
+
+	async fn set_paused(&self, pair: PairId, paused: bool) -> Result<(), Error> {
+		// The persisted flag FIRST: an in-memory pause the DB never learned about would silently
+		// un-pause on the next open, which is the one direction that loses data protection. Both
+		// writes happen under the store lock, so a concurrent `remove_pair` cannot land between
+		// them and leave the set holding a pair it has already deleted.
+		let store = self.store.lock().await;
+		let known = store
+			.set_paused(pair, paused)
+			.map_err(|e| db_error(e, "persisting a sync pair's paused flag"))?;
+		if !known {
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		let mut set = self.paused.lock().await;
+		if paused {
+			set.insert(pair);
+		} else {
+			set.remove(&pair);
+		}
+		Ok(())
 	}
 
 	/// Approve the mass-delete batch the guard is currently holding for `pair`, naming it by the
@@ -1293,7 +1361,9 @@ impl SyncEngine {
 			.map_err(|e| db_error(e, "clearing a path's failure count"))
 	}
 
-	/// Run one full sync pass: plan, screen, and apply against the remote and local tree.
+	/// Run one full sync pass: plan, screen, and apply against the remote and local tree. A
+	/// [`paused`](Self::pause_pair) pair returns a report marked
+	/// [`paused`](SyncReport::paused) instead, having read neither side.
 	pub async fn sync_once(&self, pair: PairId) -> Result<SyncReport, Error> {
 		self.sync_once_observed(pair, &mut |_| {}).await
 	}
@@ -1301,11 +1371,22 @@ impl SyncEngine {
 	/// Like [`sync_once`](Self::sync_once), but reports live progress: `observer` is invoked with
 	/// each [`SyncEvent`] as the pass plans and applies its actions (see [`SyncEvent`] for the
 	/// event order). The observer is called synchronously between async steps, so keep it quick.
+	///
+	/// A [`paused`](Self::pause_pair) pair emits NO events at all — there was no pass to report on
+	/// — and returns a report marked [`paused`](SyncReport::paused).
 	pub async fn sync_once_observed(
 		&self,
 		pair: PairId,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> Result<SyncReport, Error> {
+		if self.is_paused(pair).await {
+			tracing::debug!("sync_once[pair {pair}]: paused — neither side was read");
+			return Ok(SyncReport {
+				paused: true,
+				..SyncReport::default()
+			});
+		}
+
 		let prep = self.prepare(pair).await?;
 		let mut report = SyncReport::default();
 
@@ -2211,6 +2292,57 @@ mod tests {
 			"the restart re-does the pass's writes: {:?}",
 			actions.iter().map(describe).collect::<Vec<_>>()
 		);
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A pause and a removal of the same pair, in flight at once from two callers of one engine.
+	/// `sync_pairs.id` is a plain `INTEGER PRIMARY KEY`, so sqlite hands a deleted id back to the
+	/// next pair created here — an id left behind in the paused set would silently pause that
+	/// fresh pair, whose own row says it is running.
+	#[tokio::test]
+	async fn a_pause_racing_a_removal_leaves_no_paused_id_behind() {
+		let path =
+			std::env::temp_dir().join(format!("filen_sync_pause_race_{}.db", Uuid::new_v4()));
+		let engine = Arc::new(
+			SyncEngine::open(offline_client(), path.clone())
+				.await
+				.unwrap(),
+		);
+		let (pair, _) = engine
+			.store
+			.lock()
+			.await
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+
+		// The store lock fixes the interleaving: both verbs queue on it while this guard is held,
+		// and tokio's mutex hands it out in request order, so the pause runs first and the removal
+		// second — the order in which a pause that persisted its flag can land after the row it
+		// describes is already gone.
+		let guard = engine.store.lock().await;
+		let pausing = tokio::spawn({
+			let engine = Arc::clone(&engine);
+			async move { engine.pause_pair(pair).await }
+		});
+		tokio::task::yield_now().await;
+		let removing = tokio::spawn({
+			let engine = Arc::clone(&engine);
+			async move { engine.remove_pair(pair).await }
+		});
+		tokio::task::yield_now().await;
+		drop(guard);
+
+		// The pause itself may legitimately succeed or be refused, depending on which verb the
+		// store lock served first; what must hold either way is that nothing stays paused.
+		let _ = pausing.await.unwrap();
+		removing.await.unwrap().unwrap();
+		assert!(
+			!engine.is_paused(pair).await,
+			"the removed pair left its id in the paused set; the next pair sqlite gives that id \
+			 would never sync"
+		);
+
 		drop(engine);
 		std::fs::remove_file(&path).ok();
 	}

@@ -11,6 +11,11 @@
 //! synced and no-ops. The engine's own *staging* writes — download temp files and the quarantine
 //! bin — are filtered out instead (see [`triggers_pass`]): they are never content the next pass
 //! would act on, so a pass for them is pure waste.
+//!
+//! While the pair is [`paused`](super::SyncEngine::pause_pair) the loop runs no passes and leaves
+//! the dirty signal alone, so it is still pending when the pair resumes: whatever happened during
+//! the pause is picked up by the first pass afterwards. The watcher and the cache subscription are
+//! left registered throughout — tearing either down would cost a full relist to rebuild.
 
 use std::{
 	ffi::OsStr,
@@ -138,6 +143,9 @@ impl SyncEngine {
 	/// Start a continuous sync of `pair`: an immediate pass, then a debounced pass on every local
 	/// or remote change, plus a periodic safety-net pass. Returns a [`WatchHandle`] that stops
 	/// everything when dropped. Requires a multi-threaded runtime (it spawns a background task).
+	///
+	/// A watch on a [`paused`](Self::pause_pair) pair starts, and idles: it runs no pass until the
+	/// pair is resumed.
 	pub async fn watch(self: Arc<Self>, pair: PairId) -> Result<WatchHandle, Error> {
 		self.watch_observed(pair, Box::new(|_| {})).await
 	}
@@ -252,6 +260,13 @@ async fn run_loop(
 	safety_net.tick().await; // consume the immediate first tick (the initial pass below covers it)
 
 	loop {
+		if engine.is_paused(pair).await {
+			if !wait_while_paused(&mut shutdown, config.debounce).await {
+				return;
+			}
+			continue;
+		}
+
 		let error = run_pass(&engine, pair, observer.as_mut()).await;
 		if error.is_none() {
 			failures = 0;
@@ -281,6 +296,23 @@ async fn run_loop(
 		{
 			return;
 		}
+	}
+}
+
+/// Wait out one poll interval while the pair is paused. Returns `false` if the watch was stopped.
+///
+/// Deliberately does NOT touch `dirty`: a change that happens while the pair is paused leaves its
+/// signal pending, so the first pass after the resume is the one that catches up on the lot. The
+/// pause itself is polled rather than signalled — the alternative is per-pair wakeup plumbing
+/// through the engine to save a timer that fires at the debounce cadence.
+async fn wait_while_paused(
+	shutdown: &mut tokio::sync::oneshot::Receiver<()>,
+	poll: Duration,
+) -> bool {
+	tokio::select! {
+		biased;
+		_ = &mut *shutdown => false,
+		_ = tokio::time::sleep(poll) => true,
 	}
 }
 
@@ -396,7 +428,7 @@ mod tests {
 
 	use super::{
 		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, WatchConfig, backoff, triggers_pass,
-		wait_for_next_pass,
+		wait_for_next_pass, wait_while_paused,
 	};
 
 	/// A safety-net interval as `run_loop` sets one up: the immediate first tick consumed, so the
@@ -537,6 +569,44 @@ mod tests {
 			.await,
 			"a stopped watch must not wait out the backoff"
 		);
+		assert_eq!(start.elapsed(), Duration::ZERO);
+	}
+
+	/// A paused pair polls, and never consumes the change signal: the notification a paused loop
+	/// walked past is still there for the first wait after the resume, so the backlog syncs then
+	/// rather than waiting out a whole safety-net interval.
+	#[tokio::test(start_paused = true)]
+	async fn a_paused_loop_leaves_the_change_signal_pending() {
+		let (shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+		let poll = Duration::from_millis(200);
+
+		// A change lands while the pair is paused; two paused polls walk past it.
+		dirty.notify_one();
+		let start = tokio::time::Instant::now();
+		assert!(wait_while_paused(&mut shutdown, poll).await);
+		assert!(wait_while_paused(&mut shutdown, poll).await);
+		assert_eq!(
+			start.elapsed(),
+			poll * 2,
+			"a paused poll waits its interval"
+		);
+
+		// Resumed: the pending notification is what ends the very next wait, one debounce later —
+		// not the safety net, which is far away.
+		let start = tokio::time::Instant::now();
+		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert_eq!(
+			start.elapsed(),
+			DEBOUNCE,
+			"the change made during the pause was swallowed"
+		);
+
+		// And stopping the watch is never delayed by a paused poll.
+		drop(shutdown_tx);
+		let start = tokio::time::Instant::now();
+		assert!(!wait_while_paused(&mut shutdown, Duration::from_secs(600)).await);
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
 
