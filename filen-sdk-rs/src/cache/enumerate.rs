@@ -23,7 +23,10 @@ use crate::{
 	cache::{
 		CacheError, SearchResult,
 		search::{open_read_connection, row_to_result},
-		sql::statements::{CACHE_META_GET, ENUMERATE_SUBTREE, WATERMARK_KEY},
+		sql::{
+			columns::ITEMS_UUID,
+			statements::{ANCESTRY_OF_UUID, CACHE_META_GET, ENUMERATE_SUBTREE, WATERMARK_KEY},
+		},
 	},
 	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
 };
@@ -89,7 +92,47 @@ pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result
 	})
 }
 
+/// The cached upward ancestor chain of `uuid` — the item itself plus every ancestor up to the
+/// account root — read from the cache DB at `path`. One indexed recursive walk of `items.parent`,
+/// cycle-safe (see the SQL).
+///
+/// EMPTY means the cache has never seen `uuid`, which is not the same as "it has no ancestors":
+/// callers must treat an empty answer as UNKNOWN, never as evidence of where the item sits.
+pub(crate) fn read_ancestors(path: &Path, uuid: Uuid) -> rusqlite::Result<Vec<Uuid>> {
+	let conn = open_read_connection(path)?;
+	let mut stmt = conn.prepare(ANCESTRY_OF_UUID)?;
+	let rows = stmt.query_map(params![uuid], |row| row.get::<_, Uuid>(ITEMS_UUID))?;
+	rows.collect()
+}
+
 impl Client {
+	/// The cached ancestor chain of `uuid` (see [`read_ancestors`] — an empty answer means the
+	/// cache does not know the item, not that it has no ancestors). Errors if the cache was never
+	/// configured. The blocking SQLite read runs on a blocking thread.
+	pub(crate) async fn cached_ancestors(&self, uuid: Uuid) -> Result<Vec<Uuid>, Error> {
+		let path = self.cache_slot.lock().await.db_path().ok_or_else(|| {
+			Error::custom(
+				ErrorKind::InvalidState,
+				"cache is not configured; call configure_cache first",
+			)
+		})?;
+		tokio::task::spawn_blocking(move || read_ancestors(&path, uuid))
+			.await
+			.map_err(|e| {
+				Error::custom(
+					ErrorKind::Internal,
+					format!("ancestry read task failed: {e}"),
+				)
+			})?
+			.map_err(|e| {
+				Error::custom_with_source(
+					ErrorKind::Internal,
+					CacheError::db(e, format!("reading the ancestry of {uuid}")),
+					Some("reading cached ancestry".to_string()),
+				)
+			})
+	}
+
 	/// Take a consistent [`SubtreeSnapshot`] of the cached subtree under sync root `root` — the
 	/// remote-state half the sync engine reconciles against. Errors if the cache was never
 	/// configured. The blocking SQLite read runs on a blocking thread so it never stalls the
