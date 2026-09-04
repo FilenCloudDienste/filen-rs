@@ -227,6 +227,78 @@ jobs:
           IMAP_EMAIL_USER: ${{ secrets['IMAP_EMAIL_USER'] }}
           IMAP_EMAIL_PASSWORD: ${{ secrets['IMAP_EMAIL_PASSWORD'] }}
           RUST_LOG: debug
+  test-sync-engine:
+    # The sync engine's live suites (`sync_engine_tests`, `sync_engine_blackbox_tests` and the
+    # grouped `sync_suite`) serialize on the account's single drive-write lock and fail
+    # spuriously when anything else on the account contends, so they run in their own job
+    # AFTER the whole matrix and the 2FA leg (needs: both, so nothing else touches the
+    # account), single-threaded, on Linux only (the FS watcher backend exercised locally is
+    # inotify/FSEvents; Windows is unproven). V2 account only: the engine builds on the
+    # cache, which the V1 legacy account has no separate coverage for. `-p filen-sdk-rs`
+    # keeps heif-decoder out of the build, so no meson/ninja/nasm here. The full
+    # `sync_suite` takes ~65 minutes alone.
+    #
+    # One step per binary, each `!cancelled()`: a red early binary must not skip the rest.
+    needs: [test, test-2fa]
+    if: |
+      !cancelled() && (
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch' ||
+        contains(github.event.head_commit.message, '[test]') ||
+        contains(github.event.pull_request.title, '[test]') ||
+        contains(github.event.pull_request.body, '[test]')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-test-ubuntu-latest
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: false
+      - name: Install Wild linker
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
+        env:
+          # Env beats .cargo/config.toml: a cache-miss cargo install runs in the repo
+          # checkout, which would otherwise need Wild to build Wild.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      - name: Run sync_engine_tests (single-threaded)
+        if: ${{ !cancelled() }}
+        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_tests --no-fail-fast -- --test-threads=1
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_sdk_rs::sync_engine=debug,info
+      - name: Run sync_engine_blackbox_tests (single-threaded)
+        if: ${{ !cancelled() }}
+        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_blackbox_tests --no-fail-fast -- --test-threads=1
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_sdk_rs::sync_engine=debug,info
+      - name: Run sync_suite (single-threaded)
+        if: ${{ !cancelled() }}
+        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_suite --no-fail-fast -- --test-threads=1
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_sdk_rs::sync_engine=debug,info
   test-wasm:
     if: |
       github.event_name == 'schedule' ||
