@@ -916,13 +916,13 @@ pub(crate) fn reconcile(
 	}
 
 	// Resolve moves next; their endpoints are then excluded from the per-path reconcile so a move
-	// is never also emitted as a delete + create. Skip this in additive backup modes: a move's
-	// other half is a deletion of the old name, and a backup mode must NEVER delete on its
-	// destination — so a moved item is handled as an additive create of the new name with the old
-	// name retained, not laundered into a move (which would remove the old name).
-	if mode.propagates_deletes() {
-		detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
-	}
+	// is never also emitted as a delete + create. This runs in EVERY mode, backup modes included: a
+	// rename on the source side is one item that changed name, and mirroring it as a metadata-only
+	// re-parent/rename keeps the backup a faithful copy instead of accumulating the old name beside
+	// the new one forever. It does not weaken the backup guarantee — a move deletes nothing on the
+	// destination, and a real deletion (content that reappears nowhere) is still suppressed by the
+	// `delete_ok` gate below.
+	detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
 
 	for key in keys {
 		if consumed.contains(key) {
@@ -941,18 +941,15 @@ pub(crate) fn reconcile(
 		let local_node = local.get(key);
 		let remote_node = remote.get(key);
 
+		// A backup mode is its mirror mode minus deletions on the destination — the ONE difference,
+		// so the two share an arm and the deletion policy is read off the mode itself.
+		let delete_ok = mode.propagates_deletes();
 		match mode {
-			super::SyncMode::LocalToRemote => {
-				push_to_remote(key, local_node, remote_node, base, true, &mut actions)
+			super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => {
+				push_to_remote(key, local_node, remote_node, base, delete_ok, &mut actions)
 			}
-			super::SyncMode::LocalBackup => {
-				push_to_remote(key, local_node, remote_node, base, false, &mut actions)
-			}
-			super::SyncMode::RemoteToLocal => {
-				pull_to_local(key, local_node, remote_node, base, true, &mut actions)
-			}
-			super::SyncMode::RemoteBackup => {
-				pull_to_local(key, local_node, remote_node, base, false, &mut actions)
+			super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => {
+				pull_to_local(key, local_node, remote_node, base, delete_ok, &mut actions)
 			}
 			super::SyncMode::TwoWay => {
 				reconcile_two_way(key, local_node, remote_node, base, &mut actions)
@@ -1257,6 +1254,55 @@ mod tests {
 				to_path: "b.txt".to_string(),
 			}],
 			"a remote move renames the local file, not delete + re-download"
+		);
+	}
+
+	#[test]
+	fn a_rename_in_a_backup_mode_moves_the_destination_instead_of_copying_it() {
+		let uuid = Uuid::new_v4();
+		// LocalBackup: the source (local) renamed a.txt -> b.txt. The remote backup follows with a
+		// metadata-only re-parent/rename, not an upload of b.txt with a.txt left behind.
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
+		let local = map(vec![("b.txt", local_file("b.txt", [5; 32]))]);
+		assert_eq!(
+			plan(SyncMode::LocalBackup, &baseline, &local, &remote),
+			vec![SyncAction::MoveRemote {
+				from_path: "a.txt".to_string(),
+				to_path: "b.txt".to_string(),
+				remote_uuid: uuid,
+			}],
+			"a backup destination follows a source rename instead of accumulating both names"
+		);
+
+		// RemoteBackup: the mirror image — the source (remote) renamed, the local backup follows.
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [5; 32]))]);
+		let remote = map(vec![("b.txt", remote_file("b.txt", uuid, [5; 32]))]);
+		assert_eq!(
+			plan(SyncMode::RemoteBackup, &baseline, &local, &remote),
+			vec![SyncAction::MoveLocal {
+				from_path: "a.txt".to_string(),
+				to_path: "b.txt".to_string(),
+			}]
+		);
+	}
+
+	#[test]
+	fn a_backup_mode_still_never_propagates_a_real_deletion() {
+		// The distinction move detection must preserve: a rename is a move, but a deletion with no
+		// new home for the content stays suppressed on a backup destination.
+		let uuid = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", uuid, [5; 32]))]);
+		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [5; 32]))]);
+		assert!(
+			plan(SyncMode::LocalBackup, &baseline, &HashMap::new(), &remote).is_empty(),
+			"a local deletion must not reach a remote backup"
+		);
+		let local = map(vec![("a.txt", local_file("a.txt", [5; 32]))]);
+		assert!(
+			plan(SyncMode::RemoteBackup, &baseline, &local, &HashMap::new()).is_empty(),
+			"a remote deletion must not reach a local backup"
 		);
 	}
 

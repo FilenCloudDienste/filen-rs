@@ -744,21 +744,24 @@ async fn move15_twoway_move_vs_edit() {
 }
 
 // ============================================================================
-// MOVE-16 — Backup modes do NOT mirror the delete-half of a move.
+// MOVE-16 — Backup modes mirror a rename as a MOVE (never as a deletion).
 // ============================================================================
 
 #[shared_test_runtime]
-async fn move16_local_backup_does_not_mirror_move_delete() {
+async fn move16_local_backup_mirrors_a_rename_as_a_move() {
 	let sc = single_client(SyncMode::LocalBackup).await;
 	write_file(&sc.local, "mv.txt", b"backup-C1");
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
-	// Rename locally; LocalBackup must push the new name but NOT trash the old.
+	// Rename locally; LocalBackup re-parents/renames the remote item rather than uploading the new
+	// name beside the old one — and it still never trashes.
 	move_file(&sc.local, "mv.txt", "moved.txt");
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.moved_remote, 1, "the rename must be a move: {r2:?}");
+	assert_eq!(r2.uploaded, 0, "no re-upload for a rename: {r2:?}");
 	assert_eq!(
 		r2.remotely_trashed, 0,
 		"backup must not trash on a move: {r2:?}"
@@ -770,15 +773,15 @@ async fn move16_local_backup_does_not_mirror_move_delete() {
 		"new name not pushed"
 	);
 	assert!(
-		find_file(&files, "mv.txt").is_some(),
-		"backup must RETAIN the original name (additive): {files:?}"
+		find_file(&files, "mv.txt").is_none(),
+		"the moved item must not also remain under its old name: {files:?}"
 	);
 
 	sc.cleanup();
 }
 
 #[shared_test_runtime]
-async fn move16_remote_backup_does_not_mirror_move_delete() {
+async fn move16_remote_backup_mirrors_a_rename_as_a_move() {
 	let sc = single_client(SyncMode::RemoteBackup).await;
 	let mut rf = upload_root(&sc, "mv.txt", b"backup-C1").await;
 	wait_cache_has(&sc, rf.uuid()).await;
@@ -787,7 +790,8 @@ async fn move16_remote_backup_does_not_mirror_move_delete() {
 	assert_eq!(r1.downloaded, 1, "{r1:?}");
 	assert!(read_eq(&sc.local, "mv.txt", b"backup-C1"));
 
-	// Rename on the remote; RemoteBackup pulls the new name but must keep the old local copy.
+	// Rename on the remote; RemoteBackup renames the local copy instead of re-downloading it, and
+	// still deletes nothing.
 	sc.resources
 		.client
 		.update_file_metadata(
@@ -809,6 +813,8 @@ async fn move16_remote_backup_does_not_mirror_move_delete() {
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.moved_local, 1, "the rename must be a move: {r2:?}");
+	assert_eq!(r2.downloaded, 0, "no re-download for a rename: {r2:?}");
 	assert_eq!(
 		r2.locally_deleted, 0,
 		"backup must not delete locally on a move: {r2:?}"
@@ -818,8 +824,8 @@ async fn move16_remote_backup_does_not_mirror_move_delete() {
 		"new name not pulled"
 	);
 	assert!(
-		sc.local.join("mv.txt").exists(),
-		"remote-backup must RETAIN the pre-move local name (additive)"
+		!sc.local.join("mv.txt").exists(),
+		"the moved copy must not also remain under its old name"
 	);
 
 	sc.cleanup();
