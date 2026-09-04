@@ -32,7 +32,7 @@ pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
 pub use engine::{ConflictResolution, SyncEngine};
 pub use events::{SyncEvent, SyncObserver};
-pub use guard::GuardReason;
+pub use guard::{DeleteGuard, GuardReason};
 pub use mode::SyncMode;
 pub use outcome::{
 	PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, RefuseReason,
