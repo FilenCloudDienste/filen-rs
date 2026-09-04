@@ -513,6 +513,73 @@ pub struct SyncEngine {
 	/// One-shot mass-delete approvals: pair -> the batch token the caller approved. The next pass
 	/// whose held batch hashes to that token executes it; any other batch is held again.
 	approvals: Mutex<HashMap<PairId, String>>,
+	/// Serializes [`add_pair`](SyncEngine::add_pair): its overlap check reads the registry and then
+	/// inserts into it, with an `await` in between, so two concurrent registrations would otherwise
+	/// both find the roots free and both commit — the exact overlap the check exists to refuse.
+	registrations: Mutex<()>,
+}
+
+/// Why [`SyncEngine::add_pair`] refused to register a pair: its roots overlap one already
+/// registered, so the two pairs would fight over the same items — each reading the other's writes
+/// as foreign changes, re-uploading and re-deleting them without ever converging.
+///
+/// Carried as the source of the returned [`Error`], so a caller that wants to react per case can
+/// recover it with [`Error::downcast`].
+///
+/// # The remote-nesting gap
+///
+/// Remote nesting is detected from the CACHE's ancestry of the two roots, which is the only cheap
+/// way to relate two uuids without a round trip per pair. That makes the nested-remote checks
+/// BEST-EFFORT: a remote root the cache has not learned about yet (a folder created seconds ago, a
+/// cache still converging) has no cached ancestry, so a nesting it is part of is not seen and the
+/// registration is allowed. Equal remote roots are caught regardless — that comparison needs no
+/// cache. A nesting missed here surfaces later as the two pairs disagreeing about the shared
+/// subtree; re-checking it on every pass is the fix if that ever proves to matter in practice.
+#[derive(Debug, thiserror::Error)]
+pub enum PairOverlap {
+	/// Another pair already syncs this exact local folder.
+	#[error("sync pair {pair} already syncs the local root {existing:?}")]
+	LocalRootInUse { pair: PairId, existing: String },
+	/// The new local root is INSIDE an existing pair's local root.
+	#[error("the local root is inside sync pair {pair}'s root {existing:?}")]
+	LocalRootNested { pair: PairId, existing: String },
+	/// The new local root CONTAINS an existing pair's local root.
+	#[error("the local root contains sync pair {pair}'s root {existing:?}")]
+	LocalRootContains { pair: PairId, existing: String },
+	/// Another pair already syncs this exact remote folder.
+	#[error("sync pair {pair} already syncs the remote root {existing}")]
+	RemoteRootInUse { pair: PairId, existing: Uuid },
+	/// The new remote root is INSIDE an existing pair's remote root.
+	#[error("the remote root is inside sync pair {pair}'s remote root {existing}")]
+	RemoteRootNested { pair: PairId, existing: Uuid },
+	/// The new remote root CONTAINS an existing pair's remote root.
+	#[error("the remote root contains sync pair {pair}'s remote root {existing}")]
+	RemoteRootContains { pair: PairId, existing: Uuid },
+}
+
+/// How a candidate local root relates to an existing pair's, or `None` when they are disjoint.
+/// Both paths are canonical (every stored root was canonicalized when it was registered), so a
+/// prefix comparison is a real containment test rather than a string coincidence.
+fn local_overlap(candidate: &Path, existing: &Path, pair: PairId) -> Option<PairOverlap> {
+	let shown = || existing.to_string_lossy().into_owned();
+	if candidate == existing {
+		Some(PairOverlap::LocalRootInUse {
+			pair,
+			existing: shown(),
+		})
+	} else if candidate.starts_with(existing) {
+		Some(PairOverlap::LocalRootNested {
+			pair,
+			existing: shown(),
+		})
+	} else if existing.starts_with(candidate) {
+		Some(PairOverlap::LocalRootContains {
+			pair,
+			existing: shown(),
+		})
+	} else {
+		None
+	}
 }
 
 /// The read-only inputs to a pass, shared by planning and applying.
@@ -663,6 +730,7 @@ impl SyncEngine {
 			observed: Arc::new(Observations::default()),
 			roots: Mutex::new(HashMap::new()),
 			approvals: Mutex::new(HashMap::new()),
+			registrations: Mutex::new(()),
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
@@ -711,6 +779,73 @@ impl SyncEngine {
 		}
 	}
 
+	/// Refuse a pair whose roots overlap one already registered (see [`PairOverlap`]). The pair
+	/// being re-registered unchanged is exempt: identical roots are the idempotent case, not an
+	/// overlap.
+	async fn check_roots_free(
+		&self,
+		local_root: &Path,
+		local: &str,
+		remote_root: Uuid,
+	) -> Result<(), Error> {
+		let existing = self.list_pairs().await?;
+		let same_pair =
+			|record: &PairRecord| record.local_root == local && record.remote_root == remote_root;
+
+		for record in existing.iter().filter(|r| !same_pair(r)) {
+			if let Some(overlap) =
+				local_overlap(local_root, Path::new(&record.local_root), record.id)
+			{
+				return Err(overlap_error(overlap));
+			}
+			if record.remote_root == remote_root {
+				return Err(overlap_error(PairOverlap::RemoteRootInUse {
+					pair: record.id,
+					existing: record.remote_root,
+				}));
+			}
+		}
+
+		// Nested remote roots need the cache's ancestry (see `PairOverlap`'s note on the gap). One
+		// walk for the candidate covers "the new root is inside an existing one"; one per existing
+		// root covers the other direction. An ancestry the cache cannot supply is skipped, never
+		// treated as proof the roots are unrelated.
+		let candidate_chain = self.ancestry_or_unknown(remote_root).await;
+		for record in existing.iter().filter(|r| !same_pair(r)) {
+			if candidate_chain.contains(&record.remote_root) {
+				return Err(overlap_error(PairOverlap::RemoteRootNested {
+					pair: record.id,
+					existing: record.remote_root,
+				}));
+			}
+			if self
+				.ancestry_or_unknown(record.remote_root)
+				.await
+				.contains(&remote_root)
+			{
+				return Err(overlap_error(PairOverlap::RemoteRootContains {
+					pair: record.id,
+					existing: record.remote_root,
+				}));
+			}
+		}
+		Ok(())
+	}
+
+	/// `uuid`'s cached ancestor chain, or an empty chain when the cache cannot answer. Best-effort
+	/// by design: a root the cache has not learned about must not block a registration.
+	async fn ancestry_or_unknown(&self, uuid: Uuid) -> Vec<Uuid> {
+		match self.client.cached_ancestors(uuid).await {
+			Ok(chain) => chain,
+			Err(error) => {
+				tracing::debug!(
+					"add_pair: cannot read the cached ancestry of {uuid} ({error}); nested-remote-root detection is skipped for it"
+				);
+				Vec::new()
+			}
+		}
+	}
+
 	/// Register a sync pair, returning its id. `remote_root` must be a sync-rooted SUBFOLDER the
 	/// cache covers (not the account root).
 	///
@@ -746,6 +881,11 @@ impl SyncEngine {
 			));
 		}
 		let local = local_root.to_string_lossy().into_owned();
+		// Held across the check AND the insert: concurrent registrations must not both read a
+		// registry neither has written to yet.
+		let _registering = self.registrations.lock().await;
+		self.check_roots_free(&local_root, &local, remote_root)
+			.await?;
 		let (pair, stored_mode) = self
 			.store
 			.lock()
@@ -1309,6 +1449,14 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 	}
 }
 
+fn overlap_error(overlap: PairOverlap) -> Error {
+	Error::custom_with_source(
+		ErrorKind::InvalidState,
+		overlap,
+		Some("registering a sync pair whose roots overlap an existing one".to_string()),
+	)
+}
+
 fn db_error(error: rusqlite::Error, context: &str) -> Error {
 	Error::custom_with_source(ErrorKind::Internal, error, Some(context.to_string()))
 }
@@ -1333,6 +1481,28 @@ mod tests {
 
 	/// The pair whose writes the pending-write tests record.
 	const PAIR: PairId = 1;
+
+	#[test]
+	fn local_roots_overlap_only_when_one_actually_contains_the_other() {
+		let existing = Path::new("/sync/data");
+		assert!(matches!(
+			local_overlap(Path::new("/sync/data"), existing, 1),
+			Some(PairOverlap::LocalRootInUse { pair: 1, .. })
+		));
+		assert!(matches!(
+			local_overlap(Path::new("/sync/data/sub/deep"), existing, 1),
+			Some(PairOverlap::LocalRootNested { pair: 1, .. })
+		));
+		assert!(matches!(
+			local_overlap(Path::new("/sync"), existing, 1),
+			Some(PairOverlap::LocalRootContains { pair: 1, .. })
+		));
+		// A sibling is disjoint, and so is a name that merely SHARES a prefix with the root: the
+		// comparison is per path component, not per byte.
+		assert!(local_overlap(Path::new("/sync/other"), existing, 1).is_none());
+		assert!(local_overlap(Path::new("/sync/database"), existing, 1).is_none());
+		assert!(local_overlap(Path::new("/elsewhere"), existing, 1).is_none());
+	}
 
 	/// The reconciler's own one-line rendering of an action — what these tests assert plans by.
 	/// (The public [`PlannedAction`] rendering is pinned in `outcome.rs`.)
