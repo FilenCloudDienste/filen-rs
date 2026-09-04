@@ -35,7 +35,7 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::file::meta::FileMetaChanges;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::SyncMode;
+use filen_sdk_rs::sync_engine::{SyncMode, UnsyncableReason};
 
 use crate::harness::*;
 use crate::helpers::*;
@@ -573,8 +573,8 @@ async fn path_23_dir_vs_file_type_collision() {}
 ///
 /// Embedded `/`/`\` are impossible to create as a single local path segment, and the SDK's
 /// `ValidatedName` rejects control chars and trailing/leading space on PUSH — so this asserts the
-/// engine surfaces such a name as a per-action error (not a panic, not a silent wrong-path write)
-/// while the legal `..weird`/`..foo` names push cleanly.
+/// engine reports such a name as UNSYNCABLE (not a panic, not a per-pass upload failure, not a
+/// silent wrong-path write) while the legal `..weird`/`..foo` names push cleanly.
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn path_add_local_quirky_legal_names_push_safely() {
@@ -588,10 +588,19 @@ async fn path_add_local_quirky_legal_names_push_safely() {
 	std::fs::write(sc.local.join(tabname), b"T").unwrap();
 
 	let r1 = sc.sync().await;
-	// The two legal names must upload; the control-char name may surface as a per-action error.
-	assert!(
-		r1.uploaded >= 2,
+	// The two legal names must upload; the control-char name is screened out before any transfer.
+	assert_eq!(
+		r1.uploaded, 2,
 		"the two legal quirky names must upload: {r1:?}"
+	);
+	assert!(
+		r1.unsyncable.iter().any(|u| u.rel_path == tabname),
+		"the control-char name must be reported unsyncable: {:?}",
+		r1.unsyncable
+	);
+	assert!(
+		r1.errors.is_empty(),
+		"a name that can never be pushed is not an error to retry: {r1:?}"
 	);
 
 	let (dirs, files) = list_root(&sc).await;
@@ -622,6 +631,85 @@ async fn path_add_local_quirky_legal_names_push_safely() {
 		r2.remote_dirs_created, 0,
 		"quirky-name re-sync must not create dirs: {r2:?}"
 	);
+	sc.cleanup();
+}
+
+/// A local name the remote would reject is detected BEFORE any transfer: it is reported once per
+/// pass as unsyncable, its whole subtree is left out of the plan, and no upload is ever attempted
+/// for it — so a single such name cannot spam every pass with the same failure forever. Renaming
+/// it to something valid makes it sync normally.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn path_add_remote_invalid_local_names_reported_once_not_retried() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "good.txt", b"G");
+	// `CON` is a reserved device name; `bad.` ends in a dot. Both are creatable here and both are
+	// refused by the SDK's own validator, i.e. no upload of them could ever succeed.
+	write_file(&sc.local, "CON", b"C");
+	write_file(&sc.local, "bad./inner.txt", b"I");
+
+	let r1 = sc.sync().await;
+	assert!(
+		r1.errors.is_empty(),
+		"an unsyncable name must not surface as a retryable error: {r1:?}"
+	);
+	assert_eq!(r1.uploaded, 1, "only the valid file is pushed: {r1:?}");
+	assert_eq!(r1.remote_dirs_created, 0, "{r1:?}");
+
+	let reported: Vec<&str> = r1.unsyncable.iter().map(|u| u.rel_path.as_str()).collect();
+	assert_eq!(
+		reported,
+		vec!["CON", "bad."],
+		"each rejected name is reported ONCE, and its child is not reported separately: {:?}",
+		r1.unsyncable
+	);
+	assert!(
+		r1.unsyncable
+			.iter()
+			.all(|u| matches!(u.reason, UnsyncableReason::InvalidName { .. })),
+		"{:?}",
+		r1.unsyncable
+	);
+
+	let (dirs, files) = list_root(&sc).await;
+	assert!(find_file(&files, "good.txt").is_some(), "{files:?}");
+	assert!(find_file(&files, "CON").is_none(), "{files:?}");
+	assert!(find_dir(&dirs, "bad.").is_none(), "{dirs:?}");
+
+	// The dry run says exactly the same thing, and plans nothing for those paths.
+	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert_eq!(plan.unsyncable, r1.unsyncable, "{plan:?}");
+	assert!(
+		!plan
+			.actions
+			.iter()
+			.any(|a| a.rel_path == "CON" || a.rel_path.starts_with("bad.")),
+		"nothing is planned for an unsyncable path: {plan:?}"
+	);
+
+	// A second pass repeats the report and still attempts nothing: no retry storm.
+	let r2 = sc.sync().await;
+	assert_eq!(r2.unsyncable, r1.unsyncable, "{r2:?}");
+	assert_eq!(r2.uploaded, 0, "{r2:?}");
+	assert!(r2.errors.is_empty(), "{r2:?}");
+
+	// Renaming to a valid name makes the whole subtree sync normally, and clears the report.
+	std::fs::rename(sc.local.join("bad."), sc.local.join("fine")).unwrap();
+	std::fs::rename(sc.local.join("CON"), sc.local.join("CON.txt")).unwrap();
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert!(r3.unsyncable.is_empty(), "{:?}", r3.unsyncable);
+	assert_eq!(r3.uploaded, 2, "CON.txt + fine/inner.txt: {r3:?}");
+	assert_eq!(r3.remote_dirs_created, 1, "{r3:?}");
+
+	let (dirs, files) = list_root(&sc).await;
+	assert!(find_file(&files, "CON.txt").is_some(), "{files:?}");
+	let fine = find_dir(&dirs, "fine").expect("fine/ missing");
+	assert!(
+		find_file(&list_dir(&sc, fine).await.1, "inner.txt").is_some(),
+		"the previously-skipped subtree now syncs"
+	);
+
 	sc.cleanup();
 }
 
