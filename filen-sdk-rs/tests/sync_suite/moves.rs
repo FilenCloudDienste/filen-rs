@@ -1141,63 +1141,66 @@ async fn move23_empty_directory_rename() {
 #[shared_test_runtime]
 async fn move24_cross_pair_move() {
 	// Build two sibling remote roots under the test's scoped dir, both covered by the same cache.
-	let sc = single_client(SyncMode::LocalToRemote).await;
-	let r1_dir = sc
-		.resources
-		.client
-		.create_dir(&root_dirtype(&sc), "R1")
-		.await
-		.unwrap();
-	let r2_dir = sc
-		.resources
-		.client
-		.create_dir(&root_dirtype(&sc), "R2")
-		.await
-		.unwrap();
-	wait_cache_has(&sc, r1_dir.uuid()).await;
-	wait_cache_has(&sc, r2_dir.uuid()).await;
+	// The engine holds NO pair on the scoped dir itself: `add_pair` refuses a root that contains an
+	// already-registered one, so a pair on the shared root could not coexist with the two inside it
+	// (the same reason CONTROL-04 registers its pairs on siblings).
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let root: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, root).await;
+	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
 
+	let root_dt = DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir));
+	let r1_dir = resources.client.create_dir(&root_dt, "R1").await.unwrap();
+	let r2_dir = resources.client.create_dir(&root_dt, "R2").await.unwrap();
+	for uuid in [r1_dir.uuid(), r2_dir.uuid()] {
+		assert!(
+			poll_for_item(cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"cache never observed item {uuid}"
+		);
+	}
+
+	let engine =
+		filen_sdk_rs::sync_engine::SyncEngine::open(cache.client.clone(), temp_cache_path())
+			.await
+			.unwrap();
 	let l1 = fresh_local_dir("p1");
 	let l2 = fresh_local_dir("p2");
-	let p1 = sc
-		.engine
+	let p1 = engine
 		.add_pair(l1.clone(), r1_dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
-	let p2 = sc
-		.engine
+	let p2 = engine
 		.add_pair(l2.clone(), r2_dir.uuid(), SyncMode::LocalToRemote)
 		.await
 		.unwrap();
 
 	// g.txt starts in L1; sync both pairs to baseline.
 	write_file(&l1, "g.txt", b"cross-pair-C1");
-	let a1 = sc.engine.sync_once(p1).await.unwrap();
+	let a1 = engine.sync_once(p1).await.unwrap();
 	assert!(a1.errors.is_empty(), "{a1:?}");
 	assert_eq!(a1.uploaded, 1, "{a1:?}");
-	let b1 = sc.engine.sync_once(p2).await.unwrap();
+	let b1 = engine.sync_once(p2).await.unwrap();
 	assert!(b1.errors.is_empty(), "{b1:?}");
 
 	// Move g.txt OUT of L1 and INTO L2 (filesystem move across sync roots).
 	std::fs::rename(l1.join("g.txt"), l2.join("g.txt")).unwrap();
 
-	let a2 = sc.engine.sync_once(p1).await.unwrap();
+	let a2 = engine.sync_once(p1).await.unwrap();
 	assert!(a2.errors.is_empty(), "{a2:?}");
-	let b2 = sc.engine.sync_once(p2).await.unwrap();
+	let b2 = engine.sync_once(p2).await.unwrap();
 	assert!(b2.errors.is_empty(), "{b2:?}");
 	assert_eq!(b2.uploaded, 1, "P2 should upload g.txt: {b2:?}");
 
 	// P1's remote (R1) must no longer have g.txt.
-	let (_, r1_files) = list_dir(&sc.resources.client, &r1_dir).await;
+	let (_, r1_files) = list_dir(&resources.client, &r1_dir).await;
 	assert!(find_file(&r1_files, "g.txt").is_none(), "g.txt still in R1");
 	// P2's remote (R2) must now have g.txt with C1.
-	let (_, r2_files) = list_dir(&sc.resources.client, &r2_dir).await;
+	let (_, r2_files) = list_dir(&resources.client, &r2_dir).await;
 	let g = find_file(&r2_files, "g.txt").expect("g.txt missing in R2");
 	assert_eq!(g.size, b"cross-pair-C1".len() as u64);
 
 	std::fs::remove_dir_all(&l1).ok();
 	std::fs::remove_dir_all(&l2).ok();
-	sc.cleanup();
 }
 
 // ============================================================================

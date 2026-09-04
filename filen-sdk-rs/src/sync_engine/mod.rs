@@ -30,7 +30,7 @@ mod watch;
 
 pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
-pub use engine::{ConflictResolution, SyncEngine};
+pub use engine::{ConflictResolution, PairOverlap, SyncEngine};
 pub use events::{SyncEvent, SyncObserver};
 pub use guard::{DeleteGuard, GuardReason};
 pub use mode::SyncMode;
