@@ -879,12 +879,47 @@ async fn control_15_abrupt_kill_mid_pass_recoverable() {
 	// byte-exact convergence, no orphaned partials in quarantine.
 }
 
-#[ignore = "blocked: no public reconfigure — changing a pair's MODE must apply prospectively"]
+/// CONTROL-16 — reconfiguring a pair's MODE applies from the next pass and costs nothing: the
+/// baseline is kept (no re-transfer, no full re-sync), and a change made AFTER the switch is
+/// handled by the new mode.
 #[shared_test_runtime]
 async fn control_16_reconfigure_mode_prospective() {
-	// plan: local-backup pair to baseline; reconfigure to two-way; local-delete a file; pass =>
-	// deletion now mirrored per NEW mode, not retroactively; unrelated files not re-transferred;
-	// baseline valid; no full re-sync from the mode change.
+	let sc = single_client(SyncMode::LocalBackup).await;
+	for name in ["keep1.txt", "keep2.txt", "gone.txt"] {
+		write_file(&sc.local, name, content_for(name).as_slice());
+	}
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 3, "{r1:?}");
+
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	// The switch alone is a no-op: nothing is re-transferred and the baseline still holds.
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.uploaded, 0, "no re-upload from the mode change: {r2:?}");
+	assert_eq!(r2.downloaded, 0, "no re-download either: {r2:?}");
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
+
+	// A deletion made AFTER the switch is mirrored per the new mode (local-backup would not have).
+	std::fs::remove_file(sc.local.join("gone.txt")).unwrap();
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(
+		r3.remotely_trashed, 1,
+		"the new mode propagates the deletion: {r3:?}"
+	);
+	assert_eq!(r3.uploaded, 0, "the untouched files stay put: {r3:?}");
+
+	let (_dirs, files) = list_remote(&sc.resources).await;
+	let mut names: Vec<&str> = files.iter().filter_map(|f| f.name()).collect();
+	names.sort_unstable();
+	assert_eq!(names, vec!["keep1.txt", "keep2.txt"], "{names:?}");
+
+	sc.cleanup();
 }
 
 #[ignore = "blocked: no public reconfigure — changing a pair's ROOT must stop the old root and safely reconcile the new"]
