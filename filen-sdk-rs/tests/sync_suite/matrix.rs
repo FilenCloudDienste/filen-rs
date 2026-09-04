@@ -90,7 +90,7 @@ fn assert_noop(r: &SyncReport) {
 	assert_eq!(r.moved_remote, 0, "{r:?}");
 	assert_eq!(r.moved_local, 0, "{r:?}");
 	assert_eq!(r.conflicts.len(), 0, "{r:?}");
-	assert_eq!(r.held_deletions, 0, "{r:?}");
+	assert_eq!(r.held_deletions(), 0, "{r:?}");
 	assert!(r.errors.is_empty(), "{r:?}");
 }
 

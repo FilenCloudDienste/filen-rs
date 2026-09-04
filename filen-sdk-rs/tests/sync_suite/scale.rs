@@ -536,7 +536,8 @@ async fn scale_10_local_move_batch_is_moves_not_reupload() {
 		"only the emptied source dir may be trashed, never file data: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"a move must not trip the mass-delete hold: {r2:?}"
 	);
 	// All N items moved (counted as moves, not delete+create).
@@ -641,7 +642,8 @@ async fn scale_b_remote_move_batch_is_local_moves_not_redownload() {
 		"a remote move must NOT delete locally: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"a move must not trip the quarantine hold: {r2:?}"
 	);
 	assert!(r2.moved_local >= 1, "expected local moves: {r2:?}");
@@ -699,7 +701,7 @@ async fn scale_11_mass_local_delete_is_held() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"mass-delete guard should engage for {N}/{N}: {r2:?}"
 	);
 	assert_eq!(
@@ -924,7 +926,8 @@ async fn scale_15_mixed_large_batch_one_pass() {
 	assert!(r2.moved_remote >= 1, "moves categorized as moves: {r2:?}");
 	assert_eq!(r2.remotely_trashed, 3, "exactly the 3 deletes: {r2:?}");
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"3 deletes below the floor — not held: {r2:?}"
 	);
 
@@ -1144,8 +1147,7 @@ async fn scale_19_first_sync_into_populated_remote_no_wipe() {
 	// Differing-content same-path files surface as conflicts (not blindly overwritten).
 	for i in 0..SHARED_DIFF {
 		assert!(
-			r1.conflicts
-				.iter()
+			r1.conflict_paths()
 				.any(|c| c.contains(&format!("diff{i}.txt"))),
 			"diff{i}.txt should be a conflict: {r1:?}"
 		);
@@ -1218,11 +1220,12 @@ async fn scale_20_local_backup_delete_not_mirrored() {
 		"backup must not mirror local deletes: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"no deletions to hold in backup mode: {r2:?}"
 	);
 	assert!(
-		r2.guard_message.is_none(),
+		r2.guard.is_none(),
 		"no mass-delete prompt in backup mode: {r2:?}"
 	);
 
@@ -1543,8 +1546,8 @@ async fn scale_d_many_simultaneous_conflicts_all_surfaced() {
 		.await;
 		assert!(ra.errors.is_empty(), "A errors: {:?}", ra.errors);
 		assert!(rb.errors.is_empty(), "B errors: {:?}", rb.errors);
-		for c in ra.conflicts.iter().chain(rb.conflicts.iter()) {
-			conflicts.insert(c.clone());
+		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
+			conflicts.insert(c.to_string());
 		}
 		tokio::time::sleep(Duration::from_millis(1200)).await;
 	}

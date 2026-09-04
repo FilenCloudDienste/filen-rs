@@ -338,7 +338,8 @@ async fn l2r_local_delete_propagates_to_remote() {
 		"local delete should trash on remote: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"1 of 2 should not trip the guard: {r2:?}"
 	);
 
@@ -696,7 +697,7 @@ async fn twoway_divergent_modification_conflicts_nondestructively() {
 
 	let r2 = engine.sync_once(pair).await.unwrap();
 	assert!(
-		r2.conflicts.iter().any(|c| c.contains("fight.txt")),
+		r2.conflict_paths().any(|c| c.contains("fight.txt")),
 		"expected fight.txt in conflicts: {r2:?}"
 	);
 	// No destructive action: nothing trashed/deleted.
@@ -735,7 +736,7 @@ async fn twoway_local_delete_propagates() {
 		r2.remotely_trashed, 1,
 		"a local delete should trash on remote in TwoWay: {r2:?}"
 	);
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 
 	let (_dirs, files) = fx.list_remote_root().await;
 	assert!(
@@ -773,7 +774,7 @@ async fn twoway_idempotent_second_pass() {
 	assert_eq!(r2.moved_remote, 0, "{r2:?}");
 	assert_eq!(r2.moved_local, 0, "{r2:?}");
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert!(r2.errors.is_empty(), "{r2:?}");
 
 	fx.cleanup();
@@ -1112,7 +1113,7 @@ async fn mass_delete_guard_holds_large_deletion() {
 	let r2 = engine.sync_once(pair).await.unwrap();
 
 	assert!(
-		r2.held_deletions > 0 || r2.guard_message.is_some(),
+		r2.held_deletions() > 0 || r2.guard.is_some(),
 		"mass-delete guard should have engaged for {DELETE}/{TOTAL} deletions: {r2:?}"
 	);
 	assert_eq!(

@@ -165,7 +165,7 @@ async fn mode_02_l2r_mirrors_local_deletion() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.remotely_trashed, 1, "local delete must mirror: {r2:?}");
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 
 	let (_dirs, files) = list_remote_root(&sc).await;
 	assert!(
@@ -406,7 +406,7 @@ async fn mode_09_twoway_divergent_edit_conflicts_nondestructively() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.conflicts.iter().any(|c| c.contains("c.txt")),
+		r2.conflict_paths().any(|c| c.contains("c.txt")),
 		"expected c.txt conflict: {r2:?}"
 	);
 	// No destructive action and the local side is left intact (recoverable).
@@ -513,7 +513,7 @@ async fn mode_12_twoway_delete_vs_edit_conflicts_nondestructively() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
-		r2.conflicts.iter().any(|c| c.contains("f.txt")),
+		r2.conflict_paths().any(|c| c.contains("f.txt")),
 		"delete-vs-edit must conflict: {r2:?}"
 	);
 	// The edited remote file must NOT be silently destroyed by the local delete.
@@ -574,7 +574,7 @@ async fn mode_add_twoway_create_create_different_content_conflicts() {
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert!(
-		r1.conflicts.iter().any(|c| c.contains("new.txt")),
+		r1.conflict_paths().any(|c| c.contains("new.txt")),
 		"create/create divergence must conflict: {r1:?}"
 	);
 	// Neither create is destroyed.
@@ -880,7 +880,7 @@ async fn mode_18_first_sync_does_not_wipe_populated_destination() {
 	);
 	// The one pre-existing destination file is HELD (not trashed) by the first-sync guard — that
 	// hold is the no-wipe mechanism, so held_deletions is 1, not 0.
-	assert_eq!(r1.held_deletions, 1, "{r1:?}");
+	assert_eq!(r1.held_deletions(), 1, "{r1:?}");
 	assert_eq!(r1.uploaded, 1, "source file should be copied: {r1:?}");
 
 	let (_dirs, files) = list_remote_root(&sc).await;
@@ -1025,7 +1025,7 @@ async fn mode_24_r2l_empty_source_leaves_populated_destination_intact() {
 	assert_eq!(r1.locally_deleted, 0, "empty source wiped local: {r1:?}");
 	// The single local-only file is HELD by the first-sync guard rather than deleted — holding is
 	// the no-wipe mechanism, so held_deletions is 1.
-	assert_eq!(r1.held_deletions, 1, "{r1:?}");
+	assert_eq!(r1.held_deletions(), 1, "{r1:?}");
 	assert_eq!(r1.conflicts.len(), 0, "{r1:?}");
 	assert!(
 		read_eq(&sc.local, "local-only.txt", b"L"),
