@@ -711,8 +711,14 @@ impl SyncEngine {
 		}
 	}
 
-	/// Register a sync pair (idempotent for the same `(local_root, remote_root)`), returning its id.
-	/// `remote_root` must be a sync-rooted SUBFOLDER the cache covers (not the account root).
+	/// Register a sync pair, returning its id. `remote_root` must be a sync-rooted SUBFOLDER the
+	/// cache covers (not the account root).
+	///
+	/// Idempotent for the same `(local_root, remote_root, mode)`: the existing pair's id comes back
+	/// and nothing is disturbed. The same roots with a DIFFERENT mode is an ERROR, not a silent
+	/// switch — an established pair's direction decides whether the next pass overwrites the local
+	/// copy or the remote one, which is far too consequential to change as a side effect of a
+	/// registration call. Use [`reconfigure_pair`](Self::reconfigure_pair) to change it.
 	///
 	/// `local_root` must already EXIST and be a directory; it is canonicalized before being stored,
 	/// so the pair's identity (and the write-confinement anchor) is symlink-stable. A missing or
@@ -740,14 +746,62 @@ impl SyncEngine {
 			));
 		}
 		let local = local_root.to_string_lossy().into_owned();
-		let pair = self
+		let (pair, stored_mode) = self
 			.store
 			.lock()
 			.await
 			.create_pair(&local, remote_root, mode)
 			.map_err(|e| db_error(e, "registering a sync pair"))?;
+		if stored_mode != mode {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!(
+					"sync pair {pair} is already registered for these roots in {stored_mode:?} \
+					 mode; call reconfigure_pair to change it to {mode:?}"
+				),
+			));
+		}
 		self.observe_pair(pair, remote_root).await;
 		Ok(pair)
+	}
+
+	/// Change `pair`'s [`SyncMode`]. The new mode applies from the NEXT pass; nothing is re-run
+	/// under it and no baseline row is dropped, so an established pair does not re-transfer its
+	/// contents and a held conflict stays held for
+	/// [`resolve_conflict`](Self::resolve_conflict).
+	///
+	/// "Prospective" is about the PASSES, not about the divergence between the two sides. The next
+	/// pass reconciles whatever state the sides are in right now under the new rules, so a
+	/// divergence the old mode deliberately left standing is acted on as soon as the new mode says
+	/// to act on it. Concretely:
+	///
+	/// - to `LocalToRemote`: the remote stops being an independent side — a remote-only edit is
+	///   overwritten by the local copy rather than pulled — and, going the other way, a
+	///   `RemoteToLocal` switch has the local copy overwritten instead.
+	/// - a backup mode (`LocalBackup` / `RemoteBackup`) to a deletion-propagating one: every source
+	///   deletion the backup mode had left standing on the destination is a pending deletion under
+	///   the new mode, and the next pass propagates the whole set at once. The mass-delete guard
+	///   still screens it (see [`set_delete_guard`](Self::set_delete_guard)), so a large backlog is
+	///   held for approval rather than applied unasked — but a small one is not. Run
+	///   [`plan_pair`](Self::plan_pair) after switching to see exactly what the first pass will do.
+	/// - to a backup mode: deletions simply stop propagating from the next pass on; nothing already
+	///   deleted comes back.
+	///
+	/// Errors if the pair is unknown. Re-registering an existing pair through
+	/// [`add_pair`](Self::add_pair) with a different mode is an error rather than a silent switch,
+	/// so a mode change is always this explicit call.
+	pub async fn reconfigure_pair(&self, pair: PairId, mode: SyncMode) -> Result<(), Error> {
+		let changed = self
+			.store
+			.lock()
+			.await
+			.set_mode(pair, mode)
+			.map_err(|e| db_error(e, "reconfiguring a sync pair"))?;
+		if changed == 0 {
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		tracing::debug!("sync pair {pair}: mode changed to {mode:?} from the next pass");
+		Ok(())
 	}
 
 	/// Resolve a two-way conflict the engine is holding at `rel_path` (one reported in
@@ -1567,7 +1621,7 @@ mod tests {
 		let baseline = written_row(uuid, hash(1));
 		let pair = {
 			let store = BaselineStore::open(&path).unwrap();
-			let pair = store
+			let (pair, _) = store
 				.create_pair("/root", Uuid::new_v4(), SyncMode::LocalToRemote)
 				.unwrap();
 			store

@@ -7,6 +7,7 @@
 use std::{borrow::Cow, time::Duration};
 
 use filen_macros::shared_test_runtime;
+use filen_sdk_rs::sync_engine::PlannedActionKind;
 use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
@@ -930,31 +931,186 @@ async fn mode_19_identical_no_baseline_recognized_as_synced() {
 // MODE-20..22 — Mode switching (BLOCKED: no public mode-switch API)
 // ============================================================================
 
-// `SyncEngine` exposes `open`, `add_pair` (idempotent for the same roots), and `sync_once`. There
-// is NO public API to change an existing pair's `SyncMode`, and the per-pair baseline lives in the
-// engine's own baseline DB — so a switch cannot be simulated by reopening the engine with a
-// different mode without resetting the baseline (which would defeat the test's premise of keeping
-// the SAME baseline across the switch). Re-`add_pair` with a different mode is documented only as
-// "idempotent for the same (local_root, remote_root)" and must not be relied on to mutate the mode.
-#[ignore = "blocked: needs a public per-pair mode-switch API (none exists) — see TODO"]
+// `SyncEngine::reconfigure_pair` changes an established pair's `SyncMode` prospectively: the
+// baseline is kept, nothing is re-run, and the next pass reconciles the sides as they are now under
+// the new rules. `add_pair` with a different mode is an error rather than a silent switch, so these
+// tests go through `reconfigure_pair`.
+
+/// MODE-20 — switching two-way -> local->remote makes the local side authoritative: a local delete
+/// is mirrored, and a remote-only edit is overwritten instead of pulled.
 #[shared_test_runtime]
 async fn mode_20_switch_twoway_to_l2r_changes_deletion_directionality() {
-	// plan: establish two-way pair with t.txt + u.txt synced; switch pair to local->remote;
-	// delete t.txt locally -> mirrored to remote; remote-only edit of u.txt NOT pulled (local wins).
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, "t.txt", b"T");
+	write_file(&sc.local, "u.txt", b"U-local");
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 2, "{r1:?}");
+
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	assert_eq!(
+		sc.engine.list_pairs().await.unwrap()[0].mode,
+		SyncMode::LocalToRemote,
+		"the pair reports its new mode"
+	);
+
+	// A remote-only edit of u.txt that two-way would have PULLED, plus a local delete of t.txt.
+	modify_remote(&sc, "u.txt", b"U-remote-edit").await;
+	std::fs::remove_file(sc.local.join("t.txt")).unwrap();
+
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(
+		r2.remotely_trashed, 1,
+		"the local delete is mirrored: {r2:?}"
+	);
+	assert_eq!(r2.downloaded, 0, "the remote edit is NOT pulled: {r2:?}");
+	assert!(
+		read_eq(&sc.local, "u.txt", b"U-local"),
+		"the local copy must survive under local->remote"
+	);
+	assert_eq!(
+		r2.uploaded, 1,
+		"the local copy is re-pushed instead: {r2:?}"
+	);
+
+	let (_d, files) = list_remote_root(&sc).await;
+	assert!(
+		find_file(&files, "t.txt").is_none(),
+		"t.txt still on remote"
+	);
+	assert_eq!(
+		find_file(&files, "u.txt").unwrap().size,
+		b"U-local".len() as u64
+	);
+
+	sc.cleanup();
 }
 
-#[ignore = "blocked: needs a public per-pair mode-switch API (none exists) — see TODO"]
+/// MODE-21 — switching local->remote -> local-backup stops mirroring deletions from the next pass
+/// on (contrast MODE-02, where the same delete is propagated).
 #[shared_test_runtime]
 async fn mode_21_switch_l2r_to_local_backup_stops_mirroring_deletes() {
-	// plan: establish local->remote pair with w.txt synced; switch to local-backup; delete w.txt
-	// locally; sync -> w.txt STILL on remote, 0 deletions (contrast MODE-02).
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "w.txt", b"W");
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 1, "{r1:?}");
+
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::LocalBackup)
+		.await
+		.unwrap();
+	std::fs::remove_file(sc.local.join("w.txt")).unwrap();
+
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(
+		r2.remotely_trashed, 0,
+		"a backup mode never deletes: {r2:?}"
+	);
+	assert_eq!(
+		r2.held_deletions(),
+		0,
+		"not held either — never planned: {r2:?}"
+	);
+	let (_d, files) = list_remote_root(&sc).await;
+	assert!(
+		find_file(&files, "w.txt").is_some(),
+		"the backup copy must survive the local delete"
+	);
+
+	sc.cleanup();
 }
 
-#[ignore = "blocked: needs a public per-pair mode-switch API (none exists) — see TODO"]
+/// MODE-22 — a mode switch is prospective in the PASSES, not in the divergence: switching a backup
+/// pair to local->remote makes the deletions the backup mode had left standing pending under the
+/// new rules, and the very next pass propagates them.
+///
+/// (The stub this replaces expected the opposite — that a pre-switch local delete would never be
+/// mirrored. That would need the switch to rewrite the baseline to forget the deleted path, i.e. to
+/// act retroactively on history, which is exactly what `reconfigure_pair` promises NOT to do.
+/// `plan_pair` after a switch is how a caller sees the backlog before it is applied.)
 #[shared_test_runtime]
-async fn mode_22_switch_local_backup_to_l2r_future_deletes_only() {
-	// plan: local-backup, locally delete x.txt (survives on remote); switch to local->remote; a
-	// no-change pass must NOT retroactively delete x.txt; a later local delete of y.txt IS mirrored.
+async fn mode_22_switch_local_backup_to_l2r_applies_the_standing_divergence() {
+	let sc = single_client(SyncMode::LocalBackup).await;
+	write_file(&sc.local, "x.txt", b"X");
+	write_file(&sc.local, "y.txt", b"Y");
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 2, "{r1:?}");
+
+	// Under local-backup the delete is not propagated: x.txt survives remotely.
+	std::fs::remove_file(sc.local.join("x.txt")).unwrap();
+	let r2 = sc.sync().await;
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+
+	// The dry run shows the standing divergence BEFORE any pass acts on it.
+	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert!(
+		plan.actions
+			.iter()
+			.any(|a| a.rel_path == "x.txt" && a.kind == PlannedActionKind::TrashRemote),
+		"the switch makes the standing local delete a pending remote trash: {plan:?}"
+	);
+
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(
+		r3.remotely_trashed, 1,
+		"the standing deletion is propagated under the new mode: {r3:?}"
+	);
+	assert_eq!(
+		r3.uploaded, 0,
+		"no re-transfer from the mode change: {r3:?}"
+	);
+	assert_eq!(r3.downloaded, 0, "{r3:?}");
+
+	// A later local delete is mirrored the same way, and y.txt was never re-transferred.
+	std::fs::remove_file(sc.local.join("y.txt")).unwrap();
+	let r4 = sc.sync().await;
+	assert_eq!(r4.remotely_trashed, 1, "{r4:?}");
+	let (_d, files) = list_remote_root(&sc).await;
+	assert!(files.is_empty(), "both deletions landed: {files:?}");
+
+	sc.cleanup();
+}
+
+/// Re-registering an established pair with a different mode is refused rather than silently
+/// re-pointing it; the same mode is idempotent.
+#[shared_test_runtime]
+async fn mode_add_pair_refuses_a_silent_mode_change() {
+	let sc = single_client(SyncMode::TwoWay).await;
+
+	let same = sc
+		.engine
+		.add_pair(sc.local.clone(), sc.remote, SyncMode::TwoWay)
+		.await
+		.expect("re-registering the same pair is idempotent");
+	assert_eq!(same, sc.pair, "the same roots return the same id");
+
+	let error = sc
+		.engine
+		.add_pair(sc.local.clone(), sc.remote, SyncMode::LocalBackup)
+		.await
+		.expect_err("a different mode must be refused")
+		.to_string();
+	assert!(
+		error.contains("reconfigure_pair"),
+		"the refusal must point at the explicit call: {error}"
+	);
+	assert_eq!(
+		sc.engine.list_pairs().await.unwrap()[0].mode,
+		SyncMode::TwoWay,
+		"the refused call left the pair alone"
+	);
+
+	sc.cleanup();
 }
 
 // ============================================================================
