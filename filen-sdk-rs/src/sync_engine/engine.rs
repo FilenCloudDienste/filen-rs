@@ -909,6 +909,27 @@ impl SyncEngine {
 		})
 	}
 
+	/// Set `pair`'s mass-delete threshold, from the next pass on. Persisted with the pair, so it
+	/// survives a restart; read it back on the pair's [`PairRecord`].
+	///
+	/// The threshold is the only part of the guard that is configurable. The other holds — an
+	/// incomplete local scan, a first sync against a populated destination, a remote view that has
+	/// never converged or came back wholly empty — are about whether this pass's evidence can be
+	/// TRUSTED at all, and stay in force under every setting including
+	/// [`DeleteGuard::unlimited`].
+	pub async fn set_delete_guard(&self, pair: PairId, guard: DeleteGuard) -> Result<(), Error> {
+		let changed = self
+			.store
+			.lock()
+			.await
+			.set_delete_guard(pair, guard)
+			.map_err(|e| db_error(e, "setting the delete guard"))?;
+		if changed == 0 {
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		Ok(())
+	}
+
 	/// Every sync pair this engine has registered, in registration order.
 	pub async fn list_pairs(&self) -> Result<Vec<PairRecord>, Error> {
 		self.store
@@ -1189,7 +1210,7 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 	} else {
 		Vec::new()
 	};
-	let decision = guard::screen(executable, state, DeleteGuard::default());
+	let decision = guard::screen(executable, state, prep.record.delete_guard);
 	let pass_token = (!decision.held.is_empty()).then(|| deletion_batch_token(&decision.held));
 	Screened {
 		conflicts,

@@ -15,11 +15,18 @@
 use std::{collections::HashSet, fmt};
 
 use super::plan::SyncAction;
+use crate::{Error, ErrorKind};
 
-/// Deletion-volume policy. The limit for a pass is `max(floor, ratio * tracked_items)`: small
-/// deletes are always allowed (the floor), and beyond that up to a fraction of the tracked set.
+/// Deletion-volume policy for one sync pair. The limit for a pass is
+/// `max(floor, ratio × tracked_items)`: small deletes are always allowed (the floor), and beyond
+/// that up to a fraction of the tracked set.
+///
+/// It is per-pair persistent state: [`add_pair`](super::SyncEngine::add_pair) starts a pair on
+/// [`default`](Self::default), and [`set_delete_guard`](super::SyncEngine::set_delete_guard)
+/// changes it for every later pass. A pair's current setting is on its
+/// [`PairRecord`](super::PairRecord).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DeleteGuard {
+pub struct DeleteGuard {
 	floor: usize,
 	ratio: f64,
 }
@@ -38,15 +45,45 @@ impl Default for DeleteGuard {
 }
 
 impl DeleteGuard {
-	/// A guard that never trips on volume (a power-user opt-out); the scan-incomplete precondition
-	/// still applies.
-	// Exercised by the guard unit tests; retained as the "disable the volume floor" API surface.
-	#[allow(dead_code)]
-	pub(crate) fn unlimited() -> Self {
+	/// A guard allowing up to `max(floor, ratio × tracked)` deletions per pass.
+	///
+	/// `ratio` must be a real number in `0.0..=1.0`. A ratio above 1 could only ever exceed the
+	/// tracked-item count — i.e. never trip — which [`unlimited`](Self::unlimited) says explicitly
+	/// instead, and NaN would silently compare false against every limit. A `floor` of 0 is allowed
+	/// and means "the ratio alone decides".
+	pub fn new(floor: usize, ratio: f64) -> Result<Self, Error> {
+		if !(0.0..=1.0).contains(&ratio) {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!(
+					"a delete-guard ratio must be between 0.0 and 1.0 (got {ratio}); use \
+					 DeleteGuard::unlimited() to disable the volume check entirely"
+				),
+			));
+		}
+		Ok(Self { floor, ratio })
+	}
+
+	/// A guard that never trips on volume (a power-user opt-out).
+	///
+	/// The scan-incomplete, first-sync, un-converged and wholly-empty-remote holds still apply:
+	/// those are about whether the pass's evidence can be TRUSTED, not about how much it would
+	/// delete, and no threshold setting can make an unread tree readable.
+	pub fn unlimited() -> Self {
 		Self {
 			floor: usize::MAX,
 			ratio: 1.0,
 		}
+	}
+
+	/// The minimum number of deletions always allowed, whatever the ratio works out to.
+	pub fn floor(&self) -> usize {
+		self.floor
+	}
+
+	/// The fraction of the tracked set allowed beyond the floor.
+	pub fn ratio(&self) -> f64 {
+		self.ratio
 	}
 
 	fn limit(&self, tracked: usize) -> usize {
@@ -460,6 +497,49 @@ mod tests {
 		let decision = screen(actions, state, DeleteGuard::default());
 		assert_eq!(decision.safe, vec![create_remote_dir("other")]);
 		assert_eq!(decision.held, vec![del("gone")]);
+	}
+
+	#[test]
+	fn a_configured_guard_moves_the_threshold_both_ways() {
+		// A stricter-than-default guard: 3 deletions against 100 tracked would sail past the
+		// default (limit 50) but exceeds max(2, 0.0 * 100) = 2.
+		let strict = DeleteGuard::new(2, 0.0).unwrap();
+		let actions: Vec<_> = (0..3).map(|i| del(&format!("d{i}"))).collect();
+		assert_eq!(
+			screen(actions.clone(), established(100), strict).reason,
+			Some(GuardReason::ExceededThreshold {
+				deletions: 3,
+				limit: 2,
+			})
+		);
+		assert!(
+			screen(actions, established(100), DeleteGuard::default())
+				.reason
+				.is_none(),
+			"the same batch is routine under the default guard"
+		);
+
+		// A looser one: 20 deletions of a 20-item pair trips the default (limit 10) but not a
+		// whole-tree ratio.
+		let loose = DeleteGuard::new(10, 1.0).unwrap();
+		let wipe: Vec<_> = (0..20).map(|i| del(&format!("f{i}"))).collect();
+		assert!(screen(wipe, established(20), loose).reason.is_none());
+	}
+
+	#[test]
+	fn a_guard_ratio_outside_zero_to_one_is_rejected_rather_than_clamped() {
+		assert_eq!(DeleteGuard::new(10, 0.5).unwrap().ratio(), 0.5);
+		assert_eq!(DeleteGuard::new(7, 1.0).unwrap().floor(), 7);
+		for bad in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+			let error = DeleteGuard::new(10, bad)
+				.err()
+				.unwrap_or_else(|| panic!("ratio {bad} must be refused"))
+				.to_string();
+			assert!(
+				error.contains("between 0.0 and 1.0"),
+				"the refusal must name the range: {error}"
+			);
+		}
 	}
 
 	#[test]
