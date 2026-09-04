@@ -12,18 +12,16 @@
 //! unit: executing half of it only produces a server rejection every pass. Pure and synchronous so
 //! the policy is fully unit-testable.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt};
 
 use super::plan::SyncAction;
 
 /// Deletion-volume policy. The limit for a pass is `max(floor, ratio * tracked_items)`: small
 /// deletes are always allowed (the floor), and beyond that up to a fraction of the tracked set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DeleteGuard {
-	/// Always allow at least this many deletions, regardless of the ratio.
-	pub(crate) floor: usize,
-	/// Allow deletions up to this fraction of the tracked-item count (beyond the floor).
-	pub(crate) ratio: f64,
+	floor: usize,
+	ratio: f64,
 }
 
 impl Default for DeleteGuard {
@@ -59,7 +57,7 @@ impl DeleteGuard {
 
 /// Why the guard held this pass's deletions.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GuardReason {
+pub enum GuardReason {
 	/// The local scan did not complete, so apparent deletions may be phantom (an unmounted root,
 	/// an unreadable subtree). All deletions are held unconditionally.
 	ScanIncomplete,
@@ -84,8 +82,34 @@ pub(crate) enum GuardReason {
 	/// permanent end state of that deletion, so holding it would never release and the pair would
 	/// keep the local copy forever.
 	RemoteEmptied { deletions: usize },
-	/// The deletion count exceeded the configured limit for the tracked-item count.
+	/// The deletion count exceeded the configured limit for the tracked-item count (see
+	/// [`DeleteGuard`]).
 	ExceededThreshold { deletions: usize, limit: usize },
+}
+
+impl fmt::Display for GuardReason {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::ScanIncomplete => f.write_str(
+				"the local scan did not complete, so an apparently-deleted item may just be unread",
+			),
+			Self::FirstSyncWithDeletions { deletions } => write!(
+				f,
+				"first sync of this pair: {deletions} pre-existing destination item(s) would be deleted"
+			),
+			Self::RemoteUnconverged { deletions } => write!(
+				f,
+				"the remote view has never converged, so {deletions} apparent remote deletion(s) are untrustworthy"
+			),
+			Self::RemoteEmptied { deletions } => write!(
+				f,
+				"the remote listed NOTHING at all while {deletions} item(s) are still tracked"
+			),
+			Self::ExceededThreshold { deletions, limit } => {
+				write!(f, "{deletions} deletion(s) exceed the limit of {limit}")
+			}
+		}
+	}
 }
 
 /// The screened plan: the actions safe to apply now, plus any deletions held back (and why).

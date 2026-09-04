@@ -21,7 +21,11 @@ use super::{
 	baseline::{
 		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PendingRow,
 	},
-	guard::{self, DeleteGuard},
+	guard::{self, DeleteGuard, GuardReason},
+	outcome::{
+		PlanOutcome, PlannedAction, PlannedConflict, RefuseReason, UnsyncablePath, planned_action,
+		planned_conflict,
+	},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
 };
@@ -511,15 +515,6 @@ pub struct SyncEngine {
 	approvals: Mutex<HashMap<PairId, String>>,
 }
 
-/// Why the engine refused to act on a pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RefuseReason {
-	/// Two remote items resolve to the same case-insensitive path.
-	RemoteCollision,
-	/// Two local items normalize to the same path.
-	LocalCollision,
-}
-
 /// The read-only inputs to a pass, shared by planning and applying.
 struct Prepared {
 	record: PairRecord,
@@ -539,6 +534,23 @@ struct Prepared {
 	holds: plan::PassHolds,
 	dirs: Vec<CacheableDir<'static>>,
 	files: Vec<CacheableFile<'static>>,
+}
+
+impl Prepared {
+	/// Map internal actions onto the public [`PlannedAction`] shape, resolving each one's size from
+	/// whichever side of this pass knows it.
+	fn planned(&self, actions: &[SyncAction]) -> Vec<PlannedAction> {
+		actions
+			.iter()
+			.map(|action| planned_action(action, &self.local_scan.nodes, &self.remote_view.nodes))
+			.collect()
+	}
+
+	/// Every path this pass will not act on, and why — reported identically by the dry run and by
+	/// the pass itself, so a caller sees the same list either way.
+	fn unsyncable(&self) -> Vec<UnsyncablePath> {
+		Vec::new()
+	}
 }
 
 /// Which side wins when a caller resolves a held two-way conflict via
@@ -633,29 +645,6 @@ fn resolution_entry(
 		}),
 		ConflictResolution::KeepBoth => unreachable!("normalized to KeepRemote above"),
 	}
-}
-
-/// What a pass WOULD do, from [`SyncEngine::plan_pair`] — a dry run that touches neither side.
-/// Actions are rendered as human-readable one-liners rather than the engine's internal action
-/// type, which is deliberately not public API.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlanOutcome {
-	/// The pass would refuse to run — a local or remote name collision makes a 1:1 mapping
-	/// impossible — and would apply nothing.
-	Refused { reason: String },
-	Planned {
-		/// One line per action the pass would apply, in apply order.
-		actions: Vec<String>,
-		/// Deletions the mass-delete guard would hold back (not in `actions`).
-		held_deletions: Vec<String>,
-		/// Paths that would be reported as two-way conflicts — held, never applied.
-		conflicts: Vec<String>,
-		/// Why the guard would hold deletions, when it would.
-		guard_message: Option<String>,
-		/// Set alongside `held_deletions`: the token identifying that batch, for
-		/// [`SyncEngine::approve_deletions`].
-		pass_token: Option<String>,
-	},
 }
 
 impl SyncEngine {
@@ -902,18 +891,21 @@ impl SyncEngine {
 	/// baseline. A pending deletion approval is neither consumed nor honoured here.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
 		let prep = self.prepare(pair).await?;
-		if let Some(refusal) = refusal(&prep) {
-			return Ok(PlanOutcome::Refused {
-				reason: format!("name collision ({refusal:?})"),
+		if let Some(reason) = refusal(&prep) {
+			return Ok(PlanOutcome {
+				refused: Some(reason),
+				..PlanOutcome::default()
 			});
 		}
 		let screened = reconcile_and_screen(&prep, screen_state(&prep));
-		Ok(PlanOutcome::Planned {
-			actions: screened.decision.safe.iter().map(describe).collect(),
-			held_deletions: screened.decision.held.iter().map(describe).collect(),
-			conflicts: screened.conflicts,
-			guard_message: screened.decision.reason.map(|reason| format!("{reason:?}")),
+		Ok(PlanOutcome {
+			actions: prep.planned(&screened.decision.safe),
+			held: prep.planned(&screened.decision.held),
+			held_reason: screened.decision.reason,
 			pass_token: screened.pass_token,
+			conflicts: screened.conflicts,
+			unsyncable: prep.unsyncable(),
+			refused: None,
 		})
 	}
 
@@ -1001,9 +993,12 @@ impl SyncEngine {
 			mode: prep.record.mode,
 		});
 
+		report.unsyncable = prep.unsyncable();
+
 		if let Some(refusal) = refusal(&prep) {
 			tracing::debug!("sync_once[pair {pair}]: refused — {refusal:?}");
-			let reason = format!("name collision ({refusal:?})");
+			let reason = refusal.to_string();
+			report.refused = Some(refusal);
 			observer(SyncEvent::Refused {
 				reason: reason.clone(),
 			});
@@ -1035,13 +1030,15 @@ impl SyncEngine {
 		}
 		let decision = screened.decision;
 		report.conflicts = screened.conflicts;
-		// `held` can also carry the create half of a held type flip; the report counts deletions.
-		report.held_deletions = decision.held.iter().filter(|a| a.is_delete()).count();
-		report.guard_message = decision.reason.map(|reason| format!("{reason:?}"));
+		// `held` can also carry the create half of a held type flip; `held_deletions()` counts only
+		// the deletions.
+		report.held = prep.planned(&decision.held);
+		report.guard = decision.reason.clone();
 		report.deletion_token = screened.pass_token;
 		report.deferred_paths = screened.deferred_paths;
 
-		for rel_path in &report.conflicts {
+		for conflict in &report.conflicts {
+			let rel_path = &conflict.rel_path;
 			// HOLD the conflict in the baseline: the path (and its subtree) is excluded from
 			// planning until `resolve_conflict` picks a winner, instead of being re-surfaced,
 			// unresolvable, on every pass.
@@ -1060,10 +1057,14 @@ impl SyncEngine {
 				rel_path: rel_path.clone(),
 			});
 		}
-		if report.held_deletions > 0 {
+		if report.held_deletions() > 0 {
 			observer(SyncEvent::DeletionsHeld {
-				count: report.held_deletions,
-				reason: report.guard_message.clone().unwrap_or_default(),
+				count: report.held_deletions(),
+				reason: report
+					.guard
+					.as_ref()
+					.map(GuardReason::to_string)
+					.unwrap_or_default(),
 				pass_token: report.deletion_token.clone().unwrap_or_default(),
 			});
 		}
@@ -1074,7 +1075,7 @@ impl SyncEngine {
 		if decision.safe.is_empty() {
 			tracing::debug!(
 				"sync_once[pair {pair}]: nothing to apply ({} deletion(s) held, {} conflict(s), {} path(s) deferred)",
-				report.held_deletions,
+				report.held_deletions(),
 				report.conflicts.len(),
 				report.deferred_paths,
 			);
@@ -1116,7 +1117,7 @@ impl SyncEngine {
 			report.moved_remote,
 			report.moved_local,
 			report.conflicts.len(),
-			report.held_deletions,
+			report.held_deletions(),
 			report.deferred_paths,
 			report.errors.len(),
 		);
@@ -1146,7 +1147,7 @@ fn refusal(prep: &Prepared) -> Option<RefuseReason> {
 /// A reconciled, guard-screened pass.
 struct Screened {
 	/// Paths surfaced as two-way conflicts (held, never applied).
-	conflicts: Vec<String>,
+	conflicts: Vec<PlannedConflict>,
 	/// Every executable action in apply order — what an APPROVED pass runs, held deletions and all.
 	all: Vec<SyncAction>,
 	decision: guard::GuardDecision,
@@ -1171,8 +1172,14 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		.into_iter()
 		.partition(|a| matches!(a, SyncAction::Conflict { .. }));
 	let conflicts = conflict_actions
-		.into_iter()
-		.map(|a| a.rel_path().to_string())
+		.iter()
+		.map(|a| {
+			planned_conflict(
+				a.rel_path(),
+				&prep.local_scan.nodes,
+				&prep.remote_view.nodes,
+			)
+		})
 		.collect();
 	// The unscreened list is only needed to release an approved batch, which cannot happen unless
 	// the pass plans a deletion at all — so a pure-transfer pass (a first sync, say) never pays for
@@ -1227,11 +1234,6 @@ fn screen_state(prep: &Prepared) -> guard::ScreenState {
 	}
 }
 
-/// One human-readable line describing an action, for the dry-run preview.
-fn describe(action: &SyncAction) -> String {
-	action.describe()
-}
-
 fn db_error(error: rusqlite::Error, context: &str) -> Error {
 	Error::custom_with_source(ErrorKind::Internal, error, Some(context.to_string()))
 }
@@ -1256,6 +1258,12 @@ mod tests {
 
 	/// The pair whose writes the pending-write tests record.
 	const PAIR: PairId = 1;
+
+	/// The reconciler's own one-line rendering of an action — what these tests assert plans by.
+	/// (The public [`PlannedAction`] rendering is pinned in `outcome.rs`.)
+	fn describe(action: &SyncAction) -> String {
+		action.describe()
+	}
 
 	/// A client with no account and no network behind it. [`SyncEngine::open`] only hands it to
 	/// the cache to subscribe each pair's remote root, and a subscription the cache refuses leaves

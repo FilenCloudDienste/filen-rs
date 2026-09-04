@@ -316,7 +316,7 @@ async fn basic_06_idempotent_second_pass_push() {
 	assert_eq!(r2.moved_remote, 0, "{r2:?}");
 	assert_eq!(r2.moved_local, 0, "{r2:?}");
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
-	assert_eq!(r2.held_deletions, 0, "{r2:?}");
+	assert_eq!(r2.held_deletions(), 0, "{r2:?}");
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	sc.cleanup();
 }
@@ -1183,7 +1183,8 @@ async fn basic_23_local_backup_does_not_mirror_delete() {
 		"backup must not trash on source delete: {r2:?}"
 	);
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"backup absorbs the delete, not holds it: {r2:?}"
 	);
 
@@ -1345,7 +1346,8 @@ async fn basic_add_delete_propagates_push() {
 	assert_eq!(r2.remotely_trashed, 1, "exactly one delete: {r2:?}");
 	assert_eq!(r2.uploaded, 0, "{r2:?}");
 	assert_eq!(
-		r2.held_deletions, 0,
+		r2.held_deletions(),
+		0,
 		"1 of 3 is below the mass-delete floor: {r2:?}"
 	);
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
