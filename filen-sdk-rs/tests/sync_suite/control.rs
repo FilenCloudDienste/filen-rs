@@ -5,8 +5,9 @@
 //! made while the engine was down, and watch-mode lifecycle — rather than the per-file diff logic.
 //!
 //! The PUBLIC engine surface is intentionally small: `open`, `add_pair` (idempotent for the same
-//! `(local, remote)`), `sync_once`, `sync_once_observed`, `watch`, `watch_observed`. There is no
-//! public `pause`/`resume`, `remove_pair`, `reconfigure`, status query, clean-stop, or
+//! `(local, remote, mode)`, refused for overlapping roots), `remove_pair`, `reconfigure_pair`,
+//! `sync_once`, `sync_once_observed`, `watch`, `watch_observed`. There is no public
+//! `pause`/`resume`, root reconfigure, status query, clean-stop, or
 //! baseline-corruption seam. Every plan item that depends on one of those — and every fault-
 //! injection item (mid-pass stop, crash, corrupted baseline) — is written as an `#[ignore]` stub
 //! that records its plan, because faking it would assert nothing real.
@@ -104,19 +105,25 @@ fn has_file(files: &[filen_sdk_rs::fs::file::RemoteFile], name: &str) -> bool {
 async fn control_04_add_second_pair_disjoint_both_converge() {
 	// P1: localA -> remoteA (push). P2: localB <- remoteB (pull). Disjoint roots, one engine.
 	let resources = test_utils::RESOURCES.get_resources().await;
-	let remote_a: Uuid = resources.dir.uuid();
-	let cache = TestCache::new(&resources.client, remote_a).await;
-	wait_for_converged_resync(&cache.messages, remote_a, 0, CACHE_CONVERGE_TIMEOUT).await;
+	let root: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, root).await;
+	wait_for_converged_resync(&cache.messages, root, 0, CACHE_CONVERGE_TIMEOUT).await;
 
-	// A second remote root inside the same converged cache subtree.
-	let sub_b = cache
+	// A subfolder per pair, inside the same converged cache subtree. They must be SIBLINGS: a pair
+	// rooted at the shared root would contain the other's folder, which `add_pair` refuses (and
+	// which would have P1 mirror the absence of P2's items).
+	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
+	let sub_a = cache
 		.client
-		.create_dir(
-			&DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir)),
-			"p2_remote",
-		)
+		.create_dir(&root_dt, "p1_remote")
 		.await
 		.unwrap();
+	let sub_b = cache
+		.client
+		.create_dir(&root_dt, "p2_remote")
+		.await
+		.unwrap();
+	let remote_a: Uuid = sub_a.uuid();
 	let remote_b: Uuid = sub_b.uuid();
 	// Seed a pending remote file for P2.
 	let b_builder = cache
@@ -686,14 +693,11 @@ async fn control_add_during_watch_live_pickup() {
 // Missing public surface (verified against the API reference + black-box use):
 //   * pause(pair) / resume(pair)         -> CONTROL-01, -02, -03, -18, -21, -24
 //   * remove_pair(pair)                  -> CONTROL-05, -06, -19, -25, remove-mid-pass
-//   * reconfigure mode/root              -> CONTROL-16, -17, -24
+//   * reconfigure ROOT                   -> CONTROL-17 (the MODE half is CONTROL-16, implemented)
 //   * pair status query / registry list  -> CONTROL-23, auto-load, idempotent-verbs
 //   * clean stop / abrupt-kill harness   -> CONTROL-14, -15, -18, remove-mid-pass
 //   * baseline corruption/inspection     -> CONTROL-13, partially-corrupted-config
 //   * control-transition event stream    -> control-transition-events
-// CONTROL-08/09 (nested roots) need a documented overlap policy to assert against; the public
-// add_pair neither rejects nor documents single-owner behavior, so a meaningful assertion is
-// blocked on that decision.
 // ===========================================================================
 
 #[ignore = "blocked: no public pause/resume — needs control-plane API (pause halts new work, resume continues)"]
@@ -1120,18 +1124,191 @@ async fn control_add_partially_corrupted_multipair_config_isolated() {
 	// errored, never wipes a side), clear warning names P2, startup does not fail wholesale.
 }
 
-#[ignore = "blocked: no documented nested-local-root overlap policy — add_pair neither rejects nor documents single-owner behavior to assert against"]
+/// CONTROL-08 — overlapping LOCAL roots are refused, in every direction, with an error naming the
+/// pair that already owns the folder. Two pairs sharing a subtree would each read the other's
+/// writes as foreign changes and never converge, so the overlap is rejected at registration rather
+/// than arbitrated later.
 #[shared_test_runtime]
 async fn control_08_nested_local_roots_deterministic() {
-	// plan: P1 local /sync/data; attempt P2 local /sync/data/sub; assert rejection w/ clear error OR
-	// accepted w/ deterministic single-owner of the overlap (a file in /sub acted on by exactly one
-	// pair, never double-uploaded/deleted).
+	let (resources, cache, _root, local) = raw_setup("c08").await;
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	std::fs::create_dir_all(local.join("sub")).unwrap();
+	let outer = local.parent().unwrap().to_path_buf();
+
+	// Two SIBLING remote folders, so the local roots are the only thing under test.
+	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
+	let mine = cache.client.create_dir(&root_dt, "c08_mine").await.unwrap();
+	let other = cache
+		.client
+		.create_dir(&root_dt, "c08_other")
+		.await
+		.unwrap();
+
+	let p1 = engine
+		.add_pair(local.clone(), mine.uuid(), SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	for (label, candidate, expected) in [
+		(
+			"the same folder",
+			local.clone(),
+			"already syncs the local root",
+		),
+		(
+			"a folder inside it",
+			local.join("sub"),
+			"is inside sync pair",
+		),
+		("a folder containing it", outer, "contains sync pair"),
+	] {
+		let error = match engine
+			.add_pair(candidate.clone(), other.uuid(), SyncMode::TwoWay)
+			.await
+		{
+			Ok(id) => panic!("{label} ({candidate:?}) was accepted as pair {id}"),
+			Err(error) => error.to_string(),
+		};
+		assert!(
+			error.contains(expected),
+			"{label}: the refusal must say how the roots overlap, got {error}"
+		);
+	}
+
+	// Every refusal left the registry untouched: the original pair, and only it, is registered.
+	let pairs = engine.list_pairs().await.unwrap();
+	assert_eq!(pairs.len(), 1, "{pairs:?}");
+	assert_eq!(pairs[0].id, p1);
+
+	// A disjoint local root against the second remote is still accepted.
+	let elsewhere = fresh_local_dir("c08b");
+	engine
+		.add_pair(elsewhere.clone(), other.uuid(), SyncMode::TwoWay)
+		.await
+		.expect("a disjoint pair is accepted");
+
+	std::fs::remove_dir_all(&local).ok();
+	std::fs::remove_dir_all(&elsewhere).ok();
 }
 
-#[ignore = "blocked: no documented nested-remote-root overlap policy — needs the engine's overlap contract to assert against"]
+/// (add) — the overlap refusal must hold when two registrations run CONCURRENTLY, which is how an
+/// app registering its pairs at startup issues them. The check reads the registry and then writes
+/// to it with an await in between, so without serialization both calls see a registry neither has
+/// written to yet and both commit — leaving exactly the overlapping pair of pairs that never
+/// converges.
+#[shared_test_runtime]
+async fn control_add_concurrent_overlapping_registrations_refused() {
+	let (resources, cache, _root, local) = raw_setup("c08c").await;
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let nested = local.join("sub");
+	std::fs::create_dir_all(&nested).unwrap();
+
+	// Two SIBLING remote folders, so the nested LOCAL roots are the only overlap.
+	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
+	let mine = cache
+		.client
+		.create_dir(&root_dt, "c08c_mine")
+		.await
+		.unwrap();
+	let other = cache
+		.client
+		.create_dir(&root_dt, "c08c_other")
+		.await
+		.unwrap();
+
+	let (outer, inner) = tokio::join!(
+		engine.add_pair(local.clone(), mine.uuid(), SyncMode::TwoWay),
+		engine.add_pair(nested.clone(), other.uuid(), SyncMode::TwoWay),
+	);
+	assert!(
+		outer.is_ok() != inner.is_ok(),
+		"exactly one of two overlapping registrations may win: {outer:?} / {inner:?}"
+	);
+	let pairs = engine.list_pairs().await.unwrap();
+	assert_eq!(
+		pairs.len(),
+		1,
+		"the refused registration must leave nothing behind: {pairs:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// CONTROL-09 — overlapping REMOTE roots are refused: the same remote folder outright, and a
+/// nested one whenever the cache can relate the two uuids (see `PairOverlap`'s note on that being
+/// best-effort).
 #[shared_test_runtime]
 async fn control_09_nested_remote_roots_deterministic() {
-	// plan: P1 localA <-> remote/docs; attempt P2 localB <-> remote/docs/reports; assert reject w/
-	// clear msg OR deterministic single-owner of the overlap, no concurrent upload-over+delete, no
-	// infinite ping-pong.
+	let (resources, cache, _root, local_a) = raw_setup("c09a").await;
+	let local_b = fresh_local_dir("c09b");
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+
+	// The pair's root is a SUBFOLDER, so a later sibling folder is genuinely disjoint from it.
+	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
+	let docs = cache.client.create_dir(&root_dt, "c09_docs").await.unwrap();
+	let remote = docs.uuid();
+	let p1 = engine
+		.add_pair(local_a.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	// The SAME remote folder from a different local root: refused without needing the cache.
+	let error = engine
+		.add_pair(local_b.clone(), remote, SyncMode::TwoWay)
+		.await
+		.expect_err("two pairs may not share one remote root")
+		.to_string();
+	assert!(
+		error.contains("already syncs the remote root"),
+		"the refusal must name the conflict: {error}"
+	);
+
+	// A folder INSIDE the pair's remote root, once the cache has learned about it.
+	let nested = cache
+		.client
+		.create_dir(
+			&DirType::<Normal>::Dir(std::borrow::Cow::Owned(docs.clone())),
+			"reports",
+		)
+		.await
+		.unwrap();
+	assert!(
+		poll_for_item(cache.db_path(), nested.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed the nested remote folder"
+	);
+	let error = engine
+		.add_pair(local_b.clone(), nested.uuid(), SyncMode::TwoWay)
+		.await
+		.expect_err("a remote root inside another pair's root must be refused")
+		.to_string();
+	assert!(
+		error.contains("inside sync pair"),
+		"the refusal must name the nesting: {error}"
+	);
+
+	// Only ONE pair is registered: every refusal left the registry alone.
+	let pairs = engine.list_pairs().await.unwrap();
+	assert_eq!(pairs.len(), 1, "{pairs:?}");
+	assert_eq!(pairs[0].id, p1);
+
+	// Disjoint roots are still fine — the check rejects overlap, not multi-pair use.
+	let sibling = cache
+		.client
+		.create_dir(&root_dt, "c09_sibling")
+		.await
+		.unwrap();
+	engine
+		.add_pair(local_b.clone(), sibling.uuid(), SyncMode::TwoWay)
+		.await
+		.expect("a disjoint pair is accepted");
+	assert_eq!(engine.list_pairs().await.unwrap().len(), 2);
+
+	std::fs::remove_dir_all(&local_a).ok();
+	std::fs::remove_dir_all(&local_b).ok();
 }
