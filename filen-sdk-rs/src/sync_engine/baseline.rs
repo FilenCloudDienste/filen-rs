@@ -227,6 +227,10 @@ pub struct PairRecord {
 	/// [`SyncEngine::set_delete_guard`](super::SyncEngine::set_delete_guard) (or the default it was
 	/// registered with).
 	pub delete_guard: DeleteGuard,
+	/// Whether the pair is [`paused`](super::SyncEngine::pause_pair) — the same answer
+	/// [`SyncEngine::is_paused`](super::SyncEngine::is_paused) gives, so a caller listing the pairs
+	/// does not have to ask again per pair.
+	pub paused: bool,
 }
 
 /// A registered pair's id, handed back by [`SyncEngine::add_pair`](super::SyncEngine::add_pair).
@@ -371,7 +375,7 @@ impl BaselineStore {
 	pub(crate) fn pair(&self, id: PairId) -> rusqlite::Result<Option<PairRecord>> {
 		self.conn
 			.query_row(
-				"SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio FROM sync_pairs WHERE id = ?1",
+				"SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio, paused FROM sync_pairs WHERE id = ?1",
 				params![id],
 				Self::row_to_pair,
 			)
@@ -380,7 +384,7 @@ impl BaselineStore {
 
 	pub(crate) fn list_pairs(&self) -> rusqlite::Result<Vec<PairRecord>> {
 		self.conn
-			.prepare("SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio FROM sync_pairs ORDER BY id")?
+			.prepare("SELECT id, local_root, remote_root, mode, guard_floor, guard_ratio, paused FROM sync_pairs ORDER BY id")?
 			.query_map([], Self::row_to_pair)?
 			.collect()
 	}
@@ -446,6 +450,7 @@ impl BaselineStore {
 			remote_root: row.get("remote_root")?,
 			mode: SyncMode::from_i64(mode_raw).ok_or_else(|| corrupt("mode", mode_raw))?,
 			delete_guard,
+			paused: row.get("paused")?,
 		})
 	}
 
@@ -1225,6 +1230,40 @@ mod tests {
 
 		assert!(store.load_pending(NOW, GRACE).unwrap().is_empty());
 		assert_eq!(pending_count(&store), 0, "the orphan was deleted");
+	}
+
+	/// The listed record carries the flag, so a caller rendering the pairs does not have to ask per
+	/// pair — and reads it from the row, not from a default the record was built with.
+	#[test]
+	fn a_listed_pair_reports_whether_it_is_paused() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (running, _) = store
+			.create_pair("/home/u/running", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (paused, _) = store
+			.create_pair("/home/u/paused", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		assert!(
+			store.list_pairs().unwrap().iter().all(|pair| !pair.paused),
+			"a new pair must list as running"
+		);
+
+		store.set_paused(paused, true).unwrap();
+		let listed = store.list_pairs().unwrap();
+		assert_eq!(
+			listed
+				.iter()
+				.filter(|pair| pair.paused)
+				.map(|pair| pair.id)
+				.collect::<Vec<_>>(),
+			vec![paused],
+			"list_pairs did not report the paused pair"
+		);
+		assert!(store.pair(paused).unwrap().unwrap().paused);
+		assert!(!store.pair(running).unwrap().unwrap().paused);
+
+		store.set_paused(paused, false).unwrap();
+		assert!(!store.pair(paused).unwrap().unwrap().paused, "the resume");
 	}
 
 	#[test]
