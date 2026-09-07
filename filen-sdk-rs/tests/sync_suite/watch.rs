@@ -1678,12 +1678,92 @@ async fn watch_26_remove_pair_stops_events() {}
 #[shared_test_runtime]
 async fn watch_add_remote_burst_coalesces() {}
 
-// (add) — net interval restarts after an event pass (not redundant right after) yet not starvable.
-// The interval is configurable now, but the premise is not the loop's contract: the safety net is a
-// plain `tokio::time::Interval` that an event pass does NOT reset, so a net tick falling just after
-// an event pass fires anyway. Whether it SHOULD reset is an owner call; until then there is nothing
-// to assert. Plan (if it should): drive event passes during the interval, assert no redundant net
-// pass immediately after, but a net pass still fires over a long idle stretch.
-#[ignore = "blocked: needs an owner decision on whether an event pass resets the safety-net interval — see TODO"]
+// ============================================================================
+// (add) — the safety net measures time since the last SUCCESSFUL pass
+// ============================================================================
+
+/// A stream of event passes, each well inside the net interval, must keep the net from firing at
+/// all: every successful pass restarts it. The other half is that this cannot starve the net — once
+/// the events stop, the net passes come as usual.
+///
+/// The trigger is a file created and deleted again inside one debounce window, so each pass wakes,
+/// finds nothing to do and writes nothing: a real upload would put its own cache announcement into
+/// the pass count and make the bound below meaningless.
 #[shared_test_runtime]
-async fn watch_add_net_interval_resets_but_not_starved() {}
+async fn watch_add_net_interval_resets_but_not_starved() {
+	const NET: Duration = Duration::from_secs(6);
+	const SPACING: Duration = Duration::from_secs(3);
+	const TRIGGERS: usize = 20;
+
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::LocalToRemote).await;
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_secs(1),
+				safety_net: NET,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	// Settle: the initial pass and whatever the registrations themselves triggered must be spent
+	// before the pass count means anything.
+	assert!(
+		wait_until(WATCH_SETTLE, || log.passes() >= 1).await,
+		"the watch never ran its initial pass"
+	);
+	tokio::time::sleep(NET * 2).await;
+	let before = log.passes();
+
+	// One no-op trigger every SPACING, for well over three net intervals — each waited out before
+	// the next goes in. That wait is what gives the count below its meaning: two triggers landing
+	// inside one in-flight pass coalesce (the dirty signal holds a single permit), and the triggered
+	// passes they cost would leave exactly the room under the bound that the net passes this test is
+	// looking for would take. Awaiting each one pins the triggered count at TRIGGERS, so any surplus
+	// is the net.
+	for i in 0..TRIGGERS {
+		let expected = log.passes() + 1;
+		let name = format!("blip{i}.txt");
+		write_file(&sc.local, &name, b"gone before the pass");
+		std::fs::remove_file(sc.local.join(&name)).unwrap();
+		assert!(
+			wait_until(NET * 2, || log.passes() >= expected).await,
+			"trigger {i} never ran its pass"
+		);
+		tokio::time::sleep(SPACING).await;
+	}
+
+	// Each of those passes reset the net, so the only passes in that window are the triggered ones:
+	// without the reset the net would have fired another TRIGGERS * SPACING / NET times on top.
+	let during = log.passes() - before;
+	assert!(
+		during <= TRIGGERS + 1,
+		"the safety net fired despite the event passes resetting it ({during} passes for \
+		 {TRIGGERS} triggers)"
+	);
+	assert_eq!(log.uploaded(), 0, "a since-deleted file was uploaded");
+	assert_eq!(log.remotely_trashed(), 0, "unexpected remote trash");
+
+	// Not starvable: with the triggers stopped, the net drives passes on its own again.
+	let idle_from = log.passes();
+	assert!(
+		wait_until(NET * 4, || log.passes() >= idle_from + 2).await,
+		"the safety net stopped firing after the event passes ({idle_from} -> {})",
+		log.passes()
+	);
+
+	let (_dirs, files) = list_remote_root(&sc).await;
+	assert!(
+		files.is_empty(),
+		"the remote gained {} file(s) from a no-op trigger",
+		files.len()
+	);
+
+	handle.stop().await;
+	sc.cleanup();
+}
