@@ -90,16 +90,17 @@ fn assert_noop(r: &SyncReport) {
 // ===========================================================================
 // IMPLEMENTED — same-version baseline persistence/reopen substrate.
 // These are the live analogues of the upgrade path: a persisted baseline is
-// re-loaded by a fresh engine `open` and acted on correctly. The schema
-// VERSION-CHANGE dimension itself is covered by the `#[ignore]` stubs.
+// re-loaded by a fresh engine `open` and acted on correctly. There is no second
+// schema version yet, so the VERSION-CHANGE dimension reduces to MIGRATE-04's
+// fail-closed refusal of a foreign stamp.
 // ===========================================================================
 
 /// MIGRATE-01 (same-version analogue) — a persisted baseline re-loaded by a fresh engine `open` with
 /// nothing changed yields a TRUE no-op: zero create/update/delete/move/quarantine, no transfer, no
 /// destination wipe, and the remote object set + sizes are byte-for-byte unchanged. This is exactly
 /// the property an in-place migration must preserve (read an older baseline without manufacturing
-/// phantom diffs); only the schema-version BUMP is out of reach for the live harness (see the
-/// `migrate_01_*` ignored stub).
+/// phantom diffs); only the schema-version BUMP is out of reach, because no second version exists
+/// yet (a foreign stamp is refused outright, see MIGRATE-04).
 #[shared_test_runtime]
 async fn migrate_01_reopened_baseline_first_pass_is_noop() {
 	let resources = test_utils::RESOURCES.get_resources().await;
@@ -318,8 +319,8 @@ async fn migrate_03_present_baseline_is_incremental_not_first_sync() {
 }
 
 /// MIGRATE-06 (same-version analogue) — re-running the reopened engine is idempotent: a second AND
-/// third pass after the reopen no-op stay clean no-ops with no transfer activity. (The schema-bump
-/// "happens exactly once" assertion needs baseline-store inspection — see the ignored stub.)
+/// third pass after the reopen no-op stay clean no-ops with no transfer activity. (A schema-bump
+/// "happens exactly once" assertion would need baseline-store inspection; there is no bump today.)
 #[shared_test_runtime]
 async fn migrate_06_reopen_passes_are_idempotent() {
 	let resources = test_utils::RESOURCES.get_resources().await;

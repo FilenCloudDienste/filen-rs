@@ -2260,7 +2260,8 @@ mod tests {
 		assert_eq!(
 			entry.agreed_hash,
 			Some(hash(3)),
-			"the resolution settles on the row's content, so the pull below is not re-read as a 			 concurrent edit and the path does not conflict forever"
+			"the resolution settles on the row's content, so the pull below is not re-read as a \
+			 concurrent edit and the path does not conflict forever"
 		);
 
 		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
