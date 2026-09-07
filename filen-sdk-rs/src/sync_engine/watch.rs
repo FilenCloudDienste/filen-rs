@@ -12,7 +12,9 @@
 //! bin — are filtered out instead (see [`triggers_pass`]): they are never content the next pass
 //! would act on, so a pass for them is pure waste.
 //!
-//! While the pair is [`paused`](super::SyncEngine::pause_pair) the loop runs no passes and leaves
+//! A pair that is ALREADY paused cannot be watched — [`watch`](super::SyncEngine::watch) refuses
+//! it, so a handle whose loop runs nothing is never handed out. While a pair is
+//! [`paused`](super::SyncEngine::pause_pair) under a running watch the loop runs no passes and leaves
 //! the dirty signal alone, so it is still pending when the pair resumes: whatever happened during
 //! the pause is picked up by the first pass afterwards. The watcher and the cache subscription are
 //! left registered throughout — tearing either down would cost a full relist to rebuild.
@@ -146,8 +148,9 @@ impl SyncEngine {
 	/// or remote change, plus a periodic safety-net pass. Returns a [`WatchHandle`] that stops
 	/// everything when dropped. Requires a multi-threaded runtime (it spawns a background task).
 	///
-	/// A watch on a [`paused`](Self::pause_pair) pair starts, and idles: it runs no pass until the
-	/// pair is resumed.
+	/// A [`paused`](Self::pause_pair) pair cannot be watched: starting a watch on one is an error,
+	/// because a handle whose loop is doing nothing (and says nothing about why) is indistinguishable
+	/// from a broken watch. Resume the pair first, then watch it.
 	pub async fn watch(self: Arc<Self>, pair: PairId) -> Result<WatchHandle, Error> {
 		self.watch_observed(pair, Box::new(|_| {})).await
 	}
@@ -166,7 +169,8 @@ impl SyncEngine {
 	}
 
 	/// Like [`watch_observed`](Self::watch_observed), but on `config`'s timings instead of the
-	/// defaults. Errors if the configuration is not one the loop can honour (see [`WatchConfig`]).
+	/// defaults. Errors if the configuration is not one the loop can honour (see [`WatchConfig`]),
+	/// and — like the other two — if the pair is paused.
 	pub async fn watch_with(
 		self: Arc<Self>,
 		pair: PairId,
@@ -187,6 +191,12 @@ impl SyncEngine {
 				})?
 				.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?
 		};
+		if record.paused {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!("sync pair {pair} is paused: resume it before starting a watch on it"),
+			));
+		}
 		let local_root = PathBuf::from(&record.local_root);
 
 		let dirty = Arc::new(Notify::new());

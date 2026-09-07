@@ -1374,6 +1374,11 @@ async fn watch_15_pause_resume() {
 		"the watch never ran its initial pass"
 	);
 	engine.pause_pair(pair).await.unwrap();
+	// A paused pair cannot be watched at all: resuming first is the supported order.
+	assert!(
+		engine.clone().watch(pair).await.is_err(),
+		"a paused pair must not be watchable"
+	);
 	// Let a pass that was already in flight when the pause landed finish.
 	tokio::time::sleep(NET).await;
 	let passes_at_pause = log.passes();
