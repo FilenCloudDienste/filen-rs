@@ -1,26 +1,17 @@
-//! Baseline schema / version migration tests (`MIGRATE-*`) for the two-way sync engine.
+//! Baseline schema / version tests (`MIGRATE-*`) for the two-way sync engine.
 //!
-//! HONEST SCOPING NOTE. Every MIGRATE test is fundamentally about the persisted per-pair baseline
-//! surviving an ENGINE UPGRADE: an OLDER engine writes a baseline at an OLD schema version, then a
-//! NEWER engine reads/migrates it. Exercising that dimension needs infrastructure the current
-//! black-box harness does NOT expose:
+//! SCOPING NOTE. The engine has ONE schema version and no migration chain: nothing has shipped a
+//! baseline DB, so there is nothing to migrate FROM. A DB stamped at any other version — older or
+//! newer — is refused rather than read (`migrate_04_*`), because reading foreign rows under these
+//! rules would misplan them into deletes. The step-by-step upgrade assertions this module used to
+//! stub out describe machinery that does not exist; they are gone rather than left standing as
+//! ignored placeholders, and the first released schema is what would bring them back.
 //!
-//! - a *prior* `SyncEngine` build that writes an older-schema baseline (there is exactly one engine version available),
-//! - baseline-store inspection/mutation (read the schema-version field, count entries, plant a newer-than-supported version, hand-write per-entry encryption/DEK columns),
-//! - deterministic mid-write interruption of the migration (kill between temp-write and commit).
-//!
-//! None of that is fakeable through the public API, so the assertions that hinge on a version
-//! CHANGE are stubbed `#[ignore]` with their plan summary, NOT faked into asserting nothing.
-//!
-//! What the live harness GENUINELY supports — and what is implemented here — is the load-bearing
-//! SAFETY substrate every MIGRATE case layers on top of: a baseline persisted to a stable DB path
-//! is re-used across a fresh `SyncEngine::open` (the process-restart analogue) so the next pass is a
+//! What remains is the load-bearing SAFETY substrate: a baseline persisted to a stable DB path is
+//! re-used across a fresh `SyncEngine::open` (the process-restart analogue) so the next pass is a
 //! clean no-op, the persisted baseline is distinguished from an absent one (no first-sync wipe of a
 //! populated side), a genuine post-baseline change is still detected, move/rename identity (uuid)
-//! survives the reopen, and the reopen is idempotent and durable across multiple cold starts. These
-//! are the SAME-version analogues; they prove the baseline round-trips and is acted on correctly,
-//! which is the property an in-place migration must preserve. The version-bump-specific guarantees
-//! sit in the ignored stubs.
+//! survives the reopen, and the reopen is idempotent and durable across multiple cold starts.
 use std::borrow::Cow;
 
 use filen_macros::shared_test_runtime;
@@ -473,28 +464,15 @@ async fn migrate_10_baseline_durable_across_repeated_cold_starts() {
 }
 
 // ===========================================================================
-// BLOCKED — version-CHANGE dimension: needs an older-engine build, baseline-
-// store schema inspection/mutation, or mid-migration interruption. Stubbed so
-// they assert the real thing once that infra exists, never faked.
+// Version handling: one schema, and anything else refused.
 // ===========================================================================
 
-/// MIGRATE-01 (version-bump assertion) — the on-disk baseline schema-version FIELD is bumped to the
-/// new version in place after the first post-upgrade pass, and the migrated entry count equals the
-/// pre-migration count.
-#[ignore = "blocked: needs older-engine build + baseline-store schema inspection — see TODO"]
+/// MIGRATE-04 — a baseline stamped at any version but this build's is refused, never silently
+/// mis-read into deletes/wipes, and the file is left exactly as it was. Both directions: a NEWER
+/// stamp (what a future engine would write) and an OLDER one (there is no migration chain, so an
+/// older stamp is just as foreign). Restoring the real stamp brings the pair straight back.
 #[shared_test_runtime]
-async fn migrate_01_old_baseline_schema_version_bumped_in_place() {
-	// plan: converge with the OLDER engine (persist OLD-schema baseline); confirm tree+baseline
-	// record every entry; swap in the NEWER engine; run one pass with NO changes. Verify the on-disk
-	// baseline schema-version field is bumped, the pass is a true no-op (zero create/update/delete/
-	// move/quarantine, no events), remote uuids + local mtimes/sizes byte-for-byte unchanged, and the
-	// migrated entry count == pre-migration count.
-}
-
-/// MIGRATE-04 — a newer-than-supported baseline is refused, never silently mis-read into
-/// deletes/wipes; the newer baseline file is left intact when refused.
-#[shared_test_runtime]
-async fn migrate_04_newer_than_supported_baseline_fails_closed() {
+async fn migrate_04_a_foreign_schema_version_fails_closed() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let remote: Uuid = resources.dir.uuid();
 	let cache = TestCache::new(&resources.client, remote).await;
@@ -518,86 +496,69 @@ async fn migrate_04_newer_than_supported_baseline_fails_closed() {
 	let pre_tree = walk_tree(&local);
 	drop(engine1);
 
-	// Simulate a DOWNGRADE: stamp the persisted baseline at a schema version this build does not
-	// understand (what a newer engine would have written).
-	let planted = {
-		let conn = open_read_write_db(&db_path);
-		conn.execute_batch("PRAGMA user_version = 99;").unwrap();
-		conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-			.unwrap()
-	};
-	assert_eq!(planted, 99, "precondition: the newer version was planted");
-
-	// The engine must fail CLOSED — refuse to open at all rather than read the newer rows under
-	// older rules and plan deletes from them.
-	let message = match SyncEngine::open(cache.client.clone(), db_path.clone()).await {
-		Ok(_) => panic!("a newer-than-supported baseline must be refused"),
-		Err(error) => format!("{error}"),
-	};
-	assert!(
-		message.contains("schema version"),
-		"the refusal must name the version problem: {message}"
-	);
-
-	// Nothing was destroyed on either side, and the newer baseline file was NOT downgraded.
-	let (_d1, files1) = list_dir(&cache, &resources.dir).await;
-	assert_eq!(files1.len(), pre_count, "remote changed after the refusal");
-	assert!(
-		find_file(&files1, "keep1.txt").is_some(),
-		"remote file lost"
-	);
-	assert!(
-		find_file(&files1, "keep2.txt").is_some(),
-		"remote file lost"
-	);
-	assert_eq!(walk_tree(&local), pre_tree, "local tree changed");
-	assert!(
-		!local.join(".filen-sync-trash").exists(),
-		"a refused open must not quarantine anything"
-	);
-	let still: i64 = open_read_write_db(&db_path)
+	let current: i64 = open_read_write_db(&db_path)
 		.query_row("PRAGMA user_version", [], |row| row.get(0))
 		.unwrap();
-	assert_eq!(still, 99, "the refused baseline was rewritten in place");
+	assert!(current > 0, "the engine must stamp the baseline it writes");
+
+	for planted in [current + 1, current - 1] {
+		let stamped = {
+			let conn = open_read_write_db(&db_path);
+			conn.execute_batch(&format!("PRAGMA user_version = {planted};"))
+				.unwrap();
+			conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+				.unwrap()
+		};
+		assert_eq!(stamped, planted, "precondition: the version was planted");
+
+		// The engine must fail CLOSED — refuse to open at all rather than read foreign rows under
+		// these rules and plan deletes from them.
+		let message = match SyncEngine::open(cache.client.clone(), db_path.clone()).await {
+			Ok(_) => panic!("schema version {planted} must be refused"),
+			Err(error) => format!("{error}"),
+		};
+		assert!(
+			message.contains("schema version"),
+			"the refusal must name the version problem: {message}"
+		);
+
+		// Nothing was destroyed on either side, and the baseline file was NOT re-stamped.
+		let (_d1, files1) = list_dir(&cache, &resources.dir).await;
+		assert_eq!(files1.len(), pre_count, "remote changed after the refusal");
+		assert!(
+			find_file(&files1, "keep1.txt").is_some(),
+			"remote file lost"
+		);
+		assert!(
+			find_file(&files1, "keep2.txt").is_some(),
+			"remote file lost"
+		);
+		assert_eq!(walk_tree(&local), pre_tree, "local tree changed");
+		assert!(
+			!local.join(".filen-sync-trash").exists(),
+			"a refused open must not quarantine anything"
+		);
+		let still: i64 = open_read_write_db(&db_path)
+			.query_row("PRAGMA user_version", [], |row| row.get(0))
+			.unwrap();
+		assert_eq!(
+			still, planted,
+			"the refused baseline was rewritten in place"
+		);
+	}
+
+	// The refusal is about the stamp alone: restore it and the very same DB opens and no-ops.
+	open_read_write_db(&db_path)
+		.execute_batch(&format!("PRAGMA user_version = {current};"))
+		.unwrap();
+	let engine2 = SyncEngine::open(cache.client.clone(), db_path)
+		.await
+		.expect("the untouched baseline must open again once its stamp is restored");
+	let pair2 = engine2
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	assert_noop(&engine2.sync_once(pair2).await.unwrap());
 
 	std::fs::remove_dir_all(&local).ok();
-}
-
-/// MIGRATE-05 — interrupted migration is atomic and resumable: after a kill mid-write of the migrated
-/// baseline, the on-disk baseline is fully old-schema OR fully new-schema, never a torn mix.
-#[ignore = "blocked: needs deterministic mid-write interruption + baseline-store inspection — see TODO"]
-#[shared_test_runtime]
-async fn migrate_05_interrupted_migration_is_atomic_and_resumable() {
-	// plan: persist an OLD-schema baseline for a converged pair; begin migration but kill the process
-	// mid-write of the migrated baseline (before any commit/rename); restart and run a pass. Verify
-	// the on-disk baseline is EITHER fully old- OR fully new-schema (temp-file+rename / transactional
-	// store), migration completes (or cleanly restarts from the old baseline) and the pass is a no-op
-	// with no spurious re-sync/delete/wipe/quarantine. Repeating the interrupt+restart cycle still
-	// converges to a single fully-migrated baseline with identical entry count.
-}
-
-/// MIGRATE-08 — multi-pair upgrade: each pair's baseline migrates independently; one
-/// newer-than-supported (failing) pair does not affect the others.
-#[ignore = "blocked: needs older-engine build + per-pair baseline version planting — see TODO"]
-#[shared_test_runtime]
-async fn migrate_08_per_pair_migration_isolated() {
-	// plan: configure two+ pairs converged under the OLDER engine, each with its own OLD-schema
-	// baseline; make ONE pair's baseline newer-than-supported (per MIGRATE-04), the rest valid old.
-	// Upgrade and run a pass over all pairs. Verify the valid old-schema pairs migrate in place and
-	// run no-op passes; the newer-than-supported pair is refused/degraded safely and reported per
-	// pair, WITHOUT aborting or corrupting the others; no cross-pair contamination (the failing pair
-	// causes no deletes/wipes/quarantine in any other pair, and its own data is untouched).
-}
-
-/// MIGRATE-09 — migration preserves encryption-version / DEK reference fields so no file is
-/// re-encrypted, re-keyed, or re-uploaded as a side effect.
-#[ignore = "blocked: needs older-engine build + per-entry baseline encryption-field inspection — see TODO"]
-#[shared_test_runtime]
-async fn migrate_09_encryption_dek_metadata_preserved() {
-	// plan: converge with the OLDER engine on an account using a specific key model (V2 master-key or
-	// V3 DEK); persist an OLD-schema baseline carrying per-entry encryption metadata. Upgrade and run
-	// one pass with no content changes. Verify per-entry encryption-version / DEK reference fields
-	// survive migration (files still recognized by their existing encrypted identity), no file is
-	// re-encrypted/re-keyed/re-uploaded, the pass is a no-op, remote uuids + ciphertext unchanged, and
-	// no version-mismatch errors or encryption-attributed spurious updates appear.
 }
