@@ -2,6 +2,9 @@
 use std::{borrow::Cow, collections::BTreeSet};
 
 use filen_macros::shared_test_runtime;
+use filen_types::fs::StableUuid;
+use futures::FutureExt;
+
 use filen_sdk_rs::fs::HasName;
 use filen_sdk_rs::fs::HasUUID;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
@@ -1726,4 +1729,174 @@ async fn converge_a7_new_dir_and_child_ordering() {
 	let child = find_file(&files, "child.txt").expect("newdir/child.txt missing");
 	assert_eq!(child.size, b"c".len() as u64);
 	sc.cleanup();
+}
+
+// ============================================================================
+// CONVERGE-A8 — the file lineage survives an edit on a versioning-DISABLED
+// account, where the server replaces the file in place instead of archiving a
+// version: the successor keeps the lineage id, the retired row is re-stamped
+// with a fresh one that names no live file, and the engine must read the two
+// as ONE item.
+// ============================================================================
+
+/// The `stable_uuid` (lineage id) the cache holds for a file uuid — the field the engine's remote
+/// view carries and every lineage rule reads. Read straight from the cache DB: no public helper
+/// exposes it, and whether it survives a versioning-disabled edit is the whole point here.
+fn cached_stable_uuid(db_path: &std::path::Path, uuid: Uuid) -> Option<StableUuid> {
+	let conn = open_read_db(db_path).ok()?;
+	conn.query_row(
+		"SELECT f.stable_uuid FROM items i JOIN files f ON f.id = i.id WHERE i.uuid = ?",
+		rusqlite::params![uuid],
+		|row| row.get(0),
+	)
+	.ok()
+}
+
+#[shared_test_runtime]
+async fn converge_a8_versioning_disabled_edit_keeps_one_lineage() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	// The same lock order the socket / user / cache tests use for this flag on the shared account:
+	// the version-chain lock first, then the account-wide versioning flag.
+	let _version_lock = sc
+		.resources
+		.client
+		.acquire_lock_with_default("test:versions")
+		.await
+		.unwrap();
+	let _versioning_lock = sc
+		.resources
+		.client
+		.acquire_lock_with_default("test:user-versioning")
+		.await
+		.unwrap();
+	let original = sc
+		.resources
+		.client
+		.get_user_info()
+		.await
+		.unwrap()
+		.versioning_enabled;
+	sc.resources
+		.client
+		.set_versioning_enabled(false)
+		.await
+		.unwrap();
+
+	// Put the account-wide flag back whatever the body does, and back to what it WAS: a panic that
+	// left it changed would change what every later test on this shared account sees. NOTHING that
+	// can fail may sit between the call above and this guard — the read-back that checks the flag
+	// took is the body's first act for exactly that reason.
+	let outcome = std::panic::AssertUnwindSafe(versioning_disabled_body(&sc))
+		.catch_unwind()
+		.await;
+	sc.resources
+		.client
+		.set_versioning_enabled(original)
+		.await
+		.unwrap();
+	sc.cleanup();
+	if let Err(panic) = outcome {
+		std::panic::resume_unwind(panic);
+	}
+}
+
+async fn versioning_disabled_body(sc: &SingleClient) {
+	let db = sc.cache.db_path().to_path_buf();
+
+	assert!(
+		!sc.resources
+			.client
+			.get_user_info()
+			.await
+			.unwrap()
+			.versioning_enabled,
+		"precondition: the account must actually be running with versioning off"
+	);
+
+	write_file(&sc.local, "vd.txt", b"v1");
+	let r0 = sc.sync().await;
+	assert!(r0.errors.is_empty(), "{r0:?}");
+	assert_eq!(r0.uploaded, 1, "{r0:?}");
+
+	let (_d, files) = list_dir(&sc.cache.client, &sc.resources.dir).await;
+	let v1 = find_file(&files, "vd.txt").expect("vd.txt missing").clone();
+	assert!(
+		poll_for_item(&db, v1.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never listed the uploaded file"
+	);
+	assert_eq!(
+		cached_stable_uuid(&db, v1.uuid()),
+		Some(v1.stable_uuid()),
+		"precondition: the cache carries the file's lineage id"
+	);
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 0, "{r1:?}");
+	assert_eq!(r1.downloaded, 0, "{r1:?}");
+
+	// backend timestamps have a resolution of one second
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+	// The edit. With versioning OFF the server does not archive a version: it trashes the old row
+	// (re-stamping THAT row with a fresh lineage id, so a stable-keyed consumer cannot tombstone
+	// the live file) and announces the successor separately.
+	write_file(&sc.local, "vd.txt", b"v2 is longer");
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.uploaded, 1, "the local edit pushes: {r2:?}");
+	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
+
+	let (_d, files) = list_dir(&sc.cache.client, &sc.resources.dir).await;
+	assert_eq!(
+		files.iter().filter(|f| f.name() == Some("vd.txt")).count(),
+		1,
+		"a versioning-disabled edit replaces the file in place; two copies means a duplicate"
+	);
+	let v2 = find_file(&files, "vd.txt").expect("vd.txt missing").clone();
+	assert_ne!(v2.uuid(), v1.uuid(), "the edit re-mints the uuid");
+	assert_eq!(
+		v2.stable_uuid(),
+		v1.stable_uuid(),
+		"the server keeps the lineage id on the LIVE file"
+	);
+	assert_eq!(
+		sc.cache.client.list_file_versions(&v2).await.unwrap().len(),
+		1,
+		"precondition: with versioning off the edit replaces in place instead of archiving a \
+		 version, which is the code path this test is about"
+	);
+
+	// What the ENGINE actually reads. If the ghost's freshly minted id ever landed on the live row,
+	// every lineage rule would read the successor as a DIFFERENT file taking the path over.
+	assert!(
+		poll_for_item(&db, v2.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never listed the successor"
+	);
+	assert!(
+		poll_for_item_absent(&db, v1.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"the retired uuid is still in the cache"
+	);
+	assert_eq!(
+		cached_stable_uuid(&db, v2.uuid()),
+		Some(v1.stable_uuid()),
+		"the cache lost the lineage across a versioning-disabled edit"
+	);
+
+	// And the pass that reads it: our own version at the path, one lineage, nothing to do.
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(r3.uploaded, 0, "no re-push: {r3:?}");
+	assert_eq!(r3.downloaded, 0, "no spurious re-download: {r3:?}");
+	assert_eq!(
+		r3.conflicts.len(),
+		0,
+		"an edit of our own lineage is no conflict: {r3:?}"
+	);
+	assert_eq!(r3.locally_deleted, 0, "{r3:?}");
+	assert_eq!(r3.remotely_trashed, 0, "no delete + recreate: {r3:?}");
+	assert_eq!(
+		r3.deferred_paths, 0,
+		"the retired ghost must not hold the path back: {r3:?}"
+	);
+	assert!(read_eq(&sc.local, "vd.txt", b"v2 is longer"));
 }
