@@ -666,6 +666,99 @@ fn create_local(rel_path: &str, remote: &RemoteNode) -> SyncAction {
 	}
 }
 
+/// Advance every baseline row's agreed-content marker that this pass's RAW cache snapshot
+/// confirms, and return the rows that moved so the caller can persist them.
+///
+/// The confirmation is one specific observation: the snapshot lists the row's own version uuid at
+/// the row's path. That is the remote saying it holds exactly what the row records, which is what
+/// makes the row's content agreed by both sides. A push cannot claim this for itself — the upload
+/// only proves the server took the bytes — so this is the step that retires the gap a push leaves.
+///
+/// It MUST be given the raw snapshot, never the view
+/// [`PendingWrites::fold_into`](super::engine::PendingWrites::fold_into) has corrected: the fold
+/// synthesises our own just-written version at the path from the very row being confirmed, so a
+/// folded view would confirm every push against itself and the marker would mean nothing.
+pub(super) fn confirm_agreed_content(
+	baseline: &mut HashMap<String, BaselineEntry>,
+	raw_remote: &HashMap<String, RemoteNode>,
+) -> Vec<BaselineEntry> {
+	let mut advanced = Vec::new();
+	for (rel_path, entry) in baseline.iter_mut() {
+		if entry.kind != NodeKind::File
+			|| entry.state != BaselineState::Synced
+			|| entry.content_hash.is_none()
+			|| entry.agreed_hash == entry.content_hash
+		{
+			continue;
+		}
+		if raw_remote.get(rel_path).map(|node| node.remote_uuid) != entry.remote_uuid {
+			continue;
+		}
+		entry.agreed_hash = entry.content_hash;
+		tracing::debug!(
+			"plan: the remote confirms {rel_path:?} — both sides hold what the baseline records"
+		);
+		advanced.push(entry.clone());
+	}
+	advanced
+}
+
+/// Whether the remote change at a path is another client's edit made CONCURRENTLY with a push of
+/// ours that no snapshot ever confirmed — the one remote change a two-way pass must NOT just pull.
+///
+/// The row holds our own content and the version uuid our push minted; `agreed_hash` holds the last
+/// content both sides were known to hold. Equal, and the push was confirmed (a pass saw our version
+/// as the remote head), so a foreign version stacked on top of it is an edit made AFTER ours and
+/// pulling it is right — that is the ordinary sequential case. Different, and our push was never
+/// observed to land while a foreign version of the SAME file now carries content that is neither
+/// ours nor the agreed one: both sides moved off the agreed content, which is a conflict.
+///
+/// Deliberately narrow — a file on both sides, the same server-minted lineage (a DIFFERENT lineage
+/// is a replacement and converges the ordinary way), a different version uuid, and hashes on both
+/// sides that actually differ.
+///
+/// `agreed_hash: None` — a file this side created and pushed, nothing having confirmed it since —
+/// is an UNCONFIRMED push like any other, not an absence of evidence: the two clients that create
+/// the same name concurrently both hold such a row, and treating the marker's absence as consent
+/// resolves that silently in whichever client's favour happened to look second. Only a snapshot
+/// listing our own version at the path (`agreed_hash == content_hash`) makes a foreign version on
+/// top of it an edit made AFTER ours.
+///
+/// KNOWN WINDOW: the confirmation needs a pass to run while our version is the remote head. One
+/// that happens to run in that window records the push as confirmed, so a genuinely concurrent edit
+/// landing afterwards pulls; one that does not sees a conflict even where the other client edited
+/// strictly after us. The server's version chain cannot separate the two — a concurrent upload and
+/// a later one supersede our uuid identically — so this observation is the only evidence there is.
+///
+/// TWO-WAY ONLY. A one-way mode has an authoritative side and no divergence to surface:
+/// [`SyncMode::LocalToRemote`](super::SyncMode::LocalToRemote) re-pushes the local copy and
+/// [`SyncMode::RemoteToLocal`](super::SyncMode::RemoteToLocal) pulls the remote one, exactly as
+/// before.
+fn is_unconfirmed_concurrent_edit(
+	local: Option<&LocalNode>,
+	remote: Option<&RemoteNode>,
+	base: Option<&BaselineEntry>,
+) -> bool {
+	let (Some(local), Some(remote), Some(base)) = (local, remote, base) else {
+		return false;
+	};
+	local.kind == NodeKind::File
+		&& remote.kind == NodeKind::File
+		&& base.kind == NodeKind::File
+		// Our push is still unconfirmed: the row's content is not what both sides last agreed on.
+		// `None` is not agreement — nothing has ever confirmed this row's content.
+		&& base.content_hash != base.agreed_hash
+		// A foreign VERSION of the same file — not our own, and not a different file taking over.
+		&& base.remote_uuid != Some(remote.remote_uuid)
+		&& same_file_lineage(base, remote)
+		// ... carrying content that is genuinely not ours. An identical re-upload is no divergence,
+		// and a remote with no stored hash is no evidence of one.
+		&& matches!(
+			(base.content_hash, remote.content_hash),
+			(Some(ours), Some(theirs)) if ours != theirs
+		)
+}
+
 fn reconcile_two_way(
 	rel_path: &str,
 	local: Option<&LocalNode>,
@@ -681,7 +774,23 @@ fn reconcile_two_way(
 		(false, false) => {}
 		// Only one side moved — propagate it (deletes always propagate in two-way).
 		(true, false) => push_to_remote(rel_path, local, remote, base, true, actions),
-		(false, true) => pull_to_local(rel_path, local, remote, base, true, actions),
+		// The remote moved and the local side did not — a pull, UNLESS the row's own content is a
+		// push we never saw land and the remote now carries somebody else's edit of the same file:
+		// then both sides moved off the last agreed content and pulling would bury ours.
+		(false, true) => {
+			if is_unconfirmed_concurrent_edit(local, remote, base) {
+				let action = SyncAction::Conflict {
+					rel_path: rel_path.to_string(),
+				};
+				tracing::debug!(
+					"plan: {} — a foreign version of the same file landed on a push this engine never saw confirmed",
+					action.describe()
+				);
+				actions.push(action);
+			} else {
+				pull_to_local(rel_path, local, remote, base, true, actions);
+			}
+		}
 		// Both moved: either they converged on the same content (adopt, no transfer) or they
 		// genuinely diverged (a conflict the caller resolves; modify-vs-delete is refined later).
 		(true, true) => {
@@ -733,6 +842,13 @@ fn reconcile_two_way(
 ///   is and the moved version arrives beside it. The push-only modes never reach this block at all:
 ///   `LocalToRemote` re-pushes the edit at the source path and trashes the remote's moved copy,
 ///   `LocalBackup` re-pushes and leaves it.
+///
+///   A lineage match whose new version is a foreign EDIT over a push nothing confirmed
+///   ([`is_unconfirmed_concurrent_edit`]) is not carried across either, for the same reason at one
+///   remove: the rename would put our unconfirmed copy under the download. In two-way it surfaces
+///   the source as a conflict right here — the reconcile could not, since with nothing left at the
+///   source path it reads a plain remote-side deletion — and the moved version downloads at its new
+///   name as an untracked remote item.
 /// - Local moves are matched by content hash: a baseline file gone locally whose content reappears
 ///   at a new local path (uniquely — ambiguous content is left to delete+create), with the remote
 ///   still holding the original, becomes a `MoveRemote`.
@@ -793,6 +909,29 @@ fn detect_moves(
 					None => continue,
 				},
 			};
+			// The edit a move carried is measured by the same rule as one that stayed put: over a
+			// push no snapshot ever confirmed it is a divergence, not an item to carry across.
+			// Consuming it would rename our unconfirmed copy to the destination for the paired
+			// download to write over — the loss the rule exists to stop, one rename away — and
+			// leaving the pair to the reconcile is no better, since the source would then read as a
+			// remote-side deletion. So the source is surfaced here and its path consumed; the moved
+			// version is untracked at its new name and downloads there through the ordinary
+			// reconcile, which is the same outcome the uuid branch produces for a two-sided change.
+			if carries_edit
+				&& mode.pushes()
+				&& is_unconfirmed_concurrent_edit(local.get(from), remote.get(to), Some(base))
+			{
+				let action = SyncAction::Conflict {
+					rel_path: from.clone(),
+				};
+				tracing::debug!(
+					"plan: {} — the moved version is a foreign edit over a push this engine never saw confirmed",
+					action.describe()
+				);
+				actions.push(action);
+				consumed.insert(from.clone());
+				continue;
+			}
 			if to != from
 				&& !baseline.contains_key(to)
 				&& local.contains_key(from)
@@ -1310,6 +1449,7 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: None,
+			agreed_hash: None,
 		}
 	}
 
@@ -1328,7 +1468,239 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			// The ordinary shape: what the row records is what both sides were last known to hold.
+			agreed_hash: Some(Blake3Hash::from(hash)),
 		}
+	}
+
+	/// The row a push left behind: our content on top of a DIFFERENT agreed one, and no snapshot
+	/// has confirmed the push since.
+	fn base_file_pushed(rel: &str, uuid: Uuid, hash: [u8; 32], agreed: [u8; 32]) -> BaselineEntry {
+		BaselineEntry {
+			agreed_hash: Some(Blake3Hash::from(agreed)),
+			..base_file(rel, uuid, hash)
+		}
+	}
+
+	/// Rule (d), the case it exists for: our push is unconfirmed and a foreign version of the same
+	/// file now holds the path with different bytes. Both sides moved off the agreed content, so
+	/// this is a two-way conflict rather than a pull that would bury our copy.
+	#[test]
+	fn a_foreign_edit_over_an_unconfirmed_push_is_a_conflict() {
+		let lineage = Uuid::new_v4();
+		// The row: we pushed [1;32] on top of the agreed [0;32]; nothing has confirmed it.
+		let baseline = map(vec![(
+			"a.txt",
+			base_file_pushed("a.txt", lineage, [1; 32], [0; 32]),
+		)]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"a.txt",
+			remote_version("a.txt", lineage, Uuid::new_v4(), [2; 32]),
+		)]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::Conflict {
+				rel_path: "a.txt".to_string(),
+			}],
+			"a concurrent edit of a file we just pushed must be surfaced, not pulled over"
+		);
+	}
+
+	/// The negative: once a pass has confirmed our push (agreed == what the row records), a foreign
+	/// version on top of it is an edit made AFTER ours and pulls exactly as it always did.
+	#[test]
+	fn a_foreign_edit_over_a_confirmed_push_still_pulls() {
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", lineage, [1; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"a.txt",
+			remote_version("a.txt", lineage, Uuid::new_v4(), [2; 32]),
+		)]);
+		let new_uuid = remote["a.txt"].remote_uuid;
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::DownloadFile {
+				rel_path: "a.txt".to_string(),
+				remote_uuid: new_uuid,
+			}]
+		);
+	}
+
+	/// No agreed content on record (a file this side created and pushed, nothing confirmed since)
+	/// is an UNCONFIRMED push, not consent: a foreign version on top of it is surfaced, not pulled
+	/// over. This is what makes two clients creating the same name concurrently non-silent — both
+	/// hold exactly this row, so with `None` read as agreement the loser's copy would be buried.
+	#[test]
+	fn a_foreign_edit_with_no_agreed_content_recorded_is_a_conflict() {
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![(
+			"a.txt",
+			BaselineEntry {
+				agreed_hash: None,
+				..base_file("a.txt", lineage, [1; 32])
+			},
+		)]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"a.txt",
+			remote_version("a.txt", lineage, Uuid::new_v4(), [2; 32]),
+		)]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::Conflict {
+				rel_path: "a.txt".to_string(),
+			}]
+		);
+	}
+
+	/// A DIFFERENT file taking the path over is a replacement, not a concurrent edit of ours: the
+	/// destination has to converge on whatever holds the path, so it pulls.
+	#[test]
+	fn a_replacement_over_an_unconfirmed_push_is_not_a_concurrent_edit() {
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![(
+			"a.txt",
+			base_file_pushed("a.txt", lineage, [1; 32], [0; 32]),
+		)]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"a.txt",
+			remote_file("a.txt", Uuid::new_v4(), [2; 32]),
+		)]);
+		let other_uuid = remote["a.txt"].remote_uuid;
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::DownloadFile {
+				rel_path: "a.txt".to_string(),
+				remote_uuid: other_uuid,
+			}]
+		);
+	}
+
+	/// A foreign version carrying the SAME bytes we pushed is nobody diverging — the other client
+	/// wrote what we already hold. Nothing happens at all.
+	#[test]
+	fn a_content_equal_foreign_version_over_an_unconfirmed_push_is_no_conflict() {
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![(
+			"a.txt",
+			base_file_pushed("a.txt", lineage, [1; 32], [0; 32]),
+		)]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"a.txt",
+			remote_version("a.txt", lineage, Uuid::new_v4(), [1; 32]),
+		)]);
+		assert!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote).is_empty(),
+			"identical bytes under a new version id are not a divergence"
+		);
+	}
+
+	/// The one-way modes are untouched: each has an authoritative side and no divergence to
+	/// surface, so the same inputs re-push (local-authoritative) or pull (remote-authoritative).
+	#[test]
+	fn one_way_modes_ignore_the_agreed_content_marker() {
+		let lineage = Uuid::new_v4();
+		let baseline = map(vec![(
+			"a.txt",
+			base_file_pushed("a.txt", lineage, [1; 32], [0; 32]),
+		)]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"a.txt",
+			remote_version("a.txt", lineage, Uuid::new_v4(), [2; 32]),
+		)]);
+		let new_uuid = remote["a.txt"].remote_uuid;
+		for mode in [SyncMode::LocalToRemote, SyncMode::LocalBackup] {
+			assert_eq!(
+				plan(mode, &baseline, &local, &remote),
+				vec![SyncAction::UploadFile {
+					rel_path: "a.txt".to_string(),
+				}],
+				"{mode:?} must re-push the local copy"
+			);
+		}
+		for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+			assert_eq!(
+				plan(mode, &baseline, &local, &remote),
+				vec![SyncAction::DownloadFile {
+					rel_path: "a.txt".to_string(),
+					remote_uuid: new_uuid,
+				}],
+				"{mode:?} must pull the remote copy"
+			);
+		}
+	}
+
+	/// Rule (c): the snapshot listing our own version at the path is what makes the row's content
+	/// agreed. Only the rows that actually moved come back, so only those are persisted.
+	#[test]
+	fn the_raw_snapshot_showing_our_version_advances_the_agreed_content() {
+		let uuid = Uuid::new_v4();
+		let mut baseline = map(vec![(
+			"a.txt",
+			base_file_pushed("a.txt", uuid, [1; 32], [0; 32]),
+		)]);
+		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [1; 32]))]);
+
+		let advanced = confirm_agreed_content(&mut baseline, &remote);
+		assert_eq!(
+			advanced
+				.iter()
+				.map(|e| e.rel_path.as_str())
+				.collect::<Vec<_>>(),
+			vec!["a.txt"],
+			"the confirmed row is handed back to be persisted"
+		);
+		assert_eq!(
+			baseline["a.txt"].agreed_hash,
+			Some(Blake3Hash::from([1; 32])),
+			"the marker moved onto what the row records"
+		);
+		// Idempotent: a second pass over an already-agreed row has nothing to persist.
+		assert!(confirm_agreed_content(&mut baseline, &remote).is_empty());
+	}
+
+	/// A foreign version at the path proves nothing about our push, and neither does an empty
+	/// snapshot: the marker stays where it was.
+	#[test]
+	fn a_path_the_snapshot_does_not_confirm_leaves_the_agreed_content_alone() {
+		let ours = Uuid::new_v4();
+		let row = base_file_pushed("a.txt", ours, [1; 32], [0; 32]);
+		for remote in [
+			map(vec![(
+				"a.txt",
+				remote_version("a.txt", ours, Uuid::new_v4(), [2; 32]),
+			)]),
+			HashMap::new(),
+		] {
+			let mut baseline = map(vec![("a.txt", row.clone())]);
+			assert!(confirm_agreed_content(&mut baseline, &remote).is_empty());
+			assert_eq!(
+				baseline["a.txt"].agreed_hash,
+				Some(Blake3Hash::from([0; 32])),
+				"an unconfirmed push must not advance its own marker"
+			);
+		}
+	}
+
+	/// A conflicted row is a holding cell for a divergence, not a converged state — confirming it
+	/// would claim both sides agree on the loser's content.
+	#[test]
+	fn a_conflicted_row_is_never_confirmed() {
+		let uuid = Uuid::new_v4();
+		let mut baseline = map(vec![(
+			"a.txt",
+			BaselineEntry {
+				state: BaselineState::Conflicted,
+				..base_file_pushed("a.txt", uuid, [1; 32], [0; 32])
+			},
+		)]);
+		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [1; 32]))]);
+		assert!(confirm_agreed_content(&mut baseline, &remote).is_empty());
 	}
 
 	#[test]
@@ -1531,6 +1903,84 @@ mod tests {
 				.iter()
 				.any(|a| matches!(a, SyncAction::MoveLocal { .. })),
 			"a diverged local copy must not be consumed as a move: {actions:?}"
+		);
+	}
+
+	/// The move branch reads the same rule as the per-path reconcile. A foreign version of our own
+	/// lineage that moved AND edited over a push nothing confirmed is a divergence, and consuming
+	/// it as a move would rename our unconfirmed copy to the destination for the paired download to
+	/// write over — the same silent loss the rule exists to stop, just one rename away. Leaving the
+	/// pair alone is not enough either: the source would then read as a remote-side deletion and be
+	/// deleted locally. The source is surfaced, and the moved version still arrives at its new name.
+	#[test]
+	fn a_lineage_move_over_an_unconfirmed_push_surfaces_instead_of_moving() {
+		let lineage = Uuid::new_v4();
+		let new_uuid = Uuid::new_v4();
+		// We pushed [1;32] over the agreed [0;32]; nothing confirmed it. The other client edited
+		// the same file to [2;32] and renamed it in the same window.
+		let baseline = map(vec![(
+			"a.txt",
+			base_file_pushed("a.txt", lineage, [1; 32], [0; 32]),
+		)]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"b.txt",
+			remote_version("b.txt", lineage, new_uuid, [2; 32]),
+		)]);
+
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			!actions
+				.iter()
+				.any(|a| matches!(a, SyncAction::MoveLocal { .. })),
+			"our unconfirmed copy must not be renamed under the download: {actions:?}"
+		);
+		assert!(
+			!actions.iter().any(|a| matches!(
+				a,
+				SyncAction::DeleteLocal { rel_path, .. } if rel_path == "a.txt"
+			)),
+			"nor deleted as though the remote had dropped it: {actions:?}"
+		);
+		assert!(
+			actions.contains(&SyncAction::Conflict {
+				rel_path: "a.txt".to_string(),
+			}),
+			"the divergence must be surfaced: {actions:?}"
+		);
+		assert!(
+			actions.iter().any(|a| matches!(
+				a,
+				SyncAction::DownloadFile { rel_path, .. } if rel_path == "b.txt"
+			)),
+			"the moved version still arrives under its new name: {actions:?}"
+		);
+	}
+
+	/// The negative, so the guard cannot swallow the ordinary move+edit: with the push confirmed
+	/// (or nothing pushed at all) the pair is still carried across as one item.
+	#[test]
+	fn a_lineage_move_over_a_confirmed_push_is_still_a_move() {
+		let lineage = Uuid::new_v4();
+		let new_uuid = Uuid::new_v4();
+		let baseline = map(vec![("a.txt", base_file("a.txt", lineage, [1; 32]))]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"b.txt",
+			remote_version("b.txt", lineage, new_uuid, [2; 32]),
+		)]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![
+				SyncAction::MoveLocal {
+					from_path: "a.txt".to_string(),
+					to_path: "b.txt".to_string(),
+				},
+				SyncAction::DownloadFile {
+					rel_path: "b.txt".to_string(),
+					remote_uuid: new_uuid,
+				},
+			]
 		);
 	}
 
@@ -1783,6 +2233,7 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: None,
+			agreed_hash: None,
 		};
 		let baseline = map(vec![
 			("old", base_dir),
