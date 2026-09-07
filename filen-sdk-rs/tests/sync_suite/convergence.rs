@@ -150,6 +150,31 @@ async fn converge_03_one_sided_modification_propagates() {
 	let s0 = sc2.sync().await;
 	assert_eq!(s0.uploaded, 1, "{s0:?}");
 
+	// One pass that LISTS our own push as the remote head, which is what records v1 as the content
+	// both sides hold (the same explicit step CONVERGE-20 takes). Without it the remote edit below
+	// is indistinguishable from one made CONCURRENTLY with the v1 push — a brand-new file's row
+	// carries no agreed content, and an unconfirmed push is exactly what makes a foreign version a
+	// conflict — so the edit would surface instead of pulling. A client's own sync loop supplies
+	// this pass in practice.
+	let (_d, files) = list_dir(&sc2.cache.client, &sc2.resources.dir).await;
+	let v1_uuid: Uuid = find_file(&files, "m.txt").expect("m.txt missing").uuid();
+	let v1_db = sc2.cache.db_path().to_path_buf();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || query_cached_file(
+			&v1_db, v1_uuid
+		)
+		.is_some())
+		.await,
+		"cache never reflected v1"
+	);
+	let sconf = sc2.sync().await;
+	assert!(sconf.errors.is_empty(), "{sconf:?}");
+	assert_eq!(
+		sconf.uploaded, 0,
+		"the confirming pass must be a no-op: {sconf:?}"
+	);
+	assert_eq!(sconf.downloaded, 0, "{sconf:?}");
+
 	// Modify the same name on the remote (server versions it to a new uuid).
 	let new_rf = upload_to(&sc2.cache.client, sc2.remote, "m.txt", b"v2-remote").await;
 	let new_uuid: Uuid = new_rf.uuid();
@@ -990,10 +1015,32 @@ async fn converge_20_alternating_one_sided_edits() {
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 	assert_eq!(r1.conflicts.len(), 0, "{r1:?}");
 	let (_d, files) = list_dir(&sc.cache.client, &sc.resources.dir).await;
-	assert_eq!(
-		find_file(&files, "seq.txt").unwrap().size,
-		b"v1".len() as u64
+	let v1 = find_file(&files, "seq.txt").expect("seq.txt missing");
+	assert_eq!(v1.size, b"v1".len() as u64);
+
+	// One pass that LISTS our own push as the remote head, which is what records v1 as the content
+	// both sides hold. Without it the v2 edit below is indistinguishable from an edit made
+	// concurrently with the v1 push and surfaces as a conflict instead of pulling — the client's
+	// own sync loop supplies this pass in practice, and here it is made explicit so the alternation
+	// this test is about stays deterministic.
+	let v1_uuid: Uuid = v1.uuid();
+	let cache_db = sc.cache.db_path().to_path_buf();
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || query_cached_file(
+			&cache_db, v1_uuid
+		)
+		.is_some())
+		.await,
+		"cache never reflected v1"
 	);
+	let rc = sc.sync().await;
+	assert!(rc.errors.is_empty(), "{rc:?}");
+	assert_eq!(
+		rc.uploaded, 0,
+		"the confirming pass must be a no-op: {rc:?}"
+	);
+	assert_eq!(rc.downloaded, 0, "{rc:?}");
+	assert_eq!(rc.conflicts.len(), 0, "{rc:?}");
 
 	// Remote edit -> v2 (versioned to new uuid).
 	let v2 = upload_to(&sc.cache.client, sc.remote, "seq.txt", b"v2").await;
@@ -1463,6 +1510,33 @@ async fn run_a4_trial(order: Order) -> TreeMap {
 		},
 	)
 	.await;
+
+	// Both files reached the remote as pushes from A that no snapshot has confirmed yet: nothing has
+	// listed A's own versions as the remote head, so B's edit below would read on A as an edit made
+	// CONCURRENTLY with A's push and surface as a conflict instead of pulling. A running client's own
+	// sync loop supplies that pass; here it is made explicit — as CONVERGE-20 does — so this stays a
+	// test about ORDER rather than a race between A's push and B's edit reaching A's cache.
+	let (_d, files) = list_dir(&tc.resources.client, &tc.resources.dir).await;
+	let db_a = tc.cache_a.db_path().to_path_buf();
+	for name in ["p.txt", "q.txt"] {
+		let uuid: Uuid = find_file(&files, name)
+			.unwrap_or_else(|| panic!("{name} never reached the remote"))
+			.uuid();
+		assert!(
+			poll_until(CACHE_CONVERGE_TIMEOUT, || query_cached_file(&db_a, uuid)
+				.is_some())
+			.await,
+			"A's cache never listed its own push of {name}"
+		);
+	}
+	let rconf = tc.engine_a.sync_once(tc.pair_a).await.unwrap();
+	assert!(rconf.errors.is_empty(), "{rconf:?}");
+	assert_eq!(
+		rconf.uploaded + rconf.downloaded,
+		0,
+		"the confirming pass must be a no-op: {rconf:?}"
+	);
+	assert_eq!(rconf.conflicts.len(), 0, "{rconf:?}");
 
 	// Disjoint modifications: A edits p, B edits q.
 	write_file(&tc.local_a, "p.txt", b"p1");

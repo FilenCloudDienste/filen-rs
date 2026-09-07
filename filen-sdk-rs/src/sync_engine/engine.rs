@@ -244,9 +244,10 @@ impl PendingWrites {
 		self.map().values().map(|write| write.seq).min()
 	}
 
-	/// Drop the records the cache has caught up to and the ones past [`PENDING_CREATE_GRACE`], and
-	/// return the uuids that remain — the ones the snapshot demonstrably still shows in their
-	/// pre-write state — split by what the reconciler has to do about each.
+	/// Drop the records the cache has demonstrably caught up to and the ones past
+	/// [`PENDING_CREATE_GRACE`], and return what the reconciler still has to suppress on their
+	/// behalf. Whether a surviving create may actually correct the view is [`fold_create`]'s
+	/// question, not this one's.
 	///
 	/// `observed` must have been copied BEFORE `remote` was read, so a cache batch committed after
 	/// the snapshot cannot retire a record whose item that snapshot still predates. `remote` is
@@ -279,16 +280,14 @@ impl PendingWrites {
 				return true;
 			}
 			match &write.kind {
-				PendingKind::Created { path, replaced } => {
-					if snapshot_path.contains_key(uuid) {
-						return false;
-					}
-					// Someone else's item holds the path: the snapshot is not behind on our write,
-					// it is showing a foreign one — which the reconciler must act on at once.
-					match remote.get(path.as_str()).map(|node| node.remote_uuid) {
-						Some(occupant) => Some(occupant) == *replaced,
-						None => true,
-					}
+				PendingKind::Created { .. } => {
+					// The snapshot lists what we wrote: the cache has caught up. What it lists
+					// INSTEAD is a question of identity — the version our upload superseded reads
+					// exactly like somebody else's write from here — and the row that answers it is
+					// the fold's ([`fold_create`]), which refuses to paint over an item that is not
+					// ours. Keeping the record until then costs nothing: the announcement above or
+					// the grace ceiling retires it either way.
+					!snapshot_path.contains_key(uuid)
 				}
 				PendingKind::Moved { from, .. } => snapshot_path
 					.get(uuid)
@@ -410,13 +409,15 @@ fn place_node(
 	path_of.insert(uuid, path);
 }
 
-/// Show what we wrote at `path`, over the uuid it replaced there.
+/// Show what we wrote at `path`, over the version it superseded there — and decide, for a path
+/// showing something else entirely, whether this engine may claim it at all. [`PendingWrites`]
+/// keeps a create's record while the cache has announced nothing of it; this is where what the
+/// snapshot shows at its path is weighed against it.
 ///
 /// The node comes from the baseline row at `path` whatever uuid that row names, not from the
 /// record's own uuid: a second write to the same path inside the window supersedes the first, and
-/// its record is retired by the very snapshot lag this fold exists for (the path holds neither of
-/// our uuids, so it reads as foreign). The surviving record still proves the path is ours, and the
-/// row is where the latest write recorded itself.
+/// the row is where the latest write recorded itself, so both records fold the same node and the
+/// first one to run wins.
 fn fold_create(
 	nodes: &mut HashMap<String, RemoteNode>,
 	path_of: &mut HashMap<Uuid, String>,
@@ -428,14 +429,23 @@ fn fold_create(
 	let Some(node) = written_node(baseline.get(path)) else {
 		return false;
 	};
-	match nodes.get(path).map(|node| node.remote_uuid) {
+	match nodes.get(path) {
 		// The cache is showing what our baseline records: it has caught up.
-		Some(current) if current == node.remote_uuid => return false,
+		Some(current) if current.remote_uuid == node.remote_uuid => return false,
 		// Ours — the write itself, or the version it superseded — so the cache is behind on us.
-		Some(current) if current == uuid || Some(current) == replaced => {}
+		Some(current) if current.remote_uuid == uuid || Some(current.remote_uuid) == replaced => {}
+		// Another VERSION of the same file. A record only reaches the fold while the cache has
+		// announced nothing of our write, and the cache cannot have applied a version that landed
+		// AFTER ours without announcing ours on the way — so what it shows here is a version our
+		// upload went on top of, whichever client made it. Left standing it reads as a foreign edit
+		// over an unconfirmed push and conflicts the client whose copy is the remote head. (A
+		// resync that skips straight past our version can still show a genuinely newer one; that
+		// costs a pass or two at this path until the grace ceiling retires the record.)
+		Some(current)
+			if current.stable_uuid.is_some() && current.stable_uuid == node.stable_uuid => {}
 		None => {}
-		// Somebody else's item: the pass has to reconcile against it, and `settle` retires such a
-		// record anyway.
+		// Somebody else's item — a different file has taken the path over, and the pass has to
+		// reconcile against it at once.
 		Some(_) => return false,
 	}
 	place_node(nodes, path_of, path.to_string(), node);
@@ -614,6 +624,10 @@ struct Prepared {
 	holds: plan::PassHolds,
 	/// The pair's live per-path failure streaks: `rel_path -> (attempts, last error)`.
 	failures: HashMap<String, (u32, String)>,
+	/// Baseline rows whose agreed-content marker this pass's raw snapshot advanced (see
+	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
+	/// either way; a real pass persists them, a dry run writes nothing.
+	confirmed: Vec<BaselineEntry>,
 	dirs: Vec<CacheableDir<'static>>,
 	files: Vec<CacheableFile<'static>>,
 }
@@ -710,6 +724,7 @@ fn synced_shell(rel_path: &str) -> BaselineEntry {
 		remote_hash: None,
 		remote_size: None,
 		remote_stable_uuid: None,
+		agreed_hash: None,
 	}
 }
 
@@ -745,6 +760,10 @@ fn resolution_entry(
 				content_hash: converged.then_some(held.content_hash).flatten(),
 				size: converged.then_some(held.size).flatten(),
 				local_mtime: converged.then_some(held.local_mtime).flatten(),
+				// Resolving is an act of agreement: whatever the row now records as this side's
+				// content is what both sides are taken to hold from here on, so the next foreign
+				// edit reads as an ordinary one instead of re-conflicting forever.
+				agreed_hash: converged.then_some(held.content_hash).flatten(),
 				..synced_shell(rel_path)
 			}
 		}),
@@ -767,6 +786,9 @@ fn resolution_entry(
 				remote_uuid: converged.then_some(held.remote_uuid).flatten(),
 				remote_stable_uuid: converged.then_some(held.remote_stable_uuid).flatten(),
 				remote_modified: converged.then_some(held.remote_modified).flatten(),
+				// As above — and here the row's content is the local copy either way, so the marker
+				// records it whether or not the two sides converged while the conflict was held.
+				agreed_hash: held.content_hash,
 				..synced_shell(rel_path)
 			}
 		}),
@@ -1084,21 +1106,10 @@ impl SyncEngine {
 			(record, entries, failures)
 		};
 
-		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(
-			baseline_entries
-				.into_iter()
-				.map(|entry| (entry.rel_path.clone(), entry))
-				.collect(),
-		);
-
-		let local_root = PathBuf::from(&record.local_root);
-		let scan_baseline = Arc::clone(&baseline);
-		let local_scan =
-			tokio::task::spawn_blocking(move || scan::scan_local(&local_root, &scan_baseline))
-				.await
-				.map_err(|e| {
-					Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}"))
-				})?;
+		let mut baseline_map: HashMap<String, BaselineEntry> = baseline_entries
+			.into_iter()
+			.map(|entry| (entry.rel_path.clone(), entry))
+			.collect();
 
 		// Copied BEFORE the snapshot is read: an event the cache commits afterwards describes a
 		// state this snapshot predates, so it must not retire a pending write this pass.
@@ -1109,6 +1120,22 @@ impl SyncEngine {
 			.await?;
 		let mut remote_view =
 			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
+
+		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
+		// view — before this engine's own writes are folded into it, and before the baseline is
+		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
+		// demonstrably hold, which is what a later foreign edit is measured against.
+		let confirmed = plan::confirm_agreed_content(&mut baseline_map, &remote_view.nodes);
+		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
+
+		let local_root = PathBuf::from(&record.local_root);
+		let scan_baseline = Arc::clone(&baseline);
+		let local_scan =
+			tokio::task::spawn_blocking(move || scan::scan_local(&local_root, &scan_baseline))
+				.await
+				.map_err(|e| {
+					Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}"))
+				})?;
 
 		let remote_emptied =
 			remote_view.nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some());
@@ -1147,6 +1174,7 @@ impl SyncEngine {
 			remote_emptied,
 			holds,
 			failures,
+			confirmed,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
 		})
@@ -1392,6 +1420,16 @@ impl SyncEngine {
 		}
 
 		let prep = self.prepare(pair).await?;
+		// Persist what this pass's snapshot confirmed. Only a real pass writes it: `plan_pair` stays
+		// a pure read, so a dry run inside the confirmation window just leaves it for the next pass.
+		if !prep.confirmed.is_empty() {
+			let store = self.store.lock().await;
+			for entry in &prep.confirmed {
+				store
+					.upsert_entry(pair, entry)
+					.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
+			}
+		}
 		let mut report = SyncReport::default();
 
 		tracing::debug!(
@@ -2030,6 +2068,7 @@ mod tests {
 			remote_hash: Some(hash(3)),
 			remote_size: Some(5),
 			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			agreed_hash: None,
 		}
 	}
 
@@ -2083,6 +2122,10 @@ mod tests {
 		assert_eq!(entry.size, Some(5));
 		assert_eq!(entry.local_mtime, Some(111));
 		assert_eq!(entry.remote_uuid, Some(uuid));
+		assert_eq!(
+			entry.agreed_hash, entry.content_hash,
+			"resolving records what the two sides now agree on"
+		);
 
 		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
 		assert!(
@@ -2119,6 +2162,10 @@ mod tests {
 		);
 		assert_eq!(entry.remote_modified, Some(222));
 		assert_eq!(entry.content_hash, Some(hash(3)));
+		assert_eq!(
+			entry.agreed_hash, entry.content_hash,
+			"resolving records what the two sides now agree on"
+		);
 
 		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
 		assert!(
@@ -2150,6 +2197,11 @@ mod tests {
 			entry.remote_uuid, None,
 			"a diverged remote side must still read as changed"
 		);
+		assert_eq!(
+			entry.agreed_hash,
+			Some(hash(3)),
+			"the resolution settles on the row's content, so the pull below is not re-read as a 			 concurrent edit and the path does not conflict forever"
+		);
 
 		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
 		let actions = plan::reconcile(
@@ -2180,6 +2232,10 @@ mod tests {
 		assert_eq!(
 			entry.content_hash, None,
 			"a diverged local side must still read as changed"
+		);
+		assert_eq!(
+			entry.agreed_hash, None,
+			"there is nothing agreed yet: the local copy has still to be pushed"
 		);
 
 		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
@@ -2233,6 +2289,7 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			agreed_hash: None,
 		}
 	}
 
@@ -2686,10 +2743,59 @@ mod tests {
 		);
 	}
 
+	/// The other side of the same-round race, on the client that WON it. Its upload is the remote
+	/// head, but the cache applied the version that upload superseded and has not announced ours
+	/// yet — so the path shows a foreign uuid of our own lineage. Reading that as somebody else's
+	/// write left the winner reconciling against the version it had already replaced: a foreign
+	/// edit over an unconfirmed push, i.e. a persisted conflict on the client whose copy IS the
+	/// head. Our write has to stand in the view instead.
+	#[test]
+	fn the_version_our_own_upload_superseded_does_not_read_as_a_foreign_write() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (base, ours, theirs) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+		pending.record(&observations, PAIR, ours, created("a.txt", Some(base)));
+
+		// The row our upload left: our bytes under our uuid, the file's lineage, and the shared
+		// base still the last content both sides were known to hold.
+		let lineage = StableUuid::new_for_test(base);
+		let mut baseline = written_row(ours, hash(2));
+		let row = baseline.get_mut("a.txt").unwrap();
+		row.remote_stable_uuid = Some(lineage);
+		row.agreed_hash = Some(hash(0));
+
+		// What the lagging cache shows: the other client's version of the SAME file, which landed
+		// first and which our upload went on top of.
+		let mut remote = node_at("a.txt", theirs);
+		let node = remote.get_mut("a.txt").unwrap();
+		node.stable_uuid = Some(lineage);
+		node.content_hash = Some(hash(1));
+
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		assert_eq!(
+			pending.fold_into(PAIR, &baseline, &mut remote),
+			1,
+			"the cache has announced nothing of ours, so what it shows is the version we replaced"
+		);
+		assert_eq!(remote["a.txt"].remote_uuid, ours);
+		assert!(
+			plan::reconcile(
+				SyncMode::TwoWay,
+				&baseline,
+				&local_map(hash(2)),
+				&remote,
+				&holds
+			)
+			.actions
+			.is_empty(),
+			"the client holding the head must not conflict with the version it superseded"
+		);
+	}
+
 	/// A third uuid at the path is not our write lagging: somebody else wrote there after us, and
 	/// the reconciler has to see that immediately rather than wait out the grace window.
 	#[test]
-	fn a_foreign_uuid_at_the_path_retires_the_write() {
+	fn a_foreign_uuid_at_the_path_is_never_painted_over() {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (old, new) = (Uuid::new_v4(), Uuid::new_v4());

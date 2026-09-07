@@ -382,6 +382,7 @@ mod tests {
 				remote_hash: None,
 				remote_size: None,
 				remote_stable_uuid: None,
+				agreed_hash: None,
 			},
 		)]);
 
