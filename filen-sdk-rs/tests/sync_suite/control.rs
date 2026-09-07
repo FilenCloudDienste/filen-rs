@@ -1510,7 +1510,7 @@ async fn control_add_persisted_pairs_autoload_on_fresh_start() {
 	// syncs without re-add; paused stays paused; baselines reused (no redundant transfer).
 }
 
-#[ignore = "blocked: no public remove_pair / clean-stop — removing a pair mid-pass must stop promptly + leave both sides intact"]
+#[ignore = "blocked: needs the deterministic mid-pass interruption seam — remove_pair exists and ends the watch loop, but proving the in-flight pass stops promptly and leaves both sides intact needs a pause hook inside apply"]
 #[shared_test_runtime]
 async fn control_add_remove_pair_mid_pass() {
 	// plan: pair with 20 uploads + 5 deletes queued; begin pass; remove(pair) mid-apply; settle =>
