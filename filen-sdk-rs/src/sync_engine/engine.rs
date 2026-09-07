@@ -1271,7 +1271,9 @@ impl SyncEngine {
 	/// nobody asked for as the price of resuming.
 	///
 	/// The flag is persisted with the pair, so an engine reopened on the same baseline DB comes
-	/// back paused. Pausing an already-paused pair is a no-op; an unknown pair is an error.
+	/// back paused. Pausing an already-paused pair is a no-op; an unknown pair is an error. A pair
+	/// that is already paused cannot be WATCHED, either — [`watch`](Self::watch) refuses it rather
+	/// than hand out a handle whose loop does nothing.
 	pub async fn pause_pair(&self, pair: PairId) -> Result<(), Error> {
 		self.set_paused(pair, true).await
 	}
@@ -2359,6 +2361,45 @@ mod tests {
 			"the restart re-does the pass's writes: {:?}",
 			actions.iter().map(describe).collect::<Vec<_>>()
 		);
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// Watching a paused pair is refused rather than started idle: a handle whose loop runs nothing
+	/// looks exactly like a broken watch, and the caller who paused the pair is the one who can say
+	/// whether it should be running.
+	#[tokio::test]
+	async fn a_watch_on_a_paused_pair_is_refused() {
+		let path =
+			std::env::temp_dir().join(format!("filen_sync_watch_paused_{}.db", Uuid::new_v4()));
+		let engine = Arc::new(
+			SyncEngine::open(offline_client(), path.clone())
+				.await
+				.unwrap(),
+		);
+		let (pair, _) = engine
+			.store
+			.lock()
+			.await
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		engine.pause_pair(pair).await.unwrap();
+
+		let error = match Arc::clone(&engine).watch(pair).await {
+			Ok(_) => panic!("a paused pair must not be watchable"),
+			Err(error) => error.to_string(),
+		};
+		assert!(
+			error.contains("paused") && error.contains("resume"),
+			"the refusal must say what to do about it: {error}"
+		);
+		// An id nobody registered is still reported as unknown, not as paused.
+		let unknown = match Arc::clone(&engine).watch(pair + 9_999).await {
+			Ok(_) => panic!("an unknown pair must not be watchable"),
+			Err(error) => error.to_string(),
+		};
+		assert!(unknown.contains("unknown sync pair"), "{unknown}");
+
 		drop(engine);
 		std::fs::remove_file(&path).ok();
 	}
