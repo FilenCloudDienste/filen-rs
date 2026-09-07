@@ -63,6 +63,12 @@ impl UnauthClient {
 		})
 	}
 
+	/// The thumbnail policy and decode gate, shared with every [`Client`] descended from this
+	/// one.
+	pub fn thumbnails(&self) -> &crate::auth::http::ThumbnailConfig {
+		self.state.thumbnails()
+	}
+
 	pub fn from_stringified(&self, stringified: StringifiedClient) -> Result<Client, Error> {
 		let auth_info =
 			AuthInfo::from_string_and_version(&stringified.auth_info, stringified.auth_version)?;

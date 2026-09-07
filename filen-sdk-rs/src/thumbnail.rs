@@ -4,8 +4,9 @@ use crate::{ErrorKind, error::Error};
 
 /// Extensions worth spending bytes on, evaluated from the filename at READ
 /// time. The one gate in front of the pipeline, on every target: the mobile
-/// cache, `makeThumbnailInMemory` and `File.canMakeThumbnail` all consult it,
-/// so a format is admitted or refused in one place.
+/// cache, `makeThumbnailInMemory` and the `canMakeThumbnail` flag on every
+/// JS file shape (`File`, `SharedFile`, `LinkedFile`) all consult it, so a
+/// format is admitted or refused in one place.
 ///
 /// This list is ours on purpose. The stored mime is written once at upload by
 /// whichever client uploaded the file — `mime-types` (JS), `mime_guess` (Rust)
@@ -585,9 +586,14 @@ mod remote_chunks {
 		EmbeddedPreview, ErrorKind, PreviewSegment, ThumbSpec, ThumbnailFit, ThumbnailOutcome,
 		locate_embedded_preview, make_thumbnail_from_source,
 	};
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use crate::auth::Client;
 	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 	use crate::fs::file::enums::RemoteFileType;
-	use crate::{auth::Client, fs::file::traits::File};
+	use crate::{
+		auth::{shared_client::SharedClient, unauth::UnauthClient},
+		fs::file::traits::File,
+	};
 	use std::sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -601,15 +607,19 @@ mod remote_chunks {
 	///
 	/// Shared by both bridges below: what a synchronous `read_at` awaits is the
 	/// same everywhere, only HOW it gets to await it differs per target.
+	///
+	/// Needs no authentication, like every read: a file carries its own key
+	/// whether it was listed from the drive, a shared-in folder or a public
+	/// link, which is what lets an `UnauthClient` thumbnail a linked file.
 	async fn fetch_range(
-		client: &Client,
+		client: &UnauthClient,
 		file: &dyn crate::fs::file::traits::File,
 		start: u64,
 		end: u64,
 	) -> Result<Vec<u8>, Error> {
 		use futures::AsyncReadExt;
 
-		let mut reader = crate::fs::file::read::FileReaderBuilder::new(client.unauthed(), file)
+		let mut reader = crate::fs::file::read::FileReaderBuilder::new(client, file)
 			.with_start(start)
 			.with_end(end)
 			.build();
@@ -673,13 +683,29 @@ mod remote_chunks {
 			handle: tokio::runtime::Handle,
 			cancel: Option<Arc<AtomicBool>>,
 		) -> Self {
+			Self::with_client(client, file, handle, cancel)
+		}
+
+		/// [`new`](Self::new) for either client: the fetch only ever needs the
+		/// unauthenticated half.
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		pub(crate) fn with_client<C, F>(
+			client: Arc<C>,
+			file: F,
+			handle: tokio::runtime::Handle,
+			cancel: Option<Arc<AtomicBool>>,
+		) -> Self
+		where
+			C: SharedClient + Send + Sync + 'static,
+			F: File + Send + Sync + 'static,
+		{
 			let len = file.size();
 			Self::with_fetcher(
 				len,
 				cancel,
 				Box::new(move |start, end| {
 					handle
-						.block_on(fetch_range(&client, &file, start, end))
+						.block_on(fetch_range(client.get_unauth_client(), &file, start, end))
 						.map_err(std::io::Error::other)
 				}),
 			)
@@ -1008,12 +1034,13 @@ mod remote_chunks {
 	/// The two arms differ only in how the synchronous work is taken off the
 	/// runtime and how its source gets back on it.
 	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
-	pub(crate) async fn over_remote_chunks<F, R>(
-		client: Arc<Client>,
+	pub(crate) async fn over_remote_chunks<C, F, R>(
+		client: Arc<C>,
 		file: &F,
 		job: impl FnOnce(Box<dyn ByteSource>) -> Result<R, Error> + Send + 'static,
 	) -> Result<R, Error>
 	where
+		C: SharedClient + Send + Sync + 'static,
 		F: File + Clone + Send + Sync + 'static,
 		R: Send + 'static,
 	{
@@ -1039,8 +1066,12 @@ mod remote_chunks {
 			// closure so the permit outlives a cancelled caller's future the way the detached
 			// job does. A locate holds it for two to four chunk reads — worth one gate over a
 			// second one that would admit nothing more.
-			let decode_permit = client.thumbnails().decode_permit().await;
-			let source = RemoteChunkSource::new(
+			let decode_permit = client
+				.get_unauth_client()
+				.thumbnails()
+				.decode_permit()
+				.await;
+			let source = RemoteChunkSource::with_client(
 				client,
 				file.clone(),
 				tokio::runtime::Handle::current(),
@@ -1075,7 +1106,11 @@ mod remote_chunks {
 			// orphaned job still runs) is worth nothing here: every job goes through the one
 			// worker in turn, so a spare permit buys no extra concurrency, only an earlier
 			// place in that queue.
-			let _decode_permit = client.thumbnails().decode_permit().await;
+			let _decode_permit = client
+				.get_unauth_client()
+				.thumbnails()
+				.decode_permit()
+				.await;
 			let (generation, mut done) = decode_worker::submit(move || job(Box::new(source)));
 			let died = || {
 				Error::custom(
@@ -1112,9 +1147,14 @@ mod remote_chunks {
 						// connection — which is time another driver must not count against
 						// the worker.
 						decode_worker::note_activity();
-						let data = fetch_range(&client, file, request.start, request.end)
-							.await
-							.map_err(std::io::Error::other);
+						let data = fetch_range(
+							client.get_unauth_client(),
+							file,
+							request.start,
+							request.end,
+						)
+						.await
+						.map_err(std::io::Error::other);
 						let _ = request.reply.send(data);
 						// Handing the chunk back is the second observation of the pair: it
 						// dates the worker's next silence from when the worker resumed, not
@@ -1153,12 +1193,13 @@ mod remote_chunks {
 	/// Thumbnails a remote file straight from its chunks: the webp bytes and
 	/// the verdict, without the file ever being resident in full.
 	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
-	pub(crate) async fn thumbnail_remote_file<F>(
-		client: Arc<Client>,
+	pub(crate) async fn thumbnail_remote_file<C, F>(
+		client: Arc<C>,
 		file: F,
 		spec: ThumbSpec,
 	) -> Result<(ThumbnailOutcome, Vec<u8>), Error>
 	where
+		C: SharedClient + Send + Sync + 'static,
 		F: File + Clone + Send + Sync + 'static,
 	{
 		over_remote_chunks(client, &file, move |source| {
@@ -1184,12 +1225,13 @@ mod remote_chunks {
 	/// write, so a consumer always sees a finished stream — and can remove the
 	/// empty file it created for a `None`.
 	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
-	pub(crate) async fn write_embedded_preview_remote<W>(
-		client: Arc<Client>,
+	pub(crate) async fn write_embedded_preview_remote<C, W>(
+		client: Arc<C>,
 		file: RemoteFileType<'static>,
 		writer: &mut W,
 	) -> Result<Option<EmbeddedPreview>, Error>
 	where
+		C: SharedClient + Send + Sync + 'static,
 		W: futures::AsyncWrite + Unpin,
 	{
 		use futures::AsyncWriteExt;
@@ -1207,7 +1249,7 @@ mod remote_chunks {
 			// segment.
 			let start = preview.located.offset;
 			let mut reader =
-				crate::fs::file::read::FileReaderBuilder::new(client.unauthed(), &file)
+				crate::fs::file::read::FileReaderBuilder::new(client.get_unauth_client(), &file)
 					.with_start(start)
 					.with_end(start + preview.located.len)
 					.build();
@@ -1249,6 +1291,8 @@ pub use remote_chunks::RemoteChunkSource;
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod js_impls {
+	use std::sync::Arc;
+
 	use filen_macros::js_type;
 
 	use super::{
@@ -1257,19 +1301,24 @@ mod js_impls {
 	};
 	use crate::{
 		Error,
-		auth::JsClient,
+		auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
 		error::MetadataWasNotDecryptedError,
 		fs::{
 			HasName,
-			file::{AnonymousRemoteFile, enums::RemoteFileType, traits::HasFileInfo},
+			file::{enums::RemoteFileType, traits::HasFileInfo},
 		},
-		js::{AnyFile, File},
+		js::AnyFile,
 		runtime::do_on_commander,
 	};
 
-	#[js_type(import)]
+	// `no_ser`: `AnyFile` is an import-only shape (untagged on the way in from
+	// JS) and has no `Serialize`, so this cannot derive one either.
+	#[js_type(import, no_ser)]
 	pub struct MakeThumbnailInMemoryParams {
-		pub file: File,
+		/// Any file that can be read: a drive file, a file listed from a
+		/// shared-in folder or a public link (no stable id), a file shared
+		/// with you directly, or a file link. Thumbnailing only reads.
+		pub file: AnyFile,
 		pub max_width: u32,
 		pub max_height: u32,
 	}
@@ -1323,6 +1372,54 @@ mod js_impls {
 		},
 	}
 
+	/// One body for both clients: nothing here needs an account, and a file
+	/// from a public link is exactly what an `UnauthClient` holds.
+	async fn make_thumbnail_in_memory_generic<C>(
+		client: Arc<C>,
+		params: MakeThumbnailInMemoryParams,
+	) -> Result<MakeThumbnailInMemoryResult, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+	{
+		do_on_commander(move || async move {
+			let file = RemoteFileType::try_from(params.file)?;
+			let mime = file.mime().ok_or(MetadataWasNotDecryptedError)?;
+			// The extension, not the stored mime: that mime is whatever the
+			// uploading client's library said years ago, and RAW is absent
+			// from every such table (see `might_be_thumbnailable`) — gated on
+			// it, this refused every RAW on the drive while the mobile cache
+			// thumbnailed them fine.
+			if !might_be_thumbnailable(file.name(), Some(mime)) {
+				return Ok(MakeThumbnailInMemoryResult::Unsupported);
+			}
+			let spec = client.get_unauth_client().thumbnails().spec_remote(
+				params.max_width,
+				params.max_height,
+				file.size(),
+			);
+			let (outcome, webp_data) = thumbnail_remote_file(client, file, spec).await?;
+			Ok(match outcome {
+				ThumbnailOutcome::Thumbnail(info) => MakeThumbnailInMemoryResult::Thumbnail {
+					thumbnail: InMemoryThumbnail {
+						#[cfg(feature = "wasm-full")]
+						webp_data: serde_bytes::ByteBuf::from(webp_data),
+						#[cfg(feature = "uniffi")]
+						webp_data,
+						width: info.width,
+						height: info.height,
+						from_embedded_preview: info.source == ThumbSource::EmbeddedPreview,
+					},
+				},
+				ThumbnailOutcome::Unsupported => MakeThumbnailInMemoryResult::Unsupported,
+				ThumbnailOutcome::OverBudget => MakeThumbnailInMemoryResult::OverBudget,
+				ThumbnailOutcome::Corrupt(message) => {
+					MakeThumbnailInMemoryResult::Corrupt { message }
+				}
+			})
+		})
+		.await
+	}
+
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
@@ -1342,44 +1439,25 @@ mod js_impls {
 			&self,
 			params: MakeThumbnailInMemoryParams,
 		) -> Result<MakeThumbnailInMemoryResult, Error> {
-			let this = self.inner();
-			do_on_commander(move || async move {
-				// Thumbnailing only reads the file, so a file from a link or a
-				// shared-in listing (which reports no stable id) is fine.
-				let file = AnonymousRemoteFile::try_from(params.file)?;
-				let mime = file.mime().ok_or(MetadataWasNotDecryptedError)?;
-				// The extension, not the stored mime: that mime is whatever the
-				// uploading client's library said years ago, and RAW is absent
-				// from every such table (see `might_be_thumbnailable`) — gated on
-				// it, this refused every RAW on the drive while the mobile cache
-				// thumbnailed them fine.
-				if !might_be_thumbnailable(file.name(), Some(mime)) {
-					return Ok(MakeThumbnailInMemoryResult::Unsupported);
-				}
-				let spec =
-					this.thumbnails()
-						.spec_remote(params.max_width, params.max_height, file.size());
-				let (outcome, webp_data) = thumbnail_remote_file(this, file, spec).await?;
-				Ok(match outcome {
-					ThumbnailOutcome::Thumbnail(info) => MakeThumbnailInMemoryResult::Thumbnail {
-						thumbnail: InMemoryThumbnail {
-							#[cfg(feature = "wasm-full")]
-							webp_data: serde_bytes::ByteBuf::from(webp_data),
-							#[cfg(feature = "uniffi")]
-							webp_data,
-							width: info.width,
-							height: info.height,
-							from_embedded_preview: info.source == ThumbSource::EmbeddedPreview,
-						},
-					},
-					ThumbnailOutcome::Unsupported => MakeThumbnailInMemoryResult::Unsupported,
-					ThumbnailOutcome::OverBudget => MakeThumbnailInMemoryResult::OverBudget,
-					ThumbnailOutcome::Corrupt(message) => {
-						MakeThumbnailInMemoryResult::Corrupt { message }
-					}
-				})
-			})
-			.await
+			make_thumbnail_in_memory_generic(self.inner(), params).await
+		}
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
+	)]
+	#[cfg_attr(feature = "uniffi", uniffi::export)]
+	impl UnauthJsClient {
+		#[cfg_attr(
+			all(target_family = "wasm", target_os = "unknown"),
+			wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailInMemory")
+		)]
+		pub async fn make_thumbnail_in_memory(
+			&self,
+			params: MakeThumbnailInMemoryParams,
+		) -> Result<MakeThumbnailInMemoryResult, Error> {
+			make_thumbnail_in_memory_generic(self.inner(), params).await
 		}
 	}
 	/// What came of writing a file's embedded preview.
@@ -1449,6 +1527,56 @@ mod js_impls {
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	async fn write_embedded_preview_generic<C>(
+		client: Arc<C>,
+		params: WriteEmbeddedPreviewParams,
+	) -> Result<EmbeddedPreviewResult, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+	{
+		use crate::fs::file::service_worker::{StreamWriter, WriteFrame};
+
+		// The same bridge `downloadFileToWriter` uses: frames cross to a
+		// local task that owns the JS stream, so nothing here ever holds
+		// more than one flush buffer of the preview.
+		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
+		let writer = wasm_streams::WritableStream::from_raw(params.writer)
+			.try_into_async_write()
+			.map_err(|(e, _)| {
+				Error::custom(
+					crate::ErrorKind::Conversion,
+					format!("got error when converting to WritableStream: {:?}", e),
+				)
+			})?;
+		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
+		crate::js::spawn_buffered_write_future(
+			data_receiver,
+			writer,
+			None::<fn(u64)>,
+			result_sender,
+		);
+
+		params
+			.managed_future
+			.into_js_managed_commander_future(move || async move {
+				let file = RemoteFileType::try_from(params.file)?;
+				let mut writer = StreamWriter::new(data_sender);
+				let preview = write_embedded_preview_remote(client, file, &mut writer).await?;
+				// The close above sent the Done frame; wait for the JS
+				// side to have taken every byte before answering, or a
+				// caller could read the file back before it is whole.
+				result_receiver.await.unwrap_or_else(|_| {
+					Err(Error::custom(
+						crate::ErrorKind::Cancelled,
+						"preview write task cancelled",
+					))
+				})?;
+				Ok(EmbeddedPreviewResult::from(preview))
+			})?
+			.await
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 	impl JsClient {
 		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
@@ -1458,49 +1586,67 @@ mod js_impls {
 			&self,
 			params: WriteEmbeddedPreviewParams,
 		) -> Result<EmbeddedPreviewResult, Error> {
-			use crate::fs::file::service_worker::{StreamWriter, WriteFrame};
-
-			let this = self.inner();
-			// The same bridge `downloadFileToWriter` uses: frames cross to a
-			// local task that owns the JS stream, so nothing here ever holds
-			// more than one flush buffer of the preview.
-			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-			let writer = wasm_streams::WritableStream::from_raw(params.writer)
-				.try_into_async_write()
-				.map_err(|(e, _)| {
-					Error::custom(
-						crate::ErrorKind::Conversion,
-						format!("got error when converting to WritableStream: {:?}", e),
-					)
-				})?;
-			let (result_sender, result_receiver) =
-				tokio::sync::oneshot::channel::<Result<(), Error>>();
-			crate::js::spawn_buffered_write_future(
-				data_receiver,
-				writer,
-				None::<fn(u64)>,
-				result_sender,
-			);
-
-			params
-				.managed_future
-				.into_js_managed_commander_future(move || async move {
-					let file = RemoteFileType::try_from(params.file)?;
-					let mut writer = StreamWriter::new(data_sender);
-					let preview = write_embedded_preview_remote(this, file, &mut writer).await?;
-					// The close above sent the Done frame; wait for the JS
-					// side to have taken every byte before answering, or a
-					// caller could read the file back before it is whole.
-					result_receiver.await.unwrap_or_else(|_| {
-						Err(Error::custom(
-							crate::ErrorKind::Cancelled,
-							"preview write task cancelled",
-						))
-					})?;
-					Ok(EmbeddedPreviewResult::from(preview))
-				})?
-				.await
+			write_embedded_preview_generic(self.inner(), params).await
 		}
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
+	impl UnauthJsClient {
+		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
+		/// shot — into `writer`, as stored. See [`EmbeddedPreviewResult`].
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "writeEmbeddedPreview")]
+		pub async fn write_embedded_preview(
+			&self,
+			params: WriteEmbeddedPreviewParams,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			write_embedded_preview_generic(self.inner(), params).await
+		}
+	}
+
+	#[cfg(feature = "uniffi")]
+	async fn write_embedded_preview_to_path_generic<C>(
+		client: Arc<C>,
+		file: AnyFile,
+		file_path: String,
+		managed_future: crate::js::ManagedFuture,
+	) -> Result<EmbeddedPreviewResult, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+	{
+		use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let file = RemoteFileType::try_from(file)?;
+				let path = std::path::PathBuf::from(file_path);
+				let file_name = path
+					.file_name()
+					.map(|name| name.to_string_lossy().into_owned())
+					.ok_or_else(|| {
+						Error::custom(
+							crate::ErrorKind::IO,
+							"preview path has no file name".to_string(),
+						)
+					})?;
+				let tmp_path =
+					path.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+				let tmp_file = tokio::fs::OpenOptions::new()
+					.write(true)
+					.create_new(true)
+					.open(&tmp_path)
+					.await?;
+				let mut tmp_guard = crate::io::client_impl::TmpFileGuard::new(tmp_path.clone());
+				let mut writer = tmp_file.compat_write();
+				let preview = write_embedded_preview_remote(client, file, &mut writer).await?;
+				drop(writer);
+				if preview.is_some() {
+					tokio::fs::rename(&tmp_path, &path).await?;
+					tmp_guard.disarm();
+				}
+				Ok(EmbeddedPreviewResult::from(preview))
+			})
+			.await
 	}
 
 	#[cfg(feature = "uniffi")]
@@ -1518,39 +1664,27 @@ mod js_impls {
 			file_path: String,
 			managed_future: crate::js::ManagedFuture,
 		) -> Result<EmbeddedPreviewResult, Error> {
-			use tokio_util::compat::TokioAsyncWriteCompatExt;
+			write_embedded_preview_to_path_generic(self.inner(), file, file_path, managed_future)
+				.await
+		}
+	}
 
-			let this = self.inner();
-			managed_future
-				.into_js_managed_commander_future(move || async move {
-					let file = RemoteFileType::try_from(file)?;
-					let path = std::path::PathBuf::from(file_path);
-					let file_name = path
-						.file_name()
-						.map(|name| name.to_string_lossy().into_owned())
-						.ok_or_else(|| {
-							Error::custom(
-								crate::ErrorKind::IO,
-								"preview path has no file name".to_string(),
-							)
-						})?;
-					let tmp_path =
-						path.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-					let tmp_file = tokio::fs::OpenOptions::new()
-						.write(true)
-						.create_new(true)
-						.open(&tmp_path)
-						.await?;
-					let mut tmp_guard = crate::io::client_impl::TmpFileGuard::new(tmp_path.clone());
-					let mut writer = tmp_file.compat_write();
-					let preview = write_embedded_preview_remote(this, file, &mut writer).await?;
-					drop(writer);
-					if preview.is_some() {
-						tokio::fs::rename(&tmp_path, &path).await?;
-						tmp_guard.disarm();
-					}
-					Ok(EmbeddedPreviewResult::from(preview))
-				})
+	#[cfg(feature = "uniffi")]
+	#[uniffi::export]
+	impl UnauthJsClient {
+		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
+		/// shot — to `file_path`, as stored. See [`EmbeddedPreviewResult`].
+		///
+		/// Written beside the destination and renamed into place, so nothing
+		/// a viewer might cache ever sits at the path half-finished; on
+		/// `noPreview` no file is left at all.
+		pub async fn write_embedded_preview_to_path(
+			&self,
+			file: AnyFile,
+			file_path: String,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			write_embedded_preview_to_path_generic(self.inner(), file, file_path, managed_future)
 				.await
 		}
 	}
