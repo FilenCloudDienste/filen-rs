@@ -178,6 +178,22 @@ pub(crate) struct BaselineEntry {
 	/// one does not, so it is what tells a new version of the SAME file apart from a DIFFERENT file
 	/// that has taken the path over.
 	pub(crate) remote_stable_uuid: Option<StableUuid>,
+	/// The last content BOTH sides were known to hold at this path.
+	///
+	/// `content_hash` is what THIS side recorded; this is what the two sides last AGREED on. A pull,
+	/// an adopt of a converged path and a conflict resolution write the two the same — both sides
+	/// demonstrably held that content at that moment. A PUSH does not: an upload proves the server
+	/// took our bytes, not that the remote still held them when we next looked, so the marker stays
+	/// on the previous agreed content until a snapshot shows our own version at the path.
+	///
+	/// That gap is what tells a remote edit made AFTER our push (pull it) from one made
+	/// CONCURRENTLY with it (a conflict) — see `plan::reconcile_two_way`.
+	///
+	/// `None` = nothing is on record (a file this side created and pushed, and nothing has confirmed
+	/// it since). That is an UNCONFIRMED push like any other, not consent: a foreign version of the
+	/// same lineage landing on such a row is a conflict, which is what makes two clients creating
+	/// the same name concurrently non-silent.
+	pub(crate) agreed_hash: Option<Blake3Hash>,
 }
 
 /// One row of the persisted pending-write journal: a remote write this engine made, and when by
@@ -439,8 +455,8 @@ impl BaselineStore {
 			"INSERT OR REPLACE INTO baseline
 			 (pair_id, rel_path, kind, remote_uuid, content_hash, size, local_mtime,
 			  remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
-			  remote_stable_uuid)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+			  remote_stable_uuid, agreed_hash)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
 			params![
 				pair,
 				entry.rel_path,
@@ -456,6 +472,7 @@ impl BaselineStore {
 				entry.remote_hash.as_ref().map(|h| h.as_ref().as_slice()),
 				entry.remote_size.map(|s| s as i64),
 				entry.remote_stable_uuid,
+				entry.agreed_hash.as_ref().map(|h| h.as_ref().as_slice()),
 			],
 		)?;
 		Ok(())
@@ -471,7 +488,7 @@ impl BaselineStore {
 			.query_row(
 				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
 				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
-				        remote_stable_uuid
+				        remote_stable_uuid, agreed_hash
 				 FROM baseline WHERE pair_id = ?1 AND rel_path = ?2",
 				params![pair, rel_path],
 				Self::row_to_entry,
@@ -485,7 +502,7 @@ impl BaselineStore {
 			.prepare(
 				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
 				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
-				        remote_stable_uuid
+				        remote_stable_uuid, agreed_hash
 				 FROM baseline WHERE pair_id = ?1 ORDER BY rel_path",
 			)?
 			.query_map(params![pair], Self::row_to_entry)?
@@ -676,6 +693,10 @@ impl BaselineStore {
 			.get::<_, Option<Vec<u8>>>("remote_hash")?
 			.map(hash_from_blob)
 			.transpose()?;
+		let agreed_hash = row
+			.get::<_, Option<Vec<u8>>>("agreed_hash")?
+			.map(hash_from_blob)
+			.transpose()?;
 		let side_kind = |raw: Option<i64>| match raw {
 			None => Ok(None),
 			Some(raw) => NodeKind::from_i64(raw)
@@ -696,6 +717,7 @@ impl BaselineStore {
 			remote_hash,
 			remote_size: row.get::<_, Option<i64>>("remote_size")?.map(|s| s as u64),
 			remote_stable_uuid: row.get("remote_stable_uuid")?,
+			agreed_hash,
 		})
 	}
 }
@@ -719,6 +741,7 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: Some(StableUuid::new_for_test(Uuid::new_v4())),
+			agreed_hash: Some(Blake3Hash::from([0xAB; 32])),
 		}
 	}
 
@@ -737,6 +760,7 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: None,
+			agreed_hash: None,
 		}
 	}
 

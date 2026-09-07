@@ -561,6 +561,9 @@ async fn apply_transfer(
 				remote.map(|n| n.size).unwrap_or(0),
 				local_mtime_of(&path),
 				remote.map(|n| n.modified_millis),
+				// A pull is the moment both sides demonstrably hold the same bytes: the content just
+				// fetched IS the agreed content.
+				remote.and_then(|n| n.content_hash),
 			)
 			.await?;
 		}
@@ -595,6 +598,11 @@ async fn apply_transfer(
 				local.map(|n| n.size).unwrap_or(0),
 				local.map(|n| n.mtime_millis),
 				Some(uploaded.timestamp.timestamp_millis()),
+				// A push does NOT make its own content agreed: the server took our bytes, but
+				// another client's edit may already be on its way to the same path. The marker stays
+				// on the previous agreed content until a snapshot lists this version at this path
+				// (`plan::confirm_agreed_content`), and the gap is what surfaces a concurrent edit.
+				ctx.baseline.get(rel_path).and_then(|b| b.agreed_hash),
 			);
 			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
 		}
@@ -730,6 +738,9 @@ async fn apply_one(
 				local.map(|n| n.size).unwrap_or(0),
 				local.map(|n| n.mtime_millis),
 				Some(remote_file.timestamp.timestamp_millis()),
+				// A move changes no content, so whatever the two sides agreed on at the old path
+				// they still agree on at the new one.
+				ctx.baseline.get(from_path).and_then(|b| b.agreed_hash),
 			);
 			commit_remote_write(
 				ctx,
@@ -779,6 +790,9 @@ async fn apply_one(
 					.unwrap_or(0),
 				local_mtime_of(&to),
 				remote.map(|n| n.modified_millis),
+				// The row follows the moved file, and so does its agreed content. A move that
+				// carried an edit is paired with a download, which re-records both.
+				base.and_then(|b| b.agreed_hash),
 			)
 			.await?;
 			report.moved_local += 1;
@@ -859,8 +873,9 @@ fn local_holds_unsynced_content(path: &Path, base: Option<&BaselineEntry>) -> bo
 /// policy is unit-testable.
 #[derive(Debug, PartialEq, Eq)]
 enum AdoptOutcome {
-	/// Both sides hold the item and agree — record the converged state.
-	Record(BaselineEntry),
+	/// Both sides hold the item and agree — record the converged state. Boxed: the row dwarfs the
+	/// two unit variants beside it.
+	Record(Box<BaselineEntry>),
 	/// Both sides agree the item is GONE (a convergent delete) — drop the stale baseline row.
 	DropRow,
 	/// Both sides LOOK gone, but this pass's absence evidence is untrustworthy — leave the row for
@@ -882,7 +897,7 @@ fn adopt_outcome(
 	absence_trusted: bool,
 ) -> AdoptOutcome {
 	match (local, remote) {
-		(Some(local), Some(remote)) => AdoptOutcome::Record(BaselineEntry {
+		(Some(local), Some(remote)) => AdoptOutcome::Record(Box::new(BaselineEntry {
 			rel_path: rel_path.to_string(),
 			kind: remote.kind,
 			remote_uuid: Some(remote.remote_uuid),
@@ -905,7 +920,13 @@ fn adopt_outcome(
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: remote.stable_uuid,
-		}),
+			// Adopting is the observation that both sides already hold this content, which is
+			// exactly what the agreed marker records.
+			agreed_hash: match remote.kind {
+				NodeKind::Dir => None,
+				NodeKind::File => remote.content_hash,
+			},
+		})),
 		// A convergent delete drops the row — but only when the pass can trust that both sides are
 		// really gone. Under an incomplete scan or an un-converged/empty remote view the row is the
 		// only record that the item was ever synced; dropping it makes the next healthy pass read
@@ -947,6 +968,8 @@ pub(super) async fn record_conflict(
 		remote_hash: remote.and_then(|r| r.content_hash),
 		remote_size: remote.map(|r| r.size),
 		remote_stable_uuid: remote.and_then(|r| r.stable_uuid),
+		// While the divergence is held there is no agreed content; resolving it records one again.
+		agreed_hash: None,
 	};
 	store
 		.lock()
@@ -979,10 +1002,18 @@ fn dir_entry(rel_path: &str, remote_uuid: Option<Uuid>, local_mtime: Option<i64>
 		remote_size: None,
 		// A directory has no whole-life id of its own: its uuid already survives its renames.
 		remote_stable_uuid: None,
+		// Nor any content for the two sides to agree on.
+		agreed_hash: None,
 	}
 }
 
 /// The synced baseline row a file write leaves behind.
+///
+/// `agreed_hash` is the caller's to decide, because only the caller knows what its write proved:
+/// a pull records the content it just fetched (both sides demonstrably hold it), a push carries
+/// the PREVIOUS agreed content forward (the upload says nothing about what the remote holds by the
+/// time we look again), and a move carries the moved row's marker to its new path. See
+/// [`BaselineEntry::agreed_hash`].
 #[allow(clippy::too_many_arguments)]
 fn file_entry(
 	rel_path: &str,
@@ -992,6 +1023,7 @@ fn file_entry(
 	size: u64,
 	local_mtime: Option<i64>,
 	remote_modified: Option<i64>,
+	agreed_hash: Option<filen_types::crypto::Blake3Hash>,
 ) -> BaselineEntry {
 	BaselineEntry {
 		rel_path: rel_path.to_string(),
@@ -1007,6 +1039,7 @@ fn file_entry(
 		remote_hash: None,
 		remote_size: None,
 		remote_stable_uuid,
+		agreed_hash,
 	}
 }
 
@@ -1029,6 +1062,7 @@ async fn upsert_file_baseline(
 	size: u64,
 	local_mtime: Option<i64>,
 	remote_modified: Option<i64>,
+	agreed_hash: Option<filen_types::crypto::Blake3Hash>,
 ) -> Result<(), crate::Error> {
 	upsert_baseline(
 		ctx,
@@ -1040,6 +1074,7 @@ async fn upsert_file_baseline(
 			size,
 			local_mtime,
 			remote_modified,
+			agreed_hash,
 		),
 	)
 	.await
@@ -1305,6 +1340,7 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: None,
+			agreed_hash: None,
 		}
 	}
 
@@ -1383,6 +1419,22 @@ mod tests {
 		assert_eq!(entry.content_hash, Some(hash));
 		assert_eq!(entry.remote_uuid, Some(remote.remote_uuid));
 		assert_eq!(entry.remote_modified, Some(900));
+		// Adopting a converged path is the observation that BOTH sides hold this content, so it is
+		// also what records the agreed content the concurrent-edit rule reads.
+		assert_eq!(entry.agreed_hash, entry.content_hash);
+		assert!(entry.agreed_hash.is_some());
+	}
+
+	/// A directory has no content, so nothing for the two sides to agree on.
+	#[test]
+	fn adopting_a_directory_records_no_agreed_content() {
+		let local = local_node("d", 1, None);
+		let mut remote = remote_node("d", None);
+		remote.kind = NodeKind::Dir;
+		match adopt_outcome("d", Some(&local), Some(&remote), true) {
+			AdoptOutcome::Record(entry) => assert_eq!(entry.agreed_hash, None),
+			other => panic!("expected a recorded row, got {other:?}"),
+		}
 	}
 
 	#[test]
