@@ -17,14 +17,22 @@ use uuid::Uuid;
 
 use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode};
 
-/// The schema version this build writes and understands, stamped into `PRAGMA user_version`. A DB
-/// carrying a HIGHER version was written by a newer engine and is REFUSED (never read under the
-/// older rules, which would misread it into deletes); a LOWER one is migrated forward in place.
-const SCHEMA_VERSION: i64 = 6;
+/// The schema version this build writes and understands, stamped into `PRAGMA user_version`.
+///
+/// There is no migration chain and no released schema to migrate FROM: a DB stamped at anything
+/// else — older or newer — was not written by this engine, and reading it under these rules would
+/// misread its rows into deletes. Both directions are refused (see [`BaselineStore::init`]); the
+/// first released schema is what a migration path would start from.
+const SCHEMA_VERSION: i64 = 1;
 
-/// Schema for the baseline DB. `foreign_keys` is applied per-connection in [`BaselineStore::init`]
-/// (it resets to off on every open). No WAL: a single owner writes and reads this DB, so the
-/// default rollback journal is enough.
+/// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys` is applied
+/// per-connection in [`BaselineStore::init`] (it resets to off on every open). No WAL: a single
+/// owner writes and reads this DB, so the default rollback journal is enough.
+///
+/// `pending_writes` is the journal of remote writes this engine has made that the cache has not
+/// announced yet (see [`PendingWrites`](super::engine::PendingWrites)), keyed by uuid like the
+/// in-memory journal it mirrors. `path_failures` counts how many times in a row applying one path
+/// has failed, and what the last failure said. Both cascade with their pair.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sync_pairs (
 	id INTEGER PRIMARY KEY,
@@ -52,14 +60,10 @@ CREATE TABLE IF NOT EXISTS baseline (
 	remote_hash BLOB,
 	remote_size INTEGER,
 	remote_stable_uuid BLOB,
+	agreed_hash BLOB,
 	PRIMARY KEY (pair_id, rel_path)
 );
-";
 
-/// The v2 addition: the journal of remote writes this engine has made that the cache has not
-/// announced yet (see [`PendingWrites`](super::engine::PendingWrites)). Keyed by uuid, like the
-/// in-memory journal it mirrors, and cascaded with its pair.
-const PENDING_WRITES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pending_writes (
 	uuid BLOB PRIMARY KEY,
 	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
@@ -70,11 +74,7 @@ CREATE TABLE IF NOT EXISTS pending_writes (
 	to_path TEXT,
 	recorded_at INTEGER NOT NULL
 );
-";
 
-/// The v4 addition: how many times in a row applying one path has failed, and what the last
-/// failure said. Cascaded with its pair, like the journal.
-const PATH_FAILURES_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS path_failures (
 	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
 	rel_path TEXT NOT NULL,
@@ -249,97 +249,33 @@ fn hash_from_blob(bytes: Vec<u8>) -> rusqlite::Result<Blake3Hash> {
 		})
 }
 
-/// Whether `table` already has a column named `column`.
-fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-	let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-	let mut rows = stmt.query_map([], |row| row.get::<_, String>("name"))?;
-	rows.try_fold(false, |found, name| Ok(found || name? == column))
+/// Whether the DB has never been written to — no table of ours, and none of anybody else's. That,
+/// not `user_version`, is what tells a brand-new file apart from a DB stamped at a version this
+/// build does not know: version 0 is both "SQLite's default for an empty file" and "stamped by
+/// something that did not use `user_version`".
+fn is_unwritten(conn: &Connection) -> rusqlite::Result<bool> {
+	let tables: i64 = conn.query_row(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+		[],
+		|row| row.get(0),
+	)?;
+	Ok(tables == 0)
 }
 
-/// Bring a DB stamped at `from` up to [`SCHEMA_VERSION`], one version at a time. A fresh DB starts
-/// at 0 and runs every step, so each one is idempotent against the tables [`SCHEMA`] just created.
-fn migrate(conn: &Connection, from: i64) -> rusqlite::Result<()> {
-	if from < 1 {
-		migrate_to_v1(conn)?;
-	}
-	if from < 2 {
-		migrate_to_v2(conn)?;
-	}
-	if from < 3 {
-		migrate_to_v3(conn)?;
-	}
-	if from < 4 {
-		migrate_to_v4(conn)?;
-	}
-	if from < 5 {
-		migrate_to_v5(conn)?;
-	}
-	if from < 6 {
-		migrate_to_v6(conn)?;
-	}
-	Ok(())
-}
-
-/// Bring a version-0 DB (written before `user_version` was stamped, so without the per-side
-/// conflict-evidence columns) up to v1. A DB freshly created from [`SCHEMA`] already has them, so
-/// this is a no-op there.
-fn migrate_to_v1(conn: &Connection) -> rusqlite::Result<()> {
-	for (column, ty) in [
-		("local_kind", "INTEGER"),
-		("remote_kind", "INTEGER"),
-		("remote_hash", "BLOB"),
-		("remote_size", "INTEGER"),
-	] {
-		if !has_column(conn, "baseline", column)? {
-			conn.execute_batch(&format!("ALTER TABLE baseline ADD COLUMN {column} {ty};"))?;
-		}
-	}
-	Ok(())
-}
-
-/// Bring a v1 DB up to v2: the pending-write journal. A v1 DB simply has none, so creating the
-/// table is the whole migration — no existing row is read or rewritten.
-fn migrate_to_v2(conn: &Connection) -> rusqlite::Result<()> {
-	conn.execute_batch(PENDING_WRITES_SCHEMA)
-}
-
-/// Bring a v2 DB up to v3: the per-pair delete-guard threshold. Both columns are NULLable and a
-/// NULL pair of them reads back as [`DeleteGuard::default`], so every existing pair keeps exactly
-/// the hardcoded policy it was already running under.
-fn migrate_to_v3(conn: &Connection) -> rusqlite::Result<()> {
-	for (column, ty) in [("guard_floor", "INTEGER"), ("guard_ratio", "REAL")] {
-		if !has_column(conn, "sync_pairs", column)? {
-			conn.execute_batch(&format!("ALTER TABLE sync_pairs ADD COLUMN {column} {ty};"))?;
-		}
-	}
-	Ok(())
-}
-
-/// Bring a v3 DB up to v4: the per-path failure counters. A v3 DB simply has none, so creating the
-/// table is the whole migration — every path starts from a clean slate, which is also what a
-/// successful pass would have left behind.
-fn migrate_to_v4(conn: &Connection) -> rusqlite::Result<()> {
-	conn.execute_batch(PATH_FAILURES_SCHEMA)
-}
-
-/// Bring a v4 DB up to v5: the per-pair paused flag. Every existing pair defaults to NOT paused,
-/// which is what it was; a DB freshly created from [`SCHEMA`] already carries the column.
-fn migrate_to_v5(conn: &Connection) -> rusqlite::Result<()> {
-	if !has_column(conn, "sync_pairs", "paused")? {
-		conn.execute_batch("ALTER TABLE sync_pairs ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;")?;
-	}
-	Ok(())
-}
-
-/// Bring a v5 DB up to v6: the file's server-minted whole-life id alongside its version uuid. A v5
-/// row simply has none, and a NULL there reads as "lineage unknown" — which every rule consulting
-/// it already treats as no evidence — so no existing row is read or rewritten; each path re-learns
-/// its id the next time the pair writes there.
-fn migrate_to_v6(conn: &Connection) -> rusqlite::Result<()> {
-	if !has_column(conn, "baseline", "remote_stable_uuid")? {
-		conn.execute_batch("ALTER TABLE baseline ADD COLUMN remote_stable_uuid BLOB;")?;
-	}
-	Ok(())
+/// Create the schema and stamp its version as ONE transaction.
+///
+/// SQLite's DDL is transactional and `user_version` lives in the database header, so a failure
+/// anywhere in the batch rolls the whole thing back and leaves the file exactly as it was found:
+/// no tables, version 0 — which [`is_unwritten`] reads as a brand-new DB, so the next open creates
+/// it from scratch. Without the transaction a failure halfway through leaves a partial set of
+/// tables at version 0, and every later open refuses that as a stranger's DB.
+///
+/// Takes the batch as a parameter so the failure path is testable with a batch that cannot commit.
+fn create_schema(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
+	let tx = conn.unchecked_transaction()?;
+	conn.execute_batch(schema)?;
+	conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+	tx.commit()
 }
 
 impl BaselineStore {
@@ -353,29 +289,27 @@ impl BaselineStore {
 		Self::init(Connection::open_in_memory().map_err(open_error)?)
 	}
 
+	/// A fresh DB is created whole and stamped at [`SCHEMA_VERSION`]. An existing one is opened only
+	/// when it carries exactly that version: anything else — older or newer — is refused rather than
+	/// read, since there is no migration chain to bring it here and reading foreign rows under these
+	/// rules would misplan them into deletes.
 	fn init(conn: Connection) -> Result<Self, crate::Error> {
 		conn.execute_batch("PRAGMA foreign_keys = ON;")
 			.map_err(open_error)?;
 		let version: i64 = conn
 			.query_row("PRAGMA user_version", [], |row| row.get(0))
 			.map_err(open_error)?;
-		if version > SCHEMA_VERSION {
+		if is_unwritten(&conn).map_err(open_error)? {
+			create_schema(&conn, SCHEMA).map_err(open_error)?;
+		} else if version != SCHEMA_VERSION {
 			return Err(crate::Error::custom(
 				crate::ErrorKind::InvalidState,
 				format!(
-					"sync baseline DB is at schema version {version}, but this build understands \
-					 only up to {SCHEMA_VERSION}: refusing to open it (a newer engine wrote it; \
-					 upgrade, or remove the baseline DB to re-sync from scratch)"
+					"sync baseline DB is at schema version {version}, but this build reads only \
+					 version {SCHEMA_VERSION}: refusing to open it (it was not written by this \
+					 engine; remove the baseline DB to re-sync from scratch)"
 				),
 			));
-		}
-		// Idempotent: creates the base tables on a fresh DB, no-ops on an existing one; the
-		// migrations below add everything a later version introduced.
-		conn.execute_batch(SCHEMA).map_err(open_error)?;
-		if version < SCHEMA_VERSION {
-			migrate(&conn, version).map_err(open_error)?;
-			conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
-				.map_err(open_error)?;
 		}
 		Ok(Self { conn })
 	}
@@ -784,7 +718,7 @@ mod tests {
 			remote_kind: None,
 			remote_hash: None,
 			remote_size: None,
-			remote_stable_uuid: None,
+			remote_stable_uuid: Some(StableUuid::new_for_test(Uuid::new_v4())),
 		}
 	}
 
@@ -843,115 +777,77 @@ mod tests {
 		assert_eq!(version_of(&store), SCHEMA_VERSION);
 	}
 
+	/// Both directions of a version mismatch are refused, and the DB is left exactly as it was.
+	/// There is no migration chain: a stamp other than the current one means the DB was not written
+	/// by this engine, whichever side of the current version it sits on.
 	#[test]
-	fn a_newer_than_supported_db_is_refused_not_degraded() {
-		let path = std::env::temp_dir().join(format!("filen_baseline_v2_{}.db", Uuid::new_v4()));
-		{
-			let store = BaselineStore::open(&path).unwrap();
-			store
-				.conn
-				.execute_batch(&format!("PRAGMA user_version = {};", SCHEMA_VERSION + 1))
+	fn a_db_stamped_at_any_other_version_is_refused_not_read() {
+		for planted in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+			let path = temp_db_path(&format!("version_{planted}"));
+			{
+				let store = BaselineStore::open(&path).unwrap();
+				store
+					.conn
+					.execute_batch(&format!("PRAGMA user_version = {planted};"))
+					.unwrap();
+			}
+			let message = match BaselineStore::open(&path) {
+				Ok(_) => panic!("schema version {planted} must be refused"),
+				Err(error) => error.to_string(),
+			};
+			assert!(
+				message.contains("schema version") && message.contains("refusing"),
+				"the refusal must name the version problem: {message}"
+			);
+			// Fails CLOSED: the DB is left as it was, neither migrated nor re-stamped in place.
+			let raw = Connection::open(&path).unwrap();
+			let still: i64 = raw
+				.query_row("PRAGMA user_version", [], |row| row.get(0))
 				.unwrap();
+			assert_eq!(still, planted, "the refused DB was rewritten");
+			drop(raw);
+			std::fs::remove_file(&path).ok();
 		}
-		let message = match BaselineStore::open(&path) {
-			Ok(_) => panic!("a newer schema must be refused"),
-			Err(error) => error.to_string(),
-		};
-		assert!(
-			message.contains("schema version") && message.contains("refusing"),
-			"the refusal must name the version problem: {message}"
-		);
-		// Fails CLOSED: the newer DB is left exactly as it was, not downgraded in place.
-		let raw = Connection::open(&path).unwrap();
-		let still: i64 = raw
-			.query_row("PRAGMA user_version", [], |row| row.get(0))
-			.unwrap();
-		assert_eq!(still, SCHEMA_VERSION + 1, "the refused DB was rewritten");
-		drop(raw);
-		std::fs::remove_file(&path).ok();
 	}
 
+	/// Creating the schema is all-or-nothing. A batch that fails partway (here: a statement SQLite
+	/// rejects, standing in for a disk error) must leave the file exactly as it was found — no
+	/// tables, version 0 — because that is the one state a later open reads as "brand new" and
+	/// creates from scratch. A partial set of tables would be refused as a stranger's DB forever.
 	#[test]
-	fn a_pre_versioning_db_is_migrated_forward_in_place() {
-		let path = std::env::temp_dir().join(format!("filen_baseline_v0_{}.db", Uuid::new_v4()));
-		// A v0 DB: the pre-versioning schema (no per-side conflict-evidence columns, user_version 0)
-		// carrying one row that must survive the migration.
+	fn a_schema_creation_that_fails_partway_leaves_no_tables_behind() {
+		let path = temp_db_path("partial_schema");
+		let broken = format!("{SCHEMA}\nCREATE TABLE oops (id INTEGER PRIMARY KEY;");
 		{
 			let conn = Connection::open(&path).unwrap();
-			conn.execute_batch(
-				"CREATE TABLE sync_pairs (
-					id INTEGER PRIMARY KEY,
-					local_root TEXT NOT NULL,
-					remote_root BLOB NOT NULL,
-					mode INTEGER NOT NULL,
-					UNIQUE (local_root, remote_root)
-				);
-				CREATE TABLE baseline (
-					pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
-					rel_path TEXT NOT NULL,
-					kind INTEGER NOT NULL,
-					remote_uuid BLOB,
-					content_hash BLOB,
-					size INTEGER,
-					local_mtime INTEGER,
-					remote_modified INTEGER,
-					state INTEGER NOT NULL,
-					PRIMARY KEY (pair_id, rel_path)
-				);
-				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
-					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
-				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
-					VALUES (1, 'kept.txt', 2, 7, 0);",
-			)
-			.unwrap();
+			create_schema(&conn, &broken).expect_err("the broken batch must fail");
+			assert!(
+				is_unwritten(&conn).unwrap(),
+				"the failed creation left tables behind"
+			);
+			let version: i64 = conn
+				.query_row("PRAGMA user_version", [], |row| row.get(0))
+				.unwrap();
+			assert_eq!(version, 0, "the failed creation stamped a version");
 		}
 
-		let store = BaselineStore::open(&path).unwrap();
-		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
-		let entry = store.entry(1, "kept.txt").unwrap().expect("row survived");
-		assert_eq!(entry.size, Some(7));
-		assert_eq!(entry.local_kind, None, "the new columns read back as unset");
-		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
-		drop(store);
-
-		// Re-opening the migrated DB is a clean no-op (the migration runs exactly once).
-		let again = BaselineStore::open(&path).unwrap();
-		assert_eq!(version_of(&again), SCHEMA_VERSION);
-		assert!(again.entry(1, "kept.txt").unwrap().is_some());
-		drop(again);
-		std::fs::remove_file(&path).ok();
-	}
-
-	#[test]
-	fn a_v2_db_gains_the_delete_guard_columns_and_its_pairs_keep_the_default() {
-		let path = temp_db_path("v2_guard");
-		// A v2 DB: the schema before the per-pair threshold, carrying a pair that must come back
-		// running exactly the policy it ran under before the migration.
-		{
-			let conn = Connection::open(&path).unwrap();
-			conn.execute_batch(
-				"CREATE TABLE sync_pairs (
-					id INTEGER PRIMARY KEY,
-					local_root TEXT NOT NULL,
-					remote_root BLOB NOT NULL,
-					mode INTEGER NOT NULL,
-					UNIQUE (local_root, remote_root)
-				);
-				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
-					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
-				PRAGMA user_version = 2;",
-			)
-			.unwrap();
-		}
-
+		// So the next open creates it from scratch rather than refusing it.
 		let store = BaselineStore::open(&path).unwrap();
 		assert_eq!(version_of(&store), SCHEMA_VERSION);
-		let record = store.pair(1).unwrap().expect("the pair survived");
-		assert_eq!(
-			record.delete_guard,
-			DeleteGuard::default(),
-			"a pre-v3 pair keeps the policy it was already running"
-		);
+		assert!(store.list_pairs().unwrap().is_empty());
+		drop(store);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A DB file that exists but has never been written to is a FRESH one, not a version-0 stranger:
+	/// `user_version` reads 0 either way, so emptiness is what tells them apart.
+	#[test]
+	fn an_empty_db_file_is_created_from_scratch_rather_than_refused() {
+		let path = temp_db_path("empty_file");
+		drop(Connection::open(&path).unwrap());
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(version_of(&store), SCHEMA_VERSION);
+		assert!(store.list_pairs().unwrap().is_empty());
 		drop(store);
 		std::fs::remove_file(&path).ok();
 	}
@@ -1031,40 +927,6 @@ mod tests {
 		// The streak is pair-scoped state: removing the pair takes it with it.
 		store.delete_pair(pair).unwrap();
 		assert!(store.failures(pair).unwrap().is_empty());
-	}
-
-	#[test]
-	fn a_v3_db_gains_the_path_failure_table_with_every_path_clean() {
-		let path = temp_db_path("v3_failures");
-		{
-			let conn = Connection::open(&path).unwrap();
-			conn.execute_batch(
-				"CREATE TABLE sync_pairs (
-					id INTEGER PRIMARY KEY,
-					local_root TEXT NOT NULL,
-					remote_root BLOB NOT NULL,
-					mode INTEGER NOT NULL,
-					guard_floor INTEGER,
-					guard_ratio REAL,
-					UNIQUE (local_root, remote_root)
-				);
-				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
-					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
-				PRAGMA user_version = 3;",
-			)
-			.unwrap();
-		}
-
-		let store = BaselineStore::open(&path).unwrap();
-		assert_eq!(version_of(&store), SCHEMA_VERSION);
-		assert!(
-			store.failures(1).unwrap().is_empty(),
-			"a pre-v4 pair starts with no failure streaks"
-		);
-		store.record_failure(1, "x.txt", "e").unwrap();
-		assert_eq!(store.failures(1).unwrap()["x.txt"].0, 1);
-		drop(store);
-		std::fs::remove_file(&path).ok();
 	}
 
 	#[test]
@@ -1339,165 +1201,6 @@ mod tests {
 
 		assert!(store.load_pending(NOW, GRACE).unwrap().is_empty());
 		assert_eq!(pending_count(&store), 0, "the orphan was deleted");
-	}
-
-	/// v5 -> v6: the file lineage column. A v5 row has none, and must survive reading `None` there
-	/// rather than failing the open or losing anything it did record.
-	#[test]
-	fn a_v5_db_is_migrated_to_v6_keeping_its_rows() {
-		let path = temp_db_path("v5");
-		{
-			let conn = Connection::open(&path).unwrap();
-			// The v5 schema: everything except `remote_stable_uuid`.
-			conn.execute_batch(
-				"CREATE TABLE sync_pairs (
-					id INTEGER PRIMARY KEY,
-					local_root TEXT NOT NULL,
-					remote_root BLOB NOT NULL,
-					mode INTEGER NOT NULL,
-					guard_floor INTEGER,
-					guard_ratio REAL,
-					paused INTEGER NOT NULL DEFAULT 0,
-					UNIQUE (local_root, remote_root)
-				);
-				CREATE TABLE baseline (
-					pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
-					rel_path TEXT NOT NULL,
-					kind INTEGER NOT NULL,
-					remote_uuid BLOB,
-					content_hash BLOB,
-					size INTEGER,
-					local_mtime INTEGER,
-					remote_modified INTEGER,
-					state INTEGER NOT NULL,
-					local_kind INTEGER,
-					remote_kind INTEGER,
-					remote_hash BLOB,
-					remote_size INTEGER,
-					PRIMARY KEY (pair_id, rel_path)
-				);
-				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
-					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
-				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
-					VALUES (1, 'kept.txt', 2, 7, 0);
-				PRAGMA user_version = 5;",
-			)
-			.unwrap();
-			conn.execute_batch(PENDING_WRITES_SCHEMA).unwrap();
-			conn.execute_batch(PATH_FAILURES_SCHEMA).unwrap();
-		}
-
-		let store = BaselineStore::open(&path).unwrap();
-		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
-		let entry = store.entry(1, "kept.txt").unwrap().expect("row survived");
-		assert_eq!(entry.size, Some(7));
-		assert_eq!(
-			entry.remote_stable_uuid, None,
-			"a pre-v6 row reads back with no lineage recorded"
-		);
-		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
-		// The new column is writable and round-trips from the very first write.
-		let mut updated = entry;
-		updated.remote_stable_uuid = Some(StableUuid::new_for_test(Uuid::new_v4()));
-		store.upsert_entry(1, &updated).unwrap();
-		assert_eq!(store.entry(1, "kept.txt").unwrap(), Some(updated));
-		drop(store);
-		std::fs::remove_file(&path).ok();
-	}
-
-	/// The first real migration: a v1 DB (baseline rows, no journal) gains the table and keeps
-	/// everything it had.
-	#[test]
-	fn a_v1_db_is_migrated_to_v2_keeping_its_rows() {
-		let path = temp_db_path("v1");
-		{
-			let conn = Connection::open(&path).unwrap();
-			conn.execute_batch(SCHEMA).unwrap();
-			conn.execute_batch(
-				"INSERT INTO sync_pairs (id, local_root, remote_root, mode)
-					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
-				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
-					VALUES (1, 'kept.txt', 2, 7, 0);
-				PRAGMA user_version = 1;",
-			)
-			.unwrap();
-		}
-
-		let store = BaselineStore::open(&path).unwrap();
-		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
-		assert_eq!(store.entry(1, "kept.txt").unwrap().unwrap().size, Some(7));
-		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
-		// The journal the migration added is usable at once.
-		store
-			.record_pending(1, Uuid::new_v4(), &created("a.txt"), NOW, &[])
-			.unwrap();
-		assert_eq!(store.load_pending(NOW, GRACE).unwrap().len(), 1);
-		drop(store);
-		std::fs::remove_file(&path).ok();
-	}
-
-	/// A v4 DB (pairs + journal + failure counters, no paused flag) gains the column, and every pair
-	/// it already had comes back running — which is what it was.
-	#[test]
-	fn a_v4_db_is_migrated_to_v5_with_its_pairs_unpaused() {
-		let path = temp_db_path("v4");
-		{
-			let conn = Connection::open(&path).unwrap();
-			// The v4 shape of `sync_pairs`, spelled out rather than taken from SCHEMA: SCHEMA is
-			// the CURRENT shape and would already carry the column this migration adds.
-			conn.execute_batch(
-				"CREATE TABLE sync_pairs (
-					id INTEGER PRIMARY KEY,
-					local_root TEXT NOT NULL,
-					remote_root BLOB NOT NULL,
-					mode INTEGER NOT NULL,
-					guard_floor INTEGER,
-					guard_ratio REAL,
-					UNIQUE (local_root, remote_root)
-				);
-				CREATE TABLE baseline (
-					pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
-					rel_path TEXT NOT NULL,
-					kind INTEGER NOT NULL,
-					remote_uuid BLOB,
-					content_hash BLOB,
-					size INTEGER,
-					local_mtime INTEGER,
-					remote_modified INTEGER,
-					state INTEGER NOT NULL,
-					local_kind INTEGER,
-					remote_kind INTEGER,
-					remote_hash BLOB,
-					remote_size INTEGER,
-					PRIMARY KEY (pair_id, rel_path)
-				);
-				INSERT INTO sync_pairs (id, local_root, remote_root, mode)
-					VALUES (1, '/old/root', X'00000000000000000000000000000001', 0);
-				INSERT INTO baseline (pair_id, rel_path, kind, size, state)
-					VALUES (1, 'kept.txt', 2, 7, 0);
-				PRAGMA user_version = 4;",
-			)
-			.unwrap();
-			conn.execute_batch(PENDING_WRITES_SCHEMA).unwrap();
-			conn.execute_batch(PATH_FAILURES_SCHEMA).unwrap();
-		}
-
-		let store = BaselineStore::open(&path).unwrap();
-		assert_eq!(version_of(&store), SCHEMA_VERSION, "stamped in place");
-		assert_eq!(store.entry(1, "kept.txt").unwrap().unwrap().size, Some(7));
-		assert_eq!(store.list_pairs().unwrap().len(), 1, "pair survived");
-		assert!(
-			store.paused_pairs().unwrap().is_empty(),
-			"a migrated pair must come back running, not paused"
-		);
-		drop(store);
-
-		// Re-opening the migrated DB runs the step again as a no-op.
-		let again = BaselineStore::open(&path).unwrap();
-		assert_eq!(version_of(&again), SCHEMA_VERSION);
-		assert!(again.entry(1, "kept.txt").unwrap().is_some());
-		drop(again);
-		std::fs::remove_file(&path).ok();
 	}
 
 	#[test]
