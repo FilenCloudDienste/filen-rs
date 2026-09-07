@@ -1664,14 +1664,92 @@ async fn watch_22_baseline_persists_across_restart() {}
 #[shared_test_runtime]
 async fn watch_25_sustained_load_bounded() {}
 
-// WATCH-26 — removing a pair while watching stops its events and leaves data intact.
-// `remove_pair` exists now, but what a running watch is supposed to do when its pair disappears is
-// undefined: the loop keeps ticking and every pass fails with "unknown sync pair", so it settles
-// into the failure backoff logging warnings forever rather than stopping. Asserting anything here
-// needs that contract decided first (stop the loop? make the pass a no-op like a pause?).
-#[ignore = "blocked: undefined contract for a watch whose pair was removed — see TODO"]
+// ============================================================================
+// WATCH-26 — removing a pair stops its watch, and takes nothing with it
+// ============================================================================
+
+/// A watch whose pair is removed underneath it must STOP — not tick on into the failure backoff
+/// with every pass failing against a pair that no longer exists. The stop is observable on the
+/// handle's status, the handle is still fine to stop afterwards, and neither side lost anything:
+/// removal is a registry operation.
 #[shared_test_runtime]
-async fn watch_26_remove_pair_stops_events() {}
+async fn watch_26_remove_pair_stops_events() {
+	const NET: Duration = Duration::from_secs(3);
+
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::LocalToRemote).await;
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_secs(1),
+				safety_net: NET,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+	let status = handle.status();
+
+	// Liveness first: the watch is really syncing before its pair goes away.
+	write_file(&sc.local, "kept.txt", b"before the removal");
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() >= 1).await,
+		"the watch never uploaded the file (passes={})",
+		log.passes()
+	);
+
+	engine.remove_pair(pair).await.unwrap();
+	assert!(
+		wait_until(WATCH_SETTLE, || status.borrow().stopped).await,
+		"the watch never reported itself stopped after its pair was removed (passes={})",
+		log.passes()
+	);
+
+	// And it really is stopped: several safety-net intervals with a fresh local change in them
+	// produce no pass at all.
+	let passes_at_removal = log.passes();
+	let uploaded_at_removal = log.uploaded();
+	write_file(&sc.local, "after_removal.txt", b"must not be synced");
+	tokio::time::sleep(NET * 4).await;
+	assert_eq!(
+		log.passes(),
+		passes_at_removal,
+		"a pass ran after the pair was removed"
+	);
+	assert_eq!(
+		log.uploaded(),
+		uploaded_at_removal,
+		"an upload happened after the pair was removed"
+	);
+
+	// Both sides intact, and the post-removal change left alone.
+	let (_dirs, files) = list_remote_root(&sc).await;
+	assert!(
+		find_file(&files, "kept.txt").is_some(),
+		"removing the pair trashed the remote file"
+	);
+	assert!(
+		find_file(&files, "after_removal.txt").is_none(),
+		"the post-removal change was synced anyway"
+	);
+	assert!(
+		read_eq(&sc.local, "kept.txt", b"before the removal"),
+		"removing the pair touched the local file"
+	);
+
+	// The handle is still fine: stopping an already-stopped loop returns at once.
+	let t = std::time::Instant::now();
+	handle.stop().await;
+	assert!(
+		t.elapsed() < Duration::from_secs(5),
+		"stopping a watch whose pair was removed hung"
+	);
+
+	sc.cleanup();
+}
 
 // (add) — a burst of REMOTE notifications is coalesced into a single pass (remote symmetry of -03).
 // Doable in spirit (bulk-create 50 remote files, assert one coalesced pull), but reliably proving

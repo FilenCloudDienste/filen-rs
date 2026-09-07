@@ -33,9 +33,15 @@ const SCHEMA_VERSION: i64 = 1;
 /// announced yet (see [`PendingWrites`](super::engine::PendingWrites)), keyed by uuid like the
 /// in-memory journal it mirrors. `path_failures` counts how many times in a row applying one path
 /// has failed, and what the last failure said. Both cascade with their pair.
+///
+/// `sync_pairs.id` is `AUTOINCREMENT` for one reason: a removed pair's id must never come back. A
+/// watch loop finishes the pass it is in when its pair is removed, and that pass goes on writing
+/// baseline and journal rows keyed by the id it started with — which a plain `INTEGER PRIMARY KEY`
+/// hands straight to the next pair created, whose first sync is then reconciled against a stranger's
+/// rows. With the id retired those writes hit the foreign key and fail, which is what they should do.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sync_pairs (
-	id INTEGER PRIMARY KEY,
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	local_root TEXT NOT NULL,
 	remote_root BLOB NOT NULL,
 	mode INTEGER NOT NULL,
@@ -956,6 +962,32 @@ mod tests {
 		// The streak is pair-scoped state: removing the pair takes it with it.
 		store.delete_pair(pair).unwrap();
 		assert!(store.failures(pair).unwrap().is_empty());
+	}
+
+	/// A removed pair's id must never be handed to a later pair. A watch loop finishes the pass it
+	/// is in when its pair is removed, so that pass still writes baseline and journal rows keyed by
+	/// the old id: with the id reused, they land in the successor — whose first sync is supposed to
+	/// see an EMPTY baseline — instead of failing against a pair that is gone.
+	#[test]
+	fn a_removed_pairs_id_is_never_handed_to_a_later_pair() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let remote = Uuid::new_v4();
+		let (pair, _) = store
+			.create_pair("/root", remote, SyncMode::TwoWay)
+			.unwrap();
+		store.delete_pair(pair).unwrap();
+
+		let (readded, _) = store
+			.create_pair("/root", remote, SyncMode::TwoWay)
+			.unwrap();
+		assert_ne!(readded, pair, "the removed pair's id came back");
+		// So a write from the removed pair's in-flight pass has nowhere to land.
+		assert!(
+			store
+				.upsert_entry(pair, &file_entry("f.txt", [1; 32], 3))
+				.is_err(),
+			"a baseline write for the removed pair was accepted"
+		);
 	}
 
 	#[test]
