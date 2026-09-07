@@ -53,9 +53,11 @@ pub struct WatchConfig {
 	/// restarts it, so a continuous stream of writes syncs once it stops, not repeatedly during.
 	/// Must be non-zero: a zero debounce turns every filesystem event into its own pass.
 	pub debounce: Duration,
-	/// How often a pass runs regardless of any trigger — the backstop for what the FS watcher and
-	/// the cache subscription miss or coalesce. Must exceed [`debounce`](Self::debounce): a safety
-	/// net inside the coalescing window would keep firing before a burst could ever settle.
+	/// How long after the last SUCCESSFUL pass one runs regardless of any trigger — the backstop
+	/// for what the FS watcher and the cache subscription miss or coalesce. An event-triggered pass
+	/// pushes the next net pass out by a full interval instead of being trailed by a redundant one.
+	/// Must exceed [`debounce`](Self::debounce): a safety net inside the coalescing window would
+	/// keep firing before a burst could ever settle.
 	pub safety_net: Duration,
 }
 
@@ -270,6 +272,12 @@ async fn run_loop(
 		let error = run_pass(&engine, pair, observer.as_mut()).await;
 		if error.is_none() {
 			failures = 0;
+			// The net measures time since the last SUCCESSFUL pass, not since the last tick: a pass
+			// that just succeeded has already done everything the net would do, so a tick that came
+			// due during it buys nothing but a no-op pass right after. A FAILED pass deliberately
+			// leaves the interval alone — its own retry timer is the backoff, and a run of failures
+			// must not push the net out indefinitely.
+			safety_net.reset();
 		} else {
 			failures = failures.saturating_add(1);
 		}
