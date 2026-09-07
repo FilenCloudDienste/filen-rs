@@ -11,10 +11,12 @@ use crate::{
 	},
 	crypto::error::ConversionError,
 	fs::{
+		HasName,
 		categories::{DirType, RootItemType, Shared},
-		file::RemoteRootFile,
+		file::{RemoteRootFile, traits::HasFileInfo},
 	},
 	js::{FileMeta, categories::common::dir::RootDirWithMeta},
+	thumbnail::might_be_thumbnailable,
 };
 
 #[js_type(export, wasm_all)]
@@ -85,11 +87,16 @@ pub struct SharedFile {
 	meta: FileMeta,
 	sharing_role: SharingRole,
 	__shared_tag: bool,
+	// JS only field, indicates if the file can have a thumbnail generated;
+	// the same gate `File.canMakeThumbnail` answers, so a caller never has to
+	// call into WASM to check the name.
+	can_make_thumbnail: bool,
 }
 
 impl From<SharedRootFileRS> for SharedFile {
 	fn from(value: SharedRootFileRS) -> Self {
 		Self {
+			can_make_thumbnail: might_be_thumbnailable(value.name(), value.mime()),
 			__shared_tag: true,
 			uuid: value.file.uuid,
 			size: value.file.size,

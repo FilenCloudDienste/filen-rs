@@ -16,10 +16,12 @@ use crate::{
 	crypto::{error::ConversionError, file::FileKey},
 	error::ResultExt,
 	fs::{
+		HasName,
 		categories::{DirType, Linked},
 		dir::{LinkedDirectory, RootDirectoryWithMeta},
-		file::LinkedFile as LinkedFileRS,
+		file::{LinkedFile as LinkedFileRS, traits::HasFileInfo},
 	},
+	thumbnail::might_be_thumbnailable,
 };
 
 use super::common::dir::RootDirWithMeta;
@@ -42,11 +44,16 @@ pub struct LinkedFile {
 	timestamp: DateTime<Utc>,
 	file_key: String,
 	__linked_tag: bool,
+	// JS only field, indicates if the file can have a thumbnail generated;
+	// the same gate `File.canMakeThumbnail` answers, so a caller never has to
+	// call into WASM to check the name.
+	can_make_thumbnail: bool,
 }
 
 impl From<LinkedFileRS> for LinkedFile {
 	fn from(value: LinkedFileRS) -> Self {
 		Self {
+			can_make_thumbnail: might_be_thumbnailable(value.name(), value.mime()),
 			uuid: value.uuid,
 			name: value.name,
 			mime: value.mime,
