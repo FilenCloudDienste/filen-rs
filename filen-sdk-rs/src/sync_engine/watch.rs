@@ -97,6 +97,10 @@ impl WatchConfig {
 
 /// An active continuous sync. Dropping it stops the background loop, the FS watcher, and the
 /// cache subscription; [`stop`](Self::stop) does the same but waits for the loop to finish.
+///
+/// The loop can also end on its own, when the pair is removed underneath it (see
+/// [`SyncEngine::remove_pair`](super::SyncEngine::remove_pair)); the handle stays usable either
+/// way, and [`status`](Self::status) reports the loop as [`stopped`](WatchStatus::stopped).
 pub struct WatchHandle {
 	// Dropping the sender closes the channel, which breaks the loop's shutdown select arm.
 	shutdown: tokio::sync::oneshot::Sender<()>,
@@ -141,6 +145,11 @@ pub struct WatchStatus {
 	pub consecutive_failures: u32,
 	/// Why the last pass failed, or `None` while the watch is healthy.
 	pub last_error: Option<String>,
+	/// The terminal state: the loop has ended and will run no further pass. Either the watch was
+	/// stopped (its handle dropped or [`stopped`](WatchHandle::stop)), or the pair was removed
+	/// underneath it (see [`SyncEngine::remove_pair`](super::SyncEngine::remove_pair)) — which is
+	/// the case a caller cannot see coming, and the reason this is observable at all.
+	pub stopped: bool,
 }
 
 impl SyncEngine {
@@ -178,25 +187,10 @@ impl SyncEngine {
 		observer: SyncObserver,
 	) -> Result<WatchHandle, Error> {
 		config.validate()?;
-		let record = {
-			let store = self.store.lock().await;
-			store
-				.pair(pair)
-				.map_err(|e| {
-					Error::custom_with_source(
-						ErrorKind::Internal,
-						e,
-						Some("loading pair".to_string()),
-					)
-				})?
-				.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?
-		};
-		if record.paused {
-			return Err(Error::custom(
-				ErrorKind::InvalidState,
-				format!("sync pair {pair} is paused: resume it before starting a watch on it"),
-			));
-		}
+		// The pair AND the signal that ends the loop, in one step: everything below — the cache
+		// registration especially — takes real time, and a removal that lands during it must not
+		// find the loop unsubscribed (see [`SyncEngine::watchable_pair`]).
+		let (record, removed) = self.watchable_pair(pair).await?;
 		let local_root = PathBuf::from(&record.local_root);
 
 		let dirty = Arc::new(Notify::new());
@@ -230,15 +224,13 @@ impl SyncEngine {
 
 		let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 		let (status_tx, status_rx) = tokio::sync::watch::channel(WatchStatus::default());
+		let stop = Stop {
+			handle: shutdown_rx,
+			removed,
+		};
 		let engine = Arc::clone(&self);
 		let loop_done = tokio::spawn(run_loop(
-			engine,
-			pair,
-			config,
-			dirty,
-			shutdown_rx,
-			observer,
-			status_tx,
+			engine, pair, config, dirty, stop, observer, status_tx,
 		));
 
 		Ok(WatchHandle {
@@ -251,17 +243,43 @@ impl SyncEngine {
 	}
 }
 
+/// Everything that ends a watch: the handle going away (its shutdown sender dropped), and the pair
+/// being removed underneath the loop. Both are checked wherever the loop waits, so neither is
+/// delayed by a backoff or by a paused poll.
+struct Stop {
+	handle: tokio::sync::oneshot::Receiver<()>,
+	removed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Stop {
+	/// Resolves once the watch must end. Level-triggered on the removal, not edge-triggered: a
+	/// removal that already happened ends every later wait too, however often this is called.
+	async fn ended(&mut self) {
+		if *self.removed.borrow() {
+			return;
+		}
+		tokio::select! {
+			biased;
+			_ = &mut self.handle => {}
+			// An error here means the engine dropped the signal — with the pair, or with itself.
+			// Either way there is nothing left to sync.
+			_ = self.removed.changed() => {}
+		}
+	}
+}
+
 /// The background loop: an initial pass, then debounced passes on `dirty`, plus a periodic pass,
-/// until `shutdown` fires (its sender dropped). A pass that fails outright backs the loop off (see
-/// [`backoff`]) so a persistent error does not hot-loop at the debounce cadence; that backoff is
-/// also the retry timer, since an outage over a quiescent tree produces no trigger of its own.
+/// until the watch is stopped or its pair removed (see [`Stop`]). A pass that fails outright backs
+/// the loop off (see [`backoff`]) so a persistent error does not hot-loop at the debounce cadence;
+/// that backoff is also the retry timer, since an outage over a quiescent tree produces no trigger
+/// of its own.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
 	engine: Arc<SyncEngine>,
 	pair: PairId,
 	config: WatchConfig,
 	dirty: Arc<Notify>,
-	mut shutdown: tokio::sync::oneshot::Receiver<()>,
+	mut stop: Stop,
 	mut observer: SyncObserver,
 	status: tokio::sync::watch::Sender<WatchStatus>,
 ) {
@@ -273,8 +291,8 @@ async fn run_loop(
 
 	loop {
 		if engine.is_paused(pair).await {
-			if !wait_while_paused(&mut shutdown, config.debounce).await {
-				return;
+			if !wait_while_paused(&mut stop, config.debounce).await {
+				break;
 			}
 			continue;
 		}
@@ -295,6 +313,7 @@ async fn run_loop(
 		let _ = status.send(WatchStatus {
 			consecutive_failures: failures,
 			last_error: error,
+			stopped: false,
 		});
 		let delay = backoff(failures);
 		if let Some(delay) = delay {
@@ -303,18 +322,14 @@ async fn run_loop(
 			);
 		}
 
-		if !wait_for_next_pass(
-			&mut shutdown,
-			&dirty,
-			&mut safety_net,
-			config.debounce,
-			delay,
-		)
-		.await
-		{
-			return;
+		if !wait_for_next_pass(&mut stop, &dirty, &mut safety_net, config.debounce, delay).await {
+			break;
 		}
 	}
+
+	// The terminal state: a caller watching the health is otherwise left waiting on a report that
+	// will never come, unable to tell a stopped loop from a quiet one.
+	status.send_modify(|status| status.stopped = true);
 }
 
 /// Wait out one poll interval while the pair is paused. Returns `false` if the watch was stopped.
@@ -323,13 +338,10 @@ async fn run_loop(
 /// signal pending, so the first pass after the resume is the one that catches up on the lot. The
 /// pause itself is polled rather than signalled — the alternative is per-pair wakeup plumbing
 /// through the engine to save a timer that fires at the debounce cadence.
-async fn wait_while_paused(
-	shutdown: &mut tokio::sync::oneshot::Receiver<()>,
-	poll: Duration,
-) -> bool {
+async fn wait_while_paused(stop: &mut Stop, poll: Duration) -> bool {
 	tokio::select! {
 		biased;
-		_ = &mut *shutdown => false,
+		_ = stop.ended() => false,
 		_ = tokio::time::sleep(poll) => true,
 	}
 }
@@ -341,7 +353,7 @@ async fn wait_while_paused(
 /// safety net or a change event happens to offer next. While healthy the wait ends on the periodic
 /// safety-net tick, or on a change event once the burst behind it has gone quiet for `debounce`.
 async fn wait_for_next_pass(
-	shutdown: &mut tokio::sync::oneshot::Receiver<()>,
+	stop: &mut Stop,
 	dirty: &Notify,
 	safety_net: &mut tokio::time::Interval,
 	debounce: Duration,
@@ -350,21 +362,21 @@ async fn wait_for_next_pass(
 	if let Some(delay) = backoff {
 		return tokio::select! {
 			biased;
-			_ = &mut *shutdown => false,
+			_ = stop.ended() => false,
 			_ = tokio::time::sleep(delay) => true,
 		};
 	}
 
 	tokio::select! {
 		biased;
-		_ = &mut *shutdown => return false,
+		_ = stop.ended() => return false,
 		_ = safety_net.tick() => {}
 		_ = dirty.notified() => {
 			// Coalesce the burst: wait for `debounce` of quiet (each new event restarts it).
 			loop {
 				tokio::select! {
 					biased;
-					_ = &mut *shutdown => return false,
+					_ = stop.ended() => return false,
 					_ = dirty.notified() => continue,
 					_ = tokio::time::sleep(debounce) => break,
 				}
@@ -445,7 +457,7 @@ mod tests {
 	use tokio::sync::Notify;
 
 	use super::{
-		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, WatchConfig, backoff, triggers_pass,
+		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, Stop, WatchConfig, backoff, triggers_pass,
 		wait_for_next_pass, wait_while_paused,
 	};
 
@@ -456,6 +468,18 @@ mod tests {
 		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 		interval.tick().await;
 		interval
+	}
+
+	/// A [`Stop`] as the loop holds one, plus the two senders that can trip it: the handle's
+	/// shutdown, and the engine's per-pair removal signal.
+	fn stop() -> (
+		tokio::sync::oneshot::Sender<()>,
+		tokio::sync::watch::Sender<bool>,
+		Stop,
+	) {
+		let (shutdown_tx, handle) = tokio::sync::oneshot::channel();
+		let (removed_tx, removed) = tokio::sync::watch::channel(false);
+		(shutdown_tx, removed_tx, Stop { handle, removed })
 	}
 
 	fn event(kind: EventKind, paths: &[&str]) -> notify::Event {
@@ -523,14 +547,14 @@ mod tests {
 	/// and the backoff schedule is decoration.
 	#[tokio::test(start_paused = true)]
 	async fn a_failed_pass_retries_on_the_backoff_schedule() {
-		let (_shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
 
 		let start = tokio::time::Instant::now();
 		assert!(
 			wait_for_next_pass(
-				&mut shutdown,
+				&mut stop,
 				&dirty,
 				&mut safety_net,
 				DEBOUNCE,
@@ -549,17 +573,17 @@ mod tests {
 	/// A healthy wait is unchanged: a change event, coalesced over [`DEBOUNCE`], or the safety net.
 	#[tokio::test(start_paused = true)]
 	async fn a_healthy_wait_ends_on_a_debounced_change_or_the_safety_net() {
-		let (_shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
 
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
 		assert_eq!(start.elapsed(), DEBOUNCE, "a change waits out the debounce");
 
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
 		assert_eq!(
 			start.elapsed(),
 			SAFETY_NET - DEBOUNCE,
@@ -570,7 +594,7 @@ mod tests {
 	/// Stopping the watch is never delayed by a backoff.
 	#[tokio::test(start_paused = true)]
 	async fn a_stop_interrupts_the_backoff() {
-		let (shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let (shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
 
@@ -578,7 +602,7 @@ mod tests {
 		let start = tokio::time::Instant::now();
 		assert!(
 			!wait_for_next_pass(
-				&mut shutdown,
+				&mut stop,
 				&dirty,
 				&mut safety_net,
 				DEBOUNCE,
@@ -590,12 +614,59 @@ mod tests {
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
 
+	/// A pair removed underneath the loop ends every wait at once, whichever one the loop is in —
+	/// the failure backoff included, which is exactly where a watch on a removed pair ends up
+	/// (every pass fails with "unknown sync pair") and where it used to sit forever.
+	#[tokio::test(start_paused = true)]
+	async fn a_removed_pair_ends_the_wait_wherever_the_loop_is() {
+		let (_shutdown_tx, removed_tx, mut stop) = stop();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+
+		removed_tx.send(true).unwrap();
+		let start = tokio::time::Instant::now();
+		assert!(
+			!wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				DEBOUNCE,
+				Some(MAX_BACKOFF)
+			)
+			.await,
+			"a removed pair must not wait out the backoff"
+		);
+		assert!(
+			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await,
+			"a removed pair must not wait for the next trigger either"
+		);
+		assert!(
+			!wait_while_paused(&mut stop, Duration::from_secs(600)).await,
+			"a removed pair must not keep polling its pause"
+		);
+		assert_eq!(start.elapsed(), Duration::ZERO);
+	}
+
+	/// The engine dropping the signal (with the pair, or with itself) stops the loop just as a
+	/// removal does: there is nothing left to sync either way.
+	#[tokio::test(start_paused = true)]
+	async fn a_dropped_removal_signal_stops_the_loop_too() {
+		let (_shutdown_tx, removed_tx, mut stop) = stop();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+
+		drop(removed_tx);
+		let start = tokio::time::Instant::now();
+		assert!(!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert_eq!(start.elapsed(), Duration::ZERO);
+	}
+
 	/// A paused pair polls, and never consumes the change signal: the notification a paused loop
 	/// walked past is still there for the first wait after the resume, so the backlog syncs then
 	/// rather than waiting out a whole safety-net interval.
 	#[tokio::test(start_paused = true)]
 	async fn a_paused_loop_leaves_the_change_signal_pending() {
-		let (shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let (shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
 		let poll = Duration::from_millis(200);
@@ -603,8 +674,8 @@ mod tests {
 		// A change lands while the pair is paused; two paused polls walk past it.
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_while_paused(&mut shutdown, poll).await);
-		assert!(wait_while_paused(&mut shutdown, poll).await);
+		assert!(wait_while_paused(&mut stop, poll).await);
+		assert!(wait_while_paused(&mut stop, poll).await);
 		assert_eq!(
 			start.elapsed(),
 			poll * 2,
@@ -614,7 +685,7 @@ mod tests {
 		// Resumed: the pending notification is what ends the very next wait, one debounce later —
 		// not the safety net, which is far away.
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
 		assert_eq!(
 			start.elapsed(),
 			DEBOUNCE,
@@ -624,21 +695,21 @@ mod tests {
 		// And stopping the watch is never delayed by a paused poll.
 		drop(shutdown_tx);
 		let start = tokio::time::Instant::now();
-		assert!(!wait_while_paused(&mut shutdown, Duration::from_secs(600)).await);
+		assert!(!wait_while_paused(&mut stop, Duration::from_secs(600)).await);
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
 
 	/// A configured debounce, not the default one, is what a burst is coalesced over.
 	#[tokio::test(start_paused = true)]
 	async fn the_configured_debounce_is_what_a_burst_waits_out() {
-		let (_shutdown_tx, mut shutdown) = tokio::sync::oneshot::channel();
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
 		let debounce = Duration::from_millis(50);
 
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut shutdown, &dirty, &mut safety_net, debounce, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, debounce, None).await);
 		assert_eq!(start.elapsed(), debounce);
 	}
 
