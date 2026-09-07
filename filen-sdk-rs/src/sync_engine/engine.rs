@@ -540,6 +540,11 @@ pub struct SyncEngine {
 	/// The pairs currently paused (see [`SyncEngine::pause_pair`]). Mirrors the `paused` column,
 	/// which is the source of truth across restarts; this copy is what every pass consults.
 	paused: Mutex<HashSet<PairId>>,
+	/// One removal signal per pair that has been watched: [`remove_pair`](SyncEngine::remove_pair)
+	/// flips it and drops it, so the pair's watch loops stop instead of failing every pass against a
+	/// pair that no longer exists — and a pair re-registered under the same id (sqlite reuses one)
+	/// gets a fresh signal rather than an already-tripped one.
+	removals: Mutex<HashMap<PairId, tokio::sync::watch::Sender<bool>>>,
 }
 
 /// Why [`SyncEngine::add_pair`] refused to register a pair: its roots overlap one already
@@ -821,6 +826,7 @@ impl SyncEngine {
 			approvals: Mutex::new(HashMap::new()),
 			registrations: Mutex::new(()),
 			paused: Mutex::new(paused),
+			removals: Mutex::new(HashMap::new()),
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
@@ -1239,22 +1245,35 @@ impl SyncEngine {
 	/// remote folder are left exactly as they are — a removed pair simply stops syncing. Adding the
 	/// same roots again later starts from an empty baseline, i.e. with first-sync semantics.
 	/// Removing an unknown pair is a no-op.
+	///
+	/// A watch running on the pair STOPS: its loop has nothing left to sync, and every pass it tried
+	/// would fail against a pair that is gone. The loop finishes whatever pass is in flight, then
+	/// ends and publishes a [`stopped`](super::WatchStatus::stopped) status; its
+	/// [`WatchHandle`](super::WatchHandle) stays valid, so a caller holding one can still drop or
+	/// stop it. That last pass may still be writing when this returns — its baseline and journal
+	/// writes name a pair id this retires for good, so they fail rather than land in a pair added
+	/// afterwards.
 	pub async fn remove_pair(&self, pair: PairId) -> Result<(), Error> {
 		self.approvals.lock().await.remove(&pair);
 		// Dropping the handle unsubscribes the pair's cache notifications.
 		self.roots.lock().await.remove(&pair);
-		// The pair's journal rows go with it (`ON DELETE CASCADE`); drop the in-memory copies too.
-		// Re-registering the same roots hands back the SAME pair id, and a stale `Trashed` record
-		// would then hide a remote item from the fresh pair's very first view.
+		// The pair's journal rows go with it (`ON DELETE CASCADE`); drop the in-memory copies too,
+		// so nothing of the removed pair is left to be consulted or re-persisted.
 		self.pending.forget_pair(pair);
 		let store = self.store.lock().await;
+		// Under the store lock, which is also the lock a watch reads the pair and subscribes under
+		// (see `watchable_pair`): a watch setting up right now either registered before this and
+		// gets tripped here, or reads the deleted row afterwards and is refused. Before the delete,
+		// so a loop sitting between two passes learns about the removal at once rather than starting
+		// one more against the rows this is about to take away.
+		if let Some(signal) = self.removals.lock().await.remove(&pair) {
+			let _ = signal.send(true);
+		}
 		store
 			.delete_pair(pair)
 			.map_err(|e| db_error(e, "removing a sync pair"))?;
-		// Under the same lock as the delete, and as `set_paused`'s own write: a pause that landed
-		// in between would leave the set holding an id whose row is gone, and sqlite hands a
-		// deleted `INTEGER PRIMARY KEY` back to the next pair created here — which would then read
-		// as paused while its own row says it is running.
+		// Under the same lock as the delete, and as `set_paused`'s own write: a pause that landed in
+		// between would leave the set holding an id whose row is gone.
 		self.paused.lock().await.remove(&pair);
 		Ok(())
 	}
@@ -1290,6 +1309,45 @@ impl SyncEngine {
 	/// paused (it has no state to be paused in).
 	pub async fn is_paused(&self, pair: PairId) -> bool {
 		self.paused.lock().await.contains(&pair)
+	}
+
+	/// The pair a watch is about to start on, together with the signal that ends its loop.
+	///
+	/// Both come out of ONE store-lock acquisition, and [`remove_pair`](Self::remove_pair) trips the
+	/// signal under that same lock, so a removal racing a watch's setup has exactly two outcomes:
+	/// either it deleted the row first and this reports an unknown pair, or it finds the
+	/// subscription already registered and trips it. Subscribing afterwards — the setup does real
+	/// work, a cache registration and a filesystem watcher, in between — would let a removal fall
+	/// into the gap and go unheard, leaving the loop retrying a pair that is gone.
+	pub(super) async fn watchable_pair(
+		&self,
+		pair: PairId,
+	) -> Result<(PairRecord, tokio::sync::watch::Receiver<bool>), Error> {
+		let store = self.store.lock().await;
+		let record = store
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading pair"))?
+			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+		if record.paused {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!("sync pair {pair} is paused: resume it before starting a watch on it"),
+			));
+		}
+		let removed = self.removal_signal(pair).await;
+		drop(store);
+		Ok((record, removed))
+	}
+
+	/// A signal for `pair`'s watch loop to stop on: it flips to `true` when the pair is removed (see
+	/// [`remove_pair`](Self::remove_pair)). Watches on the same pair share one signal.
+	pub(super) async fn removal_signal(&self, pair: PairId) -> tokio::sync::watch::Receiver<bool> {
+		self.removals
+			.lock()
+			.await
+			.entry(pair)
+			.or_insert_with(|| tokio::sync::watch::channel(false).0)
+			.subscribe()
 	}
 
 	async fn set_paused(&self, pair: PairId, paused: bool) -> Result<(), Error> {
@@ -2404,10 +2462,63 @@ mod tests {
 		std::fs::remove_file(&path).ok();
 	}
 
-	/// A pause and a removal of the same pair, in flight at once from two callers of one engine.
-	/// `sync_pairs.id` is a plain `INTEGER PRIMARY KEY`, so sqlite hands a deleted id back to the
-	/// next pair created here — an id left behind in the paused set would silently pause that
-	/// fresh pair, whose own row says it is running.
+	/// A watch starting on a pair while a removal of that same pair is in flight. Registering the
+	/// watch's stop signal after the existence check — with a cache registration and a filesystem
+	/// watcher in between — would let the removal land in the gap: it would find no signal to trip,
+	/// delete the row, and the watch would then subscribe to a fresh signal nobody will ever trip,
+	/// leaving a loop that fails every pass against a pair that is gone and never stops.
+	#[tokio::test]
+	async fn a_removal_racing_a_watchs_setup_is_never_lost() {
+		let path =
+			std::env::temp_dir().join(format!("filen_sync_watch_race_{}.db", Uuid::new_v4()));
+		let engine = Arc::new(
+			SyncEngine::open(offline_client(), path.clone())
+				.await
+				.unwrap(),
+		);
+		let (pair, _) = engine
+			.store
+			.lock()
+			.await
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+
+		// The store lock fixes the interleaving, as in the pause/removal race above: both verbs
+		// queue on it while this guard is held, and tokio hands the mutex out in request order, so
+		// the watch's setup runs first and the removal second — the order in which the removal has
+		// nothing registered to trip yet.
+		let guard = engine.store.lock().await;
+		let watching = tokio::spawn({
+			let engine = Arc::clone(&engine);
+			async move { engine.watchable_pair(pair).await }
+		});
+		tokio::task::yield_now().await;
+		let removing = tokio::spawn({
+			let engine = Arc::clone(&engine);
+			async move { engine.remove_pair(pair).await }
+		});
+		tokio::task::yield_now().await;
+		drop(guard);
+
+		removing.await.unwrap().unwrap();
+		// The watch either never starts (the removal won the lock) or starts holding a signal the
+		// removal has already tripped. What must not happen is a live signal for a dead pair.
+		if let Ok((_, removed)) = watching.await.unwrap() {
+			assert!(
+				*removed.borrow(),
+				"the watch subscribed after the removal had already passed by: its loop would \
+				 retry a pair that no longer exists forever"
+			);
+		}
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A pause and a removal of the same pair, in flight at once from two callers of one engine. An
+	/// id left behind in the paused set describes a pair that no longer exists: it makes
+	/// [`SyncEngine::is_paused`] report a phantom, and the set grows for as long as the engine is
+	/// open.
 	#[tokio::test]
 	async fn a_pause_racing_a_removal_leaves_no_paused_id_behind() {
 		let path =
