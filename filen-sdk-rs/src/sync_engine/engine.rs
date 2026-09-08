@@ -573,6 +573,45 @@ impl PendingWrites {
 		}
 	}
 
+	/// This pair's pending CREATES whose path the snapshot shows another version of the same file
+	/// at — neither what we wrote nor the version we replaced. Each is
+	/// `(record uuid, path, the version our row records, the stranger)`.
+	///
+	/// This is the one state where [`fold_create`] paints over something it cannot identify from
+	/// the record alone, so it is the one worth asking the server about (see
+	/// `SyncEngine::retire_superseded_creates`). Everything else the fold decides for itself.
+	fn strangers(
+		&self,
+		pair: PairId,
+		baseline: &HashMap<String, BaselineEntry>,
+		nodes: &HashMap<String, RemoteNode>,
+	) -> Vec<(Uuid, String, Uuid, Uuid)> {
+		self.map()
+			.iter()
+			.filter(|(_, write)| write.pair == pair)
+			.filter_map(|(uuid, write)| {
+				let PendingKind::Created { path, replaced } = &write.kind else {
+					return None;
+				};
+				let ours = written_node(baseline.get(path))?;
+				let current = nodes.get(path)?;
+				if current.remote_uuid == ours.remote_uuid
+					|| current.remote_uuid == *uuid
+					|| Some(current.remote_uuid) == *replaced
+				{
+					return None;
+				}
+				(current.stable_uuid.is_some() && current.stable_uuid == ours.stable_uuid)
+					.then(|| (*uuid, path.clone(), ours.remote_uuid, current.remote_uuid))
+			})
+			.collect()
+	}
+
+	/// Drop one record: whatever it was waiting for has been answered another way.
+	fn retire(&self, uuid: Uuid) {
+		self.map().remove(&uuid);
+	}
+
 	/// Fold this pair's surviving records into `nodes` — the path-keyed remote view built from the
 	/// cache snapshot — and return how many were applied.
 	///
@@ -1596,6 +1635,70 @@ impl SyncEngine {
 		plan::confirm_agreed_pushes(baseline, &confirmed)
 	}
 
+	/// Ask the server which version is current at the path of a pending create whose snapshot shows
+	/// a same-lineage STRANGER, and retire the record when ours is not.
+	///
+	/// [`fold_create`] paints our own version over such a stranger, and it is usually right to: the
+	/// ordinary reason for one is a cache still listing the version our upload superseded, which
+	/// the winner of a same-name race sees at its own path and must not conflict against. A resync
+	/// that skipped straight past our version looks identical from here and is not — the stranger
+	/// is then genuinely newer, and folding hides it until the 180 s grace ceiling retires the
+	/// record. One lookup separates the two, and only in that state: no pending create, or a
+	/// snapshot showing what we wrote or what we replaced, costs nothing at all.
+	///
+	/// Retiring the record is all this does. What the standing stranger MEANS — a pull, or a
+	/// conflict against a push of ours that nothing confirmed — is the reconcile's to decide, from
+	/// the same rules as any other foreign version.
+	async fn retire_superseded_creates(
+		&self,
+		pair: PairId,
+		baseline: &HashMap<String, BaselineEntry>,
+		raw_remote: &HashMap<String, RemoteNode>,
+		files: &[CacheableFile<'static>],
+	) -> Result<(), Error> {
+		let candidates = self.pending.strangers(pair, baseline, raw_remote);
+		let mut retired = Vec::new();
+		for (record, path, ours, stranger) in candidates {
+			let Some(cacheable) = files.iter().find(|f| f.uuid == stranger) else {
+				continue;
+			};
+			let file = crate::io::RemoteFile::from(cacheable.clone());
+			// By LINEAGE, not by the version chain's order: the chain is sorted by original upload
+			// time to the second, so a race leaves the two versions tied and its first entry is not
+			// reliably the head. This asks the server outright, and in one call.
+			let head = match self
+				.client
+				.get_file_by_stable_uuid(file.stable_uuid())
+				.await
+			{
+				Ok(head) => Some(head.uuid()),
+				Err(error) => {
+					// No answer, so no reason to stop trusting our own write yet: the fold carries
+					// on until the cache announces something or the grace ceiling runs out.
+					tracing::debug!(
+						"sync_once[pair {pair}]: could not check which version is current at {path:?} — {error}"
+					);
+					continue;
+				}
+			};
+			if head.is_some_and(|head| head != ours) {
+				tracing::debug!(
+					"sync_once[pair {pair}]: the server says this engine's write at {path:?} was superseded — reconciling against what the snapshot shows"
+				);
+				self.pending.retire(record);
+				retired.push(record);
+			}
+		}
+		if !retired.is_empty() {
+			self.store
+				.lock()
+				.await
+				.delete_pending(&retired)
+				.map_err(|e| db_error(e, "retiring a superseded write"))?;
+		}
+		Ok(())
+	}
+
 	/// Advance what the cache's announcements have confirmed since the last pass, and persist it.
 	///
 	/// The announcement half of [`confirm_pushes`](Self::confirm_pushes) alone: with no snapshot
@@ -1711,6 +1814,10 @@ impl SyncEngine {
 				.delete_pending(&retired)
 				.map_err(|e| db_error(e, "retiring pending writes"))?;
 		}
+		// A create whose path shows another version of the same file is the one thing the fold
+		// cannot settle on its own; ask the server before it paints over a stranger.
+		self.retire_superseded_creates(pair, &baseline, &remote_view.nodes, &snapshot.files)
+			.await?;
 		// Correct the view with what this engine wrote and the cache has not shown yet, BEFORE
 		// anything reconciles or detects moves against it.
 		let folded = self
@@ -3704,6 +3811,73 @@ mod tests {
 			.is_empty(),
 			"the client holding the head must not conflict with the version it superseded"
 		);
+	}
+
+	/// The state above is also the ONE the record cannot settle by itself — a version of the same
+	/// file that is neither ours nor the one we replaced reads the same whether the cache is
+	/// behind on our write or skipped straight past it. That is what the server is asked about;
+	/// nothing else is.
+	#[test]
+	fn only_a_same_lineage_stranger_at_a_pending_creates_path_is_worth_a_lookup() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (base, ours, theirs) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+		pending.record(&observations, PAIR, ours, created("a.txt", Some(base)));
+		let lineage = StableUuid::new_for_test(base);
+		let mut baseline = written_row(ours, hash(2));
+		baseline.get_mut("a.txt").unwrap().remote_stable_uuid = Some(lineage);
+
+		let same_lineage = |uuid: Uuid| {
+			let mut nodes = node_at("a.txt", uuid);
+			nodes.get_mut("a.txt").unwrap().stable_uuid = Some(lineage);
+			nodes
+		};
+		for settled in [
+			// The cache has caught up to our own write.
+			same_lineage(ours),
+			// It is showing the version our upload superseded.
+			same_lineage(base),
+			// A different FILE has taken the path over — the fold refuses it outright.
+			node_at("a.txt", Uuid::new_v4()),
+			// Nothing at the path at all.
+			HashMap::new(),
+		] {
+			assert!(
+				pending.strangers(PAIR, &baseline, &settled).is_empty(),
+				"the record answers for this state on its own"
+			);
+		}
+
+		assert_eq!(
+			pending.strangers(PAIR, &baseline, &same_lineage(theirs)),
+			vec![("a.txt".to_string(), ours, theirs)]
+				.into_iter()
+				.map(|(path, ours_uuid, stranger)| (ours, path, ours_uuid, stranger))
+				.collect::<Vec<_>>()
+		);
+	}
+
+	/// What the lookup's answer does: with the record retired, the stranger stands and the pass
+	/// reconciles against it instead of waiting out the grace window.
+	#[test]
+	fn retiring_a_superseded_create_lets_the_stranger_stand() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (base, ours, theirs) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+		pending.record(&observations, PAIR, ours, created("a.txt", Some(base)));
+		let lineage = StableUuid::new_for_test(base);
+		let mut baseline = written_row(ours, hash(2));
+		baseline.get_mut("a.txt").unwrap().remote_stable_uuid = Some(lineage);
+		let mut remote = node_at("a.txt", theirs);
+		remote.get_mut("a.txt").unwrap().stable_uuid = Some(lineage);
+
+		pending.retire(ours);
+		assert_eq!(
+			pending.fold_into(PAIR, &baseline, &mut remote),
+			0,
+			"with the record gone there is nothing left to paint over the snapshot"
+		);
+		assert_eq!(remote["a.txt"].remote_uuid, theirs);
 	}
 
 	/// A third uuid at the path is not our write lagging: somebody else wrote there after us, and
