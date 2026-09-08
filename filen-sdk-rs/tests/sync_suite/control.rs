@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
+use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
 	Backlog, CONFIRM_TENURE, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode, WatchConfig,
@@ -737,7 +738,7 @@ async fn control_add_during_watch_live_pickup() {
 // Missing public surface (verified against the API reference + black-box use):
 //   * reconfigure ROOT                   -> CONTROL-17, -24 (the MODE half is CONTROL-16, implemented)
 //   * pair registry auto-load            -> auto-load, idempotent-verbs, CONTROL-25
-//   * clean stop / abrupt-kill harness   -> CONTROL-14, -15, -18, remove-mid-pass
+//   * clean stop / abrupt-kill harness   -> CONTROL-14, -15
 //   * baseline corruption/inspection     -> CONTROL-13, partially-corrupted-config
 //   * control-transition event stream    -> control-transition-events
 // ===========================================================================
@@ -790,9 +791,30 @@ async fn control_01_pause_halts_resume_continues() {
 		engine.pause_pair(pair + 9_999).await.is_err(),
 		"an unknown pair must not be pausable"
 	);
+	// On a PAUSED pair, giving its actions up is exactly the verb's job, and it leaves the pair
+	// paused.
+	engine.cancel_paused_actions(pair).await.unwrap();
+	assert!(
+		engine.is_paused(pair).await,
+		"cancelling the paused actions un-paused the pair"
+	);
 
 	engine.resume_pair(pair).await.unwrap();
 	assert!(!engine.is_paused(pair).await, "resume_pair did not take");
+	// On a RUNNING pair it is refused instead of quietly doing nothing: an `Ok` there reads as "the
+	// transfers are being given up" while the pass carries on uploading.
+	let refused = engine
+		.cancel_paused_actions(pair)
+		.await
+		.expect_err("a running pair has no paused actions to cancel");
+	assert!(
+		refused.to_string().contains("is not paused"),
+		"the refusal must say what state the pair is in: {refused}"
+	);
+	assert!(
+		engine.cancel_paused_actions(pair + 9_999).await.is_err(),
+		"an unknown pair must not be cancellable"
+	);
 	let resumed = engine.sync_once(pair).await.unwrap();
 	assert!(!resumed.paused, "{resumed:?}");
 	assert!(resumed.errors.is_empty(), "{resumed:?}");
@@ -1533,6 +1555,145 @@ async fn control_19_remove_one_among_several() {
 	}
 }
 
+/// CONTROL — removing a pair while a pass of it is mid-transfer: the removal takes that pass down
+/// with it instead of letting it upload on. The transfers in flight are dropped, `remove_pair`
+/// returns once they have (not once the plan is finished), the remote is left holding whole files
+/// only, and nothing of the pair survives — a re-add starts from an empty baseline and converges.
+#[shared_test_runtime]
+async fn control_add_remove_pair_mid_pass() {
+	const SMALL: usize = 60;
+	/// Every planned action: the small files plus the big one.
+	const N: usize = SMALL + 1;
+	/// What the removal has to give up on: big enough that a pass cut short here cannot have
+	/// finished it, so an interrupted plan is the only way this test can pass.
+	const BIG: usize = 16 * 1024 * 1024;
+
+	let (resources, cache, remote, local) = raw_setup("crm").await;
+	for i in 0..SMALL {
+		write_file(
+			&local,
+			&format!("f{i:02}.txt"),
+			format!("content {i}").as_bytes(),
+		);
+	}
+	write_file(&local, "big.bin", &vec![0x5a_u8; BIG]);
+	let engine = Arc::new(
+		SyncEngine::open(cache.client.clone(), temp_cache_path())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+
+	let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+	let running = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		let log = log.clone();
+		async move {
+			let mut observer = recording_observer(log);
+			engine
+				.sync_once_observed(pair, &mut observer)
+				.await
+				.unwrap()
+		}
+	});
+	// Land the removal on a pass that is provably TRANSFERRING, so what it has to stop is a set of
+	// uploads in flight — not a pass still scanning or queueing on the drive lock.
+	wait_for_first_upload(&log).await;
+
+	let started = std::time::Instant::now();
+	engine.remove_pair(pair).await.unwrap();
+	let removal = started.elapsed();
+	assert!(
+		removal < Duration::from_secs(60),
+		"remove_pair took {removal:?}: it waited for the pass instead of cancelling it"
+	);
+	// It waited for the pass it cancelled, though — that is the point of the wait: no action of a
+	// removed pair may still be running once the rows it writes into are gone.
+	let report = tokio::time::timeout(Duration::from_secs(30), running)
+		.await
+		.expect("the pass outlived the removal that cancelled it")
+		.unwrap();
+	assert!(
+		report.interrupted > 0,
+		"the removal never reached the pass in flight: {report:?}"
+	);
+	assert_eq!(
+		report.uploaded + report.interrupted,
+		N,
+		"every planned action must be either done or counted as interrupted: {report:?}"
+	);
+
+	// Whole files only. The remote can hold a FEW more than the report claims: an upload dropped
+	// after the server committed its `upload/done`, with the response still in flight, made a file
+	// that nothing recorded — but even that one is a COMPLETE file, never a half of one.
+	let (dirs, files) = list_remote(&resources).await;
+	assert!(
+		dirs.is_empty(),
+		"the pass created folders it was not asked to"
+	);
+	assert!(
+		(report.uploaded..=N).contains(&files.len()),
+		"the remote holds {} file(s), outside what the interrupted pass could have created: {report:?}",
+		files.len()
+	);
+	for file in &files {
+		let name = file.name().expect("a remote file with no name");
+		let expected = std::fs::metadata(local.join(name)).unwrap().len();
+		assert_eq!(
+			file.size(),
+			expected,
+			"the remote holds a partial {name} — a dropped upload left half a file behind"
+		);
+	}
+
+	// The pair itself is gone, registry and baseline both.
+	assert!(
+		engine.list_pairs().await.unwrap().is_empty(),
+		"the removed pair is still registered"
+	);
+	assert!(
+		engine.sync_once(pair).await.is_err(),
+		"the removed pair still syncs"
+	);
+
+	// Re-adding it starts over from an empty baseline (its rows were cascaded away) and finishes
+	// the job: every file on the remote exactly once, and nothing left for the pass after that.
+	let readded = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	// The backlog includes the 16 MiB upload the removal dropped. A single pass may lose a chunk of
+	// it to the backend's occasional 300 s stall (a transient transfer error the next pass retries),
+	// so converge over a few passes; what must hold is the end state, not a clean first pass.
+	let mut converged = false;
+	for _ in 0..4 {
+		let after = engine.sync_once(readded).await.unwrap();
+		assert_eq!(after.interrupted, 0, "{after:?}");
+		if after.errors.is_empty() {
+			converged = true;
+			break;
+		}
+	}
+	assert!(converged, "the re-added pair kept failing its uploads");
+	let (_dirs, files) = list_remote(&resources).await;
+	assert_eq!(
+		files.len(),
+		N,
+		"the re-added pair left the remote missing files, or holding extras"
+	);
+	let settled = engine.sync_once(readded).await.unwrap();
+	assert_eq!(
+		(settled.uploaded, settled.downloaded, settled.interrupted),
+		(0, 0, 0),
+		"the removal and the re-add left work behind: {settled:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
 /// CONTROL-21 — a backlog accumulated over a long pause converges in a few resumed passes, with
 /// every staged change applied exactly once: nothing dropped, nothing double-applied.
 #[shared_test_runtime]
@@ -1790,14 +1951,6 @@ async fn control_add_persisted_pairs_autoload_on_fresh_start() {
 	// plan: add 2 pairs (1 active, 1 paused), converge, shut down; start a NEW engine WITHOUT any
 	// add() calls; query registry => both reappear w/ roots/modes/state; active pair's staged change
 	// syncs without re-add; paused stays paused; baselines reused (no redundant transfer).
-}
-
-#[ignore = "blocked: needs the deterministic mid-pass interruption seam — remove_pair exists and ends the watch loop, but proving the in-flight pass stops promptly and leaves both sides intact needs a pause hook inside apply"]
-#[shared_test_runtime]
-async fn control_add_remove_pair_mid_pass() {
-	// plan: pair with 20 uploads + 5 deletes queued; begin pass; remove(pair) mid-apply; settle =>
-	// no NEW actions, in-flight atomic/rolled back, pair gone from registry + baseline cleaned up,
-	// both sides coherent, a later re-add behaves as first-sync-against-populated.
 }
 
 // The pause/resume half of this is now covered by CONTROL-01 (pause-already-paused,

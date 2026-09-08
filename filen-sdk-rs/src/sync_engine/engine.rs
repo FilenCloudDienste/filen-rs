@@ -57,6 +57,17 @@ const PENDING_CREATE_GRACE: Duration = Duration::from_secs(180);
 /// success or by [`SyncEngine::retry_path`].
 const MAX_PATH_FAILURES: u32 = 3;
 
+/// How long [`SyncEngine::remove_pair`] waits for the pass it cancelled to end before it retires
+/// the pair's rows anyway.
+///
+/// A cancelled pass unwinds in milliseconds — the transfer in flight is dropped and everything
+/// behind it skipped — but an action the gate does not cover (a directory create, move or trash
+/// already sent) has to come back from the server first. Past this the removal goes ahead: waiting
+/// longer would hang a UI on a straggler, and a write from one lands on a pair id that no longer
+/// exists, where its foreign key refuses it rather than let it into whatever pair sqlite gives that
+/// id next.
+const REMOVE_CANCEL_GRACE: Duration = Duration::from_secs(10);
+
 /// One remote write this engine made, and how to tell whether the cache has caught up to it.
 #[derive(Debug)]
 struct PendingWrite {
@@ -1724,14 +1735,19 @@ impl SyncEngine {
 				tracing::debug!(
 					"sync_once[pair {pair}]: the server says this engine's write at {path:?} was superseded — reconciling against what the snapshot shows"
 				);
-				self.pending.retire(record);
 				retired.push(record);
 			}
 		}
 		if !retired.is_empty() {
-			self.store
-				.lock()
-				.await
+			// The store lock FIRST, and the in-memory retirement under it: a cancel dropping this
+			// read between the two halves — the next candidate's lookup is a whole network call wide
+			// — would leave the DB holding a record memory has already retired, and the next open
+			// would fold this engine's write back over the version the server just said replaced it.
+			let store = self.store.lock().await;
+			for record in &retired {
+				self.pending.retire(*record);
+			}
+			store
 				.delete_pending(&retired)
 				.map_err(|e| db_error(e, "retiring a superseded write"))?;
 		}
@@ -1842,17 +1858,21 @@ impl SyncEngine {
 			remote_view.nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some());
 		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
 		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
-		// pure in-memory operation.
-		let before = self.pending.uuids();
-		let mut holds = self.pending.settle(pair, &observed, &remote_view.nodes);
-		let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
-		if !retired.is_empty() {
-			self.store
-				.lock()
-				.await
-				.delete_pending(&retired)
-				.map_err(|e| db_error(e, "retiring pending writes"))?;
-		}
+		// pure in-memory operation — under a lock taken BEFORE it, because waiting for that lock is
+		// the one await between the two halves and this read runs under the pass's cancel: dropped
+		// there, the retirement would stand in memory and not in the DB.
+		let mut holds = {
+			let store = self.store.lock().await;
+			let before = self.pending.uuids();
+			let holds = self.pending.settle(pair, &observed, &remote_view.nodes);
+			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
+			if !retired.is_empty() {
+				store
+					.delete_pending(&retired)
+					.map_err(|e| db_error(e, "retiring pending writes"))?;
+			}
+			holds
+		};
 		// A create whose path shows another version of the same file is the one thing the fold
 		// cannot settle on its own; ask the server before it paints over a stranger.
 		self.retire_superseded_creates(pair, &baseline, &remote_view.nodes, &snapshot.files)
@@ -1888,6 +1908,13 @@ impl SyncEngine {
 	/// Reconcile + guard-screen a pass WITHOUT applying it: a dry run that reads both sides and
 	/// reports what a [`sync_once`](Self::sync_once) would do, mutating neither tree nor the
 	/// baseline. A pending deletion approval is neither consumed nor honoured here.
+	///
+	/// It takes no pass gate: it has no plan and no action for a pause to interrupt, and a dry run
+	/// must not be something [`remove_pair`](Self::remove_pair) waits for. That is not the same as
+	/// touching nothing — it runs the same [`prepare`](Self::prepare), so it makes that read's
+	/// server calls and retires the journal records that read settles. What it does NOT do is
+	/// persist the confirmations it observed. A [`paused`](Self::pause_pair) pair is planned like
+	/// any other.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
 		let prep = self.prepare(pair).await?;
 		if let Some(reason) = refusal(&prep) {
@@ -1945,14 +1972,30 @@ impl SyncEngine {
 	/// same roots again later starts from an empty baseline, i.e. with first-sync semantics.
 	/// Removing an unknown pair is a no-op.
 	///
+	/// The pass in flight is CANCELLED rather than allowed to run on: the transfer running is
+	/// dropped, the actions queued behind it are skipped, and a pass parked on a
+	/// [`pause`](Self::pause_pair) is cut loose rather than left waiting for a resume that can no
+	/// longer be asked for. Nothing an interrupted action did is recorded half-way (see
+	/// [`pause_pair_with`](Self::pause_pair_with)), so the pair is retired mid-pass without leaving
+	/// either side half-written. This call waits for that pass to end — up to
+	/// [`REMOVE_CANCEL_GRACE`], after which the removal proceeds regardless and a straggler's write
+	/// fails on its foreign key. A pass still READING the two sides is reached too, and waited for:
+	/// it takes its gate before its scan, so the cancel drops the read where it stands and the pass
+	/// ends without planning anything. A control verb made while this waits cannot take that cancel
+	/// back: [`pause`](Self::pause_pair), [`resume`](Self::resume_pair) and
+	/// [`cancel_paused_actions`](Self::cancel_paused_actions) are all REFUSED, rather than quietly
+	/// accepted on a pair that is on its way out.
+	///
 	/// A watch running on the pair STOPS: its loop has nothing left to sync, and every pass it tried
-	/// would fail against a pair that is gone. The loop finishes whatever pass is in flight, then
-	/// ends and publishes a [`PairRemoved`](super::WatchState::PairRemoved) status; its
+	/// would fail against a pair that is gone. It ends and publishes a
+	/// [`PairRemoved`](super::WatchState::PairRemoved) status; its
 	/// [`WatchHandle`](super::WatchHandle) stays valid, so a caller holding one can still drop or
-	/// stop it. That last pass may still be writing when this returns — its baseline and journal
-	/// writes name a pair id this retires for good, so they fail rather than land in a pair added
-	/// afterwards.
+	/// stop it.
 	pub async fn remove_pair(&self, pair: PairId) -> Result<(), Error> {
+		// FIRST, before anything of the pair is retired: stop the pass in flight and wait for it to
+		// end. Until it does it may still write — its rows name a pair id that still exists — so a
+		// cancel after the delete would leave a completed action racing the cascade.
+		self.cancel_pass_in_flight(pair).await;
 		self.approvals.lock().await.remove(&pair);
 		// Dropping the handle unsubscribes the pair's cache notifications.
 		self.roots.lock().await.remove(&pair);
@@ -1972,13 +2015,41 @@ impl SyncEngine {
 			.delete_pair(pair)
 			.map_err(|e| db_error(e, "removing a sync pair"))?;
 		// Under the same lock as the delete, and as `set_control`'s own write: a pause that landed
-		// in between would leave the map holding an id whose row is gone. A pass PARKED on this
-		// pair's pause is cut loose rather than left waiting for a resume that can no longer be
-		// asked for — the pair it would sync is gone.
-		if let Some(control) = self.paused.lock().await.remove(&pair) {
-			cancel_suspension(&control);
-		}
+		// in between would leave the map holding an id whose row is gone. The channel itself is
+		// already `Retired` — that is what kept a pause or resume made while this WAITED for the
+		// pass from taking the cancel back — so there is nothing left to say on it.
+		self.paused.lock().await.remove(&pair);
 		Ok(())
+	}
+
+	/// Stop the pass in flight on `pair` and wait (up to [`REMOVE_CANCEL_GRACE`]) for it to end: a
+	/// suspension becomes a cancel, the transfer running is dropped, and every action behind either
+	/// is skipped, so the pass returns an [`interrupted`](SyncReport::interrupted) report. Waits on
+	/// the pass's own gate going away, which is what tells the two apart — a pass that has ended
+	/// from one that has merely been told to.
+	///
+	/// Holds NO other lock meanwhile: the pass it waits for takes the store lock on its way out, to
+	/// record what it did and what failed.
+	async fn cancel_pass_in_flight(&self, pair: PairId) {
+		// Only a pass that has ASKED for its gate is reachable — and waited for — here, which a pass
+		// does before it reads either side, so scanning and planning are covered as well as
+		// applying. A pass that asks for its gate AFTER this is stopped by `pass_gate` refusing it,
+		// under the same store lock this removal deletes the pair row under.
+		let control = self.control_channel(pair).await;
+		// `Retired`, not `Cancelled`: the cancel has to keep the last word for the whole wait. A
+		// pause landing in it would otherwise re-park the pass — on a state nothing left in the
+		// engine can change, holding the drive-write lock until the grace runs out — and a resume
+		// would let it apply the rest of its plan against a pair being taken away.
+		control.send_replace(PassControl::Retired);
+		if tokio::time::timeout(REMOVE_CANCEL_GRACE, control.closed())
+			.await
+			.is_err()
+		{
+			tracing::warn!(
+				"remove_pair[pair {pair}]: the pass in flight has not ended after \
+				 {REMOVE_CANCEL_GRACE:?}; retiring the pair anyway"
+			);
+		}
 	}
 
 	/// Pause `pair`: its watch loop stops running passes, and [`sync_once`](Self::sync_once)
@@ -2000,9 +2071,10 @@ impl SyncEngine {
 	///
 	/// The flag is persisted with the pair, so an engine reopened on the same baseline DB comes
 	/// back paused (a suspended PASS is process-local: a restart has nothing to resume, and nothing
-	/// was half-written). Pausing an already-paused pair re-applies the options; an unknown pair is
-	/// an error. A pair that is already paused cannot be WATCHED, either — [`watch`](Self::watch)
-	/// refuses it rather than hand out a handle whose loop does nothing.
+	/// was half-written). Pausing an already-paused pair re-applies the options; an unknown pair, and
+	/// one whose [`removal`](Self::remove_pair) is already under way, are errors. A pair that is
+	/// already paused cannot be WATCHED, either — [`watch`](Self::watch) refuses it rather than hand
+	/// out a handle whose loop does nothing.
 	pub async fn pause_pair(&self, pair: PairId) -> Result<(), Error> {
 		self.pause_pair_with(pair, PauseOptions::default()).await
 	}
@@ -2042,10 +2114,27 @@ impl SyncEngine {
 	/// instead of waiting out its [`cancel_after`](PauseOptions::cancel_after) window. The pair
 	/// STAYS paused.
 	///
-	/// A pair that is not paused has no pass to unwind and is left alone (pause it first if that is
-	/// what you meant); an unknown pair is an error.
+	/// A pair that is not paused has no pass to unwind: that is an error, not a no-op — the caller
+	/// asked to give up transfers nothing is holding back, which means it believes the pair to be in
+	/// a state it is not (pause it first if that is what you meant). An unknown pair is an error
+	/// too, and so is one whose [`removal`](Self::remove_pair) is already under way.
 	pub async fn cancel_paused_actions(&self, pair: PairId) -> Result<(), Error> {
-		cancel_suspension(&self.pair_control(pair).await?);
+		let control = self.pair_control(pair).await?;
+		let state = *control.borrow();
+		// A pair on its way out reads as paused — `Retired` is every bit as not-`Run` as a pause is —
+		// but it is not a pause anyone may act on: the removal's cancel is already final and the row
+		// goes moments later, so this has nothing to convert and no pair to leave paused afterwards.
+		// Refused with the same words the other control verbs use, before anything is written.
+		if state == PassControl::Retired {
+			return Err(being_removed(pair));
+		}
+		if !state.is_paused() {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				format!("sync pair {pair} is not paused"),
+			));
+		}
+		cancel_suspension(&control);
 		Ok(())
 	}
 
@@ -2062,7 +2151,8 @@ impl SyncEngine {
 	/// Resume a [`paused`](Self::pause_pair) pair. Nothing is re-listed and no baseline is
 	/// invalidated: whatever changed on either side while the pair was paused is reconciled by the
 	/// next pass exactly as if it had changed a moment ago — and a pass SUSPENDED mid-way carries
-	/// on from where it parked. Resuming a running pair is a no-op; an unknown pair is an error.
+	/// on from where it parked. Resuming a running pair is a no-op; an unknown pair, and one whose
+	/// [`removal`](Self::remove_pair) is already under way, are errors.
 	///
 	/// A pause is also the one stretch where no pass runs to confirm the pushes made just before
 	/// it, so the resume sweeps those (see [`CONFIRM_TENURE`]) — a `plan_pair` between the resume
@@ -2082,9 +2172,24 @@ impl SyncEngine {
 			.is_some_and(|control| control.borrow().is_paused())
 	}
 
-	/// The checkpoint an apply pass of `pair` parks on, cloned per pass (see the pause module).
-	async fn pass_gate(&self, pair: PairId) -> PassGate {
-		PassGate::new(self.control_channel(pair).await)
+	/// The checkpoint a pass of `pair` parks on, cloned per pass (see the pause module). Taken at the
+	/// TOP of a pass, before either side is read, so a cancel covers the whole of it.
+	///
+	/// Taken under the store lock, and REFUSED for a pair the registry no longer knows: a pass that
+	/// asks for its gate after [`remove_pair`](Self::remove_pair) has finished learns here that its
+	/// pair is gone — before it reads or applies anything. Under the same lock as the delete, so the
+	/// two cannot interleave: either the gate is in the map before the removal reads it, and the
+	/// removal cancels it and waits for it, or the row is already gone and there is no pass to gate.
+	async fn pass_gate(&self, pair: PairId) -> Result<PassGate, Error> {
+		let store = self.store.lock().await;
+		if store
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.is_none()
+		{
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		Ok(PassGate::new(self.control_channel(pair).await))
 	}
 
 	/// `pair`'s control channel, created (running) if this is the first time anyone asked.
@@ -2154,18 +2259,46 @@ impl SyncEngine {
 	}
 
 	async fn set_control(&self, pair: PairId, control: PassControl) -> Result<(), Error> {
-		// The persisted flag FIRST: an in-memory pause the DB never learned about would silently
-		// un-pause on the next open, which is the one direction that loses data protection. Both
-		// writes happen under the store lock, so a concurrent `remove_pair` cannot land between
+		// Both writes happen under the store lock, so a concurrent `remove_pair` cannot land between
 		// them and leave the map holding a pair it has already deleted.
 		let store = self.store.lock().await;
+		// A pair whose removal is under way is REFUSED before anything is written: persisting a flag
+		// on a row that is deleted moments later describes nothing, and the caller would otherwise
+		// be told a pause took that in truth changed neither the pass nor the pair. Read WITHOUT
+		// creating the channel, so an unknown pair leaves no entry behind; only a pair a removal has
+		// reached can be `Retired`.
+		let retired = self
+			.paused
+			.lock()
+			.await
+			.get(&pair)
+			.is_some_and(|state| *state.borrow() == PassControl::Retired);
+		if retired {
+			return Err(being_removed(pair));
+		}
+		// The persisted flag FIRST: an in-memory pause the DB never learned about would silently
+		// un-pause on the next open, which is the one direction that loses data protection.
 		let known = store
 			.set_paused(pair, control.is_paused())
 			.map_err(|e| db_error(e, "persisting a sync pair's paused flag"))?;
 		if !known {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
-		self.control_channel(pair).await.send_replace(control);
+		// A removal that started since the check above still keeps the last word — `Retired` is
+		// final, and the flag just persisted goes with the row — so report it as the refusal it is.
+		let applied = self
+			.control_channel(pair)
+			.await
+			.send_if_modified(|state| match state {
+				PassControl::Retired => false,
+				state => {
+					*state = control;
+					true
+				}
+			});
+		if !applied {
+			return Err(being_removed(pair));
+		}
 		Ok(())
 	}
 
@@ -2261,10 +2394,12 @@ impl SyncEngine {
 	/// [`paused`](SyncReport::paused) instead, having read neither side.
 	///
 	/// A pause that lands WHILE this runs reaches into the pass (see
-	/// [`pause_pair_with`](Self::pause_pair_with)): a suspension parks it — this call keeps waiting,
-	/// so whoever wants it back must resume the pair or cancel its actions — and a cancel returns
-	/// the pass's report early, with [`interrupted`](SyncReport::interrupted) counting what it did
-	/// not do.
+	/// [`pause_pair_with`](Self::pause_pair_with)) from its first step, the read of the two sides,
+	/// to its last: a suspension parks it — this call keeps waiting, so whoever wants it back must
+	/// resume the pair or cancel its actions — and a cancel returns the pass's report early, with
+	/// [`interrupted`](SyncReport::interrupted) counting what it did not do. A cancel that lands
+	/// before there is a plan to count returns the [`paused`](SyncReport::paused) report instead,
+	/// having read one side and applied nothing; if the pair was being REMOVED, that is an error.
 	pub async fn sync_once(&self, pair: PairId) -> Result<SyncReport, Error> {
 		self.sync_once_observed(pair, &mut |_| {}).await
 	}
@@ -2288,7 +2423,29 @@ impl SyncEngine {
 			});
 		}
 
-		let prep = self.prepare(pair).await?;
+		// The gate BEFORE either side is read, not before the first action: reading two trees takes
+		// as long as writing them, and a pass holding no gate is one a cancel can neither reach nor
+		// wait for — `remove_pair` would delete the rows out from under it and only learn of it when
+		// a straggler's write failed. Held from here, a cancel covers the scan, the plan and the
+		// apply alike. `plan_pair` deliberately takes none: it has no plan and no action to
+		// interrupt, and nothing for a removal to wait on.
+		let gate = self.pass_gate(pair).await?;
+		let Some(prepared) = gate.guard(self.prepare(pair)).await else {
+			// Cancelled while still reading: no plan was made, so nothing was applied and no
+			// baseline row written — the journal records the read had already retired stay retired,
+			// in memory and in the DB alike, which is what keeps the two halves in step. A removal
+			// took the pair with it and is said so; a plain cancel leaves the pair paused, which is
+			// the report a pause made a moment earlier would have produced.
+			if gate.retired() {
+				return Err(being_removed(pair));
+			}
+			tracing::debug!("sync_once[pair {pair}]: cancelled while reading the two sides");
+			return Ok(SyncReport {
+				paused: true,
+				..SyncReport::default()
+			});
+		};
+		let prep = prepared?;
 		// Persist what this pass confirmed. Only a real pass writes it: `plan_pair` stays a pure
 		// read, so a dry run inside the confirmation window just leaves it for the next pass — and
 		// leaves the evidence with it, which is why the records are retired HERE and not in the
@@ -2428,8 +2585,6 @@ impl SyncEngine {
 		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
 
 		let local_root = PathBuf::from(&prep.record.local_root);
-		// Pausing the pair from here on reaches INTO this pass (see `pause_pair_with`).
-		let gate = self.pass_gate(pair).await;
 		let ctx = ApplyContext {
 			client: &self.client,
 			local_root: &local_root,
@@ -2683,6 +2838,17 @@ fn db_error(error: rusqlite::Error, context: &str) -> Error {
 	Error::custom_with_source(ErrorKind::Internal, error, Some(context.to_string()))
 }
 
+/// The refusal every control verb gets once [`SyncEngine::remove_pair`] has started on the pair: its
+/// row is deleted moments later, so there is nothing left for a pause or a resume to describe — and
+/// either would take back the cancel the removal is waiting on — and nothing for a cancel of the
+/// paused actions to convert, the removal's own cancel being final.
+fn being_removed(pair: PairId) -> Error {
+	Error::custom(
+		ErrorKind::InvalidState,
+		format!("sync pair {pair} is being removed"),
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::collections::HashSet;
@@ -2695,6 +2861,7 @@ mod tests {
 	use crate::{
 		auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
 		sync_engine::{
+			PauseMode,
 			baseline::{BaselineChange, NodeKind},
 			plan::RemoteNode,
 			scan::LocalNode,
@@ -3468,6 +3635,566 @@ mod tests {
 			!engine.is_paused(pair).await,
 			"the removed pair left its id in the paused set; the next pair sqlite gives that id \
 			 would never sync"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A fresh engine on a throwaway baseline DB, with one pair registered.
+	async fn engine_with_pair(tag: &str) -> (SyncEngine, PairId, PathBuf) {
+		let path = std::env::temp_dir().join(format!("filen_sync_{tag}_{}.db", Uuid::new_v4()));
+		let engine = SyncEngine::open(offline_client(), path.clone())
+			.await
+			.unwrap();
+		let (pair, _) = engine
+			.store
+			.lock()
+			.await
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		(engine, pair, path)
+	}
+
+	/// A stand-in for the pass in flight, shaped like the action loop in [`apply`]: the checkpoint
+	/// before an action, a transfer that never finishes on its own, the row it would record once it
+	/// did, and the checkpoint of the action behind it. It resolves to what it got done — which,
+	/// once the pair it syncs is removed, must be nothing at all.
+	fn pass_in_flight(gate: PassGate) -> tokio::task::JoinHandle<Vec<&'static str>> {
+		tokio::spawn(async move {
+			let mut done = Vec::new();
+			if !gate.wait_to_start().await {
+				return done;
+			}
+			if gate.guard(std::future::pending::<()>()).await.is_some() {
+				done.push("the transfer's baseline row");
+			}
+			if gate.wait_to_start().await {
+				done.push("the action behind it");
+			}
+			done
+		})
+	}
+
+	/// Removing a pair stops the pass in flight instead of letting it run on: the transfer is
+	/// dropped where it stands, it records nothing, the actions queued behind it never start — and
+	/// the removal does not return until that has happened, so a completed action is not left
+	/// racing the delete of the rows it would write into.
+	#[tokio::test]
+	async fn removing_a_pair_drops_the_transfer_in_flight_and_waits_for_the_pass() {
+		let (engine, pair, path) = engine_with_pair("remove_mid_pass").await;
+		let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
+		tokio::task::yield_now().await;
+		assert!(
+			!pass.is_finished(),
+			"the stand-in pass was supposed to be stuck in its transfer"
+		);
+
+		engine.remove_pair(pair).await.unwrap();
+		assert!(
+			pass.is_finished(),
+			"remove_pair returned with the pass it retired the pair under still running"
+		);
+		assert_eq!(
+			pass.await.unwrap(),
+			Vec::<&str>::new(),
+			"the pass kept working after its pair was removed"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// The same, for a pass PARKED on the pair's pause: the removal converts that suspension into a
+	/// cancel, so the parked action never starts. Nobody is left to resume it — the pair it would
+	/// sync is gone.
+	#[tokio::test]
+	async fn removing_a_paused_pair_never_lets_its_parked_action_start() {
+		let (engine, pair, path) = engine_with_pair("remove_parked").await;
+		engine.pause_pair(pair).await.unwrap();
+		let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
+		tokio::task::yield_now().await;
+		assert!(!pass.is_finished(), "a suspended pass must park, not end");
+
+		engine.remove_pair(pair).await.unwrap();
+		assert!(
+			pass.is_finished(),
+			"remove_pair returned with a pass still parked on the pair it removed"
+		);
+		assert_eq!(
+			pass.await.unwrap(),
+			Vec::<&str>::new(),
+			"the parked action started after its pair was removed"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// The two things that cut a pass loose — a watch being stopped (whose engine-side half is
+	/// [`SyncEngine::cancel_suspended_pass`], polled by the loop's unparking for as long as it
+	/// lives) and the pair being removed — both wait for something, and neither may end up waiting
+	/// on the other. Nor may a pause that never escalates park the removal.
+	#[tokio::test]
+	async fn a_stop_and_a_removal_of_the_same_pair_never_wait_on_each_other() {
+		// STOP first: the watch is already gone and has cut the parked pass loose; the removal that
+		// follows finds a pass that is cancelled but has not unwound yet.
+		let (engine, pair, path) = engine_with_pair("stop_then_remove").await;
+		engine.pause_pair(pair).await.unwrap();
+		let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
+		tokio::task::yield_now().await;
+		engine.cancel_suspended_pass(pair).await;
+		engine.remove_pair(pair).await.unwrap();
+		assert!(
+			pass.is_finished(),
+			"the removal left the stopped pass behind"
+		);
+		assert_eq!(pass.await.unwrap(), Vec::<&str>::new());
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+
+		// REMOVE first: the stopped watch keeps unparking a pair the engine has already forgotten,
+		// which must neither block nor resurrect the control state the removal took away.
+		let (engine, pair, path) = engine_with_pair("remove_then_stop").await;
+		engine.pause_pair(pair).await.unwrap();
+		let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
+		tokio::task::yield_now().await;
+		engine.remove_pair(pair).await.unwrap();
+		engine.cancel_suspended_pass(pair).await;
+		assert!(
+			pass.is_finished(),
+			"the removal did not end the parked pass"
+		);
+		assert_eq!(pass.await.unwrap(), Vec::<&str>::new());
+		assert!(
+			!engine.is_paused(pair).await,
+			"the removed pair kept its control state"
+		);
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+
+		// PAUSE first, with no escalation window at all: nothing but the removal can end this pass,
+		// so a removal that waited for the pause to be reversed would wait for ever.
+		let (engine, pair, path) = engine_with_pair("pause_then_remove").await;
+		let pass = pass_in_flight(engine.pass_gate(pair).await.unwrap());
+		tokio::task::yield_now().await;
+		engine
+			.pause_pair_with(
+				pair,
+				PauseOptions {
+					mode: PauseMode::Suspend,
+					cancel_after: None,
+				},
+			)
+			.await
+			.unwrap();
+		engine.remove_pair(pair).await.unwrap();
+		assert!(
+			pass.is_finished(),
+			"the removal returned while a pass sat on a pause nothing else can end"
+		);
+		assert_eq!(pass.await.unwrap(), Vec::<&str>::new());
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// The window the tests below aim at: the removal has cancelled the pass and is waiting for
+	/// it to end, and a control call lands in the middle of that wait. Reports what the pass got
+	/// done and how long the removal took.
+	async fn a_removal_raced_by<F, Fut>(
+		engine: &Arc<SyncEngine>,
+		pair: PairId,
+		interfere: F,
+	) -> (Vec<&'static str>, Duration)
+	where
+		F: FnOnce() -> Fut,
+		Fut: std::future::Future<Output = ()>,
+	{
+		let gate = engine.pass_gate(pair).await.unwrap();
+		let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+		let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+		// The pass in flight, with its bookkeeping held up the way a sibling transfer contending for
+		// the store lock holds it up: that is the window the removal spends waiting for it.
+		let pass = tokio::spawn(async move {
+			let mut done = Vec::new();
+			if gate.guard(std::future::pending::<()>()).await.is_some() {
+				done.push("the transfer's baseline row");
+			}
+			dropped_tx.send(()).unwrap();
+			release_rx.await.unwrap();
+			if gate.wait_to_start().await {
+				done.push("the action behind it");
+			}
+			done
+		});
+
+		let started = tokio::time::Instant::now();
+		let removing = tokio::spawn({
+			let engine = Arc::clone(engine);
+			async move { engine.remove_pair(pair).await }
+		});
+		// The transfer was dropped, so the removal has cancelled the pass and is now waiting for it.
+		dropped_rx.await.unwrap();
+		interfere().await;
+		release_tx.send(()).unwrap();
+
+		removing.await.unwrap().unwrap();
+		let elapsed = started.elapsed();
+		let done = tokio::time::timeout(Duration::from_secs(60), pass)
+			.await
+			.expect("the removal left the pass parked on a pair that is gone")
+			.unwrap();
+		(done, elapsed)
+	}
+
+	/// A pause landing while the removal waits for the pass it cancelled must not put that pass back
+	/// to sleep. Nothing left in the engine could ever wake it again — the persisted flag, the
+	/// control channel and the map entry all go with the pair row — so it would park for ever,
+	/// holding the drive-write lock every other pair's pass queues on. The caller is told so, rather
+	/// than handed an `Ok` for a pause that took on nothing.
+	#[tokio::test(start_paused = true)]
+	async fn a_pause_landing_while_a_removal_waits_cannot_re_park_the_pass() {
+		let (engine, pair, path) = engine_with_pair("pause_during_removal").await;
+		let engine = Arc::new(engine);
+		let (done, elapsed) = a_removal_raced_by(&engine, pair, || async {
+			let refused = engine
+				.pause_pair_with(
+					pair,
+					PauseOptions {
+						mode: PauseMode::Suspend,
+						// Nothing but the removal can end this pass: a suspension that never
+						// escalates.
+						cancel_after: None,
+					},
+				)
+				.await
+				.expect_err("a pause during a removal must not report success");
+			assert!(
+				refused.to_string().contains("is being removed"),
+				"the refusal must say why: {refused}"
+			);
+		})
+		.await;
+		assert_eq!(
+			done,
+			Vec::<&str>::new(),
+			"the pass kept working after its pair was removed"
+		);
+		// The cancel has to keep the last word THROUGHOUT the wait, not merely be re-sent once the
+		// grace elapsed: a pass re-parked for those ten seconds sits on the drive-write lock every
+		// other pair queues on, and the removal blocks the caller for as long.
+		assert!(
+			elapsed < REMOVE_CANCEL_GRACE,
+			"the removal took {elapsed:?}: the pause re-parked the pass and only the grace \
+			 timeout got it out"
+		);
+		assert!(
+			!engine.is_paused(pair).await,
+			"the removed pair kept its control state"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// The other half: a RESUME landing in the same window must not restart the pass the removal
+	/// cancelled. It would apply the rest of its plan — uploads, remote trashes, local deletions —
+	/// against a pair whose rows are deleted moments later. It is refused, for the same reason the
+	/// pause above is.
+	#[tokio::test(start_paused = true)]
+	async fn a_resume_landing_while_a_removal_waits_cannot_restart_the_pass() {
+		let (engine, pair, path) = engine_with_pair("resume_during_removal").await;
+		let engine = Arc::new(engine);
+		let (done, elapsed) = a_removal_raced_by(&engine, pair, || async {
+			let refused = engine
+				.resume_pair(pair)
+				.await
+				.expect_err("a resume during a removal must not report success");
+			assert!(
+				refused.to_string().contains("is being removed"),
+				"the refusal must say why: {refused}"
+			);
+		})
+		.await;
+		assert_eq!(
+			done,
+			Vec::<&str>::new(),
+			"the resume let the cancelled pass carry on against a pair being removed"
+		);
+		assert!(
+			elapsed < REMOVE_CANCEL_GRACE,
+			"the removal took {elapsed:?} instead of ending with the pass it cancelled"
+		);
+		assert!(
+			!engine.is_paused(pair).await,
+			"the removed pair kept its control state"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// And the third verb: cancelling the paused actions of a pair whose removal is waiting for the
+	/// pass it cancelled. The pair reads as paused — `Retired` is not `Run` — but there is no pause
+	/// to convert and no pair to leave paused, so an `Ok` here tells the caller its suspension was
+	/// given up when nothing of the kind happened. It is refused exactly as the pause and the resume
+	/// above are.
+	#[tokio::test(start_paused = true)]
+	async fn cancelling_the_paused_actions_while_a_removal_waits_is_refused() {
+		let (engine, pair, path) = engine_with_pair("cancel_during_removal").await;
+		let engine = Arc::new(engine);
+		let (done, elapsed) = a_removal_raced_by(&engine, pair, || async {
+			let refused = engine
+				.cancel_paused_actions(pair)
+				.await
+				.expect_err("a cancel during a removal must not report success");
+			assert!(
+				refused.to_string().contains("is being removed"),
+				"the refusal must say why, not read as an ordinary pause: {refused}"
+			);
+		})
+		.await;
+		assert_eq!(
+			done,
+			Vec::<&str>::new(),
+			"the pass kept working after its pair was removed"
+		);
+		assert!(
+			elapsed < REMOVE_CANCEL_GRACE,
+			"the removal took {elapsed:?} instead of ending with the pass it cancelled"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A real pass registers its control channel BEFORE it reads either side: a pass that has read
+	/// its pair row but holds no gate is one a cancel can neither reach nor wait for, and reading
+	/// two trees takes as long as writing them, so that window is not a corner case.
+	#[tokio::test]
+	async fn a_pass_takes_its_gate_before_it_reads_either_side() {
+		let (engine, pair, path) = engine_with_pair("gate_before_read").await;
+		// Offline, so the pass fails in its remote enumeration. That it registered a control channel
+		// before getting that far is what says the gate came first.
+		assert!(
+			engine.sync_once(pair).await.is_err(),
+			"the offline stand-in was supposed to fail in its remote enumeration"
+		);
+		assert!(
+			engine.paused.lock().await.contains_key(&pair),
+			"the pass read the two sides before taking its gate: a cancel landing there would \
+			 neither reach it nor wait for it"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A REAL pass, parked in its read half: the remote enumeration is the first thing that wants
+	/// the client's cache slot, so holding that slot stops `sync_once` inside `prepare` — under the
+	/// gate it took first, which is the window the two tests below land a control call in.
+	fn a_pass_parked_in_its_read(
+		engine: &Arc<SyncEngine>,
+		pair: PairId,
+	) -> tokio::task::JoinHandle<Result<SyncReport, Error>> {
+		let engine = Arc::clone(engine);
+		tokio::spawn(async move { engine.sync_once(pair).await })
+	}
+
+	/// Wait for that pass to reach its gate — it registers the pair's control channel before it
+	/// reads either side — and then to park in the read behind it.
+	async fn parked(engine: &SyncEngine, pair: PairId) {
+		for _ in 0..100 {
+			if engine.paused.lock().await.contains_key(&pair) {
+				tokio::task::yield_now().await;
+				return;
+			}
+			tokio::task::yield_now().await;
+		}
+		panic!("the pass never took its gate");
+	}
+
+	/// Let a task a control call just woke actually run: on the current-thread test runtime the
+	/// caller has to yield for the pass it cancelled to be polled at all.
+	async fn ended<T>(pass: &tokio::task::JoinHandle<T>) -> bool {
+		for _ in 0..100 {
+			if pass.is_finished() {
+				return true;
+			}
+			tokio::task::yield_now().await;
+		}
+		false
+	}
+
+	/// And a removal landing in that window reaches it: the read is dropped where it stands, the
+	/// pass ends without planning anything, and the removal waits for it instead of deleting the
+	/// rows out from under a pass it never saw.
+	#[tokio::test(start_paused = true)]
+	async fn a_removal_during_the_read_half_ends_the_pass_before_it_plans() {
+		let (engine, pair, path) = engine_with_pair("remove_during_prepare").await;
+		let engine = Arc::new(engine);
+		let slot = engine.client.cache_slot.lock().await;
+		let pass = a_pass_parked_in_its_read(&engine, pair);
+		parked(&engine, pair).await;
+		assert!(
+			!pass.is_finished(),
+			"the pass was supposed to be stuck in its read"
+		);
+
+		let started = tokio::time::Instant::now();
+		engine.remove_pair(pair).await.unwrap();
+		let elapsed = started.elapsed();
+		assert!(
+			pass.is_finished(),
+			"remove_pair returned with a pass still reading the pair it removed"
+		);
+		// Waited for the pass rather than giving up on a read it could not reach.
+		assert!(
+			elapsed < REMOVE_CANCEL_GRACE,
+			"the removal took {elapsed:?}: the cancel never reached the pass in its read"
+		);
+
+		// Only now, and there is nothing left to let through: the read was dropped where it stood.
+		drop(slot);
+		let refused = pass.await.unwrap().expect_err(
+			"the read survived the removal, so the pass planned against rows that are gone",
+		);
+		assert!(
+			refused.to_string().contains("is being removed"),
+			"a pass dropped by a removal must say so, not report a read that failed: {refused}"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// The same window, CANCELLED rather than removed: the pair is still there, so the pass reports
+	/// the pause instead of an error — the very report a pause landing a moment earlier would have
+	/// produced, with nothing planned, applied or recorded.
+	#[tokio::test(start_paused = true)]
+	async fn a_cancel_during_the_read_half_ends_the_pass_with_the_paused_report() {
+		let (engine, pair, path) = engine_with_pair("cancel_during_prepare").await;
+		let engine = Arc::new(engine);
+		let slot = engine.client.cache_slot.lock().await;
+		let pass = a_pass_parked_in_its_read(&engine, pair);
+		parked(&engine, pair).await;
+		assert!(
+			!pass.is_finished(),
+			"the pass was supposed to be stuck in its read"
+		);
+
+		engine
+			.pause_pair_with(
+				pair,
+				PauseOptions {
+					mode: PauseMode::Cancel,
+					cancel_after: None,
+				},
+			)
+			.await
+			.unwrap();
+		assert!(
+			ended(&pass).await,
+			"the cancel never reached the pass reading the two sides"
+		);
+
+		drop(slot);
+		let report = pass
+			.await
+			.unwrap()
+			.expect("a cancelled read is not a failure: the pair is still there to be reported on");
+		assert_eq!(
+			report,
+			SyncReport {
+				paused: true,
+				..SyncReport::default()
+			},
+			"a pass dropped in its read must report the pause and nothing else"
+		);
+		assert!(
+			engine.store.lock().await.entries(pair).unwrap().is_empty(),
+			"a pass that never had a plan wrote a baseline row"
+		);
+		assert!(
+			engine.is_paused(pair).await,
+			"the cancel left the pair running"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A dry run stays a pure read: it takes NO pass gate, so it neither leaves control state behind
+	/// for a pair nobody paused nor makes a removal wait for a call that writes nothing.
+	#[tokio::test]
+	async fn a_dry_run_takes_no_pass_gate() {
+		let (engine, pair, path) = engine_with_pair("plan_no_gate").await;
+		// Offline, so the remote enumeration inside fails; the gate would have been taken before
+		// that, which is what this is about.
+		let _ = engine.plan_pair(pair).await;
+		assert!(
+			!engine.paused.lock().await.contains_key(&pair),
+			"a dry run took a pass gate"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A control verb refuses the state it cannot act on rather than returning `Ok` for nothing:
+	/// cancelling the transfers of a pair nobody paused has no parked pass to unwind, and an `Ok`
+	/// there reads as "the transfers are being given up" while they run happily on.
+	#[tokio::test]
+	async fn cancelling_the_actions_of_a_pair_that_is_not_paused_is_refused() {
+		let (engine, pair, path) = engine_with_pair("cancel_not_paused").await;
+
+		let running = engine
+			.cancel_paused_actions(pair)
+			.await
+			.expect_err("a pair nobody paused has no actions to cancel");
+		assert!(
+			running.to_string().contains("is not paused"),
+			"the refusal must say what state the pair is in: {running}"
+		);
+		let unknown = engine
+			.cancel_paused_actions(pair + 9_999)
+			.await
+			.expect_err("an unknown pair must not be cancellable");
+		assert!(
+			unknown.to_string().contains("unknown sync pair"),
+			"an unknown id must still read as unknown, not as unpaused: {unknown}"
+		);
+
+		// Paused, it is exactly what the verb is for — and it leaves the pair paused, so a repeat is
+		// idempotent rather than a second refusal.
+		engine.pause_pair(pair).await.unwrap();
+		engine.cancel_paused_actions(pair).await.unwrap();
+		assert!(
+			engine.is_paused(pair).await,
+			"cancelling the paused actions un-paused the pair"
+		);
+		engine.cancel_paused_actions(pair).await.unwrap();
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A pass that was still SCANNING when its pair was removed holds no control channel, so the
+	/// removal neither reaches it nor waits for it. Asking for its gate afterwards is where it has
+	/// to learn the pair is gone — otherwise it is handed a fresh RUNNING gate and applies its whole
+	/// plan (uploads, remote trashes, local deletions) against rows the removal has taken away.
+	#[tokio::test]
+	async fn a_pass_that_asks_for_its_gate_after_the_removal_is_refused() {
+		let (engine, pair, path) = engine_with_pair("gate_after_removal").await;
+		engine.remove_pair(pair).await.unwrap();
+
+		assert!(
+			engine.pass_gate(pair).await.is_err(),
+			"the pass got a gate for a pair that no longer exists"
+		);
+		assert!(
+			!engine.paused.lock().await.contains_key(&pair),
+			"asking for the gate left a control entry behind for a pair that is gone"
 		);
 
 		drop(engine);

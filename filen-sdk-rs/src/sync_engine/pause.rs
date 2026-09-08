@@ -92,6 +92,14 @@ pub(super) enum PassControl {
 	},
 	/// Paused, unwinding the pass in flight (see [`PauseMode::Cancel`]).
 	Cancelled,
+	/// The pair is being REMOVED: like [`Cancelled`](Self::Cancelled) for the pass, and FINAL — a
+	/// pause, a resume or a cancel of the paused actions landing while
+	/// [`remove_pair`](super::SyncEngine::remove_pair) waits for that pass is refused rather than
+	/// allowed to take the cancel back, or to report a conversion of it. Reviving the pass there would
+	/// either park it on a state nothing left in the engine can change — its channel and its row go
+	/// with the pair moments later — or let it apply the rest of its plan against a pair that is
+	/// being taken away.
+	Retired,
 }
 
 impl PassControl {
@@ -127,12 +135,19 @@ impl PassControl {
 pub(super) struct PassGate {
 	/// `None` for a pass nothing can pause (unit tests, and any caller that has no pair state).
 	control: Option<watch::Sender<PassControl>>,
+	/// A receiver held for as long as the pass (and every transfer that cloned this gate) lives,
+	/// and never read: it makes [`watch::Sender::closed`] on the pair's channel resolve exactly
+	/// when the pass has ended, which is how
+	/// [`remove_pair`](super::SyncEngine::remove_pair) waits for the pass it just cancelled.
+	_alive: Option<watch::Receiver<PassControl>>,
 }
 
 impl PassGate {
 	pub(super) fn new(control: watch::Sender<PassControl>) -> Self {
+		let alive = control.subscribe();
 		Self {
 			control: Some(control),
+			_alive: Some(alive),
 		}
 	}
 
@@ -154,12 +169,21 @@ impl PassGate {
 			let current = *state.borrow_and_update();
 			match current {
 				PassControl::Run => return true,
-				PassControl::Cancelled => return false,
+				PassControl::Cancelled | PassControl::Retired => return false,
 				PassControl::Suspended { escalate_at } => {
 					await_change(control, &mut state, escalate_at).await;
 				}
 			}
 		}
+	}
+
+	/// Whether the pass's pair is being REMOVED, as opposed to merely cancelled — the two ways
+	/// [`guard`](Self::guard) can come back empty, which the pass answers differently: a cancel
+	/// leaves a paused pair to report on, a removal leaves no pair at all.
+	pub(super) fn retired(&self) -> bool {
+		self.control
+			.as_ref()
+			.is_some_and(|control| *control.borrow() == PassControl::Retired)
 	}
 
 	/// Race `work` against a cancel of the pass. `None` means it was DROPPED where it stood, which
@@ -234,7 +258,7 @@ async fn cancelled(control: &watch::Sender<PassControl>) {
 	loop {
 		let current = *state.borrow_and_update();
 		match current {
-			PassControl::Cancelled => return,
+			PassControl::Cancelled | PassControl::Retired => return,
 			PassControl::Run => await_change(control, &mut state, None).await,
 			PassControl::Suspended { escalate_at } => {
 				await_change(control, &mut state, escalate_at).await;
