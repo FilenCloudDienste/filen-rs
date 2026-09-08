@@ -202,7 +202,9 @@ pub(crate) struct BaselineEntry {
 	/// an adopt of a converged path and a conflict resolution write the two the same — both sides
 	/// demonstrably held that content at that moment. A PUSH does not: an upload proves the server
 	/// took our bytes, not that the remote still held them when we next looked, so the marker stays
-	/// on the previous agreed content until a snapshot shows our own version at the path.
+	/// on the previous agreed content until something confirms our version: a snapshot listing it at
+	/// the path, or its having stood as the remote head for
+	/// [`CONFIRM_TENURE`](super::engine::CONFIRM_TENURE).
 	///
 	/// That gap is what tells a remote edit made AFTER our push (pull it) from one made
 	/// CONCURRENTLY with it (a conflict) — see `plan::reconcile_two_way`.
