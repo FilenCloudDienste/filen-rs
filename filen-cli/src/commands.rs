@@ -7,7 +7,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	fs::{
 		HasName as _, HasParent as _, HasUUID,
-		categories::{DirType, NonRootFileType, Normal},
+		categories::{DirType, NonRootFileType, Normal, fs::CategoryFS},
 		dir::meta::DirectoryMetaChanges,
 		file::{meta::FileMetaChanges, traits::HasFileInfo as _},
 	},
@@ -698,10 +698,16 @@ async fn print_file_or_directory_info(
 			}
 		}
 		NonRootFileType::Dir(dir) => {
+			let size_info = Normal::dir_size(&**client, &DirType::from(&*dir), ())
+				.await
+				.context("Failed to get directory size")?;
 			if ui.json {
 				ui.print_json(json!({
 					"name": dir.name().map(str::to_string).unwrap_or_else(|| dir.uuid().to_string()),
 					"type": "directory",
+					"size": size_info.size,
+					"files": size_info.files,
+					"directories": size_info.dirs,
 					"created": dir.created(),
 					"uuid": dir.uuid(),
 				}))?;
@@ -714,6 +720,9 @@ async fn print_file_or_directory_info(
 				ui.print_key_value_table(&[
 					("Name", &dir_name),
 					("Type", "Directory"),
+					("Size", &ui::format_size(size_info.size)),
+					("Files", &size_info.files.to_string()),
+					("Directories", &size_info.dirs.to_string()),
 					(
 						"Created",
 						&dir.created()
@@ -721,26 +730,32 @@ async fn print_file_or_directory_info(
 							.unwrap_or("-".to_string()),
 					),
 					("UUID", &dir_uuid),
-					// todo: aggregate directory size, file count, ...?
 				]);
 			}
 		}
-		NonRootFileType::Root(_) => {
+		NonRootFileType::Root(root) => {
 			let user_info = client
 				.get_user_info()
 				.await
 				.context("Failed to get user info")?;
+			let size_info = Normal::dir_size(&**client, &DirType::from(&*root), ())
+				.await
+				.context("Failed to get drive size")?;
 			if ui.json {
 				ui.print_json(json!({
 					"type": "drive",
 					"usedStorage": user_info.storage_used,
 					"totalStorage": user_info.max_storage,
+					"files": size_info.files,
+					"directories": size_info.dirs,
 				}))?;
 			} else {
 				ui.print_key_value_table(&[
 					("Type", "Drive"),
 					("Used", &ui::format_size(user_info.storage_used)),
 					("Total", &ui::format_size(user_info.max_storage)),
+					("Files", &size_info.files.to_string()),
+					("Directories", &size_info.dirs.to_string()),
 				]);
 			}
 		}

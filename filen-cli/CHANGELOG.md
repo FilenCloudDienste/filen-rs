@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - improved `mv` to include renaming and handle more special cases
+- `stat <directory>` and `stat /` now show total size and amount of files and directories
 
 ## 0.2.7 - 2026-06-19
 
