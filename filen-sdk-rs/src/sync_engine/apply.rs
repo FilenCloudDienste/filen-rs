@@ -23,7 +23,10 @@ use super::{
 	engine::{Observations, PendingKind, PendingWrites},
 	events::SyncEvent,
 	guard::GuardReason,
-	outcome::{PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason, UnsyncablePath},
+	outcome::{
+		PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, RefuseReason,
+		UnsyncablePath,
+	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths},
 	scan::{LocalNode, QUARANTINE_DIR},
@@ -121,6 +124,9 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) client: &'a Client,
 	pub(super) local_root: &'a Path,
 	pub(super) pair: PairId,
+	/// The pair's mode. Read only where the direction changes what an action MEANS — a two-way
+	/// upload has a divergence to surface where a one-way one has an authoritative side.
+	pub(super) mode: super::SyncMode,
 	pub(super) store: &'a Mutex<BaselineStore>,
 	pub(super) local: &'a HashMap<String, LocalNode>,
 	/// The pair's baseline as of the start of the pass — what the local side is expected to hold.
@@ -201,6 +207,15 @@ pub(super) fn rename_aside(root: &Path, rel_path: &str) -> Result<Option<String>
 	if source.symlink_metadata().is_err() {
 		return Ok(None);
 	}
+	let (rel, dest) = aside_target(root, rel_path)?;
+	std::fs::rename(&source, &dest).map_err(io_err)?;
+	Ok(Some(rel))
+}
+
+/// A free `<stem>.old.<ext>` name beside `rel_path` (`<stem>.old.N.<ext>` when that is taken), with
+/// its confined local path. What [`rename_aside`] moves the losing copy to, and where a keep-both
+/// resolution of a buried version downloads it.
+pub(super) fn aside_target(root: &Path, rel_path: &str) -> Result<(String, PathBuf), crate::Error> {
 	let (parent, name) = parent_and_name(rel_path);
 	let (stem, ext) = match name.rsplit_once('.') {
 		Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
@@ -223,8 +238,7 @@ pub(super) fn rename_aside(root: &Path, rel_path: &str) -> Result<Option<String>
 		};
 		let dest = confined_local_target(root, &rel)?;
 		if dest.symlink_metadata().is_err() {
-			std::fs::rename(&source, &dest).map_err(io_err)?;
-			return Ok(Some(rel));
+			return Ok((rel, dest));
 		}
 	}
 	Err(internal_owned(format!(
@@ -387,6 +401,17 @@ pub(super) async fn apply(
 						SyncAction::DownloadFile { .. } => report.downloaded += 1,
 						_ => {}
 					}
+				}
+				// The upload landed and stands — it is still an upload — but it buried a
+				// concurrent edit, and that is a conflict of this pass's own making.
+				Ok(Transfer::Overwrote(conflict)) => {
+					applied += 1;
+					report.uploaded += 1;
+					observer(action.to_event());
+					observer(SyncEvent::Conflict {
+						rel_path: conflict.rel_path.clone(),
+					});
+					report.conflicts.push(*conflict);
 				}
 				Err(error) => {
 					applied += 1;
@@ -579,10 +604,14 @@ fn note_failure(report: &mut SyncReport, rel_path: &str, error: &crate::Error) {
 
 /// Whether one transfer ran at all — the pass can be cancelled before it starts, or while its
 /// network op is in flight (see [`PassGate`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Transfer {
 	/// It ran to the end and recorded what it did.
 	Done,
+	/// The upload landed and IS the remote head — but the server's version chain shows it went on
+	/// top of a version this pass never saw. Another client edited the file between the snapshot
+	/// this pass read and our upload, and our bytes buried it; the conflict says so.
+	Overwrote(Box<PlannedConflict>),
 	/// The pass was cancelled: it never started, or it was dropped mid-flight. Either way it
 	/// recorded nothing, and the next pass re-plans it.
 	Interrupted,
@@ -703,6 +732,31 @@ async fn apply_transfer(
 			// remote head confirms even without a pass ever catching it there.
 			ctx.observed
 				.watch_push(new_uuid, Some(uploaded.stable_uuid()), replaced);
+			// ... and the version chain says whether we landed on the version we meant to.
+			if let Some(buried) = buried_version(
+				ctx,
+				&uploaded,
+				new_uuid,
+				replaced,
+				local.and_then(|n| n.content_hash),
+			)
+			.await
+			{
+				let entry = overwritten_entry(rel_path, local, &buried);
+				tracing::debug!(
+					"apply: the upload of {rel_path:?} went on top of version {} — a concurrent edit this pass never saw",
+					buried.uuid()
+				);
+				// No pending-write record: the path is HELD from here on, so no pass reconciles
+				// against it, and a fold would have to read the row — which describes the buried
+				// version, not what the remote holds.
+				upsert_baseline(ctx, &entry).await?;
+				return Ok(Transfer::Overwrote(Box::new(PlannedConflict {
+					rel_path: rel_path.clone(),
+					local: local.map(|node| node.kind.into()),
+					remote: Some(PlannedNodeKind::File),
+				})));
+			}
 			let entry = file_entry(
 				rel_path,
 				Some(new_uuid),
@@ -780,8 +834,13 @@ async fn apply_one(
 			report.remote_dirs_created += 1;
 		}
 		SyncAction::UploadFile { .. } => {
-			if apply_transfer(ctx, action, files, dir_by_path).await? == Transfer::Done {
-				report.uploaded += 1;
+			match apply_transfer(ctx, action, files, dir_by_path).await? {
+				Transfer::Done => report.uploaded += 1,
+				Transfer::Overwrote(conflict) => {
+					report.uploaded += 1;
+					report.conflicts.push(*conflict);
+				}
+				Transfer::Interrupted => {}
 			}
 		}
 		SyncAction::TrashRemote {
@@ -1037,6 +1096,88 @@ fn adopt_outcome(
 	}
 }
 
+/// The version this upload buried, when it buried one: the pusher's side of a concurrent edit.
+///
+/// A same-name upload is versioned rather than refused, so an edit another client made between
+/// this pass reading the remote and our upload landing ends up UNDER our bytes, invisible to
+/// everything the pass can see. The server's version chain is the only place it shows, so the
+/// upload arm asks — once per upload, and only for an upload that replaced a version this pass
+/// actually saw. A brand-new file has no chain to read (nothing was there to interleave with), and
+/// a one-way mode has an authoritative side and no divergence to surface.
+///
+/// A lookup that fails leaves the push looking ordinary: the pass records the row it always did,
+/// and the other client's own conflict is what surfaces the divergence.
+async fn buried_version(
+	ctx: &ApplyContext<'_>,
+	uploaded: &RemoteFile,
+	ours: Uuid,
+	replaced: Option<Uuid>,
+	ours_hash: Option<filen_types::crypto::Blake3Hash>,
+) -> Option<crate::fs::file::FileVersion> {
+	if ctx.mode != super::SyncMode::TwoWay {
+		return None;
+	}
+	let replaced = replaced?;
+	let versions = match ctx.client.list_file_versions(uploaded).await {
+		Ok(versions) => versions,
+		Err(error) => {
+			tracing::debug!(
+				"apply: could not read the version chain after uploading {ours} — {error}"
+			);
+			return None;
+		}
+	};
+	// Versions this engine minted itself are not candidates, whatever the chain's order says: the
+	// server stamps to the second, so our own previous upload and a stranger's concurrent edit can
+	// share a second with the version we replaced and be told apart by nothing else.
+	let chain: Vec<(Uuid, chrono::DateTime<Utc>)> = versions
+		.iter()
+		.filter(|version| version.uuid() == replaced || !ctx.observed.minted(version.uuid()))
+		.map(|version| (version.uuid(), version.timestamp()))
+		.collect();
+	let buried = crate::sync_engine::plan::interleaved_version(&chain, ours, replaced)?;
+	let buried = versions
+		.into_iter()
+		.find(|version| version.uuid() == buried)?;
+	// Landing on a version nobody told us about is only a DIVERGENCE if its bytes differ from
+	// ours: two clients making the identical edit at once bury each other's copy and lose nothing.
+	// A version the server stored no hash for is no evidence of one either — the same rule the
+	// two-way reconcile applies to a foreign version sitting at a path.
+	match (ours_hash, buried.metadata().hash()) {
+		(Some(ours), Some(theirs)) if ours != theirs => Some(buried),
+		_ => None,
+	}
+}
+
+/// The row that holds a buried concurrent edit for the caller to resolve.
+///
+/// Its local half is our own copy — which is also what the remote head now carries, since our
+/// upload won — and its remote half names the BURIED version: the uuid, hash and size
+/// [`resolve_conflict`](super::SyncEngine::resolve_conflict) needs to restore or fetch it.
+fn overwritten_entry(
+	rel_path: &str,
+	local: Option<&LocalNode>,
+	buried: &crate::fs::file::FileVersion,
+) -> BaselineEntry {
+	BaselineEntry {
+		rel_path: rel_path.to_string(),
+		kind: NodeKind::File,
+		remote_uuid: Some(buried.uuid()),
+		content_hash: local.and_then(|l| l.content_hash),
+		size: local.map(|l| l.size),
+		local_mtime: local.map(|l| l.mtime_millis),
+		remote_modified: Some(buried.timestamp().timestamp_millis()),
+		state: BaselineState::Overwritten,
+		local_kind: Some(NodeKind::File),
+		remote_kind: Some(NodeKind::File),
+		remote_hash: buried.metadata().hash(),
+		remote_size: Some(buried.size()),
+		remote_stable_uuid: Some(buried.stable_uuid()),
+		// Our push buried theirs: there is no content the two sides ever agreed on here.
+		agreed_hash: None,
+	}
+}
+
 /// Record a two-way conflict in the baseline: the path is HELD (excluded from planning, along with
 /// its subtree) until [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) picks a
 /// winner. The row keeps both sides' evidence as of this pass — the local kind/hash/size/mtime the
@@ -1277,7 +1418,10 @@ async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), c
 ///
 /// Returns where the item went, so a caller whose write then does NOT happen can put it back (see
 /// [`restore_stashed`]); `None` when there was nothing to move.
-fn quarantine_local(root: &Path, rel_path: &str) -> Result<Option<PathBuf>, crate::Error> {
+pub(super) fn quarantine_local(
+	root: &Path,
+	rel_path: &str,
+) -> Result<Option<PathBuf>, crate::Error> {
 	let source = local_path(root, rel_path);
 	// A missing source is a no-op — e.g. it already moved as part of an ancestor's quarantine.
 	if source.symlink_metadata().is_err() {
