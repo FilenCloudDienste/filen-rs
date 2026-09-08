@@ -693,10 +693,16 @@ async fn apply_transfer(
 			// A same-name upload versions whatever the path held: record that uuid, so the next
 			// pass can tell a cache that has not caught up (the old uuid still at the path) from
 			// someone ELSE having written there since (a third uuid).
+			let replaced = ctx.remote.get(rel_path).map(|node| node.remote_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
-				replaced: ctx.remote.get(rel_path).map(|node| node.remote_uuid),
+				replaced,
 			};
+			// The push leaves the agreed content behind (below); from here on the cache's
+			// announcements are what date it, so that a version of ours that quietly stood as the
+			// remote head confirms even without a pass ever catching it there.
+			ctx.observed
+				.watch_push(new_uuid, Some(uploaded.stable_uuid()), replaced);
 			let entry = file_entry(
 				rel_path,
 				Some(new_uuid),
