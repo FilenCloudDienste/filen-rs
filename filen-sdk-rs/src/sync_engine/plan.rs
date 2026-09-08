@@ -684,11 +684,7 @@ pub(super) fn confirm_agreed_content(
 ) -> Vec<BaselineEntry> {
 	let mut advanced = Vec::new();
 	for (rel_path, entry) in baseline.iter_mut() {
-		if entry.kind != NodeKind::File
-			|| entry.state != BaselineState::Synced
-			|| entry.content_hash.is_none()
-			|| entry.agreed_hash == entry.content_hash
-		{
+		if !awaits_confirmation(entry) {
 			continue;
 		}
 		if raw_remote.get(rel_path).map(|node| node.remote_uuid) != entry.remote_uuid {
@@ -701,6 +697,96 @@ pub(super) fn confirm_agreed_content(
 		advanced.push(entry.clone());
 	}
 	advanced
+}
+
+/// Whether a row is a push still waiting for something to confirm it: this side's content is on
+/// record, and it is not what the two sides last agreed on.
+pub(super) fn awaits_confirmation(entry: &BaselineEntry) -> bool {
+	entry.kind == NodeKind::File
+		&& entry.state == BaselineState::Synced
+		&& entry.content_hash.is_some()
+		&& entry.agreed_hash != entry.content_hash
+}
+
+/// Advance the agreed-content marker of every unconfirmed row whose version uuid is in `confirmed`
+/// — the pushes some other evidence than a snapshot has vouched for (a tenure as the remote head,
+/// or the server's own version chain) — and return the rows that moved so the caller can persist
+/// them.
+///
+/// Split from [`confirm_agreed_content`] because the evidence comes from outside the plan (the
+/// cache's announcement timestamps, a version listing) while the row rule is the same; keeping the
+/// rule here keeps the pass's confirmation policy in one place and unit-testable.
+pub(super) fn confirm_agreed_pushes(
+	baseline: &mut HashMap<String, BaselineEntry>,
+	confirmed: &HashSet<Uuid>,
+) -> Vec<BaselineEntry> {
+	let mut advanced = Vec::new();
+	for (rel_path, entry) in baseline.iter_mut() {
+		if !awaits_confirmation(entry)
+			|| !entry
+				.remote_uuid
+				.is_some_and(|uuid| confirmed.contains(&uuid))
+		{
+			continue;
+		}
+		entry.agreed_hash = entry.content_hash;
+		tracing::debug!(
+			"plan: {rel_path:?} — this engine's push stood as the remote head long enough to count as agreed"
+		);
+		advanced.push(entry.clone());
+	}
+	advanced
+}
+
+/// What the server's version chain says about a push of ours: how long it stood before anything
+/// landed on top of it.
+///
+/// `versions` is the lineage as [`Client::list_file_versions`](crate::auth::Client::list_file_versions)
+/// returns it and `superseded_by` is the version the pass's snapshot found at the row's path.
+/// `Some(true)` when ours stood for at least `tenure`.
+///
+/// The tenure is measured against the EARLIEST version that is not ours and is not older than ours
+/// — never against `superseded_by` itself, which is only the version the path carries now. A client
+/// that edited beside us and then edited again minutes later leaves both on the chain, and dating
+/// ours against the later one would read a concurrent edit as consent and pull over our bytes.
+/// `superseded_by` is required to be on the chain (a chain that does not carry it is not answering
+/// about this path) and is a candidate like any other.
+///
+/// Deliberately not read from the chain's ORDER: the server stamps versions to the SECOND, so the
+/// two versions of one race carry the same stamp and their relative order in the listing is
+/// arbitrary. A tie therefore measures as no tenure at all — the safe direction, and the right
+/// answer for a race. The version our upload replaced ties with ours the same way if the two landed
+/// in one second, which costs a confirmation the row could have had; a conflict surfaced is the
+/// direction to be wrong in.
+///
+/// `None` when the chain does not carry ours or `superseded_by` — a versioning-disabled account
+/// keeps only the head — and when nothing on it is newer than ours at all, which a lineage somebody
+/// has restored an old version into can look like. No evidence either way.
+///
+/// This is the evidence of last resort — it needs no observation of ours, so it answers for a row a
+/// restarted engine knows nothing about.
+pub(super) fn version_chain_verdict(
+	versions: &[(Uuid, chrono::DateTime<chrono::Utc>)],
+	ours: Uuid,
+	superseded_by: Uuid,
+	tenure: std::time::Duration,
+) -> Option<bool> {
+	let at = |wanted: Uuid| {
+		versions
+			.iter()
+			.find(|(uuid, _)| *uuid == wanted)
+			.map(|(_, at)| *at)
+	};
+	let ours_at = at(ours)?;
+	// The version the snapshot shows has to be on the chain, or it is not this file's chain.
+	at(superseded_by)?;
+	let first_after = versions
+		.iter()
+		.filter(|(uuid, at)| *uuid != ours && *at >= ours_at)
+		.map(|(_, at)| *at)
+		.min()?;
+	let stood_for = first_after.signed_duration_since(ours_at);
+	Some(stood_for.to_std().is_ok_and(|stood| stood >= tenure))
 }
 
 /// The baseline rows a [`Backlog::AdoptDestination`](super::mode::Backlog::AdoptDestination) mode
@@ -818,11 +904,13 @@ fn adopted_from_local(rel_path: &str, node: &LocalNode) -> BaselineEntry {
 /// listing our own version at the path (`agreed_hash == content_hash`) makes a foreign version on
 /// top of it an edit made AFTER ours.
 ///
-/// KNOWN WINDOW: the confirmation needs a pass to run while our version is the remote head. One
-/// that happens to run in that window records the push as confirmed, so a genuinely concurrent edit
-/// landing afterwards pulls; one that does not sees a conflict even where the other client edited
-/// strictly after us. The server's version chain cannot separate the two — a concurrent upload and
-/// a later one supersede our uuid identically — so this observation is the only evidence there is.
+/// A snapshot listing our version is not the only thing that can confirm it: a push that stood as
+/// the remote head for [`CONFIRM_TENURE`](super::engine::CONFIRM_TENURE) counts too, dated either
+/// from the cache's own announcements or from the server's version chain (see
+/// `SyncEngine::confirm_pushes`). That is what keeps a pair that was paused for an hour — no pass,
+/// so nothing a snapshot could confirm — from reading every foreign edit made since as a conflict.
+/// What stays a conflict is the case the rule is for: a foreign version that landed on ours INSIDE
+/// that window, which is what a genuinely concurrent edit looks like.
 ///
 /// TWO-WAY ONLY. A one-way mode has an authoritative side and no divergence to surface:
 /// [`SyncMode::LocalToRemote`](super::SyncMode::LocalToRemote) re-pushes the local copy and
@@ -1845,6 +1933,113 @@ mod tests {
 		)]);
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [1; 32]))]);
 		assert!(confirm_agreed_content(&mut baseline, &remote).is_empty());
+	}
+
+	/// The tenure rule's other half: evidence from OUTSIDE the snapshot (the cache's announcement
+	/// timestamps, or the server's version chain) names the version uuids it vouches for, and the
+	/// same row rule applies to them.
+	#[test]
+	fn a_push_some_other_evidence_vouches_for_advances_the_agreed_content() {
+		let uuid = Uuid::new_v4();
+		let mut baseline = map(vec![
+			("a.txt", base_file_pushed("a.txt", uuid, [1; 32], [0; 32])),
+			(
+				"b.txt",
+				base_file_pushed("b.txt", Uuid::new_v4(), [2; 32], [0; 32]),
+			),
+		]);
+		let advanced = confirm_agreed_pushes(&mut baseline, &HashSet::from([uuid]));
+
+		assert_eq!(
+			advanced
+				.iter()
+				.map(|e| e.rel_path.as_str())
+				.collect::<Vec<_>>(),
+			vec!["a.txt"],
+			"only the vouched-for version's row moves"
+		);
+		assert_eq!(
+			baseline["a.txt"].agreed_hash,
+			baseline["a.txt"].content_hash
+		);
+		assert_eq!(
+			baseline["b.txt"].agreed_hash,
+			Some(Blake3Hash::from([0; 32])),
+			"a row nothing vouched for is left alone"
+		);
+	}
+
+	#[test]
+	fn a_row_that_is_not_an_unconfirmed_push_is_never_advanced_by_tenure() {
+		let uuid = Uuid::new_v4();
+		for row in [
+			// Already agreed.
+			base_file_pushed("a.txt", uuid, [1; 32], [1; 32]),
+			// Held in conflict.
+			BaselineEntry {
+				state: BaselineState::Conflicted,
+				..base_file_pushed("a.txt", uuid, [1; 32], [0; 32])
+			},
+			// A directory has no content for the two sides to agree on.
+			base_dir("a.txt", uuid),
+		] {
+			let agreed = row.agreed_hash;
+			let mut baseline = map(vec![("a.txt", row)]);
+			assert!(confirm_agreed_pushes(&mut baseline, &HashSet::from([uuid])).is_empty());
+			assert_eq!(baseline["a.txt"].agreed_hash, agreed);
+		}
+	}
+
+	/// The server-side evidence: how long our version stood before the one that superseded it.
+	#[test]
+	fn the_version_chain_dates_a_push_by_what_landed_on_top_of_it() {
+		let tenure = std::time::Duration::from_secs(30);
+		let (ours, foreign, older) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+		// Superseded well after the window: an edit made against our version, so pulling it is right.
+		let chain = vec![(foreign, ms(100_000)), (ours, ms(60_000)), (older, ms(0))];
+		assert_eq!(
+			version_chain_verdict(&chain, ours, foreign, tenure),
+			Some(true)
+		);
+
+		// Superseded INSIDE the window: the other client was editing at the same time.
+		let chain = vec![(foreign, ms(65_000)), (ours, ms(60_000)), (older, ms(0))];
+		assert_eq!(
+			version_chain_verdict(&chain, ours, foreign, tenure),
+			Some(false)
+		);
+
+		// A second foreign edit later on does not undo the first. What buried our version is
+		// whatever landed on it FIRST, so the row stays unconfirmed even though the version the
+		// snapshot now shows is minutes newer.
+		let latest = Uuid::new_v4();
+		let chain = vec![
+			(latest, ms(100_000)),
+			(foreign, ms(65_000)),
+			(ours, ms(60_000)),
+			(older, ms(0)),
+		];
+		assert_eq!(
+			version_chain_verdict(&chain, ours, latest, tenure),
+			Some(false),
+			"the edit that buried ours landed inside the window; a later one on top of THAT says \
+			 nothing about ours"
+		);
+
+		// The same stamp on both — a race the server could not separate — is no tenure at all,
+		// whichever way the listing happens to order them.
+		let chain = vec![(ours, ms(60_000)), (foreign, ms(60_000))];
+		assert_eq!(
+			version_chain_verdict(&chain, ours, foreign, tenure),
+			Some(false)
+		);
+
+		// A chain missing either version (versioning disabled) is no evidence at all.
+		assert_eq!(
+			version_chain_verdict(&[(foreign, ms(65_000))], ours, foreign, tenure),
+			None
+		);
 	}
 
 	#[test]

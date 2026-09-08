@@ -18,7 +18,8 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	Backlog, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState,
+	Backlog, CONFIRM_TENURE, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode, WatchConfig,
+	WatchState,
 };
 use uuid::Uuid;
 
@@ -1557,6 +1558,25 @@ async fn control_21_resume_long_pause_backlog_converges() {
 	assert_eq!(first.uploaded, BASE, "{first:?}");
 
 	engine.pause_pair(pair).await.unwrap();
+
+	// A LONG pause: the pushes of the first pass must have stood as the remote head for longer
+	// than the confirmation window before anyone edits them, or the engine has to read the remote
+	// edits staged below as concurrent with its own pushes and surface them as conflicts. Wait for
+	// the cache to announce every push (that is when its tenure starts), then let the window pass.
+	let (_d, pushed) = list_remote(&resources).await;
+	assert_eq!(
+		pushed.len(),
+		BASE,
+		"the first pass left files behind: {pushed:?}"
+	);
+	for file in &pushed {
+		assert!(
+			poll_for_item(cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+			"the cache never announced the push of {}",
+			file.uuid()
+		);
+	}
+	tokio::time::sleep(CONFIRM_TENURE + Duration::from_secs(5)).await;
 
 	// Stage the whole backlog while paused: creates on both sides, local deletions, and remote
 	// edits of already-baselined files.

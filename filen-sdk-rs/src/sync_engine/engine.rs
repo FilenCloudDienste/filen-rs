@@ -89,34 +89,171 @@ pub(super) enum PendingKind {
 	Trashed,
 }
 
-/// Uuids the cache has announced to this engine, each stamped with the observation counter at the
-/// time it arrived.
+/// How long a push of ours must stand as the remote head before the engine takes its content as
+/// AGREED, with no snapshot ever having listed it.
 ///
-/// This is what retires a pending write in the ordinary case. Waiting for the written uuid to
-/// APPEAR in a snapshot only works while the item survives, and two everyday events destroy it:
+/// A push proves only that the server took our bytes. What makes the content agreed is the remote
+/// still holding it a while later — long enough that another client's edit of the same file would
+/// have to have been made against our version rather than beside it. Thirty seconds is that "a
+/// while": comfortably longer than the socket round trip that announces a foreign write (so a
+/// genuinely concurrent edit lands INSIDE the window and stays a conflict), and short enough that
+/// the ordinary "someone edited it minutes later" case confirms without a pass having to catch our
+/// version as the head.
+pub const CONFIRM_TENURE: Duration = Duration::from_secs(30);
+
+/// How long a push record survives with nothing ever resolving it.
+///
+/// A pass forgets the record of every row it persisted as agreed, so this only catches the ones no
+/// pass will ever look at again — a row whose pair was removed, a conflict resolved out from under
+/// it. Generous, because a paused pair's records are what confirm it on resume.
+const PUSH_RECORD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// What the cache's announcements say about one push of ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PushVerdict {
+	/// Our version stood as the remote head for [`CONFIRM_TENURE`] before anything superseded it
+	/// (or still stands): its content is what both sides hold.
+	Confirmed,
+	/// Evidence exists and does not confirm — something superseded our version inside the window,
+	/// or it has not stood long enough yet.
+	Unconfirmed,
+	/// No evidence either way: the announcement was never seen, or this engine was restarted since.
+	Unknown,
+}
+
+/// One push of ours awaiting confirmation: when the cache announced our version and when anything
+/// superseded it. The difference is the tenure the confirmation rule reads.
+#[derive(Debug)]
+struct PushTenure {
+	/// The file's whole-life id, so a NEW version of the same file recognisably supersedes ours
+	/// even when no archive/trash event names our uuid (a resync, say).
+	lineage: Option<filen_types::fs::StableUuid>,
+	recorded: Instant,
+	announced: Option<Instant>,
+	superseded: Option<Instant>,
+}
+
+impl PushTenure {
+	fn verdict(&self, now: Instant) -> PushVerdict {
+		match self.stood_for(now) {
+			Some(stood_for) if stood_for >= CONFIRM_TENURE => PushVerdict::Confirmed,
+			Some(_) => PushVerdict::Unconfirmed,
+			None => PushVerdict::Unknown,
+		}
+	}
+
+	/// How long our version has stood as the remote head — until whatever superseded it, or until
+	/// now if nothing has. `None` while the cache has not announced it at all.
+	fn stood_for(&self, now: Instant) -> Option<std::time::Duration> {
+		let announced = self.announced?;
+		Some(
+			self.superseded
+				.unwrap_or(now)
+				.saturating_duration_since(announced),
+		)
+	}
+}
+
+/// Uuids the cache has announced to this engine, each stamped with the observation counter and the
+/// moment it arrived — plus the tenure of every push of ours still awaiting confirmation.
+///
+/// The counter is what retires a pending write in the ordinary case. Waiting for the written uuid
+/// to APPEAR in a snapshot only works while the item survives, and two everyday events destroy it:
 /// a re-upload (ours or another client's) versions the file under a fresh uuid, and a deletion
 /// removes it outright. Either way the cache announces the uuid — as a `New`, a `Trashed`, an
 /// `Archived` or a `Removed` — and that announcement alone proves the cache is no longer behind
 /// on our write.
+///
+/// The timestamps are what confirms a push no snapshot ever caught as the head (see
+/// [`CONFIRM_TENURE`]). Both are recorded on the cache worker thread, so this type never does more
+/// than take a lock and touch two maps.
 #[derive(Debug, Default)]
 pub(super) struct Observations(std::sync::Mutex<ObservationState>);
 
 #[derive(Debug, Default)]
 struct ObservationState {
 	seq: u64,
-	seen: HashMap<Uuid, u64>,
+	seen: HashMap<Uuid, (u64, Instant)>,
+	/// Pushes of ours whose content is not agreed yet, keyed by the version uuid the upload minted.
+	pushes: HashMap<Uuid, PushTenure>,
 }
 
 impl Observations {
-	/// Record every uuid a committed cache batch touched. Runs on the cache worker thread, so it
-	/// does nothing but take a lock and insert.
-	fn note(&self, uuids: impl IntoIterator<Item = Uuid>) {
+	/// Record every uuid a committed cache batch touched, and time-stamp what it says about a push
+	/// of ours. Runs on the cache worker thread, so it does nothing but take a lock and insert.
+	fn note(&self, events: &mut dyn Iterator<Item = &CacheEvent<'_>>) {
+		let now = Instant::now();
+		let mut state = self.state();
+		for event in events {
+			for uuid in event_uuids(event).into_iter().flatten() {
+				state.see(uuid, now);
+			}
+			state.note_tenure(event, now);
+		}
+	}
+
+	/// Record an announcement directly, for the tests that have no cache event to hand.
+	#[cfg(test)]
+	fn note_uuids(&self, uuids: impl IntoIterator<Item = Uuid>) {
+		let now = Instant::now();
 		let mut state = self.state();
 		for uuid in uuids {
-			state.seq += 1;
-			let seq = state.seq;
-			state.seen.insert(uuid, seq);
+			state.see(uuid, now);
 		}
+	}
+
+	/// Start watching a push of ours: it is unconfirmed until the cache says otherwise.
+	///
+	/// `replaced` is the version this upload went on top of — its own record, if it still has one,
+	/// answers for a path the baseline has since moved past, so it goes.
+	pub(super) fn watch_push(
+		&self,
+		uuid: Uuid,
+		lineage: Option<filen_types::fs::StableUuid>,
+		replaced: Option<Uuid>,
+	) {
+		let now = Instant::now();
+		let mut state = self.state();
+		if let Some(replaced) = replaced {
+			state.pushes.remove(&replaced);
+		}
+		// The cache can announce our own upload before the call that made it has returned; the
+		// announcement map is the only place that moment survives.
+		let announced = state.seen.get(&uuid).map(|(_, at)| *at);
+		state.pushes.insert(
+			uuid,
+			PushTenure {
+				lineage,
+				recorded: now,
+				announced,
+				superseded: None,
+			},
+		);
+	}
+
+	/// What the announcements say about the push that minted `uuid`.
+	fn push_verdict(&self, uuid: Uuid, now: Instant) -> PushVerdict {
+		let state = self.state();
+		let Some(push) = state.pushes.get(&uuid) else {
+			return PushVerdict::Unknown;
+		};
+		let verdict = push.verdict(now);
+		tracing::debug!(
+			"sync engine: the push that minted {uuid} stood as the head for {:?} — {verdict:?}",
+			push.stood_for(now)
+		);
+		verdict
+	}
+
+	/// Forget the push records a pass has finished with, and any that no pass will ever read again.
+	fn forget_pushes(&self, decided: &[Uuid], now: Instant) {
+		let mut state = self.state();
+		for uuid in decided {
+			state.pushes.remove(uuid);
+		}
+		state
+			.pushes
+			.retain(|_, push| now.saturating_duration_since(push.recorded) < PUSH_RECORD_TTL);
 	}
 
 	/// The current counter — the stamp a write recorded now must be beaten by to retire.
@@ -128,7 +265,11 @@ impl Observations {
 	/// after the snapshot must not retire a write this pass, or the pass would go on to read the
 	/// just-written item as deleted.
 	fn snapshot(&self) -> HashMap<Uuid, u64> {
-		self.state().seen.clone()
+		self.state()
+			.seen
+			.iter()
+			.map(|(uuid, (seq, _))| (*uuid, *seq))
+			.collect()
 	}
 
 	/// Forget the observations no live pending write can ever consult — only one stamped LATER
@@ -137,7 +278,7 @@ impl Observations {
 	fn prune_before(&self, oldest: Option<u64>) {
 		let mut state = self.state();
 		match oldest {
-			Some(seq) => state.seen.retain(|_, stamp| *stamp > seq),
+			Some(seq) => state.seen.retain(|_, (stamp, _)| *stamp > seq),
 			None => state.seen.clear(),
 		}
 	}
@@ -147,6 +288,55 @@ impl Observations {
 		self.0
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
+	}
+}
+
+impl ObservationState {
+	/// Stamp one announced uuid with the next observation counter and the moment it arrived.
+	fn see(&mut self, uuid: Uuid, now: Instant) {
+		self.seq += 1;
+		let seq = self.seq;
+		self.seen.insert(uuid, (seq, now));
+	}
+
+	/// Time-stamp what one cache event says about the pushes being watched: a live announcement of
+	/// our own version, or something taking its place.
+	///
+	/// The scan over the watched pushes is bounded by how many pushes this engine has made since the
+	/// last pass persisted what it confirmed — every one of those records is retired there, whether
+	/// it was a snapshot or a tenure that vouched for it — so in steady state it is a handful of
+	/// comparisons on the cache worker thread.
+	///
+	/// ponytail: O(pushes) per foreign event, which a first sync of a huge tree can make O(n) while
+	/// its uploads are still unsettled. A `lineage -> uuids` index beside `pushes` makes it O(1) if
+	/// that ever shows up in a profile.
+	fn note_tenure(&mut self, event: &CacheEvent<'_>, now: Instant) {
+		let CacheEventType::File(file) = &event.event else {
+			return;
+		};
+		match file {
+			FileEvent::New(f) | FileEvent::Changed(f) | FileEvent::Move(f) => {
+				if let Some(push) = self.pushes.get_mut(&f.uuid) {
+					push.announced.get_or_insert(now);
+					return;
+				}
+				// A different version of a file we pushed: whatever announced it, ours is no longer
+				// what the remote holds.
+				for (uuid, push) in self.pushes.iter_mut() {
+					if *uuid != f.uuid && push.lineage == Some(f.stable_uuid) {
+						push.superseded.get_or_insert(now);
+					}
+				}
+			}
+			// An edit (either versioning mode) or a deletion of our own version: either way it stopped
+			// standing at this moment.
+			FileEvent::Archived { uuid, .. } | FileEvent::Trashed { uuid, .. } => {
+				if let Some(push) = self.pushes.get_mut(uuid) {
+					push.superseded.get_or_insert(now);
+				}
+			}
+			FileEvent::Removed(_) | FileEvent::MetadataChanged { .. } => {}
+		}
 	}
 }
 
@@ -176,9 +366,53 @@ fn event_uuids(event: &CacheEvent<'_>) -> [Option<Uuid>; 2] {
 /// cache batch and nothing else. It runs on the cache worker thread, so it never awaits and never
 /// touches the database.
 fn observation_callback(observations: Arc<Observations>) -> SyncRootCallback {
-	Box::new(move |events| {
-		observations.note(events.flat_map(event_uuids).flatten());
-	})
+	Box::new(move |events| observations.note(events))
+}
+
+/// Read what the cache's announcements say about every unconfirmed push in `baseline`: the version
+/// uuids they confirm, and the rows (`rel_path`, ours, the foreign version at the path) they say
+/// nothing about that are worth asking the server about.
+///
+/// Purely a READ of the observations. The records it consulted stay put, because the caller may be
+/// a dry run: [`SyncEngine::plan_pair`] reaches this through `prepare` and persists nothing, and a
+/// record dropped there would leave the pass that follows with no evidence at all that the push was
+/// ever confirmed. Only the callers that write the advanced rows retire the records
+/// ([`Observations::forget_pushes`]).
+fn observed_confirmations(
+	observed: &Observations,
+	baseline: &HashMap<String, BaselineEntry>,
+	raw_remote: &HashMap<String, RemoteNode>,
+	now: Instant,
+) -> (std::collections::HashSet<Uuid>, Vec<(String, Uuid, Uuid)>) {
+	let mut confirmed = std::collections::HashSet::new();
+	// rel_path is only for the log; the lookup runs on the foreign version sitting at it.
+	let mut ask_server = Vec::new();
+	for (rel_path, entry) in baseline.iter() {
+		if !plan::awaits_confirmation(entry) {
+			continue;
+		}
+		let Some(ours) = entry.remote_uuid else {
+			continue;
+		};
+		match observed.push_verdict(ours, now) {
+			PushVerdict::Confirmed => {
+				confirmed.insert(ours);
+			}
+			PushVerdict::Unconfirmed => {}
+			// Nothing observed. Worth a round trip only where the answer changes this pass:
+			// a foreign version of the same file already sitting at the row's path.
+			PushVerdict::Unknown => {
+				if let Some(node) = raw_remote.get(rel_path)
+					&& node.remote_uuid != ours
+					&& node.stable_uuid.is_some()
+					&& node.stable_uuid == entry.remote_stable_uuid
+				{
+					ask_server.push((rel_path.clone(), ours, node.remote_uuid));
+				}
+			}
+		}
+	}
+	(confirmed, ask_server)
 }
 
 /// Remote writes this engine made recently. The apply layer records every item it creates or
@@ -1161,6 +1395,122 @@ impl SyncEngine {
 		.map_err(|e| db_error(e, "resolving a conflict"))
 	}
 
+	/// Retire the confirmation gap this engine's own pushes leave, from the evidence a snapshot
+	/// listing our version at its path ([`plan::confirm_agreed_content`]) cannot supply.
+	///
+	/// Two sources, cheapest first:
+	/// - the cache's announcements. A version of ours that stood as the remote head for
+	///   [`CONFIRM_TENURE`] before anything superseded it is content both sides held, whether or
+	///   not a pass ever happened to run while it was the head. This is what confirms the backlog a
+	///   PAUSED pair accumulated: no pass runs, so nothing else ever could.
+	/// - the server's version chain, for a row the announcements say nothing about (this engine was
+	///   restarted, or the announcement never arrived) whose path now carries a foreign version of
+	///   the same file. The two versions' timestamps say how long ours stood. One lookup per such
+	///   row, and only for a row that is actually about to be reconciled against a foreign version;
+	///   a lookup that fails leaves the row unconfirmed, exactly as before.
+	///
+	/// Returns the rows that moved, for the caller to persist — and to retire their push records
+	/// with ([`Observations::forget_pushes`]) once it has. Reading a verdict does not consume it:
+	/// `prepare` runs for [`plan_pair`](Self::plan_pair) too, which writes nothing.
+	///
+	/// `raw_remote` must be the RAW snapshot: a view with this engine's own writes folded in shows
+	/// our version at its own path and would confirm every push against itself.
+	async fn confirm_pushes(
+		&self,
+		baseline: &mut HashMap<String, BaselineEntry>,
+		raw_remote: &HashMap<String, RemoteNode>,
+		files: &[CacheableFile<'static>],
+	) -> Vec<BaselineEntry> {
+		let (mut confirmed, ask_server) =
+			observed_confirmations(&self.observed, baseline, raw_remote, Instant::now());
+
+		for (rel_path, ours, foreign) in ask_server {
+			let Some(cacheable) = files.iter().find(|f| f.uuid == foreign) else {
+				continue;
+			};
+			let file = crate::io::RemoteFile::from(cacheable.clone());
+			let versions = match self.client.list_file_versions(&file).await {
+				Ok(versions) => versions,
+				Err(error) => {
+					// Offline, or the endpoint refused: the row stays unconfirmed, which is the
+					// safe direction — the pass surfaces a conflict rather than burying our bytes.
+					tracing::debug!(
+						"sync_once: could not read the version chain of {rel_path:?} to date this engine's push — {error}"
+					);
+					continue;
+				}
+			};
+			let chain: Vec<(Uuid, chrono::DateTime<Utc>)> = versions
+				.iter()
+				.map(|version| (version.uuid(), version.timestamp()))
+				.collect();
+			match plan::version_chain_verdict(&chain, ours, foreign, CONFIRM_TENURE) {
+				Some(true) => {
+					tracing::debug!(
+						"sync_once: the server's version chain confirms this engine's push of {rel_path:?}"
+					);
+					confirmed.insert(ours);
+				}
+				Some(false) => tracing::debug!(
+					"sync_once: {rel_path:?} — a foreign version landed on this engine's push inside the confirmation window"
+				),
+				None => tracing::debug!(
+					"sync_once: {rel_path:?} — the version chain does not carry this engine's push, so it stays unconfirmed"
+				),
+			}
+		}
+
+		plan::confirm_agreed_pushes(baseline, &confirmed)
+	}
+
+	/// Advance what the cache's announcements have confirmed since the last pass, and persist it.
+	///
+	/// The announcement half of [`confirm_pushes`](Self::confirm_pushes) alone: with no snapshot
+	/// there is no foreign version to date a push against, so nothing here talks to the server.
+	/// A pass does this itself; this is for the stretches where none runs.
+	async fn sweep_confirmations(&self, pair: PairId) -> Result<(), Error> {
+		let mut baseline: HashMap<String, BaselineEntry> = {
+			let store = self.store.lock().await;
+			store
+				.entries(pair)
+				.map_err(|e| db_error(e, "loading the baseline"))?
+				.into_iter()
+				.map(|entry| (entry.rel_path.clone(), entry))
+				.collect()
+		};
+		let advanced = self
+			.confirm_pushes(&mut baseline, &HashMap::new(), &[])
+			.await;
+		if advanced.is_empty() {
+			return Ok(());
+		}
+		{
+			let store = self.store.lock().await;
+			for entry in &advanced {
+				store
+					.upsert_entry(pair, entry)
+					.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
+			}
+		}
+		self.forget_settled_pushes(&advanced);
+		Ok(())
+	}
+
+	/// Retire the push records of rows this caller has just PERSISTED as agreed — the ones a
+	/// snapshot listed at their own path as well as the ones a tenure dated — plus any record no
+	/// pass will ever read again (see [`PUSH_RECORD_TTL`]).
+	///
+	/// Only a caller that wrote the rows may do this. The record is the only evidence a push was
+	/// ever confirmed, and dropping it without recording what it proved leaves the next pass
+	/// reading the row as an unconfirmed push again — with a foreign edit on top, a false conflict.
+	fn forget_settled_pushes(&self, persisted: &[BaselineEntry]) {
+		let decided: Vec<Uuid> = persisted
+			.iter()
+			.filter_map(|entry| entry.remote_uuid)
+			.collect();
+		self.observed.forget_pushes(&decided, Instant::now());
+	}
+
 	/// Run the read-only half: load the baseline, scan, enumerate the remote, build the view.
 	async fn prepare(&self, pair: PairId) -> Result<Prepared, Error> {
 		let (record, baseline_entries, failures) = {
@@ -1197,7 +1547,11 @@ impl SyncEngine {
 		// view — before this engine's own writes are folded into it, and before the baseline is
 		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
 		// demonstrably hold, which is what a later foreign edit is measured against.
-		let confirmed = plan::confirm_agreed_content(&mut baseline_map, &remote_view.nodes);
+		let mut confirmed = plan::confirm_agreed_content(&mut baseline_map, &remote_view.nodes);
+		confirmed.extend(
+			self.confirm_pushes(&mut baseline_map, &remote_view.nodes, &snapshot.files)
+				.await,
+		);
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
 
 		let local_root = PathBuf::from(&record.local_root);
@@ -1430,8 +1784,13 @@ impl SyncEngine {
 	/// invalidated: whatever changed on either side while the pair was paused is reconciled by the
 	/// next pass exactly as if it had changed a moment ago — and a pass SUSPENDED mid-way carries
 	/// on from where it parked. Resuming a running pair is a no-op; an unknown pair is an error.
+	///
+	/// A pause is also the one stretch where no pass runs to confirm the pushes made just before
+	/// it, so the resume sweeps those (see [`CONFIRM_TENURE`]) — a `plan_pair` between the resume
+	/// and the next pass then reads the same agreed content the pass will.
 	pub async fn resume_pair(&self, pair: PairId) -> Result<(), Error> {
-		self.set_control(pair, PassControl::Run).await
+		self.set_control(pair, PassControl::Run).await?;
+		self.sweep_confirmations(pair).await
 	}
 
 	/// Whether `pair` is currently [`paused`](Self::pause_pair) — in either flavour. An unknown
@@ -1651,8 +2010,10 @@ impl SyncEngine {
 		}
 
 		let prep = self.prepare(pair).await?;
-		// Persist what this pass's snapshot confirmed. Only a real pass writes it: `plan_pair` stays
-		// a pure read, so a dry run inside the confirmation window just leaves it for the next pass.
+		// Persist what this pass confirmed. Only a real pass writes it: `plan_pair` stays a pure
+		// read, so a dry run inside the confirmation window just leaves it for the next pass — and
+		// leaves the evidence with it, which is why the records are retired HERE and not in the
+		// reading step.
 		if !prep.confirmed.is_empty() {
 			let store = self.store.lock().await;
 			for entry in &prep.confirmed {
@@ -1661,6 +2022,7 @@ impl SyncEngine {
 					.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
 			}
 		}
+		self.forget_settled_pushes(&prep.confirmed);
 		let mut report = SyncReport::default();
 
 		tracing::debug!(
@@ -2860,7 +3222,7 @@ mod tests {
 		let uuid = Uuid::new_v4();
 		pending.record(&observations, PAIR, uuid, created("a.txt", None));
 
-		observations.note([uuid]);
+		observations.note_uuids([uuid]);
 		let observed = observations.snapshot();
 
 		let mut remote = HashMap::new();
@@ -2888,7 +3250,7 @@ mod tests {
 
 		// The pass copies the observations, THEN reads the snapshot; the event lands in between.
 		let observed = observations.snapshot();
-		observations.note([uuid]);
+		observations.note_uuids([uuid]);
 
 		let mut remote = HashMap::new();
 		pending.settle(PAIR, &observed, &remote);
@@ -2908,7 +3270,7 @@ mod tests {
 		let pending = PendingWrites::default();
 		let uuid = Uuid::new_v4();
 
-		observations.note([uuid]);
+		observations.note_uuids([uuid]);
 		pending.record(&observations, PAIR, uuid, moved("a.txt", "b.txt"));
 
 		let baseline = HashMap::from([(
@@ -2923,7 +3285,7 @@ mod tests {
 			"the snapshot still shows the pre-move path and nothing new has been announced"
 		);
 
-		observations.note([uuid]);
+		observations.note_uuids([uuid]);
 		let mut remote = node_at("a.txt", uuid);
 		pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
@@ -3317,7 +3679,7 @@ mod tests {
 	fn observations_are_pruned_to_the_oldest_live_write() {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
-		observations.note([Uuid::new_v4(), Uuid::new_v4()]);
+		observations.note_uuids([Uuid::new_v4(), Uuid::new_v4()]);
 
 		let uuid = Uuid::new_v4();
 		pending.record(&observations, PAIR, uuid, created("a.txt", None));
@@ -3327,12 +3689,139 @@ mod tests {
 			"observations older than every live write are unreachable"
 		);
 
-		observations.note([uuid]);
+		observations.note_uuids([uuid]);
 		pending.settle(PAIR, &observations.snapshot(), &HashMap::new());
 		observations.prune_before(pending.oldest_stamp());
 		assert!(
 			observations.snapshot().is_empty(),
 			"with no pending write left there is nothing to remember at all"
+		);
+	}
+
+	/// One push of ours, announced `announced_ago` before "now" and superseded (if at all) that
+	/// long after the announcement.
+	fn tenure(announced_ago: Option<u64>, superseded_after: Option<u64>) -> (PushTenure, Instant) {
+		// Built forwards from a real `Instant`, never backwards: subtracting from `Instant::now()`
+		// underflows on a machine that has been up for less than the offset.
+		let announced = Instant::now();
+		let now = announced + Duration::from_secs(announced_ago.unwrap_or(0));
+		(
+			PushTenure {
+				lineage: None,
+				recorded: announced,
+				announced: announced_ago.map(|_| announced),
+				superseded: superseded_after.map(|after| announced + Duration::from_secs(after)),
+			},
+			now,
+		)
+	}
+
+	#[test]
+	fn a_push_that_stood_as_the_head_long_enough_is_confirmed() {
+		let (push, now) = tenure(Some(40), None);
+		assert_eq!(push.verdict(now), PushVerdict::Confirmed);
+	}
+
+	#[test]
+	fn a_push_superseded_inside_the_window_is_not_confirmed() {
+		let (push, now) = tenure(Some(40), Some(5));
+		assert_eq!(
+			push.verdict(now),
+			PushVerdict::Unconfirmed,
+			"another client was editing at the same time; its version is not an edit made after ours"
+		);
+	}
+
+	#[test]
+	fn a_push_superseded_after_the_window_is_still_confirmed() {
+		let (push, now) = tenure(Some(40), Some(35));
+		assert_eq!(
+			push.verdict(now),
+			PushVerdict::Confirmed,
+			"our version stood for the full window before anything landed on it"
+		);
+	}
+
+	#[test]
+	fn a_push_that_is_still_ripening_is_not_confirmed_yet() {
+		let (push, now) = tenure(Some(5), None);
+		assert_eq!(push.verdict(now), PushVerdict::Unconfirmed);
+	}
+
+	#[test]
+	fn a_push_the_cache_never_announced_has_no_verdict() {
+		let (push, now) = tenure(None, None);
+		assert_eq!(
+			push.verdict(now),
+			PushVerdict::Unknown,
+			"with no observation the server's version chain is the only evidence left"
+		);
+	}
+
+	#[test]
+	fn watching_a_push_picks_up_an_announcement_that_beat_it() {
+		let observations = Observations::default();
+		let uuid = Uuid::new_v4();
+		// The cache can commit our own upload's event before the upload call has returned.
+		observations.note_uuids([uuid]);
+		observations.watch_push(uuid, None, None);
+		assert_eq!(
+			observations.push_verdict(uuid, Instant::now() + Duration::from_secs(40)),
+			PushVerdict::Confirmed,
+			"the announcement that arrived first still dates the push"
+		);
+	}
+
+	#[test]
+	fn a_push_forgotten_after_a_pass_read_it_has_no_verdict_left() {
+		let observations = Observations::default();
+		let uuid = Uuid::new_v4();
+		observations.note_uuids([uuid]);
+		observations.watch_push(uuid, None, None);
+		observations.forget_pushes(&[uuid], Instant::now());
+		assert_eq!(
+			observations.push_verdict(uuid, Instant::now() + Duration::from_secs(40)),
+			PushVerdict::Unknown
+		);
+	}
+
+	/// Reading the verdicts is what `plan_pair` does too, and it persists nothing. If the read
+	/// retired the records, a dry run inside the confirmation window would leave the pass after it
+	/// with an unconfirmed row and no evidence left to confirm it — a false conflict against an
+	/// edit made long after ours.
+	#[test]
+	fn reading_the_announcements_leaves_them_for_the_pass_that_persists() {
+		let observations = Observations::default();
+		let uuid = Uuid::new_v4();
+		observations.note_uuids([uuid]);
+		observations.watch_push(uuid, None, None);
+		let baseline = written_row(uuid, hash(1));
+		let ripe = Instant::now() + Duration::from_secs(40);
+
+		let read = || observed_confirmations(&observations, &baseline, &HashMap::new(), ripe).0;
+		assert_eq!(read(), std::collections::HashSet::from([uuid]));
+		assert_eq!(
+			read(),
+			std::collections::HashSet::from([uuid]),
+			"a dry run that wrote nothing must not have consumed the evidence"
+		);
+
+		// The pass that persisted the row is the one that retires it.
+		observations.forget_pushes(&[uuid], Instant::now());
+		assert!(read().is_empty());
+	}
+
+	#[test]
+	fn a_re_push_of_the_same_path_retires_the_version_it_replaced() {
+		let observations = Observations::default();
+		let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+		observations.note_uuids([first]);
+		observations.watch_push(first, None, None);
+		observations.watch_push(second, None, Some(first));
+		assert_eq!(
+			observations.push_verdict(first, Instant::now() + Duration::from_secs(40)),
+			PushVerdict::Unknown,
+			"the row moved on to the new version, so the old record answers for nothing"
 		);
 	}
 }
