@@ -43,6 +43,9 @@ pub(crate) enum Commands {
 		/// Directory to list files in (default: the current working directory)
 		#[arg(add = FilenCompleter::directory())]
 		directory: Option<String>,
+		/// Use a long listing format with file sizes
+		#[arg(short = 'l', long)]
+		long: bool,
 	},
 	/// Print the contents of a file
 	Cat {
@@ -233,8 +236,8 @@ pub(crate) async fn execute_command(
 				..Default::default()
 			})
 		}
-		Commands::Ls { directory } => {
-			list_directory(ui, client, working_path, directory).await?;
+		Commands::Ls { directory, long } => {
+			list_directory(ui, client, working_path, directory, long).await?;
 			None
 		}
 		Commands::Cat { file } => {
@@ -473,6 +476,7 @@ async fn list_directory(
 	client: &mut LazyClient,
 	working_path: &RemotePath,
 	directory: Option<String>,
+	long: bool,
 ) -> Result<()> {
 	let directory_str = working_path.navigate(directory.as_deref().unwrap_or("")).0;
 	let client = client.get(ui).await?;
@@ -491,7 +495,7 @@ async fn list_directory(
 		NonRootFileType::Root(root) => DirType::Root(root),
 		_ => return Err(UI::failure(&format!("Not a directory: {}", directory_str))),
 	};
-	list_directory_by_dir(ui, client, &directory, None).await
+	list_directory_by_dir(ui, client, &directory, None, long).await
 }
 
 fn print_items_after_list(
@@ -499,6 +503,7 @@ fn print_items_after_list(
 	dirs: Vec<RemoteDirectory>,
 	files: Vec<RemoteFile>,
 	directory_label: Option<&str>,
+	long: bool,
 ) -> Result<()> {
 	let mut directories = dirs
 		.iter()
@@ -509,40 +514,64 @@ fn print_items_after_list(
 		})
 		.collect::<Vec<String>>();
 	directories.sort();
-	let mut file_names = files
+	let mut files = files
 		.iter()
 		.map(|f| {
-			f.name()
-				.map(str::to_string)
-				.unwrap_or_else(|| f.uuid().to_string())
+			(
+				f.name()
+					.map(str::to_string)
+					.unwrap_or_else(|| f.uuid().to_string()),
+				f.size(),
+			)
 		})
+		.collect::<Vec<(String, u64)>>();
+	files.sort_by(|(a, _), (b, _)| a.cmp(b));
+	let file_names = files
+		.iter()
+		.map(|(name, _)| name.clone())
 		.collect::<Vec<String>>();
-	file_names.sort();
 	if ui.json {
 		ui.print_json(json!({
 			"directories": directories,
 			"files": file_names,
 		}))?;
-	} else {
-		// print directory names in blue
-		let directories = directories
-			.iter()
-			.map(|s| style(s).blue().to_string())
-			.collect::<Vec<String>>();
-		let all_items = directories
-			.iter()
-			.chain(file_names.iter())
-			.map(|s| s.as_ref())
-			.collect::<Vec<&str>>();
-		if all_items.is_empty() {
-			ui.print_muted(&format!(
-				"{} is empty",
-				directory_label.unwrap_or("Directory")
-			));
-			return Ok(());
-		}
-		ui.print_grid(&all_items);
+		return Ok(());
 	}
+	if directories.is_empty() && files.is_empty() {
+		ui.print_muted(&format!(
+			"{} is empty",
+			directory_label.unwrap_or("Directory")
+		));
+		return Ok(());
+	}
+	if long {
+		// one item per line, with a right-aligned size column (directories have no size)
+		let sizes = files
+			.iter()
+			.map(|(_, size)| ui::format_size(*size))
+			.collect::<Vec<String>>();
+		let size_width = sizes.iter().map(|s| s.len()).max().unwrap_or(0).max(1);
+		for name in &directories {
+			// pad before styling, so the ANSI codes don't count towards the column width
+			let size = format!("{:>size_width$}", "-");
+			ui.print(&format!("{}  {}", style(size).dim(), style(name).blue()));
+		}
+		for ((name, _), size) in files.iter().zip(sizes.iter()) {
+			ui.print(&format!("{:>size_width$}  {}", size, name));
+		}
+		return Ok(());
+	}
+	// print directory names in blue
+	let directories = directories
+		.iter()
+		.map(|s| style(s).blue().to_string())
+		.collect::<Vec<String>>();
+	let all_items = directories
+		.iter()
+		.chain(file_names.iter())
+		.map(|s| s.as_ref())
+		.collect::<Vec<&str>>();
+	ui.print_grid(&all_items);
 	Ok(())
 }
 
@@ -551,12 +580,13 @@ async fn list_directory_by_dir(
 	client: &Client,
 	directory: &DirType<'_, Normal>,
 	directory_label: Option<&str>,
+	long: bool,
 ) -> Result<()> {
 	let (dirs, files) = client
 		.list_dir::<_, Normal>(directory, None::<&fn(u64, Option<u64>)>)
 		.await
 		.context("Failed to list directory")?;
-	print_items_after_list(ui, dirs, files, directory_label)
+	print_items_after_list(ui, dirs, files, directory_label, long)
 }
 
 enum PrintFileLines {
@@ -1184,7 +1214,7 @@ async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 		.list_trash(None::<&fn(u64, Option<u64>)>)
 		.await
 		.context("Failed to list trash")?;
-	print_items_after_list(ui, dirs, files, Some("Trash"))
+	print_items_after_list(ui, dirs, files, Some("Trash"), false)
 }
 
 enum TrashAction {

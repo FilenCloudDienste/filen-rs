@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - interactive `search` command to globally search for files and directories in the drive
 - `upload` and `download` commands to transfer files and directories to and from the drive
 - `trash-restore` and `trash-delete` commands to restore or permanently delete files and directories from the trash
+- `ls --long` (`ls -l`) to list items one per line with human-readable file sizes
 
 ### Changed
 
