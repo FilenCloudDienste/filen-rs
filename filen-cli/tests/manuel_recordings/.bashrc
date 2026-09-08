@@ -13,6 +13,10 @@ no-auth() {
     export INTERNAL_FLAG_FOR_FILEN_CLI_AUTH_CONFIG_PATH=""
 }
 
+if [ -n "$OVERRIDE_TEST_AUTH_CONFIG_PATH" ]; then
+    export INTERNAL_FLAG_FOR_FILEN_CLI_AUTH_CONFIG_PATH=" --auth-config-path $OVERRIDE_TEST_AUTH_CONFIG_PATH"
+fi
+
 # make a uniquely named temporary directory for this test run
 export MANUEL_TMP="$(mktemp -d /tmp/filen-cli-test-XXXXXX)"
 # (will cd $MANUEL_TMP at the end of the script)

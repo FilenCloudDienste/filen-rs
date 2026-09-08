@@ -1,7 +1,27 @@
-use std::time::Duration;
-
 #[cfg(target_os = "linux")]
-#[test]
-fn run_manuel_tests() {
-	manuel::run_manuel_tests_in_dir("tests/manuel_recordings", true, Duration::from_secs(300));
+#[filen_macros::shared_test_runtime]
+async fn run_manuel_tests() {
+	// export auth config to tmp file
+	use std::io::Write;
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let auth_config =
+		filen_cli::serialize_auth_config(client).expect("Failed to serialize auth config");
+	let mut temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+	let auth_config_path = temp_file
+		.path()
+		.to_str()
+		.expect("Failed to convert temp file path to str")
+		.to_string();
+	write!(temp_file, "{}", auth_config).expect("Failed to write auth config to temp file");
+	dotenv::dotenv().ok(); // loads TEST_EMAIL and TEST_PASSWORD from .env file, just like test_utils does
+	unsafe {
+		std::env::set_var("OVERRIDE_TEST_AUTH_CONFIG_PATH", auth_config_path);
+	}
+
+	manuel::run_manuel_tests_in_dir(
+		"tests/manuel_recordings",
+		true,
+		std::time::Duration::from_secs(300),
+	);
 }
