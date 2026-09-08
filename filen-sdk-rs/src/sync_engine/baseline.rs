@@ -127,6 +127,16 @@ pub(crate) enum BaselineState {
 	/// A two-way conflict was surfaced for this path; it is excluded from further passes until the
 	/// caller resolves it.
 	Conflicted,
+	/// A conflict of the same standing, from the other side of the same race: this engine's own
+	/// upload landed on top of a version it never saw — another client's edit, made between this
+	/// pass reading the remote and its upload landing — and buried it.
+	///
+	/// It is held exactly like [`Conflicted`](Self::Conflicted), and the row's remote half names
+	/// the BURIED version rather than what the remote holds now (our own upload is the head). That
+	/// difference is why it is a state of its own:
+	/// [`resolve_conflict`](super::SyncEngine::resolve_conflict) has to restore the version to
+	/// bring it back, where an ordinary conflict only has to stop pushing over it.
+	Overwritten,
 	/// The DESTINATION's copy of an item the source no longer has, adopted at a mode switch
 	/// ([`Backlog::AdoptDestination`](super::mode::Backlog::AdoptDestination)). The row records
 	/// what the destination held at that moment.
@@ -145,6 +155,7 @@ impl BaselineState {
 			Self::Synced => 0,
 			Self::Conflicted => 1,
 			Self::Adopted => 2,
+			Self::Overwritten => 3,
 		}
 	}
 
@@ -153,8 +164,16 @@ impl BaselineState {
 			0 => Some(Self::Synced),
 			1 => Some(Self::Conflicted),
 			2 => Some(Self::Adopted),
+			3 => Some(Self::Overwritten),
 			_ => None,
 		}
+	}
+
+	/// Whether the row is a divergence being HELD for the caller to resolve — both flavours. The
+	/// planner treats them identically: the path and its subtree are excluded until
+	/// [`resolve_conflict`](super::SyncEngine::resolve_conflict) picks a winner.
+	pub(crate) fn is_conflict(self) -> bool {
+		matches!(self, Self::Conflicted | Self::Overwritten)
 	}
 }
 

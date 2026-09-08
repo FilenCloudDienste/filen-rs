@@ -34,8 +34,10 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	cache::{CacheEvent, CacheEventType, DirEvent, FileEvent, SyncRootCallback, SyncRootHandle},
+	fs::HasUUID,
 	fs::dir::cache::CacheableDir,
 	fs::file::cache::CacheableFile,
+	io::client_impl::IoSharedClientExt,
 };
 
 /// The ceiling on how long a remote write this engine made stays trusted over the cache snapshot.
@@ -108,6 +110,13 @@ pub const CONFIRM_TENURE: Duration = Duration::from_secs(30);
 /// it. Generous, because a paused pair's records are what confirm it on resume.
 const PUSH_RECORD_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long the engine remembers that a version uuid came out of one of its OWN uploads.
+///
+/// Only the version chain of a path this engine has just written asks, and only about versions
+/// around that write, so this needs to outlive a pass and nothing more. Sized like the pending-write
+/// grace for the same reason: past it, a write of ours is not something a pass still reasons about.
+const MINTED_TTL: Duration = PENDING_CREATE_GRACE;
+
 /// What the cache's announcements say about one push of ours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PushVerdict {
@@ -176,6 +185,19 @@ struct ObservationState {
 	seen: HashMap<Uuid, (u64, Instant)>,
 	/// Pushes of ours whose content is not agreed yet, keyed by the version uuid the upload minted.
 	pushes: HashMap<Uuid, PushTenure>,
+	/// Every version uuid this engine's own uploads minted recently, confirmed or not.
+	///
+	/// The version chain cannot say who made a version and the server stamps them to the second,
+	/// so our own previous upload and another client's concurrent edit are indistinguishable there
+	/// whenever both fall in one second. This is the difference: a uuid in here came out of an
+	/// upload of ours, so it is not an edit anybody interleaved (see
+	/// [`plan::interleaved_version`]).
+	///
+	/// It is process-local, so a restart forgets what it wrote and a chain question asked
+	/// within one second of a pre-restart upload can read that upload as a stranger's — one
+	/// spurious conflict, cleared with KeepLocal. Persisting it would mean a table for a fact that
+	/// matters for [`MINTED_TTL`].
+	minted: HashMap<Uuid, Instant>,
 }
 
 impl Observations {
@@ -220,6 +242,7 @@ impl Observations {
 		// The cache can announce our own upload before the call that made it has returned; the
 		// announcement map is the only place that moment survives.
 		let announced = state.seen.get(&uuid).map(|(_, at)| *at);
+		state.minted.insert(uuid, now);
 		state.pushes.insert(
 			uuid,
 			PushTenure {
@@ -245,6 +268,11 @@ impl Observations {
 		verdict
 	}
 
+	/// Whether this engine's own upload minted `uuid` recently (see [`MINTED_TTL`]).
+	pub(super) fn minted(&self, uuid: Uuid) -> bool {
+		self.state().minted.contains_key(&uuid)
+	}
+
 	/// Forget the push records a pass has finished with, and any that no pass will ever read again.
 	fn forget_pushes(&self, decided: &[Uuid], now: Instant) {
 		let mut state = self.state();
@@ -254,6 +282,9 @@ impl Observations {
 		state
 			.pushes
 			.retain(|_, push| now.saturating_duration_since(push.recorded) < PUSH_RECORD_TTL);
+		state
+			.minted
+			.retain(|_, at| now.saturating_duration_since(*at) < MINTED_TTL);
 	}
 
 	/// The current counter — the stamp a write recorded now must be beaten by to retire.
@@ -1355,22 +1386,34 @@ impl SyncEngine {
 		rel_path: &str,
 		resolution: ConflictResolution,
 	) -> Result<(), Error> {
-		let store = self.store.lock().await;
-		let record = store
-			.pair(pair)
-			.map_err(|e| db_error(e, "loading the sync pair"))?
-			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
-		let mut held = store
-			.entry(pair, rel_path)
-			.map_err(|e| db_error(e, "loading the held conflict"))?
-			.filter(|entry| entry.state == BaselineState::Conflicted)
-			.ok_or_else(|| {
-				Error::custom(
-					ErrorKind::InvalidState,
-					format!("no conflict is being held at {rel_path:?} for this pair"),
-				)
-			})?;
+		let (record, mut held) = {
+			let store = self.store.lock().await;
+			let record = store
+				.pair(pair)
+				.map_err(|e| db_error(e, "loading the sync pair"))?
+				.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+			let held = store
+				.entry(pair, rel_path)
+				.map_err(|e| db_error(e, "loading the held conflict"))?
+				.filter(|entry| entry.state.is_conflict())
+				.ok_or_else(|| {
+					Error::custom(
+						ErrorKind::InvalidState,
+						format!("no conflict is being held at {rel_path:?} for this pair"),
+					)
+				})?;
+			(record, held)
+		};
 
+		// A divergence this engine's own push created is resolved against the SERVER's version
+		// history rather than against what the remote holds now — our upload is what it holds.
+		if held.state == BaselineState::Overwritten {
+			return self
+				.resolve_overwritten(pair, &record, rel_path, &held, resolution)
+				.await;
+		}
+
+		let store = self.store.lock().await;
 		let mut winner = resolution;
 		if winner == ConflictResolution::KeepBoth {
 			// Move the losing local copy out of the way FIRST, then resolve the path itself to the
@@ -1393,6 +1436,96 @@ impl SyncEngine {
 			None => store.delete_entry(pair, rel_path),
 		}
 		.map_err(|e| db_error(e, "resolving a conflict"))
+	}
+
+	/// Resolve a divergence this engine's own upload created — it buried another client's edit (see
+	/// [`BaselineState::Overwritten`]).
+	///
+	/// The shape is the mirror of an ordinary conflict: the winning side is already the remote head
+	/// and the losing side is a version in the file's history, so every resolution acts on the
+	/// history rather than on the current head.
+	///
+	/// - [`KeepLocal`](ConflictResolution::KeepLocal): nothing to do on the remote — our bytes are
+	///   the head and theirs stay in the version history. The row goes, and the next pass records
+	///   the two sides as converged (they hold the same content) with no transfer.
+	/// - [`KeepRemote`](ConflictResolution::KeepRemote): restore the buried version, so it is the
+	///   head again, and quarantine our own copy. The next pass downloads what we restored; our
+	///   bytes are recoverable from the bin and from the history.
+	/// - [`KeepBoth`](ConflictResolution::KeepBoth): fetch the buried version beside ours as
+	///   `<stem>.old.<ext>`. It has no baseline row, so the next pass uploads it — and both
+	///   clients end up holding both files instead of one of them silently losing an edit.
+	async fn resolve_overwritten(
+		&self,
+		pair: PairId,
+		record: &PairRecord,
+		rel_path: &str,
+		held: &BaselineEntry,
+		resolution: ConflictResolution,
+	) -> Result<(), Error> {
+		let buried_uuid = held.remote_uuid.ok_or_else(|| {
+			Error::custom(
+				ErrorKind::InvalidState,
+				format!("the conflict held at {rel_path:?} names no buried version"),
+			)
+		})?;
+		let local_root = Path::new(&record.local_root);
+		match resolution {
+			ConflictResolution::KeepLocal => {}
+			ConflictResolution::KeepBoth => {
+				let buried = self.client.get_file(buried_uuid).await?;
+				let (aside, path) = apply::aside_target(local_root, rel_path)?;
+				self.client
+					.download_file_to_path(&buried, &path, None)
+					.await?;
+				tracing::debug!(
+					"resolve_conflict[pair {pair}]: kept the buried version of {rel_path:?} as {aside:?}"
+				);
+			}
+			ConflictResolution::KeepRemote => {
+				// The head by LINEAGE, never the version chain's first entry: the chain is sorted by
+				// each version's original upload time, to the second, so the two uploads of the race
+				// that made this row tie and their order in the listing is arbitrary — half the time
+				// its first entry would be the buried version itself, and the restore below would be
+				// skipped as a no-op while the local copy went to the bin.
+				let lineage = held.remote_stable_uuid.ok_or_else(|| {
+					Error::custom(
+						ErrorKind::InvalidState,
+						format!("the conflict held at {rel_path:?} names no file to restore into"),
+					)
+				})?;
+				let mut head = self.client.get_file_by_stable_uuid(lineage).await?;
+				if head.uuid() != buried_uuid {
+					let version = self
+						.client
+						.list_file_versions(&head)
+						.await?
+						.into_iter()
+						.find(|version| version.uuid() == buried_uuid)
+						.ok_or_else(|| {
+							Error::custom(
+								ErrorKind::InvalidState,
+								format!(
+									"the version buried at {rel_path:?} is no longer restorable"
+								),
+							)
+						})?;
+					self.client.restore_file_version(&mut head, version).await?;
+				}
+				// Our own copy goes to the bin rather than under the download: the restored version
+				// is what this resolution asked for, and the bytes it replaces are not lost.
+				apply::quarantine_local(local_root, rel_path)?;
+				tracing::debug!(
+					"resolve_conflict[pair {pair}]: restored the version buried at {rel_path:?} and quarantined the local copy"
+				);
+			}
+		}
+		// Either way the row has said all it has to say: dropping it lets the next pass reconcile
+		// the path from what the two sides now actually hold.
+		self.store
+			.lock()
+			.await
+			.delete_entry(pair, rel_path)
+			.map_err(|e| db_error(e, "resolving a conflict"))
 	}
 
 	/// Retire the confirmation gap this engine's own pushes leave, from the evidence a snapshot
@@ -2083,6 +2216,21 @@ impl SyncEngine {
 
 		for conflict in &report.conflicts {
 			let rel_path = &conflict.rel_path;
+			// A row held because THIS engine's push buried a concurrent edit is the one kind the
+			// current view cannot describe: the remote head is our own upload, and the version the
+			// row is holding for the caller only exists in the file's history. Re-recording it from
+			// the view would put our own copy on both sides of the conflict and lose the only
+			// reference to the buried one.
+			if prep
+				.baseline
+				.get(rel_path)
+				.is_some_and(|row| row.state == BaselineState::Overwritten)
+			{
+				observer(SyncEvent::Conflict {
+					rel_path: rel_path.clone(),
+				});
+				continue;
+			}
 			// HOLD the conflict in the baseline: the path (and its subtree) is excluded from
 			// planning until `resolve_conflict` picks a winner, instead of being re-surfaced,
 			// unresolvable, on every pass.
@@ -2140,6 +2288,7 @@ impl SyncEngine {
 			client: &self.client,
 			local_root: &local_root,
 			pair,
+			mode: prep.record.mode,
 			store: &self.store,
 			local: &prep.local_scan.nodes,
 			baseline: &prep.baseline,
@@ -3809,6 +3958,28 @@ mod tests {
 		// The pass that persisted the row is the one that retires it.
 		observations.forget_pushes(&[uuid], Instant::now());
 		assert!(read().is_empty());
+	}
+
+	/// What the version chain cannot say: which versions came out of THIS engine. Two uploads a
+	/// second apart carry the same server stamp, so without this the previous one reads as a
+	/// stranger's edit that our push buried.
+	#[test]
+	fn a_version_this_engine_uploaded_is_remembered_as_its_own() {
+		let observations = Observations::default();
+		let (ours, theirs) = (Uuid::new_v4(), Uuid::new_v4());
+		observations.watch_push(ours, None, None);
+
+		assert!(observations.minted(ours));
+		assert!(!observations.minted(theirs), "another client's version");
+
+		// Confirming the push retires its tenure record, not the fact that we made it: the pass after
+		// it still has to recognise the version as ours.
+		observations.forget_pushes(&[ours], Instant::now());
+		assert!(observations.minted(ours));
+
+		// Past the window a pass reasons about, it goes.
+		observations.forget_pushes(&[], Instant::now() + MINTED_TTL);
+		assert!(!observations.minted(ours));
 	}
 
 	#[test]
