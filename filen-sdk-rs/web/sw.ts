@@ -24,18 +24,21 @@ self.addEventListener("activate", (event: ExtendableEvent) => {
 	)
 })
 
-let state: Client
+// Module state lives only as long as this worker instance: the browser stops an idle service
+// worker (Firefox after 30 s) and starts a fresh one on the next fetch, so a client set by
+// /serviceWorker/init is gone by the time a page that waited on the network comes back.
+let state: Client | undefined
 
-async function download(file: File): Promise<Uint8Array> {
+async function download(client: Client, file: File): Promise<Uint8Array> {
 	return await collectBytes((writer: WritableStream<Uint8Array>) =>
-		state.downloadFileToWriter({
+		client.downloadFileToWriter({
 			file: file,
 			writer
 		})
 	)
 }
 
-export async function initClient(client: StringifiedClient): Promise<void> {
+export async function initClient(client: StringifiedClient): Promise<Client> {
 	console.log("Initializing state in service worker...")
 
 	await init(dataURItoBuffer(filenSdkRsWasmPath))
@@ -43,6 +46,38 @@ export async function initClient(client: StringifiedClient): Promise<void> {
 	state = fromStringified(client)
 
 	console.log("State initialized in service worker")
+
+	return state
+}
+
+// The client this instance holds, or the one the request carries as `stringifiedClient` when
+// the worker was restarted since /serviceWorker/init.
+async function ensureClient(url: URL): Promise<Client> {
+	if (state) {
+		return state
+	}
+
+	const client = url.searchParams.get("stringifiedClient")
+
+	if (!client) {
+		throw new Error("service worker was restarted and the request carries no stringifiedClient")
+	}
+
+	return await initClient(JSON.parse(decodeURIComponent(client), jsonBigIntReviver) as StringifiedClient)
+}
+
+// A rejected respondWith promise reaches the page as an opaque "NetworkError when attempting to
+// fetch resource" / "Failed to fetch"; answer with a 500 that names the failure instead.
+// Message and stack both: Firefox's `stack` does not repeat the message, Chromium's does.
+function respond(e: FetchEvent, handler: () => Promise<Response>) {
+	e.respondWith(
+		handler().catch(
+			(err: unknown) =>
+				new Response(`service worker failed: ${err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err)}`, {
+					status: 500
+				})
+		)
+	)
 }
 
 self.addEventListener("fetch", (e: FetchEvent) => {
@@ -59,11 +94,16 @@ self.addEventListener("fetch", (e: FetchEvent) => {
 							status: 400
 						})
 					)
+
+					break
 				}
 
-				e.respondWith(
-					download(JSON.parse(decodeURIComponent(file), jsonBigIntReviver) as File).then(data => new Response(Buffer.from(data)))
-				)
+				respond(e, async () => {
+					const client = await ensureClient(url)
+					const data = await download(client, JSON.parse(decodeURIComponent(file), jsonBigIntReviver) as File)
+
+					return new Response(Buffer.from(data))
+				})
 
 				break
 			}
@@ -72,11 +112,11 @@ self.addEventListener("fetch", (e: FetchEvent) => {
 				const client = url.searchParams.get("stringifiedClient")
 
 				if (client) {
-					e.respondWith(
-						initClient(JSON.parse(decodeURIComponent(client), jsonBigIntReviver) as StringifiedClient).then(
-							() => new Response("Client initialized in SW")
-						)
-					)
+					respond(e, async () => {
+						await initClient(JSON.parse(decodeURIComponent(client), jsonBigIntReviver) as StringifiedClient)
+
+						return new Response("Client initialized in SW")
+					})
 				} else {
 					e.respondWith(
 						new Response("No client provided", {

@@ -1736,10 +1736,21 @@ test("service worker", async () => {
 		await new Promise<void>(resolve => setTimeout(resolve, 5000))
 
 		const jsonClient = JSON.stringify(await state.toStringified(), jsonBigIntReplacer)
+		const clientParam = `stringifiedClient=${encodeURIComponent(jsonClient)}`
 
-		const initRes = await fetch(`/serviceWorker/init?stringifiedClient=${encodeURIComponent(jsonClient)}`)
+		// The worker answers its own failures with a 500 whose body names them; surface that body,
+		// a bare `res.ok` assertion never does.
+		const bodyOrThrow = async (res: Response, what: string) => {
+			const text = await res.text()
 
-		expect(initRes.ok).toBe(true)
+			if (!res.ok) {
+				throw new Error(`${what} answered ${res.status}: ${text}`)
+			}
+
+			return text
+		}
+
+		await bodyOrThrow(await fetch(`/serviceWorker/init?${clientParam}`), "service worker init")
 
 		// wait a bit to ensure service worker is ready and client is loaded
 		await new Promise<void>(resolve => setTimeout(resolve, 5000))
@@ -1751,9 +1762,16 @@ test("service worker", async () => {
 
 		const stringifiedFile = JSON.stringify(file, jsonBigIntReplacer)
 
-		const res = await fetch("/serviceWorker/download?file=" + encodeURIComponent(stringifiedFile))
-		expect(res.ok).toBe(true)
-		const text = await res.text()
+		// Firefox stops a service worker that has been idle for 30 s and starts a fresh one, with
+		// empty module state, on the next fetch. In the nightly the upload above waits on the
+		// drive-write lock for longer than that, so idle past the timeout on purpose: every run then
+		// downloads through a restarted worker, which re-initialises from the client on the request.
+		await new Promise<void>(resolve => setTimeout(resolve, 35_000))
+
+		const text = await bodyOrThrow(
+			await fetch(`/serviceWorker/download?file=${encodeURIComponent(stringifiedFile)}&${clientParam}`),
+			"service worker download"
+		)
 		expect(text).toBe("service worker file content")
 	} finally {
 		clearInterval(intervalId)
