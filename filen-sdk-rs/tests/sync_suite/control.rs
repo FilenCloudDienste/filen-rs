@@ -17,7 +17,9 @@ use std::time::Duration;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{Backlog, SyncEngine, SyncEvent, SyncMode, WatchConfig};
+use filen_sdk_rs::sync_engine::{
+	Backlog, SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState,
+};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -832,6 +834,7 @@ async fn control_02_pause_durable_across_safety_net() {
 	engine.pause_pair(pair).await.unwrap();
 	tokio::time::sleep(NET).await;
 	let before = passes(&log);
+	let status = handle.status();
 
 	// Two remote adds, then several safety-net intervals with the pair paused.
 	seed_remote_file(&cache, remote, "r1.txt", b"one").await;
@@ -847,6 +850,11 @@ async fn control_02_pause_durable_across_safety_net() {
 		engine.is_paused(pair).await,
 		"the pause did not survive the safety net"
 	);
+	assert_eq!(
+		status.borrow().state,
+		WatchState::Paused,
+		"a loop idling on a paused pair must say so"
+	);
 	assert!(
 		!local.join("r1.txt").exists() && !local.join("r2.txt").exists(),
 		"a paused pair downloaded the remote adds"
@@ -861,8 +869,20 @@ async fn control_02_pause_durable_across_safety_net() {
 		"the backlog did not sync after resume (passes={})",
 		passes(&log)
 	);
+	// Published when the pass that did it RETURNS, a moment after its files land.
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || status.borrow().state
+			== WatchState::Running)
+		.await,
+		"the resumed loop never reported itself running again"
+	);
 
 	handle.stop().await;
+	assert_eq!(
+		status.borrow().state,
+		WatchState::Stopped,
+		"a watch the caller stopped must not read as anything else"
+	);
 	std::fs::remove_dir_all(&local).ok();
 }
 

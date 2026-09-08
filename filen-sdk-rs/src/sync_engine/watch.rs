@@ -13,7 +13,10 @@
 //! would act on, so a pass for them is pure waste.
 //!
 //! A pair that is ALREADY paused cannot be watched — [`watch`](super::SyncEngine::watch) refuses
-//! it, so a handle whose loop runs nothing is never handed out. While a pair is
+//! it, so a handle whose loop runs nothing is never handed out. Pausing a pair whose watch is
+//! mid-pass reaches into that pass exactly as it does for a one-shot
+//! [`sync_once`](super::SyncEngine::sync_once) (see
+//! [`pause_pair_with`](super::SyncEngine::pause_pair_with)): it parks, or it unwinds. While a pair is
 //! [`paused`](super::SyncEngine::pause_pair) under a running watch the loop runs no passes and leaves
 //! the dirty signal alone, so it is still pending when the pair resumes: whatever happened during
 //! the pause is picked up by the first pass afterwards. The watcher and the cache subscription are
@@ -100,7 +103,7 @@ impl WatchConfig {
 ///
 /// The loop can also end on its own, when the pair is removed underneath it (see
 /// [`SyncEngine::remove_pair`](super::SyncEngine::remove_pair)); the handle stays usable either
-/// way, and [`status`](Self::status) reports the loop as [`stopped`](WatchStatus::stopped).
+/// way, and [`status`](Self::status) says which of the two it was (see [`WatchState`]).
 pub struct WatchHandle {
 	// Dropping the sender closes the channel, which breaks the loop's shutdown select arm.
 	shutdown: tokio::sync::oneshot::Sender<()>,
@@ -136,6 +139,26 @@ impl WatchHandle {
 	}
 }
 
+/// What a watch loop is doing right now — and, once it has ended, WHY, which is what a caller
+/// cannot otherwise see coming.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WatchState {
+	/// Live: running passes, or waiting for the next trigger.
+	#[default]
+	Running,
+	/// Live but idle: the pair is [`paused`](super::SyncEngine::pause_pair), so the loop runs no
+	/// passes until it is resumed. It keeps its filesystem watcher and cache subscription.
+	/// Published once the loop reaches its idle poll, so a pass SUSPENDED part-way through by that
+	/// same pause still reads as [`Running`](Self::Running) until it ends.
+	Paused,
+	/// Terminal — the watch was stopped: its handle was dropped or [`stop`](WatchHandle::stop)ped.
+	Stopped,
+	/// Terminal — the pair was removed underneath the loop (see
+	/// [`SyncEngine::remove_pair`](super::SyncEngine::remove_pair)), so there was nothing left to
+	/// sync. Neither side was touched by the removal itself.
+	PairRemoved,
+}
+
 /// The health of a running watch, published after every pass. A pass failing outright (as opposed
 /// to a single action inside it, which surfaces as [`SyncEvent::ActionFailed`]) is otherwise
 /// invisible: the loop logs it and retries.
@@ -145,11 +168,9 @@ pub struct WatchStatus {
 	pub consecutive_failures: u32,
 	/// Why the last pass failed, or `None` while the watch is healthy.
 	pub last_error: Option<String>,
-	/// The terminal state: the loop has ended and will run no further pass. Either the watch was
-	/// stopped (its handle dropped or [`stopped`](WatchHandle::stop)), or the pair was removed
-	/// underneath it (see [`SyncEngine::remove_pair`](super::SyncEngine::remove_pair)) — which is
-	/// the case a caller cannot see coming, and the reason this is observable at all.
-	pub stopped: bool,
+	/// What the loop is doing — including the two ways it can END, which a caller has no other way
+	/// to tell apart.
+	pub state: WatchState,
 }
 
 impl SyncEngine {
@@ -252,6 +273,11 @@ struct Stop {
 }
 
 impl Stop {
+	/// Whether it was the PAIR going away that ended the loop, rather than the handle.
+	fn pair_removed(&self) -> bool {
+		*self.removed.borrow()
+	}
+
 	/// Resolves once the watch must end. Level-triggered on the removal, not edge-triggered: a
 	/// removal that already happened ends every later wait too, however often this is called.
 	async fn ended(&mut self) {
@@ -291,6 +317,12 @@ async fn run_loop(
 
 	loop {
 		if engine.is_paused(pair).await {
+			// A closed channel just means nobody is watching the health any more.
+			let _ = status.send_if_modified(|status| {
+				let changed = status.state != WatchState::Paused;
+				status.state = WatchState::Paused;
+				changed
+			});
 			if !wait_while_paused(&mut stop, config.debounce).await {
 				break;
 			}
@@ -313,7 +345,7 @@ async fn run_loop(
 		let _ = status.send(WatchStatus {
 			consecutive_failures: failures,
 			last_error: error,
-			stopped: false,
+			state: WatchState::Running,
 		});
 		let delay = backoff(failures);
 		if let Some(delay) = delay {
@@ -327,9 +359,15 @@ async fn run_loop(
 		}
 	}
 
-	// The terminal state: a caller watching the health is otherwise left waiting on a report that
-	// will never come, unable to tell a stopped loop from a quiet one.
-	status.send_modify(|status| status.stopped = true);
+	// The terminal state, and which of the two it is: a caller watching the health is otherwise
+	// left waiting on a report that will never come, unable to tell a stopped loop from a quiet one
+	// — or a watch it stopped itself from a pair that was taken out from under it.
+	let ended = if stop.pair_removed() {
+		WatchState::PairRemoved
+	} else {
+		WatchState::Stopped
+	};
+	status.send_modify(|status| status.state = ended);
 }
 
 /// Wait out one poll interval while the pair is paused. Returns `false` if the watch was stopped.
