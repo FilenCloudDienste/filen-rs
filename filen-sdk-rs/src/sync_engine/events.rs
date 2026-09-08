@@ -15,7 +15,8 @@ use super::{SyncMode, apply::SyncReport};
 /// [`Refused`](Self::Refused), or any number of [`Conflict`](Self::Conflict) /
 /// [`DeletionsHeld`](Self::DeletionsHeld) then [`Planned`](Self::Planned) followed by one
 /// in-progress event per applied action, each possibly trailed by
-/// [`ActionFailed`](Self::ActionFailed)) → [`PassCompleted`](Self::PassCompleted).
+/// [`ActionFailed`](Self::ActionFailed)) → [`PassCompleted`](Self::PassCompleted). A pass the pair's
+/// pause cut short reports one [`Interrupted`](Self::Interrupted) before it completes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
 	/// A pass began (after the read-only prepare), in this mode.
@@ -54,6 +55,12 @@ pub enum SyncEvent {
 	MovingLocal { from: String, to: String },
 	/// An individual action failed; the pass continues past it (the failure is also in the report).
 	ActionFailed { rel_path: String, error: String },
+	/// The pass was cut short: the pair was paused with
+	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran, so `actions` of its planned
+	/// actions were not carried out — the transfer dropped in flight plus everything behind it.
+	/// They left nothing behind and the next pass re-plans them (see
+	/// [`SyncReport::interrupted`](super::SyncReport::interrupted)).
+	Interrupted { actions: usize },
 	/// A path that is already identical on both sides was adopted into the baseline (no transfer) —
 	/// so a later one-sided change at that path is classified correctly rather than misread.
 	AdoptedBaseline { rel_path: String },

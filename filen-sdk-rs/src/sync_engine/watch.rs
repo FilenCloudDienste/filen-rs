@@ -19,8 +19,10 @@
 //! [`pause_pair_with`](super::SyncEngine::pause_pair_with)): it parks, or it unwinds. While a pair is
 //! [`paused`](super::SyncEngine::pause_pair) under a running watch the loop runs no passes and leaves
 //! the dirty signal alone, so it is still pending when the pair resumes: whatever happened during
-//! the pause is picked up by the first pass afterwards. The watcher and the cache subscription are
-//! left registered throughout — tearing either down would cost a full relist to rebuild.
+//! the pause is picked up by the first pass afterwards — including the remainder of a pass the
+//! pause itself cut short, which re-arms that signal on its way out. The watcher and the cache
+//! subscription are left registered throughout — tearing either down would cost a full relist to
+//! rebuild.
 
 use std::{
 	ffi::OsStr,
@@ -32,7 +34,9 @@ use std::{
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::Notify;
 
-use super::{SyncEvent, SyncObserver, baseline::PairId, engine::SyncEngine, scan::QUARANTINE_DIR};
+use super::{
+	SyncEvent, SyncObserver, SyncReport, baseline::PairId, engine::SyncEngine, scan::QUARANTINE_DIR,
+};
 use crate::{
 	Error, ErrorKind,
 	cache::{SyncRootCallback, SyncRootHandle},
@@ -119,6 +123,12 @@ impl WatchHandle {
 	/// Stop the watch and wait for the background loop to finish (up to one in-flight pass), so a
 	/// caller can be sure nothing is still touching either side when this returns. Dropping the
 	/// handle stops the loop too, but does not wait for it.
+	///
+	/// A pass PARKED on a [`pause`](super::SyncEngine::pause_pair) does not hold either of those
+	/// open: stopping the watch gives that pass's transfers up (as
+	/// [`cancel_paused_actions`](super::SyncEngine::cancel_paused_actions) would) so it can unwind
+	/// and release the drive-write lock — including a pause that lands after this was called, which
+	/// is the one nobody is left to reverse. The pair itself stays paused.
 	pub async fn stop(self) {
 		let Self {
 			shutdown,
@@ -248,6 +258,7 @@ impl SyncEngine {
 		let stop = Stop {
 			handle: shutdown_rx,
 			removed,
+			handle_gone: false,
 		};
 		let engine = Arc::clone(&self);
 		let loop_done = tokio::spawn(run_loop(
@@ -270,6 +281,10 @@ impl SyncEngine {
 struct Stop {
 	handle: tokio::sync::oneshot::Receiver<()>,
 	removed: tokio::sync::watch::Receiver<bool>,
+	/// Set once the handle's signal has been seen. A `oneshot::Receiver` PANICS if it is polled
+	/// again after it completed, and the loop awaits [`ended`](Self::ended) more than once: the
+	/// running pass races it, and whatever the loop waits on next races it again.
+	handle_gone: bool,
 }
 
 impl Stop {
@@ -278,15 +293,15 @@ impl Stop {
 		*self.removed.borrow()
 	}
 
-	/// Resolves once the watch must end. Level-triggered on the removal, not edge-triggered: a
-	/// removal that already happened ends every later wait too, however often this is called.
+	/// Resolves once the watch must end. Level-triggered on both signals, not edge-triggered: a
+	/// stop that already happened ends every later wait too, however often this is called.
 	async fn ended(&mut self) {
-		if *self.removed.borrow() {
+		if self.handle_gone || *self.removed.borrow() {
 			return;
 		}
 		tokio::select! {
 			biased;
-			_ = &mut self.handle => {}
+			_ = &mut self.handle => self.handle_gone = true,
 			// An error here means the engine dropped the signal — with the pair, or with itself.
 			// Either way there is nothing left to sync.
 			_ = self.removed.changed() => {}
@@ -329,17 +344,35 @@ async fn run_loop(
 			continue;
 		}
 
-		let error = run_pass(&engine, pair, observer.as_mut()).await;
+		let (error, owed) = tokio::select! {
+			outcome = run_pass(&engine, pair, observer.as_mut()) => outcome,
+			// Never resolves: it only makes sure a pass PARKED on a suspension gives up when the
+			// watch is stopped, so the pass above can finish and this loop can end. Without it a
+			// stop (or a dropped handle) waits out the suspension's escalation window — for ever if
+			// it has none — while the pass sits on the drive-write lock.
+			() = unpark_on_stop(&engine, pair, &mut stop, config.debounce) => unreachable!(),
+		};
 		if error.is_none() {
 			failures = 0;
 			// The net measures time since the last SUCCESSFUL pass, not since the last tick: a pass
 			// that just succeeded has already done everything the net would do, so a tick that came
 			// due during it buys nothing but a no-op pass right after. A FAILED pass deliberately
 			// leaves the interval alone — its own retry timer is the backoff, and a run of failures
-			// must not push the net out indefinitely.
-			safety_net.reset();
+			// must not push the net out indefinitely. So does a pass a pause cut short: it did not
+			// do what the net would have done either.
+			if !owed {
+				safety_net.reset();
+			}
 		} else {
 			failures = failures.saturating_add(1);
+		}
+		if owed {
+			// What that pass did not get to is still owed, and the trigger that started it went
+			// with it. Re-arm the signal, so the wait below ends at the debounce and hands over to
+			// the paused branch above — which runs the remainder the moment the pair resumes.
+			// Without it the loop sits in that wait until the safety net fires, minutes after the
+			// resume, with nothing else to wake it (the work it skipped changed neither side).
+			dirty.notify_one();
 		}
 		// A closed channel just means nobody is watching the health any more.
 		let _ = status.send(WatchStatus {
@@ -368,6 +401,25 @@ async fn run_loop(
 		WatchState::Stopped
 	};
 	status.send_modify(|status| status.state = ended);
+}
+
+/// Wait for the watch to be stopped, then keep cutting loose a pass PARKED on the pair's
+/// suspension — and never resolve, so this only ever ends the pass it is racing, never the wait for
+/// it.
+///
+/// A suspended pass comes back when the pair is resumed or its actions cancelled; a stopped watch
+/// has nobody left to ask for either, so without this the loop (and [`WatchHandle::stop`], and the
+/// drive-write lock the pass is holding) would wait out the suspension's escalation window, or for
+/// ever if the pause was made with no window at all. Repeated on a `poll` timer rather than done
+/// once, because a pause can land at any moment while the pass runs — including AFTER the stop,
+/// which is exactly when there is nobody left to un-park it. Polled for the same reason
+/// [`wait_while_paused`] is: the alternative is per-pair wakeup plumbing through the engine.
+async fn unpark_on_stop(engine: &SyncEngine, pair: PairId, stop: &mut Stop, poll: Duration) {
+	stop.ended().await;
+	loop {
+		engine.cancel_suspended_pass(pair).await;
+		tokio::time::sleep(poll).await;
+	}
 }
 
 /// Wait out one poll interval while the pair is paused. Returns `false` if the watch was stopped.
@@ -432,25 +484,40 @@ fn backoff(failures: u32) -> Option<Duration> {
 }
 
 /// Run one pass, logging (not propagating) any failure — the loop is best-effort and the next
-/// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s. Returns
-/// the pass's own error, if any (per-action errors inside a completed pass do not count).
+/// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s.
+///
+/// Returns the pass's own error, if any (per-action errors inside a completed pass do not count),
+/// and whether it left work owed (see [`owes_a_pass`]).
 async fn run_pass(
 	engine: &SyncEngine,
 	pair: PairId,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
-) -> Option<String> {
+) -> (Option<String>, bool) {
 	match engine.sync_once_observed(pair, observer).await {
 		Ok(report) => {
 			if !report.errors.is_empty() {
 				tracing::warn!("sync pair {pair}: {} action error(s)", report.errors.len());
 			}
-			None
+			(None, owes_a_pass(&report))
 		}
 		Err(e) => {
 			tracing::warn!("sync pair {pair} failed: {e}");
-			Some(e.to_string())
+			(Some(e.to_string()), false)
 		}
 	}
+}
+
+/// Whether a pause cut this pass short, leaving the loop owing a pass of its own.
+///
+/// Two shapes, one debt. A pass cancelled part-way through its plan reports what it did not do as
+/// [`interrupted`](SyncReport::interrupted). A pass cancelled BEFORE it had a plan to count — a
+/// pause landing while it read the two sides, or in the instant between the loop's own pause check
+/// and the pass's — has nothing to count and reports itself
+/// [`paused`](SyncReport::paused). Either way the pass did none of what the safety net would have
+/// done and the trigger that started it is spent, so the loop must re-arm that trigger and leave
+/// the net measuring from the last pass that actually ran.
+fn owes_a_pass(report: &SyncReport) -> bool {
+	report.interrupted > 0 || report.paused
 }
 
 /// Whether a filesystem event under `root` is worth waking the loop for.
@@ -495,8 +562,8 @@ mod tests {
 	use tokio::sync::Notify;
 
 	use super::{
-		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, Stop, WatchConfig, backoff, triggers_pass,
-		wait_for_next_pass, wait_while_paused,
+		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, Stop, SyncReport, WatchConfig, backoff,
+		owes_a_pass, triggers_pass, wait_for_next_pass, wait_while_paused,
 	};
 
 	/// A safety-net interval as `run_loop` sets one up: the immediate first tick consumed, so the
@@ -517,7 +584,15 @@ mod tests {
 	) {
 		let (shutdown_tx, handle) = tokio::sync::oneshot::channel();
 		let (removed_tx, removed) = tokio::sync::watch::channel(false);
-		(shutdown_tx, removed_tx, Stop { handle, removed })
+		(
+			shutdown_tx,
+			removed_tx,
+			Stop {
+				handle,
+				removed,
+				handle_gone: false,
+			},
+		)
 	}
 
 	fn event(kind: EventKind, paths: &[&str]) -> notify::Event {
@@ -735,6 +810,60 @@ mod tests {
 		let start = tokio::time::Instant::now();
 		assert!(!wait_while_paused(&mut stop, Duration::from_secs(600)).await);
 		assert_eq!(start.elapsed(), Duration::ZERO);
+	}
+
+	/// A pause that lands on a pass BEFORE it has a plan to count leaves the same debt as one that
+	/// cut a plan in half: the pass applied nothing, and the trigger that started it is spent. The
+	/// loop must re-arm that trigger, or the first pass after the resume is whichever safety-net
+	/// tick happens to come next — a pair the user just un-paused sitting idle for minutes.
+	#[tokio::test(start_paused = true)]
+	async fn a_pause_that_beat_the_plan_still_owes_a_pass() {
+		// The loop's tail for such a pass: re-arm the trigger, leave the safety net alone.
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+		let report = SyncReport {
+			paused: true,
+			..SyncReport::default()
+		};
+		if owes_a_pass(&report) {
+			dirty.notify_one();
+		}
+
+		let start = tokio::time::Instant::now();
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert_eq!(
+			start.elapsed(),
+			DEBOUNCE,
+			"the loop waited out the safety net instead of owning the pass the pause cut short"
+		);
+
+		// A pass that ran to the end is the only one that owes nothing.
+		assert!(!owes_a_pass(&SyncReport::default()));
+		assert!(owes_a_pass(&SyncReport {
+			interrupted: 1,
+			..SyncReport::default()
+		}));
+	}
+
+	/// A stop that already fired ends every later wait, and can be awaited any number of times: the
+	/// loop races it against the running pass and then against whatever it waits on next, and a
+	/// `oneshot::Receiver` polled again after it completed PANICS.
+	#[tokio::test(start_paused = true)]
+	async fn a_stop_that_already_fired_ends_every_later_wait() {
+		let (shutdown_tx, _removed_tx, mut stop) = stop();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+
+		drop(shutdown_tx);
+		stop.ended().await;
+		stop.ended().await;
+		assert!(!wait_while_paused(&mut stop, Duration::from_secs(600)).await);
+		assert!(!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(
+			!stop.pair_removed(),
+			"the handle went away, not the pair — the loop must report the right end"
+		);
 	}
 
 	/// A configured debounce, not the default one, is what a burst is coalesced over.

@@ -24,6 +24,7 @@ use super::{
 	events::SyncEvent,
 	guard::GuardReason,
 	outcome::{PlannedAction, PlannedActionKind, PlannedConflict, RefuseReason, UnsyncablePath},
+	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths},
 	scan::{LocalNode, QUARANTINE_DIR},
 };
@@ -80,6 +81,13 @@ pub struct SyncReport {
 	/// scanned nothing, planned nothing and applied nothing, so every field above is at its zero
 	/// value. Not the same as a pass that ran and found nothing to do.
 	pub paused: bool,
+	/// How many planned actions this pass did NOT carry out because the pair was paused with
+	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran — the transfer dropped in
+	/// flight plus everything queued behind it. Those actions recorded nothing — a row is written
+	/// only after its action succeeded, and a transfer that succeeded is never dropped before its
+	/// row — and the next pass re-plans them. Zero on a pass that ran to the end, including one
+	/// that was merely SUSPENDED and resumed.
+	pub interrupted: usize,
 	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
 	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
 	/// ones (a refusal, a lock that could not be taken) that belong to no path.
@@ -132,6 +140,9 @@ pub(super) struct ApplyContext<'a> {
 	/// The uuids the cache has announced, stamped — read when a pending write is recorded so the
 	/// write only retires on an announcement that came AFTER it.
 	pub(super) observed: &'a Observations,
+	/// The pair's pause checkpoint: consulted before every action, and raced against every
+	/// transfer (see [`PassGate`]).
+	pub(super) gate: &'a PassGate,
 }
 
 fn local_path(root: &Path, rel_path: &str) -> PathBuf {
@@ -246,6 +257,13 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 ///
 /// Each action emits its [`SyncEvent`] to `observer` (and an [`ActionFailed`](SyncEvent::ActionFailed)
 /// if it errors): serial actions when they start, concurrent transfers as each completes.
+///
+/// Pausing the pair reaches into this loop through [`ApplyContext::gate`]: a SUSPENDED pass parks
+/// before its next action — and before taking the drive lock — while a transfer already running
+/// finishes, since the transfer paths poll no pause signal of their own; a CANCELLED one drops the
+/// transfers in flight and skips everything left, counting them in [`SyncReport::interrupted`]. A
+/// transfer that got as far as FINISHING is never dropped between its network op and the row that
+/// records it (see [`apply_transfer`]), so the two always agree.
 pub(super) async fn apply(
 	ctx: ApplyContext<'_>,
 	actions: Vec<SyncAction>,
@@ -272,22 +290,6 @@ pub(super) async fn apply(
 	}
 	resolve_folded_objects(&ctx, &actions, &mut files, &mut dir_by_path).await;
 
-	// Hold the drive-write lock for the whole pass when it mutates the remote (a pure pull touches
-	// only local files and needs no lock). Inner `lock_drive` calls then return a clone of this.
-	let _drive_lock = if actions.iter().any(mutates_remote) {
-		match ctx.client.lock_drive().await {
-			Ok(lock) => Some(lock),
-			Err(error) => {
-				report
-					.errors
-					.push(format!("failed to acquire the drive lock: {error}"));
-				return;
-			}
-		}
-	} else {
-		None
-	};
-
 	// Split the phase-ordered plan: creates+moves first (serial — they fill `dir_by_path` and are
 	// parent-before-child), then transfers (concurrent), then deletes (serial — descendant-first).
 	// A "replace-delete" (a delete whose path is (re)created this pass — a file<->dir type flip) is
@@ -309,8 +311,48 @@ pub(super) async fn apply(
 		}
 	}
 
+	// What the pass still owes if it is cancelled part-way: everything it has not carried out.
+	let total = pre.len() + transfers.len() + post.len();
+	let mut applied = 0usize;
+
+	// Hold the drive-write lock for the whole pass when it mutates the remote (a pure pull touches
+	// only local files and needs no lock). Inner `lock_drive` calls then return a clone of this.
+	//
+	// Taken UNDER the gate, because acquiring it is itself a wait a pause has to be able to reach: a
+	// contended acquisition retries for hours by default, so a pass told to stop while queueing for
+	// the lock would otherwise take it just to release it — and report what it did not do only then.
+	// A suspended pass parks here instead of holding a lock it is not using. Dropping the
+	// acquisition mid-request can leave the server holding a lock nothing refreshes; that lease
+	// expires on its own within ~30 s.
+	let _drive_lock = if pre
+		.iter()
+		.chain(&transfers)
+		.chain(&post)
+		.any(mutates_remote)
+	{
+		if !ctx.gate.wait_to_start().await {
+			return note_interrupted(report, total, observer);
+		}
+		match ctx.gate.guard(ctx.client.lock_drive()).await {
+			Some(Ok(lock)) => Some(lock),
+			Some(Err(error)) => {
+				report
+					.errors
+					.push(format!("failed to acquire the drive lock: {error}"));
+				return;
+			}
+			None => return note_interrupted(report, total, observer),
+		}
+	} else {
+		None
+	};
+
 	for action in &pre {
+		if !ctx.gate.wait_to_start().await {
+			return note_interrupted(report, total - applied, observer);
+		}
 		apply_serial(&ctx, action, &files, &mut dir_by_path, report, observer).await;
+		applied += 1;
 	}
 
 	if !transfers.is_empty() {
@@ -330,7 +372,14 @@ pub(super) async fn apply(
 		);
 		while let Some((action, result)) = stream.next().await {
 			match result {
-				Ok(()) => {
+				// A cancel skips a transfer that has not started and DROPS one that is mid-flight;
+				// either way it recorded nothing, and the pass owes it to the next one.
+				Ok(Transfer::Interrupted) => {
+					tracing::debug!("apply: {} interrupted", action.describe());
+					continue;
+				}
+				Ok(Transfer::Done) => {
+					applied += 1;
 					tracing::debug!("apply: {} done", action.describe());
 					observer(action.to_event());
 					match action {
@@ -340,6 +389,7 @@ pub(super) async fn apply(
 					}
 				}
 				Err(error) => {
+					applied += 1;
 					tracing::debug!("apply: {} FAILED — {error}", action.describe());
 					observer(SyncEvent::ActionFailed {
 						rel_path: action.rel_path().to_string(),
@@ -352,8 +402,29 @@ pub(super) async fn apply(
 	}
 
 	for action in &post {
+		if !ctx.gate.wait_to_start().await {
+			return note_interrupted(report, total - applied, observer);
+		}
 		apply_serial(&ctx, action, &files, &mut dir_by_path, report, observer).await;
+		applied += 1;
 	}
+	note_interrupted(report, total - applied, observer);
+}
+
+/// Record a pass cut short by a cancel: how many planned actions it did not carry out, both on the
+/// report and as an event, so a caller can tell "nothing left to do" from "stopped part-way". A
+/// pass that ran to the end owes nothing and reports nothing.
+fn note_interrupted(
+	report: &mut SyncReport,
+	remaining: usize,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) {
+	if remaining == 0 {
+		return;
+	}
+	tracing::debug!("apply: interrupted with {remaining} action(s) left unapplied");
+	report.interrupted = remaining;
+	observer(SyncEvent::Interrupted { actions: remaining });
 }
 
 /// The remote file objects a pass can act on: the cache snapshot's, plus the ones fetched for
@@ -506,15 +577,35 @@ fn note_failure(report: &mut SyncReport, rel_path: &str, error: &crate::Error) {
 		.push((rel_path.to_string(), error.to_string()));
 }
 
+/// Whether one transfer ran at all — the pass can be cancelled before it starts, or while its
+/// network op is in flight (see [`PassGate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+	/// It ran to the end and recorded what it did.
+	Done,
+	/// The pass was cancelled: it never started, or it was dropped mid-flight. Either way it
+	/// recorded nothing, and the next pass re-plans it.
+	Interrupted,
+}
+
 /// Perform a transfer (download or upload): the network op + baseline write only. It touches no
 /// shared mutable state — it READS `dir_by_path` and the baseline store is internally locked — so
 /// transfers run concurrently; the caller does the report/event accounting as each completes.
+///
+/// The pair's pause gates it in two places, and only those two: nothing starts while the pass is
+/// suspended, and the NETWORK op alone is raced against a cancel. The bookkeeping after that op is
+/// deliberately outside the race — it waits on the store lock every other transfer of the pass
+/// contends for, and a cancel landing in that window would leave the remote holding a write no
+/// baseline row describes and no report counts.
 async fn apply_transfer(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
 	files: &RemoteFiles<'_>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
-) -> Result<(), crate::Error> {
+) -> Result<Transfer, crate::Error> {
+	if !ctx.gate.wait_to_start().await {
+		return Ok(Transfer::Interrupted);
+	}
 	match action {
 		SyncAction::DownloadFile {
 			rel_path,
@@ -547,10 +638,24 @@ async fn apply_transfer(
 					.map_err(db_err)?,
 				None => None,
 			};
-			stash_local_target(ctx.local_root, rel_path, base.as_ref())?;
-			ctx.client
-				.download_file_to_path(&remote_file, &path, None)
-				.await?;
+			let stashed = stash_local_target(ctx.local_root, rel_path, base.as_ref())?;
+			let Some(downloaded) = ctx
+				.gate
+				.guard(ctx.client.download_file_to_path(&remote_file, &path, None))
+				.await
+			else {
+				// Dropped before it could put anything at the path — so the copy moved out of its
+				// way is all that path has, and it goes back. Leaving it in the bin would leave the
+				// path empty for the next pass to read as a local deletion.
+				restore_stashed(stashed, &path);
+				return Ok(Transfer::Interrupted);
+			};
+			// A download that FAILED leaves the same empty path behind, and the retry the next pass
+			// makes stashes the restored copy again if it is still unsynced.
+			if let Err(error) = downloaded {
+				restore_stashed(stashed, &path);
+				return Err(error);
+			}
 			let remote = ctx.remote.get(rel_path);
 			upsert_file_baseline(
 				ctx,
@@ -575,10 +680,14 @@ async fn apply_transfer(
 				.clone();
 			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
 			let path = local_path(ctx.local_root, rel_path);
-			let (uploaded, _file) = ctx
-				.client
-				.upload_file_from_path(&parent_type, path, None)
-				.await?;
+			let Some(upload) = ctx
+				.gate
+				.guard(ctx.client.upload_file_from_path(&parent_type, path, None))
+				.await
+			else {
+				return Ok(Transfer::Interrupted);
+			};
+			let (uploaded, _file) = upload?;
 			let local = ctx.local.get(rel_path);
 			let new_uuid: Uuid = uploaded.uuid();
 			// A same-name upload versions whatever the path held: record that uuid, so the next
@@ -608,7 +717,7 @@ async fn apply_transfer(
 		}
 		_ => return Err(internal("apply_transfer called with a non-transfer action")),
 	}
-	Ok(())
+	Ok(Transfer::Done)
 }
 
 async fn apply_one(
@@ -629,11 +738,12 @@ async fn apply_one(
 		// Transfers normally run via the concurrent path in `apply`; these arms keep `apply_one`
 		// total and correct if a transfer is ever applied serially.
 		SyncAction::DownloadFile { .. } => {
-			apply_transfer(ctx, action, files, dir_by_path).await?;
-			report.downloaded += 1;
+			if apply_transfer(ctx, action, files, dir_by_path).await? == Transfer::Done {
+				report.downloaded += 1;
+			}
 		}
 		SyncAction::DeleteLocal { rel_path, .. } => {
-			quarantine_local(ctx.local_root, rel_path)?;
+			let _stashed = quarantine_local(ctx.local_root, rel_path)?;
 			delete_baseline(ctx, rel_path).await?;
 			report.locally_deleted += 1;
 		}
@@ -664,8 +774,9 @@ async fn apply_one(
 			report.remote_dirs_created += 1;
 		}
 		SyncAction::UploadFile { .. } => {
-			apply_transfer(ctx, action, files, dir_by_path).await?;
-			report.uploaded += 1;
+			if apply_transfer(ctx, action, files, dir_by_path).await? == Transfer::Done {
+				report.uploaded += 1;
+			}
 		}
 		SyncAction::TrashRemote {
 			rel_path,
@@ -811,15 +922,18 @@ async fn apply_one(
 /// write lands on top of it. Every local write that can OVERWRITE — a remote-wins download, and a
 /// move whose destination is occupied — goes through here, so a local edit is never destroyed
 /// silently; it lands in the quarantine bin the same way a propagated deletion does.
+///
+/// Returns where it was stashed (nothing stashed: `None`), for a caller whose write may still not
+/// happen — see [`restore_stashed`].
 fn stash_local_target(
 	local_root: &Path,
 	rel_path: &str,
 	base: Option<&BaselineEntry>,
-) -> Result<(), crate::Error> {
+) -> Result<Option<PathBuf>, crate::Error> {
 	if local_holds_unsynced_content(&local_path(local_root, rel_path), base) {
-		quarantine_local(local_root, rel_path)?;
+		return quarantine_local(local_root, rel_path);
 	}
-	Ok(())
+	Ok(None)
 }
 
 /// Whether the item at a pull's target path holds content the baseline cannot vouch for — a local
@@ -1154,17 +1268,44 @@ async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), c
 /// UNIQUE on collision (` (N)` suffix): two deletions at the same path over time must not overwrite
 /// each other (data loss), and renaming a directory onto an existing non-empty quarantine entry
 /// would otherwise fail and wedge the pass forever (a re-failing, never-advancing deletion).
-fn quarantine_local(root: &Path, rel_path: &str) -> Result<(), crate::Error> {
+///
+/// Returns where the item went, so a caller whose write then does NOT happen can put it back (see
+/// [`restore_stashed`]); `None` when there was nothing to move.
+fn quarantine_local(root: &Path, rel_path: &str) -> Result<Option<PathBuf>, crate::Error> {
 	let source = local_path(root, rel_path);
 	// A missing source is a no-op — e.g. it already moved as part of an ancestor's quarantine.
 	if source.symlink_metadata().is_err() {
-		return Ok(());
+		return Ok(None);
 	}
 	let dest = unique_quarantine_dest(local_path(&root.join(QUARANTINE_DIR), rel_path));
 	if let Some(parent) = dest.parent() {
 		std::fs::create_dir_all(parent).map_err(io_err)?;
 	}
-	std::fs::rename(&source, &dest).map_err(io_err)
+	std::fs::rename(&source, &dest).map_err(io_err)?;
+	Ok(Some(dest))
+}
+
+/// Put a [`stash_local_target`] back where it came from, for a write that never landed after all —
+/// a download the pair's pause dropped mid-flight. Without this the path is left EMPTY: the next
+/// pass reads a baseline row with nothing on disk as a local deletion and conflicts over a
+/// deletion nobody made, for a file whose only copy sits in the quarantine bin.
+///
+/// Never overwrites: something back at the path is somebody's newer write, and the stashed copy
+/// stays recoverable in the bin rather than being put on top of it. Best-effort for the same
+/// reason — a restore that fails leaves the copy where it is still safe.
+fn restore_stashed(stashed: Option<PathBuf>, path: &Path) {
+	let Some(stashed) = stashed else {
+		return;
+	};
+	if path.exists() {
+		return;
+	}
+	if let Err(error) = std::fs::rename(&stashed, path) {
+		tracing::warn!(
+			"failed to restore {} from the quarantine bin: {error}",
+			path.display()
+		);
+	}
 }
 
 /// Stash whatever occupies a local move's destination, unless the destination is the SOURCE seen
@@ -1184,7 +1325,8 @@ fn stash_move_target(
 	base: Option<&BaselineEntry>,
 ) -> Result<(), crate::Error> {
 	if has_own_directory_entry(&local_path(local_root, to_path)) {
-		stash_local_target(local_root, to_path, base)?;
+		// The rename that follows always lands, so nothing here is ever put back.
+		let _stashed = stash_local_target(local_root, to_path, base)?;
 	}
 	Ok(())
 }
@@ -1309,12 +1451,18 @@ mod tests {
 		let trash = root.join(QUARANTINE_DIR);
 
 		std::fs::write(root.join("x.txt"), b"first").unwrap();
-		quarantine_local(&root, "x.txt").unwrap();
+		assert_eq!(
+			quarantine_local(&root, "x.txt").unwrap(),
+			Some(trash.join("x.txt"))
+		);
 		assert_eq!(std::fs::read(trash.join("x.txt")).unwrap(), b"first");
 
 		// A second deletion at the same rel path must NOT clobber the first quarantined copy.
 		std::fs::write(root.join("x.txt"), b"second").unwrap();
-		quarantine_local(&root, "x.txt").unwrap();
+		assert_eq!(
+			quarantine_local(&root, "x.txt").unwrap(),
+			Some(trash.join("x.txt (1)"))
+		);
 		assert_eq!(
 			std::fs::read(trash.join("x.txt")).unwrap(),
 			b"first",
@@ -1489,7 +1637,7 @@ mod tests {
 		let root = temp_dir();
 		std::fs::write(root.join("dest.txt"), b"never synced").unwrap();
 
-		stash_local_target(&root, "dest.txt", None).unwrap();
+		let _stashed = stash_local_target(&root, "dest.txt", None).unwrap();
 
 		assert!(
 			!root.join("dest.txt").exists(),
@@ -1550,7 +1698,8 @@ mod tests {
 		let root = temp_dir();
 		let (path, base) = synced_file(&root, b"abc");
 
-		stash_local_target(&root, "a.txt", Some(&base)).unwrap();
+		let stashed = stash_local_target(&root, "a.txt", Some(&base)).unwrap();
+		assert_eq!(stashed, None, "nothing was stashed, so nothing to put back");
 
 		assert!(path.exists(), "an unmodified copy is left where it is");
 		assert!(
@@ -1606,7 +1755,60 @@ mod tests {
 	fn quarantine_of_a_missing_source_is_a_noop() {
 		let root = temp_dir();
 		// e.g. the item already moved as part of an ancestor's quarantine.
-		quarantine_local(&root, "already/gone.txt").expect("missing source is a no-op");
+		assert_eq!(
+			quarantine_local(&root, "already/gone.txt").expect("missing source is a no-op"),
+			None
+		);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// A download the pause dropped (or one that failed) never writes at its target, so the copy
+	/// stashed out of its way goes BACK: left in the bin, the path is empty, and the next pass
+	/// reads a baseline row with nothing on disk as a local deletion — a conflict over a deletion
+	/// nobody made, for a file whose only copy is in the quarantine bin.
+	#[test]
+	fn a_write_that_never_landed_puts_its_stashed_target_back() {
+		let root = temp_dir();
+		std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
+
+		let stashed = stash_local_target(&root, "a.txt", None).unwrap();
+		assert!(
+			stashed.is_some(),
+			"a copy the baseline cannot vouch for must be stashed before the download"
+		);
+		assert!(!root.join("a.txt").exists());
+
+		restore_stashed(stashed, &root.join("a.txt"));
+
+		assert_eq!(
+			std::fs::read(root.join("a.txt")).unwrap(),
+			b"a local edit",
+			"the interrupted download left the path empty"
+		);
+		assert!(
+			!root.join(QUARANTINE_DIR).join("a.txt").exists(),
+			"and nothing is left duplicated in the bin"
+		);
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// Unless something is back at the path: that is somebody's newer write, and the stashed copy
+	/// stays recoverable in the bin rather than being put on top of it.
+	#[test]
+	fn a_restore_never_overwrites_what_took_the_path() {
+		let root = temp_dir();
+		std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
+		let stashed = stash_local_target(&root, "a.txt", None).unwrap();
+		std::fs::write(root.join("a.txt"), b"written since").unwrap();
+
+		restore_stashed(stashed, &root.join("a.txt"));
+
+		assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"written since");
+		assert_eq!(
+			std::fs::read(root.join(QUARANTINE_DIR).join("a.txt")).unwrap(),
+			b"a local edit",
+			"the stashed copy must stay recoverable"
+		);
 		std::fs::remove_dir_all(&root).ok();
 	}
 }

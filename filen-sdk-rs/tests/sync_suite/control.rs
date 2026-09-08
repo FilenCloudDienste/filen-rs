@@ -18,7 +18,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	Backlog, SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState,
+	Backlog, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState,
 };
 use uuid::Uuid;
 
@@ -112,6 +112,31 @@ fn passes(log: &EventLog) -> usize {
 		.iter()
 		.filter(|e| matches!(e, SyncEvent::PassCompleted { .. }))
 		.count()
+}
+
+/// How many uploads a pass has reported so far — the tick of the action loop, which is what a
+/// suspended pass must stop producing.
+fn uploads(log: &EventLog) -> usize {
+	log.lock()
+		.unwrap()
+		.iter()
+		.filter(|e| matches!(e, SyncEvent::Uploading { .. }))
+		.count()
+}
+
+/// Wait until the pass has reported its first upload, so a pause issued next lands with the action
+/// loop provably INSIDE its transfers — not still scanning, listing or queueing on the drive lock,
+/// where a pause reaches nothing that is running. With far more files than the client's transfer
+/// concurrency, one completed upload means a full set of them is in flight behind it.
+async fn wait_for_first_upload(log: &EventLog) {
+	let deadline = std::time::Instant::now() + Duration::from_secs(180);
+	while uploads(log) == 0 {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the pass never got as far as uploading"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
 }
 
 // ===========================================================================
@@ -1169,15 +1194,232 @@ async fn control_17_reconfigure_root_safe() {
 	// populated safety, no mass-delete, coherent new baseline.
 }
 
-// `pause_pair` deliberately does NOT interrupt a pass already running — it stops the NEXT one —
-// so this test's premise ("no NEW actions begin, in-flight action atomic/rolled back") is not the
-// contract; whether pause should also preempt is an owner call, and asserting it needs the same
-// mid-pass barrier CONTROL-14 wants.
-#[ignore = "blocked: pause does not preempt an in-flight pass by design; needs an owner decision plus a mid-pass barrier"]
+/// CONTROL-18 — a pause reaches into the pass already running. Suspended, its action loop starts
+/// nothing new; escalated by its `cancel_after`, it drops what is in flight, says how many actions
+/// it did not carry out, and leaves the two sides coherent: everything the report counted is on the
+/// remote, everything it did not is owed to the next pass, and that pass finishes the job without
+/// re-doing what the first one recorded.
+///
+/// The pass is driven with more files than the client's transfer concurrency, so there is always a
+/// queue behind the transfers in flight for the pause to land in front of. One of them is big
+/// enough to still be uploading when the window elapses — sorted first, so it is in the very first
+/// batch of transfers — so the escalation drops a live network op rather than only unwinding the
+/// actions parked behind it.
 #[shared_test_runtime]
 async fn control_18_pause_mid_pass_coherent() {
-	// plan: start a many-action pass; pause mid-apply; assert no NEW actions begin, in-flight action
-	// atomic/rolled back, resume converges byte-exact, baseline only reflects completed actions.
+	const SMALL: usize = 60;
+	/// Every planned action: the small files plus the big one.
+	const N: usize = SMALL + 1;
+
+	let (resources, cache, remote, local) = raw_setup("c18").await;
+	for i in 0..SMALL {
+		write_file(
+			&local,
+			&format!("f{i:02}.txt"),
+			format!("content {i}").as_bytes(),
+		);
+	}
+	let big = vec![0x5a_u8; 16 * 1024 * 1024];
+	write_file(&local, "big.bin", &big);
+	let engine = Arc::new(
+		SyncEngine::open(cache.client.clone(), temp_cache_path())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+
+	let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+	let running = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		let log = log.clone();
+		async move {
+			let mut observer = recording_observer(log);
+			engine
+				.sync_once_observed(pair, &mut observer)
+				.await
+				.unwrap()
+		}
+	});
+	// Land the pause on a pass that is provably TRANSFERRING, so the escalation has transfers in
+	// flight to drop — a pause that arrives while the pass is still scanning or queueing on the
+	// drive lock would prove only that the action loop never started.
+	wait_for_first_upload(&log).await;
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Suspend,
+				cancel_after: Some(Duration::from_secs(2)),
+			},
+		)
+		.await
+		.unwrap();
+
+	let first = tokio::time::timeout(Duration::from_secs(300), running)
+		.await
+		.expect("the suspended pass never escalated into a cancel")
+		.unwrap();
+	assert!(first.errors.is_empty(), "{first:?}");
+	assert!(
+		first.uploaded > 0,
+		"the pause was supposed to land on a pass mid-transfer: {first:?}"
+	);
+	assert!(
+		first.interrupted > 0,
+		"the pause never reached the pass in flight: {first:?}"
+	);
+	assert_eq!(
+		first.uploaded + first.interrupted,
+		N,
+		"every planned action must be either done or counted as interrupted: {first:?}"
+	);
+	assert!(
+		engine.is_paused(pair).await,
+		"the pair must still be paused after its suspension escalated"
+	);
+
+	// Every upload the report counted is really on the remote, and nothing beyond the plan is. The
+	// remote can hold a FEW more than the report claims: an upload dropped after the server
+	// committed its `upload/done`, with the response still in flight, made a file that nothing
+	// recorded. That is why it counts as interrupted — the next pass owes it.
+	let (_dirs, files) = list_remote(&resources).await;
+	assert!(
+		(first.uploaded..=N).contains(&files.len()),
+		"the remote holds {} file(s), outside what the interrupted pass could have created: {first:?}",
+		files.len()
+	);
+
+	// And the next pass finishes the job without re-doing anything already recorded.
+	engine.resume_pair(pair).await.unwrap();
+	let second = engine.sync_once(pair).await.unwrap();
+	assert!(second.errors.is_empty(), "{second:?}");
+	assert_eq!(second.interrupted, 0, "{second:?}");
+	assert!(
+		second.uploaded <= N - first.uploaded,
+		"the pass after the interruption re-did work the first one had already recorded: {second:?}"
+	);
+	let (_dirs, files) = list_remote(&resources).await;
+	assert_eq!(
+		files.len(),
+		N,
+		"the two passes together must leave every file on the remote exactly once"
+	);
+	// Converged: nothing of the interruption is left for a third pass to clean up.
+	let third = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		(third.uploaded, third.downloaded, third.interrupted),
+		(0, 0, 0),
+		"the interruption left work behind: {third:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// CONTROL-18b — a SUSPENDED pass is parked, not abandoned: while the pair is paused it starts no
+/// further action, and the resume carries THAT SAME pass to the end — every file uploaded exactly
+/// once, nothing re-transferred and nothing left behind.
+#[shared_test_runtime]
+async fn control_18b_suspend_parks_and_resume_finishes_the_pass() {
+	const N: usize = 60;
+	const PARKED: Duration = Duration::from_secs(5);
+
+	let (resources, cache, remote, local) = raw_setup("c18b").await;
+	for i in 0..N {
+		write_file(
+			&local,
+			&format!("f{i:02}.txt"),
+			format!("content {i}").as_bytes(),
+		);
+	}
+	let engine = Arc::new(
+		SyncEngine::open(cache.client.clone(), temp_cache_path())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+
+	let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+	let running = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		let log = log.clone();
+		async move {
+			let mut observer = recording_observer(log);
+			engine
+				.sync_once_observed(pair, &mut observer)
+				.await
+				.unwrap()
+		}
+	});
+	// Suspend a pass that is provably transferring, so what parks is the action loop itself.
+	wait_for_first_upload(&log).await;
+	// A far-off escalation window: this test is about the parking, and the resume below is what
+	// ends it — but a bounded window means a failing run releases the drive lock by itself.
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Suspend,
+				cancel_after: Some(Duration::from_secs(120)),
+			},
+		)
+		.await
+		.unwrap();
+
+	// Parked: the transfers already in flight drain, and then nothing else starts. Two readings a
+	// while apart, the second equal to the first, is the action loop standing still.
+	tokio::time::sleep(PARKED).await;
+	let parked_at = uploads(&log);
+	tokio::time::sleep(PARKED).await;
+	assert_eq!(
+		uploads(&log),
+		parked_at,
+		"a suspended pass kept starting actions"
+	);
+	assert!(
+		(1..N).contains(&parked_at),
+		"the pause reached a pass that was not transferring, or one already finished: {parked_at}"
+	);
+	assert!(
+		!running.is_finished(),
+		"a suspended pass must stay alive, not return"
+	);
+
+	engine.resume_pair(pair).await.unwrap();
+	let report = tokio::time::timeout(Duration::from_secs(300), running)
+		.await
+		.expect("the resumed pass never finished")
+		.unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(
+		report.interrupted, 0,
+		"a suspension that was resumed interrupts nothing: {report:?}"
+	);
+	assert_eq!(
+		report.uploaded, N,
+		"the resumed pass must finish the job it parked in the middle of: {report:?}"
+	);
+
+	let (_dirs, files) = list_remote(&resources).await;
+	assert_eq!(
+		files.len(),
+		N,
+		"the remote is missing files, or holds extras"
+	);
+	// And with the pass finished properly there is nothing left over for the next one.
+	let after = engine.sync_once(pair).await.unwrap();
+	assert_eq!(
+		(after.uploaded, after.downloaded, after.interrupted),
+		(0, 0, 0),
+		"the resumed pass left work behind: {after:?}"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 /// CONTROL-19 — removing ONE of several pairs affects only that pair: the others keep converging,

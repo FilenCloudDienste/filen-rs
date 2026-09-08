@@ -24,6 +24,7 @@ mod events;
 mod guard;
 mod mode;
 mod outcome;
+mod pause;
 mod plan;
 mod scan;
 mod watch;
@@ -38,4 +39,5 @@ pub use outcome::{
 	PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, RefuseReason,
 	UnsyncablePath, UnsyncableReason,
 };
+pub use pause::{DEFAULT_CANCEL_AFTER, PauseMode, PauseOptions};
 pub use watch::{WatchConfig, WatchHandle, WatchState, WatchStatus};
