@@ -24,7 +24,7 @@ use filen_sdk_rs::{
 		dir::RemoteDirectory,
 		file::RemoteFile,
 	},
-	sync_engine::{SyncEngine, SyncEvent, SyncMode, WatchConfig},
+	sync_engine::{SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState},
 };
 use uuid::Uuid;
 
@@ -1703,8 +1703,12 @@ async fn watch_26_remove_pair_stops_events() {
 
 	engine.remove_pair(pair).await.unwrap();
 	assert!(
-		wait_until(WATCH_SETTLE, || status.borrow().stopped).await,
-		"the watch never reported itself stopped after its pair was removed (passes={})",
+		wait_until(WATCH_SETTLE, || {
+			status.borrow().state == WatchState::PairRemoved
+		})
+		.await,
+		"the watch never reported its pair removed (state={:?}, passes={})",
+		status.borrow().state,
 		log.passes()
 	);
 
