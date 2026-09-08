@@ -81,8 +81,14 @@ pub struct SyncReport {
 	/// Per-action failures (the pass continues past them).
 	pub errors: Vec<String>,
 	/// The pair is PAUSED (see [`SyncEngine::pause_pair`](super::SyncEngine::pause_pair)): the pass
-	/// scanned nothing, planned nothing and applied nothing, so every field above is at its zero
-	/// value. Not the same as a pass that ran and found nothing to do.
+	/// planned nothing, wrote no baseline row and applied nothing, so every field above is at its
+	/// zero value. Not the same as a pass that ran and found nothing to do.
+	///
+	/// Two shapes report the same way. A pass that never started — the pair was already paused when
+	/// it was asked for — read neither side. A pass a cancel dropped while it was still READING the
+	/// two sides may have got as far as finishing its local scan and retiring the journal records
+	/// that scan settled; it had no plan, so there was nothing to count as
+	/// [`interrupted`](Self::interrupted) and nothing to undo.
 	pub paused: bool,
 	/// How many planned actions this pass did NOT carry out because the pair was paused with
 	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran — the transfer dropped in
