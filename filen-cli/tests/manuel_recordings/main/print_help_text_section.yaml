@@ -1,0 +1,66 @@
+# Manuel recording file
+
+# (manuel) filen help auth                                                                                              #
+# Authentication                                                                                                        #
+#                                                                                                                       #
+# There are multiple ways to authenticate:                                                                              #
+# - set the CLI arguments `--email` (or environment variable `FILEN_CLI_EMAIL`)                                         #
+#   and `--password` (`FILEN_CLI_PASSWORD`), optionally `--two-factor-code` (`FILEN_CLI_2FA_CODE`)                      #
+#   (when the two-factor code is omitted and required, you will be prompted for it)                                     #
+# - specify an auth config via the `--auth-config-path` flag                                                            #
+#   (exported via `filen export-auth-config`),                                                                          #
+#   or put an auth config in one of the default locations:                                                              #
+#   (unless overwritten by the `--config-dir` flag)                                                                     #
+#   - `./filen-cli-auth-config.txt` (current working directory)                                                         #
+#   - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`                                                         #
+#   - Windows: `%appdata%\filen-cli\filen-cli-auth-config.txt`                                                          #
+# - if none of these is set, you will be prompted for credentials,                                                      #
+#   with the option to save them securely in the system keychain                                                        #
+#                                                                                                                       #
+# ┃ export-auth-config                                                                                                  #
+# ┃ Export an auth config (to be used with --auth-config-path option)                                                   #
+#                                                                                                                       #
+# ┃ logout                                                                                                              #
+# ┃ Delete saved credentials and exit                                                                                   #
+# (manuel)                                                                                                              #
+#                                                                                                                       #
+
+terminal_width: 118
+recording_items:
+- !Output "\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 110
+- !Input
+  - 32
+- !Input
+  - 104
+- !Input
+  - 101
+- !Input
+  - 108
+- !Input
+  - 112
+- !Input
+  - 32
+- !Input
+  - 97
+- !Input
+  - 117
+- !Input
+  - 116
+- !Input
+  - 104
+- !Input
+  - 2
+- !Output "filen help auth\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[1m\e[4mAuthentication\e[0m\r\n\r\nThere are multiple ways to authenticate:\r\n- set the CLI arguments `--email` (or environment variable `FILEN_CLI_EMAIL`)\r\n  and `--password` (`FILEN_CLI_PASSWORD`), optionally `--two-factor-code` (`FILEN_CLI_2FA_CODE`)\r\n  (when the two-factor code is omitted and required, you will be prompted for it)\r\n- specify an auth config via the `--auth-config-path` flag\r\n  (exported via `filen export-auth-config`),\r\n  or put an auth config in one of the default locations:\r\n  (unless overwritten by the `--config-dir` flag)\r\n  - `./filen-cli-auth-config.txt` (current working directory)\r\n  - Linux/macOS: `$HOME/.filen-cli/filen-cli-auth-config.txt`\r\n  - Windows: `%appdata%\\filen-cli\\filen-cli-auth-config.txt`\r\n- if none of these is set, you will be prompted for credentials,\r\n  with the option to save them securely in the system keychain\r\n\r\n┃ \e[4m\e[32mexport-auth-config\e[0m\r\n┃ Export an auth config (to be used with --auth-config-path option)\r\n\r\n┃ \e[4m\e[32mlogout\e[0m\r\n┃ Delete saved credentials and exit\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "

@@ -143,8 +143,12 @@ pub(crate) enum Commands {
 		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 	},
-	/// List trashed items with option to restore or permanently delete them
+	/// List trashed items
 	ListTrash,
+	/// Restore a trashed item interactively
+	TrashRestore,
+	/// Permanently delete a trashed item interactively
+	TrashDelete,
 	/// Permanently delete all trashed items
 	EmptyTrash,
 	/// Export an auth config (to be used with --auth-config-path option)
@@ -313,6 +317,14 @@ pub(crate) async fn execute_command(
 		}
 		Commands::ListTrash => {
 			list_trash(ui, client).await?;
+			None
+		}
+		Commands::TrashRestore => {
+			select_trash_item(ui, client, TrashAction::Restore).await?;
+			None
+		}
+		Commands::TrashDelete => {
+			select_trash_item(ui, client, TrashAction::Delete).await?;
 			None
 		}
 		Commands::EmptyTrash => {
@@ -1173,6 +1185,139 @@ async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 		.await
 		.context("Failed to list trash")?;
 	print_items_after_list(ui, dirs, files, Some("Trash"))
+}
+
+enum TrashAction {
+	Restore,
+	Delete,
+}
+
+enum TrashItem {
+	Dir(RemoteDirectory),
+	File(RemoteFile),
+}
+
+impl TrashItem {
+	fn uuid_string(&self) -> String {
+		match self {
+			TrashItem::Dir(dir) => dir.uuid().to_string(),
+			TrashItem::File(file) => file.uuid().to_string(),
+		}
+	}
+}
+
+/// Lists the trash and lets the user pick one item to restore or permanently delete.
+async fn select_trash_item(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	action: TrashAction,
+) -> Result<()> {
+	let client = client.get(ui).await?;
+	let (dirs, files) = client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list trash")?;
+
+	// directories first, each group sorted by name, like `ls` prints them
+	let mut items = dirs
+		.into_iter()
+		.map(|dir| {
+			let name = dir
+				.name()
+				.map(str::to_string)
+				.unwrap_or_else(|| dir.uuid().to_string());
+			(name, TrashItem::Dir(dir))
+		})
+		.collect::<Vec<(String, TrashItem)>>();
+	items.sort_by(|(a, _), (b, _)| a.cmp(b));
+	let mut file_items = files
+		.into_iter()
+		.map(|file| {
+			let name = file
+				.name()
+				.map(str::to_string)
+				.unwrap_or_else(|| file.uuid().to_string());
+			(name, TrashItem::File(file))
+		})
+		.collect::<Vec<(String, TrashItem)>>();
+	file_items.sort_by(|(a, _), (b, _)| a.cmp(b));
+	items.append(&mut file_items);
+	if items.is_empty() {
+		ui.print_muted("Trash is empty");
+		return Ok(());
+	}
+
+	// mark directories with a trailing slash, and disambiguate items that share a name by
+	// their UUID, so every option maps back to exactly one item
+	let options = items
+		.iter()
+		.map(|(name, item)| {
+			let mut label = match item {
+				TrashItem::Dir(_) => format!("{}/", name),
+				TrashItem::File(_) => name.clone(),
+			};
+			if items.iter().filter(|(other, _)| other == name).count() > 1 {
+				label.push_str(&format!(" ({})", item.uuid_string()));
+			}
+			label
+		})
+		.collect::<Vec<String>>();
+	let Some(selection) = ui.prompt_select(
+		match action {
+			TrashAction::Restore => "Select an item to restore",
+			TrashAction::Delete => "Select an item to permanently delete",
+		},
+		options.clone(),
+	)?
+	else {
+		return Ok(());
+	};
+	let index = options
+		.iter()
+		.position(|option| *option == selection)
+		.context("Failed to resolve selected item")?;
+	let (name, item) = items.remove(index);
+
+	match action {
+		TrashAction::Restore => match item {
+			TrashItem::Dir(mut dir) => {
+				client
+					.restore_dir(&mut dir)
+					.await
+					.context("Failed to restore directory")?;
+				ui.print_success(&format!("Restored directory: {}", name));
+			}
+			TrashItem::File(mut file) => {
+				client
+					.restore_file(&mut file)
+					.await
+					.context("Failed to restore file")?;
+				ui.print_success(&format!("Restored file: {}", name));
+			}
+		},
+		TrashAction::Delete => {
+			if !ui.prompt_confirm(&format!("Permanently delete {}?", name), false)? {
+				return Ok(());
+			}
+			match item {
+				TrashItem::Dir(dir) => {
+					client
+						.delete_dir_permanently(dir)
+						.await
+						.context("Failed to permanently delete directory")?;
+					ui.print_success(&format!("Permanently deleted directory: {}", name));
+				}
+				TrashItem::File(file) => {
+					client
+						.delete_file_permanently(file)
+						.await
+						.context("Failed to permanently delete file")?;
+					ui.print_success(&format!("Permanently deleted file: {}", name));
+				}
+			}
+		}
+	}
+	Ok(())
 }
 
 async fn empty_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {

@@ -423,6 +423,37 @@ impl UI {
 		}
 	}
 
+	/// Prompt the user for a selection from a list of options
+	pub(crate) fn prompt_select(
+		&mut self,
+		msg: &str,
+		options: Vec<String>,
+	) -> Result<Option<String>> {
+		info!(
+			"[PROMPT] prompt_select with message: {} and options: {:?}",
+			msg, options
+		);
+		let result = inquire::Select::new(
+			&self.redact_for_replay_testing(msg.trim().to_string()),
+			options,
+		)
+		.prompt();
+		match result {
+			Ok(answer) => {
+				info!("[PROMPT] answer: {}", answer);
+				Ok(Some(answer.to_string()))
+			}
+			Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+				info!("[PROMPT] canceled");
+				Ok(None)
+			}
+			Err(InquireError::IO(_)) | Err(InquireError::NotTTY) => {
+				Err(anyhow::anyhow!("{}", FAILED_TO_READ_INPUT_PROMPT))
+			}
+			Err(e) => Err(anyhow::anyhow!("Failed to read input prompt: {}", e)),
+		}
+	}
+
 	// format help text
 
 	pub(crate) fn format_command_help(cmd: &mut clap::Command) -> String {
