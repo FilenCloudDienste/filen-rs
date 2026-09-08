@@ -5,7 +5,7 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
-	collections::{BTreeSet, HashMap, HashSet},
+	collections::{BTreeSet, HashMap},
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -26,6 +26,7 @@ use super::{
 		PlanOutcome, PlannedAction, PlannedConflict, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
 	},
+	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	scan::{self, LocalScan, ScanError},
 };
@@ -537,9 +538,12 @@ pub struct SyncEngine {
 	/// inserts into it, with an `await` in between, so two concurrent registrations would otherwise
 	/// both find the roots free and both commit — the exact overlap the check exists to refuse.
 	registrations: Mutex<()>,
-	/// The pairs currently paused (see [`SyncEngine::pause_pair`]). Mirrors the `paused` column,
-	/// which is the source of truth across restarts; this copy is what every pass consults.
-	paused: Mutex<HashSet<PairId>>,
+	/// The live pause state of every pair the engine has had to look at, one
+	/// [`watch`](tokio::sync::watch) channel each (see [`SyncEngine::pause_pair_with`]). It mirrors
+	/// the persisted `paused` column — which stays the source of truth across restarts — and adds
+	/// what the pass IN FLIGHT must do about the pause, which is process-local by nature: a restart
+	/// has no pass to suspend. Bounded by the pair count; an entry goes with its pair.
+	paused: Mutex<HashMap<PairId, tokio::sync::watch::Sender<PassControl>>>,
 	/// One removal signal per pair that has been watched: [`remove_pair`](SyncEngine::remove_pair)
 	/// flips it and drops it, so the pair's watch loops stop instead of failing every pass against a
 	/// pair that no longer exists — and a pair re-registered under the same id (sqlite reuses one)
@@ -811,11 +815,19 @@ impl SyncEngine {
 				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
 			})??;
 		// A pair paused by an earlier session stays paused: read the flags before the store moves
-		// into the engine, so no pass can run against an empty set in the meantime.
+		// into the engine, so no pass can run against an empty map in the meantime. The pass that
+		// session had in flight died with it, so every pair comes back on the DEFAULT pause options
+		// — there is nothing left for a mode to apply to.
 		let paused = store
 			.paused_pairs()
 			.map_err(|e| db_error(e, "loading paused sync pairs"))?
 			.into_iter()
+			.map(|pair| {
+				(
+					pair,
+					tokio::sync::watch::channel(PassControl::pausing(PauseOptions::default())).0,
+				)
+			})
 			.collect();
 		let engine = Self {
 			client,
@@ -1302,7 +1314,7 @@ impl SyncEngine {
 	///
 	/// A watch running on the pair STOPS: its loop has nothing left to sync, and every pass it tried
 	/// would fail against a pair that is gone. The loop finishes whatever pass is in flight, then
-	/// ends and publishes a [`stopped`](super::WatchStatus::stopped) status; its
+	/// ends and publishes a [`PairRemoved`](super::WatchState::PairRemoved) status; its
 	/// [`WatchHandle`](super::WatchHandle) stays valid, so a caller holding one can still drop or
 	/// stop it. That last pass may still be writing when this returns — its baseline and journal
 	/// writes name a pair id this retires for good, so they fail rather than land in a pair added
@@ -1326,9 +1338,13 @@ impl SyncEngine {
 		store
 			.delete_pair(pair)
 			.map_err(|e| db_error(e, "removing a sync pair"))?;
-		// Under the same lock as the delete, and as `set_paused`'s own write: a pause that landed in
-		// between would leave the set holding an id whose row is gone.
-		self.paused.lock().await.remove(&pair);
+		// Under the same lock as the delete, and as `set_control`'s own write: a pause that landed
+		// in between would leave the map holding an id whose row is gone. A pass PARKED on this
+		// pair's pause is cut loose rather than left waiting for a resume that can no longer be
+		// asked for — the pair it would sync is gone.
+		if let Some(control) = self.paused.lock().await.remove(&pair) {
+			cancel_suspension(&control);
+		}
 		Ok(())
 	}
 
@@ -1338,31 +1354,126 @@ impl SyncEngine {
 	/// change signal pending, so the first pass after [`resume_pair`](Self::resume_pair) catches
 	/// up on everything at once.
 	///
+	/// A pass that is ALREADY RUNNING is suspended: it parks before its next action and resumes
+	/// exactly where it stopped, giving up its transfers only if the pause outlives
+	/// [`DEFAULT_CANCEL_AFTER`](super::DEFAULT_CANCEL_AFTER) —
+	/// [`pause_pair_with`](Self::pause_pair_with) is where that choice lives, and this is
+	/// [`PauseOptions::default`].
+	///
 	/// A pause does NOT tear the pair down: its filesystem watcher and its cache sync-root
 	/// subscription stay registered. Dropping the subscription would untrack the root in the cache,
 	/// and re-registering it would then relist the whole root under the drive lock — a resync
 	/// nobody asked for as the price of resuming.
 	///
 	/// The flag is persisted with the pair, so an engine reopened on the same baseline DB comes
-	/// back paused. Pausing an already-paused pair is a no-op; an unknown pair is an error. A pair
-	/// that is already paused cannot be WATCHED, either — [`watch`](Self::watch) refuses it rather
-	/// than hand out a handle whose loop does nothing.
+	/// back paused (a suspended PASS is process-local: a restart has nothing to resume, and nothing
+	/// was half-written). Pausing an already-paused pair re-applies the options; an unknown pair is
+	/// an error. A pair that is already paused cannot be WATCHED, either — [`watch`](Self::watch)
+	/// refuses it rather than hand out a handle whose loop does nothing.
 	pub async fn pause_pair(&self, pair: PairId) -> Result<(), Error> {
-		self.set_paused(pair, true).await
+		self.pause_pair_with(pair, PauseOptions::default()).await
+	}
+
+	/// [`pause_pair`](Self::pause_pair), choosing what happens to the pass already in flight.
+	///
+	/// * [`PauseMode::Suspend`](super::PauseMode::Suspend) parks that pass between actions and
+	///   keeps it alive: a resume continues the same pass, with the same plan, the same drive lock
+	///   and everything it had already done. A transfer already running finishes — the native
+	///   upload/download paths poll no pause signal of their own, so there is no mid-transfer park
+	///   to take, and the parking happens at the next action boundary.
+	/// * [`PauseMode::Cancel`](super::PauseMode::Cancel) drops the transfers in flight, skips the
+	///   rest of the plan, and lets the pass return a report whose
+	///   [`interrupted`](SyncReport::interrupted) counts what it did not do. An interrupted action
+	///   records nothing: an interrupted download removes its temp file and puts back whatever it
+	///   had stashed out of its way, an interrupted upload
+	///   normally never reaches the `upload/done` that would make it a file, and a transfer that DID
+	///   finish is never dropped between that and the baseline row recording it. The next pass
+	///   re-plans the remainder — including an upload the server committed as it was dropped, which
+	///   it re-uploads over the same name.
+	///
+	/// [`cancel_after`](PauseOptions::cancel_after) is what converts the first into the second, so a
+	/// UI can offer one button: a short pause resumes its transfers where they were, a long one
+	/// gives them up rather than sit on the drive-write lock. It is counted FROM THIS CALL — the
+	/// deadline is stamped here and shared by every action of the pass, so a countdown shown next to
+	/// the button is the one the pass keeps, whether it parks at once or is still finishing a 500 MB
+	/// upload when the window runs out. Re-issuing the pause with new options restarts it. `None`
+	/// never escalates — the pass then parks until [`resume_pair`](Self::resume_pair) or
+	/// [`cancel_paused_actions`](Self::cancel_paused_actions), holding the drive lock throughout,
+	/// and a [`sync_once`](Self::sync_once) call waiting on that pass waits with it.
+	pub async fn pause_pair_with(&self, pair: PairId, options: PauseOptions) -> Result<(), Error> {
+		self.set_control(pair, PassControl::pausing(options)).await
+	}
+
+	/// Turn a [`suspended`](super::PauseMode::Suspend) pause into a
+	/// [`cancelling`](super::PauseMode::Cancel) one: the pass parked on this pair unwinds now
+	/// instead of waiting out its [`cancel_after`](PauseOptions::cancel_after) window. The pair
+	/// STAYS paused.
+	///
+	/// A pair that is not paused has no pass to unwind and is left alone (pause it first if that is
+	/// what you meant); an unknown pair is an error.
+	pub async fn cancel_paused_actions(&self, pair: PairId) -> Result<(), Error> {
+		cancel_suspension(&self.pair_control(pair).await?);
+		Ok(())
+	}
+
+	/// [`cancel_paused_actions`](Self::cancel_paused_actions) for a caller inside the engine, on a
+	/// pair it need not have checked first: it cuts loose a pass parked on a suspension without
+	/// touching the persisted paused flag. A watch being stopped uses it, so a loop whose pass is
+	/// parked ends instead of waiting for a resume that whoever stopped it is not going to send.
+	pub(super) async fn cancel_suspended_pass(&self, pair: PairId) {
+		if let Some(control) = self.paused.lock().await.get(&pair) {
+			cancel_suspension(control);
+		}
 	}
 
 	/// Resume a [`paused`](Self::pause_pair) pair. Nothing is re-listed and no baseline is
 	/// invalidated: whatever changed on either side while the pair was paused is reconciled by the
-	/// next pass exactly as if it had changed a moment ago. Resuming a running pair is a no-op; an
-	/// unknown pair is an error.
+	/// next pass exactly as if it had changed a moment ago — and a pass SUSPENDED mid-way carries
+	/// on from where it parked. Resuming a running pair is a no-op; an unknown pair is an error.
 	pub async fn resume_pair(&self, pair: PairId) -> Result<(), Error> {
-		self.set_paused(pair, false).await
+		self.set_control(pair, PassControl::Run).await
 	}
 
-	/// Whether `pair` is currently [`paused`](Self::pause_pair). An unknown pair reads as not
-	/// paused (it has no state to be paused in).
+	/// Whether `pair` is currently [`paused`](Self::pause_pair) — in either flavour. An unknown
+	/// pair reads as not paused (it has no state to be paused in).
 	pub async fn is_paused(&self, pair: PairId) -> bool {
-		self.paused.lock().await.contains(&pair)
+		self.paused
+			.lock()
+			.await
+			.get(&pair)
+			.is_some_and(|control| control.borrow().is_paused())
+	}
+
+	/// The checkpoint an apply pass of `pair` parks on, cloned per pass (see the pause module).
+	async fn pass_gate(&self, pair: PairId) -> PassGate {
+		PassGate::new(self.control_channel(pair).await)
+	}
+
+	/// `pair`'s control channel, created (running) if this is the first time anyone asked.
+	async fn control_channel(&self, pair: PairId) -> tokio::sync::watch::Sender<PassControl> {
+		self.paused
+			.lock()
+			.await
+			.entry(pair)
+			.or_insert_with(|| tokio::sync::watch::channel(PassControl::Run).0)
+			.clone()
+	}
+
+	/// `pair`'s control channel, refusing a pair the registry does not know.
+	async fn pair_control(
+		&self,
+		pair: PairId,
+	) -> Result<tokio::sync::watch::Sender<PassControl>, Error> {
+		let store = self.store.lock().await;
+		if store
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.is_none()
+		{
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		drop(store);
+		Ok(self.control_channel(pair).await)
 	}
 
 	/// The pair a watch is about to start on, together with the signal that ends its loop.
@@ -1404,24 +1515,19 @@ impl SyncEngine {
 			.subscribe()
 	}
 
-	async fn set_paused(&self, pair: PairId, paused: bool) -> Result<(), Error> {
+	async fn set_control(&self, pair: PairId, control: PassControl) -> Result<(), Error> {
 		// The persisted flag FIRST: an in-memory pause the DB never learned about would silently
 		// un-pause on the next open, which is the one direction that loses data protection. Both
 		// writes happen under the store lock, so a concurrent `remove_pair` cannot land between
-		// them and leave the set holding a pair it has already deleted.
+		// them and leave the map holding a pair it has already deleted.
 		let store = self.store.lock().await;
 		let known = store
-			.set_paused(pair, paused)
+			.set_paused(pair, control.is_paused())
 			.map_err(|e| db_error(e, "persisting a sync pair's paused flag"))?;
 		if !known {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
-		let mut set = self.paused.lock().await;
-		if paused {
-			set.insert(pair);
-		} else {
-			set.remove(&pair);
-		}
+		self.control_channel(pair).await.send_replace(control);
 		Ok(())
 	}
 
@@ -1475,12 +1581,17 @@ impl SyncEngine {
 				problems.push(format!("{path}: recording the failure count failed: {e}"));
 			}
 		}
-		for path in attempted
-			.iter()
-			.filter(|p| !failed.contains_key(p.as_str()))
-		{
-			if let Err(e) = store.clear_failure(pair, path) {
-				problems.push(format!("{path}: clearing the failure count failed: {e}"));
+		// A pass cut short by a cancel cannot tell which of its actions ran, and an action that
+		// never ran proves nothing about the path: clearing its streak would hand a permanently
+		// broken path a fresh set of retries every time someone pauses. Only the failures count.
+		if report.interrupted == 0 {
+			for path in attempted
+				.iter()
+				.filter(|p| !failed.contains_key(p.as_str()))
+			{
+				if let Err(e) = store.clear_failure(pair, path) {
+					problems.push(format!("{path}: clearing the failure count failed: {e}"));
+				}
 			}
 		}
 		report.errors.extend(problems);
@@ -1510,6 +1621,12 @@ impl SyncEngine {
 	/// Run one full sync pass: plan, screen, and apply against the remote and local tree. A
 	/// [`paused`](Self::pause_pair) pair returns a report marked
 	/// [`paused`](SyncReport::paused) instead, having read neither side.
+	///
+	/// A pause that lands WHILE this runs reaches into the pass (see
+	/// [`pause_pair_with`](Self::pause_pair_with)): a suspension parks it — this call keeps waiting,
+	/// so whoever wants it back must resume the pair or cancel its actions — and a cancel returns
+	/// the pass's report early, with [`interrupted`](SyncReport::interrupted) counting what it did
+	/// not do.
 	pub async fn sync_once(&self, pair: PairId) -> Result<SyncReport, Error> {
 		self.sync_once_observed(pair, &mut |_| {}).await
 	}
@@ -1655,6 +1772,8 @@ impl SyncEngine {
 		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
 
 		let local_root = PathBuf::from(&prep.record.local_root);
+		// Pausing the pair from here on reaches INTO this pass (see `pause_pair_with`).
+		let gate = self.pass_gate(pair).await;
 		let ctx = ApplyContext {
 			client: &self.client,
 			local_root: &local_root,
@@ -1669,6 +1788,7 @@ impl SyncEngine {
 			files: &prep.files,
 			pending: &self.pending,
 			observed: &self.observed,
+			gate: &gate,
 		};
 		let attempted: Vec<String> = decision
 			.safe
@@ -1678,7 +1798,7 @@ impl SyncEngine {
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
 		self.note_path_outcomes(pair, &attempted, &mut report).await;
 		tracing::debug!(
-			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} deferred, {} error(s)",
+			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} deferred, {} interrupted, {} error(s)",
 			report.uploaded,
 			report.downloaded,
 			report.remote_dirs_created,
@@ -1690,6 +1810,7 @@ impl SyncEngine {
 			report.conflicts.len(),
 			report.held_deletions(),
 			report.deferred_paths,
+			report.interrupted,
 			report.errors.len(),
 		);
 		observer(SyncEvent::PassCompleted {

@@ -24,7 +24,9 @@ use filen_sdk_rs::{
 		dir::RemoteDirectory,
 		file::RemoteFile,
 	},
-	sync_engine::{SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState},
+	sync_engine::{
+		PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState,
+	},
 };
 use uuid::Uuid;
 
@@ -1750,6 +1752,187 @@ async fn watch_26_remove_pair_stops_events() {
 	assert!(
 		t.elapsed() < Duration::from_secs(5),
 		"stopping a watch whose pair was removed hung"
+	);
+
+	sc.cleanup();
+}
+
+// ============================================================================
+// (add) — a pass a pause cut short is re-planned on the resume, not at the net
+// ============================================================================
+
+/// The remainder an interrupted pass reports is owed to the NEXT pass — and under a watch that
+/// pass must come when the pair resumes, not a safety-net interval later. The trigger that started
+/// the interrupted pass is spent, and an interrupted action changes neither side, so nothing else
+/// is left to wake the loop.
+///
+/// Driven as a pull of ONE big file: the cancel drops a download that is really in flight, the pass
+/// completes nothing, and no local rename or remote write happens that could wake the loop by
+/// itself and mask the re-plan this test is about.
+#[shared_test_runtime]
+async fn watch_add_interrupted_pass_replans_on_resume() {
+	// Far enough away that the resumed pass cannot be the net's doing.
+	const NET: Duration = Duration::from_secs(600);
+	const AFTER_RESUME: Duration = Duration::from_secs(120);
+
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::RemoteToLocal).await;
+	// Big enough that the download is still running a moment after the pass reports its plan —
+	// several seconds of transfer against the fraction of a second the cancel below takes to land.
+	let data = vec![0x5a_u8; 48 * 1024 * 1024];
+	let rf = upload_remote(&sc, "big.bin", &data).await;
+	wait_cache_sees(&sc, rf.uuid()).await;
+
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_millis(200),
+				safety_net: NET,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	// Cancel the pass as soon as it says what it planned: by then it is inside its download.
+	assert!(
+		wait_until(WATCH_SETTLE, || log
+			.count(|e| matches!(e, SyncEvent::Planned { .. }))
+			> 0)
+		.await,
+		"the watch never planned its initial pass"
+	);
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Cancel,
+				cancel_after: None,
+			},
+		)
+		.await
+		.unwrap();
+	assert!(
+		wait_until(WATCH_SETTLE, || log
+			.count(|e| matches!(e, SyncEvent::Interrupted { .. }))
+			> 0)
+		.await,
+		"the pause never reached the pass in flight (passes={}, down={})",
+		log.passes(),
+		log.downloaded()
+	);
+	assert_eq!(
+		log.downloaded(),
+		0,
+		"the download finished before the cancel could drop it — nothing was interrupted"
+	);
+	assert!(
+		!sc.local.join("big.bin").exists(),
+		"the dropped download left its target behind"
+	);
+
+	// The remainder must land on the resume, not on the safety net.
+	engine.resume_pair(pair).await.unwrap();
+	assert!(
+		wait_until(AFTER_RESUME, || log.downloaded() >= 1).await,
+		"the interrupted pass's remainder waited for the safety net instead of the resume \
+		 (passes={}, down={})",
+		log.passes(),
+		log.downloaded()
+	);
+	assert!(
+		read_eq(&sc.local, "big.bin", &data),
+		"the re-planned download did not reproduce the file"
+	);
+
+	handle.stop().await;
+	sc.cleanup();
+}
+
+// ============================================================================
+// (add) — stopping a watch outlasts a pause issued after the stop
+// ============================================================================
+
+/// Stopping a watch gives up a pass parked on a pause so the loop can end — including a pause that
+/// lands AFTER the stop, which is the one nobody is left to reverse. With no escalation window of
+/// its own, such a pause would otherwise park the pass for ever, with
+/// [`WatchHandle::stop`](filen_sdk_rs::sync_engine::WatchHandle::stop) waiting on it and the pass
+/// sitting on the drive-write lock. An app shutting down (stop the watches, then pause the pairs)
+/// hits exactly this order.
+#[shared_test_runtime]
+async fn watch_add_stop_outlasts_a_pause_issued_after_it() {
+	const N: usize = 60;
+	const STOP_WITHIN: Duration = Duration::from_secs(120);
+
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::LocalToRemote).await;
+	// Written before the watch starts, so the initial pass is the one uploading them; far more
+	// than the transfer concurrency, so the action loop still has a queue when the stop lands.
+	for i in 0..N {
+		write_file(
+			&sc.local,
+			&format!("f{i:02}.txt"),
+			format!("c{i}").as_bytes(),
+		);
+	}
+
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_millis(200),
+				safety_net: Duration::from_secs(600),
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+	assert!(
+		wait_until(WATCH_SETTLE, || log
+			.count(|e| matches!(e, SyncEvent::Uploading { .. }))
+			> 0)
+		.await,
+		"the watch never got as far as uploading"
+	);
+	assert_eq!(
+		log.passes(),
+		0,
+		"the pass finished before the stop could land on it"
+	);
+
+	// The pause arrives a moment into the stop, with no window of its own: only the stop's own
+	// un-parking can end it.
+	let pausing = tokio::spawn({
+		let engine = Arc::clone(&engine);
+		async move {
+			tokio::time::sleep(Duration::from_secs(1)).await;
+			engine
+				.pause_pair_with(
+					pair,
+					PauseOptions {
+						mode: PauseMode::Suspend,
+						cancel_after: None,
+					},
+				)
+				.await
+				.unwrap();
+		}
+	});
+	assert!(
+		tokio::time::timeout(STOP_WITHIN, handle.stop())
+			.await
+			.is_ok(),
+		"stopping the watch waited on a pass parked by a pause issued after the stop"
+	);
+	pausing.await.unwrap();
+	assert!(
+		engine.is_paused(pair).await,
+		"stopping the watch must leave the pair paused"
 	);
 
 	sc.cleanup();
