@@ -178,8 +178,9 @@ jobs:
       - name: Run clippy Android
         run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy Android uniffi
-        # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked.
-        run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache -- -D warnings
+        # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked, and
+        # `sync-engine` so it keeps compiling here even though mobile does not ship it yet.
+        run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run clippy all features
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run clippy single-threaded
@@ -193,8 +194,9 @@ jobs:
       - name: Run clippy iOS
         run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy iOS uniffi
-        # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked.
-        run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache -- -D warnings
+        # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked, and
+        # `sync-engine` so it keeps compiling here even though mobile does not ship it yet.
+        run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run unit tests
         run: cargo test --lib -F cache,sync-engine --no-fail-fast
         env:
