@@ -127,6 +127,16 @@ pub(crate) enum BaselineState {
 	/// A two-way conflict was surfaced for this path; it is excluded from further passes until the
 	/// caller resolves it.
 	Conflicted,
+	/// The DESTINATION's copy of an item the source no longer has, adopted at a mode switch
+	/// ([`Backlog::AdoptDestination`](super::mode::Backlog::AdoptDestination)). The row records
+	/// what the destination held at that moment.
+	///
+	/// It is not a synced state and never classifies anything: the reconcile reads such a path as
+	/// having no baseline at all, so the item reads as newly created on the side that has it. What
+	/// the row adds is one thing — a one-way mode does NOT delete the destination's copy while the
+	/// source is still empty there. The row retires the moment either side moves: the two sides
+	/// converging adopts a `Synced` row over it, and both sides losing the path drops it.
+	Adopted,
 }
 
 impl BaselineState {
@@ -134,6 +144,7 @@ impl BaselineState {
 		match self {
 			Self::Synced => 0,
 			Self::Conflicted => 1,
+			Self::Adopted => 2,
 		}
 	}
 
@@ -141,6 +152,7 @@ impl BaselineState {
 		match value {
 			0 => Some(Self::Synced),
 			1 => Some(Self::Conflicted),
+			2 => Some(Self::Adopted),
 			_ => None,
 		}
 	}
@@ -370,12 +382,31 @@ impl BaselineStore {
 	}
 
 	/// Change a registered pair's mode, returning how many rows it touched (0 = unknown pair).
-	/// Only the `sync_pairs` row moves: the pair's baseline is deliberately left alone.
-	pub(crate) fn set_mode(&self, id: PairId, mode: SyncMode) -> rusqlite::Result<usize> {
-		self.conn.execute(
+	///
+	/// `adopted` is the baseline re-seed a
+	/// [`Backlog::AdoptDestination`](super::mode::Backlog::AdoptDestination) switch computed — empty
+	/// for [`Propagate`](super::mode::Backlog::Propagate), where the rows are deliberately left
+	/// alone. The rows and the mode land in ONE transaction: a switch that took effect without its
+	/// re-seed is the propagating behaviour the caller explicitly did not ask for, and the very next
+	/// pass would act on it.
+	pub(crate) fn set_mode(
+		&self,
+		id: PairId,
+		mode: SyncMode,
+		adopted: &[BaselineEntry],
+	) -> rusqlite::Result<usize> {
+		let tx = self.conn.unchecked_transaction()?;
+		let changed = self.conn.execute(
 			"UPDATE sync_pairs SET mode = ?2 WHERE id = ?1",
 			params![id, mode.as_i64()],
-		)
+		)?;
+		if changed > 0 {
+			for entry in adopted {
+				self.upsert_entry(id, entry)?;
+			}
+		}
+		tx.commit()?;
+		Ok(changed)
 	}
 
 	pub(crate) fn pair(&self, id: PairId) -> rusqlite::Result<Option<PairRecord>> {
@@ -1017,13 +1048,73 @@ mod tests {
 		assert_eq!(store.pair(id).unwrap().unwrap().mode, SyncMode::TwoWay);
 
 		// Changing it is an explicit, separate operation.
-		assert_eq!(store.set_mode(id, SyncMode::LocalToRemote).unwrap(), 1);
+		assert_eq!(store.set_mode(id, SyncMode::LocalToRemote, &[]).unwrap(), 1);
 		assert_eq!(
 			store.pair(id).unwrap().unwrap().mode,
 			SyncMode::LocalToRemote
 		);
-		assert_eq!(store.set_mode(9999, SyncMode::TwoWay).unwrap(), 0);
+		assert_eq!(store.set_mode(9999, SyncMode::TwoWay, &[]).unwrap(), 0);
 		assert_eq!(store.list_pairs().unwrap().len(), 1);
+	}
+
+	/// A `Backlog::AdoptDestination` switch writes its re-seeded rows and the new mode together:
+	/// a mode that took effect without them is the propagating behaviour the caller did not ask
+	/// for, and the very next pass would act on it.
+	#[test]
+	fn a_mode_change_and_the_rows_it_adopts_land_together() {
+		let path = temp_db_path("reconfigure");
+		let remote = Uuid::new_v4();
+		let adopted = BaselineEntry {
+			state: BaselineState::Adopted,
+			..file_entry("gone.txt", [4; 32], 7)
+		};
+		let pair = {
+			let store = BaselineStore::open(&path).unwrap();
+			let (pair, _) = store
+				.create_pair("/root", remote, SyncMode::LocalBackup)
+				.unwrap();
+			assert_eq!(
+				store
+					.set_mode(
+						pair,
+						SyncMode::LocalToRemote,
+						std::slice::from_ref(&adopted)
+					)
+					.unwrap(),
+				1
+			);
+			pair
+		};
+
+		let reopened = BaselineStore::open(&path).unwrap();
+		assert_eq!(
+			reopened.pair(pair).unwrap().unwrap().mode,
+			SyncMode::LocalToRemote
+		);
+		assert_eq!(
+			reopened.entry(pair, "gone.txt").unwrap().as_ref(),
+			Some(&adopted),
+			"the adopted row must survive with its state intact"
+		);
+
+		// An unknown pair changes nothing at all — neither a mode nor a stray baseline row.
+		assert_eq!(
+			reopened
+				.set_mode(
+					pair + 9_999,
+					SyncMode::TwoWay,
+					std::slice::from_ref(&adopted)
+				)
+				.unwrap(),
+			0
+		);
+		assert_eq!(reopened.entries(pair + 9_999).unwrap().len(), 0);
+		assert_eq!(
+			reopened.pair(pair).unwrap().unwrap().mode,
+			SyncMode::LocalToRemote
+		);
+		drop(reopened);
+		std::fs::remove_file(&path).ok();
 	}
 
 	#[test]

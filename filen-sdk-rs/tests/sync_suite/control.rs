@@ -17,7 +17,7 @@ use std::time::Duration;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, WatchConfig};
+use filen_sdk_rs::sync_engine::{Backlog, SyncEngine, SyncEvent, SyncMode, WatchConfig};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -1111,7 +1111,7 @@ async fn control_16_reconfigure_mode_prospective() {
 	assert_eq!(r1.uploaded, 3, "{r1:?}");
 
 	sc.engine
-		.reconfigure_pair(sc.pair, SyncMode::TwoWay)
+		.reconfigure_pair(sc.pair, SyncMode::TwoWay, Backlog::Propagate)
 		.await
 		.unwrap();
 
