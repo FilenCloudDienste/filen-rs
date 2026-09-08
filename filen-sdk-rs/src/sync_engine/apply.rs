@@ -766,35 +766,14 @@ async fn apply_one(
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
 			std::fs::rename(&from, &to).map_err(io_err)?;
-			// The row follows the LINEAGE — what the file held at its old path, now at its new
-			// one — not the destination's current remote state. Anchoring it to the latter would
-			// be a lie whenever the move carried a content edit: the renamed copy is still the
-			// PRE-edit one, and a row claiming the new version's hash and size is one the
-			// scanner's fast-path can never catch up with, so the stale bytes would eventually be
-			// pushed back over the remote's edit. The reconciler pairs such a move with a download
-			// that corrects the row; this is what keeps the row honest if that download fails.
-			let base = ctx.baseline.get(from_path);
-			let remote = ctx.remote.get(to_path);
-			delete_baseline(ctx, from_path).await?;
-			upsert_file_baseline(
-				ctx,
+			let row = moved_file_row(
 				to_path,
-				base.and_then(|b| b.remote_uuid)
-					.or_else(|| remote.map(|n| n.remote_uuid)),
-				base.and_then(|b| b.remote_stable_uuid)
-					.or_else(|| remote.and_then(|n| n.stable_uuid)),
-				base.and_then(|b| b.content_hash)
-					.or_else(|| remote.and_then(|n| n.content_hash)),
-				base.and_then(|b| b.size)
-					.or_else(|| remote.map(|n| n.size))
-					.unwrap_or(0),
+				ctx.baseline.get(from_path),
+				ctx.remote.get(to_path),
 				local_mtime_of(&to),
-				remote.map(|n| n.modified_millis),
-				// The row follows the moved file, and so does its agreed content. A move that
-				// carried an edit is paired with a download, which re-records both.
-				base.and_then(|b| b.agreed_hash),
-			)
-			.await?;
+			);
+			delete_baseline(ctx, from_path).await?;
+			upsert_baseline(ctx, &row).await?;
 			report.moved_local += 1;
 		}
 		SyncAction::Conflict { rel_path } => {
@@ -1041,6 +1020,53 @@ fn file_entry(
 		remote_stable_uuid,
 		agreed_hash,
 	}
+}
+
+/// The baseline row a [`SyncAction::MoveLocal`] leaves at the destination — decided purely (no I/O)
+/// so the policy is unit-testable; `local_mtime` is the renamed file's, read by the caller.
+///
+/// The row follows the LINEAGE — what the file held at its old path, now at its new one — not the
+/// destination's current remote state. Anchoring it to the latter would be a lie whenever the move
+/// carried a content edit: the renamed copy is still the PRE-edit one, and a row claiming the new
+/// version's hash and size is one the scanner's fast-path can never catch up with, so the stale
+/// bytes would eventually be pushed back over the remote's edit. The reconciler pairs such a move
+/// with a download that corrects the row; this is what keeps the row honest if that download fails.
+///
+/// The same goes for a row that records NO local content — a `KeepLocal` resolution clears the local
+/// half on purpose and leaves it that way until the re-push. The destination's remote state is not a
+/// stand-in for it: with the kept copy and the remote's the same length, a row carrying the remote's
+/// hash and size would satisfy the scanner's `(size, mtime)` fast path at the new path forever, so
+/// the push the row is waiting for would never happen and the next foreign edit would overwrite the
+/// kept bytes without even a quarantine. Recording nothing makes the scanner re-hash there, which is
+/// what puts the pending push back on the next pass.
+pub(super) fn moved_file_row(
+	to_path: &str,
+	base: Option<&BaselineEntry>,
+	remote: Option<&RemoteNode>,
+	local_mtime: Option<i64>,
+) -> BaselineEntry {
+	let (content_hash, size, local_mtime) = match base.and_then(|b| b.content_hash) {
+		Some(hash) => (
+			Some(hash),
+			base.and_then(|b| b.size).unwrap_or(0),
+			local_mtime,
+		),
+		None => (None, 0, None),
+	};
+	file_entry(
+		to_path,
+		base.and_then(|b| b.remote_uuid)
+			.or_else(|| remote.map(|n| n.remote_uuid)),
+		base.and_then(|b| b.remote_stable_uuid)
+			.or_else(|| remote.and_then(|n| n.stable_uuid)),
+		content_hash,
+		size,
+		local_mtime,
+		remote.map(|n| n.modified_millis),
+		// The row follows the moved file, and so does its agreed content. A move that carried an
+		// edit is paired with a download, which re-records both.
+		base.and_then(|b| b.agreed_hash),
+	)
 }
 
 async fn upsert_dir_baseline(
@@ -1533,6 +1559,47 @@ mod tests {
 		);
 
 		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// A `KeepLocal` resolution clears the row's local half on purpose and leaves it that way until
+	/// the re-push. A move must carry that emptiness across: filling it in from the DESTINATION's
+	/// remote state would record bytes nobody ever compared, and where the kept copy happens to be
+	/// the same length as the remote's the scanner's `(size, mtime)` fast path would vouch for them
+	/// forever — the push the row is waiting for never happens, and the next foreign edit overwrites
+	/// the kept copy without even a quarantine.
+	#[test]
+	fn moving_a_row_with_no_local_content_records_none_at_the_new_path() {
+		let kept = BaselineEntry {
+			content_hash: None,
+			size: None,
+			local_mtime: None,
+			..baseline_file("a.txt", None)
+		};
+		let remote = remote_node("b.txt", Some(Blake3Hash::from([9; 32])));
+
+		let row = moved_file_row("b.txt", Some(&kept), Some(&remote), Some(4242));
+		assert_eq!(
+			row.content_hash, None,
+			"the destination's remote hash is not a stand-in for local content nobody recorded"
+		);
+		assert_eq!(
+			row.local_mtime, None,
+			"nor is there an mtime to fast-path on"
+		);
+		assert_ne!(
+			row.size,
+			Some(remote.size),
+			"nor may the remote's size stand in for it"
+		);
+		// The remote anchor still follows the moved row: that half of it IS on record.
+		assert_eq!(row.remote_uuid, kept.remote_uuid);
+
+		// The negative: an ordinary move carries the local half it does have across untouched.
+		let synced = baseline_file("a.txt", Some(Blake3Hash::from([1; 32])));
+		let row = moved_file_row("b.txt", Some(&synced), Some(&remote), Some(4242));
+		assert_eq!(row.content_hash, synced.content_hash);
+		assert_eq!(row.size, synced.size);
+		assert_eq!(row.local_mtime, Some(4242), "the renamed file's own mtime");
 	}
 
 	#[test]
