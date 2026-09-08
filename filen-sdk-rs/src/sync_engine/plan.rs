@@ -789,6 +789,46 @@ pub(super) fn version_chain_verdict(
 	Some(stood_for.to_std().is_ok_and(|stood| stood >= tenure))
 }
 
+/// The version our own upload buried, if it buried one.
+///
+/// `versions` is the lineage as the server lists it — with the versions this engine minted itself
+/// already filtered out, bar `replaced` — `ours` the version the upload minted and `replaced` the
+/// version the pass's snapshot said the path held. A version that is neither, and that is later
+/// than `replaced`, landed between the pass reading the remote and our upload: another client's
+/// edit that a same-name upload versioned rather than refused — our bytes are on top of it now, and
+/// its author has no way of knowing. The earliest such version is the one our upload buried.
+///
+/// Not read from the chain's ORDER, which cannot answer it: the server records a version's time to
+/// the second, so two versions of one second sort arbitrarily, and our own previous upload is
+/// routinely listed above the version it was later replaced by. The comparison is strict for the
+/// same reason — inside one second the chain cannot say which of two versions came first, and
+/// guessing there costs a conflict on a path nobody but us touched. What that gives up is an
+/// interleave that landed in the very second of the version it displaced; the client that made it
+/// still surfaces its own side of the divergence. The caller strips our own recent uploads first,
+/// which is what the stamps cannot do at all.
+///
+/// `None` when nothing on the chain is later, and when the chain does not carry `replaced` at
+/// all — a versioning-disabled account keeps only the head, which is no evidence either way.
+///
+/// A version that landed on top of OURS between the upload and this listing is later than
+/// `replaced` too, and is reported the same way. It is a concurrent edit whichever of the two is
+/// the remote head, and the resolution reads that from the server.
+pub(super) fn interleaved_version(
+	versions: &[(Uuid, chrono::DateTime<chrono::Utc>)],
+	ours: Uuid,
+	replaced: Uuid,
+) -> Option<Uuid> {
+	let replaced_at = versions
+		.iter()
+		.find(|(uuid, _)| *uuid == replaced)
+		.map(|(_, at)| *at)?;
+	versions
+		.iter()
+		.filter(|(uuid, at)| *uuid != ours && *uuid != replaced && *at > replaced_at)
+		.min_by_key(|(_, at)| *at)
+		.map(|(uuid, _)| *uuid)
+}
+
 /// The baseline rows a [`Backlog::AdoptDestination`](super::mode::Backlog::AdoptDestination) mode
 /// switch writes: one per tracked path where the NEW mode's source side has nothing and the
 /// destination still holds a copy — the standing backlog a backup mode accumulated.
@@ -1369,7 +1409,7 @@ pub(crate) fn reconcile(
 		// A held conflict is never acted on until the caller resolves it — but it IS re-reported
 		// every pass, so a caller watching the reports keeps seeing what is outstanding. Its
 		// subtree is suppressed below, along with any conflict surfaced by this pass.
-		if base.is_some_and(|b| b.state == BaselineState::Conflicted) {
+		if base.is_some_and(|b| b.state.is_conflict()) {
 			actions.push(SyncAction::Conflict {
 				rel_path: key.to_string(),
 			});
@@ -2039,6 +2079,81 @@ mod tests {
 		assert_eq!(
 			version_chain_verdict(&[(foreign, ms(65_000))], ours, foreign, tenure),
 			None
+		);
+	}
+
+	/// The pusher's side of a concurrent edit: what our own upload landed on top of.
+	#[test]
+	fn an_upload_that_landed_on_a_version_this_pass_never_saw_reports_it() {
+		let (ours, replaced, stranger) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+		// The ordinary push: ours is the only version as recent as the one the snapshot showed.
+		assert_eq!(
+			interleaved_version(
+				&[(ours, ms(60_000)), (replaced, ms(30_000))],
+				ours,
+				replaced
+			),
+			None
+		);
+
+		// Somebody else's edit landed on it too — our bytes are on top of it and nothing else this
+		// pass can see says so.
+		let raced = [
+			(ours, ms(60_000)),
+			(stranger, ms(45_000)),
+			(replaced, ms(30_000)),
+		];
+		assert_eq!(
+			interleaved_version(&raced, ours, replaced),
+			Some(stranger),
+			"the version that landed on the one this pass saw is the one we buried"
+		);
+
+		// The same, with the racing pair stamped identically so the listing orders them the other
+		// way round: the answer comes from the stamps, so it does not move.
+		let tied = [
+			(stranger, ms(60_000)),
+			(ours, ms(60_000)),
+			(replaced, ms(30_000)),
+		];
+		assert_eq!(interleaved_version(&tied, ours, replaced), Some(stranger));
+
+		// A version stamped in the very second of the one we replaced is NOT reported: inside one
+		// second the chain cannot say which came first, and our own previous upload lands there
+		// often enough that guessing would hold a conflict on a path nobody else touched. The cost
+		// is a race that tight going unreported on this side — its author still surfaces it.
+		let tied_with_replaced = [
+			(ours, ms(60_000)),
+			(stranger, ms(45_000)),
+			(replaced, ms(45_000)),
+		];
+		assert_eq!(
+			interleaved_version(&tied_with_replaced, ours, replaced),
+			None
+		);
+
+		// Versions older than the one the snapshot showed are the file's history, not an interleave.
+		let older = [
+			(ours, ms(60_000)),
+			(replaced, ms(45_000)),
+			(stranger, ms(10_000)),
+		];
+		assert_eq!(interleaved_version(&older, ours, replaced), None);
+
+		// A chain that does not carry the version we replaced is no evidence about it.
+		assert_eq!(
+			interleaved_version(&[(ours, ms(60_000))], ours, replaced),
+			None
+		);
+		assert_eq!(
+			interleaved_version(
+				&[(stranger, ms(45_000)), (replaced, ms(30_000))],
+				ours,
+				replaced
+			),
+			Some(stranger),
+			"a version on top of the one we replaced counts even when ours is no longer listed"
 		);
 	}
 
