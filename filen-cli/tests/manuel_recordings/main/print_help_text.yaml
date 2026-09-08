@@ -1,0 +1,250 @@
+# Manuel recording file
+
+# (manuel) no-auth                                                                           #
+# (manuel) filen --help                                                                      #
+# Usage                                                                                      #
+#                                                                                            #
+# Welcome to Filen CLI v0.2.7!                                                               #
+#                                                                                            #
+# You can find out more about the Filen CLI at https://github.com/FilenCloudDienste/filen-cl #
+# i-releases                                                                                 #
+#                                                                                            #
+# Invoke the Filen CLI with no command specified to enter interactive mode (REPL).           #
+# There, you can specify absolute paths (starting with "/") or relative paths (supports "."  #
+# and "..").                                                                                 #
+#                                                                                            #
+# Options                                                                                    #
+#                                                                                            #
+# → -v, --verbose...                                                                         #
+#   Increase verbosity (-v, -vv, -vvv)                                                       #
+# → -q, --quiet                                                                              #
+#   Hide progress bars and other non-essential output (overrides -v)                         #
+# → --config-dir <CONFIG_DIR>                                                                #
+#   Config directory (overrides system default)                                              #
+# → -e, --email <EMAIL>                                                                      #
+#   Filen account email (requires --password) [env: FILEN_CLI_EMAIL=]                        #
+# → -p, --password <PASSWORD>                                                                #
+#   Filen account password (requires --email) [env: FILEN_CLI_PASSWORD=]                     #
+# → -t, --two-factor-code <TWO_FACTOR_CODE>                                                  #
+#   Filen account two-factor code (optional, requires --email and --password) [env: FILEN_CL #
+# I_2FA_CODE=]                                                                               #
+# → --auth-config-path <AUTH_CONFIG_PATH>                                                    #
+#   Path to auth config file (exported via `filen export-auth-config`)                       #
+# → --concurrency <CONCURRENCY>                                                              #
+#   Limit concurrent API connections                                                         #
+# → --requests-per-sec <REQUESTS_PER_SEC>                                                    #
+#   Maximum number of API requests per second                                                #
+# → --upload-bandwidth-kbps <UPLOAD_BANDWIDTH_KBPS>                                          #
+#   Cap upload bandwidth, in kilobytes per second                                            #
+# → --download-bandwidth-kbps <DOWNLOAD_BANDWIDTH_KBPS>                                      #
+#   Cap download bandwidth, in kilobytes per second                                          #
+# → --memory-budget-bytes <MEMORY_BUDGET_BYTES>                                              #
+#   Memory budget for file I/O, in bytes                                                     #
+# → --connect-timeout <CONNECT_TIMEOUT>                                                      #
+#   Connection timeout                                                                       #
+# → --skip-update                                                                            #
+#   Skip checking for updates                                                                #
+# → --force-update-check                                                                     #
+#   Force checking for updates                                                               #
+# → --always-update                                                                          #
+#   Force checking for updates and install them automatically. Usually, updates are only ins #
+# talled in REPL mode                                                                        #
+# → --reluctant-autocomplete                                                                 #
+#   Sets autocomplete to be less eager, only completing remote paths after pressing tab      #
+# → --json                                                                                   #
+#   Format command output as machine-readable JSON (where applicable)                        #
+# → -V, --version                                                                            #
+#   Print version                                                                            #
+#                                                                                            #
+# Updates                                                                                    #
+#                                                                                            #
+# The updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-re #
+# leases                                                                                     #
+# when the CLI is run (unless skipped in the 5mins since the last check, or through the `--s #
+# kip-update` flag).                                                                         #
+# The executable will be replaced in place, with the filename updated if it contains the ver #
+# sion number.                                                                               #
+#                                                                                            #
+# Commands                                                                                   #
+#                                                                                            #
+# ┃ help [COMMAND_OR_TOPIC]                                                                  #
+# ┃ Print help about a command or topic (default: general help)                              #
+# ┃ → [COMMAND_OR_TOPIC]  Command or topic to show help about                                #
+#                                                                                            #
+# ┃ view-html-docs                                                                           #
+# ┃ View the documentation (same as --help) locally in a browser rendered as HTML            #
+#                                                                                            #
+# ┃ exit                                                                                     #
+# ┃ Exit the REPL                                                                            #
+#                                                                                            #
+# More help topics                                                                           #
+#                                                                                            #
+# Authentication  → help auth                                                                #
+# Accessing Files  → help access-files                                                       #
+# Transferring Files  → help transfer-files                                                  #
+# Managed Rclone  → help managed-rclone                                                      #
+# (manuel) filen help                                                                        #
+# Usage                                                                                      #
+#                                                                                            #
+# Welcome to Filen CLI v0.2.7!                                                               #
+#                                                                                            #
+# You can find out more about the Filen CLI at https://github.com/FilenCloudDienste/filen-cl #
+# i-releases                                                                                 #
+#                                                                                            #
+# Invoke the Filen CLI with no command specified to enter interactive mode (REPL).           #
+# There, you can specify absolute paths (starting with "/") or relative paths (supports "."  #
+# and "..").                                                                                 #
+#                                                                                            #
+# Options                                                                                    #
+#                                                                                            #
+# → -v, --verbose...                                                                         #
+#   Increase verbosity (-v, -vv, -vvv)                                                       #
+# → -q, --quiet                                                                              #
+#   Hide progress bars and other non-essential output (overrides -v)                         #
+# → --config-dir <CONFIG_DIR>                                                                #
+#   Config directory (overrides system default)                                              #
+# → -e, --email <EMAIL>                                                                      #
+#   Filen account email (requires --password) [env: FILEN_CLI_EMAIL=]                        #
+# → -p, --password <PASSWORD>                                                                #
+#   Filen account password (requires --email) [env: FILEN_CLI_PASSWORD=]                     #
+# → -t, --two-factor-code <TWO_FACTOR_CODE>                                                  #
+#   Filen account two-factor code (optional, requires --email and --password) [env: FILEN_CL #
+# I_2FA_CODE=]                                                                               #
+# → --auth-config-path <AUTH_CONFIG_PATH>                                                    #
+#   Path to auth config file (exported via `filen export-auth-config`)                       #
+# → --concurrency <CONCURRENCY>                                                              #
+#   Limit concurrent API connections                                                         #
+# → --requests-per-sec <REQUESTS_PER_SEC>                                                    #
+#   Maximum number of API requests per second                                                #
+# → --upload-bandwidth-kbps <UPLOAD_BANDWIDTH_KBPS>                                          #
+#   Cap upload bandwidth, in kilobytes per second                                            #
+# → --download-bandwidth-kbps <DOWNLOAD_BANDWIDTH_KBPS>                                      #
+#   Cap download bandwidth, in kilobytes per second                                          #
+# → --memory-budget-bytes <MEMORY_BUDGET_BYTES>                                              #
+#   Memory budget for file I/O, in bytes                                                     #
+# → --connect-timeout <CONNECT_TIMEOUT>                                                      #
+#   Connection timeout                                                                       #
+# → --skip-update                                                                            #
+#   Skip checking for updates                                                                #
+# → --force-update-check                                                                     #
+#   Force checking for updates                                                               #
+# → --always-update                                                                          #
+#   Force checking for updates and install them automatically. Usually, updates are only ins #
+# talled in REPL mode                                                                        #
+# → --reluctant-autocomplete                                                                 #
+#   Sets autocomplete to be less eager, only completing remote paths after pressing tab      #
+# → --json                                                                                   #
+#   Format command output as machine-readable JSON (where applicable)                        #
+# → -V, --version                                                                            #
+#   Print version                                                                            #
+#                                                                                            #
+# Updates                                                                                    #
+#                                                                                            #
+# The updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-re #
+# leases                                                                                     #
+# when the CLI is run (unless skipped in the 5mins since the last check, or through the `--s #
+# kip-update` flag).                                                                         #
+# The executable will be replaced in place, with the filename updated if it contains the ver #
+# sion number.                                                                               #
+#                                                                                            #
+# Commands                                                                                   #
+#                                                                                            #
+# ┃ help [COMMAND_OR_TOPIC]                                                                  #
+# ┃ Print help about a command or topic (default: general help)                              #
+# ┃ → [COMMAND_OR_TOPIC]  Command or topic to show help about                                #
+#                                                                                            #
+# ┃ view-html-docs                                                                           #
+# ┃ View the documentation (same as --help) locally in a browser rendered as HTML            #
+#                                                                                            #
+# ┃ exit                                                                                     #
+# ┃ Exit the REPL                                                                            #
+#                                                                                            #
+# More help topics                                                                           #
+#                                                                                            #
+# Authentication  → help auth                                                                #
+# Accessing Files  → help access-files                                                       #
+# Transferring Files  → help transfer-files                                                  #
+# Managed Rclone  → help managed-rclone                                                      #
+# (manuel)                                                                                   #
+#                                                                                            #
+
+terminal_width: 91
+recording_items:
+- !Output "\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 110
+- !Input
+  - 111
+- !Input
+  - 45
+- !Input
+  - 97
+- !Input
+  - 117
+- !Input
+  - 116
+- !Input
+  - 104
+- !Input
+  - 2
+- !Output "no-auth\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 110
+- !Input
+  - 32
+- !Input
+  - 45
+- !Input
+  - 45
+- !Input
+  - 104
+- !Input
+  - 101
+- !Input
+  - 108
+- !Input
+  - 112
+- !Input
+  - 2
+- !Output "filen --help\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[1m\e[4mUsage\e[0m\r\n\r\nWelcome to Filen CLI v0.2.7!\r\n\r\nYou can find out more about the Filen CLI at https://github.com/FilenCloudDienste/filen-cli-releases\r\n\r\nInvoke the Filen CLI with no command specified to enter interactive mode (REPL).\r\nThere, you can specify absolute paths (starting with \"/\") or relative paths (supports \".\" and \"..\").\r\n\r\n\e[1m\e[4mOptions\e[0m\r\n\r\n\e[2m→\e[0m \e[32m-v\e[0m, \e[32m--verbose\e[0m\e[32m...\e[0m\r\n  Increase verbosity (-v, -vv, -vvv)\r\n\e[2m→\e[0m \e[32m-q\e[0m, \e[32m--quiet\e[0m\r\n  Hide progress bars and other non-essential output (overrides -v)\r\n\e[2m→\e[0m \e[32m--config-dir\e[0m\e[32m \e[0m\e[32m<CONFIG_DIR>\e[0m\r\n  Config directory (overrides system default)\r\n\e[2m→\e[0m \e[32m-e\e[0m, \e[32m--email\e[0m\e[32m \e[0m\e[32m<EMAIL>\e[0m\r\n  Filen account email (requires --password) \e[2m[env: \e[0m\e[2mFILEN_CLI_EMAIL=\e[0m\e[2m]\e[0m\r\n\e[2m→\e[0m \e[32m-p\e[0m, \e[32m--password\e[0m\e[32m \e[0m\e[32m<PASSWORD>\e[0m\r\n  Filen account password (requires --email) \e[2m[env: \e[0m\e[2mFILEN_CLI_PASSWORD=\e[0m\e[2m]\e[0m\r\n\e[2m→\e[0m \e[32m-t\e[0m, \e[32m--two-factor-code\e[0m\e[32m \e[0m\e[32m<TWO_FACTOR_CODE>\e[0m\r\n  Filen account two-factor code (optional, requires --email and --password) \e[2m[env: \e[0m\e[2mFILEN_CLI_2FA_CODE=\e[0m\e[2m]\e[0m\r\n\e[2m→\e[0m \e[32m--auth-config-path\e[0m\e[32m \e[0m\e[32m<AUTH_CONFIG_PATH>\e[0m\r\n  Path to auth config file (exported via `filen export-auth-config`)\r\n\e[2m→\e[0m \e[32m--concurrency\e[0m\e[32m \e[0m\e[32m<CONCURRENCY>\e[0m\r\n  Limit concurrent API connections\r\n\e[2m→\e[0m \e[32m--requests-per-sec\e[0m\e[32m \e[0m\e[32m<REQUESTS_PER_SEC>\e[0m\r\n  Maximum number of API requests per second\r\n\e[2m→\e[0m \e[32m--upload-bandwidth-kbps\e[0m\e[32m \e[0m\e[32m<UPLOAD_BANDWIDTH_KBPS>\e[0m\r\n  Cap upload bandwidth, in kilobytes per second\r\n\e[2m→\e[0m \e[32m--download-bandwidth-kbps\e[0m\e[32m \e[0m\e[32m<DOWNLOAD_BANDWIDTH_KBPS>\e[0m\r\n  Cap download bandwidth, in kilobytes per second\r\n\e[2m→\e[0m \e[32m--memory-budget-bytes\e[0m\e[32m \e[0m\e[32m<MEMORY_BUDGET_BYTES>\e[0m\r\n  Memory budget for file I/O, in bytes\r\n\e[2m→\e[0m \e[32m--connect-timeout\e[0m\e[32m \e[0m\e[32m<CONNECT_TIMEOUT>\e[0m\r\n  Connection timeout\r\n\e[2m→\e[0m \e[32m--skip-update\e[0m\r\n  Skip checking for updates\r\n\e[2m→\e[0m \e[32m--force-update-check\e[0m\r\n  Force checking for updates\r\n\e[2m→\e[0m \e[32m--always-update\e[0m\r\n  Force checking for updates and install them automatically. Usually, updates are only installed in REPL mode\r\n\e[2m→\e[0m \e[32m--reluctant-autocomplete\e[0m\r\n  Sets autocomplete to be less eager, only completing remote paths after pressing tab\r\n\e[2m→\e[0m \e[32m--json\e[0m\r\n  Format command output as machine-readable JSON (where applicable)\r\n\e[2m→\e[0m \e[32m-V\e[0m, \e[32m--version\e[0m\r\n  Print version\r\n\r\n\e[1m\e[4mUpdates\e[0m\r\n\r\nThe updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-releases\r\nwhen the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).\r\nThe executable will be replaced in place, with the filename updated if it contains the version number.\r\n\r\n\e[1m\e[4mCommands\e[0m\r\n\r\n┃ \e[4m\e[32mhelp\e[0m [COMMAND_OR_TOPIC]\r\n┃ Print help about a command or topic (default: general help)\r\n┃ \e[2m→\e[0m \e[32m[COMMAND_OR_TOPIC]\e[0m  Command or topic to show help about\r\n\r\n┃ \e[4m\e[32mview-html-docs\e[0m\r\n┃ View the documentation (same as --help) locally in a browser rendered as HTML\r\n\r\n┃ \e[4m\e[32mexit\e[0m\r\n┃ Exit the REPL\r\n\r\n\e[1m\e[4mMore help topics\e[0m\r\n\r\n\e[4mAuthentication\e[0m  \e[2m→\e[0m \e[32mhelp auth\e[0m\r\n\e[4mAccessing Files\e[0m  \e[2m→\e[0m \e[32mhelp access-files\e[0m\r\n\e[4mTransferring Files\e[0m  \e[2m→\e[0m \e[32mhelp transfer-files\e[0m\r\n\e[4mManaged Rclone\e[0m  \e[2m→\e[0m \e[32mhelp managed-rclone\e[0m\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 110
+- !Input
+  - 32
+- !Input
+  - 104
+- !Input
+  - 101
+- !Input
+  - 108
+- !Input
+  - 112
+- !Input
+  - 2
+- !Output "filen help\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[1m\e[4mUsage\e[0m\r\n\r\nWelcome to Filen CLI v0.2.7!\r\n\r\nYou can find out more about the Filen CLI at https://github.com/FilenCloudDienste/filen-cli-releases\r\n\r\nInvoke the Filen CLI with no command specified to enter interactive mode (REPL).\r\nThere, you can specify absolute paths (starting with \"/\") or relative paths (supports \".\" and \"..\").\r\n\r\n\e[1m\e[4mOptions\e[0m\r\n\r\n\e[2m→\e[0m \e[32m-v\e[0m, \e[32m--verbose\e[0m\e[32m...\e[0m\r\n  Increase verbosity (-v, -vv, -vvv)\r\n\e[2m→\e[0m \e[32m-q\e[0m, \e[32m--quiet\e[0m\r\n  Hide progress bars and other non-essential output (overrides -v)\r\n\e[2m→\e[0m \e[32m--config-dir\e[0m\e[32m \e[0m\e[32m<CONFIG_DIR>\e[0m\r\n  Config directory (overrides system default)\r\n\e[2m→\e[0m \e[32m-e\e[0m, \e[32m--email\e[0m\e[32m \e[0m\e[32m<EMAIL>\e[0m\r\n  Filen account email (requires --password) \e[2m[env: \e[0m\e[2mFILEN_CLI_EMAIL=\e[0m\e[2m]\e[0m\r\n\e[2m→\e[0m \e[32m-p\e[0m, \e[32m--password\e[0m\e[32m \e[0m\e[32m<PASSWORD>\e[0m\r\n  Filen account password (requires --email) \e[2m[env: \e[0m\e[2mFILEN_CLI_PASSWORD=\e[0m\e[2m]\e[0m\r\n\e[2m→\e[0m \e[32m-t\e[0m, \e[32m--two-factor-code\e[0m\e[32m \e[0m\e[32m<TWO_FACTOR_CODE>\e[0m\r\n  Filen account two-factor code (optional, requires --email and --password) \e[2m[env: \e[0m\e[2mFILEN_CLI_2FA_CODE=\e[0m\e[2m]\e[0m\r\n\e[2m→\e[0m \e[32m--auth-config-path\e[0m\e[32m \e[0m\e[32m<AUTH_CONFIG_PATH>\e[0m\r\n  Path to auth config file (exported via `filen export-auth-config`)\r\n\e[2m→\e[0m \e[32m--concurrency\e[0m\e[32m \e[0m\e[32m<CONCURRENCY>\e[0m\r\n  Limit concurrent API connections\r\n\e[2m→\e[0m \e[32m--requests-per-sec\e[0m\e[32m \e[0m\e[32m<REQUESTS_PER_SEC>\e[0m\r\n  Maximum number of API requests per second\r\n\e[2m→\e[0m \e[32m--upload-bandwidth-kbps\e[0m\e[32m \e[0m\e[32m<UPLOAD_BANDWIDTH_KBPS>\e[0m\r\n  Cap upload bandwidth, in kilobytes per second\r\n\e[2m→\e[0m \e[32m--download-bandwidth-kbps\e[0m\e[32m \e[0m\e[32m<DOWNLOAD_BANDWIDTH_KBPS>\e[0m\r\n  Cap download bandwidth, in kilobytes per second\r\n\e[2m→\e[0m \e[32m--memory-budget-bytes\e[0m\e[32m \e[0m\e[32m<MEMORY_BUDGET_BYTES>\e[0m\r\n  Memory budget for file I/O, in bytes\r\n\e[2m→\e[0m \e[32m--connect-timeout\e[0m\e[32m \e[0m\e[32m<CONNECT_TIMEOUT>\e[0m\r\n  Connection timeout\r\n\e[2m→\e[0m \e[32m--skip-update\e[0m\r\n  Skip checking for updates\r\n\e[2m→\e[0m \e[32m--force-update-check\e[0m\r\n  Force checking for updates\r\n\e[2m→\e[0m \e[32m--always-update\e[0m\r\n  Force checking for updates and install them automatically. Usually, updates are only installed in REPL mode\r\n\e[2m→\e[0m \e[32m--reluctant-autocomplete\e[0m\r\n  Sets autocomplete to be less eager, only completing remote paths after pressing tab\r\n\e[2m→\e[0m \e[32m--json\e[0m\r\n  Format command output as machine-readable JSON (where applicable)\r\n\e[2m→\e[0m \e[32m-V\e[0m, \e[32m--version\e[0m\r\n  Print version\r\n\r\n\e[1m\e[4mUpdates\e[0m\r\n\r\nThe updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-releases\r\nwhen the CLI is run (unless skipped in the 5mins since the last check, or through the `--skip-update` flag).\r\nThe executable will be replaced in place, with the filename updated if it contains the version number.\r\n\r\n\e[1m\e[4mCommands\e[0m\r\n\r\n┃ \e[4m\e[32mhelp\e[0m [COMMAND_OR_TOPIC]\r\n┃ Print help about a command or topic (default: general help)\r\n┃ \e[2m→\e[0m \e[32m[COMMAND_OR_TOPIC]\e[0m  Command or topic to show help about\r\n\r\n┃ \e[4m\e[32mview-html-docs\e[0m\r\n┃ View the documentation (same as --help) locally in a browser rendered as HTML\r\n\r\n┃ \e[4m\e[32mexit\e[0m\r\n┃ Exit the REPL\r\n\r\n\e[1m\e[4mMore help topics\e[0m\r\n\r\n\e[4mAuthentication\e[0m  \e[2m→\e[0m \e[32mhelp auth\e[0m\r\n\e[4mAccessing Files\e[0m  \e[2m→\e[0m \e[32mhelp access-files\e[0m\r\n\e[4mTransferring Files\e[0m  \e[2m→\e[0m \e[32mhelp transfer-files\e[0m\r\n\e[4mManaged Rclone\e[0m  \e[2m→\e[0m \e[32mhelp managed-rclone\e[0m\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+final_output_formatted: "\e[34;1m(manuel)\e[m no-auth\e[m\n\e[34;1m(manuel)\e[m filen --help\e[m\n\e[1;4mUsage\e[m\n\e[m\nWelcome to Filen CLI v0.2.7!\e[m\n\e[m\nYou can find out more about the Filen CLI at https://github.com/FilenCloudDienste/filen-cl\e[m\ni-releases\e[m\n\e[m\nInvoke the Filen CLI with no command specified to enter interactive mode (REPL).\e[m\nThere, you can specify absolute paths (starting with \"/\") or relative paths (supports \".\" \e[m\nand \"..\").\e[m\n\e[m\n\e[1;4mOptions\e[m\n\e[m\n\e[2m→\e[m \e[32m-v\e[m, \e[32m--verbose...\e[m\n  Increase verbosity (-v, -vv, -vvv)\e[m\n\e[2m→\e[m \e[32m-q\e[m, \e[32m--quiet\e[m\n  Hide progress bars and other non-essential output (overrides -v)\e[m\n\e[2m→\e[m \e[32m--config-dir <CONFIG_DIR>\e[m\n  Config directory (overrides system default)\e[m\n\e[2m→\e[m \e[32m-e\e[m, \e[32m--email <EMAIL>\e[m\n  Filen account email (requires --password) \e[2m[env: FILEN_CLI_EMAIL=]\e[m\n\e[2m→\e[m \e[32m-p\e[m, \e[32m--password <PASSWORD>\e[m\n  Filen account password (requires --email) \e[2m[env: FILEN_CLI_PASSWORD=]\e[m\n\e[2m→\e[m \e[32m-t\e[m, \e[32m--two-factor-code <TWO_FACTOR_CODE>\e[m\n  Filen account two-factor code (optional, requires --email and --password) \e[2m[env: FILEN_CL\e[m\n\e[2mI_2FA_CODE=]\e[m\n\e[2m→\e[m \e[32m--auth-config-path <AUTH_CONFIG_PATH>\e[m\n  Path to auth config file (exported via `filen export-auth-config`)\e[m\n\e[2m→\e[m \e[32m--concurrency <CONCURRENCY>\e[m\n  Limit concurrent API connections\e[m\n\e[2m→\e[m \e[32m--requests-per-sec <REQUESTS_PER_SEC>\e[m\n  Maximum number of API requests per second\e[m\n\e[2m→\e[m \e[32m--upload-bandwidth-kbps <UPLOAD_BANDWIDTH_KBPS>\e[m\n  Cap upload bandwidth, in kilobytes per second\e[m\n\e[2m→\e[m \e[32m--download-bandwidth-kbps <DOWNLOAD_BANDWIDTH_KBPS>\e[m\n  Cap download bandwidth, in kilobytes per second\e[m\n\e[2m→\e[m \e[32m--memory-budget-bytes <MEMORY_BUDGET_BYTES>\e[m\n  Memory budget for file I/O, in bytes\e[m\n\e[2m→\e[m \e[32m--connect-timeout <CONNECT_TIMEOUT>\e[m\n  Connection timeout\e[m\n\e[2m→\e[m \e[32m--skip-update\e[m\n  Skip checking for updates\e[m\n\e[2m→\e[m \e[32m--force-update-check\e[m\n  Force checking for updates\e[m\n\e[2m→\e[m \e[32m--always-update\e[m\n  Force checking for updates and install them automatically. Usually, updates are only ins\e[m\ntalled in REPL mode\e[m\n\e[2m→\e[m \e[32m--reluctant-autocomplete\e[m\n  Sets autocomplete to be less eager, only completing remote paths after pressing tab\e[m\n\e[2m→\e[m \e[32m--json\e[m\n  Format command output as machine-readable JSON (where applicable)\e[m\n\e[2m→\e[m \e[32m-V\e[m, \e[32m--version\e[m\n  Print version\e[m\n\e[m\n\e[1;4mUpdates\e[m\n\e[m\nThe updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-re\e[m\nleases\e[m\nwhen the CLI is run (unless skipped in the 5mins since the last check, or through the `--s\e[m\nkip-update` flag).\e[m\nThe executable will be replaced in place, with the filename updated if it contains the ver\e[m\nsion number.\e[m\n\e[m\n\e[1;4mCommands\e[m\n\e[m\n┃ \e[32;4mhelp\e[m [COMMAND_OR_TOPIC]\e[m\n┃ Print help about a command or topic (default: general help)\e[m\n┃ \e[2m→\e[m \e[32m[COMMAND_OR_TOPIC]\e[m  Command or topic to show help about\e[m\n\e[m\n┃ \e[32;4mview-html-docs\e[m\n┃ View the documentation (same as --help) locally in a browser rendered as HTML\e[m\n\e[m\n┃ \e[32;4mexit\e[m\n┃ Exit the REPL\e[m\n\e[m\n\e[1;4mMore help topics\e[m\n\e[m\n\e[4mAuthentication\e[m  \e[2m→\e[m \e[32mhelp auth\e[m\n\e[4mAccessing Files\e[m  \e[2m→\e[m \e[32mhelp access-files\e[m\n\e[4mTransferring Files\e[m  \e[2m→\e[m \e[32mhelp transfer-files\e[m\n\e[4mManaged Rclone\e[m  \e[2m→\e[m \e[32mhelp managed-rclone\e[m\n\e[34;1m(manuel)\e[m filen help\e[m\n\e[1;4mUsage\e[m\n\e[m\nWelcome to Filen CLI v0.2.7!\e[m\n\e[m\nYou can find out more about the Filen CLI at https://github.com/FilenCloudDienste/filen-cl\e[m\ni-releases\e[m\n\e[m\nInvoke the Filen CLI with no command specified to enter interactive mode (REPL).\e[m\nThere, you can specify absolute paths (starting with \"/\") or relative paths (supports \".\" \e[m\nand \"..\").\e[m\n\e[m\n\e[1;4mOptions\e[m\n\e[m\n\e[2m→\e[m \e[32m-v\e[m, \e[32m--verbose...\e[m\n  Increase verbosity (-v, -vv, -vvv)\e[m\n\e[2m→\e[m \e[32m-q\e[m, \e[32m--quiet\e[m\n  Hide progress bars and other non-essential output (overrides -v)\e[m\n\e[2m→\e[m \e[32m--config-dir <CONFIG_DIR>\e[m\n  Config directory (overrides system default)\e[m\n\e[2m→\e[m \e[32m-e\e[m, \e[32m--email <EMAIL>\e[m\n  Filen account email (requires --password) \e[2m[env: FILEN_CLI_EMAIL=]\e[m\n\e[2m→\e[m \e[32m-p\e[m, \e[32m--password <PASSWORD>\e[m\n  Filen account password (requires --email) \e[2m[env: FILEN_CLI_PASSWORD=]\e[m\n\e[2m→\e[m \e[32m-t\e[m, \e[32m--two-factor-code <TWO_FACTOR_CODE>\e[m\n  Filen account two-factor code (optional, requires --email and --password) \e[2m[env: FILEN_CL\e[m\n\e[2mI_2FA_CODE=]\e[m\n\e[2m→\e[m \e[32m--auth-config-path <AUTH_CONFIG_PATH>\e[m\n  Path to auth config file (exported via `filen export-auth-config`)\e[m\n\e[2m→\e[m \e[32m--concurrency <CONCURRENCY>\e[m\n  Limit concurrent API connections\e[m\n\e[2m→\e[m \e[32m--requests-per-sec <REQUESTS_PER_SEC>\e[m\n  Maximum number of API requests per second\e[m\n\e[2m→\e[m \e[32m--upload-bandwidth-kbps <UPLOAD_BANDWIDTH_KBPS>\e[m\n  Cap upload bandwidth, in kilobytes per second\e[m\n\e[2m→\e[m \e[32m--download-bandwidth-kbps <DOWNLOAD_BANDWIDTH_KBPS>\e[m\n  Cap download bandwidth, in kilobytes per second\e[m\n\e[2m→\e[m \e[32m--memory-budget-bytes <MEMORY_BUDGET_BYTES>\e[m\n  Memory budget for file I/O, in bytes\e[m\n\e[2m→\e[m \e[32m--connect-timeout <CONNECT_TIMEOUT>\e[m\n  Connection timeout\e[m\n\e[2m→\e[m \e[32m--skip-update\e[m\n  Skip checking for updates\e[m\n\e[2m→\e[m \e[32m--force-update-check\e[m\n  Force checking for updates\e[m\n\e[2m→\e[m \e[32m--always-update\e[m\n  Force checking for updates and install them automatically. Usually, updates are only ins\e[m\ntalled in REPL mode\e[m\n\e[2m→\e[m \e[32m--reluctant-autocomplete\e[m\n  Sets autocomplete to be less eager, only completing remote paths after pressing tab\e[m\n\e[2m→\e[m \e[32m--json\e[m\n  Format command output as machine-readable JSON (where applicable)\e[m\n\e[2m→\e[m \e[32m-V\e[m, \e[32m--version\e[m\n  Print version\e[m\n\e[m\n\e[1;4mUpdates\e[m\n\e[m\nThe updater checks for new releases from https://github.com/FilenCloudDienste/filen-cli-re\e[m\nleases\e[m\nwhen the CLI is run (unless skipped in the 5mins since the last check, or through the `--s\e[m\nkip-update` flag).\e[m\nThe executable will be replaced in place, with the filename updated if it contains the ver\e[m\nsion number.\e[m\n\e[m\n\e[1;4mCommands\e[m\n\e[m\n┃ \e[32;4mhelp\e[m [COMMAND_OR_TOPIC]\e[m\n┃ Print help about a command or topic (default: general help)\e[m\n┃ \e[2m→\e[m \e[32m[COMMAND_OR_TOPIC]\e[m  Command or topic to show help about\e[m\n\e[m\n┃ \e[32;4mview-html-docs\e[m\n┃ View the documentation (same as --help) locally in a browser rendered as HTML\e[m\n\e[m\n┃ \e[32;4mexit\e[m\n┃ Exit the REPL\e[m\n\e[m\n\e[1;4mMore help topics\e[m\n\e[m\n\e[4mAuthentication\e[m  \e[2m→\e[m \e[32mhelp auth\e[m\n\e[4mAccessing Files\e[m  \e[2m→\e[m \e[32mhelp access-files\e[m\n\e[4mTransferring Files\e[m  \e[2m→\e[m \e[32mhelp transfer-files\e[m\n\e[4mManaged Rclone\e[m  \e[2m→\e[m \e[32mhelp managed-rclone\e[m\n\e[34;1m(manuel)\e[m \e[m\n"

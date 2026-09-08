@@ -585,6 +585,9 @@ async fn print_file(
 				.rev()
 				.take(n)
 				.collect::<Vec<&str>>()
+				.into_iter()
+				.rev()
+				.collect::<Vec<&str>>()
 				.join("\n"),
 		};
 		ui.print(&content);

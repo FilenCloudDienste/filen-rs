@@ -220,7 +220,13 @@ fn authenticate_from_auth_config(
 	let auth_config_paths = if let Some(path) = path_arg {
 		vec![PathBuf::from(path)]
 	} else {
-		get_auth_config_default_locations(config)
+		if std::env::var("FILEN_CLI_TESTING_DISABLE_AUTODETECTED_AUTH_CONFIG")
+			!= Ok("1".to_string())
+		{
+			get_auth_config_default_locations(config)
+		} else {
+			vec![]
+		}
 	};
 	for path in auth_config_paths {
 		if path.exists() {

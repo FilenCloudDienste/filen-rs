@@ -1,0 +1,298 @@
+# Manuel recording file
+
+# (manuel) filen --config-dir $MANUEL_TMP exit                                               #
+# (manuel) cat $MANUEL_TMP/logs/latest.log | grep -q "Logging level: OFF" # this means the f #
+# ile contains the logs                                                                      #
+# (manuel)                                                                                   #
+#                                                                                            #
+
+terminal_width: 91
+recording_items:
+- !Output "\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 110
+- !Input
+  - 32
+- !Input
+  - 45
+- !Input
+  - 45
+- !Input
+  - 99
+- !Input
+  - 111
+- !Input
+  - 110
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 103
+- !Input
+  - 45
+- !Input
+  - 100
+- !Input
+  - 105
+- !Input
+  - 114
+- !Input
+  - 32
+- !Input
+  - 36
+- !Input
+  - 77
+- !Input
+  - 65
+- !Input
+  - 78
+- !Input
+  - 85
+- !Input
+  - 69
+- !Input
+  - 76
+- !Input
+  - 95
+- !Input
+  - 84
+- !Input
+  - 77
+- !Input
+  - 80
+- !Input
+  - 32
+- !Input
+  - 101
+- !Input
+  - 120
+- !Input
+  - 105
+- !Input
+  - 116
+- !Input
+  - 2
+- !Output "filen --config-dir $MANUEL_TMP exit\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+- !Input
+  - 99
+- !Input
+  - 97
+- !Input
+  - 116
+- !Input
+  - 32
+- !Input
+  - 36
+- !Input
+  - 77
+- !Input
+  - 65
+- !Input
+  - 78
+- !Input
+  - 85
+- !Input
+  - 69
+- !Input
+  - 76
+- !Input
+  - 95
+- !Input
+  - 84
+- !Input
+  - 77
+- !Input
+  - 80
+- !Input
+  - 47
+- !Input
+  - 108
+- !Input
+  - 111
+- !Input
+  - 103
+- !Input
+  - 115
+- !Input
+  - 47
+- !Input
+  - 108
+- !Input
+  - 97
+- !Input
+  - 116
+- !Input
+  - 101
+- !Input
+  - 115
+- !Input
+  - 116
+- !Input
+  - 46
+- !Input
+  - 108
+- !Input
+  - 111
+- !Input
+  - 103
+- !Input
+  - 32
+- !Input
+  - 124
+- !Input
+  - 32
+- !Input
+  - 103
+- !Input
+  - 114
+- !Input
+  - 101
+- !Input
+  - 112
+- !Input
+  - 32
+- !Input
+  - 45
+- !Input
+  - 113
+- !Input
+  - 32
+- !Input
+  - 34
+- !Input
+  - 76
+- !Input
+  - 111
+- !Input
+  - 103
+- !Input
+  - 103
+- !Input
+  - 105
+- !Input
+  - 110
+- !Input
+  - 103
+- !Input
+  - 32
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 118
+- !Input
+  - 101
+- !Input
+  - 108
+- !Input
+  - 58
+- !Input
+  - 32
+- !Input
+  - 79
+- !Input
+  - 70
+- !Input
+  - 70
+- !Input
+  - 34
+- !Input
+  - 32
+- !Input
+  - 35
+- !Input
+  - 32
+- !Input
+  - 116
+- !Input
+  - 104
+- !Input
+  - 105
+- !Input
+  - 115
+- !Input
+  - 32
+- !Input
+  - 109
+- !Input
+  - 101
+- !Input
+  - 97
+- !Input
+  - 110
+- !Input
+  - 115
+- !Input
+  - 32
+- !Input
+  - 116
+- !Input
+  - 104
+- !Input
+  - 101
+- !Input
+  - 32
+- !Input
+  - 102
+- !Input
+  - 105
+- !Input
+  - 108
+- !Input
+  - 101
+- !Input
+  - 32
+- !Input
+  - 99
+- !Input
+  - 111
+- !Input
+  - 110
+- !Input
+  - 116
+- !Input
+  - 97
+- !Input
+  - 105
+- !Input
+  - 110
+- !Input
+  - 115
+- !Input
+  - 32
+- !Input
+  - 116
+- !Input
+  - 104
+- !Input
+  - 101
+- !Input
+  - 32
+- !Input
+  - 108
+- !Input
+  - 111
+- !Input
+  - 103
+- !Input
+  - 115
+- !Input
+  - 2
+- !Output "cat $MANUEL_TMP/logs/latest.log | grep -q \"Logging level: OFF\" # this means the file contains the logs\b"
+- !Input
+  - 13
+- !Output "\r\n\e[?2004l\r\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+final_output_formatted: "\e[34;1m(manuel)\e[m filen --config-dir $MANUEL_TMP exit\e[m\n\e[34;1m(manuel)\e[m cat $MANUEL_TMP/logs/latest.log | grep -q \"Logging level: OFF\" # this means the f\e[m\nile contains the logs\e[m\n\e[34;1m(manuel)\e[m \e[m\n"

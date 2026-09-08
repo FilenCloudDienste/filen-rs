@@ -1,0 +1,219 @@
+# Manuel recording file
+
+# (manuel) filen --verbose exit                                                              #
+# [omit] [INFO]  (filen_cli) Logging level: INFO                                             #
+# [omit] [INFO]  (filen_cli) Full log file: {{ $HOME }}/.config/filen-cli-dev/logs/latest.log  #
+# [omit] [INFO]  (filen_cli) Filen CLI v0.2.7                                                #
+# [omit] [INFO]  (filen_cli::updater) Skipping update check in debug build                   #
+# (manuel) filen --verbose --config-dir $MANUEL_TMP exit                                     #
+# [omit] [INFO]  (filen_cli) Logging level: INFO                                             #
+# [omit] [INFO]  (filen_cli) Full log file: {{ $MANUEL_TMP }}/logs/latest.log                  #
+# [omit] [INFO]  (filen_cli) Filen CLI v0.2.7                                                #
+# [omit] [INFO]  (filen_cli::updater) Skipping update check in debug build                   #
+# (manuel)                                                                                   #
+#                                                                                            #
+
+terminal_width: 91
+recording_items:
+  - !Output "\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+  - !Input
+    - 102
+  - !Output f
+  - !Input
+    - 105
+  - !Output i
+  - !Input
+    - 108
+  - !Output l
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 110
+  - !Output n
+  - !Input
+    - 32
+  - !Output " "
+  - !Input
+    - 45
+  - !Output "-"
+  - !Input
+    - 45
+  - !Output "-"
+  - !Input
+    - 118
+  - !Output v
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 114
+  - !Output r
+  - !Input
+    - 98
+  - !Output b
+  - !Input
+    - 111
+  - !Output o
+  - !Input
+    - 115
+  - !Output s
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 32
+  - !Output " "
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 120
+  - !Output x
+  - !Input
+    - 105
+  - !Output i
+  - !Input
+    - 116
+  - !Output t
+  - !Input
+    - 13
+  - !Output "\r\n\e[?2004l\r\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli)\e[0m Logging level: INFO\r\n\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli)\e[0m Full log file: \e[33m\e[1m{{ $HOME }}\e[0m/.config/filen-cli-dev/logs/latest.log\r\n\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli)\e[0m Filen CLI v0.2.7\r\n\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli::updater)\e[0m Skipping update check in debug build\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+  - !Input
+    - 102
+  - !Output f
+  - !Input
+    - 105
+  - !Output i
+  - !Input
+    - 108
+  - !Output l
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 110
+  - !Output n
+  - !Input
+    - 32
+  - !Output " "
+  - !Input
+    - 45
+  - !Output "-"
+  - !Input
+    - 45
+  - !Output "-"
+  - !Input
+    - 118
+  - !Output v
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 114
+  - !Output r
+  - !Input
+    - 98
+  - !Output b
+  - !Input
+    - 111
+  - !Output o
+  - !Input
+    - 115
+  - !Output s
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 32
+  - !Output " "
+  - !Input
+    - 45
+  - !Output "-"
+  - !Input
+    - 45
+  - !Output "-"
+  - !Input
+    - 99
+  - !Output c
+  - !Input
+    - 111
+  - !Output o
+  - !Input
+    - 110
+  - !Output n
+  - !Input
+    - 102
+  - !Output f
+  - !Input
+    - 105
+  - !Output i
+  - !Input
+    - 103
+  - !Output g
+  - !Input
+    - 45
+  - !Output "-"
+  - !Input
+    - 100
+  - !Output d
+  - !Input
+    - 105
+  - !Output i
+  - !Input
+    - 114
+  - !Output r
+  - !Input
+    - 32
+  - !Input
+    - 36
+  - !Output " $"
+  - !Input
+    - 77
+  - !Output M
+  - !Input
+    - 65
+  - !Output A
+  - !Input
+    - 78
+  - !Output N
+  - !Input
+    - 85
+  - !Output U
+  - !Input
+    - 69
+  - !Output E
+  - !Input
+    - 76
+  - !Output L
+  - !Input
+    - 95
+  - !Output _
+  - !Input
+    - 84
+  - !Output T
+  - !Input
+    - 77
+  - !Output M
+  - !Input
+    - 80
+  - !Output P
+  - !Input
+    - 32
+  - !Output " "
+  - !Input
+    - 101
+  - !Output e
+  - !Input
+    - 120
+  - !Output x
+  - !Input
+    - 105
+  - !Output i
+  - !Input
+    - 116
+  - !Output t
+  - !Input
+    - 13
+  - !Output "\r\n\e[?2004l\r\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli)\e[0m Logging level: INFO\r\n\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli)\e[0m Full log file: \e[33m\e[1m{{ $MANUEL_TMP }}\e[0m/logs/latest.log\r\n\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli)\e[0m Filen CLI v0.2.7\r\n\e[2m[omit]\e[0m \e[32m[INFO] \e[0m \e[2m(filen_cli::updater)\e[0m Skipping update check in debug build\r\n\e[?2004h\e[1m\e[34m(manuel)\e[0m "
+final_output_formatted: "\e[34;1m(manuel)\e[m filen --verbose exit\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli)\e[m Logging level: INFO\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli)\e[m Full log file: \e[33;1m{{ $HOME }}\e[m/.config/filen-cli-dev/logs/latest.log\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli)\e[m Filen CLI v0.2.7\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli::updater)\e[m Skipping update check in debug build\e[m\n\e[34;1m(manuel)\e[m filen --verbose --config-dir $MANUEL_TMP exit\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli)\e[m Logging level: INFO\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli)\e[m Full log file: \e[33;1m{{ $MANUEL_TMP }}\e[m/logs/latest.log\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli)\e[m Filen CLI v0.2.7\e[m\n\e[2m[omit]\e[m \e[32m[INFO] \e[m \e[2m(filen_cli::updater)\e[m Skipping update check in debug build\e[m\n\e[34;1m(manuel)\e[m \e[m\n"
