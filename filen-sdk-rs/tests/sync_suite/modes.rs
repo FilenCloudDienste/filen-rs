@@ -7,7 +7,7 @@
 use std::{borrow::Cow, time::Duration};
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::sync_engine::PlannedActionKind;
+use filen_sdk_rs::sync_engine::{Backlog, PlannedActionKind};
 use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
@@ -947,7 +947,7 @@ async fn mode_20_switch_twoway_to_l2r_changes_deletion_directionality() {
 	assert_eq!(r1.uploaded, 2, "{r1:?}");
 
 	sc.engine
-		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote)
+		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote, Backlog::Propagate)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -999,7 +999,7 @@ async fn mode_21_switch_l2r_to_local_backup_stops_mirroring_deletes() {
 	assert_eq!(r1.uploaded, 1, "{r1:?}");
 
 	sc.engine
-		.reconfigure_pair(sc.pair, SyncMode::LocalBackup)
+		.reconfigure_pair(sc.pair, SyncMode::LocalBackup, Backlog::Propagate)
 		.await
 		.unwrap();
 	std::fs::remove_file(sc.local.join("w.txt")).unwrap();
@@ -1046,7 +1046,7 @@ async fn mode_22_switch_local_backup_to_l2r_applies_the_standing_divergence() {
 	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
 
 	sc.engine
-		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote)
+		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote, Backlog::Propagate)
 		.await
 		.unwrap();
 
@@ -1077,6 +1077,77 @@ async fn mode_22_switch_local_backup_to_l2r_applies_the_standing_divergence() {
 	assert_eq!(r4.remotely_trashed, 1, "{r4:?}");
 	let (_d, files) = list_remote_root(&sc).await;
 	assert!(files.is_empty(), "both deletions landed: {files:?}");
+
+	sc.cleanup();
+}
+
+/// MODE-22b — the same switch with `Backlog::AdoptDestination`: the standing backlog is re-seeded
+/// from the DESTINATION before the new mode takes effect, so the backup copies of files the source
+/// deleted count as intended. The next pass plans nothing at all, and the copies survive — while a
+/// deletion made AFTER the switch still propagates, since the adoption is a one-off re-seed and not
+/// a permanent exemption.
+#[shared_test_runtime]
+async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead() {
+	let sc = single_client(SyncMode::LocalBackup).await;
+	write_file(&sc.local, "x.txt", b"X");
+	write_file(&sc.local, "y.txt", b"Y");
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 2, "{r1:?}");
+
+	// Under local-backup the delete is not propagated: x.txt survives remotely (MODE-22's setup).
+	std::fs::remove_file(sc.local.join("x.txt")).unwrap();
+	let r2 = sc.sync().await;
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote, Backlog::AdoptDestination)
+		.await
+		.unwrap();
+	assert_eq!(
+		sc.engine.list_pairs().await.unwrap()[0].mode,
+		SyncMode::LocalToRemote,
+		"the pair reports its new mode"
+	);
+
+	// Contrast MODE-22, where the very same dry run shows a TrashRemote for x.txt.
+	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert!(
+		plan.actions.is_empty() && plan.held.is_empty(),
+		"an adopted backlog leaves the first pass with nothing to do: {plan:?}"
+	);
+
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(
+		r3.remotely_trashed, 0,
+		"the adopted copy must not be trashed: {r3:?}"
+	);
+	assert_eq!(r3.uploaded, 0, "nor pushed back to the source: {r3:?}");
+	assert_eq!(r3.downloaded, 0, "{r3:?}");
+	assert!(
+		!sc.local.join("x.txt").exists(),
+		"a one-way mirror never writes to its source"
+	);
+	let (_d, files) = list_remote_root(&sc).await;
+	assert!(
+		find_file(&files, "x.txt").is_some(),
+		"the adopted backup copy must survive the switch"
+	);
+
+	// A deletion made after the switch is mirrored the ordinary way.
+	std::fs::remove_file(sc.local.join("y.txt")).unwrap();
+	let r4 = sc.sync().await;
+	assert!(r4.errors.is_empty(), "{r4:?}");
+	assert_eq!(r4.remotely_trashed, 1, "{r4:?}");
+	let (_d, files) = list_remote_root(&sc).await;
+	assert!(
+		find_file(&files, "x.txt").is_some(),
+		"the adopted copy must still be there"
+	);
+	assert!(
+		find_file(&files, "y.txt").is_none(),
+		"the later deletion did not propagate"
+	);
 
 	sc.cleanup();
 }
