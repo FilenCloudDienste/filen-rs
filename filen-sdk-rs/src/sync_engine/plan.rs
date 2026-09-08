@@ -703,6 +703,100 @@ pub(super) fn confirm_agreed_content(
 	advanced
 }
 
+/// The baseline rows a [`Backlog::AdoptDestination`](super::mode::Backlog::AdoptDestination) mode
+/// switch writes: one per tracked path where the NEW mode's source side has nothing and the
+/// destination still holds a copy — the standing backlog a backup mode accumulated.
+///
+/// Each row records what the destination holds RIGHT NOW (from the same snapshot and scan a pass
+/// reads), marked [`BaselineState::Adopted`]: the copy is intended, not a deletion waiting to be
+/// propagated. What that means per mode is [`reconcile`]'s business, not this function's.
+///
+/// Two deliberate exclusions:
+/// - a path with no baseline row at all. That is an item the pair never synced — a file another
+///   client created on the destination — and the new mode's ordinary rules apply to it, exactly as
+///   they would have without a switch. Only the pair's own standing divergence is adopted.
+/// - a held conflict. It is the caller's to [`resolve_conflict`](super::SyncEngine::resolve_conflict),
+///   and overwriting the row with an adoption would drop the divergence it is holding.
+pub(crate) fn adopt_destination_rows(
+	mode: super::SyncMode,
+	baseline: &HashMap<String, BaselineEntry>,
+	local: &HashMap<String, LocalNode>,
+	remote: &HashMap<String, RemoteNode>,
+) -> Vec<BaselineEntry> {
+	let mut rows = Vec::new();
+	for (rel_path, base) in baseline {
+		if base.state != BaselineState::Synced {
+			continue;
+		}
+		let (local_node, remote_node) = (local.get(rel_path), remote.get(rel_path));
+		let row = match mode {
+			super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => remote_node
+				.filter(|_| local_node.is_none())
+				.map(|node| adopted_from_remote(rel_path, node)),
+			super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => local_node
+				.filter(|_| remote_node.is_none())
+				.map(|node| adopted_from_local(rel_path, node)),
+			// Either side may be the one that kept the item; a path both sides still hold is not a
+			// standing deletion at all.
+			super::SyncMode::TwoWay => match (local_node, remote_node) {
+				(None, Some(node)) => Some(adopted_from_remote(rel_path, node)),
+				(Some(node), None) => Some(adopted_from_local(rel_path, node)),
+				_ => None,
+			},
+		};
+		if let Some(row) = row {
+			tracing::debug!(
+				"reconfigure: adopting the destination's copy of {rel_path:?} — the source no longer has it"
+			);
+			rows.push(row);
+		}
+	}
+	rows
+}
+
+/// An [`Adopted`](BaselineState::Adopted) row anchored to what the REMOTE holds at a path.
+fn adopted_from_remote(rel_path: &str, node: &RemoteNode) -> BaselineEntry {
+	let is_file = node.kind == NodeKind::File;
+	BaselineEntry {
+		rel_path: rel_path.to_string(),
+		kind: node.kind,
+		remote_uuid: Some(node.remote_uuid),
+		content_hash: is_file.then_some(node.content_hash).flatten(),
+		size: is_file.then_some(node.size),
+		local_mtime: None,
+		remote_modified: is_file.then_some(node.modified_millis),
+		state: BaselineState::Adopted,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
+		remote_stable_uuid: node.stable_uuid,
+		// Nothing is agreed: only one side holds this path.
+		agreed_hash: None,
+	}
+}
+
+/// An [`Adopted`](BaselineState::Adopted) row anchored to what the LOCAL tree holds at a path.
+fn adopted_from_local(rel_path: &str, node: &LocalNode) -> BaselineEntry {
+	let is_file = node.kind == NodeKind::File;
+	BaselineEntry {
+		rel_path: rel_path.to_string(),
+		kind: node.kind,
+		remote_uuid: None,
+		content_hash: is_file.then_some(node.content_hash).flatten(),
+		size: is_file.then_some(node.size),
+		local_mtime: Some(node.mtime_millis),
+		remote_modified: None,
+		state: BaselineState::Adopted,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
+		remote_stable_uuid: None,
+		agreed_hash: None,
+	}
+}
+
 /// Whether the remote change at a path is another client's edit made CONCURRENTLY with a push of
 /// ours that no snapshot ever confirmed — the one remote change a two-way pass must NOT just pull.
 ///
@@ -853,9 +947,12 @@ fn reconcile_two_way(
 ///   at a new local path (uniquely — ambiguous content is left to delete+create), with the remote
 ///   still holding the original, becomes a `MoveRemote`.
 ///
-/// A path held in conflict is never a move endpoint: consuming it here would skip the per-path
-/// conflict hold, rewrite its baseline as `Synced` against one side's content and lose the
-/// divergence for good. Held paths must fall through to the reconcile loop and be re-reported.
+/// Only a `Synced` row is a move endpoint. A path held in conflict must not be one: consuming it
+/// here would skip the per-path conflict hold, rewrite its baseline as `Synced` against one side's
+/// content and lose the divergence for good. Nor is a row
+/// [`Adopted`](BaselineState::Adopted) from a destination at a mode switch — it records one side's
+/// standing copy, not a synced pair, so matching it by uuid or by content would move an item the
+/// source never had. Both fall through to the reconcile loop, which knows what to do with them.
 fn detect_moves(
 	mode: super::SyncMode,
 	baseline: &HashMap<String, BaselineEntry>,
@@ -882,7 +979,7 @@ fn detect_moves(
 			.collect();
 		for (from, base) in baseline {
 			if base.kind != NodeKind::File
-				|| base.state == BaselineState::Conflicted
+				|| base.state != BaselineState::Synced
 				|| consumed.contains(from)
 			{
 				continue;
@@ -1005,7 +1102,7 @@ fn detect_moves(
 		}
 		for (from, base) in baseline {
 			if base.kind != NodeKind::File
-				|| base.state == BaselineState::Conflicted
+				|| base.state != BaselineState::Synced
 				|| consumed.contains(from)
 				|| local.contains_key(from)
 			{
@@ -1192,6 +1289,35 @@ pub(crate) fn reconcile(
 		}
 		let local_node = local.get(key);
 		let remote_node = remote.get(key);
+
+		// A path adopted from the destination at a mode switch (see
+		// [`adopt_destination_rows`]). The row is never a baseline for classification — whatever
+		// still holds the path reads as newly created — and in a one-way mode it holds off the
+		// destination-side deletion for as long as the source has nothing there.
+		let mut base = base;
+		if base.is_some_and(|b| b.state == BaselineState::Adopted) {
+			let source_holds = match mode {
+				super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => {
+					local_node.is_some()
+				}
+				super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => {
+					remote_node.is_some()
+				}
+				// Both sides are sources; the surviving copy flows back to the other one.
+				super::SyncMode::TwoWay => local_node.is_some() || remote_node.is_some(),
+			};
+			if local_node.is_some() || remote_node.is_some() {
+				if !source_holds {
+					tracing::debug!(
+						"reconcile: leaving {key:?} alone — the destination's copy was adopted at a mode switch and the source is still empty here"
+					);
+					continue;
+				}
+				base = None;
+			}
+			// Neither side holds the path any more: the real row falls through below, where the
+			// both-absent arm retires it.
+		}
 
 		// A backup mode is its mirror mode minus deletions on the destination — the ONE difference,
 		// so the two share an arm and the deletion policy is read off the mode itself.
@@ -2184,6 +2310,179 @@ mod tests {
 
 	fn map<T>(items: Vec<(&str, T)>) -> HashMap<String, T> {
 		items.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+	}
+
+	// ------------------------------------------------------------------------
+	// Backlog::AdoptDestination — the mode-switch re-seed and what it plans
+	// ------------------------------------------------------------------------
+
+	/// The re-seed picks exactly the tracked paths whose SOURCE side is gone under the NEW mode,
+	/// and anchors each row to what the destination holds now.
+	#[test]
+	fn the_reseed_adopts_only_the_paths_the_source_no_longer_has() {
+		let gone = Uuid::new_v4();
+		let both = Uuid::new_v4();
+		let baseline = map(vec![
+			("gone.txt", base_file("gone.txt", gone, [1; 32])),
+			("both.txt", base_file("both.txt", both, [2; 32])),
+		]);
+		// gone.txt survives only on the remote; both.txt is still on both sides. untracked.txt is a
+		// remote item the pair never synced.
+		let local = map(vec![("both.txt", local_file("both.txt", [2; 32]))]);
+		let remote = map(vec![
+			("gone.txt", remote_file("gone.txt", gone, [1; 32])),
+			("both.txt", remote_file("both.txt", both, [2; 32])),
+			(
+				"untracked.txt",
+				remote_file("untracked.txt", Uuid::new_v4(), [3; 32]),
+			),
+		]);
+
+		let rows = adopt_destination_rows(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert_eq!(
+			rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
+			vec!["gone.txt"],
+			"only the standing source deletion is adopted"
+		);
+		let row = &rows[0];
+		assert_eq!(row.state, BaselineState::Adopted);
+		assert_eq!(row.remote_uuid, Some(gone), "anchored to the remote copy");
+		assert_eq!(row.content_hash, Some(Blake3Hash::from([1; 32])));
+		assert_eq!(row.agreed_hash, None, "one side only: nothing is agreed");
+
+		// The mirror image: with the REMOTE as the source, the local-only copy is the one adopted.
+		let rows = adopt_destination_rows(
+			SyncMode::RemoteToLocal,
+			&baseline,
+			&remote_as_local(),
+			&map(vec![]),
+		);
+		assert!(
+			rows.iter().all(|r| r.remote_uuid.is_none()),
+			"a local-side adoption records no remote anchor: {rows:?}"
+		);
+	}
+
+	/// A local tree standing in for "the local side kept both files, the remote lost them".
+	fn remote_as_local() -> HashMap<String, LocalNode> {
+		map(vec![
+			("gone.txt", local_file("gone.txt", [1; 32])),
+			("both.txt", local_file("both.txt", [2; 32])),
+		])
+	}
+
+	/// What the adoption buys: a mirror mode leaves the adopted copy alone instead of trashing it,
+	/// where the same state with an ordinary synced row is a deletion (which is what
+	/// `Backlog::Propagate` keeps).
+	#[test]
+	fn a_mirror_leaves_an_adopted_destination_copy_alone() {
+		let uuid = Uuid::new_v4();
+		let remote = map(vec![("gone.txt", remote_file("gone.txt", uuid, [1; 32]))]);
+		let local = map(vec![]);
+
+		// Propagate: the standing row makes this a deletion under the new mode.
+		let synced = map(vec![("gone.txt", base_file("gone.txt", uuid, [1; 32]))]);
+		assert_eq!(
+			plan(SyncMode::LocalToRemote, &synced, &local, &remote),
+			vec![SyncAction::TrashRemote {
+				rel_path: "gone.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: uuid,
+			}]
+		);
+
+		// AdoptDestination: the same two sides, with the re-seeded row, plan nothing at all.
+		let adopted = map(vec![(
+			"gone.txt",
+			adopted_from_remote("gone.txt", &remote["gone.txt"]),
+		)]);
+		assert!(
+			plan(SyncMode::LocalToRemote, &adopted, &local, &remote).is_empty(),
+			"an adopted destination copy must not be deleted, or re-created"
+		);
+		// And a backup mode never deleted it either way.
+		assert!(plan(SyncMode::LocalBackup, &adopted, &local, &remote).is_empty());
+	}
+
+	/// TwoWay has no destination to spare: the adopted copy reads as newly created on the side that
+	/// still holds it and flows back to the other one.
+	#[test]
+	fn two_way_pulls_an_adopted_destination_copy_back() {
+		let uuid = Uuid::new_v4();
+		let remote = map(vec![("gone.txt", remote_file("gone.txt", uuid, [1; 32]))]);
+		let adopted = map(vec![(
+			"gone.txt",
+			adopted_from_remote("gone.txt", &remote["gone.txt"]),
+		)]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &adopted, &map(vec![]), &remote),
+			vec![SyncAction::DownloadFile {
+				rel_path: "gone.txt".to_string(),
+				remote_uuid: uuid,
+			}]
+		);
+	}
+
+	/// The row retires on its own: as soon as the source has something at the path again the two
+	/// sides reconcile normally (here: the same bytes on both sides, so the pass records the
+	/// converged state), and once neither side holds the path the row is dropped.
+	#[test]
+	fn an_adopted_row_retires_as_soon_as_either_side_moves() {
+		let uuid = Uuid::new_v4();
+		let remote = map(vec![("gone.txt", remote_file("gone.txt", uuid, [1; 32]))]);
+		let adopted = map(vec![(
+			"gone.txt",
+			adopted_from_remote("gone.txt", &remote["gone.txt"]),
+		)]);
+
+		// The source is back with the SAME content: nothing to transfer, but the row must stop
+		// being an adoption.
+		let local = map(vec![("gone.txt", local_file("gone.txt", [1; 32]))]);
+		assert_eq!(
+			plan(SyncMode::LocalToRemote, &adopted, &local, &remote),
+			vec![SyncAction::AdoptBaseline {
+				rel_path: "gone.txt".to_string(),
+			}]
+		);
+		// Back with DIFFERENT content: the source is authoritative again.
+		let edited = map(vec![("gone.txt", local_file("gone.txt", [9; 32]))]);
+		assert_eq!(
+			plan(SyncMode::LocalToRemote, &adopted, &edited, &remote),
+			vec![SyncAction::UploadFile {
+				rel_path: "gone.txt".to_string(),
+			}]
+		);
+		// The destination lost it too (someone deleted it there): the stale row is retired.
+		assert_eq!(
+			plan(
+				SyncMode::LocalToRemote,
+				&adopted,
+				&map(vec![]),
+				&map(vec![])
+			),
+			vec![SyncAction::AdoptBaseline {
+				rel_path: "gone.txt".to_string(),
+			}]
+		);
+	}
+
+	/// An adopted row is one side's standing copy, not a synced pair, so move detection must not
+	/// match it: the "moved" item was never on the source side to begin with.
+	#[test]
+	fn an_adopted_row_is_never_a_move_endpoint() {
+		let uuid = Uuid::new_v4();
+		let remote = map(vec![("moved.txt", remote_file("moved.txt", uuid, [1; 32]))]);
+		let adopted = map(vec![(
+			"gone.txt",
+			adopted_from_remote("gone.txt", &remote_file("gone.txt", uuid, [1; 32])),
+		)]);
+		let actions = plan(SyncMode::TwoWay, &adopted, &map(vec![]), &remote);
+		assert!(
+			!actions
+				.iter()
+				.any(|a| matches!(a, SyncAction::MoveLocal { .. })),
+			"the adopted row was matched as a move source: {actions:?}"
+		);
 	}
 
 	#[test]

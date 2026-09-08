@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
-	SyncEvent, SyncMode,
+	Backlog, SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
 	baseline::{
 		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PendingRow,
@@ -1016,27 +1016,81 @@ impl SyncEngine {
 	///   `RemoteToLocal` switch has the local copy overwritten instead.
 	/// - a backup mode (`LocalBackup` / `RemoteBackup`) to a deletion-propagating one: every source
 	///   deletion the backup mode had left standing on the destination is a pending deletion under
-	///   the new mode, and the next pass propagates the whole set at once. The mass-delete guard
-	///   still screens it (see [`set_delete_guard`](Self::set_delete_guard)), so a large backlog is
-	///   held for approval rather than applied unasked — but a small one is not. Run
-	///   [`plan_pair`](Self::plan_pair) after switching to see exactly what the first pass will do.
+	///   the new mode. This is what `backlog` decides — see below.
 	/// - to a backup mode: deletions simply stop propagating from the next pass on; nothing already
 	///   deleted comes back.
 	///
-	/// Errors if the pair is unknown. Re-registering an existing pair through
+	/// # The standing backlog
+	///
+	/// [`Backlog::Propagate`] takes the sides as they are: the whole set of source deletions the
+	/// backup mode left standing is pending at once, and the next pass propagates it. The
+	/// mass-delete guard still screens it (see [`set_delete_guard`](Self::set_delete_guard)), so a
+	/// large backlog is held for approval rather than applied unasked — but a small one is not.
+	///
+	/// [`Backlog::AdoptDestination`] reads both sides FIRST (one snapshot + one local scan, the same
+	/// pair a pass reads) and re-seeds the baseline from the destination for every tracked path the
+	/// source no longer has, in the same transaction as the mode change. Those copies then count as
+	/// intended: a one-way mirror neither deletes them nor pushes them back to the source, and
+	/// `TwoWay` reads them as newly created on the side that still has them and flows them back. A
+	/// destination item the pair never tracked is not adopted — the new mode's ordinary rules apply
+	/// to it, switch or no switch.
+	///
+	/// Either way, [`plan_pair`](Self::plan_pair) after the switch shows exactly what the first pass
+	/// will do.
+	///
+	/// Errors if the pair is unknown, and — for [`Backlog::AdoptDestination`] only — if that read
+	/// cannot be trusted to say what either side no longer has: a name collision, an incomplete local
+	/// scan, or a remote view that has never converged or came back wholly empty. The mode is left
+	/// exactly as it was, so the call is safe to retry. Re-registering an existing pair through
 	/// [`add_pair`](Self::add_pair) with a different mode is an error rather than a silent switch,
 	/// so a mode change is always this explicit call.
-	pub async fn reconfigure_pair(&self, pair: PairId, mode: SyncMode) -> Result<(), Error> {
+	pub async fn reconfigure_pair(
+		&self,
+		pair: PairId,
+		mode: SyncMode,
+		backlog: Backlog,
+	) -> Result<(), Error> {
+		// Read both sides before touching the mode: the adoption is anchored to what the
+		// destination holds NOW, and the switch must not take effect without it.
+		let adopted = match backlog {
+			Backlog::Propagate => Vec::new(),
+			Backlog::AdoptDestination => {
+				let prep = self.prepare(pair).await?;
+				// The adoption rewrites baseline rows from this one read, and every row it writes is
+				// for a path it reads as GONE on the source side — so it needs the same evidence a
+				// pass needs before acting on an absence. Read through an incomplete scan or an
+				// unconverged/transiently-empty remote view it does the opposite of what was asked:
+				// it adopts nothing and the switch then propagates the very backlog the caller wanted
+				// kept, or it adopts a whole pair from whichever side still lists something and drops
+				// the other side's anchors. Refuse instead — the mode is left as it was, and the
+				// caller can retry once the view is healthy.
+				if let Some(reason) = adoption_refusal(refusal(&prep), &screen_state(&prep)) {
+					return Err(Error::custom(
+						ErrorKind::InvalidState,
+						format!("cannot adopt the destination: {reason}"),
+					));
+				}
+				plan::adopt_destination_rows(
+					mode,
+					&prep.baseline,
+					&prep.local_scan.nodes,
+					&prep.remote_view.nodes,
+				)
+			}
+		};
 		let changed = self
 			.store
 			.lock()
 			.await
-			.set_mode(pair, mode)
+			.set_mode(pair, mode, &adopted)
 			.map_err(|e| db_error(e, "reconfiguring a sync pair"))?;
 		if changed == 0 {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
-		tracing::debug!("sync pair {pair}: mode changed to {mode:?} from the next pass");
+		tracing::debug!(
+			"sync pair {pair}: mode changed to {mode:?} from the next pass ({backlog:?}, {} destination item(s) adopted)",
+			adopted.len()
+		);
 		Ok(())
 	}
 
@@ -1661,6 +1715,31 @@ fn refusal(prep: &Prepared) -> Option<RefuseReason> {
 	None
 }
 
+/// Why a [`Backlog::AdoptDestination`] switch must not act on the read it just made — `None` when
+/// it can. Decided purely (no I/O) so the policy is unit-testable.
+///
+/// The bar is the pass's own: a 1:1 path mapping (no name collision on either side) plus
+/// [`absence_trusted`](guard::ScreenState::absence_trusted), since the adoption is entirely a
+/// judgement about which paths one side no longer has.
+fn adoption_refusal(refused: Option<RefuseReason>, state: &guard::ScreenState) -> Option<String> {
+	if let Some(reason) = refused {
+		return Some(reason.to_string());
+	}
+	if state.absence_trusted() {
+		return None;
+	}
+	Some(
+		if !state.scan_complete {
+			"the local scan is incomplete"
+		} else if !state.remote_converged {
+			"the remote view has never converged"
+		} else {
+			"the remote view came back wholly empty"
+		}
+		.to_string(),
+	)
+}
+
 /// A reconciled, guard-screened pass.
 struct Screened {
 	/// Paths surfaced as two-way conflicts (held, never applied).
@@ -1873,6 +1952,56 @@ mod tests {
 
 		// Nothing blocked -> the plan is untouched.
 		assert_eq!(drop_blocked(actions.clone(), &BTreeSet::new()), actions);
+	}
+
+	/// A mode switch that adopts the destination's standing copies rewrites baseline rows for every
+	/// path it reads as gone on the source side, so it may only run on evidence a pass would act on.
+	/// Untrusted, the switch is worse than useless: it adopts nothing and then propagates the whole
+	/// backlog the caller asked to keep, or adopts a whole pair from whichever side a transient fault
+	/// left listing something.
+	#[test]
+	fn adopting_the_destination_is_refused_on_evidence_a_pass_would_not_act_on() {
+		let healthy = guard::ScreenState {
+			scan_complete: true,
+			remote_converged: true,
+			remote_emptied: false,
+			first_sync: false,
+			tracked: 5,
+		};
+		assert_eq!(adoption_refusal(None, &healthy), None);
+
+		for (state, expected) in [
+			(
+				guard::ScreenState {
+					scan_complete: false,
+					..healthy
+				},
+				"the local scan is incomplete",
+			),
+			(
+				guard::ScreenState {
+					remote_converged: false,
+					..healthy
+				},
+				"the remote view has never converged",
+			),
+			(
+				guard::ScreenState {
+					remote_emptied: true,
+					..healthy
+				},
+				"the remote view came back wholly empty",
+			),
+		] {
+			assert_eq!(adoption_refusal(None, &state).as_deref(), Some(expected));
+		}
+
+		// A name collision makes a 1:1 mapping impossible, so it refuses the switch for the same
+		// reason it refuses a pass — even with everything else healthy.
+		assert_eq!(
+			adoption_refusal(Some(RefuseReason::LocalCollision), &healthy).as_deref(),
+			Some(RefuseReason::LocalCollision.to_string().as_str())
+		);
 	}
 
 	fn scan_root(tag: &str) -> PathBuf {

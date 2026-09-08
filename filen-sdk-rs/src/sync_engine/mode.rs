@@ -23,6 +23,33 @@ pub enum SyncMode {
 	RemoteBackup,
 }
 
+/// What a [`reconfigure_pair`](super::SyncEngine::reconfigure_pair) does with the divergence the
+/// OLD mode deliberately left standing — the backup destination's copies of items the source has
+/// since deleted.
+///
+/// It only ever matters when the old mode was additive and the new one is not: a backup mode never
+/// propagates a source deletion, so its destination accumulates copies the mirror modes would
+/// remove on their next pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backlog {
+	/// Reconcile the two sides as they are, under the new rules. Every deletion the old mode left
+	/// standing is pending from the next pass and propagates at once (mass-delete-guard screened).
+	Propagate,
+	/// Adopt the destination's standing copies first: every path the SOURCE no longer has, but the
+	/// destination still does, is re-seeded into the baseline from the destination's current state
+	/// before the switch takes effect.
+	///
+	/// In a one-way mirror those copies then count as intended — the next pass neither deletes them
+	/// nor pushes them back to the source, until the source has something at that path again. In
+	/// [`TwoWay`](SyncMode::TwoWay) they read as newly created on the side that still has them and
+	/// flow back to the other.
+	///
+	/// Because it is a judgement about what one side no longer has, the switch is REFUSED on the
+	/// same evidence a pass holds its deletions on — a name collision, an incomplete local scan, an
+	/// unconverged or wholly empty remote view — leaving the mode unchanged for the caller to retry.
+	AdoptDestination,
+}
+
 impl SyncMode {
 	/// Whether local-side changes flow to the remote.
 	pub(crate) fn pushes(self) -> bool {
