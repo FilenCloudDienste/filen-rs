@@ -894,7 +894,18 @@ fn detect_moves(
 			// edit at `from` this is a genuine both-sides divergence, and consuming it as a move
 			// would rename the local copy and then write over it, laundering a conflict into a
 			// silent overwrite. The mode decides what it becomes instead; see the doc comment.
-			if classify_local(local.get(from), Some(base)) != Side::Unchanged {
+			//
+			// A row with NO local content on record is not such an edit: it is a row waiting for a
+			// push (a `KeepLocal` resolution anchors the baseline to the remote and clears the
+			// local half on purpose). Comparing a hash against `None` reports "changed" for every
+			// one of them, which would turn a remote rename landing before that push into a second
+			// conflict at the source plus a download at the new name. No local evidence is not
+			// evidence of a local change: carry the move across and let the pending push follow at
+			// the new name. The waiver is for the RENAME only — a move that also carried an EDIT is
+			// refused below, where the kept copy would end up under the download.
+			if base.content_hash.is_some()
+				&& classify_local(local.get(from), Some(base)) != Side::Unchanged
+			{
 				continue;
 			}
 			// `carries_edit`: the lineage moved AND changed version, so the local copy this move
@@ -917,9 +928,16 @@ fn detect_moves(
 			// remote-side deletion. So the source is surfaced here and its path consumed; the moved
 			// version is untracked at its new name and downloads there through the ordinary
 			// reconcile, which is the same outcome the uuid branch produces for a two-sided change.
+			//
+			// A row with no local content on record is measured the same way, and has to be spelled
+			// out because [`is_unconfirmed_concurrent_edit`] has no hash of ours to compare: being
+			// excused from the local-change guard above is not agreement. The copy a `KeepLocal`
+			// resolution kept is diverged from what the remote holds by construction, so a remote
+			// change that renamed AND edited the file is the same divergence one rename away.
 			if carries_edit
 				&& mode.pushes()
-				&& is_unconfirmed_concurrent_edit(local.get(from), remote.get(to), Some(base))
+				&& (base.content_hash.is_none()
+					|| is_unconfirmed_concurrent_edit(local.get(from), remote.get(to), Some(base)))
 			{
 				let action = SyncAction::Conflict {
 					rel_path: from.clone(),
@@ -1821,6 +1839,112 @@ mod tests {
 				},
 			],
 			"the move and the edit it carried are applied together"
+		);
+	}
+
+	/// The guard is about a local CHANGE, not about a row that happens to record no local content.
+	/// A `KeepLocal` resolution anchors the row to the remote and clears the local half on purpose,
+	/// so the row sits at `content_hash: None` until the re-push. Comparing a hash against `None`
+	/// reports "changed" for every such row, and a remote rename landing in that window would then
+	/// be refused as a move: a second conflict at the source plus a download at the new name,
+	/// instead of the rename the remote actually made.
+	#[test]
+	fn a_remote_rename_before_a_kept_local_re_push_is_still_a_move() {
+		let uuid = Uuid::new_v4();
+		// The row a KeepLocal resolution leaves: the remote's anchor, no local evidence at all.
+		let kept = BaselineEntry {
+			content_hash: None,
+			size: None,
+			local_mtime: None,
+			agreed_hash: None,
+			..base_file("a.txt", uuid, [5; 32])
+		};
+		let baseline = map(vec![("a.txt", kept)]);
+		// The local copy still holds the bytes the caller kept; the remote renamed its own (still
+		// diverged) copy a.txt -> b.txt, same uuid.
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![("b.txt", remote_file("b.txt", uuid, [2; 32]))]);
+
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::MoveLocal {
+				from_path: "a.txt".to_string(),
+				to_path: "b.txt".to_string(),
+			}],
+			"the rename must be carried across, with nothing else planned at either path"
+		);
+
+		// The pending push follows on the NEXT pass, at the new name. Planned against the row the
+		// apply step actually writes for this move — not a hand-made one: the row's local half is
+		// what decides whether the scanner even looks at the file again, so a test that invented it
+		// could pass over an engine that never pushes the kept copy at all.
+		let moved = map(vec![(
+			"b.txt",
+			super::super::apply::moved_file_row(
+				"b.txt",
+				baseline.get("a.txt"),
+				remote.get("b.txt"),
+				Some(1),
+			),
+		)]);
+		assert_eq!(
+			moved["b.txt"].content_hash, None,
+			"the moved row records no local content, so the scanner must re-hash at the new path"
+		);
+		let local_moved = map(vec![("b.txt", local_file("b.txt", [1; 32]))]);
+		assert_eq!(
+			plan(SyncMode::TwoWay, &moved, &local_moved, &remote),
+			vec![SyncAction::UploadFile {
+				rel_path: "b.txt".to_string(),
+			}],
+			"the kept local copy must be pushed at its new name"
+		);
+	}
+
+	/// The other half of that guard. "No local content on record" excuses the row from being read as
+	/// a local EDIT, but it is not agreement either: the copy a `KeepLocal` resolution kept is
+	/// diverged from what the remote holds, by construction. So a remote change that renamed AND
+	/// edited the file is not carried across it — the rename would put the kept bytes under the
+	/// paired download, which is the loss the unconfirmed-push rule exists to stop, one rename away.
+	/// Same outcome as that rule's: the source surfaces, and the moved version arrives untracked
+	/// under its new name.
+	#[test]
+	fn a_remote_rename_that_carried_an_edit_is_not_moved_onto_a_kept_local_copy() {
+		let lineage = Uuid::new_v4();
+		let new_uuid = Uuid::new_v4();
+		let kept = BaselineEntry {
+			content_hash: None,
+			size: None,
+			local_mtime: None,
+			agreed_hash: None,
+			..base_file("a.txt", lineage, [5; 32])
+		};
+		let baseline = map(vec![("a.txt", kept)]);
+		let local = map(vec![("a.txt", local_file("a.txt", [1; 32]))]);
+		let remote = map(vec![(
+			"b.txt",
+			remote_version("b.txt", lineage, new_uuid, [2; 32]),
+		)]);
+
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			!actions
+				.iter()
+				.any(|a| matches!(a, SyncAction::MoveLocal { .. })),
+			"the kept copy must not be renamed under the download: {actions:?}"
+		);
+		assert!(
+			actions.contains(&SyncAction::Conflict {
+				rel_path: "a.txt".to_string(),
+			}),
+			"the divergence must be surfaced: {actions:?}"
+		);
+		assert!(
+			actions.iter().any(|a| matches!(
+				a,
+				SyncAction::DownloadFile { rel_path, .. } if rel_path == "b.txt"
+			)),
+			"the moved version still arrives under its new name: {actions:?}"
 		);
 	}
 
