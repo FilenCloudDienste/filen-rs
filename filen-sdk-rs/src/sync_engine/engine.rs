@@ -175,7 +175,7 @@ impl PushTenure {
 ///
 /// The timestamps are what confirms a push no snapshot ever caught as the head (see
 /// [`CONFIRM_TENURE`]). Both are recorded on the cache worker thread, so this type never does more
-/// than take a lock and touch two maps.
+/// than take a lock and look a couple of uuids up.
 #[derive(Debug, Default)]
 pub(super) struct Observations(std::sync::Mutex<ObservationState>);
 
@@ -184,7 +184,14 @@ struct ObservationState {
 	seq: u64,
 	seen: HashMap<Uuid, (u64, Instant)>,
 	/// Pushes of ours whose content is not agreed yet, keyed by the version uuid the upload minted.
+	///
+	/// Only ever touched through [`ObservationState::insert_push`] and
+	/// [`ObservationState::drop_push`], which keep `pushes_by_lineage` in step with it.
 	pushes: HashMap<Uuid, PushTenure>,
+	/// The same records' uuids grouped by the file they belong to, so an event about a file we
+	/// pushed reaches its record without walking every push being watched — a first sync leaves one
+	/// per uploaded file until the pass after it records what got confirmed.
+	pushes_by_lineage: HashMap<filen_types::fs::StableUuid, Vec<Uuid>>,
 	/// Every version uuid this engine's own uploads minted recently, confirmed or not.
 	///
 	/// The version chain cannot say who made a version and the server stamps them to the second,
@@ -237,13 +244,13 @@ impl Observations {
 		let now = Instant::now();
 		let mut state = self.state();
 		if let Some(replaced) = replaced {
-			state.pushes.remove(&replaced);
+			state.drop_push(replaced);
 		}
 		// The cache can announce our own upload before the call that made it has returned; the
 		// announcement map is the only place that moment survives.
 		let announced = state.seen.get(&uuid).map(|(_, at)| *at);
 		state.minted.insert(uuid, now);
-		state.pushes.insert(
+		state.insert_push(
 			uuid,
 			PushTenure {
 				lineage,
@@ -276,12 +283,15 @@ impl Observations {
 	/// Forget the push records a pass has finished with, and any that no pass will ever read again.
 	fn forget_pushes(&self, decided: &[Uuid], now: Instant) {
 		let mut state = self.state();
-		for uuid in decided {
-			state.pushes.remove(uuid);
-		}
-		state
+		let expired: Vec<Uuid> = state
 			.pushes
-			.retain(|_, push| now.saturating_duration_since(push.recorded) < PUSH_RECORD_TTL);
+			.iter()
+			.filter(|(_, push)| now.saturating_duration_since(push.recorded) >= PUSH_RECORD_TTL)
+			.map(|(uuid, _)| *uuid)
+			.collect();
+		for uuid in decided.iter().chain(&expired) {
+			state.drop_push(*uuid);
+		}
 		state
 			.minted
 			.retain(|_, at| now.saturating_duration_since(*at) < MINTED_TTL);
@@ -330,17 +340,50 @@ impl ObservationState {
 		self.seen.insert(uuid, (seq, now));
 	}
 
+	/// Start watching a push, filed under its lineage as well as its own uuid.
+	fn insert_push(&mut self, uuid: Uuid, push: PushTenure) {
+		// A second record for one uuid would leave the first one's index entry behind.
+		self.drop_push(uuid);
+		if let Some(lineage) = push.lineage {
+			self.pushes_by_lineage
+				.entry(lineage)
+				.or_default()
+				.push(uuid);
+		}
+		self.pushes.insert(uuid, push);
+	}
+
+	/// Retire one push record, index entry and all. A stale entry there would either point at a
+	/// record that is gone or keep a retired one reachable.
+	fn drop_push(&mut self, uuid: Uuid) {
+		let Some(lineage) = self.pushes.remove(&uuid).and_then(|push| push.lineage) else {
+			return;
+		};
+		if let Some(watched) = self.pushes_by_lineage.get_mut(&lineage) {
+			watched.retain(|watched| *watched != uuid);
+			if watched.is_empty() {
+				self.pushes_by_lineage.remove(&lineage);
+			}
+		}
+	}
+
+	/// Note that something else now stands where our push of this file stood.
+	fn supersede_lineage(&mut self, lineage: filen_types::fs::StableUuid, now: Instant) {
+		let Some(watched) = self.pushes_by_lineage.get(&lineage) else {
+			return;
+		};
+		for uuid in watched {
+			if let Some(push) = self.pushes.get_mut(uuid) {
+				push.superseded.get_or_insert(now);
+			}
+		}
+	}
+
 	/// Time-stamp what one cache event says about the pushes being watched: a live announcement of
 	/// our own version, or something taking its place.
 	///
-	/// The scan over the watched pushes is bounded by how many pushes this engine has made since the
-	/// last pass persisted what it confirmed — every one of those records is retired there, whether
-	/// it was a snapshot or a tenure that vouched for it — so in steady state it is a handful of
-	/// comparisons on the cache worker thread.
-	///
-	/// ponytail: O(pushes) per foreign event, which a first sync of a huge tree can make O(n) while
-	/// its uploads are still unsettled. A `lineage -> uuids` index beside `pushes` makes it O(1) if
-	/// that ever shows up in a profile.
+	/// Both are map lookups: this runs on the cache worker thread, for every event of every
+	/// committed batch, while a first sync can leave one watched push per uploaded file.
 	fn note_tenure(&mut self, event: &CacheEvent<'_>, now: Instant) {
 		let CacheEventType::File(file) = &event.event else {
 			return;
@@ -353,11 +396,7 @@ impl ObservationState {
 				}
 				// A different version of a file we pushed: whatever announced it, ours is no longer
 				// what the remote holds.
-				for (uuid, push) in self.pushes.iter_mut() {
-					if *uuid != f.uuid && push.lineage == Some(f.stable_uuid) {
-						push.superseded.get_or_insert(now);
-					}
-				}
+				self.supersede_lineage(f.stable_uuid, now);
 			}
 			// An edit (either versioning mode) or a deletion of our own version: either way it stopped
 			// standing at this moment.
@@ -4154,6 +4193,43 @@ mod tests {
 		// Past the window a pass reasons about, it goes.
 		observations.forget_pushes(&[], Instant::now() + MINTED_TTL);
 		assert!(!observations.minted(ours));
+	}
+
+	/// A push is superseded through the lineage index, so the index has to hold exactly the records
+	/// being watched: an entry that outlives its record would keep a retired push reachable, and a
+	/// record missing from it would never learn it was superseded — a push confirmed by a tenure it
+	/// did not have, which pulls another client's concurrent edit over ours without a word.
+	#[test]
+	fn another_version_of_a_file_we_pushed_supersedes_it_through_the_lineage_index() {
+		let mut state = ObservationState::default();
+		let lineage = StableUuid::new_for_test(Uuid::new_v4());
+		let (ours, replaced) = (Uuid::new_v4(), Uuid::new_v4());
+		let now = Instant::now();
+		let watched = || PushTenure {
+			lineage: Some(lineage),
+			recorded: now,
+			announced: Some(now),
+			superseded: None,
+		};
+		state.insert_push(replaced, watched());
+		state.insert_push(ours, watched());
+
+		// The version our own upload replaced is not watched any more, so nothing about the file
+		// speaks for it.
+		state.drop_push(replaced);
+		state.supersede_lineage(lineage, now + Duration::from_secs(5));
+		let ripe = now + Duration::from_secs(40);
+		assert_eq!(
+			state.pushes[&ours].verdict(ripe),
+			PushVerdict::Unconfirmed,
+			"another client's version landed on ours inside the window"
+		);
+
+		state.drop_push(ours);
+		assert!(
+			state.pushes_by_lineage.is_empty(),
+			"the index outlived the records it points at"
+		);
 	}
 
 	#[test]
