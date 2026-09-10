@@ -2094,9 +2094,167 @@ async fn control_add_concurrent_overlapping_registrations_refused() {
 	std::fs::remove_dir_all(&local).ok();
 }
 
+/// CONTROL-09b — the nesting the CACHE cannot see: a folder created seconds ago by another client
+/// has no cached ancestry at all, so registering a pair on it used to be allowed and left two pairs
+/// fighting over one subtree. The check asks the server for the chain instead, so the refusal does
+/// not depend on the cache having caught up.
+#[shared_test_runtime]
+async fn control_09b_nested_remote_root_refused_before_the_cache_knows_it() {
+	let (resources, cache, _root, local_a) = raw_setup("c09ba").await;
+	let local_b = fresh_local_dir("c09bb");
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+
+	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
+	let docs = cache
+		.client
+		.create_dir(&root_dt, "c09b_docs")
+		.await
+		.unwrap();
+	engine
+		.add_pair(local_a.clone(), docs.uuid(), SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	// Created through the OTHER client, and used at once: this engine's cache has never heard of it
+	// (and if the socket beats us to it, the answer must be the same one).
+	let fresh = resources
+		.client
+		.create_dir(
+			&DirType::<Normal>::Dir(std::borrow::Cow::Owned(docs.clone())),
+			"c09b_fresh",
+		)
+		.await
+		.unwrap();
+	let error = engine
+		.add_pair(local_b.clone(), fresh.uuid(), SyncMode::TwoWay)
+		.await
+		.expect_err("a remote root inside another pair's root must be refused, cached or not")
+		.to_string();
+	assert!(
+		error.contains("inside sync pair"),
+		"the refusal must name the nesting: {error}"
+	);
+
+	// The other direction, equally uncached: a pair on a folder that CONTAINS an existing pair's
+	// remote root. `c09b_outer` is brand new, so nothing relates it to `docs` but the server.
+	let outer = resources
+		.client
+		.create_dir(&root_dt, "c09b_outer")
+		.await
+		.unwrap();
+	let inner = resources
+		.client
+		.create_dir(
+			&DirType::<Normal>::Dir(std::borrow::Cow::Owned(outer.clone())),
+			"c09b_inner",
+		)
+		.await
+		.unwrap();
+	let pair_inner = engine
+		.add_pair(local_b.clone(), inner.uuid(), SyncMode::TwoWay)
+		.await
+		.expect("a disjoint pair is accepted");
+	let local_c = fresh_local_dir("c09bc");
+	let error = engine
+		.add_pair(local_c.clone(), outer.uuid(), SyncMode::TwoWay)
+		.await
+		.expect_err("a remote root containing another pair's root must be refused")
+		.to_string();
+	assert!(
+		error.contains("contains sync pair"),
+		"the refusal must name the containment: {error}"
+	);
+
+	// Exactly the two accepted pairs are registered; neither refusal left anything behind.
+	let pairs = engine.list_pairs().await.unwrap();
+	assert_eq!(pairs.len(), 2, "{pairs:?}");
+	assert!(pairs.iter().any(|p| p.id == pair_inner), "{pairs:?}");
+
+	std::fs::remove_dir_all(&local_a).ok();
+	std::fs::remove_dir_all(&local_b).ok();
+	std::fs::remove_dir_all(&local_c).ok();
+}
+
+/// CONTROL-09c — a registered pair whose remote root someone else DELETED must not wedge every
+/// later registration. `add_pair` walks each registered root's ancestry on the server, so a root
+/// that will not resolve would refuse a registration the caller never asked about. It does not: the
+/// server keeps answering for a trashed-and-emptied folder, with `Trash` as its parent, and the
+/// walk stops there — the deleted pair relates to nothing and the new pair goes in. This pins that,
+/// because the alternative (an error out of the walk) is invisible until someone hits it.
+#[shared_test_runtime]
+async fn control_09c_a_deleted_pair_root_does_not_block_a_new_pair() {
+	let (resources, cache, _root, local_a) = raw_setup("c09ca").await;
+	let local_b = fresh_local_dir("c09cb");
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+
+	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
+	let mut doomed = cache
+		.client
+		.create_dir(&root_dt, "c09c_doomed")
+		.await
+		.unwrap();
+	let doomed_uuid = doomed.uuid();
+	engine
+		.add_pair(local_a.clone(), doomed_uuid, SyncMode::TwoWay)
+		.await
+		.unwrap();
+
+	// Another client trashes the pair's remote root and empties the trash out from under it.
+	resources.client.trash_dir(&mut doomed).await.unwrap();
+	resources
+		.client
+		.delete_dir_permanently(doomed)
+		.await
+		.unwrap();
+
+	// A brand-new sibling folder, plainly disjoint from the deleted one. Registering it must not
+	// fail on the OTHER pair's root failing to resolve.
+	let fresh = cache
+		.client
+		.create_dir(&root_dt, "c09c_fresh")
+		.await
+		.unwrap();
+	let pair_b = engine
+		.add_pair(local_b.clone(), fresh.uuid(), SyncMode::TwoWay)
+		.await
+		.expect("a disjoint pair must register even when another pair's remote root is gone");
+
+	let pairs = engine.list_pairs().await.unwrap();
+	assert_eq!(pairs.len(), 2, "{pairs:?}");
+	assert!(pairs.iter().any(|p| p.id == pair_b), "{pairs:?}");
+
+	// The registration still relates what it CAN: a root nested under the surviving pair is
+	// refused, so degrading the gone root did not degrade the check itself.
+	let nested = resources
+		.client
+		.create_dir(
+			&DirType::<Normal>::Dir(std::borrow::Cow::Owned(fresh.clone())),
+			"c09c_nested",
+		)
+		.await
+		.unwrap();
+	let local_c = fresh_local_dir("c09cc");
+	let error = engine
+		.add_pair(local_c.clone(), nested.uuid(), SyncMode::TwoWay)
+		.await
+		.expect_err("a remote root inside a live pair's root must still be refused")
+		.to_string();
+	assert!(
+		error.contains("inside sync pair"),
+		"the refusal must name the nesting: {error}"
+	);
+
+	std::fs::remove_dir_all(&local_a).ok();
+	std::fs::remove_dir_all(&local_b).ok();
+	std::fs::remove_dir_all(&local_c).ok();
+}
+
 /// CONTROL-09 — overlapping REMOTE roots are refused: the same remote folder outright, and a
-/// nested one whenever the cache can relate the two uuids (see `PairOverlap`'s note on that being
-/// best-effort).
+/// nested one whether or not the cache can already relate the two uuids.
 #[shared_test_runtime]
 async fn control_09_nested_remote_roots_deterministic() {
 	let (resources, cache, _root, local_a) = raw_setup("c09a").await;
