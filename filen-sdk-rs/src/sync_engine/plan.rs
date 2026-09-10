@@ -830,19 +830,26 @@ pub(super) fn interleaved_version(
 }
 
 /// The baseline rows a [`Backlog::AdoptDestination`](super::mode::Backlog::AdoptDestination) mode
-/// switch writes: one per tracked path where the NEW mode's source side has nothing and the
-/// destination still holds a copy — the standing backlog a backup mode accumulated.
+/// switch writes: one per path the NEW mode's source side has nothing at while the destination
+/// holds a copy — the pair's standing backlog, plus whatever else the destination has accumulated.
 ///
 /// Each row records what the destination holds RIGHT NOW (from the same snapshot and scan a pass
 /// reads), marked [`BaselineState::Adopted`]: the copy is intended, not a deletion waiting to be
 /// propagated. What that means per mode is [`reconcile`]'s business, not this function's.
 ///
-/// Two deliberate exclusions:
-/// - a path with no baseline row at all. That is an item the pair never synced — a file another
-///   client created on the destination — and the new mode's ordinary rules apply to it, exactly as
-///   they would have without a switch. Only the pair's own standing divergence is adopted.
-/// - a held conflict. It is the caller's to [`resolve_conflict`](super::SyncEngine::resolve_conflict),
-///   and overwriting the row with an adoption would drop the divergence it is holding.
+/// Two sources, both destination-only:
+/// - a TRACKED path (a `Synced` row) the source has lost: the standing backlog a backup mode
+///   accumulated.
+/// - an UNTRACKED path — no baseline row at all — that only the destination holds: a file another
+///   client created straight on the destination. It has never been the pair's to delete, and
+///   without a row a one-way mirror trashes it on the very next pass, so the switch adopts it too.
+///   Only in the ONE-WAY modes: two-way has no destination to spare, an untracked copy already
+///   flows back to the other side under the ordinary rules, and a row here would only take the path
+///   out of move detection (see [`detect_moves`]).
+///
+/// A held conflict is excluded from both: it is the caller's to
+/// [`resolve_conflict`](super::SyncEngine::resolve_conflict), and overwriting the row with an
+/// adoption would drop the divergence it is holding.
 pub(crate) fn adopt_destination_rows(
 	mode: super::SyncMode,
 	baseline: &HashMap<String, BaselineEntry>,
@@ -876,6 +883,32 @@ pub(crate) fn adopt_destination_rows(
 			);
 			rows.push(row);
 		}
+	}
+	let untracked = |rel_path: &String| !baseline.contains_key(rel_path);
+	match mode {
+		super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => {
+			for (rel_path, node) in remote.iter().filter(|(p, _)| untracked(p)) {
+				if local.contains_key(rel_path) {
+					continue;
+				}
+				tracing::debug!(
+					"reconfigure: adopting the destination-only item {rel_path:?} — the pair never tracked it"
+				);
+				rows.push(adopted_from_remote(rel_path, node));
+			}
+		}
+		super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => {
+			for (rel_path, node) in local.iter().filter(|(p, _)| untracked(p)) {
+				if remote.contains_key(rel_path) {
+					continue;
+				}
+				tracing::debug!(
+					"reconfigure: adopting the destination-only item {rel_path:?} — the pair never tracked it"
+				);
+				rows.push(adopted_from_local(rel_path, node));
+			}
+		}
+		super::SyncMode::TwoWay => {}
 	}
 	rows
 }
@@ -2626,8 +2659,8 @@ mod tests {
 	// Backlog::AdoptDestination — the mode-switch re-seed and what it plans
 	// ------------------------------------------------------------------------
 
-	/// The re-seed picks exactly the tracked paths whose SOURCE side is gone under the NEW mode,
-	/// and anchors each row to what the destination holds now.
+	/// The re-seed picks exactly the paths whose SOURCE side is gone under the NEW mode — tracked or
+	/// not — and anchors each row to what the destination holds now.
 	#[test]
 	fn the_reseed_adopts_only_the_paths_the_source_no_longer_has() {
 		let gone = Uuid::new_v4();
@@ -2649,12 +2682,15 @@ mod tests {
 		]);
 
 		let rows = adopt_destination_rows(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		let mut adopted: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
+		adopted.sort_unstable();
 		assert_eq!(
-			rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
-			vec!["gone.txt"],
-			"only the standing source deletion is adopted"
+			adopted,
+			vec!["gone.txt", "untracked.txt"],
+			"the standing source deletion AND the destination-only item the pair never tracked; \
+			 both.txt is on both sides, so it is neither"
 		);
-		let row = &rows[0];
+		let row = rows.iter().find(|r| r.rel_path == "gone.txt").unwrap();
 		assert_eq!(row.state, BaselineState::Adopted);
 		assert_eq!(row.remote_uuid, Some(gone), "anchored to the remote copy");
 		assert_eq!(row.content_hash, Some(Blake3Hash::from([1; 32])));
@@ -2671,6 +2707,81 @@ mod tests {
 			rows.iter().all(|r| r.remote_uuid.is_none()),
 			"a local-side adoption records no remote anchor: {rows:?}"
 		);
+	}
+
+	/// A file another client created straight on the destination has no baseline row, so before the
+	/// switch adopted it a one-way mirror read it as an item to remove and trashed it on the very
+	/// next pass. The adoption is what makes the destination's contents what the caller asked to
+	/// keep, rather than only the pair's own standing backlog.
+	#[test]
+	fn the_reseed_adopts_a_destination_only_item_the_pair_never_tracked() {
+		let theirs = Uuid::new_v4();
+		let remote = map(vec![(
+			"theirs.txt",
+			remote_file("theirs.txt", theirs, [7; 32]),
+		)]);
+		let (baseline, local) = (map(vec![]), map(vec![]));
+
+		// Without a row the mirror removes it.
+		assert_eq!(
+			plan(SyncMode::LocalToRemote, &baseline, &local, &remote),
+			vec![SyncAction::TrashRemote {
+				rel_path: "theirs.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: theirs,
+			}]
+		);
+
+		let rows = adopt_destination_rows(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert_eq!(
+			rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
+			vec!["theirs.txt"]
+		);
+		assert_eq!(rows[0].state, BaselineState::Adopted);
+		assert_eq!(rows[0].remote_uuid, Some(theirs));
+
+		let adopted = map(vec![("theirs.txt", rows.into_iter().next().unwrap())]);
+		assert!(
+			plan(SyncMode::LocalToRemote, &adopted, &local, &remote).is_empty(),
+			"the adopted copy must survive the switch"
+		);
+
+		// Two-way needs no row: an untracked destination-only item already flows back on its own,
+		// and a row here would only take the path out of move detection.
+		assert!(adopt_destination_rows(SyncMode::TwoWay, &baseline, &local, &remote).is_empty());
+		assert_eq!(
+			plan(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::DownloadFile {
+				rel_path: "theirs.txt".to_string(),
+				remote_uuid: theirs,
+			}]
+		);
+	}
+
+	/// The mirror image, with the LOCAL tree as the destination: a file someone dropped into the
+	/// local root is adopted rather than deleted by the first pull-only pass after the switch.
+	#[test]
+	fn the_reseed_adopts_a_local_only_item_when_the_local_side_is_the_destination() {
+		let local = map(vec![("dropped.txt", local_file("dropped.txt", [7; 32]))]);
+		let (baseline, remote) = (map(vec![]), map(vec![]));
+
+		assert_eq!(
+			plan(SyncMode::RemoteToLocal, &baseline, &local, &remote),
+			vec![SyncAction::DeleteLocal {
+				rel_path: "dropped.txt".to_string(),
+				kind: NodeKind::File,
+			}]
+		);
+
+		let rows = adopt_destination_rows(SyncMode::RemoteToLocal, &baseline, &local, &remote);
+		assert_eq!(
+			rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
+			vec!["dropped.txt"]
+		);
+		assert!(rows[0].remote_uuid.is_none(), "anchored to the local copy");
+
+		let adopted = map(vec![("dropped.txt", rows.into_iter().next().unwrap())]);
+		assert!(plan(SyncMode::RemoteToLocal, &adopted, &local, &remote).is_empty());
 	}
 
 	/// A local tree standing in for "the local side kept both files, the remote lost them".

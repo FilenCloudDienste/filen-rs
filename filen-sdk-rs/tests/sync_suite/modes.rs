@@ -1081,11 +1081,12 @@ async fn mode_22_switch_local_backup_to_l2r_applies_the_standing_divergence() {
 	sc.cleanup();
 }
 
-/// MODE-22b — the same switch with `Backlog::AdoptDestination`: the standing backlog is re-seeded
-/// from the DESTINATION before the new mode takes effect, so the backup copies of files the source
-/// deleted count as intended. The next pass plans nothing at all, and the copies survive — while a
-/// deletion made AFTER the switch still propagates, since the adoption is a one-off re-seed and not
-/// a permanent exemption.
+/// MODE-22b — the same switch with `Backlog::AdoptDestination`: the destination's contents are
+/// re-seeded into the baseline before the new mode takes effect, so the backup copies of files the
+/// source deleted count as intended — and so does a file another client put on the destination
+/// directly, which the pair never tracked and a mirror would otherwise remove on its first pass.
+/// That next pass plans nothing at all and both copies survive, while a deletion made AFTER the
+/// switch still propagates: the adoption is a one-off re-seed, not a permanent exemption.
 #[shared_test_runtime]
 async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead() {
 	let sc = single_client(SyncMode::LocalBackup).await;
@@ -1098,6 +1099,11 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 	std::fs::remove_file(sc.local.join("x.txt")).unwrap();
 	let r2 = sc.sync().await;
 	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+
+	// A file another client wrote straight to the destination: no baseline row anywhere, so the
+	// mirror the switch turns on reads it as an item to remove.
+	let theirs = upload_remote(&sc, "z.txt", b"Z-FROM-ANOTHER-CLIENT").await;
+	wait_cache_has(&sc, theirs.uuid()).await;
 
 	sc.engine
 		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote, Backlog::AdoptDestination)
@@ -1128,10 +1134,18 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 		!sc.local.join("x.txt").exists(),
 		"a one-way mirror never writes to its source"
 	);
+	assert!(
+		!sc.local.join("z.txt").exists(),
+		"nor for an item it adopted from the destination"
+	);
 	let (_d, files) = list_remote_root(&sc).await;
 	assert!(
 		find_file(&files, "x.txt").is_some(),
 		"the adopted backup copy must survive the switch"
+	);
+	assert!(
+		find_file(&files, "z.txt").is_some(),
+		"so must the destination-only file the pair never tracked"
 	);
 
 	// A deletion made after the switch is mirrored the ordinary way.
@@ -1143,6 +1157,10 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 	assert!(
 		find_file(&files, "x.txt").is_some(),
 		"the adopted copy must still be there"
+	);
+	assert!(
+		find_file(&files, "z.txt").is_some(),
+		"and so must the adopted destination-only file"
 	);
 	assert!(
 		find_file(&files, "y.txt").is_none(),
