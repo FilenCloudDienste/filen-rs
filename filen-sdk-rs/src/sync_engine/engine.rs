@@ -12,6 +12,7 @@ use std::{
 };
 
 use chrono::Utc;
+use filen_types::fs::ParentUuid;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -34,9 +35,9 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	cache::{CacheEvent, CacheEventType, DirEvent, FileEvent, SyncRootCallback, SyncRootHandle},
-	fs::HasUUID,
 	fs::dir::cache::CacheableDir,
 	fs::file::cache::CacheableFile,
+	fs::{HasParent, HasUUID},
 	io::client_impl::IoSharedClientExt,
 };
 
@@ -67,6 +68,14 @@ const MAX_PATH_FAILURES: u32 = 3;
 /// exists, where its foreign key refuses it rather than let it into whatever pair sqlite gives that
 /// id next.
 const REMOVE_CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// How many levels [`SyncEngine::add_pair`]'s remote-ancestry walk climbs before it gives up.
+///
+/// A flat ceiling rather than a chain read in one request, because no such endpoint exists — the
+/// walk is one `get_dir` per level, and a folder nested this deep is not somewhere a sync pair gets
+/// registered. A chain that hits the ceiling is logged, and a nesting above it goes undetected
+/// exactly as it did before the walk existed.
+const MAX_REMOTE_ANCESTRY_DEPTH: usize = 64;
 
 /// One remote write this engine made, and how to tell whether the cache has caught up to it.
 #[derive(Debug)]
@@ -923,15 +932,14 @@ pub struct SyncEngine {
 /// Carried as the source of the returned [`Error`], so a caller that wants to react per case can
 /// recover it with [`Error::downcast`].
 ///
-/// # The remote-nesting gap
+/// # How remote nesting is established
 ///
-/// Remote nesting is detected from the CACHE's ancestry of the two roots, which is the only cheap
-/// way to relate two uuids without a round trip per pair. That makes the nested-remote checks
-/// BEST-EFFORT: a remote root the cache has not learned about yet (a folder created seconds ago, a
-/// cache still converging) has no cached ancestry, so a nesting it is part of is not seen and the
-/// registration is allowed. Equal remote roots are caught regardless — that comparison needs no
-/// cache. A nesting missed here surfaces later as the two pairs disagreeing about the shared
-/// subtree; re-checking it on every pass is the fix if that ever proves to matter in practice.
+/// Two uuids only relate through their ancestry. The CACHE answers that for free, but only for what
+/// it has enumerated — a folder created seconds ago is not in it yet — so what the cache cannot
+/// prove is asked of the SERVER, one [`Client::get_dir`] per level up to the account root. That
+/// makes the nested-remote checks exact rather than best-effort, at the price of
+/// [`SyncEngine::add_pair`] needing the network: a server error refuses the registration instead of
+/// registering a pair whose roots were never actually checked.
 #[derive(Debug, thiserror::Error)]
 pub enum PairOverlap {
 	/// Another pair already syncs this exact local folder.
@@ -974,6 +982,31 @@ fn local_overlap(candidate: &Path, existing: &Path, pair: PairId) -> Option<Pair
 			pair,
 			existing: shown(),
 		})
+	} else {
+		None
+	}
+}
+
+/// How a candidate remote root relates to an existing pair's, or `None` when they are disjoint.
+///
+/// The same test as [`local_overlap`] with the two roots' upward ancestor chains — each the root
+/// itself followed by every ancestor up to the account root — standing in for path prefixes. A
+/// chain short of the account root only ever proves a relation, never the absence of one, which is
+/// why the caller runs this over the cache's partial chains for a refusal and over
+/// [`SyncEngine::server_ancestry`]'s complete ones before it accepts.
+fn remote_overlap(
+	candidate: Uuid,
+	candidate_chain: &[Uuid],
+	existing: Uuid,
+	existing_chain: &[Uuid],
+	pair: PairId,
+) -> Option<PairOverlap> {
+	if candidate == existing {
+		Some(PairOverlap::RemoteRootInUse { pair, existing })
+	} else if candidate_chain.contains(&existing) {
+		Some(PairOverlap::RemoteRootNested { pair, existing })
+	} else if existing_chain.contains(&candidate) {
+		Some(PairOverlap::RemoteRootContains { pair, existing })
 	} else {
 		None
 	}
@@ -1264,8 +1297,9 @@ impl SyncEngine {
 		let existing = self.list_pairs().await?;
 		let same_pair =
 			|record: &PairRecord| record.local_root == local && record.remote_root == remote_root;
+		let others: Vec<&PairRecord> = existing.iter().filter(|r| !same_pair(r)).collect();
 
-		for record in existing.iter().filter(|r| !same_pair(r)) {
+		for record in &others {
 			if let Some(overlap) =
 				local_overlap(local_root, Path::new(&record.local_root), record.id)
 			{
@@ -1279,44 +1313,112 @@ impl SyncEngine {
 			}
 		}
 
-		// Nested remote roots need the cache's ancestry (see `PairOverlap`'s note on the gap). One
-		// walk for the candidate covers "the new root is inside an existing one"; one per existing
-		// root covers the other direction. An ancestry the cache cannot supply is skipped, never
-		// treated as proof the roots are unrelated.
-		let candidate_chain = self.ancestry_or_unknown(remote_root).await;
-		for record in existing.iter().filter(|r| !same_pair(r)) {
-			if candidate_chain.contains(&record.remote_root) {
-				return Err(overlap_error(PairOverlap::RemoteRootNested {
-					pair: record.id,
-					existing: record.remote_root,
-				}));
-			}
-			if self
-				.ancestry_or_unknown(record.remote_root)
-				.await
-				.contains(&remote_root)
-			{
-				return Err(overlap_error(PairOverlap::RemoteRootContains {
-					pair: record.id,
-					existing: record.remote_root,
-				}));
+		// With no other pair there is nothing for this one to overlap, so the ancestry below is not
+		// asked for at all: the first pair a caller registers must not need the network to be
+		// checked against a registry that is empty.
+		if others.is_empty() {
+			return Ok(());
+		}
+
+		// Nested remote roots need each root's ancestry (see `PairOverlap`). The cache answers for
+		// free and a chain it already carries is a nesting it has actually observed, so it runs first
+		// as a short-circuit — but never as an acceptance: it is only as fresh as the last event it
+		// applied, and a folder moved into a pair's root seconds ago still reads there as unrelated.
+		if let Some(overlap) = self.cached_overlap(remote_root, &others).await {
+			return Err(overlap_error(overlap));
+		}
+
+		// The exact answer: both chains read from the SERVER to the account root, so a nesting is
+		// refused whether or not the cache has caught up with either folder — and a chain the server
+		// will not supply refuses the registration rather than let a pair through unchecked.
+		let account_root = self.client.root().uuid();
+		let candidate_chain = self.server_ancestry(remote_root, account_root).await?;
+		for record in &others {
+			let existing_chain = self
+				.server_ancestry(record.remote_root, account_root)
+				.await?;
+			if let Some(overlap) = remote_overlap(
+				remote_root,
+				&candidate_chain,
+				record.remote_root,
+				&existing_chain,
+				record.id,
+			) {
+				return Err(overlap_error(overlap));
 			}
 		}
 		Ok(())
 	}
 
-	/// `uuid`'s cached ancestor chain, or an empty chain when the cache cannot answer. Best-effort
-	/// by design: a root the cache has not learned about must not block a registration.
-	async fn ancestry_or_unknown(&self, uuid: Uuid) -> Vec<Uuid> {
-		match self.client.cached_ancestors(uuid).await {
-			Ok(chain) => chain,
-			Err(error) => {
-				tracing::debug!(
-					"add_pair: cannot read the cached ancestry of {uuid} ({error}); nested-remote-root detection is skipped for it"
-				);
-				Vec::new()
+	/// The overlap the CACHE can already see between `candidate` and one of `others`, or `None`.
+	///
+	/// Free — one indexed SQLite read per root — and enough to REFUSE on: a chain carrying the other
+	/// root is a nesting the cache has observed. It is not enough to ACCEPT on, so `None` here means
+	/// "ask the server", never "disjoint". The cost of the asymmetry is a stale refusal: a folder the
+	/// cache still believes sits inside a pair's root is refused until the cache catches up, which is
+	/// the safe direction and self-clearing.
+	async fn cached_overlap(&self, candidate: Uuid, others: &[&PairRecord]) -> Option<PairOverlap> {
+		let candidate_chain = self.cached_ancestry(candidate).await;
+		for record in others {
+			let existing_chain = self.cached_ancestry(record.remote_root).await;
+			if let Some(overlap) = remote_overlap(
+				candidate,
+				&candidate_chain,
+				record.remote_root,
+				&existing_chain,
+				record.id,
+			) {
+				return Some(overlap);
 			}
 		}
+		None
+	}
+
+	/// `uuid`'s cached upward chain, EMPTY when the cache cannot answer — which
+	/// [`Client::cached_ancestors`] documents as "unknown", never as "no ancestors".
+	async fn cached_ancestry(&self, uuid: Uuid) -> Vec<Uuid> {
+		self.client
+			.cached_ancestors(uuid)
+			.await
+			.unwrap_or_else(|error| {
+				tracing::debug!(
+					"add_pair: cannot read the cached ancestry of {uuid} ({error}); asking the server instead"
+				);
+				Vec::new()
+			})
+	}
+
+	/// `uuid`'s upward chain read from the server, one [`Client::get_dir`] per level.
+	///
+	/// Bounded three ways: at the account root, at [`MAX_REMOTE_ANCESTRY_DEPTH`] levels, and at a
+	/// parent already on the chain (a cycle no healthy server serves). A parent that is not a folder
+	/// at all — the trash, or one of the virtual parents — ends the walk too: there is no folder
+	/// chain above it to compare against. That last stop is what keeps a registered pair whose
+	/// remote root someone else deleted from wedging every later registration: the server still
+	/// answers for such a folder, with `Trash` as its parent, so the walk yields the root alone and
+	/// the pair simply relates to nothing (CONTROL-09c).
+	async fn server_ancestry(&self, uuid: Uuid, account_root: Uuid) -> Result<Vec<Uuid>, Error> {
+		let mut chain = vec![uuid];
+		let mut current = uuid;
+		while current != account_root {
+			if chain.len() >= MAX_REMOTE_ANCESTRY_DEPTH {
+				tracing::warn!(
+					"add_pair: the ancestry of {uuid} is more than {MAX_REMOTE_ANCESTRY_DEPTH} levels deep; a nesting above that is not detected"
+				);
+				break;
+			}
+			let dir = self.client.get_dir(current).await?;
+			let ParentUuid::Uuid(parent) = *dir.parent() else {
+				break;
+			};
+			if chain.contains(&parent) {
+				tracing::warn!("add_pair: the ancestry of {uuid} loops at {parent}");
+				break;
+			}
+			chain.push(parent);
+			current = parent;
+		}
+		Ok(chain)
 	}
 
 	/// Register a sync pair, returning its id. `remote_root` must be a sync-rooted SUBFOLDER the
@@ -3148,6 +3250,40 @@ mod tests {
 		assert!(local_overlap(Path::new("/sync/other"), existing, 1).is_none());
 		assert!(local_overlap(Path::new("/sync/database"), existing, 1).is_none());
 		assert!(local_overlap(Path::new("/elsewhere"), existing, 1).is_none());
+	}
+
+	/// The same relation between two REMOTE roots, decided from their ancestor chains. The chains
+	/// are what a partial cache view used to get wrong: `docs` is an ancestor of `reports` whether
+	/// or not anything has enumerated it, so the answer must come from a chain that reaches the
+	/// account root and not from what happens to be cached.
+	#[test]
+	fn remote_roots_overlap_only_when_one_chain_carries_the_other_root() {
+		let (root, docs, reports, photos) = (
+			Uuid::new_v4(),
+			Uuid::new_v4(),
+			Uuid::new_v4(),
+			Uuid::new_v4(),
+		);
+		// Each chain is the root itself, then every ancestor up to the account root.
+		let docs_chain = [docs, root];
+		let reports_chain = [reports, docs, root];
+		let photos_chain = [photos, root];
+
+		assert!(matches!(
+			remote_overlap(docs, &docs_chain, docs, &docs_chain, 1),
+			Some(PairOverlap::RemoteRootInUse { pair: 1, .. })
+		));
+		assert!(matches!(
+			remote_overlap(reports, &reports_chain, docs, &docs_chain, 1),
+			Some(PairOverlap::RemoteRootNested { pair: 1, .. })
+		));
+		assert!(matches!(
+			remote_overlap(docs, &docs_chain, reports, &reports_chain, 1),
+			Some(PairOverlap::RemoteRootContains { pair: 1, .. })
+		));
+		// Siblings under one parent are disjoint, and sharing an ancestor is not a relation.
+		assert!(remote_overlap(photos, &photos_chain, docs, &docs_chain, 1).is_none());
+		assert!(remote_overlap(photos, &photos_chain, reports, &reports_chain, 1).is_none());
 	}
 
 	/// The reconciler's own one-line rendering of an action — what these tests assert plans by.
