@@ -19,6 +19,12 @@ async fn run_manuel_tests() {
 		std::env::set_var("OVERRIDE_TEST_AUTH_CONFIG_PATH", auth_config_path);
 	}
 
+	// create remote test root /filen-cli-testing
+	client
+		.find_or_create_dir("/filen-cli-testing")
+		.await
+		.expect("Failed to find or create remote test root");
+
 	let write_diffs_to_file = {
 		let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
 		term_program == "vscode" || term_program == "tmux" // non-exhaustive
