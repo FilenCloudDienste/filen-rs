@@ -1026,6 +1026,66 @@ mod remote_chunks {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	const DECODE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+	/// Runs a synchronous job over a cancellable source on a blocking thread —
+	/// the whole native protocol, shared by every source that has one
+	/// ([`over_remote_chunks`] below, `over_local_file` in `js_impls`), which
+	/// differ only in the `source` they build.
+	///
+	/// A dropped caller (a cancelled request, a closed view) leaves the
+	/// blocking closure running detached with live reads. The guard flips the
+	/// source's cancel flag so its next read fails instead.
+	///
+	/// Decode buffers, not downloads, are the memory hazard, and this path was
+	/// bounded only by tokio's 512 blocking threads. The permit is acquired
+	/// BEFORE the source and the spawn, so parked work costs a future rather
+	/// than a blocked pool thread; MOVED INTO the closure so the permit
+	/// outlives a cancelled caller's future the way the detached job does. A
+	/// locate holds it for two to four chunk reads — worth one gate over a
+	/// second one that would admit nothing more.
+	#[cfg(all(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		any(feature = "wasm-full", feature = "uniffi")
+	))]
+	pub(super) async fn over_cancellable_source<C, R>(
+		client: Arc<C>,
+		source: impl FnOnce(Arc<C>, Arc<AtomicBool>) -> Result<Box<dyn ByteSource>, Error>,
+		job: impl FnOnce(Box<dyn ByteSource>) -> Result<R, Error> + Send + 'static,
+	) -> Result<R, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+		R: Send + 'static,
+	{
+		struct CancelOnDrop(Option<Arc<AtomicBool>>);
+		impl Drop for CancelOnDrop {
+			fn drop(&mut self) {
+				if let Some(flag) = self.0.take() {
+					flag.store(true, Ordering::Relaxed);
+				}
+			}
+		}
+		let decode_permit = client
+			.get_unauth_client()
+			.thumbnails()
+			.decode_permit()
+			.await;
+		let cancel = Arc::new(AtomicBool::new(false));
+		let mut guard = CancelOnDrop(Some(cancel.clone()));
+		let source = source(client, cancel)?;
+		let joined = tokio::task::spawn_blocking(move || {
+			let _decode_permit = decode_permit;
+			job(source)
+		})
+		.await;
+		// The job is over — nothing is left for a late drop to cancel.
+		guard.0 = None;
+		joined.map_err(|e| {
+			Error::custom(
+				ErrorKind::ImageError,
+				format!("thumbnail decode task failed: {e}"),
+			)
+		})?
+	}
+
 	/// Runs a synchronous job over a remote file's chunks, off the async
 	/// runtime's threads — a thumbnail decode, or a preview locate — without
 	/// the file ever being resident in full.
@@ -1045,50 +1105,19 @@ mod remote_chunks {
 	{
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		{
-			// A dropped caller (a cancelled request, a closed view) leaves the
-			// blocking closure running detached with live network fetches. The
-			// guard flips the source's cancel flag so its next read fails
-			// instead.
-			struct CancelOnDrop(Option<Arc<AtomicBool>>);
-			impl Drop for CancelOnDrop {
-				fn drop(&mut self) {
-					if let Some(flag) = self.0.take() {
-						flag.store(true, Ordering::Relaxed);
-					}
-				}
-			}
-			let cancel = Arc::new(AtomicBool::new(false));
-			let mut guard = CancelOnDrop(Some(cancel.clone()));
-			// Decode buffers, not downloads, are the memory hazard, and this path was bounded
-			// only by tokio's 512 blocking threads. Acquired BEFORE the source and the spawn, so
-			// parked work costs a future rather than a blocked pool thread; MOVED INTO the
-			// closure so the permit outlives a cancelled caller's future the way the detached
-			// job does. A locate holds it for two to four chunk reads — worth one gate over a
-			// second one that would admit nothing more.
-			let decode_permit = client
-				.get_unauth_client()
-				.thumbnails()
-				.decode_permit()
-				.await;
-			let source = RemoteChunkSource::with_client(
+			over_cancellable_source(
 				client,
-				file.clone(),
-				tokio::runtime::Handle::current(),
-				Some(cancel),
-			);
-			let joined = tokio::task::spawn_blocking(move || {
-				let _decode_permit = decode_permit;
-				job(Box::new(source))
-			})
-			.await;
-			// The job is over — nothing is left for a late drop to cancel.
-			guard.0 = None;
-			joined.map_err(|e| {
-				Error::custom(
-					ErrorKind::ImageError,
-					format!("thumbnail decode task failed: {e}"),
-				)
-			})?
+				|client, cancel| {
+					Ok(Box::new(RemoteChunkSource::with_client(
+						client,
+						file.clone(),
+						tokio::runtime::Handle::current(),
+						Some(cancel),
+					)))
+				},
+				job,
+			)
+			.await
 		}
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
@@ -1298,6 +1327,13 @@ mod js_impls {
 		EmbeddedPreview, ThumbSource, ThumbnailOutcome, might_be_thumbnailable,
 		remote_chunks::{thumbnail_remote_file, write_embedded_preview_remote},
 	};
+	// The local-source path below (a path on uniffi) runs the pipeline itself
+	// rather than over remote chunks.
+	#[cfg(feature = "uniffi")]
+	use super::{
+		ByteSource, FileSource, ThumbnailFit, locate_embedded_preview, make_thumbnail_from_source,
+		remote_chunks::over_cancellable_source, write_embedded_preview,
+	};
 	use crate::{
 		Error,
 		auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
@@ -1371,6 +1407,34 @@ mod js_impls {
 		},
 	}
 
+	impl MakeThumbnailInMemoryResult {
+		/// The one place a pipeline outcome and its webp bytes become the
+		/// JS-facing verdict, shared by every source the bytes can come from
+		/// (a remote file, a local path, an upload stream) so none of them can
+		/// disagree about what an outcome means — or about which of the two
+		/// `webp_data` types this build carries.
+		fn from_outcome(outcome: ThumbnailOutcome, webp_data: Vec<u8>) -> Self {
+			match outcome {
+				ThumbnailOutcome::Thumbnail(info) => MakeThumbnailInMemoryResult::Thumbnail {
+					thumbnail: InMemoryThumbnail {
+						#[cfg(feature = "wasm-full")]
+						webp_data: serde_bytes::ByteBuf::from(webp_data),
+						#[cfg(feature = "uniffi")]
+						webp_data,
+						width: info.width,
+						height: info.height,
+						from_embedded_preview: info.source == ThumbSource::EmbeddedPreview,
+					},
+				},
+				ThumbnailOutcome::Unsupported => MakeThumbnailInMemoryResult::Unsupported,
+				ThumbnailOutcome::OverBudget => MakeThumbnailInMemoryResult::OverBudget,
+				ThumbnailOutcome::Corrupt(message) => {
+					MakeThumbnailInMemoryResult::Corrupt { message }
+				}
+			}
+		}
+	}
+
 	/// One body for both clients: nothing here needs an account, and a file
 	/// from a public link is exactly what an `UnauthClient` holds.
 	async fn make_thumbnail_in_memory_generic<C>(
@@ -1397,24 +1461,9 @@ mod js_impls {
 				file.size(),
 			);
 			let (outcome, webp_data) = thumbnail_remote_file(client, file, spec).await?;
-			Ok(match outcome {
-				ThumbnailOutcome::Thumbnail(info) => MakeThumbnailInMemoryResult::Thumbnail {
-					thumbnail: InMemoryThumbnail {
-						#[cfg(feature = "wasm-full")]
-						webp_data: serde_bytes::ByteBuf::from(webp_data),
-						#[cfg(feature = "uniffi")]
-						webp_data,
-						width: info.width,
-						height: info.height,
-						from_embedded_preview: info.source == ThumbSource::EmbeddedPreview,
-					},
-				},
-				ThumbnailOutcome::Unsupported => MakeThumbnailInMemoryResult::Unsupported,
-				ThumbnailOutcome::OverBudget => MakeThumbnailInMemoryResult::OverBudget,
-				ThumbnailOutcome::Corrupt(message) => {
-					MakeThumbnailInMemoryResult::Corrupt { message }
-				}
-			})
+			Ok(MakeThumbnailInMemoryResult::from_outcome(
+				outcome, webp_data,
+			))
 		})
 		.await
 	}
@@ -1603,6 +1652,152 @@ mod js_impls {
 		}
 	}
 
+	// -----------------------------------------------------------------------
+	// Bytes that are not on the drive yet, on mobile: a path the picker or the
+	// camera roll handed over.
+	// -----------------------------------------------------------------------
+
+	/// Runs a synchronous job over a local file, off the async runtime's
+	/// threads — the local-source sibling of
+	/// [`over_remote_chunks`](super::remote_chunks::over_remote_chunks).
+	///
+	/// The gate and the cancel protocol are that sibling's, shared verbatim
+	/// through [`over_cancellable_source`]; only the source differs. A
+	/// [`FileSource`] honours the same cancel-before-every-read contract a
+	/// remote one does, so a caller that goes away leaves the detached job
+	/// dying at its next read rather than decoding to completion.
+	#[cfg(feature = "uniffi")]
+	async fn over_local_file<C, R>(
+		client: Arc<C>,
+		path: String,
+		job: impl FnOnce(Box<dyn ByteSource>) -> Result<R, Error> + Send + 'static,
+	) -> Result<R, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+		R: Send + 'static,
+	{
+		let file = tokio::fs::File::open(path).await?.into_std().await;
+		over_cancellable_source(
+			client,
+			|_client, cancel| Ok(Box::new(FileSource::with_cancel(file, Some(cancel))?)),
+			job,
+		)
+		.await
+	}
+
+	#[cfg(feature = "uniffi")]
+	async fn make_thumbnail_from_path_generic<C>(
+		client: Arc<C>,
+		file_path: String,
+		max_width: u32,
+		max_height: u32,
+		managed_future: crate::js::ManagedFuture,
+	) -> Result<MakeThumbnailInMemoryResult, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+	{
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				// No `might_be_thumbnailable` gate here, unlike the remote path:
+				// that gate exists to avoid spending network bytes on a name that
+				// says the file is not an image. Sniffing a local file is a read
+				// of its first few bytes, and the sniff is the authority anyway —
+				// so a picker-supplied name with no extension is thumbnailed
+				// rather than refused unseen.
+				//
+				// `spec_local`: the bytes are on disk, nothing to protect.
+				let spec = client
+					.get_unauth_client()
+					.thumbnails()
+					.spec_local(max_width, max_height);
+				let (outcome, webp_data) = over_local_file(client, file_path, move |source| {
+					let mut webp = Vec::new();
+					let outcome = make_thumbnail_from_source(
+						source,
+						&spec,
+						ThumbnailFit::Contain,
+						&mut webp,
+					)?;
+					Ok((outcome, webp))
+				})
+				.await?;
+				Ok(MakeThumbnailInMemoryResult::from_outcome(
+					outcome, webp_data,
+				))
+			})
+			.await
+	}
+
+	/// Opens a fresh temp file beside `path`, guarded, for a preview that is
+	/// renamed into place only once it is whole — so nothing a viewer might
+	/// cache ever sits at the destination half-finished, and a failure leaves
+	/// no file at all.
+	#[cfg(feature = "uniffi")]
+	async fn create_tmp_beside(
+		path: &std::path::Path,
+	) -> Result<
+		(
+			std::path::PathBuf,
+			crate::io::client_impl::TmpFileGuard,
+			tokio::fs::File,
+		),
+		Error,
+	> {
+		let file_name = path
+			.file_name()
+			.map(|name| name.to_string_lossy().into_owned())
+			.ok_or_else(|| {
+				Error::custom(
+					crate::ErrorKind::IO,
+					"preview path has no file name".to_string(),
+				)
+			})?;
+		let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+		let tmp_file = tokio::fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&tmp_path)
+			.await?;
+		let guard = crate::io::client_impl::TmpFileGuard::new(tmp_path.clone());
+		Ok((tmp_path, guard, tmp_file))
+	}
+
+	#[cfg(feature = "uniffi")]
+	async fn write_embedded_preview_from_path_generic<C>(
+		client: Arc<C>,
+		source_path: String,
+		preview_path: String,
+		managed_future: crate::js::ManagedFuture,
+	) -> Result<EmbeddedPreviewResult, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+	{
+		managed_future
+			.into_js_managed_commander_future(move || async move {
+				let path = std::path::PathBuf::from(preview_path);
+				let (tmp_path, mut tmp_guard, tmp_file) = create_tmp_beside(&path).await?;
+				let mut tmp_file = tmp_file.into_std().await;
+				// One blocking job for both halves. The locate is what the decode
+				// gate is for — the copy that follows rides along on the same
+				// permit and the same open file, and a second acquisition between
+				// them would admit no more work than this one does.
+				let preview = over_local_file(client, source_path, move |mut source| {
+					let Some(preview) = locate_embedded_preview(&mut *source)? else {
+						return Ok(None);
+					};
+					write_embedded_preview(&mut *source, &preview, &mut tmp_file)?;
+					Ok(Some(preview))
+				})
+				.await?;
+				if preview.is_some() {
+					tokio::fs::rename(&tmp_path, &path).await?;
+					tmp_guard.disarm();
+				}
+				Ok(EmbeddedPreviewResult::from(preview))
+			})
+			.await
+	}
+
 	#[cfg(feature = "uniffi")]
 	async fn write_embedded_preview_to_path_generic<C>(
 		client: Arc<C>,
@@ -1619,23 +1814,7 @@ mod js_impls {
 			.into_js_managed_commander_future(move || async move {
 				let file = RemoteFileType::try_from(file)?;
 				let path = std::path::PathBuf::from(file_path);
-				let file_name = path
-					.file_name()
-					.map(|name| name.to_string_lossy().into_owned())
-					.ok_or_else(|| {
-						Error::custom(
-							crate::ErrorKind::IO,
-							"preview path has no file name".to_string(),
-						)
-					})?;
-				let tmp_path =
-					path.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-				let tmp_file = tokio::fs::OpenOptions::new()
-					.write(true)
-					.create_new(true)
-					.open(&tmp_path)
-					.await?;
-				let mut tmp_guard = crate::io::client_impl::TmpFileGuard::new(tmp_path.clone());
+				let (tmp_path, mut tmp_guard, tmp_file) = create_tmp_beside(&path).await?;
 				let mut writer = tmp_file.compat_write();
 				let preview = write_embedded_preview_remote(client, file, &mut writer).await?;
 				drop(writer);
@@ -1666,6 +1845,50 @@ mod js_impls {
 			write_embedded_preview_to_path_generic(self.inner(), file, file_path, managed_future)
 				.await
 		}
+
+		/// Thumbnails a file on disk that is not on the drive yet — what the
+		/// picker or the camera roll hands over at upload time. See
+		/// [`MakeThumbnailInMemoryResult`].
+		///
+		/// Decoded under the client's whole memory budget (nothing is streaming
+		/// behind it) and in turn with every other decode, on the same gate.
+		pub async fn make_thumbnail_from_path(
+			&self,
+			file_path: String,
+			max_width: u32,
+			max_height: u32,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<MakeThumbnailInMemoryResult, Error> {
+			make_thumbnail_from_path_generic(
+				self.inner(),
+				file_path,
+				max_width,
+				max_height,
+				managed_future,
+			)
+			.await
+		}
+
+		/// Writes the embedded preview of a file on disk that is not on the
+		/// drive yet, to `preview_path`. See [`EmbeddedPreviewResult`].
+		///
+		/// Written beside the destination and renamed into place, so nothing a
+		/// viewer might cache ever sits at the path half-finished; on
+		/// `noPreview` no file is left at all.
+		pub async fn write_embedded_preview_from_path(
+			&self,
+			source_path: String,
+			preview_path: String,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			write_embedded_preview_from_path_generic(
+				self.inner(),
+				source_path,
+				preview_path,
+				managed_future,
+			)
+			.await
+		}
 	}
 
 	#[cfg(feature = "uniffi")]
@@ -1685,6 +1908,50 @@ mod js_impls {
 		) -> Result<EmbeddedPreviewResult, Error> {
 			write_embedded_preview_to_path_generic(self.inner(), file, file_path, managed_future)
 				.await
+		}
+
+		/// Thumbnails a file on disk that is not on the drive yet — what the
+		/// picker or the camera roll hands over at upload time. See
+		/// [`MakeThumbnailInMemoryResult`].
+		///
+		/// Decoded under the client's whole memory budget (nothing is streaming
+		/// behind it) and in turn with every other decode, on the same gate.
+		pub async fn make_thumbnail_from_path(
+			&self,
+			file_path: String,
+			max_width: u32,
+			max_height: u32,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<MakeThumbnailInMemoryResult, Error> {
+			make_thumbnail_from_path_generic(
+				self.inner(),
+				file_path,
+				max_width,
+				max_height,
+				managed_future,
+			)
+			.await
+		}
+
+		/// Writes the embedded preview of a file on disk that is not on the
+		/// drive yet, to `preview_path`. See [`EmbeddedPreviewResult`].
+		///
+		/// Written beside the destination and renamed into place, so nothing a
+		/// viewer might cache ever sits at the path half-finished; on
+		/// `noPreview` no file is left at all.
+		pub async fn write_embedded_preview_from_path(
+			&self,
+			source_path: String,
+			preview_path: String,
+			managed_future: crate::js::ManagedFuture,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			write_embedded_preview_from_path_generic(
+				self.inner(),
+				source_path,
+				preview_path,
+				managed_future,
+			)
+			.await
 		}
 	}
 }
