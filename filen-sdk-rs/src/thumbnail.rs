@@ -1218,6 +1218,67 @@ mod remote_chunks {
 		}
 	}
 
+	/// Runs a synchronous job that needs NO chunk service — its bytes are
+	/// already in memory — on the same decode worker, under the same gate and
+	/// the same stall deadline.
+	///
+	/// This is [`over_remote_chunks`]'s wasm arm minus the chunk-serving select
+	/// arm: a `MemSource` job never asks for a chunk, so the only two events
+	/// left are the result and the deadline. Read that loop for why each piece
+	/// is here — the deadline watches worker-side silence ACROSS ALL DRIVERS,
+	/// and a stamp that moved while our generation is still live means the
+	/// worker is merely busy ahead of us.
+	///
+	/// The permit is the CALLER's, taken by reference rather than acquired
+	/// here. The buffer the job decodes is as much of the page's memory as the
+	/// decode is, and the caller materialises it BEFORE this is ever called, so
+	/// a gate held only around the decode would bound neither. It stays in the
+	/// driver rather than moving into the job for the reason the sibling gives:
+	/// a trapped worker runs no destructor, so a permit inside the job would be
+	/// lost for the life of the page.
+	///
+	/// With no chunk traffic to observe, nothing re-arms the deadline once the
+	/// job starts: [`DECODE_STALL_TIMEOUT`] is a ceiling on the WHOLE decode
+	/// here, not on one unobserved step of it. That is still far above any
+	/// in-memory decode under this budget — which the caller's buffer has
+	/// already been subtracted from — and a longer deadline for the chunkless
+	/// case buys nothing until a real device reports otherwise.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	pub(super) async fn local_decode_job<R>(
+		_decode_permit: &tokio::sync::OwnedSemaphorePermit,
+		job: impl FnOnce() -> Result<R, Error> + Send + 'static,
+	) -> Result<R, Error>
+	where
+		R: Send + 'static,
+	{
+		let (generation, mut done) = decode_worker::submit(job);
+		let died = || {
+			Error::custom(
+				ErrorKind::ImageError,
+				"thumbnail decode worker died".to_string(),
+			)
+		};
+		let deadline = sleep_until(TimerInstant::now() + DECODE_STALL_TIMEOUT);
+		tokio::pin!(deadline);
+		let mut last_activity = decode_worker::activity();
+		loop {
+			tokio::select! {
+				biased;
+				result = &mut done => return result.map_err(|_| died())?,
+				() = &mut deadline => {
+					let seen = decode_worker::activity();
+					if seen != last_activity && decode_worker::is_live(generation) {
+						last_activity = seen;
+						deadline.as_mut().reset(TimerInstant::now() + DECODE_STALL_TIMEOUT);
+						continue;
+					}
+					decode_worker::retire(generation);
+					return Err(died());
+				}
+			}
+		}
+	}
+
 	/// Thumbnails a remote file straight from its chunks: the webp bytes and
 	/// the verdict, without the file ever being resident in full.
 	#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
@@ -1327,13 +1388,16 @@ mod js_impls {
 		EmbeddedPreview, ThumbSource, ThumbnailOutcome, might_be_thumbnailable,
 		remote_chunks::{thumbnail_remote_file, write_embedded_preview_remote},
 	};
-	// The local-source path below (a path on uniffi) runs the pipeline itself
-	// rather than over remote chunks.
+	// The local-source paths below (an upload stream on wasm, a path on
+	// uniffi) run the pipeline themselves rather than over remote chunks.
 	#[cfg(feature = "uniffi")]
 	use super::{
-		ByteSource, FileSource, ThumbnailFit, locate_embedded_preview, make_thumbnail_from_source,
-		remote_chunks::over_cancellable_source, write_embedded_preview,
+		ByteSource, FileSource, remote_chunks::over_cancellable_source, write_embedded_preview,
 	};
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use super::{MemSource, PreviewSegment, remote_chunks::local_decode_job};
+	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+	use super::{ThumbnailFit, locate_embedded_preview, make_thumbnail_from_source};
 	use crate::{
 		Error,
 		auth::{JsClient, js_impls::UnauthJsClient, shared_client::SharedClient},
@@ -1624,6 +1688,303 @@ mod js_impls {
 			.await
 	}
 
+	// -----------------------------------------------------------------------
+	// Bytes that are not on the drive yet: what a browser holds at upload time
+	// is a `ReadableStream`, and both calls below start by draining one.
+	// -----------------------------------------------------------------------
+
+	/// Pumps a JS `ReadableStream` into a channel from the CALLING thread,
+	/// which is where the stream's JS object lives — the same split
+	/// `uploadFileFromReader` uses, because a `ReadableStream` cannot be moved
+	/// to the commander.
+	///
+	/// A read error arrives in-band as the last item, so the consumer sees it
+	/// where it sees the bytes. A consumer that stops reading (it settled its
+	/// verdict early) drops the receiver, and the pump ends with it.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	fn spawn_stream_pump(
+		reader: web_sys::ReadableStream,
+	) -> Result<tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>, Error> {
+		use futures::AsyncReadExt;
+
+		let mut reader = wasm_streams::ReadableStream::from_raw(reader)
+			.try_into_async_read()
+			.map_err(|(e, _)| {
+				Error::custom(
+					crate::ErrorKind::Conversion,
+					format!("got error when converting to ReadableStream: {e:?}"),
+				)
+			})?;
+		let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Error>>(10);
+		crate::runtime::spawn_local(async move {
+			let mut buffer = vec![0u8; 64 * 1024];
+			loop {
+				match reader.read(&mut buffer).await {
+					Ok(0) => break,
+					Ok(n) => {
+						if sender.send(Ok(buffer[..n].to_vec())).await.is_err() {
+							return;
+						}
+					}
+					Err(e) => {
+						let _ = sender
+							.send(Err(Error::custom(
+								crate::ErrorKind::IO,
+								format!("error reading from stream: {e:?}"),
+							)))
+							.await;
+						return;
+					}
+				}
+			}
+		});
+		Ok(receiver)
+	}
+
+	/// Collects the whole stream into one buffer, or fails with
+	/// `InsufficientMemory` because it would not fit under `max` — the
+	/// client's `max_source_bytes`.
+	///
+	/// The cap is checked against `known_size` first, so a caller that declares
+	/// an over-cap size is refused before the buffer is reserved, and again as
+	/// the bytes arrive, because that declaration is the caller's word. Past it
+	/// the receiver is dropped and the rest of the stream is never pulled.
+	///
+	/// A hard error, never a verdict: every arm of
+	/// `MakeThumbnailInMemoryResult` and `EmbeddedPreviewResult` is documented
+	/// as a settled, cacheable answer about the file, and a stream too large to
+	/// buffer is exactly the file that DOES carry an embedded preview — which
+	/// the remote path serves from a chunk or two once the bytes are uploaded.
+	/// Settling here would cache a lie. `InsufficientMemory` rather than
+	/// `ImageError`, which is what a broken bitstream answers: a caller that
+	/// wants to retry over the chunks after the upload has to be able to tell
+	/// the two apart from the kind alone.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	async fn buffer_source_stream(
+		chunks: &mut tokio::sync::mpsc::Receiver<Result<Vec<u8>, Error>>,
+		known_size: Option<u64>,
+		max: u64,
+	) -> Result<Vec<u8>, Error> {
+		let too_large = || {
+			Error::custom(
+				crate::ErrorKind::InsufficientMemory,
+				format!("stream exceeds the {max}-byte thumbnail source cap"),
+			)
+		};
+		if known_size.is_some_and(|size| size > max) {
+			return Err(too_large());
+		}
+		// Reserved up front where the caller said how much there is: wasm linear
+		// memory is never returned to the host, so a Vec doubling its way to the
+		// final size costs more than the buffer itself. The cap above bounds the
+		// reservation, whatever the declaration.
+		let mut buf = match known_size {
+			Some(size) => Vec::with_capacity(usize::try_from(size).unwrap_or(0)),
+			None => Vec::new(),
+		};
+		while let Some(chunk) = chunks.recv().await {
+			let chunk = chunk?;
+			if buf.len() as u64 + chunk.len() as u64 > max {
+				return Err(too_large());
+			}
+			buf.extend_from_slice(&chunk);
+		}
+		Ok(buf)
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[js_type(import, wasm_all, no_ser, no_default)]
+	pub struct MakeThumbnailFromStreamParams {
+		/// The bytes to thumbnail, straight from the picker — a `File`'s
+		/// `stream()` is one. Read once, and only up to the client's
+		/// `max_source_bytes`.
+		#[tsify(type = "ReadableStream<Uint8Array>")]
+		#[serde(with = "serde_wasm_bindgen::preserve")]
+		pub reader: web_sys::ReadableStream,
+		pub max_width: u32,
+		pub max_height: u32,
+		/// The size, where it is known (a `File` knows it). Only an
+		/// optimisation and an early refusal; the cap is enforced on the bytes
+		/// regardless.
+		pub known_size: Option<u64>,
+		// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
+		#[serde(default)]
+		pub managed_future: crate::js::ManagedFuture,
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	async fn make_thumbnail_from_stream_generic<C>(
+		client: Arc<C>,
+		params: MakeThumbnailFromStreamParams,
+	) -> Result<MakeThumbnailInMemoryResult, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+	{
+		let mut chunks = spawn_stream_pump(params.reader)?;
+		let (max_width, max_height, known_size) =
+			(params.max_width, params.max_height, params.known_size);
+
+		params
+			.managed_future
+			.into_js_managed_commander_future(move || async move {
+				let thumbnails = client.get_unauth_client().thumbnails();
+				// Held from BEFORE the buffering to after the decode. On wasm the
+				// buffer is the bigger half of what a call costs and linear memory
+				// is never returned to the host, so a gate that only covered the
+				// decode would bound nothing: N concurrent callers would each park
+				// `max_source_bytes` on the one commander thread.
+				let decode_permit = thumbnails.decode_permit().await;
+				let buf =
+					buffer_source_stream(&mut chunks, known_size, thumbnails.max_source_bytes)
+						.await?;
+				// `spec_in_memory`, not `spec_local`: the buffer stays resident
+				// under the decode, so it comes off the budget the way a remote
+				// source's chunk slots do. What is left bounds the DECODE.
+				let spec = thumbnails.spec_in_memory(max_width, max_height, buf.len());
+				let (outcome, webp_data) = local_decode_job(&decode_permit, move || {
+					let mut webp = Vec::new();
+					let outcome = make_thumbnail_from_source(
+						Box::new(MemSource(buf)),
+						&spec,
+						ThumbnailFit::Contain,
+						&mut webp,
+					)?;
+					Ok((outcome, webp))
+				})
+				.await?;
+				Ok(MakeThumbnailInMemoryResult::from_outcome(
+					outcome, webp_data,
+				))
+			})?
+			.await
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[js_type(import, wasm_all, no_ser, no_default)]
+	pub struct WriteEmbeddedPreviewFromStreamParams {
+		/// The container to look in, straight from the picker. Read once, in
+		/// full: the preview is copied out of the buffer, not re-read.
+		#[tsify(type = "ReadableStream<Uint8Array>")]
+		#[serde(with = "serde_wasm_bindgen::preserve")]
+		pub reader: web_sys::ReadableStream,
+		/// Where the bytes go. Closed on every settled answer, empty for
+		/// `noPreview`; left unclosed on a failure so the stream aborts and a
+		/// partial preview is never saved as complete.
+		#[tsify(type = "WritableStream<Uint8Array>")]
+		#[serde(with = "serde_wasm_bindgen::preserve")]
+		pub writer: web_sys::WritableStream,
+		pub known_size: Option<u64>,
+		// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
+		#[serde(default)]
+		pub managed_future: crate::js::ManagedFuture,
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	async fn write_embedded_preview_from_stream_generic<C>(
+		client: Arc<C>,
+		params: WriteEmbeddedPreviewFromStreamParams,
+	) -> Result<EmbeddedPreviewResult, Error>
+	where
+		C: SharedClient + Send + Sync + 'static,
+	{
+		use crate::fs::file::service_worker::{
+			MAX_BUFFER_SIZE_BEFORE_FLUSH, StreamWriter, WriteFrame,
+		};
+		use futures::AsyncWriteExt;
+
+		let mut chunks = spawn_stream_pump(params.reader)?;
+		// The same bridge `writeEmbeddedPreview` uses: frames cross to a local
+		// task that owns the JS stream, so the copy never holds more than one
+		// flush buffer on top of the source buffer.
+		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
+		let writer = wasm_streams::WritableStream::from_raw(params.writer)
+			.try_into_async_write()
+			.map_err(|(e, _)| {
+				Error::custom(
+					crate::ErrorKind::Conversion,
+					format!("got error when converting to WritableStream: {e:?}"),
+				)
+			})?;
+		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
+		crate::js::spawn_buffered_write_future(
+			data_receiver,
+			writer,
+			None::<fn(u64)>,
+			result_sender,
+		);
+		let known_size = params.known_size;
+
+		params
+			.managed_future
+			.into_js_managed_commander_future(move || async move {
+				let thumbnails = client.get_unauth_client().thumbnails();
+				// Held from BEFORE the buffering to after the copy, for the same
+				// reason the thumbnail path holds it: the buffer, not the locate,
+				// is what this call costs the page.
+				let decode_permit = thumbnails.decode_permit().await;
+				let buf =
+					buffer_source_stream(&mut chunks, known_size, thumbnails.max_source_bytes)
+						.await?;
+				// The locate is what the gate bounds; the buffer comes back out
+				// of the source so the copy can slice it.
+				let (located, buf) = local_decode_job(&decode_permit, move || {
+					let mut source = MemSource(buf);
+					let located = locate_embedded_preview(&mut source)?;
+					Ok((located, source.0))
+				})
+				.await?;
+				let mut writer = StreamWriter::new(data_sender);
+				if let Some(preview) = &located {
+					for segment in preview.segments() {
+						match segment {
+							PreviewSegment::Source { start, end } => {
+								// The locate answered against these very bytes, so
+								// the range is inside them — checked anyway, since
+								// the alternative to a message is a panic.
+								let slice = usize::try_from(start)
+									.ok()
+									.zip(usize::try_from(end).ok())
+									.and_then(|(start, end)| buf.get(start..end))
+									.ok_or_else(|| {
+										Error::custom(
+											crate::ErrorKind::ImageError,
+											format!(
+												"embedded preview ends at {end}, past the {} bytes buffered",
+												buf.len()
+											),
+										)
+									})?;
+								// One flush buffer at a time. `StreamWriter` never
+								// splits what it is handed — it copies the whole
+								// slice and ships it as one frame, which the
+								// receiving task copies again — so a 25 MB
+								// full-size preview handed over in one call would
+								// cost two more copies of itself. The remote
+								// sibling gets this from its reader; here the
+								// chunking is the reader.
+								for part in slice.chunks(MAX_BUFFER_SIZE_BEFORE_FLUSH) {
+									writer.write_all(part).await?;
+								}
+							}
+							PreviewSegment::App1(app1) => writer.write_all(&app1).await?,
+						}
+					}
+				}
+				writer.close().await?;
+				// The close sent the Done frame; wait for the JS side to have
+				// taken every byte before answering, or a caller could read the
+				// file back before it is whole.
+				result_receiver.await.unwrap_or_else(|_| {
+					Err(Error::custom(
+						crate::ErrorKind::Cancelled,
+						"preview write task cancelled",
+					))
+				})?;
+				Ok(EmbeddedPreviewResult::from(located))
+			})?
+			.await
+	}
+
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 	impl JsClient {
@@ -1635,6 +1996,37 @@ mod js_impls {
 			params: WriteEmbeddedPreviewParams,
 		) -> Result<EmbeddedPreviewResult, Error> {
 			write_embedded_preview_generic(self.inner(), params).await
+		}
+
+		/// Thumbnails bytes that are not on the drive yet — what a picker hands
+		/// over at upload time. See [`MakeThumbnailInMemoryResult`].
+		///
+		/// The stream is buffered whole, up to the client's `max_source_bytes`
+		/// — past that the call fails with `InsufficientMemory` rather than
+		/// settling a verdict, since the uploaded file's embedded preview still
+		/// costs `makeThumbnailInMemory` a chunk or two — and decoded on the one
+		/// decode worker, in turn with every other decode on the page.
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailFromStream")]
+		pub async fn make_thumbnail_from_stream(
+			&self,
+			params: MakeThumbnailFromStreamParams,
+		) -> Result<MakeThumbnailInMemoryResult, Error> {
+			make_thumbnail_from_stream_generic(self.inner(), params).await
+		}
+
+		/// Writes the embedded preview of bytes that are not on the drive yet.
+		/// See [`EmbeddedPreviewResult`].
+		///
+		/// The stream is buffered whole, up to the client's `max_source_bytes`
+		/// — past that the call fails with `InsufficientMemory` rather than
+		/// answering `noPreview`, since the uploaded file's preview still costs
+		/// `writeEmbeddedPreview` a chunk or two.
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "writeEmbeddedPreviewFromStream")]
+		pub async fn write_embedded_preview_from_stream(
+			&self,
+			params: WriteEmbeddedPreviewFromStreamParams,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			write_embedded_preview_from_stream_generic(self.inner(), params).await
 		}
 	}
 
@@ -1649,6 +2041,37 @@ mod js_impls {
 			params: WriteEmbeddedPreviewParams,
 		) -> Result<EmbeddedPreviewResult, Error> {
 			write_embedded_preview_generic(self.inner(), params).await
+		}
+
+		/// Thumbnails bytes that are not on the drive yet — what a picker hands
+		/// over at upload time. See [`MakeThumbnailInMemoryResult`].
+		///
+		/// The stream is buffered whole, up to the client's `max_source_bytes`
+		/// — past that the call fails with `InsufficientMemory` rather than
+		/// settling a verdict, since the uploaded file's embedded preview still
+		/// costs `makeThumbnailInMemory` a chunk or two — and decoded on the one
+		/// decode worker, in turn with every other decode on the page.
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailFromStream")]
+		pub async fn make_thumbnail_from_stream(
+			&self,
+			params: MakeThumbnailFromStreamParams,
+		) -> Result<MakeThumbnailInMemoryResult, Error> {
+			make_thumbnail_from_stream_generic(self.inner(), params).await
+		}
+
+		/// Writes the embedded preview of bytes that are not on the drive yet.
+		/// See [`EmbeddedPreviewResult`].
+		///
+		/// The stream is buffered whole, up to the client's `max_source_bytes`
+		/// — past that the call fails with `InsufficientMemory` rather than
+		/// answering `noPreview`, since the uploaded file's preview still costs
+		/// `writeEmbeddedPreview` a chunk or two.
+		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "writeEmbeddedPreviewFromStream")]
+		pub async fn write_embedded_preview_from_stream(
+			&self,
+			params: WriteEmbeddedPreviewFromStreamParams,
+		) -> Result<EmbeddedPreviewResult, Error> {
+			write_embedded_preview_from_stream_generic(self.inner(), params).await
 		}
 	}
 
@@ -2314,6 +2737,26 @@ mod tests {
 			SharedClientState::new(ClientConfig::default().with_thumbnail_mem_budget(1024))
 				.expect("valid config");
 		assert_eq!(starved.thumbnails().spec_remote(32, 32, 1).mem_budget, 0);
+	}
+
+	/// The same correction for a buffered source, whose residency is the whole file rather than
+	/// two chunk slots — without it one call costs the buffer PLUS the whole budget.
+	#[test]
+	fn spec_in_memory_pays_for_the_buffer_the_caller_is_holding() {
+		let state = SharedClientState::new(ClientConfig::default()).expect("valid config");
+		let thumbs = state.thumbnails();
+
+		assert_eq!(
+			thumbs.spec_in_memory(32, 32, 8 * 1024 * 1024).mem_budget,
+			thumbs.mem_budget - 8 * 1024 * 1024
+		);
+		// A buffer at the source cap eats the whole budget rather than wrapping to a huge one.
+		assert_eq!(
+			thumbs
+				.spec_in_memory(32, 32, thumbs.mem_budget + 1)
+				.mem_budget,
+			0
+		);
 	}
 
 	/// The permit is `acquire_owned`ed so it can be MOVED INTO the detached blocking closure and

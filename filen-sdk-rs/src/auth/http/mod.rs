@@ -370,8 +370,32 @@ impl ThumbnailConfig {
 	}
 
 	/// Spec for bytes that are already local: the whole budget, and a full decode is free.
+	///
+	/// "Local" means a source the pipeline reads through without holding it — a file on disk. A
+	/// source the caller had to materialise in memory first is [`spec_in_memory`](Self::spec_in_memory).
 	pub fn spec_local(&self, target_width: u32, target_height: u32) -> ThumbSpec {
 		ThumbSpec::new(target_width, target_height, self.mem_budget)
+	}
+
+	/// Spec for a source the caller buffered in full — an upload stream on wasm, where the picker's
+	/// bytes cannot be re-read and have to be held.
+	///
+	/// The same correction [`spec_remote`](Self::spec_remote) makes for its two chunk slots, for a
+	/// source orders of magnitude larger: the buffer stays resident for the whole decode and the
+	/// pipeline's own accounting cannot see it, so it comes off the budget. Without this one decode
+	/// costs the buffer PLUS the whole budget, and on wasm neither half is ever returned to the
+	/// host.
+	pub fn spec_in_memory(
+		&self,
+		target_width: u32,
+		target_height: u32,
+		source_len: usize,
+	) -> ThumbSpec {
+		ThumbSpec::new(
+			target_width,
+			target_height,
+			self.mem_budget.saturating_sub(source_len),
+		)
 	}
 
 	/// Spec for a file streamed over the network through a `RemoteChunkSource`.
