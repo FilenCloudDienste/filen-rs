@@ -606,7 +606,7 @@ fn make_output_environment_agnostic_for_replay_testing(mut output: String) -> St
 }
 
 impl UI {
-	fn redact_for_replay_testing(&self, output: String) -> String {
+	pub(crate) fn redact_for_replay_testing(&self, output: String) -> String {
 		if self.make_output_environment_agnostic_for_replay_testing {
 			make_output_environment_agnostic_for_replay_testing(output)
 		} else {

@@ -1,11 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::{
+	sync::{Arc, Mutex},
+	time::Duration,
+};
 
 use crate::{CommandResult, auth::LazyClient, ui::UI, util::RemotePath};
 use anyhow::{Context, Result, anyhow};
 use filen_sdk_rs::{
-	cache::{SearchConfig, SearchSnapshot},
+	cache::{CacheMessage, ResyncProgress, SearchConfig, SearchSnapshot},
 	fs::HasUUID as _,
 };
+use serde_json::json;
 
 // todo: allow non-interactive search
 
@@ -57,6 +61,7 @@ pub(crate) async fn search_cmd(
 		} else {
 			format!("Search in {}:", working_path)
 		};
+		let prompt_text = ui.redact_for_replay_testing(prompt_text);
 		tokio::task::spawn_blocking(move || {
 			inquire::Text::new(&prompt_text)
 				.with_placeholder("(your query)")
@@ -167,4 +172,108 @@ impl inquire::Autocomplete for SearchAutocomplete {
 			.map(|r| r.new_results_available)
 			.unwrap_or(false)
 	}
+}
+
+pub(crate) async fn search_cmd_non_interactive(
+	ui: &mut UI,
+	client: &mut LazyClient,
+	working_path: &RemotePath,
+	query: &str,
+) -> Result<()> {
+	let lazy_client = client;
+	let client = lazy_client.get(ui).await?;
+
+	let working_dir_uuid = client
+		.find_item_at_path(&working_path.0)
+		.await
+		.context("Failed to find working directory")?
+		.ok_or(anyhow::anyhow!("Working directory not found"))?
+		.uuid();
+	let search = client
+		.clone()
+		.create_search(working_dir_uuid, SearchConfig::new().with_name(query))
+		.await
+		.context("Failed to create search")?;
+	let results = Arc::new(Mutex::new(Vec::new()));
+	let results_ = results.clone();
+	let cache_callback_rx = lazy_client
+		.get_cache_callback_rx()
+		.ok_or(anyhow::anyhow!("Failed to get cache callback receiver"))?;
+
+	let (initial_snapshot, _search_window_handle) = search
+		.get_range(
+			0..100_000,
+			Box::new(move |snapshot| {
+				let mut results = match results_.lock() {
+					Ok(results) => results,
+					Err(e) => {
+						log::warn!("Failed to lock search results mutex: {}", e);
+						return;
+					}
+				};
+				if snapshot.total > 100_000 {
+					log::warn!(
+						"Search results truncated to 100,000 items, total results: {}",
+						snapshot.total
+					);
+				}
+				results.clear();
+				results.extend(snapshot.results.iter().map(|r| r.full_path()));
+			}),
+		)
+		.await
+		.context("Failed to get search results")?;
+	// the initial snapshot is not delivered through the callback
+	results
+		.lock()
+		.map_err(|e| anyhow!("Failed to lock search results mutex: {}", e))?
+		.extend(initial_snapshot.results.iter().map(|r| r.full_path()));
+
+	let start_time = std::time::Instant::now();
+	loop {
+		match cache_callback_rx.try_recv() {
+			Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+				if start_time.elapsed() > Duration::from_secs(30) {
+					return Err(anyhow!(
+						"Cache resync did not finish within 30 seconds, search results may be incomplete"
+					));
+				}
+			}
+			Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+				return Err(anyhow::anyhow!("Cache callback channel disconnected"));
+			}
+			Ok(msg) => {
+				if let CacheMessage::ResyncProgress(progress) = msg
+					&& let ResyncProgress::Finished { converged } = progress
+				{
+					if !converged {
+						return Err(anyhow!(
+							"Cache resync did not converge, search results may be incomplete"
+						));
+					}
+					break;
+				}
+			}
+		}
+	}
+	tokio::time::sleep(Duration::from_millis(10)).await; // wait a bit for the last search results to arrive, not sure if global cache state callback or get_range callback is called first
+	let results = results
+		.lock()
+		.map_err(|e| anyhow!("Failed to lock search results mutex: {}", e))?;
+	if ui.json {
+		ui.print_json(json!({
+			"results": results.clone(),
+		}))?;
+	} else {
+		ui.print_grid(
+			results
+				.iter()
+				.map(|r| r.as_str())
+				.collect::<Vec<_>>()
+				.as_slice(),
+		)
+	};
+
+	Ok(())
 }

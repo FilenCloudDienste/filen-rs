@@ -40,6 +40,7 @@ pub(crate) enum LazyClient {
 	},
 	Authenticated {
 		client: Arc<Client>,
+		cache_callback_rx: tokio::sync::mpsc::UnboundedReceiver<filen_sdk_rs::cache::CacheMessage>,
 	},
 }
 
@@ -64,7 +65,7 @@ impl LazyClient {
 
 	pub(crate) async fn get(&mut self, ui: &mut UI) -> Result<&Arc<Client>> {
 		match self {
-			Self::Authenticated { client } => Ok(client),
+			Self::Authenticated { client, .. } => Ok(client),
 			Self::Unauthenticated {
 				config,
 				email_arg,
@@ -83,14 +84,22 @@ impl LazyClient {
 					client_config_args,
 				)
 				.await?;
+				let (cache_callback_tx, cache_callback_rx) = tokio::sync::mpsc::unbounded_channel();
 				client
-					.configure_cache(config.config_dir.join("filen-sdk-rs-cache"), |_| {})
+					.configure_cache(config.config_dir.join("filen-sdk-rs-cache"), move |msgs| {
+						for msg in msgs {
+							cache_callback_tx.send(msg).unwrap_or_else(|e| {
+								log::warn!("Failed to send cache callback message: {:?}", e);
+							});
+						}
+					})
 					.await
 					.context("Failed to configure cache")?;
 				*self = Self::Authenticated {
 					client: Arc::new(client),
+					cache_callback_rx,
 				};
-				let Self::Authenticated { client } = self else {
+				let Self::Authenticated { client, .. } = self else {
 					unreachable!();
 				};
 				Ok(client)
@@ -100,7 +109,18 @@ impl LazyClient {
 
 	pub(crate) fn get_arc(&self) -> Option<Arc<Client>> {
 		match self {
-			Self::Authenticated { client } => Some(client.clone()),
+			Self::Authenticated { client, .. } => Some(client.clone()),
+			Self::Unauthenticated { .. } => None,
+		}
+	}
+
+	pub(crate) fn get_cache_callback_rx(
+		&mut self,
+	) -> Option<&mut tokio::sync::mpsc::UnboundedReceiver<filen_sdk_rs::cache::CacheMessage>> {
+		match self {
+			Self::Authenticated {
+				cache_callback_rx, ..
+			} => Some(cache_callback_rx),
 			Self::Unauthenticated { .. } => None,
 		}
 	}

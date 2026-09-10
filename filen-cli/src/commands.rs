@@ -133,8 +133,8 @@ pub(crate) enum Commands {
 		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
 		path: Option<String>,
 	},
-	/// Search for a file or directory interactively
-	Search,
+	/// Search for a file or directory interactively, or specify a query
+	Search { query: Option<String> },
 	/// Favorite a file or directory
 	Favorite {
 		/// File or directory to favorite
@@ -336,7 +336,14 @@ pub(crate) async fn execute_command(
 			notes_cmds::export_notes(ui, client, path.as_deref()).await?;
 			None
 		}
-		Commands::Search => search_cmd::search_cmd(ui, client, working_path).await?,
+		Commands::Search { query } => {
+			if let Some(query) = query {
+				search_cmd::search_cmd_non_interactive(ui, client, working_path, &query).await?;
+				None
+			} else {
+				search_cmd::search_cmd(ui, client, working_path).await?
+			}
+		}
 		Commands::Favorite { file_or_directory } => {
 			fs_cmds::set_file_or_directory_favorite(
 				ui,
