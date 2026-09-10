@@ -1405,12 +1405,15 @@ impl SyncEngine {
 	/// large backlog is held for approval rather than applied unasked — but a small one is not.
 	///
 	/// [`Backlog::AdoptDestination`] reads both sides FIRST (one snapshot + one local scan, the same
-	/// pair a pass reads) and re-seeds the baseline from the destination for every tracked path the
-	/// source no longer has, in the same transaction as the mode change. Those copies then count as
-	/// intended: a one-way mirror neither deletes them nor pushes them back to the source, and
-	/// `TwoWay` reads them as newly created on the side that still has them and flows them back. A
-	/// destination item the pair never tracked is not adopted — the new mode's ordinary rules apply
-	/// to it, switch or no switch.
+	/// pair a pass reads) and re-seeds the baseline from the destination for every path the source no
+	/// longer has, in the same transaction as the mode change. Those copies then count as intended: a
+	/// one-way mirror neither deletes them nor pushes them back to the source, and `TwoWay` reads
+	/// them as newly created on the side that still has them and flows them back. In the ONE-WAY
+	/// modes that covers a destination item the pair never TRACKED as well — a file another client
+	/// created straight on the destination, which the mirror would otherwise trash on the very next
+	/// pass. `TwoWay` re-seeds only the paths it tracked: an untracked copy already flows to the
+	/// other side under the ordinary rules, and a row there would only take the path out of move
+	/// detection.
 	///
 	/// Either way, [`plan_pair`](Self::plan_pair) after the switch shows exactly what the first pass
 	/// will do.
