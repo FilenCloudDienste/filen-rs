@@ -160,9 +160,9 @@ impl AuthCacheState {
 		// running detached — detached network fetches on the remote path, a
 		// decode hogging the single gate permit on the local one. The guard
 		// flips the source's cancel flag when this future drops un-disarmed,
-		// and BOTH source kinds answer their next read with Interrupted,
-		// unwinding the orphaned decode at the same granularity an async
-		// decoder would get instead of letting it run to completion.
+		// and BOTH source kinds fail their next read, unwinding the orphaned
+		// decode at the same granularity an async decoder would get instead of
+		// letting it run to completion.
 		struct CancelOnDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
 		impl Drop for CancelOnDrop {
 			fn drop(&mut self) {

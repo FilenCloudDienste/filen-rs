@@ -368,8 +368,8 @@ where
 		// not the transport, and some report it as an io error rather than a
 		// decode one (the `png` crate does; `jpeg-decoder` does not). None of
 		// the sources here can produce `UnexpectedEof`: a read past the end
-		// answers `Ok(0)`, a cancel answers `Interrupted`, and a failed fetch
-		// answers `Other`. So this can only have been synthesised by a decoder
+		// answers `Ok(0)`, and a cancel or a failed fetch answers `Other`. So
+		// this can only have been synthesised by a decoder
 		// reading a truncated file — and left classified as transport it would
 		// make a truncated PNG retry forever instead of settling.
 		Err(microthumb::ThumbError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -641,10 +641,14 @@ mod remote_chunks {
 	/// native bridge is ever handed a flag, see [`cancel`](Self::cancel).
 	pub struct RemoteChunkSource {
 		fetch: Box<dyn FnMut(u64, u64) -> std::io::Result<Vec<u8>> + Send>,
-		/// Checked before every read: cancellation surfaces as
-		/// `ErrorKind::Interrupted`, which unwinds the decode through its normal
-		/// error path at chunk granularity — the same points an async decoder
-		/// would get to cancel at.
+		/// Checked before every read: cancellation surfaces as an io error,
+		/// which unwinds the decode through its normal error path at chunk
+		/// granularity — the same points an async decoder would get to cancel
+		/// at. `ErrorKind::Other`, never `Interrupted`: std's `read_exact`
+		/// retries `Interrupted` forever, and every decoder but png and gif
+		/// reads through it, so a cancel answered that way spun the decode at
+		/// 100% CPU on a blocking thread, holding its decode permit, instead of
+		/// ending it.
 		///
 		/// `Some` only on the native bridge. `over_requests` passes `None`, so
 		/// on wasm this check is a permanent no-op: nothing there has a cancel
@@ -659,7 +663,7 @@ mod remote_chunks {
 	}
 
 	impl RemoteChunkSource {
-		fn with_fetcher(
+		pub(super) fn with_fetcher(
 			len: u64,
 			cancel: Option<Arc<AtomicBool>>,
 			fetch: Box<dyn FnMut(u64, u64) -> std::io::Result<Vec<u8>> + Send>,
@@ -736,9 +740,7 @@ mod remote_chunks {
 					// way, instead of parking this worker here for good with
 					// every later caller queued behind it. One allocation per
 					// chunk fetch is nothing against the fetch.
-					let cancelled = || {
-						std::io::Error::new(std::io::ErrorKind::Interrupted, "thumbnail cancelled")
-					};
+					let cancelled = || std::io::Error::other("thumbnail cancelled");
 					let (reply, replies) = std::sync::mpsc::channel();
 					requests
 						.send(ChunkRequest { start, end, reply })
@@ -760,10 +762,7 @@ mod remote_chunks {
 				.as_ref()
 				.is_some_and(|c| c.load(Ordering::Relaxed))
 			{
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::Interrupted,
-					"thumbnail cancelled",
-				));
+				return Err(std::io::Error::other("thumbnail cancelled"));
 			}
 			// Two fixed slots instead of a map: header + payload locality is all
 			// the demuxers need, and eviction keeps the source at ≤2 MiB.
@@ -1048,8 +1047,8 @@ mod remote_chunks {
 		{
 			// A dropped caller (a cancelled request, a closed view) leaves the
 			// blocking closure running detached with live network fetches. The
-			// guard flips the source's cancel flag so its next read answers
-			// Interrupted instead.
+			// guard flips the source's cancel flag so its next read fails
+			// instead.
 			struct CancelOnDrop(Option<Arc<AtomicBool>>);
 			impl Drop for CancelOnDrop {
 				fn drop(&mut self) {
@@ -1695,8 +1694,8 @@ mod tests {
 	use microthumb::MemSource;
 
 	use super::{
-		DEFAULT_THUMBNAIL_MEM_BUDGET, REMOTE_SOURCE_RESIDENT_BYTES, ThumbSpec, ThumbnailFit,
-		ThumbnailOutcome, make_thumbnail_from_source,
+		DEFAULT_THUMBNAIL_MEM_BUDGET, REMOTE_SOURCE_RESIDENT_BYTES, RemoteChunkSource, ThumbSpec,
+		ThumbnailFit, ThumbnailOutcome, make_thumbnail_from_source,
 	};
 	use crate::auth::http::{ClientConfig, SharedClientState};
 
@@ -1801,7 +1800,7 @@ mod tests {
 
 	/// A [`microthumb::ByteSource`] with [`super::RemoteChunkSource`]'s
 	/// observable behavior, minus the network: short reads at every chunk
-	/// boundary, and a cancel flag answered with `Interrupted` — optionally
+	/// boundary, and a cancel flag answered with an io error — optionally
 	/// flipped by the source itself after N reads, standing in for a batch
 	/// cancel landing mid-decode.
 	struct ChunkySource {
@@ -1826,10 +1825,7 @@ mod tests {
 				self.cancel.store(true, Ordering::Relaxed);
 			}
 			if self.cancel.load(Ordering::Relaxed) {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::Interrupted,
-					"thumbnail cancelled",
-				));
+				return Err(std::io::Error::other("thumbnail cancelled"));
 			}
 			let Ok(offset) = usize::try_from(offset) else {
 				return Ok(0);
@@ -1873,8 +1869,8 @@ mod tests {
 	#[test]
 	fn a_cancel_mid_decode_is_a_hard_error_not_a_cached_verdict() {
 		// The flag flips after the header reads succeed, the way a batch
-		// cancel lands mid-decode. Interrupted must surface as Err — never as
-		// a settled verdict, which the platform would cache forever.
+		// cancel lands mid-decode. A cancel must surface as Err — never as a
+		// settled verdict, which the platform would cache forever.
 		let source = ChunkySource {
 			data: png_bytes(300, 200),
 			chunk: 1024,
@@ -1885,6 +1881,59 @@ mod tests {
 		let mut out = Vec::new();
 		let result = make_thumbnail_from_source(
 			Box::new(source),
+			&ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET),
+			ThumbnailFit::Cover,
+			&mut out,
+		);
+		assert!(result.is_err(), "expected a hard error, got {result:?}");
+	}
+
+	/// The real remote source, minus the network: one fetch serves the whole
+	/// JPEG, and the cancel flag flips after the header reads. Reads are
+	/// counted so a decoder that keeps retrying the refusal fails here rather
+	/// than spinning the test: `jpeg-decoder` reads through std's
+	/// `read_exact`, which retries `ErrorKind::Interrupted` forever.
+	#[test]
+	fn a_cancelled_remote_source_stops_a_jpeg_decode() {
+		struct CancelAfter {
+			inner: RemoteChunkSource,
+			cancel: Arc<AtomicBool>,
+			after: usize,
+			reads: usize,
+		}
+		impl ByteSource for CancelAfter {
+			fn len(&self) -> u64 {
+				self.inner.len()
+			}
+			fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+				self.reads += 1;
+				assert!(
+					self.reads <= self.after + 8,
+					"the decoder kept reading after the cancel: {} reads",
+					self.reads
+				);
+				if self.reads > self.after {
+					self.cancel.store(true, Ordering::Relaxed);
+				}
+				self.inner.read_at(offset, buf)
+			}
+		}
+		let data = jpeg_bytes(600, 400);
+		let len = data.len() as u64;
+		let cancel = Arc::new(AtomicBool::new(false));
+		let inner = RemoteChunkSource::with_fetcher(
+			len,
+			Some(cancel.clone()),
+			Box::new(move |start, end| Ok(data[start as usize..end as usize].to_vec())),
+		);
+		let mut out = Vec::new();
+		let result = make_thumbnail_from_source(
+			Box::new(CancelAfter {
+				inner,
+				cancel,
+				after: 3,
+				reads: 0,
+			}),
 			&ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET),
 			ThumbnailFit::Cover,
 			&mut out,

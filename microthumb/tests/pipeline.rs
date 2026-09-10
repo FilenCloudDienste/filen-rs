@@ -3,12 +3,18 @@
 //! encode AV1, so that case reads the browser suite's committed `parrot.avif`
 //! and says so at the test.
 
-use std::io::Cursor;
+use std::{
+	io::Cursor,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 use image::{ImageFormat, Rgb, RgbImage};
 use microthumb::{
-	APP_PROCESS_MEM_BUDGET, DEFAULT_MEM_BUDGET, MemSource, ThumbError, ThumbOutcome, ThumbSpec,
-	generate,
+	APP_PROCESS_MEM_BUDGET, ByteSource, DEFAULT_MEM_BUDGET, FileSource, MemSource, ThumbError,
+	ThumbOutcome, ThumbSpec, generate,
 };
 
 /// Most tests care only about the pixels. The ones that care about WHICH path
@@ -130,6 +136,66 @@ fn truncated_jpeg_is_an_error_not_a_thumbnail() {
 	let mut bytes = encode(&checkerboard(512, 512), ImageFormat::Jpeg);
 	bytes.truncate(bytes.len() / 3);
 	assert!(thumb(Box::new(MemSource(bytes)), &spec(64)).is_err());
+}
+
+/// A [`FileSource`] whose cancel flag flips after `after` reads, the way a
+/// batch cancel lands mid-decode. Every read is counted so a decoder that
+/// keeps retrying the refusal fails here instead of spinning the test.
+struct CancelAfter {
+	inner: FileSource,
+	cancel: Arc<AtomicBool>,
+	after: usize,
+	reads: usize,
+}
+
+impl ByteSource for CancelAfter {
+	fn len(&self) -> u64 {
+		self.inner.len()
+	}
+
+	fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+		self.reads += 1;
+		assert!(
+			self.reads <= self.after + 8,
+			"the decoder kept reading after the cancel: {} reads",
+			self.reads
+		);
+		if self.reads > self.after {
+			self.cancel.store(true, Ordering::Relaxed);
+		}
+		self.inner.read_at(offset, buf)
+	}
+}
+
+#[test]
+fn a_cancelled_file_source_stops_every_decoder() {
+	// std's `read_exact` retries `ErrorKind::Interrupted` forever, and every
+	// decoder but png and gif reads through it. A cancel answered with that
+	// kind spun the decode at 100% CPU, holding its decode permit, instead of
+	// dying at the next read.
+	let dir = std::env::temp_dir();
+	for (format, ext) in [
+		(ImageFormat::Jpeg, "jpg"),
+		(ImageFormat::WebP, "webp"),
+		(ImageFormat::Png, "png"),
+	] {
+		let path = dir.join(format!("microthumb-cancel-{}.{ext}", std::process::id()));
+		std::fs::write(&path, encode(&checkerboard(512, 512), format)).unwrap();
+		let cancel = Arc::new(AtomicBool::new(false));
+		let file = std::fs::File::open(&path).unwrap();
+		let source = CancelAfter {
+			inner: FileSource::with_cancel(file, Some(cancel.clone())).unwrap(),
+			cancel,
+			after: 3,
+			reads: 0,
+		};
+		let result = generate(Box::new(source), &spec(64));
+		let _ = std::fs::remove_file(&path);
+		assert!(
+			matches!(result, Err(ThumbError::Io(_))),
+			"{ext}: expected a hard io error, got {result:?}"
+		);
+	}
 }
 
 /// SOI + SOF2 (progressive) header for an image of the given size — enough

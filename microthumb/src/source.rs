@@ -29,10 +29,15 @@ impl FileSource {
 	}
 
 	/// `cancel` is checked before every read: flipping it makes the next read
-	/// answer `Interrupted`, unwinding a decode whose awaiting caller is
-	/// already gone — the same contract remote sources honor at chunk
-	/// granularity, so an orphaned local decode dies at its next read instead
-	/// of running to completion under whatever gate serializes decodes.
+	/// fail, unwinding a decode whose awaiting caller is already gone — the
+	/// same contract remote sources honor at chunk granularity, so an orphaned
+	/// local decode dies at its next read instead of running to completion
+	/// under whatever gate serializes decodes.
+	///
+	/// The failure is `ErrorKind::Other`, never `Interrupted`: std's
+	/// `read_exact` retries `Interrupted` forever, and every decoder but png
+	/// and gif reads through it, so a cancel answered that way spun the decode
+	/// at 100% CPU instead of ending it.
 	pub fn with_cancel(file: std::fs::File, cancel: Option<Arc<AtomicBool>>) -> io::Result<Self> {
 		let len = file.metadata()?.len();
 		Ok(FileSource { file, len, cancel })
@@ -50,10 +55,7 @@ impl ByteSource for FileSource {
 			.as_ref()
 			.is_some_and(|c| c.load(Ordering::Relaxed))
 		{
-			return Err(io::Error::new(
-				io::ErrorKind::Interrupted,
-				"thumbnail cancelled",
-			));
+			return Err(io::Error::other("thumbnail cancelled"));
 		}
 		if offset >= self.len {
 			return Ok(0);
