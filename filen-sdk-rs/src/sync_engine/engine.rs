@@ -107,12 +107,23 @@ pub(super) enum PendingKind {
 ///
 /// A push proves only that the server took our bytes. What makes the content agreed is the remote
 /// still holding it a while later — long enough that another client's edit of the same file would
-/// have to have been made against our version rather than beside it. Thirty seconds is that "a
-/// while": comfortably longer than the socket round trip that announces a foreign write (so a
-/// genuinely concurrent edit lands INSIDE the window and stays a conflict), and short enough that
-/// the ordinary "someone edited it minutes later" case confirms without a pass having to catch our
-/// version as the head.
-pub const CONFIRM_TENURE: Duration = Duration::from_secs(30);
+/// have to have been made against our version rather than beside it. Ten seconds is that "a while":
+/// comfortably above the socket round trip that announces a foreign write, and above the spread an
+/// UNCONTENDED same-round race leaves between the two clients' versions — 0–6 s where the live
+/// suite measures it — so a genuinely concurrent edit is still INSIDE the window and stays a
+/// conflict. Past that spread the window only costs confirmations: a sequential edit made a few
+/// seconds after ours is the ordinary case, and it should confirm without a pass having to catch
+/// our version as the head.
+///
+/// What the window is NOT above is the account-wide drive-write lock. Two clients of one account
+/// serialize their uploads on it, and a client that misses the release waits out a fibonacci
+/// back-off that reaches tens of seconds ([`crate::sync::lock`]) — the live suite has measured a
+/// same-round race spread 30 s apart that way. A race stretched past the window is, by every piece
+/// of evidence the engine has, an ordinary later edit: our push confirms and the foreign version is
+/// pulled over our local copy, leaving only the pusher's interleave check to surface it, and a
+/// CREATE race has no replaced version for that check to read at all. That class is accepted (see
+/// the engine's remaining-work notes); a shorter window widens it.
+pub const CONFIRM_TENURE: Duration = Duration::from_secs(10);
 
 /// How long a push record survives with nothing ever resolving it.
 ///
@@ -4787,19 +4798,33 @@ mod tests {
 		);
 	}
 
+	/// Comfortably PAST the confirmation window, and comfortably INSIDE it. Both are expressed in
+	/// terms of [`CONFIRM_TENURE`] so retuning the constant cannot leave a fixture on the wrong side
+	/// of it while the test still passes for the wrong reason.
+	fn past_window() -> Duration {
+		CONFIRM_TENURE * 2
+	}
+
+	fn inside_window() -> Duration {
+		CONFIRM_TENURE / 2
+	}
+
 	/// One push of ours, announced `announced_ago` before "now" and superseded (if at all) that
 	/// long after the announcement.
-	fn tenure(announced_ago: Option<u64>, superseded_after: Option<u64>) -> (PushTenure, Instant) {
+	fn tenure(
+		announced_ago: Option<Duration>,
+		superseded_after: Option<Duration>,
+	) -> (PushTenure, Instant) {
 		// Built forwards from a real `Instant`, never backwards: subtracting from `Instant::now()`
 		// underflows on a machine that has been up for less than the offset.
 		let announced = Instant::now();
-		let now = announced + Duration::from_secs(announced_ago.unwrap_or(0));
+		let now = announced + announced_ago.unwrap_or_default();
 		(
 			PushTenure {
 				lineage: None,
 				recorded: announced,
 				announced: announced_ago.map(|_| announced),
-				superseded: superseded_after.map(|after| announced + Duration::from_secs(after)),
+				superseded: superseded_after.map(|after| announced + after),
 			},
 			now,
 		)
@@ -4807,13 +4832,13 @@ mod tests {
 
 	#[test]
 	fn a_push_that_stood_as_the_head_long_enough_is_confirmed() {
-		let (push, now) = tenure(Some(40), None);
+		let (push, now) = tenure(Some(past_window()), None);
 		assert_eq!(push.verdict(now), PushVerdict::Confirmed);
 	}
 
 	#[test]
 	fn a_push_superseded_inside_the_window_is_not_confirmed() {
-		let (push, now) = tenure(Some(40), Some(5));
+		let (push, now) = tenure(Some(past_window()), Some(inside_window()));
 		assert_eq!(
 			push.verdict(now),
 			PushVerdict::Unconfirmed,
@@ -4823,7 +4848,7 @@ mod tests {
 
 	#[test]
 	fn a_push_superseded_after_the_window_is_still_confirmed() {
-		let (push, now) = tenure(Some(40), Some(35));
+		let (push, now) = tenure(Some(past_window() * 2), Some(past_window()));
 		assert_eq!(
 			push.verdict(now),
 			PushVerdict::Confirmed,
@@ -4833,7 +4858,7 @@ mod tests {
 
 	#[test]
 	fn a_push_that_is_still_ripening_is_not_confirmed_yet() {
-		let (push, now) = tenure(Some(5), None);
+		let (push, now) = tenure(Some(inside_window()), None);
 		assert_eq!(push.verdict(now), PushVerdict::Unconfirmed);
 	}
 
@@ -4855,7 +4880,7 @@ mod tests {
 		observations.note_uuids([uuid]);
 		observations.watch_push(uuid, None, None);
 		assert_eq!(
-			observations.push_verdict(uuid, Instant::now() + Duration::from_secs(40)),
+			observations.push_verdict(uuid, Instant::now() + past_window()),
 			PushVerdict::Confirmed,
 			"the announcement that arrived first still dates the push"
 		);
@@ -4869,7 +4894,7 @@ mod tests {
 		observations.watch_push(uuid, None, None);
 		observations.forget_pushes(&[uuid], Instant::now());
 		assert_eq!(
-			observations.push_verdict(uuid, Instant::now() + Duration::from_secs(40)),
+			observations.push_verdict(uuid, Instant::now() + past_window()),
 			PushVerdict::Unknown
 		);
 	}
@@ -4885,7 +4910,7 @@ mod tests {
 		observations.note_uuids([uuid]);
 		observations.watch_push(uuid, None, None);
 		let baseline = written_row(uuid, hash(1));
-		let ripe = Instant::now() + Duration::from_secs(40);
+		let ripe = Instant::now() + past_window();
 
 		let read = || observed_confirmations(&observations, &baseline, &HashMap::new(), ripe).0;
 		assert_eq!(read(), std::collections::HashSet::from([uuid]));
@@ -4944,8 +4969,8 @@ mod tests {
 		// The version our own upload replaced is not watched any more, so nothing about the file
 		// speaks for it.
 		state.drop_push(replaced);
-		state.supersede_lineage(lineage, now + Duration::from_secs(5));
-		let ripe = now + Duration::from_secs(40);
+		state.supersede_lineage(lineage, now + inside_window());
+		let ripe = now + past_window();
 		assert_eq!(
 			state.pushes[&ours].verdict(ripe),
 			PushVerdict::Unconfirmed,
@@ -4967,7 +4992,7 @@ mod tests {
 		observations.watch_push(first, None, None);
 		observations.watch_push(second, None, Some(first));
 		assert_eq!(
-			observations.push_verdict(first, Instant::now() + Duration::from_secs(40)),
+			observations.push_verdict(first, Instant::now() + past_window()),
 			PushVerdict::Unknown,
 			"the row moved on to the new version, so the old record answers for nothing"
 		);
