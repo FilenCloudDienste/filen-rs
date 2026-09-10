@@ -19,9 +19,15 @@ async fn run_manuel_tests() {
 		std::env::set_var("OVERRIDE_TEST_AUTH_CONFIG_PATH", auth_config_path);
 	}
 
+	let write_diffs_to_file = {
+		let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+		term_program == "vscode" || term_program == "tmux" // non-exhaustive
+	};
+
 	manuel::run_manuel_tests_in_dir(
 		"tests/manuel_recordings",
 		true,
 		std::time::Duration::from_secs(300),
+		!write_diffs_to_file,
 	);
 }

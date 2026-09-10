@@ -1,8 +1,15 @@
 # load credentials from .env file
 source $(realpath $MANUEL_CWD/../.env)
-if [ -z "$TEST_EMAIL" ] || [ -z "$TEST_PASSWORD" ] || [ -z "$TEST_AUTH_CONFIG_PATH" ]; then
-    echo "Error: TEST_EMAIL, TEST_PASSWORD, and TEST_AUTH_CONFIG_PATH must be set in .env file"
+if [ -z "$TEST_EMAIL" ] || [ -z "$TEST_PASSWORD" ]; then
+    echo "Error: TEST_EMAIL and TEST_PASSWORD must be set"
     exit 1
+fi
+if [ -z "$TEST_AUTH_CONFIG_PATH" ] && [ -z "$OVERRIDE_TEST_AUTH_CONFIG_PATH" ]; then
+    echo "Error: TEST_AUTH_CONFIG_PATH (or OVERRIDE_TEST_AUTH_CONFIG_PATH) must be set"
+    exit 1
+fi
+if [ -n "$OVERRIDE_TEST_AUTH_CONFIG_PATH" ]; then
+    export TEST_AUTH_CONFIG_PATH="$OVERRIDE_TEST_AUTH_CONFIG_PATH"
 fi
 export MANUEL_EMAIL="$TEST_EMAIL"
 export MANUEL_PASSWORD="$TEST_PASSWORD"
@@ -12,10 +19,6 @@ export FILEN_CLI_TESTING_DISABLE_KEYRING="1"
 no-auth() {
     export INTERNAL_FLAG_FOR_FILEN_CLI_AUTH_CONFIG_PATH=""
 }
-
-if [ -n "$OVERRIDE_TEST_AUTH_CONFIG_PATH" ]; then
-    export INTERNAL_FLAG_FOR_FILEN_CLI_AUTH_CONFIG_PATH=" --auth-config-path $OVERRIDE_TEST_AUTH_CONFIG_PATH"
-fi
 
 # make a uniquely named temporary directory for this test run
 export MANUEL_TMP="$(mktemp -d /tmp/filen-cli-test-XXXXXX)"
