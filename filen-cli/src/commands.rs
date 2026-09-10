@@ -14,6 +14,7 @@ use crate::{
 };
 
 mod fs_cmds;
+mod notes_cmds;
 mod rclone_cmds;
 mod search_cmd;
 mod transfer_cmds;
@@ -125,6 +126,12 @@ pub(crate) enum Commands {
 		/// Local destination directory (default: the current local directory)
 		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
 		destination: Option<String>,
+	},
+	/// Export all notes to a local directory
+	ExportNotes {
+		/// Local directory to export the notes to (default: the current local directory)
+		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		path: Option<String>,
 	},
 	/// Search for a file or directory interactively
 	Search,
@@ -323,6 +330,10 @@ pub(crate) async fn execute_command(
 		} => {
 			transfer_cmds::download(ui, client, working_path, &source, destination.as_deref())
 				.await?;
+			None
+		}
+		Commands::ExportNotes { path } => {
+			notes_cmds::export_notes(ui, client, path.as_deref()).await?;
 			None
 		}
 		Commands::Search => search_cmd::search_cmd(ui, client, working_path).await?,

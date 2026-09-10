@@ -107,6 +107,11 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 			],
 		},
 		DocSection {
+			id: "notes",
+			title: "Notes",
+			elements: vec![DocElement::CommandHelp("export-notes")],
+		},
+		DocSection {
 			id: "managed-rclone",
 			title: "Managed Rclone",
 			elements: vec![

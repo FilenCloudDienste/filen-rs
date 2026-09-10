@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `upload` and `download` commands to transfer files and directories to and from the drive
 - `trash-restore` and `trash-delete` commands to restore or permanently delete files and directories from the trash
 - `ls --long` (`ls -l`) to list items one per line with human-readable file sizes
+- `export-notes` command to export all notes to a local directory
 
 ### Changed
 
