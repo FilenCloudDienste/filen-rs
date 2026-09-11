@@ -125,14 +125,39 @@ pub(super) enum PendingKind {
 /// our version as the head.
 ///
 /// What the window is NOT above is the account-wide drive-write lock. Two clients of one account
-/// serialize their uploads on it, and a client that misses the release waits out a fibonacci
-/// back-off that reaches tens of seconds ([`crate::sync::lock`]) — the live suite has measured a
-/// same-round race spread 30 s apart that way. A race stretched past the window is, by every piece
-/// of evidence the engine has, an ordinary later edit: our push confirms and the foreign version is
-/// pulled over our local copy, leaving only the pusher's interleave check to surface it, and a
-/// CREATE race has no replaced version for that check to read at all. That class is accepted (see
-/// the engine's remaining-work notes); a shorter window widens it.
+/// serialize their uploads on it, so the one that queues lands its version as far behind the other's
+/// as its wait was long — the live suite has measured a same-round race spread 30 s apart, back when
+/// a pass polled for the lock on the shared ladder's 30 s ceiling. A pass polls on
+/// `PASS_LOCK_MAX_SLEEP` now, which bounds the part of that wait the acquisition adds; what no
+/// ceiling can bound is the holder's own apply, which runs on under the lock after its upload. A
+/// race stretched past the window is, by every piece of evidence the engine has, an ordinary later
+/// edit: our push confirms and the foreign version is pulled over our local copy, leaving only the
+/// pusher's interleave check to surface it, and a CREATE race has no replaced version for that check
+/// to read at all. That residual class is accepted; a shorter window widens it.
 pub const CONFIRM_TENURE: Duration = Duration::from_secs(10);
+
+/// The ceiling on ONE sleep of the drive-lock acquisition a pass makes, with the lock module's
+/// default attempt count, so the whole wait's bound moves with it: 8640 polls of at most 5 s give
+/// up after about 12 h where the default ladder allowed about 72 h, with the same `RetryFailed`
+/// at the end.
+///
+/// A pass holds the account-wide drive-write lock for its whole apply, so two clients of one account
+/// run their rounds one after the other, and the second one's version lands as far behind the
+/// first's as its wait for the lock was long. Past [`CONFIRM_TENURE`] that is no longer a race by
+/// any evidence the engine has: the first client's push has tenured, so it pulls the second's
+/// version over its own copy instead of surfacing a conflict, and the bytes it planned survive only
+/// as a server version. The default ladder ([`crate::sync::lock`], capped at
+/// [`MAX_SLEEP_TIME_DEFAULT`](crate::sync::lock::MAX_SLEEP_TIME_DEFAULT), 30 s per sleep) puts a
+/// missed release well past the window on its own: a client that polls a moment too early sleeps out
+/// its whole current step before it asks again. Half the window bounds that miss to a fraction of it
+/// instead, for the price of more polls on a lock held through a long apply. Only the ENGINE's own
+/// acquisition is bounded this way; every other caller of [`Client::lock_drive`] keeps the default
+/// ladder.
+///
+/// It does NOT bound the whole gap between the two versions. The winner holds the lock until the end
+/// of its apply, so its upload can already be older than the window by the time the loser is let in;
+/// what this bounds is the part the acquisition itself adds — the wait AFTER the release.
+pub(super) const PASS_LOCK_MAX_SLEEP: Duration = Duration::from_secs(5);
 
 /// How long a push record survives with nothing ever resolving it.
 ///
@@ -2976,6 +3001,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+		sync::lock::MAX_SLEEP_TIME_DEFAULT,
 		sync_engine::{
 			PauseMode,
 			baseline::{BaselineChange, NodeKind},
@@ -4967,6 +4993,24 @@ mod tests {
 			},
 			now,
 		)
+	}
+
+	/// The pass's drive-lock ceiling earns its place only by staying inside the confirmation window:
+	/// a pass that missed another client's release has to poll again, take the lock and upload while
+	/// the round it queued behind is still a race by the engine's own measure. Two sleeps' worth of
+	/// room is the whole of it — there is no third poll left inside the window.
+	#[test]
+	fn the_pass_lock_ceiling_polls_again_inside_the_confirmation_window() {
+		assert!(
+			PASS_LOCK_MAX_SLEEP * 2 <= CONFIRM_TENURE,
+			"a missed release costs up to {PASS_LOCK_MAX_SLEEP:?}, which has to leave room inside \
+			 CONFIRM_TENURE ({CONFIRM_TENURE:?}) for the round it lets through"
+		);
+		assert!(
+			PASS_LOCK_MAX_SLEEP < MAX_SLEEP_TIME_DEFAULT,
+			"the point of the engine's own ceiling is that it is shorter than the shared default \
+			 ({MAX_SLEEP_TIME_DEFAULT:?}), which is past the window on its own"
+		);
 	}
 
 	#[test]

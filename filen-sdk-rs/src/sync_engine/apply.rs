@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
-	engine::{Observations, PendingKind, PendingWrites},
+	engine::{Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites},
 	events::SyncEvent,
 	guard::GuardReason,
 	outcome::{
@@ -40,6 +40,7 @@ use crate::{
 		file::{cache::CacheableFile, meta::FileMetaChanges},
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
+	sync::lock::ATTEMPTS_DEFAULT,
 };
 use tokio::sync::Mutex;
 
@@ -338,9 +339,14 @@ pub(super) async fn apply(
 	// Hold the drive-write lock for the whole pass when it mutates the remote (a pure pull touches
 	// only local files and needs no lock). Inner `lock_drive` calls then return a clone of this.
 	//
+	// Polled on a schedule of the engine's own (`PASS_LOCK_MAX_SLEEP`, default attempt count) rather
+	// than the shared default ladder, so a pass that misses another client's release picks the lock
+	// up inside the confirmation window instead of tens of seconds later, where its round no longer
+	// reads as a race against the one it queued behind.
+	//
 	// Taken UNDER the gate, because acquiring it is itself a wait a pause has to be able to reach: a
-	// contended acquisition retries for hours by default, so a pass told to stop while queueing for
-	// the lock would otherwise take it just to release it — and report what it did not do only then.
+	// contended acquisition retries for hours, so a pass told to stop while queueing for the lock
+	// would otherwise take it just to release it — and report what it did not do only then.
 	// A suspended pass parks here instead of holding a lock it is not using. Dropping the
 	// acquisition mid-request can leave the server holding a lock nothing refreshes; that lease
 	// expires on its own within ~30 s.
@@ -353,7 +359,14 @@ pub(super) async fn apply(
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total, observer);
 		}
-		match ctx.gate.guard(ctx.client.lock_drive()).await {
+		match ctx
+			.gate
+			.guard(
+				ctx.client
+					.lock_drive_bounded(PASS_LOCK_MAX_SLEEP, ATTEMPTS_DEFAULT),
+			)
+			.await
+		{
 			Some(Ok(lock)) => Some(lock),
 			Some(Err(error)) => {
 				report
