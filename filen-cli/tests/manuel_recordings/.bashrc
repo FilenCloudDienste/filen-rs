@@ -1,5 +1,7 @@
-# load credentials from .env file
-source $(realpath $MANUEL_CWD/../.env)
+MANUEL_ENV_FILE="$MANUEL_CWD/../.env"
+if [ -f "$MANUEL_ENV_FILE" ]; then
+    source "$MANUEL_ENV_FILE"
+fi
 if [ -z "$TEST_EMAIL" ] || [ -z "$TEST_PASSWORD" ]; then
     echo "Error: TEST_EMAIL and TEST_PASSWORD must be set"
     exit 1
@@ -28,12 +30,15 @@ MANUEL_REMOTE_CWD_candidate="filen-cli-testing/manuel-$RANDOM"
 set-remote-cwd() {
     export MANUEL_REMOTE_CWD="$MANUEL_REMOTE_CWD_candidate"
 }
-# todo: add recording name here
 
 # make filen-cli binary available
 cd $MANUEL_CWD
-CARGO_MANIFEST_DIR=$(dirname $(cargo metadata --format-version=1 | jq --raw-output '.packages.[] | select(.name=="filen-cli") | .manifest_path'))
-export FILEN_CLI_BINARY="$(realpath $CARGO_MANIFEST_DIR/../target/debug/filen-cli)"
+CARGO_TARGET_DIRECTORY=$(cargo metadata --format-version=1 --no-deps 2>/dev/null | jq --raw-output '.target_directory')
+export FILEN_CLI_BINARY="$CARGO_TARGET_DIRECTORY/debug/filen-cli"
+if [ ! -x "$FILEN_CLI_BINARY" ]; then
+    echo "Error: filen-cli binary not found at $FILEN_CLI_BINARY (build it: cargo build -p filen-cli)"
+    exit 1
+fi
 export INTERNAL_FLAG_FOR_FILEN_CLI_AUTOCOMPLETE=" --reluctant-autocomplete"
 filen() {
     working_path_flag=" "
