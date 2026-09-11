@@ -443,6 +443,20 @@ impl Client {
 mod tests {
 	use super::*;
 
+	/// The caller-chosen ceiling is what bounds how late a contended acquisition's NEXT poll is —
+	/// the sync engine picks a short one so a pass that misses another client's release is back
+	/// inside its confirmation window. Every step of the ramp has to respect it, not just the
+	/// ones past it.
+	#[test]
+	fn the_backoff_ramp_never_sleeps_longer_than_its_ceiling() {
+		let ceiling = Duration::from_secs(5);
+		assert!(
+			fibonacci_iter(ceiling)
+				.take(64)
+				.all(|delay| delay <= ceiling)
+		);
+	}
+
 	#[test]
 	fn refresh_delay_saturates_when_first_poll_is_late() {
 		assert_eq!(

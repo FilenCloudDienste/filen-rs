@@ -64,7 +64,10 @@ impl Client {
 	/// sharing, but a server-side-contended acquisition gives up with
 	/// [`ErrorKind::RetryFailed`](crate::ErrorKind::RetryFailed) after `attempts` polls instead
 	/// of waiting out the multi-hour default schedule. Used by the cache worker's resync, which
-	/// must yield back to draining events when the lock is contended rather than parking on it.
+	/// must yield back to draining events when the lock is contended rather than parking on it,
+	/// and by a sync-engine pass, which keeps the default attempt count and takes only the
+	/// tighter poll cadence — a pass that misses the release has to be back inside its own
+	/// confirmation window.
 	#[cfg(feature = "cache")]
 	pub(crate) async fn lock_drive_bounded(
 		&self,
