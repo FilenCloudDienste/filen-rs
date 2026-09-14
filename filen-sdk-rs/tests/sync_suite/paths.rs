@@ -14,15 +14,16 @@
 //! REJECTS exactly the hostile inputs these tests need: `/` and `\` and `:` and the Windows
 //! reserved-char set and all control chars (incl. NUL/newline/tab) are forbidden; `.`/`..`/`""`
 //! error; trailing dot/space, leading space, names > 255 bytes, and Windows device names
-//! (CON/PRN/...) all error. The `malformed` feature's seams (`create_malformed_file`,
-//! `create_malformed_dir`, `create_dir_with_name_hash`) do NOT help: `create_dir_with_name_hash`
-//! still validates the name via `make_parts`, and the `create_malformed_*` paths stuff RAW bytes
-//! into the *encrypted* name/meta fields, so the cache cannot DECODE them into a name at all — the
-//! item never surfaces as a named entry the engine could (mis)materialize. There is therefore no
-//! current seam to inject a hostile-but-decodable remote name, so PATH-01..05, 08, 09, 13, 14, 19,
-//! 21, 24, 25 and the review-added traversal/illegal-char/sanitization-collision/watch-self-write
-//! cases are written as `#[ignore]` stubs that record their plan. They must NOT be faked: with no
-//! injection seam, a "passing" run would assert nothing about hostile-name handling.
+//! (CON/PRN/...) all error. The `malformed` feature's seams mostly do NOT help:
+//! `create_dir_with_name_hash` still validates the name via `make_parts`, and
+//! `create_malformed_file` stores whatever strings it is given as the *encrypted* fields, so a
+//! hostile FILE name needs a full encrypted file metadata (key included) the suite cannot build.
+//! The one exception is a DIRECTORY: `create_malformed_dir` given metadata encrypted with the
+//! client's own crypter surfaces as a decodable directory with any name at all, which is how
+//! PATH-19 stages `.` and `..` (under `-F malformed`). There is no seam for the rest, so PATH-01..05,
+//! 08, 09, 13, 14, 21, 24, 25 and the review-added traversal/illegal-char/sanitization-collision/
+//! watch-self-write cases are written as `#[ignore]` stubs that record their plan. They must NOT be
+//! faked: with no injection seam, a "passing" run would assert nothing about hostile-name handling.
 //!
 //! What the current harness genuinely supports — and what is implemented below — is every PATH case
 //! whose names are VALID (so injectable through the conforming `Client`): case-only renames,
@@ -36,6 +37,8 @@ use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::file::meta::FileMetaChanges;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{SyncMode, UnsyncableReason};
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::{crypto::shared::MetaCrypter, sync_engine::UnsyncablePath};
 
 use crate::harness::*;
 use crate::helpers::*;
@@ -910,13 +913,68 @@ async fn path_14_very_long_total_path() {}
 #[shared_test_runtime]
 async fn path_17_control_dir_excluded_and_name_collision_safe() {}
 
-/// PATH-19 — empty name, single dot, and double dot as literal remote directory entries.
-/// Plan: remote entries named "", ".", ".." (where the API allows) content X; r2l. Verify: none
-/// resolve to current/parent dir, each sanitized to a distinct in-root name or skipped-with-warning,
-/// no data loss to L's children/parent, idempotent, no crash.
-#[ignore = "blocked: needs hostile-remote-name injection seam (Client rejects ''/'.'/'..') — see module docs"]
+/// PATH-19 — single dot and double dot as literal remote directory names. Neither resolves to the
+/// sync root or its parent: each is left out of the view and reported with its name (the
+/// skipped-with-warning branch of the plan), no local directory is created for either and nothing
+/// but the valid sibling appears under the local root, and a second pass does the same and nothing
+/// more. An empty name is not staged: it needs no handling of its own beyond the same check.
+#[cfg(feature = "malformed")]
 #[shared_test_runtime]
-async fn path_19_empty_dot_and_dotdot_literal_entries() {}
+async fn path_19_dot_and_dotdot_literal_entries() {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	let root = DirType::<Normal>::Dir(Cow::Borrowed(&sc.resources.dir));
+	let mut hostile = Vec::new();
+	for name in [".", ".."] {
+		// Metadata encrypted like any client's: it DECODES, to a name no conforming client writes.
+		let meta = sc
+			.resources
+			.client
+			.crypter()
+			.encrypt_meta(&format!(r#"{{"name":"{name}"}}"#))
+			.await;
+		let uuid = sc
+			.resources
+			.client
+			.create_malformed_dir(&root, name, &meta.0)
+			.await
+			.unwrap();
+		hostile.push(uuid);
+	}
+	let ok = upload_root(&sc, "ok.txt", b"ok").await;
+	for uuid in hostile.into_iter().chain([ok.uuid()]) {
+		assert!(
+			poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"cache never observed item {uuid}"
+		);
+	}
+
+	let reported: Vec<UnsyncablePath> = [".", ".."]
+		.into_iter()
+		.map(|name| UnsyncablePath {
+			rel_path: name.to_string(),
+			reason: UnsyncableReason::RemoteInvalidName {
+				name: name.to_string(),
+			},
+		})
+		.collect();
+	for pass in 1..=2 {
+		let report = sc.sync().await;
+		assert!(report.errors.is_empty(), "pass {pass}: {report:?}");
+		assert_eq!(report.unsyncable, reported, "pass {pass}: {report:?}");
+		assert_eq!(report.local_dirs_created, 0, "pass {pass}: {report:?}");
+		assert_eq!(
+			report.downloaded,
+			usize::from(pass == 1),
+			"pass {pass}: {report:?}"
+		);
+	}
+	assert_eq!(
+		walk_tree(&sc.local).into_keys().collect::<Vec<_>>(),
+		vec!["ok.txt".to_string()],
+		"only the valid sibling materialized"
+	);
+	sc.cleanup();
+}
 
 /// PATH-21 — whitespace-only and leading-space remote names (" ", "   ", " leading.txt").
 /// Plan: remote entries with those names + distinct contents; two r2l passes. Verify: each distinct
