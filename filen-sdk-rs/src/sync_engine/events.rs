@@ -54,7 +54,10 @@ pub enum SyncEvent {
 	MovingRemote { from: String, to: String },
 	/// Renaming a local file in place of a re-download (a detected remote move).
 	MovingLocal { from: String, to: String },
-	/// An individual action failed; the pass continues past it (the failure is also in the report).
+	/// An individual action failed; the pass continues past it (the failure is also in the report),
+	/// and a failure no transfer to that side can get past — a full disk or a full account — also
+	/// holds back the transfers that write there (see
+	/// [`SyncReport::halted`](super::SyncReport::halted)).
 	ActionFailed { rel_path: String, error: String },
 	/// The pass was cut short: the pair was paused with
 	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran, so `actions` of its planned

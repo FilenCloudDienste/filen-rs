@@ -38,8 +38,8 @@ pub use events::{SyncEvent, SyncObserver};
 pub use guard::{DeleteGuard, GuardReason};
 pub use mode::{Backlog, SyncMode};
 pub use outcome::{
-	PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, RefuseReason,
-	UnsyncablePath, UnsyncableReason,
+	HaltReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
+	RefuseReason, UnsyncablePath, UnsyncableReason,
 };
 pub use pause::{DEFAULT_CANCEL_AFTER, PauseMode, PauseOptions};
 pub use watch::{WatchConfig, WatchHandle, WatchState, WatchStatus};
