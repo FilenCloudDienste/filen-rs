@@ -28,6 +28,11 @@ mod state;
 // through `Client::{configure_cache, add_sync_root, flush_cache}` and
 // `SyncRootHandle::{evict, update_list_dir_recursive}` + its `Drop`, never as a constructible type.
 pub(crate) use handle::CacheSlot;
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) use sql::UndecodableItem;
 pub(crate) use state::{CacheControlMessage, CacheState};
 pub use {
 	error::CacheError,

@@ -13,6 +13,7 @@ use crate::{
 	ErrorKind,
 	auth::Client,
 	fs::{
+		cache::CacheableConversionError,
 		categories::{DirType, Normal},
 		dir::cache::CacheableDir,
 		file::cache::CacheableFile,
@@ -21,7 +22,10 @@ use crate::{
 	socket::DecryptedSocketEvent,
 	util::PeekableReceiver,
 };
-use filen_types::{fs::StableUuid, traits::CowHelpers};
+use filen_types::{
+	fs::{ParentUuid, StableUuid},
+	traits::CowHelpers,
+};
 use futures::StreamExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
@@ -39,7 +43,7 @@ use crate::cache::{
 	handle::{CacheMessage, ResyncProgress},
 	search::ReadTask,
 	sql::{
-		PersistedEvent,
+		PersistedEvent, UndecodableItem,
 		columns::{COUNT, FILES_STABLE_UUID, ITEMS_PARENT},
 	},
 };
@@ -1369,7 +1373,8 @@ impl CacheState {
 		let (trashed, live): (Vec<RemoteFile>, Vec<RemoteFile>) =
 			heads.into_iter().partition(|head| head.parent.is_trash());
 		let mut errors = Vec::new();
-		let (_, files) = convert_listing(Vec::new(), live, &mut errors);
+		// A head is one file of a file sync root, not a listing of a directory the engine reads.
+		let (_, files) = convert_listing(Vec::new(), live, &mut errors, &mut Vec::new());
 		if !errors.is_empty() {
 			self.surface_errors(errors);
 		}
@@ -2800,7 +2805,16 @@ impl CacheState {
 					continue;
 				}
 			}
-			let (cdirs, cfiles) = convert_listing(dirs, files, &mut errors);
+			let mut undecodable = Vec::new();
+			let (cdirs, cfiles) = convert_listing(dirs, files, &mut errors, &mut undecodable);
+			// Before the diff deletes the rows these records used to be: a reader never sees such an
+			// item gone without its record in place.
+			if let Err(e) = self.replace_undecodable(root, &undecodable) {
+				errors.push(CacheError::db(
+					e,
+					format!("recording the undecodable items of sync root {root}"),
+				));
+			}
 			per_root.push((root, cdirs, cfiles));
 		}
 		if !errors.is_empty() {
@@ -3039,7 +3053,8 @@ impl CacheState {
 				// error on the bulk insert is surfaced ALONGSIDE the conversion errors rather than
 				// discarding the ones accumulated so far.
 				let mut errors = Vec::new();
-				let (cdirs, cfiles) = convert_listing(dirs, files, &mut errors);
+				// A manual listing is not scoped to a sync root, so it has no root's records to replace.
+				let (cdirs, cfiles) = convert_listing(dirs, files, &mut errors, &mut Vec::new());
 				if let Err(e) = self.upsert_dirs(cdirs.iter()) {
 					errors.push(CacheError::db(
 						e,
@@ -3063,24 +3078,53 @@ impl CacheState {
 
 /// Convert a freshly-listed remote subtree into owned cacheables for the resync diff. A
 /// record that cannot be made cacheable (e.g. a non-uuid parent) is pushed to `errors` (non-fatal) and
-/// skipped, so one bad record never aborts the whole resync.
+/// skipped, so one bad record never aborts the whole resync. One skipped because its metadata did
+/// not decode is ALSO pushed to `undecodable`: it still exists, and a caller listing a sync root
+/// keeps that on record (see [`UndecodableItem`]).
 fn convert_listing(
 	dirs: Vec<RemoteDirectory>,
 	files: Vec<RemoteFile>,
 	errors: &mut Vec<CacheError>,
+	undecodable: &mut Vec<UndecodableItem>,
 ) -> (Vec<CacheableDir<'static>>, Vec<CacheableFile<'static>>) {
 	let mut cacheable_dirs = Vec::with_capacity(dirs.len());
 	for dir in dirs {
 		match CacheableDir::try_from(dir) {
 			Ok(cacheable) => cacheable_dirs.push(cacheable),
-			Err((dir, e)) => errors.push(CacheError::dir_cacheable_conversion(dir, e.into())),
+			Err((dir, e)) => {
+				if let (
+					CacheableConversionError::MetadataNotDecrypted(_),
+					ParentUuid::Uuid(parent),
+				) = (&e, &dir.parent)
+				{
+					undecodable.push(UndecodableItem {
+						uuid: dir.uuid,
+						parent: *parent,
+						stable_uuid: None,
+					});
+				}
+				errors.push(CacheError::dir_cacheable_conversion(dir, e.into()))
+			}
 		}
 	}
 	let mut cacheable_files = Vec::with_capacity(files.len());
 	for file in files {
 		match CacheableFile::try_from(file) {
 			Ok(cacheable) => cacheable_files.push(cacheable),
-			Err((file, e)) => errors.push(CacheError::file_cacheable_conversion(file, e.into())),
+			Err((file, e)) => {
+				if let (
+					CacheableConversionError::MetadataNotDecrypted(_),
+					ParentUuid::Uuid(parent),
+				) = (&e, &file.parent)
+				{
+					undecodable.push(UndecodableItem {
+						uuid: file.uuid,
+						parent: *parent,
+						stable_uuid: Some(file.stable_uuid),
+					});
+				}
+				errors.push(CacheError::file_cacheable_conversion(file, e.into()))
+			}
 		}
 	}
 	(cacheable_dirs, cacheable_files)

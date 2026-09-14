@@ -5,7 +5,7 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
-	collections::{BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -1163,6 +1163,11 @@ struct Prepared {
 	/// The per-path failure streaks that block planning this pass (see [`streak_blocks`]). A streak
 	/// below the threshold, or one whose retry interval has run out, is not here.
 	failures: HashMap<String, PathFailure>,
+	/// Synced paths whose remote item still exists but is out of the view (see
+	/// [`plan::unknown_remote_paths`]), with why. Blocked and reported, never read as deleted.
+	unknown_remote: BTreeMap<String, UnsyncableReason>,
+	/// Remote items out of the view that no baseline row names: reported only.
+	never_synced_remote: Vec<UnsyncablePath>,
 	/// Baseline rows whose agreed-content marker this pass's raw snapshot advanced (see
 	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
 	/// either way; a real pass persists them, a dry run writes nothing.
@@ -1206,18 +1211,29 @@ impl Prepared {
 						},
 					}),
 			)
+			.chain(
+				self.unknown_remote
+					.iter()
+					.map(|(rel_path, reason)| UnsyncablePath {
+						rel_path: rel_path.clone(),
+						reason: reason.clone(),
+					}),
+			)
+			.chain(self.never_synced_remote.iter().cloned())
 			.collect();
 		// One stable order, so a caller diffing consecutive reports sees only real changes.
 		all.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 		all
 	}
 
-	/// Every path this pass must not plan an action for: a name the remote would reject, and a path
-	/// whose failure streak ran out. Both are reported by [`unsyncable`](Self::unsyncable).
+	/// Every path this pass must not plan an action for: a name the remote would reject, a path
+	/// whose failure streak ran out, and a synced path whose remote item is out of the view. All are
+	/// reported by [`unsyncable`](Self::unsyncable).
 	fn blocked_paths(&self) -> BTreeSet<String> {
 		self.failures
 			.keys()
 			.chain(self.local_scan.invalid_names.keys())
+			.chain(self.unknown_remote.keys())
 			.cloned()
 			.collect()
 	}
@@ -2120,8 +2136,12 @@ impl SyncEngine {
 			.client
 			.enumerate_sync_root_snapshot(record.remote_root)
 			.await?;
-		let mut remote_view =
-			plan::build_remote_view(record.remote_root, &snapshot.dirs, &snapshot.files);
+		let mut remote_view = plan::build_remote_view(
+			record.remote_root,
+			&snapshot.dirs,
+			&snapshot.files,
+			&snapshot.undecodable,
+		);
 
 		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
 		// view — before this engine's own writes are folded into it, and before the baseline is
@@ -2133,6 +2153,8 @@ impl SyncEngine {
 				.await,
 		);
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
+		let (unknown_remote, never_synced_remote) =
+			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
 
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
@@ -2200,6 +2222,8 @@ impl SyncEngine {
 			remote_emptied,
 			holds,
 			failures,
+			unknown_remote,
+			never_synced_remote,
 			confirmed,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
@@ -3059,13 +3083,15 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 
 /// Drop every action at a blocked path, and everything under it.
 ///
-/// A path is blocked when the remote would reject its name, or when its failure streak ran out (and
+/// A path is blocked when the remote would reject its name, when its failure streak ran out (and
 /// stays blocked until a [`retry_path`](SyncEngine::retry_path) or a rename clears it, or
-/// [`PATH_FAILURE_RETRY_INTERVAL`] passes and it is tried once more). The SUBTREE
-/// goes with it either way: a name the remote refuses can hold no remote children, and the failures
+/// [`PATH_FAILURE_RETRY_INTERVAL`] passes and it is tried once more), or when it was synced and its
+/// remote item is still there but out of the view (see [`plan::unknown_remote_paths`]). The SUBTREE
+/// goes with it every time: a name the remote refuses can hold no remote children, the failures
 /// that get this far are structural — a directory that cannot be created can hold no children, a
 /// local tree that cannot be written to cannot take a file — so planning the descendants would just
-/// start the same streak one level down.
+/// start the same streak one level down, and what sits under a directory the view cannot see is as
+/// unknown as the directory.
 ///
 /// Dropping the destination half of a MOVE takes the deletions that would strand its source with it
 /// (see below): an unrelocatable item must not be deleted from the side that still holds it.
@@ -3227,6 +3253,84 @@ mod tests {
 
 		// Nothing blocked -> the plan is untouched.
 		assert_eq!(drop_blocked(actions.clone(), &BTreeSet::new()), actions);
+	}
+
+	/// A synced file whose remote item dropped out of the view (its metadata stopped decoding) reads
+	/// to the reconciler exactly like a remote deletion, and one deletion is far under the guard's
+	/// floor, so the guard lets it through. The block on the unknown path is what keeps the local
+	/// copy.
+	#[test]
+	fn a_synced_path_whose_remote_item_left_the_view_is_blocked_not_deleted() {
+		let root = Uuid::new_v4();
+		let uuid = Uuid::new_v4();
+		let hash = Blake3Hash::from([3; 32]);
+		let baseline = HashMap::from([(
+			"doc.txt".to_string(),
+			BaselineEntry {
+				remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
+				agreed_hash: Some(hash),
+				..synced_file("doc.txt", uuid, hash, 4)
+			},
+		)]);
+		let local = HashMap::from([(
+			"doc.txt".to_string(),
+			LocalNode {
+				rel_path: "doc.txt".to_string(),
+				kind: NodeKind::File,
+				size: 4,
+				mtime_millis: 0,
+				content_hash: Some(hash),
+			},
+		)]);
+		let view = plan::build_remote_view(
+			root,
+			&[],
+			&[],
+			&[crate::cache::UndecodableItem {
+				uuid,
+				parent: root,
+				stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			}],
+		);
+		let reconciled = plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&view.nodes,
+			&plan::PassHolds::default(),
+		);
+		assert_eq!(
+			reconciled.actions,
+			vec![SyncAction::DeleteLocal {
+				rel_path: "doc.txt".to_string(),
+				kind: NodeKind::File,
+			}],
+			"unblocked, the vanished item plans a local delete"
+		);
+		let healthy = guard::ScreenState {
+			scan_complete: true,
+			remote_converged: true,
+			remote_emptied: false,
+			first_sync: false,
+			tracked: 1,
+		};
+		assert!(
+			guard::screen(reconciled.actions.clone(), healthy, DeleteGuard::default())
+				.held
+				.is_empty(),
+			"the guard alone lets that one delete through"
+		);
+
+		let (unknown, never_synced) = plan::unknown_remote_paths(&baseline, &view.skipped);
+		assert_eq!(
+			unknown,
+			BTreeMap::from([("doc.txt".to_string(), UnsyncableReason::RemoteUndecodable)])
+		);
+		assert!(never_synced.is_empty(), "{never_synced:?}");
+		assert!(
+			drop_blocked(reconciled.actions, &unknown.keys().cloned().collect()).is_empty(),
+			"the unknown path plans nothing"
+		);
 	}
 
 	/// A mode switch that adopts the destination's standing copies rewrites baseline rows for every

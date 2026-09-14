@@ -24,7 +24,9 @@ use crate::{
 		CacheError, SearchResult,
 		search::{open_read_connection, row_to_result},
 		sql::{
+			UndecodableItem,
 			columns::ITEMS_UUID,
+			list_undecodable,
 			statements::{ANCESTRY_OF_UUID, CACHE_META_GET, ENUMERATE_SUBTREE, WATERMARK_KEY},
 		},
 	},
@@ -41,6 +43,10 @@ pub(crate) struct SubtreeSnapshot {
 	/// `None` on a fresh cache that has applied nothing yet. Every buffered event whose
 	/// `drive_message_id <= watermark` is already reflected in `dirs`/`files`.
 	pub(crate) watermark: Option<u64>,
+	/// The listed records whose metadata did not decode, and so are in neither `dirs` nor `files`.
+	/// NOT scoped to `root`: the table holds every sync root's, and a record is only placeable by
+	/// its parent, which the caller resolves against `dirs`.
+	pub(crate) undecodable: Vec<UndecodableItem>,
 }
 
 /// Hydrate every descendant of `root` from `conn` into split dir/file vecs, reusing the search
@@ -83,12 +89,14 @@ pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result
 	let tx = conn.transaction()?;
 	let (dirs, files) = enumerate_subtree(&tx, root)?;
 	let watermark = read_watermark(&tx)?;
+	let undecodable = list_undecodable(&tx)?;
 	// Read-only: dropping the deferred transaction just ends the snapshot (nothing to commit).
 	drop(tx);
 	Ok(SubtreeSnapshot {
 		dirs,
 		files,
 		watermark,
+		undecodable,
 	})
 }
 
@@ -338,6 +346,52 @@ mod tests {
 		// Anchoring at a uuid that isn't even in the cache is likewise empty (not an error).
 		let absent = read_subtree_snapshot(&f.path, empty.uuid).unwrap();
 		assert!(absent.dirs.is_empty() && absent.files.is_empty());
+	}
+
+	/// A record a listing could not decode rides along with the snapshot until the uuid is gone or
+	/// decodes again: a removal drops it, a decodable upsert of the same uuid hides it, and the next
+	/// listing of its root replaces it.
+	#[test]
+	fn undecodable_records_are_listed_until_removed_decoded_or_relisted() {
+		let mut f = fixture();
+		let garbled_file = UndecodableItem {
+			uuid: Uuid::new_v4(),
+			parent: f.a.uuid,
+			stable_uuid: Some(StableUuid::new_for_test(Uuid::new_v4())),
+		};
+		let garbled_dir = UndecodableItem {
+			uuid: Uuid::new_v4(),
+			parent: f.root,
+			stable_uuid: None,
+		};
+		let decodes_later = UndecodableItem {
+			uuid: f.b1.uuid,
+			parent: f.b.uuid,
+			stable_uuid: Some(f.b1.stable_uuid),
+		};
+		f.state
+			.replace_undecodable(f.root, &[garbled_file, garbled_dir, decodes_later])
+			.unwrap();
+		let listed = |f: &Fixture| {
+			let mut got = read_subtree_snapshot(&f.path, f.root).unwrap().undecodable;
+			got.sort_by_key(|item| item.uuid);
+			got
+		};
+		let mut expected = vec![garbled_file, garbled_dir];
+		expected.sort_by_key(|item| item.uuid);
+		assert_eq!(
+			listed(&f),
+			expected,
+			"b1 is a cached item, so its stale record is not reported"
+		);
+
+		f.state
+			.delete_items(std::iter::once(garbled_file.uuid))
+			.unwrap();
+		assert_eq!(listed(&f), vec![garbled_dir], "a removal drops the record");
+
+		f.state.replace_undecodable(f.root, &[]).unwrap();
+		assert!(listed(&f).is_empty(), "a clean relisting clears the root");
 	}
 
 	#[test]
