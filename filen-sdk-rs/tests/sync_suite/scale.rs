@@ -514,8 +514,9 @@ async fn scale_05_deep_nesting_round_trips() {
 // Move / delete batches
 // ============================================================================
 
-/// SCALE-10 — a large LOCAL move batch (rename of a whole directory) is detected as moves, not
-/// delete+re-upload: zero uploads, zero trashes, the files re-parent on the remote, byte-exact.
+/// SCALE-10 — a large LOCAL move batch (rename of a whole directory) is ONE move of the directory,
+/// not delete+re-upload nor a move per file: zero uploads, zero trashes, the directory keeps its
+/// uuid and every file is still under it, byte-exact.
 #[shared_test_runtime]
 async fn scale_10_local_move_batch_is_moves_not_reupload() {
 	let sc = single_client(SyncMode::LocalToRemote).await;
@@ -532,6 +533,9 @@ async fn scale_10_local_move_batch_is_moves_not_reupload() {
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, N, "{r1:?}");
+	let a_uuid = find_dir(&list_root(&sc).await.0, "A")
+		.expect("A dir present")
+		.uuid();
 
 	// Rename the whole directory A -> B in one local operation.
 	std::fs::rename(sc.local.join("A"), sc.local.join("B")).unwrap();
@@ -539,36 +543,28 @@ async fn scale_10_local_move_batch_is_moves_not_reupload() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "a rename must NOT re-upload bytes: {r2:?}");
-	// A directory rename is applied as: create the new dir, re-parent (move) every file into it,
-	// then trash the now-EMPTY old dir. So the only thing trashed is the emptied source dir A —
-	// never file data (the per-file moves carry the bytes). A true single-node dir rename would
-	// make this 0; that remains a possible future optimization.
-	assert!(
-		r2.remotely_trashed <= 1,
-		"only the emptied source dir may be trashed, never file data: {r2:?}"
+	// The directory itself is renamed on the remote, its files riding along: nothing is created
+	// and nothing — not even an emptied source directory — is trashed.
+	assert_eq!(
+		r2.remotely_trashed, 0,
+		"a directory rename trashes nothing: {r2:?}"
 	);
+	assert_eq!(r2.remote_dirs_created, 0, "{r2:?}");
 	assert_eq!(
 		r2.held_deletions(),
 		0,
 		"a move must not trip the mass-delete hold: {r2:?}"
 	);
-	// All N items moved (counted as moves, not delete+create).
 	assert_eq!(
-		r2.moved_remote, N,
-		"every file must be re-parented as a move, not re-uploaded: {r2:?}"
+		r2.moved_remote, 1,
+		"the whole directory is one move, whatever it holds: {r2:?}"
 	);
 
-	// Remote reflects the move: files under B, none under A.
+	// Remote reflects the move: the same directory, now named B, holding every file.
 	let (dirs, _) = list_root(&sc).await;
-	assert!(
-		find_dir(&dirs, "A").is_none()
-			|| list_dir(&sc, find_dir(&dirs, "A").unwrap())
-				.await
-				.1
-				.is_empty(),
-		"A should be gone/empty"
-	);
+	assert!(find_dir(&dirs, "A").is_none(), "A should be gone");
 	let b = find_dir(&dirs, "B").expect("B dir present");
+	assert_eq!(b.uuid(), a_uuid, "the directory keeps its uuid");
 	let (_, bfiles) = list_dir(&sc, b).await;
 	assert_eq!(bfiles.len(), N, "all files re-parented under B");
 	for i in 0..N {

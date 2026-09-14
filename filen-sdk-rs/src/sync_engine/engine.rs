@@ -853,8 +853,8 @@ fn fold_create(
 }
 
 /// Show the item we moved at its destination rather than where the cache still lists it. A
-/// directory — renamed in place, see [`plan::fold_case_only_dir_renames`] — carries the subtree
-/// the cache still lists under its old spelling along with it.
+/// directory — see [`plan::fold_dir_moves`] — carries the subtree the cache still lists under its
+/// old path along with it.
 fn fold_move(
 	nodes: &mut HashMap<String, RemoteNode>,
 	path_of: &mut HashMap<Uuid, String>,
@@ -1060,10 +1060,10 @@ fn remote_overlap(
 struct Prepared {
 	record: PairRecord,
 	baseline: Arc<HashMap<String, BaselineEntry>>,
-	/// The case-only directory renames this pass makes (see
-	/// [`plan::fold_case_only_dir_renames`]). `baseline`, `local_scan` and `remote_view` are
-	/// already keyed by the spelling each of them ends with.
-	dir_renames: Vec<SyncAction>,
+	/// The directory moves this pass makes, in the order they run (see [`plan::fold_dir_moves`]).
+	/// `baseline`, `local_scan` and `remote_view` are already keyed by the paths those subtrees
+	/// end up at.
+	dir_moves: Vec<SyncAction>,
 	local_scan: LocalScan,
 	remote_view: RemoteView,
 	/// Whether the cache's remote view has converged at least once (the snapshot carried a
@@ -2053,21 +2053,22 @@ impl SyncEngine {
 		}
 		holds.held_remote = remote_view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
-		// Rename in place what the two sides spell differently only by case, and read the rest of
-		// the pass under the spelling it ends with. AFTER the fold: a rename of ours the cache has
-		// not shown yet must read as done, not as the remote renaming the directory back.
+		// Carry each directory move across as one move — a case-only rename included — and read the
+		// rest of the pass where those subtrees end up. AFTER the fold: a move of ours the cache has
+		// not shown yet must read as done, not as the remote moving the directory back.
 		let mut baseline = baseline;
-		let dir_renames = plan::fold_case_only_dir_renames(
+		let dir_moves = plan::fold_dir_moves(
 			record.mode,
 			Arc::make_mut(&mut baseline),
 			&mut local_scan.nodes,
 			&mut remote_view.nodes,
+			&holds.held_remote,
 		);
 
 		Ok(Prepared {
 			record,
 			baseline,
-			dir_renames,
+			dir_moves,
 			local_scan,
 			remote_view,
 			remote_converged: snapshot.watermark.is_some(),
@@ -2871,9 +2872,9 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		&prep.holds,
 	);
 	let deferred_paths = plan.deferred_paths;
-	// The renames run before everything else in the plan, which already names their subtrees by
-	// the new spelling. Copied: the dry run plans from the same borrowed `Prepared`.
-	let mut actions = prep.dir_renames.clone();
+	// The directory moves run before everything else in the plan, which already names their
+	// subtrees by the paths they move to. Copied: the dry run plans from the same borrowed `Prepared`.
+	let mut actions = prep.dir_moves.clone();
 	actions.extend(plan.actions);
 	let actions = drop_blocked(actions, &prep.blocked_paths());
 	let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
