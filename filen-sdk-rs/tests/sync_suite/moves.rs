@@ -351,6 +351,11 @@ async fn move06_whole_subtree_relocation() {
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "subtree move must not re-upload: {r2:?}");
+	// `mkdir archive; mv proj archive/proj` is one server-side move after the create of its new
+	// parent: nothing moved file by file, nothing trashed.
+	assert_eq!(r2.remote_dirs_created, 1, "{r2:?}");
+	assert_eq!(r2.moved_remote, 1, "{r2:?}");
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
 
 	let (dirs, _) = list_dir(&sc.resources.client, &sc.resources.dir).await;
 	assert!(find_dir(&dirs, "proj").is_none(), "top-level proj/ lingers");
@@ -1006,12 +1011,14 @@ async fn move20_subtree_relocation_no_false_mass_delete_trip() {
 	let mut total_uploaded = 0usize;
 	let mut total_trashed = 0usize;
 	let mut total_held = 0usize;
+	let mut total_moved = 0usize;
 	for _ in 0..6 {
 		let r = sc.sync().await;
 		assert!(r.errors.is_empty(), "{r:?}");
 		total_uploaded += r.uploaded;
 		total_trashed += r.remotely_trashed;
 		total_held += r.held_deletions();
+		total_moved += r.moved_remote;
 		let (dirs, _) = list_dir(&sc.resources.client, &sc.resources.dir).await;
 		if find_dir(&dirs, "bulk").is_none() && find_dir(&dirs, "relocated").is_some() {
 			break;
@@ -1021,12 +1028,15 @@ async fn move20_subtree_relocation_no_false_mass_delete_trip() {
 		total_uploaded < N,
 		"a subtree move must not re-upload all {N} files (uploaded {total_uploaded})"
 	);
-	// The relocation re-parents every file (moves), then trashes the emptied source directories
-	// (bulk/ plus bulk/d0..d4 = 6). No FILE data is trashed — the end-state check below proves all
-	// N files survive under relocated/bulk. Only emptied container dirs are cleaned up.
-	assert!(
-		total_trashed <= 6,
-		"only emptied source dirs may be cleaned up, never file data (trashed {total_trashed})"
+	// The relocation is one server-side move of bulk/ after the create of relocated/: nothing is
+	// re-parented file by file, and no emptied source directory is left behind to trash.
+	assert_eq!(
+		total_moved, 1,
+		"the subtree must move as one directory (moved {total_moved})"
+	);
+	assert_eq!(
+		total_trashed, 0,
+		"a directory move trashes nothing (trashed {total_trashed})"
 	);
 	assert_eq!(
 		total_held, 0,
