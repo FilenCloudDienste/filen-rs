@@ -11,7 +11,8 @@
 //! Symlinks are followed and their targets read as regular files (Filen has no symlink concept and
 //! the engine never writes one); `walkdir`'s loop detection guards against cycles. A symlink that
 //! cannot be followed (dangling, or part of a loop) is recorded as an error but does not make the
-//! scan incomplete, unless the baseline tracks that path (see [`LocalScan::complete`]).
+//! scan incomplete, unless the baseline tracks a directory at that path (see
+//! [`LocalScan::complete`]).
 //!
 //! A symlinked DIRECTORY whose target lies inside the root is not walked: its target is walked under
 //! its real path, and walking the link as well would sync one subtree twice under two names. The
@@ -105,9 +106,10 @@ pub(crate) struct LocalScan {
 	///
 	/// A symlink that cannot be followed (dangling, or looping back onto an ancestor) leaves it
 	/// true: the link itself is all there is, and treating it as missing evidence would hold every
-	/// deletion of the pair for as long as the link exists. Unless the baseline has a row at that
-	/// path: then the link used to lead somewhere that was synced (an unmounted drive, say), and
-	/// reading its subtree as deleted would propagate that.
+	/// deletion of the pair for as long as the link exists. Unless the baseline has a DIRECTORY row
+	/// at that path: then the link used to lead to a tree that was synced (an unmounted drive, say),
+	/// and reading that subtree as deleted would propagate it. A file row there is only the copy a
+	/// file link was synced as, and its deletion propagates like any other.
 	pub(crate) complete: bool,
 	pub(crate) errors: Vec<ScanError>,
 	/// Paths whose NAME the remote would reject, mapped to the validator's own message. Reported
@@ -305,9 +307,15 @@ pub(crate) fn scan_local(
 					.and_then(normalize_rel_path)
 					.unwrap_or_default();
 				// An unreadable directory or entry means the tree is partial. A symlink that leads
-				// nowhere does not: there is nothing behind it to have missed — unless something
-				// was synced there, which would otherwise read as deleted.
-				if !unfollowable_symlink(&err) || baseline.contains_key(&rel_path) {
+				// nowhere does not: there is nothing behind it to have missed — unless a DIRECTORY
+				// was synced through it (a link to an unmounted drive), whose subtree would
+				// otherwise read as deleted. A file synced as a link's copy is only that copy, and
+				// its deletion propagates like any other.
+				if !unfollowable_symlink(&err)
+					|| baseline
+						.get(&rel_path)
+						.is_some_and(|entry| entry.kind == NodeKind::Dir)
+				{
 					complete = false;
 				}
 				let source = match err.loop_ancestor() {
@@ -844,6 +852,49 @@ mod tests {
 
 		fs::remove_dir_all(&root).ok();
 		fs::remove_dir_all(&outside).ok();
+	}
+
+	/// A link synced as a copy of the file it pointed at, whose target is then deleted, is a
+	/// dangling link to a FILE: reported, but the scan stays complete, so the target's deletion (and
+	/// every other one) is not held for as long as the link exists.
+	#[cfg(unix)]
+	#[test]
+	fn a_dangling_file_symlink_the_baseline_tracks_keeps_the_scan_complete() {
+		use std::os::unix::fs::symlink;
+
+		let root = temp_root();
+		symlink(root.join("target.txt"), root.join("link.txt")).unwrap();
+		let file_row = |rel_path: &str| BaselineEntry {
+			rel_path: rel_path.to_string(),
+			kind: NodeKind::File,
+			remote_uuid: None,
+			content_hash: None,
+			size: Some(1),
+			local_mtime: Some(1),
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		};
+		let baseline = HashMap::from([
+			("link.txt".to_string(), file_row("link.txt")),
+			("target.txt".to_string(), file_row("target.txt")),
+		]);
+
+		let scan = scan_local(&root, &baseline, ScanDepth::Fast);
+		assert!(
+			scan.complete,
+			"a dead link to a synced file must not hold every deletion: {:?}",
+			scan.errors
+		);
+		assert_eq!(scan.reported_errors().count(), 1, "{:?}", scan.errors);
+		assert!(scan.nodes.is_empty(), "{:?}", scan.nodes.keys());
+
+		fs::remove_dir_all(&root).ok();
 	}
 
 	#[cfg(unix)]
