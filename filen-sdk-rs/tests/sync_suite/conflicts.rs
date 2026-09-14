@@ -142,7 +142,7 @@ fn find_file<'a>(files: &'a [RemoteFile], name: &str) -> Option<&'a RemoteFile> 
 /// Fail unless an `Order::Concurrent` round really staged a race the engine can still recognise.
 ///
 /// `Order::Concurrent` starts both passes at once; it does not make them upload at once. An apply
-/// holds the account-wide drive-write lock for its whole duration and the other client waits on a
+/// holds the account-wide drive-write lock for up to a minute at a time and the other client waits on a
 /// fibonacci back-off, so the two versions of one file can end up tens of seconds apart. Past
 /// `CONFIRM_TENURE` the loser's push is no longer a race by any evidence the engine has: the
 /// server's version chain dates it as an ordinary earlier edit, it confirms, and the winner is
