@@ -35,7 +35,8 @@ use notify::{RecursiveMode, Watcher};
 use tokio::sync::Notify;
 
 use super::{
-	SyncEvent, SyncObserver, SyncReport, baseline::PairId, engine::SyncEngine, scan::QUARANTINE_DIR,
+	SyncEvent, SyncObserver, SyncReport, apply::LOCK_FAILURE, baseline::PairId, engine::SyncEngine,
+	scan::QUARANTINE_DIR,
 };
 use crate::{
 	Error, ErrorKind,
@@ -486,8 +487,8 @@ fn backoff(failures: u32) -> Option<Duration> {
 /// Run one pass, logging (not propagating) any failure — the loop is best-effort and the next
 /// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s.
 ///
-/// Returns the pass's own error, if any (per-action errors inside a completed pass do not count),
-/// and whether it left work owed (see [`owes_a_pass`]).
+/// Returns the pass's own error, if any (per-action errors inside a completed pass do not count; a
+/// drive lock it could not take does), and whether it left work owed (see [`pass_outcome`]).
 async fn run_pass(
 	engine: &SyncEngine,
 	pair: PairId,
@@ -498,13 +499,30 @@ async fn run_pass(
 			if !report.errors.is_empty() {
 				tracing::warn!("sync pair {pair}: {} action error(s)", report.errors.len());
 			}
-			(None, owes_a_pass(&report))
+			pass_outcome(report)
 		}
 		Err(e) => {
 			tracing::warn!("sync pair {pair} failed: {e}");
 			(Some(e.to_string()), false)
 		}
 	}
+}
+
+/// What a pass that returned a report means for the loop: its own failure, if any, and whether it
+/// left work owed (see [`owes_a_pass`]).
+///
+/// A pass that could not take the drive lock returns a report but applied nothing, so it is a
+/// failed pass. Its backoff is the retry timer, which is why it owes no re-armed trigger on top.
+fn pass_outcome(report: SyncReport) -> (Option<String>, bool) {
+	if !report.lock_failed {
+		return (None, owes_a_pass(&report));
+	}
+	let error = report
+		.errors
+		.into_iter()
+		.find(|error| error.starts_with(LOCK_FAILURE))
+		.unwrap_or_else(|| LOCK_FAILURE.to_string());
+	(Some(error), false)
 }
 
 /// Whether a pause cut this pass short, leaving the loop owing a pass of its own.
@@ -563,7 +581,11 @@ mod tests {
 
 	use super::{
 		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, Stop, SyncReport, WatchConfig, backoff,
-		owes_a_pass, triggers_pass, wait_for_next_pass, wait_while_paused,
+		owes_a_pass, pass_outcome, triggers_pass, wait_for_next_pass, wait_while_paused,
+	};
+	use crate::{
+		Error, ErrorKind,
+		sync_engine::apply::{LOCK_FAILURE, note_lock_failure},
 	};
 
 	/// A safety-net interval as `run_loop` sets one up: the immediate first tick consumed, so the
@@ -844,6 +866,27 @@ mod tests {
 			interrupted: 1,
 			..SyncReport::default()
 		}));
+	}
+
+	/// A pass that could not take the drive lock still returns a report, but it applied nothing.
+	/// The loop must count it as a failed pass — so the health shows it and the next pass waits out
+	/// the backoff — instead of resetting its failure count as though the pass had run. The backoff
+	/// is the retry timer, so no re-armed trigger is owed on top of it.
+	#[test]
+	fn a_pass_that_could_not_take_the_drive_lock_counts_as_a_failure() {
+		let mut report = SyncReport::default();
+		let cause = Error::custom(ErrorKind::RetryFailed, "held by another device");
+		note_lock_failure(&mut report, 3, &cause, &mut |_| {});
+		let (error, owed) = pass_outcome(report);
+		assert_eq!(
+			error,
+			Some(format!("{LOCK_FAILURE}: {cause}")),
+			"a pass that could not take the drive lock must publish its cause"
+		);
+		assert!(
+			!owed,
+			"a failed pass is retried on the backoff, not re-armed at the debounce"
+		);
 	}
 
 	/// A stop that already fired ends every later wait, and can be awaited any number of times: the
