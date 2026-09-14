@@ -32,7 +32,8 @@ const SCHEMA_VERSION: i64 = 1;
 /// `pending_writes` is the journal of remote writes this engine has made that the cache has not
 /// announced yet (see [`PendingWrites`](super::engine::PendingWrites)), keyed by uuid like the
 /// in-memory journal it mirrors. `path_failures` counts how many times in a row applying one path
-/// has failed, and what the last failure said. Both cascade with their pair.
+/// has failed, what the last failure said, and when it happened (unix millis) — the time is what
+/// lets an exhausted streak expire and be retried. Both cascade with their pair.
 ///
 /// `sync_pairs.id` is `AUTOINCREMENT` for one reason: a removed pair's id must never come back. A
 /// watch loop finishes the pass it is in when its pair is removed, and that pass goes on writing
@@ -86,6 +87,7 @@ CREATE TABLE IF NOT EXISTS path_failures (
 	rel_path TEXT NOT NULL,
 	attempts INTEGER NOT NULL,
 	last_error TEXT NOT NULL,
+	last_failure_at INTEGER NOT NULL,
 	PRIMARY KEY (pair_id, rel_path)
 );
 ";
@@ -94,6 +96,17 @@ CREATE TABLE IF NOT EXISTS path_failures (
 const KIND_CREATED: i64 = 1;
 const KIND_MOVED: i64 = 2;
 const KIND_TRASHED: i64 = 3;
+
+/// One path's live failure streak, as `path_failures` holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PathFailure {
+	/// How many attempts in a row failed.
+	pub(crate) attempts: u32,
+	/// What the most recent one said.
+	pub(crate) last_error: String,
+	/// When the most recent one happened, in unix millis.
+	pub(crate) last_failure_at: i64,
+}
 
 /// Whether a baseline row describes a directory or a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,20 +661,23 @@ impl BaselineStore {
 		Ok(())
 	}
 
-	/// Count one failed attempt at `rel_path`, remembering what went wrong. Consecutive: a success
-	/// or a [`clear_failure`](Self::clear_failure) resets the count to nothing.
+	/// Count one failed attempt at `rel_path`, made at `at` (unix millis), remembering what went
+	/// wrong. Consecutive: a success or a [`clear_failure`](Self::clear_failure) resets the count to
+	/// nothing.
 	pub(crate) fn record_failure(
 		&self,
 		pair: PairId,
 		rel_path: &str,
 		error: &str,
+		at: i64,
 	) -> rusqlite::Result<()> {
 		self.conn.execute(
-			"INSERT INTO path_failures (pair_id, rel_path, attempts, last_error)
-			 VALUES (?1, ?2, 1, ?3)
+			"INSERT INTO path_failures (pair_id, rel_path, attempts, last_error, last_failure_at)
+			 VALUES (?1, ?2, 1, ?3, ?4)
 			 ON CONFLICT (pair_id, rel_path)
-			 DO UPDATE SET attempts = attempts + 1, last_error = excluded.last_error",
-			params![pair, rel_path, error],
+			 DO UPDATE SET attempts = attempts + 1, last_error = excluded.last_error,
+			 last_failure_at = excluded.last_failure_at",
+			params![pair, rel_path, error, at],
 		)?;
 		Ok(())
 	}
@@ -675,18 +691,25 @@ impl BaselineStore {
 		Ok(())
 	}
 
-	/// Every path under `pair` with a live failure streak: `rel_path -> (attempts, last error)`.
+	/// Every path under `pair` with a live failure streak, by `rel_path`.
 	pub(crate) fn failures(
 		&self,
 		pair: PairId,
-	) -> rusqlite::Result<std::collections::HashMap<String, (u32, String)>> {
+	) -> rusqlite::Result<std::collections::HashMap<String, PathFailure>> {
 		self.conn
-			.prepare("SELECT rel_path, attempts, last_error FROM path_failures WHERE pair_id = ?1")?
+			.prepare(
+				"SELECT rel_path, attempts, last_error, last_failure_at FROM path_failures
+				 WHERE pair_id = ?1",
+			)?
 			.query_map(params![pair], |row| {
 				let attempts: i64 = row.get("attempts")?;
 				Ok((
 					row.get::<_, String>("rel_path")?,
-					(attempts.max(0) as u32, row.get::<_, String>("last_error")?),
+					PathFailure {
+						attempts: attempts.max(0) as u32,
+						last_error: row.get("last_error")?,
+						last_failure_at: row.get("last_failure_at")?,
+					},
 				))
 			})?
 			.collect()
@@ -1007,23 +1030,30 @@ mod tests {
 			.unwrap();
 		assert!(store.failures(pair).unwrap().is_empty());
 
-		store.record_failure(pair, "a.txt", "boom").unwrap();
-		store.record_failure(pair, "a.txt", "boom again").unwrap();
-		store.record_failure(pair, "b.txt", "other").unwrap();
+		store.record_failure(pair, "a.txt", "boom", 1_000).unwrap();
+		store
+			.record_failure(pair, "a.txt", "boom again", 2_000)
+			.unwrap();
+		store.record_failure(pair, "b.txt", "other", 1_500).unwrap();
 		let failures = store.failures(pair).unwrap();
 		assert_eq!(
 			failures["a.txt"],
-			(2, "boom again".to_string()),
-			"the streak counts up and keeps the LAST error"
+			PathFailure {
+				attempts: 2,
+				last_error: "boom again".to_string(),
+				last_failure_at: 2_000,
+			},
+			"the streak counts up and keeps the LAST error and the LAST failure's time"
 		);
-		assert_eq!(failures["b.txt"].0, 1);
+		assert_eq!(failures["b.txt"].attempts, 1);
+		assert_eq!(failures["b.txt"].last_failure_at, 1_500);
 
 		// Clearing one path leaves the other alone, and a later failure starts from 1 again.
 		store.clear_failure(pair, "a.txt").unwrap();
 		assert!(!store.failures(pair).unwrap().contains_key("a.txt"));
-		store.record_failure(pair, "a.txt", "fresh").unwrap();
-		assert_eq!(store.failures(pair).unwrap()["a.txt"].0, 1);
-		assert_eq!(store.failures(pair).unwrap()["b.txt"].0, 1);
+		store.record_failure(pair, "a.txt", "fresh", 3_000).unwrap();
+		assert_eq!(store.failures(pair).unwrap()["a.txt"].attempts, 1);
+		assert_eq!(store.failures(pair).unwrap()["b.txt"].attempts, 1);
 
 		// Clearing a path with no streak is a no-op, not an error.
 		store.clear_failure(pair, "never-failed.txt").unwrap();
