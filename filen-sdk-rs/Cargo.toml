@@ -56,11 +56,6 @@ required-features = ["cache"]
 name = "cache_search_tests"
 required-features = ["cache"]
 
-# Live end-to-end tests for the sync engine.
-[[test]]
-name = "sync_engine_tests"
-required-features = ["sync-engine"]
-
 # Black-box e2e tests authored against the documented public API only (no internals).
 [[test]]
 name = "sync_engine_blackbox_tests"
