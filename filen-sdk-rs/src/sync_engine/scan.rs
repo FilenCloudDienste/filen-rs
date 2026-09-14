@@ -11,6 +11,11 @@
 //! the engine never writes one); `walkdir`'s loop detection guards against cycles. A symlink that
 //! cannot be followed (dangling, or part of a loop) is recorded as an error but does not make the
 //! scan incomplete, unless the baseline tracks that path (see [`LocalScan::complete`]).
+//!
+//! A symlinked DIRECTORY whose target lies inside the root is not walked: its target is walked under
+//! its real path, and walking the link as well would sync one subtree twice under two names. The
+//! real path is the one synced, whichever of the two the walk reaches first; the link is recorded in
+//! [`LocalScan::aliased_dirs`].
 
 use std::{
 	collections::{BTreeMap, HashMap},
@@ -116,9 +121,20 @@ pub(crate) struct LocalScan {
 	/// makes every apparent deletion untrustworthy. An unsyncable name is the opposite — a fully
 	/// observed item that simply cannot be pushed — so the guard must not be tripped by it.
 	pub(crate) invalid_names: BTreeMap<String, String>,
+	/// Symlinked directories whose target lies inside the root, mapped to the target's own path.
+	/// Neither the link nor anything under it is in `nodes`: the target is scanned under its real
+	/// path. The engine blocks every action at or under the link, so what an earlier pass synced
+	/// there is not read as deleted, and nothing is downloaded through the link.
+	pub(crate) aliased_dirs: BTreeMap<String, String>,
 }
 
 impl LocalScan {
+	/// The paths no action may be planned at or under: a name the remote would reject, and a
+	/// symlink to a directory the scan reads under its real path.
+	pub(crate) fn blocked_paths(&self) -> impl Iterator<Item = &String> {
+		self.invalid_names.keys().chain(self.aliased_dirs.keys())
+	}
+
 	/// One line per scan error a pass reports in [`SyncReport::errors`](super::SyncReport::errors):
 	/// every error but a [`DuplicateName`](ScanError::DuplicateName), which refuses the pass with
 	/// its own line instead.
@@ -147,6 +163,16 @@ fn unfollowable_symlink(err: &walkdir::Error) -> bool {
 		std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 			&& std::fs::metadata(path).is_err()
 	})
+}
+
+/// The root-relative path of the directory `entry` links to, if `entry` is a symlinked directory
+/// whose canonical target lies inside `canonical_root`.
+fn alias_target(entry: &walkdir::DirEntry, canonical_root: Option<&Path>) -> Option<String> {
+	if entry.depth() == 0 || !entry.path_is_symlink() || !entry.file_type().is_dir() {
+		return None;
+	}
+	let target = std::fs::canonicalize(entry.path()).ok()?;
+	normalize_rel_path(target.strip_prefix(canonical_root?).ok()?)
 }
 
 /// The reason the remote would reject `rel_path`'s own name, or `None` if it would accept it.
@@ -223,11 +249,34 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 	// collision key -> the rel_path that claimed it, to detect a second entry normalizing the same.
 	let mut claimed: HashMap<String, String> = HashMap::new();
 
+	let mut aliased_dirs = BTreeMap::new();
+	// Canonical, so a root reached through a symlink (macOS's `/var`) compares with the canonical
+	// targets. A root that does not resolve fails the walk below anyway.
+	let canonical_root = std::fs::canonicalize(root).ok();
+
 	let walker = walkdir::WalkDir::new(root)
 		.follow_links(true)
 		.into_iter()
-		// Never descend into our own quarantine dir (it holds locally-deleted items).
-		.filter_entry(|e| e.depth() != 1 || e.file_name() != OsStr::new(QUARANTINE_DIR));
+		.filter_entry(|e| {
+			// Never descend into our own quarantine dir (it holds locally-deleted items).
+			if e.depth() == 1 && e.file_name() == OsStr::new(QUARANTINE_DIR) {
+				return false;
+			}
+			let Some(target) = alias_target(e, canonical_root.as_deref()) else {
+				return true;
+			};
+			// Only targets INSIDE the root have a real path that wins. Two links to one directory
+			// outside the root are both still walked, and upload it twice.
+			if let Some(link) = e
+				.path()
+				.strip_prefix(root)
+				.ok()
+				.and_then(normalize_rel_path)
+			{
+				aliased_dirs.insert(link, target);
+			}
+			false
+		});
 
 	for entry in walker {
 		let entry = match entry {
@@ -374,6 +423,7 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 		complete,
 		errors,
 		invalid_names,
+		aliased_dirs,
 	}
 }
 
@@ -661,6 +711,7 @@ mod tests {
 				},
 			],
 			invalid_names: BTreeMap::new(),
+			aliased_dirs: BTreeMap::new(),
 		};
 		let reported: Vec<String> = scan.reported_errors().collect();
 		assert_eq!(
@@ -711,6 +762,59 @@ mod tests {
 		assert_eq!(scan.reported_errors().count(), 3);
 
 		fs::remove_dir_all(&root).ok();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_symlink_to_a_directory_inside_the_root_is_scanned_once_under_its_real_path() {
+		use std::os::unix::fs::symlink;
+
+		let root = temp_root();
+		let outside = temp_root();
+		fs::write(outside.join("far.txt"), b"far").unwrap();
+		fs::create_dir_all(root.join("real").join("sub")).unwrap();
+		fs::write(root.join("real").join("a.txt"), b"a").unwrap();
+		fs::write(root.join("real").join("sub").join("b.txt"), b"b").unwrap();
+		// Links named to sort before and after their target, so walk order cannot decide the winner.
+		symlink(root.join("real"), root.join("alias")).unwrap();
+		symlink(root.join("real"), root.join("zlias")).unwrap();
+		// Nested inside its own target's parent, and spelled relative.
+		symlink("sub", root.join("real").join("inner")).unwrap();
+		// A link to a file inside the root stays a copy; a link leading outside is walked.
+		symlink(root.join("real").join("a.txt"), root.join("copy.txt")).unwrap();
+		symlink(&outside, root.join("away")).unwrap();
+
+		let scan = scan_local(&root, &HashMap::new());
+		assert!(scan.complete, "{:?}", scan.errors);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		paths.sort();
+		assert_eq!(
+			paths,
+			vec![
+				"away",
+				"away/far.txt",
+				"copy.txt",
+				"real",
+				"real/a.txt",
+				"real/sub",
+				"real/sub/b.txt",
+			]
+		);
+		assert_eq!(
+			scan.aliased_dirs,
+			BTreeMap::from([
+				("alias".to_string(), "real".to_string()),
+				("real/inner".to_string(), "real/sub".to_string()),
+				("zlias".to_string(), "real".to_string()),
+			])
+		);
+		let mut blocked: Vec<&String> = scan.blocked_paths().collect();
+		blocked.sort();
+		assert_eq!(blocked, vec!["alias", "real/inner", "zlias"]);
+
+		fs::remove_dir_all(&root).ok();
+		fs::remove_dir_all(&outside).ok();
 	}
 
 	#[cfg(unix)]

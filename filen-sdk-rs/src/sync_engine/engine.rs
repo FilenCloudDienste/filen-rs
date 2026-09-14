@@ -1220,19 +1220,30 @@ impl Prepared {
 					}),
 			)
 			.chain(self.never_synced_remote.iter().cloned())
+			.chain(
+				self.local_scan
+					.aliased_dirs
+					.iter()
+					.map(|(rel_path, target)| UnsyncablePath {
+						rel_path: rel_path.clone(),
+						reason: UnsyncableReason::LocalAlias {
+							target: target.clone(),
+						},
+					}),
+			)
 			.collect();
 		// One stable order, so a caller diffing consecutive reports sees only real changes.
 		all.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 		all
 	}
 
-	/// Every path this pass must not plan an action for: a name the remote would reject, a path
-	/// whose failure streak ran out, and a synced path whose remote item is out of the view. All are
-	/// reported by [`unsyncable`](Self::unsyncable).
+	/// Every path this pass must not plan an action for: a name the remote would reject, a local
+	/// symlink to a directory inside the root, a path whose failure streak ran out, and a synced path
+	/// whose remote item is out of the view. All are reported by [`unsyncable`](Self::unsyncable).
 	fn blocked_paths(&self) -> BTreeSet<String> {
 		self.failures
 			.keys()
-			.chain(self.local_scan.invalid_names.keys())
+			.chain(self.local_scan.blocked_paths())
 			.chain(self.unknown_remote.keys())
 			.cloned()
 			.collect()
@@ -3405,7 +3416,7 @@ mod tests {
 			remote,
 			&plan::PassHolds::default(),
 		);
-		drop_blocked(plan.actions, &scan.invalid_names.keys().cloned().collect())
+		drop_blocked(plan.actions, &scan.blocked_paths().cloned().collect())
 	}
 
 	fn synced_file(rel: &str, uuid: Uuid, hash: Blake3Hash, size: u64) -> BaselineEntry {
@@ -3428,6 +3439,63 @@ mod tests {
 			size,
 			modified_millis: 0,
 		}
+	}
+
+	/// A link to a directory inside the root that an earlier pass synced as a directory of its own:
+	/// its copy is not trashed, and nothing the remote holds under the link's name is downloaded
+	/// through the link into the real directory.
+	#[cfg(unix)]
+	#[test]
+	fn a_symlink_to_a_directory_inside_the_root_plans_nothing_under_the_link() {
+		let root = scan_root("alias");
+		std::fs::create_dir(root.join("real")).unwrap();
+		std::fs::write(root.join("real").join("a.txt"), b"payload").unwrap();
+		std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+		let hash: Blake3Hash = blake3::hash(b"payload").into();
+		let other: Blake3Hash = blake3::hash(b"remote only").into();
+
+		let mut baseline = HashMap::new();
+		let mut remote = HashMap::new();
+		for dir in ["real", "link"] {
+			let uuid = Uuid::new_v4();
+			baseline.insert(
+				dir.to_string(),
+				BaselineEntry {
+					kind: NodeKind::Dir,
+					remote_uuid: Some(uuid),
+					..synced_shell(dir)
+				},
+			);
+			remote.insert(
+				dir.to_string(),
+				RemoteNode {
+					rel_path: dir.to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: uuid,
+					stable_uuid: None,
+					content_hash: None,
+					size: 0,
+					modified_millis: 0,
+				},
+			);
+			let file = format!("{dir}/a.txt");
+			let uuid = Uuid::new_v4();
+			baseline.insert(file.clone(), synced_file(&file, uuid, hash, 7));
+			remote.insert(file.clone(), remote_file(&file, uuid, hash, 7));
+		}
+		// Something the remote gained under the link's name since.
+		remote.insert(
+			"link/new.txt".to_string(),
+			remote_file("link/new.txt", Uuid::new_v4(), other, 11),
+		);
+
+		let actions = planned_over_scan(&root, &baseline, &remote);
+		assert!(
+			actions.is_empty(),
+			"no deletion of the link's synced copy, no download through the link: {actions:?}"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
 	}
 
 	/// Renaming an already-SYNCED file to a name the remote would reject must not read as a local

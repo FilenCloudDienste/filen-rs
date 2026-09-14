@@ -165,11 +165,22 @@ pub enum UnsyncableReason {
 	/// listing, or the chain loops. Handled like [`RemoteUndecodable`](Self::RemoteUndecodable); for
 	/// an item that was never synced, `rel_path` is its bare name, since it has no path.
 	RemoteBrokenParent,
+	/// A local symlink to a directory inside the sync root. The directory is synced under its real
+	/// path, `target`; the link is left alone on both sides, so neither a copy synced at the link's
+	/// path before nor anything the remote holds there is deleted, and nothing is written through
+	/// the link.
+	LocalAlias { target: String },
 }
 
 impl fmt::Display for UnsyncableReason {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
+			Self::LocalAlias { target } => {
+				write!(
+					f,
+					"a symlink to {target:?}, which is synced under that path"
+				)
+			}
 			Self::InvalidName { detail } => {
 				write!(f, "the remote would reject this name: {detail}")
 			}
