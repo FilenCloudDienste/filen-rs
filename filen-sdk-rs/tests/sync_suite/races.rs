@@ -19,7 +19,9 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, SyncObserver, SyncReport};
+use filen_sdk_rs::sync_engine::{
+	SyncEngine, SyncEvent, SyncMode, SyncObserver, SyncReport, UnsyncablePath, UnsyncableReason,
+};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -755,7 +757,9 @@ async fn race_23_mass_delete_guard_holds_bulk_vanish() {
 
 /// RACE-19 — a symlink and a symlink loop must not hang/recurse the scan. A file symlink uploads as
 /// a copy of its target; the loop is reported in the pass's errors on every pass, is not uploaded,
-/// and does not make the scan incomplete (so a local deletion still propagates).
+/// and does not make the scan incomplete (so a local deletion still propagates). A symlink to a
+/// sibling directory is not uploaded a second time: the directory syncs once, under its real path,
+/// and the link is reported as unsyncable.
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn race_19_symlink_and_loop_do_not_hang_scan() {
@@ -764,8 +768,11 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 	let sc = single_client(SyncMode::LocalToRemote).await;
 	write_file(&sc.local, "target.txt", b"A-target");
 	write_file(&sc.local, "doomed.txt", b"A-doomed");
-	// A symlink to a regular file, and a self-referential directory loop.
+	write_file(&sc.local, "real/in.txt", b"A-in");
+	// A symlink to a regular file, a symlink to a sibling directory, and a self-referential
+	// directory loop.
 	symlink(sc.local.join("target.txt"), sc.local.join("link.txt")).unwrap();
+	symlink(sc.local.join("real"), sc.local.join("alias")).unwrap();
 	std::fs::create_dir_all(sc.local.join("cycle")).unwrap();
 	symlink(sc.local.join("cycle"), sc.local.join("cycle/self")).unwrap();
 
@@ -786,7 +793,18 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 		"the loop is the pass's only error: {r1:?}"
 	);
 	assert_eq!(loop_errors(&r1).len(), 1, "the loop is reported: {r1:?}");
-	assert_eq!(r1.uploaded, 3, "{r1:?}");
+	// target.txt, doomed.txt, link.txt and real/in.txt, and nothing through `alias`.
+	assert_eq!(r1.uploaded, 4, "{r1:?}");
+	assert_eq!(
+		r1.unsyncable,
+		vec![UnsyncablePath {
+			rel_path: "alias".to_string(),
+			reason: UnsyncableReason::LocalAlias {
+				target: "real".to_string(),
+			},
+		}],
+		"{r1:?}"
+	);
 
 	// Deleting a synced file still propagates: the loop does not hold deletions.
 	std::fs::remove_file(sc.local.join("doomed.txt")).unwrap();
@@ -810,12 +828,26 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 		let f = find_file(&files, name).unwrap();
 		assert_eq!(f.size, b"A-target".len() as u64, "{name} content wrong");
 	}
-	let dir_names: Vec<&str> = dirs.iter().filter_map(|d| d.name()).collect();
-	assert_eq!(dir_names, vec!["cycle"], "{r2:?}");
+	let mut dir_names: Vec<&str> = dirs.iter().filter_map(|d| d.name()).collect();
+	dir_names.sort_unstable();
+	assert_eq!(
+		dir_names,
+		vec!["cycle", "real"],
+		"the sibling directory is uploaded once, under its real name: {r2:?}"
+	);
 	let (cycle_dirs, cycle_files) = list_dir(&sc, find_dir(&dirs, "cycle").unwrap()).await;
 	assert!(
 		cycle_dirs.is_empty() && cycle_files.is_empty(),
 		"nothing is uploaded through the loop: {cycle_dirs:?} {cycle_files:?}"
+	);
+	let (real_dirs, real_files) = list_dir(&sc, find_dir(&dirs, "real").unwrap()).await;
+	assert!(real_dirs.is_empty(), "{real_dirs:?}");
+	let real_names: Vec<&str> = real_files.iter().filter_map(|f| f.name()).collect();
+	assert_eq!(real_names, vec!["in.txt"]);
+	assert_eq!(
+		real_files[0].size,
+		b"A-in".len() as u64,
+		"real/in.txt content wrong"
 	);
 	sc.cleanup();
 }
