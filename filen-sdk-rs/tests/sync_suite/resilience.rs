@@ -912,3 +912,61 @@ async fn resil_add_unwritable_baseline_fails_safe() {
 	// no data loss, no-op clean. Needs control over the baseline-store path's writability (a black-box
 	// test cannot reach the store).
 }
+
+/// RESIL-LOCK — a pass lets the account's drive-write lock go between batches. With a hold spent
+/// after one remote write, another client of the account (its own lock cache, so a real server-side
+/// acquisition) takes the lock while the pass still has uploads left, and the pass then takes it back
+/// and finishes every upload. Needs `-F malformed` for the lock-budget seam.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn resil_lock_released_between_batches() {
+	const FILES: usize = 4;
+	let mut sc = single_client(SyncMode::LocalToRemote).await;
+	sc.engine.set_lock_budget(
+		std::time::Duration::from_secs(60),
+		1,
+		std::time::Duration::from_secs(10),
+	);
+	for i in 0..FILES {
+		let rel = format!("batch_{i}.txt");
+		write_file(&sc.local, &rel, &content_for(&rel));
+	}
+
+	let uploads = std::sync::atomic::AtomicUsize::new(0);
+	let first_upload = tokio::sync::Notify::new();
+	let mut observer = |event: filen_sdk_rs::sync_engine::SyncEvent| {
+		if matches!(
+			event,
+			filen_sdk_rs::sync_engine::SyncEvent::Uploading { .. }
+		) {
+			uploads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			first_upload.notify_one();
+		}
+	};
+	let pass = sc.engine.sync_once_observed(sc.pair, &mut observer);
+	let other_device = async {
+		first_upload.notified().await;
+		let lock = sc
+			.resources
+			.client
+			.acquire_lock("drive-write", std::time::Duration::from_secs(1), 40)
+			.await
+			.expect("another client of the account never got the drive lock");
+		let seen = uploads.load(std::sync::atomic::Ordering::SeqCst);
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+		drop(lock);
+		seen
+	};
+	let (report, seen) = tokio::join!(pass, other_device);
+	let report = report.expect("sync_once");
+
+	assert!(
+		seen < FILES,
+		"the other client got the lock only after all {FILES} uploads: the pass never let it go \
+		 between batches: {report:?}"
+	);
+	assert_eq!(report.uploaded, FILES, "{report:?}");
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(report.interrupted, 0, "{report:?}");
+	sc.cleanup();
+}
