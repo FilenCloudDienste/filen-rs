@@ -20,7 +20,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use filen_types::fs::StableUuid;
+use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use futures::{StreamExt, stream::FuturesUnordered};
 use uuid::Uuid;
 
@@ -1265,7 +1265,15 @@ async fn apply_transfer(
 					.map_err(db_err)?,
 				None => None,
 			};
-			let stashed = stash_local_target(ctx.local_root, rel_path, base.as_ref())?;
+			// The scan's hash describes the pass-start row only; a row read back from the store
+			// describes a file this pass moved here since.
+			let scanned_hash = ctx
+				.baseline
+				.get(rel_path)
+				.and(ctx.local.get(rel_path))
+				.and_then(|node| node.content_hash);
+			let stashed =
+				stash_local_target(ctx.local_root, rel_path, base.as_ref(), scanned_hash)?;
 			let Some(downloaded) = ctx
 				.gate
 				.guard(ctx.client.download_file_to_path(&remote_file, &path, None))
@@ -1690,14 +1698,24 @@ async fn apply_one(
 /// move whose destination is occupied — goes through here, so a local edit is never destroyed
 /// silently; it lands in the quarantine bin the same way a propagated deletion does.
 ///
+/// `scanned_hash` is the content hash this pass's scan read at the target, passed only when `base`
+/// is the pass-start row that scan was measured against. A scan that hashed something other than
+/// the row records is an edit the `(size, mtime)` test below cannot see — a same-size edit that kept
+/// its mtime, which only a [deep](super::scan::ScanDepth::Deep) scan hashes — so it is stashed too.
+///
 /// Returns where it was stashed (nothing stashed: `None`), for a caller whose write may still not
 /// happen — see [`restore_stashed`].
 fn stash_local_target(
 	local_root: &Path,
 	rel_path: &str,
 	base: Option<&BaselineEntry>,
+	scanned_hash: Option<Blake3Hash>,
 ) -> Result<Option<PathBuf>, crate::Error> {
-	if local_holds_unsynced_content(&local_path(local_root, rel_path), base) {
+	let scan_saw_an_edit = matches!(
+		(base.and_then(|b| b.content_hash), scanned_hash),
+		(Some(recorded), Some(scanned)) if recorded != scanned
+	);
+	if scan_saw_an_edit || local_holds_unsynced_content(&local_path(local_root, rel_path), base) {
 		return quarantine_local(local_root, rel_path);
 	}
 	Ok(None)
@@ -2177,8 +2195,9 @@ fn stash_move_target(
 	base: Option<&BaselineEntry>,
 ) -> Result<(), crate::Error> {
 	if has_own_directory_entry(&local_path(local_root, to_path)) {
-		// The rename that follows always lands, so nothing here is ever put back.
-		let _stashed = stash_local_target(local_root, to_path, base)?;
+		// The rename that follows always lands, so nothing here is ever put back. No scanned hash:
+		// the scan saw this destination free, so whatever is here now arrived after it.
+		let _stashed = stash_local_target(local_root, to_path, base, None)?;
 	}
 	Ok(())
 }
@@ -2921,7 +2940,7 @@ mod tests {
 		let root = temp_dir();
 		std::fs::write(root.join("dest.txt"), b"never synced").unwrap();
 
-		let _stashed = stash_local_target(&root, "dest.txt", None).unwrap();
+		let _stashed = stash_local_target(&root, "dest.txt", None, None).unwrap();
 
 		assert!(
 			!root.join("dest.txt").exists(),
@@ -2982,13 +3001,41 @@ mod tests {
 		let root = temp_dir();
 		let (path, base) = synced_file(&root, b"abc");
 
-		let stashed = stash_local_target(&root, "a.txt", Some(&base)).unwrap();
+		let stashed = stash_local_target(&root, "a.txt", Some(&base), None).unwrap();
 		assert_eq!(stashed, None, "nothing was stashed, so nothing to put back");
 
 		assert!(path.exists(), "an unmodified copy is left where it is");
 		assert!(
 			!root.join(QUARANTINE_DIR).exists(),
 			"nothing is quarantined"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// A same-size edit that kept its mtime passes the `(size, mtime)` test, so only the hash a deep
+	/// scan read can tell it from the synced copy. A pull over it must stash it first; a scan hash
+	/// matching the row stashes nothing.
+	#[test]
+	fn a_pull_over_an_edit_only_the_scan_hash_saw_quarantines_first() {
+		let root = temp_dir();
+		let (path, base) = synced_file(&root, b"abc");
+		assert!(!local_holds_unsynced_content(&path, Some(&base)));
+
+		let matching = stash_local_target(&root, "a.txt", Some(&base), base.content_hash).unwrap();
+		assert_eq!(
+			matching, None,
+			"a scan that read the recorded hash vouches for the copy"
+		);
+
+		let stashed =
+			stash_local_target(&root, "a.txt", Some(&base), Some(Blake3Hash::from([9; 32])))
+				.unwrap()
+				.expect("an edit the scan hashed must be stashed");
+		assert_eq!(std::fs::read(&stashed).unwrap(), b"abc");
+		assert!(
+			!path.exists(),
+			"the edit is moved out of the download's way"
 		);
 
 		std::fs::remove_dir_all(&root).ok();
@@ -3055,7 +3102,7 @@ mod tests {
 		let root = temp_dir();
 		std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
 
-		let stashed = stash_local_target(&root, "a.txt", None).unwrap();
+		let stashed = stash_local_target(&root, "a.txt", None, None).unwrap();
 		assert!(
 			stashed.is_some(),
 			"a copy the baseline cannot vouch for must be stashed before the download"
@@ -3082,7 +3129,7 @@ mod tests {
 	fn a_restore_never_overwrites_what_took_the_path() {
 		let root = temp_dir();
 		std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
-		let stashed = stash_local_target(&root, "a.txt", None).unwrap();
+		let stashed = stash_local_target(&root, "a.txt", None, None).unwrap();
 		std::fs::write(root.join("a.txt"), b"written since").unwrap();
 
 		restore_stashed(stashed, &root.join("a.txt"));
