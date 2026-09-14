@@ -1974,15 +1974,93 @@ async fn remote_file_size(sc: &SingleClient, name: &str) -> Option<u64> {
 // BLOCKED tests — require infrastructure the current harness does not expose.
 // ===========================================================================
 
-#[ignore = "blocked: needs a case-insensitive-FS guarantee + a mismatched-name-hash seam to make two \
-distinct remote items collide on one local path (the blackbox suite's `remote_case_collision_refused` \
-uses the `malformed` feature's create_*_with_name_hash, which the harness does not surface). TODO: \
-expose a colliding-remote-setup helper / run under -F malformed."]
+/// CONFLICT-10 — on an established two-way pair, two remote directories differing only in case
+/// (`Readme`/`README`) appear. The pass refuses as a remote collision: neither is merged into the
+/// other, a local edit staged meanwhile is held rather than pushed or lost, both remote copies stay
+/// intact, and a re-run refuses the same way. Once one of the two is trashed the pair converges on
+/// its own. Needs `-F malformed` for the name-hash seam.
+///
+/// The case-colliding shape staged is two DIRECTORIES: the name-hash seam exists only for directory
+/// creation, so two sibling FILES differing only in case (`Readme.txt`/`README.TXT`) are not
+/// covered here.
+#[cfg(feature = "malformed")]
 #[shared_test_runtime]
 async fn conflict_10_case_only_collision() {
-	// plan: create Readme.txt("lower") and README.TXT("UPPER") on remote (distinct items); sync to a
-	// case-insensitive local FS; assert neither silently merged, collision held/reported, both bytes
-	// retrievable, re-run stable.
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, "keep.txt", b"v1");
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 1, "{r1:?}");
+
+	let (upper, mut lower) = stage_case_colliding_dirs(&sc, "Readme", "README").await;
+	write_file(&sc.local, "keep.txt", b"v2 edited while refused");
+
+	for round in 0..2 {
+		let report = sc.sync().await;
+		assert_eq!(
+			report.refused,
+			Some(filen_sdk_rs::sync_engine::RefuseReason::RemoteCollision),
+			"round {round}: the collision must refuse the pass: {report:?}"
+		);
+		assert_eq!(
+			(
+				report.uploaded,
+				report.downloaded,
+				report.remotely_trashed,
+				report.locally_deleted
+			),
+			(0, 0, 0, 0),
+			"round {round}: a refused pass does nothing: {report:?}"
+		);
+		assert!(
+			read_eq(&sc.local, "keep.txt", b"v2 edited while refused"),
+			"round {round}: the held local edit was lost"
+		);
+		assert!(
+			!sc.local.join("Readme").exists(),
+			"round {round}: a colliding dir was materialized locally"
+		);
+	}
+	for dir in [&upper, &lower] {
+		let name = dir.name().unwrap();
+		let (_d, files) = sc
+			.cache
+			.client
+			.list_dir(
+				&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
+				None::<&fn(u64, Option<u64>)>,
+			)
+			.await
+			.unwrap();
+		let notes = find_file(&files, "notes.txt")
+			.unwrap_or_else(|| panic!("{name}/notes.txt lost on the remote"));
+		assert_eq!(notes.size, name.len() as u64, "{name}/notes.txt changed");
+	}
+
+	// Resolving the collision by hand releases the pair.
+	let lower_uuid = lower.uuid();
+	sc.cache.client.trash_dir(&mut lower).await.unwrap();
+	assert!(
+		poll_for_item_absent(sc.cache.db_path(), lower_uuid, CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never dropped the trashed README"
+	);
+	let resolved = sc.sync().await;
+	assert!(resolved.errors.is_empty(), "{resolved:?}");
+	assert_eq!(resolved.refused, None, "{resolved:?}");
+	assert_eq!(resolved.uploaded, 1, "the held edit goes up: {resolved:?}");
+	assert_eq!(
+		resolved.downloaded, 1,
+		"the surviving copy comes down: {resolved:?}"
+	);
+	assert!(
+		read_eq(&sc.local, "Readme/notes.txt", b"Readme"),
+		"the surviving Readme/notes.txt did not arrive intact"
+	);
+	assert_eq!(
+		remote_file_size(&sc, "keep.txt").await,
+		Some(b"v2 edited while refused".len() as u64),
+		"the held edit did not reach the remote"
+	);
+	sc.cleanup();
 }
 
 #[ignore = "blocked: needs a name-normalizing local FS guarantee (NFC<->NFD equivalence on \
