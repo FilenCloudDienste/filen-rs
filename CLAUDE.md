@@ -108,7 +108,8 @@ Test notes:
 | `wasm-full` | Browser WASM build (with threads) |
 | `service-worker` | WASM service-worker build |
 | `multi-threaded-crypto` | `rayon` / `wasm-bindgen-rayon` parallel crypto |
-| `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata) — never enable in production |
+| `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata, `create_dir_with_name_hash` bypasses the case-insensitive name dedup) — never enable in production |
+| `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates the `sync_engine_blackbox_tests` / `sync_engine_stress_tests` / `sync_suite` test targets |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark only |
 
@@ -127,8 +128,9 @@ committing never triggers a vendored C++ build and needs no `meson` / `ninja` / 
 wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 
 - **pre-commit** — `cargo fmt --all --check`, `cargo fmt` inside `filen-sdk-rs`, `taplo
-  lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then four clippy passes: workspace
-  (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`, and
+  lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then five clippy passes: workspace
+  (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`,
+  `-p filen-sdk-rs -F sync-engine,malformed --all-targets` (the same command as ci-linux), and
   wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
   `filen-sdk-rs` directory). **On a cold cargo cache this takes several minutes** — warm the
   cache by running those clippy invocations first, or the commit may be killed by a tool/CI
@@ -173,6 +175,12 @@ pull request into `main` or `dev` (from a fork too), runs `branch-lint.yml`, the
 a branch that skipped the hooks would miss: the diff policy and commit-message checks
 against the pull request's target branch (`origin/main` for a push), unfolded fix-ups,
 `cargo fmt`, `taplo`, and the `-p filen-sdk-rs -F uniffi,http-provider` clippy pass.
+
+The sync engine's live tests run only nightly (or on a `[test]` commit/PR), in `test.yml`'s
+`test-sync-engine` job: after the matrix and 2FA legs, Linux, V2 account, one
+`!cancelled()` step per binary — `cache_tests`, `cache_search_tests`,
+`sync_engine_blackbox_tests` and `sync_suite`, all `-p filen-sdk-rs -F sync-engine,malformed`,
+the engine binaries with `--test-threads=1`.
 
 The auto-formatter some editors/agents run on save does **not** match this repo's nightly
 `cargo fmt` output and will fail the pre-commit gate. Run `cargo fmt -p <crate>` before
@@ -258,6 +266,7 @@ Filen Backend (HTTPS/JSON)
 - **`socket/`** — WebSocket event listener (native via `tokio-tungstenite`, WASM via `web-sys`)
 - **`io/`** — local filesystem tree operations for sync
 - **`sync/`** — drive locking (`ResourceLock`) and sync state
+- **`sync_engine/`** (`sync-engine`, native only) — keeps a local folder in sync with a remote folder: cache snapshot + local `scan` + persisted SQLite `baseline` → `plan` → `guard` (mass-delete screen) → `apply`, plus `watch` (the continuous `notify` loop), `pause` and the `outcome`/`events` reporting types
 
 ### `filen-types` Internal Structure
 
