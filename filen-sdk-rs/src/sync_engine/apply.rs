@@ -14,7 +14,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::{
-		Arc,
+		Arc, PoisonError,
 		atomic::{AtomicBool, Ordering},
 	},
 };
@@ -47,8 +47,12 @@ use crate::{
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock},
+	util::{MaybeArc, MaybeSendCallback},
 };
-use tokio::{sync::Mutex, time::Instant};
+use tokio::{
+	sync::{Mutex, mpsc::UnboundedSender},
+	time::Instant,
+};
 
 /// Outcome of one apply pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -421,6 +425,10 @@ pub(super) async fn apply(
 
 	if !pending.is_empty() {
 		let concurrency = ctx.client.unauthed().state().max_concurrency().max(1);
+		// Byte progress comes from inside the SDK's transfer futures, which cannot reach the
+		// observer this loop holds: they queue it here and the loop delivers it — between
+		// completions, and all of a transfer's progress ahead of that transfer's own event.
+		let (progress, mut progress_events) = tokio::sync::mpsc::unbounded_channel();
 		let mut pending = pending.into_iter().peekable();
 		let mut in_flight = FuturesUnordered::new();
 		// Uploads in flight use the lock, so it is let go only once none is; downloads do not.
@@ -448,9 +456,17 @@ pub(super) async fn apply(
 				lease.note_start(action);
 				pending.next();
 				remote_in_flight += usize::from(mutates_remote(action));
-				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path));
+				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path, &progress));
 			}
-			let Some((action, result)) = in_flight.next().await else {
+			let next = tokio::select! {
+				biased;
+				Some(event) = progress_events.recv() => {
+					observer(event);
+					continue;
+				}
+				next = in_flight.next() => next,
+			};
+			let Some((action, result)) = next else {
 				// Nothing in flight: the transfers are done, or the next one waits on the lock.
 				let Some((action, releasable)) = pending.next() else {
 					break;
@@ -463,10 +479,14 @@ pub(super) async fn apply(
 					None => return note_interrupted(report, total - applied, observer),
 				}
 				remote_in_flight += usize::from(mutates_remote(action));
-				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path));
+				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path, &progress));
 				continue;
 			};
 			remote_in_flight -= usize::from(mutates_remote(action));
+			// A transfer queues its last progress before it resolves.
+			while let Ok(event) = progress_events.try_recv() {
+				observer(event);
+			}
 			match result {
 				// A cancel skips a transfer that has not started and DROPS one that is mid-flight;
 				// either way it recorded nothing, and the pass owes it to the next one.
@@ -546,10 +566,11 @@ async fn run_transfer<'a>(
 	action: &'a SyncAction,
 	files: &RemoteFiles<'_>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
+	progress: &UnboundedSender<SyncEvent>,
 ) -> (&'a SyncAction, Result<Transfer, crate::Error>) {
 	(
 		action,
-		apply_transfer(ctx, action, files, dir_by_path).await,
+		apply_transfer(ctx, action, files, dir_by_path, progress).await,
 	)
 }
 
@@ -1229,6 +1250,7 @@ async fn apply_transfer(
 	action: &SyncAction,
 	files: &RemoteFiles<'_>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
+	progress: &UnboundedSender<SyncEvent>,
 ) -> Result<Transfer, crate::Error> {
 	if !ctx.gate.wait_to_start().await {
 		return Ok(Transfer::Interrupted);
@@ -1276,7 +1298,15 @@ async fn apply_transfer(
 				stash_local_target(ctx.local_root, rel_path, base.as_ref(), scanned_hash)?;
 			let Some(downloaded) = ctx
 				.gate
-				.guard(ctx.client.download_file_to_path(&remote_file, &path, None))
+				.guard(ctx.client.download_file_to_path(
+					&remote_file,
+					&path,
+					Some(progress_callback(
+						progress,
+						rel_path,
+						ctx.remote.get(rel_path).map_or(0, |node| node.size),
+					)),
+				))
 				.await
 			else {
 				// Dropped before it could put anything at the path — so the copy moved out of its
@@ -1317,7 +1347,15 @@ async fn apply_transfer(
 			let path = local_path(ctx.local_root, rel_path);
 			let Some(upload) = ctx
 				.gate
-				.guard(ctx.client.upload_file_from_path(&parent_type, path, None))
+				.guard(ctx.client.upload_file_from_path(
+					&parent_type,
+					path,
+					Some(progress_callback(
+						progress,
+						rel_path,
+						ctx.local.get(rel_path).map_or(0, |node| node.size),
+					)),
+				))
 				.await
 			else {
 				return Ok(Transfer::Interrupted);
@@ -1386,6 +1424,29 @@ async fn apply_transfer(
 	Ok(Transfer::Done)
 }
 
+/// The SDK progress callback for the transfer of `rel_path`. The SDK hands it byte deltas, already
+/// throttled to one call per 200 ms plus a final flush; it adds them up and queues a
+/// [`SyncEvent::Progress`] for the apply loop to deliver. The running total is updated and sent
+/// under one lock, so the queued `bytes` never go down even if two chunk futures report at once.
+fn progress_callback<'a>(
+	progress: &'a UnboundedSender<SyncEvent>,
+	rel_path: &'a str,
+	total: u64,
+) -> MaybeSendCallback<'a, u64> {
+	let bytes = std::sync::Mutex::new(0u64);
+	MaybeArc::new(move |delta| {
+		let mut bytes = bytes.lock().unwrap_or_else(PoisonError::into_inner);
+		*bytes += delta;
+		// The receiver lives until every transfer of the pass has resolved, so a send cannot fail
+		// while one is still reporting.
+		let _ = progress.send(SyncEvent::Progress {
+			rel_path: rel_path.to_string(),
+			bytes: *bytes,
+			total,
+		});
+	})
+}
+
 async fn apply_one(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
@@ -1405,7 +1466,16 @@ async fn apply_one(
 		// Transfers normally run via the concurrent path in `apply`; these arms keep `apply_one`
 		// total and correct if a transfer is ever applied serially.
 		SyncAction::DownloadFile { .. } => {
-			if apply_transfer(ctx, action, files, dir_by_path).await? == Transfer::Done {
+			// No observer reaches this fallback, so its progress goes to a channel nobody reads.
+			if apply_transfer(
+				ctx,
+				action,
+				files,
+				dir_by_path,
+				&tokio::sync::mpsc::unbounded_channel().0,
+			)
+			.await? == Transfer::Done
+			{
 				report.downloaded += 1;
 			}
 		}
@@ -1448,7 +1518,15 @@ async fn apply_one(
 			report.remote_dirs_created += 1;
 		}
 		SyncAction::UploadFile { .. } => {
-			match apply_transfer(ctx, action, files, dir_by_path).await? {
+			match apply_transfer(
+				ctx,
+				action,
+				files,
+				dir_by_path,
+				&tokio::sync::mpsc::unbounded_channel().0,
+			)
+			.await?
+			{
 				Transfer::Done => report.uploaded += 1,
 				Transfer::Overwrote(conflict) => {
 					report.uploaded += 1;
@@ -2425,6 +2503,25 @@ mod tests {
 
 	fn io_kind(kind: std::io::ErrorKind) -> std::io::Error {
 		std::io::Error::from(kind)
+	}
+
+	/// The SDK reports byte deltas; the engine turns them into a running total for the path, with
+	/// the planned size alongside.
+	#[test]
+	fn progress_callback_reports_a_running_total() {
+		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+		let callback = progress_callback(&sender, "dir/f.bin", 12);
+		callback(5);
+		callback(7);
+		drop(callback);
+		let progress = |bytes| SyncEvent::Progress {
+			rel_path: "dir/f.bin".to_string(),
+			bytes,
+			total: 12,
+		};
+		assert_eq!(receiver.try_recv().unwrap(), progress(5));
+		assert_eq!(receiver.try_recv().unwrap(), progress(12));
+		assert!(receiver.try_recv().is_err());
 	}
 
 	/// A full disk or a full account is found wherever the SDK put it: straight from a local write

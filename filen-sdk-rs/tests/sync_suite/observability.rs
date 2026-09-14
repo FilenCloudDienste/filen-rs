@@ -7,7 +7,7 @@
 //!
 //! Tests that need infrastructure the current harness/public API does not provide — deterministic
 //! mid-transfer/crash interruption, a per-item transfer-failure injector, a dry-run/plan-only mode,
-//! a mass-delete *confirmation* API, byte/size progress fields, report timestamps, mid-pass
+//! a mass-delete *confirmation* API, report timestamps, mid-pass
 //! listener (un)registration, or a pass identifier — are written as `#[ignore]` stubs documenting
 //! the plan, rather than faked.
 use std::borrow::Cow;
@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
+use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
 	PlannedActionKind, PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport,
@@ -1306,13 +1307,143 @@ async fn observ_21_report_emitted_exactly_once_even_with_errors() {
 	// and the pass terminates cleanly. Needs fault injection to produce the error path deterministically.
 }
 
-#[ignore = "blocked: SyncEvent carries no byte/size fields — see OBSERV-22 TODO"]
+/// The byte progress `events` carry for each `(name, size)`: every tick names the file's true size as
+/// its total, comes before the event `finished` recognises as that transfer's own, never goes down,
+/// and ends at the size. An empty file moves no bytes and reports none.
+fn assert_byte_progress(
+	events: &[SyncEvent],
+	sizes: &[(&str, usize)],
+	finished: impl Fn(&SyncEvent) -> Option<&str>,
+) {
+	for &(name, size) in sizes {
+		let size = size as u64;
+		let done_at = events
+			.iter()
+			.position(|e| finished(e) == Some(name))
+			.unwrap_or_else(|| panic!("no completion event for {name}: {events:?}"));
+		let ticks: Vec<(usize, u64, u64)> = events
+			.iter()
+			.enumerate()
+			.filter_map(|(i, e)| match e {
+				SyncEvent::Progress {
+					rel_path,
+					bytes,
+					total,
+				} if rel_path == name => Some((i, *bytes, *total)),
+				_ => None,
+			})
+			.collect();
+		if size == 0 {
+			assert!(
+				ticks.is_empty(),
+				"an empty file reported progress: {ticks:?}"
+			);
+			continue;
+		}
+		assert!(!ticks.is_empty(), "no progress for {name}: {events:?}");
+		for &(at, bytes, total) in &ticks {
+			assert_eq!(total, size, "{name}: total is not the file size: {ticks:?}");
+			assert!(
+				bytes <= size,
+				"{name}: progress overshot its size: {ticks:?}"
+			);
+			assert!(
+				at < done_at,
+				"{name}: progress after the transfer's own event: {events:?}"
+			);
+		}
+		assert!(
+			ticks.windows(2).all(|w| w[0].1 <= w[1].1),
+			"{name}: progress went backwards: {ticks:?}"
+		);
+		assert_eq!(
+			ticks.last().unwrap().1,
+			size,
+			"{name}: progress must end at the file size: {ticks:?}"
+		);
+	}
+}
+
+/// OBSERV-22 — byte progress matches what was transferred, for uploads and downloads of 0 B, 1 B,
+/// 1 MiB and a multi-chunk file (see `assert_byte_progress`), and the transferred bytes are
+/// identical on the other side.
 #[shared_test_runtime]
 async fn observ_22_byte_size_accounting_matches_transferred() {
-	// plan: transfer files of known sizes (0 B, 1 B, 1 MiB, multi-chunk); assert each action's
-	// reported total size == true byte size, cumulative transferred == size at completion (incl. the
-	// 0-byte file), destination byte-identical, multi-chunk progress monotone and <= total. The
-	// public SyncEvent variants carry only rel_path — no size/bytes/progress fields exist.
+	const MIB: usize = 1024 * 1024;
+	let body = |size: usize| (0..size).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+	let sc = single_client(SyncMode::TwoWay).await;
+
+	let up: [(&str, usize); 4] = [
+		("up-empty.bin", 0),
+		("up-one.bin", 1),
+		("up-mib.bin", MIB),
+		("up-multi.bin", 3 * MIB + 17),
+	];
+	for (name, size) in up {
+		write_file(&sc.local, name, &body(size));
+	}
+	let mut events = Vec::new();
+	let r1 = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut |e| events.push(e))
+		.await
+		.unwrap();
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 4, "{r1:?}");
+	assert_byte_progress(&events, &up, |e| match e {
+		SyncEvent::Uploading { rel_path } => Some(rel_path),
+		_ => None,
+	});
+	let remote = list_remote_files(&sc).await;
+	for (name, size) in up {
+		assert_eq!(
+			remote
+				.iter()
+				.find(|f| f.name() == Some(name))
+				.map(|f| f.size()),
+			Some(size as u64),
+			"{name} on the remote"
+		);
+	}
+
+	let down: [(&str, usize); 4] = [
+		("down-empty.bin", 0),
+		("down-one.bin", 1),
+		("down-mib.bin", MIB),
+		("down-multi.bin", 2 * MIB + 5),
+	];
+	let client = sc.cache.client.clone();
+	for (name, size) in down {
+		let builder = client.make_file_builder(name, sc.remote).unwrap();
+		let file = client
+			.upload_file(builder, body(size).as_slice())
+			.await
+			.unwrap();
+		assert!(
+			poll_for_item(sc.cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+			"cache never observed {name}"
+		);
+	}
+	let mut events = Vec::new();
+	let r2 = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut |e| events.push(e))
+		.await
+		.unwrap();
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.downloaded, 4, "{r2:?}");
+	assert_byte_progress(&events, &down, |e| match e {
+		SyncEvent::Downloading { rel_path } => Some(rel_path),
+		_ => None,
+	});
+	for (name, size) in down {
+		assert!(
+			read_eq(&sc.local, name, &body(size)),
+			"{name} not byte-identical locally"
+		);
+	}
+
+	sc.cleanup();
 }
 
 /// OBSERV-23 — a held mass delete reports as HELD with zero deletion events, and once approved by
