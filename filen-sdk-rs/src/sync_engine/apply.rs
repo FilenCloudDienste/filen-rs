@@ -9,7 +9,7 @@
 //! the scanner's fast-path stays stable.
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{BTreeSet, HashMap, HashSet},
 	path::{Path, PathBuf},
 };
 
@@ -29,7 +29,7 @@ use super::{
 	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths, is_under},
-	scan::{LocalNode, QUARANTINE_DIR},
+	scan::{LocalNode, QUARANTINE_DIR, collision_key},
 };
 use crate::{
 	auth::Client,
@@ -431,6 +431,7 @@ pub(super) async fn apply(
 				}
 				Ok(Transfer::Done) => {
 					applied += 1;
+					writes.note(action);
 					tracing::debug!("apply: {} done", action.describe());
 					observer(action.to_event());
 					match action {
@@ -443,6 +444,7 @@ pub(super) async fn apply(
 				// concurrent edit, and that is a conflict of this pass's own making.
 				Ok(Transfer::Overwrote(conflict)) => {
 					applied += 1;
+					writes.note(action);
 					report.uploaded += 1;
 					observer(action.to_event());
 					observer(SyncEvent::Conflict {
@@ -484,14 +486,72 @@ pub(super) async fn apply(
 	note_interrupted(report, total - applied, observer);
 }
 
-/// What this pass has carried out so far that its later actions depend on.
+/// What this pass has written so far, so that no later action of the SAME pass takes it down.
+///
+/// The server dedups a create against an existing item case-insensitively and hands back that
+/// item, and a case-insensitive filesystem resolves two spellings to one entry, so a delete planned
+/// for one path can land on what another action of the pass just created, moved or renamed. The
+/// planner does not plan that shape (see [`plan::fold_case_only_dir_renames`](super::plan)); this
+/// is the net under it: a remote trash or local quarantine whose target is, or holds, something the
+/// pass already wrote is refused, and the next pass re-plans from what is really there.
 #[derive(Debug, Default)]
 struct PassWrites {
+	/// Remote uuids the pass created, moved or renamed — including a create the dedup answered with
+	/// an existing directory's uuid.
+	remote_uuids: HashSet<Uuid>,
+	/// Collision keys of the remote paths the pass wrote.
+	remote_keys: BTreeSet<String>,
+	/// Collision keys of the local paths the pass wrote.
+	local_keys: BTreeSet<String>,
 	/// The new spellings of the directory renames that failed: nothing under them is attempted.
 	failed_renames: Vec<String>,
 }
 
 impl PassWrites {
+	/// Record a successfully applied action.
+	fn note(&mut self, action: &SyncAction) {
+		match action {
+			SyncAction::CreateLocalDir { rel_path } | SyncAction::DownloadFile { rel_path, .. } => {
+				self.local_keys.insert(collision_key(rel_path));
+			}
+			SyncAction::MoveLocal { to_path, .. } | SyncAction::RenameLocalDir { to_path, .. } => {
+				self.local_keys.insert(collision_key(to_path));
+			}
+			SyncAction::CreateRemoteDir { rel_path } | SyncAction::UploadFile { rel_path } => {
+				self.remote_keys.insert(collision_key(rel_path));
+			}
+			SyncAction::MoveRemote {
+				to_path,
+				remote_uuid,
+				..
+			}
+			| SyncAction::RenameRemoteDir {
+				to_path,
+				remote_uuid,
+				..
+			} => {
+				self.remote_keys.insert(collision_key(to_path));
+				self.remote_uuids.insert(*remote_uuid);
+			}
+			SyncAction::DeleteLocal { .. }
+			| SyncAction::TrashRemote { .. }
+			| SyncAction::Conflict { .. }
+			| SyncAction::AdoptBaseline { .. } => {}
+		}
+	}
+
+	/// Whether trashing the remote item `remote_uuid` at `rel_path` would take down something this
+	/// pass wrote.
+	fn shields_remote(&self, rel_path: &str, remote_uuid: Uuid) -> bool {
+		self.remote_uuids.contains(&remote_uuid)
+			|| holds_key_at_or_under(&self.remote_keys, rel_path)
+	}
+
+	/// Whether quarantining the local item at `rel_path` would take down something this pass wrote.
+	fn shields_local(&self, rel_path: &str) -> bool {
+		holds_key_at_or_under(&self.local_keys, rel_path)
+	}
+
 	/// Skip `action` when it sits under a directory whose rename failed this pass — the plan names
 	/// that subtree by a spelling neither side carries — recording it as a failure of its own.
 	fn skips(
@@ -518,6 +578,18 @@ impl PassWrites {
 		note_failure(report, action.rel_path(), &error);
 		true
 	}
+}
+
+/// Whether `keys` holds the collision key of `rel_path` or of something under it.
+fn holds_key_at_or_under(keys: &BTreeSet<String>, rel_path: &str) -> bool {
+	let key = collision_key(rel_path);
+	if keys.contains(&key) {
+		return true;
+	}
+	let prefix = format!("{key}/");
+	keys.range(prefix.clone()..)
+		.next()
+		.is_some_and(|next| next.starts_with(&prefix))
 }
 
 /// The rows of a directory renamed in place, as `(the path the store still has the row under, the
@@ -714,7 +786,11 @@ async fn apply_serial(
 ) {
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
-	if let Err(error) = apply_one(ctx, action, files, dir_by_path, report).await {
+	let result = apply_one(ctx, action, files, dir_by_path, writes, report).await;
+	if result.is_ok() {
+		writes.note(action);
+	}
+	if let Err(error) = result {
 		tracing::debug!("apply: {} FAILED — {error}", action.describe());
 		if let SyncAction::RenameRemoteDir { to_path, .. }
 		| SyncAction::RenameLocalDir { to_path, .. } = action
@@ -922,6 +998,7 @@ async fn apply_one(
 	action: &SyncAction,
 	files: &RemoteFiles<'_>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
+	writes: &mut PassWrites,
 	report: &mut SyncReport,
 ) -> Result<(), crate::Error> {
 	match action {
@@ -940,6 +1017,11 @@ async fn apply_one(
 			}
 		}
 		SyncAction::DeleteLocal { rel_path, .. } => {
+			if writes.shields_local(rel_path) {
+				return Err(internal_owned(format!(
+					"refusing to quarantine {rel_path:?}: this pass already wrote there, under this or another spelling"
+				)));
+			}
 			let _stashed = quarantine_local(ctx.local_root, rel_path)?;
 			delete_baseline(ctx, rel_path).await?;
 			report.locally_deleted += 1;
@@ -961,6 +1043,8 @@ async fn apply_one(
 				.create_dir_with_created(&parent_type, name, created)
 				.await?;
 			let new_uuid: Uuid = new_dir.uuid();
+			// When the dedup answered with an existing directory, this is ITS uuid.
+			writes.remote_uuids.insert(new_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
 				replaced: ctx.remote.get(rel_path).map(|node| node.remote_uuid),
@@ -985,6 +1069,11 @@ async fn apply_one(
 			kind,
 			remote_uuid,
 		} => {
+			if writes.shields_remote(rel_path, *remote_uuid) {
+				return Err(internal_owned(format!(
+					"refusing to trash {rel_path:?}: this pass already wrote that item, or under that name"
+				)));
+			}
 			match kind {
 				NodeKind::File => {
 					let mut remote_file = files
@@ -1737,6 +1826,66 @@ mod tests {
 		let dir = std::env::temp_dir().join(format!("filen_confine_test_{}", Uuid::new_v4()));
 		std::fs::create_dir_all(&dir).unwrap();
 		dir
+	}
+
+	/// The shape a case-only directory rename planned per path takes on the remote: the create at
+	/// the new spelling is answered by the dedup with the EXISTING directory's uuid, and the trash
+	/// at the old spelling then names that same uuid. The trash must be refused.
+	#[test]
+	fn a_trash_of_a_directory_this_pass_created_is_refused() {
+		let existing = Uuid::new_v4();
+		let mut writes = PassWrites::default();
+		writes.note(&SyncAction::CreateRemoteDir {
+			rel_path: "docs".to_string(),
+		});
+		writes.remote_uuids.insert(existing);
+		assert!(writes.shields_remote("Docs", existing), "same uuid");
+		assert!(
+			writes.shields_remote("Docs", Uuid::new_v4()),
+			"same name under another spelling"
+		);
+		assert!(
+			!writes.shields_remote("Other", Uuid::new_v4()),
+			"an unrelated trash is not held"
+		);
+	}
+
+	/// A trash or quarantine of a directory that now holds something this pass wrote — a child
+	/// moved or downloaded into it under another spelling — would take that write down with it.
+	#[test]
+	fn a_delete_above_a_write_of_this_pass_is_refused() {
+		let mut writes = PassWrites::default();
+		writes.note(&SyncAction::MoveRemote {
+			from_path: "Docs/a.txt".to_string(),
+			to_path: "docs/a.txt".to_string(),
+			remote_uuid: Uuid::new_v4(),
+		});
+		writes.note(&SyncAction::DownloadFile {
+			rel_path: "docs/b.txt".to_string(),
+			remote_uuid: Uuid::new_v4(),
+		});
+		assert!(writes.shields_remote("Docs", Uuid::new_v4()));
+		assert!(writes.shields_local("Docs"));
+		assert!(
+			!writes.shields_local("Docs/c.txt"),
+			"a sibling of the write is not held"
+		);
+		assert!(
+			!writes.shields_local("doc"),
+			"a name sharing only a prefix is not held"
+		);
+	}
+
+	#[test]
+	fn a_key_sorting_between_a_dir_and_its_children_does_not_hide_them() {
+		// `docs-x` sorts after `docs` but before `docs/`, so a range read has to start at the
+		// child prefix rather than at the key itself.
+		let keys = BTreeSet::from(["docs-x".to_string(), "docs/a.txt".to_string()]);
+		assert!(holds_key_at_or_under(&keys, "Docs"));
+		assert!(!holds_key_at_or_under(
+			&BTreeSet::from(["docs-x".to_string()]),
+			"Docs"
+		));
 	}
 
 	/// A directory renamed in place moves every row of its subtree back from the new spelling the
