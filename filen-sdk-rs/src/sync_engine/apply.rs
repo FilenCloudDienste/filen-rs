@@ -9,18 +9,19 @@
 //! the scanner's fast-path stays stable.
 
 use std::{
-	collections::{BTreeSet, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::StableUuid;
-use futures::StreamExt;
+use futures::{StreamExt, stream::FuturesUnordered};
 use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
-	engine::{Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites},
+	engine::{LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites},
 	events::SyncEvent,
 	guard::GuardReason,
 	outcome::{
@@ -40,9 +41,9 @@ use crate::{
 		file::{cache::CacheableFile, meta::FileMetaChanges},
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
-	sync::lock::ATTEMPTS_DEFAULT,
+	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock},
 };
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 
 /// Outcome of one apply pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -164,6 +165,8 @@ pub(super) struct ApplyContext<'a> {
 	/// The pair's pause checkpoint: consulted before every action, and raced against every
 	/// transfer (see [`PassGate`]).
 	pub(super) gate: &'a PassGate,
+	/// The bounds of each hold of the drive-write lock (see [`Lease`]).
+	pub(super) lock_budget: LockBudget,
 }
 
 fn local_path(root: &Path, rel_path: &str) -> PathBuf {
@@ -274,9 +277,12 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 
 /// Execute `actions` (already ordered + guard-screened) against the remote and local tree.
 ///
-/// The drive-write lock is taken ONCE for the whole pass (when anything mutates the remote) so the
-/// per-op `lock_drive` calls inside upload/create become free clones of the held lock instead of
-/// each doing an acquire+release server round-trip — the dominant per-file cost at scale.
+/// The drive-write lock is held per bounded BATCH of remote writes (see [`Lease`]) so the per-op
+/// `lock_drive` calls inside upload/create become free clones of the held lock instead of each
+/// doing an acquire+release server round-trip — the dominant per-file cost at scale — while no other
+/// device of the account waits on it for longer than about [`PASS_LOCK_MAX_HOLD`](super::engine::PASS_LOCK_MAX_HOLD). It is let go
+/// only between actions that do not depend on one another (see [`release_points`]), once no remote
+/// write is in flight, and taken again before the next remote write; a pure pull never takes it.
 ///
 /// File transfers (uploads/downloads) — the bulk of the work and independent of one another — run
 /// CONCURRENTLY, bounded by the client's configured concurrency ([`ClientConfig::with_concurrency`],
@@ -339,56 +345,34 @@ pub(super) async fn apply(
 			pre.push(action);
 		}
 	}
+	order_transfers(&pre, &mut transfers);
 
 	// What the pass still owes if it is cancelled part-way: everything it has not carried out.
 	let total = pre.len() + transfers.len() + post.len();
 	let mut applied = 0usize;
 
-	// Hold the drive-write lock for the whole pass when it mutates the remote (a pure pull touches
-	// only local files and needs no lock). Inner `lock_drive` calls then return a clone of this.
-	//
-	// Polled on a schedule of the engine's own (`PASS_LOCK_MAX_SLEEP`, default attempt count) rather
-	// than the shared default ladder, so a pass that misses another client's release picks the lock
-	// up inside the confirmation window instead of tens of seconds later, where its round no longer
-	// reads as a race against the one it queued behind.
-	//
-	// Taken UNDER the gate, because acquiring it is itself a wait a pause has to be able to reach: a
-	// contended acquisition retries for hours, so a pass told to stop while queueing for the lock
-	// would otherwise take it just to release it — and report what it did not do only then.
-	// A suspended pass parks here instead of holding a lock it is not using. Dropping the
-	// acquisition mid-request can leave the server holding a lock nothing refreshes; that lease
-	// expires on its own within ~30 s.
-	let _drive_lock = if pre
-		.iter()
-		.chain(&transfers)
-		.chain(&post)
-		.any(mutates_remote)
-	{
-		if !ctx.gate.wait_to_start().await {
-			return note_interrupted(report, total, observer);
-		}
-		match ctx
-			.gate
-			.guard(
-				ctx.client
-					.lock_drive_bounded(PASS_LOCK_MAX_SLEEP, ATTEMPTS_DEFAULT),
-			)
-			.await
-		{
-			Some(Ok(lock)) => Some(lock),
-			Some(Err(error)) => return note_lock_failure(report, total, &error, observer),
-			None => return note_interrupted(report, total, observer),
-		}
-	} else {
-		None
+	// Where the drive lock may be let go: before an action no earlier one is still waiting on.
+	let releasable = {
+		let order: Vec<&SyncAction> = pre.iter().chain(&transfers).chain(&post).collect();
+		release_points(&order, &create_targets)
 	};
+	let (pre_release, rest) = releasable.split_at(pre.len());
+	let (transfer_release, post_release) = rest.split_at(transfers.len());
+	let mut lease = Lease::Unheld;
 
 	let mut writes = PassWrites::default();
-	for action in &pre {
+	for (action, &releasable) in pre.iter().zip(pre_release) {
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
 		if !writes.skips(action, report, observer) {
+			match lease.prepare(&ctx, action, releasable).await {
+				Some(Ok(())) => {}
+				Some(Err(error)) => {
+					return note_lock_failure(report, total - applied, &error, observer);
+				}
+				None => return note_interrupted(report, total - applied, observer),
+			}
 			apply_serial(
 				&ctx,
 				action,
@@ -403,32 +387,57 @@ pub(super) async fn apply(
 		applied += 1;
 	}
 
-	let planned_transfers = transfers.len();
-	transfers.retain(|action| !writes.skips(action, report, observer));
-	applied += planned_transfers - transfers.len();
+	let pending: Vec<(&SyncAction, bool)> = transfers
+		.iter()
+		.zip(transfer_release.iter().copied())
+		.filter(|(action, _)| !writes.skips(action, report, observer))
+		.collect();
+	applied += transfers.len() - pending.len();
 
-	if !transfers.is_empty() {
+	if !pending.is_empty() {
 		let concurrency = ctx.client.unauthed().state().max_concurrency().max(1);
-		let ctx_ref = &ctx;
-		let dir_ref = &dir_by_path;
-		let files_ref = &files;
-		let mut stream = std::pin::pin!(
-			futures::stream::iter(transfers.iter())
-				.map(|action| async move {
-					(
-						action,
-						apply_transfer(ctx_ref, action, files_ref, dir_ref).await,
-					)
-				})
-				.buffer_unordered(concurrency)
-		);
-		while let Some((action, result)) = stream.next().await {
+		let mut pending = pending.into_iter().peekable();
+		let mut in_flight = FuturesUnordered::new();
+		// Uploads in flight use the lock, so it is let go only once none is; downloads do not.
+		let mut remote_in_flight = 0usize;
+		loop {
+			while in_flight.len() < concurrency
+				&& let Some(&(action, releasable)) = pending.peek()
+			{
+				let now = Instant::now();
+				if remote_in_flight == 0 {
+					lease.release_if_spent(&ctx.lock_budget, releasable, now);
+				}
+				if !lease.admits(&ctx.lock_budget, action, releasable, now) {
+					break;
+				}
+				lease.note_start(action);
+				pending.next();
+				remote_in_flight += usize::from(mutates_remote(action));
+				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path));
+			}
+			let Some((action, result)) = in_flight.next().await else {
+				// Nothing in flight: the transfers are done, or the next one waits on the lock.
+				let Some((action, releasable)) = pending.next() else {
+					break;
+				};
+				match lease.prepare(&ctx, action, releasable).await {
+					Some(Ok(())) => {}
+					Some(Err(error)) => {
+						return note_lock_failure(report, total - applied, &error, observer);
+					}
+					None => return note_interrupted(report, total - applied, observer),
+				}
+				remote_in_flight += usize::from(mutates_remote(action));
+				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path));
+				continue;
+			};
+			remote_in_flight -= usize::from(mutates_remote(action));
 			match result {
 				// A cancel skips a transfer that has not started and DROPS one that is mid-flight;
 				// either way it recorded nothing, and the pass owes it to the next one.
 				Ok(Transfer::Interrupted) => {
 					tracing::debug!("apply: {} interrupted", action.describe());
-					continue;
 				}
 				Ok(Transfer::Done) => {
 					applied += 1;
@@ -466,11 +475,18 @@ pub(super) async fn apply(
 		}
 	}
 
-	for action in &post {
+	for (action, &releasable) in post.iter().zip(post_release) {
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
 		if !writes.skips(action, report, observer) {
+			match lease.prepare(&ctx, action, releasable).await {
+				Some(Ok(())) => {}
+				Some(Err(error)) => {
+					return note_lock_failure(report, total - applied, &error, observer);
+				}
+				None => return note_interrupted(report, total - applied, observer),
+			}
 			apply_serial(
 				&ctx,
 				action,
@@ -485,6 +501,222 @@ pub(super) async fn apply(
 		applied += 1;
 	}
 	note_interrupted(report, total - applied, observer);
+}
+
+/// One transfer, paired with the action it ran — named so every transfer of a pass is the same
+/// future type and they can share one [`FuturesUnordered`].
+async fn run_transfer<'a>(
+	ctx: &ApplyContext<'_>,
+	action: &'a SyncAction,
+	files: &RemoteFiles<'_>,
+	dir_by_path: &HashMap<String, RemoteDirectory>,
+) -> (&'a SyncAction, Result<Transfer, crate::Error>) {
+	(
+		action,
+		apply_transfer(ctx, action, files, dir_by_path).await,
+	)
+}
+
+/// The pass's hold on the account-wide drive-write lock, taken per bounded batch of its apply.
+///
+/// Nothing but this holds the pass's `Arc` of the lock, so moving out of [`Held`](Self::Held) drops
+/// it; the lock is really released when the last in-process holder lets go — the SDK ops of the pass
+/// clone it only for their own duration, which is why it is let go only with no remote write in
+/// flight. Another holder in the process (the cache worker's resync) may legitimately keep it.
+enum Lease {
+	/// Not taken yet this pass.
+	Unheld,
+	Held {
+		lock: Arc<ResourceLock>,
+		/// When this hold began.
+		since: Instant,
+		/// How many remote writes started under it.
+		writes: usize,
+	},
+	/// Let go at `at`; not asked for again before [`PASS_LOCK_YIELD`](super::engine::PASS_LOCK_YIELD) has passed.
+	Released { at: Instant },
+}
+
+impl Lease {
+	/// Whether the hold has run its course (see [`hold_spent`]).
+	fn spent(&self, budget: &LockBudget, now: Instant) -> bool {
+		matches!(self, Self::Held { since, writes, .. } if hold_spent(budget, *since, *writes, now))
+	}
+
+	/// Let a spent hold go, when the next action sits where a release splits nothing.
+	fn release_if_spent(&mut self, budget: &LockBudget, releasable: bool, now: Instant) {
+		if releasable && self.spent(budget, now) {
+			*self = Self::Released { at: now };
+		}
+	}
+
+	/// Whether `action` may start now without the lease changing first: no spent hold is waiting to
+	/// be let go before it, and a remote write finds a lock whose lease is still good.
+	fn admits(
+		&self,
+		budget: &LockBudget,
+		action: &SyncAction,
+		releasable: bool,
+		now: Instant,
+	) -> bool {
+		if releasable && self.spent(budget, now) {
+			return false;
+		}
+		!mutates_remote(action) || matches!(self, Self::Held { lock, .. } if lock.is_valid())
+	}
+
+	/// Count `action` against the hold when it writes to the remote.
+	fn note_start(&mut self, action: &SyncAction) {
+		if mutates_remote(action)
+			&& let Self::Held { writes, .. } = self
+		{
+			*writes += 1;
+		}
+	}
+
+	/// Get the lease ready for `action` and count it: let a spent hold go at a boundary that allows
+	/// it, and take the lock before a remote write that finds none (or one whose lease was lost).
+	/// `None` means the pass was cancelled meanwhile; an `Err` is a lock the pass could not take.
+	///
+	/// The lock is polled on a schedule of the engine's own (`PASS_LOCK_MAX_SLEEP`, default attempt
+	/// count) rather than the shared default ladder, so a pass that misses another client's release
+	/// picks the lock up inside the confirmation window instead of tens of seconds later, where its
+	/// round no longer reads as a race against the one it queued behind.
+	///
+	/// It is taken UNDER the gate, because acquiring it is itself a wait a pause has to be able to
+	/// reach: a contended acquisition retries for hours, so a pass told to stop while queueing for
+	/// the lock would otherwise take it just to release it — and report what it did not do only
+	/// then. A suspended pass parks here instead of holding a lock it is not using. Dropping the
+	/// acquisition mid-request can leave the server holding a lock nothing refreshes; that lease
+	/// expires on its own within ~30 s.
+	async fn prepare(
+		&mut self,
+		ctx: &ApplyContext<'_>,
+		action: &SyncAction,
+		releasable: bool,
+	) -> Option<Result<(), crate::Error>> {
+		let now = Instant::now();
+		self.release_if_spent(&ctx.lock_budget, releasable, now);
+		if !self.admits(&ctx.lock_budget, action, releasable, now) {
+			if let Self::Released { at } = *self {
+				ctx.gate
+					.guard(tokio::time::sleep_until(at + ctx.lock_budget.rest))
+					.await?;
+			}
+			if !ctx.gate.wait_to_start().await {
+				return None;
+			}
+			let lock = match ctx
+				.gate
+				.guard(
+					ctx.client
+						.lock_drive_bounded(PASS_LOCK_MAX_SLEEP, ATTEMPTS_DEFAULT),
+				)
+				.await?
+			{
+				Ok(lock) => lock,
+				Err(error) => return Some(Err(error)),
+			};
+			*self = Self::Held {
+				lock,
+				since: Instant::now(),
+				writes: 0,
+			};
+		}
+		self.note_start(action);
+		Some(Ok(()))
+	}
+}
+
+/// Whether a hold of the drive lock that began at `since` and has started `writes` remote writes has
+/// run its course: the budget's time or its batch — by default
+/// [`PASS_LOCK_MAX_HOLD`](super::engine::PASS_LOCK_MAX_HOLD) or
+/// [`PASS_LOCK_MAX_BATCH`](super::engine::PASS_LOCK_MAX_BATCH) — whichever comes first.
+fn hold_spent(budget: &LockBudget, since: Instant, writes: usize, now: Instant) -> bool {
+	now.saturating_duration_since(since) >= budget.hold || writes >= budget.batch
+}
+
+/// Put the transfers — independent of one another, so their order is free — in the order that lets
+/// the pass hold the drive lock least: first the ones that finish a compound step of `pre` (the create
+/// half of a replace-delete, anything under a moved directory), so that step ends as early as it can
+/// (see [`release_points`]); then downloads, which need no lock; then uploads, which do.
+fn order_transfers(pre: &[SyncAction], transfers: &mut [SyncAction]) {
+	let replaced: HashSet<&str> = pre
+		.iter()
+		.filter(|action| action.is_delete())
+		.map(SyncAction::rel_path)
+		.collect();
+	let moved_dirs: Vec<&str> = pre.iter().filter_map(moved_dir).collect();
+	transfers.sort_by_key(|action| {
+		let path = action.rel_path();
+		let completes_step = replaced.contains(path)
+			|| moved_dirs
+				.iter()
+				.any(|dir| path == *dir || is_under(path, dir));
+		(
+			!completes_step,
+			matches!(action, SyncAction::UploadFile { .. }),
+		)
+	});
+}
+
+/// Where a directory move is headed, for a directory move.
+fn moved_dir(action: &SyncAction) -> Option<&str> {
+	match action {
+		SyncAction::MoveRemote {
+			to_path,
+			kind: NodeKind::Dir,
+			..
+		}
+		| SyncAction::MoveLocal {
+			to_path,
+			kind: NodeKind::Dir,
+			..
+		} => Some(to_path),
+		_ => None,
+	}
+}
+
+/// For each position of the pass's execution `order`, whether the drive lock may be let go just
+/// before it: `false` where an action already run is still waiting on one at or after it.
+///
+/// Two shapes tie actions together. A replace-delete is half of a type flip: the path stays empty
+/// until the create at it runs, and another client let in between would find it free. A directory
+/// move carries its subtree: what the plan names under the destination (a create, a move, a
+/// transfer) assumes the move has just happened. A deletion under a moved directory names its item
+/// by uuid and ties nothing. Every other boundary is between independent actions — each one's write
+/// already committed — and so is every boundary between phases that no such tie crosses.
+fn release_points(order: &[&SyncAction], create_targets: &HashSet<String>) -> Vec<bool> {
+	// The last position at which each path is created, transferred or moved from or to.
+	let mut last: BTreeMap<&str, usize> = BTreeMap::new();
+	for (position, action) in order.iter().enumerate() {
+		if !action.is_delete() {
+			let (from, to) = action.endpoints();
+			last.insert(from, position);
+			last.insert(to, position);
+		}
+	}
+	let mut reach: Option<usize> = None;
+	order
+		.iter()
+		.enumerate()
+		.map(|(position, action)| {
+			let releasable = reach.is_none_or(|reach| reach < position);
+			let tied_until = if action.is_delete() && create_targets.contains(action.rel_path()) {
+				last.get(action.rel_path()).copied()
+			} else if let Some(dir) = moved_dir(action) {
+				let prefix = format!("{dir}/");
+				last.range(prefix.as_str()..)
+					.take_while(|(path, _)| path.starts_with(&prefix))
+					.map(|(_, &position)| position)
+					.max()
+			} else {
+				None
+			};
+			reach = reach.max(tied_until);
+			releasable
+		})
+		.collect()
 }
 
 /// What this pass has written so far, so that no later action of the SAME pass takes it down.
@@ -1889,10 +2121,161 @@ fn internal_owned(message: String) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
+	use std::time::Duration;
+
 	use filen_types::crypto::Blake3Hash;
 	use uuid::Uuid;
 
 	use super::*;
+
+	fn upload(rel_path: &str) -> SyncAction {
+		SyncAction::UploadFile {
+			rel_path: rel_path.to_string(),
+		}
+	}
+
+	fn download(rel_path: &str) -> SyncAction {
+		SyncAction::DownloadFile {
+			rel_path: rel_path.to_string(),
+			remote_uuid: Uuid::new_v4(),
+		}
+	}
+
+	fn create_dir(rel_path: &str) -> SyncAction {
+		SyncAction::CreateRemoteDir {
+			rel_path: rel_path.to_string(),
+		}
+	}
+
+	fn trash(rel_path: &str, kind: NodeKind) -> SyncAction {
+		SyncAction::TrashRemote {
+			rel_path: rel_path.to_string(),
+			kind,
+			remote_uuid: Uuid::new_v4(),
+		}
+	}
+
+	fn move_dir(from_path: &str, to_path: &str) -> SyncAction {
+		SyncAction::MoveRemote {
+			from_path: from_path.to_string(),
+			to_path: to_path.to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: Uuid::new_v4(),
+		}
+	}
+
+	fn release_points_of(order: &[SyncAction]) -> Vec<bool> {
+		let refs: Vec<&SyncAction> = order.iter().collect();
+		release_points(&refs, &create_target_paths(order))
+	}
+
+	/// Between independent actions — and across phases no tie crosses — the lock may go anywhere.
+	#[test]
+	fn independent_actions_may_release_between_any_two() {
+		let order = [
+			create_dir("a"),
+			create_dir("a/b"),
+			upload("a/x"),
+			download("y"),
+			trash("old", NodeKind::File),
+		];
+		assert_eq!(release_points_of(&order), vec![true; order.len()]);
+	}
+
+	/// A type flip empties its path until the create at it runs: no release may land in between,
+	/// whatever runs between the two halves.
+	#[test]
+	fn a_release_never_splits_a_replace_delete_from_its_create() {
+		let order = [
+			trash("x", NodeKind::File),
+			create_dir("a"),
+			create_dir("x"),
+			create_dir("z"),
+		];
+		assert_eq!(release_points_of(&order), vec![true, false, false, true]);
+
+		// The directory half of a flip is recreated by a TRANSFER, in the next phase.
+		let order = [trash("x", NodeKind::Dir), upload("x"), upload("y")];
+		assert_eq!(release_points_of(&order), vec![true, false, true]);
+	}
+
+	/// What the plan names under a moved directory — a nested move, a create, a transfer — assumes
+	/// the move just happened; a deletion under it names its item by uuid and waits on nothing.
+	#[test]
+	fn a_release_never_splits_a_directory_move_from_what_it_carries() {
+		let order = [
+			move_dir("d", "e"),
+			move_dir("e/in", "e/in2"),
+			create_dir("a"),
+			create_dir("e/in2/new"),
+			upload("e/in2/f"),
+			upload("g"),
+			trash("e/old", NodeKind::File),
+		];
+		assert_eq!(
+			release_points_of(&order),
+			vec![true, false, false, false, false, true, true]
+		);
+
+		// A sibling that only shares the name's prefix is not under the moved directory.
+		let order = [move_dir("d", "e"), upload("ex"), upload("e2/f")];
+		assert_eq!(release_points_of(&order), vec![true, true, true]);
+	}
+
+	/// The transfers that finish a compound step go first, so the step — and the stretch the lock
+	/// cannot be let go in — ends as early as it can; then the downloads, which need no lock, then the
+	/// uploads.
+	#[test]
+	fn transfers_that_finish_a_compound_step_run_first_then_downloads_then_uploads() {
+		let pre = [trash("flip", NodeKind::Dir), move_dir("d", "e")];
+		let mut transfers = [
+			upload("a"),
+			download("b"),
+			upload("e/child"),
+			download("c"),
+			upload("flip"),
+		];
+		order_transfers(&pre, &mut transfers);
+		let paths: Vec<&str> = transfers.iter().map(SyncAction::rel_path).collect();
+		assert_eq!(paths, ["e/child", "flip", "b", "c", "a"]);
+	}
+
+	/// A hold runs its course on time or on count, whichever comes first.
+	#[test]
+	fn a_hold_is_spent_after_its_time_or_its_batch() {
+		let budget = LockBudget::default();
+		let since = Instant::now();
+		assert!(!hold_spent(&budget, since, 0, since));
+		assert!(!hold_spent(
+			&budget,
+			since,
+			budget.batch - 1,
+			since + budget.hold - Duration::from_millis(1)
+		));
+		assert!(hold_spent(&budget, since, 0, since + budget.hold));
+		assert!(hold_spent(&budget, since, budget.batch, since));
+	}
+
+	/// Without a held lock only a remote write has to wait for one; nothing that is merely local or a
+	/// download does, released or not.
+	#[test]
+	fn only_a_remote_write_waits_for_the_lock() {
+		let now = Instant::now();
+		let budget = LockBudget::default();
+		for lease in [Lease::Unheld, Lease::Released { at: now }] {
+			assert!(lease.admits(&budget, &download("a"), true, now));
+			assert!(!lease.admits(&budget, &trash("b", NodeKind::File), false, now));
+			assert!(!lease.admits(&budget, &upload("c"), true, now));
+			assert!(lease.admits(
+				&budget,
+				&SyncAction::CreateLocalDir {
+					rel_path: "d".to_string()
+				},
+				true,
+				now
+			));
+		}
+	}
 
 	fn temp_dir() -> PathBuf {
 		let dir = std::env::temp_dir().join(format!("filen_confine_test_{}", Uuid::new_v4()));
