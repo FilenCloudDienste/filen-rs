@@ -6,7 +6,7 @@
 //! source (`make dst match src`, gated by whether deletions propagate); two-way uses the baseline
 //! to tell which side changed and surfaces a genuine both-sides-changed divergence as a conflict.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use unicode_normalization::UnicodeNormalization;
@@ -78,33 +78,25 @@ pub(crate) enum SyncAction {
 	AdoptBaseline {
 		rel_path: String,
 	},
-	/// A file moved/renamed on the local side -> re-parent + rename the remote item (uuid kept)
-	/// instead of re-uploading its content.
+	/// An item moved/renamed on the local side -> re-parent + rename the remote item (uuid kept)
+	/// instead of re-uploading its content or re-creating it.
+	///
+	/// A DIRECTORY move carries its whole subtree: it is planned by [`fold_dir_moves`], which
+	/// re-keys the pass's inputs so every child is read at its new path and is a no-op unless it
+	/// changed on its own. It runs before every other action of the pass.
 	MoveRemote {
 		from_path: String,
 		to_path: String,
+		kind: NodeKind,
 		remote_uuid: Uuid,
 	},
-	/// A file moved/renamed on the remote side -> rename the local file instead of re-downloading.
+	/// An item moved/renamed on the remote side -> rename the local item instead of re-downloading
+	/// it (a file) or quarantining and re-creating its subtree (a directory, see
+	/// [`fold_dir_moves`]).
 	MoveLocal {
 		from_path: String,
 		to_path: String,
-	},
-	/// A directory renamed in place on the local side -> rename the remote directory (uuid and
-	/// subtree kept). Planned only for a case-only rename, which a create at the new spelling
-	/// cannot express: the server's case-insensitive dedup hands that create the very directory
-	/// the old spelling's trash would then take down, subtree and all. See
-	/// [`fold_case_only_dir_renames`].
-	RenameRemoteDir {
-		from_path: String,
-		to_path: String,
-		remote_uuid: Uuid,
-	},
-	/// A directory renamed in place on the remote side -> rename the local directory instead of
-	/// quarantining its subtree and re-creating it. Case-only, like [`Self::RenameRemoteDir`].
-	RenameLocalDir {
-		from_path: String,
-		to_path: String,
+		kind: NodeKind,
 	},
 }
 
@@ -121,10 +113,7 @@ impl SyncAction {
 			| Self::TrashRemote { rel_path, .. }
 			| Self::Conflict { rel_path }
 			| Self::AdoptBaseline { rel_path } => rel_path,
-			Self::MoveRemote { to_path, .. }
-			| Self::MoveLocal { to_path, .. }
-			| Self::RenameRemoteDir { to_path, .. }
-			| Self::RenameLocalDir { to_path, .. } => to_path,
+			Self::MoveRemote { to_path, .. } | Self::MoveLocal { to_path, .. } => to_path,
 		}
 	}
 
@@ -135,11 +124,9 @@ impl SyncAction {
 			Self::MoveRemote {
 				from_path, to_path, ..
 			}
-			| Self::MoveLocal { from_path, to_path }
-			| Self::RenameRemoteDir {
+			| Self::MoveLocal {
 				from_path, to_path, ..
-			}
-			| Self::RenameLocalDir { from_path, to_path } => (from_path, to_path),
+			} => (from_path, to_path),
 			other => (other.rel_path(), other.rel_path()),
 		}
 	}
@@ -179,17 +166,16 @@ impl SyncAction {
 			Self::Conflict { rel_path } => format!("conflict {rel_path:?}"),
 			Self::AdoptBaseline { rel_path } => format!("adopt baseline {rel_path:?}"),
 			Self::MoveRemote {
-				from_path, to_path, ..
-			} => format!("move remote {from_path:?} -> {to_path:?}"),
-			Self::MoveLocal { from_path, to_path } => {
-				format!("move local {from_path:?} -> {to_path:?}")
-			}
-			Self::RenameRemoteDir {
-				from_path, to_path, ..
-			} => format!("rename remote dir {from_path:?} -> {to_path:?}"),
-			Self::RenameLocalDir { from_path, to_path } => {
-				format!("rename local dir {from_path:?} -> {to_path:?}")
-			}
+				from_path,
+				to_path,
+				kind,
+				..
+			} => format!("move remote {kind:?} {from_path:?} -> {to_path:?}"),
+			Self::MoveLocal {
+				from_path,
+				to_path,
+				kind,
+			} => format!("move local {kind:?} {from_path:?} -> {to_path:?}"),
 		}
 	}
 
@@ -217,15 +203,13 @@ impl SyncAction {
 			},
 			Self::MoveRemote {
 				from_path, to_path, ..
-			}
-			| Self::RenameRemoteDir {
-				from_path, to_path, ..
 			} => SyncEvent::MovingRemote {
 				from: from_path.clone(),
 				to: to_path.clone(),
 			},
-			Self::MoveLocal { from_path, to_path }
-			| Self::RenameLocalDir { from_path, to_path } => SyncEvent::MovingLocal {
+			Self::MoveLocal {
+				from_path, to_path, ..
+			} => SyncEvent::MovingLocal {
 				from: from_path.clone(),
 				to: to_path.clone(),
 			},
@@ -1262,6 +1246,7 @@ fn detect_moves(
 				let action = SyncAction::MoveLocal {
 					from_path: from.clone(),
 					to_path: to.to_string(),
+					kind: NodeKind::File,
 				};
 				tracing::debug!(
 					"plan: {} — remote item moved (matched by {}); renaming locally instead of re-downloading",
@@ -1334,6 +1319,7 @@ fn detect_moves(
 				let action = SyncAction::MoveRemote {
 					from_path: from.clone(),
 					to_path: to.to_string(),
+					kind: NodeKind::File,
 					remote_uuid: uuid,
 				};
 				tracing::debug!(
@@ -1395,39 +1381,50 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 	});
 }
 
-/// Rename in place every directory the two sides spell differently only by case, and re-key the
-/// three inputs so the rest of the pass reads that subtree under the spelling it ends with. Returns
-/// the renames shallowest first, the order they have to run in.
+/// Carry every directory move the pass can identify across as ONE move of the directory, and re-key
+/// the three inputs so the rest of the pass reads that subtree where it ends up. Returns the moves
+/// in the order they have to run: each one is found in inputs the earlier ones already re-keyed, so
+/// a directory's move precedes any move inside it.
 ///
-/// Planned any other way a case-only rename destroys the directory it renames. The per-path
-/// reconcile sees two unrelated paths — a create at the new spelling and a delete at the old one —
-/// and the server's name dedup is case-insensitive, so the create is handed back the very directory
-/// the delete then trashes, subtree and all; the pull side quarantines the whole local subtree on a
-/// case-insensitive filesystem the same way. A rename in place keeps the remote uuid, and with the
-/// inputs re-keyed every child is a no-op unless it changed on its own.
+/// Planned per path, a directory move is a create at the new path, a move per file and a trash of
+/// the old directory: a round trip per child instead of one, and a new directory uuid, which loses
+/// everything keyed by it (a public link is). A move of the directory keeps its uuid, and with the
+/// inputs re-keyed every child is a no-op unless it changed on its own — an edit inside a moved
+/// directory is planned at its new path and applied after the move.
 ///
-/// Only a directory under the SAME parent path on both sides is a candidate; a case change deeper
-/// down is found on a later iteration, once its parent has been re-keyed. Which side is renamed:
-/// - a one-way mode renames its destination to the source's spelling;
-/// - two-way renames the REMOTE when the baseline recorded the remote's spelling for that same
-///   directory and has no row at the local one — the local side is what changed — and the LOCAL
-///   side otherwise: the remote renamed it, or nothing says which side moved and the spelling every
-///   other device of the account already sees is the one to keep.
+/// Two shapes are found, a case-only rename first:
 ///
-/// A path held in conflict at either spelling is left to the ordinary reconcile.
+/// - A directory the two sides spell differently only by case. Planned any other way it destroys
+///   the directory: the per-path reconcile sees a create at the new spelling and a delete at the
+///   old one, the server's name dedup is case-insensitive, so the create is handed back the very
+///   directory the delete then trashes, subtree and all; the pull side quarantines the whole local
+///   subtree on a case-insensitive filesystem the same way. Only a directory under the SAME parent
+///   path on both sides is a candidate; a case change deeper down is found on a later iteration,
+///   once its parent has been re-keyed. Which side is renamed:
+///   - a one-way mode renames its destination to the source's spelling;
+///   - two-way renames the REMOTE when the baseline recorded the remote's spelling for that same
+///     directory and has no row at the local one — the local side is what changed — and the LOCAL
+///     side otherwise: the remote renamed it, or nothing says which side moved and the spelling
+///     every other device of the account already sees is the one to keep.
 ///
-/// Each rename re-scans the inputs, so the cost is the tree size times the number of case-only
-/// renames in one pass; an index by collision key is the upgrade if mass case renames show up.
-pub(crate) fn fold_case_only_dir_renames(
+///   A path held in conflict at either spelling is left to the ordinary reconcile.
+/// - A directory moved to a different path on one side; see [`next_dir_move`].
+///
+/// Each move re-scans the inputs, so the cost is the tree size times the number of directory moves
+/// in one pass; an index by collision key and uuid is the upgrade if mass moves show up.
+pub(crate) fn fold_dir_moves(
 	mode: super::SyncMode,
 	baseline: &mut HashMap<String, BaselineEntry>,
 	local: &mut HashMap<String, LocalNode>,
 	remote: &mut HashMap<String, RemoteNode>,
+	held: &HashSet<String>,
 ) -> Vec<SyncAction> {
 	let mut renames = Vec::new();
-	while let Some(action) = next_case_only_dir_rename(mode, baseline, local, remote) {
+	while let Some(action) = next_case_only_dir_rename(mode, baseline, local, remote)
+		.or_else(|| next_dir_move(mode, baseline, local, remote, held))
+	{
 		let (from, to) = action.endpoints();
-		if matches!(action, SyncAction::RenameRemoteDir { .. }) {
+		if matches!(action, SyncAction::MoveRemote { .. }) {
 			rekey_subtree(remote, from, to, |node, path| {
 				node.rel_path = path.to_string()
 			});
@@ -1448,8 +1445,7 @@ pub(crate) fn fold_case_only_dir_renames(
 	renames
 }
 
-/// The shallowest case-only directory rename left in the inputs (see
-/// [`fold_case_only_dir_renames`]).
+/// The shallowest case-only directory rename left in the inputs (see [`fold_dir_moves`]).
 fn next_case_only_dir_rename(
 	mode: super::SyncMode,
 	baseline: &HashMap<String, BaselineEntry>,
@@ -1505,18 +1501,201 @@ fn next_case_only_dir_rename(
 				}
 			};
 			Some(if rename_remote {
-				SyncAction::RenameRemoteDir {
+				SyncAction::MoveRemote {
 					from_path: remote_path.to_string(),
 					to_path: local_path.to_string(),
+					kind: NodeKind::Dir,
 					remote_uuid,
 				}
 			} else {
-				SyncAction::RenameLocalDir {
+				SyncAction::MoveLocal {
 					from_path: local_path.to_string(),
 					to_path: remote_path.to_string(),
+					kind: NodeKind::Dir,
 				}
 			})
 		})
+}
+
+/// The shallowest directory move to a DIFFERENT path left in the inputs (see [`fold_dir_moves`]).
+/// Two ways to find one, each tied to the side that moved:
+///
+/// - Pulled (a mode that pulls): a `Synced` baseline directory whose remote uuid the view now shows
+///   at another path, while the local directory still sits at the recorded path. The uuid is the
+///   server's own identity for the directory, so the match is certain. It becomes a `MoveLocal`.
+/// - Pushed (a mode that pushes): a `Synced` baseline directory gone locally, still on the remote
+///   under the recorded uuid at the recorded path, whose subtree reappears under exactly one new
+///   local directory ([`dir_signature`]: the same relative paths and kinds, and every file with the
+///   same hash and size). The subtree has to hold at least one file — a subtree of empty
+///   directories says nothing about identity — and a second match on either end is ambiguous. It
+///   becomes a `MoveRemote`. A move that also changed something inside does not match; it falls
+///   back to the per-path plan, which is correct and only slower.
+///
+/// Either is left to the per-path plan when any of these holds:
+/// - a baseline row at or under the source is not `Synced` (a held conflict, an adopted row);
+/// - the destination is taken, or has something under it, in the baseline or on the side being
+///   moved — compared by collision key, which is how the server dedups names;
+/// - one end lies under the other, or under a path the cache is holding (`held`);
+/// - the destination's parent directory does not exist yet on the side being moved: the moves run
+///   before the creates of the pass;
+/// - on the remote, the path a directory passes through between its re-parent and its rename is
+///   taken.
+fn next_dir_move(
+	mode: super::SyncMode,
+	baseline: &HashMap<String, BaselineEntry>,
+	local: &HashMap<String, LocalNode>,
+	remote: &HashMap<String, RemoteNode>,
+	held: &HashSet<String>,
+) -> Option<SyncAction> {
+	let mut sources: Vec<(&str, Uuid)> = baseline
+		.iter()
+		.filter(|(_, row)| row.kind == NodeKind::Dir && row.state == BaselineState::Synced)
+		.filter_map(|(path, row)| Some((path.as_str(), row.remote_uuid?)))
+		.collect();
+	if sources.is_empty() {
+		return None;
+	}
+	sources.sort_unstable_by_key(|(path, _)| (path.matches('/').count(), *path));
+	let remote_dir_at: HashMap<Uuid, &str> = remote
+		.iter()
+		.filter(|_| mode.pulls())
+		.filter(|(_, node)| node.kind == NodeKind::Dir)
+		.map(|(path, node)| (node.remote_uuid, path.as_str()))
+		.collect();
+	// The new local directories and what each holds, built only once a pushed move is possible.
+	let mut new_local_dirs: Option<Vec<(&str, Signature<'_>)>> = None;
+	let is_dir = |node: Option<&RemoteNode>| node.is_some_and(|n| n.kind == NodeKind::Dir);
+
+	sources.iter().find_map(|&(from, uuid)| {
+		let action = if local.get(from).is_some_and(|n| n.kind == NodeKind::Dir) {
+			let to = *remote_dir_at.get(&uuid)?;
+			let parent = parent_path(to);
+			let parent_exists =
+				parent.is_empty() || local.get(parent).is_some_and(|n| n.kind == NodeKind::Dir);
+			(parent_exists && !occupied(local, to)).then(|| SyncAction::MoveLocal {
+				from_path: from.to_string(),
+				to_path: to.to_string(),
+				kind: NodeKind::Dir,
+			})?
+		} else if mode.pushes()
+			&& remote
+				.get(from)
+				.is_some_and(|n| n.kind == NodeKind::Dir && n.remote_uuid == uuid)
+			&& !occupied(local, from)
+		{
+			let signature = baseline_dir_signature(baseline, from)?;
+			let new_dirs = new_local_dirs.get_or_insert_with(|| {
+				local
+					.iter()
+					.filter(|(path, node)| {
+						node.kind == NodeKind::Dir && !baseline.contains_key(path.as_str())
+					})
+					.filter_map(|(path, _)| Some((path.as_str(), dir_signature(local, path)?)))
+					.collect()
+			});
+			let mut matches = new_dirs.iter().filter(|(_, s)| *s == signature);
+			let (to, _) = matches.next()?;
+			if matches.next().is_some() {
+				return None;
+			}
+			// The same subtree vanished from somewhere else too: which of the two moved is a guess.
+			let twin = sources.iter().any(|&(other, _)| {
+				other != from
+					&& !local.contains_key(other)
+					&& baseline_dir_signature(baseline, other).as_ref() == Some(&signature)
+			});
+			let (to_parent, to_name) = (parent_path(to), leaf(to));
+			let via = match to_parent.is_empty() {
+				true => leaf(from).to_string(),
+				false => format!("{to_parent}/{}", leaf(from)),
+			};
+			let passes_free =
+				parent_path(from) == to_parent || leaf(from) == to_name || !occupied(remote, &via);
+			let parent_exists = to_parent.is_empty() || is_dir(remote.get(to_parent));
+			(!twin && parent_exists && passes_free && !occupied(remote, to)).then(|| {
+				SyncAction::MoveRemote {
+					from_path: from.to_string(),
+					to_path: to.to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: uuid,
+				}
+			})?
+		} else {
+			return None;
+		};
+		let (from_key, to_key) = (collision_key(from), collision_key(action.rel_path()));
+		let to = action.rel_path();
+		let clear = from_key != to_key
+			&& !is_under(&to_key, &from_key)
+			&& !is_under(&from_key, &to_key)
+			&& !occupied(baseline, to)
+			&& ![from, to].into_iter().any(|end| {
+				is_under_held_path(end, held) || held.iter().any(|path| is_under(path, end))
+			}) && baseline
+			.iter()
+			.all(|(path, row)| !is_under(path, from) || row.state == BaselineState::Synced);
+		clear.then_some(action)
+	})
+}
+
+/// What a directory holds, relative to it: every path under it with its kind and, for a file, its
+/// content hash and size. Two directories with equal signatures hold the same tree.
+type Signature<'a> = BTreeMap<&'a str, (NodeKind, Option<Blake3Hash>, u64)>;
+
+/// The signature of the local directory at `root`; `None` when a file under it has no hash.
+fn dir_signature<'a>(local: &'a HashMap<String, LocalNode>, root: &str) -> Option<Signature<'a>> {
+	local
+		.iter()
+		.filter(|(path, _)| is_under(path, root))
+		.map(|(path, node)| {
+			let (hash, size) = match node.kind {
+				NodeKind::File => (Some(node.content_hash?), node.size),
+				NodeKind::Dir => (None, 0),
+			};
+			Some((&path[root.len()..], (node.kind, hash, size)))
+		})
+		.collect()
+}
+
+/// The signature the baseline recorded for the directory at `root` — `None` when it cannot vouch
+/// for the subtree: a row under it that is not `Synced`, a file row without a hash or a size, or no
+/// file at all.
+fn baseline_dir_signature<'a>(
+	baseline: &'a HashMap<String, BaselineEntry>,
+	root: &str,
+) -> Option<Signature<'a>> {
+	let signature: Signature<'a> = baseline
+		.iter()
+		.filter(|(path, _)| is_under(path, root))
+		.map(|(path, row)| {
+			if row.state != BaselineState::Synced {
+				return None;
+			}
+			let (hash, size) = match row.kind {
+				NodeKind::File => (Some(row.content_hash?), row.size?),
+				NodeKind::Dir => (None, 0),
+			};
+			Some((&path[root.len()..], (row.kind, hash, size)))
+		})
+		.collect::<Option<_>>()?;
+	signature
+		.values()
+		.any(|(kind, ..)| *kind == NodeKind::File)
+		.then_some(signature)
+}
+
+/// Whether `map` holds `rel_path`, under any spelling, or anything under it.
+fn occupied<T>(map: &HashMap<String, T>, rel_path: &str) -> bool {
+	let key = collision_key(rel_path);
+	map.keys().any(|path| {
+		let path = collision_key(path);
+		path == key || is_under(&path, &key)
+	})
+}
+
+/// The last component of a `/`-joined relative path.
+fn leaf(rel_path: &str) -> &str {
+	rel_path.rsplit_once('/').map_or(rel_path, |(_, name)| name)
 }
 
 /// The parent part of a `/`-joined relative path (`""` at the top level).
@@ -1725,9 +1904,9 @@ pub(crate) fn reconcile(
 /// recursive (the server trashes a dir's whole subtree; a local delete quarantines it), so it must
 /// still wait until everything moving OUT of that directory has moved.
 ///
-/// A directory renamed in place runs before all of them: the rest of the plan already names its
-/// subtree by the new spelling (see [`fold_case_only_dir_renames`]).
-const PHASE_DIR_RENAME: u8 = 0;
+/// A directory move runs before all of them: the rest of the plan already names its subtree by the
+/// path it moves to (see [`fold_dir_moves`]).
+const PHASE_DIR_MOVE: u8 = 0;
 const PHASE_FILE_REPLACE_DELETE: u8 = 1;
 const PHASE_CREATE: u8 = 2;
 const PHASE_MOVE: u8 = 3;
@@ -1741,7 +1920,14 @@ const PHASE_CONFLICT: u8 = 7;
 /// cannot strand an item an earlier move/transfer still needs.
 fn action_phase(action: &SyncAction, create_targets: &std::collections::HashSet<String>) -> u8 {
 	match action {
-		SyncAction::RenameRemoteDir { .. } | SyncAction::RenameLocalDir { .. } => PHASE_DIR_RENAME,
+		SyncAction::MoveRemote {
+			kind: NodeKind::Dir,
+			..
+		}
+		| SyncAction::MoveLocal {
+			kind: NodeKind::Dir,
+			..
+		} => PHASE_DIR_MOVE,
 		// Replace-delete of a FILE: removing it strands nothing, so it goes first — the create at
 		// that path would otherwise hit the still-present old item.
 		SyncAction::DeleteLocal {
@@ -1860,7 +2046,13 @@ mod tests {
 	) -> Vec<SyncAction> {
 		let (mut baseline, mut local, mut remote) =
 			(baseline.clone(), local.clone(), remote.clone());
-		let mut actions = fold_case_only_dir_renames(mode, &mut baseline, &mut local, &mut remote);
+		let mut actions = fold_dir_moves(
+			mode,
+			&mut baseline,
+			&mut local,
+			&mut remote,
+			&HashSet::new(),
+		);
 		actions.extend(plan(mode, &baseline, &local, &remote));
 		actions
 	}
@@ -1915,9 +2107,10 @@ mod tests {
 			let (baseline, local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
 			assert_eq!(
 				plan_with_renames(mode, &baseline, &local, &remote),
-				vec![SyncAction::RenameRemoteDir {
+				vec![SyncAction::MoveRemote {
 					from_path: "Docs".to_string(),
 					to_path: "docs".to_string(),
+					kind: NodeKind::Dir,
 					remote_uuid: dir,
 				}],
 				"{mode:?}"
@@ -1938,9 +2131,10 @@ mod tests {
 			let (baseline, local, remote) = case_tree("Docs", "Docs", "docs", dir, file);
 			assert_eq!(
 				plan_with_renames(mode, &baseline, &local, &remote),
-				vec![SyncAction::RenameLocalDir {
+				vec![SyncAction::MoveLocal {
 					from_path: "Docs".to_string(),
 					to_path: "docs".to_string(),
+					kind: NodeKind::Dir,
 				}],
 				"{mode:?}"
 			);
@@ -1955,9 +2149,10 @@ mod tests {
 		let (baseline, local, remote) = case_tree("Docs", "Docs", "docs", dir, file);
 		assert_eq!(
 			plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote),
-			vec![SyncAction::RenameRemoteDir {
+			vec![SyncAction::MoveRemote {
 				from_path: "docs".to_string(),
 				to_path: "Docs".to_string(),
+				kind: NodeKind::Dir,
 				remote_uuid: dir,
 			}]
 		);
@@ -1987,9 +2182,10 @@ mod tests {
 		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
 		let (baseline, mut local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
 		local.insert("docs/a.txt".to_string(), local_file("docs/a.txt", [2; 32]));
-		let rename = SyncAction::RenameRemoteDir {
+		let rename = SyncAction::MoveRemote {
 			from_path: "Docs".to_string(),
 			to_path: "docs".to_string(),
+			kind: NodeKind::Dir,
 			remote_uuid: dir,
 		};
 		let mut ordered = vec![
@@ -2045,14 +2241,16 @@ mod tests {
 		assert_eq!(
 			plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote),
 			vec![
-				SyncAction::RenameRemoteDir {
+				SyncAction::MoveRemote {
 					from_path: "Docs".to_string(),
 					to_path: "docs".to_string(),
+					kind: NodeKind::Dir,
 					remote_uuid: outer,
 				},
-				SyncAction::RenameRemoteDir {
+				SyncAction::MoveRemote {
 					from_path: "docs/Sub".to_string(),
 					to_path: "docs/sub".to_string(),
+					kind: NodeKind::Dir,
 					remote_uuid: inner,
 				},
 			]
@@ -2066,9 +2264,457 @@ mod tests {
 		let (mut baseline, mut local, mut remote) = case_tree("Docs", "docs", "Docs", dir, file);
 		baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
 		assert!(
-			fold_case_only_dir_renames(SyncMode::TwoWay, &mut baseline, &mut local, &mut remote)
-				.is_empty()
+			fold_dir_moves(
+				SyncMode::TwoWay,
+				&mut baseline,
+				&mut local,
+				&mut remote,
+				&HashSet::new()
+			)
+			.is_empty()
 		);
+	}
+
+	/// The uuids of a synced directory tree `<dir>/a.txt`, `<dir>/sub/`, `<dir>/sub/b.txt`.
+	#[derive(Clone, Copy)]
+	struct TreeIds {
+		dir: Uuid,
+		a: Uuid,
+		sub: Uuid,
+		b: Uuid,
+	}
+
+	impl TreeIds {
+		fn new() -> Self {
+			Self {
+				dir: Uuid::new_v4(),
+				a: Uuid::new_v4(),
+				sub: Uuid::new_v4(),
+				b: Uuid::new_v4(),
+			}
+		}
+
+		fn paths(dir: &str) -> [String; 4] {
+			[
+				dir.to_string(),
+				format!("{dir}/a.txt"),
+				format!("{dir}/sub"),
+				format!("{dir}/sub/b.txt"),
+			]
+		}
+
+		fn baseline(self, dir: &str) -> Vec<(String, BaselineEntry)> {
+			let [d, a, s, b] = Self::paths(dir);
+			vec![
+				(d.clone(), base_dir(&d, self.dir)),
+				(a.clone(), base_file(&a, self.a, [1; 32])),
+				(s.clone(), base_dir(&s, self.sub)),
+				(b.clone(), base_file(&b, self.b, [2; 32])),
+			]
+		}
+
+		fn local(dir: &str) -> Vec<(String, LocalNode)> {
+			let [d, a, s, b] = Self::paths(dir);
+			vec![
+				(d.clone(), local_dir(&d)),
+				(a.clone(), local_file(&a, [1; 32])),
+				(s.clone(), local_dir(&s)),
+				(b.clone(), local_file(&b, [2; 32])),
+			]
+		}
+
+		fn remote(self, dir: &str) -> Vec<(String, RemoteNode)> {
+			let [d, a, s, b] = Self::paths(dir);
+			vec![
+				(d.clone(), remote_dir_node(&d, self.dir)),
+				(a.clone(), remote_file(&a, self.a, [1; 32])),
+				(s.clone(), remote_dir_node(&s, self.sub)),
+				(b.clone(), remote_file(&b, self.b, [2; 32])),
+			]
+		}
+	}
+
+	/// A pair holding the synced tree under `docs/` plus an empty synced `archive/`, with the local
+	/// side holding it under `local_dir` and the remote under `remote_dir`.
+	fn moved_tree(
+		ids: TreeIds,
+		local_at: &str,
+		remote_at: &str,
+	) -> (
+		HashMap<String, BaselineEntry>,
+		HashMap<String, LocalNode>,
+		HashMap<String, RemoteNode>,
+	) {
+		let archive = Uuid::new_v4();
+		let mut baseline: HashMap<_, _> = ids.baseline("docs").into_iter().collect();
+		baseline.insert("archive".to_string(), base_dir("archive", archive));
+		let mut local: HashMap<_, _> = TreeIds::local(local_at).into_iter().collect();
+		local.insert("archive".to_string(), local_dir("archive"));
+		let mut remote: HashMap<_, _> = ids.remote(remote_at).into_iter().collect();
+		remote.insert("archive".to_string(), remote_dir_node("archive", archive));
+		(baseline, local, remote)
+	}
+
+	fn dir_moves_in(actions: &[SyncAction]) -> Vec<&SyncAction> {
+		actions
+			.iter()
+			.filter(|action| {
+				matches!(
+					action,
+					SyncAction::MoveRemote {
+						kind: NodeKind::Dir,
+						..
+					} | SyncAction::MoveLocal {
+						kind: NodeKind::Dir,
+						..
+					}
+				)
+			})
+			.collect()
+	}
+
+	/// A directory the remote moved and renamed is ONE local move — children carried with it,
+	/// nothing downloaded, quarantined or re-created — in every mode that pulls.
+	#[test]
+	fn a_remote_dir_move_is_one_local_move() {
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::RemoteToLocal,
+			SyncMode::RemoteBackup,
+		] {
+			let (baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "archive/documents");
+			assert_eq!(
+				plan_with_renames(mode, &baseline, &local, &remote),
+				vec![SyncAction::MoveLocal {
+					from_path: "docs".to_string(),
+					to_path: "archive/documents".to_string(),
+					kind: NodeKind::Dir,
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// A directory the local side moved and renamed, with its subtree intact, is ONE remote move of
+	/// the same uuid in every mode that pushes.
+	#[test]
+	fn a_local_dir_move_is_one_remote_move_of_the_same_uuid() {
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::LocalToRemote,
+			SyncMode::LocalBackup,
+		] {
+			let ids = TreeIds::new();
+			let (baseline, local, remote) = moved_tree(ids, "archive/documents", "docs");
+			assert_eq!(
+				plan_with_renames(mode, &baseline, &local, &remote),
+				vec![SyncAction::MoveRemote {
+					from_path: "docs".to_string(),
+					to_path: "archive/documents".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: ids.dir,
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// Without the fold a local directory rename is the per-path plan: a new directory, a move per
+	/// file, and the old directory trashed. Pins what the fold replaces.
+	#[test]
+	fn a_local_dir_rename_planned_per_path_re_creates_the_directory() {
+		let ids = TreeIds::new();
+		let (baseline, local, remote) = moved_tree(ids, "documents", "docs");
+		let actions = plan(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(
+			actions.contains(&SyncAction::TrashRemote {
+				rel_path: "docs".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: ids.dir,
+			}),
+			"{actions:?}"
+		);
+		assert!(
+			actions.contains(&SyncAction::CreateRemoteDir {
+				rel_path: "documents".to_string(),
+			}),
+			"{actions:?}"
+		);
+	}
+
+	/// A local rename whose subtree also changed is not matched: an edited child, a child added and
+	/// a child left behind each break the signature, and the pass falls back to the per-path plan.
+	#[test]
+	fn a_local_dir_rename_with_a_changed_subtree_is_not_matched() {
+		type Change = fn(&mut HashMap<String, LocalNode>);
+		let changes: [(&str, Change); 4] = [
+			("a child edited", |local| {
+				local.insert(
+					"documents/a.txt".to_string(),
+					local_file("documents/a.txt", [9; 32]),
+				);
+			}),
+			("a child added", |local| {
+				local.insert(
+					"documents/new.txt".to_string(),
+					local_file("documents/new.txt", [9; 32]),
+				);
+			}),
+			("a child left behind", |local| {
+				local.remove("documents/sub/b.txt");
+				local.insert("b.txt".to_string(), local_file("b.txt", [2; 32]));
+			}),
+			("a child renamed", |local| {
+				let node = local.remove("documents/a.txt").unwrap();
+				local.insert(
+					"documents/renamed.txt".to_string(),
+					LocalNode {
+						rel_path: "documents/renamed.txt".to_string(),
+						..node
+					},
+				);
+			}),
+		];
+		for (label, change) in changes {
+			let (baseline, mut local, remote) = moved_tree(TreeIds::new(), "documents", "docs");
+			change(&mut local);
+			let actions = plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote);
+			assert!(dir_moves_in(&actions).is_empty(), "{label}: {actions:?}");
+		}
+	}
+
+	/// A subtree that holds no file at all says nothing about identity: two empty directories are
+	/// not a move.
+	#[test]
+	fn a_local_rename_of_a_subtree_without_files_is_not_matched() {
+		let (dir, sub) = (Uuid::new_v4(), Uuid::new_v4());
+		let baseline = map(vec![
+			("old", base_dir("old", dir)),
+			("old/sub", base_dir("old/sub", sub)),
+		]);
+		let remote = map(vec![
+			("old", remote_dir_node("old", dir)),
+			("old/sub", remote_dir_node("old/sub", sub)),
+		]);
+		let local = map(vec![
+			("new", local_dir("new")),
+			("new/sub", local_dir("new/sub")),
+		]);
+		let actions = plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(dir_moves_in(&actions).is_empty(), "{actions:?}");
+	}
+
+	/// Two candidates on either end make the match a guess, so neither is taken.
+	#[test]
+	fn an_ambiguous_local_dir_rename_is_not_matched() {
+		// One vanished tree, two new copies of it.
+		let (baseline, mut local, remote) = moved_tree(TreeIds::new(), "documents", "docs");
+		local.extend(TreeIds::local("copy"));
+		let actions = plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(dir_moves_in(&actions).is_empty(), "two new: {actions:?}");
+
+		// Two vanished trees with the same content, one new copy.
+		let (mut baseline, local, mut remote) = moved_tree(TreeIds::new(), "documents", "docs");
+		let twin = TreeIds::new();
+		baseline.extend(twin.baseline("twin"));
+		remote.extend(twin.remote("twin"));
+		let actions = plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(
+			dir_moves_in(&actions).is_empty(),
+			"two vanished: {actions:?}"
+		);
+	}
+
+	/// A destination already taken — on the side being moved, or in the baseline — is not moved
+	/// onto.
+	#[test]
+	fn a_dir_move_onto_an_existing_path_is_not_planned() {
+		// Push: the remote already holds another directory under the new name. The tree is not
+		// moved onto it; what lands inside it is the per-path plan's business (its `sub/` may still
+		// move in as a directory of its own).
+		let (baseline, local, mut remote) = moved_tree(TreeIds::new(), "documents", "docs");
+		remote.insert(
+			"documents".to_string(),
+			remote_dir_node("documents", Uuid::new_v4()),
+		);
+		let actions = plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(
+			!dir_moves_in(&actions)
+				.iter()
+				.any(|action| action.rel_path() == "documents"),
+			"push: {actions:?}"
+		);
+
+		// Pull: the local side already holds a directory where the remote moved it.
+		let (baseline, mut local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		local.insert("documents".to_string(), local_dir("documents"));
+		let actions = plan_with_renames(SyncMode::RemoteToLocal, &baseline, &local, &remote);
+		assert!(
+			moves_onto(&actions, "documents").is_none(),
+			"pull: {actions:?}"
+		);
+
+		// Pull: the baseline still tracks something at the destination.
+		let (mut baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		baseline.insert(
+			"documents/x.txt".to_string(),
+			base_file("documents/x.txt", Uuid::new_v4(), [3; 32]),
+		);
+		let actions = plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			moves_onto(&actions, "documents").is_none(),
+			"baseline: {actions:?}"
+		);
+	}
+
+	/// The directory move in `actions` whose destination is `to`, if any.
+	fn moves_onto<'a>(actions: &'a [SyncAction], to: &str) -> Option<&'a SyncAction> {
+		dir_moves_in(actions)
+			.into_iter()
+			.find(|action| action.rel_path() == to)
+	}
+
+	/// A move into a directory that does not exist on the moved side yet is left to the per-path
+	/// plan: the directory moves run before the creates.
+	#[test]
+	fn a_dir_move_into_a_new_parent_is_not_planned() {
+		let (baseline, local, remote) = moved_tree(TreeIds::new(), "fresh/documents", "docs");
+		let actions = plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(dir_moves_in(&actions).is_empty(), "push: {actions:?}");
+
+		let (baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "fresh/documents");
+		let actions = plan_with_renames(SyncMode::RemoteToLocal, &baseline, &local, &remote);
+		assert!(dir_moves_in(&actions).is_empty(), "pull: {actions:?}");
+	}
+
+	/// A conflict held anywhere in the subtree keeps the directory where it is.
+	#[test]
+	fn a_dir_holding_a_conflict_is_not_moved() {
+		let (mut baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		baseline.get_mut("docs/sub/b.txt").unwrap().state = BaselineState::Conflicted;
+		let actions = plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(dir_moves_in(&actions).is_empty(), "{actions:?}");
+	}
+
+	/// A path the cache is holding at either end keeps the directory where it is.
+	#[test]
+	fn a_dir_under_a_held_remote_path_is_not_moved() {
+		let (mut baseline, mut local, mut remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		let held = HashSet::from(["documents/sub/b.txt".to_string()]);
+		assert!(
+			fold_dir_moves(
+				SyncMode::TwoWay,
+				&mut baseline,
+				&mut local,
+				&mut remote,
+				&held
+			)
+			.is_empty()
+		);
+	}
+
+	/// A remote move whose local subtree was edited meanwhile is still one move: the edit is
+	/// planned at the new path, after the move.
+	#[test]
+	fn a_child_edited_under_a_remotely_moved_dir_is_pushed_at_its_new_path() {
+		let (baseline, mut local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		local.insert("docs/a.txt".to_string(), local_file("docs/a.txt", [9; 32]));
+		assert_eq!(
+			plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![
+				SyncAction::MoveLocal {
+					from_path: "docs".to_string(),
+					to_path: "documents".to_string(),
+					kind: NodeKind::Dir,
+				},
+				SyncAction::UploadFile {
+					rel_path: "documents/a.txt".to_string(),
+				},
+			]
+		);
+	}
+
+	/// A move inside a moved directory — the remote moved `docs/` and renamed `sub/` in it — is the
+	/// outer move first, then the inner one at the outer's new path, and nothing for the files.
+	#[test]
+	fn nested_dir_moves_fold_the_outer_one_first() {
+		let ids = TreeIds::new();
+		let (baseline, local, mut remote) = moved_tree(ids, "docs", "documents");
+		let node = |path: &str| RemoteNode {
+			rel_path: path.to_string(),
+			..remote["documents/sub/b.txt"].clone()
+		};
+		let b = node("documents/renamed/b.txt");
+		remote.remove("documents/sub/b.txt");
+		remote.remove("documents/sub");
+		remote.insert("documents/renamed/b.txt".to_string(), b);
+		remote.insert(
+			"documents/renamed".to_string(),
+			remote_dir_node("documents/renamed", ids.sub),
+		);
+		assert_eq!(
+			plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![
+				SyncAction::MoveLocal {
+					from_path: "docs".to_string(),
+					to_path: "documents".to_string(),
+					kind: NodeKind::Dir,
+				},
+				SyncAction::MoveLocal {
+					from_path: "documents/sub".to_string(),
+					to_path: "documents/renamed".to_string(),
+					kind: NodeKind::Dir,
+				},
+			]
+		);
+	}
+
+	/// A pushed move that re-parented the directory and then failed to rename it leaves the remote at
+	/// the new parent under the old name. With the rows recorded there, the next pass plans the rename
+	/// alone; with the rows still at the source, it finds the directory at neither end and plans no
+	/// move at all — which is why apply records the half-done step.
+	#[test]
+	fn a_half_done_local_dir_move_is_finished_by_the_next_pass() {
+		let ids = TreeIds::new();
+		let archive = Uuid::new_v4();
+		let tree = |baseline_at: &str| {
+			let mut baseline: HashMap<_, _> = ids.baseline(baseline_at).into_iter().collect();
+			baseline.insert("archive".to_string(), base_dir("archive", archive));
+			let mut local: HashMap<_, _> =
+				TreeIds::local("archive/documents").into_iter().collect();
+			local.insert("archive".to_string(), local_dir("archive"));
+			let mut remote: HashMap<_, _> = ids.remote("archive/docs").into_iter().collect();
+			remote.insert("archive".to_string(), remote_dir_node("archive", archive));
+			(baseline, local, remote)
+		};
+
+		let (baseline, local, remote) = tree("archive/docs");
+		assert_eq!(
+			plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![SyncAction::MoveRemote {
+				from_path: "archive/docs".to_string(),
+				to_path: "archive/documents".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: ids.dir,
+			}]
+		);
+
+		let (baseline, local, remote) = tree("docs");
+		let actions = plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(dir_moves_in(&actions).is_empty(), "{actions:?}");
+	}
+
+	/// A moved directory is re-parented before it is renamed, so the name it has in between must be
+	/// free on the remote too.
+	#[test]
+	fn a_local_dir_move_whose_intermediate_name_is_taken_is_not_planned() {
+		let (baseline, local, mut remote) = moved_tree(TreeIds::new(), "archive/documents", "docs");
+		remote.insert(
+			"archive/docs".to_string(),
+			remote_dir_node("archive/docs", Uuid::new_v4()),
+		);
+		let actions = plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		assert!(dir_moves_in(&actions).is_empty(), "{actions:?}");
 	}
 
 	fn ms(millis: i64) -> DateTime<Utc> {
@@ -2619,6 +3265,7 @@ mod tests {
 			vec![SyncAction::MoveRemote {
 				from_path: "a.txt".to_string(),
 				to_path: "b.txt".to_string(),
+				kind: NodeKind::File,
 				remote_uuid: uuid,
 			}],
 			"a local move re-parents the remote item, not trash + re-upload"
@@ -2637,6 +3284,7 @@ mod tests {
 			vec![SyncAction::MoveLocal {
 				from_path: "a.txt".to_string(),
 				to_path: "b.txt".to_string(),
+				kind: NodeKind::File,
 			}],
 			"a remote move renames the local file, not delete + re-download"
 		);
@@ -2718,6 +3366,7 @@ mod tests {
 				SyncAction::MoveLocal {
 					from_path: "a.txt".to_string(),
 					to_path: "b.txt".to_string(),
+					kind: NodeKind::File,
 				},
 				SyncAction::DownloadFile {
 					rel_path: "b.txt".to_string(),
@@ -2756,6 +3405,7 @@ mod tests {
 			vec![SyncAction::MoveLocal {
 				from_path: "a.txt".to_string(),
 				to_path: "b.txt".to_string(),
+				kind: NodeKind::File,
 			}],
 			"the rename must be carried across, with nothing else planned at either path"
 		);
@@ -2985,6 +3635,7 @@ mod tests {
 				SyncAction::MoveLocal {
 					from_path: "a.txt".to_string(),
 					to_path: "b.txt".to_string(),
+					kind: NodeKind::File,
 				},
 				SyncAction::DownloadFile {
 					rel_path: "b.txt".to_string(),
@@ -3007,6 +3658,7 @@ mod tests {
 			vec![SyncAction::MoveRemote {
 				from_path: "a.txt".to_string(),
 				to_path: "b.txt".to_string(),
+				kind: NodeKind::File,
 				remote_uuid: uuid,
 			}],
 			"a backup destination follows a source rename instead of accumulating both names"
@@ -3021,6 +3673,7 @@ mod tests {
 			vec![SyncAction::MoveLocal {
 				from_path: "a.txt".to_string(),
 				to_path: "b.txt".to_string(),
+				kind: NodeKind::File,
 			}]
 		);
 	}
@@ -3530,6 +4183,7 @@ mod tests {
 				SyncAction::MoveRemote {
 					from_path: "old/x.txt".to_string(),
 					to_path: "new/x.txt".to_string(),
+					kind: NodeKind::File,
 					remote_uuid: file_uuid,
 				},
 				SyncAction::TrashRemote {
@@ -3590,6 +4244,7 @@ mod tests {
 				SyncAction::MoveRemote {
 					from_path: "box/inner.txt".to_string(),
 					to_path: "item/inner.txt".to_string(),
+					kind: NodeKind::File,
 					remote_uuid: inner_uuid,
 				},
 				// Only now may the old DIRECTORY be trashed; the upload of the new file `box`
@@ -3829,6 +4484,7 @@ mod tests {
 			vec![SyncAction::MoveLocal {
 				from_path: "b.txt".to_string(),
 				to_path: "a.txt".to_string(),
+				kind: NodeKind::File,
 			}]
 		);
 	}
@@ -3916,6 +4572,7 @@ mod tests {
 			SyncAction::MoveRemote {
 				from_path: "x".into(),
 				to_path: "y".into(),
+				kind: NodeKind::File,
 				remote_uuid: Uuid::nil(),
 			}
 			.to_event(),
