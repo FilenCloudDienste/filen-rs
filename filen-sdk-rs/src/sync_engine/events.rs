@@ -7,6 +7,8 @@
 //! [`SyncEngine::sync_once_observed`](super::SyncEngine::sync_once_observed) (one-shot) or
 //! [`SyncEngine::watch_observed`](super::SyncEngine::watch_observed) (continuous).
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use super::{SyncMode, apply::SyncReport};
 
 /// A single event from a sync pass, delivered to a [`SyncObserver`] in the order it happens.
@@ -79,4 +81,65 @@ pub enum SyncEvent {
 ///
 /// One-shot callers use [`SyncEngine::sync_once_observed`](super::SyncEngine::sync_once_observed),
 /// which takes any `&mut (dyn FnMut(SyncEvent) + Send)` (e.g. `&mut |event| { … }`).
+///
+/// An observer that panics does not take the pass down with it: the panic is caught at the call,
+/// logged once, and that observer receives nothing more for the rest of the pass, which carries on
+/// and still returns its report. The next pass calls it again. (The panic still reaches the process's
+/// panic hook, and under `panic = "abort"` there is nothing to catch.)
 pub type SyncObserver = Box<dyn FnMut(SyncEvent) + Send + 'static>;
+
+/// Wrap `observer` so a panic inside it stays inside it: caught, logged once, and the observer is
+/// skipped from then on. A pass calls its observer while holding the drive-write lock and between
+/// the steps that keep the baseline and the two trees in step, so an unwind out of it could leave a
+/// half-applied action behind; the pass is worth more than the observer's remaining events.
+pub(super) fn contain_panics(
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> impl FnMut(SyncEvent) + Send + '_ {
+	let mut panicked = false;
+	move |event| {
+		if panicked {
+			return;
+		}
+		if catch_unwind(AssertUnwindSafe(|| observer(event))).is_err() {
+			panicked = true;
+			tracing::error!(
+				"a sync observer panicked; it receives no further events for the rest of this pass"
+			);
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A panic inside the observer is caught, and the observer is never called again by that
+	/// wrapper; an observer that did not panic sees every event.
+	#[test]
+	fn a_panicking_observer_is_contained_and_then_skipped() {
+		let mut calls = 0usize;
+		let mut observer = |_event: SyncEvent| {
+			calls += 1;
+			if calls == 2 {
+				panic!("observer failure");
+			}
+		};
+		{
+			let mut contained = contain_panics(&mut observer);
+			for actions in 0..5 {
+				contained(SyncEvent::Planned { actions });
+			}
+		}
+		assert_eq!(calls, 2, "the observer was called again after it panicked");
+
+		let mut seen = Vec::new();
+		let mut recorder = |event: SyncEvent| seen.push(event);
+		{
+			let mut contained = contain_panics(&mut recorder);
+			for actions in 0..3 {
+				contained(SyncEvent::Planned { actions });
+			}
+		}
+		assert_eq!(seen.len(), 3);
+	}
+}
