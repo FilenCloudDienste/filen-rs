@@ -20,6 +20,9 @@ use super::{SyncMode, apply::SyncReport};
 /// [`ActionFailed`](Self::ActionFailed)) → [`PassCompleted`](Self::PassCompleted). A pass the pair's
 /// pause cut short, or that could not take the drive lock, reports one
 /// [`Interrupted`](Self::Interrupted) before it completes.
+///
+/// A pass that fails outright ends with [`PassFailed`](Self::PassFailed) instead of
+/// `PassCompleted` — with or without a `PassStarted` before it, depending on how far it got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
 	/// A pass began (after the read-only prepare), in this mode.
@@ -73,6 +76,12 @@ pub enum SyncEvent {
 	AdoptedBaseline { rel_path: String },
 	/// The pass finished; carries the full [`SyncReport`].
 	PassCompleted { report: SyncReport },
+	/// The pass failed outright, so there is no report: `error` is the rendering of the error
+	/// [`sync_once_observed`](super::SyncEngine::sync_once_observed) returns (an unknown or
+	/// removed pair, an unreadable baseline, a sync root the server no longer has). The last event
+	/// of that pass; no [`PassCompleted`](Self::PassCompleted) follows. Failures of single actions
+	/// are [`ActionFailed`](Self::ActionFailed) instead.
+	PassFailed { error: String },
 }
 
 /// A sink for [`SyncEvent`]s, owned for the lifetime of a continuous
