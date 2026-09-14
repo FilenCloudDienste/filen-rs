@@ -3,7 +3,9 @@
 //! re-reconciles to the same plan.
 //!
 //! Each action is best-effort: a failure is recorded in the [`SyncReport`] and the pass continues,
-//! since the actions are independent and the next pass re-plans from truth. Local deletions move
+//! since the actions are independent and the next pass re-plans from truth. The exception is a
+//! failure no transfer to that side can get past — a full local disk or a full account — which
+//! stops the pass starting any more of those (see [`SyncReport::halted`]). Local deletions move
 //! to the pair's quarantine dir (recoverable); remote deletions go to Filen trash. The local mtime
 //! written to the baseline after a download is read back from disk (not the value we asked for) so
 //! the scanner's fast-path stays stable.
@@ -11,7 +13,10 @@
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use chrono::{DateTime, Utc};
@@ -25,8 +30,8 @@ use super::{
 	events::SyncEvent,
 	guard::GuardReason,
 	outcome::{
-		PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, RefuseReason,
-		UnsyncablePath,
+		HaltReason, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
+		RefuseReason, UnsyncablePath,
 	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths, is_under},
@@ -82,7 +87,8 @@ pub struct SyncReport {
 	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions). It changes if the
 	/// batch changes, so an approval can never leak onto a different set of deletions.
 	pub deletion_token: Option<String>,
-	/// Per-action failures (the pass continues past them).
+	/// Per-action failures (the pass continues past them; one that ran out of room also holds back
+	/// the transfers behind it, see [`halted`](Self::halted)).
 	pub errors: Vec<String>,
 	/// The pair is PAUSED (see [`SyncEngine::pause_pair`](super::SyncEngine::pause_pair)): the pass
 	/// planned nothing, wrote no baseline row and applied nothing, so every field above is at its
@@ -107,6 +113,20 @@ pub struct SyncReport {
 	/// watch loop must count the pass as failed rather than healthy. The error itself is the entry
 	/// in `errors` that starts with [`LOCK_FAILURE`].
 	pub(super) lock_failed: bool,
+	/// Set when a side ran out of room during the pass: the local disk or the account, whichever
+	/// was found full first. The action that ran into it — and any transfer already running that
+	/// did too — is in [`errors`](Self::errors) but counts against no path's failure streak, since
+	/// the path itself is not what is broken. Each side found full has its own line there, so a
+	/// pass that fills both says so.
+	///
+	/// From then on the pass starts no further transfer that WRITES to a full side (see
+	/// [`HaltReason::held_transfers`]): no upload once the account is full, no download once the
+	/// disk is. Everything else still runs — the other direction's transfers, directory creates,
+	/// moves and deletions — so a full account does not stop a two-way pair pulling the other
+	/// devices' changes, and deletions that free room are not held behind the transfers that need
+	/// it. [`interrupted`](Self::interrupted) does not count the held transfers: the next pass
+	/// re-plans them. A watch treats such a pass as a failed one and backs off before the next.
+	pub halted: Option<HaltReason>,
 	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
 	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
 	/// ones (a refusal, a lock that could not be taken) that belong to no path.
@@ -361,6 +381,8 @@ pub(super) async fn apply(
 	let mut lease = Lease::Unheld;
 
 	let mut writes = PassWrites::default();
+	// The sides found full so far: each holds back the transfers that write to it.
+	let full = FullSides::default();
 	for (action, &releasable) in pre.iter().zip(pre_release) {
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
@@ -373,7 +395,7 @@ pub(super) async fn apply(
 				}
 				None => return note_interrupted(report, total - applied, observer),
 			}
-			apply_serial(
+			if let Some(reason) = apply_serial(
 				&ctx,
 				action,
 				&files,
@@ -382,7 +404,10 @@ pub(super) async fn apply(
 				report,
 				observer,
 			)
-			.await;
+			.await
+			{
+				full.note(reason);
+			}
 		}
 		applied += 1;
 	}
@@ -404,6 +429,15 @@ pub(super) async fn apply(
 			while in_flight.len() < concurrency
 				&& let Some(&(action, releasable)) = pending.peek()
 			{
+				// Once an action finds a side full, the transfers already running finish, and the ones
+				// not started yet that write to that side never start (they record nothing). Held back
+				// for want of room: carried out as far as this pass can, owed to no pause.
+				if full.holds(action) {
+					pending.next();
+					applied += 1;
+					tracing::debug!("apply: {} held, its side is full", action.describe());
+					continue;
+				}
 				let now = Instant::now();
 				if remote_in_flight == 0 {
 					lease.release_if_spent(&ctx.lock_budget, releasable, now);
@@ -469,7 +503,9 @@ pub(super) async fn apply(
 						rel_path: action.rel_path().to_string(),
 						error: error.to_string(),
 					});
-					note_failure(report, action.rel_path(), &error);
+					if let Some(reason) = note_failure(report, action.rel_path(), &error) {
+						full.note(reason);
+					}
 				}
 			}
 		}
@@ -1033,6 +1069,7 @@ fn is_transfer(action: &SyncAction) -> bool {
 }
 
 /// Apply one action serially: emit its in-progress event, run it, and record success/failure.
+/// Returns the side its failure found full, if it did (see [`note_failure`]).
 async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
@@ -1041,44 +1078,126 @@ async fn apply_serial(
 	writes: &mut PassWrites,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
-) {
+) -> Option<HaltReason> {
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
-	let result = apply_one(ctx, action, files, dir_by_path, writes, report).await;
-	if result.is_ok() {
-		writes.note(action);
-	}
-	if let Err(error) = result {
-		tracing::debug!("apply: {} FAILED — {error}", action.describe());
-		if let SyncAction::MoveRemote {
-			to_path,
-			kind: NodeKind::Dir,
-			..
+	let error = match apply_one(ctx, action, files, dir_by_path, writes, report).await {
+		Ok(()) => {
+			writes.note(action);
+			return None;
 		}
-		| SyncAction::MoveLocal {
-			to_path,
-			kind: NodeKind::Dir,
-			..
-		} = action
-		{
-			writes.failed_dir_moves.push(to_path.clone());
-		}
-		observer(SyncEvent::ActionFailed {
-			rel_path: action.rel_path().to_string(),
-			error: error.to_string(),
-		});
-		note_failure(report, action.rel_path(), &error);
+		Err(error) => error,
+	};
+	tracing::debug!("apply: {} FAILED — {error}", action.describe());
+	if let SyncAction::MoveRemote {
+		to_path,
+		kind: NodeKind::Dir,
+		..
 	}
+	| SyncAction::MoveLocal {
+		to_path,
+		kind: NodeKind::Dir,
+		..
+	} = action
+	{
+		writes.failed_dir_moves.push(to_path.clone());
+	}
+	observer(SyncEvent::ActionFailed {
+		rel_path: action.rel_path().to_string(),
+		error: error.to_string(),
+	});
+	note_failure(report, action.rel_path(), &error)
 }
 
 /// Record one action failure: the human-readable line AND the `(path, error)` pair the engine's
 /// per-path failure counter consumes, so a path that fails every pass is eventually reported as
 /// unsyncable instead of retried forever.
-fn note_failure(report: &mut SyncReport, rel_path: &str, error: &crate::Error) {
+///
+/// A failure that says a side has no room left (see [`pass_halt`]) is not the path's fault and
+/// counts against no streak: it sets [`halted`](SyncReport::halted) instead (if nothing did yet),
+/// with one line per side saying so, and is returned so the caller holds back the transfers that
+/// write there.
+fn note_failure(
+	report: &mut SyncReport,
+	rel_path: &str,
+	error: &crate::Error,
+) -> Option<HaltReason> {
 	report.errors.push(format!("{rel_path}: {error}"));
-	report
-		.failed_paths
-		.push((rel_path.to_string(), error.to_string()));
+	let Some(reason) = pass_halt(error) else {
+		report
+			.failed_paths
+			.push((rel_path.to_string(), error.to_string()));
+		return None;
+	};
+	let line = reason.held_line();
+	if !report.errors.contains(&line) {
+		report.errors.push(line);
+	}
+	report.halted.get_or_insert(reason);
+	Some(reason)
+}
+
+/// The sides of a pass found full so far, read by the transfers as they start. Atomics, because
+/// those run concurrently while the apply loop records their failures.
+#[derive(Default)]
+struct FullSides {
+	local: AtomicBool,
+	remote: AtomicBool,
+}
+
+impl FullSides {
+	fn note(&self, reason: HaltReason) {
+		match reason {
+			HaltReason::LocalStorageFull => &self.local,
+			HaltReason::RemoteStorageFull => &self.remote,
+		}
+		.store(true, Ordering::Relaxed);
+	}
+
+	/// Whether `action` writes to a side found full, and so must not start: an upload once the
+	/// account is full, a download once the local disk is.
+	fn holds(&self, action: &SyncAction) -> bool {
+		match action {
+			SyncAction::UploadFile { .. } => self.remote.load(Ordering::Relaxed),
+			SyncAction::DownloadFile { .. } => self.local.load(Ordering::Relaxed),
+			_ => false,
+		}
+	}
+}
+
+/// Whether `error` means a side of this pass has no room left: the local disk, or the account. Looked for along the whole error chain, including inside an `io::Error` wrapping
+/// another error — which is how the upload writer hands on a server refusal.
+fn pass_halt(error: &crate::Error) -> Option<HaltReason> {
+	let mut next: Option<&(dyn std::error::Error + 'static)> = Some(error);
+	while let Some(current) = next {
+		if current
+			.downcast_ref::<crate::Error>()
+			.is_some_and(|sdk| sdk.kind() == crate::ErrorKind::MaxStorageReached)
+			|| matches!(
+				current.downcast_ref::<filen_types::error::ResponseError>(),
+				Some(filen_types::error::ResponseError::ApiError { code: Some(code), .. })
+					if code == "max_storage_reached"
+			) {
+			return Some(HaltReason::RemoteStorageFull);
+		}
+		next = match current.downcast_ref::<std::io::Error>() {
+			Some(io)
+				if matches!(
+					io.kind(),
+					std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+				) =>
+			{
+				return Some(HaltReason::LocalStorageFull);
+			}
+			// `io::Error::source` skips the error it wraps and reports that error's own source, so
+			// step into the wrapped one directly.
+			Some(io) => io
+				.get_ref()
+				.map(|inner| inner as &(dyn std::error::Error + 'static)),
+			None => current.source(),
+		};
+	}
+	None
 }
 
 /// Whether one transfer ran at all — the pass can be cancelled before it starts, or while its
@@ -1091,7 +1210,7 @@ enum Transfer {
 	/// top of a version this pass never saw. Another client edited the file between the snapshot
 	/// this pass read and our upload, and our bytes buried it; the conflict says so.
 	Overwrote(Box<PlannedConflict>),
-	/// The pass was cancelled: it never started, or it was dropped mid-flight. Either way it
+	/// The pass was cancelled: it never started, or a cancel dropped it mid-flight. Either way it
 	/// recorded nothing, and the next pass re-plans it.
 	Interrupted,
 }
@@ -2275,6 +2394,160 @@ mod tests {
 				now
 			));
 		}
+	}
+
+	fn over_quota() -> crate::Error {
+		filen_types::error::ResponseError::ApiError {
+			message: None,
+			code: Some("max_storage_reached".to_string()),
+		}
+		.into()
+	}
+
+	fn io_kind(kind: std::io::ErrorKind) -> std::io::Error {
+		std::io::Error::from(kind)
+	}
+
+	/// A full disk or a full account is found wherever the SDK put it: straight from a local write
+	/// (`?` on an io result, or the engine's own `io_err`), from a server response, and inside the
+	/// `io::Error` the upload writer wraps a server refusal in. Anything else stays a per-path
+	/// failure.
+	#[test]
+	fn storage_full_is_found_anywhere_in_the_error_chain() {
+		use std::io::ErrorKind as Io;
+
+		let local = Some(HaltReason::LocalStorageFull);
+		assert_eq!(
+			pass_halt(&crate::Error::from(io_kind(Io::StorageFull))),
+			local
+		);
+		assert_eq!(pass_halt(&io_err(io_kind(Io::StorageFull))), local);
+		assert_eq!(pass_halt(&io_err(io_kind(Io::QuotaExceeded))), local);
+		assert_eq!(
+			pass_halt(&crate::Error::from(std::io::Error::other(io_err(io_kind(
+				Io::StorageFull
+			))))),
+			local
+		);
+
+		let remote = Some(HaltReason::RemoteStorageFull);
+		assert_eq!(pass_halt(&over_quota()), remote);
+		assert_eq!(pass_halt(&over_quota().with_context("uploading")), remote);
+		assert_eq!(
+			pass_halt(&crate::Error::from(std::io::Error::other(over_quota()))),
+			remote,
+			"the upload writer hands a failed chunk on inside an io::Error"
+		);
+		assert_eq!(
+			pass_halt(&crate::Error::custom_with_source(
+				crate::ErrorKind::Server,
+				filen_types::error::ResponseError::ApiError {
+					message: None,
+					code: Some("max_storage_reached".to_string()),
+				},
+				None::<String>,
+			)),
+			remote,
+			"the server's code decides, whatever kind it was wrapped under"
+		);
+
+		assert_eq!(
+			pass_halt(&crate::Error::from(io_kind(Io::PermissionDenied))),
+			None
+		);
+		assert_eq!(
+			pass_halt(&crate::Error::from(std::io::Error::other("disk on fire"))),
+			None
+		);
+		assert_eq!(
+			pass_halt(
+				&filen_types::error::ResponseError::ApiError {
+					message: None,
+					code: Some("file_not_found".to_string()),
+				}
+				.into()
+			),
+			None
+		);
+		assert_eq!(pass_halt(&internal("boom")), None);
+	}
+
+	/// A storage-full failure halts the pass once, with one line saying why, and counts against no
+	/// path; an ordinary failure next to it still counts against its own.
+	#[test]
+	fn a_storage_full_failure_halts_the_pass_instead_of_counting_against_its_path() {
+		let mut report = SyncReport::default();
+		note_failure(
+			&mut report,
+			"locked.txt",
+			&crate::Error::from(io_kind(std::io::ErrorKind::PermissionDenied)),
+		);
+		note_failure(
+			&mut report,
+			"big.bin",
+			&io_err(io_kind(std::io::ErrorKind::StorageFull)),
+		);
+		note_failure(
+			&mut report,
+			"again.bin",
+			&io_err(io_kind(std::io::ErrorKind::StorageFull)),
+		);
+		note_failure(&mut report, "other.bin", &over_quota());
+
+		assert_eq!(report.halted, Some(HaltReason::LocalStorageFull));
+		assert_eq!(
+			report
+				.failed_paths
+				.iter()
+				.map(|(path, _)| path.as_str())
+				.collect::<Vec<_>>(),
+			["locked.txt"],
+			"only the failure that is the path's own counts towards a streak"
+		);
+		for reason in [HaltReason::LocalStorageFull, HaltReason::RemoteStorageFull] {
+			assert_eq!(
+				report
+					.errors
+					.iter()
+					.filter(|line| **line == reason.held_line())
+					.count(),
+				1,
+				"one line per full side: {:?}",
+				report.errors
+			);
+		}
+		assert_eq!(report.errors.len(), 6, "{:?}", report.errors);
+		assert_eq!(report.interrupted, 0);
+	}
+
+	/// A full side holds back only the transfers that write to it: a full account stops uploads and
+	/// lets downloads (and every non-transfer action) through, a full disk the reverse.
+	#[test]
+	fn a_full_side_holds_only_the_transfers_that_write_to_it() {
+		let upload = SyncAction::UploadFile {
+			rel_path: "up.bin".to_string(),
+		};
+		let download = SyncAction::DownloadFile {
+			rel_path: "down.bin".to_string(),
+			remote_uuid: Uuid::new_v4(),
+		};
+		let trash = SyncAction::TrashRemote {
+			rel_path: "gone.bin".to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Uuid::new_v4(),
+		};
+		let actions = [&upload, &download, &trash];
+		let held = |full: &FullSides| actions.map(|action| full.holds(action));
+
+		let full = FullSides::default();
+		assert_eq!(held(&full), [false, false, false]);
+		full.note(HaltReason::RemoteStorageFull);
+		assert_eq!(held(&full), [true, false, false]);
+		let full = FullSides::default();
+		full.note(HaltReason::LocalStorageFull);
+		assert_eq!(held(&full), [false, true, false]);
+		full.note(HaltReason::RemoteStorageFull);
+		assert_eq!(held(&full), [true, true, false]);
 	}
 
 	fn temp_dir() -> PathBuf {

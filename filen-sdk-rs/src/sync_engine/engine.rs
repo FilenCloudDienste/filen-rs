@@ -2663,8 +2663,9 @@ impl SyncEngine {
 		}
 		// A pass cut short by a cancel cannot tell which of its actions ran, and an action that
 		// never ran proves nothing about the path: clearing its streak would hand a permanently
-		// broken path a fresh set of retries every time someone pauses. Only the failures count.
-		if report.interrupted == 0 {
+		// broken path a fresh set of retries every time someone pauses. Only the failures count. A
+		// pass that found a side full held back transfers the same way.
+		if report.interrupted == 0 && report.halted.is_none() {
 			for path in attempted
 				.iter()
 				.filter(|p| !failed.contains_key(p.as_str()))
