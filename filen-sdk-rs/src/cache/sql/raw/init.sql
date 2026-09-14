@@ -142,6 +142,22 @@ CREATE INDEX idx_events_order ON events (
 CREATE UNIQUE INDEX idx_events_unique_id ON events (drive_message_id)
 WHERE drive_message_id IS NOT NULL;
 
+-- Listed records a resync could not make cacheable because their metadata
+-- did not decrypt or decode (only a non-conforming client writes one). They
+-- are not items: there is no name or key to serve. They are kept so a reader
+-- can tell "this uuid still exists" from "this uuid is gone" — without them
+-- a synced item whose metadata got garbled reads as deleted. Every resync
+-- that lists a root replaces that root's rows; an item delete drops its row.
+CREATE TABLE undecodable_items (
+	root BLOB NOT NULL,
+	uuid BLOB NOT NULL,
+	parent BLOB NOT NULL,
+	-- The file's whole-life id (the listing carries it in plain text); NULL
+	-- marks a directory, which has none.
+	stable_uuid BLOB,
+	PRIMARY KEY (root, uuid)
+);
+
 -- Singleton key/value metadata. Holds the global watermark and the event
 -- blob format version.
 CREATE TABLE cache_meta (

@@ -149,6 +149,22 @@ pub enum UnsyncableReason {
 	/// [`PATH_FAILURE_RETRY_INTERVAL`](super::PATH_FAILURE_RETRY_INTERVAL), so a path that was only
 	/// broken for a while (a file another process held locked) syncs again without a retry call.
 	RepeatedFailure { attempts: u32, last_error: String },
+	/// The remote item's metadata could not be decrypted or decoded (only a non-conforming client
+	/// writes such an item), so nothing is known about it but that it exists. It is never pulled,
+	/// and its absence from the remote view is NOT a deletion: a synced path whose item this became
+	/// keeps its local copy, and nothing is pushed over it or under it, for as long as it stays so.
+	/// For an item that was never synced, `rel_path` is the directory holding it (`""` for the sync
+	/// root).
+	RemoteUndecodable,
+	/// The remote name cannot be used as a local path component: it is empty, `.` or `..`, or holds
+	/// a path separator or NUL, so pulling it could write outside the sync root. Handled like
+	/// [`RemoteUndecodable`](Self::RemoteUndecodable): a synced path whose item was renamed to such a
+	/// name is left alone on both sides rather than read as deleted. `name` is the remote name.
+	RemoteInvalidName { name: String },
+	/// The remote item's parent chain never reaches the sync root: its parent is missing from the
+	/// listing, or the chain loops. Handled like [`RemoteUndecodable`](Self::RemoteUndecodable); for
+	/// an item that was never synced, `rel_path` is its bare name, since it has no path.
+	RemoteBrokenParent,
 }
 
 impl fmt::Display for UnsyncableReason {
@@ -156,6 +172,15 @@ impl fmt::Display for UnsyncableReason {
 		match self {
 			Self::InvalidName { detail } => {
 				write!(f, "the remote would reject this name: {detail}")
+			}
+			Self::RemoteUndecodable => {
+				f.write_str("the remote item's metadata could not be decrypted or decoded")
+			}
+			Self::RemoteInvalidName { name } => {
+				write!(f, "the remote name {name:?} is not a usable local name")
+			}
+			Self::RemoteBrokenParent => {
+				f.write_str("the remote item's parent chain does not lead back to the sync root")
 			}
 			Self::RepeatedFailure {
 				attempts,

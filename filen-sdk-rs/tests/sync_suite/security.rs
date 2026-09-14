@@ -17,7 +17,17 @@ use filen_sdk_rs::auth::Client;
 use filen_sdk_rs::fs::HasUUID;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode};
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::{
+	fs::{
+		HasName,
+		categories::{DirType, Normal},
+	},
+	sync_engine::{UnsyncablePath, UnsyncableReason},
+};
 use filen_types::fs::Uuid;
+#[cfg(feature = "malformed")]
+use std::borrow::Cow;
 
 use crate::harness::*;
 use crate::helpers::*;
@@ -730,25 +740,204 @@ async fn sec08_auth_and_network_errors_carry_no_secret_values() {
 	// other pairs continue. Requires a controllable failing transport / revocable session.
 }
 
-#[ignore = "blocked: needs undecryptable remote item the cache will surface to the engine (malformed feature / mock) — see TODO"]
-#[shared_test_runtime]
-async fn sec11_decryption_failure_surfaced_not_silent_empty() {
-	// plan: place a remote item the client cannot decrypt (corrupt ciphertext / garbled meta /
-	// undecryptable key envelope); run remote->local and two-way. Verify it is reported as an
-	// error/conflict for that path (not silently skipped while claiming success), no zero-byte file
-	// is written, the baseline is not advanced for it, and other decryptable items still converge.
-	// Requires injecting an undecryptable item past the cache's decode gate (it rejects such meta
-	// before the engine sees it) — needs the `malformed` seam or a mock remote.
+// ============================================================================
+// SEC-11 / SEC-12 — remote items whose metadata cannot be decrypted
+// ============================================================================
+
+/// The files directly under the test's remote root, straight from the server.
+#[cfg(feature = "malformed")]
+async fn remote_root_files(resources: &test_utils::TestResources) -> Vec<RemoteFile> {
+	resources
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap()
+		.1
 }
 
-#[ignore = "blocked: needs undecryptable remote item on a push-capable pair (malformed feature / mock) — see TODO"]
+/// SEC-11 — a remote item the client cannot decrypt is REPORTED, not skipped while the pass claims
+/// success: nothing is written locally for it, on this pass or the next, and the decryptable file
+/// beside it still syncs.
+///
+/// The item is staged before the cache first lists the root. A live event for such an item carries
+/// nothing the cache can apply; a listing is what keeps it on record.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn sec11_decryption_failure_surfaced_not_silent_empty() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	resources
+		.client
+		.create_malformed_file(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
+			"garbled.bin",
+			"not metadata",
+			"not a mime",
+			"not a size",
+		)
+		.await
+		.unwrap();
+	let builder = resources
+		.client
+		.make_file_builder("good.txt", remote)
+		.unwrap();
+	resources
+		.client
+		.upload_file(builder, b"good")
+		.await
+		.unwrap();
+
+	let cache = TestCache::new(&resources.client, remote).await;
+	assert!(wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await);
+	let local = fresh_local_dir("sec11");
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::RemoteToLocal)
+		.await
+		.unwrap();
+
+	// An item never synced is reported at the directory that holds it: the root.
+	let reported = vec![UnsyncablePath {
+		rel_path: String::new(),
+		reason: UnsyncableReason::RemoteUndecodable,
+	}];
+	let r1 = engine.sync_once(pair).await.unwrap();
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(
+		r1.downloaded, 1,
+		"only the decryptable file is pulled: {r1:?}"
+	);
+	assert_eq!(r1.unsyncable, reported, "{r1:?}");
+	assert!(read_eq(&local, "good.txt", b"good"));
+	assert_eq!(
+		walk_tree(&local).into_keys().collect::<Vec<_>>(),
+		vec!["good.txt".to_string()],
+		"nothing is written for the undecryptable item"
+	);
+	assert_eq!(engine.plan_pair(pair).await.unwrap().unsyncable, reported);
+
+	let r2 = engine.sync_once(pair).await.unwrap();
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.downloaded, 0, "{r2:?}");
+	assert_eq!(r2.unsyncable, reported, "reported on every pass: {r2:?}");
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// SEC-12 — on a push-capable pair, a SYNCED file that a non-conforming client replaced with a
+/// version nobody can decrypt is left alone on both sides. The synced uuid is no longer the remote
+/// head, which the pass would otherwise read as a remote deletion and quarantine the local copy for.
+/// Instead the local copy stays where it is, no decryptable stand-in is uploaded over the remote
+/// item, the path is reported on every pass, and an unrelated upload still completes.
+///
+/// A same-name upload is what makes the undecryptable item the file's new version. A fresh cache is
+/// what lists it, and the engine is reopened on it over the same baseline.
+#[cfg(feature = "malformed")]
 #[shared_test_runtime]
 async fn sec12_undecryptable_item_never_reuploaded_as_plaintext() {
-	// plan: on a push-capable mode, present an undecryptable remote item mapping to a local path;
-	// run the pass and inspect the remote object. Verify the engine does NOT decrypt-fail-then-
-	// upload a plaintext stand-in, the remote ciphertext is left intact, the item stays in
-	// error/conflict, and unrelated legitimate uploads still complete encrypted. Same precondition
-	// blocker as SEC-11 (need a real undecryptable item the engine actually processes).
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, remote).await;
+	assert!(wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await);
+
+	let local = fresh_local_dir("sec12");
+	write_file(&local, "report.txt", SECRET_MARKER);
+	// A synced sibling keeps the remote view non-empty: a wholly empty view is held by the guard on
+	// its own, which would hide what this test is about.
+	write_file(&local, "other.txt", b"other");
+	let baseline_db = temp_cache_path();
+	{
+		let engine = SyncEngine::open(cache.client.clone(), baseline_db.clone())
+			.await
+			.unwrap();
+		let pair = engine
+			.add_pair(local.clone(), remote, SyncMode::TwoWay)
+			.await
+			.unwrap();
+		let r1 = engine.sync_once(pair).await.unwrap();
+		assert!(r1.errors.is_empty(), "{r1:?}");
+		assert_eq!(r1.uploaded, 2, "{r1:?}");
+		// Settle into the steady state of a synced file: the cache lists both uploads, and a pass
+		// over that listing confirms them as the content both sides hold.
+		for file in remote_root_files(&resources).await {
+			assert!(
+				poll_for_item(cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+				"cache never observed {:?}",
+				file.name()
+			);
+		}
+		let settled = engine.sync_once(pair).await.unwrap();
+		assert!(settled.errors.is_empty(), "{settled:?}");
+		assert_eq!(settled.uploaded + settled.downloaded, 0, "{settled:?}");
+	}
+
+	resources
+		.client
+		.create_malformed_file(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
+			"report.txt",
+			"not metadata",
+			"not a mime",
+			"not a size",
+		)
+		.await
+		.unwrap();
+	let relisted = TestCache::new(&resources.client, remote).await;
+	assert!(wait_for_converged_resync(&relisted.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await);
+	write_file(&local, "fresh.txt", b"fresh");
+
+	let engine = SyncEngine::open(relisted.client.clone(), baseline_db)
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let reported = vec![UnsyncablePath {
+		rel_path: "report.txt".to_string(),
+		reason: UnsyncableReason::RemoteUndecodable,
+	}];
+	for pass in 1..=2 {
+		let report = engine.sync_once(pair).await.unwrap();
+		assert!(report.errors.is_empty(), "pass {pass}: {report:?}");
+		assert_eq!(report.unsyncable, reported, "pass {pass}: {report:?}");
+		assert!(
+			report.held.is_empty(),
+			"the guard holds nothing here, so it is not what keeps the copy: {report:?}"
+		);
+		assert!(
+			report.conflicts.is_empty(),
+			"an item the view cannot see is not a conflict either: {report:?}"
+		);
+		assert_eq!(report.locally_deleted, 0, "pass {pass}: {report:?}");
+		assert_eq!(report.remotely_trashed, 0, "pass {pass}: {report:?}");
+		assert_eq!(
+			report.uploaded,
+			usize::from(pass == 1),
+			"only the unrelated file is pushed, once: {report:?}"
+		);
+		assert!(
+			read_eq(&local, "report.txt", SECRET_MARKER),
+			"pass {pass}: the local copy must stay in place"
+		);
+	}
+
+	let files = remote_root_files(&resources).await;
+	assert!(
+		files.iter().any(|f| f.name() == Some("fresh.txt")),
+		"the unrelated upload completed"
+	);
+	assert!(
+		files.iter().all(|f| f.name() != Some("report.txt")),
+		"no decryptable stand-in was uploaded over the undecryptable item"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 #[ignore = "blocked: needs a prior-on-disk-format baseline fixture + a migrating engine build — see TODO"]
