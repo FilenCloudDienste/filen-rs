@@ -852,8 +852,9 @@ fn fold_create(
 	true
 }
 
-/// Show the item we moved at its destination rather than where the cache still lists it. Only
-/// files are ever moved on the remote, so there is no subtree to carry along.
+/// Show the item we moved at its destination rather than where the cache still lists it. A
+/// directory — renamed in place, see [`plan::fold_case_only_dir_renames`] — carries the subtree
+/// the cache still lists under its old spelling along with it.
 fn fold_move(
 	nodes: &mut HashMap<String, RemoteNode>,
 	path_of: &mut HashMap<Uuid, String>,
@@ -882,6 +883,9 @@ fn fold_move(
 	if nodes.get(to).is_some_and(|node| node.remote_uuid != uuid) {
 		return vacated.is_some();
 	}
+	let carries_subtree = vacated
+		.as_ref()
+		.is_some_and(|node| node.kind == NodeKind::Dir);
 	let node =
 		vacated.or_else(|| written_node(baseline.get(to)).filter(|node| node.remote_uuid == uuid));
 	let Some(mut node) = node else {
@@ -889,6 +893,21 @@ fn fold_move(
 	};
 	node.rel_path = to.to_string();
 	place_node(nodes, path_of, to.to_string(), node);
+	if carries_subtree {
+		let children: Vec<String> = nodes
+			.keys()
+			.filter(|key| plan::is_under(key, from))
+			.cloned()
+			.collect();
+		for old in children {
+			let Some(mut child) = nodes.remove(&old) else {
+				continue;
+			};
+			let new = format!("{to}{}", &old[from.len()..]);
+			child.rel_path = new.clone();
+			place_node(nodes, path_of, new, child);
+		}
+	}
 	true
 }
 
@@ -1041,6 +1060,10 @@ fn remote_overlap(
 struct Prepared {
 	record: PairRecord,
 	baseline: Arc<HashMap<String, BaselineEntry>>,
+	/// The case-only directory renames this pass makes (see
+	/// [`plan::fold_case_only_dir_renames`]). `baseline`, `local_scan` and `remote_view` are
+	/// already keyed by the spelling each of them ends with.
+	dir_renames: Vec<SyncAction>,
 	local_scan: LocalScan,
 	remote_view: RemoteView,
 	/// Whether the cache's remote view has converged at least once (the snapshot carried a
@@ -1988,7 +2011,7 @@ impl SyncEngine {
 
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
-		let local_scan =
+		let mut local_scan =
 			tokio::task::spawn_blocking(move || scan::scan_local(&local_root, &scan_baseline))
 				.await
 				.map_err(|e| {
@@ -2030,10 +2053,21 @@ impl SyncEngine {
 		}
 		holds.held_remote = remote_view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
+		// Rename in place what the two sides spell differently only by case, and read the rest of
+		// the pass under the spelling it ends with. AFTER the fold: a rename of ours the cache has
+		// not shown yet must read as done, not as the remote renaming the directory back.
+		let mut baseline = baseline;
+		let dir_renames = plan::fold_case_only_dir_renames(
+			record.mode,
+			Arc::make_mut(&mut baseline),
+			&mut local_scan.nodes,
+			&mut remote_view.nodes,
+		);
 
 		Ok(Prepared {
 			record,
 			baseline,
+			dir_renames,
 			local_scan,
 			remote_view,
 			remote_converged: snapshot.watermark.is_some(),
@@ -2837,7 +2871,11 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		&prep.holds,
 	);
 	let deferred_paths = plan.deferred_paths;
-	let actions = drop_blocked(plan.actions, &prep.blocked_paths());
+	// The renames run before everything else in the plan, which already names their subtrees by
+	// the new spelling. Copied: the dry run plans from the same borrowed `Prepared`.
+	let mut actions = prep.dir_renames.clone();
+	actions.extend(plan.actions);
+	let actions = drop_blocked(actions, &prep.blocked_paths());
 	let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
 		.into_iter()
 		.partition(|a| matches!(a, SyncAction::Conflict { .. }));
@@ -3355,6 +3393,48 @@ mod tests {
 			from: from.to_string(),
 			to: to.to_string(),
 		}
+	}
+
+	/// A directory this engine renamed in place, which the cache still lists under its old
+	/// spelling, is shown at the new one — children and all. Leaving the children behind would read
+	/// them as untracked remote items beside tracked ones gone missing.
+	#[test]
+	fn folding_a_directory_rename_carries_its_subtree() {
+		let (dir, child) = (Uuid::new_v4(), Uuid::new_v4());
+		let node = |path: &str, uuid: Uuid, kind: NodeKind| RemoteNode {
+			rel_path: path.to_string(),
+			kind,
+			remote_uuid: uuid,
+			stable_uuid: None,
+			content_hash: None,
+			size: 0,
+			modified_millis: 0,
+		};
+		let mut nodes = HashMap::from([
+			("Docs".to_string(), node("Docs", dir, NodeKind::Dir)),
+			(
+				"Docs/a.txt".to_string(),
+				node("Docs/a.txt", child, NodeKind::File),
+			),
+		]);
+		let mut path_of: HashMap<Uuid, String> = nodes
+			.iter()
+			.map(|(path, node)| (node.remote_uuid, path.clone()))
+			.collect();
+		assert!(fold_move(
+			&mut nodes,
+			&mut path_of,
+			&HashMap::new(),
+			dir,
+			"Docs",
+			"docs"
+		));
+		let mut paths: Vec<&str> = nodes.keys().map(String::as_str).collect();
+		paths.sort_unstable();
+		assert_eq!(paths, ["docs", "docs/a.txt"]);
+		assert_eq!(nodes["docs/a.txt"].rel_path, "docs/a.txt");
+		assert_eq!(path_of[&child], "docs/a.txt");
+		assert_eq!(path_of[&dir], "docs");
 	}
 
 	fn hash(byte: u8) -> Blake3Hash {

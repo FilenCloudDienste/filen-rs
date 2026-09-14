@@ -622,13 +622,30 @@ impl BaselineStore {
 				recorded_at
 			],
 		)?;
+		self.write_changes(pair, changes)?;
+		tx.commit()
+	}
+
+	/// Apply several baseline edits in ONE transaction — for a local write that re-keys a whole
+	/// subtree, where a crash part-way would leave rows under both spellings.
+	pub(crate) fn apply_changes(
+		&self,
+		pair: PairId,
+		changes: &[BaselineChange<'_>],
+	) -> rusqlite::Result<()> {
+		let tx = self.conn.unchecked_transaction()?;
+		self.write_changes(pair, changes)?;
+		tx.commit()
+	}
+
+	fn write_changes(&self, pair: PairId, changes: &[BaselineChange<'_>]) -> rusqlite::Result<()> {
 		for change in changes {
 			match change {
 				BaselineChange::Upsert(entry) => self.upsert_entry(pair, entry)?,
 				BaselineChange::Delete(rel_path) => self.delete_entry(pair, rel_path)?,
 			}
 		}
-		tx.commit()
+		Ok(())
 	}
 
 	/// Count one failed attempt at `rel_path`, remembering what went wrong. Consecutive: a success
