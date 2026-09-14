@@ -2759,6 +2759,9 @@ impl SyncEngine {
 	///
 	/// A [`paused`](Self::pause_pair) pair emits NO events at all — there was no pass to report on
 	/// — and returns a report marked [`paused`](SyncReport::paused).
+	///
+	/// A panic inside `observer` is caught and logged once; the observer receives nothing more for
+	/// the rest of the pass, and the pass carries on (see [`SyncObserver`](super::SyncObserver)).
 	pub async fn sync_once_observed(
 		&self,
 		pair: PairId,
@@ -2772,6 +2775,19 @@ impl SyncEngine {
 	/// mtime is planned as the edit it is — and a download planned over such a file stashes it first
 	/// (see `apply::stash_local_target`). The watch runs one on its deep-scan tick.
 	pub(super) async fn sync_pass(
+		&self,
+		pair: PairId,
+		depth: ScanDepth,
+		observer: &mut (dyn FnMut(SyncEvent) + Send),
+	) -> Result<SyncReport, Error> {
+		let mut contained = super::events::contain_panics(observer);
+		let observer: &mut (dyn FnMut(SyncEvent) + Send) = &mut contained;
+		self.run_pass(pair, depth, observer).await
+	}
+
+	/// The body of [`sync_pass`](Self::sync_pass), reporting to an observer whose panics are
+	/// already contained.
+	async fn run_pass(
 		&self,
 		pair: PairId,
 		depth: ScanDepth,
