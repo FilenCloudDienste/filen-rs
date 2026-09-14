@@ -200,6 +200,45 @@ impl fmt::Display for RefuseReason {
 	}
 }
 
+/// A side of a pass that ran out of room: no transfer writing to it can succeed, so the pass holds
+/// those back, and the failure counts against no path's failure streak (see
+/// [`SyncReport::halted`](super::SyncReport::halted)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaltReason {
+	/// The local disk has no room for another write (or a disk quota on it is used up).
+	LocalStorageFull,
+	/// The account's storage is used up: the server refused a write with `max_storage_reached`.
+	RemoteStorageFull,
+}
+
+impl HaltReason {
+	/// The transfers this condition holds back: `"uploads"` for a full account, `"downloads"` for a
+	/// full local disk.
+	pub fn held_transfers(self) -> &'static str {
+		match self {
+			Self::LocalStorageFull => "downloads",
+			Self::RemoteStorageFull => "uploads",
+		}
+	}
+
+	/// The line a pass's [`errors`](super::SyncReport::errors) carries once it found this side full.
+	pub(super) fn held_line(self) -> String {
+		format!(
+			"{self}: no further {} were started this pass",
+			self.held_transfers()
+		)
+	}
+}
+
+impl fmt::Display for HaltReason {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(match self {
+			Self::LocalStorageFull => "the local disk is full",
+			Self::RemoteStorageFull => "the account's storage is full",
+		})
+	}
+}
+
 /// What a pass WOULD do, from [`SyncEngine::plan_pair`](super::SyncEngine::plan_pair) — a dry run
 /// that touches neither side and advances no baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

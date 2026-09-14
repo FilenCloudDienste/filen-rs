@@ -488,7 +488,9 @@ fn backoff(failures: u32) -> Option<Duration> {
 /// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s.
 ///
 /// Returns the pass's own error, if any (per-action errors inside a completed pass do not count; a
-/// drive lock it could not take does), and whether it left work owed (see [`pass_outcome`]).
+/// drive lock it could not take does, and so does a pass that found a side full — see
+/// [`halted`](SyncReport::halted) — so the loop backs off rather than running into the same full
+/// disk at the debounce cadence), and whether it left work owed (see [`pass_outcome`]).
 async fn run_pass(
 	engine: &SyncEngine,
 	pair: PairId,
@@ -513,9 +515,11 @@ async fn run_pass(
 ///
 /// A pass that could not take the drive lock returns a report but applied nothing, so it is a
 /// failed pass. Its backoff is the retry timer, which is why it owes no re-armed trigger on top.
+/// A pass [`halted`](SyncReport::halted) for want of space is a failed pass too, so it backs off.
 fn pass_outcome(report: SyncReport) -> (Option<String>, bool) {
 	if !report.lock_failed {
-		return (None, owes_a_pass(&report));
+		let error = report.halted.map(|reason| reason.held_line());
+		return (error, owes_a_pass(&report));
 	}
 	let error = report
 		.errors
