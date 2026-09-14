@@ -238,6 +238,11 @@ jobs:
     # keeps heif-decoder out of the build, so no meson/ninja/nasm here. The full
     # `sync_suite` takes ~65 minutes alone.
     #
+    # The cache's live binaries (`cache_tests`, `cache_search_tests`) run here too. They
+    # contend for the same drive-write lock, so they cannot join the matrix legs, three of
+    # which share each account concurrently. The engine's remote view is the cache, and
+    # `sync-engine` implies `cache`, so they reuse this job's build.
+    #
     # One step per binary, each `!cancelled()`: a red early binary must not skip the rest.
     needs: [test, test-2fa]
     if: |
@@ -249,7 +254,7 @@ jobs:
         contains(github.event.pull_request.body, '[test]')
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -272,6 +277,24 @@ jobs:
           # checkout, which would otherwise need Wild to build Wild.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      - name: Run cache_tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test cache_tests --no-fail-fast
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_sdk_rs::cache=debug,info
+      - name: Run cache_search_tests
+        if: ${{ !cancelled() }}
+        run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test cache_search_tests --no-fail-fast
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_sdk_rs::cache=debug,info
       - name: Run sync_engine_tests (single-threaded)
         if: ${{ !cancelled() }}
         run: cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_tests --no-fail-fast -- --test-threads=1
