@@ -144,7 +144,10 @@ pub enum UnsyncableReason {
 	InvalidName { detail: String },
 	/// Every attempt to apply this path failed, `attempts` times in a row. The engine stopped
 	/// planning it so one broken path cannot stall (or spam) every pass; the count is cleared by a
-	/// success or by [`SyncEngine::retry_path`](super::SyncEngine::retry_path).
+	/// success or by [`SyncEngine::retry_path`](super::SyncEngine::retry_path). The engine also
+	/// tries the path once more on its own every
+	/// [`PATH_FAILURE_RETRY_INTERVAL`](super::PATH_FAILURE_RETRY_INTERVAL), so a path that was only
+	/// broken for a while (a file another process held locked) syncs again without a retry call.
 	RepeatedFailure { attempts: u32, last_error: String },
 }
 
