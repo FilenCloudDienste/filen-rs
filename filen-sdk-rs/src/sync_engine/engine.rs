@@ -1020,6 +1020,12 @@ pub struct SyncEngine {
 	removals: Mutex<HashMap<PairId, tokio::sync::watch::Sender<bool>>>,
 	/// The bounds of each hold of the drive-write lock a pass takes (see [`LockBudget`]).
 	lock_budget: LockBudget,
+	/// One lock per pair, held by a pass from before it reads the baseline until it has recorded the
+	/// conflicts it found, and by [`resolve_conflict`](SyncEngine::resolve_conflict) for the whole
+	/// resolution — so a resolution never lands between a pass's read and the conflict rows it writes
+	/// from that read. `Arc`: the guard is held across awaits after the map's own lock is released.
+	/// Bounded by the pair count; an entry goes with its pair.
+	reading: Mutex<HashMap<PairId, Arc<Mutex<()>>>>,
 }
 
 #[cfg(feature = "malformed")]
@@ -1217,8 +1223,9 @@ pub enum ConflictResolution {
 	/// The local copy wins: the next pass pushes it to the remote (or, if the conflict was a
 	/// local deletion, propagates that deletion).
 	KeepLocal,
-	/// The remote copy wins: the next pass pulls it over the local copy (or, if the conflict was a
-	/// remote deletion, propagates that deletion — quarantining the local file).
+	/// The remote copy wins: the next pass pulls it, with a local file whose content differed moved
+	/// to the `.filen-sync-trash` bin first (or, if the conflict was a remote deletion, propagates
+	/// that deletion — quarantining the local file).
 	KeepRemote,
 	/// Keep both: the local copy is renamed aside to `<stem>.old.<ext>` (`<stem>.old.N.<ext>` on
 	/// collision) so it uploads as a new file, and the conflicting path itself then resolves as
@@ -1247,6 +1254,13 @@ fn synced_shell(rel_path: &str) -> BaselineEntry {
 	}
 }
 
+/// Whether a held conflict row records the same content on both sides.
+fn sides_converged(held: &BaselineEntry) -> bool {
+	held.content_hash.is_some()
+		&& held.content_hash == held.remote_hash
+		&& held.size == held.remote_size
+}
+
 /// The baseline row that resolving a held conflict writes, or `None` when the winning side had
 /// nothing at the path (the row is dropped instead, so the other side reads as a fresh create).
 ///
@@ -1267,10 +1281,7 @@ fn resolution_entry(
 		// is nothing left to push, so record the whole converged state at once instead of leaving
 		// a row a further pass has to adopt.
 		ConflictResolution::KeepLocal => held.remote_kind.map(|kind| {
-			let converged = kind == super::baseline::NodeKind::File
-				&& held.content_hash.is_some()
-				&& held.content_hash == held.remote_hash
-				&& held.size == held.remote_size;
+			let converged = kind == NodeKind::File && sides_converged(held);
 			BaselineEntry {
 				kind,
 				remote_uuid: held.remote_uuid,
@@ -1293,10 +1304,7 @@ fn resolution_entry(
 		// nothing to pull, so the remote anchor is recorded too rather than left for a later
 		// adopt pass.
 		ConflictResolution::KeepRemote => held.local_kind.map(|kind| {
-			let converged = kind == super::baseline::NodeKind::File
-				&& held.content_hash.is_some()
-				&& held.content_hash == held.remote_hash
-				&& held.size == held.remote_size;
+			let converged = kind == NodeKind::File && sides_converged(held);
 			BaselineEntry {
 				kind,
 				content_hash: held.content_hash,
@@ -1350,6 +1358,7 @@ impl SyncEngine {
 			paused: Mutex::new(paused),
 			removals: Mutex::new(HashMap::new()),
 			lock_budget: LockBudget::default(),
+			reading: Mutex::new(HashMap::new()),
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
@@ -1697,13 +1706,33 @@ impl SyncEngine {
 	/// [`KeepBoth`](ConflictResolution::KeepBoth) additionally renames the local copy aside to
 	/// `<stem>.old.<ext>` first, so that copy uploads as a new file instead of being overwritten.
 	///
-	/// Errors if the pair is unknown or no conflict is currently held at `rel_path`.
+	/// [`KeepRemote`](ConflictResolution::KeepRemote) moves a local file whose content differs from
+	/// the remote's into the pair's `.filen-sync-trash` bin first: that edit was never uploaded, so
+	/// the download would otherwise destroy the only copy.
+	///
+	/// A resolution never interleaves with a pass: a pass still reading the pair, or recording the
+	/// conflicts it read, is waited for, since the rows it writes would overwrite this one. A
+	/// [`paused`](Self::pause_pair) pair stays resolvable — a pause parks a pass between actions,
+	/// never inside that read, so the wait is at most the read in flight. A pair whose
+	/// [`removal`](Self::remove_pair) is under way is refused, as the other control verbs are, and
+	/// that removal waits for a resolution already running.
+	///
+	/// Errors if the pair is unknown, is being removed, or no conflict is currently held at
+	/// `rel_path`.
 	pub async fn resolve_conflict(
 		&self,
 		pair: PairId,
 		rel_path: &str,
 		resolution: ConflictResolution,
 	) -> Result<(), Error> {
+		// The gate (refusing an unknown pair) keeps a removal waiting for this call; the lock keeps
+		// it out of a pass's read. The retirement is read AFTER the lock, since a removal may start
+		// while this waits for it.
+		let gate = self.pass_gate(pair).await?;
+		let _reading = self.reading_lock(pair).await.lock_owned().await;
+		if gate.retired() {
+			return Err(being_removed(pair));
+		}
 		let (record, mut held) = {
 			let store = self.store.lock().await;
 			let record = store
@@ -1745,6 +1774,19 @@ impl SyncEngine {
 			}
 			// Either way the local side is now empty at this path, so the remote copy lands there.
 			winner = ConflictResolution::KeepRemote;
+		} else if winner == ConflictResolution::KeepRemote
+			&& held.local_kind == Some(NodeKind::File)
+			&& held.remote_kind.is_some()
+			&& !sides_converged(&held)
+		{
+			// The losing local edit goes to the bin, as the `Overwritten` shape's does. Anchoring the
+			// row to it instead would let the next pass vouch for it and download straight over it.
+			// With the local side emptied the path resolves the way `KeepBoth` leaves it.
+			let bin = apply::quarantine_local(Path::new(&record.local_root), rel_path)?;
+			tracing::debug!(
+				"resolve_conflict[pair {pair}]: quarantined the local copy of {rel_path:?} as {bin:?}"
+			);
+			held.local_kind = None;
 		}
 
 		match resolution_entry(rel_path, &held, winner) {
@@ -2260,6 +2302,7 @@ impl SyncEngine {
 		// already `Retired` — that is what kept a pause or resume made while this WAITED for the
 		// pass from taking the cancel back — so there is nothing left to say on it.
 		self.paused.lock().await.remove(&pair);
+		self.reading.lock().await.remove(&pair);
 		Ok(())
 	}
 
@@ -2431,6 +2474,11 @@ impl SyncEngine {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
 		Ok(PassGate::new(self.control_channel(pair).await))
+	}
+
+	/// `pair`'s reading lock (see the `reading` field), created if this is the first time anyone asked.
+	async fn reading_lock(&self, pair: PairId) -> Arc<Mutex<()>> {
+		Arc::clone(self.reading.lock().await.entry(pair).or_default())
 	}
 
 	/// `pair`'s control channel, created (running) if this is the first time anyone asked.
@@ -2671,7 +2719,17 @@ impl SyncEngine {
 		// apply alike. `plan_pair` deliberately takes none: it has no plan and no action to
 		// interrupt, and nothing for a removal to wait on.
 		let gate = self.pass_gate(pair).await?;
-		let Some(prepared) = gate.guard(self.prepare(pair)).await else {
+		// Held until this pass has recorded the conflicts it reads, so `resolve_conflict` cannot
+		// land in between and be overwritten by a row written from a read that predates it. Taken
+		// under the gate: a cancel reaches a pass waiting for it as well as one reading.
+		let reading = self.reading_lock(pair).await;
+		let Some((recording, prepared)) = gate
+			.guard(async move {
+				let recording = reading.lock_owned().await;
+				(recording, self.prepare(pair).await)
+			})
+			.await
+		else {
 			// Cancelled while still reading: no plan was made, so nothing was applied and no
 			// baseline row written — the journal records the read had already retired stay retired,
 			// in memory and in the DB alike, which is what keeps the two halves in step. A removal
@@ -2793,6 +2851,8 @@ impl SyncEngine {
 				rel_path: rel_path.clone(),
 			});
 		}
+		// Every conflict row this pass will write is written: a resolution may land from here on.
+		drop(recording);
 		if report.held_deletions() > 0 {
 			observer(SyncEvent::DeletionsHeld {
 				count: report.held_deletions(),
@@ -4492,6 +4552,189 @@ mod tests {
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
+	}
+
+	/// A resolution landing while a pass reads the pair waits for that pass: the pass records its
+	/// conflict rows from what it read, so a resolution written in between would be put back to
+	/// `Conflicted` with nobody told — and, for `KeepBoth`, with the local copy already renamed.
+	#[tokio::test(start_paused = true)]
+	async fn a_resolution_waits_for_the_pass_reading_the_pair() {
+		let (engine, pair, path) = engine_with_pair("resolve_during_prepare").await;
+		let engine = Arc::new(engine);
+		engine
+			.store
+			.lock()
+			.await
+			.upsert_entry(pair, &converged_conflict(Uuid::new_v4()))
+			.unwrap();
+		let slot = engine.client.cache_slot.lock().await;
+		let pass = a_pass_parked_in_its_read(&engine, pair);
+		parked(&engine, pair).await;
+
+		let resolving = tokio::spawn({
+			let engine = Arc::clone(&engine);
+			async move {
+				engine
+					.resolve_conflict(pair, "a.txt", ConflictResolution::KeepLocal)
+					.await
+			}
+		});
+		assert!(
+			!ended(&resolving).await,
+			"the resolution landed while a pass was still reading the pair it would re-record"
+		);
+		assert!(
+			engine
+				.store
+				.lock()
+				.await
+				.entry(pair, "a.txt")
+				.unwrap()
+				.is_some_and(|row| row.state == BaselineState::Conflicted),
+			"the resolution wrote its row under the pass"
+		);
+
+		// The offline pass fails in its read once it gets the slot, and lets the resolution through.
+		drop(slot);
+		assert!(pass.await.unwrap().is_err());
+		resolving.await.unwrap().unwrap();
+		assert_eq!(
+			engine
+				.store
+				.lock()
+				.await
+				.entry(pair, "a.txt")
+				.unwrap()
+				.map(|row| row.state),
+			Some(BaselineState::Synced)
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A paused pair holds its conflicts like any other, and the caller must be able to settle them
+	/// before resuming: the pause does not make the resolution wait.
+	#[tokio::test]
+	async fn a_paused_pair_is_still_resolvable() {
+		let (engine, pair, path) = engine_with_pair("resolve_paused").await;
+		engine
+			.pause_pair_with(
+				pair,
+				PauseOptions {
+					mode: PauseMode::Suspend,
+					cancel_after: None,
+				},
+			)
+			.await
+			.unwrap();
+		engine
+			.store
+			.lock()
+			.await
+			.upsert_entry(pair, &converged_conflict(Uuid::new_v4()))
+			.unwrap();
+		engine
+			.resolve_conflict(pair, "a.txt", ConflictResolution::KeepLocal)
+			.await
+			.expect("a paused pair must stay resolvable");
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// And the last control verb: a resolution landing while a removal waits for its pass is refused
+	/// with the words the others use, rather than writing a row the removal is about to take away.
+	#[tokio::test(start_paused = true)]
+	async fn resolving_a_conflict_while_a_removal_waits_is_refused() {
+		let (engine, pair, path) = engine_with_pair("resolve_during_removal").await;
+		let engine = Arc::new(engine);
+		let (done, _) = a_removal_raced_by(&engine, pair, || async {
+			let refused = engine
+				.resolve_conflict(pair, "a.txt", ConflictResolution::KeepBoth)
+				.await
+				.expect_err("a resolution during a removal must not report success");
+			assert!(
+				refused.to_string().contains("is being removed"),
+				"the refusal must say why: {refused}"
+			);
+		})
+		.await;
+		assert_eq!(done, Vec::<&str>::new());
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// Keeping the remote side of an ordinary conflict moves the losing local edit to the bin. That
+	/// edit was never uploaded, so the download that follows would otherwise destroy the only copy.
+	/// A local copy that already holds the remote's content has nothing to lose and stays put.
+	#[tokio::test]
+	async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
+		let path =
+			std::env::temp_dir().join(format!("filen_sync_keep_remote_{}.db", Uuid::new_v4()));
+		let root = std::env::temp_dir().join(format!("filen_sync_keep_remote_{}", Uuid::new_v4()));
+		std::fs::create_dir_all(&root).unwrap();
+		let engine = SyncEngine::open(offline_client(), path.clone())
+			.await
+			.unwrap();
+		let (pair, _) = engine
+			.store
+			.lock()
+			.await
+			.create_pair(root.to_str().unwrap(), Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+
+		// Diverged: the local copy's content is not the remote head's.
+		std::fs::write(root.join("a.txt"), b"LOCAL").unwrap();
+		let diverged = BaselineEntry {
+			remote_hash: Some(hash(4)),
+			..converged_conflict(Uuid::new_v4())
+		};
+		engine
+			.store
+			.lock()
+			.await
+			.upsert_entry(pair, &diverged)
+			.unwrap();
+		engine
+			.resolve_conflict(pair, "a.txt", ConflictResolution::KeepRemote)
+			.await
+			.unwrap();
+		assert_eq!(
+			std::fs::read(root.join(scan::QUARANTINE_DIR).join("a.txt")).unwrap(),
+			b"LOCAL",
+			"the losing local edit must be recoverable from the bin"
+		);
+		assert!(!root.join("a.txt").exists());
+		assert_eq!(
+			engine.store.lock().await.entry(pair, "a.txt").unwrap(),
+			None,
+			"with the local side moved away, the remote copy must read as a fresh create"
+		);
+
+		// Converged: nothing to lose, nothing moved.
+		std::fs::write(root.join("b.txt"), b"SAME").unwrap();
+		let converged = BaselineEntry {
+			rel_path: "b.txt".to_string(),
+			..converged_conflict(Uuid::new_v4())
+		};
+		engine
+			.store
+			.lock()
+			.await
+			.upsert_entry(pair, &converged)
+			.unwrap();
+		engine
+			.resolve_conflict(pair, "b.txt", ConflictResolution::KeepRemote)
+			.await
+			.unwrap();
+		assert!(root.join("b.txt").exists());
+		assert!(!root.join(scan::QUARANTINE_DIR).join("b.txt").exists());
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+		std::fs::remove_dir_all(&root).ok();
 	}
 
 	/// A dry run stays a pure read: it takes NO pass gate, so it neither leaves control state behind
