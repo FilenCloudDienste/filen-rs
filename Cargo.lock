@@ -3662,7 +3662,7 @@ dependencies = [
 [[package]]
 name = "manuel"
 version = "0.1.0"
-source = "git+https://github.com/JupiterPi/manuel#c1c65639d94aae5e62f691a596640cd996478036"
+source = "git+https://github.com/JupiterPi/manuel#860c239367ef4daf6d094bde19e30f845b00858d"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
