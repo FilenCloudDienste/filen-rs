@@ -4166,6 +4166,53 @@ mod tests {
 		std::fs::remove_file(&path).ok();
 	}
 
+	/// A pass that could not take the drive lock ran none of its plan, so it proves nothing about any
+	/// path it planned: every failure streak must come through it untouched. Clearing them would
+	/// hand a permanently broken path a fresh set of retries each time the lock is contended.
+	#[tokio::test]
+	async fn a_pass_that_could_not_take_the_drive_lock_leaves_every_failure_streak_alone() {
+		let (engine, pair, path) = engine_with_pair("lock_failure_streaks").await;
+		{
+			let store = engine.store.lock().await;
+			store.record_failure(pair, "broken.txt", "boom").unwrap();
+			store.record_failure(pair, "broken.txt", "boom").unwrap();
+		}
+		let before = engine.store.lock().await.failures(pair).unwrap();
+
+		let attempted = vec!["broken.txt".to_string(), "fine.txt".to_string()];
+		let mut report = SyncReport::default();
+		let mut events = Vec::new();
+		apply::note_lock_failure(
+			&mut report,
+			attempted.len(),
+			&Error::custom(ErrorKind::RetryFailed, "the drive lock is held elsewhere"),
+			&mut |event| events.push(event),
+		);
+		engine
+			.note_path_outcomes(pair, &attempted, &mut report)
+			.await;
+
+		assert_eq!(
+			engine.store.lock().await.failures(pair).unwrap(),
+			before,
+			"a pass that applied nothing touched a path's failure streak"
+		);
+		assert_eq!(
+			report.interrupted,
+			attempted.len(),
+			"the pass owes every action it planned"
+		);
+		assert_eq!(
+			events,
+			vec![SyncEvent::Interrupted {
+				actions: attempted.len()
+			}]
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
 	/// A REAL pass, parked in its read half: the remote enumeration is the first thing that wants
 	/// the client's cache slot, so holding that slot stops `sync_once` inside `prepare` — under the
 	/// gate it took first, which is the window the two tests below land a control call in.
