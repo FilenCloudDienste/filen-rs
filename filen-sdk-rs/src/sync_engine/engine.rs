@@ -20,7 +20,8 @@ use super::{
 	Backlog, SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
 	baseline::{
-		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PendingRow,
+		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PathFailure,
+		PendingRow,
 	},
 	guard::{self, DeleteGuard, GuardReason},
 	outcome::{
@@ -55,8 +56,20 @@ const PENDING_CREATE_GRACE: Duration = Duration::from_secs(180);
 /// Small on purpose: the point is to stop a permanently-broken path (a local file the OS will not
 /// let us read, a remote item the account may not write) from failing on every pass forever, while
 /// still riding out the transient failures a couple of retries cover. A path is unblocked by a
-/// success or by [`SyncEngine::retry_path`].
+/// success, by [`SyncEngine::retry_path`], or — for one more attempt — once its last failure is
+/// [`PATH_FAILURE_RETRY_INTERVAL`] old.
 const MAX_PATH_FAILURES: u32 = 3;
+
+/// How long a path whose failure streak ran out (see [`UnsyncableReason::RepeatedFailure`]) stays
+/// unplanned before the engine tries it once more on its own.
+///
+/// The streak never simply expires: the first pass after the interval plans the path again, and
+/// a failure there extends the streak and dates it anew, so the path waits another interval; a
+/// success clears it. That is what lets a path that is only broken for a while — a file another
+/// process holds locked, a file still being written, a server that kept failing — sync again with
+/// nobody calling [`SyncEngine::retry_path`], at a cost of one attempt per interval for a path that
+/// is broken for good.
+pub const PATH_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How long [`SyncEngine::remove_pair`] waits for the pass it cancelled to end before it retires
 /// the pair's rows anyway.
@@ -1147,8 +1160,9 @@ struct Prepared {
 	remote_emptied: bool,
 	/// What this pass must not act on (see [`plan::PassHolds`]).
 	holds: plan::PassHolds,
-	/// The pair's live per-path failure streaks: `rel_path -> (attempts, last error)`.
-	failures: HashMap<String, (u32, String)>,
+	/// The per-path failure streaks that block planning this pass (see [`streak_blocks`]). A streak
+	/// below the threshold, or one whose retry interval has run out, is not here.
+	failures: HashMap<String, PathFailure>,
 	/// Baseline rows whose agreed-content marker this pass's raw snapshot advanced (see
 	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
 	/// either way; a real pass persists them, a dry run writes nothing.
@@ -1182,14 +1196,14 @@ impl Prepared {
 			});
 		let mut all: Vec<UnsyncablePath> = names
 			.chain(
-				self.exhausted_paths()
-					.into_iter()
-					.map(|rel_path| UnsyncablePath {
+				self.failures
+					.iter()
+					.map(|(rel_path, failure)| UnsyncablePath {
+						rel_path: rel_path.clone(),
 						reason: UnsyncableReason::RepeatedFailure {
-							attempts: self.failures[&rel_path].0,
-							last_error: self.failures[&rel_path].1.clone(),
+							attempts: failure.attempts,
+							last_error: failure.last_error.clone(),
 						},
-						rel_path,
 					}),
 			)
 			.collect();
@@ -1201,19 +1215,21 @@ impl Prepared {
 	/// Every path this pass must not plan an action for: a name the remote would reject, and a path
 	/// whose failure streak ran out. Both are reported by [`unsyncable`](Self::unsyncable).
 	fn blocked_paths(&self) -> BTreeSet<String> {
-		let mut blocked = self.exhausted_paths();
-		blocked.extend(self.local_scan.invalid_names.keys().cloned());
-		blocked
-	}
-
-	/// The paths whose failure streak has reached [`MAX_PATH_FAILURES`] — no longer planned.
-	fn exhausted_paths(&self) -> BTreeSet<String> {
 		self.failures
-			.iter()
-			.filter(|(_, (attempts, _))| *attempts >= MAX_PATH_FAILURES)
-			.map(|(rel_path, _)| rel_path.clone())
+			.keys()
+			.chain(self.local_scan.invalid_names.keys())
+			.cloned()
 			.collect()
 	}
+}
+
+/// Whether a failure streak keeps its path out of a pass planned at `now` (unix millis): it has
+/// reached [`MAX_PATH_FAILURES`], and its last failure is younger than
+/// [`PATH_FAILURE_RETRY_INTERVAL`]. A last failure dated in the future (the clock went back) counts
+/// as fresh, so a clock step never releases a path early.
+fn streak_blocks(failure: &PathFailure, now: i64) -> bool {
+	let interval = i64::try_from(PATH_FAILURE_RETRY_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+	failure.attempts >= MAX_PATH_FAILURES && now.saturating_sub(failure.last_failure_at) < interval
 }
 
 /// Which side wins when a caller resolves a held two-way conflict via
@@ -2084,9 +2100,11 @@ impl SyncEngine {
 			let entries = store
 				.entries(pair)
 				.map_err(|e| db_error(e, "loading the baseline"))?;
-			let failures = store
+			let now = Utc::now().timestamp_millis();
+			let mut failures = store
 				.failures(pair)
 				.map_err(|e| db_error(e, "loading the per-path failure counts"))?;
+			failures.retain(|_, failure| streak_blocks(failure, now));
 			(record, entries, failures)
 		};
 
@@ -2619,7 +2637,8 @@ impl SyncEngine {
 
 	/// Record what this pass's attempted paths did: a failure extends that path's streak, a success
 	/// ends it. Once a streak reaches [`MAX_PATH_FAILURES`] the path stops being planned and is
-	/// reported as [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever.
+	/// reported as [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever —
+	/// until [`PATH_FAILURE_RETRY_INTERVAL`] after its last failure, when it is tried once more.
 	async fn note_path_outcomes(
 		&self,
 		pair: PairId,
@@ -2636,8 +2655,9 @@ impl SyncEngine {
 			.collect();
 		let store = self.store.lock().await;
 		let mut problems = Vec::new();
+		let now = Utc::now().timestamp_millis();
 		for (path, error) in &failed {
-			if let Err(e) = store.record_failure(pair, path, error) {
+			if let Err(e) = store.record_failure(pair, path, error, now) {
 				problems.push(format!("{path}: recording the failure count failed: {e}"));
 			}
 		}
@@ -2659,7 +2679,8 @@ impl SyncEngine {
 
 	/// Plan `rel_path` again on the next pass, whatever its failure history: it clears the
 	/// consecutive-failure count the engine stopped planning it on (see
-	/// [`UnsyncableReason::RepeatedFailure`]).
+	/// [`UnsyncableReason::RepeatedFailure`]). Without it the engine tries such a path once per
+	/// [`PATH_FAILURE_RETRY_INTERVAL`] on its own.
 	///
 	/// Idempotent — a path with no failure streak is left alone rather than erroring, so a caller
 	/// can retry a whole reported list without checking each entry first. Errors only if the pair
@@ -3038,7 +3059,8 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 /// Drop every action at a blocked path, and everything under it.
 ///
 /// A path is blocked when the remote would reject its name, or when its failure streak ran out (and
-/// stays blocked until a [`retry_path`](SyncEngine::retry_path) or a rename clears it). The SUBTREE
+/// stays blocked until a [`retry_path`](SyncEngine::retry_path) or a rename clears it, or
+/// [`PATH_FAILURE_RETRY_INTERVAL`] passes and it is tried once more). The SUBTREE
 /// goes with it either way: a name the remote refuses can hold no remote children, and the failures
 /// that get this far are structural — a directory that cannot be created can hold no children, a
 /// local tree that cannot be written to cannot take a file — so planning the descendants would just
@@ -3387,38 +3409,60 @@ mod tests {
 		std::fs::remove_dir_all(&root).ok();
 	}
 
-	/// The streak only blocks once it reaches the threshold, and reports the attempts and the last
-	/// error it saw. Below the threshold the path is still planned, so a transient failure is
-	/// retried rather than parked.
+	/// The streak only blocks once it reaches the threshold. Below the threshold the path is still
+	/// planned, so a transient failure is retried rather than parked.
 	#[test]
 	fn a_failure_streak_blocks_only_at_the_threshold() {
-		let mut failures = HashMap::new();
+		const NOW: i64 = 1_800_000_000_000;
 		for attempts in 0..MAX_PATH_FAILURES {
-			failures.insert("flaky.txt".to_string(), (attempts, "boom".to_string()));
-			let blocked = blocked_from(&failures);
 			assert!(
-				blocked.is_empty(),
+				!streak_blocks(&failure(attempts, NOW), NOW),
 				"{attempts} failure(s) is under the threshold, so the path is still planned"
 			);
 		}
-		failures.insert(
-			"flaky.txt".to_string(),
-			(MAX_PATH_FAILURES, "last words".to_string()),
+		assert!(streak_blocks(&failure(MAX_PATH_FAILURES, NOW), NOW));
+	}
+
+	/// An exhausted streak does not park its path for good: once its last failure is a retry
+	/// interval old the path is planned again, and the failure that attempt records dates the
+	/// streak anew, so it waits a whole interval more.
+	#[test]
+	fn an_exhausted_streak_is_retried_once_its_last_failure_is_an_interval_old() {
+		const NOW: i64 = 1_800_000_000_000;
+		let interval = PATH_FAILURE_RETRY_INTERVAL.as_millis() as i64;
+		let exhausted_at = NOW - interval;
+
+		assert!(
+			streak_blocks(&failure(MAX_PATH_FAILURES, exhausted_at), NOW - 1),
+			"a millisecond short of the interval, the path is still parked"
 		);
-		assert_eq!(
-			blocked_from(&failures),
-			BTreeSet::from(["flaky.txt".to_string()])
+		assert!(
+			!streak_blocks(&failure(MAX_PATH_FAILURES, exhausted_at), NOW),
+			"a whole interval after the last failure, the path is tried again"
+		);
+		assert!(
+			!streak_blocks(&failure(MAX_PATH_FAILURES + 5, exhausted_at - 1), NOW),
+			"however long the streak, it is the age of its last failure that releases it"
+		);
+
+		// That retry failed: one more attempt, dated now, parks it for another interval.
+		let rearmed = failure(MAX_PATH_FAILURES + 1, NOW);
+		assert!(streak_blocks(&rearmed, NOW));
+		assert!(streak_blocks(&rearmed, NOW + interval - 1));
+		assert!(!streak_blocks(&rearmed, NOW + interval));
+
+		assert!(
+			streak_blocks(&failure(MAX_PATH_FAILURES, NOW + interval * 10), NOW),
+			"a last failure dated after now (the clock stepped back) must not release the path"
 		);
 	}
 
-	/// `exhausted_paths`/`unsyncable` read the same map; this exercises the threshold rule without
-	/// building a whole `Prepared`.
-	fn blocked_from(failures: &HashMap<String, (u32, String)>) -> BTreeSet<String> {
-		failures
-			.iter()
-			.filter(|(_, (attempts, _))| *attempts >= MAX_PATH_FAILURES)
-			.map(|(rel_path, _)| rel_path.clone())
-			.collect()
+	fn failure(attempts: u32, last_failure_at: i64) -> PathFailure {
+		PathFailure {
+			attempts,
+			last_error: "boom".to_string(),
+			last_failure_at,
+		}
 	}
 
 	#[test]
@@ -4381,8 +4425,13 @@ mod tests {
 		let (engine, pair, path) = engine_with_pair("lock_failure_streaks").await;
 		{
 			let store = engine.store.lock().await;
-			store.record_failure(pair, "broken.txt", "boom").unwrap();
-			store.record_failure(pair, "broken.txt", "boom").unwrap();
+			let now = Utc::now().timestamp_millis();
+			store
+				.record_failure(pair, "broken.txt", "boom", now)
+				.unwrap();
+			store
+				.record_failure(pair, "broken.txt", "boom", now)
+				.unwrap();
 		}
 		let before = engine.store.lock().await.failures(pair).unwrap();
 
