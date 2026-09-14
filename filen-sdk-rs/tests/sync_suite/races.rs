@@ -19,7 +19,7 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, SyncObserver};
+use filen_sdk_rs::sync_engine::{SyncEngine, SyncEvent, SyncMode, SyncObserver, SyncReport};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -753,8 +753,9 @@ async fn race_23_mass_delete_guard_holds_bulk_vanish() {
 // IMPLEMENTED — special files (symlinks / loops / hardlinks)
 // ===========================================================================
 
-/// RACE-19 — a symlink and a symlink loop must not hang/recurse the scan; the real target file is
-/// uploaded byte-exact and nothing is duplicated unboundedly.
+/// RACE-19 — a symlink and a symlink loop must not hang/recurse the scan. A file symlink uploads as
+/// a copy of its target; the loop is reported in the pass's errors on every pass, is not uploaded,
+/// and does not make the scan incomplete (so a local deletion still propagates).
 #[cfg(unix)]
 #[shared_test_runtime]
 async fn race_19_symlink_and_loop_do_not_hang_scan() {
@@ -762,27 +763,59 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 
 	let sc = single_client(SyncMode::LocalToRemote).await;
 	write_file(&sc.local, "target.txt", b"A-target");
+	write_file(&sc.local, "doomed.txt", b"A-doomed");
 	// A symlink to a regular file, and a self-referential directory loop.
 	symlink(sc.local.join("target.txt"), sc.local.join("link.txt")).unwrap();
 	std::fs::create_dir_all(sc.local.join("cycle")).unwrap();
 	symlink(sc.local.join("cycle"), sc.local.join("cycle/self")).unwrap();
 
 	// The scan must terminate (no infinite recursion) and not crash; bounded so a hang fails fast.
-	let _r1 = tokio::time::timeout(Duration::from_secs(180), sc.sync())
+	let r1 = tokio::time::timeout(Duration::from_secs(180), sc.sync())
 		.await
 		.expect("sync hung on the symlink loop");
+	let loop_errors = |r: &SyncReport| -> Vec<String> {
+		r.errors
+			.iter()
+			.filter(|e| e.contains("cycle/self"))
+			.cloned()
+			.collect()
+	};
+	assert_eq!(
+		r1.errors.len(),
+		1,
+		"the loop is the pass's only error: {r1:?}"
+	);
+	assert_eq!(loop_errors(&r1).len(), 1, "the loop is reported: {r1:?}");
+	assert_eq!(r1.uploaded, 3, "{r1:?}");
+
+	// Deleting a synced file still propagates: the loop does not hold deletions.
+	std::fs::remove_file(sc.local.join("doomed.txt")).unwrap();
 	let r2 = tokio::time::timeout(Duration::from_secs(180), sc.sync())
 		.await
 		.expect("second sync hung on the symlink loop");
+	assert!(r2.guard.is_none(), "the loop held the deletion: {r2:?}");
+	assert_eq!(r2.remotely_trashed, 1, "{r2:?}");
+	assert_eq!(r2.uploaded, 0, "{r2:?}");
+	assert_eq!(
+		r2.errors,
+		loop_errors(&r1),
+		"the loop is reported again, and nothing else: {r2:?}"
+	);
 
-	// The real target's bytes must be present on the remote regardless of the symlink policy.
-	let (_d, files) = list_root(&sc).await;
-	let t = find_file(&files, "target.txt").expect("target.txt must be uploaded");
-	assert_eq!(t.size, b"A-target".len() as u64, "target.txt content lost");
-	// Whatever the symlink contract, the scan must not have exploded the tree.
+	let (dirs, files) = list_root(&sc).await;
+	let mut file_names: Vec<&str> = files.iter().filter_map(|f| f.name()).collect();
+	file_names.sort_unstable();
+	assert_eq!(file_names, vec!["link.txt", "target.txt"], "{r2:?}");
+	for name in ["link.txt", "target.txt"] {
+		let f = find_file(&files, name).unwrap();
+		assert_eq!(f.size, b"A-target".len() as u64, "{name} content wrong");
+	}
+	let dir_names: Vec<&str> = dirs.iter().filter_map(|d| d.name()).collect();
+	assert_eq!(dir_names, vec!["cycle"], "{r2:?}");
+	let (cycle_dirs, cycle_files) = list_dir(&sc, find_dir(&dirs, "cycle").unwrap()).await;
 	assert!(
-		files.len() < 50,
-		"symlink loop produced an unbounded structure: {r2:?}"
+		cycle_dirs.is_empty() && cycle_files.is_empty(),
+		"nothing is uploaded through the loop: {cycle_dirs:?} {cycle_files:?}"
 	);
 	sc.cleanup();
 }
