@@ -19,7 +19,8 @@ use super::{SyncMode, apply::SyncReport};
 /// in-progress event per applied action, each possibly trailed by
 /// [`ActionFailed`](Self::ActionFailed)) → [`PassCompleted`](Self::PassCompleted). A pass the pair's
 /// pause cut short, or that could not take the drive lock, reports one
-/// [`Interrupted`](Self::Interrupted) before it completes.
+/// [`Interrupted`](Self::Interrupted) before it completes. A file
+/// transfer ticks [`Progress`](Self::Progress) while it runs.
 ///
 /// A pass that fails outright ends with [`PassFailed`](Self::PassFailed) instead of
 /// `PassCompleted` — with or without a `PassStarted` before it, depending on how far it got.
@@ -47,6 +48,21 @@ pub enum SyncEvent {
 	Uploading { rel_path: String },
 	/// Downloading a remote file into the local tree.
 	Downloading { rel_path: String },
+	/// Bytes moved so far by the upload or download of `rel_path`. File transfers run concurrently
+	/// and report their [`Uploading`](Self::Uploading) / [`Downloading`](Self::Downloading) event
+	/// once they finish, so a transfer's progress comes BEFORE that event.
+	///
+	/// `bytes` is cumulative and never decreases within one transfer. `total` is the file size the
+	/// pass planned with: the remote file's size for a download, the size the local scan read for
+	/// an upload — a file still being written to can upload more than that. Delivered at most once
+	/// per 200 ms per transfer, plus a last one as the transfer's final bytes land; an empty file
+	/// moves no bytes and reports none. A transfer that fails or is cancelled can stop short of
+	/// `total`.
+	Progress {
+		rel_path: String,
+		bytes: u64,
+		total: u64,
+	},
 	/// Creating a directory on the remote.
 	CreatingRemoteDir { rel_path: String },
 	/// Creating a directory in the local tree.
