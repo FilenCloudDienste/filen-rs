@@ -268,12 +268,7 @@ pub(super) fn planned_action(
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 ) -> PlannedAction {
-	let rel_path = match action {
-		SyncAction::MoveRemote { from_path, .. } | SyncAction::MoveLocal { from_path, .. } => {
-			from_path.clone()
-		}
-		other => other.rel_path().to_string(),
-	};
+	let rel_path = action.endpoints().0.to_string();
 	let local_size = |path: &str| local.get(path).map(|node| node.size);
 	let remote_size = |path: &str| remote.get(path).map(|node| node.size);
 	let (kind, node, size) = match action {
@@ -297,8 +292,22 @@ pub(super) fn planned_action(
 			PlannedNodeKind::Dir,
 			None,
 		),
-		// Only files are ever moved rather than re-transferred (see the reconciler), and the source
-		// path is where each side still holds the bytes.
+		// A directory is renamed in place only for a case-only rename; it has no size.
+		SyncAction::RenameRemoteDir { to_path, .. } => (
+			PlannedActionKind::MoveRemote {
+				to: to_path.clone(),
+			},
+			PlannedNodeKind::Dir,
+			None,
+		),
+		SyncAction::RenameLocalDir { to_path, .. } => (
+			PlannedActionKind::MoveLocal {
+				to: to_path.clone(),
+			},
+			PlannedNodeKind::Dir,
+			None,
+		),
+		// Any other move is a file's, and the source path is where each side still holds the bytes.
 		SyncAction::MoveRemote { to_path, .. } => (
 			PlannedActionKind::MoveRemote {
 				to: to_path.clone(),
