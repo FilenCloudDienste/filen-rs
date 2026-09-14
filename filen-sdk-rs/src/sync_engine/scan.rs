@@ -1,5 +1,6 @@
 //! The local-side scan: walk a pair's local root into a `rel_path -> LocalNode` map, applying the
-//! mtime+size fast-path so an unchanged file is never re-hashed.
+//! mtime+size fast-path so an unchanged file is never re-hashed — except on a
+//! [`ScanDepth::Deep`] scan, which hashes every file.
 //!
 //! Paths are NFC-normalized (macOS hands back NFD) and `/`-joined so they key 1:1 against the
 //! NFC-normalized remote snapshot and the baseline. Two entries that normalize to the same key are
@@ -227,6 +228,17 @@ fn hash_file(path: &Path) -> std::io::Result<Blake3Hash> {
 	Ok(hasher.finalize().into())
 }
 
+/// How much a scan trusts the `(size, mtime)` fast-path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanDepth {
+	/// Reuse the baseline's hash for a file whose `(size, mtime)` still match its row.
+	Fast,
+	/// Hash every file. Catches a same-size edit that kept its mtime (`touch -r`, an `rsync -a`
+	/// restore, an editor that restores the timestamp), which the fast-path reads as unchanged for
+	/// ever.
+	Deep,
+}
+
 /// The fast-path: reuse the baseline's content hash when the file's `(size, mtime)` are unchanged,
 /// so an untouched file is never re-hashed. `None` means "diverged or unknown — must hash".
 fn fast_path_hash(baseline: Option<&BaselineEntry>, size: u64, mtime: i64) -> Option<Blake3Hash> {
@@ -240,8 +252,13 @@ fn fast_path_hash(baseline: Option<&BaselineEntry>, size: u64, mtime: i64) -> Op
 }
 
 /// Walk `root` into a `rel_path -> LocalNode` map. `baseline` (keyed by rel_path) drives the
-/// fast-path. Blocking work — the engine calls this on a blocking thread.
-pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>) -> LocalScan {
+/// fast-path, unless `depth` is [`ScanDepth::Deep`]; it is read for the symlink rule on
+/// [`LocalScan::complete`] either way. Blocking work — the engine calls this on a blocking thread.
+pub(crate) fn scan_local(
+	root: &Path,
+	baseline: &HashMap<String, BaselineEntry>,
+	depth: ScanDepth,
+) -> LocalScan {
 	let mut nodes = HashMap::new();
 	let mut errors = Vec::new();
 	let mut invalid_names = BTreeMap::new();
@@ -395,7 +412,11 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 			NodeKind::File => {
 				let size = metadata.len();
 				let mtime = FilenMetaExt::modified(&metadata).timestamp_millis();
-				let content_hash = match fast_path_hash(baseline.get(&rel_path), size, mtime) {
+				let reused = match depth {
+					ScanDepth::Fast => fast_path_hash(baseline.get(&rel_path), size, mtime),
+					ScanDepth::Deep => None,
+				};
+				let content_hash = match reused {
 					Some(hash) => Some(hash),
 					None => match hash_file(entry.path()) {
 						Ok(hash) => Some(hash),
@@ -455,7 +476,7 @@ mod tests {
 		fs::create_dir(root.join("sub")).unwrap();
 		fs::write(root.join("sub").join("b.txt"), b"world").unwrap();
 
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		assert!(
 			scan.complete,
 			"a clean tree scans completely: {:?}",
@@ -513,7 +534,7 @@ mod tests {
 			},
 		)]);
 
-		let scan = scan_local(&root, &baseline);
+		let scan = scan_local(&root, &baseline, ScanDepth::Fast);
 		assert_eq!(
 			scan.nodes["a.txt"].content_hash,
 			Some(sentinel),
@@ -528,11 +549,19 @@ mod tests {
 				..baseline["a.txt"].clone()
 			},
 		)]);
-		let rescan = scan_local(&root, &stale);
+		let rescan = scan_local(&root, &stale, ScanDepth::Fast);
 		assert_ne!(
 			rescan.nodes["a.txt"].content_hash,
 			Some(sentinel),
 			"a diverged size triggers a fresh hash"
+		);
+
+		// A deep scan ignores the fast-path: the same matching row no longer hides the content.
+		let deep = scan_local(&root, &baseline, ScanDepth::Deep);
+		assert_eq!(
+			deep.nodes["a.txt"].content_hash,
+			Some(blake3::hash(b"hello").into()),
+			"a deep scan hashes a file whose (size, mtime) match its row"
 		);
 
 		fs::remove_dir_all(&root).ok();
@@ -541,7 +570,7 @@ mod tests {
 	#[test]
 	fn missing_root_is_reported_incomplete() {
 		let root = std::env::temp_dir().join(format!("filen_scan_absent_{}", Uuid::new_v4()));
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		assert!(
 			!scan.complete,
 			"a missing root scans incomplete (guards mass-delete)"
@@ -563,7 +592,7 @@ mod tests {
 		// A DIRECTORY with that suffix is a legitimate user item and stays.
 		fs::create_dir(root.join("notes.filendl")).unwrap();
 
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
 		paths.sort();
 		assert_eq!(
@@ -591,7 +620,7 @@ mod tests {
 		fs::create_dir_all(root.join("bad.").join("deeper")).unwrap();
 		fs::write(root.join("bad.").join("deeper").join("x.txt"), b"deep").unwrap();
 
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
 		paths.sort();
 		// The scan reports the disk as it is: a rejected name is unpushable, not invisible. Dropping
@@ -639,7 +668,7 @@ mod tests {
 		for name in ["CONSOLE", "console.txt", "CON.txt", "a.b", ".hidden"] {
 			fs::write(root.join(name), b"x").unwrap();
 		}
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		assert!(
 			scan.invalid_names.is_empty(),
 			"none of these are rejected by the SDK validator: {:?}",
@@ -657,7 +686,7 @@ mod tests {
 		fs::create_dir(&quarantine).unwrap();
 		fs::write(quarantine.join("trashed.txt"), b"old").unwrap();
 
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		let paths: Vec<_> = scan.nodes.keys().cloned().collect();
 		assert_eq!(
 			paths,
@@ -679,7 +708,7 @@ mod tests {
 		fs::write(root.join("locked").join("inner.txt"), b"y").unwrap();
 		fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
 
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
 
 		assert!(!scan.complete, "an unreadable subtree is missing evidence");
@@ -739,7 +768,7 @@ mod tests {
 		fs::create_dir(root.join("cycle")).unwrap();
 		symlink(root.join("cycle"), root.join("cycle").join("self")).unwrap();
 
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		assert!(
 			scan.complete,
 			"a link that leads nowhere hides nothing, so deletions must not be held for it: {:?}",
@@ -784,7 +813,7 @@ mod tests {
 		symlink(root.join("real").join("a.txt"), root.join("copy.txt")).unwrap();
 		symlink(&outside, root.join("away")).unwrap();
 
-		let scan = scan_local(&root, &HashMap::new());
+		let scan = scan_local(&root, &HashMap::new(), ScanDepth::Fast);
 		assert!(scan.complete, "{:?}", scan.errors);
 		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
 		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
@@ -845,7 +874,7 @@ mod tests {
 			},
 		)]);
 
-		let scan = scan_local(&root, &baseline);
+		let scan = scan_local(&root, &baseline, ScanDepth::Fast);
 		assert!(
 			!scan.complete,
 			"what was synced behind the link must not read as deleted"

@@ -30,7 +30,7 @@ use super::{
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
-	scan::{self, LocalScan, ScanError},
+	scan::{self, LocalScan, ScanDepth, ScanError},
 };
 use crate::{
 	Error, ErrorKind,
@@ -1702,7 +1702,7 @@ impl SyncEngine {
 		let adopted = match backlog {
 			Backlog::Propagate => Vec::new(),
 			Backlog::AdoptDestination => {
-				let prep = self.prepare(pair).await?;
+				let prep = self.prepare(pair, ScanDepth::Fast).await?;
 				// The adoption rewrites baseline rows from this one read, and every row it writes is
 				// for a path it reads as GONE on the source side — so it needs the same evidence a
 				// pass needs before acting on an absence. Read through an incomplete scan or an
@@ -1756,7 +1756,10 @@ impl SyncEngine {
 	/// A resolution never interleaves with a pass: a pass still reading the pair, or recording the
 	/// conflicts it read, is waited for, since the rows it writes would overwrite this one. A
 	/// [`paused`](Self::pause_pair) pair stays resolvable — a pause parks a pass between actions,
-	/// never inside that read, so the wait is at most the read in flight. A pair whose
+	/// never inside that read, so the wait is at most the read in flight. That read includes the
+	/// local scan, so behind a watch's deep-scan pass (see
+	/// [`WatchConfig::deep_scan_every`](super::WatchConfig::deep_scan_every)), which re-hashes every
+	/// local file, the wait can run to minutes on a large tree. A pair whose
 	/// [`removal`](Self::remove_pair) is under way is refused, as the other control verbs are, and
 	/// that removal waits for a resolution already running.
 	///
@@ -2116,8 +2119,9 @@ impl SyncEngine {
 		self.observed.forget_pushes(&decided, Instant::now());
 	}
 
-	/// Run the read-only half: load the baseline, scan, enumerate the remote, build the view.
-	async fn prepare(&self, pair: PairId) -> Result<Prepared, Error> {
+	/// Run the read-only half: load the baseline, scan (at `depth`), enumerate the remote, build the
+	/// view.
+	async fn prepare(&self, pair: PairId, depth: ScanDepth) -> Result<Prepared, Error> {
 		let (record, baseline_entries, failures) = {
 			let store = self.store.lock().await;
 			let record = store
@@ -2169,12 +2173,11 @@ impl SyncEngine {
 
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
-		let mut local_scan =
-			tokio::task::spawn_blocking(move || scan::scan_local(&local_root, &scan_baseline))
-				.await
-				.map_err(|e| {
-					Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}"))
-				})?;
+		let mut local_scan = tokio::task::spawn_blocking(move || {
+			scan::scan_local(&local_root, &scan_baseline, depth)
+		})
+		.await
+		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?;
 
 		let remote_emptied =
 			remote_view.nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some());
@@ -2252,7 +2255,7 @@ impl SyncEngine {
 	/// persist the confirmations it observed. A [`paused`](Self::pause_pair) pair is planned like
 	/// any other.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let prep = self.prepare(pair).await?;
+		let prep = self.prepare(pair, ScanDepth::Fast).await?;
 		if let Some(reason) = refusal(&prep) {
 			return Ok(PlanOutcome {
 				refused: Some(reason),
@@ -2761,6 +2764,19 @@ impl SyncEngine {
 		pair: PairId,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> Result<SyncReport, Error> {
+		self.sync_pass(pair, ScanDepth::Fast, observer).await
+	}
+
+	/// [`sync_once_observed`](Self::sync_once_observed) with the local scan at `depth`. A
+	/// [`Deep`](ScanDepth::Deep) pass re-hashes every local file, so a same-size edit that kept its
+	/// mtime is planned as the edit it is — and a download planned over such a file stashes it first
+	/// (see `apply::stash_local_target`). The watch runs one on its deep-scan tick.
+	pub(super) async fn sync_pass(
+		&self,
+		pair: PairId,
+		depth: ScanDepth,
+		observer: &mut (dyn FnMut(SyncEvent) + Send),
+	) -> Result<SyncReport, Error> {
 		if self.is_paused(pair).await {
 			tracing::debug!("sync_once[pair {pair}]: paused — neither side was read");
 			return Ok(SyncReport {
@@ -2783,7 +2799,7 @@ impl SyncEngine {
 		let Some((recording, prepared)) = gate
 			.guard(async move {
 				let recording = reading.lock_owned().await;
-				(recording, self.prepare(pair).await)
+				(recording, self.prepare(pair, depth).await)
 			})
 			.await
 		else {
@@ -3408,7 +3424,7 @@ mod tests {
 		baseline: &HashMap<String, BaselineEntry>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		let scan = scan::scan_local(root, &HashMap::new());
+		let scan = scan::scan_local(root, &HashMap::new(), ScanDepth::Fast);
 		let plan = plan::reconcile(
 			SyncMode::TwoWay,
 			baseline,
