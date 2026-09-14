@@ -19,7 +19,8 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	PlannedActionKind, PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport,
+	ConflictResolution, PlannedActionKind, PlannedConflict, PlannedNodeKind, SyncEngine, SyncEvent,
+	SyncMode, SyncReport,
 };
 use uuid::Uuid;
 
@@ -1640,6 +1641,53 @@ async fn observ_add_throwing_listener_does_not_corrupt() {
 			.count(),
 		1,
 		"the next pass reports to the same observer again: {next:?}"
+	);
+
+	sc.cleanup();
+}
+
+/// `list_conflicts` reads back the conflicts the engine holds, with no pass: none before, exactly
+/// what the pass reported once it recorded one, and none once that conflict is resolved.
+#[shared_test_runtime]
+async fn observ_add_list_conflicts_reads_held_conflicts() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, "held.txt", b"BASE");
+	write_file(&sc.local, "clean.txt", b"clean");
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 2, "{r1:?}");
+	assert!(sc.engine.list_conflicts(sc.pair).await.unwrap().is_empty());
+
+	write_file(&sc.local, "held.txt", b"LOCAL-EDIT");
+	let client = sc.cache.client.clone();
+	let builder = client.make_file_builder("held.txt", sc.remote).unwrap();
+	let remote = client
+		.upload_file(builder, b"REMOTE-EDIT".as_slice())
+		.await
+		.unwrap();
+	assert!(
+		poll_for_item(sc.cache.db_path(), remote.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"cache never observed the remote edit"
+	);
+	let r2 = sc.sync().await;
+	let expected = vec![PlannedConflict {
+		rel_path: "held.txt".to_string(),
+		local: Some(PlannedNodeKind::File),
+		remote: Some(PlannedNodeKind::File),
+	}];
+	assert_eq!(r2.conflicts, expected, "{r2:?}");
+	assert_eq!(sc.engine.list_conflicts(sc.pair).await.unwrap(), expected);
+	assert!(
+		read_eq(&sc.local, "held.txt", b"LOCAL-EDIT"),
+		"the held local edit was touched"
+	);
+
+	sc.engine
+		.resolve_conflict(sc.pair, "held.txt", ConflictResolution::KeepLocal)
+		.await
+		.unwrap();
+	assert!(
+		sc.engine.list_conflicts(sc.pair).await.unwrap().is_empty(),
+		"a resolved conflict is still listed"
 	);
 
 	sc.cleanup();
