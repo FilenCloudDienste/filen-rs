@@ -4,7 +4,10 @@
 //! Two trigger sources feed one "dirty" signal: a `notify` filesystem watcher on the local root,
 //! and a cache sync-root subscription for remote changes. A burst is debounced (coalesced) into a
 //! single [`sync_once`](super::SyncEngine::sync_once). A periodic tick re-syncs regardless, so
-//! anything the watcher coalesces or drops (FSEvents/inotify are best-effort) is still caught.
+//! anything the watcher coalesces or drops (FSEvents/inotify are best-effort) is still caught. A
+//! rarer deep-scan tick (see [`WatchConfig::deep_scan_every`]) runs a pass that re-hashes every
+//! local file, for the one change neither a watcher event nor the scan's `(size, mtime)` fast-path
+//! reveals: a same-size edit that kept its mtime.
 //!
 //! Neither trigger source is required. A filesystem watcher that cannot start or cannot cover the
 //! whole tree (on Linux, typically a tree with more directories than `fs.inotify.max_user_watches`
@@ -38,11 +41,14 @@ use std::{
 };
 
 use notify::{EventHandler, RecursiveMode, Watcher};
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::Instant};
 
 use super::{
-	SyncEvent, SyncObserver, SyncReport, apply::LOCK_FAILURE, baseline::PairId, engine::SyncEngine,
-	scan::QUARANTINE_DIR,
+	SyncEvent, SyncObserver, SyncReport,
+	apply::LOCK_FAILURE,
+	baseline::PairId,
+	engine::SyncEngine,
+	scan::{QUARANTINE_DIR, ScanDepth},
 };
 use crate::{
 	Error, ErrorKind,
@@ -54,6 +60,12 @@ use crate::{
 const DEBOUNCE: Duration = Duration::from_millis(800);
 /// Default periodic full pass — the backstop for anything the watchers miss or coalesce.
 const SAFETY_NET: Duration = Duration::from_secs(300);
+/// Default interval between deep-scan passes (see [`WatchConfig::deep_scan_every`]): a day.
+const DEEP_SCAN_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// How soon a deep pass that failed — an error, or a side found full — is tried again as one,
+/// when that is sooner than [`WatchConfig::deep_scan_every`]. Not at the backoff cadence: every
+/// attempt re-hashes the whole tree, and a full account or a long outage can last for hours.
+const DEEP_SCAN_RETRY: Duration = Duration::from_secs(60 * 60);
 /// Delay after the first failed pass; doubles per consecutive failure up to [`MAX_BACKOFF`].
 const BASE_BACKOFF: Duration = Duration::from_secs(2);
 /// Ceiling on that backoff, so a persistent failure still retries about as often as the safety net.
@@ -75,6 +87,24 @@ pub struct WatchConfig {
 	/// Must exceed [`debounce`](Self::debounce): a safety net inside the coalescing window would
 	/// keep firing before a burst could ever settle.
 	pub safety_net: Duration,
+	/// How often a pass re-hashes every local file instead of trusting the scan's `(size, mtime)`
+	/// fast-path, or `None` for never. The fast-path reads a same-size edit that kept its mtime
+	/// (`touch -r`, an `rsync -a` restore, an editor that restores the timestamp) as unchanged, so
+	/// the edit is never pushed and a later remote change is pulled over it without a quarantine. A
+	/// deep pass plans it as the edit it is, and stashes it before any download that would
+	/// overwrite it.
+	///
+	/// Measured from the start of the watch, then from the last deep pass. A deep pass that fails
+	/// (including one that finds the disk or the account full) is tried again as one after an hour,
+	/// or after this interval if that is shorter — not on every backoff retry, since each attempt
+	/// reads the whole tree; one a pause cuts short stays due. The schedule lives only as long as
+	/// the watch, so a watch restarted more often than this never runs one.
+	///
+	/// The default is once a day: a deep pass reads the whole tree, which on a large tree or a
+	/// battery-powered device is too costly to run at the safety-net cadence, while an edit that
+	/// hides from both the watcher and the fast-path is rare enough that a day's exposure is the
+	/// better trade. Must be non-zero when set.
+	pub deep_scan_every: Option<Duration>,
 }
 
 impl Default for WatchConfig {
@@ -82,6 +112,7 @@ impl Default for WatchConfig {
 		Self {
 			debounce: DEBOUNCE,
 			safety_net: SAFETY_NET,
+			deep_scan_every: Some(DEEP_SCAN_EVERY),
 		}
 	}
 }
@@ -103,6 +134,12 @@ impl WatchConfig {
 					"watch safety net ({:?}) must be longer than the debounce ({:?})",
 					self.safety_net, self.debounce
 				),
+			));
+		}
+		if self.deep_scan_every.is_some_and(|every| every.is_zero()) {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				"watch deep-scan interval must be greater than zero",
 			));
 		}
 		Ok(())
@@ -358,6 +395,8 @@ async fn run_loop(
 	let mut safety_net = tokio::time::interval(config.safety_net);
 	safety_net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 	safety_net.tick().await; // consume the immediate first tick (the initial pass below covers it)
+	// When the next deep-scan pass is due; `None` while deep scans are off.
+	let mut next_deep = config.deep_scan_every.map(|every| Instant::now() + every);
 
 	loop {
 		if engine.is_paused(pair).await {
@@ -373,8 +412,9 @@ async fn run_loop(
 			continue;
 		}
 
+		let depth = scan_depth(next_deep, Instant::now());
 		let (error, owed) = tokio::select! {
-			outcome = run_pass(&engine, pair, observer.as_mut()) => outcome,
+			outcome = run_pass(&engine, pair, depth, observer.as_mut()) => outcome,
 			// Never resolves: it only makes sure a pass PARKED on a suspension gives up when the
 			// watch is stopped, so the pass above can finish and this loop can end. Without it a
 			// stop (or a dropped handle) waits out the suspension's escalation window — for ever if
@@ -395,6 +435,14 @@ async fn run_loop(
 		} else {
 			failures = failures.saturating_add(1);
 		}
+		next_deep = next_deep_after(
+			next_deep,
+			depth,
+			error.is_some(),
+			owed,
+			config.deep_scan_every,
+			Instant::now(),
+		);
 		if owed {
 			// What that pass did not get to is still owed, and the trigger that started it went
 			// with it. Re-arm the signal, so the wait below ends at the debounce and hands over to
@@ -411,7 +459,16 @@ async fn run_loop(
 			);
 		}
 
-		if !wait_for_next_pass(&mut stop, &dirty, &mut safety_net, config.debounce, delay).await {
+		if !wait_for_next_pass(
+			&mut stop,
+			&dirty,
+			&mut safety_net,
+			next_deep,
+			config.debounce,
+			delay,
+		)
+		.await
+		{
 			break;
 		}
 	}
@@ -465,11 +522,13 @@ async fn wait_while_paused(stop: &mut Stop, poll: Duration) -> bool {
 /// After a failed pass that `backoff` delay *is* the whole wait: it is the retry timer, so a
 /// persistent failure retries on the backoff schedule rather than falling through to whatever the
 /// safety net or a change event happens to offer next. While healthy the wait ends on the periodic
-/// safety-net tick, or on a change event once the burst behind it has gone quiet for `debounce`.
+/// safety-net tick, when the deep scan at `next_deep` comes due, or on a change event once the
+/// burst behind it has gone quiet for `debounce`.
 async fn wait_for_next_pass(
 	stop: &mut Stop,
 	dirty: &Notify,
 	safety_net: &mut tokio::time::Interval,
+	next_deep: Option<Instant>,
 	debounce: Duration,
 	backoff: Option<Duration>,
 ) -> bool {
@@ -485,6 +544,7 @@ async fn wait_for_next_pass(
 		biased;
 		_ = stop.ended() => return false,
 		_ = safety_net.tick() => {}
+		_ = deep_scan_due(next_deep) => {}
 		_ = dirty.notified() => {
 			// Coalesce the burst: wait for `debounce` of quiet (each new event restarts it).
 			loop {
@@ -498,6 +558,48 @@ async fn wait_for_next_pass(
 		}
 	}
 	true
+}
+
+/// Resolves once the deep scan at `next_deep` is due; never, while deep scans are off.
+async fn deep_scan_due(next_deep: Option<Instant>) {
+	match next_deep {
+		Some(due) => tokio::time::sleep_until(due).await,
+		None => std::future::pending().await,
+	}
+}
+
+/// When the deep scan is due after a pass at `depth` that `failed` (an error, or a side found full)
+/// and that did or did not leave work `owed`. Only a deep pass moves the schedule, and not one a
+/// pause cut short. One that ran pushes it a full `every` out; one that failed retries after
+/// [`DEEP_SCAN_RETRY`] at most, rather than re-hashing the tree on every backoff retry.
+fn next_deep_after(
+	next_deep: Option<Instant>,
+	depth: ScanDepth,
+	failed: bool,
+	owed: bool,
+	every: Option<Duration>,
+	now: Instant,
+) -> Option<Instant> {
+	if depth != ScanDepth::Deep || owed {
+		return next_deep;
+	}
+	every.map(|every| {
+		now + if failed {
+			every.min(DEEP_SCAN_RETRY)
+		} else {
+			every
+		}
+	})
+}
+
+/// How the next pass scans: [`Deep`](ScanDepth::Deep) once the deep scan at `next_deep` is due,
+/// whatever woke the loop — a change event landing after the due time takes the deep pass with it.
+fn scan_depth(next_deep: Option<Instant>, now: Instant) -> ScanDepth {
+	if next_deep.is_some_and(|due| now >= due) {
+		ScanDepth::Deep
+	} else {
+		ScanDepth::Fast
+	}
 }
 
 /// How long to wait before the next pass after `failures` consecutive failed ones: nothing while
@@ -517,9 +619,13 @@ fn backoff(failures: u32) -> Option<Duration> {
 async fn run_pass(
 	engine: &SyncEngine,
 	pair: PairId,
+	depth: ScanDepth,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> (Option<String>, bool) {
-	match engine.sync_once_observed(pair, observer).await {
+	if depth == ScanDepth::Deep {
+		tracing::debug!("sync pair {pair}: deep-scan pass, re-hashing every local file");
+	}
+	match engine.sync_pass(pair, depth, observer).await {
 		Ok(report) => {
 			if !report.errors.is_empty() {
 				tracing::warn!("sync pair {pair}: {} action error(s)", report.errors.len());
@@ -688,8 +794,9 @@ mod tests {
 	use tokio::sync::Notify;
 
 	use super::{
-		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, Stop, SyncReport, WatchConfig, WatchState,
-		WatchStatus, backoff, local_event_handler, owes_a_pass, pass_outcome, publish_pass,
+		BASE_BACKOFF, DEBOUNCE, DEEP_SCAN_EVERY, DEEP_SCAN_RETRY, MAX_BACKOFF, SAFETY_NET,
+		ScanDepth, Stop, SyncReport, WatchConfig, WatchState, WatchStatus, backoff,
+		local_event_handler, next_deep_after, owes_a_pass, pass_outcome, publish_pass, scan_depth,
 		start_local_watcher, triggers_pass, wait_for_next_pass, wait_while_paused,
 	};
 	use crate::{
@@ -782,7 +889,7 @@ mod tests {
 
 		handler(Err(watch_limit()));
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
 		assert_eq!(
 			start.elapsed(),
 			DEBOUNCE,
@@ -919,6 +1026,7 @@ mod tests {
 				&mut stop,
 				&dirty,
 				&mut safety_net,
+				None,
 				DEBOUNCE,
 				Some(BASE_BACKOFF)
 			)
@@ -941,11 +1049,11 @@ mod tests {
 
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
 		assert_eq!(start.elapsed(), DEBOUNCE, "a change waits out the debounce");
 
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
 		assert_eq!(
 			start.elapsed(),
 			SAFETY_NET - DEBOUNCE,
@@ -967,6 +1075,7 @@ mod tests {
 				&mut stop,
 				&dirty,
 				&mut safety_net,
+				None,
 				DEBOUNCE,
 				Some(MAX_BACKOFF)
 			)
@@ -992,6 +1101,7 @@ mod tests {
 				&mut stop,
 				&dirty,
 				&mut safety_net,
+				None,
 				DEBOUNCE,
 				Some(MAX_BACKOFF)
 			)
@@ -999,7 +1109,7 @@ mod tests {
 			"a removed pair must not wait out the backoff"
 		);
 		assert!(
-			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await,
+			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await,
 			"a removed pair must not wait for the next trigger either"
 		);
 		assert!(
@@ -1019,7 +1129,9 @@ mod tests {
 
 		drop(removed_tx);
 		let start = tokio::time::Instant::now();
-		assert!(!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(
+			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await
+		);
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
 
@@ -1047,7 +1159,7 @@ mod tests {
 		// Resumed: the pending notification is what ends the very next wait, one debounce later —
 		// not the safety net, which is far away.
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
 		assert_eq!(
 			start.elapsed(),
 			DEBOUNCE,
@@ -1080,7 +1192,7 @@ mod tests {
 		}
 
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
 		assert_eq!(
 			start.elapsed(),
 			DEBOUNCE,
@@ -1129,11 +1241,101 @@ mod tests {
 		stop.ended().await;
 		stop.ended().await;
 		assert!(!wait_while_paused(&mut stop, Duration::from_secs(600)).await);
-		assert!(!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert!(
+			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await
+		);
 		assert!(
 			!stop.pair_removed(),
 			"the handle went away, not the pair — the loop must report the right end"
 		);
+	}
+
+	/// A deep scan comes due on its own interval: the wait ends at that instant, even with the
+	/// safety net further out and nothing changing, and that pass — or any pass after it — is a
+	/// deep one. With deep scans off the wait ignores it, and every pass is fast.
+	#[tokio::test(start_paused = true)]
+	async fn a_deep_scan_wakes_the_loop_when_it_comes_due() {
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+		let every = SAFETY_NET / 3;
+		let start = tokio::time::Instant::now();
+		let next_deep = Some(start + every);
+
+		assert_eq!(scan_depth(next_deep, start), ScanDepth::Fast);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				next_deep,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
+		assert_eq!(
+			start.elapsed(),
+			every,
+			"the deep scan must not wait for the safety net"
+		);
+		assert_eq!(
+			scan_depth(next_deep, tokio::time::Instant::now()),
+			ScanDepth::Deep
+		);
+		// Still due for a pass a change event starts later: the schedule moves only once a deep
+		// pass has run.
+		assert_eq!(
+			scan_depth(next_deep, tokio::time::Instant::now() + DEBOUNCE),
+			ScanDepth::Deep
+		);
+
+		let start = tokio::time::Instant::now();
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
+		assert_eq!(
+			start.elapsed(),
+			SAFETY_NET - every,
+			"with deep scans off, the safety net ends the wait"
+		);
+		assert_eq!(
+			scan_depth(None, tokio::time::Instant::now()),
+			ScanDepth::Fast
+		);
+	}
+
+	/// A deep pass moves the schedule; a fast one or one a pause cut short does not. One that failed
+	/// — an error, or a halt on a full disk or account — is not due again on the next backoff retry,
+	/// only after the retry interval (or its own interval, if shorter).
+	#[test]
+	fn a_failed_deep_pass_is_retried_on_its_own_interval_not_the_backoff() {
+		let now = tokio::time::Instant::now();
+		let due = Some(now);
+		let day = Some(DEEP_SCAN_EVERY);
+		let deep = ScanDepth::Deep;
+
+		assert_eq!(
+			next_deep_after(due, deep, false, false, day, now),
+			Some(now + DEEP_SCAN_EVERY)
+		);
+		let retry = next_deep_after(due, deep, true, false, day, now);
+		assert_eq!(retry, Some(now + DEEP_SCAN_RETRY));
+		assert_eq!(
+			scan_depth(retry, now + MAX_BACKOFF),
+			ScanDepth::Fast,
+			"a backoff retry after a failed deep pass must not re-hash the tree again"
+		);
+		let short = Duration::from_secs(60);
+		assert_eq!(
+			next_deep_after(due, deep, true, false, Some(short), now),
+			Some(now + short)
+		);
+		assert_eq!(next_deep_after(due, deep, false, true, day, now), due);
+		assert_eq!(next_deep_after(due, deep, true, true, day, now), due);
+		assert_eq!(
+			next_deep_after(due, ScanDepth::Fast, true, false, day, now),
+			due
+		);
+		assert_eq!(next_deep_after(None, deep, false, false, None, now), None);
 	}
 
 	/// A configured debounce, not the default one, is what a burst is coalesced over.
@@ -1146,7 +1348,7 @@ mod tests {
 
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, debounce, None).await);
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, debounce, None).await);
 		assert_eq!(start.elapsed(), debounce);
 	}
 
@@ -1155,7 +1357,18 @@ mod tests {
 		let default = WatchConfig::default();
 		assert_eq!(default.debounce, DEBOUNCE);
 		assert_eq!(default.safety_net, SAFETY_NET);
+		assert_eq!(default.deep_scan_every, Some(DEEP_SCAN_EVERY));
 		default.validate().expect("the defaults must be valid");
+
+		// A zero deep-scan interval would re-hash the whole tree on every pass.
+		assert!(
+			WatchConfig {
+				deep_scan_every: Some(Duration::ZERO),
+				..default
+			}
+			.validate()
+			.is_err()
+		);
 
 		// A zero debounce turns every filesystem event into its own pass.
 		assert!(
@@ -1172,6 +1385,7 @@ mod tests {
 			WatchConfig {
 				debounce: Duration::from_secs(10),
 				safety_net: Duration::from_secs(5),
+				deep_scan_every: None,
 			}
 			.validate()
 			.is_err()
@@ -1180,6 +1394,7 @@ mod tests {
 			WatchConfig {
 				debounce: Duration::from_secs(5),
 				safety_net: Duration::from_secs(5),
+				deep_scan_every: None,
 			}
 			.validate()
 			.is_err()
@@ -1187,6 +1402,7 @@ mod tests {
 		WatchConfig {
 			debounce: Duration::from_millis(1),
 			safety_net: Duration::from_millis(2),
+			deep_scan_every: None,
 		}
 		.validate()
 		.expect("a tight but ordered pair is fine");
