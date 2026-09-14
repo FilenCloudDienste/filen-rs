@@ -15,7 +15,7 @@ use filen_sdk_rs::fs::dir::meta::DirectoryMetaChanges;
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::file::meta::FileMetaChanges;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{SyncEvent, SyncMode};
+use filen_sdk_rs::sync_engine::{SyncEvent, SyncMode, SyncReport};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -161,19 +161,38 @@ async fn move02_directory_rename_preserves_children() {
 	let r1 = sc.sync().await;
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, 3, "{r1:?}");
+	let (dirs0, _) = list_dir(&sc.resources.client, &sc.resources.dir).await;
+	let docs0 = find_dir(&dirs0, "docs").expect("docs/ missing");
+	let (docs_dirs0, _) = list_dir(&sc.resources.client, docs0).await;
+	let sub_uuid = find_dir(&docs_dirs0, "sub")
+		.expect("docs/sub missing")
+		.uuid();
+	let docs_uuid = docs0.uuid();
 
 	move_file(&sc.local, "docs", "documents");
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.uploaded, 0, "children must not re-upload: {r2:?}");
+	assert_eq!(
+		r2.moved_remote, 1,
+		"the rename is one move of the directory: {r2:?}"
+	);
+	assert_eq!(r2.remote_dirs_created, 0, "{r2:?}");
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
 
 	let (dirs, _) = list_dir(&sc.resources.client, &sc.resources.dir).await;
 	assert!(find_dir(&dirs, "docs").is_none(), "stale docs/ lingers");
 	let documents = find_dir(&dirs, "documents").expect("documents/ missing");
+	assert_eq!(
+		documents.uuid(),
+		docs_uuid,
+		"the directory keeps its uuid across the rename"
+	);
 	let (d_dirs, d_files) = list_dir(&sc.resources.client, documents).await;
 	assert!(find_file(&d_files, "f1.txt").is_some());
 	assert!(find_file(&d_files, "f2.txt").is_some());
 	let sub = find_dir(&d_dirs, "sub").expect("documents/sub missing");
+	assert_eq!(sub.uuid(), sub_uuid, "the subdirectory keeps its uuid");
 	let (_, sub_files) = list_dir(&sc.resources.client, sub).await;
 	let f3 = find_file(&sub_files, "f3.txt").expect("f3.txt missing");
 	assert_eq!(f3.size, b"C3-three".len() as u64);
@@ -1504,6 +1523,27 @@ async fn move_a3_twoway_divergent_directory_rename() {
 	move_file(&tc.local_a, "d", "dlocal");
 	move_file(&tc.local_b, "d", "dremote");
 
+	// Both sides must settle on the same tree: the directory under one of the two new names, with
+	// its child, and nothing left at `d/`. The usual end is one name — each side moves the directory
+	// on the remote, the move that lands last wins and the other side follows it as a local move — but
+	// a side that reads the other's move before planning its own cannot pair the two, and keeps both
+	// names. Either is converged; a tree the two sides disagree on, or one missing the child, is not.
+	let settled = || {
+		let tree = walk_tree(&tc.local_a);
+		let dirs: Vec<&str> = tree
+			.iter()
+			.filter(|(_, (is_dir, ..))| *is_dir)
+			.map(|(path, _)| path.as_str())
+			.collect();
+		trees_equal(&tc.local_a, &tc.local_b)
+			&& !dirs.is_empty()
+			&& tree.len() == dirs.len() * 2
+			&& dirs.iter().all(|dir| {
+				(*dir == "dlocal" || *dir == "dremote")
+					&& read_eq(&tc.local_a, &format!("{dir}/c.txt"), b"child-C1")
+			})
+	};
+	let mut converged = false;
 	for _ in 0..14 {
 		let (ra, rb) = sync_round(
 			&tc.engine_a,
@@ -1518,19 +1558,52 @@ async fn move_a3_twoway_divergent_directory_rename() {
 		for c in ra.conflict_paths().chain(rb.conflict_paths()) {
 			conflicts.insert(c.to_string());
 		}
+		if settled() {
+			converged = true;
+			break;
+		}
 		tokio::time::sleep(Duration::from_millis(1500)).await;
 	}
-
-	// The child content must survive under SOME directory name on some side; no data loss.
-	let child_survives = read_eq(&tc.local_a, "dlocal/c.txt", b"child-C1")
-		|| read_eq(&tc.local_a, "dremote/c.txt", b"child-C1")
-		|| read_eq(&tc.local_b, "dlocal/c.txt", b"child-C1")
-		|| read_eq(&tc.local_b, "dremote/c.txt", b"child-C1")
-		|| read_eq(&tc.local_a, "d/c.txt", b"child-C1")
-		|| read_eq(&tc.local_b, "d/c.txt", b"child-C1");
 	assert!(
-		child_survives,
-		"a divergent directory rename must not lose the child content"
+		converged,
+		"a divergent directory rename never converged — A {:?} / B {:?}",
+		tree_paths(&tc.local_a),
+		tree_paths(&tc.local_b)
+	);
+	assert!(
+		conflicts.is_empty(),
+		"two renames of one directory are not a conflict: {conflicts:?}"
+	);
+
+	// Settled means stable: a further round on both sides changes nothing.
+	tokio::time::sleep(Duration::from_millis(1500)).await;
+	let (ra, rb) = sync_round(
+		&tc.engine_a,
+		tc.pair_a,
+		&tc.engine_b,
+		tc.pair_b,
+		Order::AFirst,
+	)
+	.await;
+	for (side, report) in [("A", &ra), ("B", &rb)] {
+		assert!(report.errors.is_empty(), "{side}: {report:?}");
+		assert_eq!(
+			report.uploaded + report.downloaded + report.moved_remote + report.moved_local,
+			0,
+			"{side} still moving content after settling: {report:?}"
+		);
+		assert_eq!(
+			report.remotely_trashed + report.locally_deleted,
+			0,
+			"{side} still deleting after settling: {report:?}"
+		);
+		assert!(report.conflicts.is_empty(), "{side}: {report:?}");
+	}
+	assert!(
+		settled(),
+		"the settled state did not hold — A {:?} / B {:?}",
+		tree_paths(&tc.local_a),
+		tree_paths(&tc.local_b)
 	);
 
 	tc.cleanup();
@@ -1918,4 +1991,217 @@ async fn move26_remote_case_only_dir_rename_twoway() {
 #[shared_test_runtime]
 async fn move26_remote_case_only_dir_rename_remote_to_local() {
 	remote_case_only_dir_rename(SyncMode::RemoteToLocal).await;
+}
+
+// ============================================================================
+// MOVE-27 — A directory moved AND renamed on one side is one move of that directory on the other:
+// the same uuids, the children carried along, nothing re-transferred, trashed or quarantined.
+// ============================================================================
+
+const MOVED_A: &[u8] = b"moved-dir-A";
+const MOVED_B: &[u8] = b"moved-dir-B";
+
+/// The uuids of `dir`, its `a.txt`, `sub/` and `sub/b.txt` — asserting that is all it holds.
+async fn moved_subtree_uuids(sc: &SingleClient, dir: &RemoteDirectory) -> [Uuid; 4] {
+	let (sub_dirs, files) = list_dir(&sc.resources.client, dir).await;
+	assert_eq!(sub_dirs.len(), 1, "{sub_dirs:?}");
+	assert_eq!(files.len(), 1, "{files:?}");
+	let a = find_file(&files, "a.txt").expect("a.txt missing");
+	assert_eq!(a.size, MOVED_A.len() as u64, "a.txt size");
+	let sub = find_dir(&sub_dirs, "sub").expect("sub/ missing");
+	let (_, sub_files) = list_dir(&sc.resources.client, sub).await;
+	assert_eq!(sub_files.len(), 1, "{sub_files:?}");
+	let b = find_file(&sub_files, "b.txt").expect("b.txt missing");
+	assert_eq!(b.size, MOVED_B.len() as u64, "b.txt size");
+	[dir.uuid(), a.uuid(), sub.uuid(), b.uuid()]
+}
+
+/// One pass that must have made exactly the given moves and nothing else.
+fn assert_moves_only(report: &SyncReport, moved_remote: usize, moved_local: usize, label: &str) {
+	assert!(report.errors.is_empty(), "{label}: {report:?}");
+	assert_eq!(report.moved_remote, moved_remote, "{label}: {report:?}");
+	assert_eq!(report.moved_local, moved_local, "{label}: {report:?}");
+	assert_eq!(
+		report.uploaded + report.downloaded,
+		0,
+		"{label}: nothing may be re-transferred: {report:?}"
+	);
+	assert_eq!(
+		report.remote_dirs_created + report.local_dirs_created,
+		0,
+		"{label}: no directory may be re-created: {report:?}"
+	);
+	assert_eq!(
+		report.remotely_trashed + report.locally_deleted,
+		0,
+		"{label}: nothing may be deleted: {report:?}"
+	);
+	assert!(report.held.is_empty(), "{label}: {report:?}");
+	assert!(report.conflicts.is_empty(), "{label}: {report:?}");
+}
+
+/// The end state both directions reach: `docs/` now lives at `archive/documents/` on both sides,
+/// with its children, the same remote uuids, and nothing in the Filen trash or the quarantine bin.
+async fn assert_dir_move_converged(sc: &SingleClient, original: [Uuid; 4]) {
+	assert_eq!(
+		tree_paths(&sc.local),
+		vec![
+			"archive",
+			"archive/documents",
+			"archive/documents/a.txt",
+			"archive/documents/sub",
+			"archive/documents/sub/b.txt",
+			"archive/keep.txt",
+		],
+		"local tree must hold the moved directory and every child"
+	);
+	assert!(read_eq(&sc.local, "archive/documents/a.txt", MOVED_A));
+	assert!(read_eq(&sc.local, "archive/documents/sub/b.txt", MOVED_B));
+	assert_eq!(
+		quarantined_file_count(&sc.local),
+		0,
+		"a directory move must quarantine nothing"
+	);
+	let (dirs, files) = list_dir(&sc.resources.client, &sc.resources.dir).await;
+	assert!(files.is_empty(), "no stray file under the root: {files:?}");
+	assert_eq!(dirs.len(), 1, "only archive/ under the root: {dirs:?}");
+	let archive = find_dir(&dirs, "archive").expect("archive/ missing");
+	let (archive_dirs, archive_files) = list_dir(&sc.resources.client, archive).await;
+	assert_eq!(archive_dirs.len(), 1, "{archive_dirs:?}");
+	assert_eq!(archive_files.len(), 1, "{archive_files:?}");
+	let documents = find_dir(&archive_dirs, "documents").expect("archive/documents/ missing");
+	assert_eq!(
+		moved_subtree_uuids(sc, documents).await,
+		original,
+		"the moved directory and its children must keep their uuids"
+	);
+	assert_none_trashed(sc, &original).await;
+}
+
+async fn local_dir_move(mode: SyncMode) {
+	let sc = single_client(mode).await;
+	write_file(&sc.local, "archive/keep.txt", b"moved-dir-keep");
+	write_file(&sc.local, "docs/a.txt", MOVED_A);
+	write_file(&sc.local, "docs/sub/b.txt", MOVED_B);
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 3, "{r1:?}");
+	let (dirs, _) = list_dir(&sc.resources.client, &sc.resources.dir).await;
+	let docs = find_dir(&dirs, "docs").expect("docs/ missing");
+	let original = moved_subtree_uuids(&sc, docs).await;
+	for uuid in original {
+		wait_cache_has(&sc, uuid).await;
+	}
+
+	move_file(&sc.local, "docs", "archive/documents");
+	// The first pass right after the move reads a cache that has not seen it yet.
+	assert_moves_only(&sc.sync().await, 1, 0, "move");
+	assert!(
+		poll_for_dir_name(
+			sc.cache.db_path(),
+			original[0],
+			"documents",
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await,
+		"cache never saw the directory under its new name"
+	);
+	for pass in 0..2 {
+		assert_moves_only(&sc.sync().await, 0, 0, &format!("settled pass {pass}"));
+	}
+	assert_dir_move_converged(&sc, original).await;
+	sc.cleanup();
+}
+
+async fn remote_dir_move(mode: SyncMode) {
+	let sc = single_client(mode).await;
+	let client = &sc.resources.client;
+	let archive = client
+		.create_dir(&root_dirtype(&sc), "archive")
+		.await
+		.unwrap();
+	let keep = client
+		.upload_file(
+			client
+				.make_file_builder("keep.txt", archive.uuid())
+				.unwrap(),
+			b"moved-dir-keep",
+		)
+		.await
+		.unwrap();
+	let mut docs = client.create_dir(&root_dirtype(&sc), "docs").await.unwrap();
+	let a = client
+		.upload_file(
+			client.make_file_builder("a.txt", docs.uuid()).unwrap(),
+			MOVED_A,
+		)
+		.await
+		.unwrap();
+	let sub = client
+		.create_dir(&DirType::<Normal>::Dir(Cow::Borrowed(&docs)), "sub")
+		.await
+		.unwrap();
+	let b = client
+		.upload_file(
+			client.make_file_builder("b.txt", sub.uuid()).unwrap(),
+			MOVED_B,
+		)
+		.await
+		.unwrap();
+	let original = [docs.uuid(), a.uuid(), sub.uuid(), b.uuid()];
+	for uuid in original.into_iter().chain([keep.uuid()]) {
+		wait_cache_has(&sc, uuid).await;
+	}
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.downloaded, 3, "{r1:?}");
+	assert!(read_eq(&sc.local, "docs/sub/b.txt", MOVED_B));
+
+	client
+		.move_dir(&mut docs, &DirType::<Normal>::Dir(Cow::Borrowed(&archive)))
+		.await
+		.unwrap();
+	client
+		.update_dir_metadata(
+			&mut docs,
+			DirectoryMetaChanges::default().name("documents").unwrap(),
+		)
+		.await
+		.unwrap();
+	assert!(
+		poll_for_dir_name(
+			sc.cache.db_path(),
+			docs.uuid(),
+			"documents",
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await,
+		"cache never saw the remote directory move"
+	);
+	assert_moves_only(&sc.sync().await, 0, 1, "move");
+	for pass in 0..2 {
+		assert_moves_only(&sc.sync().await, 0, 0, &format!("settled pass {pass}"));
+	}
+	assert_dir_move_converged(&sc, original).await;
+	sc.cleanup();
+}
+
+#[shared_test_runtime]
+async fn move27_local_dir_move_twoway() {
+	local_dir_move(SyncMode::TwoWay).await;
+}
+
+#[shared_test_runtime]
+async fn move27_local_dir_move_local_to_remote() {
+	local_dir_move(SyncMode::LocalToRemote).await;
+}
+
+#[shared_test_runtime]
+async fn move27_remote_dir_move_twoway() {
+	remote_dir_move(SyncMode::TwoWay).await;
+}
+
+#[shared_test_runtime]
+async fn move27_remote_dir_move_remote_to_local() {
+	remote_dir_move(SyncMode::RemoteToLocal).await;
 }

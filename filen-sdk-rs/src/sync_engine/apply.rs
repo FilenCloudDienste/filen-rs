@@ -53,10 +53,11 @@ pub struct SyncReport {
 	pub remote_dirs_created: usize,
 	pub locally_deleted: usize,
 	pub remotely_trashed: usize,
-	/// Files re-parented/renamed on the remote in place of a re-upload, and directories renamed in
-	/// place on the remote.
+	/// Items re-parented/renamed on the remote in place of a re-upload — a directory counts once,
+	/// whatever its subtree holds.
 	pub moved_remote: usize,
-	/// Files renamed locally in place of a re-download, and directories renamed in place locally.
+	/// Items renamed/moved locally in place of a re-download — a directory counts once, whatever its
+	/// subtree holds.
 	pub moved_local: usize,
 	/// Paths surfaced as two-way conflicts (left untouched), with what each side held.
 	pub conflicts: Vec<PlannedConflict>,
@@ -491,7 +492,7 @@ pub(super) async fn apply(
 /// The server dedups a create against an existing item case-insensitively and hands back that
 /// item, and a case-insensitive filesystem resolves two spellings to one entry, so a delete planned
 /// for one path can land on what another action of the pass just created, moved or renamed. The
-/// planner does not plan that shape (see [`plan::fold_case_only_dir_renames`](super::plan)); this
+/// planner does not plan that shape (see [`plan::fold_dir_moves`](super::plan)); this
 /// is the net under it: a remote trash or local quarantine whose target is, or holds, something the
 /// pass already wrote is refused, and the next pass re-plans from what is really there.
 #[derive(Debug, Default)]
@@ -503,8 +504,8 @@ struct PassWrites {
 	remote_keys: BTreeSet<String>,
 	/// Collision keys of the local paths the pass wrote.
 	local_keys: BTreeSet<String>,
-	/// The new spellings of the directory renames that failed: nothing under them is attempted.
-	failed_renames: Vec<String>,
+	/// Where the directory moves that failed were headed: nothing under those paths is attempted.
+	failed_dir_moves: Vec<String>,
 }
 
 impl PassWrites {
@@ -514,18 +515,13 @@ impl PassWrites {
 			SyncAction::CreateLocalDir { rel_path } | SyncAction::DownloadFile { rel_path, .. } => {
 				self.local_keys.insert(collision_key(rel_path));
 			}
-			SyncAction::MoveLocal { to_path, .. } | SyncAction::RenameLocalDir { to_path, .. } => {
+			SyncAction::MoveLocal { to_path, .. } => {
 				self.local_keys.insert(collision_key(to_path));
 			}
 			SyncAction::CreateRemoteDir { rel_path } | SyncAction::UploadFile { rel_path } => {
 				self.remote_keys.insert(collision_key(rel_path));
 			}
 			SyncAction::MoveRemote {
-				to_path,
-				remote_uuid,
-				..
-			}
-			| SyncAction::RenameRemoteDir {
 				to_path,
 				remote_uuid,
 				..
@@ -552,8 +548,8 @@ impl PassWrites {
 		holds_key_at_or_under(&self.local_keys, rel_path)
 	}
 
-	/// Skip `action` when it sits under a directory whose rename failed this pass — the plan names
-	/// that subtree by a spelling neither side carries — recording it as a failure of its own.
+	/// Skip `action` when it sits under a directory whose move failed this pass — the plan names that
+	/// subtree by a path neither side carries — recording it as a failure of its own.
 	fn skips(
 		&self,
 		action: &SyncAction,
@@ -561,7 +557,7 @@ impl PassWrites {
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> bool {
 		let (from, to) = action.endpoints();
-		let Some(dir) = self.failed_renames.iter().find(|dir| {
+		let Some(dir) = self.failed_dir_moves.iter().find(|dir| {
 			[from, to]
 				.into_iter()
 				.any(|path| path == dir.as_str() || is_under(path, dir))
@@ -592,27 +588,53 @@ fn holds_key_at_or_under(keys: &BTreeSet<String>, rel_path: &str) -> bool {
 		.is_some_and(|next| next.starts_with(&prefix))
 }
 
-/// The rows of a directory renamed in place, as `(the path the store still has the row under, the
-/// row)`. `baseline` already names them by `to` — the plan re-keyed it (see
-/// [`plan::fold_case_only_dir_renames`](super::plan)) — and the store still has them under `from`.
-fn renamed_rows<'a>(
-	baseline: &'a HashMap<String, BaselineEntry>,
+/// The rows of a moved directory's subtree as the store holds them NOW, each as `(the path the store
+/// has it under, the row re-keyed from `from` to `to`)`.
+///
+/// Read from the store, not from the pass's baseline: the plan re-keyed that one for every directory
+/// move of the pass at once (see [`plan::fold_dir_moves`](super::plan)), so for a move with another
+/// nested inside it, it already names the inner directory by the path the INNER move gives it. Taken
+/// from the store, each move commits its own step only, and an inner move that then fails leaves the
+/// rows where the directory really is.
+fn moved_rows(
+	store: &BaselineStore,
+	pair: PairId,
 	from: &str,
 	to: &str,
-) -> Vec<(String, &'a BaselineEntry)> {
-	baseline
-		.iter()
-		.filter(|(path, _)| path.as_str() == to || is_under(path, to))
-		.map(|(path, row)| (format!("{from}{}", &path[to.len()..]), row))
-		.collect()
+) -> rusqlite::Result<Vec<(String, BaselineEntry)>> {
+	Ok(store
+		.entries(pair)?
+		.into_iter()
+		.filter(|row| row.rel_path == from || is_under(&row.rel_path, from))
+		.map(|mut row| {
+			let moved = format!("{to}{}", &row.rel_path[from.len()..]);
+			(std::mem::replace(&mut row.rel_path, moved), row)
+		})
+		.collect())
 }
 
-/// The baseline edits that move `rows` (see [`renamed_rows`]) to their new paths: every delete
-/// before any upsert, so no row is written and then deleted under a path two spellings share.
-fn rename_changes<'a>(rows: &'a [(String, &'a BaselineEntry)]) -> Vec<BaselineChange<'a>> {
+/// The baseline edits that move `rows` (see [`moved_rows`]) to their new paths: every delete before
+/// any upsert, so no row is written and then deleted under a path two spellings share.
+fn rename_changes(rows: &[(String, BaselineEntry)]) -> Vec<BaselineChange<'_>> {
 	let deletes = rows.iter().map(|(old, _)| BaselineChange::Delete(old));
 	let upserts = rows.iter().map(|(_, row)| BaselineChange::Upsert(row));
 	deletes.chain(upserts).collect()
+}
+
+/// Journal a remote directory move from `from` to `to` and carry its subtree's rows along, in one
+/// transaction.
+async fn commit_dir_move(
+	ctx: &ApplyContext<'_>,
+	uuid: Uuid,
+	from: &str,
+	to: &str,
+) -> Result<(), crate::Error> {
+	let rows = moved_rows(&*ctx.store.lock().await, ctx.pair, from, to).map_err(db_err)?;
+	let kind = PendingKind::Moved {
+		from: from.to_string(),
+		to: to.to_string(),
+	};
+	commit_remote_write(ctx, uuid, kind, &rename_changes(&rows)).await
 }
 
 /// Record a pass that could not take the drive lock. It ran none of its `remaining` actions, so it
@@ -700,18 +722,23 @@ async fn resolve_folded_objects(
 			},
 			SyncAction::MoveRemote {
 				to_path,
+				kind,
 				remote_uuid,
 				..
 			} => {
-				wanted_files.insert(*remote_uuid);
+				match kind {
+					NodeKind::File => {
+						wanted_files.insert(*remote_uuid);
+					}
+					// The view already lists the directory at the path it moves to.
+					NodeKind::Dir => {
+						wanted_dirs.insert(to_path);
+					}
+				}
 				wanted_dirs.insert(parent_and_name(to_path).0);
 			}
 			SyncAction::UploadFile { rel_path } | SyncAction::CreateRemoteDir { rel_path } => {
 				wanted_dirs.insert(parent_and_name(rel_path).0);
-			}
-			// The view already lists the directory under its new spelling.
-			SyncAction::RenameRemoteDir { to_path, .. } => {
-				wanted_dirs.insert(to_path);
 			}
 			_ => {}
 		}
@@ -762,7 +789,6 @@ fn mutates_remote(action: &SyncAction) -> bool {
 			| SyncAction::CreateRemoteDir { .. }
 			| SyncAction::TrashRemote { .. }
 			| SyncAction::MoveRemote { .. }
-			| SyncAction::RenameRemoteDir { .. }
 	)
 }
 
@@ -792,10 +818,18 @@ async fn apply_serial(
 	}
 	if let Err(error) = result {
 		tracing::debug!("apply: {} FAILED — {error}", action.describe());
-		if let SyncAction::RenameRemoteDir { to_path, .. }
-		| SyncAction::RenameLocalDir { to_path, .. } = action
+		if let SyncAction::MoveRemote {
+			to_path,
+			kind: NodeKind::Dir,
+			..
+		}
+		| SyncAction::MoveLocal {
+			to_path,
+			kind: NodeKind::Dir,
+			..
+		} = action
 		{
-			writes.failed_renames.push(to_path.clone());
+			writes.failed_dir_moves.push(to_path.clone());
 		}
 		observer(SyncEvent::ActionFailed {
 			rel_path: action.rel_path().to_string(),
@@ -1104,6 +1138,7 @@ async fn apply_one(
 		SyncAction::MoveRemote {
 			from_path,
 			to_path,
+			kind: NodeKind::File,
 			remote_uuid,
 		} => {
 			let mut remote_file = files
@@ -1156,7 +1191,11 @@ async fn apply_one(
 			.await?;
 			report.moved_remote += 1;
 		}
-		SyncAction::MoveLocal { from_path, to_path } => {
+		SyncAction::MoveLocal {
+			from_path,
+			to_path,
+			kind: NodeKind::File,
+		} => {
 			let from = local_path(ctx.local_root, from_path);
 			let to = confined_local_target(ctx.local_root, to_path)?;
 			// The reconciler only plans a move onto a destination the SCAN saw free, but a pass
@@ -1178,35 +1217,69 @@ async fn apply_one(
 			upsert_baseline(ctx, &row).await?;
 			report.moved_local += 1;
 		}
-		SyncAction::RenameRemoteDir {
+		SyncAction::MoveRemote {
 			from_path,
 			to_path,
+			kind: NodeKind::Dir,
 			remote_uuid,
 		} => {
+			// The view — and so this map — already lists the directory at the path it moves to.
 			let mut dir = dir_by_path
 				.get(to_path)
 				.filter(|dir| dir.uuid() == *remote_uuid)
 				.cloned()
-				.ok_or_else(|| internal("rename-source dir missing from the snapshot"))?;
-			let changes = DirectoryMetaChanges::default()
-				.name(parent_and_name(to_path).1)
+				.ok_or_else(|| internal("move-source dir missing from the snapshot"))?;
+			let (from_parent, from_name) = parent_and_name(from_path);
+			let (to_parent, to_name) = parent_and_name(to_path);
+			// Validated before anything moves, so a name the rename would refuse fails the action
+			// with the directory still where the baseline has it.
+			let rename = (to_name != from_name)
+				.then(|| DirectoryMetaChanges::default().name(to_name))
+				.transpose()
 				.map_err(crate::Error::from)?;
-			ctx.client.update_dir_metadata(&mut dir, changes).await?;
+			let reparented = to_parent != from_parent;
+			if reparented {
+				let parent = dir_by_path
+					.get(to_parent)
+					.ok_or_else(|| internal("move-target parent dir is missing"))?
+					.clone();
+				let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
+				ctx.client.move_dir(&mut dir, &parent_type).await?;
+			}
+			if let Some(changes) = rename
+				&& let Err(error) = ctx.client.update_dir_metadata(&mut dir, changes).await
+			{
+				if reparented {
+					// The re-parent landed and the rename did not: the directory now sits under its
+					// new parent with its old name. Record that, or the next pass finds it at neither
+					// end of the move — no baseline row where it is, nothing on either side where the
+					// rows are — and plans the whole subtree as new on both sides. Recorded, the next
+					// pass reads a synced directory and plans the rename alone.
+					let via = match to_parent {
+						"" => from_name.to_string(),
+						parent => format!("{parent}/{from_name}"),
+					};
+					commit_dir_move(ctx, *remote_uuid, from_path, &via).await?;
+				}
+				return Err(error);
+			}
 			dir_by_path.insert(to_path.clone(), dir);
-			let rows = renamed_rows(ctx.baseline, from_path, to_path);
-			let kind = PendingKind::Moved {
-				from: from_path.clone(),
-				to: to_path.clone(),
-			};
-			commit_remote_write(ctx, *remote_uuid, kind, &rename_changes(&rows)).await?;
+			commit_dir_move(ctx, *remote_uuid, from_path, to_path).await?;
 			report.moved_remote += 1;
 		}
-		SyncAction::RenameLocalDir { from_path, to_path } => {
+		SyncAction::MoveLocal {
+			from_path,
+			to_path,
+			kind: NodeKind::Dir,
+		} => {
 			let from = local_path(ctx.local_root, from_path);
 			let to = confined_local_target(ctx.local_root, to_path)?;
-			// On a case-sensitive filesystem the new spelling can have become a directory of its own
-			// since the scan, and a rename onto an empty one would silently replace it.
-			if has_own_directory_entry(&to) {
+			// The destination can have become a directory of its own since the scan, and a rename
+			// onto an empty one would silently replace it. A case-only rename cannot ask for the path
+			// itself — a case-insensitive filesystem answers with the source — so it asks the parent
+			// for the exact name.
+			let case_only = collision_key(from_path) == collision_key(to_path);
+			if has_own_directory_entry(&to) || (!case_only && to.symlink_metadata().is_ok()) {
 				return Err(internal_owned(format!(
 					"refusing to rename {from_path:?} onto the existing {to_path:?}"
 				)));
@@ -1223,10 +1296,9 @@ async fn apply_one(
 				std::fs::rename(&to, &step).map_err(io_err)?;
 				std::fs::rename(&step, &to).map_err(io_err)?;
 			}
-			let rows = renamed_rows(ctx.baseline, from_path, to_path);
-			ctx.store
-				.lock()
-				.await
+			let store = ctx.store.lock().await;
+			let rows = moved_rows(&store, ctx.pair, from_path, to_path).map_err(db_err)?;
+			store
 				.apply_changes(ctx.pair, &rename_changes(&rows))
 				.map_err(db_err)?;
 			report.moved_local += 1;
@@ -1858,6 +1930,7 @@ mod tests {
 		writes.note(&SyncAction::MoveRemote {
 			from_path: "Docs/a.txt".to_string(),
 			to_path: "docs/a.txt".to_string(),
+			kind: NodeKind::File,
 			remote_uuid: Uuid::new_v4(),
 		});
 		writes.note(&SyncAction::DownloadFile {
@@ -1888,27 +1961,23 @@ mod tests {
 		));
 	}
 
-	/// A directory renamed in place moves every row of its subtree back from the new spelling the
-	/// plan already uses to the old one the store still holds, and nothing outside it.
+	/// A directory renamed in place moves every row of its subtree from the spelling the store holds
+	/// to the new one, and nothing outside it.
 	#[test]
-	fn renamed_rows_map_each_subtree_row_to_its_stored_path() {
-		let baseline = HashMap::from([
-			(
-				"docs".to_string(),
-				dir_entry("docs", Some(Uuid::new_v4()), None),
-			),
-			(
-				"docs/sub".to_string(),
-				dir_entry("docs/sub", Some(Uuid::new_v4()), None),
-			),
-			(
-				"docs-x".to_string(),
-				dir_entry("docs-x", Some(Uuid::new_v4()), None),
-			),
-		]);
-		let mut rows: Vec<(String, String)> = renamed_rows(&baseline, "Docs", "docs")
+	fn moved_rows_map_each_subtree_row_to_its_new_path() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), super::super::SyncMode::TwoWay)
+			.unwrap();
+		for path in ["Docs", "Docs/sub", "Docs-x"] {
+			store
+				.upsert_entry(pair, &dir_entry(path, Some(Uuid::new_v4()), None))
+				.unwrap();
+		}
+		let mut rows: Vec<(String, String)> = moved_rows(&store, pair, "Docs", "docs")
+			.unwrap()
 			.into_iter()
-			.map(|(old, row)| (old, row.rel_path.clone()))
+			.map(|(old, row)| (old, row.rel_path))
 			.collect();
 		rows.sort();
 		assert_eq!(
@@ -1918,6 +1987,44 @@ mod tests {
 				("Docs/sub".to_string(), "docs/sub".to_string()),
 			]
 		);
+	}
+
+	/// A move nested inside another commits the rows of its own step only: after the outer move the
+	/// inner directory's rows sit where the disk has them until the inner move runs, nothing stays
+	/// behind under the outer source, and an inner move that never runs leaves the store agreeing
+	/// with the disk.
+	#[test]
+	fn nested_dir_moves_commit_each_step_from_the_store() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), super::super::SyncMode::TwoWay)
+			.unwrap();
+		for path in ["D", "D/in", "D/in/x"] {
+			store
+				.upsert_entry(pair, &dir_entry(path, Some(Uuid::new_v4()), None))
+				.unwrap();
+		}
+		let paths = |store: &BaselineStore| -> Vec<String> {
+			store
+				.entries(pair)
+				.unwrap()
+				.into_iter()
+				.map(|entry| entry.rel_path)
+				.collect()
+		};
+		let step = |from: &str, to: &str| {
+			let rows = moved_rows(&store, pair, from, to).unwrap();
+			store.apply_changes(pair, &rename_changes(&rows)).unwrap();
+		};
+
+		step("D", "E");
+		assert_eq!(
+			paths(&store),
+			["E", "E/in", "E/in/x"],
+			"the outer move committed more than its own step"
+		);
+		step("E/in", "E/in2");
+		assert_eq!(paths(&store), ["E", "E/in2", "E/in2/x"]);
 	}
 
 	#[test]

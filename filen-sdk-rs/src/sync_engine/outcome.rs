@@ -292,35 +292,27 @@ pub(super) fn planned_action(
 			PlannedNodeKind::Dir,
 			None,
 		),
-		// A directory is renamed in place only for a case-only rename; it has no size.
-		SyncAction::RenameRemoteDir { to_path, .. } => (
+		// A file's size is read at the source path, where each side still holds the bytes; a
+		// directory has none.
+		SyncAction::MoveRemote { to_path, kind, .. } => (
 			PlannedActionKind::MoveRemote {
 				to: to_path.clone(),
 			},
-			PlannedNodeKind::Dir,
-			None,
+			(*kind).into(),
+			match kind {
+				NodeKind::File => local_size(&rel_path),
+				NodeKind::Dir => None,
+			},
 		),
-		SyncAction::RenameLocalDir { to_path, .. } => (
+		SyncAction::MoveLocal { to_path, kind, .. } => (
 			PlannedActionKind::MoveLocal {
 				to: to_path.clone(),
 			},
-			PlannedNodeKind::Dir,
-			None,
-		),
-		// Any other move is a file's, and the source path is where each side still holds the bytes.
-		SyncAction::MoveRemote { to_path, .. } => (
-			PlannedActionKind::MoveRemote {
-				to: to_path.clone(),
+			(*kind).into(),
+			match kind {
+				NodeKind::File => remote_size(&rel_path),
+				NodeKind::Dir => None,
 			},
-			PlannedNodeKind::File,
-			local_size(&rel_path),
-		),
-		SyncAction::MoveLocal { to_path, .. } => (
-			PlannedActionKind::MoveLocal {
-				to: to_path.clone(),
-			},
-			PlannedNodeKind::File,
-			remote_size(&rel_path),
 		),
 		SyncAction::TrashRemote { rel_path, kind, .. } => (
 			PlannedActionKind::TrashRemote,
@@ -435,6 +427,7 @@ mod tests {
 			&SyncAction::MoveRemote {
 				from_path: "old.txt".to_string(),
 				to_path: "new/here.txt".to_string(),
+				kind: NodeKind::File,
 				remote_uuid: Uuid::nil(),
 			},
 			&local,
