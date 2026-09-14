@@ -8,11 +8,14 @@
 //! missing root) must never let the mass-delete guard propagate deletions.
 //!
 //! Symlinks are followed and their targets read as regular files (Filen has no symlink concept and
-//! the engine never writes one); `walkdir`'s loop detection guards against cycles.
+//! the engine never writes one); `walkdir`'s loop detection guards against cycles. A symlink that
+//! cannot be followed (dangling, or part of a loop) is recorded as an error but does not make the
+//! scan incomplete, unless the baseline tracks that path (see [`LocalScan::complete`]).
 
 use std::{
 	collections::{BTreeMap, HashMap},
 	ffi::OsStr,
+	fmt,
 	path::{Component, Path},
 };
 
@@ -44,14 +47,15 @@ pub(crate) struct LocalNode {
 	pub(crate) content_hash: Option<Blake3Hash>,
 }
 
-/// What went wrong for one entry during a scan. Non-fatal individually (collected), but any error
-/// marks the whole scan [`incomplete`](LocalScan::complete).
-// Variant fields are diagnostic context surfaced through `Debug` (the errors are collected and
-// logged), not read directly — kept for observability rather than deleted.
-#[allow(dead_code)]
+/// What went wrong for one entry during a scan. Non-fatal individually: the walk carries on, every
+/// error is logged at `warn` as it is recorded, and all but a
+/// [`DuplicateName`](Self::DuplicateName) (which refuses the pass instead) are reported in the
+/// pass's [`SyncReport::errors`](super::SyncReport::errors). Any error marks the whole scan
+/// [`incomplete`](LocalScan::complete), except a symlink that cannot be followed.
 #[derive(Debug)]
 pub(crate) enum ScanError {
-	/// An entry could not be read (permission, vanished mid-walk, hash failure, a symlink loop).
+	/// An entry could not be read (permission, vanished mid-walk, hash failure, a symlink that is
+	/// dangling or part of a loop).
 	Io {
 		rel_path: String,
 		source: std::io::Error,
@@ -63,6 +67,27 @@ pub(crate) enum ScanError {
 	DuplicateName { rel_path: String },
 }
 
+impl fmt::Display for ScanError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			// An error on the root itself (a missing root) has no relative path.
+			Self::Io { rel_path, source } if rel_path.is_empty() => {
+				write!(f, "local root: {source}")
+			}
+			Self::Io { rel_path, source } => write!(f, "{rel_path}: {source}"),
+			Self::NonUtf8Name { lossy_path } => {
+				write!(f, "{lossy_path}: the name is not valid UTF-8")
+			}
+			Self::DuplicateName { rel_path } => {
+				write!(
+					f,
+					"{rel_path}: the names collide once case and Unicode form are folded"
+				)
+			}
+		}
+	}
+}
+
 /// The result of scanning a local root.
 #[derive(Debug)]
 pub(crate) struct LocalScan {
@@ -71,6 +96,12 @@ pub(crate) struct LocalScan {
 	/// subtree, a non-UTF-8 name, or a normalized-name collision. The mass-delete guard refuses to
 	/// propagate deletions from an incomplete scan (an empty/half-read source must not nuke the
 	/// destination).
+	///
+	/// A symlink that cannot be followed (dangling, or looping back onto an ancestor) leaves it
+	/// true: the link itself is all there is, and treating it as missing evidence would hold every
+	/// deletion of the pair for as long as the link exists. Unless the baseline has a row at that
+	/// path: then the link used to lead somewhere that was synced (an unmounted drive, say), and
+	/// reading its subtree as deleted would propagate that.
 	pub(crate) complete: bool,
 	pub(crate) errors: Vec<ScanError>,
 	/// Paths whose NAME the remote would reject, mapped to the validator's own message. Reported
@@ -85,6 +116,37 @@ pub(crate) struct LocalScan {
 	/// makes every apparent deletion untrustworthy. An unsyncable name is the opposite — a fully
 	/// observed item that simply cannot be pushed — so the guard must not be tripped by it.
 	pub(crate) invalid_names: BTreeMap<String, String>,
+}
+
+impl LocalScan {
+	/// One line per scan error a pass reports in [`SyncReport::errors`](super::SyncReport::errors):
+	/// every error but a [`DuplicateName`](ScanError::DuplicateName), which refuses the pass with
+	/// its own line instead.
+	pub(crate) fn reported_errors(&self) -> impl Iterator<Item = String> + '_ {
+		self.errors
+			.iter()
+			.filter(|e| !matches!(e, ScanError::DuplicateName { .. }))
+			.map(|e| format!("local scan: {e}"))
+	}
+}
+
+/// Log `error` and collect it.
+fn record(errors: &mut Vec<ScanError>, root: &Path, error: ScanError) {
+	tracing::warn!("local scan of {}: {error}", root.display());
+	errors.push(error);
+}
+
+/// Whether a walk error is a symlink that cannot be followed: one looping back onto an ancestor, or
+/// one whose target does not resolve (dangling, or a link to itself). A symlink to a directory that
+/// merely cannot be READ is not one of these — its target exists and was not read.
+fn unfollowable_symlink(err: &walkdir::Error) -> bool {
+	if err.loop_ancestor().is_some() {
+		return true;
+	}
+	err.path().is_some_and(|path| {
+		std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+			&& std::fs::metadata(path).is_err()
+	})
 }
 
 /// The reason the remote would reject `rel_path`'s own name, or `None` if it would accept it.
@@ -171,19 +233,27 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 		let entry = match entry {
 			Ok(entry) => entry,
 			Err(err) => {
-				// A walk error (unreadable dir, symlink loop) — the tree is partial.
-				complete = false;
 				let rel_path = err
 					.path()
 					.and_then(|p| p.strip_prefix(root).ok())
 					.and_then(normalize_rel_path)
 					.unwrap_or_default();
-				errors.push(ScanError::Io {
-					rel_path,
-					source: err
+				// An unreadable directory or entry means the tree is partial. A symlink that leads
+				// nowhere does not: there is nothing behind it to have missed — unless something
+				// was synced there, which would otherwise read as deleted.
+				if !unfollowable_symlink(&err) || baseline.contains_key(&rel_path) {
+					complete = false;
+				}
+				let source = match err.loop_ancestor() {
+					Some(ancestor) => std::io::Error::other(format!(
+						"symlink loops back onto {}",
+						ancestor.display()
+					)),
+					None => err
 						.into_io_error()
 						.unwrap_or_else(|| std::io::Error::other("directory walk error")),
-				});
+				};
+				record(&mut errors, root, ScanError::Io { rel_path, source });
 				continue;
 			}
 		};
@@ -198,9 +268,13 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 		};
 		let Some(rel_path) = normalize_rel_path(rel) else {
 			complete = false;
-			errors.push(ScanError::NonUtf8Name {
-				lossy_path: rel.to_string_lossy().into_owned(),
-			});
+			record(
+				&mut errors,
+				root,
+				ScanError::NonUtf8Name {
+					lossy_path: rel.to_string_lossy().into_owned(),
+				},
+			);
 			continue;
 		};
 
@@ -210,12 +284,10 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 			Ok(metadata) => metadata,
 			Err(err) => {
 				complete = false;
-				errors.push(ScanError::Io {
-					rel_path,
-					source: err
-						.into_io_error()
-						.unwrap_or_else(|| std::io::Error::other("metadata error")),
-				});
+				let source = err
+					.into_io_error()
+					.unwrap_or_else(|| std::io::Error::other("metadata error"));
+				record(&mut errors, root, ScanError::Io { rel_path, source });
 				continue;
 			}
 		};
@@ -225,7 +297,8 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 		} else if metadata.is_file() {
 			NodeKind::File
 		} else {
-			// Sockets, FIFOs, devices, broken symlinks: not syncable, skip silently.
+			// Sockets, FIFOs, devices: not syncable, skip silently. (A broken symlink never gets
+			// here: following it fails, and the walk hands it over as an error above.)
 			continue;
 		};
 
@@ -252,9 +325,13 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 
 		if let Some(previous) = claimed.insert(collision_key(&rel_path), rel_path.clone()) {
 			complete = false;
-			errors.push(ScanError::DuplicateName {
-				rel_path: format!("{previous} / {rel_path}"),
-			});
+			record(
+				&mut errors,
+				root,
+				ScanError::DuplicateName {
+					rel_path: format!("{previous} / {rel_path}"),
+				},
+			);
 			continue;
 		}
 
@@ -275,7 +352,7 @@ pub(crate) fn scan_local(root: &Path, baseline: &HashMap<String, BaselineEntry>)
 						Ok(hash) => Some(hash),
 						Err(source) => {
 							complete = false;
-							errors.push(ScanError::Io { rel_path, source });
+							record(&mut errors, root, ScanError::Io { rel_path, source });
 							continue;
 						}
 					},
@@ -537,6 +614,139 @@ mod tests {
 			vec!["keep.txt"],
 			"the quarantine subtree is not scanned"
 		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn an_unreadable_directory_is_reported_with_its_path() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		fs::create_dir(root.join("locked")).unwrap();
+		fs::write(root.join("locked").join("inner.txt"), b"y").unwrap();
+		fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+		let scan = scan_local(&root, &HashMap::new());
+		fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+
+		assert!(!scan.complete, "an unreadable subtree is missing evidence");
+		let reported: Vec<String> = scan.reported_errors().collect();
+		assert_eq!(reported.len(), 1, "{reported:?}");
+		assert!(
+			reported[0].starts_with("local scan: locked: "),
+			"the line names the path it is about: {reported:?}"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[test]
+	fn a_name_collision_is_not_reported_as_an_error_line() {
+		let scan = LocalScan {
+			nodes: HashMap::new(),
+			complete: false,
+			errors: vec![
+				ScanError::DuplicateName {
+					rel_path: "A.txt / a.txt".to_string(),
+				},
+				ScanError::NonUtf8Name {
+					lossy_path: "bad\u{FFFD}".to_string(),
+				},
+				ScanError::Io {
+					rel_path: String::new(),
+					source: std::io::Error::from(std::io::ErrorKind::NotFound),
+				},
+			],
+			invalid_names: BTreeMap::new(),
+		};
+		let reported: Vec<String> = scan.reported_errors().collect();
+		assert_eq!(
+			reported,
+			vec![
+				"local scan: bad\u{FFFD}: the name is not valid UTF-8".to_string(),
+				format!(
+					"local scan: local root: {}",
+					std::io::Error::from(std::io::ErrorKind::NotFound)
+				),
+			],
+			"a collision refuses the pass with its own line; everything else is reported"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_dangling_symlink_or_a_loop_is_reported_but_keeps_the_scan_complete() {
+		use std::os::unix::fs::symlink;
+
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+		symlink(root.join("itself"), root.join("itself")).unwrap();
+		fs::create_dir(root.join("cycle")).unwrap();
+		symlink(root.join("cycle"), root.join("cycle").join("self")).unwrap();
+
+		let scan = scan_local(&root, &HashMap::new());
+		assert!(
+			scan.complete,
+			"a link that leads nowhere hides nothing, so deletions must not be held for it: {:?}",
+			scan.errors
+		);
+		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		paths.sort();
+		assert_eq!(paths, vec!["cycle", "keep.txt"]);
+
+		let mut errored: Vec<&str> = scan
+			.errors
+			.iter()
+			.map(|e| match e {
+				ScanError::Io { rel_path, .. } => rel_path.as_str(),
+				other => panic!("unexpected scan error {other:?}"),
+			})
+			.collect();
+		errored.sort_unstable();
+		assert_eq!(errored, vec!["cycle/self", "dangling", "itself"]);
+		assert_eq!(scan.reported_errors().count(), 3);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_dangling_symlink_the_baseline_tracks_marks_the_scan_incomplete() {
+		use std::os::unix::fs::symlink;
+
+		let root = temp_root();
+		// A link to a directory that was synced through it, and is now gone (an unmounted drive).
+		symlink(root.join("unmounted"), root.join("media")).unwrap();
+		let baseline = HashMap::from([(
+			"media".to_string(),
+			BaselineEntry {
+				rel_path: "media".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: None,
+				content_hash: None,
+				size: None,
+				local_mtime: None,
+				remote_modified: None,
+				state: BaselineState::Synced,
+				local_kind: None,
+				remote_kind: None,
+				remote_hash: None,
+				remote_size: None,
+				remote_stable_uuid: None,
+				agreed_hash: None,
+			},
+		)]);
+
+		let scan = scan_local(&root, &baseline);
+		assert!(
+			!scan.complete,
+			"what was synced behind the link must not read as deleted"
+		);
+		assert_eq!(scan.reported_errors().count(), 1, "{:?}", scan.errors);
 
 		fs::remove_dir_all(&root).ok();
 	}

@@ -2819,6 +2819,8 @@ impl SyncEngine {
 		});
 
 		report.unsyncable = prep.unsyncable();
+		// Before the refusal check, so a refused pass still says what the scan could not read.
+		report.errors.extend(prep.local_scan.reported_errors());
 
 		if let Some(refusal) = refusal(&prep) {
 			tracing::debug!("sync_once[pair {pair}]: refused — {refusal:?}");
