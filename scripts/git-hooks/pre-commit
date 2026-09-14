@@ -91,10 +91,11 @@ if have cargo; then
 fi
 
 # Sync-engine clippy (a native-only feature not covered by the default or wasm runs);
-# --all-targets also type-checks the live e2e test binary (which CI does not run).
+# --all-targets also type-checks its live test binaries, and `malformed` the cases gated
+# on it. Same command as ci-linux's sync engine pass.
 if have cargo; then
-	run "cargo clippy -p filen-sdk-rs -F sync-engine -- -D warnings" \
-		cargo clippy -p filen-sdk-rs -F sync-engine --all-targets -- -D warnings
+	run "cargo clippy -p filen-sdk-rs -F sync-engine,malformed -- -D warnings" \
+		cargo clippy -p filen-sdk-rs -F sync-engine,malformed --all-targets -- -D warnings
 fi
 
 # WASM clippy: the two configurations wasm-pack.sh ships (the service-worker one
