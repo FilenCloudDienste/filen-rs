@@ -6,6 +6,12 @@
 //! single [`sync_once`](super::SyncEngine::sync_once). A periodic tick re-syncs regardless, so
 //! anything the watcher coalesces or drops (FSEvents/inotify are best-effort) is still caught.
 //!
+//! Neither trigger source is required. A filesystem watcher that cannot start or cannot cover the
+//! whole tree (on Linux, typically a tree with more directories than `fs.inotify.max_user_watches`
+//! allows) and a cache subscription the cache refuses are logged, recorded on the
+//! [`WatchStatus`], and leave that side on the safety net alone — a slower sync, not none. A
+//! watcher error at runtime is recorded the same way, and wakes the loop for a pass.
+//!
 //! Self-induced changes (the engine's own writes/uploads) re-trigger the watcher and the cache
 //! subscription; that costs at most one extra pass, which the baseline recognizes as already
 //! synced and no-ops. The engine's own *staging* writes — download temp files and the quarantine
@@ -31,7 +37,7 @@ use std::{
 	time::Duration,
 };
 
-use notify::{RecursiveMode, Watcher};
+use notify::{EventHandler, RecursiveMode, Watcher};
 use tokio::sync::Notify;
 
 use super::{
@@ -115,9 +121,10 @@ pub struct WatchHandle {
 	// Resolves when the background loop has returned; `stop` awaits it.
 	loop_done: tokio::task::JoinHandle<()>,
 	status: tokio::sync::watch::Receiver<WatchStatus>,
-	// Holds the FS watcher and the cache registration alive for the watch's lifetime.
-	_watcher: notify::RecommendedWatcher,
-	_sync_root: SyncRootHandle,
+	// Holds the FS watcher and the cache registration alive for the watch's lifetime. Either is
+	// `None` when it could not be set up; the status says so (see [`WatchStatus`]).
+	_watcher: Option<notify::RecommendedWatcher>,
+	_sync_root: Option<SyncRootHandle>,
 }
 
 impl WatchHandle {
@@ -182,6 +189,17 @@ pub struct WatchStatus {
 	/// What the loop is doing — including the two ways it can END, which a caller has no other way
 	/// to tell apart.
 	pub state: WatchState,
+	/// Why the watch no longer hears about every LOCAL change as it happens, or `None` while the
+	/// filesystem watcher covers the whole tree. Set when the watcher could not start or could not
+	/// watch the whole tree, or reported an error while running (a directory created past the OS
+	/// watch limit goes unwatched). Local changes it misses are picked up by the safety-net pass.
+	/// Holds the first error, and stays set for the life of the watch: the watcher does not recover
+	/// the coverage it lost.
+	pub local_events_degraded: Option<String>,
+	/// Why the watch hears about no REMOTE changes as they happen, or `None` while its cache
+	/// subscription is registered. Set when the cache refused the subscription; remote changes are
+	/// then picked up by the safety-net pass. Stays set for the life of the watch.
+	pub remote_events_degraded: Option<String>,
 }
 
 impl SyncEngine {
@@ -226,36 +244,46 @@ impl SyncEngine {
 		let local_root = PathBuf::from(&record.local_root);
 
 		let dirty = Arc::new(Notify::new());
+		// Created before either trigger source, so a source that fails to start can say so.
+		let (status_tx, status_rx) = tokio::sync::watch::channel(WatchStatus::default());
 
 		// Remote-change trigger: a cache sync-root subscription that pings on any committed batch.
+		// Best-effort, like the engine's own subscription (see `SyncEngine::observe_pair`): without
+		// it remote changes wait for the safety net, which is better than no watch at all.
 		let remote_dirty = Arc::clone(&dirty);
 		let callback: SyncRootCallback = Box::new(move |_events| {
 			remote_dirty.notify_one();
 		});
-		let sync_root = self
+		let sync_root = match self
 			.client
 			.clone()
 			.add_sync_root(record.remote_root, callback)
-			.await?;
+			.await
+		{
+			Ok(handle) => Some(handle),
+			Err(error) => {
+				tracing::warn!(
+					"sync pair {pair}: remote change notifications are unavailable ({error}); remote changes will sync on the safety net"
+				);
+				status_tx.send_modify(|status| {
+					status.remote_events_degraded = Some(error.to_string());
+				});
+				None
+			}
+		};
 
 		// Local-change trigger: a recursive filesystem watcher on the local root. The watcher
 		// reports canonicalized paths, so the root it filters against must be canonical too.
-		let local_dirty = Arc::clone(&dirty);
 		let watch_root = std::fs::canonicalize(&local_root).unwrap_or_else(|_| local_root.clone());
-		let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-			if let Ok(event) = &res
-				&& triggers_pass(&watch_root, event)
-			{
-				local_dirty.notify_one();
-			}
-		})
-		.map_err(watch_error)?;
-		watcher
-			.watch(&local_root, RecursiveMode::Recursive)
-			.map_err(watch_error)?;
+		let handler = local_event_handler(pair, watch_root, Arc::clone(&dirty), status_tx.clone());
+		let watcher = start_local_watcher::<notify::RecommendedWatcher>(
+			pair,
+			&local_root,
+			handler,
+			&status_tx,
+		);
 
 		let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-		let (status_tx, status_rx) = tokio::sync::watch::channel(WatchStatus::default());
 		let stop = Stop {
 			handle: shutdown_rx,
 			removed,
@@ -375,12 +403,7 @@ async fn run_loop(
 			// resume, with nothing else to wake it (the work it skipped changed neither side).
 			dirty.notify_one();
 		}
-		// A closed channel just means nobody is watching the health any more.
-		let _ = status.send(WatchStatus {
-			consecutive_failures: failures,
-			last_error: error,
-			state: WatchState::Running,
-		});
+		publish_pass(&status, failures, error);
 		let delay = backoff(failures);
 		if let Some(delay) = delay {
 			tracing::warn!(
@@ -566,31 +589,231 @@ fn is_engine_staging(root: &Path, path: &Path) -> bool {
 		|| rel.components().next().map(|c| c.as_os_str()) == Some(OsStr::new(QUARANTINE_DIR))
 }
 
-fn watch_error(error: notify::Error) -> Error {
-	Error::custom_with_source(ErrorKind::IO, error, Some("filesystem watcher".to_string()))
+/// Publish a finished pass's health. Only the pass's own fields change: a degraded trigger source
+/// recorded earlier is still degraded after the pass.
+fn publish_pass(
+	status: &tokio::sync::watch::Sender<WatchStatus>,
+	failures: u32,
+	error: Option<String>,
+) {
+	status.send_modify(|status| {
+		status.consecutive_failures = failures;
+		status.last_error = error;
+		status.state = WatchState::Running;
+	});
+}
+
+/// Start the filesystem watcher on `root`. Never fails the watch: a watcher that cannot be created
+/// is recorded (see [`degrade_local`]) and `None` leaves local changes to the safety net. One that
+/// starts but cannot watch the whole tree — on Linux, a tree with more directories than
+/// `fs.inotify.max_user_watches` allows — is recorded too, but kept: it still reports changes in
+/// the part of the tree it did cover.
+///
+/// Generic over the watcher so a test can make it fail; the watch always uses
+/// [`notify::RecommendedWatcher`].
+fn start_local_watcher<W: Watcher>(
+	pair: PairId,
+	root: &Path,
+	handler: impl EventHandler,
+	status: &tokio::sync::watch::Sender<WatchStatus>,
+) -> Option<W> {
+	let mut watcher = W::new(handler, notify::Config::default())
+		.inspect_err(|error| degrade_local(pair, status, error))
+		.ok()?;
+	if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
+		degrade_local(pair, status, &error);
+	}
+	Some(watcher)
+}
+
+/// The filesystem watcher's event handler. A change wakes the loop unless it is the engine's own
+/// staging write (see [`triggers_pass`]). An error wakes it too, and is recorded: it means the
+/// watcher may have missed something — a directory created past the OS watch limit goes unwatched,
+/// a failed read loses the events it held — so a pass runs now rather than at the next safety net.
+fn local_event_handler(
+	pair: PairId,
+	root: PathBuf,
+	dirty: Arc<Notify>,
+	status: tokio::sync::watch::Sender<WatchStatus>,
+) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+	move |res| match res {
+		Ok(event) => {
+			if triggers_pass(&root, &event) {
+				dirty.notify_one();
+			}
+		}
+		Err(error) => {
+			degrade_local(pair, &status, &error);
+			dirty.notify_one();
+		}
+	}
+}
+
+/// Record on the status that the watch no longer hears about every local change. Keeps the FIRST
+/// error, the one that cost the coverage (a later one is usually the same limit hit again), and
+/// warns for that one only, so a watcher reporting a stream of errors cannot flood the log.
+fn degrade_local(
+	pair: PairId,
+	status: &tokio::sync::watch::Sender<WatchStatus>,
+	error: &notify::Error,
+) {
+	let first = status.send_if_modified(|status| {
+		if status.local_events_degraded.is_some() {
+			return false;
+		}
+		status.local_events_degraded = Some(error.to_string());
+		true
+	});
+	if first {
+		tracing::warn!(
+			"sync pair {pair}: the filesystem watcher is not seeing every local change ({error}); what it misses will sync on the safety net"
+		);
+	} else {
+		tracing::debug!("sync pair {pair}: filesystem watcher error: {error}");
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use std::{
 		path::{Path, PathBuf},
+		sync::Arc,
 		time::Duration,
 	};
 
 	use notify::{
-		EventKind,
+		EventHandler, EventKind, RecursiveMode, Watcher, WatcherKind,
 		event::{CreateKind, ModifyKind, RenameMode},
 	};
 	use tokio::sync::Notify;
 
 	use super::{
-		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, Stop, SyncReport, WatchConfig, backoff,
-		owes_a_pass, pass_outcome, triggers_pass, wait_for_next_pass, wait_while_paused,
+		BASE_BACKOFF, DEBOUNCE, MAX_BACKOFF, SAFETY_NET, Stop, SyncReport, WatchConfig, WatchState,
+		WatchStatus, backoff, local_event_handler, owes_a_pass, pass_outcome, publish_pass,
+		start_local_watcher, triggers_pass, wait_for_next_pass, wait_while_paused,
 	};
 	use crate::{
 		Error, ErrorKind,
 		sync_engine::apply::{LOCK_FAILURE, note_lock_failure},
 	};
+
+	fn watch_limit() -> notify::Error {
+		notify::Error::new(notify::ErrorKind::MaxFilesWatch)
+	}
+
+	/// A watcher the OS refuses to create at all.
+	struct Unstartable;
+
+	impl Watcher for Unstartable {
+		fn new<F: EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+			Err(notify::Error::generic("no watcher backend"))
+		}
+		fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
+			unreachable!("never created")
+		}
+		fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+			unreachable!("never created")
+		}
+		fn kind() -> WatcherKind {
+			WatcherKind::NullWatcher
+		}
+	}
+
+	/// A watcher that starts, then runs out of OS watches part-way through the tree.
+	struct OverLimit;
+
+	impl Watcher for OverLimit {
+		fn new<F: EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+			Ok(Self)
+		}
+		fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
+			Err(watch_limit())
+		}
+		fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+			Ok(())
+		}
+		fn kind() -> WatcherKind {
+			WatcherKind::NullWatcher
+		}
+	}
+
+	/// A watcher that cannot be set up must not take the watch down with it: the watch starts on
+	/// the safety net alone, and says so on its status instead of failing.
+	#[test]
+	fn a_watcher_that_cannot_start_leaves_the_watch_degraded_not_failed() {
+		let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
+		assert!(
+			start_local_watcher::<Unstartable>(1, Path::new("/sync/root"), |_| {}, &status)
+				.is_none()
+		);
+		let degraded = health.borrow().local_events_degraded.clone();
+		assert_eq!(degraded.as_deref(), Some("no watcher backend"));
+		assert_eq!(health.borrow().remote_events_degraded, None);
+	}
+
+	/// A watcher that covered only part of the tree is kept, since it still reports that part, and
+	/// the watch is marked degraded.
+	#[test]
+	fn a_watcher_over_the_watch_limit_is_kept_and_reported() {
+		let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
+		assert!(
+			start_local_watcher::<OverLimit>(1, Path::new("/sync/root"), |_| {}, &status).is_some()
+		);
+		assert_eq!(
+			health.borrow().local_events_degraded.as_deref(),
+			Some("OS file watch limit reached.")
+		);
+	}
+
+	/// A watcher error at runtime wakes the loop (whatever the watcher lost is caught one debounce
+	/// later, not at the safety net), marks the watch degraded, and keeps the first error.
+	#[tokio::test(start_paused = true)]
+	async fn a_watcher_error_wakes_the_loop_and_marks_the_watch_degraded() {
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
+		let dirty = Arc::new(Notify::new());
+		let mut safety_net = safety_net().await;
+		let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
+		let mut handler = local_event_handler(
+			1,
+			PathBuf::from("/sync/root"),
+			Arc::clone(&dirty),
+			status.clone(),
+		);
+
+		handler(Err(watch_limit()));
+		let start = tokio::time::Instant::now();
+		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, DEBOUNCE, None).await);
+		assert_eq!(
+			start.elapsed(),
+			DEBOUNCE,
+			"a watcher error must wake the loop, not wait for the safety net"
+		);
+		assert_eq!(
+			health.borrow().local_events_degraded.as_deref(),
+			Some("OS file watch limit reached.")
+		);
+
+		handler(Err(notify::Error::generic("read failed")));
+		assert_eq!(
+			health.borrow().local_events_degraded.as_deref(),
+			Some("OS file watch limit reached."),
+			"the first error is the one that cost the coverage"
+		);
+
+		// A pass finishing afterwards does not clear it: the lost coverage does not come back.
+		publish_pass(&status, 1, Some("boom".to_string()));
+		let after = health.borrow().clone();
+		assert_eq!(
+			after,
+			WatchStatus {
+				consecutive_failures: 1,
+				last_error: Some("boom".to_string()),
+				state: WatchState::Running,
+				local_events_degraded: Some("OS file watch limit reached.".to_string()),
+				remote_events_degraded: None,
+			}
+		);
+	}
 
 	/// A safety-net interval as `run_loop` sets one up: the immediate first tick consumed, so the
 	/// next one is a full [`SAFETY_NET`] away.
