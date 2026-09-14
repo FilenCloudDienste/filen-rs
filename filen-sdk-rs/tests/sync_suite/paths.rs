@@ -838,15 +838,49 @@ async fn path_08_os_reserved_device_names() {}
 #[shared_test_runtime]
 async fn path_09_trailing_space_or_dot_names() {}
 
-/// PATH-11 — two remote siblings differing only in case (`data.txt`/`DATA.TXT`) on a
-/// case-insensitive local FS. Plan: bypass server case-dedup (the `malformed`-feature
-/// `create_dir_with_name_hash`/equivalent) so both coexist; r2l. Verify: engine surfaces a
-/// collision (no silent B-over-A clobber), each materialized file has ITS content, report counts
-/// it, deterministic on re-run. (Mirrors `sync_engine_blackbox_tests::remote_case_collision_refused`,
-/// which needs `-F malformed`; the suite binary is not built with `malformed`.)
-#[ignore = "blocked: needs the `malformed` feature seam (create_dir_with_name_hash) not enabled for this suite binary — see module docs"]
+/// PATH-11 — two remote sibling directories differing only in case (`Data`/`DATA`, staged past the
+/// server's case-insensitive dedup) cannot both map onto one local path, so a remote->local pass
+/// refuses as a remote collision: nothing is materialized locally (no silent clobber of one by the
+/// other), both remote items and their contents stay put, and a re-run refuses the same way.
+/// Needs `-F malformed` for the name-hash seam.
+///
+/// Only the DIRECTORY shape is staged: the name-hash seam exists only for directory creation, so two
+/// sibling FILES differing only in case (`data.txt`/`DATA.TXT`) are not covered here.
+#[cfg(feature = "malformed")]
 #[shared_test_runtime]
-async fn path_11_case_colliding_remote_siblings() {}
+async fn path_11_case_colliding_remote_siblings() {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	let (upper, lower) = stage_case_colliding_dirs(&sc, "Data", "DATA").await;
+
+	for round in 0..2 {
+		let report = sc.sync().await;
+		assert_eq!(
+			report.refused,
+			Some(filen_sdk_rs::sync_engine::RefuseReason::RemoteCollision),
+			"round {round}: the collision must refuse the pass: {report:?}"
+		);
+		assert!(!report.errors.is_empty(), "round {round}: {report:?}");
+		assert_eq!(
+			(report.downloaded, report.local_dirs_created),
+			(0, 0),
+			"round {round}: a refused pass writes nothing: {report:?}"
+		);
+		assert!(
+			walk_tree(&sc.local).is_empty(),
+			"round {round}: something was materialized locally: {:?}",
+			walk_tree(&sc.local).keys()
+		);
+	}
+
+	for dir in [&upper, &lower] {
+		let name = dir.name().unwrap();
+		let (_d, files) = list_dir(&sc, dir).await;
+		let notes = find_file(&files, "notes.txt")
+			.unwrap_or_else(|| panic!("{name}/notes.txt lost on the remote"));
+		assert_eq!(notes.size, name.len() as u64, "{name}/notes.txt changed");
+	}
+	sc.cleanup();
+}
 
 /// PATH-13 — very long single filename near/over the 255-byte component limit.
 /// Plan: remote files at 255 bytes and 256 bytes; r2l. Verify: 255-byte created byte-exact;

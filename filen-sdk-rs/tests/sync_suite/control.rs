@@ -1209,7 +1209,7 @@ async fn control_16_reconfigure_mode_prospective() {
 	sc.cleanup();
 }
 
-#[ignore = "blocked: no public reconfigure — changing a pair's ROOT must stop the old root and safely reconcile the new"]
+#[ignore = "blocked: reconfigure_pair changes only a pair's mode, not its root — changing a pair's ROOT must stop the old root and safely reconcile the new"]
 #[shared_test_runtime]
 async fn control_17_reconfigure_root_safe() {
 	// plan: pair (L_old, R) to baseline; reconfigure local root to L_new (populated); pass =>
@@ -1929,12 +1929,58 @@ async fn control_23_pause_status_survives_restart() {
 	std::fs::remove_dir_all(&local).ok();
 }
 
-#[ignore = "blocked: no public reconfigure — reconfigure-while-paused must defer all effect until resume"]
+/// CONTROL-24 — a mode change made while the pair is paused takes no effect until the resume: the
+/// paused pair still refuses to sync, and the first pass after the resume runs under the NEW mode,
+/// so a deletion staged while paused is mirrored (local-backup would have kept the remote copy).
 #[shared_test_runtime]
 async fn control_24_reconfigure_while_paused_deferred() {
-	// plan: pair to baseline, pause; reconfigure mode (local-backup -> two-way) while paused; stage
-	// a local delete while paused; resume; pass => no action while paused, NEW mode governs the
-	// delete (mirrored), no old-mode action, baseline consistent with new mode.
+	let sc = single_client(SyncMode::LocalBackup).await;
+	for name in ["keep.txt", "gone.txt"] {
+		write_file(&sc.local, name, content_for(name).as_slice());
+	}
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 2, "{r1:?}");
+
+	sc.engine.pause_pair(sc.pair).await.unwrap();
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::TwoWay, Backlog::Propagate)
+		.await
+		.unwrap();
+	std::fs::remove_file(sc.local.join("gone.txt")).unwrap();
+
+	let record = sc.engine.list_pairs().await.unwrap().remove(0);
+	assert_eq!(record.mode, SyncMode::TwoWay, "the new mode is recorded");
+	assert!(record.paused, "reconfiguring must not resume the pair");
+
+	let paused = sc.sync().await;
+	assert!(paused.paused, "the paused pair synced anyway: {paused:?}");
+	assert_eq!(paused.remotely_trashed, 0, "{paused:?}");
+	let (_d, files) = list_remote(&sc.resources).await;
+	assert!(
+		has_file(&files, "gone.txt"),
+		"the deletion was mirrored while paused"
+	);
+
+	sc.engine.resume_pair(sc.pair).await.unwrap();
+	let resumed = sc.sync().await;
+	assert!(resumed.errors.is_empty(), "{resumed:?}");
+	assert_eq!(
+		resumed.remotely_trashed, 1,
+		"the new mode must mirror the deletion staged while paused: {resumed:?}"
+	);
+	assert_eq!(
+		resumed.uploaded, 0,
+		"nothing is re-transferred: {resumed:?}"
+	);
+	assert_eq!(resumed.downloaded, 0, "{resumed:?}");
+	let (_d, files) = list_remote(&sc.resources).await;
+	assert!(
+		!has_file(&files, "gone.txt"),
+		"gone.txt still on the remote"
+	);
+	assert!(has_file(&files, "keep.txt"), "keep.txt lost");
+
+	sc.cleanup();
 }
 
 #[ignore = "blocked: needs a concurrent control-op serialization harness (the verbs themselves now exist)"]
@@ -1945,12 +1991,103 @@ async fn control_25_concurrent_control_ops_serialized() {
 	// P1 roots intact; no deadlock/panic/lost/dup entries.
 }
 
-#[ignore = "blocked: no public registry/auto-load — pairs must rehydrate + resume schedule on a fresh engine WITHOUT re-add"]
+/// CONTROL-ADD — every registered pair reloads on a fresh engine WITHOUT a re-add: `list_pairs`
+/// reports each with its roots, mode and paused flag, the active pair syncs a change staged while
+/// down on its persisted baseline (no redundant transfer), and the paused one still refuses.
+/// CONTROL-23 covers the paused flag alone; this adds the registry and a second, active pair.
 #[shared_test_runtime]
 async fn control_add_persisted_pairs_autoload_on_fresh_start() {
-	// plan: add 2 pairs (1 active, 1 paused), converge, shut down; start a NEW engine WITHOUT any
-	// add() calls; query registry => both reappear w/ roots/modes/state; active pair's staged change
-	// syncs without re-add; paused stays paused; baselines reused (no redundant transfer).
+	let (resources, cache, _root, local_active) = raw_setup("cauto_a").await;
+	// Each pair gets its own remote subfolder, as in CONTROL-19.
+	let mut remotes = Vec::new();
+	for name in ["cauto_active", "cauto_paused"] {
+		let dir = cache
+			.client
+			.create_dir(
+				&DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir)),
+				name,
+			)
+			.await
+			.unwrap();
+		remotes.push(dir);
+	}
+	let (remote_active, remote_paused) = (remotes[0].uuid(), remotes[1].uuid());
+	let local_paused = fresh_local_dir("cauto_p");
+	write_file(&local_active, "a.txt", b"active");
+	write_file(&local_paused, "p.txt", b"paused");
+	let db = temp_cache_path();
+
+	// --- session 1: register and baseline both, pause one ---
+	let (active, paused) = {
+		let engine = SyncEngine::open(cache.client.clone(), db.clone())
+			.await
+			.unwrap();
+		let active = engine
+			.add_pair(local_active.clone(), remote_active, SyncMode::TwoWay)
+			.await
+			.unwrap();
+		let paused = engine
+			.add_pair(local_paused.clone(), remote_paused, SyncMode::LocalToRemote)
+			.await
+			.unwrap();
+		assert_eq!(engine.sync_once(active).await.unwrap().uploaded, 1);
+		assert_eq!(engine.sync_once(paused).await.unwrap().uploaded, 1);
+		engine.pause_pair(paused).await.unwrap();
+		(active, paused)
+	}; // engine dropped — "process shutdown"
+
+	write_file(&local_active, "a_new.txt", b"staged while down");
+	write_file(&local_paused, "p_new.txt", b"must not sync");
+
+	// --- session 2: a fresh engine on the same db, no add_pair at all ---
+	let engine = SyncEngine::open(cache.client.clone(), db).await.unwrap();
+	let pairs = engine.list_pairs().await.unwrap();
+	assert_eq!(pairs.len(), 2, "both pairs must reload: {pairs:?}");
+	let reloaded_active = pairs.iter().find(|p| p.id == active).expect("active pair");
+	let reloaded_paused = pairs.iter().find(|p| p.id == paused).expect("paused pair");
+	assert_eq!(reloaded_active.remote_root, remote_active);
+	assert_eq!(reloaded_active.mode, SyncMode::TwoWay);
+	assert!(!reloaded_active.paused);
+	assert_eq!(
+		std::path::Path::new(&reloaded_active.local_root),
+		local_active.canonicalize().unwrap(),
+		"the active pair's local root"
+	);
+	assert_eq!(reloaded_paused.remote_root, remote_paused);
+	assert_eq!(reloaded_paused.mode, SyncMode::LocalToRemote);
+	assert!(
+		reloaded_paused.paused,
+		"the pause must reload with the pair"
+	);
+	assert_eq!(
+		std::path::Path::new(&reloaded_paused.local_root),
+		local_paused.canonicalize().unwrap(),
+		"the paused pair's local root"
+	);
+
+	let r_active = engine.sync_once(active).await.unwrap();
+	assert!(r_active.errors.is_empty(), "{r_active:?}");
+	assert_eq!(
+		(r_active.uploaded, r_active.downloaded),
+		(1, 0),
+		"only the staged file transfers — the baseline was reused: {r_active:?}"
+	);
+	let r_paused = engine.sync_once(paused).await.unwrap();
+	assert!(
+		r_paused.paused,
+		"the reloaded paused pair synced: {r_paused:?}"
+	);
+
+	let (_d, active_files) = list_dir(&cache.client, &remotes[0]).await;
+	assert!(has_file(&active_files, "a_new.txt"), "a_new.txt not pushed");
+	let (_d, paused_files) = list_dir(&cache.client, &remotes[1]).await;
+	assert!(
+		!has_file(&paused_files, "p_new.txt"),
+		"the paused pair pushed p_new.txt"
+	);
+
+	std::fs::remove_dir_all(&local_active).ok();
+	std::fs::remove_dir_all(&local_paused).ok();
 }
 
 // The pause/resume half of this is now covered by CONTROL-01 (pause-already-paused,

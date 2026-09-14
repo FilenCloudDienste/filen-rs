@@ -190,6 +190,60 @@ pub async fn single_client(mode: SyncMode) -> SingleClient {
 	}
 }
 
+/// Stage two directories under the single client's remote root whose names differ only in case
+/// (`upper`, `lower`), each holding a `notes.txt` whose bytes are its directory's name, and wait for
+/// the cache to hold all four items. Returns `(upper, lower)`.
+///
+/// The server dedups a parent's children case-insensitively on a client-supplied name hash, so the
+/// second directory goes through `create_dir_with_name_hash` with a hash that does not match its
+/// name. Asserts the remote really holds both before returning.
+#[cfg(feature = "malformed")]
+pub async fn stage_case_colliding_dirs(
+	sc: &SingleClient,
+	upper: &str,
+	lower: &str,
+) -> (
+	filen_sdk_rs::fs::dir::RemoteDirectory,
+	filen_sdk_rs::fs::dir::RemoteDirectory,
+) {
+	let client = &sc.cache.client;
+	let root = filen_sdk_rs::fs::categories::DirType::<filen_sdk_rs::fs::categories::Normal>::Dir(
+		std::borrow::Cow::Borrowed(&sc.resources.dir),
+	);
+	let upper_dir = client.create_dir(&root, upper).await.unwrap();
+	let bypass = client.hash_name(&format!("{lower}-case-collision-bypass"));
+	let lower_dir = client
+		.create_dir_with_name_hash(&root, lower, &bypass)
+		.await
+		.unwrap();
+	for dir in [&upper_dir, &lower_dir] {
+		let name = filen_sdk_rs::fs::HasName::name(dir).unwrap();
+		let builder = client.make_file_builder("notes.txt", dir.uuid()).unwrap();
+		let file = client.upload_file(builder, name.as_bytes()).await.unwrap();
+		for uuid in [dir.uuid(), file.uuid()] {
+			assert!(
+				poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
+				"the cache never observed {name}"
+			);
+		}
+	}
+
+	let (dirs, _files) = client
+		.list_dir(&root, None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	let colliding = dirs
+		.iter()
+		.filter_map(filen_sdk_rs::fs::HasName::name)
+		.filter(|n| n.eq_ignore_ascii_case(upper))
+		.count();
+	assert_eq!(
+		colliding, 2,
+		"precondition: the remote must hold both case-colliding dirs"
+	);
+	(upper_dir, lower_dir)
+}
+
 /// Two independent client+cache+engine stacks syncing the SAME remote dir, each with its own local
 /// dir — for two-way / convergence / conflict / contention tests.
 pub struct TwoClients {
