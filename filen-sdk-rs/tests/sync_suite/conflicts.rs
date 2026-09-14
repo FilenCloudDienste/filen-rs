@@ -2157,10 +2157,9 @@ async fn conflict_16_resolve_keep_local() {
 	sc.cleanup();
 }
 
-/// CONFLICT-17 — resolving a held conflict KEEP-REMOTE pulls the remote copy on the next pass.
-///
-/// (As with `conflict_16`, keeping the LOSING side recoverable is `KeepBoth`'s job — `KeepRemote`
-/// deliberately lets the remote copy win outright.)
+/// CONFLICT-17 — resolving a held conflict KEEP-REMOTE pulls the remote copy on the next pass, and
+/// the losing local edit goes to the `.filen-sync-trash` bin rather than under the download: it was
+/// never uploaded, so the bin is the only place its bytes still exist.
 #[shared_test_runtime]
 async fn conflict_17_resolve_keep_remote() {
 	let sc = single_client(SyncMode::TwoWay).await;
@@ -2194,6 +2193,11 @@ async fn conflict_17_resolve_keep_remote() {
 	// Both sides now hold the remote-wins bytes.
 	assert!(read_eq(&sc.local, "conf2.txt", b"RRR"));
 	assert_eq!(remote_file_size(&sc, "conf2.txt").await, Some(3));
+	// And the losing local edit is recoverable from the bin.
+	assert!(
+		bytes_recoverable_anywhere(&sc.local.join(".filen-sync-trash"), b"LLLLLLLLLL"),
+		"keep-remote destroyed the local edit it lost to: it was never uploaded"
+	);
 
 	let r4 = sc.sync().await;
 	assert!(r4.conflicts.is_empty(), "the conflict came back: {r4:?}");
