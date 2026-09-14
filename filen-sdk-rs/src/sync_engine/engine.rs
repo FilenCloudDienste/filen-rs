@@ -25,7 +25,7 @@ use super::{
 	},
 	guard::{self, DeleteGuard, GuardReason},
 	outcome::{
-		PlanOutcome, PlannedAction, PlannedConflict, RefuseReason, UnsyncablePath,
+		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
@@ -2738,6 +2738,36 @@ impl SyncEngine {
 			.map_err(|e| db_error(e, "clearing a path's failure count"))
 	}
 
+	/// The conflicts the engine is holding for `pair`, ordered by path: every conflict a pass
+	/// reported in [`SyncReport::conflicts`] that [`resolve_conflict`](Self::resolve_conflict) has
+	/// not resolved yet, with what each side held when it was recorded. This includes an upload of
+	/// this engine's that went on top of a version it never saw.
+	///
+	/// Reads the persisted baseline only: no scan, no server call, nothing written, and it does not
+	/// wait for a pass in flight. A conflict that pass has yet to record appears once it has.
+	/// Errors only if the pair is unknown.
+	pub async fn list_conflicts(&self, pair: PairId) -> Result<Vec<PlannedConflict>, Error> {
+		let store = self.store.lock().await;
+		if store
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.is_none()
+		{
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		Ok(store
+			.entries(pair)
+			.map_err(|e| db_error(e, "loading the held conflicts"))?
+			.into_iter()
+			.filter(|entry| entry.state.is_conflict())
+			.map(|entry| PlannedConflict {
+				local: entry.local_kind.map(PlannedNodeKind::from),
+				remote: entry.remote_kind.map(PlannedNodeKind::from),
+				rel_path: entry.rel_path,
+			})
+			.collect())
+	}
+
 	/// Run one full sync pass: plan, screen, and apply against the remote and local tree. A
 	/// [`paused`](Self::pause_pair) pair returns a report marked
 	/// [`paused`](SyncReport::paused) instead, having read neither side.
@@ -4295,6 +4325,62 @@ mod tests {
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		(engine, pair, path)
+	}
+
+	/// `list_conflicts` returns exactly the rows held for resolution — both flavours, with what each
+	/// side held — and nothing from a synced row; an unknown pair is an error, not an empty list.
+	#[tokio::test]
+	async fn list_conflicts_reads_the_held_rows_only() {
+		let (engine, pair, path) = engine_with_pair("list_conflicts").await;
+		assert!(engine.list_conflicts(pair).await.unwrap().is_empty());
+		let hash = Blake3Hash::from([7; 32]);
+		{
+			let store = engine.store.lock().await;
+			store
+				.upsert_entry(pair, &synced_file("synced.txt", Uuid::new_v4(), hash, 1))
+				.unwrap();
+			store
+				.upsert_entry(
+					pair,
+					&BaselineEntry {
+						state: BaselineState::Conflicted,
+						local_kind: Some(NodeKind::File),
+						remote_kind: None,
+						..synced_file("b/edited.txt", Uuid::new_v4(), hash, 2)
+					},
+				)
+				.unwrap();
+			store
+				.upsert_entry(
+					pair,
+					&BaselineEntry {
+						state: BaselineState::Overwritten,
+						local_kind: Some(NodeKind::File),
+						remote_kind: Some(NodeKind::File),
+						..synced_file("a.txt", Uuid::new_v4(), hash, 3)
+					},
+				)
+				.unwrap();
+		}
+		assert_eq!(
+			engine.list_conflicts(pair).await.unwrap(),
+			vec![
+				PlannedConflict {
+					rel_path: "a.txt".to_string(),
+					local: Some(PlannedNodeKind::File),
+					remote: Some(PlannedNodeKind::File),
+				},
+				PlannedConflict {
+					rel_path: "b/edited.txt".to_string(),
+					local: Some(PlannedNodeKind::File),
+					remote: None,
+				},
+			]
+		);
+		assert!(engine.list_conflicts(pair + 1000).await.is_err());
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
 	}
 
 	/// A pass that fails outright tells its observer, with the error the call returns. Here the pair
