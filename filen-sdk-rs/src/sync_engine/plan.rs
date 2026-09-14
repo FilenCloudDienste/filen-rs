@@ -15,9 +15,13 @@ use uuid::Uuid;
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	events::SyncEvent,
+	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key},
 };
-use crate::fs::{dir::cache::CacheableDir, file::cache::CacheableFile};
+use crate::{
+	cache::UndecodableItem,
+	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
+};
 
 /// Guards against a malformed (cyclic) remote parent chain when resolving a path.
 const MAX_REMOTE_DEPTH: usize = 256;
@@ -236,36 +240,70 @@ fn is_safe_name(name: &str) -> bool {
 		&& !name.contains('\0')
 }
 
-/// Resolve the `/`-joined, NFC-normalized path of an item from its name + parent by walking the
-/// dir index up to `root`. `None` for an orphan (a parent not present in the snapshot), a chain
-/// that exceeds [`MAX_REMOTE_DEPTH`] (a malformed cycle), or any name on the chain that is not a
-/// safe path component (so a traversal name like `..` never enters the plan).
-fn resolve_path(
-	name: &str,
+/// Why [`resolve_parent`] could not place a directory under the sync root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unresolved {
+	/// An ancestor — the directory with this uuid — is itself left out of the view (an unsafe name,
+	/// an undecodable directory, or a broken chain further up). The item is recorded under that
+	/// ancestor's path and reason.
+	UnderSkipped(Uuid),
+	/// The immediate parent is nowhere in the snapshot, or the chain runs past
+	/// [`MAX_REMOTE_DEPTH`] (a malformed cycle).
+	BrokenParent,
+}
+
+/// Resolve the `/`-joined, NFC-normalized path of the directory `parent` by walking the dir index
+/// up to `root` (`""` for the root itself). Fails when the chain passes a directory the view leaves
+/// out — one whose name is not a safe path component, so a traversal name like `..` never enters
+/// the plan, or one listed in `undecodable_dirs` — or never reaches `root`.
+fn resolve_parent(
 	parent: Uuid,
 	root: Uuid,
 	dir_index: &HashMap<Uuid, (String, Uuid)>,
-) -> Option<String> {
-	if !is_safe_name(name) {
-		return None;
-	}
-	let mut parts = vec![name.to_string()];
+	undecodable_dirs: &HashSet<Uuid>,
+) -> Result<String, Unresolved> {
+	let mut parts: Vec<&str> = Vec::new();
+	// The directory the walk stepped up from, whose own parent `current` is.
+	let mut below: Option<Uuid> = None;
 	let mut current = parent;
-	let mut steps = 0;
 	while current != root {
-		let (parent_name, grandparent) = dir_index.get(&current)?;
-		if !is_safe_name(parent_name) {
-			return None;
+		if parts.len() >= MAX_REMOTE_DEPTH {
+			return Err(Unresolved::BrokenParent);
 		}
-		parts.push(parent_name.clone());
+		if undecodable_dirs.contains(&current) {
+			return Err(Unresolved::UnderSkipped(current));
+		}
+		let Some((name, grandparent)) = dir_index.get(&current) else {
+			return Err(match below {
+				// That directory's parent is missing: it is the one recorded as broken.
+				Some(orphan) => Unresolved::UnderSkipped(orphan),
+				None => Unresolved::BrokenParent,
+			});
+		};
+		if !is_safe_name(name) {
+			return Err(Unresolved::UnderSkipped(current));
+		}
+		parts.push(name);
+		below = Some(current);
 		current = *grandparent;
-		steps += 1;
-		if steps > MAX_REMOTE_DEPTH {
-			return None;
-		}
 	}
 	parts.reverse();
-	Some(parts.join("/"))
+	Ok(parts.join("/"))
+}
+
+fn join_path(parent_path: &str, name: &str) -> String {
+	if parent_path.is_empty() {
+		name.to_string()
+	} else {
+		format!("{parent_path}/{name}")
+	}
+}
+
+/// Whether `rel_path` is the local quarantine dir or inside it. The local scan never lists it, so
+/// the remote view leaves out a remote folder that happens to carry the name too — it is never
+/// mistaken for (or synced into) the quarantine area.
+fn in_quarantine(rel_path: &str) -> bool {
+	rel_path == QUARANTINE_DIR || rel_path.starts_with(&format!("{QUARANTINE_DIR}/"))
 }
 
 /// The remote view of a sync root's subtree, plus whether it is safe to reconcile against.
@@ -281,19 +319,95 @@ pub(crate) struct RemoteView {
 	/// re-upload whose successor has been applied while the predecessor's trash has not. Only that
 	/// one path is held back; the pass runs.
 	pub(crate) held_paths: HashSet<String>,
+	/// Remote items that exist but are NOT in `nodes`, and why. Their absence from `nodes` is no
+	/// evidence of a deletion (see [`unknown_remote_paths`]).
+	pub(crate) skipped: Vec<SkippedRemote>,
+}
+
+/// A remote item the snapshot holds that the view could not place at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedRemote {
+	pub(crate) remote_uuid: Uuid,
+	/// The file's whole-life id; `None` for a directory.
+	pub(crate) stable_uuid: Option<StableUuid>,
+	/// Where the item would sit: its parent's path joined with its name. For an undecodable item,
+	/// whose name is unknown, the parent's path (`""` for the sync root); for a broken parent chain,
+	/// which has no path at all, the bare name. An item under a skipped directory carries that
+	/// directory's path and reason.
+	pub(crate) rel_path: String,
+	pub(crate) reason: UnsyncableReason,
 }
 
 /// Build the remote view from a cache subtree snapshot rooted at `root`. Names are NFC-normalized
-/// so they key 1:1 against the local scan; orphaned items (broken parent chain) are skipped.
+/// so they key 1:1 against the local scan.
+///
+/// An item that cannot be placed — an unsafe name, a broken parent chain, or metadata the cache
+/// could not decode (`undecodable`, which may hold other roots' records too: only those whose
+/// parent resolves under `root` are this view's) — is left out of `nodes` and recorded in
+/// [`RemoteView::skipped`]. A descendant of a skipped directory is left out with it and recorded
+/// under that directory's path and reason: its own uuid is still what a synced item moved beneath
+/// the directory is found by (see [`unknown_remote_paths`]).
 pub(crate) fn build_remote_view(
 	root: Uuid,
 	dirs: &[CacheableDir<'_>],
 	files: &[CacheableFile<'_>],
+	undecodable: &[UndecodableItem],
 ) -> RemoteView {
 	let dir_index: HashMap<Uuid, (String, Uuid)> = dirs
 		.iter()
 		.map(|d| (d.uuid, (d.name.nfc().collect::<String>(), d.parent)))
 		.collect();
+	let undecodable_dirs: HashSet<Uuid> = undecodable
+		.iter()
+		.filter(|item| item.stable_uuid.is_none())
+		.map(|item| item.uuid)
+		.collect();
+
+	let mut skipped = Skipped::default();
+	for item in undecodable {
+		match resolve_parent(item.parent, root, &dir_index, &undecodable_dirs) {
+			Ok(rel_path) => skipped.record(SkippedRemote {
+				remote_uuid: item.uuid,
+				stable_uuid: item.stable_uuid,
+				rel_path,
+				reason: UnsyncableReason::RemoteUndecodable,
+			}),
+			Err(Unresolved::UnderSkipped(ancestor)) => {
+				skipped.under(item.uuid, item.stable_uuid, ancestor);
+			}
+			// Not under this root at all: another root's record.
+			Err(Unresolved::BrokenParent) => {}
+		}
+	}
+	// The path of an item named `name` under `parent`, or `None` with the reason recorded.
+	let mut place = |name: &str,
+	                 parent: Uuid,
+	                 remote_uuid: Uuid,
+	                 stable_uuid: Option<StableUuid>| {
+		let skip = match resolve_parent(parent, root, &dir_index, &undecodable_dirs) {
+			Ok(parent_path) if is_safe_name(name) => return Some(join_path(&parent_path, name)),
+			Ok(parent_path) => SkippedRemote {
+				remote_uuid,
+				stable_uuid,
+				rel_path: join_path(&parent_path, name),
+				reason: UnsyncableReason::RemoteInvalidName {
+					name: name.to_string(),
+				},
+			},
+			Err(Unresolved::UnderSkipped(ancestor)) => {
+				skipped.under(remote_uuid, stable_uuid, ancestor);
+				return None;
+			}
+			Err(Unresolved::BrokenParent) => SkippedRemote {
+				remote_uuid,
+				stable_uuid,
+				rel_path: name.to_string(),
+				reason: UnsyncableReason::RemoteBrokenParent,
+			},
+		};
+		skipped.record(skip);
+		None
+	};
 
 	let mut nodes = HashMap::new();
 	// collision key -> the raw path that claimed it, so a byte-identical duplicate is told apart
@@ -303,10 +417,7 @@ pub(crate) fn build_remote_view(
 	let mut held_paths: HashSet<String> = HashSet::new();
 
 	let mut insert = |rel_path: String, node: RemoteNode| {
-		// The local quarantine dir is excluded from the local scan; exclude it from the remote view
-		// too, so a remote folder that happens to be named `.filen-sync-trash` is never mistaken for
-		// (or synced into) the quarantine area.
-		if rel_path == QUARANTINE_DIR || rel_path.starts_with(&format!("{QUARANTINE_DIR}/")) {
+		if in_quarantine(&rel_path) {
 			return;
 		}
 		match claimed.get(&collision_key(&rel_path)) {
@@ -331,7 +442,7 @@ pub(crate) fn build_remote_view(
 
 	for dir in dirs {
 		let name = dir.name.nfc().collect::<String>();
-		let Some(rel_path) = resolve_path(&name, dir.parent, root, &dir_index) else {
+		let Some(rel_path) = place(&name, dir.parent, dir.uuid, None) else {
 			continue;
 		};
 		insert(
@@ -350,7 +461,7 @@ pub(crate) fn build_remote_view(
 
 	for file in files {
 		let name = file.name.nfc().collect::<String>();
-		let Some(rel_path) = resolve_path(&name, file.parent, root, &dir_index) else {
+		let Some(rel_path) = place(&name, file.parent, file.uuid, Some(file.stable_uuid)) else {
 			continue;
 		};
 		insert(
@@ -371,7 +482,121 @@ pub(crate) fn build_remote_view(
 		nodes,
 		has_collisions,
 		held_paths,
+		skipped: skipped.finish(),
 	}
+}
+
+/// The skipped items of a view being built: the ones recorded with a reason of their own, and the
+/// ones under a skipped directory, which take that directory's record once every item is placed.
+#[derive(Default)]
+struct Skipped {
+	recorded: Vec<SkippedRemote>,
+	/// uuid -> its index in `recorded`.
+	by_uuid: HashMap<Uuid, usize>,
+	/// Every item under a skipped directory: its uuid, whole-life id, and the nearest skipped
+	/// ancestor `resolve_parent` found.
+	under: Vec<(Uuid, Option<StableUuid>, Uuid)>,
+}
+
+impl Skipped {
+	/// Record an item with its own reason — unless it sits in the quarantine dir, which the view
+	/// leaves out without a word (and its descendants with it).
+	fn record(&mut self, skip: SkippedRemote) {
+		if in_quarantine(&skip.rel_path) {
+			return;
+		}
+		self.by_uuid.insert(skip.remote_uuid, self.recorded.len());
+		self.recorded.push(skip);
+	}
+
+	fn under(&mut self, remote_uuid: Uuid, stable_uuid: Option<StableUuid>, ancestor: Uuid) {
+		self.under.push((remote_uuid, stable_uuid, ancestor));
+	}
+
+	/// Resolve every item under a skipped directory to the record of the directory that has one: the
+	/// nearest skipped ancestor may itself sit under another, so the walk climbs, one skipped
+	/// directory per step. An item whose chain ends in nothing recorded (the quarantine dir) stays
+	/// out unrecorded.
+	fn finish(mut self) -> Vec<SkippedRemote> {
+		let parent_of: HashMap<Uuid, Uuid> = self
+			.under
+			.iter()
+			.map(|&(uuid, _, ancestor)| (uuid, ancestor))
+			.collect();
+		for &(remote_uuid, stable_uuid, ancestor) in &self.under {
+			let mut at = ancestor;
+			for _ in 0..=MAX_REMOTE_DEPTH {
+				if let Some(&index) = self.by_uuid.get(&at) {
+					let record = &self.recorded[index];
+					let (rel_path, reason) = (record.rel_path.clone(), record.reason.clone());
+					self.recorded.push(SkippedRemote {
+						remote_uuid,
+						stable_uuid,
+						rel_path,
+						reason,
+					});
+					break;
+				}
+				match parent_of.get(&at) {
+					Some(&up) => at = up,
+					None => break,
+				}
+			}
+		}
+		self.recorded
+	}
+}
+
+/// Split the view's skipped items into the SYNCED paths they make unknown and the reports for items
+/// never synced.
+///
+/// A baseline row whose remote item — by uuid, or for a file by its whole-life id, which survives
+/// the new version a foreign same-name upload makes — is among the skipped was not deleted: the
+/// item is still there, only the view cannot say where it is or what it holds. Planning such a path
+/// from its absence would quarantine the local copy (or re-upload it over the item), and one such
+/// path is far below what the mass-delete guard holds. So it is returned keyed by its baseline path
+/// with its reason, for the pass to leave that path and its subtree alone and report it. A skipped
+/// item no baseline row names is only reported, under its would-be path.
+pub(crate) fn unknown_remote_paths(
+	baseline: &HashMap<String, BaselineEntry>,
+	skipped: &[SkippedRemote],
+) -> (BTreeMap<String, UnsyncableReason>, Vec<UnsyncablePath>) {
+	let mut by_uuid: HashMap<Uuid, &str> = HashMap::new();
+	let mut by_lineage: HashMap<StableUuid, &str> = HashMap::new();
+	for entry in baseline.values() {
+		if let Some(uuid) = entry.remote_uuid {
+			by_uuid.insert(uuid, &entry.rel_path);
+		}
+		if let Some(lineage) = entry.remote_stable_uuid {
+			by_lineage.insert(lineage, &entry.rel_path);
+		}
+	}
+	let mut unknown = BTreeMap::new();
+	let mut never_synced: Vec<UnsyncablePath> = Vec::new();
+	for item in skipped {
+		let synced_at = by_uuid.get(&item.remote_uuid).or_else(|| {
+			item.stable_uuid
+				.and_then(|lineage| by_lineage.get(&lineage))
+		});
+		if let Some(path) = synced_at {
+			unknown.insert((*path).to_string(), item.reason.clone());
+			continue;
+		}
+		let report = UnsyncablePath {
+			rel_path: item.rel_path.clone(),
+			reason: item.reason.clone(),
+		};
+		// Two undecodable items in one directory, or the items under one skipped directory, report
+		// the same line; once is enough.
+		if !never_synced.contains(&report) {
+			never_synced.push(report);
+		}
+	}
+	// A synced directory's subtree is already left alone with it: its synced descendants add no
+	// line of their own.
+	let unknown_dirs: Vec<String> = unknown.keys().cloned().collect();
+	unknown.retain(|path, _| !unknown_dirs.iter().any(|dir| is_under(path, dir)));
+	(unknown, never_synced)
 }
 
 /// How one side compares to the baseline at a path.
@@ -4500,21 +4725,212 @@ mod tests {
 		assert!(!is_safe_name("a\\b"), "embedded backslash");
 	}
 
+	fn remote_dir(name: &str, parent: Uuid) -> CacheableDir<'static> {
+		CacheableDir {
+			uuid: Uuid::new_v4(),
+			parent,
+			color: Default::default(),
+			favorited: false,
+			timestamp: ms(1),
+			name: Cow::Owned(name.to_string()),
+			created: Some(ms(1)),
+		}
+	}
+
+	fn undecodable(parent: Uuid, stable_uuid: Option<StableUuid>) -> UndecodableItem {
+		UndecodableItem {
+			uuid: Uuid::new_v4(),
+			parent,
+			stable_uuid,
+		}
+	}
+
 	#[test]
-	fn resolve_path_skips_traversal_names_so_they_never_enter_the_plan() {
+	fn a_traversal_name_never_enters_the_view_and_its_subtree_shares_its_record() {
 		let root = Uuid::new_v4();
-		let empty = HashMap::new();
-		// A direct child literally named ".." is rejected (would escape the root on pull).
-		assert_eq!(resolve_path("..", root, root, &empty), None);
-		// A normal child resolves.
+		// A direct child literally named ".." (it would escape the root on pull), and a normal
+		// directory beside it.
+		let evil = remote_dir("..", root);
+		let ok = remote_dir("ok", root);
+		// A child under the traversal-named dir is left out with it, recorded under its record.
+		let under_evil = remote_dir("x", evil.uuid);
+		let view = build_remote_view(root, &[evil.clone(), ok, under_evil.clone()], &[], &[]);
+		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["ok"]);
+		let record = |remote_uuid| SkippedRemote {
+			remote_uuid,
+			stable_uuid: None,
+			rel_path: "..".to_string(),
+			reason: UnsyncableReason::RemoteInvalidName {
+				name: "..".to_string(),
+			},
+		};
 		assert_eq!(
-			resolve_path("ok.txt", root, root, &empty),
-			Some("ok.txt".to_string())
+			view.skipped,
+			vec![record(evil.uuid), record(under_evil.uuid)]
 		);
-		// A child under an ancestor dir whose NAME is a traversal is rejected too.
-		let evil_parent = Uuid::new_v4();
-		let idx = HashMap::from([(evil_parent, ("..".to_string(), root))]);
-		assert_eq!(resolve_path("x.txt", evil_parent, root, &idx), None);
+	}
+
+	/// The cache's undecodable records carry every sync root's; only those under THIS root are the
+	/// view's, placed at the directory that holds them — and one inside an undecodable directory
+	/// takes that directory's record.
+	#[test]
+	fn undecodable_items_are_recorded_under_their_parent_when_they_belong_to_the_root() {
+		let root = Uuid::new_v4();
+		let sub = remote_dir("sub", root);
+		let lineage = StableUuid::new_for_test(Uuid::new_v4());
+		let in_sub = undecodable(sub.uuid, Some(lineage));
+		let garbled_dir = undecodable(root, None);
+		let under_garbled = undecodable(garbled_dir.uuid, Some(lineage));
+		let elsewhere = undecodable(Uuid::new_v4(), None);
+		let view = build_remote_view(
+			root,
+			std::slice::from_ref(&sub),
+			&[],
+			&[in_sub, garbled_dir, under_garbled, elsewhere],
+		);
+		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["sub"]);
+		let recorded: Vec<(Uuid, &str)> = view
+			.skipped
+			.iter()
+			.map(|s| {
+				assert_eq!(s.reason, UnsyncableReason::RemoteUndecodable);
+				(s.remote_uuid, s.rel_path.as_str())
+			})
+			.collect();
+		assert_eq!(
+			recorded,
+			vec![
+				(in_sub.uuid, "sub"),
+				(garbled_dir.uuid, ""),
+				(under_garbled.uuid, "")
+			]
+		);
+		assert_eq!(view.skipped[0].stable_uuid, Some(lineage));
+	}
+
+	/// A synced item moved under a directory the view skips is still found, by its own uuid: its
+	/// synced path is unknown, not absent, however deep under the skipped directory it sits. A synced
+	/// directory's descendants add no line of their own, and the strangers under one skipped
+	/// directory report that directory once.
+	#[test]
+	fn a_synced_item_moved_under_a_skipped_directory_is_unknown_not_absent() {
+		let root = Uuid::new_v4();
+		let evil = remote_dir("..", root);
+		let moved = cacheable_file(evil.uuid, "a.txt");
+		let stranger = cacheable_file(evil.uuid, "b.txt");
+		let nested = remote_dir("deeper", evil.uuid);
+		let deep = cacheable_file(nested.uuid, "c.txt");
+		let garbled = undecodable(root, None);
+		let in_garbled = undecodable(garbled.uuid, None);
+		let view = build_remote_view(
+			root,
+			&[evil.clone(), nested.clone()],
+			&[moved.clone(), stranger, deep.clone()],
+			&[garbled, in_garbled],
+		);
+		assert!(view.nodes.is_empty(), "{:?}", view.nodes.keys());
+		let invalid = UnsyncableReason::RemoteInvalidName {
+			name: "..".to_string(),
+		};
+		for uuid in [evil.uuid, moved.uuid, nested.uuid, deep.uuid] {
+			let record = view
+				.skipped
+				.iter()
+				.find(|s| s.remote_uuid == uuid)
+				.unwrap_or_else(|| panic!("{uuid} not recorded: {:?}", view.skipped));
+			assert_eq!((record.rel_path.as_str(), &record.reason), ("..", &invalid));
+		}
+
+		let baseline = HashMap::from([
+			(
+				"docs/a.txt".to_string(),
+				base_file("docs/a.txt", moved.uuid, [1; 32]),
+			),
+			("sub".to_string(), base_dir("sub", nested.uuid)),
+			(
+				"sub/c.txt".to_string(),
+				base_file("sub/c.txt", deep.uuid, [2; 32]),
+			),
+		]);
+		let (unknown, never_synced) = unknown_remote_paths(&baseline, &view.skipped);
+		assert_eq!(
+			unknown,
+			BTreeMap::from([
+				("docs/a.txt".to_string(), invalid.clone()),
+				("sub".to_string(), invalid.clone()),
+			])
+		);
+		assert_eq!(
+			never_synced,
+			vec![
+				UnsyncablePath {
+					rel_path: String::new(),
+					reason: UnsyncableReason::RemoteUndecodable,
+				},
+				UnsyncablePath {
+					rel_path: "..".to_string(),
+					reason: invalid,
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn a_synced_path_whose_item_was_skipped_is_unknown_and_a_stranger_is_only_reported() {
+		let synced_uuid = Uuid::new_v4();
+		let lineage = StableUuid::new_for_test(synced_uuid);
+		let baseline = HashMap::from([
+			(
+				"docs".to_string(),
+				BaselineEntry {
+					kind: NodeKind::Dir,
+					remote_stable_uuid: None,
+					..base_file("docs", Uuid::new_v4(), [0; 32])
+				},
+			),
+			(
+				"docs/a.txt".to_string(),
+				base_file("docs/a.txt", synced_uuid, [1; 32]),
+			),
+		]);
+		let skipped = vec![
+			// A foreign same-name upload left `a.txt` as a NEW version the cache cannot decode: a
+			// different uuid, the same lineage.
+			SkippedRemote {
+				remote_uuid: Uuid::new_v4(),
+				stable_uuid: Some(lineage),
+				rel_path: "docs".to_string(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			},
+			// Two undecodable strangers in one directory report one line.
+			SkippedRemote {
+				remote_uuid: Uuid::new_v4(),
+				stable_uuid: None,
+				rel_path: "docs".to_string(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			},
+			SkippedRemote {
+				remote_uuid: Uuid::new_v4(),
+				stable_uuid: None,
+				rel_path: "docs".to_string(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			},
+		];
+		let (unknown, never_synced) = unknown_remote_paths(&baseline, &skipped);
+		assert_eq!(
+			unknown,
+			BTreeMap::from([(
+				"docs/a.txt".to_string(),
+				UnsyncableReason::RemoteUndecodable
+			)])
+		);
+		assert_eq!(
+			never_synced,
+			vec![UnsyncablePath {
+				rel_path: "docs".to_string(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			}]
+		);
 	}
 
 	#[test]
@@ -4529,7 +4945,7 @@ mod tests {
 			name: Cow::Borrowed(QUARANTINE_DIR),
 			created: Some(ms(1)),
 		};
-		let view = build_remote_view(root, std::slice::from_ref(&trash), &[]);
+		let view = build_remote_view(root, std::slice::from_ref(&trash), &[], &[]);
 		assert!(
 			view.nodes.is_empty(),
 			"a remote folder named like the quarantine dir must be excluded from the view"
@@ -4825,7 +5241,7 @@ mod tests {
 		};
 		let sibling = cacheable_file(root, "other.txt");
 
-		let view = build_remote_view(root, &[], &[predecessor, successor, sibling.clone()]);
+		let view = build_remote_view(root, &[], &[predecessor, successor, sibling.clone()], &[]);
 
 		assert!(
 			!view.has_collisions,
@@ -4854,7 +5270,7 @@ mod tests {
 			..lower.clone()
 		};
 
-		let view = build_remote_view(root, &[], &[lower, upper]);
+		let view = build_remote_view(root, &[], &[lower, upper], &[]);
 
 		assert!(
 			view.has_collisions,
@@ -4899,11 +5315,17 @@ mod tests {
 			hash: Some(Blake3Hash::from([5; 32])),
 		};
 		let orphan = CacheableFile {
+			uuid: Uuid::new_v4(),
 			parent: Uuid::new_v4(), // a parent not in the snapshot -> orphan, skipped
 			..file.clone()
 		};
 
-		let view = build_remote_view(root, std::slice::from_ref(&sub), &[file.clone(), orphan]);
+		let view = build_remote_view(
+			root,
+			std::slice::from_ref(&sub),
+			&[file.clone(), orphan.clone()],
+			&[],
+		);
 		assert!(!view.has_collisions);
 		let mut paths: Vec<_> = view.nodes.keys().cloned().collect();
 		paths.sort();
@@ -4911,6 +5333,16 @@ mod tests {
 			paths,
 			vec!["sub", "sub/f.txt"],
 			"orphan skipped, path resolved"
+		);
+		assert_eq!(
+			view.skipped,
+			vec![SkippedRemote {
+				remote_uuid: orphan.uuid,
+				stable_uuid: Some(orphan.stable_uuid),
+				rel_path: "f.txt".to_string(),
+				reason: UnsyncableReason::RemoteBrokenParent,
+			}],
+			"the orphan is recorded, not silently dropped"
 		);
 		assert_eq!(view.nodes["sub/f.txt"].remote_uuid, file.uuid);
 		assert_eq!(

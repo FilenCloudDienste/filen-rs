@@ -3,7 +3,9 @@ use crate::cache::sql::columns::{
 	FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE,
 	PRAGMA_SYNCHRONOUS,
 };
-use filen_types::fs::ParentUuid;
+use crate::fs::{dir::meta::DirectoryMeta, file::meta::FileMeta};
+use filen_types::{crypto::EncryptedString, fs::ParentUuid};
+use std::borrow::Cow;
 
 /// Unit constructors have no resync deps, so these futures never touch the network — a minimal
 /// current-thread runtime suffices.
@@ -734,7 +736,7 @@ fn changed_on_out_of_root_sync_root_dir_applies() {
 	let before = item_content_hash(&state, b.uuid);
 	// Same uuid + parent, renamed → the fingerprint changes.
 	let mut b_changed = cache_dir(1, account_root);
-	b_changed.name = std::borrow::Cow::Owned("renamed".to_string());
+	b_changed.name = Cow::Owned("renamed".to_string());
 	state
 		.apply_event(
 			CacheEventType::Dir(DirEvent::Changed(b_changed.clone())),
@@ -3370,4 +3372,72 @@ fn a_trashed_head_for_an_untracked_lineage_still_removes_the_stale_row() {
 		"the dir root that held the file is told once: {seen:?}"
 	);
 	assert!(seen[0].contains("Trashed"), "{seen:?}");
+}
+
+/// A listed record whose metadata did not decode is still an existing item: the listing conversion
+/// keeps it on record (dir or file, with the file's whole-life id) besides reporting the error. A
+/// record that fails for another reason — a parent that is not a directory — is only reported.
+#[test]
+fn convert_listing_keeps_the_undecodable_records_on_file() {
+	let parent = Uuid::new_v4();
+	let garbled = || EncryptedString(Cow::Borrowed("not metadata"));
+	let dir = RemoteDirectory::from_meta(
+		Uuid::new_v4(),
+		ParentUuid::Uuid(parent),
+		Default::default(),
+		false,
+		chrono::Utc::now(),
+		DirectoryMeta::Encrypted(garbled()),
+	);
+	let lineage = StableUuid::new_for_test(Uuid::new_v4());
+	let file = RemoteFile::from_meta(
+		Uuid::new_v4(),
+		lineage,
+		ParentUuid::Uuid(parent),
+		0,
+		1,
+		"region",
+		"bucket",
+		chrono::Utc::now(),
+		false,
+		FileMeta::Encrypted(garbled()),
+	);
+	let trashed = RemoteFile::from_meta(
+		Uuid::new_v4(),
+		lineage,
+		ParentUuid::Trash(parent),
+		0,
+		1,
+		"region",
+		"bucket",
+		chrono::Utc::now(),
+		false,
+		FileMeta::Encrypted(garbled()),
+	);
+
+	let mut errors = Vec::new();
+	let mut undecodable = Vec::new();
+	let (dirs, files) = convert_listing(
+		vec![dir.clone()],
+		vec![file.clone(), trashed],
+		&mut errors,
+		&mut undecodable,
+	);
+	assert!(dirs.is_empty() && files.is_empty());
+	assert_eq!(errors.len(), 3, "every failed record is still reported");
+	assert_eq!(
+		undecodable,
+		vec![
+			UndecodableItem {
+				uuid: dir.uuid,
+				parent,
+				stable_uuid: None,
+			},
+			UndecodableItem {
+				uuid: file.uuid,
+				parent,
+				stable_uuid: Some(lineage),
+			},
+		]
+	);
 }

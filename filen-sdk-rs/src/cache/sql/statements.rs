@@ -11,7 +11,8 @@ macro_rules! def_sql_user_version {
 // 3: files gained stable_uuid (and the CacheEvent rkyv payload layout changed with it).
 // 4: file sync roots — idx_files_stable_uuid and files.superseded, plus the `FileEvent::Trashed`
 //    variant (and the reshaped `Archived`), which again change the CacheEvent rkyv payload layout.
-def_sql_user_version!(4);
+// 5: undecodable_items — the listed records whose metadata did not decode.
+def_sql_user_version!(5);
 
 pub(crate) const VACUUM: &str = "VACUUM;";
 pub(crate) const GET_USER_VERSION: &str = "PRAGMA user_version;";
@@ -47,6 +48,21 @@ pub(crate) const DIFF_ORPHANS_ABSENT: &str = include_str!("raw/diff_orphans_abse
 pub(crate) const DIFF_CREATES: &str = include_str!("raw/diff_creates.sql");
 pub(crate) const DIFF_MOVES: &str = include_str!("raw/diff_moves.sql");
 pub(crate) const DIFF_CONTENT_CHANGES: &str = include_str!("raw/diff_content_changes.sql");
+
+// The listed records whose metadata did not decode (see `undecodable_items` in `raw/init.sql`).
+// Single trivial clauses, inlined like the protected-roots ones above.
+pub(crate) const UNDECODABLE_CLEAR_ROOT: &str = "DELETE FROM undecodable_items WHERE root = ?1";
+pub(crate) const UNDECODABLE_INSERT: &str = "INSERT OR IGNORE INTO undecodable_items \
+	 (root, uuid, parent, stable_uuid) VALUES (?1, ?2, ?3, ?4)";
+pub(crate) const UNDECODABLE_DELETE: &str = "DELETE FROM undecodable_items WHERE uuid = ?1";
+pub(crate) const UNDECODABLE_DELETE_ALL: &str = "DELETE FROM undecodable_items";
+// A uuid a later event or listing made decodable is an item again, not an undecodable record.
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) const UNDECODABLE_LIST: &str = "SELECT DISTINCT uuid, parent, stable_uuid \
+	 FROM undecodable_items WHERE uuid NOT IN (SELECT uuid FROM items)";
 
 // Whole-subtree enumeration for the sync engine's remote snapshot (read via `cache::enumerate`,
 // which is compiled under the same gate). Its column order MUST match

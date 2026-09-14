@@ -38,6 +38,37 @@ pub(in crate::cache) mod statements;
 // requires CHUNK_SIZE to be a multiple of its `MULTI_ROW_CHUNK`.
 pub(crate) const CHUNK_SIZE: usize = 50_000;
 
+/// A listed record whose metadata did not decrypt or decode, so it has no cacheable form. Kept (see
+/// `undecodable_items` in `raw/init.sql`) so a reader can tell an item that still exists from one
+/// that is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UndecodableItem {
+	pub(crate) uuid: Uuid,
+	pub(crate) parent: Uuid,
+	/// `Some` for a file — its whole-life id, which the listing carries in plain text — and `None`
+	/// for a directory, which has none.
+	pub(crate) stable_uuid: Option<StableUuid>,
+}
+
+/// Every undecodable record whose uuid is not an item again, across all sync roots.
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) fn list_undecodable(
+	conn: &rusqlite::Connection,
+) -> rusqlite::Result<Vec<UndecodableItem>> {
+	let mut stmt = conn.prepare_cached(statements::UNDECODABLE_LIST)?;
+	let rows = stmt.query_map((), |row| {
+		Ok(UndecodableItem {
+			uuid: row.get(ITEMS_UUID)?,
+			parent: row.get(columns::ITEMS_PARENT)?,
+			stable_uuid: row.get(FILES_STABLE_UUID)?,
+		})
+	})?;
+	rows.collect()
+}
+
 impl CacheState {
 	/// Run `for_chunk` over `items` in `CHUNK_SIZE` batches, each batch in its OWN transaction (so a huge
 	/// bulk op commits incrementally instead of holding one giant transaction). `for_chunk` prepares its
@@ -94,11 +125,36 @@ impl CacheState {
 	) -> rusqlite::Result<()> {
 		self.execute_chunked(items, |transaction, chunk| {
 			let mut delete_item_stmt = transaction.prepare_cached(statements::ITEM_DELETE)?;
+			// A removal event names the uuid whatever the cache made of it, so an undecodable record
+			// goes with it; otherwise it would stand for an item that is gone until the next resync.
+			let mut delete_undecodable_stmt =
+				transaction.prepare_cached(statements::UNDECODABLE_DELETE)?;
 			for uuid in chunk {
 				item::delete_item_with_stmt(uuid, &mut delete_item_stmt)?;
+				item::delete_item_with_stmt(uuid, &mut delete_undecodable_stmt)?;
 			}
 			Ok(())
 		})
+	}
+
+	/// Replace `root`'s undecodable records with the ones its fresh listing produced.
+	pub(crate) fn replace_undecodable(
+		&mut self,
+		root: Uuid,
+		items: &[UndecodableItem],
+	) -> rusqlite::Result<()> {
+		self.db
+			.execute(statements::UNDECODABLE_CLEAR_ROOT, rusqlite::params![root])?;
+		let mut stmt = self.db.prepare_cached(statements::UNDECODABLE_INSERT)?;
+		for item in items {
+			stmt.execute(rusqlite::params![
+				root,
+				item.uuid,
+				item.parent,
+				item.stable_uuid
+			])?;
+		}
+		Ok(())
 	}
 
 	/// The cached uuid(s) currently filed under a file lineage's whole-life id. Normally one row;
@@ -162,6 +218,7 @@ impl CacheState {
 	/// is responsible for scheduling a resync to re-converge the now-empty item cache.
 	pub(crate) fn delete_all_non_root(&mut self) -> rusqlite::Result<()> {
 		self.db.execute(statements::ITEM_DELETE_ALL_NON_ROOT, [])?;
+		self.db.execute(statements::UNDECODABLE_DELETE_ALL, [])?;
 		Ok(())
 	}
 
