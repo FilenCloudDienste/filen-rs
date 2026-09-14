@@ -90,6 +90,22 @@ pub(crate) enum SyncAction {
 		from_path: String,
 		to_path: String,
 	},
+	/// A directory renamed in place on the local side -> rename the remote directory (uuid and
+	/// subtree kept). Planned only for a case-only rename, which a create at the new spelling
+	/// cannot express: the server's case-insensitive dedup hands that create the very directory
+	/// the old spelling's trash would then take down, subtree and all. See
+	/// [`fold_case_only_dir_renames`].
+	RenameRemoteDir {
+		from_path: String,
+		to_path: String,
+		remote_uuid: Uuid,
+	},
+	/// A directory renamed in place on the remote side -> rename the local directory instead of
+	/// quarantining its subtree and re-creating it. Case-only, like [`Self::RenameRemoteDir`].
+	RenameLocalDir {
+		from_path: String,
+		to_path: String,
+	},
 }
 
 impl SyncAction {
@@ -105,7 +121,26 @@ impl SyncAction {
 			| Self::TrashRemote { rel_path, .. }
 			| Self::Conflict { rel_path }
 			| Self::AdoptBaseline { rel_path } => rel_path,
-			Self::MoveRemote { to_path, .. } | Self::MoveLocal { to_path, .. } => to_path,
+			Self::MoveRemote { to_path, .. }
+			| Self::MoveLocal { to_path, .. }
+			| Self::RenameRemoteDir { to_path, .. }
+			| Self::RenameLocalDir { to_path, .. } => to_path,
+		}
+	}
+
+	/// Both paths an action touches: `(from, to)` for a move or rename, the one path twice
+	/// otherwise.
+	pub(super) fn endpoints(&self) -> (&str, &str) {
+		match self {
+			Self::MoveRemote {
+				from_path, to_path, ..
+			}
+			| Self::MoveLocal { from_path, to_path }
+			| Self::RenameRemoteDir {
+				from_path, to_path, ..
+			}
+			| Self::RenameLocalDir { from_path, to_path } => (from_path, to_path),
+			other => (other.rel_path(), other.rel_path()),
 		}
 	}
 
@@ -149,6 +184,12 @@ impl SyncAction {
 			Self::MoveLocal { from_path, to_path } => {
 				format!("move local {from_path:?} -> {to_path:?}")
 			}
+			Self::RenameRemoteDir {
+				from_path, to_path, ..
+			} => format!("rename remote dir {from_path:?} -> {to_path:?}"),
+			Self::RenameLocalDir { from_path, to_path } => {
+				format!("rename local dir {from_path:?} -> {to_path:?}")
+			}
 		}
 	}
 
@@ -176,11 +217,15 @@ impl SyncAction {
 			},
 			Self::MoveRemote {
 				from_path, to_path, ..
+			}
+			| Self::RenameRemoteDir {
+				from_path, to_path, ..
 			} => SyncEvent::MovingRemote {
 				from: from_path.clone(),
 				to: to_path.clone(),
 			},
-			Self::MoveLocal { from_path, to_path } => SyncEvent::MovingLocal {
+			Self::MoveLocal { from_path, to_path }
+			| Self::RenameLocalDir { from_path, to_path } => SyncEvent::MovingLocal {
 				from: from_path.clone(),
 				to: to_path.clone(),
 			},
@@ -1336,13 +1381,7 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 		if matches!(action, SyncAction::Conflict { .. }) {
 			return true;
 		}
-		let (from, to) = match action {
-			SyncAction::MoveRemote {
-				from_path, to_path, ..
-			}
-			| SyncAction::MoveLocal { from_path, to_path } => (from_path.as_str(), to_path.as_str()),
-			other => (other.rel_path(), other.rel_path()),
-		};
+		let (from, to) = action.endpoints();
 		let held = conflicted
 			.iter()
 			.any(|c| is_under(from, c) || is_under(to, c));
@@ -1354,6 +1393,158 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 		}
 		!held
 	});
+}
+
+/// Rename in place every directory the two sides spell differently only by case, and re-key the
+/// three inputs so the rest of the pass reads that subtree under the spelling it ends with. Returns
+/// the renames shallowest first, the order they have to run in.
+///
+/// Planned any other way a case-only rename destroys the directory it renames. The per-path
+/// reconcile sees two unrelated paths — a create at the new spelling and a delete at the old one —
+/// and the server's name dedup is case-insensitive, so the create is handed back the very directory
+/// the delete then trashes, subtree and all; the pull side quarantines the whole local subtree on a
+/// case-insensitive filesystem the same way. A rename in place keeps the remote uuid, and with the
+/// inputs re-keyed every child is a no-op unless it changed on its own.
+///
+/// Only a directory under the SAME parent path on both sides is a candidate; a case change deeper
+/// down is found on a later iteration, once its parent has been re-keyed. Which side is renamed:
+/// - a one-way mode renames its destination to the source's spelling;
+/// - two-way renames the REMOTE when the baseline recorded the remote's spelling for that same
+///   directory and has no row at the local one — the local side is what changed — and the LOCAL
+///   side otherwise: the remote renamed it, or nothing says which side moved and the spelling every
+///   other device of the account already sees is the one to keep.
+///
+/// A path held in conflict at either spelling is left to the ordinary reconcile.
+///
+/// Each rename re-scans the inputs, so the cost is the tree size times the number of case-only
+/// renames in one pass; an index by collision key is the upgrade if mass case renames show up.
+pub(crate) fn fold_case_only_dir_renames(
+	mode: super::SyncMode,
+	baseline: &mut HashMap<String, BaselineEntry>,
+	local: &mut HashMap<String, LocalNode>,
+	remote: &mut HashMap<String, RemoteNode>,
+) -> Vec<SyncAction> {
+	let mut renames = Vec::new();
+	while let Some(action) = next_case_only_dir_rename(mode, baseline, local, remote) {
+		let (from, to) = action.endpoints();
+		if matches!(action, SyncAction::RenameRemoteDir { .. }) {
+			rekey_subtree(remote, from, to, |node, path| {
+				node.rel_path = path.to_string()
+			});
+		} else {
+			rekey_subtree(local, from, to, |node, path| {
+				node.rel_path = path.to_string()
+			});
+		}
+		rekey_subtree(baseline, from, to, |entry, path| {
+			entry.rel_path = path.to_string()
+		});
+		tracing::debug!(
+			"plan: {} — the two sides spell the directory differently only by case",
+			action.describe()
+		);
+		renames.push(action);
+	}
+	renames
+}
+
+/// The shallowest case-only directory rename left in the inputs (see
+/// [`fold_case_only_dir_renames`]).
+fn next_case_only_dir_rename(
+	mode: super::SyncMode,
+	baseline: &HashMap<String, BaselineEntry>,
+	local: &HashMap<String, LocalNode>,
+	remote: &HashMap<String, RemoteNode>,
+) -> Option<SyncAction> {
+	// Collision key -> the local directory no remote item holds under that exact spelling. The scan
+	// refuses two local entries with one key, so the map loses nothing.
+	let local_only: HashMap<String, &str> = local
+		.iter()
+		.filter(|(path, node)| node.kind == NodeKind::Dir && !remote.contains_key(*path))
+		.map(|(path, _)| (collision_key(path), path.as_str()))
+		.collect();
+	if local_only.is_empty() {
+		return None;
+	}
+	let mut candidates: Vec<(&str, &str, Uuid)> = remote
+		.iter()
+		.filter(|(path, node)| node.kind == NodeKind::Dir && !local.contains_key(*path))
+		.filter_map(|(remote_path, node)| {
+			let local_path = *local_only.get(&collision_key(remote_path))?;
+			(parent_path(local_path) == parent_path(remote_path)).then_some((
+				local_path,
+				remote_path.as_str(),
+				node.remote_uuid,
+			))
+		})
+		.collect();
+	candidates
+		.sort_unstable_by_key(|(local_path, ..)| (local_path.matches('/').count(), *local_path));
+	candidates
+		.into_iter()
+		.find_map(|(local_path, remote_path, remote_uuid)| {
+			let at_local = baseline.get(local_path);
+			let at_remote = baseline.get(remote_path);
+			if at_local
+				.into_iter()
+				.chain(at_remote)
+				.any(|row| row.state.is_conflict())
+			{
+				return None;
+			}
+			let rename_remote = match mode {
+				super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => true,
+				super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => false,
+				super::SyncMode::TwoWay => {
+					at_local.is_none()
+						&& at_remote.is_some_and(|row| {
+							row.kind == NodeKind::Dir
+								&& row.state == BaselineState::Synced
+								&& row.remote_uuid == Some(remote_uuid)
+						})
+				}
+			};
+			Some(if rename_remote {
+				SyncAction::RenameRemoteDir {
+					from_path: remote_path.to_string(),
+					to_path: local_path.to_string(),
+					remote_uuid,
+				}
+			} else {
+				SyncAction::RenameLocalDir {
+					from_path: local_path.to_string(),
+					to_path: remote_path.to_string(),
+				}
+			})
+		})
+}
+
+/// The parent part of a `/`-joined relative path (`""` at the top level).
+fn parent_path(rel_path: &str) -> &str {
+	rel_path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// Move every entry at `from` or under it to the same place under `to`, rewriting the path the
+/// entry carries with `set_path`.
+fn rekey_subtree<T>(
+	map: &mut HashMap<String, T>,
+	from: &str,
+	to: &str,
+	set_path: impl Fn(&mut T, &str),
+) {
+	let moving: Vec<String> = map
+		.keys()
+		.filter(|key| key.as_str() == from || is_under(key, from))
+		.cloned()
+		.collect();
+	for old in moving {
+		let Some(mut value) = map.remove(&old) else {
+			continue;
+		};
+		let new = format!("{to}{}", &old[from.len()..]);
+		set_path(&mut value, &new);
+		map.insert(new, value);
+	}
 }
 
 /// What a pass must NOT act on, beyond what the three inputs themselves say.
@@ -1533,19 +1724,24 @@ pub(crate) fn reconcile(
 /// a file<->dir type flip) has to precede the create at that path, but a DIRECTORY delete is
 /// recursive (the server trashes a dir's whole subtree; a local delete quarantines it), so it must
 /// still wait until everything moving OUT of that directory has moved.
-const PHASE_FILE_REPLACE_DELETE: u8 = 0;
-const PHASE_CREATE: u8 = 1;
-const PHASE_MOVE: u8 = 2;
-const PHASE_DIR_REPLACE_DELETE: u8 = 3;
-const PHASE_TRANSFER: u8 = 4;
-const PHASE_DELETE: u8 = 5;
-const PHASE_CONFLICT: u8 = 6;
+///
+/// A directory renamed in place runs before all of them: the rest of the plan already names its
+/// subtree by the new spelling (see [`fold_case_only_dir_renames`]).
+const PHASE_DIR_RENAME: u8 = 0;
+const PHASE_FILE_REPLACE_DELETE: u8 = 1;
+const PHASE_CREATE: u8 = 2;
+const PHASE_MOVE: u8 = 3;
+const PHASE_DIR_REPLACE_DELETE: u8 = 4;
+const PHASE_TRANSFER: u8 = 5;
+const PHASE_DELETE: u8 = 6;
+const PHASE_CONFLICT: u8 = 7;
 
 /// The apply phase of an action given the set of paths the pass materializes (`create_targets`).
 /// See the `PHASE_*` constants; other deletes run LAST (child-before-parent) so a directory delete
 /// cannot strand an item an earlier move/transfer still needs.
 fn action_phase(action: &SyncAction, create_targets: &std::collections::HashSet<String>) -> u8 {
 	match action {
+		SyncAction::RenameRemoteDir { .. } | SyncAction::RenameLocalDir { .. } => PHASE_DIR_RENAME,
 		// Replace-delete of a FILE: removing it strands nothing, so it goes first — the create at
 		// that path would otherwise hit the still-present old item.
 		SyncAction::DeleteLocal {
@@ -1652,6 +1848,227 @@ mod tests {
 		let mut remote = remote.clone();
 		writes.fold_into(PAIR, baseline, &mut remote);
 		reconcile(mode, baseline, local, &remote, &PassHolds::default()).actions
+	}
+
+	/// What a pass plans once the case-only directory renames are folded into its inputs: the
+	/// renames first, then the reconciled rest.
+	fn plan_with_renames(
+		mode: SyncMode,
+		baseline: &HashMap<String, BaselineEntry>,
+		local: &HashMap<String, LocalNode>,
+		remote: &HashMap<String, RemoteNode>,
+	) -> Vec<SyncAction> {
+		let (mut baseline, mut local, mut remote) =
+			(baseline.clone(), local.clone(), remote.clone());
+		let mut actions = fold_case_only_dir_renames(mode, &mut baseline, &mut local, &mut remote);
+		actions.extend(plan(mode, &baseline, &local, &remote));
+		actions
+	}
+
+	/// A synced directory holding `a.txt`, spelled `base_name` in the baseline, `local_name` on disk
+	/// and `remote_name` on the remote.
+	fn case_tree(
+		base_name: &str,
+		local_name: &str,
+		remote_name: &str,
+		dir: Uuid,
+		file: Uuid,
+	) -> (
+		HashMap<String, BaselineEntry>,
+		HashMap<String, LocalNode>,
+		HashMap<String, RemoteNode>,
+	) {
+		let child = |name: &str| format!("{name}/a.txt");
+		let baseline = HashMap::from([
+			(base_name.to_string(), base_dir(base_name, dir)),
+			(
+				child(base_name),
+				base_file(&child(base_name), file, [1; 32]),
+			),
+		]);
+		let local = HashMap::from([
+			(local_name.to_string(), local_dir(local_name)),
+			(child(local_name), local_file(&child(local_name), [1; 32])),
+		]);
+		let remote = HashMap::from([
+			(remote_name.to_string(), remote_dir_node(remote_name, dir)),
+			(
+				child(remote_name),
+				remote_file(&child(remote_name), file, [1; 32]),
+			),
+		]);
+		(baseline, local, remote)
+	}
+
+	/// A directory renamed only by case on the LOCAL side is renamed in place on the remote, and
+	/// nothing else happens: no create at the new spelling (the dedup would hand it the same
+	/// directory) and no trash at the old one (which would take that directory down with its
+	/// subtree).
+	#[test]
+	fn a_local_case_only_dir_rename_renames_the_remote_dir_in_place() {
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::LocalToRemote,
+			SyncMode::LocalBackup,
+		] {
+			let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
+			let (baseline, local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
+			assert_eq!(
+				plan_with_renames(mode, &baseline, &local, &remote),
+				vec![SyncAction::RenameRemoteDir {
+					from_path: "Docs".to_string(),
+					to_path: "docs".to_string(),
+					remote_uuid: dir,
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// The mirror: a directory renamed only by case on the REMOTE side is renamed in place locally,
+	/// instead of quarantining the local subtree and re-creating it.
+	#[test]
+	fn a_remote_case_only_dir_rename_renames_the_local_dir_in_place() {
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::RemoteToLocal,
+			SyncMode::RemoteBackup,
+		] {
+			let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
+			let (baseline, local, remote) = case_tree("Docs", "Docs", "docs", dir, file);
+			assert_eq!(
+				plan_with_renames(mode, &baseline, &local, &remote),
+				vec![SyncAction::RenameLocalDir {
+					from_path: "Docs".to_string(),
+					to_path: "docs".to_string(),
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// A one-way mode puts its SOURCE's spelling back on a destination whose case drifted, whatever
+	/// the baseline says.
+	#[test]
+	fn a_one_way_mode_renames_its_destination_to_the_source_spelling() {
+		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
+		let (baseline, local, remote) = case_tree("Docs", "Docs", "docs", dir, file);
+		assert_eq!(
+			plan_with_renames(SyncMode::LocalToRemote, &baseline, &local, &remote),
+			vec![SyncAction::RenameRemoteDir {
+				from_path: "docs".to_string(),
+				to_path: "Docs".to_string(),
+				remote_uuid: dir,
+			}]
+		);
+	}
+
+	/// Without the fold the same inputs plan the destructive shape this exists to prevent — a create
+	/// at one spelling and a directory trash at the other. Pins why the fold has to run first.
+	#[test]
+	fn a_case_only_dir_rename_planned_per_path_trashes_the_directory() {
+		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
+		let (baseline, local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		assert!(
+			actions.contains(&SyncAction::TrashRemote {
+				rel_path: "Docs".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: dir,
+			}),
+			"{actions:?}"
+		);
+	}
+
+	/// A child that changed in the same pass is still planned — at the new spelling, after the
+	/// rename.
+	#[test]
+	fn a_child_edited_under_a_case_renamed_dir_is_pushed_at_the_new_spelling() {
+		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
+		let (baseline, mut local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
+		local.insert("docs/a.txt".to_string(), local_file("docs/a.txt", [2; 32]));
+		let rename = SyncAction::RenameRemoteDir {
+			from_path: "Docs".to_string(),
+			to_path: "docs".to_string(),
+			remote_uuid: dir,
+		};
+		let mut ordered = vec![
+			SyncAction::UploadFile {
+				rel_path: "docs/a.txt".to_string(),
+			},
+			rename.clone(),
+		];
+		order_actions(&mut ordered);
+		assert_eq!(
+			ordered[0], rename,
+			"the rename runs before anything under it"
+		);
+		assert_eq!(
+			plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![
+				rename,
+				SyncAction::UploadFile {
+					rel_path: "docs/a.txt".to_string(),
+				},
+			]
+		);
+	}
+
+	/// A case change at two levels is two renames, the parent first, and nothing more.
+	#[test]
+	fn nested_case_only_dir_renames_fold_parent_first() {
+		let (outer, inner, file) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+		let baseline = HashMap::from([
+			("Docs".to_string(), base_dir("Docs", outer)),
+			("Docs/Sub".to_string(), base_dir("Docs/Sub", inner)),
+			(
+				"Docs/Sub/a.txt".to_string(),
+				base_file("Docs/Sub/a.txt", file, [1; 32]),
+			),
+		]);
+		let local = HashMap::from([
+			("docs".to_string(), local_dir("docs")),
+			("docs/sub".to_string(), local_dir("docs/sub")),
+			(
+				"docs/sub/a.txt".to_string(),
+				local_file("docs/sub/a.txt", [1; 32]),
+			),
+		]);
+		let remote = HashMap::from([
+			("Docs".to_string(), remote_dir_node("Docs", outer)),
+			("Docs/Sub".to_string(), remote_dir_node("Docs/Sub", inner)),
+			(
+				"Docs/Sub/a.txt".to_string(),
+				remote_file("Docs/Sub/a.txt", file, [1; 32]),
+			),
+		]);
+		assert_eq!(
+			plan_with_renames(SyncMode::TwoWay, &baseline, &local, &remote),
+			vec![
+				SyncAction::RenameRemoteDir {
+					from_path: "Docs".to_string(),
+					to_path: "docs".to_string(),
+					remote_uuid: outer,
+				},
+				SyncAction::RenameRemoteDir {
+					from_path: "docs/Sub".to_string(),
+					to_path: "docs/sub".to_string(),
+					remote_uuid: inner,
+				},
+			]
+		);
+	}
+
+	/// A path held in conflict is not renamed: the conflict hold decides it.
+	#[test]
+	fn a_conflicted_dir_is_not_case_renamed() {
+		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
+		let (mut baseline, mut local, mut remote) = case_tree("Docs", "docs", "Docs", dir, file);
+		baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
+		assert!(
+			fold_case_only_dir_renames(SyncMode::TwoWay, &mut baseline, &mut local, &mut remote)
+				.is_empty()
+		);
 	}
 
 	fn ms(millis: i64) -> DateTime<Utc> {

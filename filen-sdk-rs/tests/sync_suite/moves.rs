@@ -1724,3 +1724,198 @@ async fn move_a7_remote_move_with_edit_leaves_no_quarantine_copy() {
 
 	sc.cleanup();
 }
+
+// ============================================================================
+// MOVE-26 — Case-only DIRECTORY rename renames in place; nothing is trashed.
+// ============================================================================
+
+/// Rename `from` -> `to` under `root` through a temporary name, so a case-only rename lands on a
+/// case-insensitive filesystem too.
+fn rename_via_temp(root: &std::path::Path, from: &str, to: &str) {
+	let temp = format!("{to}.case-rename-tmp");
+	std::fs::rename(root.join(from), root.join(&temp)).unwrap();
+	std::fs::rename(root.join(&temp), root.join(to)).unwrap();
+}
+
+/// The uuids of `Docs/`, `Docs/a.txt`, `Docs/sub/` and `Docs/sub/b.txt` under the remote root,
+/// looked up by whatever case the directory currently wears (`dir_name`).
+async fn case_tree_uuids(sc: &SingleClient, dir_name: &str) -> [Uuid; 4] {
+	let (dirs, files) = list_dir(&sc.resources.client, &sc.resources.dir).await;
+	assert_eq!(
+		dirs.len(),
+		1,
+		"exactly one directory under the root: {dirs:?}"
+	);
+	assert!(files.is_empty(), "no stray file under the root: {files:?}");
+	let docs = find_dir(&dirs, dir_name).unwrap_or_else(|| panic!("{dir_name}/ missing: {dirs:?}"));
+	let (sub_dirs, docs_files) = list_dir(&sc.resources.client, docs).await;
+	assert_eq!(sub_dirs.len(), 1, "{sub_dirs:?}");
+	assert_eq!(docs_files.len(), 1, "{docs_files:?}");
+	let a = find_file(&docs_files, "a.txt").expect("a.txt missing");
+	assert_eq!(a.size, b"case-dir-A".len() as u64, "a.txt size");
+	let sub = find_dir(&sub_dirs, "sub").expect("sub/ missing");
+	let (_, sub_files) = list_dir(&sc.resources.client, sub).await;
+	assert_eq!(sub_files.len(), 1, "{sub_files:?}");
+	let b = find_file(&sub_files, "b.txt").expect("b.txt missing");
+	assert_eq!(b.size, b"case-dir-B".len() as u64, "b.txt size");
+	[docs.uuid(), a.uuid(), sub.uuid(), b.uuid()]
+}
+
+/// Nothing this test created sits in the Filen trash.
+async fn assert_none_trashed(sc: &SingleClient, uuids: &[Uuid]) {
+	let (dirs, files) = sc
+		.resources
+		.client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	let trashed: Vec<Uuid> = dirs
+		.iter()
+		.map(HasUUID::uuid)
+		.chain(files.iter().map(HasUUID::uuid))
+		.filter(|uuid| uuids.contains(uuid))
+		.collect();
+	assert!(
+		trashed.is_empty(),
+		"items landed in the Filen trash: {trashed:?}"
+	);
+}
+
+/// The end state both directions must reach: the new spelling on both sides, every child present
+/// with its bytes, the same remote uuids, and nothing in the Filen trash or the quarantine bin.
+async fn assert_case_rename_converged(sc: &SingleClient, original: [Uuid; 4]) {
+	assert_eq!(
+		tree_paths(&sc.local),
+		vec!["docs", "docs/a.txt", "docs/sub", "docs/sub/b.txt"],
+		"local tree must carry the new spelling and every child"
+	);
+	assert!(read_eq(&sc.local, "docs/a.txt", b"case-dir-A"));
+	assert!(read_eq(&sc.local, "docs/sub/b.txt", b"case-dir-B"));
+	assert_eq!(
+		quarantined_file_count(&sc.local),
+		0,
+		"a case-only rename must quarantine nothing"
+	);
+	let renamed = case_tree_uuids(sc, "docs").await;
+	assert_eq!(renamed, original, "the remote items must keep their uuids");
+	assert_none_trashed(sc, &original).await;
+}
+
+/// Run `passes` passes; none may error, trash, delete locally or re-transfer.
+async fn case_rename_passes(sc: &SingleClient, passes: usize, label: &str) {
+	for pass in 0..passes {
+		let report = sc.sync().await;
+		assert!(report.errors.is_empty(), "{label} pass {pass}: {report:?}");
+		assert_eq!(
+			report.remotely_trashed, 0,
+			"{label} pass {pass}: {report:?}"
+		);
+		assert_eq!(report.locally_deleted, 0, "{label} pass {pass}: {report:?}");
+		assert_eq!(report.uploaded, 0, "{label} pass {pass}: {report:?}");
+		assert_eq!(report.downloaded, 0, "{label} pass {pass}: {report:?}");
+		assert!(report.held.is_empty(), "{label} pass {pass}: {report:?}");
+	}
+}
+
+async fn local_case_only_dir_rename(mode: SyncMode) {
+	let sc = single_client(mode).await;
+	write_file(&sc.local, "Docs/a.txt", b"case-dir-A");
+	write_file(&sc.local, "Docs/sub/b.txt", b"case-dir-B");
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 2, "{r1:?}");
+	let original = case_tree_uuids(&sc, "Docs").await;
+	for uuid in original {
+		wait_cache_has(&sc, uuid).await;
+	}
+
+	rename_via_temp(&sc.local, "Docs", "docs");
+	// The first pass right after the rename reads a cache that has not seen it yet.
+	case_rename_passes(&sc, 1, "rename").await;
+	assert!(
+		poll_for_dir_name(
+			sc.cache.db_path(),
+			original[0],
+			"docs",
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await,
+		"cache never saw the directory under its new spelling"
+	);
+	case_rename_passes(&sc, 2, "settled").await;
+	assert_case_rename_converged(&sc, original).await;
+	sc.cleanup();
+}
+
+async fn remote_case_only_dir_rename(mode: SyncMode) {
+	let sc = single_client(mode).await;
+	let client = &sc.resources.client;
+	let mut docs = client.create_dir(&root_dirtype(&sc), "Docs").await.unwrap();
+	let a = client
+		.upload_file(
+			client.make_file_builder("a.txt", docs.uuid()).unwrap(),
+			b"case-dir-A",
+		)
+		.await
+		.unwrap();
+	let sub = client
+		.create_dir(&DirType::<Normal>::Dir(Cow::Borrowed(&docs)), "sub")
+		.await
+		.unwrap();
+	let b = client
+		.upload_file(
+			client.make_file_builder("b.txt", sub.uuid()).unwrap(),
+			b"case-dir-B",
+		)
+		.await
+		.unwrap();
+	let original = [docs.uuid(), a.uuid(), sub.uuid(), b.uuid()];
+	for uuid in original {
+		wait_cache_has(&sc, uuid).await;
+	}
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.downloaded, 2, "{r1:?}");
+	assert!(read_eq(&sc.local, "Docs/sub/b.txt", b"case-dir-B"));
+
+	client
+		.update_dir_metadata(
+			&mut docs,
+			DirectoryMetaChanges::default().name("docs").unwrap(),
+		)
+		.await
+		.unwrap();
+	assert!(
+		poll_for_dir_name(
+			sc.cache.db_path(),
+			docs.uuid(),
+			"docs",
+			CACHE_CONVERGE_TIMEOUT
+		)
+		.await,
+		"cache never saw the remote case-only rename"
+	);
+	case_rename_passes(&sc, 3, "rename").await;
+	assert_case_rename_converged(&sc, original).await;
+	sc.cleanup();
+}
+
+#[shared_test_runtime]
+async fn move26_local_case_only_dir_rename_twoway() {
+	local_case_only_dir_rename(SyncMode::TwoWay).await;
+}
+
+#[shared_test_runtime]
+async fn move26_local_case_only_dir_rename_local_to_remote() {
+	local_case_only_dir_rename(SyncMode::LocalToRemote).await;
+}
+
+#[shared_test_runtime]
+async fn move26_remote_case_only_dir_rename_twoway() {
+	remote_case_only_dir_rename(SyncMode::TwoWay).await;
+}
+
+#[shared_test_runtime]
+async fn move26_remote_case_only_dir_rename_remote_to_local() {
+	remote_case_only_dir_rename(SyncMode::RemoteToLocal).await;
+}
