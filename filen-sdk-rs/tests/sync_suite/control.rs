@@ -1043,11 +1043,21 @@ async fn control_05_remove_pair_leaves_both_sides_intact() {
 	write_file(&local, "f1.txt", b"locally edited after removal");
 	seed_remote_file(&cache, remote, "added_after_removal.txt", b"remote add").await;
 
-	// The removed pair cannot be synced at all.
-	assert!(
-		engine.sync_once(pair).await.is_err(),
-		"a removed pair must not sync"
-	);
+	// The removed pair cannot be synced at all, and an observed pass says so as it fails.
+	let mut events = Vec::new();
+	let refused = engine
+		.sync_once_observed(pair, &mut |event| events.push(event))
+		.await;
+	if let Err(error) = &refused {
+		assert_eq!(
+			events,
+			vec![SyncEvent::PassFailed {
+				error: error.to_string()
+			}],
+			"a pass that fails outright must report it"
+		);
+	}
+	assert!(refused.is_err(), "a removed pair must not sync");
 
 	// Remote: the local delete was NOT mirrored, the local edit was NOT pushed.
 	let (_d1, after) = list_remote(&resources).await;
