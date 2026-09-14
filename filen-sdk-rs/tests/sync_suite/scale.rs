@@ -1732,11 +1732,21 @@ async fn scale_23_progress_events_emitted_and_bounded() {
 		"in-progress events must equal Planned count"
 	);
 
-	// Bounded: total event volume is O(actions), not one-per-byte.
+	// Bounded: total event volume is O(actions), not one-per-byte. Byte progress is throttled per
+	// transfer, and each of these files is far smaller than one upload chunk, so each upload reports
+	// its bytes exactly once, when they land.
+	let progress = events
+		.iter()
+		.filter(|e| matches!(e, SyncEvent::Progress { .. }))
+		.count();
+	assert_eq!(
+		progress, N,
+		"one Progress per small upload, not one per byte: {events:?}"
+	);
 	assert!(
-		events.len() <= planned_actions + 4,
+		events.len() - progress <= planned_actions + 4,
 		"event volume must be bounded (~actions + lifecycle): {} events for {planned_actions} actions",
-		events.len()
+		events.len() - progress
 	);
 
 	// The final PassCompleted carries a report reconciling with the in-progress counts.
