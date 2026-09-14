@@ -1124,10 +1124,9 @@ async fn observ_add_no_phantom_dir_create_for_existing_dir() {
 // (add) — a SLOW progress listener does not lose events or abort the pass
 // ===========================================================================
 
-// The observer is a `FnMut` called synchronously; a Rust observer cannot "throw" without unwinding
-// through the engine (the plan's throwing-listener leg), so the genuinely-supported robustness
-// variant is a SLOW listener: it sleeps on every event and must still receive every event while the
-// pass completes and applies all work.
+// The observer is a `FnMut` called synchronously. A SLOW listener sleeps on every event and must still
+// receive every event while the pass completes and applies all work. A panicking one is covered by
+// `observ_add_throwing_listener_does_not_corrupt`.
 #[shared_test_runtime]
 async fn observ_add_slow_listener_does_not_lose_events() {
 	let sc = single_client(SyncMode::LocalToRemote).await;
@@ -1441,12 +1440,76 @@ async fn observ_add_unique_pass_identifier_correlation() {
 	// its id. Neither SyncReport nor SyncEvent exposes a pass identifier.
 }
 
-#[ignore = "blocked: a throwing observer would unwind through the engine (undefined for these tests) — slow-listener variant implemented as observ_add_slow_listener_does_not_lose_events"]
+/// A panicking ("throwing") observer does not corrupt the pass. It panics on the first upload it
+/// hears of, inside apply while the pass holds the drive-write lock. The panic is contained: the pass
+/// still applies all N uploads and returns its report, and that observer is not called again for
+/// the rest of the pass. The next pass, which needs the lock again, runs and calls it again.
 #[shared_test_runtime]
 async fn observ_add_throwing_listener_does_not_corrupt() {
-	// plan: register one throwing listener + one well-behaved recorder; assert the pass completes and
-	// applies all N actions, the recorder still gets exactly N events, the report counters == N, and
-	// exactly one final report fires. A Rust observer cannot "throw" without panicking/unwinding
-	// through the synchronous observer call site; the supported slow-listener robustness leg is
-	// covered by observ_add_slow_listener_does_not_lose_events.
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	const N: usize = 6;
+	for i in 0..N {
+		write_file(&sc.local, &format!("t{i}.txt"), format!("c{i}").as_bytes());
+	}
+
+	// ONE observer for both passes, as a watch hands the same one to every pass: it panics on the
+	// first upload event it ever hears of, and only then.
+	let seen = std::sync::Mutex::new(Vec::new());
+	let mut observer = {
+		let seen = &seen;
+		let mut panicked = false;
+		move |e: SyncEvent| {
+			let fail = !panicked && matches!(e, SyncEvent::Uploading { .. });
+			seen.lock().unwrap().push(e);
+			if fail {
+				panicked = true;
+				panic!("observer failure on the first upload event");
+			}
+		}
+	};
+	let report = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut observer)
+		.await
+		.unwrap();
+	let first = std::mem::take(&mut *seen.lock().unwrap());
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(report.uploaded, N, "{report:?}");
+	assert_eq!(list_remote_files(&sc).await.len(), N, "every upload landed");
+	assert!(
+		matches!(first.last(), Some(SyncEvent::Uploading { .. })),
+		"the observer was called after it panicked: {first:?}"
+	);
+	assert_eq!(
+		first
+			.iter()
+			.filter(|e| matches!(e, SyncEvent::Uploading { .. }))
+			.count(),
+		1,
+		"{first:?}"
+	);
+
+	// The same observer, on the next pass: it hears that pass from start to end.
+	write_file(&sc.local, "after.txt", b"after");
+	let r2 = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut observer)
+		.await
+		.unwrap();
+	let next = std::mem::take(&mut *seen.lock().unwrap());
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.uploaded, 1, "{r2:?}");
+	assert!(
+		matches!(next.first(), Some(SyncEvent::PassStarted { .. })),
+		"the next pass reports to the same observer again: {next:?}"
+	);
+	assert_eq!(
+		next.iter()
+			.filter(|e| matches!(e, SyncEvent::PassCompleted { .. }))
+			.count(),
+		1,
+		"the next pass reports to the same observer again: {next:?}"
+	);
+
+	sc.cleanup();
 }
