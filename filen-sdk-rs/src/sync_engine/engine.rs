@@ -2758,7 +2758,8 @@ impl SyncEngine {
 	/// event order). The observer is called synchronously between async steps, so keep it quick.
 	///
 	/// A [`paused`](Self::pause_pair) pair emits NO events at all — there was no pass to report on
-	/// — and returns a report marked [`paused`](SyncReport::paused).
+	/// — and returns a report marked [`paused`](SyncReport::paused). A pass that returns an error
+	/// reports it as [`SyncEvent::PassFailed`] first.
 	///
 	/// A panic inside `observer` is caught and logged once; the observer receives nothing more for
 	/// the rest of the pass, and the pass carries on (see [`SyncObserver`](super::SyncObserver)).
@@ -2782,7 +2783,13 @@ impl SyncEngine {
 	) -> Result<SyncReport, Error> {
 		let mut contained = super::events::contain_panics(observer);
 		let observer: &mut (dyn FnMut(SyncEvent) + Send) = &mut contained;
-		self.run_pass(pair, depth, observer).await
+		let result = self.run_pass(pair, depth, observer).await;
+		if let Err(error) = &result {
+			observer(SyncEvent::PassFailed {
+				error: error.to_string(),
+			});
+		}
+		result
 	}
 
 	/// The body of [`sync_pass`](Self::sync_pass), reporting to an observer whose panics are
@@ -4288,6 +4295,29 @@ mod tests {
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		(engine, pair, path)
+	}
+
+	/// A pass that fails outright tells its observer, with the error the call returns. Here the pair
+	/// is gone, so the pass fails before it reads either side and that is its only event.
+	#[tokio::test]
+	async fn a_pass_that_fails_outright_reports_pass_failed() {
+		let (engine, pair, path) = engine_with_pair("pass_failed").await;
+		engine.remove_pair(pair).await.unwrap();
+
+		let mut events = Vec::new();
+		let error = engine
+			.sync_once_observed(pair, &mut |event| events.push(event))
+			.await
+			.unwrap_err();
+		assert_eq!(
+			events,
+			vec![SyncEvent::PassFailed {
+				error: error.to_string()
+			}]
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
 	}
 
 	/// A stand-in for the pass in flight, shaped like the action loop in [`apply`]: the checkpoint
